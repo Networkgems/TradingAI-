@@ -340,3 +340,115 @@ test('the in-force block is published on EVERY verdict, including the untouched 
     assert.ok('inForce' in g.out.boundInForce);
   }
 });
+
+// ---------------------------------------------------------------------------
+// TRA-3881 — the reader has to say WHICH capital instrument governs.
+//
+// The 2026-08-20T04:06Z reading was healthy in every way that matters — `within`,
+// φ_eff binding, 2/2 coverage — and it published `fleetCapitalHeadroomUsd
+// −$120.81`, because `A/φ` describes a precondition TRA-3879 retired. That
+// number was in this reader's own escalation checklist. A permanent false alarm
+// and a deleted alarm end in the same place.
+//
+// Every scenario below is built from a REAL capture. The `phi_fleet_derived`
+// branch is the live 04:07Z payload untouched; the other branches are the same
+// bytes with the server's TRA-3881 fields grafted on, because bqb1 has not shipped
+// them yet — which is exactly what the deployed-bytes AC1 grade is for.
+// ---------------------------------------------------------------------------
+
+test('TRA-3881 — the FIXED capture really carries the false alarm this ticket is about', () => {
+  const served = cloneFixed().fee.aggregateFleetBound;
+  assert.equal(served.verdict, 'within', 'a healthy reading');
+  assert.ok(served.fleetCapitalHeadroomUsd < 0, 'and a negative headroom beside it');
+  assert.ok(armedOf(cloneFixed().fee).every(r => r.fleetSizingReason === 'phi_fleet_derived'));
+  assert.equal(gradeFixed().verdict, 'CLEAN');
+});
+
+test('TRA-3881 — on PRE-3881 bytes the stale negative headroom is labelled DO-NOT-ESCALATE, not paged', () => {
+  const g = gradeFixed();
+  assert.equal(g.verdict, 'CLEAN', 'the verdict must not move — this is a labelling fix, not a grade');
+  assert.equal(g.code, EXIT.CLEAN);
+  assert.equal(g.out.boundInForce.inForce, true, 'the TRA-3879 bound WAS in force on this reading');
+  assert.equal(g.out.fleetCapital.ceilingBasis, null, 'these bytes predate TRA-3881');
+  assert.equal(g.out.fleetCapital.staleFittedCeiling, true);
+  assert.match(g.out.fleetCapital.doNotEscalate, /KNOWN STALE-φ artifact/);
+  assert.match(g.out.fleetCapital.governing, /UNKNOWN/);
+});
+
+test('TRA-3881 — the DO-NOT-ESCALATE label DISCRIMINATES: it stays off when the bound is not in force', () => {
+  // A marker that fires on every reading is boilerplate (TRA-3723). Same negative
+  // headroom, but the fleet read is unusable — so the sum really IS unbounded and
+  // the negative number is a finding, not an artifact. The label must vanish.
+  const fee = cloneFixed().fee;
+  for (const r of armedOf(fee)) {
+    r.fleetCapitalUsd = null;
+    r.fleetSizingReason = 'fleet_capital_unreadable';
+  }
+  const g = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
+  assert.ok(fee.aggregateFleetBound.fleetCapitalHeadroomUsd < 0, 'still negative');
+  assert.equal(g.out.boundInForce.inForce, false);
+  assert.equal(g.out.fleetCapital.staleFittedCeiling, false);
+  assert.equal(g.out.fleetCapital.doNotEscalate, undefined);
+  assert.equal(g.verdict, 'UNBOUND', 'and it is a real finding — exit 3, not a pass');
+});
+
+test('TRA-3881 — AC1 branch: TRA-3881 bytes withhold the fitted pair and the reader names the bound in force', () => {
+  const fee = cloneFixed().fee;
+  const A = fee.aggregateCapUsd;
+  const capital = fee.aggregateFleetBound.fleetCapitalUsd;
+  // The server bytes AC1 pre-registers: ceiling/headroom null under phi_fleet_derived.
+  Object.assign(fee.aggregateFleetBound, {
+    fleetCapitalCeilingUsd: null,
+    fleetCapitalHeadroomUsd: null,
+    fleetCapitalCeilingBasis: 'withheld — every armed book is sizing on φ_eff = A/Σ E_i (phi_fleet_derived)…',
+    fleetSizingReason: 'phi_fleet_derived',
+    fleetRiskFractionEffective: A / capital,
+    fleetSizedMaxSumUsd: A,
+    fleetSizedHeadroomUsd: 0,
+  });
+  const g = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
+  assert.equal(g.verdict, 'CLEAN');
+  assert.equal(g.out.fleetCapital.fittedHeadroomUsd, null);
+  assert.equal(g.out.fleetCapital.staleFittedCeiling, false, 'nothing stale is being served any more');
+  assert.equal(g.out.fleetCapital.sizedHeadroomUsd, 0);
+  assert.match(g.out.fleetCapital.governing, /TRA-3879 bound/);
+  assert.match(g.out.fleetCapital.governing, /does NOT apply/);
+  // AC1 restated at the reader: nothing it surfaces implies an over-limit fleet.
+  for (const [k, v] of Object.entries(g.out.fleetCapital)) {
+    assert.ok(typeof v !== 'number' || v >= 0, `${k} must not be negative on a healthy derived reading, got ${v}`);
+  }
+});
+
+test('TRA-3881 — AC3 branch: fleet_capital_unreadable keeps the pair AND keeps it negative', () => {
+  const fee = cloneFixed().fee;
+  const stale = fee.aggregateFleetBound.fleetCapitalHeadroomUsd;
+  Object.assign(fee.aggregateFleetBound, {
+    fleetCapitalCeilingBasis: 'IN FORCE — at least one armed book sized with an UNUSABLE fleet read…',
+    fleetSizingReason: 'fleet_capital_unreadable',
+    fleetSizedHeadroomUsd: -1,
+    fleetSizedMaxSumUsd: fee.aggregateCapUsd + 1,
+  });
+  for (const r of armedOf(fee)) { r.fleetCapitalUsd = null; r.fleetSizingReason = 'fleet_capital_unreadable'; }
+  const g = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
+  assert.equal(g.out.fleetCapital.fittedHeadroomUsd, stale, 'the pair still publishes');
+  assert.ok(g.out.fleetCapital.fittedHeadroomUsd < 0, 'and can still go negative — the evidence stays');
+  assert.match(g.out.fleetCapital.governing, /fitted precondition/);
+  assert.equal(g.out.fleetCapital.staleFittedCeiling, false, 'not an artifact here — the sum IS unbounded');
+  assert.equal(g.verdict, 'UNBOUND');
+});
+
+test('TRA-3881 — the fleetCapital block is published on EVERY verdict, breach included', () => {
+  // Same discipline as boundInForce: a field that appears only when it is bad
+  // cannot be asserted on, and its absence reads as "fine" rather than "not measured".
+  for (const g of [grade(), gradeFixed()]) {
+    assert.ok(Object.prototype.hasOwnProperty.call(g.out, 'fleetCapital'));
+    for (const k of ['ceilingBasis', 'fittedCeilingUsd', 'fittedHeadroomUsd', 'sizedMaxSumUsd', 'sizedHeadroomUsd', 'governing', 'staleFittedCeiling']) {
+      assert.ok(k in g.out.fleetCapital, `${k} missing on the ${g.verdict} reading`);
+    }
+  }
+  // ⚠ AND IT NEVER MUTES A BREACH. The overage is unconditional; re-labelling a
+  // live fail-open with a more procedural word is how a loud finding gets re-read
+  // as a caveat (TRA-3723).
+  assert.equal(grade().verdict, 'BREACH');
+  assert.equal(grade().out.fleetCapital.doNotEscalate, undefined);
+});

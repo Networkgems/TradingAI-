@@ -265,6 +265,58 @@ export function gradeFleetBound({ live, fee, expectCommit = null, measuredAt }) 
   // BREACH reading is entitled to be judged against.
   out.boundInForce = gradeBoundInForce(armed, typeof A === 'number' ? A : NaN, eligible);
 
+  // TRA-3881 — WHICH CAPITAL INSTRUMENT GOVERNS THIS READING.
+  //
+  // The escalation checklist in this reader's carrier (routine 2b3b32bc) used to
+  // quote `fleetCapitalUsd / fleetCapitalCeilingUsd / fleetCapitalHeadroomUsd`
+  // flat. After TRA-3879 the fitted ceiling `A/φ` describes a precondition that
+  // no longer governs, so on a perfectly healthy fleet it served −$120.81 beside
+  // its own `within` — every reading, by construction. A permanent false alarm
+  // gets muted and a muted alarm is a deleted alarm, so the reader now says
+  // WHICH number to read instead of printing both and hoping.
+  out.fleetCapital = (() => {
+    const fitted = served?.fleetCapitalCeilingUsd ?? null;
+    const fittedHeadroom = served?.fleetCapitalHeadroomUsd ?? null;
+    const sizedHeadroom = served?.fleetSizedHeadroomUsd ?? null;
+    const basis = served?.fleetCapitalCeilingBasis ?? null;
+    // A pre-TRA-3881 build publishes the fitted pair unconditionally. When the
+    // rows say the TRA-3879 bound WAS in force, a negative fitted headroom on
+    // such a build is the known artifact — not a finding, and explicitly not an
+    // escalation. Naming it here is what stops the next reader from paging on it.
+    const staleFittedCeiling =
+      basis === null
+      && typeof fittedHeadroom === 'number'
+      && fittedHeadroom < 0
+      && out.boundInForce.inForce === true;
+    return {
+      fleetCapitalUsd: served?.fleetCapitalUsd ?? null,
+      // ⭐ READ THIS FIRST. Present ⇒ TRA-3881 bytes; the server itself says
+      // whether the fitted pair below means anything on this reading.
+      ceilingBasis: basis,
+      fittedCeilingUsd: fitted,
+      fittedHeadroomUsd: fittedHeadroom,
+      // The bound TRA-3879 actually installed: `φ_eff · Σ E_i` against `A`.
+      sizedMaxSumUsd: served?.fleetSizedMaxSumUsd ?? null,
+      sizedHeadroomUsd: sizedHeadroom,
+      governing:
+        basis === null
+          ? 'UNKNOWN — pre-TRA-3881 bytes publish no ceiling basis'
+          : fitted === null
+            ? 'φ_eff · Σ E_i ≤ A (the TRA-3879 bound); the fitted A/φ precondition is withheld and does NOT apply here'
+            : 'Σ E_i ≤ A/φ (the fitted precondition) — the server says it still governs this reading',
+      staleFittedCeiling,
+      ...(staleFittedCeiling
+        ? {
+          doNotEscalate:
+            `⚠ fleetCapitalHeadroomUsd $${fittedHeadroom.toFixed(2)} is NEGATIVE on a build that predates `
+            + 'TRA-3881, while the TRA-3879 bound IS in force on these rows. That is the KNOWN STALE-φ '
+            + 'artifact (A/φ against a φ that no longer sizes anything), NOT a fleet over its limit. Do '
+            + 'not escalate on this field; read sizedHeadroomUsd, or the verdict.',
+        }
+        : {}),
+    };
+  })();
+
   // UNBOUND only ever upgrades a CLEAN. It must NOT touch a BREACH: the overage
   // is already real and unconditional, and re-labelling a live fail-open with a
   // more procedural word is how a loud finding gets read as a caveat — the same

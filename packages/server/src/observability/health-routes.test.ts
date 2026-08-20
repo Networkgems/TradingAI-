@@ -6057,6 +6057,26 @@ describe('GET /api/health/live-options-fee-slippage — aggregate cap (TRA-3445)
       expect(g.sumBookCapUsd).toBeNull();
     });
 
+    // ─── TRA-3881 — the ROUTE carries the ceiling basis and the sized bound ───
+    // ⭐ The PRESENCE of these keys is the deployed-bytes proof the fix shipped
+    // (assert with `hasOwnProperty`; a build without it lacks them entirely).
+    // The `null`-vs-absent distinction is load-bearing here: `undefined` means
+    // "old bytes", `null` means "this build looked and withheld it on purpose".
+    it('TRA-3881 — publishes fleetCapitalCeilingBasis and the sized-bound pair on every verdict', () => {
+      const withRows = bound([row('admin', true, 750, 2000), row('v0nni', true, 194.32, 400)]) as unknown as Record<string, unknown>;
+      const blind = bound() as unknown as Record<string, unknown>;
+      for (const g of [withRows, blind]) {
+        for (const k of ['fleetCapitalCeilingBasis', 'fleetSizingReason', 'fleetRiskFractionEffective', 'fleetSizedMaxSumUsd', 'fleetSizedHeadroomUsd']) {
+          expect(Object.prototype.hasOwnProperty.call(g, k)).toBe(true);
+        }
+      }
+      // These rows publish no TRA-3879 sizing block, so the fitted precondition
+      // is genuinely what bounds them — the ceiling stays lit and stays negative.
+      expect(withRows.fleetSizingReason).toBeNull();
+      expect(withRows.fleetCapitalCeilingUsd).toBe(1543.85);
+      expect(withRows.fleetCapitalCeilingBasis).toMatch(/pre-TRA-3879/);
+    });
+
     it('is graded from the SAME snapshot it publishes — the provider is read once', () => {
       // Two reads could serve a sum no row on this response supports. Also the
       // only thing that would catch the grade being computed off a second,

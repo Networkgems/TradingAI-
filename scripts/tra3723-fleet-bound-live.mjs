@@ -118,6 +118,17 @@ if (asJson) {
   const bifLabel = bif.inForce === true ? 'YES' : bif.inForce === false ? 'NO' : 'not published (pre-TRA-3879 build)';
   console.log(`  bound   in force: ${bifLabel}   [sizing: ${(bif.sizingReasons ?? []).map(r => r ?? 'absent').join(', ') || 'n/a'}]`);
   if (bif.inForce !== true) console.log(`          ${bif.reason}`);
+  // TRA-3881 — say WHICH capital instrument governs, and never print a stale
+  // negative headroom without the label that says it is stale. The old escalation
+  // checklist quoted `fleetCapitalHeadroomUsd` flat, and after TRA-3879 that field
+  // reads −$120.81 on a perfectly healthy fleet — on every reading, forever.
+  const fc = out.fleetCapital ?? {};
+  console.log(`  capital $${fc.fleetCapitalUsd ?? 'n/a'}   governing bound: ${fc.governing ?? 'n/a'}`);
+  console.log(
+    `          fitted A/phi: ceiling $${fc.fittedCeilingUsd ?? 'withheld'} headroom $${fc.fittedHeadroomUsd ?? 'withheld'}`
+    + `   |   sized phi_eff*SumE: max SumB $${fc.sizedMaxSumUsd ?? 'n/a'} headroom $${fc.sizedHeadroomUsd ?? 'n/a'}`,
+  );
+  if (fc.doNotEscalate) console.log(`          ${fc.doNotEscalate}`);
   if (out.partial) console.log(`  ${out.partial}`);
 }
 process.exit(code);

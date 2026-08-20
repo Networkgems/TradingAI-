@@ -1269,10 +1269,25 @@ export interface LiveOtmFleetBoundRow {
    * mode-based sum overstates the fleet by a whole book (TRA-3445).
    */
   liveEntryGateOpen: boolean;
-  /** `B_i = min(φ · availableCashUsd, A)` as the order site would resolve it. */
+  /** `B_i = min(φ_eff · availableCashUsd, A)` as the order site would resolve it. */
   capUsd: number;
   /** `E_i` — the sizing basis. `null` ⇒ no usable snapshot ⇒ `capUsd` is 0. */
   availableCashUsd: number | null;
+  /**
+   * TRA-3881 — the TRA-3879 sizing block, as `getLiveOtmAggregateExposure`
+   * already publishes it on the very same rows.
+   *
+   * OPTIONAL because ABSENCE IS A REAL READING, not a gap to be defaulted away:
+   * a row without these fields came from pre-TRA-3879 bytes, where the fitted
+   * precondition `Σ E_i ≤ A/φ` genuinely IS what holds the sum down. Defaulting
+   * them to a post-fix value would make an old build grade like a new one — the
+   * direction that costs money.
+   */
+  fleetRiskFractionEffective?: number;
+  /** `Σ E_i` THIS row's engine derived `φ_eff` from. `null` ⇒ its fleet read was unusable. */
+  fleetCapitalUsd?: number | null;
+  /** WHY this row's `φ_eff` is what it is. Evidence for the ceiling gate below. */
+  fleetSizingReason?: LiveOtmFleetSizingReason;
 }
 
 /**
@@ -1309,10 +1324,57 @@ export interface LiveOtmFleetBoundGrade {
   roundingAllowanceUsd: number | null;
   /** `Σ E_i` over gate-open rows with a readable balance. */
   fleetCapitalUsd: number | null;
-  /** `A / φ` — the capital ceiling the scheme silently assumes. `null` ⇒ φ unusable. */
+  /**
+   * `A / φ` — the FITTED precondition: the capital above which a bound built on
+   * the CONFIGURED φ fails open.
+   *
+   * ⚠ TRA-3881 — this is `null` whenever that precondition is no longer what
+   * holds `Σ B_i` down. It is not a general-purpose disclosure; it is an
+   * instrument for one regime, and after TRA-3879 that regime is no longer the
+   * normal one. Publishing `A/φ` against a stale φ on a healthy fleet served a
+   * −$120.81 headroom beside its own `within` — and a permanent false alarm and
+   * a deleted alarm end in the same place. {@link fleetCapitalCeilingBasis}
+   * always says which it is; read that before reading these two.
+   */
   fleetCapitalCeilingUsd: number | null;
-  /** `ceiling − capital`; NEGATIVE means the precondition is already violated. */
+  /** `ceiling − capital`; NEGATIVE means the fitted precondition is already violated. */
   fleetCapitalHeadroomUsd: number | null;
+  /**
+   * TRA-3881 — WHY the two fields above are published or withheld, in words, for
+   * a reader who has only this object. Always a sentence, never `null`: "the
+   * field is absent" and "the field is absent FOR A REASON" must not look alike.
+   */
+  fleetCapitalCeilingBasis: string;
+  /**
+   * The `fleetSizingReason` the armed rows agree on, or `'mixed'` when they do
+   * not. `null` ⇒ the rows predate TRA-3879 and publish no sizing block at all.
+   *
+   * ⚠ EVIDENCE, NOT THE TEST — the arithmetic below is the test (TRA-3831: a
+   * ban-list of reason names is a list of names; an invariant is arithmetic).
+   */
+  fleetSizingReason: LiveOtmFleetSizingReason | 'mixed' | null;
+  /**
+   * TRA-3881 — `φ_eff`, the fraction the order site is ACTUALLY sizing on, taken
+   * as the LOOSEST (max) value across the armed rows. Loosest, not first or
+   * mean: `Σ B_i ≤ φ_eff · Σ E_i` only bounds the sum if it holds for the
+   * largest φ_eff any book is using, and a mean would let one book's stale
+   * fraction hide behind another's tight one.
+   */
+  fleetRiskFractionEffective: number | null;
+  /**
+   * `φ_eff · Σ E_i` — the LARGEST `Σ B_i` the sizing rule now in force can
+   * produce at this capital. THIS is the quantity that governs after TRA-3879,
+   * and it is the same arithmetic the TRA-3737 reader performs client-side.
+   */
+  fleetSizedMaxSumUsd: number | null;
+  /**
+   * `A − fleetSizedMaxSumUsd`. **This one MAY go negative, and a negative here
+   * is a real finding**: it means the fraction the books are sizing on does not
+   * deliver the authorization — the `fleet_capital_unreadable` fallback, or a
+   * fleet read that missed a book. That is the state the detector exists for,
+   * so this field is never suppressed.
+   */
+  fleetSizedHeadroomUsd: number | null;
   /** Gate-open books whose balance was unreadable — they contribute `B_i = 0`. */
   unreadableBalanceBooks: Array<string | null>;
 }
@@ -1331,8 +1393,19 @@ function blindGrade(reason: string, fleetCapUsd: number): LiveOtmFleetBoundGrade
     fleetCapitalUsd: null,
     fleetCapitalCeilingUsd: null,
     fleetCapitalHeadroomUsd: null,
+    fleetCapitalCeilingBasis:
+      'not computed — the grade is blind, so there is no capital column to state a precondition against',
+    fleetSizingReason: null,
+    fleetRiskFractionEffective: null,
+    fleetSizedMaxSumUsd: null,
+    fleetSizedHeadroomUsd: null,
     unreadableBalanceBooks: [],
   };
+}
+
+/** Cent-round, and normalise `-0` to `0` so a headroom of exactly zero reads as zero. */
+function usd(n: number): number {
+  return Math.round(n * 100) / 100 + 0;
 }
 
 /**
@@ -1346,9 +1419,25 @@ function blindGrade(reason: string, fleetCapUsd: number): LiveOtmFleetBoundGrade
  *      actually honour. A book whose balance is dark has `capUsd = 0` and can
  *      spend nothing, so the sum is exact even when the capital column is not.
  *      An unusable φ does NOT blind it.
- *   2. THE CAPITAL COLUMNS — `Σ E_i` against `A/φ`, the forward-looking
- *      precondition. These go `null` when they cannot be computed, and that
- *      never touches the verdict.
+ *   2. THE CAPITAL COLUMNS — the forward-looking precondition. These go `null`
+ *      when they cannot be computed, and that never touches the verdict.
+ *
+ * ⭐ TRA-3881 — THE SECOND COLUMN IS NOW TWO COLUMNS, because after TRA-3879
+ * there are two candidate bounds and only one of them is holding on any given
+ * reading:
+ *
+ *   • `fleetCapitalCeilingUsd` / `fleetCapitalHeadroomUsd` — `A/φ` vs `Σ E_i`,
+ *     the FITTED precondition. Published only in the states where it still
+ *     governs (`phi_configured`, `fleet_capital_unreadable`, pre-TRA-3879
+ *     rows), `null` otherwise, with `fleetCapitalCeilingBasis` always naming
+ *     which and why.
+ *   • `fleetSizedMaxSumUsd` / `fleetSizedHeadroomUsd` — `φ_eff · Σ E_i` vs `A`,
+ *     the bound TRA-3879 actually installed. Always published.
+ *
+ * The old pair kept firing on a fleet that was fine: `A/φ` against a stale φ
+ * served `−$120.81` beside its own `within` all through 2026-08-20. A detector
+ * whose supporting columns contradict its verdict gets muted, and a muted
+ * detector and no detector are the same object.
  *
  * Fails to `blind`, never to `within`: an unwired provider (`rows == null`), a
  * non-finite / non-positive `A`, or any gate-open row carrying a non-finite
@@ -1390,11 +1479,127 @@ export function gradeLiveOtmFleetBound(
     .map(r => r.book);
   const fleetCapitalUsd =
     readable.reduce((acc, r) => acc + cents(r.availableCashUsd as number), 0) / 100;
-  const fleetCapitalCeilingUsd = phi === null ? null : Math.round((fleetCapUsd / phi) * 100) / 100;
-  const fleetCapitalHeadroomUsd =
-    fleetCapitalCeilingUsd === null
+
+  // ------------------------------------------------------------------------
+  // TRA-3881 — WHICH BOUND IS ACTUALLY HOLDING THE SUM DOWN?
+  //
+  // `A/φ` and `A − φ_eff·Σ E_i` answer two different questions and only one of
+  // them governs on any given reading. Publishing both unconditionally made the
+  // detector's supporting columns contradict its own verdict: on 2026-08-20 a
+  // healthy post-TRA-3879 fleet served `within` beside `fleetCapitalHeadroomUsd
+  // −$120.81`, because `A/φ` describes a precondition TRA-3879 retired.
+  //
+  // ⚠ The remedy is NOT to recompute the ceiling from `φ_eff`. That pins the
+  // headroom to exactly $0.00 whenever the derived branch binds, which is
+  // arithmetically true and instrumentally worthless — a field that cannot
+  // move is not a reading.
+  // ------------------------------------------------------------------------
+  const sizingReasons = [...new Set(open.map(r => r.fleetSizingReason ?? null))];
+  const publishesSizingBlock = open.some(
+    r => typeof r.fleetRiskFractionEffective === 'number' && Number.isFinite(r.fleetRiskFractionEffective),
+  );
+  const fleetSizingReason: LiveOtmFleetSizingReason | 'mixed' | null =
+    !publishesSizingBlock || sizingReasons.length === 0
       ? null
-      : Math.round((fleetCapitalCeilingUsd - fleetCapitalUsd) * 100) / 100;
+      : sizingReasons.length === 1 && sizingReasons[0] !== null
+        ? sizingReasons[0]
+        : 'mixed';
+
+  // φ_eff taken at its LOOSEST across the arm: the sum is bounded only if the
+  // largest fraction any book is sizing on delivers the bound.
+  const phiEffs = open
+    .map(r => r.fleetRiskFractionEffective)
+    .filter((v): v is number => typeof v === 'number' && Number.isFinite(v) && v > 0);
+  const fleetRiskFractionEffective = phiEffs.length > 0 ? Math.max(...phiEffs) : phi;
+  // Σ E_i is taken from THIS route's own capital column, never from a row's
+  // self-reported `fleetCapitalUsd`: a fleet read that silently missed a book
+  // reports its own coverage honestly-but-wrongly, and the whole point of this
+  // number is to catch that. Cross-column, deliberately (TRA-3737 §2 item 2).
+  const fleetSizedMaxSumUsd =
+    fleetRiskFractionEffective === null ? null : usd(fleetRiskFractionEffective * fleetCapitalUsd);
+  const fleetSizedHeadroomUsd =
+    fleetSizedMaxSumUsd === null ? null : usd(fleetCapUsd - fleetSizedMaxSumUsd);
+
+  // Does the FITTED precondition still govern? Publish the pair when it does,
+  // `null` when it does not — never a stale number. Precedence is deliberate:
+  // the states that keep the evidence win over the state that suppresses it.
+  const fleetReadUnusable = open.some(
+    r =>
+      r.fleetSizingReason === 'fleet_capital_unreadable'
+      || (r.fleetSizingReason !== undefined
+        && (typeof r.fleetCapitalUsd !== 'number' || !Number.isFinite(r.fleetCapitalUsd))),
+  );
+  // ⭐ THE SUPPRESSION IS ARITHMETIC-GATED, NOT NAME-GATED (TRA-3831/TRA-3737 §2).
+  // A row that CLAIMS `phi_fleet_derived` while its φ_eff does not actually
+  // deliver `φ_eff · Σ E_i ≤ A` has not installed the new bound, so retiring the
+  // old instrument on the strength of the label alone would blind the detector
+  // on exactly the reading that needs it. A reason name is a name; a bound is
+  // arithmetic. The claim must pay for itself before it buys the suppression.
+  const derivedBoundHolds =
+    fleetSizedMaxSumUsd !== null && cents(fleetSizedMaxSumUsd) <= cents(fleetCapUsd);
+  const allDerived =
+    publishesSizingBlock
+    && open.length > 0
+    && open.every(r => r.fleetSizingReason === 'phi_fleet_derived')
+    && derivedBoundHolds;
+
+  let ceilingApplies: boolean;
+  let fleetCapitalCeilingBasis: string;
+  if (phi === null) {
+    ceilingApplies = false;
+    fleetCapitalCeilingBasis =
+      'withheld — φ is unusable, so A/φ is not computable. This is not a statement about the fleet.';
+  } else if (!publishesSizingBlock) {
+    // AC2's other half: on pre-TRA-3879 bytes the fitted precondition is the
+    // ONLY thing standing between `Σ B_i` and the authorization. Retiring the
+    // instrument for that build would delete the TRA-3723 finding itself.
+    ceilingApplies = true;
+    fleetCapitalCeilingBasis =
+      'IN FORCE — these rows publish no TRA-3879 sizing block (pre-TRA-3879 bytes), so Σ B_i is held '
+      + 'down by the fitted precondition Σ E_i ≤ A/φ and NOTHING ELSE. A negative headroom here is the '
+      + 'TRA-3723 fail-open.';
+  } else if (fleetReadUnusable) {
+    // AC3. The one state where `Σ B_i` is unbounded again — and therefore the
+    // one state where this pair must keep its teeth. Blinding the detector here
+    // would be worse than the wrong sign: it removes the evidence too.
+    ceilingApplies = true;
+    fleetCapitalCeilingBasis =
+      'IN FORCE — at least one armed book sized with an UNUSABLE fleet read (fleet_capital_unreadable), '
+      + 'so it fell back to the pre-TRA-3879 per-book bound min(φ·E_i, A) and the SUM is bounded only by '
+      + 'the fitted precondition again. A negative headroom here is real.';
+  } else if (allDerived) {
+    // AC1. `φ_eff = A/Σ E_i` binds on every armed book, so `Σ B_i ≤ A` holds at
+    // ANY `Σ E_i` the fleet read can see. `A/φ` describes a precondition that
+    // no longer governs, and a number that no longer governs is not a caveat —
+    // it is a false alarm with a dollar sign in front of it.
+    ceilingApplies = false;
+    fleetCapitalCeilingBasis =
+      'withheld — every armed book is sizing on φ_eff = A/Σ E_i (phi_fleet_derived), so Σ B_i ≤ A holds '
+      + 'at ANY fleet capital and the fitted precondition Σ E_i ≤ A/φ no longer governs. Read '
+      + 'fleetSizedMaxSumUsd / fleetSizedHeadroomUsd instead — that is the bound in force (TRA-3881).';
+  } else if (!derivedBoundHolds) {
+    // The rows claim a bound their own arithmetic does not deliver. Nothing
+    // structural is holding the sum, so the fitted precondition is the only
+    // instrument left and it stays lit.
+    ceilingApplies = true;
+    fleetCapitalCeilingBasis =
+      `IN FORCE — the armed rows publish φ_eff ${fleetRiskFractionEffective ?? 'unreadable'}, but `
+      + `φ_eff × Σ E_i $${fleetCapitalUsd.toFixed(2)} = $${fleetSizedMaxSumUsd?.toFixed(2) ?? '?'} `
+      + `EXCEEDS A $${fleetCapUsd.toFixed(2)}, so the TRA-3879 bound is NOT delivering and Σ B_i is held `
+      + 'by the fitted precondition alone. Read fleetSizedHeadroomUsd — it is negative.';
+  } else {
+    // φ itself binds on at least one book and nothing is unreadable: the fitted
+    // precondition is genuinely what is holding that book's budget down.
+    ceilingApplies = true;
+    fleetCapitalCeilingBasis =
+      `IN FORCE — sizing reason ${fleetSizingReason ?? 'unknown'}: at least one armed book is sizing on `
+      + 'the CONFIGURED φ, so the fitted precondition Σ E_i ≤ A/φ is what bounds its budget. A negative '
+      + 'headroom here means φ has gone stale against live capital.';
+  }
+
+  const fleetCapitalCeilingUsd = ceilingApplies && phi !== null ? usd(fleetCapUsd / phi) : null;
+  const fleetCapitalHeadroomUsd =
+    fleetCapitalCeilingUsd === null ? null : usd(fleetCapitalCeilingUsd - fleetCapitalUsd);
 
   // The slack is a property of how precisely φ can be EXPRESSED, so it is
   // measured against the capital that produced the sum — never a flat dollar
@@ -1417,13 +1622,21 @@ export function gradeLiveOtmFleetBound(
       + `φ 4th-place slack — the disclosed rounding overage, not a capital fail-open`;
   } else {
     verdict = 'breach';
+    // ⚠ TRA-3881 — the diagnosis a breach carries has to name the bound that
+    // was ACTUALLY in force, or the remedy it points at is the wrong one. Under
+    // the derived branch a breach is NOT "φ is stale" (φ is not what sized it);
+    // it is the order site failing to honour a φ_eff the route can see.
     reason =
       `FLEET FAIL-OPEN: Σ B_i $${sumBookCapUsd.toFixed(2)} over ${open.length} armed book(s) `
-      + `exceeds the $${fleetCapUsd.toFixed(2)} authorization by $${overageUsd.toFixed(2)} `
-      + `(φ ${phi ?? 'unreadable'} is stale against fleet capital `
-      + `$${fleetCapitalUsd.toFixed(2)}; the precondition is Σ E_i ≤ `
-      + `$${fleetCapitalCeilingUsd?.toFixed(2) ?? '?'}). min(…, A) is PER BOOK and does not bound `
-      + `this sum — see TRA-3723`;
+      + `exceeds the $${fleetCapUsd.toFixed(2)} authorization by $${overageUsd.toFixed(2)}. `
+      + (ceilingApplies
+        ? `φ ${phi ?? 'unreadable'} is stale against fleet capital $${fleetCapitalUsd.toFixed(2)}; `
+          + `the precondition is Σ E_i ≤ $${fleetCapitalCeilingUsd?.toFixed(2) ?? '?'}. `
+          + 'min(…, A) is PER BOOK and does not bound this sum — see TRA-3723'
+        : `The TRA-3879 bound was sizing (φ_eff ${fleetRiskFractionEffective ?? 'unreadable'} × Σ E_i `
+          + `$${fleetCapitalUsd.toFixed(2)} = $${fleetSizedMaxSumUsd?.toFixed(2) ?? '?'} ≤ A), so this `
+          + 'sum should not be possible: the order site is NOT honouring the φ_eff this route publishes, '
+          + 'or a book sized against a different Σ E_i — see TRA-3881');
   }
 
   // ⚠ A pass computed one book short is not a pass over the whole arm. The
@@ -1454,6 +1667,11 @@ export function gradeLiveOtmFleetBound(
     fleetCapitalUsd,
     fleetCapitalCeilingUsd,
     fleetCapitalHeadroomUsd,
+    fleetCapitalCeilingBasis,
+    fleetSizingReason,
+    fleetRiskFractionEffective,
+    fleetSizedMaxSumUsd,
+    fleetSizedHeadroomUsd,
     unreadableBalanceBooks,
   };
 }
