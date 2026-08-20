@@ -64,6 +64,9 @@ const MONEY_BOOK: LiveStopActionabilityContext = {
   actOnAdoptedBrokerRows: true,
   holdLiveOptionsOvernightForPdt: true,
   swingHoldOptions: false,
+  // TRA-3902 — the shipped default window. MEASURED_AT is 22:41Z, hours past
+  // it, so nothing in this file re-attributes to `opening_range_hold`.
+  openingRangeGuardMin: 15,
   now: MEASURED_AT,
 };
 

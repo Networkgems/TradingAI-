@@ -82,6 +82,7 @@ describe('TRA-3892 positive control — the 2026-08-20 pair, BEFORE the breach',
       actOnAdoptedBrokerRows: false,
       holdLiveOptionsOvernightForPdt: true,
       swingHoldOptions: false,
+      openingRangeGuardMin: 15, // TRA-3902 — shipped default; NOON is outside the window
       now: NOON,
     });
     expect(act.breached).toBe(0);
@@ -96,6 +97,7 @@ describe('TRA-3892 positive control — the 2026-08-20 pair, BEFORE the breach',
       actOnAdoptedBrokerRows: false,
       holdLiveOptionsOvernightForPdt: true,
       swingHoldOptions: false,
+      openingRangeGuardMin: 15, // TRA-3902 — shipped default; NOON is outside the window
       now: POST_CLOSE,
     });
     expect(act).toMatchObject({ breached: 1, actionable: 0, inert: 1, byReason: { pdt_hold_today: 1 }, releasesAt: RELEASE_ISO });

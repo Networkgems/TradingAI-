@@ -536,3 +536,25 @@ export function resolveSwingTimeStopTradingDays(env: NodeJS.ProcessEnv = process
   }
   return OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT;
 }
+
+// TRA-3217 / TRA-3902 — the live OPENING-RANGE window, in minutes after the
+// 9:30 ET open. Inside it the engine refuses every exit it would otherwise fire
+// on a live row: the trail family since TRA-3217 (chandelier / premium trail /
+// profit-lock), and since TRA-3902 the hard premium stop as well. Default 15;
+// `0` disables. An absent/blank/garbage value means the DEFAULT, never 0 —
+// `Number('')` is 0, and a silently disabled window would read identically to
+// an armed one on every session that happens not to gap.
+//
+// One resolver, read per pass rather than cached at module load, so an env flip
+// on the box takes effect on restart without a code change — and so the three
+// consumers (`buildOptionExitRisk`, the `checkExits` hold, and the
+// `liveStopActionability` walk on the health route) cannot each parse it
+// differently and disagree about whether a stop is being held.
+export const OPTION_OPENING_RANGE_MIN_VALUE = 'OPTION_TRAIL_OPENING_RANGE_MIN';
+export const OPTION_OPENING_RANGE_MIN_DEFAULT = 15;
+
+export function resolveOptionOpeningRangeMin(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[OPTION_OPENING_RANGE_MIN_VALUE]?.trim();
+  const parsed = raw ? Number(raw) : Number.NaN;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : OPTION_OPENING_RANGE_MIN_DEFAULT;
+}

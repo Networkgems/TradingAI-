@@ -953,6 +953,14 @@ export interface LiveStopActionabilityContext {
   holdLiveOptionsOvernightForPdt: boolean;
   /** TRA-1136 — the resolved knob. */
   swingHoldOptions: boolean;
+  /**
+   * TRA-3902 — the live opening-range window in minutes (the value the exit
+   * pass hands `checkExits` as `openingRangeHoldMin`; `0` = no window).
+   * REQUIRED for the same reason `actOnAdoptedBrokerRows` is: an optional
+   * field defaulting to 0 would make every caller silently claim no stop is
+   * ever held at the open, which is the opposite of the shipped default.
+   */
+  openingRangeGuardMin: number;
   /** Evaluation instant. Defaults to `Date.now()`; injected by the controls. */
   now?: number;
 }
@@ -990,7 +998,14 @@ export type LiveStopInertReason =
   /** TRA-483 (`:5041`) — the PDT overnight hold. Has a known release. */
   | 'pdt_hold_today'
   /** TRA-495/TRA-1136 (`:5072`) — the swing hold. Has a known release. */
-  | 'swing_hold_today';
+  | 'swing_hold_today'
+  /**
+   * TRA-3902 — the live opening-range window (default 15 min after the 9:30
+   * ET open). Has a known release: the end of the window. Like the two holds
+   * above it is a DEFERRAL of a stop we intend to fire, and the stop is
+   * re-read against the live mark the moment the window closes.
+   */
+  | 'opening_range_hold';
 
 /** TRA-3822 — see {@link summarizeLiveStopActionability}. */
 export interface LiveStopActionabilitySummary {
@@ -1104,6 +1119,10 @@ export function summarizeLiveStopActionability(
 ): LiveStopActionabilitySummary {
   const now = ctx.now ?? Date.now();
   const nowKey = toDateKey(now);
+  // TRA-3902 — resolved once per call, exactly as `checkExits` resolves it once
+  // per pass. `null` when the window is off (0) or the ET calendar math fails,
+  // and `null` never reads as "inside".
+  const openingRangeMins = ctx.openingRangeGuardMin > 0 ? minutesSinceRthOpen(now) : null;
   const byReason: Partial<Record<LiveStopInertReason, number>> = {};
   let breached = 0;
   let actionable = 0;
@@ -1157,6 +1176,11 @@ export function summarizeLiveStopActionability(
       // `swingHeldToday` at `:4823` is `(positionIsLive || swingHoldOptions)`,
       // and every row here is already live — so the knob cannot un-latch it.
       reason = 'swing_hold_today';
+    } else if (openingRangeMins !== null && openingRangeMins < ctx.openingRangeGuardMin) {
+      // TRA-3902 — same predicate as `inOpeningRange` in `checkExits` (a
+      // pre-open tick, negative minutes, counts as inside), and the same
+      // position in the walk: it sits AT the SL branch, after every `continue`.
+      reason = 'opening_range_hold';
     }
 
     if (reason === null) {
@@ -1171,6 +1195,11 @@ export function summarizeLiveStopActionability(
     // UTC day rolls past the row's open date.
     if (reason === 'pdt_hold_today' || reason === 'swing_hold_today') {
       const release = nextUtcDayStart(opt.openedAt);
+      if (earliestRelease === null || release < earliestRelease) earliestRelease = release;
+      if (latestRelease === null || release > latestRelease) latestRelease = release;
+    } else if (reason === 'opening_range_hold') {
+      // TRA-3902 — releases when the window closes: now + (window − elapsed).
+      const release = now + (ctx.openingRangeGuardMin - (openingRangeMins as number)) * 60_000;
       if (earliestRelease === null || release < earliestRelease) earliestRelease = release;
       if (latestRelease === null || release > latestRelease) latestRelease = release;
     } else {
@@ -2614,6 +2643,8 @@ export class PaperOptionsAccount {
    * the guard engaged rather than never ran.
    */
   private chandelierStaleBreachVetoes = 0;
+  /** TRA-3902 — since-boot count of hard stops HELD inside the live opening-range window (one per row per window). */
+  private slOpeningRangeHolds = 0;
   /**
    * TRA-483 — overnight-hold gate for live positions opened today. Default
    * `true`: refuse to fire same-day TP1/SL/trail exits on live positions so
@@ -5542,7 +5573,17 @@ export class PaperOptionsAccount {
      * under this mode contains the staged intents, not closed positions —
      * callers should not push these into `closedOptions`.
      */
-    options: { waitAndHold?: boolean } = {},
+    options: {
+      waitAndHold?: boolean;
+      /**
+       * TRA-3902 — the live opening-range window in minutes after the 9:30 ET
+       * open, during which the HARD premium stop is held as well as the trail
+       * family. Folded (max) with `exitRisk.openingRangeGuardMin` so the window
+       * no longer depends on an ATR being available. `0`/absent ⇒ no hold from
+       * this field.
+       */
+      openingRangeHoldMin?: number;
+    } = {},
     /**
      * TRA-1025 (TRA-1023 item 4) — per-position {@link ExitState} for single-leg
      * RV options, keyed by `position.id`. When present and the position matches
@@ -5591,7 +5632,12 @@ export class PaperOptionsAccount {
     // an absent `openingRangeGuardMin`) disables the guard; a pre-open tick
     // (negative minutes) counts as inside it, because a trail fire before the
     // open would be strictly worse than one at the open.
-    const openingRangeGuardMin = exitRisk?.openingRangeGuardMin ?? 0;
+    // TRA-3902 — the same window now also holds the hard stop, and arrives on
+    // the options bag so it exists even when `exitRisk` does not.
+    const openingRangeGuardMin = Math.max(
+      exitRisk?.openingRangeGuardMin ?? 0,
+      options.openingRangeHoldMin ?? 0,
+    );
     const openingRangeMins = openingRangeGuardMin > 0 ? minutesSinceRthOpen(Date.now()) : null;
     const withinOpeningRange =
       openingRangeGuardMin > 0 && openingRangeMins !== null && openingRangeMins < openingRangeGuardMin;
@@ -6287,10 +6333,48 @@ export class PaperOptionsAccount {
         // rule reads the same way at both trigger sites and a future non-finite
         // value (a `null` from disk ToNumber-coerces to 0 in `mark <= null`
         // too) cannot quietly change which way this branch falls.
-        if (isArmedThreshold(opt.stopLossPremium) && mark <= opt.stopLossPremium) {
+        const slBreached = isArmedThreshold(opt.stopLossPremium) && mark <= opt.stopLossPremium;
+        if (!inOpeningRange && opt.slHeldInOpeningRange) {
+          // The window has closed for this row; the latch is consumed either
+          // way. If the stop is still through, the branch below fires it on
+          // this tick, with the hold's provenance on the journal row.
+          delete opt.slHeldInOpeningRange;
+          if (slBreached) exitJournalReason = 'sl_after_opening_range';
+        }
+        if (slBreached && inOpeningRange) {
+          // TRA-3902 — the hard stop is HELD inside the live opening-range
+          // window. TRA-3217 exempted it "by design", and the design sold the
+          // owner's positions into the open: 10 of the 12 live closes since
+          // 07-30 landed in 13:30–13:47Z, and the two most recent (08-18,
+          // 13:30Z and 13:45Z) were `sl` on hand-placed rows. The PDT hold
+          // releases at 00:00Z, so a stop breached on day 0 is re-read against
+          // the first opening print of day 1 — the widest, least informative
+          // quote of the session — and fires before the market has picked a
+          // direction. The board's directive is to hold through that print.
+          //
+          // This is a DEFERRAL, not a re-anchor: a premium stop is a level, and
+          // moving it would be lowering it. After the window the stop is read
+          // against the live mark exactly as before, and fires if still
+          // through. Latched once per window so the log and the counter say
+          // "held" once, not once per tick; the latch is persisted so a mid-
+          // window restart cannot launder the hold into a fire.
+          if (!opt.slHeldInOpeningRange) {
+            opt.slHeldInOpeningRange = true;
+            this.slOpeningRangeHolds += 1;
+            accountLog.warn('hard stop HELD inside the live opening-range window', {
+              issue: 'TRA-3902',
+              optionSymbol: opt.optionSymbol,
+              mode: opt.mode ?? 'demo',
+              mark,
+              stopLossPremium: opt.stopLossPremium,
+              minutesSinceOpen: openingRangeMins,
+              windowMin: openingRangeGuardMin,
+            });
+          }
+        } else if (slBreached) {
           exitPremium = opt.stopLossPremium;
           exitKind = 'sl';
-          exitJournalReason = 'sl';
+          exitJournalReason = exitJournalReason ?? 'sl';
         // TRA-3217 item 2 — the premium-space trail is gated by the live
         // opening-range window like the chandelier (the hard SL above is
         // exempt by design). Its ratchet does NOT get the re-anchor
@@ -7314,6 +7398,16 @@ export class PaperOptionsAccount {
   }
 
   /**
+   * TRA-3902 — how many times this process HELD a breached hard stop inside the
+   * live opening-range window (one per row per window). Since-boot, count only;
+   * the live read during the window itself is `liveStopActionability.byReason
+   * .opening_range_hold` on `/api/health/options-live`.
+   */
+  getSlOpeningRangeHolds(): number {
+    return this.slOpeningRangeHolds;
+  }
+
+  /**
    * TRA-323 — sync open option positions held in Tradier into this paper
    * account so the user can see and close them from TradeAI's Open Options
    * view. Used when a position was opened directly on Tradier (e.g. on the
@@ -8055,10 +8149,13 @@ export class PaperOptionsAccount {
    * re-deriving it anywhere else would invert the answer.
    */
   liveStopActionabilitySummary(
-    opts: { brokerMirroring: boolean; now?: number },
+    opts: { brokerMirroring: boolean; openingRangeGuardMin: number; now?: number },
   ): LiveStopActionabilitySummary {
     return summarizeLiveStopActionability(this.openOptions.values(), {
       brokerMirroring: opts.brokerMirroring,
+      // TRA-3902 — from the ENGINE, like `brokerMirroring`: the window is a
+      // per-pass argument to `checkExits` and the account does not hold it.
+      openingRangeGuardMin: opts.openingRangeGuardMin,
       autoManageImportedTradierOptions: this.autoManageImportedTradierOptions,
       // TRA-3829 — this account's RESOLVED arm, for the same reason the docblock
       // above gives for the other three terms: re-deriving it from the env here

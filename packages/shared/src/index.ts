@@ -3096,6 +3096,17 @@ export interface OptionPosition {
    */
   chandelierBreachedWhileSuppressed?: boolean;
   /**
+   * TRA-3902 — true once the HARD premium stop has been read as breached on a
+   * live row inside the opening-range window and deliberately not fired. Set
+   * once per window (so the log line and the since-boot counter say "held"
+   * once, not once per tick) and consumed on the first tick after the window
+   * closes, where the stop is re-read against the live mark and fires if still
+   * through — journalled as `sl_after_opening_range` so the books can tell a
+   * post-hold fire from a fresh intraday one. Persisted so a mid-window
+   * restart cannot launder the hold into a fire.
+   */
+  slHeldInOpeningRange?: boolean;
+  /**
    * TRA-3217 — provenance note for the chandelier trail, so a later
    * `chandelier` exit can say which trail actually fired (three mechanisms
    * shared one label before this):

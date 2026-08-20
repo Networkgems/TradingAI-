@@ -1400,7 +1400,11 @@ describe('PaperOptionsAccount.reconcileTradierPositions', () => {
         optionType: 'call',
         strike: 200,
         expiration: '2024-07-05',
-        contracts: 99,
+        // TRA-3890 — the SAME lot size. Tradier's `/positions` price is a blend
+        // across every contract on the symbol, so a mismatched lot (the old `99`
+        // here) now DECLINES the restatement as `quantity_mismatch` instead of
+        // writing a price nobody paid onto the engine's row.
+        contracts: beforeContracts,
         premiumPaid: 9.99,
       }),
     ]);
@@ -1411,8 +1415,8 @@ describe('PaperOptionsAccount.reconcileTradierPositions', () => {
     const survivor = acct.getState().openOptions.find(o => o.optionSymbol === 'AAPL240705C00200000');
     // Still engine-opened — correcting the basis does not turn it into an import.
     expect(survivor?.importedFromTradier).toBeFalsy();
-    // Quantity is still ours: the broker payload's 99 is ignored, because the
-    // partial-close bookkeeping owns `contracts`, not the reconcile.
+    // Quantity is still ours: the partial-close bookkeeping owns `contracts`,
+    // not the reconcile.
     expect(survivor?.contracts).toBe(beforeContracts);
     // ...but the cost basis is now broker truth, not the pre-trade mid.
     expect(survivor?.premiumPaid).toBeCloseTo(9.99, 6);
@@ -1652,7 +1656,11 @@ describe('PaperOptionsAccount reconcile — engine-origin risk schedule (TRA-282
     );
     expect(opened).not.toBeNull();
 
-    acct.reconcileTradierPositions([buildTslaImport({ premiumPaid: 0.30 })], 'live');
+    // TRA-3890 — matching lot, or the restatement is declined as `quantity_mismatch`.
+    acct.reconcileTradierPositions(
+      [buildTslaImport({ premiumPaid: 0.30, contracts: opened!.contracts })],
+      'live',
+    );
 
     const opt = acct.getState().openOptions[0]!;
     expect(opt.signalType).toBe('otm_mispricing');
@@ -4020,18 +4028,117 @@ describe('TRA-3217 — stale-breach veto + opening-range window', () => {
     expect(closed[0].exitReason).toBe('chandelier_restarted');
   });
 
-  it('the opening-range window does NOT hold the hard premium stop', () => {
+  // TRA-3902 — this test used to pin the OPPOSITE ("the opening-range window
+  // does NOT hold the hard premium stop"). That exemption is what sold the
+  // owner's positions into the open after TRA-3217 had fixed the trail: 10 of
+  // the 12 live closes since 07-30 landed in 13:30–13:47Z, the two most recent
+  // (08-18) as `sl` at 13:30Z and 13:45Z. The board's directive is to hold.
+  it('TRA-3902 — the opening-range window HOLDS the hard premium stop on a live row, then re-reads it after the window', () => {
+    const { acct, row } = liveAccount();
+    const sym = acct.getState().openOptions[0].optionSymbol!;
+    const tickAt = (mark: number) => acct.checkExits(
+      new Map([['AAPL', 200]]), new Map([[sym, mark]]), 'live', {}, undefined, RISK_GUARDED,
+    );
+
+    // Day 1, open + 5 min: mark crashes through the SL (0.80). Held — and
+    // latched ONCE, so a second in-window tick does not count twice.
+    vi.setSystemTime(D1_OPEN + 5 * 60_000);
+    expect(tickAt(0.75)).toHaveLength(0);
+    expect(row().slHeldInOpeningRange).toBe(true);
+    expect(acct.getSlOpeningRangeHolds()).toBe(1);
+    vi.setSystemTime(D1_OPEN + 10 * 60_000);
+    expect(tickAt(0.70)).toHaveLength(0);
+    expect(acct.getSlOpeningRangeHolds()).toBe(1);
+
+    // Open + 15 min exactly = the window has closed. Still through the stop ⇒
+    // it fires on this tick, at the STOP level (a deferral, not a re-anchor),
+    // journalled with the hold's provenance.
+    vi.setSystemTime(D1_OPEN + 15 * 60_000);
+    const closed = tickAt(0.75);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].exitReason).toBe('sl_after_opening_range');
+    expect(closed[0].currentPremium).toBeCloseTo(0.80, 6);
+    expect(closed[0].slHeldInOpeningRange).toBeUndefined();
+  });
+
+  it('TRA-3902 — a breach that heals inside the window does NOT fire after it, and a fresh mid-session breach is a plain `sl`', () => {
+    const { acct, row } = liveAccount();
+    const sym = acct.getState().openOptions[0].optionSymbol!;
+    const tickAt = (mark: number) => acct.checkExits(
+      new Map([['AAPL', 200]]), new Map([[sym, mark]]), 'live', {}, undefined, RISK_GUARDED,
+    );
+
+    vi.setSystemTime(D1_OPEN + 2 * 60_000);
+    expect(tickAt(0.75)).toHaveLength(0);
+    // The opening print was noise: the mark is back above the stop when the
+    // window closes. Nothing fires; the latch is consumed.
+    vi.setSystemTime(D1_OPEN + 20 * 60_000);
+    expect(tickAt(0.95)).toHaveLength(0);
+    expect(row().slHeldInOpeningRange).toBeUndefined();
+    // A real mid-session break is the ordinary stop, with the ordinary label.
+    vi.setSystemTime(D1_OPEN + 120 * 60_000);
+    const closed = tickAt(0.78);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].exitReason).toBe('sl');
+  });
+
+  it('TRA-3902 — the hold rides the options bag, so it holds even when no `exitRisk` (no ATR) is available', () => {
     const { acct } = liveAccount();
     const sym = acct.getState().openOptions[0].optionSymbol!;
+    // Both books open on day 0 (so the PDT hold has released by day 1).
+    const control = liveAccount();
+    const controlSym = control.acct.getState().openOptions[0].optionSymbol!;
+    vi.setSystemTime(D1_OPEN + 5 * 60_000);
+    const held = acct.checkExits(
+      new Map([['AAPL', 200]]), new Map([[sym, 0.75]]), 'live', { openingRangeHoldMin: 15 },
+    );
+    expect(held).toHaveLength(0);
+    // Negative control — window off on the sibling book: the same tick fires
+    // the stop at the open, exactly as every build before this one did.
+    const fired = control.acct.checkExits(
+      new Map([['AAPL', 200]]), new Map([[controlSym, 0.75]]), 'live', { openingRangeHoldMin: 0 },
+    );
+    expect(fired).toHaveLength(1);
+    expect(fired[0].exitReason).toBe('sl');
+  });
 
-    // Day 1 inside the window, mark crashes through the SL (0.80) — a real
-    // stop keeps its semantics; only trail-family exits wait out the window.
+  it('TRA-3902 — the hard-stop hold is live-only: a demo row still stops out at the open', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo');
     vi.setSystemTime(D1_OPEN + 5 * 60_000);
     const closed = acct.checkExits(
-      new Map([['AAPL', 200]]), new Map([[sym, 0.75]]), 'live', {}, undefined, RISK_GUARDED,
+      new Map([['AAPL', 200]]), new Map([[pos!.optionSymbol!, 0.75]]), 'demo',
+      { openingRangeHoldMin: 15 }, undefined, RISK_GUARDED,
     );
     expect(closed).toHaveLength(1);
     expect(closed[0].exitReason).toBe('sl');
+  });
+
+  it('TRA-3902 — the health route names the hold and its release, with the same predicate', () => {
+    const { acct } = liveAccount();
+    const sym = acct.getState().openOptions[0].optionSymbol!;
+    vi.setSystemTime(D1_OPEN + 5 * 60_000);
+    acct.checkExits(new Map([['AAPL', 200]]), new Map([[sym, 0.75]]), 'live', { openingRangeHoldMin: 15 });
+    // Inside the window: inert, reason named, releases at open + 15.
+    const inWindow = acct.liveStopActionabilitySummary({
+      brokerMirroring: true, openingRangeGuardMin: 15, now: D1_OPEN + 5 * 60_000,
+    });
+    expect(inWindow.breached).toBe(1);
+    expect(inWindow.inert).toBe(1);
+    expect(inWindow.byReason).toEqual({ opening_range_hold: 1 });
+    expect(inWindow.releasesAt).toBe(new Date(D1_OPEN + 15 * 60_000).toISOString());
+    expect(inWindow.indefinite).toBe(0);
+    // After the window: the same row is ACTIONABLE.
+    const after = acct.liveStopActionabilitySummary({
+      brokerMirroring: true, openingRangeGuardMin: 15, now: D1_OPEN + 16 * 60_000,
+    });
+    expect(after.actionable).toBe(1);
+    expect(after.inert).toBe(0);
+    // Window off: never inert for this reason, even at the open.
+    const off = acct.liveStopActionabilitySummary({
+      brokerMirroring: true, openingRangeGuardMin: 0, now: D1_OPEN + 5 * 60_000,
+    });
+    expect(off.actionable).toBe(1);
   });
 
   it('the window is live-only: a demo row still exits at the open', () => {

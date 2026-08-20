@@ -164,7 +164,7 @@ import {
 } from './wheel-iv-entry-filter.js';
 import { recordWheelBookSnapshot } from './wheel-promotion-gate-store.js';
 import type { WheelBookPosition } from './wheel-vol-stress-harness.js';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, resolveOptionOpeningRangeMin, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
 // TRA-3401 — nominate an OTM strike inside the band the cost bar can admit.
 import { selectAdmissibleOtmCandidate, isOtmAdmissibleStrikeEnabled, resolveAdmissibleBand } from './otm-admissible-strike.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
@@ -2860,13 +2860,10 @@ export class SignalEngine {
     // exempt). Default 15 minutes after the 9:30 ET open; `0` disables. Read
     // per-build rather than cached at module load so an env flip on the box
     // takes effect on restart without a code change.
-    // An absent/blank/garbage env var means the DEFAULT (15), never 0 —
-    // `Number('')` is 0, and a silently disabled guard would read identically
-    // to an armed one on every session that happens not to gap.
-    const rawOpeningRange = process.env.OPTION_TRAIL_OPENING_RANGE_MIN?.trim();
-    const parsedOpeningRange = rawOpeningRange ? Number(rawOpeningRange) : Number.NaN;
-    const openingRangeGuardMin =
-      Number.isFinite(parsedOpeningRange) && parsedOpeningRange >= 0 ? parsedOpeningRange : 15;
+    // TRA-3902 — parsed by the one shared resolver (absent/blank/garbage ⇒ the
+    // default 15, never 0) so this, the hard-stop hold and the health route's
+    // `liveStopActionability` walk all read the same window.
+    const openingRangeGuardMin = resolveOptionOpeningRangeMin();
     return { underlyingAtrBySymbol, underlyingAtrPctBySymbol, takeProfitEarlyCaptureFrac, openingRangeGuardMin };
   }
 
@@ -5591,7 +5588,10 @@ export class SignalEngine {
           prices,
           optionMarks,
           this.mode,
-          { waitAndHold: liveOptionsMirroring },
+          // TRA-3902 — the opening-range hold on the hard stop rides the options
+          // bag rather than `optionExitRisk`, which is absent whenever no
+          // underlying has 15 cached bars; the hold must not depend on an ATR.
+          { waitAndHold: liveOptionsMirroring, openingRangeHoldMin: resolveOptionOpeningRangeMin() },
           rvStructuralExitStates,
           optionExitRisk,
           rvExitParams,
@@ -8755,6 +8755,8 @@ export class SignalEngine {
     return this.optionsAccount.liveStopActionabilitySummary({
       brokerMirroring:
         this.mode === 'live' && this.tradierLiveOptionsEnabled && this.tradierLiveClient !== null,
+      // TRA-3902 — the same resolver the exit pass hands `checkExits`.
+      openingRangeGuardMin: resolveOptionOpeningRangeMin(),
       ...(now === undefined ? {} : { now }),
     });
   }

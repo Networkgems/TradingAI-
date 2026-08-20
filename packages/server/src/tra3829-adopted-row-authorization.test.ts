@@ -277,6 +277,9 @@ describe('TRA-3829 ARM C — a row adopted by the OLD build keeps its armed stop
       actOnAdoptedBrokerRows: false,
       holdLiveOptionsOvernightForPdt: false,
       swingHoldOptions: false,
+      // TRA-3902 — window off: this call reads the wall clock, and a run that
+      // happens to land inside 13:30–13:45Z must not re-attribute the gate.
+      openingRangeGuardMin: 0,
     });
     expect(s.breached).toBe(2);
     expect(s.actionable).toBe(0);
