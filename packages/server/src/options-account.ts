@@ -2546,6 +2546,20 @@ export class PaperOptionsAccount {
    */
   private engineBasisRestatedTotal = 0;
   /**
+   * TRA-3896 — repairs applied by `repairEngineBasisFromRecordedFill`, counted
+   * SEPARATELY from {@link engineBasisRestatedTotal}.
+   *
+   * They must not share a counter. `candidates` counts rows the RECONCILE
+   * matched, and the repair route is not a reconcile — so folding a repair into
+   * `restated` produced a census that contradicted itself on the live box
+   * within minutes of shipping: `candidates: 4`, `skips.quantity_mismatch: 4`,
+   * `restated: 1`. Every candidate declined, and yet one restatement. A reader
+   * subtracting to find "how many did the sweep actually move" gets 0 from one
+   * line and 1 from the next, and the honest answer — the sweep moved none, an
+   * out-of-band repair moved one — was not written down anywhere.
+   */
+  private engineBasisRepairedTotal = 0;
+  /**
    * TRA-1976 — equity shares taken on when a cash-secured put is assigned, keyed
    * by lot id. This is the equity inventory the TRA-1966 primitive deferred; it
    * lets {@link settleCoveredWrite}'s `assigned` branch convert a short put into
@@ -7761,7 +7775,11 @@ export class PaperOptionsAccount {
   private finishEngineBasisRestatement(opt: OptionPosition): void {
     const rec = this.engineBasisRestatements[this.engineBasisRestatements.length - 1];
     if (!rec || rec.positionId !== opt.id) return;
-    this.engineBasisRestatedTotal += 1;
+    // TRA-3896 — the repair is not a reconcile, so it must not land in the
+    // sweep's numerator. See {@link engineBasisRepairedTotal} for the
+    // self-contradicting census that produced on the live box.
+    if (rec.source === 'recorded_fill_repair') this.engineBasisRepairedTotal += 1;
+    else this.engineBasisRestatedTotal += 1;
     const after = opt.premiumPaid;
     const ratioOf = (v: number): number => (after > 0 ? v / after : Number.NaN);
     rec.premiumPaidAfter = after;
@@ -7784,6 +7802,8 @@ export class PaperOptionsAccount {
   getEngineBasisRestatementCensus(): {
     candidates: number;
     restated: number;
+    /** TRA-3896 — out-of-band repairs. NOT part of `candidates` / `restated`. */
+    repaired: number;
     retained: number;
     retentionCap: number;
     skips: Record<EngineBasisSkipReason, number>;
@@ -7792,6 +7812,7 @@ export class PaperOptionsAccount {
     return {
       candidates: this.engineBasisCandidates,
       restated: this.engineBasisRestatedTotal,
+      repaired: this.engineBasisRepairedTotal,
       retained: this.engineBasisRestatements.length,
       retentionCap: ENGINE_BASIS_RESTATEMENT_LOG_CAP,
       skips: { ...this.engineBasisSkips },

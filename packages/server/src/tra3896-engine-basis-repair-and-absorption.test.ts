@@ -277,6 +277,27 @@ describe('TRA-3896 part 1 — repairEngineBasisFromRecordedFill', () => {
     expect(rec!.premiumPaidAfter).toBe(1.65);
   });
 
+  it('a repair does NOT land in the reconcile sweep\'s numerator', () => {
+    // Found on the live box within minutes of shipping: the census read
+    // `candidates: 4`, `skips.quantity_mismatch: 4`, `restated: 1` — every
+    // candidate declined, and yet one restatement. A reader subtracting to find
+    // "what did the sweep actually move" gets 0 from one line and 1 from the
+    // next. `candidates` counts rows the RECONCILE matched; the repair is not a
+    // reconcile, so it gets its own column.
+    recordEngineOpen(BAC, 1, 1.65);
+    const acct = liveAccount([pos()]);
+    expect(acct.repairEngineBasisFromRecordedFill(pos().id).status).toBe('repaired');
+
+    const census = acct.getEngineBasisRestatementCensus();
+    expect(census.repaired).toBe(1);
+    expect(census.restated).toBe(0);   // the sweep moved nothing
+    expect(census.candidates).toBe(0); // and matched nothing
+    // The record is still on the tape, and its `source` is the per-record form
+    // of the same split.
+    expect(census.retained).toBe(1);
+    expect(census.restatements[0]!.source).toBe('recorded_fill_repair');
+  });
+
   it('the DRY RUN writes nothing and reports the same levels the write installs', () => {
     recordEngineOpen(BAC, 1, 1.65);
     const acct = liveAccount([pos()]);

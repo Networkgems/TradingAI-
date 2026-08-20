@@ -14220,6 +14220,15 @@ app.get('/api/options/basis-restatements', requireAuth, async (req, res) => {
       window: 'process uptime — resets on restart',
       candidates: memory.candidates,
       restated: memory.restated,
+      // TRA-3896 — out-of-band repairs, OUTSIDE `candidates`/`restated`.
+      // `candidates` counts rows the RECONCILE matched; the repair route is not
+      // a reconcile. Folded together they published a census that contradicted
+      // itself on this host within minutes of shipping — `candidates: 4`,
+      // `skips.quantity_mismatch: 4`, `restated: 1`: every candidate declined,
+      // and yet one restatement. Read `restated` as "what the sweep moved" and
+      // this as "what a human ordered moved"; the durable log's `source` field
+      // is the per-record form of the same split.
+      repaired: memory.repaired,
       skips: memory.skips,
     },
     // Survives restarts. This is the tape gate A is graded against.
