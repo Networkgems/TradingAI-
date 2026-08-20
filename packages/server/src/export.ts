@@ -149,6 +149,22 @@ export interface ExportCoverage {
   note: string;
 }
 
+/**
+ * TRA-3874 — which filter parameters the REQUEST actually carried.
+ *
+ * Declared HERE rather than in `export-request.ts` (which owns the rules that
+ * produce it) for the same reason as the coverage types above: `ExportSummary`
+ * carries it on the wire, and `export-request.ts` reaches `export-history.ts`,
+ * which imports a VALUE from this module. Keeping the type here means the wire
+ * shape never depends on the direction of a runtime import.
+ */
+export interface ExportFiltersRequested {
+  modes: boolean;
+  markets: boolean;
+  from: boolean;
+  to: boolean;
+}
+
 /** TRA-3860 — row-provenance census, so a mixed export is legible. */
 export interface ExportSourceCounts {
   /** Rows from the live in-memory book (full premiums). */
@@ -177,6 +193,18 @@ export interface ExportSummary {
   coverage?: ExportCoverage;
   /** TRA-3860 — how many served rows came from the book vs the durable journal. */
   sources?: ExportSourceCounts;
+  /**
+   * TRA-3874 — which filter parameters the REQUEST carried, as booleans.
+   *
+   * `filters.modes: []` publishes the RESOLVED filter, in which empty means
+   * "every mode". That was ambiguous while an unrecognized token could be dropped
+   * into the same `[]`; it no longer can be (`export-request.ts` refuses it), but
+   * the echo alone still requires a reader to KNOW that rule before they can tell
+   * "I asked for nothing" from "something I asked for went missing". This block
+   * states it in the document they keep. Optional on the TYPE for the same reason
+   * as `coverage`: the pure `summarize()` never sees the query string.
+   */
+  filtersRequested?: ExportFiltersRequested;
 }
 
 export interface ExportDocument {

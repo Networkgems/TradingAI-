@@ -733,7 +733,6 @@ import {
   toCsv,
   type ExportFilters,
   type ExportFormat,
-  type ExportMarket,
   type ExportSummary,
   type ExportTradeRow,
 } from './export.js';
@@ -745,6 +744,14 @@ import {
   resolveExportCoverage,
   selectJournalExportRows,
 } from './export-history.js';
+// TRA-3874 — the strict filter parse that stops `/api/trades/export` from
+// widening `modes` / `markets` to EVERYTHING on a typo'd key or value.
+import {
+  checkConfusableExportKeys,
+  describeRequestedFilters,
+  parseExportMarkets,
+  parseExportModes,
+} from './export-request.js';
 import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
 import { applyTheoFloor, OTM_PANEL_THEO_FLOOR } from './otm-theo-floor.js';
 import { applyDeltaFloor, OTM_PANEL_DELTA_FLOOR } from './otm-delta-floor.js';
@@ -864,7 +871,6 @@ import {
   type StrategyPresetId,
   type Position,
   type OptionPosition,
-  type AccountMode,
   ALERT_CHANNELS,
   resolveAlertPreferences,
   REPORT_CADENCES,
@@ -9321,18 +9327,15 @@ async function mergeResearchAndNews(yahoo: NewsItem[]): Promise<NewsItem[]> {
 
 // ── Trade history export (TRA-564, parent TRA-410 §2.4 / B1) ─────────────────
 
-/** Parse a comma-separated, lower-cased, de-duped query list. */
-function parseCsvParam(raw: unknown): string[] {
-  if (typeof raw !== 'string' || !raw.trim()) return [];
-  return Array.from(
-    new Set(
-      raw
-        .split(',')
-        .map(s => s.trim().toLowerCase())
-        .filter(Boolean),
-    ),
-  );
-}
+// ⛔ TRA-3874 — `parseCsvParam()` lived here and was the whole defect. It returned
+// `[]` for ANY input it could not use (a non-string, a blank value, or — after the
+// caller's `.filter(isValid…)` — a token outside the accepted set), and `[]` is
+// what `applyFilters` reads as NO FILTER. So every way of mis-spelling a filter
+// widened the export to the full population, live real-money rows included, under
+// a 200 that was byte-indistinguishable from a filter that worked. Do not
+// reintroduce a "lenient CSV param" helper on this route: the parse now lives in
+// `export-request.ts` and REFUSES, and the only input allowed to mean "everything"
+// is an absent key.
 
 /**
  * Parse a `from`/`to` boundary as epoch-ms. Accepts an epoch-ms number, an ISO
@@ -9356,8 +9359,10 @@ function parseExportBoundary(raw: unknown, isEnd: boolean): number | undefined {
   return ms;
 }
 
-const VALID_MARKETS: ExportMarket[] = ['stocks', 'crypto', 'options'];
-const VALID_MODES: AccountMode[] = ['demo', 'live'];
+// TRA-3874 — the accepted sets moved to `ALL_EXPORT_MARKETS` / `ALL_EXPORT_MODES`
+// (`export-history.js`), which the strict parse and the refusal MESSAGE both read.
+// They used to be duplicated here, so a set that named the caller's options and a
+// set that validated them could drift apart silently.
 
 /** Union the per-env closed-options buckets from a stocks snapshot, de-duped by id. */
 function collectClosedOptions(snap: StocksTradeSnapshot | null): OptionPosition[] {
@@ -9414,12 +9419,33 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
       return;
     }
 
-    const markets = parseCsvParam(query['markets']).filter((m): m is ExportMarket =>
-      (VALID_MARKETS as string[]).includes(m),
-    );
-    const modes = parseCsvParam(query['modes']).filter((m): m is AccountMode =>
-      (VALID_MODES as string[]).includes(m),
-    );
+    // TRA-3874 — refuse a KEY that is confusable with a parameter that works
+    // (`mode`, `market`, `book`, `username`) before anything else looks at the
+    // query. Express cannot report a typo'd param, and an ignored `mode=demo`
+    // served two live real-money rows under a 200 that read exactly like a
+    // filter that worked.
+    const keyCheck = checkConfusableExportKeys(query);
+    if (!keyCheck.ok) {
+      res.status(400).json(keyCheck.refusal);
+      return;
+    }
+
+    // TRA-3874 — and refuse an unrecognized VALUE. The old parse dropped unknown
+    // tokens, leaving `[]`, which `applyFilters` reads as NO FILTER: `modes=bogus`
+    // widened to every mode. Only an ABSENT key may mean "everything" now.
+    const marketsParsed = parseExportMarkets(query['markets']);
+    if (!marketsParsed.ok) {
+      res.status(400).json(marketsParsed.refusal);
+      return;
+    }
+    const modesParsed = parseExportModes(query['modes']);
+    if (!modesParsed.ok) {
+      res.status(400).json(modesParsed.refusal);
+      return;
+    }
+    const markets = marketsParsed.values;
+    const modes = modesParsed.values;
+    const filtersRequested = describeRequestedFilters(query);
     const filters: ExportFilters = {
       markets,
       modes,
@@ -9499,6 +9525,7 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
       ...summary,
       coverage,
       sources: { book: rows.length - journalServed, journal: journalServed },
+      filtersRequested,
     };
 
     const stamp = new Date().toISOString().slice(0, 10);
