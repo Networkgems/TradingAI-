@@ -749,9 +749,12 @@ import {
 // widening `modes` / `markets` to EVERYTHING on a typo'd key or value.
 // TRA-3883 — …and the case-folded KEY check plus the strict `from`/`to` parse,
 // which are the two edges that parse was scoped short of.
+// TRA-3882 — …and the CSV form of that same "which filters were asked for"
+// statement, which until now existed only in the `format=json` envelope.
 import {
   checkExportQueryKeys,
   describeRequestedFilters,
+  filtersRequestedHeaderValue,
   parseExportBoundary,
   parseExportMarkets,
   parseExportModes,
@@ -9590,6 +9593,15 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
       // em-dash, and the first cut of this line made every CSV export — the
       // route's DEFAULT format — a 500 on live bqb1.
       res.setHeader('X-Export-Coverage', coverageHeaderValue(coverage));
+      // TRA-3882 — and the same for WHICH FILTERS WERE ASKED FOR. `?markets=
+      // options&modes=live` and `?markets=options` returned a byte-identical
+      // CSV header row, so once saved to disk two files answering materially
+      // different questions could not be told apart. This is the JSON path's
+      // `summary.filtersRequested`, rendered off the SAME `describeRequested
+      // Filters(query)` result computed above — never re-derived here, because
+      // a provenance line that can disagree with the filter it describes is
+      // worse than no provenance line.
+      res.setHeader('X-Export-Filters-Requested', filtersRequestedHeaderValue(filtersRequested));
       res.send(toCsv(rows));
     }
   } catch (err) {

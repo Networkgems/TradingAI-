@@ -11,6 +11,7 @@ import {
 import {
   checkExportQueryKeys,
   describeRequestedFilters,
+  filtersRequestedHeaderValue,
   parseExportBoundary,
   parseExportMarkets,
   parseExportModes,
@@ -111,19 +112,46 @@ function buildApp(): express.Express {
       to: toParsed.value,
     };
     const trades = applyFilters(POPULATION, filters);
-    res.status(200).json({
-      summary: { filters, filtersRequested: describeRequestedFilters(query), count: trades.length },
-      trades,
-      // Echoed so a failure names the shape Express actually delivered rather
-      // than leaving it to be re-derived by hand.
-      rawQueryShapes: {
-        modes: Array.isArray(query['modes']) ? 'array' : typeof query['modes'],
-        markets: Array.isArray(query['markets']) ? 'array' : typeof query['markets'],
-      },
-    });
+
+    // TRA-3882 — computed ONCE, exactly as `index.ts` does, and then rendered
+    // into whichever form the caller asked for. The suite below asserts the two
+    // forms agree; that assertion is only worth anything because there is a
+    // single call here for them to agree ABOUT.
+    const filtersRequested = describeRequestedFilters(query);
+
+    // The format branch, mirroring `index.ts` — including the DEFAULT. A stub in
+    // which JSON is the default cannot see this ticket's defect at all: the
+    // whole finding is that the format a human downloads without asking for it
+    // is the one that carried no provenance.
+    const format = String(query['format'] ?? 'csv').toLowerCase() === 'json' ? 'json' : 'csv';
+    if (format === 'json') {
+      res.status(200).json({
+        summary: { filters, filtersRequested, count: trades.length },
+        trades,
+        // Echoed so a failure names the shape Express actually delivered rather
+        // than leaving it to be re-derived by hand.
+        rawQueryShapes: {
+          modes: Array.isArray(query['modes']) ? 'array' : typeof query['modes'],
+          markets: Array.isArray(query['markets']) ? 'array' : typeof query['markets'],
+        },
+      });
+      return;
+    }
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('X-Export-Filters-Requested', filtersRequestedHeaderValue(filtersRequested));
+    res.status(200).send(
+      [CSV_COLUMNS.join(','), ...trades.map(t => CSV_COLUMNS.map(c => String(t[c])).join(','))].join('\n'),
+    );
   });
   return app;
 }
+
+/**
+ * The three columns the assertions below actually read. `toCsv()` itself is
+ * `export.ts`'s and is graded by its own suite; reproducing its full §2.3 column
+ * list here would make this file a second, drifting copy of that schema.
+ */
+const CSV_COLUMNS = ['symbol', 'market', 'mode'] as const;
 
 let server: Server;
 let base: string;
@@ -153,9 +181,26 @@ interface ExportResponse {
   accepted?: string[];
 }
 
+/**
+ * A JSON read. Since TRA-3882 gave this stub the route's real format branch,
+ * `format` is appended when the caller named none — a 200 with no `format` key
+ * is now CSV, as it is in production, and `res.json()` would throw on it.
+ *
+ * The refusal cases below are unaffected either way: every guard 400s with a
+ * JSON body regardless of the requested format, which is `index.ts`'s behaviour
+ * too. `format` is not one of the four FILTER keys, so adding it does not move
+ * `filters`, `filtersRequested`, or a single served row.
+ */
 async function get(qs: string): Promise<{ status: number; body: ExportResponse }> {
-  const res = await fetch(`${base}/api/trades/export?${qs}`);
+  const withFormat = /(^|&)format=/.test(qs) ? qs : `${qs}&format=json`;
+  const res = await fetch(`${base}/api/trades/export?${withFormat}`);
   return { status: res.status, body: (await res.json()) as ExportResponse };
+}
+
+/** A read of the route's DEFAULT format — the artifact a human downloads. */
+async function getCsv(qs: string): Promise<{ status: number; headers: Headers; text: string }> {
+  const res = await fetch(`${base}/api/trades/export?${qs}`);
+  return { status: res.status, headers: res.headers, text: await res.text() };
 }
 
 describe('TRA-3874 — the filing\'s measurement table, re-run on the wire', () => {
@@ -277,6 +322,93 @@ describe('TRA-3874 — what Express actually hands the route (measured, not assu
       const served: ExportTradeRow[] = status === 200 ? (body.trades ?? []) : [];
       expect(served.filter(t => t.mode === 'live'), qs).toEqual([]);
     }
+  });
+});
+
+describe('TRA-3882 — the CSV carries its own provenance, on the wire', () => {
+  it('THE DEFECT: the two requests that saved to indistinguishable files now differ', async () => {
+    // Measured on bqb1 `2e4654b142d4`: both 200 text/csv, both 2 data rows,
+    // BYTE-IDENTICAL header line. One asked for live; one asked for nothing.
+    const filtered = await getCsv('from=2026-08-18&to=2026-08-18&markets=options&modes=live');
+    const unfiltered = await getCsv('from=2026-08-18&to=2026-08-18&markets=options');
+    expect(filtered.status).toBe(200);
+    expect(unfiltered.status).toBe(200);
+
+    // The body is still byte-identical — that is deliberate, not a leftover.
+    // AC1 buys provenance without a comment row ahead of the column header,
+    // which would break naive spreadsheet and `pandas.read_csv` imports.
+    expect(filtered.text.split('\n')[0]).toBe(unfiltered.text.split('\n')[0]);
+    expect(filtered.text.startsWith('symbol,')).toBe(true);
+
+    // AC2 — and the saved documents are now distinguishable.
+    const asked = filtered.headers.get('x-export-filters-requested');
+    const notAsked = unfiltered.headers.get('x-export-filters-requested');
+    expect(asked).not.toBeNull();
+    expect(notAsked).not.toBeNull();
+    expect(asked).not.toBe(notAsked);
+    expect(JSON.parse(asked ?? '{}')).toEqual({ modes: true, markets: true, from: true, to: true });
+    expect(JSON.parse(notAsked ?? '{}')).toEqual({ modes: false, markets: true, from: true, to: true });
+  });
+
+  it('AC2 — the header and `summary.filtersRequested` agree, request for request', async () => {
+    for (const qs of [
+      'markets=options&modes=live',
+      'markets=options',
+      'from=2026-08-18&markets=options&modes=demo',
+      '',
+    ]) {
+      const csv = await getCsv(qs);
+      const json = await get(qs);
+      expect(csv.status, qs).toBe(200);
+      expect(json.status, qs).toBe(200);
+      expect(JSON.parse(csv.headers.get('x-export-filters-requested') ?? 'null'), qs)
+        .toEqual(json.body.summary?.filtersRequested);
+    }
+  });
+
+  it('AC1 — the header value is what the formatter produced, not a re-derivation', async () => {
+    const qs = 'markets=options&modes=live';
+    const { headers } = await getCsv(qs);
+    expect(headers.get('x-export-filters-requested')).toBe(
+      filtersRequestedHeaderValue({ modes: true, markets: true, from: false, to: false }),
+    );
+  });
+
+  it('AC3 — the JSON path is unchanged: no header, and the summary keeps its shape', async () => {
+    const res = await fetch(`${base}/api/trades/export?format=json&markets=options&modes=live`);
+    expect(res.status).toBe(200);
+    // The provenance header is the CSV form's substitute for a summary object.
+    // The JSON path already states it in the body; duplicating it there would be
+    // a second place for the two to disagree.
+    expect(res.headers.get('x-export-filters-requested')).toBeNull();
+    const body = (await res.json()) as ExportResponse;
+    expect(body.summary?.filtersRequested).toEqual({
+      modes: true,
+      markets: true,
+      from: false,
+      to: false,
+    });
+  });
+
+  it('AC4 — the TRA-3874 controls still hold on the CSV path the header now annotates', async () => {
+    // A provenance line is worthless if the work that added it broke the filter
+    // it describes. Same two controls as the parent, read off the DEFAULT format.
+    const live = await getCsv('markets=options&modes=live');
+    const liveRows = live.text.split('\n').slice(1).filter(Boolean);
+    expect(liveRows).toHaveLength(2);
+    expect(liveRows.every(r => r.endsWith(',live'))).toBe(true);
+    expect(JSON.parse(live.headers.get('x-export-filters-requested') ?? '{}').modes).toBe(true);
+
+    const demo = await getCsv('markets=options&modes=demo');
+    const demoRows = demo.text.split('\n').slice(1).filter(Boolean);
+    expect(demoRows.filter(r => r.endsWith(',live'))).toEqual([]);
+    expect(JSON.parse(demo.headers.get('x-export-filters-requested') ?? '{}').modes).toBe(true);
+  });
+
+  it('a refusal carries no provenance header — there is no document to annotate', async () => {
+    const { status, headers } = await getCsv('markets=options&mode=demo');
+    expect(status).toBe(400);
+    expect(headers.get('x-export-filters-requested')).toBeNull();
   });
 });
 

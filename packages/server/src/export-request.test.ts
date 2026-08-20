@@ -5,6 +5,7 @@ import {
   EXPORT_QUERY_PARAMETERS,
   checkExportQueryKeys,
   describeRequestedFilters,
+  filtersRequestedHeaderValue,
   parseExportBoundary,
   parseExportMarkets,
   parseExportModes,
@@ -266,6 +267,63 @@ describe('TRA-3874 §3 — the echo distinguishes "not asked" from "asked"', () 
     // say the caller asked.
     expect(applyFilters(POPULATION, filters)).toHaveLength(3);
     expect(describeRequestedFilters(q).modes).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-3882 — …and the CSV form of that echo, which is the format a human
+// actually downloads and the one that carried no record of the request at all.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('TRA-3882 — the CSV provenance header', () => {
+  it('renders the SAME shape the JSON path publishes, so the two can be diffed', () => {
+    const requested = describeRequestedFilters({ markets: 'options', modes: 'live' });
+    // Byte-for-byte the JSON summary's own serialisation of the same object.
+    // If the header ever needed a translation table, the two forms could drift
+    // and a reader would have no way to know which one was lying.
+    expect(filtersRequestedHeaderValue(requested)).toBe(JSON.stringify(requested));
+    expect(JSON.parse(filtersRequestedHeaderValue(requested))).toEqual({
+      modes: true,
+      markets: true,
+      from: false,
+      to: false,
+    });
+  });
+
+  it('THE DEFECT: the two requests that produced byte-identical CSVs now differ', () => {
+    // The filing's measurement, as a property. Both served the same 2 rows off
+    // bqb1 `2e4654b1` with an identical column header; only the URL — which the
+    // saved file does not carry — told them apart.
+    const filtered = filtersRequestedHeaderValue(
+      describeRequestedFilters({ from: '2026-08-18', to: '2026-08-18', markets: 'options', modes: 'live' }),
+    );
+    const unfiltered = filtersRequestedHeaderValue(
+      describeRequestedFilters({ from: '2026-08-18', to: '2026-08-18', markets: 'options' }),
+    );
+    expect(filtered).not.toBe(unfiltered);
+    expect(JSON.parse(filtered).modes).toBe(true);
+    expect(JSON.parse(unfiltered).modes).toBe(false);
+  });
+
+  it('is safe to hand `res.setHeader`: printable ASCII only, no line breaks', () => {
+    // The reason this goes through `asciiHeaderJson` rather than a bare
+    // `JSON.stringify`: TRA-3860's first cut of the sibling `X-Export-Coverage`
+    // header threw `ERR_INVALID_CHAR` on an em-dash and made every CSV export —
+    // the route's DEFAULT format — a 500 on live bqb1.
+    for (const q of [{}, { modes: 'live' }, { modes: 'live', markets: 'options', from: '0', to: '0' }]) {
+      const value = filtersRequestedHeaderValue(describeRequestedFilters(q));
+      expect(value, JSON.stringify(q)).toMatch(/^[\x20-\x7E]*$/);
+    }
+  });
+
+  it('cannot express an opinion the description does not hold', () => {
+    // AC2 as a type-level property, asserted at runtime: the formatter's ONLY
+    // input is the already-computed description, so there is no query in scope
+    // for it to re-derive presence from and no path by which the header and
+    // `summary.filtersRequested` can disagree.
+    const requested = describeRequestedFilters({ markets: 'options' });
+    const header = JSON.parse(filtersRequestedHeaderValue(requested));
+    expect(header).toEqual(requested);
   });
 });
 

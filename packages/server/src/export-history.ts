@@ -255,13 +255,30 @@ export function resolveExportCoverage(input: CoverageInput): ExportCoverage {
  */
 export function coverageHeaderValue(coverage: ExportCoverage): string {
   const { note: _note, ...floors } = coverage;
-  const json = JSON.stringify({
+  return asciiHeaderJson({
     ...floors,
     noteIn: 'summary.coverage.note of the JSON export (TRA-3860)',
   });
-  // `\uXXXX`-escape everything outside printable ASCII. JSON parses the escapes
-  // back to the identical string, so the value stays machine-readable.
-  return json.replace(/[^\x20-\x7E]/g, ch =>
+}
+
+/**
+ * JSON, `\uXXXX`-escaped down to printable ASCII, for a response HEADER value.
+ *
+ * Extracted from {@link coverageHeaderValue} for TRA-3882, which adds a second
+ * provenance header to the same CSV response. The escape is the part that must
+ * not be re-implemented: `res.setHeader` throws `ERR_INVALID_CHAR` on any
+ * character outside latin1, and that throw already turned every CSV export —
+ * the route's DEFAULT format — into a `500` on live bqb1 once. A second header
+ * hand-rolling `JSON.stringify` is that outage waiting for its first non-ASCII
+ * field. JSON parses the escapes back to the identical string, so the value
+ * stays machine-readable.
+ *
+ * ASCII, not latin1: `setHeader` would accept U+0080–U+00FF, but they are not
+ * safely round-trippable through every HTTP client's header decoding, and no
+ * value here needs them.
+ */
+export function asciiHeaderJson(value: unknown): string {
+  return JSON.stringify(value).replace(/[^\x20-\x7E]/g, ch =>
     `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`,
   );
 }

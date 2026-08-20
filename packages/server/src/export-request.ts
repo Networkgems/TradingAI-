@@ -1,6 +1,6 @@
 import type { AccountMode } from '@trading-app/shared';
 import type { ExportFiltersRequested, ExportMarket } from './export.js';
-import { ALL_EXPORT_MARKETS, ALL_EXPORT_MODES } from './export-history.js';
+import { ALL_EXPORT_MARKETS, ALL_EXPORT_MODES, asciiHeaderJson } from './export-history.js';
 
 export type { ExportFiltersRequested };
 
@@ -475,4 +475,40 @@ export function describeRequestedFilters(query: Record<string, unknown>): Export
     from: present('from'),
     to: present('to'),
   };
+}
+
+/**
+ * TRA-3882 — the same statement, on the `X-Export-Filters-Requested` header, so
+ * the CSV form of the export carries it too.
+ *
+ * CSV is the route's DEFAULT format and the artifact a human downloads to
+ * reconcile against a broker statement, and it had no record of what was asked
+ * for: `?markets=options&modes=live` and `?markets=options` came back with a
+ * byte-identical header row, so two CSVs answering materially different
+ * questions were indistinguishable once saved to disk. The value of an audit
+ * export is that the document states its own provenance; a reader should not
+ * have to remember, or trust, which URL produced the file in front of them.
+ *
+ * **A header, not a comment row.** The RFC-4180 body stays byte-identical, for
+ * the same reason `X-Export-Coverage` does: a `#`-comment line ahead of the
+ * column header breaks naive spreadsheet imports and `pandas.read_csv`, which
+ * would be a real regression traded for provenance.
+ *
+ * **It takes the DESCRIPTION, not the query.** The whole point of the header is
+ * that it agrees with `summary.filtersRequested`; a provenance line that can
+ * disagree with the filter it describes is worse than no provenance line. So
+ * this cannot re-derive presence — the route calls
+ * {@link describeRequestedFilters} once and both the JSON summary and this
+ * header are rendered from that one object. Passing the query here instead
+ * would reintroduce exactly the second opinion this is meant to foreclose.
+ *
+ * The shape is deliberately identical to `summary.filtersRequested` — same
+ * keys, same booleans — so the two forms can be compared byte for byte rather
+ * than through a translation nobody has written down. `false` is "the request
+ * did not carry this key", which after TRA-3874's strict parse is the ONLY way
+ * to reach the unfiltered population: a key present but unrecognized, and a
+ * value present but unrecognized, are both `400`s that never reach a response.
+ */
+export function filtersRequestedHeaderValue(requested: ExportFiltersRequested): string {
+  return asciiHeaderJson(requested);
 }
