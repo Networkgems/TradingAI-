@@ -234,7 +234,7 @@ export interface LiveEnforceRecord {
 
 /** TRA-3510 — the nominator branch + chain shape carried on an OTM verdict. */
 export interface LiveEnforceNominator {
-  /** `in_band` | `fallback_top_mispricing` | `legacy` | `none`. */
+  /** `in_band` | `in_band_fair` | `fallback_top_mispricing` (persisted pre-TRA-3856 rows only) | `legacy` | `none`. */
   selection: AdmissibleSelection;
   /** How many `cheap` candidates the scanned chain offered. */
   cheapConsidered: number;
@@ -260,13 +260,24 @@ export interface LiveEnforceNominator {
   strikesInBand?: number;
 }
 
-/** The selection values a persisted row may carry. Anything else is dropped on hydrate. */
-const SELECTIONS: readonly AdmissibleSelection[] = [
-  'in_band',
-  'fallback_top_mispricing',
-  'legacy',
-  'none',
-];
+/**
+ * The selection values a persisted row may carry. Anything else is dropped on
+ * hydrate — so this list being SHORT is the failure mode (TRA-3839's shape: a
+ * hand-written key list ships the next value ABSENT). The `Record` makes the
+ * compiler refuse a union member this list is missing. `fallback_top_mispricing`
+ * stays: no new row can carry it (TRA-3856 replaced the fallback with an
+ * abstention), but rows persisted before that deploy do.
+ */
+const SELECTION_SET: Record<AdmissibleSelection, true> = {
+  in_band: true,
+  in_band_fair: true,
+  fallback_top_mispricing: true,
+  abstain_no_in_band: true,
+  legacy: true,
+  none: true,
+};
+const SELECTIONS: readonly AdmissibleSelection[] =
+  Object.keys(SELECTION_SET) as AdmissibleSelection[];
 
 /**
  * TRA-3483 — one recorded decision's ingredients for the counterfactual sweep.
@@ -888,7 +899,7 @@ export interface LiveEnforceCellSummary {
  * cannot breach a floor at or below the band's `min` either.
  */
 export interface LiveEnforceSelectionSummary {
-  /** `in_band` | `fallback_top_mispricing` | `legacy` | `none`. */
+  /** `in_band` | `in_band_fair` | `fallback_top_mispricing` (persisted pre-TRA-3856 rows only) | `legacy` | `none`. */
   selection: string;
   evaluated: number;
   blocked: number;

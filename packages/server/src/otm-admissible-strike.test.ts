@@ -102,13 +102,58 @@ describe('selectAdmissibleOtmCandidate (TRA-3401)', () => {
     expect(got.selection).toBe('in_band');
   });
 
-  it('ignores non-cheap classifications on both paths', () => {
+  it('an in-band `cheap` outranks an in-band `expensive` that sorts higher', () => {
     const got = selectAdmissibleOtmCandidate(
       [cand(0.51, 'expensive'), cand(0.03), cand(0.52)],
       { enabled: true, band },
     );
     expect(got.candidate!.delta).toBe(0.52);
+    expect(got.selection).toBe('in_band');
     expect(got.cheapConsidered).toBe(2);
+  });
+
+  // ── TRA-3856: the band-first tiers ──────────────────────────────────────────
+
+  it('TIER 2: no `cheap` in band nominates the strongest `fair` in band', () => {
+    // The TRA-3859-measured live shape: every in-band strike classifies `fair`.
+    const got = selectAdmissibleOtmCandidate(
+      [cand(0.03), cand(0.52, 'fair'), cand(0.50, 'fair')],
+      { enabled: true, band },
+    );
+    expect(got.candidate!.delta).toBe(0.52); // rank order preserved within the tier
+    expect(got.selection).toBe('in_band_fair');
+    expect(got.cheapInBand).toBe(0);
+    expect(got.strikesInBand).toBe(2);
+  });
+
+  it('TIER 1 beats TIER 2 even when the fair strike is the stronger read', () => {
+    const got = selectAdmissibleOtmCandidate(
+      [cand(0.52, 'fair'), cand(0.50, 'cheap')],
+      { enabled: true, band },
+    );
+    expect(got.candidate!.delta).toBe(0.50);
+    expect(got.selection).toBe('in_band');
+  });
+
+  it('`expensive` is nominated under NO tier — an all-expensive band abstains', () => {
+    const got = selectAdmissibleOtmCandidate(
+      [cand(0.51, 'expensive'), cand(0.52, 'expensive')],
+      { enabled: true, band },
+    );
+    expect(got.candidate).toBeNull();
+    expect(got.selection).toBe('abstain_no_in_band');
+    expect(got.strikesInBand).toBe(2);
+  });
+
+  it('REGRESSION (TRA-3856): the old fallback chain now ABSTAINS instead of nominating the lottery tail', () => {
+    // Exactly the chain shape that produced 766/766 blocked over 08-05→08-19:
+    // cheap candidates exist, none in band. The old branch nominated cand(0.03).
+    const thin = [cand(0.03), cand(0.11)];
+    const got = selectAdmissibleOtmCandidate(thin, { enabled: true, band });
+    expect(got.candidate).toBeNull();
+    expect(got.selection).toBe('abstain_no_in_band');
+    expect(got.cheapConsidered).toBe(2);
+    expect(got.cheapInBand).toBe(0);
   });
 
   it('a non-finite delta fails the band (TRA-1407 predicate parity)', () => {
@@ -119,24 +164,26 @@ describe('selectAdmissibleOtmCandidate (TRA-3401)', () => {
     expect(got.candidate!.delta).toBe(0.51);
   });
 
-  // The safety property that makes arming this reversible: the flag can only ADD
-  // admissible nominations. It never suppresses a signal the legacy path emitted.
-  it('ARMED with nothing in band keeps the legacy nominee and SAYS so', () => {
+  // TRA-3856 — the reversibility story CHANGED, on purpose: armed, the selector
+  // may now SUPPRESS a nomination the legacy path would have emitted, because
+  // that nomination was a guaranteed downstream reject (far-OTM, |Δ| < 0.495 ⇒
+  // gross_negative). Disarming the flag still restores legacy byte-for-byte.
+  it('DISARMED is untouched by TRA-3856 — the same thin chain still yields the legacy nominee', () => {
     const thin = [cand(0.03), cand(0.11)];
-    const got = selectAdmissibleOtmCandidate(thin, { enabled: true, band });
+    const got = selectAdmissibleOtmCandidate(thin, { enabled: false, band });
     expect(got.candidate!.delta).toBe(0.03);
-    expect(got.candidate).toBe(selectAdmissibleOtmCandidate(thin, { enabled: false, band }).candidate);
-    expect(got.selection).toBe('fallback_top_mispricing');
-    expect(got.cheapInBand).toBe(0);
+    expect(got.selection).toBe('legacy');
   });
 
-  it('an empty / no-cheap chain reports `none`, not a silent drop', () => {
-    for (const c of [[], [cand(0.5, 'expensive')]]) {
-      const got = selectAdmissibleOtmCandidate(c, { enabled: true, band });
-      expect(got.candidate).toBeNull();
-      expect(got.selection).toBe('none');
-      expect(got.cheapConsidered).toBe(0);
-    }
+  it('an EMPTY chain reports `none` (market data), a surveyed band-empty chain abstains (band)', () => {
+    const empty = selectAdmissibleOtmCandidate([], { enabled: true, band });
+    expect(empty.candidate).toBeNull();
+    expect(empty.selection).toBe('none');
+    expect(empty.cheapConsidered).toBe(0);
+
+    const surveyed = selectAdmissibleOtmCandidate([cand(0.5, 'expensive')], { enabled: true, band });
+    expect(surveyed.candidate).toBeNull();
+    expect(surveyed.selection).toBe('abstain_no_in_band');
   });
 
   it('echoes the applied band so a verdict needs no re-derivation', () => {
@@ -145,31 +192,31 @@ describe('selectAdmissibleOtmCandidate (TRA-3401)', () => {
   });
 });
 
-// ── TRA-3619: the pre-cheapness band count ───────────────────────────────────
+// ── TRA-3619: the pre-classification band count ──────────────────────────────
 //
-// `cheapInBand: 0` on a `fallback_top_mispricing` row is JOINTLY caused, and the
-// two causes call for opposite actions:
+// `cheapInBand: 0` on an abstaining row is JOINTLY caused, and the two causes
+// call for opposite actions:
 //
 //   State A — the chain holds no strike in the band at all. The band edges are
-//             the question; re-ordering the screens cannot conjure a strike.
-//   State B — the chain holds in-band strikes and the cheapness screen (which
-//             runs FIRST, `otm-admissible-strike.ts` line ~165) discarded them
-//             before the band filter ever ran. The screen ORDER is the lever.
+//             the question; no selection policy can conjure a strike.
+//   State B — the chain holds in-band strikes and none was nominable (since
+//             TRA-3856 that means ALL of them classified `expensive`; before it,
+//             the cheapness screen ran first and dropped `fair` ones too).
 //
 // Every test below is a discrimination test: same `cheapInBand`, different world.
-describe('strikesInBand — the pre-cheapness band count (TRA-3619)', () => {
-  it('STATE B: an in-band strike the cheapness screen dropped is COUNTED', () => {
-    // 0.51 is inside [0.495, 0.55) but classified `expensive`, so the cheapness
-    // screen removes it upstream of the band filter. This is the live shape the
-    // issue's prior predicts: near-ATM contracts are expensive, "cheap" selects
-    // the far-OTM tail.
+describe('strikesInBand — the pre-classification band count (TRA-3619)', () => {
+  it('STATE B: an in-band strike no tier can nominate is still COUNTED', () => {
+    // 0.51 is inside [0.495, 0.55) but classified `expensive` — excluded from
+    // every tier. TRA-3856 note: the `fair` 0.52 that used to be dropped by the
+    // cheapness screen is now the TIER-2 nominee, so state B requires the whole
+    // band to be `expensive`.
     const got = selectAdmissibleOtmCandidate(
-      [cand(0.03), cand(0.51, 'expensive'), cand(0.52, 'fair')],
+      [cand(0.03), cand(0.51, 'expensive'), cand(0.62, 'fair')],
       { enabled: true, band },
     );
-    expect(got.selection).toBe('fallback_top_mispricing');
+    expect(got.selection).toBe('abstain_no_in_band');
     expect(got.cheapInBand).toBe(0);       // what the deployed surface shows...
-    expect(got.strikesInBand).toBe(2);     // ...and what it could not show.
+    expect(got.strikesInBand).toBe(1);     // ...and what it could not show.
     expect(got.strikesConsidered).toBe(3);
   });
 
@@ -178,7 +225,7 @@ describe('strikesInBand — the pre-cheapness band count (TRA-3619)', () => {
       [cand(0.03), cand(0.11, 'expensive'), cand(0.62, 'fair')],
       { enabled: true, band },
     );
-    expect(got.selection).toBe('fallback_top_mispricing');
+    expect(got.selection).toBe('abstain_no_in_band');
     expect(got.cheapInBand).toBe(0);
     expect(got.strikesInBand).toBe(0);
     expect(got.strikesConsidered).toBe(3);
@@ -217,13 +264,14 @@ describe('strikesInBand — the pre-cheapness band count (TRA-3619)', () => {
       { enabled: true, band },
     );
     expect(got.strikesInBand).toBe(2); // 0.495 and -0.52; 0.55 and NaN excluded
-    expect(got.selection).toBe('none'); // nothing `cheap` — and still counted
+    expect(got.selection).toBe('in_band_fair'); // TRA-3856 tier 2 nominates here
+    expect(got.candidate!.delta).toBe(0.495);
   });
 
-  it('a `none` chain still reports the shape, so a thin chain is not a silent zero', () => {
+  it('an abstaining chain still reports the shape, so a thin chain is not a silent zero', () => {
     const got = selectAdmissibleOtmCandidate([cand(0.51, 'expensive')], { enabled: true, band });
     expect(got.candidate).toBeNull();
-    expect(got.selection).toBe('none');
+    expect(got.selection).toBe('abstain_no_in_band');
     expect(got.cheapConsidered).toBe(0);
     expect(got.strikesConsidered).toBe(1);
     expect(got.strikesInBand).toBe(1);
@@ -241,19 +289,24 @@ describe('strikesInBand — the pre-cheapness band count (TRA-3619)', () => {
     expect(got.strikesConsidered).toBe(2);
   });
 
-  it('changes NO verdict — the nominee is identical with and without the count', () => {
-    // The recorder discipline, asserted rather than asserted-of: adding the count
-    // must not perturb selection or candidate on any branch.
+  it('the nominee is exactly the TRA-3856 tier rule — counts perturb nothing', () => {
+    // The recorder discipline, asserted rather than asserted-of: the counts must
+    // not perturb selection or candidate on any branch. The oracle is the tier
+    // rule itself: in-band cheap, else in-band fair, else null (never a
+    // far-OTM fallback).
     for (const c of [
       [cand(0.04), cand(0.51)],
       [cand(0.04), cand(0.51, 'expensive')],
+      [cand(0.04), cand(0.52, 'fair')],
       [cand(0.04)],
       [] as ReturnType<typeof cand>[],
     ]) {
       const got = selectAdmissibleOtmCandidate(c, { enabled: true, band });
-      const cheap = c.filter((x) => x.classification === 'cheap');
-      const inBandCheap = cheap.filter((x) => Math.abs(x.delta) >= band.min && Math.abs(x.delta) < band.max);
-      expect(got.candidate).toBe(inBandCheap[0] ?? cheap[0] ?? null);
+      const inBand = c.filter((x) => Math.abs(x.delta) >= band.min && Math.abs(x.delta) < band.max);
+      const expected = inBand.find((x) => x.classification === 'cheap')
+        ?? inBand.find((x) => x.classification === 'fair')
+        ?? null;
+      expect(got.candidate).toBe(expected);
     }
   });
 });

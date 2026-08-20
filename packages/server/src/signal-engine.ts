@@ -10559,8 +10559,13 @@ export class SignalEngine {
         // TRA-3392 ratified ([0.495, 0.55) — the one Bonferroni-surviving positive
         // expectancy cell), so mispricing still drives the pick and the band only
         // bounds where it may look. No gate threshold moves. DARK by default; when
-        // disarmed it is byte-identical to the legacy `find`, and even when armed
-        // it falls back to the legacy nominee rather than suppressing a signal.
+        // disarmed it is byte-identical to the legacy `find`.
+        //
+        // TRA-3856 — armed, it is band-FIRST and it ABSTAINS: `cheap` in band,
+        // else `fair` in band (`in_band_fair` — the population TRA-3859 priced),
+        // else NO nominee. The old armed fallback handed the gates a far-OTM
+        // strike they must reject (766/766 blocked 08-05→08-19), which made the
+        // sleeve's zero read as gate strictness instead of selector output.
         const otmPick = selectAdmissibleOtmCandidate(result.candidates, {
           enabled: isOtmAdmissibleStrikeEnabled(
             this.mode === 'demo' ? this.resolveDemoFlagEnv() : process.env,
@@ -10569,13 +10574,33 @@ export class SignalEngine {
             this.mode === 'demo' ? this.resolveDemoFlagEnv() : process.env,
           ),
         });
+        // May be an `in_band_fair` nominee since TRA-3856; the name survives
+        // because everything below reads it as "the pick", not as a class label.
         const cheap = otmPick.candidate;
-        // TRA-3557 — the chain HAD candidates but none classified `cheap` (the
-        // selector's `selection: 'none'`; it falls back to the legacy nominee
-        // rather than suppressing, so this is never the armed band's doing). A
-        // distinct bucket from `no_candidates` above: that one is an empty chain,
-        // this one is a chain with nothing long-only in it.
-        if (!cheap) { scanRun.reject('no_cheap_candidate'); continue; }
+        // TRA-3557 / TRA-3856 — two different no-nominee worlds, two buckets:
+        // `no_in_band_strike` is the armed selector ABSTAINING (chain surveyed,
+        // nothing nominable inside the band — the band is the question), while
+        // `no_cheap_candidate` is a chain with nothing long-only in it at all
+        // (selection `none`). Distinct from `no_candidates` above, which is an
+        // empty chain. Folding the abstention into either would make the armed
+        // band's suppression read as thin market data.
+        if (!cheap) {
+          if (otmPick.selection === 'abstain_no_in_band') {
+            // An abstention is a decision, not an absence — log the chain shape
+            // it was decided on (no nominee ⇒ no gate verdict ever stamps it).
+            log.info('OTM strike nomination ABSTAINED (TRA-3856)', {
+              sym,
+              cheapConsidered: otmPick.cheapConsidered,
+              strikesConsidered: otmPick.strikesConsidered,
+              strikesInBand: otmPick.strikesInBand,
+              band: otmPick.band,
+            });
+            scanRun.reject('no_in_band_strike');
+          } else {
+            scanRun.reject('no_cheap_candidate');
+          }
+          continue;
+        }
         // TRA-3510 — the nominator branch, stamped on EVERY live gate verdict
         // below rather than only logged. The `log.info` under it reaches an
         // operator tailing Render; it reaches no endpoint, so until now no fold

@@ -723,51 +723,71 @@ describe('SignalEngine — relative-value scanner bridge', () => {
     // `in_band` nominee cannot breach a floor at 0.40 BY CONSTRUCTION), or the low
     // tail was nominated and genuinely cleared. `bySelection` is the only axis on
     // the payload that separates them.
+    //
+    // TRA-3856: armed, the low tail can no longer be nominated AT ALL — the old
+    // fallback branch abstains, and an abstained scan reaches no gate. The axis
+    // now discriminates the TIERS (`in_band` vs `in_band_fair`), and the absence
+    // of a verdict is itself the abstention's signature (plus the scan-run
+    // reject bucket `no_in_band_strike`, which is counted, not silent).
     describe('bySelection separates a clamped zero from a measured one', () => {
       beforeEach(() => {
         process.env[OTM_ADMISSIBLE_STRIKE_FLAG] = '1';
       });
 
-      it('an in_band pick and a fallback_top_mispricing pick land on DISTINCT rows', async () => {
+      it('an in_band pick and an in_band_fair pick land on DISTINCT rows; an abstained chain lands on NONE', async () => {
         // Chain A: a cheap strike inside the ratified band ⇒ `in_band`.
         await runLiveOtm([
           makeOtmCandidate({ optionSymbol: 'AAPL240705C00200000', delta: 0.05 }),
           makeOtmCandidate({ optionSymbol: 'AAPL240705C00205000', delta: 0.52 }),
         ]);
-        // Chain B: nothing in band ⇒ the legacy top-|mispricingPct| nominee is
-        // kept, and it is the far LOW tail the floor exists to cut.
+        // Chain B: only a `fair` strike in band ⇒ TIER 2, `in_band_fair`.
+        await runLiveOtm([
+          makeOtmCandidate({ optionSymbol: 'AAPL240705C00210000', delta: 0.05 }),
+          makeOtmCandidate({
+            optionSymbol: 'AAPL240705C00220000', delta: 0.53, classification: 'fair',
+          }),
+        ]);
+        // Chain C: nothing in band ⇒ ABSTAIN (TRA-3856). The far low tail is
+        // never nominated, so no gate ever sees this chain.
         await runLiveOtm([makeOtmCandidate({ optionSymbol: 'AAPL240705C00215000', delta: 0.05 })]);
 
         const floor = gate('otm_delta_floor');
-        expect(floor?.evaluated).toBe(2);
+        expect(floor?.evaluated).toBe(2); // chains A and B only — C abstained
 
         const inBand = floor?.bySelection.find((s) => s.selection === 'in_band');
-        const fallback = floor?.bySelection.find((s) => s.selection === 'fallback_top_mispricing');
+        const inBandFair = floor?.bySelection.find((s) => s.selection === 'in_band_fair');
 
-        // Two rows, not one bucket — the axis discriminates.
+        // Two rows, not one bucket — the axis discriminates the tiers; and no
+        // `fallback_top_mispricing` row can exist post-TRA-3856.
         expect(floor?.bySelection).toHaveLength(2);
+        expect(floor?.bySelection.some((s) => s.selection === 'fallback_top_mispricing')).toBe(false);
 
-        // The `in_band` row cleared the floor because the SELECTOR put it above
-        // 0.495, not because the floor measured anything. That is the vacuous zero.
+        // Both rows cleared the floor because the SELECTOR put them above
+        // 0.495, not because the floor measured anything — the vacuous zero,
+        // now on every armed row by construction.
         expect(inBand?.evaluated).toBe(1);
         expect(inBand?.blocked).toBe(0);
         expect(inBand?.meanCheapConsidered).toBe(2);
         expect(inBand?.meanCheapInBand).toBe(1);
 
-        // The `fallback` row is the real measurement: the low tail WAS nominated
-        // and the floor bit. `cheapInBand: 0` is definitional on this branch — the
-        // fallback is taken precisely because nothing was admissible.
-        expect(fallback?.evaluated).toBe(1);
-        expect(fallback?.blocked).toBe(1);
-        expect(fallback?.meanCheapInBand).toBe(0);
-        expect(fallback?.rowsWithChainShape).toBe(1);
+        // The tier-2 row is definitionally `cheapInBand: 0` — the tier exists
+        // precisely because nothing cheap was in band.
+        expect(inBandFair?.evaluated).toBe(1);
+        expect(inBandFair?.blocked).toBe(0);
+        expect(inBandFair?.meanCheapInBand).toBe(0);
+        expect(inBandFair?.rowsWithChainShape).toBe(1);
       });
 
       it('the axis is present on the RETAINED fold too, not only the current ET day', async () => {
-        await runLiveOtm([makeOtmCandidate({ delta: 0.05 })]);
+        await runLiveOtm([
+          makeOtmCandidate({ delta: 0.05 }),
+          makeOtmCandidate({
+            optionSymbol: 'AAPL240705C00220000', delta: 0.53, classification: 'fair',
+          }),
+        ]);
         const retained = summarizeLiveEnforceGate(etDateString(new Date()))
           .retained.byGate.find((x) => x.gate === 'otm_delta_floor');
-        expect(retained?.bySelection.map((s) => s.selection)).toEqual(['fallback_top_mispricing']);
+        expect(retained?.bySelection.map((s) => s.selection)).toEqual(['in_band_fair']);
       });
 
       it('a DISARMED selector folds to `legacy` — armed-and-empty never reads as never-armed', async () => {
@@ -783,59 +803,55 @@ describe('SignalEngine — relative-value scanner bridge', () => {
         expect(floor?.bySelection[0]?.meanCheapInBand).toBe(0);
       });
 
-      // ── TRA-3619: State A vs State B, end to end ──────────────────────────
+      // ── TRA-3619 × TRA-3856: the abstention end to end ─────────────────────
       //
-      // `meanCheapInBand: 0` on the fallback branch is jointly caused. These two
-      // tests drive the REAL live scan over chains that differ ONLY in whether an
-      // in-band strike exists, and assert the published payload separates them.
-      it('STATE B — an in-band strike the cheapness screen dropped reaches the payload', async () => {
-        await runLiveOtm([
+      // Chains where nothing in band is nominable now ABSTAIN instead of
+      // nominating the far tail. These drive the REAL live scan and assert the
+      // abstention's signature: no gate verdict, no open — never a lottery-tail
+      // nomination.
+      it('an all-`expensive` band ABSTAINS: no gate verdict, no open', async () => {
+        const engine = await runLiveOtm([
           makeOtmCandidate({ optionSymbol: 'AAPL240705C00210000', delta: 0.05 }),
-          // In band, but `expensive` ⇒ removed by the cheapness screen BEFORE the
-          // band filter runs. The old surface cannot see it at all.
+          // In band but IV-rich — nominable under no tier.
           makeOtmCandidate({
             optionSymbol: 'AAPL240705C00205000', delta: 0.52, classification: 'expensive',
           }),
         ]);
 
-        const fallback = gate('otm_delta_floor')?.bySelection
-          .find((s) => s.selection === 'fallback_top_mispricing');
-        expect(fallback?.meanCheapInBand).toBe(0);        // unchanged, still 0
-        expect(fallback?.meanStrikesInBand).toBe(1);      // and now: State B
-        expect(fallback?.meanStrikesConsidered).toBe(2);
-        expect(fallback?.rowsWithStrikeShape).toBe(1);
+        expect(gate('otm_delta_floor')?.evaluated ?? 0).toBe(0);
+        expect(gate('cost_bar')?.evaluated ?? 0).toBe(0);
+        expect(engine.getState().options.openOptions).toHaveLength(0);
       });
 
-      it('STATE A — a chain with no in-band strike publishes ZERO, not null', async () => {
-        await runLiveOtm([
+      it('a chain with NO in-band strike abstains identically — the far tail is never nominated', async () => {
+        const engine = await runLiveOtm([
           makeOtmCandidate({ optionSymbol: 'AAPL240705C00210000', delta: 0.05 }),
           makeOtmCandidate({
             optionSymbol: 'AAPL240705C00215000', delta: 0.11, classification: 'expensive',
           }),
         ]);
 
-        const fallback = gate('otm_delta_floor')?.bySelection
-          .find((s) => s.selection === 'fallback_top_mispricing');
-        expect(fallback?.meanCheapInBand).toBe(0);
-        // A measured 0 — `rowsWithStrikeShape > 0` is what makes it a measurement
-        // rather than "this fold predates the field".
-        expect(fallback?.meanStrikesInBand).toBe(0);
-        expect(fallback?.rowsWithStrikeShape).toBe(1);
+        expect(gate('otm_delta_floor')?.evaluated ?? 0).toBe(0);
+        expect(engine.getState().options.openOptions).toHaveLength(0);
       });
 
-      it('the strike counts survive the RETAINED fold, not just the ET-day view', async () => {
+      it('the strike counts ride the in_band_fair rows that DO reach the fold', async () => {
         await runLiveOtm([
           makeOtmCandidate({ delta: 0.05 }),
           makeOtmCandidate({
             optionSymbol: 'AAPL240705C00205000', delta: 0.52, classification: 'expensive',
           }),
+          makeOtmCandidate({
+            optionSymbol: 'AAPL240705C00220000', delta: 0.53, classification: 'fair',
+          }),
         ]);
         const retained = summarizeLiveEnforceGate(etDateString(new Date()))
           .retained.byGate.find((x) => x.gate === 'otm_delta_floor');
-        const fallback = retained?.bySelection
-          .find((s) => s.selection === 'fallback_top_mispricing');
-        expect(fallback?.meanStrikesInBand).toBe(1);
-        expect(fallback?.rowsWithStrikeShape).toBe(1);
+        const fair = retained?.bySelection
+          .find((s) => s.selection === 'in_band_fair');
+        expect(fair?.meanStrikesInBand).toBe(2); // the expensive 0.52 is counted
+        expect(fair?.meanCheapInBand).toBe(0);
+        expect(fair?.rowsWithStrikeShape).toBe(1);
       });
     });
   });

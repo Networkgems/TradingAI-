@@ -58,15 +58,17 @@
  * return a populated result so the caller can log and count the verdict, which
  * is the property TRA-2341/TRA-2388 exist to preserve.
  *
- * ## Screen order (TRA-3619)
+ * ## Screen order (TRA-3619, inverted by TRA-3856)
  *
- * **The cheapness screen runs FIRST and the band filter runs INSIDE its output.**
- * `selectAdmissibleOtmCandidate` filters `classification === 'cheap'`, then
- * filters THAT subset on |Δ|. The band never sees a non-`cheap` strike, so
- * `cheapInBand` is `cheap ∩ band` and a zero on it is jointly caused: the chain
- * may hold no in-band strike, or it may hold one that the cheapness screen
- * already threw away. `strikesInBand` splits those two by running the same band
- * predicate over the pre-cheapness candidate set.
+ * **Armed, the band filter runs FIRST and classification ranks INSIDE it.**
+ * Until TRA-3856 the order was the reverse — `classification === 'cheap'`
+ * first, band second — and the no-overlap branch fell back to the top
+ * mispricing at ANY delta instead of abstaining, so the armed selector was
+ * guaranteed to nominate a far-OTM strike the cost bar must reject whenever
+ * `cheap ∩ band = ∅` (which TRA-3859 measured as the normal live shape: every
+ * in-band strike on the 10-name universe classified `fair`). `cheapInBand` is
+ * still `cheap ∩ band` and `strikesInBand` is still the pre-classification
+ * band count, so both series stay comparable across the change.
  *
  * The upstream ordering matters too: `findMispricedOtmContracts` applies the OTM
  * side test and the liquidity/quality screens BEFORE classifying, so even the
@@ -138,11 +140,35 @@ export function resolveAdmissibleBand(env: NodeJS.ProcessEnv = process.env): Adm
 export type AdmissibleSelection =
   /** A `cheap` candidate inside the band — the nominee the bar can admit. */
   | 'in_band'
-  /** Band armed, but no `cheap` candidate landed in it; legacy nominee kept. */
+  /**
+   * TRA-3856 — no `cheap` strike in the band, so the strongest non-`expensive`
+   * mispricing read INSIDE the band is nominated instead. This is the
+   * "non-cheapest in-band strike" population TRA-3859 priced: on the live
+   * 10-name universe every in-band strike classified `fair`, so without this
+   * tier the armed selector nominates in-band roughly never (`cheap ∩ band` was
+   * 2 rows in the whole 08-19 session, both off-allowlist). `expensive` (IV
+   * rich) is never nominated — buying measured-rich premium is not a tier.
+   */
+  | 'in_band_fair'
+  /**
+   * HISTORICAL (pre-TRA-3856). The armed no-overlap branch used to return the
+   * top mispricing at ANY delta — a far-OTM strike the cost bar must reject
+   * (766/766 blocked over 08-05→08-19). No new row can carry this value; it
+   * stays in the union so persisted ledger rows hydrate instead of dropping.
+   */
   | 'fallback_top_mispricing'
+  /**
+   * TRA-3856 — band armed, chain surveyed, and no nominable strike (cheap or
+   * fair) sits inside it: ABSTAIN. The old behaviour here was the defect — a
+   * nominee the downstream gates are guaranteed to reject is not a signal, and
+   * emitting one made the sleeve's zero read as gate strictness instead of
+   * selector output. The caller records the abstention on its own scan-run
+   * bucket, so a suppressed scan is counted, never silent.
+   */
+  | 'abstain_no_in_band'
   /** Selector disarmed — byte-identical to the legacy `find`. */
   | 'legacy'
-  /** No `cheap` candidate at all. A thin chain, not a suppressed one. */
+  /** Empty chain (armed) or no `cheap` candidate (disarmed). Thin, not suppressed. */
   | 'none';
 
 export interface AdmissibleStrikeResult<T extends AdmissibleStrikeCandidate> {
@@ -171,14 +197,14 @@ export interface AdmissibleStrikeResult<T extends AdmissibleStrikeCandidate> {
    * TRA-3619 — the measurement this field exists for. Candidates whose |Δ| is
    * inside the band, counted BEFORE `classification === 'cheap'` is applied.
    *
-   * {@link cheapInBand} is `cheap ∩ band`, so on a `fallback_top_mispricing` row
-   * it is 0 by construction and cannot separate two very different worlds:
+   * {@link cheapInBand} is `cheap ∩ band`, so on an `abstain_no_in_band` row
+   * (or a persisted `fallback_top_mispricing` one) it is 0 by construction and
+   * cannot separate two very different worlds:
    *
    *   • `strikesInBand: 0`  ⇒ the band is empty IN THE CHAIN. Nothing the branch
    *     ordering does can help; the band edges are the question (TRA-3401).
-   *   • `strikesInBand ≥ 1` ⇒ the chain HAD in-band strikes and the cheapness
-   *     screen discarded them before the band filter ran. The branch ordering is
-   *     then the lever.
+   *   • `strikesInBand ≥ 1` ⇒ the chain HAD in-band strikes and every one of
+   *     them classified `expensive` — nominable under no tier.
    *
    * The band is only consulted when the selector is armed, so this is 0 on the
    * `legacy` (disarmed) branch — the same convention {@link cheapInBand} uses.
@@ -191,12 +217,29 @@ export interface AdmissibleStrikeResult<T extends AdmissibleStrikeCandidate> {
 }
 
 /**
- * Pick the OTM nominee.
+ * Pick the OTM nominee — BAND FIRST (TRA-3856).
  *
  * Candidates arrive sorted by `|mispricingPct|` (rank order), and that order is
- * preserved within the band: this returns the STRONGEST mispricing read that is
- * also admissible, so the mispricing edge still drives the choice — the band
- * only bounds where it may look.
+ * preserved within the band: within each tier this returns the STRONGEST
+ * mispricing read, so the mispricing edge still drives the choice — the band
+ * bounds where it may look.
+ *
+ * Armed, the band filter runs FIRST and classification ranks INSIDE it:
+ *
+ *   1. `cheap` in band   → `in_band`         (unchanged from TRA-3401)
+ *   2. `fair` in band    → `in_band_fair`    (TRA-3856 — the tier that makes the
+ *                                             armed selector nominate at all on
+ *                                             chains where nothing in band is
+ *                                             underpriced, which TRA-3859 measured
+ *                                             to be the normal live shape)
+ *   3. nothing nominable → `abstain_no_in_band`, candidate `null` — NEVER the
+ *      far-OTM fallback. The old no-overlap branch nominated the top mispricing
+ *      at any delta, which the cost bar is algebraically guaranteed to reject
+ *      (|Δ| < 0.495 ⇒ blocked; 766/766 over 08-05→08-19). An abstention the
+ *      caller can count beats a nomination the gates must refuse.
+ *
+ * `expensive` is excluded from every tier: this sleeve is long-only, and an
+ * IV-rich contract is a measured overpay, not a weaker signal.
  *
  * When `enabled` is false the result is byte-identical to the legacy
  * `find(c => c.classification === 'cheap')`, which is what makes this safe to
@@ -211,9 +254,9 @@ export function selectAdmissibleOtmCandidate<T extends AdmissibleStrikeCandidate
 ): AdmissibleStrikeResult<T> {
   const { enabled, band } = opts;
   const cheap = candidates.filter((c) => c.classification === 'cheap');
-  const top = cheap.length > 0 ? cheap[0] : null;
 
   if (!enabled) {
+    const top = cheap.length > 0 ? cheap[0] : null;
     return {
       candidate: top,
       selection: top ? 'legacy' : 'none',
@@ -230,33 +273,38 @@ export function selectAdmissibleOtmCandidate<T extends AdmissibleStrikeCandidate
     return Number.isFinite(abs) && abs >= band.min && abs < band.max;
   };
 
-  // TRA-3619 — the SAME band predicate, run once over the pre-cheapness set. It
-  // is deliberately the identical function rather than a re-implementation: the
+  // TRA-3619 — the SAME band predicate for the count and the tiers. It is
+  // deliberately the identical function rather than a re-implementation: the
   // whole value of the count is that `strikesInBand === 0` and `cheapInBand === 0`
   // are comparable, and two predicates that could drift apart would make the
   // comparison meaningless.
-  const strikesInBand = candidates.filter(inBandOf).length;
-  const inBand = cheap.filter(inBandOf);
+  const bandCandidates = candidates.filter(inBandOf);
+  const strikesInBand = bandCandidates.length;
+  const inBandCheap = bandCandidates.filter((c) => c.classification === 'cheap');
 
-  if (inBand.length > 0) {
-    return {
-      candidate: inBand[0],
-      selection: 'in_band',
-      cheapConsidered: cheap.length,
-      cheapInBand: inBand.length,
-      strikesConsidered: candidates.length,
-      strikesInBand,
-      band,
-    };
-  }
-
-  return {
-    candidate: top,
-    selection: top ? 'fallback_top_mispricing' : 'none',
+  const shape = {
     cheapConsidered: cheap.length,
-    cheapInBand: 0,
     strikesConsidered: candidates.length,
     strikesInBand,
     band,
+  };
+
+  if (inBandCheap.length > 0) {
+    return { candidate: inBandCheap[0], selection: 'in_band', cheapInBand: inBandCheap.length, ...shape };
+  }
+
+  const inBandFair = bandCandidates.filter((c) => c.classification === 'fair');
+  if (inBandFair.length > 0) {
+    return { candidate: inBandFair[0], selection: 'in_band_fair', cheapInBand: 0, ...shape };
+  }
+
+  // An empty chain is a fact about the market data ('none'); a surveyed chain
+  // with nothing nominable in band is a fact about the band ('abstain...').
+  // They demand opposite responses, so they must not share a key.
+  return {
+    candidate: null,
+    selection: candidates.length === 0 ? 'none' : 'abstain_no_in_band',
+    cheapInBand: 0,
+    ...shape,
   };
 }
