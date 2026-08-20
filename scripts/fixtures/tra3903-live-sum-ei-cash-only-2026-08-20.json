@@ -1,0 +1,96 @@
+{
+  "_capture": {
+    "issue": "TRA-3903",
+    "what": "Sum E_i is CASH-ONLY after TRA-3897 shipped the capital basis at the per-book level. fleetCapitalUsd 674.68 (= 274.68 + 400.00, cash) while the rows sizingBasisUsd sum to 1008.68 (= 608.68 + 400.00). fleetSizedMaxSumUsd 327.76 is published as the ceiling on Sum B_i while sumBookCapUsd serves 490.01 -- a 162.25 self-contradiction in one object.",
+    "capturedAt": "2026-08-20T22:44:59.285Z",
+    "source": "https://tradingai-bqb1.onrender.com/api/health/live-options-fee-slippage",
+    "build": {
+      "version": "0.0.0",
+      "commit": "8d6e7e959c03605f5b460160e2e3f165669722f4",
+      "commitShort": "8d6e7e959c03",
+      "branch": null,
+      "buildTime": null,
+      "commitSource": "git",
+      "nodeVersion": "v20.19.0",
+      "pid": 73,
+      "startedAt": "2026-08-20T22:33:22.707Z",
+      "uptimeSec": 696
+    },
+    "verbatim": true
+  },
+  "aggregateFleetBound": {
+    "verdict": "within",
+    "reason": "Σ B_i $490.01 over 2 armed book(s) fits the $500.00 fleet authorization",
+    "fleetCapUsd": 500,
+    "fleetRiskFraction": 0.4858,
+    "gateOpenBooks": 2,
+    "books": [
+      "admin",
+      "v0nni"
+    ],
+    "sumBookCapUsd": 490.01,
+    "overageUsd": 0,
+    "roundingAllowanceUsd": 0.07,
+    "fleetCapitalUsd": 674.68,
+    "fleetCapitalCeilingUsd": 1029.23,
+    "fleetCapitalHeadroomUsd": 354.55,
+    "fleetCapitalCeilingBasis": "IN FORCE — sizing reason phi_configured: at least one armed book is sizing on the CONFIGURED φ, so the fitted precondition Σ E_i ≤ A/φ is what bounds its budget. A negative headroom here means φ has gone stale against live capital.",
+    "fleetSizingReason": "phi_configured",
+    "fleetRiskFractionEffective": 0.4858,
+    "fleetSizedMaxSumUsd": 327.76,
+    "fleetSizedHeadroomUsd": 172.24,
+    "unreadableBalanceBooks": []
+  },
+  "aggregateExposure": [
+    {
+      "book": "admin",
+      "mode": "live",
+      "liveEntryGateOpen": true,
+      "capUsd": 295.69,
+      "fleetCapUsd": 500,
+      "fleetRiskFraction": 0.4858,
+      "fleetRiskFractionEffective": 0.4858,
+      "fleetCapitalUsd": 1008.68,
+      "fleetCapitalBooks": 2,
+      "fleetSizingReason": "phi_configured",
+      "availableCashUsd": 274.68,
+      "openPremiumAtRiskUsd": 334,
+      "openRows": 2,
+      "unpricedOpenRows": 0,
+      "headroomUsd": 0,
+      "headroomSignedUsd": -38.31,
+      "sizingBasisUsd": 608.68
+    },
+    {
+      "book": "v0nni",
+      "mode": "live",
+      "liveEntryGateOpen": true,
+      "capUsd": 194.32,
+      "fleetCapUsd": 500,
+      "fleetRiskFraction": 0.4858,
+      "fleetRiskFractionEffective": 0.4858,
+      "fleetCapitalUsd": 1008.68,
+      "fleetCapitalBooks": 2,
+      "fleetSizingReason": "phi_configured",
+      "availableCashUsd": 400,
+      "openPremiumAtRiskUsd": 0,
+      "openRows": 0,
+      "unpricedOpenRows": 0,
+      "headroomUsd": 194.32,
+      "headroomSignedUsd": 194.32,
+      "sizingBasisUsd": 400
+    }
+  ],
+  "arm": {
+    "otmFlagOn": true,
+    "rvFlagOn": false,
+    "windowOpen": true,
+    "testUntilEpochMs": 1798750800000,
+    "testUntilIso": "2026-12-31T21:00:00.000Z",
+    "otmArmed": true,
+    "rvArmed": false
+  },
+  "aggregateCapUsd": 500,
+  "fleetRiskFraction": 0.4858,
+  "fleetCapitalBasisUsd": 1543.96
+}
