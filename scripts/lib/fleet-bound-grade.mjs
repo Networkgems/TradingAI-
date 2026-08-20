@@ -13,16 +13,128 @@
 // discriminates in BOTH directions.
 //
 // EXIT CODES — "could not check" never shares a code with "checked and fine":
-//   0 CLEAN   Σ B_i ≤ A (or over by no more than the disclosed φ 4th-place slack)
-//   1 BREACH  Σ B_i > A + slack — the fleet fail-open, live
-//   3 BLIND   unreachable, unparseable, un-wired, or the pin did not match
-//   Precedence BLIND > BREACH > CLEAN.
+//   0 CLEAN    Σ B_i ≤ A (or over by no more than the disclosed φ 4th-place slack)
+//   1 BREACH   Σ B_i > A + slack — the fleet fail-open, live
+//   3 BLIND    unreachable, unparseable, un-wired, or the pin did not match
+//   3 UNBOUND  Σ B_i fits, but the BOUND THAT MAKES IT FIT IS NOT IN FORCE (below)
+//   Precedence BLIND > BREACH > CLEAN; UNBOUND only ever upgrades a CLEAN.
 
-export const EXIT = { CLEAN: 0, BREACH: 1, USAGE: 2, BLIND: 3 };
+export const EXIT = {
+  CLEAN: 0,
+  BREACH: 1,
+  USAGE: 2,
+  BLIND: 3,
+  /**
+   * Deliberately the SAME code as BLIND. The scheduler's contract is binary —
+   * "0 is a pass, anything else is not" — and UNBOUND is squarely a could-not-
+   * certify, so it must not need a new branch in any existing caller. The
+   * distinct VERDICT STRING is what a human needs; the code is what the routine
+   * needs.
+   */
+  UNBOUND: 3,
+};
 
 /** Cent-exact sum, so 0.1+0.2 never manufactures or hides a breach. */
 function sumCents(rows, key) {
   return rows.reduce((s, r) => s + (Number.isFinite(r?.[key]) ? Math.round(r[key] * 100) : 0), 0) / 100;
+}
+
+const usable = v => typeof v === 'number' && Number.isFinite(v) && v > 0;
+
+/**
+ * TRA-3737 §2 — is the fleet bound ACTUALLY IN FORCE on this reading?
+ *
+ * TRA-3879 shipped `φ_eff = min(φ, A / Σ E_i)`, which makes `Σ B_i ≤ A`
+ * structural instead of fitted. But `Σ E_i` is a READ, and the read has failure
+ * modes that do not announce themselves:
+ *
+ *   - `fleet_capital_unreadable` — the cross-engine read was unwired or threw.
+ *     Sizing falls back to `min(φ·E_i, A)`, the PRE-TRA-3879 bound, and the sum
+ *     is unbounded again. The server publishes this honestly and the served
+ *     `verdict` still says `within` whenever balances happen to fit.
+ *   - A PARTIAL population. Measured for real 28s after the TRA-3879 boot: v0nni
+ *     had no balance snapshot, `Σ E_i` was admin alone, `A/Σ E_i` did not bind,
+ *     φ did, and the route published `within` — a pass on the fixed build with
+ *     the fix doing nothing. Understating `Σ E_i` LOOSENS the bound, so this
+ *     failure is always in the permissive direction.
+ *
+ * In both states `Σ B_i ≤ A` is a coincidence of today's balances. A reader that
+ * cannot tell that apart from "the bound held" is only half a reader — which is
+ * the exact criticism TRA-3737 was filed to answer one level down.
+ *
+ * ⚠ THE TEST IS A PROPERTY, NOT A LIST OF REASON STRINGS. `fleetSizingReason` is
+ * reported as evidence and never branched on: a ban list is names, and the
+ * invariant is arithmetic. What must hold, per armed row:
+ *
+ *   1. `fleetCapitalUsd` is a usable number       — the fleet read produced something
+ *   2. `fleetCapitalUsd ≥ Σ E_i we can see ourselves` — computed from a DIFFERENT
+ *      column, so a fleet read that silently missed a book is caught even if it
+ *      reports its own coverage honestly-but-wrongly
+ *   3. `fleetCapitalBooks ≥ eligible armed books` — the coverage claim itself
+ *   4. `φ_eff · fleetCapitalUsd ≤ A`              — the published φ_eff actually
+ *      delivers the bound, since `Σ B_i ≤ φ_eff · Σ E_i` by construction
+ *
+ * @returns {{inForce: boolean|null, reason: string, ...}} `inForce: null` ⇒ this
+ *   build does not publish the block at all (pre-TRA-3879). That is NOT graded
+ *   as a failure — on such a build the sum genuinely is unbounded, but that is
+ *   the TRA-3723 world the served `verdict` already covers, and flipping every
+ *   old build red would mute the reader. It is published loudly instead.
+ */
+function gradeBoundInForce(armed, A, eligibleBooks) {
+  const published = armed.filter(r => 'fleetRiskFractionEffective' in (r ?? {}));
+  if (armed.length === 0 || published.length === 0) {
+    return {
+      inForce: null,
+      reason:
+        'this build does not publish the TRA-3879 fleet-sizing block '
+        + '(fleetRiskFractionEffective / fleetCapitalUsd / fleetCapitalBooks) — '
+        + 'pre-TRA-3879 bytes, so Σ B_i is bounded only by the fitted precondition',
+      sizingReasons: [],
+    };
+  }
+
+  const observedFleetCapitalUsd = sumCents(armed, 'availableCashUsd');
+  const failures = [];
+  for (const r of armed) {
+    const who = r?.book ?? '<unnamed>';
+    const phiEff = r?.fleetRiskFractionEffective;
+    const capital = r?.fleetCapitalUsd;
+    const books = r?.fleetCapitalBooks;
+
+    if (!usable(capital)) {
+      failures.push(`${who}: fleetCapitalUsd ${capital === null ? 'null' : capital} — the fleet read was unusable, so sizing fell back to the per-book bound min(φ·E_i, A) and the SUM is unbounded`);
+      continue;
+    }
+    if (Math.round(capital * 100) < Math.round(observedFleetCapitalUsd * 100)) {
+      failures.push(`${who}: fleetCapitalUsd $${capital.toFixed(2)} is BELOW the $${observedFleetCapitalUsd.toFixed(2)} this reader can see across the armed books — the fleet read missed capital, which loosens φ_eff`);
+      continue;
+    }
+    if (!Number.isFinite(books) || books < eligibleBooks) {
+      failures.push(`${who}: fleetCapitalBooks ${books} covers fewer than the ${eligibleBooks} eligible armed book(s) — φ_eff was derived one book short`);
+      continue;
+    }
+    if (!usable(phiEff)) {
+      failures.push(`${who}: fleetRiskFractionEffective ${phiEff} is not a usable fraction`);
+      continue;
+    }
+    // Float slack only, scaled to A — a FLAT dollar tolerance here would repeat
+    // φ's own mistake (a constant fitted to one night's numbers) one level up.
+    if (phiEff * capital > A + Math.abs(A) * 1e-9) {
+      failures.push(`${who}: φ_eff ${phiEff} × Σ E_i $${capital.toFixed(2)} = $${(phiEff * capital).toFixed(2)} EXCEEDS A $${A.toFixed(2)} — the published fraction does not deliver the bound`);
+    }
+  }
+
+  const sizingReasons = [...new Set(armed.map(r => r?.fleetSizingReason ?? null))];
+  return {
+    inForce: failures.length === 0,
+    reason: failures.length === 0
+      ? `φ_eff · Σ E_i ≤ A holds on all ${armed.length} armed book(s) over a fleet read covering ${eligibleBooks}`
+      : failures.join(' | '),
+    observedFleetCapitalUsd,
+    // Evidence, never the test.
+    sizingReasons,
+    failures,
+  };
 }
 
 /**
@@ -33,7 +145,7 @@ function sumCents(rows, key) {
  * @param {object?} arg.fee           body of GET /api/health/live-options-fee-slippage
  * @param {string?} arg.expectCommit  pin; a mismatch is BLIND, never a pass
  * @param {string}  arg.measuredAt    ISO stamp, injected so this stays pure
- * @returns {{verdict:'CLEAN'|'BREACH'|'BLIND', code:number, out:object}}
+ * @returns {{verdict:'CLEAN'|'BREACH'|'BLIND'|'UNBOUND', code:number, out:object}}
  */
 export function gradeFleetBound({ live, fee, expectCommit = null, measuredAt }) {
   const blind = (reason, extra = {}) => ({
@@ -146,6 +258,30 @@ export function gradeFleetBound({ live, fee, expectCommit = null, measuredAt }) 
   // exactly how it gets re-read as a caveat (TRA-3723).
   if (unreadable.length > 0 && verdict !== 'BREACH') {
     out.partial = `⚠ PARTIAL: covers ${armed.length}/${eligible} of the arm — ${unreadable.join(', ')} had no readable balance`;
+  }
+
+  // TRA-3737 §2 — grade the BOUND, not just the SUM. Published on every verdict,
+  // because "the bound was in force" is evidence a CLEAN reading needs and a
+  // BREACH reading is entitled to be judged against.
+  out.boundInForce = gradeBoundInForce(armed, typeof A === 'number' ? A : NaN, eligible);
+
+  // UNBOUND only ever upgrades a CLEAN. It must NOT touch a BREACH: the overage
+  // is already real and unconditional, and re-labelling a live fail-open with a
+  // more procedural word is how a loud finding gets read as a caveat — the same
+  // discipline the partial marker follows above. It must not touch a BLIND
+  // either: we do not know what we measured, so we cannot claim to know the
+  // bound was off.
+  if (verdict === 'CLEAN' && out.boundInForce.inForce === false) {
+    out.servedReason = out.reason;
+    verdict = 'UNBOUND';
+    code = EXIT.UNBOUND;
+    out.reason =
+      `BOUND NOT IN FORCE — Σ B_i $${localSum.toFixed(2)} fits A $${Number(A).toFixed(2)}, but that is a `
+      + 'coincidence of today\'s balances, not a guarantee: the TRA-3879 fleet bound did not bind on this '
+      + `reading. ${out.boundInForce.reason}. `
+      + `Sizing reason(s) served: ${out.boundInForce.sizingReasons.map(r => r ?? 'absent').join(', ')}. `
+      + 'A deposit — or nothing at all, as on 2026-08-20 — puts Σ B_i past the authorization with no '
+      + 'further warning. This is exit 3, NOT a pass.';
   }
 
   out.verdict = verdict;

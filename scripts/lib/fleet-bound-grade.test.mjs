@@ -21,11 +21,23 @@ import { gradeFleetBound, EXIT } from './fleet-bound-grade.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CAPTURE = path.join(HERE, '..', 'fixtures', 'tra3737-live-breach-2026-08-20.json');
+// TRA-3737 §2 — the SECOND real capture: bqb1 `2e4654b142d4` at 2026-08-20T04:07Z,
+// ~13 min after TRA-3879's fix went live, serving `within` with `φ_eff` BINDING
+// over a complete 2/2 population. The green control is now a real reading of the
+// fixed host rather than a mutation of the broken one, so "the reader goes green"
+// is evidence about the system and not about my edit to a fixture.
+const FIXED = path.join(HERE, '..', 'fixtures', 'tra3737-live-bound-in-force-2026-08-20.json');
 const AT = '2026-08-20T03:20:00.000Z';
 
 const capture = JSON.parse(fs.readFileSync(CAPTURE, 'utf8'));
 const clone = () => JSON.parse(JSON.stringify(capture));
 const grade = over => gradeFleetBound({ ...clone(), expectCommit: null, measuredAt: AT, ...over });
+
+const fixed = JSON.parse(fs.readFileSync(FIXED, 'utf8'));
+const cloneFixed = () => JSON.parse(JSON.stringify(fixed));
+const gradeFixed = over => gradeFleetBound({ ...cloneFixed(), expectCommit: null, measuredAt: AT, ...over });
+/** The armed rows of the post-fix capture, by reference into a fresh clone. */
+const armedOf = fee => fee.aggregateExposure.filter(r => r.liveEntryGateOpen === true);
 
 test('the capture really is the incident — otherwise every control below is vacuous', () => {
   assert.equal(capture.live.build.commitShort, 'a689158c9157');
@@ -171,4 +183,160 @@ test('pid is published but flagged as a non-discriminator', () => {
   const { out } = grade();
   assert.equal(out.pidIsNotARestartDiscriminator, true);
   assert.ok(out.build.startedAt, 'startedAt + commitShort are the pin');
+});
+
+// --------------------------------------------------------------------------
+// TRA-3737 §2 — "Σ B_i fits" and "the bound that makes it fit is in force" are
+// TWO CLAIMS, and until now the reader only ever asked the first. The states
+// below all serve `within`; the reader has to separate them.
+// --------------------------------------------------------------------------
+
+test('the post-fix capture really is the fixed host — otherwise every green control below is vacuous', () => {
+  assert.equal(fixed.live.build.commitShort, '2e4654b142d4');
+  assert.equal(fixed.fee.aggregateFleetBound.verdict, 'within');
+  assert.equal(fixed.fee.aggregateFleetBound.sumBookCapUsd, 499.99);
+  assert.equal(fixed.fee.aggregateCapUsd, 500);
+  assert.equal(fixed.fee.arm.otmArmed, true, 'still a real-money armed path — the fix did not dark the sleeve');
+  const armed = armedOf(fixed.fee);
+  assert.equal(armed.length, 2, 'coverage 2/2 — a fix graded one book short is the §x80 trap');
+  assert.ok(armed.every(r => r.fleetSizingReason === 'phi_fleet_derived'));
+});
+
+test('GREEN CONTROL: the fixed host reads CLEAN and the bound is IN FORCE', () => {
+  const { verdict, code, out } = gradeFixed();
+  assert.equal(verdict, 'CLEAN');
+  assert.equal(code, EXIT.CLEAN);
+  assert.equal(out.boundInForce.inForce, true);
+  assert.deepEqual(out.boundInForce.sizingReasons, ['phi_fleet_derived']);
+});
+
+test('the in-force test is ARITHMETIC: φ_eff · Σ E_i lands on A to the cent on the real capture', () => {
+  // This is the invariant, restated as the assertion. If it ever stops holding on
+  // a live reading, `Σ B_i ≤ φ_eff · Σ E_i ≤ A` stops being derivable.
+  const armed = armedOf(cloneFixed().fee);
+  const phi = armed[0].fleetRiskFractionEffective;
+  const capital = armed[0].fleetCapitalUsd;
+  assert.equal(Math.round(phi * capital * 100) / 100, 500);
+  assert.equal(capital, 1150.04);
+});
+
+test('UNBOUND: `fleet_capital_unreadable` is NOT a pass, even though Σ B_i fits', () => {
+  // The one state TRA-3879 explicitly leaves the sum unbounded in. The server is
+  // honest about it and still serves `within`, because today's balances fit.
+  const fee = cloneFixed().fee;
+  for (const r of armedOf(fee)) {
+    r.fleetSizingReason = 'fleet_capital_unreadable';
+    r.fleetCapitalUsd = null;
+    r.fleetCapitalBooks = 0;
+    r.fleetRiskFractionEffective = r.fleetRiskFraction;
+  }
+  const { verdict, code, out } = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
+  assert.equal(verdict, 'UNBOUND');
+  assert.equal(code, EXIT.UNBOUND);
+  assert.notEqual(EXIT.UNBOUND, EXIT.CLEAN, 'a non-pass must never share the pass code');
+  assert.equal(out.servedVerdict, 'within', 'the SERVER still said within — that is the whole point');
+  assert.match(out.reason, /BOUND NOT IN FORCE/);
+  assert.match(out.boundInForce.reason, /fleet read was unusable/);
+});
+
+test('UNBOUND: a PARTIAL fleet read — the §x80 trap, measured 28s after the real boot', () => {
+  // v0nni had no balance snapshot, so `Σ E_i` was admin alone, `A/Σ E_i` did not
+  // bind, φ did — and the route published `within` on the FIXED build with the fix
+  // doing nothing. Understating `Σ E_i` always loosens the bound.
+  const fee = cloneFixed().fee;
+  for (const r of armedOf(fee)) {
+    r.fleetCapitalUsd = 750.04; // admin only
+    r.fleetCapitalBooks = 1;
+    r.fleetRiskFractionEffective = r.fleetRiskFraction; // 0.4858 — φ won
+    r.fleetSizingReason = 'phi_configured'; // a REASSURING name for the failure
+  }
+  const { verdict, code, out } = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
+  assert.equal(verdict, 'UNBOUND');
+  assert.equal(code, EXIT.UNBOUND);
+  assert.match(out.boundInForce.reason, /BELOW the \$1150\.04 this reader can see/);
+});
+
+test('the in-force test is a PROPERTY, not a ban list of reason strings', () => {
+  // A future `fleetSizingReason` nobody has written yet must still be caught if the
+  // arithmetic does not hold. Name it something soothing and check it still fails.
+  const fee = cloneFixed().fee;
+  for (const r of armedOf(fee)) {
+    r.fleetSizingReason = 'phi_reconciled_ok';
+    r.fleetRiskFractionEffective = 0.4858; // φ_eff · Σ E_i = $558.68 > A $500
+  }
+  const { verdict, out } = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
+  assert.equal(verdict, 'UNBOUND');
+  assert.match(out.boundInForce.reason, /does not deliver the bound/);
+  assert.deepEqual(out.boundInForce.sizingReasons, ['phi_reconciled_ok'], 'reported as evidence, never branched on');
+});
+
+test('`phi_configured` over a COMPLETE fleet read is genuinely in force — the reader must not cry wolf', () => {
+  // The pre-TRA-3879 posture is SAFE whenever `Σ E_i ≤ A/φ` actually holds. If the
+  // reader flagged it anyway it would be red on the correct state, and a reader
+  // that is always red is muted inside a week — the empty room again.
+  const fee = cloneFixed().fee;
+  for (const r of armedOf(fee)) {
+    r.availableCashUsd = 500; // Σ E_i = $1000 ≤ A/φ $1029.23
+    r.capUsd = 242.9;
+    r.fleetCapitalUsd = 1000;
+    r.fleetCapitalBooks = 2;
+    r.fleetRiskFractionEffective = 0.4858;
+    r.fleetSizingReason = 'phi_configured';
+  }
+  fee.aggregateFleetBound.sumBookCapUsd = 485.8;
+  const { verdict, out } = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
+  assert.equal(verdict, 'CLEAN');
+  assert.equal(out.boundInForce.inForce, true);
+});
+
+test('UNBOUND NEVER hedges a BREACH — the overage is unconditional', () => {
+  // Same discipline as the partial marker. Re-labelling a live fail-open with a
+  // more procedural word is how a loud finding gets re-read as a caveat.
+  const fee = cloneFixed().fee;
+  fee.aggregateFleetBound.verdict = 'breach';
+  fee.aggregateFleetBound.reason = 'FLEET FAIL-OPEN: synthetic';
+  for (const r of armedOf(fee)) {
+    r.fleetSizingReason = 'fleet_capital_unreadable';
+    r.fleetCapitalUsd = null;
+    r.fleetCapitalBooks = 0;
+  }
+  const { verdict, code, out } = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
+  assert.equal(verdict, 'BREACH');
+  assert.equal(code, EXIT.BREACH);
+  assert.equal(out.boundInForce.inForce, false, 'still PUBLISHED — it just does not change the verdict');
+  assert.equal(out.servedReason, undefined);
+});
+
+test('UNBOUND never hedges a BLIND either — we do not know what we measured', () => {
+  const fee = cloneFixed().fee;
+  for (const r of armedOf(fee)) { r.fleetCapitalUsd = null; r.fleetCapitalBooks = 0; }
+  const { verdict, code } = gradeFleetBound({ live: cloneFixed().live, fee, expectCommit: 'deadbeef0000', measuredAt: AT });
+  assert.equal(verdict, 'BLIND');
+  assert.equal(code, EXIT.BLIND);
+});
+
+test('a PRE-TRA-3879 build reports `inForce: null` and does NOT flip red', () => {
+  // The 2026-08-20 breach capture predates the fleet-sizing block entirely. On such
+  // bytes the sum genuinely is unbounded — but that is the TRA-3723 world the served
+  // `verdict` already covers, and flipping every old build red would mute the reader.
+  // It is published loudly instead of graded silently.
+  const armed = armedOf(clone().fee);
+  assert.ok(armed.every(r => !('fleetRiskFractionEffective' in r)), 'the breach capture must predate the block');
+  const fee = clone().fee;
+  delete fee.aggregateFleetBound;
+  fee.aggregateCapUsd = 750; // the old authorization ⇒ $558.68 fits
+  const { verdict, code, out } = gradeFleetBound({ live: clone().live, fee, measuredAt: AT });
+  assert.equal(verdict, 'CLEAN');
+  assert.equal(code, EXIT.CLEAN);
+  assert.equal(out.boundInForce.inForce, null);
+  assert.match(out.boundInForce.reason, /pre-TRA-3879 bytes/);
+});
+
+test('the in-force block is published on EVERY verdict, including the untouched breach', () => {
+  // A field that only appears when it is bad cannot be asserted on by anyone
+  // downstream, and its absence reads as "fine" rather than "not measured".
+  for (const g of [grade(), gradeFixed()]) {
+    assert.ok(Object.prototype.hasOwnProperty.call(g.out, 'boundInForce'));
+    assert.ok('inForce' in g.out.boundInForce);
+  }
 });

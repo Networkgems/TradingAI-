@@ -23,7 +23,10 @@
 //   1 BREACH    Σ B_i > A + slack — the fleet fail-open, live
 //   2 usage
 //   3 BLIND     unreachable, unparseable, un-wired, or the pin did not match
-//   Precedence BLIND > BREACH > CLEAN.
+//   3 UNBOUND   Σ B_i fits, but TRA-3879's `φ_eff = min(φ, A/Σ E_i)` did NOT bind on
+//               this reading (unusable or PARTIAL fleet read), so the fit is a
+//               coincidence of today's balances and the sum is unbounded again
+//   Precedence BLIND > BREACH > CLEAN; UNBOUND only ever upgrades a CLEAN.
 //
 // ⚠ PIN ON `build.commitShort` + `build.startedAt`, NEVER `build.pid`: pid moved
 // 73 → 73 → 72 across two real deploys, so it does not discriminate a restart and
@@ -95,7 +98,10 @@ if (asJson) {
 } else if (verdict === 'BLIND') {
   console.error(`BLIND — ${out.reason}`);
 } else {
-  console.log(`${verdict} — ${out.reason}`);
+  // UNBOUND goes to stderr with the rest of the detail still on stdout: it is not
+  // a pass, and a non-pass that prints only to stdout gets skimmed past.
+  if (verdict === 'UNBOUND') console.error(`UNBOUND — ${out.reason}`);
+  else console.log(`${verdict} — ${out.reason}`);
   console.log(`  source  ${out.source}`);
   console.log(`  build   ${out.build.commitShort} startedAt ${out.build.startedAt} (pid ${out.build.pid} — NOT a restart discriminator)`);
   console.log(`  arm     otmArmed=${out.arm.otmArmed} otmFlagOn=${out.arm.otmFlagOn} windowOpen=${out.arm.windowOpen} until ${out.arm.testUntilIso}`);
@@ -105,6 +111,13 @@ if (asJson) {
   }
   console.log(`  SUM     $${out.sumBookCapUsd.toFixed(2)}   [${out.gradeSource}]`);
   console.log(`  cover   ${out.coverage.armedBooksCovered}/${out.coverage.eligibleBooks} of the arm`);
+  // ⭐ Print this on EVERY verdict, including CLEAN. "Σ B_i fits" and "the bound
+  // that makes it fit is in force" are two different claims, and the whole point
+  // of TRA-3737 §2 is that the second one was never being asked.
+  const bif = out.boundInForce ?? {};
+  const bifLabel = bif.inForce === true ? 'YES' : bif.inForce === false ? 'NO' : 'not published (pre-TRA-3879 build)';
+  console.log(`  bound   in force: ${bifLabel}   [sizing: ${(bif.sizingReasons ?? []).map(r => r ?? 'absent').join(', ') || 'n/a'}]`);
+  if (bif.inForce !== true) console.log(`          ${bif.reason}`);
   if (out.partial) console.log(`  ${out.partial}`);
 }
 process.exit(code);
