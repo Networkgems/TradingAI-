@@ -1695,10 +1695,10 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
   }
 
   // TRA-3872 — mark 0.90 (was 1.20): one contract is $90 of premium, inside the
-  // TRA-3836 <=$100 canary ceiling every live open is now graded against. These
-  // tests exercise MIRROR mechanics, not the ceiling, so their subject order
-  // must be one production could actually place; at $121 the ceiling refused
-  // every open before the broker stub could see it.
+  // TRA-3836 canary ceiling every live open is now graded against ($100 at the
+  // time of the fix; TRA-3870 re-ratified $300/order, which $90 also clears).
+  // These tests exercise MIRROR mechanics, not the ceiling, so their subject
+  // order must be one production could actually place at ANY ratified posture.
   function freshScanner(mark = 0.90): StubScanner {
     const scanner = new StubScanner();
     scanner.scan.mockResolvedValue({
@@ -2250,19 +2250,13 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
     expect(state.signals[0].liveSkipReason).toBeUndefined();
   });
 
-  it('sizes off live equity — and the TRA-3836 canary ceiling refuses the multi-contract order it produces at the broker seam', async () => {
-    // TRA-3872 — this used to assert the sized 2-contract order REACHED the
-    // broker. Under the board's ratified <=$100 attended-canary premium ceiling
-    // (TRA-3836/TRA-3827, compiled default == hard max, env can only lower) a
-    // $200 order can never reach a broker in production, so "the mirror submits
-    // the sized count" is no longer a property live code has — the walk-level
-    // passthrough keeps that coverage in tradier-smart-open.test.ts. What this
-    // test still proves, on the SAME fixture: sizing used the REAL $50K Tradier
-    // equity (the refusal names $200.00 — exactly 2 × $100, a figure the stale
-    // $25K paper equity cannot produce), and the ceiling refuses at the seam
-    // with the order voided rather than clamped (TRA-3688: refuse, never
-    // resize).
-    clearLiveEnforceGateLedger();
+  it('opens a sized position when live equity is sufficient (regression check on the override path)', async () => {
+    // TRA-3872/TRA-3870 — this $200 (2-contract) order was refused while the
+    // TRA-3836 ceiling stood at $100/order; the board's TRA-3870 re-ratification
+    // ($300/order) makes it placeable in production again, so the original
+    // property — the mirror submits the SIZED count off REAL Tradier equity —
+    // is back. Ceiling-refusal coverage at this seam lives in the TRA-3216
+    // "composes with the canary ceiling" block and canary-ceiling.test.ts.
     const stub: TradierLiveStub = {
       getAccountBalance: vi.fn(),
       getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
@@ -2282,25 +2276,12 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
 
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
 
-    // Refused BEFORE the broker: no order, no phantom position, slot freed.
-    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
     const state = engine.getState();
-    expect(state.options.openOptions).toHaveLength(0);
-    expect(state.options.dailyOptionsCount).toBe(0);
-    // The reason discloses the sized notional — $200.00 IS the live-equity
-    // sizing assertion — and names the ratified ceiling it exceeded.
+    expect(state.options.openOptions).toHaveLength(1);
+    expect(state.options.openOptions[0].contracts).toBe(2);
     expect(state.signals).toHaveLength(1);
-    expect(state.signals[0].liveSkipReason).toContain('canary ceiling REFUSED');
-    expect(state.signals[0].liveSkipReason).toContain('$200.00');
-    expect(state.signals[0].liveSkipReason).toContain('$100.00');
-    // The refusal is on the census with its own reasonCode, so a per-order
-    // bite is distinguishable from an aggregate one.
-    const canary = summarizeLiveEnforceGate('1970-01-01').retained.byGate
-      .find((g) => g.gate === 'canary_ceiling')!;
-    expect(canary).toMatchObject({ evaluated: 1, blocked: 1, blockRate: 1 });
-    expect(canary.byReason).toEqual([
-      { reasonCode: 'canary_ceiling_per_order', blocked: 1, share: 1 },
-    ]);
+    expect(state.signals[0].liveSkipReason).toBeUndefined();
   });
 
   it('falls back to paper equity when tradierLiveOptionsEnabled is false (TRA-357 defense-in-depth gate)', async () => {
@@ -8503,14 +8484,22 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
       });
     });
 
-    // ── TRA-3872 (parent TRA-3836) — the <=$100 canary ceiling at the SAME
-    // seam, engine-level. The pure grader has its own suite
-    // (canary-ceiling.test.ts); these pin the one thing that suite cannot see
-    // and that shipped wrong: what the CALL SITE feeds it. Every caller opens
-    // the paper row BEFORE mirroring, so a bare fold already contained the
-    // order and the projection double-counted it — an $82 open on a FLAT book
-    // graded as $164 and refused itself (the ratified canary order included).
-    describe('composes with the <=$100 canary ceiling (TRA-3836/TRA-3872)', () => {
+    // ── TRA-3872 (parent TRA-3836) — the canary ceiling at the SAME seam,
+    // engine-level. The pure grader has its own suite (canary-ceiling.test.ts);
+    // these pin the one thing that suite cannot see and that shipped wrong:
+    // what the CALL SITE feeds it. Every caller opens the paper row BEFORE
+    // mirroring, so a bare fold already contained the order and the projection
+    // double-counted it — an $82 open on a FLAT book graded as $164 and
+    // refused itself (the ratified canary order included).
+    //
+    // The ceiling is PINNED to $100 via the env knob (which may only LOWER the
+    // TRA-3870 compiled $300/$500 defaults — a value ops can legitimately set)
+    // so the boundary arithmetic below stays exact whatever the board ratifies
+    // next: these tests are about the SEAM, not the current number.
+    describe('composes with the canary ceiling, pinned to $100 via env (TRA-3836/TRA-3872)', () => {
+      beforeEach(() => { process.env.LIVE_OPTION_CANARY_CEILING_USD = '100'; });
+      afterEach(() => { delete process.env.LIVE_OPTION_CANARY_CEILING_USD; });
+
       it('REFUSES on the true aggregate: $30 held + $82 entry = $112 > $100, with its own reasonCode', async () => {
         const stub = liveStub();
         const engine = richEngine(stub);
