@@ -9,8 +9,9 @@ import {
   type ExportTradeRow,
 } from './export.js';
 import {
-  checkConfusableExportKeys,
+  checkExportQueryKeys,
   describeRequestedFilters,
+  parseExportBoundary,
   parseExportMarkets,
   parseExportModes,
 } from './export-request.js';
@@ -77,7 +78,7 @@ function buildApp(): express.Express {
   app.get('/api/trades/export', (req, res) => {
     const query = req.query as Record<string, unknown>;
 
-    const keyCheck = checkConfusableExportKeys(query);
+    const keyCheck = checkExportQueryKeys(query);
     if (!keyCheck.ok) {
       res.status(400).json(keyCheck.refusal);
       return;
@@ -92,9 +93,22 @@ function buildApp(): express.Express {
       res.status(400).json(modesParsed.refusal);
       return;
     }
+    // TRA-3883 R2 — the range bounds, in the same position as `index.ts`.
+    const fromParsed = parseExportBoundary(query['from'], 'from');
+    if (!fromParsed.ok) {
+      res.status(400).json(fromParsed.refusal);
+      return;
+    }
+    const toParsed = parseExportBoundary(query['to'], 'to');
+    if (!toParsed.ok) {
+      res.status(400).json(toParsed.refusal);
+      return;
+    }
     const filters: ExportFilters = {
       markets: marketsParsed.values,
       modes: modesParsed.values,
+      from: fromParsed.value,
+      to: toParsed.value,
     };
     const trades = applyFilters(POPULATION, filters);
     res.status(200).json({
@@ -252,10 +266,119 @@ describe('TRA-3874 — what Express actually hands the route (measured, not assu
       'markets=options&modes=Demo',
       'markets=options&modes=demo,bogus',
       'markets=options&modes=demo&modes=demo',
+      // TRA-3883 — the two spellings that served two live rows on the parent's
+      // own deployed remedy. They belong in THIS loop, not in a separate one:
+      // the property is the same property.
+      'markets=options&Mode=demo',
+      'markets=options&MODES=demo',
+      'markets=options&MODE=demo',
     ]) {
       const { status, body } = await get(qs);
       const served: ExportTradeRow[] = status === 200 ? (body.trades ?? []) : [];
       expect(served.filter(t => t.mode === 'live'), qs).toEqual([]);
     }
+  });
+});
+
+describe('TRA-3883 — the residual, re-run on the wire', () => {
+  it('R1 THE TRAP: ?Mode=demo is a 400 naming `Mode`, not a 200 with 2 live rows', async () => {
+    const { status, body } = await get('format=json&markets=options&Mode=demo');
+    expect(status).toBe(400);
+    expect(body.parameter).toBe('Mode');
+    expect(body.trades).toBeUndefined();
+  });
+
+  it('R1 THE TRAP: ?MODES=demo — a case-variant of the REAL key — is a 400', async () => {
+    const { status, body } = await get('format=json&markets=options&MODES=demo');
+    expect(status).toBe(400);
+    expect(body.parameter).toBe('MODES');
+    expect(body.detail).toContain('case-SENSITIVE');
+    expect(body.trades).toBeUndefined();
+  });
+
+  it('R1: ?Markets=options refuses on the KEY — asserted on the REASON, not the code', async () => {
+    // The filing's warning: this row 400'd before the fix too, but for TRA-3860's
+    // range refusal firing on a widened `markets`. A status-code-only assertion
+    // passes while the hole is open.
+    const { status, body } = await get('format=json&Markets=options&modes=live');
+    expect(status).toBe(400);
+    expect(body.parameter).toBe('Markets');
+    expect(body.error).toContain('Markets');
+  });
+
+  it('R1: and the same request with no `from` is no longer a silent 200', async () => {
+    const { status } = await get('format=json&to=2026-08-18&Markets=options&modes=live');
+    expect(status).toBe(400);
+  });
+
+  it('R2 THE TRAP: an unparseable ?from= is a 400, not the full population', async () => {
+    for (const token of ['2026-31-01', 'last-monday', '18-08-2026']) {
+      const { status, body } = await get(
+        `format=json&to=2026-08-18&markets=options&modes=live&from=${encodeURIComponent(token)}`,
+      );
+      expect(status, token).toBe(400);
+      expect(body.parameter, token).toBe('from');
+      expect(body.rejected, token).toEqual([token]);
+      expect(body.trades, token).toBeUndefined();
+    }
+  });
+
+  it('R2 CONTROL: the window actually meant still serves, and still filters', async () => {
+    const { status, body } = await get(
+      'format=json&from=2026-08-18&to=2026-08-18&markets=options&modes=live',
+    );
+    expect(status).toBe(200);
+    expect(body.summary?.filters.from).toBeTypeOf('number');
+    expect((body.trades ?? []).map(t => t.symbol)).toEqual([
+      'PLTR260821C00180000',
+      'SPY260821C00645000',
+    ]);
+  });
+
+  it('R2 CONTROL: an ABSENT from/to still means "no bound" and serves 200', async () => {
+    const { status, body } = await get('format=json&markets=options');
+    expect(status).toBe(200);
+    expect(body.summary?.filters.from).toBeUndefined();
+    expect(body.summary?.filtersRequested).toEqual({
+      modes: false,
+      markets: true,
+      from: false,
+      to: false,
+    });
+    expect(body.trades).toHaveLength(3);
+  });
+
+  it('R2 CONTROL: every still-accepted date form is a 200 on the wire', async () => {
+    for (const token of ['2026/08/18', '08-18-2026', 'Aug 18 2026', '2026-08-18T00:00', '2026-8-18', '0']) {
+      const { status } = await get(
+        `format=json&markets=options&from=${encodeURIComponent(token)}`,
+      );
+      expect(status, token).toBe(200);
+    }
+  });
+
+  it('a present-but-blank ?from= is refused on the wire', async () => {
+    const { status, body } = await get('format=json&markets=options&from=');
+    expect(status).toBe(400);
+    expect(body.detail).toContain('OMIT the parameter');
+  });
+
+  it('a repeated ?from= arrives as an ARRAY and is refused', async () => {
+    const { status, body } = await get('format=json&markets=options&from=2026-08-01&from=2026-08-18');
+    expect(status).toBe(400);
+    expect(body.error).toContain('more than once');
+  });
+
+  it('REGRESSION GUARD: the fix did not become refuse-everything', async () => {
+    // The TRA-3874 controls, re-run alongside — a fix that 400s every request
+    // would satisfy every refusal assertion above.
+    const live = await get('markets=options&modes=live');
+    expect(live.status).toBe(200);
+    expect((live.body.trades ?? []).length).toBe(2);
+    const demo = await get('markets=options&modes=demo');
+    expect(demo.status).toBe(200);
+    expect((demo.body.trades ?? []).filter(t => t.mode === 'live')).toEqual([]);
+    const absent = await get('markets=options');
+    expect(absent.status).toBe(200);
   });
 });

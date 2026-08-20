@@ -2,8 +2,10 @@ import { describe, it, expect } from 'vitest';
 import { applyFilters, type ExportFilters, type ExportTradeRow } from './export.js';
 import {
   CONFUSABLE_EXPORT_KEYS,
-  checkConfusableExportKeys,
+  EXPORT_QUERY_PARAMETERS,
+  checkExportQueryKeys,
   describeRequestedFilters,
+  parseExportBoundary,
   parseExportMarkets,
   parseExportModes,
 } from './export-request.js';
@@ -173,7 +175,7 @@ describe('TRA-3874 — modes/markets accept only what they can honour', () => {
 
 describe('TRA-3874 — confusable query KEYS', () => {
   it('THE TRAP (singular key): ?mode=demo refuses and names the plural', () => {
-    const check = checkConfusableExportKeys({ markets: 'options', mode: 'demo' });
+    const check = checkExportQueryKeys({ markets: 'options', mode: 'demo' });
     expect(check.ok).toBe(false);
     if (check.ok) return;
     expect(check.refusal.parameter).toBe('mode');
@@ -181,7 +183,7 @@ describe('TRA-3874 — confusable query KEYS', () => {
   });
 
   it('?market=options refuses and names `markets`', () => {
-    const check = checkConfusableExportKeys({ market: 'options' });
+    const check = checkExportQueryKeys({ market: 'options' });
     expect(check.ok).toBe(false);
     if (check.ok) return;
     expect(check.refusal.detail).toContain('`markets`');
@@ -192,7 +194,7 @@ describe('TRA-3874 — confusable query KEYS', () => {
     // authenticated user, so a caller passing one gets a book they did not ask
     // for. Pointing them at a plural would be a wrong answer confidently given.
     for (const key of ['book', 'username']) {
-      const check = checkConfusableExportKeys({ [key]: 'admin' });
+      const check = checkExportQueryKeys({ [key]: 'admin' });
       expect(check.ok, key).toBe(false);
       if (check.ok) continue;
       expect(check.refusal.detail).toContain('AUTHENTICATED');
@@ -202,12 +204,12 @@ describe('TRA-3874 — confusable query KEYS', () => {
 
   it('a confusable key refuses even when its VALUE is empty', () => {
     // `?mode=` is still a caller who thinks they are filtering.
-    expect(checkConfusableExportKeys({ mode: '' }).ok).toBe(false);
+    expect(checkExportQueryKeys({ mode: '' }).ok).toBe(false);
   });
 
   it('CONTROL: the real parameters all pass', () => {
     expect(
-      checkConfusableExportKeys({
+      checkExportQueryKeys({
         format: 'json',
         modes: 'live',
         markets: 'options',
@@ -220,7 +222,7 @@ describe('TRA-3874 — confusable query KEYS', () => {
   it('CONTROL: an unknown-but-harmless key still passes', () => {
     // Only the enumerated confusables are rejected. Refusing every unrecognized
     // key would break callers over parameters that never meant anything here.
-    expect(checkConfusableExportKeys({ modes: 'live', _cacheBust: '1' }).ok).toBe(true);
+    expect(checkExportQueryKeys({ modes: 'live', _cacheBust: '1' }).ok).toBe(true);
   });
 
   it('the confusable set is exactly the four QA measured as silently ignored', () => {
@@ -228,7 +230,7 @@ describe('TRA-3874 — confusable query KEYS', () => {
   });
 
   it('names EVERY offending key, not just the first', () => {
-    const check = checkConfusableExportKeys({ market: 'options', mode: 'demo', book: 'admin' });
+    const check = checkExportQueryKeys({ market: 'options', mode: 'demo', book: 'admin' });
     expect(check.ok).toBe(false);
     if (check.ok) return;
     expect(check.refusal.rejected).toEqual(['mode', 'market', 'book']);
@@ -264,5 +266,194 @@ describe('TRA-3874 §3 — the echo distinguishes "not asked" from "asked"', () 
     // say the caller asked.
     expect(applyFilters(POPULATION, filters)).toHaveLength(3);
     expect(describeRequestedFilters(q).modes).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-3883 — the residual: the parent's refusals stopped at the EXACT SPELLING.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('TRA-3883 R1 — the key refusal is CASE-FOLDED', () => {
+  it('THE TRAP: ?Mode=demo — one capital letter — refuses like `mode`', () => {
+    // Measured on bqb1 2e4654b1: this returned 200 with 2 rows, BOTH mode "live",
+    // to a caller who asked for demo. The parent's headline sentence, verbatim,
+    // on the parent's own deployed remedy.
+    const check = checkExportQueryKeys({ markets: 'options', Mode: 'demo' });
+    expect(check.ok).toBe(false);
+    if (check.ok) return;
+    expect(check.refusal.parameter).toBe('Mode');
+    expect(check.refusal.rejected).toEqual(['Mode']);
+    // Echoed as SPELLED, so the caller can find it in their own URL.
+    expect(check.refusal.detail).toContain('`Mode`');
+    expect(check.refusal.detail).toContain('`modes`');
+  });
+
+  it('every case-variant of every confusable key refuses (AC1)', () => {
+    // Enumerating variants is what this replaces — `Mode`/`MODE`/`mOdE` is an
+    // infinite list, and the one left out is the one that serves live rows.
+    for (const base of CONFUSABLE_EXPORT_KEYS.keys()) {
+      for (const spelling of [
+        base.toUpperCase(),
+        base[0]!.toUpperCase() + base.slice(1),
+        base.slice(0, -1) + base.slice(-1).toUpperCase(),
+      ]) {
+        expect(checkExportQueryKeys({ [spelling]: 'x' }).ok, spelling).toBe(false);
+      }
+    }
+  });
+
+  it('THE TRAP: ?MODES=demo — a case-variant of a REAL parameter — refuses (AC2)', () => {
+    // The more confusing half: there IS a working parameter by that name, so the
+    // caller believes they used it. It was invisible to BOTH ends — the check did
+    // not see it and the parse read `modes` as ABSENT, which legally means "all".
+    const check = checkExportQueryKeys({ markets: 'options', MODES: 'demo' });
+    expect(check.ok).toBe(false);
+    if (check.ok) return;
+    expect(check.refusal.parameter).toBe('MODES');
+    expect(check.refusal.detail).toContain('case-SENSITIVE');
+    expect(check.refusal.detail).toContain('`modes`');
+    // It must not be told it is a typo for something else, nor that it was applied.
+    expect(check.refusal.detail).toContain('IGNORED rather than applied');
+  });
+
+  it('a case-variant of EVERY real parameter refuses (AC2)', () => {
+    for (const canonical of EXPORT_QUERY_PARAMETERS) {
+      const shouted = canonical.toUpperCase();
+      const titled = canonical[0]!.toUpperCase() + canonical.slice(1);
+      expect(checkExportQueryKeys({ [shouted]: 'x' }).ok, shouted).toBe(false);
+      expect(checkExportQueryKeys({ [titled]: 'x' }).ok, titled).toBe(false);
+    }
+  });
+
+  it('`Markets=options` refuses on the KEY — not on an unrelated range bound', () => {
+    // The filing's own probe re-ran the parent's trap: `Markets=options&modes=live`
+    // 400'd, but with TRA-3860's "from is earlier than this export can attest to",
+    // because empty `markets` widened into stocks. Drop `from` and it was a silent
+    // 200. A test asserting only the status code passes while the hole is open, so
+    // this one asserts the REASON.
+    const check = checkExportQueryKeys({ Markets: 'options', modes: 'live' });
+    expect(check.ok).toBe(false);
+    if (check.ok) return;
+    expect(check.refusal.parameter).toBe('Markets');
+    expect(check.refusal.error).toContain('Markets');
+  });
+
+  it('names every spelling when the same key arrives twice-cased', () => {
+    const check = checkExportQueryKeys({ Mode: 'demo', MODE: 'live' });
+    expect(check.ok).toBe(false);
+    if (check.ok) return;
+    expect(check.refusal.rejected).toEqual(['Mode', 'MODE']);
+  });
+
+  it('CONTROL: the canonical spellings all still pass', () => {
+    expect(
+      checkExportQueryKeys({
+        format: 'json',
+        modes: 'live',
+        markets: 'options',
+        from: '2026-08-18',
+        to: '2026-08-18',
+      }).ok,
+    ).toBe(true);
+  });
+
+  it('CONTROL: an unknown-but-harmless key still passes, in any case', () => {
+    // The scope did not widen to "refuse every unrecognized key". `_cacheBust` is
+    // not confusable with anything here and never meant anything to this route.
+    expect(checkExportQueryKeys({ modes: 'live', _cacheBust: '1' }).ok).toBe(true);
+    expect(checkExportQueryKeys({ modes: 'live', 'X-Trace-Id': 'abc' }).ok).toBe(true);
+  });
+
+  it('the accepted list published in a refusal is the real parameter set', () => {
+    const check = checkExportQueryKeys({ Mode: 'demo' });
+    expect(check.ok).toBe(false);
+    if (check.ok) return;
+    expect(check.refusal.accepted).toEqual([...EXPORT_QUERY_PARAMETERS]);
+    expect(EXPORT_QUERY_PARAMETERS).toEqual(['format', 'modes', 'markets', 'from', 'to']);
+  });
+});
+
+describe('TRA-3883 R2 — an unreadable from/to refuses instead of unsetting the bound', () => {
+  it('THE TRAP: from=2026-31-01 was SERVED while from=2026-01-01 was REFUSED', () => {
+    // The sharp part is not the widening. `2026-01-01` is refused by TRA-3860
+    // because the route will not attest to history it does not hold; `2026-31-01`
+    // expresses the same intent, was dropped to "no floor", and got the full
+    // 15-row population back. The typo defeated the guard.
+    const check = parseExportBoundary('2026-31-01', 'from');
+    expect(check.ok).toBe(false);
+    if (check.ok) return;
+    expect(check.refusal.parameter).toBe('from');
+    // Names the token…
+    expect(check.refusal.rejected).toEqual(['2026-31-01']);
+    expect(check.refusal.error).toContain('2026-31-01');
+    // …and the accepted formats, so the message is self-servicing (AC3).
+    expect(check.refusal.accepted.join(' ')).toContain('YYYY-MM-DD');
+    expect(check.refusal.accepted.join(' ')).toContain('epoch milliseconds');
+  });
+
+  it('every unparseable form from the filing refuses', () => {
+    for (const token of ['2026-31-01', 'last-monday', '18-08-2026', 'yesterday', '2026-13-01']) {
+      expect(parseExportBoundary(token, 'from').ok, token).toBe(false);
+      expect(parseExportBoundary(token, 'to').ok, token).toBe(false);
+    }
+  });
+
+  it('CONTROL (AC3): the five forms that resolved still resolve, plus a bare epoch-ms', () => {
+    // This is the half that stops the fix shipping as a date-parser tightening.
+    // A reader's prior is "dates work here" and it must keep being true.
+    for (const token of [
+      '2026-08-18',
+      '2026/08/18',
+      '08-18-2026',
+      'Aug 18 2026',
+      '2026-08-18T00:00',
+      '2026-8-18',
+      '1755475200000',
+      '2026-08-18T13:30:00Z',
+    ]) {
+      const parsed = parseExportBoundary(token, 'from');
+      expect(parsed.ok, token).toBe(true);
+      if (!parsed.ok) continue;
+      expect(Number.isFinite(parsed.value ?? NaN), token).toBe(true);
+    }
+  });
+
+  it('THE ASYMMETRY THE PARENT RULED ON: an ABSENT key still means "no bound"', () => {
+    expect(parseExportBoundary(undefined, 'from')).toEqual({ ok: true, value: undefined });
+    expect(parseExportBoundary(undefined, 'to')).toEqual({ ok: true, value: undefined });
+  });
+
+  it('a PRESENT but blank bound refuses — it is not a way to say "unbounded"', () => {
+    const check = parseExportBoundary('', 'from');
+    expect(check.ok).toBe(false);
+    if (check.ok) return;
+    expect(check.refusal.detail).toContain('OMIT the parameter');
+    expect(parseExportBoundary('   ', 'to').ok).toBe(false);
+  });
+
+  it('a repeated ?from=a&from=b (an ARRAY from Express) refuses', () => {
+    const check = parseExportBoundary(['2026-08-01', '2026-08-18'], 'from');
+    expect(check.ok).toBe(false);
+    if (check.ok) return;
+    expect(check.refusal.error).toContain('more than once');
+    expect(check.refusal.rejected).toEqual(['2026-08-01', '2026-08-18']);
+  });
+
+  it('a non-string (?from[x]=1) refuses rather than falling through to no bound', () => {
+    expect(parseExportBoundary({ x: '1' }, 'from').ok).toBe(false);
+  });
+
+  it('an epoch-ms outside the representable range refuses, not silently unsets', () => {
+    // `Number.isFinite` alone admits values that make an Invalid Date downstream.
+    expect(parseExportBoundary('99999999999999999999', 'from').ok).toBe(false);
+  });
+
+  it('CONTROL: a date-only `to` is still widened to the end of the UTC day', () => {
+    const to = parseExportBoundary('2026-08-18', 'to');
+    const from = parseExportBoundary('2026-08-18', 'from');
+    expect(to.ok && from.ok).toBe(true);
+    if (!to.ok || !from.ok) return;
+    // The inclusive-upper-bound behaviour predates this ticket and must survive it.
+    expect(to.value! - from.value!).toBe(86_400_000 - 1);
   });
 });

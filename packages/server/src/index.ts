@@ -747,9 +747,12 @@ import {
 } from './export-history.js';
 // TRA-3874 — the strict filter parse that stops `/api/trades/export` from
 // widening `modes` / `markets` to EVERYTHING on a typo'd key or value.
+// TRA-3883 — …and the case-folded KEY check plus the strict `from`/`to` parse,
+// which are the two edges that parse was scoped short of.
 import {
-  checkConfusableExportKeys,
+  checkExportQueryKeys,
   describeRequestedFilters,
+  parseExportBoundary,
   parseExportMarkets,
   parseExportModes,
 } from './export-request.js';
@@ -9362,27 +9365,12 @@ async function mergeResearchAndNews(yahoo: NewsItem[]): Promise<NewsItem[]> {
 // `export-request.ts` and REFUSES, and the only input allowed to mean "everything"
 // is an absent key.
 
-/**
- * Parse a `from`/`to` boundary as epoch-ms. Accepts an epoch-ms number, an ISO
- * timestamp, or a bare `YYYY-MM-DD` date. A date-only `to` is widened to the
- * end of that UTC day so the upper bound is inclusive of trades closed any time
- * that day. Returns undefined on an unparseable / blank value.
- */
-function parseExportBoundary(raw: unknown, isEnd: boolean): number | undefined {
-  if (typeof raw !== 'string' || !raw.trim()) return undefined;
-  const trimmed = raw.trim();
-  if (/^\d+$/.test(trimmed)) {
-    const n = Number(trimmed);
-    return Number.isFinite(n) ? n : undefined;
-  }
-  const ms = Date.parse(trimmed);
-  if (!Number.isFinite(ms)) return undefined;
-  // Date-only end boundary → end of the UTC day (inclusive).
-  if (isEnd && /^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
-    return ms + 86_400_000 - 1;
-  }
-  return ms;
-}
+// ⛔ TRA-3883 — `parseExportBoundary()` lived here too, and returned `undefined`
+// for anything it could not read. `undefined` means NO BOUND, so `from=2026-31-01`
+// was served the full 15-row population while the correctly spelled
+// `from=2026-01-01` was REFUSED by TRA-3860's range guard: the typo did not merely
+// widen, it defeated the guard. It now lives in `export-request.ts` and REFUSES.
+// Do not reintroduce a boundary parse that resolves failure to a missing bound.
 
 // TRA-3874 — the accepted sets moved to `ALL_EXPORT_MARKETS` / `ALL_EXPORT_MODES`
 // (`export-history.js`), which the strict parse and the refusal MESSAGE both read.
@@ -9438,20 +9426,27 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
     const username = res.locals['authUser'] as string;
     const query = req.query as Record<string, unknown>;
 
-    const format: ExportFormat = String(query['format'] ?? 'csv').toLowerCase() === 'json' ? 'json' : 'csv';
-    if (query['format'] && format !== String(query['format']).toLowerCase()) {
-      res.status(400).json({ error: "format must be 'csv' or 'json'" });
-      return;
-    }
-
     // TRA-3874 — refuse a KEY that is confusable with a parameter that works
     // (`mode`, `market`, `book`, `username`) before anything else looks at the
     // query. Express cannot report a typo'd param, and an ignored `mode=demo`
     // served two live real-money rows under a 200 that read exactly like a
     // filter that worked.
-    const keyCheck = checkConfusableExportKeys(query);
+    //
+    // TRA-3883 — the lookup is now CASE-FOLDED, and a case-variant of a real
+    // parameter (`MODES=`, `Markets=`, `From=`, `Format=`) is refused too:
+    // `Mode=demo` and `MODES=demo` each served two live rows to a caller who
+    // asked for demo, because the check could not see them and the parse read
+    // them as an absent key. This runs FIRST — ahead of even the `format` read —
+    // so no branch below it can interpret a key that is not spelled right.
+    const keyCheck = checkExportQueryKeys(query);
     if (!keyCheck.ok) {
       res.status(400).json(keyCheck.refusal);
+      return;
+    }
+
+    const format: ExportFormat = String(query['format'] ?? 'csv').toLowerCase() === 'json' ? 'json' : 'csv';
+    if (query['format'] && format !== String(query['format']).toLowerCase()) {
+      res.status(400).json({ error: "format must be 'csv' or 'json'" });
       return;
     }
 
@@ -9468,14 +9463,27 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
       res.status(400).json(modesParsed.refusal);
       return;
     }
+    // TRA-3883 R2 — and refuse an unreadable RANGE BOUND. `from=2026-31-01` used
+    // to resolve to "no floor" and get served the full population, while the same
+    // intent spelled `from=2026-01-01` was refused by the range guard below.
+    const fromParsed = parseExportBoundary(query['from'], 'from');
+    if (!fromParsed.ok) {
+      res.status(400).json(fromParsed.refusal);
+      return;
+    }
+    const toParsed = parseExportBoundary(query['to'], 'to');
+    if (!toParsed.ok) {
+      res.status(400).json(toParsed.refusal);
+      return;
+    }
     const markets = marketsParsed.values;
     const modes = modesParsed.values;
     const filtersRequested = describeRequestedFilters(query);
     const filters: ExportFilters = {
       markets,
       modes,
-      from: parseExportBoundary(query['from'], false),
-      to: parseExportBoundary(query['to'], true),
+      from: fromParsed.value,
+      to: toParsed.value,
     };
 
     const [stocksSnap, cryptoSnap] = await Promise.all([
