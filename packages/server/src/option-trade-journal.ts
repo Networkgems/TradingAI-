@@ -535,7 +535,19 @@ type PartialCloseLine = { kind: 'partial_close'; id: string; partial: OptionTrad
 // by the time anyone reads. Everything else on the witness below (symbol, OCC,
 // structure, mode) is read off the record the fold is about to delete, so a
 // legacy `{kind,id}` line still yields a usable witness minus those two fields.
-type VoidLine = { kind: 'void'; id: string; ts?: number; reason?: string };
+type VoidLine = {
+  kind: 'void';
+  id: string;
+  ts?: number;
+  reason?: string;
+  // TRA-3905 — WHICH book and WHICH class of refusal. `reason` alone is
+  // free text with no attribution: 25 real-money rejects on 2026-08-20 had to
+  // be attributed to `v0nni` by hand, off a `canary_ceiling` count and the
+  // OTHER book's broker order history. Both optional so lines written before
+  // this field still replay.
+  book?: string;
+  reasonCode?: string;
+};
 // TRA-2819 — supersede the MONEY on an already-CLOSED row with broker truth.
 //
 // The mirror image of `void`. That line retracts a row for a trade that never
@@ -590,6 +602,21 @@ export interface OptionTradeVoidRecord {
   ts: number | null;
   /** Which abort branch voided the open; `null` on a line predating this field. */
   reason: string | null;
+  /**
+   * TRA-3905 — WHICH BOOK. `null` on a line predating this field, or when the
+   * engine carried no username. The retraction DELETES the row, so the record
+   * below is the only surviving description of the order and until this field
+   * existed it could not say whose it was. `mode` says demo-or-live; it does
+   * not say which of several live books.
+   */
+  book: string | null;
+  /**
+   * TRA-3905 — WHICH CLASS of refusal, as a stable code
+   * (`BrokerRejectClass`). The point is that a broker PERMISSION refusal, which
+   * no retry can ever fix, was stored identically to `walk_exhausted`, which
+   * the next tick fixes. `null` on a line predating this field.
+   */
+  reasonCode: string | null;
   /** Did the fold actually retract a row, or was it refused / unknown? */
   applied: boolean;
   mode: 'demo' | 'live' | null;
@@ -832,6 +859,8 @@ function foldLine(
         id: line.id,
         ts: typeof line.ts === 'number' && Number.isFinite(line.ts) ? line.ts : null,
         reason: typeof line.reason === 'string' ? line.reason : null,
+        book: typeof line.book === 'string' && line.book !== '' ? line.book : null,
+        reasonCode: typeof line.reasonCode === 'string' && line.reasonCode !== '' ? line.reasonCode : null,
         applied: false,
         mode: rec?.mode ?? null,
         symbol: rec?.symbol ?? null,
@@ -846,6 +875,8 @@ function foldLine(
       id: line.id,
       ts: typeof line.ts === 'number' && Number.isFinite(line.ts) ? line.ts : null,
       reason: typeof line.reason === 'string' ? line.reason : null,
+      book: typeof line.book === 'string' && line.book !== '' ? line.book : null,
+      reasonCode: typeof line.reasonCode === 'string' && line.reasonCode !== '' ? line.reasonCode : null,
       applied: true,
       mode: rec.mode,
       symbol: rec.symbol,
@@ -1194,12 +1225,24 @@ export async function recordOptionTradeVoid(
   reason?: string,
   // Test seam — pin the witness clock. Defaults to wall time.
   ts: number = Date.now(),
+  // TRA-3905 — WHICH book and WHICH class. Optional so the existing three-arg
+  // contract still compiles, but the live abort funnel passes both: without
+  // them `voids.recent[]` says a retraction happened and cannot say whose book
+  // it was or whether a retry could ever have helped.
+  meta?: { book?: string | null; reasonCode?: string | null },
 ): Promise<boolean> {
   if (!isOptionTradeJournalEnabled()) return false;
   const map = await ensureLoaded();
   const existing = map.get(id);
   if (!existing || existing.outcome !== 'OPEN') return false;
-  const line: VoidLine = { kind: 'void', id, ts, ...(reason !== undefined ? { reason } : {}) };
+  const line: VoidLine = {
+    kind: 'void',
+    id,
+    ts,
+    ...(reason !== undefined ? { reason } : {}),
+    ...(meta?.book ? { book: meta.book } : {}),
+    ...(meta?.reasonCode ? { reasonCode: meta.reasonCode } : {}),
+  };
   foldLine(map, line);
   await appendLine(line);
   log.info('option trade journal open VOIDED (order never filled)', {
@@ -1209,6 +1252,8 @@ export async function recordOptionTradeVoid(
     structure: existing.structure,
     mode: existing.mode,
     reason: reason ?? null,
+    book: meta?.book ?? null,
+    reasonCode: meta?.reasonCode ?? null,
   });
   return true;
 }

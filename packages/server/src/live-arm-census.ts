@@ -1,6 +1,12 @@
 import type { AccountSettings, TradierEnv } from '@trading-app/shared';
 import { isLiveTradierOptionsEnabled } from '@trading-app/shared';
 import { resolveLiveOptionsCreds, isLiveBrokerOperator } from './signal-engine.js';
+// TRA-3905 — the broker-OUTCOME fold. Every field this census owns is a fact
+// about OUR side of the seam and all of them were true for the book the broker
+// refused 25 times; the join below is the only thing on this report that can
+// disagree with them.
+import { summarizeBrokerSubmitCensus } from './broker-submit-census.js';
+import type { BrokerSubmitCensusRow } from './broker-submit-census.js';
 
 /**
  * TRA-3117 — the per-book LIVE-ARM CENSUS.
@@ -168,6 +174,22 @@ export interface LiveArmCensusRow {
    * while refusing to name the account.
    */
   optionsAccountIdTail: string | null;
+  /**
+   * TRA-3905 — WHAT THE BROKER ACTUALLY DID with this book's orders today.
+   *
+   * Every OTHER field on this row is a fact about our own side of the seam:
+   * creds, client, mode, routing. On 2026-08-20 all of them were `true` for
+   * `v0nni` and matched `admin` cell for cell — while Tradier rejected 25 of her
+   * 25 real-money orders for `Account is restricted for option trading`. Broker
+   * approval is not knowable from anything we hold, so the only server-side
+   * evidence is the outcome of having asked, and `submitted` vs `filled` is the
+   * pair that separates the two books.
+   *
+   * `null` means the join DID NOT RUN (no `etDay` was supplied) — never "clean".
+   * An unread instrument and a green one must not share a value; see
+   * {@link LiveArmCensusReport.brokerOutcomesEtDay}.
+   */
+  brokerOutcome: BrokerSubmitCensusRow | null;
 }
 
 export interface LiveArmCensusReport {
@@ -198,7 +220,22 @@ export interface LiveArmCensusReport {
     modeDisagreementCount: number;
     /** Books whose derived and runtime client states disagree. */
     clientDisagreementCount: number;
+    /**
+     * TRA-3905 — live books the permission breaker has HALTED today, and live
+     * books whose broker outcome grades `red` (a permission reject seen, or the
+     * breaker tripped). `null` when the broker join did not run — an unread
+     * count must never render as `0`.
+     */
+    brokerPermissionBlockedCount: number | null;
+    brokerRedBookCount: number | null;
   };
+  /**
+   * TRA-3905 — the ET day the {@link LiveArmCensusRow.brokerOutcome} join was
+   * folded for, or `null` when no `etDay` was supplied and the join did not run.
+   * This is the field that says whether the broker-outcome cells on this report
+   * were MEASURED at all.
+   */
+  brokerOutcomesEtDay: string | null;
 }
 
 /** Masked last-4 only — matches the existing operator block's contract. */
@@ -210,6 +247,12 @@ function maskTail(accountId: string): string | null {
 export function summarizeLiveArmCensus(
   books: LiveArmCensusBookInput[],
   env: NodeJS.ProcessEnv = process.env,
+  /**
+   * TRA-3905 — the ET day to fold broker outcomes for. Omitted ⇒ the join does
+   * not run and every `brokerOutcome` is `null` (UNREAD), never a zero row: a
+   * caller that forgot to pass it must not get a clean-looking report.
+   */
+  etDay: string | null = null,
 ): LiveArmCensusReport {
   const rows: LiveArmCensusRow[] = [];
   for (const book of books) {
@@ -252,11 +295,29 @@ export function summarizeLiveArmCensus(
       // requires a non-empty account id, so this is non-null exactly when
       // `accountIdSource` is.
       optionsAccountIdTail: resolved.credentialsResolved ? maskTail(resolved.accountId) : null,
+      // Filled in below — the roster it folds over is not known until every row
+      // has been built.
+      brokerOutcome: null,
     });
+  }
+  // TRA-3905 — join the broker-outcome fold onto the rows. The roster is EVERY
+  // row in this cohort, not just the armed ones: a book that placed orders this
+  // morning and was disarmed since is exactly the history a reader needs, and
+  // `summarizeBrokerSubmitCensus` unions the roster with the day's activity so
+  // neither direction can erase the other.
+  const brokerCensus = etDay === null ? null : summarizeBrokerSubmitCensus(etDay, rows.map(r => r.username));
+  if (brokerCensus) {
+    const byBook = new Map(brokerCensus.books.map(b => [b.book, b]));
+    for (const row of rows) {
+      // Non-null for every row: the roster above guarantees a zero-filled cell
+      // exists for each. A missing one would be the absent-reads-clean shape.
+      row.brokerOutcome = byBook.get(row.username) ?? null;
+    }
   }
   return {
     booksScanned: books.length,
     books: rows,
+    brokerOutcomesEtDay: brokerCensus?.etDay ?? null,
     rollup: {
       liveBookCount: rows.length,
       nonOperatorLiveBookCount: rows.filter(r => !isLiveBrokerOperator(r.username, env)).length,
@@ -266,6 +327,13 @@ export function summarizeLiveArmCensus(
       modeDisagreementCount: rows.filter(r => r.modeDisagreement).length,
       /** Rows where the derived and runtime client states disagree. */
       clientDisagreementCount: rows.filter(r => r.clientDisagreement).length,
+      // TRA-3905 — `null`, not `0`, when the join did not run.
+      brokerPermissionBlockedCount: brokerCensus
+        ? rows.filter(r => r.brokerOutcome?.brokerPermissionBlocked === true).length
+        : null,
+      brokerRedBookCount: brokerCensus
+        ? rows.filter(r => r.brokerOutcome?.verdict === 'red').length
+        : null,
     },
   };
 }

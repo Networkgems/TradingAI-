@@ -10634,6 +10634,12 @@ app.get('/api/health/options-live', async (_req, res) => {
           runtime: ctx.engine.getLiveOptionsArmState(),
         })),
       ),
+      process.env,
+      // TRA-3905 — fold TODAY's broker submitted/filled/reject outcomes onto
+      // each row. Without this argument every `brokerOutcome` reads `null`
+      // (UNREAD) and `brokerOutcomesEtDay` says so — which is the honest
+      // reading, but not the one this route is for.
+      etDateString(new Date()),
     );
     res.json({
       ok: true,

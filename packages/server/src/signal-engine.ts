@@ -358,6 +358,20 @@ import { resolveMakerWalkConfig, type MakerWalkConfig } from './option-maker-con
  */
 const SHADOW_CHASE_MAX_IN_FLIGHT = 200;
 import { recordOptionTradeEntrySlippage, recordOptionTradeVoid } from './option-trade-journal.js';
+// TRA-3905 — the per-book submitted/filled/reject fold and the permission
+// breaker. A book the broker refuses 100% of the time read FULLY ARMED on every
+// other instrument on this box; `submitted` vs `filled` per book is the pair
+// that discriminates and nothing published it.
+import {
+  UNATTRIBUTED_BOOK,
+  claimPermissionBlockAlert,
+  classifyBrokerRejectText,
+  getBrokerPermissionBlock,
+  recordBrokerFill,
+  recordBrokerReject,
+  recordBrokerSubmit,
+} from './broker-submit-census.js';
+import type { BrokerRejectClass } from './broker-submit-census.js';
 import { isLiveEntryGatePassed } from './capital-gate-manifest.js';
 import { isSma200DemoForwardTestEnabled } from './sma200-forward-test-flag.js';
 import { resolveDemoFlagEnv } from './demo-flags.js';
@@ -10288,12 +10302,52 @@ export class SignalEngine {
     // TRA-3486 — hoisted above the entry guards (it was defined below them) so
     // those guards can void too. It closes over nothing but `opened` and
     // `surfaceLiveSkip`, so the move is position-independent.
-    const tradierVoid = (reason: string): void => {
+    // TRA-3905 — the book this seam is acting for, resolved ONCE so the census
+    // key, the void line's `book` and the breaker all agree. `alertUsername` is
+    // the username the arm census keys on, so the two surfaces join.
+    const censusBook = this.alertUsername ?? UNATTRIBUTED_BOOK;
+    const censusEtDay = etDateString(new Date());
+
+    const tradierVoid = (
+      reason: string,
+      // TRA-3905 — WHICH CLASS of refusal. Every branch below knows its own
+      // statically; only the broker's `rejected` has to read it out of Tradier's
+      // free text (`classifyBrokerRejectText`). Not optional: a default would
+      // let a new abort branch land unclassified as the transient `other`,
+      // which is exactly how a permission refusal hid behind `walk_exhausted`.
+      reasonCode: BrokerRejectClass,
+    ): void => {
       log.warn('voiding paper open', {
         positionId: opened.id,
         optionSymbol: opened.optionSymbol,
         reason,
+        reasonCode,
+        book: censusBook,
       });
+      // TRA-3905 — the durable per-book fold, BEFORE the journal retraction:
+      // `recordOptionTradeVoid` is fire-and-forget behind a flag and a flush
+      // chain, so it is not a place a census can depend on being reached.
+      const verdict = recordBrokerReject(censusBook, censusEtDay, reasonCode, reason);
+      if (verdict.tripped) {
+        // The breaker just tripped. Alert ONCE (the latch is inside
+        // `claimPermissionBlockAlert`) — the 08-20 book re-submitted the same
+        // names for 4.5 hours, so a per-reject page would be 25 pages.
+        log.error('BROKER PERMISSION BLOCK — halting live option submits on this book (TRA-3905)', {
+          book: censusBook,
+          etDay: censusEtDay,
+          consecutivePermissionRejects: verdict.consecutivePermission,
+          reason,
+        });
+        if (claimPermissionBlockAlert(censusBook, censusEtDay)) {
+          emitAlert({
+            kind: 'risk_halt',
+            username: censusBook,
+            mode: 'live',
+            reason: `Broker refused ${verdict.consecutivePermission} consecutive option orders for account permission reasons — live option entries halted for today. Broker said: ${reason}`,
+            dedupKey: `broker_permission_block:${censusBook}:${censusEtDay}`,
+          });
+        }
+      }
       this.optionsAccount.voidOpenOption(opened.id);
       // TRA-3472 — retract the journal OPEN too. The row was written BEFORE this
       // function contacted the broker (the paper open calls `queueJournalOpen`
@@ -10319,7 +10373,15 @@ export class SignalEngine {
         // retraction deletes the row, so without it the only trace of WHICH
         // abort fired is a log line, and `/v1/logs?text=` is unreadable on this
         // host. `/api/health/option-journal` serves it back as `voids.recent[]`.
-        .then(() => recordOptionTradeVoid(opened.id, reason))
+        // TRA-3905 — `book` + `reasonCode` ride the line too. The retraction
+        // deletes the row, so the witness is all that survives, and until this
+        // it named neither the book nor whether a retry could ever help.
+        .then(() =>
+          recordOptionTradeVoid(opened.id, reason, Date.now(), {
+            book: this.alertUsername ?? null,
+            reasonCode,
+          }),
+        )
         .catch((err: unknown) => {
           log.warn('option trade journal void failed', {
             positionId: opened.id,
@@ -10340,17 +10402,46 @@ export class SignalEngine {
       return true;
     }
     if (!this.tradierLiveClient) {
-      tradierVoid('no live Tradier options client — broker seam unavailable (TRA-2693 mode-flip window)');
+      tradierVoid(
+        'no live Tradier options client — broker seam unavailable (TRA-2693 mode-flip window)',
+        'client_unavailable',
+      );
       return false;
     }
     if (!opened.optionSymbol) {
-      tradierVoid('live open carries no option symbol — nothing to submit and no exit path could key on it');
+      tradierVoid(
+        'live open carries no option symbol — nothing to submit and no exit path could key on it',
+        'policy',
+      );
       return false;
     }
     if (!(opened.contracts > 0)) {
       // `!( > 0)` and not `<= 0`: NaN is the case that gets here (a zero count is
       // already refused by the account), and NaN fails BOTH comparisons.
-      tradierVoid(`live open carries a non-positive contract count (${String(opened.contracts)})`);
+      tradierVoid(
+        `live open carries a non-positive contract count (${String(opened.contracts)})`,
+        'policy',
+      );
+      return false;
+    }
+
+    // TRA-3905 — THE PERMISSION BREAKER. Placed ahead of every other check so a
+    // book the broker has already refused for account-permission reasons moves
+    // no ledger, touches no quote and asks the broker nothing: on 2026-08-20 the
+    // same names (XLF x4, SOUN x3, RCAT x3) were re-submitted and re-rejected
+    // across 4.5 hours because nothing anywhere remembered the first refusal.
+    //
+    // This is a REFUSAL that names itself, not a silent skip — it voids with an
+    // explicit reason, counts itself on the census as `permission_blocked`, and
+    // leaves `brokerPermissionBlocked: true` on the arm census row. A skip would
+    // reproduce the original defect one layer down: a halted book reading
+    // identically to a quiet one.
+    const permissionBlock = getBrokerPermissionBlock(censusBook, censusEtDay);
+    if (permissionBlock.blocked) {
+      tradierVoid(
+        `broker permission block — ${permissionBlock.consecutivePermission} consecutive account-permission rejects on this book today; live option submits halted (TRA-3905). Broker said: ${permissionBlock.reason ?? 'n/a'}`,
+        'permission_blocked',
+      );
       return false;
     }
     // TRA-1980 — SHADOW-first pre-trade liquidity record at order-decision time
@@ -10400,7 +10491,7 @@ export class SignalEngine {
         reasonCode: canaryVerdict.reasonCode,
         username: this.alertUsername ?? null,
       });
-      tradierVoid(canaryVerdict.reason!);
+      tradierVoid(canaryVerdict.reason!, 'policy');
       return false;
     }
 
@@ -10411,6 +10502,7 @@ export class SignalEngine {
     if (typeof obp === 'number' && Number.isFinite(obp) && obp < notionalCost) {
       tradierVoid(
         `Tradier option buying power $${obp.toFixed(2)} < required $${notionalCost.toFixed(2)}`,
+        'buying_power',
       );
       return false;
     }
@@ -10421,6 +10513,7 @@ export class SignalEngine {
     if (typeof dtbp === 'number' && Number.isFinite(dtbp) && dtbp < notionalCost) {
       tradierVoid(
         `Tradier day-trade buying power $${dtbp.toFixed(2)} < required $${notionalCost.toFixed(2)}`,
+        'buying_power',
       );
       return false;
     }
@@ -10432,13 +10525,19 @@ export class SignalEngine {
     // rolling back the paper open exactly like the BP guards above. Tightening-only.
     const spreadVeto = await this.enforceLiveOptionSpreadVeto(opened);
     if (spreadVeto) {
-      tradierVoid(spreadVeto);
+      tradierVoid(spreadVeto, 'spread_veto');
       return false;
     }
 
     // TRA-374 — smart-open limit walk (mid+1¢ stepping toward the ask) rather than
     // paying the ask with a market order. A walk that exhausts voids the paper
     // open with a clear skip reason instead of crossing through at a worse price.
+    // TRA-3905 — THE SUBMIT SIDE OF THE DISCRIMINATOR, stamped here and nowhere
+    // earlier: everything above this line is one of OUR refusals, and counting
+    // those as submissions would destroy the one thing this pair means — "the
+    // broker saw it and did not fill it". One count per pass through this seam,
+    // not per limit re-price inside the TRA-374 ladder.
+    recordBrokerSubmit(censusBook, censusEtDay);
     try {
       const outcome = await submitSmartBuyToOpen(
         this.tradierLiveClient,
@@ -10447,6 +10546,10 @@ export class SignalEngine {
         opts?.walk ? { walk: opts.walk } : {},
       );
       if (outcome.status === 'filled') {
+        // TRA-3905 — the fill side. Also clears the permission run: a fill is
+        // positive proof this account may trade options, so a later reject
+        // starts fresh rather than accumulating across a healthy session.
+        recordBrokerFill(censusBook, censusEtDay);
         // TRA-1929 — capture the real fill for the fee/slippage calibration ledger.
         // Slippage is per-contract; `fees` is null at fill time (the order payload
         // carries no commission — that lives on the account-history endpoint, a
@@ -10514,21 +10617,30 @@ export class SignalEngine {
       }).catch(() => {});
       if (outcome.status === 'rejected') {
         const idSuffix = outcome.orderId !== undefined ? ` ${outcome.orderId}` : '';
-        tradierVoid(`Tradier order${idSuffix} rejected: ${outcome.reason}`);
+        // TRA-3905 — the ONE branch whose class is not known statically: the
+        // broker's refusal arrives as free text and `rejected` covers both
+        // "restricted for option trading" (terminal, no retry can fix it) and
+        // ordinary transient refusals. Classify Tradier's OWN message, not our
+        // wrapper, so the prefix cannot influence the match.
+        tradierVoid(
+          `Tradier order${idSuffix} rejected: ${outcome.reason}`,
+          classifyBrokerRejectText(outcome.reason),
+        );
         this.refreshTradierBalance().catch(() => {});
         return false;
       }
       if (outcome.status === 'walk_exhausted') {
-        tradierVoid(outcome.reason);
+        tradierVoid(outcome.reason, 'walk_exhausted');
         this.refreshTradierBalance().catch(() => {});
         return false;
       }
       // no_quote
-      tradierVoid(outcome.reason);
+      tradierVoid(outcome.reason, 'no_quote');
       return false;
     } catch (err: unknown) {
       tradierVoid(
         `Tradier live buy threw ${err instanceof Error ? err.message : String(err)}`,
+        'throw',
       );
       return false;
     }
