@@ -64,6 +64,39 @@
 //     the blindness and window-floor checks that guard every other absence here. A blind or
 //     unmeasured instrument can never reach the acknowledged pass.
 //
+// ── SHAPE CLASSIFICATION (TRA-3922) — REPORTING ONLY, IT MOVES NO EXIT CODE ──
+// Two events on 2026-08-20T21:21Z were bare `{mode}` PUTs from our own Demo toggle
+// (`AccountModeSwitcher.tsx:149`). That control is DELIBERATELY left reachable while the
+// operator is pinned (d86230c / TRA-3809: disabling it recreates the illusory-lever bug in
+// mirror image, and it is the control an operator reaches for to get OUT of a live arm).
+// So the ratified lever appends a fresh durable event, with a fresh `at`, on every click —
+// and acks match on identity, so NO ack can ever generalise to it. Arm B therefore pins RED
+// for the full 180d retention on a designed, benign, operator-initiated action, and the class
+// it exists to catch arrives into an alarm nobody reads. TRA-3852 fixed pin-on for FIXED
+// events; the intentionally-open lever has no clearing path at all.
+//
+// The obvious repair — "a refusal arriving through the ratified UI control is a
+// non-alarming class" — is UNSOUND AS AN EXIT-CODE RULE, and this grader does not implement
+// it. Every field that would identify the ratified control (`route`, `refererOrigin`,
+// `userAgentFamily`) is a REQUEST HEADER THE CALLER SETS. `http-security.ts:40` already says
+// it in the codebase's own words: "a client can forge any `Origin` it likes, so origin-based
+// rejection is not a security boundary." An exit rule keyed on those fields hands the mute
+// button to exactly the writer the alarm exists to catch: two lines of `curl -H` and a real
+// unattributed demotion grades as the benign class. That is not LOOSEN-pass/TIGHTEN-fail; it
+// is softening with a spoofable key.
+//
+// What ships here is the half that cannot soften anything: every event is CLASSIFIED and the
+// class is PRINTED, with per-class counts and, for anything off-shape, the reasons. Exit
+// codes are byte-identical to before — a `ratified_ui_shape` event still exits 1, and control
+// 24 pins that. The classes are a SHAPE, never an authentication, and the report says so.
+//
+// A sound exit-code loosening needs a discriminator the client cannot set — an
+// authenticated-principal / session identity recorded on the event and PUBLISHED. The ledger
+// records `username` on disk (`boot-arm-repair-ledger.ts:139`) but does not publish it, and
+// `username` alone would not separate "the operator clicking Demo" from "someone holding the
+// operator's session" anyway. That is a server-side change, and it is the same evidence an
+// access-control investigation would need. See TRA-3922.
+//
 // USAGE
 //   node scripts/check-boot-arm-repairs.mjs                    # grade live bqb1
 //   node scripts/check-boot-arm-repairs.mjs --host=https://…   # grade another service
@@ -128,6 +161,74 @@ function eventFingerprint(e) {
 function ackFingerprint(a) {
   const repaired = Array.isArray(a?.repaired) ? [...a.repaired].sort() : [];
   return JSON.stringify([String(a?.at ?? ''), String(a?.origin ?? ''), repaired, Number(a?.bodyFieldCount)]);
+}
+
+// ── shape classification (TRA-3922) ─────────────────────────────────────────
+// See the header. These decide what gets PRINTED about an event. They do not, and must
+// not, reach the exit code — `gradeBootArmRepairs` never branches on a class.
+
+/** The one route our mode switcher posts to. */
+const SETTINGS_ROUTE = 'PUT /api/account/settings';
+
+/**
+ * Origins that serve OUR OWN dashboard, mirroring the server's CORS allowlist
+ * (`packages/server/src/http-security.ts` — `PAGES_ORIGIN` plus the service's own host).
+ * A caller-supplied header, so membership here is a SHAPE observation and nothing more.
+ */
+const RATIFIED_UI_ORIGINS = new Set([
+  'https://networkgems.github.io',        // PAGES_ORIGIN — the public web build
+  'https://tradingai-bqb1.onrender.com',  // the service serving its own copy
+]);
+
+/**
+ * Label ONE published ledger event. Pure. Returns `{ klass, reasons[] }`.
+ *
+ *   boot_persisted    — no request behind it. Something reached DISK by a path that is not
+ *                       the settings PUT. The gravest class; `requestOrigin` cannot even
+ *                       be forged here because there is none.
+ *   off_shape_write   — a request-borne repair that does NOT look like our mode switcher.
+ *                       `reasons` says which way it differs, in full.
+ *   ratified_ui_shape — indistinguishable ON THE WIRE from our own Demo toggle. NOT a
+ *                       clean bill of health: every field checked is caller-controlled.
+ */
+export function classifyRepairEvent(e) {
+  if (e?.origin === 'boot') {
+    return {
+      klass: 'boot_persisted',
+      reasons: ['no request behind it — the PERSISTED operator was already demoted'],
+    };
+  }
+  const ro = e?.requestOrigin ?? null;
+  if (ro == null || typeof ro !== 'object') {
+    return {
+      klass: 'off_shape_write',
+      reasons: ['a settings_write with NO request origin recorded at all'],
+    };
+  }
+
+  const route = ro.route ?? null;
+  const referer = ro.refererOrigin ?? null;
+  const ua = ro.userAgentFamily ?? null;
+  const bodyFields = Array.isArray(e?.bodyFields) ? e.bodyFields : [];
+  const reasons = [];
+
+  if (route !== SETTINGS_ROUTE) reasons.push(`route ${JSON.stringify(route)} is not ${JSON.stringify(SETTINGS_ROUTE)}`);
+  if (referer === null) reasons.push('NO referer origin — our own UI in a browser always sends one');
+  else if (!RATIFIED_UI_ORIGINS.has(referer)) reasons.push(`referer origin ${referer} is not one of our own surfaces`);
+  if (ua === null) reasons.push('NO user-agent family');
+  else if (!ua.startsWith('browser:')) reasons.push(`user-agent family ${ua} is not a browser — this is a script`);
+  if (bodyFields.length !== 1 || bodyFields[0] !== 'mode') {
+    // Summarised, not dumped: a 61-field save (the TRA-3833 event) would otherwise bury
+    // every other reason under one line. The full list is already printed above.
+    const shown = bodyFields.length > 4
+      ? `${bodyFields.length} fields`
+      : JSON.stringify(bodyFields);
+    reasons.push(`bodyFields ${shown} is not exactly ["mode"] — not the mode switcher`);
+  }
+
+  return reasons.length === 0
+    ? { klass: 'ratified_ui_shape', reasons: [] }
+    : { klass: 'off_shape_write', reasons };
 }
 
 /**
@@ -274,14 +375,43 @@ export function gradeBootArmRepairs(payload, opts = {}) {
         lines.push('      no request behind it — the boot-arm found the PERSISTED operator already');
         lines.push('      demoted. Something reached DISK by a path that is not the settings PUT.');
       }
+      // TRA-3922 — printed, never graded. `gradeBootArmRepairs` does not branch on this.
+      const { klass, reasons } = classifyRepairEvent(e);
+      lines.push(`      shape=${klass}`);
+      for (const r of reasons) lines.push(`        · ${r}`);
       lines.push(hit
         ? `      ACKNOWLEDGED by ${hit.ack.issue} (fix ${hit.ack.fixCommit}, verified in the serving build)`
         : '      UNACKNOWLEDGED — this one needs attribution.');
     }
     if (events.length > 20) lines.push(`  … and ${events.length - 20} older event(s), see the raw payload.`);
     lines.push('');
+
+    // ── shape census (TRA-3922). Reporting only — the exit code above is unchanged. ──
+    const byClass = { boot_persisted: 0, off_shape_write: 0, ratified_ui_shape: 0 };
+    for (const e of events) byClass[classifyRepairEvent(e).klass] += 1;
+    lines.push(`  shape census: ${JSON.stringify(byClass)}`);
+    if (byClass.ratified_ui_shape > 0) {
+      lines.push(`  ${byClass.ratified_ui_shape} event(s) are INDISTINGUISHABLE ON THE WIRE from our own Demo`);
+      lines.push('  toggle (AccountModeSwitcher.tsx:149) — the control d86230c deliberately left');
+      lines.push('  reachable so an operator can get OUT of a live arm. That is the likeliest');
+      lines.push('  reading. It is NOT a clearance: route, referer and user-agent are all headers');
+      lines.push('  the caller sets, so this shape is forgeable by exactly the writer this alarm');
+      lines.push('  exists to catch. It stays exit 1 and it stays printed.');
+    }
+    // Scoped to the UNACKNOWLEDGED events on purpose: an off-shape event that is already
+    // pinned to a settled fix (the 2026-08-17 61-field save) is not something to read first.
+    const offShapeUnacked = unacked.filter((e) => classifyRepairEvent(e).klass !== 'ratified_ui_shape');
+    if (offShapeUnacked.length > 0) {
+      lines.push(`  ⚠ ${offShapeUnacked.length} UNACKNOWLEDGED event(s) do NOT match the ratified control's shape.`);
+      lines.push('  Those are the ones to read first — the reasons are printed per event above.');
+      for (const e of offShapeUnacked) lines.push(`      ${e.at}  ${classifyRepairEvent(e).klass}`);
+    }
+    lines.push('');
     lines.push(`  distinct request origins: ${ledger.distinctRequestOrigins ?? '(absent)'}`);
     lines.push('  > 1 means MORE THAN ONE writer — do not close on a single attribution.');
+    lines.push('  ⚠ the triple is route|refererOrigin|userAgentFamily, and userAgentFamily is a');
+    lines.push('  COARSE fingerprint: two different Safari clients collapse into one triple. A');
+    lines.push('  count of 1 is NOT proof of a single actor.');
 
     if (!enumerable) {
       lines.push('');
@@ -589,6 +719,61 @@ if (process.argv.includes('--selftest')) {
       wrap(soundLedger()), EXIT_CLEAN, { acks: [goodAck], isFixServing: SERVING }],
   ];
 
+  // ── TRA-3922 shape-classification controls ────────────────────────────────
+  // The literal 2026-08-20T21:21:18.907Z bqb1 event: a bare `{mode}` PUT from the Demo
+  // toggle in Safari on the Pages build. THE fixture this ticket is about.
+  const theDemoClick = {
+    ts: Date.parse('2026-08-20T21:21:18.907Z'),
+    at: '2026-08-20T21:21:18.907Z',
+    origin: 'settings_write',
+    repaired: ['mode'],
+    bodyFields: ['mode'],
+    requestOrigin: {
+      route: 'PUT /api/account/settings',
+      refererOrigin: 'https://networkgems.github.io',
+      userAgentFamily: 'browser:safari',
+    },
+    survivedRestart: true,
+  };
+  const withOrigin = (over) => ({
+    ...theDemoClick,
+    requestOrigin: { ...theDemoClick.requestOrigin, ...over },
+  });
+
+  // EVERY row that is not the first must classify OUT of `ratified_ui_shape`. These are
+  // the positive controls the ticket requires before any exit-code loosening could ever be
+  // argued for: strip or change ONE caller-supplied field and the shape must not match.
+  const shapeControls = [
+    ['S1 the 2026-08-20 Demo click matches the ratified control shape', theDemoClick, 'ratified_ui_shape'],
+    ['S2 MISSING referer origin', withOrigin({ refererOrigin: null }), 'off_shape_write'],
+    ['S3 MISSING user-agent family', withOrigin({ userAgentFamily: null }), 'off_shape_write'],
+    ['S4 UNEXPECTED referer origin', withOrigin({ refererOrigin: 'https://evil.example' }), 'off_shape_write'],
+    // The lookalike the CORS tests already pin (http-security.test.ts:64) — a suffix that
+    // reads like ours to a human and is a different host to a URL parser.
+    ['S5 LOOKALIKE referer origin', withOrigin({ refererOrigin: 'https://networkgems.github.io.evil.example' }), 'off_shape_write'],
+    // Same host, wrong scheme — also pinned as rejected on the CORS side.
+    ['S6 PLAINTEXT referer origin', withOrigin({ refererOrigin: 'http://networkgems.github.io' }), 'off_shape_write'],
+    ['S7 NON-BROWSER user agent (curl)', withOrigin({ userAgentFamily: 'curl' }), 'off_shape_write'],
+    ['S8 NON-BROWSER user agent (python)', withOrigin({ userAgentFamily: 'python' }), 'off_shape_write'],
+    ['S9 a DIFFERENT route', withOrigin({ route: 'POST /api/account/settings' }), 'off_shape_write'],
+    ['S10 no route at all', withOrigin({ route: null }), 'off_shape_write'],
+    ['S11 no requestOrigin at all', { ...theDemoClick, requestOrigin: null }, 'off_shape_write'],
+    ['S12 origin=boot (reached DISK, not the settings PUT)',
+      { ...theDemoClick, origin: 'boot', requestOrigin: null }, 'boot_persisted'],
+    // A boot repair that somehow carries a perfect-looking requestOrigin must STILL read as
+    // boot: origin is server-side and outranks every caller-supplied field.
+    ['S13 origin=boot outranks a ratified-looking requestOrigin',
+      { ...theDemoClick, origin: 'boot' }, 'boot_persisted'],
+    ['S14 a MULTI-FIELD save is not the mode switcher',
+      { ...theDemoClick, bodyFields: ['mode', 'liveTradeEquitiesTradier'] }, 'off_shape_write'],
+    ['S15 the 2026-08-17 61-field save (TRA-3833)',
+      { ...theDemoClick, bodyFields: Array.from({ length: 61 }, (_, i) => `f${i}`) }, 'off_shape_write'],
+    ['S16 an EMPTY body is not the mode switcher', { ...theDemoClick, bodyFields: [] }, 'off_shape_write'],
+    ['S17 the right field COUNT but the wrong field', { ...theDemoClick, bodyFields: ['viewMode'] }, 'off_shape_write'],
+    // The 2026-08-16 incident: bare {mode} from the service's own host, Chrome. Same shape.
+    ['S18 the 2026-08-16 incident also matches the shape', theIncident, 'ratified_ui_shape'],
+  ];
+
   let failed = 0;
   for (const [name, payload, want] of controls) {
     const got = gradeBootArmRepairs(payload, { minWindowDays: DEFAULT_MIN_WINDOW_DAYS }).exit;
@@ -598,6 +783,66 @@ if (process.argv.includes('--selftest')) {
   }
   for (const [name, payload, want, ackOpts] of ackControls) {
     const got = gradeBootArmRepairs(payload, { minWindowDays: DEFAULT_MIN_WINDOW_DAYS, ...ackOpts }).exit;
+    const ok = got === want;
+    if (!ok) failed += 1;
+    console.log(`${ok ? 'ok  ' : 'FAIL'}  control ${name} → exit ${got} (want ${want})`);
+  }
+  for (const [name, event, want] of shapeControls) {
+    const got = classifyRepairEvent(event).klass;
+    const ok = got === want;
+    if (!ok) failed += 1;
+    console.log(`${ok ? 'ok  ' : 'FAIL'}  shape ${name} → ${got} (want ${want})`);
+  }
+  // An off-shape verdict that does not SAY WHY is unactionable — the reason list is the
+  // deliverable, not the label.
+  for (const [name, event, want] of shapeControls) {
+    if (want !== 'off_shape_write') continue;
+    const ok = classifyRepairEvent(event).reasons.length > 0;
+    if (!ok) failed += 1;
+    console.log(`${ok ? 'ok  ' : 'FAIL'}  shape-reason ${name} → names at least one reason`);
+  }
+
+  // ── THE ANTI-SOFTENING PIN ────────────────────────────────────────────────
+  // The whole risk of shipping a classifier is that it becomes a mute button. These grade
+  // the LIVE 2026-08-21 bqb1 ledger, verbatim, and every one must still be RED.
+  const bqb1_0821 = wrap(soundLedger({
+    state: 'attempts_recorded',
+    events: [theDemoClick, { ...theDemoClick, ts: Date.parse('2026-08-20T21:21:02.374Z'), at: '2026-08-20T21:21:02.374Z' },
+      { ...theIncident, ts: Date.parse('2026-08-17T13:53:42.411Z'), at: '2026-08-17T13:53:42.411Z',
+        repaired: ['liveTradeEquitiesTradier'], bodyFields: Array.from({ length: 61 }, (_, i) => `f${i}`),
+        requestOrigin: { ...theIncident.requestOrigin, refererOrigin: 'https://networkgems.github.io' } }],
+    attempts: 3,
+    attemptsByOrigin: { settings_write: 3, boot: 0 },
+    distinctRequestOrigins: 2,
+    observingDays: 3,
+    observationBoots: 26,
+    durability: { ...soundLedger().durability, hydratedRepairs: 3, hydratedRecords: 28 },
+  }));
+  const ack3833 = {
+    at: '2026-08-17T13:53:42.411Z', origin: 'settings_write',
+    repaired: ['liveTradeEquitiesTradier'], bodyFieldCount: 61,
+    issue: 'TRA-3833', fixCommit: '0ce7226',
+  };
+  const pins = [
+    ['24 a ratified_ui_shape event is STILL exit 1 with no ack',
+      gradeBootArmRepairs(wrap(soundLedger({
+        state: 'attempts_recorded', events: [theDemoClick], attempts: 1,
+        attemptsByOrigin: { settings_write: 1, boot: 0 }, distinctRequestOrigins: 1,
+        durability: { ...soundLedger().durability, hydratedRepairs: 1, hydratedRecords: 48 },
+      }))).exit, EXIT_ATTEMPTS],
+    ['25 the live 2026-08-21 bqb1 ledger, TRA-3833 acked, is STILL exit 1',
+      gradeBootArmRepairs(bqb1_0821, { acks: [ack3833], isFixServing: SERVING }).exit, EXIT_ATTEMPTS],
+    ['26 …and identically so with --no-acks (the existing control is unchanged)',
+      gradeBootArmRepairs(bqb1_0821).exit, EXIT_ATTEMPTS],
+    ['27 an ALL-ratified-shape ledger is still exit 1 (no class is ever a pass)',
+      gradeBootArmRepairs(wrap(soundLedger({
+        state: 'attempts_recorded',
+        events: [theDemoClick, theIncident], attempts: 2,
+        attemptsByOrigin: { settings_write: 2, boot: 0 }, distinctRequestOrigins: 2,
+        durability: { ...soundLedger().durability, hydratedRepairs: 2, hydratedRecords: 49 },
+      }))).exit, EXIT_ATTEMPTS],
+  ];
+  for (const [name, got, want] of pins) {
     const ok = got === want;
     if (!ok) failed += 1;
     console.log(`${ok ? 'ok  ' : 'FAIL'}  control ${name} → exit ${got} (want ${want})`);
@@ -631,6 +876,28 @@ if (process.argv.includes('--selftest')) {
       gradeBootArmRepairs(ackControls[9][1], ackControls[9][3]), 'ORPHANED'],
     ['the acked pass declares its own precondition',
       gradeBootArmRepairs(ackControls[0][1], ackControls[0][3]), 'ancestor of the serving commit'],
+    // TRA-3922 — the classification is worthless if the report does not carry it, and
+    // DANGEROUS if it carries it without the forgeability caveat.
+    ['labels each event with its shape',
+      gradeBootArmRepairs(bqb1_0821, { acks: [ack3833], isFixServing: SERVING }), 'shape=ratified_ui_shape'],
+    ['prints a per-class census',
+      gradeBootArmRepairs(bqb1_0821, { acks: [ack3833], isFixServing: SERVING }), 'shape census:'],
+    ['names the ratified control it looks like',
+      gradeBootArmRepairs(bqb1_0821, { acks: [ack3833], isFixServing: SERVING }), 'AccountModeSwitcher.tsx:149'],
+    ['refuses to read the ratified shape as a clearance',
+      gradeBootArmRepairs(bqb1_0821, { acks: [ack3833], isFixServing: SERVING }), 'forgeable by exactly the writer'],
+    ['says an off-shape event WHY it is off-shape',
+      gradeBootArmRepairs(wrap(soundLedger({
+        state: 'attempts_recorded', events: [withOrigin({ userAgentFamily: 'curl' })], attempts: 1,
+        attemptsByOrigin: { settings_write: 1, boot: 0 },
+      }))), 'is not a browser — this is a script'],
+    ['flags the off-shape events as the ones to read first',
+      gradeBootArmRepairs(wrap(soundLedger({
+        state: 'attempts_recorded', events: [withOrigin({ refererOrigin: null })], attempts: 1,
+        attemptsByOrigin: { settings_write: 1, boot: 0 },
+      }))), 'do NOT match the ratified control'],
+    ['discloses that userAgentFamily is a coarse fingerprint',
+      gradeBootArmRepairs(bqb1_0821, { acks: [ack3833], isFixServing: SERVING }), 'NOT proof of a single actor'],
   ];
   for (const [name, result, want] of textChecks) {
     const ok = result.lines.join('\n').includes(want);
