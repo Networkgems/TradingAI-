@@ -8942,6 +8942,27 @@ export class SignalEngine {
     openPremiumAtRiskUsd: number;
     openRows: number;
     unpricedOpenRows: number;
+    /**
+     * TRA-3913 — of `openPremiumAtRiskUsd`, the share sitting in contracts this
+     * engine's own fill records DO NOT account for: hand-placed desk premium the
+     * broker reconcile blended onto an engine row.
+     *
+     * ⚠ It is INSIDE `openPremiumAtRiskUsd`, not beside it. The order path gates
+     * on the total (TRA-3911's `Σ_j atRisk_j`), so this column is what says how
+     * much of the board's authorization is being spent by a party the board
+     * never routed through the engine. Engine-attributable spend is
+     * `openPremiumAtRiskUsd − adoptedPremiumAtRiskUsd`.
+     */
+    adoptedPremiumAtRiskUsd: number;
+    /** TRA-3913 — rows carrying ANY of the above. A row may be partly ours and partly the desk's. */
+    adoptedOpenRows: number;
+    /**
+     * TRA-3913 — of `adoptedOpenRows`, how many are a REFUSAL (the fill oracle
+     * could not answer) rather than a FINDING. Non-zero ⇒ `adoptedPremiumAtRiskUsd`
+     * is an UPPER bound on desk money and a LOWER bound on ours, and must not be
+     * published as a desk measurement.
+     */
+    adoptedAttributionBlindRows: number;
     headroomUsd: number | null;
     /** TRA-3897 (AC2) — unclamped `capUsd − openPremiumAtRiskUsd`; negative ⇒ over cap. */
     headroomSignedUsd: number | null;
@@ -9029,6 +9050,10 @@ export class SignalEngine {
       openPremiumAtRiskUsd: atRisk.usd,
       openRows: atRisk.rows,
       unpricedOpenRows: atRisk.unpricedRows,
+      // TRA-3913 — the DESK's share of the figure the order path gates on.
+      adoptedPremiumAtRiskUsd: atRisk.adoptedUsd,
+      adoptedOpenRows: atRisk.adoptedRows,
+      adoptedAttributionBlindRows: atRisk.attributionBlindRows,
       headroomUsd: liveOptionTestAggregateHeadroomUsd(atRisk.usd, capUsd),
       // TRA-3897 (AC2) — the SIGNED headroom. `headroomUsd` floors at 0, so a
       // book over its own cap published byte-identically to one exactly at it:

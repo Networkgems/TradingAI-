@@ -63,12 +63,12 @@ function snapshotOf(positions: OptionPosition[]) {
 describe('foldOpenPremiumAtRisk (TRA-3445)', () => {
   it('sums premiumPaid × contractsRemaining × 100 over the open rows', () => {
     expect(foldOpenPremiumAtRisk([pos()]))
-      .toEqual({ usd: 150, rows: 1, unpricedRows: 0, adoptedUsd: 0, adoptedRows: 0 });
+      .toEqual({ usd: 150, rows: 1, unpricedRows: 0, adoptedUsd: 0, adoptedRows: 0, attributionBlindRows: 0 });
     expect(foldOpenPremiumAtRisk([
       pos({ id: 'a' }),
       pos({ id: 'b', premiumPaid: 0.82 }),
       pos({ id: 'c', premiumPaid: 2.00, contracts: 2, contractsRemaining: 2 }),
-    ])).toEqual({ usd: 150 + 82 + 400, rows: 3, unpricedRows: 0, adoptedUsd: 0, adoptedRows: 0 });
+    ])).toEqual({ usd: 150 + 82 + 400, rows: 3, unpricedRows: 0, adoptedUsd: 0, adoptedRows: 0, attributionBlindRows: 0 });
   });
 
   it('uses REMAINING contracts, so a TP1 partial releases the headroom it freed', () => {
@@ -94,7 +94,7 @@ describe('foldOpenPremiumAtRisk (TRA-3445)', () => {
     ]);
     // A silent skip would leave `usd: 150, rows: 1` — indistinguishable from a
     // book that really holds one position. `unpricedRows` is the discriminator.
-    expect(fold).toEqual({ usd: 150, rows: 1, unpricedRows: 3, adoptedUsd: 0, adoptedRows: 0 });
+    expect(fold).toEqual({ usd: 150, rows: 1, unpricedRows: 3, adoptedUsd: 0, adoptedRows: 0, attributionBlindRows: 0 });
   });
 
   it('TRA-3829 — an ADOPTED row counts toward the TOTAL but is attributed away from the engine', () => {
@@ -127,9 +127,16 @@ describe('foldOpenPremiumAtRisk (TRA-3445)', () => {
     // What the cap should be enforced against.
     expect(fold.usd - fold.adoptedUsd).toBeCloseTo(150, 2);
 
-    // ARMED, the same row is the engine's to spend, and the split collapses —
-    // the attribution follows the authorisation rather than being a second,
-    // independently-drifting opinion about the same row.
+    // ⚠ TRA-3913 REVERSED THIS ASSERTION, deliberately. It used to read: "ARMED,
+    // the same row is the engine's to spend, and the split collapses — the
+    // attribution follows the authorisation rather than being a second,
+    // independently-drifting opinion about the same row."
+    //
+    // That coupling is the defect. `ENABLE_ENGINE_ACT_ON_ADOPTED_BROKER_OPTIONS`
+    // answers "may the engine EXIT the desk's position", which says nothing
+    // about who BOUGHT it — and once TRA-3911 made the order path gate on this
+    // fold, arming an exit path would have silently handed the desk's premium
+    // the board's entry authorization to spend. Two questions, two answers.
     const armed = foldOpenPremiumAtRisk(
       [
         pos({ id: 'engine' }),
@@ -147,13 +154,18 @@ describe('foldOpenPremiumAtRisk (TRA-3445)', () => {
       /* armed */ true,
     );
     expect(armed.usd).toBeCloseTo(150 + 287, 2);
-    expect(armed.adoptedUsd).toBe(0);
-    expect(armed.adoptedRows).toBe(0);
+    expect(armed.adoptedUsd).toBeCloseTo(287, 2);
+    expect(armed.adoptedRows).toBe(1);
+    // And it is a FINDING, not a refusal: the row's authority says `foreign`, so
+    // the oracle was never asked and there is nothing blind about the answer.
+    expect(armed.attributionBlindRows).toBe(0);
+    // The arm is genuinely inert here — same bytes armed and disarmed.
+    expect(armed.adoptedUsd).toBeCloseTo(fold.adoptedUsd, 2);
   });
 
   it('an EMPTY book is $0 at risk with zero rows — not a null or a synthetic bucket', () => {
     expect(foldOpenPremiumAtRisk([]))
-      .toEqual({ usd: 0, rows: 0, unpricedRows: 0, adoptedUsd: 0, adoptedRows: 0 });
+      .toEqual({ usd: 0, rows: 0, unpricedRows: 0, adoptedUsd: 0, adoptedRows: 0, attributionBlindRows: 0 });
   });
 });
 

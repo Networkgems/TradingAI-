@@ -136,6 +136,196 @@ export function engineMayActOnAdoptedRow(
 }
 
 // --------------------------------------------------------------------------
+// TRA-3913 — WHOSE EXPOSURE IS THIS ROW? A different question from
+// `engineMayActOnAdoptedRow`, which the two shared one answer for until now.
+//
+// TRA-3829 attributed a row away from the engine iff `engineMayActOnAdoptedRow`
+// refused it, on the stated ground that "the attribution follows the
+// authorisation rather than being a second, independently-drifting opinion".
+// That is wrong in the one branch the authorisation predicate says YES to for a
+// reason that has nothing to do with who paid: `engine_origin`.
+//
+// Measured on bqb1 `020100dc56aa`, 2026-08-21T00:19:40Z, real money:
+//
+//   XLF260925C00057500  contracts 2  premiumPaid 0.965  -> row folds $193.00
+//     engine ledger: ONE buy_to_open, 1 @1.08, oid 142603071  = $108.00
+//     (1.08 + 0.85) / 2 = 0.965 EXACTLY  =>  contract #2 is the DESK's, $85.00
+//
+// The pre-TRA-3896 reconcile took the BROKER's lot of 2 and its BLENDED premium
+// onto the engine's own row, so an `engine_origin` row now carries a contract
+// nobody routed through the engine. `engineMayActOnAdoptedRow` returns true on
+// it — correctly, we must be able to EXIT it — and the fold read that `true` as
+// "this is the engine's money". `adoptedUsd` therefore read $0.00 on a row
+// holding $85.00 of somebody else's premium.
+//
+// ⚠ THE PRICE THIS ACQUIRED. Before TRA-3911 nothing consumed the split, so it
+// was a labelling defect. As of `404e8e5bd919` the order path gates on
+// `admissible_i = max(0, min(cap_i − atRisk_i, A − Σ_j atRisk_j))`, and
+// `Σ_j atRisk_j` is this fold. The desk's $85.00 now crowds out engine entries
+// dollar-for-dollar out of the board's $500 authorization (v0nni $193.67 →
+// $142.00 on that fleet). It errs SAFE — the fleet under-admits, never over —
+// but it spends an authorization the desk was never granted.
+//
+// ⛔ WHAT THIS DOES **NOT** DO. It does not change `usd`, so no cap gets looser:
+// the adopted share is CARVED OUT of the row's total, never subtracted from it.
+// It does not restate the row (TRA-3896's guard is default-safe and correct
+// going forward; this is attribution, not a basis rewrite). And it does not
+// widen `engineMayActOnAdoptedRow` — the engine may still exit every row it
+// could exit before, which is the whole reason that predicate had to stay.
+//
+// ⛔ `armed` IS DELIBERATELY NOT CONSULTED HERE. `ENABLE_ENGINE_ACT_ON_ADOPTED_
+// BROKER_OPTIONS` answers "may the engine exit the desk's position", which has
+// no bearing on who bought it. Arming an exit path must not silently reclassify
+// the desk's premium as engine spend — that is the same conflation one level up.
+// --------------------------------------------------------------------------
+
+/**
+ * TRA-3913 — the attribution oracle's answer, narrowed to the two fields this
+ * predicate reads. Structurally a `Pick` of `RecordedEngineOpenBasis`
+ * (`live-options-fee-slippage-ledger.ts`), restated locally so this module keeps
+ * importing nothing — the acyclic direction the TRA-3829 note above relies on.
+ */
+export interface EngineRecordedOpenEvidence {
+  /** Contracts this engine's own PRICED `buy_to_open` records account for. */
+  contracts: number;
+  /** Quantity-weighted `filledPrice` over those fills, per contract. */
+  premiumPaid: number;
+  /** `buy_to_open` rows in the episode we could not price. `> 0` ⇒ refuse. */
+  unpricedFills: number;
+}
+
+/** Why {@link splitEngineExposureContracts} attributed the row the way it did. */
+export type EngineExposureReason =
+  /** Not an adopted row at all — engine-opened, never imported. Oracle not consulted. */
+  | 'not_imported'
+  /** A SANDBOX import. Oracle not consulted: the live fill ledger cannot answer for it. */
+  | 'sandbox_import'
+  /** `foreign` / `unresolved` / absent authority ⇒ wholly the desk's, `armed` or not. */
+  | 'foreign_authority'
+  /** `engine_origin` and our own fills cover the whole lot ⇒ wholly ours. */
+  | 'engine_accounted'
+  /** `engine_origin` and our own fills cover only PART of the lot ⇒ the rest is the desk's. */
+  | 'engine_partial'
+  /** `engine_origin` but the ledger holds no `buy_to_open` for the symbol ⇒ cannot answer. */
+  | 'oracle_silent'
+  /** `engine_origin` but the episode holds an unpriceable fill ⇒ cannot answer completely. */
+  | 'oracle_unpriced';
+
+export interface EngineExposureSplit {
+  /** Contracts attributable to THIS engine's own recorded entries. */
+  engineContracts: number;
+  /** The remainder — contracts on the row that the engine cannot account for. */
+  adoptedContracts: number;
+  /**
+   * The oracle's per-contract basis for `engineContracts`, or `null` when the
+   * oracle did not answer. ⚠ The caller must price the engine share at THIS,
+   * never at the row's `premiumPaid`: the row's figure is the BROKER's blend
+   * across both parties, so pricing 1 of 2 XLF contracts at the blended 0.965
+   * yields $96.50 where the engine actually paid $108.00 — and the $85.00 the
+   * desk actually paid would come out as $96.50 too. Both wrong, and they do
+   * not even sum to the row.
+   */
+  recordedPremiumPaid: number | null;
+  reason: EngineExposureReason;
+  /**
+   * True iff `adoptedContracts` is a REFUSAL (the oracle could not answer)
+   * rather than a FINDING (it answered, and the contracts are not ours).
+   *
+   * These must never share a column. "The desk owns 1 XLF contract" and "the
+   * fill ledger was never hydrated so we cannot vouch for anything" produce the
+   * identical `adoptedUsd`, and only one of them is a fact about the book.
+   */
+  oracleRefused: boolean;
+}
+
+/**
+ * TRA-3913 — split a row's open contracts into ENGINE and ADOPTED, using this
+ * engine's own recorded `buy_to_open` fills as the oracle.
+ *
+ * The rule, in one line: **a row is the engine's exposure only to the extent
+ * this engine's own fill records account for its contracts.**
+ *
+ * Total over the input space and, like {@link engineMayActOnAdoptedRow}, written
+ * as an allow-list so an unrecognised shape lands in the conservative branch:
+ *
+ * 1. `importedFromTradier !== true` ⇒ **wholly ENGINE**, oracle NOT consulted.
+ *    ⛔ This early-out is load-bearing, not an optimisation. The ledger is
+ *    LIVE-only, so consulting it for a demo/paper row returns `null` for every
+ *    one of them, and rule 5 would then attribute the ENTIRE paper book to the
+ *    desk. Engine-opened rows are outside this ticket and the guard must never
+ *    widen onto them.
+ * 2. `tradierEnv === 'sandbox'` ⇒ **wholly ENGINE**, oracle NOT consulted. Same
+ *    reason, and the same partition as the action predicate — on an imported row
+ *    `mode` is stamped `'live'` unconditionally (TRA-3112 item 3), so `mode`
+ *    would be wrong in both directions here exactly as it is there.
+ * 3. authority other than `engine_origin` ⇒ **wholly ADOPTED**. A `foreign` row
+ *    is the desk's by provenance; there is nothing for the oracle to add, and
+ *    asking it opens a double-attribution hazard (two rows on one OCC symbol
+ *    would each claim the same recorded contracts).
+ * 4. `engine_origin`, oracle `null` or `unpricedFills > 0` ⇒ **wholly ADOPTED**,
+ *    `oracleRefused: true`. ⛔ `null` is "cannot answer", NOT "the engine bought
+ *    nothing" and NOT permission (AC2). A fail-OPEN reading of exactly this
+ *    `null` is what put a foreign contract on an engine row to begin with.
+ * 5. `engine_origin`, oracle answered ⇒ ours up to `min(contracts, remaining)`,
+ *    the rest the desk's. `min` matters: a PARTIAL CLOSE truncates the oracle's
+ *    episode window, and a partial close on the ROW shrinks `remaining` — the
+ *    two move independently and neither may over-claim the other.
+ */
+export function splitEngineExposureContracts(
+  row: { importedFromTradier?: boolean; adoptionAuthority?: string; tradierEnv?: string },
+  remainingContracts: number,
+  /**
+   * Lazy on purpose: rules 1–3 must not pay for a ledger walk, and rule 1 must
+   * not even be ABLE to read an answer it would have to discard.
+   */
+  lookupRecordedOpenBasis: () => EngineRecordedOpenEvidence | null,
+): EngineExposureSplit {
+  const remaining =
+    Number.isFinite(remainingContracts) && remainingContracts > 0 ? remainingContracts : 0;
+  const wholly = (
+    who: 'engine' | 'adopted',
+    reason: EngineExposureReason,
+    oracleRefused: boolean,
+    recordedPremiumPaid: number | null = null,
+  ): EngineExposureSplit => ({
+    engineContracts: who === 'engine' ? remaining : 0,
+    adoptedContracts: who === 'engine' ? 0 : remaining,
+    recordedPremiumPaid,
+    reason,
+    oracleRefused,
+  });
+
+  if (row.importedFromTradier !== true) return wholly('engine', 'not_imported', false);
+  if (row.tradierEnv === 'sandbox') return wholly('engine', 'sandbox_import', false);
+  if (row.adoptionAuthority !== 'engine_origin') {
+    return wholly('adopted', 'foreign_authority', false);
+  }
+
+  const recorded = lookupRecordedOpenBasis();
+  if (recorded === null) return wholly('adopted', 'oracle_silent', true);
+  if (!(recorded.unpricedFills === 0)) return wholly('adopted', 'oracle_unpriced', true);
+
+  // `!(x > 0)` rather than `x <= 0`: the latter admits NaN into the ACCOUNTED
+  // branch, and a NaN contract count reads as a number until something compares
+  // it (TRA-3486).
+  const accounted =
+    Number.isFinite(recorded.contracts) && recorded.contracts > 0 ? recorded.contracts : 0;
+  const premium =
+    Number.isFinite(recorded.premiumPaid) && recorded.premiumPaid > 0 ? recorded.premiumPaid : null;
+  if (accounted === 0 || premium === null) return wholly('adopted', 'oracle_unpriced', true);
+
+  const engineContracts = Math.min(accounted, remaining);
+  const adoptedContracts = remaining - engineContracts;
+  return {
+    engineContracts,
+    adoptedContracts,
+    recordedPremiumPaid: premium,
+    reason: adoptedContracts > 0 ? 'engine_partial' : 'engine_accounted',
+    oracleRefused: false,
+  };
+}
+
+// --------------------------------------------------------------------------
 // TRA-1114 — demo-only deterministic directional call/put entry.
 //
 // Board escalation (3rd time: TRA-1021 → TRA-1113). The board keeps reporting

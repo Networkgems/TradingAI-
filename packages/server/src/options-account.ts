@@ -66,7 +66,13 @@ import {
 } from './engine-basis-restatement-log.js';
 // TRA-3829 — the adoption AUTHORISATION predicate. `option-exec-flag.ts` imports
 // nothing from this module, so this direction is acyclic.
-import { engineMayActOnAdoptedRow, isEngineActionOnAdoptedRowsArmed } from './option-exec-flag.js';
+// TRA-3913 — and the EXPOSURE-ATTRIBUTION predicate, which is a different
+// question from the authorisation one and no longer shares its answer.
+import {
+  engineMayActOnAdoptedRow,
+  isEngineActionOnAdoptedRowsArmed,
+  splitEngineExposureContracts,
+} from './option-exec-flag.js';
 import {
   type MarketableOpenMtmConfig,
   DEFAULT_MARKETABLE_OPEN_MTM_CONFIG,
@@ -2414,10 +2420,42 @@ export interface OpenPremiumAtRisk {
    * engine-attributable figure derivable (which is what a cap wants). A fold
    * that simply dropped adopted rows would understate real exposure on a live
    * account, which is the failure in the other direction.
+   *
+   * ⚠️ TRA-3913 — this is now a PARTIAL attribution, per contract, not a
+   * whole-row flag. See {@link splitEngineExposureContracts}: an `engine_origin`
+   * row that the pre-TRA-3896 reconcile widened onto the broker's lot holds BOTH
+   * kinds at once, and on 2026-08-21 the live XLF row held $108.00 of ours and
+   * $85.00 of the desk's under one `premiumPaid: 0.965` blend. `usd` is
+   * unchanged; the adopted share is carved out of it, never added to it, so
+   * `usd - adoptedUsd` remains the engine-attributable figure and no cap moves.
    */
   adoptedUsd: number;
-  /** TRA-3829 (AC5) — the ADOPTED subset of `rows`. Same discipline as {@link adoptedUsd}. */
+  /**
+   * TRA-3829 (AC5) — rows carrying ANY adopted premium. Same discipline as
+   * {@link adoptedUsd}. ⚠️ TRA-3913: a row counted here may still be partly the
+   * engine's, so this is "rows with desk money on them", never "rows that are
+   * wholly the desk's".
+   */
   adoptedRows: number;
+  /**
+   * TRA-3913 — of {@link adoptedRows}, how many were attributed to the desk
+   * because the fill oracle **could not answer** (no `buy_to_open` on the
+   * symbol, or an unpriceable one) rather than because it answered and the
+   * contracts are not ours.
+   *
+   * These must never share a column with a finding. "The desk owns 1 XLF
+   * contract" and "the fill ledger was never hydrated, so we cannot vouch for
+   * anything" produce the IDENTICAL `adoptedUsd`, and only one of them is a
+   * fact about the book. TRA-3553 drew the same line for
+   * `recordedOpenFillCount` and it is the same instrument here: a zero is
+   * scoped to what the oracle could see.
+   *
+   * Non-zero does NOT mean the figure is wrong — refusing is the conservative
+   * direction and AC2's required one. It means the figure is a floor on the
+   * engine's own share, and a reader publishing it as a desk measurement should
+   * say so.
+   */
+  attributionBlindRows: number;
 }
 
 /**
@@ -2445,12 +2483,21 @@ export function foldOpenPremiumAtRisk(
    * `usd` / `rows` / `unpricedRows`, whose values are unchanged by this ticket.
    */
   armed: boolean = isEngineActionOnAdoptedRowsArmed(),
+  /**
+   * TRA-3913 — the ATTRIBUTION oracle: this engine's own recorded `buy_to_open`
+   * fills. Injected so the split is testable without a hydrated ledger on disk,
+   * and defaulted to the real module so every existing caller gets the corrected
+   * attribution without a change at the call site.
+   */
+  recordedOpenBasis: (optionSymbol: string) => RecordedEngineOpenBasis | null =
+    recordedEngineOpenBasis,
 ): OpenPremiumAtRisk {
   let usd = 0;
   let rows = 0;
   let unpricedRows = 0;
   let adoptedUsd = 0;
   let adoptedRows = 0;
+  let attributionBlindRows = 0;
   for (const p of positions) {
     const remaining = p.contractsRemaining ?? p.contracts;
     if (
@@ -2463,15 +2510,47 @@ export function foldOpenPremiumAtRisk(
     const rowUsd = p.premiumPaid * remaining * 100;
     usd += rowUsd;
     rows += 1;
-    // TRA-3829 (AC5) — attribute the row. `engineMayActOnAdoptedRow` is reused
-    // rather than testing `importedFromTradier` directly so that "the engine
-    // may act on it" and "it counts as the engine's exposure" are one question
-    // with one answer. In particular a TRA-2820 re-adopted ENGINE row is ours
-    // by both readings, and a sandbox import is ours by both readings — a hand
-    // -rolled `importedFromTradier` test here would have split them.
-    if (!engineMayActOnAdoptedRow(p, armed)) {
-      adoptedUsd += rowUsd;
+    // TRA-3913 — attribute the row PER CONTRACT against this engine's own fill
+    // records, not per row against the action arm.
+    //
+    // TRA-3829 reused `engineMayActOnAdoptedRow` here on the stated ground that
+    // "may the engine act on it" and "is it the engine's exposure" should be one
+    // question with one answer. They are not. That predicate says YES to an
+    // `engine_origin` row because we PLACED it and must be able to EXIT it — and
+    // the pre-TRA-3896 reconcile could widen such a row onto the BROKER's whole
+    // lot, so saying yes to the row said yes to contracts the desk bought. On
+    // bqb1 2026-08-21 that was $85.00 of desk premium reading as engine spend
+    // with `adoptedUsd: $0.00`, against a $500 board authorization the order
+    // path had just started gating on (TRA-3911).
+    //
+    // ⛔ `armed` is no longer consulted for the split, deliberately — see
+    // {@link splitEngineExposureContracts}. It is still the parameter the exit
+    // path resolves and is left on this signature unchanged for that reason.
+    const split = splitEngineExposureContracts(p, remaining, () =>
+      // A row with no OCC symbol is unaskable, and the oracle's contract for
+      // "cannot answer" is `null` — which routes to ADOPTED, the conservative
+      // side. Synthesising an empty-string lookup would instead walk the ledger
+      // for `''`, find nothing, and reach the same branch by accident.
+      typeof p.optionSymbol === 'string' && p.optionSymbol.length > 0
+        ? recordedOpenBasis(p.optionSymbol)
+        : null);
+    if (split.adoptedContracts > 0) {
+      // Price the ENGINE share at the oracle's basis and carve the remainder out
+      // of the row, rather than pricing the adopted share at the row's blend.
+      // The row's `premiumPaid` is the BROKER's average across both parties: on
+      // the live XLF row, 1 of 2 contracts at the blended 0.965 is $96.50, where
+      // the engine paid $108.00 and the desk paid $85.00. Carving guarantees
+      // `engineUsd + adoptedUsd === rowUsd` by construction, which is what keeps
+      // `usd` untouched and `usd - adoptedUsd` honest.
+      const engineUsd = split.engineContracts > 0 && split.recordedPremiumPaid !== null
+        ? split.recordedPremiumPaid * split.engineContracts * 100
+        : 0;
+      // Clamp at 0: a row RESTATED below what the ledger says we paid would
+      // otherwise mint negative adopted premium and quietly inflate the engine's
+      // own figure past the row total.
+      adoptedUsd += Math.max(0, rowUsd - engineUsd);
       adoptedRows += 1;
+      if (split.oracleRefused) attributionBlindRows += 1;
     }
   }
   return {
@@ -2480,6 +2559,7 @@ export function foldOpenPremiumAtRisk(
     unpricedRows,
     adoptedUsd: Math.round(adoptedUsd * 100) / 100,
     adoptedRows,
+    attributionBlindRows,
   };
 }
 

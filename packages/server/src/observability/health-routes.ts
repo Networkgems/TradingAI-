@@ -486,6 +486,35 @@ export interface LiveOtmAggregateExposure {
   /** > 0 ⇒ the enforced figure is known to UNDERSTATE exposure (see `foldOpenPremiumAtRisk`). */
   unpricedOpenRows: number;
   /**
+   * ⚠ OPTIONAL, and that is the point. This route is a PASS-THROUGH — it does
+   * not read these three — and a row served by a build older than TRA-3913
+   * genuinely does not carry them. That ABSENCE is the deployed-bytes signal
+   * AC5 grades (`scripts/tra3913-adopted-attribution-live.mjs` G1: 0/67 rows
+   * pre-fix), so declaring them required would assert at the type level exactly
+   * the thing the wire does not guarantee. Same reason TRA-3911's
+   * `admissibleEntryUsd` is served here without being declared at all.
+   *
+   * TRA-3913 — the DESK's share of `openPremiumAtRiskUsd`: premium in contracts
+   * this engine's own `buy_to_open` records do not account for, which the broker
+   * reconcile blended onto an engine row.
+   *
+   * ⚠ INSIDE `openPremiumAtRiskUsd`, not beside it. The order path gates on the
+   * total (TRA-3911's `Σ_j atRisk_j`), so this is how much of the board's
+   * authorization a party outside the engine is spending. The
+   * engine-attributable figure is `openPremiumAtRiskUsd − adoptedPremiumAtRiskUsd`.
+   * Measured $85.00 on bqb1's live XLF row, 2026-08-21.
+   */
+  adoptedPremiumAtRiskUsd?: number;
+  /** TRA-3913 — rows holding ANY of the above. A row can be partly ours, partly the desk's. */
+  adoptedOpenRows?: number;
+  /**
+   * TRA-3913 — of `adoptedOpenRows`, how many the fill oracle REFUSED rather
+   * than ANSWERED. Non-zero ⇒ the adopted figure is an upper bound on desk money
+   * (and the engine figure a lower bound on ours); do not publish it as a desk
+   * measurement. Zero is scoped to what the oracle could see, as ever.
+   */
+  adoptedAttributionBlindRows?: number;
+  /**
    * `capUsd − openPremiumAtRiskUsd`, floored at 0; `null` when unreadable.
    *
    * ⚠ THE FLOOR IS LOSSY. A book over its cap publishes `0` here, which is
