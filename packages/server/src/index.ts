@@ -4018,7 +4018,20 @@ async function buildLiveTodayCellReport(
     return { ...generateEodReport(snapshot), pnlSource: 'live-intraday' as const };
   }
   const env: TradierEnv = mode === 'live' ? 'production' : 'sandbox';
-  const todayBalance = ctx.engine.getEquitySnapshot().equity;
+  // TRA-3924 — read the BROKER equity, never `getEquitySnapshot().equity`.
+  //
+  // `getEquitySnapshot()` returns the engine's PaperAccount in every mode, and
+  // on a `mode: live` book that is the PRESERVED DEMO balance (TRA-3288 names
+  // this surface; live fills are refused entry by design). This cell was the
+  // one remaining reader that fed it into a "current Tradier equity" header:
+  // on 2026-08-21 pre-open it rendered **+$1,924.81** for the day against a
+  // broker that read $678.60 (= the $2,603.49 demo book − the 08-20 broker
+  // anchor of $678.68). `getState()` is the surface the dashboard tiles and
+  // the 21:00 ET settled write both read; in live mode it substitutes the
+  // cached `liveTradierBalance.totalEquity` and reports `0` when no broker
+  // balance has been fetched — which the guard below turns into "--" rather
+  // than a number the broker never confirmed.
+  const todayBalance = ctx.engine.getState().account.totalEquity;
   if (!Number.isFinite(todayBalance) || todayBalance <= 0) return null;
 
   const today = etDateString();
