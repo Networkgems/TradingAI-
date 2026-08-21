@@ -514,6 +514,53 @@ export interface RecordedEngineOpenBasis {
   stoppedAtClose: boolean;
   /** Fill time of the newest `buy_to_open` in the episode, ms epoch. */
   lastTs: number;
+  /**
+   * ── TRA-3913 (regression, 2026-08-21) — THE SAME EPISODE, SCOPED TO ROWS THE
+   * ENGINE ITSELF PLACED (`origin: 'fill'`). ─────────────────────────────────
+   *
+   * The four fields below exist because the ones above answer a question this
+   * module's own importer can put a foreign answer into. `origin:
+   * 'history_import'` rows are the RECONCILE's reconstruction of fills the
+   * broker reports and NO chokepoint of ours recorded (TRA-2959) — they carry
+   * the broker's price, `orderId: null` and `sleeve: 'unattributed'`, and they
+   * are written for the DESK's hand-placed contracts exactly as readily as for
+   * ours. They are evidence about the ACCOUNT, never evidence that this engine
+   * placed the order.
+   *
+   * ⚠ MEASURED, LIVE, ON REAL MONEY. TRA-3913 shipped on `1f1264df` and graded
+   * 12/12 at 03:07Z with the live XLF row splitting $108.00 engine / $85.00
+   * desk. By 13:26Z the same build on the same pid served `adoptedUsd $0.00`
+   * again — no deploy, no code change. Overnight the importer had appended
+   * `XLF260925C00057500 1 @0.85 origin:'history_import'` (the desk's contract)
+   * and `BAC260925C00063000 1 @1.17`, and `contracts` above dutifully counted
+   * them. The oracle for "what did WE pay, and for how many" had absorbed the
+   * desk's fill and answered 2, so the fold attributed the whole lot to the
+   * engine. ⇒ **AN ORACLE THAT INGESTS THE BROKER'S RECORD OF SOMEBODY ELSE'S
+   * TRADE CANNOT ANSWER A PROVENANCE QUESTION**, and the defect re-entered a
+   * ticket that had already been graded PASS on live bytes, through the DATA,
+   * with the fixed code still running.
+   *
+   * ⛔ The wide fields are NOT deprecated and must not be redefined in terms of
+   * these. `importedFromTradier` rows aside, the wide basis is what a RETENTION
+   * or restart gap leaves us — and TRA-2820 measured what happens when a
+   * provenance reader under-counts: 8 live contracts / $216 of real premium
+   * handed the sub-floor sentinel with no stop for a session. Under-counting is
+   * safe for an ATTRIBUTION caller (it over-reports the desk's share and moves
+   * no cap) and dangerous for a PROVENANCE caller. Each caller picks the scope
+   * that fails closed FOR IT; that choice is the whole point of publishing both.
+   */
+  /** Contracts backed by PRICED `buy_to_open` rows this engine placed itself. */
+  enginePlacedContracts: number;
+  /** Quantity-weighted `filledPrice` over those engine-placed fills only. */
+  enginePlacedPremiumPaid: number;
+  /** Engine-placed `buy_to_open` rows in the episode we could not price. */
+  enginePlacedUnpricedFills: number;
+  /**
+   * Contracts in the episode whose ONLY evidence is a `history_import` row.
+   * `enginePlacedContracts === 0 && importedContracts > 0` is the state above:
+   * the ledger holds rows for this OCC and not one of them says we placed it.
+   */
+  importedContracts: number;
 }
 
 /**
@@ -542,17 +589,38 @@ export function recordedEngineOpenBasis(optionSymbol: string): RecordedEngineOpe
   let unpricedFills = 0;
   let lastTs = 0;
   const orderIds: number[] = [];
+  // TRA-3913 — the same walk, scoped to rows we placed. Accumulated HERE rather
+  // than in a second pass over a filtered copy so the two answers can never be
+  // computed over different episode windows.
+  let enginePlacedContracts = 0;
+  let enginePlacedCostBasisUsd = 0;
+  let enginePlacedUnpricedFills = 0;
+  let importedContracts = 0;
   for (const f of episode) {
     const qty = typeof f.contracts === 'number' && Number.isFinite(f.contracts) ? f.contracts : 0;
     const price = f.filledPrice;
+    // `!== 'history_import'` rather than `=== 'fill'`: rows written before
+    // TRA-2959 hydrate with `origin: 'fill'` (see `recordLiveOptionFill`), and a
+    // future origin tag must not silently fall out of the engine's own share —
+    // an unrecognised value belongs on the side that fails closed for the
+    // PROVENANCE readers, which is "ours". The importer is the one thing that
+    // demonstrably writes somebody else's trade into this ledger; name it.
+    const enginePlaced = f.origin !== 'history_import';
     if (typeof f.orderId === 'number' && Number.isFinite(f.orderId)) orderIds.push(f.orderId);
     if (f.ts > lastTs) lastTs = f.ts;
     if (!(qty > 0) || typeof price !== 'number' || !Number.isFinite(price) || price <= 0) {
       unpricedFills += 1;
+      if (enginePlaced) enginePlacedUnpricedFills += 1;
       continue;
     }
     contracts += qty;
     costBasisUsd += price * qty * 100;
+    if (enginePlaced) {
+      enginePlacedContracts += qty;
+      enginePlacedCostBasisUsd += price * qty * 100;
+    } else {
+      importedContracts += qty;
+    }
   }
   return {
     contracts,
@@ -566,6 +634,13 @@ export function recordedEngineOpenBasis(optionSymbol: string): RecordedEngineOpe
     unpricedFills,
     stoppedAtClose,
     lastTs,
+    enginePlacedContracts,
+    // Same divide guard as above, and for the same reason: 0 engine-placed
+    // contracts must not mint a NaN that reads as a number until compared.
+    enginePlacedPremiumPaid:
+      enginePlacedContracts > 0 ? enginePlacedCostBasisUsd / (enginePlacedContracts * 100) : 0,
+    enginePlacedUnpricedFills,
+    importedContracts,
   };
 }
 

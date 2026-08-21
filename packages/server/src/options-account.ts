@@ -8431,7 +8431,21 @@ export class PaperOptionsAccount {
           // `null` (no record at all) is NOT permission. It is the oracle unable
           // to answer, and the fail-open reading of it is what put a foreign
           // contract on this row in the first place.
-          const engineAccountsFor = recorded && recorded.unpricedFills === 0 ? recorded.contracts : null;
+          //
+          // ⚠ TRA-3913 (regression, 2026-08-21) — ENGINE-PLACED contracts, not
+          // the episode-wide count. This is a WRITE path guarding real money,
+          // and the widened count is precisely what the desk's own fill arrives
+          // as: the reconcile imports the broker's record of the hand-placed
+          // contract (`origin: 'history_import'`), the oracle then answers 2 for
+          // a lot of which we bought 1, and this branch ALLOWS absorbing the
+          // broker's blended basis onto the engine's row — the exact damage
+          // TRA-3896 exists to prevent, re-armed by TRA-2959's importer. The
+          // scoping only ever refuses MORE, which is this guard's stated safe
+          // default ("row keeps its own basis; the excess is drift").
+          const engineAccountsFor =
+            recorded && recorded.enginePlacedUnpricedFills === 0
+              ? recorded.enginePlacedContracts
+              : null;
           if (engineAccountsFor === null || incoming.contracts > engineAccountsFor) {
             this.importedAbsorptionRefusals += 1;
             accountLog.warn(
@@ -8443,12 +8457,21 @@ export class PaperOptionsAccount {
                 heldContracts,
                 brokerContracts: incoming.contracts,
                 engineRecordedContracts: engineAccountsFor,
+                // TRA-3744's shape: a path that fails closed can still name the
+                // wrong cause. This ladder decides in the SAME order as the
+                // guard above, and the import case is listed before the generic
+                // shortfall because it is the one an operator would otherwise
+                // read as "our records are just behind".
                 oracle:
                   recorded === null
                     ? 'no `buy_to_open` recorded for this contract — UNRESOLVED, not permission'
-                    : recorded.unpricedFills > 0
-                      ? 'recorded fills carry no usable price — cannot account for the lot'
-                      : 'recorded fills account for fewer contracts than the broker reports',
+                    : recorded.enginePlacedUnpricedFills > 0
+                      ? 'engine-placed fills carry no usable price — cannot account for the lot'
+                      : recorded.enginePlacedContracts === 0 && recorded.importedContracts > 0
+                        ? 'every recorded open on this OCC is a `history_import` of a broker fill — the ledger knows the contracts exist and cannot say they are ours (TRA-3913)'
+                        : 'engine-placed fills account for fewer contracts than the broker reports',
+                episodeRecordedContracts: recorded?.contracts ?? null,
+                importedContracts: recorded?.importedContracts ?? null,
                 enginePremiumPaid: existing.premiumPaid,
                 brokerBlendedPremium: incoming.premiumPaid,
                 action:

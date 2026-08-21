@@ -503,6 +503,49 @@ describe('TRA-3896 part 2 — the reconcile refuses to widen an engine-origin ro
     expect(acct.getImportedAbsorptionCensus()).toEqual({ candidates: 1, refusals: 0, allowed: 1 });
   });
 
+  it('★ TRA-3913 — a `history_import` of the DESK\'s fill is not a top-up, and must not unlock the copy', () => {
+    // The state the live box actually reached overnight on 2026-08-21. This
+    // guard's oracle is the same one TRA-3913 uses, and the TRA-2959 importer
+    // writes the desk's contract into it: engine 1 @1.08 (ours, order 142603071)
+    // plus an import 1 @0.85 (theirs, no order id). The episode-wide count then
+    // reads 2 — EXACTLY the "our own fills account for the whole incoming lot"
+    // condition — and this branch would have absorbed the broker's 2-lot and its
+    // 0.965 blend onto the engine's row, re-deriving the stop off a price the
+    // engine never paid. That is the damage TRA-3896 exists to prevent, re-armed
+    // through the data instead of the code.
+    //
+    // ⚠ Note what makes this a real control and not a restatement of the test
+    // above: the two differ ONLY in the `origin` of the second fill. Same lot,
+    // same prices, same broker report, opposite verdicts.
+    recordEngineOpen(XLF, 1, 1.08, 142603071, OPENED_AT);
+    recordLiveOptionFill({
+      ts: OPENED_AT + 3_600_000,
+      etDay: '2026-08-20',
+      sleeve: 'unattributed',
+      optionSymbol: XLF,
+      side: 'buy_to_open',
+      contracts: 1,
+      filledPrice: 0.85,
+      orderId: null,
+      origin: 'history_import',
+    });
+    // The oracle knows 2 contracts exist and can vouch for exactly 1 of them.
+    const basis = recordedEngineOpenBasis(XLF)!;
+    expect(basis.contracts).toBe(2);
+    expect(basis.enginePlacedContracts).toBe(1);
+    expect(basis.importedContracts).toBe(1);
+
+    const acct = liveAccount([xlfRow()]);
+    acct.reconcileTradierPositions([tradierPos()], 'live');
+
+    const row = acct.getState().openOptions[0]!;
+    expect(row.contracts).toBe(1);
+    expect(row.contractsRemaining).toBe(1);
+    expect(row.premiumPaid).toBe(1.08);        // NOT the 0.965 blend
+    expect(row.stopLossPremium).toBeCloseTo(0.864, 10); // its own stop, not 0.772
+    expect(acct.getImportedAbsorptionCensus()).toEqual({ candidates: 1, refusals: 1, allowed: 0 });
+  });
+
   it('★ NEGATIVE CONTROL: a real partial CLOSE still reduces the row — the refusal is one-directional', () => {
     // Refusing a DECREASE would strand the row believing it holds contracts that
     // are gone. The broker is the authority on what is left.

@@ -99,6 +99,20 @@ if (liveOpens.length === 0) {
     + 'so the conservative branch fires for a reason that has nothing to do with this fix');
 }
 
+// ⛔ ENGINE-PLACED ROWS ONLY (`origin !== 'history_import'`) — 2026-08-21.
+// This grader FAILED 11/12 at 13:26Z on the build it had passed 12/12 at 03:07Z:
+// same pid, same commit, uptime 37,409s. Overnight the TRA-2959 reconcile
+// imported the two contracts no chokepoint of ours recorded — the DESK's — and
+// both this tape and the server's oracle counted them, so the served engine
+// share went to $358.00 (the whole book) and adopted to $0.00. An `origin:
+// 'history_import'` row is the broker's record of a fill, written for the desk's
+// hand-placed contract exactly as readily as for ours; it is evidence about the
+// ACCOUNT, never evidence that this engine placed the order.
+//
+// ⚠ The two implementations moving together does NOT make this identity
+// vacuous: the tape is still summed independently from raw `records[]`, so a
+// fold that split the wrong way still fails here. What the scoping fixes is the
+// QUESTION both sides answer.
 function tapeBasis(optionSymbol) {
   const bySym = records.filter(r => r.optionSymbol === optionSymbol)
     .slice()
@@ -106,16 +120,18 @@ function tapeBasis(optionSymbol) {
   let contracts = 0;
   let costBasisUsd = 0;
   let unpriced = 0;
+  let imported = 0;
   for (const f of bySym) {
     if (f.side === 'sell_to_close') break; // episode boundary
     if (f.side !== 'buy_to_open') continue;
     const q = Number.isFinite(f.contracts) ? f.contracts : 0;
+    if (f.origin === 'history_import') { imported += q > 0 ? q : 0; continue; }
     const p = f.filledPrice;
     if (!(q > 0) || typeof p !== 'number' || !Number.isFinite(p) || p <= 0) { unpriced += 1; continue; }
     contracts += q;
     costBasisUsd += p * q * 100;
   }
-  return { contracts, costBasisUsd, unpriced };
+  return { contracts, costBasisUsd, unpriced, imported };
 }
 
 // ── The subject: gate-open books only ────────────────────────────────────────
@@ -184,11 +200,15 @@ for (const r of withRows) {
       `the tape itself holds ${tapeUnpriced} unpriceable fill(s) — oracle incomplete`);
     continue;
   }
+  const tapeImported = contributing.reduce((sum, b) => sum + (b.imported ?? 0), 0);
   check(`G2.${r.book}.tape`,
     cents(engineServed) === cents(tapeUsd),
-    `served engine share ${usd(engineServed)} === raw fill tape ${usd(tapeUsd)}`
+    `served engine share ${usd(engineServed)} === engine-placed fill tape ${usd(tapeUsd)}`
     + ` over ${contributing.length} OPEN episode(s): `
-    + contributing.map(b => `${b.s} ${b.contracts}@${usd(b.costBasisUsd / (b.contracts * 100))}`).join(', '));
+    + contributing.map(b => `${b.s} ${b.contracts}@${b.contracts > 0 ? usd(b.costBasisUsd / (b.contracts * 100)) : 'n/a'}`
+      + (b.imported > 0 ? ` +${b.imported} imported` : '')).join(', ')
+    + ` · ${tapeImported} contract(s) held on `
+    + '`history_import` rows are NOT counted as ours (the 2026-08-21 regression)');
 
   check(`G2.${r.book}.rowcount`,
     Number.isInteger(r.adoptedOpenRows) && r.adoptedOpenRows <= r.openRows,
@@ -234,6 +254,32 @@ check('G3.fleet-at-risk-is-the-TOTAL',
     Object.prototype.hasOwnProperty.call(r, 'adoptedPremiumAtRiskUsd')).length;
   check('C2.presence-can-FAIL', present === 0,
     'the pre-fix shape (key deleted) is detected as ABSENT, so G1 is a real read');
+}
+// C4 — THE REGRESSION'S OWN CONTROL. The tape must not move when a
+// `history_import` row is injected, and it MUST move for the identical row
+// tagged `origin: 'fill'`. Both directions, because "ignores everything" is the
+// obvious way to fail this after the 2026-08-21 fix (TRA-3722's lesson).
+{
+  const sym = liveOpens[0].optionSymbol;
+  const base = tapeBasis(sym);
+  const synth = (origin) => ({
+    ...liveOpens[0], optionSymbol: sym, side: 'buy_to_open', mode: 'live',
+    contracts: 1, filledPrice: 9.99, orderId: null, origin,
+    ts: Math.max(...records.filter(r => r.optionSymbol === sym).map(r => r.ts)) + 1,
+  });
+  const saved = records.slice();
+  records.push(synth('history_import'));
+  const withImport = tapeBasis(sym);
+  records.length = 0; records.push(...saved, synth('fill'));
+  const withFill = tapeBasis(sym);
+  records.length = 0; records.push(...saved);
+  check('C4.import-is-ignored-and-a-fill-is-not',
+    cents(withImport.costBasisUsd) === cents(base.costBasisUsd)
+    && withImport.imported === base.imported + 1
+    && cents(withFill.costBasisUsd) === cents(base.costBasisUsd + 999),
+    `injected +1@$9.99: as \`history_import\` the tape holds at ${usd(base.costBasisUsd)}`
+    + ` (imported ${base.imported}→${withImport.imported}); as \`fill\` it moves to`
+    + ` ${usd(withFill.costBasisUsd)} — the scoping discriminates in BOTH directions`);
 }
 // C3 — the fold is on the ARM, not on `mode`.
 {

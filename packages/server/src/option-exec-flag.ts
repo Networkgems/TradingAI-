@@ -229,12 +229,35 @@ export function hasEngineHandover(
  * importing nothing — the acyclic direction the TRA-3829 note above relies on.
  */
 export interface EngineRecordedOpenEvidence {
-  /** Contracts this engine's own PRICED `buy_to_open` records account for. */
+  /**
+   * Contracts EVERY priced `buy_to_open` row in the episode accounts for,
+   * whoever placed them.
+   *
+   * ⛔ NOT the attribution figure — read {@link EngineRecordedOpenEvidence.enginePlacedContracts}.
+   * Kept on the interface because the refusal messages report it: "the ledger
+   * knows about 2 contracts and can only vouch for 1" is a different, and more
+   * useful, statement than either number alone.
+   */
   contracts: number;
   /** Quantity-weighted `filledPrice` over those fills, per contract. */
   premiumPaid: number;
   /** `buy_to_open` rows in the episode we could not price. `> 0` ⇒ refuse. */
   unpricedFills: number;
+  /**
+   * TRA-3913 (regression 2026-08-21) — contracts backed by rows the ENGINE
+   * PLACED, i.e. excluding the reconcile's `history_import` reconstructions of
+   * broker fills no chokepoint of ours recorded. THIS is the attribution
+   * oracle: an import row is written for the desk's hand-placed contract
+   * exactly as readily as for ours, so counting it answers "the broker says
+   * this OCC was bought" where the question is "did WE buy it".
+   */
+  enginePlacedContracts: number;
+  /** Quantity-weighted `filledPrice` over the engine-placed fills only. */
+  enginePlacedPremiumPaid: number;
+  /** Engine-placed rows in the episode we could not price. `> 0` ⇒ refuse. */
+  enginePlacedUnpricedFills: number;
+  /** Contracts in the episode whose only evidence is a `history_import` row. */
+  importedContracts: number;
 }
 
 /** Why {@link splitEngineExposureContracts} attributed the row the way it did. */
@@ -252,7 +275,15 @@ export type EngineExposureReason =
   /** `engine_origin` but the ledger holds no `buy_to_open` for the symbol ⇒ cannot answer. */
   | 'oracle_silent'
   /** `engine_origin` but the episode holds an unpriceable fill ⇒ cannot answer completely. */
-  | 'oracle_unpriced';
+  | 'oracle_unpriced'
+  /**
+   * TRA-3913 regression — `engine_origin`, the ledger DOES hold opens for the
+   * symbol, and every one of them is a `history_import` reconstruction of a
+   * broker fill. The ledger can say the contracts exist; it cannot say they are
+   * ours. A REFUSAL, not a finding: the engine's own row may equally have aged
+   * out of the 30-day retention and been re-imported from history.
+   */
+  | 'oracle_import_only';
 
 export interface EngineExposureSplit {
   /** Contracts attributable to THIS engine's own recorded entries. */
@@ -305,14 +336,25 @@ export interface EngineExposureSplit {
  *    is the desk's by provenance; there is nothing for the oracle to add, and
  *    asking it opens a double-attribution hazard (two rows on one OCC symbol
  *    would each claim the same recorded contracts).
- * 4. `engine_origin`, oracle `null` or `unpricedFills > 0` ⇒ **wholly ADOPTED**,
- *    `oracleRefused: true`. ⛔ `null` is "cannot answer", NOT "the engine bought
- *    nothing" and NOT permission (AC2). A fail-OPEN reading of exactly this
- *    `null` is what put a foreign contract on an engine row to begin with.
- * 5. `engine_origin`, oracle answered ⇒ ours up to `min(contracts, remaining)`,
- *    the rest the desk's. `min` matters: a PARTIAL CLOSE truncates the oracle's
- *    episode window, and a partial close on the ROW shrinks `remaining` — the
- *    two move independently and neither may over-claim the other.
+ * 4. `engine_origin`, oracle `null` / no engine-placed contracts / an unpriced
+ *    engine-placed fill ⇒ **wholly ADOPTED**, `oracleRefused: true`. ⛔ `null`
+ *    is "cannot answer", NOT "the engine bought nothing" and NOT permission
+ *    (AC2). A fail-OPEN reading of exactly this `null` is what put a foreign
+ *    contract on an engine row to begin with.
+ * 5. `engine_origin`, oracle answered ⇒ ours up to
+ *    `min(enginePlacedContracts, remaining)`, the rest the desk's. `min`
+ *    matters: a PARTIAL CLOSE truncates the oracle's episode window, and a
+ *    partial close on the ROW shrinks `remaining` — the two move independently
+ *    and neither may over-claim the other.
+ *
+ * ⚠ TRA-3913 REGRESSION (2026-08-21) — rules 4 and 5 read
+ * `enginePlacedContracts`, NEVER `contracts`. The episode-wide count includes
+ * the reconcile's `history_import` rows, which are the broker's record of a
+ * fill NO chokepoint of ours saw — written for the DESK's contract as readily
+ * as for ours. Overnight on 2026-08-21 the importer appended the desk's XLF
+ * contract at $0.85, the wide count went 1 → 2, and this predicate handed the
+ * engine a contract it did not buy on a build that had graded 12/12 PASS the
+ * same morning. **The fix was correct and the DATA moved underneath it.**
  */
 export function splitEngineExposureContracts(
   row: { importedFromTradier?: boolean; adoptionAuthority?: string; tradierEnv?: string },
@@ -346,16 +388,36 @@ export function splitEngineExposureContracts(
 
   const recorded = lookupRecordedOpenBasis();
   if (recorded === null) return wholly('adopted', 'oracle_silent', true);
-  if (!(recorded.unpricedFills === 0)) return wholly('adopted', 'oracle_unpriced', true);
+  // ⚠ SCOPED TO THE ENGINE-PLACED ROWS, NOT THE EPISODE (TRA-3913 regression,
+  // measured on bqb1 2026-08-21 13:26Z with the FIXED build still running). An
+  // unpriceable row we did not place cannot spoil an answer about contracts we
+  // did: it only concerns contracts already on the adopted side. Refusing on
+  // the episode-wide count would hand the desk a whole engine row every time the
+  // importer recovered one unpriced broker leg.
+  if (!(recorded.enginePlacedUnpricedFills === 0)) {
+    return wholly('adopted', 'oracle_unpriced', true);
+  }
 
   // `!(x > 0)` rather than `x <= 0`: the latter admits NaN into the ACCOUNTED
   // branch, and a NaN contract count reads as a number until something compares
   // it (TRA-3486).
   const accounted =
-    Number.isFinite(recorded.contracts) && recorded.contracts > 0 ? recorded.contracts : 0;
+    Number.isFinite(recorded.enginePlacedContracts) && recorded.enginePlacedContracts > 0
+      ? recorded.enginePlacedContracts
+      : 0;
   const premium =
-    Number.isFinite(recorded.premiumPaid) && recorded.premiumPaid > 0 ? recorded.premiumPaid : null;
-  if (accounted === 0 || premium === null) return wholly('adopted', 'oracle_unpriced', true);
+    Number.isFinite(recorded.enginePlacedPremiumPaid) && recorded.enginePlacedPremiumPaid > 0
+      ? recorded.enginePlacedPremiumPaid
+      : null;
+  if (accounted === 0 || premium === null) {
+    // Separate the two silences one last time. "We hold import rows for this OCC
+    // and nothing that says we placed it" is a different fact from "the episode
+    // holds a fill we cannot price", and on 2026-08-21 the first one is what the
+    // overnight reconcile manufactured on the live book.
+    const importedOnly =
+      Number.isFinite(recorded.importedContracts) && recorded.importedContracts > 0;
+    return wholly('adopted', importedOnly ? 'oracle_import_only' : 'oracle_unpriced', true);
+  }
 
   const engineContracts = Math.min(accounted, remaining);
   const adoptedContracts = remaining - engineContracts;
