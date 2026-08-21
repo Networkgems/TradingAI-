@@ -49,7 +49,9 @@
 // ⛔ Zero artifacts read is BLIND, never PASS. Zero rows FILTERED is FAIL, never
 // PASS. The two zeros mean different things and are reported separately.
 import fs from 'node:fs';
-import { assessQuotePlausibility, SUSPECT_MOVE_RATIO_FLOOR } from '../packages/shared/dist/index.js';
+import {
+  assessQuotePlausibility, SUSPECT_MOVE_RATIO_FLOOR, formatQuoteLevel,
+} from '../packages/shared/dist/index.js';
 
 const HOST = process.env.HOST ?? 'https://tradingai-bqb1.onrender.com';
 const FOLDS = ['demo', 'live', 'sandbox'];
@@ -76,7 +78,43 @@ const env = {
   ADMIN_PASSWORD: process.env.ADMIN_PASSWORD ?? process.env.TRADING_ADMIN_PASSWORD ?? fileEnv.ADMIN_PASSWORD,
 };
 
-/** The generator's row rendering. Must stay byte-identical to `formatMoverMarkdownRow`. */
+/**
+ * EVERY rendering `formatMoverMarkdownRow` may have produced for this row, across
+ * the one formatter change the archive spans.
+ *
+ * ⛔ TRA-3915 — THIS USED TO RETURN ONE STRING WITH A HARD-CODED `$`, AND THE
+ * COMMENT ABOVE IT SAID "must stay byte-identical to `formatMoverMarkdownRow`".
+ * It stopped being that in `edb7e65` (TRA-3390), which routed the generator
+ * through `formatQuoteLevel` so a KRW level stops claiming to be dollars. The
+ * locator did not move, so for any row whose currency is foreign or unknown the
+ * reconstruction no longer matches the served line — and the HALF-FILTERED leg
+ * below is a `rows.some(l => l === moverRow(s))`, where a non-match reads as
+ * ABSENT, i.e. as correctly suppressed. That is the fourth bullet of the unit
+ * test's own header list ("a row locator that silently stops matching after a
+ * formatter change, degrading to nothing-removed — indistinguishable from
+ * clean") occurring in the checker that exists to catch it.
+ *
+ * The archive genuinely spans both renderings and neither can be dropped:
+ *   • pre-TRA-3390 artifacts were WRITTEN with the hard-coded `$` and carry no
+ *     `currency`, so grading them with today's renderer alone would blind the
+ *     check over most of the corpus — the same bug, aimed the other way;
+ *   • post-TRA-3390 artifacts carry the currency-aware rendering.
+ * A served line matching EITHER is the same row. Widening the locator cannot
+ * manufacture a false HALF-FILTERED: both candidates start `| ${symbol} |`, so a
+ * line matching one is that symbol's row under one of the two generators.
+ */
+function moverRowCandidates(m) {
+  const pct = (m.changePct >= 0 ? '+' : '') + m.changePct.toFixed(2);
+  const row = level => `| ${m.symbol} | ${level} | ${pct}% |`;
+  const legacy = '$' + Math.abs(m.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  // Derived from the SHIPPED formatter, never re-implemented: a re-implementation
+  // is what drifted, and a control that grades a copy against a literal cannot
+  // see the copy drift.
+  const current = formatQuoteLevel(Math.abs(m.price), m.currency);
+  return [...new Set([row(legacy), row(current)])];
+}
+
+/** The archived (pre-TRA-3390) rendering. Kept for the byte-for-byte control. */
 function moverRow(m) {
   const usd = '$' + Math.abs(m.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const pct = (m.changePct >= 0 ? '+' : '') + m.changePct.toFixed(2);
@@ -125,11 +163,33 @@ function selftest() {
   // along (TRA-3241).
   const qmco = { symbol: 'QMCO', price: 19.34, changePct: 64.18 };
   if (assessQuotePlausibility(qmco).suspect) fails.push('control: QMCO 19.34/+64.18% must NOT be suspect');
-  // The row renderer must reproduce the archived line byte-for-byte, or the
+  // The row locator must reproduce the archived line byte-for-byte, or the
   // surface check silently degrades to "no suppressed row found in the table",
   // which reads exactly like a correctly filtered table.
-  if (moverRow(selx) !== '| SELX | $0.34 | +1316.67% |') {
-    fails.push(`control: row renderer drifted — got ${moverRow(selx)}`);
+  if (!moverRowCandidates(selx).includes('| SELX | $0.34 | +1316.67% |')) {
+    fails.push(`control: locator lost the archived rendering — got ${moverRowCandidates(selx).join(' | ')}`);
+  }
+  // TRA-3915 — and it must reproduce the line TODAY'S generator writes, derived
+  // from the shipped formatter rather than from a literal. The control this
+  // replaces compared a LOCAL re-implementation against a hard-coded string, so
+  // it agreed with itself by construction and stayed green through the entire
+  // TRA-3390 drift it existed to catch. A control that cannot fail is not one.
+  const selxUsd = { ...selx, currency: 'USD' };
+  if (!moverRowCandidates(selxUsd).includes(`| SELX | ${formatQuoteLevel(0.34, 'USD')} | +1316.67% |`)) {
+    fails.push('control: locator does not reproduce the shipped USD rendering');
+  }
+  // ...and the two renderings must actually DIFFER where TRA-3390 made them
+  // differ. If this ever collapses to one candidate, the locator has silently
+  // stopped spanning the formatter boundary and the foreign rows are blind again
+  // — which is the failure that got here in the first place, so it is asserted
+  // rather than assumed.
+  const krw = { symbol: '000660.KS', price: 1550000, changePct: -14.65, currency: 'KRW' };
+  const krwRows = moverRowCandidates(krw);
+  if (krwRows.length !== 2) {
+    fails.push(`control: locator no longer spans the TRA-3390 boundary — ${krwRows.length} candidate(s)`);
+  }
+  if (!krwRows.includes('| 000660.KS | 1,550,000.00 KRW | -14.65% |')) {
+    fails.push('control: locator cannot see a currency-aware foreign row');
   }
   // And the table parser must be able to SEE a row, else every artifact grades
   // as trivially consistent.
@@ -230,7 +290,8 @@ for (const fold of FOLDS) {
           problems.push(`SURFACE DIVERGENCE — ${mv.length} JSON rows vs ${rows.length} markdown rows`);
         }
         for (const s of suppressed) {
-          if (rows.some(l => l === moverRow(s))) {
+          const candidates = moverRowCandidates(s);
+          if (rows.some(l => candidates.includes(l))) {
             problems.push(`HALF-FILTERED — ${s.symbol} suppressed from JSON but STILL RENDERED in the markdown table`);
           }
         }

@@ -532,6 +532,11 @@ function top5Movers(
       symbol: s.symbol,
       price: s.price,
       changePct: s.changePct,
+      // TRA-3915 — carried for the same reason the served movers carry it a few
+      // lines above, and off the same field. The excluded set is drawn from the
+      // WHOLE candidate universe rather than the surviving 5, so this is the
+      // surface most likely to be printing a foreign level.
+      ...(typeof s.currency === 'string' ? { currency: s.currency } : {}),
       impliedPrevClose: v.impliedPrevClose,
       ratio: v.ratio,
       ...(action

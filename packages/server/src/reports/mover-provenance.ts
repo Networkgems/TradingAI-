@@ -180,7 +180,18 @@ function buildWriteTimeBlock(
   }
 
   const rows = writeTime.displaced.map((e, i) => {
-    const price = Number.isFinite(e.price) ? `$${Math.abs(e.price).toFixed(2)}` : 'n/a';
+    // TRA-3915 — the same rendering as `moverCell` above, for the same reason,
+    // and it is this line that made the point the `moverCell` docblock argues.
+    // It kept the hard-coded `$` through TRA-3390 and so denominated the
+    // write-time table in dollars while the read-time table four paragraphs up
+    // had stopped doing that — the two surfaces disagreeing about the same class
+    // of datum, inside the one note whose whole job is that they must not. (It
+    // also dropped the thousands separators, so a KRW level printed as
+    // `$1550000.00` where the table above it prints `1,550,000.00 KRW`.)
+    //
+    // `n/a` is retained for a non-finite price, exactly as in `moverCell`: "no
+    // number" is a different fact from "number with an unknown unit".
+    const price = Number.isFinite(e.price) ? formatQuoteLevel(Math.abs(e.price), e.currency) : 'n/a';
     const pct = Number.isFinite(e.changePct)
       ? `${e.changePct >= 0 ? '+' : ''}${e.changePct.toFixed(2)}%`
       : 'n/a';

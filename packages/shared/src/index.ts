@@ -4377,6 +4377,25 @@ export interface MoverWriteTimeExclusion {
   symbol: string;
   /** The price the row carried when it was excluded, verbatim. */
   price: number;
+  /**
+   * TRA-3915 — the currency `price` is denominated in, same contract as
+   * {@link EodMover.currency} and copied off the same `SymbolState` row.
+   *
+   * This field exists because the suppression note renders TWO tables and they
+   * were denominating the same class of datum differently: the read-time table
+   * went currency-aware with TRA-3390 while the write-time table below it kept a
+   * hard-coded `$`. That is the two-surfaces-disagree failure the read-time
+   * docblock in `mover-provenance.ts` says it exists to prevent, reproduced one
+   * paragraph lower — and the write-time set is drawn from the FULL ranking
+   * universe (~525 rows on bqb1, ~131 condemned), which is where the foreign
+   * listings actually are. The read-time table can only ever be wrong about the
+   * 5 rows that survived.
+   *
+   * Optional, and absent renders unit-less: every record persisted before this
+   * ticket lacks it, and an archived row we cannot retroactively denominate must
+   * not be asserted as dollars (TRA-3390 rule 2, *unknown is not USD*).
+   */
+  currency?: string;
   /** The `changePct` it would have been RANKED on, verbatim. */
   changePct: number;
   /**

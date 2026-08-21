@@ -17,6 +17,17 @@
 //
 // The positive control is a REAL archived row: `| SELX | $0.34 | +1316.67% |`,
 // the row quoted verbatim off the 2026-07-21 live artifact on TRA-2631.
+//
+// ⚠️ TRA-3915 — THE FIXTURES BELOW CARRY AN EXPLICIT `currency: 'USD'`, AND THAT
+// IS LOAD-BEARING, NOT DECORATION. Since TRA-3390 every level on both surfaces
+// renders through `formatQuoteLevel`, whose rule 2 is *unknown is not USD*: a
+// fixture with no `currency` renders `0.34`, bare. That is correct behaviour and
+// it is also what silently voided the positive control — the fourth bullet
+// above, arriving as itself. `not.toContain('| SELX | $0.34 | +1316.67% |')`
+// went VACUOUSLY true, and would have stayed green with the filter deleted
+// outright. These four rows are US listings quoted off live artifacts in
+// dollars, so USD is the fixture's fact about the row, not a default being
+// reinstated. A currency-LESS row is pinned separately, on purpose, below.
 
 import { describe, it, expect } from 'vitest';
 import type {
@@ -32,17 +43,17 @@ import { formatMoverMarkdownRow, MOVERS_MARKDOWN_HEADING } from './eod-report.js
 const BUILD = '7a5317605e1c';
 
 /** The fabricated 2026-07-21 headline: implied prev close 0.0240, r = 14.17. */
-const SELX: EodMover = { symbol: 'SELX', price: 0.34, changePct: 1316.67 };
+const SELX: EodMover = { symbol: 'SELX', price: 0.34, changePct: 1316.67, currency: 'USD' };
 /**
  * A genuine large mover safely under the band (QMCO, 2026-08-11, r = 1.642).
  * TRA-3241 retired INLF ($6.27 / +97.17%, r = 1.9717) from this role: it sits
  * INSIDE the k = 2 proximity band — an MNST-shaped row, correctly suppressed
  * by the current rule.
  */
-const QMCO: EodMover = { symbol: 'QMCO', price: 19.34, changePct: 64.18 };
-const NVDA: EodMover = { symbol: 'NVDA', price: 178.25, changePct: 2.41 };
+const QMCO: EodMover = { symbol: 'QMCO', price: 19.34, changePct: 64.18, currency: 'USD' };
+const NVDA: EodMover = { symbol: 'NVDA', price: 178.25, changePct: 2.41, currency: 'USD' };
 /** The second fabricated headline, off the 2026-07-15 live artifact. */
-const JEM: EodMover = { symbol: 'JEM', price: 6.05, changePct: 1102.07 };
+const JEM: EodMover = { symbol: 'JEM', price: 6.05, changePct: 1102.07, currency: 'USD' };
 
 function markdownWith(movers: EodMover[]): string {
   return [
@@ -92,15 +103,28 @@ function cleanReport(movers: EodMover[]) {
  * the session summary while the footer called that document "as published".
  */
 const PLAG_WT: MoverWriteTimeExclusion = {
-  symbol: 'PLAG', price: 5.81, changePct: 927.05,
+  symbol: 'PLAG', price: 5.81, changePct: 927.05, currency: 'USD',
   instrument: 'TRA-2610:session-move', reason: 'implausible_session_move',
   impliedPrevClose: 0.5657, ratio: 10.27,
 };
 const MNST_WT: MoverWriteTimeExclusion = {
-  symbol: 'MNST', price: 45.53, changePct: -50.21,
+  symbol: 'MNST', price: 45.53, changePct: -50.21, currency: 'USD',
   instrument: 'TRA-3068:corporate-action', reason: 'corporate_action',
   impliedPrevClose: 91.44, ratio: 2.008,
   corporateAction: '2:1 exDate=2026-08-11',
+};
+/**
+ * TRA-3915 — the write-time surface's foreign row. SK Hynix is THE row TRA-3390
+ * was filed on (`| 000660.KS | $1,550,000.00 | -14.65% |`, 2026-07-28), and it is
+ * a ranking candidate like any other, so it can be condemned at write time and
+ * land in the displaced table. Before this ticket that table rendered it
+ * `$1550000.00` — the original defect, one paragraph below the table that had
+ * been fixed.
+ */
+const HYNIX_WT: MoverWriteTimeExclusion = {
+  symbol: '000660.KS', price: 1550000, changePct: -14.65, currency: 'KRW',
+  instrument: 'TRA-2634:level-continuity', reason: 'level_discontinuity',
+  impliedPrevClose: 1816056.64, ratio: 1.17,
 };
 
 /** Data rows of the movers table in a served document (header rows excluded). */
@@ -252,7 +276,15 @@ describe('read-time mover filter + provenance (TRA-2631, board ruling A)', () =>
 
   // ── Scope point 3: BOTH surfaces, and never half of one ────────────────────
   it('removes the row from the rendered table, leaving the clean rows byte-identical', () => {
-    const out = annotateReportProvenance(report([SELX, QMCO, NVDA]), BUILD);
+    const input = report([SELX, QMCO, NVDA]);
+    // TRA-3915 — the negative control's own control. `not.toContain` is only
+    // evidence if the string is one the UNFILTERED document actually renders;
+    // otherwise deleting the filter outright leaves this test green. It went
+    // vacuous once already, silently, when TRA-3390 moved the renderer under a
+    // currency-less fixture, so it is now pinned in both directions.
+    expect(input.markdown).toContain('| SELX | $0.34 | +1316.67% |');
+
+    const out = annotateReportProvenance(input, BUILD);
 
     expect(out.markdown).not.toContain('| SELX | $0.34 | +1316.67% |');
     expect(tableRows(out.markdown)).toEqual([
@@ -471,5 +503,99 @@ describe('write-time exclusions are carried into the read-time note (TRA-3296)',
     expect(out.top5Movers.map(m => m.symbol)).toEqual(['QMCO']);
     expect(out.moversProvenance!.filteredCount).toBe(1);
     expect(out.markdown).toContain('Write-time exclusions: UNKNOWN');
+  });
+});
+
+// ── TRA-3915 ─────────────────────────────────────────────────────────────────
+//
+// This note renders levels on THREE surfaces — the movers table, the read-time
+// suppression rows, and the write-time displaced rows — and TRA-3390's docblock
+// argues at length that they must not disagree about the same datum. Nothing
+// pinned that. The read-time cell went currency-aware in `edb7e65`, the
+// write-time cell kept a hard-coded `$` for another five months, and the only
+// test that touched either was asserting the OLD string off a fixture that had
+// no currency to render — so it failed for being stale rather than for catching
+// the divergence one line below it.
+//
+// The rule under test is TRA-3390's rule 2, **UNKNOWN IS NOT USD**, and the
+// reason it gets its own block is that the tempting repair for a red
+// `toContain('$0.34')` is to default the absent currency back to USD on "just
+// this surface". That is the original defect, re-shipped silently, for every row
+// the adapter was quiet on.
+describe('every level on this note carries its own currency (TRA-3915 / TRA-3390)', () => {
+  const KRW: EodMover = { symbol: '000660.KS', price: 1550000, changePct: 1316.67, currency: 'KRW' };
+  /** The archived shape: stored before TRA-3390, so genuinely undenominated. */
+  const NOCCY: EodMover = { symbol: 'SELX', price: 0.34, changePct: 1316.67 };
+
+  it('renders a foreign level in ITS OWN currency in the suppression note, not dollars', () => {
+    const out = annotateReportProvenance(report([KRW, QMCO, NVDA]), BUILD);
+    expect(out.moversProvenance!.filteredCount).toBe(1);
+    expect(out.markdown).toContain('1,550,000.00 KRW');
+    // The defect, stated as the assertion that catches it coming back.
+    expect(out.markdown).not.toContain('$1,550,000.00');
+    expect(out.markdown).not.toContain('$1550000.00');
+  });
+
+  it('renders an UNKNOWN currency bare — absent must never be re-defaulted to USD', () => {
+    const out = annotateReportProvenance(report([NOCCY, QMCO, NVDA]), BUILD);
+    expect(out.moversProvenance!.filteredCount).toBe(1);
+    expect(out.markdown).toContain('0.34 / +1316.67%');
+    expect(out.markdown).not.toContain('$0.34 / +1316.67%');
+  });
+
+  it('agrees with the movers table about the same row, on both surfaces', () => {
+    // The property TRA-3390's docblock claims and TRA-3915 found unenforced: the
+    // note re-prints levels the table also prints, and a reader must not see the
+    // same number denominated two ways in one document.
+    for (const m of [SELX, KRW, NOCCY]) {
+      const out = annotateReportProvenance(report([m, QMCO, NVDA]), BUILD);
+      const level = formatMoverMarkdownRow(m).split('|')[2]!.trim();
+      expect(out.markdown).toContain(`${level} / `);
+    }
+  });
+
+  it('renders the WRITE-TIME displaced table in each row\'s own currency too', () => {
+    const out = annotateReportProvenance(
+      reportWithWriteTime([QMCO, NVDA], {
+        displaced: [MNST_WT, HYNIX_WT], excludedTotal: 131, candidateCount: 525, build: BUILD,
+      }),
+      BUILD,
+    );
+    // USD is unchanged from the pre-TRA-3915 rendering — this fix moves the UNIT,
+    // not the digits, for every row that was already correct.
+    expect(out.markdown).toContain('$45.53 / -50.21%');
+    // ...and the row the whole currency ticket was filed on is no longer dollars.
+    expect(out.markdown).toContain('1,550,000.00 KRW / -14.65%');
+    expect(out.markdown).not.toContain('$1550000.00');
+  });
+
+  it('leaves an undenominated write-time row bare rather than asserting dollars', () => {
+    // Every `MoverWriteTimeExclusion` persisted before TRA-3915 is this shape.
+    const { currency: _drop, ...archived } = MNST_WT;
+    const out = annotateReportProvenance(
+      reportWithWriteTime([QMCO, NVDA], {
+        displaced: [archived], excludedTotal: 7, candidateCount: 500, build: BUILD,
+      }),
+      BUILD,
+    );
+    expect(out.markdown).toContain('45.53 / -50.21%');
+    expect(out.markdown).not.toContain('$45.53');
+  });
+
+  it('still says n/a for a non-finite write-time price — no number is not unknown unit', () => {
+    // The discrimination `moverCell` documents, now asserted on the surface that
+    // only ever had it by accident.
+    const out = annotateReportProvenance(
+      reportWithWriteTime([QMCO, NVDA], {
+        displaced: [{ ...MNST_WT, price: Number.NaN }],
+        excludedTotal: 7, candidateCount: 500, build: BUILD,
+      }),
+      BUILD,
+    );
+    expect(out.markdown).toContain('n/a / -50.21%');
+    // `formatQuoteLevel`'s own non-finite rendering must NOT leak through here:
+    // an em-dash would be a third spelling of a fact this note already has two
+    // agreed words for.
+    expect(out.markdown).not.toContain('— / -50.21%');
   });
 });

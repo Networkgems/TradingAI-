@@ -24,6 +24,7 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { formatQuoteLevel } from '../packages/shared/dist/index.js';
 
 // `new URL(...).pathname` yields `/C:/...` on Windows, which `spawn` resolves to
 // the nonexistent `C:\C:\...`. Every control then fails identically for a reason
@@ -62,15 +63,26 @@ function stamp(m, verdict, reason) {
   };
 }
 
+/**
+ * TRA-3915 — the row rendering a build shipping TODAY'S `formatMoverMarkdownRow`
+ * writes. Differs from `moverRow` above exactly where TRA-3390 made it differ:
+ * a foreign or undenominated level. Fixtures built with this one are post-3390
+ * artifacts; fixtures built with `moverRow` are the archive.
+ */
+function moverRowCurrent(m) {
+  const pct = (m.changePct >= 0 ? '+' : '') + m.changePct.toFixed(2);
+  return `| ${m.symbol} | ${formatQuoteLevel(Math.abs(m.price), m.currency)} | ${pct}% |`;
+}
+
 /** Build a served artifact the way the annotator would. */
-function artifact({ served, suppressed, markdownRows, note }) {
+function artifact({ served, suppressed, markdownRows, note, render = moverRow }) {
   const md = [
     '# Daily EOD Report — 2026-07-21',
     '',
     HEADING,
     '| Symbol | Price | Change % |',
     '|--------|-------|----------|',
-    ...markdownRows.map(moverRow),
+    ...markdownRows.map(render),
     '',
     note,
     '',
@@ -153,6 +165,36 @@ const HALF = artifact({
   note: NOTE_FILTERED,
 });
 
+// MUTATION 3b — TRA-3915. The SAME defect as MUTATION 3, on a row whose level
+// TRA-3390 changed the rendering of, in an artifact written by a post-TRA-3390
+// build. This is the case the checker was BLIND to: its locator reconstructed
+// `| 000660.KS | $1,550,000.00 | -14.65% |` while the served table said
+// `| 000660.KS | 1,550,000.00 KRW | -14.65% |`, the strings did not match, and a
+// non-match reads as "not in the table" — i.e. as correctly suppressed.
+//
+// ⚠️ It must fail with **HALF-FILTERED** specifically, not merely with a non-zero
+// exit. SURFACE DIVERGENCE fires here too (3 markdown rows vs 2 served) and it
+// fired before this fix as well, so an exit-code-only control would have called
+// the blind checker green. The message is the discriminator.
+const HYNIX = { symbol: '000660.KS', price: 1550000, changePct: 1316.67, currency: 'KRW' };
+const HALF_FOREIGN = artifact({
+  served: [stamp(QMCO, 'plausible'), stamp(NVDA, 'plausible')],
+  suppressed: [stamp(HYNIX, 'suspect', 'implausible_move_ratio')],
+  markdownRows: [HYNIX, QMCO, NVDA],
+  // Its own note, naming the foreign symbol, so this case fails on the surface
+  // legs alone and cannot be scored green-adjacent by the DISTINGUISHABLE leg
+  // firing for an unrelated reason.
+  note: [
+    `> ⚠️ **PROVENANCE — 1 of 3 published row(s) SUPPRESSED as unverified. 2 row(s) shown above.**`,
+    `> Filtered at read time by rule \`${RULE_ID}\` (threshold \`SUSPECT_MOVE_RATIO_FLOOR = 1.9\`), build \`${BUILD}\`.`,
+    '> The stored report on disk is **unchanged and byte-intact** — TRA-2634.',
+    WRITE_TIME_CLEAN,
+    '> | # | Symbol | Published | Verdict | Implied prev close | Ratio |',
+    '> | 1 | 000660.KS | 1,550,000.00 KRW / +1316.67% | suspect (implausible_move_ratio) | 109,388.00 | 14.17 |',
+  ].join('\n'),
+  render: moverRowCurrent,
+});
+
 // MUTATION 4 — filtered, but the response does not SAY it was filtered. This is
 // the defect the ruling's second half exists to prevent, so it must not pass.
 const SILENT = artifact({
@@ -210,6 +252,7 @@ const CASES = [
   { name: 'MUTATION leaked — a suspect row survived into the served array', reports: [GOOD, LEAKED], expect: 1, expectText: 'LEAKED' },
   { name: 'MUTATION over-filtered — a genuine mover was deleted', reports: [OVER], expect: 1, expectText: 'OVER-FILTERED' },
   { name: 'MUTATION half-filtered — gone from JSON, still in the markdown', reports: [HALF], expect: 1, expectText: 'HALF-FILTERED' },
+  { name: 'MUTATION half-filtered on a FOREIGN row, post-TRA-3390 rendering (TRA-3915)', reports: [HALF_FOREIGN], expect: 1, expectText: 'HALF-FILTERED' },
   { name: 'MUTATION silent — filtered but the note does not say so', reports: [SILENT], expect: 1, expectText: 'reads as clean' },
   { name: 'MUTATION write-time silent — the note never mentions the WRITE-TIME stage (TRA-3296)', reports: [WRITE_TIME_SILENT], expect: 1, expectText: 'SILENT about write-time' },
   { name: 'PASS — a pre-fix artifact that honestly renders write-time as UNKNOWN (TRA-3296)', reports: [WRITE_TIME_UNKNOWN], expect: 0, expectText: 'PASS' },
