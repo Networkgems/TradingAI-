@@ -66,6 +66,10 @@ function persistedRow(overrides: Partial<OptionPosition> = {}): OptionPosition {
     signalType: 'tradier_import',
     importedFromTradier: true,
     mode: 'live',
+    // TRA-3829 ruling B (card 331ddc56, 2026-08-21) — the deployment flag alone
+    // no longer admits an adopted row; a PER-ROW human hand-over is the second
+    // key. This fixture carries one so the file keeps grading its own subject.
+    engineHandover: { grantedAt: '2026-08-21T13:00:00.000Z', grantedBy: 'test-human' },
     ...overrides,
   } as unknown as OptionPosition;
 }

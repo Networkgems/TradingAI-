@@ -74,6 +74,7 @@ import {
 // question from the authorisation one and no longer shares its answer.
 import {
   engineMayActOnAdoptedRow,
+  hasEngineHandover,
   isEngineActionOnAdoptedRowsArmed,
   splitEngineExposureContracts,
 } from './option-exec-flag.js';
@@ -9132,6 +9133,94 @@ export class PaperOptionsAccount {
     if (!opt.importedFromTradier) return null;
     this.openOptions.delete(optionId);
     return { ...opt };
+  }
+
+  /**
+   * TRA-3829 (board ruling B, card `331ddc56`) — a human hands ONE adopted
+   * broker row to the engine. This is the only writer of
+   * {@link OptionPosition.engineHandover}.
+   *
+   * Refusals are typed, not thrown, because every one of them is a fact the
+   * route must be able to say back to the human:
+   *   • `not_found`        — no open row with that id on this book
+   *   • `not_adopted`      — an engine-opened row; it was never the human's to
+   *                          hand over and the guard never applied to it
+   *   • `engine_origin`    — the oracle PROVED the engine placed it (TRA-2820);
+   *                          it is already managed and a grant would only
+   *                          muddy who decided what
+   *   • `already_granted`  — idempotent: the existing grant is returned and NOT
+   *                          overwritten, so the first human's name and instant
+   *                          stay on the row
+   *
+   * On success the grant is stamped and the risk schedule is RE-INSTALLED
+   * through the same `applyImportedRiskThresholds` + `engineMayActOnAdoptedRow`
+   * pair the reconcile uses, so the row moves from the sentinel to a real RV
+   * stop / TP1 / trailing schedule exactly as if it had been authorised at
+   * adoption time. If the deployment master arm is OFF the grant is recorded
+   * but the predicate still refuses, the sentinel stays, and `armedNow` says
+   * so — the route surfaces that rather than letting a human believe the
+   * engine is minding a row it is not.
+   */
+  handOverAdoptedOption(
+    optionId: string,
+    grantedBy: string,
+    nowMs: number = Date.now(),
+  ):
+    | { status: 'granted'; position: OptionPosition; armedNow: boolean }
+    | { status: 'already_granted'; position: OptionPosition; armedNow: boolean }
+    | { status: 'not_found' | 'not_adopted' | 'engine_origin' | 'bad_grantor' } {
+    const opt = this.openOptions.get(optionId);
+    if (!opt) return { status: 'not_found' };
+    if (opt.importedFromTradier !== true) return { status: 'not_adopted' };
+    if (opt.adoptionAuthority === 'engine_origin' || opt.engineOriginSleeve) {
+      return { status: 'engine_origin' };
+    }
+    if (typeof grantedBy !== 'string' || grantedBy.trim() === '') return { status: 'bad_grantor' };
+    const already = hasEngineHandover(opt);
+    if (!already) {
+      opt.engineHandover = { grantedAt: new Date(nowMs).toISOString(), grantedBy: grantedBy.trim() };
+    }
+    const mayAct = engineMayActOnAdoptedRow(opt, this.actOnAdoptedBrokerRows);
+    applyImportedRiskThresholds(opt, this.rvRiskParams, this.autoManageImportedTradierOptions, !mayAct);
+    accountLog.info('adopted broker option HANDED OVER to the engine by a human', {
+      issue: 'TRA-3829',
+      optionSymbol: opt.optionSymbol,
+      grantedBy: opt.engineHandover?.grantedBy,
+      grantedAt: opt.engineHandover?.grantedAt,
+      idempotent: already,
+      masterArm: this.actOnAdoptedBrokerRows,
+      armedNow: mayAct,
+      stopLossPremium: opt.stopLossPremium,
+      riskUnmanagedReason: opt.riskUnmanagedReason ?? null,
+    });
+    return { status: already ? 'already_granted' : 'granted', position: { ...opt }, armedNow: mayAct };
+  }
+
+  /**
+   * TRA-3829 (ruling B) — the human takes the row back. Removes the grant and
+   * re-installs the schedule, which (for a `foreign` / `unresolved` row) means
+   * the sentinel: stop 0, TP1 ∞, `adopted_not_authorized`. A pending exit
+   * already at the broker is NOT recalled here — that is
+   * `/api/options/:id/cancel-pending-exit`, and the route says so.
+   */
+  revokeEngineHandover(
+    optionId: string,
+  ): { status: 'revoked'; position: OptionPosition } | { status: 'not_found' | 'not_granted' } {
+    const opt = this.openOptions.get(optionId);
+    if (!opt) return { status: 'not_found' };
+    if (!hasEngineHandover(opt)) return { status: 'not_granted' };
+    const prior = opt.engineHandover;
+    delete opt.engineHandover;
+    const mayAct = engineMayActOnAdoptedRow(opt, this.actOnAdoptedBrokerRows);
+    applyImportedRiskThresholds(opt, this.rvRiskParams, this.autoManageImportedTradierOptions, !mayAct);
+    accountLog.info('engine hand-over REVOKED on an adopted broker option', {
+      issue: 'TRA-3829',
+      optionSymbol: opt.optionSymbol,
+      priorGrant: prior,
+      stopLossPremium: opt.stopLossPremium,
+      riskUnmanagedReason: opt.riskUnmanagedReason ?? null,
+    });
+    return { status: 'revoked', position: { ...opt } };
   }
 
   /**

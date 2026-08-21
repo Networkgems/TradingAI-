@@ -17343,6 +17343,32 @@ export class SignalEngine {
     return { status: 'not_found', positionId: optionId, env: null };
   }
 
+  /**
+   * TRA-3829 (board ruling B, card `331ddc56`) — hand ONE adopted broker row
+   * to the engine, or take it back. Thin dispatch over the env buckets; the
+   * decision and the schedule re-install live on `PaperOptionsAccount`.
+   */
+  handOverAdoptedOption(
+    optionId: string,
+    grantedBy: string,
+  ): ReturnType<PaperOptionsAccount['handOverAdoptedOption']> & { env?: TradierEnv } {
+    for (const env of ['sandbox', 'production'] as const) {
+      const out = this.optionsAccounts[env].handOverAdoptedOption(optionId, grantedBy);
+      if (out.status !== 'not_found') return { ...out, env };
+    }
+    return { status: 'not_found' };
+  }
+
+  revokeEngineHandover(
+    optionId: string,
+  ): ReturnType<PaperOptionsAccount['revokeEngineHandover']> & { env?: TradierEnv } {
+    for (const env of ['sandbox', 'production'] as const) {
+      const out = this.optionsAccounts[env].revokeEngineHandover(optionId);
+      if (out.status !== 'not_found') return { ...out, env };
+    }
+    return { status: 'not_found' };
+  }
+
   async cancelManualPendingExit(optionId: string): Promise<
     | { status: 'cancelled'; orderId?: string | number }
     | { status: 'not_pending' }

@@ -124,15 +124,58 @@ export function isEngineActionOnAdoptedRowsArmed(
  * ticket exists to refuse. Sandbox has to say so to be let through — which
  * costs a legacy sandbox row nothing but a stop it never needed, and is the
  * cheap direction of the two.
+ *
+ * ── Board ruling B (card `331ddc56`, 2026-08-21): PER-ROW hand-over ───────
+ * The board chose (b) — *fully managed, but only after an explicit per-row
+ * opt-in* — over (a) visible-never-actioned and (c) excluded. So `armed`
+ * alone is NOT sufficient for a `foreign` / `unresolved` row any more: that
+ * would be option (a) with a deployment-wide switch, which is not what was
+ * ruled. Two keys are now required, and both are explicit:
+ *
+ *   1. `armed` — the deployment-wide `ENABLE_ENGINE_ACT_ON_ADOPTED_BROKER_OPTIONS`
+ *      master arm (default off). This is what keeps the whole mechanism dark
+ *      under the go-live code freeze: with it unset, a grant written onto a row
+ *      is recorded but inert.
+ *   2. `row.engineHandover` — a legible per-row grant written by a human
+ *      through `POST /api/options/:id/engine-handover`. See
+ *      `OptionPosition.engineHandover` for why malformed counts as absent.
+ *
+ * Either key missing ⇒ refuse. The window ruling B accepts — between the
+ * broker fill and the human's hand-over — is spent with the row visible,
+ * marked, counted as the HUMAN'S exposure (`adoptedUsd`), and carrying the
+ * unmanaged sentinel, exactly as under (a).
  */
 export function engineMayActOnAdoptedRow(
-  row: { importedFromTradier?: boolean; adoptionAuthority?: string; tradierEnv?: string },
+  row: {
+    importedFromTradier?: boolean;
+    adoptionAuthority?: string;
+    tradierEnv?: string;
+    engineHandover?: { grantedAt?: unknown; grantedBy?: unknown } | null;
+  },
   armed: boolean,
 ): boolean {
   if (row.importedFromTradier !== true) return true;
   if (row.tradierEnv === 'sandbox') return true;
   if (row.adoptionAuthority === 'engine_origin') return true;
-  return armed;
+  return armed && hasEngineHandover(row);
+}
+
+/**
+ * TRA-3829 (ruling B) — is there a LEGIBLE hand-over on this row?
+ *
+ * Strict on purpose: a grant is a statement about who decided what and when,
+ * so both halves must parse. `{ grantedBy: '' }`, `{ grantedAt: 'soon' }` and
+ * `true` all read as "nobody handed it over". The only way to be admitted is
+ * to have been written by the one surface that writes well-formed grants.
+ */
+export function hasEngineHandover(
+  row: { engineHandover?: { grantedAt?: unknown; grantedBy?: unknown } | null },
+): boolean {
+  const g = row.engineHandover;
+  if (!g || typeof g !== 'object') return false;
+  if (typeof g.grantedBy !== 'string' || g.grantedBy.trim() === '') return false;
+  if (typeof g.grantedAt !== 'string' || !Number.isFinite(Date.parse(g.grantedAt))) return false;
+  return true;
 }
 
 // --------------------------------------------------------------------------

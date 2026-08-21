@@ -31,7 +31,10 @@
 //     stop = 2.02  x 0.75 = 1.51500      mark 1.42  => BREACHED by 6.3%
 //   cost basis 287.00 + 404.00 = 691.00 USD  (= 6.91x the ratified $100 ceiling)
 //
-//   ARM A  (actOnAdoptedBrokerRows: true  -- the pre-TRA-3829 box)
+//   ARM A  (actOnAdoptedBrokerRows: true AND each row HANDED OVER by a human
+//           -- board ruling B, card 331ddc56, 2026-08-21. Before the ruling this
+//           arm was the pre-TRA-3829 box with the flag alone; under (b) the
+//           flag alone is no longer sufficient, see ARM D.)
 //     exits staged                 : 2
 //     pendingExit.qty each         : 2
 //     pendingExit.kind each        : 'sl'
@@ -61,6 +64,15 @@ import { describe, it, expect } from 'vitest';
 import type { TradierOpenOptionPosition } from '@trading-app/engine';
 import type { OptionPosition } from '@trading-app/shared';
 import { PaperOptionsAccount, summarizeLiveStopActionability } from './options-account.js';
+import { engineMayActOnAdoptedRow, hasEngineHandover } from './option-exec-flag.js';
+
+/** Ruling B: a human hands EVERY adopted row on the book to the engine. */
+function handOverAll(acct: PaperOptionsAccount, by = 'board-member'): void {
+  for (const opt of acct.getState().openOptions) {
+    const out = acct.handOverAdoptedOption(opt.id, by, Date.parse('2026-08-21T13:00:00.000Z'));
+    expect(out.status).toBe('granted');
+  }
+}
 
 /** 2026-08-17, the ET session the owner hand-traded. Prior-day, so no PDT latch. */
 const PLTR_ACQUIRED = Date.parse('2026-08-17T13:46:42.898Z');
@@ -128,20 +140,29 @@ function liveBook(overrides: Record<string, unknown> = {}): PaperOptionsAccount 
 
 // ─── ARM A — the control CONTAINS the condition ──────────────────────────────
 
-describe('TRA-3829 ARM A — armed, the engine really does exit the human of its own accord', () => {
-  it('stages a sell_to_close on BOTH hand-placed rows, with no arm, deploy or decision', () => {
+describe('TRA-3829 ARM A — master arm ON and HANDED OVER: the engine really does exit', () => {
+  it('stages a sell_to_close on BOTH hand-placed rows once a human hands each one over', () => {
     const acct = liveBook({ actOnAdoptedBrokerRows: true });
 
     // The production adoption path. Nothing else touches the book.
     const summary = acct.reconcileTradierPositions(handPlacedPayload(), 'live');
     expect(summary.added).toBe(2);
 
-    // The rows came back typed as adoptions, and the oracle called them foreign.
+    // Ruling B: adopted, foreign, and STILL on the sentinel until handed over --
+    // even with the deployment master arm on.
     for (const opt of acct.getState().openOptions) {
       expect(opt.importedFromTradier).toBe(true);
       expect(opt.signalType).toBe('tradier_import');
       expect(opt.adoptionAuthority).toBe('foreign');
-      // Armed, because the deployment said it may act on adopted inventory.
+      expect(opt.stopLossPremium).toBe(0);
+      expect(opt.riskUnmanagedReason).toBe('adopted_not_authorized');
+    }
+
+    // The explicit per-row opt-in. This is the only thing that changes.
+    handOverAll(acct);
+    for (const opt of acct.getState().openOptions) {
+      expect(opt.engineHandover).toEqual({ grantedAt: '2026-08-21T13:00:00.000Z', grantedBy: 'board-member' });
+      // Armed NOW, because a human said so for THIS row and the deployment allows it.
       expect(opt.stopLossPremium).toBeGreaterThan(0);
       expect(opt.riskUnmanagedReason).toBeUndefined();
     }
@@ -237,7 +258,11 @@ describe('TRA-3829 ARM C — a row adopted by the OLD build keeps its armed stop
     // armed stops, which is what is sitting in production snapshots today.
     const oldBuild = liveBook({ actOnAdoptedBrokerRows: true });
     oldBuild.reconcileTradierPositions(handPlacedPayload(), 'live');
+    handOverAll(oldBuild);
     const snapshot = oldBuild.exportSnapshot();
+    // A pre-TRA-3829 snapshot carries armed stops and NO grant field. Strip the
+    // grant so the restored rows are byte-for-byte what production holds today.
+    for (const row of snapshot.openOptions) delete row.engineHandover;
 
     // Deploy the guard. Same rows, restored through the production persistence
     // path (`importSnapshot`, including its TRA-2957 threshold healing).
@@ -284,6 +309,109 @@ describe('TRA-3829 ARM C — a row adopted by the OLD build keeps its armed stop
     expect(s.breached).toBe(2);
     expect(s.actionable).toBe(0);
     expect(s.byReason).toEqual({ adopted_not_authorized: 2 });
+  });
+});
+
+// ─── ARM D — board ruling B: two keys, per row ──────────────────────────────
+
+describe('TRA-3829 ARM D — ruling B: the deployment flag alone is NOT a hand-over', () => {
+  it('master arm ON, no grant: both rows adopted, neither armed, nothing fires', () => {
+    // This is the case that separates (b) from (a)-with-a-switch. Pre-ruling
+    // this configuration exited both rows (old ARM A).
+    const acct = liveBook({ actOnAdoptedBrokerRows: true });
+    acct.reconcileTradierPositions(handPlacedPayload(), 'live');
+    for (const opt of acct.getState().openOptions) {
+      expect(opt.stopLossPremium).toBe(0);
+      expect(opt.riskUnmanagedReason).toBe('adopted_not_authorized');
+      expect(hasEngineHandover(opt)).toBe(false);
+    }
+    expect(acct.checkExits(UNDERLYINGS, breachedMarks(), 'live', { waitAndHold: true })).toHaveLength(0);
+    // Still the human's exposure at the measurement layer.
+    expect(acct.openPremiumAtRiskForMode('live').adoptedUsd).toBeCloseTo(691.0, 2);
+  });
+
+  it('grant written, master arm OFF: recorded but inert, and the method SAYS so', () => {
+    const acct = liveBook();
+    acct.reconcileTradierPositions(handPlacedPayload(), 'live');
+    const [first] = acct.getState().openOptions;
+    const out = acct.handOverAdoptedOption(first!.id, 'board-member');
+    expect(out.status).toBe('granted');
+    if (out.status !== 'granted') return;
+    expect(out.armedNow).toBe(false);
+    expect(out.position.engineHandover?.grantedBy).toBe('board-member');
+    expect(out.position.stopLossPremium).toBe(0);
+    expect(out.position.riskUnmanagedReason).toBe('adopted_not_authorized');
+    expect(acct.checkExits(UNDERLYINGS, breachedMarks(), 'live', { waitAndHold: true })).toHaveLength(0);
+  });
+
+  it('hand-over is PER ROW: granting one arms one, the other stays refused', () => {
+    const acct = liveBook({ actOnAdoptedBrokerRows: true });
+    acct.reconcileTradierPositions(handPlacedPayload(), 'live');
+    const bySym = new Map(acct.getState().openOptions.map(o => [o.optionSymbol!, o]));
+    const out = acct.handOverAdoptedOption(bySym.get('PLTR260821C00180000')!.id, 'board-member');
+    expect(out.status).toBe('granted');
+    const exited = acct.checkExits(UNDERLYINGS, breachedMarks(), 'live', { waitAndHold: true });
+    expect(exited).toHaveLength(1);
+    expect(exited[0]!.optionSymbol).toBe('PLTR260821C00180000');
+    const spy = acct.getState().openOptions.find(o => o.optionSymbol === 'SPY260821C00777000')!;
+    expect(spy.pendingExit).toBeUndefined();
+    expect(spy.riskUnmanagedReason).toBe('adopted_not_authorized');
+    // A hand-over changes who may EXIT the row, not who BOUGHT it (TRA-3913:
+    // exposure attribution is provenance-based and independent of this
+    // predicate). Both rows stay the human's $691.00 at the measurement layer
+    // even though the engine is now minding one of them.
+    const atRisk = acct.openPremiumAtRiskForMode('live');
+    expect(atRisk.adoptedRows).toBe(2);
+    expect(atRisk.adoptedUsd).toBeCloseTo(691.0, 2);
+  });
+
+  it("idempotent: a second hand-over keeps the FIRST human's name and instant", () => {
+    const acct = liveBook({ actOnAdoptedBrokerRows: true });
+    acct.reconcileTradierPositions(handPlacedPayload(), 'live');
+    const [row] = acct.getState().openOptions;
+    expect(acct.handOverAdoptedOption(row!.id, 'alice', Date.parse('2026-08-21T13:00:00Z')).status).toBe('granted');
+    const again = acct.handOverAdoptedOption(row!.id, 'bob', Date.parse('2026-08-21T14:00:00Z'));
+    expect(again.status).toBe('already_granted');
+    expect(acct.getState().openOptions[0]!.engineHandover).toEqual({
+      grantedAt: '2026-08-21T13:00:00.000Z',
+      grantedBy: 'alice',
+    });
+  });
+
+  it('revoke re-installs the sentinel and the predicate refuses again', () => {
+    const acct = liveBook({ actOnAdoptedBrokerRows: true });
+    acct.reconcileTradierPositions(handPlacedPayload(), 'live');
+    handOverAll(acct);
+    const [row] = acct.getState().openOptions;
+    expect(row!.stopLossPremium).toBeGreaterThan(0);
+    const out = acct.revokeEngineHandover(row!.id);
+    expect(out.status).toBe('revoked');
+    const after = acct.getState().openOptions.find(o => o.id === row!.id)!;
+    expect(after.engineHandover).toBeUndefined();
+    expect(after.stopLossPremium).toBe(0);
+    expect(after.riskUnmanagedReason).toBe('adopted_not_authorized');
+    expect(acct.revokeEngineHandover(row!.id).status).toBe('not_granted');
+  });
+
+  it('refuses to hand over what is not adoptable, and a grant must be legible', () => {
+    const acct = liveBook({
+      actOnAdoptedBrokerRows: true,
+      resolveLiveOpenSleeve: (sym: string) => (sym === 'PLTR260821C00180000' ? 'single_leg_otm' : null),
+    });
+    acct.reconcileTradierPositions(handPlacedPayload(), 'live');
+    const bySym = new Map(acct.getState().openOptions.map(o => [o.optionSymbol!, o]));
+    // Engine-origin (TRA-2820) needs no permission and must not take a grant.
+    expect(acct.handOverAdoptedOption(bySym.get('PLTR260821C00180000')!.id, 'x').status).toBe('engine_origin');
+    expect(acct.handOverAdoptedOption('nope', 'x').status).toBe('not_found');
+    expect(acct.handOverAdoptedOption(bySym.get('SPY260821C00777000')!.id, '   ').status).toBe('bad_grantor');
+
+    // A truthy byte is not a grant. Allow-list, not deny-list.
+    const base = { importedFromTradier: true, adoptionAuthority: 'foreign', tradierEnv: 'production' };
+    expect(engineMayActOnAdoptedRow({ ...base, engineHandover: { grantedAt: '2026-08-21T13:00:00Z', grantedBy: 'a' } }, true)).toBe(true);
+    expect(engineMayActOnAdoptedRow({ ...base, engineHandover: { grantedAt: 'soon', grantedBy: 'a' } }, true)).toBe(false);
+    expect(engineMayActOnAdoptedRow({ ...base, engineHandover: { grantedAt: '2026-08-21T13:00:00Z', grantedBy: '' } }, true)).toBe(false);
+    expect(engineMayActOnAdoptedRow({ ...base, engineHandover: true as unknown as { grantedAt: string } }, true)).toBe(false);
+    expect(engineMayActOnAdoptedRow({ ...base, engineHandover: { grantedAt: '2026-08-21T13:00:00Z', grantedBy: 'a' } }, false)).toBe(false);
   });
 });
 

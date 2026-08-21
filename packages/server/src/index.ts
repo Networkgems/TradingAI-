@@ -504,6 +504,8 @@ import {
   // TRA-3689 — the EFFECTIVE arms (flag AND window), i.e. what the order sites call.
   isOptionLiveOtmArmed,
   isOptionLiveRvLongArmed,
+  // TRA-3829 (ruling B) — master arm gating the per-row hand-over surface.
+  isEngineActionOnAdoptedRowsArmed,
   parseOptionLiveTestUntil,
 } from './option-exec-flag.js';
 import { runIdeasAutoExecute } from './options-ideas-auto-execute.js';
@@ -14206,6 +14208,93 @@ app.post('/api/options/:id/repair-engine-basis', requireAuth, requireAdmin, asyn
     broadcastEngineState(ctx);
   }
   res.json({ ok: true, ...outcome });
+});
+
+/**
+ * TRA-3829 (board ruling B, card `331ddc56`, 2026-08-21) — the per-row
+ * HAND-OVER surface. A human explicitly hands ONE adopted broker option to the
+ * engine; until they do, the engine never exits it (see
+ * `engineMayActOnAdoptedRow`).
+ *
+ * Two keys, both explicit, both required before the engine acts:
+ *   1. deployment master arm `ENABLE_ENGINE_ACT_ON_ADOPTED_BROKER_OPTIONS`
+ *      (default OFF — this whole surface returns 409 `handover_surface_disarmed`
+ *      while it is unset, so under the go-live code freeze it is inert);
+ *   2. the per-row grant this route writes, carrying the authenticated
+ *      username and the instant.
+ *
+ * Scoped to the caller's OWN books via `userCtx` — there is no cross-user
+ * id space here, and no `?env=` override (TRA-3112 item A).
+ * Read-only against the broker: this writes a local field and re-derives the
+ * local risk schedule. No order is placed by handing over; the engine's
+ * normal exit pass does that later, on its own evidence, if the row breaches.
+ */
+app.post('/api/options/:id/engine-handover', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
+  const { id } = req.params as Record<string, string>;
+  if (!isEngineActionOnAdoptedRowsArmed()) {
+    res.status(409).json({
+      error: 'handover_surface_disarmed',
+      detail:
+        'ENABLE_ENGINE_ACT_ON_ADOPTED_BROKER_OPTIONS is not set on this deployment, so a hand-over ' +
+        'would be recorded but inert. Refusing rather than recording a grant the engine will not honour (TRA-3829).',
+    });
+    return;
+  }
+  const out = ctx.engine.handOverAdoptedOption(id, username);
+  switch (out.status) {
+    case 'granted':
+    case 'already_granted':
+      broadcastEngineState(ctx);
+      res.json({
+        ok: true,
+        status: out.status,
+        env: out.env,
+        armedNow: out.armedNow,
+        engineHandover: out.position.engineHandover,
+        stopLossPremium: out.position.stopLossPremium,
+        riskUnmanagedReason: out.position.riskUnmanagedReason ?? null,
+      });
+      return;
+    case 'not_found':
+      res.status(404).json({ error: 'Option position not found.' });
+      return;
+    case 'not_adopted':
+      res.status(409).json({ error: 'not_adopted', detail: 'This row was opened by the engine; it was never adopted and needs no hand-over.' });
+      return;
+    case 'engine_origin':
+      res.status(409).json({ error: 'engine_origin', detail: 'The provenance oracle proved the engine placed this contract (TRA-2820); it is already managed.' });
+      return;
+    case 'bad_grantor':
+      res.status(400).json({ error: 'bad_grantor' });
+      return;
+  }
+});
+
+app.delete('/api/options/:id/engine-handover', requireAuth, async (req, res) => {
+  const ctx = await userCtx(res);
+  const { id } = req.params as Record<string, string>;
+  const out = ctx.engine.revokeEngineHandover(id);
+  if (out.status === 'revoked') {
+    broadcastEngineState(ctx);
+    res.json({
+      ok: true,
+      env: out.env,
+      stopLossPremium: out.position.stopLossPremium,
+      riskUnmanagedReason: out.position.riskUnmanagedReason ?? null,
+      pendingExit: out.position.pendingExit ?? null,
+      ...(out.position.pendingExit
+        ? { note: 'A close is already in flight at the broker; revoking does not recall it — use cancel-pending-exit.' }
+        : {}),
+    });
+    return;
+  }
+  if (out.status === 'not_granted') {
+    res.status(409).json({ error: 'not_granted' });
+    return;
+  }
+  res.status(404).json({ error: 'Option position not found.' });
 });
 
 /**

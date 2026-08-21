@@ -149,6 +149,7 @@ describe('foldOpenPremiumAtRisk (TRA-3445)', () => {
           importedFromTradier: true,
           adoptionAuthority: 'foreign',
           tradierEnv: 'production',
+          engineHandover: { grantedAt: '2026-08-21T13:00:00.000Z', grantedBy: 'test-human' },
         }),
       ],
       /* armed */ true,

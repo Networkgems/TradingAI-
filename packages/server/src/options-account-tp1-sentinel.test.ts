@@ -72,6 +72,17 @@ function throughDisk(acct: PaperOptionsAccount): PaperOptionsAccount {
   return restored;
 }
 
+/**
+ * TRA-3829 ruling B (card 331ddc56, 2026-08-21) — the deployment flag alone no
+ * longer admits an adopted row; a PER-ROW human hand-over is the second key.
+ * Applied after each reconcile so this file keeps grading the TP1 sentinel.
+ */
+function handOverAll(acct: PaperOptionsAccount): void {
+  for (const opt of acct.getState().openOptions) {
+    acct.handOverAdoptedOption(opt.id, 'test-human', Date.parse('2026-08-21T13:00:00.000Z'));
+  }
+}
+
 function subFloorImportAccount(): PaperOptionsAccount {
   const acct = new PaperOptionsAccount({
     initialEquity: 25_000,
@@ -88,6 +99,7 @@ function subFloorImportAccount(): PaperOptionsAccount {
     actOnAdoptedBrokerRows: true,
   });
   acct.reconcileTradierPositions([buildTslaImport()], 'live');
+  handOverAll(acct);
   return acct;
 }
 
@@ -198,6 +210,7 @@ describe('TRA-2957 — the unmanaged sentinel must survive a persistence round-t
       actOnAdoptedBrokerRows: true,
     });
     acct.reconcileTradierPositions([buildTslaImport({ premiumPaid: 0.6 })], 'live');
+    handOverAll(acct);
 
     const staged = throughDisk(acct);
     const opt0 = staged.getState().openOptions[0]!;
@@ -292,6 +305,11 @@ describe('TRA-2957 — a hand-built legacy row with a null threshold is still sa
       importedFromTradier: true,
       mode: 'live',
       riskUnmanagedReason: 'sub_floor_premium',
+      // TRA-3829 ruling B (card 331ddc56, 2026-08-21) — the deployment flag alone
+      // no longer admits an adopted row; a PER-ROW human hand-over is the second
+      // key. This fixture carries one so the file keeps grading its own subject.
+      engineHandover: { grantedAt: '2026-08-21T13:00:00.000Z', grantedBy: 'test-human' },
+
     } as unknown as OptionPosition;
 
     const acct = new PaperOptionsAccount({

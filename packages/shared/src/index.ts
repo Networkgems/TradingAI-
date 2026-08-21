@@ -2786,6 +2786,32 @@ export interface OptionPosition {
    */
   adoptionAuthority?: 'engine_origin' | 'foreign' | 'unresolved';
   /**
+   * TRA-3829 (board ruling B, card `331ddc56`, 2026-08-21) — the EXPLICIT,
+   * PER-ROW hand-over of an adopted broker position to the engine.
+   *
+   * Ruling B: *"adopted rows are exited by the engine only once a human
+   * explicitly hands each row over; the default stays non-acting."* This field
+   * IS the hand-over. It is written by exactly one surface
+   * (`POST /api/options/:id/engine-handover`, an authenticated human action)
+   * and read by exactly one predicate (`engineMayActOnAdoptedRow`), so "who
+   * decided the engine may sell this" is always answerable from the row.
+   *
+   * Absent ⇔ nobody handed it over, and on a `foreign` / `unresolved`
+   * adoption that means the engine never exits it, no matter what any
+   * deployment-wide flag says. A present-but-malformed value (empty
+   * `grantedBy`, unparseable `grantedAt`) is treated as ABSENT by the
+   * predicate — a grant must be a legible fact, not a truthy byte.
+   *
+   * Never stamped on `engine_origin` rows: the engine placed those and does
+   * not need permission to mind its own order (TRA-2820).
+   */
+  engineHandover?: {
+    /** ISO-8601 instant the human handed the row to the engine. */
+    grantedAt: string;
+    /** The authenticated username that did it. */
+    grantedBy: string;
+  };
+  /**
    * TRA-3078 — the option-trade-journal row id this position's PARTIAL and
    * CLOSE rows must be written to. Absent ⇔ unresolved; present and equal to
    * {@link id} ⇔ resolved to identity, which is the case for every
