@@ -3152,6 +3152,20 @@ export interface OptionPosition {
    */
   slHeldForDailyClose?: string;
   /**
+   * TRA-3902 (board, 2026-08-21, comment 427fa1f4) — the ET date key on which
+   * this live row's breached CHANDELIER trail was last HELD until the
+   * daily-close window under the `daily_close` stop policy. Ruling B moved the
+   * −20% premium stop to the close; the chandelier (TRA-3217 re-anchor) still
+   * sold XLF ×2 at 13:48Z on 08-21, three minutes after the opening-range hold
+   * released, and took the desk's hand-added contract with it. Same shape as
+   * `slHeldForDailyClose`: once per row per ET day, cleared when the trail
+   * fires (`chandelier_daily_close`), persisted so a restart cannot launder
+   * the hold into a fire. The health walk reads THIS key (it has no
+   * underlying price to re-derive the breach from), so it means "held at some
+   * tick today", not "through the trail right now".
+   */
+  chandelierHeldForDailyClose?: string;
+  /**
    * TRA-3217 — provenance note for the chandelier trail, so a later
    * `chandelier` exit can say which trail actually fired (three mechanisms
    * shared one label before this):

@@ -1081,13 +1081,27 @@ export type LiveStopInertReason =
    * release: the start of the next close window. A row through the
    * catastrophic level inside the session is `actionable`, not this.
    */
-  | 'daily_close_hold';
+  | 'daily_close_hold'
+  /**
+   * TRA-3902 (board, 2026-08-21) — the live `daily_close` policy applied to the
+   * CHANDELIER trail: the exit pass read this row's trail as breached at some
+   * tick today (persisted latch `chandelierHeldForDailyClose` = today's ET
+   * key) and held it for the close window. Only reported on rows whose −20%
+   * premium stop is NOT also breached (those read `daily_close_hold` — the
+   * premium stop is the tighter bound and the walk names one gate per row).
+   * The walk has no underlying price, so this is "held today", not "through
+   * the trail right now". Release: the start of the next close window.
+   */
+  | 'chandelier_daily_close_hold';
 
 /** TRA-3822 — see {@link summarizeLiveStopActionability}. */
 export interface LiveStopActionabilitySummary {
   /**
    * Live open rows carrying an ARMED stop (`isArmedThreshold`) whose mark is at
    * or through it. The denominator; `breached === actionable + inFlight + inert`.
+   * TRA-3902 (08-21): also counts live rows whose CHANDELIER trail the exit pass
+   * held for the close window today (`chandelier_daily_close_hold`), so a held
+   * trail is not invisible on the route; the identity above still holds.
    */
   breached: number;
   /** The subset `checkExits` WOULD act on this tick — it reaches `:5332`. */
@@ -1219,9 +1233,35 @@ export function summarizeLiveStopActionability(
     // Fact 1 — the breach, using the SAME predicate as the SL branch at `:5332`.
     // `isArmedThreshold` first: `stopLossPremium: 0` means "no stop", and a
     // `null` from disk ToNumber-coerces in `mark <= null` (TRA-2957).
-    if (!isArmedThreshold(opt.stopLossPremium)) continue;
     const mark = opt.currentPremium;
-    if (!Number.isFinite(mark) || mark > opt.stopLossPremium) continue;
+    const slBreached =
+      isArmedThreshold(opt.stopLossPremium) && Number.isFinite(mark) && mark <= opt.stopLossPremium;
+    if (!slBreached) {
+      // TRA-3902 (board, 2026-08-21) — a row NOT through its premium stop can
+      // still be through its CHANDELIER trail and held for the close window.
+      // The walk cannot re-derive that breach (no underlying price here), so
+      // it reads the exit pass's own persisted latch for today's ET day. A row
+      // that is past the latch's day, or whose window is open, is not held.
+      if (
+        dailyClosePhase !== null
+        && !dailyClosePhase.inCloseWindow
+        && opt.chandelierHeldForDailyClose !== undefined
+        && opt.chandelierHeldForDailyClose === etDateKey(now)
+        && !opt.pendingExit
+      ) {
+        breached += 1;
+        inert += 1;
+        byReason.chandelier_daily_close_hold = (byReason.chandelier_daily_close_hold ?? 0) + 1;
+        if (dailyClosePhase.releaseAt != null) {
+          const release = dailyClosePhase.releaseAt;
+          if (earliestRelease === null || release < earliestRelease) earliestRelease = release;
+          if (latestRelease === null || release > latestRelease) latestRelease = release;
+        } else {
+          indefinite += 1;
+        }
+      }
+      continue;
+    }
     breached += 1;
 
     // Fact 2 — walk the `continue` gates in `checkExits` loop order and stop at
@@ -2988,6 +3028,8 @@ export class PaperOptionsAccount {
   private slOpeningRangeHolds = 0;
   /** TRA-3902 (ruling B) — live rows held until the daily-close window, one per row per ET day. */
   private slDailyCloseHolds = 0;
+  /** TRA-3902 (08-21) — live rows whose breached chandelier trail was held until the daily-close window, one per row per ET day. */
+  private chandelierDailyCloseHolds = 0;
   /**
    * TRA-483 — overnight-hold gate for live positions opened today. Default
    * `true`: refuse to fire same-day TP1/SL/trail exits on live positions so
@@ -6638,7 +6680,7 @@ export class PaperOptionsAccount {
           }
         }
 
-        if (
+        const chandelierBreachedNow =
           exitPremium === null
           && chandelierUSide !== null
           && chandelierUnderlying != null
@@ -6647,8 +6689,41 @@ export class PaperOptionsAccount {
           // opening-range window; the bookkeeping above holds the breach for a
           // post-window re-test instead.
           && !inOpeningRange
-          && chandelierExitTriggered(chandelierUSide, chandelierUnderlying, opt.chandelierStop)
-        ) {
+          && chandelierExitTriggered(chandelierUSide, chandelierUnderlying, opt.chandelierStop);
+        // TRA-3902 (board, 2026-08-21, comment 427fa1f4) — under the live
+        // `daily_close` policy the chandelier, like the −20% premium stop, is a
+        // level on the CLOSE: it is read only inside the last `closeWindowMin`
+        // minutes of RTH. Ruling B (`ec2d33c`) moved only the premium stop, and
+        // on 08-21 the chandelier sold XLF ×2 at 13:48Z — three minutes after
+        // the opening-range hold released, still "at the open" in the owner's
+        // sentence, and it took the desk's hand-added contract with it.
+        // Intraday the only engine exit on a live single-leg stays the −50%
+        // catastrophic premium stop below. This is a DEFERRAL like ruling B,
+        // not a TRA-3217 re-anchor: the ratchet above keeps running, and if
+        // the spot is still through the trail when the window opens, it fires.
+        const chandelierHeldForDailyClose =
+          chandelierBreachedNow && dailyClosePhase !== null && positionIsLive && !dailyClosePhase.inCloseWindow;
+        if (chandelierHeldForDailyClose) {
+          const dayKey = etDateKey(Date.now());
+          if (opt.chandelierHeldForDailyClose !== dayKey) {
+            // Latched once per row per ET day so the log and the counter say
+            // "held" once, not once per tick; persisted so a restart cannot
+            // launder the hold into a fire. The health walk names this as
+            // `chandelier_daily_close_hold` with the window's start as release.
+            opt.chandelierHeldForDailyClose = dayKey;
+            this.chandelierDailyCloseHolds += 1;
+            accountLog.warn('chandelier trail HELD until the daily-close window (live daily-close policy)', {
+              issue: 'TRA-3902',
+              optionSymbol: opt.optionSymbol,
+              spot: chandelierUnderlying,
+              chandelierStop: opt.chandelierStop,
+              peakUnderlying: opt.peakUnderlying,
+              mark,
+              closeWindowMin: liveStopPolicy!.closeWindowMin,
+              releasesAt: dailyClosePhase!.releaseAt === null ? null : new Date(dailyClosePhase!.releaseAt).toISOString(),
+            });
+          }
+        } else if (chandelierBreachedNow) {
           exitPremium = mark;
           exitKind = 'trail';
           // TRA-3217 item 4 — one label covered three mechanisms; split them
@@ -6657,13 +6732,19 @@ export class PaperOptionsAccount {
           // before this branch can run, so a non-zero count of that label in
           // the journal means the veto is structurally broken, not that the
           // policy chose to fire.
+          // TRA-3902 — a fire inside the close window on a row that was held
+          // earlier today carries the hold's provenance (`chandelier_daily_close`).
+          const heldToday = opt.chandelierHeldForDailyClose === etDateKey(Date.now());
+          delete opt.chandelierHeldForDailyClose;
           exitJournalReason = opt.chandelierBreachedWhileSuppressed
             ? 'chandelier_deferred_breach'
-            : opt.chandelierTrailNote === 'restarted_stale_breach'
-              ? 'chandelier_restarted'
-              : opt.chandelierTrailNote === 'spot_seeded'
-                ? 'chandelier_spot_seeded'
-                : 'chandelier';
+            : heldToday
+              ? 'chandelier_daily_close'
+              : opt.chandelierTrailNote === 'restarted_stale_breach'
+                ? 'chandelier_restarted'
+                : opt.chandelierTrailNote === 'spot_seeded'
+                  ? 'chandelier_spot_seeded'
+                  : 'chandelier';
         } else if (exitPremium === null && !inOpeningRange) {
           // Rule 2 — trade-level profit-lock on premium-derived R (we are always
           // LONG the premium, so entry = premiumPaid, stop = stopLossPremium).
@@ -7830,6 +7911,16 @@ export class PaperOptionsAccount {
    */
   getSlDailyCloseHolds(): number {
     return this.slDailyCloseHolds;
+  }
+
+  /**
+   * TRA-3902 (board, 2026-08-21) — how many times this process HELD a breached
+   * chandelier trail on a live row until the daily-close window (one per row
+   * per ET day). Since-boot; the live read is
+   * `liveStopActionability.byReason.chandelier_daily_close_hold`.
+   */
+  getChandelierDailyCloseHolds(): number {
+    return this.chandelierDailyCloseHolds;
   }
 
   /**

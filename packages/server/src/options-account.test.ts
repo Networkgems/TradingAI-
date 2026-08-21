@@ -4249,6 +4249,103 @@ describe('TRA-3217 — stale-breach veto + opening-range window', () => {
     expect(legacy.actionable).toBe(1);
   });
 
+  // ── TRA-3902 (board, 2026-08-21, comment 427fa1f4) ──────────────────────────
+  // The chandelier joins ruling B: on a live row under `daily_close` the trail
+  // is read only inside the close window. On 08-21 it sold XLF ×2 at 13:48Z,
+  // three minutes after the opening-range hold released.
+  it('TRA-3902/chandelier — a mid-session trail break on a live row is HELD and fires as `chandelier_daily_close` only inside the close window', () => {
+    const { acct, row } = liveAccount();
+    const sym = acct.getState().openOptions[0].optionSymbol!;
+    const tickAt = (spot: number) => acct.checkExits(
+      new Map([['AAPL', spot]]), new Map([[sym, 1.0]]), 'live',
+      { openingRangeHoldMin: 15, liveStopPolicy: DAILY_CLOSE }, undefined, RISK_GUARDED,
+    );
+    // Day 0 establishes a clean trail (peak 210 / stop 198), never breached.
+    tickAt(200); tickAt(210);
+    expect(row().chandelierStop).toBeCloseTo(198, 6);
+    // Day 1, 09:48 ET (after the opening window) — the XLF shape: spot 195
+    // through the 198 stop. Legacy build: fires `chandelier`. Now: held, latched.
+    vi.setSystemTime(D1_OPEN + 18 * 60_000);
+    expect(tickAt(195)).toHaveLength(0);
+    expect(row().chandelierHeldForDailyClose).toBe('2024-06-05');
+    expect(acct.getChandelierDailyCloseHolds()).toBe(1);
+    expect(row().chandelierBreachedWhileSuppressed).toBeUndefined(); // a deferral, NOT a TRA-3217 re-anchor
+    expect(row().chandelierStop).toBeCloseTo(198, 6);
+    // Noon, still through: held, no second count.
+    vi.setSystemTime(D1_OPEN + 150 * 60_000);
+    expect(tickAt(194)).toHaveLength(0);
+    expect(acct.getChandelierDailyCloseHolds()).toBe(1);
+    // Health walk mid-session: the held trail is visible, with the window start as release.
+    const mid = acct.liveStopActionabilitySummary({
+      brokerMirroring: true, openingRangeGuardMin: 15, liveStopPolicy: DAILY_CLOSE, now: D1_OPEN + 150 * 60_000,
+    });
+    expect(mid.breached).toBe(1);
+    expect(mid.byReason).toEqual({ chandelier_daily_close_hold: 1 });
+    expect(mid.releasesAt).toBe(new Date(D1_CLOSE_WINDOW).toISOString());
+    expect(mid.indefinite).toBe(0);
+    // 15:29 ET — still held.
+    vi.setSystemTime(D1_CLOSE_WINDOW - 60_000);
+    expect(tickAt(194)).toHaveLength(0);
+    // 15:31 ET — inside the window and still through: fires, with the hold's provenance.
+    vi.setSystemTime(D1_CLOSE_WINDOW + 60_000);
+    const closed = tickAt(194);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].exitReason).toBe('chandelier_daily_close');
+    expect(closed[0].chandelierHeldForDailyClose).toBeUndefined();
+  });
+
+  it('TRA-3902/chandelier — a trail break that recovers by the close window never sells, and the latch does not leak into the next day', () => {
+    const { acct, row } = liveAccount();
+    const sym = acct.getState().openOptions[0].optionSymbol!;
+    const tickAt = (spot: number) => acct.checkExits(
+      new Map([['AAPL', spot]]), new Map([[sym, 1.0]]), 'live',
+      { openingRangeHoldMin: 15, liveStopPolicy: DAILY_CLOSE }, undefined, RISK_GUARDED,
+    );
+    tickAt(200); tickAt(210);
+    vi.setSystemTime(D1_OPEN + 60 * 60_000);
+    expect(tickAt(195)).toHaveLength(0);
+    expect(row().chandelierHeldForDailyClose).toBe('2024-06-05');
+    // Recovered above the (unchanged) 198 stop by the window: nothing fires.
+    vi.setSystemTime(D1_CLOSE_WINDOW + 5 * 60_000);
+    expect(tickAt(201)).toHaveLength(0);
+    vi.setSystemTime(D1_CLOSE - 60_000);
+    expect(tickAt(200)).toHaveLength(0);
+    expect(acct.getState().openOptions).toHaveLength(1);
+    // The stale latch is yesterday's key: the walk does not report it tomorrow.
+    const tomorrow = acct.liveStopActionabilitySummary({
+      brokerMirroring: true, openingRangeGuardMin: 15, liveStopPolicy: DAILY_CLOSE,
+      now: D1_OPEN + 24 * 60 * 60_000 + 60 * 60_000,
+    });
+    expect(tomorrow.breached).toBe(0);
+    expect(tomorrow.byReason).toEqual({});
+  });
+
+  it('TRA-3902/chandelier — `intraday` policy and demo rows still fire the chandelier mid-session (byte-identical to before)', () => {
+    const a = liveAccount();
+    const aSym = a.acct.getState().openOptions[0].optionSymbol!;
+    const legacyTick = (spot: number) => a.acct.checkExits(
+      new Map([['AAPL', spot]]), new Map([[aSym, 1.0]]), 'live',
+      { openingRangeHoldMin: 15, liveStopPolicy: { ...DAILY_CLOSE, policy: 'intraday' } }, undefined, RISK_GUARDED,
+    );
+    legacyTick(200); legacyTick(210);
+    vi.setSystemTime(D1_OPEN + 60 * 60_000);
+    const legacy = legacyTick(195);
+    expect(legacy).toHaveLength(1);
+    expect(legacy[0].exitReason).toBe('chandelier');
+    expect(a.acct.getChandelierDailyCloseHolds()).toBe(0);
+
+    const demo = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = demo.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo');
+    const demoTick = (spot: number) => demo.checkExits(
+      new Map([['AAPL', spot]]), new Map([[pos!.optionSymbol!, 1.0]]), 'demo',
+      { openingRangeHoldMin: 15, liveStopPolicy: DAILY_CLOSE }, undefined, RISK_GUARDED,
+    );
+    demoTick(200); demoTick(210);
+    const demoClosed = demoTick(195);
+    expect(demoClosed).toHaveLength(1);
+    expect(demoClosed[0].exitReason).toBe('chandelier');
+  });
+
   it('TRA-3902 — the hard-stop hold is live-only: a demo row still stops out at the open', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo');
