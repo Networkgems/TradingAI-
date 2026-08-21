@@ -183,6 +183,10 @@ describe('TRA-2820 — back-stamping legacy rows at the durable boundary', () =>
       total: 1,
       byReason: { sub_floor_premium: 1 },
       unexplained: 0,
+      // TRA-3909 — `null`, never 0: this account has no broker read to hand, so
+      // "broker contracts we have no row for" is NOT MEASURED here. A 0 would be
+      // an all-clear the summary has not earned.
+      uncoveredBrokerContracts: null,
     });
   });
 
@@ -247,6 +251,10 @@ describe('TRA-2820 — back-stamping legacy rows at the durable boundary', () =>
       total: 0,
       byReason: {},
       unexplained: 0,
+      // TRA-3909 — `null`, never 0: this account has no broker read to hand, so
+      // "broker contracts we have no row for" is NOT MEASURED here. A 0 would be
+      // an all-clear the summary has not earned.
+      uncoveredBrokerContracts: null,
     });
   });
 });

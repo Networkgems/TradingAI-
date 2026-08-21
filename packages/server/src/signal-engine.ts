@@ -346,7 +346,7 @@ import {
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount, type EquityExitRiskInput } from './paper-account.js';
-import { PaperOptionsAccount, qualifyLiveStopActionability, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary, type LiveStopActionabilityQualified, type LiveExitPassStatus, type DayOneStopPosture, type EngineBasisRepairOutcome } from './options-account.js';
+import { PaperOptionsAccount, qualifyLiveStopActionability, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary, type LiveStopActionabilityQualified, type LiveExitPassStatus, type DayOneStopPosture, type EngineBasisRepairOutcome, type LiveLotAdoptionReport } from './options-account.js';
 import { bindOptionsPnlToEquityBook } from './options-equity-bridge.js';
 import {
   PENDING_CLOSE_MAX_REPRICE_STEPS,
@@ -17695,6 +17695,21 @@ export class SignalEngine {
       if (out.status !== 'not_found') return { ...out, env };
     }
     return { status: 'not_found' };
+  }
+
+  /**
+   * TRA-3909 — the per-lot adoption reading, per Tradier env.
+   *
+   * BOTH envs are returned rather than just the live one, and that is the
+   * anti-vacuity property: a reader that only ever sees `production` cannot tell
+   * "the pass ran and this book has nothing to adopt" from "this build routes
+   * the pass somewhere else". `symbolsExamined` on each bucket says which.
+   */
+  liveLotAdoptionReports(): Record<TradierEnv, LiveLotAdoptionReport> {
+    return {
+      sandbox: this.optionsAccounts.sandbox.liveLotAdoptionReport(),
+      production: this.optionsAccounts.production.liveLotAdoptionReport(),
+    };
   }
 
   async cancelManualPendingExit(optionId: string): Promise<

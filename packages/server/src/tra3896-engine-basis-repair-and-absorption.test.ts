@@ -464,14 +464,32 @@ describe('TRA-3896 part 2 — the reconcile refuses to widen an engine-origin ro
     recordEngineOpen(XLF, 1, 1.08, 142603650);
     const acct = liveAccount([xlfRow()]);
 
+    // ⚠️ UPDATED BY TRA-3909, and the update is that ticket's whole point: this
+    // refusal was always the SAFE half of an incomplete answer. It stopped the
+    // engine's row widening, and left the desk's contract with no row and no
+    // stop at all. TRA-3909 completes the branch the refusal falls through to.
+    //
+    // TRA-3896's own invariant is asserted below UNCHANGED — 0.965 and 0.772
+    // never touch the engine's row. What is added is the contract that used to
+    // be invisible.
     acct.reconcileTradierPositions([tradierPos()], 'live');
 
-    const row = acct.getState().openOptions[0]!;
+    const rows = acct.getState().openOptions;
+    const row = rows.find(r => r.id === xlfRow().id)!;
     expect(row.contracts).toBe(1);
     expect(row.contractsRemaining).toBe(1);
     expect(row.premiumPaid).toBe(1.08);       // NOT the 0.965 blend
     expect(row.stopLossPremium).toBeCloseTo(0.864, 10); // its own stop, not 0.772
-    expect(acct.getImportedAbsorptionCensus()).toEqual({ candidates: 1, refusals: 1, allowed: 0 });
+
+    const desk = rows.find(r => r.adoptionAuthority === 'desk_add')!;
+    expect(desk.contracts).toBe(1);
+    expect(desk.premiumPaid).toBeCloseTo(0.85, 10);      // the exact residual
+    expect(desk.stopLossPremium).toBeCloseTo(0.68, 10);
+
+    // ⛔ The census reads zero because the case is now RESOLVED UPSTREAM, not
+    // because the guard was removed. The CONTROL above is the proof: with the
+    // oracle silent, adoption declines, this arm is reached, and it refuses.
+    expect(acct.getImportedAbsorptionCensus()).toEqual({ candidates: 0, refusals: 0, allowed: 0 });
   });
 
   it('★ the refusal SURVIVES A REBOOT — reconcile runs on boot, which is why a hand correction reverts', () => {
@@ -481,8 +499,16 @@ describe('TRA-3896 part 2 — the reconcile refuses to widen an engine-origin ro
     recordEngineOpen(XLF, 1, 1.08, 142603650);
     const acct = liveAccount([xlfRow()]);
     for (let i = 0; i < 3; i++) acct.reconcileTradierPositions([tradierPos()], 'live');
-    expect(acct.getState().openOptions[0]!.premiumPaid).toBe(1.08);
-    expect(acct.getImportedAbsorptionCensus().refusals).toBe(3);
+
+    // TRA-3909 — the settled PER-LOT shape is what has to survive now, and it
+    // has to survive being RE-DERIVED rather than merely remembered: the second
+    // and third passes must mint nothing and re-blend nothing.
+    const rows = acct.getState().openOptions;
+    expect(rows).toHaveLength(2);
+    expect(rows.find(r => r.id === xlfRow().id)!.premiumPaid).toBe(1.08);
+    expect(rows.filter(r => r.adoptionAuthority === 'desk_add')).toHaveLength(1);
+    expect(rows.find(r => r.adoptionAuthority === 'desk_add')!.premiumPaid).toBeCloseTo(0.85, 10);
+    expect(acct.getImportedAbsorptionCensus().refusals).toBe(0);
   });
 
   it('★ NEGATIVE CONTROL: a genuine partial-fill top-up is still allowed through', () => {

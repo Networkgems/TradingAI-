@@ -2779,12 +2779,39 @@ export interface OptionPosition {
    *                       TRA-3826 mistake ("an absent discriminator is not a
    *                       negative result — it is no result").
    *
+   *   • `desk_add`      — TRA-3909. A lot the DESK added to a contract this
+   *                       engine already holds a row for, minted per-lot at its
+   *                       own residual basis with its own stop. See below.
+   *
    * Absent ⇔ the row did not come through the adoption path at all, i.e. a
-   * plain engine-opened position. Absent is NOT a fourth authorisation state
+   * plain engine-opened position. Absent is NOT a fifth authorisation state
    * and must never be defaulted to one: read it only on rows where
    * `importedFromTradier` is true.
+   *
+   * ── TRA-3909: why `desk_add` is a FOURTH value and not `foreign` ──────────
+   * Board instruction, TRA-3904 `92bc1e83`: *"Bot should manage added positions
+   * from Tradier"*. A lot minted as `foreign` gets
+   * `applyImportedRiskThresholds(…, unauthorized: true)` ⇒ `tp1 = Infinity`,
+   * `stopLossPremium = 0`, `riskUnmanagedReason: 'adopted_not_authorized'` —
+   * i.e. adopting the desk's contract as `foreign` produces a row with NO STOP,
+   * which is functionally identical to the state the board asked us to fix.
+   *
+   * So the guard has to admit this population, and the population is deliberately
+   * narrower than the one TRA-3829 was written about. `desk_add` is minted ONLY
+   * for a residual lot on an OCC symbol where this engine **already owns a row**
+   * — someone adding to a trade the engine is already in. A standalone desk
+   * position, with no engine contract anywhere near it (the six tickets typed
+   * into Tradier's web UI on 2026-08-17, which is the case TRA-3829 exists for),
+   * has no engine row on its symbol, takes the `no_engine_row` refusal in
+   * `planLotAdoption`, and stays `foreign` and guarded exactly as before.
+   *
+   * ⚠️ This value therefore AUTHORISES EXITS on real money. It is stamped by one
+   * call site (`PaperOptionsAccount.applyLotAdoptionPlan`) and by nothing else,
+   * and that site refuses to keep a `desk_add` row that did not end up with an
+   * armed stop — an adopted lot with a zero stop is the defect wearing the fix's
+   * clothes.
    */
-  adoptionAuthority?: 'engine_origin' | 'foreign' | 'unresolved';
+  adoptionAuthority?: 'engine_origin' | 'foreign' | 'unresolved' | 'desk_add';
   /**
    * TRA-3829 (board ruling B, card `331ddc56`, 2026-08-21) — the EXPLICIT,
    * PER-ROW hand-over of an adopted broker position to the engine.
@@ -2967,6 +2994,26 @@ export interface OptionPosition {
    * cleared the moment the stop stops triggering or the release opens.
    */
   otmStopHeldForPdt?: string;
+  /**
+   * TRA-3909 — the risk schedule a `desk_add` lot is managed on: the sleeve that
+   * opened the ENGINE's sibling contract on the same OCC symbol, read from the
+   * fill ledger's `buy_to_open` row.
+   *
+   * Set only on rows with `adoptionAuthority: 'desk_add'`, and it is the field
+   * that makes the per-lot stop DURABLE. The desk lot's levels are
+   * `applyEngineOriginRiskThresholds(row, deskAddSleeve, …)` against the lot's
+   * OWN basis — the desk added to this trade, so it gets this trade's schedule
+   * at its own price. On the live OTM sleeve that is `0.8 ×` / `1.5 ×`, which is
+   * where the ordered levels come from: BAC 1.17 → stop **0.936**, XLF 0.85 →
+   * stop **0.680**.
+   *
+   * Deliberately NOT `engineOriginSleeve`, which documents *the sleeve that
+   * actually placed this contract*. The desk placed this one. Re-using that
+   * field would make `stampLegacyUnmanagedRows` and the two `updateConfig`
+   * re-apply loops treat a desk lot as engine-origin inventory, and would assert
+   * a provenance the ledger does not support. This is the schedule half only.
+   */
+  deskAddSleeve?: 'single_leg_rv' | 'single_leg_otm' | 'single_leg_directional';
   /**
    * TRA-348 — Tradier order id for an in-flight `sell_to_close` against an
    * imported position. Set when the close order was accepted but did not

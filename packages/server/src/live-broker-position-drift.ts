@@ -282,6 +282,16 @@ export interface LiveBrokerPositionDriftReport {
   brokerContracts: number;
   /** Broker symbols the engine holds no eligible row for (foreign inventory). */
   brokerOnlySymbols: number;
+  /**
+   * TRA-3909 — CONTRACTS on those symbols, not just how many symbols.
+   *
+   * `brokerOnlySymbols` counts names; this counts real money. Paired with
+   * {@link excessContracts} it is the whole of "broker premium this book has no
+   * row for", which is what `liveUnmanagedRisk.uncoveredBrokerContracts`
+   * publishes — the number that read a correct-but-useless 0 over an unstopped
+   * $117 BAC contract on 2026-08-20.
+   */
+  brokerOnlyContracts: number;
   shortfalls: BrokerShortfall[];
   /** ★ The alarm number: contracts that left the broker with no order of ours. */
   outOfBandContracts: number;
@@ -345,6 +355,7 @@ export function darkBrokerPositionDriftReport(
     brokerSymbols: 0,
     brokerContracts: 0,
     brokerOnlySymbols: 0,
+    brokerOnlyContracts: 0,
     shortfalls: [],
     outOfBandContracts: 0,
     outOfBandSymbols: 0,
@@ -440,8 +451,19 @@ const NO_RECORDED_CONTRACTS_ORACLE: RecordedEngineContractsOracle = () => null;
  * `unresolved` imports stay out: those are the desk's inventory, and their
  * absence from a payload is not evidence about any order of ours.
  */
+/**
+ * TRA-3909 — `desk_add` joins the managed set, and it MUST.
+ *
+ * A desk lot adopted per-lot carries an engine stop and is exited by the engine
+ * exit pass, so it is engine-managed by the same reading `engine_origin` is. It
+ * is also the only reason the split symbol reconciles at all: with the desk lot
+ * excluded, the engine side of XLF would count 1 against the broker's 2 and this
+ * detector would report a permanent `excess` over a contract that now has a row
+ * and a stop — turning the fix into a standing false alarm.
+ */
 function isEngineManagedRow(opt: OptionPosition): boolean {
-  return !opt.importedFromTradier || opt.adoptionAuthority === 'engine_origin';
+  if (!opt.importedFromTradier) return true;
+  return opt.adoptionAuthority === 'engine_origin' || opt.adoptionAuthority === 'desk_add';
 }
 
 export function diffLiveBrokerPositions(
@@ -462,6 +484,7 @@ export function diffLiveBrokerPositions(
     brokerSymbols: 0,
     brokerContracts: 0,
     brokerOnlySymbols: 0,
+    brokerOnlyContracts: 0,
     shortfalls: [],
     outOfBandContracts: 0,
     outOfBandSymbols: 0,
@@ -550,7 +573,14 @@ export function diffLiveBrokerPositions(
     const openedAt = typeof opt.openedAt === 'number' && Number.isFinite(opt.openedAt) ? opt.openedAt : now;
     agg.oldestOpenedAt = Math.min(agg.oldestOpenedAt, openedAt);
     agg.rowIds.push(opt.id);
-    if (opt.importedFromTradier) {
+    // TRA-3909 — narrowed from `importedFromTradier` to the ENGINE-ORIGIN
+    // authority specifically. `importedFromTradier` was an adequate proxy while
+    // `engine_origin` was the only import the filter above admitted; it is not
+    // one now. A `desk_add` lot is by construction NOT accounted for by this
+    // engine's fill ledger — that is what makes it a desk lot — so counting it
+    // here would report an absorption on every pass over a correctly split
+    // symbol, which is the reverse of what this arm exists to catch.
+    if (opt.importedFromTradier && opt.adoptionAuthority === 'engine_origin') {
       agg.engineOriginImportedContracts += contracts;
       agg.engineOriginImportedRowIds.push(opt.id);
       base.engineOriginImportedRowsChecked += 1;
@@ -601,10 +631,16 @@ export function diffLiveBrokerPositions(
   }
 
   let brokerOnly = 0;
-  for (const symbol of brokerBySymbol.keys()) {
-    if (!engineBySymbol.has(symbol)) brokerOnly += 1;
+  let brokerOnlyContracts = 0;
+  for (const [symbol, qty] of brokerBySymbol) {
+    if (!engineBySymbol.has(symbol)) {
+      brokerOnly += 1;
+      // TRA-3909 — the contracts too, not just the name. See the field's doc.
+      brokerOnlyContracts += Number.isFinite(qty) && qty > 0 ? qty : 0;
+    }
   }
   base.brokerOnlySymbols = brokerOnly;
+  base.brokerOnlyContracts = brokerOnlyContracts;
 
   if (base.engineRowsChecked === 0) {
     // Nothing to compare. Deliberately NOT `clean`: a green with an empty
@@ -815,6 +851,8 @@ export function summarizeLiveBrokerPositionDrift(
   tooYoungSymbols: number;
   excessContracts: number;
   brokerOnlySymbols: number;
+  /** TRA-3909 — contracts on broker-only symbols; see the report field. */
+  brokerOnlyContracts: number;
   /** TRA-3896 — engine-origin rows holding more than our own fills account for. */
   absorbedContracts: number;
   engineOriginImportedRowsChecked: number;
@@ -837,6 +875,7 @@ export function summarizeLiveBrokerPositionDrift(
       tooYoungSymbols: 0,
       excessContracts: 0,
       brokerOnlySymbols: 0,
+      brokerOnlyContracts: 0,
       absorbedContracts: 0,
       engineOriginImportedRowsChecked: 0,
       absorptionUnresolvedRows: 0,
@@ -855,6 +894,7 @@ export function summarizeLiveBrokerPositionDrift(
     tooYoungSymbols: report.tooYoungSymbols,
     excessContracts: report.excessContracts,
     brokerOnlySymbols: report.brokerOnlySymbols,
+    brokerOnlyContracts: report.brokerOnlyContracts,
     absorbedContracts: report.absorbedContracts,
     engineOriginImportedRowsChecked: report.engineOriginImportedRowsChecked,
     absorptionUnresolvedRows: report.absorptionUnresolvedRows,

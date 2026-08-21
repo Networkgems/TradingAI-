@@ -104,8 +104,29 @@ export function isEngineActionOnAdoptedRowsArmed(
  * - `tradierEnv === 'sandbox'` ⇒ **true**. See the partition note below.
  * - `engine_origin` ⇒ **true**. The oracle PROVED we placed it. TRA-2820's fix
  *   stands: a live row whose local record was lost keeps its stops.
+ * - `desk_add` ⇒ **true**. TRA-3909, and the one deliberate widening of this
+ *   guard since it shipped. See below.
  * - `foreign` / `unresolved` / absent / anything else ⇒ **`armed`**, i.e. false
  *   unless the deployment has explicitly opted in.
+ *
+ * ── TRA-3909: why `desk_add` is admitted, and how narrowly ────────────────
+ * Board instruction, TRA-3904 `92bc1e83`, 2026-08-20T23:21:32Z: *"Bot should
+ * manage added positions from Tradier"*. That cannot be executed with this
+ * guard as it stood — a lot adopted as `foreign` takes the sentinel schedule
+ * (`stopLossPremium: 0`), so it would be visibly adopted and functionally
+ * identical to the unmanaged contract the board was complaining about.
+ *
+ * ⚠️ The widening is a population, not a policy change, and the population is
+ * strictly smaller than the one this ticket was written about. TRA-3829's case
+ * is a STANDALONE desk position — the six tickets typed into Tradier's web UI
+ * on 2026-08-17, with no engine contract anywhere near them. `desk_add` is
+ * minted only for a RESIDUAL lot on an OCC symbol where this engine already
+ * owns a row (`planLotAdoption` refuses `no_engine_row` otherwise), i.e. the
+ * desk adding to a trade the engine is already running. Those two sets are
+ * disjoint, so nothing TRA-3829 refuses today starts being actioned.
+ *
+ * The default direction of the flag is UNCHANGED and still the non-acting one:
+ * a row of unknown or foreign origin still needs an explicit deployment opt-in.
  *
  * ── Why the partition is `tradierEnv` and NOT `mode` ──────────────────────
  * ⛔ TRA-3112 item 3: on an imported row `mode` is stamped `'live'`
@@ -157,6 +178,9 @@ export function engineMayActOnAdoptedRow(
   if (row.importedFromTradier !== true) return true;
   if (row.tradierEnv === 'sandbox') return true;
   if (row.adoptionAuthority === 'engine_origin') return true;
+  // TRA-3909 — a desk lot added to a contract the engine already holds. Still an
+  // allow-list entry, so an unrecognised shape keeps refusing by construction.
+  if (row.adoptionAuthority === 'desk_add') return true;
   return armed && hasEngineHandover(row);
 }
 

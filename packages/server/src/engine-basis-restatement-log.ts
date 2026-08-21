@@ -46,12 +46,23 @@ export const ENGINE_BASIS_RESTATEMENT_FILENAME = 'engine-basis-restatements.json
  *     refusal regressed.
  *   • `recorded_fill_repair` — the TRA-3896 admin repair, sourced from this
  *     engine's OWN `buy_to_open` records. Ordered by a human, once.
+ *   • `desk_lot_split` — TRA-3909. The reconcile UNBLENDING a row that had
+ *     already absorbed a desk contract: the engine row is shrunk back to the
+ *     lot the fill ledger accounts for and restated to that lot's own fill,
+ *     and the residual is minted as its own `desk_add` row. Also sourced from
+ *     our own records, but written by the reconcile rather than by a human, and
+ *     it is the only one of the three whose `contracts` moves as well as its
+ *     basis — so a reader must not fold it into `recorded_fill_repair`.
  *
- * Optional because every record written before this ticket carries neither, and
- * back-filling a guess onto them would be inventing provenance. Absent reads as
- * "pre-TRA-3896, therefore `broker_reconcile`" — the only mechanism that existed.
+ * Optional because every record written before TRA-3896 carries none of them,
+ * and back-filling a guess onto them would be inventing provenance. Absent reads
+ * as "pre-TRA-3896, therefore `broker_reconcile`" — the only mechanism that
+ * existed.
  */
-export type EngineBasisRestatementSource = 'broker_reconcile' | 'recorded_fill_repair';
+export type EngineBasisRestatementSource =
+  | 'broker_reconcile'
+  | 'recorded_fill_repair'
+  | 'desk_lot_split';
 
 /** One witnessed restatement: both sides of an edit that is otherwise unobservable. */
 export interface EngineBasisRestatementRecord {

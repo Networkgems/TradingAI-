@@ -264,6 +264,10 @@ describe('TRA-3553 case (b) — an unknown broker row fails LOUD, never quietly'
       total: 1,
       byReason: { provenance_unresolved: 1 },
       unexplained: 0,
+      // TRA-3909 — `null`, never 0: this account has no broker read to hand, so
+      // "broker contracts we have no row for" is NOT MEASURED here. A 0 would be
+      // an all-clear the summary has not earned.
+      uncoveredBrokerContracts: null,
     });
   });
 

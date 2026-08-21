@@ -11010,6 +11010,26 @@ app.get('/api/health/options-live', async (_req, res) => {
       // standing reason not to widen what it says about the real-money book.
       liveUnmanagedRisk: summarizeLiveUnmanagedRisk(
         getAllUserContexts().flatMap(c => c.engine.getState().options.openOptions ?? []),
+        // TRA-3909 — the row walk above CANNOT see a broker contract this book
+        // has no row for, and on 2026-08-20T23:38Z that made it publish a
+        // correct `{ total: 0, unexplained: 0 }` over a real, unstopped $117 BAC
+        // contract. Only a third source neither the row nor the broker wrote can
+        // see it, so the number comes from the drift detector.
+        //
+        // FAILS TO `null`, NEVER TO 0: if ANY context's last drift check was
+        // blind/dark/never-ran, the fleet total would be a floor of unknown
+        // depth, and a floor published as a count is exactly the all-clear this
+        // field exists to withhold.
+        (() => {
+          const lasts = getAllUserContexts().map(c => c.engine.getLiveBrokerPositionDriftState().last);
+          if (lasts.length === 0) return null;
+          let total = 0;
+          for (const last of lasts) {
+            if (!last || last.status === 'blind' || last.status === 'dark') return null;
+            total += last.excessContracts + last.brokerOnlyContracts;
+          }
+          return total;
+        })(),
       ),
       // TRA-3822 — the counter `liveUnmanagedRisk` above is STRUCTURALLY UNABLE
       // to contain: is a live stop that is already THROUGH going to be acted on?
@@ -14962,6 +14982,44 @@ app.delete('/api/options/:id/engine-handover', requireAuth, async (req, res) => 
     return;
   }
   res.status(404).json({ error: 'Option position not found.' });
+});
+
+/**
+ * TRA-3909 — WHICH desk lots this book adopted, and which it REFUSED.
+ *
+ * ── Why a route and not a log line ─────────────────────────────────────────
+ * The adoption pass is idempotent by design: one reconcile after it runs there
+ * is nothing left to do. So the ACTIONS it took are visible for ~30 seconds and
+ * then never again, and a build where this mechanism is absent publishes the
+ * same silence as a book with nothing to adopt. That is the recurring bug this
+ * whole ticket tree is about, and the standing rule from TRA-3909's own
+ * acceptance is that a green with no failing state is not a reading.
+ *
+ * So this route publishes THREE things that fail differently:
+ *
+ *   • `adopted[]` — derived from the BOOK, not from the pass, so it survives.
+ *     Each lot names its own `premiumPaid`, its own `stopLossPremium` and its
+ *     own `currentPremium` — ⚠️ the breach predicate is `currentPremium`
+ *     (`options-account.ts:1123`), NOT `lastMark`, and on 2026-08-20 both live
+ *     rows' `lastMark` sat above it and flipped the XLF verdict.
+ *   • `refused[]` — the NEGATIVE CONTROL, and the half that leaves no trace on
+ *     any row. Re-published every reconcile for as long as the condition holds,
+ *     each with the enumerated `reason` that produced it.
+ *   • `symbolsExamined` / `ranAt` — the denominator. An empty `adopted` with
+ *     `symbolsExamined: 0` means the pass did not run; the same empty list with
+ *     a non-zero count means it ran and found nothing to do. Those are not the
+ *     same state and must never publish the same payload.
+ *
+ * `engineMayAct` on each lot is the field that says whether the row is theatre:
+ * an adopted lot the engine may not act on carries a stop nothing will ever
+ * fire, and reads identically to a managed one on every other field.
+ *
+ * ADMIN + GET. It names OCC symbols and real dollars on the live book, so it is
+ * authenticated (TRA-2163); it is a pure read and writes nothing.
+ */
+app.get('/api/options/lot-adoption', requireAuth, requireAdmin, async (_req, res) => {
+  const ctx = await userCtx(res);
+  res.json({ ok: true, byEnv: ctx.engine.liveLotAdoptionReports() });
 });
 
 /**

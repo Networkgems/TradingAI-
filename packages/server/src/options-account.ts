@@ -83,6 +83,18 @@ import {
 // question from the authorisation one and no longer shares its answer.
 // TRA-3926 — and the same attribution applied to the WRITE side, where it
 // bounds the quantity an exit may submit rather than labelling a fold.
+//
+// TRA-3909 ⇄ TRA-3913 interaction, stated once here because the two tickets
+// landed within hours of each other on this same import: the per-lot split
+// below mints rows carrying `adoptionAuthority: 'desk_add'`, which is NOT
+// `engine_origin`, so it takes rule 3 of `splitEngineExposureContracts` —
+// wholly ADOPTED, oracle NOT consulted, `oracleRefused: false`. That is the
+// intended reading in both directions: rule 3's own docblock names the
+// "two rows on one OCC symbol would each claim the same recorded contracts"
+// double-attribution hazard, and a split XLF row is exactly that shape. It is
+// also why the split IMPROVES TRA-3913's figures rather than perturbing them —
+// once the blend is gone the desk lot is priced at its own 0.85 basis instead
+// of the broker's 0.965 blend, so `adoptedUsd` stops being an estimate.
 import {
   boundExitContractsToEngineShare,
   engineMayActOnAdoptedRow,
@@ -91,6 +103,23 @@ import {
   splitEngineExposureContracts,
   type EngineExitQuantityBound,
 } from './option-exec-flag.js';
+// TRA-3909 — the PER-LOT adoption planner. Pure, so every refusal below is
+// reachable from a test without a broker, a ledger or a clock.
+import {
+  planLotAdoption,
+  type AdoptedLotView,
+  type LiveLotAdoptionReport,
+  type LotAdoptionPlan,
+  type LotAdoptionRefusal,
+  type LotAdoptionRowView,
+  type LotProvenance,
+} from './live-lot-adoption.js';
+export type {
+  AdoptedLotView,
+  LiveLotAdoptionReport,
+  LotAdoptionRefusal,
+  LotAdoptionRefusalReason,
+} from './live-lot-adoption.js';
 import {
   type MarketableOpenMtmConfig,
   DEFAULT_MARKETABLE_OPEN_MTM_CONFIG,
@@ -866,6 +895,29 @@ export interface LiveUnmanagedRiskSummary {
    * exactly as unexplained.
    */
   unexplained: number;
+  /**
+   * TRA-3909 — ⚠️ **BROKER contracts on the live book with NO engine row at
+   * all.** `null` when it could not be measured (the drift detector was blind or
+   * dark on every context); never `0` for "not measured".
+   *
+   * Read this BEFORE reading `total: 0` as an all-clear. The two numbers above
+   * walk OUR OWN ROWS, so a contract the broker holds and this book has no row
+   * for is not unmanaged — it is INVISIBLE, and the summary reports the same
+   * `{ total: 0, unexplained: 0 }` it reports over a genuinely clean book.
+   *
+   * That is not hypothetical. On 2026-08-20T23:38Z this object read
+   * `{ total: 0, unexplained: 0 }` while the live Tradier account held a BAC
+   * contract worth ~$117 with no row and no stop of any kind. The CEO named it
+   * on TRA-3909 as the thing that must not stay true after the fix: *"a silent
+   * success is indistinguishable from a silent no-op"*.
+   *
+   * Deliberately NOT folded into `total`. `total` is "rows we chose not to
+   * manage" and several consumers are pinned on that reading; this is "premium
+   * we cannot see", which is a different and worse thing. Sourced from
+   * `brokerPositionDrift` (`excessContracts` + broker-only symbols) because only
+   * a third source that neither the row nor the broker wrote can see it.
+   */
+  uncoveredBrokerContracts: number | null;
 }
 
 /**
@@ -1009,6 +1061,14 @@ export interface DetachedWorkingExitsByReason {
  */
 export function summarizeLiveUnmanagedRisk(
   positions: Iterable<OptionPosition>,
+  /**
+   * TRA-3909 — broker contracts with no engine row, from the drift detector.
+   * Defaults to `null` = NOT MEASURED, which is the honest reading for a caller
+   * that has no broker read to hand. It must never default to `0`: that is the
+   * value that would make an unmeasured book publish an all-clear, which is the
+   * exact defect this argument exists to close.
+   */
+  uncoveredBrokerContracts: number | null = null,
 ): LiveUnmanagedRiskSummary {
   const byReason: Record<string, number> = {};
   let total = 0;
@@ -1023,7 +1083,7 @@ export function summarizeLiveUnmanagedRisk(
     }
     if (!Number.isFinite(opt.stopLossPremium) || opt.stopLossPremium <= 0) unexplained += 1;
   }
-  return { total, byReason, unexplained };
+  return { total, byReason, unexplained, uncoveredBrokerContracts };
 }
 
 /**
@@ -2983,6 +3043,55 @@ export class PaperOptionsAccount {
    */
   private engineBasisRepairedTotal = 0;
   /**
+   * TRA-3909 — the last PER-LOT adoption pass over the live book.
+   *
+   * Held as the pass's own output rather than reconstructed from the rows,
+   * because the two halves answer different questions and only one of them
+   * survives success: the ADOPTED lots are readable off the book forever (they
+   * are rows), while a REFUSAL leaves no trace on any row at all. A refusal that
+   * is not published is the exact shape of this whole ticket tree — a state that
+   * reads identically whether the mechanism ran and declined, or never ran.
+   *
+   * Overwritten each pass, so it is a READING and not a log: a refusal that has
+   * been fixed disappears on the next reconcile (30s), and one that persists
+   * keeps re-publishing itself.
+   */
+  private lotAdoptionLast: {
+    ranAt: number;
+    symbolsExamined: number;
+    mintedLast: number;
+    splitLast: number;
+    refusals: LotAdoptionRefusal[];
+  } | null = null;
+  /** TRA-3909 — monotonic: desk lots minted since boot. */
+  private lotAdoptionMintedTotal = 0;
+  /** TRA-3909 — monotonic: engine rows unblended (shrunk back to their own lot). */
+  private lotAdoptionSplitTotal = 0;
+  /** TRA-3909 — monotonic: symbol-passes that declined. The refusal's denominator. */
+  private lotAdoptionRefusedTotal = 0;
+  /**
+   * TRA-3909 — reconcile passes where a symbol held MORE THAN ONE row, so the
+   * broker's blended `premiumPaid` and its lot `contracts` described no row in
+   * the group and the per-row copy was refused wholesale.
+   *
+   * This is the steady state of a correctly split symbol, so a NON-zero value
+   * here is the normal reading once adoption has run — not an alarm. It is
+   * counted because the alternative is a silent `continue` on the live exit
+   * path's own bookkeeping.
+   */
+  private lotSplitBrokerCopyRefusals = 0;
+  /**
+   * TRA-3909 — reconcile passes where a row on the SAME OCC symbol but a
+   * DIFFERENT book (`mode`) existed.
+   *
+   * Before this ticket the reconcile resolved `existing` with an unscoped
+   * `find`, so a live broker contract whose OCC collided with a demo row would
+   * update the DEMO row and never mint a live one — the live contract would end
+   * up with no row anywhere. Scoping the lookup to `mode` fixes that; the
+   * counter exists so the behaviour change is visible rather than silent.
+   */
+  private crossModeSymbolCollisions = 0;
+  /**
    * TRA-1976 — equity shares taken on when a cash-secured put is assigned, keyed
    * by lot id. This is the equity inventory the TRA-1966 primitive deferred; it
    * lets {@link settleCoveredWrite}'s `assigned` branch convert a short put into
@@ -4000,6 +4109,14 @@ export class PaperOptionsAccount {
       for (const opt of this.openOptions.values()) {
         if (!opt.importedFromTradier) continue;
         if (opt.engineOriginSleeve) continue;
+        // TRA-3909 — a `desk_add` lot is not governed by this arm (see
+        // `engineMayActOnAdoptedRow`), so flipping the arm must not rewrite its
+        // schedule. Re-derive its OWN sleeve's levels against its own basis, the
+        // same shape the `engineOriginSleeve` skip above serves.
+        if (opt.adoptionAuthority === 'desk_add' && opt.deskAddSleeve) {
+          applyEngineOriginRiskThresholds(opt, opt.deskAddSleeve, this.otmRiskParams, this.rvRiskParams);
+          continue;
+        }
         applyImportedRiskThresholds(
           opt,
           this.rvRiskParams,
@@ -4027,6 +4144,14 @@ export class PaperOptionsAccount {
           // own sleeve's schedule off the current `premiumPaid` instead.
           if (opt.engineOriginSleeve) {
             applyEngineOriginRiskThresholds(opt, opt.engineOriginSleeve, this.otmRiskParams, this.rvRiskParams);
+            continue;
+          }
+          // TRA-3909 — same reasoning for a desk lot: it was adopted onto the
+          // engine's own trade by board order, not brought to the account by the
+          // user, so the "manage imported holdings" toggle is not the switch that
+          // governs it. Keep it on its sleeve's schedule at its own basis.
+          if (opt.adoptionAuthority === 'desk_add' && opt.deskAddSleeve) {
+            applyEngineOriginRiskThresholds(opt, opt.deskAddSleeve, this.otmRiskParams, this.rvRiskParams);
             continue;
           }
           // TRA-3829 — the Settings toggle must not re-arm a stop on inventory
@@ -8658,8 +8783,13 @@ export class PaperOptionsAccount {
     // TRA-3896 — the repair is not a reconcile, so it must not land in the
     // sweep's numerator. See {@link engineBasisRepairedTotal} for the
     // self-contradicting census that produced on the live box.
-    if (rec.source === 'recorded_fill_repair') this.engineBasisRepairedTotal += 1;
-    else this.engineBasisRestatedTotal += 1;
+    // TRA-3909 — `desk_lot_split` is not the TRA-2889 sweep either: it is the
+    // reconcile UNBLENDING a row against our own ledger, and folding it into
+    // `restated` would tell a reader the broker-truth sweep moved a basis it
+    // explicitly refused to move. Counted with the repairs, which is what it is.
+    if (rec.source === 'recorded_fill_repair' || rec.source === 'desk_lot_split') {
+      this.engineBasisRepairedTotal += 1;
+    } else this.engineBasisRestatedTotal += 1;
     const after = opt.premiumPaid;
     const ratioOf = (v: number): number => (after > 0 ? v / after : Number.NaN);
     rec.premiumPaidAfter = after;
@@ -9096,10 +9226,55 @@ export class PaperOptionsAccount {
       if (closed) removed += 1;
     }
 
+    // ── TRA-3909: PER-LOT adoption, before the per-row branches below ────────
+    // Split any engine row that has already absorbed a desk contract, and mint
+    // the desk's residual as its own row with its own basis and its own stop.
+    // Runs FIRST so the branches below see the settled per-lot shape, and it is
+    // idempotent — after one pass it returns plans with no steps, forever.
+    this.adoptDeskLots(positions, mode);
+
     for (const incoming of positions) {
-      const existing = Array.from(this.openOptions.values()).find(
-        o => o.optionSymbol === incoming.optionSymbol,
+      // TRA-3909 — a symbol can now hold MORE THAN ONE row, one per lot, so the
+      // old `find` (first match wins) is no longer a correct resolution.
+      //
+      // Scoped to `mode`, which the old lookup was not. That is a fix, not a
+      // widening: a live broker contract whose OCC collided with a DEMO row used
+      // to resolve to the demo row — updating the wrong book AND suppressing the
+      // mint, leaving the live contract with no row anywhere. Counted so the
+      // change is visible.
+      const symbolRows = Array.from(this.openOptions.values()).filter(
+        o => o.optionSymbol === incoming.optionSymbol && (o.mode ?? 'demo') === mode,
       );
+      if (
+        symbolRows.length === 0
+        && Array.from(this.openOptions.values()).some(o => o.optionSymbol === incoming.optionSymbol)
+      ) {
+        this.crossModeSymbolCollisions += 1;
+      }
+
+      // TRA-3078 — the journal repair runs for EVERY imported row on the symbol,
+      // not just the first: a split symbol holds two, and the one that would
+      // have been skipped is the freshly-minted desk lot whose close would then
+      // be written against an id the journal has never seen.
+      for (const row of symbolRows) {
+        if (row.importedFromTradier && row.journalId === undefined) {
+          this.queueJournalImportOpen(row, 'reconcile_repair');
+        }
+      }
+
+      if (symbolRows.length > 1) {
+        // Tradier's `/positions` is ONE row per OCC, so on a split symbol
+        // `incoming.contracts` is the LOT SUM and `incoming.premiumPaid` is the
+        // LOT BLEND. Neither describes any single row in this group, and writing
+        // either onto one of them is TRA-3890's defect with extra steps. The
+        // per-row copy is refused wholesale; the group's quantity is reconciled
+        // by `adoptDeskLots` above, against the fill ledger rather than against
+        // the blend.
+        this.lotSplitBrokerCopyRefusals += 1;
+        continue;
+      }
+
+      const existing = symbolRows[0];
       if (existing) {
         if (!existing.importedFromTradier) {
           // TRA-2889 / TRA-2873 — an engine-opened row used to take an
@@ -9183,9 +9358,10 @@ export class PaperOptionsAccount {
         // Cheap and self-terminating: `journalId` is stamped on every
         // terminating branch, the journal lookup is served from the loaded
         // in-memory map, and a row that resolves once is skipped from then on.
-        if (existing.journalId === undefined) {
-          this.queueJournalImportOpen(existing, 'reconcile_repair');
-        }
+        // TRA-3909 — the repair itself now runs in the `symbolRows` loop above,
+        // for every imported row on the symbol rather than only for the one this
+        // branch resolved to. The reasoning below is unchanged and is why it is
+        // still unconditional-but-self-terminating.
         // ── TRA-3896 part 2 ──────────────────────────────────────────────────
         // An `engine_origin` imported row must not silently take on a broker lot
         // LARGER than this engine can account for having bought.
@@ -9358,6 +9534,352 @@ export class PaperOptionsAccount {
     }
 
     return { added, updated, removed, total: positions.length };
+  }
+
+  /**
+   * TRA-3909 — how this row got onto the book, in the planner's vocabulary.
+   *
+   * `engine` reuses the SAME reading `live-broker-position-drift.ts` uses
+   * (`isEngineManagedRow`): not imported at all, or imported and proven ours.
+   * Written once, here, so "is this the engine's contract" has one answer across
+   * the adoption pass and the drift detector rather than two that can drift.
+   */
+  private lotProvenanceOf(opt: OptionPosition): LotProvenance {
+    if (!opt.importedFromTradier) return 'engine';
+    if (opt.adoptionAuthority === 'engine_origin') return 'engine';
+    if (opt.adoptionAuthority === 'desk_add') return 'desk_add';
+    return 'foreign';
+  }
+
+  /**
+   * TRA-3909 — adopt desk-added broker lots PER LOT, at each lot's own basis,
+   * with each lot's own stop.
+   *
+   * Executes the board's TRA-3904 `92bc1e83` instruction under the CEO reading
+   * on TRA-3895 `e7b15b97`. See `live-lot-adoption.ts` for the arithmetic and
+   * for why every incomplete-ledger path is a refusal rather than a fallback to
+   * the blend.
+   *
+   * ── Where it runs, and why that is the whole durability story ───────────────
+   * Inside the reconcile, which runs ON BOOT and every 30s after. TRA-3896
+   * proved there is NO hand path here: the only routes that reach an open row
+   * are `close`, `cancel-pending-exit` and this reconcile, and the imported
+   * branch re-copied the broker's blend on every pass — so any manual row edit
+   * reverted within hours. A repair that lives in the reconcile cannot be
+   * reverted by the reconcile, and survives a restart because it is re-derived
+   * rather than remembered.
+   *
+   * ⛔ Places no order, closes nothing and writes nothing to the broker. It only
+   * ever redistributes contracts the broker already reports, between rows on
+   * this book.
+   */
+  private adoptDeskLots(
+    positions: readonly TradierOpenOptionPosition[],
+    mode: AccountMode,
+  ): void {
+    const refusals: LotAdoptionRefusal[] = [];
+    let mintedLast = 0;
+    let splitLast = 0;
+    let symbolsExamined = 0;
+
+    for (const incoming of positions) {
+      const occ = incoming.optionSymbol;
+      if (typeof occ !== 'string' || occ === '') continue;
+      const rows = Array.from(this.openOptions.values()).filter(
+        o => o.optionSymbol === occ && (o.mode ?? 'demo') === mode && o.closedAt === undefined,
+      );
+      // A symbol with no local row at all is the ordinary adoption path's job
+      // (the mint at the bottom of the reconcile), not this pass's. Skipping it
+      // silently rather than refusing keeps the refusal list to symbols where a
+      // per-lot question was actually asked.
+      if (rows.length === 0) continue;
+      symbolsExamined += 1;
+
+      const views: LotAdoptionRowView[] = rows.map(r => ({
+        id: r.id,
+        contracts: r.contractsRemaining ?? r.contracts,
+        premiumPaid: r.premiumPaid,
+        provenance: this.lotProvenanceOf(r),
+        inFlight: !!r.pendingExit || r.pendingCloseOrderId !== undefined,
+        multiLeg: !!r.legs && r.legs.length > 0,
+        coveredWrite: !!r.coveredWrite,
+      }));
+      // The ledger records LIVE fills only, so a demo book would answer `null`
+      // for every symbol. `planLotAdoption` says so as `not_live` rather than
+      // letting the oracle's structural silence read as a finding.
+      const live = mode === 'live';
+      const recorded = live ? recordedEngineOpenBasis(occ) : null;
+      const plan = planLotAdoption(
+        { optionSymbol: occ, contracts: incoming.contracts, premiumPaid: incoming.premiumPaid },
+        views,
+        recorded === null ? null : {
+          contracts: recorded.contracts,
+          premiumPaid: recorded.premiumPaid,
+          costBasisUsd: recorded.costBasisUsd,
+          unpricedFills: recorded.unpricedFills,
+          stoppedAtClose: recorded.stoppedAtClose,
+        },
+        { live },
+      );
+
+      if (plan.refusals.length > 0) {
+        // `not_live` is the demo book's structural state on every symbol of every
+        // pass — publishing it would bury a real refusal under the demo book's
+        // whole option chain, which is the "eighteen backlog rows cannot bury one
+        // incident" rule. Counted nowhere, reported nowhere, by design.
+        for (const r of plan.refusals) {
+          if (r.reason === 'not_live') continue;
+          refusals.push(r);
+          this.lotAdoptionRefusedTotal += 1;
+          // `no_residual` is the ordinary state of a book nobody has added to,
+          // so it is reported (the reader needs the denominator) but logged at
+          // debug rather than warn.
+          const line = 'per-lot adoption declined';
+          const payload = {
+            issue: 'TRA-3909',
+            optionSymbol: r.optionSymbol,
+            reason: r.reason,
+            detail: r.detail,
+            brokerContracts: r.brokerContracts,
+            engineContracts: r.engineContracts,
+            deskContracts: r.deskContracts,
+            recordedContracts: r.recordedContracts,
+            note: 'nothing was written; the row keeps its own contracts, basis and stop',
+          };
+          if (r.reason === 'no_residual') accountLog.debug(line, payload);
+          else accountLog.warn(line, payload);
+        }
+        continue;
+      }
+
+      const applied = this.applyLotAdoptionPlan(plan, incoming, mode, refusals);
+      splitLast += applied.split;
+      mintedLast += applied.minted;
+    }
+
+    this.lotAdoptionLast = {
+      ranAt: Date.now(),
+      symbolsExamined,
+      mintedLast,
+      splitLast,
+      refusals,
+    };
+  }
+
+  /**
+   * TRA-3909 — apply one {@link LotAdoptionPlan}. The only site that stamps
+   * `adoptionAuthority: 'desk_add'`.
+   *
+   * ── The split ──────────────────────────────────────────────────────────────
+   * Shrinks the engine row back to the lot the fill ledger accounts for and
+   * restates it to that lot's OWN fill, via the shipped
+   * {@link restateEngineOpenedBasis} rescale rather than a second schedule of
+   * its own. On the live XLF row that is `2 ct @ 0.965 → 1 ct @ 1.08`, carrying
+   * the stop `0.772 → 0.864` — which is the number that matters, because 0.864
+   * is above the 0.82 `currentPremium` and 0.772 is below it.
+   *
+   * ── The mint ───────────────────────────────────────────────────────────────
+   * ⚠️ Deliberately does NOT go through `installReconcileRiskThresholds`. That
+   * helper re-derives `adoptionAuthority` from the provenance oracle, and the
+   * oracle answers on the OCC SYMBOL — so on a symbol the engine really did buy
+   * it would stamp the desk's contract `engine_origin`, asserting this engine
+   * placed an order it did not place. The schedule is applied directly instead,
+   * off the sibling's sleeve.
+   *
+   * ⛔ A desk lot that does not end up with an ARMED stop is not kept. An adopted
+   * row with `stopLossPremium: 0` is visually adopted and functionally identical
+   * to the unmanaged broker contract the board asked us to fix — it is the
+   * defect wearing the fix's clothes — so the mint is rolled back and reported
+   * as a refusal instead.
+   */
+  private applyLotAdoptionPlan(
+    plan: LotAdoptionPlan,
+    incoming: TradierOpenOptionPosition,
+    mode: AccountMode,
+    refusals: LotAdoptionRefusal[],
+  ): { split: number; minted: number } {
+    let split = 0;
+    let minted = 0;
+
+    if (plan.split) {
+      const row = this.openOptions.get(plan.split.positionId);
+      if (row) {
+        const before = { contracts: row.contracts, remaining: row.contractsRemaining, premiumPaid: row.premiumPaid, stop: row.stopLossPremium };
+        row.contracts = plan.split.toContracts;
+        row.contractsRemaining = plan.split.toContracts;
+        this.recordEngineBasisRestatement(row, plan.split.toPremiumPaid, 'desk_lot_split');
+        restateEngineOpenedBasis(row, plan.split.toPremiumPaid);
+        this.finishEngineBasisRestatement(row);
+        this.lotAdoptionSplitTotal += 1;
+        split = 1;
+        accountLog.warn('per-lot adoption: engine row UNBLENDED back to its own fill', {
+          issue: 'TRA-3909',
+          positionId: row.id,
+          optionSymbol: plan.optionSymbol,
+          contractsBefore: before.remaining ?? before.contracts,
+          contractsAfter: row.contractsRemaining,
+          premiumPaidBefore: before.premiumPaid,
+          premiumPaidAfter: row.premiumPaid,
+          stopLossPremiumBefore: before.stop,
+          stopLossPremiumAfter: row.stopLossPremium,
+          brokerCostBasisUsd: plan.brokerCostBasisUsd,
+          engineRecordedCostBasisUsd: plan.recordedCostBasisUsd,
+          note: 'basis is this engine\'s own recorded fill, never the broker blend; nothing was closed',
+        });
+      }
+    }
+
+    if (plan.mint) {
+      // The schedule the ENGINE's sibling contract on this OCC is managed on,
+      // read from the ledger's own `buy_to_open` row. The desk added to this
+      // trade, so the lot gets this trade's schedule against its OWN basis.
+      const fill = lastRecordedOpenFill(plan.optionSymbol);
+      const sleeve = fill && fill.sleeve !== 'unattributed'
+        ? (fill.sleeve === 'directional' ? 'single_leg_directional' : fill.sleeve)
+        : null;
+      if (sleeve === null) {
+        const refusal: LotAdoptionRefusal = {
+          optionSymbol: plan.optionSymbol,
+          reason: 'oracle_silent',
+          detail: 'the fill ledger has no attributable sleeve for the engine\'s own contract on this symbol, so there is no schedule to manage the desk lot on. An adopted lot with no stop is the defect, not the fix.',
+          brokerContracts: plan.brokerContracts,
+          engineContracts: plan.engineHeldContracts,
+          deskContracts: plan.deskHeldContracts,
+          recordedContracts: plan.recordedContracts,
+        };
+        refusals.push(refusal);
+        this.lotAdoptionRefusedTotal += 1;
+        accountLog.warn('per-lot adoption declined', { issue: 'TRA-3909', ...refusal });
+        return { split, minted };
+      }
+
+      const position: OptionPosition = {
+        id: randomUUID(),
+        symbol: incoming.underlying,
+        optionSymbol: plan.optionSymbol,
+        optionType: incoming.optionType,
+        strike: incoming.strike,
+        expiration: incoming.expiration,
+        contracts: plan.mint.contracts,
+        contractsRemaining: plan.mint.contracts,
+        premiumPaid: plan.mint.premiumPaid,
+        // The mark refresher repopulates this from the quote cache; the entry
+        // price is a better placeholder than zero or the broker's blend.
+        currentPremium: plan.mint.premiumPaid,
+        tp1Premium: Number.POSITIVE_INFINITY,
+        tp1Hit: false,
+        stopLossPremium: 0,
+        peakPremium: plan.mint.premiumPaid,
+        trailingActive: false,
+        trailingStopPremium: 0,
+        underlyingEntryPrice: 0,
+        openedAt: incoming.acquiredAt,
+        signalId: `tradier-desk-add-${plan.optionSymbol}`,
+        signalType: 'tradier_import',
+        mode,
+        importedFromTradier: true,
+        adoptionAuthority: 'desk_add',
+        deskAddSleeve: sleeve,
+        ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
+      };
+      applyEngineOriginRiskThresholds(position, sleeve, this.otmRiskParams, this.rvRiskParams);
+
+      if (!isArmedThreshold(position.stopLossPremium)) {
+        const refusal: LotAdoptionRefusal = {
+          optionSymbol: plan.optionSymbol,
+          reason: 'residual_non_positive',
+          detail: `the ${sleeve} schedule produced no armed stop against a residual basis of ${plan.mint.premiumPaid}; the mint was rolled back rather than left as an adopted row with a zero stop.`,
+          brokerContracts: plan.brokerContracts,
+          engineContracts: plan.engineHeldContracts,
+          deskContracts: plan.deskHeldContracts,
+          recordedContracts: plan.recordedContracts,
+        };
+        refusals.push(refusal);
+        this.lotAdoptionRefusedTotal += 1;
+        accountLog.warn('per-lot adoption declined', { issue: 'TRA-3909', ...refusal });
+        return { split, minted };
+      }
+
+      this.seedImportUnderlyingEntry(position);
+      this.openOptions.set(position.id, position);
+      // TRA-2937 — journal the adoption, or its close lands against an id the
+      // journal has never seen and is silently dropped.
+      this.queueJournalImportOpen(position);
+      this.lotAdoptionMintedTotal += 1;
+      minted = 1;
+      accountLog.warn('per-lot adoption: desk lot ADOPTED with its own basis and its own stop', {
+        issue: 'TRA-3909',
+        positionId: position.id,
+        optionSymbol: plan.optionSymbol,
+        contracts: position.contracts,
+        premiumPaid: position.premiumPaid,
+        stopLossPremium: position.stopLossPremium,
+        tp1Premium: position.tp1Premium,
+        sleeve,
+        residualUsd: plan.mint.residualUsd,
+        brokerContracts: plan.brokerContracts,
+        brokerCostBasisUsd: plan.brokerCostBasisUsd,
+        engineRecordedContracts: plan.recordedContracts,
+        engineRecordedCostBasisUsd: plan.recordedCostBasisUsd,
+        note: 'basis is the exact residual (broker cost - this engine\'s recorded cost); no order was placed',
+      });
+    }
+
+    return { split, minted };
+  }
+
+  /**
+   * TRA-3909 — the reading AC4 asks for: every adopted lot named, and every
+   * refused one named alongside it.
+   *
+   * ── Why the adopted half is derived from the BOOK, not from the pass ───────
+   * Because the pass is idempotent, and that is exactly the trap. One reconcile
+   * after adoption there is nothing left to do, so a report built from the
+   * pass's ACTIONS would read `{ minted: 0, refused: 0 }` — identical to a build
+   * where this code never ran at all. The adopted lots are rows, so they can be
+   * read back forever; the counters below say what the last pass DID, and the
+   * two together are what separate "working" from "absent".
+   *
+   * The refusals are the opposite case — a refusal leaves no trace on any row —
+   * so those come from the pass, and they re-publish on every reconcile for as
+   * long as the condition holds.
+   */
+  liveLotAdoptionReport(): LiveLotAdoptionReport {
+    const adopted: AdoptedLotView[] = [];
+    for (const opt of this.openOptions.values()) {
+      if (opt.closedAt !== undefined) continue;
+      if (opt.adoptionAuthority !== 'desk_add') continue;
+      adopted.push({
+        positionId: opt.id,
+        optionSymbol: opt.optionSymbol ?? '',
+        mode: opt.mode ?? 'demo',
+        contracts: opt.contractsRemaining ?? opt.contracts,
+        premiumPaid: opt.premiumPaid,
+        currentPremium: opt.currentPremium,
+        stopLossPremium: opt.stopLossPremium,
+        tp1Premium: Number.isFinite(opt.tp1Premium) ? opt.tp1Premium : null,
+        sleeve: opt.deskAddSleeve ?? null,
+        openedAt: opt.openedAt,
+        // The one field that says whether this row is theatre: an adopted lot
+        // the engine may not act on has a stop nothing will ever fire.
+        engineMayAct: engineMayActOnAdoptedRow(opt, this.actOnAdoptedBrokerRows),
+        stopArmed: isArmedThreshold(opt.stopLossPremium),
+        riskUnmanagedReason: opt.riskUnmanagedReason ?? null,
+      });
+    }
+    return {
+      ranAt: this.lotAdoptionLast?.ranAt ?? null,
+      symbolsExamined: this.lotAdoptionLast?.symbolsExamined ?? 0,
+      adopted,
+      refused: this.lotAdoptionLast ? [...this.lotAdoptionLast.refusals] : [],
+      mintedLast: this.lotAdoptionLast?.mintedLast ?? 0,
+      splitLast: this.lotAdoptionLast?.splitLast ?? 0,
+      mintedTotal: this.lotAdoptionMintedTotal,
+      splitTotal: this.lotAdoptionSplitTotal,
+      refusedTotal: this.lotAdoptionRefusedTotal,
+      brokerCopyRefusedOnSplitSymbol: this.lotSplitBrokerCopyRefusals,
+      crossModeSymbolCollisions: this.crossModeSymbolCollisions,
+    };
   }
 
   /**

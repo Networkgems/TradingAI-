@@ -1527,6 +1527,10 @@ describe('PaperOptionsAccount reconcile — engine-origin risk schedule (TRA-282
       total: 1,
       byReason: { sub_floor_premium: 1 },
       unexplained: 0,
+      // TRA-3909 — `null`, never 0: this account has no broker read to hand, so
+      // "broker contracts we have no row for" is NOT MEASURED here. A 0 would be
+      // an all-clear the summary has not earned.
+      uncoveredBrokerContracts: null,
     });
   });
 
@@ -1555,7 +1559,7 @@ describe('PaperOptionsAccount reconcile — engine-origin risk schedule (TRA-282
     // Provenance is recorded, and the row is NOT counted as unmanaged.
     expect(opt.engineOriginSleeve).toBe('single_leg_otm');
     expect(opt.riskUnmanagedReason).toBeUndefined();
-    expect(acct.liveUnmanagedRiskSummary()).toEqual({ total: 0, byReason: {}, unexplained: 0 });
+    expect(acct.liveUnmanagedRiskSummary()).toEqual({ total: 0, byReason: {}, unexplained: 0, uncoveredBrokerContracts: null });
   });
 
   it('an RV-origin row gets the dollar-floored RV stop; a directional one gets the ATM defaults', () => {
@@ -1598,7 +1602,7 @@ describe('PaperOptionsAccount reconcile — engine-origin risk schedule (TRA-282
     expect(opt.stopLossPremium).toBe(0);
     expect(opt.riskUnmanagedReason).toBe('sub_floor_premium');
     // Demo rows are out of scope for the live counter entirely.
-    expect(acct.liveUnmanagedRiskSummary()).toEqual({ total: 0, byReason: {}, unexplained: 0 });
+    expect(acct.liveUnmanagedRiskSummary()).toEqual({ total: 0, byReason: {}, unexplained: 0, uncoveredBrokerContracts: null });
   });
 
   it('a premium restatement on an engine-origin row re-derives its OWN schedule, not the import one', () => {
@@ -1682,7 +1686,7 @@ describe('PaperOptionsAccount reconcile — engine-origin risk schedule (TRA-282
         { ...buildBarePosition(), mode: 'demo', stopLossPremium: 0 },
         { ...buildBarePosition(), mode: 'live', stopLossPremium: 0, closedAt: TRADING_TIME },
       ]),
-    ).toEqual({ total: 0, byReason: {}, unexplained: 1 });
+    ).toEqual({ total: 0, byReason: {}, unexplained: 1, uncoveredBrokerContracts: null });
   });
 });
 
