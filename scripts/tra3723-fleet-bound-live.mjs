@@ -107,7 +107,18 @@ if (asJson) {
   console.log(`  arm     otmArmed=${out.arm.otmArmed} otmFlagOn=${out.arm.otmFlagOn} windowOpen=${out.arm.windowOpen} until ${out.arm.testUntilIso}`);
   console.log(`  A       $${out.fleetCapUsd}   phi ${out.fleetRiskFraction}   basis $${out.fleetCapitalBasisUsd ?? 'n/a'}`);
   for (const b of out.armedBooks) {
-    console.log(`  book    ${b.book}: B_i $${b.capUsd}  (E_i $${b.availableCashUsd}, openRows ${b.openRows} — flatness is not headroom)`);
+    // ⚠ PRINT THE COLUMN THE ROW WAS ACTUALLY SIZED ON. This line printed
+    // `availableCashUsd` under the label `E_i`, which stopped being true at
+    // TRA-3897 (`E_i = cash + atRisk`) — so on 2026-08-21 it published
+    // `admin: B_i $306.31 (E_i $274.60)`, a cap 12% ABOVE the capital it names.
+    // No verdict moved (every fold uses `rowBasisUsd`), but the row is what a
+    // human re-derives φ_eff from, and one that cannot reproduce from its own
+    // label reads like the fail-open this reader exists to catch.
+    const basis = b.sizingBasisUsd ?? b.availableCashUsd;
+    const composition = b.sizingBasisSource === 'capital'
+      ? ` = cash $${b.availableCashUsd} + at-risk $${b.openPremiumAtRiskUsd ?? 0}`
+      : ' — cash only, row published no sizingBasisUsd (pre-TRA-3897 bytes)';
+    console.log(`  book    ${b.book}: B_i $${b.capUsd}  (E_i $${basis}${composition}, openRows ${b.openRows} — flatness is not headroom)`);
   }
   console.log(`  SUM     $${out.sumBookCapUsd.toFixed(2)}   [${out.gradeSource}]`);
   console.log(`  cover   ${out.coverage.armedBooksCovered}/${out.coverage.eligibleBooks} of the arm`);

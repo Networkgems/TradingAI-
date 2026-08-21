@@ -916,3 +916,59 @@ test('TRA-3737 s4 the admissibleIdentity block is published on EVERY verdict', (
     assert.ok('graded' in g.out.admissibleIdentity);
   }
 });
+
+// ---------------------------------------------------------------------------
+// TRA-3737 s5 — THE ROW MUST REPRODUCE FROM ITS OWN LABEL.
+//
+// Found while grading routine 2b3b32bc's 2026-08-21T12:30Z fire, on the fire's
+// own output: `admin: B_i $306.31 (E_i $274.60)` — a cap 12% ABOVE the capital
+// the line names. `E_i` was `availableCashUsd`, which stopped being `E_i` at
+// TRA-3897 (`E_i = cash + atRisk`). No verdict moved and none ever could: every
+// fold in the grader goes through `rowBasisUsd`. But the per-book row is what a
+// human re-derives φ_eff from, and `B_i > E_i` is the visual signature of the
+// fail-open this whole reader exists to catch — a false alarm aimed at the only
+// reader in the room. The JSON consumer had it worse: `sizingBasisUsd` was not
+// projected at all, so `capUsd` could not be reproduced from ANY published field.
+// ---------------------------------------------------------------------------
+
+test('TRA-3737 s5 the projected E_i is the CAPITAL basis, and capUsd reproduces from it — not from cash', () => {
+  const rows = gradeEnforced().out.armedBooks;
+  const phi = 0.48417709261339426;
+  const admin = rows.find(r => r.book === 'admin');
+  assert.equal(admin.sizingBasisUsd, 632.68);
+  assert.equal(admin.sizingBasisSource, 'capital');
+  // Reproduces from the label to the cent...
+  assert.ok(Math.abs(admin.capUsd - phi * admin.sizingBasisUsd) <= 0.01,
+    `capUsd ${admin.capUsd} should reproduce from E_i ${admin.sizingBasisUsd}`);
+  // ...and demonstrably does NOT from the column that used to be printed. This
+  // is the assertion that makes the control a detector rather than a restatement:
+  // it fails against the old projection, where E_i WAS this number.
+  assert.ok(Math.abs(admin.capUsd - phi * admin.availableCashUsd) > 100,
+    'cash-as-E_i must be visibly wrong, or this control proves nothing');
+  // Cent-exact, never float-exact: `274.68 + 358` is `632.6800000000001` in IEEE
+  // doubles, and a control that reads that as a mismatch is the false alarm.
+  assert.equal(
+    Math.round((admin.availableCashUsd + admin.openPremiumAtRiskUsd) * 100),
+    Math.round(admin.sizingBasisUsd * 100),
+  );
+});
+
+test('TRA-3737 s5 pre-TRA-3897 bytes fall back to cash and SAY SO — a reader wrong on every old build gets muted', () => {
+  for (const r of grade().out.armedBooks) {
+    assert.equal(r.sizingBasisSource, 'cash_only_fallback');
+    assert.equal(r.sizingBasisUsd, r.availableCashUsd, 'on those bytes cash genuinely IS E_i');
+  }
+});
+
+test('TRA-3737 s5 both fields are published on EVERY verdict, and no row ever publishes B_i above its own E_i', () => {
+  const all = [grade(), gradeFixed(), gradeExposed(), gradeEnforced(), gradeFleetBound({ ...cloneContradiction(), measuredAt: AT })];
+  for (const g of all) {
+    for (const r of g.out.armedBooks) {
+      assert.equal(typeof r.sizingBasisUsd, 'number', `missing basis on ${g.verdict}/${r.book}`);
+      assert.ok(['capital', 'cash_only_fallback'].includes(r.sizingBasisSource), `bad source on ${g.verdict}`);
+      // φ_eff ≤ 1 on every reading these captures cover, so a cap above its own
+      // basis is either a real fail-open or — as it was here — a mislabelled row.
+      assert.ok(r.capUsd <= r.sizingBasisUsd + 0.01, `${g.verdict}/${r.book}: B_i $${r.capUsd} > E_i $${r.sizingBasisUsd}`);
+    }
+  }
+});

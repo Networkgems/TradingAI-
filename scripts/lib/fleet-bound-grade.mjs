@@ -554,6 +554,21 @@ export function gradeFleetBound({ live, fee, expectCommit = null, measuredAt }) 
       book: r.book,
       capUsd: r.capUsd,
       availableCashUsd: r.availableCashUsd,
+      // ⚠ `E_i` IS THE COLUMN THE ROW WAS SIZED ON, AND SINCE TRA-3897 THAT IS
+      // `cash + atRisk`, NOT CASH. This projection published cash only, and the
+      // reader printed it under the label `E_i` — so admin read `B_i $306.31
+      // (E_i $274.60)`, a book sized 12% ABOVE its own stated capital. Nothing
+      // gated on it (every verdict folds `rowBasisUsd` itself), but a figure
+      // that does not reproduce from its own label reads like a fail-open to
+      // the human the reader exists to reach, and the JSON consumer could not
+      // reproduce `capUsd` from any field present. Publish the basis and say
+      // where it came from: `capital` = the row's own `sizingBasisUsd`,
+      // `cash_only_fallback` = pre-TRA-3897 bytes where cash genuinely IS E_i.
+      sizingBasisUsd: rowBasisUsd(r),
+      sizingBasisSource:
+        typeof r?.sizingBasisUsd === 'number' && Number.isFinite(r.sizingBasisUsd)
+          ? 'capital'
+          : 'cash_only_fallback',
       // Published, never subtracted: flatness is a MEASUREMENT WITH A TIMESTAMP,
       // not a property, and it is not headroom against an authorization (CEO,
       // TRA-3737 2026-08-20). A flat book with an armed sleeve can be long in
