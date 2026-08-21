@@ -114,6 +114,13 @@ function resolve(
     census?: OversoldCloseCensus;
     records?: LiveOptionFillRecord[];
     submitted?: ReadonlySet<number> | null;
+    /**
+     * TRA-3939 — the ET days the submit ledger is attested for. NOT defaulted to
+     * "all days" when `submitted` is passed: that default is precisely the bug the
+     * coverage axis exists to prevent, and a test helper that papers over it would
+     * grade a resolver nobody ships.
+     */
+    covered?: readonly string[] | null;
   } = {},
 ) {
   return resolveOpenLegProvenance({
@@ -121,6 +128,7 @@ function resolve(
     records: opts.records ?? IMPORT_ONLY_RECORDS,
     brokerOrders,
     engineSubmittedOrderIds: opts.submitted ?? null,
+    engineSubmitWitnessEtDays: opts.covered ? new Set(opts.covered) : null,
     resolvedAt: Date.parse('2026-08-21T22:00:00Z'),
   });
 }
@@ -306,8 +314,11 @@ describe('TRA-3932 verdicts — a blind never becomes an accusation', () => {
     expect(r.contractsByVerdict.desk_placed).toBe(0);
   });
 
-  it('AC3 — with a submit witness present, an unknown opening id IS desk_placed', () => {
-    const r = resolve([order({ id: 900001 })], { submitted: new Set([555555]) });
+  it('AC3 — with a submit witness present AND ATTESTED for the open day, an unknown opening id IS desk_placed', () => {
+    const r = resolve([order({ id: 900001 })], {
+      submitted: new Set([555555]),
+      covered: ['2026-08-04'],
+    });
     expect(r.rows[0]!.verdict).toBe('desk_placed');
     expect(r.rows[0]!.detail).toContain('predating the bound');
     expect(r.contractsByVerdict.desk_placed).toBe(4);
@@ -318,8 +329,50 @@ describe('TRA-3932 verdicts — a blind never becomes an accusation', () => {
     // The pair is the point: one input, two verdicts, differing only in the
     // witness. A `desk_placed` that fires on every witnessed input would be the
     // accusation machine this module exists to refuse.
+    //
+    // No `covered` days: a POSITIVE id match needs no coverage claim, and that is
+    // the ordering (step 6 above step 7). If this ever starts needing one, the
+    // resolver has begun demanding attestation for a statement that does not rest
+    // on absence.
     const r = resolve([order({ id: 900001 })], { submitted: new Set([900001]) });
     expect(r.rows[0]!.verdict).toBe('engine_placed');
+  });
+
+  // ── TRA-3939: the coverage axis, and the day-one accusation it prevents ─────
+
+  it('TRA-3939 — an ARMED but UNATTESTED ledger is silent, not exculpatory: blind, never desk_placed', () => {
+    // THE DAY-ONE SHAPE. The submit ledger exists and is non-empty, but it was not
+    // recording on 2026-08-04 when this leg opened. Without the coverage axis the
+    // resolver would read that absence as "the desk placed it" and charge a real
+    // person with a trade this engine made — on the ledger's first day, for every
+    // contract that predates it.
+    const r = resolve([order({ id: 900001 })], {
+      submitted: new Set([555555]),
+      covered: ['2026-08-20', '2026-08-21'],
+    });
+    expect(r.rows[0]!.verdict).toBe('blind_no_issuer_witness');
+    expect(r.rows[0]!.detail).toContain('NOT attested');
+    expect(r.rows[0]!.detail).toContain('2026-08-04');
+    expect(r.contractsByVerdict.desk_placed).toBe(0);
+  });
+
+  it('TRA-3939 — an EMPTY id set attested for the day still reaches desk_placed', () => {
+    // The mirror of the test above, and the reason coverage is a separate axis
+    // rather than "is the set non-empty". A day we WERE recording, on which we
+    // placed nothing, is a real observation: the absence testifies.
+    const r = resolve([order({ id: 900001 })], {
+      submitted: new Set<number>(),
+      covered: ['2026-08-04'],
+    });
+    expect(r.rows[0]!.verdict).toBe('desk_placed');
+  });
+
+  it('TRA-3939 — coverage of a DIFFERENT day never leaks onto the subject day', () => {
+    const r = resolve([order({ id: 900001 })], {
+      submitted: new Set([555555]),
+      covered: ['2026-08-03', '2026-08-05'],
+    });
+    expect(r.rows[0]!.verdict).toBe('blind_no_issuer_witness');
   });
 
   it('only engine_placed / desk_placed are terminal — every blind stays unresolved', () => {

@@ -237,14 +237,106 @@ export function tradierBaseUrl(env: TradierEnv): string {
   return env === 'production' ? PROD_BASE : SANDBOX_BASE;
 }
 
+/**
+ * TRA-3939 — one order id, observed AT SUBMIT, before and independent of any fill.
+ *
+ * ## Why this hook is at `postOrder` and not at the caller
+ *
+ * TRA-3932 measured that the broker order id reaches disk in exactly ONE place,
+ * `live-options-fee-slippage.jsonl`, and only at **FILL** time — so an order we
+ * placed whose fill the chokepoint missed leaves no id anywhere, and "absent from
+ * our records" cannot refute engine origin.
+ *
+ * The obvious remedy — record `outcome.orderId` where the signal engine already
+ * branches on the smart-open result — is **wrong, in the direction that
+ * manufactures a false accusation**. {@link submitSmartBuyToOpen} walks a limit
+ * ladder: it POSTs an order, waits, CANCELS it, and POSTs another at the next
+ * price, up to five times. Each of those is a real order at the broker with its
+ * own id, and each will appear in `/accounts/{id}/orders` as `canceled`. But the
+ * outcome type carries an id only on `filled` and `rejected` — a `walk_exhausted`
+ * outcome returns **no id at all**, having minted up to five. Recording only the
+ * outcome's id would leave those cancelled steps absent from our set, and a later
+ * provenance read would charge every one of them to the desk.
+ *
+ * `postOrder` is the only place every id is visible exactly once. It is also the
+ * only place that is structurally exhaustive: a future submit path added anywhere
+ * on this client is observed without being taught to observe itself.
+ *
+ * ⚠ **What this CANNOT capture, stated rather than implied.** `postOrder` throws
+ * before returning when Tradier refuses at POST time (non-2xx, or an `errors`
+ * envelope — the 2026-08-20 `Account is restricted for option trading.` shape).
+ * No order was created and no id exists, so there is nothing to record and the
+ * absence is not a gap in this instrument. What IS captured is every order the
+ * broker ACKNOWLEDGED: the fills, the walk steps we cancelled, and the orders
+ * that reached a terminal `rejected`/`expired`/`canceled` status after the ack.
+ */
+export interface TradierOrderSubmitEvent {
+  /** The broker's id for the order it just acknowledged — the join key. */
+  orderId: number;
+  /** Tradier's status AT ACK (`ok`/`open`/`pending`), not a terminal state. */
+  ackStatus: string;
+  /** `production` vs `sandbox`. The provenance question is only ever about real money. */
+  env: TradierEnv;
+  accountId: string;
+  /** `option` / `equity` / `multileg` / `otoco` — read off the submitted body. */
+  orderClass: string | null;
+  side: string | null;
+  symbol: string | null;
+  /** OCC contract when the body carried one (`option_symbol`, or leg 0 of a multileg). */
+  optionSymbol: string | null;
+  quantity: number | null;
+  limitPrice: number | null;
+  submittedAt: number;
+}
+
+export type TradierOrderSubmitObserver = (event: TradierOrderSubmitEvent) => void;
+
+let orderSubmitObserver: TradierOrderSubmitObserver | null = null;
+
+/**
+ * Install the process-wide submit observer. `null` uninstalls (test seam).
+ *
+ * A module-level singleton rather than a constructor arg on purpose: clients are
+ * built ad hoc in a dozen places (per operator, per env, per route), and a
+ * per-client opt-in would silently miss whichever construction site nobody
+ * remembered — which is precisely the class of gap this exists to close.
+ */
+export function setTradierOrderSubmitObserver(observer: TradierOrderSubmitObserver | null): void {
+  orderSubmitObserver = observer;
+}
+
+/** Read back what is installed. Lets a health route publish `armed:false` rather than assume. */
+export function getTradierOrderSubmitObserver(): TradierOrderSubmitObserver | null {
+  return orderSubmitObserver;
+}
+
+/** First present value among `keys`, as a trimmed string, else `null`. */
+function bodyString(body: URLSearchParams, ...keys: string[]): string | null {
+  for (const k of keys) {
+    const v = body.get(k);
+    if (typeof v === 'string' && v.trim() !== '') return v;
+  }
+  return null;
+}
+
+function bodyNumber(body: URLSearchParams, ...keys: string[]): number | null {
+  const s = bodyString(body, ...keys);
+  if (s === null) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
 export class TradierOrderClient {
   protected readonly baseUrl: string;
   protected readonly accountId: string;
   protected readonly headers: Record<string, string>;
+  /** TRA-3939 — kept so the submit observer can separate real money from sandbox. */
+  protected readonly env: TradierEnv;
 
   constructor(apiToken: string, accountId: string, env: TradierEnv = 'sandbox') {
     this.baseUrl = tradierBaseUrl(env);
     this.accountId = accountId;
+    this.env = env;
     this.headers = {
       Authorization: `Bearer ${apiToken}`,
       Accept: 'application/json',
@@ -500,6 +592,35 @@ export class TradierOrderClient {
     }
     if (!data.order) {
       throw new Error('Tradier order response missing order payload');
+    }
+    // TRA-3939 — THE SUBMIT-TIME ID CHOKEPOINT. Emitted here, after the broker has
+    // acknowledged an id and before this returns to any caller, so a walk step we
+    // are about to cancel is recorded exactly like the one that fills.
+    //
+    // Isolated from the order path entirely: a recorder that throws must never
+    // turn an ACKNOWLEDGED live order into a caller-visible failure — the caller
+    // would void a paper open for a real order that is working at the broker. The
+    // observer counts its own failures on its own side (see
+    // `tra3939-order-provenance-capture.ts`); a swallow that nothing counts is the
+    // silent-clean shape this codebase keeps paying for.
+    if (orderSubmitObserver !== null && typeof data.order.id === 'number') {
+      try {
+        orderSubmitObserver({
+          orderId: data.order.id,
+          ackStatus: typeof data.order.status === 'string' ? data.order.status : 'unknown',
+          env: this.env,
+          accountId: this.accountId,
+          orderClass: bodyString(body, 'class'),
+          side: bodyString(body, 'side', 'side[0]'),
+          symbol: bodyString(body, 'symbol', 'symbol[0]'),
+          optionSymbol: bodyString(body, 'option_symbol', 'option_symbol[0]'),
+          quantity: bodyNumber(body, 'quantity', 'quantity[0]'),
+          limitPrice: bodyNumber(body, 'price', 'price[0]'),
+          submittedAt: Date.now(),
+        });
+      } catch {
+        // never into the order path
+      }
     }
     return data.order;
   }

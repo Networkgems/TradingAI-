@@ -177,8 +177,12 @@ export {
   roundToCent,
   TRADIER_TERMINAL_STATUSES,
   TRADIER_REJECTED_STATUSES,
+  setTradierOrderSubmitObserver,
+  getTradierOrderSubmitObserver,
 } from './tradier/index.js';
 export type {
+  TradierOrderSubmitEvent,
+  TradierOrderSubmitObserver,
   TradierEnv,
   TradierBracketOrderParams,
   TradierOrderResponse,

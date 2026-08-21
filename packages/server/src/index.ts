@@ -311,6 +311,19 @@ import {
   persistOpenLegProvenance,
   summarizeStoredProvenance,
 } from './tra3932-open-leg-provenance.js';
+// TRA-3939 — the two captures that make the question above ANSWERABLE next time:
+// a submit-time order-id ledger and a daily capture of the broker's one-day
+// order window.
+import {
+  setOrderProvenanceCaptureDataDir,
+  armEngineSubmitRecorder,
+  recordEngineOrderSubmit,
+  captureBrokerOrderDay,
+  capturedBrokerOrders,
+  summarizeBrokerOrderCaptures,
+  summarizeEngineSubmitWitness,
+  engineSubmittedProductionOrderIds,
+} from './tra3939-order-provenance-capture.js';
 import { detectOversoldEngineCloses } from './tra3926-oversold-close-detector.js';
 // TRA-2820 — live-book "is it actually stopped?" counter for /api/health/options-live.
 import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability, mergeDayOneStopPosture, blindDayOneStopPosture } from './options-account.js';
@@ -800,6 +813,10 @@ import {
   tradierBaseUrl,
   TradierOptionsClient,
   DEFAULT_SHORT_SQUEEZE_THRESHOLDS,
+  // TRA-3939 — the submit-time order-id chokepoint lives in `postOrder`; this is
+  // how the server installs its durable recorder onto it.
+  setTradierOrderSubmitObserver,
+  type TradierAccountOrder,
   type TradierCashEvent,
   type TradierTradeHistoryFill,
 } from '@trading-app/engine';
@@ -4857,6 +4874,23 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
 // because its lines are verdicts about historical contracts reached from broker
 // evidence that expires, not measurements a later run could retake.
 setOpenLegProvenanceDataDir(DATA_DIR);
+
+// TRA-3939 — ARM THE TWO CAPTURES. Both stores hang off the same resolved
+// DATA_DIR and neither is compacted (see the module docblock: they hold evidence
+// that expires at the source, not measurements a later run can retake).
+//
+// The order here is load-bearing. The arm line is written BEFORE the observer is
+// installed so that a box which boots and immediately submits cannot produce an
+// order line with no arm line above it — a ledger whose first line is a trade
+// cannot tell "armed and quiet" from "never armed", and that distinction is the
+// whole safety property of the witness (an empty set read as testimony is how a
+// blind becomes an accusation against the desk).
+setOrderProvenanceCaptureDataDir(DATA_DIR);
+armEngineSubmitRecorder({
+  bootedAt: Date.now() - Math.round(process.uptime() * 1000),
+  commit: process.env.RENDER_GIT_COMMIT ?? null,
+});
+setTradierOrderSubmitObserver(recordEngineOrderSubmit);
 
 {
   const h = hydrateLiveOptionsFeeSlippageFromDisk(DATA_DIR);
@@ -11352,6 +11386,180 @@ app.get('/api/health/options-live', async (_req, res) => {
 // reaches disk only on a FILL), so "absent from our records" cannot be read as
 // "the desk placed it" — it is the same absence the defect is made of. Wiring a
 // real set here is the forward remedy and belongs on its own ticket.
+/**
+ * TRA-3939 — capture the broker's ONE-DAY order window for today's ET day.
+ *
+ * ## Why this runs post-close and hourly rather than at a fixed instant
+ *
+ * `/accounts/{id}/orders` serves the CURRENT TRADING DAY and nothing else
+ * (measured on production 2026-08-21: 5 orders, `etDaysCovered ["2026-08-21"]`).
+ * So the capture must land AFTER the last order of the day exists and BEFORE the
+ * ET rollover erases it — a window that opens at the 16:00 ET close and shuts at
+ * ET midnight.
+ *
+ * Firing it on the EXISTING hourly tick rather than one scheduled minute is the
+ * same reasoning TRA-2279 D2 already applies one hook up: a single `onMarketClose`
+ * minute is one restart away from being missed, and under `skip_missed` the slot
+ * is never replayed. Hourly gives ~8 chances, and the store's own idempotence (a
+ * day holding a successful line is skipped) keeps that to one real broker call per
+ * day. A FAILED read is deliberately retryable: a 17:00 ET success still saves the
+ * day, which a marker-based dedup would have forfeited.
+ *
+ * ⚠ It captures the day whether or not we traded. An empty order list on a day we
+ * are attested for is EVIDENCE ("the account held no orders"), and it is the only
+ * thing that makes a later absence mean anything. Skipping quiet days would leave
+ * exactly the holes this ticket was filed about.
+ */
+async function runBrokerOrderDayCapture(opts: { force?: boolean } = {}): Promise<{
+  ran: boolean;
+  reason: string;
+  etDay: string;
+  written: boolean;
+  skippedAlreadyCaptured: boolean;
+  orders: number;
+  read: boolean;
+  attestation: string | null;
+  error: string | null;
+}> {
+  const etDay = etDateString(new Date());
+  const base = {
+    etDay,
+    written: false,
+    skippedAlreadyCaptured: false,
+    orders: 0,
+    read: false,
+    attestation: null as string | null,
+    error: null as string | null,
+  };
+  // The window, not a schedule: capture only once the session's orders are all in.
+  // `--force` exists for the operator path (and for the day this shipped, which is
+  // itself inside the window and holds orders that expire at midnight).
+  if (!opts.force && etHour() < 16) {
+    return { ...base, ran: false, reason: `before the 16:00 ET close (etHour=${etHour()})` };
+  }
+  if (summarizeBrokerOrderCaptures().days.some(d => d.etDay === etDay && d.captured)) {
+    return { ...base, ran: false, reason: 'already captured this ET day', skippedAlreadyCaptured: true };
+  }
+  const operator = resolveLiveBrokerOperator();
+  const settings = await loadSettings(operator);
+  const client = buildTradierAccountClientForEnv(settings, 'production', operator);
+  if (!client) {
+    // A day we could not even ask about still gets a line — "no client" is a named
+    // blind, and its absence would be indistinguishable from a day nobody ran.
+    const r = captureBrokerOrderDay({
+      etDay,
+      orders: null,
+      error: 'no production Tradier options credentials resolvable for the live operator',
+      capturedAt: Date.now(),
+      accountEnv: 'production',
+    });
+    return {
+      ...base,
+      ran: true,
+      reason: 'no production client',
+      written: r.written,
+      error: r.line?.error ?? null,
+      attestation: r.line?.attestation ?? null,
+    };
+  }
+  let orders: TradierAccountOrder[] | null = null;
+  let error: string | null = null;
+  try {
+    orders = await client.listOrders();
+  } catch (err) {
+    error = err instanceof Error ? err.message : String(err);
+    log.warn('tra3939 broker order capture: listOrders failed', { etDay, reason: error });
+  }
+  const result = captureBrokerOrderDay({
+    etDay,
+    orders,
+    error,
+    capturedAt: Date.now(),
+    accountEnv: 'production',
+  });
+  if (result.written) {
+    log.info('tra3939 broker order window captured (TRA-3939)', {
+      etDay,
+      orders: result.line?.orders.length ?? 0,
+      etDaysCovered: result.line?.etDaysCovered ?? [],
+      attestation: result.line?.attestation ?? null,
+    });
+  }
+  return {
+    ran: true,
+    reason: result.written ? 'captured' : result.skippedAlreadyCaptured ? 'already captured' : 'append failed',
+    etDay,
+    written: result.written,
+    skippedAlreadyCaptured: result.skippedAlreadyCaptured,
+    orders: result.line?.orders.length ?? 0,
+    read: result.line?.read ?? false,
+    attestation: result.line?.attestation ?? null,
+    error: result.line?.error ?? null,
+  };
+}
+
+/**
+ * TRA-3939 — read BOTH captures back, plus what they entitle a reader to conclude.
+ *
+ * Public (no auth) on purpose and consistent with every sibling `/api/health/*`
+ * grader surface on this box: it publishes COUNTS, COVERAGE and GAPS — never a
+ * token, an account id or a price. `orderIds` is a cardinality, not the ids.
+ */
+app.get('/api/health/order-provenance-capture', (_req, res) => {
+  const witness = summarizeEngineSubmitWitness();
+  const captures = summarizeBrokerOrderCaptures();
+  res.json({
+    ok: true,
+    etDay: etDateString(new Date()),
+    etHour: etHour(),
+    // Read FIRST: with DATA_DIR unset these files die on the next redeploy and
+    // there is no error to catch — the only discriminator is the path (TRA-1681).
+    durability: { ephemeral: witness.ephemeral, dataDir: witness.dataDir === null ? null : 'set' },
+    submitLedger: {
+      armed: witness.armed,
+      firstEtDay: witness.firstEtDay,
+      lastEtDay: witness.lastEtDay,
+      lines: witness.lines,
+      armLines: witness.armLines,
+      orderIds: witness.orderIds,
+      productionOrderIds: witness.productionOrderIds,
+      corruptLines: witness.corruptLines,
+      appendErrors: witness.appendErrors,
+      lastAppendError: witness.lastAppendError,
+    },
+    brokerOrderCapture: {
+      lines: captures.lines,
+      days: captures.days,
+      // A MISSED DAY IS A NAMED GAP, NEVER AN EMPTY ONE (AC2).
+      gapEtDays: captures.gapEtDays,
+    },
+    /**
+     * The days on which absence from the submit ledger MEANS something. This is
+     * the field a `desk_placed` verdict stands on; everything else here is
+     * bookkeeping.
+     */
+    witnessCoverage: {
+      attestedEtDays: witness.coveredEtDays,
+      unattestedEtDays: witness.uncoveredCapturedEtDays,
+    },
+    retention: witness.retention,
+  });
+});
+
+/**
+ * TRA-3939 — run the capture now. Admin-gated: it reads a real brokerage account
+ * and writes durable state. Read-only at the broker and at the book.
+ */
+app.post('/api/health/order-provenance-capture', requireAuth, requireAdmin, async (req, res) => {
+  const force = String((req.query as Record<string, unknown>)['force'] ?? '') === 'true';
+  try {
+    const result = await runBrokerOrderDayCapture({ force });
+    res.json({ ok: true, force, ...result, captures: summarizeBrokerOrderCaptures() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 app.post(
   '/api/health/live-options-fee-slippage/open-leg-provenance',
   requireAuth,
@@ -11374,10 +11582,10 @@ app.post(
     // AT THE CLIENT. This is the one place that can tell them apart, and it
     // must: a failed fetch presenting as "the broker holds no orders" is the
     // closed-world reading that turns a blind into a false accusation.
-    let brokerOrders: Awaited<ReturnType<typeof client.listOrders>> | null = null;
+    let liveOrders: Awaited<ReturnType<typeof client.listOrders>> | null = null;
     let fetchError: string | null = null;
     try {
-      brokerOrders = await client.listOrders();
+      liveOrders = await client.listOrders();
     } catch (err) {
       fetchError = err instanceof Error ? err.message : String(err);
       log.warn('tra3932 open-leg provenance: broker order fetch failed', {
@@ -11385,12 +11593,39 @@ app.post(
         reason: fetchError,
       });
     }
+    // TRA-3939 — the live fetch UNION the durable daily archive, de-duplicated on
+    // order id. This is the half of the remedy that widens REACH: the live call
+    // serves one trading day, and every day we captured is a day that stays
+    // answerable forever. The union is fed through the SAME `measureBrokerOrderReach`,
+    // so the reach the verdict was reached under is measured off the merged rows'
+    // own `create_date` — never claimed from the fact that an archive exists.
+    //
+    // `null` still has to survive the merge: an unread live fetch with an EMPTY
+    // archive must stay `null` (⇒ `blind_broker_unreadable`), because folding it
+    // to `[]` would present a failed read as "the broker holds no orders" — the
+    // closed-world reading this whole module refuses.
+    const archived = capturedBrokerOrders();
+    let brokerOrders: TradierAccountOrder[] | null = null;
+    if (liveOrders !== null || archived.length > 0) {
+      const byId = new Map<number, TradierAccountOrder>();
+      // Archive first, live second: a same-id row read live today is the fresher
+      // record of the same order and should win the tie.
+      for (const o of archived) byId.set(o.id, o);
+      for (const o of liveOrders ?? []) byId.set(o.id, o);
+      brokerOrders = [...byId.values()];
+    }
     const summary = summarizeLiveOptionsFeeSlippage();
+    // TRA-3939 (AC3) — WIRE THE WITNESS. `engineSubmittedOrderIds` was `null` here
+    // with the reason stated inline; it is now the durable submit-time set, and
+    // `engineSubmitWitnessEtDays` is the coverage axis that keeps the ledger's
+    // FIRST, EMPTY day from reading as testimony against the desk.
+    const witness = summarizeEngineSubmitWitness();
     const result = resolveOpenLegProvenance({
       census: detectOversoldEngineCloses(summary.records),
       records: summary.records,
       brokerOrders,
-      engineSubmittedOrderIds: null,
+      engineSubmittedOrderIds: witness.armed ? engineSubmittedProductionOrderIds() : null,
+      engineSubmitWitnessEtDays: witness.armed ? new Set(witness.coveredEtDays) : null,
       resolvedAt: Date.now(),
     });
     const persisted = persistOpenLegProvenance(result);
@@ -11405,14 +11640,29 @@ app.post(
       rows: result.rows,
       persisted,
       stored: summarizeStoredProvenance(),
-      // The submit-time witness is the missing instrument, not a missing fetch.
+      // TRA-3939 — the witness is now an instrument with a MEASURED reach rather
+      // than a stated absence. `attestedEtDays` is the whole of its authority: a
+      // subject whose open falls outside it stays blind, and says so.
       issuerWitness: {
-        available: false,
-        reason:
-          'no durable record of order ids this engine SUBMITTED exists — the broker order id reaches '
-          + 'disk only on a FILL (live-options-fee-slippage.jsonl), so an order we placed whose fill the '
-          + 'chokepoint missed leaves no id anywhere. Until that exists, "absent from our records" cannot '
-          + 'refute engine origin and no contract can be charged to the desk.',
+        available: witness.armed,
+        productionOrderIds: witness.productionOrderIds,
+        attestedEtDays: witness.coveredEtDays,
+        unattestedEtDays: witness.uncoveredCapturedEtDays,
+        ephemeral: witness.ephemeral,
+        retention: witness.retention,
+        reason: witness.armed
+          ? 'durable submit-time order-id ledger is armed; absence from it refutes engine origin ONLY on '
+            + 'the attested ET days above (TRA-3939). Outside them the silence is ours, not the desk\'s.'
+          : 'the submit-time order-id recorder has never been armed on this disk — the broker order id '
+            + 'reaches disk only on a FILL, so an order we placed whose fill the chokepoint missed leaves '
+            + 'no id anywhere and no contract can be charged to the desk.',
+      },
+      // The archive that widens the one-day broker window, published so a reader
+      // can tell a day we captured from a day we did not.
+      brokerOrderCapture: {
+        archivedOrders: archived.length,
+        liveOrders: liveOrders === null ? null : liveOrders.length,
+        ...summarizeBrokerOrderCaptures(),
       },
     });
   },
@@ -16635,6 +16885,17 @@ scheduler.start({
     // zero-fills an unmeasured fee, and internally best-effort — it cannot throw
     // into this tick.
     await runCloseBasisSweep(closeBasisSweepDeps);
+    // TRA-3939 — capture the broker's ONE-DAY order window before the ET rollover
+    // erases it. Self-gating (post-16:00 ET only, once per ET day, and a failed
+    // read stays retryable inside the window) so this costs ZERO broker calls on
+    // every other hourly tick. Best-effort: a capture that throws must not starve
+    // the sweeps above it, and a day we could not capture is written as a NAMED
+    // blind rather than left indistinguishable from a day nobody ran.
+    await runBrokerOrderDayCapture().catch(err =>
+      log.warn('tra3939 broker order capture tick failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      }),
+    );
   },
   // TRA-849 — 8:30 AM ET pre-market morning brief. Renders the macro gate +
   // each user's watchlist setups, open book, and overnight news, then pushes

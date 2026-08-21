@@ -244,6 +244,26 @@ export interface OpenLegProvenanceInput {
    * TRA-3926's C8 lesson, one ticket over.
    */
   engineSubmittedOrderIds: ReadonlySet<number> | null;
+  /**
+   * TRA-3939 — the ET days {@link engineSubmittedOrderIds} is ENTITLED TO SPEAK
+   * ABOUT, and the reason a non-null id set is not on its own a witness.
+   *
+   * The submit ledger starts empty. Hand the resolver its ids without a coverage
+   * axis and every order the engine placed BEFORE the recorder was armed reads as
+   * "absent from our records" — and step 6 turns that absence into `desk_placed`,
+   * charging a real person with a trade this engine made. The blind this module
+   * exists to preserve would become an accusation on the ledger's first day.
+   *
+   * So a day is only usable when something attests the recorder was resident for
+   * the whole window in which the order could have been placed. `null` ⇒ no
+   * coverage information at all, which is treated exactly as no witness.
+   *
+   * The asymmetry from {@link engineFilledOrderIds} still holds and is why this is
+   * only needed on the refuting side: a fill-time id MATCH is a positive statement
+   * and needs no coverage claim (step 4 sits above this). It is the INFERENCE FROM
+   * ABSENCE that requires knowing the recorder was watching.
+   */
+  engineSubmitWitnessEtDays: ReadonlySet<string> | null;
   resolvedAt: number;
 }
 
@@ -431,17 +451,21 @@ const EMPTY_BY_VERDICT = (): Record<OpenLegProvenanceVerdict, number> => ({
  * The decision order is the fail-closed order, and each step is a refusal that
  * fires BEFORE the step that could accuse:
  *
- *   1. no read            → `blind_broker_unreadable`
- *   2. list misses the day → `blind_broker_window`      (AC5)
- *   3. no opening order    → `blind_no_order_record`
- *   4. id IS ours          → `engine_placed`            (positive, terminal)
- *   5. no issuer witness   → `blind_no_issuer_witness`  (today's live state)
- *   6. id is not ours      → `desk_placed`              (positive, terminal, AC3)
+ *   1. no read              → `blind_broker_unreadable`
+ *   2. list misses the day  → `blind_broker_window`      (AC5)
+ *   3. no opening order     → `blind_no_order_record`
+ *   4. id in our FILL set   → `engine_placed`            (positive, terminal)
+ *   5. no submit ledger     → `blind_no_issuer_witness`
+ *   6. id in our SUBMIT set → `engine_placed`            (positive, terminal)
+ *   7. day not attested     → `blind_no_issuer_witness`  (TRA-3939)
+ *   8. id is not ours       → `desk_placed`              (positive, terminal, AC3)
  *
- * Step 4 sits ABOVE step 5 deliberately: a fill-time id match is a positive
- * statement and does not need the submit-time witness to mean something. Step 5
- * sits above step 6 because the reverse — reading "absent from our records" as
- * "the desk placed it" — is precisely the inference this ticket exists to refuse.
+ * Steps 4 and 6 sit ABOVE the blinds deliberately: an id MATCH is a positive
+ * statement and needs no coverage claim to mean something. Steps 5 and 7 sit above
+ * step 8 because the reverse — reading "absent from our records" as "the desk
+ * placed it" — is precisely the inference this ticket exists to refuse, and step 7
+ * is the specific form of it TRA-3939 had to add: an id set that EXISTS but was
+ * not recording on the day in question is silent, not exculpatory.
  */
 export function resolveOpenLegProvenance(input: OpenLegProvenanceInput): OpenLegProvenanceResult {
   const reach = measureBrokerOrderReach(input.brokerOrders);
@@ -491,15 +515,33 @@ export function resolveOpenLegProvenance(input: OpenLegProvenanceInput): OpenLeg
         `fill-time id set — and that absence cannot be read as "not ours", because no durable submit-time ` +
         `order-id record exists (the id reaches disk only on a FILL). This is a gap in OUR instrumentation`;
     } else if (brokerOpeningOrderIds.some((id) => input.engineSubmittedOrderIds!.has(id))) {
+      // Positive membership needs no coverage claim: an id IN our submit ledger was
+      // put there by our own submit path. Coverage only ever gates the INFERENCE
+      // FROM ABSENCE below, so this sits above the coverage test on purpose.
       verdict = 'engine_placed';
       detail =
         `opening order ${brokerOpeningOrderIds.join(', ')} is in the durable submit-time id set — this ` +
         `engine issued it and the fill was never recorded (TRA-2959)`;
+    } else if (input.engineSubmitWitnessEtDays === null || !input.engineSubmitWitnessEtDays.has(s.openEtDay)) {
+      // TRA-3939 — THE STEP THAT KEEPS AN EMPTY LEDGER FROM BECOMING AN ACCUSATION.
+      // The id set exists but was not recording on the day this leg opened, so its
+      // silence is not testimony. Same verdict as having no ledger at all, because
+      // for THIS contract that is exactly what we have.
+      verdict = 'blind_no_issuer_witness';
+      detail =
+        `opening order ${brokerOpeningOrderIds.join(', ')} exists at the broker and is absent from both ` +
+        `our fill-time and our submit-time id sets — but the submit recorder is NOT attested for the ` +
+        `${s.openEtDay} open (${
+          input.engineSubmitWitnessEtDays === null
+            ? 'no coverage record'
+            : `attested days: ${[...input.engineSubmitWitnessEtDays].sort().join(', ') || 'none'}`
+        }), so its silence about this day is not evidence. The absence is OURS, not the desk's`;
     } else {
       verdict = 'desk_placed';
       detail =
         `opening order ${brokerOpeningOrderIds.join(', ')} exists at the broker and is in NEITHER our ` +
-        `fill-time nor our submit-time id set — no path of ours issued it. The engine transacted a ` +
+        `fill-time nor our submit-time id set, and the submit recorder IS attested for the ` +
+        `${s.openEtDay} open — so no path of ours issued it. The engine transacted a ` +
         `contract the desk opened: a NEW instance of TRA-3926's defect, predating the bound`;
     }
 

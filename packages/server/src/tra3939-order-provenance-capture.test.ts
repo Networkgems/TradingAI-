@@ -1,0 +1,354 @@
+/**
+ * TRA-3939 — the two captures, graded on the properties that make them evidence
+ * rather than bookkeeping.
+ *
+ * The three that matter, and each has its own negative control:
+ *   • a MISSED day reads as a NAMED GAP, never as an empty day;
+ *   • a FAILED read is recorded, and does not un-capture a day that succeeded;
+ *   • a day the recorder did not cover END TO END is NOT attested, so the submit
+ *     ledger's silence about it cannot become a `desk_placed`.
+ */
+
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { TradierAccountOrder, TradierOrderSubmitEvent } from '@trading-app/engine';
+import {
+  __resetOrderProvenanceCaptureForTest,
+  armEngineSubmitRecorder,
+  bootCoversSession,
+  brokerOrderCaptureLogPath,
+  captureBrokerOrderDay,
+  capturedBrokerOrders,
+  engineSubmitLogPath,
+  engineSubmittedProductionOrderIds,
+  etDayOf,
+  recordEngineOrderSubmit,
+  setOrderProvenanceCaptureDataDir,
+  summarizeBrokerOrderCaptures,
+  summarizeEngineSubmitWitness,
+} from './tra3939-order-provenance-capture.js';
+
+let dir: string;
+
+/** 2026-08-21 08:00 ET — before the 09:30 session open. */
+const BOOT_BEFORE_OPEN = Date.parse('2026-08-21T12:00:00.000Z');
+/** 2026-08-21 11:00 ET — mid-session. */
+const BOOT_MID_SESSION = Date.parse('2026-08-21T15:00:00.000Z');
+
+function submitEvent(over: Partial<TradierOrderSubmitEvent> = {}): TradierOrderSubmitEvent {
+  return {
+    orderId: 900001,
+    ackStatus: 'ok',
+    env: 'production',
+    accountId: '6YA00154',
+    orderClass: 'option',
+    side: 'buy_to_open',
+    symbol: 'XLF',
+    optionSymbol: 'XLF260925C00057500',
+    quantity: 1,
+    limitPrice: 1.23,
+    submittedAt: Date.parse('2026-08-21T14:00:00.000Z'),
+    ...over,
+  };
+}
+
+function order(over: Partial<TradierAccountOrder> = {}): TradierAccountOrder {
+  return {
+    id: 900001,
+    status: 'filled',
+    orderClass: 'option',
+    side: 'buy_to_open',
+    symbol: 'XLF',
+    optionSymbol: 'XLF260925C00057500',
+    quantity: 1,
+    execQuantity: 1,
+    avgFillPrice: 1.23,
+    createDate: '2026-08-21T14:00:00.000Z',
+    transactionDate: '2026-08-21T14:00:02.000Z',
+    tag: null,
+    ...over,
+  };
+}
+
+beforeEach(() => {
+  __resetOrderProvenanceCaptureForTest();
+  dir = mkdtempSync(join(tmpdir(), 'tra3939-'));
+  setOrderProvenanceCaptureDataDir(dir);
+});
+
+afterEach(() => {
+  __resetOrderProvenanceCaptureForTest();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// ── half (1): the submit-time id ledger ─────────────────────────────────────
+
+describe('TRA-3939 submit-time id ledger', () => {
+  it('records an acknowledged id at SUBMIT, with no fill anywhere in sight', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    recordEngineOrderSubmit(submitEvent());
+    expect([...engineSubmittedProductionOrderIds()]).toEqual([900001]);
+  });
+
+  it('AC1 — captures the WALK STEPS a caller never sees, which is the population that would be misread', () => {
+    // `submitSmartBuyToOpen` POSTs, waits, CANCELS and re-POSTs up to five times.
+    // Its outcome type carries an id only on `filled`/`rejected`; a
+    // `walk_exhausted` returns NONE, having minted five real orders that will all
+    // appear in `/orders` as `canceled`. Recording only the outcome's id would
+    // leave those absent from our set — and a later provenance read would charge
+    // every one of them to the desk.
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    for (const id of [1001, 1002, 1003, 1004, 1005]) {
+      recordEngineOrderSubmit(submitEvent({ orderId: id }));
+    }
+    expect([...engineSubmittedProductionOrderIds()].sort((a, b) => a - b)).toEqual([
+      1001, 1002, 1003, 1004, 1005,
+    ]);
+  });
+
+  it('SANDBOX ids are recorded but never join a production question', () => {
+    // Tradier mints sandbox and production ids from separate spaces with no
+    // guarantee of disjointness. A collision would manufacture an `engine_placed`
+    // on a contract this account never touched.
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    recordEngineOrderSubmit(submitEvent({ orderId: 4242, env: 'sandbox' }));
+    expect(engineSubmittedProductionOrderIds().has(4242)).toBe(false);
+    expect(summarizeEngineSubmitWitness().orderIds).toBe(1);
+    expect(summarizeEngineSubmitWitness().productionOrderIds).toBe(0);
+  });
+
+  it('ARMED AND QUIET is distinguishable from NEVER ARMED — the whole safety property', () => {
+    // A ledger whose first line is a trade cannot tell these apart, and absence
+    // only means something on a day we know we were watching.
+    expect(summarizeEngineSubmitWitness().armed).toBe(false);
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    const w = summarizeEngineSubmitWitness();
+    expect(w.armed).toBe(true);
+    expect(w.orderIds).toBe(0);
+    expect(w.armLines).toBe(1);
+  });
+
+  it('a corrupt line is COUNTED, never folded into a clean answer', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    recordEngineOrderSubmit(submitEvent());
+    const path = engineSubmitLogPath(dir);
+    writeFileSync(path, readFileSync(path, 'utf8') + '{not json\n', 'utf8');
+    const w = summarizeEngineSubmitWitness();
+    expect(w.corruptLines).toBe(1);
+    expect(w.orderIds).toBe(1);
+  });
+
+  it('never throws when no data dir is configured — the order path must survive it', () => {
+    setOrderProvenanceCaptureDataDir(null);
+    expect(() => recordEngineOrderSubmit(submitEvent())).not.toThrow();
+    expect(summarizeEngineSubmitWitness().lines).toBe(0);
+  });
+});
+
+// ── half (2): the daily broker order capture ────────────────────────────────
+
+describe('TRA-3939 daily broker order capture', () => {
+  it('AC2 — records the capture WITH its own etDaysCovered, so a captured day is legible as one', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    const r = captureBrokerOrderDay({
+      etDay: '2026-08-21',
+      orders: [order()],
+      capturedAt: Date.parse('2026-08-21T21:00:00.000Z'),
+      accountEnv: 'production',
+    });
+    expect(r.written).toBe(true);
+    expect(r.line!.etDaysCovered).toEqual(['2026-08-21']);
+    expect(r.line!.oldestCreateDate).toBe('2026-08-21T14:00:00.000Z');
+  });
+
+  it('is idempotent on SUCCESS — an hourly scheduler writes one line per ET day', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    const first = captureBrokerOrderDay({
+      etDay: '2026-08-21',
+      orders: [order()],
+      capturedAt: 1,
+      accountEnv: 'production',
+    });
+    const second = captureBrokerOrderDay({
+      etDay: '2026-08-21',
+      orders: [order()],
+      capturedAt: 2,
+      accountEnv: 'production',
+    });
+    expect(first.written).toBe(true);
+    expect(second.written).toBe(false);
+    expect(second.skippedAlreadyCaptured).toBe(true);
+    expect(summarizeBrokerOrderCaptures().lines).toBe(1);
+  });
+
+  it('a FAILED read is written as a named blind AND stays retryable inside the window', () => {
+    // The retry is the point: a 16:00 ET failure must not forfeit a day the broker
+    // is still serving at 17:00 ET.
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    const blind = captureBrokerOrderDay({
+      etDay: '2026-08-21',
+      orders: null,
+      error: 'HTTP 401',
+      capturedAt: 1,
+      accountEnv: 'production',
+    });
+    expect(blind.written).toBe(true);
+    expect(blind.line!.read).toBe(false);
+    expect(blind.line!.attestation).toBe('blind');
+    const retry = captureBrokerOrderDay({
+      etDay: '2026-08-21',
+      orders: [order()],
+      capturedAt: 2,
+      accountEnv: 'production',
+    });
+    expect(retry.written).toBe(true);
+    const day = summarizeBrokerOrderCaptures().days.find(d => d.etDay === '2026-08-21')!;
+    expect(day.captured).toBe(true);
+    expect(day.attempts).toBe(2);
+  });
+
+  it('a later BLIND retry cannot un-capture a day that already succeeded', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    captureBrokerOrderDay({ etDay: '2026-08-21', orders: [order()], capturedAt: 1, accountEnv: 'production' });
+    // Force a second line past the idempotence guard by writing it directly — the
+    // shape a future caller could produce.
+    const path = brokerOrderCaptureLogPath(dir);
+    writeFileSync(
+      path,
+      readFileSync(path, 'utf8')
+        + JSON.stringify({
+          kind: 'broker_order_capture',
+          etDay: '2026-08-21',
+          capturedAt: 3,
+          read: false,
+          error: 'later failure',
+          orders: [],
+          etDaysCovered: [],
+          oldestCreateDate: null,
+          newestCreateDate: null,
+          attestation: 'blind',
+          recorderBootedAt: null,
+          submitLedgerLines: 0,
+          accountEnv: 'production',
+        })
+        + '\n',
+      'utf8',
+    );
+    const day = summarizeBrokerOrderCaptures().days.find(d => d.etDay === '2026-08-21')!;
+    expect(day.captured).toBe(true);
+    expect(day.orders).toBe(1);
+  });
+
+  it('AC2 — A MISSED DAY READS AS A NAMED GAP, NOT AS AN EMPTY ONE', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    // Mon 2026-08-17 and Wed 2026-08-19 captured; Tue 2026-08-18 never ran.
+    for (const d of ['2026-08-17', '2026-08-19']) {
+      captureBrokerOrderDay({ etDay: d, orders: [], capturedAt: 1, accountEnv: 'production' });
+    }
+    const s = summarizeBrokerOrderCaptures();
+    expect(s.gapEtDays).toEqual(['2026-08-18']);
+    // …and the day we captured with NO orders is a real observation, not a gap.
+    expect(s.days.find(d => d.etDay === '2026-08-17')!.captured).toBe(true);
+    expect(s.days.find(d => d.etDay === '2026-08-17')!.orders).toBe(0);
+  });
+
+  it('weekends are not gaps', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    for (const d of ['2026-08-21', '2026-08-24']) {
+      captureBrokerOrderDay({ etDay: d, orders: [], capturedAt: 1, accountEnv: 'production' });
+    }
+    expect(summarizeBrokerOrderCaptures().gapEtDays).toEqual([]);
+  });
+
+  it('the archive is what widens the broker ONE-DAY window past today', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    captureBrokerOrderDay({
+      etDay: '2026-08-20',
+      orders: [order({ id: 111, createDate: '2026-08-20T14:00:00.000Z' })],
+      capturedAt: 1,
+      accountEnv: 'production',
+    });
+    captureBrokerOrderDay({
+      etDay: '2026-08-21',
+      orders: [order({ id: 222 })],
+      capturedAt: 2,
+      accountEnv: 'production',
+    });
+    expect(capturedBrokerOrders().map(o => o.id).sort((a, b) => a - b)).toEqual([111, 222]);
+  });
+
+  it('a BLIND day contributes no rows to the archive', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    captureBrokerOrderDay({ etDay: '2026-08-21', orders: null, error: 'boom', capturedAt: 1, accountEnv: 'production' });
+    expect(capturedBrokerOrders()).toEqual([]);
+  });
+});
+
+// ── the attestation rule: what entitles the ledger to speak about a day ─────
+
+describe('TRA-3939 attestation — the coverage axis behind a desk_placed', () => {
+  it('a boot BEFORE the session open covers the day; a mid-session boot does not', () => {
+    expect(bootCoversSession(BOOT_BEFORE_OPEN, '2026-08-21')).toBe(true);
+    expect(bootCoversSession(BOOT_MID_SESSION, '2026-08-21')).toBe(false);
+  });
+
+  it('a boot on an EARLIER day covers it; a boot on a LATER day does not', () => {
+    expect(bootCoversSession(Date.parse('2026-08-18T18:00:00.000Z'), '2026-08-21')).toBe(true);
+    expect(bootCoversSession(Date.parse('2026-08-24T12:00:00.000Z'), '2026-08-21')).toBe(false);
+  });
+
+  it('an UNKNOWN boot fails CLOSED — an attestation we cannot compute is not one we passed', () => {
+    expect(bootCoversSession(null, '2026-08-21')).toBe(false);
+    expect(bootCoversSession(Number.NaN, '2026-08-21')).toBe(false);
+  });
+
+  it('a full-session boot yields an ATTESTED day; the ledger may speak about it', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    captureBrokerOrderDay({ etDay: '2026-08-21', orders: [order()], capturedAt: 1, accountEnv: 'production' });
+    const w = summarizeEngineSubmitWitness();
+    expect(w.coveredEtDays).toEqual(['2026-08-21']);
+    expect(w.uncoveredCapturedEtDays).toEqual([]);
+  });
+
+  it('THE NEGATIVE CONTROL — a mid-session boot captures the day but is NOT attested for it', () => {
+    // The orders are saved (half (1) still works and the evidence is preserved),
+    // but the box was not resident for the whole window in which an order could
+    // have been placed, so its silence about that day is not testimony. Folding
+    // this into `attested` is exactly how an empty ledger becomes an accusation.
+    armEngineSubmitRecorder({ bootedAt: BOOT_MID_SESSION });
+    const r = captureBrokerOrderDay({
+      etDay: '2026-08-21',
+      orders: [order()],
+      capturedAt: 1,
+      accountEnv: 'production',
+    });
+    expect(r.line!.attestation).toBe('partial');
+    const w = summarizeEngineSubmitWitness();
+    expect(w.coveredEtDays).toEqual([]);
+    expect(w.uncoveredCapturedEtDays).toEqual(['2026-08-21']);
+    // …and the orders are still there. Attestation gates the INFERENCE, never the capture.
+    expect(capturedBrokerOrders()).toHaveLength(1);
+  });
+
+  it('a BLIND day is never attested', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    captureBrokerOrderDay({ etDay: '2026-08-21', orders: null, error: 'boom', capturedAt: 1, accountEnv: 'production' });
+    expect(summarizeEngineSubmitWitness().coveredEtDays).toEqual([]);
+  });
+
+  it('a day with NO capture at all is never attested — silence is not coverage', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    expect(summarizeEngineSubmitWitness().coveredEtDays).toEqual([]);
+  });
+});
+
+describe('TRA-3939 etDayOf', () => {
+  it('folds a UTC instant onto its ET calendar day, including across the boundary', () => {
+    // 2026-08-22T03:00Z is still 2026-08-21 in ET (23:00 EDT) — the exact rollover
+    // the broker's one-day window turns on.
+    expect(etDayOf(Date.parse('2026-08-22T03:00:00.000Z'))).toBe('2026-08-21');
+    expect(etDayOf(Date.parse('2026-08-22T04:30:00.000Z'))).toBe('2026-08-22');
+  });
+});

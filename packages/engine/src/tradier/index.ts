@@ -5,6 +5,8 @@ export {
   parseTradierOrderLegs,
   TRADIER_TERMINAL_STATUSES,
   TRADIER_REJECTED_STATUSES,
+  setTradierOrderSubmitObserver,
+  getTradierOrderSubmitObserver,
 } from './order-client.js';
 export type {
   TradierEnv,
@@ -13,6 +15,8 @@ export type {
   TradierOrderDetail,
   TradierOpenEquityPosition,
   TradierOrderLeg,
+  TradierOrderSubmitEvent,
+  TradierOrderSubmitObserver,
 } from './order-client.js';
 export {
   TradierOptionsClient,
