@@ -8417,6 +8417,20 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
         fleetHeadroomSignedUsd: null,
         fleetAtRiskUsd: null,
         fleetAtRiskBooks: 0,
+        // TRA-3913 — the ADOPTED columns. This literal is an exhaustive
+        // `toEqual`, so publishing a new key is a breaking change to it by
+        // construction; that is the point of asserting the whole object and it
+        // is why these are added rather than the assertion loosened.
+        //
+        // All three are 0 because the book is FLAT, and on a flat book they are
+        // the only honest answer: there is no row to attribute, so there is no
+        // desk premium and nothing the oracle was asked about. ⚠ Note this is
+        // the one place a `0` in `adoptedAttributionBlindRows` is unambiguous —
+        // elsewhere it carries the "we could answer" claim that TRA-3913 keeps
+        // separate from the dollar figure.
+        adoptedPremiumAtRiskUsd: 0,
+        adoptedOpenRows: 0,
+        adoptedAttributionBlindRows: 0,
       });
 
       seedOpenLivePremium(engine, 700);
