@@ -85,11 +85,27 @@ export interface OversoldCloseFinding {
  * positive finite number. `contracts` is not validated on hydrate, so a corrupt
  * on-disk row reaches this walk, and netting `NaN` reads as a number until
  * something compares it (TRA-3486).
+ *
+ * `import_only` — everything outstanding on this OCC is a `history_import`, so
+ * the engine closed a position whose OPEN leg our chokepoint never recorded.
+ * ⚠ THIS IS NOT EVIDENCE OF AN OVER-SELL AND IT WAS THE FIRST THING THIS
+ * DETECTOR GOT WRONG. Run against the live 49-row tape on 2026-08-21 it called
+ * four of these findings — including `SPY260807P00760000 sold 4 / ours 0` — and
+ * the importer exists precisely because our chokepoint has demonstrably missed
+ * OUR OWN fills (TRA-2959: 7 of 11 filled orders never reached the ledger). An
+ * engine buy the chokepoint missed is imported from broker history and then
+ * closed by us with `origin: 'fill'`, which is byte-identical to the desk's
+ * contract being sold by the engine. Same ambiguity `oracle_import_only` names
+ * one level down, same answer: counted, named, and NOT accused.
  */
 export interface BlindClose {
   optionSymbol: string;
   ts: number;
-  reason: 'no_open_record' | 'unusable_quantity';
+  reason: 'no_open_record' | 'unusable_quantity' | 'import_only';
+  /** Contracts the close sold. Present so a blind row is still legible. */
+  soldContracts: number;
+  /** Outstanding contracts whose only evidence is a `history_import` row. */
+  importedOpenContracts: number;
 }
 
 export interface OversoldCloseCensus {
@@ -120,6 +136,13 @@ export interface OversoldCloseCensus {
  * grades the live ledger on the health route. Records may arrive in any order;
  * the walk sorts oldest-first itself (stable, so same-`ts` rows keep append
  * order — which is the order they actually filled in).
+ *
+ * ⚠ A FINDING REQUIRES A POSITIVE STATEMENT, NOT JUST A SHORTFALL. The engine
+ * must have SOME recorded open of its own outstanding on the OCC
+ * (`engineOpenContracts > 0`) before a shortfall is charged to it. Where the
+ * whole open leg is a `history_import`, the close reads BLIND — see
+ * `BlindClose.import_only`, which is the branch the first version of this
+ * function got wrong against the live tape.
  *
  * ⛔ The netting is deliberately NOT `openEpisodeWindow`'s. That walk REFUSES
  * the whole symbol on an `unmatched_close` — which is the correct answer to
@@ -181,7 +204,10 @@ export function detectOversoldEngineCloses(
 
     engineCloses += 1;
     if (!(qty > 0)) {
-      blindCloses.push({ optionSymbol: symbol, ts: f.ts, reason: 'unusable_quantity' });
+      blindCloses.push({
+        optionSymbol: symbol, ts: f.ts, reason: 'unusable_quantity',
+        soldContracts: 0, importedOpenContracts: importedOpen.get(symbol) ?? 0,
+      });
       continue;
     }
     const ours = engineOpen.get(symbol) ?? 0;
@@ -190,7 +216,23 @@ export function detectOversoldEngineCloses(
       // Nothing outstanding from either party. Retention, a cold ledger, or an
       // import that recovered one leg of a round trip and not the other — the
       // close may have been entirely correct and we cannot tell.
-      blindCloses.push({ optionSymbol: symbol, ts: f.ts, reason: 'no_open_record' });
+      blindCloses.push({
+        optionSymbol: symbol, ts: f.ts, reason: 'no_open_record',
+        soldContracts: qty, importedOpenContracts: 0,
+      });
+      continue;
+    }
+    if (ours === 0) {
+      // Every outstanding contract on this OCC is a `history_import`. See
+      // `BlindClose.import_only`: our own chokepoint has demonstrably missed our
+      // own fills, so this is the shape of an engine buy recovered from broker
+      // history and then closed by us — indistinguishable, in these bytes, from
+      // the desk's contract being sold. A finding here is a false accusation.
+      blindCloses.push({
+        optionSymbol: symbol, ts: f.ts, reason: 'import_only',
+        soldContracts: qty, importedOpenContracts: theirs,
+      });
+      importedOpen.set(symbol, Math.max(0, theirs - qty));
       continue;
     }
     judgedCloses += 1;

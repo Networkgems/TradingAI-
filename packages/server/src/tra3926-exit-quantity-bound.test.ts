@@ -619,6 +619,40 @@ describe('TRA-3926 AC5 — the detector for the condition that has ALREADY occur
     expect(census.status).toBe('vacuous');
   });
 
+  it('an ENGINE close of an IMPORT-ONLY open reads BLIND, not oversold', () => {
+    // ⚠ THE FIRST VERSION OF THIS DETECTOR CALLED THIS A FINDING, and against
+    // the live 49-row tape that produced four false accusations — including
+    // `SPY260807P00760000 sold 4 / ours 0` on 2026-08-05. The importer exists
+    // because our own chokepoint has demonstrably missed OUR OWN fills
+    // (TRA-2959: 7 of 11 filled orders never reached the ledger), so an engine
+    // buy recovered from broker history and then closed by us is byte-identical
+    // to the desk's contract being sold by the engine.
+    const census = detectOversoldEngineCloses([
+      ledgerRow({ ts: DESK_AT, contracts: 4, filledPrice: 0.85, orderId: null, origin: 'history_import', sleeve: 'unattributed' }),
+      ledgerRow({ ts: CLOSED_AT, etDay: '2026-08-21', side: 'sell_to_close', contracts: 4, filledPrice: 1.01, orderId: 142806015 }),
+    ]);
+    expect(census.findings).toEqual([]);
+    expect(census.blindCloses).toEqual([
+      { optionSymbol: XLF, ts: CLOSED_AT, reason: 'import_only', soldContracts: 4, importedOpenContracts: 4 },
+    ]);
+    // Blind is NOT clean. `engineCloses: 1 / judgedCloses: 0` is the pair that
+    // says so, and the verdict follows the denominator.
+    expect(census).toMatchObject({ status: 'vacuous', engineCloses: 1, judgedCloses: 0 });
+  });
+
+  it('still fires when the engine has SOME open of its own and sells past it', () => {
+    // The live 2026-08-05 shape: `QQQ260911P00545000 sold 5, ours 4, desk 1`.
+    // A positive statement plus a shortfall is a finding; the `import_only`
+    // carve-out above must not swallow it.
+    const census = detectOversoldEngineCloses([
+      ledgerRow({ contracts: 4, filledPrice: 1.0, orderId: 140287000 }),
+      ledgerRow({ ts: DESK_AT, contracts: 1, filledPrice: 1.2, orderId: null, origin: 'history_import', sleeve: 'unattributed' }),
+      ledgerRow({ ts: CLOSED_AT, etDay: '2026-08-21', side: 'sell_to_close', contracts: 5, filledPrice: 1.1, orderId: 140287732 }),
+    ]);
+    expect(census.status).toBe('oversold');
+    expect(census.findings[0]).toMatchObject({ soldContracts: 5, engineOpenContracts: 4, excessContracts: 1 });
+  });
+
   it('reports a close whose opens aged out as BLIND, not as a finding', () => {
     const census = detectOversoldEngineCloses([
       ledgerRow({ ts: CLOSED_AT, etDay: '2026-08-21', side: 'sell_to_close', contracts: 2, filledPrice: 1.01, orderId: 142806015 }),
@@ -626,7 +660,7 @@ describe('TRA-3926 AC5 — the detector for the condition that has ALREADY occur
     expect(census.status).toBe('vacuous');
     expect(census.findings).toEqual([]);
     expect(census.blindCloses).toEqual([
-      { optionSymbol: XLF, ts: CLOSED_AT, reason: 'no_open_record' },
+      { optionSymbol: XLF, ts: CLOSED_AT, reason: 'no_open_record', soldContracts: 2, importedOpenContracts: 0 },
     ]);
   });
 
@@ -641,7 +675,7 @@ describe('TRA-3926 AC5 — the detector for the condition that has ALREADY occur
       ledgerRow({ ts: CLOSED_AT, side: 'sell_to_close', contracts: Number.NaN, orderId: 142806015 }),
     ]);
     expect(census.blindCloses).toEqual([
-      { optionSymbol: XLF, ts: CLOSED_AT, reason: 'unusable_quantity' },
+      { optionSymbol: XLF, ts: CLOSED_AT, reason: 'unusable_quantity', soldContracts: 0, importedOpenContracts: 0 },
     ]);
     expect(census.judgedCloses).toBe(0);
     expect(census.status).toBe('vacuous');
