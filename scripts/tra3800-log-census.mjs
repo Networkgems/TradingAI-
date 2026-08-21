@@ -101,8 +101,36 @@ const c1 = await pull({ limit: 5 });
 console.log(`CONTROL 1 (no text filter)     : ${c1.lines.length} line(s) — reader ${c1.lines.length > 0 ? 'LIVE' : 'BLIND'}`);
 if (c1.lines.length === 0) { console.error('reader returned 0 unfiltered — BLIND, this is a HOLD'); process.exit(3); }
 
-const c2 = await pull({ text: 'exit evaluation interval exceeded', limit: 5 });
-console.log(`CONTROL 2 (known-firing text=) : ${c2.lines.length} line(s) — filter ${c2.lines.length > 0 ? 'WORKS' : 'SUSPECT'}`);
+// CONTROL 2 must not hardcode its needle. It used to probe with
+// 'exit evaluation interval exceeded', chosen because it fired 134x/min — and then
+// TRA-3800 suppressed exactly that string, so on 2026-08-21 a healthy box reported
+// `filter SUSPECT` and the control became a permanent false alarm out of hours.
+// ONE CHECK'S REMEDY DESTROYED ANOTHER CHECK'S EVIDENCE. Any hardcoded needle decays
+// the same way, so calibrate off a line CONTROL 1 just returned: that line is known
+// to exist inside this exact window, so a working `text=` MUST return at least one.
+// ⚠️ Render splits `text=` on commas, so a needle containing one silently becomes a
+// multi-term query — token on letters only and it cannot happen.
+function pickNeedle(lines) {
+  let best = null;
+  for (const l of lines) {
+    const msg = String(l.message ?? '');
+    for (const tok of msg.split(/[^A-Za-z]+/)) {
+      if (tok.length >= 8 && (best === null || tok.length > best.tok.length)) best = { tok, msg };
+    }
+  }
+  return best;
+}
+const needle = pickNeedle(c1.lines);
+if (needle === null) {
+  console.log('CONTROL 2 (calibrated text=)   : UNCALIBRATED — no >=8-char alpha token in the CONTROL 1 sample');
+} else {
+  const c2 = await pull({ text: needle.tok, limit: 5 });
+  // A hit that does not contain the needle is the filter answering a different
+  // question — count only lines that actually carry it.
+  const hits = c2.lines.filter((l) => String(l.message ?? '').includes(needle.tok)).length;
+  console.log(`CONTROL 2 (calibrated text=)   : ${hits} line(s) for "${needle.tok}" — filter ${hits > 0 ? 'WORKS' : 'SUSPECT'}`);
+  if (hits === 0) console.error(`  ** a token lifted from a line inside this window matched nothing — text= is not filtering, treat every per-family zero below as UNREAD **`);
+}
 
 const c3 = await pull({ text: 'tra3800-needle-that-cannot-exist', limit: 5 });
 console.log(`CONTROL 3 (absent needle)      : ${c3.lines.length} line(s) — expect 0 ${c3.lines.length === 0 ? 'OK' : '** FILTER BROKEN OPEN **'}`);
