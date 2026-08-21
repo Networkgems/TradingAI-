@@ -270,9 +270,33 @@ describe('per-lot adoption of desk-added Tradier lots (TRA-3909)', () => {
     const fold = foldOpenPremiumAtRisk(acct.getState().openOptions, false);
     expect(fold.usd).toBeCloseTo(475, 6);
     expect(fold.rows).toBe(4);
-    // A desk lot is the engine's exposure now, so it is NOT in the "adopted and
-    // unactionable" split — that split is what TRA-3829 keeps out of the cap.
-    expect(fold.adoptedUsd).toBeCloseTo(0, 6);
+
+    // ⚠️ This assertion USED to read `adoptedUsd === 0`, on the pre-TRA-3913
+    // rule that `adoptedUsd` was `!engineMayActOnAdoptedRow(row)` — and
+    // `desk_add` is in that allow-list, so an adopted lot fell out of the
+    // column entirely. TRA-3913 landed on `main` hours after this branch was
+    // cut and made attribution a DIFFERENT question from authorisation:
+    // `splitEngineExposureContracts` rule 3 sends any authority that is not
+    // `engine_origin` — `desk_add` included — to wholly ADOPTED.
+    //
+    // The new reading is the correct one and it is the one TRA-3913 was filed
+    // to get. "The engine MAY EXIT this lot" and "the engine PAID for this lot"
+    // are not the same claim, and only the second one may spend the entry
+    // budget. So the two columns now split the book exactly along the seam this
+    // ticket cut it on:
+    //
+    //   desk   XLF 1 @ 0.85 = $85 + BAC 1 @ 1.17 = $117 → adoptedUsd  $202
+    //   engine XLF 1 @ 1.08 = $108 + BAC 1 @ 1.65 = $165 → usd-adopted $273
+    //                                                       total     $475
+    //
+    // and $273 is what the cap reads. Before this ticket the same book gave
+    // TRA-3913 a $0.00 adopted figure against $85 of real desk premium,
+    // because the blend hid the desk's contract inside an `engine_origin` row.
+    expect(fold.adoptedUsd).toBeCloseTo(202, 6);
+    expect(fold.usd - fold.adoptedUsd).toBeCloseTo(273, 6);
+    // Each desk lot is a FINDING, not an oracle refusal: the authority is known,
+    // so nothing here is attributed to the desk merely because we could not ask.
+    expect(fold.attributionBlindRows).toBe(0);
   });
 
   it('AC4 — the route names every adopted lot AND every refusal', () => {
