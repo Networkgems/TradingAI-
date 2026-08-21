@@ -590,6 +590,14 @@ export interface EngineState {
    * partial `EngineState` fixtures stay valid; the live builders always set it.
    */
   catalystGateShadowDecisions?: CatalystGateDecision[];
+  /**
+   * TRA-3910 — which BOOK this state renders (`bookView`) vs which book the
+   * engine ROUTES to (`engineMode`). Equal unless the user set a `viewMode`
+   * override; the dashboard labels from `bookView` and shows a banner when
+   * the two differ, so "viewing demo" can never read as "disarmed".
+   */
+  bookView?: 'demo' | 'live';
+  engineMode?: 'demo' | 'live';
   account: AccountState;
   closedPositions: ReturnType<PaperAccount['checkExits']>;
   options: OptionsAccountState;
@@ -18164,7 +18172,18 @@ export class SignalEngine {
     return this.optionsAccounts[env].getEngineBasisRestatementCensus();
   }
 
-  getState(): EngineState {
+  /**
+   * @param view TRA-3910 — which BOOK to render. Defaults to the engine's own
+   *   `this.mode`, which is the ROUTING mode the TRA-2649 arm governs; every
+   *   fleet/health/capital reader calls this with no argument and is unaffected.
+   *   Only the per-user dashboard surfaces (`GET /api/state`, the WS `state`
+   *   frame) pass `settings.viewMode`, so the pinned live operator can look at
+   *   the demo book. This is a READ of a book that is always resident (the demo
+   *   paper book is loaded in live mode too, see the constructor) — it never
+   *   touches `this.mode`, the broker clients, or the armed settings.
+   */
+  getState(view?: 'demo' | 'live'): EngineState {
+    const bookView: 'demo' | 'live' = view ?? this.mode;
     const symbols = Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol));
     // TRA-844 — spot resolver for the portfolio Greeks rollup. The options
     // account holds positions but not live underlying prices, so we hand it a
@@ -18185,9 +18204,9 @@ export class SignalEngine {
     // entries persisted before TRA-231 have no `mode` stamp; route them to
     // 'demo' since pre-field opens only fired from the demo path (live equity
     // wasn't wired and the live RV scanner only emerged in TRA-191/TRA-220).
-    const isMode = (m: 'demo' | 'live' | undefined): boolean => (m ?? 'demo') === this.mode;
+    const isMode = (m: 'demo' | 'live' | undefined): boolean => (m ?? 'demo') === bookView;
     const scopedSignals = this.recentSignals.filter(s => isMode(s.mode));
-    if (this.mode === 'live') {
+    if (bookView === 'live') {
       // Live mode (TRA-220): the live equity broker isn't wired up yet, so the
       // stock account is masked to zero. The options paper account is the
       // active trading surface in live and surfaces real positions / P&L so
@@ -18256,6 +18275,8 @@ export class SignalEngine {
         supertrendShadowSignals: this.supertrendShadowSignals,
         // TRA-1972 — observe-only catalyst earnings/macro proximity gate decisions.
         catalystGateShadowDecisions: this.catalystGateShadowDecisions,
+        bookView,
+        engineMode: this.mode,
         account: liveAccount,
         closedPositions: [],
         options: {
@@ -18311,6 +18332,8 @@ export class SignalEngine {
       supertrendShadowSignals: this.supertrendShadowSignals,
       // TRA-1972 — observe-only catalyst earnings/macro proximity gate decisions.
       catalystGateShadowDecisions: this.catalystGateShadowDecisions,
+      bookView,
+      engineMode: this.mode,
       account: demoAccountWithBreakdown,
       closedPositions: this.allClosedPositions.filter(p => isMode(p.mode)).slice(-20),
       options: {

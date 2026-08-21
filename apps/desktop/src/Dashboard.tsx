@@ -65,7 +65,7 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
 
   const {
     state, connected, news, isAdmin,
-    accountMode, setAccountMode, tradierEnv, optionsDailyLimit,
+    accountMode, setAccountMode, engineMode, liveBrokerArmPinned, tradierEnv, optionsDailyLimit,
     accountSettings, applyAccountSettings,
   } = useStockEngine(token, tab, onLogout, onActivity);
 
@@ -97,6 +97,8 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
         tradingAgentsEnabled={state?.tradingAgentsEnabled ?? accountSettings?.tradingAgentsEnabled ?? false}
         tradingAgentsGatingEnabled={state?.tradingAgentsGatingEnabled ?? accountSettings?.tradingAgentsGatingEnabled ?? false}
         accountMode={accountMode}
+        engineMode={engineMode}
+        liveBrokerArmPinned={liveBrokerArmPinned}
         onAccountModeChange={setAccountMode}
         theme={theme}
         onToggleTheme={onToggleTheme}

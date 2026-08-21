@@ -1232,6 +1232,17 @@ function cloneAlertPreferences(prefs: AlertPreferences): AlertPreferences {
 
 export interface AccountSettings {
   mode: AccountMode;
+  /**
+   * TRA-3910 — which BOOK the dashboard renders, decoupled from `mode` (which
+   * book the ENGINE arms/routes). `undefined`/`null` ⇒ follow `mode`. Written
+   * only by `PUT /api/account/view-mode`, which whitelists this one field and
+   * refuses every arm field; read only by the dashboard surfaces
+   * (`GET /api/state` + the per-user WS `state` frame). The TRA-2649 arm
+   * (`applyLiveBrokerArm`) never reads or writes it, so the pinned live
+   * operator can look at the demo book without a `mode` write, a clamp, or a
+   * `bootArmRepairLedger` row — and without the live routing changing.
+   */
+  viewMode?: AccountMode | null;
   // Demo mode settings
   demoEquity: number;
   demoEquityStocks: number;

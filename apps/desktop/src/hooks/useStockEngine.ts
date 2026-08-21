@@ -17,8 +17,25 @@ export interface StockEngine {
   connected: boolean;
   news: NewsItem[];
   isAdmin: boolean;
+  /**
+   * TRA-3910 — the BOOK the dashboard is showing (`viewMode ?? mode`). Labels
+   * and panels read this. It is NOT the engine's routing mode; see `engineMode`.
+   */
   accountMode: 'demo' | 'live';
   setAccountMode: (mode: 'demo' | 'live') => void;
+  /**
+   * TRA-3910 — the engine's ROUTING mode (`settings.mode`), i.e. which book
+   * real orders go to. Differs from `accountMode` only while a view override is
+   * set; the header renders a banner in that case so "viewing demo" can never be
+   * read as "disarmed".
+   */
+  engineMode: 'demo' | 'live';
+  /**
+   * TRA-3910 — true when this user's `mode` is governed by the TRA-2649
+   * live-broker arm (the pinned operator). The switcher then routes a Demo press
+   * to `PUT /api/account/view-mode` instead of a `mode` write the arm would clamp.
+   */
+  liveBrokerArmPinned: boolean;
   tradierEnv: 'sandbox' | 'production';
   optionsDailyLimit: number;
   /**
@@ -43,6 +60,8 @@ export function useStockEngine(
   const [news, setNews] = useState<NewsItem[]>([]);
   const [isAdmin, setIsAdmin] = useState(false);
   const [accountMode, setAccountMode] = useState<'demo' | 'live'>('demo');
+  const [engineMode, setEngineMode] = useState<'demo' | 'live'>('demo');
+  const [liveBrokerArmPinned, setLiveBrokerArmPinned] = useState(false);
   // TRA-244 — drives the Calendar tab's per-account bucket; flipping
   // `liveTradierEnvOptions` swaps the rows shown for the active account.
   const [tradierEnv, setTradierEnv] = useState<'sandbox' | 'production'>('sandbox');
@@ -136,7 +155,16 @@ export function useStockEngine(
   // saves take effect without a hard page refresh.
   const applyAccountSettings = useCallback((s: Partial<AccountSettings> | null | undefined) => {
     if (!s) return;
-    if (s.mode === 'demo' || s.mode === 'live') setAccountMode(s.mode);
+    // TRA-3910 — `accountMode` is the BOOK SHOWN: the `viewMode` override when
+    // set, else the routing mode. `engineMode` tracks routing alone.
+    if (s.mode === 'demo' || s.mode === 'live') {
+      setEngineMode(s.mode);
+      setAccountMode(s.viewMode === 'demo' || s.viewMode === 'live' ? s.viewMode : s.mode);
+    } else if (s.viewMode === 'demo' || s.viewMode === 'live') {
+      setAccountMode(s.viewMode);
+    }
+    const pinned = (s as { liveBrokerArmPinned?: unknown }).liveBrokerArmPinned;
+    if (typeof pinned === 'boolean') setLiveBrokerArmPinned(pinned);
     const limit = pickOptionsDailyLimit(s);
     if (typeof limit === 'number') setOptionsDailyLimit(limit);
     if (s.liveTradierEnvOptions === 'sandbox' || s.liveTradierEnvOptions === 'production') {
@@ -162,7 +190,7 @@ export function useStockEngine(
 
   return {
     state, connected, news, isAdmin,
-    accountMode, setAccountMode, tradierEnv, optionsDailyLimit,
+    accountMode, setAccountMode, engineMode, liveBrokerArmPinned, tradierEnv, optionsDailyLimit,
     accountSettings,
     applyAccountSettings,
   };

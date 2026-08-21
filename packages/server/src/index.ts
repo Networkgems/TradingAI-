@@ -9614,7 +9614,8 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
 
 app.get('/api/state', requireAuth, async (_req, res) => {
   const ctx = await userCtx(res);
-  res.json(ctx.engine.getState());
+  // TRA-3910 — the dashboard's book, honouring `viewMode`; routing mode untouched.
+  res.json(dashboardEngineState(ctx));
 });
 
 app.get('/api/crypto/state', requireAuth, async (_req, res) => {
@@ -12304,7 +12305,119 @@ app.get('/api/account/settings', requireAuth, async (_req, res, next) => {
   const username = res.locals['authUser'] as string;
   try {
     const settings = await loadSettings(username);
-    res.json(settings);
+    // TRA-3910 — tell the client whether THIS user's `mode` is governed by the
+    // TRA-2649 live-broker arm (derived, never persisted). The AccountModeSwitcher
+    // uses it to route a Demo press to `PUT /api/account/view-mode` (a pure view
+    // change) instead of a `mode` write the arm would clamp and ledger.
+    res.json({ ...settings, liveBrokerArmPinned: shouldBootArmLiveEquity(settings, username) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── TRA-3910 — dashboard BOOK VIEW, split from the engine's ROUTING mode ─────
+//
+// `admin` is the pinned real-money operator (`LIVE_EQUITY_BOOT_USER`), and the
+// TRA-2649 arm re-converges its `mode` to `live` on every settings write. That is
+// ratified and stays. Its side effect was that the operator of the live book could
+// not LOOK at the demo book: a Demo press was a `{mode:'demo'}` PUT, answered 200,
+// landed on `bootArmRepairLedger` as `repaired:["mode"]`, and reverted (two such
+// presses at 21:21Z on 2026-08-20 — read by the board as a broken toggle).
+//
+// `viewMode` is a separate persisted field the arm never reads. The engine's
+// `getState(view)` renders whichever book is asked for — the demo paper book is
+// resident in live mode too — while `this.mode`, the broker clients and the three
+// armed fields are untouched. Only the per-user dashboard surfaces consult it.
+
+/**
+ * The three fields the TRA-2649 arm owns. The view route refuses a body carrying
+ * ANY of them (and anything else but `viewMode`) with a NAMED 400, so a view path
+ * that grew write power over the arm fails loudly instead of reading as a toggle
+ * that finally "stuck".
+ */
+const LIVE_BROKER_ARM_FIELDS: ReadonlyArray<keyof AccountSettings> = [
+  'mode',
+  'liveTradierEnvOptions',
+  'liveTradeEquitiesTradier',
+];
+
+/**
+ * Which book the dashboard should render for `username`, or `undefined` when the
+ * view simply follows the engine's routing mode (the default for everyone). Only
+ * returns a value when an override is set AND differs from `mode`, so the common
+ * path costs nothing and `getState()` keeps its default argument.
+ */
+function resolveDashboardBookView(username: string): 'demo' | 'live' | undefined {
+  const s = getSettings(username);
+  const v = s.viewMode;
+  if (v !== 'demo' && v !== 'live') return undefined;
+  const routing: 'demo' | 'live' = s.mode === 'live' ? 'live' : 'demo';
+  return v === routing ? undefined : v;
+}
+
+/** Engine state as the DASHBOARD should see it (honours `viewMode`). */
+function dashboardEngineState(ctx: UserContext): ReturnType<UserContext['engine']['getState']> {
+  return ctx.engine.getState(resolveDashboardBookView(ctx.username));
+}
+
+app.put('/api/account/view-mode', requireAuth, async (req, res, next) => {
+  const username = res.locals['authUser'] as string;
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const keys = Object.keys(body);
+    const rejected = keys.filter(k => k !== 'viewMode');
+    if (rejected.length > 0) {
+      // Negative control (acceptance 2). Name the arm fields specifically so the
+      // refusal is attributable, but refuse EVERY foreign key — an allow-list,
+      // not a deny-list, so a new armed field can never slip past by omission.
+      const armFieldsRejected = rejected.filter(k => (LIVE_BROKER_ARM_FIELDS as ReadonlyArray<string>).includes(k));
+      log.warn('TRA-3910 view-mode route refused a body carrying non-view fields', {
+        username,
+        rejected,
+        armFieldsRejected,
+      });
+      res.status(400).json({
+        ok: false,
+        code: 'view_mode_route_refuses_arm_fields',
+        error: 'PUT /api/account/view-mode accepts only { viewMode }. It never writes the engine\'s routing mode; use PUT /api/account/settings for that (the TRA-2649 arm governs it).',
+        rejected,
+        armFieldsRejected,
+      });
+      return;
+    }
+    const requested = body['viewMode'];
+    if (requested !== 'demo' && requested !== 'live' && requested !== null) {
+      res.status(400).json({
+        ok: false,
+        code: 'view_mode_invalid',
+        error: "viewMode must be 'demo', 'live', or null (follow the engine mode).",
+      });
+      return;
+    }
+    const ctx = await userCtx(res);
+    const current = await loadSettings(username);
+    const updated: AccountSettings = { ...current, viewMode: requested };
+    // Tripwire: by construction this write changes no armed field. If it ever
+    // does, refuse rather than persist — a view route must never be the thing
+    // that moves the live routing in either direction.
+    const armDelta = LIVE_BROKER_ARM_FIELDS.filter(k => updated[k] !== current[k]);
+    if (armDelta.length > 0) {
+      log.error('TRA-3910 view-mode route would have changed an armed field — refused', { username, armDelta });
+      res.status(500).json({ ok: false, code: 'view_mode_arm_invariant_violated', armDelta });
+      return;
+    }
+    await saveSettings(username, updated);
+    // No `engine.applySettings` here on purpose: `mode` is unchanged, so there is
+    // nothing for the engine to re-derive and no broker balance to refetch. The
+    // only thing that changes is which book the next frame renders.
+    broadcastEngineState(ctx);
+    res.json({
+      ok: true,
+      viewMode: updated.viewMode ?? null,
+      mode: updated.mode,
+      bookView: resolveDashboardBookView(username) ?? (updated.mode === 'live' ? 'live' : 'demo'),
+      liveBrokerArmPinned: shouldBootArmLiveEquity(updated, username),
+    });
   } catch (err) {
     next(err);
   }
@@ -12460,6 +12573,12 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
   // makes the arm ineligible, `repaired` is empty, and this clamps nothing. A
   // settings PUT was never a durable de-escalation (a redeploy always undid it), so
   // no working safety lever is removed here — an illusory one is.
+  // TRA-3910 — an explicit ROUTING-mode switch clears any stale book-view
+  // override (the user asked for that book to be both armed and shown). The view
+  // route is the only writer that sets `viewMode`; this path only ever resets it.
+  if (body.mode !== undefined && body.viewMode === undefined && body.mode !== current.mode) {
+    updated.viewMode = null;
+  }
   const armRepaired = applyLiveBrokerArm(updated, username);
   if (armRepaired.length > 0) {
     liveBrokerArmWriteRepairs += 1;
@@ -15663,7 +15782,8 @@ function closeUserSockets(username: string): number {
 }
 
 function broadcastEngineState(ctx: UserContext): void {
-  broadcastToUser(ctx.username, JSON.stringify({ type: 'state', payload: ctx.engine.getState() }));
+  // TRA-3910 — per-user dashboard frame: honours `viewMode`.
+  broadcastToUser(ctx.username, JSON.stringify({ type: 'state', payload: dashboardEngineState(ctx) }));
 }
 
 function broadcastCryptoState(ctx: UserContext): void {
@@ -15696,7 +15816,7 @@ wss.on('connection', async (ws) => {
   if (!username) { ws.close(); return; }
   const ctx = await ensureUserContext(username);
 
-  ws.send(JSON.stringify({ type: 'state', payload: ctx.engine.getState() }));
+  ws.send(JSON.stringify({ type: 'state', payload: dashboardEngineState(ctx) }));
   ws.send(JSON.stringify({ type: 'crypto_state', payload: ctx.cryptoEngine.getState() }));
 
   // TRA-244 — read latest.json from the active stocks bucket so the WS
@@ -15743,7 +15863,11 @@ function attachBroadcastHandlers(ctx: UserContext): void {
   );
   ctx.engine.onTick((state) => {
     try { equityAudit.observe(state as unknown as Parameters<typeof equityAudit.observe>[0]); } catch { /* audit must never break broadcast */ }
-    broadcastToUser(ctx.username, JSON.stringify({ type: 'state', payload: state }));
+    // TRA-3910 — the audit above observes the ROUTING-mode state the engine
+    // ticked with; the dashboard frame honours `viewMode`. Re-rendered only
+    // when an override is actually set, so the default path ships `state` as-is.
+    const view = resolveDashboardBookView(ctx.username);
+    broadcastToUser(ctx.username, JSON.stringify({ type: 'state', payload: view ? ctx.engine.getState(view) : state }));
   });
   ctx.cryptoEngine.onTick((state) => {
     try { cryptoAudit.observe(state as unknown as Parameters<typeof cryptoAudit.observe>[0]); } catch { /* audit must never break broadcast */ }

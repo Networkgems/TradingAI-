@@ -2618,6 +2618,21 @@ tr:hover td { background: var(--bg-hover); }
   background: var(--surface);
 }
 .account-mode-switch.busy { opacity: 0.6; }
+/* TRA-3910 — shown whenever the dashboard renders a different book than the
+   engine routes to, so a demo VIEW never reads as a disarmed engine. */
+.book-view-banner {
+  display: inline-block;
+  margin-left: 0.5rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #7a4b00;
+  background: #fff3cd;
+  border: 1px solid #f0c36d;
+  vertical-align: middle;
+}
 .account-mode-option {
   appearance: none;
   background: transparent;

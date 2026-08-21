@@ -37,13 +37,42 @@ async function readAppliedMode(r: Response): Promise<AccountMode | null> {
   }
 }
 
+/**
+ * TRA-3910 — the view route's 200 body. `bookView` is what the dashboard will
+ * render from the next frame; `mode` is the routing mode, which this route can
+ * never change (it 400s on any body key but `viewMode`).
+ */
+async function readViewResult(r: Response): Promise<{ bookView: AccountMode; mode: AccountMode } | null> {
+  try {
+    const body = (await r.json()) as { bookView?: unknown; mode?: unknown } | null;
+    return isAccountMode(body?.bookView) && isAccountMode(body?.mode)
+      ? { bookView: body.bookView, mode: body.mode }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 export function AccountModeSwitcher({
   mode,
+  engineMode,
+  liveBrokerArmPinned = false,
   onChange,
   market,
   token,
 }: {
+  /** The BOOK currently shown. */
   mode: AccountMode;
+  /** TRA-3910 — the engine's ROUTING mode; defaults to `mode` (no override). */
+  engineMode?: AccountMode;
+  /**
+   * TRA-3910 — when true this user's `mode` is held on the live arm by the
+   * server (`GET /api/account/settings` → `liveBrokerArmPinned`), so a press is
+   * sent to `PUT /api/account/view-mode` — a pure VIEW change that never writes
+   * `mode`, is never clamped, and leaves no `bootArmRepairLedger` row. The live
+   * routing is untouched either way; the header banner says so.
+   */
+  liveBrokerArmPinned?: boolean;
   onChange: (mode: AccountMode) => void;
   market: 'stocks' | 'crypto';
   token: string;
@@ -56,8 +85,49 @@ export function AccountModeSwitcher({
   const [clampedTo, setClampedTo] = useState<AccountMode | null>(null);
   const toast = useToast();
 
+  async function switchViewTo(next: AccountMode) {
+    setBusy(true);
+    try {
+      const r = await fetch(`${HTTP_URL}/api/account/view-mode`, {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ viewMode: next }),
+      });
+      if (!r.ok) {
+        logger.warn('account-mode', `view switch to ${next} returned HTTP ${r.status}`);
+        toast.error(`Could not switch the view to the ${next === 'live' ? 'Live' : 'Demo'} book — HTTP ${r.status}`);
+        return;
+      }
+      const applied = await readViewResult(r);
+      if (applied === null) {
+        logger.warn('account-mode', `view switch to ${next} returned 200 but no bookView — outcome unverified`);
+        toast.info('Sent the view switch, but the server did not report which book it will show. Reload to confirm.');
+        return;
+      }
+      setClampedTo(null);
+      onChange(applied.bookView);
+      toast.success(
+        `Viewing the ${applied.bookView === 'live' ? 'Live' : 'Demo'} book`
+        + (applied.bookView !== applied.mode
+          ? ` — the engine is still routing to the ${applied.mode.toUpperCase()} account; nothing was disarmed.`
+          : '.'),
+      );
+    } catch (err) {
+      logger.error('account-mode', `failed to switch the view to ${next}`, err);
+      toast.error(`Could not switch the view to ${next} — network error`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function switchTo(next: AccountMode) {
     if (next === mode || busy) return;
+    // TRA-3910 — the pinned live operator: change what is SHOWN, never what is
+    // ARMED. No `mode` write ⇒ no TRA-2649 clamp, no repair-ledger row.
+    if (liveBrokerArmPinned) {
+      await switchViewTo(next);
+      return;
+    }
     if (next === 'live') {
       const ackKey = `liveModeAcknowledged_${market}`;
       const alreadyAcknowledged = localStorage.getItem(ackKey) === 'true';
@@ -153,8 +223,11 @@ export function AccountModeSwitcher({
   // the pin is later cleared the toggle would stay dead until a reload, and
   // this is the control someone reaches for when they are trying to get OUT of
   // a live arm. An honest label beats a dead button.
+  const routing: AccountMode = engineMode ?? mode;
   const clampNote = (side: AccountMode) =>
-    clampedTo !== null && clampedTo !== side
+    liveBrokerArmPinned
+      ? ` — VIEW only: the engine keeps routing to the ${routing.toUpperCase()} account (pinned live-broker arm)`
+      : clampedTo !== null && clampedTo !== side
       ? ` — the server refused this switch and held the account on ${clampedTo === 'live' ? 'LIVE' : 'DEMO'};`
         + ' clear LIVE_EQUITY_BOOT_USER on the service to de-escalate'
       : '';

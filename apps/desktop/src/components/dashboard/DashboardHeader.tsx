@@ -33,6 +33,8 @@ export function DashboardHeader({
   tradingAgentsEnabled,
   tradingAgentsGatingEnabled,
   accountMode,
+  engineMode,
+  liveBrokerArmPinned,
   onAccountModeChange,
   theme,
   onToggleTheme,
@@ -58,7 +60,13 @@ export function DashboardHeader({
    *  (true ↔ agents auto-route paper orders). Optional so a pre-TRA-796 server
    *  state still type-checks. */
   tradingAgentsGatingEnabled?: boolean;
+  /** TRA-3910 — the BOOK being shown (`viewMode ?? mode`). */
   accountMode: 'demo' | 'live';
+  /** TRA-3910 — the engine's ROUTING mode. Optional so older callers type-check;
+   *  defaults to `accountMode` (no override). */
+  engineMode?: 'demo' | 'live';
+  /** TRA-3910 — whether the TRA-2649 arm governs this user's `mode`. */
+  liveBrokerArmPinned?: boolean;
   onAccountModeChange: (mode: 'demo' | 'live') => void;
   theme: Theme;
   onToggleTheme: () => void;
@@ -69,6 +77,9 @@ export function DashboardHeader({
 }) {
   const [tradingToggling, setTradingToggling] = useState(false);
   const toast = useToast();
+  // TRA-3910 — routing mode; equals the shown book unless a view override is set.
+  const routingMode: 'demo' | 'live' = engineMode ?? accountMode;
+  const viewingOtherBook = routingMode !== accountMode;
 
   async function toggleAutoTrading() {
     setTradingToggling(true);
@@ -99,8 +110,27 @@ export function DashboardHeader({
         <h1>TradingAI <span className="mode-badge stocks">Stocks</span></h1>
         {/* TRA-569 — coach-mark anchor for the account-mode stop (design §3.3). */}
         <span data-tour="account-mode" className="tour-anchor">
-          <AccountModeSwitcher mode={accountMode} onChange={onAccountModeChange} market="stocks" token={token} />
+          <AccountModeSwitcher
+            mode={accountMode}
+            engineMode={routingMode}
+            liveBrokerArmPinned={liveBrokerArmPinned ?? false}
+            onChange={onAccountModeChange}
+            market="stocks"
+            token={token}
+          />
         </span>
+        {/* TRA-3910 — the shown book differs from the routed book. Say so in the
+            header, every frame, so a demo VIEW can never be read as the live
+            arm having been stood down. */}
+        {viewingOtherBook && (
+          <span
+            className="book-view-banner"
+            data-testid="book-view-banner"
+            title={`The dashboard is showing the ${accountMode.toUpperCase()} book. The engine is still routing orders to the ${routingMode.toUpperCase()} account — nothing was disarmed.`}
+          >
+            Viewing {accountMode.toUpperCase()} book · engine is {routingMode.toUpperCase()}
+          </span>
+        )}
       </div>
       <div className="header-right">
         {/* TRA-544 (TRA-529 §2B) — "Trading Agents" master switch, centred in
@@ -114,7 +144,10 @@ export function DashboardHeader({
               from advisory-only into actually opening/monitoring/closing paper
               trades. Live agent routing stays behind the API-only board+CTO
               go-live gate. */}
-          {accountMode === 'demo' && (
+          {/* TRA-3910 — gated on the ROUTING mode, not the shown book: a pinned
+              live operator viewing the demo book must not be handed a routing
+              control the live engine would act on. */}
+          {routingMode === 'demo' && (
             <AgentGatingButton
               token={token}
               enabled={tradingAgentsGatingEnabled ?? false}
