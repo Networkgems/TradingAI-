@@ -60,7 +60,13 @@ async function pin() {
   const r = await get('/api/health/options-live');
   const b = r?.build ?? null;
   return b
-    ? { commit: b.commit, pid: b.pid, startedAt: b.startedAt, uptimeSec: b.uptimeSec ?? null }
+    ? {
+      commit: b.commit,
+      pid: b.pid,
+      startedAt: b.startedAt,
+      uptimeSec: b.uptimeSec ?? null,
+      drift: r?.brokerPositionDrift ?? null,
+    }
     : null;
 }
 
@@ -145,6 +151,74 @@ if (withRows.length === 0) {
   blind('every gate-open book is FLAT — an empty book attributes correctly by construction, '
     + 'so a PASS here would measure nothing (the TRA-3911 dark-book lesson)');
 }
+
+// ── THE SUBJECT MUST BE PRESENT, AND `excess` IS NOT PRESENCE ────────────────
+// 2026-08-21T14:2xZ: this grader scored 13/13 PASS against `1f1264df` — the
+// build that does NOT carry the fix, the build it had scored 11/12 FAIL against
+// ninety minutes earlier. Nothing was fixed in between. At 13:48:04Z the engine
+// closed the widened XLF row, and with it the only row on the whole box that had
+// a foreign contract ON it. Every criterion then became arithmetically correct
+// about a book with nothing to attribute, and the pre-fix CONTROL evaporated
+// along with the subject.
+//
+// ⭐ A FOREIGN CONTRACT STILL EXISTS — it is just in the branch this fold cannot
+// see. `brokerPositionDrift` splits it two ways and the split is not stable:
+//   • `absorbed` — the contract was taken ONTO an engine row. It is inside
+//     `openPremiumAtRiskUsd`, so `adoptedPremiumAtRiskUsd` is the column that
+//     answers for it and THIS GRADER IS THE INSTRUMENT. Score it.
+//   • `excess`   — the contract sits BESIDE the row at the broker. It is in no
+//     row, so no fold can express it and `adoptedPremiumAtRiskUsd $0.00` is
+//     CORRECT AND MEANINGLESS at the same time. Scoring that is measuring the
+//     absence of the subject.
+// Same dollar of real broker risk, two branches, and on this one boot the box
+// has reported `absorbed` 186 times and `excess` 347 times. So which verdict
+// this grader is entitled to reach is decided by which side of a coin flip the
+// adoption sweep last landed on — which makes the presence test mandatory, not
+// defensive (TRA-3911: gate the verdict on the OPERAND'S presence, never on the
+// criterion's outcome).
+// ⚠ The gate is EVALUATED here and FIRED at the verdict, so the G1 field-presence
+// rows still print: "the fix is deployed" and "the fix was exercised" are two
+// different findings and the first survives the absence of the second.
+//
+// ⛔ AND IT MUST NEVER SWALLOW A FAIL. Read the branches in the right order:
+// under the PRE-FIX build with a contract `absorbed` onto a row, the adopted
+// columns read 0 *because that is the defect* — so keying presence on the
+// adopted columns ALONE would convert this ticket's own 12/13 FAIL into a BLIND
+// and delete the alarm. `absorbed`/`engineOriginImportedRowsCheckedLast` are
+// therefore the authority on whether a subject EXISTS, and the adopted columns
+// only ever ADD to that set. A failed criterion is likewise proof the subject
+// was present: nothing can fail about a book with nothing in it.
+const drift = before.drift ?? null;
+const subjectAbsenceReason = (bookRows, d, failures = 0) => {
+  const adoptedNow = bookRows.reduce((n, r) => n + (r.adoptedOpenRows ?? 0), 0);
+  const refusedNow = bookRows.reduce((n, r) => n + (r.adoptedAttributionBlindRows ?? 0), 0);
+  const absorbedNow = d?.absorbedContractsLast ?? 0;
+  const importedNow = d?.engineOriginImportedRowsCheckedLast ?? 0;
+  if (adoptedNow > 0 || refusedNow > 0 || absorbedNow > 0 || importedNow > 0) return null;
+  if (failures > 0) return null;
+  const drift = d;
+  if (!drift) {
+    return 'no adopted or refused row on any gate-open book, and `brokerPositionDrift` is '
+      + 'unreadable — cannot tell "the fold attributed correctly" from "there was nothing '
+      + 'on a row to attribute"';
+  }
+  const excess = drift.excessContractsLast ?? 0;
+  const absorbed = drift.absorbedContractsLast ?? 0;
+  const imported = drift.engineOriginImportedRowsCheckedLast ?? 0;
+  if (excess > 0 && absorbed === 0 && imported === 0) {
+    return `NO SUBJECT — drift status '${drift.liveBookStatus ?? drift.status}' holds `
+      + `${excess} foreign contract(s) BESIDE the engine's rows, none on one. `
+      + '`adoptedPremiumAtRiskUsd $0.00` is correct here and proves nothing about this fix: '
+      + 'the fold can only answer for a contract that was taken onto a row. '
+      + `(this boot: absorbedChecks=${drift.absorbedChecks ?? '?'} excessChecks=`
+      + `${drift.excessChecks ?? '?'} — the branch is not stable, so re-run)`;
+  }
+  return 'NO SUBJECT — every gate-open book folds 0 adopted and 0 refused rows and the broker '
+    + 'holds nothing foreign, so the attribution split is never exercised. A book the engine '
+    + 'opened by itself attributes correctly under the PRE-FIX code too: on 2026-08-21 this '
+    + 'grader scored 13/13 against `1f1264df`, the build without the fix. PASS requires a row '
+    + 'to attribute.';
+};
 
 // ── G1 — DEPLOYED BYTES, by field presence, on EVERY row ─────────────────────
 const KEYS = ['adoptedPremiumAtRiskUsd', 'adoptedOpenRows', 'adoptedAttributionBlindRows'];
@@ -289,6 +363,28 @@ check('G3.fleet-at-risk-is-the-TOTAL',
     + ' — the fleet is summed on the ARM');
 }
 
+// C5 — the NO-SUBJECT gate must be able to NOT fire. A blind gate that fires on
+// every input is the same instrument as no grader at all, and it would make the
+// post-deploy grade permanently un-reachable. Four inputs, three of which must
+// leave it silent — including the pre-fix `absorbed` shape, whose adopted
+// columns read 0 *because that is the defect being graded*.
+{
+  const base = withRows[0];
+  const quiet = [
+    ['a row IS labelled adopted',
+      subjectAbsenceReason([{ ...base, adoptedOpenRows: 1 }], drift)],
+    ['a row was REFUSED (oracle blind)',
+      subjectAbsenceReason([{ ...base, adoptedAttributionBlindRows: 1 }], drift)],
+    ['drift ABSORBED a contract onto a row, adopted columns still 0 (the pre-fix defect)',
+      subjectAbsenceReason([base], { ...drift, absorbedContractsLast: 1, excessContractsLast: 0 })],
+  ];
+  const stillFires = subjectAbsenceReason([base], drift);
+  check('C5.no-subject-gate-can-be-silent',
+    quiet.every(([, r]) => r === null) && typeof stillFires === 'string',
+    `silent on ${quiet.length}/3 subject-present shapes (${quiet.map(([n]) => n.split(',')[0]).join('; ')})`
+    + ' and still fires on this run — so BLIND here is a reading, not a constant');
+}
+
 // ── Verdict ─────────────────────────────────────────────────────────────────
 const after = await pin();
 if (!after?.commit) blind('pin unreadable after the probe');
@@ -311,10 +407,24 @@ for (const r of withRows) {
     + ` over ${r.openRows} row(s), ${r.adoptedOpenRows} adopted,`
     + ` ${r.adoptedAttributionBlindRows} refused`);
 }
+if (drift) {
+  console.log(`#   brokerPositionDrift: ${drift.liveBookStatus ?? drift.status}`
+    + ` · excessLast=${drift.excessContractsLast ?? '?'}`
+    + ` absorbedLast=${drift.absorbedContractsLast ?? '?'}`
+    + ` engineOriginImportedRowsLast=${drift.engineOriginImportedRowsCheckedLast ?? '?'}`
+    + ` · this boot: absorbedChecks=${drift.absorbedChecks ?? '?'}`
+    + ` excessChecks=${drift.excessChecks ?? '?'}`);
+}
 if (typeof after.uptimeSec === 'number' && after.uptimeSec < SHALLOW_BOOT_SEC) {
   blind(`graded ${after.uptimeSec}s after boot — balances and the ledger may not have arrived;`
     + ' a shallow read is cured by a second read at depth, not by a re-ship');
 }
+// ⛔ AFTER the rows print, BEFORE the verdict. A criterion that cannot fail on
+// this run's data is not a pass, and 13/13 over an empty subject is the loudest
+// possible way to say nothing. Evaluated with the FAILURE COUNT in hand so a
+// real FAIL is never downgraded to "could not tell".
+const noSubject = subjectAbsenceReason(withRows, drift, failed.length);
+if (noSubject) blind(noSubject);
 console.log(`${failed.length === 0 ? 'PASS' : 'FAIL'} — ${rows.length - failed.length}/${rows.length}`
   + ` at uptimeSec=${age(after)}`);
 process.exit(failed.length === 0 ? 0 : 1);
