@@ -363,26 +363,51 @@ check('G3.fleet-at-risk-is-the-TOTAL',
     + ' — the fleet is summed on the ARM');
 }
 
-// C5 — the NO-SUBJECT gate must be able to NOT fire. A blind gate that fires on
-// every input is the same instrument as no grader at all, and it would make the
-// post-deploy grade permanently un-reachable. Four inputs, three of which must
-// leave it silent — including the pre-fix `absorbed` shape, whose adopted
-// columns read 0 *because that is the defect being graded*.
+// C5 — the NO-SUBJECT gate must be able to fire AND to stay silent. A blind gate
+// that fires on every input is the same instrument as no grader at all, and one
+// that can never fire makes the post-deploy grade permanently un-reachable.
+//
+// ⛔ NEITHER LIMB MAY BE READ OFF TODAY'S BOOK. The first draft (2026-08-21,
+// written on a beat when the live book genuinely held no subject) proved "it can
+// still fire" by calling the gate on the LIVE row — which is not a statement
+// about the gate at all, it is a statement about the data. On 2026-08-21T21:2xZ
+// a real adopted row appeared (`admin` desk $141.00, the fix working exactly as
+// specified) and this control went RED on a run where every substantive
+// criterion passed. Same shelf-life defect TRA-3926 named one level up: a
+// control whose verdict moves with the subject it is controlling for is a
+// measurement, not a control. Both limbs are now built from a NEUTRAL shape this
+// script constructs, so C5 grades the PREDICATE and nothing else.
 {
-  const base = withRows[0];
+  const neutral = {
+    ...withRows[0],
+    adoptedOpenRows: 0,
+    adoptedAttributionBlindRows: 0,
+    adoptedPremiumAtRiskUsd: 0,
+  };
+  const noSubjectDrift = {
+    ...(drift ?? {}),
+    absorbedContractsLast: 0,
+    excessContractsLast: 0,
+    engineOriginImportedRowsCheckedLast: 0,
+  };
   const quiet = [
     ['a row IS labelled adopted',
-      subjectAbsenceReason([{ ...base, adoptedOpenRows: 1 }], drift)],
+      subjectAbsenceReason([{ ...neutral, adoptedOpenRows: 1 }], noSubjectDrift)],
     ['a row was REFUSED (oracle blind)',
-      subjectAbsenceReason([{ ...base, adoptedAttributionBlindRows: 1 }], drift)],
+      subjectAbsenceReason([{ ...neutral, adoptedAttributionBlindRows: 1 }], noSubjectDrift)],
     ['drift ABSORBED a contract onto a row, adopted columns still 0 (the pre-fix defect)',
-      subjectAbsenceReason([base], { ...drift, absorbedContractsLast: 1, excessContractsLast: 0 })],
+      subjectAbsenceReason([neutral], { ...noSubjectDrift, absorbedContractsLast: 1 })],
+    ['a criterion FAILED, so there was something present to fail',
+      subjectAbsenceReason([neutral], noSubjectDrift, 1)],
   ];
-  const stillFires = subjectAbsenceReason([base], drift);
-  check('C5.no-subject-gate-can-be-silent',
-    quiet.every(([, r]) => r === null) && typeof stillFires === 'string',
-    `silent on ${quiet.length}/3 subject-present shapes (${quiet.map(([n]) => n.split(',')[0]).join('; ')})`
-    + ' and still fires on this run — so BLIND here is a reading, not a constant');
+  const fires = subjectAbsenceReason([neutral], noSubjectDrift);
+  const silent = quiet.filter(([, r]) => r === null);
+  check('C5.no-subject-gate-is-not-a-constant',
+    silent.length === quiet.length && typeof fires === 'string',
+    `${silent.length}/${quiet.length} subject-present shapes leave it silent`
+    + ` (${silent.map(([n]) => n.split(',')[0]).join('; ') || 'NONE'})`
+    + ` and the constructed no-subject shape ${typeof fires === 'string' ? 'DOES' : 'does NOT'} fire`
+    + ' — both limbs constructed here, neither read off today\'s book');
 }
 
 // ── Verdict ─────────────────────────────────────────────────────────────────
