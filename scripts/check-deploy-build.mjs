@@ -372,6 +372,23 @@ function makeIsolatedSubject(rev) {
     throw new Blind(`git worktree add failed: ${add.err || add.out}`);
   }
 
+  // ⛔ AN ABSENT `node_modules` IS "COULD NOT CHECK", NEVER "IT IS BROKEN".
+  // This `continue` used to swallow the root case: the subject worktree was then
+  // built with NO dependencies, `tsc -b` died in `@trading-app/shared`, and the
+  // gate refused the push with exit 1 BROKEN — a false accusation against a
+  // commit it never actually compiled. Measured 2026-08-21 on TRA-3913, where a
+  // clean `git worktree add` (which does not carry `node_modules`) reported the
+  // then-tip `cd59921b` as un-deployable. The false RED is the expensive
+  // direction: it is the one that gets `--no-verify`'d, and that is the same end
+  // state as no gate. The link-failure path below already reads BLIND; absence
+  // has to reach the same place, or the two halves of "could not check"
+  // disagree.
+  if (!existsSync(join(REPO_ROOT, 'node_modules'))) {
+    cleanupIsolatedSubject({ dir, wt });
+    throw new Blind(`\`${REPO_ROOT}\` has no root \`node_modules\` — the subject would be `
+      + 'compiled without its dependencies and every failure would be an artifact of that. '
+      + 'Run `pnpm install` in this checkout (a fresh `git worktree` does not inherit one).');
+  }
   for (const d of NODE_MODULES_DIRS) {
     const target = join(REPO_ROOT, d, 'node_modules');
     if (!existsSync(target)) continue;
