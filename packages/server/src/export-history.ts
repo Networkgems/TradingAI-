@@ -8,8 +8,12 @@ import type {
   ExportMoneyRestatement,
   ExportTradeRow,
 } from './export.js';
-import { formatHoldDuration } from './export.js';
+import { applyMoneyRestatement, formatHoldDuration } from './export.js';
 import type { OptionTradeJournalRecord } from './option-trade-journal.js';
+// TRA-3930 — the two markers that tell a REPAIR-authored record of a close from
+// the engine's own, used to pick which of two records of ONE close is published.
+import { TRADIER_IMPORT_STRUCTURE } from './option-trade-journal.js';
+import { RECONSTRUCTED_EXIT_REASON } from './tra3485-stale-open-repair.js';
 
 export type {
   ExportCoverage,
@@ -448,70 +452,204 @@ export function rowFromJournalRecord(r: OptionTradeJournalRecord): ExportTradeRo
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-3930 — ONE CLOSE IS ONE ROW, and the row id is not the close id
+//
+// The export served **-130.00 for a -65.00 day** on live bqb1 2026-08-21, because
+// the two halves of "de-dupe the journal against the book" were both keyed wrong:
+//
+//   Cause 1 — the book side was addressed by `position.id`, but the journal is
+//   addressed by `position.journalId ?? position.id` (TRA-3078; see
+//   {@link journalIdForPosition}). One of the day's two live closes was a
+//   reconcile-REBOUND import whose two ids differ, so `excludeIds.has(r.id)` was
+//   structurally unable to be true for it and its journal twin was served
+//   alongside the book copy — same OCC, same exit timestamp to the millisecond,
+//   same money, twice.
+//
+//   Cause 2 — and an id set cannot fix that alone, because the journal held TWO
+//   records for one BAC close: the engine's (`chandelier_restarted`) and a
+//   TRA-3485 reconstruction (`reconstructed-TRA-3472`) minted rather than rebound
+//   by the import reconciler. The engine's record matched the book and was
+//   correctly dropped; the reconstruction has no book twin under ANY id, so a
+//   set of book ids — however it is keyed — can exclude at most one of them.
+//
+// So the unit of de-duplication here is the CLOSE, not the journal row. Rows are
+// grouped by close identity first; a group with a book twin is dropped whole, and
+// a group without one serves exactly ONE row.
+//
+// ⚠️ This is a REPORTING repair. The duplicate BAC record is a real defect in the
+// import reconciler's MINT-vs-REBIND decision (the TRA-2937/TRA-3472 family) and
+// is filed separately — an export that quietly renders a corrupt journal as a
+// clean day would be worse than the double it replaces, which is why the collapse
+// is published on `summary` rather than performed in silence.
+
 /**
- * TRA-3875 — the restatements a book row must adopt, keyed by trade id.
+ * TRA-3930 — the identity of a CLOSE, as distinct from the identity of a ROW.
+ *
+ * `mode | OCC symbol | closeTs`, and every part is load-bearing. Two closes of
+ * the SAME contract in the SAME book at the SAME millisecond are not two closes;
+ * `closeTs` is stamped from the exit, so genuine sequential exits of one contract
+ * differ by seconds at minimum, and the observed duplicate pair matched to the ms
+ * (`closeTs 1787331910473` on both) — that is a copy, not a coincidence.
+ *
+ * `null` when the row carries no `optionSymbol` (pre-TRA-1656 rows). With no
+ * contract identity there is nothing to assert sameness ON, so such a row is left
+ * ungrouped and served on its own merits — collapsing on `mode|closeTs` alone
+ * would merge two genuinely different contracts closed in the same batch.
+ */
+function closeIdentityKey(r: OptionTradeJournalRecord): string | null {
+  if (!r.optionSymbol) return null;
+  if (!isFiniteNumber(r.closeTs)) return null;
+  return `${r.mode}|${r.optionSymbol}|${r.closeTs}`;
+}
+
+/**
+ * TRA-3930 — how good a DESCRIPTIVE record of a close a journal row is. Higher
+ * wins; money is ranked separately (see {@link moneyRecordFor}) because the two
+ * questions have different answers.
+ *
+ * A `tradier_import` row is inventory the firm did not select (TRA-2937), and a
+ * `reconstructed-TRA-3472` exit reason explicitly means "the real exit was LOST
+ * and this close was back-filled from broker fills" (TRA-3485) — it names the
+ * ruling that authorised the reconstruction precisely so it is not mistaken for
+ * an observed decision. Where an engine-authored record of the same close exists,
+ * it is the one that carries the strategy label and the actual exit decision, and
+ * it is the one that must be published.
+ */
+function descriptiveRank(r: OptionTradeJournalRecord): number {
+  let rank = 0;
+  if (r.structure !== TRADIER_IMPORT_STRUCTURE) rank += 2;
+  if (r.exitReason && r.exitReason !== RECONSTRUCTED_EXIT_REASON) rank += 1;
+  return rank;
+}
+
+/** The rows of one close, in first-appearance order, plus the book twin if any. */
+interface JournalCloseGroup {
+  rows: OptionTradeJournalRecord[];
+  /**
+   * The journal id under which the in-memory book holds this close, or `null`.
+   * This is the key a restatement must be published under — the book row is
+   * joined back by `journalIdForPosition(position)` in `export.ts`.
+   */
+  bookJournalId: string | null;
+}
+
+/**
+ * TRA-3930 — group this book's CLOSED journal rows by the close each describes.
+ *
+ * `bookJournalIds` must be `new Set(closedOptions.map(journalIdForPosition))` —
+ * the ids the JOURNAL knows the book's closes by, never the bare `position.id`
+ * that Cause 1 used.
+ *
+ * Insertion-ordered: the served rows keep the journal's own order, so a book row
+ * and its twin can never reorder between two calls (the TRA-3860 guarantee).
+ */
+function groupJournalCloses(
+  rows: readonly OptionTradeJournalRecord[],
+  bookJournalIds: ReadonlySet<string>,
+): JournalCloseGroup[] {
+  const groups = new Map<string, JournalCloseGroup>();
+  for (const r of rows) {
+    if (r.outcome === 'OPEN') continue;
+    if (!isFiniteNumber(r.closeTs)) continue;
+    // An ungroupable row keys on its own id, so it is its own group of one and
+    // behaves exactly as it did before this ticket.
+    const key = closeIdentityKey(r) ?? `row:${r.id}`;
+    const existing = groups.get(key);
+    const group = existing ?? { rows: [], bookJournalId: null };
+    group.rows.push(r);
+    if (bookJournalIds.has(r.id)) group.bookJournalId = r.id;
+    if (!existing) groups.set(key, group);
+  }
+  return [...groups.values()];
+}
+
+/**
+ * The MEASURED-money record of a close, if the group holds one.
+ *
+ * TRA-2819/TRA-3875: only `pnlBasis: 'broker-fill'` is a measured disagreement.
+ * A row without it holds the engine's own arithmetic — the same figure the book
+ * holds — so there is nothing to supersede, and manufacturing an entry would
+ * replace a number with itself while incrementing `supersededRowCount`.
+ *
+ * TRA-3930 widens the search from "the twin row" to "any record of THIS close",
+ * because once two records can describe one close, the one holding broker truth
+ * and the one holding the engine's exit decision need not be the same row. It is
+ * scoped by {@link closeIdentityKey}, i.e. same book, same contract, same exit
+ * millisecond — never across closes.
+ */
+function moneyRecordFor(group: JournalCloseGroup): OptionTradeJournalRecord | null {
+  return group.rows.find(r => r.pnlBasis === 'broker-fill') ?? null;
+}
+
+/**
+ * `feesUsd` is set only alongside `pnlBasis` (TRA-2819, never zero-filled), so
+ * the `fees_usd: 0` fallback inside is unreachable in practice and is kept only
+ * so the type is total.
+ */
+function restatementFromRecord(r: OptionTradeJournalRecord): ExportMoneyRestatement {
+  const mapped = rowFromJournalRecord(r);
+  return {
+    gross_pnl_usd: mapped.gross_pnl_usd,
+    fees_usd: mapped.fees_usd,
+    net_pnl_usd: mapped.net_pnl_usd,
+    // The restatement re-derives `realizedR` in the same write that moves the
+    // money (`option-trade-journal.ts`), so R travels with it. Keeping the
+    // book's R would publish an R computed from the number just replaced.
+    pnl_r: mapped.pnl_r,
+    exit_price: mapped.exit_price,
+    entry_price: mapped.entry_price,
+  };
+}
+
+/**
+ * TRA-3875 — the restatements a book row must adopt, keyed by the id the JOURNAL
+ * knows that book row by (`journalIdForPosition`, TRA-3930 — it was keyed by the
+ * bare `position.id` and therefore missed every rebound position).
  *
  * ⚠️ Same precondition as {@link selectJournalExportRows} — `rows` must ALREADY
  * be book-scoped by `journalRowsForBook`, or one account's restatement lands on
  * another's book row.
  *
- * `bookIds` is the in-memory book's id set: this is deliberately the COMPLEMENT
- * of the set `selectJournalExportRows` serves. Every closed journal row either
- * (a) has no book twin and is served directly by that function, carrying its own
- * restated money, or (b) has a book twin, is dropped there, and its money is
- * carried over HERE. Exactly one path handles each row, so no restatement is
- * double-counted and none is lost.
- *
- * Only `pnlBasis: 'broker-fill'` rows produce an entry. A journal row without it
- * holds the engine's own figure — the same figure the book holds — so there is
- * nothing to supersede, and manufacturing an entry would replace a number with
- * itself while incrementing `supersededRowCount`. A restatement is a MEASURED
- * disagreement or it is not published.
- *
- * `feesUsd` is set only alongside `pnlBasis` (TRA-2819, never zero-filled), so
- * the `fees_usd: 0` fallback here is unreachable in practice and is kept only so
- * the type is total.
+ * `bookJournalIds` is the book's closes addressed the journal's way: this is
+ * deliberately the COMPLEMENT of what {@link selectJournalExportRows} serves.
+ * Every CLOSE either (a) has no book twin and is served directly by that function
+ * carrying its own restated money, or (b) has a book twin, is dropped there, and
+ * its money is carried over HERE. Exactly one path handles each close, so no
+ * restatement is double-counted and none is lost. Both functions partition on the
+ * same {@link groupJournalCloses} call, so the two cannot drift apart.
  */
 export function collectJournalMoneyRestatements(
   rows: readonly OptionTradeJournalRecord[],
-  bookIds: ReadonlySet<string>,
+  bookJournalIds: ReadonlySet<string>,
 ): Map<string, ExportMoneyRestatement> {
   const out = new Map<string, ExportMoneyRestatement>();
-  for (const r of rows) {
-    if (r.outcome === 'OPEN') continue;
-    if (!isFiniteNumber(r.closeTs)) continue;
-    if (!bookIds.has(r.id)) continue;
-    if (r.pnlBasis !== 'broker-fill') continue;
-    const mapped = rowFromJournalRecord(r);
-    out.set(r.id, {
-      gross_pnl_usd: mapped.gross_pnl_usd,
-      fees_usd: mapped.fees_usd,
-      net_pnl_usd: mapped.net_pnl_usd,
-      // The restatement re-derives `realizedR` in the same write that moves the
-      // money (`option-trade-journal.ts`), so R travels with it. Keeping the
-      // book's R would publish an R computed from the number just replaced.
-      pnl_r: mapped.pnl_r,
-      exit_price: mapped.exit_price,
-      entry_price: mapped.entry_price,
-    });
+  for (const group of groupJournalCloses(rows, bookJournalIds)) {
+    if (group.bookJournalId === null) continue;
+    const money = moneyRecordFor(group);
+    if (!money) continue;
+    out.set(group.bookJournalId, restatementFromRecord(money));
   }
   return out;
 }
 
 /**
- * The journal rows this book's export may serve: closed, and carrying a usable
- * exit timestamp.
+ * The journal rows this book's export may serve: closed, carrying a usable exit
+ * timestamp, and — since TRA-3930 — ONE PER CLOSE.
  *
  * ⚠️ Same precondition as {@link journalFloorForMode} — `rows` must ALREADY be
  * book-scoped by `journalRowsForBook`. The floor and the served rows are derived
  * from the identical input for that reason: a floor computed over a wider
  * population than the rows would publish coverage the export cannot honour.
  *
- * `excludeIds` is the in-memory book's id set. The journal is keyed on the
- * position id (`recordOptionTradeOpen({ id: position.id })`), so an id present in
- * both is the SAME trade, and exactly one of the two copies may be served or the
- * day double-counts. The BOOK copy is the one that survives — it carries the
- * exit premium, the exit reason and the strategy label.
+ * `bookJournalIds` is the in-memory book's closes addressed by
+ * {@link journalIdForPosition} — the id the journal is actually keyed on, NOT the
+ * bare `position.id`. An id present in both stores is the SAME trade, and exactly
+ * one of the two copies may be served or the day double-counts. The BOOK copy is
+ * the one that survives — it carries the exit premium, the exit reason and the
+ * strategy label — and it survives for the whole GROUP, not merely for the row it
+ * matched: a second journal record of an already-book-held close is still that
+ * close, and serving it is the same double under a different id.
  *
  * ⚠️ TRA-3875 — dropping the twin used to drop its MONEY with it, and that cost
  * the close basis: a restated journal figure (-156.23) was discarded in favour of
@@ -526,14 +664,25 @@ export function collectJournalMoneyRestatements(
  */
 export function selectJournalExportRows(
   rows: readonly OptionTradeJournalRecord[],
-  excludeIds: ReadonlySet<string>,
+  bookJournalIds: ReadonlySet<string>,
 ): ExportTradeRow[] {
   const out: ExportTradeRow[] = [];
-  for (const r of rows) {
-    if (r.outcome === 'OPEN') continue;
-    if (!isFiniteNumber(r.closeTs)) continue;
-    if (excludeIds.has(r.id)) continue;
-    out.push(rowFromJournalRecord(r));
+  for (const group of groupJournalCloses(rows, bookJournalIds)) {
+    // The book holds this close. Its row wins and this whole group is dropped;
+    // the money, if any of these records measured it, went to the restatement map.
+    if (group.bookJournalId !== null) continue;
+    // No book twin, so the journal is the only record of this close. Publish the
+    // best DESCRIPTIVE record of it, and overlay the measured money if a sibling
+    // record of the same close holds it and the chosen one does not.
+    let rep = group.rows[0]!;
+    for (const r of group.rows) {
+      if (descriptiveRank(r) > descriptiveRank(rep)) rep = r;
+    }
+    const money = moneyRecordFor(group);
+    const row = rowFromJournalRecord(rep);
+    out.push(
+      money && money !== rep ? applyMoneyRestatement(row, restatementFromRecord(money)) : row,
+    );
   }
   return out;
 }

@@ -1,4 +1,6 @@
 import type { Position, OptionPosition, AccountMode } from '@trading-app/shared';
+// TRA-3930 — the canonical book↔journal id join; see `option-trade-journal.ts`.
+import { journalIdForPosition } from './option-trade-journal.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TRA-564 (parent TRA-410 §2.3/§2.4, B1) — trade-history export serializer.
@@ -493,7 +495,15 @@ export function buildRows(input: ExportInput): ExportTradeRow[] {
   // this is the last point that still holds `o.id`; `ExportTradeRow` carries no
   // id, so the book↔journal join is unrecoverable one line later.
   for (const o of input.optionsClosed ?? []) {
-    rows.push(applyMoneyRestatement(rowFromOption(o), input.optionMoneyRestatements?.get(o.id)));
+    // TRA-3930 — joined on the id the JOURNAL knows this position by, which is
+    // the key `collectJournalMoneyRestatements` publishes under. `o.id` is the
+    // BOOK's id and the two differ on any reconcile-rebound import.
+    rows.push(
+      applyMoneyRestatement(
+        rowFromOption(o),
+        input.optionMoneyRestatements?.get(journalIdForPosition(o)),
+      ),
+    );
   }
   // TRA-3860 — durable-ledger rows last, so a book row and its journal twin can
   // never reorder relative to each other between two calls.

@@ -113,6 +113,9 @@ import {
   // import out of the learned-weights fold.
   findOpenOptionTradeJournalRecordsByOptionSymbol,
   TRADIER_IMPORT_STRUCTURE,
+  // TRA-3930 — the ONE spelling of the book↔journal id join, shared with the
+  // export reader that used to get it wrong.
+  journalIdForPosition,
   outcomeForR,
   type JournalTrend,
   type OptionTradeJournalOpen,
@@ -3524,9 +3527,15 @@ export class PaperOptionsAccount {
    * written to. Identity for everything except a reconcile-adopted import; see
    * {@link OptionPosition.journalId}, which is where the binding lives so it
    * survives a restart.
+   *
+   * TRA-3930 — delegates to the exported {@link journalIdForPosition} rather
+   * than re-spelling `?? position.id` here. There was a second, WRONG spelling
+   * of this join in `/api/trades/export` (a bare `position.id`), which
+   * double-counted every rebound close for as long as its book twin was alive.
+   * One definition is what keeps a reader and a writer on the same key.
    */
   private journalIdFor(position: OptionPosition): string {
-    return position.journalId ?? position.id;
+    return journalIdForPosition(position);
   }
 
   /**

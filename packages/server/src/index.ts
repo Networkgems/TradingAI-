@@ -108,6 +108,9 @@ import {
   getOptionTradeVoids,
   recordOptionTradeCloseBasis,
   getOptionTradeCloseBasisAmends,
+  // TRA-3930 — the ONE spelling of the book↔journal id join. The export used to
+  // carry a second, wrong one.
+  journalIdForPosition,
   type OptionTradeJournalRecord,
 } from './option-trade-journal.js';
 // TRA-2819 — the money-side sibling of the repair below. That one decides
@@ -9551,10 +9554,28 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
       return;
     }
 
-    // Journal rows are de-duped against the book by trade id (the journal is
-    // keyed on `position.id`), and the BOOK copy wins the ROW — it carries the
-    // exit premium, the exit reason and the strategy label.
-    const bookOptionIds = new Set(optionsClosed.map(o => o.id));
+    // Journal rows are de-duped against the book by trade id, and the BOOK copy
+    // wins the ROW — it carries the exit premium, the exit reason and the
+    // strategy label.
+    //
+    // ⚠️ TRA-3930 — through `journalIdForPosition`, NEVER a bare `o.id`. The
+    // comment that used to sit here asserted "the journal is keyed on
+    // `position.id`" and that premise is FALSE in production: a position the
+    // reconcile REBOUND onto a pre-existing OPEN row carries the journal's id in
+    // `journalId` (TRA-3078), and every journal WRITE has gone through that
+    // accessor since. Reading it back with `o.id` matched nothing for such a
+    // position, so its journal twin was served beside the book copy — same OCC,
+    // same exit millisecond, same money — and live bqb1 published **-130.00 for
+    // a -65.00 day** on 2026-08-21, with `win_rate` computed over the doubles
+    // too. 1 of the 2 live book closes that day had `journalId != id`. The bug
+    // was invisible for as long as it was because the double needs BOTH copies
+    // alive at once and the 21:00 ET archive (TRA-219) clears the book half
+    // nightly — every reading ever taken before that day was post-archive.
+    //
+    // The SAME set feeds both call sites below, deliberately: they partition the
+    // journal between them, and a partition computed from two different keys is
+    // not a partition.
+    const bookOptionIds = new Set(optionsClosed.map(o => journalIdForPosition(o)));
     const journalExportRows = selectJournalExportRows(bookJournalRows, bookOptionIds);
 
     // TRA-3875 — ...but it does NOT win the MONEY. TRA-3730's sweep restates the

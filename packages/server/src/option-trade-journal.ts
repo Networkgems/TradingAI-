@@ -78,6 +78,33 @@ export type JournalTrend = 'up' | 'down' | 'sideways' | 'unknown';
 export const TRADIER_IMPORT_STRUCTURE = 'tradier_import';
 
 /**
+ * TRA-3930 — THE id this journal knows a book position by. One definition, so a
+ * reader and a writer cannot address the same trade differently.
+ *
+ * Every journal write in `options-account.ts` (open, partial close, close) has
+ * gone through `OptionsAccount.journalIdFor` — i.e. through this expression —
+ * since TRA-3078, because `reconcileTradierPositions` mints a fresh `randomUUID`
+ * for a contract the local book lost track of while the journal still holds that
+ * contract's OPEN row under the OLD id, and `OptionPosition.journalId` is the
+ * durable rebinding. ABSENT ⇒ resolved to identity.
+ *
+ * `/api/trades/export` read the same binding back with a bare `position.id` and
+ * so missed every rebound position: on bqb1 2026-08-21, 1 of the 2 live book
+ * closes had `journalId != id` (`XLF260925C00057500`, book `4128b85b…` vs journal
+ * `be56369f…`), its journal twin was therefore never excluded, and the day
+ * published **-130.00 for a -65.00 day**. The premise was invisible because the
+ * duplicate needs the book copy and the journal copy alive at the same instant,
+ * and the 21:00 ET archive (TRA-219) clears the book half every night.
+ *
+ * Structural parameter rather than `OptionPosition`, so this module keeps no
+ * dependency on `@trading-app/shared` and the accessor is reusable by any reader
+ * holding the two fields.
+ */
+export function journalIdForPosition(position: { id: string; journalId?: string }): string {
+  return position.journalId ?? position.id;
+}
+
+/**
  * TRA-2937 — true for a journal row that records a position the firm did not
  * choose: a Tradier-imported contract adopted by `reconcileTradierPositions`.
  *

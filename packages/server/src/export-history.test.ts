@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import type { OptionPosition } from '@trading-app/shared';
 import { buildExport, toCsv, EXPORT_COLUMNS, type ExportFilters } from './export.js';
 import {
@@ -10,7 +13,10 @@ import {
   rowFromJournalRecord,
   selectJournalExportRows,
 } from './export-history.js';
-import type { OptionTradeJournalRecord } from './option-trade-journal.js';
+import {
+  journalIdForPosition,
+  type OptionTradeJournalRecord,
+} from './option-trade-journal.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TRA-3860 — `/api/trades/export` accepted a historical `from`/`to` range it
@@ -32,6 +38,8 @@ import type { OptionTradeJournalRecord } from './option-trade-journal.js';
 // deliberately pinned to the filed numbers so this suite keeps testing THIS
 // change instead of tracking someone else's restatements.
 // ─────────────────────────────────────────────────────────────────────────────
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /** The 2026-08-19T01:00:06.467Z archive tick from the incident log line. */
 const ARCHIVE_BOUNDARY = Date.parse('2026-08-19T01:00:06.467Z');
@@ -771,5 +779,349 @@ describe('TRA-3875 AC6 — the design §2.3 CSV header is byte-identical', () =>
     // The restated money DOES reach the CSV — it is a money column, not a new one.
     expect(csv).toContain('-156.23');
     expect(csv).not.toContain('-278');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-3930 — the export DOUBLE-COUNTED every live option close while its book
+// twin was still in memory: bqb1 published **-130.00 for a -65.00 day** on ET
+// 2026-08-21, `summary.count 4` for two real closes.
+//
+// The fixtures below are that day's closes exactly as the live reads held them
+// (build `4e10132`, pid 73, pinned before AND after every read): `/api/state →
+// options.closedOptions`, and `/api/health/option-journal?rows=all` filtered to
+// `closeEtDay: "2026-08-21"` and `mode: "live"`. BOTH causes are in the one
+// fixture because both were on the wire at once.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** ms-epoch exit stamps, identical across both stores on the wire. */
+const XLF_CLOSE_TS = Date.parse('2026-08-21T13:48:04.444Z');
+const BAC_CLOSE_TS = Date.parse('2026-08-21T17:05:10.473Z');
+
+/**
+ * The XLF close, whose book id and journal id DIFFER — the reconcile REBOUND it
+ * onto a pre-existing OPEN row (TRA-3078), so `journalId` is where the binding
+ * lives. The direct-id control on the live reader confirmed `4128b85b…` is not
+ * in the journal AT ALL, which is why the old key could never exclude anything
+ * for this position.
+ */
+const XLF_BOOK_ID = '4128b85b-b025-4455-8589-c40c5099d8a0';
+const XLF_JOURNAL_ID = 'be56369f-5f1d-4479-8000-9c679e4dab3e';
+/** The BAC close, resolved to identity — `journalId` absent on the wire. */
+const BAC_ID = '0e180e8c-fe75-49d9-a7f8-84267b610c22';
+/** The DUPLICATE record of that same BAC close: MINTed, not rebound. */
+const BAC_DUP_ID = '6bbc5d17-40da-4999-ab4e-f8920fe42adb';
+
+function book0821(): OptionPosition[] {
+  return [
+    {
+      id: XLF_BOOK_ID,
+      // ⚠️ The whole of Cause 1 is in this one field.
+      journalId: XLF_JOURNAL_ID,
+      symbol: 'XLF',
+      optionSymbol: 'XLF260925C00057500',
+      contracts: 2,
+      premiumPaid: 0.965,
+      currentPremium: 1.01,
+      openedAt: Date.parse('2026-08-21T13:23:02.482Z'),
+      closedAt: XLF_CLOSE_TS,
+      pnl: 9,
+      signalType: 'otm_mispricing',
+      exitReason: 'chandelier_spot_seeded',
+      mode: 'live',
+    } as unknown as OptionPosition,
+    {
+      id: BAC_ID,
+      symbol: 'BAC',
+      optionSymbol: 'BAC260925C00063000',
+      contracts: 1,
+      premiumPaid: 1.65,
+      currentPremium: 0.91,
+      openedAt: 1787232982482,
+      closedAt: BAC_CLOSE_TS,
+      pnl: -74,
+      signalType: 'otm_mispricing',
+      exitReason: 'chandelier_restarted',
+      mode: 'live',
+    } as unknown as OptionPosition,
+  ];
+}
+
+/**
+ * The three live journal rows for that ET day. XLF's twin, BAC's engine-authored
+ * twin, and BAC's TRA-3485 reconstruction — which is the SAME close as the row
+ * before it (`closeTs` identical to the millisecond, same OCC, same contracts,
+ * -73.99999999999999 vs -74), minted rather than rebound by
+ * `reconcileTradierPositions`. Their `openTs` differ by the observed 279 ms.
+ */
+const JOURNAL_0821: OptionTradeJournalRecord[] = [
+  journalRow({
+    id: XLF_JOURNAL_ID,
+    symbol: 'XLF',
+    optionSymbol: 'XLF260925C00057500',
+    structure: 'single_leg_otm',
+    outcome: 'SCRATCH',
+    openTs: Date.parse('2026-08-21T13:23:02.482Z'),
+    closeTs: XLF_CLOSE_TS,
+    atRiskUsd: 101,
+    entryMarkUsd: 1.01,
+    contracts: 1,
+    realizedPnlUsd: 9,
+    realizedR: 0.0891089108910891,
+    exitReason: 'chandelier_spot_seeded',
+  } as Partial<OptionTradeJournalRecord>),
+  journalRow({
+    id: BAC_ID,
+    symbol: 'BAC',
+    optionSymbol: 'BAC260925C00063000',
+    structure: 'single_leg_otm',
+    outcome: 'LOSS',
+    openTs: 1787232982482,
+    closeTs: BAC_CLOSE_TS,
+    atRiskUsd: 151,
+    contracts: 1,
+    realizedPnlUsd: -73.99999999999999,
+    realizedR: -0.49,
+    exitReason: 'chandelier_restarted',
+  } as Partial<OptionTradeJournalRecord>),
+  journalRow({
+    id: BAC_DUP_ID,
+    symbol: 'BAC',
+    optionSymbol: 'BAC260925C00063000',
+    structure: 'tradier_import',
+    outcome: 'LOSS',
+    // 279 ms after the real OPEN — the signature of a second mint.
+    openTs: 1787232982761,
+    closeTs: BAC_CLOSE_TS,
+    atRiskUsd: 141,
+    contracts: 1,
+    realizedPnlUsd: -74,
+    realizedR: -0.5248,
+    exitReason: 'reconstructed-TRA-3472',
+  } as Partial<OptionTradeJournalRecord>),
+];
+
+const DAY_0821: ExportFilters = {
+  markets: ['options'],
+  modes: ['live'],
+  ...day('2026-08-21'),
+};
+
+/**
+ * One export of ET 2026-08-21. `archived` is again the only variable: the 21:00
+ * ET tick is what emptied the book half, and it is why this defect survived —
+ * every reading ever taken before that day was post-archive, i.e. single-copy.
+ *
+ * ⚠️ The book id set is built the way `index.ts` builds it — through
+ * `journalIdForPosition`. A test that spelled it `o.id` here would encode the
+ * bug and go green against it.
+ */
+function exportAt0821({ archived }: { archived: boolean }) {
+  const optionsClosed = archived ? [] : book0821();
+  const bookIds = new Set(optionsClosed.map(o => journalIdForPosition(o)));
+  return buildExport(
+    {
+      optionsClosed,
+      preMappedRows: selectJournalExportRows(JOURNAL_0821, bookIds),
+      optionMoneyRestatements: collectJournalMoneyRestatements(JOURNAL_0821, bookIds),
+    },
+    DAY_0821,
+  );
+}
+
+describe('TRA-3930 AC1 — the published day is the day that happened', () => {
+  it('serves 2 rows and -65.00, not 4 rows and -130.00', () => {
+    const { rows, summary } = exportAt0821({ archived: false });
+
+    // The filed symptom, exactly: `count 4`, `net_pnl_usd -130`.
+    expect(summary.count).toBe(2);
+    expect(summary.totals.net_pnl_usd).toBe(-65);
+    expect(summary.totals.gross_pnl_usd).toBe(-65);
+
+    // No consumer joining on OCC can get two contradictory answers for one trade.
+    expect(rows.map(r => r.symbol).sort()).toEqual([
+      'BAC260925C00063000',
+      'XLF260925C00057500',
+    ]);
+    // `win_rate` read 0.5 both before and after, because the duplication was
+    // symmetric — one win doubled, one loss doubled. It is asserted for the
+    // DENOMINATOR, which was 4 and is now 2, not for the ratio.
+    expect(summary.win_rate).toBe(0.5);
+  });
+
+  it('does not move on the 21:00 ET archive clock', () => {
+    const before = exportAt0821({ archived: false });
+    const after = exportAt0821({ archived: true });
+    expect(before.summary.count).toBe(after.summary.count);
+    expect(before.summary.totals.net_pnl_usd).toBe(after.summary.totals.net_pnl_usd);
+    // Provenance DOES move, and honestly so: `sources.book: 2` is the pre-archive
+    // census, and 2026-08-21 was the first day that census was ever non-zero on
+    // bqb1 — which is the whole reason this was readable for exactly one day.
+    expect(before.summary.sources).toEqual({ book: 2, journal: 0 });
+    expect(after.summary.sources).toEqual({ book: 0, journal: 2 });
+  });
+});
+
+describe('TRA-3930 AC2 — Cause 1: the dedup key is the JOURNAL id, not the book id', () => {
+  it('excludes the twin of a REBOUND position, whose two ids differ', () => {
+    const bookIds = new Set(book0821().map(o => journalIdForPosition(o)));
+    expect(bookIds.has(XLF_JOURNAL_ID)).toBe(true);
+    expect(bookIds.has(XLF_BOOK_ID)).toBe(false);
+    expect(selectJournalExportRows(JOURNAL_0821, bookIds)).toEqual([]);
+  });
+
+  it('NEGATIVE CONTROL: the old book-id key still lets the rebound twin through', () => {
+    // Keyed the pre-fix way, with Cause 2 already repaired — so this isolates
+    // Cause 1 alone. Without this the suite would only pin the right answer and
+    // could not show the wrong one was reachable.
+    const wrongKey = new Set(book0821().map(o => o.id));
+    const served = selectJournalExportRows(JOURNAL_0821, wrongKey);
+    // 1 of the day's 2 book rows (50%) had `journalId != id`.
+    expect(served.map(r => r.symbol)).toEqual(['XLF260925C00057500']);
+    const { summary } = buildExport(
+      { optionsClosed: book0821(), preMappedRows: served },
+      DAY_0821,
+    );
+    expect(summary.count).toBe(3);
+    expect(summary.totals.net_pnl_usd).toBe(-56);
+  });
+
+  it('carries the restatement onto the book row under the JOURNAL id', () => {
+    // The latent MONEY half of the same key. A rebound position whose twin is
+    // `broker-fill` was BOTH unrestated AND published twice — which lands on
+    // TRA-3875's stated FAIL condition (`supersededRowCount: 0` beside a
+    // `pnl_basis: "book"` row whose twin is `broker-fill`) via a cause that has
+    // nothing to do with the restatement logic.
+    const restated = JOURNAL_0821.map(r =>
+      r.id === XLF_JOURNAL_ID
+        ? ({
+            ...r,
+            pnlBasis: 'broker-fill',
+            feesUsd: 0.7,
+            realizedPnlUsd: 8.3,
+            realizedR: 0.082,
+            entryFillPremium: 0.96,
+            exitFillPremium: 1.0,
+          } as OptionTradeJournalRecord)
+        : r,
+    );
+    const bookIds = new Set(book0821().map(o => journalIdForPosition(o)));
+    expect([...collectJournalMoneyRestatements(restated, bookIds).keys()]).toEqual([
+      XLF_JOURNAL_ID,
+    ]);
+
+    const { rows, summary } = buildExport(
+      {
+        optionsClosed: book0821(),
+        preMappedRows: selectJournalExportRows(restated, bookIds),
+        optionMoneyRestatements: collectJournalMoneyRestatements(restated, bookIds),
+      },
+      DAY_0821,
+    );
+    expect(summary.count).toBe(2);
+    expect(summary.supersededRowCount).toBe(1);
+    const xlf = rows.find(r => r.symbol === 'XLF260925C00057500')!;
+    expect(xlf.source).toBe('book');
+    expect(xlf.pnl_basis).toBe('broker-fill');
+    expect(xlf.net_pnl_usd).toBe(8.3);
+  });
+});
+
+describe('TRA-3930 AC3 — Cause 2: one close is one row, even with two journal records', () => {
+  it('drops the reconstruction whose close is book-held under a DIFFERENT id', () => {
+    // `6bbc5d17` has no book twin under ANY id, so no set of book ids — however
+    // it is keyed — can exclude it. It is dropped because its CLOSE is served.
+    const bookIds = new Set(book0821().map(o => journalIdForPosition(o)));
+    expect(bookIds.has(BAC_DUP_ID)).toBe(false);
+    expect(selectJournalExportRows(JOURNAL_0821, bookIds)).toHaveLength(0);
+  });
+
+  it('post-archive, publishes the ENGINE record of the close, not the repair one', () => {
+    // Both BAC records survive the book test once the book is empty. Exactly one
+    // is served, and it is the one that knows WHY the trade was exited:
+    // `reconstructed-TRA-3472` explicitly means the real exit was LOST (TRA-3485)
+    // and must not join `byExitReason` as if it had been observed.
+    const served = selectJournalExportRows(JOURNAL_0821, new Set());
+    expect(served).toHaveLength(2);
+    expect(served.filter(r => r.symbol === 'BAC260925C00063000')).toHaveLength(1);
+    expect(served.find(r => r.symbol === 'BAC260925C00063000')!.exit_reason).toBe(
+      'chandelier_restarted',
+    );
+  });
+
+  it('takes MEASURED money off a SIBLING record of the same close', () => {
+    // Once two records can describe one close, the record holding the exit
+    // DECISION and the record holding broker truth need not be the same row.
+    // Scoped to `mode|OCC|closeTs`, never across closes.
+    const withFill = JOURNAL_0821.map(r =>
+      r.id === BAC_DUP_ID
+        ? ({
+            ...r,
+            pnlBasis: 'broker-fill',
+            feesUsd: 0.34,
+            realizedPnlUsd: -70.5,
+            realizedR: -0.5,
+            exitFillPremium: 0.95,
+          } as OptionTradeJournalRecord)
+        : r,
+    );
+    const bac = selectJournalExportRows(withFill, new Set()).find(
+      r => r.symbol === 'BAC260925C00063000',
+    )!;
+    expect(bac.exit_reason).toBe('chandelier_restarted');
+    expect(bac.net_pnl_usd).toBe(-70.5);
+    expect(bac.pnl_basis).toBe('broker-fill');
+  });
+
+  it('never collapses two DIFFERENT closes of the same contract', () => {
+    // `closeTs` is the discriminator. A second exit of the same contract one
+    // second later is a second trade, and merging them would be this ticket's
+    // defect in the expensive direction — an UNDER-count.
+    const second = { ...JOURNAL_0821[1]!, id: 'later', closeTs: BAC_CLOSE_TS + 1000 };
+    const served = selectJournalExportRows([...JOURNAL_0821, second], new Set());
+    expect(served.filter(r => r.symbol === 'BAC260925C00063000')).toHaveLength(2);
+  });
+
+  it('never collapses across BOOKS: demo and live are separate closes', () => {
+    const demoTwin = { ...JOURNAL_0821[1]!, id: 'demo-1', mode: 'demo' } as OptionTradeJournalRecord;
+    const served = selectJournalExportRows([...JOURNAL_0821, demoTwin], new Set());
+    expect(served.filter(r => r.symbol === 'BAC260925C00063000')).toHaveLength(2);
+  });
+
+  it('leaves a row with NO optionSymbol ungrouped rather than guessing', () => {
+    // Pre-TRA-1656 rows carry no contract identity, so there is nothing to assert
+    // sameness ON. Collapsing them on `mode|closeTs` alone would merge two
+    // genuinely different contracts closed in the same batch.
+    const anon = (id: string) =>
+      ({ ...JOURNAL_0821[1]!, id, optionSymbol: undefined }) as OptionTradeJournalRecord;
+    expect(selectJournalExportRows([anon('a'), anon('b')], new Set())).toHaveLength(2);
+  });
+});
+
+describe('TRA-3930 AC4 — the ROUTE builds the key the fixed way', () => {
+  // Everything above grades the library. The defect was in the CALL SITE: the
+  // library was handed a set of the wrong ids. `export-request.integration.test`
+  // re-implements the route rather than importing `index.ts`, so there is no
+  // wire-level suite this can hang off — and a green library over a call site
+  // nobody graded is the TRA-2298/TRA-2320 shape exactly. This reads the source.
+  const src = readFileSync(join(__dirname, 'index.ts'), 'utf-8');
+
+  it('derives `bookOptionIds` through `journalIdForPosition`, never a bare `o.id`', () => {
+    expect(src).toContain('new Set(optionsClosed.map(o => journalIdForPosition(o)))');
+    // The exact pre-fix expression, which must not come back.
+    expect(src).not.toContain('new Set(optionsClosed.map(o => o.id))');
+  });
+
+  it('hands the SAME set to both call sites, so the two paths still partition', () => {
+    expect(src).toContain('selectJournalExportRows(bookJournalRows, bookOptionIds)');
+    expect(src).toContain('collectJournalMoneyRestatements(bookJournalRows, bookOptionIds)');
+  });
+
+  it('joins the restatement back onto the book row by the journal id', () => {
+    // The other half of the same key: `export.ts` looks the map up per position,
+    // and a lookup by `o.id` against a map keyed by journal id silently misses.
+    const exportSrc = readFileSync(join(__dirname, 'export.ts'), 'utf-8');
+    expect(exportSrc).toContain('optionMoneyRestatements?.get(journalIdForPosition(o))');
+    expect(exportSrc).not.toContain('optionMoneyRestatements?.get(o.id)');
   });
 });
