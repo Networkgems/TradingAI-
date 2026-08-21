@@ -15574,6 +15574,7 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
     getTradierBarPullRateState,
     getTradierQuotaBudgetState,
     getFeedDegradationState,
+    getUnservableSymbolsState,
   } = await import('./yahoo-feed.js');
   const {
     testCoinMarketCap,
@@ -15743,6 +15744,18 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
     // TRA-1940 — degraded-feed detail: which provider, why, quota/breaker expiry,
     // and the per-tick secondary-fetch wall-time budget currently enforced.
     feedDegradation: getFeedDegradationState(),
+    // TRA-3804 — the un-servable skip list. ⚠ ALWAYS PRESENT, and deliberately
+    // NOT wrapped in the `try { … } catch { { error } }` idiom used for the
+    // provider probes above: this is a pure in-memory census with no network
+    // leg, so an `{ error }` here would mean a programming fault, not a degraded
+    // provider, and swallowing it would leave the counter reading zero.
+    //
+    // ⚠ READ `evaluations` BEFORE `skippedCount`. `skippedCount: 0` on a healthy
+    // box (nothing is dead) and `skippedCount: 0` because the gate never ran are
+    // the SAME vector apart from `evaluations`. And read the block for
+    // PRESENCE — a deploy predating TRA-3804 omits it entirely, which `?? 0`
+    // would render as a clean "nothing skipped".
+    unservableSymbols: getUnservableSymbolsState(),
     bootEnv,
     results,
     ts: new Date().toISOString(),

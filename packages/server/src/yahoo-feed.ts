@@ -3,6 +3,14 @@ import { TradierStocksClient, type TradierEnv, type TradierEquityQuote } from '@
 import type { Candle, NewsItem, CorporateAction } from '@trading-app/shared';
 import { corporateActionInSessionWindow, normalizeQuoteCurrency } from '@trading-app/shared';
 import { fetchStooqQuote } from './stooq-feed.js';
+// TRA-3804 — the re-checkable un-servable skip list. See that module's header
+// for why a mark needs the WHOLE cascade to have failed, not just the primary.
+import {
+  recordUnservableAttempt,
+  recordServableSymbol,
+  shouldSkipUnservable,
+  getUnservableSymbolState,
+} from './unservable-symbols.js';
 
 /**
  * TRA-3390 — the currency of the venue the Tradier equity adapter queries. See
@@ -2398,6 +2406,23 @@ export async function fetchYahooChartQuote(symbol: string): Promise<QuoteResult 
  * Yahoo path is unreachable.
  */
 export async function fetchQuote(symbol: string): Promise<QuoteResult | null> {
+  // TRA-3804 — a symbol that no source served on its last N consecutive full
+  // cascades gets skipped until its TTL lapses. Returning null here is exactly
+  // what the full cascade returns for such a symbol today, ~3s of retry-ladder
+  // sleep later; the observable result for every caller is unchanged. Never
+  // reached for an active-interest symbol (open position / recent signal).
+  if (shouldSkipUnservable(symbol, isActiveInterest(symbol))) return null;
+  const quote = await fetchQuoteCascade(symbol);
+  // One good print retires a mark, whatever the history says. This is the only
+  // recovery path an active-interest symbol has (the gate above never skips it,
+  // so it keeps being fetched while marked).
+  if (quote) recordServableSymbol(symbol);
+  return quote;
+}
+
+/** The ordered failover itself. Split out of {@link fetchQuote} so the skip gate
+ *  and the recovery record each have exactly one site. */
+async function fetchQuoteCascade(symbol: string): Promise<QuoteResult | null> {
   // Primary: Tradier. (Single-symbol path — `fetchQuotes` uses the multi-symbol
   // endpoint to save round-trips for the watchlist refresh.)
   if (tradierStocksClient && !isTradierQuoteBlocked()) {
@@ -2472,10 +2497,31 @@ export async function fetchQuotes(
   // scanner's spot fetch) reuse a slightly older quote rather than burning a
   // fresh Tradier request; it defaults to the short live-quote TTL.
   const ttlMs = Math.max(0, opts?.maxStaleMs ?? QUOTE_CACHE_TTL_MS);
-  const { fresh, stale } = partitionCachedQuotes({ symbols, cache: quoteCache, ttlMs, now });
+  const { fresh, stale: staleAll } = partitionCachedQuotes({ symbols, cache: quoteCache, ttlMs, now });
   for (const [sym, q] of fresh) results.set(sym, q);
+  // TRA-3804 — drop symbols the whole cascade has repeatedly failed to price.
+  // Applied HERE, above the Tradier batch, so a skipped symbol costs neither a
+  // slot in `symbols=` nor a secondary fan-out (the 3s retry ladder + Stooq 404
+  // this ticket is about). They are simply absent from `results`, which is
+  // byte-identical to what the full cascade returns for them today.
+  //
+  // `isActiveInterest` is the OPEN-POSITION GUARD, and it is structural rather
+  // than a one-time audit: `signal-engine.doTick` asserts that set every tick
+  // from `account.getState().openPositions` (+ recent signals), so a symbol a
+  // position depends on can never be skipped. The set's 2-minute decay TTL
+  // comfortably covers the ~30s tick, and a mark needs at least two prior ticks
+  // to exist at all — so there is no boot window in which a mark is live but
+  // the guard has not yet been asserted.
+  const stale = staleAll.filter(s => !shouldSkipUnservable(s, isActiveInterest(s)));
   if (stale.length === 0) return results;
   const staleSet = new Set(stale);
+
+  // TRA-3804 — filled by the Tradier batch below when (and only when) THIS call
+  // is the one that fires it. `primaryAnswered` stays false on the singleflight
+  // await branch, on a breaker skip, and on a thrown batch — in all three cases
+  // this call has no primary verdict of its own and therefore records nothing.
+  let primaryUnmatched: ReadonlySet<string> = new Set<string>();
+  let primaryAnswered = false;
 
   // Primary: one Tradier call for the stale remainder (cache hits already served).
   // TRA-739 singleflight: coalesce concurrent callers that all find the same stale
@@ -2498,7 +2544,13 @@ export async function fetchQuotes(
       // subset) so concurrent waiters find their symbols fresh after this batch.
       const toFetch = new Set<string>(stale);
       for (const [sym, entry] of quoteCache) {
-        if (now - entry.storedAt > ttlMs) toFetch.add(sym);
+        if (now - entry.storedAt <= ttlMs) continue;
+        // TRA-3804 — this sweep reaches past THIS caller's `stale` set, so it has
+        // to pass the same gate or a skipped symbol comes straight back in
+        // through the cache. `toFetch.has` keeps the gate from being consulted
+        // twice for symbols `stale` already cleared.
+        if (toFetch.has(sym) || shouldSkipUnservable(sym, isActiveInterest(sym))) continue;
+        toFetch.add(sym);
       }
       const toFetchArr = [...toFetch];
       const quoteFetch = (async () => {
@@ -2508,10 +2560,17 @@ export async function fetchQuotes(
           const { quotes: tradier, unmatchedSymbols } = await tradierStocksClient!.getQuotesDetailed(toFetchArr);
           const unmatchedLine = recordTradierUnmatched(unmatchedSymbols, toFetchArr.length);
           if (unmatchedLine) console.warn(unmatchedLine);
+          // TRA-3804 — the primary's own verdict, kept for the fan-out below.
+          // On its own it is NOT grounds to skip a symbol: ~24 foreign tickers
+          // are unmatched here on every tick and are priced fine by Yahoo. It is
+          // the necessary half of the mark predicate, never the sufficient half.
+          primaryUnmatched = new Set(unmatchedSymbols);
+          primaryAnswered = true;
           const storedAt = Date.now();
           for (const [sym, q] of tradier) {
             const quote = tradierQuoteToResult(q);
             quoteCache.set(sym, { quote, storedAt });
+            recordServableSymbol(sym);
             if (staleSet.has(sym)) results.set(sym, quote);
           }
         } catch (err: unknown) {
@@ -2599,9 +2658,25 @@ export async function fetchQuotes(
     }
     const slice = remaining.slice(i, i + QUOTE_BATCH);
     const settled = await Promise.all(slice.map(sym => fetchSecondaryQuote(sym).then(q => [sym, q] as const)));
+    // TRA-3804 — read the breaker ONCE, after the slice settled. A trip part-way
+    // through this slice makes every later `null` in it a breaker artefact
+    // rather than a delisting, and a breaker artefact must never earn a strike:
+    // that is the direction that un-prices a live symbol during an outage.
+    const secondaryDefinitive = !isRateLimited();
     for (const [sym, q] of settled) {
-      if (q) results.set(sym, q);
-      else failures++;
+      if (q) {
+        results.set(sym, q);
+        recordServableSymbol(sym);
+        continue;
+      }
+      failures++;
+      // A strike needs BOTH halves: the primary named this symbol un-servable in
+      // this same call, AND the whole secondary chain (yahoo quote → yahoo chart
+      // → stooq) ran to completion and produced nothing. Anything less is an
+      // outage, a budget truncation, or a primary that simply wasn't consulted.
+      if (secondaryDefinitive && primaryAnswered && primaryUnmatched.has(sym)) {
+        recordUnservableAttempt(sym);
+      }
     }
     if (i + QUOTE_BATCH < remaining.length) await sleep(FANOUT_SLEEP_MS);
   }
@@ -2908,6 +2983,20 @@ export function isYahooBreakerOpen(): boolean {
 }
 
 /**
+ * Test seam — close the Yahoo rate-limit breaker.
+ *
+ * TRA-3804: a 429 raised inside a unit test trips the breaker for the
+ * BOOT-WINDOW cooldown (10 minutes of real time, because `process.uptime()` in a
+ * test run is always inside `BOOT_WINDOW_MS`). That is process-global state with
+ * no natural expiry inside a suite, so one test exercising the breaker silently
+ * short-circuits every later test in the same file — which is order-dependence
+ * that reads as a passing suite.
+ */
+export function __resetYahooBreakerForTests(): void {
+  rateLimitedUntil = 0;
+}
+
+/**
  * Trip the shared Yahoo rate-limit breaker from another module (e.g. the
  * crypto feed). Yahoo's 429 is per-IP, so a 429 on crypto quotes means the
  * stocks branch is also about to get rate-limited; tripping the shared
@@ -2967,6 +3056,21 @@ export function getFeedDegradationState(): {
     },
     fanoutBudgetMs: FEED_FANOUT_BUDGET_MS,
   };
+}
+
+/**
+ * TRA-3804 — the un-servable skip-list census for `/api/health/quotes`.
+ *
+ * ⚠ Read `evaluations` BEFORE `skippedCount`. A deploy where the gate never ran
+ * and a healthy box with nothing dead both report `skippedCount: 0`; only
+ * `evaluations` separates them. And the block must be read for **presence** —
+ * `?? 0` on a deploy that predates this change manufactures a green.
+ *
+ * Re-exported from `unservable-symbols.ts` so the health route keeps importing
+ * one feed module rather than reaching past it.
+ */
+export function getUnservableSymbolsState(): ReturnType<typeof getUnservableSymbolState> {
+  return getUnservableSymbolState();
 }
 
 // ── Boot env-token seed (TRA-574) ─────────────────────────────────────────────
