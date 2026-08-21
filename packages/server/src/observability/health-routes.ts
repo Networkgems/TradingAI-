@@ -36,6 +36,10 @@ import {
   isOptionPhaseBEnabled,
   OPTION_SHADOW_EMERGENCY_OFF,
 } from '../option-shadow-ledger.js';
+// TRA-3926 — the detector for the condition that has ALREADY fired on real
+// money: an engine `sell_to_close` for more contracts than the engine's own
+// opens covered. Independent of the exit-path bound by design.
+import { detectOversoldEngineCloses } from '../tra3926-oversold-close-detector.js';
 import {
   isOptionExecEnabled,
   isOptionEmaPullbackEnabled,
@@ -4654,6 +4658,32 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // TRA-2850 — `stalled: true` is the NON-GREEN state: repeated no-match with
       // nothing ever written; do not read `lastError: null` as health.
       autoReconcile: getLiveOptionsFeeReconcileState(),
+      // TRA-3926 (AC5) — DID THE ENGINE SELL MORE THAN IT BOUGHT?
+      //
+      // It did, once, on real money: 2026-08-21T13:48:04Z, order 142806015,
+      // `XLF260925C00057500` sold 2 having bought 1. Nothing alarmed. The only
+      // trace was `autoReconcile.lastGainLossRejections` carrying a `no-lot`
+      // entry, which reads as a data-freshness complaint about the P&L
+      // reconciler rather than as the engine disposing of the desk's contract.
+      //
+      // ⭐ The PRESENCE of this key is the deployed-bytes proof the detector
+      // shipped (assert with `hasOwnProperty`; a build without the module lacks
+      // the key entirely). Read `status` FIRST and read all three values:
+      //   • `oversold` — findings[]. THE ALARM. Each names its OCC, order id and
+      //     `excessContracts`, and `importedOpenContracts` says where the excess
+      //     came from.
+      //   • `clean`    — judged at least one engine close and every one was
+      //     covered by our own opens.
+      //   • `vacuous`  — NOTHING was judgeable (`judgedCloses: 0`). NOT a pass.
+      //     A detector whose denominator is empty has proved nothing, and on a
+      //     30-day-retention ledger this is what an old event decays into.
+      // `blindCloses` is the third value kept out of both verdicts: a close
+      // whose opens aged out looks identical to a close of contracts we never
+      // bought, and folding it either way would be a guess.
+      //
+      // Counts + OCC symbols only — no user identifiers (TRA-2163); the symbols
+      // are already published on `records[]` immediately below.
+      oversoldCloses: detectOversoldEngineCloses(summary.records),
       note: summary.durability.ephemeral
         ? `NOT DURABLE — DATA_DIR is ephemeral (${summary.durability.dataDir ?? 'memory-only'}); these ${summary.n} fill(s) die at the next reboot and the calibration is not captured. Fix = DATA_DIR=/data on bqb1 (TRA-1719). Read durability.ephemeral before trusting any count.`
         : `DURABLE: ${summary.n} fill(s) on ${summary.durability.dataDir}. fees auto-back-fill on the boot kick + ET hourly tick (TRA-2810/TRA-2850; ${summary.feesMeasured}/${summary.n} measured — see autoReconcile.unmeasured* for the pending/awaiting-close/aged split, and autoReconcile.stalled for the non-green state): real production fees derive from settled /gainloss cost/proceeds (history commission is 0 on every production row and only joins when positive). TRA-2959: slippage.nMeasured states its denominator (${summary.slippage.nMeasured}/${summary.slippage.nTotal}; ${summary.slippage.excludedNoAskQuote} excluded by name: no submit-time ask — market/emergency exits + history imports), and autoReconcile.coverage cross-checks the ledger against broker account-history — missingContracts > 0 means fills NO code path recorded (the 2026-08-04 silence appendErrors cannot see); the same pass imports them as origin:'history_import' rows.`,

@@ -431,6 +431,231 @@ export function splitEngineExposureContracts(
 }
 
 // --------------------------------------------------------------------------
+// TRA-3926 — THE SAME SPLIT, ON THE WRITE PATH.
+//
+// ⚠ THIS FIRED ON REAL MONEY. 2026-08-21T13:48:04Z, production account ***0154:
+//
+//     08-20 13:35:30Z  buy_to_open   ct=1  @1.08  origin=fill            oid=142603071
+//     08-20 17:00:00Z  buy_to_open   ct=1  @0.85  origin=history_import  oid=null
+//     08-21 13:48:04Z  sell_to_close ct=2  @1.01  origin=fill            oid=142806015
+//
+// One engine buy, one DESK buy, and a TWO-contract engine sell. The close
+// carries `origin: 'fill'` and a broker order id, so this engine submitted it,
+// and `LIVE_OPTION_TEST_MAX_CONTRACTS` is 1 — no engine entry can open a 2-lot
+// and there is no second XLF `buy_to_open` order id anywhere in our tape. The
+// pre-TRA-3896 reconcile had widened the engine's row onto the broker's whole
+// lot of 2, and the exit path took its quantity from `contracts`.
+//
+// ⛔ WHY TRA-3913 DID NOT PREVENT IT, HAVING SHIPPED THE ORACLE THAT WOULD HAVE.
+// {@link splitEngineExposureContracts} had exactly ONE caller —
+// `foldOpenPremiumAtRisk`, a READER. The exit path asked
+// {@link engineMayActOnAdoptedRow}, a WHOLE-ROW boolean that returns `true` for
+// `adoptionAuthority: 'engine_origin'` (correctly — we opened that row and must
+// be able to exit it), and then took the QUANTITY from the row. **A row is a
+// reader's claim about exposure AND a writer's order ticket at the same time,
+// and only the reader was fixed.** The comment at `options-account.ts` naming
+// `armed` as "still the parameter the exit path resolves" was written by the
+// same commit and is what makes this a scoping miss rather than a surprise.
+//
+// ⛔ AUTHORIZATION IS NOT QUANTITY. Deploying TRA-3829's ruling B
+// (`a5ab3887`, per-row hand-over) would NOT have stopped this close: ruling B
+// gates rows the engine may not ACT on, and an `engine_origin` row is one the
+// engine genuinely may act on. The authorization question was right here. The
+// QUANTITY was wrong, and it needs a different remedy — this one.
+// --------------------------------------------------------------------------
+
+/** Why {@link boundExitContractsToEngineShare} allowed / refused what it did. */
+export interface EngineExitQuantityBound {
+  /**
+   * Contracts the exit path may submit: `min(requested, engineContracts)`.
+   * **This is the only number that may reach `sellContracts…`.**
+   */
+  exitContracts: number;
+  /**
+   * Requested minus allowed — contracts on the row this engine must NOT sell.
+   * `> 0` is a REFUSAL and must be surfaced, never silently dropped: the
+   * position is still open at the broker and somebody has to close it.
+   */
+  refusedContracts: number;
+  /** What the row asked to exit before the bound. */
+  requestedContracts: number;
+  /**
+   * {@link splitEngineExposureContracts}'s verdict on the row, or the
+   * `handed_over` sentinel when a human's per-row grant lifted the bound before
+   * the split was consulted.
+   */
+  reason: EngineExposureReason | 'handed_over';
+  /**
+   * True iff the oracle COULD NOT ANSWER for this row, rather than answering
+   * and finding the contracts are not ours. Same discipline as
+   * {@link EngineExposureSplit.oracleRefused} — a refusal and a finding must not
+   * share a column, and the remedies differ: a finding wants the desk to close
+   * its own contract, a refusal wants somebody to look at the ledger.
+   */
+  oracleRefused: boolean;
+  /**
+   * True iff the bound DECLINED TO BIND because the oracle could not make a
+   * complete positive statement about this row. The exit goes out UNBOUNDED —
+   * i.e. at the pre-fix quantity — and this flag is the countable residual.
+   *
+   * ⚠ This is a deliberate, measured fail-open and it is the smaller of two
+   * real-money hazards. See the rule note on
+   * {@link boundExitContractsToEngineShare}.
+   */
+  blind: boolean;
+  /** True iff the bound actually reduced the quantity. The countable event. */
+  bounded: boolean;
+}
+
+/**
+ * TRA-3926 — bound an exit's `sell_to_close` quantity by the contracts THIS
+ * engine's own fill records account for.
+ *
+ * The rule, in one line: **the engine may sell only what it can prove it
+ * bought.**
+ *
+ * Total over the input space, and byte-for-byte a no-op on the rows that carry
+ * the entire demo book plus every engine-opened live row: rules 1 and 2 of
+ * {@link splitEngineExposureContracts} return the whole remainder as ENGINE for
+ * `importedFromTradier !== true` and for sandbox imports, so
+ * `min(requested, remaining) === requested` for every caller that was already
+ * honouring `contractsRemaining`. The bound can only ever bite on a LIVE
+ * IMPORTED row — which is exactly the population the reconcile can widen.
+ *
+ * ── ⛔ THE RULE FOR ORACLE SILENCE, AND WHY IT IS NOT "REFUSE EVERYTHING" ────
+ *
+ * TRA-3926 AC2 asked for the strict form: a row the oracle cannot answer for
+ * exits at most what the ledger POSITIVELY accounts for — which is 0 — with the
+ * residual refused. Written that way, **it turns TRA-2820 back on**, and the
+ * repository already carries the control that proves it: `TRA-3829 — an
+ * ENGINE-OPENED row re-adopted after a lost local row keeps its stops`. That
+ * fixture is a row the app really did place, whose local row was lost to a
+ * reboot; the fill ledger holds nothing for it, and the strict rule leaves it
+ * open at the broker under a breached stop with no exit at all. That is not a
+ * hypothetical — it is TRA-2820, measured: 8 live contracts, $216 of real
+ * premium, unstopped for a session, and filed as working-as-intended.
+ *
+ * Two real-money hazards, opposite directions, and the choice has to be made
+ * per BRANCH rather than per ticket:
+ *
+ *  • the ledger holds a COMPLETE, POSITIVE account of this OCC's current
+ *    episode and it accounts for FEWER contracts than the row holds
+ *    (`engine_partial`) ⇒ **BIND**. The ledger is working and it contradicts
+ *    the row. This is the 2026-08-21 state exactly, and binding here is
+ *    unambiguous: we know what we bought, we know what the row says, and the
+ *    difference is somebody else's.
+ *  • the oracle REFUSED — no rows for the OCC, an unpriceable engine fill, or
+ *    an episode of nothing but imports ⇒ **BLIND**. The instrument is dark for
+ *    this row, and a dark instrument cannot support a refusal any more than it
+ *    can support a permission (`recordedOpenFillCount`'s whole reason for
+ *    existing: *a discriminator that cannot tell "no" from "I do not know" is
+ *    not a discriminator*). The exit goes out unbounded — the pre-fix
+ *    behaviour — and `blind` is set so the residual is COUNTED rather than
+ *    quietly inherited.
+ *
+ * ⚠ SAY WHAT THAT LEAVES OPEN. The blind branch is a fail-open, deliberately.
+ * The fix shrinks the population that can over-sell from *every imported row*
+ * to *rows the ledger cannot speak about*, and makes that remainder visible;
+ * it does not reduce it to zero, and a report that claimed otherwise would be
+ * wrong. Closing the blind branch needs a durable per-row order-id provenance
+ * the ledger's 30-day retention does not currently provide — a different
+ * ticket, with a different remedy.
+ *
+ * **Never silently sold and never silently abandoned** is one requirement, and
+ * it is met branch by branch: `refusedContracts` for what we would not sell,
+ * `blind` for what we could not judge. Neither is allowed to be zero-cost.
+ *
+ * ⛔ ONE CARVE-OUT, AND IT IS THE BOARD'S: AN EXPLICIT PER-ROW HAND-OVER.
+ * TRA-3829 ruling B (card `331ddc56`) is that a human may hand a specific
+ * broker row to the engine, after which the engine manages it FULLY — which
+ * necessarily includes selling contracts the engine never bought, because that
+ * is the entire content of the grant. A grant that left the engine unable to
+ * exit what it was granted would be option (a) wearing ruling B's name, and it
+ * is a shipped, ratified behaviour with its own control (`TRA-3829 ARM A`).
+ *
+ * So the bound asks the split ONLY where nobody has answered the transaction
+ * question by hand. Note what this does NOT unlock: `engine_origin` rows never
+ * needed a hand-over to be actionable, so a desk contract the reconcile widened
+ * onto one has been granted by NOBODY — and that is precisely the row the
+ * 2026-08-21 close sold from. **AUTHORIZATION AND QUANTITY ARE STILL TWO
+ * QUESTIONS; this is the one place the first one legitimately answers the
+ * second, because a human answered it about THIS row on purpose.**
+ *
+ * @param requestedContracts what the exit rule wants to sell (a full exit's
+ *   `contractsRemaining`, or a TP1 partial's slice — the bound does not care
+ *   which, it only ever lowers).
+ * @param remainingContracts the row's open quantity, i.e. the denominator the
+ *   split attributes. Passed separately from `requestedContracts` because a TP1
+ *   partial asks for less than the row holds and the SPLIT must still see the
+ *   whole row: attributing against the slice would let a sequence of partials
+ *   each re-claim the same engine contracts.
+ * @param armed the deployment-wide `ENABLE_ENGINE_ACT_ON_ADOPTED_BROKER_OPTIONS`
+ *   master arm — the FIRST of ruling B's two keys. Read here for the hand-over
+ *   carve-out ONLY. ⛔ It is still not consulted for the split itself: whether
+ *   the engine may exit the desk's position has no bearing on who bought it
+ *   (TRA-3913), and this parameter must never widen `engineContracts`.
+ */
+export function boundExitContractsToEngineShare(
+  row: {
+    importedFromTradier?: boolean;
+    adoptionAuthority?: string;
+    tradierEnv?: string;
+    engineHandover?: { grantedAt?: unknown; grantedBy?: unknown } | null;
+  },
+  requestedContracts: number,
+  remainingContracts: number,
+  lookupRecordedOpenBasis: () => EngineRecordedOpenEvidence | null,
+  armed: boolean,
+): EngineExitQuantityBound {
+  const requested =
+    Number.isFinite(requestedContracts) && requestedContracts > 0 ? Math.floor(requestedContracts) : 0;
+  if (row.importedFromTradier === true && armed && hasEngineHandover(row)) {
+    // Both of ruling B's keys are present on THIS row. The oracle is not
+    // consulted at all — deliberately, so a hand-over cannot be silently
+    // narrowed by the state of a ledger the human never looked at.
+    return {
+      exitContracts: requested,
+      refusedContracts: 0,
+      requestedContracts: requested,
+      reason: 'handed_over',
+      oracleRefused: false,
+      blind: false,
+      bounded: false,
+    };
+  }
+  const split = splitEngineExposureContracts(row, remainingContracts, lookupRecordedOpenBasis);
+  if (split.oracleRefused) {
+    // BLIND. See the rule note above: binding on a dark instrument is how the
+    // strict reading of AC2 re-creates TRA-2820. The exit goes out at the
+    // quantity the rule asked for and the caller COUNTS this.
+    return {
+      exitContracts: requested,
+      refusedContracts: 0,
+      requestedContracts: requested,
+      reason: split.reason,
+      oracleRefused: true,
+      blind: true,
+      bounded: false,
+    };
+  }
+  // `Math.min` against a floored, positive-checked `requested` — a NaN request
+  // has already been coerced to 0 above rather than propagated into the
+  // comparison (TRA-3486: `NaN` reads as a number until something compares it,
+  // and `Math.min(NaN, 1)` is `NaN`, which would reach the broker as a quantity).
+  const exitContracts = Math.min(requested, split.engineContracts);
+  const refusedContracts = requested - exitContracts;
+  return {
+    exitContracts,
+    refusedContracts,
+    requestedContracts: requested,
+    reason: split.reason,
+    oracleRefused: false,
+    blind: false,
+    bounded: refusedContracts > 0,
+  };
+}
+
+// --------------------------------------------------------------------------
 // TRA-1114 — demo-only deterministic directional call/put entry.
 //
 // Board escalation (3rd time: TRA-1021 → TRA-1113). The board keeps reporting

@@ -8441,6 +8441,51 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-3926 — the exit-quantity bound's census, folded over both broker envs.
+   *
+   * Read `checked` WITH `bounded`. A branch that never runs and a branch that
+   * runs and finds every contract accounted for both publish `bounded: 0`, and
+   * only the denominator separates them (same discipline as
+   * `getImportedAbsorptionCensus`, one level down).
+   *
+   * `refusedContracts > 0` is the line that needs a HUMAN: those contracts are
+   * open at the broker and the engine has declined to sell them, deliberately.
+   * `suppressedExits` counts the stages that produced NO order at all.
+   *
+   * ⚠ `blindRows` IS THE RESIDUAL FAIL-OPEN, not a health number: staging sites
+   * where the fill ledger could not answer, so the exit went out at the ROW's
+   * quantity exactly as it did before this fix. Binding there instead is how
+   * the strict reading of AC2 re-creates TRA-2820 — see
+   * `boundExitContractsToEngineShare`. Read it as COVERAGE against `checked`.
+   */
+  getExitQuantityBoundCensus(): {
+    checked: number;
+    bounded: number;
+    refusedContracts: number;
+    blindRows: number;
+    suppressedExits: number;
+    lastRefusalAt: number | null;
+  } {
+    let checked = 0;
+    let bounded = 0;
+    let refusedContracts = 0;
+    let blindRows = 0;
+    let suppressedExits = 0;
+    let lastRefusalAt: number | null = null;
+    for (const env of ['sandbox', 'production'] as const) {
+      const c = this.optionsAccounts[env].getExitQuantityBoundCensus();
+      checked += c.checked;
+      bounded += c.bounded;
+      refusedContracts += c.refusedContracts;
+      blindRows += c.blindRows;
+      suppressedExits += c.suppressedExits;
+      const at = c.last?.at ?? null;
+      if (at !== null && (lastRefusalAt === null || at > lastRefusalAt)) lastRefusalAt = at;
+    }
+    return { checked, bounded, refusedContracts, blindRows, suppressedExits, lastRefusalAt };
+  }
+
+  /**
    * TRA-2984 — page on a `sell_to_close` that expired unfilled.
    *
    * This is the "first-class alert" half of the issue. The reason it needs one

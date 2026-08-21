@@ -11207,6 +11207,61 @@ app.get('/api/health/options-live', async (_req, res) => {
       liveExitErrors: summarizeLiveExitErrors(
         getAllUserContexts().flatMap(c => c.engine.getState().options.openOptions ?? []),
       ),
+      // TRA-3926 — the EXIT-QUANTITY bound. On 2026-08-21T13:48:04Z the engine
+      // submitted a `sell_to_close` for 2 contracts of XLF260925C00057500 having
+      // bought 1: the pre-TRA-3896 reconcile had widened the row onto the
+      // broker's whole lot and the exit sized off the row's `contracts`. The
+      // staged quantity is now bounded by what this engine's own fill records
+      // account for.
+      //
+      // Read `checked` WITH `bounded`, always. `bounded: 0 / checked: 0` means
+      // no imported row has reached a staging site (the normal state, and the
+      // permanent one on a demo-only box); `bounded: 0 / checked > 0` means the
+      // bound ran and every contract was ours. A build without the bound at all
+      // publishes the first shape, so the pair is the deployed-bytes proof as
+      // well as the measurement.
+      //
+      // `refusedContracts > 0` NEEDS A HUMAN: those contracts are open at the
+      // broker and the engine is deliberately declining to sell them. Refused,
+      // not abandoned — the row carries `exitQuantityRefusal` on the
+      // authenticated `/api/state`, a fully-suppressed stage also sets
+      // `exitErrorReason` (so it is counted in `liveExitErrors` above), and the
+      // reason text is in the process log under
+      // `component: 'live-exit-quantity-bound'`.
+      //
+      // ⚠ `blindRows` IS THE RESIDUAL FAIL-OPEN, NOT A HEALTH NUMBER. Those are
+      // staging sites where the fill ledger could not answer for the row, so the
+      // exit went out at the ROW's quantity — exactly as it did before this fix.
+      // Binding there instead would leave a real-money position under a breached
+      // stop with no exit at all, which is TRA-2820 (8 live contracts, $216, one
+      // session). Read `blindRows` against `checked` as COVERAGE: the fix shrank
+      // the population that can over-sell from every imported row to the rows the
+      // ledger cannot speak about, and this is what is left.
+      exitQuantityBound: getAllUserContexts().reduce(
+        (acc, c) => {
+          const s = c.engine.getExitQuantityBoundCensus();
+          return {
+            checked: acc.checked + s.checked,
+            bounded: acc.bounded + s.bounded,
+            refusedContracts: acc.refusedContracts + s.refusedContracts,
+            blindRows: acc.blindRows + s.blindRows,
+            suppressedExits: acc.suppressedExits + s.suppressedExits,
+            lastRefusalAt:
+              s.lastRefusalAt !== null
+              && (acc.lastRefusalAt === null || s.lastRefusalAt > acc.lastRefusalAt)
+                ? s.lastRefusalAt
+                : acc.lastRefusalAt,
+          };
+        },
+        {
+          checked: 0,
+          bounded: 0,
+          refusedContracts: 0,
+          blindRows: 0,
+          suppressedExits: 0,
+          lastRefusalAt: null as number | null,
+        },
+      ),
     });
   } catch (err) {
     log.error('options-live health probe failed', {

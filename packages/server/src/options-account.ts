@@ -72,11 +72,15 @@ import {
 // nothing from this module, so this direction is acyclic.
 // TRA-3913 — and the EXPOSURE-ATTRIBUTION predicate, which is a different
 // question from the authorisation one and no longer shares its answer.
+// TRA-3926 — and the same attribution applied to the WRITE side, where it
+// bounds the quantity an exit may submit rather than labelling a fold.
 import {
+  boundExitContractsToEngineShare,
   engineMayActOnAdoptedRow,
   hasEngineHandover,
   isEngineActionOnAdoptedRowsArmed,
   splitEngineExposureContracts,
+  type EngineExitQuantityBound,
 } from './option-exec-flag.js';
 import {
   type MarketableOpenMtmConfig,
@@ -2695,6 +2699,42 @@ export class PaperOptionsAccount {
    * an INCREASE to consider, refused or allowed. The denominator.
    */
   private importedAbsorptionCandidates = 0;
+  /**
+   * TRA-3926 — imported rows that reached an exit staging site and were passed
+   * through {@link boundExitContractsToEngineShare}. The denominator; see
+   * {@link getExitQuantityBoundCensus} for why it is published.
+   */
+  private exitQuantityChecked = 0;
+  /** TRA-3926 — staging sites where the bound LOWERED the quantity. */
+  private exitQuantityBounded = 0;
+  /** TRA-3926 — contracts the engine declined to sell, summed. */
+  private exitQuantityRefusedContracts = 0;
+  /**
+   * TRA-3926 — staging sites where the oracle could not answer, so the bound
+   * DECLINED TO BIND and the exit went out at the row's own quantity. The
+   * residual fail-open, counted. See `boundExitContractsToEngineShare`.
+   */
+  private exitQuantityBlindRows = 0;
+  /** TRA-3926 — staging sites suppressed entirely (nothing provably ours). */
+  private exitQuantitySuppressedExits = 0;
+  /**
+   * TRA-3926 — per-row de-dupe key for the refusal warn. `checkExits` runs on
+   * every tick and a permanently-refused row would otherwise emit the same line
+   * forever, which buries the first occurrence. Keyed by position id, valued by
+   * the refusal's shape, so a CHANGE (a partial close moved the quantity, the
+   * ledger hydrated, the desk closed its leg) logs again.
+   */
+  private exitQuantityLoggedSignatures: Map<string, string> = new Map();
+  /** TRA-3926 — newest refusal, for the operator-facing health line. */
+  private exitQuantityLastRefusal: {
+    at: number;
+    optionSymbol: string;
+    requestedContracts: number;
+    exitContracts: number;
+    refusedContracts: number;
+    reason: string;
+    oracleRefused: boolean;
+  } | null = null;
   /**
    * TRA-3896 — increases this engine's own `buy_to_open` records DID account
    * for, so the copy proceeded: a genuine partial-fill top-up. Published so
@@ -5921,6 +5961,148 @@ export class PaperOptionsAccount {
   }
 
   /**
+   * TRA-3926 — the ONE place a staged `sell_to_close` quantity is decided.
+   *
+   * Every `waitAndHold` staging site in {@link checkExits} routes its quantity
+   * through here before it lands on `pendingExit.qty`, which is the number
+   * `submitStagedOptionExits` hands to `sellContracts` / `sellContractsLimit`.
+   * On 2026-08-21T13:48:04Z that number came straight off the row and the engine
+   * sold two contracts having bought one — see
+   * {@link boundExitContractsToEngineShare} for the tape.
+   *
+   * Returns the quantity to stage, or `0` to mean **do not stage anything**. A
+   * `0` is a REFUSAL and it is surfaced three ways before this returns:
+   * `exitErrorReason` on the row (which `summarizeLiveExitErrors` publishes on
+   * `/api/health/options-live`), a counter pair on
+   * {@link getExitQuantityBoundCensus}, and an `accountLog.warn`. The row stays open at
+   * the broker with no engine exit — that is the point, and it is why silence
+   * here was never an option: "never silently sold" and "never silently
+   * abandoned" are one requirement.
+   *
+   * ⚠ NOT a no-op for the row's own bookkeeping. This bounds what the engine
+   * SUBMITS; it does not restate `contracts`, and the row keeps folding its full
+   * premium into `usd` exactly as TRA-3913 left it. The contracts the engine
+   * refuses to sell are still the desk's on `adoptedUsd`.
+   */
+  private stageableExitContracts(opt: OptionPosition, requestedContracts: number): number {
+    const remaining = opt.contractsRemaining ?? opt.contracts;
+    const bound: EngineExitQuantityBound = boundExitContractsToEngineShare(
+      opt,
+      requestedContracts,
+      remaining,
+      () =>
+        // Same lazy-lookup contract as the fold (TRA-3913): a row with no OCC
+        // symbol is UNASKABLE and the oracle's answer for that is `null`, which
+        // routes to the conservative side. Synthesising an empty-string lookup
+        // would walk the ledger for `''`, find nothing, and reach the same
+        // branch by accident rather than by decision.
+        typeof opt.optionSymbol === 'string' && opt.optionSymbol.length > 0
+          ? recordedEngineOpenBasis(opt.optionSymbol)
+          : null,
+      // TRA-3829 ruling B's master arm, for the per-row HAND-OVER carve-out
+      // only — the same value the authorisation gate above this call resolved.
+      this.actOnAdoptedBrokerRows,
+    );
+    // The denominator is scoped to the population the bound can BITE on. A demo
+    // box stages exits all day and none of them are imported; counting those
+    // here would bury the one number that matters under a rising `checked` that
+    // proves nothing about live imported rows.
+    if (opt.importedFromTradier === true) this.exitQuantityChecked += 1;
+    // BLIND — the oracle could not make a complete positive statement about
+    // this row, so the exit goes out UNBOUNDED (the pre-fix quantity). Counted,
+    // never silent: this is the residual fail-open the fix does not close, and
+    // a count is the only thing that keeps it from being inherited quietly.
+    // Binding here instead is how the strict reading of AC2 re-creates TRA-2820
+    // — see the rule note on `boundExitContractsToEngineShare`.
+    if (bound.blind) {
+      this.exitQuantityBlindRows += 1;
+      const blindSignature = `blind|${opt.optionSymbol ?? ''}|${bound.reason}`;
+      if (this.exitQuantityLoggedSignatures.get(opt.id) !== blindSignature) {
+        this.exitQuantityLoggedSignatures.set(opt.id, blindSignature);
+        accountLog.warn('sell_to_close quantity NOT bounded — the fill ledger cannot answer for this row', {
+          component: 'live-exit-quantity-bound',
+          issue: 'TRA-3926',
+          optionSymbol: opt.optionSymbol ?? null,
+          positionId: opt.id,
+          rowContracts: remaining,
+          requested: bound.requestedContracts,
+          reason: bound.reason,
+          note:
+            'exiting at the row quantity, as before this fix. Refusing here would leave a real-money '
+            + 'position under a breached stop with no exit at all (TRA-2820).',
+        });
+      }
+      delete opt.exitQuantityRefusal;
+      return bound.exitContracts;
+    }
+    if (!bound.bounded) {
+      // The bound stopped biting — the desk closed its leg, the ledger
+      // hydrated, a partial close moved the quantity. Clear the residual rather
+      // than leave a stale one asserting a contract nobody is holding back.
+      delete opt.exitQuantityRefusal;
+      this.exitQuantityLoggedSignatures.delete(opt.id);
+      return bound.exitContracts;
+    }
+
+    this.exitQuantityBounded += 1;
+    this.exitQuantityRefusedContracts += bound.refusedContracts;
+    if (bound.exitContracts === 0) this.exitQuantitySuppressedExits += 1;
+    const optionSymbol = opt.optionSymbol ?? '';
+    this.exitQuantityLastRefusal = {
+      at: Date.now(),
+      optionSymbol,
+      requestedContracts: bound.requestedContracts,
+      exitContracts: bound.exitContracts,
+      refusedContracts: bound.refusedContracts,
+      reason: bound.reason,
+      oracleRefused: bound.oracleRefused,
+    };
+    const detail =
+      `TRA-3926: this engine's own fill records account for ${bound.exitContracts} of the `
+      + `${bound.requestedContracts} contract(s) this exit asked to sell (${bound.reason}`
+      + `${bound.oracleRefused ? ', oracle could not answer' : ''}). `
+      + `${bound.refusedContracts} contract(s) REFUSED — they remain open at the broker and need a human.`;
+    // The row-level residual. Survives the staging site's
+    // `delete opt.exitErrorReason` on purpose: a PARTIAL bound stages a
+    // perfectly good order for our own share and leaves a contract behind, so
+    // there is no error to hold the fact and it would otherwise vanish.
+    opt.exitQuantityRefusal = {
+      at: Date.now(),
+      requestedContracts: bound.requestedContracts,
+      exitContracts: bound.exitContracts,
+      refusedContracts: bound.refusedContracts,
+      reason: bound.reason,
+      oracleRefused: bound.oracleRefused,
+    };
+    // ...and when NOTHING could be staged, it is also an exit failure in the
+    // sense `exitErrorReason` already means: no order went to the broker and
+    // the row's stop did not act. `summarizeLiveExitErrors` counts it there.
+    if (bound.exitContracts === 0) opt.exitErrorReason = detail;
+    // Logged once per distinct (symbol, requested→allowed, reason) shape per
+    // row: `checkExits` runs every tick, and a row whose ledger evidence aged
+    // out refuses FOREVER. A warn per tick would bury its own first occurrence,
+    // and this is the line an operator has to be able to find.
+    const signature = `${optionSymbol}|${bound.requestedContracts}|${bound.exitContracts}|${bound.reason}`;
+    if (this.exitQuantityLoggedSignatures.get(opt.id) !== signature) {
+      this.exitQuantityLoggedSignatures.set(opt.id, signature);
+      accountLog.warn('sell_to_close quantity BOUNDED to the engine\'s own accounted contracts', {
+        component: 'live-exit-quantity-bound',
+        issue: 'TRA-3926',
+        optionSymbol,
+        positionId: opt.id,
+        rowContracts: remaining,
+        requested: bound.requestedContracts,
+        allowed: bound.exitContracts,
+        refused: bound.refusedContracts,
+        reason: bound.reason,
+        oracleRefused: bound.oracleRefused,
+        adoptionAuthority: opt.adoptionAuthority ?? null,
+      });
+    }
+    return bound.exitContracts;
+  }
+
+  /**
    * Update mark prices and handle exits:
    *   1. Partial exit (50% contracts) when premium hits TP1 (+25%)
    *   2. Trailing stop activates at +20% gain; trails 12% below peak
@@ -6514,11 +6696,16 @@ export class PaperOptionsAccount {
               // re-staged at MARKET, not re-submitted at the price the market
               // already declined. `kind: 'sl'` here is the order-pricing bucket
               // and the exit is risk-reducing, so it qualifies.
+              // TRA-3926 — the engine sells only what its own fills account
+              // for. `0` ⇒ refuse the whole stage (already surfaced by the
+              // helper) rather than submit a quantity we cannot vouch for.
+              const structuralQty = this.stageableExitContracts(opt, opt.contractsRemaining);
+              if (structuralQty <= 0) continue;
               const structuralEscalation = (opt.exitExpiredCount ?? 0) > 0;
               if (structuralEscalation) this.escalatedExits += 1;
               opt.pendingExit = {
                 tradierOrderId: '',
-                qty: opt.contractsRemaining,
+                qty: structuralQty,
                 limitPrice: mark,
                 submittedAt: Date.now(),
                 pricing: structuralEscalation ? 'market' : 'limit',
@@ -6587,9 +6774,17 @@ export class PaperOptionsAccount {
             // unresolvable `pendingExit` detaches every exit rule on the row
             // (TRA-2956). The SL/trailing staging site below draws `exitPremium`
             // from several sources, so it re-checks there rather than here.
+            // TRA-3926 — bound the PARTIAL too. The split is taken against the
+            // whole row (see `boundExitContractsToEngineShare`'s
+            // `remainingContracts`), so a sequence of TP1 partials cannot each
+            // re-claim the same engine contracts; and on a 2-lot row holding one
+            // desk contract, a 50% partial asks for 1 and gets 1 — the bound is
+            // silent exactly where it should be.
+            const tp1Qty = this.stageableExitContracts(opt, exitContracts);
+            if (tp1Qty <= 0) continue;
             opt.pendingExit = {
               tradierOrderId: '',
-              qty: exitContracts,
+              qty: tp1Qty,
               limitPrice: opt.tp1Premium,
               submittedAt: Date.now(),
               kind: 'tp1',
@@ -6927,10 +7122,20 @@ export class PaperOptionsAccount {
           // latches `pendingExit` and detaches the rules that would have closed
           // the row. Fail to the next tick, which still sees the position.
           if (!useMarket && !isArmedThreshold(exitPremium)) continue;
+          // TRA-3926 — the site that actually fired on 2026-08-21. `contracts`
+          // was 2 because the pre-TRA-3896 reconcile widened the row onto the
+          // broker's whole lot; the engine had bought 1 and sold both.
+          //
+          // ⚠ Placed AFTER the `isArmedThreshold` refusal so the loop order the
+          // `summarizeLiveStopActionability` walk mirrors stays byte-faithful,
+          // and BEFORE `escalatedExits` so a refused stage does not book an
+          // escalation that never reached the broker.
+          const exitQty = this.stageableExitContracts(opt, opt.contractsRemaining);
+          if (exitQty <= 0) continue;
           if (expiryEscalation) this.escalatedExits += 1;
           opt.pendingExit = {
             tradierOrderId: '',
-            qty: opt.contractsRemaining,
+            qty: exitQty,
             limitPrice: exitPremium,
             submittedAt: Date.now(),
             pricing: useMarket ? 'market' : 'limit',
@@ -8069,6 +8274,63 @@ export class PaperOptionsAccount {
       candidates: this.importedAbsorptionCandidates,
       refusals: this.importedAbsorptionRefusals,
       allowed: this.importedAbsorptionAllowed,
+    };
+  }
+
+  /**
+   * TRA-3926 — the read side of the EXIT-QUANTITY bound.
+   *
+   * Same denominator discipline as {@link getImportedAbsorptionCensus}, and for
+   * the same reason: `bounded: 0` with `checked: 0` means no imported row ever
+   * reached a staging site (fine, and the state a demo-only box sits in
+   * permanently); `bounded: 0` with `checked > 0` means the engine's own fills
+   * accounted for every contract it staged. A branch that never runs publishes
+   * the first shape, so the pair is the deployed-bytes proof as well as the
+   * measurement.
+   *
+   * `refusedContracts` is the number that needs a HUMAN. Those contracts are
+   * still open at the broker with the engine declining to sell them — refused,
+   * not abandoned, and this is where the refusal is legible.
+   */
+  getExitQuantityBoundCensus(): {
+    /** Imported rows that reached a staging site and were measured. */
+    checked: number;
+    /** Of those, the ones whose staged quantity the bound LOWERED. */
+    bounded: number;
+    /** Contracts the engine declined to sell, summed over `bounded` events. */
+    refusedContracts: number;
+    /**
+     * Staging sites where the oracle could not answer, so the bound DECLINED TO
+     * BIND and the exit went out at the ROW's quantity — pre-fix behaviour.
+     *
+     * ⚠ THIS IS THE RESIDUAL FAIL-OPEN AND IT IS NOT ZERO BY CONSTRUCTION. Read
+     * it as coverage, not as health: `bounded: 0 / blindRows: 12` means the
+     * bound ran twelve times and could judge none of them. Refusing on these
+     * instead is how the strict reading of AC2 re-creates TRA-2820 (a live row
+     * under a breached stop with no exit at all) — see
+     * `boundExitContractsToEngineShare`.
+     */
+    blindRows: number;
+    /** Staging sites that were suppressed entirely (`exitContracts === 0`). */
+    suppressedExits: number;
+    /** Newest refusal, for the health route's operator line. */
+    last: {
+      at: number;
+      optionSymbol: string;
+      requestedContracts: number;
+      exitContracts: number;
+      refusedContracts: number;
+      reason: string;
+      oracleRefused: boolean;
+    } | null;
+  } {
+    return {
+      checked: this.exitQuantityChecked,
+      bounded: this.exitQuantityBounded,
+      refusedContracts: this.exitQuantityRefusedContracts,
+      blindRows: this.exitQuantityBlindRows,
+      suppressedExits: this.exitQuantitySuppressedExits,
+      last: this.exitQuantityLastRefusal === null ? null : { ...this.exitQuantityLastRefusal },
     };
   }
 

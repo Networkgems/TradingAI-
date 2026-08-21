@@ -2993,6 +2993,41 @@ export interface OptionPosition {
    */
   exitErrorReason?: string;
   /**
+   * TRA-3926 — contracts on this row the engine DECLINED to sell, because its
+   * own recorded `buy_to_open` fills could not account for them.
+   *
+   * ⚠ THIS IS NOT AN ERROR AND IT IS DELIBERATELY NOT
+   * {@link OptionPosition.exitErrorReason}. That field means "the last exit
+   * ATTEMPT failed", and every staging site clears it the moment a fresh order
+   * goes out — which is right, and which is exactly why it cannot carry this.
+   * On 2026-08-21 the engine staged a `sell_to_close` for 2 contracts of
+   * `XLF260925C00057500` having bought 1, and the order FILLED: there was no
+   * failure anywhere for an error field to hold. The bound now stages 1 and
+   * leaves the desk's contract alone — a successful exit with a residual, and
+   * the residual has to be legible or it is silently abandoned.
+   *
+   * Sticky by design (`riskUnmanagedReason`'s discipline): it is re-derived on
+   * every staging attempt and only cleared when the bound stops biting, so a
+   * row whose ledger evidence aged out keeps saying so for as long as it is
+   * true. Read `oracleRefused` to tell a FINDING from a REFUSAL — "the desk owns
+   * 1 contract" and "the fill ledger cannot vouch for anything" produce the same
+   * `refusedContracts` and want different people (TRA-3913 rule 4).
+   */
+  exitQuantityRefusal?: {
+    /** ms epoch of the most recent staging attempt that was bounded. */
+    at: number;
+    /** What the exit rule asked to sell before the bound. */
+    requestedContracts: number;
+    /** What was actually staged. `0` ⇒ no order went out at all. */
+    exitContracts: number;
+    /** `requested − staged`. Contracts still open at the broker, unsold by us. */
+    refusedContracts: number;
+    /** `splitEngineExposureContracts`'s verdict, or `handed_over`. */
+    reason: string;
+    /** True ⇒ the oracle could not ANSWER, rather than answered "not yours". */
+    oracleRefused: boolean;
+  };
+  /**
    * TRA-450 — consecutive rejected auto-close (`sell_to_close`) attempts the
    * engine has made for this position. Bumped by `clearPendingExit` each time
    * the broker REFUSES a staged exit (rejected / canceled / error, or the
