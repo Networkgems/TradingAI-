@@ -625,3 +625,158 @@ test('the reachableExposure block is published on EVERY verdict, breach included
     assert.ok('graded' in g.out.reachableExposure);
   }
 });
+
+// --------------------------------------------------------------------------
+// TRA-3903 — the DETECTOR SELF-CONTRADICTION check.
+//
+// TRA-3897 re-based `E_i` on capital (`cash + atRisk`) and the grade's own
+// `Σ E_i` fold did not follow, so one object served `sumBookCapUsd $499.99`
+// beside `fleetSizedMaxSumUsd $326.66` — a ceiling $173.33 BELOW the sum it is
+// a ceiling on — and advertised $173.34 of headroom while the true figure was
+// $0.01. The positive control is that reading, verbatim, off the live host.
+//
+// ⚠ THIS IS NOT A FLEET FINDING. On that same reading the ROWS carried the
+// correct `Σ E_i` ($1,032.68) and `φ_eff = A/Σ E_i`, so `Σ B_i ≤ A` genuinely
+// held at the order site. The instrument was wrong, not the fleet — which is
+// why BREACH and EXPOSURE outrank INCOHERENT below.
+// --------------------------------------------------------------------------
+
+const CONTRADICTION = path.join(HERE, '..', 'fixtures', 'tra3903-live-detector-contradiction-2026-08-20.json');
+const contradiction = JSON.parse(fs.readFileSync(CONTRADICTION, 'utf8'));
+const cloneContradiction = () => JSON.parse(JSON.stringify(contradiction));
+
+test('TRA-3903 the capture really is the contradiction — otherwise the controls below are vacuous', () => {
+  const g = contradiction.fee.aggregateFleetBound;
+  assert.equal(contradiction.live.build.commitShort, 'f3718bcee7a6');
+  assert.equal(g.verdict, 'within', 'the route called itself fine');
+  assert.equal(g.sumBookCapUsd, 499.99);
+  assert.equal(g.fleetSizedMaxSumUsd, 326.66, 'the ceiling it published for that same sum');
+  assert.equal(g.fleetCapitalUsd, 674.68, 'cash only');
+  assert.equal(g.fleetSizedHeadroomUsd, 173.34, 'the fiction');
+  assert.equal(contradiction.fee.aggregateCapUsd, 500);
+  assert.equal(contradiction.fee.arm.otmArmed, true, 'ARMED real money');
+  assert.deepEqual(g.unreadableBalanceBooks, [], 'COMPLETE population — not a coverage artifact');
+  // The rows were never wrong; that is the whole finding.
+  const armed = armedOf(contradiction.fee);
+  assert.equal(armed.reduce((s, r) => s + Math.round(r.sizingBasisUsd * 100), 0) / 100, 1032.68);
+  for (const r of armed) assert.equal(r.fleetCapitalUsd, 1032.68, `${r.book} sized on the CORRECT fleet capital`);
+});
+
+test('TRA-3903 POSITIVE CONTROL: the live contradiction does NOT exit 0', () => {
+  const { verdict, code, out } = gradeFleetBound({ ...cloneContradiction(), measuredAt: AT });
+  assert.notEqual(code, EXIT.CLEAN, 'a self-contradicting detector must never read as a pass');
+  // EXPOSURE outranks it on this reading (admin at-risk $358 > its own cap
+  // $306.32), but INCOHERENT is what it was BEFORE that upgrade, and the
+  // reader records it rather than losing the finding to the louder one.
+  assert.equal(verdict, 'EXPOSURE');
+  assert.equal(out.priorVerdict, 'INCOHERENT');
+  assert.equal(out.sizedCeilingCoversSum.covers, false);
+  assert.equal(out.sizedCeilingCoversSum.shortfallUsd, 173.33);
+});
+
+test('TRA-3903 INCOHERENT ISOLATED: a ceiling below the served sum fails on its own', () => {
+  // The green capture, with ONLY the ceiling column moved below the sum.
+  // Reachable exposure still fits A and the bound is still in force, so if this
+  // goes non-zero it is this check and nothing else.
+  const fee = cloneFixed().fee;
+  fee.aggregateFleetBound.fleetSizedMaxSumUsd = 326.66;
+  const { verdict, code, out } = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
+  assert.equal(verdict, 'INCOHERENT');
+  assert.equal(code, EXIT.INCOHERENT);
+  assert.notEqual(code, EXIT.CLEAN);
+  assert.equal(out.reachableExposure.breach, false, 'isolated: no exposure finding');
+  assert.equal(out.boundInForce.inForce, true, 'isolated: the bound itself was fine');
+  assert.match(out.reason, /DETECTOR CONTRADICTS ITSELF/);
+  assert.match(out.reason, /NOT a claim that/);
+});
+
+test('TRA-3903 NEGATIVE CONTROL: a ceiling that COVERS the served sum stays CLEAN', () => {
+  // The direction that proves the check discriminates. A reader that is always
+  // red gets muted — the same end state as no reader.
+  const fee = cloneFixed().fee;
+  fee.aggregateFleetBound.fleetSizedMaxSumUsd = 500.0; // >= sumBookCapUsd 499.99
+  const { verdict, code, out } = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
+  assert.equal(verdict, 'CLEAN');
+  assert.equal(code, EXIT.CLEAN);
+  assert.equal(out.sizedCeilingCoversSum.covers, true);
+});
+
+test('TRA-3903 the boundary is INCLUSIVE and cent-exact — equality is not a contradiction', () => {
+  const fee = cloneFixed().fee;
+  fee.aggregateFleetBound.fleetSizedMaxSumUsd = fee.aggregateFleetBound.sumBookCapUsd; // 499.99
+  const { verdict, out } = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
+  assert.equal(out.sizedCeilingCoversSum.covers, true, 'a ceiling EQUAL to the sum covers it');
+  assert.equal(verdict, 'CLEAN');
+  // One cent below is the defect.
+  const fee2 = cloneFixed().fee;
+  fee2.aggregateFleetBound.fleetSizedMaxSumUsd = 499.98;
+  assert.equal(gradeFleetBound({ live: cloneFixed().live, fee: fee2, measuredAt: AT }).verdict, 'INCOHERENT');
+});
+
+test('TRA-3903 SKIPPED, not red, on pre-TRA-3881 bytes that publish no ceiling column', () => {
+  // Same discipline as `inForce: null` and the reachable-exposure UNGRADED
+  // branch: going red on every old build is how a reader gets muted.
+  const g = gradeFixed();
+  assert.equal(g.out.sizedCeilingCoversSum.graded, false);
+  assert.match(g.out.sizedCeilingCoversSum.reason, /pre-TRA-3881/);
+  assert.equal(g.verdict, 'CLEAN');
+  assert.equal(g.code, EXIT.CLEAN);
+});
+
+test('TRA-3903 a BREACH outranks INCOHERENT — a live fail-open is not downgraded to a column bug', () => {
+  const fee = clone().fee; // the real $558.68 breach
+  fee.aggregateFleetBound.fleetSizedMaxSumUsd = 1.0; // maximally contradictory
+  const { verdict, code } = gradeFleetBound({ live: clone().live, fee, measuredAt: AT });
+  assert.equal(verdict, 'BREACH');
+  assert.equal(code, EXIT.BREACH);
+});
+
+test('TRA-3903 an UNBOUND outranks INCOHERENT — a claim about the FLEET beats one about the instrument', () => {
+  const fee = cloneFixed().fee;
+  fee.aggregateFleetBound.fleetSizedMaxSumUsd = 326.66; // contradictory
+  for (const r of armedOf(fee)) r.fleetCapitalUsd = null; // and the fleet read is unusable
+  const { verdict, code } = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
+  assert.equal(verdict, 'UNBOUND');
+  assert.equal(code, EXIT.UNBOUND);
+});
+
+test('TRA-3903 the sizedCeilingCoversSum block is published on EVERY verdict', () => {
+  // A field that appears only when it is bad cannot be asserted on, and its
+  // absence reads as "fine" rather than "not measured".
+  const all = [grade(), gradeFixed(), gradeExposed(), gradeFleetBound({ ...cloneContradiction(), measuredAt: AT })];
+  for (const g of all) {
+    assert.ok(Object.prototype.hasOwnProperty.call(g.out, 'sizedCeilingCoversSum'), `missing on ${g.verdict}`);
+    assert.ok('graded' in g.out.sizedCeilingCoversSum);
+  }
+});
+
+// --------------------------------------------------------------------------
+// TRA-3903 — the CROSS-COLUMN fold in `gradeBoundInForce` check #2.
+//
+// That check exists to catch a fleet read that silently MISSED capital, and it
+// works by comparing the row's self-reported `fleetCapitalUsd` against a sum
+// this reader takes from a DIFFERENT column. It was summing `availableCashUsd`,
+// which stopped being `E_i` at TRA-3897 — so post-3897 it compared a correct
+// $1,032.68 against a low-balled $674.68 and passed on `>=`. It could no longer
+// fail in the permissive direction, which is the only direction it exists for.
+// --------------------------------------------------------------------------
+
+test('TRA-3903 check #2 folds sizingBasisUsd, so a fleet read missing PREMIUM is caught', () => {
+  const fee = cloneContradiction().fee;
+  // The rows sum to Σ E_i $1,032.68. Claim a fleet read that saw only the CASH
+  // half — exactly the shape TRA-3897 fixed at the order site. Pre-TRA-3903 the
+  // reader folded cash too, so 674.68 >= 674.68 passed and this was invisible.
+  for (const r of armedOf(fee)) r.fleetCapitalUsd = 674.68;
+  const { out } = gradeFleetBound({ live: cloneContradiction().live, fee, measuredAt: AT });
+  assert.equal(out.boundInForce.observedFleetCapitalUsd, 1032.68, 'summed from the BASIS column');
+  assert.equal(out.boundInForce.inForce, false);
+  assert.match(out.boundInForce.reason, /is BELOW the \$1032\.68 this reader can see/);
+});
+
+test('TRA-3903 check #2 still falls back to cash on pre-TRA-3897 rows — old builds stay gradeable', () => {
+  const fee = cloneFixed().fee; // rows publish no sizingBasisUsd
+  for (const r of armedOf(fee)) assert.equal(r.sizingBasisUsd, undefined);
+  const { out, verdict } = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
+  assert.equal(out.boundInForce.observedFleetCapitalUsd, 1150.04, 'cash IS E_i on those bytes');
+  assert.equal(verdict, 'CLEAN');
+});

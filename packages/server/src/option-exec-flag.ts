@@ -1380,8 +1380,26 @@ export interface LiveOtmFleetBoundRow {
   liveEntryGateOpen: boolean;
   /** `B_i = min(φ_eff · availableCashUsd, A)` as the order site would resolve it. */
   capUsd: number;
-  /** `E_i` — the sizing basis. `null` ⇒ no usable snapshot ⇒ `capUsd` is 0. */
+  /**
+   * The CASH half of `E_i`. `null` ⇒ no usable snapshot ⇒ `capUsd` is 0.
+   *
+   * ⚠ TRA-3903 — this is NOT `E_i` and has not been since TRA-3897. Read
+   * {@link sizingBasisUsd}. The name is kept because it is the name the served
+   * `aggregateExposure` row uses, and renaming a published column to fix a
+   * comment breaks every reader that already joins on it.
+   */
   availableCashUsd: number | null;
+  /**
+   * TRA-3903 — `E_i = availableCashUsd + openPremiumAtRiskUsd`, as the row
+   * ALREADY publishes it. This is the column `Σ E_i` must be folded from.
+   *
+   * OPTIONAL for the same reason the sizing block above is: ABSENCE IS A REAL
+   * READING. A row without it came from pre-TRA-3897 bytes, where `E_i`
+   * genuinely WAS cash, and defaulting it would make an old build grade like a
+   * new one. Absent ⇒ fall back to {@link availableCashUsd}, which is exactly
+   * what that build sized on.
+   */
+  sizingBasisUsd?: number | null;
   /**
    * TRA-3881 — the TRA-3879 sizing block, as `getLiveOtmAggregateExposure`
    * already publishes it on the very same rows.
@@ -1431,8 +1449,39 @@ export interface LiveOtmFleetBoundGrade {
   overageUsd: number | null;
   /** The φ-rounding slack allowed before `overageUsd` counts as a breach. */
   roundingAllowanceUsd: number | null;
-  /** `Σ E_i` over gate-open rows with a readable balance. */
+  /**
+   * `Σ E_i` over gate-open rows with a readable balance.
+   *
+   * ⚠ TRA-3903 — folded from the rows' own `sizingBasisUsd` (`cash + atRisk`),
+   * NOT from `availableCashUsd`. Read {@link fleetCapitalBasis} to see which
+   * column a given build actually used before comparing this to anything.
+   */
   fleetCapitalUsd: number | null;
+  /**
+   * TRA-3903 — WHICH COLUMN {@link fleetCapitalUsd} was folded from.
+   *
+   * - `capital`   — every readable row published `sizingBasisUsd`; `Σ E_i` is
+   *                 the same basis the order site sized on. The correct state.
+   * - `cash_only` — no readable row published one: pre-TRA-3897 bytes, where
+   *                 cash genuinely IS `E_i`. Honest for that build.
+   * - `mixed`     — some did, some did not (a fleet mid-deploy).
+   *
+   * ⭐ PRESENCE of this key is the deployed-bytes proof the TRA-3903 fold
+   * shipped; a build without it lacks the key entirely (`hasOwnProperty`).
+   */
+  fleetCapitalBasis: 'capital' | 'cash_only' | 'mixed';
+  /**
+   * TRA-3903 — does the ceiling this object publishes actually cover the sum
+   * this object is serving? `fleetSizedMaxSumUsd >= sumBookCapUsd`.
+   *
+   * `null` ⇒ not computable (blind, or no `φ_eff` on these rows). `false` is a
+   * SELF-CONTRADICTION and always a defect in this object — never a statement
+   * about the fleet: on 2026-08-20 it was `false` while `Σ B_i ≤ A` genuinely
+   * held at the order site. It is published rather than folded into `verdict`
+   * precisely so a reader can tell "the detector is lying" apart from "the
+   * fleet is over", which are different incidents with different remedies.
+   */
+  sizedCeilingCoversSum: boolean | null;
   /**
    * `A / φ` — the FITTED precondition: the capital above which a bound built on
    * the CONFIGURED φ fails open.
@@ -1500,6 +1549,11 @@ function blindGrade(reason: string, fleetCapUsd: number): LiveOtmFleetBoundGrade
     overageUsd: null,
     roundingAllowanceUsd: null,
     fleetCapitalUsd: null,
+    // A blind grade folded nothing, so it cannot claim a capital basis. It
+    // reports the pre-TRA-3897 value rather than inventing a fourth state:
+    // `sizedCeilingCoversSum: null` beside it already says "not computed".
+    fleetCapitalBasis: 'cash_only',
+    sizedCeilingCoversSum: null,
     fleetCapitalCeilingUsd: null,
     fleetCapitalHeadroomUsd: null,
     fleetCapitalCeilingBasis:
@@ -1586,8 +1640,45 @@ export function gradeLiveOtmFleetBound(
   const unreadableBalanceBooks = open
     .filter(r => typeof r.availableCashUsd !== 'number' || !Number.isFinite(r.availableCashUsd))
     .map(r => r.book);
-  const fleetCapitalUsd =
-    readable.reduce((acc, r) => acc + cents(r.availableCashUsd as number), 0) / 100;
+  // ------------------------------------------------------------------------
+  // TRA-3903 — `Σ E_i` FOLDS THE SAME BASIS THE ROWS PUBLISH, NOT CASH.
+  //
+  // TRA-3897 re-based the PER-BOOK cap on capital (`E_i = cash + atRisk`) and
+  // this reduce did not follow, so one `aggregateFleetBound` object served
+  // `sumBookCapUsd $499.99` beside `fleetSizedMaxSumUsd $326.66` — a ceiling
+  // $173.33 BELOW the sum it is a ceiling ON, published as the fleet's headroom
+  // while the true headroom was ONE CENT (measured on `f3718bcee7a6`,
+  // 2026-08-20T23:52Z, complete population).
+  //
+  // ⚠ THE ROWS WERE NEVER WRONG, AND THAT IS THE WHOLE POINT. On the same
+  // reading each row published `fleetCapitalUsd 1032.68` and `φ_eff 0.484177 =
+  // A/1032.68`, i.e. the ORDER SITE was correctly bounded and `Σ B_i ≤ A` held.
+  // Only this column was cash. So this is a DETECTOR defect, not a fail-open —
+  // but a detector that contradicts itself gets muted, and a muted detector and
+  // no detector are the same object (TRA-3881). The margin it was mis-reporting
+  // was $0.01.
+  //
+  // Falls back to `availableCashUsd` per row, never fleet-wide: on pre-TRA-3897
+  // bytes cash IS `E_i`, and a mixed fleet mid-deploy must fold each row on the
+  // basis THAT row was sized with rather than picking one rule for both.
+  // ------------------------------------------------------------------------
+  const rowBasisUsd = (r: LiveOtmFleetBoundRow): number =>
+    typeof r.sizingBasisUsd === 'number' && Number.isFinite(r.sizingBasisUsd)
+      ? r.sizingBasisUsd
+      : (r.availableCashUsd as number);
+  const fleetCapitalUsd = readable.reduce((acc, r) => acc + cents(rowBasisUsd(r)), 0) / 100;
+  // Which column this fold actually came from. ⭐ ITS PRESENCE IS THE
+  // DEPLOYED-BYTES PROOF that the capital fold shipped (TRA-3903 AC5: grade
+  // FIELD PRESENCE — ancestry is only a lower bound on content); its VALUE is
+  // the proof the fold is right. A build serving `cash_only` over rows that
+  // publish `sizingBasisUsd` is the defect, and now says so in one word.
+  const basisRows = readable.filter(r => typeof r.sizingBasisUsd === 'number' && Number.isFinite(r.sizingBasisUsd));
+  const fleetCapitalBasis: 'capital' | 'cash_only' | 'mixed' =
+    readable.length === 0 || basisRows.length === 0
+      ? 'cash_only'
+      : basisRows.length === readable.length
+        ? 'capital'
+        : 'mixed';
 
   // ------------------------------------------------------------------------
   // TRA-3881 — WHICH BOUND IS ACTUALLY HOLDING THE SUM DOWN?
@@ -1774,6 +1865,11 @@ export function gradeLiveOtmFleetBound(
     overageUsd,
     roundingAllowanceUsd,
     fleetCapitalUsd,
+    fleetCapitalBasis,
+    // Cent-compared, like every other equality in this file: both operands are
+    // products of a fraction and a balance, so a bare `>=` flaps at the penny.
+    sizedCeilingCoversSum:
+      fleetSizedMaxSumUsd === null ? null : cents(fleetSizedMaxSumUsd) >= cents(sumBookCapUsd),
     fleetCapitalCeilingUsd,
     fleetCapitalHeadroomUsd,
     fleetCapitalCeilingBasis,

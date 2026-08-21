@@ -19,7 +19,10 @@
 //   3 UNBOUND  Σ B_i fits, but the BOUND THAT MAKES IT FIT IS NOT IN FORCE (below)
 //   1 EXPOSURE Σ B_i fits and the bound is in force, but the fleet's REACHABLE
 //              exposure — Σ max(cap_i, atRisk_i) — is over A anyway (below)
-//   Precedence BLIND > BREACH > EXPOSURE > UNBOUND > CLEAN.
+//   3 INCOHERENT the served grade contradicts itself: it publishes a
+//              `fleetSizedMaxSumUsd` CEILING below the `sumBookCapUsd` it is
+//              serving, so its headroom columns are fiction (TRA-3903)
+//   Precedence BLIND > BREACH > EXPOSURE > UNBOUND > INCOHERENT > CLEAN.
 
 export const EXIT = {
   CLEAN: 0,
@@ -42,6 +45,25 @@ export const EXIT = {
    * the existing non-pass code, let the VERDICT STRING carry the discrimination.
    */
   EXPOSURE: 1,
+  /**
+   * TRA-3903 — the served grade CONTRADICTS ITSELF: it publishes
+   * `fleetSizedMaxSumUsd` as the maximum `Σ B_i` this fleet can reach while
+   * simultaneously serving a larger `sumBookCapUsd`. A ceiling below the value
+   * it is a ceiling ON is not a reading of the fleet; it is a defect in the
+   * instrument.
+   *
+   * Same code as BLIND/UNBOUND, and deliberately so: this is squarely a
+   * could-not-certify. The columns disagree, so nothing either of them says
+   * about headroom can be relied on — including the reassuring one. Measured on
+   * `f3718bcee7a6` 2026-08-20T23:52Z the route advertised $173.34 of headroom
+   * while the true figure was $0.01.
+   *
+   * ⚠ NOT a claim that the fleet is over its authorization. On that same
+   * reading `Σ B_i ≤ A` genuinely held AT THE ORDER SITE, because the ROWS
+   * carried the correct `Σ E_i` ($1,032.68) and only the grade's own column was
+   * cash-only. BREACH and EXPOSURE outrank this for exactly that reason.
+   */
+  INCOHERENT: 3,
 };
 
 /** Cent-exact sum, so 0.1+0.2 never manufactures or hides a breach. */
@@ -50,6 +72,30 @@ function sumCents(rows, key) {
 }
 
 const usable = v => typeof v === 'number' && Number.isFinite(v) && v > 0;
+
+/**
+ * TRA-3903 — `E_i` FOR ONE ROW, from the column that row was actually sized on.
+ *
+ * `availableCashUsd` stopped being `E_i` at TRA-3897 (`E_i = cash + atRisk`).
+ * Summing cash here made check #2 below — the cross-column test whose entire job
+ * is to catch a fleet read that quietly missed capital — compare a correct
+ * `fleetCapitalUsd` ($1,032.68) against a low-balled $674.68 and pass, because
+ * the test is `>=`. It could no longer fail in the permissive direction, which
+ * is the only direction it exists for.
+ *
+ * Falls back to cash when the row publishes no basis: on pre-TRA-3897 bytes cash
+ * IS `E_i`, and a reader that goes red on every old build gets muted.
+ */
+function rowBasisUsd(r) {
+  const basis = r?.sizingBasisUsd;
+  if (typeof basis === 'number' && Number.isFinite(basis)) return basis;
+  return Number.isFinite(r?.availableCashUsd) ? r.availableCashUsd : 0;
+}
+
+/** Cent-exact `Σ E_i` across rows, each on its own basis. */
+function sumBasisCents(rows) {
+  return rows.reduce((s, r) => s + Math.round(rowBasisUsd(r) * 100), 0) / 100;
+}
 
 /**
  * TRA-3737 §2 — is the fleet bound ACTUALLY IN FORCE on this reading?
@@ -103,7 +149,8 @@ function gradeBoundInForce(armed, A, eligibleBooks) {
     };
   }
 
-  const observedFleetCapitalUsd = sumCents(armed, 'availableCashUsd');
+  // TRA-3903 — the SIZING BASIS, not cash. See `rowBasisUsd`.
+  const observedFleetCapitalUsd = sumBasisCents(armed);
   const failures = [];
   for (const r of armed) {
     const who = r?.book ?? '<unnamed>';
@@ -234,7 +281,12 @@ function gradeReachableExposure(armed, A) {
   // Computed, never read off the served `roundingAllowanceUsd`: a suppression
   // that trusts a served field can be bought by inflating that field
   // (TRA-3881 — suppress on arithmetic, never on a name).
-  const slack = Math.round(1e-4 * sumCents(armed, 'availableCashUsd') * 100) / 100;
+  // TRA-3903 — scaled to Σ E_i, the quantity φ actually multiplies
+  // (`cap_i = φ_eff · E_i`), not to cash. Cash understates it post-TRA-3897, so
+  // this moves the tolerance in the direction of FEWER false alarms; it cannot
+  // hide an overage, because `E_i ≥ cash` makes the change monotone upward and
+  // the term is 1e-4 of it.
+  const slack = Math.round(1e-4 * sumBasisCents(armed) * 100) / 100;
   const overageUsd = Math.round(Math.max(0, reachableUsd - A) * 100) / 100;
   const breach = reachableUsd > A + slack;
   const overCap = perBook.filter(b => b.overCapUsd > 0);
@@ -361,7 +413,7 @@ export function gradeFleetBound({ live, fee, expectCommit = null, measuredAt }) 
     // disclosed rounding overage does not read as the defect. Scale the tolerance
     // to the thing it measures — a FLAT dollar tolerance would repeat φ's own
     // mistake (a constant fitted to one night's balances) one level up.
-    const capital = sumCents(armed, 'availableCashUsd');
+    const capital = sumBasisCents(armed); // TRA-3903 — Σ E_i, not cash
     const slack = Math.round(1e-4 * capital * 100) / 100;
     const overage = Math.max(0, Math.round((localSum - A) * 100) / 100);
     verdict = overage > slack ? 'BREACH' : 'CLEAN';
@@ -434,13 +486,82 @@ export function gradeFleetBound({ live, fee, expectCommit = null, measuredAt }) 
     };
   })();
 
+  // TRA-3903 §AC2 — DOES THE CEILING COVER THE SUM IT IS A CEILING ON?
+  //
+  // `fleetSizedMaxSumUsd` is published as "the largest Σ B_i the sizing rule now
+  // in force can produce". `sumBookCapUsd` is the Σ B_i it is ACTUALLY serving.
+  // The first must be ≥ the second on every reading, and on 2026-08-20 it was
+  // $326.66 against $499.99 — the grade's `Σ E_i` folded `availableCashUsd`
+  // while the rows it summed published `sizingBasisUsd` (`cash + atRisk`).
+  //
+  // ⭐ CROSS-COLUMN BY CONSTRUCTION, and that is the point (TRA-3881: take the
+  // two sides from DIFFERENT columns or the check is vacuous). Both operands are
+  // read off the SERVED grade, so this fires on any build whose two columns
+  // disagree — including builds that predate the fix and builds that regress
+  // after it. It needs no new server field to work, which is why it can grade
+  // tonight's capture as a positive control.
+  //
+  // ⚠ SKIPPED, NOT RED, when `fleetSizedMaxSumUsd` is absent (pre-TRA-3881
+  // bytes publish no such column). Same discipline as `inForce: null` and the
+  // reachable-exposure `graded: false` branch: a reader that goes red on every
+  // old build gets muted, and a muted reader is the empty room TRA-3737 exists
+  // to close.
+  out.sizedCeilingCoversSum = (() => {
+    const ceiling = served?.fleetSizedMaxSumUsd ?? null;
+    if (!Number.isFinite(ceiling)) {
+      return {
+        graded: false,
+        reason:
+          'this build publishes no fleetSizedMaxSumUsd (pre-TRA-3881 bytes) — there is no '
+          + 'ceiling column to check the served sum against',
+      };
+    }
+    const servedSum = Number.isFinite(served?.sumBookCapUsd) ? served.sumBookCapUsd : localSum;
+    const shortfallUsd = Math.round((servedSum - ceiling) * 100) / 100;
+    const covers = Math.round(ceiling * 100) >= Math.round(servedSum * 100);
+    return {
+      graded: true,
+      covers,
+      sizedMaxSumUsd: ceiling,
+      sumBookCapUsd: servedSum,
+      shortfallUsd: Math.max(0, shortfallUsd),
+      // The server names its own fold from TRA-3903 on; absent ⇒ pre-fix bytes.
+      servedFleetCapitalBasis: served?.fleetCapitalBasis ?? null,
+      servedFleetCapitalUsd: served?.fleetCapitalUsd ?? null,
+      // What Σ E_i looks like from the ROWS — a different column again, so a
+      // reader can see WHICH side is understated without trusting either.
+      observedFleetCapitalUsd: out.boundInForce?.observedFleetCapitalUsd ?? null,
+      reason: covers
+        ? `fleetSizedMaxSumUsd $${ceiling.toFixed(2)} covers the served Σ B_i $${servedSum.toFixed(2)}`
+        : `fleetSizedMaxSumUsd $${ceiling.toFixed(2)} is BELOW the Σ B_i $${servedSum.toFixed(2)} this same `
+          + `object is serving, by $${shortfallUsd.toFixed(2)}`,
+    };
+  })();
+
+  if (verdict === 'CLEAN' && out.sizedCeilingCoversSum.graded === true && out.sizedCeilingCoversSum.covers === false) {
+    const s = out.sizedCeilingCoversSum;
+    out.servedReason = out.reason;
+    verdict = 'INCOHERENT';
+    code = EXIT.INCOHERENT;
+    out.reason =
+      `DETECTOR CONTRADICTS ITSELF — ${s.reason}. A ceiling cannot sit below the value it is a ceiling `
+      + `on, so this object's capital columns are not a reading of the fleet. The served Σ E_i is `
+      + `$${s.servedFleetCapitalUsd ?? '?'} (basis: ${s.servedFleetCapitalBasis ?? 'not published — pre-TRA-3903 bytes'}) `
+      + `while the rows themselves sum to $${s.observedFleetCapitalUsd ?? '?'}: the grade folded cash where the `
+      + 'rows publish sizingBasisUsd (TRA-3897 re-based E_i on capital and this fold did not follow). '
+      + `The advertised fleetSizedHeadroomUsd is therefore fiction — true headroom is A − Σ B_i. `
+      + 'This is exit 3, NOT a pass. It is NOT a claim that Σ B_i is over A: check the verdict for that.';
+  }
+
   // UNBOUND only ever upgrades a CLEAN. It must NOT touch a BREACH: the overage
   // is already real and unconditional, and re-labelling a live fail-open with a
   // more procedural word is how a loud finding gets read as a caveat — the same
   // discipline the partial marker follows above. It must not touch a BLIND
   // either: we do not know what we measured, so we cannot claim to know the
   // bound was off.
-  if (verdict === 'CLEAN' && out.boundInForce.inForce === false) {
+  // TRA-3903 — it also upgrades an INCOHERENT: "the bound did not bind" is a
+  // statement about the FLEET, and outranks "the instrument's columns disagree".
+  if ((verdict === 'CLEAN' || verdict === 'INCOHERENT') && out.boundInForce.inForce === false) {
     out.servedReason = out.reason;
     verdict = 'UNBOUND';
     code = EXIT.UNBOUND;
@@ -465,7 +586,7 @@ export function gradeFleetBound({ live, fee, expectCommit = null, measuredAt }) 
   // re-labelling a live fail-open with a longer word is how a loud finding gets
   // re-read as a caveat. It must not touch a BLIND either — we do not know what
   // we measured. Same discipline as UNBOUND and the partial marker.
-  if ((verdict === 'CLEAN' || verdict === 'UNBOUND') && out.reachableExposure.breach === true) {
+  if ((verdict === 'CLEAN' || verdict === 'UNBOUND' || verdict === 'INCOHERENT') && out.reachableExposure.breach === true) {
     out.priorVerdict = verdict;
     out.priorReason = out.reason;
     verdict = 'EXPOSURE';
