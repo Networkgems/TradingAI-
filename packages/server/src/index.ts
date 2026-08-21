@@ -15585,6 +15585,11 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
     getCoinbaseBarPullRateState,
     fetchCryptoDailyBars,
   } = await import('./crypto-feed.js');
+  // TRA-3805 — counters for the per-symbol log suppressions. Imported here rather
+  // than re-exported through yahoo-feed because `stooqNonOk` is not yahoo-feed's
+  // family, and routing it through there would make the emitter and the counter
+  // live in different modules for one of the two families.
+  const { getSymbolLogSuppressionState } = await import('./symbol-log-dedupe.js');
   const results: Record<string, unknown> = {};
 
   // TRA-708 — run every probe in PARALLEL, each under `runQuotesProbe`'s hard
@@ -15756,6 +15761,19 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
     // PRESENCE — a deploy predating TRA-3804 omits it entirely, which `?? 0`
     // would render as a clean "nothing skipped".
     unservableSymbols: getUnservableSymbolsState(),
+    // TRA-3805 — the per-symbol log suppressions' own instrument. ⚠ ALWAYS
+    // PRESENT, same contract as the block above: assert PRESENCE, never `?? 0`.
+    //
+    // ⚠ READ `calls` BEFORE `linesSuppressed`. A suppression that is working and
+    // an emitter that has died both write zero lines to the tape; `calls: 0` is
+    // the only thing that separates them, and it is per-FAMILY because a dead
+    // stooq leg and a quiet stooq leg are also indistinguishable from the
+    // tradier family's counters.
+    //
+    // `announcedKeys` is the FULL live membership, never a capped prefix — that
+    // is the TRA-3385 guarantee this measure had to preserve while cutting the
+    // ~10.9 lines/minute the set-keyed dedupe was emitting.
+    logSuppression: getSymbolLogSuppressionState(),
     bootEnv,
     results,
     ts: new Date().toISOString(),

@@ -1011,29 +1011,45 @@ describe('TRA-3385 — ^VIX served by the Tradier primary, both spellings resolv
   });
 });
 
-// TRA-3385 (Remedy B) — the un-servable set is logged as a FULL membership once
-// per session (again only on change), never a capped 20-name prefix.
-describe('recordTradierUnmatched (TRA-3385 un-servable class measurement)', () => {
+// TRA-3385 (Remedy B) — the un-servable set is logged as a FULL membership,
+// never a capped 20-name prefix.
+//
+// TRA-3805 — the "again only on change" half of that spec was the defect: the
+// dedupe key was one batch's exact membership, and quotes are fetched in shards
+// with different membership, so the key flipped on every call. The third case
+// below asserted that behaviour BY DESIGN; it is inverted here deliberately
+// rather than deleted, because "membership changed ⇒ re-log" is precisely the
+// clause the live tape disproved. Full acceptance fixture (the three real shards
+// from bqb1 2026-08-16T18:11Z) lives in `tra3805-symbol-log-dedupe.test.ts`.
+describe('recordTradierUnmatched (TRA-3385 measurement, TRA-3805 per-symbol key)', () => {
   it('emits the full sorted membership with counts on first sight', () => {
     __resetTradierUnmatchedForTests();
     const line = recordTradierUnmatched(['BAYN.DE', 'ARX.TO', '2330.TW'], 670);
-    expect(line).toContain('3/670');
+    expect(line).toContain('3 newly un-servable');
+    expect(line).toContain('3/670 unmatched in this batch');
     expect(line).toContain('unmatched_symbols');
     expect(line).toContain('2330.TW, ARX.TO, BAYN.DE');
   });
 
-  it('suppresses a repeat of the same membership (once per session)', () => {
+  it('suppresses a repeat of the same membership', () => {
     __resetTradierUnmatchedForTests();
     expect(recordTradierUnmatched(['ARX.TO'], 670)).not.toBeNull();
     expect(recordTradierUnmatched(['ARX.TO'], 670)).toBeNull();
-    // Order must not defeat the dedupe key.
+    // Order must not defeat the dedupe.
     expect(recordTradierUnmatched(['ARX.TO'], 671)).toBeNull();
   });
 
-  it('re-emits when the membership changes', () => {
+  // Was: 're-emits when the membership changes'. Inverted by TRA-3805.
+  it('stays silent when the membership changes but every member is announced', () => {
     __resetTradierUnmatchedForTests();
-    expect(recordTradierUnmatched(['ARX.TO'], 670)).not.toBeNull();
     expect(recordTradierUnmatched(['ARX.TO', 'BB.TO'], 670)).not.toBeNull();
+    // A shard that drops a member — the 26/26 → 24/596 transition that made the
+    // old key flip — has nothing new to say.
+    expect(recordTradierUnmatched(['ARX.TO'], 596)).toBeNull();
+    // A shard that ADDS one names only the addition.
+    const line = recordTradierUnmatched(['ARX.TO', 'BB.TO', '2330.TW'], 140);
+    expect(line).toContain('2330.TW');
+    expect(line).not.toContain('ARX.TO');
   });
 
   it('stays silent on an empty set without consuming the session slot', () => {

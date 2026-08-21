@@ -11,6 +11,10 @@
  * intraday open. This is degraded but usable for top-mover ranking.
  */
 import { logger } from './observability/index.js';
+// TRA-3805 (measure 3 of TRA-3800) — this file logged one warn line per symbol
+// per call with no dedupe at all, and it is the LAST leg of the quote cascade, so
+// every permanently-unknown ticker paid a line on every tick.
+import { announceSymbolOnce } from './symbol-log-dedupe.js';
 
 const log = logger.child({ module: 'stooq-feed' });
 
@@ -78,17 +82,34 @@ export async function fetchStooqQuote(symbol: string): Promise<QuoteData | null>
   try {
     const resp = await withTimeout(fetch(url), STOOQ_CALL_TIMEOUT_MS, `stooq(${symbol})`);
     if (!resp.ok) {
-      log.warn('quote fetch returned non-OK status', { symbol, status: resp.status });
+      // TRA-3805 — announced once per (symbol, status) per TTL window. The status
+      // is part of the key on purpose: a ticker that 404s forever and the same
+      // ticker starting to 429 are different facts, and keying on the bare symbol
+      // would let the first one swallow the second. Counters:
+      // `/api/health/feeds` → `logSuppression.stooqNonOk`.
+      if (announceSymbolOnce('stooqNonOk', `${symbol}#${resp.status}`)) {
+        log.warn('quote fetch returned non-OK status (first sight this window; repeats suppressed — see health logSuppression.stooqNonOk)', { symbol, status: resp.status });
+      }
       return null;
     }
     const csv = await resp.text();
     const parsed = parseStooqCsv(csv);
     if (!parsed) {
-      log.warn('unparseable CSV (likely unknown symbol)', { symbol });
+      // Same family, same treatment: the `N/D` sentinel is Stooq's way of saying
+      // "unknown symbol", which is a permanent fact about the ticker and so repeats
+      // at exactly the tick rate. `#unparseable` shares the stooqNonOk key space
+      // rather than the HTTP-status space, which no real status can collide with.
+      if (announceSymbolOnce('stooqNonOk', `${symbol}#unparseable`)) {
+        log.warn('unparseable CSV (likely unknown symbol; repeats suppressed — see health logSuppression.stooqNonOk)', { symbol });
+      }
     }
     return parsed;
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
+    // ⚠ NOT deduped. This branch is timeouts and transport faults — transient by
+    // nature, and the thing a reader most needs to see recur. Suppressing it would
+    // trade a real outage signal for log volume that measure 1 (TRA-3804) already
+    // removes at source.
     log.warn('quote fetch failed', { symbol, reason: msg });
     return null;
   }

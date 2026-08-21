@@ -11,6 +11,9 @@ import {
   shouldSkipUnservable,
   getUnservableSymbolState,
 } from './unservable-symbols.js';
+// TRA-3805 — per-SYMBOL announcement ledger. Replaces the set-keyed dedupe that
+// sharded batches defeated on every call.
+import { announceSymbols, __resetSymbolLogDedupeForTests } from './symbol-log-dedupe.js';
 
 /**
  * TRA-3390 — the currency of the venue the Tradier equity adapter queries. See
@@ -488,27 +491,43 @@ export function _resetPreFanoutEpisodeForTests(): void {
 // are permanently un-servable by the primary?") looking like an open research
 // task. This surfaces the answer as a measurement: the FULL membership, never
 // a capped prefix — the 20-name `DROPPED_SYMBOL_SAMPLE` prefix on the drop
-// lines is exactly what made this class invisible. Logged once per session and
-// again only when membership changes, so a 670-symbol universe costs one line
-// per boot, not one per tick.
-let lastUnmatchedLoggedKey: string | null = null;
+// lines is exactly what made this class invisible.
+//
+// TRA-3805 — that dedupe was keyed on the exact membership of ONE BATCH, and
+// quotes are fetched in SHARDS with different membership, so the key flipped on
+// every call and each shard clobbered the key the next shard would have matched.
+// The doc comment here used to promise "one line per boot"; the live tape read
+// ~10.9 lines/minute, and both were true at once. The key is now the SYMBOL —
+// see `symbol-log-dedupe.ts` for why, and for the counters that give this
+// suppression a failing state.
+//
+// ⚠ The set-shaped state is GONE on purpose. Re-introducing any per-call
+// membership key here re-introduces the incident; the shards are heterogeneous by
+// construction (a 26-symbol shard, a 596-symbol shard and a 140-symbol shard
+// inside one 2.3s tick) and no set key can survive that.
 
-/** Returns the warn line to log for this batch's `unmatched_symbols`, or null
- * when there is nothing new to say (empty set, or same membership as already
- * logged this session). Pure apart from the module-level dedupe key, so tests
- * can drive it directly. */
+/**
+ * Returns the warn line to log for this batch's `unmatched_symbols`, or null when
+ * there is nothing new to say — an empty set, or a batch whose members have all
+ * already been announced inside the TTL window.
+ *
+ * The line names ONLY the newly-announced symbols, so a re-shard cannot resurrect
+ * the same 24 tickers; the batch-level `n/requested` census is carried alongside
+ * so a reader still sees how big the un-servable set was on the call that emitted.
+ * Pure apart from the shared announcement ledger, so tests can drive it directly.
+ */
 export function recordTradierUnmatched(unmatched: readonly string[], requestedCount: number): string | null {
-  if (unmatched.length === 0) return null;
-  const sorted = [...unmatched].sort();
-  const key = sorted.join(',');
-  if (key === lastUnmatchedLoggedKey) return null;
-  lastUnmatchedLoggedKey = key;
-  return `[yahoo-feed] tradier quotes(batch): ${unmatched.length}/${requestedCount} requested symbols un-servable by the primary feed (unmatched_symbols): ${sorted.join(', ')}`;
+  const fresh = announceSymbols('tradierUnmatched', unmatched);
+  if (fresh.length === 0) return null;
+  const sorted = [...fresh].sort();
+  return `[yahoo-feed] tradier quotes(batch): ${sorted.length} newly un-servable by the primary feed ` +
+    `(unmatched_symbols; ${unmatched.length}/${requestedCount} unmatched in this batch): ${sorted.join(', ')}`;
 }
 
-/** Test seam: forget the last-logged unmatched membership. */
+/** Test seam: forget every announced un-servable symbol. Clears the whole shared
+ * ledger, stooq's family included — the families share one module-level store. */
 export function __resetTradierUnmatchedForTests(): void {
-  lastUnmatchedLoggedKey = null;
+  __resetSymbolLogDedupeForTests();
 }
 
 // ── TRA-505 / TRA-572: wire the quote feed to live UI creds, multi-tenant-safe ─
