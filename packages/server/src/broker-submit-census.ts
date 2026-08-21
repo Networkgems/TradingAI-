@@ -1,3 +1,7 @@
+// TRA-3937 — snapshot/hydrate imports for durable census.
+import { readFileSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+
 /**
  * TRA-3905 — the PER-BOOK BROKER SUBMIT/FILL CENSUS and the permission breaker.
  *
@@ -168,6 +172,14 @@ interface BookDayCell {
 
 /** etDay -> book -> cell. */
 const store = new Map<string, Map<string, BookDayCell>>();
+
+/**
+ * TRA-3937 — ET days whose data was loaded from a snapshot file rather than
+ * accumulated by this process. Used to set `fromSnapshot` on the report so
+ * `check:broker-census` can distinguish a durable post-close read (CLEAN/FAIL)
+ * from a mid-session restart (FORFEIT).
+ */
+const hydratedDays = new Set<string>();
 
 function emptyCell(): BookDayCell {
   return {
@@ -382,6 +394,13 @@ export interface BrokerSubmitCensusReport {
   };
   /** ET days currently held, oldest first — the retention window, measured. */
   retainedEtDays: string[];
+  /**
+   * TRA-3937 — true when this day's data was loaded from a durable snapshot
+   * rather than accumulated by the current process. `check:broker-census` uses
+   * this to distinguish a durable post-close read (grade CLEAN/FAIL) from a
+   * mid-session restart where the live fold is partial (grade FORFEIT).
+   */
+  fromSnapshot: boolean;
 }
 
 function zeroRejects(): Record<BrokerRejectClass, number> {
@@ -456,10 +475,98 @@ export function summarizeBrokerSubmitCensus(
       degradedBookCount: rows.filter(r => r.verdict === 'degraded').length,
     },
     retainedEtDays: [...store.keys()].sort(),
+    fromSnapshot: hydratedDays.has(etDay),
   };
 }
+
+// ─── TRA-3937: durable snapshot ──────────────────────────────────────────────
+
+function censusSnapDir(dataDir: string): string {
+  return join(dataDir, 'broker-census');
+}
+function censusSnapPath(dataDir: string, etDay: string): string {
+  return join(censusSnapDir(dataDir), `${etDay}.json`);
+}
+
+function serializeDay(day: Map<string, BookDayCell>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [book, cell] of day) {
+    out[book] = { ...cell, rejects: Object.fromEntries(cell.rejects) };
+  }
+  return out;
+}
+
+function deserializeDay(raw: Record<string, unknown>): Map<string, BookDayCell> {
+  const day = new Map<string, BookDayCell>();
+  for (const [book, c] of Object.entries(raw)) {
+    const cell = c as Record<string, unknown>;
+    const rejectsRaw = (cell['rejects'] ?? {}) as Record<string, number>;
+    day.set(book, {
+      submitted: Number(cell['submitted'] ?? 0),
+      filled: Number(cell['filled'] ?? 0),
+      rejects: new Map(Object.entries(rejectsRaw).map(([k, v]) => [k as BrokerRejectClass, Number(v)])),
+      brokerRejects: Number(cell['brokerRejects'] ?? 0),
+      preSubmitAborts: Number(cell['preSubmitAborts'] ?? 0),
+      consecutivePermission: Number(cell['consecutivePermission'] ?? 0),
+      blockedSince: cell['blockedSince'] != null ? Number(cell['blockedSince']) : null,
+      blockedReason: cell['blockedReason'] != null ? String(cell['blockedReason']) : null,
+      refusedByBreaker: Number(cell['refusedByBreaker'] ?? 0),
+      alerted: Boolean(cell['alerted']),
+    });
+  }
+  return day;
+}
+
+/**
+ * TRA-3937 — write a snapshot of `etDay`'s cells to `dataDir/broker-census/YYYY-MM-DD.json`.
+ * Called from the health route after reading the census, so the snapshot is written
+ * while the process is still alive — before the post-close deploy burst kills it.
+ * Idempotent and fail-soft: a write failure never throws to the caller.
+ */
+export function persistCensusDaySync(etDay: string, dataDir: string): void {
+  const day = store.get(etDay);
+  if (!day || day.size === 0) return;
+  try {
+    mkdirSync(censusSnapDir(dataDir), { recursive: true });
+    writeFileSync(censusSnapPath(dataDir, etDay), JSON.stringify(serializeDay(day)));
+  } catch {
+    // fail-soft: a write error must never break the health route
+  }
+}
+
+/**
+ * TRA-3937 — on boot, load all snapshot files from `dataDir/broker-census/` and
+ * populate the in-memory store. Live-process data always wins: if a day is already
+ * in the store (accumulated this session) the snapshot is skipped.
+ */
+export function hydrateCensusFromDir(dataDir: string): { days: number } {
+  const snapDir = censusSnapDir(dataDir);
+  let entries: string[];
+  try {
+    entries = readdirSync(snapDir).filter(f => /^\d{4}-\d{2}-\d{2}\.json$/.test(f));
+  } catch {
+    return { days: 0 };
+  }
+  let loaded = 0;
+  for (const f of entries) {
+    const etDay = f.slice(0, 10);
+    if (store.has(etDay)) continue; // live-process data wins
+    try {
+      const raw = JSON.parse(readFileSync(join(snapDir, f), 'utf-8')) as Record<string, unknown>;
+      store.set(etDay, deserializeDay(raw));
+      hydratedDays.add(etDay);
+      loaded += 1;
+    } catch {
+      // corrupt or unreadable snapshot: skip silently
+    }
+  }
+  return { days: loaded };
+}
+
+// ─── end TRA-3937 ────────────────────────────────────────────────────────────
 
 /** Test seam only. */
 export function __resetBrokerSubmitCensusForTest(): void {
   store.clear();
+  hydratedDays.clear();
 }

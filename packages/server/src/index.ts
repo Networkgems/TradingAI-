@@ -322,6 +322,8 @@ import {
 } from './live-broker-position-drift.js';
 // TRA-3117 — per-book live-arm census for /api/health/options-live.
 import { summarizeLiveArmCensus } from './live-arm-census.js';
+// TRA-3937 — durable broker-census snapshot: hydrate on boot, persist on read.
+import { hydrateCensusFromDir, persistCensusDaySync } from './broker-submit-census.js';
 import { runLiveOptionsFeeReconcile } from './live-options-fee-reconcile.js'; // TRA-2810/TRA-2850
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
@@ -4610,6 +4612,17 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
       rejects: h.rejects,
       days: h.days,
     });
+  }
+}
+
+// TRA-3937 — reload broker-outcome census snapshots from prior sessions. Without this
+// a post-close deploy wipes the in-memory fold and the 16:10 ET census read returns
+// all-idle (FORFEIT). Snapshots are written on each health-route read (below); they
+// survive the boot and let `check:broker-census` grade CLEAN/FAIL instead of FORFEIT.
+{
+  const h = hydrateCensusFromDir(DATA_DIR);
+  if (h.days > 0) {
+    log.info('broker-submit census hydrated from snapshots (TRA-3937)', { days: h.days });
   }
 }
 
@@ -10691,6 +10704,11 @@ app.get('/api/health/options-live', async (_req, res) => {
       // reading, but not the one this route is for.
       etDateString(new Date()),
     );
+    // TRA-3937 — persist today's census to disk while this process is alive.
+    // Written synchronously so the snapshot is on disk before the caller returns;
+    // fail-soft inside `persistCensusDaySync` so a write error never breaks this route.
+    const etDayNow = etDateString(new Date());
+    persistCensusDaySync(etDayNow, DATA_DIR);
     res.json({
       ok: true,
       issue: 'TRA-1581',

@@ -236,6 +236,8 @@ export interface LiveArmCensusReport {
    * were MEASURED at all.
    */
   brokerOutcomesEtDay: string | null;
+  /** TRA-3937 — true when census data was loaded from a durable snapshot (post-close restart). */
+  brokerOutcomesFromSnapshot: boolean;
 }
 
 /** Masked last-4 only — matches the existing operator block's contract. */
@@ -318,6 +320,9 @@ export function summarizeLiveArmCensus(
     booksScanned: books.length,
     books: rows,
     brokerOutcomesEtDay: brokerCensus?.etDay ?? null,
+    // TRA-3937 — true when the census data was loaded from a durable snapshot
+    // (post-close restart). The grader uses this to avoid FORFEIT on a durable read.
+    brokerOutcomesFromSnapshot: brokerCensus?.fromSnapshot ?? false,
     rollup: {
       liveBookCount: rows.length,
       nonOperatorLiveBookCount: rows.filter(r => !isLiveBrokerOperator(r.username, env)).length,

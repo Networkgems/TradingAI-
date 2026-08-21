@@ -153,16 +153,30 @@ export function grade({ census, journal, session, now }) {
   }
 
   // ── FORFEIT — a restart inside the session truncates the fold. ─────────────
+  // TRA-3937: a restart AFTER the close is no longer a forfeit when the census
+  // data was loaded from a durable snapshot written before the deploy killed the
+  // prior process. fromSnapshot must be the actual field from the payload — the
+  // grader cannot assume; it reads.
   const openMs = etWallToUtc(session, 9, 30);
   const closeMs = etWallToUtc(session, 16, 0);
+  const fromSnapshot = lac.brokerOutcomesFromSnapshot === true;
   if (bootMs > openMs) {
     say('');
     const covered = Math.max(0, Math.round((closeMs - bootMs) / 60000));
-    return done(EXIT.FORFEIT, covered === 0
-      // The 08-20 case exactly: booted 23:03 ET, seven hours after the close.
-      // Process-lifetime state means that ET day is not "partial", it is GONE.
-      ? `process booted ${build.startedAt}, entirely AFTER the ${new Date(closeMs).toISOString()} close — 0 min of ${session} is in this fold, and process-lifetime state makes that day PERMANENTLY unreadable. Nothing was lost; it can only be re-read on a later session.`
-      : `process booted ${build.startedAt}, AFTER the ${new Date(openMs).toISOString()} open — the fold covers only ${covered} min of the session. Partial, not gradeable. Re-arm for the next session.`);
+    if (covered === 0 && fromSnapshot) {
+      // Boot is entirely after the close AND the census fold came from a durable
+      // snapshot (TRA-3937 fix). The data is complete — grade it normally.
+      say(`⚠️  boot ${build.startedAt} is AFTER the ${new Date(closeMs).toISOString()} close,`);
+      say(`   but brokerOutcomesFromSnapshot=true — data loaded from durable snapshot.`);
+      say(`   Grading as DURABLE READ (not FORFEIT).`);
+      // fall through to grading
+    } else {
+      return done(EXIT.FORFEIT, covered === 0
+        // The 08-20 case exactly: booted 23:03 ET, seven hours after the close.
+        // Process-lifetime state means that ET day is not "partial", it is GONE.
+        ? `process booted ${build.startedAt}, entirely AFTER the ${new Date(closeMs).toISOString()} close — 0 min of ${session} is in this fold, and no snapshot is available. Day PERMANENTLY unreadable. Nothing was lost; it can only be re-read on a later session.`
+        : `process booted ${build.startedAt}, AFTER the ${new Date(openMs).toISOString()} open — the fold covers only ${covered} min of the session. Partial, not gradeable. Re-arm for the next session.`);
+    }
   }
   const partial = now < closeMs;
   if (partial) say(`⚠️  PARTIAL — read ${Math.round((closeMs - now) / 60000)} min BEFORE the 16:00 ET close; counters may still move.`);
@@ -273,6 +287,15 @@ export function grade({ census, journal, session, now }) {
   // ── ATTRIBUTION — and the vacuity guard that makes it mean anything. ───────
   say('');
   say('attribution — voids.recent[] rows minted by THIS process');
+  if (fromSnapshot) {
+    // TRA-3937 — for a durable snapshot read the void journal belongs to the current
+    // (post-deploy) process, not the session that submitted. The journal cannot hold
+    // rows from a process that is no longer running. Skip, not UNREAD: the census
+    // data IS wired — the snapshot on disk is the evidence — and the attribution
+    // check tests the WIRE, not the data. A skip here is "not applicable", which is
+    // different from "not checked" — we say it explicitly.
+    say(`  SKIP  attribution — brokerOutcomesFromSnapshot=true; this process did not see the session's submissions. The snapshot content IS the evidence.`);
+  } else {
   const voids = journal?.voids ?? {};
   const recent = Array.isArray(voids.recent) ? voids.recent : null;
   if (!recent) {
@@ -306,6 +329,7 @@ export function grade({ census, journal, session, now }) {
     for (const r of postBoot) codes[String(r.reasonCode)] = (codes[String(r.reasonCode)] ?? 0) + 1;
     say(`  post-boot by reasonCode: ${Object.entries(codes).map(([k, n]) => `${k}=${n}`).join(' ')}`);
   }
+  } // end !fromSnapshot attribution block
 
   say('');
   if (failures > 0) {
@@ -342,6 +366,7 @@ function happy() {
     liveArmCensus: {
       booksScanned: 67,
       brokerOutcomesEtDay: SESSION,
+      brokerOutcomesFromSnapshot: false,
       books: [
         book('admin', outcome({ book: 'admin', submitted: 4, filled: 3, verdict: 'green' })),
         book('Richard', outcome({ book: 'Richard' }), { realMoneyArmed: false, liveEntryGateOpen: false }),
@@ -427,6 +452,20 @@ async function selftest() {
   afterClose.journal.build.startedAt = '2026-08-21T22:03:30.762Z';
   arm('a boot entirely after the close is FORFEIT and says PERMANENTLY unreadable',
     run(afterClose, Date.parse('2026-08-21T23:00:00Z')), EXIT.FORFEIT, { re: /0 min of .* PERMANENTLY unreadable/s });
+  // Same boot-after-close case, but with snapshot=true on the payload: the grader
+  // must NOT forfeit — the data is durable and complete.
+  const afterCloseSnap = clone(afterClose);
+  afterCloseSnap.census.liveArmCensus.brokerOutcomesFromSnapshot = true;
+  arm('TRA-3937: post-close boot + fromSnapshot=true grades as CLEAN, not FORFEIT',
+    run(afterCloseSnap, Date.parse('2026-08-21T23:00:00Z')), EXIT.CLEAN,
+    { re: /DURABLE READ/ });
+  // A mid-session restart (boot DURING the session) is still FORFEIT regardless
+  // of fromSnapshot — that data is partial (only covers from the restart forward).
+  const midSessionSnap = clone(restarted);
+  midSessionSnap.census.liveArmCensus.brokerOutcomesFromSnapshot = true;
+  midSessionSnap.journal.build.startedAt = '2026-08-21T17:00:00.000Z';
+  arm('TRA-3937: mid-session boot + fromSnapshot=true is still FORFEIT (partial fold)',
+    run(midSessionSnap), EXIT.FORFEIT, { re: /AFTER the .* open/ });
 
   console.log('\nTHE BREAKER PIN — an instrument that NOTICES vs one that REPORTS');
   const unpinned = clone(happy());
