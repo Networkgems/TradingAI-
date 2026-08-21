@@ -304,6 +304,14 @@ import {
   backfillLiveOptionFeesFromGainLoss,
   summarizeLiveOptionsFeeSlippage,
 } from './live-options-fee-slippage-ledger.js';
+// TRA-3932 — WHO OPENED the contracts TRA-3926's detector could not attribute.
+import {
+  setOpenLegProvenanceDataDir,
+  resolveOpenLegProvenance,
+  persistOpenLegProvenance,
+  summarizeStoredProvenance,
+} from './tra3932-open-leg-provenance.js';
+import { detectOversoldEngineCloses } from './tra3926-oversold-close-detector.js';
 // TRA-2820 — live-book "is it actually stopped?" counter for /api/health/options-live.
 import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability, mergeDayOneStopPosture, blindDayOneStopPosture } from './options-account.js';
 import { resolveLiveOptionStopPolicy } from './exit-risk-rules-flag.js';
@@ -4831,6 +4839,12 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
 // readable at /api/health/live-options-fee-slippage. Durable only when DATA_DIR is a
 // persistent mount (else `durability.ephemeral` says so; the fix is DATA_DIR=/data per
 // TRA-1719). Best-effort; compacted to 30 days.
+// TRA-3932 — bind the open-leg provenance store to the same resolved DATA_DIR.
+// There is nothing to hydrate: the file is read on demand and never compacted,
+// because its lines are verdicts about historical contracts reached from broker
+// evidence that expires, not measurements a later run could retake.
+setOpenLegProvenanceDataDir(DATA_DIR);
+
 {
   const h = hydrateLiveOptionsFeeSlippageFromDisk(DATA_DIR);
   if (h.records > 0) {
@@ -11301,6 +11315,91 @@ app.get('/api/health/options-live', async (_req, res) => {
 // redeploy keeps them. Read/reconcile only — moves NO capital. Admin-gated (mutates
 // durable calibration state + reads a broker account). `start`/`end` are
 // `YYYY-MM-DD` (inclusive); both default to a 7-day ET lookback ending today.
+// TRA-3932 — resolve the OPENING LEG of every contract TRA-3926's detector could
+// not attribute, against the ONE Tradier surface that carries order records.
+//
+// READ-ONLY at the broker and at the book: it fetches `/accounts/{id}/orders`,
+// joins it against the fill ledger, and appends verdicts to its own durable
+// JSONL. It moves no capital, restates no row and rewrites no ledger — same
+// posture as TRA-3926 and TRA-3913, which is what this ticket asked for.
+//
+// Admin-gated because it reads a real brokerage account and writes durable state.
+// Deliberately NOT on a tick: the subject set is a FIXED historical population of
+// 11 contracts, so a per-tick broker call would spend a request budget forever to
+// re-ask a question that is either answered or provably unanswerable.
+//
+// ⚠ The `desk_placed` branch is UNREACHABLE from this call site today, and that
+// is stated rather than hidden: `engineSubmittedOrderIds: null` below is the
+// measured fact that we hold no durable record of order ids we SUBMITTED (the id
+// reaches disk only on a FILL), so "absent from our records" cannot be read as
+// "the desk placed it" — it is the same absence the defect is made of. Wiring a
+// real set here is the forward remedy and belongs on its own ticket.
+app.post(
+  '/api/health/live-options-fee-slippage/open-leg-provenance',
+  requireAuth,
+  requireAdmin,
+  async (_req, res) => {
+    const operator = resolveLiveBrokerOperator();
+    const settings = await loadSettings(operator);
+    // TRA-3112 — `/accounts/{id}/orders` is the ACCOUNT surface, same scope as
+    // `listAccountHistory`. Resolved AS the operator; the route is already admin.
+    const client = buildTradierAccountClientForEnv(settings, 'production', operator);
+    if (!client) {
+      res.status(409).json({
+        ok: false,
+        error: 'No production Tradier options credentials resolvable for the live operator',
+      });
+      return;
+    }
+    // `listOrders` swallows auth/network failure into `[]`, exactly as its
+    // siblings do — so an empty list and a failed fetch are indistinguishable
+    // AT THE CLIENT. This is the one place that can tell them apart, and it
+    // must: a failed fetch presenting as "the broker holds no orders" is the
+    // closed-world reading that turns a blind into a false accusation.
+    let brokerOrders: Awaited<ReturnType<typeof client.listOrders>> | null = null;
+    let fetchError: string | null = null;
+    try {
+      brokerOrders = await client.listOrders();
+    } catch (err) {
+      fetchError = err instanceof Error ? err.message : String(err);
+      log.warn('tra3932 open-leg provenance: broker order fetch failed', {
+        operator,
+        reason: fetchError,
+      });
+    }
+    const summary = summarizeLiveOptionsFeeSlippage();
+    const result = resolveOpenLegProvenance({
+      census: detectOversoldEngineCloses(summary.records),
+      records: summary.records,
+      brokerOrders,
+      engineSubmittedOrderIds: null,
+      resolvedAt: Date.now(),
+    });
+    const persisted = persistOpenLegProvenance(result);
+    res.json({
+      ok: true,
+      operator,
+      fetchError,
+      reach: result.reach,
+      subjectContracts: result.subjectContracts,
+      unresolvedContracts: result.unresolvedContracts,
+      contractsByVerdict: result.contractsByVerdict,
+      rows: result.rows,
+      persisted,
+      stored: summarizeStoredProvenance(),
+      // The submit-time witness is the missing instrument, not a missing fetch.
+      issuerWitness: {
+        available: false,
+        reason:
+          'no durable record of order ids this engine SUBMITTED exists — the broker order id reaches '
+          + 'disk only on a FILL (live-options-fee-slippage.jsonl), so an order we placed whose fill the '
+          + 'chokepoint missed leaves no id anywhere. Until that exists, "absent from our records" cannot '
+          + 'refute engine origin and no contract can be charged to the desk.',
+      },
+    });
+  },
+);
+
 app.post('/api/health/live-options-fee-slippage/reconcile', requireAuth, requireAdmin, async (req, res) => {
   const isDate = (v: unknown): v is string => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
   const q = req.query as Record<string, unknown>;

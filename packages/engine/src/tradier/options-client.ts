@@ -368,11 +368,153 @@ export interface TradierTradeHistoryFill {
    */
   transactionId: string;
   /**
-   * Tradier order id from `trade.order_id`. Present on production fills;
-   * absent (null) on sandbox or when Tradier omits it. Use as the
-   * primary join key for commission back-fill when available (TRA-2810).
+   * Tradier order id from `trade.order_id`, when the broker sends one.
+   *
+   * ⚠ **TRA-3932 — "present on production fills" was WRONG, and it cost a ticket.**
+   * This line used to promise a production order id, and TRA-3932 was filed on the
+   * strength of it ("the discriminator that exists is the broker's order history …
+   * that answer is one fetch away"). Measured on the live production account
+   * 2026-08-21: `orderId` is `null` on **every** option row `/history` has returned
+   * — 4/4 in the reconcile's own `lastHistorySample` and 13/13 on the
+   * `origin:'history_import'` rows the importer minted from them, against 38/38
+   * ids present on fill-time rows. The importer is not dropping it; the broker
+   * never sends it on this account.
+   *
+   * So this field is a BONUS join key for commission back-fill (TRA-2810) when it
+   * happens to arrive, and it is NOT a provenance instrument. The only Tradier
+   * surface that carries order records is {@link TradierOptionsClient.listOrders}.
    */
   orderId: number | null;
+}
+
+/**
+ * TRA-3932 — one row of `/accounts/{id}/orders`, normalised.
+ *
+ * Every field here is the BROKER's account-level record of an order. None of them
+ * says WHO placed it: an order typed into Tradier's web dashboard and an order
+ * this engine POSTed are the same shape, and we set no `tag`. Provenance is
+ * therefore a JOIN against our own side, never a property of this row — see
+ * `tra3932-open-leg-provenance.ts`.
+ */
+export interface TradierAccountOrder {
+  /** Tradier order id — the join key against any id we recorded ourselves. */
+  id: number;
+  /** `filled` / `canceled` / `rejected` / `expired` / `open` / `pending` / `error`. */
+  status: string;
+  /** `option`, `equity`, `multileg`, `combo`, … Only `option` rows can carry an OCC. */
+  orderClass: string;
+  /** `buy_to_open` / `sell_to_close` / … Absent on some multileg envelopes. */
+  side: string | null;
+  /** Underlying ticker Tradier keyed the order under. */
+  symbol: string | null;
+  /** OCC contract, when the order was an option order. */
+  optionSymbol: string | null;
+  /** Contracts ordered (not necessarily filled). */
+  quantity: number | null;
+  /** Contracts actually executed. */
+  execQuantity: number | null;
+  avgFillPrice: number | null;
+  /** ISO timestamp Tradier stamped when the order was CREATED — the reach axis. */
+  createDate: string | null;
+  /** ISO timestamp of the last transaction on the order. */
+  transactionDate: string | null;
+  /**
+   * Caller-set order tag, when the account is queried with `includeTags`. We have
+   * never set one on any submit path, so this is expected to be `null` on every
+   * historical row; it is parsed anyway because a `null` we PARSED and a field we
+   * never looked at are different evidence.
+   */
+  tag: string | null;
+}
+
+/** Tradier returns `T | T[]`, sometimes the string `'null'` when there are none. */
+interface TradierOrdersEnvelope {
+  orders?: { order?: TradierRawOrderRow | TradierRawOrderRow[] } | string | null;
+}
+
+interface TradierRawOrderRow {
+  id?: unknown;
+  status?: unknown;
+  class?: unknown;
+  side?: unknown;
+  symbol?: unknown;
+  option_symbol?: unknown;
+  quantity?: unknown;
+  exec_quantity?: unknown;
+  avg_fill_price?: unknown;
+  create_date?: unknown;
+  transaction_date?: unknown;
+  tag?: unknown;
+  /** Multileg orders nest their contracts here. */
+  leg?: unknown;
+}
+
+/** Coerce to a finite number, or `null`. Tradier sends numerics as both string and number. */
+function orderNumber(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string' && v.trim() !== '') {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function orderString(v: unknown): string | null {
+  return typeof v === 'string' && v !== '' ? v : null;
+}
+
+/**
+ * TRA-3932 — normalise the `/accounts/{id}/orders` envelope.
+ *
+ * Multileg orders carry their contracts on nested `leg[]` rows rather than a
+ * top-level `option_symbol`; those legs are FLATTENED into one normalised row per
+ * leg, sharing the parent's id and create date. Dropping them would make an OCC
+ * that was only ever traded inside a spread read as "no order record", which is
+ * the false-negative direction and the one that turns into a false accusation
+ * downstream.
+ *
+ * A row whose `id` will not coerce is dropped: an order record with no id cannot
+ * be joined to anything and is not evidence about provenance.
+ */
+export function parseTradierOrders(envelope: TradierOrdersEnvelope | null): TradierAccountOrder[] {
+  if (!envelope || typeof envelope.orders !== 'object' || envelope.orders == null) return [];
+  const out: TradierAccountOrder[] = [];
+  for (const raw of asArray(envelope.orders.order)) {
+    const id = orderNumber(raw.id);
+    if (id === null) continue;
+    const base = {
+      id,
+      status: orderString(raw.status) ?? 'unknown',
+      orderClass: orderString(raw.class) ?? 'unknown',
+      symbol: orderString(raw.symbol),
+      createDate: orderString(raw.create_date),
+      transactionDate: orderString(raw.transaction_date),
+      tag: orderString(raw.tag),
+    };
+    const legs = Array.isArray(raw.leg) ? raw.leg : raw.leg != null ? [raw.leg] : [];
+    if (legs.length > 0) {
+      for (const legRaw of legs as TradierRawOrderRow[]) {
+        out.push({
+          ...base,
+          side: orderString(legRaw.side) ?? orderString(raw.side),
+          optionSymbol: orderString(legRaw.option_symbol),
+          quantity: orderNumber(legRaw.quantity) ?? orderNumber(raw.quantity),
+          execQuantity: orderNumber(legRaw.exec_quantity) ?? orderNumber(raw.exec_quantity),
+          avgFillPrice: orderNumber(legRaw.avg_fill_price) ?? orderNumber(raw.avg_fill_price),
+        });
+      }
+      continue;
+    }
+    out.push({
+      ...base,
+      side: orderString(raw.side),
+      optionSymbol: orderString(raw.option_symbol),
+      quantity: orderNumber(raw.quantity),
+      execQuantity: orderNumber(raw.exec_quantity),
+      avgFillPrice: orderNumber(raw.avg_fill_price),
+    });
+  }
+  return out;
 }
 
 /**
@@ -807,6 +949,47 @@ export class TradierOptionsClient extends TradierOrderClient {
       `/accounts/${encodeURIComponent(this.accountId)}/history?${params}`,
     );
     return parseTradierHistory(data);
+  }
+
+  /**
+   * TRA-3932 — list the account's ORDER records (`/accounts/{id}/orders`).
+   *
+   * This is the ONLY Tradier surface that returns *orders*; every other reader on
+   * this client (`/history`, `/gainloss`, `/positions`) returns *executions* or
+   * *state*. The distinction is the whole point of this method: a provenance
+   * question ("was there an order for this contract, and what was its id") is not
+   * answerable from an execution row, and on THIS production account it provably
+   * is not — `/history` serves `trade.order_id` as `null` on every option row it
+   * has ever returned here (TRA-3932 measured 4/4 broker rows and 13/13 imported
+   * ledger rows), notwithstanding the "present on production fills" note on
+   * {@link TradierTradeHistoryFill.orderId}.
+   *
+   * ⚠ **The window is a MEASUREMENT, not a promise.** Tradier documents no date
+   * range on this endpoint and `scripts/tra3299-sandbox-attribution.mjs` already
+   * records "its /orders covers the CURRENT trading day only" for sandbox. The
+   * caller must therefore read {@link TradierAccountOrder.createDate} and decide
+   * for itself whether the list reaches the day it is asking about — an order the
+   * endpoint never served is NOT evidence that no order existed. Consuming this
+   * as a closed world is how a reader manufactures a false accusation, which is
+   * exactly the defect TRA-3926's detector shipped with.
+   *
+   * Returns `[]` on auth / network failure, matching the other account readers.
+   * `[]` is therefore ambiguous BY CONSTRUCTION between "no orders" and "could not
+   * read", and callers that need to tell those apart must gate on their own
+   * evidence (see `tra3932-open-leg-provenance.ts`, which refuses to grade a
+   * subject against an empty list).
+   */
+  async listOrders(options: { includeTags?: boolean } = {}): Promise<TradierAccountOrder[]> {
+    const params = new URLSearchParams();
+    // `includeTags` costs nothing and is the one field that could ever carry a
+    // caller-set provenance marker. We have never set one (no submit path passes
+    // `tag`), so it is expected to be absent — recorded so a future submit-time
+    // tag becomes readable here without a second change.
+    if (options.includeTags !== false) params.set('includeTags', 'true');
+    const data = await this.getJson<TradierOrdersEnvelope>(
+      `/accounts/${encodeURIComponent(this.accountId)}/orders?${params}`,
+    );
+    return parseTradierOrders(data);
   }
 
   /**

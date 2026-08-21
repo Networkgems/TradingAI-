@@ -40,6 +40,7 @@ import {
 // money: an engine `sell_to_close` for more contracts than the engine's own
 // opens covered. Independent of the exit-path bound by design.
 import { detectOversoldEngineCloses } from '../tra3926-oversold-close-detector.js';
+import { summarizeStoredProvenance } from '../tra3932-open-leg-provenance.js';
 import {
   isOptionExecEnabled,
   isOptionEmaPullbackEnabled,
@@ -4684,6 +4685,23 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // Counts + OCC symbols only — no user identifiers (TRA-2163); the symbols
       // are already published on `records[]` immediately below.
       oversoldCloses: detectOversoldEngineCloses(summary.records),
+      // TRA-3932 — WHO OPENED the contracts `oversoldCloses` could not attribute.
+      //
+      // This is the DURABLE STORE, not a re-derivation: it reports what the
+      // resolver concluded when it was last run against the broker's order list,
+      // because that evidence expires (see `tra3932-open-leg-provenance.ts`). A
+      // subject with `terminal: true` is ANSWERED and will never be re-graded; a
+      // subject sitting on a blind carries `attempts` + `detail` naming exactly
+      // which limb refused, so a permanent blind reads as a measured finding
+      // rather than as work nobody did.
+      //
+      // `subjects: 0` means the resolver has never been run on this box — NOT
+      // that there is nothing to answer for. Read `oversoldCloses.blindCloses`
+      // above for the population. The resolver is triggered explicitly at
+      // POST /api/health/live-options-fee-slippage/open-leg-provenance (admin);
+      // it is not on a tick, because it reaches the broker and the subject set
+      // is a fixed historical population, not a stream.
+      openLegProvenance: summarizeStoredProvenance(),
       note: summary.durability.ephemeral
         ? `NOT DURABLE — DATA_DIR is ephemeral (${summary.durability.dataDir ?? 'memory-only'}); these ${summary.n} fill(s) die at the next reboot and the calibration is not captured. Fix = DATA_DIR=/data on bqb1 (TRA-1719). Read durability.ephemeral before trusting any count.`
         : `DURABLE: ${summary.n} fill(s) on ${summary.durability.dataDir}. fees auto-back-fill on the boot kick + ET hourly tick (TRA-2810/TRA-2850; ${summary.feesMeasured}/${summary.n} measured — see autoReconcile.unmeasured* for the pending/awaiting-close/aged split, and autoReconcile.stalled for the non-green state): real production fees derive from settled /gainloss cost/proceeds (history commission is 0 on every production row and only joins when positive). TRA-2959: slippage.nMeasured states its denominator (${summary.slippage.nMeasured}/${summary.slippage.nTotal}; ${summary.slippage.excludedNoAskQuote} excluded by name: no submit-time ask — market/emergency exits + history imports), and autoReconcile.coverage cross-checks the ledger against broker account-history — missingContracts > 0 means fills NO code path recorded (the 2026-08-04 silence appendErrors cannot see); the same pass imports them as origin:'history_import' rows.`,
