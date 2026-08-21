@@ -19,9 +19,13 @@
 //   3 UNBOUND  Σ B_i fits, but the BOUND THAT MAKES IT FIT IS NOT IN FORCE (below)
 //   1 EXPOSURE Σ B_i fits and the bound is in force, but the fleet's REACHABLE
 //              exposure — Σ max(cap_i, atRisk_i) — is over A anyway (below)
-//   3 INCOHERENT the served grade contradicts itself: it publishes a
-//              `fleetSizedMaxSumUsd` CEILING below the `sumBookCapUsd` it is
-//              serving, so its headroom columns are fiction (TRA-3903)
+//   3 INCOHERENT the instrument contradicts itself. TWO triggers: (a) it
+//              publishes a `fleetSizedMaxSumUsd` CEILING below the
+//              `sumBookCapUsd` it is serving, so its headroom columns are
+//              fiction (TRA-3903); (b) the served `admissibleEntryUsd` does not
+//              reproduce from `max(0, min(cap_i − atRisk_i, A − Σ atRisk))`
+//              folded over the armed rows BY THIS READER (TRA-3737 §4) — the
+//              column the reachable number is now built from
 //   Precedence BLIND > BREACH > EXPOSURE > UNBOUND > INCOHERENT > CLEAN.
 
 export const EXIT = {
@@ -347,6 +351,140 @@ function gradeReachableExposure(armed, A) {
 }
 
 /**
+ * TRA-3737 §4 — DOES THE SERVED `admissibleEntryUsd` REPRODUCE FROM THE RULE?
+ *
+ * 🔴 THE READER STOPPED BEING INDEPENDENT THE MOMENT IT STARTED READING THE
+ * ANSWER. Up to `020100dc56aa` the reachable check computed
+ * `Σ max(cap_i, atRisk_i)` from two raw columns and could contradict the server.
+ * TRA-3911 made that closed form invariant under its own fix, so the check above
+ * now prefers the row's OWN `admissibleEntryUsd` — correct, and it means the
+ * headline number is the server's own arithmetic graded against itself. A check
+ * that takes both operands from the same source certifies itself (TRA-3903, the
+ * `>=` on a low-balled `Σ E_i` that could no longer fail permissive).
+ *
+ * So this grades the SERVED admissible against the RULE THE BOARD RATIFIED,
+ * recomputed here from columns the order site did not get to pick:
+ *
+ *     admissible_i ≡ max(0, min(cap_i − atRisk_i, A − Σ_j atRisk_j))
+ *
+ * with `Σ_j atRisk_j` folded HERE over the armed rows, never taken from the
+ * served `fleetAtRiskUsd`. That fold is the fail-open direction and the reason
+ * this check exists: a fleet term computed over an INCOMPLETE population makes
+ * `A − Σ atRisk` too LARGE, every `admissible_i` too generous, and the fleet
+ * reachable past A while every column still agrees with every other column.
+ * It is the §x58/§x80 partial-population trap wearing the order site's hat.
+ *
+ * ⚠ UNGRADED, NOT RED, on any build whose rows omit `admissibleEntryUsd`
+ * (pre-TRA-3911). Those bytes have no fleet term to reproduce, the reachable
+ * check already grades them with the per-book closed form, and a reader that is
+ * red on every old build gets muted — the empty room this ticket exists to close.
+ *
+ * ⚠ ONE-SIDED. Only `served > identity` (and only a fleet term folded over LESS
+ * at-risk than the reader can see) changes the verdict — see the block below.
+ *
+ * ⚠ TOLERANCE 1¢, and it is not slack: the served operands are themselves
+ * rounded to cents and the server floors its own sizing (TRA-3903 — the route
+ * publishes `fleetSizedHeadroomUsd 0.00` where the true figure is `$0.01`). A
+ * float-exact predicate here would page on the rounding, which is TRA-3881's
+ * permanent false alarm reborn one column over.
+ */
+function gradeAdmissibleIdentity(armed, A, served) {
+  const ungraded = reason => ({ graded: false, reason, perBook: [] });
+  if (armed.length === 0 || !usable(A)) {
+    return ungraded('no armed books, or no usable A on this build');
+  }
+  const withField = armed.filter(r => Number.isFinite(r?.admissibleEntryUsd));
+  if (withField.length !== armed.length) {
+    return ungraded(
+      `${armed.length - withField.length} of ${armed.length} armed row(s) publish no admissibleEntryUsd `
+      + '— pre-TRA-3911 bytes carry no fleet term to reproduce (the reachable check grades those)',
+    );
+  }
+  if (armed.some(r => !Number.isFinite(r?.openPremiumAtRiskUsd) || !Number.isFinite(r?.capUsd))) {
+    return ungraded('an armed row omits capUsd or openPremiumAtRiskUsd — the identity has no operands');
+  }
+
+  // OUR fold, over OUR armed set. Never `served.fleetAtRiskUsd` — that is the
+  // column under test.
+  const observedFleetAtRiskUsd = sumCents(armed, 'openPremiumAtRiskUsd');
+  const fleetHeadroomSignedUsd = Math.round((A - observedFleetAtRiskUsd) * 100) / 100;
+  const cents = v => Math.round(v * 100);
+  const TOL = 1; // one cent, see above
+
+  const perBook = armed.map(r => {
+    const bookHeadroom = Math.round((r.capUsd - r.openPremiumAtRiskUsd) * 100) / 100;
+    const expected = Math.round(Math.max(0, Math.min(bookHeadroom, fleetHeadroomSignedUsd)) * 100) / 100;
+    const deltaCents = cents(r.admissibleEntryUsd) - cents(expected);
+    return {
+      book: r.book ?? '<unnamed>',
+      servedAdmissibleUsd: r.admissibleEntryUsd,
+      bookHeadroomSignedUsd: bookHeadroom,
+      expectedAdmissibleUsd: expected,
+      deltaUsd: Math.round(deltaCents) / 100,
+      reproduces: Math.abs(deltaCents) <= TOL,
+      // The order site's OWN view of the fleet term, per row.
+      servedFleetAtRiskUsd: Number.isFinite(r.fleetAtRiskUsd) ? r.fleetAtRiskUsd : null,
+      servedFleetAtRiskBooks: Number.isFinite(r.fleetAtRiskBooks) ? r.fleetAtRiskBooks : null,
+      admissibleBoundBy: r.admissibleBoundBy ?? null,
+    };
+  });
+
+  // ⭐⭐⭐ THE PREDICATE IS ONE-SIDED, AND THAT IS NOT A WEAKENING — IT IS THE
+  // DIFFERENCE BETWEEN AN ALARM AND A MUTED READER. Served ABOVE the identity is
+  // the fail-open: the order site handed a book more room than the ratified rule
+  // allows, so the next entry can widen the fleet past A. Served BELOW it is the
+  // order site REFUSING — `no_balance_snapshot`, `fleet_unreadable`, any future
+  // fail-closed branch — and a reader that pages on a refusal pages on exactly
+  // the readings we most want it to survive. Under-serves are published as
+  // `sizedDown`, never as a verdict.
+  //
+  // Same rule applied to the population: a fleet term folded over FEWER books
+  // understates Σ atRisk and LOOSENS every admissible. Folded over more, it
+  // tightens. Only the loosening direction is graded, and `fleetAtRiskBooks` is
+  // reported as CONTEXT rather than graded on its own — the count's exact
+  // semantics are the server's to change, while the dollar comparison against a
+  // fold this reader did itself cannot be argued with.
+  const populationMismatches = perBook
+    .filter(b => b.servedFleetAtRiskUsd !== null && cents(b.servedFleetAtRiskUsd) < cents(observedFleetAtRiskUsd) - TOL)
+    .map(b => `${b.book}: order site folded Sum atRisk $${b.servedFleetAtRiskUsd.toFixed(2)} where the armed rows `
+      + `sum to $${observedFleetAtRiskUsd.toFixed(2)} -- UNDERSTATED, so A - Sum atRisk came out too large`
+      + (b.servedFleetAtRiskBooks !== null ? ` (it counted ${b.servedFleetAtRiskBooks} book(s), the reader sees ${armed.length})` : ''));
+
+  const identityMismatches = perBook
+    .filter(b => b.deltaUsd > 0 && !b.reproduces)
+    .map(b => `${b.book}: served admissible $${b.servedAdmissibleUsd.toFixed(2)} vs `
+      + `max(0, min(cap-atRisk $${b.bookHeadroomSignedUsd.toFixed(2)}, `
+      + `A-Sum atRisk $${fleetHeadroomSignedUsd.toFixed(2)})) = $${b.expectedAdmissibleUsd.toFixed(2)} `
+      + `-- TOO GENEROUS by $${b.deltaUsd.toFixed(2)}`);
+
+  const sizedDown = perBook
+    .filter(b => b.deltaUsd < 0 && !b.reproduces)
+    .map(b => `${b.book}: served $${b.servedAdmissibleUsd.toFixed(2)} BELOW the rule's $${b.expectedAdmissibleUsd.toFixed(2)} `
+      + `[boundBy ${b.admissibleBoundBy ?? 'unstated'}] -- the order site refused room it was entitled to, which `
+      + 'cannot widen the fleet; reported, not graded');
+
+  const mismatches = [...identityMismatches, ...populationMismatches];
+  return {
+    graded: true,
+    coherent: mismatches.length === 0,
+    observedFleetAtRiskUsd,
+    fleetHeadroomSignedUsd,
+    servedFleetAtRiskUsd: Number.isFinite(served?.fleetAtRiskUsd) ? served.fleetAtRiskUsd : null,
+    servedSumAdmissibleUsd: Number.isFinite(served?.sumAdmissibleEntryUsd) ? served.sumAdmissibleEntryUsd : null,
+    expectedSumAdmissibleUsd: sumCents(perBook, 'expectedAdmissibleUsd'),
+    toleranceUsd: TOL / 100,
+    perBook,
+    mismatches,
+    sizedDown,
+    reason: (mismatches.length === 0
+      ? `every served admissibleEntryUsd is at or below max(0, min(cap_i - atRisk_i, A - Sum atRisk $${observedFleetAtRiskUsd.toFixed(2)})), `
+        + `folded over all ${armed.length} armed book(s) by the reader`
+      : `the served admissible column exceeds the ratified rule: ${mismatches.join('; ')}`)
+      + (sizedDown.length > 0 ? `. Sized DOWN (not graded): ${sizedDown.join('; ')}` : ''),
+  };
+}
+
+/**
  * Grade one reading of the live fleet bound.
  *
  * @param {object}  arg
@@ -618,6 +756,41 @@ export function gradeFleetBound({ live, fee, expectCommit = null, measuredAt }) 
   // is: "what can the fleet reach" is evidence a CLEAN reading needs, and a
   // BREACH reading is entitled to be judged against it too.
   out.reachableExposure = gradeReachableExposure(armed, typeof A === 'number' ? A : NaN);
+
+  // TRA-3737 §4 — published on EVERY verdict, like boundInForce: "is the number
+  // I just quoted the server's own arithmetic, checked against the rule?" is
+  // evidence a CLEAN needs and a BREACH is entitled to be judged against.
+  out.admissibleIdentity = gradeAdmissibleIdentity(armed, typeof A === 'number' ? A : NaN, served);
+
+  // A failed identity is an INSTRUMENT finding, not a fleet finding — the same
+  // class as the ceiling contradiction above, so it takes the same verdict and
+  // the same exit code rather than inventing a sixth string for a carrier prompt
+  // to not know about (§x81: shipping a new verdict means editing every prompt
+  // that switches on the old one). It upgrades a CLEAN, APPENDS to an existing
+  // INCOHERENT, and touches nothing louder: BREACH/EXPOSURE are findings about
+  // the money, UNBOUND is a finding about the bound, and re-labelling either
+  // with a more procedural word is how a loud finding gets re-read as a caveat.
+  if ((verdict === 'CLEAN' || verdict === 'INCOHERENT') && out.admissibleIdentity.graded === true && out.admissibleIdentity.coherent === false) {
+    const ai = out.admissibleIdentity;
+    const tooGenerous = ai.perBook.some(b => b.deltaUsd > 0);
+    if (verdict === 'CLEAN') {
+      out.servedReason = out.reason;
+      out.reason = '';
+    }
+    verdict = 'INCOHERENT';
+    code = EXIT.INCOHERENT;
+    out.reason = (out.reason ? `${out.reason} ALSO: ` : '')
+      + `THE ORDER PATH'S OWN ADMISSIBLE COLUMN DOES NOT REPRODUCE FROM THE RULE THE BOARD RATIFIED `
+      + `(A bounds REACHABLE capital, TRA-3703 4b54935e). ${ai.reason}. `
+      + `The reader's reachable number is built FROM that column, so on this reading it is grading the `
+      + `server's arithmetic against itself and cannot be read as an independent pass. `
+      + (tooGenerous
+        ? 'At least one book was allowed MORE than the rule permits, which is the fail-open direction: '
+          + 'the next entry can widen the fleet past A with every published column still agreeing. '
+        : 'The order site folded a SMALLER Sum atRisk than the armed rows carry, so its A - Sum atRisk term '
+          + 'came out too large -- the partial-population fail-open, one level down from TRA-3723. ')
+      + 'This is exit 3, NOT a pass.';
+  }
 
   // EXPOSURE upgrades a CLEAN **and an UNBOUND** — it outranks UNBOUND because
   // it is a DEFINITE finding ("the fleet can reach $X > A") against a

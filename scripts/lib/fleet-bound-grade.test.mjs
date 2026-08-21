@@ -780,3 +780,139 @@ test('TRA-3903 check #2 still falls back to cash on pre-TRA-3897 rows — old bu
   assert.equal(out.boundInForce.observedFleetCapitalUsd, 1150.04, 'cash IS E_i on those bytes');
   assert.equal(verdict, 'CLEAN');
 });
+
+// --------------------------------------------------------------------------
+// TRA-3737 §4 — THE ADMISSIBLE IDENTITY.
+//
+// TRA-3911 made `Σ max(cap_i, atRisk_i)` invariant under its own fix, so the
+// reachable check now reads the row's own `admissibleEntryUsd`. Correct — and it
+// means the headline number is the server's arithmetic graded against itself. A
+// check that takes both operands from the same source certifies itself, which is
+// the TRA-3903 defect one column over. These controls prove the reader can still
+// contradict the server.
+//
+// Fixture: `tra3737-live-reachable-enforced-2026-08-21.json` — a VERBATIM
+// capture of `404e8e5bd919` at 2026-08-21T02:2xZ, the first build on which the
+// order path publishes the column. Green control and mutation base both.
+// --------------------------------------------------------------------------
+
+const ENFORCED = path.join(HERE, '..', 'fixtures', 'tra3737-live-reachable-enforced-2026-08-21.json');
+const enforced = JSON.parse(fs.readFileSync(ENFORCED, 'utf8'));
+const cloneEnforced = () => JSON.parse(JSON.stringify(enforced));
+const gradeEnforced = over => gradeFleetBound({ ...cloneEnforced(), expectCommit: null, measuredAt: AT, ...over });
+
+test('TRA-3737 s4 GREEN: the live capture reproduces every served admissible from the rule', () => {
+  const { verdict, code, out } = gradeEnforced();
+  const ai = out.admissibleIdentity;
+  assert.equal(ai.graded, true);
+  assert.equal(ai.coherent, true, ai.reason);
+  // The rule, worked on the real books: admin is $51.68 OVER its own cap so it
+  // is entitled to nothing; v0nni's own headroom is $193.67 but the FLEET term
+  // A - Σ atRisk = $500 - $358 = $142 binds it. That $142 is what makes
+  // reachable land on A exactly.
+  assert.equal(ai.observedFleetAtRiskUsd, 358);
+  assert.equal(ai.fleetHeadroomSignedUsd, 142);
+  const byBook = Object.fromEntries(ai.perBook.map(b => [b.book, b]));
+  assert.equal(byBook.admin.expectedAdmissibleUsd, 0);
+  assert.equal(byBook.v0nni.expectedAdmissibleUsd, 142);
+  assert.equal(byBook.v0nni.servedAdmissibleUsd, 142);
+  assert.equal(verdict, 'CLEAN');
+  assert.equal(code, EXIT.CLEAN);
+});
+
+test('TRA-3737 s4 RED: a book handed MORE than the rule allows is caught, and the MONEY finding outranks it', () => {
+  const fee = cloneEnforced().fee;
+  // v0nni's own headroom is $193.67, so an order path that dropped the FLEET
+  // term would publish exactly this — and every other column would still agree
+  // with it. That is the whole reason the check exists.
+  for (const r of armedOf(fee)) if (r.book === 'v0nni') r.admissibleEntryUsd = 193.67;
+  const { verdict, code, out } = gradeFleetBound({ live: cloneEnforced().live, fee, measuredAt: AT });
+  // reachable is now $551.67 > A, so EXPOSURE — the MONEY finding — outranks the
+  // instrument finding. The identity is still published and still says why.
+  assert.equal(verdict, 'EXPOSURE');
+  assert.equal(code, EXIT.EXPOSURE);
+  assert.equal(out.admissibleIdentity.coherent, false);
+  assert.match(out.admissibleIdentity.reason, /TOO GENEROUS by \$51\.67/);
+});
+
+test('TRA-3737 s4 RED isolated: over the rule but still inside A is INCOHERENT on its own', () => {
+  // A is DATA, so the honest isolation raises it rather than inventing a
+  // scenario the books cannot produce: at A $560 the rule gives v0nni
+  // min($193.67, $560 - $358 = $202) = $193.67, and reachable $551.67 fits.
+  const mk = admissible => {
+    const fee = cloneEnforced().fee;
+    // A is `fee.aggregateCapUsd` — the row/grade `fleetCapUsd` columns are
+    // echoes, and setting only those would leave the grader on the old A.
+    fee.aggregateCapUsd = 560;
+    fee.aggregateFleetBound.fleetCapUsd = 560;
+    for (const r of armedOf(fee)) { r.fleetCapUsd = 560; if (r.book === 'v0nni') r.admissibleEntryUsd = admissible; }
+    return gradeFleetBound({ live: cloneEnforced().live, fee, measuredAt: AT });
+  };
+  const ok = mk(193.67);
+  assert.equal(ok.out.admissibleIdentity.coherent, true, ok.out.admissibleIdentity.reason);
+  assert.equal(ok.verdict, 'CLEAN', 'reachable $551.67 fits A $560');
+
+  const bad = mk(196);           // $2.33 over the rule, reachable $554 — still inside A
+  assert.equal(bad.out.admissibleIdentity.coherent, false);
+  assert.equal(bad.verdict, 'INCOHERENT', 'no money finding here — the instrument alone is wrong');
+  assert.equal(bad.code, EXIT.INCOHERENT);
+  assert.match(bad.out.reason, /DOES NOT REPRODUCE FROM THE RULE/);
+  assert.match(bad.out.reason, /exit 3, NOT a pass/);
+});
+
+test('TRA-3737 s4 RED: a fleet term folded over a PARTIAL population is caught by the reader own fold', () => {
+  const fee = cloneEnforced().fee;
+  // The order site's own view of Σ atRisk drops admin's $358 — the §x58/§x80
+  // partial-population trap at the ORDER SITE. Its admissible arithmetic stays
+  // self-consistent; only the reader's independent fold disagrees.
+  for (const r of armedOf(fee)) { r.fleetAtRiskUsd = 0; r.fleetAtRiskBooks = 1; }
+  const { verdict, code, out } = gradeFleetBound({ live: cloneEnforced().live, fee, measuredAt: AT });
+  assert.equal(out.admissibleIdentity.coherent, false);
+  assert.match(out.admissibleIdentity.reason, /UNDERSTATED, so A - Sum atRisk came out too large/);
+  assert.match(out.admissibleIdentity.reason, /it counted 1 book\(s\), the reader sees 2/);
+  assert.equal(verdict, 'INCOHERENT');
+  assert.equal(code, EXIT.INCOHERENT);
+});
+
+test('TRA-3737 s4 a fail-CLOSED refusal is NEVER an alarm — the predicate is one-sided on purpose', () => {
+  const fee = cloneEnforced().fee;
+  // `fleet_unreadable` / `no_balance_snapshot` publish admissible 0 while the
+  // rule would allow $142. A two-sided predicate pages on exactly the readings
+  // we most need the reader to survive, and a reader that pages on a refusal
+  // gets muted — which is the empty room this ticket exists to close.
+  for (const r of armedOf(fee)) if (r.book === 'v0nni') { r.admissibleEntryUsd = 0; r.admissibleBoundBy = 'fleet_unreadable'; }
+  const { verdict, out } = gradeFleetBound({ live: cloneEnforced().live, fee, measuredAt: AT });
+  assert.equal(out.admissibleIdentity.coherent, true);
+  assert.equal(out.admissibleIdentity.sizedDown.length, 1);
+  assert.match(out.admissibleIdentity.reason, /boundBy fleet_unreadable/);
+  assert.equal(verdict, 'CLEAN');
+});
+
+test('TRA-3737 s4 TOLERANCE: 1c of rounding is not a finding, 2c is', () => {
+  const at = d => {
+    const fee = cloneEnforced().fee;
+    for (const r of armedOf(fee)) if (r.book === 'v0nni') r.admissibleEntryUsd = Math.round((142 + d) * 100) / 100;
+    return gradeFleetBound({ live: cloneEnforced().live, fee, measuredAt: AT }).out.admissibleIdentity;
+  };
+  assert.equal(at(0.01).coherent, true, 'the server floors its own sizing to cents (TRA-3903)');
+  assert.equal(at(0.02).coherent, false);
+});
+
+test('TRA-3737 s4 UNGRADED, not red, on pre-TRA-3911 bytes that publish no admissible column', () => {
+  for (const g of [grade(), gradeFixed(), gradeExposed()]) {
+    assert.equal(g.out.admissibleIdentity.graded, false, `${g.verdict} should be ungraded`);
+    assert.match(g.out.admissibleIdentity.reason, /publish no admissibleEntryUsd/);
+  }
+  // and the verdicts those captures already earned are untouched
+  assert.equal(grade().verdict, 'BREACH');
+  assert.equal(gradeFixed().verdict, 'CLEAN');
+  assert.equal(gradeExposed().verdict, 'EXPOSURE');
+});
+
+test('TRA-3737 s4 the admissibleIdentity block is published on EVERY verdict', () => {
+  const all = [grade(), gradeFixed(), gradeExposed(), gradeEnforced(), gradeFleetBound({ ...cloneContradiction(), measuredAt: AT })];
+  for (const g of all) {
+    assert.ok(Object.prototype.hasOwnProperty.call(g.out, 'admissibleIdentity'), `missing on ${g.verdict}`);
+    assert.ok('graded' in g.out.admissibleIdentity);
+  }
+});

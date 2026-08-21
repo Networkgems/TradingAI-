@@ -135,7 +135,12 @@ if (asJson) {
   // equal by construction, so this line is not noise — it is only ever news.
   const re = out.reachableExposure ?? {};
   if (re.graded) {
-    console.log(`  reach   $${re.reachableUsd.toFixed(2)} = Sum max(cap_i, atRisk_i)  vs A $${re.fleetCapUsd.toFixed(2)}${re.breach ? `   OVER BY $${re.overageUsd.toFixed(2)}` : ''}`);
+    // ⚠ NAME THE FORMULA ACTUALLY USED. Post-TRA-3911 the per-book term is
+    // `atRisk_i + admissible_i`, and printing `max(cap_i, atRisk_i)` over it
+    // published a number that does not reproduce from the label — live, v0nni
+    // contributed $142.00 where `max($193.67, $0)` reads $193.67.
+    const formula = re.ruleEnforced ? 'Sum (atRisk_i + admissible_i)' : 'Sum max(cap_i, atRisk_i)';
+    console.log(`  reach   $${re.reachableUsd.toFixed(2)} = ${formula}  vs A $${re.fleetCapUsd.toFixed(2)}${re.breach ? `   OVER BY $${re.overageUsd.toFixed(2)}` : ''}`);
     for (const b of re.perBook) {
       console.log(
         `          ${b.book}: cap $${b.capUsd.toFixed(2)} at-risk $${b.openPremiumAtRiskUsd.toFixed(2)}`
@@ -145,6 +150,21 @@ if (asJson) {
     }
   } else {
     console.log(`  reach   not graded: ${re.reason}`);
+  }
+  // ⭐ Printed on EVERY verdict, and printed right under `reach` on purpose:
+  // this is the line that says whether the number above was checked against the
+  // ratified rule or merely echoed back from the server that produced it.
+  const ai = out.admissibleIdentity ?? {};
+  if (ai.graded) {
+    console.log(
+      `  ident   served admissible ${ai.coherent ? 'REPRODUCES' : 'DOES NOT REPRODUCE'} from `
+      + `max(0, min(cap_i-atRisk_i, A-Sum atRisk $${ai.observedFleetAtRiskUsd.toFixed(2)}))`
+      + ` [reader's own fold over ${ai.perBook.length} armed book(s)]`,
+    );
+    for (const m of ai.mismatches) console.log(`          MISMATCH ${m}`);
+    for (const s of ai.sizedDown) console.log(`          sized down (not graded) ${s}`);
+  } else {
+    console.log(`  ident   not graded: ${ai.reason ?? 'absent'}`);
   }
   if (out.partial) console.log(`  ${out.partial}`);
 }
