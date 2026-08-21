@@ -210,17 +210,40 @@ describe('per-lot adoption of desk-added Tradier lots (TRA-3909)', () => {
     expect(xlfDesk!.adoptionAuthority).toBe('desk_add');
   });
 
-  it('AC1b — every adopted lot has an ARMED stop the engine may actually act on', () => {
+  it('AC1b — an adopted lot gets its own ARMED stop LEVEL, and ruling B decides who fires it', () => {
     const acct = freshAccount();
     acct.reconcileTradierPositions(BROKER_AT_2338, 'live');
 
-    for (const lot of acct.getState().openOptions.filter(o => o.adoptionAuthority === 'desk_add')) {
+    const deskLots = acct.getState().openOptions.filter(o => o.adoptionAuthority === 'desk_add');
+    expect(deskLots.length).toBeGreaterThan(0);   // a denominator, so the loop cannot pass vacuously
+
+    const GRANT = { grantedAt: '2026-08-21T20:00:00Z', grantedBy: 'admin' };
+    for (const lot of deskLots) {
+      // The half TRA-3909 owns, and the half that SURVIVES the retraction below:
+      // the lot is priced at its OWN basis and carries a real armed level. That
+      // does not come from `engineMayActOnAdoptedRow` — it comes from
+      // `deskAddSleeve` via `applyEngineOriginRiskThresholds`, which the reconcile
+      // and both `updateConfig` loops reach through an explicit `continue`.
       expect(lot.stopLossPremium).toBeGreaterThan(0);
       expect(lot.riskUnmanagedReason).toBeUndefined();
-      // ⛔ The half that would make it theatre: a stop nothing will ever fire.
-      // `armed: false` is the SHIPPED default of
-      // ENABLE_ENGINE_ACT_ON_ADOPTED_BROKER_OPTIONS, so this is the real posture.
-      expect(engineMayActOnAdoptedRow(lot, false)).toBe(true);
+
+      // ⛔ RETRACTED (board ruling B, card `331ddc56`, shipped `a5ab388`). This
+      // read `.toBe(true)` on the strength of a fourth allow-list entry
+      // `desk_add ⇒ true`. Ruling B post-dates that line AND the CTO's review of
+      // it, and names no exception: an adopted broker row is the engine's to exit
+      // only after a human hands THAT row over. `armed: false` is the shipped
+      // default of the master arm, so this is the real posture on bqb1 today.
+      expect(engineMayActOnAdoptedRow(lot, false)).toBe(false);
+
+      // Neither key alone is sufficient — asserted in both directions, so a
+      // regression that silently drops either one has a failing state.
+      expect(engineMayActOnAdoptedRow(lot, true)).toBe(false);                    // arm, no grant
+      expect(engineMayActOnAdoptedRow({ ...lot, engineHandover: GRANT }, false)).toBe(false); // grant, no arm
+
+      // …and BOTH keys ⇒ the engine may act. Without this the assertions above
+      // also pass on a build where `desk_add` is hard-refused and a hand-over
+      // grant does nothing at all, which is a different and worse thing.
+      expect(engineMayActOnAdoptedRow({ ...lot, engineHandover: GRANT }, true)).toBe(true);
     }
 
     // …and the guard is NOT widened: a standalone foreign import still refuses.
@@ -314,7 +337,12 @@ describe('per-lot adoption of desk-added Tradier lots (TRA-3909)', () => {
     expect(bac.premiumPaid).toBeCloseTo(1.17, 10);
     expect(bac.stopLossPremium).toBeCloseTo(0.936, 10);
     expect(bac.stopArmed).toBe(true);
-    expect(bac.engineMayAct).toBe(true);
+    // ⛔ Ruling B: the LEVEL is armed and the lot is priced at its own basis, but
+    // no human has handed this row over, so the engine may not fire it. The two
+    // fields are deliberately separate — `stopArmed && !engineMayAct` is exactly
+    // the state the report exists to make legible rather than let read as managed.
+    expect(bac.engineMayAct).toBe(false);
+    expect(bac.exitInertReason).toBe('adopted_not_authorized');
     expect(bac.sleeve).toBe('single_leg_otm');
 
     // ⚠️ THE NEGATIVE CONTROL. A book where nothing refuses cannot prove the

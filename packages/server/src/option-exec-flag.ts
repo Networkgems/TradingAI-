@@ -104,29 +104,47 @@ export function isEngineActionOnAdoptedRowsArmed(
  * - `tradierEnv === 'sandbox'` ⇒ **true**. See the partition note below.
  * - `engine_origin` ⇒ **true**. The oracle PROVED we placed it. TRA-2820's fix
  *   stands: a live row whose local record was lost keeps its stops.
- * - `desk_add` ⇒ **true**. TRA-3909, and the one deliberate widening of this
- *   guard since it shipped. See below.
- * - `foreign` / `unresolved` / absent / anything else ⇒ **`armed`**, i.e. false
- *   unless the deployment has explicitly opted in.
+ * - `desk_add` ⇒ **`armed && granted`**, exactly like `foreign`. TRA-3909
+ *   proposed admitting it unconditionally; board ruling B overtook that. See
+ *   below.
+ * - `foreign` / `unresolved` / absent / anything else ⇒ **`armed && granted`**,
+ *   i.e. false unless the deployment has opted in AND a human handed this row
+ *   over.
  *
- * ── TRA-3909: why `desk_add` is admitted, and how narrowly ────────────────
+ * ── TRA-3909 `desk_add`: proposed as a widening, RETRACTED under ruling B ──
  * Board instruction, TRA-3904 `92bc1e83`, 2026-08-20T23:21:32Z: *"Bot should
- * manage added positions from Tradier"*. That cannot be executed with this
- * guard as it stood — a lot adopted as `foreign` takes the sentinel schedule
- * (`stopLossPremium: 0`), so it would be visibly adopted and functionally
- * identical to the unmanaged contract the board was complaining about.
+ * manage added positions from Tradier"*. TRA-3909 read that as requiring a
+ * fourth allow-list entry — `desk_add ⇒ true`, unconditional — on the ground
+ * that a lot adopted as `foreign` takes the sentinel schedule
+ * (`stopLossPremium: 0`) and would be visibly adopted but functionally
+ * identical to the unmanaged contract the board complained about. The CTO
+ * reviewed and accepted that line on TRA-3916.
  *
- * ⚠️ The widening is a population, not a policy change, and the population is
- * strictly smaller than the one this ticket was written about. TRA-3829's case
- * is a STANDALONE desk position — the six tickets typed into Tradier's web UI
- * on 2026-08-17, with no engine contract anywhere near them. `desk_add` is
- * minted only for a RESIDUAL lot on an OCC symbol where this engine already
- * owns a row (`planLotAdoption` refuses `no_engine_row` otherwise), i.e. the
- * desk adding to a trade the engine is already running. Those two sets are
- * disjoint, so nothing TRA-3829 refuses today starts being actioned.
+ * ⛔ Both the argument and the review PRE-DATE board ruling B (card
+ * `331ddc56`, 2026-08-21, shipped `a5ab388`), which post-dates the TRA-3904
+ * instruction and answers the same question more narrowly: *fully managed, but
+ * only after an explicit PER-ROW opt-in*. A `desk_add` lot is a broker contract
+ * this engine did not open, i.e. an adopted broker row, so ruling B governs it
+ * and an unconditional entry here would carve a class of adopted rows out of a
+ * ruling that names no exception. The line is therefore NOT reinstated.
  *
- * The default direction of the flag is UNCHANGED and still the non-acting one:
- * a row of unknown or foreign origin still needs an explicit deployment opt-in.
+ * ⚠️ The premise that made the widening look forced turned out to be false, and
+ * that is why retracting it costs TRA-3909 almost nothing. The desk lot's
+ * schedule does NOT come from this predicate: `updateConfig` and the reconcile
+ * both `continue` past `applyImportedRiskThresholds` for a `desk_add` row and
+ * re-derive `applyEngineOriginRiskThresholds(opt, opt.deskAddSleeve, …)`
+ * against the lot's OWN basis. So under ruling B a desk lot still gets its own
+ * row, its own basis and its own ARMED stop level — what it does not get is the
+ * engine pulling the trigger, until a human grants hand-over through
+ * `POST /api/options/:id/engine-handover`. That state is legible rather than
+ * silent: `liveLotAdoptionReport` publishes `engineMayAct: false` with
+ * `exitInertReason: 'adopted_not_authorized'` per lot.
+ *
+ * If the board rules that `desk_add` IS exempt — the argument being that the
+ * desk added to a trade the engine was already running, which is not the
+ * standalone hand-typed position TRA-3829 was written about — the change is one
+ * line: restore `if (row.adoptionAuthority === 'desk_add') return true;` above
+ * the final return. It is deliberately left as a one-line delta for that reason.
  *
  * ── Why the partition is `tradierEnv` and NOT `mode` ──────────────────────
  * ⛔ TRA-3112 item 3: on an imported row `mode` is stamped `'live'`
@@ -178,9 +196,9 @@ export function engineMayActOnAdoptedRow(
   if (row.importedFromTradier !== true) return true;
   if (row.tradierEnv === 'sandbox') return true;
   if (row.adoptionAuthority === 'engine_origin') return true;
-  // TRA-3909 — a desk lot added to a contract the engine already holds. Still an
-  // allow-list entry, so an unrecognised shape keeps refusing by construction.
-  if (row.adoptionAuthority === 'desk_add') return true;
+  // TRA-3909 — a `desk_add` lot deliberately falls through to here rather than
+  // getting its own allow-list entry. It is an adopted broker row, so board
+  // ruling B's two keys govern it. See the retraction note in the docblock.
   return armed && hasEngineHandover(row);
 }
 
