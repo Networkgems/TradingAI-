@@ -1358,13 +1358,34 @@ function cents(usd: number): number {
 // the invariant `Σ B_i ≤ A` was never able to state. On today's numbers v0nni
 // goes `$193.67 → $142.00` and reachable lands on EXACTLY $500.00.
 //
-// ⚠ It does NOT serialize two engines evaluating in the same tick. That race is
-// bounded by the pre-existing TRA-3879 invariant `Σ cap_i = Σ B_i ≤ A`: since
-// `Σ_i admissible_i ≤ Σ_i (cap_i − atRisk_i)⁺ ≤ Σ_i cap_i ≤ A`, a concurrent
-// double-admit can only reach `A` from a FLAT fleet. It is the grandfathered
-// term — not concurrency — that this ticket exists to close, and the residual is
-// published (see {@link LiveOtmFleetBoundGrade.reachableSumUsd}) rather than
-// assumed away.
+// ⚠ It does NOT serialize two engines evaluating in the same tick — and the
+// trigger for that residual is FLEET COMPOSITION, not luck. (CEO, TRA-3911
+// comment `2451aaf1`; recorded on TRA-3703 as a standing precondition. An
+// earlier revision of this paragraph said only "a concurrent double-admit can
+// only reach `A` from a FLAT fleet" — true, but loose enough to hide WHEN the
+// residual bites.)
+//
+// The sharp statement starts from the first operand: a book with
+// `atRisk_i ≥ cap_i` has `admissible_i = 0`, so **every book that CAN race is by
+// construction under its own cap.** Count the racers:
+//
+//   • TWO gate-open books, both under cap → concurrent worst case is
+//     `Σ_i cap_i = Σ B_i ≤ A` (the TRA-3879 invariant). Safe.
+//   • TWO gate-open books, one grandfathered → the grandfathered one is
+//     admissible $0, leaving exactly ONE racer. **No race exists.**
+//     ⇒ on TODAY'S fleet (`admin` grandfathered, `v0nni` open) the concurrent
+//     overshoot is not merely bounded, it is STRUCTURALLY UNREACHABLE.
+//   • THREE OR MORE gate-open books with one grandfathered → two or more racers
+//     read the same `Σ_j atRisk_j` and each admits up to its own cap, so the
+//     worst case is `Σ_i cap_i + excess ≤ A + excess` — which is EXACTLY the
+//     overshoot this ticket closed, back again through the concurrent door.
+//
+// ⭐ SO: OPENING A THIRD LIVE ENTRY GATE RE-OPENS TRA-3703'S FINDING, and
+// whoever proposes it OWNS SERIALIZING ADMISSION FIRST. Do not read the
+// two-book safety above as a property of the bound; it is a property of the
+// fleet's current shape. It is the grandfathered term — not concurrency — that
+// this ticket exists to close, and the residual is published (see
+// {@link LiveOtmFleetBoundGrade.reachableSumUsd}) rather than assumed away.
 //
 // ⚠ DEGRADES, NEVER DARKS. An unreadable fleet at-risk yields `null` and the
 // order path falls back to the per-book gate that is in force today — the same

@@ -36,12 +36,29 @@ const check = (id, ok, detail) => { rows.push({ id, ok, detail }); };
 async function pin() {
   const r = await fetch(`${HOST}/api/health/options-live`).then(x => x.json()).catch(() => null);
   const b = r?.build ?? null;
-  return b ? { commit: b.commit, pid: b.pid, startedAt: b.startedAt } : null;
+  return b
+    ? { commit: b.commit, pid: b.pid, startedAt: b.startedAt, uptimeSec: b.uptimeSec ?? null }
+    : null;
 }
+
+// ⭐ BOOT AGE IS PART OF THE VERDICT, NOT OF THE OPERATOR'S MEMORY.
+//
+// CEO, TRA-3911 comment `84f1f0b2`: *A GRADER'S BLINDNESS IS A PROPERTY OF THE
+// RUN, NOT OF THE BUILD — SO IT IS CURED BY A SECOND READ AT DEPTH, NOT BY A
+// RE-SHIP.* This run's first pass scored 32/32 thirty-six seconds after a boot
+// and was worthless; the CEO's independent read of the SAME build at
+// `uptimeSec 315→502` was a real PASS. Nothing in the output distinguished the
+// two, so a human had to notice. It now says so itself: boot age is printed on
+// both pins and stamped on the terminal line.
+const SHALLOW_BOOT_SEC = 120;
+const age = p => (typeof p?.uptimeSec === 'number' ? `${p.uptimeSec}s` : 'unknown');
 
 const before = await pin();
 if (!before?.commit) blind('pin unreadable before the probe');
-console.log(`# pin BEFORE  commit=${before.commit} pid=${before.pid} startedAt=${before.startedAt}`);
+console.log(
+  `# pin BEFORE  commit=${before.commit} pid=${before.pid} startedAt=${before.startedAt}`
+  + ` uptimeSec=${age(before)}`,
+);
 if (EXPECT && !before.commit.startsWith(EXPECT)) {
   blind(`live commit ${before.commit} is not the graded build ${EXPECT}`);
 }
@@ -78,6 +95,28 @@ if (dark.length > 0) {
     + ' this run cannot see. Typically the first ~1-2 min after a boot. Re-run.',
   );
 }
+
+// The SERVER'S OWN blindness field, read as a second gate rather than inferred
+// from the rows. `dark` above is THIS script's opinion about `availableCashUsd`;
+// `unreadableBalanceBooks` is the grade's opinion about the same books, computed
+// by the code under test. They should agree — and when they do not, the one that
+// says "blind" wins, because a disagreement is itself evidence the run cannot
+// see what it is grading. Its EMPTINESS is the negative control that separates
+// PASS from PASS-OR-BLIND (CEO, `84f1f0b2`).
+const unreadable = Array.isArray(bound.unreadableBalanceBooks) ? bound.unreadableBalanceBooks : null;
+if (unreadable === null) {
+  blind('aggregateFleetBound.unreadableBalanceBooks ABSENT — the grade cannot self-classify');
+}
+if (unreadable.length > 0) {
+  blind(
+    `the grade names ${unreadable.length} unreadable-balance book(s) `
+    + `(${unreadable.map(b => b ?? '<unnamed>').join(', ')}) — its own blindness field is non-empty,`
+    + ' so `reachableSumUsd` is folded over a fleet it cannot fully see. Re-run.',
+  );
+}
+console.log(
+  `# blindness  unreadableBalanceBooks=[] (${armed.length} armed book(s) all serving balances)`,
+);
 
 // ---------------------------------------------------------------------------
 // AC1 — the ORDER PATH publishes, and honours, the admissible bound.
@@ -217,7 +256,10 @@ check('C3 gate-open != mode-live on this host (the fold is on the right field)',
 
 // ---------------------------------------------------------------------------
 const after = await pin();
-console.log(`# pin AFTER   commit=${after?.commit} pid=${after?.pid} startedAt=${after?.startedAt}`);
+console.log(
+  `# pin AFTER   commit=${after?.commit} pid=${after?.pid} startedAt=${after?.startedAt}`
+  + ` uptimeSec=${age(after)}`,
+);
 if (!after || after.commit !== before.commit || after.pid !== before.pid || after.startedAt !== before.startedAt) {
   blind('pin MOVED across the probe — the rows would be a mix of two builds');
 }
@@ -243,6 +285,18 @@ for (const r of rows) {
   console.log(`  ${r.ok ? 'PASS' : 'FAIL'}  ${r.id}  --  ${r.detail}`);
 }
 console.log(`\n${rows.length - failed}/${rows.length} criteria pass.`);
-if (failed > 0) { console.log('FAIL'); process.exit(1); }
-console.log('PASS — the reachable bound is ENFORCING on this pinned build.');
+
+// The run classifies ITSELF. A shallow boot is not a FAIL — every criterion may
+// legitimately pass on rows that had nothing to say — but it is not a PASS the
+// board can bank either, and the cure is a SECOND READ AT DEPTH, never a re-ship.
+const shallow = typeof after?.uptimeSec === 'number' && after.uptimeSec < SHALLOW_BOOT_SEC;
+const depth = `boot age ${age(before)} → ${age(after)}, unreadableBalanceBooks []`;
+if (failed > 0) { console.log(`FAIL  (${depth})`); process.exit(1); }
+if (shallow) {
+  console.log(
+    `SHALLOW — ${rows.length}/${rows.length} scored under ${SHALLOW_BOOT_SEC}s of uptime (${depth}).`
+    + ' Balances read, so this is NOT blind, but re-read at depth before citing it.',
+  );
+}
+console.log(`PASS — the reachable bound is ENFORCING on this pinned build (${depth}).`);
 process.exit(0);
