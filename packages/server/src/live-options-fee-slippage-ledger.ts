@@ -272,6 +272,140 @@ export function recordLiveOptionFill(input: LiveOptionFillInput): void {
 }
 
 /**
+ * TRA-3918 — why an OPEN-EPISODE walk exists, and why "most recent
+ * `buy_to_open`" was the wrong question.
+ *
+ * ── The defect ──────────────────────────────────────────────────────────────
+ * {@link lastRecordedOpenSleeve} and {@link lastRecordedOpenFill} used to walk
+ * BACKWARD looking for the newest `buy_to_open` on the symbol and stop there,
+ * with no regard for whether that episode had since been CLOSED. So a contract
+ * the engine bought and sold in July still answered `engine` in August — for
+ * an OCC that, by then, only the desk held:
+ *
+ *   buy_to_open  XLF …C57.5  1     <- episode A opens
+ *   sell_to_close XLF …C57.5 1     <- episode A closes; we hold ZERO
+ *                                     (the desk later buys 1 of the same OCC)
+ *   lastRecordedOpenFill(…)  -> the episode-A buy_to_open   ⇐ WRONG
+ *
+ * Downstream that answer becomes `adoptionAuthority: 'engine_origin'` on the
+ * desk's contract (TRA-3916's decay), which re-blends the desk's basis into the
+ * engine's stop and spends the board's adoption authorization on the desk's
+ * money. An OCC we ever bought was, in effect, forever ours.
+ *
+ * ── Why it is a running-quantity walk, not "stop at the first close" ────────
+ * {@link recordedEngineOpenBasis} stops at the first `sell_to_close` it meets
+ * walking backward, which truncates on a PARTIAL close. That is deliberate
+ * there: its callers treat a quantity they cannot fully account for as a
+ * REFUSAL, so truncation fails closed. The same rule here would fail OPEN in
+ * the direction TRA-2820 is about — a partially-closed ENGINE position (buy 2,
+ * close 1, still holding 1) would answer "no record", `ledgerOpenProvenance`
+ * would read that as `foreign`, and a real-money contract the engine placed
+ * would be handed the import sentinel with nothing minding its stop.
+ *
+ * So the boundary is the close that FLATTENS the position, tracked by net
+ * contracts, and a new episode starts at the next `buy_to_open` off zero.
+ *
+ * ── Rows are ordered by `ts`, not by array position ─────────────────────────
+ * `fills` is append-ordered, and `importMissingLiveOptionFills` appends
+ * history-reconstructed rows at the END even though they represent OLDER fills
+ * (TRA-2959). A positional walk therefore puts an imported open AFTER the close
+ * that closed it and reads a flat contract as open. Position was good enough
+ * for "newest buy anywhere"; it is not good enough for an episode boundary.
+ *
+ * ── Three "no" states, and they are not the same "no" ───────────────────────
+ * `flat` (we opened this OCC and closed it — the contract at the broker is not
+ * from an episode of ours) is a FINDING. `no_record` is the older finding.
+ * `indeterminate` is a REFUSAL: the ledger's own arithmetic does not close, so
+ * it cannot vouch for anything on this symbol, and saying `foreign` there is a
+ * guess wearing a verdict's clothes. Callers must keep the refusal separate —
+ * `null` from these oracles is "cannot answer", never permission (TRA-3913 AC2).
+ */
+export type OpenEpisodeStatus =
+  /** A `buy_to_open` episode is open right now; `fills` holds its opens. */
+  | 'open'
+  /** The ledger holds opens for this OCC and every one of them was closed out. */
+  | 'flat'
+  /** The ledger holds no row at all for this OCC. */
+  | 'no_record'
+  /** The ledger's own quantities do not reconcile — it cannot answer. */
+  | 'indeterminate';
+
+export type OpenEpisodeIndeterminateReason =
+  /**
+   * A `sell_to_close` with nothing open to close (or closing more than is
+   * open). The ledger is MISSING opens — 30-day retention aged them out, or the
+   * history importer recovered one leg of a round trip and not the other. Every
+   * episode boundary after that point is unknowable.
+   */
+  | 'unmatched_close'
+  /**
+   * A row carrying a `contracts` value that is not a positive finite number.
+   * `contracts` is not validated on hydrate, so a corrupt on-disk row reaches
+   * the walk. Netting `NaN` reads as a number until something compares it.
+   */
+  | 'unusable_quantity';
+
+/** TRA-3918 — the currently-open `buy_to_open` episode for one OCC symbol. */
+export interface OpenEpisodeWindow {
+  status: OpenEpisodeStatus;
+  /**
+   * The `buy_to_open` rows of the CURRENTLY-OPEN episode, oldest-first. Empty
+   * on every status other than `open`.
+   */
+  fills: LiveOptionFillRecord[];
+  /** Net contracts the ledger believes are open. `0` unless `status === 'open'`. */
+  netContracts: number;
+  /** `sell_to_close` rows the walk consumed before it stopped. */
+  closes: number;
+  /** Set only on `indeterminate`. */
+  reason: OpenEpisodeIndeterminateReason | null;
+}
+
+/** TRA-3918 — see {@link OpenEpisodeStatus}. The one walk all three oracles share. */
+export function openEpisodeWindow(optionSymbol: string): OpenEpisodeWindow {
+  const rows = fills.filter((f) => f.optionSymbol === optionSymbol);
+  // Stable (ES2019) — same-`ts` rows keep append order, which is the order they
+  // actually filled in.
+  rows.sort((a, b) => a.ts - b.ts);
+  if (rows.length === 0) {
+    return { status: 'no_record', fills: [], netContracts: 0, closes: 0, reason: null };
+  }
+
+  const refuse = (
+    reason: OpenEpisodeIndeterminateReason,
+    closes: number,
+  ): OpenEpisodeWindow => ({ status: 'indeterminate', fills: [], netContracts: 0, closes, reason });
+
+  let episode: LiveOptionFillRecord[] = [];
+  let net = 0;
+  let closes = 0;
+  for (const f of rows) {
+    const qty = f.contracts;
+    if (typeof qty !== 'number' || !Number.isFinite(qty) || qty <= 0) {
+      return refuse('unusable_quantity', closes);
+    }
+    if (f.side === 'buy_to_open') {
+      // Off zero, this opens a NEW episode — whatever came before is closed and
+      // does not get to vote on what we hold now.
+      if (net <= 0) episode = [];
+      episode.push(f);
+      net += qty;
+      continue;
+    }
+    closes += 1;
+    // A close with nothing open, or closing more than is open, means the ledger
+    // is missing rows. Refuse rather than net to zero and call it flat.
+    if (net <= 0 || qty > net) return refuse('unmatched_close', closes);
+    net -= qty;
+    if (net === 0) episode = []; // FLATTENED — the episode is over, permanently.
+  }
+
+  return episode.length > 0
+    ? { status: 'open', fills: episode, netContracts: net, closes, reason: null }
+    : { status: 'flat', fills: [], netContracts: 0, closes, reason: null };
+}
+
+/**
  * TRA-2811 — the sleeve the most recent `buy_to_open` row recorded for this
  * contract, or null when the ledger holds no open for it. The close-side
  * recorder MUST prefer this over re-deriving from the position object: on
@@ -283,13 +417,14 @@ export function recordLiveOptionFill(input: LiveOptionFillInput): void {
  * provenance: it was written by the code that chose the sleeve. Rows hydrate
  * from disk on boot (30-day retention), so the join survives reboots wherever
  * the ledger itself does.
+ *
+ * TRA-3918 — scoped to the CURRENTLY-OPEN episode; a closed round trip no longer
+ * votes. See {@link openEpisodeWindow}. `null` is "cannot answer" and callers
+ * must not read it as "the engine never bought this".
  */
 export function lastRecordedOpenSleeve(optionSymbol: string): LiveFillSleeve | null {
-  for (let i = fills.length - 1; i >= 0; i--) {
-    const f = fills[i]!;
-    if (f.side === 'buy_to_open' && f.optionSymbol === optionSymbol) return f.sleeve;
-  }
-  return null;
+  const window = openEpisodeWindow(optionSymbol);
+  return window.status === 'open' ? window.fills[window.fills.length - 1]!.sleeve : null;
 }
 
 /**
@@ -302,13 +437,15 @@ export function lastRecordedOpenSleeve(optionSymbol: string): LiveFillSleeve | n
  * order the app itself placed. TRA-2820 names its two lost TSLA positions by
  * their broker order ids (`140022786` / `140028461`) precisely because nothing
  * left on the position row could name them.
+ *
+ * TRA-3918 — scoped to the CURRENTLY-OPEN episode; a closed round trip no longer
+ * votes. See {@link openEpisodeWindow} for why the boundary is the close that
+ * FLATTENS the position rather than the first close the walk meets, and why
+ * `null` here is "cannot answer", never "the contract is the desk's".
  */
 export function lastRecordedOpenFill(optionSymbol: string): LiveOptionFillRecord | null {
-  for (let i = fills.length - 1; i >= 0; i--) {
-    const f = fills[i]!;
-    if (f.side === 'buy_to_open' && f.optionSymbol === optionSymbol) return f;
-  }
-  return null;
+  const window = openEpisodeWindow(optionSymbol);
+  return window.status === 'open' ? window.fills[window.fills.length - 1]! : null;
 }
 
 /**
@@ -341,6 +478,16 @@ export function lastRecordedOpenFill(optionSymbol: string): LiveOptionFillRecord
  * treats a quantity it cannot fully account for as a REFUSAL, so truncation
  * fails closed (no write) rather than open (a basis derived from part of the
  * lot).
+ *
+ * ⚠ TRA-3918 — this is therefore a DIFFERENT walk from {@link openEpisodeWindow},
+ * on purpose, and the two must not be "unified". This one answers a BASIS
+ * question, where under-counting is safe and over-counting spends the board's
+ * authorization on the desk's money; that one answers a PROVENANCE question,
+ * where under-counting hands a real-money engine contract the import sentinel
+ * and leaves it with no stop (TRA-2820). Both stop at a close; only this one
+ * stops at a close that did not flatten. Verified against the closed-episode
+ * shape in `tra3918-open-episode-walk.test.ts` — this function was already
+ * correct for it, which is why TRA-3918 did not have to touch it.
  *
  * `unpricedFills` is the honest-null discipline this module is built on: a
  * `buy_to_open` with `filledPrice: null` is a contract we cannot price, so the

@@ -52,6 +52,10 @@ import {
   lastRecordedOpenSleeve,
   lastRecordedOpenFill,
   recordedOpenFillCount,
+  // TRA-3918 — the open-EPISODE walk. `lastRecordedOpenFill` answers with the
+  // newest open in the current episode; this is the same walk with its three
+  // "no" states kept apart, which is what the provenance verdict needs.
+  openEpisodeWindow,
   // TRA-3896 — "what did WE pay, and for how many". The one number both halves
   // of this ticket turn on, and the only source for it that is neither the
   // broker's blend nor a request body.
@@ -1902,9 +1906,15 @@ export type LiveOpenProvenance =
     }
   | {
       /**
-       * The oracle is HEALTHY and has no record of us opening this contract ⇒
+       * The oracle is HEALTHY and has no record of us HOLDING this contract ⇒
        * genuinely foreign broker inventory. TRA-462 and the import schedule
        * apply exactly as before.
+       *
+       * TRA-3918 — "no record of us holding it" now covers two shapes, and the
+       * second one is the whole ticket: the ledger has never seen the OCC, OR
+       * every episode we opened on it was CLOSED. Before, a closed round trip
+       * still answered `engine`, so an OCC we ever bought was forever ours and
+       * a desk contract on that symbol was adopted onto the engine's schedule.
        */
       kind: 'foreign';
     }
@@ -1913,10 +1923,40 @@ export type LiveOpenProvenance =
        * The oracle could not answer. NOT a synonym for `foreign` — it is the
        * absence of a reading, and it is what gets stamped on the row so the
        * zero stop is legible as "unknown" rather than "declined".
+       *
+       * TRA-3918 widened this from the single `ledger_empty` shape: a ledger
+       * with rows whose own quantities do not reconcile is just as unable to
+       * answer as an empty one, and collapsing that into `foreign` would be the
+       * same fail-open guess in a new costume.
        */
       kind: 'unresolved';
-      reason: 'ledger_empty';
+      reason: 'ledger_empty' | 'unmatched_close' | 'unusable_quantity';
     };
+
+/**
+ * TRA-3553 / TRA-3918 — the operator-facing gloss for an `unresolved` verdict.
+ * Kept beside the type so a new reason cannot be added without one: the warn
+ * line used to hardcode the `ledger_empty` sentence, which would have described
+ * an empty ledger for a ledger that is not empty.
+ */
+const LIVE_OPEN_PROVENANCE_UNRESOLVED_NOTE: Record<
+  Extract<LiveOpenProvenance, { kind: 'unresolved' }>['reason'],
+  string
+> = {
+  ledger_empty:
+    'the live fee/slippage ledger holds NO buy_to_open rows, so it cannot ' +
+    'say whether the engine placed this contract. Treat as UNCLASSIFIED, ' +
+    'not as a decision to leave it unmanaged.',
+  unmatched_close:
+    'the live fee/slippage ledger holds a sell_to_close on this contract with ' +
+    'no open to match it (30-day retention aged the open out, or the history ' +
+    'importer recovered one leg of a round trip). Episode boundaries on this ' +
+    'symbol are unknowable, so provenance is UNCLASSIFIED — not foreign.',
+  unusable_quantity:
+    'a live fee/slippage ledger row for this contract carries an unusable ' +
+    '`contracts` value, so the open/closed arithmetic cannot be run. ' +
+    'UNCLASSIFIED — not a decision to leave the row unmanaged.',
+};
 
 /**
  * TRA-3553 — the default oracle: the live fee/slippage ledger, read for BOTH
@@ -1932,13 +1972,32 @@ export type LiveOpenProvenance =
  * no engine provenance to inherit) is a real, healthy reading that names no
  * sleeve — so it is `foreign`, not `unresolved`. The oracle answered; the answer
  * is "nothing of ours".
+ *
+ * TRA-3918 — it now reads the OPEN-EPISODE window rather than "the newest
+ * `buy_to_open` anywhere in the ledger". The `flat` branch is the repair: a
+ * contract we bought and sold is not one we hold, so the row sitting at the
+ * broker under that OCC belongs to somebody else. That branch does NOT consult
+ * `recordedOpenFillCount` and must not — a ledger that just walked a complete
+ * round trip for this symbol has already demonstrated it can answer, and a
+ * second liveness probe could only ever downgrade a finding to a refusal.
  */
 function ledgerOpenProvenance(optionSymbol: string): LiveOpenProvenance {
-  const fill = lastRecordedOpenFill(optionSymbol);
-  if (fill && fill.sleeve !== 'unattributed') {
-    return { kind: 'engine', sleeve: fill.sleeve, orderId: fill.orderId };
+  const window = openEpisodeWindow(optionSymbol);
+  if (window.status === 'indeterminate') {
+    // The ledger's own arithmetic does not close. It cannot vouch for this
+    // symbol in EITHER direction, and `foreign` here would be a guess that
+    // reads exactly like a finding.
+    return { kind: 'unresolved', reason: window.reason ?? 'ledger_empty' };
   }
-  if (fill) return { kind: 'foreign' };
+  if (window.status === 'open') {
+    const fill = window.fills[window.fills.length - 1]!;
+    return fill.sleeve !== 'unattributed'
+      ? { kind: 'engine', sleeve: fill.sleeve, orderId: fill.orderId }
+      : { kind: 'foreign' };
+  }
+  // 'flat' — we opened this OCC and closed it out. The oracle ANSWERED.
+  if (window.status === 'flat') return { kind: 'foreign' };
+  // 'no_record' — never seen this OCC; the health probe decides which "no".
   return recordedOpenFillCount() > 0
     ? { kind: 'foreign' }
     : { kind: 'unresolved', reason: 'ledger_empty' };
@@ -8569,10 +8628,11 @@ export class PaperOptionsAccount {
           ? {
               issueDetail: 'TRA-3553',
               oracle: verdict.reason,
-              note:
-                'the live fee/slippage ledger holds NO buy_to_open rows, so it cannot ' +
-                'say whether the engine placed this contract. Treat as UNCLASSIFIED, ' +
-                'not as a decision to leave it unmanaged.',
+              // TRA-3918 — keyed off the reason, not hardcoded. The sentence
+              // below used to assert an EMPTY ledger unconditionally, which
+              // would have been a false statement about the box for the two
+              // reasons this ticket added.
+              note: LIVE_OPEN_PROVENANCE_UNRESOLVED_NOTE[verdict.reason],
             }
           : {}),
       });

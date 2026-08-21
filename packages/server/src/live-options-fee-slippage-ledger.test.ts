@@ -106,7 +106,14 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
       sleeve: 'single_leg_otm',
       optionSymbol: 'AMZN260904P00245000',
       side: 'buy_to_open',
-      contracts: 1,
+      // TRA-3918 — 2 contracts, not the incident's 1, so the close below is a
+      // PARTIAL one and the episode is still open when the side filter is
+      // graded. At 1 contract the round trip FLATTENS, and the correct answer
+      // after TRA-3918 is `null` — which would pass this assertion for the
+      // wrong reason (or, as written before, fail it). The side filter and the
+      // episode boundary are two different claims and they get two different
+      // fixtures; the second one is the `it` immediately below.
+      contracts: 2,
       submittedLimit: 2.0,
       askAtSubmit: 2.0,
       midAtSubmit: 1.9,
@@ -114,7 +121,8 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
       fees: null,
       orderId: 1,
     });
-    // A close row for the same contract must NOT satisfy the lookup (side filter).
+    // A close row for the same contract must NOT satisfy the lookup (side filter):
+    // if the filter broke, this row's mislabeled sleeve is what would come back.
     recordLiveOptionFill({
       ts: 2000,
       etDay: '2026-08-03',
@@ -132,6 +140,34 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
     expect(lastRecordedOpenSleeve('AMZN260904P00245000')).toBe('single_leg_otm');
     // A different contract's open does not leak across symbols.
     expect(lastRecordedOpenSleeve('QQQ260904C00797000')).toBeNull();
+  });
+
+  it('lastRecordedOpenSleeve stops at the close that FLATTENS the position (TRA-3918)', () => {
+    // The other half of the claim above, and the one that used to be wrong: a
+    // CLOSED episode kept voting, so an OCC this engine had ever bought answered
+    // `engine` forever — including for a contract the desk later bought on the
+    // same symbol. Full detail and the in-situ consequences:
+    // `tra3918-open-episode-walk.test.ts`.
+    clearLiveOptionsFeeSlippageLedger();
+    const open = {
+      ts: 1000, etDay: '2026-07-31', sleeve: 'single_leg_otm' as const,
+      optionSymbol: 'AMZN260904P00245000', side: 'buy_to_open' as const,
+      contracts: 1, filledPrice: 2.0, orderId: 1,
+    };
+    recordLiveOptionFill(open);
+    expect(lastRecordedOpenSleeve('AMZN260904P00245000')).toBe('single_leg_otm');
+
+    recordLiveOptionFill({
+      ts: 2000, etDay: '2026-08-03', sleeve: 'single_leg_directional',
+      optionSymbol: 'AMZN260904P00245000', side: 'sell_to_close',
+      contracts: 1, filledPrice: 0.89, orderId: 139775135,
+    });
+    // We hold ZERO. The episode is over and does not get to answer again.
+    expect(lastRecordedOpenSleeve('AMZN260904P00245000')).toBeNull();
+
+    // …and a genuine RE-OPEN answers with the SECOND episode, not the first.
+    recordLiveOptionFill({ ...open, ts: 3000, sleeve: 'single_leg_rv', orderId: 2 });
+    expect(lastRecordedOpenSleeve('AMZN260904P00245000')).toBe('single_leg_rv');
   });
 
   it('hydrates prior fills from disk on boot (survives a reboot on a persistent dir)', () => {
