@@ -249,14 +249,39 @@ function gradeReachableExposure(armed, A) {
     };
   }
 
+  // ── TRA-3911 — READ THE RULE THE ORDER SITE IS ACTUALLY RUNNING ──────────
+  //
+  // `Σ max(cap_i, atRisk_i)` is `Σ (atRisk_i + admissible_i)` under the PER-BOOK
+  // rule, and it was the right reading for every build up to `020100dc56aa`.
+  // TRA-3911 bounds `admissible_i` by `A - Σ_j atRisk_j` as well, and that term
+  // moves NEITHER `cap_i` NOR `atRisk_i` — so this closed form is INVARIANT
+  // under the fix and would go on reporting the pre-fix number forever, firing
+  // EXPOSURE on a fleet the order path had correctly bounded.
+  //
+  // A permanent false alarm and a deleted alarm end in the same place
+  // (TRA-3881), and this reader is a scheduled routine — it would page on every
+  // fire. So: prefer the row's OWN `admissibleEntryUsd` when it publishes one,
+  // and fall back to `(cap_i - atRisk_i)+` when it does not.
+  //
+  // ⭐ FIELD PRESENCE, NOT ANCESTRY. A row without the field came from a build
+  // WITHOUT the gate, and $551.67 is the correct reading of those bytes. A
+  // reader that assumed the fix was deployed would clear the finding on the one
+  // build that still has it.
+  const enforcedRows = armed.filter(r => Number.isFinite(r?.admissibleEntryUsd));
+  const rulePostFix = enforcedRows.length === armed.length;
   const perBook = armed.map(r => {
     const cap = Number.isFinite(r.capUsd) ? r.capUsd : 0;
     const atRisk = r.openPremiumAtRiskUsd;
+    const admissible = Number.isFinite(r.admissibleEntryUsd)
+      ? Math.max(0, r.admissibleEntryUsd)
+      : Math.max(0, Math.round((cap - atRisk) * 100) / 100);
     return {
       book: r.book ?? '<unnamed>',
       capUsd: cap,
       openPremiumAtRiskUsd: atRisk,
-      reachableUsd: Math.max(cap, atRisk),
+      admissibleEntryUsd: Number.isFinite(r.admissibleEntryUsd) ? r.admissibleEntryUsd : null,
+      admissibleBoundBy: r.admissibleBoundBy ?? null,
+      reachableUsd: Math.round((atRisk + admissible) * 100) / 100,
       // UNCLAMPED — the served `headroomUsd` floors at 0 and deletes this.
       trueHeadroomUsd: Math.round((cap - atRisk) * 100) / 100,
       overCapUsd: Math.round(Math.max(0, atRisk - cap) * 100) / 100,
@@ -300,9 +325,24 @@ function gradeReachableExposure(armed, A) {
     slackUsd: slack,
     perBook,
     booksOverOwnCap: overCap.map(b => `${b.book} at-risk $${b.openPremiumAtRiskUsd.toFixed(2)} vs cap $${b.capUsd.toFixed(2)} (over by $${b.overCapUsd.toFixed(2)}, route publishes headroom ${b.servedHeadroomUsd})`),
+    // TRA-3911 — the rule the number was computed under, so a reader can never
+    // mistake "bounded" for "happens to fit today".
+    rule: rulePostFix
+      ? 'post-TRA-3911: Σ (atRisk_i + admissible_i), admissible_i read off the row'
+      : 'pre-TRA-3911: Σ max(cap_i, atRisk_i) — no row publishes admissibleEntryUsd, so the order '
+        + 'path is bounded PER BOOK only',
+    ruleEnforced: rulePostFix,
     reason: breach
-      ? `REACHABLE EXPOSURE $${reachableUsd.toFixed(2)} = Σ max(cap_i, atRisk_i) EXCEEDS A $${A.toFixed(2)} by $${overageUsd.toFixed(2)}`
-      : `Σ max(cap_i, atRisk_i) $${reachableUsd.toFixed(2)} fits A $${A.toFixed(2)}`,
+      ? `REACHABLE EXPOSURE $${reachableUsd.toFixed(2)} = Σ (atRisk_i + admissible_i) EXCEEDS A `
+        + `$${A.toFixed(2)} by $${overageUsd.toFixed(2)}`
+        + (rulePostFix
+          ? ' — and the TRA-3911 fleet term IS in force, so this is grandfathered excess under an '
+            + 'OPEN position, not a widening path: no new entry can add to it'
+          : ' — the TRA-3911 fleet term is NOT in force on these bytes, so the next entry can widen it')
+      : `Σ (atRisk_i + admissible_i) $${reachableUsd.toFixed(2)} fits A $${A.toFixed(2)}`
+        + (rulePostFix
+          ? ' (TRA-3911 fleet term in force)'
+          : ' (per-book bound only — a coincidence of the balances on this reading)'),
   };
 }
 

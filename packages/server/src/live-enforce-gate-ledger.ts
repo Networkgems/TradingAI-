@@ -94,7 +94,22 @@ export type LiveEnforceGate =
   | 'entry_delta_ceiling'
   | 'entry_delta_ceiling_shadow'
   | 'aggregate_cap'
-  | 'canary_ceiling';
+  | 'canary_ceiling'
+  /**
+   * TRA-3911 — the FLEET bound `Σ_j atRisk_j + entry ≤ A`. Its own gate rather
+   * than a reason code on `aggregate_cap` for the same reason `aggregate_cap` is
+   * its own gate: only a gate carries an `evaluated` denominator, and this one
+   * has a THIRD state the others do not — `boundBy: 'fleet_unreadable'`, where
+   * the fleet read degraded and the SUM is unbounded again. That state is an
+   * ADMIT, so without its own `evaluated` column a day on which the fleet bound
+   * was never actually in force is indistinguishable after the fact from a day
+   * on which it simply never bit.
+   *
+   * Also: the two refusals have different remedies. `aggregate_cap` says "this
+   * book is full"; this says "the FLEET is at its authorization", which nothing
+   * this book does can change.
+   */
+  | 'fleet_reachable_bound';
 
 /** One durable ARMED-LIVE enforcement decision — a write-through of the verdict. */
 export interface LiveEnforceRecord {
@@ -223,6 +238,28 @@ export interface LiveEnforceRecord {
      * a build with a PER-BOOK bound only — never read it as "it bound".
      */
     fleetSizingReason?: 'phi_configured' | 'phi_fleet_derived' | 'fleet_capital_unreadable';
+    /**
+     * TRA-3911 — `max(0, min(capUsd − atRisk_i, A − Σ_j atRisk_j))`: the premium
+     * the `fleet_reachable_bound` gate actually admitted against.
+     */
+    admissibleUsd?: number;
+    /**
+     * TRA-3911 — ⭐ THE FIELD TO GRADE on this gate, for exactly the reason
+     * `fleetSizingReason` is the one to grade on `aggregate_cap`: its PRESENCE
+     * is the deployed-bytes proof the reachable bound shipped, and the value
+     * `fleet_unreadable` is the single state in which the fleet term is NOT in
+     * force and `Σ atRisk` is unbounded again. Absent ⇒ a row from a build with
+     * the per-book bound only — never read it as "it bound".
+     */
+    admissibleBoundBy?: 'book' | 'fleet_reachable' | 'both' | 'fleet_unreadable' | 'none';
+    /** TRA-3911 — `capUsd − atRisk_i`, SIGNED. Negative ⇒ already over this book's own cap. */
+    bookHeadroomSignedUsd?: number;
+    /** TRA-3911 — `A − Σ_j atRisk_j`, SIGNED. `null` ⇒ the fleet at-risk fold was unusable. */
+    fleetHeadroomSignedUsd?: number | null;
+    /** TRA-3911 — `Σ_j atRisk_j` at decision time. `null` ⇒ unreadable. */
+    fleetAtRiskUsd?: number | null;
+    /** TRA-3911 — how many gate-open books that fold covered (this one included). */
+    fleetAtRiskBooks?: number;
   };
   /**
    * TRA-3510 — WHICH NOMINATOR BRANCH produced the candidate this verdict ruled
@@ -503,6 +540,13 @@ const GATES: LiveEnforceGate[] = [
   // the key's PRESENCE in this census is the env-independent deployed-bytes
   // proof the control shipped, and its ABSENCE proves it did not.
   'canary_ceiling',
+  // TRA-3911 — the REACHABLE fleet bound `Σ_j atRisk_j + entry ≤ A`. Listed for
+  // the same reason every gate above it is: the key's PRESENCE in this census is
+  // the env-independent deployed-bytes proof the control shipped, and its
+  // ABSENCE proves it did not — which matters more here than anywhere else on
+  // this list, because this gate's deadline (TRA-3911 AC5) is graded on whether
+  // it is enforcing on a PINNED BUILD, not on whether it was merged.
+  'fleet_reachable_bound',
 ];
 
 /** Apply one decision to the in-memory tallies (shared by record + hydrate). */

@@ -8000,7 +8000,14 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
     // at the broker seam and records BOTH verdicts (an $82 entry on an empty
     // book is an ADMIT). Same discipline: named row, exact total.
     expect(retained.find((g) => g.gate === 'canary_ceiling')).toMatchObject({ evaluated: 1, blocked: 0 });
-    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(3);
+    // TRA-3911 — and a FOURTH: the REACHABLE fleet bound records BOTH verdicts
+    // too. Its admits are not optional bookkeeping — `admissibleBoundBy:
+    // 'fleet_unreadable'` is an ADMIT, and it is the one state in which the
+    // fleet term is NOT in force, so a day on which the bound was never actually
+    // enforced is otherwise indistinguishable after the fact from a day on which
+    // it simply never bit. Same discipline: named row, exact total.
+    expect(retained.find((g) => g.gate === 'fleet_reachable_bound')).toMatchObject({ evaluated: 1, blocked: 0 });
+    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(4);
   });
 
   it('flag ON + below-floor live candidate: NO broker order, reason surfaced, ledger counts the REJECT', async () => {
@@ -8393,6 +8400,23 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
         fleetCapitalUsd: 10_000,
         fleetCapitalBooks: 1,
         fleetSizingReason: 'phi_fleet_derived',
+        // TRA-3911 — the fleet AT-RISK read is unwired here for the same reason
+        // the capital read is (no `index.ts` in a unit), and the degrade is
+        // PUBLISHED rather than silently absorbed: `admissibleEntryUsd` falls
+        // back to `cap − atRisk` — the per-book bound in force before this
+        // ticket — and `admissibleBoundBy` says exactly why.
+        //
+        // ⚠ `fleetAtRiskUsd: null`, NEVER 0. On this row the two would be
+        // arithmetically identical (the book IS flat) and that is precisely why
+        // it has to be asserted here: a `0` meaning "the fleet has spent
+        // nothing" and a `0` meaning "we could not read the fleet" would be the
+        // same bytes, and the second one hands out the full authorization.
+        admissibleEntryUsd: 750,
+        admissibleBoundBy: 'fleet_unreadable',
+        bookHeadroomSignedUsd: 750,
+        fleetHeadroomSignedUsd: null,
+        fleetAtRiskUsd: null,
+        fleetAtRiskBooks: 0,
       });
 
       seedOpenLivePremium(engine, 700);

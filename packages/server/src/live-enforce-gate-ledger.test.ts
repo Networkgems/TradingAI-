@@ -48,12 +48,17 @@ describe('live-enforce-gate-ledger', () => {
     // the same reason: the key's PRESENCE at `evaluated: 0` is the deployed-bytes
     // proof the board's <=$100 attended-canary ceiling shipped, before any live
     // nominee has reached the seam.
+    // TRA-3911 — `fleet_reachable_bound` joins on the strongest version still:
+    // the whole ticket turns on whether the bound is ENFORCING on a pinned
+    // build, and the row's presence at `evaluated: 0` is what makes that
+    // answerable without an env read.
     expect(s.byGate.map((g) => g.gate).sort()).toEqual([
       'aggregate_cap',
       'canary_ceiling',
       'cost_bar',
       'entry_delta_ceiling',
       'entry_delta_ceiling_shadow',
+      'fleet_reachable_bound',
       'otm_delta_floor',
       'spread',
       'universe',

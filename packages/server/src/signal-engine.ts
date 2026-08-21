@@ -119,7 +119,8 @@ import {
   PCS_ENTRY_DTE_BAND,
 } from './pcs-shadow-ledger.js';
 import { selectWeeklyPcs } from '@trading-app/engine';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd, liveOptionTestAggregateHeadroomSignedUsd, resolveLiveOptionTestFleetRiskFraction, resolveLiveOptionTestBookAggregateCapUsd, sumLiveOtmFleetCapitalUsd, resolveEffectiveFleetRiskFraction, resolveLiveOtmSizingBasisUsd } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd, liveOptionTestAggregateHeadroomSignedUsd, resolveLiveOptionTestFleetRiskFraction, resolveLiveOptionTestBookAggregateCapUsd, sumLiveOtmFleetCapitalUsd, resolveEffectiveFleetRiskFraction, resolveLiveOtmSizingBasisUsd, sumLiveOtmFleetAtRiskUsd, resolveLiveOtmAdmissibleEntryUsd, fitsLiveOtmReachableBound } from './option-exec-flag.js';
+import type { LiveOtmAdmissibleBoundBy } from './option-exec-flag.js';
 import type { LiveOtmFleetCapitalRow, LiveOtmFleetSizingReason } from './option-exec-flag.js';
 // TRA-3879 — the cross-engine balance READ that makes `Σ B_i ≤ A` structural.
 // A read of a derived scalar, not the shared mutable accumulator TRA-3445
@@ -8932,6 +8933,18 @@ export class SignalEngine {
     headroomSignedUsd: number | null;
     /** TRA-3897 — `E_i = availableCashUsd + openPremiumAtRiskUsd`, the sizing basis. */
     sizingBasisUsd: number | null;
+    /** TRA-3911 — `max(0, min(capUsd − atRisk, A − Σ_j atRisk_j))`; the bound the order site gates on. */
+    admissibleEntryUsd: number;
+    /** TRA-3911 — which operand bound it. `fleet_unreadable` ⇒ per-book only. */
+    admissibleBoundBy: LiveOtmAdmissibleBoundBy;
+    /** TRA-3911 — `capUsd − atRisk`, SIGNED. Identical to `headroomSignedUsd`; published so both operands sit together. */
+    bookHeadroomSignedUsd: number;
+    /** TRA-3911 — `A − Σ_j atRisk_j`, SIGNED. `null` ⇒ fleet at-risk unreadable. */
+    fleetHeadroomSignedUsd: number | null;
+    /** TRA-3911 — `Σ_j atRisk_j` over the gate-open books. `null` ⇒ unreadable. */
+    fleetAtRiskUsd: number | null;
+    /** TRA-3911 — how many gate-open books that fold covered. */
+    fleetAtRiskBooks: number;
   } {
     // TRA-3674 — the RESOLVED PER-BOOK budget, not the fleet scalar. Before
     // this, all 67 rows reported a uniform `capUsd: 750`, so the route could
@@ -8942,11 +8955,15 @@ export class SignalEngine {
     const fleetRiskFraction = resolveLiveOptionTestFleetRiskFraction(process.env);
     const selfRow = this.getLiveOtmFleetCapitalRow();
     const availableCashUsd = selfRow.availableCashUsd;
+    // TRA-3911 — ONE enumeration, read once and folded twice below, mirroring
+    // the order site exactly. The row must publish what the ORDER SITE would
+    // honour or the TRA-3737 reader grades a column nothing enforces.
+    const fleetRows = readLiveOtmFleetCapitalRows();
     // TRA-3879 — the row must publish the budget the ORDER SITE would honour,
     // so it resolves through the SAME fleet read. A row computed on the
     // per-book φ while the order site sized on `φ_eff` would republish the
     // fail-open this ticket closes, and the TRA-3737 reader grades THIS column.
-    const fleet = sumLiveOtmFleetCapitalUsd(readLiveOtmFleetCapitalRows(), selfRow);
+    const fleet = sumLiveOtmFleetCapitalUsd(fleetRows, selfRow);
     const sizing = resolveEffectiveFleetRiskFraction(
       fleetRiskFraction, fleetCapUsd, fleet.fleetCapitalUsd, fleet.books,
     );
@@ -8957,6 +8974,16 @@ export class SignalEngine {
     const sizingBasisUsd = resolveLiveOtmSizingBasisUsd(availableCashUsd, atRisk.usd);
     const capUsd = resolveLiveOptionTestBookAggregateCapUsd(
       availableCashUsd, atRisk.usd, fleetCapUsd, fleetRiskFraction, fleet.fleetCapitalUsd,
+    );
+    // TRA-3911 (AC1) — the admissible entry AS THE ORDER SITE RESOLVES IT, on
+    // the same rows and with the same three operands. This is the column whose
+    // PRESENCE proves the reachable bound is deployed (a deploy order's commit
+    // is a lower bound on content, not an expected reading — TRA-3660), and
+    // whose VALUE is the PASS number: on the 2026-08-21T00:19Z fleet, v0nni
+    // reads $142.00 here where `headroomUsd` reads $193.67.
+    const fleetAtRisk = sumLiveOtmFleetAtRiskUsd(fleetRows, selfRow);
+    const admissible = resolveLiveOtmAdmissibleEntryUsd(
+      capUsd, atRisk.usd, fleetCapUsd, fleetAtRisk,
     );
     return {
       book: this.alertUsername ?? null,
@@ -8999,6 +9026,24 @@ export class SignalEngine {
       // `availableCashUsd + openPremiumAtRiskUsd` whenever cash is readable,
       // and `null` on the same fail-closed branch that zeroes `capUsd`.
       sizingBasisUsd,
+      // TRA-3911 (AC1) — the REACHABLE bound, on the wire.
+      //
+      // `headroomUsd` / `headroomSignedUsd` answer "how much of THIS BOOK's cap
+      // is left". `admissibleEntryUsd` answers "how much may this book actually
+      // add", which is the smaller of that and the fleet's remaining
+      // authorization — and it is the only one of the three the order site now
+      // gates on. Published beside them rather than replacing them, because the
+      // difference between the two questions is exactly what this ticket exists
+      // to make un-confusable.
+      admissibleEntryUsd: admissible.admissibleUsd,
+      admissibleBoundBy: admissible.boundBy,
+      bookHeadroomSignedUsd: admissible.bookHeadroomSignedUsd,
+      fleetHeadroomSignedUsd: admissible.fleetHeadroomSignedUsd,
+      // `Σ_j atRisk_j`. ⚠ `null` is a REAL state (`fleet_unreadable`) and is the
+      // one state where the fleet term is not in force; it must be readable as
+      // itself and never inferred from an admissible figure that looks normal.
+      fleetAtRiskUsd: admissible.fleetAtRiskUsd,
+      fleetAtRiskBooks: admissible.fleetAtRiskBooks,
     };
   }
 
@@ -11192,12 +11237,27 @@ export class SignalEngine {
           // ⚠ `atRisk` is resolved BEFORE the sizing now, not after: it is an
           // input to the basis, not merely the quantity compared against it.
           const atRisk = this.optionsAccount.openPremiumAtRiskForMode('live');
-          const fleetCapital = sumLiveOtmFleetCapitalUsd(readLiveOtmFleetCapitalRows(), {
+          // TRA-3911 — ONE read, TWO folds. `readLiveOtmFleetCapitalRows()`
+          // enumerates every engine, so calling it twice would double the
+          // cross-engine work on the order path for no new information. The
+          // at-risk fold rides the SAME rows the capital fold already uses (the
+          // seam has carried `openPremiumAtRiskUsd` since TRA-3897), which is
+          // why bounding reachable needed no second enumeration and no new
+          // coupling. ⚠ Still `getLiveOtmFleetCapitalRow()`, never
+          // `getLiveOtmAggregateExposure()` — that row's `capUsd` is a function
+          // of these sums and reading it here would recurse.
+          const fleetRows = readLiveOtmFleetCapitalRows();
+          const fleetCapital = sumLiveOtmFleetCapitalUsd(fleetRows, {
             book: this.alertUsername ?? null,
             // The SAME balance sized against above — the fleet sum must contain
             // the basis it is about to bound, or it understates `Σ E_i` and the
             // bound comes out LOOSE.
             availableCashUsd: availableCash,
+            openPremiumAtRiskUsd: atRisk.usd,
+          });
+          // TRA-3911 — `Σ_j atRisk_j`, the operand `A − Σ_j atRisk_j` needs.
+          const fleetAtRisk = sumLiveOtmFleetAtRiskUsd(fleetRows, {
+            book: this.alertUsername ?? null,
             openPremiumAtRiskUsd: atRisk.usd,
           });
           const fleetSizing = resolveEffectiveFleetRiskFraction(
@@ -11295,6 +11355,118 @@ export class SignalEngine {
               username: this.alertUsername ?? null,
             });
             scanRun.reject('over_aggregate_cap');
+            continue;
+          }
+
+          // ── TRA-3911 (AC1) — BOUND *REACHABLE*, NOT `Σ B_i` ────────────────
+          //
+          // Everything above bounds THIS book: `atRisk_i + entry ≤ cap_i`. The
+          // board's `A` bounds capital REACHABLE across the fleet (CEO ruling
+          // TRA-3703 `4b54935e`), and `Σ B_i ≤ A` does not deliver that — `B_i`
+          // is UNSPENT BUDGET, and a budget cannot go negative, so it omits
+          // every dollar a book holds ABOVE its own cap.
+          //
+          // Measured on `020100dc56aa` 2026-08-21T00:19:40Z: `admin` cap $306.32
+          // vs at-risk $358.00 (`headroomSignedUsd −51.68`), `v0nni` cap $193.67
+          // vs at-risk $0. The route served `within` on `Σ B_i $499.99 ≤ $500.00`
+          // while the fleet could reach `$499.99 + $51.68 = $551.67`. Nobody
+          // breached a gate: `admin`'s entries fit the cap in force when they
+          // were admitted, and then `A` came down (TRA-3827) and φ_eff moved
+          // underneath the open position. THE EXCESS IS GRANDFATHERED, and it
+          // recurs every time φ moves — so the fix is the TERM, not the instance.
+          //
+          //     admissible_i = max(0, min( cap_i − atRisk_i , A − Σ_j atRisk_j ))
+          //
+          // The second operand is what makes it a FLEET bound: every admission
+          // now satisfies `Σ_j atRisk_j + entry ≤ A`, and `Σ_j atRisk_j` is
+          // re-read here on every order, so the invariant survives any sequence
+          // of entries. On the measured numbers `v0nni` goes $193.67 → $142.00
+          // and reachable lands on exactly $500.00 — $51.67 of headroom, not the
+          // programme.
+          //
+          // ⚠ A SEPARATE REFUSAL FROM `over_aggregate_cap`, DELIBERATELY. Same
+          // arithmetic as folding it into the `min`, different attribution: "this
+          // book is full" and "the FLEET is at its authorization" have different
+          // remedies and different owners, and a refusal a desk cannot attribute
+          // is the TRA-3216 shape (TRA-3674's rule).
+          //
+          // ⚠ DEGRADES TO THE PER-BOOK BOUND when `Σ_j atRisk_j` is unreadable
+          // (`boundBy: 'fleet_unreadable'`), matching the TRA-3879 AC4 contract:
+          // a missing operand costs the fleet its improvement, never its floor.
+          // That state is PUBLISHED on both verdicts below so it can never be
+          // inferred from an admissible figure that merely looks normal.
+          const admissible = resolveLiveOtmAdmissibleEntryUsd(
+            aggregateCapUsd, atRisk.usd, fleetCapUsd, fleetAtRisk,
+          );
+          const fitsReachable = fitsLiveOtmReachableBound(testNotional, admissible);
+          const reachableReason = fitsReachable
+            ? undefined
+            : `OTM live test skipped — REACHABLE fleet bound: this $${testNotional.toFixed(2)} entry `
+              + `exceeds the $${admissible.admissibleUsd.toFixed(2)} admissible premium for this book `
+              + `(= max(0, min(this book's cap $${aggregateCapUsd.toFixed(2)} − at risk `
+              + `$${atRisk.usd.toFixed(2)} = $${admissible.bookHeadroomSignedUsd.toFixed(2)}, `
+              + `fleet authorization $${fleetCapUsd.toFixed(2)} − Σ fleet at risk `
+              + `$${admissible.fleetAtRiskUsd?.toFixed(2) ?? 'unreadable'} = `
+              + `$${admissible.fleetHeadroomSignedUsd?.toFixed(2) ?? 'unreadable'}))) `
+              + `[bound by ${admissible.boundBy} over ${admissible.fleetAtRiskBooks} book(s)] `
+              // Name the ruling, because the remedy for this refusal is NOT the
+              // remedy for `over_aggregate_cap`: nothing this book does to its
+              // own cap moves it, and lowering A cannot cure an overshoot that
+              // is already below A.
+              + `(A bounds capital REACHABLE, not Σ B_i — CEO ruling TRA-3703 \`4b54935e\`, `
+              + `enforced per TRA-3911)`;
+          recordLiveEnforceDecision(
+            'fleet_reachable_bound',
+            'single_leg_otm',
+            !fitsReachable,
+            etDateString(new Date()),
+            reachableReason,
+            Date.now(),
+            {
+              reasonCode: fitsReachable ? undefined : 'over_fleet_reachable_bound',
+              book: this.alertUsername ?? null,
+              // Recorded on BOTH verdicts, same reason the block above is: the
+              // admits are what supply the `evaluated` denominator that tells
+              // "never had to bite" apart from "never wired in", and
+              // `boundBy: 'fleet_unreadable'` on an admit is the one state where
+              // the SUM is unbounded again. It must be readable after the fact.
+              budget: {
+                capUsd: aggregateCapUsd,
+                fleetCapUsd,
+                // Carried on this gate too, not just on `aggregate_cap`: a
+                // reachable refusal is only interpretable next to the terms the
+                // per-book cap was resolved from, and the two ledger rows are
+                // read independently.
+                fleetRiskFraction,
+                availableCashUsd: availableCash,
+                admissibleUsd: admissible.admissibleUsd,
+                admissibleBoundBy: admissible.boundBy,
+                bookHeadroomSignedUsd: admissible.bookHeadroomSignedUsd,
+                fleetHeadroomSignedUsd: admissible.fleetHeadroomSignedUsd,
+                fleetAtRiskUsd: admissible.fleetAtRiskUsd,
+                fleetAtRiskBooks: admissible.fleetAtRiskBooks,
+              },
+            },
+          );
+          if (!fitsReachable) {
+            surfaceOtmLiveSkip(reachableReason!);
+            log.info('live OTM bounded test: over the REACHABLE fleet bound, skipped (TRA-3911)', {
+              sym,
+              optionSymbol: cheap.optionSymbol,
+              testNotional,
+              aggregateCapUsd,
+              openPremiumAtRiskUsd: atRisk.usd,
+              openRows: atRisk.rows,
+              fleetCapUsd,
+              admissibleUsd: admissible.admissibleUsd,
+              admissibleBoundBy: admissible.boundBy,
+              bookHeadroomSignedUsd: admissible.bookHeadroomSignedUsd,
+              fleetHeadroomSignedUsd: admissible.fleetHeadroomSignedUsd,
+              fleetAtRiskUsd: admissible.fleetAtRiskUsd,
+              fleetAtRiskBooks: admissible.fleetAtRiskBooks,
+              username: this.alertUsername ?? null,
+            });
+            scanRun.reject('over_fleet_reachable_bound');
             continue;
           }
 

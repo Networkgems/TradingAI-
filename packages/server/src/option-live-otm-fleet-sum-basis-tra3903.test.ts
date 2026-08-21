@@ -141,11 +141,26 @@ describe('TRA-3903 AC1 — the grade folds the SAME basis the rows publish', () 
     expect(A - (g.sumBookCapUsd as number)).toBeCloseTo(0.01, 2);
   });
 
-  it('the verdict is UNTOUCHED — a column fix must not become a fleet finding', () => {
+  it('THIS COLUMN FIX is still not a fleet finding — Σ B_i is untouched', () => {
+    // ⚠ RE-POINTED BY TRA-3911, NOT WEAKENED. This assertion's CLAIM is that the
+    // TRA-3903 capital fold does not move the verdict, and that claim is intact
+    // and asserted below on the `Σ B_i` column, which is the column TRA-3903
+    // changed. What it USED to assert — the literal string `within` — stopped
+    // being about that claim the moment TRA-3911 re-pointed the verdict at
+    // REACHABLE exposure per the CEO ruling on TRA-3703 (`4b54935e`).
+    //
+    // The fixture is the very fleet that ruling is about: `admin` carries
+    // $358.00 at risk against a $306.32 cap, so it holds $51.68 of GRANDFATHERED
+    // EXCESS and the fleet can reach $551.67 against A $500.00. `breach` is the
+    // correct reading of these bytes, and it was correct on 2026-08-20 too — the
+    // detector simply was not grading that quantity yet.
     const g = gradeLiveOtmFleetBound(rows(), A, PHI);
-    expect(g.verdict).toBe(SERVED.verdict); // still `within`, as the live host said
     expect(g.sumBookCapUsd).toBeCloseTo(SERVED.sumBookCapUsd, 2);
-    expect(g.overageUsd).toBe(0);
+    expect(g.overageUsd).toBe(0); // ← the TRA-3903 claim, on the TRA-3903 column
+    // And the verdict moved for a reason this file can name, not silently.
+    expect(g.verdict).toBe('breach');
+    expect(g.reachableSumUsd).toBeCloseTo(551.67, 2);
+    expect(g.grandfatheredExcessUsd).toBeCloseTo(51.68, 2);
   });
 });
 
@@ -200,6 +215,16 @@ describe('TRA-3903 AC5 — the new columns are gradeable by FIELD PRESENCE', () 
     expect(g.fleetCapitalUsd).toBeCloseTo(SERVED.fleetCapitalUsd, 2);
     expect(g.fleetSizedMaxSumUsd).toBeCloseTo(SERVED.fleetSizedMaxSumUsd, 1);
     expect(g.sizedCeilingCoversSum).toBe(false);
-    expect(g.verdict).toBe('within'); // …and the verdict still says fine. That is the point.
+    // …and the `Σ B_i` verdict this file is about still says fine. THAT is the
+    // point: a self-contradicting instrument that grades itself clean.
+    //
+    // ⚠ RE-POINTED BY TRA-3911. `overageUsd` — `Σ B_i` vs `A` — is the column
+    // this assertion was ever about, and it is still 0 under the re-created
+    // defect. The object-level `verdict` now also carries the REACHABLE
+    // quantity, which on this fixture is a genuine breach ($551.67 vs $500.00)
+    // and has nothing to do with the cash/capital fold being re-created here.
+    // Asserting the string would silently couple TRA-3903's regression control
+    // to a term TRA-3903 does not touch.
+    expect(g.overageUsd).toBe(0);
   });
 });
