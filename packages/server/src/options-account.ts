@@ -3092,6 +3092,17 @@ export class PaperOptionsAccount {
    */
   private crossModeSymbolCollisions = 0;
   /**
+   * TRA-3909 (CTO review, TRA-3916) — broker increases refused on a SOLE
+   * `desk_add` row, i.e. a second desk add on a symbol the engine has left.
+   *
+   * Its own counter rather than the TRA-3896 census, because the two refusals
+   * guard different populations and are decided by different evidence: 3896's is
+   * "our fill ledger cannot account for this", this one is "this lot is not ours
+   * to widen at all". Sharing a counter would make either one's regression
+   * invisible behind the other's activity.
+   */
+  private deskLotAbsorptionRefusals = 0;
+  /**
    * TRA-1976 — equity shares taken on when a cash-secured put is assigned, keyed
    * by lot id. This is the equity inventory the TRA-1966 primitive deferred; it
    * lets {@link settleCoveredWrite}'s `assigned` branch convert a short put into
@@ -9467,6 +9478,81 @@ export class PaperOptionsAccount {
             orderIds: recorded?.orderIds ?? [],
           });
         }
+        // ── TRA-3909 amendment (CTO review, TRA-3916) ────────────────────────
+        // ★ `desk_add` MUST BE STICKY, and the reason is that the label is only
+        // evaluated once while the row outlives the evaluation.
+        //
+        // A desk lot becomes the ONLY row on its OCC the moment the engine's
+        // sibling exits — and on 2026-08-20 XLF's engine leg was already through
+        // its stop, so that is the state the book reaches ~30s after this ships,
+        // not a corner case. Reaching the code below with one row would:
+        //
+        //   • copy the broker's blended `premiumPaid` onto the desk lot, which is
+        //     the TRA-3895 defect again (the blend moved the stop UP here only
+        //     because the engine leg was dearer; reverse the basis order and it
+        //     moves DOWN);
+        //   • call `installReconcileRiskThresholds`, which RE-STAMPS
+        //     `adoptionAuthority` from `ledgerOpenProvenance` — and that oracle
+        //     reads `lastRecordedOpenFill`, which does NOT stop at a
+        //     `sell_to_close`, so on any OCC this engine ever bought it answers
+        //     `engine`. The desk's contract would be recorded as engine-PLACED;
+        //   • therefore relabel it `engine_origin`, at which point it silently
+        //     gains eligibility for `isEngineManagedRow`, `stampLegacyUnmanagedRows`,
+        //     both `updateConfig` re-apply loops and the TRA-3896 top-up arm. The
+        //     authority is strictly wider than it reads, because it DECAYS.
+        //   • and `liveLotAdoptionReport().adopted` would go empty — byte-identical
+        //     to a build where adoption never happened.
+        //
+        // So: never copy the basis (it is the residual, durable by construction),
+        // never re-stamp the authority, refuse an INCREASE, and still honour a
+        // DECREASE — the desk closing part of their own lot is real and the broker
+        // is the authority on what is left.
+        //
+        // ⚠️ The refused increase is deliberately NOT routed through the drift
+        // detector's absorption arm. That arm compares a symbol's imported rows
+        // against the fill LEDGER, and a desk lot is by construction absent from
+        // that ledger — folding it in would report an absorption on every pass
+        // over every correctly adopted symbol. It surfaces as `brokerPositionDrift.
+        // excess` instead, which is exactly what an unadopted broker contract is.
+        if (existing.adoptionAuthority === 'desk_add') {
+          const deskHeld = existing.contractsRemaining ?? existing.contracts;
+          if (Number.isFinite(incoming.contracts) && incoming.contracts > deskHeld) {
+            this.deskLotAbsorptionRefusals += 1;
+            accountLog.warn('desk-adopted lot: broker lot is LARGER than this lot — absorption REFUSED', {
+              issue: 'TRA-3909',
+              positionId: existing.id,
+              optionSymbol: existing.optionSymbol,
+              deskHeld,
+              brokerContracts: incoming.contracts,
+              deskPremiumPaid: existing.premiumPaid,
+              brokerBlendedPremium: incoming.premiumPaid,
+              action: 'row keeps its own contracts, basis and stop; the excess is a `brokerPositionDrift` finding',
+              note: 'a desk lot never absorbs and never re-labels; nothing was closed',
+            });
+            continue;
+          }
+          if (
+            Number.isFinite(incoming.contracts)
+            && incoming.contracts > 0
+            && incoming.contracts < deskHeld
+          ) {
+            // A real partial close by the desk. Quantity only — the surviving
+            // contracts still cost what they cost.
+            existing.contracts = incoming.contracts;
+            existing.contractsRemaining = incoming.contracts;
+            updated += 1;
+            accountLog.info('desk-adopted lot: broker reports fewer contracts — quantity followed, basis untouched', {
+              issue: 'TRA-3909',
+              positionId: existing.id,
+              optionSymbol: existing.optionSymbol,
+              from: deskHeld,
+              to: incoming.contracts,
+              premiumPaid: existing.premiumPaid,
+            });
+          }
+          continue;
+        }
+
         const contractsChanged = existing.contracts !== incoming.contracts;
         const premiumChanged = Math.abs(existing.premiumPaid - incoming.premiumPaid) > 1e-6;
         if (contractsChanged || premiumChanged) {
@@ -9844,11 +9930,34 @@ export class PaperOptionsAccount {
    * so those come from the pass, and they re-publish on every reconcile for as
    * long as the condition holds.
    */
-  liveLotAdoptionReport(): LiveLotAdoptionReport {
+  liveLotAdoptionReport(
+    /**
+     * TRA-3916 — `checkExits({ waitAndHold })` as the ENGINE computes it. REQUIRED
+     * and not optional-defaulting-to-true, for the same reason
+     * `LiveStopActionabilityContext.actOnAdoptedBrokerRows` is: an optional field
+     * here would make every caller silently claim the mirror is up, and this
+     * route's whole job is to refuse to claim things it has not been told.
+     */
+    opts: { brokerMirroring: boolean },
+  ): LiveLotAdoptionReport {
     const adopted: AdoptedLotView[] = [];
     for (const opt of this.openOptions.values()) {
       if (opt.closedAt !== undefined) continue;
       if (opt.adoptionAuthority !== 'desk_add') continue;
+      // TRA-3916 — the `checkExits` inert walk, IN ITS OWN ORDER
+      // (`options-account.ts` ~:1255-1290). Only the gates that can apply to a
+      // single-leg long desk lot; `multi_leg_combo` / `covered_write` cannot
+      // reach a row this pass minted.
+      const stopArmed = isArmedThreshold(opt.stopLossPremium);
+      const exitInertReason = !this.autoManageImportedTradierOptions
+        ? 'imported_auto_manage_off' as const
+        : !opts.brokerMirroring
+          ? 'imported_no_broker_mirror' as const
+          : !engineMayActOnAdoptedRow(opt, this.actOnAdoptedBrokerRows)
+            ? 'adopted_not_authorized' as const
+            : !stopArmed
+              ? 'stop_not_armed' as const
+              : null;
       adopted.push({
         positionId: opt.id,
         optionSymbol: opt.optionSymbol ?? '',
@@ -9860,10 +9969,11 @@ export class PaperOptionsAccount {
         tp1Premium: Number.isFinite(opt.tp1Premium) ? opt.tp1Premium : null,
         sleeve: opt.deskAddSleeve ?? null,
         openedAt: opt.openedAt,
-        // The one field that says whether this row is theatre: an adopted lot
-        // the engine may not act on has a stop nothing will ever fire.
-        engineMayAct: engineMayActOnAdoptedRow(opt, this.actOnAdoptedBrokerRows),
-        stopArmed: isArmedThreshold(opt.stopLossPremium),
+        // The one field that says whether this row is theatre. COMPOSED over the
+        // whole walk, not the authority test alone — see `AdoptedLotView`.
+        engineMayAct: exitInertReason === null,
+        exitInertReason,
+        stopArmed,
         riskUnmanagedReason: opt.riskUnmanagedReason ?? null,
       });
     }
@@ -9879,6 +9989,11 @@ export class PaperOptionsAccount {
       refusedTotal: this.lotAdoptionRefusedTotal,
       brokerCopyRefusedOnSplitSymbol: this.lotSplitBrokerCopyRefusals,
       crossModeSymbolCollisions: this.crossModeSymbolCollisions,
+      deskLotAbsorptionRefusals: this.deskLotAbsorptionRefusals,
+      gates: {
+        autoManageImportedTradierOptions: this.autoManageImportedTradierOptions,
+        brokerMirroring: opts.brokerMirroring,
+      },
     };
   }
 

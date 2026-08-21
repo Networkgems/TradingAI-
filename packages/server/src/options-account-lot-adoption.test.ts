@@ -279,7 +279,7 @@ describe('per-lot adoption of desk-added Tradier lots (TRA-3909)', () => {
     const acct = freshAccount();
     acct.reconcileTradierPositions(BROKER_AT_2338, 'live');
 
-    const report = acct.liveLotAdoptionReport();
+    const report = acct.liveLotAdoptionReport({ brokerMirroring: true });
     expect(report.ranAt).toBe(NOW);
     expect(report.symbolsExamined).toBe(2);
     expect(report.mintedLast).toBe(2);
@@ -298,7 +298,7 @@ describe('per-lot adoption of desk-added Tradier lots (TRA-3909)', () => {
     const stubborn = freshAccount();
     clearLiveOptionsFeeSlippageLedger();          // the oracle goes silent
     stubborn.reconcileTradierPositions(BROKER_AT_2338, 'live');
-    const refusedReport = stubborn.liveLotAdoptionReport();
+    const refusedReport = stubborn.liveLotAdoptionReport({ brokerMirroring: true });
     expect(refusedReport.adopted).toHaveLength(0);
     expect(refusedReport.mintedLast).toBe(0);
     expect(refusedReport.refused).toHaveLength(2);
@@ -335,7 +335,7 @@ describe('per-lot adoption of desk-added Tradier lots (TRA-3909)', () => {
     expect(bacEngine!.premiumPaid).toBeCloseTo(1.65, 10);
     expect(bacDesk!.premiumPaid).toBeCloseTo(1.17, 10);
 
-    const report = rebooted.liveLotAdoptionReport();
+    const report = rebooted.liveLotAdoptionReport({ brokerMirroring: true });
     expect(report.mintedLast).toBe(0);
     expect(report.splitLast).toBe(0);
     // Still readable: the ADOPTED half is derived from the book, so a settled
@@ -413,6 +413,147 @@ describe('per-lot adoption of desk-added Tradier lots (TRA-3909)', () => {
     expect(summarizeLiveUnmanagedRisk(
       after, driftAfter.excessContracts + driftAfter.brokerOnlyContracts,
     ).uncoveredBrokerContracts).toBe(0);
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TRA-3916 (CTO review) — ★ THE DESK LOT MUST NOT DECAY.
+  //
+  // `desk_add` is decided once, at mint, from "does the engine hold a row on this
+  // OCC". The row outlives that evaluation: the moment the engine's sibling exits,
+  // the desk lot is the ONLY row on its symbol and falls into the pre-3909
+  // single-row import branch — which copies the broker's blend and calls
+  // `installReconcileRiskThresholds`, which re-stamps `adoptionAuthority` from an
+  // oracle (`lastRecordedOpenFill`) that does NOT stop at a `sell_to_close` and so
+  // answers `engine` for any OCC we ever bought.
+  //
+  // ⚠️ Not a corner case: XLF's engine leg is ALREADY through its stop
+  // (0.82 < 0.864 is the number this whole ticket is about), so this is the state
+  // the book reaches ~30s after the deploy.
+  //
+  // Both probes are CTO's, reproduced against the same 23:38Z fixture.
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /** Adopt, then retire the engine's XLF leg the way its stop firing would. */
+  function adoptThenEngineLegExits(acct: PaperOptionsAccount): void {
+    acct.reconcileTradierPositions(BROKER_AT_2338, 'live');
+    const engineRow = rowsFor(acct, XLF).find(r => r.adoptionAuthority !== 'desk_add')!;
+    acct.dropImportedPosition(engineRow.id);
+    recordLiveOptionFill({
+      ts: NOW, etDay: '2026-08-20', sleeve: 'single_leg_otm', optionSymbol: XLF,
+      side: 'sell_to_close', contracts: 1, filledPrice: 0.86, fees: null, orderId: 142900001,
+    });
+  }
+
+  it('★ PROBE 1: the engine leg exits and the broker re-prices — the lot stays `desk_add` @ 0.85/0.68', () => {
+    const acct = freshAccount();
+    adoptThenEngineLegExits(acct);
+
+    // Broker now reports the symbol at average cost over what is left.
+    acct.reconcileTradierPositions(
+      [
+        brokerRow({ optionSymbol: BAC, strike: 63, contracts: 2, premiumPaid: 1.41 }),
+        brokerRow({ optionSymbol: XLF, strike: 57.5, contracts: 1, premiumPaid: 0.965 }),
+      ],
+      'live',
+    );
+
+    const xlf = rowsFor(acct, XLF);
+    expect(xlf).toHaveLength(1);
+    const desk = xlf[0]!;
+    // ⛔ NOT `engine_origin`. The desk placed this contract; recording it as
+    // engine-placed is false provenance, and it silently confers eligibility for
+    // `isEngineManagedRow`, `stampLegacyUnmanagedRows`, both `updateConfig`
+    // re-apply loops and the TRA-3896 top-up arm.
+    expect(desk.adoptionAuthority).toBe('desk_add');
+    // ⛔ NOT the 0.965 blend, and therefore NOT a stop of 0.772.
+    expect(desk.premiumPaid).toBeCloseTo(0.85, 10);
+    expect(desk.stopLossPremium).toBeCloseTo(0.68, 10);
+    expect(desk.deskAddSleeve).toBe('single_leg_otm');
+    // …and it is still NAMEABLE. An empty `adopted` here would read identically
+    // to a build where adoption never happened.
+    const report = acct.liveLotAdoptionReport({ brokerMirroring: true });
+    expect(report.adopted.map(a => a.optionSymbol)).toContain(XLF);
+  });
+
+  it('★ PROBE 2: a SECOND desk add on a symbol the engine left is REFUSED, never absorbed', () => {
+    const acct = freshAccount();
+    adoptThenEngineLegExits(acct);
+
+    // The desk buys one more: broker 2 ct @ 0.80 blended.
+    acct.reconcileTradierPositions(
+      [
+        brokerRow({ optionSymbol: BAC, strike: 63, contracts: 2, premiumPaid: 1.41 }),
+        brokerRow({ optionSymbol: XLF, strike: 57.5, contracts: 2, premiumPaid: 0.80 }),
+      ],
+      'live',
+    );
+
+    const xlf = rowsFor(acct, XLF);
+    expect(xlf).toHaveLength(1);
+    // Row completely unchanged: not widened to 2, not repriced to 0.80, not
+    // relabelled, and its stop is still its own.
+    expect(xlf[0]!.contractsRemaining).toBe(1);
+    expect(xlf[0]!.premiumPaid).toBeCloseTo(0.85, 10);
+    expect(xlf[0]!.stopLossPremium).toBeCloseTo(0.68, 10);
+    expect(xlf[0]!.adoptionAuthority).toBe('desk_add');
+
+    // Counted, and VISIBLE as a broker excess — which is what an unadopted
+    // broker contract is. Deliberately not routed through the drift detector's
+    // absorption arm: that arm reads the fill ledger, and a desk lot is by
+    // construction absent from it.
+    const report = acct.liveLotAdoptionReport({ brokerMirroring: true });
+    expect(report.deskLotAbsorptionRefusals).toBeGreaterThanOrEqual(1);
+    const drift = diffLiveBrokerPositions(
+      { ok: true, positions: [brokerRow({ optionSymbol: XLF, strike: 57.5, contracts: 2, premiumPaid: 0.80 })] },
+      acct.getState().openOptions.filter(o => o.optionSymbol === XLF),
+      NOW,
+      (sym) => recordedEngineOpenBasis(sym)?.contracts ?? null,
+    );
+    expect(drift.excessContracts).toBe(1);
+    expect(drift.absorbedContracts).toBe(0);
+  });
+
+  it('★ a desk-side PARTIAL CLOSE is still honoured — the refusal is one-directional', () => {
+    // Refusing a DECREASE would strand the row believing it holds contracts that
+    // are gone. Quantity follows the broker; the basis does not move.
+    const acct = freshAccount();
+    acct.reconcileTradierPositions(BROKER_AT_2338, 'live');
+    // Give the desk lot 2 contracts so there is something to close half of.
+    const desk = rowsFor(acct, XLF).find(r => r.adoptionAuthority === 'desk_add')!;
+    desk.contracts = 2;
+    desk.contractsRemaining = 2;
+    acct.dropImportedPosition(rowsFor(acct, XLF).find(r => r.adoptionAuthority !== 'desk_add')!.id);
+
+    acct.reconcileTradierPositions(
+      [brokerRow({ optionSymbol: XLF, strike: 57.5, contracts: 1, premiumPaid: 0.85 })],
+      'live',
+    );
+
+    const after = rowsFor(acct, XLF)[0]!;
+    expect(after.contractsRemaining).toBe(1);
+    expect(after.premiumPaid).toBeCloseTo(0.85, 10);
+    expect(after.adoptionAuthority).toBe('desk_add');
+  });
+
+  it('★ `engineMayAct` is the WHOLE walk — auto-manage off makes it read false', () => {
+    const acct = freshAccount();
+    acct.reconcileTradierPositions(BROKER_AT_2338, 'live');
+
+    // Broker mirror down: the stop is written but `checkExits` will never fire it.
+    const noMirror = acct.liveLotAdoptionReport({ brokerMirroring: false });
+    expect(noMirror.adopted.every(a => a.stopArmed)).toBe(true);
+    expect(noMirror.adopted.every(a => a.engineMayAct === false)).toBe(true);
+    expect(noMirror.adopted.every(a => a.exitInertReason === 'imported_no_broker_mirror')).toBe(true);
+    expect(noMirror.gates.brokerMirroring).toBe(false);
+
+    // Auto-manage off precedes it in the walk, so it wins the label.
+    acct.updateConfig({ autoManageImportedTradierOptions: false });
+    const noAuto = acct.liveLotAdoptionReport({ brokerMirroring: true });
+    expect(noAuto.adopted.every(a => a.exitInertReason === 'imported_auto_manage_off')).toBe(true);
+    expect(noAuto.gates.autoManageImportedTradierOptions).toBe(false);
+    // ⛔ And the toggle must not have rewritten the desk lot's schedule.
+    expect(rowsFor(acct, XLF).find(r => r.adoptionAuthority === 'desk_add')!.stopLossPremium)
+      .toBeCloseTo(0.68, 10);
   });
 
   it('⛔ places no order and closes nothing', () => {

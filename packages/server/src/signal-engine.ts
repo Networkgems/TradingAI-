@@ -17706,9 +17706,16 @@ export class SignalEngine {
    * the pass somewhere else". `symbolsExamined` on each bucket says which.
    */
   liveLotAdoptionReports(): Record<TradierEnv, LiveLotAdoptionReport> {
+    // TRA-3916 — `checkExits({ waitAndHold })`, recomputed from the SAME three
+    // fields as the call site (`:5351-5354`) and deliberately duplicated as an
+    // expression rather than routed through a helper, for the same reason
+    // `getLiveStopActionabilityRows` does it: it has to stay byte-comparable to
+    // the gate it is claiming to predict.
+    const brokerMirroring =
+      this.mode === 'live' && this.tradierLiveOptionsEnabled && this.tradierLiveClient !== null;
     return {
-      sandbox: this.optionsAccounts.sandbox.liveLotAdoptionReport(),
-      production: this.optionsAccounts.production.liveLotAdoptionReport(),
+      sandbox: this.optionsAccounts.sandbox.liveLotAdoptionReport({ brokerMirroring }),
+      production: this.optionsAccounts.production.liveLotAdoptionReport({ brokerMirroring }),
     };
   }
 

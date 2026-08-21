@@ -235,8 +235,27 @@ export interface AdoptedLotView {
    * ⚠️ The field that says whether this row is theatre. An adopted lot the
    * engine may not act on carries a stop nothing will ever fire, which reads
    * identically to a managed one on every other field here.
+   *
+   * TRA-3916 (CTO review) — this is the COMPOSED answer, not
+   * `engineMayActOnAdoptedRow` alone. That predicate sits FIFTH in the
+   * `checkExits` inert walk, behind `imported_auto_manage_off` and
+   * `imported_no_broker_mirror`, both of which apply to every imported row. With
+   * either of those off the bare predicate returns `true` on a row whose stop
+   * the exit pass will never fire — precisely the reads-identically shape this
+   * route exists to break. {@link exitInertReason} names which gate refused.
    */
   engineMayAct: boolean;
+  /**
+   * TRA-3916 — the FIRST gate in the `checkExits` walk that refuses this row, in
+   * that walk's own order, or `null` when nothing does. A bare boolean cannot be
+   * acted on; this can.
+   */
+  exitInertReason:
+    | 'imported_auto_manage_off'
+    | 'imported_no_broker_mirror'
+    | 'adopted_not_authorized'
+    | 'stop_not_armed'
+    | null;
   stopArmed: boolean;
   riskUnmanagedReason: string | null;
 }
@@ -270,6 +289,18 @@ export interface LiveLotAdoptionReport {
   brokerCopyRefusedOnSplitSymbol: number;
   /** TRA-3909 — OCC collisions between books; see the counter's own docblock. */
   crossModeSymbolCollisions: number;
+  /**
+   * TRA-3916 — broker increases refused on a SOLE `desk_add` row: a second desk
+   * add on a symbol the engine has since left. The refusal that stops a desk lot
+   * absorbing another and then decaying into `engine_origin`.
+   */
+  deskLotAbsorptionRefusals: number;
+  /**
+   * TRA-3916 — the two `checkExits` gates that precede the authority test and
+   * apply to every imported row, echoed so a reader can see WHY a lot's
+   * `engineMayAct` reads false without re-deriving the engine's state.
+   */
+  gates: { autoManageImportedTradierOptions: boolean; brokerMirroring: boolean };
 }
 
 function usable(n: number | undefined | null): n is number {
