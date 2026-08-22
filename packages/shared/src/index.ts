@@ -2933,6 +2933,41 @@ export interface OptionPosition {
    */
   engineOriginSleeve?: 'single_leg_rv' | 'single_leg_otm' | 'single_leg_directional';
   /**
+   * TRA-3943 (parent TRA-3927, board card `a29b2db8`) — the SPOT LEVEL at which
+   * this row's thesis is invalidated: `underlyingEntryPrice ∓ atrMult ×
+   * ATR(14, DAILY)`, stamped ONCE at entry and never moved. Below it for a call,
+   * above it for a put.
+   *
+   * Frozen at entry on purpose. "1×ATR invalidation" is a LEVEL, and re-deriving
+   * it every tick off a moving ATR would make the stop drift with the very
+   * volatility expansion that is invalidating the trade. It is also what lets a
+   * grader read the level off the row instead of re-deriving it from a bar feed
+   * that has since moved.
+   *
+   * ABSENT is the fail-CLOSED state and it is a routine one: a row opened before
+   * TRA-3943 shipped, a row whose `underlyingEntryPrice` was not a real spot
+   * (`0` on every `tradier_import` — TRA-2893), or a cold daily-bar feed all
+   * leave it unset, and the ATR leg of the stop is then INERT for that row (the
+   * −35% premium leg still runs). Never defaulted to a number: a `0` level fires
+   * every put on every tick, which is the exact TRA-2893 fail-open one field over.
+   */
+  otmAtrInvalidationLevel?: number;
+  /**
+   * TRA-3943 — the ATR(14, daily) reading {@link otmAtrInvalidationLevel} was
+   * derived from, kept so the level is auditable without re-fetching bars.
+   */
+  otmAtrInvalidationAtr?: number;
+  /**
+   * TRA-3943 — ET day key on which this row's OTM intraday stop was through but
+   * the day-one PDT release refused it for want of day-trade capacity.
+   *
+   * A latch, for the same reason `slHeldForDailyClose` is one: the log line and
+   * the counter must say "held" once per row per day, not once per exit tick.
+   * Persisted so a mid-session restart cannot launder the hold into a fire, and
+   * cleared the moment the stop stops triggering or the release opens.
+   */
+  otmStopHeldForPdt?: string;
+  /**
    * TRA-348 — Tradier order id for an in-flight `sell_to_close` against an
    * imported position. Set when the close order was accepted but did not
    * reach a terminal `filled` state inside the wait window (after-hours,

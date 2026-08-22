@@ -11170,6 +11170,38 @@ app.get('/api/health/options-live', async (_req, res) => {
       // downside until the next 00:00Z — that is `holdLiveOptionsOvernightForPdt`
       // doing its job (TRA-2983), composed with an entry path that may open at
       // any hour. Same blind/zero discipline as its neighbour.
+      //
+      // TRA-3943 (parent TRA-3927, board card `a29b2db8`) — ...and on the
+      // `single_leg_otm` sleeve that is no longer the whole story, which is why
+      // `stopBasis` is now a FOLD and not a literal. Read three fields together
+      // and in this order, because each answers a question the one before it
+      // cannot:
+      //
+      //   • `stopBasisBySleeve['otm_mispricing']` — does the RULE govern this
+      //     sleeve's rows? `premium_pct_or_atr` ⇒ the −35%-premium / 1×ATR-spot
+      //     intraday stop is the primary exit and `daily_close` is the backstop.
+      //     This is AC2's subject: the fleet fold cannot answer a per-sleeve
+      //     question once the book holds an RV row too, and it reads `mixed`
+      //     exactly then.
+      //   • `otmDayOneStop.release.released` — can it REACH THE BROKER today? A
+      //     rule that resolves `dtbp_exhausted` or `capacity_unreadable` is
+      //     decorative for the session in precisely the way TRA-3892 measured,
+      //     and it reads identically in the field above. The production account
+      //     ***0154 is `cash`, which has no PDT bucket to burn, so its reason is
+      //     `cash_account`.
+      //   • `otmDayOneStop.atrLegInertRows` — how many counted rows have NO
+      //     stamped invalidation level, i.e. run on the premium leg alone. A row
+      //     opened before this shipped, or one with no real entry spot, is inert
+      //     on that leg by construction. Publishing the rule without this
+      //     denominator is the `evaluated: 0` trap TRA-3926 paid for.
+      //
+      // `otmDayOneStop.fires` is the SINCE-BOOT twin of all three: `rows: 0`
+      // says nothing about whether the rule has ever fired, and `pdtHeld > 0`
+      // means it triggered and the release refused.
+      //
+      // ⚠️ SCOPE: one sleeve. RV and directional rows keep `full_premium`
+      // because nothing gave them a day-one lever, and this says NOTHING about
+      // the arm — read `liveOtmRouting` above for whether the sleeve trades.
       liveDayOneStopPosture: (() => {
         try {
           return {

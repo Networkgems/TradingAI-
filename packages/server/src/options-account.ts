@@ -22,6 +22,15 @@ import type {
 import { computePortfolioGreeks } from './reports/portfolio-greeks.js';
 import { etDateKey, etWallClockToUtcMs } from './et-clock.js';
 import type { LiveOptionStopPolicy, OtmSleeveExitRuleName } from './exit-risk-rules-flag.js';
+import {
+  otmDayOneStopVerdict,
+  otmAtrInvalidationLevel,
+  OTM_DAY_ONE_STOP_JOURNAL_REASON,
+  OTM_DAY_ONE_STOP_BASIS,
+  type OtmDayOneStopRule,
+  type OtmDayOneStopRelease,
+  type OtmDayOneStopTrigger,
+} from './otm-day-one-stop.js';
 import type { SpotResolver, PortfolioGreeksOptions } from './reports/portfolio-greeks.js';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
@@ -1497,10 +1506,66 @@ export function mergeLiveStopActionability(
  */
 export interface DayOneStopPosture {
   /**
-   * Always `'full_premium'`. Published as a literal so a consumer that joins
-   * this to a sizing model cannot mistake it for a stop-distance basis.
+   * The FLEET basis, folded from {@link stopBasisBySleeve} (TRA-3943).
+   *
+   * `full_premium` was a literal until TRA-3943 shipped the OTM sleeve's
+   * intraday stop, and it stays the reading for every sleeve that still has no
+   * day-one lever. It is a FOLD, so read it with `stopBasisBySleeve`:
+   *
+   *   • `full_premium` — no counted row has a day-one stop (TRA-3892's world);
+   *   • `premium_pct_or_atr` — every counted row does;
+   *   • `mixed` — some do and some do not, which is the state a fleet with one
+   *     OTM row and one RV row is actually in, and which neither literal can say.
+   *
+   * ⚠️ A `premium_pct_or_atr` basis is a claim about the RULE, not about whether
+   * it can reach the broker today. `otmDayOneStop.release.released` is that
+   * second question and it is answered separately, because a rule that resolves
+   * `dtbp_exhausted` is decorative for the session in exactly the way TRA-3892
+   * measured — and it would read identically here.
    */
-  stopBasis: 'full_premium';
+  stopBasis: 'full_premium' | typeof OTM_DAY_ONE_STOP_BASIS | 'mixed';
+  /**
+   * TRA-3943 — the per-sleeve basis over the counted rows, keyed on the same
+   * `signalType` as {@link premiumBySleeveUsd}. This is the field AC2 grades:
+   * "stopBasis != full_premium for OTM rows" is a question about a sleeve, and
+   * the fleet fold cannot answer it when the book holds more than one.
+   */
+  stopBasisBySleeve: Record<string, 'full_premium' | typeof OTM_DAY_ONE_STOP_BASIS>;
+  /**
+   * TRA-3943 — the OTM sleeve's rule as this process resolved it, with BOTH
+   * thresholds on the wire, or `null` when the caller did not attach one (the
+   * pre-TRA-3943 reading).
+   */
+  otmDayOneStop: {
+    armed: boolean;
+    /** Fraction of entry premium lost at which the premium leg fires (0.35). */
+    premiumStopPct: number;
+    /** `1 − premiumStopPct` — the mark floor as a ratio of entry (0.65). */
+    markFloorRatio: number;
+    /** ATR(14, daily) multiple for the spot invalidation level (1). */
+    atrMult: number;
+    source: 'default' | 'env' | 'env_invalid';
+    release: OtmDayOneStopRelease;
+    /**
+     * Counted OTM rows carrying a usable `otmAtrInvalidationLevel`, over the
+     * counted OTM rows. The ATR leg is INERT on the rest (a row opened before
+     * this shipped, or one with no real entry spot), and a rule published
+     * without its denominator is the `evaluated: 0` trap TRA-3926 paid for.
+     */
+    atrLegRows: number;
+    atrLegInertRows: number;
+    /**
+     * TRA-3943 — SINCE-BOOT fires, split by leg, and the day-one fires HELD for
+     * want of day-trade capacity.
+     *
+     * The three counters above describe the rows the book holds RIGHT NOW; a
+     * `rows: 0` reading says nothing about whether the rule has ever fired,
+     * which is the exact ambiguity TRA-3892's breach-keyed counter had. These
+     * are the cumulative twin. `pdtHeld > 0` means the rule triggered and the
+     * release refused — the remedy is armed and NOT in force.
+     */
+    fires: { premiumPct: number; atrInvalidation: number; pdtHeld: number };
+  } | null;
   /** Live open rows currently bound by a date-keyed hold, breached or not. */
   rows: number;
   /** Σ `premiumPaid × contractsRemaining × 100` over those rows, 2dp. */
@@ -1520,6 +1585,23 @@ export interface DayOneStopPostureContext {
   holdLiveOptionsOvernightForPdt: boolean;
   /** Evaluation instant. Defaults to `Date.now()`; injected by the controls. */
   now?: number;
+  /**
+   * TRA-3943 — the SAME `{rule, release}` the engine hands `checkExits` this
+   * tick, resolved once by the engine and passed to both.
+   *
+   * Absent ⇒ the pre-TRA-3943 reading (`full_premium` everywhere,
+   * `otmDayOneStop: null`), which is what an older caller and every existing
+   * test get. Deliberately NOT re-derived from `process.env` here: this summary
+   * is a claim about what the exit path is doing, and a second resolution could
+   * report a rule the exit pass is not running (the TRA-3829 discipline).
+   */
+  otmDayOneStop?: { rule: OtmDayOneStopRule; release: OtmDayOneStopRelease };
+  /**
+   * TRA-3943 — this book's since-boot fire counters
+   * ({@link OptionsAccount.getOtmDayOneStopCounters}). Zeros when absent, which
+   * is what a caller with no account to ask gets.
+   */
+  otmDayOneStopCounters?: { premiumPct: number; atrInvalidation: number; pdtHeld: number };
 }
 
 function r2usd(v: number): number {
@@ -1534,6 +1616,11 @@ export function summarizeDayOneStopPosture(
   const now = ctx.now ?? Date.now();
   const nowKey = toDateKey(now);
   const premiumBySleeveUsd: Record<string, number> = {};
+  // TRA-3943 — per-sleeve basis, accumulated over the SAME counted population as
+  // the dollars above it so the two can never describe different row sets.
+  const stopBasisBySleeve: Record<string, 'full_premium' | typeof OTM_DAY_ONE_STOP_BASIS> = {};
+  let atrLegRows = 0;
+  let atrLegInertRows = 0;
   let rows = 0;
   let premiumAtRiskUsd = 0;
   let earliestRelease: number | null = null;
@@ -1555,6 +1642,21 @@ export function summarizeDayOneStopPosture(
     premiumAtRiskUsd += usd;
     const sleeve = opt.signalType ?? 'unknown';
     premiumBySleeveUsd[sleeve] = (premiumBySleeveUsd[sleeve] ?? 0) + usd;
+    // TRA-3943 — a row's basis is `premium_pct_or_atr` iff the rule this pass is
+    // running actually governs it: armed, and on the sleeve. The sleeve
+    // predicate is `isOtmSleeveRow`, the SAME one `checkExits` scopes the rule
+    // with, so the published basis cannot claim a row the exit path skips.
+    const governed = ctx.otmDayOneStop?.rule.armed === true && isOtmSleeveRow(opt);
+    const rowBasis = governed ? OTM_DAY_ONE_STOP_BASIS : ('full_premium' as const);
+    // A sleeve reads `full_premium` if ANY of its counted rows is ungoverned —
+    // the pessimistic fold, because the field exists to expose an unstopped
+    // dollar and a majority vote would hide one behind its neighbours.
+    if (stopBasisBySleeve[sleeve] !== 'full_premium') stopBasisBySleeve[sleeve] = rowBasis;
+    if (governed) {
+      const level = opt.otmAtrInvalidationLevel;
+      if (level !== undefined && Number.isFinite(level) && level > 0) atrLegRows += 1;
+      else atrLegInertRows += 1;
+    }
     const release = nextUtcDayStart(opt.openedAt);
     if (earliestRelease === null || release < earliestRelease) earliestRelease = release;
   }
@@ -1562,7 +1664,22 @@ export function summarizeDayOneStopPosture(
     premiumBySleeveUsd[k] = r2usd(premiumBySleeveUsd[k]);
   }
   return {
-    stopBasis: 'full_premium',
+    stopBasis: foldDayOneStopBasis(Object.values(stopBasisBySleeve)),
+    stopBasisBySleeve,
+    otmDayOneStop: ctx.otmDayOneStop === undefined
+      ? null
+      : {
+        armed: ctx.otmDayOneStop.rule.armed,
+        premiumStopPct: ctx.otmDayOneStop.rule.premiumStopPct,
+        markFloorRatio: ctx.otmDayOneStop.rule.markFloorRatio,
+        atrMult: ctx.otmDayOneStop.rule.atrMult,
+        source: ctx.otmDayOneStop.rule.source,
+        release: ctx.otmDayOneStop.release,
+        atrLegRows,
+        atrLegInertRows,
+        fires: ctx.otmDayOneStopCounters
+          ?? { premiumPct: 0, atrInvalidation: 0, pdtHeld: 0 },
+      },
     rows,
     premiumAtRiskUsd: r2usd(premiumAtRiskUsd),
     premiumBySleeveUsd,
@@ -1570,26 +1687,74 @@ export function summarizeDayOneStopPosture(
   };
 }
 
+/**
+ * TRA-3943 — fold per-sleeve bases into the fleet reading.
+ *
+ * An EMPTY population reads `full_premium`, not `premium_pct_or_atr`: with no
+ * rows there is no evidence the rule governs anything, and the optimistic
+ * default is how a dark book comes to read as a passing one (TRA-3911's
+ * `32/32 = blind, not pass`).
+ */
+function foldDayOneStopBasis(
+  bases: Iterable<'full_premium' | typeof OTM_DAY_ONE_STOP_BASIS>,
+): DayOneStopPosture['stopBasis'] {
+  let sawFull = false;
+  let sawRule = false;
+  for (const b of bases) {
+    if (b === 'full_premium') sawFull = true;
+    else sawRule = true;
+  }
+  if (sawFull && sawRule) return 'mixed';
+  if (sawRule) return OTM_DAY_ONE_STOP_BASIS;
+  return 'full_premium';
+}
+
 /** TRA-3892 — fold per-book postures into the fleet figure the no-auth route publishes. */
 export function mergeDayOneStopPosture(
   summaries: Iterable<DayOneStopPosture>,
 ): DayOneStopPosture {
   const premiumBySleeveUsd: Record<string, number> = {};
+  const stopBasisBySleeve: Record<string, 'full_premium' | typeof OTM_DAY_ONE_STOP_BASIS> = {};
   let rows = 0;
   let premiumAtRiskUsd = 0;
   let earliest: string | null = null;
+  // TRA-3943 — the rule is a PROCESS-level resolution, identical across this
+  // process's books, so the fold takes the first non-null and adds the row
+  // counters. A book that reported none (an older engine) contributes rows to
+  // the dollars and nothing to the rule, which is the honest shape.
+  let otmDayOneStop: DayOneStopPosture['otmDayOneStop'] = null;
+  let atrLegRows = 0;
+  let atrLegInertRows = 0;
+  const fires = { premiumPct: 0, atrInvalidation: 0, pdtHeld: 0 };
   for (const s of summaries) {
     rows += s.rows;
     premiumAtRiskUsd += s.premiumAtRiskUsd;
     for (const [k, v] of Object.entries(s.premiumBySleeveUsd)) {
       premiumBySleeveUsd[k] = r2usd((premiumBySleeveUsd[k] ?? 0) + v);
     }
+    for (const [k, v] of Object.entries(s.stopBasisBySleeve ?? {})) {
+      // Same pessimistic fold as the per-book walk: one ungoverned row anywhere
+      // in the fleet makes the sleeve read `full_premium`.
+      if (stopBasisBySleeve[k] !== 'full_premium') stopBasisBySleeve[k] = v;
+    }
+    if (s.otmDayOneStop !== null && s.otmDayOneStop !== undefined) {
+      atrLegRows += s.otmDayOneStop.atrLegRows;
+      atrLegInertRows += s.otmDayOneStop.atrLegInertRows;
+      fires.premiumPct += s.otmDayOneStop.fires.premiumPct;
+      fires.atrInvalidation += s.otmDayOneStop.fires.atrInvalidation;
+      fires.pdtHeld += s.otmDayOneStop.fires.pdtHeld;
+      if (otmDayOneStop === null) otmDayOneStop = s.otmDayOneStop;
+    }
     if (s.releasesAt !== null && (earliest === null || s.releasesAt < earliest)) {
       earliest = s.releasesAt;
     }
   }
   return {
-    stopBasis: 'full_premium',
+    stopBasis: foldDayOneStopBasis(Object.values(stopBasisBySleeve)),
+    stopBasisBySleeve,
+    otmDayOneStop: otmDayOneStop === null
+      ? null
+      : { ...otmDayOneStop, atrLegRows, atrLegInertRows, fires },
     rows,
     premiumAtRiskUsd: r2usd(premiumAtRiskUsd),
     premiumBySleeveUsd,
@@ -1606,7 +1771,14 @@ export function blindDayOneStopPosture(): {
   [K in keyof DayOneStopPosture]: K extends 'stopBasis' ? 'full_premium' : null
 } {
   return {
+    // TRA-3943 — the blind twin keeps `full_premium`, and that is deliberate: a
+    // blind instrument must not publish the token that says "this sleeve has a
+    // day-one stop". `instrumentBlind: true` on the route is the reading; this
+    // literal is the SAFE side of a field a consumer might join to a sizing
+    // model, which is the same argument TRA-3892 made for the literal itself.
     stopBasis: 'full_premium',
+    stopBasisBySleeve: null,
+    otmDayOneStop: null,
     rows: null,
     premiumAtRiskUsd: null,
     premiumBySleeveUsd: null,
@@ -3101,6 +3273,28 @@ export class PaperOptionsAccount {
   private slDailyCloseHolds = 0;
   /** TRA-3902 (08-21) — live rows whose breached chandelier trail was held until the daily-close window, one per row per ET day. */
   private chandelierDailyCloseHolds = 0;
+  /**
+   * TRA-3943 — OTM intraday stops this process FIRED, split by leg. Since-boot.
+   *
+   * Two counters and not one: the −35% premium leg and the 1×ATR spot leg fail
+   * in different worlds (an IV crush that never moves spot vs a grind that never
+   * reaches 35%), and a pooled count cannot tell a grader which one the sleeve
+   * is actually living on.
+   */
+  private otmDayOneStopFires: Record<OtmDayOneStopTrigger, number> = {
+    premium_pct: 0,
+    atr_invalidation: 0,
+  };
+  /**
+   * TRA-3943 — OTM intraday stops this process could NOT fire on day one because
+   * the account had no day-trade capacity (one per row per ET day).
+   *
+   * This is the counter that keeps the release honest. A stop that resolves
+   * `released: false` is decorative for that session in exactly the way TRA-3892
+   * measured, and "the rule is armed" would otherwise read identically to "the
+   * rule is armed and firing". Non-zero here means the remedy is NOT in force.
+   */
+  private otmDayOneStopPdtHolds = 0;
   /**
    * TRA-483 — overnight-hold gate for live positions opened today. Default
    * `true`: refuse to fire same-day TP1/SL/trail exits on live positions so
@@ -6210,6 +6404,24 @@ export class PaperOptionsAccount {
        * default, the ruling lives at the one production caller.
        */
       otmSleeveExitRule?: OtmSleeveExitRuleName;
+      /**
+       * TRA-3943 (parent TRA-3927, board card `a29b2db8`) — the `single_leg_otm`
+       * sleeve's INTRADAY stop (−`premiumStopPct` of entry premium OR the
+       * entry-stamped 1×ATR spot invalidation) and the day-one PDT RELEASE that
+       * lets it reach the broker on the entry session.
+       *
+       * ABSENT ⇒ the rule does not exist for this pass, byte-identical to the
+       * pre-TRA-3943 cascade. Same split as `liveStopPolicy` / `otmSleeveExitRule`
+       * before it: the legacy lives at the callee's default and the ruling lives
+       * at the one production caller (`signal-engine`), so every existing test
+       * and every other caller is untouched.
+       *
+       * `release` is consulted ONLY where the TRA-483 PDT hold would otherwise
+       * `continue` — i.e. day one on a LIVE row. It is a release of THIS stop and
+       * nothing else: TP1, take-profit-early and the trail stay held, which is the
+       * "risk-reducing only" half of TRA-3892's ruling 4.
+       */
+      otmDayOneStop?: { rule: OtmDayOneStopRule; release: OtmDayOneStopRelease };
     } = {},
     /**
      * TRA-1025 (TRA-1023 item 4) — per-position {@link ExitState} for single-leg
@@ -6473,6 +6685,70 @@ export class PaperOptionsAccount {
       const inOpeningRange = withinOpeningRange && positionIsLive;
       const trailExitSuppressed = pdtHeldToday || swingHeldToday || inOpeningRange;
 
+      // TRA-3943 (parent TRA-3927, board card `a29b2db8`) — the OTM sleeve's
+      // INTRADAY stop, evaluated HERE rather than down in the exit cascade
+      // because the two things it has to outrank (`pdtHeldToday` and the
+      // TRA-3902 `daily_close` deferral) both sit ABOVE that cascade. Computing
+      // it next to the suppression predicates is the same discipline TRA-3217
+      // applied to the trail bookkeeping: the verdict and the gates that consume
+      // it cannot drift apart if they are derived in one place.
+      //
+      // Scoped by `isOtmSleeveRow` — the TRA-3941 predicate, which covers a row
+      // re-typed to `tradier_import` by a reboot's reconcile (TRA-2811) via its
+      // durable `engineOriginSleeve` stamp. RV and directional rows resolve
+      // `null` here and every branch below is byte-identical for them.
+      //
+      // ⚠️ The opening-range window is NOT overridden. TRA-3902's first fix and
+      // TRA-3941's own tape agree that the open is where this sleeve's exits went
+      // wrong (every chandelier close landed 0–18 min after it); a −35% stop that
+      // fires on the widest print of the session is the defect this ticket is the
+      // remedy for, spelled the other way round. The stop fires on the first tick
+      // AFTER the window.
+      const otmDayOneStop = options.otmDayOneStop;
+      let otmStopTrigger: OtmDayOneStopTrigger | null = null;
+      if (otmDayOneStop !== undefined && !opt.legs && !inOpeningRange && isOtmSleeveRow(opt)) {
+        const verdict = otmDayOneStopVerdict(
+          {
+            premiumPaid: opt.premiumPaid,
+            optionType: opt.optionType,
+            ...(opt.otmAtrInvalidationLevel === undefined
+              ? {}
+              : { otmAtrInvalidationLevel: opt.otmAtrInvalidationLevel }),
+          },
+          {
+            mark,
+            underlyingSpot: underlyingPrices.get(opt.symbol),
+            rule: otmDayOneStop.rule,
+          },
+        );
+        if (verdict.fires) {
+          // The DAY-ONE release is the only place the PDT hold is consulted, and
+          // it fails CLOSED: on a margin account with no day-trade capacity the
+          // row stays held and the counter below is what says so out loud. A row
+          // opened on an EARLIER day is not day-one and is never gated by it.
+          if (pdtHeldToday && !otmDayOneStop.release.released) {
+            if (opt.otmStopHeldForPdt !== etDateKey(Date.now())) {
+              opt.otmStopHeldForPdt = etDateKey(Date.now());
+              this.otmDayOneStopPdtHolds += 1;
+              accountLog.warn('OTM intraday stop HELD on day one — no day-trade capacity', {
+                issue: 'TRA-3943',
+                optionSymbol: opt.optionSymbol,
+                trigger: verdict.trigger,
+                mark,
+                markFloor: verdict.markFloor,
+                releaseReason: otmDayOneStop.release.reason,
+                accountType: otmDayOneStop.release.accountType,
+              });
+            }
+          } else {
+            otmStopTrigger = verdict.trigger;
+            delete opt.otmStopHeldForPdt;
+          }
+        } else {
+          delete opt.otmStopHeldForPdt;
+        }
+      }
+
       // TRA-1268 (TRA-1250 Rule 1) — maintain the underlying-space chandelier
       // trail every tick (even while a PDT / swing-hold suppression would defer
       // the exit below), mirroring how the premium peak/trailing state above
@@ -6705,7 +6981,16 @@ export class PaperOptionsAccount {
       // is correct when the gate releases on the next session.
       // TRA-3217 — predicate computed above, next to the trail bookkeeping it
       // must stay in lockstep with.
-      if (pdtHeldToday) {
+      //
+      // TRA-3943 — ...with ONE exception, and it is the whole ticket. An OTM row
+      // whose intraday stop is through AND whose account has day-trade capacity
+      // falls through to the cascade, where the stop is the FIRST rule evaluated
+      // and every other exit is skipped. That is TRA-3892 ruling 4's
+      // "risk-reducing only" release: nothing but this stop passes, so the hold
+      // still refuses the TP1 partial, take-profit-early and the trail on day one.
+      // `otmStopTrigger` is null unless the release said yes, so the fail-closed
+      // direction is spelled at the site that computes it, not here.
+      if (pdtHeldToday && otmStopTrigger === null) {
         continue;
       }
 
@@ -6835,7 +7120,14 @@ export class PaperOptionsAccount {
       // `mark >= 0` on a row whose `+Infinity` sentinel was flattened to `null`
       // by the snapshot's `JSON.stringify`, which fires a take-profit on every
       // position with a positive mark — including losers, 25s after the open.
-      if (!opt.tp1Hit && isArmedThreshold(opt.tp1Premium) && mark >= opt.tp1Premium && opt.contractsRemaining > 1) {
+      // TRA-3943 — `otmStopTrigger !== null` is the ONE way a live row reaches
+      // this line on its entry day, and the release that put it here is
+      // risk-REDUCING only (TRA-3892 ruling 4). TP1 is a PROFIT partial, so it
+      // must not ride in on a stop's release. The two conditions are already
+      // near-disjoint (`mark >= tp1Premium` vs `mark <= 0.65 × premiumPaid`), but
+      // "near-disjoint" is an argument about today's thresholds, not a scope, and
+      // the ATR leg does not read the mark at all.
+      if (otmStopTrigger === null && !opt.tp1Hit && isArmedThreshold(opt.tp1Premium) && mark >= opt.tp1Premium && opt.contractsRemaining > 1) {
         const exitContracts = Math.floor(opt.contractsRemaining * partialExitRatio);
         if (exitContracts > 0) {
           if (waitAndHold) {
@@ -6925,12 +7217,57 @@ export class PaperOptionsAccount {
       let exitKind: 'sl' | 'trail' | null = null;
       let exitJournalReason: string | null = null;
 
+      // TRA-3943 (parent TRA-3927, board card `a29b2db8`) — the OTM sleeve's
+      // intraday stop, FIRST in the cascade because it is the PRIMARY rule on
+      // this sleeve and everything below it is now the backstop:
+      //
+      //   • the TRA-3902 `daily_close` policy still owns the −20% level at the
+      //     close window and the −50% catastrophic level intraday. It is reached
+      //     on any tick this rule declines, so nothing was removed — a row that
+      //     somehow escapes −35% still meets −50%;
+      //   • the premium trail (TRA-3941's ruling) still owns the winning side.
+      //
+      // Fired at the MARK, like the catastrophic stop and for the same reason: a
+      // limit resting at the −35% LEVEL would sit above a market that has already
+      // traded through it and would never fill (TRA-3902's own note at the
+      // catastrophic branch). `exitKind: 'sl'` puts it on the risk-reducing side
+      // of the TRA-2984 expiry escalation, so an unfilled stop crosses the spread
+      // on the retry instead of repeating an order the market has refused —
+      // which is the difference between an actionable stop and a decorative one.
+      //
+      // The journal reason names the LEG (`sl_otm_premium_pct` /
+      // `sl_otm_atr_invalidation`), never bare `sl`: AC3 is graded off the
+      // journal, and a grader has to be able to separate this rule's closes from
+      // the daily-close backstop's without re-deriving the price.
+      if (otmStopTrigger !== null) {
+        exitPremium = mark;
+        exitKind = 'sl';
+        exitJournalReason = OTM_DAY_ONE_STOP_JOURNAL_REASON[otmStopTrigger];
+        this.otmDayOneStopFires[otmStopTrigger] += 1;
+        accountLog.warn('OTM intraday stop FIRED', {
+          issue: 'TRA-3943',
+          optionSymbol: opt.optionSymbol,
+          mode: opt.mode ?? 'demo',
+          trigger: otmStopTrigger,
+          mark,
+          premiumPaid: opt.premiumPaid,
+          atrInvalidationLevel: opt.otmAtrInvalidationLevel ?? null,
+          spot: underlyingPrices.get(opt.symbol) ?? null,
+          openedToday: openedTodayKey,
+        });
+      }
+
       // TRA-1268 (TRA-1250 Rules 1-2) — evaluate the give-back rules first so a
       // ratchet-trail break or a profit give-back exits at the live mark BEFORE
       // the hard premium stop is reached. Both close the full remaining position
       // at the current mark; the underlying-space chandelier state was already
       // ratcheted above.
-      if (exitRisk && !opt.legs) {
+      //
+      // TRA-3943 — `exitPremium === null` is a NO-OP for every pre-existing
+      // caller (nothing above this line has ever assigned it) and is the guard
+      // that keeps the OTM intraday stop above the give-back family rather than
+      // beside it.
+      if (exitPremium === null && exitRisk && !opt.legs) {
         // TRA-1294 — take-profit-early (PROFIT-side mirror of Rules 1-2). Bank the
         // win once we've captured the target fraction of available profit BEFORE
         // the give-back trail/lock even engages. We are always LONG the premium
@@ -8205,6 +8542,27 @@ export class PaperOptionsAccount {
   }
 
   /**
+   * TRA-3943 — OTM intraday stop fires since boot, split by leg, plus the day-one
+   * fires this process HELD for want of day-trade capacity.
+   *
+   * `pdtHeld > 0` is the reading that says the remedy is not in force on this
+   * book: the rule triggered, and the PDT release refused. Read it with
+   * `liveDayOneStopPosture.otmDayOneStop.release` on `/api/health/options-live`,
+   * which carries the REASON.
+   */
+  getOtmDayOneStopCounters(): {
+    premiumPct: number;
+    atrInvalidation: number;
+    pdtHeld: number;
+  } {
+    return {
+      premiumPct: this.otmDayOneStopFires.premium_pct,
+      atrInvalidation: this.otmDayOneStopFires.atr_invalidation,
+      pdtHeld: this.otmDayOneStopPdtHolds,
+    };
+  }
+
+  /**
    * TRA-3902 (board, 2026-08-21) — how many times this process HELD a breached
    * chandelier trail on a live row until the daily-close window (one per row
    * per ET day). Since-boot; the live read is
@@ -9402,11 +9760,54 @@ export class PaperOptionsAccount {
    * TRA-3892 — premium this book holds under a stop that cannot fire today.
    * Reads the RESOLVED PDT knob for the same reason the method above does.
    */
-  dayOneStopPosture(now?: number): DayOneStopPosture {
+  dayOneStopPosture(
+    now?: number,
+    /**
+     * TRA-3943 — the SAME `{rule, release}` the engine hands `checkExits`.
+     * Absent ⇒ the pre-TRA-3943 reading; see {@link DayOneStopPostureContext}.
+     */
+    otmDayOneStop?: { rule: OtmDayOneStopRule; release: OtmDayOneStopRelease },
+  ): DayOneStopPosture {
     return summarizeDayOneStopPosture(this.openOptions.values(), {
       holdLiveOptionsOvernightForPdt: this.holdLiveOptionsOvernightForPdt,
       now,
+      ...(otmDayOneStop === undefined
+        ? {}
+        : { otmDayOneStop, otmDayOneStopCounters: this.getOtmDayOneStopCounters() }),
     });
+  }
+
+  /**
+   * TRA-3943 — stamp the entry-anchored 1×ATR spot invalidation level on an
+   * OTM row the engine has just opened.
+   *
+   * A method and not an eighth positional argument to `openOptionFromCandidate`:
+   * the ATR is a DAILY-bar read the account has no feed for, the open path
+   * already carries seven optional parameters, and every existing caller of the
+   * open path must stay byte-identical.
+   *
+   * REFUSES (returns false, stamping nothing) when the level cannot be honestly
+   * derived — no real entry anchor, no positive ATR. An unstamped row has an
+   * inert ATR leg and is counted as such on the health route; a row stamped from
+   * a `0` anchor would fire every put on every tick (TRA-2893).
+   */
+  stampOtmAtrInvalidation(
+    positionId: string,
+    args: { atrDaily: number | undefined; atrMult: number },
+  ): boolean {
+    const opt = this.openOptions.get(positionId);
+    if (!opt) return false;
+    if (!isOtmSleeveRow(opt)) return false;
+    const level = otmAtrInvalidationLevel({
+      optionType: opt.optionType,
+      underlyingEntryPrice: opt.underlyingEntryPrice,
+      atrDaily: args.atrDaily,
+      atrMult: args.atrMult,
+    });
+    if (level === null) return false;
+    opt.otmAtrInvalidationLevel = level;
+    opt.otmAtrInvalidationAtr = args.atrDaily;
+    return true;
   }
 
   /**

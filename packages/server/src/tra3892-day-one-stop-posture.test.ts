@@ -70,6 +70,12 @@ describe('TRA-3892 positive control — the 2026-08-20 pair, BEFORE the breach',
     const posture = summarizeDayOneStopPosture(rows, { holdLiveOptionsOvernightForPdt: true, now: NOON });
     expect(posture).toEqual({
       stopBasis: 'full_premium',
+      // TRA-3943 — the two fields this ticket added. With NO rule attached
+      // (which is what this caller does, and what every pre-TRA-3943 caller
+      // did) the sleeve map echoes the fleet literal and the rule reads `null`,
+      // so the 2026-08-20 reading this test pins is unchanged in substance.
+      stopBasisBySleeve: { otm_mispricing: 'full_premium' },
+      otmDayOneStop: null,
       rows: 2,
       premiumAtRiskUsd: 273,
       premiumBySleeveUsd: { otm_mispricing: 273 },
@@ -128,7 +134,18 @@ describe('TRA-3892 release — the hold is a UTC-day key', () => {
       holdLiveOptionsOvernightForPdt: true,
       now: Date.UTC(2026, 7, 21, 0, 0, 1),
     });
-    expect(p).toEqual({ stopBasis: 'full_premium', rows: 0, premiumAtRiskUsd: 0, premiumBySleeveUsd: {}, releasesAt: null });
+    // TRA-3943 — an EMPTY counted population folds to `full_premium` and an
+    // empty sleeve map, never to the rule token: a dark book is blind, not
+    // passing.
+    expect(p).toEqual({
+      stopBasis: 'full_premium',
+      stopBasisBySleeve: {},
+      otmDayOneStop: null,
+      rows: 0,
+      premiumAtRiskUsd: 0,
+      premiumBySleeveUsd: {},
+      releasesAt: null,
+    });
   });
 });
 
@@ -185,6 +202,10 @@ describe('TRA-3892 fleet fold and blind twin', () => {
     const flat = summarizeDayOneStopPosture([], { holdLiveOptionsOvernightForPdt: true, now: NOON });
     expect(mergeDayOneStopPosture([a, b, flat])).toEqual({
       stopBasis: 'full_premium',
+      // TRA-3943 — no book attached a rule, so every sleeve reads the literal
+      // and the fleet fold agrees with it.
+      stopBasisBySleeve: { otm_mispricing: 'full_premium', relative_value: 'full_premium' },
+      otmDayOneStop: null,
       rows: 2,
       premiumAtRiskUsd: 273,
       premiumBySleeveUsd: { otm_mispricing: 108, relative_value: 165 },
@@ -195,6 +216,11 @@ describe('TRA-3892 fleet fold and blind twin', () => {
   it('the blind twin NULLs every measured field — blind must never read as flat', () => {
     expect(blindDayOneStopPosture()).toEqual({
       stopBasis: 'full_premium',
+      // TRA-3943 — the two new fields NULL with the rest of them. The basis
+      // literal stays `full_premium` on purpose: a blind instrument must not
+      // publish the token that claims this sleeve has a day-one stop.
+      stopBasisBySleeve: null,
+      otmDayOneStop: null,
       rows: null,
       premiumAtRiskUsd: null,
       premiumBySleeveUsd: null,

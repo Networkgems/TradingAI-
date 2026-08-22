@@ -26,6 +26,15 @@ import {
   describeCorporateAction,
 } from '@trading-app/shared';
 import { etDateKey } from './et-clock.js';
+// TRA-3943 (parent TRA-3927, board card `a29b2db8`) — the OTM sleeve's intraday
+// stop: rule resolution, the day-one PDT release, and the entry-stamped 1×ATR
+// spot invalidation level.
+import {
+  resolveOtmDayOneStopRule,
+  resolveOtmDayOneStopRelease,
+  type OtmDayOneStopRule,
+  type OtmDayOneStopRelease,
+} from './otm-day-one-stop.js';
 // TRA-3387 — durability for the TRA-3243 session-scoped verdict. `symbolState` lives only in
 // this process, so a restart between a condemnation and the 01:00Z EOD run reverted TRA-3243
 // AND published an empty census that read as clean. The store survives the restart; the
@@ -1859,6 +1868,14 @@ const TECHNICAL_SNAPSHOT_REFRESH_MS = 5 * 60_000;
 const TECHNICAL_COLD_SCAN_INTERVAL = 4;
 const MTF_MINUTE_BARS = 2000;
 const MTF_DAILY_BARS = 260;
+/**
+ * TRA-3943 — daily bars pulled on the COLD path for the OTM sleeve's entry
+ * ATR(14, daily). 40 is ATR(14)'s 15-bar floor plus a month of slack for
+ * holidays and a thin provider response; deliberately far short of
+ * {@link MTF_DAILY_BARS}, because this pull happens on the entry path and the
+ * only thing downstream of it is a 14-period average.
+ */
+const OTM_DAILY_ATR_BARS = 40;
 
 /**
  * TRA-787 — SupertrendConfluence SHADOW channel parameters.
@@ -3078,6 +3095,17 @@ export class SignalEngine {
    * the IV-vs-RV scan reads realised-vol history without a second feed call.
    */
   private dailyCloseCache: Map<string, number[]> = new Map();
+  /**
+   * TRA-3943 — per-symbol DAILY candles for the OTM sleeve's entry ATR, stashed
+   * off the same {@link refreshTechnicalSnapshot} pull `dailyCloseCache` rides.
+   *
+   * Full OHLC and not closes: an ATR needs the high/low range, and a
+   * close-to-close proxy computed from `dailyCloseCache` would be a DIFFERENT
+   * number published under the board's name.
+   */
+  private otmDailyBarCache: Map<string, Candle[]> = new Map();
+  /** TRA-3943 — resolved ATR(14, daily) per symbol, keyed on the ET day it was taken. */
+  private otmDailyAtrCache: Map<string, { dayKey: string; atr: number | undefined }> = new Map();
   /**
    * TRA-787 — latest SupertrendConfluence shadow signals surfaced on
    * EngineState.supertrendShadowSignals. Observe-only: never merged into
@@ -5646,6 +5674,19 @@ export class SignalEngine {
             // not depend on the ATR feed that fed the chandelier.
             // DEFAULT `trail` — the ruling, for BOTH books (paper and live).
             otmSleeveExitRule: resolveOtmSleeveExitRule().rule,
+            // TRA-3943 (parent TRA-3927, board card `a29b2db8`) — the OTM
+            // sleeve's INTRADAY stop and its day-one PDT release. Resolved ONCE
+            // per pass, here, and handed to BOTH `checkExits` and the health
+            // route's posture read through {@link resolveOtmDayOneStop} — a
+            // second resolution in the route could publish a rule the exit path
+            // is not running (the TRA-3829 discipline).
+            //
+            // BOTH BOOKS, like the TRA-3942 entry window and for the same
+            // reason: paper is the surface the desk grades the live sleeve
+            // against, and AC3 is graded off the journal. The PDT release only
+            // ever engages on a LIVE day-one row (`pdtHeldToday` is live-only),
+            // so attaching it on the demo pass changes nothing there.
+            otmDayOneStop: this.resolveOtmDayOneStop(),
           },
           rvStructuralExitStates,
           optionExitRisk,
@@ -8982,7 +9023,97 @@ export class SignalEngine {
    * `getLiveStopActionability`.
    */
   getDayOneStopPosture(now?: number): DayOneStopPosture {
-    return this.optionsAccount.dayOneStopPosture(now);
+    return this.optionsAccount.dayOneStopPosture(now, this.resolveOtmDayOneStop());
+  }
+
+  /**
+   * TRA-3943 — the OTM sleeve's intraday stop as THIS process resolves it, plus
+   * the day-one PDT release read off the live broker balance snapshot.
+   *
+   * ONE resolver, two consumers (`checkExits` and {@link getDayOneStopPosture}),
+   * for the reason TRA-3829 wrote down: a health route that re-derives a rule
+   * from the env can report a refusal the exit path is not making, or miss one
+   * it is. The release in particular is a function of a snapshot that is DROPPED
+   * when it goes stale (`TRADIER_BALANCE_STALE_MS`), so it is a measurement with
+   * a shelf life and must be taken in the beat it is used.
+   */
+  private resolveOtmDayOneStop(): { rule: OtmDayOneStopRule; release: OtmDayOneStopRelease } {
+    return {
+      rule: resolveOtmDayOneStopRule(),
+      release: resolveOtmDayOneStopRelease(this.liveTradierBalance),
+    };
+  }
+
+  /**
+   * TRA-3943 — ATR(14) on DAILY bars for one underlying, for the OTM sleeve's
+   * entry-stamped spot invalidation level.
+   *
+   * NOT the `underlyingAtrBySymbol` the chandelier used: that is ATR(14) on the
+   * 5m shadow-candle cache, and 1× of it is a handful of cents — a level the
+   * spot crosses on noise. The board wrote "1×ATR(14, daily)" and the two are
+   * different instruments wearing the same name.
+   *
+   * Cached per symbol per ET day. Warmed for free whenever
+   * {@link refreshTechnicalSnapshot} runs (it already pulls daily bars); the
+   * on-demand fetch below is the cold path and is reached at most ONCE PER
+   * ENTRY, not per scan — the call sits after every gate has passed, and the
+   * sleeve's 2-row cap bounds it at a couple of pulls a day.
+   *
+   * `undefined` on any failure. The caller stamps nothing, the ATR leg is inert
+   * for that row, and the health route counts it (`atrLegInertRows`) — the
+   * fail-closed direction, because the alternative is a level derived from a
+   * number we did not measure.
+   */
+  /**
+   * TRA-3943 — resolve the entry ATR and stamp the invalidation level on a row
+   * the OTM opener has just returned.
+   *
+   * Never throws and never blocks the open: a cold feed leaves the row
+   * unstamped, its ATR leg inert, and the −35% premium leg — which needs no
+   * feed at all — still running. That asymmetry is why the premium leg is the
+   * primary one and the one AC3 grades.
+   */
+  private async stampOtmAtrInvalidation(position: OptionPosition): Promise<void> {
+    try {
+      const rule = resolveOtmDayOneStopRule();
+      if (!rule.armed) return;
+      const atrDaily = await this.otmDailyAtr(position.symbol);
+      const stamped = this.optionsAccount.stampOtmAtrInvalidation(position.id, {
+        atrDaily,
+        atrMult: rule.atrMult,
+      });
+      log.info('OTM ATR invalidation level (TRA-3943)', {
+        sym: position.symbol,
+        optionSymbol: position.optionSymbol,
+        optionType: position.optionType,
+        underlyingEntryPrice: position.underlyingEntryPrice,
+        atrDaily: atrDaily ?? null,
+        atrMult: rule.atrMult,
+        stamped,
+        level: position.otmAtrInvalidationLevel ?? null,
+      });
+    } catch (err: unknown) {
+      log.warn('OTM ATR invalidation stamp failed (TRA-3943) — ATR leg inert for this row', {
+        sym: position.symbol,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private async otmDailyAtr(symbol: string): Promise<number | undefined> {
+    const sym = symbol.toUpperCase();
+    const dayKey = etDateKey(Date.now());
+    const hit = this.otmDailyAtrCache.get(sym);
+    if (hit && hit.dayKey === dayKey) return hit.atr;
+    let bars = this.otmDailyBarCache.get(sym);
+    if (!bars || bars.length < 15) {
+      bars = await fetchDailyCandles(sym, OTM_DAILY_ATR_BARS).catch(() => [] as Candle[]);
+    }
+    if (bars.length >= 15) this.otmDailyBarCache.set(sym, bars);
+    const a = bars.length >= 15 ? atr(bars) : null;
+    const value = a != null && Number.isFinite(a) && a > 0 ? a : undefined;
+    this.otmDailyAtrCache.set(sym, { dayKey, atr: value });
+    return value;
   }
 
   /**
@@ -11841,6 +11972,11 @@ export class SignalEngine {
             log.info('live OTM bounded test: paper open null', { sym, optionSymbol: cheap.optionSymbol });
             continue;
           }
+          // TRA-3943 — stamp the 1×ATR(14, daily) spot invalidation level while
+          // the entry anchor is fresh. Placed BEFORE the broker mirror so a row
+          // that fills carries its level from its very first exit tick; a failed
+          // mirror rolls the paper open back and takes the stamp with it.
+          await this.stampOtmAtrInvalidation(openedLive);
           this.recordChurnOpen(signal.symbol);
           this.beginShadowMakerChase('single_leg_otm', signal, openedLive);
 
@@ -11929,6 +12065,10 @@ export class SignalEngine {
           this.activeRiskSizingMultiplier('options_otm'),
         );
         if (!opened) continue;
+        // TRA-3943 — same stamp on the paper book. Both books, deliberately: the
+        // desk grades the live sleeve against paper, and a mirror whose rows
+        // carry no invalidation level would report a stop the live book has.
+        await this.stampOtmAtrInvalidation(opened);
         scanRun.opened();
         this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
         // TRA-1662 — shadow the maker chase this demo open did NOT route.
@@ -19121,6 +19261,10 @@ export class SignalEngine {
       // last good series.
       if (dailyBars.length > 0) {
         this.dailyCloseCache.set(sym, dailyBars.map((b) => b.close));
+        // TRA-3943 — and stash the BARS for the OTM sleeve's entry ATR(14,
+        // daily). Same pull, same non-empty guard, zero extra feed calls; this
+        // is what keeps `otmDailyAtr`'s on-demand fetch a cold path.
+        if (dailyBars.length >= 15) this.otmDailyBarCache.set(sym, dailyBars);
       }
       return snap;
     } catch (err: unknown) {
