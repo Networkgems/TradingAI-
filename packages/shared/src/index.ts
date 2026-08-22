@@ -3056,6 +3056,12 @@ export interface OptionPosition {
     residualPremiumPaid: number;
     /** ms epoch of the mint. */
     at: number;
+    /**
+     * `capture_fill` only — whether the TRA-3939 submit witness attests every
+     * ET day the fill(s) came from. Legibility, not a gate: the capture prices
+     * a population the residual identity already labels `desk_add`.
+     */
+    attestation?: 'full' | 'partial';
   };
   /**
    * TRA-3946 (TRA-3907 phase 1) — per-LOT add provenance.

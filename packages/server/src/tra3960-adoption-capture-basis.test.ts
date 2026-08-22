@@ -24,6 +24,9 @@ import {
 const XLF = 'XLF260925C00057500';
 const BAC = 'BAC260925C00063000';
 const LIVE = { live: true };
+// The engine opened BAC at 13:37Z on 08-20; the desk added at 19:36Z the same day.
+const ENGINE_OPEN_MS = Date.parse('2026-08-20T13:37:00Z');
+const DESK_FILL_MS = Date.parse('2026-08-20T19:36:00Z');
 
 function row(over: Partial<LotAdoptionRowView> = {}): LotAdoptionRowView {
   return { id: 'row-1', contracts: 1, premiumPaid: 1.0, provenance: 'engine', inFlight: false, multiLeg: false, coveredWrite: false, ...over };
@@ -37,11 +40,11 @@ function ledger(over: Partial<LotAdoptionLedgerView> = {}): LotAdoptionLedgerVie
 
 function order(over: Partial<LotAdoptionCapturedOrder> = {}): LotAdoptionCapturedOrder {
   // Order 142769192 — the desk's real BAC fill of 2026-08-20, 1 ct @ 1.17.
-  return { orderId: 142769192, status: 'filled', orderClass: 'option', side: 'buy_to_open', optionSymbol: BAC, execQuantity: 1, avgFillPrice: 1.17, etDay: '2026-08-20', ...over };
+  return { orderId: 142769192, status: 'filled', orderClass: 'option', side: 'buy_to_open', optionSymbol: BAC, execQuantity: 1, avgFillPrice: 1.17, createMs: DESK_FILL_MS, etDay: '2026-08-20', ...over };
 }
 
 function capture(over: Partial<LotAdoptionCaptureView> = {}): LotAdoptionCaptureView {
-  return { orders: [order()], attestedEtDays: ['2026-08-20'], engineOrderIds: new Set<number>([142769100]), ...over };
+  return { orders: [order()], attestedEtDays: ['2026-08-20'], engineOrderIds: new Set<number>([142769100]), episodeStartMs: ENGINE_OPEN_MS, ...over };
 }
 
 function reasonOf(plan: LotAdoptionPlan): string | undefined {
@@ -62,6 +65,7 @@ describe('TRA-3960 — the capture store prices the lot first', () => {
       captureOrderIds: [142769192],
       captureCostUsd: 117,
       captureFallback: null,
+      captureAttestation: 'full',
     });
     expect(plan.mint!.premiumPaid).toBeCloseTo(1.17, 10);
     // The residual is still carried, so agreement is visible AS agreement.
@@ -102,7 +106,7 @@ describe('TRA-3960 — the capture store prices the lot first', () => {
       capture({
         orders: [
           order({ orderId: 142769426, optionSymbol: XLF, avgFillPrice: 0.85 }),
-          order({ orderId: 142769999, optionSymbol: XLF, avgFillPrice: 0.8, etDay: '2026-08-21' }),
+          order({ orderId: 142769999, optionSymbol: XLF, avgFillPrice: 0.8, createMs: DESK_FILL_MS + 86_400_000, etDay: '2026-08-21' }),
         ],
         attestedEtDays: ['2026-08-20', '2026-08-21'],
       }),
@@ -128,8 +132,10 @@ describe('TRA-3960 — the capture store prices the lot first', () => {
     ['the order is not filled', { orders: [order({ status: 'canceled' })] }, 'no_desk_fill_captured'],
     ['the order is a sell_to_close', { orders: [order({ side: 'sell_to_close' })] }, 'no_desk_fill_captured'],
     ['the order is multileg', { orders: [order({ orderClass: 'multileg' })] }, 'no_desk_fill_captured'],
-    ['the day is UNATTESTED by the submit witness', { attestedEtDays: [] }, 'day_unattested'],
-    ['the order carries no createDate', { orders: [order({ etDay: null })] }, 'day_unattested'],
+    ['the episode start is unknown (ledger not `open`)', { episodeStartMs: null }, 'episode_unknown'],
+    ["the fill PREDATES the engine's episode (a desk round-trip from last week)", { orders: [order({ createMs: ENGINE_OPEN_MS - 7 * 86_400_000, etDay: '2026-08-13' })] }, 'outside_episode'],
+    ['the order carries no createDate', { orders: [order({ createMs: null, etDay: null })] }, 'outside_episode'],
+    ['a non-engine sell_to_close sits in the window (FIFO)', { orders: [order(), order({ orderId: 142769300, side: 'sell_to_close', createMs: DESK_FILL_MS + 60_000 })] }, 'desk_close_in_window'],
     ['the fill carries no price', { orders: [order({ avgFillPrice: null })] }, 'unpriced'],
     ['the fill carries no exec quantity', { orders: [order({ execQuantity: null })] }, 'unpriced'],
     ['the attested fills do not sum to the residual', { orders: [order({ execQuantity: 2 })] }, 'quantity_mismatch'],
@@ -142,13 +148,42 @@ describe('TRA-3960 — the capture store prices the lot first', () => {
     expect(plan.mint!.captureOrderIds).toEqual([]);
   });
 
-  it('an unattested day is NAMED, not used: the candidate day is in the detail', () => {
-    const r = priceResidualFromCapture(capture({ attestedEtDays: ['2026-08-21'] }), BAC, 1);
+  it('an UNATTESTED day is priced but STAMPED partial: attestation is legibility, not a gate', () => {
+    // Measured live 2026-08-22: bqb1 boots mid-session, both captured days read
+    // `partial`. Requiring `full` would decline on nearly every real day, and
+    // the price does not depend on it: the residual identity already labels
+    // this population `desk_add`; the capture only supplies what it paid.
+    const r = priceResidualFromCapture(capture({ attestedEtDays: [] }), BAC, 1);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.premiumPaid).toBeCloseTo(1.17, 10);
+      expect(r.attestation).toBe('partial');
+    }
+    const plan = planLotAdoption(bacBroker, bacEngine, bacLedger, LIVE, capture({ attestedEtDays: [] }));
+    expect(plan.mint!.basisSource).toBe('capture_fill');
+    expect(plan.mint!.captureAttestation).toBe('partial');
+  });
+
+  it('a fill that predates the episode is NAMED in the detail, not used', () => {
+    const r = priceResidualFromCapture(capture({ orders: [order({ createMs: ENGINE_OPEN_MS - 1, etDay: '2026-08-20' })] }), BAC, 1);
     expect(r.ok).toBe(false);
     if (!r.ok) {
-      expect(r.reason).toBe('day_unattested');
+      expect(r.reason).toBe('outside_episode');
       expect(r.detail).toContain('2026-08-20');
     }
+  });
+
+  it('a non-engine close BEFORE the episode does not poison the window; one INSIDE does', () => {
+    const before = priceResidualFromCapture(capture({ orders: [order(), order({ orderId: 9, side: 'sell_to_close', createMs: ENGINE_OPEN_MS - 1 })] }), BAC, 1);
+    expect(before.ok).toBe(true);
+    const inside = priceResidualFromCapture(capture({ orders: [order(), order({ orderId: 9, side: 'sell_to_close', createMs: ENGINE_OPEN_MS + 1 })] }), BAC, 1);
+    expect(inside.ok).toBe(false);
+    if (!inside.ok) expect(inside.reason).toBe('desk_close_in_window');
+  });
+
+  it("the ENGINE's own sell_to_close in the window is not a desk close (excluded by id)", () => {
+    const r = priceResidualFromCapture(capture({ orders: [order(), order({ orderId: 142769100, side: 'sell_to_close', createMs: ENGINE_OPEN_MS + 1 })] }), BAC, 1);
+    expect(r.ok).toBe(true);
   });
 
   it('a NON-POSITIVE residual is not rescued by a captured fill — an inconsistency is not a price', () => {

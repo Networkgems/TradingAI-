@@ -90,6 +90,8 @@ export interface LotAdoptionCapturedOrder {
   optionSymbol: string | null;
   execQuantity: number | null;
   avgFillPrice: number | null;
+  /** `Date.parse(createDate)`, or `null` when the capture row carried no date. */
+  createMs: number | null;
   /** ET day of `createDate`, or `null` when the capture row carried no date. */
   etDay: string | null;
 }
@@ -97,21 +99,38 @@ export interface LotAdoptionCapturedOrder {
 /**
  * TRA-3960 — the capture store as a basis source.
  *
- * ⚠️ `attestedEtDays` and `engineOrderIds` are the LOAD-BEARING fields, not
- * `orders`. A desk order and an engine order are the same shape in the
- * broker's list (no submit path of ours sets a `tag`), so "not one of ours" is
- * only a reading on a day the submit recorder is attested for — the same
- * empty-witness-is-not-an-absent-witness rule TRA-3939 is built around. On an
- * unattested day an unrecognised id could be an engine order the ledger missed
- * (TRA-2959: 7 of 11 fills never reached it), and pricing the desk lot off the
- * ENGINE's fill is a mis-statement with an order id on it.
+ * ── What the capture is asked, and what it is NOT asked ─────────────────────
+ * It is asked for the PRICE of the residual contracts. It is not asked WHO
+ * placed them: the residual identity already labels every contract the fill
+ * ledger cannot account for `desk_add`, and the capture prices exactly that
+ * population — filled `buy_to_open` on this OCC whose id the fill ledger does
+ * not hold. An engine fill the chokepoint missed (TRA-2959: 7 of 11) lands in
+ * the residual under BOTH sources, at its real price under this one. So the
+ * submit witness's attestation — TRA-3939's guard against ACCUSING a human of
+ * an engine trade — is not load-bearing for the price. It is PUBLISHED
+ * (`captureAttestation`), never required; measured live 2026-08-22, bqb1 boots
+ * mid-session often enough that both captured days read `partial`, and a
+ * predicate that required `full` would decline on nearly every real day.
+ *
+ * ── What IS load-bearing ────────────────────────────────────────────────────
+ *   • `engineOrderIds` — the fill ledger's own ids for this OCC (∪ the submit
+ *     ledger's). The exclusion set that defines the population.
+ *   • `episodeStartMs` — the engine's first `buy_to_open` in the CURRENT open
+ *     episode. A desk add "to a trade the engine is in" cannot predate it, and
+ *     a desk round-trip from an earlier episode must not price this one.
+ *   • no non-engine `sell_to_close` inside the window — a desk that reduced
+ *     its lot makes which fill is still open a FIFO question, and this module
+ *     does not guess.
+ *   • the candidates sum EXACTLY to the residual.
  */
 export interface LotAdoptionCaptureView {
   orders: readonly LotAdoptionCapturedOrder[];
-  /** `EngineSubmitWitnessSummary.coveredEtDays` — the days "not ours" is a reading. */
+  /** `EngineSubmitWitnessSummary.coveredEtDays` — stamped on the mint, not required. */
   attestedEtDays: readonly string[];
   /** Submit-ledger production ids ∪ this symbol's fill-ledger `orderIds`. */
   engineOrderIds: ReadonlySet<number>;
+  /** Fill time of the engine's oldest open in the current episode; `null` ⇒ unknown ⇒ decline. */
+  episodeStartMs: number | null;
 }
 
 /** TRA-3960 — where a minted lot's `premiumPaid` came from. Never absent. */
@@ -131,12 +150,19 @@ export type LotMintCaptureFallbackReason =
   | 'capture_absent'
   /** No filled `buy_to_open` on this OCC in the store that is not an engine id. */
   | 'no_desk_fill_captured'
-  /** Candidates exist only on days the submit witness cannot speak for. */
-  | 'day_unattested'
+  /** The engine's episode start is unknown, so no window can be drawn. */
+  | 'episode_unknown'
+  /** Candidates exist, but all predate the engine's current episode (or are undated). */
+  | 'outside_episode'
+  /** A non-engine `sell_to_close` sits inside the window: which fill is open is FIFO. */
+  | 'desk_close_in_window'
   /** A candidate carries no usable `avgFillPrice` / `execQuantity`. */
   | 'unpriced'
-  /** The attested desk fills do not sum to the residual contracts. */
+  /** The in-window desk fills do not sum to the residual contracts. */
   | 'quantity_mismatch';
+
+/** TRA-3960 — whether the submit witness covers every day the capture priced from. */
+export type LotMintCaptureAttestation = 'full' | 'partial';
 
 /** TRA-3909 — how a row on the symbol got onto this book. */
 export type LotProvenance =
@@ -311,69 +337,91 @@ export interface LotMintStep {
   captureCostUsd: number | null;
   /** Why the capture did NOT price this lot. `null` iff `basisSource === 'capture_fill'`. */
   captureFallback: LotMintCaptureFallbackReason | null;
+  /**
+   * Whether the submit witness attests every ET day the capture priced from.
+   * `null` unless `basisSource === 'capture_fill'`. Legibility, not a gate —
+   * see {@link LotAdoptionCaptureView}.
+   */
+  captureAttestation: LotMintCaptureAttestation | null;
 }
 
 /**
  * TRA-3960 — find the desk's own fills for `residualContracts` on `optionSymbol`
  * in the capture store. PURE. Returns the priced lot, or the reason it declined.
  *
- * Attribution is by EXCLUSION on an ATTESTED day, never by shape: a filled
- * `buy_to_open` on this OCC whose id the engine cannot claim, on a day the
- * submit witness covers. Candidates on unattested days are named, not used.
- * The candidates must sum EXACTLY to the residual — a partial match would price
- * some of the residual off a fill and the rest off nothing.
+ * The population is by EXCLUSION and by WINDOW, never by shape: a filled
+ * `buy_to_open` on this OCC whose id the fill ledger does not hold, created at
+ * or after the engine's first open in the current episode, with no non-engine
+ * close in that window. The candidates must sum EXACTLY to the residual — a
+ * partial match would price some of the residual off a fill and the rest off
+ * nothing.
  */
 export function priceResidualFromCapture(
   capture: LotAdoptionCaptureView | null | undefined,
   optionSymbol: string,
   residualContracts: number,
 ):
-  | { ok: true; premiumPaid: number; costUsd: number; orderIds: number[] }
+  | { ok: true; premiumPaid: number; costUsd: number; orderIds: number[]; attestation: LotMintCaptureAttestation }
   | { ok: false; reason: LotMintCaptureFallbackReason; detail: string } {
   if (!capture) return { ok: false, reason: 'capture_absent', detail: 'no capture view was supplied on this path.' };
-  const attested = new Set(capture.attestedEtDays);
-  const onSymbol = capture.orders.filter(o =>
+  const nonEngineFilled = capture.orders.filter(o =>
     o.optionSymbol === optionSymbol
     && o.orderClass === 'option'
-    && o.side === 'buy_to_open'
     && o.status === 'filled'
     && Number.isFinite(o.orderId)
     && !capture.engineOrderIds.has(o.orderId));
-  if (onSymbol.length === 0) {
+  const opens = nonEngineFilled.filter(o => o.side === 'buy_to_open');
+  if (opens.length === 0) {
     return { ok: false, reason: 'no_desk_fill_captured', detail: `the capture store holds no filled \`buy_to_open\` on ${optionSymbol} outside the engine's own order ids.` };
   }
-  const attestedFills = onSymbol.filter(o => o.etDay !== null && attested.has(o.etDay));
-  if (attestedFills.length === 0) {
-    const days = [...new Set(onSymbol.map(o => o.etDay ?? 'undated'))].sort();
+  const start = capture.episodeStartMs;
+  if (start === null || !Number.isFinite(start)) {
+    return { ok: false, reason: 'episode_unknown', detail: `${opens.length} candidate fill(s) on ${optionSymbol} but the engine's episode start is unknown, so no window can be drawn around them.` };
+  }
+  const inWindow = opens.filter(o => o.createMs !== null && Number.isFinite(o.createMs) && o.createMs >= start);
+  if (inWindow.length === 0) {
+    const days = [...new Set(opens.map(o => o.etDay ?? 'undated'))].sort();
     return {
       ok: false,
-      reason: 'day_unattested',
-      detail: `${onSymbol.length} candidate fill(s) on ${days.join(', ')} but the submit witness attests none of those days, so "not the engine's order" is not a reading there.`,
+      reason: 'outside_episode',
+      detail: `${opens.length} candidate fill(s) on ${days.join(', ')} all predate the engine's current episode (or are undated); a desk add to this trade cannot precede it.`,
+    };
+  }
+  const closesInWindow = nonEngineFilled.filter(o =>
+    o.side === 'sell_to_close' && o.createMs !== null && Number.isFinite(o.createMs) && o.createMs >= start);
+  if (closesInWindow.length > 0) {
+    return {
+      ok: false,
+      reason: 'desk_close_in_window',
+      detail: `non-engine sell_to_close order(s) ${closesInWindow.map(o => o.orderId).join(', ')} sit inside the episode window; which desk fill is still open is a FIFO question this pass does not answer.`,
     };
   }
   let qty = 0;
   let costUsd = 0;
   const orderIds: number[] = [];
-  for (const o of attestedFills) {
+  const attested = new Set(capture.attestedEtDays);
+  let attestation: LotMintCaptureAttestation = 'full';
+  for (const o of inWindow) {
     if (!usable(o.execQuantity) || !usable(o.avgFillPrice) || !Number.isInteger(o.execQuantity)) {
       return { ok: false, reason: 'unpriced', detail: `captured order ${o.orderId} carries execQuantity ${o.execQuantity} / avgFillPrice ${o.avgFillPrice}; a fill with no price cannot be a basis.` };
     }
     qty += o.execQuantity;
     costUsd += o.execQuantity * o.avgFillPrice * 100;
     orderIds.push(o.orderId);
+    if (o.etDay === null || !attested.has(o.etDay)) attestation = 'partial';
   }
   if (qty !== residualContracts) {
     return {
       ok: false,
       reason: 'quantity_mismatch',
-      detail: `attested desk fills on ${optionSymbol} (orders ${orderIds.join(', ')}) total ${qty} contract(s) against a residual of ${residualContracts}; a partial attribution would price part of the lot off nothing.`,
+      detail: `in-window desk fills on ${optionSymbol} (orders ${orderIds.join(', ')}) total ${qty} contract(s) against a residual of ${residualContracts}; a partial attribution would price part of the lot off nothing.`,
     };
   }
   const premiumPaid = costUsd / (qty * 100);
   if (!usable(premiumPaid)) {
     return { ok: false, reason: 'unpriced', detail: `capture cost ${costUsd} over ${qty} contract(s) is not a positive finite premium.` };
   }
-  return { ok: true, premiumPaid, costUsd: round2(costUsd), orderIds };
+  return { ok: true, premiumPaid, costUsd: round2(costUsd), orderIds, attestation };
 }
 
 export interface LotAdoptionPlan {
@@ -438,6 +486,8 @@ export interface AdoptedLotView {
   basisSource: LotMintBasisSource | null;
   /** TRA-3960 — the capture order id(s) behind a `capture_fill` basis. */
   basisOrderIds: number[];
+  /** TRA-3960 — witness coverage of the capture days behind a `capture_fill` basis. */
+  basisAttestation: LotMintCaptureAttestation | null;
 }
 
 /**
@@ -710,6 +760,7 @@ export function planLotAdoption(
       captureOrderIds: captured.orderIds,
       captureCostUsd: captured.costUsd,
       captureFallback: null,
+      captureAttestation: captured.attestation,
     };
     return plan;
   }
@@ -723,6 +774,7 @@ export function planLotAdoption(
     captureOrderIds: [],
     captureCostUsd: null,
     captureFallback: captured.reason,
+    captureAttestation: null,
   };
   return plan;
 }

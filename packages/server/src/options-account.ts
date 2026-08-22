@@ -9529,7 +9529,7 @@ export class PaperOptionsAccount {
       ? 'desk_lot_mint_capture_fill'
       : 'desk_lot_mint_residual';
     const provenance = plan.mint.basisSource === 'capture_fill'
-      ? `tra3939 capture: order(s) ${plan.mint.captureOrderIds.join(', ')} = $${plan.mint.captureCostUsd} over ${plan.mint.contracts} ct; residual identity said ${plan.mint.residualPremiumPaid}`
+      ? `tra3939 capture: order(s) ${plan.mint.captureOrderIds.join(', ')} = $${plan.mint.captureCostUsd} over ${plan.mint.contracts} ct, witness ${plan.mint.captureAttestation}; residual identity said ${plan.mint.residualPremiumPaid}`
       : `residual identity: broker $${plan.brokerCostBasisUsd} − engine-recorded $${plan.recordedCostBasisUsd} = $${plan.mint.residualUsd} over ${plan.mint.contracts} ct; capture declined: ${plan.mint.captureFallback}`;
     const rec: EngineBasisRestatement = {
       ts: Date.now(),
@@ -10820,6 +10820,7 @@ export class PaperOptionsAccount {
               optionSymbol: o.optionSymbol,
               execQuantity: o.execQuantity,
               avgFillPrice: o.avgFillPrice,
+              createMs: Number.isFinite(ms) ? ms : null,
               etDay: Number.isFinite(ms) ? etDayOf(ms) : null,
             };
           }),
@@ -10832,10 +10833,16 @@ export class PaperOptionsAccount {
       if (captureBase === 'unconfigured') return null;
       const engineOrderIds = new Set<number>(captureBase.submitIds);
       for (const id of recordedOrderIds) engineOrderIds.add(id);
+      // The engine's oldest open in the CURRENT episode draws the window a desk
+      // add must fall inside. `openEpisodeWindow` is the same walk the other
+      // oracles share; anything but `open` leaves the window undrawable.
+      const episode = openEpisodeWindow(occ);
+      const episodeStartMs = episode.status === 'open' && episode.fills.length > 0 ? episode.fills[0]!.ts : null;
       return {
         orders: captureBase.orders.filter(o => o.optionSymbol === occ),
         attestedEtDays: captureBase.attestedEtDays,
         engineOrderIds,
+        episodeStartMs,
       };
     };
 
@@ -11047,6 +11054,7 @@ export class PaperOptionsAccount {
           orderIds: [...plan.mint.captureOrderIds],
           residualPremiumPaid: plan.mint.residualPremiumPaid,
           at: Date.now(),
+          ...(plan.mint.captureAttestation === null ? {} : { attestation: plan.mint.captureAttestation }),
         },
         ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
       };
@@ -11105,6 +11113,7 @@ export class PaperOptionsAccount {
         captureCostUsd: plan.mint.captureCostUsd,
         residualPremiumPaid: plan.mint.residualPremiumPaid,
         captureFallback: plan.mint.captureFallback,
+        captureAttestation: plan.mint.captureAttestation,
         note: plan.mint.basisSource === 'capture_fill'
           ? 'basis is the desk\'s own recorded fill from the TRA-3939 capture store (order id + price); no order was placed'
           : 'basis is the exact residual (broker cost - this engine\'s recorded cost); the capture store declined (see captureFallback); no order was placed',
@@ -11179,6 +11188,7 @@ export class PaperOptionsAccount {
         // defaulted to a source.
         basisSource: opt.deskAddBasis?.source ?? null,
         basisOrderIds: opt.deskAddBasis ? [...opt.deskAddBasis.orderIds] : [],
+        basisAttestation: opt.deskAddBasis?.attestation ?? null,
       });
     }
     return {

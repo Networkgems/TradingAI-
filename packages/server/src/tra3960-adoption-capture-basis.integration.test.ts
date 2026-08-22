@@ -144,10 +144,28 @@ describe('TRA-3960 — adoption reads the TRA-3939 capture store as its basis so
     expect(census.operatorRestated).toBe(0);
   });
 
-  it('NEGATIVE CONTROL — a capture on an UNATTESTED day (mid-session boot) is not used: residual, fallback named', () => {
+  it('the LIVE shape (mid-session boot ⇒ day `partial`) is still priced, and STAMPED partial', () => {
     seedCapture([captured()], { bootBeforeOpen: false });
     expect(summarizeEngineSubmitWitness().coveredEtDays).toEqual([]);
     expect(summarizeEngineSubmitWitness().uncoveredCapturedEtDays).toEqual(['2026-08-20']);
+
+    const acct = freshAccount();
+    acct.reconcileTradierPositions([bacBroker(1.425)], 'live');
+
+    const desk = deskRow(acct);
+    expect(desk.premiumPaid).toBeCloseTo(1.17, 10);
+    expect(desk.deskAddBasis).toMatchObject({ source: 'capture_fill', orderIds: [DESK_ORDER], attestation: 'partial' });
+    const report = acct.liveLotAdoptionReport({ brokerMirroring: true });
+    expect(report.adopted[0]!.basisAttestation).toBe('partial');
+    const line = acct.getEngineBasisRestatementCensus().restatements.find(r => r.source === 'desk_lot_mint_capture_fill');
+    expect(line!.provenance).toContain('witness partial');
+  });
+
+  it("NEGATIVE CONTROL — a desk round-trip from BEFORE the engine's episode does not price this one", () => {
+    // The desk bought 1 ct last week (and sold it); the capture holds that buy.
+    // The residual today is a different contract and must not wear last week's price.
+    const lastWeek = '2026-08-13T15:00:00.000Z';
+    seedCapture([captured({ id: 142700001, avgFillPrice: 0.99, createDate: lastWeek, transactionDate: lastWeek })]);
 
     const acct = freshAccount();
     acct.reconcileTradierPositions([bacBroker(1.41)], 'live');
@@ -159,7 +177,7 @@ describe('TRA-3960 — adoption reads the TRA-3939 capture store as its basis so
     expect(report.mintedFromCaptureTotal).toBe(0);
     expect(report.mintedFromResidualTotal).toBe(1);
     const line = acct.getEngineBasisRestatementCensus().restatements.find(r => r.source === 'desk_lot_mint_residual');
-    expect(line!.provenance).toContain('day_unattested');
+    expect(line!.provenance).toContain('outside_episode');
   });
 
   it('NEGATIVE CONTROL — an UNCONFIGURED store reads capture_absent, not "consulted and empty"', () => {
