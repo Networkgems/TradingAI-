@@ -8515,6 +8515,16 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
         adoptedPremiumAtRiskUsd: 0,
         adoptedOpenRows: 0,
         adoptedAttributionBlindRows: 0,
+        // TRA-3958 — the OPERATOR-PIN provenance overlay, added here for exactly
+        // the reason the paragraph above gives: this literal is exhaustive, so a
+        // new key breaks it by construction and the break is the notification.
+        //
+        // 0 on a flat book, and unambiguously so: no rows, so no pinned ones.
+        // ⚠ Elsewhere a 0 here is a real claim — "none of the dollars under this
+        // admission came from a human with a citation" — and it is the claim a
+        // reader gating on `admissibleEntryUsd` is entitled to.
+        operatorPinnedAtRiskUsd: 0,
+        operatorPinnedOpenRows: 0,
       });
 
       seedOpenLivePremium(engine, 700);

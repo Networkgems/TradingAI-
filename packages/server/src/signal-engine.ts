@@ -9227,6 +9227,28 @@ export class SignalEngine {
      * published as a desk measurement.
      */
     adoptedAttributionBlindRows: number;
+    /**
+     * TRA-3958 — of `openPremiumAtRiskUsd`, the dollars whose basis an OPERATOR
+     * pinned by hand (`POST /api/options/:id/restate-adopted-basis`) rather than
+     * a machine oracle supplying it.
+     *
+     * ⚠ A PROVENANCE OVERLAY, NOT A PARTITION. It is inside
+     * `openPremiumAtRiskUsd` and it OVERLAPS `adoptedPremiumAtRiskUsd` — the
+     * live BAC row is both. Do not subtract it from anything expecting the
+     * remainder to be a clean complement.
+     *
+     * Why it is on THIS payload: `premiumPaid` is read by the stop engine and
+     * SPENT here, and before this column a correction to the former moved the
+     * latter with no trace. On 2026-08-22 restating BAC 1.41 → 1.17 (a stop
+     * breached by the error alone) also moved `admin`'s `headroomSignedUsd` by
+     * $24.00 and its `admissibleEntryUsd` with it. Both figures looked entirely
+     * ordinary afterwards. A reader gating on admission is entitled to know
+     * that some of the basis under it is a human's number with a citation, not
+     * a fill.
+     */
+    operatorPinnedAtRiskUsd: number;
+    /** TRA-3958 — rows carrying the above. $117 on one row and $39 on three are different facts. */
+    operatorPinnedOpenRows: number;
     headroomUsd: number | null;
     /** TRA-3897 (AC2) — unclamped `capUsd − openPremiumAtRiskUsd`; negative ⇒ over cap. */
     headroomSignedUsd: number | null;
@@ -9318,6 +9340,15 @@ export class SignalEngine {
       adoptedPremiumAtRiskUsd: atRisk.adoptedUsd,
       adoptedOpenRows: atRisk.adoptedRows,
       adoptedAttributionBlindRows: atRisk.attributionBlindRows,
+      // TRA-3958 — how many of the dollars above rest on an OPERATOR PIN rather
+      // than a machine oracle. Published HERE, beside `admissibleEntryUsd`,
+      // because that is the number a pin silently moves: restating the live BAC
+      // row 1.41 → 1.17 to unbreak its stop also moved `admin`'s signed headroom
+      // $24.00 and its admission with it, and the route said nothing. Overlaps
+      // `adoptedPremiumAtRiskUsd` by construction — it is a provenance overlay
+      // on `openPremiumAtRiskUsd`, not another partition of it.
+      operatorPinnedAtRiskUsd: atRisk.operatorPinnedUsd,
+      operatorPinnedOpenRows: atRisk.operatorPinnedRows,
       headroomUsd: liveOptionTestAggregateHeadroomUsd(atRisk.usd, capUsd),
       // TRA-3897 (AC2) — the SIGNED headroom. `headroomUsd` floors at 0, so a
       // book over its own cap published byte-identically to one exactly at it:

@@ -63,12 +63,12 @@ function snapshotOf(positions: OptionPosition[]) {
 describe('foldOpenPremiumAtRisk (TRA-3445)', () => {
   it('sums premiumPaid × contractsRemaining × 100 over the open rows', () => {
     expect(foldOpenPremiumAtRisk([pos()]))
-      .toEqual({ usd: 150, rows: 1, unpricedRows: 0, adoptedUsd: 0, adoptedRows: 0, attributionBlindRows: 0 });
+      .toEqual({ usd: 150, rows: 1, unpricedRows: 0, adoptedUsd: 0, adoptedRows: 0, attributionBlindRows: 0, operatorPinnedUsd: 0, operatorPinnedRows: 0 });
     expect(foldOpenPremiumAtRisk([
       pos({ id: 'a' }),
       pos({ id: 'b', premiumPaid: 0.82 }),
       pos({ id: 'c', premiumPaid: 2.00, contracts: 2, contractsRemaining: 2 }),
-    ])).toEqual({ usd: 150 + 82 + 400, rows: 3, unpricedRows: 0, adoptedUsd: 0, adoptedRows: 0, attributionBlindRows: 0 });
+    ])).toEqual({ usd: 150 + 82 + 400, rows: 3, unpricedRows: 0, adoptedUsd: 0, adoptedRows: 0, attributionBlindRows: 0, operatorPinnedUsd: 0, operatorPinnedRows: 0 });
   });
 
   it('uses REMAINING contracts, so a TP1 partial releases the headroom it freed', () => {
@@ -94,7 +94,7 @@ describe('foldOpenPremiumAtRisk (TRA-3445)', () => {
     ]);
     // A silent skip would leave `usd: 150, rows: 1` — indistinguishable from a
     // book that really holds one position. `unpricedRows` is the discriminator.
-    expect(fold).toEqual({ usd: 150, rows: 1, unpricedRows: 3, adoptedUsd: 0, adoptedRows: 0, attributionBlindRows: 0 });
+    expect(fold).toEqual({ usd: 150, rows: 1, unpricedRows: 3, adoptedUsd: 0, adoptedRows: 0, attributionBlindRows: 0, operatorPinnedUsd: 0, operatorPinnedRows: 0 });
   });
 
   it('TRA-3829 — an ADOPTED row counts toward the TOTAL but is attributed away from the engine', () => {
@@ -166,7 +166,7 @@ describe('foldOpenPremiumAtRisk (TRA-3445)', () => {
 
   it('an EMPTY book is $0 at risk with zero rows — not a null or a synthetic bucket', () => {
     expect(foldOpenPremiumAtRisk([]))
-      .toEqual({ usd: 0, rows: 0, unpricedRows: 0, adoptedUsd: 0, adoptedRows: 0, attributionBlindRows: 0 });
+      .toEqual({ usd: 0, rows: 0, unpricedRows: 0, adoptedUsd: 0, adoptedRows: 0, attributionBlindRows: 0, operatorPinnedUsd: 0, operatorPinnedRows: 0 });
   });
 });
 

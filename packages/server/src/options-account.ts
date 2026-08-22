@@ -3013,6 +3013,68 @@ export interface OpenPremiumAtRisk {
    * say so.
    */
   attributionBlindRows: number;
+  /**
+   * TRA-3958 (CEO ruling on TRA-3703) — of {@link usd}, the dollars whose
+   * per-contract basis came from an OPERATOR PIN rather than from a machine
+   * oracle (a broker fill, our own fill ledger, or the importer).
+   *
+   * ⚠️ THIS FIELD EXISTS BECAUSE ONE FIELD HAS TWO CONSUMERS WITH DIFFERENT
+   * CORRECTNESS CONDITIONS. `premiumPaid` is READ by the stop engine, which
+   * needs a defensible management level, and SPENT by this fold, which is a
+   * risk number that gates live entry admission. TRA-3958 restated the live BAC
+   * row 1.41 → 1.17 to fix a stop that was breached by the error alone — and
+   * the same write moved `admin`'s `headroomSignedUsd` by $24.00 and its
+   * `admissibleEntryUsd` with it. The stop correction was right; the
+   * authorization change was a side effect nobody ordered and, crucially,
+   * NOTHING ON THE ROUTE SAID IT HAD HAPPENED: `adoptedPremiumAtRiskUsd 117.00`
+   * is byte-identical whether the 117 came from a broker fill or from a human
+   * with a citation.
+   *
+   * So the fold now declares its provenance. A pin that moves an authorization
+   * is LOUD, on the same payload `admissibleEntryUsd` is served from, and a
+   * reader who wants the machine-sourced figure can subtract.
+   *
+   * ⚠️ SIGN IS THE WHOLE POINT. A pin that RAISES a basis is conservative and
+   * costs nothing; one that LOWERS it buys entry admission. This field does not
+   * judge which — it makes the question answerable without re-deriving the
+   * basis from the fill tape by hand, which is what the 2026-08-22 ruling had
+   * to do.
+   *
+   * Counted only while the pin is LIVE — see {@link isOperatorBasisPinLive}. A
+   * pin whose row has moved off the pinned figure is void, and a void pin's
+   * dollars are the broker's again.
+   */
+  operatorPinnedUsd: number;
+  /**
+   * TRA-3958 — rows contributing to {@link operatorPinnedUsd}. Published beside
+   * the dollars for the same reason {@link adoptedRows} is: one $117 row and
+   * three $39 rows are different facts about the book, and a dollar figure
+   * alone cannot tell them apart.
+   */
+  operatorPinnedRows: number;
+}
+
+/**
+ * TRA-3958 — is this row's operator basis pin STILL IN FORCE?
+ *
+ * Exported and shared deliberately. The reconcile (`reconcileTradierPositions`)
+ * and the at-risk fold must agree to the bit on what "pinned" means: if the
+ * fold counted a row the reconcile treats as void, the published provenance
+ * would describe a correction that is no longer holding — which is precisely
+ * the class of bug TRA-3958 shipped a liveness counter for. One predicate, two
+ * callers, no second implementation to drift.
+ *
+ * The tolerance mirrors the reconcile's `1e-6`: `premiumPaid` round-trips
+ * through JSON on every snapshot export/import, and an exact `===` on a float
+ * that has been through that cycle is a coin toss.
+ */
+export function isOperatorBasisPinLive(
+  row: Pick<OptionPosition, 'premiumPaid' | 'operatorBasisPin'>,
+): boolean {
+  const pin = row.operatorBasisPin;
+  if (!pin || !Number.isFinite(pin.premiumPaid)) return false;
+  if (!Number.isFinite(row.premiumPaid)) return false;
+  return Math.abs(row.premiumPaid - pin.premiumPaid) <= 1e-6;
 }
 
 /**
@@ -3055,6 +3117,8 @@ export function foldOpenPremiumAtRisk(
   let adoptedUsd = 0;
   let adoptedRows = 0;
   let attributionBlindRows = 0;
+  let operatorPinnedUsd = 0;
+  let operatorPinnedRows = 0;
   for (const p of positions) {
     const remaining = p.contractsRemaining ?? p.contracts;
     if (
@@ -3067,6 +3131,16 @@ export function foldOpenPremiumAtRisk(
     const rowUsd = p.premiumPaid * remaining * 100;
     usd += rowUsd;
     rows += 1;
+    // TRA-3958 — declare the basis PROVENANCE of the dollars this fold spends.
+    // Counted off the WHOLE row: the pin prices every contract on it, so there
+    // is no per-contract carve here the way there is for the adopted split.
+    // Note these dollars are NOT carved out of `usd` — a pinned row is still
+    // real exposure. This is a provenance overlay on the same total, which is
+    // why it can and does overlap `adoptedUsd`.
+    if (isOperatorBasisPinLive(p)) {
+      operatorPinnedUsd += rowUsd;
+      operatorPinnedRows += 1;
+    }
     // TRA-3913 — attribute the row PER CONTRACT against this engine's own fill
     // records, not per row against the action arm.
     //
@@ -3117,6 +3191,8 @@ export function foldOpenPremiumAtRisk(
     adoptedUsd: Math.round(adoptedUsd * 100) / 100,
     adoptedRows,
     attributionBlindRows,
+    operatorPinnedUsd: Math.round(operatorPinnedUsd * 100) / 100,
+    operatorPinnedRows,
   };
 }
 
@@ -10084,7 +10160,10 @@ export class PaperOptionsAccount {
         // a pinned lot and an adopted lot are the same kind of object, one
         // priced by our ledger and one priced by a human with a citation.
         const pin = existing.operatorBasisPin;
-        if (pin && Math.abs(existing.premiumPaid - pin.premiumPaid) <= 1e-6) {
+        // TRA-3958 — the SAME predicate the at-risk fold publishes provenance
+        // off (`isOperatorBasisPinLive`). Shared so "this row is pinned" cannot
+        // mean one thing to the reconcile and another to the cap.
+        if (pin && isOperatorBasisPinLive(existing)) {
           const pinnedHeld = existing.contractsRemaining ?? existing.contracts;
           if (Number.isFinite(incoming.contracts) && incoming.contracts > pinnedHeld) {
             // A lot the operator never priced has arrived on this symbol. The

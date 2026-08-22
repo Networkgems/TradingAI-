@@ -520,6 +520,22 @@ export interface LiveOtmAggregateExposure {
    */
   adoptedAttributionBlindRows?: number;
   /**
+   * TRA-3958 — of `openPremiumAtRiskUsd`, the dollars resting on an OPERATOR's
+   * pinned basis rather than a machine oracle's.
+   *
+   * ⚠ AN OVERLAY, NOT A PARTITION: inside `openPremiumAtRiskUsd` and freely
+   * overlapping `adoptedPremiumAtRiskUsd`. The live BAC row is both at once.
+   *
+   * Read it whenever you are about to act on `admissibleEntryUsd`. Non-zero
+   * means part of the basis under that admission is a human's figure with a
+   * citation — recoverable in full from
+   * `/api/options/basis-restatements` → `durable.restatements[]`, which carries
+   * the before/after and the provenance string verbatim.
+   */
+  operatorPinnedAtRiskUsd?: number;
+  /** TRA-3958 — rows carrying the above. */
+  operatorPinnedOpenRows?: number;
+  /**
    * `capUsd − openPremiumAtRiskUsd`, floored at 0; `null` when unreadable.
    *
    * ⚠ THE FLOOR IS LOSSY. A book over its cap publishes `0` here, which is

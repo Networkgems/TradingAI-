@@ -49,7 +49,11 @@ import { join } from 'path';
 import type { TradierOpenOptionPosition } from '@trading-app/engine';
 import type { OptionPosition } from '@trading-app/shared';
 
-import { PaperOptionsAccount } from './options-account.js';
+import {
+  PaperOptionsAccount,
+  foldOpenPremiumAtRisk,
+  isOperatorBasisPinLive,
+} from './options-account.js';
 import {
   configureEngineBasisRestatementLog,
   readEngineBasisRestatements,
@@ -543,5 +547,132 @@ describe('TRA-3958 — a second post is not a second restatement', () => {
     // stitched from a different row, which is the failure TRA-3010 named.
     expect(Number.isFinite(rec.premiumPaidAfter)).toBe(true);
     expect(Number.isFinite(rec.stopLossPremiumAfter)).toBe(true);
+  });
+});
+
+// ─── The CEO's two-consumer split (ruling on TRA-3703, 2026-08-22) ───────────
+//
+// `premiumPaid` has TWO consumers with different correctness conditions: the
+// stop engine READS it (it needs a defensible management level) and the
+// cap/headroom fold SPENDS it (it is a risk number that gates live entry
+// admission). Everything above this line grades the first consumer. This block
+// grades the second, and the specific defect it grades is that BEFORE the
+// overlay the two moved together SILENTLY:
+//
+//   restating BAC 1.41 → 1.17 to unbreak a stop also moved `admin`'s
+//   `openPremiumAtRiskUsd` 141 → 117 and its `admissibleEntryUsd` with it, and
+//   NOTHING on the route said the basis under that admission was a human's
+//   number. $117 from a broker fill and $117 from an operator's citation were
+//   byte-identical — the recurring shape this whole ticket is an instance of.
+//
+// ⚠️ The discriminating test here is NOT "the pinned row reads 117". An overlay
+// that simply returned `usd` would pass that and be worthless. It is the pair:
+// the SAME row, same size, same adoption path, once pinned and once not, must
+// differ — so UNPINNED is asserted at 0 in the same breath, every time.
+describe('TRA-3958 — the at-risk fold declares which of its dollars an operator pinned', () => {
+  it('is SILENT on an unpinned row and LOUD on the pinned one — same row, same dollars', () => {
+    // UNPINNED: adopted at the blend, exactly as the live row stood before the
+    // restatement. This is the control, and it is what makes the assertion
+    // below a measurement rather than a restatement of `usd`.
+    const before = foldOpenPremiumAtRisk([adoptedAndHandedOver(BLEND).row()]);
+    expect(before.usd).toBe(141);
+    expect(before.operatorPinnedUsd).toBe(0);
+    expect(before.operatorPinnedRows).toBe(0);
+    // ...and it IS adopted, so the new column is not just tracking that.
+    expect(before.adoptedUsd).toBe(141);
+
+    // PINNED: the identical row, restated through the production route.
+    const { acct, row } = adoptedAndHandedOver(BLEND);
+    expect(acct.restateAdoptedBasisFromOperator(row().id, request()).status).toBe('restated');
+    const after = foldOpenPremiumAtRisk([row()]);
+
+    // The authorization DID move — that is the fact the CEO caught, and it is
+    // asserted here rather than hidden, because the fix is not "stop it moving"
+    // but "stop it moving silently".
+    expect(after.usd).toBe(117);
+    expect(before.usd - after.usd).toBe(24);
+    // And now the route says why.
+    expect(after.operatorPinnedUsd).toBe(117);
+    expect(after.operatorPinnedRows).toBe(1);
+  });
+
+  it('is an OVERLAY on `usd`, not a partition of it — the live row is adopted AND pinned', () => {
+    const { acct, row } = adoptedAndHandedOver(BLEND);
+    acct.restateAdoptedBasisFromOperator(row().id, request());
+    const fold = foldOpenPremiumAtRisk([row()]);
+    // All three describe the SAME $117. A reader subtracting the overlay out of
+    // the total expecting a clean complement would zero a live position.
+    expect(fold.usd).toBe(117);
+    expect(fold.adoptedUsd).toBe(117);
+    expect(fold.operatorPinnedUsd).toBe(117);
+    expect(fold.rows).toBe(1);
+  });
+
+  it('counts only dollars that are actually pinned, not every dollar on a book that has one', () => {
+    // Two rows, one pinned. The overlay must be a SUM OVER PINNED ROWS, not a
+    // flag on the fold: a book-level boolean would report the whole $258.
+    const { acct, row } = adoptedAndHandedOver(BLEND);
+    acct.restateAdoptedBasisFromOperator(row().id, request());
+    const unpinned: OptionPosition = {
+      ...adoptedAndHandedOver(BLEND).row(),
+      id: 'other-row',
+      optionSymbol: 'XLF260925C00057500',
+      symbol: 'XLF',
+    };
+    const fold = foldOpenPremiumAtRisk([row(), unpinned]);
+    expect(fold.usd).toBe(117 + 141);
+    expect(fold.rows).toBe(2);
+    expect(fold.operatorPinnedUsd).toBe(117);
+    expect(fold.operatorPinnedRows).toBe(1);
+  });
+
+  it('drops a VOID pin: a row that moved off the pinned figure is the broker\'s dollars again', () => {
+    const { acct, row } = adoptedAndHandedOver(BLEND);
+    acct.restateAdoptedBasisFromOperator(row().id, request());
+    expect(foldOpenPremiumAtRisk([row()]).operatorPinnedUsd).toBe(117);
+
+    // The row moves off the pinned figure by some path that is not the pin.
+    // The correction is no longer in force, so the provenance claim must not
+    // outlive it — a stale overlay would attribute the broker's number to a
+    // human, which is the same class of error in the opposite direction.
+    const voided: OptionPosition = { ...row(), premiumPaid: 1.30 };
+    expect(isOperatorBasisPinLive(voided)).toBe(false);
+    const fold = foldOpenPremiumAtRisk([voided]);
+    expect(fold.usd).toBe(130);
+    expect(fold.operatorPinnedUsd).toBe(0);
+    expect(fold.operatorPinnedRows).toBe(0);
+  });
+
+  it('agrees with the RECONCILE to the bit — one predicate, not two implementations', () => {
+    // The reconcile decides "pinned ⇒ skip the broker copy"; the fold decides
+    // "pinned ⇒ declare the provenance". If those two ever disagreed, the route
+    // would publish a correction that is no longer holding. They are the same
+    // exported predicate, and this drives BOTH to prove it on one row.
+    const { acct, row } = adoptedAndHandedOver(BLEND);
+    acct.restateAdoptedBasisFromOperator(row().id, request());
+
+    for (let i = 0; i < 3; i += 1) acct.reconcileTradierPositions(brokerPayload(BLEND), 'live');
+
+    // The reconcile held it...
+    expect(acct.getEngineBasisRestatementCensus().operatorPin.holds).toBeGreaterThan(0);
+    expect(row().premiumPaid).toBe(DESK);
+    // ...and the fold says so on the same row, in the same state.
+    expect(isOperatorBasisPinLive(row())).toBe(true);
+    expect(foldOpenPremiumAtRisk([row()]).operatorPinnedUsd).toBe(117);
+  });
+
+  it('survives the restart, because the pin does and the fold is over positions', () => {
+    // `operatorPin.holds` is a since-boot counter and resets; this column is a
+    // fold over positions and must not. bqb1 restarts several times a day, and
+    // a provenance overlay that vanished on reboot would quietly re-launder an
+    // operator's basis into a machine-sourced one.
+    const { acct, row } = adoptedAndHandedOver(BLEND);
+    acct.restateAdoptedBasisFromOperator(row().id, request());
+    const rebooted = liveBook();
+    rebooted.importSnapshot(JSON.parse(JSON.stringify(acct.exportSnapshot())));
+    const fold = foldOpenPremiumAtRisk(rebooted.getState().openOptions);
+    expect(fold.usd).toBe(117);
+    expect(fold.operatorPinnedUsd).toBe(117);
+    expect(fold.operatorPinnedRows).toBe(1);
   });
 });
