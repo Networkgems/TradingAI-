@@ -52,12 +52,17 @@ describe('live-enforce-gate-ledger', () => {
     // the whole ticket turns on whether the bound is ENFORCING on a pinned
     // build, and the row's presence at `evaluated: 0` is what makes that
     // answerable without an env read.
+    // TRA-3942 — `entry_window` joins for the deployed-bytes reason AND one of
+    // its own: it is the first gate on the OTM funnel, so it is the one axis
+    // whose `evaluated` is the whole nominee population. A zero here is a zero
+    // the sleeve produced, never one a tighter sibling upstream ate.
     expect(s.byGate.map((g) => g.gate).sort()).toEqual([
       'aggregate_cap',
       'canary_ceiling',
       'cost_bar',
       'entry_delta_ceiling',
       'entry_delta_ceiling_shadow',
+      'entry_window',
       'fleet_reachable_bound',
       'otm_delta_floor',
       'spread',

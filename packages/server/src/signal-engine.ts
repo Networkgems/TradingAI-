@@ -174,6 +174,14 @@ import type { WheelBookPosition } from './wheel-vol-stress-harness.js';
 import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, resolveOptionOpeningRangeMin, resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
 // TRA-3401 — nominate an OTM strike inside the band the cost bar can admit.
 import { selectAdmissibleOtmCandidate, isOtmAdmissibleStrikeEnabled, resolveAdmissibleBand } from './otm-admissible-strike.js';
+// TRA-3942 — WHEN the OTM sleeve may open. Entry-side only; nothing on any exit
+// path imports this module and that is load-bearing (see its header).
+import {
+  resolveOtmEntryWindows,
+  otmEntryWindowVerdict,
+  formatOtmEntryWindows,
+  OTM_ENTRY_WINDOW_CLOSED_CODE,
+} from './otm-entry-window.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
 import { sessionEdgeBlackoutVerdict } from './session-edge-blackout-flag.js';
@@ -7361,6 +7369,71 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-3942 (parent TRA-3927, board card `a29b2db8` accepted 2026-08-22T04:18Z)
+   * — the ENTRY-TIME WINDOW on the `single_leg_otm` sleeve.
+   *
+   * Finding F1: 15 of 17 live OTM entries filled 13:35–13:51Z, the widest-spread
+   * / highest-IV-crush window of the session. Not a threshold defect — the
+   * sleeve was reacting to the overnight gap, which is the largest mispricing
+   * print on the chain and therefore what `|mispricingPct|` ranks first. The
+   * remedy is a clock, not a number: open only inside 10:15–11:30 ET and
+   * 15:00–15:45 ET (see `otm-entry-window.ts` for the windows, the DST handling
+   * and the fail directions).
+   *
+   * ⚠️ BOTH BOOKS, unlike every other private reject helper on this class. There
+   * is no `mode !== 'live'` early return and there must not be one: paper is the
+   * surface the desk grades the live sleeve against, so a gate that moves live
+   * entries and leaves paper entries where they were makes the mirror lie about
+   * the population it mirrors (AC1's paper clause, AC3's grading premise).
+   *
+   * ⚠️ ENTRY ONLY. This is called from the OTM OPEN path and nothing else; no
+   * exit path imports the module. A refusal here is a trade that does not
+   * happen, never a position that is held.
+   *
+   * The LIVE verdict is additionally written to `/api/health/live-enforce-gates`
+   * under gate `entry_window`, on BOTH branches — a gate whose rejects are
+   * invisible cannot be told from an inert one (TRA-1486/TRA-3216), and only the
+   * admits supply the `evaluated` denominator. Ordered at the TOP of the OTM
+   * funnel, so that denominator is the whole nominee population rather than the
+   * ~0.7% that survives the cost bar (the TRA-3504/TRA-3510 hoist lesson, and
+   * the `evaluated: 0` trap TRA-3926 paid for).
+   *
+   * Returns the rejection reason, or `null` when the window is open.
+   */
+  private otmEntryWindowRejectReason(
+    nominator?: LiveEnforceNominator | null,
+  ): string | null {
+    const resolution = resolveOtmEntryWindows(process.env);
+    const verdict = otmEntryWindowVerdict(new Date(), resolution);
+    if (this.mode === 'live') {
+      recordLiveEnforceDecision(
+        'entry_window',
+        'single_leg_otm',
+        !verdict.open,
+        etDateString(new Date()),
+        verdict.reason ?? undefined,
+        Date.now(),
+        {
+          // Two refusal modes with different remedies: `entry_window_closed` is
+          // the sleeve awake at the wrong time (benign, expected most of the
+          // session); an unreadable clock is a RUNTIME defect that happens to
+          // fail closed, and folding it into the ordinary refusal would hide a
+          // box whose ET rendering is broken behind a bucket that is supposed to
+          // be large.
+          reasonCode: verdict.open
+            ? undefined
+            : verdict.clockReadable
+              ? OTM_ENTRY_WINDOW_CLOSED_CODE
+              : 'entry_window_clock_unreadable',
+          book: this.alertUsername ?? null,
+          nominator: nominator ?? null,
+        },
+      );
+    }
+    return verdict.reason;
+  }
+
+  /**
    * TRA-1670 (TRA-1647B) — the OTHER edge of the entry band: the per-structure
    * entry-delta CEILING.
    *
@@ -11050,9 +11123,70 @@ export class SignalEngine {
           delta: cheap.delta,
         };
 
-        // TRA-3216 (parent TRA-2760) — LIVE UNDERLYING ALLOWLIST. First cut on the
-        // real-money path, and the only one that is about the NAME rather than the
-        // contract. No-op in demo and when explicitly unrestricted.
+        // TRA-3942 (parent TRA-3927, board card `a29b2db8`) — THE ENTRY-TIME
+        // WINDOW, and the FIRST cut on the OTM open in BOTH books.
+        //
+        // Finding F1: 15 of 17 live entries filled 13:35–13:51Z. New buys are now
+        // admitted only inside 10:15–11:30 ET and 15:00–15:45 ET (ET, resolved
+        // against the tz database — never a hard-coded UTC offset; see
+        // `otm-entry-window.ts`).
+        //
+        // ORDERED FIRST, deliberately, and the placement is the instrument twice
+        // over:
+        //
+        //  1. It is the only cut here that is a property of the CLOCK rather than
+        //     of the candidate. Every gate below spends work on a candidate the
+        //     window has already refused, and — worse — would record a verdict
+        //     about a trade that could never have happened, which is how a gate
+        //     ledger comes to describe a population the sleeve does not trade.
+        //  2. `entry_window.evaluated` is therefore the WHOLE nominee population.
+        //     Anything ordered below the cost bar sees ~0.7% of live nominees
+        //     (retained block rate 0.9928), and a gate whose denominator a
+        //     tighter sibling upstream has already eaten publishes a zero that
+        //     reads identically to never having been wired in — the exact trap
+        //     `fleet_reachable_bound` fell into on TRA-3926.
+        //
+        // NOT mode-scoped. Demo/paper is the mirror the desk grades the live
+        // sleeve against (AC3 is graded off `/api/trades/export`), so gating one
+        // book and not the other would make the mirror lie. Surfaced with a
+        // visible skip reason — the churn-brake pattern — so the refusal is on
+        // the feed and not only in the log, and the hour-long dedup above means
+        // this records ~1 verdict per OCC per hour rather than one per sweep.
+        //
+        // ⚠️ ENTRY-SIDE ONLY. `checkExits` does not consult it and no exit path
+        // imports the module: a row opened at 10:20 ET is stopped, trailed and
+        // closed on exactly the schedule it had before this ticket (AC1's last
+        // clause). The real-money arm, the ~$250 row size and the 2-row cap are
+        // untouched (AC4) — they live below and are not read here.
+        const otmWindowReject = this.otmEntryWindowRejectReason(nominator);
+        if (otmWindowReject) {
+          signal.signalSkipReason = otmWindowReject;
+          if (this.mode === 'live') signal.liveSkipReason = otmWindowReject;
+          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.dailySignals.push({
+            id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
+          });
+          log.info('OTM open rejected by entry-time window (TRA-3942)', {
+            sym,
+            optionSymbol: cheap.optionSymbol,
+            mode: this.mode,
+            windowsEt: formatOtmEntryWindows(resolveOtmEntryWindows(process.env).windows),
+            reason: otmWindowReject,
+          });
+          scanRun.reject(OTM_ENTRY_WINDOW_CLOSED_CODE);
+          continue;
+        }
+
+        // TRA-3216 (parent TRA-2760) — LIVE UNDERLYING ALLOWLIST. The first
+        // CANDIDATE-shaped cut on the real-money path, and the only one that is
+        // about the NAME rather than the contract. (This note read "first cut"
+        // until TRA-3942 put the entry-time window above it; the window is a cut
+        // on the CLOCK and refuses every name alike, so the ordering does not
+        // change what this axis measures — but its `evaluated` now excludes the
+        // out-of-window sweeps, and a rate compared across that boundary is
+        // comparing two populations.) No-op in demo and when explicitly
+        // unrestricted.
         //
         // Ordered BEFORE the cost bar deliberately. The bar is the expensive,
         // decisive filter and its block rate is the number operators tune against;

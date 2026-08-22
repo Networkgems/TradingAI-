@@ -109,7 +109,19 @@ export type LiveEnforceGate =
    * book is full"; this says "the FLEET is at its authorization", which nothing
    * this book does can change.
    */
-  | 'fleet_reachable_bound';
+  | 'fleet_reachable_bound'
+  /**
+   * TRA-3942 (parent TRA-3927, board card `a29b2db8`) — the ENTRY-TIME window on
+   * the `single_leg_otm` sleeve: new buys only inside 10:15–11:30 ET and
+   * 15:00–15:45 ET. Its own gate because it is the only cut here that is a
+   * property of the CLOCK rather than of the candidate — an operator reading
+   * `blocked` on this axis learns "the sleeve was awake at the wrong time",
+   * which no threshold change can fix and no other axis can express.
+   *
+   * Recorded on BOTH verdicts. The admits are what supply the denominator that
+   * separates "the window never bit" from "the gate was never wired in".
+   */
+  | 'entry_window';
 
 /** One durable ARMED-LIVE enforcement decision — a write-through of the verdict. */
 export interface LiveEnforceRecord {
@@ -547,6 +559,14 @@ const GATES: LiveEnforceGate[] = [
   // this list, because this gate's deadline (TRA-3911 AC5) is graded on whether
   // it is enforcing on a PINNED BUILD, not on whether it was merged.
   'fleet_reachable_bound',
+  // TRA-3942 (parent TRA-3927) — the ENTRY-TIME window on the OTM sleeve. Listed
+  // for the same deployed-bytes reason, and with one extra property worth
+  // stating: this gate is ordered at the TOP of the OTM funnel, above the
+  // universe cut and above the cost bar, so its `evaluated` is the whole nominee
+  // population rather than the ~0.7% that survives the bar. A zero here is a
+  // zero the SLEEVE produced, not one a tighter sibling upstream ate — which is
+  // exactly the reading `fleet_reachable_bound` could not make (TRA-3926).
+  'entry_window',
 ];
 
 /** Apply one decision to the in-memory tallies (shared by record + hydrate). */

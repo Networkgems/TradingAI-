@@ -165,8 +165,20 @@ import type {
   Candle,
 } from '@trading-app/shared';
 
-// Inside an ET trading window: 10:00 AM ET on a Tuesday → 14:00 UTC during EDT.
-const TRADING_TIME = Date.parse('2024-06-04T14:00:00Z');
+// Inside an ET trading window: 10:20 AM ET on a Tuesday → 14:20 UTC during EDT.
+//
+// ⚠️ TRA-3942 moved this from 10:00 ET. The OTM sleeve now admits ENTRIES only
+// inside 10:15–11:30 ET and 15:00–15:45 ET (board card `a29b2db8`, finding F1:
+// 15 of 17 live entries filled 13:35–13:51Z, the widest-spread window of the
+// session), and 10:00 ET is outside both — so every OTM-open case in this file
+// was refused by the window before reaching the gate it was written to test,
+// which is a vacuous pass wearing a red X. 10:20 ET is the same session, the
+// same 50 minutes past the opening range, and inside the first window.
+//
+// It stays a SINGLE constant on purpose: a per-test clock would let the next
+// entry-timing rule split this file into cases that were retimed and cases that
+// were quietly left outside the window.
+const TRADING_TIME = Date.parse('2024-06-04T14:20:00Z');
 
 // TRA-1089 — the shadow 5m candle cache is now module-shared across engines, so
 // it must be cleared between tests or a symbol seeded by one test leaks into a
@@ -6827,7 +6839,7 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
 
   beforeEach(() => {
     vi.useFakeTimers();
-    vi.setSystemTime(TRADING_TIME); // 10:00 ET — inside the options trading window
+    vi.setSystemTime(TRADING_TIME); // 10:20 ET — inside the options trading window (TRA-3942)
     delete process.env[OPTION_DEMO_DIRECTIONAL_FLAG];
     delete process.env[OPTION_LIVE_DIRECTIONAL_FLAG];
   });
@@ -8007,7 +8019,13 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
     // enforced is otherwise indistinguishable after the fact from a day on which
     // it simply never bit. Same discipline: named row, exact total.
     expect(retained.find((g) => g.gate === 'fleet_reachable_bound')).toMatchObject({ evaluated: 1, blocked: 0 });
-    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(4);
+    // TRA-3942 — and a FIFTH: the ENTRY-TIME window records both verdicts, and
+    // `TRADING_TIME` (10:20 ET) is inside the morning window, so this pass is an
+    // ADMIT. It is the FIRST gate on the funnel, which is what makes its
+    // `evaluated` the whole nominee population rather than the ~0.7% that
+    // survives the cost bar. Same discipline: named row, exact total.
+    expect(retained.find((g) => g.gate === 'entry_window')).toMatchObject({ evaluated: 1, blocked: 0 });
+    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(5);
   });
 
   it('flag ON + below-floor live candidate: NO broker order, reason surfaced, ledger counts the REJECT', async () => {

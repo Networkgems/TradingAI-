@@ -331,6 +331,14 @@ import { resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule } from './exit-ri
 // TRA-3941 — the frozen sleeve KEY the exit ruling is scoped to, so the wire
 // field names the same join column the journal tape and the gate ledger use.
 import { OTM_SLEEVE_MANDATE_STRUCTURE } from './otm-sleeve-mandate.js';
+// TRA-3942 — the OTM sleeve's ENTRY-TIME windows, published on the wire.
+import {
+  resolveOtmEntryWindows,
+  otmEntryWindowVerdict,
+  otmEntryWindowsUtcAt,
+  formatOtmEntryWindows,
+  OTM_ENTRY_WINDOWS_VALUE,
+} from './otm-entry-window.js';
 // TRA-3067 — counts-only projection of the out-of-band-close detector.
 import {
   foldLiveBrokerDriftStatuses,
@@ -10977,6 +10985,48 @@ app.get('/api/health/options-live', async (_req, res) => {
           rule: resolution.rule,
           source: resolution.source,
           chandelierRetired: resolution.rule === 'trail',
+        };
+      })(),
+      // TRA-3942 (parent TRA-3927, board card `a29b2db8` accepted 2026-08-22) —
+      // the EFFECTIVE entry-time windows on the `single_leg_otm` sleeve, on the
+      // wire, because a deploy order's commit is a lower bound on content and
+      // never a reading (AC4's "surface the effective windows").
+      //
+      // `windowsEt` is the canonical spec — ET wall clock, which is what the
+      // gate actually evaluates. `windowsUtcNow` is the SAME windows rendered at
+      // the offset in force AT THE INSTANT OF THIS READ, and it is the field
+      // that proves the DST handling from outside: in July it reads
+      // `14:15Z-15:30Z` / `19:00Z-19:45Z`, in January the same box reads
+      // `15:15Z-16:30Z` / `20:00Z-20:45Z`, and `windowsEt` has not moved. A
+      // stored UTC constant would read identically in both and be wrong in one.
+      //
+      // `openNow` is the live verdict, so a grader can join "the sleeve took no
+      // entry in this sweep" to "the window was shut" without re-deriving the
+      // clock. `source: env_invalid` means somebody spelled the env wrong and
+      // got the board's defaults anyway — visible, never silent.
+      //
+      // ⚠️ SCOPE: entry side only. This says nothing about exits (no exit path
+      // reads it), nothing about the arm — read `liveOtmRouting` above for
+      // whether the sleeve trades at all — and nothing about row size or the
+      // 2-row cap, which TRA-3942 did not touch.
+      otmEntryWindows: (() => {
+        const resolution = resolveOtmEntryWindows();
+        const now = Date.now();
+        const verdict = otmEntryWindowVerdict(now, resolution);
+        return {
+          issue: 'TRA-3942',
+          sleeve: OTM_SLEEVE_MANDATE_STRUCTURE,
+          windowsEt: formatOtmEntryWindows(resolution.windows),
+          windowsUtcNow: otmEntryWindowsUtcAt(resolution.windows, now),
+          source: resolution.source,
+          envKey: OTM_ENTRY_WINDOWS_VALUE,
+          raw: resolution.raw,
+          openNow: verdict.open,
+          etMinutesNow: verdict.etMinutes,
+          clockReadable: verdict.clockReadable,
+          reasonCode: verdict.reasonCode,
+          appliesTo: ['paper', 'live'] as const,
+          exitsGated: false as const,
         };
       })(),
       liveStopActionability: (() => {
