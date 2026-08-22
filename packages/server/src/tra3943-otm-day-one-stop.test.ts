@@ -29,7 +29,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { PaperOptionsAccount, summarizeDayOneStopPosture, mergeDayOneStopPosture, blindDayOneStopPosture } from './options-account.js';
+import {
+  PaperOptionsAccount,
+  summarizeDayOneStopPosture,
+  mergeDayOneStopPosture,
+  blindDayOneStopPosture,
+  summarizeLiveStopActionability,
+  type LiveStopActionabilityContext,
+} from './options-account.js';
 import {
   resolveOtmDayOneStopRule,
   resolveOtmDayOneStopRelease,
@@ -686,5 +693,209 @@ describe('TRA-3943 AC4 — the real-money arm, the row size and the 2-row cap ar
     // the NEXT one.
     expect(acct.getState().openOptions).toHaveLength(0);
     expect(contracts).toBeGreaterThan(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. The DETECTOR, not the rule (`summarizeLiveStopActionability`).
+//
+// Found by re-grading this ticket on the CURRENT build (`2fa34b84`) rather than
+// the one it was graded against — TRA-3927's own hook.
+//
+// `liveStopActionability.inert` is TRA-3822's decorative-stop number and the
+// instrument TRA-3892 grades this sleeve's posture with. Its walk models the
+// `continue` chain in `checkExits`; the TRA-3943 stop does NOT live in that
+// chain, it lives ABOVE it and OUTRANKS two of its gates. So before this fix the
+// detector reported `inert / daily_close_hold` (and on the entry day
+// `inert / pdt_hold_today`) against a row `checkExits` was firing at the mark.
+//
+// That is worse than a cosmetic drift: on Monday's first live OTM loser the
+// instrument built to catch decorative stops would have declared this remedy
+// decorative. Each subject below is therefore paired with the SAME row under a
+// context that omits `otmDayOneStop` — the pre-fix walk — so a green assertion
+// cannot be the old behaviour wearing a new name.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('TRA-3943 — the actionability walk knows about the OTM intraday stop', () => {
+  /** 11:00 ET: inside RTH, past the opening range, outside the close window. */
+  const AT = MIDDAY;
+
+  const BOOK: LiveStopActionabilityContext = {
+    brokerMirroring: true,
+    autoManageImportedTradierOptions: true,
+    actOnAdoptedBrokerRows: true,
+    // The gate this rule outranks. `true` is the shipped resolver default.
+    holdLiveOptionsOvernightForPdt: true,
+    swingHoldOptions: false,
+    openingRangeGuardMin: 15,
+    liveStopPolicy: DAILY_CLOSE,
+    now: AT,
+  };
+  /** The pre-TRA-3943 walk: same book, rule detached. The control. */
+  const PRE_FIX: LiveStopActionabilityContext = { ...BOOK };
+  const WITH_RULE: LiveStopActionabilityContext = {
+    ...BOOK,
+    otmDayOneStop: { rule: RULE, release: CASH_RELEASE },
+  };
+
+  /**
+   * A live `otm_mispricing` row at −36% of entry premium: through the −35% leg,
+   * and (necessarily) also through its own −20% `stopLossPremium`, which is what
+   * made the mis-attribution invisible — the walk SAW the breach, it just named
+   * the wrong gate.
+   */
+  function otmRow(overrides: Partial<OptionPosition> = {}): OptionPosition {
+    return {
+      id: 'otm-d1',
+      symbol: 'SOFI',
+      optionSymbol: 'SOFI260918C00030000',
+      optionType: 'call',
+      strike: 30,
+      expiration: '2026-09-18',
+      contracts: 1,
+      contractsRemaining: 1,
+      premiumPaid: 1.0,
+      currentPremium: 0.64,
+      tp1Premium: 1.5,
+      tp1Hit: false,
+      stopLossPremium: 0.8,
+      peakPremium: 1.0,
+      trailingActive: false,
+      trailingStopPremium: 0,
+      underlyingEntryPrice: 30,
+      openedAt: D1_OPEN,
+      signalId: 'otm-SOFI260918C00030000',
+      signalType: 'otm_mispricing',
+      mode: 'live',
+      ...overrides,
+    } as OptionPosition;
+  }
+
+  it('POSITIVE CONTROL — the pre-fix walk calls a firing day-one row inert', () => {
+    const s = summarizeLiveStopActionability([otmRow()], PRE_FIX);
+    expect(s.breached).toBe(1);
+    expect(s.actionable).toBe(0);
+    expect(s.inert).toBe(1);
+    // On its ENTRY day the PDT gate is the first refusal the old walk reaches.
+    expect(s.byReason).toEqual({ pdt_hold_today: 1 });
+  });
+
+  it('a day-one row through −35% on a CASH account is ACTIONABLE', () => {
+    const s = summarizeLiveStopActionability([otmRow()], WITH_RULE);
+    expect(s.actionable).toBe(1);
+    expect(s.inert).toBe(0);
+    expect(s.byReason).toEqual({});
+    // The identity the summary's own docblock promises.
+    expect(s.breached).toBe(s.actionable + s.inFlight + s.inert);
+  });
+
+  it('a DAY-TWO row through −35% outside the close window is ACTIONABLE, not daily_close_hold', () => {
+    // Opened the previous UTC day, so the PDT gate cannot be the refusal and the
+    // ONLY thing that could hold it is the TRA-3902 `daily_close` deferral.
+    const row = otmRow({ id: 'otm-d2', openedAt: D1_OPEN - 24 * 3_600_000 });
+    expect(summarizeLiveStopActionability([row], PRE_FIX).byReason)
+      .toEqual({ daily_close_hold: 1 });
+    const s = summarizeLiveStopActionability([row], WITH_RULE);
+    expect(s.actionable).toBe(1);
+    expect(s.inert).toBe(0);
+  });
+
+  it('the release fails CLOSED — an unreadable balance leaves the day-one row held', () => {
+    const held = resolveOtmDayOneStopRelease(null);
+    expect(held.released).toBe(false);
+    const s = summarizeLiveStopActionability([otmRow()], {
+      ...BOOK,
+      otmDayOneStop: { rule: RULE, release: held },
+    });
+    expect(s.actionable).toBe(0);
+    expect(s.byReason).toEqual({ pdt_hold_today: 1 });
+  });
+
+  it('the opening-range window still wins — the rule does not override it', () => {
+    // A DAY-TWO row, so `pdt_hold_today` (which sits ABOVE the window in both
+    // the walk and `checkExits`) cannot be the refusal and the window is
+    // isolated. 09:40 ET, 10 minutes into the 15-minute guard.
+    const row = otmRow({ id: 'otm-d2', openedAt: D1_OPEN - 24 * 3_600_000 });
+    const s = summarizeLiveStopActionability([row], {
+      ...WITH_RULE,
+      now: D1_OPEN + 10 * 60_000,
+    });
+    expect(s.actionable).toBe(0);
+    expect(s.byReason).toEqual({ opening_range_hold: 1 });
+  });
+
+  it('inside the window on DAY ONE the PDT gate is named, not the window', () => {
+    // Not a widening — the walk has always ordered `pdt_hold_today` first, and
+    // `checkExits` agrees (`:7129` `continue`s long before the opening-range SL
+    // branch). Pinned so the new branch cannot be blamed for the ordering.
+    const s = summarizeLiveStopActionability([otmRow()], {
+      ...WITH_RULE,
+      now: D1_OPEN + 10 * 60_000,
+    });
+    expect(s.byReason).toEqual({ pdt_hold_today: 1 });
+  });
+
+  it('a gate ABOVE the rule still refuses — the branch is placed, not prepended', () => {
+    // `checkExits` `continue`s on the close-reject breaker long before `:7129`,
+    // so the OTM stop never reaches its fire site on this row either.
+    const s = summarizeLiveStopActionability([otmRow({ closeRejectCount: 5 })], WITH_RULE);
+    expect(s.actionable).toBe(0);
+    expect(s.byReason).toEqual({ close_reject_breaker: 1 });
+  });
+
+  it('a row through −35% with NO armed premium stop is still counted as breached', () => {
+    // `stopLossPremium: 0` is "no stop" (TRA-2957), so the old walk skipped the
+    // row entirely — invisible rather than mis-attributed.
+    const row = otmRow({ id: 'otm-nostop', stopLossPremium: 0 });
+    expect(summarizeLiveStopActionability([row], PRE_FIX).breached).toBe(0);
+    const s = summarizeLiveStopActionability([row], WITH_RULE);
+    expect(s.breached).toBe(1);
+    expect(s.actionable).toBe(1);
+  });
+
+  it('NEGATIVE — a row above the −35% floor is untouched by the new branch', () => {
+    // −30%: through the −20% stop, NOT through this rule. It must keep reading
+    // as held by the daily-close policy, or the detector has over-matched.
+    const row = otmRow({ id: 'otm-30', currentPremium: 0.70, openedAt: D1_OPEN - 24 * 3_600_000 });
+    const s = summarizeLiveStopActionability([row], WITH_RULE);
+    expect(s.actionable).toBe(0);
+    expect(s.byReason).toEqual({ daily_close_hold: 1 });
+  });
+
+  it('NEGATIVE — an RV row on the same book is byte-identical with and without the rule', () => {
+    const rv = otmRow({
+      id: 'rv-1',
+      signalType: 'relative_value',
+      openedAt: D1_OPEN - 24 * 3_600_000,
+    });
+    expect(summarizeLiveStopActionability([rv], WITH_RULE))
+      .toEqual(summarizeLiveStopActionability([rv], PRE_FIX));
+  });
+
+  it('NEGATIVE — a DISARMED rule leaves the walk exactly where it was', () => {
+    const rows = [otmRow(), otmRow({ id: 'otm-d2', openedAt: D1_OPEN - 24 * 3_600_000 })];
+    const disarmed = resolveOtmDayOneStopRule({ [OTM_DAY_ONE_STOP_VALUE]: 'off' });
+    expect(disarmed.armed).toBe(false);
+    expect(summarizeLiveStopActionability(rows, {
+      ...BOOK,
+      otmDayOneStop: { rule: disarmed, release: CASH_RELEASE },
+    })).toEqual(summarizeLiveStopActionability(rows, PRE_FIX));
+  });
+
+  it('the ATR leg cannot fire in this walk, and that direction is PESSIMISTIC', () => {
+    // The walk has no underlying price. A row whose spot is through the level
+    // but whose mark is not through −35% therefore still reads `inert` — the
+    // disclosed limitation, asserted so a future reader cannot mistake it for a
+    // claim that the ATR leg is covered here.
+    const row = otmRow({
+      id: 'otm-atr',
+      // −25%: through the −20% `stopLossPremium` so the walk DOES reach the gate
+      // chain, but above the −35% floor so only the ATR leg could rescue it.
+      currentPremium: 0.75,
+      otmAtrInvalidationLevel: 29,   // a call: spot <= 29 invalidates
+      openedAt: D1_OPEN - 24 * 3_600_000,
+    } as Partial<OptionPosition>);
+    const s = summarizeLiveStopActionability([row], WITH_RULE);
+    expect(s.actionable).toBe(0);
+    expect(s.byReason).toEqual({ daily_close_hold: 1 });
   });
 });

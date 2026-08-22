@@ -1133,6 +1133,32 @@ export interface LiveStopActionabilityContext {
    * agree by construction. The engine always passes the env-resolved policy.
    */
   liveStopPolicy?: LiveOptionStopPolicy;
+  /**
+   * TRA-3943 — the SAME `{rule, release}` the engine hands `checkExits` and
+   * {@link summarizeDayOneStopPosture}. Absent ⇒ the pre-TRA-3943 walk.
+   *
+   * ## Why the walk had to learn this rule
+   *
+   * The OTM intraday stop does not sit in the `continue` chain this walk models;
+   * it sits ABOVE it, and it is the one thing that OUTRANKS two of the gates the
+   * walk names. `checkExits` computes the verdict at `:6843` and then
+   * `otmStopTrigger !== null` (a) skips the `pdtHeldToday` `continue` at `:7129`
+   * and (b) assigns `exitPremium` at `:7378`, which makes the TRA-3902
+   * `daily_close` branch at `:7570` unreachable for that row.
+   *
+   * So without this field the walk mis-attributes in the ONE direction that
+   * matters: a live OTM row through −35% outside the close window scores
+   * `inert / daily_close_hold` (and on its entry day `inert / pdt_hold_today`)
+   * while `checkExits` is in fact firing it at the mark. `inert` is TRA-3822's
+   * decorative-stop number and TRA-3892's instrument, so a remedy that landed
+   * would have read on the wire as a remedy that did not — a FALSE POSITIVE on
+   * the exact detector built to catch this class of defect.
+   *
+   * Absent is the PESSIMISTIC reading (more `inert`), which is why it is
+   * optional rather than required: an old caller over-reports risk, and no
+   * caller can silently claim a stop is actionable that is not.
+   */
+  otmDayOneStop?: { rule: OtmDayOneStopRule; release: OtmDayOneStopRelease };
   /** Evaluation instant. Defaults to `Date.now()`; injected by the controls. */
   now?: number;
 }
@@ -1340,7 +1366,47 @@ export function summarizeLiveStopActionability(
     const mark = opt.currentPremium;
     const slBreached =
       isArmedThreshold(opt.stopLossPremium) && Number.isFinite(mark) && mark <= opt.stopLossPremium;
-    if (!slBreached) {
+
+    // TRA-3943 — the OTM sleeve's intraday stop, re-derived here by calling the
+    // ONE exported verdict `checkExits` calls, for the reason TRA-3829's
+    // `engineMayActOnAdoptedRow` note gives: a re-implementation would drift
+    // from the gate it claims to predict.
+    //
+    // ⚠️ The PREMIUM leg only. This walk has no underlying price (the same
+    // limitation that forced the chandelier branch below to read a persisted
+    // latch rather than re-derive a breach), so `underlyingSpot` is passed
+    // `undefined` and the ATR leg cannot fire here. That direction is
+    // PESSIMISTIC — an ATR-only fire still reads `inert` — and it is disclosed
+    // rather than papered over with a stale spot.
+    const otmGoverned =
+      ctx.otmDayOneStop !== undefined
+      && ctx.otmDayOneStop.rule.armed
+      && !opt.legs
+      && isOtmSleeveRow(opt);
+    // `inOpeningRange` is NOT overridden by this rule (`:6845` gates the verdict
+    // on it), so the window still wins and the row falls through to
+    // `opening_range_hold` below.
+    const otmInOpeningRange = openingRangeMins !== null && openingRangeMins < ctx.openingRangeGuardMin;
+    const otmPremiumLegThrough =
+      otmGoverned
+      && !otmInOpeningRange
+      && otmDayOneStopVerdict(
+        { premiumPaid: opt.premiumPaid, optionType: opt.optionType },
+        { mark, underlyingSpot: undefined, rule: ctx.otmDayOneStop!.rule },
+      ).fires;
+    // `:6865` exactly: on day one the fire is held unless the release said yes,
+    // and it fails CLOSED. A row opened on an EARLIER day is not day-one and the
+    // release is never consulted for it.
+    const otmDayOne =
+      ctx.holdLiveOptionsOvernightForPdt && toDateKey(opt.openedAt) === nowKey;
+    const otmActs =
+      otmPremiumLegThrough && !(otmDayOne && !ctx.otmDayOneStop!.release.released);
+
+    // A row through −35% is through an armed stop even if `stopLossPremium` is
+    // not also breached (the −20% level is the tighter bound in practice, but
+    // "in practice" is a statement about today's constants, not a scope). Count
+    // it, so `breached === actionable + inFlight + inert` still holds.
+    if (!slBreached && !otmPremiumLegThrough) {
       // TRA-3902 (board, 2026-08-21) — a row NOT through its premium stop can
       // still be through its CHANDELIER trail and held for the close window.
       // The walk cannot re-derive that breach (no underlying price here), so
@@ -1392,6 +1458,14 @@ export function summarizeLiveStopActionability(
       reason = 'close_reject_breaker';
     } else if ((opt.exitExpiredCount ?? 0) >= MAX_CONSECUTIVE_EXIT_EXPIRIES) {
       reason = 'exit_expired_breaker';
+    } else if (otmActs) {
+      // TRA-3943 — ACTIONABLE, and `reason` stays null so it is counted as such
+      // below. This branch sits HERE and not earlier because every gate above it
+      // is a `continue` in `checkExits` that fires before `:7129`, so the OTM
+      // stop never reaches its fire site on those rows either. Below it are the
+      // only two gates the rule outranks: the PDT hold (skipped at `:7129`) and
+      // the `daily_close` deferral (made unreachable by the `exitPremium`
+      // assignment at `:7378`).
     } else if (ctx.holdLiveOptionsOvernightForPdt && toDateKey(opt.openedAt) === nowKey) {
       reason = 'pdt_hold_today';
     } else if (
@@ -10371,11 +10445,16 @@ export class PaperOptionsAccount {
       brokerMirroring: boolean;
       openingRangeGuardMin: number;
       liveStopPolicy?: LiveOptionStopPolicy;
+      /** TRA-3943 — from the ENGINE, like the window and the policy above. */
+      otmDayOneStop?: { rule: OtmDayOneStopRule; release: OtmDayOneStopRelease };
       now?: number;
     },
   ): LiveStopActionabilitySummary {
     return summarizeLiveStopActionability(this.openOptions.values(), {
       brokerMirroring: opts.brokerMirroring,
+      // TRA-3943 — the account cannot resolve this: the RELEASE half is read off
+      // the live broker balance snapshot, which only the engine holds.
+      ...(opts.otmDayOneStop === undefined ? {} : { otmDayOneStop: opts.otmDayOneStop }),
       // TRA-3902 (ruling B) — from the ENGINE, like the window above.
       ...(opts.liveStopPolicy === undefined ? {} : { liveStopPolicy: opts.liveStopPolicy }),
       // TRA-3902 — from the ENGINE, like `brokerMirroring`: the window is a

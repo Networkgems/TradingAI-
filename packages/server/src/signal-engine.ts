@@ -8967,6 +8967,11 @@ export class SignalEngine {
       // TRA-3902 (ruling B) — the same resolver again, so the health route and
       // the exit pass cannot disagree about whether the stop is being read.
       liveStopPolicy: resolveLiveOptionStopPolicy(),
+      // TRA-3943 — the THIRD consumer of the one resolver (`checkExits` and
+      // `getDayOneStopPosture` are the other two). Without it this walk reports
+      // `daily_close_hold` / `pdt_hold_today` against rows the exit pass is
+      // actually firing; see `LiveStopActionabilityContext.otmDayOneStop`.
+      otmDayOneStop: this.resolveOtmDayOneStop(),
       ...(now === undefined ? {} : { now }),
     });
   }
