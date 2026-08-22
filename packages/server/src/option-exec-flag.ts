@@ -1722,6 +1722,168 @@ export function resolveLiveOtmSizingBasisUsd(
   return (Math.round(availableCashUsd * 100) + Math.round(atRisk * 100)) / 100;
 }
 
+// --------------------------------------------------------------------------
+// TRA-3964 — THE TWO HALVES OF `E_i` ARE SNAPSHOTS TAKEN UP TO 120s APART, AND
+// THE SKEW IS FAIL-OPEN.
+//
+// `resolveLiveOtmSizingBasisUsd` above is exact — *given simultaneous operands*.
+// Its whole justification is the invariance "buying for `x` lowers cash by `x`
+// and raises at-risk by `x`, so `E_i` does not move". The two halves do not move
+// together:
+//
+//   • `openPremiumAtRiskUsd` — SYNCHRONOUS. A fold over the in-memory
+//     `openOptions` map, correct the instant `openOptionFromCandidate` returns.
+//   • `availableCashUsd`     — a CACHED broker balance, refreshed on `doTick`
+//     only once `TRADIER_BALANCE_REFRESH_MS` (120s) has elapsed.
+//
+// And the refresh asymmetry was exactly backwards: `mirrorLiveOptionOpen` forced
+// a refresh on `rejected` and on `walk_exhausted` — the two branches where NO
+// cash moved — and not on `filled`, the one where it did. So for up to 120s (FOUR
+// scanner ticks at the 30s interval) `E_i` DOUBLE-COUNTS the premium just spent:
+// the stale cash still contains it and `openPremiumAtRiskUsd` now contains it
+// too. `capUsd` is inflated by `φ_eff · x`, and so is every column derived from
+// it. Measured on the shipped folds over bqb1's live `admin` row: after spending
+// its whole $36.90 allowance the engine offered $6.45 more admission where the
+// true book had $0.01.
+//
+// ⛔ THE ONE-LINE FIX (refresh on `filled`) INVERTS THE FAILURE. A refresh
+// RACES the broker's own settlement: return before Tradier debits and we cache
+// PRE-DEBIT cash *and* push the next scheduled refresh out another 120s — a
+// LONGER skew with no self-healing deadline.
+//
+// ⭐ So the basis is made UN-DOUBLE-COUNTABLE instead, with no new broker call on
+// the order path: the engine tracks the premium it has spent since the balance
+// snapshot was taken and DEDUCTS it from the cash half. `E_i` is then correct
+// regardless of refresh timing — the correction is exactly the term the stale
+// snapshot is missing, and it goes to zero on its own the moment a snapshot that
+// post-dates the fill arrives.
+// --------------------------------------------------------------------------
+
+/**
+ * How long AFTER a fill a balance snapshot must have been taken before that
+ * fill's premium is treated as reflected in it.
+ *
+ * ⭐ THIS CONSTANT IS THE WHOLE ANSWER TO THE SETTLEMENT RACE, and it is why
+ * this is not the one-line fix. `snapshotAt > filledAt` is NOT sufficient: a
+ * balance fetched microseconds after the fill acknowledgment can legitimately
+ * come back pre-debit, and clearing the fill on it would restore the very
+ * double-count this exists to remove. The grace makes "reflected" mean "taken
+ * far enough after the fill that a debit had to be in it".
+ *
+ * ⚠ IT IS ONE-SIDED ON PURPOSE. Too LARGE and a settled fill stays deducted a
+ * little longer than it had to — the cap comes out TIGHTER, and it self-clears
+ * at the next refresh. Too SMALL and the fail-open comes back. Every error this
+ * constant can make is therefore paid in the conservative direction, which is
+ * the only reason a magic number is tolerable here at all.
+ */
+export const LIVE_BALANCE_SETTLEMENT_GRACE_MS = 10_000;
+
+/** One live open fill whose cash debit may not yet be in the cached balance. */
+export interface UnsettledLivePremiumFill {
+  /** Wall clock at which the broker reported the fill. */
+  filledAtMs: number;
+  /**
+   * The CASH the broker debited: `avgFillPrice × contracts × 100`.
+   *
+   * ⚠ Deliberately the FILL price, not the row's `premiumPaid`. This term
+   * corrects the CASH half, so it must be the number that actually left the
+   * account — if the two ever disagree, the broker's is the one the balance
+   * moved by.
+   */
+  premiumUsd: number;
+}
+
+/**
+ * `Σ premium` over the fills a balance snapshot taken at `balanceAsOfMs` cannot
+ * yet contain.
+ *
+ * `balanceAsOfMs = 0` (never had a successful fetch) folds EVERY fill in: with
+ * no snapshot there is nothing to have settled into, and the fail-closed
+ * direction is to assume none of it has.
+ *
+ * A non-finite / negative `premiumUsd` is counted as 0 rather than poisoning the
+ * sum to `NaN` — the sum is a deduction, and a `NaN` deduction would null the
+ * whole basis and dark the book over one malformed fill record. It is reported
+ * in `blindFills` so "nothing is pending" and "one fill was unreadable" are not
+ * the same reading.
+ */
+export function foldUnsettledLivePremiumUsd(
+  fills: readonly UnsettledLivePremiumFill[] | null | undefined,
+  balanceAsOfMs: number,
+  graceMs: number = LIVE_BALANCE_SETTLEMENT_GRACE_MS,
+): { usd: number; fills: number; blindFills: number } {
+  if (!Array.isArray(fills) || fills.length === 0) {
+    return { usd: 0, fills: 0, blindFills: 0 };
+  }
+  let cents = 0;
+  let counted = 0;
+  let blind = 0;
+  for (const f of fills) {
+    if (!f || !isLivePremiumUnsettled(f, balanceAsOfMs, graceMs)) continue;
+    counted += 1;
+    if (typeof f.premiumUsd !== 'number' || !Number.isFinite(f.premiumUsd) || f.premiumUsd <= 0) {
+      blind += 1;
+      continue;
+    }
+    cents += Math.round(f.premiumUsd * 100);
+  }
+  return { usd: cents / 100, fills: counted, blindFills: blind };
+}
+
+/**
+ * Is this fill's debit still MISSING from a snapshot taken at `balanceAsOfMs`?
+ *
+ * A fill with a non-finite `filledAtMs` reads UNSETTLED (never settled): an
+ * unreadable timestamp must not be a licence to stop deducting.
+ */
+export function isLivePremiumUnsettled(
+  fill: UnsettledLivePremiumFill,
+  balanceAsOfMs: number,
+  graceMs: number = LIVE_BALANCE_SETTLEMENT_GRACE_MS,
+): boolean {
+  if (!Number.isFinite(balanceAsOfMs) || balanceAsOfMs <= 0) return true;
+  const filledAt = fill.filledAtMs;
+  if (typeof filledAt !== 'number' || !Number.isFinite(filledAt)) return true;
+  const grace = Number.isFinite(graceMs) && graceMs >= 0 ? graceMs : LIVE_BALANCE_SETTLEMENT_GRACE_MS;
+  return balanceAsOfMs < filledAt + grace;
+}
+
+/**
+ * TRA-3964 — the CASH half of `E_i`, corrected for premium the cached balance
+ * snapshot has not caught up to yet: `max(0, brokerCash − unsettledPremium)`.
+ *
+ * `unsettledPremiumUsd` is REQUIRED, positional-second, for the same reason
+ * TRA-3897 made `openPremiumAtRiskUsd` required on the basis resolver: an
+ * optional operand lets a new call site silently re-introduce the raw broker
+ * cash, and the raw broker cash IS the defect. The compiler makes every producer
+ * say.
+ *
+ * FAIL-CLOSED in both directions:
+ *   • an unusable `brokerCashUsd` → `null`, unchanged from before, so
+ *     `no_balance_snapshot` keeps its existing verdict;
+ *   • an unusable `unsettledPremiumUsd` → `null` as well. A non-finite
+ *     deduction cannot be read as "deduct nothing" — that is the fail-open
+ *     direction and it is the direction this whole ticket is about.
+ *
+ * The `max(0, …)` floor matters: a book that spent nearly all its cash between
+ * two snapshots would otherwise produce a NEGATIVE cash half, which
+ * `resolveLiveOtmSizingBasisUsd` rejects as unusable and would DARK the book. A
+ * $0 cash half is the honest reading there — no spendable cash — and it leaves
+ * `E_i` equal to the premium already at risk, i.e. the cap stops moving rather
+ * than the book going out.
+ */
+export function resolveSettledAvailableCashUsd(
+  brokerCashUsd: number | null | undefined,
+  unsettledPremiumUsd: number,
+): number | null {
+  if (typeof brokerCashUsd !== 'number') return null;
+  if (!Number.isFinite(brokerCashUsd) || brokerCashUsd < 0) return null;
+  if (typeof unsettledPremiumUsd !== 'number' || !Number.isFinite(unsettledPremiumUsd)) return null;
+  const deduction = unsettledPremiumUsd > 0 ? unsettledPremiumUsd : 0;
+  const netCents = Math.round(brokerCashUsd * 100) - Math.round(deduction * 100);
+  return Math.max(0, netCents) / 100;
+}
+
 /**
  * Sum `Σ E_i` over the gate-open books with a readable balance.
  *

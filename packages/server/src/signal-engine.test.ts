@@ -8469,6 +8469,16 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
       expect(engine.getLiveOtmAggregateExposure()).toEqual({
         book: 'admin', mode: 'live', liveEntryGateOpen: true, capUsd: 750,
         fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: 10_000,
+        // TRA-3964 — the cash half's PROVENANCE. This book is flat and nothing
+        // is pending, so the correction is $0 and `availableCashUsd` is the
+        // broker's own figure unchanged: the fix is a no-op on a quiet book, and
+        // this exhaustive row is where that is pinned.
+        // `balanceAsOfMs` is null because this harness injects the balance
+        // without ever fetching one — which must read as "no as-of stamp", never
+        // as `0` ("fetched at the epoch") or `0ms` ("fetched just now").
+        balanceAgeMs: null, balanceAsOfMs: null, brokerCashUsd: 10_000,
+        unsettledLivePremiumUsd: 0, unsettledLivePremiumFills: 0,
+        unsettledLivePremiumBlindFills: 0,
         openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: 750,
         // TRA-3897 — the book is FLAT, so the capital basis IS the cash and the
         // signed headroom IS the clamped one. Both unchanged here by design:
@@ -8869,6 +8879,242 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
         expect(canary.byReason).toEqual([
           { reasonCode: 'canary_ceiling_unpriced_rows', blocked: 1, share: 1 },
         ]);
+      });
+    });
+
+    // ── TRA-3964 ────────────────────────────────────────────────────────────
+    // `E_i = cash + atRisk` is invariant under taking risk ONLY IF BOTH HALVES
+    // MOVE TOGETHER. `openPremiumAtRiskUsd` is synchronous (a fold over the
+    // in-memory book); `availableCashUsd` is a broker snapshot refreshed at most
+    // every 120s, and `mirrorLiveOptionOpen` forced a refresh on `rejected` and
+    // `walk_exhausted` — where NO cash moved — but not on `filled`. So for four
+    // scanner ticks after every live fill the basis DOUBLE-COUNTS the premium
+    // just spent, in the ADMITTING direction, by `φ_eff · x`.
+    //
+    // ⭐ THESE RUN AGAINST THE ENGINE THROUGH A REAL FILL, deliberately. The
+    // resolver suite cannot catch this: `resolveLiveOtmSizingBasisUsd(500, 82)`
+    // is arithmetically perfect and always was. The defect is entirely in WHEN
+    // its two operands were sampled, and only the order path can express that.
+    //
+    // ⚠ Every assertion below is written against the PUBLIC row, using no
+    // symbol this fix introduced, so it is runnable — and RED — on `355ca553`.
+    describe('unsettled premium (TRA-3964)', () => {
+      /** The book the grader runs on: poor enough that `φ_eff · E` binds, not `A`. */
+      const CASH_USD = 500;
+      /**
+       * The cash the broker actually took: `avgFillPrice 0.82 × 1 × 100`.
+       *
+       * ⚠ NOT the same as what the engine BOOKS. The stub's ask is $0.82 and its
+       * mid $0.80, and the row lands with `premiumPaid 0.80` — so $82 leaves the
+       * account against $80 of recorded at-risk. The correction deducts the
+       * BROKER's figure, deliberately: it corrects the CASH half, and the cash
+       * half moved by $82. (The $2 is entry slippage. It is a real reduction in
+       * this book's capital and shows up identically on a settled book, so it is
+       * not something this fix introduces — see `settledReference` below.)
+       */
+      const FILL_CASH_USD = 82;
+      /** What the engine books for that same fill — `premiumPaid 0.80 × 100`. */
+      const BOOK_AT_RISK_USD = 80;
+      /** `E_i` once the dust settles: $418 cash + $80 at risk. */
+      const SETTLED_BASIS_USD = CASH_USD - FILL_CASH_USD + BOOK_AT_RISK_USD;
+      /** `φ · E` at `E = $498`, floored to the cent — the SETTLED cap. */
+      const SETTLED_CAP_USD = 241.92;
+
+      /**
+       * The reference: the same book AFTER the broker has debited the fill —
+       * $418 of cash and $80 already at risk.
+       *
+       * ⭐ THIS IS THE POINT. Settled and skewed are the SAME BOOK holding the
+       * same contract with the same money gone; they differ only in whether the
+       * cash snapshot has caught up. A basis that is invariant under taking risk
+       * must publish identical numbers for the two, and that equality is what
+       * makes this a grader rather than a restatement of the implementation.
+       */
+      function settledReference(): SignalEngine {
+        const engine = bookWithCash(liveStub(), CASH_USD - FILL_CASH_USD);
+        seedOpenLivePremium(engine, BOOK_AT_RISK_USD);
+        return engine;
+      }
+
+      it('AC1 — a live fill against a pre-fill balance snapshot must not inflate the cap', async () => {
+        const stub = liveStub();
+        const engine = bookWithCash(stub, CASH_USD);
+        await runOtm(engine, ['AAPL']);
+
+        // The fill is real: broker called, row on the live book, $80 at risk.
+        expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+        expect(engine.getState().options.openOptions).toHaveLength(1);
+
+        const served = engine.getLiveOtmAggregateExposure();
+        expect(served.openPremiumAtRiskUsd).toBe(BOOK_AT_RISK_USD);
+
+        // ⭐ THE GRADER. On `355ca553` the cash half is still the pre-fill $500
+        // while the premium half already carries the $80, so `E_i` reads $580
+        // and every column below comes out `φ · $82 = $39.84` too high:
+        //   capUsd 281.76 · headroomSignedUsd 201.76 · admissibleEntryUsd 201.76
+        // against a settled book's 241.92 / 161.92 / 161.92.
+        const settled = settledReference().getLiveOtmAggregateExposure();
+        expect(served.capUsd).toBeLessThanOrEqual(settled.capUsd);
+        expect(served.headroomSignedUsd!).toBeLessThanOrEqual(settled.headroomSignedUsd!);
+        expect(served.admissibleEntryUsd).toBeLessThanOrEqual(settled.admissibleEntryUsd);
+
+        // Pinned, not merely bounded: `≤` alone would pass a build that darkened
+        // the book instead of correcting it, which is a different bug.
+        expect(served.capUsd).toBe(SETTLED_CAP_USD);
+        expect(served.sizingBasisUsd).toBe(SETTLED_BASIS_USD);
+        expect(served.headroomSignedUsd).toBe(SETTLED_CAP_USD - BOOK_AT_RISK_USD);
+        expect(settled.capUsd).toBe(SETTLED_CAP_USD);
+      });
+
+      it('AC4 (negative control) — the SAME grader is GREEN on a settled book', () => {
+        // No fill has happened since the snapshot: the cash half already contains
+        // the debit. Served and reference are the same object shape and must
+        // agree exactly — so the grader above cannot be simply always-red.
+        const served = settledReference().getLiveOtmAggregateExposure();
+        const settled = settledReference().getLiveOtmAggregateExposure();
+        expect(served.capUsd).toBe(settled.capUsd);
+        expect(served.headroomSignedUsd).toBe(settled.headroomSignedUsd);
+        expect(served.admissibleEntryUsd).toBe(settled.admissibleEntryUsd);
+        expect(served.capUsd).toBe(SETTLED_CAP_USD);
+      });
+
+      it('AC4 (second control) — a FLAT book is untouched: the correction is $0, not a haircut', () => {
+        // The whole fix must be a no-op whenever nothing is pending. A build that
+        // deducted unconditionally would tighten every book on the fleet.
+        const flat = bookWithCash(liveStub(), CASH_USD).getLiveOtmAggregateExposure();
+        expect(flat.availableCashUsd).toBe(CASH_USD);
+        expect(flat.brokerCashUsd).toBe(CASH_USD);
+        expect(flat.unsettledLivePremiumUsd).toBe(0);
+        expect(flat.capUsd).toBe(242.90); // φ · $500 — untouched by this ticket
+        expect(flat.openPremiumAtRiskUsd).toBe(0);
+      });
+
+      it('AC2 — the snapshot\'s age and the pending premium are ON THE WIRE', async () => {
+        const engine = bookWithCash(liveStub(), CASH_USD);
+        await runOtm(engine, ['AAPL']);
+        const row = engine.getLiveOtmAggregateExposure();
+
+        // The three columns that make a skewed reading distinguishable from a
+        // settled one. Before this ticket the payload carried NONE of them, so
+        // the two were byte-identical and the skew healed itself in 120s.
+        expect(row.unsettledLivePremiumUsd).toBe(FILL_CASH_USD);
+        expect(row.unsettledLivePremiumFills).toBe(1);
+        expect(row.unsettledLivePremiumBlindFills).toBe(0);
+        // The broker's own figure is published beside the corrected one, so the
+        // correction is auditable rather than folded away.
+        expect(row.brokerCashUsd).toBe(CASH_USD);
+        expect(row.availableCashUsd).toBe(CASH_USD - FILL_CASH_USD);
+        expect(row.brokerCashUsd! - row.availableCashUsd!).toBe(row.unsettledLivePremiumUsd);
+        // This harness injects the balance without ever fetching it, so there is
+        // no as-of stamp — and `null` says exactly that. It must NOT read as 0ms
+        // ("fetched just now"), which is the fail-open reading.
+        expect(row.balanceAsOfMs).toBeNull();
+        expect(row.balanceAgeMs).toBeNull();
+      });
+
+      it('the deduction CLEARS on a snapshot taken after the fill — it is not a permanent haircut', async () => {
+        const engine = bookWithCash(liveStub(), CASH_USD);
+        await runOtm(engine, ['AAPL']);
+        expect(engine.getLiveOtmAggregateExposure().unsettledLivePremiumUsd).toBe(FILL_CASH_USD);
+
+        // Back-date the fill so a refresh landing NOW is comfortably past the
+        // settlement grace, then hand the engine the DEBITED balance — exactly
+        // what the 120s `doTick` refresh does once Tradier has taken the money.
+        const priv = engine as unknown as {
+          unsettledLivePremiumFills: Array<{ filledAtMs: number }>;
+          tradierLiveClient: { getAccountBalance: () => Promise<unknown> };
+          refreshTradierBalance: () => Promise<void>;
+        };
+        priv.unsettledLivePremiumFills[0]!.filledAtMs = Date.now() - 60_000;
+        const debited = CASH_USD - FILL_CASH_USD;
+        priv.tradierLiveClient.getAccountBalance = async () => ({
+          totalEquity: debited, totalCash: debited,
+          optionBuyingPower: debited, dayTradeBuyingPower: debited,
+        });
+        await priv.refreshTradierBalance();
+
+        const row = engine.getLiveOtmAggregateExposure();
+        // The debit is now in the broker's own number, so deducting it AGAIN
+        // would double-count in the OTHER direction and tighten the book by $82.
+        expect(row.unsettledLivePremiumUsd).toBe(0);
+        expect(row.unsettledLivePremiumFills).toBe(0);
+        expect(row.brokerCashUsd).toBe(debited);
+        expect(row.availableCashUsd).toBe(debited);
+        // ⭐ The published row is IDENTICAL either side of the settlement
+        // boundary. That invariance is the property TRA-3897's algebra claimed
+        // and this ticket restores — and it is why the correction is a
+        // correction rather than a haircut.
+        expect(row.sizingBasisUsd).toBe(SETTLED_BASIS_USD);
+        expect(row.capUsd).toBe(SETTLED_CAP_USD);
+        expect(row.balanceAsOfMs).not.toBeNull();
+        expect(row.balanceAgeMs).toBeGreaterThanOrEqual(0);
+      });
+
+      it('a FAILED refresh does not clear the deduction — the snapshot underneath is as old as ever', async () => {
+        const engine = bookWithCash(liveStub(), CASH_USD);
+        await runOtm(engine, ['AAPL']);
+        const priv = engine as unknown as {
+          lastTradierBalanceSuccessAt: number;
+          tradierLiveClient: { getAccountBalance: () => Promise<unknown> };
+          refreshTradierBalance: () => Promise<void>;
+        };
+        // A snapshot taken a minute ago — i.e. BEFORE the fill, and recent
+        // enough that `TRADIER_BALANCE_STALE_MS` does not drop it on the failure.
+        priv.lastTradierBalanceSuccessAt = Date.now() - 60_000;
+        priv.tradierLiveClient.getAccountBalance = async () => { throw new Error('502'); };
+        await priv.refreshTradierBalance();
+
+        // `lastTradierBalanceFetchAt` moved (it is stamped in a `finally`); the
+        // SNAPSHOT did not. Pruning off the attempt stamp would clear a fill the
+        // cached cash figure still has not accounted for — the fail-open again,
+        // one layer down.
+        const row = engine.getLiveOtmAggregateExposure();
+        expect(row.unsettledLivePremiumUsd).toBe(FILL_CASH_USD);
+        expect(row.availableCashUsd).toBe(CASH_USD - FILL_CASH_USD);
+        expect(row.capUsd).toBe(SETTLED_CAP_USD);
+      });
+
+      // ── AC3 ───────────────────────────────────────────────────────────────
+      // `liveAvailableCashUsd()` is `min(optionBuyingPower, totalCash,
+      // totalEquity)`. On an option BUY, OBP and totalCash fall by the premium
+      // but `totalEquity` DOES NOT (cash becomes an asset). So if the `min`
+      // resolved to `totalEquity` on this account, the cash half would never
+      // fall on a buy at all and the double-count would be PERMANENT rather
+      // than bounded by the refresh interval — a strictly worse variant.
+      //
+      // ⭐ MEASURED, NOT READ. `GET /api/state` on bqb1's `admin` book, live SHA
+      // `355ca553b437ef9de7ea8759bbd1461ed4c0839b`, 2026-08-22T~17:40Z, live
+      // mode: the payload's `account` block IS the Tradier balance in live mode
+      // (`signal-engine.ts` `liveAccount`), so it carries all three components:
+      //
+      //     optionBuyingPower  $379.15   ← THE MINIMUM. This one binds.
+      //     totalCash          $411.15
+      //     totalEquity        $652.15
+      //
+      // ⇒ THE PERMANENT VARIANT IS RULED OUT BY MEASUREMENT. And the ordering is
+      // stable in the direction that matters: a fill moves the two smaller
+      // components DOWN and leaves `totalEquity` alone, so the `min` can only
+      // stay where it is. The second assertion measures that rather than
+      // asserting it.
+      //
+      // (`$652.15` is also the `E_i` TRA-3964 was filed on — `$379.15` cash +
+      // `$273.00` at risk. It coincides with `totalEquity` on this account and
+      // that is a coincidence, not an identity. Do not read one off the other.)
+      it('AC3 — the `min` binds on optionBuyingPower, which DOES fall on a buy', () => {
+        const engine = engineFor('live', liveStub());
+        const setBalance = (obp: number, cash: number, equity: number) => {
+          (engine as unknown as { liveTradierBalance: unknown }).liveTradierBalance = {
+            totalEquity: equity, totalCash: cash, optionBuyingPower: obp,
+          };
+        };
+
+        setBalance(379.15, 411.15, 652.15);            // bqb1 `admin`, as measured
+        expect(engine.getLiveOtmAggregateExposure().brokerCashUsd).toBe(379.15);
+
+        // A $100 buy: OBP and cash down $100, equity unchanged. If the min were
+        // pinned to equity this would not move — that is the permanent variant.
+        setBalance(279.15, 311.15, 652.15);
+        expect(engine.getLiveOtmAggregateExposure().brokerCashUsd).toBe(279.15);
       });
     });
   });

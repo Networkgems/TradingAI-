@@ -486,6 +486,33 @@ export interface LiveOtmAggregateExposure {
    * from "this book's balance went dark" from "φ mis-resolved".
    */
   availableCashUsd: number | null;
+  /**
+   * ⭐ TRA-3964 (AC2) — THE AGE OF THE CASH HALF OF `E_i`, in ms.
+   *
+   * ⚠ OPTIONAL, and for the usual reason: ABSENCE IS A REAL READING. A row
+   * without it came from a build where the cash half was an UNCORRECTED
+   * snapshot up to 120s old, so `capUsd` / `headroomSignedUsd` /
+   * `admissibleEntryUsd` on that row may be inflated by `φ_eff ×` any premium
+   * filled in that window. Declaring it required would assert at the type level
+   * the very thing the wire does not guarantee.
+   *
+   * `null` ⇒ no successful balance fetch has ever landed on this engine.
+   */
+  balanceAgeMs?: number | null;
+  /** TRA-3964 — the snapshot's as-of stamp, epoch ms. `null` ⇒ never fetched. */
+  balanceAsOfMs?: number | null;
+  /** TRA-3964 — the broker's raw `min(...)` BEFORE the unsettled-premium correction. */
+  brokerCashUsd?: number | null;
+  /**
+   * TRA-3964 — premium filled since the snapshot was taken: the dollars the
+   * cached cash figure still holds and `openPremiumAtRiskUsd` holds too.
+   * `brokerCashUsd − availableCashUsd` by construction.
+   */
+  unsettledLivePremiumUsd?: number;
+  /** TRA-3964 — how many fills that covers. */
+  unsettledLivePremiumFills?: number;
+  /** TRA-3964 — of those, how many had an unreadable premium ⇒ the correction UNDERSTATES. */
+  unsettledLivePremiumBlindFills?: number;
   openPremiumAtRiskUsd: number;
   openRows: number;
   /** > 0 ⇒ the enforced figure is known to UNDERSTATE exposure (see `foldOpenPremiumAtRisk`). */

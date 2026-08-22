@@ -128,9 +128,9 @@ import {
   PCS_ENTRY_DTE_BAND,
 } from './pcs-shadow-ledger.js';
 import { selectWeeklyPcs } from '@trading-app/engine';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd, liveOptionTestAggregateHeadroomSignedUsd, resolveLiveOptionTestFleetRiskFraction, resolveLiveOptionTestBookAggregateCapUsd, sumLiveOtmFleetCapitalUsd, resolveEffectiveFleetRiskFraction, resolveLiveOtmSizingBasisUsd, sumLiveOtmFleetAtRiskUsd, resolveLiveOtmAdmissibleEntryUsd, fitsLiveOtmReachableBound } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd, liveOptionTestAggregateHeadroomSignedUsd, resolveLiveOptionTestFleetRiskFraction, resolveLiveOptionTestBookAggregateCapUsd, sumLiveOtmFleetCapitalUsd, resolveEffectiveFleetRiskFraction, resolveLiveOtmSizingBasisUsd, sumLiveOtmFleetAtRiskUsd, resolveLiveOtmAdmissibleEntryUsd, fitsLiveOtmReachableBound, foldUnsettledLivePremiumUsd, resolveSettledAvailableCashUsd, isLivePremiumUnsettled } from './option-exec-flag.js';
 import type { LiveOtmAdmissibleBoundBy } from './option-exec-flag.js';
-import type { LiveOtmFleetCapitalRow, LiveOtmFleetSizingReason } from './option-exec-flag.js';
+import type { LiveOtmFleetCapitalRow, LiveOtmFleetSizingReason, UnsettledLivePremiumFill } from './option-exec-flag.js';
 // TRA-3879 — the cross-engine balance READ that makes `Σ B_i ≤ A` structural.
 // A read of a derived scalar, not the shared mutable accumulator TRA-3445
 // avoided; unwired it returns `null` and sizing falls back to the per-book
@@ -3602,8 +3602,32 @@ export class SignalEngine {
   private liveTradierBalance: TradierAccountBalance | null = null;
   private lastTradierBalanceFetchAt = 0;
   /** TRA-406 — timestamp of the last *successful* balance fetch (not merely
-   *  attempted). Drives the `TRADIER_BALANCE_STALE_MS` staleness timeout. */
+   *  attempted). Drives the `TRADIER_BALANCE_STALE_MS` staleness timeout.
+   *
+   *  TRA-3964 — it is ALSO the as-of stamp of {@link liveTradierBalance}, and
+   *  that is now load-bearing: it is what says which live fills the cached cash
+   *  figure can possibly have caught up to. `lastTradierBalanceFetchAt` (an
+   *  ATTEMPT stamp, moved in a `finally`) must never be used for that — a failed
+   *  fetch advances it while the snapshot underneath stays exactly as old. */
   private lastTradierBalanceSuccessAt = 0;
+  /**
+   * TRA-3964 — live open fills whose cash debit the cached balance snapshot may
+   * not contain yet. Deducted from the cash half of `E_i` so the basis is
+   * correct regardless of refresh timing (see the block above
+   * {@link resolveSettledAvailableCashUsd}).
+   *
+   * ⚠ DEBITS ONLY, on purpose. A live CLOSE credits cash back and is NOT tracked
+   * here, so between the close and the next refresh the cash half is understated
+   * — the cap comes out tighter, which is the direction a sizing basis is
+   * allowed to be wrong in. Adding the credit side would be a fail-OPEN
+   * correction resting on the same unverified settlement assumption this ticket
+   * exists to remove.
+   *
+   * Bounded by construction: one entry per live fill, pruned on every successful
+   * balance refresh, and a book whose refreshes keep failing loses the snapshot
+   * entirely at `TRADIER_BALANCE_STALE_MS` (fail-closed) long before this grows.
+   */
+  private unsettledLivePremiumFills: UnsettledLivePremiumFill[] = [];
   /**
    * TRA-356 — last successful (or attempted) Tradier portfolio reconcile.
    * Compared against `TRADIER_PORTFOLIO_RECONCILE_MS` to gate the per-tick
@@ -4038,6 +4062,11 @@ export class SignalEngine {
       } else {
         this.liveTradierBalance = null;
         this.lastTradierBalanceFetchAt = 0;
+        // TRA-3964 — no snapshot ⇒ nothing to correct. `liveAvailableCashUsd()`
+        // is already `null` (fail-closed) here, so the pending list is dead
+        // weight that would otherwise deduct against the NEXT connection's
+        // first balance.
+        this.unsettledLivePremiumFills = [];
       }
       // Live mode: leave account/options/tracker untouched so the demo state
       // (equity, positions, dailyPnl) is preserved for a later switch back.
@@ -4047,6 +4076,8 @@ export class SignalEngine {
     // future re-entry can't surface a stale figure.
     this.liveTradierBalance = null;
     this.lastTradierBalanceFetchAt = 0;
+    // TRA-3964 — and the correction that belonged to it (see above).
+    this.unsettledLivePremiumFills = [];
     const targetEquity = settings.demoEquityStocks ?? settings.demoEquity;
     this.account.applyEquity(targetEquity);
     // TRA-233 — keep both env buckets equity-aligned so a later switch into
@@ -9147,12 +9178,83 @@ export class SignalEngine {
    *
    * `null` (not 0) for "no snapshot", so the caller's fail-closed branch stays
    * distinguishable from a genuinely empty account.
+   *
+   * ⭐ TRA-3964 — NET OF UNSETTLED PREMIUM. The raw `min(...)` is a snapshot up
+   * to 120s old while the other half of `E_i` is synchronous, so the raw figure
+   * double-counts every fill taken since the snapshot — in the LOOSENING
+   * direction. {@link unsettledLivePremiumUsd} is exactly the term that snapshot
+   * is missing. Read {@link brokerReportedCashUsd} when you want the broker's
+   * own number (the exposure row publishes both, plus the snapshot's age).
    */
   private liveAvailableCashUsd(): number | null {
+    return resolveSettledAvailableCashUsd(
+      this.brokerReportedCashUsd(),
+      this.unsettledLivePremiumUsd().usd,
+    );
+  }
+
+  /**
+   * TRA-3964 — the broker's OWN cash figure, `min(optionBuyingPower, totalCash,
+   * totalEquity)`, before the unsettled-premium correction.
+   *
+   * ⚠ MEASURED ON bqb1's `admin`, live SHA `355ca553b437`, 2026-08-22: OBP
+   * $379.15 · totalCash $411.15 · totalEquity $652.15 ⇒ the `min` picks
+   * **optionBuyingPower**. That matters because `totalEquity` does NOT fall when
+   * an option is bought (cash becomes an asset), so had it been the binding
+   * component the double-count would have been PERMANENT rather than bounded by
+   * the refresh interval. It is not. The ordering is also stable in the
+   * direction that matters: a fill moves OBP and totalCash DOWN and leaves
+   * totalEquity where it was, so the `min` can only stay on OBP.
+   */
+  private brokerReportedCashUsd(): number | null {
     const bal = this.liveTradierBalance;
     const candidates = [bal?.optionBuyingPower, bal?.totalCash, bal?.totalEquity]
       .filter((v): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0);
     return candidates.length === 0 ? null : Math.min(...candidates);
+  }
+
+  /**
+   * TRA-3964 — premium this engine has spent that the cached balance snapshot
+   * cannot yet have caught up to, with the fill count behind it.
+   */
+  private unsettledLivePremiumUsd(): { usd: number; fills: number; blindFills: number } {
+    return foldUnsettledLivePremiumUsd(
+      this.unsettledLivePremiumFills,
+      this.lastTradierBalanceSuccessAt,
+    );
+  }
+
+  /**
+   * TRA-3964 — record the cash a live open fill just took out of the account.
+   *
+   * Called on the `filled` branch of {@link mirrorLiveOptionOpen} — the branch
+   * that used to be the ONLY one not to touch the balance, while `rejected` and
+   * `walk_exhausted` (where no cash moved) both forced a refresh.
+   *
+   * ⚠ It deliberately does NOT refresh the balance. A refresh here races the
+   * broker's settlement: come back pre-debit and we cache stale cash AND push
+   * the next scheduled refresh out another 120s, i.e. a longer skew with no
+   * self-healing deadline. This records the debit locally instead, which is
+   * correct whenever the refresh lands.
+   */
+  private recordUnsettledLivePremium(premiumUsd: number, filledAtMs = Date.now()): void {
+    this.unsettledLivePremiumFills.push({ filledAtMs, premiumUsd });
+  }
+
+  /**
+   * TRA-3964 — drop the fills a freshly-taken balance snapshot must now contain.
+   *
+   * Called only after a SUCCESSFUL fetch, and graded against
+   * `lastTradierBalanceSuccessAt` + the settlement grace, so a failed refresh
+   * (which advances the attempt stamp but not the snapshot) cannot clear a
+   * deduction the cached cash figure still needs.
+   */
+  private pruneSettledLivePremiumFills(): void {
+    if (this.unsettledLivePremiumFills.length === 0) return;
+    const asOf = this.lastTradierBalanceSuccessAt;
+    this.unsettledLivePremiumFills = this.unsettledLivePremiumFills.filter(
+      f => isLivePremiumUnsettled(f, asOf),
+    );
   }
 
   /**
@@ -9203,6 +9305,48 @@ export class SignalEngine {
     fleetCapitalBooks: number;
     fleetSizingReason: LiveOtmFleetSizingReason;
     availableCashUsd: number | null;
+    /**
+     * ⭐ TRA-3964 (AC2) — THE AGE OF THE CASH HALF, ON THE WIRE.
+     *
+     * `Date.now() − lastTradierBalanceSuccessAt`. `null` ⇒ no successful fetch
+     * has ever landed (which is also why `availableCashUsd` is `null`).
+     *
+     * This route served `availableCashUsd`, `sizingBasisUsd`, `capUsd`,
+     * `headroomSignedUsd` and `admissibleEntryUsd` with NO indication of how old
+     * the cash half was, while the premium half was synchronous. A skewed
+     * reading was therefore BYTE-IDENTICAL to a settled one and healed itself
+     * within 120s — invisible to every reading taken more than two minutes after
+     * a fill, which is every reading anyone took (TRA-3911/3913/3958/3962). The
+     * age is published so the next reader is not in that position.
+     */
+    balanceAgeMs: number | null;
+    /** TRA-3964 — the snapshot's as-of stamp, epoch ms. `null` ⇒ never fetched. */
+    balanceAsOfMs: number | null;
+    /**
+     * TRA-3964 — the BROKER's own `min(optionBuyingPower, totalCash,
+     * totalEquity)`, BEFORE the unsettled-premium correction.
+     *
+     * Published beside {@link availableCashUsd} so the correction is auditable
+     * rather than folded away: the two are equal exactly when nothing is
+     * pending, and `brokerCashUsd − availableCashUsd` is
+     * {@link unsettledLivePremiumUsd} by construction.
+     */
+    brokerCashUsd: number | null;
+    /**
+     * TRA-3964 — premium spent since the balance snapshot was taken, i.e. the
+     * dollars the cached cash figure still contains and `openPremiumAtRiskUsd`
+     * also contains. `> 0` ⇒ a raw `cash + atRisk` read of this book RIGHT NOW
+     * would be double-counting exactly this much.
+     */
+    unsettledLivePremiumUsd: number;
+    /** TRA-3964 — how many fills that covers. $156 on one fill and on four are different facts. */
+    unsettledLivePremiumFills: number;
+    /**
+     * TRA-3964 — of those, how many carried an unreadable premium and were
+     * counted as $0. `> 0` ⇒ {@link unsettledLivePremiumUsd} UNDERSTATES the
+     * correction, so the basis is known to be loose. Never collapsed into 0.
+     */
+    unsettledLivePremiumBlindFills: number;
     openPremiumAtRiskUsd: number;
     openRows: number;
     unpricedOpenRows: number;
@@ -9276,6 +9420,11 @@ export class SignalEngine {
     const fleetRiskFraction = resolveLiveOptionTestFleetRiskFraction(process.env);
     const selfRow = this.getLiveOtmFleetCapitalRow();
     const availableCashUsd = selfRow.availableCashUsd;
+    // TRA-3964 (AC2) — the provenance of the cash half, read from the SAME
+    // engine state `selfRow.availableCashUsd` was just derived from, so the row
+    // cannot publish a correction that differs from the one applied.
+    const unsettled = this.unsettledLivePremiumUsd();
+    const balanceAsOfMs = this.lastTradierBalanceSuccessAt > 0 ? this.lastTradierBalanceSuccessAt : null;
     // TRA-3911 — ONE enumeration, read once and folded twice below, mirroring
     // the order site exactly. The row must publish what the ORDER SITE would
     // honour or the TRA-3737 reader grades a column nothing enforces.
@@ -9333,6 +9482,16 @@ export class SignalEngine {
       fleetCapitalBooks: sizing.fleetCapitalBooks,
       fleetSizingReason: sizing.reason,
       availableCashUsd,
+      // TRA-3964 (AC2) — HOW OLD THE CASH HALF IS, and what has been spent since
+      // it was taken. Without these the row cannot be told apart from one whose
+      // two halves were simultaneous, which is the only state its algebra is
+      // exact in.
+      balanceAgeMs: balanceAsOfMs === null ? null : Math.max(0, Date.now() - balanceAsOfMs),
+      balanceAsOfMs,
+      brokerCashUsd: this.brokerReportedCashUsd(),
+      unsettledLivePremiumUsd: unsettled.usd,
+      unsettledLivePremiumFills: unsettled.fills,
+      unsettledLivePremiumBlindFills: unsettled.blindFills,
       openPremiumAtRiskUsd: atRisk.usd,
       openRows: atRisk.rows,
       unpricedOpenRows: atRisk.unpricedRows,
@@ -10866,6 +11025,21 @@ export class SignalEngine {
         opts?.walk ? { walk: opts.walk } : {},
       );
       if (outcome.status === 'filled') {
+        // ⭐ TRA-3964 — REAL CASH JUST LEFT THE ACCOUNT, and the cached balance
+        // does not know. This was the ONE outcome that touched neither the
+        // balance nor any record of the debit, while `rejected` and
+        // `walk_exhausted` below — where nothing moved — both force a refresh.
+        // The result was a 120s window (four scanner ticks) in which
+        // `E_i = cash + atRisk` DOUBLE-COUNTED this premium and every cap
+        // derived from it read `φ_eff · x` too high, in the admitting direction.
+        //
+        // Recorded, not refreshed: a refresh here is a coin flip on broker
+        // settlement latency (see `recordUnsettledLivePremium`). `avgFillPrice`
+        // is the price the broker actually charged, so this is the cash it
+        // actually took — not the row's `premiumPaid`, which is our side of it.
+        if (Number.isFinite(outcome.avgFillPrice) && opened.contracts > 0) {
+          this.recordUnsettledLivePremium(outcome.avgFillPrice * opened.contracts * 100);
+        }
         // TRA-3905 — the fill side. Also clears the permission run: a fill is
         // positive proof this account may trade options, so a later reject
         // starts fresh rather than accumulating across a healthy session.
@@ -20488,6 +20662,12 @@ export class SignalEngine {
       if (balance) {
         this.liveTradierBalance = balance;
         this.lastTradierBalanceSuccessAt = Date.now();
+        // TRA-3964 — a snapshot taken NOW settles every fill old enough for the
+        // broker to have debited it. Ordered AFTER the stamp: the prune grades
+        // against `lastTradierBalanceSuccessAt`, so running it first would grade
+        // the new snapshot against the previous one's as-of time and keep
+        // deducting premium this fetch already accounts for.
+        this.pruneSettledLivePremiumFills();
       }
     } catch (err: unknown) {
       // TRA-406 — log the failure (was `console.error`), and enforce a
