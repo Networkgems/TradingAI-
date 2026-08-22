@@ -189,6 +189,7 @@ import {
   resolveOtmEntryWindows,
   otmEntryWindowVerdict,
   formatOtmEntryWindows,
+  otmDedupeSuppressionEndMs,
   OTM_ENTRY_WINDOW_CLOSED_CODE,
 } from './otm-entry-window.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
@@ -11222,10 +11223,24 @@ export class SignalEngine {
 
         // Dedup: same OCC fired in the last hour — avoid re-spamming the feed
         // when the chain stays cheap across multiple scans.
+        //
+        // ⚠️ TRA-3953 (parent TRA-3942) — the suppression end is PER-TOKEN, not a
+        // flat hour, and the reason is that the ENTRY-WINDOW reject below parks
+        // its refused signal in THIS SAME RING. A refusal therefore wrote an
+        // admission token for the OCC it refused: a 14:59 ET refusal outlived
+        // the 15:00 ET open by 59 minutes and cost that OCC the whole afternoon
+        // window, because the suppressed re-nomination `continue`s here and
+        // never reaches the window check again. `otmDedupeSuppressionEndMs`
+        // expires a WINDOW token at `min(t + 60min, next window open)` and
+        // leaves every other token — universe, delta band, cost bar — on the
+        // full hour, because those refuse a candidate that was never tradeable
+        // while the window refuses one that becomes tradeable minutes later.
+        const nowMs = Date.now();
+        const otmDedupeWindows = resolveOtmEntryWindows(process.env);
         const recentDup = this.recentSignals.find(
           (s) => s.type === 'otm_mispricing'
             && (s as OtmMispricingSignal).optionSymbol === cheap.optionSymbol
-            && Date.now() - s.timestamp < 60 * 60_000,
+            && nowMs < otmDedupeSuppressionEndMs(s, otmDedupeWindows),
         );
         if (recentDup) { scanRun.reject('recent_duplicate'); continue; }
 
@@ -11292,6 +11307,17 @@ export class SignalEngine {
         const otmWindowReject = this.otmEntryWindowRejectReason(nominator);
         if (otmWindowReject) {
           signal.signalSkipReason = otmWindowReject;
+          // TRA-3953 — the LOW-CARDINALITY twin, and it is load-bearing rather
+          // than decorative: the dedup above reads it to tell a CLOCK refusal
+          // (retryable the moment the window opens) from a CANDIDATE one, and
+          // `signalSkipReason` cannot answer that — it is prose with the clock,
+          // the window spec and the resolution source interpolated into it.
+          // Both refusal modes carry the same code here, exactly as
+          // `verdict.reasonCode` does; the clock-unreadable split lives on the
+          // live-enforce ledger, and an unreadable clock also makes
+          // `nextOtmEntryWindowOpenMs` return null, so that token falls back to
+          // the untouched 60-minute brake on its own.
+          signal.signalSkipReasonCode = OTM_ENTRY_WINDOW_CLOSED_CODE;
           if (this.mode === 'live') signal.liveSkipReason = otmWindowReject;
           this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
           if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();

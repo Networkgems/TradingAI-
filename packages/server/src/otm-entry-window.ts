@@ -63,7 +63,7 @@
  * inferred from a deploy SHA.
  */
 
-import { formatEtClock, parseEtClockParts } from './et-clock.js';
+import { formatEtClock, parseEtClockParts, etDateKey, etWallClockToUtcMs } from './et-clock.js';
 
 /**
  * One admission window, as MINUTES PAST ET MIDNIGHT, half-open `[startMin,
@@ -240,6 +240,105 @@ export function otmEntryWindowVerdict(
       + `entry windows [${spec} ET] (source ${resolution.source}) — entry refused, exits unaffected`,
     reasonCode: OTM_ENTRY_WINDOW_CLOSED_CODE,
   };
+}
+
+/**
+ * TRA-3953 (parent TRA-3942) — the OTM churn-brake, as a named constant.
+ *
+ * The `runOtmScan` dedup swallows a repeat nomination of the same OCC for an
+ * hour so a chain that stays cheap across ~51 sweeps records ~1 verdict rather
+ * than 51. That is deliberate and it stays. See
+ * {@link otmDedupeSuppressionEndMs} for the one token it does NOT hold for the
+ * full hour.
+ */
+export const OTM_DEDUPE_CHURN_BRAKE_MS = 60 * 60_000;
+
+/**
+ * TRA-3953 — the epoch-ms instant at which an entry window NEXT opens strictly
+ * after `at`, or `null` if it cannot be resolved.
+ *
+ * ET, via the tz database, for the reason the whole module exists: the next
+ * open is a WALL-CLOCK event, and `at + k` arithmetic against a stored offset
+ * moves it an hour on the first Sunday in November.
+ *
+ * Searches today's ET calendar date and the next two, which is enough for any
+ * window list: the ET date of `at + 24h` is not always `date(at) + 1` (a
+ * fall-back day is 25 hours long and can return the SAME key), so the third
+ * probe is what guarantees the following day is covered rather than assumed.
+ * Duplicate keys are collapsed, so the cost is at most three date resolutions.
+ *
+ * Fails to `null` — never to a plausible-looking guess — when the ET clock is
+ * unreadable. The caller's fallback is the unmodified 60-minute brake, i.e. a
+ * broken clock buys today's behaviour, not a disarmed dedup.
+ */
+export function nextOtmEntryWindowOpenMs(
+  at: Date | number,
+  resolution: OtmEntryWindowResolution = resolveOtmEntryWindows(),
+): number | null {
+  const atMs = at instanceof Date ? at.getTime() : at;
+  if (!Number.isFinite(atMs)) return null;
+  let best: number | null = null;
+  const seen = new Set<string>();
+  for (let dayOffset = 0; dayOffset <= 2; dayOffset += 1) {
+    const dateKey = etDateKey(atMs + dayOffset * 24 * 60 * 60_000);
+    if (seen.has(dateKey)) continue;
+    seen.add(dateKey);
+    for (const w of resolution.windows) {
+      // `24:00` is spellable as an END (`00:00-24:00`) but never as an open.
+      if (w.startMin >= 24 * 60) continue;
+      const open = etWallClockToUtcMs(dateKey, Math.floor(w.startMin / 60), w.startMin % 60);
+      if (open === null || !Number.isFinite(open)) continue;
+      if (open <= atMs) continue;
+      if (best === null || open < best) best = open;
+    }
+  }
+  return best;
+}
+
+/**
+ * TRA-3953 — when the OTM dedup token written by `signal` stops suppressing.
+ *
+ * ## The defect this exists to remove
+ *
+ * TRA-3942's window reject parks the refused signal in `recentSignals` — the
+ * house churn-brake pattern, so the refusal is on the feed and not only in the
+ * log. But `recentSignals` is also the dedup ring, and the dedup matched on
+ * `type` + `optionSymbol` and nothing else. **A refusal therefore wrote a
+ * 60-minute admission token for the OCC it refused.** The suppressed
+ * re-nomination `continue`s before it ever reaches the window check again, so
+ * the OCC's first admissible retry was `first refusal + 60 min` — not "the
+ * moment the window opens".
+ *
+ * Measured against the board's windows (10:15–11:30 and 15:00–15:45 ET): an OCC
+ * first nominated at 10:14 ET lost 59 of the morning window's 75 minutes, and
+ * one first nominated at 14:59 ET missed the entire 45-minute afternoon window
+ * for that day. The gate narrowed the very window it was built to open.
+ *
+ * ## Why only the WINDOW token
+ *
+ * Every other cut on this path — the live universe, the delta ceiling/floor,
+ * the cost bar — refuses a candidate that was **never tradeable**. Holding its
+ * token for the full hour costs nothing, because nothing about the candidate
+ * changes inside that hour. The window refuses a candidate that becomes
+ * tradeable **minutes later**, on a schedule we already know exactly. Same
+ * write, different consequence — so only this one token gets the shorter life,
+ * at `min(t + 60 min, next window open)`.
+ *
+ * Everything else about the refusal write is unchanged: same `unshift`, same
+ * alert, same `dailySignals` record, same `entry_window.evaluated` denominator.
+ * And the brake is NOT disarmed — an OCC held out of window all session still
+ * records a handful of verdicts, not one per sweep, because each refusal writes
+ * a fresh token and the next open is at most one brake-length away.
+ */
+export function otmDedupeSuppressionEndMs(
+  signal: { timestamp: number; signalSkipReasonCode?: string },
+  resolution: OtmEntryWindowResolution = resolveOtmEntryWindows(),
+): number {
+  const churnBrakeEnd = signal.timestamp + OTM_DEDUPE_CHURN_BRAKE_MS;
+  if (signal.signalSkipReasonCode !== OTM_ENTRY_WINDOW_CLOSED_CODE) return churnBrakeEnd;
+  const nextOpen = nextOtmEntryWindowOpenMs(signal.timestamp, resolution);
+  if (nextOpen === null) return churnBrakeEnd;
+  return Math.min(churnBrakeEnd, nextOpen);
 }
 
 /**

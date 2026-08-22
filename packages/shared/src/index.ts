@@ -128,6 +128,27 @@ export interface TradeSignal {
    */
   signalSkipReason?: string;
   /**
+   * TRA-3953 (parent TRA-3942) — the LOW-CARDINALITY twin of
+   * `signalSkipReason`, for the suppressions whose *machine* identity a later
+   * reader has to recover.
+   *
+   * `signalSkipReason` is prose, and prose is the wrong key: it interpolates
+   * the clock, the window spec and the resolution source, so folding on it
+   * yields one bucket per decision. It also cannot be matched against without
+   * pinning a sentence, which is a coupling that breaks the first time somebody
+   * improves the wording.
+   *
+   * Currently written by exactly one producer — the `single_leg_otm` entry-time
+   * window (`OTM_ENTRY_WINDOW_CLOSED_CODE`) — because that is the only
+   * suppression whose token another gate has to *reason about*: the OTM
+   * churn-brake dedup expires a window refusal at the next window open rather
+   * than on the flat hour, and it needs to tell a CLOCK refusal from a
+   * CANDIDATE one to do it. Absent on every other skip, and absent on signals
+   * that proceed normally — an undefined code means "not a coded suppression",
+   * never "not suppressed".
+   */
+  signalSkipReasonCode?: string;
+  /**
    * TRA-1972 (D1 of TRA-1968) — catalyst event-proximity SHADOW decision. When
    * the earnings/macro gate WOULD block this new entry, the reason is stamped
    * here for observability — but in D1 the engine does NOT suppress the open

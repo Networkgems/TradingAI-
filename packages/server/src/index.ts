@@ -346,7 +346,10 @@ import {
   otmEntryWindowVerdict,
   otmEntryWindowsUtcAt,
   formatOtmEntryWindows,
+  nextOtmEntryWindowOpenMs,
   OTM_ENTRY_WINDOWS_VALUE,
+  OTM_DEDUPE_CHURN_BRAKE_MS,
+  OTM_ENTRY_WINDOW_CLOSED_CODE,
 } from './otm-entry-window.js';
 // TRA-3067 — counts-only projection of the out-of-band-close detector.
 import {
@@ -11156,6 +11159,27 @@ app.get('/api/health/options-live', async (_req, res) => {
           reasonCode: verdict.reasonCode,
           appliesTo: ['paper', 'live'] as const,
           exitsGated: false as const,
+          // TRA-3953 — the second-order interaction, on the wire, because the
+          // fix is a PREDICATE and a predicate is exactly the thing a deploy
+          // SHA cannot evidence. The window reject parks its signal in the OTM
+          // dedup ring, so before this the refusal wrote a 60-minute admission
+          // token and a 14:59 ET refusal cost that OCC the whole 15:00–15:45
+          // window. `nextWindowOpenUtc` is computed live from the SAME
+          // resolution the gate uses, so a grader can join a refusal stamp to
+          // the instant its token dies without re-deriving the ET clock; it is
+          // `null` only when that clock is unreadable, which is also the case
+          // in which the token falls back to the untouched full hour.
+          refusalDedupe: (() => {
+            const nextOpen = nextOtmEntryWindowOpenMs(now, resolution);
+            return {
+              issue: 'TRA-3953',
+              churnBrakeMs: OTM_DEDUPE_CHURN_BRAKE_MS,
+              windowRefusalExpiresAtNextOpen: true as const,
+              nextWindowOpenUtc: nextOpen === null ? null : new Date(nextOpen).toISOString(),
+              nextWindowOpenInMs: nextOpen === null ? null : nextOpen - now,
+              skipReasonCode: OTM_ENTRY_WINDOW_CLOSED_CODE,
+            };
+          })(),
         };
       })(),
       liveStopActionability: (() => {
