@@ -14922,6 +14922,85 @@ app.post('/api/options/:id/repair-engine-basis', requireAuth, requireAdmin, asyn
 });
 
 /**
+ * TRA-3958 (CEO ruling on TRA-3895 `7adbb4b1`, 2026-08-22) — restate an ADOPTED
+ * broker row's basis to a figure supplied by an OPERATOR, and re-derive its risk
+ * schedule off it.
+ *
+ * ── Why this route exists when `repair-engine-basis` refuses request bodies ──
+ * Because for the row it was built for, every machine oracle on this box has
+ * expired. The desk bought 1 `BAC260925C00063000` at 1.17 on 2026-08-20T19:36Z
+ * (order `142769192`); Tradier's `/orders` serves the current trading day only,
+ * TRA-3939's durable capture starts 08-21, our fill ledger never saw the desk
+ * place it, and `/positions` reports the surviving lot at the two-lot AVERAGE —
+ * so TRA-3909's residual identity would REPRODUCE the 1.41 blend rather than
+ * refuse it. The live stop is priced off that blend at 1.0575 against a 0.94
+ * mark, i.e. breached by the error alone; at the desk's real 1.17 the same
+ * shipped schedule gives 0.8775 and holds.
+ *
+ * The figure is therefore a human's, and this route is built around that fact:
+ * `provenance` is REQUIRED and stored verbatim in the durable restatement
+ * ledger, and `expectedPremiumPaid` is required so a stale figure cannot land on
+ * a row that moved after the operator read it.
+ *
+ * ── Contract ────────────────────────────────────────────────────────────────
+ * Body: `{ premiumPaid, expectedPremiumPaid, provenance }` — all three required.
+ * `?confirm=TRA-3958` writes; without it the SAME code path runs every
+ * precondition and returns `would_restate` with the levels it would install,
+ * previewed by running the shipped `applyImportedRiskThresholds` against a copy
+ * of the row. One implementation of the refusal set, so a dry run cannot
+ * disagree with the write.
+ *
+ * `status` is five-valued and a silent no-op is impossible:
+ *   • `restated`        200 — `before`/`after` carry all four levels.
+ *   • `would_restate`   200 — dry run; NOTHING written.
+ *   • `already_correct` 200 — the row is already at the operator's figure;
+ *     nothing written, and deliberately not `restated` with a zero delta.
+ *   • `refused`         409 — a named precondition failed. Read `reason`.
+ *   • `not_found`       404.
+ *
+ * `requireAdmin` as well as `requireAuth`: this is the only surface on the
+ * server that puts a human's number onto a live row's basis.
+ */
+app.post('/api/options/:id/restate-adopted-basis', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params as Record<string, string>;
+  const ctx = await userCtx(res);
+  const apply = (req.query as Record<string, unknown>)['confirm'] === 'TRA-3958';
+  const body = (req.body ?? {}) as Record<string, unknown>;
+
+  // Passed through as-is — the account owns the refusal set, so a shape check
+  // here would be a second implementation of `unreadable_value` free to disagree
+  // with the one that guards the write. `Number()` coercion is deliberately NOT
+  // applied: a `"1.17"` that silently becomes 1.17 is a request nobody typed.
+  const outcome = ctx.engine.restateAdoptedBasisFromOperator(id, {
+    premiumPaid: body['premiumPaid'] as number,
+    expectedPremiumPaid: body['expectedPremiumPaid'] as number,
+    provenance: body['provenance'] as string,
+    apply,
+  });
+
+  if (outcome.status === 'not_found') {
+    res.status(404).json({ ok: false, ...outcome });
+    return;
+  }
+  if (outcome.status === 'refused') {
+    // 409 for the same reason the repair uses one: the request is well-formed
+    // and the row exists. The STATE refuses, and the reason is the payload.
+    res.status(409).json({ ok: false, ...outcome });
+    return;
+  }
+  if (outcome.status === 'would_restate') {
+    res.json({ ok: true, dryRun: true, confirmWith: 'confirm=TRA-3958', ...outcome });
+    return;
+  }
+  if (outcome.status === 'restated') {
+    // A real-money row's stop just moved. Push it to every connected reader now
+    // rather than waiting for the next tick.
+    broadcastEngineState(ctx);
+  }
+  res.json({ ok: true, ...outcome });
+});
+
+/**
  * TRA-3829 (board ruling B, card `331ddc56`, 2026-08-21) — the per-row
  * HAND-OVER surface. A human explicitly hands ONE adopted broker option to the
  * engine; until they do, the engine never exits it (see
@@ -15205,6 +15284,13 @@ app.get('/api/options/basis-restatements', requireAuth, async (req, res) => {
       // this as "what a human ordered moved"; the durable log's `source` field
       // is the per-record form of the same split.
       repaired: memory.repaired,
+      // TRA-3958 — basis moves ordered by an OPERATOR, outside all three counts
+      // above. `repaired` means "moved to a figure THIS ENGINE recorded"; this
+      // one means "moved to a figure a human supplied, with a citation", which
+      // is a different claim about where the number came from and must never be
+      // readable as the other. The durable log's `provenance` field is the
+      // per-record form.
+      operatorRestated: memory.operatorRestated,
       skips: memory.skips,
     },
     // Survives restarts. This is the tape gate A is graded against.

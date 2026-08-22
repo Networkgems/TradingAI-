@@ -2496,6 +2496,11 @@ export interface EngineBasisRestatement {
    * `recorded_fill_repair` is the admin repair sourced from our own fills.
    */
   source: EngineBasisRestatementSource;
+  /**
+   * TRA-3958 — only on `operator_restatement`: the operator's cited provenance,
+   * verbatim. The figure came from a human, so the citation IS the evidence.
+   */
+  provenance?: string;
   tp1PremiumBefore: number;
   tp1PremiumAfter: number;
   stopLossPremiumBefore: number;
@@ -2621,6 +2626,117 @@ export type EngineBasisRepairOutcome =
       recorded: RecordedEngineOpenBasis;
       before: EngineBasisRepairSchedule;
       after: EngineBasisRepairSchedule;
+    };
+
+/**
+ * TRA-3958 — why an OPERATOR restatement of an adopted row's basis declined.
+ *
+ * Enumerated for the same reason {@link EngineBasisRepairRefusal} is, plus one
+ * that is specific to this route: it is the only write surface on this server
+ * that puts a HUMAN'S number onto a real-money row's basis, so every way it can
+ * go wrong has to be a fact the route can say back rather than a 400 with prose.
+ *
+ * `multi_leg` and `covered_write` are deliberately absent, and that is not an
+ * oversight: both shapes are minted only by the engine's own writers
+ * (`openCoveredCall` / `openCashSecuredPut`, and the combo path), so they carry
+ * `importedFromTradier !== true` and are already turned away by `not_adopted`
+ * one branch earlier. Adding unreachable refusals would be adding branches no
+ * control can produce.
+ */
+export type AdoptedBasisRestatementRefusal =
+  /**
+   * The operator's `premiumPaid` / `expectedPremiumPaid`, or the row's own
+   * persisted basis, is not a positive finite number. All three are anchors —
+   * a NaN anywhere here is a stop priced off nothing.
+   */
+  | 'unreadable_value'
+  /** No `provenance`. The figure is a human's; the citation IS the evidence. */
+  | 'no_provenance'
+  /**
+   * Not an adopted broker row. Either engine-opened, or an import the ledger
+   * PROVED is ours (`adoptionAuthority: 'engine_origin'`) — in which case
+   * `repair-engine-basis` owns it and sources the number from our own fills,
+   * which is strictly better evidence than anything typed into a request body.
+   */
+  | 'not_adopted'
+  /** An exit or close is at the broker; the pollers own this basis. */
+  | 'in_flight'
+  /**
+   * ★ The load-bearing refusal. The row's current basis is not the one the
+   * operator said they were correcting, so the row moved under them. Writing
+   * anyway would land a stale figure on a state nobody looked at.
+   */
+  | 'basis_moved'
+  /**
+   * The operator's figure is below `RV_MIN_MARK_FLOOR`, so
+   * `applyImportedRiskThresholds` would take TRA-462's sentinel path and
+   * install stop 0 / TP1 ∞ / `riskUnmanagedReason: 'sub_floor_premium'`. That
+   * is a legitimate schedule and a terrible surprise: the operator asked for a
+   * corrected stop and would get NO stop, on a live row, with a 200. Refused
+   * and SAID, rather than applied quietly.
+   */
+  | 'sub_floor_premium';
+
+/** TRA-3958 — the four levels, before and after. Same shape as the repair's. */
+export type AdoptedBasisRestatementSchedule = EngineBasisRepairSchedule;
+
+/**
+ * TRA-3958 — the restatement's verdict. As with the repair, a silent no-op is
+ * impossible: every terminal state names itself.
+ *
+ *   • `not_found`       — no such row on this book.
+ *   • `refused`         — a named precondition failed. NOTHING was written.
+ *   • `already_correct` — the row is already at the operator's figure. Written
+ *     nothing, including no log line, so a re-post cannot inflate the ledger.
+ *   • `would_restate`   — `apply: false`. Every precondition passed, the write
+ *     was withheld, and `after` carries the levels it WOULD install — derived
+ *     by running the shipped `applyImportedRiskThresholds` against a copy of
+ *     the row, never by re-deriving the arithmetic here.
+ *   • `restated`        — basis written and the schedule re-derived off it.
+ */
+export type AdoptedBasisRestatementOutcome =
+  | { status: 'not_found'; positionId: string }
+  | {
+      status: 'refused';
+      reason: AdoptedBasisRestatementRefusal;
+      positionId: string;
+      optionSymbol: string;
+      persistedPremiumPaid: number;
+      persistedContracts: number;
+      requestedPremiumPaid: number;
+      expectedPremiumPaid: number;
+      detail: string;
+    }
+  | {
+      status: 'already_correct';
+      positionId: string;
+      optionSymbol: string;
+      persistedPremiumPaid: number;
+      persistedContracts: number;
+      requestedPremiumPaid: number;
+      expectedPremiumPaid: number;
+    }
+  | {
+      status: 'restated' | 'would_restate';
+      positionId: string;
+      optionSymbol: string;
+      persistedPremiumPaid: number;
+      persistedContracts: number;
+      requestedPremiumPaid: number;
+      expectedPremiumPaid: number;
+      /** Stored verbatim, and echoed verbatim. */
+      provenance: string;
+      before: AdoptedBasisRestatementSchedule;
+      after: AdoptedBasisRestatementSchedule;
+      /**
+       * Whether the engine is actually authorised to act on the row the
+       * schedule was just installed on ({@link engineMayActOnAdoptedRow}). A
+       * corrected basis under a revoked hand-over is a corrected number and no
+       * stop, and the caller must not have to infer which one they got.
+       */
+      armedNow: boolean;
+      /** The sentinel's reason after the write, or `null` when armed. */
+      riskUnmanagedReason: string | null;
     };
 
 function restateEngineOpenedBasis(opt: OptionPosition, brokerPremium: number): void {
@@ -3116,6 +3232,16 @@ export class PaperOptionsAccount {
    * out-of-band repair moved one — was not written down anywhere.
    */
   private engineBasisRepairedTotal = 0;
+  /**
+   * TRA-3958 — basis moves ordered by an OPERATOR
+   * ({@link restateAdoptedBasisFromOperator}), counted separately from BOTH of
+   * the above for the same reason they are separate from each other: the
+   * question a reader is asking of this census is "where did this row's number
+   * come from", and folding a human's figure into `repaired` — whose defining
+   * property is that the figure came from our own fill ledger — answers it
+   * wrongly and cannot be un-answered afterwards.
+   */
+  private engineBasisOperatorRestatedTotal = 0;
   /**
    * TRA-3909 — the last PER-LOT adoption pass over the live book.
    *
@@ -8824,6 +8950,8 @@ export class PaperOptionsAccount {
     // TRA-3896 — defaulted rather than required so the reconcile call site reads
     // unchanged, and so a future third mechanism has to name itself explicitly.
     source: EngineBasisRestatementSource = 'broker_reconcile',
+    /** TRA-3958 — verbatim on `operator_restatement`; absent everywhere else. */
+    provenance?: string,
   ): void {
     const before = opt.premiumPaid;
     // Ratios are only meaningful against a positive basis; the caller has
@@ -8841,6 +8969,7 @@ export class PaperOptionsAccount {
       ratio: brokerPremium / before,
       brokerCostBasisUsd: brokerPremium * opt.contracts * 100,
       source,
+      ...(provenance === undefined ? {} : { provenance }),
       tp1PremiumBefore: opt.tp1Premium,
       tp1PremiumAfter: Number.NaN,
       stopLossPremiumBefore: opt.stopLossPremium,
@@ -8872,7 +9001,13 @@ export class PaperOptionsAccount {
     // reconcile UNBLENDING a row against our own ledger, and folding it into
     // `restated` would tell a reader the broker-truth sweep moved a basis it
     // explicitly refused to move. Counted with the repairs, which is what it is.
-    if (rec.source === 'recorded_fill_repair' || rec.source === 'desk_lot_split') {
+    // TRA-3958 — an OPERATOR restatement is neither. `repaired` means "moved to
+    // a figure this system recorded"; the whole reason this third mechanism
+    // exists is that no such figure survives for the row it was built for. Its
+    // own counter, so a reader can never take a human's number for one of ours.
+    if (rec.source === 'operator_restatement') {
+      this.engineBasisOperatorRestatedTotal += 1;
+    } else if (rec.source === 'recorded_fill_repair' || rec.source === 'desk_lot_split') {
       this.engineBasisRepairedTotal += 1;
     } else this.engineBasisRestatedTotal += 1;
     const after = opt.premiumPaid;
@@ -8899,6 +9034,12 @@ export class PaperOptionsAccount {
     restated: number;
     /** TRA-3896 — out-of-band repairs. NOT part of `candidates` / `restated`. */
     repaired: number;
+    /**
+     * TRA-3958 — basis moves ordered by an operator. NOT part of `candidates`,
+     * `restated` or `repaired`: the figure came from a human, and that is the
+     * one thing about it a reader must never have to infer.
+     */
+    operatorRestated: number;
     retained: number;
     retentionCap: number;
     skips: Record<EngineBasisSkipReason, number>;
@@ -8908,6 +9049,7 @@ export class PaperOptionsAccount {
       candidates: this.engineBasisCandidates,
       restated: this.engineBasisRestatedTotal,
       repaired: this.engineBasisRepairedTotal,
+      operatorRestated: this.engineBasisOperatorRestatedTotal,
       retained: this.engineBasisRestatements.length,
       retentionCap: ENGINE_BASIS_RESTATEMENT_LOG_CAP,
       skips: { ...this.engineBasisSkips },
@@ -9208,6 +9350,273 @@ export class PaperOptionsAccount {
         tp1Premium: opt.tp1Premium,
         trailingStopPremium: opt.trailingStopPremium,
       },
+    };
+  }
+
+  /**
+   * TRA-3958 — restate an ADOPTED broker row's basis to a figure supplied by an
+   * operator, and re-derive its risk schedule off the corrected number.
+   *
+   * ── Why an operator-supplied number is allowed here and nowhere else ────────
+   * `repairEngineBasisFromRecordedFill` refuses a request-body figure on the
+   * stated ground that "an operator-supplied basis is a second way to get a
+   * number nobody paid onto the row". That reasoning holds exactly as long as a
+   * machine oracle can answer, and on the row this was built for none can:
+   *
+   *   • the desk's `buy_to_open` for `BAC260925C00063000` (order `142769192`,
+   *     1 ct @ 1.17) filled 2026-08-20T19:36Z, and Tradier's `/accounts/{id}/
+   *     orders` serves the CURRENT TRADING DAY only;
+   *   • TRA-3939's durable order capture begins 2026-08-21 — one day late for
+   *     this fill, and correct for every fill after it;
+   *   • the fill ledger never recorded the desk placing it, so
+   *     `repair-engine-basis` answers `no_recorded_fill` (`recordedOpenFills:
+   *     29` — a populated ledger that genuinely never saw this open);
+   *   • TRA-3909's residual identity would not refuse either. With the engine's
+   *     sibling lot closed, `/positions` reports the survivor at the two-lot
+   *     AVERAGE, so `(141 − 0) ÷ (1 − 0)` = 1.41 — it REPRODUCES the blend.
+   *     `no_engine_row` is refusing upstream of that arithmetic and is the only
+   *     reason the blend was never re-derived and re-blessed.
+   *
+   * So the choice is not "operator figure vs oracle figure". It is "operator
+   * figure with a citation vs a blend of two lots nobody paid", and the blend is
+   * what prices the live stop today: 1.41 → stop 1.0575 against a 0.94 mark, a
+   * stop that is BREACHED purely because of the overstatement. At the desk's
+   * actual 1.17 the same shipped schedule gives 0.8775 and does not fire.
+   *
+   * ── What keeps it from being a footgun ──────────────────────────────────────
+   * The route is deliberately narrow. It cannot touch an engine-origin row (that
+   * is `repair-engine-basis`, which sources the number from our own fills and is
+   * strictly better evidence). It cannot land a stale number: the caller must
+   * state the basis they believe they are correcting, and `basis_moved` refuses
+   * if the row has moved since they read it. It cannot install a surprise: a
+   * sub-floor figure would take TRA-462's sentinel path and leave a live row
+   * with NO stop, so it is refused and said out loud rather than applied. And it
+   * cannot be audited later on trust alone — `provenance` is required, non-empty,
+   * and written verbatim into the durable restatement ledger beside the numbers.
+   *
+   * ── The schedule is never computed here ─────────────────────────────────────
+   * The new levels come from {@link applyImportedRiskThresholds}, the same
+   * function the adoption and hand-over paths run, called through the same
+   * `engineMayActOnAdoptedRow` pair. A hand-computed stop in this method would be
+   * a second implementation of the schedule, free to disagree with the one the
+   * exit engine actually reads — which is the TRA-3895 shape one layer down.
+   *
+   * `apply: false` runs every precondition and previews the levels by running
+   * that same function against a COPY of the row, so a dry run cannot claim a
+   * schedule the write would not produce. Same posture as the repair, and for
+   * the same reason.
+   */
+  restateAdoptedBasisFromOperator(
+    positionId: string,
+    req: {
+      premiumPaid: number;
+      expectedPremiumPaid: number;
+      provenance: string;
+      apply?: boolean;
+    },
+  ): AdoptedBasisRestatementOutcome {
+    const apply = req.apply ?? true;
+    const opt = this.openOptions.get(positionId);
+    if (!opt) return { status: 'not_found', positionId };
+
+    const optionSymbol = opt.optionSymbol ?? '';
+    const persistedContracts = opt.contractsRemaining ?? opt.contracts;
+    const requestedPremiumPaid = req.premiumPaid;
+    const expectedPremiumPaid = req.expectedPremiumPaid;
+    const provenance = typeof req.provenance === 'string' ? req.provenance.trim() : '';
+    const context = {
+      positionId,
+      optionSymbol,
+      persistedPremiumPaid: opt.premiumPaid,
+      persistedContracts,
+      requestedPremiumPaid,
+      expectedPremiumPaid,
+    };
+    // Cent-level. The same tolerance `repairEngineBasisFromRecordedFill` uses,
+    // so "the row is already there" means the same thing on both routes.
+    const EPS = 1e-6;
+    const readable = (v: unknown): v is number =>
+      typeof v === 'number' && Number.isFinite(v) && v > 0;
+
+    // ── The request, before the state ───────────────────────────────────────
+    if (!readable(requestedPremiumPaid) || !readable(expectedPremiumPaid)) {
+      return {
+        status: 'refused',
+        reason: 'unreadable_value',
+        ...context,
+        detail:
+          'both `premiumPaid` and `expectedPremiumPaid` must be positive finite numbers. '
+          + 'A NaN or a missing field here is a stop priced off nothing.',
+      };
+    }
+    if (provenance === '') {
+      return {
+        status: 'refused',
+        reason: 'no_provenance',
+        ...context,
+        detail:
+          'this figure comes from a human, so the citation IS the evidence: state where the number '
+          + 'came from (e.g. the source file and line that computed it against the live order). '
+          + 'Refusing rather than writing a basis with a blank audit trail.',
+      };
+    }
+    if (!readable(opt.premiumPaid)) {
+      return {
+        status: 'refused',
+        reason: 'unreadable_value',
+        ...context,
+        detail:
+          'the row\'s own `premiumPaid` is not a positive finite number, so there is no state to '
+          + 'compare `expectedPremiumPaid` against and `basis_moved` could not fire. Refused rather '
+          + 'than written blind.',
+      };
+    }
+
+    // ── The row ─────────────────────────────────────────────────────────────
+    if (opt.importedFromTradier !== true) {
+      return {
+        status: 'refused',
+        reason: 'not_adopted',
+        ...context,
+        detail:
+          'this is an engine-opened row. Its basis is repaired from THIS ENGINE\'S OWN recorded '
+          + 'fills via `POST /api/options/:id/repair-engine-basis`, which is strictly better '
+          + 'evidence than a number in a request body.',
+      };
+    }
+    if (opt.adoptionAuthority === 'engine_origin' || opt.engineOriginSleeve) {
+      return {
+        status: 'refused',
+        reason: 'not_adopted',
+        ...context,
+        detail:
+          'the fill ledger PROVED this import is ours (`adoptionAuthority: engine_origin`), so it is '
+          + '`repair-engine-basis`\'s row and its basis is recoverable from our own records.',
+      };
+    }
+    if (opt.pendingExit || opt.pendingCloseOrderId !== undefined) {
+      return {
+        status: 'refused',
+        reason: 'in_flight',
+        ...context,
+        detail:
+          'an exit or close is in flight; the pollers are already deriving realized P&L against this '
+          + 'basis and own the row until it resolves.',
+      };
+    }
+
+    // ── Idempotence BEFORE `basis_moved`, deliberately ──────────────────────
+    // A re-post of the identical correction must not read as a stale operator:
+    // the second time round the row IS the requested figure and `expected` is
+    // the pre-correction one, so an ordering that checked `basis_moved` first
+    // would refuse the one request that is provably harmless — it writes
+    // nothing either way. Nothing here is written, so the row cannot drift.
+    if (Math.abs(opt.premiumPaid - requestedPremiumPaid) <= EPS) {
+      return { status: 'already_correct', ...context };
+    }
+    if (Math.abs(opt.premiumPaid - expectedPremiumPaid) > EPS) {
+      return {
+        status: 'refused',
+        reason: 'basis_moved',
+        ...context,
+        detail:
+          `the row's basis is ${opt.premiumPaid}, not the ${expectedPremiumPaid} this request says it `
+          + 'is correcting. Something moved it after the operator read it, so their figure describes a '
+          + 'state that no longer exists. Re-read the row and re-issue.',
+      };
+    }
+    if (requestedPremiumPaid < RV_MIN_MARK_FLOOR) {
+      return {
+        status: 'refused',
+        reason: 'sub_floor_premium',
+        ...context,
+        detail:
+          `${requestedPremiumPaid} is below RV_MIN_MARK_FLOOR (${RV_MIN_MARK_FLOOR}), so re-deriving the `
+          + 'schedule off it takes TRA-462\'s sentinel path: stop 0, TP1 infinite, '
+          + '`riskUnmanagedReason: sub_floor_premium`. That is a live row with NO stop, which is the '
+          + 'opposite of what a basis correction is for. Refused and said, not applied quietly.',
+      };
+    }
+
+    const scheduleOf = (row: OptionPosition): AdoptedBasisRestatementSchedule => ({
+      premiumPaid: row.premiumPaid,
+      stopLossPremium: row.stopLossPremium,
+      tp1Premium: row.tp1Premium,
+      trailingStopPremium: row.trailingStopPremium,
+    });
+    const before = scheduleOf(opt);
+
+    /**
+     * The whole effect, in one place, so the preview and the write are the same
+     * code applied to different objects. Returns the authorisation the schedule
+     * was installed under, which is the difference between a corrected stop and
+     * a corrected number with no stop at all.
+     */
+    const install = (row: OptionPosition): boolean => {
+      row.premiumPaid = requestedPremiumPaid;
+      // `peakPremium` is seeded to `premiumPaid` at adoption and only rises on a
+      // real mark. Where it still equals the OLD basis it is that seed and
+      // nothing else — an artifact of the wrong number — so it moves with it.
+      // Anywhere else it is an observed high and is left alone; inventing a peak
+      // this contract never printed would re-arm the trailing stop off fiction.
+      if (row.peakPremium === before.premiumPaid) row.peakPremium = requestedPremiumPaid;
+      // NOT touched: `currentPremium` (the live mark, maintained by TRA-351's
+      // refresher) and `contracts` (this route restates a PRICE, never a size —
+      // a quantity edit is the blend running backwards, TRA-3890).
+      const mayAct = engineMayActOnAdoptedRow(row, this.actOnAdoptedBrokerRows);
+      applyImportedRiskThresholds(row, this.rvRiskParams, this.autoManageImportedTradierOptions, !mayAct);
+      return mayAct;
+    };
+
+    if (!apply) {
+      // A shallow copy is enough: every field `install` touches is a scalar.
+      const preview = { ...opt };
+      const armedNow = install(preview);
+      return {
+        status: 'would_restate',
+        ...context,
+        provenance,
+        before,
+        after: scheduleOf(preview),
+        armedNow,
+        riskUnmanagedReason: preview.riskUnmanagedReason ?? null,
+      };
+    }
+
+    // Pre-half first — it reads the row before the mutation, as the reconcile's
+    // call site does — then the write, then the post-half against the SAME
+    // object, then the durable append. `operator_restatement` keeps this out of
+    // both the reconcile's numerator and the repair's.
+    this.recordEngineBasisRestatement(opt, requestedPremiumPaid, 'operator_restatement', provenance);
+    const armedNow = install(opt);
+    this.finishEngineBasisRestatement(opt);
+
+    accountLog.warn('adopted row basis RESTATED from an operator-supplied figure', {
+      issue: 'TRA-3958',
+      positionId,
+      optionSymbol,
+      contracts: persistedContracts,
+      premiumPaidBefore: before.premiumPaid,
+      premiumPaidAfter: opt.premiumPaid,
+      expectedPremiumPaid,
+      stopLossPremiumBefore: before.stopLossPremium,
+      stopLossPremiumAfter: opt.stopLossPremium,
+      tp1PremiumBefore: before.tp1Premium,
+      tp1PremiumAfter: opt.tp1Premium,
+      armedNow,
+      riskUnmanagedReason: opt.riskUnmanagedReason ?? null,
+      provenance,
+      note: 'operator-supplied basis: no machine oracle on this box can answer for this fill (TRA-3958)',
+    });
+
+    return {
+      status: 'restated',
+      ...context,
+      provenance,
+      before,
+      after: scheduleOf(opt),
+      armedNow,
+      riskUnmanagedReason: opt.riskUnmanagedReason ?? null,
     };
   }
 

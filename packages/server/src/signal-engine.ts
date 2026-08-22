@@ -347,7 +347,7 @@ import {
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount, type EquityExitRiskInput } from './paper-account.js';
-import { PaperOptionsAccount, qualifyLiveStopActionability, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary, type LiveStopActionabilityQualified, type LiveExitPassStatus, type DayOneStopPosture, type EngineBasisRepairOutcome, type LiveLotAdoptionReport } from './options-account.js';
+import { PaperOptionsAccount, qualifyLiveStopActionability, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary, type LiveStopActionabilityQualified, type LiveExitPassStatus, type DayOneStopPosture, type EngineBasisRepairOutcome, type AdoptedBasisRestatementOutcome, type LiveLotAdoptionReport } from './options-account.js';
 import { bindOptionsPnlToEquityBook } from './options-equity-bridge.js';
 import {
   PENDING_CLOSE_MAX_REPRICE_STEPS,
@@ -17695,6 +17695,28 @@ export class SignalEngine {
   ): EngineBasisRepairOutcome & { env: TradierEnv | null } {
     for (const env of ['sandbox', 'production'] as const) {
       const outcome = this.optionsAccounts[env].repairEngineBasisFromRecordedFill(optionId, opts);
+      // `not_found` means this account does not hold the row — keep looking.
+      // Every other status is a real verdict from the account that DOES hold it.
+      if (outcome.status !== 'not_found') return { ...outcome, env };
+    }
+    return { status: 'not_found', positionId: optionId, env: null };
+  }
+
+  /**
+   * TRA-3958 — restate an ADOPTED row's basis from an operator-supplied figure.
+   * See `PaperOptionsAccount.restateAdoptedBasisFromOperator` for why a human's
+   * number is admissible on this route and on no other, and for the refusal set.
+   *
+   * Searched across both Tradier envs by position id, exactly as
+   * {@link repairEngineBasisFromRecordedFill} is, and for the same reason: the
+   * caller holds a row id from `/api/state` and does not know which book has it.
+   */
+  restateAdoptedBasisFromOperator(
+    optionId: string,
+    req: { premiumPaid: number; expectedPremiumPaid: number; provenance: string; apply?: boolean },
+  ): AdoptedBasisRestatementOutcome & { env: TradierEnv | null } {
+    for (const env of ['sandbox', 'production'] as const) {
+      const outcome = this.optionsAccounts[env].restateAdoptedBasisFromOperator(optionId, req);
       // `not_found` means this account does not hold the row — keep looking.
       // Every other status is a real verdict from the account that DOES hold it.
       if (outcome.status !== 'not_found') return { ...outcome, env };

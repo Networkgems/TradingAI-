@@ -62,7 +62,20 @@ export const ENGINE_BASIS_RESTATEMENT_FILENAME = 'engine-basis-restatements.json
 export type EngineBasisRestatementSource =
   | 'broker_reconcile'
   | 'recorded_fill_repair'
-  | 'desk_lot_split';
+  | 'desk_lot_split'
+  /**
+   * TRA-3958 — an OPERATOR restated an adopted row's basis. The only source
+   * whose figure came from a human rather than from a record this system
+   * wrote, and it exists because on the BAC row every machine oracle had
+   * expired: the desk's fill was 2026-08-20, Tradier's `/orders` serves the
+   * current trading day only, TRA-3939's durable capture starts 08-21, and
+   * `/positions` reports the survivor at the two-lot AVERAGE (so the residual
+   * identity would reproduce the blend rather than refuse). A reader must be
+   * able to tell this apart from the other three at a glance, because it is
+   * the one whose truth rests on the `provenance` string beside it rather than
+   * on bytes we wrote ourselves.
+   */
+  | 'operator_restatement';
 
 /** One witnessed restatement: both sides of an edit that is otherwise unobservable. */
 export interface EngineBasisRestatementRecord {
@@ -78,6 +91,17 @@ export interface EngineBasisRestatementRecord {
   brokerCostBasisUsd: number;
   /** TRA-3896 — see {@link EngineBasisRestatementSource}. Absent on pre-3896 rows. */
   source?: EngineBasisRestatementSource;
+  /**
+   * TRA-3958 — WHERE an `operator_restatement` figure came from, stored
+   * verbatim as the operator typed it. Absent on every other source, whose
+   * provenance is the mechanism itself.
+   *
+   * This is the whole audit trail for a number no oracle on this box can
+   * re-derive, so it is never normalised, never truncated into meaning, and
+   * never defaulted: a restatement with no provenance is REFUSED upstream
+   * rather than written with a blank here.
+   */
+  provenance?: string;
   tp1PremiumBefore: number;
   tp1PremiumAfter: number;
   stopLossPremiumBefore: number;
