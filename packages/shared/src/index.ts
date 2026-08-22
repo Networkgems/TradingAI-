@@ -3036,6 +3036,59 @@ export interface OptionPosition {
    */
   deskAddSleeve?: 'single_leg_rv' | 'single_leg_otm' | 'single_leg_directional';
   /**
+   * TRA-3946 (TRA-3907 phase 1) — per-LOT add provenance.
+   *
+   * The board's 08-20 posture (TRA-3896/3904/3909) is per-lot: every add is its
+   * own row with its own basis and its own stop, never blended. A lot the ENGINE
+   * adds under the average-down rule is therefore a second row on the same OCC,
+   * and the broker-vs-engine drift grader (`live-broker-position-drift.ts`)
+   * must count it as EXPECTED quantity rather than as a desk `excess`. This
+   * field is what lets it: `engine_average_down` lots are engine-managed by
+   * construction, whichever `adoptionAuthority` a later re-adoption stamps.
+   *
+   * `desk_add` mirrors `adoptionAuthority: 'desk_add'` so "how did this lot get
+   * here" has ONE vocabulary across desk and engine adds — one code path, not
+   * two. Absent ⇒ the row is an ordinary entry lot.
+   *
+   * Phase 1 ships the field and its grader reading only; NO row is written with
+   * `engine_average_down` until a phase-2 board card authorises a live add.
+   */
+  addOrigin?: 'engine_average_down' | 'desk_add';
+  /**
+   * TRA-3946 — the OTM selector's nomination tier for THIS row's opening
+   * decision (`AdmissibleSelection` in `otm-admissible-strike.ts`), stamped at
+   * the open so the average-down shadow can read the entry tier off the row.
+   * The live-enforce gate ledger carries the same value but is an aggregate
+   * with no per-OCC join. Absent ⇒ not band-admitted (RV / directional /
+   * imported rows, and rows opened before this stamp existed).
+   */
+  entryNominatorSelection?: 'in_band' | 'in_band_fair' | 'fallback_top_mispricing' | 'legacy' | 'abstain_no_in_band' | 'none';
+  /**
+   * TRA-3946 — per-row MAX ADVERSE EXCURSION against the ORIGINAL basis:
+   * running min of `mark / originalBasis − 1`, with the mark and instant of the
+   * min. In-memory twin of the durable journal `mae` line (the journal is the
+   * store of record; this rides the snapshot so a restart re-seeds the running
+   * min without re-reading the journal). `persistedFrac` is the last value
+   * written to the journal, so the append cadence is bounded.
+   */
+  averageDownMae?: {
+    frac: number;
+    mark: number;
+    at: number;
+    basisPremium: number;
+    basisSource: 'broker_entry_fill' | 'operator_pin' | 'premium_paid';
+    persistedFrac?: number;
+  };
+  /**
+   * TRA-3946 — which shadow verdicts this row has already been journalled
+   * under (one durable line per row per reason; `firstTraversalAt` is the
+   * first instant the mark sat inside the add band).
+   */
+  averageDownShadow?: {
+    reasons: string[];
+    firstTraversalAt?: number;
+  };
+  /**
    * TRA-3958 — an OPERATOR restated this adopted row's basis, and this pin is
    * what makes the correction SURVIVE.
    *

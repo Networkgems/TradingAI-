@@ -9125,6 +9125,11 @@ export class SignalEngine {
    * separate and unwidened because TRA-3829 depends on its nine-reason walk and
    * a 26-test suite pins `actionable`'s meaning.
    */
+  /** TRA-3946 — this book's since-boot average-down shadow liveness fold. */
+  getAverageDownShadowSinceBoot(): ReturnType<PaperOptionsAccount['averageDownShadowSinceBoot']> {
+    return this.optionsAccount.averageDownShadowSinceBoot();
+  }
+
   getLiveStopActionabilityRows(now?: number): LiveStopActionabilitySummary {
     return this.optionsAccount.liveStopActionabilitySummary({
       brokerMirroring:
@@ -12487,6 +12492,11 @@ export class SignalEngine {
             log.info('live OTM bounded test: paper open null', { sym, optionSymbol: cheap.optionSymbol });
             continue;
           }
+          // TRA-3946 — stamp the selector's nomination tier on the ROW. The gate
+          // ledger carries the same value but has no per-OCC join, and the
+          // average-down shadow's `confidence_low` test reads it off the row.
+          // Before the mirror, for the same reason as the ATR stamp below.
+          openedLive.entryNominatorSelection = nominator.selection;
           // TRA-3943 — stamp the 1×ATR(14, daily) spot invalidation level while
           // the entry anchor is fresh. Placed BEFORE the broker mirror so a row
           // that fills carries its level from its very first exit tick; a failed
@@ -12582,6 +12592,9 @@ export class SignalEngine {
           otmFloor.maxContractsPerEntry,
         );
         if (!opened) continue;
+        // TRA-3946 — the entry tier, on the paper row too (the mirror the
+        // average-down shadow's demo MAE is graded beside).
+        opened.entryNominatorSelection = nominator.selection;
         // TRA-3943 — same stamp on the paper book. Both books, deliberately: the
         // desk grades the live sleeve against paper, and a mirror whose rows
         // carry no invalidation level would report a stop the live book has.

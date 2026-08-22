@@ -120,8 +120,12 @@ import {
   // TRA-3930 — the ONE spelling of the book↔journal id join. The export used to
   // carry a second, wrong one.
   journalIdForPosition,
+  // TRA-3946 — the durable average-down shadow / MAE fold.
+  summarizeOptionJournalAverageDown,
+  getOptionTradeJournalIntegrity,
   type OptionTradeJournalRecord,
 } from './option-trade-journal.js';
+import { resolveAverageDownConfig, AVERAGE_DOWN_SHADOW_REASONS } from './option-average-down-shadow.js';
 // TRA-2819 — the money-side sibling of the repair below. That one decides
 // whether a stale OPEN row is a trade at all; this one takes rows that are
 // already correctly CLOSED and moves their P&L from the app's mid-basis,
@@ -335,7 +339,7 @@ import {
 } from './tra3939-order-provenance-capture.js';
 import { detectOversoldEngineCloses } from './tra3926-oversold-close-detector.js';
 // TRA-2820 — live-book "is it actually stopped?" counter for /api/health/options-live.
-import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability, mergeDayOneStopPosture, blindDayOneStopPosture } from './options-account.js';
+import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability, mergeDayOneStopPosture, blindDayOneStopPosture, type PaperOptionsAccount } from './options-account.js';
 import { resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule } from './exit-risk-rules-flag.js';
 // TRA-3941 — the frozen sleeve KEY the exit ruling is scoped to, so the wire
 // field names the same join column the journal tape and the gate ledger use.
@@ -10872,8 +10876,82 @@ app.get('/api/health/options-live', async (_req, res) => {
     // fail-soft inside `persistCensusDaySync` so a write error never breaks this route.
     const etDayNow = etDateString(new Date());
     persistCensusDaySync(etDayNow, DATA_DIR);
+    // TRA-3946 (TRA-3907 phase 1) — the average-down SHADOW readout. The
+    // durable half (n, by reason, MAE) is folded from the journal; the
+    // since-boot half is liveness only. ABSENT ≠ 0: an unreadable journal
+    // renders `shadow: null` / `mae: null`, never zeros (the discriminator
+    // counter can itself be unreadable).
+    const averageDown = await (async () => {
+      const cfg = resolveAverageDownConfig(process.env);
+      const flag = { flag: cfg.enabled ? ('on' as const) : ('off' as const), source: cfg.source, config: {
+        bandMinPct: cfg.bandMinPct, bandMaxPct: cfg.bandMaxPct, maxAddUsd: cfg.maxAddUsd, maxRowUsd: cfg.maxRowUsd, minDte: cfg.minDte,
+      } };
+      // ⛔ Phase 1: NO order path exists behind this flag. Stated on the wire so
+      // a reader of `flag: 'on'` cannot infer capital is at risk.
+      const phase = { phase: 1 as const, ordersPossible: false as const };
+      let sinceBoot: ReturnType<PaperOptionsAccount['averageDownShadowSinceBoot']>[] | null = null;
+      try {
+        sinceBoot = getAllUserContexts().map(c => c.engine.getAverageDownShadowSinceBoot());
+      } catch {
+        sinceBoot = null;
+      }
+      const sinceBootFold = sinceBoot === null ? null : sinceBoot.reduce(
+        (acc, f) => ({
+          evaluations: acc.evaluations + f.evaluations,
+          maeUpdates: acc.maeUpdates + f.maeUpdates,
+          maePersists: acc.maePersists + f.maePersists,
+          lastEvaluatedAt: Math.max(acc.lastEvaluatedAt ?? 0, f.lastEvaluatedAt ?? 0) || null,
+          byReason: Object.fromEntries(
+            AVERAGE_DOWN_SHADOW_REASONS.map(r => [r, (acc.byReason[r] ?? 0) + (f.byReason[r] ?? 0)]),
+          ) as Record<string, number>,
+        }),
+        {
+          evaluations: 0, maeUpdates: 0, maePersists: 0, lastEvaluatedAt: null as number | null,
+          byReason: Object.fromEntries(AVERAGE_DOWN_SHADOW_REASONS.map(r => [r, 0])) as Record<string, number>,
+        },
+      );
+      if (!isOptionTradeJournalEnabled()) {
+        return { ...flag, ...phase, shadow: null, mae: null, sinceBoot: sinceBootFold, blindReason: 'journal_disabled' as const };
+      }
+      try {
+        const rows = await listOptionTradeJournal();
+        const integrity = getOptionTradeJournalIntegrity();
+        if (integrity.readError !== null) {
+          return { ...flag, ...phase, shadow: null, mae: null, sinceBoot: sinceBootFold, blindReason: `journal_read_error: ${integrity.readError}` };
+        }
+        const live = summarizeOptionJournalAverageDown(rows.filter(r => r.mode === 'live'), AVERAGE_DOWN_SHADOW_REASONS);
+        const demo = summarizeOptionJournalAverageDown(rows.filter(r => r.mode !== 'live'), AVERAGE_DOWN_SHADOW_REASONS);
+        return {
+          ...flag,
+          ...phase,
+          shadow: {
+            rowsTraversed: live.rowsTraversed,
+            wouldAdd: live.wouldAdd,
+            blockedBy: live.blockedBy,
+            firstVerdict: live.firstVerdict,
+            // The phase-2 gate: n ≥ 20 live band traversals (TRA-3907 §5).
+            sampleFloor: 20,
+          },
+          mae: {
+            rowsWithMae: live.rowsWithMae + demo.rowsWithMae,
+            byMode: {
+              live: { rowsWithMae: live.rowsWithMae, rowsMaeAtOrBelow: live.rowsMaeAtOrBelow },
+              demo: { rowsWithMae: demo.rowsWithMae, rowsMaeAtOrBelow: demo.rowsMaeAtOrBelow },
+            },
+          },
+          sinceBoot: sinceBootFold,
+          blindReason: null,
+        };
+      } catch (err) {
+        return {
+          ...flag, ...phase, shadow: null, mae: null, sinceBoot: sinceBootFold,
+          blindReason: err instanceof Error ? err.message : String(err),
+        };
+      }
+    })();
     res.json({
       ok: true,
+      averageDown,
       issue: 'TRA-1581',
       time: new Date().toISOString(),
       build: resolveBuildInfo(),

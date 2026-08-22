@@ -461,7 +461,16 @@ const NO_RECORDED_CONTRACTS_ORACLE: RecordedEngineContractsOracle = () => null;
  * detector would report a permanent `excess` over a contract that now has a row
  * and a stop — turning the fix into a standing false alarm.
  */
-function isEngineManagedRow(opt: OptionPosition): boolean {
+/**
+ * TRA-3946 — a lot the ENGINE added under the average-down rule is engine
+ * inventory by construction, whatever a later re-adoption stamps on it. It is
+ * a second row on the same OCC, and this grader sums engine contracts per OCC,
+ * so the add is EXPECTED quantity — not a desk `excess`, which is the TRA-3895
+ * failure mode re-created by our own code (TRA-3907 §4c). Phase 1 writes no
+ * such row; the reading ships ahead of the row so phase 2 cannot forget it.
+ */
+export function isEngineManagedRow(opt: OptionPosition): boolean {
+  if (opt.addOrigin === 'engine_average_down') return true;
   if (!opt.importedFromTradier) return true;
   return opt.adoptionAuthority === 'engine_origin' || opt.adoptionAuthority === 'desk_add';
 }

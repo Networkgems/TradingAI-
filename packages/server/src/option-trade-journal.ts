@@ -503,6 +503,50 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
    * always right — which is the vacuous green this ticket exists to avoid.
    */
   realizedPnlUsdBeforeRestatement?: number;
+  /**
+   * TRA-3946 — the row's MAX ADVERSE EXCURSION against its ORIGINAL basis:
+   * running min of `mark / basis − 1`. The durable twin of
+   * `OptionPosition.averageDownMae`; folded as a MONOTONE MIN so a replay of
+   * lines in any order, or a restart that re-seeds from an older snapshot,
+   * can never raise it. This is the field TRA-3907 §5 needs before an
+   * average-down backtest is discriminable at all — the journal had no path.
+   */
+  mae?: OptionTradeJournalMae;
+  /**
+   * TRA-3946 — the average-down SHADOW verdicts this row has collected, one
+   * per distinct reason (see `option-average-down-shadow.ts`). The first entry
+   * dates the row's first band traversal — the sample unit for the phase-2
+   * n ≥ 20 read.
+   */
+  averageDownShadow?: OptionTradeJournalAverageDownShadow[];
+}
+
+/** TRA-3946 — see {@link OptionTradeJournalRecord.mae}. */
+export interface OptionTradeJournalMae {
+  /** `mark / basisPremium − 1` at the min. */
+  frac: number;
+  /** The mark at the min. */
+  mark: number;
+  /** ms epoch of the min. */
+  at: number;
+  /** The ORIGINAL basis the fraction was taken against. */
+  basisPremium: number;
+  basisSource: 'broker_entry_fill' | 'operator_pin' | 'premium_paid';
+}
+
+/** TRA-3946 — see {@link OptionTradeJournalRecord.averageDownShadow}. */
+export interface OptionTradeJournalAverageDownShadow {
+  ts: number;
+  /** One of `AVERAGE_DOWN_SHADOW_REASONS`. Typed loosely here so the journal has no dependency on the evaluator. */
+  reason: string;
+  mark: number;
+  basisPremium: number;
+  frac: number;
+  /** Entry nomination tier read off the row, or `null` when the row carried none. */
+  tier: string | null;
+  dte: number | null;
+  /** What the phase-2 add would have cost, when the verdict reached the cap test. */
+  addUsd: number | null;
 }
 
 /**
@@ -594,13 +638,22 @@ type AmendCloseBasisLine = {
   ts: number;
   basis: OptionTradeCloseBasis;
 };
+// TRA-3946 — supersede the row's running MAE. Appended while the row is OPEN,
+// on a bounded cadence (`AVERAGE_DOWN_MAE_PERSIST_STEP`); folded as a MIN so
+// order never matters. Dropped for an unknown id, like every amend.
+type MaeLine = { kind: 'mae'; id: string; mae: OptionTradeJournalMae };
+// TRA-3946 — one average-down shadow verdict. Deduped on (id, reason) at fold
+// time, so a replay of the same line twice is one verdict.
+type AverageDownShadowLine = { kind: 'average_down_shadow'; id: string; shadow: OptionTradeJournalAverageDownShadow };
 type JournalLine =
   | OpenLine
   | CloseLine
   | AmendEntrySlippageLine
   | PartialCloseLine
   | VoidLine
-  | AmendCloseBasisLine;
+  | AmendCloseBasisLine
+  | MaeLine
+  | AverageDownShadowLine;
 
 /**
  * TRA-3472 — a retraction that leaves no trace is ungradeable.
@@ -866,6 +919,29 @@ function foldLine(
     const p = line.partial;
     if (!Number.isFinite(p?.ts) || !Number.isFinite(p?.realizedPnlUsd)) return;
     map.set(line.id, { ...rec, partials: [...(rec.partials ?? []), p] });
+    return;
+  }
+  if (line.kind === 'mae') {
+    // TRA-3946 — monotone MIN. A later line with a HIGHER fraction (a replay
+    // out of order, a re-seeded snapshot) never raises the recorded excursion.
+    const rec = map.get(line.id);
+    if (!rec) return;
+    const m = line.mae;
+    if (!m || !Number.isFinite(m.frac) || !Number.isFinite(m.basisPremium) || !(m.basisPremium > 0)) return;
+    if (rec.mae && Number.isFinite(rec.mae.frac) && rec.mae.frac <= m.frac) return;
+    map.set(line.id, { ...rec, mae: { ...m } });
+    return;
+  }
+  if (line.kind === 'average_down_shadow') {
+    // TRA-3946 — one verdict per (row, reason). Order of first appearance is
+    // kept: index 0 dates the first band traversal.
+    const rec = map.get(line.id);
+    if (!rec) return;
+    const s = line.shadow;
+    if (!s || typeof s.reason !== 'string' || !Number.isFinite(s.ts)) return;
+    const prior = rec.averageDownShadow ?? [];
+    if (prior.some((p) => p.reason === s.reason)) return;
+    map.set(line.id, { ...rec, averageDownShadow: [...prior, { ...s }] });
     return;
   }
   if (line.kind === 'void') {
@@ -1352,6 +1428,111 @@ export async function recordOptionTradeCloseBasis(
     feesUsd: basis.feesUsd,
   });
   return true;
+}
+
+/**
+ * TRA-3946 — persist the row's running MAE. Refused (returns false) when the
+ * flag is off, the value is malformed, the row is unknown, or the row is no
+ * longer OPEN — an excursion after the close is not an excursion the rule could
+ * have acted on. A value that does not LOWER the recorded min is a silent
+ * no-op (no line appended) so the fold and the file agree.
+ */
+export async function recordOptionTradeMae(id: string, mae: OptionTradeJournalMae): Promise<boolean> {
+  if (!isOptionTradeJournalEnabled()) return false;
+  if (!mae || !Number.isFinite(mae.frac) || !Number.isFinite(mae.at) || !(mae.basisPremium > 0)) return false;
+  const map = await ensureLoaded();
+  const existing = map.get(id);
+  if (!existing || existing.outcome !== 'OPEN') return false;
+  if (existing.mae && Number.isFinite(existing.mae.frac) && existing.mae.frac <= mae.frac) return false;
+  const line: MaeLine = { kind: 'mae', id, mae };
+  foldLine(map, line);
+  await appendLine(line);
+  return true;
+}
+
+/**
+ * TRA-3946 — persist one average-down shadow verdict. One line per (row,
+ * reason): a second call with a reason the row already carries is a no-op.
+ * Same OPEN-only refusal as the MAE line.
+ */
+export async function recordOptionTradeAverageDownShadow(
+  id: string,
+  shadow: OptionTradeJournalAverageDownShadow,
+): Promise<boolean> {
+  if (!isOptionTradeJournalEnabled()) return false;
+  if (!shadow || typeof shadow.reason !== 'string' || !Number.isFinite(shadow.ts)) return false;
+  const map = await ensureLoaded();
+  const existing = map.get(id);
+  if (!existing || existing.outcome !== 'OPEN') return false;
+  if ((existing.averageDownShadow ?? []).some((p) => p.reason === shadow.reason)) return false;
+  const line: AverageDownShadowLine = { kind: 'average_down_shadow', id, shadow };
+  foldLine(map, line);
+  await appendLine(line);
+  log.info('option average-down shadow verdict (TRA-3946)', {
+    id,
+    symbol: existing.symbol,
+    optionSymbol: existing.optionSymbol,
+    mode: existing.mode,
+    reason: shadow.reason,
+    frac: shadow.frac,
+    tier: shadow.tier,
+    dte: shadow.dte,
+    addUsd: shadow.addUsd,
+  });
+  return true;
+}
+
+/**
+ * TRA-3946 — the durable average-down readout over a set of journal rows.
+ *
+ * Every count is a count of ROWS (the sample unit), never of evaluations:
+ * `rowsTraversed` is rows carrying at least one shadow verdict, `wouldAdd` and
+ * each `blockedBy.*` the rows carrying THAT verdict. A row can appear under
+ * more than one key (blocked by `window` at 13:40Z, `wouldAdd` at 14:10Z), so
+ * the keys do not sum to `rowsTraversed`; `firstVerdict` is the partition that
+ * does. `rowsWithMae` is rows with a persisted excursion. Pure.
+ */
+export interface OptionJournalAverageDownSummary {
+  rowsTraversed: number;
+  wouldAdd: number;
+  blockedBy: Record<string, number>;
+  /** Partition of `rowsTraversed` by the FIRST verdict each row received. */
+  firstVerdict: Record<string, number>;
+  rowsWithMae: number;
+  /** Rows whose MAE reached the band floor (≤ −bandMin) — the path fact, flag-independent. */
+  rowsMaeAtOrBelow: { pct10: number; pct18: number; pct20: number };
+}
+
+export function summarizeOptionJournalAverageDown(
+  rows: readonly OptionTradeJournalRecord[],
+  reasons: readonly string[],
+): OptionJournalAverageDownSummary {
+  const blockedBy: Record<string, number> = {};
+  const firstVerdict: Record<string, number> = {};
+  for (const r of reasons) { if (r !== 'wouldAdd') blockedBy[r] = 0; firstVerdict[r] = 0; }
+  let rowsTraversed = 0;
+  let wouldAdd = 0;
+  let rowsWithMae = 0;
+  const maeAt = { pct10: 0, pct18: 0, pct20: 0 };
+  for (const rec of rows) {
+    const shadow = rec.averageDownShadow ?? [];
+    if (shadow.length > 0) {
+      rowsTraversed += 1;
+      const first = shadow[0]!.reason;
+      firstVerdict[first] = (firstVerdict[first] ?? 0) + 1;
+      for (const s of shadow) {
+        if (s.reason === 'wouldAdd') wouldAdd += 1;
+        else blockedBy[s.reason] = (blockedBy[s.reason] ?? 0) + 1;
+      }
+    }
+    if (rec.mae && Number.isFinite(rec.mae.frac)) {
+      rowsWithMae += 1;
+      if (rec.mae.frac <= -0.10) maeAt.pct10 += 1;
+      if (rec.mae.frac <= -0.18) maeAt.pct18 += 1;
+      if (rec.mae.frac <= -0.20) maeAt.pct20 += 1;
+    }
+  }
+  return { rowsTraversed, wouldAdd, blockedBy, firstVerdict, rowsWithMae, rowsMaeAtOrBelow: maeAt };
 }
 
 /** Classify a signed R-multiple into a WIN/LOSS/SCRATCH verdict. */

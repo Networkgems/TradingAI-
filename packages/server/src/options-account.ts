@@ -157,10 +157,24 @@ import {
   // export reader that used to get it wrong.
   journalIdForPosition,
   outcomeForR,
+  // TRA-3946 — the durable MAE + average-down shadow lines.
+  recordOptionTradeMae,
+  recordOptionTradeAverageDownShadow,
   type JournalTrend,
   type OptionTradeJournalOpen,
   type SentimentIcBand,
 } from './option-trade-journal.js';
+// TRA-3946 — the observe-only average-down shadow (phase 1, zero capital).
+import {
+  resolveAverageDownConfig,
+  evaluateAverageDownShadow,
+  foldAverageDownMae,
+  AVERAGE_DOWN_SHADOW_REASONS,
+  type AverageDownConfig,
+  type AverageDownShadowReason,
+} from './option-average-down-shadow.js';
+import { resolveCanaryCeiling } from './canary-ceiling.js';
+import { resolveOptionOpeningRangeMin, resolveLiveOptionStopPolicy } from './exit-risk-rules-flag.js';
 // TRA-2333 — the arming scope stamped onto every journal open row.
 import { riskThrottleSizingScope, type RiskThrottleSizingPath } from './risk-throttle-sizing.js';
 
@@ -698,6 +712,19 @@ function resolveDailyCloseStopPhase(
     releaseAt = nextOpen == null ? null : nextOpen + windowStartMin * 60_000;
   }
   return { inSession, inCloseWindow, releaseAt };
+}
+
+/** TRA-3946 — per-pass inputs of the average-down shadow; see `resolveAverageDownPassContext`. */
+interface AverageDownPassContext {
+  now: number;
+  nowEtDay: string;
+  minutesSinceRthOpen: number | null;
+  openingRangeMin: number;
+  closeWindowMin: number;
+  ceiling: { perOrderUsd: number; aggregateUsd: number } | null;
+  config: AverageDownConfig;
+  /** Lazy, memoised per pass. `null` = the fold could not be read. */
+  bookAtRiskUsd: () => number | null;
 }
 
 /**
@@ -3874,6 +3901,26 @@ export class PaperOptionsAccount {
    */
   private journalWrites: Promise<unknown> = Promise.resolve();
 
+  /**
+   * TRA-3946 — SINCE-BOOT liveness of the average-down shadow. The durable
+   * per-row facts live in the journal (MAE + verdict lines); this fold exists
+   * only so a reader can tell "the evaluator ran this session" from "it never
+   * ran". It is reset by a restart BY DESIGN and must never be quoted as n.
+   */
+  private averageDownSinceBoot: {
+    evaluations: number;
+    maeUpdates: number;
+    maePersists: number;
+    lastEvaluatedAt: number | null;
+    byReason: Record<AverageDownShadowReason, number>;
+  } = {
+    evaluations: 0,
+    maeUpdates: 0,
+    maePersists: 0,
+    lastEvaluatedAt: null,
+    byReason: Object.fromEntries(AVERAGE_DOWN_SHADOW_REASONS.map((r) => [r, 0])) as Record<AverageDownShadowReason, number>,
+  };
+
 
   constructor(config: OptionsAccountConfig = {}) {
     this.initialEquity = config.initialEquity ?? DEFAULT_ACCOUNT_SETTINGS.demoEquity;
@@ -3957,6 +4004,149 @@ export class PaperOptionsAccount {
    */
   async flushOptionTradeJournal(): Promise<void> {
     await this.journalWrites;
+  }
+
+  /**
+   * TRA-3946 — the per-pass inputs of the average-down shadow. Separate from
+   * {@link observeAverageDown} so the env reads and the calendar math happen
+   * ONCE per `checkExits` pass rather than once per row.
+   */
+  private resolveAverageDownPassContext(
+    now: number,
+    openingRangeGuardMin: number,
+    closeWindowMinFromCaller: number | undefined,
+  ): AverageDownPassContext {
+    const config = resolveAverageDownConfig(process.env);
+    const openingRangeMin = Math.max(openingRangeGuardMin, resolveOptionOpeningRangeMin(process.env));
+    const closeWindowMin = closeWindowMinFromCaller ?? resolveLiveOptionStopPolicy(process.env).closeWindowMin;
+    const ceiling = resolveCanaryCeiling(process.env);
+    let bookAtRiskUsd: number | null | undefined;
+    return {
+      now,
+      nowEtDay: etDateKey(now),
+      minutesSinceRthOpen: minutesSinceRthOpen(now),
+      openingRangeMin,
+      closeWindowMin,
+      ceiling: ceiling ? { perOrderUsd: ceiling.perOrderUsd, aggregateUsd: ceiling.aggregateUsd } : null,
+      config,
+      bookAtRiskUsd: () => {
+        if (bookAtRiskUsd === undefined) {
+          try {
+            const fold = this.openPremiumAtRiskForMode('live');
+            bookAtRiskUsd = Number.isFinite(fold.usd) ? fold.usd : null;
+          } catch {
+            bookAtRiskUsd = null;
+          }
+        }
+        return bookAtRiskUsd;
+      },
+    };
+  }
+
+  /**
+   * TRA-3946 (TRA-3907 phase 1, board card `eefc204e`) — observe one row on one
+   * mark. ⛔ PLACES NO ORDER IN ANY STATE. Two effects only:
+   *
+   *   1. the row's running MAE against its ORIGINAL basis (every mode — the
+   *      demo book is the mirror the §5 backtest is graded against), persisted
+   *      to the durable journal on a bounded cadence;
+   *   2. on a LIVE single-leg row, the shadow verdict — journalled once per
+   *      (row, reason). Band test, `rule_off`, tier, day-1, window, DTE, caps.
+   *
+   * Skipped silently (no counter, no line) for combos, covered writes and rows
+   * with no basis — those are not the population the rule is about. A journal
+   * write failure is logged and swallowed, like every other journal emit here.
+   */
+  private observeAverageDown(opt: OptionPosition, mark: number, ctx: AverageDownPassContext): void {
+    if ((opt.legs && opt.legs.length > 0) || opt.coveredWrite) return;
+    const maeUpdate = foldAverageDownMae(opt, mark, ctx.now);
+    if (!maeUpdate) return;
+    const journalId = journalIdForPosition(opt);
+    const fold = this.averageDownSinceBoot;
+    if (!opt.averageDownMae || maeUpdate.next.frac !== opt.averageDownMae.frac) fold.maeUpdates += 1;
+    opt.averageDownMae = maeUpdate.next;
+    if (maeUpdate.persist) {
+      fold.maePersists += 1;
+      const mae = {
+        frac: maeUpdate.next.frac,
+        mark: maeUpdate.next.mark,
+        at: maeUpdate.next.at,
+        basisPremium: maeUpdate.next.basisPremium,
+        basisSource: maeUpdate.next.basisSource,
+      };
+      this.journalWrites = this.journalWrites
+        .then(() => recordOptionTradeMae(journalId, mae))
+        .catch((err) => {
+          accountLog.warn('option average-down MAE journal emit failed (TRA-3946)', {
+            id: journalId,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        });
+    }
+
+    if ((opt.mode ?? 'demo') !== 'live') return;
+    const verdict = evaluateAverageDownShadow(opt, {
+      mark,
+      now: ctx.now,
+      nowEtDay: ctx.nowEtDay,
+      openedEtDay: etDateKey(opt.openedAt),
+      minutesSinceRthOpen: ctx.minutesSinceRthOpen,
+      openingRangeMin: ctx.openingRangeMin,
+      closeWindowMin: ctx.closeWindowMin,
+      // Lazy: the fold walks the whole book, and only a row past the DTE test
+      // needs it.
+      bookAtRiskUsd: ctx.config.enabled ? ctx.bookAtRiskUsd() : null,
+      ceiling: ctx.ceiling,
+      config: ctx.config,
+    });
+    if (!verdict) return;
+    fold.evaluations += 1;
+    fold.lastEvaluatedAt = ctx.now;
+    if (verdict.reason === null) return;
+    fold.byReason[verdict.reason] += 1;
+
+    const shadow = opt.averageDownShadow ?? { reasons: [] };
+    if (verdict.inBand && shadow.firstTraversalAt === undefined) shadow.firstTraversalAt = ctx.now;
+    if (shadow.reasons.includes(verdict.reason)) {
+      opt.averageDownShadow = shadow;
+      return;
+    }
+    shadow.reasons = [...shadow.reasons, verdict.reason];
+    opt.averageDownShadow = shadow;
+    const line = {
+      ts: ctx.now,
+      reason: verdict.reason,
+      mark,
+      basisPremium: verdict.basis.premium,
+      frac: verdict.frac,
+      tier: opt.entryNominatorSelection ?? null,
+      dte: verdict.dte,
+      addUsd: verdict.addUsd,
+    };
+    this.journalWrites = this.journalWrites
+      .then(() => recordOptionTradeAverageDownShadow(journalId, line))
+      .catch((err) => {
+        accountLog.warn('option average-down shadow journal emit failed (TRA-3946)', {
+          id: journalId,
+          reason: verdict.reason,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+  }
+
+  /**
+   * TRA-3946 — the since-boot liveness fold of the shadow, for the health
+   * route. NOT the sample: n lives in the journal (`summarizeOptionJournalAverageDown`).
+   */
+  averageDownShadowSinceBoot(): {
+    evaluations: number;
+    maeUpdates: number;
+    maePersists: number;
+    lastEvaluatedAt: number | null;
+    byReason: Record<AverageDownShadowReason, number>;
+  } {
+    const f = this.averageDownSinceBoot;
+    return { ...f, byReason: { ...f.byReason } };
   }
 
   /**
@@ -7096,6 +7286,16 @@ export class PaperOptionsAccount {
       liveStopPolicy?.policy === 'daily_close'
         ? resolveDailyCloseStopPhase(Date.now(), liveStopPolicy.closeWindowMin)
         : null;
+    // TRA-3946 — the average-down SHADOW context, resolved once per pass. The
+    // window terms are the SAME resolvers the exit pass and the health route
+    // use, folded (max) with whatever the caller handed down, so the shadow
+    // cannot disagree with the stop about where the open/close windows are.
+    // The book-level at-risk fold is lazy: most passes never reach the cap test.
+    const averageDownCtx = this.resolveAverageDownPassContext(
+      Date.now(),
+      openingRangeGuardMin,
+      liveStopPolicy?.closeWindowMin,
+    );
     // TRA-949 — roll the ET-day before any auto-exit books realized P&L. The
     // opening baseline (openingOptionsPnlByMode) previously only advanced on an
     // ENTRY path; a day whose only options activity is a CLOSE (the demo
@@ -7267,6 +7467,11 @@ export class PaperOptionsAccount {
       opt.currentPremium = mark;
 
       if (mark > opt.peakPremium) opt.peakPremium = mark;
+
+      // TRA-3946 — the average-down SHADOW, on the same mark the stops read.
+      // Observe-only: writes the row's running MAE and a journal verdict, and
+      // NOTHING else — no order, no row, no field the stop engine consumes.
+      this.observeAverageDown(opt, mark, averageDownCtx);
 
       // TRA-3217 — the suppression predicates, computed ONCE per row and shared
       // between the trail-maintenance block below and the `continue` gates
@@ -10486,6 +10691,9 @@ export class PaperOptionsAccount {
    * the adoption pass and the drift detector rather than two that can drift.
    */
   private lotProvenanceOf(opt: OptionPosition): LotProvenance {
+    // TRA-3946 — an engine average-down lot is engine inventory regardless of
+    // what a later re-adoption stamped; same reading as `isEngineManagedRow`.
+    if (opt.addOrigin === 'engine_average_down') return 'engine';
     if (!opt.importedFromTradier) return 'engine';
     if (opt.adoptionAuthority === 'engine_origin') return 'engine';
     if (opt.adoptionAuthority === 'desk_add') return 'desk_add';
