@@ -8535,6 +8535,17 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
         // reader gating on `admissibleEntryUsd` is entitled to.
         operatorPinnedAtRiskUsd: 0,
         operatorPinnedOpenRows: 0,
+        // TRA-3965 — the UNBOOKED-ENTRY-PREMIUM overlay, added here for the same
+        // reason, and this row doubles as its flat-book control: the correction
+        // must be a strict no-op wherever no live fill of ours is stamped.
+        //
+        // ⚠ The suppressed column is the one that has to be here. `0` in
+        // `unbookedEntryPremiumUsd` is published by a book with nothing to
+        // correct AND by a book whose operator pin refused a correction, and
+        // only the second is a fact worth waking someone for.
+        unbookedEntryPremiumUsd: 0,
+        unbookedEntryPremiumRows: 0,
+        unbookedEntryPremiumSuppressedUsd: 0,
       });
 
       seedOpenLivePremium(engine, 700);
@@ -8913,12 +8924,40 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
        * not something this fix introduces — see `settledReference` below.)
        */
       const FILL_CASH_USD = 82;
-      /** What the engine books for that same fill — `premiumPaid 0.80 × 100`. */
-      const BOOK_AT_RISK_USD = 80;
-      /** `E_i` once the dust settles: $418 cash + $80 at risk. */
+      /**
+       * What the engine BOOKS as at-risk for that same fill.
+       *
+       * ⚠ TRA-3965 MOVED THIS, 80 → 82, and the move is the successor ticket's
+       * whole point. `premiumPaid` is still the scanner's mark ($0.80) — no stop
+       * on the row moved — but the fold now ADDS the premium the broker actually
+       * took and did not book (`brokerEntryFill 0.82`), so the figure the order
+       * path gates on is the $82 that left the account rather than the $80 our
+       * mid recorded. The two constants are equal from here on, and that
+       * equality IS the fix: at-risk can no longer read below the cash spent.
+       *
+       * ⛔ THIS DOES NOT WEAKEN THE GRADER BELOW. TRA-3964's discriminator is
+       * the CASH half: on `355ca553` the served row carried the pre-fill $500 of
+       * cash against an already-debited book, so `E_i` read $580 and `capUsd`
+       * $281.76 — still nowhere near the $242.90 both sides agree on now. What
+       * changed is which lot the reference book holds, not what is being
+       * compared.
+       */
+      const BOOK_AT_RISK_USD = FILL_CASH_USD;
+      /**
+       * `E_i` once the dust settles: $418 cash + $82 at risk.
+       *
+       * ⭐ It is $500 — the book's whole pre-trade capital — and post-TRA-3965
+       * that is the CORRECT reading, not a coincidence. `openPremiumAtRiskUsd`
+       * is an ENTRY-BASIS fold by construction (TRA-3445: the board bounded what
+       * may be SPENT), so a book that spent $82 on a lot holds $82 of basis and
+       * `E_i` does not move at all across the fill. It used to land on $498
+       * because the fold booked $80 for an $82 spend — i.e. the $2 shortfall
+       * showed up as capital that had evaporated, which is exactly the
+       * mis-statement TRA-3965 was filed on.
+       */
       const SETTLED_BASIS_USD = CASH_USD - FILL_CASH_USD + BOOK_AT_RISK_USD;
-      /** `φ · E` at `E = $498`, floored to the cent — the SETTLED cap. */
-      const SETTLED_CAP_USD = 241.92;
+      /** `φ · E` at `E = $500`, floored to the cent — the SETTLED cap. */
+      const SETTLED_CAP_USD = 242.90;
 
       /**
        * The reference: the same book AFTER the broker has debited the fill —
@@ -9115,6 +9154,146 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
         // pinned to equity this would not move — that is the permanent variant.
         setBalance(279.15, 311.15, 652.15);
         expect(engine.getLiveOtmAggregateExposure().brokerCashUsd).toBe(279.15);
+      });
+    });
+
+    // ── TRA-3965 ────────────────────────────────────────────────────────────
+    // The PREMIUM half of the same skew. TRA-3964 corrected the CASH half; this
+    // is the other operand, and it fails the same way in the same direction:
+    // `openPremiumAtRiskUsd` folds `premiumPaid`, an engine open books
+    // `premiumPaid = signal.mark` (the scanner's pre-trade mid), and the broker
+    // charges `avgFillPrice`. The stub's mid is $0.80 and its fill $0.82, so
+    // the fold spends $80 for a lot that cost $82 — an understatement, which
+    // OVERSTATES `admissibleEntryUsd` and understates `Σ atRisk_j` against `A`.
+    //
+    // ⚠ MEASURED FIRST, AND THE FILING'S PREMISE DID NOT SURVIVE IT.
+    // `restateEngineOpenedBasis` (TRA-2889/TRA-2873) DOES re-stamp an
+    // engine-opened live row to the broker's `cost_basis / quantity / 100` on
+    // the reconcile sweep, rescaling the stop schedule with it. Read off bqb1's
+    // durable log on 2026-08-22 (`GET /api/options/basis-restatements`):
+    //
+    //     SOFI260925C00019000  1.205 -> 1.23  broker_reconcile  fill +23.1 s
+    //     BAC260925C00063000   1.51  -> 1.65  broker_reconcile  fill +72.3 s
+    //
+    // …and the live gap across all three open lots was $0.00 at grading time.
+    // So this is a WINDOW (fill ack → next matching reconcile), not the
+    // permanent life-of-position defect the ticket describes — except on the
+    // rows where that sweep is skipped by design and never runs at all
+    // (`quantity_mismatch` — a desk add on the same OCC — plus `multi_leg`,
+    // `covered_write`, and every state where the broker read fails).
+    //
+    // ⭐ THE FIX IS A SEPARATE COLUMN, NEVER A WRITE TO `premiumPaid`. That
+    // field is READ by the stop engine and SPENT by the fold, and TRA-3958 is
+    // the measured proof that moving it moves both. So the realized fill is
+    // stamped as `brokerEntryFill` and the fold ADDS the shortfall.
+    describe('unbooked entry premium (TRA-3965)', () => {
+      /** `avgFillPrice 0.82 × 1 × 100` — the cash the broker actually took. */
+      const FILL_CASH_USD = 82;
+      /** `premiumPaid 0.80 × 1 × 100` — what the row books at open. */
+      const MARK_AT_RISK_USD = 80;
+
+      /** The `liveStub`, with the broker filling at `price` instead of the ask. */
+      function stubFilledAt(price: number) {
+        const stub = liveStub();
+        stub.waitForOrderTerminalStatus = vi.fn(async () => ({
+          id: 42, status: 'filled', avg_fill_price: price,
+        })) as unknown as typeof stub.waitForOrderTerminalStatus;
+        return stub;
+      }
+
+      const openRowOf = (engine: SignalEngine) =>
+        engine.getState().options.openOptions.find((o) => o.optionSymbol !== 'MSFT240705C00420000')!;
+
+      it('AC2 — a fill ABOVE the mark must not publish an at-risk BELOW the cash the broker took', async () => {
+        const stub = liveStub();
+        const engine = bookWithCash(stub, 500);
+        await runOtm(engine, ['AAPL']);
+
+        // The fill is real, and it is the skewed one: booked $80, charged $82.
+        expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+        const row = openRowOf(engine);
+        expect(row.premiumPaid).toBe(0.80);
+        expect(row.brokerEntryFill).toMatchObject({ premiumPaid: 0.82, contracts: 1 });
+
+        // ⭐ THE GRADER. RED on `8c96ed6d`, which publishes exactly $80.00 here
+        // — a lot the broker was paid $82.00 for. Written as an inequality
+        // against the broker's own figure so it states the PROPERTY, not this
+        // implementation's arithmetic.
+        const served = engine.getLiveOtmAggregateExposure();
+        expect(served.openPremiumAtRiskUsd).toBeGreaterThanOrEqual(FILL_CASH_USD);
+        // Pinned too: `≥` alone would pass a build that inflated at-risk
+        // wholesale, which tightens the book for a reason nobody asked for.
+        expect(served.openPremiumAtRiskUsd).toBe(FILL_CASH_USD);
+
+        // The correction is READABLE, not folded away — same discipline as
+        // `unpricedOpenRows` and `operatorPinnedAtRiskUsd`.
+        expect(served.unbookedEntryPremiumUsd).toBe(FILL_CASH_USD - MARK_AT_RISK_USD);
+        expect(served.unbookedEntryPremiumRows).toBe(1);
+        expect(served.unbookedEntryPremiumSuppressedUsd).toBe(0);
+
+        // ⛔ AC3 (stop half) — the stop engine's inputs are BYTE-IDENTICAL to
+        // the pre-fix build. `premiumPaid` still holds the mark, and every level
+        // is still the mark's multiple: an at-risk correction that moved a stop
+        // on a real-money row is the TRA-3958 defect, and it is what the
+        // separate column exists to make impossible.
+        expect(row.premiumPaid).toBe(0.80);
+        expect(row.stopLossPremium).toBe(0.80 * 0.8);
+        expect(row.tp1Premium).toBe(0.80 * 1.5);
+      });
+
+      it('AC4 (negative control) — the SAME grader is GREEN on a lot filled AT the mark', async () => {
+        // Price improvement to the mid: the broker took exactly what the row
+        // books. The correction must be $0 — a build that added unconditionally
+        // would tighten every book on the fleet, and this grader would be
+        // simply always-red rather than a discriminator.
+        const stub = stubFilledAt(0.80);
+        const engine = bookWithCash(stub, 500);
+        await runOtm(engine, ['AAPL']);
+
+        expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+        expect(openRowOf(engine).brokerEntryFill).toMatchObject({ premiumPaid: 0.80 });
+
+        const served = engine.getLiveOtmAggregateExposure();
+        expect(served.openPremiumAtRiskUsd).toBeGreaterThanOrEqual(MARK_AT_RISK_USD);
+        expect(served.openPremiumAtRiskUsd).toBe(MARK_AT_RISK_USD);
+        expect(served.unbookedEntryPremiumUsd).toBe(0);
+        expect(served.unbookedEntryPremiumRows).toBe(0);
+      });
+
+      it('AC4 (second control) — a fill BELOW the mark does NOT lower at-risk', async () => {
+        // ⛔ THE TIGHTENING CLAMP. Booking a better-than-mark fill here would
+        // LOWER `atRisk` and buy entry admission — a fresh fail-open shipped
+        // inside the fix for the old one. Correcting the basis downward is the
+        // reconcile's job (it carries the stops across when it does); this
+        // column may only ever ADD.
+        const engine = bookWithCash(stubFilledAt(0.70), 500);
+        await runOtm(engine, ['AAPL']);
+
+        const served = engine.getLiveOtmAggregateExposure();
+        expect(openRowOf(engine).brokerEntryFill).toMatchObject({ premiumPaid: 0.70 });
+        expect(served.openPremiumAtRiskUsd).toBe(MARK_AT_RISK_USD);
+        expect(served.unbookedEntryPremiumUsd).toBe(0);
+      });
+
+      it('the correction CLEARS once the reconcile re-stamps the basis — the two fixes compose', async () => {
+        const engine = bookWithCash(liveStub(), 500);
+        await runOtm(engine, ['AAPL']);
+        expect(engine.getLiveOtmAggregateExposure().unbookedEntryPremiumUsd).toBe(2);
+
+        // What `restateEngineOpenedBasis` does 23 s later on the live host:
+        // move `premiumPaid` to broker truth and rescale the schedule.
+        const row = openRowOf(engine);
+        row.premiumPaid = 0.82;
+        row.stopLossPremium = 0.82 * 0.8;
+        row.tp1Premium = 0.82 * 1.5;
+
+        // The uplift is now $0 — the row books what the broker charged — and
+        // `openPremiumAtRiskUsd` is UNCHANGED at $82. Both paths land on the
+        // same number, which is why they can ship together without one
+        // double-counting the other.
+        const served = engine.getLiveOtmAggregateExposure();
+        expect(served.unbookedEntryPremiumUsd).toBe(0);
+        expect(served.openPremiumAtRiskUsd).toBe(FILL_CASH_USD);
       });
     });
   });

@@ -9393,6 +9393,32 @@ export class SignalEngine {
     operatorPinnedAtRiskUsd: number;
     /** TRA-3958 — rows carrying the above. $117 on one row and $39 on three are different facts. */
     operatorPinnedOpenRows: number;
+    /**
+     * TRA-3965 — of `openPremiumAtRiskUsd`, the dollars added because the BROKER
+     * charged more for this engine's own entry than the row's basis books.
+     *
+     * An engine open books `premiumPaid = signal.mark`; `restateEngineOpenedBasis`
+     * moves it to broker truth on a later reconcile — measured live at 23.1 s
+     * (SOFI) and 72.3 s (BAC) — and never at all on a `quantity_mismatch` /
+     * `multi_leg` / `covered_write` row. Until it lands, the fold spent the mid
+     * for a lot the broker was already paid the fill for.
+     *
+     * ⚠ INSIDE `openPremiumAtRiskUsd`, like `operatorPinnedAtRiskUsd` and for the
+     * same reason: a correction that moves what the order path may spend and
+     * leaves no reading behind is indistinguishable from no correction at all.
+     * Zero is the healthy steady state. A figure that STAYS non-zero names a row
+     * the reconcile is refusing to re-stamp — cross-read the skip census on
+     * `GET /api/options/basis-restatements`.
+     */
+    unbookedEntryPremiumUsd: number;
+    /** TRA-3965 — rows carrying the above. */
+    unbookedEntryPremiumRows: number;
+    /**
+     * TRA-3965 — dollars a LIVE operator pin (TRA-3958) held OFF the correction.
+     * A refusal must never share a column with a finding: "nothing to add" and
+     * "something to add, and the pin outranked it" both publish `0` above.
+     */
+    unbookedEntryPremiumSuppressedUsd: number;
     headroomUsd: number | null;
     /** TRA-3897 (AC2) — unclamped `capUsd − openPremiumAtRiskUsd`; negative ⇒ over cap. */
     headroomSignedUsd: number | null;
@@ -9508,6 +9534,12 @@ export class SignalEngine {
       // on `openPremiumAtRiskUsd`, not another partition of it.
       operatorPinnedAtRiskUsd: atRisk.operatorPinnedUsd,
       operatorPinnedOpenRows: atRisk.operatorPinnedRows,
+      // TRA-3965 — the premium half of TRA-3964's skew, on the wire. The cash
+      // half self-healed in 120s; this one heals only when the broker reconcile
+      // re-stamps the row, and on a `quantity_mismatch` row it never does.
+      unbookedEntryPremiumUsd: atRisk.unbookedEntryPremiumUsd,
+      unbookedEntryPremiumRows: atRisk.unbookedEntryPremiumRows,
+      unbookedEntryPremiumSuppressedUsd: atRisk.unbookedEntryPremiumSuppressedUsd,
       headroomUsd: liveOptionTestAggregateHeadroomUsd(atRisk.usd, capUsd),
       // TRA-3897 (AC2) — the SIGNED headroom. `headroomUsd` floors at 0, so a
       // book over its own cap published byte-identically to one exactly at it:
@@ -11039,6 +11071,36 @@ export class SignalEngine {
         // actually took — not the row's `premiumPaid`, which is our side of it.
         if (Number.isFinite(outcome.avgFillPrice) && opened.contracts > 0) {
           this.recordUnsettledLivePremium(outcome.avgFillPrice * opened.contracts * 100);
+          // ⭐ TRA-3965 — THE SAME FIGURE, KEPT ON THE ROW.
+          //
+          // `avgFillPrice` reaches four telemetry sinks from this branch
+          // (`recordLiveOptionFill`, the maker-fill census,
+          // `recordOptionTradeEntrySlippage`, and TRA-3964's unsettled-cash
+          // correction above) and, until this line, none of the places that gate
+          // money. The row still books `premiumPaid = signal.mark`, so
+          // `foldOpenPremiumAtRisk` spends the scanner's mid for a lot the broker
+          // has already charged the fill for — understating `atRisk`, which
+          // OVERSTATES `admissibleEntryUsd` and understates `Σ atRisk_j` against
+          // the board's `A`. Both in the admitting direction.
+          //
+          // ⛔ STAMPED IN ITS OWN COLUMN, NOT ONTO `premiumPaid`. Writing the
+          // basis here would silently re-derive every stop on the row off a
+          // field the stop engine owns — TRA-3958's defect, at the open site
+          // instead of the reconcile's. `restateEngineOpenedBasis` is the one
+          // thing allowed to move `premiumPaid`, and it carries the schedule
+          // across when it does.
+          //
+          // Not conditional on `opts?.sleeve` (unlike the fee ledger below): a
+          // caller that passes no sleeve still spent real money, and a risk
+          // figure must not be scoped to a telemetry tag.
+          opened.brokerEntryFill = {
+            premiumPaid: outcome.avgFillPrice,
+            contracts: opened.contracts,
+            at: Date.now(),
+            ...(typeof outcome.orderId === 'number' && Number.isFinite(outcome.orderId)
+              ? { orderId: outcome.orderId }
+              : {}),
+          };
         }
         // TRA-3905 — the fill side. Also clears the permission run: a fill is
         // positive proof this account may trade options, so a later reject

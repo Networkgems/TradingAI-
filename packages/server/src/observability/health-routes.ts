@@ -563,6 +563,39 @@ export interface LiveOtmAggregateExposure {
   /** TRA-3958 — rows carrying the above. */
   operatorPinnedOpenRows?: number;
   /**
+   * TRA-3965 — of `openPremiumAtRiskUsd`, the dollars added because the BROKER
+   * charged more for this engine's own entry than the row's basis books.
+   *
+   * The premium half of TRA-3964's skew. `premiumPaid` on an engine-opened row
+   * is the scanner's pre-trade mid until `restateEngineOpenedBasis` moves it to
+   * broker truth on a later reconcile (measured live at 23.1 s and 72.3 s), and
+   * on a `quantity_mismatch` / `multi_leg` / `covered_write` row that sweep is
+   * skipped by design and the window never closes.
+   *
+   * ⚠ AN OVERLAY, NOT A PARTITION — inside `openPremiumAtRiskUsd`. Zero is the
+   * healthy steady state (re-stamp landed, or the fill was at the mark). A
+   * figure that STAYS non-zero names a row the reconcile is refusing to
+   * re-stamp; cross-read the skip census on `/api/options/basis-restatements`.
+   *
+   * OPTIONAL on the contract: absence is the deployed-bytes signal — a build
+   * without TRA-3965 omits the key entirely, which a grader must not read as
+   * `0`. (TRA-3964 drew the same line for `unsettledLivePremiumUsd`.)
+   */
+  unbookedEntryPremiumUsd?: number;
+  /** TRA-3965 — rows carrying the above. */
+  unbookedEntryPremiumRows?: number;
+  /**
+   * TRA-3965 — dollars a LIVE operator pin (TRA-3958) held OFF the correction,
+   * because a pin is a standing instruction about the basis and outranks it.
+   *
+   * Published because a refusal must never share a column with a finding:
+   * "nothing to add" and "something to add, and the pin refused it" are the
+   * identical `unbookedEntryPremiumUsd: 0`, and only one is a fact about the
+   * book. The live BAC row is pinned at 1.17 and carries a 1.65 engine fill, so
+   * this is the state, not a hypothetical.
+   */
+  unbookedEntryPremiumSuppressedUsd?: number;
+  /**
    * `capUsd − openPremiumAtRiskUsd`, floored at 0; `null` when unreadable.
    *
    * ⚠ THE FLOOR IS LOSSY. A book over its cap publishes `0` here, which is

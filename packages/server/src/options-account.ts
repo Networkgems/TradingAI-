@@ -3052,6 +3052,93 @@ export interface OpenPremiumAtRisk {
    * alone cannot tell them apart.
    */
   operatorPinnedRows: number;
+  /**
+   * TRA-3965 — of {@link usd}, the dollars added because the BROKER charged
+   * more for this engine's own entry than the row's basis books.
+   *
+   * `premiumPaid` on an engine-opened row is the scanner's pre-trade NBBO mid
+   * until `restateEngineOpenedBasis` moves it to broker truth on a later
+   * reconcile. Between the fill and that sweep — 23.1 s on the live
+   * `SOFI260925C00019000` row, 72.3 s on `BAC260925C00063000`, both read off
+   * the durable restatement log on 2026-08-22 — this fold spent the mid for a
+   * lot the broker had already been paid the fill for, and the error is in the
+   * ADMITTING direction. The sweep also never runs on `quantity_mismatch` /
+   * `multi_leg` / `covered_write` rows, where the window never closes at all.
+   *
+   * ⚠️ PUBLISHED, not merely applied. This fold has now been bitten twice by an
+   * understatement with no column: `unpricedRows` exists because an UNPRICED
+   * row silently understated `usd`, and TRA-3958's `operatorPinnedUsd` exists
+   * because a pin moved an authorization with nothing on the route saying so. A
+   * correction that changes what the order path may spend and leaves no reading
+   * behind is the same defect a third time.
+   *
+   * Zero is the healthy steady state (the re-stamp landed, or the fill was at
+   * the mark). A number that STAYS non-zero is a row the reconcile is refusing
+   * to re-stamp — read the skip census on `/api/options/basis-restatements`.
+   */
+  unbookedEntryPremiumUsd: number;
+  /** TRA-3965 — rows contributing to {@link unbookedEntryPremiumUsd}. */
+  unbookedEntryPremiumRows: number;
+  /**
+   * TRA-3965 — dollars a LIVE operator pin held OFF {@link unbookedEntryPremiumUsd}.
+   *
+   * An operator pin is a standing instruction about the basis (TRA-3958), so it
+   * outranks this correction and the uplift is suppressed on a pinned row. But
+   * "there was nothing to add" and "there was something to add and the pin
+   * refused it" produce the identical `unbookedEntryPremiumUsd: 0`, and only
+   * one of them is a fact about the book. Same discipline as
+   * {@link attributionBlindRows}: a refusal never shares a column with a
+   * finding.
+   */
+  unbookedEntryPremiumSuppressedUsd: number;
+}
+
+/**
+ * TRA-3965 — the dollars the broker took for THIS ENGINE's own entry that the
+ * row's basis has not (yet) booked.
+ *
+ * Exported for the same reason {@link isOperatorBasisPinLive} is: the fold and
+ * its tests must agree to the bit on what the correction is, and a second
+ * implementation would drift.
+ *
+ * ⭐ TIGHTENING-ONLY, BY CONSTRUCTION — three separate clamps, each load-bearing:
+ *
+ *   1. `Math.max(0, …)` on the per-contract delta. A fill BELOW the mark is
+ *      real (the walk starts at the mid and a marketable limit can improve),
+ *      and booking it would LOWER `atRisk` and buy entry admission — a new
+ *      fail-open shipped inside the fix for the old one. The truthful figure
+ *      there is the reconcile's job, which restates the whole basis and carries
+ *      the stops with it; this column may only ever add.
+ *   2. `min(remaining, stamp.contracts)`. The reconcile can widen a row onto
+ *      the broker's whole lot, so `remaining` may count contracts the DESK
+ *      bought. Our fill's own quantity is the only number that bounds the
+ *      correction to premium we actually paid — pricing the desk's contracts at
+ *      our slippage would be TRA-3913's defect wearing this ticket's clothes.
+ *   3. A live operator pin suppresses it entirely (caller's job — see
+ *      {@link foldOpenPremiumAtRisk}), because a pin is a standing instruction
+ *      about the basis and this is not.
+ *
+ * Returns 0 for every row without a stamp, which is every row this engine did
+ * not open live — demo rows, imported rows, and everything opened before this
+ * shipped. That is the correct answer, not a gap: the fold's pre-TRA-3965
+ * behaviour is what those rows get.
+ */
+export function unbookedEntryPremiumForRow(
+  row: Pick<OptionPosition, 'premiumPaid' | 'brokerEntryFill'>,
+  remainingContracts: number,
+): number {
+  const stamp = row.brokerEntryFill;
+  if (!stamp) return 0;
+  // `!(x > 0)` rather than `x <= 0` throughout: the latter admits NaN into the
+  // arithmetic, and a NaN uplift reads as a number until something compares it
+  // (TRA-3486). A NaN here would poison `usd` for the WHOLE book, not one row.
+  if (!Number.isFinite(stamp.premiumPaid) || !(stamp.premiumPaid > 0)) return 0;
+  if (!Number.isFinite(stamp.contracts) || !(stamp.contracts > 0)) return 0;
+  if (!Number.isFinite(row.premiumPaid) || !(row.premiumPaid > 0)) return 0;
+  if (!Number.isFinite(remainingContracts) || !(remainingContracts > 0)) return 0;
+  const perContract = Math.max(0, stamp.premiumPaid - row.premiumPaid);
+  if (perContract === 0) return 0;
+  return perContract * Math.min(remainingContracts, stamp.contracts) * 100;
 }
 
 /**
@@ -3119,6 +3206,9 @@ export function foldOpenPremiumAtRisk(
   let attributionBlindRows = 0;
   let operatorPinnedUsd = 0;
   let operatorPinnedRows = 0;
+  let unbookedEntryPremiumUsd = 0;
+  let unbookedEntryPremiumRows = 0;
+  let unbookedEntryPremiumSuppressedUsd = 0;
   for (const p of positions) {
     const remaining = p.contractsRemaining ?? p.contracts;
     if (
@@ -3140,6 +3230,34 @@ export function foldOpenPremiumAtRisk(
     if (isOperatorBasisPinLive(p)) {
       operatorPinnedUsd += rowUsd;
       operatorPinnedRows += 1;
+    }
+    // TRA-3965 — add back the premium the BROKER took for our own entry that
+    // `premiumPaid` has not booked yet. See {@link unbookedEntryPremiumForRow}
+    // for the three clamps that make this tightening-only.
+    //
+    // ⛔ ADDED TO `usd`, AND CARVED FROM NOTHING. The adopted split below is
+    // taken against `rowUsd` — the row's own basis — deliberately: pricing the
+    // desk's share off a total inflated by OUR slippage would attribute our
+    // fill's cost to the desk and shrink `usd - adoptedUsd`, the engine-
+    // attributable figure the board's authorization is measured against. The
+    // uplift is ours by construction (clamp 2), so it belongs outside the carve
+    // and `usd - adoptedUsd` stays honest with it in.
+    //
+    // ⛔ AN OPERATOR PIN OUTRANKS IT. A pin is a standing instruction about the
+    // basis, installed with a citation because no machine oracle could answer
+    // (TRA-3958); this correction is a machine oracle asserting itself. Adding
+    // to a pinned row would re-open, from a second direction, exactly the
+    // authorization the operator's write already settled — the live BAC row is
+    // pinned at 1.17 and carries a 1.65 engine fill, so this is not theoretical.
+    const unbooked = unbookedEntryPremiumForRow(p, remaining);
+    if (unbooked > 0) {
+      if (isOperatorBasisPinLive(p)) {
+        unbookedEntryPremiumSuppressedUsd += unbooked;
+      } else {
+        usd += unbooked;
+        unbookedEntryPremiumUsd += unbooked;
+        unbookedEntryPremiumRows += 1;
+      }
     }
     // TRA-3913 — attribute the row PER CONTRACT against this engine's own fill
     // records, not per row against the action arm.
@@ -3193,6 +3311,10 @@ export function foldOpenPremiumAtRisk(
     attributionBlindRows,
     operatorPinnedUsd: Math.round(operatorPinnedUsd * 100) / 100,
     operatorPinnedRows,
+    unbookedEntryPremiumUsd: Math.round(unbookedEntryPremiumUsd * 100) / 100,
+    unbookedEntryPremiumRows,
+    unbookedEntryPremiumSuppressedUsd:
+      Math.round(unbookedEntryPremiumSuppressedUsd * 100) / 100,
   };
 }
 

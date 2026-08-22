@@ -3075,6 +3075,60 @@ export interface OptionPosition {
     provenance: string;
   };
   /**
+   * TRA-3965 — what the BROKER charged for this row's entry, stamped once from
+   * `outcome.avgFillPrice` at the fill ack. **A RISK FIGURE, NOT A BASIS.**
+   *
+   * ⛔ THIS IS NOT `premiumPaid` AND MUST NEVER BE READ AS THE ROW'S BASIS.
+   * `premiumPaid` has two consumers with opposite correctness conditions — the
+   * stop engine READS it (`stopLossPremium` / `tp1Premium` / the trailing
+   * activation are all `premiumPaid × k`) and `foldOpenPremiumAtRisk` SPENDS it
+   * against the board's live-entry authorization. TRA-3958 is the measured
+   * proof that moving the one field moves both: restating the live BAC row
+   * 1.41 → 1.17 fixed a stop AND moved `admin`'s `admissibleEntryUsd` by $24,
+   * which nobody ordered. So the realized fill lands in its own column and the
+   * stop engine never learns it exists.
+   *
+   * ── Why it is needed at all, given TRA-2889's re-stamp ────────────────────
+   * An engine open books `premiumPaid = signal.mark` (the scanner's pre-trade
+   * NBBO mid) and `restateEngineOpenedBasis` moves it to the broker's
+   * `cost_basis / quantity / 100` on the next matching reconcile. That works —
+   * measured live on 2026-08-22 from the durable log: `SOFI260925C00019000`
+   * 1.205 → 1.23, stops rescaled, **23.1 s after the fill**; `BAC` 1.51 → 1.65
+   * at **72.3 s**. But it is a WINDOW, and the scanner ticks inside it: for
+   * those seconds the fold spends the mark while the broker has already taken
+   * the fill, understating `atRisk` in the ADMITTING direction.
+   *
+   * And the window does not always close. The re-stamp is skipped, by design
+   * and permanently, on `quantity_mismatch` (a desk add on the same OCC — the
+   * BAC 2026-08-20 state), `multi_leg`, `covered_write`, and whenever the
+   * broker sweep cannot run at all (`fetch_failed` / `no_client`). In those
+   * states the row keeps the scanner's mark for the life of the position.
+   *
+   * The stamp is taken at the one place that holds the broker's price with no
+   * dependency on a later sweep, a ledger retention window, or an importer that
+   * writes the desk's fills into our tape (TRA-3913). It rides
+   * `exportSnapshot`/`importSnapshot` with the row — `openOptions` is
+   * serialized structurally — so it survives the restarts bqb1 takes several
+   * times a day, which a since-boot counter would not.
+   *
+   * ⚠️ Consumed ONLY as a tightening: {@link foldOpenPremiumAtRisk} adds
+   * `max(0, brokerEntryFill.premiumPaid − premiumPaid)` over
+   * `min(contractsRemaining, brokerEntryFill.contracts)` contracts. It can
+   * never lower the fold, so no cap gets looser than the pre-TRA-3965 build on
+   * any input, and once the re-stamp lands the two agree and the uplift is 0 —
+   * the two fixes compose instead of fighting.
+   */
+  brokerEntryFill?: {
+    /** `avgFillPrice` — the per-contract price the broker actually charged. */
+    premiumPaid: number;
+    /** Contracts THIS engine's own order filled. Bounds the uplift. */
+    contracts: number;
+    /** Fill-ack wall clock, ms epoch. */
+    at: number;
+    /** Broker order id, when the walk returned one. The handle back to the tape. */
+    orderId?: number;
+  };
+  /**
    * TRA-348 — Tradier order id for an in-flight `sell_to_close` against an
    * imported position. Set when the close order was accepted but did not
    * reach a terminal `filled` state inside the wait window (after-hours,
