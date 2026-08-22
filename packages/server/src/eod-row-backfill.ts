@@ -7,6 +7,7 @@ import {
 } from './pnl-tracker.js';
 import type { EodTailCalendar, JournalDayCloses } from './pnl-reconciliation.js';
 import { staleTailSessions } from './pnl-reconciliation.js';
+import { resolveOpenOptionMarkDelta } from './tradier-eod-option-mark.js';
 
 // TRA-2829 (parent TRA-2827, CFO ruling 2026-08-04) — reconstruct the EOD ledger
 // rows for sessions the 21:00 ET archive never wrote.
@@ -77,6 +78,14 @@ export const STOCK_LEG_BASIS_NOT_MEASURED = 'zero-probe-not-measured';
  * sets for building Tradier stock reconstruction.
  */
 export const STOCK_LEG_BASIS_PROBE_DISAGREES = 'zero-probe-disagrees';
+
+/**
+ * TRA-3954 — `stockLegProbeMarkBasis` vocabulary. Which FORM of the probe the
+ * writer stamped. Diagnosis only: the reader keys its verdict on the probe
+ * number, never on these strings.
+ */
+export const STOCK_LEG_PROBE_MARK_DIFFERENCED = 'mark-differenced';
+export const STOCK_LEG_PROBE_MARK_NOT_MEASURED = 'mark-not-measured';
 
 // TRA-3948 — the probe tolerance moved to `pnl-tracker.ts` alongside the basis
 // vocabulary, so `pnl-reconciliation.ts` can grade a row against the SAME
@@ -418,12 +427,20 @@ export function shapeLiveRecordedRow(args: {
     netCashFlow: number;
     combinedPnl: number;
   } | null;
+  /**
+   * TRA-3954 — EOD unrealized P&L on open option positions per session
+   * (`tradier-eod-option-mark.<env>.json`, collapsed to `unrealizedUsd`).
+   * Optional so the demo/back-fill callers and every pre-existing fixture keep
+   * compiling; absent = the mark operand is NOT MEASURED on this row.
+   */
+  optionMarkUsdByDate?: Record<string, number> | null;
 }): Pick<
   DailySnapshot,
   'openingEquity' | 'openingEquityBasis' | 'closingEquity' | 'closingEquityBasis'
   | 'dailyPnl' | 'combinedPnl' | 'stockLegBasis' | 'stockLegProbeUsd' | 'netCashFlowUsd'
+  | 'openOptionMarkUsd' | 'openOptionMarkDeltaUsd' | 'stockLegProbeMarkBasis'
 > {
-  const { date, optionsDailyPnl, balanceByDate, override } = args;
+  const { date, optionsDailyPnl, balanceByDate, override, optionMarkUsdByDate } = args;
   const round2 = (n: number): number => Math.round(n * 100) / 100;
   const rawClose = balanceByDate[date];
   const closingEquity =
@@ -448,9 +465,25 @@ export function shapeLiveRecordedRow(args: {
   // The probe needs all three operands MEASURED — equity endpoints AND flow. A
   // probe computed with an assumed-zero flow would book a deposit as apparent
   // stock activity, the exact confusion `netCashFlowUsd` exists to prevent.
+  //
+  // TRA-3954 — the FOURTH operand. `closingEquity` is the broker's
+  // mark-to-market and carries the unrealized P&L of whatever is open at the
+  // close; every other operand is realized. Without this term the probe is the
+  // MTM-vs-realized gap and reads RED on every overnight-option session (admin
+  // 08-17: −197.36, reconciled to the cent against Tradier in TRA-3951). The
+  // mark is differenced over the SAME span as the equity delta, and when either
+  // endpoint is uncaptured the probe falls back to the three-operand form and
+  // STAMPS that it did (`stockLegProbeMarkBasis`), rather than assuming 0 —
+  // which is the "nothing was open" reading, and the one a missing capture
+  // must never impersonate.
+  const { markUsd: openOptionMarkUsd, deltaUsd: openOptionMarkDeltaUsd } =
+    resolveOpenOptionMarkDelta(optionMarkUsdByDate, date, prev === null ? null : prev.date);
   const stockLegProbeUsd =
     closingEquity !== null && openingEquity !== null && netCashFlowUsd !== null
-      ? round2(closingEquity - openingEquity - optionsDailyPnl - netCashFlowUsd)
+      ? round2(
+        closingEquity - openingEquity - optionsDailyPnl - netCashFlowUsd
+        - (openOptionMarkDeltaUsd ?? 0),
+      )
       : null;
   const probeDisagrees =
     stockLegProbeUsd !== null && Math.abs(stockLegProbeUsd) > STOCK_LEG_PROBE_TOLERANCE_USD;
@@ -470,6 +503,12 @@ export function shapeLiveRecordedRow(args: {
         : STOCK_LEG_BASIS_INERT,
     stockLegProbeUsd,
     netCashFlowUsd,
+    openOptionMarkUsd,
+    openOptionMarkDeltaUsd,
+    stockLegProbeMarkBasis:
+      openOptionMarkDeltaUsd === null
+        ? STOCK_LEG_PROBE_MARK_NOT_MEASURED
+        : STOCK_LEG_PROBE_MARK_DIFFERENCED,
   };
 }
 

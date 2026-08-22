@@ -262,6 +262,12 @@ export interface TradierAccountBalance {
    * positions. `null` when absent. Mirrors "Short Option Value".
    */
   optionShortValue?: number | null;
+  /**
+   * TRA-3954 — Tradier `open_pl`: the broker's own unrealized P&L on open
+   * positions (ALL asset classes). Carried as diagnosis beside the computed
+   * open-option mark in `tradier-eod-option-mark.ts`; `null` when absent.
+   */
+  openPl?: number | null;
 }
 
 /** Tradier returns `T | T[]` depending on result count; sometimes `null`/empty string when none. */
@@ -845,6 +851,7 @@ export class TradierOptionsClient extends TradierOrderClient {
       stockLongValue: num(b.stock_long_value),
       optionLongValue: num(b.option_long_value),
       optionShortValue: num(b.option_short_value),
+      openPl: num(b.open_pl),
     };
   }
 

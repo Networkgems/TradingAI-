@@ -256,6 +256,7 @@ describe('TRA-3948 — the fleet fold', () => {
         username: 'admin',
         dates: ['2026-08-17', '2026-08-18', '2026-08-20', '2026-08-21'],
         maxProbeUsd: 197.36,
+        datesWithoutMark: [],
       },
     ]);
     expect(s.maxLiveStockLegProbeUsd).toBeCloseTo(197.36, 2);
@@ -343,5 +344,117 @@ describe('TRA-3948 — the caveat travels on the payload', () => {
     // ...but the DEMO cohort's working signal is not retired: the entries are
     // scoped, and the bare field name is deliberately absent.
     expect(g.ungradeableFields).not.toContain('maxStockLegDriftUsd');
+  });
+});
+
+/**
+ * TRA-3954 — the probe gains its unrealized-mark operand.
+ *
+ * Fixture: the TRA-3951 Tradier reconcile of admin 08-17/08-18, to the cent.
+ * 08-17 bought 4 contracts (691.44) and held them overnight marked 494.08; the
+ * three-operand probe read the unrealized −197.36 as a RED. With the mark
+ * differenced the same session reconciles to 0.00 — the GREEN branch on a
+ * session WITH an overnight position, which no live session had ever exercised.
+ */
+describe('TRA-3954 — a discriminating session WITH an overnight position reconciles GREEN', () => {
+  const overnight = (over: Partial<DailySnapshot> = {}): DailySnapshot =>
+    brokerRow('2026-08-17', {
+      // The four-operand writer: (946.60 − 1143.96) − 0 − (−197.36) − 0 = 0.00
+      openOptionMarkUsd: -197.36,
+      openOptionMarkDeltaUsd: -197.36,
+      stockLegProbeMarkBasis: 'mark-differenced',
+      stockLegProbeUsd: 0,
+      stockLegBasis: 'zero-probe-agrees',
+      ...over,
+    });
+
+  it('GREEN, discriminating, and counted as the overnight-reconciled case', () => {
+    const r = reconcilePnl([overnight()], new Map(), BASELINE);
+    const d = r.days[0]!;
+    expect(d.openOptionMarkUsd).toBeCloseTo(-197.36, 2);
+    expect(d.openOptionMarkDeltaUsd).toBeCloseTo(-197.36, 2);
+    expect(d.stockLegProbeMarkBasis).toBe('mark-differenced');
+    expect(d.stockLegProbeUsd).toBe(0);
+    // Discriminating on the equity move AND on the new operand — a session
+    // where only the mark moved would still enter the denominator.
+    expect(r.stockLegProbeDiscriminatingCount).toBe(1);
+    expect(r.stockLegProbeOk).toBe(true);
+    expect(r.stockLegProbeOffendingDates).toEqual([]);
+    expect(r.stockLegProbeMarkDifferencedCount).toBe(1);
+    expect(r.stockLegProbeOffendingWithoutMarkDates).toEqual([]);
+    expect(r.stockLegProbeOvernightReconciledCount).toBe(1);
+  });
+
+  it('a session where ONLY the mark moved (no equity move, no options) is still discriminating', () => {
+    // Equity flat, realized flat, but the open contracts marked −50 and the
+    // probe then reads +50 — something unbooked offset the mark. Without the
+    // fourth operand in the discriminating rule this row would be a silent
+    // non-member of the denominator.
+    const r = reconcilePnl([overnight({
+      openingEquity: 946.6,
+      closingEquity: 946.6,
+      openOptionMarkDeltaUsd: -50,
+      stockLegProbeUsd: 50,
+      stockLegBasis: 'zero-probe-disagrees',
+    })], new Map(), BASELINE);
+    expect(r.stockLegProbeDiscriminatingCount).toBe(1);
+    expect(r.stockLegProbeOk).toBe(false);
+    expect(r.stockLegProbeOvernightReconciledCount).toBe(0);
+  });
+
+  it('the FAIL branch stays satisfiable WITH the operand: a real unbooked move is RED and NOT without-mark', () => {
+    const r = reconcilePnl([overnight({
+      closingEquity: 846.6,
+      stockLegProbeUsd: -100,
+      stockLegBasis: 'zero-probe-disagrees',
+    })], new Map(), BASELINE);
+    expect(r.stockLegProbeOk).toBe(false);
+    expect(r.stockLegProbeOffendingDates).toEqual(['2026-08-17']);
+    // This RED is attributable: the mark was differenced and the residual survived.
+    expect(r.stockLegProbeOffendingWithoutMarkDates).toEqual([]);
+    expect(r.stockLegProbeOvernightReconciledCount).toBe(0);
+  });
+
+  it('the pre-TRA-3954 offender is NOT softened: still RED, and named as lacking the operand', () => {
+    // The row exactly as the three-operand writer left it on 08-17.
+    const r = reconcilePnl([brokerRow('2026-08-17')], new Map(), BASELINE);
+    expect(r.days[0]!.openOptionMarkDeltaUsd).toBeNull();
+    expect(r.days[0]!.stockLegProbeMarkBasis).toBeNull();
+    expect(r.stockLegProbeOk).toBe(false);
+    expect(r.stockLegProbeOffendingDates).toEqual(['2026-08-17']);
+    expect(r.stockLegProbeOffendingWithoutMarkDates).toEqual(['2026-08-17']);
+    expect(r.stockLegProbeMarkDifferencedCount).toBe(0);
+    expect(r.stockLegProbeOvernightReconciledCount).toBe(0);
+  });
+
+  it('the fleet fold separates "RED because the mark is unknown" from "RED with the mark known"', () => {
+    const s = summarizeLiveStockLegProbe([
+      book('admin', 'live', {
+        stockLegProbeOk: false,
+        stockLegProbeMeasuredCount: 9,
+        stockLegProbeDiscriminatingCount: 5,
+        stockLegProbeOffendingDates: ['2026-08-17', '2026-08-18', '2026-08-20', '2026-08-21'],
+        maxStockLegProbeUsd: 197.36,
+        stockLegBasisCounts: { 'zero-probe-agrees': 5, 'zero-probe-disagrees': 4 },
+        stockLegProbeMarkDifferencedCount: 1,
+        stockLegProbeOffendingWithoutMarkDates: ['2026-08-17', '2026-08-18', '2026-08-20', '2026-08-21'],
+        stockLegProbeOvernightReconciledCount: 1,
+      }),
+      // A book from a fixture that predates the fields folds as 0, not as clean.
+      book('v0nni', 'live', { stockLegProbeMeasuredCount: 8, maxStockLegProbeUsd: 0 }),
+    ]);
+    expect(s.liveStockLegProbeOk).toBe(false);
+    expect(s.liveStockLegProbeMarkDifferencedCount).toBe(1);
+    expect(s.liveStockLegProbeOffendingWithoutMarkCount).toBe(4);
+    expect(s.liveStockLegProbeOvernightReconciledCount).toBe(1);
+    expect(s.liveStockLegProbeOffendingBooks[0]!.datesWithoutMark).toHaveLength(4);
+  });
+
+  it('the caveat names the operand, the counts, and the optionsDaily side', () => {
+    expect(PNL_STOCK_LEG_PROBE_NOTE).toContain('TRA-3954');
+    expect(PNL_STOCK_LEG_PROBE_NOTE).toContain('liveStockLegProbeMarkDifferencedCount');
+    expect(PNL_STOCK_LEG_PROBE_NOTE).toContain('liveStockLegProbeOffendingWithoutMarkCount');
+    expect(PNL_STOCK_LEG_PROBE_NOTE).toContain('liveStockLegProbeOvernightReconciledCount');
+    expect(PNL_STOCK_LEG_PROBE_NOTE).toContain('NOT `journalOptionsPnl`');
   });
 });

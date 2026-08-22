@@ -258,6 +258,34 @@ export interface DailySnapshot {
    * rows and on every row written before this ticket.
    */
   netCashFlowUsd?: number | null;
+  /**
+   * TRA-3954 — the EOD unrealized P&L on OPEN option positions at this
+   * session's close (`option_long_value − Σ cost_basis`, from
+   * `tradier-eod-option-mark.<env>.json`), USD. Written on live broker-shaped
+   * recorded rows only. `null` = the mark was not captured for this session —
+   * NOT MEASURED, never 0 (0 is the "nothing open" reading). Absent on demo
+   * rows and on every row written before this ticket.
+   */
+  openOptionMarkUsd?: number | null;
+  /**
+   * TRA-3954 — `openOptionMarkUsd(date) − openOptionMarkUsd(prevDate)` over the
+   * SAME span the equity delta covers. This is the FOURTH operand of
+   * {@link DailySnapshot.stockLegProbeUsd}: `closingEquity` is mark-to-market
+   * while every other operand is realized, so without it the probe measured the
+   * MTM-vs-realized gap and pinned RED on every overnight-option session
+   * (TRA-3951 reconciled 08-17's −197.36 to this exactly). `null` when EITHER
+   * endpoint's mark is uncaptured; the probe then falls back to the
+   * three-operand form and says so via `stockLegProbeMarkBasis`.
+   */
+  openOptionMarkDeltaUsd?: number | null;
+  /**
+   * TRA-3954 — which form of the probe the writer stamped: `'mark-differenced'`
+   * (four operands, the mark delta subtracted) or `'mark-not-measured'` (three
+   * operands, the pre-TRA-3954 form — the probe on such a row still contains
+   * unrealized mark motion). Diagnosis only; the reader's verdict keys on the
+   * probe NUMBER, never on this string.
+   */
+  stockLegProbeMarkBasis?: string;
   trades: number;
 }
 

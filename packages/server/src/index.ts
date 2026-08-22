@@ -73,6 +73,14 @@ import {
 } from './eod-row-backfill.js';
 // TRA-3288 — the recorded-row writer stamps WHICH surface it writes.
 import { CLOSING_EQUITY_BASIS_ENGINE_PAPER } from './pnl-tracker.js';
+// TRA-3954 — the EOD open-option mark, the stock-leg probe's fourth operand.
+import {
+  TRADIER_EOD_OPTION_MARK_FILE_PREFIX,
+  computeOpenOptionMark,
+  parseOpenOptionMarkFile,
+  openOptionMarkUsdByDate,
+  type OpenOptionMarkByDate,
+} from './tradier-eod-option-mark.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { buildJournalCalendarCells, nonSessionCloseRetractions } from './reports/desk-calendar.js';
 import { foldDeskRows } from './test-accounts.js'; // TRA-2554 — the desk fold names itself on the wire
@@ -2422,6 +2430,10 @@ async function generateAndSaveReport(
         optionsDailyPnl: finalReport.optionsPnl,
         balanceByDate: await loadTradierBalanceSnapshots(ctx, 'production'),
         override: tradierLiveOverride,
+        // TRA-3954 — the fourth operand, captured by the override pass above.
+        optionMarkUsdByDate: openOptionMarkUsdByDate(
+          await loadTradierOptionMarks(ctx, 'production'),
+        ),
       })
       : null;
     // TRA-2323 — realized option P&L now lands in `PaperAccount` equity (that is
@@ -3351,6 +3363,37 @@ async function saveTradierBalanceSnapshots(
   await writeFile(tradierBalancePath(ctx, env), JSON.stringify(snapshots, null, 2), 'utf-8');
 }
 
+// TRA-3954 — `tradier-eod-option-mark.<env>.json`: the EOD unrealized P&L on
+// open option positions, per session, captured on the same tick as the balance
+// snapshot. See `tradier-eod-option-mark.ts` for why this is the probe's fourth
+// operand. A sibling file, not a new shape on the balance file: every reader of
+// `tradier-eod-balance.*` filters to bare numbers and would silently drop a
+// richer entry.
+function tradierOptionMarkPath(ctx: UserContext, env: TradierEnv): string {
+  return join(ctx.dataDir, `${TRADIER_EOD_OPTION_MARK_FILE_PREFIX}.${env}.json`);
+}
+
+async function loadTradierOptionMarks(
+  ctx: UserContext,
+  env: TradierEnv,
+): Promise<OpenOptionMarkByDate> {
+  const path = tradierOptionMarkPath(ctx, env);
+  if (!existsSync(path)) return {};
+  try {
+    return parseOpenOptionMarkFile(JSON.parse(await readFile(path, 'utf-8')));
+  } catch {
+    return {};
+  }
+}
+
+async function saveTradierOptionMarks(
+  ctx: UserContext,
+  env: TradierEnv,
+  marks: OpenOptionMarkByDate,
+): Promise<void> {
+  await writeFile(tradierOptionMarkPath(ctx, env), JSON.stringify(marks, null, 2), 'utf-8');
+}
+
 async function loadTradierCashFlow(
   ctx: UserContext,
   env: TradierEnv,
@@ -3558,6 +3601,53 @@ async function reconcileTradierLiveCalendar(
   const snapshots = await loadTradierBalanceSnapshots(ctx, env);
   snapshots[reportDate] = todayBalance;
   await saveTradierBalanceSnapshots(ctx, env, snapshots);
+
+  // TRA-3954 — capture the EOD open-option mark on the SAME tick, so the
+  // ledger-row writer can difference it over the same span as the equity
+  // delta. Best-effort and NON-FATAL: a failed capture leaves this session's
+  // mark ABSENT (the row then stamps `stockLegProbeMarkBasis:
+  // 'mark-not-measured'`), never 0. The log line is the only record of why.
+  if (client) {
+    try {
+      const [balance, positions] = await Promise.all([
+        client.getAccountBalance(),
+        client.readOpenOptionPositions(),
+      ]);
+      const capture = computeOpenOptionMark({
+        balance,
+        positions: positions.ok
+          ? { ok: true, positions: positions.positions }
+          : { ok: false, detail: `${positions.reason}: ${positions.detail}` },
+        capturedAt: new Date().toISOString(),
+      });
+      if (capture.ok) {
+        const marks = await loadTradierOptionMarks(ctx, env);
+        marks[reportDate] = capture.snapshot;
+        await saveTradierOptionMarks(ctx, env, marks);
+        log.info('TRA-3954 captured EOD open-option mark', {
+          username: ctx.username,
+          env,
+          reportDate,
+          ...capture.snapshot,
+        });
+      } else {
+        log.warn('TRA-3954 EOD open-option mark NOT captured — probe falls back to 3 operands', {
+          username: ctx.username,
+          env,
+          reportDate,
+          reason: capture.reason,
+          detail: capture.detail,
+        });
+      }
+    } catch (err) {
+      log.warn('TRA-3954 EOD open-option mark capture threw — probe falls back to 3 operands', {
+        username: ctx.username,
+        env,
+        reportDate,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   // Without a prior anchor we can't compute a daily delta. The file is
   // seeded — the next EOD report run will have a valid prev to compare
