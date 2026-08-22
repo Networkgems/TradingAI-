@@ -421,6 +421,42 @@ export interface LiveNavBookDenominator {
   postOnsetEligiblePairs: number;
   /** `null` when the book's post-onset trip-capable count is > 0. */
   vacuousReason: 'no_live_options_onset' | 'no_post_onset_trip_capable_pairs' | null;
+  /**
+   * TRA-3952 — rows in the book's series whose `optionsDaily` clears the cent tolerance.
+   * The operand behind {@link lagScope}: a book with no onset AND no options P&L anywhere
+   * has nothing for the lag predicate to grade; a book with no onset BUT options P&L has a
+   * broken onset derivation, which is a grader defect and must not leave the cohort quietly.
+   */
+  optionsPnlRows: number;
+  /**
+   * TRA-3952 — which cohort this book sits in for the `lagDenominator` ANY-gate.
+   *
+   * - `graded`: the book has a live-options onset; it is in the gate and can hold the axis
+   *   `vacuous` on its own (the TRA-3450 per-book rule, unchanged).
+   * - `excluded_no_onset`: no onset and no options P&L in any row. The predicate is about
+   *   options money leaking into the stock leg, and this book has never had any, so it has
+   *   nothing to cover and nothing to be covered for. Published as a NAMED bucket
+   *   (`LiveNavGrade.lagDenominatorScope`), never dropped.
+   * - `suspect_onset_derivation`: no onset but options P&L is present. The onset operand is
+   *   contradicted by the book's own rows; the axis grades `blind` on it.
+   *
+   * Absent on rows written before TRA-3952.
+   */
+  lagScope: 'graded' | 'excluded_no_onset' | 'suspect_onset_derivation';
+}
+
+/**
+ * TRA-3952 — the scoping record for the `lagDenominator` ANY-gate, written on every row so
+ * "which books was the gate actually over" is recoverable without the payload. The excluded
+ * bucket is the point: scoping the gate must not turn into silent exclusion.
+ */
+export interface LiveNavLagDenominatorScope {
+  /** Books the ANY-gate ran over. */
+  graded: string[];
+  /** Live books with no onset and no options P&L — outside the gate, by design, by name. */
+  excludedNoOnset: string[];
+  /** Live books with no onset but options P&L present — the axis is `blind` on these. */
+  suspectOnset: string[];
 }
 
 /** The graded result. Pure function of the payload — no IO, no clock, no LLM. */
@@ -439,9 +475,17 @@ export interface LiveNavGrade extends LiveNavSignals {
      * TRA-3450 — did the `lag` axis have ANYTHING to grade? `vacuous` when any live book's
      * post-onset trip-capable pair count is 0. Never `pass` unless every live book has at
      * least one, so a `clean` verdict now carries a non-empty denominator by construction.
+     *
+     * TRA-3952 — "every live book" is now every live book WITH a live-options onset. A live
+     * book that has never opened an option and has never booked options P&L has no lag
+     * predicate to grade and sits outside the gate in the named `excludedNoOnset` bucket of
+     * {@link LiveNavGrade.lagDenominatorScope}. An empty graded cohort is still `vacuous`,
+     * never `pass`; a no-onset book that DOES carry options P&L makes the axis `blind`.
      */
     lagDenominator: LiveNavAxis;
   };
+  /** TRA-3952 — which books the `lagDenominator` gate ran over, and which it set aside, by name. */
+  lagDenominatorScope: LiveNavLagDenominatorScope;
   /** Offending books, ready to print. Empty on a clean lag axis. */
   lagBooks: Array<{ username: string; dates: string[] }>;
   /** Named, with WHY — see {@link LiveNavUngradedBook}. */
@@ -577,6 +621,13 @@ export function computeLiveLagDenominators(payload: unknown): LiveNavBookDenomin
     let tripCapablePairs = 0;
     let postOnsetTripCapablePairs = 0;
     let postOnsetTripPairs = 0;
+    // TRA-3952 — counted over EVERY row (the pair loop below starts at 1), so a lone first
+    // row carrying options P&L is not missed by the scope guard.
+    let optionsPnlRows = 0;
+    for (const d of days) {
+      const o = num(d.optionsDaily);
+      if (o !== null && Math.abs(o) > CENT_TOLERANCE_USD) optionsPnlRows += 1;
+    }
     for (let i = 1; i < days.length; i += 1) {
       const cur = days[i]!;
       const prev = days[i - 1]!;
@@ -618,6 +669,13 @@ export function computeLiveLagDenominators(payload: unknown): LiveNavBookDenomin
           : onsetDate === null
             ? 'no_live_options_onset'
             : 'no_post_onset_trip_capable_pairs',
+      optionsPnlRows,
+      lagScope:
+        onsetDate !== null
+          ? 'graded'
+          : optionsPnlRows > 0
+            ? 'suspect_onset_derivation'
+            : 'excluded_no_onset',
     });
   }
   return out;
@@ -751,23 +809,52 @@ export function gradeLiveNavTripwirePayload(payload: unknown): LiveNavGrade {
   // Graded PER BOOK: any live book at zero makes the axis vacuous. A fleet SUM would let one
   // busy book manufacture cover for a silent one, which is the same offender-only-cohort
   // mistake `liveGradeableBookCount` exists to catch one field over.
+  //
+  // TRA-3952 — the per-book gate runs over books that HAVE a live-options onset. A live book
+  // that has never opened an option and has never booked options P&L (v0nni: 13 rows, every
+  // one `stockDaily: 0` AND `optionsDaily: 0`) is not a silent book being covered for — it
+  // has nothing the predicate could leak. Holding the axis `vacuous` on it gave the axis no
+  // reachable `pass` off ANY repair and no terminating event anyone on the board controls.
+  // Two things keep this from being the silent-exclusion mistake one field over:
+  //   1. the set-aside books are PUBLISHED by name on every row (`lagDenominatorScope`), and
+  //      named in the reason string whenever the axis is not `pass`;
+  //   2. a no-onset book that DOES carry options P&L is a contradicted onset operand — a
+  //      grader defect, not an absence of evidence — and grades the axis `blind`, which
+  //      outranks `vacuous` and is never green.
+  // An empty graded cohort (every live book no-onset) is still `vacuous`, never `pass`: the
+  // ANY-gate over nothing is the `every`-on-empty green this module exists to refuse.
   let lagDenominator: LiveNavAxis;
-  const emptyBooks = (denominators ?? []).filter((b) => b.vacuousReason !== null);
+  const gradedBooks = (denominators ?? []).filter((b) => b.lagScope === 'graded');
+  const excludedBooks = (denominators ?? []).filter((b) => b.lagScope === 'excluded_no_onset');
+  const suspectBooks = (denominators ?? []).filter((b) => b.lagScope === 'suspect_onset_derivation');
+  const emptyBooks = gradedBooks.filter((b) => b.vacuousReason !== null);
+  const names = (bs: LiveNavBookDenominator[]): string => bs.map((b) => b.username).join(',');
+  const excludedSuffix = excludedBooks.length > 0 ? `;excluded_no_onset:${names(excludedBooks)}` : '';
   if (!payloadUsable) lagDenominator = blind('payload_unusable');
   else if (disowned('livePriorOptionsLagOk')) lagDenominator = blind('operand_declared_ungradeable');
   // A census we could not take is BLIND, never vacuous — see `computeLiveLagDenominators`.
   else if (denominators === null) lagDenominator = blind('engines_unreadable');
   else if (denominators.length === 0) lagDenominator = blind('empty_live_cohort');
+  else if (suspectBooks.length > 0)
+    lagDenominator = blind(`onset_derivation_suspect:${names(suspectBooks)}${excludedSuffix}`);
+  else if (gradedBooks.length === 0)
+    lagDenominator = vacuous(`no_live_book_with_options_onset${excludedSuffix}`);
   else if (emptyBooks.length > 0)
     lagDenominator = vacuous(
-      `no_post_onset_trip_capable_pairs:${emptyBooks.map((b) => `${b.username}=${b.vacuousReason}`).join(',')}`,
+      `no_post_onset_trip_capable_pairs:${emptyBooks.map((b) => `${b.username}=${b.vacuousReason}`).join(',')}${excludedSuffix}`,
     );
   // A post-onset trip that the served scalar did NOT report is a contradiction between the
   // endpoint's verdict and its own day rows. Louder than vacuous: it means the tripwire had
   // something to grade and graded it wrong.
-  else if (denominators.some((b) => b.postOnsetTripPairs > 0) && lagRaw.value !== false)
-    lagDenominator = fail('post_onset_trip_not_reported_by_scalar');
+  else if (gradedBooks.some((b) => b.postOnsetTripPairs > 0) && lagRaw.value !== false)
+    lagDenominator = fail(`post_onset_trip_not_reported_by_scalar${excludedSuffix}`);
   else lagDenominator = pass();
+
+  const lagDenominatorScope: LiveNavLagDenominatorScope = {
+    graded: gradedBooks.map((b) => b.username),
+    excludedNoOnset: excludedBooks.map((b) => b.username),
+    suspectOnset: suspectBooks.map((b) => b.username),
+  };
 
   const axes = {
     lag: { ...lag, kind: liveNavAxisKind('lag') },
@@ -793,6 +880,7 @@ export function gradeLiveNavTripwirePayload(payload: unknown): LiveNavGrade {
     eodTailStaleBooks,
     interiorAbsentBooks,
     lagDenominatorBooks: denominators ?? [],
+    lagDenominatorScope,
     observed: {
       livePriorOptionsLagOk: lagRaw.value,
       liveBookCount: bookCountRaw.value,
@@ -1084,6 +1172,12 @@ export interface LiveNavTripwireSummary extends LiveNavSignals {
     latestDenominators: LiveNavBookDenominator[];
     /** Live books at zero on the latest row, with the reason. */
     vacuousBooks: Array<{ username: string; reason: string }>;
+    /**
+     * TRA-3952 — the latest row's gate scoping. `excludedNoOnset` is the named bucket of
+     * live books outside the `lagDenominator` gate; `null` on a pre-TRA-3952 row, whose gate
+     * ran cohort-complete and recorded no scope.
+     */
+    latestScope: LiveNavLagDenominatorScope | null;
   };
   /** Non-graded evidence — diff across days to find a NEW interior absence (TRA-2943). */
   interiorAbsentBooksLatest: Array<{ username: string; dates: string[] }>;
@@ -1264,6 +1358,7 @@ export function summarizeLiveNavTripwire(
       vacuousBooks: latestDenominators
         .filter((b) => b.vacuousReason !== null)
         .map((b) => ({ username: b.username, reason: b.vacuousReason as string })),
+      latestScope: latest?.lagDenominatorScope ?? null,
     },
     interiorAbsentBooksLatest: latest?.interiorAbsentBooks ?? [],
     durability: {

@@ -5384,7 +5384,12 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
                   ? `VACUOUS — the tripwire RAN and had NOTHING to grade. ${summary.vacuity.consecutiveVacuousSessions} consecutive graded session(s) with a ZERO post-onset trip-capable denominator; ${summary.vacuity.sessionsWithTripCapableEvidence}/${summary.coverage.marketDaysRecorded} recorded session(s) carried any evidence. Books at zero: ${
                       summary.vacuity.vacuousBooks.map((b) => `${b.username}=${b.reason}`).join(', ') || 'none'
                     }. This is NOT a pass — see TRA-3450.`
-                  : `CLEAN — every NYSE session in the window has a graded, passing row over a NON-EMPTY post-onset trip-capable denominator (${summary.coverage.marketDaysRecorded}/${summary.coverage.marketDaysExpected}).`,
+                  : `CLEAN — every NYSE session in the window has a graded, passing row over a NON-EMPTY post-onset trip-capable denominator (${summary.coverage.marketDaysRecorded}/${summary.coverage.marketDaysExpected}).${
+                      // TRA-3952 — a clean that was graded over a SCOPED cohort says so, by name.
+                      (summary.vacuity.latestScope?.excludedNoOnset.length ?? 0) > 0
+                        ? ` Outside the lagDenominator gate (no live-options onset, no options P&L): ${summary.vacuity.latestScope!.excludedNoOnset.join(', ')} — see vacuity.latestScope (TRA-3952).`
+                        : ''
+                    }`,
       /**
        * TRA-3711 — `note` narrates the VERDICT lattice, which is dominated by the WORST
        * axis. `signalNote` narrates the two CHANNELS, which is the reading a consumer

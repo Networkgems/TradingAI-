@@ -637,7 +637,9 @@ describe('TRA-3450 — the denominator, and why a `true` scalar is not a pass', 
     expect(g.verdict).not.toBe('clean');
     expect(g.observed.postOnsetTripCapablePairs).toBe(0);
     expect(g.axes.lagDenominator.reason).toContain('admin=no_post_onset_trip_capable_pairs');
-    expect(g.axes.lagDenominator.reason).toContain('v0nni=no_live_options_onset');
+    // TRA-3952 — v0nni is outside the gate now, and the reason string still NAMES it.
+    expect(g.axes.lagDenominator.reason).toContain('excluded_no_onset:v0nni');
+    expect(g.lagDenominatorScope).toEqual({ graded: ['admin'], excludedNoOnset: ['v0nni'], suspectOnset: [] });
   });
 
   it('grades CLEAN only when every live book has a post-onset trip-capable pair', () => {
@@ -648,7 +650,9 @@ describe('TRA-3450 — the denominator, and why a `true` scalar is not a pass', 
   });
 
   it('one busy book cannot cover for a silent one — the census is PER BOOK', () => {
-    // admin has evidence, v0nni has none. A fleet SUM would read 1 > 0 and pass.
+    // admin has evidence, v0nni has an onset but no post-onset trip-capable pair. A fleet
+    // SUM would read 1 > 0 and pass. (TRA-3952: v0nni carries an onset here so it is IN the
+    // gate — the no-onset shape is the scoped case, tested in the TRA-3952 block below.)
     const g = gradeLiveNavTripwirePayload(
       coveredPayload({
         engines: [
@@ -663,7 +667,7 @@ describe('TRA-3450 — the denominator, and why a `true` scalar is not a pass', 
           {
             username: 'v0nni',
             mode: 'live',
-            liveOptionsOnsetDate: null,
+            liveOptionsOnsetDate: '2026-08-10',
             days: V0NNI_LIVE_DAYS,
             priorOptionsLagOk: true,
             priorOptionsLagEligibleDates: [],
@@ -673,6 +677,9 @@ describe('TRA-3450 — the denominator, and why a `true` scalar is not a pass', 
     );
     expect(g.observed.postOnsetTripCapablePairs).toBe(1); // the sum is non-zero...
     expect(g.axes.lagDenominator.status).toBe('vacuous'); // ...and it still does not pass
+    expect(g.axes.lagDenominator.reason).toBe(
+      'no_post_onset_trip_capable_pairs:v0nni=no_post_onset_trip_capable_pairs',
+    );
     expect(g.verdict).toBe('vacuous');
   });
 
@@ -1207,6 +1214,190 @@ describe('TRA-3711 — the per-class split, measured on the same rows', () => {
     const day = summarizeLiveNavTripwire(1, '2026-08-12').byDay[0]!;
     expect(day.alarm).toBe(true);
     expect(day.driver?.axis).toBe('someNewAxis');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-3952 — the `lagDenominator` ANY-gate is SCOPED to live books with an onset.
+//
+// Decision of record (option (a) of TRA-3952). A live book with no live-options onset and
+// no options P&L in any row has no lag predicate to grade: the predicate is about options
+// money leaking into the stock leg, and the book has never held any. Holding the whole axis
+// `vacuous` on it left the axis with NO reachable `pass` off any repair and NO terminating
+// event anyone on the board controls (v0nni's first-ever live option). The set-aside books
+// are published by NAME on every row — scoping is not silent exclusion — and a no-onset
+// book that DOES carry options P&L is a contradicted onset operand and grades `blind`.
+describe('TRA-3952 — the ANY-gate runs over books WITH an onset; the rest are named, not dropped', () => {
+  const T = (etDay: string): number => Date.parse(`${etDay}T21:20:00-04:00`);
+  const ADMIN_TRIP_CAPABLE = {
+    username: 'admin',
+    mode: 'live',
+    liveOptionsOnsetDate: '2026-07-30',
+    days: TRIP_CAPABLE_DAYS,
+    priorOptionsLagOk: true,
+    priorOptionsLagEligibleDates: ['2026-08-12'],
+  };
+  const V0NNI_NO_ONSET = {
+    username: 'v0nni',
+    mode: 'live',
+    liveOptionsOnsetDate: null,
+    days: V0NNI_LIVE_DAYS,
+    priorOptionsLagOk: true,
+    priorOptionsLagEligibleDates: [],
+  };
+
+  it('a never-traded live book is EXCLUDED from the gate and the axis can now PASS off admin', () => {
+    const g = gradeLiveNavTripwirePayload(coveredPayload({ engines: [ADMIN_TRIP_CAPABLE, V0NNI_NO_ONSET] }));
+    expect(g.axes.lagDenominator).toEqual({ status: 'pass', reason: null, kind: 'coverage' });
+    expect(g.observed.postOnsetTripCapablePairs).toBe(1);
+    expect(g.verdict).toBe('clean');
+    // ...and the excluded book is on the row by name, not averaged away.
+    expect(g.lagDenominatorScope).toEqual({ graded: ['admin'], excludedNoOnset: ['v0nni'], suspectOnset: [] });
+    const v0nni = g.lagDenominatorBooks.find((b) => b.username === 'v0nni')!;
+    expect(v0nni.lagScope).toBe('excluded_no_onset');
+    expect(v0nni.optionsPnlRows).toBe(0);
+    expect(v0nni.vacuousReason).toBe('no_live_options_onset'); // the per-book reading is unchanged
+  });
+
+  it('an EMPTY graded cohort is VACUOUS, never pass — the gate over nothing is not a gate', () => {
+    const g = gradeLiveNavTripwirePayload(
+      coveredPayload({ engines: [{ ...V0NNI_NO_ONSET, username: 'admin' }, V0NNI_NO_ONSET] }),
+    );
+    expect(g.axes.lagDenominator.status).toBe('vacuous');
+    expect(g.axes.lagDenominator.reason).toBe('no_live_book_with_options_onset;excluded_no_onset:admin,v0nni');
+    expect(g.lagDenominatorScope.graded).toEqual([]);
+    expect(g.verdict).toBe('vacuous');
+  });
+
+  it('a no-onset book carrying options P&L is a SUSPECT onset derivation and grades BLIND', () => {
+    // The offender-only-cohort mistake one field over: if onset derivation broke, the book
+    // it broke on must NOT quietly leave the cohort. Options P&L with no onset is that
+    // contradiction, and it outranks both the pass admin would otherwise earn and vacuous.
+    const suspect = {
+      ...V0NNI_NO_ONSET,
+      days: [
+        { date: '2026-08-11', stockDaily: 0, optionsDaily: -16 },
+        { date: '2026-08-12', stockDaily: 0, optionsDaily: 0 },
+      ],
+    };
+    const g = gradeLiveNavTripwirePayload(coveredPayload({ engines: [ADMIN_TRIP_CAPABLE, suspect] }));
+    expect(g.axes.lagDenominator).toEqual({
+      status: 'blind',
+      reason: 'onset_derivation_suspect:v0nni',
+      kind: 'coverage',
+    });
+    expect(g.verdict).toBe('blind');
+    expect(g.alarm).toBe(false); // a hole in the instrument, not a trip
+    expect(g.degraded).toBe(true);
+    expect(g.lagDenominatorScope).toEqual({ graded: ['admin'], excludedNoOnset: [], suspectOnset: ['v0nni'] });
+    expect(g.lagDenominatorBooks.find((b) => b.username === 'v0nni')!.optionsPnlRows).toBe(1);
+  });
+
+  it('the suspect guard reads EVERY row, including the first one the pair loop skips', () => {
+    const suspect = {
+      ...V0NNI_NO_ONSET,
+      days: [{ date: '2026-08-11', stockDaily: 0, optionsDaily: 3.25 }],
+    };
+    const g = gradeLiveNavTripwirePayload(coveredPayload({ engines: [ADMIN_TRIP_CAPABLE, suspect] }));
+    expect(g.axes.lagDenominator.status).toBe('blind');
+    expect(g.lagDenominatorScope.suspectOnset).toEqual(['v0nni']);
+  });
+
+  it('dust under the cent tolerance does not make a book suspect', () => {
+    const dust = {
+      ...V0NNI_NO_ONSET,
+      days: [{ date: '2026-08-11', stockDaily: 0, optionsDaily: 0.004 }, ...V0NNI_LIVE_DAYS],
+    };
+    const g = gradeLiveNavTripwirePayload(coveredPayload({ engines: [ADMIN_TRIP_CAPABLE, dust] }));
+    expect(g.lagDenominatorScope.excludedNoOnset).toEqual(['v0nni']);
+    expect(g.axes.lagDenominator.status).toBe('pass');
+  });
+
+  it('a graded book at zero STILL holds the axis vacuous, and the excluded bucket rides the reason', () => {
+    const g = gradeLiveNavTripwirePayload(
+      coveredPayload({
+        engines: [
+          { ...ADMIN_TRIP_CAPABLE, days: ADMIN_LIVE_DAYS, priorOptionsLagEligibleDates: ['2026-08-12'] },
+          V0NNI_NO_ONSET,
+        ],
+      }),
+    );
+    expect(g.axes.lagDenominator.status).toBe('vacuous');
+    expect(g.axes.lagDenominator.reason).toBe(
+      'no_post_onset_trip_capable_pairs:admin=no_post_onset_trip_capable_pairs;excluded_no_onset:v0nni',
+    );
+  });
+
+  it('a post-onset trip the scalar did not report still FAILS under scoping, bucket named', () => {
+    const g = gradeLiveNavTripwirePayload(
+      coveredPayload({
+        engines: [
+          {
+            ...ADMIN_TRIP_CAPABLE,
+            days: [
+              { date: '2026-08-11', stockDaily: 0, optionsDaily: -16 },
+              { date: '2026-08-12', stockDaily: -16, optionsDaily: 0 },
+            ],
+          },
+          V0NNI_NO_ONSET,
+        ],
+        livePriorOptionsLagOk: true,
+      }),
+    );
+    expect(g.axes.lagDenominator.status).toBe('fail');
+    expect(g.axes.lagDenominator.reason).toBe('post_onset_trip_not_reported_by_scalar;excluded_no_onset:v0nni');
+  });
+
+  it('the health summary publishes the latest scope, and reads null on a pre-TRA-3952 row', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'live-nav-3952-'));
+    try {
+      hydrateLiveNavTripwireFromDisk(dir, T('2026-08-13'));
+      recordLiveNavTripwireAssertion({
+        grade: gradeLiveNavTripwirePayload(coveredPayload({ engines: [ADMIN_TRIP_CAPABLE, V0NNI_NO_ONSET] })),
+        source: 'served',
+        now: T('2026-08-12'),
+      });
+      const s = summarizeLiveNavTripwire(1, '2026-08-12');
+      expect(s.vacuity.latestScope).toEqual({ graded: ['admin'], excludedNoOnset: ['v0nni'], suspectOnset: [] });
+      expect(s.byDay[0]!.verdict).toBe('clean');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    const legacyDir = mkdtempSync(join(tmpdir(), 'live-nav-3952-legacy-'));
+    try {
+      const legacy = {
+        kind: 'assert',
+        ts: T('2026-08-12'),
+        etDay: '2026-08-12',
+        marketDay: true,
+        source: 'served',
+        verdict: 'vacuous',
+        alarm: false,
+        axes: {
+          lag: { status: 'pass', reason: null },
+          coverage: { status: 'pass', reason: null },
+          eodRows: { status: 'pass', reason: null },
+          eodTail: { status: 'pass', reason: null },
+          lagDenominator: { status: 'vacuous', reason: 'no_post_onset_trip_capable_pairs:v0nni=no_live_options_onset' },
+        },
+        lagBooks: [],
+        ungradedBooks: [],
+        lagDenominatorBooks: [
+          { username: 'v0nni', onsetDate: null, totalPairs: 1, tripCapablePairs: 0, postOnsetTripCapablePairs: 0, postOnsetTripPairs: 0, postOnsetEligiblePairs: 0, vacuousReason: 'no_live_options_onset' },
+        ],
+        observed: { livePriorOptionsLagOk: true, postOnsetTripCapablePairs: 0 },
+      };
+      writeFileSync(liveNavTripwireLogPath(legacyDir), JSON.stringify(legacy) + '\n', 'utf8');
+      hydrateLiveNavTripwireFromDisk(legacyDir, T('2026-08-13'));
+      const s = summarizeLiveNavTripwire(1, '2026-08-12');
+      // A cohort-complete row is not rewritten into a scoped one after the fact.
+      expect(s.vacuity.latestScope).toBeNull();
+      expect(s.byDay[0]!.verdict).toBe('vacuous');
+      expect(s.vacuity.vacuousBooks).toEqual([{ username: 'v0nni', reason: 'no_live_options_onset' }]);
+    } finally {
+      rmSync(legacyDir, { recursive: true, force: true });
+    }
   });
 });
 
