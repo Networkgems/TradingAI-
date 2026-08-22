@@ -262,7 +262,7 @@ export const PNL_COMBINED_AGREEMENT_NOTE =
  * beside the fields so a gate author reading the payload head cannot miss it.
  */
 export const PNL_STOCK_LEG_PROBE_NOTE =
-  'TRA-3948: on a broker-shaped LIVE row `stockLegDrift` and `maxStockLegDriftUsd` ARE STRUCTURALLY 0 AND CANNOT SEE THE EQUITY RESIDUAL THEIR NAMES PROMISE. This is not a formula bug, it is a scope mismatch, and it read as a live green for four sessions. `stockLegDrift` is `eodStockPnl - stockDaily`; the probe is `closingEquity - openingEquity - optionsDaily - netCashFlowUsd`. The operand sets are DISJOINT. `shapeLiveRecordedRow` books `dailyPnl: 0` on every broker-shaped row by design (broker delta-equity already contains the stock P&L, so booking a demo stock figure beside it would be the TRA-3288 two-surface error relocated) and the TRA-219 21:00 ET archive zeroes `eodStockPnl`, so the drift computes `0 - 0` for EVERY possible value of the probe. Measured live 2026-08-22T04:42Z on build `0fd3b68`: `admin` served `stockLegBasis: \'zero-probe-disagrees\'` with `stockLegProbeUsd` -197.36 (08-17), +196.56 (08-18), -71.36 (08-20) and +112.47 (08-21) -- $197.36 against a $946.60 closing equity, ~21 percent of the book in one session -- while `stockLegDrift` read 0 on all four and 0 of the endpoint\'s 117 top-level keys matched /probe|basis/. THE OTHER TWO READERS WERE ALSO SILENT, AND FOR STRUCTURAL REASONS: row-level `drift` is `null` on a broker-shaped row (TRA-3349, correctly), and `stockLegOk`\'s cohort requires `stockDaily !== 0`, which the writer pins to 0, so no live row can EVER enter it -- the fleet `stockLegOk: false` / `stockLegMeasuredCount: 217` / `maxStockLegDriftUsd: 765` on the same pull is entirely DEMO rows and is pinned red, carrying no information about a live probe in either direction. READ `liveStockLegProbeOk` INSTEAD (per book: `engines[].stockLegProbeOk`; per row: `days[].stockLegProbeUsd` / `stockLegBasis`). It is TRI-STATE, RED > NOT MEASURED > GREEN, and `null` means nobody looked. THE VERDICT KEYS ON THE NUMBER, NOT ON THE `stockLegBasis` STRING: that vocabulary is an open enum owned by another module, and binding to `\'zero-probe-disagrees\'` would let a renamed or added constant empty the offender set and turn the axis green with no code change here. `stockLegBasisCounts` publishes the strings as DIAGNOSIS. QUOTE `liveStockLegProbeDiscriminatingCount`, NOT `liveStockLegProbeMeasuredCount`, BESIDE ANY VERDICT: a dormant book probes 0-0-0-0 and emits `zero-probe-agrees` however broken the wiring is, and this is not hypothetical -- live book `v0nni` sat at 400.00 -> 400.00 across all 8 of its probed sessions on that pull, so the measured count reads 16 clean-ish sessions over what is really 4 discriminating live sessions, ALL FOUR of which disagree. `liveStockLegProbeNotMeasuredCount` is the third state: rows the writer stamped a basis on whose probe could not run (an operand absent); a `null` verdict beside a non-zero value there is a COVERAGE HOLE on real-money rows, never a pass. FINALLY, WHAT THE PROBE IS NOT: it is the per-session equity move NEITHER BOOKED LEG ACCOUNTS FOR, not a claim that the residual is stock P&L. `netCashFlowUsd` was 0 and MEASURED (not null) on all 8 admin rows -- a null flow forces `stockLegBasis: \'zero-probe-not-measured\'` -- so a deposit or withdrawal is excluded, conditional on the TRA-359 flow capture; mis-timed option credits, fees and assignment are not. Attribution is open work; the DETECTOR is what this ticket restored.';
+  'TRA-3948: on a broker-shaped LIVE row `stockLegDrift` and `maxStockLegDriftUsd` ARE STRUCTURALLY 0 AND CANNOT SEE THE EQUITY RESIDUAL THEIR NAMES PROMISE. This is not a formula bug, it is a scope mismatch, and it read as a live green for four sessions. `stockLegDrift` is `eodStockPnl - stockDaily`; the probe is `closingEquity - openingEquity - optionsDaily - netCashFlowUsd`. The operand sets are DISJOINT. `shapeLiveRecordedRow` books `dailyPnl: 0` on every broker-shaped row by design (broker delta-equity already contains the stock P&L, so booking a demo stock figure beside it would be the TRA-3288 two-surface error relocated) and the TRA-219 21:00 ET archive zeroes `eodStockPnl`, so the drift computes `0 - 0` for EVERY possible value of the probe. Measured live 2026-08-22T04:42Z on build `0fd3b68`: `admin` served `stockLegBasis: \'zero-probe-disagrees\'` with `stockLegProbeUsd` -197.36 (08-17), +196.56 (08-18), -71.36 (08-20) and +112.47 (08-21) -- $197.36 against a $946.60 closing equity, ~21 percent of the book in one session -- while `stockLegDrift` read 0 on all four and 0 of the endpoint\'s 117 top-level keys matched /probe|basis/. THE OTHER TWO READERS WERE ALSO SILENT, AND FOR STRUCTURAL REASONS: row-level `drift` is `null` on a broker-shaped row (TRA-3349, correctly), and `stockLegOk`\'s cohort requires `stockDaily !== 0`, which the writer pins to 0, so no live row can EVER enter it -- the fleet `stockLegOk: false` / `stockLegMeasuredCount: 217` / `maxStockLegDriftUsd: 765` on the same pull is entirely DEMO rows and is pinned red, carrying no information about a live probe in either direction. READ `liveStockLegProbeOk` INSTEAD (per book: `engines[].stockLegProbeOk`; per row: `days[].stockLegProbeUsd` / `stockLegBasis`). It is TRI-STATE, RED > NOT MEASURED > GREEN, and `null` means nobody looked. THE VERDICT KEYS ON THE NUMBER, NOT ON THE `stockLegBasis` STRING: that vocabulary is an open enum owned by another module, and binding to `\'zero-probe-disagrees\'` would let a renamed or added constant empty the offender set and turn the axis green with no code change here. `stockLegBasisCounts` publishes the strings as DIAGNOSIS. QUOTE `liveStockLegProbeDiscriminatingCount`, NOT `liveStockLegProbeMeasuredCount`, BESIDE ANY VERDICT: a dormant book probes 0-0-0-0 and emits `zero-probe-agrees` however broken the wiring is, and this is not hypothetical -- live book `v0nni` sat at 400.00 -> 400.00 across all 8 of its probed sessions on that pull, so the measured count reads 16 clean-ish sessions over what is really 4 discriminating live sessions, ALL FOUR of which disagree. `liveStockLegProbeNotMeasuredCount` is the third state: rows the writer stamped a basis on whose probe could not run (an operand absent); a `null` verdict beside a non-zero value there is a COVERAGE HOLE on real-money rows, never a pass. AND THE AXIS DOES NOT COVER THE WHOLE LIVE BOOK -- READ `liveStockLegProbeUnstampedCount` BESIDE ANY GREEN. The `admin` book has 14 sessions since its 2026-07-30 live-options onset, and they split into THREE regimes, not one: 07-30/07-31/08-03 have NO ledger row (the permanent TRA-2888 hole, see the `eodInterior*` axes); 08-04..08-11 are 6 rows stamped `equitySourceEra` = unstamped-pre-tra3349 whose `closingEquity` is FROZEN at 2603.49 across the entire run (the TRA-3288 preserved demo PaperAccount) while options booked -$462, so `stockDaily: 0` there is the FROZEN SURFACE and not the deliberate broker-row 0, and they carry no probe and never will; only 08-12..08-21 are broker-shaped and probed. So "`stockDaily` is 0 on all 14 post-onset sessions" is TWO different phenomena with two different causes, and only the second is by design. FINALLY, WHAT THE PROBE IS NOT: it is the per-session equity move NEITHER BOOKED LEG ACCOUNTS FOR, not a claim that the residual is stock P&L. `netCashFlowUsd` was 0 and MEASURED (not null) on all 8 admin rows -- a null flow forces `stockLegBasis: \'zero-probe-not-measured\'` -- so a deposit or withdrawal is excluded, conditional on the TRA-359 flow capture; mis-timed option credits, fees and assignment are not. Attribution is open work; the DETECTOR is what this ticket restored.';
 
 /**
  * TRA-3589 — the NAV source-of-record boundary, in band.
@@ -1471,6 +1471,33 @@ export interface PnlReconcileResult {
    * count of 0 alone renders them identically.
    */
   stockLegProbeNotMeasuredCount: number;
+  /**
+   * TRA-3948 — rows carrying NO `stockLegBasis` at all: the writer never made a
+   * claim about their stock leg, so they are outside this axis entirely.
+   *
+   * Published because a `MeasuredCount` alone reads as "the live book is
+   * covered", and on `admin` it is not. Its 14 sessions since the
+   * 2026-07-30 live-options onset split into THREE regimes, not one:
+   *
+   *   2026-07-30, 07-31, 08-03  — no ledger row at all (the permanent TRA-2888
+   *                               hole). Absent from `days[]`; see the
+   *                               `eodInterior*` axes.
+   *   2026-08-04 .. 2026-08-11  — 6 rows, `equitySourceEra:
+   *                               'unstamped-pre-tra3349'`, UNSTAMPED. Their
+   *                               `closingEquity` is frozen at 2603.49 for the
+   *                               whole run (the TRA-3288 preserved demo
+   *                               PaperAccount) while options booked -$462, so
+   *                               `stockDaily: 0` there is the FROZEN SURFACE,
+   *                               not the deliberate broker-row `0`. These are
+   *                               permanently unprobeable — counted here.
+   *   2026-08-12 .. 2026-08-21  — 8 broker-shaped rows, probe stamped. The only
+   *                               sessions this axis can speak about.
+   *
+   * A reader that does not separate the second regime from the third will treat
+   * "`stockDaily` is 0 on all 14 post-onset sessions" as one phenomenon with one
+   * cause. It is two, and only one of them is by design.
+   */
+  stockLegProbeUnstampedCount: number;
   /**
    * TRA-3948 — **THE DENOMINATOR BEHIND {@link stockLegProbeOk}.** Measured
    * rows where a material residual was even POSSIBLE: at least one probe
@@ -2682,6 +2709,7 @@ export function summarizeLiveStockLegProbe(
     stockLegProbeOk: boolean | null;
     stockLegProbeMeasuredCount: number;
     stockLegProbeNotMeasuredCount: number;
+    stockLegProbeUnstampedCount: number;
     stockLegProbeDiscriminatingCount: number;
     stockLegProbeOffendingDates: string[];
     maxStockLegProbeUsd: number | null;
@@ -2692,6 +2720,7 @@ export function summarizeLiveStockLegProbe(
   liveStockLegProbeOk: boolean | null;
   liveStockLegProbeMeasuredCount: number;
   liveStockLegProbeNotMeasuredCount: number;
+  liveStockLegProbeUnstampedCount: number;
   liveStockLegProbeDiscriminatingCount: number;
   liveStockLegProbeOffendingBooks: Array<{
     username: string;
@@ -2718,6 +2747,13 @@ export function summarizeLiveStockLegProbe(
     ),
     liveStockLegProbeNotMeasuredCount: liveBooks.reduce(
       (n, e) => n + e.stockLegProbeNotMeasuredCount,
+      0,
+    ),
+    // Live rows the writer never made a claim about (`admin` 2026-08-04..08-11,
+    // `equitySourceEra` = unstamped-pre-tra3349, frozen demo equity). Non-zero
+    // beside a green means the axis is speaking about a SUBSET of the live book.
+    liveStockLegProbeUnstampedCount: liveBooks.reduce(
+      (n, e) => n + e.stockLegProbeUnstampedCount,
       0,
     ),
     liveStockLegProbeDiscriminatingCount: liveBooks.reduce(
@@ -4081,6 +4117,11 @@ export function reconcilePnl(
   const stockLegProbeNotMeasuredCount = days.filter(
     d => d.stockLegBasis !== null && (d.stockLegProbeUsd == null),
   ).length;
+  // Rows the writer made NO claim about. Not a failure — but publishing only the
+  // measured count would read as "the live book is covered", and on `admin` 6 of
+  // its 11 present post-onset rows are `unstamped-pre-tra3349` with a frozen
+  // demo `closingEquity`, permanently outside this axis.
+  const stockLegProbeUnstampedCount = days.filter(d => d.stockLegBasis === null).length;
   // DISCRIMINATING = a material residual was reachable on this row. Every
   // operand the writer differences is checked, not just the equity delta: a
   // session that moved $0 but booked $400 of options could still have produced a
@@ -4543,6 +4584,7 @@ export function reconcilePnl(
     stockLegProbeOk,
     stockLegProbeMeasuredCount: stockLegProbeRows.length,
     stockLegProbeNotMeasuredCount,
+    stockLegProbeUnstampedCount,
     stockLegProbeDiscriminatingCount: stockLegProbeDiscriminatingRows.length,
     stockLegProbeOffendingDates,
     maxStockLegProbeUsd:

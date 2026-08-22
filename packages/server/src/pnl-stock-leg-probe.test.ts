@@ -144,6 +144,8 @@ describe('TRA-3948 — vacuity is its own state, and it is not green', () => {
     const r = reconcilePnl([snap('2026-08-20', 12, 3)], new Map(), BASELINE);
     expect(r.stockLegProbeMeasuredCount).toBe(0);
     expect(r.stockLegProbeNotMeasuredCount).toBe(0);
+    // The row exists and carries no basis: outside the axis, not failing it.
+    expect(r.stockLegProbeUnstampedCount).toBe(1);
     expect(r.stockLegProbeOk).toBeNull();
     // `0` here is the `every`-on-the-empty-set pass wearing a number — the exact
     // shape `maxStockLegDriftUsd` was reporting on the live cohort.
@@ -211,6 +213,7 @@ const book = (username: string, mode: string, over: Partial<ProbeBook> = {}): Pr
   stockLegProbeOk: null,
   stockLegProbeMeasuredCount: 0,
   stockLegProbeNotMeasuredCount: 0,
+  stockLegProbeUnstampedCount: 0,
   stockLegProbeDiscriminatingCount: 0,
   stockLegProbeOffendingDates: [],
   maxStockLegProbeUsd: null,
@@ -281,6 +284,28 @@ describe('TRA-3948 — the fleet fold', () => {
     expect(s.liveStockLegProbeOk).toBeNull();
     expect(s.liveStockLegProbeDiscriminatingCount).toBe(0);
     expect(s.maxLiveStockLegProbeUsd).toBe(0);
+  });
+
+  it('counts the UNSTAMPED live rows, so a green cannot read as full coverage', () => {
+    // `admin`'s 14 sessions since the 2026-07-30 onset are THREE regimes, not
+    // one: 3 sessions with no row at all (the permanent TRA-2888 hole), 6 rows
+    // dated 2026-08-04..08-11 with `equitySourceEra: 'unstamped-pre-tra3349'`
+    // whose `closingEquity` is FROZEN at 2603.49 across the whole run (the
+    // TRA-3288 preserved demo PaperAccount) while options booked -$462, and 8
+    // broker-shaped rows this axis can actually speak about. `stockDaily: 0` on
+    // the middle regime is the frozen surface, NOT the deliberate broker-row 0.
+    const s = summarizeLiveStockLegProbe([
+      book('admin', 'live', {
+        stockLegProbeOk: true,
+        stockLegProbeMeasuredCount: 8,
+        stockLegProbeDiscriminatingCount: 4,
+        stockLegProbeUnstampedCount: 6,
+        maxStockLegProbeUsd: 0,
+      }),
+    ]);
+    expect(s.liveStockLegProbeOk).toBe(true);
+    // ...but the green covers 8 of 14 post-onset sessions, and the payload says so.
+    expect(s.liveStockLegProbeUnstampedCount).toBe(6);
   });
 
   it('a live book whose probe cannot run surfaces as a coverage hole beside the null', () => {
