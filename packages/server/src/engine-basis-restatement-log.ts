@@ -75,7 +75,26 @@ export type EngineBasisRestatementSource =
    * the one whose truth rests on the `provenance` string beside it rather than
    * on bytes we wrote ourselves.
    */
-  | 'operator_restatement';
+  | 'operator_restatement'
+  /**
+   * TRA-3960 — a `desk_add` lot was MINTED (TRA-3909) and this is the durable
+   * line saying what priced it. `premiumPaidBefore` is the broker's blended
+   * `cost_basis / quantity / 100` for the symbol (what the row would have
+   * carried under the pre-TRA-3909 copy); `premiumPaidAfter` is the lot's own
+   * basis. Two sources, kept apart because they are different CLAIMS:
+   *
+   *   • `desk_lot_mint_capture_fill` — the desk's own `buy_to_open` by order
+   *     id, from the TRA-3939 capture store. Durable evidence; the order ids
+   *     are in `provenance`.
+   *   • `desk_lot_mint_residual` — `broker_cost − engine_recorded_cost`. Exact
+   *     while the engine sibling is open, and unreadable the day after it
+   *     closes — which is the hole TRA-3960 was filed on.
+   *
+   * Neither is counted in `restated` / `repaired` / `operatorRestated`: a mint
+   * moves no existing basis.
+   */
+  | 'desk_lot_mint_capture_fill'
+  | 'desk_lot_mint_residual';
 
 /** One witnessed restatement: both sides of an edit that is otherwise unobservable. */
 export interface EngineBasisRestatementRecord {

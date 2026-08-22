@@ -3036,6 +3036,28 @@ export interface OptionPosition {
    */
   deskAddSleeve?: 'single_leg_rv' | 'single_leg_otm' | 'single_leg_directional';
   /**
+   * TRA-3960 — WHERE a `desk_add` lot's `premiumPaid` came from, stamped at the
+   * mint and carried with the row (it rides the snapshot like `deskAddSleeve`).
+   *
+   *   • `capture_fill` — the desk's own `buy_to_open`, by order id, read from
+   *     the TRA-3939 durable broker-order capture. `orderIds` names them.
+   *   • `residual_identity` — `broker_cost − engine_recorded_cost` over the
+   *     residual contracts (TRA-3909). Exact while the engine sibling is open;
+   *     its evidence EXPIRES when that sibling closes.
+   *
+   * Absent on rows minted before this stamp existed. A reader must not default
+   * it: a residual-sourced basis and a capture-sourced one are different
+   * claims about the same number, and this is the only field that says which.
+   */
+  deskAddBasis?: {
+    source: 'capture_fill' | 'residual_identity';
+    orderIds: number[];
+    /** The residual identity's own figure at mint time, whichever source won. */
+    residualPremiumPaid: number;
+    /** ms epoch of the mint. */
+    at: number;
+  };
+  /**
    * TRA-3946 (TRA-3907 phase 1) — per-LOT add provenance.
    *
    * The board's 08-20 posture (TRA-3896/3904/3909) is per-lot: every add is its

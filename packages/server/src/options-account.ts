@@ -114,8 +114,18 @@ import {
   type LotAdoptionPlan,
   type LotAdoptionRefusal,
   type LotAdoptionRowView,
+  type LotAdoptionCaptureView,
   type LotProvenance,
 } from './live-lot-adoption.js';
+// TRA-3960 — the durable broker-order capture (TRA-3939) as the adoption
+// planner's FIRST basis source. A leaf module (data-dir + observability only),
+// so this import is acyclic.
+import {
+  capturedBrokerOrders,
+  engineSubmittedProductionOrderIds,
+  summarizeEngineSubmitWitness,
+  etDayOf,
+} from './tra3939-order-provenance-capture.js';
 export type {
   AdoptedLotView,
   LiveLotAdoptionReport,
@@ -3504,6 +3514,10 @@ export class PaperOptionsAccount {
   } | null = null;
   /** TRA-3909 — monotonic: desk lots minted since boot. */
   private lotAdoptionMintedTotal = 0;
+  /** TRA-3960 — …of which priced off the TRA-3939 capture store (order id + price). */
+  private lotAdoptionMintedFromCaptureTotal = 0;
+  /** TRA-3960 — …of which priced off the residual identity. */
+  private lotAdoptionMintedFromResidualTotal = 0;
   /** TRA-3909 — monotonic: engine rows unblended (shrunk back to their own lot). */
   private lotAdoptionSplitTotal = 0;
   /** TRA-3909 — monotonic: symbol-passes that declined. The refusal's denominator. */
@@ -9496,6 +9510,58 @@ export class PaperOptionsAccount {
   }
 
   /**
+   * TRA-3960 — the durable line for a `desk_add` MINT: which source priced it.
+   *
+   * Written in one step (the row is already at its final shape when this is
+   * called) and counted in NONE of `restated` / `repaired` / `operatorRestated`
+   * — a mint moves no existing basis, and folding it into any of those would
+   * tell a reader a sweep moved a number it never touched. The split lives in
+   * `source`; the order ids ride `provenance` on the capture-sourced line, the
+   * residual arithmetic on the other.
+   */
+  private recordDeskLotMintBasis(opt: OptionPosition, brokerBlendPremium: number, plan: LotAdoptionPlan): void {
+    if (!plan.mint) return;
+    const before = brokerBlendPremium;
+    const after = opt.premiumPaid;
+    const ratioBefore = (v: number): number => (before > 0 ? v / before : Number.NaN);
+    const ratioAfter = (v: number): number => (after > 0 ? v / after : Number.NaN);
+    const source: EngineBasisRestatementSource = plan.mint.basisSource === 'capture_fill'
+      ? 'desk_lot_mint_capture_fill'
+      : 'desk_lot_mint_residual';
+    const provenance = plan.mint.basisSource === 'capture_fill'
+      ? `tra3939 capture: order(s) ${plan.mint.captureOrderIds.join(', ')} = $${plan.mint.captureCostUsd} over ${plan.mint.contracts} ct; residual identity said ${plan.mint.residualPremiumPaid}`
+      : `residual identity: broker $${plan.brokerCostBasisUsd} − engine-recorded $${plan.recordedCostBasisUsd} = $${plan.mint.residualUsd} over ${plan.mint.contracts} ct; capture declined: ${plan.mint.captureFallback}`;
+    const rec: EngineBasisRestatement = {
+      ts: Date.now(),
+      positionId: opt.id,
+      optionSymbol: opt.optionSymbol ?? '',
+      contracts: opt.contracts,
+      premiumPaidBefore: before,
+      premiumPaidAfter: after,
+      ratio: before > 0 ? after / before : Number.NaN,
+      brokerCostBasisUsd: plan.brokerCostBasisUsd,
+      source,
+      provenance,
+      tp1PremiumBefore: opt.tp1Premium,
+      tp1PremiumAfter: opt.tp1Premium,
+      stopLossPremiumBefore: opt.stopLossPremium,
+      stopLossPremiumAfter: opt.stopLossPremium,
+      trailingStopPremiumBefore: opt.trailingStopPremium,
+      trailingStopPremiumAfter: opt.trailingStopPremium,
+      trailingActive: opt.trailingActive,
+      tp1RatioBefore: ratioBefore(opt.tp1Premium),
+      tp1RatioAfter: ratioAfter(opt.tp1Premium),
+      stopRatioBefore: ratioBefore(opt.stopLossPremium),
+      stopRatioAfter: ratioAfter(opt.stopLossPremium),
+    };
+    this.engineBasisRestatements.push(rec);
+    if (this.engineBasisRestatements.length > ENGINE_BASIS_RESTATEMENT_LOG_CAP) {
+      this.engineBasisRestatements.splice(0, this.engineBasisRestatements.length - ENGINE_BASIS_RESTATEMENT_LOG_CAP);
+    }
+    appendEngineBasisRestatement(engineBasisRestatementDataDir(), { ...rec });
+  }
+
+  /**
    * TRA-3010 — read side of the gate-A instrument. `candidates` is the
    * denominator: zero means the branch never ran, which is BLIND, not a pass.
    */
@@ -10730,6 +10796,48 @@ export class PaperOptionsAccount {
     let mintedLast = 0;
     let splitLast = 0;
     let symbolsExamined = 0;
+    // TRA-3960 — the capture store, read ONCE per pass (it is a disk read) and
+    // LAZILY (only a live symbol with a local row ever asks). `null` until the
+    // first ask, so a pass that never reaches a live symbol never opens the
+    // file — and the planner records an unasked capture as `capture_absent`,
+    // never as "consulted and empty".
+    let captureBase: { orders: LotAdoptionCaptureView['orders']; attestedEtDays: string[]; submitIds: Set<number> } | 'unconfigured' | null = null;
+    const captureFor = (occ: string, recordedOrderIds: readonly number[]): LotAdoptionCaptureView | null => {
+      if (captureBase === null) {
+        const witness = summarizeEngineSubmitWitness();
+        // No data dir ⇒ the store does not EXIST on this process. That is
+        // `capture_absent`, not an empty store — an empty witness and an absent
+        // one are the distinction TRA-3939 is built around.
+        if (witness.dataDir === null) captureBase = 'unconfigured';
+        else captureBase = {
+          orders: capturedBrokerOrders().map(o => {
+            const ms = o.createDate === null ? NaN : Date.parse(o.createDate);
+            return {
+              orderId: o.id,
+              status: o.status,
+              orderClass: o.orderClass,
+              side: o.side,
+              optionSymbol: o.optionSymbol,
+              execQuantity: o.execQuantity,
+              avgFillPrice: o.avgFillPrice,
+              etDay: Number.isFinite(ms) ? etDayOf(ms) : null,
+            };
+          }),
+          attestedEtDays: witness.coveredEtDays,
+          // The submit ledger is the witness; an unarmed recorder attests no day,
+          // and `coveredEtDays` is already empty in that case.
+          submitIds: witness.armed ? engineSubmittedProductionOrderIds() : new Set<number>(),
+        };
+      }
+      if (captureBase === 'unconfigured') return null;
+      const engineOrderIds = new Set<number>(captureBase.submitIds);
+      for (const id of recordedOrderIds) engineOrderIds.add(id);
+      return {
+        orders: captureBase.orders.filter(o => o.optionSymbol === occ),
+        attestedEtDays: captureBase.attestedEtDays,
+        engineOrderIds,
+      };
+    };
 
     for (const incoming of positions) {
       const occ = incoming.optionSymbol;
@@ -10769,6 +10877,9 @@ export class PaperOptionsAccount {
           stoppedAtClose: recorded.stoppedAtClose,
         },
         { live },
+        // TRA-3960 — only a live symbol with a recorded engine side can reach
+        // the mint, so only that shape pays for the capture read.
+        live && recorded !== null ? captureFor(occ, recorded.orderIds) : null,
       );
 
       if (plan.refusals.length > 0) {
@@ -10929,6 +11040,14 @@ export class PaperOptionsAccount {
         importedFromTradier: true,
         adoptionAuthority: 'desk_add',
         deskAddSleeve: sleeve,
+        // TRA-3960 — which source priced this lot. On the row, so the route and
+        // the snapshot can tell a capture-sourced basis from a residual one.
+        deskAddBasis: {
+          source: plan.mint.basisSource,
+          orderIds: [...plan.mint.captureOrderIds],
+          residualPremiumPaid: plan.mint.residualPremiumPaid,
+          at: Date.now(),
+        },
         ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
       };
       applyEngineOriginRiskThresholds(position, sleeve, this.otmRiskParams, this.rvRiskParams);
@@ -10955,7 +11074,16 @@ export class PaperOptionsAccount {
       // journal has never seen and is silently dropped.
       this.queueJournalImportOpen(position);
       this.lotAdoptionMintedTotal += 1;
+      if (plan.mint.basisSource === 'capture_fill') this.lotAdoptionMintedFromCaptureTotal += 1;
+      else this.lotAdoptionMintedFromResidualTotal += 1;
       minted = 1;
+      // TRA-3960 — the durable line. The mint is the one basis decision on this
+      // book that no reconcile will ever re-derive (the pass is idempotent), so
+      // a process-lifetime log line would be the only record of WHICH source
+      // priced it, and bqb1 restarts several times a day. Before = the broker's
+      // blend for the symbol (what the pre-TRA-3909 copy would have written);
+      // after = the lot's own basis.
+      this.recordDeskLotMintBasis(position, incoming.premiumPaid, plan);
       accountLog.warn('per-lot adoption: desk lot ADOPTED with its own basis and its own stop', {
         issue: 'TRA-3909',
         positionId: position.id,
@@ -10970,7 +11098,16 @@ export class PaperOptionsAccount {
         brokerCostBasisUsd: plan.brokerCostBasisUsd,
         engineRecordedContracts: plan.recordedContracts,
         engineRecordedCostBasisUsd: plan.recordedCostBasisUsd,
-        note: 'basis is the exact residual (broker cost - this engine\'s recorded cost); no order was placed',
+        // TRA-3960 — the split a reader needs: which source, which order ids,
+        // what the other source said, and why the capture declined if it did.
+        basisSource: plan.mint.basisSource,
+        captureOrderIds: plan.mint.captureOrderIds,
+        captureCostUsd: plan.mint.captureCostUsd,
+        residualPremiumPaid: plan.mint.residualPremiumPaid,
+        captureFallback: plan.mint.captureFallback,
+        note: plan.mint.basisSource === 'capture_fill'
+          ? 'basis is the desk\'s own recorded fill from the TRA-3939 capture store (order id + price); no order was placed'
+          : 'basis is the exact residual (broker cost - this engine\'s recorded cost); the capture store declined (see captureFallback); no order was placed',
       });
     }
 
@@ -11038,6 +11175,10 @@ export class PaperOptionsAccount {
         exitInertReason,
         stopArmed,
         riskUnmanagedReason: opt.riskUnmanagedReason ?? null,
+        // TRA-3960 — read off the row's stamp; `null` on pre-stamp mints, never
+        // defaulted to a source.
+        basisSource: opt.deskAddBasis?.source ?? null,
+        basisOrderIds: opt.deskAddBasis ? [...opt.deskAddBasis.orderIds] : [],
       });
     }
     return {
@@ -11053,6 +11194,8 @@ export class PaperOptionsAccount {
       brokerCopyRefusedOnSplitSymbol: this.lotSplitBrokerCopyRefusals,
       crossModeSymbolCollisions: this.crossModeSymbolCollisions,
       deskLotAbsorptionRefusals: this.deskLotAbsorptionRefusals,
+      mintedFromCaptureTotal: this.lotAdoptionMintedFromCaptureTotal,
+      mintedFromResidualTotal: this.lotAdoptionMintedFromResidualTotal,
       gates: {
         autoManageImportedTradierOptions: this.autoManageImportedTradierOptions,
         brokerMirroring: opts.brokerMirroring,

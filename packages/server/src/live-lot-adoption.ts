@@ -54,6 +54,89 @@
 // wearing a different hat, so every way the ledger can be incomplete is a
 // REFUSAL and never a fallback to the blend. There is no branch below that
 // averages anything.
+//
+// ── TRA-3960: the residual's evidence EXPIRES in about one trading day ──────
+// The residual is exact only while the engine's side is non-zero. The moment
+// the engine sibling closes, Tradier's `/positions` reports the survivor at the
+// two-lot AVERAGE, and `(X − 0) / (N − 0)` is not a residual — it is the blend
+// wearing one. On the live BAC row that was 1.41 for two days (TRA-3895 →
+// TRA-3958), and the only thing that stopped it being re-derived here was the
+// upstream `no_engine_row` refusal. Two things follow, both below:
+//
+//   1. The capture store (TRA-3939, `tra3939-broker-order-capture.jsonl`) is
+//      consulted FIRST. It holds the broker's one-day `/orders` window, day by
+//      day, forever — so a desk `buy_to_open` with an order id and a price is
+//      still readable next week, when `/orders` has long since rolled over and
+//      the fill ledger (which never held a desk order) still answers nothing.
+//      An order id and a price beat an arithmetic residual.
+//   2. The residual identity REFUSES when its engine side is zero
+//      (`engine_side_zero`). That refusal did not exist; it is the one that
+//      would have caught BAC.
+//
+// Whichever source priced the lot is carried on the mint step as DATA
+// (`basisSource`), so a capture-sourced basis and a residual-sourced one are
+// distinguishable on the row, in the log and on the route.
+
+/**
+ * TRA-3960 — one captured broker order, narrowed to what the planner reads.
+ * The caller builds these from `capturedBrokerOrders()`; `etDay` is derived by
+ * the caller from `createDate` so this module stays clock-free.
+ */
+export interface LotAdoptionCapturedOrder {
+  orderId: number;
+  status: string;
+  orderClass: string;
+  side: string | null;
+  optionSymbol: string | null;
+  execQuantity: number | null;
+  avgFillPrice: number | null;
+  /** ET day of `createDate`, or `null` when the capture row carried no date. */
+  etDay: string | null;
+}
+
+/**
+ * TRA-3960 — the capture store as a basis source.
+ *
+ * ⚠️ `attestedEtDays` and `engineOrderIds` are the LOAD-BEARING fields, not
+ * `orders`. A desk order and an engine order are the same shape in the
+ * broker's list (no submit path of ours sets a `tag`), so "not one of ours" is
+ * only a reading on a day the submit recorder is attested for — the same
+ * empty-witness-is-not-an-absent-witness rule TRA-3939 is built around. On an
+ * unattested day an unrecognised id could be an engine order the ledger missed
+ * (TRA-2959: 7 of 11 fills never reached it), and pricing the desk lot off the
+ * ENGINE's fill is a mis-statement with an order id on it.
+ */
+export interface LotAdoptionCaptureView {
+  orders: readonly LotAdoptionCapturedOrder[];
+  /** `EngineSubmitWitnessSummary.coveredEtDays` — the days "not ours" is a reading. */
+  attestedEtDays: readonly string[];
+  /** Submit-ledger production ids ∪ this symbol's fill-ledger `orderIds`. */
+  engineOrderIds: ReadonlySet<number>;
+}
+
+/** TRA-3960 — where a minted lot's `premiumPaid` came from. Never absent. */
+export type LotMintBasisSource =
+  /** The desk's own `buy_to_open`, by order id, from the TRA-3939 capture. */
+  | 'capture_fill'
+  /** `broker_cost − engine_cost` over the residual contracts (TRA-3909). */
+  | 'residual_identity';
+
+/**
+ * TRA-3960 — why a mint fell back to the residual. Published on the step so a
+ * residual-sourced mint NEXT to a populated capture store is legible as the
+ * capture declining, not as the capture never having been asked.
+ */
+export type LotMintCaptureFallbackReason =
+  /** The caller passed no capture view (the store is not wired on this path). */
+  | 'capture_absent'
+  /** No filled `buy_to_open` on this OCC in the store that is not an engine id. */
+  | 'no_desk_fill_captured'
+  /** Candidates exist only on days the submit witness cannot speak for. */
+  | 'day_unattested'
+  /** A candidate carries no usable `avgFillPrice` / `execQuantity`. */
+  | 'unpriced'
+  /** The attested desk fills do not sum to the residual contracts. */
+  | 'quantity_mismatch';
 
 /** TRA-3909 — how a row on the symbol got onto this book. */
 export type LotProvenance =
@@ -170,6 +253,15 @@ export type LotAdoptionRefusalReason =
    */
   | 'residual_non_positive'
   /**
+   * TRA-3960 — the ENGINE side of the residual identity is zero: no recorded
+   * engine contracts, no recorded engine dollars, or no engine contracts held.
+   * `(broker_cost − 0) / (broker_ct − 0)` is not a residual, it is the broker's
+   * AVERAGE wearing one — on BAC that average was 1.41, and neither lot ever
+   * traded there. Refused here, in the arithmetic, so no re-ordering of the
+   * upstream guards can ever reach the blend.
+   */
+  | 'engine_side_zero'
+  /**
    * Desk rows on this symbol hold MORE contracts than the broker reports, i.e.
    * the desk closed part of their own lot. Reducing it means booking a close,
    * and this change places no order and books no exit (TRA-3909 non-negotiable).
@@ -197,11 +289,91 @@ export interface LotSplitStep {
   toPremiumPaid: number;
 }
 
-/** TRA-3909 — mint a row for the desk's contracts at their own residual basis. */
+/**
+ * TRA-3909 — mint a row for the desk's contracts at their own basis.
+ *
+ * TRA-3960 — `premiumPaid` is the figure to install; `basisSource` says where
+ * it came from. BOTH candidate figures are always carried (`residualPremiumPaid`
+ * is computed whatever wins) so a capture-sourced mint that disagrees with the
+ * residual is visible as a disagreement rather than as one number.
+ */
 export interface LotMintStep {
   contracts: number;
   premiumPaid: number;
+  /** `broker_cost − engine_recorded − already-adopted`, in dollars. */
   residualUsd: number;
+  basisSource: LotMintBasisSource;
+  /** The residual identity's own figure, whichever source won. */
+  residualPremiumPaid: number;
+  /** Order ids the capture priced this lot from. Empty on `residual_identity`. */
+  captureOrderIds: number[];
+  /** `Σ execQuantity × avgFillPrice × 100` over `captureOrderIds`, else `null`. */
+  captureCostUsd: number | null;
+  /** Why the capture did NOT price this lot. `null` iff `basisSource === 'capture_fill'`. */
+  captureFallback: LotMintCaptureFallbackReason | null;
+}
+
+/**
+ * TRA-3960 — find the desk's own fills for `residualContracts` on `optionSymbol`
+ * in the capture store. PURE. Returns the priced lot, or the reason it declined.
+ *
+ * Attribution is by EXCLUSION on an ATTESTED day, never by shape: a filled
+ * `buy_to_open` on this OCC whose id the engine cannot claim, on a day the
+ * submit witness covers. Candidates on unattested days are named, not used.
+ * The candidates must sum EXACTLY to the residual — a partial match would price
+ * some of the residual off a fill and the rest off nothing.
+ */
+export function priceResidualFromCapture(
+  capture: LotAdoptionCaptureView | null | undefined,
+  optionSymbol: string,
+  residualContracts: number,
+):
+  | { ok: true; premiumPaid: number; costUsd: number; orderIds: number[] }
+  | { ok: false; reason: LotMintCaptureFallbackReason; detail: string } {
+  if (!capture) return { ok: false, reason: 'capture_absent', detail: 'no capture view was supplied on this path.' };
+  const attested = new Set(capture.attestedEtDays);
+  const onSymbol = capture.orders.filter(o =>
+    o.optionSymbol === optionSymbol
+    && o.orderClass === 'option'
+    && o.side === 'buy_to_open'
+    && o.status === 'filled'
+    && Number.isFinite(o.orderId)
+    && !capture.engineOrderIds.has(o.orderId));
+  if (onSymbol.length === 0) {
+    return { ok: false, reason: 'no_desk_fill_captured', detail: `the capture store holds no filled \`buy_to_open\` on ${optionSymbol} outside the engine's own order ids.` };
+  }
+  const attestedFills = onSymbol.filter(o => o.etDay !== null && attested.has(o.etDay));
+  if (attestedFills.length === 0) {
+    const days = [...new Set(onSymbol.map(o => o.etDay ?? 'undated'))].sort();
+    return {
+      ok: false,
+      reason: 'day_unattested',
+      detail: `${onSymbol.length} candidate fill(s) on ${days.join(', ')} but the submit witness attests none of those days, so "not the engine's order" is not a reading there.`,
+    };
+  }
+  let qty = 0;
+  let costUsd = 0;
+  const orderIds: number[] = [];
+  for (const o of attestedFills) {
+    if (!usable(o.execQuantity) || !usable(o.avgFillPrice) || !Number.isInteger(o.execQuantity)) {
+      return { ok: false, reason: 'unpriced', detail: `captured order ${o.orderId} carries execQuantity ${o.execQuantity} / avgFillPrice ${o.avgFillPrice}; a fill with no price cannot be a basis.` };
+    }
+    qty += o.execQuantity;
+    costUsd += o.execQuantity * o.avgFillPrice * 100;
+    orderIds.push(o.orderId);
+  }
+  if (qty !== residualContracts) {
+    return {
+      ok: false,
+      reason: 'quantity_mismatch',
+      detail: `attested desk fills on ${optionSymbol} (orders ${orderIds.join(', ')}) total ${qty} contract(s) against a residual of ${residualContracts}; a partial attribution would price part of the lot off nothing.`,
+    };
+  }
+  const premiumPaid = costUsd / (qty * 100);
+  if (!usable(premiumPaid)) {
+    return { ok: false, reason: 'unpriced', detail: `capture cost ${costUsd} over ${qty} contract(s) is not a positive finite premium.` };
+  }
+  return { ok: true, premiumPaid, costUsd: round2(costUsd), orderIds };
 }
 
 export interface LotAdoptionPlan {
@@ -258,6 +430,14 @@ export interface AdoptedLotView {
     | null;
   stopArmed: boolean;
   riskUnmanagedReason: string | null;
+  /**
+   * TRA-3960 — where this lot's `premiumPaid` came from, read off the row's
+   * `deskAddBasis` stamp. `null` on rows minted before the stamp existed
+   * (pre-TRA-3960 residual mints); never defaulted to a source.
+   */
+  basisSource: LotMintBasisSource | null;
+  /** TRA-3960 — the capture order id(s) behind a `capture_fill` basis. */
+  basisOrderIds: number[];
 }
 
 /**
@@ -295,6 +475,14 @@ export interface LiveLotAdoptionReport {
    * absorbing another and then decaying into `engine_origin`.
    */
   deskLotAbsorptionRefusals: number;
+  /**
+   * TRA-3960 — mints priced off the TRA-3939 capture store vs off the residual
+   * identity, since boot. `mintedTotal === mintedFromResidualTotal` with a
+   * populated capture store is the capture being DECLINED on every mint (see
+   * `captureFallback` on the log line), not the capture being unwired.
+   */
+  mintedFromCaptureTotal: number;
+  mintedFromResidualTotal: number;
   /**
    * TRA-3916 — the two `checkExits` gates that precede the authority test and
    * apply to every imported row, echoed so a reader can see WHY a lot's
@@ -338,6 +526,12 @@ export function planLotAdoption(
   rows: readonly LotAdoptionRowView[],
   recorded: LotAdoptionLedgerView | null,
   opts: { live: boolean },
+  /**
+   * TRA-3960 — the capture store. `undefined`/`null` is recorded on the mint as
+   * `captureFallback: 'capture_absent'`, never silently read as "consulted and
+   * empty".
+   */
+  capture?: LotAdoptionCaptureView | null,
 ): LotAdoptionPlan {
   const optionSymbol = broker.optionSymbol;
   const engineRows = rows.filter(r => r.provenance === 'engine');
@@ -410,6 +604,16 @@ export function planLotAdoption(
   if (recorded.unpricedFills > 0) {
     return refuse('oracle_unpriced', `${recorded.unpricedFills} recorded open fill(s) carry no usable price, so the engine-side cost basis is an average over the priced subset only and the residual would absorb the difference.`);
   }
+  // TRA-3960 — the engine side of the subtraction must be NON-ZERO before any
+  // residual is computed. Checked on its own, ahead of the generic usability
+  // test, because "zero" is the specific shape that returns the broker's blend
+  // and it deserves its own name in the refusal list.
+  if (recorded.contracts === 0 || recorded.costBasisUsd === 0 || engineHeldContracts === 0) {
+    return refuse(
+      'engine_side_zero',
+      `recorded engine side is ${recorded.contracts} ct / $${round2(recorded.costBasisUsd)} and the engine rows hold ${engineHeldContracts}; (broker ${brokerCostBasisUsd} − 0) / (${brokerContracts} − 0) is the broker's average, not a residual, so the identity refuses rather than re-derive the blend.`,
+    );
+  }
   if (!usable(recorded.contracts) || !usable(recorded.premiumPaid) || !usable(recorded.costBasisUsd)) {
     return refuse('oracle_unpriced', 'the recorded fill quantity or weighted basis is not a positive finite number.');
   }
@@ -472,15 +676,53 @@ export function planLotAdoption(
     (a, r) => a + (usable(r.premiumPaid) && usable(r.contracts) ? r.premiumPaid * r.contracts * 100 : 0),
     0,
   );
+  // ── The residual identity. ⛔ Guarded again HERE, at the arithmetic: a zero
+  // engine side returns the blend, and this guard must hold whatever is
+  // re-ordered above it (TRA-3960).
+  if (!(recorded.costBasisUsd > 0) || !(recorded.contracts > 0)) {
+    return refuse('engine_side_zero', `residual identity reached with engine side ${recorded.contracts} ct / $${round2(recorded.costBasisUsd)}; refused at the arithmetic.`);
+  }
   const residualUsd = round2(brokerCostBasisUsd - recorded.costBasisUsd - deskCarriedUsd);
-  const premiumPaid = residualUsd / (residualContracts * 100);
-  if (!usable(residualUsd) || !usable(premiumPaid)) {
+  const residualPremiumPaid = residualUsd / (residualContracts * 100);
+  if (!usable(residualUsd) || !usable(residualPremiumPaid)) {
+    // A non-positive residual is the book and the ledger DISAGREEING, not a
+    // pricing question — so a captured fill does not rescue it. The capture is
+    // a better PRICE for a lot the identity already admits exists; it is not
+    // evidence that overrides an inconsistency on the engine side.
     return refuse(
       'residual_non_positive',
       `residual = broker ${brokerCostBasisUsd} − engine-recorded ${round2(recorded.costBasisUsd)} − already-adopted ${round2(deskCarriedUsd)} = ${residualUsd} over ${residualContracts} contract(s); a desk lot cannot have cost nothing, so the derivation is declined rather than rounded.`,
     );
   }
 
-  plan.mint = { contracts: residualContracts, premiumPaid, residualUsd };
+  // ── TRA-3960: the capture store is consulted FIRST for the PRICE ───────────
+  // A recorded desk fill (order id + price) beats the arithmetic. It is also the
+  // only source that survives the engine sibling closing, because the residual
+  // above has no engine side left at that point and refuses.
+  const captured = priceResidualFromCapture(capture, optionSymbol, residualContracts);
+  if (captured.ok) {
+    plan.mint = {
+      contracts: residualContracts,
+      premiumPaid: captured.premiumPaid,
+      residualUsd,
+      basisSource: 'capture_fill',
+      residualPremiumPaid,
+      captureOrderIds: captured.orderIds,
+      captureCostUsd: captured.costUsd,
+      captureFallback: null,
+    };
+    return plan;
+  }
+
+  plan.mint = {
+    contracts: residualContracts,
+    premiumPaid: residualPremiumPaid,
+    residualUsd,
+    basisSource: 'residual_identity',
+    residualPremiumPaid,
+    captureOrderIds: [],
+    captureCostUsd: null,
+    captureFallback: captured.reason,
+  };
   return plan;
 }
