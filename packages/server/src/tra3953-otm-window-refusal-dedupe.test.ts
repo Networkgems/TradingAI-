@@ -356,9 +356,19 @@ describe('TRA-3953 — the predicate is WIRED into the OTM dedup', () => {
     expect(unshift).toBeGreaterThan(stamp);
   });
 
-  it('NO OTHER writer stamps the code — one producer, so the key stays unambiguous', () => {
-    const stamps = [...ENGINE_SRC.matchAll(/signalSkipReasonCode\s*=/g)];
-    expect(stamps).toHaveLength(1);
+  it('NO OTHER writer stamps the WINDOW code — one producer, so the key stays unambiguous', () => {
+    // TRA-3944 added a second writer of the FIELD (the contract-floor codes,
+    // `contract_floor_*`), which is fine: the dedup keys on the VALUE, and the
+    // invariant this guards is that `entry_window_closed` has exactly one
+    // producer. Assert that, not the field's writer count.
+    const windowStamps = [...ENGINE_SRC.matchAll(/signalSkipReasonCode\s*=\s*OTM_ENTRY_WINDOW_CLOSED_CODE/g)];
+    expect(windowStamps).toHaveLength(1);
+    const allStamps = [...ENGINE_SRC.matchAll(/signalSkipReasonCode\s*=/g)];
+    for (const m of allStamps) {
+      const line = ENGINE_SRC.slice(m.index!, ENGINE_SRC.indexOf('\n', m.index!));
+      // Every other writer stamps a NAMED code from another module, never a literal.
+      expect(line).toMatch(/= (OTM_ENTRY_WINDOW_CLOSED_CODE|otmFloorPick\.code);/);
+    }
   });
 });
 

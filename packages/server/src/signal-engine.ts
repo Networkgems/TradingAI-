@@ -192,6 +192,21 @@ import {
   otmDedupeSuppressionEndMs,
   OTM_ENTRY_WINDOW_CLOSED_CODE,
 } from './otm-entry-window.js';
+// TRA-3944 — WHICH contract the OTM sleeve may buy, and HOW MANY. Entry-side
+// only, both books, engine-opened rows only (imported rows are audited, not
+// gated — see the module header).
+import {
+  resolveOtmContractFloor,
+  applyOtmContractFloor,
+  otmContractFloorVerdict,
+  otmContractFloorOpenRowVerdict,
+  capOtmEntryContracts,
+  auditOtmContractFloorRows,
+  otmContractFloorBandIntersects,
+  OTM_CONTRACT_FLOOR_SIZE_CODE,
+  type OtmContractFloorCode,
+  type OtmContractFloorImportedAudit,
+} from './otm-contract-floor.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
 import { sessionEdgeBlackoutVerdict } from './session-edge-blackout-flag.js';
@@ -7507,6 +7522,127 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-3944 — the OTM contract floor as THIS process resolves it. ONE
+   * resolver for the scan path and the health surface (TRA-3829's rule: a
+   * health route that re-derives a rule can report a refusal the scan is not
+   * making). Process env in both books — the floor is a board ruling on the
+   * sleeve, not a demo-flag experiment, and paper must mirror live.
+   */
+  private otmContractFloor() {
+    return resolveOtmContractFloor(process.env);
+  }
+
+  /** TRA-3944 — last live-ledger write per symbol for a CHAIN refusal (hourly brake). */
+  private otmContractFloorChainStamp = new Map<string, number>();
+
+  /**
+   * TRA-3944 — write the CHAIN verdict to the live-enforce ledger under
+   * `contract_floor`. Live book only (the ledger is the armed-live record).
+   * Admits are written on every sweep (they become a nominee, and the nominee
+   * path dedups itself); CHAIN refusals are braked to one row per symbol per
+   * hour so an un-buyable chain on a 5-minute sweep records ~7 rows a session
+   * rather than 79. The scan-run counter tags every sweep regardless.
+   */
+  private recordOtmContractFloorChainVerdict(
+    sym: string,
+    chain: ReturnType<typeof applyOtmContractFloor>,
+  ): void {
+    if (this.mode !== 'live') return;
+    const now = Date.now();
+    const blocked = chain.refusalCode !== null;
+    if (blocked) {
+      const last = this.otmContractFloorChainStamp.get(sym);
+      if (last !== undefined && now - last < 60 * 60_000) return;
+      this.otmContractFloorChainStamp.set(sym, now);
+    } else {
+      this.otmContractFloorChainStamp.delete(sym);
+    }
+    recordLiveEnforceDecision(
+      'contract_floor',
+      'single_leg_otm',
+      blocked,
+      etDateString(new Date(now)),
+      chain.reason ?? undefined,
+      now,
+      {
+        reasonCode: chain.refusalCode ?? undefined,
+        book: this.alertUsername ?? null,
+        // Chain-level: the selector has not run yet, so there is no nominator
+        // branch to attribute. `null` is the honest reading (TRA-3510's rule).
+        nominator: null,
+      },
+    );
+  }
+
+  /**
+   * TRA-3944 — the PICK half: rules 1–3 re-read on the nominee, then rule 4's
+   * "max 1 open row per underlying". Returns the refusal, or `null` to admit.
+   * Live verdicts land on the `contract_floor` ledger on BOTH branches.
+   */
+  private otmContractFloorPickRejectReason(
+    sym: string,
+    pick: { bid: number; ask: number; delta: number; daysToExpiration: number },
+    floor: ReturnType<typeof resolveOtmContractFloor>,
+    nominator?: LiveEnforceNominator | null,
+  ): { code: OtmContractFloorCode; reason: string } | null {
+    const v = otmContractFloorVerdict(pick, floor);
+    let out: { code: OtmContractFloorCode; reason: string } | null = null;
+    if (!v.admit) {
+      out = { code: v.reasonCode!, reason: v.reason! };
+    } else {
+      const rows = this.optionsAccount.openRowsForUnderlying(sym, this.mode);
+      const rowVerdict = otmContractFloorOpenRowVerdict(rows, floor);
+      if (!rowVerdict.admit) out = { code: rowVerdict.reasonCode!, reason: rowVerdict.reason! };
+    }
+    // BLOCKS only: the chain admit that produced this nominee already wrote
+    // this sweep's `evaluated` row, and writing a second admit here would
+    // double the denominator for every nominee that passes.
+    if (this.mode === 'live' && out !== null) {
+      recordLiveEnforceDecision(
+        'contract_floor',
+        'single_leg_otm',
+        true,
+        etDateString(new Date()),
+        out.reason,
+        Date.now(),
+        {
+          reasonCode: out.code,
+          book: this.alertUsername ?? null,
+          nominator: nominator ?? null,
+        },
+      );
+    }
+    return out;
+  }
+
+  /**
+   * TRA-3944 — the floor on the wire, per book: the effective rule, whether
+   * its |Δ| band even intersects the armed selector's band (it does NOT under
+   * today's defaults — see the module header), and the AC3 imported-row
+   * warning counter for THIS book's open rows.
+   */
+  getOtmContractFloorPosture(): {
+    mode: 'demo' | 'live';
+    floor: ReturnType<typeof resolveOtmContractFloor>;
+    selectorBand: { min: number; max: number };
+    selectorArmed: boolean;
+    bandIntersectsSelector: boolean;
+    importedAudit: OtmContractFloorImportedAudit;
+  } {
+    const floor = this.otmContractFloor();
+    const selectorEnv = this.mode === 'demo' ? this.resolveDemoFlagEnv() : process.env;
+    const selectorBand = resolveAdmissibleBand(selectorEnv);
+    return {
+      mode: this.mode,
+      floor,
+      selectorBand,
+      selectorArmed: isOtmAdmissibleStrikeEnabled(selectorEnv),
+      bandIntersectsSelector: otmContractFloorBandIntersects(floor, selectorBand),
+      importedAudit: auditOtmContractFloorRows(this.optionsAccount.contractFloorAuditRows(), floor),
+    };
+  }
+
+  /**
    * TRA-1670 (TRA-1647B) — the OTHER edge of the entry band: the per-structure
    * entry-delta CEILING.
    *
@@ -11387,6 +11523,45 @@ export class SignalEngine {
         if (result.reason !== 'ok') { scanRun.reject(`scan:${result.reason}`); continue; }
         if (result.candidates.length === 0) { scanRun.reject('no_candidates'); continue; }
 
+        // TRA-3944 (parent TRA-3927, board card `a29b2db8`) — THE CONTRACT
+        // FLOOR, over the WHOLE CHAIN and BEFORE the selector. Rule 5 is why it
+        // sits here and not on the pick: a filter applied to the nominee after
+        // the selector has chosen it can only refuse or clamp, and the ticket
+        // forbids clamping. Running it over the chain lets the selector rank
+        // INSIDE the floor-admissible set (premium ≥ $0.50, |Δ| ∈ [0.25, 0.40],
+        // DTE ∈ [21, 45], hard-refuse ≤ 7), and an empty admissible set is a
+        // refusal of the SETUP with the dominant reason code — countable on
+        // `rejectionsByGate`, on the live-enforce ledger under `contract_floor`,
+        // and in the log.
+        //
+        // Ordered ABOVE `entry_window`, which makes this the one gate whose
+        // `evaluated` is "chains surveyed" rather than "nominees": there is no
+        // nominee yet to stamp a clock verdict on, and a chain with nothing
+        // buyable under the floor is the same fact in and out of window. The
+        // live ledger write for a CHAIN refusal is braked to one row per symbol
+        // per hour (the churn-brake cadence) so a 5-minute sweep on a chain
+        // that stays un-buyable all session records ~7 verdicts, not 79; the
+        // scan-run counter still tags every sweep.
+        //
+        // BOTH books (paper is the mirror AC2 is graded against). Real-money
+        // arm, ~$250 row size, 2-row cap: untouched — none of them is read here.
+        const otmFloor = this.otmContractFloor();
+        const otmFloorChain = applyOtmContractFloor(result.candidates, otmFloor);
+        this.recordOtmContractFloorChainVerdict(sym, otmFloorChain);
+        if (otmFloorChain.refusalCode !== null) {
+          log.info('OTM setup refused by contract floor (TRA-3944)', {
+            sym,
+            mode: this.mode,
+            code: otmFloorChain.refusalCode,
+            considered: otmFloorChain.considered,
+            removedByCode: otmFloorChain.removedByCode,
+            floorSource: otmFloor.source,
+            reason: otmFloorChain.reason,
+          });
+          scanRun.reject(otmFloorChain.refusalCode);
+          continue;
+        }
+
         // The scanner sorts by |mispricingPct|, so the first `cheap` candidate
         // is the strongest long-only read for this symbol/scan.
         //
@@ -11425,7 +11600,8 @@ export class SignalEngine {
           resolveLiveOptionTestNotionalCapUsd(process.env),
           resolveCanaryCeiling(process.env)?.perOrderUsd ?? Number.POSITIVE_INFINITY,
         );
-        const otmPick = selectAdmissibleOtmCandidate(result.candidates, {
+        // TRA-3944 — the selector ranks INSIDE the floor-admissible set.
+        const otmPick = selectAdmissibleOtmCandidate(otmFloorChain.admissible, {
           enabled: isOtmAdmissibleStrikeEnabled(
             this.mode === 'demo' ? this.resolveDemoFlagEnv() : process.env,
           ),
@@ -11604,6 +11780,40 @@ export class SignalEngine {
             reason: otmWindowReject,
           });
           scanRun.reject(OTM_ENTRY_WINDOW_CLOSED_CODE);
+          continue;
+        }
+
+        // TRA-3944 — the PICK half of the contract floor, directly under the
+        // window and above every candidate-shaped gate below:
+        //
+        //  (a) re-check rules 1–3 on the nominee. The chain cut above already
+        //      guarantees this passes for every selector branch that exists
+        //      today; the re-read is the defence against a selector that grows
+        //      a fallback reaching outside `admissible` (TRA-3856 closed one;
+        //      the shape recurs), and it is cheap.
+        //  (b) rule 4's second clause — max 1 OPEN row per underlying on this
+        //      book, any sleeve, imported rows included. A name we already
+        //      hold is a name we do not add to, whatever the chain says.
+        //
+        // Surfaced with the churn-brake pattern (signal parked in the ring, so
+        // the hour-long dedup above holds it — a row that is open stays open
+        // for longer than an hour, so the token costs nothing).
+        const otmFloorPick = this.otmContractFloorPickRejectReason(
+          sym, cheap, otmFloor, nominator,
+        );
+        if (otmFloorPick) {
+          signal.signalSkipReason = otmFloorPick.reason;
+          signal.signalSkipReasonCode = otmFloorPick.code;
+          if (this.mode === 'live') signal.liveSkipReason = otmFloorPick.reason;
+          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.dailySignals.push({
+            id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
+          });
+          log.info('OTM open rejected by contract floor on the pick (TRA-3944)', {
+            sym, optionSymbol: cheap.optionSymbol, mode: this.mode, code: otmFloorPick.code, reason: otmFloorPick.reason,
+          });
+          scanRun.reject(otmFloorPick.code);
           continue;
         }
 
@@ -11888,7 +12098,14 @@ export class SignalEngine {
           const notionalCap = Math.min(availableCash, testCapUsd);
           // Largest count in [1, maxContracts] whose ASK notional fits the cap; 0 ⇒
           // even one contract breaches it, so we skip rather than round up.
-          const testContracts = resolveLiveOptionTestContracts(askLimit, notionalCap, maxContracts);
+          // TRA-3944 rule 4 — and never more than the contract floor's per-entry
+          // cap (2). `maxContracts` above is the ops-settable canary ceiling
+          // (board-authorized 2–4, TRA-2536); the floor bounds it from above
+          // without moving it. Quantity only — the contract is unchanged.
+          const testContracts = capOtmEntryContracts(
+            resolveLiveOptionTestContracts(askLimit, notionalCap, maxContracts),
+            otmFloor,
+          );
           if (testContracts < 1) {
             const oneContractNotional = askLimit * 100;
             surfaceOtmLiveSkip(
@@ -12361,6 +12578,8 @@ export class SignalEngine {
           undefined, // no bounded-live contract override on this (demo) path
           // TRA-1001 — tighten-only autopilot throttle on the OTM sleeve.
           this.activeRiskSizingMultiplier('options_otm'),
+          // TRA-3944 rule 4 — max 2 contracts per entry, on the paper book too.
+          otmFloor.maxContractsPerEntry,
         );
         if (!opened) continue;
         // TRA-3943 — same stamp on the paper book. Both books, deliberately: the

@@ -351,6 +351,12 @@ import {
   OTM_DEDUPE_CHURN_BRAKE_MS,
   OTM_ENTRY_WINDOW_CLOSED_CODE,
 } from './otm-entry-window.js';
+// TRA-3944 — the OTM sleeve's CONTRACT FLOOR, published on the wire.
+import {
+  resolveOtmContractFloor,
+  mergeOtmContractFloorImportedAudits,
+  OTM_CONTRACT_FLOOR_CODES,
+} from './otm-contract-floor.js';
 // TRA-3067 — counts-only projection of the out-of-band-close detector.
 import {
   foldLiveBrokerDriftStatuses,
@@ -11180,6 +11186,60 @@ app.get('/api/health/options-live', async (_req, res) => {
               skipReasonCode: OTM_ENTRY_WINDOW_CLOSED_CODE,
             };
           })(),
+        };
+      })(),
+      // TRA-3944 (parent TRA-3927, board card `a29b2db8`) — the CONTRACT FLOOR
+      // on the `single_leg_otm` sleeve, on the wire: premium ≥ $0.50 (ask, or
+      // mid under a 10% spread), |Δ| ∈ [0.25, 0.40], DTE ∈ [21, 45] with a
+      // hard refusal at ≤ 7, max 2 contracts per entry, max 1 open row per
+      // underlying. Field PRESENCE is the deployed-bytes proof.
+      //
+      // Read `bandIntersectsSelector` FIRST. The live selector is armed on the
+      // TRA-3392 band [0.495, 0.55) and the board's floor band does not reach
+      // it; composed as ruled (floor first, selector second) the sleeve
+      // nominates NOTHING while every gate below reads healthy. `false` here
+      // is that state, published rather than inferred from a quiet ledger.
+      //
+      // `importedAudit` is AC3: the floor does NOT gate `importedFromTradier`
+      // rows (bookkeeping, not entries); `importedViolatingRows` is the warning
+      // counter the desk sees, folded across every book.
+      //
+      // ⚠️ SCOPE: entry side only, one sleeve, nothing about the arm (read
+      // `liveOtmRouting`), nothing about the ~$250 row size or the 2-row cap.
+      otmContractFloor: (() => {
+        const postures = getAllUserContexts().map((c) => {
+          const p = c.engine.getOtmContractFloorPosture();
+          return { username: c.username, ...p };
+        });
+        const live = postures.find((p) => p.mode === 'live') ?? postures[0] ?? null;
+        const floor = live?.floor ?? resolveOtmContractFloor();
+        return {
+          issue: 'TRA-3944',
+          sleeve: OTM_SLEEVE_MANDATE_STRUCTURE,
+          premiumMin: floor.premiumMin,
+          tightSpreadPct: floor.tightSpreadPct,
+          deltaBand: [floor.deltaMin, floor.deltaMax],
+          dteBand: [floor.dteMin, floor.dteMax],
+          dteHardFloor: floor.dteHardFloor,
+          maxContractsPerEntry: floor.maxContractsPerEntry,
+          maxOpenRowsPerUnderlying: floor.maxOpenRowsPerUnderlying,
+          source: floor.source,
+          invalidKeys: floor.invalidKeys,
+          reasonCodes: OTM_CONTRACT_FLOOR_CODES,
+          appliesTo: ['paper', 'live'] as const,
+          exitsGated: false as const,
+          importedRowsGated: false as const,
+          selectorBand: live ? [live.selectorBand.min, live.selectorBand.max] : null,
+          selectorArmed: live?.selectorArmed ?? null,
+          bandIntersectsSelector: live?.bandIntersectsSelector ?? null,
+          importedAudit: mergeOtmContractFloorImportedAudits(postures.map((p) => p.importedAudit)),
+          books: postures.map((p) => ({
+            username: p.username,
+            mode: p.mode,
+            selectorArmed: p.selectorArmed,
+            bandIntersectsSelector: p.bandIntersectsSelector,
+            importedViolatingRows: p.importedAudit.importedViolatingRows,
+          })),
         };
       })(),
       liveStopActionability: (() => {

@@ -56,9 +56,12 @@ describe('live-enforce-gate-ledger', () => {
     // its own: it is the first gate on the OTM funnel, so it is the one axis
     // whose `evaluated` is the whole nominee population. A zero here is a zero
     // the sleeve produced, never one a tighter sibling upstream ate.
+    // TRA-3944 — `contract_floor` joins: the CHAIN-level cut above the
+    // selector, whose `evaluated` is "chains surveyed" rather than nominees.
     expect(s.byGate.map((g) => g.gate).sort()).toEqual([
       'aggregate_cap',
       'canary_ceiling',
+      'contract_floor',
       'cost_bar',
       'entry_delta_ceiling',
       'entry_delta_ceiling_shadow',

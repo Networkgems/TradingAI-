@@ -32,6 +32,8 @@ import {
   type OtmDayOneStopTrigger,
 } from './otm-day-one-stop.js';
 import type { SpotResolver, PortfolioGreeksOptions } from './reports/portfolio-greeks.js';
+// TRA-3944 — the OTM contract floor's per-entry contract cap + AC3 audit shape.
+import { capOtmEntryContracts, type OtmContractFloorAuditRow } from './otm-contract-floor.js';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
   OPTIONS_BUDGET_RATIO,
@@ -4825,6 +4827,46 @@ export class PaperOptionsAccount {
    * $82 open graded itself as $164 and refused (the ratified <=$100 canary
    * order would have refused itself).
    */
+  /**
+   * TRA-3944 — how many OPEN rows this book holds on `symbol` (the UNDERLYING)
+   * in `mode`, any sleeve, imported rows included. Read by the OTM contract
+   * floor's "max 1 open row per underlying" rule. Imported rows count because
+   * the rule is about exposure to the NAME, not about who opened the row — an
+   * adopted SPY call is still SPY.
+   */
+  openRowsForUnderlying(symbol: string, mode: AccountMode): number {
+    let n = 0;
+    for (const p of this.openOptions.values()) {
+      if ((p.mode ?? 'demo') !== mode) continue;
+      if (p.symbol !== symbol) continue;
+      n += 1;
+    }
+    return n;
+  }
+
+  /**
+   * TRA-3944 (AC3) — the open rows, projected to the contract-floor audit
+   * shape. The audit itself lives in `otm-contract-floor.ts` and reads ONLY
+   * `importedFromTradier` rows; engine-opened rows went through the gate.
+   */
+  contractFloorAuditRows(): OtmContractFloorAuditRow[] {
+    return Array.from(this.openOptions.values()).map((p) => ({
+      symbol: p.symbol,
+      // Multi-leg rows carry no single OCC/expiry; an empty string fails the
+      // audit's DTE read CLOSED (unreadable ⇒ counted), which is the honest
+      // disposition for a row the floor cannot measure.
+      optionSymbol: p.optionSymbol ?? '',
+      expiration: p.expiration ?? '',
+      contracts: p.contracts,
+      contractsRemaining: p.contractsRemaining,
+      premiumPaid: p.premiumPaid,
+      mode: p.mode ?? 'demo',
+      importedFromTradier: p.importedFromTradier,
+      entryDelta: p.entryDelta,
+      openedAt: p.openedAt,
+    }));
+  }
+
   openPremiumAtRiskForMode(mode: AccountMode, excludePositionId?: string): OpenPremiumAtRisk {
     return foldOpenPremiumAtRisk(
       Array.from(this.openOptions.values()).filter(
@@ -5478,6 +5520,14 @@ export class PaperOptionsAccount {
      * throttle can't halve one contract; the autopilot's HALT still gates it).
      */
     sizeMultiplier = 1,
+    /**
+     * TRA-3944 — the contract-floor CAP on this entry's count (rule 4: max 2
+     * contracts per underlying per entry). Applied AFTER sizing and after the
+     * bounded-live override alike — `min(count, maxContracts)` — so neither
+     * path can open more than the floor allows. Absent ⇒ no cap (byte-for-byte
+     * the prior behaviour for the RV/legacy callers that do not pass it).
+     */
+    maxContracts?: number,
   ): OptionPosition | null {
     this.resetDayIfNeeded();
 
@@ -5524,9 +5574,14 @@ export class PaperOptionsAccount {
     const sizedContracts = boundedLiveContracts !== undefined
       ? boundedLiveContracts
       : this.sizeContracts(budget, costPerContract, equityOverride);
-    const contracts = boundedLiveContracts === undefined && sizeMultiplier < 1
+    const throttled = boundedLiveContracts === undefined && sizeMultiplier < 1
       ? Math.floor(sizedContracts * sizeMultiplier)
       : sizedContracts;
+    // TRA-3944 rule 4 — cap the count. A cap is the ONE place this ticket
+    // clamps: it bounds quantity, never substitutes a different contract.
+    const contracts = maxContracts !== undefined
+      ? capOtmEntryContracts(throttled, { maxContractsPerEntry: maxContracts })
+      : throttled;
     if (contracts <= 0) return null;
 
     const totalCost = contracts * costPerContract;

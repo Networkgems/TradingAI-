@@ -121,7 +121,20 @@ export type LiveEnforceGate =
    * Recorded on BOTH verdicts. The admits are what supply the denominator that
    * separates "the window never bit" from "the gate was never wired in".
    */
-  | 'entry_window';
+  | 'entry_window'
+  /**
+   * TRA-3944 (parent TRA-3927, board card `a29b2db8`) — the CONTRACT FLOOR on
+   * the `single_leg_otm` sleeve: premium ≥ $0.50, |Δ| ∈ [0.25, 0.40], DTE ∈
+   * [21, 45] (hard-refuse ≤ 7), max 2 contracts / 1 open row per underlying.
+   * Its own gate because it is the first cut that is a property of the CHAIN
+   * rather than of one nominee: it runs over every candidate BEFORE the
+   * selector, so a refusal here says "nothing on this chain is buyable under
+   * the floor", which no per-nominee axis can express. `reasonCode` is one of
+   * `contract_floor_premium` / `_delta` / `_dte` / `_size` (rule 6).
+   *
+   * Recorded on BOTH verdicts, same reason as `entry_window`.
+   */
+  | 'contract_floor';
 
 /** One durable ARMED-LIVE enforcement decision — a write-through of the verdict. */
 export interface LiveEnforceRecord {
@@ -567,6 +580,12 @@ const GATES: LiveEnforceGate[] = [
   // zero the SLEEVE produced, not one a tighter sibling upstream ate — which is
   // exactly the reading `fleet_reachable_bound` could not make (TRA-3926).
   'entry_window',
+  // TRA-3944 (parent TRA-3927) — the CONTRACT FLOOR on the OTM sleeve. Listed
+  // for the deployed-bytes reason, and ordered in the funnel directly under
+  // `entry_window` (above the universe cut and the cost bar), so its
+  // `evaluated` is the in-window nominee population — one chain per symbol per
+  // sweep — and a zero here is the SLEEVE's zero, not a tighter sibling's.
+  'contract_floor',
 ];
 
 /** Apply one decision to the in-memory tallies (shared by record + hydrate). */

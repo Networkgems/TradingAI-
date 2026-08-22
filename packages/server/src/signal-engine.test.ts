@@ -310,10 +310,24 @@ class StubScanner implements RelativeValueScannerService {
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(TRADING_TIME);
+  // TRA-3944 — the OTM contract floor is the FIRST cut on the OTM chain
+  // (|Δ| ∈ [0.25, 0.40] by the board's ruling). The gates this file exercises
+  // — the 0.55 delta ceiling, the 0.40 delta floor, the [0.495, 0.55) band
+  // selector, the cost bar's measured cells — ALL live outside that band, so
+  // under the ruled defaults the floor would eat their whole test population
+  // and every assertion below would pass vacuously on an empty denominator
+  // (the TRA-3926 trap, in a test). The band is widened HERE, for this file
+  // only, via the same env knobs an operator would use; premium ($0.50) and
+  // DTE ([21, 45]) keep the ruling and the fixtures clear them. The floor's
+  // own behaviour is proved in `tra3944-otm-contract-floor.test.ts`.
+  process.env.OTM_CONTRACT_FLOOR_DELTA_MIN = '0.01';
+  process.env.OTM_CONTRACT_FLOOR_DELTA_MAX = '0.99';
 });
 
 afterEach(() => {
   vi.useRealTimers();
+  delete process.env.OTM_CONTRACT_FLOOR_DELTA_MIN;
+  delete process.env.OTM_CONTRACT_FLOOR_DELTA_MAX;
 });
 
 describe('SignalEngine — relative-value scanner bridge', () => {
@@ -8025,7 +8039,13 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
     // `evaluated` the whole nominee population rather than the ~0.7% that
     // survives the cost bar. Same discipline: named row, exact total.
     expect(retained.find((g) => g.gate === 'entry_window')).toMatchObject({ evaluated: 1, blocked: 0 });
-    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(5);
+    // TRA-3944 — and a SIXTH: the CONTRACT FLOOR records its CHAIN verdict on
+    // every sweep (one row per chain surveyed), and it sits ABOVE the window —
+    // it is a property of the chain, not of a nominee, so there is nothing yet
+    // for a clock verdict to stamp. The fixture ($0.82 ask, 31 DTE, band
+    // widened for this file) is an ADMIT. Same discipline: named row, exact total.
+    expect(retained.find((g) => g.gate === 'contract_floor')).toMatchObject({ evaluated: 1, blocked: 0 });
+    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(6);
   });
 
   // ─── TRA-3942 — the ORDERING claim, graded BEHAVIOURALLY ────────────────────
@@ -8069,8 +8089,13 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
     for (const gate of BELOW_THE_WINDOW) {
       expect(refused.find((g) => g.gate === gate)).toMatchObject({ evaluated: 0, blocked: 0 });
     }
-    // One decision on the whole pass, and no broker order.
-    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(1);
+    // TRA-3944 — the ONE gate that legitimately records above the window: the
+    // contract floor's CHAIN verdict (a chain is surveyed before any nominee
+    // exists). It is an ADMIT here and it is NOT in `BELOW_THE_WINDOW`, which
+    // is the point — the window still starves everything beneath it.
+    expect(refused.find((g) => g.gate === 'contract_floor')).toMatchObject({ evaluated: 1, blocked: 0 });
+    // Two decisions on the whole pass (chain admit + window block), and no broker order.
+    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(2);
     expect(refusedStub.buyContractsLimit).not.toHaveBeenCalled();
 
     // POSITIVE CONTROL — move ONLY the clock, into the morning window (10:20 ET).
@@ -8134,8 +8159,18 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
 
     expect(stub.buyContractsLimit).not.toHaveBeenCalled();
     expect(engine.getState().options.openOptions).toHaveLength(0);
-    expect(engine.getState().signals[0]!.liveSkipReason).toMatch(/fail-closed/);
-    expect(otmFloorGate()).toMatchObject({ evaluated: 1, blocked: 1 });
+    // TRA-3944 — the NaN now fails CLOSED one gate EARLIER: the contract floor
+    // reads |Δ| on the whole chain before the selector and refuses an unreadable
+    // delta under `contract_floor_delta`, so the TRA-2763 floor never sees the
+    // candidate. Same disposition (no order), different — and correct —
+    // attribution. A chain-level refusal has no OCC to surface on the feed, so
+    // the verdict is read off the ledger rather than off `signals[0]`.
+    const retained = summarizeLiveEnforceGate('1970-01-01').retained.byGate;
+    expect(retained.find((g) => g.gate === 'contract_floor')).toMatchObject({ evaluated: 1, blocked: 1 });
+    expect(retained.find((g) => g.gate === 'contract_floor')!.byReason).toEqual([
+      expect.objectContaining({ reasonCode: 'contract_floor_delta', blocked: 1 }),
+    ]);
+    expect(otmFloorGate()).toMatchObject({ evaluated: 0, blocked: 0 });
   });
 
   it('demo book never consults the live flag: armed live floor + below-floor demo candidate still opens, 0 ledger rows', async () => {
