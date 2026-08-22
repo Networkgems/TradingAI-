@@ -106,7 +106,67 @@ export interface OtmEvaluationLivenessInputs {
   otmContractFloor?: {
     invalidKeys?: readonly string[] | null;
     bandIntersectsSelector?: boolean | null;
+    /** The TRA-3944 floor's |delta| band (inclusive edges). */
+    deltaBand?: readonly [number, number] | null;
+    /** The armed selector's |delta| band ([min, max)). */
+    selectorBand?: readonly [number, number] | null;
   } | null;
+}
+
+// ── Population cell (QuantTrader scope note, TRA-3945 comment `88ccac56`) ──
+//
+// The window measures ONE |entryDelta| cell — the cell that SURVIVES card
+// `cc2c36fe` on TRA-3944 (floor band ∩ armed selector band) — and never a
+// blend. A blended mean of a +1.47R cell and a −0.2R cell grades neither
+// (TRA-2677). The cell is frozen at the stamp from the wire's own two bands;
+// before the stamp it is published as a PREVIEW (`frozen: false`) so the
+// pre-registration is readable on the wire today. A close whose entry delta
+// falls outside the cell is refused under `excludedCloses.reasons.outsideDeltaCell`;
+// an entry with no finite delta is refused under `entryDeltaUnknown` (fails
+// CLOSED — an unknown delta is not a member of any cell).
+
+/** Symmetric edge tolerance for float rounding on |entryDelta| (0.495 ∈ [0.50,0.55)). */
+export const OTM_EVALUATION_DELTA_CELL_TOLERANCE = 0.005;
+
+export interface OtmEvaluationPopulationCell {
+  /** Half-open [deltaAbsMin, deltaAbsMax) BEFORE tolerance. */
+  deltaAbsMin: number;
+  deltaAbsMax: number;
+  tolerance: number;
+  floorBand: [number, number];
+  selectorBand: [number, number];
+  frozen: boolean;
+  frozenAt: number | null;
+  pooledCellsForbidden: true;
+}
+
+/** `null` when the two bands do not intersect (card `cc2c36fe` unresolved). */
+export function resolveOtmEvaluationPopulationCell(
+  floor: OtmEvaluationLivenessInputs['otmContractFloor'],
+): Omit<OtmEvaluationPopulationCell, 'frozen' | 'frozenAt'> | null {
+  const fb = floor?.deltaBand;
+  const sb = floor?.selectorBand;
+  if (!fb || !sb || !fb.every(Number.isFinite) || !sb.every(Number.isFinite)) return null;
+  const lo = Math.max(fb[0], sb[0]);
+  const hi = Math.min(fb[1], sb[1]);
+  if (!(hi > lo)) return null;
+  return {
+    deltaAbsMin: round6(lo),
+    deltaAbsMax: round6(hi),
+    tolerance: OTM_EVALUATION_DELTA_CELL_TOLERANCE,
+    floorBand: [fb[0], fb[1]],
+    selectorBand: [sb[0], sb[1]],
+    pooledCellsForbidden: true,
+  };
+}
+
+export function entryDeltaInCell(
+  entryDelta: unknown,
+  cell: Pick<OtmEvaluationPopulationCell, 'deltaAbsMin' | 'deltaAbsMax' | 'tolerance'>,
+): 'in' | 'out' | 'unknown' {
+  if (typeof entryDelta !== 'number' || !Number.isFinite(entryDelta)) return 'unknown';
+  const d = Math.abs(entryDelta);
+  return d >= cell.deltaAbsMin - cell.tolerance && d < cell.deltaAbsMax + cell.tolerance ? 'in' : 'out';
 }
 
 export interface OtmEvaluationLiveness {
@@ -180,6 +240,8 @@ export interface OtmEvaluationWindowState {
   buildDriftTotal: number;
   extension: { allowed: 1; closes: number; used: boolean; usedAt: number | null };
   baseline: OtmEvaluationBaseline | null;
+  /** Frozen at the stamp; preview (`frozen: false`) or `null` while armed. */
+  populationCell: OtmEvaluationPopulationCell | null;
   terminalAt: number | null;
   verdict: OtmEvaluationVerdict | null;
   lastTickAt: number | null;
@@ -196,6 +258,7 @@ export function emptyOtmEvaluationWindowState(): OtmEvaluationWindowState {
     buildDriftTotal: 0,
     extension: { allowed: 1, closes: OTM_EVALUATION_EXTENSION_CLOSES, used: false, usedAt: null },
     baseline: null,
+    populationCell: null,
     terminalAt: null,
     verdict: null,
     lastTickAt: null,
@@ -252,6 +315,10 @@ export interface OtmEvaluationExcluded {
     dedupeDuplicate: number;
     notLive: number;
     notOtm: number;
+    /** |entryDelta| outside the frozen population cell (ONE cell, never pooled). */
+    outsideDeltaCell: number;
+    /** No finite entryDelta on the row — fails CLOSED. */
+    entryDeltaUnknown: number;
     /** VISIBILITY counter — these closes ARE counted under the fallback key. */
     brokerOrderIdNull: number;
   };
@@ -346,10 +413,12 @@ export function foldOtmEvaluationWindow(
   now: number,
 ): OtmEvaluationReadout {
   const reasons = {
-    entryPredatesStart: 0, rulesetPaused: 0, dedupeDuplicate: 0, notLive: 0, notOtm: 0, brokerOrderIdNull: 0,
+    entryPredatesStart: 0, rulesetPaused: 0, dedupeDuplicate: 0, notLive: 0, notOtm: 0,
+    outsideDeltaCell: 0, entryDeltaUnknown: 0, brokerOrderIdNull: 0,
   };
   const counted: CloseRow[] = [];
   if (state.startedAt !== null) {
+    const cell = state.populationCell;
     for (const d of dedupeClosedRows(records)) {
       const r = d.rec;
       const c = isOtmLiveClose(r);
@@ -360,6 +429,11 @@ export function foldOtmEvaluationWindow(
       if (!c.live) { reasons.notLive += 1; continue; }
       if (r.openTs < state.startedAt) { reasons.entryPredatesStart += 1; continue; }
       if (insidePausedSpan(r.openTs, state.buildDrift, now)) { reasons.rulesetPaused += 1; continue; }
+      if (cell) {
+        const m = entryDeltaInCell(r.entryDelta, cell);
+        if (m === 'out') { reasons.outsideDeltaCell += 1; continue; }
+        if (m === 'unknown') { reasons.entryDeltaUnknown += 1; continue; }
+      }
       reasons.dedupeDuplicate += d.duplicates;
       if (d.key.startsWith('fallback:')) reasons.brokerOrderIdNull += 1;
       counted.push(r);
@@ -375,7 +449,8 @@ export function foldOtmEvaluationWindow(
   const stats = otmEvaluationStats(rows);
   const target = targetFor(state);
   const excludedN =
-    reasons.entryPredatesStart + reasons.rulesetPaused + reasons.dedupeDuplicate + reasons.notLive + reasons.notOtm;
+    reasons.entryPredatesStart + reasons.rulesetPaused + reasons.dedupeDuplicate + reasons.notLive + reasons.notOtm
+    + reasons.outsideDeltaCell + reasons.entryDeltaUnknown;
 
   let criteria: OtmEvaluationReadout['criteria'] = 'below_target';
   if (stats.n >= target && stats.avgR !== null && stats.seR !== null) {
@@ -434,6 +509,7 @@ export function stepOtmEvaluationWindow(
   pin: OtmEvaluationBuildPin,
   records: ReadonlyArray<CloseRow>,
   now: number,
+  floor?: OtmEvaluationLivenessInputs['otmContractFloor'],
 ): { state: OtmEvaluationWindowState; changed: boolean } {
   const state: OtmEvaluationWindowState = {
     ...prev,
@@ -449,16 +525,27 @@ export function stepOtmEvaluationWindow(
   if (state.verdict) return { state, changed: false };
 
   if (state.startedAt === null) {
-    if (liveness.allTrue) {
+    const cell = resolveOtmEvaluationPopulationCell(floor);
+    // The cell is PART of the opening predicate: `bandIntersectsSelector` is
+    // already in `liveness`, and the cell is the same intersection read as
+    // numbers. Both bands on the wire, non-empty intersection, or no stamp.
+    if (liveness.allTrue && cell) {
       // The stamp. Once. Never re-stamped.
       state.startedAt = now;
       state.startBuild = pin;
       state.baseline = { ...computeOtmEvaluationBaseline(records, now), frozen: true, frozenAt: now };
+      state.populationCell = { ...cell, frozen: true, frozenAt: now };
       log.info('TRA-3945 OTM evaluation window OPENED', {
-        windowId: state.windowId, startedAt: new Date(now).toISOString(), build: pin, baseline: state.baseline,
+        windowId: state.windowId, startedAt: new Date(now).toISOString(), build: pin,
+        baseline: state.baseline, populationCell: state.populationCell,
       });
       mark();
     } else {
+      const cellPreview = cell ? { ...cell, frozen: false as const, frozenAt: null } : null;
+      if (JSON.stringify(cellPreview) !== JSON.stringify(state.populationCell)) {
+        state.populationCell = cellPreview;
+        mark();
+      }
       // Armed: keep the baseline PREVIEW current so the numbers are on the
       // wire now (ruling: "state the deduped n and its avg R / se(R) as
       // NUMBERS in the record at arm time"); it freezes at the stamp.
@@ -565,7 +652,16 @@ export function buildOtmEvaluationWindowRecord(
     lastTickAt: state.lastTickAt === null ? null : new Date(state.lastTickAt).toISOString(),
     lastTickBuild: state.lastTickBuild,
     eligibility:
-      'close counts iff entry.openTs >= startedAt AND entry.openTs not inside a paused span AND structure == single_leg_otm AND mode == live',
+      'close counts iff entry.openTs >= startedAt AND entry.openTs not inside a paused span AND structure == single_leg_otm AND mode == live AND |entryDelta| inside populationCell (one cell, never pooled)',
+    populationCell: state.populationCell === null
+      ? null
+      : {
+        ...state.populationCell,
+        frozenAt: state.populationCell.frozenAt === null ? null : new Date(state.populationCell.frozenAt).toISOString(),
+        membership: '|entryDelta| >= deltaAbsMin - tolerance AND |entryDelta| < deltaAbsMax + tolerance',
+      },
+    populationRuling:
+      'QuantTrader scope note (TRA-3945 comment 88ccac56): the window measures the ONE |entryDelta| cell that survives card cc2c36fe on TRA-3944 (floor deltaBand ∩ armed selectorBand, frozen at the stamp). Option B => [0.50,0.55); option A => [0.25,0.40] and the window is expected to rest at n=0 (the cost bar refuses those cells on merit) - grade that as insufficient_population, NOT as a passing window. Never pool two cells into one 30-close sample (TRA-2677).',
     dedupe: 'key = brokerOrderId ?? `${optionSymbol}|${closeTs}`; one representative per key, OTM label preferred',
     rBasis: 'journal realizedR = realizedPnlUsd / atRiskUsd (TRA-375); seR = sample sd (n-1) / sqrt(n)',
     targetCloses: OTM_EVALUATION_TARGET_CLOSES,
@@ -577,6 +673,16 @@ export function buildOtmEvaluationWindowRecord(
       failIf: 'avgR <= 0 && seR < 0.10',
       elseExtendOnce: true as const,
       terminalAt: OTM_EVALUATION_TARGET_CLOSES + OTM_EVALUATION_EXTENSION_CLOSES,
+      invalidation: {
+        cutToZeroNominationsIf: 'over the 30 closes the realized mean R has a lower CI95 below 0',
+        estimatorInvalidatedIf:
+          'realized mean R lands below barR 0.485 while the tape cell still advertises +1.470 - invalidates the ESTIMATOR, not just the band; a bigger finding than the sleeve',
+        barR: 0.485,
+        tapeCellAdvertisedR: 1.47,
+        lowerCi95: readout.n >= 2 && readout.avgR !== null && readout.seR !== null
+          ? round6(readout.avgR - 1.96 * readout.seR)
+          : null,
+      },
     },
     onFail: 'REPORT ONLY - drop the arm, do not re-tune; QuantTrader files the verdict to the board',
     baseline: state.baseline,
@@ -658,7 +764,9 @@ export async function tickOtmEvaluationWindow(args: {
   const now = args.now ?? Date.now();
   const liveness = evaluateOtmEvaluationLiveness(args.inputs);
   const prev = await loadOtmEvaluationWindowState();
-  const { state, changed } = stepOtmEvaluationWindow(prev, liveness, args.pin, args.records, now);
+  const { state, changed } = stepOtmEvaluationWindow(
+    prev, liveness, args.pin, args.records, now, args.inputs.otmContractFloor,
+  );
   if (changed) {
     try {
       await saveOtmEvaluationWindowState(state);

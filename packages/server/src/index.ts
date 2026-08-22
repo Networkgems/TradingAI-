@@ -10838,7 +10838,13 @@ function readOtmEvaluationLivenessInputs(): {
     const live = postures.find((p) => p.mode === 'live') ?? postures[0] ?? null;
     const f = live?.floor ?? resolveOtmContractFloor();
     nominationBandIntersects = live?.bandIntersectsSelector ?? null;
-    floor = { invalidKeys: f.invalidKeys, bandIntersectsSelector: nominationBandIntersects };
+    floor = {
+      invalidKeys: f.invalidKeys,
+      bandIntersectsSelector: nominationBandIntersects,
+      // TRA-3945 population cell = floor band ∩ LIVE selector band (comment `88ccac56`).
+      deltaBand: [f.deltaMin, f.deltaMax],
+      selectorBand: live ? [live.selectorBand.min, live.selectorBand.max] : null,
+    };
   } catch {
     floor = null;
   }

@@ -16,6 +16,7 @@ import {
   foldOtmEvaluationWindow,
   otmEvaluationStats,
   otmEvaluationWindowStatus,
+  resolveOtmEvaluationPopulationCell,
   stepOtmEvaluationWindow,
   type OtmEvaluationBuildPin,
   type OtmEvaluationLivenessInputs,
@@ -41,7 +42,7 @@ function close(i: number, over: Partial<Row> = {}): Row {
     ivRank: null,
     trend: 'up',
     sentiment: null,
-    entryDelta: 0.3,
+    entryDelta: 0.52,
     entryDte: 30,
     atRiskUsd,
     outcome: r > 0 ? 'WIN' : 'LOSS',
@@ -64,13 +65,13 @@ const ALL_TRUE: OtmEvaluationLivenessInputs = {
   otmSleeveExitRule: { rule: 'trail', chandelierRetired: true },
   otmEntryWindows: { refusalDedupe: { windowRefusalExpiresAtNextOpen: true } },
   liveDayOneStopPosture: { otmDayOneStop: { armed: true, release: { released: true } } },
-  otmContractFloor: { invalidKeys: [], bandIntersectsSelector: true },
+  otmContractFloor: { invalidKeys: [], bandIntersectsSelector: true, deltaBand: [0.50, 0.55], selectorBand: [0.50, 0.55] },
 };
 
 function opened(records: Row[] = []) {
   const s0 = emptyOtmEvaluationWindowState();
   const liveness = evaluateOtmEvaluationLiveness(ALL_TRUE);
-  return stepOtmEvaluationWindow(s0, liveness, PIN, records, T0 - H).state;
+  return stepOtmEvaluationWindow(s0, liveness, PIN, records, T0 - H, ALL_TRUE.otmContractFloor).state;
 }
 
 describe('TRA-3945 liveness predicate (AC4 — the wire names QuantTrader corrected)', () => {
@@ -135,7 +136,7 @@ describe('TRA-3945 AC4 — the stamp', () => {
 
   it('while armed the baseline is a live PREVIEW (frozen:false) with numbers, not a placeholder', () => {
     const l = evaluateOtmEvaluationLiveness({ ...ALL_TRUE, otmContractFloor: { invalidKeys: [], bandIntersectsSelector: false } });
-    const s = stepOtmEvaluationWindow(emptyOtmEvaluationWindowState(), l, PIN, [close(-2), close(-1)], T0).state;
+    const s = stepOtmEvaluationWindow(emptyOtmEvaluationWindowState(), l, PIN, [close(-2), close(-1)], T0, ALL_TRUE.otmContractFloor).state;
     expect(s.baseline).toMatchObject({ frozen: false, n: 2 });
     expect(typeof s.baseline?.avgR).toBe('number');
     expect(typeof s.baseline?.seR).toBe('number');
@@ -291,5 +292,60 @@ describe('TRA-3945 extension + verdict', () => {
     expect(after.changed).toBe(false);
     expect(otmEvaluationWindowStatus(after.state)).toBe('verdict_fail');
     expect(() => applyOtmEvaluationVerdict(emptyOtmEvaluationWindowState(), { status: 'verdict_pass', note: 'TRA-3945', by: 'QuantTrader' }, T0)).toThrow(/never opened/);
+  });
+});
+
+describe('TRA-3945 population cell (QuantTrader scope note 88ccac56 — ONE delta cell, never pooled)', () => {
+  const LIVE_BQB1_0822: OtmEvaluationLivenessInputs['otmContractFloor'] = {
+    invalidKeys: [], bandIntersectsSelector: false, deltaBand: [0.25, 0.40], selectorBand: [0.50, 0.55],
+  };
+
+  it('bqb1 e78b11c5 today: floor [0.25,0.40] ∩ selector [0.50,0.55) = ∅ ⇒ no cell, no stamp, record armed with populationCell null', () => {
+    expect(resolveOtmEvaluationPopulationCell(LIVE_BQB1_0822)).toBeNull();
+    const l = evaluateOtmEvaluationLiveness({ ...ALL_TRUE, otmContractFloor: LIVE_BQB1_0822 });
+    const s = stepOtmEvaluationWindow(emptyOtmEvaluationWindowState(), l, PIN, [close(1)], T0, LIVE_BQB1_0822).state;
+    expect(s.startedAt).toBeNull();
+    expect(s.populationCell).toBeNull();
+  });
+
+  it('option B: cell [0.50,0.55) frozen at the stamp; 0.495 admitted by tolerance, 0.30 refused as outsideDeltaCell', () => {
+    const s = opened();
+    expect(s.populationCell).toMatchObject({ deltaAbsMin: 0.5, deltaAbsMax: 0.55, frozen: true, pooledCellsForbidden: true });
+    const rows = [
+      close(1, { entryDelta: 0.52 }),
+      close(2, { entryDelta: -0.495 }),
+      close(3, { entryDelta: 0.30 }),
+      close(4, { entryDelta: 0.56 }),
+      close(5, { entryDelta: Number.NaN }),
+    ];
+    const r = foldOtmEvaluationWindow(rows, s, T0 + 100 * H);
+    expect(r.n).toBe(2);
+    expect(r.excludedCloses.reasons.outsideDeltaCell).toBe(2);
+    expect(r.excludedCloses.reasons.entryDeltaUnknown).toBe(1);
+    expect(r.excludedCloses.n).toBe(3);
+  });
+
+  it('option A: cell [0.25,0.40]; a 0.52 entry is refused — the two cells are never pooled', () => {
+    const floorA: OtmEvaluationLivenessInputs['otmContractFloor'] = {
+      invalidKeys: [], bandIntersectsSelector: true, deltaBand: [0.25, 0.40], selectorBand: [0.25, 0.41],
+    };
+    const l = evaluateOtmEvaluationLiveness({ ...ALL_TRUE, otmContractFloor: floorA });
+    const s = stepOtmEvaluationWindow(emptyOtmEvaluationWindowState(), l, PIN, [], T0 - H, floorA).state;
+    expect(s.populationCell).toMatchObject({ deltaAbsMin: 0.25, deltaAbsMax: 0.4, frozen: true });
+    const r = foldOtmEvaluationWindow([close(1, { entryDelta: 0.52 }), close(2, { entryDelta: 0.33 })], s, T0 + 100 * H);
+    expect(r.n).toBe(1);
+    expect(r.excludedCloses.reasons.outsideDeltaCell).toBe(1);
+  });
+
+  it('the cell is a preview while armed and the invalidation thresholds are on the wire', () => {
+    const floorPreview: OtmEvaluationLivenessInputs['otmContractFloor'] = {
+      invalidKeys: [], bandIntersectsSelector: true, deltaBand: [0.50, 0.55], selectorBand: [0.50, 0.55],
+    };
+    const l = evaluateOtmEvaluationLiveness({ ...ALL_TRUE, liveOtmRouting: false, otmContractFloor: floorPreview });
+    const s = stepOtmEvaluationWindow(emptyOtmEvaluationWindowState(), l, PIN, [], T0, floorPreview).state;
+    expect(s.populationCell).toMatchObject({ frozen: false, frozenAt: null, deltaAbsMin: 0.5 });
+    const rec = buildOtmEvaluationWindowRecord(s, l, true, foldOtmEvaluationWindow([], s, T0));
+    expect(rec.thresholds.invalidation).toMatchObject({ barR: 0.485, tapeCellAdvertisedR: 1.47, lowerCi95: null });
+    expect(rec.populationCell?.frozen).toBe(false);
   });
 });
