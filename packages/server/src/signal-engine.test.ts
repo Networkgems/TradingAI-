@@ -8028,6 +8028,72 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
     expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(5);
   });
 
+  // ─── TRA-3942 — the ORDERING claim, graded BEHAVIOURALLY ────────────────────
+  // QuantTrader accepted AC1/AC2/AC4 off the wire and then declined to grade one
+  // sentence of the filing: that `entry_window.evaluated` is the WHOLE nominee
+  // population rather than the ~0.7% surviving the cost bar. On a shut market
+  // every roster gate reads `evaluated: 0`, and a zero there is indistinguishable
+  // from never having been wired in — the `fleet_reachable_bound` trap (TRA-3926).
+  // That refusal is right, and the wire grade stays QuantTrader's on Monday.
+  //
+  // What the two source-order assertions (`tra3953…test.ts`) prove is that one
+  // string appears before another in a file. That is a LITERAL at one depth: it
+  // survives the call being moved into a branch that never runs, or the gate
+  // below being hoisted into the nominator. So grade the claim the only other way
+  // it can be graded before Monday — RUN the scan on both sides of the window
+  // boundary and read the DENOMINATORS out of the ledger.
+  //
+  // The clock is the ONLY difference between the two halves: same stub, same
+  // candidate, same arm, same book. That is what makes the second half a positive
+  // control at the right LEVEL rather than a different experiment (TRA-3442).
+  it('TRA-3942 ORDERING — a refused clock leaves EVERY gate below the window with an empty denominator, and the SAME pass inside the window fills them', async () => {
+    armLiveOtmWindow();
+    delete process.env[OPTION_OTM_DELTA_FLOOR_LIVE_FLAG];
+    const BELOW_THE_WINDOW = [
+      'universe', 'otm_delta_floor', 'cost_bar',
+      'aggregate_cap', 'canary_ceiling', 'fleet_reachable_bound',
+    ] as const;
+
+    // SUBJECT — 13:45Z = 09:45 ET, dead centre of the F1 band (15 of 17 live
+    // entries filled 13:35–13:51Z). Outside both windows ⇒ refused.
+    vi.setSystemTime(Date.parse('2024-06-04T13:45:00Z'));
+    const refusedStub = fillStub();
+    await runOtm(setupLiveEngine(refusedStub, otmScanner()), ['AAPL']);
+
+    const refused = summarizeLiveEnforceGate('1970-01-01').retained.byGate;
+    // The window itself EVALUATED the nominee and BLOCKED it.
+    expect(refused.find((g) => g.gate === 'entry_window')).toMatchObject({ evaluated: 1, blocked: 1 });
+    // …and nothing downstream ever saw the candidate. This is the ordering claim
+    // stated as a measurement: the denominator the window folded is strictly
+    // larger than every denominator below it, on the same pass.
+    for (const gate of BELOW_THE_WINDOW) {
+      expect(refused.find((g) => g.gate === gate)).toMatchObject({ evaluated: 0, blocked: 0 });
+    }
+    // One decision on the whole pass, and no broker order.
+    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(1);
+    expect(refusedStub.buyContractsLimit).not.toHaveBeenCalled();
+
+    // POSITIVE CONTROL — move ONLY the clock, into the morning window (10:20 ET).
+    // A fresh engine, because the TRA-3953 churn brake is per-engine state and
+    // this control is about the gate, not about the brake.
+    clearLiveEnforceGateLedger();
+    vi.setSystemTime(TRADING_TIME);
+    const admittedStub = fillStub();
+    await runOtm(setupLiveEngine(admittedStub, otmScanner()), ['AAPL']);
+
+    const admitted = summarizeLiveEnforceGate('1970-01-01').retained.byGate;
+    expect(admitted.find((g) => g.gate === 'entry_window')).toMatchObject({ evaluated: 1, blocked: 0 });
+    // The gates that read 0 above are reachable — they were starved by the
+    // window, not absent. (`otm_delta_floor` and `cost_bar` stay at 0 here for a
+    // DIFFERENT and already-pinned reason: both are flag-disarmed on this path,
+    // which is exactly the flag-OFF test above. Naming them separately keeps this
+    // control from claiming a reachability it does not demonstrate.)
+    for (const gate of ['universe', 'aggregate_cap', 'canary_ceiling', 'fleet_reachable_bound'] as const) {
+      expect(admitted.find((g) => g.gate === gate)).toMatchObject({ evaluated: 1 });
+    }
+    expect(admittedStub.buyContractsLimit).toHaveBeenCalledTimes(1);
+  });
+
   it('flag ON + below-floor live candidate: NO broker order, reason surfaced, ledger counts the REJECT', async () => {
     armLiveOtmWindow();
     process.env[OPTION_OTM_DELTA_FLOOR_LIVE_FLAG] = '1';
