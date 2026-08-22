@@ -247,6 +247,7 @@ export function classifyBrokerRejectText(text: string | null | undefined): Broke
 /** One order handed to the broker. */
 export function recordBrokerSubmit(book: string, etDay: string): void {
   cellFor(etDay, book).submitted += 1;
+  persistCensusDayIfArmed(etDay);
 }
 
 /**
@@ -258,6 +259,7 @@ export function recordBrokerFill(book: string, etDay: string): void {
   const cell = cellFor(etDay, book);
   cell.filled += 1;
   cell.consecutivePermission = 0;
+  persistCensusDayIfArmed(etDay);
 }
 
 export interface BrokerRejectOutcome {
@@ -293,6 +295,7 @@ export function recordBrokerReject(
     // permission rejects with nothing else, but a book that alternates
     // permission / no_quote is just as terminally restricted, and a reset on
     // the transient one would hold the counter under threshold forever.
+    persistCensusDayIfArmed(etDay);
     return { tripped: false, consecutivePermission: cell.consecutivePermission };
   }
   cell.consecutivePermission += 1;
@@ -303,6 +306,7 @@ export function recordBrokerReject(
     cell.blockedSince = ts;
     cell.blockedReason = reason;
   }
+  persistCensusDayIfArmed(etDay);
   return { tripped: shouldTrip, consecutivePermission: cell.consecutivePermission };
 }
 
@@ -488,6 +492,47 @@ function censusSnapPath(dataDir: string, etDay: string): string {
   return join(censusSnapDir(dataDir), `${etDay}.json`);
 }
 
+/**
+ * TRA-3917 — the directory write-through persistence is armed against, or `null`
+ * when nothing has armed it (unit tests, CLI importers). Set by
+ * {@link hydrateCensusFromDir}, which the server calls once at boot.
+ *
+ * ## Why write-through, and not the health-route write alone
+ *
+ * `6eac1bd` (TRA-3937) persisted the fold from ONE place: the
+ * `/api/health/options-live` handler. That is sufficient only if something calls
+ * that route while the accumulating process is still alive. On 2026-08-21 nothing
+ * did: the 16:10 ET reader routine fired at 20:10:00Z, the post-close deploy burst
+ * booted a new process at 20:12:29Z, and the agent's actual GET did not land until
+ * 21:17:30Z — 65 minutes after the fold it was grading had already been freed. The
+ * session forfeited WITH the snapshot code deployed, because the snapshot code
+ * never ran. A durability fix whose trigger is the reader cannot survive a late
+ * reader, and the reader is late exactly when the deploy burst makes it late.
+ *
+ * So the write moves to the only events that can ever change a cell. After this,
+ * the on-disk snapshot is current as of the last broker event regardless of who
+ * reads, when, or whether anyone reads at all.
+ */
+let snapshotDir: string | null = null;
+
+/**
+ * Last serialized payload written per ET day. Skips the `writeFileSync` when a
+ * mutation did not change the bytes, so a long refused-by-breaker run does not
+ * re-write an identical file hundreds of times. Purely an fs-churn bound — it is
+ * never consulted for correctness.
+ */
+const lastWritten = new Map<string, string>();
+
+/**
+ * Write-through hook for the record* functions. A no-op until
+ * {@link hydrateCensusFromDir} arms it, so importing this module never touches
+ * the filesystem on its own.
+ */
+function persistCensusDayIfArmed(etDay: string): void {
+  if (snapshotDir === null) return;
+  persistCensusDaySync(etDay, snapshotDir);
+}
+
 function serializeDay(day: Map<string, BookDayCell>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [book, cell] of day) {
@@ -526,11 +571,16 @@ function deserializeDay(raw: Record<string, unknown>): Map<string, BookDayCell> 
 export function persistCensusDaySync(etDay: string, dataDir: string): void {
   const day = store.get(etDay);
   if (!day || day.size === 0) return;
+  const payload = JSON.stringify(serializeDay(day));
+  if (lastWritten.get(etDay) === payload) return;
   try {
     mkdirSync(censusSnapDir(dataDir), { recursive: true });
-    writeFileSync(censusSnapPath(dataDir, etDay), JSON.stringify(serializeDay(day)));
+    writeFileSync(censusSnapPath(dataDir, etDay), payload);
+    lastWritten.set(etDay, payload);
   } catch {
-    // fail-soft: a write error must never break the health route
+    // fail-soft: a write error must never break the health route or a broker
+    // event. `lastWritten` is deliberately NOT set on failure, so the next
+    // mutation retries rather than treating the failed write as done.
   }
 }
 
@@ -540,6 +590,12 @@ export function persistCensusDaySync(etDay: string, dataDir: string): void {
  * in the store (accumulated this session) the snapshot is skipped.
  */
 export function hydrateCensusFromDir(dataDir: string): { days: number } {
+  // TRA-3917 — arm write-through FIRST, before any early return. On the very
+  // first boot the snapshot directory does not exist yet, `readdirSync` throws,
+  // and arming below that `catch` would leave the box durable only from its
+  // SECOND boot onward — i.e. undurable on exactly the day the directory is
+  // created, which is the day this was shipped to fix.
+  snapshotDir = dataDir;
   const snapDir = censusSnapDir(dataDir);
   let entries: string[];
   try {
@@ -569,4 +625,10 @@ export function hydrateCensusFromDir(dataDir: string): { days: number } {
 export function __resetBrokerSubmitCensusForTest(): void {
   store.clear();
   hydratedDays.clear();
+  // TRA-3917 — disarm write-through too. A test that armed it against a temp dir
+  // would otherwise leave every LATER test in the file writing to a directory it
+  // never asked for (and, once that temp dir is removed, exercising the fail-soft
+  // path instead of the one it means to test).
+  snapshotDir = null;
+  lastWritten.clear();
 }
