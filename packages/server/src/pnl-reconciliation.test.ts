@@ -2794,13 +2794,23 @@ describe('TRA-2630 AC1 — summarizeDriftGradeability', () => {
     // TRA-2943 added `eodInteriorAbsentOk` — retained for existing consumers but
     // PINNED FALSE by an adjudicated absence, so a gate keying on this list now
     // fails closed on it too. `liveEodInteriorAbsentOk` is deliberately NOT here.
+    // TRA-3948 added the last two, and they are SCOPED strings rather than bare
+    // field names on purpose: both fields still grade the DEMO cohort correctly
+    // (`stockDaily` there is a real equity delta), and are structurally 0 only on
+    // broker-shaped LIVE rows where the writer pins `dailyPnl: 0`. Listing them
+    // unscoped would retire a working demo signal to fix a live one. The bare
+    // names are asserted absent below for exactly that reason.
     expect(r.ungradeableFields).toEqual([
       'ok',
       'maxDriftUsd',
       'engines[].drift',
       'eodInteriorAbsentOk',
+      'maxStockLegDriftUsd (live cohort only — structurally 0)',
+      'engines[].stockLegDrift (broker-shaped rows only — structurally 0)',
     ]);
     expect(r.ungradeableFields).not.toContain('liveEodInteriorAbsentOk');
+    expect(r.ungradeableFields).not.toContain('maxStockLegDriftUsd');
+    expect(r.ungradeableFields).not.toContain('engines[].stockLegDrift');
   });
 
   it('emits the disclaimer machine-readably, not only as prose', () => {

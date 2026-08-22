@@ -40,6 +40,7 @@ import {
   summarizeLiveCreditObservation,
   summarizeLiveEodRowPresence,
   summarizeLiveCombinedAgreement,
+  summarizeLiveStockLegProbe,
   summarizeDriftGradeability,
 } from './pnl-reconciliation.js';
 // TRA-2888 — the permanent 07-30/07-31/08-03 gap ruling and the
@@ -6574,6 +6575,24 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       // sessions still observed by nothing — a `null` verdict beside a non-empty
       // no-reader list is a coverage hole, not a quiet pass.
       ...summarizeLiveCombinedAgreement(engines),
+      // TRA-3948 — THE EQUITY-PROBE AXIS, at the head beside the agreement axis
+      // for the same reason: it is the only reader of a per-row finding the
+      // payload was already stating about itself and nothing was folding.
+      // `stockLegBasis: 'zero-probe-disagrees'` shipped in TRA-3517 and, until
+      // this ticket, 0 of this endpoint's 117 top-level keys matched
+      // /probe|basis/ — while `admin` carried four live disagreements up to
+      // $197.36 against a $946.60 book.
+      //
+      // ⛔ DO NOT SUBSTITUTE `stockLegDrift` / `maxStockLegDriftUsd` FOR THIS.
+      // Their operands are disjoint from the probe's and `dailyPnl` is pinned 0
+      // by the broker-row writer, so they read 0.00 on the live cohort by
+      // construction. That was a live false-green, not a quiet pass.
+      //
+      // Quote `liveStockLegProbeDiscriminatingCount` beside any verdict, NOT
+      // `...MeasuredCount`: a dormant live book (`v0nni`, 400.00 -> 400.00 on all
+      // 8 probed sessions) contributes clean agreements that no wiring fault
+      // could have disturbed.
+      ...summarizeLiveStockLegProbe(engines),
       // TRA-2888 — THE INTERIOR-ABSENCE AXIS, at the head beside the tail axis
       // it completes. The tail answers "has the writer stopped?"; this answers
       // "is the recorded history complete?" — and on 2026-08-05 the first read

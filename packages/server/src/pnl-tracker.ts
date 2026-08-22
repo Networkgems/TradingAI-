@@ -34,6 +34,22 @@ export const CLOSING_EQUITY_BASIS_ENGINE_PAPER = 'engine-paper-account';
  * present value).
  */
 export const OPENING_EQUITY_BASIS_BROKER_PREV = 'broker-prev-eod-balance';
+/**
+ * TRA-2829 / TRA-3948 — residual (USD) below which the equity probe is treated
+ * as agreeing the booked-`0` stock leg is inert. Not zero: the probe also
+ * absorbs broker rounding, so demanding an exact 0.00 would flag every row on
+ * noise.
+ *
+ * MOVED HERE FROM `eod-row-backfill.ts` BY TRA-3948, for the same reason the
+ * basis vocabulary above moved: the READER (`pnl-reconciliation.ts`) has to
+ * apply the identical threshold the WRITER stamped the basis with, and it
+ * cannot value-import from `eod-row-backfill.ts` without a cycle. Two copies of
+ * this number would let the reader's verdict and the row's own
+ * `stockLegBasis` disagree about the same row — the failure mode where a
+ * `'zero-probe-disagrees'` row sits inside a green cohort. `eod-row-backfill.ts`
+ * re-exports it so existing importers keep compiling.
+ */
+export const STOCK_LEG_PROBE_TOLERANCE_USD = 1;
 
 export interface DailySnapshot {
   date: string;
