@@ -234,6 +234,105 @@ describe('TRA-3958 ARM B — restated to the desk\'s own basis, the row is held'
   });
 });
 
+// ─── The correction has to SURVIVE, and that is a separate claim ─────────────
+//
+// Measured on bqb1 2026-08-22T15:19Z, minutes after the first version of this
+// route shipped: the write landed and read back exact (1.17 / 0.8775 / 1.638),
+// and the next Tradier reconcile 30 seconds later put 1.41 straight back. An
+// adopted `foreign` row takes the "premium changed ⇒ copy the broker's number"
+// branch on every sweep, and for a symbol whose sibling lot has closed the
+// broker's number IS the blend. Nothing in the immediate read-back can tell the
+// two worlds apart — which is the whole reason these arms exist.
+
+describe('TRA-3958 — the reconcile is what took the correction back', () => {
+  it('CONTAINMENT — an unpinned adopted row really does follow the broker\'s figure', () => {
+    // Without this arm every assertion below is vacuous: a reconcile that never
+    // writes the basis would "hold" a pinned row by doing nothing at all.
+    const { acct, row } = adoptedAndHandedOver(BLEND);
+    acct.reconcileTradierPositions(brokerPayload(1.3), 'live');
+    expect(row().premiumPaid).toBeCloseTo(1.3, 10);
+    expect(row().stopLossPremium).toBeCloseTo(0.975, 10);
+  });
+
+  it('the pinned basis survives the sweep that used to overwrite it', () => {
+    const { acct, row } = adoptedAndHandedOver(BLEND);
+    expect(acct.restateAdoptedBasisFromOperator(row().id, request()).status).toBe('restated');
+
+    // The broker still reports the blend, every 30 seconds, forever.
+    for (let i = 0; i < 3; i += 1) acct.reconcileTradierPositions(brokerPayload(BLEND), 'live');
+
+    expect(row().premiumPaid).toBeCloseTo(DESK, 10);
+    expect(row().stopLossPremium).toBeCloseTo(STOP_AT_DESK, 10);
+    expect(row().tp1Premium).toBeCloseTo(TP1_AT_DESK, 10);
+    // And the reader that says so: `restated: 1, holds: 0` after a sweep is a
+    // correction that has already been lost.
+    expect(acct.getEngineBasisRestatementCensus().operatorPin.holds).toBe(3);
+
+    // The behavioural claim, after the sweeps: still not sold.
+    expect(acct.checkExits(UNDERLYINGS, MARKS, 'live', { waitAndHold: true })).toHaveLength(0);
+  });
+
+  it('the pin rides the snapshot, so a restart does not undo the correction', () => {
+    const { acct, row } = adoptedAndHandedOver(BLEND);
+    acct.restateAdoptedBasisFromOperator(row().id, request());
+
+    // The real durability path: export, JSON round-trip (bqb1 persists with
+    // `JSON.stringify`), import into a fresh account, then reconcile.
+    const snap = JSON.parse(JSON.stringify(acct.exportSnapshot()));
+    const rebooted = liveBook();
+    rebooted.importSnapshot(snap);
+    rebooted.reconcileTradierPositions(brokerPayload(BLEND), 'live');
+
+    const after = rebooted.getState().openOptions.find(o => o.optionSymbol === OCC)!;
+    expect(after.operatorBasisPin?.premiumPaid).toBeCloseTo(DESK, 10);
+    expect(after.premiumPaid).toBeCloseTo(DESK, 10);
+    expect(after.stopLossPremium).toBeCloseTo(STOP_AT_DESK, 10);
+  });
+
+  it('a LARGER broker lot is refused, not absorbed — the row keeps basis and size', () => {
+    // A second lot means the broker's average now describes something the
+    // operator never priced. Same posture as a `desk_add` lot.
+    const { acct, row } = adoptedAndHandedOver(BLEND);
+    acct.restateAdoptedBasisFromOperator(row().id, request());
+    acct.reconcileTradierPositions(
+      [{ ...brokerPayload(1.05)[0]!, contracts: 2 }],
+      'live',
+    );
+    expect(row().premiumPaid).toBeCloseTo(DESK, 10);
+    expect(row().contractsRemaining ?? row().contracts).toBe(1);
+    expect(acct.getEngineBasisRestatementCensus().operatorPin.absorptionRefusals).toBe(1);
+  });
+
+  it('a SMALLER broker lot is a real partial close: quantity follows, the price does not', () => {
+    const two = liveBook();
+    two.reconcileTradierPositions([{ ...brokerPayload(BLEND)[0]!, contracts: 2 }], 'live');
+    const id = two.getState().openOptions[0]!.id;
+    expect(two.handOverAdoptedOption(id, 'admin', GRANTED_AT).status).toBe('granted');
+    expect(two.restateAdoptedBasisFromOperator(id, request()).status).toBe('restated');
+
+    two.reconcileTradierPositions(brokerPayload(BLEND), 'live'); // 1 contract left
+    const row = two.getState().openOptions.find(o => o.id === id)!;
+    expect(row.contractsRemaining).toBe(1);
+    expect(row.premiumPaid).toBeCloseTo(DESK, 10);
+    expect(row.stopLossPremium).toBeCloseTo(STOP_AT_DESK, 10);
+    expect(row.operatorBasisPin?.contracts).toBe(1);
+  });
+
+  it('a pin whose row moved off the pinned figure is VOIDED, not left dormant', () => {
+    const { acct, row } = adoptedAndHandedOver(BLEND);
+    acct.restateAdoptedBasisFromOperator(row().id, request());
+    // Something else moves the basis — the pin no longer describes the row.
+    acct.getState(); // (read-only; the mutation below is deliberate and direct)
+    const live = (acct as unknown as { openOptions: Map<string, OptionPosition> }).openOptions.get(row().id)!;
+    live.premiumPaid = 1.05;
+
+    acct.reconcileTradierPositions(brokerPayload(BLEND), 'live');
+    expect(row().operatorBasisPin).toBeUndefined();
+    expect(row().premiumPaid).toBeCloseTo(BLEND, 10);
+    expect(acct.getEngineBasisRestatementCensus().operatorPin.releases).toBe(1);
+  });
+});
+
 // ─── The negative control ────────────────────────────────────────────────────
 
 describe('TRA-3958 — `basis_moved` is the refusal that stops a stale figure', () => {

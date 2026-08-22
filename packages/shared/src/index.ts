@@ -3036,6 +3036,45 @@ export interface OptionPosition {
    */
   deskAddSleeve?: 'single_leg_rv' | 'single_leg_otm' | 'single_leg_directional';
   /**
+   * TRA-3958 — an OPERATOR restated this adopted row's basis, and this pin is
+   * what makes the correction SURVIVE.
+   *
+   * Measured on bqb1 2026-08-22T15:19Z, minutes after the route shipped: the
+   * write landed (1.41 → 1.17, stop 1.0575 → 0.8775, read back exact), and the
+   * next Tradier reconcile — 30s later — put 1.41 straight back. An adopted
+   * `foreign` row takes the "premium changed ⇒ copy the broker's number and
+   * re-derive the schedule" branch of `reconcileTradierPositions` on EVERY
+   * sweep, and the broker's number is the two-lot blend this ticket exists to
+   * get off the row. A read-back taken immediately after the write is
+   * byte-identical in both worlds, which is exactly how this nearly shipped as
+   * "done".
+   *
+   * So the correction is not a value, it is a STANDING INSTRUCTION, and it is
+   * recorded on the row where the reconcile can see it:
+   *
+   *   • broker lot unchanged ⇒ the copy is skipped and the operator's basis
+   *     holds;
+   *   • broker lot LARGER ⇒ absorption refused, exactly as a `desk_add` lot
+   *     refuses it — a new lot means the broker's average now describes
+   *     something the operator never priced. Row keeps its basis AND its
+   *     quantity; the excess is a `brokerPositionDrift.excess` finding;
+   *   • broker lot SMALLER ⇒ a real partial close. Quantity follows, the
+   *     per-contract basis does not move, and the pin follows the new size.
+   *
+   * It rides `exportSnapshot`/`importSnapshot` with the row, so it survives the
+   * restarts bqb1 takes several times a day. Cleared only with the row itself.
+   */
+  operatorBasisPin?: {
+    /** The figure the operator installed. The pin is void if the row moves off it. */
+    premiumPaid: number;
+    /** Contracts the pinned per-contract price describes. */
+    contracts: number;
+    /** ISO instant of the restatement. */
+    at: string;
+    /** The operator's citation, verbatim — the same string in the durable log. */
+    provenance: string;
+  };
+  /**
    * TRA-348 — Tradier order id for an in-flight `sell_to_close` against an
    * imported position. Set when the close order was accepted but did not
    * reach a terminal `filled` state inside the wait window (after-hours,

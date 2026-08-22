@@ -3243,6 +3243,18 @@ export class PaperOptionsAccount {
    */
   private engineBasisOperatorRestatedTotal = 0;
   /**
+   * TRA-3958 — reconcile sweeps that HELD an operator-pinned basis against the
+   * broker's blend. This is the number that says the correction is still alive:
+   * a restatement with `operatorPinHolds: 0` after a sweep has run is a
+   * correction that has already been overwritten, and the row reads identically
+   * either way seconds after the write.
+   */
+  private operatorPinHolds = 0;
+  /** TRA-3958 — pinned rows whose broker lot GREW; absorption refused. */
+  private operatorPinAbsorptionRefusals = 0;
+  /** TRA-3958 — pins voided because the row left the pinned figure. */
+  private operatorPinReleases = 0;
+  /**
    * TRA-3909 — the last PER-LOT adoption pass over the live book.
    *
    * Held as the pass's own output rather than reconstructed from the rows,
@@ -9040,6 +9052,13 @@ export class PaperOptionsAccount {
      * one thing about it a reader must never have to infer.
      */
     operatorRestated: number;
+    /**
+     * TRA-3958 — reconcile sweeps that HELD a pinned basis against the broker's
+     * blend, refused a widening lot, or voided a pin. `holds` is the liveness
+     * read: a correction with `restatements: 1` and `holds: 0` after sweeps have
+     * run has already been overwritten, and the row cannot tell you that itself.
+     */
+    operatorPin: { holds: number; absorptionRefusals: number; releases: number };
     retained: number;
     retentionCap: number;
     skips: Record<EngineBasisSkipReason, number>;
@@ -9050,6 +9069,11 @@ export class PaperOptionsAccount {
       restated: this.engineBasisRestatedTotal,
       repaired: this.engineBasisRepairedTotal,
       operatorRestated: this.engineBasisOperatorRestatedTotal,
+      operatorPin: {
+        holds: this.operatorPinHolds,
+        absorptionRefusals: this.operatorPinAbsorptionRefusals,
+        releases: this.operatorPinReleases,
+      },
       retained: this.engineBasisRestatements.length,
       retentionCap: ENGINE_BASIS_RESTATEMENT_LOG_CAP,
       skips: { ...this.engineBasisSkips },
@@ -9554,6 +9578,17 @@ export class PaperOptionsAccount {
      */
     const install = (row: OptionPosition): boolean => {
       row.premiumPaid = requestedPremiumPaid;
+      // ★ The correction is a STANDING INSTRUCTION, not a value. Without this
+      // pin the write lands, reads back perfectly, and the next Tradier sweep
+      // 30s later copies the broker's blend back over it — measured on bqb1 at
+      // 15:19Z on 2026-08-22, minutes after the first version of this route
+      // shipped. See `OptionPosition.operatorBasisPin`.
+      row.operatorBasisPin = {
+        premiumPaid: requestedPremiumPaid,
+        contracts: persistedContracts,
+        at: new Date(Date.now()).toISOString(),
+        provenance,
+      };
       // `peakPremium` is seeded to `premiumPaid` at adoption and only rises on a
       // real mark. Where it still equals the OLD basis it is that seed and
       // nothing else — an artifact of the wrong number — so it moves with it.
@@ -10034,6 +10069,87 @@ export class PaperOptionsAccount {
             });
           }
           continue;
+        }
+
+        // ── TRA-3958 — an OPERATOR-PINNED basis is not the broker's to restate ─
+        // The branch below is where the desk's BAC row lost its correction 30
+        // seconds after it was applied: an adopted `foreign` row takes the
+        // "premium changed ⇒ copy the broker's number" path on EVERY sweep, and
+        // the broker's number for a symbol whose sibling lot has closed is the
+        // two-lot BLEND. The immediate read-back of the write is identical in
+        // both worlds, which is why this needed measuring on the live host
+        // rather than reasoning about.
+        //
+        // The three arms mirror `desk_add` exactly, and for the same reasons —
+        // a pinned lot and an adopted lot are the same kind of object, one
+        // priced by our ledger and one priced by a human with a citation.
+        const pin = existing.operatorBasisPin;
+        if (pin && Math.abs(existing.premiumPaid - pin.premiumPaid) <= 1e-6) {
+          const pinnedHeld = existing.contractsRemaining ?? existing.contracts;
+          if (Number.isFinite(incoming.contracts) && incoming.contracts > pinnedHeld) {
+            // A lot the operator never priced has arrived on this symbol. The
+            // broker's average now describes something else entirely, so it is
+            // refused rather than absorbed — the row keeps its basis AND its
+            // quantity, and the excess is a `brokerPositionDrift` finding.
+            this.operatorPinAbsorptionRefusals += 1;
+            accountLog.warn('operator-pinned row: broker lot is LARGER than the pinned lot — absorption REFUSED', {
+              issue: 'TRA-3958',
+              positionId: existing.id,
+              optionSymbol: existing.optionSymbol,
+              pinnedContracts: pinnedHeld,
+              brokerContracts: incoming.contracts,
+              pinnedPremiumPaid: pin.premiumPaid,
+              brokerBlendedPremium: incoming.premiumPaid,
+              provenance: pin.provenance,
+              action: 'row keeps its contracts, basis and stop; the excess is `brokerPositionDrift.excess`',
+            });
+            continue;
+          }
+          if (
+            Number.isFinite(incoming.contracts)
+            && incoming.contracts > 0
+            && incoming.contracts < pinnedHeld
+          ) {
+            // A real partial close. A per-contract price is invariant under it,
+            // so the quantity follows and the basis does not — and the pin
+            // follows the size so it keeps describing the row it is on.
+            existing.contracts = incoming.contracts;
+            existing.contractsRemaining = incoming.contracts;
+            existing.operatorBasisPin = { ...pin, contracts: incoming.contracts };
+            updated += 1;
+            accountLog.info('operator-pinned row: broker reports fewer contracts — quantity followed, basis untouched', {
+              issue: 'TRA-3958',
+              positionId: existing.id,
+              optionSymbol: existing.optionSymbol,
+              from: pinnedHeld,
+              to: incoming.contracts,
+              premiumPaid: existing.premiumPaid,
+            });
+            continue;
+          }
+          // Lot unchanged: the pin holds and the copy is skipped entirely —
+          // including `currentPremium`, which the TRA-351 mark refresher owns
+          // and which the copy below would otherwise stamp with the blend.
+          this.operatorPinHolds += 1;
+          continue;
+        }
+        if (pin) {
+          // A pin whose row has moved off the pinned figure by some OTHER path
+          // is void, and it is deleted rather than left lying there: a dormant
+          // pin that could re-arm if the value ever came back around again is a
+          // standing instruction nobody issued. Said out loud — this should not
+          // happen, and if it does, the reason matters more than the row.
+          this.operatorPinReleases += 1;
+          delete existing.operatorBasisPin;
+          accountLog.warn('operator basis pin RELEASED — the row no longer carries the pinned figure', {
+            issue: 'TRA-3958',
+            positionId: existing.id,
+            optionSymbol: existing.optionSymbol,
+            pinnedPremiumPaid: pin.premiumPaid,
+            rowPremiumPaid: existing.premiumPaid,
+            provenance: pin.provenance,
+            action: 'the broker copy below resumes; re-issue the restatement if the correction is still wanted',
+          });
         }
 
         const contractsChanged = existing.contracts !== incoming.contracts;

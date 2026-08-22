@@ -15291,6 +15291,13 @@ app.get('/api/options/basis-restatements', requireAuth, async (req, res) => {
       // readable as the other. The durable log's `provenance` field is the
       // per-record form.
       operatorRestated: memory.operatorRestated,
+      // TRA-3958 — the LIVENESS half of the operator restatement, and the only
+      // reader that can tell a correction that is still standing from one the
+      // reconcile has already put the broker's blend back over. `holds` counts
+      // sweeps that skipped the copy because the row is pinned. `restated: 1`
+      // with `holds: 0` once a sweep has run means the correction is GONE —
+      // which is what the row looked like for 30 seconds on 2026-08-22.
+      operatorPin: memory.operatorPin,
       skips: memory.skips,
     },
     // Survives restarts. This is the tape gate A is graded against.
