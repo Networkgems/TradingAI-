@@ -3,6 +3,7 @@ import {
   CLOSING_EQUITY_BASIS_BROKER,
   CLOSING_EQUITY_BASIS_NOT_MEASURED,
   OPENING_EQUITY_BASIS_BROKER_PREV,
+  STOCK_LEG_PROBE_TOLERANCE_USD,
 } from './pnl-tracker.js';
 import type { EodTailCalendar, JournalDayCloses } from './pnl-reconciliation.js';
 import { staleTailSessions } from './pnl-reconciliation.js';
@@ -77,12 +78,11 @@ export const STOCK_LEG_BASIS_NOT_MEASURED = 'zero-probe-not-measured';
  */
 export const STOCK_LEG_BASIS_PROBE_DISAGREES = 'zero-probe-disagrees';
 
-/**
- * Residual (USD) below which the equity probe is treated as agreeing the stock
- * leg is inert. Not zero: the probe also absorbs broker cash flow and rounding,
- * so demanding an exact 0.00 would flag every row on noise.
- */
-export const STOCK_LEG_PROBE_TOLERANCE_USD = 1;
+// TRA-3948 — the probe tolerance moved to `pnl-tracker.ts` alongside the basis
+// vocabulary, so `pnl-reconciliation.ts` can grade a row against the SAME
+// threshold that stamped its basis without importing from THIS module, which
+// value-imports from it. Re-exported here so existing importers keep compiling.
+export { STOCK_LEG_PROBE_TOLERANCE_USD };
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;

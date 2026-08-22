@@ -1,5 +1,5 @@
 import type { DailySnapshot } from './pnl-tracker.js';
-import { CLOSING_EQUITY_BASIS_BROKER } from './pnl-tracker.js';
+import { CLOSING_EQUITY_BASIS_BROKER, STOCK_LEG_PROBE_TOLERANCE_USD } from './pnl-tracker.js';
 import { isJournalAuthoritativeSource, journalRealizingEvents } from './options-daily-pnl-source.js';
 // TRA-2888 — the permanent 07-30/07-31/08-03 gap ruling. `eod-ledger-gap.ts`
 // imports only a TYPE back from this module (`EodTailCalendar`), which erases at
@@ -258,6 +258,13 @@ export const PNL_COMBINED_AGREEMENT_NOTE =
   'TRA-3517: `engines[].combinedAgreementOk` / `days[].combinedAgreement` is the reader that REPLACES `drift` on a broker-shaped row. TRA-3349 correctly suppressed `drift` to null there (the `eodCombined == stockDaily + optionsDaily` identity is an engine-book decomposition a broker row does not satisfy), and that suppression removed the ONLY automated cross-check watching `combinedPnl` on live books; the row/report agreement meant to replace it was published on neither side, so a future divergence between the TRA-359 override and the stored row would have been silent. READ A GREEN NARROWLY. Both sides are written from the SAME `override` object on the same tick (`applyTradierBalanceOverride` for the report, `shapeLiveRecordedRow` for the row), so agreement holds BY CONSTRUCTION today and is NOT independent corroboration that the broker figure is right — it would read exactly the same if the figure were wrong on both. What it can catch is the two stores DRIFTING APART later: a re-generated report, a back-fill, a clobber, or a refactor that stops threading the override into the row. The axis is graded ONLY where the claim is made (row `closingEquityBasis: \'broker-eod-balance\'` AND report `pnlSource: \'tradier-balance\'`); everywhere else it is `\'not-measured\'` with a reason, and `\'not-measured\'` MUST NEVER be folded into `\'agree\'` — on the broker-shaped cohort a vacuous true is the same reading as a real pass. `combinedAgreementOk: null` means NOTHING THAT COULD HAVE FAILED was looked at; report that state as `unknown`, never as clean. TWO DENOMINATORS, AND THEY DIFFER: `combinedAgreementGradeableCount` is how many sessions the axis GRADED, `combinedAgreementDiscriminatingCount` is how many of those could have read `disagree` (at least one side materially non-zero) — and the verdict keys on the SECOND. A session where the row and the report both read 0.00 emits `agree` however broken the wiring is, so it is a measurement and not evidence. First live read of this axis, 2026-08-13T08:39Z on build 3877000: graded 2, discriminating 1 — `admin` 2026-08-12 at -0.10 vs -0.10 is the real one, `v0nni` 2026-08-12 at 0.00 vs 0.00 is degenerate. Quote the discriminating count beside any verdict; the graded count alone doubles the apparent coverage of a single session. Also read `combinedPnlNoReaderDates` (real-money sessions whose `combinedPnl` neither reader observes).';
 
 /**
+ * TRA-3948 — the equity-probe axis and the false-green it replaces, published
+ * beside the fields so a gate author reading the payload head cannot miss it.
+ */
+export const PNL_STOCK_LEG_PROBE_NOTE =
+  'TRA-3948: on a broker-shaped LIVE row `stockLegDrift` and `maxStockLegDriftUsd` ARE STRUCTURALLY 0 AND CANNOT SEE THE EQUITY RESIDUAL THEIR NAMES PROMISE. This is not a formula bug, it is a scope mismatch, and it read as a live green for four sessions. `stockLegDrift` is `eodStockPnl - stockDaily`; the probe is `closingEquity - openingEquity - optionsDaily - netCashFlowUsd`. The operand sets are DISJOINT. `shapeLiveRecordedRow` books `dailyPnl: 0` on every broker-shaped row by design (broker delta-equity already contains the stock P&L, so booking a demo stock figure beside it would be the TRA-3288 two-surface error relocated) and the TRA-219 21:00 ET archive zeroes `eodStockPnl`, so the drift computes `0 - 0` for EVERY possible value of the probe. Measured live 2026-08-22T04:42Z on build `0fd3b68`: `admin` served `stockLegBasis: \'zero-probe-disagrees\'` with `stockLegProbeUsd` -197.36 (08-17), +196.56 (08-18), -71.36 (08-20) and +112.47 (08-21) -- $197.36 against a $946.60 closing equity, ~21 percent of the book in one session -- while `stockLegDrift` read 0 on all four and 0 of the endpoint\'s 117 top-level keys matched /probe|basis/. THE OTHER TWO READERS WERE ALSO SILENT, AND FOR STRUCTURAL REASONS: row-level `drift` is `null` on a broker-shaped row (TRA-3349, correctly), and `stockLegOk`\'s cohort requires `stockDaily !== 0`, which the writer pins to 0, so no live row can EVER enter it -- the fleet `stockLegOk: false` / `stockLegMeasuredCount: 217` / `maxStockLegDriftUsd: 765` on the same pull is entirely DEMO rows and is pinned red, carrying no information about a live probe in either direction. READ `liveStockLegProbeOk` INSTEAD (per book: `engines[].stockLegProbeOk`; per row: `days[].stockLegProbeUsd` / `stockLegBasis`). It is TRI-STATE, RED > NOT MEASURED > GREEN, and `null` means nobody looked. THE VERDICT KEYS ON THE NUMBER, NOT ON THE `stockLegBasis` STRING: that vocabulary is an open enum owned by another module, and binding to `\'zero-probe-disagrees\'` would let a renamed or added constant empty the offender set and turn the axis green with no code change here. `stockLegBasisCounts` publishes the strings as DIAGNOSIS. QUOTE `liveStockLegProbeDiscriminatingCount`, NOT `liveStockLegProbeMeasuredCount`, BESIDE ANY VERDICT: a dormant book probes 0-0-0-0 and emits `zero-probe-agrees` however broken the wiring is, and this is not hypothetical -- live book `v0nni` sat at 400.00 -> 400.00 across all 8 of its probed sessions on that pull, so the measured count reads 16 clean-ish sessions over what is really 4 discriminating live sessions, ALL FOUR of which disagree. `liveStockLegProbeNotMeasuredCount` is the third state: rows the writer stamped a basis on whose probe could not run (an operand absent); a `null` verdict beside a non-zero value there is a COVERAGE HOLE on real-money rows, never a pass. FINALLY, WHAT THE PROBE IS NOT: it is the per-session equity move NEITHER BOOKED LEG ACCOUNTS FOR, not a claim that the residual is stock P&L. `netCashFlowUsd` was 0 and MEASURED (not null) on all 8 admin rows -- a null flow forces `stockLegBasis: \'zero-probe-not-measured\'` -- so a deposit or withdrawal is excluded, conditional on the TRA-359 flow capture; mis-timed option credits, fees and assignment are not. Attribution is open work; the DETECTOR is what this ticket restored.';
+
+/**
  * TRA-3589 — the NAV source-of-record boundary, in band.
  *
  * Filed by the CFO off an independent pull: on 2026-08-12 both `mode: live`
@@ -281,6 +288,7 @@ export const PNL_RECONCILIATION_CAVEATS = [
   PNL_EOD_INTERIOR_RETIREMENT_NOTE,
   PNL_EOD_INTERIOR_ACKNOWLEDGED_NOTE,
   PNL_COMBINED_AGREEMENT_NOTE,
+  PNL_STOCK_LEG_PROBE_NOTE,
   PNL_EQUITY_SOURCE_ERA_NOTE,
   NON_SESSION_LEDGER_ROW_CAVEAT,
 ];
@@ -347,6 +355,14 @@ export const PNL_UNGRADEABLE_FIELDS = [
   'maxDriftUsd',
   'engines[].drift',
   'eodInteriorAbsentOk',
+  // TRA-3948 — SCOPED entries, and the scope is load-bearing. Both fields are
+  // gradeable on the DEMO cohort, where `stockDaily` is a real equity delta;
+  // they are structurally 0 only on broker-shaped LIVE rows, where the writer
+  // pins `dailyPnl: 0` and the archive zeroes `eodStockPnl`. Listing them
+  // unscoped would retire a working demo signal to fix a live one. See
+  // `PNL_STOCK_LEG_PROBE_NOTE`; the live reader is `liveStockLegProbeOk`.
+  'maxStockLegDriftUsd (live cohort only — structurally 0)',
+  'engines[].stockLegDrift (broker-shaped rows only — structurally 0)',
 ];
 
 /**
@@ -670,6 +686,28 @@ export interface PnlReconcileDay {
    * STOCK P&L this day realized. `stockDaily` is the durable side; a non-zero
    * value is normally the report's `allClosedPositions` list having been cleared
    * by the 21:00 ET archive before the report was written.
+   *
+   * ⛔ TRA-3948 — **THIS FIELD IS STRUCTURALLY `0` ON A BROKER-SHAPED LIVE ROW
+   * AND CANNOT SEE THE EQUITY RESIDUAL ITS NAME PROMISES.** Not a bug in the
+   * formula — a scope mismatch that read as a green for four live sessions:
+   *
+   *     stockLegDrift  operands: { eodStockPnl, stockDaily }
+   *     stockLegProbeUsd operands: { closingEquity, openingEquity,
+   *                                  optionsDailyPnl, netCashFlowUsd }
+   *
+   * The two sets are DISJOINT. `shapeLiveRecordedRow` books `dailyPnl: 0` on
+   * every broker-shaped row by design (broker delta-equity already contains the
+   * stock P&L), and `eodStockPnl` is zeroed by the TRA-219 21:00 archive, so
+   * this reads `0 − 0` identically for every possible value of the probe.
+   * Measured live 2026-08-22T04:42Z on build `0fd3b68`: `admin` carried
+   * `stockLegBasis: 'zero-probe-disagrees'` with a −$197.36 probe on 2026-08-17
+   * while `stockLegDrift` — and {@link PnlReconcileSummary.maxStockLegDriftUsd}
+   * with it — read `0`.
+   *
+   * A monitor bound to this field on a LIVE book is green by construction, not
+   * by measurement. Read {@link stockLegProbeUsd} and the
+   * `liveStockLegProbe*` fold instead; this field keeps its exact TRA-2630
+   * meaning (report-realized vs book-realized) and is left untouched on purpose.
    */
   stockLegDrift: number;
   /**
@@ -1380,8 +1418,90 @@ export interface PnlReconcileResult {
   stockLegMeasuredCount: number;
   /** TRA-2630 — dates whose |`stockLegDrift`| exceeds the tolerance (evaluated days only). */
   stockLegOffendingDates: string[];
-  /** TRA-2630 — max |`stockLegDrift`| over evaluated days, USD. */
+  /**
+   * TRA-2630 — max |`stockLegDrift`| over evaluated days, USD.
+   *
+   * ⛔ TRA-3948 — carries the scope limit of the field it folds: on a
+   * broker-shaped LIVE row `stockLegDrift` is structurally `0`, so this number
+   * cannot rise on the live cohort no matter how large the equity residual gets.
+   * See {@link PnlReconcileDay.stockLegDrift}. For the live cohort read
+   * {@link maxLiveStockLegProbeUsd}.
+   */
   maxStockLegDriftUsd: number;
+  /**
+   * TRA-3948 — **THE EQUITY-PROBE VERDICT: does the booked-`0` stock leg
+   * actually explain the session's equity move?** TRI-STATE, and the order is
+   * RED > NOT MEASURED > GREEN:
+   *
+   *  - `false` — some row's |{@link PnlReconcileDay.stockLegProbeUsd}| exceeds
+   *    {@link STOCK_LEG_PROBE_TOLERANCE_USD}. Any residual wins outright.
+   *  - `null`  — NOT MEASURED. No row in this book could have produced a
+   *    material residual (see {@link stockLegProbeDiscriminatingCount}).
+   *  - `true`  — at least one DISCRIMINATING row, and none disagreed.
+   *
+   * WHY IT EXISTS. `stockLegBasis: 'zero-probe-disagrees'` shipped in TRA-3517
+   * as a per-row string and NOTHING folded it: on the 2026-08-22T04:42Z live
+   * pull, 0 of the endpoint's 117 top-level keys matched `/probe|basis/` while
+   * `admin` carried four disagreements up to $197.36. The field whose name
+   * promised this — `stockLegDrift` — is arithmetically incapable of moving here
+   * (disjoint operands; see {@link PnlReconcileDay.stockLegDrift}), so the
+   * reading was a live false-green with no honest `null` behind it.
+   *
+   * THE VERDICT KEYS ON THE NUMBER, NOT ON `stockLegBasis`. The basis is an
+   * open enum written by another module; binding the verdict to the string
+   * `'zero-probe-disagrees'` would let a renamed or added constant silently
+   * empty the offender set and turn this axis green without a code change here.
+   * The string is published as {@link stockLegBasisCounts} — diagnosis, never
+   * the verdict — and it is graded against the SAME tolerance the writer
+   * stamped it with, so a `'zero-probe-disagrees'` row inside a green cohort is
+   * itself a detectable contradiction rather than an invisible one.
+   */
+  stockLegProbeOk: boolean | null;
+  /**
+   * TRA-3948 — rows carrying a numeric `stockLegProbeUsd`. MEASUREMENT
+   * coverage: how many rows the probe actually ran on. Deliberately NOT the
+   * denominator behind {@link stockLegProbeOk}.
+   */
+  stockLegProbeMeasuredCount: number;
+  /**
+   * TRA-3948 — rows the writer stamped a `stockLegBasis` on but whose probe is
+   * `null` (an operand was absent). Published so a zero
+   * {@link stockLegProbeMeasuredCount} is attributable: "the probe could not
+   * run" and "there were no broker-shaped rows" are different outages and a
+   * count of 0 alone renders them identically.
+   */
+  stockLegProbeNotMeasuredCount: number;
+  /**
+   * TRA-3948 — **THE DENOMINATOR BEHIND {@link stockLegProbeOk}.** Measured
+   * rows where a material residual was even POSSIBLE: at least one probe
+   * operand moved by more than the tolerance
+   * (|closingEquity − openingEquity|, |optionsDaily|, or |netCashFlowUsd|).
+   *
+   * A dormant book probes `0 − 0 − 0 − 0` and emits `zero-probe-agrees` however
+   * broken the wiring is. That is a measurement, not evidence — and it is not
+   * hypothetical: on the 2026-08-22 live pull the second live book `v0nni` sat
+   * at 400.00 → 400.00 on all 8 of its probed sessions and scored 8 clean
+   * agreements. Counting those as coverage would have reported 12 clean live
+   * sessions against 4 disagreements instead of the true 4-of-4.
+   *
+   * No red can hide behind this narrowing: a row with a material residual has,
+   * by definition, a material equity delta, so every offender is discriminating.
+   */
+  stockLegProbeDiscriminatingCount: number;
+  /** TRA-3948 — dates whose |`stockLegProbeUsd`| exceeds the tolerance. */
+  stockLegProbeOffendingDates: string[];
+  /**
+   * TRA-3948 — largest |`stockLegProbeUsd`| over MEASURED rows, USD. `null` on
+   * an empty cohort — `0` there is the `every`-on-the-empty-set pass wearing a
+   * number, the exact shape `maxStockLegDriftUsd` was reporting.
+   */
+  maxStockLegProbeUsd: number | null;
+  /**
+   * TRA-3948 — rows by `stockLegBasis` string, absent rows excluded. DIAGNOSIS,
+   * not the verdict (see {@link stockLegProbeOk}); the vocabulary is open, so
+   * treat an unfamiliar key as unread rather than as clean.
+   */
+  stockLegBasisCounts: Record<string, number>;
   /**
    * TRA-2630 — the OPTIONS-leg verdict, baseline-gated exactly like `ok`.
    * TRI-STATE as of TRA-2641, and the order is RED > NOT MEASURED > GREEN:
@@ -2507,6 +2627,119 @@ export function summarizeLiveCombinedAgreement(
     liveCombinedPnlNoReaderBooks: liveBooks
       .filter(e => e.combinedPnlNoReaderDates.length > 0)
       .map(e => ({ username: e.username, dates: e.combinedPnlNoReaderDates })),
+  };
+}
+
+/**
+ * TRA-3948 — fleet fold of the BOOKED-`0` STOCK LEG's equity probe over the
+ * LIVE cohort: is there a per-session equity move that neither booked leg
+ * accounts for?
+ *
+ * ── Why a new axis rather than a fix to `stockLegDrift` ──────────────────────
+ *
+ * `stockLegDrift` is `eodStockPnl − stockDaily`; the probe is
+ * `closingEquity − openingEquity − optionsDaily − netCashFlow`. DISJOINT
+ * operands. `shapeLiveRecordedRow` pins `dailyPnl: 0` on every broker-shaped row
+ * and the TRA-219 archive zeroes `eodStockPnl`, so the drift reads `0 − 0`
+ * however large the residual is. Read live 2026-08-22T04:42Z, build `0fd3b68`:
+ *
+ *     admin 2026-08-17  probe −197.36  basis 'zero-probe-disagrees'  drift 0
+ *     admin 2026-08-18  probe +196.56  basis 'zero-probe-disagrees'  drift 0
+ *     admin 2026-08-20  probe  −71.36  basis 'zero-probe-disagrees'  drift 0
+ *     admin 2026-08-21  probe +112.47  basis 'zero-probe-disagrees'  drift 0
+ *
+ * — $197.36 against a $946.60 book, and `maxStockLegDriftUsd` on the live cohort
+ * read `0.00`. Rewriting the drift formula to cover this would destroy the
+ * TRA-2630 leg semantics for the demo cohort where it still works; the honest
+ * repair is a second axis with its own denominator, which is what this is.
+ *
+ * ── Scoped LIVE, and the denominator travels with the verdict ────────────────
+ *
+ * Only live books carry broker-shaped rows; folding over ~65 structurally
+ * unprobed demo books would bury one graded live book. The fleet-wide
+ * `stockLegOk` demonstrates the cost of not doing this — it reads `false` with
+ * `stockLegMeasuredCount: 217` off DEMO rows and is pinned red, so it can
+ * neither report nor clear anything about a live probe.
+ *
+ * ── The green requires a MOVING book ─────────────────────────────────────────
+ *
+ * `liveStockLegProbeDiscriminatingCount` is the denominator, not
+ * `...MeasuredCount`. A dormant book probes `0 − 0 − 0 − 0` and emits
+ * `'zero-probe-agrees'` however broken the wiring is. That is not hypothetical:
+ * on the same pull, live book `v0nni` sat at 400.00 → 400.00 across all 8 of its
+ * probed sessions and contributed 8 clean agreements. Folding those in reports
+ * "12 measured, 4 offenders" over what is really 4-of-4 discriminating sessions
+ * disagreeing.
+ *
+ * `null` is NOT MEASURED and must never be reported as clean — with a non-empty
+ * `liveStockLegProbeNotMeasuredCount` beside it, it means the probe COULD NOT
+ * RUN on real-money rows, which is a coverage hole, not a pass.
+ */
+export function summarizeLiveStockLegProbe(
+  engines: ReadonlyArray<{
+    username: string;
+    mode: string;
+    stockLegProbeOk: boolean | null;
+    stockLegProbeMeasuredCount: number;
+    stockLegProbeNotMeasuredCount: number;
+    stockLegProbeDiscriminatingCount: number;
+    stockLegProbeOffendingDates: string[];
+    maxStockLegProbeUsd: number | null;
+    stockLegBasisCounts: Record<string, number>;
+  }>,
+): {
+  liveStockLegProbeBookCount: number;
+  liveStockLegProbeOk: boolean | null;
+  liveStockLegProbeMeasuredCount: number;
+  liveStockLegProbeNotMeasuredCount: number;
+  liveStockLegProbeDiscriminatingCount: number;
+  liveStockLegProbeOffendingBooks: Array<{
+    username: string;
+    dates: string[];
+    maxProbeUsd: number | null;
+  }>;
+  maxLiveStockLegProbeUsd: number | null;
+  liveStockLegBasisCounts: Record<string, number>;
+} {
+  const liveBooks = engines.filter(e => e.mode === 'live');
+  const measuredMaxima = liveBooks
+    .map(e => e.maxStockLegProbeUsd)
+    .filter((n): n is number => typeof n === 'number');
+  return {
+    liveStockLegProbeBookCount: liveBooks.length,
+    liveStockLegProbeOk: liveBooks.some(e => e.stockLegProbeOk === false)
+      ? false
+      : liveBooks.some(e => e.stockLegProbeOk === true)
+        ? true
+        : null,
+    liveStockLegProbeMeasuredCount: liveBooks.reduce(
+      (n, e) => n + e.stockLegProbeMeasuredCount,
+      0,
+    ),
+    liveStockLegProbeNotMeasuredCount: liveBooks.reduce(
+      (n, e) => n + e.stockLegProbeNotMeasuredCount,
+      0,
+    ),
+    liveStockLegProbeDiscriminatingCount: liveBooks.reduce(
+      (n, e) => n + e.stockLegProbeDiscriminatingCount,
+      0,
+    ),
+    // Named with dates, not counted. "One live book has a residual" is not
+    // actionable without knowing which sessions to reconcile against the broker.
+    liveStockLegProbeOffendingBooks: liveBooks
+      .filter(e => e.stockLegProbeOffendingDates.length > 0)
+      .map(e => ({
+        username: e.username,
+        dates: e.stockLegProbeOffendingDates,
+        maxProbeUsd: e.maxStockLegProbeUsd,
+      })),
+    maxLiveStockLegProbeUsd: measuredMaxima.length === 0 ? null : Math.max(...measuredMaxima),
+    liveStockLegBasisCounts: liveBooks.reduce<Record<string, number>>((acc, e) => {
+      for (const [basis, n] of Object.entries(e.stockLegBasisCounts)) {
+        acc[basis] = (acc[basis] ?? 0) + n;
+      }
+      return acc;
+    }, {}),
   };
 }
 
@@ -3834,6 +4067,53 @@ export function reconcilePnl(
   const stockLegMeasurableDays = evaluated.filter(
     d => d.eodStockPnl != null && d.stockDaily !== 0,
   );
+  // TRA-3948 — THE EQUITY-PROBE AXIS, the reader `stockLegDrift` cannot be.
+  //
+  // Cohort is `days`, NOT `evaluated`, and that is deliberate. The baseline gate
+  // exists to keep pre-fix rows out of verdicts they cannot satisfy; a
+  // `stockLegProbeUsd` is only ever stamped by the post-TRA-3349 writers, so the
+  // gate excludes nothing here and would only add an EVICTION path — move the
+  // baseline forward and a real disagreement leaves the cohort silently, which
+  // is how `eodTailStaleBooks` came to empty by eviction rather than by repair.
+  const stockLegProbeRows = days.filter(
+    d => typeof d.stockLegProbeUsd === 'number' && Number.isFinite(d.stockLegProbeUsd),
+  );
+  const stockLegProbeNotMeasuredCount = days.filter(
+    d => d.stockLegBasis !== null && (d.stockLegProbeUsd == null),
+  ).length;
+  // DISCRIMINATING = a material residual was reachable on this row. Every
+  // operand the writer differences is checked, not just the equity delta: a
+  // session that moved $0 but booked $400 of options could still have produced a
+  // residual, and pinning this to equity alone would drop it from the
+  // denominator.
+  const stockLegProbeDiscriminatingRows = stockLegProbeRows.filter(d => {
+    const equityMove =
+      d.closingEquity != null && d.openingEquity != null
+        ? Math.abs(d.closingEquity - d.openingEquity)
+        : null;
+    return (
+      (equityMove != null && equityMove > STOCK_LEG_PROBE_TOLERANCE_USD) ||
+      Math.abs(d.optionsDaily) > STOCK_LEG_PROBE_TOLERANCE_USD ||
+      (d.netCashFlowUsd != null && Math.abs(d.netCashFlowUsd) > STOCK_LEG_PROBE_TOLERANCE_USD)
+    );
+  });
+  const stockLegProbeOffendingDates = stockLegProbeRows
+    .filter(d => Math.abs(d.stockLegProbeUsd!) > STOCK_LEG_PROBE_TOLERANCE_USD)
+    .map(d => d.date);
+  // RED > NOT MEASURED > GREEN. A residual wins outright wherever it lands — it
+  // is discriminating by construction (a material probe needs a material
+  // operand), so this ordering cannot swallow one.
+  const stockLegProbeOk: boolean | null =
+    stockLegProbeOffendingDates.length > 0
+      ? false
+      : stockLegProbeDiscriminatingRows.length === 0
+        ? null
+        : true;
+  const stockLegBasisCounts = days.reduce<Record<string, number>>((acc, d) => {
+    if (d.stockLegBasis === null) return acc;
+    acc[d.stockLegBasis] = (acc[d.stockLegBasis] ?? 0) + 1;
+    return acc;
+  }, {});
   // NOT MEASURED (`null`) in two distinct situations, both of which a plain
   // boolean would have rendered as a green:
   //   1. no measurable row at all  — the empty-cohort trap (`every` is true on
@@ -4260,6 +4540,16 @@ export function reconcilePnl(
     maxStockLegDriftUsd: round2(
       evaluated.reduce((m, d) => Math.max(m, Math.abs(d.stockLegDrift)), 0),
     ),
+    stockLegProbeOk,
+    stockLegProbeMeasuredCount: stockLegProbeRows.length,
+    stockLegProbeNotMeasuredCount,
+    stockLegProbeDiscriminatingCount: stockLegProbeDiscriminatingRows.length,
+    stockLegProbeOffendingDates,
+    maxStockLegProbeUsd:
+      stockLegProbeRows.length === 0
+        ? null
+        : round2(stockLegProbeRows.reduce((m, d) => Math.max(m, Math.abs(d.stockLegProbeUsd!)), 0)),
+    stockLegBasisCounts,
     optionsLegOk,
     optionsLegMeasuredCount: optionsLegMeasurableDays.length,
     optionsLegSlavedCount: optionsLegSlavedDays.length,
