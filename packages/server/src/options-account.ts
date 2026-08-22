@@ -4604,7 +4604,16 @@ export class PaperOptionsAccount {
    * accumulated. Per-day attribution of the cumulative figure lives in
    * `foldJournalClosesByEtDay`, not here — this row stays trade-level.
    */
-  private queueJournalClose(position: OptionPosition, exitReason: string): void {
+  private queueJournalClose(
+    position: OptionPosition,
+    exitReason: string,
+    // TRA-3945 — the broker order id of the realising `sell_to_close`, passed
+    // by the two live-fill sites (`finalizePendingExit`, `recordImportedFill`)
+    // because both delete their pending handle before this runs. Every other
+    // site books locally and passes nothing → `null` on the row, which the
+    // evaluation window keys on `optionSymbol|closeTs` and counts visibly.
+    brokerOrderId: string | number | null = null,
+  ): void {
     if (!isOptionTradeJournalEnabled()) return;
     const id = position.id;
     const realizedPnlUsd = position.pnl ?? 0;
@@ -4643,6 +4652,7 @@ export class PaperOptionsAccount {
           realizedR,
           exitReason,
           holdDays,
+          brokerOrderId,
         });
       })
       // TRA-3078 — nothing to unbind. The binding lives on the position, which
@@ -8742,6 +8752,7 @@ export class PaperOptionsAccount {
     // e.g. `chandelier`) while `kind` is only the broker-facing bucket; stamp
     // the truth on the row and hand the journal the identical value.
     const exitReason = pending.journalReason ?? pending.kind;
+    const brokerOrderId = pending.tradierOrderId; // TRA-3945 — captured before the delete below
     opt.exitReason = exitReason;
     opt.closedAt = Date.now();
     opt.contractsRemaining = 0;
@@ -8750,7 +8761,7 @@ export class PaperOptionsAccount {
     this.openOptions.delete(optionId);
     this.closedOptions.push({ ...opt });
     // TRA-991 — fold the realized outcome onto this trade's journal row.
-    this.queueJournalClose(opt, exitReason);
+    this.queueJournalClose(opt, exitReason, brokerOrderId);
     return { ...opt };
   }
 
@@ -12007,6 +12018,7 @@ export class PaperOptionsAccount {
     opt.closedAt = Date.now();
     opt.currentPremium = avgFillPrice;
     opt.contractsRemaining = 0;
+    const brokerOrderId = opt.pendingCloseOrderId ?? null; // TRA-3945 — captured before the delete below
     delete opt.pendingCloseOrderId;
     delete opt.pendingCloseSubmittedAt; // TRA-392 — clear fill-chaser bookkeeping
     delete opt.pendingCloseRepriceSteps;
@@ -12018,7 +12030,7 @@ export class PaperOptionsAccount {
     // EVERY close through this path was dropped. `reconcileTradierPositions` now
     // journals the import (or rebinds it onto its original engine row), so the
     // call lands.
-    this.queueJournalClose(opt, exitReason);
+    this.queueJournalClose(opt, exitReason, brokerOrderId);
     // TRA-367 — surface realised P&L immediately on the Live pill instead
     // of waiting for the EOD Tradier-history reconcile. The reconciler
     // drains `realtimeImportedPnlByDate` so the same close isn't counted

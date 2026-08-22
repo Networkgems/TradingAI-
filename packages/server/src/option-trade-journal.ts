@@ -378,6 +378,16 @@ export interface OptionTradeJournalClose {
    * can be recalibrated against.
    */
   exitSlippageUsd?: number;
+  /**
+   * TRA-3945 — the broker order id of the `sell_to_close` that realised this
+   * row, when the close went through Tradier (engine-fired `pendingExit` or a
+   * user close against an imported row). `null`/absent means the close was
+   * booked locally (demo book, expiry settle, broker-reconcile) — the
+   * evaluation window keys such a close on `optionSymbol|closeTs` instead and
+   * counts it under `excludedCloses.reasons.brokerOrderIdNull` (a VISIBILITY
+   * counter; the close is still counted). Never read by any capital path.
+   */
+  brokerOrderId?: string | number | null;
 }
 
 /**
@@ -426,6 +436,8 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
   holdDays?: number;
   /** TRA-1600 (D) — measured exit-side slippage USD, folded from the CLOSE row. */
   exitSlippageUsd?: number;
+  /** TRA-3945 — broker order id of the realising close, folded from the CLOSE row. */
+  brokerOrderId?: string | number | null;
   /**
    * TRA-2895 — partial exits realized before the full close, in append order.
    *
@@ -1070,6 +1082,8 @@ function foldLine(
     // the summary rollup can decompose the round-trip cost. Only overwritten when
     // the close row carries a measurement (undefined leaves it absent).
     ...(line.close.exitSlippageUsd !== undefined ? { exitSlippageUsd: line.close.exitSlippageUsd } : {}),
+    // TRA-3945 — the dedupe handle for the evaluation window; absent stays absent.
+    ...(line.close.brokerOrderId !== undefined ? { brokerOrderId: line.close.brokerOrderId } : {}),
   });
 }
 

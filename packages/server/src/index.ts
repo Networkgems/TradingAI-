@@ -344,6 +344,8 @@ import { resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule } from './exit-ri
 // TRA-3941 — the frozen sleeve KEY the exit ruling is scoped to, so the wire
 // field names the same join column the journal tape and the gate ledger use.
 import { OTM_SLEEVE_MANDATE_STRUCTURE } from './otm-sleeve-mandate.js';
+// TRA-3945 — the pre-registered 30-close evaluation window for the OTM joint arm.
+import { tickOtmEvaluationWindow, type OtmEvaluationLivenessInputs } from './otm-evaluation-window.js';
 // TRA-3942 — the OTM sleeve's ENTRY-TIME windows, published on the wire.
 import {
   resolveOtmEntryWindows,
@@ -10811,6 +10813,60 @@ app.get('/api/health/crypto-live', async (_req, res) => {
 // account trades both equities and options per env), so a green readout here is
 // the physical proof the canary needs — NOT an autotrade arm (this probe wires
 // nothing and flips no flag).
+// TRA-3945 — the liveness predicate's inputs, read off THIS process with the
+// SAME resolvers the `/api/health/options-live` fields below use, so the
+// window's `startBuild` is pinned on exactly what the wire would have shown.
+// Called from the 60s tick AND from the health read (a read is also a tick).
+function readOtmEvaluationLivenessInputs(): {
+  inputs: OtmEvaluationLivenessInputs;
+  nominationBandIntersects: boolean | null;
+} {
+  const exitRule = resolveOtmSleeveExitRule();
+  let dayOne: OtmEvaluationLivenessInputs['liveDayOneStopPosture'] = null;
+  try {
+    const merged = mergeDayOneStopPosture(getAllUserContexts().map((c) => c.engine.getDayOneStopPosture()));
+    dayOne = merged.otmDayOneStop === null
+      ? { otmDayOneStop: null }
+      : { otmDayOneStop: { armed: merged.otmDayOneStop.armed, release: { released: merged.otmDayOneStop.release.released } } };
+  } catch {
+    dayOne = null; // instrument blind => the clause reads FALSE, never "fine"
+  }
+  let floor: OtmEvaluationLivenessInputs['otmContractFloor'] = null;
+  let nominationBandIntersects: boolean | null = null;
+  try {
+    const postures = getAllUserContexts().map((c) => c.engine.getOtmContractFloorPosture());
+    const live = postures.find((p) => p.mode === 'live') ?? postures[0] ?? null;
+    const f = live?.floor ?? resolveOtmContractFloor();
+    nominationBandIntersects = live?.bandIntersectsSelector ?? null;
+    floor = { invalidKeys: f.invalidKeys, bandIntersectsSelector: nominationBandIntersects };
+  } catch {
+    floor = null;
+  }
+  return {
+    inputs: {
+      liveOtmArmed: isOptionLiveOtmEnabled(process.env),
+      liveOtmRouting: isOptionLiveOtmArmed(process.env),
+      otmSleeveExitRule: { rule: exitRule.rule, chandelierRetired: exitRule.rule === 'trail' },
+      // The TRA-3953 witness is a literal on this build (see `refusalDedupe` below).
+      otmEntryWindows: { refusalDedupe: { windowRefusalExpiresAtNextOpen: true } },
+      liveDayOneStopPosture: dayOne,
+      otmContractFloor: floor,
+    },
+    nominationBandIntersects,
+  };
+}
+
+async function tickOtmEvaluationWindowNow(): Promise<Awaited<ReturnType<typeof tickOtmEvaluationWindow>>> {
+  const { inputs, nominationBandIntersects } = readOtmEvaluationLivenessInputs();
+  const b = resolveBuildInfo();
+  return tickOtmEvaluationWindow({
+    inputs,
+    nominationBandIntersects,
+    pin: { commit: b.commit, commitShort: b.commitShort, pid: b.pid, startedAt: b.startedAt },
+    records: await listOptionTradeJournal(),
+  });
+}
+
 app.get('/api/health/options-live', async (_req, res) => {
   try {
     const operator = resolveLiveBrokerOperator();
@@ -10949,6 +11005,17 @@ app.get('/api/health/options-live', async (_req, res) => {
         };
       }
     })();
+    // TRA-3945 — the pre-registered evaluation window; a health read is also a
+    // tick. Blind rather than absent on failure: an absent key reads as
+    // "record not deployed" to a grader pinning field presence.
+    const evaluationWindow = await tickOtmEvaluationWindowNow().then(
+      (r) => ({ ...r, instrumentBlind: false as const, blindReason: null as string | null }),
+      (err: unknown) => ({
+        issue: 'TRA-3945' as const,
+        instrumentBlind: true as const,
+        blindReason: err instanceof Error ? err.message : String(err),
+      }),
+    );
     res.json({
       ok: true,
       averageDown,
@@ -11320,6 +11387,30 @@ app.get('/api/health/options-live', async (_req, res) => {
           })),
         };
       })(),
+      // TRA-3945 (parent TRA-3927; record signed off by QuantTrader, comment
+      // `ce0ca28a`) — the PRE-REGISTERED 30-close evaluation window for the
+      // OTM JOINT arm (3941+3942+3943+3944+3953), graded by the TRA-375 rule.
+      //
+      // Read `status` FIRST. `armed` = the liveness predicate over the five
+      // rules has never read all-true on any tick, so `startedAt` is null and
+      // `n` is 0 BY CONSTRUCTION — today that is `contractFloor` (the floor's
+      // delta band does not reach the live selector; card `cc2c36fe` on
+      // TRA-3944) and it is published as `nominationBandIntersects: false`
+      // next to `n` so a week of `n: 0` is not mistaken for a quiet tape.
+      // `counting` = pinned; `paused` = a clause flipped false on a later tick
+      // and entries inside that span are refused (`buildDrift[]`). `verdict_*`
+      // is written ONLY by a hand-run carrying the grader's ticket
+      // (`verdictOwner`).
+      //
+      // `baseline` is the deduped pre-pin live OTM population as NUMBERS —
+      // a live preview while `armed`, FROZEN at the stamp — so the verdict
+      // compares against a frozen figure, not a re-derived one. `criteria` is
+      // what the thresholds say about the running readout; it is NOT a verdict
+      // and nothing in the process acts on it.
+      //
+      // ⚠️ SCOPE: report only. Touches nothing about the arm, the ~$250 row
+      // size, the 2-row cap, or any other sleeve.
+      evaluationWindow,
       liveStopActionability: (() => {
         try {
           return {
@@ -17141,6 +17232,20 @@ const exitCadenceSnapshotTimer = setInterval(
   EXIT_CADENCE_SNAPSHOT_POLL_MS,
 );
 exitCadenceSnapshotTimer.unref?.();
+
+// TRA-3945 — the evaluation window's own clock, so `startedAt` is stamped at
+// the first tick the predicate reads all-true even if nobody reads the health
+// route that minute. 60s: the stamp is a lower bound on the first eligible
+// entry and an entry window is 45 minutes wide.
+const OTM_EVALUATION_TICK_MS = 60_000;
+const otmEvaluationWindowTimer = setInterval(() => {
+  void tickOtmEvaluationWindowNow().catch((err) => {
+    logger.warn('TRA-3945 evaluation window tick failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  });
+}, OTM_EVALUATION_TICK_MS);
+otmEvaluationWindowTimer.unref?.();
 
 // ── Static frontend (production web) ────────────────────────────────────────
 const DIST_DIR = join(__dirname, '..', '..', '..', 'apps', 'desktop', 'dist');
