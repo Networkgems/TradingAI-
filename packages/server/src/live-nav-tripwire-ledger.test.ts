@@ -1209,3 +1209,202 @@ describe('TRA-3711 — the per-class split, measured on the same rows', () => {
     expect(day.driver?.axis).toBe('someNewAxis');
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-3947 — the watcher rule "PASS-live vs FAIL-A" has one UNSATISFIABLE half.
+//
+// TRA-3712's observer registered two outcomes on this axis, both branching on
+// `postOnsetTripCapablePairs > 0`:
+//
+//   PASS-live  `lagDenominator.status` is `pass` AND the row's pairs read > 0
+//   FAIL-A     `lagDenominator.status` is `pass` WHILE the row's pairs read {0, null}
+//              — "the axis claimed clean while inert"
+//
+// FAIL-A cannot happen. It is not untested, it is UNSATISFIABLE, and the proof is two
+// lines of this module: `vacuousReason === null` iff `postOnsetTripCapablePairs > 0`
+// (per book), and the axis only reaches `pass` when NO book carries a `vacuousReason`.
+// The published scalar is the SUM of the same per-book counts, and the empty-cohort
+// branch guarantees at least one term, so `pass` forces the sum to >= 1. `null` is
+// likewise reachable only when the census could not be taken, which is `blind`.
+//
+// That is good news about the instrument and BAD news about the rule: an alarm keyed
+// to FAIL-A is a control that can never fire, so it can never be evidence. Its real
+// content is an INVARIANT of this grader, and the honest place to hold an invariant is
+// a test that goes red the day a refactor breaks it — at which point FAIL-A becomes
+// reachable and someone has to re-decide. That is what this block is.
+//
+// ⚠ Scope: writer-side. The byDay READER can present (`pass`, `null`) off a disk row
+// this build did not write — the forward-compat test above ('an axis this build has
+// never heard of...') constructs exactly that shape by hand. No payload can make the
+// grader emit it.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('TRA-3947 — FAIL-A is unsatisfiable, and that is an invariant, not a passing run', () => {
+  /** One live book per distinct denominator outcome the census can produce. */
+  const BOOK_SHAPES: Record<string, Record<string, unknown>> = {
+    // pairs 1, no trip — the only shape that can carry the axis to `pass`.
+    tripCapable: {
+      liveOptionsOnsetDate: '2026-07-30',
+      days: TRIP_CAPABLE_DAYS,
+      priorOptionsLagEligibleDates: ['2026-08-12'],
+    },
+    // pairs 0, `no_live_options_onset` — v0nni, live and never opened an option.
+    noOnset: {
+      liveOptionsOnsetDate: null,
+      days: V0NNI_LIVE_DAYS,
+      priorOptionsLagEligibleDates: [],
+    },
+    // pairs 0, `no_post_onset_trip_capable_pairs` — admin, whose 2 trip-capable pairs
+    // both predate its own onset. NOTE its `postOnsetEligiblePairs` is NON-zero, which
+    // is what makes it the discriminating row for the control at the bottom.
+    onsetNoPairs: {
+      liveOptionsOnsetDate: '2026-07-30',
+      days: ADMIN_LIVE_DAYS,
+      priorOptionsLagEligibleDates: ['2026-08-05', '2026-08-06', '2026-08-12'],
+    },
+    // pairs 1 AND the predicate fires — drives the axis's one reachable `fail`.
+    tripping: {
+      liveOptionsOnsetDate: '2026-07-30',
+      days: [
+        { date: '2026-08-11', stockDaily: 0, optionsDaily: -16 },
+        { date: '2026-08-12', stockDaily: -16, optionsDaily: 0 },
+      ],
+      priorOptionsLagEligibleDates: ['2026-08-12'],
+    },
+  };
+  const SHAPE_KEYS = Object.keys(BOOK_SHAPES);
+
+  function book(shape: string, username: string): Record<string, unknown> {
+    return { username, mode: 'live', priorOptionsLagOk: true, ...BOOK_SHAPES[shape]! };
+  }
+
+  /**
+   * Every live cohort of size 1 and 2 over the shapes above, plus the three ways the
+   * census itself can be un-takeable. Enumerated rather than sampled: the space is
+   * small enough to cover exhaustively, and a sampled space can miss the one cell that
+   * matters — which is the whole complaint TRA-3947 is making one level up.
+   */
+  function cohorts(): Array<{ label: string; engines: unknown }> {
+    const out: Array<{ label: string; engines: unknown }> = [];
+    for (const a of SHAPE_KEYS) out.push({ label: a, engines: [book(a, 'admin')] });
+    for (const a of SHAPE_KEYS) {
+      for (const b of SHAPE_KEYS) {
+        out.push({ label: `${a}+${b}`, engines: [book(a, 'admin'), book(b, 'v0nni')] });
+      }
+    }
+    out.push({ label: 'sandbox-only', engines: [{ username: 'Richard', mode: 'sandbox', days: TRIP_CAPABLE_DAYS }] });
+    out.push({ label: 'engines-absent', engines: undefined });
+    out.push({ label: 'engines-not-an-array', engines: 'nope' });
+    return out;
+  }
+
+  /** Every payload this grader can be handed, as (label, payload) pairs. */
+  function space(): Array<{ label: string; payload: unknown }> {
+    const out: Array<{ label: string; payload: unknown }> = [];
+    for (const c of cohorts()) {
+      for (const scalar of [true, false, null, 'not-a-boolean']) {
+        for (const disowned of [false, true]) {
+          out.push({
+            label: `${c.label}|scalar=${String(scalar)}|disowned=${disowned}`,
+            payload: coveredPayload({
+              engines: c.engines,
+              livePriorOptionsLagOk: scalar,
+              ungradeableFields: disowned ? ['ok', 'livePriorOptionsLagOk'] : ['ok'],
+            }),
+          });
+        }
+      }
+    }
+    // Not-an-object payloads, which must never reach a per-book branch at all.
+    for (const p of [null, 42, 'payload', undefined]) out.push({ label: `raw=${String(p)}`, payload: p });
+    return out;
+  }
+
+  it('no payload in the whole space produces FAIL-A (`pass` while pairs read 0 or null)', () => {
+    const offenders: string[] = [];
+    for (const { label, payload } of space()) {
+      const g = gradeLiveNavTripwirePayload(payload);
+      const pairs = g.observed.postOnsetTripCapablePairs;
+      if (g.axes.lagDenominator.status === 'pass' && (pairs === null || pairs === 0)) {
+        offenders.push(`${label} -> pairs=${String(pairs)}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('and the space is not vacuously clean — every graded class is actually reached', () => {
+    // `every`/`some` over an empty or one-sided cohort is the failure this file exists
+    // to stop. If a refactor narrows the enumeration until `pass` is never produced,
+    // the assertion above becomes a green that proves nothing. This is its denominator.
+    const seen = { pass: 0, vacuous: 0, blind: 0, fail: 0 };
+    const pairsSeen = { positive: 0, zero: 0, nullish: 0 };
+    for (const { payload } of space()) {
+      const g = gradeLiveNavTripwirePayload(payload);
+      seen[g.axes.lagDenominator.status as keyof typeof seen] += 1;
+      const pairs = g.observed.postOnsetTripCapablePairs;
+      if (pairs === null) pairsSeen.nullish += 1;
+      else if (pairs > 0) pairsSeen.positive += 1;
+      else pairsSeen.zero += 1;
+    }
+    expect(seen.pass).toBeGreaterThan(0);
+    expect(seen.vacuous).toBeGreaterThan(0);
+    expect(seen.blind).toBeGreaterThan(0);
+    expect(seen.fail).toBeGreaterThan(0);
+    expect(pairsSeen.positive).toBeGreaterThan(0);
+    expect(pairsSeen.zero).toBeGreaterThan(0);
+    expect(pairsSeen.nullish).toBeGreaterThan(0);
+  });
+
+  it('PASS-live, the reachable half: `pass` always ships a pairs count of at least one', () => {
+    let graded = 0;
+    for (const { label, payload } of space()) {
+      const g = gradeLiveNavTripwirePayload(payload);
+      if (g.axes.lagDenominator.status !== 'pass') continue;
+      graded += 1;
+      expect(g.observed.postOnsetTripCapablePairs, label).not.toBeNull();
+      expect(g.observed.postOnsetTripCapablePairs!, label).toBeGreaterThanOrEqual(1);
+    }
+    expect(graded).toBeGreaterThan(0);
+  });
+
+  it('a null pairs count is BLIND, never a grade — "no census" is not "the census said zero"', () => {
+    let graded = 0;
+    for (const { label, payload } of space()) {
+      const g = gradeLiveNavTripwirePayload(payload);
+      if (g.observed.postOnsetTripCapablePairs !== null) continue;
+      graded += 1;
+      expect(g.axes.lagDenominator.status, label).toBe('blind');
+    }
+    expect(graded).toBeGreaterThan(0);
+  });
+
+  // ── the positive control ──────────────────────────────────────────────────
+  //
+  // An invariant test that cannot go red is the same vacuous green one level up. So:
+  // replay the SAME space against the mutation this axis is most likely to suffer, and
+  // require FAIL-A to become reachable.
+  //
+  // The mutation is not invented. `postOnsetEligiblePairs` and `postOnsetTripCapablePairs`
+  // are published side by side on every book precisely BECAUSE they diverge, and on the
+  // live payload they read 4 and 0 on `admin`. Keying the vacuity test to the eligible
+  // count — the weaker cohort, and the one a reader reaches for when asking "was there
+  // anything to grade?" — makes the axis pass on a book whose PUBLISHED denominator is
+  // still 0. That is FAIL-A exactly: clean over nothing, with the receipt still on the row.
+  it('CONTROL — key the vacuity test to the ELIGIBLE count and FAIL-A becomes reachable', () => {
+    const offenders: string[] = [];
+    for (const { label, payload } of space()) {
+      const real = gradeLiveNavTripwirePayload(payload);
+      const denominators = computeLiveLagDenominators(payload);
+      // Re-derive ONLY the vacuity branch under the wrong operand. Everything else —
+      // the published pairs scalar, the blind screens — stays as shipped, so the mutant
+      // differs from the real grader in exactly one variable.
+      if (denominators === null || denominators.length === 0) continue;
+      if (real.axes.lagDenominator.status === 'blind') continue;
+      const mutantPass = denominators.every((b) => b.postOnsetEligiblePairs > 0);
+      const pairs = real.observed.postOnsetTripCapablePairs;
+      if (mutantPass && (pairs === null || pairs === 0)) offenders.push(`${label} -> pairs=${String(pairs)}`);
+    }
+    // If this ever reads empty, the control has stopped biting and the assertion above
+    // is no longer evidence — fix the control before trusting the green.
+    expect(offenders.length).toBeGreaterThan(0);
+  });
+});
