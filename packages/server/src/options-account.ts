@@ -21,7 +21,7 @@ import type {
 } from '@trading-app/shared';
 import { computePortfolioGreeks } from './reports/portfolio-greeks.js';
 import { etDateKey, etWallClockToUtcMs } from './et-clock.js';
-import type { LiveOptionStopPolicy } from './exit-risk-rules-flag.js';
+import type { LiveOptionStopPolicy, OtmSleeveExitRuleName } from './exit-risk-rules-flag.js';
 import type { SpotResolver, PortfolioGreeksOptions } from './reports/portfolio-greeks.js';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
@@ -396,6 +396,34 @@ export interface OptionExitRiskInput {
    * (default 15; `0` disables). Absent → no guard (legacy callers/tests).
    */
   openingRangeGuardMin?: number;
+}
+
+/**
+ * TRA-3941 — is this row on the `single_leg_otm` sleeve, i.e. the population the
+ * board's exit ruling is scoped to?
+ *
+ * TWO stamps, because neither alone covers the sleeve:
+ *
+ *   • `signalType === 'otm_mispricing'` is what the OTM opener writes and what
+ *     `checkExits` already keys the OTM trail schedule off (`:6396`);
+ *   • `engineOriginSleeve === 'single_leg_otm'` is the DURABLE origin stamp that
+ *     survives a Tradier re-import after a reboot, which re-types the row to
+ *     `tradier_import` (TRA-2811 — three rows opened `single_leg_otm` closed
+ *     `single_leg_directional` on 2026-08-03 for exactly this reason). Such a row
+ *     still journals as `single_leg_otm` off the ledger's open row, so it is in
+ *     the population AC1 greps and must be in the population the rule governs.
+ *
+ * Deliberately NOT a `structure`-string lookup: `checkExits` holds positions, not
+ * journal rows, and re-deriving the sleeve from the journal inside the exit loop
+ * would make the exit rule depend on an async read that can be absent.
+ */
+export function isOtmSleeveRow(
+  // Both fields OPTIONAL on purpose: a row snapshot restored from disk can carry
+  // neither (TRA-2959), and the honest answer there is "not this sleeve", not a
+  // type error at the one call site that matters.
+  opt: { signalType?: string; engineOriginSleeve?: string },
+): boolean {
+  return opt.signalType === 'otm_mispricing' || opt.engineOriginSleeve === 'single_leg_otm';
 }
 
 /**
@@ -6166,6 +6194,22 @@ export class PaperOptionsAccount {
        * engine hands the env-resolved policy (default `daily_close`).
        */
       liveStopPolicy?: LiveOptionStopPolicy;
+      /**
+       * TRA-3941 (parent TRA-3927, board card `a29b2db8`) — which rule owns the
+       * exit on the `single_leg_otm` sleeve. `trail` RETIRES the underlying-space
+       * chandelier family on that sleeve (and only that sleeve) so the
+       * premium-space trail is the strategy-owned exit; the harness-owned exits
+       * (`take_profit_early`, the hard stop and its `daily_close` policy, the
+       * structural/time stops) are untouched, and RV / directional rows keep the
+       * chandelier regardless of this field.
+       *
+       * Absent ⇒ `chandelier`, the pre-ruling behaviour, so every existing caller
+       * and every existing test is byte-identical. The ENGINE resolves the ruling
+       * (`resolveOtmSleeveExitRule`, default `trail`) and hands it down — the same
+       * split TRA-3902 used for `liveStopPolicy`: the legacy lives at the callee's
+       * default, the ruling lives at the one production caller.
+       */
+      otmSleeveExitRule?: OtmSleeveExitRuleName;
     } = {},
     /**
      * TRA-1025 (TRA-1023 item 4) — per-position {@link ExitState} for single-leg
@@ -6231,6 +6275,10 @@ export class PaperOptionsAccount {
     // to the legacy branch, because "could not tell the time" must not turn a
     // stop off (that would be option C by accident).
     const liveStopPolicy = options.liveStopPolicy;
+    // TRA-3941 — resolved ONCE per pass, like the two above. Absent ⇒ the
+    // pre-ruling `chandelier` (see the option's docblock for why the legacy
+    // lives here and the ruling lives at the caller).
+    const otmSleeveExitRule: OtmSleeveExitRuleName = options.otmSleeveExitRule ?? 'chandelier';
     const dailyClosePhase =
       liveStopPolicy?.policy === 'daily_close'
         ? resolveDailyCloseStopPhase(Date.now(), liveStopPolicy.closeWindowMin)
@@ -6445,9 +6493,30 @@ export class PaperOptionsAccount {
       // suppressed and, on the first unsuppressed tick, RE-ANCHORS the trail
       // at the current spot instead of firing — a stop crossed while we could
       // not act is not a signal we acted on.
+      //
+      // TRA-3941 (board card `a29b2db8`) — and on the `single_leg_otm` sleeve the
+      // whole mechanism above is RETIRED. The re-anchor this ticket describes is
+      // the defect the board ruled on: it moves the trail to the gap open, which
+      // is why every one of that sleeve's chandelier closes landed 0–18 minutes
+      // into the next session. `chandelierRetired` kills the RATCHET, not just the
+      // fire, so there is no live level for a later build (or a persisted row) to
+      // trigger off — and it is scoped to this sleeve, so RV / directional rows are
+      // byte-identical.
+      const chandelierRetired = otmSleeveExitRule === 'trail' && isOtmSleeveRow(opt);
       let chandelierUSide: Side | null = null;
       let chandelierUnderlying: number | undefined;
-      if (exitRisk && !opt.legs) {
+      if (chandelierRetired) {
+        // A row that ticked on a pre-TRA-3941 build carries a PERSISTED stop, a
+        // trail note and possibly a daily-close hold latch. Dropped here rather
+        // than left inert: `summarizeLiveStopActionability` reads the hold latch
+        // directly (`:1255`) and would otherwise report a
+        // `chandelier_daily_close_hold` against a rule that no longer exists,
+        // for as long as the row stays open.
+        delete opt.chandelierStop;
+        delete opt.chandelierTrailNote;
+        delete opt.chandelierBreachedWhileSuppressed;
+        delete opt.chandelierHeldForDailyClose;
+      } else if (exitRisk && !opt.legs) {
         const uatr = exitRisk.underlyingAtrBySymbol.get(opt.symbol);
         chandelierUnderlying = underlyingPrices.get(opt.symbol);
         if (chandelierUnderlying != null && uatr !== undefined && uatr > 0) {
@@ -6886,6 +6955,14 @@ export class PaperOptionsAccount {
 
         const chandelierBreachedNow =
           exitPremium === null
+          // TRA-3941 — stated at the FIRE as well as at the ratchet. The three
+          // conjuncts below are already all false for a retired row (the block
+          // above never sets `chandelierUSide` and deletes `chandelierStop`), so
+          // this is redundant BY CONSTRUCTION today — and that is exactly the kind
+          // of implicit inertness that comes back when someone re-orders the
+          // block. The predicate that names the ruling belongs at the site that
+          // sells the position.
+          && !chandelierRetired
           && chandelierUSide !== null
           && chandelierUnderlying != null
           && opt.chandelierStop !== undefined

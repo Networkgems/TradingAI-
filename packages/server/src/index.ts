@@ -327,7 +327,10 @@ import {
 import { detectOversoldEngineCloses } from './tra3926-oversold-close-detector.js';
 // TRA-2820 — live-book "is it actually stopped?" counter for /api/health/options-live.
 import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability, mergeDayOneStopPosture, blindDayOneStopPosture } from './options-account.js';
-import { resolveLiveOptionStopPolicy } from './exit-risk-rules-flag.js';
+import { resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule } from './exit-risk-rules-flag.js';
+// TRA-3941 — the frozen sleeve KEY the exit ruling is scoped to, so the wire
+// field names the same join column the journal tape and the gate ledger use.
+import { OTM_SLEEVE_MANDATE_STRUCTURE } from './otm-sleeve-mandate.js';
 // TRA-3067 — counts-only projection of the out-of-band-close detector.
 import {
   foldLiveBrokerDriftStatuses,
@@ -10946,6 +10949,36 @@ app.get('/api/health/options-live', async (_req, res) => {
       // distinguishable from outside: `daily_close` reads the −20% stop only in
       // the last `closeWindowMin` minutes of RTH; `intraday` is the legacy.
       liveStopPolicy: resolveLiveOptionStopPolicy(),
+      // TRA-3941 (parent TRA-3927, board card `a29b2db8` accepted 2026-08-22) —
+      // the EFFECTIVE exit rule on the `single_leg_otm` sleeve, published so the
+      // ruling can be graded ON THE WIRE instead of inferred from a deploy SHA (a
+      // deploy order's commit is a lower bound on content, never a reading).
+      //
+      // `rule: 'trail'` ⇒ the underlying-space chandelier family is RETIRED on
+      // this sleeve in the process that is serving this response: the ratchet does
+      // not run, no `chandelier` / `chandelier_restarted` / `chandelier_spot_seeded`
+      // / `chandelier_daily_close` exit_reason can be minted for an OTM row, and a
+      // level persisted by an older build is dropped on the row's first exit pass.
+      // The premium trail (`peakPremium × (1 − trailOffsetPct)`, exit_reason
+      // `trail`) is the strategy-owned exit; the harness-owned exits are untouched.
+      //
+      // `source` is the honesty field: `default` (nothing set — the ruling),
+      // `env` (someone spelled it), `env_invalid` (someone spelled it WRONG and
+      // got the ruling anyway). A typo must be visible here, not silent.
+      //
+      // ⚠️ SCOPE: this names one sleeve. It says nothing about RV or directional
+      // rows, which keep the chandelier by design, and NOTHING about the arm —
+      // read `liveOtmRouting` above for whether the sleeve trades at all.
+      otmSleeveExitRule: (() => {
+        const resolution = resolveOtmSleeveExitRule();
+        return {
+          issue: 'TRA-3941',
+          sleeve: OTM_SLEEVE_MANDATE_STRUCTURE,
+          rule: resolution.rule,
+          source: resolution.source,
+          chandelierRetired: resolution.rule === 'trail',
+        };
+      })(),
       liveStopActionability: (() => {
         try {
           return {

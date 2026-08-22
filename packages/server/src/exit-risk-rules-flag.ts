@@ -599,6 +599,68 @@ export const OPTION_LIVE_STOP_POLICY_DEFAULT: LiveOptionStopPolicy = Object.free
   catastrophicLossPct: 0.5,
 });
 
+// TRA-3941 (parent TRA-3927, board card `a29b2db8` accepted 2026-08-22T04:18Z) —
+// WHICH RULE OWNS THE EXIT ON THE `single_leg_otm` SLEEVE.
+//
+// The desk tape (QuantTrader, read live off bqb1 `1f1264df` 2026-08-21T19:31Z)
+// separated the two trailing rules the OTM cell was running side by side:
+//
+//   • `trail` (the PREMIUM-space ratchet off `peakPremium`) — n=10, avgR +0.42,
+//     3/3 live winners;
+//   • `chandelier` / `chandelier_restarted` (the UNDERLYING-space ATR ratchet) —
+//     n=17, avgR −0.01, 0/4 live, and `chandelier_restarted` on BAC at −2.24R is
+//     the single worst close in the live book.
+//
+// The mechanism, not just the mean: EVERY chandelier close landed 0–18 minutes
+// after the NEXT session's open, because the TRA-3217 stale-breach veto RE-SEEDS
+// `peakUnderlying` at the current spot on the first unsuppressed tick — i.e. at
+// the gap open, the least informative price of the session — and then trails from
+// there. The premium trail has no such re-seed: `peakPremium` is a running high
+// that carries across sessions untouched, so a gap cannot re-anchor it.
+//
+// So on THIS sleeve the chandelier family is RETIRED and the premium trail is the
+// strategy-owned exit, paper AND live. The harness-owned exits are untouched
+// (`take_profit_early`, the hard premium stop and its TRA-3902 `daily_close`
+// policy, the structural/time stops), and NO other sleeve is in scope — the RV
+// and directional books keep the chandelier exactly as they had it.
+//
+// ── Fail direction ──────────────────────────────────────────────────────────
+// Absent / blank / garbage ⇒ `trail`, the RULING, never the legacy — same
+// discipline as `resolveLiveOptionStopPolicy` above. A box that silently fell
+// back to the chandelier would keep selling the owner's OTM rows into the open
+// and would read identically to a healthy one until it did. `chandelier` is
+// reachable only by spelling it exactly, which is what makes the revert a
+// deliberate act with a name in the env.
+export type OtmSleeveExitRuleName = 'trail' | 'chandelier';
+
+/** Where the resolved rule came from — `env_invalid` makes a typo loud. */
+export interface OtmSleeveExitRuleResolution {
+  rule: OtmSleeveExitRuleName;
+  source: 'default' | 'env' | 'env_invalid';
+}
+
+export const OTM_SLEEVE_EXIT_RULE_VALUE = 'OTM_SLEEVE_EXIT_RULE';
+export const OTM_SLEEVE_EXIT_RULE_DEFAULT: OtmSleeveExitRuleName = 'trail';
+
+/**
+ * Resolve the effective exit rule for the `single_leg_otm` sleeve (TRA-3941).
+ * Only the exact token `chandelier` (case/space insensitive) restores the
+ * pre-ruling behaviour; `trail` is explicit-ruling; anything else resolves to
+ * `trail` with `source: 'env_invalid'` so the typo is visible on the wire.
+ */
+export function resolveOtmSleeveExitRule(
+  env: NodeJS.ProcessEnv = process.env,
+): OtmSleeveExitRuleResolution {
+  const raw = env[OTM_SLEEVE_EXIT_RULE_VALUE];
+  if (typeof raw !== 'string' || raw.trim() === '') {
+    return { rule: OTM_SLEEVE_EXIT_RULE_DEFAULT, source: 'default' };
+  }
+  const token = raw.trim().toLowerCase();
+  if (token === 'chandelier') return { rule: 'chandelier', source: 'env' };
+  if (token === 'trail') return { rule: 'trail', source: 'env' };
+  return { rule: OTM_SLEEVE_EXIT_RULE_DEFAULT, source: 'env_invalid' };
+}
+
 export function resolveLiveOptionStopPolicy(env: NodeJS.ProcessEnv = process.env): LiveOptionStopPolicy {
   const rawPolicy = env[OPTION_LIVE_STOP_POLICY_VALUE]?.trim().toLowerCase();
   const policy: LiveOptionStopPolicyName = rawPolicy === 'intraday' ? 'intraday' : 'daily_close';
