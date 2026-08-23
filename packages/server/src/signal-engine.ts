@@ -9464,6 +9464,23 @@ export class SignalEngine {
     /** TRA-3964 — the snapshot's as-of stamp, epoch ms. `null` ⇒ never fetched. */
     balanceAsOfMs: number | null;
     /**
+     * TRA-3970 — balances envelopes REFUSED as the broker's weekend/maintenance
+     * ALL-ZEROS artifact (`total_cash`/`total_equity`/`market_value` all
+     * exactly 0 on an account that can be simultaneously serving positions).
+     * Accepting one collapsed `capUsd` to φ·atRisk and manufactured
+     * `headroomSignedUsd: −140.38` on a book that was not over cap — i.e. the
+     * TRA-3897 over-cap tripwire fired on broker maintenance. Suppressed
+     * envelopes land on the same UNREADABLE → null path as a missing payload.
+     *
+     * `null` ⇒ the counter itself is UNREADABLE (no live client, or a client
+     * that predates it). Never folded to 0 — ABSENT ≠ 0, and `> 0` beside a
+     * stale `balanceAsOfMs` is the honest reading of "the broker is asleep,
+     * not the book over cap".
+     */
+    balanceZeroArtifactSuppressions: number | null;
+    /** TRA-3970 — when the most recent artifact envelope was refused. `null` ⇒ none, or unreadable. */
+    balanceZeroArtifactLastAtMs: number | null;
+    /**
      * TRA-3964 — the BROKER's own `min(optionBuyingPower, totalCash,
      * totalEquity)`, BEFORE the unsettled-premium correction.
      *
@@ -9592,6 +9609,14 @@ export class SignalEngine {
     // cannot publish a correction that differs from the one applied.
     const unsettled = this.unsettledLivePremiumUsd();
     const balanceAsOfMs = this.lastTradierBalanceSuccessAt > 0 ? this.lastTradierBalanceSuccessAt : null;
+    // TRA-3970 — the all-zeros-envelope suppression counter lives on the
+    // client (the parse is the refusal site). Guarded: test stubs and any
+    // client built before the counter existed must read UNREADABLE, not 0.
+    const zeroArtifact =
+      this.tradierLiveClient &&
+      typeof this.tradierLiveClient.getZeroBalancesArtifactSuppression === 'function'
+        ? this.tradierLiveClient.getZeroBalancesArtifactSuppression()
+        : null;
     // TRA-3911 — ONE enumeration, read once and folded twice below, mirroring
     // the order site exactly. The row must publish what the ORDER SITE would
     // honour or the TRA-3737 reader grades a column nothing enforces.
@@ -9655,6 +9680,11 @@ export class SignalEngine {
       // exact in.
       balanceAgeMs: balanceAsOfMs === null ? null : Math.max(0, Date.now() - balanceAsOfMs),
       balanceAsOfMs,
+      // TRA-3970 — read off the CLIENT (the parse is where the refusal lives).
+      // A stub or pre-TRA-3970 client without the getter publishes null
+      // (counter unreadable), never a manufactured 0.
+      balanceZeroArtifactSuppressions: zeroArtifact === null ? null : zeroArtifact.count,
+      balanceZeroArtifactLastAtMs: zeroArtifact === null ? null : zeroArtifact.lastAtMs,
       brokerCashUsd: this.brokerReportedCashUsd(),
       unsettledLivePremiumUsd: unsettled.usd,
       unsettledLivePremiumFills: unsettled.fills,

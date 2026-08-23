@@ -8512,6 +8512,9 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
         // without ever fetching one — which must read as "no as-of stamp", never
         // as `0` ("fetched at the epoch") or `0ms` ("fetched just now").
         balanceAgeMs: null, balanceAsOfMs: null, brokerCashUsd: 10_000,
+        // TRA-3970 — the stub client carries no suppression counter, so the
+        // row reads UNREADABLE (null), never a manufactured 0.
+        balanceZeroArtifactSuppressions: null, balanceZeroArtifactLastAtMs: null,
         unsettledLivePremiumUsd: 0, unsettledLivePremiumFills: 0,
         unsettledLivePremiumBlindFills: 0,
         openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: 750,
@@ -9189,6 +9192,29 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
         // pinned to equity this would not move — that is the permanent variant.
         setBalance(279.15, 311.15, 652.15);
         expect(engine.getLiveOtmAggregateExposure().brokerCashUsd).toBe(279.15);
+      });
+
+      // ── TRA-3970 ────────────────────────────────────────────────────────────
+      // The parse-site refusal of the broker's all-zeros maintenance envelope
+      // lives in `TradierOptionsClient.getAccountBalance` (engine package,
+      // covered there). What THIS row owes is the discriminator: the refusal
+      // count on the wire, and `null` — never a manufactured 0 — when the
+      // client cannot report it (ABSENT ≠ 0).
+      it('TRA-3970 — the suppression counter is ON THE WIRE, and null when unreadable', () => {
+        const engine = engineFor('live', liveStub());
+        const priv = engine as unknown as { tradierLiveClient: unknown };
+        // `liveStub()` predates the counter: the row must read UNREADABLE.
+        let row = engine.getLiveOtmAggregateExposure();
+        expect(row.balanceZeroArtifactSuppressions).toBeNull();
+        expect(row.balanceZeroArtifactLastAtMs).toBeNull();
+        // A client that refused two artifact envelopes publishes them verbatim.
+        priv.tradierLiveClient = {
+          ...liveStub(),
+          getZeroBalancesArtifactSuppression: () => ({ count: 2, lastAtMs: 1_756_000_000_000 }),
+        };
+        row = engine.getLiveOtmAggregateExposure();
+        expect(row.balanceZeroArtifactSuppressions).toBe(2);
+        expect(row.balanceZeroArtifactLastAtMs).toBe(1_756_000_000_000);
       });
     });
 

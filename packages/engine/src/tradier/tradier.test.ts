@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { TradierOrderClient, tradierBaseUrl, parseTradierEquityPositions, parseTradierOrderLegs } from './order-client.js';
 import {
   TradierOptionsClient,
+  isBrokerMaintenanceZeroBalances,
   underlyingFromOcc,
   parseOccSymbol,
   parseTradierPositions,
@@ -400,6 +401,8 @@ describe('TradierOptionsClient.getAccountBalance (TRA-226)', () => {
       stockLongValue: null,
       optionLongValue: null,
       optionShortValue: null,
+      // TRA-3954 added `openPl` to the parse without updating this fixture.
+      openPl: null,
     });
     expect(callUrl(0)).toBe('https://sandbox.tradier.com/v1/accounts/A1/balances');
     const headers = callInit(0).headers as Record<string, string>;
@@ -429,6 +432,80 @@ describe('TradierOptionsClient.getAccountBalance (TRA-226)', () => {
     expect(await client.getAccountBalance()).toBeNull();
   });
 
+  // ─── TRA-3970 — the broker's weekend/maintenance ALL-ZEROS artifact ────────
+  // Measured 2026-08-23 (Sunday) on production ***0154: `/balances` served
+  // `total_cash: 0, total_equity: 0, market_value: 0` while `/positions`
+  // served 3 open rows in the same minute on the same credentials. Parsing it
+  // as a real $0 collapsed `capUsd` to φ·atRisk and fired the TRA-3897
+  // over-cap tripwire (`headroomSignedUsd: −140.38`) on a book not over cap.
+
+  // VACUITY CONTROL — the measured artifact envelope, hardcoded, must land on
+  // the UNREADABLE → null path AND be counted. A suppression that cannot be
+  // counted is itself the next unreadable instrument (ABSENT ≠ 0).
+  it('TRA-3970 — refuses the all-zeros maintenance envelope and counts the suppression', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        balances: {
+          account_number: 'A1',
+          account_type: 'margin',
+          total_equity: 0,
+          total_cash: 0,
+          market_value: 0,
+          margin: { option_buying_power: 0, stock_buying_power: 0 },
+        },
+      }),
+    );
+    const client = new TradierOptionsClient('tok', 'A1');
+    expect(client.getZeroBalancesArtifactSuppression()).toEqual({ count: 0, lastAtMs: null });
+    expect(await client.getAccountBalance()).toBeNull();
+    const suppression = client.getZeroBalancesArtifactSuppression();
+    expect(suppression.count).toBe(1);
+    expect(suppression.lastAtMs).toBeGreaterThan(0);
+  });
+
+  // POSITIVE CONTROL — a real nonzero envelope still parses and is NOT
+  // counted, so the refusal above cannot be simply always-on.
+  it('TRA-3970 (positive control) — a real nonzero envelope parses and is not counted', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        // bqb1 `admin` as measured 2026-08-22 — the last artifact-free read.
+        balances: { total_equity: 652.15, total_cash: 411.15, market_value: 241 },
+      }),
+    );
+    const client = new TradierOptionsClient('tok', 'A1');
+    const balance = await client.getAccountBalance();
+    expect(balance?.totalCash).toBe(411.15);
+    expect(balance?.totalEquity).toBe(652.15);
+    expect(client.getZeroBalancesArtifactSuppression()).toEqual({ count: 0, lastAtMs: null });
+  });
+
+  // DISCRIMINATING CONTROL — $0 cash beside nonzero equity/market value is a
+  // REAL account state (all cash deployed into positions) and must keep
+  // parsing. The predicate is the TRIPLE zero, not "cash is zero".
+  it('TRA-3970 — zero cash with nonzero equity is account truth, not the artifact', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        balances: { total_equity: 297, total_cash: 0, market_value: 297 },
+      }),
+    );
+    const client = new TradierOptionsClient('tok', 'A1');
+    const balance = await client.getAccountBalance();
+    expect(balance?.totalCash).toBe(0);
+    expect(balance?.totalEquity).toBe(297);
+    expect(client.getZeroBalancesArtifactSuppression().count).toBe(0);
+  });
+
+  // The predicate is STRICT: an envelope missing `market_value` is not the
+  // measured artifact shape (the TRA-226 fixtures above omit it and must keep
+  // parsing), and a missing payload is refused upstream, not here.
+  it('TRA-3970 — the artifact predicate requires all three literal zeros', () => {
+    expect(isBrokerMaintenanceZeroBalances({ total_cash: 0, total_equity: 0, market_value: 0 })).toBe(true);
+    expect(isBrokerMaintenanceZeroBalances({ total_cash: 0, total_equity: 0 })).toBe(false);
+    expect(isBrokerMaintenanceZeroBalances({ total_cash: 0, total_equity: 297, market_value: 297 })).toBe(false);
+    expect(isBrokerMaintenanceZeroBalances(null)).toBe(false);
+    expect(isBrokerMaintenanceZeroBalances(undefined)).toBe(false);
+  });
+
   // TRA-319 — option buying power surfaces from the per-account-type subobject
   // (`margin`, `pdt`, or `cash`) so the engine can pre-check before placing an
   // order Tradier would just cancel for insufficient funds.
@@ -456,6 +533,8 @@ describe('TradierOptionsClient.getAccountBalance (TRA-226)', () => {
       stockLongValue: null,
       optionLongValue: null,
       optionShortValue: null,
+      // TRA-3954 added `openPl` to the parse without updating this fixture.
+      openPl: null,
     });
   });
 

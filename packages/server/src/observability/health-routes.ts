@@ -501,6 +501,18 @@ export interface LiveOtmAggregateExposure {
   balanceAgeMs?: number | null;
   /** TRA-3964 — the snapshot's as-of stamp, epoch ms. `null` ⇒ never fetched. */
   balanceAsOfMs?: number | null;
+  /**
+   * TRA-3970 — balances envelopes refused as the broker's weekend/maintenance
+   * ALL-ZEROS artifact (triple numeric zero on `total_cash`/`total_equity`/
+   * `market_value`). Accepting one collapsed `capUsd` to φ·atRisk and fired the
+   * TRA-3897 over-cap tripwire (`headroomSignedUsd: −140.38`) on a book that
+   * was not over cap. OPTIONAL for the usual reason: a row from a pre-TRA-3970
+   * build genuinely does not carry it, and `null` means the counter itself was
+   * unreadable — neither may be read as 0.
+   */
+  balanceZeroArtifactSuppressions?: number | null;
+  /** TRA-3970 — when the most recent artifact envelope was refused. */
+  balanceZeroArtifactLastAtMs?: number | null;
   /** TRA-3964 — the broker's raw `min(...)` BEFORE the unsettled-premium correction. */
   brokerCashUsd?: number | null;
   /**

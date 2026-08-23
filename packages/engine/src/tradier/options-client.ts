@@ -145,6 +145,12 @@ interface TradierBalancesEnvelope {
     account_type?: string;
     total_equity?: number;
     total_cash?: number;
+    /**
+     * TRA-3970 — total market value of everything held. Read ONLY by the
+     * all-zeros maintenance-artifact predicate below; the parsed snapshot does
+     * not carry it.
+     */
+    market_value?: number;
     open_pl?: number;
     /** TRA-335 — total long market value, used for live equity sizing. */
     long_market_value?: number;
@@ -189,6 +195,35 @@ interface TradierBalancesEnvelope {
       unsettled_funds?: number;
     } | null;
   } | null;
+}
+
+/**
+ * TRA-3970 — is this balances payload the broker's weekend/maintenance
+ * ALL-ZEROS artifact rather than account truth?
+ *
+ * Measured 2026-08-23 (Sunday) on production account ***0154: `/balances`
+ * served `total_cash: 0, total_equity: 0, market_value: 0` while `/positions`
+ * served 3 open rows in the same minute on the same credentials — impossible
+ * as truth (the same account read $379.15 cash the day before, market closed
+ * in between). Accepting the served $0 collapsed `capUsd` to φ·atRisk and
+ * manufactured `headroomSignedUsd: -140.38` on a book that is not over cap —
+ * i.e. it armed the TRA-3897 over-cap tripwire off broker maintenance.
+ *
+ * The triple-zero predicate alone excludes every real state of a funded
+ * account: cash-and-positions cannot all be exactly $0 at once unless the
+ * account is genuinely empty, and a genuinely empty account is correctly
+ * refused entry either way — the null path just gives it the honest label
+ * ("balance unreadable") instead of a fabricated $0 basis. STRICT numeric
+ * zeros only: an envelope missing `market_value` is not the measured artifact
+ * shape and must keep parsing (the TRA-226 tests parse envelopes without it).
+ */
+export function isBrokerMaintenanceZeroBalances(b: {
+  total_cash?: number;
+  total_equity?: number;
+  market_value?: number;
+} | null | undefined): boolean {
+  if (!b) return false;
+  return b.total_cash === 0 && b.total_equity === 0 && b.market_value === 0;
 }
 
 /** TRA-226 — read-only Tradier account balance snapshot. */
@@ -616,6 +651,24 @@ export class TradierOptionsClient extends TradierOrderClient {
     super(apiToken, accountId, env);
   }
 
+  /**
+   * TRA-3970 — how many balances envelopes {@link getAccountBalance} REFUSED
+   * as the broker's all-zeros maintenance artifact. A suppression must be
+   * countable (house rule: ABSENT ≠ 0) — without this, a null return is
+   * indistinguishable from "no payload" and the suppression itself becomes
+   * the next unreadable instrument.
+   */
+  private zeroBalancesArtifactCount = 0;
+  private zeroBalancesArtifactLastAtMs: number | null = null;
+
+  /** TRA-3970 — the suppression discriminator, readable. */
+  getZeroBalancesArtifactSuppression(): { count: number; lastAtMs: number | null } {
+    return {
+      count: this.zeroBalancesArtifactCount,
+      lastAtMs: this.zeroBalancesArtifactLastAtMs,
+    };
+  }
+
   private async getJson<T>(path: string): Promise<T | null> {
     const resp = await fetch(`${this.baseUrl}${path}`, {
       headers: { Authorization: this.headers.Authorization, Accept: 'application/json' },
@@ -776,6 +829,17 @@ export class TradierOptionsClient extends TradierOrderClient {
     );
     const b = data?.balances;
     if (!b) return null;
+    // TRA-3970 — a weekend/maintenance envelope serves ALL numeric zeros
+    // (`total_cash`/`total_equity`/`market_value`) on an account simultaneously
+    // serving open positions. That is not a $0 balance, it is the broker
+    // asleep: parsing it collapsed `capUsd` to φ·atRisk and fired the
+    // TRA-3897 over-cap tripwire on a book that was not over cap. Land it on
+    // the same UNREADABLE → null path as a missing payload, and count it.
+    if (isBrokerMaintenanceZeroBalances(b)) {
+      this.zeroBalancesArtifactCount += 1;
+      this.zeroBalancesArtifactLastAtMs = Date.now();
+      return null;
+    }
     const totalEquity = typeof b.total_equity === 'number' ? b.total_equity : NaN;
     const totalCash = typeof b.total_cash === 'number' ? b.total_cash : NaN;
     if (!Number.isFinite(totalEquity) || !Number.isFinite(totalCash)) return null;
