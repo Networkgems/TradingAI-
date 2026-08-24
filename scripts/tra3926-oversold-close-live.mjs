@@ -177,9 +177,20 @@ check(`G2  excessContracts agrees  (served ${census.excessContracts})`,
 check('G3  the ACCUSED symbol set agrees exactly',
   setEq(new Set(publishedExcess.keys()), new Set(derivedExcess.keys())),
   `served [${[...publishedExcess.keys()].join(' ')}] vs derived [${[...derivedExcess.keys()].join(' ')}]`);
-check('G4  every finding rests on a POSITIVE statement (engineOpenContracts > 0)',
-  findings.every(f => f.engineOpenContracts > 0),
-  findings.length ? findings.map(f => `${f.optionSymbol}:${f.engineOpenContracts}`).join(' ') : 'no findings');
+// ⛔ THE POSITIVE STATEMENT IS THE LIFETIME COUNT, NOT THE BALANCE. This check
+// read `engineOpenContracts > 0` until 2026-08-24, which is the same running
+// balance the detector's `import_only` branch was using — so a grader and the
+// instrument it grades shared one blind spot, and the live BAC over-sell at
+// 19:31:08Z sat inside it. The order-free fold above never did (`engineBuy` is a
+// lifetime total), which is exactly why it disagreed and why it is a DIFFERENT
+// method rather than a re-implementation. `basis: 'exhausted'` findings carry
+// `engineOpenContracts: 0` BY CONSTRUCTION and must still rest on a witness.
+check('G4  every finding rests on a POSITIVE statement (engineOpensSeenContracts > 0)',
+  findings.every(f => f.engineOpensSeenContracts > 0 &&
+    (f.basis === 'exhausted' ? f.engineOpenContracts === 0 : f.engineOpenContracts > 0)),
+  findings.length
+    ? findings.map(f => `${f.optionSymbol}:${f.basis}:seen=${f.engineOpensSeenContracts}/out=${f.engineOpenContracts}`).join(' ')
+    : 'no findings');
 check('G5  every finding is self-consistent (excess === sold − engineOpen)',
   findings.every(f => f.excessContracts === f.soldContracts - f.engineOpenContracts),
   findings.map(f => `${f.optionSymbol} ${f.soldContracts}-${f.engineOpenContracts}=${f.excessContracts}`).join(' | ') || 'no findings');
@@ -198,9 +209,18 @@ check('G8  every blind carries a reason this build knows',
 // retention rolls them out the anchor stops being assertable, and that is a
 // BLIND about the anchor, not a pass — so it is checked against the TAPE's own
 // reach rather than against the calendar.
+// ⛔ THE THIRD ANCHOR IS THE ONE THAT FIRED WITH THE REMEDY ALREADY MERGED.
+// `BAC260925C00063000` order 143160792, 2026-08-24T19:31:08Z, real money: the
+// engine's second close on an OCC it bought ONE of. `a5a49717` — the second
+// oracle that binds exactly this row to 0 — was merged 13:48Z the same day and
+// did not reach the box until the 20:14:44Z deploy, because `render-redeploy`
+// refuses 13:25–20:00Z. It is anchored as `ours: 0` / `basis: exhausted`: the
+// engine's own 08-21 close had already consumed its own lot, so a check written
+// against the running balance CANNOT see it. That is the whole finding.
 const KNOWN = [
-  { symbol: 'XLF260925C00057500', orderId: 142806015, sold: 2, ours: 1 },
-  { symbol: 'QQQ260911P00545000', orderId: 140287732, sold: 5, ours: 4 },
+  { symbol: 'XLF260925C00057500', orderId: 142806015, sold: 2, ours: 1, basis: 'outstanding' },
+  { symbol: 'QQQ260911P00545000', orderId: 140287732, sold: 5, ours: 4, basis: 'outstanding' },
+  { symbol: 'BAC260925C00063000', orderId: 143160792, sold: 1, ours: 0, basis: 'exhausted' },
 ];
 const oldestTs = Math.min(...records.map(r => r.ts).filter(t => Number.isFinite(t)));
 for (const k of KNOWN) {
@@ -210,9 +230,9 @@ for (const k of KNOWN) {
     continue;
   }
   const f = findings.find(x => x.orderId === k.orderId);
-  check(`R  ${k.symbol} order ${k.orderId} is still reported (sold ${k.sold} / ours ${k.ours})`,
-    !!f && f.soldContracts === k.sold && f.engineOpenContracts === k.ours,
-    f ? `sold ${f.soldContracts} ours ${f.engineOpenContracts} excess ${f.excessContracts}` : 'NOT REPORTED');
+  check(`R  ${k.symbol} order ${k.orderId} is still reported (sold ${k.sold} / ours ${k.ours} / ${k.basis})`,
+    !!f && f.soldContracts === k.sold && f.engineOpenContracts === k.ours && f.basis === k.basis,
+    f ? `sold ${f.soldContracts} ours ${f.engineOpenContracts} excess ${f.excessContracts} basis ${f.basis}` : 'NOT REPORTED');
 }
 
 // ── the residual fail-open, always printed ─────────────────────────────────

@@ -217,6 +217,13 @@ describe('TRA-3932 subjects — the population, and which DAY the reach test ask
           engineOpenContracts: 4,
           importedOpenContracts: 1,
           excessContracts: 1,
+          // TRA-3926 (2026-08-24) — the basis triple. This subject is the
+          // `outstanding` one; the `exhausted` basis reaches this derivation with
+          // `engineOpenContracts: 0` and must still key on the IMPORTED leg,
+          // which is what the assertion below is actually about.
+          basis: 'outstanding',
+          engineOpensSeenContracts: 4,
+          engineClosesSeenContracts: 0,
         },
       ],
     });

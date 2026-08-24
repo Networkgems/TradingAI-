@@ -661,6 +661,100 @@ describe('TRA-3926 AC5 — the detector for the condition that has ALREADY occur
     expect(census.findings[0]).toMatchObject({ soldContracts: 5, engineOpenContracts: 4, excessContracts: 1 });
   });
 
+  // ── The 2026-08-24 event: the SAME defect, one basis further out ──────────
+  // Real money, order 143160792, 19:31:08Z. Anchored here as a tape rather than
+  // as a description because the distinguishing feature is the ORDER of the
+  // rows: at the second close the engine's running balance is 0 and everything
+  // outstanding is an import, which is byte-identical to the false-accusation
+  // shape above — and is not it, because THIS tape holds the engine's own
+  // `buy_to_open` for the OCC and that one does not.
+  const BAC = 'BAC260925C00063000';
+  const BAC_TAPE: LiveOptionFillRecord[] = [
+    ledgerRow({ optionSymbol: BAC, ts: OPENED_AT, contracts: 1, filledPrice: 1.65, orderId: 142603649 }),
+    ledgerRow({ optionSymbol: BAC, ts: DESK_AT, contracts: 1, filledPrice: 1.17, orderId: null, origin: 'history_import', sleeve: 'unattributed' }),
+    ledgerRow({ optionSymbol: BAC, ts: CLOSED_AT + 11_826_000, etDay: '2026-08-21', side: 'sell_to_close', contracts: 1, filledPrice: 0.91, orderId: 142899523, sleeve: 'unattributed' }),
+    ledgerRow({ optionSymbol: BAC, ts: CLOSED_AT + 279_763_000, etDay: '2026-08-24', side: 'sell_to_close', contracts: 1, filledPrice: 1.14, orderId: 143160792, sleeve: 'unattributed' }),
+  ];
+
+  it('raises on the 2026-08-24T19:31:08Z BAC close, on the EXHAUSTED basis', () => {
+    const census = detectOversoldEngineCloses(BAC_TAPE);
+    expect(census.status).toBe('oversold');
+    expect(census.excessContracts).toBe(1);
+    expect(census.findings).toHaveLength(1);
+    expect(census.findings[0]).toMatchObject({
+      optionSymbol: BAC,
+      orderId: 143160792,
+      soldContracts: 1,
+      // ⛔ ZERO, and that is the point. The engine held no outstanding lot at the
+      // moment of this close, so a check written against the running balance —
+      // which is what `import_only` was, and what the live grader's own G4 was —
+      // cannot see it. The witness is the LIFETIME count below.
+      engineOpenContracts: 0,
+      engineOpensSeenContracts: 1,
+      engineClosesSeenContracts: 1,
+      importedOpenContracts: 1,
+      excessContracts: 1,
+      basis: 'exhausted',
+    });
+    // The engine's FIRST close is its own lot and must stay clean. If it did not,
+    // the rule would be "accuse every second close" wearing a new name.
+    expect(census.judgedCloses).toBe(2);
+    expect(census.blindCloses).toEqual([]);
+  });
+
+  it('does NOT accuse a TP1 partial — two engine closes against a genuine 2-lot', () => {
+    // The AC4 control for the `exhausted` basis. `TSLA260911C00560000`,
+    // `AAPL260904P00280000` and `SPY260904C00816000` each carry two closes on the
+    // live tape; a rule that charged the second close of a scaled exit would fire
+    // on all three the day it shipped.
+    const census = detectOversoldEngineCloses([
+      ledgerRow({ contracts: 2, filledPrice: 1.08, orderId: 142603071 }),
+      ledgerRow({ ts: CLOSED_AT, etDay: '2026-08-21', side: 'sell_to_close', contracts: 1, filledPrice: 1.4, orderId: 142806015 }),
+      ledgerRow({ ts: CLOSED_AT + 60_000, etDay: '2026-08-21', side: 'sell_to_close', contracts: 1, filledPrice: 1.6, orderId: 142806099 }),
+    ]);
+    expect(census.status).toBe('clean');
+    expect(census.judgedCloses).toBe(2);
+    expect(census.findings).toEqual([]);
+    expect(census.blindCloses).toEqual([]);
+  });
+
+  it('keeps an import-only close BLIND when the engine NEVER bought the OCC', () => {
+    // The false-accusation guard, restated against the new discriminator: the
+    // lifetime count is 0 here, so nothing changed for the four live symbols
+    // (`SPY260807P00760000` &c.) that sit on this branch.
+    const census = detectOversoldEngineCloses([
+      ledgerRow({ ts: DESK_AT, contracts: 2, filledPrice: 0.85, orderId: null, origin: 'history_import', sleeve: 'unattributed' }),
+      ledgerRow({ ts: CLOSED_AT, etDay: '2026-08-21', side: 'sell_to_close', contracts: 1, filledPrice: 1.01, orderId: 142806015 }),
+      ledgerRow({ ts: CLOSED_AT + 60_000, etDay: '2026-08-21', side: 'sell_to_close', contracts: 1, filledPrice: 1.02, orderId: 142806099 }),
+    ]);
+    expect(census.findings).toEqual([]);
+    expect(census.blindCloses.map(b => b.reason)).toEqual(['import_only', 'import_only']);
+    expect(census.status).toBe('vacuous');
+  });
+
+  it('charges a close with NOTHING outstanding once the engine has bought the OCC', () => {
+    // `no_open_record`'s honest case is an ABSENCE — retention aged our opens
+    // out. This tape refutes the absence: the open is right there. Engine buys 1,
+    // sells 1, sells 1 again, with no desk contract anywhere.
+    const census = detectOversoldEngineCloses([
+      ledgerRow({ contracts: 1, filledPrice: 1.08, orderId: 142603071 }),
+      ledgerRow({ ts: CLOSED_AT, etDay: '2026-08-21', side: 'sell_to_close', contracts: 1, filledPrice: 1.4, orderId: 142806015 }),
+      ledgerRow({ ts: CLOSED_AT + 60_000, etDay: '2026-08-21', side: 'sell_to_close', contracts: 1, filledPrice: 1.6, orderId: 142806099 }),
+    ]);
+    expect(census.status).toBe('oversold');
+    expect(census.blindCloses).toEqual([]);
+    expect(census.findings[0]).toMatchObject({
+      orderId: 142806099,
+      soldContracts: 1,
+      engineOpenContracts: 0,
+      // Nobody's inventory is left to have taken it out of, which is a WORSE
+      // reading than the BAC one, not a better one.
+      importedOpenContracts: 0,
+      excessContracts: 1,
+      basis: 'exhausted',
+    });
+  });
+
   it('reports a close whose opens aged out as BLIND, not as a finding', () => {
     const census = detectOversoldEngineCloses([
       ledgerRow({ ts: CLOSED_AT, etDay: '2026-08-21', side: 'sell_to_close', contracts: 2, filledPrice: 1.01, orderId: 142806015 }),

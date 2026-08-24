@@ -72,6 +72,29 @@ export interface OversoldCloseFinding {
   importedOpenContracts: number;
   /** `soldContracts − engineOpenContracts`, always `> 0` on a finding. */
   excessContracts: number;
+  /**
+   * WHICH positive statement this accusation rests on. Both are positive; they
+   * are not equally strong, and folding them into one number would hide that.
+   *
+   * `outstanding` — the engine held recorded opens on this OCC AT THE MOMENT of
+   * the close and sold past them. The 2026-08-21 XLF event, and the 2026-08-05
+   * QQQ one.
+   *
+   * `exhausted` — the engine held recorded opens on this OCC EARLIER in this
+   * tape and had already consumed every one of them with its OWN prior closes,
+   * so `engineOpenContracts` is 0 and every outstanding contract is the desk's.
+   * See {@link BlindClose.import_only} for why a running balance of 0 is not on
+   * its own enough to accuse, and why a LIFETIME count of 0 still is not.
+   */
+  basis: 'outstanding' | 'exhausted';
+  /**
+   * Contracts the engine's OWN `buy_to_open` rows account for on this OCC over
+   * the whole tape, up to and including this close. The witness the `exhausted`
+   * basis rests on: `> 0` on every finding, of either basis.
+   */
+  engineOpensSeenContracts: number;
+  /** Contracts the engine's own PRIOR closes on this OCC already consumed. */
+  engineClosesSeenContracts: number;
 }
 
 /**
@@ -97,6 +120,37 @@ export interface OversoldCloseFinding {
  * closed by us with `origin: 'fill'`, which is byte-identical to the desk's
  * contract being sold by the engine. Same ambiguity `oracle_import_only` names
  * one level down, same answer: counted, named, and NOT accused.
+ *
+ * ⛔ AND IT IS A RUNNING BALANCE, WHICH IS THE SECOND THING THIS DETECTOR GOT
+ * WRONG — measured live, on real money, 2026-08-24T19:31:08Z, order 143160792:
+ *
+ *     BAC260925C00063000  08-20 13:36:23Z  buy_to_open   1 @1.65  origin=fill
+ *                         08-20 17:00:00Z  buy_to_open   1 @1.17  origin=history_import
+ *                         08-21 17:05:10Z  sell_to_close 1 @0.91  origin=fill
+ *                         08-24 19:31:08Z  sell_to_close 1 @1.14  origin=fill   ← this one
+ *
+ * At the last close the engine's running balance IS 0 and everything
+ * outstanding IS a `history_import` — so the branch above fired and filed it
+ * BLIND. But the reason the balance is 0 is that the engine's own 08-21 close
+ * consumed its own lot, which this tape states POSITIVELY. "Our chokepoint may
+ * have missed our buy" is not the modal explanation for a symbol whose engine
+ * buys the chokepoint demonstrably DID record. The discriminator is therefore
+ * LIFETIME engine opens on the OCC, not the balance:
+ *
+ *   • lifetime engine opens 0  ⇒ genuinely ambiguous  ⇒ BLIND, unchanged. The
+ *     four symbols above (SPY/QQQ/PLTR) all sit here and still do.
+ *   • lifetime engine opens > 0, all consumed by our own closes ⇒ the residual
+ *     is positively the desk's and we just sold it ⇒ FINDING, basis
+ *     `exhausted`.
+ *
+ * ⚠ SAY WHAT THAT COSTS. This is a WEAKER refusal than the balance test, and it
+ * has a false-accusation shape of its own: engine buys 1 (recorded) + engine
+ * buys 1 (chokepoint missed, imported) then sells twice would be charged here,
+ * and both contracts were genuinely ours. That is why the basis is carried on
+ * every finding instead of being averaged into one count — a reader can weigh
+ * `exhausted` differently from `outstanding` without re-deriving the tape. It
+ * is not why the branch exists: AC5 requires the condition that ALREADY FIRED
+ * to raise, and `import_only` files it as an unanswered question instead.
  */
 export interface BlindClose {
   optionSymbol: string;
@@ -138,11 +192,15 @@ export interface OversoldCloseCensus {
  * order — which is the order they actually filled in).
  *
  * ⚠ A FINDING REQUIRES A POSITIVE STATEMENT, NOT JUST A SHORTFALL. The engine
- * must have SOME recorded open of its own outstanding on the OCC
- * (`engineOpenContracts > 0`) before a shortfall is charged to it. Where the
- * whole open leg is a `history_import`, the close reads BLIND — see
- * `BlindClose.import_only`, which is the branch the first version of this
- * function got wrong against the live tape.
+ * must have SOME recorded open of its own on the OCC in this tape
+ * (`engineOpensSeenContracts > 0`) before a shortfall is charged to it. Where
+ * the whole open leg is a `history_import` and the engine has never bought this
+ * OCC at all, the close reads BLIND — see `BlindClose.import_only`, which is the
+ * branch the first version of this function got wrong against the live tape.
+ *
+ * ⛔ THE POSITIVE STATEMENT IS A LIFETIME COUNT, NOT THE RUNNING BALANCE, and
+ * the difference is `basis: 'exhausted'` — the branch the 2026-08-24 BAC close
+ * needed and did not have. `BlindClose.import_only` carries that measurement.
  *
  * ⛔ The netting is deliberately NOT `openEpisodeWindow`'s. That walk REFUSES
  * the whole symbol on an `unmatched_close` — which is the correct answer to
@@ -159,6 +217,16 @@ export function detectOversoldEngineCloses(
   /** Outstanding contracts per OCC, split by who the ledger says opened them. */
   const engineOpen = new Map<string, number>();
   const importedOpen = new Map<string, number>();
+  /**
+   * LIFETIME engine opens / engine closes per OCC — never decremented. These are
+   * the `exhausted` basis's witness and they are deliberately NOT the running
+   * balances above: the balance answers "what is outstanding", these answer "has
+   * our chokepoint ever recorded us buying this symbol", and only the second one
+   * can tell a consumed engine lot from a lot we never had. See
+   * `BlindClose.import_only`.
+   */
+  const engineOpensSeen = new Map<string, number>();
+  const engineClosesSeen = new Map<string, number>();
   const findings: OversoldCloseFinding[] = [];
   const blindCloses: BlindClose[] = [];
   let engineCloses = 0;
@@ -181,6 +249,7 @@ export function detectOversoldEngineCloses(
       if (!(qty > 0)) continue;
       const book = enginePlaced ? engineOpen : importedOpen;
       book.set(symbol, (book.get(symbol) ?? 0) + qty);
+      if (enginePlaced) engineOpensSeen.set(symbol, (engineOpensSeen.get(symbol) ?? 0) + qty);
       continue;
     }
 
@@ -212,7 +281,18 @@ export function detectOversoldEngineCloses(
     }
     const ours = engineOpen.get(symbol) ?? 0;
     const theirs = importedOpen.get(symbol) ?? 0;
-    if (ours === 0 && theirs === 0) {
+    const seenOpens = engineOpensSeen.get(symbol) ?? 0;
+    const seenCloses = engineClosesSeen.get(symbol) ?? 0;
+    // ⛔ BOTH blind branches are gated on `seenOpens === 0`, and for the SAME
+    // reason. Each one's honest case is an ABSENCE — retention aged our opens
+    // out, or our chokepoint never recorded them — and an absence is refuted by
+    // this very tape holding the engine's own `buy_to_open` rows for the OCC.
+    // Where it does, the running balance being 0 is a POSITIVE statement that
+    // our own closes consumed our own lots, and a further engine close is
+    // spending somebody else's contract. TRA-3976's line, one level up: a
+    // refusal backed by our own evidence binds; one that is an absence goes
+    // blind.
+    if (ours === 0 && theirs === 0 && seenOpens === 0) {
       // Nothing outstanding from either party. Retention, a cold ledger, or an
       // import that recovered one leg of a round trip and not the other — the
       // close may have been entirely correct and we cannot tell.
@@ -220,10 +300,12 @@ export function detectOversoldEngineCloses(
         optionSymbol: symbol, ts: f.ts, reason: 'no_open_record',
         soldContracts: qty, importedOpenContracts: 0,
       });
+      engineClosesSeen.set(symbol, seenCloses + qty);
       continue;
     }
-    if (ours === 0) {
-      // Every outstanding contract on this OCC is a `history_import`. See
+    if (ours === 0 && seenOpens === 0) {
+      // Every outstanding contract on this OCC is a `history_import` AND our
+      // chokepoint has never recorded us buying this symbol at all. See
       // `BlindClose.import_only`: our own chokepoint has demonstrably missed our
       // own fills, so this is the shape of an engine buy recovered from broker
       // history and then closed by us — indistinguishable, in these bytes, from
@@ -233,10 +315,17 @@ export function detectOversoldEngineCloses(
         soldContracts: qty, importedOpenContracts: theirs,
       });
       importedOpen.set(symbol, Math.max(0, theirs - qty));
+      engineClosesSeen.set(symbol, seenCloses + qty);
       continue;
     }
     judgedCloses += 1;
+    engineClosesSeen.set(symbol, seenCloses + qty);
     if (qty > ours) {
+      // `ours === 0` reaches here only when `seenOpens > 0`, i.e. the engine held
+      // recorded lots on this OCC and its OWN prior closes consumed them. That is
+      // the `exhausted` basis and it is an accusation, not a blind — the branch
+      // the 2026-08-24T19:31:08Z BAC close (order 143160792) walked through
+      // unnamed on the build that was live at the time.
       const excess = qty - ours;
       excessContracts += excess;
       findings.push({
@@ -248,6 +337,9 @@ export function detectOversoldEngineCloses(
         engineOpenContracts: ours,
         importedOpenContracts: theirs,
         excessContracts: excess,
+        basis: ours > 0 ? 'outstanding' : 'exhausted',
+        engineOpensSeenContracts: seenOpens,
+        engineClosesSeenContracts: seenCloses,
       });
       engineOpen.set(symbol, 0);
       importedOpen.set(symbol, Math.max(0, theirs - excess));
