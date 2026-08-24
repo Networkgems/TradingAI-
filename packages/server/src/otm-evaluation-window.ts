@@ -56,6 +56,23 @@ import { logger } from './observability/index.js';
 import { resolveDataDir } from './data-dir.js';
 import type { OptionTradeJournalRecord } from './option-trade-journal.js';
 import { OTM_SLEEVE_MANDATE_STRUCTURE } from './otm-sleeve-mandate.js';
+// TRA-3974 — the two reads the pre-registration assumed were free.
+import {
+  armOtmWindowCostAccumulator,
+  buildOtmWindowCostAccumulatorRecord,
+  ensureOtmWindowCostSubscription,
+  flushOtmWindowCostAccumulator,
+  loadOtmWindowCostAccumulator,
+  peekOtmWindowCostAccumulatorState,
+  type OtmWindowCostAccumulatorRecord,
+} from './otm-window-cost-accumulator.js';
+import {
+  buildOtmEntryQuoteRecord,
+  buildOtmEntryQuoteRow,
+  selectLiveOtmRows,
+  type OtmEntryQuoteInputRow,
+  type OtmEntryQuoteRecord,
+} from './otm-window-entry-quote.js';
 
 const log = logger.child({ module: 'otm-evaluation-window' });
 
@@ -407,11 +424,18 @@ function targetFor(state: OtmEvaluationWindowState): number {
   return OTM_EVALUATION_TARGET_CLOSES + (state.extension.used ? state.extension.closes : 0);
 }
 
-export function foldOtmEvaluationWindow(
+/**
+ * The window's COUNTED closes and the refusal tally, split out of
+ * {@link foldOtmEvaluationWindow} (TRA-3974) so a second reader — the
+ * fill-quote median split — runs over the record's own population by
+ * construction and can never fold a differently-selected one under the same
+ * `n`. Behaviourally identical to the block it replaced.
+ */
+export function selectOtmEvaluationCountedCloses(
   records: ReadonlyArray<CloseRow>,
   state: OtmEvaluationWindowState,
   now: number,
-): OtmEvaluationReadout {
+): { counted: CloseRow[]; reasons: OtmEvaluationExcluded['reasons'] } {
   const reasons = {
     entryPredatesStart: 0, rulesetPaused: 0, dedupeDuplicate: 0, notLive: 0, notOtm: 0,
     outsideDeltaCell: 0, entryDeltaUnknown: 0, brokerOrderIdNull: 0,
@@ -439,6 +463,15 @@ export function foldOtmEvaluationWindow(
       counted.push(r);
     }
   }
+  return { counted, reasons };
+}
+
+export function foldOtmEvaluationWindow(
+  records: ReadonlyArray<CloseRow>,
+  state: OtmEvaluationWindowState,
+  now: number,
+): OtmEvaluationReadout {
+  const { counted, reasons } = selectOtmEvaluationCountedCloses(records, state, now);
   const rows = counted.map((r) => ({
     realizedR: r.realizedR as number,
     realizedPnlUsd: r.realizedPnlUsd ?? 0,
@@ -615,6 +648,13 @@ export function buildOtmEvaluationWindowRecord(
   liveness: OtmEvaluationLiveness,
   nominationBandIntersects: boolean | null,
   readout: OtmEvaluationReadout,
+  /** TRA-3974 — the two post-pin reads. Optional so every existing caller and
+   * test keeps its signature; absent ⇒ the keys publish as `null`, which a
+   * grader reads as "not deployed", never as "measured and empty". */
+  postPin?: {
+    costAccumulator: OtmWindowCostAccumulatorRecord;
+    entryQuote: OtmEntryQuoteRecord;
+  },
 ) {
   const status = otmEvaluationWindowStatus(state);
   return {
@@ -696,6 +736,24 @@ export function buildOtmEvaluationWindowRecord(
     criteria: readout.criteria,
     excludedCloses: readout.excludedCloses,
     secondary: readout.secondary,
+    // ── TRA-3974 ────────────────────────────────────────────────────────────
+    //
+    // QuantTrader's comment `949f1e13` pre-registered two in-band
+    // contract-quality reads on the note that "the recorder already accrues".
+    // It accrues, but `/api/health/live-enforce-gates` cannot be RESTRICTED to
+    // post-pin rows (no query params; one self-clearing ET day plus a 30-day
+    // rolling fold), cannot be reconstructed by differencing daily snapshots
+    // (counters subtract, QUANTILES DO NOT), and does not SURVIVE the window
+    // (RETAIN_MS is 30 days against a ~9 calendar-week window, so its first
+    // half ages out before its last close lands).
+    //
+    // These two blocks are the read paths that make the pre-registration
+    // executable. Both are additive and read-only: they gate nothing, block no
+    // order, and touch neither `otmArmed`, the row size, the 2-row cap, the
+    // `populationCell`, nor the verdict rule above.
+    postPinCost: postPin?.costAccumulator ?? null,
+    entryQuote: postPin?.entryQuote ?? null,
+    postPinReadsIssue: 'TRA-3974' as const,
     preRegisteredCaveat:
       'On our own tape the entry window has no supporting evidence - it would have admitted 1 of 15 live OTM closes, and the 14 it refuses carry +$758 / +0.137R while the 1 it admits carries -$79 / -0.223R (n=1, confounded with the retired chandelier exit, estimates nothing). The window is justified mechanically, not empirically. If the joint arm underperforms, the entry window is the FIRST component to re-examine.',
   };
@@ -780,5 +838,64 @@ export async function tickOtmEvaluationWindow(args: {
     cache = state;
   }
   const readout = foldOtmEvaluationWindow(args.records, state, now);
-  return buildOtmEvaluationWindowRecord(state, liveness, args.nominationBandIntersects, readout);
+  const postPin = tickOtmWindowPostPinReads(state, args.records, now);
+  return buildOtmEvaluationWindowRecord(
+    state, liveness, args.nominationBandIntersects, readout, postPin,
+  );
+}
+
+/**
+ * TRA-3974 — the post-pin reads, driven off the SAME tick as the window itself.
+ *
+ * Arming is idempotent and happens here rather than at the stamp so that a
+ * build which ships the accumulator AFTER the window has already opened still
+ * arms on its first tick — it just arms late, and `armLagMs` on the published
+ * record says by how much. (The alternative — arming only inside the one-shot
+ * stamp branch — would leave a window opened by an earlier build permanently
+ * uninstrumented, silently.)
+ *
+ * Every step is wrapped: this is an instrument hanging off a record that a
+ * live-money desk reads, and an instrument may never take its subject down.
+ */
+function tickOtmWindowPostPinReads(
+  state: OtmEvaluationWindowState,
+  records: ReadonlyArray<CloseRow>,
+  now: number,
+): { costAccumulator: OtmWindowCostAccumulatorRecord; entryQuote: OtmEntryQuoteRecord } | undefined {
+  try {
+    ensureOtmWindowCostSubscription();
+    loadOtmWindowCostAccumulator(state.windowId);
+    const cell = state.populationCell;
+    if (state.startedAt !== null && cell && cell.frozen) {
+      armOtmWindowCostAccumulator({
+        windowId: state.windowId,
+        startedAt: state.startedAt,
+        band: { deltaAbsMin: cell.deltaAbsMin, deltaAbsMax: cell.deltaAbsMax },
+        now,
+      });
+    }
+    flushOtmWindowCostAccumulator(now);
+    const costAccumulator = buildOtmWindowCostAccumulatorRecord(peekOtmWindowCostAccumulatorState(), now);
+
+    const journalRows = records as ReadonlyArray<OtmEntryQuoteInputRow>;
+    const allLiveRows = selectLiveOtmRows(journalRows);
+    const postPinRows =
+      state.startedAt === null ? null : selectLiveOtmRows(journalRows, { sinceOpenTs: state.startedAt });
+    // The split runs over the window's OWN counted closes — not over a
+    // re-derived "post-pin live OTM" set, which would quietly include the rows
+    // the record excludes (paused spans, wrong delta cell, duplicates).
+    const counted = selectOtmEvaluationCountedCloses(records, state, now).counted;
+    const entryQuote = buildOtmEntryQuoteRecord({
+      allLiveRows,
+      postPinRows,
+      startedAt: state.startedAt,
+      countedCloses: counted.map((r) => buildOtmEntryQuoteRow(r as OtmEntryQuoteInputRow)),
+    });
+    return { costAccumulator, entryQuote };
+  } catch (err) {
+    log.warn('TRA-3974 post-pin reads failed; the TRA-3945 record still publishes', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    return undefined;
+  }
 }

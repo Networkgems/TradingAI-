@@ -347,7 +347,18 @@ import { resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule } from './exit-ri
 // field names the same join column the journal tape and the gate ledger use.
 import { OTM_SLEEVE_MANDATE_STRUCTURE } from './otm-sleeve-mandate.js';
 // TRA-3945 — the pre-registered 30-close evaluation window for the OTM joint arm.
-import { tickOtmEvaluationWindow, type OtmEvaluationLivenessInputs } from './otm-evaluation-window.js';
+import {
+  tickOtmEvaluationWindow,
+  OTM_EVALUATION_WINDOW_ID,
+  type OtmEvaluationLivenessInputs,
+} from './otm-evaluation-window.js';
+// TRA-3974 — the post-pin cost accumulator must be subscribed BEFORE the
+// live-enforce ledger hydrates (see the hydrate block below for why).
+import {
+  ensureOtmWindowCostSubscription,
+  flushOtmWindowCostAccumulator,
+  primeOtmWindowCostAccumulatorFromWindowState,
+} from './otm-window-cost-accumulator.js';
 // TRA-3942 — the OTM sleeve's ENTRY-TIME windows, published on the wire.
 import {
   resolveOtmEntryWindows,
@@ -5172,10 +5183,25 @@ setTimeout(() => {
 // DATA_DIR is a persistent mount (else `durability.ephemeral` says so; the fix is
 // DATA_DIR=/data per TRA-1719). Best-effort; compacted to 30 days.
 {
+  // TRA-3974 — subscribe and PRIME THE REPLAY CURSOR **before** the hydrate,
+  // never after. `hydrateLiveEnforceGateFromDisk` replays every retained JSONL
+  // row through the same `apply()` the live path uses, which is exactly how the
+  // post-pin accumulator recovers decisions the previous process recorded after
+  // its last persist. Subscribing after the hydrate would miss that replay on
+  // every single restart — silently, since the counters would still climb from
+  // the next live decision on. Loading first is what puts `(lastTs,
+  // lastTsCount)` in place so the replay is de-duplicated exactly rather than
+  // double-counted.
+  ensureOtmWindowCostSubscription();
+  const primed = primeOtmWindowCostAccumulatorFromWindowState(OTM_EVALUATION_WINDOW_ID);
   const h = hydrateLiveEnforceGateFromDisk(DATA_DIR);
   if (h.records > 0) {
     log.info('live-enforce gate ledger hydrated (TRA-2048)', { records: h.records, days: h.days });
   }
+  flushOtmWindowCostAccumulator();
+  log.info('TRA-3974 post-pin cost accumulator primed', {
+    armed: primed.armed, reason: primed.reason, ledgerRecordsReplayed: h.records,
+  });
 }
 
 // TRA-3434 — WARM THE TAPE-EXPECTANCY FOLD AT BOOT. Placed here, beside the

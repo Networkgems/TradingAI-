@@ -588,6 +588,30 @@ const GATES: LiveEnforceGate[] = [
   'contract_floor',
 ];
 
+/**
+ * TRA-3974 — read-only observers on every applied decision.
+ *
+ * Deliberately hung on {@link apply}, not on the write path, so a subscriber
+ * sees BOTH the live append AND the boot replay from
+ * {@link hydrateLiveEnforceGateFromDisk}. A subscriber that only saw live
+ * appends would silently lose whatever the ledger recorded between its last
+ * persist and an unclean stop; one that sees the replay can recover it — but it
+ * then owns its own de-duplication, because the replay re-offers rows it has
+ * already folded in. That is the subscriber's contract, stated here so the next
+ * one does not have to rediscover it.
+ *
+ * An observer that throws is logged and swallowed: this list is downstream of a
+ * verdict that has already been made, and nothing on it may reach an order path.
+ */
+export type LiveEnforceObserver = (rec: LiveEnforceRecord) => void;
+
+const observers: LiveEnforceObserver[] = [];
+
+/** Register a read-only observer. Not removable — the call sites are module-init. */
+export function onLiveEnforceRecord(fn: LiveEnforceObserver): void {
+  observers.push(fn);
+}
+
 /** Apply one decision to the in-memory tallies (shared by record + hydrate). */
 function apply(rec: LiveEnforceRecord): void {
   let day = byDay.get(rec.etDay);
@@ -652,6 +676,18 @@ function apply(rec: LiveEnforceRecord): void {
   }
   decisionsTotal += 1;
   lastDecisionAt = rec.ts;
+  // TRA-3974 — LAST, and never before the tallies: an observer must not be able
+  // to change what the ledger itself recorded, and it must not be able to break
+  // it either.
+  for (const fn of observers) {
+    try {
+      fn(rec);
+    } catch (err) {
+      log.warn('live-enforce-gate observer threw (swallowed)', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 }
 
 /**
