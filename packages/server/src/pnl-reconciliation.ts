@@ -348,7 +348,10 @@ export const PNL_DRIFT_GRADEABLE = false;
  * `eodInteriorNotAcknowledgedBooks` grade the same absence with the adjudicated
  * `enock` pairs subtracted, so a gate has a predicate instead of the retirement's
  * human instruction to "read the set of usernames". It is deliberately NOT in
- * this list. Note it is RED today and correctly so — 2026-08-07, TRA-3267.
+ * this list. Note it is RED today and correctly so — 2026-08-07, TRA-3975 (the
+ * writer defect TRA-3267 that dropped the row is fixed and closed; the row itself
+ * is unbackfillable under TRA-2888, so the absence is awaiting adjudication, and
+ * 2026-08-07 is the SOLE date holding this axis and both `live*` cohorts red).
  */
 export const PNL_UNGRADEABLE_FIELDS = [
   'ok',

@@ -577,13 +577,20 @@ describe('TRA-2931 — acknowledged interior absence, published as an identity +
     expect(forced.interiorAbsentNet).toEqual([...ACK_VISIBLE_10, ...ENOSPC, FRIDAY_BUG]);
   });
 
-  it('constraint 7 — 2026-08-07 is an OPEN defect and stays RED on all books, enock included', () => {
+  it('constraint 7 — 2026-08-07 is an UNADJUDICATED absence and stays RED on all books, enock included', () => {
     const s = summarizeEodInteriorAbsence(fleet());
     expect(isAcknowledgedInteriorAbsence('enock', FRIDAY_BUG)).toBe(false);
     expect(JSON.stringify(EOD_INTERIOR_ACKNOWLEDGED_ABSENCE.pairs)).not.toContain(FRIDAY_BUG);
     const named = EOD_INTERIOR_ACKNOWLEDGED_ABSENCE.deliberatelyNotAcknowledged
       .find(x => x.dates.includes(FRIDAY_BUG));
-    expect(named?.ticket).toBe('TRA-3267');
+    // The OWNER moved 2026-08-24: TRA-3267 fixed the writer (`d4246e0`) and closed
+    // on its own acceptances, but a forward-looking writer fix cannot repair a row
+    // already dropped and TRA-2888 forbids fabricating it. The residue — document
+    // the gap, or adopt the standing red as TRA-2943 did for enock — is a ruling,
+    // and it is tracked on TRA-3975. This assertion is what stops the date being
+    // quietly re-homed onto a closed ticket, so it pins the LIVE owner, not the
+    // historical one.
+    expect(named?.ticket).toBe('TRA-3975');
     expect(s.eodInteriorNotAcknowledgedBooks.length).toBe(3);
     for (const b of s.eodInteriorNotAcknowledgedBooks) expect(b.dates).toContain(FRIDAY_BUG);
   });

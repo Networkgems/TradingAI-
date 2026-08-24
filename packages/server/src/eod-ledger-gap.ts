@@ -333,10 +333,21 @@ export const PNL_EOD_INTERIOR_RETIREMENT_NOTE =
  * ── Why 2026-08-07 is NOT here ───────────────────────────────────────────────
  *
  * Sixty-three books red on one date is exactly the pressure that makes someone
- * reach for an acknowledgement list. 2026-08-07 is an OPEN, undocumented, live
- * defect owned by TRA-3267 and it must stay red on all 63 books, `enock`
- * included. TRA-2928 constraint 7, stated as a rule rather than a note: this list
- * holds `enock` only, and only inside 2026-06-15..2026-07-24.
+ * reach for an acknowledgement list. 2026-08-07 is an undocumented absence whose
+ * adjudication is owned by TRA-3975, and it must stay red on all 63 books,
+ * `enock` included. TRA-2928 constraint 7, stated as a rule rather than a note:
+ * this list holds `enock` only, and only inside 2026-06-15..2026-07-24.
+ *
+ * TRA-3267 (the `isMarketDay()` UTC-weekday defect that dropped the row) closed
+ * `done` 2026-08-24 on the WRITER: `d4246e0` is live and two post-fix Fridays
+ * (08-14, 08-21) and three post-fix weekends came back clean. Closing it did not
+ * repair 08-07 and was never going to — TRA-2888 anti-fabrication forbids writing
+ * the row. So the residue moved to TRA-3975 rather than being left pointing at a
+ * closed ticket. Read that ticket before touching this block: it holds the live
+ * measurement (08-07 is the SOLE date on this axis, on all four of
+ * `eodInteriorAbsentOk` / `eodInteriorNotAcknowledgedOk` and both `live*`
+ * cohorts) and the two candidate dispositions. Neither is implementable here
+ * without a fresh ruling.
  */
 export interface EodAcknowledgedAbsencePair {
   book: string;
@@ -435,12 +446,12 @@ export const EOD_INTERIOR_ACKNOWLEDGED_ABSENCE: EodInteriorAcknowledgedAbsence =
   matching:
     'Per (book, date) pair, allow-list only -- never a range, never a >= bound, never a bare date list. A 29th absent date on enock, or any date on any second book, is outside this record and goes red on eodInteriorNotAcknowledgedBooks immediately.',
   gateableAxis:
-    'eodInteriorNotAcknowledgedOk / eodInteriorNotAcknowledgedBooks. Computed by subtracting these pairs from interiorAbsentNet, which is itself unchanged. RED today (2026-08-07, TRA-3267, 63 books) -- and that red is CORRECT and must not be acknowledged here.',
+    'eodInteriorNotAcknowledgedOk / eodInteriorNotAcknowledgedBooks. Computed by subtracting these pairs from interiorAbsentNet, which is itself unchanged. RED today (2026-08-07, TRA-3975, 63 books) -- and that red is CORRECT and must not be acknowledged here. 2026-08-07 is now the SOLE date on this axis across all 63 books, and it also pins liveEodInteriorNotAcknowledgedOk false on both live books (admin, v0nni) -- i.e. the reachable red TRA-2943 nominated as the surviving gradeable signal has been reached. The writer defect that dropped the row (TRA-3267) shipped and closed 2026-08-24; the row itself cannot be backfilled (TRA-2888), so the remaining question is document-vs-adopt-the-standing-red and it is a ruling, tracked on TRA-3975.',
   deliberatelyNotAcknowledged: Object.freeze([
     Object.freeze({
       dates: Object.freeze(['2026-08-07']),
-      ticket: 'TRA-3267',
-      why: 'An OPEN, undocumented, live production defect, not an acknowledged absence: isMarketDay() derived day-of-week from host-local (UTC) time while its holiday lookup used ET, so the 21:00 ET archive dropped every Friday row fleet-wide and booked a phantom Sunday. It must stay RED on all affected books, enock included. TRA-2928 constraint 7.',
+      ticket: 'TRA-3975',
+      why: 'An undocumented absence awaiting adjudication, not an acknowledged one: isMarketDay() derived day-of-week from host-local (UTC) time while its holiday lookup used ET, so the 21:00 ET archive dropped every Friday row fleet-wide and booked a phantom Sunday. The WRITER is fixed and closed (TRA-3267, d4246e0, live 2026-08-12; verified clean over 2026-08-14 and 2026-08-21 Fridays and the 08-15/16, 08-22/23 weekends), but the dropped row cannot be written after the fact (TRA-2888), so this date stays RED on all affected books, enock included, until TRA-3975 rules on document-vs-standing-red. TRA-2928 constraint 7.',
     }),
     Object.freeze({
       dates: Object.freeze(['2026-06-19', '2026-07-03']),
@@ -457,7 +468,7 @@ export const EOD_INTERIOR_ACKNOWLEDGED_ABSENCE: EodInteriorAcknowledgedAbsence =
 
 /** Prose form, spread into the endpoint's top-level `caveats`. */
 export const PNL_EOD_INTERIOR_ACKNOWLEDGED_NOTE =
-  'TRA-2931 (ruling TRA-2928 D2): `eodInteriorNotAcknowledgedOk` / `eodInteriorNotAcknowledgedBooks` is the GATEABLE interior-absence axis. Grade it. `eodInteriorAbsentOk` stays RETIRED and pinned false (TRA-2943) and this ticket did not and could not change that -- it is additive only. WHAT IT DOES: subtracts the ACKNOWLEDGED absence -- published as `eodInteriorAcknowledgedAbsence`, an allow-list of 28 (book, date) PAIRS, `enock` only, spanning 2026-06-15..2026-07-24 -- from `interiorAbsentNet`, and grades the remainder. Everything else is untouched: `interiorAbsentRaw`, `interiorAbsentDocumented`, `interiorAbsentNet`, `interiorAbsentOk`, `eodInteriorAbsentBooks` and `eodInteriorAbsentRawBookCount` all hold exactly the values they held before this axis existed, and `enock` is still named in `eodInteriorAbsentBooks` with all of its dates. NOTHING IS SUPPRESSED. IT IS AN ACKNOWLEDGEMENT, NOT A DOCUMENTED GAP: its `cause` reads NOT MEASURED and points at TRA-2903, the archive-participation ticket, as the OPEN question -- unlike `eodDocumentedGap`, whose cause is measured (ENOSPC on inodes). The two are separate objects on separate code paths and nothing in the acknowledged record can be read from, or written into, `EOD_DOCUMENTED_GAP_DATES`. THE UNIT IS A PAIR, NEVER A RANGE: a 29th absent date on `enock`, or any date on any second book, fires immediately. TWENTY-EIGHT AND NOT THE TEN ON THE WIRE: `spanStart = max(firstRow, baselineDate)` clamps at the env-pinned 2026-07-12, so 18 of the 28 are inert today and exist so this axis does not re-red when that env moves. 2026-06-19 and 2026-07-03 are NOT in the list -- they are NYSE holidays, not sessions. THIS AXIS IS RED TODAY AND THAT IS CORRECT: 2026-08-07 has no EOD row on any book (TRA-3267 -- `isMarketDay()` read day-of-week from host-local UTC while its holiday lookup used ET, dropping every Friday row fleet-wide). 2026-08-07 is an open live defect, NOT an acknowledged absence; it is deliberately excluded from the allow-list and must stay red until TRA-3267 repairs or documents it. It is also this axis\'s live positive control: it exercises the real mechanism path on real rows in both directions at once -- `enock` reading exactly `["2026-08-07"]` proves the acknowledgement subtracts its 10 visible dates AND that it does not swallow a date outside its set.';
+  'TRA-2931 (ruling TRA-2928 D2): `eodInteriorNotAcknowledgedOk` / `eodInteriorNotAcknowledgedBooks` is the GATEABLE interior-absence axis. Grade it. `eodInteriorAbsentOk` stays RETIRED and pinned false (TRA-2943) and this ticket did not and could not change that -- it is additive only. WHAT IT DOES: subtracts the ACKNOWLEDGED absence -- published as `eodInteriorAcknowledgedAbsence`, an allow-list of 28 (book, date) PAIRS, `enock` only, spanning 2026-06-15..2026-07-24 -- from `interiorAbsentNet`, and grades the remainder. Everything else is untouched: `interiorAbsentRaw`, `interiorAbsentDocumented`, `interiorAbsentNet`, `interiorAbsentOk`, `eodInteriorAbsentBooks` and `eodInteriorAbsentRawBookCount` all hold exactly the values they held before this axis existed, and `enock` is still named in `eodInteriorAbsentBooks` with all of its dates. NOTHING IS SUPPRESSED. IT IS AN ACKNOWLEDGEMENT, NOT A DOCUMENTED GAP: its `cause` reads NOT MEASURED and points at TRA-2903, the archive-participation ticket, as the OPEN question -- unlike `eodDocumentedGap`, whose cause is measured (ENOSPC on inodes). The two are separate objects on separate code paths and nothing in the acknowledged record can be read from, or written into, `EOD_DOCUMENTED_GAP_DATES`. THE UNIT IS A PAIR, NEVER A RANGE: a 29th absent date on `enock`, or any date on any second book, fires immediately. TWENTY-EIGHT AND NOT THE TEN ON THE WIRE: `spanStart = max(firstRow, baselineDate)` clamps at the env-pinned 2026-07-12, so 18 of the 28 are inert today and exist so this axis does not re-red when that env moves. 2026-06-19 and 2026-07-03 are NOT in the list -- they are NYSE holidays, not sessions. THIS AXIS IS RED TODAY AND THAT IS CORRECT: 2026-08-07 has no EOD row on any book (TRA-3267 -- `isMarketDay()` read day-of-week from host-local UTC while its holiday lookup used ET, dropping every Friday row fleet-wide). That WRITER defect is fixed and closed (`d4246e0`, live since 2026-08-12, verified clean over the 2026-08-14 and 2026-08-21 Fridays and three post-fix weekends), but the row it dropped can never be written after the fact (TRA-2888), so 2026-08-07 is an UNADJUDICATED absence, NOT an acknowledged one; it is deliberately excluded from the allow-list and must stay red until TRA-3975 rules on it -- either documenting it (its cause IS measured, unlike `enock`\'s) or adopting the standing red the way TRA-2943 did. Do not read the closure of TRA-3267 as licence to green this axis. It is also this axis\'s live positive control: it exercises the real mechanism path on real rows in both directions at once -- `enock` reading exactly `["2026-08-07"]` proves the acknowledgement subtracts its 10 visible dates AND that it does not swallow a date outside its set.';
 
 /** Per-book split of `interiorAbsentNet` into the acknowledged arm and the graded arm. */
 export interface EodInteriorAcknowledgedSplit {
