@@ -113,6 +113,20 @@ const missingBoundKeys = bound ? BOUND_KEYS.filter(k => !(k in bound)) : BOUND_K
 check('D3  the bound census publishes all six columns',
   missingBoundKeys.length === 0, missingBoundKeys.length ? `missing ${missingBoundKeys.join(',')}` : BOUND_KEYS.join(','));
 
+// TRA-3926 (2026-08-24) — the SECOND oracle's deployed-bytes proof. This key
+// does not exist on `3d0c3582` or on any earlier build, so D4 is what
+// separates the tightening from the commit that shipped only the first
+// oracle. ⚠ ITS VALUE IS NOT A GRADE: `netOfCloses` counts staging sites the
+// second oracle ANSWERED, and it can only rise when an imported row actually
+// reaches an exit. Read it as the PAIR `netOfCloses / blindRows` — the
+// population that used to fail open, and what is left of it.
+const netKeyPresent = bound !== undefined && bound !== null && 'netOfCloses' in bound;
+check('D4  the census publishes `netOfCloses` (second-oracle bytes)',
+  netKeyPresent,
+  netKeyPresent
+    ? `netOfCloses ${bound.netOfCloses} / blindRows ${bound.blindRows}`
+    : 'ABSENT — this build predates the second oracle');
+
 if (!census) {
   print();
   console.error('FAIL — the detector is not on this build; nothing below is gradeable.');
