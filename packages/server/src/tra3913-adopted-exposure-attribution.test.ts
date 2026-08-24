@@ -100,6 +100,9 @@ function recorded(overrides: Partial<RecordedEngineOpenBasis> = {}): RecordedEng
     orderIds: [142603071],
     unpricedFills: 0,
     stoppedAtClose: false,
+    // TRA-3976 — no reconcile terminal marker on this OCC, which is what every
+    // case written before that ticket means and keeps meaning.
+    stoppedAtTermination: false,
     lastTs: Date.parse('2026-08-20T18:02:11Z'),
     enginePlacedContracts: contracts,
     enginePlacedPremiumPaid: premiumPaid,

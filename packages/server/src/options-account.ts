@@ -75,6 +75,10 @@ import {
   // OWN records account for, netted against the closes we already took. The
   // reader's basis above truncates at the first close and so cannot answer it.
   engineNetOpenContracts,
+  // TRA-3976 — the terminal marker the reconcile writes when it drops a row the
+  // ledger still reports OPEN. Without it a close we never saw leaves a PHANTOM
+  // OPEN episode that all three oracles above go on reading for 30 days.
+  recordReconcileTermination,
   type RecordedEngineOpenBasis,
   type LiveFillSleeve,
 } from './live-options-fee-slippage-ledger.js';
@@ -2355,7 +2359,7 @@ export type LiveOpenProvenance =
        * same fail-open guess in a new costume.
        */
       kind: 'unresolved';
-      reason: 'ledger_empty' | 'unmatched_close' | 'unusable_quantity';
+      reason: 'ledger_empty' | 'unmatched_close' | 'unusable_quantity' | 'reconcile_terminal';
     };
 
 /**
@@ -2381,6 +2385,17 @@ const LIVE_OPEN_PROVENANCE_UNRESOLVED_NOTE: Record<
     'a live fee/slippage ledger row for this contract carries an unusable ' +
     '`contracts` value, so the open/closed arithmetic cannot be run. ' +
     'UNCLASSIFIED — not a decision to leave the row unmanaged.',
+  // TRA-3976 — UNCLASSIFIED, deliberately, and NOT `foreign`. The finding-shaped
+  // reading ("the broker went flat on this OCC, so anything wearing it now is
+  // the desk's") is tempting and it is the TRA-2820 direction: a contract we
+  // really did place, whose fill no chokepoint recorded, would be handed the
+  // import sentinel and left with no stop. We know our position LEFT; we do not
+  // know who owns what came back.
+  reconcile_terminal:
+    'the reconcile dropped a live row for this contract while the fee/slippage ' +
+    'ledger still showed it open, and no sell_to_close of ours accounts for it ' +
+    '(the broker closed it out of band). The ledger cannot state a net position ' +
+    'on this symbol, so provenance is UNCLASSIFIED — not foreign, and not ours.',
 };
 
 /**
@@ -3419,6 +3434,14 @@ export class PaperOptionsAccount {
    * the branch was never reached rather than that it works.
    */
   private exitQuantityNetOfCloses = 0;
+  /**
+   * TRA-3976 — staging sites refused because the reconcile had already recorded
+   * that this OCC left our book through a close the fill ledger never saw.
+   * Counted apart from `bounded` for the same reason `netOfCloses` is: this is
+   * the population that used to be `blindRows`, i.e. the population that used
+   * to submit a `sell_to_close` against a phantom.
+   */
+  private exitQuantityReconcileTerminal = 0;
   /**
    * TRA-3926 — per-row de-dupe key for the refusal warn. `checkExits` runs on
    * every tick and a permanently-refused row would otherwise emit the same line
@@ -7075,6 +7098,7 @@ export class PaperOptionsAccount {
     // proves nothing about live imported rows.
     if (opt.importedFromTradier === true) this.exitQuantityChecked += 1;
     if (bound.netOfCloses) this.exitQuantityNetOfCloses += 1;
+    if (bound.reason === 'reconcile_terminal') this.exitQuantityReconcileTerminal += 1;
     // BLIND — the oracle could not make a complete positive statement about
     // this row, so the exit goes out UNBOUNDED (the pre-fix quantity). Counted,
     // never silent: this is the residual fail-open the fix does not close, and
@@ -9702,6 +9726,14 @@ export class PaperOptionsAccount {
      * "the branch works and nothing needed it" from "the branch is unreachable".
      */
     netOfCloses: number;
+    /**
+     * TRA-3976 — of `checked`, the ones refused because the reconcile had
+     * already recorded that this OCC left our book through a close the fill
+     * ledger never saw. Also a `blindRows` population before this fix, and also
+     * only readable as a PAIR with it: a `0` here says nothing about whether the
+     * branch works until `blindRows` is read beside it.
+     */
+    reconcileTerminal: number;
     /** Newest refusal, for the health route's operator line. */
     last: {
       at: number;
@@ -9720,6 +9752,7 @@ export class PaperOptionsAccount {
       blindRows: this.exitQuantityBlindRows,
       suppressedExits: this.exitQuantitySuppressedExits,
       netOfCloses: this.exitQuantityNetOfCloses,
+      reconcileTerminal: this.exitQuantityReconcileTerminal,
       last: this.exitQuantityLastRefusal === null ? null : { ...this.exitQuantityLastRefusal },
     };
   }
@@ -11866,6 +11899,52 @@ export class PaperOptionsAccount {
     // estimate rather than deduping it; 4ffbe10's mechanism is superseded on this
     // path, not wrong.
     const liveBefore = this.optionsPnlByMode.live;
+    // ── TRA-3976 — THE TERMINAL MARKER, WRITTEN BEFORE THE ROW GOES ──────────
+    // Captured here and not after `closeOption`, because `closeOption` archives
+    // the row and `opt.contractsRemaining` / `opt.optionSymbol` are the evidence
+    // this marker is made of.
+    //
+    // This close produces NO fill for the live fee/slippage ledger — there is no
+    // fill; the broker closed it out of band. Without a marker the ledger's
+    // episode walk goes on reporting the position OPEN for the whole 30-day
+    // retention window, and three separate oracles read that phantom: the fold
+    // credits the engine with a contract it does not hold, `ledgerOpenProvenance`
+    // stamps a returning desk contract `engine_origin`, and the exit bound
+    // PERMITS selling it. `SOFI260925C00019000`, 2026-08-24T13:34:55.545Z, is the
+    // measured instance — the first `broker_reconcile` close on the live book,
+    // and it produced a phantom immediately.
+    //
+    // Guarded on the ledger actually REPORTING the symbol open. A marker for an
+    // episode the ledger already has closed is noise in a census whose whole
+    // value is that its normal reading is zero.
+    const occ = typeof opt.optionSymbol === 'string' ? opt.optionSymbol : '';
+    if (occ !== '' && openEpisodeWindow(occ).status === 'open') {
+      const droppedAt = Date.now();
+      const wrote = recordReconcileTermination({
+        ts: droppedAt,
+        // ET, not `toDateKey` (which is UTC): the ledger's `etDay` column is ET
+        // and a UTC key rolls the day 4–5 hours early (TRA-407). Same inline
+        // idiom the closed-today fold above uses rather than a new import.
+        etDay: new Date(droppedAt).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }),
+        optionSymbol: occ,
+        contractsDropped: opt.contractsRemaining ?? opt.contracts,
+        positionId: opt.id,
+        source: 'broker_flat_reconcile',
+      });
+      if (wrote) {
+        accountLog.warn('reconcile dropped a row the fill ledger still reports OPEN', {
+          component: 'reconcile-terminal-marker',
+          issue: 'TRA-3976',
+          optionSymbol: occ,
+          positionId: opt.id,
+          contractsDropped: opt.contractsRemaining ?? opt.contracts,
+          note:
+            'the broker stopped reporting this OCC and no sell_to_close of ours accounts for it. '
+            + 'The ledger episode is now a REFUSAL (reconcile_terminal), not a count: the fold will '
+            + 'not credit the engine with these contracts and the exit bound will not sell them.',
+        });
+      }
+    }
     // TRA-2940 — attribute as a reconcile close, not `manual`: nobody clicked
     // anything, the broker's book simply no longer carries the position.
     const closed = this.closeOption(optionId, breakEvenFill, 'broker_reconcile');

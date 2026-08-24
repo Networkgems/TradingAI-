@@ -82,7 +82,10 @@ import {
   OPTION_OTM_DELTA_FLOOR_LIVE_FLAG,
   OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR,
 } from '../option-exec-flag.js';
-import { summarizeLiveOptionsFeeSlippage } from '../live-options-fee-slippage-ledger.js'; // TRA-1929
+import {
+  summarizeLiveOptionsFeeSlippage, // TRA-1929
+  phantomOpenEpisodeCensus, // TRA-3976
+} from '../live-options-fee-slippage-ledger.js';
 import { getLiveOptionsFeeReconcileState } from '../live-options-fee-reconcile.js'; // TRA-2810
 import { getZombieOpenSweepState } from '../zombie-open-journal-sweep.js'; // TRA-3547
 import { getCloseBasisSweepState } from '../tra3730-close-basis-sweep.js'; // TRA-3730
@@ -451,6 +454,18 @@ export interface LiveHealthDeps {
    * "not wired", never `[]` ("no books").
    */
   liveOtmAggregateExposure?: () => Array<LiveOtmAggregateExposure>;
+  /**
+   * TRA-3976 — every OCC symbol on the fleet's LIVE open book right now,
+   * backing the `phantomOpenEpisodes` census on
+   * `GET /api/health/live-options-fee-slippage`. Wire it to the union of every
+   * engine's live `openOptions[].optionSymbol` (imported rows INCLUDED — an
+   * adopted broker row is a contract we hold).
+   *
+   * Optional: absent ⇒ the census serves `verdict: 'blind'` / `rows: null`,
+   * which says "not wired", NEVER `clean` ("no phantoms"). A census whose
+   * unwired state read as healthy would be the defect it is looking for.
+   */
+  liveOpenOptionSymbols?: () => string[];
   /** Injectable clock for deterministic tests. Defaults to Date.now. */
   now?: () => number;
 }
@@ -4583,10 +4598,32 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // the same snapshot: two calls walk every engine twice and could serve a sum
     // that no row set on this response supports.
     const aggregateExposureRows = deps.liveOtmAggregateExposure?.() ?? null;
+    // TRA-3976 — `?? null` and NOT `?? []`: an unwired provider must reach the
+    // census as "cannot say", not as "the fleet holds nothing", which would
+    // grade every open ledger episode a phantom.
+    const heldLiveOptionSymbols = deps.liveOpenOptionSymbols?.() ?? null;
     res.json({
       ok: true,
       time: new Date(nowMs).toISOString(),
       build: resolveBuildInfo(),
+      /**
+       * ⭐ TRA-3976 — episodes this ledger reports OPEN that no book holds.
+       *
+       * A close the fill ledger never saw (the broker closes a position out of
+       * band; the reconcile drops our row) used to leave the episode readable as
+       * OPEN for the whole 30-day retention window — and three oracles read that
+       * phantom: the at-risk fold credited the engine with contracts it does not
+       * hold, `ledgerOpenProvenance` stamped a returning contract
+       * `engine_origin`, and the exit bound would have SOLD it.
+       *
+       * `verdict: 'phantom'` is the defect and the only value that should page.
+       * `blind` means the held-symbol provider is unwired — read `wired` first;
+       * it never folds to `clean`. `terminalMarkers` / `terminatedEpisodes` are
+       * the REMEDIATED population (the reconcile recorded the drop), and
+       * `durability.ephemeral: true` means those markers die at the next
+       * redeploy and every terminated episode silently reverts to its phantom.
+       */
+      phantomOpenEpisodes: phantomOpenEpisodeCensus(heldLiveOptionSymbols),
       otmFlag: 'ENABLE_OPTION_LIVE_OTM',
       rvFlag: 'ENABLE_OPTION_LIVE_RV_LONG',
       windowVar: 'OPTION_LIVE_TEST_UNTIL',

@@ -533,7 +533,7 @@ export interface EngineExitQuantityBound {
    * `handed_over` sentinel when a human's per-row grant lifted the bound before
    * the split was consulted.
    */
-  reason: EngineExposureReason | 'handed_over' | 'engine_net_of_closes';
+  reason: EngineExposureReason | 'handed_over' | 'engine_net_of_closes' | 'reconcile_terminal';
   /**
    * True iff the oracle COULD NOT ANSWER for this row, rather than answering
    * and finding the contracts are not ours. Same discipline as
@@ -584,6 +584,14 @@ export interface EngineNetOpenEvidence {
   closedContracts: number;
   /** `min(netContracts, max(0, engineOpen − closed))`. */
   engineNetContracts: number;
+  /**
+   * TRA-3976 — WHY the ledger could not state a net position, when it could
+   * not. `'reconcile_terminal'` is the one refusal on this path that is BACKED
+   * BY EVIDENCE OF OURS rather than by an absence, and the bound treats it
+   * differently for exactly that reason — see
+   * {@link boundExitContractsToEngineShare}.
+   */
+  reason?: string | null;
 }
 
 /**
@@ -727,6 +735,49 @@ export function boundExitContractsToEngineShare(
     // pre-fix quantity. There is no input on which consulting this widens an
     // exit, so it cannot re-open TRA-2820 through the front door either.
     const net = lookupNetOpenAccount();
+    // ── TRA-3976 — THE ONE REFUSAL THAT BINDS ─────────────────────────────
+    // Asked FIRST, because the BLIND branch below would otherwise swallow it:
+    // both arrive here as `oracleRefused`, and only one of them is an absence.
+    //
+    // `reconcile_terminal` means the reconcile watched this OCC leave the
+    // broker's book across consecutive sweeps, dropped our row, and RECORDED
+    // that it did so. The ledger is not dark for this symbol — it is holding
+    // our own written statement that the position left our book through a
+    // close no fill of ours accounts for. **A dark instrument cannot support a
+    // refusal; a lit one saying "gone" can.**
+    //
+    // ⛔ SO ASK "CLOSED FOR WHOM" ONE MORE TIME. For the READER this refusal
+    // routes the dollars to the desk (conservative: over-states adopted). For
+    // the WRITER the identical byte, routed to BLIND, would submit a
+    // `sell_to_close` for a position the broker already reports gone — an
+    // over-sell against inventory that is not there, which is TRA-3926's
+    // hazard with the phantom supplying the quantity. Conservative HERE is
+    // zero.
+    //
+    // ⚠ SAY WHAT THIS COSTS, AND WHY IT IS NOT TRA-2820. The stranding shape
+    // this can produce is: an OCC we were dropped out of, that the engine then
+    // RE-BOUGHT without any chokepoint recording the fill. TRA-2820's shape —
+    // "the ledger holds nothing for this OCC at all" — is `no_record`, and it
+    // still falls through to BLIND, untouched. And a re-entry the ledger DID
+    // record re-opens the episode (`openEpisodeWindow` clears the termination
+    // at the next `buy_to_open` off zero), so the engine keeps the ability to
+    // exit its own new position. `refusedContracts` carries the residual out so
+    // the refusal is surfaced rather than silently abandoned.
+    if (net !== null && net.status === 'indeterminate' && net.reason === 'reconcile_terminal') {
+      return {
+        exitContracts: 0,
+        refusedContracts: requested,
+        requestedContracts: requested,
+        reason: 'reconcile_terminal',
+        // The oracle ANSWERED — about our own book. Reporting this as a
+        // refusal would route it to "somebody look at the ledger" when the
+        // remedy is "somebody find out who closed this at the broker".
+        oracleRefused: false,
+        blind: false,
+        bounded: requested > 0,
+        netOfCloses: false,
+      };
+    }
     if (net !== null && net.status === 'open' && net.engineOpenContracts > 0) {
       // `engineOpenContracts > 0` is the positive witness the whole branch
       // rests on: the ledger holds a `buy_to_open` WE placed on this OCC in the

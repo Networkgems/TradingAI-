@@ -6130,6 +6130,29 @@ registerLiveHealthRoutes(app, {
   // lesson, ~40 lines up).
   liveOtmAggregateExposure: () =>
     getAllUserContexts().map(ctx => ctx.engine.getLiveOtmAggregateExposure()),
+  // TRA-3976 — the held-symbol set the phantom-open-episode census grades
+  // against. The fill ledger knows which OCCs it believes are OPEN; only this
+  // module can enumerate which ones the fleet's books actually HOLD, and the
+  // difference is the defect.
+  //
+  // ⚠ WHOLE FLEET, and LIVE ROWS ONLY — the two are not in tension. The ledger
+  // is live-only by construction (see its file header), so a demo row could
+  // never appear as a ledger episode; but the books are enumerated across the
+  // whole fleet because the ledger is a PROCESS-WIDE store and a symbol held by
+  // a second live book is emphatically not a phantom.
+  //
+  // ⚠ AND IT INCLUDES IMPORTED ROWS. An adopted broker row is a contract we
+  // hold; excluding it would file every desk position as a phantom of ours.
+  liveOpenOptionSymbols: () => {
+    const held: string[] = [];
+    for (const ctx of getAllUserContexts()) {
+      for (const opt of ctx.engine.getState().options.openOptions ?? []) {
+        if ((opt.mode ?? 'demo') !== 'live') continue;
+        if (typeof opt.optionSymbol === 'string' && opt.optionSymbol !== '') held.push(opt.optionSymbol);
+      }
+    }
+    return held;
+  },
 });
 
 // TRA-3879 — WIRE THE FLEET READ. `φ_eff = min(φ, A / Σ E_i)` is what makes

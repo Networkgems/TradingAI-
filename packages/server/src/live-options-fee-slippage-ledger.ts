@@ -40,6 +40,15 @@ const log = logger.child({ module: 'live-options-fee-slippage-ledger' });
 export const LIVE_OPTIONS_FEE_SLIPPAGE_LOG_FILENAME = 'live-options-fee-slippage.jsonl';
 
 /**
+ * TRA-3976 — the terminal-marker log. A SEPARATE file, and separate from
+ * {@link LiveOptionFillRecord}, on purpose: see
+ * {@link ReconcileTerminationRecord} for why a reconcile drop must not be
+ * written as a fill.
+ */
+export const LIVE_OPTION_RECONCILE_TERMINATION_LOG_FILENAME =
+  'live-option-reconcile-terminations.jsonl';
+
+/**
  * Retain this many ms of fill records on disk (compacted on boot). The bounded
  * test runs ~2 days; 30 days comfortably covers reading the calibration back well
  * after the window closes while bounding a file that takes a handful of lines per
@@ -202,6 +211,13 @@ export function clearLiveOptionsFeeSlippageLedger(): void {
   hydratedRecords = 0;
   appendErrors = 0;
   lastAppendError = null;
+  // TRA-3976 — the terminal markers are part of this ledger's answer, so the
+  // test seam has to drop them too. Leaving them behind would make a suite's
+  // "empty ledger" fixture silently carry the previous case's refusals.
+  terminations.length = 0;
+  hydratedTerminations = 0;
+  terminationAppendErrors = 0;
+  lastTerminationAppendError = null;
 }
 
 function finiteOrNull(n: number | null | undefined): number | null {
@@ -271,6 +287,186 @@ export function recordLiveOptionFill(input: LiveOptionFillInput): void {
   }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// TRA-3976 — A CLOSE THIS LEDGER NEVER SAW.
+//
+// ── The event, live, real money ─────────────────────────────────────────────
+// `SOFI260925C00019000` — an ordinary engine row, `buy_to_open 1 @1.23`, oid
+// `142828896`, `origin: 'fill'`, 2026-08-21T14:24:10.277Z. It was closed AT THE
+// BROKER; on 2026-08-24T13:34:55.545Z the reconcile saw the OCC gone from
+// `/positions` and dropped the local row (`exitReason: 'broker_reconcile'`).
+//
+// **No `sell_to_close` was ever written here** — there was no fill of ours to
+// write. So the ledger held exactly one SOFI row, the open, and every oracle in
+// this module went on reporting that episode OPEN, 1 contract, basis $123.00,
+// for the whole 30-day retention window. Three separate callers were wrong in
+// three different directions off the same silence:
+//
+//   • {@link recordedEngineOpenBasis} → 1 contract ⇒ `foldOpenPremiumAtRisk`
+//     would credit the ENGINE with a contract it does not hold the moment any
+//     SOFI row returns to the book. TRA-3913's exact defect, re-entering
+//     through a door that fix does not close: it assumed the ledger's silence
+//     UNDER-counts (safe), and a missing CLOSE makes it OVER-count.
+//   • `ledgerOpenProvenance` → `engine`, sleeve `single_leg_otm` ⇒ a returning
+//     desk contract gets stamped `adoptionAuthority: 'engine_origin'`.
+//   • {@link engineNetOpenContracts} → `engineNetContracts: 1` ⇒
+//     `boundExitContractsToEngineShare` would PERMIT selling it. TRA-3926's
+//     over-sell, seeded.
+//
+// Measured over the whole retained tape on 2026-08-24: 19 live closed journal
+// rows, 21 distinct ledger symbols, 19 carrying a `sell_to_close`, and exactly
+// ONE phantom-open episode — SOFI. This is the FIRST `broker_reconcile` close
+// on the live book and it produced a phantom immediately.
+//
+// ── The mechanism: a terminal marker, written at drop time ──────────────────
+// The reconcile is the only actor that KNOWS the position left our book. It
+// writes one marker here as it drops the row, and the marker is EVIDENCE ABOUT
+// OUR BOOK ("we stopped holding this, and no fill of ours accounts for it"),
+// never an inference about the broker's fills.
+//
+// ⛔ IT IS NOT A `sell_to_close` AND MUST NEVER BE WRITTEN AS ONE. There was no
+// fill: no price, no order id, no quote. A `sell_to_close` row would be a
+// FABRICATED FILL — the exact class this module's honest-null rule exists to
+// refuse (see the file header: unmeasured is `null`, never `0`) — and it would
+// leak into every consumer of `records[]`: `detectOversoldEngineCloses` would
+// count it as an engine close, `diffMissingFillsFromHistory` would grade it
+// against broker history, the fee reconcile would hunt a commission for it, and
+// `summarizeLiveOptionsFeeSlippage().closes` would report a close that never
+// happened. A separate store with a separate file is the containment.
+//
+// ⛔ AND IT IS A REFUSAL, NOT A COUNT. After a marker the episode's answer is
+// `indeterminate` / `reconcile_terminal` — "this ledger cannot state a net
+// position for this OCC" — never `flat` (a FINDING: we opened it and our own
+// records closed it out). The two want different remedies and must not share a
+// column; `flat` would let the write path read a phantom as a settled fact.
+// ════════════════════════════════════════════════════════════════════════════
+
+/** TRA-3976 — which drop path wrote the marker. */
+export type ReconcileTerminationSource =
+  /**
+   * `OptionsAccount.closeBrokerFlatPosition` — the broker stopped reporting the
+   * OCC across `BROKER_MISSING_SWEEPS_TO_CLOSE` consecutive reconcile sweeps
+   * and the local row was closed at break-even.
+   */
+  'broker_flat_reconcile';
+
+function isTerminationSource(v: unknown): v is ReconcileTerminationSource {
+  return v === 'broker_flat_reconcile';
+}
+
+/**
+ * TRA-3976 — one record that OUR BOOK stopped holding an OCC through a route
+ * that produced no fill for this ledger to record.
+ *
+ * Deliberately NOT a {@link LiveOptionFillRecord}: there is no price, no order
+ * id and no quote, so every numeric field a fill carries would have to be
+ * fabricated or null-padded, and the row would join populations it is not a
+ * member of. See the block comment above.
+ */
+export interface ReconcileTerminationRecord {
+  /** Always 'live' — the demo book has no broker counterpart to go flat at. */
+  mode: 'live';
+  /** Drop time, ms epoch. */
+  ts: number;
+  /** ET calendar day (America/New_York, YYYY-MM-DD). */
+  etDay: string;
+  /** OCC option symbol whose episode this terminates. */
+  optionSymbol: string;
+  /**
+   * `contractsRemaining` on the local row at drop time. Published as EVIDENCE
+   * (how much left the book unaccounted), never netted against the ledger's
+   * arithmetic — the whole premise is that the two do not agree.
+   */
+  contractsDropped: number;
+  /** Local position id — the durable handle back to the journal row. */
+  positionId: string | null;
+  source: ReconcileTerminationSource;
+}
+
+export interface ReconcileTerminationInput {
+  ts: number;
+  etDay: string;
+  optionSymbol: string;
+  contractsDropped: number;
+  positionId?: string | null;
+  source: ReconcileTerminationSource;
+}
+
+/** All retained terminal markers, append-ordered. */
+const terminations: ReconcileTerminationRecord[] = [];
+let terminationAppendErrors = 0;
+let lastTerminationAppendError: string | null = null;
+let hydratedTerminations = 0;
+
+export function liveOptionReconcileTerminationLogPath(dir: string): string {
+  return join(dir, LIVE_OPTION_RECONCILE_TERMINATION_LOG_FILENAME);
+}
+
+/**
+ * TRA-3976 — record that the reconcile dropped a live row for `optionSymbol`
+ * without this ledger ever seeing the close.
+ *
+ * Idempotent per (symbol, ts, positionId): the reconcile sweep runs repeatedly
+ * and a duplicate marker would inflate the census without changing any verdict.
+ * Returns whether a NEW marker was appended, so the caller can count real
+ * events rather than sweeps.
+ *
+ * Best-effort on IO, exactly like {@link recordLiveOptionFill}: a write failure
+ * is COUNTED and swallowed so a reconcile pass can never be broken by this
+ * accounting. ⚠ The in-memory marker still lands — an unwritten marker would
+ * mean the oracle silently returns to reporting the phantom after a reboot, so
+ * the durability of THIS file is published beside the fill ledger's.
+ */
+export function recordReconcileTermination(input: ReconcileTerminationInput): boolean {
+  if (typeof input.optionSymbol !== 'string' || input.optionSymbol === '') return false;
+  if (typeof input.ts !== 'number' || !Number.isFinite(input.ts)) return false;
+  if (!isTerminationSource(input.source)) return false;
+  const positionId = typeof input.positionId === 'string' && input.positionId !== '' ? input.positionId : null;
+  const already = terminations.some(
+    (t) => t.optionSymbol === input.optionSymbol && t.ts === input.ts && t.positionId === positionId,
+  );
+  if (already) return false;
+  const rec: ReconcileTerminationRecord = {
+    mode: 'live',
+    ts: input.ts,
+    etDay: input.etDay,
+    optionSymbol: input.optionSymbol,
+    // `!(x > 0)` rather than `x <= 0` — a NaN reads as a number until something
+    // compares it (TRA-3486), and this figure is published.
+    contractsDropped:
+      typeof input.contractsDropped === 'number' &&
+      Number.isFinite(input.contractsDropped) &&
+      input.contractsDropped > 0
+        ? input.contractsDropped
+        : 0,
+    positionId,
+    source: input.source,
+  };
+  terminations.push(rec);
+  if (dataDir == null) return true;
+  const path = liveOptionReconcileTerminationLogPath(dataDir);
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+  } catch {
+    // exists / unwritable — the append below surfaces the error
+  }
+  try {
+    appendFileSync(path, JSON.stringify(rec) + '\n', 'utf8');
+  } catch (err) {
+    terminationAppendErrors += 1;
+    lastTerminationAppendError = err instanceof Error ? err.message : String(err);
+    log.warn('live-option reconcile-termination append failed', {
+      reason: lastTerminationAppendError,
+    });
+  }
+  return true;
+}
+
+/** TRA-3976 — every retained terminal marker, newest first. */
+export function reconcileTerminations(): ReconcileTerminationRecord[] {
+  return [...terminations].sort((a, b) => b.ts - a.ts);
+}
+
 /**
  * TRA-3918 — why an OPEN-EPISODE walk exists, and why "most recent
  * `buy_to_open`" was the wrong question.
@@ -327,7 +523,11 @@ export type OpenEpisodeStatus =
   | 'flat'
   /** The ledger holds no row at all for this OCC. */
   | 'no_record'
-  /** The ledger's own quantities do not reconcile — it cannot answer. */
+  /**
+   * The ledger cannot state a net position for this OCC — its own quantities do
+   * not reconcile, or (TRA-3976) the reconcile recorded that our book dropped
+   * the OCC through a close this ledger never saw. Read `reason`.
+   */
   | 'indeterminate';
 
 export type OpenEpisodeIndeterminateReason =
@@ -343,7 +543,18 @@ export type OpenEpisodeIndeterminateReason =
    * `contracts` is not validated on hydrate, so a corrupt on-disk row reaches
    * the walk. Netting `NaN` reads as a number until something compares it.
    */
-  | 'unusable_quantity';
+  | 'unusable_quantity'
+  /**
+   * TRA-3976 — the reconcile dropped this OCC from our book while the ledger
+   * still showed contracts open, and wrote a terminal marker saying so. The
+   * arithmetic here is not broken; the ledger simply never saw the close, so it
+   * cannot state a net position for this symbol.
+   *
+   * ⛔ This is a REFUSAL, not `flat`. `flat` says "we opened it and our own
+   * records closed it out" — a FINDING, which the write path is entitled to act
+   * on. Here the close is exactly the thing we have no record of.
+   */
+  | 'reconcile_terminal';
 
 /** TRA-3918 — the currently-open `buy_to_open` episode for one OCC symbol. */
 export interface OpenEpisodeWindow {
@@ -357,6 +568,12 @@ export interface OpenEpisodeWindow {
   netContracts: number;
   /** `sell_to_close` rows the walk consumed before it stopped. */
   closes: number;
+  /**
+   * TRA-3976 — terminal markers the walk consumed. Counted separately from
+   * `closes` because a marker is NOT a close: it is our own record that the
+   * position left the book through a route that produced no fill.
+   */
+  terminations: number;
   /** Set only on `indeterminate`. */
   reason: OpenEpisodeIndeterminateReason | null;
 }
@@ -368,26 +585,90 @@ export function openEpisodeWindow(optionSymbol: string): OpenEpisodeWindow {
   // actually filled in.
   rows.sort((a, b) => a.ts - b.ts);
   if (rows.length === 0) {
-    return { status: 'no_record', fills: [], netContracts: 0, closes: 0, reason: null };
+    // ⚠ TRA-3976 — gated on FILLS, deliberately, and terminal markers do not
+    // widen it. A marker with no `buy_to_open` behind it says our book stopped
+    // holding an OCC whose opens this ledger never held either (retention aged
+    // them out, or no chokepoint ever recorded them); that is `no_record`'s
+    // question and `recordedOpenFillCount` is still the right discriminator for
+    // it. Returning a refusal here would convert an unrelated silence into a
+    // finding about a drop.
+    return { status: 'no_record', fills: [], netContracts: 0, closes: 0, terminations: 0, reason: null };
   }
+
+  // TRA-3976 — walk the fills and the terminal markers as ONE ts-ordered event
+  // stream. A marker is an episode boundary exactly as a flattening close is,
+  // and it has to be ordered against the fills rather than applied afterwards:
+  // an engine re-entry AFTER a drop opens a genuinely new episode the marker
+  // has no business truncating (see the `buy_to_open` branch below).
+  type EpisodeEvent =
+    | { ts: number; order: 0; fill: LiveOptionFillRecord; marker?: undefined }
+    | { ts: number; order: 1; marker: ReconcileTerminationRecord; fill?: undefined };
+  const events: EpisodeEvent[] = rows.map((f) => ({ ts: f.ts, order: 0 as const, fill: f }));
+  for (const t of terminations) {
+    if (t.optionSymbol === optionSymbol) events.push({ ts: t.ts, order: 1 as const, marker: t });
+  }
+  // `order` breaks a ts tie in favour of the FILL: a marker stamped at the same
+  // millisecond as a fill is the drop that followed it, never the drop that
+  // preceded it. Stable sort keeps same-ts fills in append order (above).
+  if (events.length > rows.length) events.sort((a, b) => a.ts - b.ts || a.order - b.order);
 
   const refuse = (
     reason: OpenEpisodeIndeterminateReason,
     closes: number,
-  ): OpenEpisodeWindow => ({ status: 'indeterminate', fills: [], netContracts: 0, closes, reason });
+    terminationCount: number,
+  ): OpenEpisodeWindow => ({
+    status: 'indeterminate',
+    fills: [],
+    netContracts: 0,
+    closes,
+    terminations: terminationCount,
+    reason,
+  });
 
   let episode: LiveOptionFillRecord[] = [];
   let net = 0;
   let closes = 0;
-  for (const f of rows) {
+  let terminationCount = 0;
+  // TRA-3976 — sticky only until the next episode opens off zero. A drop
+  // terminates the episode it dropped and NOTHING after it.
+  let terminated = false;
+  for (const ev of events) {
+    if (ev.marker !== undefined) {
+      terminationCount += 1;
+      // ⛔ The marker is NOT netted against `net`. The premise of the whole
+      // mechanism is that the ledger's arithmetic and the book disagree, so
+      // subtracting `contractsDropped` would be arithmetic on a number we have
+      // just declared unreliable — and a marker for MORE than the ledger shows
+      // would land in `unmatched_close`, filing a reconcile drop as ledger
+      // corruption.
+      if (net > 0) {
+        terminated = true;
+        net = 0;
+        episode = [];
+      }
+      // `net === 0` ⇒ the ledger ALREADY accounts for this OCC being closed (a
+      // real `sell_to_close`, or one the history importer recovered). The
+      // marker is redundant and must not downgrade that clean `flat` FINDING to
+      // a refusal — which is also how this self-heals if the importer later
+      // recovers the broker-side close.
+      continue;
+    }
+    const f = ev.fill;
     const qty = f.contracts;
     if (typeof qty !== 'number' || !Number.isFinite(qty) || qty <= 0) {
-      return refuse('unusable_quantity', closes);
+      return refuse('unusable_quantity', closes, terminationCount);
     }
     if (f.side === 'buy_to_open') {
       // Off zero, this opens a NEW episode — whatever came before is closed and
       // does not get to vote on what we hold now.
-      if (net <= 0) episode = [];
+      if (net <= 0) {
+        episode = [];
+        // TRA-3976 — and neither does an earlier drop. An engine entry on an
+        // OCC we were once dropped out of is an ordinary open with its own fill
+        // record; refusing on it forever would strand the engine's own new
+        // position (AC4's regression, one episode further on).
+        terminated = false;
+      }
       episode.push(f);
       net += qty;
       continue;
@@ -395,14 +676,18 @@ export function openEpisodeWindow(optionSymbol: string): OpenEpisodeWindow {
     closes += 1;
     // A close with nothing open, or closing more than is open, means the ledger
     // is missing rows. Refuse rather than net to zero and call it flat.
-    if (net <= 0 || qty > net) return refuse('unmatched_close', closes);
+    if (net <= 0 || qty > net) return refuse('unmatched_close', closes, terminationCount);
     net -= qty;
     if (net === 0) episode = []; // FLATTENED — the episode is over, permanently.
   }
 
-  return episode.length > 0
-    ? { status: 'open', fills: episode, netContracts: net, closes, reason: null }
-    : { status: 'flat', fills: [], netContracts: 0, closes, reason: null };
+  if (episode.length > 0) {
+    return { status: 'open', fills: episode, netContracts: net, closes, terminations: terminationCount, reason: null };
+  }
+  // TRA-3976 — REFUSAL before FINDING. The episode ended because we dropped it
+  // out of the book, not because our own records closed it out.
+  if (terminated) return refuse('reconcile_terminal', closes, terminationCount);
+  return { status: 'flat', fills: [], netContracts: 0, closes, terminations: terminationCount, reason: null };
 }
 
 /**
@@ -640,6 +925,13 @@ export interface RecordedEngineOpenBasis {
   unpricedFills: number;
   /** Whether the backward walk stopped at a `sell_to_close` (episode boundary). */
   stoppedAtClose: boolean;
+  /**
+   * TRA-3976 — whether the backward walk was bounded by a reconcile TERMINAL
+   * MARKER rather than by a close. Distinct from `stoppedAtClose` because the
+   * two are different facts about the tape: one says our own close ended the
+   * episode, the other says the episode ended without our ever seeing a close.
+   */
+  stoppedAtTermination: boolean;
   /** Fill time of the newest `buy_to_open` in the episode, ms epoch. */
   lastTs: number;
   /**
@@ -700,9 +992,30 @@ export interface RecordedEngineOpenBasis {
 export function recordedEngineOpenBasis(optionSymbol: string): RecordedEngineOpenBasis | null {
   const episode: LiveOptionFillRecord[] = [];
   let stoppedAtClose = false;
+  // ── TRA-3976 — the SECOND episode boundary: a reconcile terminal marker ────
+  // Applied as a ts CUTOFF rather than as a stop-at-this-row, because this walk
+  // is deliberately in ARRAY order (the history importer appends OLDER fills at
+  // the end, TRA-2959) and a marker has no position in that order to stop at.
+  // Any fill at or before the newest marker belongs to an episode our book has
+  // already dropped; only fills strictly AFTER it are the current one.
+  //
+  // A fill stamped at the marker's exact millisecond is treated as PRE-drop.
+  // That is the direction that fails closed here: this oracle answers a BASIS
+  // question, where under-counting over-reports the desk's share and moves no
+  // cap, and over-counting spends the board's authorization on somebody else's
+  // money (see the `enginePlacedContracts` note above).
+  let terminalTs = -Infinity;
+  for (const t of terminations) {
+    if (t.optionSymbol === optionSymbol && t.ts > terminalTs) terminalTs = t.ts;
+  }
+  let stoppedAtTermination = false;
   for (let i = fills.length - 1; i >= 0; i--) {
     const f = fills[i]!;
     if (f.optionSymbol !== optionSymbol) continue;
+    if (f.ts <= terminalTs) {
+      stoppedAtTermination = true;
+      continue;
+    }
     if (f.side === 'sell_to_close') {
       stoppedAtClose = true;
       break;
@@ -761,6 +1074,7 @@ export function recordedEngineOpenBasis(optionSymbol: string): RecordedEngineOpe
     orderIds,
     unpricedFills,
     stoppedAtClose,
+    stoppedAtTermination,
     lastTs,
     enginePlacedContracts,
     // Same divide guard as above, and for the same reason: 0 engine-placed
@@ -809,6 +1123,8 @@ export interface LiveOptionsFeeSlippageHydration {
   records: number;
   /** TRA-2850 — pre-2850 `fees: 0` rows (no feeSource) reset to honest-null this boot. */
   migrated: number;
+  /** TRA-3976 — reconcile terminal markers recovered this boot. */
+  terminations: number;
 }
 
 function isSleeve(v: unknown): v is LiveFillSleeve {
@@ -921,7 +1237,66 @@ export function hydrateLiveOptionsFeeSlippageFromDisk(
       migrated,
     });
   }
-  return { records: kept.length, migrated };
+  // TRA-3976 — the terminal markers hydrate in the SAME call, from the same
+  // dir, under the same retention. A boot that recovered the fills and not the
+  // markers would silently resume publishing the phantom the markers exist to
+  // refuse, and nothing on the wire would say so.
+  hydratedTerminations = hydrateReconcileTerminationsFromDisk(dir, now);
+  return { records: kept.length, migrated, terminations: hydratedTerminations };
+}
+
+/** TRA-3976 — see {@link hydrateLiveOptionsFeeSlippageFromDisk}; compacts the same way. */
+function hydrateReconcileTerminationsFromDisk(dir: string, now: number): number {
+  let raw = '';
+  try {
+    raw = readFileSync(liveOptionReconcileTerminationLogPath(dir), 'utf8');
+  } catch {
+    raw = '';
+  }
+  const cutoff = now - RETAIN_MS;
+  const kept: string[] = [];
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+    let rec: ReconcileTerminationRecord;
+    try {
+      rec = JSON.parse(trimmed) as ReconcileTerminationRecord;
+    } catch {
+      continue; // a torn trailing line is skipped, never thrown on
+    }
+    if (typeof rec.ts !== 'number' || !Number.isFinite(rec.ts) || rec.ts < cutoff) continue;
+    if (typeof rec.optionSymbol !== 'string' || rec.optionSymbol === '') continue;
+    if (!isTerminationSource(rec.source)) continue;
+    const clean: ReconcileTerminationRecord = {
+      mode: 'live',
+      ts: rec.ts,
+      etDay: typeof rec.etDay === 'string' ? rec.etDay : '',
+      optionSymbol: rec.optionSymbol,
+      contractsDropped:
+        typeof rec.contractsDropped === 'number' &&
+        Number.isFinite(rec.contractsDropped) &&
+        rec.contractsDropped > 0
+          ? rec.contractsDropped
+          : 0,
+      positionId: typeof rec.positionId === 'string' && rec.positionId !== '' ? rec.positionId : null,
+      source: rec.source,
+    };
+    terminations.push(clean);
+    kept.push(JSON.stringify(clean));
+  }
+  const nonEmptyLines = raw.split('\n').filter((l) => l.trim() !== '').length;
+  if (kept.length < nonEmptyLines) {
+    const path = liveOptionReconcileTerminationLogPath(dir);
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, kept.length > 0 ? kept.join('\n') + '\n' : '', 'utf8');
+    } catch (err) {
+      log.warn('live-option reconcile-termination compaction failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return kept.length;
 }
 
 // ── TRA-1954: fee back-fill reconcile ────────────────────────────────────────
@@ -2064,6 +2439,161 @@ export interface SlippageSummary {
   medianVsMid: number | null;
 }
 
+// ── TRA-3976 (AC5) — THE CENSUS ─────────────────────────────────────────────
+//
+// The marker fixes every phantom created FROM NOW ON. It cannot fix the one
+// already on the tape (SOFI was dropped on 2026-08-24T13:34:55.545Z, before any
+// build carrying this code), and it cannot prove there is not a second route
+// into the same shape. So the population is COUNTED on the wire.
+//
+// ⛔ THE CENSUS IS AN OBSERVATION, NEVER A WRITER. It is tempting to close the
+// loop — "the ledger says open, the book holds nothing, write a marker" — and
+// that is TRA-2820 with the sign flipped: a row this app really did place whose
+// LOCAL row was lost to a reboot presents identically, and marking it would
+// take the provenance away from a real engine position and leave it at the
+// broker with no stop (8 live contracts, $216, unstopped for a session). The
+// marker has exactly one writer, and it is the one actor holding evidence:
+// the reconcile, at the moment it drops the row, having watched the OCC leave
+// the broker's book across consecutive sweeps.
+//
+// ⚠ AND IT FAILS TO BLIND, NEVER TO CLEAN. With no held-symbol set wired, a
+// phantom and a healthy book are the same bytes — `wired: false` / `blind`, so
+// the absence of the instrument can never read as the absence of the defect.
+
+/** TRA-3976 — one OCC the ledger reports OPEN that our book does not hold. */
+export interface PhantomOpenEpisodeRow {
+  optionSymbol: string;
+  /** Contracts the ledger believes are open. */
+  netContracts: number;
+  /** Of those, the ones backed by a `buy_to_open` the ENGINE placed. */
+  engineOpenContracts: number;
+  /** Of those, the ones whose only evidence is a `history_import` row. */
+  importedOpenContracts: number;
+  /** Fill time of the newest open in the episode, ms epoch. */
+  lastOpenTs: number;
+}
+
+export interface PhantomOpenEpisodeCensus {
+  /** False ⇒ no held-symbol set was supplied; the verdict is `blind`. */
+  wired: boolean;
+  /**
+   * `clean`   — every OCC the ledger reports open is held by the book.
+   * `phantom` — at least one is not. THE DEFECT, and the only value that pages.
+   * `blind`   — not wired. Never folded to `clean`.
+   */
+  verdict: 'clean' | 'phantom' | 'blind';
+  /** Size of the held-symbol set, or null when unwired. */
+  heldSymbols: number | null;
+  /** Distinct OCCs whose ledger episode reads `open`. The denominator. */
+  ledgerOpenEpisodes: number;
+  /** Of those, the ones the book does not hold. `null` when unwired. */
+  phantomEpisodes: number | null;
+  /** Contracts across `rows`. `null` when unwired. */
+  phantomContracts: number | null;
+  rows: PhantomOpenEpisodeRow[] | null;
+  /** Terminal markers retained (the REMEDIATED population, all-time in window). */
+  terminalMarkers: number;
+  /** Distinct OCCs currently answering `indeterminate`/`reconcile_terminal`. */
+  terminatedEpisodes: number;
+  /**
+   * TRA-1681's discipline, applied to the marker file: `ephemeral: true` ⇒ the
+   * markers die at the next redeploy and every terminated episode silently
+   * reverts to reporting its phantom.
+   */
+  durability: {
+    path: string | null;
+    ephemeral: boolean;
+    hydrated: number;
+    appendErrors: number;
+    lastAppendError: string | null;
+  };
+}
+
+/**
+ * TRA-3976 (AC5) — count episodes this ledger reports OPEN that the local book
+ * does not hold.
+ *
+ * @param heldLiveOptionSymbols every OCC symbol on the fleet's LIVE open book
+ *   right now, or `null` when the caller cannot supply one. `null` is the BLIND
+ *   verdict; an EMPTY ARRAY is a real, held-nothing book and grades normally.
+ */
+export function phantomOpenEpisodeCensus(
+  heldLiveOptionSymbols: readonly string[] | null,
+): PhantomOpenEpisodeCensus {
+  const durability = {
+    path: dataDir === null ? null : liveOptionReconcileTerminationLogPath(dataDir),
+    ephemeral: isEphemeralDataDir(dataDir),
+    hydrated: hydratedTerminations,
+    appendErrors: terminationAppendErrors,
+    lastAppendError: lastTerminationAppendError,
+  };
+  const symbols = new Set<string>();
+  for (const f of fills) symbols.add(f.optionSymbol);
+  let ledgerOpenEpisodes = 0;
+  let terminatedEpisodes = 0;
+  const open: Array<{ symbol: string; window: OpenEpisodeWindow }> = [];
+  for (const symbol of symbols) {
+    const window = openEpisodeWindow(symbol);
+    if (window.status === 'open') {
+      ledgerOpenEpisodes += 1;
+      open.push({ symbol, window });
+    } else if (window.status === 'indeterminate' && window.reason === 'reconcile_terminal') {
+      terminatedEpisodes += 1;
+    }
+  }
+  if (heldLiveOptionSymbols === null) {
+    return {
+      wired: false,
+      verdict: 'blind',
+      heldSymbols: null,
+      ledgerOpenEpisodes,
+      phantomEpisodes: null,
+      phantomContracts: null,
+      rows: null,
+      terminalMarkers: terminations.length,
+      terminatedEpisodes,
+      durability,
+    };
+  }
+  const held = new Set(heldLiveOptionSymbols);
+  const rows: PhantomOpenEpisodeRow[] = [];
+  for (const { symbol, window } of open) {
+    if (held.has(symbol)) continue;
+    let engineOpenContracts = 0;
+    let importedOpenContracts = 0;
+    let lastOpenTs = 0;
+    for (const f of window.fills) {
+      const qty = typeof f.contracts === 'number' && Number.isFinite(f.contracts) ? f.contracts : 0;
+      // Same `!== 'history_import'` test as the oracles, and for the same
+      // reason: an unrecognised future origin must not fall silently out of the
+      // engine's column.
+      if (f.origin !== 'history_import') engineOpenContracts += qty;
+      else importedOpenContracts += qty;
+      if (f.ts > lastOpenTs) lastOpenTs = f.ts;
+    }
+    rows.push({
+      optionSymbol: symbol,
+      netContracts: window.netContracts,
+      engineOpenContracts,
+      importedOpenContracts,
+      lastOpenTs,
+    });
+  }
+  rows.sort((a, b) => b.lastOpenTs - a.lastOpenTs);
+  return {
+    wired: true,
+    verdict: rows.length > 0 ? 'phantom' : 'clean',
+    heldSymbols: held.size,
+    ledgerOpenEpisodes,
+    phantomEpisodes: rows.length,
+    phantomContracts: rows.reduce((s, r) => s + r.netContracts, 0),
+    rows,
+    terminalMarkers: terminations.length,
+    terminatedEpisodes,
+    durability,
+  };
+}
+
 export interface LiveOptionsFeeSlippageSummary {
   /** Total fills recorded (open + close, live + hydrated). */
   n: number;
@@ -2094,6 +2624,13 @@ export interface LiveOptionsFeeSlippageSummary {
   lastRecordAt: number | null;
   /** The full record set, most-recent first. */
   records: LiveOptionFillRecord[];
+  /**
+   * TRA-3976 — the reconcile terminal markers, most-recent first. Published
+   * beside `records` and NOT inside it: a marker is not a fill, and folding it
+   * into `records` would put a close that never happened into `closes`, into
+   * the oversold-close census and into the history-coverage diff.
+   */
+  reconcileTerminations: ReconcileTerminationRecord[];
 }
 
 /**
@@ -2150,5 +2687,6 @@ export function summarizeLiveOptionsFeeSlippage(): LiveOptionsFeeSlippageSummary
     },
     lastRecordAt,
     records,
+    reconcileTerminations: reconcileTerminations(),
   };
 }
