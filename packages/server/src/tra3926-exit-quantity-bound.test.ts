@@ -35,6 +35,7 @@ import { PaperOptionsAccount } from './options-account.js';
 import {
   clearLiveOptionsFeeSlippageLedger,
   recordLiveOptionFill,
+  engineNetOpenContracts,
   type LiveOptionFillRecord,
 } from './live-options-fee-slippage-ledger.js';
 import { boundExitContractsToEngineShare } from './option-exec-flag.js';
@@ -378,6 +379,7 @@ describe('TRA-3926 AC2 — a row the oracle cannot answer for is BLIND, and coun
       2,
       () => { throw new Error('the oracle must not be consulted on a foreign row'); },
       false,
+      () => null,
     );
     expect(bound).toMatchObject({
       exitContracts: 0,
@@ -428,6 +430,7 @@ describe('TRA-3926 x TRA-3829 ruling B — an explicit hand-over still exits in 
       2,
       () => { consulted += 1; return null; },
       true,
+      () => null,
     );
     expect(bound).toMatchObject({ exitContracts: 2, refusedContracts: 0, reason: 'handed_over' });
     expect(consulted).toBe(0);
@@ -448,6 +451,7 @@ describe('TRA-3926 x TRA-3829 ruling B — an explicit hand-over still exits in 
       2,
       partialOracle,
       true,
+      () => null,
     );
     expect(bound).toMatchObject({
       exitContracts: 1,
@@ -471,6 +475,7 @@ describe('TRA-3926 x TRA-3829 ruling B — an explicit hand-over still exits in 
       2,
       partialOracle,
       false,
+      () => null,
     );
     expect(bound.reason).toBe('engine_partial');
     expect(bound.exitContracts).toBe(1);
@@ -500,14 +505,14 @@ describe('TRA-3926 boundExitContractsToEngineShare — total over its input spac
     // A partial CLOSE truncates the episode window and a partial close on the
     // ROW shrinks the remainder; the two move independently.
     expect(
-      boundExitContractsToEngineShare(engineOriginRow, 2, 2, oracle(5), false).exitContracts,
+      boundExitContractsToEngineShare(engineOriginRow, 2, 2, oracle(5), false, () => null).exitContracts,
     ).toBe(2);
   });
 
   it('a NaN request coerces to 0 rather than reaching the broker as a quantity', () => {
     // `Math.min(NaN, 1)` is `NaN`, and a NaN quantity reads as a number until
     // something compares it (TRA-3486).
-    const bound = boundExitContractsToEngineShare(engineOriginRow, Number.NaN, 2, oracle(1), false);
+    const bound = boundExitContractsToEngineShare(engineOriginRow, Number.NaN, 2, oracle(1), false, () => null);
     expect(bound.exitContracts).toBe(0);
     expect(bound.requestedContracts).toBe(0);
     // Nothing was refused: nothing was asked for. A zero request is not an alarm.
@@ -522,6 +527,7 @@ describe('TRA-3926 boundExitContractsToEngineShare — total over its input spac
         2,
         () => null,
         false,
+        () => null,
       ),
     ).toMatchObject({ exitContracts: 2, reason: 'sandbox_import' });
   });
@@ -537,6 +543,7 @@ describe('TRA-3926 boundExitContractsToEngineShare — total over its input spac
       2,
       () => { consulted += 1; return partialOracle(); },
       false,
+      () => null,
     );
     expect(consulted).toBe(1);
     expect(bound).toMatchObject({ exitContracts: 1, refusedContracts: 1, reason: 'engine_partial' });
@@ -692,5 +699,245 @@ describe('TRA-3926 AC5 — the detector for the condition that has ALREADY occur
     expect(census.findings).toHaveLength(1);
     expect(census.judgedCloses).toBe(2);
     expect(census.excessContracts).toBe(1);
+  });
+});
+
+// ─── TRA-3926 second oracle (2026-08-24) — OUR OWN CLOSE USED TO BLIND US ────
+//
+// Found on the wire during the 24T13:15Z monitor beat, on the FIXED build
+// (`3d0c3582`), over a row that was on the live book at the time:
+//
+//     BAC260925C00063000  08-20 13:36:23Z  buy_to_open   1 @1.65  origin=fill
+//                         08-20 17:00:00Z  buy_to_open   1 @1.17  origin=history_import
+//                         08-21 17:05:10Z  sell_to_close 1 @0.91  origin=fill
+//
+// `recordedEngineOpenBasis` walks backward and STOPS at the first close, so it
+// returned `null` — and on the write path `null` had meant "sell the row's
+// quantity". The one contract left is the desk's ($117.00 of `adoptedUsd` in
+// the SAME process, on the operator's own basis pin), and the fix shipped to
+// stop exactly this could not see it.
+//
+// ⚠ THE IDENTICAL BYTE IS CONSERVATIVE FOR THE READER AND PERMISSIVE FOR THE
+// WRITER. That is what these tests pin, and why the repair is a SECOND oracle
+// rather than a change to the first one — `foldOpenPremiumAtRisk` is the first
+// one's other caller and TRA-3911 closed on its numbers.
+describe('TRA-3926 second oracle — the engine may not sell what its own closes already consumed', () => {
+  const BAC = 'BAC260925C00063000';
+  const BAC_ENGINE_AT = Date.parse('2026-08-20T13:36:23Z');
+  const BAC_DESK_AT = Date.parse('2026-08-20T17:00:00Z');
+  const BAC_CLOSE_AT = Date.parse('2026-08-21T17:05:10Z');
+
+  function fill(
+    over: Partial<LiveOptionFillRecord> & { ts: number; side: 'buy_to_open' | 'sell_to_close' },
+  ): void {
+    recordLiveOptionFill({
+      etDay: '2026-08-20',
+      sleeve: 'single_leg_otm',
+      optionSymbol: BAC,
+      contracts: 1,
+      filledPrice: 1.0,
+      orderId: 142603649,
+      ...over,
+    } as LiveOptionFillRecord);
+  }
+
+  /** The live tape, verbatim. */
+  function theLiveTape(): void {
+    fill({ ts: BAC_ENGINE_AT, side: 'buy_to_open', filledPrice: 1.65, orderId: 142603649 });
+    fill({
+      ts: BAC_DESK_AT,
+      side: 'buy_to_open',
+      filledPrice: 1.17,
+      orderId: null,
+      origin: 'history_import',
+      sleeve: 'unattributed',
+    });
+    fill({
+      ts: BAC_CLOSE_AT,
+      side: 'sell_to_close',
+      filledPrice: 0.91,
+      orderId: 142899523,
+      etDay: '2026-08-21',
+    });
+  }
+
+  const deskRow = {
+    importedFromTradier: true,
+    adoptionAuthority: 'engine_origin',
+    tradierEnv: 'production',
+  };
+  /** The first oracle, refusing exactly as it does on the live tape. */
+  const silent = () => null;
+  const netOracle = () => engineNetOpenContracts(BAC);
+
+  it('reports the live BAC account: one ours, one the desk’s, our close consumed OURS', () => {
+    theLiveTape();
+    expect(engineNetOpenContracts(BAC)).toEqual({
+      status: 'open',
+      netContracts: 1,
+      engineOpenContracts: 1,
+      importedOpenContracts: 1,
+      closedContracts: 1,
+      // THE NUMBER. `max(0, 1 − 1) = 0` — the engine may sell nothing here.
+      engineNetContracts: 0,
+      reason: null,
+    });
+  });
+
+  it('binds the live BAC row to ZERO, and calls it a finding rather than a refusal', () => {
+    theLiveTape();
+    const bound = boundExitContractsToEngineShare(deskRow, 1, 1, silent, false, netOracle);
+    expect(bound).toMatchObject({
+      exitContracts: 0,
+      refusedContracts: 1,
+      reason: 'engine_net_of_closes',
+      // The oracle ANSWERED. A finding wants the desk to close its own
+      // contract; a refusal wants somebody to look at the ledger.
+      oracleRefused: false,
+      blind: false,
+      bounded: true,
+      netOfCloses: true,
+    });
+  });
+
+  // ⚠ THE CONTROL THAT STOPS THIS BEING "ALWAYS REFUSE AFTER A CLOSE".
+  // The live tape carries three OCCs with two `sell_to_close` rows each
+  // (TSLA260911C00560000, AAPL260904P00280000, SPY260904C00816000), so TP1
+  // partials are real. Under the naive rule — "the episode holds a close, so we
+  // hold zero" — the engine could never exit the remainder of its OWN position.
+  it('a TP1 partial still exits its own remainder: opens 2, closes 1, exits 1', () => {
+    fill({ ts: BAC_ENGINE_AT, side: 'buy_to_open', filledPrice: 1.65, orderId: 142603649 });
+    fill({ ts: BAC_ENGINE_AT + 1_000, side: 'buy_to_open', filledPrice: 1.7, orderId: 142603650 });
+    fill({ ts: BAC_CLOSE_AT, side: 'sell_to_close', filledPrice: 2.4, orderId: 142899523 });
+
+    expect(engineNetOpenContracts(BAC)).toMatchObject({
+      status: 'open',
+      netContracts: 1,
+      engineOpenContracts: 2,
+      closedContracts: 1,
+      engineNetContracts: 1,
+    });
+    const bound = boundExitContractsToEngineShare(deskRow, 1, 1, silent, false, netOracle);
+    expect(bound).toMatchObject({
+      exitContracts: 1,
+      refusedContracts: 0,
+      bounded: false,
+      netOfCloses: true,
+    });
+  });
+
+  it('TRA-2820’s shape — NO record for the OCC — stays BLIND, and must', () => {
+    // A row this app really did place, whose local row was lost to a reboot.
+    // Binding here is how the strict reading of AC2 leaves 8 live contracts and
+    // $216 of real premium open under a breached stop with no exit at all.
+    const bound = boundExitContractsToEngineShare(deskRow, 2, 2, silent, false, netOracle);
+    expect(bound).toMatchObject({
+      exitContracts: 2,
+      blind: true,
+      oracleRefused: true,
+      netOfCloses: false,
+      reason: 'oracle_silent',
+    });
+  });
+
+  it('an import-only episode stays BLIND even with a close in it', () => {
+    // The ledger says the BROKER bought this OCC. It never says the DESK did —
+    // TRA-2959 measured 7 of 11 filled orders never reaching the ledger, and
+    // TRA-3932 refuted the fetch that could tell them apart (Tradier's order
+    // surface is a ONE-TRADING-DAY window).
+    fill({
+      ts: BAC_DESK_AT, side: 'buy_to_open', filledPrice: 1.17, orderId: null, origin: 'history_import',
+    });
+    fill({
+      ts: BAC_DESK_AT + 1_000, side: 'buy_to_open', filledPrice: 1.2, orderId: null, origin: 'history_import',
+    });
+    fill({ ts: BAC_CLOSE_AT, side: 'sell_to_close', filledPrice: 0.91, orderId: 142899523 });
+
+    expect(engineNetOpenContracts(BAC)).toMatchObject({ status: 'open', engineOpenContracts: 0 });
+    const bound = boundExitContractsToEngineShare(deskRow, 1, 1, silent, false, netOracle);
+    expect(bound).toMatchObject({ exitContracts: 1, blind: true, netOfCloses: false });
+  });
+
+  it('a ledger whose own arithmetic does not close stays BLIND, not zero', () => {
+    // `unmatched_close` — retention aged the opens out, or the importer
+    // recovered one leg of a round trip and not the other. A refusal is not a
+    // finding, and 0-because-none is not 0-because-unknown.
+    fill({ ts: BAC_ENGINE_AT, side: 'buy_to_open', filledPrice: 1.65, orderId: 142603649 });
+    fill({ ts: BAC_CLOSE_AT, side: 'sell_to_close', contracts: 4, filledPrice: 0.91, orderId: 142899523 });
+
+    expect(engineNetOpenContracts(BAC)).toMatchObject({
+      status: 'indeterminate',
+      reason: 'unmatched_close',
+      engineNetContracts: 0,
+    });
+    const bound = boundExitContractsToEngineShare(deskRow, 1, 1, silent, false, netOracle);
+    expect(bound).toMatchObject({ exitContracts: 1, blind: true, netOfCloses: false });
+  });
+
+  it('a FLAT episode stays BLIND: the ledger is exhausted and the broker still shows contracts', () => {
+    // The TRA-2959 shape. The residue at the broker is as likely a fill of ours
+    // the chokepoint missed as it is the desk's, and this instrument cannot say.
+    fill({ ts: BAC_ENGINE_AT, side: 'buy_to_open', filledPrice: 1.65, orderId: 142603649 });
+    fill({ ts: BAC_CLOSE_AT, side: 'sell_to_close', filledPrice: 0.91, orderId: 142899523 });
+
+    expect(engineNetOpenContracts(BAC)).toMatchObject({ status: 'flat', engineNetContracts: 0 });
+    const bound = boundExitContractsToEngineShare(deskRow, 1, 1, silent, false, netOracle);
+    expect(bound).toMatchObject({ exitContracts: 1, blind: true, netOfCloses: false });
+  });
+
+  it('can only ever LOWER — a bigger engine share never widens the request', () => {
+    fill({ ts: BAC_ENGINE_AT, side: 'buy_to_open', contracts: 6, filledPrice: 1.65, orderId: 142603649 });
+    fill({ ts: BAC_CLOSE_AT, side: 'sell_to_close', filledPrice: 0.91, orderId: 142899523 });
+
+    expect(engineNetOpenContracts(BAC)).toMatchObject({ engineNetContracts: 5 });
+    const bound = boundExitContractsToEngineShare(deskRow, 2, 2, silent, false, netOracle);
+    expect(bound.exitContracts).toBe(2);
+    expect(bound.bounded).toBe(false);
+  });
+
+  it('never runs on a row the FIRST oracle could answer — no double jeopardy', () => {
+    // `engine_partial` is a complete positive account. Consulting a second
+    // oracle there would let a ledger gap OVERRULE a measured finding.
+    let consulted = 0;
+    const bound = boundExitContractsToEngineShare(
+      { importedFromTradier: true, adoptionAuthority: 'engine_origin' },
+      2,
+      2,
+      partialOracle,
+      false,
+      () => {
+        consulted += 1;
+        return null;
+      },
+    );
+    expect(consulted).toBe(0);
+    expect(bound).toMatchObject({ exitContracts: 1, reason: 'engine_partial', netOfCloses: false });
+  });
+
+  it('never runs on a HANDED-OVER row — ruling B is not narrowed by a ledger nobody read', () => {
+    let consulted = 0;
+    const bound = boundExitContractsToEngineShare(
+      {
+        importedFromTradier: true,
+        adoptionAuthority: 'foreign',
+        tradierEnv: 'production',
+        engineHandover: { grantedAt: '2026-08-21T13:00:00.000Z', grantedBy: 'board-member' },
+      },
+      2,
+      2,
+      silent,
+      true,
+      () => {
+        consulted += 1;
+        return null;
+      },
+    );
+    expect(consulted).toBe(0);
+    expect(bound).toMatchObject({ exitContracts: 2, reason: 'handed_over', netOfCloses: false });
+  });
+
+  it('an UNASKABLE row — no OCC — reaches the refusal by decision, not by a lookup for the empty string', () => {
+    const bound = boundExitContractsToEngineShare(deskRow, 1, 1, silent, false, () => null);
+    expect(bound).toMatchObject({ exitContracts: 1, blind: true, netOfCloses: false });
   });
 });

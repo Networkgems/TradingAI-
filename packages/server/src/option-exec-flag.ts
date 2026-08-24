@@ -533,7 +533,7 @@ export interface EngineExitQuantityBound {
    * `handed_over` sentinel when a human's per-row grant lifted the bound before
    * the split was consulted.
    */
-  reason: EngineExposureReason | 'handed_over';
+  reason: EngineExposureReason | 'handed_over' | 'engine_net_of_closes';
   /**
    * True iff the oracle COULD NOT ANSWER for this row, rather than answering
    * and finding the contracts are not ours. Same discipline as
@@ -554,6 +554,36 @@ export interface EngineExitQuantityBound {
   blind: boolean;
   /** True iff the bound actually reduced the quantity. The countable event. */
   bounded: boolean;
+  /**
+   * TRA-3926 (2026-08-24) — true iff the answer came from the SECOND oracle,
+   * `engineNetOpenContracts`, after the first one refused. Counted separately
+   * from `bounded` because it is the population that used to be `blind`, and
+   * "the residual fail-open shrank by N" is the only claim this fix can make
+   * that a quiet tape cannot manufacture.
+   */
+  netOfCloses: boolean;
+}
+
+/**
+ * TRA-3926 (2026-08-24) — the WRITE path's second oracle, consulted only where
+ * the first one refuses. Structural mirror of
+ * `live-options-fee-slippage-ledger.ts`'s `EngineNetOpenAccount`; see that
+ * function's docblock for the rule and for the four refusals it will not answer
+ * through.
+ */
+export interface EngineNetOpenEvidence {
+  /** `'open'` is the only status this bound may act on. */
+  status: string;
+  /** Contracts the ledger believes are open on this OCC right now. */
+  netContracts: number;
+  /** Of the open episode's opens, the ones the ENGINE placed. */
+  engineOpenContracts: number;
+  /** Of the same opens, the ones whose only evidence is a `history_import`. */
+  importedOpenContracts: number;
+  /** Contracts the episode's closes consumed. */
+  closedContracts: number;
+  /** `min(netContracts, max(0, engineOpen − closed))`. */
+  engineNetContracts: number;
 }
 
 /**
@@ -655,6 +685,15 @@ export function boundExitContractsToEngineShare(
   remainingContracts: number,
   lookupRecordedOpenBasis: () => EngineRecordedOpenEvidence | null,
   armed: boolean,
+  /**
+   * TRA-3926 (2026-08-24) — the SECOND oracle, consulted ONLY on the branch
+   * where the first one refused. Lazy for the same reason as its sibling, and
+   * separate rather than folded into it because
+   * {@link EngineRecordedOpenEvidence} is TRA-3913's READER contract and
+   * `foldOpenPremiumAtRisk` is its other caller: re-shaping the walk that feeds
+   * the fold would move numbers TRA-3911 closed on.
+   */
+  lookupNetOpenAccount: () => EngineNetOpenEvidence | null,
 ): EngineExitQuantityBound {
   const requested =
     Number.isFinite(requestedContracts) && requestedContracts > 0 ? Math.floor(requestedContracts) : 0;
@@ -670,10 +709,53 @@ export function boundExitContractsToEngineShare(
       oracleRefused: false,
       blind: false,
       bounded: false,
+      netOfCloses: false,
     };
   }
   const split = splitEngineExposureContracts(row, remainingContracts, lookupRecordedOpenBasis);
   if (split.oracleRefused) {
+    // ── SECOND ORACLE (TRA-3926, 2026-08-24) ──────────────────────────────
+    // The first oracle's episode walk truncates at the first `sell_to_close`,
+    // so an OCC we bought and then CLOSED reads as silence — and on the write
+    // path silence had meant "sell the row's quantity". Measured live on
+    // `3d0c3582` over `BAC260925C00063000`: engine bought 1, desk added 1, we
+    // sold 1, and the one contract left — which the FOLD was attributing 100%
+    // to the desk in the same process — was staged to be sold by us.
+    //
+    // ⛔ IT CAN ONLY LOWER. Every path below returns `min(requested, …)`, and
+    // every refusal falls through to the BLIND branch unchanged, which is the
+    // pre-fix quantity. There is no input on which consulting this widens an
+    // exit, so it cannot re-open TRA-2820 through the front door either.
+    const net = lookupNetOpenAccount();
+    if (net !== null && net.status === 'open' && net.engineOpenContracts > 0) {
+      // `engineOpenContracts > 0` is the positive witness the whole branch
+      // rests on: the ledger holds a `buy_to_open` WE placed on this OCC in the
+      // episode that is open right now, so it is demonstrably not dark for it.
+      // An import-only episode fails this test and stays BLIND — a
+      // `history_import` row is evidence about the ACCOUNT, never about who
+      // placed the order (TRA-3913), and TRA-3932 refuted the fetch that could
+      // have told them apart.
+      const share =
+        Number.isFinite(net.engineNetContracts) && net.engineNetContracts > 0
+          ? Math.floor(net.engineNetContracts)
+          : 0;
+      const exitContracts = Math.min(requested, share);
+      const refusedContracts = requested - exitContracts;
+      return {
+        exitContracts,
+        refusedContracts,
+        requestedContracts: requested,
+        reason: 'engine_net_of_closes',
+        // The oracle ANSWERED. Keeping `oracleRefused` true here would report a
+        // measured finding as a refusal, and the two want different remedies:
+        // a finding wants the desk to close its own contract, a refusal wants
+        // somebody to look at the ledger.
+        oracleRefused: false,
+        blind: false,
+        bounded: refusedContracts > 0,
+        netOfCloses: true,
+      };
+    }
     // BLIND. See the rule note above: binding on a dark instrument is how the
     // strict reading of AC2 re-creates TRA-2820. The exit goes out at the
     // quantity the rule asked for and the caller COUNTS this.
@@ -685,6 +767,7 @@ export function boundExitContractsToEngineShare(
       oracleRefused: true,
       blind: true,
       bounded: false,
+      netOfCloses: false,
     };
   }
   // `Math.min` against a floored, positive-checked `requested` — a NaN request
@@ -701,6 +784,7 @@ export function boundExitContractsToEngineShare(
     oracleRefused: false,
     blind: false,
     bounded: refusedContracts > 0,
+    netOfCloses: false,
   };
 }
 

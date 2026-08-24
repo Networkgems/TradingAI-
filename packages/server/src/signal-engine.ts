@@ -8755,6 +8755,13 @@ export class SignalEngine {
     refusedContracts: number;
     blindRows: number;
     suppressedExits: number;
+    /**
+     * TRA-3926 (2026-08-24) — staging sites the SECOND oracle answered
+     * after the first refused. Every one of these WAS a `blindRows`, so
+     * read the pair; `netOfCloses 0` alone cannot tell "nothing needed it"
+     * from "the branch is unreachable".
+     */
+    netOfCloses: number;
     lastRefusalAt: number | null;
   } {
     let checked = 0;
@@ -8762,6 +8769,7 @@ export class SignalEngine {
     let refusedContracts = 0;
     let blindRows = 0;
     let suppressedExits = 0;
+    let netOfCloses = 0;
     let lastRefusalAt: number | null = null;
     for (const env of ['sandbox', 'production'] as const) {
       const c = this.optionsAccounts[env].getExitQuantityBoundCensus();
@@ -8770,10 +8778,13 @@ export class SignalEngine {
       refusedContracts += c.refusedContracts;
       blindRows += c.blindRows;
       suppressedExits += c.suppressedExits;
+      netOfCloses += c.netOfCloses;
       const at = c.last?.at ?? null;
       if (at !== null && (lastRefusalAt === null || at > lastRefusalAt)) lastRefusalAt = at;
     }
-    return { checked, bounded, refusedContracts, blindRows, suppressedExits, lastRefusalAt };
+    return {
+      checked, bounded, refusedContracts, blindRows, suppressedExits, netOfCloses, lastRefusalAt,
+    };
   }
 
   /**

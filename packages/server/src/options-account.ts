@@ -71,6 +71,10 @@ import {
   // of this ticket turn on, and the only source for it that is neither the
   // broker's blend nor a request body.
   recordedEngineOpenBasis,
+  // TRA-3926 — the WRITE path's oracle: how many of an OCC's open contracts our
+  // OWN records account for, netted against the closes we already took. The
+  // reader's basis above truncates at the first close and so cannot answer it.
+  engineNetOpenContracts,
   type RecordedEngineOpenBasis,
   type LiveFillSleeve,
 } from './live-options-fee-slippage-ledger.js';
@@ -3407,6 +3411,14 @@ export class PaperOptionsAccount {
   private exitQuantityBlindRows = 0;
   /** TRA-3926 — staging sites suppressed entirely (nothing provably ours). */
   private exitQuantitySuppressedExits = 0;
+  /**
+   * TRA-3926 (2026-08-24) — staging sites the SECOND oracle answered after the
+   * first refused. Every one of these would have been a `blindRows` before, so
+   * the pair is the only honest measure of what the tightening actually moved:
+   * a quiet tape cannot manufacture it, and `netOfCloses 0 / blindRows 0` says
+   * the branch was never reached rather than that it works.
+   */
+  private exitQuantityNetOfCloses = 0;
   /**
    * TRA-3926 — per-row de-dupe key for the refusal warn. `checkExits` runs on
    * every tick and a permanently-refused row would otherwise emit the same line
@@ -7048,12 +7060,21 @@ export class PaperOptionsAccount {
       // TRA-3829 ruling B's master arm, for the per-row HAND-OVER carve-out
       // only — the same value the authorisation gate above this call resolved.
       this.actOnAdoptedBrokerRows,
+      // TRA-3926 (2026-08-24) — the second oracle, reached only where the first
+      // refuses. Same UNASKABLE guard and for the same reason: a row with no OCC
+      // symbol must reach the refusal by DECISION, not by walking the ledger for
+      // `''` and finding nothing.
+      () =>
+        typeof opt.optionSymbol === 'string' && opt.optionSymbol.length > 0
+          ? engineNetOpenContracts(opt.optionSymbol)
+          : null,
     );
     // The denominator is scoped to the population the bound can BITE on. A demo
     // box stages exits all day and none of them are imported; counting those
     // here would bury the one number that matters under a rising `checked` that
     // proves nothing about live imported rows.
     if (opt.importedFromTradier === true) this.exitQuantityChecked += 1;
+    if (bound.netOfCloses) this.exitQuantityNetOfCloses += 1;
     // BLIND — the oracle could not make a complete positive statement about
     // this row, so the exit goes out UNBOUNDED (the pre-fix quantity). Counted,
     // never silent: this is the residual fail-open the fix does not close, and
@@ -9673,6 +9694,14 @@ export class PaperOptionsAccount {
     blindRows: number;
     /** Staging sites that were suppressed entirely (`exitContracts === 0`). */
     suppressedExits: number;
+    /**
+     * TRA-3926 (2026-08-24) — of `checked`, the ones the SECOND oracle answered
+     * after the first refused. **Read it against `blindRows`, never alone:**
+     * every one of these was a `blindRows` before the tightening, so the pair is
+     * the coverage statement, and `netOfCloses 0` on its own cannot distinguish
+     * "the branch works and nothing needed it" from "the branch is unreachable".
+     */
+    netOfCloses: number;
     /** Newest refusal, for the health route's operator line. */
     last: {
       at: number;
@@ -9690,6 +9719,7 @@ export class PaperOptionsAccount {
       refusedContracts: this.exitQuantityRefusedContracts,
       blindRows: this.exitQuantityBlindRows,
       suppressedExits: this.exitQuantitySuppressedExits,
+      netOfCloses: this.exitQuantityNetOfCloses,
       last: this.exitQuantityLastRefusal === null ? null : { ...this.exitQuantityLastRefusal },
     };
   }

@@ -11836,6 +11836,10 @@ app.get('/api/health/options-live', async (_req, res) => {
             refusedContracts: acc.refusedContracts + s.refusedContracts,
             blindRows: acc.blindRows + s.blindRows,
             suppressedExits: acc.suppressedExits + s.suppressedExits,
+            // TRA-3926 (2026-08-24) — the second oracle's coverage. Published
+            // BESIDE `blindRows` and never instead of it: this counter only
+            // means something as the pair `netOfCloses / blindRows`.
+            netOfCloses: acc.netOfCloses + s.netOfCloses,
             lastRefusalAt:
               s.lastRefusalAt !== null
               && (acc.lastRefusalAt === null || s.lastRefusalAt > acc.lastRefusalAt)
@@ -11849,6 +11853,7 @@ app.get('/api/health/options-live', async (_req, res) => {
           refusedContracts: 0,
           blindRows: 0,
           suppressedExits: 0,
+          netOfCloses: 0,
           lastRefusalAt: null as number | null,
         },
       ),

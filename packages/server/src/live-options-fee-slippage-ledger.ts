@@ -406,6 +406,134 @@ export function openEpisodeWindow(optionSymbol: string): OpenEpisodeWindow {
 }
 
 /**
+ * TRA-3926 (2026-08-24) — how many of an OCC's currently-open contracts THIS
+ * ENGINE's own records account for, netted against the closes we have already
+ * taken. The WRITE path's oracle; {@link recordedEngineOpenBasis} is the
+ * reader's and they must not be swapped.
+ *
+ * ── Why the reader's oracle cannot answer this, measured on live money ──────
+ * `recordedEngineOpenBasis` walks BACKWARD and stops at the first
+ * `sell_to_close` it meets, then returns `null` on an empty episode. The
+ * docblock above says that truncation "fails closed" — and it does, FOR A
+ * READER, whose refusal routes the dollars to the desk. On the WRITE path the
+ * same `null` becomes `oracleRefused` and
+ * {@link boundExitContractsToEngineShare}'s BLIND branch, which exits at the
+ * ROW's quantity. **The identical byte is conservative for the reader and
+ * permissive for the writer.**
+ *
+ * Live on bqb1 `3d0c3582`, 2026-08-24T13:26Z, with the TRA-3926 fix DEPLOYED:
+ *
+ *     BAC260925C00063000  08-20 13:36:23Z  buy_to_open   1 @1.65  origin=fill
+ *                         08-20 17:00:00Z  buy_to_open   1 @1.17  origin=history_import
+ *                         08-21 17:05:10Z  sell_to_close 1 @0.91  origin=fill
+ *
+ * `recordedEngineOpenBasis('BAC…')` → `null` (episode empty, stopped at the
+ * close), so the bound went BLIND over a row `foldOpenPremiumAtRisk` was
+ * simultaneously attributing 100% to the desk ($117.00 of `adoptedUsd`, on the
+ * operator's own basis pin). One contract left, bought by the desk, and the
+ * fix shipped to stop exactly that could not see it.
+ *
+ * ── The rule: our own closes are charged against our own lots FIRST ─────────
+ * Built on {@link openEpisodeWindow}, not on a fourth walk — that one is
+ * `ts`-ordered (imports append out of order, TRA-2959), tracks the boundary by
+ * NET contracts rather than by the first close, and already separates its three
+ * "no" states. Within the currently-open episode:
+ *
+ *     closedContracts = Σ(episode opens) − netContracts
+ *     engineNetContracts = min(netContracts, max(0, engineOpenContracts − closedContracts))
+ *
+ * Charging our closes to our own lots first is the only assignment that can
+ * never let us sell somebody else's contract, and the ledger cannot tell us
+ * which lot an exit consumed (TRA-3703 — `adopted` is the ledger echoing its own
+ * convention). BAC → `1 − 1 = 0` ⇒ the engine may sell NOTHING. A TP1 partial
+ * (open 2, close 1) → `2 − 1 = 1` ⇒ it still exits its own remainder, which is
+ * the case the naive "a closed episode means we hold zero" rule breaks and
+ * which the live tape carries three times over (`TSLA260911C00560000`,
+ * `AAPL260904P00280000`, `SPY260904C00816000` each hold two closes).
+ *
+ * ── What it refuses to answer, and why each refusal is load-bearing ─────────
+ * `no_record` — TRA-2820's shape exactly: a row this app really did place whose
+ * local row was lost to a reboot. Binding on it re-creates that incident (8 live
+ * contracts, $216, unstopped for a session). `indeterminate` — the ledger's own
+ * arithmetic does not close. `flat` — the ledger's records are exhausted and the
+ * broker still shows contracts, i.e. the TRA-2959 shape (7 of 11 filled orders
+ * never reached the ledger), so the residue is as likely ours as the desk's.
+ * `engineOpenContracts === 0` — an import-only episode says the BROKER bought
+ * this OCC, never that the DESK did (TRA-3932 refuted the fetch that could tell
+ * them apart: Tradier's order surface is a one-trading-day window).
+ *
+ * Each of those keeps the caller BLIND, which is the pre-fix quantity. This
+ * oracle can only ever LOWER what the engine submits; there is no input on which
+ * it widens one.
+ */
+export interface EngineNetOpenAccount {
+  /** {@link openEpisodeWindow}'s verdict, passed through unchanged. */
+  status: OpenEpisodeStatus;
+  /** Contracts the ledger believes are open on this OCC right now. */
+  netContracts: number;
+  /** Of the open episode's `buy_to_open` rows, the ones the ENGINE placed. */
+  engineOpenContracts: number;
+  /** Of the same rows, the ones whose only evidence is a `history_import`. */
+  importedOpenContracts: number;
+  /** Contracts the episode's closes consumed: `Σ opens − netContracts`. */
+  closedContracts: number;
+  /**
+   * The bound's answer: `min(netContracts, max(0, engineOpen − closed))`.
+   * `0` on every refusing status, which is why callers MUST branch on `status`
+   * and never on this number alone — 0-because-we-hold-none and
+   * 0-because-we-cannot-say are the same bytes here (TRA-3913 AC2).
+   */
+  engineNetContracts: number;
+  /** Set only on `indeterminate`. */
+  reason: OpenEpisodeIndeterminateReason | null;
+}
+
+export function engineNetOpenContracts(optionSymbol: string): EngineNetOpenAccount {
+  const window = openEpisodeWindow(optionSymbol);
+  const blank = {
+    status: window.status,
+    netContracts: 0,
+    engineOpenContracts: 0,
+    importedOpenContracts: 0,
+    closedContracts: 0,
+    engineNetContracts: 0,
+    reason: window.reason,
+  };
+  if (window.status !== 'open') return blank;
+
+  let openContracts = 0;
+  let engineOpenContracts = 0;
+  let importedOpenContracts = 0;
+  for (const f of window.fills) {
+    const qty = f.contracts;
+    // `openEpisodeWindow` already refused every non-positive-finite quantity,
+    // so this cannot fire — re-checked rather than asserted because a silent
+    // `NaN` here would propagate into an order quantity (TRA-3486).
+    if (typeof qty !== 'number' || !Number.isFinite(qty) || qty <= 0) return blank;
+    openContracts += qty;
+    // Same `!== 'history_import'` test as `recordedEngineOpenBasis`, and for the
+    // same reason: pre-TRA-2959 rows hydrate as `origin: 'fill'`, and an
+    // unrecognised future origin must not silently fall out of OUR share — on
+    // this path "ours" is the side that lets us keep exiting our own position.
+    if (f.origin !== 'history_import') engineOpenContracts += qty;
+    else importedOpenContracts += qty;
+  }
+  const closedContracts = openContracts - window.netContracts;
+  return {
+    status: 'open',
+    netContracts: window.netContracts,
+    engineOpenContracts,
+    importedOpenContracts,
+    closedContracts,
+    engineNetContracts: Math.min(
+      window.netContracts,
+      Math.max(0, engineOpenContracts - closedContracts),
+    ),
+    reason: null,
+  };
+}
+
+/**
  * TRA-2811 — the sleeve the most recent `buy_to_open` row recorded for this
  * contract, or null when the ledger holds no open for it. The close-side
  * recorder MUST prefer this over re-deriving from the position object: on
