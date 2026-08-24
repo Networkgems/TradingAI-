@@ -454,6 +454,31 @@ describe('TRA-3945 population cell (QuantTrader scope note 88ccac56 — ONE delt
       expect(r2.n).toBe(1);
     });
 
+    it('an INELIGIBLE row never displaces an eligible one as the representative — the layer runs LAST', () => {
+      const s = opened();
+      // The live case exactly: v0nni entered FIRST (14:25:07Z) but its
+      // `entryDelta` is not readable from outside its own session, so it may sit
+      // outside the frozen cell. If the cluster ran BEFORE the eligibility
+      // filters, the earliest-entry rule would elect the out-of-cell row and
+      // then drop it — silently costing the window a legitimate close. Ordering
+      // is what makes the remedy robust to a read I cannot make.
+      const v0nniOutOfCell = nvts({ id: 'v0nni', account: 'v0nni', brokerOrderId: 143021643, openTs: ET_0930 + 3 * H, entryDelta: 0.1, realizedR: 9, realizedPnlUsd: 2250 });
+      const adminInCell = nvts({ id: 'admin', account: 'admin', brokerOrderId: 143032832, openTs: ET_0930 + 3.3 * H, entryDelta: 0.5449163533507801, realizedR: 0.4, realizedPnlUsd: 100 });
+      const r = foldOtmEvaluationWindow([v0nniOutOfCell, adminInCell], s, T0 + 100 * H);
+      expect(r.n).toBe(1);
+      expect(r.avgR).toBe(0.4); // the ELIGIBLE row survived, not the earlier one
+      expect(r.excludedCloses.reasons.outsideDeltaCell).toBe(1);
+      expect(r.excludedCloses.reasons.sameContractSameSessionCluster).toBe(0);
+      // …and if v0nni IS in-cell, the pair collapses to one draw instead.
+      const both = foldOtmEvaluationWindow(
+        [{ ...v0nniOutOfCell, entryDelta: 0.51 } as Row, adminInCell], s, T0 + 100 * H,
+      );
+      expect(both.n).toBe(1);
+      expect(both.excludedCloses.reasons.sameContractSameSessionCluster).toBe(1);
+      // Either way the window takes exactly ONE draw from this session. The
+      // unreadable `entryDelta` cannot change the sample size.
+    });
+
     it('the ruling is PUBLISHED on the wire — a grader can read the cut before it changes a verdict', () => {
       const s = opened();
       const rec = buildOtmEvaluationWindowRecord(
