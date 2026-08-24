@@ -341,7 +341,7 @@ import {
 } from './tra3939-order-provenance-capture.js';
 import { detectOversoldEngineCloses } from './tra3926-oversold-close-detector.js';
 // TRA-2820 — live-book "is it actually stopped?" counter for /api/health/options-live.
-import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability, mergeDayOneStopPosture, blindDayOneStopPosture, type PaperOptionsAccount } from './options-account.js';
+import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability, mergeDayOneStopPosture, blindDayOneStopPosture, mergeOtmSleeveStopCoverage, blindOtmSleeveStopCoverage, type PaperOptionsAccount } from './options-account.js';
 import { resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule } from './exit-risk-rules-flag.js';
 // TRA-3941 — the frozen sleeve KEY the exit ruling is scoped to, so the wire
 // field names the same join column the journal tape and the gate ledger use.
@@ -11584,6 +11584,51 @@ app.get('/api/health/options-live', async (_req, res) => {
         } catch (err) {
           return {
             ...blindDayOneStopPosture(),
+            instrumentBlind: true as const,
+            blindReason: err instanceof Error ? err.message : String(err),
+          };
+        }
+      })(),
+      // TRA-3981 (parent TRA-3943) — the SAME rule, over the WHOLE live OTM
+      // sleeve instead of over the rows that opened today.
+      //
+      // Its neighbour above windows on `openedAt === today`, because its subject
+      // is the day-one PDT hold. The RULE has no such window, and on 2026-08-24
+      // the gap read as coverage: `atrLegInertRows: 0` was a true statement about
+      // a set that excluded the one open row whose ATR leg was inert and whose
+      // premium leg was anchored on a `residual_identity` RESTATEMENT rather than
+      // a fill (`96b0dc72`, opened 08-21, floor 0.143 against a 0.33 sibling fill
+      // — a −35% stop declining until −57%). Read these fields in this order:
+      //
+      //   • `rows` / `governedRows` — how much of the sleeve this rule is
+      //     actually the stop for. `ungovernedRows > 0` means rows on this sleeve
+      //     are on the `daily_close` backstop and nothing else, and
+      //     `ungovernedPremiumUsd` is what that is worth.
+      //   • `premiumLegInertRows` — rows with NO fill-grade anchor. The premium
+      //     leg refuses these rather than anchoring on a restatement, because the
+      //     sign of a basis error is the sign of the stop error and an
+      //     under-stated basis is the PERMISSIVE direction.
+      //   • `atrLegInertRows` — rows with no stamped spot level, over the same
+      //     book-wide population. This is the counter AC2 grades.
+      //   • `basisSourceRows` / `adopted*` — the population itself, so a grader
+      //     can SEE how many adopted rows there are and how many carry a fill
+      //     versus a restatement, rather than inferring it (AC4).
+      //
+      // ⚠️ Coverage, not an arm: this says nothing about whether the sleeve
+      // trades (`liveOtmRouting`) or whether an exit can reach the broker
+      // (`liveDayOneStopPosture.otmDayOneStop.release`). Counts and dollars only.
+      otmSleeveStopCoverage: (() => {
+        try {
+          return {
+            ...mergeOtmSleeveStopCoverage(
+              getAllUserContexts().map(c => c.engine.getOtmSleeveStopCoverage()),
+            ),
+            instrumentBlind: false as const,
+            blindReason: null,
+          };
+        } catch (err) {
+          return {
+            ...blindOtmSleeveStopCoverage(),
             instrumentBlind: true as const,
             blindReason: err instanceof Error ? err.message : String(err),
           };

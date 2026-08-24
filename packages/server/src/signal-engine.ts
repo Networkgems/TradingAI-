@@ -366,7 +366,7 @@ import {
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount, type EquityExitRiskInput } from './paper-account.js';
-import { PaperOptionsAccount, qualifyLiveStopActionability, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary, type LiveStopActionabilityQualified, type LiveExitPassStatus, type DayOneStopPosture, type EngineBasisRepairOutcome, type AdoptedBasisRestatementOutcome, type LiveLotAdoptionReport } from './options-account.js';
+import { PaperOptionsAccount, qualifyLiveStopActionability, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary, type LiveStopActionabilityQualified, type LiveExitPassStatus, type DayOneStopPosture, type OtmSleeveStopCoverage, type EngineBasisRepairOutcome, type AdoptedBasisRestatementOutcome, type LiveLotAdoptionReport } from './options-account.js';
 import { bindOptionsPnlToEquityBook } from './options-equity-bridge.js';
 import {
   PENDING_CLOSE_MAX_REPRICE_STEPS,
@@ -9217,6 +9217,18 @@ export class SignalEngine {
    */
   getDayOneStopPosture(now?: number): DayOneStopPosture {
     return this.optionsAccount.dayOneStopPosture(now, this.resolveOtmDayOneStop());
+  }
+
+  /**
+   * TRA-3981 — the OTM day-one stop's coverage over this book's WHOLE live OTM
+   * sleeve, not just the rows that opened today.
+   *
+   * The SAME resolved rule the exit pass runs (`resolveOtmDayOneStop`), for the
+   * reason its neighbour gives: a coverage claim derived from a second
+   * resolution can report a rule the exit path is not running.
+   */
+  getOtmSleeveStopCoverage(): OtmSleeveStopCoverage {
+    return this.optionsAccount.otmSleeveStopCoverage(this.resolveOtmDayOneStop());
   }
 
   /**

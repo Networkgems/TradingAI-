@@ -24,12 +24,16 @@ import { etDateKey, etWallClockToUtcMs } from './et-clock.js';
 import type { LiveOptionStopPolicy, OtmSleeveExitRuleName } from './exit-risk-rules-flag.js';
 import {
   otmDayOneStopVerdict,
+  otmDayOneStopGovernance,
+  resolveOtmStopPremiumBasis,
   otmAtrInvalidationLevel,
   OTM_DAY_ONE_STOP_JOURNAL_REASON,
   OTM_DAY_ONE_STOP_BASIS,
   type OtmDayOneStopRule,
   type OtmDayOneStopRelease,
   type OtmDayOneStopTrigger,
+  type OtmDayOneStopSubject,
+  type OtmStopPremiumBasisSource,
 } from './otm-day-one-stop.js';
 import type { SpotResolver, PortfolioGreeksOptions } from './reports/portfolio-greeks.js';
 // TRA-3944 — the OTM contract floor's per-entry contract cap + AC3 audit shape.
@@ -504,6 +508,40 @@ export function isOtmSleeveRow(
   opt: { signalType?: string; engineOriginSleeve?: string },
 ): boolean {
   return opt.signalType === 'otm_mispricing' || opt.engineOriginSleeve === 'single_leg_otm';
+}
+
+/**
+ * TRA-3981 — build the day-one stop's subject from a row, in ONE place.
+ *
+ * Every field the rule reads is provenance-bearing, and the failure this exists
+ * to prevent is a caller that omits one: `importedFromTradier`/`deskAddBasis`
+ * are optional on {@link OptionPosition}, so a hand-built `{ premiumPaid,
+ * optionType }` subject is INDISTINGUISHABLE from an engine-opened row and
+ * silently restores the permissive reading. Both readers used to build exactly
+ * that shape.
+ *
+ * The three call sites in this file are asserted to go through here by a
+ * source-level test (`tra3981-adopted-otm-basis.test.ts`), the same technique the
+ * rule module's own absence tests use — a row is a READER's claim and a WRITER's
+ * order ticket, and the two must resolve it identically (TRA-3926).
+ */
+export function otmDayOneStopSubject(
+  opt: Pick<OptionPosition, 'premiumPaid' | 'optionType' | 'otmAtrInvalidationLevel'
+    | 'importedFromTradier' | 'deskAddBasis'>,
+): OtmDayOneStopSubject {
+  return {
+    premiumPaid: opt.premiumPaid,
+    optionType: opt.optionType,
+    ...(opt.otmAtrInvalidationLevel === undefined
+      ? {}
+      : { otmAtrInvalidationLevel: opt.otmAtrInvalidationLevel }),
+    ...(opt.importedFromTradier === undefined
+      ? {}
+      : { importedFromTradier: opt.importedFromTradier }),
+    ...(opt.deskAddBasis === undefined
+      ? {}
+      : { deskAddBasis: { source: opt.deskAddBasis.source } }),
+  };
 }
 
 /**
@@ -1433,11 +1471,17 @@ export function summarizeLiveStopActionability(
     // `undefined` and the ATR leg cannot fire here. That direction is
     // PESSIMISTIC — an ATR-only fire still reads `inert` — and it is disclosed
     // rather than papered over with a stale spot.
+    //
+    // TRA-3981 — governance is asked of the SHARED resolver, not re-spelled as
+    // `rule.armed`: a row whose premium anchor is a restated basis and whose ATR
+    // level was never stamped has no leg this rule can evaluate, and the walk
+    // must not count it as one this rule will act on. It falls through to the
+    // `daily_close` / chandelier branches below, which is where it actually sits.
     const otmGoverned =
       ctx.otmDayOneStop !== undefined
-      && ctx.otmDayOneStop.rule.armed
       && !opt.legs
-      && isOtmSleeveRow(opt);
+      && isOtmSleeveRow(opt)
+      && otmDayOneStopGovernance(otmDayOneStopSubject(opt), ctx.otmDayOneStop.rule).governs;
     // `inOpeningRange` is NOT overridden by this rule (`:6845` gates the verdict
     // on it), so the window still wins and the row falls through to
     // `opening_range_hold` below.
@@ -1446,7 +1490,7 @@ export function summarizeLiveStopActionability(
       otmGoverned
       && !otmInOpeningRange
       && otmDayOneStopVerdict(
-        { premiumPaid: opt.premiumPaid, optionType: opt.optionType },
+        otmDayOneStopSubject(opt),
         { mark, underlyingSpot: undefined, rule: ctx.otmDayOneStop!.rule },
       ).fires;
     // `:6865` exactly: on day one the fire is held unless the release said yes,
@@ -1835,13 +1879,25 @@ export function summarizeDayOneStopPosture(
     // running actually governs it: armed, and on the sleeve. The sleeve
     // predicate is `isOtmSleeveRow`, the SAME one `checkExits` scopes the rule
     // with, so the published basis cannot claim a row the exit path skips.
-    const governed = ctx.otmDayOneStop?.rule.armed === true && isOtmSleeveRow(opt);
+    //
+    // TRA-3981 — and governance is now a question about the ROW as well as the
+    // rule: `isOtmSleeveRow` admits an adopted lot whose premium anchor this
+    // process never observed as a fill, and whose ATR level was therefore never
+    // stamped. Such a row has no leg to evaluate, so it reads `full_premium`
+    // here — the honest token — rather than claiming a stop it does not have.
+    const inReach = ctx.otmDayOneStop?.rule.armed === true && isOtmSleeveRow(opt);
+    const governed = inReach
+      && otmDayOneStopGovernance(otmDayOneStopSubject(opt), ctx.otmDayOneStop!.rule).governs;
     const rowBasis = governed ? OTM_DAY_ONE_STOP_BASIS : ('full_premium' as const);
     // A sleeve reads `full_premium` if ANY of its counted rows is ungoverned —
     // the pessimistic fold, because the field exists to expose an unstopped
     // dollar and a majority vote would hide one behind its neighbours.
     if (stopBasisBySleeve[sleeve] !== 'full_premium') stopBasisBySleeve[sleeve] = rowBasis;
-    if (governed) {
+    // Counted over the rule's REACH, not over the rows it ends up governing:
+    // an ungoverned row is precisely the one whose ATR leg is inert, and folding
+    // it out of its own denominator is how `atrLegInertRows: 0` comes to mean
+    // "there are none" when it means "I stopped counting them" (TRA-3981).
+    if (inReach) {
       const level = opt.otmAtrInvalidationLevel;
       if (level !== undefined && Number.isFinite(level) && level > 0) atrLegRows += 1;
       else atrLegInertRows += 1;
@@ -1972,6 +2028,211 @@ export function blindDayOneStopPosture(): {
     premiumAtRiskUsd: null,
     premiumBySleeveUsd: null,
     releasesAt: null,
+  };
+}
+
+/**
+ * TRA-3981 — the OTM day-one stop's coverage over the WHOLE live OTM book, not
+ * over the rows that happen to have opened today.
+ *
+ * ## Why this is a second instrument and not a field on the first
+ *
+ * {@link summarizeDayOneStopPosture} counts rows whose `openedAt` date-key is
+ * TODAY, because its subject is the day-one PDT hold. That window is NARROWER
+ * than the rule's reach: the rule governs every `isOtmSleeveRow` row on every day
+ * of its life. On 2026-08-24 the day-one instrument read `atrLegInertRows: 0` —
+ * a TRUE statement about a set that EXCLUDED the one open row whose ATR leg was
+ * inert (`96b0dc72`, opened 08-21) and whose premium leg was anchored on a
+ * restated basis. The counter was honest; its population was the wrong one, and
+ * a clean reading was taken for book-wide coverage.
+ *
+ * So this one carries its population in a field ({@link population}), and it is
+ * a LITERAL rather than a comment for the same reason `stopBasis` is: a reader
+ * joining two counters has to be able to see that they count different things.
+ *
+ * ⚠️ Counts and dollars only — no OCC symbols. Same no-auth route, same TRA-2163
+ * standing as its neighbours.
+ */
+export interface OtmSleeveStopCoverage {
+  /**
+   * What was counted. Every live, open, single-leg row `isOtmSleeveRow` admits,
+   * whatever day it opened on — the rule's own reach, which is the only
+   * population a coverage claim may be made over.
+   */
+  population: 'all_open_live_otm_sleeve_rows';
+  rows: number;
+  /** Rows with at least one evaluable leg — the rule IS these rows' stop. */
+  governedRows: number;
+  /** Rows the rule reaches and does not govern. `rows − governedRows`. */
+  ungovernedRows: number;
+  /** Σ `premiumPaid × contractsRemaining × 100` over the ungoverned rows, 2dp. */
+  ungovernedPremiumUsd: number;
+  /** Rows carrying a FILL-GRADE premium anchor — the premium leg can evaluate. */
+  premiumLegRows: number;
+  /** Rows whose premium anchor is a restatement or an unstamped adoption. */
+  premiumLegInertRows: number;
+  /** Rows carrying a usable `otmAtrInvalidationLevel`. */
+  atrLegRows: number;
+  /** AC2 — rows with no stamped level, counted on the day they exist. */
+  atrLegInertRows: number;
+  /** AC4 — the whole population split by where its basis came from. */
+  basisSourceRows: Record<OtmStopPremiumBasisSource, number>;
+  /** AC4 — adopted rows (`importedFromTradier` or carrying a `deskAddBasis`). */
+  adoptedRows: number;
+  /** …of which the basis is a fill this process read (`capture_fill`). */
+  adoptedFillBasisRows: number;
+  /** …of which the basis is a `residual_identity` RESTATEMENT. */
+  adoptedRestatedBasisRows: number;
+  /** `null` when the caller attached no rule (the pre-TRA-3943 reading). */
+  ruleArmed: boolean | null;
+}
+
+const EMPTY_BASIS_SOURCE_ROWS: () => Record<OtmStopPremiumBasisSource, number> = () => ({
+  entry_fill: 0,
+  desk_capture_fill: 0,
+  restated_residual: 0,
+  adopted_unstamped: 0,
+});
+
+/** TRA-3981 — see {@link OtmSleeveStopCoverage}. */
+export function summarizeOtmSleeveStopCoverage(
+  positions: Iterable<OptionPosition>,
+  ctx: { otmDayOneStop?: { rule: OtmDayOneStopRule } },
+): OtmSleeveStopCoverage {
+  const basisSourceRows = EMPTY_BASIS_SOURCE_ROWS();
+  let rows = 0;
+  let governedRows = 0;
+  let ungovernedPremiumUsd = 0;
+  let premiumLegRows = 0;
+  let atrLegRows = 0;
+  let adoptedRows = 0;
+  let adoptedFillBasisRows = 0;
+  let adoptedRestatedBasisRows = 0;
+  for (const opt of positions) {
+    if ((opt.mode ?? 'demo') !== 'live') continue;
+    if (opt.closedAt !== undefined) continue;
+    // Multi-leg rows are out for the same reason `checkExits` excludes them
+    // (`!opt.legs`): the rule is a single-contract premium/spot rule.
+    if (opt.legs) continue;
+    if (!isOtmSleeveRow(opt)) continue;
+    rows += 1;
+    // Built at each call rather than hoisted into a local: the no-drift guard in
+    // `tra3981-adopted-otm-basis.test.ts` reads the call sites out of this file's
+    // source, and a local would let a later edit swap in a hand-built subject
+    // without the guard noticing.
+    //
+    // No rule attached ⇒ nothing governs anything, and the basis split is still
+    // the honest thing to publish. `markFloorRatio` is irrelevant to provenance,
+    // so a disarmed probe rule would report the SAME split — which is why the
+    // arm rides on the payload as its own field instead of being inferable.
+    const gov = ctx.otmDayOneStop === undefined
+      ? null
+      : otmDayOneStopGovernance(otmDayOneStopSubject(opt), ctx.otmDayOneStop.rule);
+    const basis = gov?.premiumBasis ?? resolveOtmStopPremiumBasis(otmDayOneStopSubject(opt));
+    basisSourceRows[basis.source] += 1;
+    if (basis.fillGrade) premiumLegRows += 1;
+    const level = opt.otmAtrInvalidationLevel;
+    if (level !== undefined && Number.isFinite(level) && level > 0) atrLegRows += 1;
+    if (basis.source !== 'entry_fill') {
+      adoptedRows += 1;
+      if (basis.source === 'desk_capture_fill') adoptedFillBasisRows += 1;
+      if (basis.source === 'restated_residual') adoptedRestatedBasisRows += 1;
+    }
+    if (gov?.governs === true) {
+      governedRows += 1;
+    } else {
+      const remaining = Number.isFinite(opt.contractsRemaining) ? opt.contractsRemaining : 0;
+      const premium = Number.isFinite(opt.premiumPaid) ? opt.premiumPaid : 0;
+      ungovernedPremiumUsd += premium * remaining * 100;
+    }
+  }
+  return {
+    population: 'all_open_live_otm_sleeve_rows',
+    rows,
+    governedRows,
+    ungovernedRows: rows - governedRows,
+    ungovernedPremiumUsd: r2usd(ungovernedPremiumUsd),
+    premiumLegRows,
+    premiumLegInertRows: rows - premiumLegRows,
+    atrLegRows,
+    atrLegInertRows: rows - atrLegRows,
+    basisSourceRows,
+    adoptedRows,
+    adoptedFillBasisRows,
+    adoptedRestatedBasisRows,
+    ruleArmed: ctx.otmDayOneStop === undefined ? null : ctx.otmDayOneStop.rule.armed,
+  };
+}
+
+/** TRA-3981 — fold per-book coverage into the fleet figure the route publishes. */
+export function mergeOtmSleeveStopCoverage(
+  summaries: Iterable<OtmSleeveStopCoverage>,
+): OtmSleeveStopCoverage {
+  const out: OtmSleeveStopCoverage = {
+    population: 'all_open_live_otm_sleeve_rows',
+    rows: 0,
+    governedRows: 0,
+    ungovernedRows: 0,
+    ungovernedPremiumUsd: 0,
+    premiumLegRows: 0,
+    premiumLegInertRows: 0,
+    atrLegRows: 0,
+    atrLegInertRows: 0,
+    basisSourceRows: EMPTY_BASIS_SOURCE_ROWS(),
+    adoptedRows: 0,
+    adoptedFillBasisRows: 0,
+    adoptedRestatedBasisRows: 0,
+    ruleArmed: null,
+  };
+  for (const s of summaries) {
+    out.rows += s.rows;
+    out.governedRows += s.governedRows;
+    out.ungovernedRows += s.ungovernedRows;
+    out.ungovernedPremiumUsd = r2usd(out.ungovernedPremiumUsd + s.ungovernedPremiumUsd);
+    out.premiumLegRows += s.premiumLegRows;
+    out.premiumLegInertRows += s.premiumLegInertRows;
+    out.atrLegRows += s.atrLegRows;
+    out.atrLegInertRows += s.atrLegInertRows;
+    out.adoptedRows += s.adoptedRows;
+    out.adoptedFillBasisRows += s.adoptedFillBasisRows;
+    out.adoptedRestatedBasisRows += s.adoptedRestatedBasisRows;
+    for (const k of Object.keys(out.basisSourceRows) as OtmStopPremiumBasisSource[]) {
+      out.basisSourceRows[k] += s.basisSourceRows[k] ?? 0;
+    }
+    // The rule is a PROCESS-level resolution, identical across this process's
+    // books; a book that reported none contributes rows and no arm. `false`
+    // WINS over `true` — the pessimistic fold its neighbours use.
+    if (s.ruleArmed === false) out.ruleArmed = false;
+    else if (s.ruleArmed === true && out.ruleArmed === null) out.ruleArmed = true;
+  }
+  return out;
+}
+
+/**
+ * TRA-3981 — the BLIND twin. Nulled, not zeroed: `atrLegInertRows: 0` is the
+ * exact reading this ticket exists because someone believed, and a catch branch
+ * must not manufacture it.
+ */
+export function blindOtmSleeveStopCoverage(): {
+  [K in keyof OtmSleeveStopCoverage]: K extends 'population'
+    ? OtmSleeveStopCoverage['population']
+    : null
+} {
+  return {
+    population: 'all_open_live_otm_sleeve_rows',
+    rows: null,
+    governedRows: null,
+    ungovernedRows: null,
+    ungovernedPremiumUsd: null,
+    premiumLegRows: null,
+    premiumLegInertRows: null,
+    atrLegRows: null,
+    atrLegInertRows: null,
+    basisSourceRows: null,
+    adoptedRows: null,
+    adoptedFillBasisRows: null,
+    adoptedRestatedBasisRows: null,
+    ruleArmed: null,
   };
 }
 
@@ -7760,13 +8021,7 @@ export class PaperOptionsAccount {
       let otmStopTrigger: OtmDayOneStopTrigger | null = null;
       if (otmDayOneStop !== undefined && !opt.legs && !inOpeningRange && isOtmSleeveRow(opt)) {
         const verdict = otmDayOneStopVerdict(
-          {
-            premiumPaid: opt.premiumPaid,
-            optionType: opt.optionType,
-            ...(opt.otmAtrInvalidationLevel === undefined
-              ? {}
-              : { otmAtrInvalidationLevel: opt.otmAtrInvalidationLevel }),
-          },
+          otmDayOneStopSubject(opt),
           {
             mark,
             underlyingSpot: underlyingPrices.get(opt.symbol),
@@ -11884,6 +12139,19 @@ export class PaperOptionsAccount {
       ...(otmDayOneStop === undefined
         ? {}
         : { otmDayOneStop, otmDayOneStopCounters: this.getOtmDayOneStopCounters() }),
+    });
+  }
+
+  /**
+   * TRA-3981 — the day-one stop's coverage over this book's WHOLE live OTM
+   * sleeve, on every day of each row's life. See {@link OtmSleeveStopCoverage}
+   * for why the day-one posture above cannot answer the same question.
+   */
+  otmSleeveStopCoverage(
+    otmDayOneStop?: { rule: OtmDayOneStopRule },
+  ): OtmSleeveStopCoverage {
+    return summarizeOtmSleeveStopCoverage(this.openOptions.values(), {
+      ...(otmDayOneStop === undefined ? {} : { otmDayOneStop }),
     });
   }
 
