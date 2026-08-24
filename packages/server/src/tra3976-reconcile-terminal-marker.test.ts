@@ -9,6 +9,7 @@ import {
   recordLiveOptionFill,
   recordReconcileTermination,
   reconcileTerminations,
+  backfillReconcileTerminationsFromJournal,
   recordedEngineOpenBasis,
   engineNetOpenContracts,
   lastRecordedOpenFill,
@@ -557,6 +558,98 @@ describe('TRA-3976 AC2 — provenance: UNCLASSIFIED, not `foreign` and not ours'
     const row = adoptedRow();
     expect(row.adoptionAuthority).toBe('engine_origin');
     expect(row.engineOriginSleeve).toBe('single_leg_otm');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+describe('TRA-3976 — the back-fill for drops that predate the marker', () => {
+  /** The live journal row: 34f1ee99, SOFI, broker_reconcile, 13:34:55.545Z. */
+  const journalRow = (overrides: Record<string, unknown> = {}) => ({
+    id: '34f1ee99',
+    mode: 'live',
+    optionSymbol: SOFI,
+    contracts: 1,
+    closeTs: DROP_TIME,
+    exitReason: 'broker_reconcile',
+    ...overrides,
+  });
+
+  it('marks the SOFI phantom off OUR OWN journal row', () => {
+    record('buy_to_open', 1, { filledPrice: 1.23, orderId: 142828896, at: 0 });
+    expect(openEpisodeWindow(SOFI).status).toBe('open');
+
+    const r = backfillReconcileTerminationsFromJournal([journalRow()]);
+    expect(r).toEqual({
+      candidates: 1,
+      unaskable: 0,
+      alreadyAccounted: 0,
+      duplicates: 0,
+      written: 1,
+    });
+    expect(openEpisodeWindow(SOFI).reason).toBe('reconcile_terminal');
+    expect(recordedEngineOpenBasis(SOFI)).toBeNull();
+    expect(engineNetOpenContracts(SOFI).engineNetContracts).toBe(0);
+  });
+
+  it('is idempotent across reruns', () => {
+    record('buy_to_open', 1, { at: 0 });
+    expect(backfillReconcileTerminationsFromJournal([journalRow()]).written).toBe(1);
+    const second = backfillReconcileTerminationsFromJournal([journalRow()]);
+    // The OCC is no longer reported open, so the second pass has nothing to do —
+    // and even if it wrote, the (symbol, ts, positionId) dedupe would catch it.
+    expect(second.written).toBe(0);
+    expect(reconcileTerminations()).toHaveLength(1);
+  });
+
+  it('ignores every close that is not a live `broker_reconcile`', () => {
+    record('buy_to_open', 1, { at: 0 });
+    const r = backfillReconcileTerminationsFromJournal([
+      journalRow({ exitReason: 'chandelier' }),
+      journalRow({ exitReason: 'trail' }),
+      journalRow({ mode: 'demo' }),
+      journalRow({ exitReason: 'stop' }),
+    ]);
+    expect(r.candidates).toBe(0);
+    expect(r.written).toBe(0);
+    expect(openEpisodeWindow(SOFI).status).toBe('open'); // untouched
+  });
+
+  it('a row with no OCC or no closeTs is UNASKABLE, counted, and not guessed at', () => {
+    record('buy_to_open', 1, { at: 0 });
+    const r = backfillReconcileTerminationsFromJournal([
+      journalRow({ optionSymbol: null }),
+      journalRow({ closeTs: null }),
+    ]);
+    expect(r.candidates).toBe(2);
+    expect(r.unaskable).toBe(2);
+    expect(r.written).toBe(0);
+    // A row we cannot key is not a row we have cleared.
+    expect(openEpisodeWindow(SOFI).status).toBe('open');
+  });
+
+  it('a reconcile close whose OCC the ledger already accounts for is a no-op', () => {
+    record('buy_to_open', 1, { at: 0 });
+    record('sell_to_close', 1, { at: 60_000 });
+    const r = backfillReconcileTerminationsFromJournal([journalRow()]);
+    expect(r.alreadyAccounted).toBe(1);
+    expect(r.written).toBe(0);
+    expect(openEpisodeWindow(SOFI).status).toBe('flat'); // the FINDING survives
+  });
+
+  it('does not touch an OCC the engine has since re-entered', () => {
+    // The drop is old; the ledger's open episode is a NEW one. Marking at the
+    // old `closeTs` leaves the new episode intact because the walk clears the
+    // termination at the next `buy_to_open` off zero.
+    record('buy_to_open', 1, { at: 0 });
+    record('buy_to_open', 2, {
+      orderId: 143000111,
+      at: DROP_TIME - OPEN_TIME + 3_600_000,
+    });
+    backfillReconcileTerminationsFromJournal([journalRow()]);
+
+    const window = openEpisodeWindow(SOFI);
+    expect(window.status).toBe('open');
+    expect(window.fills.map((f) => f.orderId)).toEqual([143000111]);
   });
 });
 

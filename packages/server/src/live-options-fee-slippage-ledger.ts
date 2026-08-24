@@ -467,6 +467,92 @@ export function reconcileTerminations(): ReconcileTerminationRecord[] {
   return [...terminations].sort((a, b) => b.ts - a.ts);
 }
 
+/** TRA-3976 — what {@link backfillReconcileTerminationsFromJournal} did. */
+export interface ReconcileTerminationBackfillResult {
+  /** LIVE journal rows closed with `exitReason: 'broker_reconcile'`. The denominator. */
+  candidates: number;
+  /** Candidates carrying no OCC symbol or no `closeTs` — UNASKABLE, not clean. */
+  unaskable: number;
+  /** Candidates whose OCC the ledger does not report open (nothing to terminate). */
+  alreadyAccounted: number;
+  /** Candidates whose marker was already on disk. */
+  duplicates: number;
+  /** Markers written this pass. */
+  written: number;
+}
+
+/**
+ * TRA-3976 — write the markers for drops that happened BEFORE this code shipped.
+ *
+ * `closeBrokerFlatPosition` marks every drop from here on. It cannot mark the
+ * one already on the live tape: `SOFI260925C00019000` was dropped on
+ * 2026-08-24T13:34:55.545Z, and without this pass its phantom sits in the
+ * ledger until the 30-day retention window closes it — reported by the census
+ * every beat and read by all three oracles in between.
+ *
+ * ⛔ THE SOURCE IS OUR OWN JOURNAL, WHICH IS THE WHOLE POINT. Journal row
+ * `34f1ee99` carries `exitReason: 'broker_reconcile'` and `closeTs`: that is
+ * OUR durable record that OUR book stopped holding the OCC, written by the same
+ * drop this marker describes. It is evidence about our book, exactly as AC1
+ * requires — NOT an inference from the broker's `/positions` being empty, and
+ * NOT the book-vs-ledger diff the census takes (which is TRA-2820's shape read
+ * backwards: a row we really did place, whose local row was lost to a reboot,
+ * presents identically and would lose its stop).
+ *
+ * Idempotent three ways: by the (symbol, ts, positionId) dedupe in
+ * {@link recordReconcileTermination}, by skipping any OCC the ledger does not
+ * currently report OPEN, and because a redundant marker is a no-op in the walk
+ * anyway (it only terminates an episode with contracts still on it).
+ */
+export function backfillReconcileTerminationsFromJournal(
+  rows: ReadonlyArray<{
+    id?: string;
+    mode?: string;
+    optionSymbol?: string | null;
+    contracts?: number | null;
+    closeTs?: number | null;
+    exitReason?: string | null;
+  }>,
+): ReconcileTerminationBackfillResult {
+  const out: ReconcileTerminationBackfillResult = {
+    candidates: 0,
+    unaskable: 0,
+    alreadyAccounted: 0,
+    duplicates: 0,
+    written: 0,
+  };
+  for (const r of rows) {
+    if (r.mode !== 'live') continue;
+    if (r.exitReason !== 'broker_reconcile') continue;
+    out.candidates += 1;
+    const occ = typeof r.optionSymbol === 'string' ? r.optionSymbol : '';
+    const closeTs = typeof r.closeTs === 'number' && Number.isFinite(r.closeTs) ? r.closeTs : null;
+    if (occ === '' || closeTs === null) {
+      // UNASKABLE, and counted as such: a row we cannot key is not a row we
+      // have cleared. Synthesising a symbol or a timestamp here would put a
+      // marker on the wrong episode.
+      out.unaskable += 1;
+      continue;
+    }
+    if (openEpisodeWindow(occ).status !== 'open') {
+      out.alreadyAccounted += 1;
+      continue;
+    }
+    const wrote = recordReconcileTermination({
+      ts: closeTs,
+      etDay: new Date(closeTs).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }),
+      optionSymbol: occ,
+      contractsDropped:
+        typeof r.contracts === 'number' && Number.isFinite(r.contracts) ? r.contracts : 0,
+      positionId: typeof r.id === 'string' && r.id !== '' ? r.id : null,
+      source: 'broker_flat_reconcile',
+    });
+    if (wrote) out.written += 1;
+    else out.duplicates += 1;
+  }
+  return out;
+}
+
 /**
  * TRA-3918 — why an OPEN-EPISODE walk exists, and why "most recent
  * `buy_to_open`" was the wrong question.

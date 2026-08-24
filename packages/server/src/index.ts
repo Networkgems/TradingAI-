@@ -316,6 +316,8 @@ import {
   backfillLiveOptionFees,
   backfillLiveOptionFeesFromGainLoss,
   summarizeLiveOptionsFeeSlippage,
+  // TRA-3976 — mark the drops that predate the marker, from our own journal.
+  backfillReconcileTerminationsFromJournal,
 } from './live-options-fee-slippage-ledger.js';
 // TRA-3932 — WHO OPENED the contracts TRA-3926's detector could not attribute.
 import {
@@ -5013,11 +5015,55 @@ setTradierOrderSubmitObserver(recordEngineOrderSubmit);
   const h = hydrateLiveOptionsFeeSlippageFromDisk(DATA_DIR);
   if (h.records > 0) {
     // `migrated` — TRA-2850: pre-2850 `fees: 0` rows (no provenance) reset to honest-null.
+    // `terminations` — TRA-3976: reconcile terminal markers recovered this boot.
     log.info('live-options fee/slippage ledger hydrated (TRA-1929)', {
       records: h.records,
       migrated: h.migrated,
+      terminations: h.terminations,
     });
   }
+  // TRA-3976 — mark the drops that happened BEFORE the marker existed. The
+  // source is OUR OWN journal (`exitReason: 'broker_reconcile'` + `closeTs`),
+  // which is our durable record that our book stopped holding the OCC — not an
+  // inference from the broker's `/positions` being empty, and not the
+  // book-vs-ledger diff the census takes (that one is TRA-2820's shape read
+  // backwards and would take the stop off a real position).
+  //
+  // ⚠ Async and fire-and-forget: the journal loads lazily, and blocking boot on
+  // it would put a disk read in front of the listener. The window between boot
+  // and this landing is the PRE-FIX reading — the same phantom the ledger was
+  // already serving — so the race can only shorten the defect, never create one.
+  void listOptionTradeJournal({ mode: 'live' })
+    .then((rows) => {
+      const r = backfillReconcileTerminationsFromJournal(
+        rows.map((row) => ({
+          id: row.id,
+          mode: row.mode,
+          optionSymbol: row.optionSymbol ?? null,
+          contracts: row.contracts ?? null,
+          closeTs: row.closeTs ?? null,
+          exitReason: row.exitReason ?? null,
+        })),
+      );
+      if (r.candidates > 0) {
+        log.info('reconcile terminal markers back-filled from the trade journal (TRA-3976)', {
+          candidates: r.candidates,
+          // UNASKABLE rows are logged BY NAME: a row we could not key is not a
+          // row we cleared, and a bare `written` count would read as coverage.
+          unaskable: r.unaskable,
+          alreadyAccounted: r.alreadyAccounted,
+          duplicates: r.duplicates,
+          written: r.written,
+        });
+      }
+    })
+    .catch((err) => {
+      // Counted by its absence in the log above, and the census still reports
+      // the phantom — a failed back-fill must not read as a clean book.
+      log.warn('reconcile terminal-marker back-fill failed (TRA-3976)', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    });
 }
 
 // TRA-3846 — bind the TRA-3010 engine-basis restatement ledger to the same resolved
