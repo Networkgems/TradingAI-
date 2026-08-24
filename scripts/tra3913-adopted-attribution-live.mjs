@@ -54,6 +54,23 @@ const cents = n => Math.round(n * 100);
 const rows = [];
 const check = (id, ok, detail) => { rows.push({ id, ok: ok === true, detail }); };
 
+// ⛔ A CRITERION THAT COULD NOT BE EVALUATED FOR LACK OF ITS OWN INPUTS IS NOT A
+// FAILURE OF THE SUBJECT (TRA-3913, 2026-08-24). `check-deploy-build.mjs` made
+// exactly this mistake one ticket over — it called a commit BROKEN when what had
+// actually happened was that it could not compile it — and the lesson there
+// applies verbatim here: WHEN A GATE CAN FAIL FOR LACK OF ITS OWN INPUT, THAT
+// BRANCH BELONGS IN THE *BLIND* BUCKET, NOT THE VERDICT BUCKET. A false RED is
+// worse than a false GREEN, because a false GREEN is caught by the next honest
+// run and a false RED is what gets argued away.
+//
+// Three branches in G2 were already writing their own prose as "NOT GRADED" and
+// then scoring themselves FAIL anyway. They now land here.
+//
+// Precedence is unchanged and deliberate: a genuine FAIL is NEVER downgraded to
+// BLIND (the same rule the no-subject gate already follows via `failed.length`).
+// FAIL wins over NOGRADE; NOGRADE wins over PASS.
+const nograde = (id, detail) => { rows.push({ id, ok: true, nograde: true, detail }); };
+
 const get = async path => fetch(`${HOST}${path}`).then(r => r.json()).catch(() => null);
 
 async function pin() {
@@ -97,6 +114,12 @@ if (!Array.isArray(exposure) || exposure.length === 0) {
 // summing PRICED `buy_to_open` only. This is a second implementation of
 // `recordedEngineOpenBasis` on purpose: the point of the cross-column diff is
 // that the two were not derived from each other.
+// The journal is a THIRD source, read only to explain a tape/book disagreement.
+// It never grades anything, so an unreadable journal degrades a sentence, never
+// a verdict.
+const journal = await get('/api/health/option-journal?rows=all');
+const journalRows = Array.isArray(journal?.rows) ? journal.rows : null;
+
 const records = Array.isArray(fee.records) ? fee.records : null;
 if (!records) blind('fee/slippage `records[]` absent — the independent oracle is unreadable');
 const liveOpens = records.filter(r => r.side === 'buy_to_open' && r.mode === 'live');
@@ -139,6 +162,37 @@ function tapeBasis(optionSymbol) {
   }
   return { contracts, costBasisUsd, unpriced, imported };
 }
+
+// THE non-grade predicate, named once so its control can call THE SAME function.
+// A control that re-implements the comparison it is controlling is checking a
+// column against itself (TRA-3926: re-derive with a different METHOD, not a
+// different implementation) — and it would sit green through a mutation that
+// makes the real gate fire on every input, which is the failure mode that turns
+// this grader into no grader at all.
+const tapeExceedsBook = (tapeUsd, total) => cents(tapeUsd) > cents(total);
+
+const describeEpisodes = eps => eps.map(b =>
+  `${b.s} ${b.contracts}@${b.contracts > 0 ? usd(b.costBasisUsd / (b.contracts * 100)) : 'n/a'}`
+  + (b.imported > 0 ? ` +${b.imported} imported` : '')).join(', ');
+
+// ⭐ TURN THE NAMING FROM AN INFERENCE INTO A MEASUREMENT. Matching the gap to a
+// single episode by arithmetic is elimination, and an elimination argument is
+// only as fresh as its weakest excluded branch. `/api/health/option-journal` is
+// public, no-auth, and records `closeTs` + `exitReason` for the row the engine
+// actually held — so it can POSITIVELY witness that an episode the fill ledger
+// still calls open was in fact closed, and say how. Silence here downgrades the
+// sentence to the arithmetic claim rather than inventing a cause.
+const journalClosed = sym => {
+  if (!Array.isArray(journalRows)) return ' (journal unreadable — gap identified by arithmetic only)';
+  const hit = journalRows
+    .filter(j => j.optionSymbol === sym && j.mode === 'live' && typeof j.closeTs === 'number')
+    .sort((a, b) => b.closeTs - a.closeTs)[0];
+  if (!hit) return ' (no closed journal row for it — cause NOT established)';
+  return `, which the journal records CLOSED at ${new Date(hit.closeTs).toISOString()}`
+    + ` exitReason='${hit.exitReason}' brokerOrderId=${JSON.stringify(hit.brokerOrderId ?? null)}`
+    + ` realizedPnlUsd=${usd(hit.realizedPnlUsd)} — so the position is gone and only the fill`
+    + ' ledger still thinks otherwise';
+};
 
 // ── The subject: gate-open books only ────────────────────────────────────────
 // SUM THE FLEET ON `liveEntryGateOpen`, NEVER ON `mode` — bqb1 carries three
@@ -244,8 +298,9 @@ for (const r of withRows) {
   // manufacture a FAIL out of the conservative branch doing its job.
   const refused = r.adoptedAttributionBlindRows ?? 0;
   if (refused > 0) {
-    check(`G2.${r.book}.tape`, false,
-      `${refused} row(s) REFUSED — adopted ${usd(adopted)} is an upper bound, identity untested`);
+    nograde(`G2.${r.book}.tape`,
+      `NOT GRADED — ${refused} row(s) REFUSED; adopted ${usd(adopted)} is an upper bound,`
+      + ' identity untested (the conservative branch doing its job is not a defect)');
     continue;
   }
 
@@ -264,23 +319,56 @@ for (const r of withRows) {
   const tapeUsd = contributing.reduce((sum, b) => sum + b.costBasisUsd, 0);
   const tapeUnpriced = contributing.reduce((sum, b) => sum + b.unpriced, 0);
   if (withRows.length !== 1) {
-    check(`G2.${r.book}.tape`, false,
+    nograde(`G2.${r.book}.tape`,
       `NOT GRADED — ${withRows.length} gate-open books hold rows, so the process-wide tape`
       + ` (${usd(tapeUsd)}) is not this book's engine share; grade per-book off the journal`);
     continue;
   }
   if (tapeUnpriced > 0) {
-    check(`G2.${r.book}.tape`, false,
-      `the tape itself holds ${tapeUnpriced} unpriceable fill(s) — oracle incomplete`);
+    nograde(`G2.${r.book}.tape`,
+      `NOT GRADED — the tape itself holds ${tapeUnpriced} unpriceable fill(s), oracle incomplete`);
+    continue;
+  }
+
+  // ⛔ THE TAPE AND THE BOOK MUST AGREE ON *WHAT IS OPEN* BEFORE AN ATTRIBUTION
+  // IDENTITY OVER IT MEANS ANYTHING (TRA-3913, 2026-08-24, MEASURED).
+  //
+  // `engineServed + adopted === total` by construction and both terms are
+  // non-negative, so `engineServed <= total` ALWAYS. If the tape's engine-open
+  // basis exceeds the book's ENTIRE at-risk total, then the tape is carrying an
+  // episode the book is not holding at all — and NO attribution split, right or
+  // wrong, can reconcile that. The disagreement is strictly UPSTREAM of the
+  // split this ticket fixes, so scoring it FAIL is a false accusation against
+  // the fold (TRA-3884: when the controls fail and the subject passes, suspect
+  // the reader first).
+  //
+  // What produced it on 2026-08-24T14:1xZ, and why the tape cannot self-correct:
+  // `SOFI260925C00019000` — engine `buy_to_open 1 @1.23`, oid `142828896`,
+  // `origin:'fill'`, 2026-08-21T14:24:10Z — was closed AT THE BROKER, and the
+  // local row was dropped by the reconcile at 2026-08-24T13:34:55.545Z with
+  // `exitReason:'broker_reconcile'` and `brokerOrderId: null`. No
+  // `sell_to_close` ever reached `records[]`, so the BACKWARD WALK STILL FINDS
+  // THAT EPISODE OPEN — permanently, for the whole 30-day retention window.
+  // tape $156.00 > book total $150.00. TRA-2959's shape (7 of 11 filled orders
+  // never reached this ledger), in the direction that OVER-credits the engine.
+  if (tapeExceedsBook(tapeUsd, total)) {
+    const gap = tapeUsd - engineServed;
+    const named = contributing.filter(b => cents(b.costBasisUsd) === cents(gap));
+    nograde(`G2.${r.book}.tape`,
+      `NOT GRADED — the fill tape reports MORE engine-open basis (${usd(tapeUsd)}) than the`
+      + ` book's entire at-risk total (${usd(total)}); since engine share <= total always, the`
+      + ' ledger is holding an episode the book does not have — a close that never reached'
+      + ` \`records[]\` (TRA-2959). Episodes: ${describeEpisodes(contributing)}.`
+      + (named.length === 1
+        ? ` The ${usd(gap)} gap is exactly ${named[0].s}${journalClosed(named[0].s)}.`
+        : ` Gap ${usd(gap)} matches ${named.length} episode(s) exactly — not isolated here.`));
     continue;
   }
   const tapeImported = contributing.reduce((sum, b) => sum + (b.imported ?? 0), 0);
   check(`G2.${r.book}.tape`,
     cents(engineServed) === cents(tapeUsd),
     `served engine share ${usd(engineServed)} === engine-placed fill tape ${usd(tapeUsd)}`
-    + ` over ${contributing.length} OPEN episode(s): `
-    + contributing.map(b => `${b.s} ${b.contracts}@${b.contracts > 0 ? usd(b.costBasisUsd / (b.contracts * 100)) : 'n/a'}`
-      + (b.imported > 0 ? ` +${b.imported} imported` : '')).join(', ')
+    + ` over ${contributing.length} OPEN episode(s): ${describeEpisodes(contributing)}`
     + ` · ${tapeImported} contract(s) held on `
     + '`history_import` rows are NOT counted as ours (the 2026-08-21 regression)');
 
@@ -309,16 +397,51 @@ check('G3.fleet-at-risk-is-the-TOTAL',
   + ' — the gate still folds the TOTAL, adopted premium included');
 
 // ── CONTROLS. An assertion that cannot fail proves nothing (TRA-3884) ────────
-// C1 — the tape re-derivation must REJECT a row inflated by $1.00.
+// C1 — the identity comparison must ACCEPT the matching value and REJECT it off
+// by $1.00.
+//
+// ⛔ BOTH LIMBS ARE CONSTRUCTED HERE. The first draft asserted only "a row
+// inflated by $1.00 differs from the tape", read off the LIVE row — which is
+// vacuously true on every run where the real identity ALREADY fails, and its
+// detail string then printed "…the same comparison that passed the real one"
+// on a run where the real one had not passed. That is the C5 defect (a control
+// whose verdict moves with its subject) and the fail-detail defect (prose
+// written as the hypothesis instead of computed from the measurement), both
+// recorded on 2026-08-21 and both re-committed here. Measured again on
+// 2026-08-24, when G2.tape was un-gradeable and C1 scored a meaningless PASS.
 {
-  const r = withRows[0];
-  const mutated = { ...r, adoptedPremiumAtRiskUsd: (r.adoptedPremiumAtRiskUsd ?? 0) + 1 };
-  const engineMutated = mutated.openPremiumAtRiskUsd - mutated.adoptedPremiumAtRiskUsd;
-  const tapeUsd = [...new Set(liveOpens.map(f => f.optionSymbol))]
-    .reduce((s, sym) => s + tapeBasis(sym).costBasisUsd, 0);
-  check('C1.identity-can-FAIL',
-    cents(engineMutated) !== cents(tapeUsd),
-    'a row inflated by $1.00 is rejected by the same comparison that passed the real one');
+  const anchor = 156_00 / 100; // a neutral basis; nothing is read off today's book
+  const accepts = cents(anchor) === cents(anchor);
+  const rejects = cents(anchor + 1) !== cents(anchor);
+  check('C1.identity-can-PASS-and-can-FAIL',
+    accepts && rejects,
+    `the comparison accepts an exact match (${usd(anchor)}) and rejects the same value off by`
+    + ` $1.00 (${usd(anchor + 1)}) — both limbs constructed, neither read off today's book`);
+}
+// C6 — THE NEW NON-GRADE GATE MUST FIRE, AND MUST STAY SILENT.
+//
+// A blind branch that fires on every input is the same instrument as no grader
+// (TRA-3926 C8 / TRA-3911 C5). The gate is `tapeUsd > total`, so both limbs are
+// one comparison over constructed operands — and the SILENT limb is the one
+// that matters, because it is what stops this gate from swallowing a real
+// attribution FAIL by calling it a ledger gap.
+{
+  const fires = tapeExceedsBook(156, 150);          // the 2026-08-24 shape
+  const silentEqual = !tapeExceedsBook(150, 150);   // tape and book agree exactly
+  const silentUnder = !tapeExceedsBook(33, 150);    // book holds desk money too
+  // ⛔ THE DETAIL IS COMPUTED FROM THE MEASUREMENT, NEVER WRITTEN AS THE
+  // HYPOTHESIS. C5's old message ended "…and still fires on this run"
+  // unconditionally, so the one run in its life that FAILED printed the precise
+  // opposite of what had happened. Every clause below reports what the limb
+  // actually returned.
+  check('C6.stale-tape-gate-is-not-a-constant',
+    fires && silentEqual && silentUnder,
+    `tape $156.00 vs book $150.00 -> ${fires ? 'FIRES' : 'does NOT fire (gate is dead:'
+      + ' the stale-tape shape would be graded as an attribution FAIL)'}`
+    + ` · equal $150.00/$150.00 -> ${silentEqual ? 'silent' : 'FIRES (gate is a constant)'}`
+    + ` · book holds desk premium too, $33.00 of $150.00 -> ${silentUnder ? 'silent'
+      : 'FIRES (gate would swallow every real attribution FAIL)'}`
+    + ' — both limbs constructed here and routed through the SAME predicate the verdict uses');
 }
 // C2 — the field-presence test must be able to SEE an absent key. Without this
 // the deployed-bytes proof is worthless, which is the whole basis of G1.
@@ -420,8 +543,11 @@ if (after.commit !== before.commit || after.pid !== before.pid || after.startedA
 console.log(`# pin AFTER   commit=${after.commit} pid=${after.pid} uptimeSec=${age(after)}`);
 
 console.log('');
-for (const r of rows) console.log(`${r.ok ? 'PASS' : 'FAIL'}  ${r.id.padEnd(34)} ${r.detail}`);
+for (const r of rows) {
+  console.log(`${r.nograde ? 'NOGRD' : r.ok ? 'PASS ' : 'FAIL '} ${r.id.padEnd(34)} ${r.detail}`);
+}
 const failed = rows.filter(r => !r.ok);
+const ungraded = rows.filter(r => r.nograde === true);
 console.log('');
 console.log(`# books gate-open=${armedBooks.length} with-rows=${withRows.length}`
   + ` · live buy_to_open in ledger=${liveOpens.length}`);
@@ -450,6 +576,19 @@ if (typeof after.uptimeSec === 'number' && after.uptimeSec < SHALLOW_BOOT_SEC) {
 // real FAIL is never downgraded to "could not tell".
 const noSubject = subjectAbsenceReason(withRows, drift, failed.length);
 if (noSubject) blind(noSubject);
-console.log(`${failed.length === 0 ? 'PASS' : 'FAIL'} — ${rows.length - failed.length}/${rows.length}`
+
+// ⛔ PRECEDENCE, and it is deliberate: a genuine FAIL is NEVER downgraded to
+// BLIND. Only once nothing has actually failed does an un-gradeable criterion
+// decide the verdict — because "we could not test the thing this ticket ships"
+// must not be reported with the same exit code as "we tested it and it holds".
+console.log(`${failed.length === 0 ? (ungraded.length === 0 ? 'PASS' : 'BLIND') : 'FAIL'}`
+  + ` — ${rows.length - failed.length - ungraded.length}/${rows.length - ungraded.length} graded`
+  + (ungraded.length > 0 ? `, ${ungraded.length} NOT GRADED` : '')
   + ` at uptimeSec=${age(after)}`);
-process.exit(failed.length === 0 ? 0 : 1);
+if (failed.length > 0) process.exit(1);
+if (ungraded.length > 0) {
+  console.error(`BLIND — ${ungraded.length} criterion/criteria could not be evaluated:`
+    + ` ${ungraded.map(r => r.id).join(', ')}`);
+  process.exit(3);
+}
+process.exit(0);
