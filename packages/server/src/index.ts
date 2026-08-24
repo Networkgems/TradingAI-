@@ -6189,6 +6189,15 @@ registerLiveHealthRoutes(app, {
   // lesson, ~40 lines up).
   liveOtmAggregateExposure: () =>
     getAllUserContexts().map(ctx => ctx.engine.getLiveOtmAggregateExposure()),
+  // TRA-3979 — per-book OPEN LIVE ROWS for the fleet concentration fold.
+  // ⚠ WHOLE FLEET, no filter here, for the same reason `liveOtmAggregateExposure`
+  // above carries none: the gate that owns the population is applied INSIDE
+  // `gradeFleetConcentration` (`liveEntryGateOpen`) and published beside the
+  // reading, so a filter applied in this caller would silently narrow the
+  // denominator where no unit test can see it (the TRA-2650 `fleetBooks`
+  // lesson, ~50 lines up) AND would make `booksChecked` a lie.
+  liveOtmConcentration: () =>
+    getAllUserContexts().map(ctx => ctx.engine.getFleetConcentrationBook()),
   // TRA-3976 — the held-symbol set the phantom-open-episode census grades
   // against. The fill ledger knows which OCCs it believes are OPEN; only this
   // module can enumerate which ones the fleet's books actually HOLD, and the

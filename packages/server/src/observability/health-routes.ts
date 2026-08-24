@@ -120,6 +120,8 @@ import { RV_LONG_DELTA_FLOOR } from '@trading-app/engine';
 import { summarizeCostAwareGate } from '../cost-aware-gate-ledger.js';
 import { summarizeLiveEnforceGate } from '../live-enforce-gate-ledger.js'; // TRA-2048
 import { gradeCanaryCeilingHealth } from '../canary-ceiling.js'; // TRA-3836
+// TRA-3979 — fleet concentration. ADVISORY: no order site consults it.
+import { gradeFleetConcentration, type FleetConcentrationBookRow } from '../fleet-concentration.js';
 import {
   summarizeEodArchiveParticipation,
   type EodParticipationSessionAnomaly,
@@ -454,6 +456,18 @@ export interface LiveHealthDeps {
    * "not wired", never `[]` ("no books").
    */
   liveOtmAggregateExposure?: () => Array<LiveOtmAggregateExposure>;
+  /**
+   * TRA-3979 — per-book OPEN LIVE ROWS, for the fleet CONCENTRATION fold
+   * published as `fleetConcentration` on this route.
+   *
+   * Wire it to `getAllUserContexts().map(ctx => ctx.engine.getFleetConcentrationBook())`
+   * — the WHOLE fleet again, for the same reason as the row above: the
+   * `liveEntryGateOpen` population gate is applied inside the grader and
+   * NAMED in its output, so narrowing here would move the denominator out of
+   * the payload that reports it. Optional: absent ⇒ `status: 'unwired'`, which
+   * is emphatically NOT a reading of zero concentration.
+   */
+  liveOtmConcentration?: () => Array<FleetConcentrationBookRow>;
   /**
    * TRA-3976 — every OCC symbol on the fleet's LIVE open book right now,
    * backing the `phantomOpenEpisodes` census on
@@ -4778,6 +4792,38 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // (Math.max(0, …) is why 08-17's 6.91x published as "within"); this
       // block exists so that state has a byte that differs.
       canaryCeiling: gradeCanaryCeilingHealth(aggregateExposureRows, liveEnv),
+      /**
+       * ⭐ TRA-3979 — THE SAME DOLLARS `aggregateFleetBound` COUNTS, SLICED BY
+       * CONTRACT AND BY UNDERLYING INSTEAD OF BY BOOK.
+       *
+       * On 2026-08-24 both gate-open books bought `NVTS261002C00012500` 19
+       * minutes apart — $305, 68.7% of the $444 fleet at-risk, in ONE strike on
+       * ONE expiry — and every gate above passed, correctly. The bound cannot
+       * tell that apart from $305 spread across three names, because it only
+       * ever counts dollars. A DOLLAR CEILING IS NOT A RISK CEILING ONCE MORE
+       * THAN ONE BOOK SHARES A SIGNAL GENERATOR.
+       *
+       * ⛔ ADVISORY — `entryPathBehavior: 'advisory_no_refusal'`, `refuses:
+       * false`. NO ORDER SITE CONSULTS THIS OBJECT. A refusal here is a
+       * board-facing change to a ratified arm and needs a ceiling the board
+       * set; this is the measurement they set it against (back to TRA-3703).
+       *
+       * ⭐ The PRESENCE of this key is the deployed-bytes proof (assert with
+       * `hasOwnProperty`; a build without the module lacks the key entirely).
+       * Read `status` FIRST — `unwired` ≠ `empty` ≠ `measured`, and only the
+       * last is a reading. Then `maxContract` / `multiBookContracts` (the
+       * hazard: one OCC, more than one gate-open book) and `maxUnderlying` /
+       * `multiBookUnderlyings` (two strikes on one name are the same hazard
+       * wearing a different key). `concentrationIsLowerBound: true` ⇒ every
+       * share below is soft in the PERMISSIVE direction.
+       *
+       * `fleetAtRiskUsd` here is folded from the same per-row primitive as
+       * `openPremiumAtRiskUsd`, so it must equal
+       * `aggregateFleetBound.fleetAtRiskUsd`. If it ever does not, one of the
+       * two is reading a population the other is not — grade that, do not
+       * average it.
+       */
+      fleetConcentration: gradeFleetConcentration(deps.liveOtmConcentration?.() ?? null),
       // The ACTUAL arm each order site consults: raw flag AND the window. `windowOpen`
       // false ⇒ both sleeves read OFF regardless of their booleans (fail-closed).
       arm: {

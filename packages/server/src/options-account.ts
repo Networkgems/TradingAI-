@@ -34,6 +34,9 @@ import {
 import type { SpotResolver, PortfolioGreeksOptions } from './reports/portfolio-greeks.js';
 // TRA-3944 — the OTM contract floor's per-entry contract cap + AC3 audit shape.
 import { capOtmEntryContracts, type OtmContractFloorAuditRow } from './otm-contract-floor.js';
+// TRA-3979 — type-only; `fleet-concentration.ts` imports nothing, so this
+// cannot form a cycle.
+import type { FleetConcentrationPositionRow } from './fleet-concentration.js';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
   OPTIONS_BUDGET_RATIO,
@@ -3255,6 +3258,80 @@ export function isOperatorBasisPinLive(
 }
 
 /**
+ * TRA-3979 — ONE open row's contribution to {@link foldOpenPremiumAtRisk}'s
+ * `usd`, decomposed.
+ *
+ * ⭐ THIS EXISTS SO A SECOND READER CANNOT DRIFT. The fleet CONCENTRATION fold
+ * (`fleet-concentration.ts`) needs the same dollars sliced by CONTRACT rather
+ * than by book, and the honest way to get that is to call the same per-row
+ * arithmetic the enforced figure is built from — not to re-implement
+ * `premiumPaid × remaining × 100` beside it and hope the two stay equal
+ * through the next basis ticket. `Σ atRiskUsd` over a book's priced rows is
+ * `usd` by construction, and `fleet-concentration.test.ts` asserts exactly
+ * that against the same population.
+ *
+ * `priced: false` ⇒ this row is what `unpricedRows` counts: it contributes $0
+ * and the total is known to UNDERSTATE. A caller folding concentration must
+ * carry that count forward rather than treating the row as absent.
+ */
+export interface RowOpenPremiumAtRisk {
+  /** The row's premium/remaining pair was usable. `false` ⇒ `unpricedRows`. */
+  priced: boolean;
+  /** `contractsRemaining ?? contracts`; 0 when unpriced. */
+  contracts: number;
+  /** `premiumPaid × contracts × 100`, the row's own basis. 0 when unpriced. */
+  basisUsd: number;
+  /** TRA-3965 uplift ACTUALLY ADDED (0 when suppressed by an operator pin). */
+  unbookedUsd: number;
+  /** TRA-3965 uplift a live operator pin held OFF. Never inside `atRiskUsd`. */
+  unbookedSuppressedUsd: number;
+  /** TRA-3958 — a live operator basis pin prices this row. */
+  pinned: boolean;
+  /** `basisUsd + unbookedUsd` — the row's exact contribution to `usd`. */
+  atRiskUsd: number;
+}
+
+export function rowOpenPremiumAtRisk(
+  p: Pick<
+    OptionPosition,
+    'premiumPaid' | 'contracts' | 'contractsRemaining' | 'brokerEntryFill' | 'operatorBasisPin'
+  >,
+): RowOpenPremiumAtRisk {
+  const remaining = p.contractsRemaining ?? p.contracts;
+  if (
+    !Number.isFinite(p.premiumPaid) || p.premiumPaid <= 0
+    || !Number.isFinite(remaining) || remaining <= 0
+  ) {
+    return {
+      priced: false,
+      contracts: 0,
+      basisUsd: 0,
+      unbookedUsd: 0,
+      unbookedSuppressedUsd: 0,
+      pinned: false,
+      atRiskUsd: 0,
+    };
+  }
+  const basisUsd = p.premiumPaid * remaining * 100;
+  const pinned = isOperatorBasisPinLive(p);
+  const unbooked = unbookedEntryPremiumForRow(p, remaining);
+  // ⛔ AN OPERATOR PIN OUTRANKS THE CORRECTION — see the long note at the call
+  // site in `foldOpenPremiumAtRisk`. Kept here, not there, so the two readers
+  // cannot disagree about which dollars a pin suppresses.
+  const unbookedUsd = unbooked > 0 && !pinned ? unbooked : 0;
+  const unbookedSuppressedUsd = unbooked > 0 && pinned ? unbooked : 0;
+  return {
+    priced: true,
+    contracts: remaining,
+    basisUsd,
+    unbookedUsd,
+    unbookedSuppressedUsd,
+    pinned,
+    atRiskUsd: basisUsd + unbookedUsd,
+  };
+}
+
+/**
  * TRA-3445 — sum PREMIUM AT RISK over open long-option rows, USD.
  *
  * This is deliberately a fold over POSITIONS rather than a counter incremented
@@ -3309,15 +3386,17 @@ export function foldOpenPremiumAtRisk(
   let unbookedEntryPremiumRows = 0;
   let unbookedEntryPremiumSuppressedUsd = 0;
   for (const p of positions) {
-    const remaining = p.contractsRemaining ?? p.contracts;
-    if (
-      !Number.isFinite(p.premiumPaid) || p.premiumPaid <= 0
-      || !Number.isFinite(remaining) || remaining <= 0
-    ) {
+    // TRA-3979 — the per-row arithmetic moved to `rowOpenPremiumAtRisk` so the
+    // concentration fold slices THESE dollars rather than a second copy of
+    // them. Values below are byte-identical to the inline version this
+    // replaced; `option-live-otm-aggregate-cap.test.ts` is the control.
+    const row = rowOpenPremiumAtRisk(p);
+    const remaining = row.contracts;
+    if (!row.priced) {
       unpricedRows += 1;
       continue;
     }
-    const rowUsd = p.premiumPaid * remaining * 100;
+    const rowUsd = row.basisUsd;
     usd += rowUsd;
     rows += 1;
     // TRA-3958 — declare the basis PROVENANCE of the dollars this fold spends.
@@ -3326,7 +3405,7 @@ export function foldOpenPremiumAtRisk(
     // Note these dollars are NOT carved out of `usd` — a pinned row is still
     // real exposure. This is a provenance overlay on the same total, which is
     // why it can and does overlap `adoptedUsd`.
-    if (isOperatorBasisPinLive(p)) {
+    if (row.pinned) {
       operatorPinnedUsd += rowUsd;
       operatorPinnedRows += 1;
     }
@@ -3348,13 +3427,12 @@ export function foldOpenPremiumAtRisk(
     // to a pinned row would re-open, from a second direction, exactly the
     // authorization the operator's write already settled — the live BAC row is
     // pinned at 1.17 and carries a 1.65 engine fill, so this is not theoretical.
-    const unbooked = unbookedEntryPremiumForRow(p, remaining);
-    if (unbooked > 0) {
-      if (isOperatorBasisPinLive(p)) {
-        unbookedEntryPremiumSuppressedUsd += unbooked;
+    if (row.unbookedSuppressedUsd > 0 || row.unbookedUsd > 0) {
+      if (row.unbookedSuppressedUsd > 0) {
+        unbookedEntryPremiumSuppressedUsd += row.unbookedSuppressedUsd;
       } else {
-        usd += unbooked;
-        unbookedEntryPremiumUsd += unbooked;
+        usd += row.unbookedUsd;
+        unbookedEntryPremiumUsd += row.unbookedUsd;
         unbookedEntryPremiumRows += 1;
       }
     }
@@ -5160,6 +5238,43 @@ export class PaperOptionsAccount {
       entryDelta: p.entryDelta,
       openedAt: p.openedAt,
     }));
+  }
+
+  /**
+   * TRA-3979 — this book's open rows for `mode`, in the fleet CONCENTRATION
+   * fold's shape.
+   *
+   * ⭐ PRICED BY {@link rowOpenPremiumAtRisk}, the same primitive
+   * {@link openPremiumAtRiskForMode} sums. `Σ atRiskUsd` over the rows returned
+   * here is that method's `usd` by construction — which is what lets the
+   * concentration report's `fleetAtRiskUsd` be compared directly against
+   * `aggregateFleetBound.fleetAtRiskUsd` instead of being a second, plausibly
+   * different number wearing the same units.
+   *
+   * ⚠ IMPORTED ROWS INCLUDED, and deliberately: concentration is about
+   * exposure to the CONTRACT, not about who opened it. An adopted desk NVTS
+   * call sits on the same strike as ours (TRA-3829 — `importedFromTradier` is
+   * bookkeeping, not authorization). The `adopted` split stays available on
+   * the exposure row for readers who need to apportion blame; this fold is
+   * about what the fleet is holding.
+   */
+  concentrationRowsForMode(mode: AccountMode): FleetConcentrationPositionRow[] {
+    const out: FleetConcentrationPositionRow[] = [];
+    for (const p of this.openOptions.values()) {
+      if ((p.mode ?? 'demo') !== mode) continue;
+      const priced = rowOpenPremiumAtRisk(p);
+      out.push({
+        optionSymbol: typeof p.optionSymbol === 'string' && p.optionSymbol !== ''
+          ? p.optionSymbol
+          : null,
+        symbol: typeof p.symbol === 'string' && p.symbol !== '' ? p.symbol : null,
+        expiration: typeof p.expiration === 'string' && p.expiration !== '' ? p.expiration : null,
+        contracts: priced.contracts,
+        atRiskUsd: priced.atRiskUsd,
+        priced: priced.priced,
+      });
+    }
+    return out;
   }
 
   openPremiumAtRiskForMode(mode: AccountMode, excludePositionId?: string): OpenPremiumAtRisk {

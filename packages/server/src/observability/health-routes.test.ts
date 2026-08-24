@@ -6598,3 +6598,75 @@ describe('GET /api/health/live-options-fee-slippage — capRatification (TRA-369
     expect(serveCaps().capRatification.notionalCap.matchesLive).toBe(true);
   });
 });
+
+// ─── TRA-3979 — FLEET CONCENTRATION, on the read side ─────────────────────────
+// The fold itself is graded in `fleet-concentration.test.ts`. What is graded
+// HERE is the thing AC5 is actually about: THE KEY IS ON THE WIRE. A field that
+// exists in the repo and not in the deployed payload satisfies nothing, and the
+// two are indistinguishable from the repo (TRA-3660 — a deploy order's commit
+// is a lower bound on CONTENT, not an expected reading; grade field presence).
+describe('GET /api/health/live-options-fee-slippage — fleet concentration (TRA-3979)', () => {
+  function serveConc(liveOtmConcentration?: () => Array<{
+    book: string | null;
+    liveEntryGateOpen: boolean;
+    positions: Array<{
+      optionSymbol: string | null; symbol: string | null; expiration: string | null;
+      contracts: number; atRiskUsd: number; priced: boolean;
+    }> | null;
+  }>) {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => undefined) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+      ...(liveOtmConcentration ? { liveOtmConcentration } : {}),
+    });
+    const res = fakeRes();
+    routes.get('/api/health/live-options-fee-slippage')![0]!({}, res);
+    return res.body as Record<string, never> & {
+      fleetConcentration: {
+        status: string; entryPathBehavior: string; refuses: boolean;
+        populationGate: string; booksChecked: number; booksEvaluated: number;
+        fleetAtRiskUsd: number;
+        maxContract: { key: string; atRiskUsd: number; books: string[] } | null;
+        maxUnderlying: { key: string } | null;
+        multiBookContracts: Array<{ key: string; bookCount: number }>;
+      };
+    };
+  }
+
+  it('publishes the key even with no provider — UNWIRED, never a zero reading', () => {
+    const body = serveConc();
+    // ⭐ The PRESENCE of the key is the deployed-bytes proof.
+    expect(Object.prototype.hasOwnProperty.call(body, 'fleetConcentration')).toBe(true);
+    expect(body.fleetConcentration.status).toBe('unwired');
+    expect(body.fleetConcentration.maxContract).toBeNull();
+  });
+
+  it('reproduces the live 08-24 shape through the route', () => {
+    const p = (occ: string, sym: string, usd: number) => ({
+      optionSymbol: occ, symbol: sym, expiration: '2026-10-02',
+      contracts: 1, atRiskUsd: usd, priced: true,
+    });
+    const body = serveConc(() => [
+      { book: 'v0nni', liveEntryGateOpen: true, positions: [p('NVTS261002C00012500', 'NVTS', 154)] },
+      { book: 'admin', liveEntryGateOpen: true, positions: [p('NVTS261002C00012500', 'NVTS', 151)] },
+      { book: 'Richard', liveEntryGateOpen: false, positions: [] },
+    ]);
+    const fc = body.fleetConcentration;
+    expect(fc.status).toBe('measured');
+    expect(fc.fleetAtRiskUsd).toBe(305);
+    expect(fc.maxContract!.key).toBe('NVTS261002C00012500');
+    expect(fc.maxContract!.books).toEqual(['admin', 'v0nni']);
+    expect(fc.multiBookContracts).toHaveLength(1);
+    expect(fc.maxUnderlying!.key).toBe('NVTS');
+    // AC3 — the denominator is named and both counts are on the wire.
+    expect(fc.populationGate).toBe('liveEntryGateOpen');
+    expect(fc.booksChecked).toBe(3);
+    expect(fc.booksEvaluated).toBe(2);
+    // AC4 — advisory, said on the wire.
+    expect(fc.entryPathBehavior).toBe('advisory_no_refusal');
+    expect(fc.refuses).toBe(false);
+  });
+});

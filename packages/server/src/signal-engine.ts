@@ -136,6 +136,8 @@ import type { LiveOtmFleetCapitalRow, LiveOtmFleetSizingReason, UnsettledLivePre
 // avoided; unwired it returns `null` and sizing falls back to the per-book
 // bound already in force (it never darks a book).
 import { readLiveOtmFleetCapitalRows } from './live-otm-fleet-capital.js';
+/** TRA-3979 — fleet concentration (advisory; refuses nothing). */
+import type { FleetConcentrationBookRow } from './fleet-concentration.js';
 import {
   lastRecordedOpenSleeve,
   recordLiveOptionFill,
@@ -9444,6 +9446,28 @@ export class SignalEngine {
       // fold the order site and the exposure row use, so the three cannot
       // disagree about what this book's basis is.
       openPremiumAtRiskUsd: this.optionsAccount.openPremiumAtRiskForMode('live').usd,
+    };
+  }
+
+  /**
+   * TRA-3979 — this book's contribution to the fleet CONCENTRATION fold: its
+   * open LIVE rows, keyed by contract and underlying.
+   *
+   * ⭐ THE GATE IS NOT RE-DERIVED HERE. `liveEntryGateOpen` comes from
+   * {@link getLiveOtmFleetCapitalRow}, the same row `aggregateFleetBound` sums
+   * on, so the concentration report and the dollar bound cannot end up graded
+   * over two different populations — the exact failure AC3 exists to prevent.
+   *
+   * ⚠ LIVE ROWS ONLY, matching `openPremiumAtRiskUsd` on the exposure row, so
+   * `Σ` across gate-open books reconciles with `fleetAtRiskUsd`. A demo row is
+   * not fleet risk and folding it in would inflate every share.
+   */
+  getFleetConcentrationBook(): FleetConcentrationBookRow {
+    const gateRow = this.getLiveOtmFleetCapitalRow();
+    return {
+      book: gateRow.book,
+      liveEntryGateOpen: gateRow.liveEntryGateOpen,
+      positions: this.optionsAccount.concentrationRowsForMode('live'),
     };
   }
 
