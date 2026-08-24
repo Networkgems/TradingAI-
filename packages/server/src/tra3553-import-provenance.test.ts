@@ -101,12 +101,12 @@ describe('TRA-3553 — the oracle can tell "not ours" from "I cannot tell"', () 
     // here so the rest of the file has a named cause rather than an assumed
     // one. `lastRecordedOpenSleeve` is null-for-both, which is exactly why a
     // caller reading its silence as "foreign" cannot be correct in both worlds.
-    expect(lastRecordedOpenSleeve('TSLA260911C00555000')).toBeNull(); // empty ledger
+    expect(lastRecordedOpenSleeve('TSLA260911C00555000', null)).toBeNull(); // empty ledger
 
     recordEngineOpen('SPY260515C00450000', 'single_leg_otm');
     // Populated ledger, different contract — still null, same value, different
     // meaning.
-    expect(lastRecordedOpenSleeve('TSLA260911C00555000')).toBeNull();
+    expect(lastRecordedOpenSleeve('TSLA260911C00555000', null)).toBeNull();
   });
 
   it('BOTH DIRECTIONS: the same unknown contract reads foreign or unresolved by ledger health alone', () => {

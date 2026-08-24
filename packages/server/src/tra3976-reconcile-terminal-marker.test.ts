@@ -132,16 +132,16 @@ describe('TRA-3976 AC3 — THIS row, exactly: the oracle must not answer `contra
     // cannot tell "the marker works" from "the shape never had the defect".
     record('buy_to_open', 1, { filledPrice: 1.23, orderId: 142828896, at: 0 });
 
-    expect(openEpisodeWindow(SOFI).status).toBe('open');
-    expect(recordedEngineOpenBasis(SOFI)?.contracts).toBe(1);
-    expect(recordedEngineOpenBasis(SOFI)?.costBasisUsd).toBeCloseTo(123, 5);
-    expect(engineNetOpenContracts(SOFI).engineNetContracts).toBe(1);
+    expect(openEpisodeWindow(SOFI, null).status).toBe('open');
+    expect(recordedEngineOpenBasis(SOFI, null)?.contracts).toBe(1);
+    expect(recordedEngineOpenBasis(SOFI, null)?.costBasisUsd).toBeCloseTo(123, 5);
+    expect(engineNetOpenContracts(SOFI, null).engineNetContracts).toBe(1);
   });
 
   it('the READER refuses: `recordedEngineOpenBasis` returns null, not 1 contract at $123', () => {
     sofiPhantomShape();
 
-    const basis = recordedEngineOpenBasis(SOFI);
+    const basis = recordedEngineOpenBasis(SOFI, null);
     // Name the specific wrong answer, not just `null`: `toBeNull()` alone would
     // pass for a walk broken in some new way too.
     expect(basis?.contracts).not.toBe(1);
@@ -152,7 +152,7 @@ describe('TRA-3976 AC3 — THIS row, exactly: the oracle must not answer `contra
   it('the EPISODE is a REFUSAL, not a count and not `flat`', () => {
     sofiPhantomShape();
 
-    const window = openEpisodeWindow(SOFI);
+    const window = openEpisodeWindow(SOFI, null);
     expect(window.status).toBe('indeterminate');
     expect(window.reason).toBe('reconcile_terminal');
     expect(window.netContracts).toBe(0);
@@ -176,9 +176,9 @@ describe('TRA-3976 AC3 — THIS row, exactly: the oracle must not answer `contra
       row,
       1,
       1,
-      () => recordedEngineOpenBasis(SOFI),
+      () => recordedEngineOpenBasis(SOFI, null),
       false,
-      () => engineNetOpenContracts(SOFI),
+      () => engineNetOpenContracts(SOFI, null),
     );
 
     expect(bound.exitContracts).toBe(0);
@@ -200,9 +200,9 @@ describe('TRA-3976 AC3 — THIS row, exactly: the oracle must not answer `contra
       { importedFromTradier: true, adoptionAuthority: 'engine_origin', tradierEnv: 'production' },
       1,
       1,
-      () => recordedEngineOpenBasis(SOFI),
+      () => recordedEngineOpenBasis(SOFI, null),
       false,
-      () => engineNetOpenContracts(SOFI),
+      () => engineNetOpenContracts(SOFI, null),
     );
     // Without the marker the engine would sell the phantom contract.
     expect(unmarked.exitContracts).toBe(1);
@@ -212,9 +212,9 @@ describe('TRA-3976 AC3 — THIS row, exactly: the oracle must not answer `contra
       { importedFromTradier: true, adoptionAuthority: 'engine_origin', tradierEnv: 'production' },
       1,
       1,
-      () => recordedEngineOpenBasis(SOFI),
+      () => recordedEngineOpenBasis(SOFI, null),
       false,
-      () => engineNetOpenContracts(SOFI),
+      () => engineNetOpenContracts(SOFI, null),
     );
     expect(marked.exitContracts).toBe(0);
   });
@@ -225,7 +225,7 @@ describe('TRA-3976 AC3 — THIS row, exactly: the oracle must not answer `contra
     const split = splitEngineExposureContracts(
       { importedFromTradier: true, adoptionAuthority: 'engine_origin', tradierEnv: 'production' },
       1,
-      () => recordedEngineOpenBasis(SOFI),
+      () => recordedEngineOpenBasis(SOFI, null),
     );
     expect(split.engineContracts).toBe(0);
     expect(split.adoptedContracts).toBe(1);
@@ -238,8 +238,8 @@ describe('TRA-3976 AC3 — THIS row, exactly: the oracle must not answer `contra
 
   it('the POINT oracles stop answering too', () => {
     sofiPhantomShape();
-    expect(lastRecordedOpenFill(SOFI)).toBeNull();
-    expect(lastRecordedOpenSleeve(SOFI)).toBeNull();
+    expect(lastRecordedOpenFill(SOFI, null)).toBeNull();
+    expect(lastRecordedOpenSleeve(SOFI, null)).toBeNull();
   });
 });
 
@@ -252,12 +252,12 @@ describe('TRA-3976 AC4 — the negative controls: this is not "refuse everything
     record('buy_to_open', 3, { filledPrice: 1.23, orderId: 140028461, at: 0 });
     record('sell_to_close', 1, { at: 60_000 });
 
-    const window = openEpisodeWindow(SOFI);
+    const window = openEpisodeWindow(SOFI, null);
     expect(window.status).toBe('open');
     expect(window.netContracts).toBe(2);
     expect(window.terminations).toBe(0);
 
-    const net = engineNetOpenContracts(SOFI);
+    const net = engineNetOpenContracts(SOFI, null);
     expect(net.status).toBe('open');
     expect(net.engineOpenContracts).toBe(3);
     expect(net.closedContracts).toBe(1);
@@ -267,9 +267,9 @@ describe('TRA-3976 AC4 — the negative controls: this is not "refuse everything
       { importedFromTradier: true, adoptionAuthority: 'engine_origin', tradierEnv: 'production' },
       2,
       2,
-      () => recordedEngineOpenBasis(SOFI),
+      () => recordedEngineOpenBasis(SOFI, null),
       false,
-      () => engineNetOpenContracts(SOFI),
+      () => engineNetOpenContracts(SOFI, null),
     );
     expect(bound.exitContracts).toBe(2);
     expect(bound.refusedContracts).toBe(0);
@@ -281,7 +281,7 @@ describe('TRA-3976 AC4 — the negative controls: this is not "refuse everything
     // re-bought. The re-entry writes its own `buy_to_open`, so the episode
     // re-opens and the engine keeps the ability to exit its own new position.
     sofiPhantomShape();
-    expect(openEpisodeWindow(SOFI).reason).toBe('reconcile_terminal');
+    expect(openEpisodeWindow(SOFI, null).reason).toBe('reconcile_terminal');
 
     record('buy_to_open', 2, {
       filledPrice: 0.9,
@@ -290,23 +290,23 @@ describe('TRA-3976 AC4 — the negative controls: this is not "refuse everything
       at: DROP_TIME - OPEN_TIME + 3_600_000,
     });
 
-    const window = openEpisodeWindow(SOFI);
+    const window = openEpisodeWindow(SOFI, null);
     expect(window.status).toBe('open');
     expect(window.netContracts).toBe(2);
     expect(window.fills.map((f) => f.orderId)).toEqual([143000111]); // episode A is GONE
     expect(window.reason).toBeNull();
 
-    expect(recordedEngineOpenBasis(SOFI)?.contracts).toBe(2);
-    expect(recordedEngineOpenBasis(SOFI)?.stoppedAtTermination).toBe(true);
-    expect(lastRecordedOpenSleeve(SOFI)).toBe('single_leg_rv');
+    expect(recordedEngineOpenBasis(SOFI, null)?.contracts).toBe(2);
+    expect(recordedEngineOpenBasis(SOFI, null)?.stoppedAtTermination).toBe(true);
+    expect(lastRecordedOpenSleeve(SOFI, null)).toBe('single_leg_rv');
 
     const bound = boundExitContractsToEngineShare(
       { importedFromTradier: true, adoptionAuthority: 'engine_origin', tradierEnv: 'production' },
       2,
       2,
-      () => recordedEngineOpenBasis(SOFI),
+      () => recordedEngineOpenBasis(SOFI, null),
       false,
-      () => engineNetOpenContracts(SOFI),
+      () => engineNetOpenContracts(SOFI, null),
     );
     expect(bound.exitContracts).toBe(2);
     expect(bound.reason).toBe('engine_accounted');
@@ -319,8 +319,8 @@ describe('TRA-3976 AC4 — the negative controls: this is not "refuse everything
 
     // The termination is history. Answering `reconcile_terminal` here would be
     // a refusal about an episode that ended for a different, known reason.
-    expect(openEpisodeWindow(SOFI).status).toBe('flat');
-    expect(openEpisodeWindow(SOFI).reason).toBeNull();
+    expect(openEpisodeWindow(SOFI, null).status).toBe('flat');
+    expect(openEpisodeWindow(SOFI, null).reason).toBeNull();
   });
 
   it('a marker on a symbol the ledger has already flattened does NOT downgrade the finding', () => {
@@ -331,7 +331,7 @@ describe('TRA-3976 AC4 — the negative controls: this is not "refuse everything
     record('sell_to_close', 1, { at: 60_000 });
     markDropped();
 
-    const window = openEpisodeWindow(SOFI);
+    const window = openEpisodeWindow(SOFI, null);
     expect(window.status).toBe('flat');
     expect(window.reason).toBeNull();
     expect(window.terminations).toBe(1); // still counted — the marker is not hidden
@@ -341,9 +341,9 @@ describe('TRA-3976 AC4 — the negative controls: this is not "refuse everything
     record('buy_to_open', 1, { optionSymbol: BAC, orderId: 777, at: 0 });
     sofiPhantomShape();
 
-    expect(openEpisodeWindow(SOFI).reason).toBe('reconcile_terminal');
-    expect(openEpisodeWindow(BAC).status).toBe('open');
-    expect(engineNetOpenContracts(BAC).engineNetContracts).toBe(1);
+    expect(openEpisodeWindow(SOFI, null).reason).toBe('reconcile_terminal');
+    expect(openEpisodeWindow(BAC, null).status).toBe('open');
+    expect(engineNetOpenContracts(BAC, null).engineNetContracts).toBe(1);
   });
 
   it('the master-arm HAND-OVER carve-out still overrides (TRA-3829 ruling B is unchanged)', () => {
@@ -361,9 +361,9 @@ describe('TRA-3976 AC4 — the negative controls: this is not "refuse everything
       },
       1,
       1,
-      () => recordedEngineOpenBasis(SOFI),
+      () => recordedEngineOpenBasis(SOFI, null),
       true,
-      () => engineNetOpenContracts(SOFI),
+      () => engineNetOpenContracts(SOFI, null),
     );
     expect(bound.reason).toBe('handed_over');
     expect(bound.exitContracts).toBe(1);
@@ -378,9 +378,9 @@ describe('TRA-3976 AC4 — the negative controls: this is not "refuse everything
       { importedFromTradier: true, adoptionAuthority: 'engine_origin', tradierEnv: 'production' },
       2,
       2,
-      () => recordedEngineOpenBasis(SOFI),
+      () => recordedEngineOpenBasis(SOFI, null),
       false,
-      () => engineNetOpenContracts(SOFI),
+      () => engineNetOpenContracts(SOFI, null),
     );
     expect(bound.blind).toBe(true);
     expect(bound.exitContracts).toBe(2);
@@ -392,8 +392,8 @@ describe('TRA-3976 AC4 — the negative controls: this is not "refuse everything
     // is `no_record`'s question and `recordedOpenFillCount` is still its
     // discriminator; converting it into a finding about a drop would be a guess.
     markDropped();
-    expect(openEpisodeWindow(SOFI).status).toBe('no_record');
-    expect(openEpisodeWindow(SOFI).reason).toBeNull();
+    expect(openEpisodeWindow(SOFI, null).status).toBe('no_record');
+    expect(openEpisodeWindow(SOFI, null).reason).toBeNull();
   });
 });
 
@@ -446,7 +446,7 @@ describe('TRA-3976 AC1 — the marker is written by the RECONCILE, at drop time'
 
   it('closing a broker-flat row the ledger reports OPEN writes exactly one marker', () => {
     record('buy_to_open', 1, { filledPrice: 1.23, orderId: 142828896, at: 0 });
-    expect(openEpisodeWindow(SOFI).status).toBe('open');
+    expect(openEpisodeWindow(SOFI, null).status).toBe('open');
 
     const acct = seed([engineRow()]);
     const closed = acct.closeBrokerFlatPosition('opt-sofi-19c', 'broker flat');
@@ -460,8 +460,8 @@ describe('TRA-3976 AC1 — the marker is written by the RECONCILE, at drop time'
     expect(markers[0]!.source).toBe('broker_flat_reconcile');
 
     // And the phantom is gone, through the real drop path.
-    expect(openEpisodeWindow(SOFI).reason).toBe('reconcile_terminal');
-    expect(recordedEngineOpenBasis(SOFI)).toBeNull();
+    expect(openEpisodeWindow(SOFI, null).reason).toBe('reconcile_terminal');
+    expect(recordedEngineOpenBasis(SOFI, null)).toBeNull();
   });
 
   it('the marker is NOT a fill: `records[]`, `closes` and the slippage set are untouched', () => {
@@ -576,7 +576,7 @@ describe('TRA-3976 — the back-fill for drops that predate the marker', () => {
 
   it('marks the SOFI phantom off OUR OWN journal row', () => {
     record('buy_to_open', 1, { filledPrice: 1.23, orderId: 142828896, at: 0 });
-    expect(openEpisodeWindow(SOFI).status).toBe('open');
+    expect(openEpisodeWindow(SOFI, null).status).toBe('open');
 
     const r = backfillReconcileTerminationsFromJournal([journalRow()]);
     expect(r).toEqual({
@@ -586,9 +586,9 @@ describe('TRA-3976 — the back-fill for drops that predate the marker', () => {
       duplicates: 0,
       written: 1,
     });
-    expect(openEpisodeWindow(SOFI).reason).toBe('reconcile_terminal');
-    expect(recordedEngineOpenBasis(SOFI)).toBeNull();
-    expect(engineNetOpenContracts(SOFI).engineNetContracts).toBe(0);
+    expect(openEpisodeWindow(SOFI, null).reason).toBe('reconcile_terminal');
+    expect(recordedEngineOpenBasis(SOFI, null)).toBeNull();
+    expect(engineNetOpenContracts(SOFI, null).engineNetContracts).toBe(0);
   });
 
   it('is idempotent across reruns', () => {
@@ -611,7 +611,7 @@ describe('TRA-3976 — the back-fill for drops that predate the marker', () => {
     ]);
     expect(r.candidates).toBe(0);
     expect(r.written).toBe(0);
-    expect(openEpisodeWindow(SOFI).status).toBe('open'); // untouched
+    expect(openEpisodeWindow(SOFI, null).status).toBe('open'); // untouched
   });
 
   it('a row with no OCC or no closeTs is UNASKABLE, counted, and not guessed at', () => {
@@ -624,7 +624,7 @@ describe('TRA-3976 — the back-fill for drops that predate the marker', () => {
     expect(r.unaskable).toBe(2);
     expect(r.written).toBe(0);
     // A row we cannot key is not a row we have cleared.
-    expect(openEpisodeWindow(SOFI).status).toBe('open');
+    expect(openEpisodeWindow(SOFI, null).status).toBe('open');
   });
 
   it('a reconcile close whose OCC the ledger already accounts for is a no-op', () => {
@@ -633,7 +633,7 @@ describe('TRA-3976 — the back-fill for drops that predate the marker', () => {
     const r = backfillReconcileTerminationsFromJournal([journalRow()]);
     expect(r.alreadyAccounted).toBe(1);
     expect(r.written).toBe(0);
-    expect(openEpisodeWindow(SOFI).status).toBe('flat'); // the FINDING survives
+    expect(openEpisodeWindow(SOFI, null).status).toBe('flat'); // the FINDING survives
   });
 
   it('does not touch an OCC the engine has since re-entered', () => {
@@ -647,7 +647,7 @@ describe('TRA-3976 — the back-fill for drops that predate the marker', () => {
     });
     backfillReconcileTerminationsFromJournal([journalRow()]);
 
-    const window = openEpisodeWindow(SOFI);
+    const window = openEpisodeWindow(SOFI, null);
     expect(window.status).toBe('open');
     expect(window.fills.map((f) => f.orderId)).toEqual([143000111]);
   });

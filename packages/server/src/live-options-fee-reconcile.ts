@@ -413,6 +413,15 @@ export function partitionUnmeasured(
 export async function runLiveOptionsFeeReconcile(
   buildClient: () => Promise<FeeReconcileHistoryClient | null>,
   now: number = Date.now(),
+  /**
+   * ⭐ TRA-3977 — the BOOK whose Tradier account `buildClient` resolves. Every
+   * `history_import` row this pass mints is the broker's record of a fill on
+   * THAT account, and until this argument existed those rows landed in a
+   * process-global array shared by two live books with nothing saying whose
+   * they were. Absent ⇒ the rows are honestly UNATTRIBUTED and every oracle
+   * refuses to answer from them once a second book is known.
+   */
+  book: string | null = null,
 ): Promise<LiveOptionsFeeReconcileState> {
   state.ticks += 1;
   state.lastTickAt = now;
@@ -505,7 +514,7 @@ export async function runLiveOptionsFeeReconcile(
     // becomes a ledger row before the fee joins run (a missing row otherwise
     // breaks its whole symbol/day/side group's qty reconciliation in the
     // gainloss join — one silent fill poisoned the group's fees too).
-    const coverage = importMissingLiveOptionFills(historyFills, today);
+    const coverage = importMissingLiveOptionFills(historyFills, today, book);
     state.coverage = coverage;
     state.totalImportedRows += coverage.importedRows;
     // TRA-3563 — then RE-PRICE any imported row the old attribution minted at a

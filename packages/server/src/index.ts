@@ -5043,6 +5043,11 @@ setTradierOrderSubmitObserver(recordEngineOrderSubmit);
           contracts: row.contracts ?? null,
           closeTs: row.closeTs ?? null,
           exitReason: row.exitReason ?? null,
+          // TRA-3977 — the journal's own owning-book column (TRA-1475). Rows
+          // written before it exists stay UNATTRIBUTED; this pass reconstructs
+          // the PAST, and the past is precisely what cannot be attributed after
+          // the fact.
+          account: row.account ?? null,
         })),
       );
       if (r.candidates > 0) {
@@ -5090,7 +5095,15 @@ async function buildLiveFeeReconcileClient(): Promise<TradierOptionsClient | nul
 // 90s so boot IO settles first; .unref() so the timer can never hold the process open;
 // the pass itself never throws and makes no broker call when nothing is unmeasured.
 setTimeout(() => {
-  void runLiveOptionsFeeReconcile(buildLiveFeeReconcileClient);
+  // TRA-3977 — the third argument is the BOOK. `buildLiveFeeReconcileClient`
+  // resolves `resolveLiveBrokerOperator()`'s PRODUCTION account, so every
+  // `history_import` row this pass mints belongs to that operator's book. The
+  // two must be resolved from the same call or the stamp would be a guess.
+  void runLiveOptionsFeeReconcile(
+    buildLiveFeeReconcileClient,
+    Date.now(),
+    resolveLiveBrokerOperator(),
+  );
 }, 90_000).unref();
 
 // TRA-3547 — everything the zombie-open sweep touches, in one place. Injected
@@ -17589,7 +17602,12 @@ scheduler.start({
     // TRA-2810 — join Tradier account-history commission onto any live fee/slippage
     // ledger row still fees:null. Self-quenching (zero IO once nothing is unmeasured)
     // and internally best-effort — it cannot throw into this tick.
-    await runLiveOptionsFeeReconcile(buildLiveFeeReconcileClient);
+    // TRA-3977 — same book resolution as the boot kick above.
+    await runLiveOptionsFeeReconcile(
+      buildLiveFeeReconcileClient,
+      Date.now(),
+      resolveLiveBrokerOperator(),
+    );
     // TRA-3547 — resolve live journal rows the broker tape says are NOT open:
     // back-fill the CLOSE for a real round trip, retract a row that never
     // filled, refuse anything ambiguous. Runs AFTER the fee reconcile above so a

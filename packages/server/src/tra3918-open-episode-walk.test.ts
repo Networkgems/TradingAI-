@@ -96,10 +96,10 @@ describe('TRA-3918 — the open-episode walk', () => {
       // trade through this engine, which is exactly why the ledger cannot see it
       // and exactly why the walk must not answer for it.
 
-      expect(lastRecordedOpenFill(XLF)).toBeNull();
-      expect(lastRecordedOpenSleeve(XLF)).toBeNull();
+      expect(lastRecordedOpenFill(XLF, null)).toBeNull();
+      expect(lastRecordedOpenSleeve(XLF, null)).toBeNull();
 
-      const window = openEpisodeWindow(XLF);
+      const window = openEpisodeWindow(XLF, null);
       expect(window.status).toBe('flat');
       expect(window.fills).toEqual([]);
       expect(window.netContracts).toBe(0);
@@ -113,7 +113,7 @@ describe('TRA-3918 — the open-episode walk', () => {
       // The defect returned this record. Assert on the ORDER ID rather than on
       // `null` alone: `toBeNull()` above passes for a walk that is broken in
       // some new way too, and this names the specific wrong answer.
-      const answered = lastRecordedOpenFill(XLF);
+      const answered = lastRecordedOpenFill(XLF, null);
       expect(answered?.orderId).not.toBe(140022786);
       expect(answered).toBeNull();
     });
@@ -121,12 +121,12 @@ describe('TRA-3918 — the open-episode walk', () => {
     it('a MULTI-contract episode closed in two partial sells still ends flat', () => {
       record('buy_to_open', 2);
       record('sell_to_close', 1); //  <- does NOT flatten; the episode is still open
-      expect(openEpisodeWindow(XLF).status).toBe('open');
-      expect(lastRecordedOpenFill(XLF)).not.toBeNull();
+      expect(openEpisodeWindow(XLF, null).status).toBe('open');
+      expect(lastRecordedOpenFill(XLF, null)).not.toBeNull();
 
       record('sell_to_close', 1); //  <- THIS one flattens
-      expect(openEpisodeWindow(XLF).status).toBe('flat');
-      expect(lastRecordedOpenFill(XLF)).toBeNull();
+      expect(openEpisodeWindow(XLF, null).status).toBe('flat');
+      expect(lastRecordedOpenFill(XLF, null)).toBeNull();
     });
 
     it('a PARTIAL close does NOT silence the oracle (the fail-open direction)', () => {
@@ -137,11 +137,11 @@ describe('TRA-3918 — the open-episode walk', () => {
       record('buy_to_open', 3, { orderId: 140028461 });
       record('sell_to_close', 1);
 
-      const window = openEpisodeWindow(XLF);
+      const window = openEpisodeWindow(XLF, null);
       expect(window.status).toBe('open');
       expect(window.netContracts).toBe(2);
-      expect(lastRecordedOpenFill(XLF)?.orderId).toBe(140028461);
-      expect(lastRecordedOpenSleeve(XLF)).toBe('single_leg_otm');
+      expect(lastRecordedOpenFill(XLF, null)?.orderId).toBe(140028461);
+      expect(lastRecordedOpenSleeve(XLF, null)).toBe('single_leg_otm');
     });
   });
 
@@ -152,13 +152,13 @@ describe('TRA-3918 — the open-episode walk', () => {
       record('sell_to_close', 1);
       record('buy_to_open', 2, { orderId: 222, sleeve: 'single_leg_rv', filledPrice: 0.6 });
 
-      const window = openEpisodeWindow(XLF);
+      const window = openEpisodeWindow(XLF, null);
       expect(window.status).toBe('open');
       expect(window.netContracts).toBe(2);
       expect(window.fills.map((f) => f.orderId)).toEqual([222]); // episode A is GONE
 
-      expect(lastRecordedOpenFill(XLF)?.orderId).toBe(222);
-      expect(lastRecordedOpenSleeve(XLF)).toBe('single_leg_rv');
+      expect(lastRecordedOpenFill(XLF, null)?.orderId).toBe(222);
+      expect(lastRecordedOpenSleeve(XLF, null)).toBe('single_leg_rv');
     });
 
     it('several adds inside the open episode all survive; the newest wins the point answer', () => {
@@ -167,10 +167,10 @@ describe('TRA-3918 — the open-episode walk', () => {
       record('buy_to_open', 1, { orderId: 222 });
       record('buy_to_open', 1, { orderId: 333 });
 
-      const window = openEpisodeWindow(XLF);
+      const window = openEpisodeWindow(XLF, null);
       expect(window.fills.map((f) => f.orderId)).toEqual([222, 333]); // oldest-first
       expect(window.netContracts).toBe(2);
-      expect(lastRecordedOpenFill(XLF)?.orderId).toBe(333);
+      expect(lastRecordedOpenFill(XLF, null)?.orderId).toBe(333);
     });
 
     it('other OCC symbols do not leak across the boundary', () => {
@@ -179,8 +179,8 @@ describe('TRA-3918 — the open-episode walk', () => {
       record('buy_to_open', 1, { orderId: 111 });
       record('sell_to_close', 1);
 
-      expect(lastRecordedOpenFill(XLF)).toBeNull();
-      expect(lastRecordedOpenFill(bac)?.orderId).toBe(777); // untouched
+      expect(lastRecordedOpenFill(XLF, null)).toBeNull();
+      expect(lastRecordedOpenFill(bac, null)?.orderId).toBe(777); // untouched
     });
   });
 
@@ -195,8 +195,8 @@ describe('TRA-3918 — the open-episode walk', () => {
       record('sell_to_close', 1, { atMin: 20 }); // recorded live at +20m
       record('buy_to_open', 1, { atMin: 5, orderId: 555 }); // recovered later, filled at +5m
 
-      expect(openEpisodeWindow(XLF).status).toBe('flat');
-      expect(lastRecordedOpenFill(XLF)).toBeNull();
+      expect(openEpisodeWindow(XLF, null).status).toBe('flat');
+      expect(lastRecordedOpenFill(XLF, null)).toBeNull();
     });
   });
 
@@ -207,17 +207,17 @@ describe('TRA-3918 — the open-episode walk', () => {
       // one leg of a round trip. Every episode boundary after this is unknowable.
       record('sell_to_close', 1);
 
-      const window = openEpisodeWindow(XLF);
+      const window = openEpisodeWindow(XLF, null);
       expect(window.status).toBe('indeterminate');
       expect(window.reason).toBe('unmatched_close');
-      expect(lastRecordedOpenFill(XLF)).toBeNull();
+      expect(lastRecordedOpenFill(XLF, null)).toBeNull();
     });
 
     it('a close for MORE than is open is indeterminate', () => {
       record('buy_to_open', 1);
       record('sell_to_close', 2);
 
-      expect(openEpisodeWindow(XLF).reason).toBe('unmatched_close');
+      expect(openEpisodeWindow(XLF, null).reason).toBe('unmatched_close');
     });
 
     it('an unusable `contracts` value refuses rather than netting NaN', () => {
@@ -226,17 +226,17 @@ describe('TRA-3918 — the open-episode walk', () => {
       // something compares it (TRA-3486).
       record('buy_to_open', Number.NaN);
 
-      const window = openEpisodeWindow(XLF);
+      const window = openEpisodeWindow(XLF, null);
       expect(window.status).toBe('indeterminate');
       expect(window.reason).toBe('unusable_quantity');
-      expect(lastRecordedOpenFill(XLF)).toBeNull();
+      expect(lastRecordedOpenFill(XLF, null)).toBeNull();
     });
 
     it('an OCC the ledger has never seen is `no_record`, distinct from `flat`', () => {
       record('buy_to_open', 1, { optionSymbol: 'BAC260918C00050000' });
 
-      expect(openEpisodeWindow(XLF).status).toBe('no_record');
-      expect(openEpisodeWindow(XLF).reason).toBeNull();
+      expect(openEpisodeWindow(XLF, null).status).toBe('no_record');
+      expect(openEpisodeWindow(XLF, null).reason).toBeNull();
     });
   });
 
@@ -251,15 +251,15 @@ describe('TRA-3918 — the open-episode walk', () => {
       // it: this one truncates on a PARTIAL close ON PURPOSE (its callers refuse
       // a quantity they cannot fully account for), which is the opposite of what
       // the provenance walk needs.
-      expect(recordedEngineOpenBasis(XLF)).toBeNull();
+      expect(recordedEngineOpenBasis(XLF, null)).toBeNull();
     });
 
     it('a partial close truncates it to a REFUSAL, unlike the provenance walk', () => {
       record('buy_to_open', 3, { filledPrice: 0.85 });
       record('sell_to_close', 1);
 
-      expect(recordedEngineOpenBasis(XLF)).toBeNull(); // basis: refuses
-      expect(openEpisodeWindow(XLF).status).toBe('open'); // provenance: answers
+      expect(recordedEngineOpenBasis(XLF, null)).toBeNull(); // basis: refuses
+      expect(openEpisodeWindow(XLF, null).status).toBe('open'); // provenance: answers
     });
 
     it('resolves the SECOND episode after a re-open', () => {
@@ -267,7 +267,7 @@ describe('TRA-3918 — the open-episode walk', () => {
       record('sell_to_close', 1);
       record('buy_to_open', 2, { filledPrice: 0.6 });
 
-      const basis = recordedEngineOpenBasis(XLF);
+      const basis = recordedEngineOpenBasis(XLF, null);
       expect(basis?.contracts).toBe(2);
       expect(basis?.premiumPaid).toBeCloseTo(0.6, 10);
       expect(basis?.stoppedAtClose).toBe(true);

@@ -45,6 +45,7 @@ function fill(overrides: Partial<LiveOptionFillRecord> = {}): LiveOptionFillReco
     ts: T('2026-07-31T13:36:03Z'),
     etDay: '2026-07-31',
     sleeve: 'single_leg_otm',
+    book: null, // TRA-3977 — the fixture is a single-book tape
     optionSymbol: 'AMZN260904P00245000',
     side: 'buy_to_open',
     contracts: 1,

@@ -99,7 +99,7 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
   it('lastRecordedOpenSleeve returns the open row sleeve so a close can inherit it (TRA-2811)', () => {
     clearLiveOptionsFeeSlippageLedger();
     // No open row yet — nothing to inherit.
-    expect(lastRecordedOpenSleeve('AMZN260904P00245000')).toBeNull();
+    expect(lastRecordedOpenSleeve('AMZN260904P00245000', null)).toBeNull();
     recordLiveOptionFill({
       ts: 1000,
       etDay: '2026-07-31',
@@ -137,9 +137,9 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
       fees: null,
       orderId: 139775135,
     });
-    expect(lastRecordedOpenSleeve('AMZN260904P00245000')).toBe('single_leg_otm');
+    expect(lastRecordedOpenSleeve('AMZN260904P00245000', null)).toBe('single_leg_otm');
     // A different contract's open does not leak across symbols.
-    expect(lastRecordedOpenSleeve('QQQ260904C00797000')).toBeNull();
+    expect(lastRecordedOpenSleeve('QQQ260904C00797000', null)).toBeNull();
   });
 
   it('lastRecordedOpenSleeve stops at the close that FLATTENS the position (TRA-3918)', () => {
@@ -155,7 +155,7 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
       contracts: 1, filledPrice: 2.0, orderId: 1,
     };
     recordLiveOptionFill(open);
-    expect(lastRecordedOpenSleeve('AMZN260904P00245000')).toBe('single_leg_otm');
+    expect(lastRecordedOpenSleeve('AMZN260904P00245000', null)).toBe('single_leg_otm');
 
     recordLiveOptionFill({
       ts: 2000, etDay: '2026-08-03', sleeve: 'single_leg_directional',
@@ -163,17 +163,18 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
       contracts: 1, filledPrice: 0.89, orderId: 139775135,
     });
     // We hold ZERO. The episode is over and does not get to answer again.
-    expect(lastRecordedOpenSleeve('AMZN260904P00245000')).toBeNull();
+    expect(lastRecordedOpenSleeve('AMZN260904P00245000', null)).toBeNull();
 
     // …and a genuine RE-OPEN answers with the SECOND episode, not the first.
     recordLiveOptionFill({ ...open, ts: 3000, sleeve: 'single_leg_rv', orderId: 2 });
-    expect(lastRecordedOpenSleeve('AMZN260904P00245000')).toBe('single_leg_rv');
+    expect(lastRecordedOpenSleeve('AMZN260904P00245000', null)).toBe('single_leg_rv');
   });
 
   it('hydrates prior fills from disk on boot (survives a reboot on a persistent dir)', () => {
     const dir = freshDir();
     const line = JSON.stringify({
       mode: 'live', ts: 5000, etDay: '2026-07-16', sleeve: 'single_leg_rv',
+      book: null, // TRA-3977 — single-book fixture tape
       optionSymbol: 'MSFT', side: 'sell_to_close', contracts: 2,
       submittedLimit: 2.5, askAtSubmit: 2.6, midAtSubmit: 2.55, filledPrice: 2.5,
       fees: null, slippageVsAsk: -0.1, slippageVsMid: -0.05, orderId: 7,
@@ -193,6 +194,7 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
     const dir = freshDir();
     const old = JSON.stringify({
       mode: 'live', ts: 1, etDay: '2020-01-01', sleeve: 'single_leg_otm',
+      book: null, // TRA-3977 — single-book fixture tape
       optionSymbol: 'OLD', side: 'buy_to_open', contracts: 1,
       submittedLimit: 1, askAtSubmit: 1, midAtSubmit: 1, filledPrice: 1,
       fees: null, slippageVsAsk: 0, slippageVsMid: 0, orderId: 1,
@@ -209,6 +211,7 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
   function ledgerRow(over: Partial<LiveOptionFillRecord>): LiveOptionFillRecord {
     return {
       mode: 'live', ts: 1000, etDay: '2026-07-16', sleeve: 'single_leg_otm',
+      book: null, // TRA-3977 — single-book fixture tape
       optionSymbol: 'AAPL240705C00210000', side: 'buy_to_open', contracts: 1,
       submittedLimit: 0.82, askAtSubmit: 0.82, midAtSubmit: 0.80, filledPrice: 0.83,
       fees: null, feeSource: null, slippageVsAsk: 0.01, slippageVsMid: 0.03,
@@ -506,6 +509,7 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
     const dir = freshDir();
     const poisoned = JSON.stringify({
       mode: 'live', ts: 5000, etDay: '2026-08-03', sleeve: 'single_leg_otm',
+      book: null, // TRA-3977 — single-book fixture tape
       optionSymbol: 'AMZN260904C00295000', side: 'buy_to_open', contracts: 3,
       submittedLimit: 1.0, askAtSubmit: 1.0, midAtSubmit: 0.95, filledPrice: 1.0,
       fees: 0, slippageVsAsk: 0, slippageVsMid: 0.05, orderId: null, // no feeSource
@@ -528,6 +532,7 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
     const dir = freshDir();
     const genuine = JSON.stringify({
       mode: 'live', ts: 5000, etDay: '2026-08-03', sleeve: 'single_leg_otm',
+      book: null, // TRA-3977 — single-book fixture tape
       optionSymbol: 'AMZN260904C00295000', side: 'buy_to_open', contracts: 3,
       submittedLimit: 1.0, askAtSubmit: 1.0, midAtSubmit: 0.95, filledPrice: 1.0,
       fees: 0, feeSource: 'gainloss_derived', slippageVsAsk: 0, slippageVsMid: 0.05, orderId: null,
@@ -544,6 +549,7 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
     const dir = freshDir();
     const legacy = JSON.stringify({
       mode: 'live', ts: 5000, etDay: '2026-08-03', sleeve: 'single_leg_otm',
+      book: null, // TRA-3977 — single-book fixture tape
       optionSymbol: 'AMZN260904C00295000', side: 'buy_to_open', contracts: 3,
       submittedLimit: 1.0, askAtSubmit: 1.0, midAtSubmit: 0.95, filledPrice: 1.0,
       fees: 1.05, slippageVsAsk: 0, slippageVsMid: 0.05, orderId: null,
@@ -589,6 +595,7 @@ describe('gainloss join rejection reasons (TRA-3558)', () => {
   function row(over: Partial<LiveOptionFillRecord> = {}): LiveOptionFillRecord {
     return {
       mode: 'live', ts: 1000, etDay: '2026-08-06', sleeve: 'single_leg_otm',
+      book: null, // TRA-3977 — single-book fixture tape
       optionSymbol: 'TROW260918C00115000', side: 'buy_to_open', contracts: 1,
       submittedLimit: 3.9, askAtSubmit: 3.9, midAtSubmit: 3.55, filledPrice: 3.79,
       fees: null, feeSource: null, slippageVsAsk: -0.11, slippageVsMid: 0.24,
@@ -805,6 +812,7 @@ describe('diffMissingFillsFromHistory (TRA-2959)', () => {
   function rec(over: Partial<LiveOptionFillRecord>): LiveOptionFillRecord {
     return {
       mode: 'live', ts: 1000, etDay: '2026-08-04', sleeve: 'single_leg_otm',
+      book: null, // TRA-3977 — single-book fixture tape
       optionSymbol: 'TSLA260911C00560000', side: 'buy_to_open', contracts: 4,
       submittedLimit: 0.27, askAtSubmit: 0.27, midAtSubmit: 0.25, filledPrice: 0.27,
       fees: null, feeSource: null, slippageVsAsk: 0, slippageVsMid: 0.02,
@@ -972,6 +980,7 @@ describe('repriceImportedFillsFromHistory (TRA-3563)', () => {
   function rec(over: Partial<LiveOptionFillRecord>): LiveOptionFillRecord {
     return {
       mode: 'live', ts: 1000, etDay: '2026-08-04', sleeve: 'single_leg_otm',
+      book: null, // TRA-3977 — single-book fixture tape
       optionSymbol: 'QQQ260911P00545000', side: 'buy_to_open', contracts: 4,
       submittedLimit: 0.58, askAtSubmit: 0.58, midAtSubmit: 0.555, filledPrice: 0.58,
       fees: null, feeSource: null, slippageVsAsk: 0, slippageVsMid: 0.025,

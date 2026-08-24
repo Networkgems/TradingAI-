@@ -271,7 +271,7 @@ describe('per-lot adoption of desk-added Tradier lots (TRA-3909)', () => {
       { ok: true, positions: BROKER_AT_2338 },
       acct.getState().openOptions,
       NOW,
-      (sym) => recordedEngineOpenBasis(sym)?.contracts ?? null,
+      (sym) => recordedEngineOpenBasis(sym, null)?.contracts ?? null,
     );
     // The state the ticket was filed against.
     expect(before.absorbedContracts).toBe(1);
@@ -283,7 +283,7 @@ describe('per-lot adoption of desk-added Tradier lots (TRA-3909)', () => {
       { ok: true, positions: BROKER_AT_2338 },
       acct.getState().openOptions,
       NOW,
-      (sym) => recordedEngineOpenBasis(sym)?.contracts ?? null,
+      (sym) => recordedEngineOpenBasis(sym, null)?.contracts ?? null,
     );
     expect(after.absorbedContracts).toBe(0);
     expect(after.excessContracts).toBe(0);
@@ -459,7 +459,7 @@ describe('per-lot adoption of desk-added Tradier lots (TRA-3909)', () => {
 
     const drift = diffLiveBrokerPositions(
       { ok: true, positions: BROKER_AT_2338 }, rows, NOW,
-      (sym) => recordedEngineOpenBasis(sym)?.contracts ?? null,
+      (sym) => recordedEngineOpenBasis(sym, null)?.contracts ?? null,
     );
     const measured = summarizeLiveUnmanagedRisk(
       rows, drift.excessContracts + drift.brokerOnlyContracts,
@@ -471,7 +471,7 @@ describe('per-lot adoption of desk-added Tradier lots (TRA-3909)', () => {
     const after = acct.getState().openOptions;
     const driftAfter = diffLiveBrokerPositions(
       { ok: true, positions: BROKER_AT_2338 }, after, NOW,
-      (sym) => recordedEngineOpenBasis(sym)?.contracts ?? null,
+      (sym) => recordedEngineOpenBasis(sym, null)?.contracts ?? null,
     );
     expect(summarizeLiveUnmanagedRisk(
       after, driftAfter.excessContracts + driftAfter.brokerOnlyContracts,
@@ -570,7 +570,7 @@ describe('per-lot adoption of desk-added Tradier lots (TRA-3909)', () => {
       { ok: true, positions: [brokerRow({ optionSymbol: XLF, strike: 57.5, contracts: 2, premiumPaid: 0.80 })] },
       acct.getState().openOptions.filter(o => o.optionSymbol === XLF),
       NOW,
-      (sym) => recordedEngineOpenBasis(sym)?.contracts ?? null,
+      (sym) => recordedEngineOpenBasis(sym, null)?.contracts ?? null,
     );
     expect(drift.excessContracts).toBe(1);
     expect(drift.absorbedContracts).toBe(0);

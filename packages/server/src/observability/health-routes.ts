@@ -4624,6 +4624,31 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
        * redeploy and every terminated episode silently reverts to its phantom.
        */
       phantomOpenEpisodes: phantomOpenEpisodeCensus(heldLiveOptionSymbols),
+      /**
+       * ⭐ TRA-3977 (AC5) — CAN `records[]` BE PARTITIONED BY BOOK AT ALL, and
+       * is any OCC open on two live books right now?
+       *
+       * The fill ledger is a PROCESS-GLOBAL array and this box serves two live
+       * books. Until TRA-3977 nothing on a row said which one placed it, so the
+       * exit bound's two oracles — keyed on the OCC alone — could size `admin`'s
+       * `sell_to_close` off a fill placed on `v0nni`, against a different broker
+       * account, and report it `bounded: false` / `blind: false`: a row the exit
+       * census recorded as CHECKED AND CLEAN.
+       *
+       * ⚠ READ `verdict` AND `unattributedRows`, IN THAT ORDER. `clean` means
+       * MEASURED-and-no-overlap; `overlap` means the permissive branch is
+       * reachable TODAY (not itself a defect — the scoping is what makes it
+       * safe — but it is the number that says the fix is load-bearing rather
+       * than argued); `unattributed` means the tape carries rows with no book
+       * and the overlap question CANNOT BE ANSWERED for those symbols. A quiet
+       * tape and a tape nobody can read must not share a byte.
+       *
+       * ⚠ `scopingReachable: false` ⇒ at most one book is known to this store,
+       * every oracle answers exactly as it did pre-TRA-3977, and this whole
+       * block is a no-op by construction. The PRESENCE of this key is the
+       * deployed-bytes proof (a build without it lacks the key entirely).
+       */
+      crossBookEpisodes: summary.crossBook,
       otmFlag: 'ENABLE_OPTION_LIVE_OTM',
       rvFlag: 'ENABLE_OPTION_LIVE_RV_LONG',
       windowVar: 'OPTION_LIVE_TEST_UNTIL',

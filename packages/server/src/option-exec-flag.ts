@@ -533,7 +533,21 @@ export interface EngineExitQuantityBound {
    * `handed_over` sentinel when a human's per-row grant lifted the bound before
    * the split was consulted.
    */
-  reason: EngineExposureReason | 'handed_over' | 'engine_net_of_closes' | 'reconcile_terminal';
+  reason:
+    | EngineExposureReason
+    | 'handed_over'
+    | 'engine_net_of_closes'
+    | 'reconcile_terminal'
+    /**
+     * ⭐ TRA-3977 — the fill ledger serves more than one book and at least one
+     * row on this OCC carries no book discriminator, so it cannot say whether
+     * those contracts are this book's or a sibling's. BLIND (the pre-fix
+     * quantity) and COUNTED, never permission — but named, because the remedy
+     * is not the other blind branches': those want somebody to look at the
+     * ledger, this one wants the row's book stamped at fill time and then
+     * waits out the retention window.
+     */
+    | 'book_unattributed';
   /**
    * True iff the oracle COULD NOT ANSWER for this row, rather than answering
    * and finding the contracts are not ours. Same discipline as
@@ -775,6 +789,33 @@ export function boundExitContractsToEngineShare(
         oracleRefused: false,
         blind: false,
         bounded: requested > 0,
+        netOfCloses: false,
+      };
+    }
+    // ── ⭐ TRA-3977 — THE REFUSAL THAT IS NOT A DARK INSTRUMENT EITHER ─────
+    // Asked BEFORE the positive-witness branch below, and named rather than
+    // folded into the generic BLIND return, because it is a THIRD state and the
+    // other two do not cover it: the ledger is neither dark for this OCC
+    // (`no_record`) nor holding our own statement that the position left the
+    // book (`reconcile_terminal`). It is holding rows it cannot attribute to a
+    // book, in a process that serves more than one.
+    //
+    // ⛔ BLIND, NOT BOUND, and the choice is the same one the rule note above
+    // makes branch by branch. Binding to 0 here would refuse an exit on every
+    // legacy row on the tape the day this ships — TRA-2820 exactly, at fleet
+    // scale — because every retained row predates the discriminator. The
+    // reachable population that can over-sell is unchanged from TRA-3926's; what
+    // changes is that it is now NAMED, so "the fix shrank the residual by N" is
+    // a claim about a counted population rather than about a quiet tape.
+    if (net !== null && net.status === 'indeterminate' && net.reason === 'book_unattributed') {
+      return {
+        exitContracts: requested,
+        refusedContracts: 0,
+        requestedContracts: requested,
+        reason: 'book_unattributed',
+        oracleRefused: true,
+        blind: true,
+        bounded: false,
         netOfCloses: false,
       };
     }

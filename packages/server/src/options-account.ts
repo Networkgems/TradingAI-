@@ -81,6 +81,11 @@ import {
   recordReconcileTermination,
   type RecordedEngineOpenBasis,
   type LiveFillSleeve,
+  // ⭐ TRA-3977 — every oracle above is now keyed on (book, OCC). The ledger is
+  // a PROCESS-GLOBAL array two live books append to, and until this ticket the
+  // rows it answered FROM belonged to the fleet while the row it answered ABOUT
+  // belonged to one book.
+  type LedgerBookScope,
 } from './live-options-fee-slippage-ledger.js';
 import {
   appendEngineBasisRestatement,
@@ -2359,7 +2364,15 @@ export type LiveOpenProvenance =
        * same fail-open guess in a new costume.
        */
       kind: 'unresolved';
-      reason: 'ledger_empty' | 'unmatched_close' | 'unusable_quantity' | 'reconcile_terminal';
+      reason:
+        | 'ledger_empty'
+        | 'unmatched_close'
+        | 'unusable_quantity'
+        | 'reconcile_terminal'
+        // ⭐ TRA-3977 — the ledger serves more than one book and holds rows on
+        // this OCC it cannot attribute to one. UNCLASSIFIED for the same reason
+        // as every sibling above, and the note below says which remedy it wants.
+        | 'book_unattributed';
     };
 
 /**
@@ -2396,6 +2409,16 @@ const LIVE_OPEN_PROVENANCE_UNRESOLVED_NOTE: Record<
     'ledger still showed it open, and no sell_to_close of ours accounts for it ' +
     '(the broker closed it out of band). The ledger cannot state a net position ' +
     'on this symbol, so provenance is UNCLASSIFIED — not foreign, and not ours.',
+  // ⭐ TRA-3977 — and its remedy is different from every sibling above: nobody
+  // needs to look at the ledger's arithmetic, and nobody needs to find out who
+  // closed the position at the broker. The rows are simply older than the
+  // discriminator, and the repair is forward-only.
+  book_unattributed:
+    'the fee/slippage ledger is shared by more than one live book and holds ' +
+    'rows on this contract carrying no book, so it cannot say whether they are ' +
+    'THIS book\'s or a sibling\'s. UNCLASSIFIED — attributing them to the book ' +
+    'that happens to be asking is the permissive default this refusal exists to ' +
+    'refuse. Self-heals as attributed fills replace the retained ones.',
 };
 
 /**
@@ -2421,8 +2444,17 @@ const LIVE_OPEN_PROVENANCE_UNRESOLVED_NOTE: Record<
  * round trip for this symbol has already demonstrated it can answer, and a
  * second liveness probe could only ever downgrade a finding to a refusal.
  */
-function ledgerOpenProvenance(optionSymbol: string): LiveOpenProvenance {
-  const window = openEpisodeWindow(optionSymbol);
+function ledgerOpenProvenance(
+  optionSymbol: string,
+  /**
+   * TRA-3977 — the asking book. A sibling book's open is not evidence that THIS
+   * book placed the contract sitting under this OCC, and stamping a returning
+   * desk contract `engine_origin` off somebody else's fill is the third of the
+   * three oracles TRA-3976 enumerated reading one silence three ways.
+   */
+  book: LedgerBookScope,
+): LiveOpenProvenance {
+  const window = openEpisodeWindow(optionSymbol, book);
   if (window.status === 'indeterminate') {
     // The ledger's own arithmetic does not close. It cannot vouch for this
     // symbol in EITHER direction, and `foreign` here would be a guess that
@@ -3253,8 +3285,17 @@ export function foldOpenPremiumAtRisk(
    * and defaulted to the real module so every existing caller gets the corrected
    * attribution without a change at the call site.
    */
-  recordedOpenBasis: (optionSymbol: string) => RecordedEngineOpenBasis | null =
-    recordedEngineOpenBasis,
+  /**
+   * ⭐ TRA-3977 — the default is a BOOK-BLIND lookup (`book: null`), i.e. "the
+   * caller did not name its book". On a single-book process that is byte-for-
+   * byte the pre-TRA-3977 answer; once a second book is known to the ledger it
+   * is a REFUSAL, which routes the dollars to the desk (conservative for this
+   * reader). ⛔ It must not default to a fleet-wide read: that is the exact
+   * behaviour where `v0nni`'s `buy_to_open` was counted as `admin`'s engine
+   * share. The real caller passes its own book below.
+   */
+  recordedOpenBasis: (optionSymbol: string) => RecordedEngineOpenBasis | null = (occ) =>
+    recordedEngineOpenBasis(occ, null),
 ): OpenPremiumAtRisk {
   let usd = 0;
   let rows = 0;
@@ -3980,7 +4021,12 @@ export class PaperOptionsAccount {
     this.optionsDailyTradesLimit = config.optionsDailyTradesLimit ?? DEFAULT_ACCOUNT_SETTINGS.optionsDailyTradesLimit;
     this.otmRiskParams = config.otmRiskParams ?? OTM_RISK_PARAMS;
     this.rvRiskParams = config.rvRiskParams ?? RV_RISK_PARAMS;
-    this.resolveLiveOpenSleeve = config.resolveLiveOpenSleeve ?? lastRecordedOpenSleeve;
+    // ⭐ TRA-3977 — the book is read LAZILY, at call time, not captured here:
+    // `setOwner` runs AFTER construction (the per-user engine wire-up), so a
+    // value snapshotted in the constructor would be `undefined` on every real
+    // book and the oracle would be permanently book-blind.
+    this.resolveLiveOpenSleeve =
+      config.resolveLiveOpenSleeve ?? ((sym: string) => lastRecordedOpenSleeve(sym, this.owner ?? null));
     // TRA-3553 — precedence, stated once here rather than re-derived at each
     // call site: an explicit three-valued oracle wins; otherwise a caller that
     // installed the legacy sleeve hook gets its `null` read as `foreign` (it
@@ -3995,7 +4041,7 @@ export class PaperOptionsAccount {
               ? { kind: 'engine', sleeve, orderId: null }
               : { kind: 'foreign' };
           }
-        : ledgerOpenProvenance);
+        : (sym: string) => ledgerOpenProvenance(sym, this.owner ?? null));
     if (config.resolveUnderlyingEntrySpot) {
       this.resolveUnderlyingEntrySpot = config.resolveUnderlyingEntrySpot;
     }
@@ -5125,6 +5171,14 @@ export class PaperOptionsAccount {
       // constructed with an explicit `actOnAdoptedBrokerRows` override reports
       // the split the SAME way its own exit path decides.
       this.actOnAdoptedBrokerRows,
+      // ⭐ TRA-3977 — THIS book's rows, not the fleet's. The fill ledger is a
+      // process-global array two live books append to; before this argument, a
+      // sibling book's `buy_to_open` on the same OCC counted as this row's
+      // engine share and this fold under-reported `adoptedUsd` accordingly.
+      // `this.owner` is the same `alertUsername` the order-path chokepoint
+      // stamps onto the fill (TRA-1475 / TRA-3977), so the two ends of the join
+      // are the same string by construction — never re-derived from the row.
+      (occ) => recordedEngineOpenBasis(occ, this.owner ?? null),
     );
   }
 
@@ -7077,8 +7131,13 @@ export class PaperOptionsAccount {
         // routes to the conservative side. Synthesising an empty-string lookup
         // would walk the ledger for `''`, find nothing, and reach the same
         // branch by accident rather than by decision.
+        // ⭐ TRA-3977 — scoped to THIS book. See `openPremiumAtRiskForMode`;
+        // on the WRITE path the same mis-scoping let a fill placed on one book
+        // authorize a `sell_to_close` on another book's row, against a
+        // different broker account, and report it `bounded: false` /
+        // `blind: false` — a row the census recorded as CHECKED AND CLEAN.
         typeof opt.optionSymbol === 'string' && opt.optionSymbol.length > 0
-          ? recordedEngineOpenBasis(opt.optionSymbol)
+          ? recordedEngineOpenBasis(opt.optionSymbol, this.owner ?? null)
           : null,
       // TRA-3829 ruling B's master arm, for the per-row HAND-OVER carve-out
       // only — the same value the authorisation gate above this call resolved.
@@ -7088,8 +7147,11 @@ export class PaperOptionsAccount {
       // symbol must reach the refusal by DECISION, not by walking the ledger for
       // `''` and finding nothing.
       () =>
+        // ⭐ TRA-3977 — and the SECOND oracle is scoped identically. Two
+        // oracles on one write path scoped differently would be a third way to
+        // answer the wrong question.
         typeof opt.optionSymbol === 'string' && opt.optionSymbol.length > 0
-          ? engineNetOpenContracts(opt.optionSymbol)
+          ? engineNetOpenContracts(opt.optionSymbol, this.owner ?? null)
           : null,
     );
     // The denominator is scoped to the population the bound can BITE on. A demo
@@ -9851,7 +9913,8 @@ export class PaperOptionsAccount {
       return { status: 'refused', reason: 'persisted_basis_unreadable', ...context, detail: 'the row\'s own `premiumPaid` is not a positive finite number, so the threshold rescale has no anchor.' };
     }
 
-    const recorded = recordedEngineOpenBasis(optionSymbol);
+    // TRA-3977 — this book's own fills; a sibling's basis is not this row's.
+    const recorded = recordedEngineOpenBasis(optionSymbol, this.owner ?? null);
     if (!recorded) {
       // The oracle's silence is three-valued and this is the honest reading of
       // it: an EMPTY ledger (never hydrated, DATA_DIR unreadable, retention aged
@@ -10526,7 +10589,7 @@ export class PaperOptionsAccount {
         ) {
           this.importedAbsorptionCandidates += 1;
           const recorded = existing.optionSymbol
-            ? recordedEngineOpenBasis(existing.optionSymbol)
+            ? recordedEngineOpenBasis(existing.optionSymbol, this.owner ?? null) // TRA-3977
             : null;
           // `null` (no record at all) is NOT permission. It is the oracle unable
           // to answer, and the fail-open reading of it is what put a foreign
@@ -10910,7 +10973,7 @@ export class PaperOptionsAccount {
       // The engine's oldest open in the CURRENT episode draws the window a desk
       // add must fall inside. `openEpisodeWindow` is the same walk the other
       // oracles share; anything but `open` leaves the window undrawable.
-      const episode = openEpisodeWindow(occ);
+      const episode = openEpisodeWindow(occ, this.owner ?? null); // TRA-3977 — this book's episode
       const episodeStartMs = episode.status === 'open' && episode.fills.length > 0 ? episode.fills[0]!.ts : null;
       return {
         orders: captureBase.orders.filter(o => o.optionSymbol === occ),
@@ -10946,7 +11009,7 @@ export class PaperOptionsAccount {
       // for every symbol. `planLotAdoption` says so as `not_live` rather than
       // letting the oracle's structural silence read as a finding.
       const live = mode === 'live';
-      const recorded = live ? recordedEngineOpenBasis(occ) : null;
+      const recorded = live ? recordedEngineOpenBasis(occ, this.owner ?? null) : null; // TRA-3977
       const plan = planLotAdoption(
         { optionSymbol: occ, contracts: incoming.contracts, premiumPaid: incoming.premiumPaid },
         views,
@@ -11074,7 +11137,7 @@ export class PaperOptionsAccount {
       // The schedule the ENGINE's sibling contract on this OCC is managed on,
       // read from the ledger's own `buy_to_open` row. The desk added to this
       // trade, so the lot gets this trade's schedule against its OWN basis.
-      const fill = lastRecordedOpenFill(plan.optionSymbol);
+      const fill = lastRecordedOpenFill(plan.optionSymbol, this.owner ?? null); // TRA-3977
       const sleeve = fill && fill.sleeve !== 'unattributed'
         ? (fill.sleeve === 'directional' ? 'single_leg_directional' : fill.sleeve)
         : null;
@@ -11918,10 +11981,14 @@ export class PaperOptionsAccount {
     // episode the ledger already has closed is noise in a census whose whole
     // value is that its normal reading is zero.
     const occ = typeof opt.optionSymbol === 'string' ? opt.optionSymbol : '';
-    if (occ !== '' && openEpisodeWindow(occ).status === 'open') {
+    // TRA-3977 — this book's episode, and the marker below is stamped with the
+    // same book. A drop is evidence about OUR book leaving a position; a
+    // sibling's drop must neither trigger our marker nor truncate our episode.
+    if (occ !== '' && openEpisodeWindow(occ, this.owner ?? null).status === 'open') {
       const droppedAt = Date.now();
       const wrote = recordReconcileTermination({
         ts: droppedAt,
+        book: this.owner ?? null,
         // ET, not `toDateKey` (which is UTC): the ledger's `etDay` column is ET
         // and a UTC key rolls the day 4–5 hours early (TRA-407). Same inline
         // idiom the closed-today fold above uses rather than a new import.

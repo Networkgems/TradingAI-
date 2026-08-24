@@ -141,12 +141,12 @@ beforeEach(() => {
 // ─────────────────────────────────────────────────────────────────────────────
 describe('recordedEngineOpenBasis — "what did WE pay, and for how many"', () => {
   it('answers null on an empty ledger, which is UNRESOLVED and not "we bought nothing"', () => {
-    expect(recordedEngineOpenBasis(BAC)).toBeNull();
+    expect(recordedEngineOpenBasis(BAC, null)).toBeNull();
   });
 
   it('returns the single recorded fill: BAC 1 ct @ 1.65, order 142603649', () => {
     recordEngineOpen(BAC, 1, 1.65);
-    expect(recordedEngineOpenBasis(BAC)).toMatchObject({
+    expect(recordedEngineOpenBasis(BAC, null)).toMatchObject({
       contracts: 1,
       premiumPaid: 1.65,
       costBasisUsd: 165,
@@ -160,7 +160,7 @@ describe('recordedEngineOpenBasis — "what did WE pay, and for how many"', () =
   it('weights a partial-fill top-up by quantity — 1@1.00 + 2@1.30 is 3 @ 1.20', () => {
     recordEngineOpen(BAC, 1, 1.0, 1, OPENED_AT);
     recordEngineOpen(BAC, 2, 1.3, 2, OPENED_AT + 1_000);
-    const recorded = recordedEngineOpenBasis(BAC)!;
+    const recorded = recordedEngineOpenBasis(BAC, null)!;
     expect(recorded.contracts).toBe(3);
     expect(recorded.premiumPaid).toBeCloseTo(1.2, 10);
     expect(recorded.orderIds).toEqual([1, 2]); // oldest-first, i.e. fill order
@@ -179,7 +179,7 @@ describe('recordedEngineOpenBasis — "what did WE pay, and for how many"', () =
       orderId: 2,
     });
     recordEngineOpen(BAC, 1, 1.65, 3, OPENED_AT + 2_000);
-    const recorded = recordedEngineOpenBasis(BAC)!;
+    const recorded = recordedEngineOpenBasis(BAC, null)!;
     // 1 @ 1.65 — the CURRENT episode. Blending the closed 5 @ 9.99 in would be
     // the same averaging error one level up, with our own numbers.
     expect(recorded).toMatchObject({ contracts: 1, premiumPaid: 1.65, stoppedAtClose: true });
@@ -188,7 +188,7 @@ describe('recordedEngineOpenBasis — "what did WE pay, and for how many"', () =
   it('counts an unpriced fill instead of averaging over the priced subset only', () => {
     recordEngineOpen(BAC, 1, 1.65, 1, OPENED_AT);
     recordEngineOpen(BAC, 1, null, 2, OPENED_AT + 1_000);
-    const recorded = recordedEngineOpenBasis(BAC)!;
+    const recorded = recordedEngineOpenBasis(BAC, null)!;
     expect(recorded.unpricedFills).toBe(1);
     // The average over what IS priced is still 1.65 and still WRONG for a 2-lot
     // position. `unpricedFills` is what stops a caller reading it as complete.
@@ -197,7 +197,7 @@ describe('recordedEngineOpenBasis — "what did WE pay, and for how many"', () =
 
   it('another contract\'s fills never leak in', () => {
     recordEngineOpen(XLF, 1, 0.85);
-    expect(recordedEngineOpenBasis(BAC)).toBeNull();
+    expect(recordedEngineOpenBasis(BAC, null)).toBeNull();
   });
 });
 
@@ -556,7 +556,7 @@ describe('TRA-3896 part 2 — the reconcile refuses to widen an engine-origin ro
       origin: 'history_import',
     });
     // The oracle knows 2 contracts exist and can vouch for exactly 1 of them.
-    const basis = recordedEngineOpenBasis(XLF)!;
+    const basis = recordedEngineOpenBasis(XLF, null)!;
     expect(basis.contracts).toBe(2);
     expect(basis.enginePlacedContracts).toBe(1);
     expect(basis.importedContracts).toBe(1);

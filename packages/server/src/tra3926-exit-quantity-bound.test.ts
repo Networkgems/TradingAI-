@@ -558,6 +558,7 @@ function ledgerRow(over: Partial<LiveOptionFillRecord>): LiveOptionFillRecord {
     ts: OPENED_AT,
     etDay: '2026-08-20',
     sleeve: 'single_leg_otm',
+    book: null, // TRA-3977 — the fixture is a single-book tape
     optionSymbol: XLF,
     side: 'buy_to_open',
     contracts: 1,
@@ -768,11 +769,11 @@ describe('TRA-3926 second oracle — the engine may not sell what its own closes
   };
   /** The first oracle, refusing exactly as it does on the live tape. */
   const silent = () => null;
-  const netOracle = () => engineNetOpenContracts(BAC);
+  const netOracle = () => engineNetOpenContracts(BAC, null);
 
   it('reports the live BAC account: one ours, one the desk’s, our close consumed OURS', () => {
     theLiveTape();
-    expect(engineNetOpenContracts(BAC)).toEqual({
+    expect(engineNetOpenContracts(BAC, null)).toEqual({
       status: 'open',
       netContracts: 1,
       engineOpenContracts: 1,
@@ -810,7 +811,7 @@ describe('TRA-3926 second oracle — the engine may not sell what its own closes
     fill({ ts: BAC_ENGINE_AT + 1_000, side: 'buy_to_open', filledPrice: 1.7, orderId: 142603650 });
     fill({ ts: BAC_CLOSE_AT, side: 'sell_to_close', filledPrice: 2.4, orderId: 142899523 });
 
-    expect(engineNetOpenContracts(BAC)).toMatchObject({
+    expect(engineNetOpenContracts(BAC, null)).toMatchObject({
       status: 'open',
       netContracts: 1,
       engineOpenContracts: 2,
@@ -853,7 +854,7 @@ describe('TRA-3926 second oracle — the engine may not sell what its own closes
     });
     fill({ ts: BAC_CLOSE_AT, side: 'sell_to_close', filledPrice: 0.91, orderId: 142899523 });
 
-    expect(engineNetOpenContracts(BAC)).toMatchObject({ status: 'open', engineOpenContracts: 0 });
+    expect(engineNetOpenContracts(BAC, null)).toMatchObject({ status: 'open', engineOpenContracts: 0 });
     const bound = boundExitContractsToEngineShare(deskRow, 1, 1, silent, false, netOracle);
     expect(bound).toMatchObject({ exitContracts: 1, blind: true, netOfCloses: false });
   });
@@ -865,7 +866,7 @@ describe('TRA-3926 second oracle — the engine may not sell what its own closes
     fill({ ts: BAC_ENGINE_AT, side: 'buy_to_open', filledPrice: 1.65, orderId: 142603649 });
     fill({ ts: BAC_CLOSE_AT, side: 'sell_to_close', contracts: 4, filledPrice: 0.91, orderId: 142899523 });
 
-    expect(engineNetOpenContracts(BAC)).toMatchObject({
+    expect(engineNetOpenContracts(BAC, null)).toMatchObject({
       status: 'indeterminate',
       reason: 'unmatched_close',
       engineNetContracts: 0,
@@ -880,7 +881,7 @@ describe('TRA-3926 second oracle — the engine may not sell what its own closes
     fill({ ts: BAC_ENGINE_AT, side: 'buy_to_open', filledPrice: 1.65, orderId: 142603649 });
     fill({ ts: BAC_CLOSE_AT, side: 'sell_to_close', filledPrice: 0.91, orderId: 142899523 });
 
-    expect(engineNetOpenContracts(BAC)).toMatchObject({ status: 'flat', engineNetContracts: 0 });
+    expect(engineNetOpenContracts(BAC, null)).toMatchObject({ status: 'flat', engineNetContracts: 0 });
     const bound = boundExitContractsToEngineShare(deskRow, 1, 1, silent, false, netOracle);
     expect(bound).toMatchObject({ exitContracts: 1, blind: true, netOfCloses: false });
   });
@@ -889,7 +890,7 @@ describe('TRA-3926 second oracle — the engine may not sell what its own closes
     fill({ ts: BAC_ENGINE_AT, side: 'buy_to_open', contracts: 6, filledPrice: 1.65, orderId: 142603649 });
     fill({ ts: BAC_CLOSE_AT, side: 'sell_to_close', filledPrice: 0.91, orderId: 142899523 });
 
-    expect(engineNetOpenContracts(BAC)).toMatchObject({ engineNetContracts: 5 });
+    expect(engineNetOpenContracts(BAC, null)).toMatchObject({ engineNetContracts: 5 });
     const bound = boundExitContractsToEngineShare(deskRow, 2, 2, silent, false, netOracle);
     expect(bound.exitContracts).toBe(2);
     expect(bound.bounded).toBe(false);

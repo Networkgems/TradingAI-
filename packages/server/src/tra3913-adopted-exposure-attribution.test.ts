@@ -472,7 +472,7 @@ describe('TRA-3913 regression — a `history_import` row is not evidence that WE
 
   it('CONTROL — the wide count IS 2, which is what un-fixed the live book', () => {
     replayLiveTape();
-    const basis = recordedEngineOpenBasis(XLF)!;
+    const basis = recordedEngineOpenBasis(XLF, null)!;
     // This is not a bug in `contracts`: two contracts of this OCC really are
     // open at the broker, and a RISK reader wants that. The defect was reading
     // it as an answer to "did WE buy them".
@@ -482,7 +482,7 @@ describe('TRA-3913 regression — a `history_import` row is not evidence that WE
 
   it('scopes the engine share to the rows we PLACED: 1 @ 1.08, with 1 imported', () => {
     replayLiveTape();
-    const basis = recordedEngineOpenBasis(XLF)!;
+    const basis = recordedEngineOpenBasis(XLF, null)!;
     expect(basis.enginePlacedContracts).toBe(1);
     expect(basis.enginePlacedPremiumPaid).toBeCloseTo(1.08, 10);
     expect(basis.enginePlacedUnpricedFills).toBe(0);
@@ -540,7 +540,7 @@ describe('TRA-3913 regression — a `history_import` row is not evidence that WE
       side: 'buy_to_open', contracts: 2, filledPrice: 0.965, orderId: null,
       origin: 'history_import',
     });
-    const basis = recordedEngineOpenBasis(XLF)!;
+    const basis = recordedEngineOpenBasis(XLF, null)!;
     expect(basis.enginePlacedContracts).toBe(0);
     expect(basis.importedContracts).toBe(2);
 
@@ -595,7 +595,7 @@ describe('TRA-3913 regression — a `history_import` row is not evidence that WE
       side: 'buy_to_open', contracts: 1, filledPrice: null, orderId: null,
       origin: 'history_import',
     });
-    const basis = recordedEngineOpenBasis(XLF)!;
+    const basis = recordedEngineOpenBasis(XLF, null)!;
     expect(basis.unpricedFills).toBe(1); // episode-wide: yes
     expect(basis.enginePlacedUnpricedFills).toBe(0); // about OUR fills: no
 
@@ -614,7 +614,7 @@ describe('TRA-3913 regression — a `history_import` row is not evidence that WE
       ts: FILL_TS, etDay: '2026-08-20', sleeve: 'single_leg_otm', optionSymbol: XLF,
       side: 'buy_to_open', contracts: 2, filledPrice: 0.965, orderId: 142603071,
     });
-    const basis = recordedEngineOpenBasis(XLF)!;
+    const basis = recordedEngineOpenBasis(XLF, null)!;
     expect(basis.enginePlacedContracts).toBe(2);
     expect(basis.importedContracts).toBe(0);
   });

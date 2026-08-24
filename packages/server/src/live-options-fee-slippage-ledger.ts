@@ -56,6 +56,119 @@ export const LIVE_OPTION_RECONCILE_TERMINATION_LOG_FILENAME =
  */
 const RETAIN_MS = 30 * 24 * 60 * 60 * 1000;
 
+// ════════════════════════════════════════════════════════════════════════════
+// ⭐ TRA-3977 — THIS STORE IS FLEET-WIDE AND THE NUMBER IT HANDS THE EXIT PATH
+// IS SPENT PER BOOK.
+//
+// ── The measurement, live, 2026-08-24T14:4xZ on `3d0c3582` ──────────────────
+// `/api/health/live-options-fee-slippage` carries TWO `mode: 'live'` books with
+// `liveEntryGateOpen: true` — `admin` (BAC + RIG) and `v0nni` (NVTS) — and they
+// are not the same broker account. `records[]` carried, in the SAME array:
+//
+//     NVTS261002C00012500  buy_to_open  ct=1 @1.54  oid=143021643  sleeve=single_leg_otm
+//
+// $154 — v0nni's entire book — sitting next to admin's BAC / RIG / XLF rows,
+// with NOTHING on the row saying so. `LiveOptionFillRecord` had fields for
+// mode, ts, etDay, sleeve, optionSymbol, side, contracts, four prices, fees,
+// feeSource, two slippage columns, orderId and origin — and no book, user or
+// account discriminator. The store is a module-global array, one per process,
+// shared by every book the process serves.
+//
+// ── Why that is a DEFECT and not an untidiness ──────────────────────────────
+// TRA-3926 shipped `boundExitContractsToEngineShare`, which sizes a live
+// `sell_to_close` off two oracles keyed on the OCC ALONE:
+// {@link recordedEngineOpenBasis} (the reader's half, TRA-3913) and
+// {@link engineNetOpenContracts} (the write path's, TRA-3926). The row they are
+// answering ABOUT belongs to one book; the rows they answered FROM belonged to
+// the fleet. Two instances, pointing opposite ways:
+//
+//  • PERMISSIVE — book A holds one contract on OCC X that arrived as a
+//    `history_import` (the desk's); book B holds one engine `buy_to_open` on
+//    the same X. The oracle saw `engineOpenContracts 1`, `closedContracts 0`,
+//    `netContracts 2`, answered `engineNetContracts = min(2,1) = 1`, and A's
+//    exit was bounded to 1. **A sells the desk's contract, authorized by a fill
+//    placed on a different book, against a different broker account** — and the
+//    bound returns `bounded: false`, `blind: false`, i.e. the census records it
+//    as a row that was CHECKED AND CLEAN. TRA-3926's exact defect surviving
+//    TRA-3926's fix, and reported as a pass.
+//  • CONSERVATIVE — B closes its own X; that `sell_to_close` nets against A's
+//    share (`closedContracts` was fleet-wide too), so A is refused an exit on
+//    its own contract. The TRA-2820 direction the second oracle was written to
+//    avoid.
+//
+// ── The mechanism: a discriminator written at fill time, never re-derived ───
+// `book` is stamped by the chokepoint that ALREADY KNOWS it (the per-user
+// engine's `alertUsername`, the same string `OptionsAccount.setOwner` binds).
+// ⛔ It is NEVER re-derived later from a position row: TRA-2811's lesson is
+// that the open row is authoritative precisely because the code that CHOSE it
+// wrote it, and a close-time re-derivation is what broke the open↔close sleeve
+// join on 2026-08-03.
+//
+// ⛔ AND A ROW WITH NO DISCRIMINATOR IS A REFUSAL, NEVER A DEFAULT. Back-filling
+// the retained rows to "the book that is asking" is the permissive default and
+// it re-creates the defect wearing a clean-looking column. Unknown is BLIND and
+// COUNTED (TRA-3913 AC2, TRA-3926 AC2), and the refusal has its own reason —
+// {@link OpenEpisodeIndeterminateReason} `'book_unattributed'` — so it never
+// shares a byte with `no_record` (the instrument is dark) or with `flat` (a
+// finding the write path may act on).
+//
+// ── ⭐ AND THE REFUSAL IS CONDITIONED ON A **MEASURED** REACHABILITY ─────────
+// An unattributed row is ambiguous IFF more than one book could have written
+// it, which is a fact about the PROCESS, not about the row. So the scoping is
+// gated on {@link bookScopingReachable}: with at most ONE book known to this
+// store, an unattributed row cannot belong to anybody else and every oracle
+// answers byte-for-byte as it did pre-TRA-3977 (this is AC4's negative control,
+// and it is why the existing TRA-3913 / TRA-3926 fixtures did not need editing
+// — a change that also rewrote them would be a behaviour rewrite wearing a
+// scoping name). With TWO, the tape cannot be partitioned and the oracles
+// refuse.
+//
+// ⚠ The reachability read has TWO sources and the second one is the one that
+// cannot be un-wired: books are registered explicitly at engine wire-up
+// ({@link registerLiveOptionBook}) **and** auto-registered by any row this
+// store actually records or hydrates. **The array itself is the witness** — a
+// process into which two distinct books have appended is reachable whether or
+// not anyone remembered to wire the registry.
+//
+// ⚠ SAY WHAT THIS COSTS ON THE LIVE TAPE. Every one of the retained rows
+// predates the discriminator, and bqb1 serves two live books, so on the first
+// boot after this ships EVERY book-scoped query refuses until fills accumulate
+// under the new build. For the READER that routes dollars to the desk
+// (`adoptedUsd` up — the same direction TRA-3913's fix moves them). For the
+// WRITER it is the BLIND branch, i.e. the pre-TRA-3926 quantity, COUNTED. That
+// is the honest price of the finding: **the retained tape cannot be partitioned
+// by book at all, so there is no audit of the past available here — only a
+// repair going forward.**
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * TRA-3977 — the explicit opt-out from book scoping: answer over the WHOLE
+ * fleet, i.e. the pre-TRA-3977 behaviour.
+ *
+ * A symbol rather than a magic string so it can never be produced by a username,
+ * a JSON field or a `??` fallback — every fleet-wide read is a decision somebody
+ * typed, and `grep LEDGER_FLEET_WIDE` enumerates them.
+ */
+export const LEDGER_FLEET_WIDE: unique symbol = Symbol('tra3977.ledger-fleet-wide');
+
+/**
+ * Which book an oracle is being asked about.
+ *
+ * - `string`              — that book, and only that book.
+ * - `null`                — the caller CANNOT NAME its book. A refusal, not a
+ *   wildcard: a query that cannot say who is asking cannot be told which rows
+ *   are its own.
+ * - {@link LEDGER_FLEET_WIDE} — deliberately unscoped. Legal only where the
+ *   question really is fleet-wide (the phantom-episode census, the fee
+ *   reconcile's coverage diff), and every use carries a comment saying why.
+ */
+export type LedgerBookScope = string | null | typeof LEDGER_FLEET_WIDE;
+
+/** Normalise any caller-supplied book value to the stored shape. Never guesses. */
+function normalizeBook(v: unknown): string | null {
+  return typeof v === 'string' && v.length > 0 ? v : null;
+}
+
 /**
  * Which automated sleeve fired the fill.
  *
@@ -127,6 +240,17 @@ export interface LiveOptionFillRecord {
   etDay: string;
   /** Automated sleeve that fired the fill. */
   sleeve: LiveFillSleeve;
+  /**
+   * ⭐ TRA-3977 — the BOOK this fill was placed on: the owning per-user engine's
+   * `alertUsername`, stamped by the order-path chokepoint at fill time.
+   *
+   * `null` means UNATTRIBUTED — a row written before this field existed, or a
+   * caller that could not name its book. ⛔ It is NOT "the book that is asking":
+   * every book-scoped oracle treats `null` as a REFUSAL when more than one book
+   * is known to this store (see the file's TRA-3977 block). Never re-derive it
+   * from a position row.
+   */
+  book: string | null;
   /** OCC option symbol. */
   optionSymbol: string;
   /** Order side. */
@@ -170,6 +294,13 @@ export interface LiveOptionFillInput {
   ts: number;
   etDay: string;
   sleeve: LiveFillSleeve;
+  /**
+   * TRA-3977 — the owning book (`alertUsername`). Optional at the type level
+   * ONLY so pre-existing fixtures and the hydrate path compile; a live
+   * order-path chokepoint that omits it writes an UNATTRIBUTED row, which every
+   * oracle refuses to answer from once a second book is known.
+   */
+  book?: string | null;
   optionSymbol: string;
   side: LiveFillSide;
   contracts: number;
@@ -199,6 +330,56 @@ let hydratedRecords = 0;
 let appendErrors = 0;
 let lastAppendError: string | null = null;
 
+// ── TRA-3977 — the book registry ─────────────────────────────────────────────
+//
+// Two sources, deliberately, because the failure mode of a registry is that
+// nobody wires it:
+//   • `wiredBooks`  — declared at engine wire-up. Present BEFORE any fill, so a
+//     fresh process serving two books refuses on its hydrated legacy tape from
+//     the first tick rather than after the first fill of each.
+//   • `observedBooks` — every distinct non-null `book` this store has recorded
+//     or hydrated. THE ARRAY ITSELF IS THE WITNESS: a process into which two
+//     books have demonstrably appended is reachable whether or not the wire-up
+//     ran. This is the half that cannot be un-wired.
+const wiredBooks = new Set<string>();
+const observedBooks = new Set<string>();
+
+/**
+ * TRA-3977 — declare that this process serves `book`'s options book.
+ *
+ * Called from the per-user engine wire-up alongside `OptionsAccount.setOwner`,
+ * with the same `alertUsername`. Idempotent and cheap. Registering ONE book is
+ * a no-op for every oracle (see {@link bookScopingReachable}); registering a
+ * SECOND is what turns an unattributed row from an answer into a refusal.
+ */
+export function registerLiveOptionBook(book: string): void {
+  const clean = normalizeBook(book);
+  if (clean !== null) wiredBooks.add(clean);
+}
+
+/** TRA-3977 — every book known to this store, from either source, sorted. */
+export function knownLiveOptionBooks(): string[] {
+  return [...new Set([...wiredBooks, ...observedBooks])].sort();
+}
+
+/**
+ * TRA-3977 — is the book-attribution question REACHABLE in this process?
+ *
+ * ⭐ This is the measured condition AC4's negative control rests on. With at
+ * most one book known, an unattributed row cannot belong to anybody else, so
+ * scoping is a strict no-op and every oracle answers exactly as it did before
+ * this ticket. With two or more, the tape genuinely cannot be partitioned and
+ * an unattributed row is a refusal.
+ *
+ * ⚠ It is a property of the PROCESS, and it is READ, never assumed — the same
+ * discipline as `instrumentBlind` vs an empty population: "a criterion that
+ * cannot fail on this run's data is not a pass". `crossBookOpenEpisodeCensus`
+ * publishes it so a reader can tell a quiet tape from one nobody can read.
+ */
+export function bookScopingReachable(): boolean {
+  return knownLiveOptionBooks().length > 1;
+}
+
 export function liveOptionsFeeSlippageLogPath(dir: string): string {
   return join(dir, LIVE_OPTIONS_FEE_SLIPPAGE_LOG_FILENAME);
 }
@@ -218,6 +399,12 @@ export function clearLiveOptionsFeeSlippageLedger(): void {
   hydratedTerminations = 0;
   terminationAppendErrors = 0;
   lastTerminationAppendError = null;
+  // TRA-3977 — the registry is part of this store's answer too. A suite that
+  // left `admin` + `v0nni` registered from the previous case would make the
+  // NEXT case's single-book fixture refuse, which is the exact false-negative
+  // the reachability gate exists to avoid.
+  wiredBooks.clear();
+  observedBooks.clear();
 }
 
 function finiteOrNull(n: number | null | undefined): number | null {
@@ -235,6 +422,10 @@ function toRecord(input: LiveOptionFillInput): LiveOptionFillRecord {
     ts: input.ts,
     etDay: input.etDay,
     sleeve: input.sleeve,
+    // TRA-3977 — normalised, never defaulted. An absent/blank book is honestly
+    // UNATTRIBUTED; substituting a caller's identity here is the permissive
+    // back-fill AC3 refuses.
+    book: normalizeBook(input.book),
     optionSymbol: input.optionSymbol,
     side: input.side,
     contracts: input.contracts,
@@ -266,6 +457,10 @@ function toRecord(input: LiveOptionFillInput): LiveOptionFillRecord {
 export function recordLiveOptionFill(input: LiveOptionFillInput): void {
   const rec = toRecord(input);
   fills.push(rec);
+  // TRA-3977 — the array is the witness. A second book appending here makes the
+  // attribution question reachable even in a process whose registry wire-up
+  // never ran.
+  if (rec.book !== null) observedBooks.add(rec.book);
   // TRA-2959 — a history import can append a row OLDER than the newest fill;
   // `lastRecordAt` means "newest record", so it never moves backward.
   if (lastRecordAt === null || rec.ts > lastRecordAt) lastRecordAt = rec.ts;
@@ -370,6 +565,15 @@ export interface ReconcileTerminationRecord {
   ts: number;
   /** ET calendar day (America/New_York, YYYY-MM-DD). */
   etDay: string;
+  /**
+   * TRA-3977 — the BOOK whose row the reconcile dropped. Scoped identically to
+   * {@link LiveOptionFillRecord.book} and for a sharper reason: a marker is an
+   * EPISODE BOUNDARY, so a sibling book's drop would otherwise truncate this
+   * book's live episode and refuse its exit (`reconcile_terminal` binds to
+   * `exitContracts: 0`). Cross-book, that is a refusal manufactured out of
+   * somebody else's position leaving somebody else's account.
+   */
+  book: string | null;
   /** OCC option symbol whose episode this terminates. */
   optionSymbol: string;
   /**
@@ -386,6 +590,8 @@ export interface ReconcileTerminationRecord {
 export interface ReconcileTerminationInput {
   ts: number;
   etDay: string;
+  /** TRA-3977 — the dropping book. Absent ⇒ UNATTRIBUTED, never "the asker". */
+  book?: string | null;
   optionSymbol: string;
   contractsDropped: number;
   positionId?: string | null;
@@ -422,14 +628,24 @@ export function recordReconcileTermination(input: ReconcileTerminationInput): bo
   if (typeof input.ts !== 'number' || !Number.isFinite(input.ts)) return false;
   if (!isTerminationSource(input.source)) return false;
   const positionId = typeof input.positionId === 'string' && input.positionId !== '' ? input.positionId : null;
+  // TRA-3977 — `book` is part of the dedupe key. Two books dropping the same OCC
+  // in the same millisecond with no position id are two events, and collapsing
+  // them would let one book's drop silently stand in for the other's.
+  const book = normalizeBook(input.book);
   const already = terminations.some(
-    (t) => t.optionSymbol === input.optionSymbol && t.ts === input.ts && t.positionId === positionId,
+    (t) =>
+      t.optionSymbol === input.optionSymbol &&
+      t.ts === input.ts &&
+      t.positionId === positionId &&
+      t.book === book,
   );
   if (already) return false;
   const rec: ReconcileTerminationRecord = {
     mode: 'live',
     ts: input.ts,
     etDay: input.etDay,
+    // TRA-3977 — normalised, never defaulted (see `toRecord`).
+    book,
     optionSymbol: input.optionSymbol,
     // `!(x > 0)` rather than `x <= 0` — a NaN reads as a number until something
     // compares it (TRA-3486), and this figure is published.
@@ -443,6 +659,8 @@ export function recordReconcileTermination(input: ReconcileTerminationInput): bo
     source: input.source,
   };
   terminations.push(rec);
+  // TRA-3977 — same witness rule as `recordLiveOptionFill`.
+  if (rec.book !== null) observedBooks.add(rec.book);
   if (dataDir == null) return true;
   const path = liveOptionReconcileTerminationLogPath(dataDir);
   try {
@@ -512,6 +730,13 @@ export function backfillReconcileTerminationsFromJournal(
     contracts?: number | null;
     closeTs?: number | null;
     exitReason?: string | null;
+    /**
+     * TRA-3977 — the journal's own `account` column (TRA-1475), i.e. the book
+     * that held the dropped row. Absent on rows written before that column, and
+     * absent stays UNATTRIBUTED — this pass reconstructs the PAST, and the past
+     * is exactly what cannot be attributed after the fact.
+     */
+    account?: string | null;
   }>,
 ): ReconcileTerminationBackfillResult {
   const out: ReconcileTerminationBackfillResult = {
@@ -534,13 +759,21 @@ export function backfillReconcileTerminationsFromJournal(
       out.unaskable += 1;
       continue;
     }
-    if (openEpisodeWindow(occ).status !== 'open') {
+    // ⭐ TRA-3977 — FLEET_WIDE here on purpose, and it is the conservative
+    // direction. This gate only asks "does the ledger still report anything
+    // open on this OCC", i.e. is a marker worth writing at all; a book-scoped
+    // read of the legacy tape REFUSES (`book_unattributed`), which is not
+    // `open`, which would silently stop TRA-3976's back-fill from ever writing
+    // the marker it exists to write. Fleet-wide over-counts what is open, so it
+    // writes FEWER markers, never more.
+    if (openEpisodeWindow(occ, LEDGER_FLEET_WIDE).status !== 'open') {
       out.alreadyAccounted += 1;
       continue;
     }
     const wrote = recordReconcileTermination({
       ts: closeTs,
       etDay: new Date(closeTs).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }),
+      book: typeof r.account === 'string' && r.account !== '' ? r.account : null,
       optionSymbol: occ,
       contractsDropped:
         typeof r.contracts === 'number' && Number.isFinite(r.contracts) ? r.contracts : 0,
@@ -640,7 +873,66 @@ export type OpenEpisodeIndeterminateReason =
    * records closed it out" — a FINDING, which the write path is entitled to act
    * on. Here the close is exactly the thing we have no record of.
    */
-  | 'reconcile_terminal';
+  | 'reconcile_terminal'
+  /**
+   * ⭐ TRA-3977 — this process serves MORE THAN ONE book, and at least one row
+   * on this OCC carries no book discriminator. The ledger cannot say whether
+   * those contracts are the asking book's or a sibling's, so it cannot state a
+   * net position FOR THE BOOK THAT ASKED.
+   *
+   * ⛔ A REFUSAL, and it must not be silently narrowed either way. Dropping the
+   * unattributed rows is PERMISSIVE in the close direction (a sibling's
+   * `sell_to_close` vanishing inflates our engine share); keeping them is the
+   * fleet-wide behaviour this ticket exists to end. Refuse, and COUNT it —
+   * `crossBookOpenEpisodeCensus` publishes the population.
+   *
+   * ⚠ Gated on {@link bookScopingReachable}: with at most one book known to
+   * this store an unattributed row cannot be anybody else's, and this reason is
+   * unreachable by construction.
+   */
+  | 'book_unattributed';
+
+/**
+ * TRA-3977 — the rows of ONE OCC, narrowed to the book that asked.
+ *
+ * The whole scoping decision lives here, once, so the three walks that read
+ * this store cannot drift apart on it.
+ */
+interface ScopedOccRows {
+  rows: LiveOptionFillRecord[];
+  marks: ReconcileTerminationRecord[];
+  /** True ⇒ the tape cannot be partitioned for this OCC; the caller must REFUSE. */
+  refuse: boolean;
+}
+
+function scopeOccRows(optionSymbol: string, scope: LedgerBookScope): ScopedOccRows {
+  const rows = fills.filter((f) => f.optionSymbol === optionSymbol);
+  const marks = terminations.filter((t) => t.optionSymbol === optionSymbol);
+  // Deliberately unscoped — the caller's question really is fleet-wide.
+  if (scope === LEDGER_FLEET_WIDE) return { rows, marks, refuse: false };
+  // ⭐ AC4's NEGATIVE CONTROL, and it is a MEASURED condition, not an
+  // assumption. With at most one book known to this store there is nothing to
+  // scope: an unattributed row cannot belong to a sibling that does not exist,
+  // and every oracle below returns byte-for-byte what it returned before
+  // TRA-3977. This is the branch every pre-existing fixture takes.
+  if (!bookScopingReachable()) return { rows, marks, refuse: false };
+  // ⛔ AC3 — an unattributed row is a REFUSAL, never "the book that is asking".
+  if (rows.some((r) => r.book === null) || marks.some((m) => m.book === null)) {
+    return { rows: [], marks: [], refuse: true };
+  }
+  // Every row names a book, and the caller cannot name itself ⇒ none of them is
+  // provably the caller's. Same refusal, from the other side.
+  if (scope === null) {
+    return rows.length > 0 || marks.length > 0
+      ? { rows: [], marks: [], refuse: true }
+      : { rows: [], marks: [], refuse: false };
+  }
+  return {
+    rows: rows.filter((r) => r.book === scope),
+    marks: marks.filter((m) => m.book === scope),
+    refuse: false,
+  };
+}
 
 /** TRA-3918 — the currently-open `buy_to_open` episode for one OCC symbol. */
 export interface OpenEpisodeWindow {
@@ -664,9 +956,28 @@ export interface OpenEpisodeWindow {
   reason: OpenEpisodeIndeterminateReason | null;
 }
 
-/** TRA-3918 — see {@link OpenEpisodeStatus}. The one walk all three oracles share. */
-export function openEpisodeWindow(optionSymbol: string): OpenEpisodeWindow {
-  const rows = fills.filter((f) => f.optionSymbol === optionSymbol);
+/**
+ * TRA-3918 — see {@link OpenEpisodeStatus}. The one walk all three oracles share.
+ *
+ * @param book TRA-3977 — WHICH BOOK is asking. Required, and with no default:
+ *   this store is process-wide and two live books append to it, so "the rows for
+ *   this OCC" is not a well-formed question without one. Pass
+ *   {@link LEDGER_FLEET_WIDE} where the question genuinely is fleet-wide, and
+ *   say why at the call site.
+ */
+export function openEpisodeWindow(optionSymbol: string, book: LedgerBookScope): OpenEpisodeWindow {
+  const scoped = scopeOccRows(optionSymbol, book);
+  if (scoped.refuse) {
+    return {
+      status: 'indeterminate',
+      fills: [],
+      netContracts: 0,
+      closes: 0,
+      terminations: 0,
+      reason: 'book_unattributed',
+    };
+  }
+  const rows = scoped.rows;
   // Stable (ES2019) — same-`ts` rows keep append order, which is the order they
   // actually filled in.
   rows.sort((a, b) => a.ts - b.ts);
@@ -690,9 +1001,9 @@ export function openEpisodeWindow(optionSymbol: string): OpenEpisodeWindow {
     | { ts: number; order: 0; fill: LiveOptionFillRecord; marker?: undefined }
     | { ts: number; order: 1; marker: ReconcileTerminationRecord; fill?: undefined };
   const events: EpisodeEvent[] = rows.map((f) => ({ ts: f.ts, order: 0 as const, fill: f }));
-  for (const t of terminations) {
-    if (t.optionSymbol === optionSymbol) events.push({ ts: t.ts, order: 1 as const, marker: t });
-  }
+  // TRA-3977 — the SCOPED markers, from the same narrowing as the fills. A
+  // sibling book's drop is not an episode boundary on this book's position.
+  for (const t of scoped.marks) events.push({ ts: t.ts, order: 1 as const, marker: t });
   // `order` breaks a ts tie in favour of the FILL: a marker stamped at the same
   // millisecond as a fill is the drop that followed it, never the drop that
   // preceded it. Stable sort keeps same-ts fills in append order (above).
@@ -859,8 +1170,18 @@ export interface EngineNetOpenAccount {
   reason: OpenEpisodeIndeterminateReason | null;
 }
 
-export function engineNetOpenContracts(optionSymbol: string): EngineNetOpenAccount {
-  const window = openEpisodeWindow(optionSymbol);
+export function engineNetOpenContracts(
+  optionSymbol: string,
+  /**
+   * ⭐ TRA-3977 — the book whose exit is being sized. Required. Before this
+   * parameter existed, a fill placed on `v0nni` could authorize an exit on
+   * `admin`'s row against a different broker account, and the bound reported it
+   * `bounded: false` / `blind: false` — a row the census recorded as CHECKED AND
+   * CLEAN. See the TRA-3977 block at the top of this file.
+   */
+  book: LedgerBookScope,
+): EngineNetOpenAccount {
+  const window = openEpisodeWindow(optionSymbol, book);
   const blank = {
     status: window.status,
     netContracts: 0,
@@ -921,8 +1242,12 @@ export function engineNetOpenContracts(optionSymbol: string): EngineNetOpenAccou
  * votes. See {@link openEpisodeWindow}. `null` is "cannot answer" and callers
  * must not read it as "the engine never bought this".
  */
-export function lastRecordedOpenSleeve(optionSymbol: string): LiveFillSleeve | null {
-  const window = openEpisodeWindow(optionSymbol);
+export function lastRecordedOpenSleeve(
+  optionSymbol: string,
+  /** TRA-3977 — the asking book; see {@link openEpisodeWindow}. */
+  book: LedgerBookScope,
+): LiveFillSleeve | null {
+  const window = openEpisodeWindow(optionSymbol, book);
   return window.status === 'open' ? window.fills[window.fills.length - 1]!.sleeve : null;
 }
 
@@ -942,8 +1267,12 @@ export function lastRecordedOpenSleeve(optionSymbol: string): LiveFillSleeve | n
  * FLATTENS the position rather than the first close the walk meets, and why
  * `null` here is "cannot answer", never "the contract is the desk's".
  */
-export function lastRecordedOpenFill(optionSymbol: string): LiveOptionFillRecord | null {
-  const window = openEpisodeWindow(optionSymbol);
+export function lastRecordedOpenFill(
+  optionSymbol: string,
+  /** TRA-3977 — the asking book; see {@link openEpisodeWindow}. */
+  book: LedgerBookScope,
+): LiveOptionFillRecord | null {
+  const window = openEpisodeWindow(optionSymbol, book);
   return window.status === 'open' ? window.fills[window.fills.length - 1]! : null;
 }
 
@@ -1075,7 +1404,21 @@ export interface RecordedEngineOpenBasis {
  * state and must NOT be read as "the engine bought nothing" (see
  * {@link recordedOpenFillCount} for why those two are different).
  */
-export function recordedEngineOpenBasis(optionSymbol: string): RecordedEngineOpenBasis | null {
+export function recordedEngineOpenBasis(
+  optionSymbol: string,
+  /**
+   * ⭐ TRA-3977 — the book the row belongs to. Required, and its refusal shape
+   * is this function's existing one: `null`. A sibling book's `buy_to_open` is
+   * not evidence about THIS book's contract, and counting it is the
+   * double-attribution hazard `splitEngineExposureContracts` rule 3 already
+   * names — two rows on one OCC each claiming the same recorded contracts.
+   */
+  book: LedgerBookScope,
+): RecordedEngineOpenBasis | null {
+  // TRA-3977 — narrowed ONCE, up front, so the ts-cutoff below and the backward
+  // walk can never disagree about which rows are in scope.
+  const scoped = scopeOccRows(optionSymbol, book);
+  if (scoped.refuse) return null;
   const episode: LiveOptionFillRecord[] = [];
   let stoppedAtClose = false;
   // ── TRA-3976 — the SECOND episode boundary: a reconcile terminal marker ────
@@ -1091,13 +1434,12 @@ export function recordedEngineOpenBasis(optionSymbol: string): RecordedEngineOpe
   // cap, and over-counting spends the board's authorization on somebody else's
   // money (see the `enginePlacedContracts` note above).
   let terminalTs = -Infinity;
-  for (const t of terminations) {
-    if (t.optionSymbol === optionSymbol && t.ts > terminalTs) terminalTs = t.ts;
+  for (const t of scoped.marks) {
+    if (t.ts > terminalTs) terminalTs = t.ts;
   }
   let stoppedAtTermination = false;
-  for (let i = fills.length - 1; i >= 0; i--) {
-    const f = fills[i]!;
-    if (f.optionSymbol !== optionSymbol) continue;
+  for (let i = scoped.rows.length - 1; i >= 0; i--) {
+    const f = scoped.rows[i]!;
     if (f.ts <= terminalTs) {
       stoppedAtTermination = true;
       continue;
@@ -1282,6 +1624,11 @@ export function hydrateLiveOptionsFeeSlippageFromDisk(
       ts: rec.ts,
       etDay: rec.etDay,
       sleeve: rec.sleeve,
+      // ⛔ TRA-3977 — a line written before this field existed hydrates
+      // UNATTRIBUTED and stays that way. There is no back-fill here, and there
+      // must not be: the only book we could name is the one whose process is
+      // reading the file, which is exactly the permissive default AC3 refuses.
+      book: rec.book,
       optionSymbol: rec.optionSymbol,
       side: rec.side,
       contracts: typeof rec.contracts === 'number' && Number.isFinite(rec.contracts) ? rec.contracts : 0,
@@ -1295,6 +1642,10 @@ export function hydrateLiveOptionsFeeSlippageFromDisk(
       origin: rec.origin,
     });
     fills.push(clean);
+    // TRA-3977 — a hydrated row is a witness too: a file carrying two books'
+    // fills makes the attribution question reachable from the first tick, before
+    // this boot has recorded anything.
+    if (clean.book !== null) observedBooks.add(clean.book);
     kept.push(JSON.stringify(clean));
     if (clean.ts > (lastRecordAt ?? 0)) lastRecordAt = clean.ts;
   }
@@ -1357,6 +1708,8 @@ function hydrateReconcileTerminationsFromDisk(dir: string, now: number): number 
       mode: 'live',
       ts: rec.ts,
       etDay: typeof rec.etDay === 'string' ? rec.etDay : '',
+      // TRA-3977 — same no-back-fill rule as the fill hydrate.
+      book: normalizeBook(rec.book),
       optionSymbol: rec.optionSymbol,
       contractsDropped:
         typeof rec.contractsDropped === 'number' &&
@@ -1368,6 +1721,7 @@ function hydrateReconcileTerminationsFromDisk(dir: string, now: number): number 
       source: rec.source,
     };
     terminations.push(clean);
+    if (clean.book !== null) observedBooks.add(clean.book); // TRA-3977 — witness
     kept.push(JSON.stringify(clean));
   }
   const nonEmptyLines = raw.split('\n').filter((l) => l.trim() !== '').length;
@@ -2088,6 +2442,14 @@ export function diffMissingFillsFromHistory(
   records: readonly LiveOptionFillRecord[],
   historyFills: readonly TradierTradeHistoryFill[],
   todayEt: string,
+  /**
+   * ⭐ TRA-3977 — the BOOK whose Tradier account this history was fetched from.
+   * An imported row is the broker's record of a fill on ONE account, so it is
+   * attributable exactly as far as the caller's account resolution is: the fee
+   * reconcile resolves `resolveLiveBrokerOperator()`, so its imports carry that
+   * operator's book. Absent ⇒ UNATTRIBUTED, never "whoever asks".
+   */
+  book: string | null = null,
 ): { inputs: LiveOptionFillInput[]; coverage: LedgerCoverageResult } {
   // History contract totals + per-fill detail per (symbol, day, side).
   const histGroups = new Map<string, { qty: number; fills: TradierTradeHistoryFill[]; side: LiveFillSide }>();
@@ -2157,7 +2519,7 @@ export function diffMissingFillsFromHistory(
     const attributedQty = attributed.residual.reduce((sum, r) => sum + r.qty, 0);
     if (attributed.determinable && attributedQty === shortfall) {
       for (const { fill, qty } of attributed.residual) {
-        inputs.push(importedInput(fill, day, qty, g.side, records));
+        inputs.push(importedInput(fill, day, qty, g.side, records, book));
       }
       continue;
     }
@@ -2174,6 +2536,7 @@ export function diffMissingFillsFromHistory(
         // for retention/ordering (17:00Z is 12:00/13:00 ET year-round).
         ts: Date.parse(`${day}T17:00:00Z`),
         etDay: day,
+        book, // TRA-3977 — the account this history came from
         // A close inherits its sleeve from the ledger's own open row when one
         // exists; anything else is honestly unattributed.
         sleeve:
@@ -2214,12 +2577,15 @@ function importedInput(
   qty: number,
   side: LiveFillSide,
   records: readonly LiveOptionFillRecord[],
+  /** TRA-3977 — the account this history was fetched from; null ⇒ unattributed. */
+  book: string | null,
 ): LiveOptionFillInput {
   return {
     // History carries only the ET calendar day; noon-ET-ish is honest enough
     // for retention/ordering (17:00Z is 12:00/13:00 ET year-round).
     ts: Date.parse(`${day}T17:00:00Z`),
     etDay: day,
+    book,
     // A close inherits its sleeve from the ledger's own open row when one
     // exists; anything else is honestly unattributed.
     sleeve: side === 'sell_to_close' ? sleeveOfLastOpenIn(records, f.symbol) ?? 'unattributed' : 'unattributed',
@@ -2256,8 +2622,10 @@ function sleeveOfLastOpenIn(
 export function importMissingLiveOptionFills(
   historyFills: readonly TradierTradeHistoryFill[],
   todayEt: string,
+  /** TRA-3977 — see {@link diffMissingFillsFromHistory}. */
+  book: string | null = null,
 ): LedgerCoverageResult {
-  const { inputs, coverage } = diffMissingFillsFromHistory(fills, historyFills, todayEt);
+  const { inputs, coverage } = diffMissingFillsFromHistory(fills, historyFills, todayEt, book);
   for (const input of inputs) recordLiveOptionFill(input);
   if (inputs.length > 0) {
     log.warn('live-options fee-slippage ledger imported broker fills NO chokepoint recorded (TRA-2959)', {
@@ -2619,7 +2987,15 @@ export function phantomOpenEpisodeCensus(
   let terminatedEpisodes = 0;
   const open: Array<{ symbol: string; window: OpenEpisodeWindow }> = [];
   for (const symbol of symbols) {
-    const window = openEpisodeWindow(symbol);
+    // ⭐ TRA-3977 — FLEET_WIDE on purpose. This census grades the ledger against
+    // the FLEET's held symbols (`liveOpenOptionSymbols` walks every user
+    // context), so both sides of the comparison must be fleet-wide or the diff
+    // manufactures a phantom out of a scoping mismatch. Book-scoping this one
+    // would ALSO be a silent regression on the legacy tape: every episode would
+    // answer `book_unattributed`, `ledgerOpenEpisodes` would fall to 0, and a
+    // census whose whole value is that it reads zero would read zero for the
+    // wrong reason.
+    const window = openEpisodeWindow(symbol, LEDGER_FLEET_WIDE);
     if (window.status === 'open') {
       ledgerOpenEpisodes += 1;
       open.push({ symbol, window });
@@ -2680,6 +3056,116 @@ export function phantomOpenEpisodeCensus(
   };
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// ⭐ TRA-3977 AC5 — THE CROSS-BOOK CENSUS.
+//
+// The repair above is only worth what its reachability is, and "today's book
+// has no overlap" is an argument, not a measurement. The two live books run the
+// SAME OTM sleeve over the SAME universe with the SAME contract floor, so an
+// OCC held by both is an ordinary Tuesday.
+//
+// ⚠ AND A QUIET TAPE MUST BE DISTINGUISHABLE FROM A TAPE NOBODY CAN READ
+// (TRA-3926's own standing hook). Three verdicts, and `clean` is the only one
+// that means "measured, and there is no overlap":
+//   • `clean`         — every book is named and no OCC is open on two of them.
+//   • `overlap`       — at least one OCC is open on two or more books. THE
+//     reachability of the permissive branch, MEASURED. Not itself a defect —
+//     the scoping fix is what makes it safe — but it is the number that says
+//     the fix is load-bearing today rather than theoretical.
+//   • `unattributed`  — the tape carries rows with no book. The overlap
+//     question CANNOT BE ANSWERED for those symbols, and folding them into
+//     `clean` is the exact lie this census exists to refuse.
+// ════════════════════════════════════════════════════════════════════════════
+
+/** TRA-3977 — one OCC with an open episode on more than one book. */
+export interface CrossBookOpenEpisodeRow {
+  optionSymbol: string;
+  /** The books holding an open episode on it, sorted. */
+  books: string[];
+  /** Net open contracts per book, index-aligned with `books`. */
+  netContracts: number[];
+}
+
+export interface CrossBookOpenEpisodeCensus {
+  /**
+   * ⭐ The measured condition every refusal in this module is gated on: does
+   * this process serve more than one book? `false` ⇒ scoping is a strict no-op
+   * and every oracle answers exactly as it did before TRA-3977.
+   */
+  scopingReachable: boolean;
+  /** Every book known to this store (wired at engine boot ∪ seen in a row). */
+  books: string[];
+  /** `clean` | `overlap` | `unattributed` — see the block above. */
+  verdict: 'clean' | 'overlap' | 'unattributed';
+  /** Distinct OCCs carrying at least one row. The denominator. */
+  symbols: number;
+  /** Of those, the ones open on ≥2 books. */
+  overlappingSymbols: number;
+  rows: CrossBookOpenEpisodeRow[];
+  /**
+   * Rows in the whole store carrying no book discriminator. `> 0` with
+   * `scopingReachable` ⇒ every oracle REFUSES on those symbols, which is the
+   * pre-TRA-3926 quantity on the write path and the desk's dollars on the
+   * reader's. **This is the population the fix cannot repair retroactively.**
+   */
+  unattributedRows: number;
+  /** Distinct OCCs carrying at least one unattributed row. */
+  unattributedSymbols: number;
+}
+
+/** TRA-3977 AC5 — see the block above. Pure; no IO. */
+export function crossBookOpenEpisodeCensus(): CrossBookOpenEpisodeCensus {
+  const books = knownLiveOptionBooks();
+  const symbols = new Set<string>();
+  for (const f of fills) symbols.add(f.optionSymbol);
+  let unattributedRows = 0;
+  const unattributedSymbolSet = new Set<string>();
+  for (const f of fills) {
+    if (f.book === null) {
+      unattributedRows += 1;
+      unattributedSymbolSet.add(f.optionSymbol);
+    }
+  }
+  for (const t of terminations) {
+    if (t.book === null) {
+      unattributedRows += 1;
+      unattributedSymbolSet.add(t.optionSymbol);
+    }
+  }
+  const rows: CrossBookOpenEpisodeRow[] = [];
+  for (const symbol of symbols) {
+    // Only symbols we CAN partition are askable per-book; the rest are counted
+    // in the unattributed columns and must not be scored as clean.
+    if (unattributedSymbolSet.has(symbol)) continue;
+    const holders: string[] = [];
+    const nets: number[] = [];
+    for (const book of books) {
+      const w = openEpisodeWindow(symbol, book);
+      if (w.status === 'open' && w.netContracts > 0) {
+        holders.push(book);
+        nets.push(w.netContracts);
+      }
+    }
+    if (holders.length > 1) rows.push({ optionSymbol: symbol, books: holders, netContracts: nets });
+  }
+  rows.sort((a, b) => (a.optionSymbol < b.optionSymbol ? -1 : a.optionSymbol > b.optionSymbol ? 1 : 0));
+  // ⛔ PRECEDENCE: an unreadable tape outranks a quiet one. A census that
+  // reported `clean` while holding rows it cannot attribute would be exactly
+  // the "checked and clean" byte this ticket was filed about.
+  const verdict: CrossBookOpenEpisodeCensus['verdict'] =
+    unattributedRows > 0 ? 'unattributed' : rows.length > 0 ? 'overlap' : 'clean';
+  return {
+    scopingReachable: bookScopingReachable(),
+    books,
+    verdict,
+    symbols: symbols.size,
+    overlappingSymbols: rows.length,
+    rows,
+    unattributedRows,
+    unattributedSymbols: unattributedSymbolSet.size,
+  };
+}
+
 export interface LiveOptionsFeeSlippageSummary {
   /** Total fills recorded (open + close, live + hydrated). */
   n: number;
@@ -2717,6 +3203,12 @@ export interface LiveOptionsFeeSlippageSummary {
    * the oversold-close census and into the history-coverage diff.
    */
   reconcileTerminations: ReconcileTerminationRecord[];
+  /**
+   * ⭐ TRA-3977 AC5 — can the rows above be partitioned by book at all, and is
+   * any OCC open on two of them right now? Read `verdict` and
+   * `unattributedRows` BEFORE reading any per-book claim off `records[]`.
+   */
+  crossBook: CrossBookOpenEpisodeCensus;
 }
 
 /**
@@ -2774,5 +3266,6 @@ export function summarizeLiveOptionsFeeSlippage(): LiveOptionsFeeSlippageSummary
     lastRecordAt,
     records,
     reconcileTerminations: reconcileTerminations(),
+    crossBook: crossBookOpenEpisodeCensus(),
   };
 }

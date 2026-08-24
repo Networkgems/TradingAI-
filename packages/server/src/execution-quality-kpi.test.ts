@@ -13,6 +13,7 @@ function optRec(over: Partial<LiveOptionFillRecord>): LiveOptionFillRecord {
     ts: 1,
     etDay: '2026-07-17',
     sleeve: 'single_leg_rv',
+    book: null, // TRA-3977 — the fixture is a single-book tape
     optionSymbol: 'AAPL260117C00200000',
     side: 'buy_to_open',
     contracts: 1,

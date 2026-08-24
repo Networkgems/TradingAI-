@@ -141,6 +141,8 @@ import {
   recordLiveOptionFill,
   // TRA-3896 — the absorption oracle for the broker-drift check.
   recordedEngineOpenBasis,
+  // ⭐ TRA-3977 — declare this engine's book to the process-global fill ledger.
+  registerLiveOptionBook,
   type LiveFillSleeve,
 } from './live-options-fee-slippage-ledger.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
@@ -11298,6 +11300,13 @@ export class SignalEngine {
             ts: Date.now(),
             etDay: etDateString(new Date()),
             sleeve: opts.sleeve,
+            // ⭐ TRA-3977 — THE BOOK, stamped by the chokepoint that already
+            // knows it. `censusBook` is the same `alertUsername` the broker
+            // census two lines up is keyed on and the same string
+            // `OptionsAccount.setOwner` binds, so the write and every later
+            // read join on one value. ⛔ Never re-derived from a position row
+            // afterwards (TRA-2811): the code that CHOSE the book is here.
+            book: this.alertUsername ?? null,
             optionSymbol: opened.optionSymbol,
             side: 'buy_to_open',
             contracts: opened.contracts,
@@ -11420,7 +11429,9 @@ export class SignalEngine {
     // (TRA-1207) and its live arm is separately dark. `single_leg_rv` stays reserved
     // for the genuine RV path if it is ever re-armed.
     const sleeve: LiveFillSleeve =
-      lastRecordedOpenSleeve(position.optionSymbol) ??
+      // TRA-3977 — scoped to THIS book: a sibling book's open on the same OCC
+      // is not the schedule this close inherits.
+      lastRecordedOpenSleeve(position.optionSymbol, this.alertUsername ?? null) ??
       (position.signalType === undefined
         ? 'unattributed' // TRA-2959 — a row snapshot carries no signalType; don't guess
         : position.signalType === 'otm_mispricing'
@@ -11436,6 +11447,12 @@ export class SignalEngine {
         ts: Date.now(),
         etDay: etDateString(new Date()),
         sleeve,
+        // ⭐ TRA-3977 — the CLOSE side carries the book too, and it is the leg
+        // that matters most: `engineNetOpenContracts` nets closes against
+        // opens, so an unattributed `sell_to_close` from a sibling book was
+        // subtracting from THIS book's exitable share (the conservative half of
+        // the defect — TRA-2820's direction).
+        book: this.alertUsername ?? null,
         optionSymbol: position.optionSymbol,
         side: 'sell_to_close',
         contracts: qty,
@@ -17362,6 +17379,13 @@ export class SignalEngine {
     // QA/test books by. Both env buckets (sandbox/production) get the same owner;
     // the demo journal only cares WHO opened it, not which Tradier env.
     for (const acct of this.allOptionsAccounts()) acct.setOwner(username);
+    // ⭐ TRA-3977 — DECLARE the book to the fill ledger in the same breath, with
+    // the same string. This is what makes `bookScopingReachable()` true BEFORE
+    // any fill lands, so a process serving two books refuses on its hydrated
+    // (unattributed) legacy tape from the first tick rather than after the first
+    // fill of each. The ledger also auto-registers off any row it records, so
+    // this call is the EARLY half of a two-source read, never the only one.
+    registerLiveOptionBook(username);
     // TRA-857 — the live Tradier order clients scope their shared `process.env`
     // cred fallback to the pinned operator (isLiveBrokerOperator). The
     // constructor runs before this binding, so for the operator those clients
@@ -18911,7 +18935,9 @@ export class SignalEngine {
     // it as a coverage hole rather than as an all-clear.
     const report = record(
       diffLiveBrokerPositions(read, rows, now, sym => {
-        const recorded = recordedEngineOpenBasis(sym);
+        // TRA-3977 — this engine's book. The whole point of this third source
+        // is "did WE buy it"; a sibling book's fill answers a different `we`.
+        const recorded = recordedEngineOpenBasis(sym, this.alertUsername ?? null);
         if (!recorded || recorded.unpricedFills > 0) return null;
         return recorded.contracts;
       }),
