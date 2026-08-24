@@ -39,6 +39,52 @@
 //      it is still COUNTED (an expiry settle / broker-reconcile close carries
 //      no order id and is disproportionately a LOSS; refusing it would bias the
 //      sample permissive). `excludedCloses.n` sums the true exclusions only.
+//   3b. TRA-3945 cross-book ruling (CEO comment `a9f429a9`, 2026-08-24, taken
+//      while `n` was still 0 — this is PRE-registration, not a re-cut). The
+//      dedupe key in (3) collapses a double-REPORT of ONE fill. It is blind to
+//      TWO REAL fills of the SAME contract driven by ONE price path: on
+//      2026-08-24 books `v0nni` (14:25:07Z) and `admin` (14:44:33Z) each bought
+//      `NVTS261002C00012500` from the same generator, with DIFFERENT broker
+//      order ids. `seR = sd/√n` treats those as independent draws; near-equal
+//      Rs add to `n` while adding ~0 to the sum of squares, so seR falls twice
+//      over and the 0.10 precision bar clears EARLIER than the evidence
+//      supports. That is the PERMISSIVE direction on the estimator the
+//      invalidation clause itself calls "a bigger finding than the sleeve".
+//
+//      RULING: (a), generalized. A second CLUSTER layer runs after (3) and
+//      after every eligibility filter, keyed on the ENTRY:
+//
+//          cluster key = `${optionSymbol}|${etDay(openTs)}`
+//
+//      One representative per cluster (earliest `openTs`; ties broken on the
+//      dedupe key, so the choice is deterministic and replayable). The rest are
+//      refused under `excludedCloses.reasons.sameContractSameSessionCluster`.
+//
+//      Three properties make this the defensible cut, and each is pinned by a
+//      test in `tra3945-otm-evaluation-window.test.ts`:
+//        • BOOK-AGNOSTIC. The correlation is one underlying on one session, not
+//          a book boundary — two entries of one contract in ONE book on one day
+//          are exactly as correlated as two across books. Keying on `account`
+//          would answer a narrower question than the one that was asked, and it
+//          would depend on `account` being stamped on live rows (it is
+//          documented for the DEMO fold). This key needs no book dimension.
+//        • ENTRY-DERIVED, never exit-derived. The arm under test IS an exit
+//          ruleset (trail exit + day-one stop). A cluster keyed on `closeTs`
+//          would let the thing being graded choose its own sample size —
+//          two correlated entries that exit on different days would silently
+//          de-cluster. The cluster is fixed the moment the entries are booked.
+//        • MONOTONE CONSERVATIVE. The layer only ever REMOVES rows the old rule
+//          admitted; it can never admit one it excluded. So `n` is a lower
+//          bound on the old `n`, seR a upper bound, and the change can only
+//          make the bar HARDER — never a verdict flipped permissive by a rule
+//          edit. This is what makes it safe to land mid-window at n=0.
+//
+//      The same comment names the OPPOSITE failure on (3)'s fallback leg: two
+//      books closing one `optionSymbol` at one `closeTs` with a null
+//      `brokerOrderId` would COLLAPSE two real observations. That leg's job is
+//      to collapse a double-report of one fill, which is by construction within
+//      one book, so `account` now scopes it — a strict improvement (a genuine
+//      double-listing shares `account` and still collides).
 //
 // Extension is a ONE-SHOT state transition (`extension.used` flips once); at
 // 45 deduped closes with seR still ≥ 0.10 the record goes `inconclusive_terminal`
@@ -291,7 +337,23 @@ type CloseRow = OptionTradeJournalRecord & { brokerOrderId?: string | number | n
 export function otmEvaluationDedupeKey(r: CloseRow): string {
   const id = r.brokerOrderId;
   if (id !== undefined && id !== null && String(id).trim() !== '') return `order:${String(id).trim()}`;
-  return `fallback:${r.optionSymbol ?? r.symbol}|${r.closeTs}`;
+  // TRA-3945 §3b — `account` scopes the fallback leg. Its ONLY job is to collapse
+  // a double-REPORT of one fill, which is by construction inside one book (the
+  // XLF/BAC double-listing carried the same `account` under two strategy labels,
+  // so it still collides). Without the book, two DIFFERENT books closing the same
+  // contract at the same instant with no order id merge into one observation —
+  // the under-count twin of the over-count the cluster layer below refuses.
+  return `fallback:${r.account ?? '-'}|${r.optionSymbol ?? r.symbol}|${r.closeTs}`;
+}
+
+/**
+ * TRA-3945 §3b — the CLUSTER key: one contract, one ET session, ANY book.
+ *
+ * Derived from the ENTRY only. See §3b: an exit-derived key would hand the arm
+ * under test control of its own sample size.
+ */
+export function otmEvaluationClusterKey(r: CloseRow): string {
+  return `${r.optionSymbol ?? r.symbol}|${etDay(r.openTs)}`;
 }
 
 export interface OtmEvaluationStats {
@@ -338,6 +400,12 @@ export interface OtmEvaluationExcluded {
     entryDeltaUnknown: number;
     /** VISIBILITY counter — these closes ARE counted under the fallback key. */
     brokerOrderIdNull: number;
+    /**
+     * TRA-3945 §3b — an ELIGIBLE close refused because another eligible close
+     * of the same contract entered in the same ET session already represents
+     * the cluster. One price path, one draw. Book-agnostic.
+     */
+    sameContractSameSessionCluster: number;
   };
   brokerOrderIdNullCounted: true;
 }
@@ -420,6 +488,14 @@ function etHour(ms: number): number {
   return Number.isFinite(h) ? h % 24 : 0;
 }
 
+/** TRA-3945 §3b — the ET calendar day an entry was booked on ("2026-08-24"). */
+const ET_DAY_FMT = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+});
+function etDay(ms: number): string {
+  return Number.isFinite(ms) ? ET_DAY_FMT.format(new Date(ms)) : 'unknown';
+}
+
 function targetFor(state: OtmEvaluationWindowState): number {
   return OTM_EVALUATION_TARGET_CLOSES + (state.extension.used ? state.extension.closes : 0);
 }
@@ -439,7 +515,9 @@ export function selectOtmEvaluationCountedCloses(
   const reasons = {
     entryPredatesStart: 0, rulesetPaused: 0, dedupeDuplicate: 0, notLive: 0, notOtm: 0,
     outsideDeltaCell: 0, entryDeltaUnknown: 0, brokerOrderIdNull: 0,
+    sameContractSameSessionCluster: 0,
   };
+  const eligible: Array<{ rec: CloseRow; key: string; fallbackKeyed: boolean }> = [];
   const counted: CloseRow[] = [];
   if (state.startedAt !== null) {
     const cell = state.populationCell;
@@ -459,9 +537,27 @@ export function selectOtmEvaluationCountedCloses(
         if (m === 'unknown') { reasons.entryDeltaUnknown += 1; continue; }
       }
       reasons.dedupeDuplicate += d.duplicates;
-      if (d.key.startsWith('fallback:')) reasons.brokerOrderIdNull += 1;
-      counted.push(r);
+      eligible.push({ rec: r, key: d.key, fallbackKeyed: d.key.startsWith('fallback:') });
     }
+    // TRA-3945 §3b — CLUSTER layer. Runs LAST, over the ELIGIBLE set only: an
+    // out-of-cell or pre-pin row must never displace an eligible one as the
+    // representative of its session. Representative = earliest `openTs`, ties
+    // on the dedupe key, so the choice is deterministic and replay-stable.
+    const clusters = new Map<string, Array<{ rec: CloseRow; key: string; fallbackKeyed: boolean }>>();
+    for (const e of eligible) {
+      const ck = otmEvaluationClusterKey(e.rec);
+      const g = clusters.get(ck);
+      if (g) g.push(e);
+      else clusters.set(ck, [e]);
+    }
+    for (const g of clusters.values()) {
+      g.sort((a, b) => (a.rec.openTs - b.rec.openTs) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+      const rep = g[0]!;
+      reasons.sameContractSameSessionCluster += g.length - 1;
+      if (rep.fallbackKeyed) reasons.brokerOrderIdNull += 1;
+      counted.push(rep.rec);
+    }
+    counted.sort((a, b) => (a.closeTs ?? 0) - (b.closeTs ?? 0));
   }
   return { counted, reasons };
 }
@@ -483,7 +579,7 @@ export function foldOtmEvaluationWindow(
   const target = targetFor(state);
   const excludedN =
     reasons.entryPredatesStart + reasons.rulesetPaused + reasons.dedupeDuplicate + reasons.notLive + reasons.notOtm
-    + reasons.outsideDeltaCell + reasons.entryDeltaUnknown;
+    + reasons.outsideDeltaCell + reasons.entryDeltaUnknown + reasons.sameContractSameSessionCluster;
 
   let criteria: OtmEvaluationReadout['criteria'] = 'below_target';
   if (stats.n >= target && stats.avgR !== null && stats.seR !== null) {
@@ -702,7 +798,19 @@ export function buildOtmEvaluationWindowRecord(
       },
     populationRuling:
       'QuantTrader scope note (TRA-3945 comment 88ccac56): the window measures the ONE |entryDelta| cell that survives card cc2c36fe on TRA-3944 (floor deltaBand ∩ armed selectorBand, frozen at the stamp). Option B => [0.50,0.55); option A => [0.25,0.40] and the window is expected to rest at n=0 (the cost bar refuses those cells on merit) - grade that as insufficient_population, NOT as a passing window. Never pool two cells into one 30-close sample (TRA-2677).',
-    dedupe: 'key = brokerOrderId ?? `${optionSymbol}|${closeTs}`; one representative per key, OTM label preferred',
+    dedupe: 'key = brokerOrderId ?? `${account}|${optionSymbol}|${closeTs}`; one representative per key, OTM label preferred. The fallback leg is BOOK-SCOPED (TRA-3945 §3b): its job is to collapse a double-REPORT of one fill, which is always inside one book, so two books closing one contract at one instant with no order id can no longer merge into one observation.',
+    clustering: {
+      rule: 'AFTER dedupe AND after every eligibility filter: cluster key = `${optionSymbol}|${etDay(openTs)}`; one representative per cluster (earliest openTs, ties on dedupe key). Surplus rows counted under excludedCloses.reasons.sameContractSameSessionCluster.',
+      bookAgnostic: true as const,
+      derivedFrom: 'entry' as const,
+      why: 'seR = sd/sqrt(n) treats closes as independent draws. Two REAL fills of one contract in one ET session are driven by ONE price path: near-equal Rs add to n while adding ~0 to the sum of squares, so seR falls twice over and the 0.10 bar clears earlier than the evidence supports - the PERMISSIVE direction. Observed live 2026-08-24: v0nni 14:25:07Z and admin 14:44:33Z both bought NVTS261002C00012500 from the same generator with DIFFERENT broker order ids, so the report-dedupe key could not see it.',
+      entryDerivedBecause: 'The arm under test IS an exit ruleset (trail exit + day-one stop). A cluster keyed on closeTs would let the thing being graded choose its own sample size - two correlated entries exiting on different days would silently de-cluster.',
+      bookAgnosticBecause: 'The correlation is one underlying on one session, not a book boundary; two entries of one contract in ONE book on one day are exactly as correlated as two across books. Keying on `account` would also depend on a field documented for the DEMO fold.',
+      monotoneConservative: 'The layer only ever REMOVES rows the prior rule admitted - it can never admit one it excluded. n is a lower bound on the old n and seR an upper bound, so the edit can only make the bar HARDER. That asymmetry is what makes it safe to land mid-window.',
+      preRegisteredAt: '2026-08-24 while n = 0 - PRE-registration, not a re-cut',
+      ruling: 'CEO comment a9f429a9 option (a), generalized. Option (b) - declare cross-book same-contract closes independent - was REFUSED: they are manifestly not independent draws (same underlying, same strike, same expiry, same session, same generator).',
+      relatedDefect: 'TRA-2677 (never pool two populations into one sample) arriving through the door TRA-3703 names: a per-book rule times N gate-open books breaks a fleet-level property. Here the fleet-level property is the sample\'s independence, and the fold reads listOptionTradeJournal() UNSCOPED - every gate-open book\'s rows are in the population.',
+    },
     rBasis: 'journal realizedR = realizedPnlUsd / atRiskUsd (TRA-375); seR = sample sd (n-1) / sqrt(n)',
     targetCloses: OTM_EVALUATION_TARGET_CLOSES,
     extension: { ...state.extension, usedAt: state.extension.usedAt === null ? null : new Date(state.extension.usedAt).toISOString() },

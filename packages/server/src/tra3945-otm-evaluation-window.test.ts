@@ -348,4 +348,122 @@ describe('TRA-3945 population cell (QuantTrader scope note 88ccac56 — ONE delt
     expect(rec.thresholds.invalidation).toMatchObject({ barR: 0.485, tapeCellAdvertisedR: 1.47, lowerCi95: null });
     expect(rec.populationCell?.frozen).toBe(false);
   });
+
+  // ── TRA-3945 §3b — the cross-book ruling (CEO comment a9f429a9) ────────────
+  //
+  // The live case that forced it: on 2026-08-24 books `v0nni` (14:25:07Z) and
+  // `admin` (14:44:33Z) each bought NVTS261002C00012500 from the same generator
+  // with DIFFERENT broker order ids. Two real fills, ONE price path.
+  describe('cross-book same-contract clustering (§3b)', () => {
+    const ET_0930 = Date.UTC(2026, 7, 24, 13, 30); // 09:30 ET, 2026-08-24
+    function nvts(over: Partial<Row>): Row {
+      return close(1, {
+        symbol: 'NVTS',
+        optionSymbol: 'NVTS261002C00012500',
+        openTs: ET_0930 + 3 * H,
+        closeTs: ET_0930 + 5 * H,
+        ...over,
+      });
+    }
+
+    it('two REAL fills of one contract in one ET session count ONCE, across books, with distinct order ids', () => {
+      const s = opened();
+      const v0nni = nvts({ id: 'v0nni-1', account: 'v0nni', brokerOrderId: 143021643, openTs: ET_0930 + 3 * H, realizedR: 0.9, realizedPnlUsd: 225 });
+      const admin = nvts({ id: 'admin-1', account: 'admin', brokerOrderId: 143032832, openTs: ET_0930 + 3.3 * H, realizedR: 0.88, realizedPnlUsd: 220 });
+      const r = foldOtmEvaluationWindow([admin, v0nni, close(2)], s, T0 + 100 * H);
+      // The report-dedupe key CANNOT see this — the order ids differ.
+      expect(r.excludedCloses.reasons.dedupeDuplicate).toBe(0);
+      expect(r.n).toBe(2); // the NVTS cluster + the unrelated XLF row
+      expect(r.excludedCloses.reasons.sameContractSameSessionCluster).toBe(1);
+      expect(r.excludedCloses.n).toBe(1);
+    });
+
+    it('the representative is the EARLIEST entry, so the surviving row is deterministic and replay-stable', () => {
+      const s = opened();
+      const early = nvts({ id: 'early', account: 'v0nni', brokerOrderId: 999, openTs: ET_0930 + 3 * H, realizedR: 0.5, realizedPnlUsd: 125 });
+      const late = nvts({ id: 'late', account: 'admin', brokerOrderId: 111, openTs: ET_0930 + 3.3 * H, realizedR: -0.5, realizedPnlUsd: -125 });
+      // Order of arrival must not decide the sample.
+      for (const rows of [[early, late], [late, early]]) {
+        const r = foldOtmEvaluationWindow(rows, s, T0 + 100 * H);
+        expect(r.n).toBe(1);
+        expect(r.avgR).toBe(0.5); // the EARLY row's R, both ways round
+      }
+    });
+
+    it('the cluster is ENTRY-derived: two correlated entries that EXIT on different days still cluster', () => {
+      const s = opened();
+      // If the key were exit-derived, the arm under test (an EXIT ruleset)
+      // would choose its own sample size by exiting the two legs apart.
+      const a = nvts({ id: 'a', account: 'v0nni', brokerOrderId: 1, openTs: ET_0930 + 3 * H, closeTs: ET_0930 + 5 * H });
+      const b = nvts({ id: 'b', account: 'admin', brokerOrderId: 2, openTs: ET_0930 + 3.3 * H, closeTs: ET_0930 + 30 * H });
+      expect(foldOtmEvaluationWindow([a, b], s, T0 + 100 * H).n).toBe(1);
+    });
+
+    it('is BOOK-AGNOSTIC: two entries of one contract in ONE book on one day cluster too', () => {
+      const s = opened();
+      const a = nvts({ id: 'a', account: 'admin', brokerOrderId: 1, openTs: ET_0930 + 3 * H });
+      const b = nvts({ id: 'b', account: 'admin', brokerOrderId: 2, openTs: ET_0930 + 3.3 * H });
+      const r = foldOtmEvaluationWindow([a, b], s, T0 + 100 * H);
+      expect(r.n).toBe(1);
+      expect(r.excludedCloses.reasons.sameContractSameSessionCluster).toBe(1);
+    });
+
+    it('does NOT over-collapse: a different ET session, or a different contract, is a separate draw', () => {
+      const s = opened();
+      const d1 = nvts({ id: 'd1', account: 'admin', brokerOrderId: 1, openTs: ET_0930 + 3 * H });
+      const d2 = nvts({ id: 'd2', account: 'admin', brokerOrderId: 2, openTs: ET_0930 + 27 * H }); // next ET day
+      expect(foldOtmEvaluationWindow([d1, d2], s, T0 + 100 * H).n).toBe(2);
+      const other = nvts({ id: 'o', account: 'admin', brokerOrderId: 3, optionSymbol: 'NVTS261002C00013000', openTs: ET_0930 + 3.3 * H });
+      expect(foldOtmEvaluationWindow([d1, other], s, T0 + 100 * H).n).toBe(2);
+    });
+
+    it('MONOTONE CONSERVATIVE: the layer can only shrink n — it never admits a row the old rule excluded', () => {
+      const s = opened();
+      // Every previously-refused class stays refused, and the only rows the new
+      // layer touches are ones the old rule COUNTED. seR can therefore only rise.
+      const rows: Row[] = [
+        close(1, { mode: 'demo' }),                       // notLive
+        close(2, { structure: 'single_leg_rv' }),         // notOtm
+        close(-2, { closeTs: T0 + 5 * H }),               // entryPredatesStart
+        close(4, { entryDelta: 0.1 }),                    // outsideDeltaCell
+        nvts({ id: 'c1', account: 'v0nni', brokerOrderId: 7, openTs: ET_0930 + 3 * H }),
+        nvts({ id: 'c2', account: 'admin', brokerOrderId: 8, openTs: ET_0930 + 3.3 * H }),
+      ];
+      const r = foldOtmEvaluationWindow(rows, s, T0 + 100 * H);
+      const clustered = r.excludedCloses.reasons.sameContractSameSessionCluster;
+      expect(clustered).toBe(1);
+      // n + everything refused = every close handed in. Nothing appeared from nowhere.
+      expect(r.n + r.excludedCloses.n).toBe(rows.length);
+      expect(r.n).toBeLessThan(rows.length);
+    });
+
+    it('the fallback dedupe leg is BOOK-SCOPED: two books, one contract, one closeTs, no order id — both survive it', () => {
+      const s = opened();
+      // Same contract + same closeTs + null brokerOrderId in two books used to
+      // merge at the REPORT layer (the under-count twin). They must reach the
+      // cluster layer as two rows and be refused THERE, under the right reason.
+      const a = nvts({ id: 'a', account: 'v0nni', brokerOrderId: null, openTs: ET_0930 + 3 * H });
+      const b = nvts({ id: 'b', account: 'admin', brokerOrderId: null, openTs: ET_0930 + 3.3 * H });
+      const r = foldOtmEvaluationWindow([a, b], s, T0 + 100 * H);
+      expect(r.excludedCloses.reasons.dedupeDuplicate).toBe(0);
+      expect(r.excludedCloses.reasons.sameContractSameSessionCluster).toBe(1);
+      // …and a genuine double-LISTING (one book, one fill, two labels) still collides.
+      const dup = { ...a, id: 'a-import', structure: 'tradier_import' } as Row;
+      const r2 = foldOtmEvaluationWindow([a, dup], s, T0 + 100 * H);
+      expect(r2.excludedCloses.reasons.dedupeDuplicate).toBe(1);
+      expect(r2.n).toBe(1);
+    });
+
+    it('the ruling is PUBLISHED on the wire — a grader can read the cut before it changes a verdict', () => {
+      const s = opened();
+      const rec = buildOtmEvaluationWindowRecord(
+        s, evaluateOtmEvaluationLiveness(ALL_TRUE), true, foldOtmEvaluationWindow([], s, T0),
+      );
+      expect(rec.clustering).toMatchObject({ bookAgnostic: true, derivedFrom: 'entry' });
+      expect(rec.clustering.rule).toContain('etDay(openTs)');
+      expect(rec.clustering.monotoneConservative).toContain('only ever REMOVES');
+      expect(rec.dedupe).toContain('${account}');
+      expect(rec.excludedCloses.reasons.sameContractSameSessionCluster).toBe(0);
+    });
+  });
 });
