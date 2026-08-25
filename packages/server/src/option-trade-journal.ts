@@ -1,6 +1,8 @@
 import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
+import { deriveEntrySpreadPct } from '@trading-app/shared';
+import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { STOP_DISTANCE_FRACTION_OF_MARK } from './option-spread-cost.js';
 import type { RiskThrottleSizingPath, RiskThrottleSizingScope } from './risk-throttle-sizing.js';
@@ -225,6 +227,23 @@ export interface OptionTradeJournalOpen {
   entryMarkUsd?: number;
   /** TRA-1656 — contracts filled; the basis for the round-trip commission-in-R term. */
   contracts?: number;
+  /**
+   * TRA-3990 (parent TRA-3945) — the row's entry-quote stamp, mirrored
+   * VERBATIM from `OptionPosition` (see the field docs there). Kept SEPARATE
+   * from TRA-1656's `entryBid`/`entryAsk`/`entryMarkUsd` on purpose: those are
+   * the scanner snapshot the spread-cost rollup folds against `entryMarkUsd`,
+   * and on a live row the mirror supersedes THESE with the broker-submit quote
+   * (`amend_entry_quote`) without moving the TRA-1656 triple out from under
+   * that rollup. `entrySpreadPct` is what `/api/trades/export` publishes as
+   * `entry_spread_pct`. All optional: ABSENT ⇒ written before TRA-3990 (or by
+   * an open path that carries no quote), which the export renders as null —
+   * never 0 (AC3), never a reconstruction (AC5).
+   */
+  entryBidAtOpen?: number | null;
+  entryAskAtOpen?: number | null;
+  entrySpreadPct?: number | null;
+  entryQuoteSource?: EntryQuoteSource;
+  entryQuoteReason?: EntryQuoteReason | null;
   /**
    * TRA-1475 — the owning demo book's username, stamped so the firm-wide DESK
    * fold (`reports/desk-calendar.ts`) can exclude QA/test accounts (`qa*`,
@@ -657,6 +676,12 @@ type MaeLine = { kind: 'mae'; id: string; mae: OptionTradeJournalMae };
 // TRA-3946 — one average-down shadow verdict. Deduped on (id, reason) at fold
 // time, so a replay of the same line twice is one verdict.
 type AverageDownShadowLine = { kind: 'average_down_shadow'; id: string; shadow: OptionTradeJournalAverageDownShadow };
+// TRA-3990 — supersede the OPEN row's entry-quote stamp with the quote the
+// broker order actually crossed. Same shape and same reason as
+// `amend_entry_slippage`: the live open paths write the row BEFORE the broker
+// is contacted, so the row carries the scanner quote until the smart-open walk
+// fills and reports the bid/ask it walked against. Folded on OPEN rows only.
+type AmendEntryQuoteLine = { kind: 'amend_entry_quote'; id: string; quote: EntryQuoteStamp };
 type JournalLine =
   | OpenLine
   | CloseLine
@@ -665,7 +690,8 @@ type JournalLine =
   | VoidLine
   | AmendCloseBasisLine
   | MaeLine
-  | AverageDownShadowLine;
+  | AverageDownShadowLine
+  | AmendEntryQuoteLine;
 
 /**
  * TRA-3472 — a retraction that leaves no trace is ungradeable.
@@ -893,6 +919,27 @@ export function getOptionTradeJournalIntegrity(): OptionTradeJournalIntegrity {
 /** In-memory folded view: id -> latest record. */
 let cache: Map<string, OptionTradeJournalRecord> | null = null;
 
+/**
+ * TRA-3990 — a stamp is coherent when it is EITHER measured (finite bid/ask
+ * whose `(ask − bid) / mid` reconciles to `entrySpreadPct`) OR unmeasured (all
+ * three null with a recognised reason). Anything else — a spread that does not
+ * match its own bid/ask, a `0` with no quote behind it, a partial triple — is
+ * refused whole by the writer and ignored whole by the fold, so a malformed
+ * line can never half-apply or launder a synthesized number onto a row.
+ */
+function isCoherentEntryQuoteStamp(q: unknown): q is EntryQuoteStamp {
+  if (!q || typeof q !== 'object') return false;
+  const s = q as Partial<EntryQuoteStamp>;
+  if (s.entryQuoteSource !== 'scanner' && s.entryQuoteSource !== 'broker_submit') return false;
+  const derived = deriveEntrySpreadPct(s.entryBidAtOpen, s.entryAskAtOpen);
+  const measured = derived !== null
+    && typeof s.entrySpreadPct === 'number'
+    && Math.abs(s.entrySpreadPct - derived) <= 1e-9;
+  const unmeasured = s.entryBidAtOpen === null && s.entryAskAtOpen === null && s.entrySpreadPct === null
+    && (s.entryQuoteReason === 'no_quote_snapshot' || s.entryQuoteReason === 'one_sided_quote');
+  return measured || unmeasured;
+}
+
 function foldLine(
   map: Map<string, OptionTradeJournalRecord>,
   line: JournalLine,
@@ -919,6 +966,25 @@ function foldLine(
     if (typeof line.entrySlippageUsd === 'number' && Number.isFinite(line.entrySlippageUsd)) {
       map.set(line.id, { ...rec, entrySlippageUsd: line.entrySlippageUsd });
     }
+    return;
+  }
+  if (line.kind === 'amend_entry_quote') {
+    // TRA-3990 — supersede the scanner stamp with the broker-submit quote.
+    // Unknown id ⇒ dropped (never resurrects a row). A malformed line (no
+    // `quote`, or a spread that does not reconcile to its own bid/ask) is
+    // ignored rather than half-applied: the three numbers travel together.
+    const rec = map.get(line.id);
+    if (!rec) return;
+    const q = line.quote;
+    if (!isCoherentEntryQuoteStamp(q)) return;
+    map.set(line.id, {
+      ...rec,
+      entryBidAtOpen: q.entryBidAtOpen,
+      entryAskAtOpen: q.entryAskAtOpen,
+      entrySpreadPct: q.entrySpreadPct,
+      entryQuoteSource: q.entryQuoteSource,
+      entryQuoteReason: q.entrySpreadPct === null ? q.entryQuoteReason : null,
+    });
     return;
   }
   if (line.kind === 'partial_close') {
@@ -1230,6 +1296,32 @@ export async function recordOptionTradeEntrySlippage(
   foldLine(map, { kind: 'amend_entry_slippage', id, entrySlippageUsd });
   await appendLine({ kind: 'amend_entry_slippage', id, entrySlippageUsd });
   log.info('option trade journal entry-slippage amended', { id, entrySlippageUsd });
+  return true;
+}
+
+/**
+ * TRA-3990 — supersede an OPEN row's entry-quote stamp with the quote the broker
+ * order actually crossed (`submitSmartBuyToOpen`'s own pull). Same contract as
+ * {@link recordOptionTradeEntrySlippage}: no-op (false) when the flag is off,
+ * the row is unknown, or it is already closed. The stamp is written whole —
+ * nulls and reason included — so an unmeasured broker quote is recorded AS
+ * unmeasured rather than leaving the scanner's figure standing under a
+ * `broker_submit` label.
+ */
+export async function recordOptionTradeEntryQuote(
+  id: string,
+  quote: EntryQuoteStamp,
+): Promise<boolean> {
+  if (!isOptionTradeJournalEnabled()) return false;
+  if (!isCoherentEntryQuoteStamp(quote)) return false;
+  const map = await ensureLoaded();
+  const existing = map.get(id);
+  if (!existing || existing.outcome !== 'OPEN') return false;
+  foldLine(map, { kind: 'amend_entry_quote', id, quote });
+  await appendLine({ kind: 'amend_entry_quote', id, quote });
+  log.info('option trade journal entry-quote amended', {
+    id, source: quote.entryQuoteSource, entrySpreadPct: quote.entrySpreadPct, reason: quote.entryQuoteReason,
+  });
   return true;
 }
 

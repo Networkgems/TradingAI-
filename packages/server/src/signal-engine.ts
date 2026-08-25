@@ -24,6 +24,7 @@ import {
   advanceMoveSuspectSession,
   SUSPECT_MOVE_RATIO_FLOOR,
   describeCorporateAction,
+  buildEntryQuoteStamp,
 } from '@trading-app/shared';
 import { etDateKey } from './et-clock.js';
 // TRA-3943 (parent TRA-3927, board card `a29b2db8`) — the OTM sleeve's intraday
@@ -394,7 +395,8 @@ import { resolveMakerWalkConfig, type MakerWalkConfig } from './option-maker-con
  * this only bounds the pathological case where the tick stops draining them.
  */
 const SHADOW_CHASE_MAX_IN_FLIGHT = 200;
-import { recordOptionTradeEntrySlippage, recordOptionTradeVoid } from './option-trade-journal.js';
+import { recordOptionTradeEntrySlippage, recordOptionTradeEntryQuote, recordOptionTradeVoid } from './option-trade-journal.js';
+import { recordEntryQuoteStampOutcome } from './entry-quote-stamp.js';
 // TRA-3905 — the per-book submitted/filled/reject fold and the permission
 // breaker. A book the broker refuses 100% of the time read FULLY ARMED on every
 // other instrument on this box; `submitted` vs `filled` per book is the pair
@@ -11340,6 +11342,26 @@ export class SignalEngine {
               ? { orderId: outcome.orderId }
               : {}),
           };
+        }
+        // TRA-3990 — THE QUOTE THE ORDER ACTUALLY CROSSED. `outcome.bid`/`ask`
+        // are the smart-open helper's own pull, the snapshot the LIMIT ladder
+        // (and so the fill) was priced off — NOT a re-fetch, which would
+        // measure a different moment (AC1). Supersedes the scanner stamp the
+        // paper open wrote; written whole (nulls + reason on the ask-only
+        // path) so an unmeasured broker quote never leaves the scanner's
+        // figure standing under a `broker_submit` label. Mirrored to the
+        // journal in the same breath so the archive-served row agrees (AC2).
+        // Not conditional on `opts?.sleeve`: a measurement of the money
+        // path must not be scoped to a telemetry tag.
+        {
+          const entryQuote = buildEntryQuoteStamp('broker_submit', { bid: outcome.bid, ask: outcome.ask });
+          opened.entryBidAtOpen = entryQuote.entryBidAtOpen;
+          opened.entryAskAtOpen = entryQuote.entryAskAtOpen;
+          opened.entrySpreadPct = entryQuote.entrySpreadPct;
+          opened.entryQuoteSource = entryQuote.entryQuoteSource;
+          opened.entryQuoteReason = entryQuote.entryQuoteReason;
+          recordEntryQuoteStampOutcome(entryQuote);
+          recordOptionTradeEntryQuote(opened.id, entryQuote).catch(() => {});
         }
         // TRA-3905 — the fill side. Also clears the permission run: a fill is
         // positive proof this account may trade options, so a later reject

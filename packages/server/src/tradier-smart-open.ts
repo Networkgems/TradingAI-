@@ -64,6 +64,13 @@ export type SmartBuyOutcome =
       /** Ask at the moment the helper pulled the quote. */
       ask: number;
       /**
+       * TRA-3990 — bid on the SAME quote pull as `ask`/`mid`, or `null` on the
+       * ask-only path. This is the quote the order actually crossed; the caller
+       * stamps `entryBidAtOpen`/`entryAskAtOpen`/`entrySpreadPct` from it rather
+       * than re-fetching, which would measure a different moment.
+       */
+      bid: number | null;
+      /**
        * TRA-1601 (telemetry) — wall-clock ms from the first order submit to the
        * terminal `filled` poll. Feeds the maker-fill time-to-fill rollup.
        */
@@ -289,6 +296,8 @@ export async function submitSmartBuyToOpen(
         walk: attempt,
         mid: path.kind === 'mid' ? (path.bid + path.ask) / 2 : null,
         ask: path.ask,
+        // TRA-3990 — same `path`, same pull; null on the one-sided path.
+        bid: path.kind === 'mid' ? path.bid : null,
         timeToFillMs: Math.max(0, clock() - startedAt),
       };
     }

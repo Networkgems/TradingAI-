@@ -161,6 +161,13 @@ export const EXPORT_COLUMNS = [
   // because a stop-basis R that is only available by *inferring* it from the
   // premium-basis one is how the two got confused in the first place (AC3).
   'pnl_r_stop_basis',
+  // TRA-3990 — appended after it for the same reason. `(ask − bid) / mid` on
+  // the snapshot the fill price came from; options only. Null — NEVER 0 — on
+  // a row opened before the stamp shipped, on a row whose quote was
+  // unavailable at open, and on every equity/crypto row. A zero here would be
+  // indistinguishable from a perfectly tight quote and would poison the
+  // median split TRA-3945's secondary analysis is pre-registered on.
+  'entry_spread_pct',
 ] as const;
 
 export interface ExportTradeRow {
@@ -189,6 +196,14 @@ export interface ExportTradeRow {
    * `toCsv` renders an absent one as an empty cell exactly like a null.
    */
   pnl_r_stop_basis?: number | null;
+  /**
+   * TRA-3990 — `(ask − bid) / mid` at entry, from the SAME snapshot the fill
+   * price came from (see `OptionPosition.entrySpreadPct`). Last CSV column.
+   * `null` on a pre-stamp row, an unmeasured quote, and every non-option row;
+   * never `0` for any of those. Optional on the TYPE for the same reason as
+   * `pnl_r_stop_basis`; every mapper sets it.
+   */
+  entry_spread_pct?: number | null;
   /**
    * TRA-3989 — the unit `pnl_r` is in, JSON-only (see {@link ExportPnlRBasis}).
    * Optional on the TYPE for the same reason as `pnl_r_stop_basis`.
@@ -656,6 +671,8 @@ export function rowFromPosition(pos: Position, market: 'stocks' | 'crypto'): Exp
     lot_id: pos.id,
     journal_id: null,
     broker_order_id: null,
+    // TRA-3990 — options-only measurement; an equity/crypto row is null, not 0.
+    entry_spread_pct: null,
   };
 }
 
@@ -714,6 +731,9 @@ export function rowFromOption(opt: OptionPosition): ExportTradeRow {
     // then this reads null rather than reaching for `pendingCloseOrderId`, which
     // tracks a WORKING order and is cleared on the close it describes.
     broker_order_id: null,
+    // TRA-3990 — the row's own stamp, or null. `isFiniteNumber` and not `?? null`
+    // so a NaN that somehow reached the row is a blank, not a number.
+    entry_spread_pct: isFiniteNumber(opt.entrySpreadPct) ? opt.entrySpreadPct : null,
   };
 }
 

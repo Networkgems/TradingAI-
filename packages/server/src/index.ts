@@ -109,6 +109,8 @@ import { accountDeletedAt, recordAccountTombstone } from './deleted-accounts.js'
 // is still on disk hands the new account the previous holder's positions.
 import { retireOrphanedBook, shapeRetiredOrphanReceipt } from './orphaned-books.js';
 import { redactTradierEnvLabel, isRecognizedTradierEnvLabel } from './tradier-env-label.js';
+// TRA-3990 — entry-quote stamp health surface (since-boot + durable fold).
+import { entryQuoteStampSinceBoot, summarizeEntryQuoteStamp } from './entry-quote-stamp.js';
 import {
   listOptionTradeJournal,
   isOptionTradeJournalEnabled,
@@ -11139,9 +11141,31 @@ app.get('/api/health/options-live', async (_req, res) => {
         blindReason: err instanceof Error ? err.message : String(err),
       }),
     );
+    // TRA-3990 — the entry-quote stamp readout (AC4: the `no_quote_snapshot`
+    // count "is readable and is 0 or explained"). `durable` is the fold over
+    // the option-trade journal and survives the archive + a restart;
+    // `sinceBoot` is writer liveness in THIS process only. Blind, never
+    // absent, on a journal that cannot be read: `durable: null` with a reason.
+    const entryQuoteStamp = await (async () => {
+      const sinceBoot = entryQuoteStampSinceBoot();
+      if (!isOptionTradeJournalEnabled()) {
+        return { issue: 'TRA-3990' as const, sinceBoot, durable: null, blindReason: 'journal_disabled' as const };
+      }
+      try {
+        const rows = await listOptionTradeJournal();
+        const integrity = getOptionTradeJournalIntegrity();
+        if (integrity.readError !== null) {
+          return { issue: 'TRA-3990' as const, sinceBoot, durable: null, blindReason: `journal_read_error: ${integrity.readError}` };
+        }
+        return { issue: 'TRA-3990' as const, sinceBoot, durable: summarizeEntryQuoteStamp(rows), blindReason: null };
+      } catch (err) {
+        return { issue: 'TRA-3990' as const, sinceBoot, durable: null, blindReason: err instanceof Error ? err.message : String(err) };
+      }
+    })();
     res.json({
       ok: true,
       averageDown,
+      entryQuoteStamp,
       issue: 'TRA-1581',
       time: new Date().toISOString(),
       build: resolveBuildInfo(),

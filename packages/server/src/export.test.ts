@@ -262,24 +262,27 @@ describe('summarize', () => {
 // ── CSV ───────────────────────────────────────────────────────────────────────
 
 describe('toCsv', () => {
-  it('emits the exact §2.3 header, plus TRA-3989\'s `pnl_r_stop_basis` appended LAST', () => {
+  it('emits the exact §2.3 header, plus TRA-3989\'s `pnl_r_stop_basis` and TRA-3990\'s `entry_spread_pct` appended', () => {
     const csv = toCsv([]);
     // The sixteen §2.3 columns keep their ordinals; the seventeenth is the
-    // relabelled stop-distance R (TRA-3989 AC3).
+    // relabelled stop-distance R (TRA-3989 AC3); the eighteenth is the entry
+    // spread (TRA-3990 AC3).
     expect(csv.split('\r\n')[0]).toBe(
-      'symbol,market,mode,side,strategy,quantity,entry_time,entry_price,exit_time,exit_price,exit_reason,gross_pnl_usd,fees_usd,net_pnl_usd,pnl_r,hold_duration,pnl_r_stop_basis',
+      'symbol,market,mode,side,strategy,quantity,entry_time,entry_price,exit_time,exit_price,exit_reason,gross_pnl_usd,fees_usd,net_pnl_usd,pnl_r,hold_duration,pnl_r_stop_basis,entry_spread_pct',
     );
-    expect(EXPORT_COLUMNS).toHaveLength(17);
+    expect(EXPORT_COLUMNS).toHaveLength(18);
     expect(EXPORT_COLUMNS[16]).toBe('pnl_r_stop_basis');
+    expect(EXPORT_COLUMNS[17]).toBe('entry_spread_pct');
   });
 
   it('renders a data row with all columns populated', () => {
     const csv = toCsv([rowFromPosition(stock(), 'stocks')]);
     const dataLine = csv.split('\r\n')[1];
-    // An equity row's risk unit IS the stop distance, so the last column repeats
-    // `pnl_r` (2) rather than reading blank.
+    // An equity row's risk unit IS the stop distance, so `pnl_r_stop_basis`
+    // repeats `pnl_r` (2) rather than reading blank. `entry_spread_pct` (TRA-3990)
+    // is an options-only measurement and is BLANK on an equity row — never 0.
     expect(dataLine).toBe(
-      'AAPL,stocks,live,buy,orb_breakout,10,2026-05-01T14:00:00.000Z,100,2026-05-01T16:14:00.000Z,110,target,100,0,100,2,2h 14m,2',
+      'AAPL,stocks,live,buy,orb_breakout,10,2026-05-01T14:00:00.000Z,100,2026-05-01T16:14:00.000Z,110,target,100,0,100,2,2h 14m,2,',
     );
   });
 

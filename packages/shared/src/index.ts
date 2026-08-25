@@ -2670,6 +2670,88 @@ export interface OptionLeg {
   expiration: string;
 }
 
+/**
+ * TRA-3990 (parent TRA-3945) — WHICH snapshot the entry quote on a row came from.
+ *
+ *  - `broker_submit` — the bid/ask `submitSmartBuyToOpen` pulled from Tradier
+ *    immediately before the LIMIT walk; the quote the order actually crossed.
+ *    Stamped by the live mirror on `filled`, superseding the scanner stamp.
+ *  - `scanner` — the candidate's own `bid`/`ask` from the chain snapshot the
+ *    scanner derived `mark` from; the quote a DEMO fill booked against, and
+ *    the provisional stamp on a live row until the broker fill lands.
+ */
+export type EntryQuoteSource = 'broker_submit' | 'scanner';
+
+/**
+ * TRA-3990 — WHY a row carries no entry spread. Stamped instead of a number,
+ * never alongside one.
+ *
+ *  - `no_quote_snapshot` — no two-sided quote was in hand at the moment the
+ *    fill price was taken (candidate carried no bid/ask, or the broker quote
+ *    lookup returned nothing usable).
+ *  - `one_sided_quote` — an ask with no bid (the smart-open `ask_only` path).
+ *    A spread cannot be derived from one side; a zero bid is NOT a tight quote.
+ */
+export type EntryQuoteReason = 'no_quote_snapshot' | 'one_sided_quote';
+
+/**
+ * TRA-3990 — the entry-quote stamp, as it sits on {@link OptionPosition} and on
+ * the option-trade journal row. All three numbers are non-null together or null
+ * together; when null, `entryQuoteReason` says why.
+ */
+export interface EntryQuoteStamp {
+  /** Per-share bid on the snapshot the fill price was taken from. */
+  entryBidAtOpen: number | null;
+  /** Per-share ask on the same snapshot. */
+  entryAskAtOpen: number | null;
+  /** `(ask − bid) / mid`, mid = `(bid + ask) / 2`. Unrounded. */
+  entrySpreadPct: number | null;
+  entryQuoteSource: EntryQuoteSource;
+  entryQuoteReason: EntryQuoteReason | null;
+}
+
+/**
+ * TRA-3990 — `(ask − bid) / mid`, or `null` when it cannot be derived.
+ *
+ * Fails to NULL, never to a default (AC4): a non-finite side, a non-positive
+ * bid (a zero bid is a one-sided quote, not a free one), or an inverted book
+ * all yield `null`. The one value this must never produce for an unmeasured
+ * quote is `0` — a zero here is indistinguishable from a perfectly tight quote
+ * and would poison the median split the column exists to enable (AC3).
+ */
+export function deriveEntrySpreadPct(bid: unknown, ask: unknown): number | null {
+  if (typeof bid !== 'number' || typeof ask !== 'number') return null;
+  if (!Number.isFinite(bid) || !Number.isFinite(ask)) return null;
+  if (!(bid > 0) || !(ask >= bid)) return null;
+  const mid = (bid + ask) / 2;
+  if (!(mid > 0)) return null;
+  return (ask - bid) / mid;
+}
+
+/**
+ * TRA-3990 — build the stamp from whatever quote was in hand. `undefined` /
+ * `null` quote ⇒ `no_quote_snapshot`; an ask without a usable bid ⇒
+ * `one_sided_quote`; anything else that cannot yield a spread ⇒
+ * `no_quote_snapshot`. A stamp is ALWAYS produced, so an open site that calls
+ * this cannot leave the row unstamped — an absent field on a row written by
+ * this build would otherwise be indistinguishable from a pre-TRA-3990 row.
+ */
+export function buildEntryQuoteStamp(
+  source: EntryQuoteSource,
+  quote: { bid?: number | null; ask?: number | null } | null | undefined,
+): EntryQuoteStamp {
+  const bid = typeof quote?.bid === 'number' && Number.isFinite(quote.bid) ? quote.bid : null;
+  const ask = typeof quote?.ask === 'number' && Number.isFinite(quote.ask) ? quote.ask : null;
+  const spread = deriveEntrySpreadPct(bid, ask);
+  if (spread !== null && bid !== null && ask !== null) {
+    return { entryBidAtOpen: bid, entryAskAtOpen: ask, entrySpreadPct: spread, entryQuoteSource: source, entryQuoteReason: null };
+  }
+  const reason: EntryQuoteReason = ask !== null && ask > 0 && !(bid !== null && bid > 0)
+    ? 'one_sided_quote'
+    : 'no_quote_snapshot';
+  return { entryBidAtOpen: null, entryAskAtOpen: null, entrySpreadPct: null, entryQuoteSource: source, entryQuoteReason: reason };
+}
+
 export interface OptionPosition {
   id: string;
   symbol: string;
@@ -3209,6 +3291,41 @@ export interface OptionPosition {
     /** Broker order id, when the walk returned one. The handle back to the tape. */
     orderId?: number;
   };
+  /**
+   * TRA-3990 (parent TRA-3945) — THE QUOTE WE PAID, stamped at open.
+   *
+   * The execution-cost measurement behind TRA-3944 says the sleeve's cost is
+   * essentially all spread (`medianSpreadShareOfCost 0.9954`, admitted rows
+   * pay `spreadR` p50 0.357), and the obvious remedy — arm the net-edge form
+   * and sweep `k` — rests on an assumption nobody could test: that gross edge
+   * is INDEPENDENT of quote width. The test is one line (split closed rows at
+   * the median entry spread, check realized R is flat), and it could not be
+   * run because the row never held the quote. 15 live OTM closes exist and
+   * every one is unanswerable; TRA-3945's 30-close window started accruing
+   * on 2026-08-24 with the same hole.
+   *
+   * Captured on the SAME snapshot the fill price came from — never re-fetched
+   * afterwards, which would measure a different moment:
+   *   • live rows: the bid/ask `submitSmartBuyToOpen` pulled immediately
+   *     before the LIMIT walk (`entryQuoteSource: 'broker_submit'`), written
+   *     by the mirror on `filled` over the provisional scanner stamp;
+   *   • demo rows: the candidate's own `bid`/`ask`, the chain snapshot the
+   *     booked `mark` was derived from (`'scanner'`).
+   *
+   * Semantics of the three states on a row:
+   *   ABSENT  — written before TRA-3990; unknowable after the fact. Backfill
+   *             is explicitly OUT of scope (AC5): the quote at a past moment
+   *             is not recoverable and a reconstruction would be a fabricated
+   *             number sitting in the column a verdict reads.
+   *   null    — stamped by this build, quote unavailable; `entryQuoteReason`
+   *             names why. Never a synthesized figure, never `0`.
+   *   number  — measured; `entrySpreadPct === (ask − bid) / ((ask + bid) / 2)`.
+   */
+  entryBidAtOpen?: number | null;
+  entryAskAtOpen?: number | null;
+  entrySpreadPct?: number | null;
+  entryQuoteSource?: EntryQuoteSource;
+  entryQuoteReason?: EntryQuoteReason | null;
   /**
    * TRA-348 — Tradier order id for an in-flight `sell_to_close` against an
    * imported position. Set when the close order was accepted but did not

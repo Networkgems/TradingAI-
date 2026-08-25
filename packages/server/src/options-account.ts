@@ -18,7 +18,10 @@ import type {
   GuardrailVerdict,
   PortfolioGreeks,
   SignalType,
+  EntryQuoteStamp,
 } from '@trading-app/shared';
+import { buildEntryQuoteStamp } from '@trading-app/shared';
+import { recordEntryQuoteStampOutcome } from './entry-quote-stamp.js';
 import { computePortfolioGreeks } from './reports/portfolio-greeks.js';
 import { etDateKey, etWallClockToUtcMs } from './et-clock.js';
 import type { LiveOptionStopPolicy, OtmSleeveExitRuleName } from './exit-risk-rules-flag.js';
@@ -394,6 +397,24 @@ function quoteOf(
   if (!Number.isFinite(bid) || !Number.isFinite(ask) || !Number.isFinite(rawMark)) return undefined;
   if (rawMark <= 0 || bid < 0 || ask <= 0 || ask < bid) return undefined;
   return { bid, ask, mark: rawMark };
+}
+
+/**
+ * TRA-3990 — the SCANNER-side entry-quote stamp for a freshly built row, from
+ * the same `quoteOf(signal, rawMark)` the journal's TRA-1656 fields are fed
+ * from — i.e. the chain snapshot `mark` was derived from, which is the snapshot
+ * a demo fill's `premiumPaid` came from. Always yields a full stamp (nulls +
+ * reason when the candidate carried no usable two-sided quote), and counts the
+ * outcome on the since-boot surface so `no_quote_snapshot` is readable without
+ * a journal fold. A live row's mirror supersedes this with the broker-submit
+ * quote on `filled` (`signal-engine.ts`).
+ */
+function stampEntryQuoteFromScanner(
+  quote: { bid: number; ask: number; mark: number } | undefined,
+): EntryQuoteStamp {
+  const stamp = buildEntryQuoteStamp('scanner', quote);
+  recordEntryQuoteStampOutcome(stamp);
+  return stamp;
 }
 
 /**
@@ -4747,6 +4768,21 @@ export class PaperOptionsAccount {
         && quote.ask >= quote.bid
         ? { entryBid: quote.bid, entryAsk: quote.ask, entryMarkUsd: quote.mark }
         : {}),
+      // TRA-3990 — the row's entry-quote stamp, copied VERBATIM (nulls and
+      // reason included) so the journal row and the book row can never
+      // disagree, and so the archive-served row still carries it (AC2). Only
+      // when the row was stamped: a caller that built a row without a stamp
+      // (multi-leg spread, covered write) omits the keys and folds back as
+      // "never stamped", exactly like a pre-TRA-3990 row.
+      ...(position.entryQuoteSource !== undefined
+        ? {
+          entryBidAtOpen: position.entryBidAtOpen ?? null,
+          entryAskAtOpen: position.entryAskAtOpen ?? null,
+          entrySpreadPct: position.entrySpreadPct ?? null,
+          entryQuoteSource: position.entryQuoteSource,
+          entryQuoteReason: position.entryQuoteReason ?? null,
+        }
+        : {}),
       // TRA-1475 — stamp the owning book so the DESK fold can exclude QA/test
       // accounts. Only when bound (un-owned engines omit it → kept by the filter).
       ...(this.owner ? { account: this.owner } : {}),
@@ -6404,6 +6440,11 @@ export class PaperOptionsAccount {
       signalType: 'otm_mispricing',
       mode,
       ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
+      // TRA-3990 — the quote `rawMark` was derived from, stamped on the row
+      // UNCONDITIONALLY (nulls + reason when absent, never an omitted key), so a
+      // row this build wrote is never mistaken for a pre-TRA-3990 one. On a
+      // live row the mirror supersedes this with the broker-submit quote.
+      ...stampEntryQuoteFromScanner(quoteOf(signal, rawMark)),
     };
 
     this.openOptions.set(position.id, position);
@@ -6549,6 +6590,8 @@ export class PaperOptionsAccount {
       signalType: 'relative_value',
       mode,
       ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
+      // TRA-3990 — see `openOptionFromCandidate`.
+      ...stampEntryQuoteFromScanner(quoteOf(signal, rawMark)),
     };
 
     this.openOptions.set(position.id, position);

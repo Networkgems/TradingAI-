@@ -471,6 +471,9 @@ export function rowFromJournalRecord(r: OptionTradeJournalRecord): ExportTradeRo
     // TRA-3945 stamps the realising close's broker order id on the CLOSE row.
     // `??` not `||`: a numeric order id of 0 is a real handle.
     broker_order_id: r.brokerOrderId ?? null,
+    // TRA-3990 — the journal's copy of the row's stamp, so an archive-served row
+    // carries the same figure the book row did (AC2). Null on a pre-stamp row.
+    entry_spread_pct: isFiniteNumber(r.entrySpreadPct) ? r.entrySpreadPct : null,
   };
 }
 
