@@ -411,6 +411,86 @@ describe('TRA-3926 — the TP1 partial site', () => {
   });
 });
 
+// ─── TRA-3909 — a `desk_add` lot is the board's SECOND grant, and it stands too ─
+//
+// Measured live 2026-08-25 on `07cc4ba4`: `RIG260925C00006000`, `desk_add`
+// (residual identity, 1 ct @0.22), trailing stop breached, admitted by
+// `engineMayActOnAdoptedRow` (TRA-3909 exemption, board `d4f622fb`) and then
+// REFUSED by this bound 245× on one boot as `foreign_authority`. Two gates, one
+// row, opposite answers — and the refusal was the wrong one: a desk lot the
+// board told the bot to manage, sitting under a breached stop with no exit.
+
+describe('TRA-3926 x TRA-3909 — a `desk_add` lot exits in full; the bound must not make the exemption inert', () => {
+  it('does not consult either oracle on a desk_add lot, and stands aside (`desk_add_exempt`)', () => {
+    let consulted = 0;
+    const bound = boundExitContractsToEngineShare(
+      { importedFromTradier: true, adoptionAuthority: 'desk_add', tradierEnv: 'production' },
+      1,
+      1,
+      () => { consulted += 1; return null; },
+      // Master arm OFF: the exemption is not ruling B's hand-over and needs
+      // neither of its keys — exactly as `engineMayActOnAdoptedRow` reads it.
+      false,
+      () => { consulted += 1; return null; },
+    );
+    expect(bound).toMatchObject({
+      exitContracts: 1,
+      refusedContracts: 0,
+      reason: 'desk_add_exempt',
+      bounded: false,
+      blind: false,
+      oracleRefused: false,
+    });
+    expect(consulted).toBe(0);
+  });
+
+  it('the SAME lot as a `foreign` row with no hand-over is still refused in full — the pair', () => {
+    // Differing ONLY in `adoptionAuthority`. Without this the carve-out could be
+    // "every imported row exits" wearing the exemption's name.
+    const bound = boundExitContractsToEngineShare(
+      { importedFromTradier: true, adoptionAuthority: 'foreign', tradierEnv: 'production' },
+      1,
+      1,
+      () => null,
+      false,
+      () => null,
+    );
+    expect(bound).toMatchObject({ exitContracts: 0, refusedContracts: 1, reason: 'foreign_authority' });
+  });
+
+  it('at the staging site: a BREACHED desk_add lot stages its exit, and the census counts an exemption, not a refusal', () => {
+    // The live row, to the byte that matters: 1 ct, basis 0.22, stop 0.176,
+    // mark below it. The ledger is EMPTY for the symbol — the desk's fill was
+    // never ours to record — and that must not matter.
+    const acct = liveBook(widenedRow({
+      id: 'rig-desk-add',
+      contracts: 1,
+      contractsRemaining: 1,
+      premiumPaid: 0.22,
+      currentPremium: 0.17,
+      stopLossPremium: 0.176,
+      tp1Premium: 0.33,
+      peakPremium: 0.275,
+      adoptionAuthority: 'desk_add',
+    }));
+
+    const staged = acct.checkExits(UNDERLYINGS, new Map([[XLF, 0.17]]), 'live', { waitAndHold: true });
+
+    expect(staged).toHaveLength(1);
+    const row = acct.getState().openOptions[0]!;
+    expect(row.pendingExit?.qty).toBe(1);
+    expect(row.exitQuantityRefusal).toBeUndefined();
+    expect(row.exitErrorReason).toBeUndefined();
+    expect(acct.getExitQuantityBoundCensus()).toMatchObject({
+      checked: 1,
+      bounded: 0,
+      suppressedExits: 0,
+      blindRows: 0,
+      deskAddExempt: 1,
+    });
+  });
+});
+
 // ─── Ruling B — a per-row hand-over is the board's answer, and it stands ─────
 
 describe('TRA-3926 x TRA-3829 ruling B — an explicit hand-over still exits in full', () => {

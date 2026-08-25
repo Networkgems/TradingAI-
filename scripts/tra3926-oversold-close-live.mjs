@@ -127,6 +127,21 @@ check('D4  the census publishes `netOfCloses` (second-oracle bytes)',
     ? `netOfCloses ${bound.netOfCloses} / blindRows ${bound.blindRows}`
     : 'ABSENT — this build predates the second oracle');
 
+// TRA-3926 (2026-08-25) — the `desk_add` carve-out's deployed-bytes proof, and
+// the refusal REASON on the wire. Measured on `07cc4ba4`: `checked 245 /
+// refused 245 / suppressedExits 245` on the desk's `RIG260925C00006000`
+// (`desk_add`, trailing stop breached), every one of them `foreign_authority`
+// — the board's TRA-3909 exemption made inert by the bound, on real money —
+// and this grader printed PASS, because "exercised" was all the census could
+// say. Neither key exists on `07cc4ba4` or earlier.
+const deskKeysPresent = bound !== undefined && bound !== null
+  && 'deskAddExempt' in bound && 'lastRefusalReason' in bound;
+check('D5  the census publishes `deskAddExempt` + `lastRefusalReason` (desk_add carve-out bytes)',
+  deskKeysPresent,
+  deskKeysPresent
+    ? `deskAddExempt ${bound.deskAddExempt} / lastRefusalReason ${bound.lastRefusalReason}`
+    : 'ABSENT — this build predates the desk_add carve-out');
+
 if (!census) {
   print();
   console.error('FAIL — the detector is not on this build; nothing below is gradeable.');
@@ -203,6 +218,15 @@ check('G7  the census closes over its own population (judged + blind === engineC
 check('G8  every blind carries a reason this build knows',
   blinds.every(b => ['no_open_record', 'unusable_quantity', 'import_only'].includes(b.reason)),
   [...new Set(blinds.map(b => b.reason))].join(',') || 'none');
+// ⛔ THE TWO GATES MUST AGREE. After the carve-outs, `foreign_authority` can
+// reach the bound ONLY through a row `engineMayActOnAdoptedRow` should have
+// refused upstream (`foreign` / `unresolved` / absent, no hand-over) — so a
+// refusal with that reason on the wire is the authorisation gate and the
+// quantity bound disagreeing about the same row, which is the 2026-08-25 RIG
+// defect exactly. Graded only where D5 has the key; D5 carries the absence.
+check('G9  no refusal on this boot names a population the authorisation gate admits (`foreign_authority` at the bound = the gates disagree)',
+  !deskKeysPresent || bound.lastRefusalReason !== 'foreign_authority',
+  deskKeysPresent ? `lastRefusalReason ${bound.lastRefusalReason}` : 'key absent — see D5');
 
 // ── R — the two events the ticket was filed on. A REGRESSION ANCHOR. ───────
 // Both are inside the ledger's 30-day retention as of 2026-08-21. When
@@ -277,7 +301,8 @@ if (!boundExercised) {
 }
 console.log(`\nPASS${FIXTURE ? ' (FIXTURE — proves the pass branch is REACHABLE; says nothing about the box)' : ''}`
   + ` — ${rows.length}/${rows.length}; the bound was exercised ${bound.checked}× on this boot `
-  + `(bounded ${bound.bounded}, contracts refused ${bound.refusedContracts}, blind ${bound.blindRows}).`);
+  + `(bounded ${bound.bounded}, contracts refused ${bound.refusedContracts}, blind ${bound.blindRows}, `
+  + `desk_add exempt ${bound.deskAddExempt ?? '—'}, last refusal ${bound.lastRefusalReason ?? 'none'}).`);
 process.exit(0);
 
 function print() {

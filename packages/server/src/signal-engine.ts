@@ -8766,7 +8766,19 @@ export class SignalEngine {
      * from "the branch is unreachable".
      */
     netOfCloses: number;
+    /**
+     * TRA-3926 (2026-08-25) — `desk_add` lots the bound stood aside on
+     * (TRA-3909 exemption). Neither a refusal nor a blind; the population
+     * the board answered for.
+     */
+    deskAddExempt: number;
     lastRefusalAt: number | null;
+    /**
+     * TRA-3926 (2026-08-25) — the REASON on the newest refusal, on the wire.
+     * `checked 245 / refused 245` on `07cc4ba4` was the board's exemption
+     * being refused as `foreign_authority`, and nothing published said so.
+     */
+    lastRefusalReason: string | null;
   } {
     let checked = 0;
     let bounded = 0;
@@ -8774,7 +8786,9 @@ export class SignalEngine {
     let blindRows = 0;
     let suppressedExits = 0;
     let netOfCloses = 0;
+    let deskAddExempt = 0;
     let lastRefusalAt: number | null = null;
+    let lastRefusalReason: string | null = null;
     for (const env of ['sandbox', 'production'] as const) {
       const c = this.optionsAccounts[env].getExitQuantityBoundCensus();
       checked += c.checked;
@@ -8783,11 +8797,16 @@ export class SignalEngine {
       blindRows += c.blindRows;
       suppressedExits += c.suppressedExits;
       netOfCloses += c.netOfCloses;
+      deskAddExempt += c.deskAddExempt;
       const at = c.last?.at ?? null;
-      if (at !== null && (lastRefusalAt === null || at > lastRefusalAt)) lastRefusalAt = at;
+      if (at !== null && (lastRefusalAt === null || at > lastRefusalAt)) {
+        lastRefusalAt = at;
+        lastRefusalReason = c.last?.reason ?? null;
+      }
     }
     return {
-      checked, bounded, refusedContracts, blindRows, suppressedExits, netOfCloses, lastRefusalAt,
+      checked, bounded, refusedContracts, blindRows, suppressedExits, netOfCloses, deskAddExempt,
+      lastRefusalAt, lastRefusalReason,
     };
   }
 

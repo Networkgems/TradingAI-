@@ -12,19 +12,33 @@
 // a hand-built fixture proves the grader can read a shape I invented, not the
 // shape the route actually serves.
 //
-//   C1  untouched capture                    → 3 BLIND   (the bound is unexercised)
+//   C1  census forced to ZERO                → 3 BLIND   (an unexercised bound is never a pass)
 //   C2  `oversoldCloses` DELETED             → 1 FAIL    (D1; the presence test can see it ABSENT)
 //   C3  `exitQuantityBound` DELETED          → 1 FAIL    (D2)
 //   C4  `excessContracts` bumped by 1        → 1 FAIL    (G2; the served column is not trusted)
 //   C5  a finding's `engineOpenContracts`→0  → 1 FAIL    (G3/G4; a false accusation is caught)
 //   C6  an import_only blind PROMOTED to a finding → 1 FAIL (G6; the exact bug the detector shipped with)
 //   C7  `records[]` emptied                  → 3 BLIND   (a cold ledger is never a pass)
-//   C8  `checked` forced to 1                → 0 PASS    (the PASS branch is reachable at all)
+//   C8  `checked` forced to 1, last refusal a FINDING → 0 PASS (the PASS branch is reachable at all)
 //   C9  pin commit ≠ --expect                → 3 BLIND   (grades the named build or nothing)
+//   C10 `deskAddExempt` DELETED              → 1 FAIL    (D5; the carve-out's bytes can be seen absent)
+//   C11 last refusal = `foreign_authority`   → 1 FAIL    (G9; the two gates disagreeing is caught)
 //
 // ⚠ C8 is the one that matters most and it is the cheapest to get wrong: with
-// the live box permanently at `checked 0`, a grader whose PASS branch was
-// unreachable would be indistinguishable from today's correct BLIND.
+// the live box at `checked 0`, a grader whose PASS branch was unreachable would
+// be indistinguishable from a correct BLIND.
+//
+// ⚠ C1 USED TO BE "untouched capture → BLIND". That encoded the day's arithmetic
+// (`checked 0`) as the expected verdict, and it went RED on 2026-08-25 the first
+// time the box exercised the bound — a control whose verdict moves with the
+// subject is a measurement, not a control (TRA-3911 C5, TRA-3913 C5, same
+// lesson a third time). Both limbs are now CONSTRUCTED: C1 forces the census to
+// zero, C8 forces it non-zero, and neither reads today's box for its premise.
+//
+// ⚠ PRE-DEPLOY CAPTURES. A box that predates the desk_add carve-out serves no
+// `deskAddExempt` / `lastRefusalReason`. The controls grade the GRADER, so they
+// SEED those two keys on such a capture (bannered) — D5 on the real box is the
+// live grader's job, and it FAILS there, which is the negative control.
 //
 // Usage:  node scripts/tra3926-oversold-close-controls.mjs
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
@@ -44,6 +58,16 @@ if (!optionsLive?.build?.commit || !fee?.records) {
 }
 const COMMIT = optionsLive.build.commit.slice(0, 7);
 console.log(`# captured ${COMMIT} pid=${optionsLive.build.pid} records=${fee.records.length} findings=${fee.oversoldCloses?.findings?.length ?? '—'}`);
+if (optionsLive.exitQuantityBound && !('deskAddExempt' in optionsLive.exitQuantityBound)) {
+  optionsLive.exitQuantityBound.deskAddExempt = 0;
+  optionsLive.exitQuantityBound.lastRefusalReason = null;
+  console.log('# PRE-DEPLOY capture — `deskAddExempt` / `lastRefusalReason` SEEDED so the controls can grade the grader; '
+    + 'the live grader\'s D5 still fails on this box and that is the negative control.');
+}
+const ZERO_CENSUS = {
+  checked: 0, bounded: 0, refusedContracts: 0, blindRows: 0, suppressedExits: 0, netOfCloses: 0,
+  deskAddExempt: 0, lastRefusalAt: null, lastRefusalReason: null,
+};
 
 const clone = o => JSON.parse(JSON.stringify(o));
 const root = mkdtempSync(join(tmpdir(), 'tra3926-controls-'));
@@ -63,7 +87,9 @@ const run = (name, expectExit, mutate, expectSha = COMMIT) => {
   if (!ok) console.log((r.stdout + r.stderr).split('\n').filter(l => /FAIL|BLIND|PASS/.test(l)).slice(0, 6).map(l => `        ${l}`).join('\n'));
 };
 
-run('C1  untouched capture → BLIND (bound unexercised)', 3, () => {});
+run('C1  census forced to ZERO → BLIND (an unexercised bound is never a pass)', 3, ol => {
+  ol.exitQuantityBound = { ...ol.exitQuantityBound, ...ZERO_CENSUS };
+});
 run('C2  `oversoldCloses` DELETED → FAIL', 1, (ol, f) => { delete f.oversoldCloses; });
 run('C3  `exitQuantityBound` DELETED → FAIL', 1, ol => { delete ol.exitQuantityBound; });
 run('C4  served `excessContracts` +1 → FAIL', 1, (ol, f) => { f.oversoldCloses.excessContracts += 1; });
@@ -84,10 +110,22 @@ run('C6  an import_only blind PROMOTED to a finding → FAIL', 1, (ol, f) => {
   f.oversoldCloses.judgedCloses += 1;
 });
 run('C7  `records[]` emptied → BLIND (a cold ledger is never a pass)', 3, (ol, f) => { f.records = []; });
-run('C8  `exitQuantityBound.checked` = 1 → PASS (the pass branch is REACHABLE)', 0, ol => {
-  ol.exitQuantityBound = { ...ol.exitQuantityBound, checked: 1, bounded: 1, refusedContracts: 1 };
+run('C8  `exitQuantityBound.checked` = 1, last refusal a FINDING → PASS (the pass branch is REACHABLE)', 0, ol => {
+  ol.exitQuantityBound = {
+    ...ol.exitQuantityBound, checked: 1, bounded: 1, refusedContracts: 1, lastRefusalReason: 'engine_partial',
+  };
 });
 run('C9  pin commit ≠ --expect → BLIND', 3, () => {}, 'deadbee');
+run('C10 `deskAddExempt` DELETED → FAIL (D5 sees the carve-out\'s bytes ABSENT)', 1, ol => {
+  ol.exitQuantityBound = { ...ol.exitQuantityBound, checked: 1, bounded: 1, refusedContracts: 1, lastRefusalReason: 'engine_partial' };
+  delete ol.exitQuantityBound.deskAddExempt;
+});
+run('C11 last refusal = `foreign_authority` with the bound exercised → FAIL (G9: the gates disagree)', 1, ol => {
+  ol.exitQuantityBound = {
+    ...ol.exitQuantityBound, checked: 245, bounded: 245, refusedContracts: 245, suppressedExits: 245,
+    deskAddExempt: 0, lastRefusalReason: 'foreign_authority',
+  };
+});
 
 rmSync(root, { recursive: true, force: true });
 console.log(failed === 0 ? '\nCONTROLS PASS — every verdict is reachable and each is reached for its own reason.'

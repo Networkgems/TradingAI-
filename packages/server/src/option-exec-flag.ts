@@ -547,7 +547,17 @@ export interface EngineExitQuantityBound {
      * ledger, this one wants the row's book stamped at fill time and then
      * waits out the retention window.
      */
-    | 'book_unattributed';
+    | 'book_unattributed'
+    /**
+     * ⭐ TRA-3926 (2026-08-25) — the row is a `desk_add` lot: the board's
+     * SECOND grant of the transaction question (TRA-3909, interaction
+     * `d4f622fb`, `exempt`). Like `handed_over`, the oracle is never consulted
+     * and the exit goes out at the requested quantity. Measured live on
+     * `07cc4ba4` before this existed: `RIG260925C00006000`, `desk_add`, 1 ct,
+     * trailing stop breached, REFUSED 245× on one boot as `foreign_authority`
+     * — the exemption made inert by the bound, on real money.
+     */
+    | 'desk_add_exempt';
   /**
    * True iff the oracle COULD NOT ANSWER for this row, rather than answering
    * and finding the contracts are not ours. Same discipline as
@@ -666,21 +676,39 @@ export interface EngineNetOpenEvidence {
  * it is met branch by branch: `refusedContracts` for what we would not sell,
  * `blind` for what we could not judge. Neither is allowed to be zero-cost.
  *
- * ⛔ ONE CARVE-OUT, AND IT IS THE BOARD'S: AN EXPLICIT PER-ROW HAND-OVER.
- * TRA-3829 ruling B (card `331ddc56`) is that a human may hand a specific
- * broker row to the engine, after which the engine manages it FULLY — which
- * necessarily includes selling contracts the engine never bought, because that
- * is the entire content of the grant. A grant that left the engine unable to
- * exit what it was granted would be option (a) wearing ruling B's name, and it
- * is a shipped, ratified behaviour with its own control (`TRA-3829 ARM A`).
+ * ⛔ TWO CARVE-OUTS, AND BOTH ARE THE BOARD'S.
+ *
+ * 1. AN EXPLICIT PER-ROW HAND-OVER. TRA-3829 ruling B (card `331ddc56`) is
+ *    that a human may hand a specific broker row to the engine, after which the
+ *    engine manages it FULLY — which necessarily includes selling contracts the
+ *    engine never bought, because that is the entire content of the grant. A
+ *    grant that left the engine unable to exit what it was granted would be
+ *    option (a) wearing ruling B's name, and it is a shipped, ratified
+ *    behaviour with its own control (`TRA-3829 ARM A`).
+ *
+ * 2. A `desk_add` LOT. TRA-3909, interaction `d4f622fb`, answered `exempt`
+ *    2026-08-22T04:23:58Z on the board instruction *"Bot should manage added
+ *    positions from Tradier"* (TRA-3904 `92bc1e83`). {@link engineMayActOnAdoptedRow}
+ *    has carried that grant since; this bound did not, and the two gates
+ *    disagreed on real money: 2026-08-25, `RIG260925C00006000`, a `desk_add`
+ *    lot (residual identity, 1 ct @0.22) with its trailing stop breached, was
+ *    admitted by the authorisation gate and then REFUSED here 245× on one boot
+ *    as `foreign_authority` — the row's own fill records account for 0 of it,
+ *    which is TRUE and is exactly why the board's grant, not the ledger, has
+ *    to answer the quantity. The refusal left a real-money position under a
+ *    breached stop with no exit, i.e. TRA-2820's shape, dressed as a safety.
+ *    ⚠ A `desk_add` row is the desk's WHOLE lot by construction (minted for the
+ *    residual after the engine's rows are accounted for), so the requested
+ *    quantity IS the granted quantity; there is no engine share to carve.
  *
  * So the bound asks the split ONLY where nobody has answered the transaction
- * question by hand. Note what this does NOT unlock: `engine_origin` rows never
- * needed a hand-over to be actionable, so a desk contract the reconcile widened
- * onto one has been granted by NOBODY — and that is precisely the row the
- * 2026-08-21 close sold from. **AUTHORIZATION AND QUANTITY ARE STILL TWO
- * QUESTIONS; this is the one place the first one legitimately answers the
- * second, because a human answered it about THIS row on purpose.**
+ * question — by hand, or by ruling on the population. Note what this does NOT
+ * unlock: `engine_origin` rows never needed a hand-over to be actionable, so a
+ * desk contract the reconcile widened onto one has been granted by NOBODY —
+ * and that is precisely the row the 2026-08-21 close sold from.
+ * **AUTHORIZATION AND QUANTITY ARE STILL TWO QUESTIONS; these are the two
+ * places the first one legitimately answers the second, because a decision-maker
+ * answered it about THIS row, or THIS population, on purpose.**
  *
  * @param requestedContracts what the exit rule wants to sell (a full exit's
  *   `contractsRemaining`, or a TP1 partial's slice — the bound does not care
@@ -728,6 +756,25 @@ export function boundExitContractsToEngineShare(
       refusedContracts: 0,
       requestedContracts: requested,
       reason: 'handed_over',
+      oracleRefused: false,
+      blind: false,
+      bounded: false,
+      netOfCloses: false,
+    };
+  }
+  if (row.importedFromTradier === true && row.adoptionAuthority === 'desk_add') {
+    // TRA-3909's exemption (board, `d4f622fb`) — carve-out 2 in the rule note.
+    // Same shape as the hand-over and for the same reason: the transaction
+    // question was answered about this population on purpose, and consulting
+    // the ledger here can only ever say "0 of these are ours", which is true
+    // and is not the question. Not gated on `armed`: the exemption is not
+    // ruling B's hand-over and `engineMayActOnAdoptedRow` does not gate it
+    // either — the two gates must agree or the grant is inert (2026-08-25).
+    return {
+      exitContracts: requested,
+      refusedContracts: 0,
+      requestedContracts: requested,
+      reason: 'desk_add_exempt',
       oracleRefused: false,
       blind: false,
       bounded: false,

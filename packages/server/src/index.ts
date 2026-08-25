@@ -12021,11 +12021,15 @@ app.get('/api/health/options-live', async (_req, res) => {
             // BESIDE `blindRows` and never instead of it: this counter only
             // means something as the pair `netOfCloses / blindRows`.
             netOfCloses: acc.netOfCloses + s.netOfCloses,
-            lastRefusalAt:
-              s.lastRefusalAt !== null
+            // TRA-3926 (2026-08-25) — the TRA-3909 exemption's exercise, as a
+            // counted population; and the newest refusal's REASON, so a census
+            // of 245 "exercised" checks can say whether they were findings or a
+            // board grant being refused (which is what 245 of them were).
+            deskAddExempt: acc.deskAddExempt + s.deskAddExempt,
+            ...(s.lastRefusalAt !== null
               && (acc.lastRefusalAt === null || s.lastRefusalAt > acc.lastRefusalAt)
-                ? s.lastRefusalAt
-                : acc.lastRefusalAt,
+              ? { lastRefusalAt: s.lastRefusalAt, lastRefusalReason: s.lastRefusalReason }
+              : { lastRefusalAt: acc.lastRefusalAt, lastRefusalReason: acc.lastRefusalReason }),
           };
         },
         {
@@ -12035,7 +12039,9 @@ app.get('/api/health/options-live', async (_req, res) => {
           blindRows: 0,
           suppressedExits: 0,
           netOfCloses: 0,
+          deskAddExempt: 0,
           lastRefusalAt: null as number | null,
+          lastRefusalReason: null as string | null,
         },
       ),
     });

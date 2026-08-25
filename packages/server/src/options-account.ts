@@ -3907,6 +3907,14 @@ export class PaperOptionsAccount {
    */
   private exitQuantityReconcileTerminal = 0;
   /**
+   * TRA-3926 (2026-08-25) — staging sites where the row was a `desk_add` lot
+   * and the bound stood aside on the board's TRA-3909 exemption. Counted so the
+   * grant's exercise is a measured population and not a silent branch: before
+   * this existed the live census read `checked 245 / refused 245` on one such
+   * row and "exercised" was all the wire could say.
+   */
+  private exitQuantityDeskAddExempt = 0;
+  /**
    * TRA-3926 — per-row de-dupe key for the refusal warn. `checkExits` runs on
    * every tick and a permanently-refused row would otherwise emit the same line
    * forever, which buries the first occurrence. Keyed by position id, valued by
@@ -7621,6 +7629,7 @@ export class PaperOptionsAccount {
     if (opt.importedFromTradier === true) this.exitQuantityChecked += 1;
     if (bound.netOfCloses) this.exitQuantityNetOfCloses += 1;
     if (bound.reason === 'reconcile_terminal') this.exitQuantityReconcileTerminal += 1;
+    if (bound.reason === 'desk_add_exempt') this.exitQuantityDeskAddExempt += 1;
     // BLIND — the oracle could not make a complete positive statement about
     // this row, so the exit goes out UNBOUNDED (the pre-fix quantity). Counted,
     // never silent: this is the residual fail-open the fix does not close, and
@@ -10250,6 +10259,13 @@ export class PaperOptionsAccount {
      * branch works until `blindRows` is read beside it.
      */
     reconcileTerminal: number;
+    /**
+     * TRA-3926 (2026-08-25) — of `checked`, the `desk_add` lots the bound stood
+     * aside on (TRA-3909 exemption). NOT a refusal and NOT a blind: the
+     * board answered the quantity for this population. Read beside `bounded`
+     * — a box where every check is an exemption has exercised nothing else.
+     */
+    deskAddExempt: number;
     /** Newest refusal, for the health route's operator line. */
     last: {
       at: number;
@@ -10269,6 +10285,7 @@ export class PaperOptionsAccount {
       suppressedExits: this.exitQuantitySuppressedExits,
       netOfCloses: this.exitQuantityNetOfCloses,
       reconcileTerminal: this.exitQuantityReconcileTerminal,
+      deskAddExempt: this.exitQuantityDeskAddExempt,
       last: this.exitQuantityLastRefusal === null ? null : { ...this.exitQuantityLastRefusal },
     };
   }
