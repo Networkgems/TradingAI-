@@ -128,6 +128,10 @@ import {
   resolveServiceByName,
   explainUnresolved,
 } from './lib/render-service-resolve.mjs';
+// TRA-3991: when the RTH freeze refuses, say what it is HOLDING. A refusal that names a
+// safety-path remedy is a decision the operator must make; one that names none is a
+// stage-for-post-close. Read-only, fails BLIND, never deploys.
+import { lagState as deployLagState, readLiveCommit as readDeployLagLive, DEFAULT_HOST as DEPLOY_LAG_DEFAULT_HOST } from './check-deploy-lag.mjs';
 
 const API = 'https://api.render.com/v1';
 
@@ -1005,6 +1009,47 @@ async function resolveService() {
   return r.service;
 }
 
+// TRA-3991 — what is the freeze HOLDING? The exit-4 refusal above used to answer only
+// "may I deploy now" (no). On 2026-08-24 the answer to the question nobody asked — "is a
+// safety remedy waiting behind this refusal" — was yes (`a5a49717`), and the engine sold
+// the row it bounds 43 min before the post-close deploy. So the refusal now names the
+// partition of `live..target` by the safety set. It is READ-ONLY: it never authorizes an
+// override and never deploys. Every unreadable leg is reported BLIND, not "none".
+export async function describeHeldSafetyLag(service, target) {
+  const host = (service?.serviceDetails?.url ?? DEPLOY_LAG_DEFAULT_HOST).replace(/\/+$/, '');
+  try {
+    const live = await readDeployLagLive(host);
+    const lag = deployLagState({ liveSha: live.commit, baseRef: target?.sha });
+    if (lag.verdict === 'CURRENT') {
+      return `  holding : nothing — live ${lag.live.slice(0, 8)} is already the target. This deploy is a RESTART.`;
+    }
+    const safety = lag.safetyBehind;
+    if (safety.length === 0) {
+      return (
+        `  holding : ${lag.behind.length} commit(s) behind live ${lag.live.slice(0, 8)}, NONE on the safety set\n` +
+        `            (scripts/check-deploy-lag.mjs). Staging for post-close costs a measurement, not a hazard.`
+      );
+    }
+    const lines = safety.map(
+      c => `            ⛔ ${c.short} ${c.committedAt}  ${c.subject.slice(0, 80)}\n` +
+        c.hits.map(h => `               ${h.path} — ${h.why}`).join('\n'),
+    );
+    return (
+      `  holding : ${lag.behind.length} commit(s) behind live ${lag.live.slice(0, 8)}, of which ${safety.length} touch the SAFETY set:\n` +
+      `${lines.join('\n')}\n` +
+      `            ⛔ SAFETY_LAG (TRA-3991). This refusal is holding a safety-path remedy while the hazard it\n` +
+      `            closes is reachable in RTH. That is a DECISION, not a default: either re-run with\n` +
+      `            --force-rth-override="<why it cannot wait>", or write on the remedy's ticket why it CAN wait.\n` +
+      `            Nothing here authorizes the override.`
+    );
+  } catch (e) {
+    return (
+      `  holding : BLIND — could not partition live..target by the safety set (${e?.message ?? e}).\n` +
+      `            Unreadable is NOT "nothing waiting". Run scripts/check-deploy-lag.mjs by hand before staging.`
+    );
+  }
+}
+
 // Is `now` inside the RTH freeze window? Weekend deploys are always allowed (market
 // closed → no live soak session to fragment).
 export function freezeState(now) {
@@ -1239,6 +1284,7 @@ async function main() {
         `  Stage this deploy for pre-open (<13:25Z) or post-close (>20:00Z), or, if it is truly urgent,\n` +
         `  re-run with --force-rth-override="why this cannot wait" (the reason is recorded).`,
     );
+    console.error(await describeHeldSafetyLag(service, target));
     process.exit(4);
   }
 

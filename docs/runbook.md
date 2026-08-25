@@ -255,6 +255,38 @@ matching an equally stale live build would otherwise *manufacture* a CURRENT ver
 of N means the window you just measured ran on the previous build, and the result will
 look completely ordinary.
 
+##### Drift on a SAFETY path is a decision, not a number (TRA-3991)
+
+Drift answers *how far behind*. It does not say whether anything behind matters. On
+2026-08-24 `a5a49717` — the exit-quantity oracle written that morning against
+`BAC260925C00063000` — merged at 13:48Z, could not ship inside the RTH freeze, and the
+engine sold the row it bounds to 0 at 19:31:08Z, 43 min before the 20:14Z deploy.
+`--force-rth-override` existed for exactly this; nobody asked for it because nothing
+said there was anything to decide. The freeze decided by default.
+
+```bash
+pnpm check:deploy-lag
+#   → CURRENT     live is exactly origin/main                             (exit 0)
+#   → LAG         behind, nothing behind touches the safety set          (exit 1)
+#   → SAFETY_LAG  behind AND a safety-path commit is NOT running          (exit 2)
+#                 an override decision is DUE — make it in writing, or write down
+#                 why it can wait. The script authorizes nothing, deploys nothing.
+#   → BLIND       a leg could not be read (incl. a SHALLOW checkout)      (exit 3)
+pnpm check:deploy-lag:tape      # replay the last 30 d of Render deploys: how long each
+                                # safety commit sat merged-but-undeployed, in RTH minutes
+pnpm check:deploy-lag:controls  # the synthetic-repo control suite
+```
+
+The safety set is `SAFETY_SET` in `scripts/check-deploy-lag.mjs`: the oracles
+(`option-exec-flag.ts`, `live-options-fee-slippage-ledger.ts`) and the order chokepoint
+(`packages/engine/src/tradier/options-client.ts`) whole-file; `options-account.ts` and
+`signal-engine.ts` by **method** (`stageableExitContracts`, `getExitQuantityBoundCensus`)
+or by a changed line naming a bound symbol — those two files change in a quarter of all
+commits, and a whole-file scope would fire on every deploy. The RTH refusal in
+`render-redeploy.mjs` (exit 4) now prints the same partition, so the operator who *does*
+ask is told what the freeze is holding. Measured on the 30 days to 2026-08-25: a safety
+remedy sat undeployed during RTH on 11 of 21 weekdays.
+
 #### The board alarm (TRA-2364) — `blocked` issues with an EMPTY `blockedBy`
 
 An issue at `status: blocked` whose `blockedBy` is `[]` carries no edge anything can
