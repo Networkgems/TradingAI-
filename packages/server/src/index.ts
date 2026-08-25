@@ -11590,6 +11590,22 @@ app.get('/api/health/options-live', async (_req, res) => {
       //     opened before this shipped, or one with no real entry spot, is inert
       //     on that leg by construction. Publishing the rule without this
       //     denominator is the `evaluated: 0` trap TRA-3926 paid for.
+      //   • `otmDayOneStop.atrLegPopulationRows` — TRA-3985, the DENOMINATOR of
+      //     the two counters above. It is the rule's REACH (armed ∧ OTM sleeve),
+      //     which is a SUBSET of `rows`: an RV row is counted in `rows` and is in
+      //     neither ATR counter, so `atrLegInertRows / rows` is a coverage
+      //     fraction over the wrong denominator.
+      //
+      // ⚠️ TRA-3985 — READ `population` AND `books` BEFORE ANY NUMBER HERE.
+      // This is a FLEET fold (`getAllUserContexts()`); `/api/state` serves the
+      // CALLER'S BOOK. When `books > 1` the two surfaces disagree BY
+      // CONSTRUCTION and a row-by-row reconciliation against `/api/state` cannot
+      // close. Both live filings on TRA-3985 are that one missing number: an
+      // `atrLegRows: 2` "self-inconsistency" and a `premiumAtRiskUsd: 305`
+      // "over-statement against $173", each derived by reading a fleet fold
+      // against one book's rows. `population` is the second half — this
+      // instrument windows on `openedAt === today` (UTC day key) and its
+      // neighbour `otmSleeveStopCoverage` does not.
       //
       // `otmDayOneStop.fires` is the SINCE-BOOT twin of all three: `rows: 0`
       // says nothing about whether the rule has ever fired, and `pdtHeld > 0`
@@ -11643,6 +11659,9 @@ app.get('/api/health/options-live', async (_req, res) => {
       // ⚠️ Coverage, not an arm: this says nothing about whether the sleeve
       // trades (`liveOtmRouting`) or whether an exit can reach the broker
       // (`liveDayOneStopPosture.otmDayOneStop.release`). Counts and dollars only.
+      //
+      // ⚠️ TRA-3985 — `books` is the fleet/book gap, same as on its neighbour:
+      // this folds every user context and `/api/state` serves one of them.
       otmSleeveStopCoverage: (() => {
         try {
           return {

@@ -76,6 +76,10 @@ describe('TRA-3892 positive control — the 2026-08-20 pair, BEFORE the breach',
       // so the 2026-08-20 reading this test pins is unchanged in substance.
       stopBasisBySleeve: { otm_mispricing: 'full_premium' },
       otmDayOneStop: null,
+      // TRA-3985 — the population literal and the book count. One summarize call
+      // is one book; the 2026-08-20 reading is otherwise unchanged.
+      population: 'live_held_rows_opened_today',
+      books: 1,
       rows: 2,
       premiumAtRiskUsd: 273,
       premiumBySleeveUsd: { otm_mispricing: 273 },
@@ -141,6 +145,10 @@ describe('TRA-3892 release — the hold is a UTC-day key', () => {
       stopBasis: 'full_premium',
       stopBasisBySleeve: {},
       otmDayOneStop: null,
+      // TRA-3985 — an EMPTY book is still A BOOK. `books: 0` here would say "no
+      // book was read", which is the blind twin's reading, not this one's.
+      population: 'live_held_rows_opened_today',
+      books: 1,
       rows: 0,
       premiumAtRiskUsd: 0,
       premiumBySleeveUsd: {},
@@ -206,6 +214,12 @@ describe('TRA-3892 fleet fold and blind twin', () => {
       // and the fleet fold agrees with it.
       stopBasisBySleeve: { otm_mispricing: 'full_premium', relative_value: 'full_premium' },
       otmDayOneStop: null,
+      // TRA-3985 — THREE books folded, two of which hold rows. This is the
+      // number that makes the fold reconcilable against a single-book
+      // `/api/state`, and the empty third book still counts: "a book that holds
+      // nothing" and "a book that was not read" are different facts.
+      population: 'live_held_rows_opened_today',
+      books: 3,
       rows: 2,
       premiumAtRiskUsd: 273,
       premiumBySleeveUsd: { otm_mispricing: 108, relative_value: 165 },
@@ -221,6 +235,11 @@ describe('TRA-3892 fleet fold and blind twin', () => {
       // publish the token that claims this sleeve has a day-one stop.
       stopBasisBySleeve: null,
       otmDayOneStop: null,
+      // TRA-3985 — `books` is a MEASUREMENT and nulls with the rest. `population`
+      // is not: it says what this instrument would have counted, which is true
+      // whether or not the count succeeded (its neighbour's literal, same rule).
+      population: 'live_held_rows_opened_today',
+      books: null,
       rows: null,
       premiumAtRiskUsd: null,
       premiumBySleeveUsd: null,

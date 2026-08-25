@@ -62,6 +62,47 @@ export type ExportFormat = 'csv' | 'json';
 export type ExportRowSource = 'book' | 'journal';
 export type ExportPnlBasis = 'book' | 'broker-fill';
 
+/**
+ * TRA-3985 (Defect 2) — WHICH LOT this row's exit consumed.
+ *
+ * ── Why this exists ─────────────────────────────────────────────────────────
+ *
+ * On 2026-08-24 two live rows shared one OCC symbol — `RIG260925C00006000`,
+ * opened **357ms apart** (`…18:04:24.494Z` and `…18:04:24.851Z`) — and one of
+ * them closed on `sl_otm_premium_pct` while the other survived and had its
+ * basis restated to `0.22` by a `residual_identity` desk-add 28m53s earlier.
+ * The two lots carry DIFFERENT premium anchors (`0.33` vs `0.22`), so the same
+ * `0.18` fill grades **−45.45%** against one and **−18.18%** against the other.
+ * TRA-3943 AC3's bar is `>= −40% of premium`: the verdict INVERTS on the lot
+ * attribution, and neither `/api/trades/export` nor `/api/state` could say
+ * which lot the exit consumed. `buildRows` said so in as many words — "
+ * `ExportTradeRow` carries no id, so the book↔journal join is unrecoverable one
+ * line later" — and that is the sentence this pair of fields retires.
+ *
+ * `lot_id` is the BOOK row's own id, i.e. the lot. `journal_id` is the id the
+ * durable journal knows that close by, which is `journalId ?? id` and therefore
+ * **NOT** always the same string (TRA-3078/TRA-3930: a position the reconcile
+ * REBOUND onto a pre-existing open row carries a different `journalId`, and a
+ * `-130.00` for a `-65.00` day is what conflating the two cost). Publishing one
+ * and calling it "the id" is the defect that already shipped once; both are
+ * published, separately, and a reader joins on the one it means.
+ *
+ * A JOURNAL-sourced row publishes `journal_id` and leaves `lot_id` **null** —
+ * the journal does not store the book position id, so it cannot be recovered
+ * from that side, and the "blank beats an invented value" rule that governs
+ * `exit_price` in {@link rowFromJournalRecord} governs identity too.
+ *
+ * ⚠️ JSON-only, exactly like `source`/`pnl_basis`: `toCsv` maps
+ * {@link EXPORT_COLUMNS} explicitly, so the design §2.3 CSV header stays
+ * byte-identical and no existing consumer is touched.
+ */
+export type ExportLotIdentity = {
+  /** The BOOK row's id — the lot. `null` on a journal-sourced row. */
+  lot_id: string | null;
+  /** The id the durable option-trade journal keys this close on (options only). */
+  journal_id: string | null;
+};
+
 /** Standard equity-option contract multiplier (shares per contract). */
 const OPTION_CONTRACT_MULTIPLIER = 100;
 
@@ -113,6 +154,27 @@ export interface ExportTradeRow {
    */
   source?: ExportRowSource;
   pnl_basis?: ExportPnlBasis;
+  /**
+   * TRA-3985 — lot identity, JSON-only (see {@link ExportLotIdentity}). Optional
+   * on the TYPE for the same reason `source` is: a hand-built fixture or an
+   * older caller still type-checks. Every mapper in this module and in
+   * `export-history.ts` sets both. ABSENT and `null` mean the same thing here —
+   * "this row does not name a lot" — and neither may ever be read as "the lot is
+   * whatever the OCC symbol matched", which is the inference this field exists
+   * to make unnecessary.
+   */
+  lot_id?: string | null;
+  journal_id?: string | null;
+  /**
+   * TRA-3985 — the broker order id of the REALISING CLOSE, when the durable fill
+   * ledger measured one (TRA-3945 stamps it on the journal's close row). This is
+   * the strongest available attribution: an order id is the broker's own handle
+   * on the fill, and unlike `lot_id` it survives an archive.
+   *
+   * `null` when nothing measured one — an unrestated row, a demo row, or a close
+   * the fill ledger never saw. It is NOT a claim the close had no order.
+   */
+  broker_order_id?: string | number | null;
 }
 
 /**
@@ -183,6 +245,18 @@ export interface ExportMoneyRestatement {
   exit_price: number | null;
   /** Broker ENTRY fill per share; null when the restatement measured none. */
   entry_price: number | null;
+  /**
+   * TRA-3985 — the realising close's broker order id (TRA-3945), when the fill
+   * ledger measured one. It rides on the RESTATEMENT rather than being read off
+   * the book row for the same reason the fills do: it is a thing the broker
+   * settled, and the in-memory book never holds it after the close.
+   *
+   * `null` ⇒ nothing measured one. It does NOT overwrite a value already on the
+   * row (see {@link applyMoneyRestatement}) — a restatement that could not
+   * measure an order id is not a reason to delete one the row already carried,
+   * the same rule `exit_price`/`entry_price` follow one field up.
+   */
+  broker_order_id: string | number | null;
 }
 
 /**
@@ -208,6 +282,10 @@ export function applyMoneyRestatement(
     net_pnl_usd: restatement.net_pnl_usd,
     pnl_r: restatement.pnl_r,
     pnl_basis: 'broker-fill',
+    // TRA-3985 — identity is NOT restated: `lot_id`/`journal_id` describe which
+    // row this is, and the restatement is joined ON `journal_id`, so letting it
+    // rewrite the key would make the join unverifiable from the output.
+    broker_order_id: restatement.broker_order_id ?? row.broker_order_id ?? null,
   };
 }
 
@@ -440,6 +518,12 @@ export function rowFromPosition(pos: Position, market: 'stocks' | 'crypto'): Exp
     hold_duration: formatHoldDuration(pos.openedAt, pos.closedAt),
     source: 'book',
     pnl_basis: 'book',
+    // TRA-3985 — equity/crypto rows have a lot id and no option-trade journal.
+    // `journal_id: null` here is a statement about the STORE, not a missing
+    // measurement: there is no journal for this market to be keyed on.
+    lot_id: pos.id,
+    journal_id: null,
+    broker_order_id: null,
   };
 }
 
@@ -481,6 +565,18 @@ export function rowFromOption(opt: OptionPosition): ExportTradeRow {
     // in-memory book is never restated in place: TRA-3730's sweep writes the
     // journal only, and that asymmetry is what this field makes readable.
     pnl_basis: 'book',
+    // TRA-3985 — BOTH ids, because they are not always the same string and the
+    // question "which lot did this exit consume" is only answerable with the
+    // book one. `journalIdForPosition` is the SAME accessor `buildRows` joins
+    // the restatement on, deliberately: an id published here that disagreed
+    // with the id the join used would be worse than none.
+    lot_id: opt.id,
+    journal_id: journalIdForPosition(opt),
+    // Book rows carry no measured close order id of their own. `buildRows`
+    // overlays one from the restatement when the fill ledger measured it; until
+    // then this reads null rather than reaching for `pendingCloseOrderId`, which
+    // tracks a WORKING order and is cleared on the close it describes.
+    broker_order_id: null,
   };
 }
 
@@ -492,8 +588,15 @@ export function buildRows(input: ExportInput): ExportTradeRow[] {
   for (const p of input.stocksClosed ?? []) rows.push(rowFromPosition(p, 'stocks'));
   for (const p of input.cryptoClosed ?? []) rows.push(rowFromPosition(p, 'crypto'));
   // TRA-3875 — the restatement overlay lands HERE, not in the mapper, because
-  // this is the last point that still holds `o.id`; `ExportTradeRow` carries no
-  // id, so the book↔journal join is unrecoverable one line later.
+  // this is the last point that still holds the `OptionPosition` itself.
+  //
+  // TRA-3985 — the second half of that sentence used to read "`ExportTradeRow`
+  // carries no id, so the book↔journal join is unrecoverable one line later",
+  // and it was true: on 2026-08-24 an `sl_otm_premium_pct` exit on
+  // `RIG260925C00006000` could not be tied to either of the two lots that share
+  // that OCC (opened 357ms apart, basis 0.33 vs a restated 0.22), and TRA-3943
+  // AC3's −40% verdict inverts on which one it was. The row now publishes
+  // `lot_id`/`journal_id`/`broker_order_id`, so the join survives the mapper.
   for (const o of input.optionsClosed ?? []) {
     // TRA-3930 — joined on the id the JOURNAL knows this position by, which is
     // the key `collectJournalMoneyRestatements` publishes under. `o.id` is the

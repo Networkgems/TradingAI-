@@ -1788,6 +1788,23 @@ export interface DayOneStopPosture {
     atrLegRows: number;
     atrLegInertRows: number;
     /**
+     * TRA-3985 — the DENOMINATOR of the two counters above, on the wire.
+     *
+     * `atrLegRows` is "rows with a LIVE ATR leg", not "rows in the ATR-eligible
+     * population", and the field name does not disambiguate — QuantTrader had to
+     * ask which reading was intended before it could qualify a grading
+     * population. The eligible set is the rule's REACH (armed ∧ `isOtmSleeveRow`),
+     * which is a SUBSET of `rows`: an RV row is counted in `rows` and is in
+     * neither ATR counter. So `atrLegRows + atrLegInertRows ≤ rows`, always, and
+     * a reader comparing `atrLegInertRows` against `rows` gets a coverage
+     * fraction with the wrong denominator.
+     *
+     * Published rather than left derivable-by-addition because the two counters
+     * are also the thing a reader checks the fold with, and an identity you have
+     * to reconstruct is one you can reconstruct wrongly.
+     */
+    atrLegPopulationRows: number;
+    /**
      * TRA-3943 — SINCE-BOOT fires, split by leg, and the day-one fires HELD for
      * want of day-trade capacity.
      *
@@ -1799,6 +1816,36 @@ export interface DayOneStopPosture {
      */
     fires: { premiumPct: number; atrInvalidation: number; pdtHeld: number };
   } | null;
+  /**
+   * TRA-3985 — WHAT WAS COUNTED, as a literal on the wire rather than as a
+   * comment in this file.
+   *
+   * Its neighbour {@link OtmSleeveStopCoverage} has carried `population` since
+   * TRA-3981 and this one did not, so the two published counts that differ for a
+   * structural reason with only one of them saying so. On 2026-08-24 that gap
+   * produced a filed defect: `atrLegRows: 2` was read against the 2 rows
+   * `/api/state` showed and declared self-inconsistent, when the population was
+   * the 2 rows opened THAT DAY across every book in the process.
+   *
+   * ⚠️ `_today` is keyed on the UTC date of `openedAt`, matching `releasesAt`
+   * (next 00:00Z), NOT on the ET session date.
+   */
+  population: 'live_held_rows_opened_today';
+  /**
+   * TRA-3985 — how many BOOKS this reading folds
+   * ({@link mergeDayOneStopPosture}'s input length; 1 straight out of
+   * {@link summarizeDayOneStopPosture}).
+   *
+   * The health route is fleet-wide (`getAllUserContexts()`) while `/api/state`
+   * is the CALLER'S BOOK, so the two surfaces disagree by construction whenever
+   * this is > 1 — and nothing on either surface said so. Both live filings on
+   * TRA-3985 (the `atrLegRows: 2` elimination and the `premiumAtRiskUsd: 305`
+   * vs `$173` reconciliation) are that single missing number, twice; measured
+   * 2026-08-25T18:18Z, `rows: 3` / coverage `rows: 4` against 2 rows on
+   * `/api/state`. A reader seeing `books > 1` knows a single-book reconciliation
+   * cannot close, instead of concluding the instrument is broken.
+   */
+  books: number;
   /** Live open rows currently bound by a date-keyed hold, breached or not. */
   rows: number;
   /** Σ `premiumPaid × contractsRemaining × 100` over those rows, 2dp. */
@@ -1922,9 +1969,13 @@ export function summarizeDayOneStopPosture(
         release: ctx.otmDayOneStop.release,
         atrLegRows,
         atrLegInertRows,
+        atrLegPopulationRows: atrLegRows + atrLegInertRows,
         fires: ctx.otmDayOneStopCounters
           ?? { premiumPct: 0, atrInvalidation: 0, pdtHeld: 0 },
       },
+    population: 'live_held_rows_opened_today',
+    // One summary is one book. The fold counts them (`mergeDayOneStopPosture`).
+    books: 1,
     rows,
     premiumAtRiskUsd: r2usd(premiumAtRiskUsd),
     premiumBySleeveUsd,
@@ -1970,8 +2021,12 @@ export function mergeDayOneStopPosture(
   let otmDayOneStop: DayOneStopPosture['otmDayOneStop'] = null;
   let atrLegRows = 0;
   let atrLegInertRows = 0;
+  // TRA-3985 — counted off the SUMMARIES, and summed rather than incremented, so
+  // a nested fold (a merge of merges) still reports books and not merge-calls.
+  let books = 0;
   const fires = { premiumPct: 0, atrInvalidation: 0, pdtHeld: 0 };
   for (const s of summaries) {
+    books += s.books;
     rows += s.rows;
     premiumAtRiskUsd += s.premiumAtRiskUsd;
     for (const [k, v] of Object.entries(s.premiumBySleeveUsd)) {
@@ -1999,7 +2054,15 @@ export function mergeDayOneStopPosture(
     stopBasisBySleeve,
     otmDayOneStop: otmDayOneStop === null
       ? null
-      : { ...otmDayOneStop, atrLegRows, atrLegInertRows, fires },
+      : {
+        ...otmDayOneStop,
+        atrLegRows,
+        atrLegInertRows,
+        atrLegPopulationRows: atrLegRows + atrLegInertRows,
+        fires,
+      },
+    population: 'live_held_rows_opened_today',
+    books,
     rows,
     premiumAtRiskUsd: r2usd(premiumAtRiskUsd),
     premiumBySleeveUsd,
@@ -2013,7 +2076,13 @@ export function mergeDayOneStopPosture(
  * zero premium under a decorative stop" must never share a reading.
  */
 export function blindDayOneStopPosture(): {
-  [K in keyof DayOneStopPosture]: K extends 'stopBasis' ? 'full_premium' : null
+  [K in keyof DayOneStopPosture]: K extends 'stopBasis'
+    ? 'full_premium'
+    // TRA-3985 — `population` survives blindness for the same reason its
+    // neighbour's does: it says what this instrument WOULD have counted, which
+    // is true whether or not the count succeeded. `books` does NOT — that is a
+    // measurement, and a blind fold must not publish one.
+    : K extends 'population' ? DayOneStopPosture['population'] : null
 } {
   return {
     // TRA-3943 — the blind twin keeps `full_premium`, and that is deliberate: a
@@ -2024,6 +2093,8 @@ export function blindDayOneStopPosture(): {
     stopBasis: 'full_premium',
     stopBasisBySleeve: null,
     otmDayOneStop: null,
+    population: 'live_held_rows_opened_today',
+    books: null,
     rows: null,
     premiumAtRiskUsd: null,
     premiumBySleeveUsd: null,
@@ -2060,6 +2131,13 @@ export interface OtmSleeveStopCoverage {
    * population a coverage claim may be made over.
    */
   population: 'all_open_live_otm_sleeve_rows';
+  /**
+   * TRA-3985 — how many BOOKS this reading folds. See
+   * {@link DayOneStopPosture.books}: the health route is fleet-wide and
+   * `/api/state` is one book, and a coverage claim that does not say how many
+   * books it spans gets reconciled against the wrong row set.
+   */
+  books: number;
   rows: number;
   /** Rows with at least one evaluable leg — the rule IS these rows' stop. */
   governedRows: number;
@@ -2148,6 +2226,8 @@ export function summarizeOtmSleeveStopCoverage(
   }
   return {
     population: 'all_open_live_otm_sleeve_rows',
+    // One summary is one book; `mergeOtmSleeveStopCoverage` sums them.
+    books: 1,
     rows,
     governedRows,
     ungovernedRows: rows - governedRows,
@@ -2170,6 +2250,7 @@ export function mergeOtmSleeveStopCoverage(
 ): OtmSleeveStopCoverage {
   const out: OtmSleeveStopCoverage = {
     population: 'all_open_live_otm_sleeve_rows',
+    books: 0,
     rows: 0,
     governedRows: 0,
     ungovernedRows: 0,
@@ -2185,6 +2266,8 @@ export function mergeOtmSleeveStopCoverage(
     ruleArmed: null,
   };
   for (const s of summaries) {
+    // Summed, not incremented — a merge of merges still counts books.
+    out.books += s.books;
     out.rows += s.rows;
     out.governedRows += s.governedRows;
     out.ungovernedRows += s.ungovernedRows;
@@ -2220,6 +2303,7 @@ export function blindOtmSleeveStopCoverage(): {
 } {
   return {
     population: 'all_open_live_otm_sleeve_rows',
+    books: null,
     rows: null,
     governedRows: null,
     ungovernedRows: null,

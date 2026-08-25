@@ -449,6 +449,18 @@ export function rowFromJournalRecord(r: OptionTradeJournalRecord): ExportTradeRo
     hold_duration: formatHoldDuration(r.openTs, r.closeTs),
     source: 'journal',
     pnl_basis: restated ? 'broker-fill' : 'book',
+    // TRA-3985 — the journal knows this close by `r.id`, which is
+    // `journalIdForPosition(position)` at the write site and therefore joins to
+    // a book row's `journal_id`, NEVER to its `lot_id`. The book position id is
+    // not stored on this side and so is not recoverable: `lot_id` is null rather
+    // than a copy of `r.id`, because a copy would read as a successful lot
+    // attribution to any consumer joining on it — the exact false confidence
+    // this ticket's Defect 2 is about.
+    lot_id: null,
+    journal_id: r.id,
+    // TRA-3945 stamps the realising close's broker order id on the CLOSE row.
+    // `??` not `||`: a numeric order id of 0 is a real handle.
+    broker_order_id: r.brokerOrderId ?? null,
   };
 }
 
@@ -599,6 +611,11 @@ function restatementFromRecord(r: OptionTradeJournalRecord): ExportMoneyRestatem
     pnl_r: mapped.pnl_r,
     exit_price: mapped.exit_price,
     entry_price: mapped.entry_price,
+    // TRA-3985 — the order id travels with the money for the same reason `pnl_r`
+    // does: it is measured by the SAME broker-fill restatement, and a book row
+    // that adopts a broker-settled figure without the handle that settled it
+    // cannot be reconciled against the broker afterwards.
+    broker_order_id: mapped.broker_order_id ?? null,
   };
 }
 
