@@ -122,6 +122,19 @@ export const OPEN_LEG_PROVENANCE_RETENTION = 'none — verdicts are not re-deriv
  */
 const OPENING_SIDES = new Set(['buy_to_open', 'sell_to_open']);
 
+/** Tradier statuses under which contracts actually reached the account. */
+const EXECUTED_STATUSES = new Set(['filled', 'partially_filled']);
+
+/**
+ * Did this order put ANY contract in the account? Status first; `execQuantity`
+ * second so a cancelled-after-partial row (status `canceled`, exec > 0) still
+ * counts — it DID open something, and that something needs a provenance.
+ */
+export function orderExecuted(o: TradierAccountOrder): boolean {
+  if (EXECUTED_STATUSES.has(String(o.status ?? '').toLowerCase())) return true;
+  return typeof o.execQuantity === 'number' && Number.isFinite(o.execQuantity) && o.execQuantity > 0;
+}
+
 /** One verdict about ONE OCC's opening leg. */
 export type OpenLegProvenanceVerdict =
   /**
@@ -213,10 +226,25 @@ export interface OpenLegSubject {
 /** One resolved row. */
 export interface OpenLegProvenanceRow extends OpenLegSubject {
   verdict: OpenLegProvenanceVerdict;
-  /** Opening order ids the broker's list held for this OCC (may be empty). */
+  /**
+   * EXECUTED opening order ids the broker's list held for this OCC (may be empty).
+   * Only an order that put a contract in the account can be that contract's
+   * provenance — see `brokerUnfilledOpeningOrderIds` for the ones that did not.
+   */
   brokerOpeningOrderIds: number[];
   /** Of those, the ones our own fill ledger records as ours. */
   matchedEngineOrderIds: number[];
+  /**
+   * Opening orders for this OCC that NEVER executed (cancelled walk steps,
+   * rejects, expiries). Listed so a reader can see them, and EXCLUDED from every
+   * join above: joining on these is wrong in BOTH directions — a cancelled engine
+   * walk step would read `engine_placed` for a contract the desk bought, and a
+   * cancelled desk attempt would read `desk_placed` for one the engine filled.
+   * Measured on real bytes 2026-08-25 (BAC260925C00063000: archived opening order
+   * 142843026 of 08-21 with no matching buy in the broker's own history).
+   * Optional on the type only because rows persisted before it existed lack it.
+   */
+  brokerUnfilledOpeningOrderIds?: number[];
   /** Prose naming the evidence that produced the verdict. Computed, never templated from the hypothesis. */
   detail: string;
   /** ms epoch the resolution ran. */
@@ -453,7 +481,7 @@ const EMPTY_BY_VERDICT = (): Record<OpenLegProvenanceVerdict, number> => ({
  *
  *   1. no read              → `blind_broker_unreadable`
  *   2. list misses the day  → `blind_broker_window`      (AC5)
- *   3. no opening order     → `blind_no_order_record`
+ *   3. no EXECUTED opening  → `blind_no_order_record`    (unfilled ones are named, never joined)
  *   4. id in our FILL set   → `engine_placed`            (positive, terminal)
  *   5. no submit ledger     → `blind_no_issuer_witness`
  *   6. id in our SUBMIT set → `engine_placed`            (positive, terminal)
@@ -484,7 +512,15 @@ export function resolveOpenLegProvenance(input: OpenLegProvenanceInput): OpenLeg
         typeof o.side === 'string' &&
         OPENING_SIDES.has(o.side.toLowerCase()),
     );
-    const brokerOpeningOrderIds = openingOrders.map((o) => o.id);
+    // Only an order that EXECUTED can be the provenance of a contract in the
+    // account. The unfilled ones are real broker rows with real ids — the engine's
+    // limit walk mints up to five per open (TRA-3939 AC1) — and every one of them
+    // is in our submit ledger, so joining on them would turn a cancelled engine
+    // attempt into an `engine_placed` for a contract the DESK filled.
+    const executed = openingOrders.filter(orderExecuted);
+    const unfilled = openingOrders.filter((o) => !orderExecuted(o));
+    const brokerOpeningOrderIds = executed.map((o) => o.id);
+    const brokerUnfilledOpeningOrderIds = unfilled.map((o) => o.id);
     const matchedEngineOrderIds = brokerOpeningOrderIds.filter((id) => oursByFill.has(id));
 
     let verdict: OpenLegProvenanceVerdict;
@@ -501,8 +537,14 @@ export function resolveOpenLegProvenance(input: OpenLegProvenanceInput): OpenLeg
     } else if (brokerOpeningOrderIds.length === 0) {
       verdict = 'blind_no_order_record';
       detail =
-        `the order list reaches ${s.openEtDay} (oldest ${reach.oldestCreateDate}) and holds no opening ` +
-        `order for ${s.optionSymbol}; absence in a list that may page or filter is not a positive refutation`;
+        `the order list reaches ${s.openEtDay} (oldest ${reach.oldestCreateDate}) and holds no EXECUTED ` +
+        `opening order for ${s.optionSymbol}` +
+        (unfilled.length > 0
+          ? ` — ${unfilled.length} opening order(s) exist but never filled (${unfilled
+              .map((o) => `${o.id}:${o.status}`)
+              .join(', ')}), and an order that put no contract in the account cannot be the provenance of one`
+          : '') +
+        `; absence in a list that may page or filter is not a positive refutation`;
     } else if (matchedEngineOrderIds.length > 0) {
       verdict = 'engine_placed';
       detail =
@@ -552,6 +594,7 @@ export function resolveOpenLegProvenance(input: OpenLegProvenanceInput): OpenLeg
       verdict,
       brokerOpeningOrderIds,
       matchedEngineOrderIds,
+      brokerUnfilledOpeningOrderIds,
       detail,
       resolvedAt: input.resolvedAt,
     });

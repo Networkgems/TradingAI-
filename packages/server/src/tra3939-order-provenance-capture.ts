@@ -691,3 +691,150 @@ export function capturedBrokerOrders(): TradierAccountOrder[] {
 export function orderProvenanceCaptureAppendErrors(): { submit: number; capture: number } {
   return { submit: submitAppendErrors, capture: captureAppendErrors };
 }
+
+// ── the per-order census: the join, exercised on EVERY captured order ────────
+
+/**
+ * Who issued ONE captured order. Same three names the resolver uses for a
+ * subject contract, so a reader maps them without a legend:
+ *   `engine_placed`           — the id is in our submit ledger (or our fill ledger)
+ *   `desk_placed`             — absent from both, on a day the ledger is ATTESTED for
+ *   `blind_no_issuer_witness` — absent from both, on a day it is not (or undated)
+ */
+export type CapturedOrderIssuer = 'engine_placed' | 'desk_placed' | 'blind_no_issuer_witness';
+
+export interface CapturedOrderCensusRow {
+  id: number;
+  etDay: string | null;
+  createDate: string | null;
+  optionSymbol: string;
+  side: string | null;
+  status: string;
+  quantity: number | null;
+  execQuantity: number | null;
+  issuer: CapturedOrderIssuer;
+  /** The evidence the issuer verdict stands on. */
+  witness: 'submit_ledger' | 'fill_ledger' | 'attested_absence' | 'unattested_day' | 'undated';
+}
+
+export interface CapturedOrderCensusDay {
+  etDay: string;
+  attested: boolean;
+  orders: number;
+  engine_placed: number;
+  desk_placed: number;
+  blind_no_issuer_witness: number;
+}
+
+export interface CapturedOrderCensus {
+  /** Option orders only — the submit ledger hooks the OPTIONS client, so an equity order's absence from it is not evidence. */
+  orders: CapturedOrderCensusRow[];
+  skippedNonOption: number;
+  byIssuer: Record<CapturedOrderIssuer, number>;
+  byDay: CapturedOrderCensusDay[];
+  /** engine_placed + desk_placed — the count of terminal verdicts reached on real rows. */
+  terminalOrders: number;
+}
+
+export interface CapturedOrderCensusInput {
+  orders: readonly TradierAccountOrder[];
+  /** Production ids the submit ledger holds. */
+  submittedIds: ReadonlySet<number>;
+  /** Ids our fill ledger holds, when the caller has them. A positive witness on any day. */
+  filledIds?: ReadonlySet<number> | null;
+  /** ET days the submit ledger is attested for — the ONLY days absence means "desk". */
+  attestedEtDays: ReadonlySet<string>;
+}
+
+/**
+ * TRA-3939 AC4 — run the resolver's issuer join (steps 4/6/7/8) over EVERY
+ * captured option order, not only over over-sold subjects.
+ *
+ * The resolver can only reach a terminal verdict on a subject the over-sell
+ * detector names, and every subject so far opened before the archive existed.
+ * A resolver whose terminal branches have never fired on real bytes is the same
+ * instrument as one that cannot reach them (TRA-3926 C8) — so the same join is
+ * exercised here on the population that IS in reach: every order we captured.
+ * PURE; the route feeds it the durable stores.
+ *
+ * Step 7 is preserved exactly: absence on an unattested day is a blind, never a
+ * `desk_placed`. This census is a READER's instrument — nothing spends on it.
+ */
+export function censusCapturedOrders(input: CapturedOrderCensusInput): CapturedOrderCensus {
+  const rows: CapturedOrderCensusRow[] = [];
+  const seen = new Set<number>();
+  let skippedNonOption = 0;
+  for (const o of input.orders) {
+    if (typeof o.id !== 'number' || !Number.isFinite(o.id) || seen.has(o.id)) continue;
+    seen.add(o.id);
+    if (typeof o.optionSymbol !== 'string' || o.optionSymbol === '') {
+      skippedNonOption += 1;
+      continue;
+    }
+    const ms = o.createDate === null ? NaN : Date.parse(o.createDate);
+    const etDay = Number.isFinite(ms) ? etDayOf(ms) : null;
+    let issuer: CapturedOrderIssuer;
+    let witness: CapturedOrderCensusRow['witness'];
+    if (input.submittedIds.has(o.id)) {
+      issuer = 'engine_placed';
+      witness = 'submit_ledger';
+    } else if (input.filledIds?.has(o.id)) {
+      issuer = 'engine_placed';
+      witness = 'fill_ledger';
+    } else if (etDay === null) {
+      issuer = 'blind_no_issuer_witness';
+      witness = 'undated';
+    } else if (input.attestedEtDays.has(etDay)) {
+      issuer = 'desk_placed';
+      witness = 'attested_absence';
+    } else {
+      issuer = 'blind_no_issuer_witness';
+      witness = 'unattested_day';
+    }
+    rows.push({
+      id: o.id,
+      etDay,
+      createDate: o.createDate,
+      optionSymbol: o.optionSymbol,
+      side: o.side,
+      status: o.status,
+      quantity: o.quantity,
+      execQuantity: o.execQuantity,
+      issuer,
+      witness,
+    });
+  }
+  rows.sort((a, b) => (a.createDate ?? '').localeCompare(b.createDate ?? '') || a.id - b.id);
+  const byIssuer: Record<CapturedOrderIssuer, number> = {
+    engine_placed: 0,
+    desk_placed: 0,
+    blind_no_issuer_witness: 0,
+  };
+  const dayMap = new Map<string, CapturedOrderCensusDay>();
+  for (const r of rows) {
+    byIssuer[r.issuer] += 1;
+    const key = r.etDay ?? 'undated';
+    let d = dayMap.get(key);
+    if (!d) {
+      d = {
+        etDay: key,
+        attested: r.etDay !== null && input.attestedEtDays.has(r.etDay),
+        orders: 0,
+        engine_placed: 0,
+        desk_placed: 0,
+        blind_no_issuer_witness: 0,
+      };
+      dayMap.set(key, d);
+    }
+    d.orders += 1;
+    d[r.issuer] += 1;
+  }
+  const byDay = [...dayMap.values()].sort((a, b) => a.etDay.localeCompare(b.etDay));
+  return {
+    orders: rows,
+    skippedNonOption,
+    byIssuer,
+    byDay,
+    terminalOrders: byIssuer.engine_placed + byIssuer.desk_placed,
+  };
+}

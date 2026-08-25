@@ -327,6 +327,7 @@ import {
   resolveOpenLegProvenance,
   persistOpenLegProvenance,
   summarizeStoredProvenance,
+  engineFilledOrderIds,
 } from './tra3932-open-leg-provenance.js';
 // TRA-3939 — the two captures that make the question above ANSWERABLE next time:
 // a submit-time order-id ledger and a daily capture of the broker's one-day
@@ -337,6 +338,7 @@ import {
   recordEngineOrderSubmit,
   captureBrokerOrderDay,
   capturedBrokerOrders,
+  censusCapturedOrders,
   summarizeBrokerOrderCaptures,
   summarizeEngineSubmitWitness,
   engineSubmittedProductionOrderIds,
@@ -12227,6 +12229,14 @@ async function runBrokerOrderDayCapture(opts: { force?: boolean } = {}): Promise
 app.get('/api/health/order-provenance-capture', (_req, res) => {
   const witness = summarizeEngineSubmitWitness();
   const captures = summarizeBrokerOrderCaptures();
+  // TRA-3939 AC4 — the issuer join run over EVERY captured option order, so the
+  // terminal branches fire on real bytes without waiting for the next over-sell.
+  const orderCensus = censusCapturedOrders({
+    orders: capturedBrokerOrders(),
+    submittedIds: witness.armed ? engineSubmittedProductionOrderIds() : new Set<number>(),
+    filledIds: engineFilledOrderIds(summarizeLiveOptionsFeeSlippage().records),
+    attestedEtDays: new Set(witness.coveredEtDays),
+  });
   res.json({
     ok: true,
     etDay: etDateString(new Date()),
@@ -12261,6 +12271,12 @@ app.get('/api/health/order-provenance-capture', (_req, res) => {
       attestedEtDays: witness.coveredEtDays,
       unattestedEtDays: witness.uncoveredCapturedEtDays,
     },
+    /**
+     * Per-order issuer verdicts over the whole archive. `desk_placed` here is a
+     * READER's statement (the ledger is attested for that day and holds no such
+     * id) — it spends nothing and accuses nothing on an unattested day.
+     */
+    orderCensus,
     retention: witness.retention,
   });
 });

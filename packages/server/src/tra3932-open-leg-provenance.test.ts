@@ -397,6 +397,58 @@ describe('TRA-3932 verdicts — a blind never becomes an accusation', () => {
     expect(summed).toBe(r.subjectContracts);
     expect(r.subjectContracts).toBe(4);
   });
+
+  // ── TRA-3939 (08-25, real bytes): only an EXECUTED order can be a provenance ──
+
+  it('THE BAC SHAPE — a cancelled engine walk step in the submit ledger is NOT engine_placed for a contract it never filled', () => {
+    // Real bytes 2026-08-25: BAC260925C00063000 had an archived opening order
+    // 142843026 (08-21) with NO matching buy in the broker's own history. Had the
+    // reach covered the open, joining on it would have exonerated the engine for a
+    // contract the desk bought at 1.17 the day before. The submit ledger records
+    // every walk step by design (AC1), so this is the ledger's own shape.
+    const r = resolve([order({ id: 142843026, status: 'canceled', execQuantity: 0, avgFillPrice: null })], {
+      submitted: new Set([142843026]),
+      covered: ['2026-08-04'],
+    });
+    expect(r.rows[0]!.verdict).toBe('blind_no_order_record');
+    expect(r.rows[0]!.brokerOpeningOrderIds).toEqual([]);
+    expect(r.rows[0]!.brokerUnfilledOpeningOrderIds).toEqual([142843026]);
+    expect(r.rows[0]!.detail).toContain('never filled');
+    expect(r.rows[0]!.detail).toContain('142843026:canceled');
+    expect(r.contractsByVerdict.engine_placed).toBe(0);
+  });
+
+  it('the mirror — a cancelled DESK attempt on an attested day is NOT desk_placed either', () => {
+    const r = resolve([order({ id: 777777, status: 'rejected', execQuantity: 0 })], {
+      submitted: new Set([555555]),
+      covered: ['2026-08-04'],
+    });
+    expect(r.rows[0]!.verdict).toBe('blind_no_order_record');
+    expect(r.contractsByVerdict.desk_placed).toBe(0);
+  });
+
+  it('a cancelled-after-PARTIAL row (status canceled, exec > 0) DID open something and is still joined', () => {
+    const r = resolve([order({ id: 900001, status: 'canceled', quantity: 2, execQuantity: 1 })], {
+      submitted: new Set([900001]),
+    });
+    expect(r.rows[0]!.verdict).toBe('engine_placed');
+    expect(r.rows[0]!.brokerOpeningOrderIds).toEqual([900001]);
+  });
+
+  it('an executed order beside a cancelled one: the executed id alone is joined, the other is only named', () => {
+    const r = resolve(
+      [
+        order({ id: 142843026, status: 'canceled', execQuantity: 0 }),
+        order({ id: 142603649, status: 'filled', createDate: '2026-08-04T13:36:00.000Z' }),
+      ],
+      { submitted: new Set([142843026]), covered: ['2026-08-04'] },
+    );
+    // The executed open is NOT in the submit ledger and the day is attested ⇒ desk.
+    // The cancelled one IS ours, and must not override that.
+    expect(r.rows[0]!.verdict).toBe('desk_placed');
+    expect(r.rows[0]!.brokerOpeningOrderIds).toEqual([142603649]);
+    expect(r.rows[0]!.brokerUnfilledOpeningOrderIds).toEqual([142843026]);
+  });
 });
 
 // ── the parser ──────────────────────────────────────────────────────────────

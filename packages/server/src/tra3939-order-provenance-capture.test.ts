@@ -21,6 +21,7 @@ import {
   brokerOrderCaptureLogPath,
   captureBrokerOrderDay,
   capturedBrokerOrders,
+  censusCapturedOrders,
   engineSubmitLogPath,
   engineSubmittedProductionOrderIds,
   etDayOf,
@@ -341,6 +342,75 @@ describe('TRA-3939 attestation — the coverage axis behind a desk_placed', () =
   it('a day with NO capture at all is never attested — silence is not coverage', () => {
     armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
     expect(summarizeEngineSubmitWitness().coveredEtDays).toEqual([]);
+  });
+});
+
+describe('TRA-3939 AC4 — the per-order census fires the terminal branches on every captured order', () => {
+  const ATTESTED = new Set(['2026-08-24']);
+
+  it('an id in the submit ledger is engine_placed on ANY day — a positive match needs no coverage claim', () => {
+    const c = censusCapturedOrders({
+      orders: [order({ id: 1, createDate: '2026-08-21T14:00:00.000Z' })],
+      submittedIds: new Set([1]),
+      attestedEtDays: ATTESTED,
+    });
+    expect(c.orders[0]!.issuer).toBe('engine_placed');
+    expect(c.orders[0]!.witness).toBe('submit_ledger');
+    expect(c.terminalOrders).toBe(1);
+  });
+
+  it('absent from both ledgers on an ATTESTED day is desk_placed; on an unattested day it is a blind', () => {
+    const c = censusCapturedOrders({
+      orders: [
+        order({ id: 1, createDate: '2026-08-24T14:00:00.000Z' }),
+        order({ id: 2, createDate: '2026-08-25T14:00:00.000Z' }),
+      ],
+      submittedIds: new Set([999]),
+      attestedEtDays: ATTESTED,
+    });
+    expect(c.orders.map(r => r.issuer)).toEqual(['desk_placed', 'blind_no_issuer_witness']);
+    expect(c.orders[1]!.witness).toBe('unattested_day');
+    expect(c.byDay).toEqual([
+      { etDay: '2026-08-24', attested: true, orders: 1, engine_placed: 0, desk_placed: 1, blind_no_issuer_witness: 0 },
+      { etDay: '2026-08-25', attested: false, orders: 1, engine_placed: 0, desk_placed: 0, blind_no_issuer_witness: 1 },
+    ]);
+    expect(c.terminalOrders).toBe(1);
+  });
+
+  it('the fill ledger is a second positive witness, ranked below the submit ledger', () => {
+    const c = censusCapturedOrders({
+      orders: [order({ id: 7, createDate: '2026-08-24T14:00:00.000Z' })],
+      submittedIds: new Set(),
+      filledIds: new Set([7]),
+      attestedEtDays: ATTESTED,
+    });
+    expect(c.orders[0]!.issuer).toBe('engine_placed');
+    expect(c.orders[0]!.witness).toBe('fill_ledger');
+  });
+
+  it('NON-OPTION orders are skipped and counted — the ledger hooks the options client, so their absence is not evidence', () => {
+    const c = censusCapturedOrders({
+      orders: [
+        order({ id: 1, orderClass: 'equity', optionSymbol: null, createDate: '2026-08-24T14:00:00.000Z' }),
+        order({ id: 2, createDate: '2026-08-24T14:00:00.000Z' }),
+        order({ id: 2, createDate: '2026-08-24T14:00:00.000Z' }), // same id captured twice
+      ],
+      submittedIds: new Set(),
+      attestedEtDays: ATTESTED,
+    });
+    expect(c.skippedNonOption).toBe(1);
+    expect(c.orders).toHaveLength(1);
+    expect(c.byIssuer.desk_placed).toBe(1);
+  });
+
+  it('an UNDATED row is a blind, never a desk_placed — no day, no attestation', () => {
+    const c = censusCapturedOrders({
+      orders: [order({ id: 1, createDate: null })],
+      submittedIds: new Set(),
+      attestedEtDays: ATTESTED,
+    });
+    expect(c.orders[0]!.issuer).toBe('blind_no_issuer_witness');
+    expect(c.orders[0]!.witness).toBe('undated');
   });
 });
 

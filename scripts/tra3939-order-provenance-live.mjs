@@ -252,6 +252,41 @@ async function main() {
     pass('G7 writes clean', `lines=${submit.lines} appendErrors=0 corruptLines=0`);
   }
 
+  // G8 — AC4: the terminal branches must have FIRED on real bytes. The resolver
+  // only reaches them on an over-sold subject in reach; the census runs the same
+  // join over every captured option order. A `desk_placed` off an unattested day
+  // is the accusation this ticket refuses, so that is graded first.
+  const census = payload.orderCensus ?? null;
+  if (census === null) {
+    blind('orderCensus is absent from the surface — this build predates the AC4 census');
+  } else {
+    const attested = new Set(Array.isArray(coverage.attestedEtDays) ? coverage.attestedEtDays : []);
+    const rows = Array.isArray(census.orders) ? census.orders : [];
+    const unearnedDesk = rows.filter((r) => r.issuer === 'desk_placed' && !attested.has(r.etDay));
+    const byDay = (census.byDay ?? [])
+      .map((d) => `${d.etDay}${d.attested ? '*' : ''}:${d.orders}(e${d.engine_placed}/d${d.desk_placed}/b${d.blind_no_issuer_witness})`)
+      .join(' ');
+    if (unearnedDesk.length > 0) {
+      fail(
+        'G8 terminal fired',
+        `${unearnedDesk.length} desk_placed verdict(s) stand on an UNATTESTED day: ${unearnedDesk
+          .map((r) => `${r.id}@${r.etDay}`)
+          .join(', ')}`,
+      );
+    } else if (Number(census.terminalOrders ?? 0) > 0) {
+      pass(
+        'G8 terminal fired',
+        `${census.terminalOrders} terminal issuer verdict(s) on real rows — engine_placed=${census.byIssuer?.engine_placed} `
+          + `desk_placed=${census.byIssuer?.desk_placed} blind=${census.byIssuer?.blind_no_issuer_witness}; byDay ${byDay || 'none'} (*=attested)`,
+      );
+    } else {
+      blind(
+        `the census holds ${rows.length} option order(s) and reached NO terminal verdict — nothing captured on an `
+          + `attested day and nothing in the submit ledger. The branches are still unexercised on real bytes.`,
+      );
+    }
+  }
+
   const after = await pin().catch(() => null);
   if (after === null || !samePin(before, after)) {
     blind(`the build moved under the probe: ${JSON.stringify(before)} → ${JSON.stringify(after)}`);
