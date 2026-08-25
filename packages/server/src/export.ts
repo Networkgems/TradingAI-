@@ -817,7 +817,10 @@ export function summarize(rows: ExportTradeRow[], filters: ExportFilters): Expor
 
 // ── Serializers ──────────────────────────────────────────────────────────────
 
-function csvCell(value: string | number | null): string {
+// TRA-3989 — `undefined` is admitted on the TYPE now that `pnl_r_stop_basis` is
+// optional on the row (a hand-built fixture may omit it); the body already
+// rendered it as an empty cell, so the widening changes no output.
+function csvCell(value: string | number | null | undefined): string {
   if (value === null || value === undefined) return '';
   const str = String(value);
   if (/[",\r\n]/.test(str)) {
