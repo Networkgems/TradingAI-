@@ -152,7 +152,7 @@ describe('rowFromPosition', () => {
 });
 
 describe('rowFromOption', () => {
-  it('uses the OCC symbol, side=buy, contract-multiplier R, and last mark as exit', () => {
+  it('uses the OCC symbol, side=buy, premium-basis R, and last mark as exit', () => {
     const row = rowFromOption(option());
     expect(row.symbol).toBe('TSLA260619C00250000');
     expect(row.market).toBe('options');
@@ -162,8 +162,13 @@ describe('rowFromOption', () => {
     expect(row.exit_price).toBe(6);
     expect(row.net_pnl_usd).toBe(400);
     expect(row.hold_duration).toBe('6h 0m');
-    // risk = |4-3| * 2 contracts * 100 = 200; R = 400/200 = 2
-    expect(row.pnl_r).toBe(2);
+    // TRA-3989 — `pnl_r` is in the JOURNAL's basis: premium at open = 4 × 2
+    // contracts × 100 = 800; R = 400/800 = 0.5. The stop-distance figure this
+    // used to publish as `pnl_r` (|4−3| × 2 × 100 = 200; 400/200 = 2) is now
+    // `pnl_r_stop_basis`, explicitly labelled.
+    expect(row.pnl_r).toBe(0.5);
+    expect(row.pnl_r_stop_basis).toBe(2);
+    expect(row.pnl_r_basis).toBe('premium');
   });
 
   it('falls back to the underlying symbol when optionSymbol is absent', () => {
@@ -257,19 +262,24 @@ describe('summarize', () => {
 // ── CSV ───────────────────────────────────────────────────────────────────────
 
 describe('toCsv', () => {
-  it('emits the exact §2.3 header', () => {
+  it('emits the exact §2.3 header, plus TRA-3989\'s `pnl_r_stop_basis` appended LAST', () => {
     const csv = toCsv([]);
+    // The sixteen §2.3 columns keep their ordinals; the seventeenth is the
+    // relabelled stop-distance R (TRA-3989 AC3).
     expect(csv.split('\r\n')[0]).toBe(
-      'symbol,market,mode,side,strategy,quantity,entry_time,entry_price,exit_time,exit_price,exit_reason,gross_pnl_usd,fees_usd,net_pnl_usd,pnl_r,hold_duration',
+      'symbol,market,mode,side,strategy,quantity,entry_time,entry_price,exit_time,exit_price,exit_reason,gross_pnl_usd,fees_usd,net_pnl_usd,pnl_r,hold_duration,pnl_r_stop_basis',
     );
-    expect(EXPORT_COLUMNS).toHaveLength(16);
+    expect(EXPORT_COLUMNS).toHaveLength(17);
+    expect(EXPORT_COLUMNS[16]).toBe('pnl_r_stop_basis');
   });
 
   it('renders a data row with all columns populated', () => {
     const csv = toCsv([rowFromPosition(stock(), 'stocks')]);
     const dataLine = csv.split('\r\n')[1];
+    // An equity row's risk unit IS the stop distance, so the last column repeats
+    // `pnl_r` (2) rather than reading blank.
     expect(dataLine).toBe(
-      'AAPL,stocks,live,buy,orb_breakout,10,2026-05-01T14:00:00.000Z,100,2026-05-01T16:14:00.000Z,110,target,100,0,100,2,2h 14m',
+      'AAPL,stocks,live,buy,orb_breakout,10,2026-05-01T14:00:00.000Z,100,2026-05-01T16:14:00.000Z,110,target,100,0,100,2,2h 14m,2',
     );
   });
 

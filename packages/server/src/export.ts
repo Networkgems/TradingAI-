@@ -35,8 +35,28 @@ import { journalIdForPosition } from './option-trade-journal.js';
 //     The column is kept in the schema (design §2.3) so a future fee-tracking
 //     change on the BOOK side stays purely additive and the CSV header never has
 //     to change.
-//   * pnl_r — R-multiple is derived from the entry→stop distance (the trade's
-//     initial risk), not stored. Null when the stop is absent/zero.
+//   * pnl_r — R-multiple. ⚠ THE BASIS DEPENDS ON THE MARKET, and since TRA-3989
+//     it depends on NOTHING ELSE:
+//       - equity/crypto rows: pnl ÷ the entry→stop distance × quantity (the
+//         trade's initial risk). Null when the stop is absent/zero.
+//       - OPTIONS rows: pnl ÷ the FULL PREMIUM at open (`premiumPaid × contracts
+//         × 100`) — the option-trade JOURNAL's `realizedR` basis (`realizedPnlUsd
+//         / atRiskUsd`, where `atRiskUsd` is `totalCost` at the open site). Before
+//         TRA-3989 a BOOK-served options row divided by the stop distance and a
+//         JOURNAL-served one by the premium, so the unit of this column flipped
+//         on the 21:00 ET archive — the same 30 closes read ~5× larger at 19:00Z
+//         than at 02:00Z, with the losers (which terminate at a stop and are
+//         read same-day) amplified and the winners not. See
+//         {@link optionPremiumRiskUsd} for why the premium is the reference.
+//     `pnl_r_basis` (JSON) names the unit per row so no reader has to know this.
+//   * pnl_r_stop_basis — TRA-3989: the stop-distance R, RELABELLED rather than
+//     deleted. On options rows this is the gate-basis reading (`pnl ÷
+//     |premiumPaid − stopLossPremium| × contracts × 100`); null when the row has
+//     no armed stop (`stopLossPremium` absent or the `0` "never stop" sentinel —
+//     see `isArmedThreshold` in `options-account.ts`) and null on every
+//     journal-served row (the journal does not record the stop). On equity/crypto
+//     rows it equals `pnl_r`. In the CSV header as the LAST column, so every
+//     existing §2.3 column keeps its ordinal.
 //   * hold_duration — human string ("2h 14m") derived from openedAt→closedAt.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -61,6 +81,17 @@ export type ExportFormat = 'csv' | 'json';
  */
 export type ExportRowSource = 'book' | 'journal';
 export type ExportPnlBasis = 'book' | 'broker-fill';
+
+/**
+ * TRA-3989 — the UNIT of the `pnl_r` column, per row, so a reader never has to
+ * infer it from `market` (or, as before this ticket, from the clock).
+ *
+ * `'premium'` = pnl ÷ full premium at open (options; the journal's `realizedR`
+ * basis). `'stop-distance'` = pnl ÷ entry→stop distance (equity/crypto, whose
+ * risk unit IS the stop). The stop-distance reading for options is published
+ * separately as `pnl_r_stop_basis` and is never what `pnl_r` holds.
+ */
+export type ExportPnlRBasis = 'premium' | 'stop-distance';
 
 /**
  * TRA-3985 (Defect 2) — WHICH LOT this row's exit consumed.
@@ -124,6 +155,12 @@ export const EXPORT_COLUMNS = [
   'net_pnl_usd',
   'pnl_r',
   'hold_duration',
+  // TRA-3989 — appended LAST so the sixteen §2.3 columns keep their ordinals
+  // and a positional CSV consumer reads exactly what it read before. This is
+  // the first change to the §2.3 header since it was written; it is made
+  // because a stop-basis R that is only available by *inferring* it from the
+  // premium-basis one is how the two got confused in the first place (AC3).
+  'pnl_r_stop_basis',
 ] as const;
 
 export interface ExportTradeRow {
@@ -145,6 +182,18 @@ export interface ExportTradeRow {
   net_pnl_usd: number | null;
   pnl_r: number | null;
   hold_duration: string;
+  /**
+   * TRA-3989 — the stop-distance R (see the header note). In the CSV as the last
+   * column. Optional on the TYPE only so a hand-built fixture still type-checks
+   * (`tsc -b` compiles the test files — TRA-3695); every mapper sets it, and
+   * `toCsv` renders an absent one as an empty cell exactly like a null.
+   */
+  pnl_r_stop_basis?: number | null;
+  /**
+   * TRA-3989 — the unit `pnl_r` is in, JSON-only (see {@link ExportPnlRBasis}).
+   * Optional on the TYPE for the same reason as `pnl_r_stop_basis`.
+   */
+  pnl_r_basis?: ExportPnlRBasis;
   /**
    * TRA-3875 — provenance, JSON-only (see {@link ExportRowSource}). Optional on
    * the TYPE so a fixture or an older caller that builds a row by hand still
@@ -271,6 +320,16 @@ export interface ExportMoneyRestatement {
 export function applyMoneyRestatement(
   row: ExportTradeRow,
   restatement: ExportMoneyRestatement | undefined,
+  /**
+   * TRA-3989 — the BOOK row's stop-distance risk in USD ({@link optionStopRiskUsd}),
+   * so the relabelled stop-basis R can be re-derived against the restated NET.
+   * `pnl_r` already travels with the money (the journal re-derives `realizedR` in
+   * the same write); leaving `pnl_r_stop_basis` as the book's own arithmetic would
+   * put an R computed from the replaced figure one column over from the figure
+   * that replaced it — the exact defect TRA-3875 fixed for `pnl_r`. Absent or
+   * unarmed ⇒ null: broker money over a book-mark stop is not published.
+   */
+  stopRiskUsd?: number,
 ): ExportTradeRow {
   if (!restatement) return row;
   return {
@@ -281,6 +340,7 @@ export function applyMoneyRestatement(
     fees_usd: restatement.fees_usd,
     net_pnl_usd: restatement.net_pnl_usd,
     pnl_r: restatement.pnl_r,
+    pnl_r_stop_basis: rMultiple(restatement.net_pnl_usd ?? undefined, stopRiskUsd ?? NaN),
     pnl_basis: 'broker-fill',
     // TRA-3985 — identity is NOT restated: `lot_id`/`journal_id` describe which
     // row this is, and the restatement is joined ON `journal_id`, so letting it
@@ -490,6 +550,74 @@ function moneyOrNull(value: number | undefined): number | null {
   return isFiniteNumber(value) ? round(value, 2) : null;
 }
 
+/**
+ * TRA-3989 — an options row's risk in the JOURNAL's basis: the full premium at
+ * open, `premiumPaid × contracts × 100`. `NaN` when the row cannot state one.
+ *
+ * ── Why the premium, and not the stop, is the export's `pnl_r` unit ──────────
+ *
+ * Measured live 2026-08-24 (bqb1 `07cc4ba4`): 98 export rows, 96 of which
+ * reconciled `pnl_r == gross_pnl_usd / (entry_price × 100 × quantity)`. The 2
+ * that did not were both closes from THAT DAY, still book-served, and both
+ * divided by the stop distance instead: `RIG260925C00006000` published
+ * `-2.273` for a `-0.455` premium-basis loss (5.0×), `BAC260925C00063000`
+ * `-0.103` for `-0.026` (4.0×). At 02:00Z the archive would have re-served
+ * both from the journal at the premium figure. Same route, same query, a
+ * different UNIT selected by the hour of the read.
+ *
+ * The premium is the reference because it is (a) the basis of every archived
+ * row — the 15 historical live OTM closes TRA-3945's baseline is frozen on —
+ * so choosing it changes nothing a reader has already been served; (b) fixed at
+ * the open and therefore stable across the 21:00 ET archive edge; (c) invariant
+ * to a stop re-tune (TRA-3943 moved the OTM stop; an R denominated on the stop
+ * moves with the thing the arm under test changed — TRA-2677's mixed-population
+ * defect, on the units axis); and (d) the SAME arithmetic as the journal's
+ * `atRiskUsd`, which is `totalCost = contracts × premiumPaid × 100` at every
+ * single-leg open site (`options-account.ts`, `queueJournalOpen`).
+ *
+ * `opt.contracts` is the count OPENED (`contractsRemaining` is what a TP1
+ * scale-out decrements), so a partially-exited row still divides by the premium
+ * it actually paid — matching the journal, which captured `atRiskUsd` at open.
+ *
+ * Residual, stated rather than hidden: a book row whose `premiumPaid` was later
+ * restated in place (TRA-3958 operator pin, `residual_identity` desk-add) divides
+ * by its CURRENT basis, and the row's own `entry_price` is that same basis, so
+ * the row stays self-consistent (AC2's identity holds row-locally). The journal
+ * twin, if it carries `pnlBasis: 'broker-fill'`, wins `pnl_r` via the
+ * restatement overlay regardless.
+ */
+export function optionPremiumRiskUsd(opt: Pick<OptionPosition, 'premiumPaid' | 'contracts'>): number {
+  return isFiniteNumber(opt.premiumPaid) && isFiniteNumber(opt.contracts)
+    ? opt.premiumPaid * opt.contracts * OPTION_CONTRACT_MULTIPLIER
+    : NaN;
+}
+
+/**
+ * TRA-3989 — an options row's risk in the GATE's basis: the entry→stop distance,
+ * `|premiumPaid − stopLossPremium| × contracts × 100`. This was `pnl_r`'s
+ * denominator on book-served rows before this ticket; it now feeds
+ * `pnl_r_stop_basis` only.
+ *
+ * `NaN` when there is no ARMED stop. `stopLossPremium: 0` is the book's "never
+ * stop" sentinel (`isArmedThreshold` in `options-account.ts` rejects it; an
+ * unauthorized adopted lot carries it), and a distance measured from a stop that
+ * does not exist is not a risk unit — it would silently equal the premium
+ * basis and read as a coincidence rather than as "no stop".
+ *
+ * ⚠ Even where a stop IS armed this is the GENERIC stop on the row, not
+ * necessarily the stop that FIRED: RIG closed on `sl_otm_premium_pct` (the
+ * TRA-3943 day-one leg, floor `premium × 0.65`) while its `stopLossPremium` was
+ * the 20% stop. The stop basis is therefore not self-consistent as a unit, which
+ * is one more reason it is relabelled rather than kept as `pnl_r`.
+ */
+export function optionStopRiskUsd(
+  opt: Pick<OptionPosition, 'premiumPaid' | 'contracts' | 'stopLossPremium'>,
+): number {
+  if (!isFiniteNumber(opt.stopLossPremium) || opt.stopLossPremium <= 0) return NaN;
+  if (!isFiniteNumber(opt.premiumPaid) || !isFiniteNumber(opt.contracts)) return NaN;
+  return Math.abs(opt.premiumPaid - opt.stopLossPremium) * opt.contracts * OPTION_CONTRACT_MULTIPLIER;
+}
+
 // ── Row mappers ──────────────────────────────────────────────────────────────
 
 /** Map an equity/crypto closed `Position` into the flat export row shape. */
@@ -516,6 +644,10 @@ export function rowFromPosition(pos: Position, market: 'stocks' | 'crypto'): Exp
     net_pnl_usd: net,
     pnl_r: rMultiple(pos.pnl, risk),
     hold_duration: formatHoldDuration(pos.openedAt, pos.closedAt),
+    // TRA-3989 — an equity/crypto row's risk unit IS the stop distance, so the
+    // relabelled column carries the same figure as `pnl_r` and the basis says so.
+    pnl_r_stop_basis: rMultiple(pos.pnl, risk),
+    pnl_r_basis: 'stop-distance',
     source: 'book',
     pnl_basis: 'book',
     // TRA-3985 — equity/crypto rows have a lot id and no option-trade journal.
@@ -529,9 +661,12 @@ export function rowFromPosition(pos: Position, market: 'stocks' | 'crypto'): Exp
 
 /** Map a closed `OptionPosition` (always long premium) into an export row. */
 export function rowFromOption(opt: OptionPosition): ExportTradeRow {
-  const risk = isFiniteNumber(opt.stopLossPremium)
-    ? Math.abs(opt.premiumPaid - opt.stopLossPremium) * opt.contracts * OPTION_CONTRACT_MULTIPLIER
-    : NaN;
+  // TRA-3989 — `pnl_r` divides by the PREMIUM (the journal's `atRiskUsd`), never
+  // by the stop distance: a book-served row and its journal-served twin must
+  // publish the same R, and the twin has no stop to divide by. The stop-basis
+  // figure survives one column over as `pnl_r_stop_basis`.
+  const premiumRisk = optionPremiumRiskUsd(opt);
+  const stopRisk = optionStopRiskUsd(opt);
   const net = moneyOrNull(opt.pnl);
   return {
     symbol: opt.optionSymbol ?? opt.symbol,
@@ -557,8 +692,10 @@ export function rowFromOption(opt: OptionPosition): ExportTradeRow {
     gross_pnl_usd: net,
     fees_usd: 0,
     net_pnl_usd: net,
-    pnl_r: rMultiple(opt.pnl, risk),
+    pnl_r: rMultiple(opt.pnl, premiumRisk),
     hold_duration: formatHoldDuration(opt.openedAt, opt.closedAt),
+    pnl_r_stop_basis: rMultiple(opt.pnl, stopRisk),
+    pnl_r_basis: 'premium',
     source: 'book',
     // TRA-3875 — the ENGINE's close arithmetic, unless `buildRows` overlays a
     // broker-fill restatement over it (see {@link applyMoneyRestatement}). The
@@ -605,6 +742,10 @@ export function buildRows(input: ExportInput): ExportTradeRow[] {
       applyMoneyRestatement(
         rowFromOption(o),
         input.optionMoneyRestatements?.get(journalIdForPosition(o)),
+        // TRA-3989 — the stop risk is only recoverable HERE, where the position
+        // is still in hand; the overlay re-derives `pnl_r_stop_basis` against
+        // the restated net with it.
+        optionStopRiskUsd(o),
       ),
     );
   }

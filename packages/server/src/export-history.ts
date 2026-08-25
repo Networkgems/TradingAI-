@@ -447,6 +447,16 @@ export function rowFromJournalRecord(r: OptionTradeJournalRecord): ExportTradeRo
     net_pnl_usd: net,
     pnl_r: isFiniteNumber(r.realizedR) ? Math.round((r.realizedR + Number.EPSILON) * 1000) / 1000 : null,
     hold_duration: formatHoldDuration(r.openTs, r.closeTs),
+    // TRA-3989 — `realizedR` is `realizedPnlUsd / atRiskUsd` = pnl ÷ FULL PREMIUM,
+    // and `rowFromOption` now divides by the same thing, so a book-served row
+    // and this one agree on `pnl_r` (the regression in
+    // `tra3989-export-r-basis.test.ts` holds the two mappers to it). The journal
+    // records no stop, so the stop-basis column is null here — a blank, never a
+    // premium figure re-scaled by a constant that is stale the day the stop is
+    // re-tuned (the `0.25` in `GATE_R_PER_PREMIUM_R` already is: the live OTM
+    // stop is `premium × 0.80`, a 5× not a 4×).
+    pnl_r_stop_basis: null,
+    pnl_r_basis: 'premium',
     source: 'journal',
     pnl_basis: restated ? 'broker-fill' : 'book',
     // TRA-3985 — the journal knows this close by `r.id`, which is
