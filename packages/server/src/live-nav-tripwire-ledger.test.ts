@@ -27,6 +27,8 @@ import {
   liveNavWriterDueAtMs,
   resolveLiveNavObservationStart,
   seedLiveNavObservationStartForTest,
+  stockLegOperand,
+  STOCK_LEG_PROBE_DUST_USD,
   LIVE_NAV_OBSERVATION_START_FILENAME,
   LIVE_NAV_WRITER_DUE_GRACE_MS,
   LIVE_NAV_TRIPWIRE_FILENAME,
@@ -2072,5 +2074,231 @@ describe('TRA-4000 — onset present + nothing realized is `onset_unrealized`, n
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-4014 — the stock-leg operand on a shaper-written row is the PROBE, not the literal.
+//
+// `shapeLiveRecordedRow` pins `stockDaily: 0` on every broker-shaped row and publishes the
+// falsifiable read beside it as `stockLegProbeUsd` (stamping `stockLegBasis`). Keying the
+// census on the literal gave it an operand set disjoint from anything the live path produces:
+// admin posted `stockDaily: 0` on 16/16 post-onset sessions while its probe read up to
+// $197.36, and the axis sat `vacuous` by construction. The fixtures below are the rows
+// served at 2026-08-26T07:48:26.820Z, reduced to the fields this gate reads.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('TRA-4014 — the probe is the stock-leg operand on a shaper-written row', () => {
+  /** admin, post-onset tail as served. Every row `closingEquityBasis: broker-eod-balance`. */
+  const ADMIN_SERVED_0826 = [
+    { date: '2026-08-13', stockDaily: 0, optionsDaily: 0, stockLegBasis: 'zero-probe-agrees', stockLegProbeUsd: 0 },
+    { date: '2026-08-14', stockDaily: 0, optionsDaily: 0, stockLegBasis: 'zero-probe-agrees', stockLegProbeUsd: 0 },
+    { date: '2026-08-17', stockDaily: 0, optionsDaily: 0, stockLegBasis: 'zero-probe-disagrees', stockLegProbeUsd: -197.36 },
+    { date: '2026-08-18', stockDaily: 0, optionsDaily: -393, stockLegBasis: 'zero-probe-disagrees', stockLegProbeUsd: 196.56 },
+    { date: '2026-08-19', stockDaily: 0, optionsDaily: 0, stockLegBasis: 'zero-probe-agrees', stockLegProbeUsd: -0.12 },
+    { date: '2026-08-20', stockDaily: 0, optionsDaily: 0, stockLegBasis: 'zero-probe-disagrees', stockLegProbeUsd: -71.36 },
+    { date: '2026-08-21', stockDaily: 0, optionsDaily: -139, stockLegBasis: 'zero-probe-disagrees', stockLegProbeUsd: 112.47 },
+    // The row this ticket named: options-eligible (prior -139) AND a material probe.
+    { date: '2026-08-24', stockDaily: 0, optionsDaily: -15, stockLegBasis: 'zero-probe-disagrees', stockLegProbeUsd: -19.59 },
+    // Eligible too (prior -15) but the probe is dust once the mark is differenced.
+    { date: '2026-08-25', stockDaily: 0, optionsDaily: 1, stockLegBasis: 'zero-probe-agrees', stockLegProbeUsd: -0.43 },
+  ];
+  /** v0nni as served: onset 08-24, one realized row, the only material probe has a ZERO prior. */
+  const V0NNI_SERVED_0826 = [
+    { date: '2026-08-20', stockDaily: 0, optionsDaily: 0, stockLegBasis: 'zero-probe-agrees', stockLegProbeUsd: 0 },
+    { date: '2026-08-21', stockDaily: 0, optionsDaily: 0, stockLegBasis: 'zero-probe-agrees', stockLegProbeUsd: 0 },
+    { date: '2026-08-24', stockDaily: 0, optionsDaily: 0, stockLegBasis: 'zero-probe-disagrees', stockLegProbeUsd: -14.44 },
+    { date: '2026-08-25', stockDaily: 0, optionsDaily: -5, stockLegBasis: 'zero-probe-disagrees', stockLegProbeUsd: -1.34 },
+  ];
+  const servedEngines = (over: { admin?: unknown[]; v0nni?: unknown[] } = {}) => [
+    {
+      username: 'admin',
+      mode: 'live',
+      liveOptionsOnsetDate: '2026-07-30',
+      days: over.admin ?? ADMIN_SERVED_0826,
+      priorOptionsLagOk: true,
+      priorOptionsLagEligibleDates: ['2026-08-19', '2026-08-24', '2026-08-25'],
+    },
+    {
+      username: 'v0nni',
+      mode: 'live',
+      liveOptionsOnsetDate: '2026-08-24',
+      days: over.v0nni ?? V0NNI_SERVED_0826,
+      priorOptionsLagOk: null,
+      priorOptionsLagEligibleDates: [],
+    },
+  ];
+
+  it('resolves the operand by provenance: literal on a demo row, probe on a stamped row, null when the probe is not measured', () => {
+    expect(stockLegOperand({ stockDaily: -5.5 })).toEqual({ value: -5.5, source: 'stockDaily' });
+    expect(stockLegOperand({ stockDaily: 0, stockLegBasis: 'zero-probe-disagrees', stockLegProbeUsd: -19.59 })).toEqual({
+      value: -19.59,
+      source: 'probe',
+    });
+    // A stamped row with no finite probe is the absent-operand case — NEVER `0`, and the
+    // pinned literal beside it must not be read as the measurement.
+    expect(stockLegOperand({ stockDaily: 0, stockLegBasis: 'not-measured', stockLegProbeUsd: null })).toEqual({
+      value: null,
+      source: 'probe_not_measured',
+    });
+    expect(stockLegOperand({ stockDaily: -5.5, stockLegBasis: 'not-measured' })).toEqual({
+      value: null,
+      source: 'probe_not_measured',
+    });
+    // An empty basis string is not a stamp.
+    expect(stockLegOperand({ stockDaily: -5.5, stockLegBasis: '', stockLegProbeUsd: 3 })).toEqual({ value: -5.5, source: 'stockDaily' });
+  });
+
+  it('ARMS admin on the served rows: 0 -> 1 post-onset trip-capable pair, the 08-24 one, and no trip', () => {
+    const books = computeLiveLagDenominators({ engines: servedEngines() })!;
+    const admin = books.find((b) => b.username === 'admin')!;
+    // 08-24: probe -19.59 vs prior optionsDaily -139 — material, eligible, not equal.
+    expect(admin.postOnsetTripCapablePairs).toBe(1);
+    expect(admin.postOnsetTripPairs).toBe(0);
+    expect(admin.vacuousReason).toBeNull();
+    // 08-19 (probe -0.12 vs prior -393) and 08-25 (probe -0.43 vs prior -15): eligible but
+    // DUST. Named, not silently dropped.
+    expect(admin.postOnsetProbeDustPairs).toBe(2);
+    // Every post-onset row graded off the probe; the literal was never the operand.
+    expect(admin.postOnsetStockLegOperand).toEqual({ stockDaily: 0, probe: 9, probeNotMeasured: 0 });
+    // 08-17/08-18/08-20/08-21 carry material probes but their PRIOR optionsDaily is 0 —
+    // the C-novies disjointness — so they stay out. Only the 08-24 intersection counts.
+    expect(admin.tripCapablePairs).toBe(1);
+  });
+
+  it('does NOT arm v0nni: its only material probe sits beside a zero prior', () => {
+    const books = computeLiveLagDenominators({ engines: servedEngines() })!;
+    const v0nni = books.find((b) => b.username === 'v0nni')!;
+    expect(v0nni.postOnsetTripCapablePairs).toBe(0);
+    expect(v0nni.postOnsetProbeDustPairs).toBe(0); // -1.34 is above dust, but the prior is 0
+    expect(v0nni.vacuousReason).toBe('no_post_onset_trip_capable_pairs');
+    expect(v0nni.lagScope).toBe('graded');
+  });
+
+  it('grades the served payload VACUOUS on v0nni ALONE — the reason string no longer names admin', () => {
+    const g = gradeLiveNavTripwirePayload(
+      servedPayload({ liveGradeableBookCount: 2, livePriorOptionsLagOk: true, engines: servedEngines() }),
+    );
+    expect(g.axes.lagDenominator.status).toBe('vacuous');
+    expect(g.axes.lagDenominator.reason).toBe('no_post_onset_trip_capable_pairs:v0nni=no_post_onset_trip_capable_pairs');
+    expect(g.axes.lag.status).toBe('pass');
+    expect(g.alarm).toBe(false);
+    expect(g.observed.postOnsetTripCapablePairs).toBe(1);
+  });
+
+  it('passes once v0nni books a material probe beside a non-zero prior', () => {
+    const g = gradeLiveNavTripwirePayload(
+      servedPayload({
+        liveGradeableBookCount: 2,
+        livePriorOptionsLagOk: true,
+        engines: servedEngines({
+          v0nni: [
+            ...V0NNI_SERVED_0826,
+            { date: '2026-08-26', stockDaily: 0, optionsDaily: 0, stockLegBasis: 'zero-probe-disagrees', stockLegProbeUsd: 7.25 },
+          ],
+        }),
+      }),
+    );
+    expect(g.axes.lagDenominator).toEqual({ status: 'pass', reason: null, kind: 'coverage' });
+    expect(g.observed.postOnsetTripCapablePairs).toBe(2);
+  });
+
+  it('a probe of exactly $1.00 beside an equal prior is dust, not a trip', () => {
+    // 08-26 prior (08-25) optionsDaily is 1 and the probe reads 1.00: equal to the cent, but
+    // $1.00 is NOT above the dust floor, so the pair is not capable and must not trip.
+    const g = gradeLiveNavTripwirePayload(
+      servedPayload({
+        liveGradeableBookCount: 2,
+        livePriorOptionsLagOk: true,
+        engines: servedEngines({
+          admin: [
+            ...ADMIN_SERVED_0826,
+            { date: '2026-08-26', stockDaily: 0, optionsDaily: 0, stockLegBasis: 'zero-probe-agrees', stockLegProbeUsd: 1.0 },
+          ],
+        }),
+      }),
+    );
+    expect(g.axes.lagDenominator.status).toBe('vacuous');
+    expect(g.alarm).toBe(false);
+    const admin = g.lagDenominatorBooks.find((b) => b.username === 'admin')!;
+    expect(admin.postOnsetProbeDustPairs).toBe(3); // 08-19, 08-25, and this one
+  });
+
+  it('TRIPS on the stale-anchor shape: the probe equals the prior session optionsDaily to the cent', () => {
+    // openingEquity[t] = closingEquity[t-2] makes the probe absorb the whole prior session;
+    // on a clean options-only prior day that is exactly optionsDaily[t-1]. The served scalar
+    // compares the pinned literal and cannot see it, so this must fail off the recount.
+    //
+    // v0nni is VACUOUS in this fixture (its served rows). The trip must still read `fail`:
+    // the branch order used to let a sibling's empty denominator swallow a real trip.
+    const tripped = gradeLiveNavTripwirePayload(
+      servedPayload({
+        liveGradeableBookCount: 2,
+        livePriorOptionsLagOk: true,
+        engines: servedEngines({
+          admin: [
+            ...ADMIN_SERVED_0826.slice(0, 7), // ..08-21, optionsDaily -139
+            { date: '2026-08-24', stockDaily: 0, optionsDaily: -15, stockLegBasis: 'zero-probe-disagrees', stockLegProbeUsd: -139 },
+          ],
+        }),
+      }),
+    );
+    const admin = tripped.lagDenominatorBooks.find((b) => b.username === 'admin')!;
+    expect(admin.postOnsetTripCapablePairs).toBe(1);
+    expect(admin.postOnsetTripPairs).toBe(1);
+    expect(tripped.axes.lagDenominator.status).toBe('fail');
+    expect(tripped.axes.lagDenominator.reason).toBe('post_onset_trip_not_reported_by_scalar');
+    expect(tripped.alarm).toBe(true);
+    expect(tripped.verdict).toBe('fail');
+  });
+
+  it('the dust floor is the writer $1, applied to the PROBE only — a measured stockDaily keeps the cent', () => {
+    expect(STOCK_LEG_PROBE_DUST_USD).toBe(1);
+    const books = computeLiveLagDenominators({
+      engines: [
+        {
+          username: 'admin',
+          mode: 'live',
+          liveOptionsOnsetDate: '2026-07-30',
+          days: [
+            { date: '2026-08-11', stockDaily: 0, optionsDaily: -16, stockLegBasis: 'zero-probe-agrees', stockLegProbeUsd: 0 },
+            // probe 0.99 on a stamped row: dust.
+            { date: '2026-08-12', stockDaily: 0, optionsDaily: -20, stockLegBasis: 'zero-probe-agrees', stockLegProbeUsd: 0.99 },
+            // stockDaily 0.99 on a DEMO-shaped row (no stamp): a measured figure, capable.
+            { date: '2026-08-13', stockDaily: 0.99, optionsDaily: 0 },
+          ],
+        },
+      ],
+    })!;
+    expect(books[0]!.postOnsetTripCapablePairs).toBe(1);
+    expect(books[0]!.postOnsetProbeDustPairs).toBe(1);
+    expect(books[0]!.postOnsetStockLegOperand).toEqual({ stockDaily: 1, probe: 2, probeNotMeasured: 0 });
+  });
+
+  it('a stamped row whose probe is NOT MEASURED is out of the denominator even with a non-zero literal', () => {
+    const books = computeLiveLagDenominators({
+      engines: [
+        {
+          username: 'admin',
+          mode: 'live',
+          liveOptionsOnsetDate: '2026-07-30',
+          days: [
+            { date: '2026-08-11', stockDaily: 0, optionsDaily: -16, stockLegBasis: 'zero-probe-agrees', stockLegProbeUsd: 0 },
+            { date: '2026-08-12', stockDaily: -16, optionsDaily: 0, stockLegBasis: 'not-measured', stockLegProbeUsd: null },
+          ],
+        },
+      ],
+    })!;
+    expect(books[0]!.postOnsetTripCapablePairs).toBe(0);
+    expect(books[0]!.postOnsetTripPairs).toBe(0); // the literal -16 == prior -16 must NOT read as a trip
+    expect(books[0]!.postOnsetStockLegOperand).toEqual({ stockDaily: 0, probe: 1, probeNotMeasured: 1 });
+  });
+
+  it('unstamped rows grade exactly as before — the TRA-3450 census is unchanged on demo-shaped rows', () => {
+    const before = computeLiveLagDenominators(servedPayload())!;
+    const admin = before.find((b) => b.username === 'admin')!;
+    expect(admin.tripCapablePairs).toBe(2);
+    expect(admin.postOnsetTripCapablePairs).toBe(0);
+    expect(admin.postOnsetStockLegOperand).toEqual({ stockDaily: 4, probe: 0, probeNotMeasured: 0 });
+    expect(admin.postOnsetProbeDustPairs).toBe(0);
   });
 });

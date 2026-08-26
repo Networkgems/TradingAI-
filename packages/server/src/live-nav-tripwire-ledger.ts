@@ -477,8 +477,15 @@ export interface LiveNavBookDenominator {
   /** Consecutive day pairs in the book's series, post-onset or not. */
   totalPairs: number;
   /**
-   * Pairs where `stockDaily[t] != 0` AND `optionsDaily[t-1] != 0` — the pairs on which
-   * `round(stockDaily[t],2) === round(optionsDaily[t-1],2)` COULD have fired. Not onset-gated.
+   * Pairs where the STOCK-LEG OPERAND of row `t` is non-zero AND `optionsDaily[t-1] != 0` —
+   * the pairs on which `round(stockLeg[t],2) === round(optionsDaily[t-1],2)` COULD have
+   * fired. Not onset-gated.
+   *
+   * TRA-4014 — "stock-leg operand" is `stockDaily` on a row the demo engine wrote, and
+   * `stockLegProbeUsd` on a row the live shaper / back-fill wrote (see
+   * {@link stockLegOperand}). On the latter `stockDaily` is a pinned literal `0`, so keying on
+   * it gave this census an operand set DISJOINT from anything the live path can produce and
+   * held the axis `vacuous` on every live book by construction.
    */
   tripCapablePairs: number;
   /** {@link tripCapablePairs} additionally gated on `date[t] >= onsetDate`. **THE denominator.** */
@@ -491,6 +498,22 @@ export interface LiveNavBookDenominator {
    * module header. NOT graded.
    */
   postOnsetEligiblePairs: number;
+  /**
+   * TRA-4014 — which field supplied the stock-leg operand, counted over every post-onset row
+   * (`date >= onsetDate`, first row included). Published so the operand switch is auditable
+   * from the row: a book whose post-onset rows are all `probe` is grading the live shaper's
+   * falsifiable read, never its pinned literal. `probeNotMeasured` rows are stamped
+   * (`stockLegBasis` present) but carry no finite probe — the absent-operand case, out of
+   * the denominator. Absent on rows written before TRA-4014.
+   */
+  postOnsetStockLegOperand: { stockDaily: number; probe: number; probeNotMeasured: number };
+  /**
+   * TRA-4014 — post-onset pairs with a non-zero PRIOR whose probe operand sits inside the $1
+   * dust floor ({@link STOCK_LEG_PROBE_DUST_USD}). These are NOT trip-capable (C-novies rule
+   * (a): sub-$1 pairs are dust and keep the verdict `vacuous`); counted so the exclusion is
+   * visible rather than silent. Absent on rows written before TRA-4014.
+   */
+  postOnsetProbeDustPairs: number;
   /**
    * `null` when the book's post-onset trip-capable count is > 0.
    *
@@ -718,20 +741,75 @@ function bookList(v: unknown): Array<{ username: string; dates: string[] }> {
  */
 const CENT_TOLERANCE_USD = 0.01;
 
+/**
+ * TRA-4014 — the live writer's own inertness floor for the stock-leg probe
+ * (`STOCK_LEG_PROBE_TOLERANCE_USD` in `pnl-tracker.ts`, $1): a probe inside it is stamped
+ * `zero-probe-agrees`, i.e. the writer itself says the stock leg IS zero on that row, and the
+ * probe carries per-contract fee dust ($0.11) that a cent tolerance would count as evidence.
+ * Duplicated, not imported, for the same reason as {@link CENT_TOLERANCE_USD}.
+ */
+export const STOCK_LEG_PROBE_DUST_USD = 1;
+
 function num(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+/** TRA-4014 — where a row's stock-leg operand came from. */
+export type StockLegOperandSource = 'stockDaily' | 'probe' | 'probe_not_measured';
+
+/**
+ * TRA-4014 — resolve the STOCK-LEG operand of one day row.
+ *
+ * The live shaper (`shapeLiveRecordedRow`) and the TRA-2829 back-fill book `stockDaily: 0` as a
+ * pinned literal and publish the falsifiable read beside it as `stockLegProbeUsd`, stamping
+ * `stockLegBasis` to say so ("the STOCK leg is booked 0 and made falsifiable via the probe").
+ * On such a row the literal cannot carry evidence — `admin` has posted `stockDaily: 0` on 16/16
+ * post-onset sessions while its own probe read up to $197.36 — so the census reads the
+ * operand the writer declared falsifiable. A row with no `stockLegBasis` was written by the
+ * demo engine and its `stockDaily` is the measured figure; it keeps grading as before.
+ *
+ * The mechanism this makes reachable is the STALE-OPENING-ANCHOR producer of TRA-2630 Defect
+ * B (TRA-4003): if the shaper's `prevDate` slips a session, `openingEquity[t]` is
+ * `closingEquity[t-2]` and the probe absorbs the whole prior session —
+ * `probe[t] = residual[t] + optionsDaily[t-1] + markDelta[t-1] + flow[t-1]` — which on a clean
+ * options-only prior day is exactly `round(probe[t],2) === round(optionsDaily[t-1],2)`, the
+ * trip shape, on the operand the live writer actually produces. The counter-reset producer
+ * cannot reach a live row (the shaper reads no counter), which is why keying on the literal
+ * had no failing state.
+ *
+ * A stamped row whose probe is not a finite number is `probe_not_measured` — the writer could
+ * not form the probe (an equity endpoint or the cash flow was NOT MEASURED) — and is the
+ * absent-operand case: `value: null`, never `0`.
+ */
+export function stockLegOperand(row: Record<string, unknown>): {
+  value: number | null;
+  source: StockLegOperandSource;
+} {
+  const stamped = typeof row.stockLegBasis === 'string' && row.stockLegBasis !== '';
+  if (!stamped) return { value: num(row.stockDaily), source: 'stockDaily' };
+  const probe = num(row.stockLegProbeUsd);
+  return probe === null
+    ? { value: null, source: 'probe_not_measured' }
+    : { value: probe, source: 'probe' };
 }
 
 /**
  * TRA-3450 — recompute, per live book, how many pairs the lag tripwire could possibly have
  * fired on since that book's live-options onset.
  *
- * A pair `(t-1, t)` is TRIP-CAPABLE when `stockDaily[t] != 0` and `optionsDaily[t-1] != 0`:
- * those are the two operands of `round(stockDaily[t],2) === round(optionsDaily[t-1],2)`, and
- * with either at zero the predicate has no failing state on that pair. POST-ONSET adds
+ * A pair `(t-1, t)` is TRIP-CAPABLE when the stock-leg operand of row `t` is non-zero and
+ * `optionsDaily[t-1] != 0`: those are the two operands of
+ * `round(stockLeg[t],2) === round(optionsDaily[t-1],2)`, and with either at zero the
+ * predicate has no failing state on that pair. POST-ONSET adds
  * `date[t] >= liveOptionsOnsetDate` — a trip before the book held any live option cannot be a
  * real-money NAV overstatement, which is the same onset scoping TRA-2831 forced on the credit
  * metrics after 100% of a "live" numerator turned out to predate onset.
+ *
+ * TRA-4014 — the stock-leg operand is resolved per row by {@link stockLegOperand}. "Non-zero"
+ * is the cent tolerance on a measured `stockDaily` and the writer's $1 dust floor
+ * ({@link STOCK_LEG_PROBE_DUST_USD}) on a probe: a sub-$1 probe is the writer's own
+ * `zero-probe-agrees` and must not arm the denominator on fee dust. The trip comparison
+ * itself stays at the cent on both.
  *
  * Returns `null` when `engines` is unreadable — the caller must grade that `blind`, never
  * vacuous. "The census said zero" and "there was no census" are not the same reading, which is
@@ -762,27 +840,44 @@ export function computeLiveLagDenominators(payload: unknown): LiveNavBookDenomin
     // TRA-3952 — counted over EVERY row (the pair loop below starts at 1), so a lone first
     // row carrying options P&L is not missed by the scope guard.
     let optionsPnlRows = 0;
+    // TRA-4014 — operand provenance, post-onset rows only (the denominator's own cohort).
+    const postOnsetStockLegOperand = { stockDaily: 0, probe: 0, probeNotMeasured: 0 };
+    let postOnsetProbeDustPairs = 0;
+    const isPostOnset = (d: Record<string, unknown>): boolean => {
+      const date = typeof d.date === 'string' ? d.date : null;
+      // No onset ⇒ no post-onset row can exist. ISO dates compare correctly as strings.
+      return onsetDate !== null && date !== null && date >= onsetDate;
+    };
     for (const d of days) {
       const o = num(d.optionsDaily);
       if (o !== null && Math.abs(o) > CENT_TOLERANCE_USD) optionsPnlRows += 1;
+      if (isPostOnset(d)) {
+        const src = stockLegOperand(d).source;
+        if (src === 'stockDaily') postOnsetStockLegOperand.stockDaily += 1;
+        else if (src === 'probe') postOnsetStockLegOperand.probe += 1;
+        else postOnsetStockLegOperand.probeNotMeasured += 1;
+      }
     }
     for (let i = 1; i < days.length; i += 1) {
       const cur = days[i]!;
       const prev = days[i - 1]!;
       totalPairs += 1;
-      const stock = num(cur.stockDaily);
+      const { value: stock, source } = stockLegOperand(cur);
       const priorOptions = num(prev.optionsDaily);
       // A row missing either operand is NOT trip-capable and is NOT counted as evidence —
       // it is the absent-field case, and counting it would inflate the very denominator
       // whose emptiness is the finding.
       if (stock === null || priorOptions === null) continue;
-      if (Math.abs(stock) <= CENT_TOLERANCE_USD || Math.abs(priorOptions) <= CENT_TOLERANCE_USD) {
+      if (Math.abs(priorOptions) <= CENT_TOLERANCE_USD) continue;
+      // TRA-4014 — the "non-zero stock leg" floor depends on which field supplied it: the
+      // writer's own $1 inertness floor on a probe, the cent on a measured `stockDaily`.
+      const stockFloor = source === 'probe' ? STOCK_LEG_PROBE_DUST_USD : CENT_TOLERANCE_USD;
+      if (Math.abs(stock) <= stockFloor) {
+        if (source === 'probe' && isPostOnset(cur)) postOnsetProbeDustPairs += 1;
         continue;
       }
       tripCapablePairs += 1;
-      const date = typeof cur.date === 'string' ? cur.date : null;
-      // No onset ⇒ no post-onset pair can exist. ISO dates compare correctly as strings.
-      if (onsetDate === null || date === null || date < onsetDate) continue;
+      if (!isPostOnset(cur)) continue;
       postOnsetTripCapablePairs += 1;
       if (Math.abs(stock - priorOptions) <= CENT_TOLERANCE_USD) postOnsetTripPairs += 1;
     }
@@ -801,6 +896,8 @@ export function computeLiveLagDenominators(payload: unknown): LiveNavBookDenomin
       postOnsetTripCapablePairs,
       postOnsetTripPairs,
       postOnsetEligiblePairs,
+      postOnsetStockLegOperand,
+      postOnsetProbeDustPairs,
       // TRA-4000 — `optionsPnlRows == 0` ⇒ no pair has a non-zero prior `optionsDaily` ⇒
       // `postOnsetTripCapablePairs == 0`, so an `onset_unrealized` book is vacuous BY
       // CONSTRUCTION and the reason names the window rather than the generic zero.
@@ -995,6 +1092,23 @@ export function gradeLiveNavTripwirePayload(payload: unknown): LiveNavGrade {
   // A census we could not take is BLIND, never vacuous — see `computeLiveLagDenominators`.
   else if (denominators === null) lagDenominator = blind('engines_unreadable');
   else if (denominators.length === 0) lagDenominator = blind('empty_live_cohort');
+  // A post-onset trip that the served scalar did NOT report is a contradiction between the
+  // endpoint's verdict and its own day rows. Louder than vacuous: it means the tripwire had
+  // something to grade and graded it wrong.
+  //
+  // TRA-4014 — this branch is now also the ONLY path a live-book trip can take. The served
+  // scalar (`priorOptionsLagOk`) still compares the pinned `stockDaily` literal, which on a
+  // shaper-written row is `0` forever, so a stale-anchor trip on the PROBE operand is one the
+  // scalar structurally cannot report. `alarm` keys on status, not axis kind (TRA-3711), so
+  // the `fail` here reaches the trip channel.
+  //
+  // It sits ABOVE the vacuous branches on purpose. It used to sit below them, which meant a
+  // real trip on one book was reported as `vacuous` whenever a SIBLING book had an empty
+  // denominator — and a sibling at zero is the live fleet's steady state (v0nni today). The
+  // module's own lattice is `fail` > `blind` > `vacuous`; a branch order that let a coverage
+  // reading on book B swallow a trip on book A inverted it.
+  else if (gradedBooks.some((b) => b.postOnsetTripPairs > 0) && lagRaw.value !== false)
+    lagDenominator = fail(`post_onset_trip_not_reported_by_scalar${excludedSuffix}`);
   else if (suspectBooks.length > 0)
     lagDenominator = blind(`onset_derivation_suspect:${names(suspectBooks)}${excludedSuffix}`);
   else if (gateBooks.length === 0)
@@ -1003,11 +1117,6 @@ export function gradeLiveNavTripwirePayload(payload: unknown): LiveNavGrade {
     lagDenominator = vacuous(
       `no_post_onset_trip_capable_pairs:${emptyBooks.map((b) => `${b.username}=${b.vacuousReason}`).join(',')}${excludedSuffix}`,
     );
-  // A post-onset trip that the served scalar did NOT report is a contradiction between the
-  // endpoint's verdict and its own day rows. Louder than vacuous: it means the tripwire had
-  // something to grade and graded it wrong.
-  else if (gradedBooks.some((b) => b.postOnsetTripPairs > 0) && lagRaw.value !== false)
-    lagDenominator = fail(`post_onset_trip_not_reported_by_scalar${excludedSuffix}`);
   else lagDenominator = pass();
 
   const lagDenominatorScope: LiveNavLagDenominatorScope = {
