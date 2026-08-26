@@ -651,7 +651,7 @@ describe('TRA-3450 — the denominator, and why a `true` scalar is not a pass', 
     expect(g.axes.lagDenominator.reason).toContain('admin=no_post_onset_trip_capable_pairs');
     // TRA-3952 — v0nni is outside the gate now, and the reason string still NAMES it.
     expect(g.axes.lagDenominator.reason).toContain('excluded_no_onset:v0nni');
-    expect(g.lagDenominatorScope).toEqual({ graded: ['admin'], excludedNoOnset: ['v0nni'], suspectOnset: [] });
+    expect(g.lagDenominatorScope).toEqual({ graded: ['admin'], excludedNoOnset: ['v0nni'], suspectOnset: [], onsetUnrealized: [] });
   });
 
   it('grades CLEAN only when every live book has a post-onset trip-capable pair', () => {
@@ -689,8 +689,11 @@ describe('TRA-3450 — the denominator, and why a `true` scalar is not a pass', 
     );
     expect(g.observed.postOnsetTripCapablePairs).toBe(1); // the sum is non-zero...
     expect(g.axes.lagDenominator.status).toBe('vacuous'); // ...and it still does not pass
+    // TRA-4000 — this fixture (onset stamped, every options row zero) IS the transitional
+    // window, so the per-book reason now names it. The status is unchanged: the window holds
+    // the axis exactly as a graded book at zero did.
     expect(g.axes.lagDenominator.reason).toBe(
-      'no_post_onset_trip_capable_pairs:v0nni=no_post_onset_trip_capable_pairs',
+      'no_post_onset_trip_capable_pairs:v0nni=onset_present_no_realized_options;onset_unrealized:v0nni',
     );
     expect(g.verdict).toBe('vacuous');
   });
@@ -1267,7 +1270,7 @@ describe('TRA-3952 — the ANY-gate runs over books WITH an onset; the rest are 
     expect(g.observed.postOnsetTripCapablePairs).toBe(1);
     expect(g.verdict).toBe('clean');
     // ...and the excluded book is on the row by name, not averaged away.
-    expect(g.lagDenominatorScope).toEqual({ graded: ['admin'], excludedNoOnset: ['v0nni'], suspectOnset: [] });
+    expect(g.lagDenominatorScope).toEqual({ graded: ['admin'], excludedNoOnset: ['v0nni'], suspectOnset: [], onsetUnrealized: [] });
     const v0nni = g.lagDenominatorBooks.find((b) => b.username === 'v0nni')!;
     expect(v0nni.lagScope).toBe('excluded_no_onset');
     expect(v0nni.optionsPnlRows).toBe(0);
@@ -1304,7 +1307,7 @@ describe('TRA-3952 — the ANY-gate runs over books WITH an onset; the rest are 
     expect(g.verdict).toBe('blind');
     expect(g.alarm).toBe(false); // a hole in the instrument, not a trip
     expect(g.degraded).toBe(true);
-    expect(g.lagDenominatorScope).toEqual({ graded: ['admin'], excludedNoOnset: [], suspectOnset: ['v0nni'] });
+    expect(g.lagDenominatorScope).toEqual({ graded: ['admin'], excludedNoOnset: [], suspectOnset: ['v0nni'], onsetUnrealized: [] });
     expect(g.lagDenominatorBooks.find((b) => b.username === 'v0nni')!.optionsPnlRows).toBe(1);
   });
 
@@ -1373,7 +1376,7 @@ describe('TRA-3952 — the ANY-gate runs over books WITH an onset; the rest are 
         now: T('2026-08-12'),
       });
       const s = summarizeLiveNavTripwire(1, '2026-08-12');
-      expect(s.vacuity.latestScope).toEqual({ graded: ['admin'], excludedNoOnset: ['v0nni'], suspectOnset: [] });
+      expect(s.vacuity.latestScope).toEqual({ graded: ['admin'], excludedNoOnset: ['v0nni'], suspectOnset: [], onsetUnrealized: [] });
       expect(s.byDay[0]!.verdict).toBe('clean');
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -1882,5 +1885,192 @@ describe('TRA-4001 — observation-start marker, DUE sessions, and the NOT MEASU
   it('the marker etDay follows the row etDay convention (ET, not UTC)', () => {
     // A marker written at 2026-08-26T03:00Z is 2026-08-25 23:00 ET — same ET day as the last row.
     expect(liveNavEtDay(POST_DEPLOY_BOOT)).toBe('2026-08-25');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-4000 — an onset stamped from an OPEN position is not realized options P&L.
+//
+// `liveOptionsOnsetDate` keys on the first live option's `openTs`; `optionsPnlRows` counts
+// sessions with REALIZED options P&L. Between a book's first live open and its first live
+// close the two disagree, and on 2026-08-25 `v0nni` served `lagScope: "graded"` with
+// `optionsPnlRows: 0` — the TRA-3952 membership test ("in excludedNoOnset iff
+// optionsPnlRows == 0") violated in the direction the branch table did not cover, while the
+// axis said nothing. The next session's trade walked the book out of the state; nothing in
+// the code did. These tests pin the window as its own named scope value and pin that naming
+// it cannot move the axis.
+describe('TRA-4000 — onset present + nothing realized is `onset_unrealized`, named and in-gate', () => {
+  const T = (etDay: string): number => Date.parse(`${etDay}T21:20:00-04:00`);
+  /** A never-traded live book, for the mixed-cohort case. */
+  const V0NNI_NO_ONSET_FIXTURE = {
+    username: 'quiet',
+    mode: 'live',
+    liveOptionsOnsetDate: null,
+    days: V0NNI_LIVE_DAYS,
+    priorOptionsLagOk: true,
+    priorOptionsLagEligibleDates: [],
+  };
+  const ADMIN_TRIP_CAPABLE = {
+    username: 'admin',
+    mode: 'live',
+    liveOptionsOnsetDate: '2026-07-30',
+    days: TRIP_CAPABLE_DAYS,
+    priorOptionsLagOk: true,
+    priorOptionsLagEligibleDates: ['2026-08-12'],
+  };
+  /**
+   * `v0nni` as served on 2026-08-25T18:44Z (build 07cc4ba43af6): onset 2026-08-24 stamped
+   * from two OPEN lots ($177.50 at risk), every row's `optionsDaily` zero, `eodCombined`
+   * -14.44 on the 24th from the stock-leg probe. Reduced to the fields this gate reads.
+   */
+  const V0NNI_ONSET_UNREALIZED = {
+    username: 'v0nni',
+    mode: 'live',
+    liveOptionsOnsetDate: '2026-08-24',
+    days: [
+      { date: '2026-08-21', stockDaily: 0, optionsDaily: 0 },
+      { date: '2026-08-24', stockDaily: 0, optionsDaily: 0 },
+    ],
+    priorOptionsLagOk: null,
+    priorOptionsLagEligibleDates: [],
+  };
+  /** The same book one session later (2026-08-26T02:07Z read): first live close, -5 realized. */
+  const V0NNI_REALIZED = {
+    ...V0NNI_ONSET_UNREALIZED,
+    days: [...V0NNI_ONSET_UNREALIZED.days, { date: '2026-08-25', stockDaily: 0, optionsDaily: -5 }],
+  };
+
+  it('the 2026-08-25 state is `onset_unrealized`, not `graded`, and reads so from the scope alone', () => {
+    const g = gradeLiveNavTripwirePayload(coveredPayload({ engines: [ADMIN_TRIP_CAPABLE, V0NNI_ONSET_UNREALIZED] }));
+    const v0nni = g.lagDenominatorBooks.find((b) => b.username === 'v0nni')!;
+    expect(v0nni.onsetDate).toBe('2026-08-24');
+    expect(v0nni.optionsPnlRows).toBe(0);
+    expect(v0nni.lagScope).toBe('onset_unrealized');
+    expect(v0nni.vacuousReason).toBe('onset_present_no_realized_options');
+    expect(v0nni.postOnsetTripCapablePairs).toBe(0);
+    // Three states, three readings, from the scope record — no re-derivation by hand.
+    expect(g.lagDenominatorScope).toEqual({
+      graded: ['admin'],
+      excludedNoOnset: [],
+      suspectOnset: [],
+      onsetUnrealized: ['v0nni'],
+    });
+  });
+
+  it('naming the window does NOT move the axis: it holds vacuous, exactly as `graded`-at-zero did', () => {
+    // admin alone would earn `pass` (one honest trip-capable pair, no trip). v0nni in the
+    // transitional window must still hold the axis — there is live money at risk in an open
+    // option — and the reason must name BOTH the per-book window and the bucket.
+    const g = gradeLiveNavTripwirePayload(coveredPayload({ engines: [ADMIN_TRIP_CAPABLE, V0NNI_ONSET_UNREALIZED] }));
+    expect(g.axes.lagDenominator.status).toBe('vacuous');
+    expect(g.axes.lagDenominator.reason).toBe(
+      'no_post_onset_trip_capable_pairs:v0nni=onset_present_no_realized_options;onset_unrealized:v0nni',
+    );
+    expect(g.verdict).toBe('vacuous');
+    expect(g.alarm).toBe(false);
+  });
+
+  it('the first live close walks the book into `graded` — the 2026-08-26 reading, unchanged by this fix', () => {
+    const g = gradeLiveNavTripwirePayload(coveredPayload({ engines: [ADMIN_TRIP_CAPABLE, V0NNI_REALIZED] }));
+    const v0nni = g.lagDenominatorBooks.find((b) => b.username === 'v0nni')!;
+    expect(v0nni.optionsPnlRows).toBe(1);
+    expect(v0nni.lagScope).toBe('graded');
+    // Realized on the 25th, but no session AFTER it with a non-zero stock leg yet: the generic
+    // zero, not the transitional window.
+    expect(v0nni.vacuousReason).toBe('no_post_onset_trip_capable_pairs');
+    expect(g.lagDenominatorScope).toEqual({
+      graded: ['admin', 'v0nni'],
+      excludedNoOnset: [],
+      suspectOnset: [],
+      onsetUnrealized: [],
+    });
+    expect(g.axes.lagDenominator.reason).toBe(
+      'no_post_onset_trip_capable_pairs:v0nni=no_post_onset_trip_capable_pairs',
+    );
+  });
+
+  it('an all-transitional live cohort is still vacuous, never pass, and the bucket rides the reason', () => {
+    const g = gradeLiveNavTripwirePayload(
+      coveredPayload({ engines: [{ ...V0NNI_ONSET_UNREALIZED, username: 'admin' }, V0NNI_ONSET_UNREALIZED] }),
+    );
+    expect(g.axes.lagDenominator.status).toBe('vacuous');
+    expect(g.axes.lagDenominator.reason).toBe(
+      'no_post_onset_trip_capable_pairs:admin=onset_present_no_realized_options,v0nni=onset_present_no_realized_options;onset_unrealized:admin,v0nni',
+    );
+    expect(g.lagDenominatorScope.graded).toEqual([]);
+  });
+
+  it('a suspect book still outranks the window, and both buckets are named on the blind reason', () => {
+    const suspect = {
+      ...V0NNI_ONSET_UNREALIZED,
+      username: 'ghost',
+      liveOptionsOnsetDate: null,
+      days: [{ date: '2026-08-24', stockDaily: 0, optionsDaily: -16 }],
+    };
+    const g = gradeLiveNavTripwirePayload(
+      coveredPayload({ engines: [ADMIN_TRIP_CAPABLE, V0NNI_ONSET_UNREALIZED, { ...V0NNI_NO_ONSET_FIXTURE }, suspect] }),
+    );
+    expect(g.axes.lagDenominator.status).toBe('blind');
+    expect(g.axes.lagDenominator.reason).toBe(
+      'onset_derivation_suspect:ghost;excluded_no_onset:quiet;onset_unrealized:v0nni',
+    );
+  });
+
+  it('INVARIANT — `graded` implies onset present AND optionsPnlRows > 0, over every cell of (onset?, realized?)', () => {
+    // The four scope values are exhaustive and disjoint over the two operands. This is the
+    // assertion TRA-4000 asked for, stated as a property rather than a fixture: no input can
+    // put a zero-realized book in `graded`, and no input can leave a book unnamed.
+    const cells: Array<{ onset: string | null; optionsDaily: number; scope: string }> = [
+      { onset: '2026-08-24', optionsDaily: -5, scope: 'graded' },
+      { onset: '2026-08-24', optionsDaily: 0, scope: 'onset_unrealized' },
+      { onset: null, optionsDaily: -5, scope: 'suspect_onset_derivation' },
+      { onset: null, optionsDaily: 0, scope: 'excluded_no_onset' },
+      // Dust under the cent tolerance is not realized P&L, in either onset state.
+      { onset: '2026-08-24', optionsDaily: 0.004, scope: 'onset_unrealized' },
+      { onset: null, optionsDaily: 0.004, scope: 'excluded_no_onset' },
+    ];
+    for (const cell of cells) {
+      const rows = computeLiveLagDenominators({
+        engines: [
+          {
+            username: 'x',
+            mode: 'live',
+            liveOptionsOnsetDate: cell.onset,
+            days: [{ date: '2026-08-24', stockDaily: 0, optionsDaily: cell.optionsDaily }],
+          },
+        ],
+      })!;
+      const b = rows[0]!;
+      expect(b.lagScope, JSON.stringify(cell)).toBe(cell.scope);
+      if (b.lagScope === 'graded') {
+        expect(b.onsetDate).not.toBeNull();
+        expect(b.optionsPnlRows).toBeGreaterThan(0);
+      }
+      if (b.lagScope === 'onset_unrealized') {
+        expect(b.onsetDate).not.toBeNull();
+        expect(b.optionsPnlRows).toBe(0);
+        // ...and it is vacuous BY CONSTRUCTION, so it can never be the book that earns `pass`.
+        expect(b.postOnsetTripCapablePairs).toBe(0);
+        expect(b.vacuousReason).toBe('onset_present_no_realized_options');
+      }
+    }
+  });
+
+  it('the health summary carries the transitional bucket on the latest row', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'live-nav-4000-'));
+    try {
+      hydrateLiveNavTripwireFromDisk(dir, T('2026-08-13'));
+      recordLiveNavTripwireAssertion({
+        grade: gradeLiveNavTripwirePayload(coveredPayload({ engines: [ADMIN_TRIP_CAPABLE, V0NNI_ONSET_UNREALIZED] })),
+        source: 'served',
+        now: T('2026-08-12'),
+      });
+      const s = summarizeLiveNavTripwire(1, '2026-08-12');
+      expect(s.vacuity.latestScope?.onsetUnrealized).toEqual(['v0nni']);
+      expect(s.vacuity.vacuousBooks).toEqual([{ username: 'v0nni', reason: 'onset_present_no_realized_options' }]);
+      expect(s.byDay[0]!.verdict).toBe('vacuous');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
