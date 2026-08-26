@@ -4,12 +4,13 @@ import type {
   ExportCoverageSource,
   ExportEntryPriceBasis,
   ExportFilters,
+  ExportJournalPremiumBasis,
   ExportMarket,
   ExportMarketCoverage,
   ExportMoneyRestatement,
   ExportTradeRow,
 } from './export.js';
-import { applyMoneyRestatement, formatHoldDuration } from './export.js';
+import { applyMoneyRestatement, formatHoldDuration, premiumRBasisLabel } from './export.js';
 import type { OptionTradeJournalRecord } from './option-trade-journal.js';
 // TRA-3930 — the two markers that tell a REPAIR-authored record of a close from
 // the engine's own, used to pick which of two records of ONE close is published.
@@ -484,7 +485,13 @@ export function rowFromJournalRecord(r: OptionTradeJournalRecord): ExportTradeRo
     // figure, so `pnl_r == net_pnl_usd / premium_basis_usd` reconciles here
     // exactly as it does on a book row. Null — never 0 — when the record states
     // no basis (a reconstructed lot; then `realizedR` is not finite either).
-    pnl_r_basis: 'premium-open-mark',
+    //
+    // TRA-4035 — the label is read off the record's OWN `atRiskBasis` (TRA-4028),
+    // not asserted from the figure being present: BAC `6bbc5d17` was restated
+    // onto its $117 ledger fill and read `pnl_r -0.026` (÷117, correct) under
+    // `'premium-open-mark'` (wrong — $117 is the 1.17 FILL). `'mark'` and ABSENT
+    // (pre-TRA-4028 rows, engine rows whose open IS the mark) keep the old label.
+    pnl_r_basis: premiumRBasisLabel(r.atRiskBasis),
     premium_basis_usd: isFiniteNumber(r.atRiskUsd) && r.atRiskUsd > 0 ? r.atRiskUsd : null,
     source: 'journal',
     pnl_basis: restated ? 'broker-fill' : 'book',
@@ -671,6 +678,9 @@ function restatementFromRecord(r: OptionTradeJournalRecord): ExportMoneyRestatem
     // journal's open-mark `atRiskUsd`, unchanged by the restatement
     // (`OptionTradeCloseBasis.realizedR` — "same denominator as before").
     premium_basis_usd: mapped.premium_basis_usd ?? null,
+    // TRA-4035 — and what that basis IS, so the overlay labels the book row the
+    // way the journal labels itself (`atRiskBasis 'fill'` ⇒ `'premium-fill'`).
+    pnl_r_basis: mapped.pnl_r_basis,
   };
 }
 
@@ -740,6 +750,11 @@ export function collectJournalMoneyRestatements(
  * true. The reconstructed-lot `atRiskUsd` miss on `BAC260925C00063000` is a
  * reference-row defect with its own child and is not papered over here.
  *
+ * TRA-4035 — each entry carries the record's `atRiskBasis` (TRA-4028) beside
+ * the figure, so `rowFromOption` labels the book row by what the twin SAYS its
+ * basis is. A record without the field maps to `atRiskBasis: null` (instant
+ * unknown ⇒ `'premium-open-mark'`, the pre-ticket label), never to `'fill'`.
+ *
  * ⚠️ Same precondition as the sibling collectors — `rows` must ALREADY be
  * book-scoped by `journalRowsForBook`, or one account's open mark lands on
  * another's row.
@@ -747,14 +762,19 @@ export function collectJournalMoneyRestatements(
 export function collectJournalPremiumBases(
   rows: readonly OptionTradeJournalRecord[],
   bookJournalIds: ReadonlySet<string>,
-): Map<string, number> {
-  const out = new Map<string, number>();
+): Map<string, ExportJournalPremiumBasis> {
+  const out = new Map<string, ExportJournalPremiumBasis>();
   for (const r of rows) {
     if (!bookJournalIds.has(r.id)) continue;
     if (!isFiniteNumber(r.atRiskUsd) || r.atRiskUsd <= 0) continue;
     // First finite basis per id wins. The journal folds one record per id, so
     // a second hit is the same record seen twice, never a competing figure.
-    if (!out.has(r.id)) out.set(r.id, r.atRiskUsd);
+    if (!out.has(r.id)) {
+      out.set(r.id, {
+        atRiskUsd: r.atRiskUsd,
+        atRiskBasis: r.atRiskBasis === 'fill' || r.atRiskBasis === 'mark' ? r.atRiskBasis : null,
+      });
+    }
   }
   return out;
 }

@@ -9,6 +9,7 @@ import {
   applyMoneyRestatement,
   optionPremiumRiskUsd,
   optionStopRiskUsd,
+  premiumRBasisLabel,
   EXPORT_COLUMNS,
   type ExportMoneyRestatement,
 } from './export.js';
@@ -370,7 +371,7 @@ describe('TRA-4027 AC1 — a book row with a journal twin divides by the twin\'s
     const opt = nvts();
     const twin = journalTwin(opt, { atRiskUsd: NVTS_MARK_BASIS, realizedR: -74 / NVTS_MARK_BASIS, entryMarkUsd: 1.395 });
     const bases = collectJournalPremiumBases([twin], new Set([opt.id]));
-    expect(bases.get(opt.id)).toBe(NVTS_MARK_BASIS);
+    expect(bases.get(opt.id)?.atRiskUsd).toBe(NVTS_MARK_BASIS);
     // BEFORE the archive: book-served, twin still in the journal.
     const before = buildRows({ optionsClosed: [opt], optionPremiumBases: bases })[0];
     // AFTER the archive: the book copy is gone; the journal serves the row.
@@ -399,7 +400,7 @@ describe('TRA-4027 AC1 — a book row with a journal twin divides by the twin\'s
   it('a twin still `OPEN` in the journal (close write queued) already carries the open-mark basis and is joined', () => {
     const opt = nvts();
     const openTwin = journalTwin(opt, { atRiskUsd: NVTS_MARK_BASIS, outcome: 'OPEN', closeTs: undefined, realizedPnlUsd: undefined, realizedR: undefined } as Partial<OptionTradeJournalRecord>);
-    expect(collectJournalPremiumBases([openTwin], new Set([opt.id])).get(opt.id)).toBe(NVTS_MARK_BASIS);
+    expect(collectJournalPremiumBases([openTwin], new Set([opt.id])).get(opt.id)?.atRiskUsd).toBe(NVTS_MARK_BASIS);
   });
 
   it('the collector is scoped to the book\'s ids and skips a record with no finite positive basis', () => {
@@ -512,5 +513,102 @@ describe('TRA-4027 AC3 — `entry_price` stays the FILL; `premium_basis_usd` car
     expect(EXPORT_COLUMNS).not.toContain('premium_basis_usd');
     expect(EXPORT_COLUMNS).not.toContain('pnl_r_basis');
     expect(toCsv([]).split('\r\n')[0].split(',')).not.toContain('premium_basis_usd');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-4035 — the label keyed on the PRESENCE of the twin's `atRiskUsd`, not on
+// what the journal SAYS that figure is. TRA-4028 made the basis self-describing
+// (`atRiskBasis: 'fill' | 'mark'`) and restated BAC `6bbc5d17` onto its $117
+// ledger fill; read 2026-08-26T08:56Z off bqb1 `6b0cbb29`: journal `atRiskUsd
+// 117`, `atRiskBasis 'fill'`, `realizedR -0.0256` — export `pnl_r -0.026`
+// (correct), `premium_basis_usd 117` (correct), `pnl_r_basis
+// 'premium-open-mark'` (WRONG: $117 is the 1.17 FILL, not any mark).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The restated BAC desk lot as the journal holds it after the TRA-4028 AC3 apply. */
+function bacFillTwin(over: Partial<OptionTradeJournalRecord> = {}): OptionTradeJournalRecord {
+  return journalTwin(bac({ id: '6bbc5d17', premiumPaid: 1.17, contracts: 1, pnl: -3 }), {
+    id: '6bbc5d17',
+    structure: 'tradier_import',
+    atRiskUsd: 117,
+    atRiskBasis: 'fill',
+    atRiskProvenance: 'ledger_fill:history_import',
+    realizedR: -3 / 117,
+    entryMarkUsd: undefined,
+    ...over,
+  } as Partial<OptionTradeJournalRecord>);
+}
+
+describe('TRA-4035 AC1/AC2 — `pnl_r_basis` on a journal row names the instant the journal STATES, not the presence of a figure', () => {
+  it("a twin with `atRiskBasis: 'fill'` (BAC 6bbc5d17 after TRA-4028) labels `'premium-fill'`; figure and R untouched", () => {
+    const row = rowFromJournalRecord(bacFillTwin());
+    expect(row.pnl_r_basis).toBe('premium-fill');
+    // Non-goals held: neither the divisor nor the R moves with the label.
+    expect(row.premium_basis_usd).toBe(117);
+    expect(row.pnl_r).toBeCloseTo(-0.026, 3);
+    expect(row.pnl_r).toBeCloseTo((row.net_pnl_usd as number) / (row.premium_basis_usd as number), 3);
+  });
+
+  it("a twin with `atRiskBasis: 'mark'` (an import the ledger could not attribute) labels `'premium-open-mark'`", () => {
+    const row = rowFromJournalRecord(bacFillTwin({ atRiskUsd: 141, atRiskBasis: 'mark', atRiskProvenance: 'mark:remainder_excess', realizedR: -3 / 141 }));
+    expect(row.pnl_r_basis).toBe('premium-open-mark');
+    expect(row.premium_basis_usd).toBe(141);
+  });
+
+  it('a twin WITHOUT the field (pre-TRA-4028 row, engine `single_leg_otm` row) keeps `\'premium-open-mark\'` — absent is unknown, never fill', () => {
+    const engine = journalTwin(rig());
+    expect(engine.atRiskBasis).toBeUndefined();
+    expect(rowFromJournalRecord(engine).pnl_r_basis).toBe('premium-open-mark');
+    // …and an explicit garbage value is treated as absent, not as fill.
+    expect(rowFromJournalRecord(bacFillTwin({ atRiskBasis: 'ledger' as unknown as 'fill' })).pnl_r_basis).toBe('premium-open-mark');
+  });
+
+  it('the helper is the single source of the label', () => {
+    expect(premiumRBasisLabel('fill')).toBe('premium-fill');
+    expect(premiumRBasisLabel('mark')).toBe('premium-open-mark');
+    expect(premiumRBasisLabel(null)).toBe('premium-open-mark');
+    expect(premiumRBasisLabel(undefined)).toBe('premium-open-mark');
+  });
+});
+
+describe('TRA-4035 — the same fill-basis twin, read through the BOOK-served path (pre-archive), agrees with its journal-served row', () => {
+  it('`collectJournalPremiumBases` carries `atRiskBasis` and `rowFromOption` labels off it', () => {
+    const opt = bac({ id: '6bbc5d17', premiumPaid: 1.17, contracts: 1, pnl: -3 });
+    const twin = bacFillTwin();
+    const bases = collectJournalPremiumBases([twin], new Set([opt.id]));
+    expect(bases.get(opt.id)).toEqual({ atRiskUsd: 117, atRiskBasis: 'fill' });
+    const book = buildRows({ optionsClosed: [opt], optionPremiumBases: bases })[0];
+    const journal = rowFromJournalRecord(twin);
+    expect(book.pnl_r_basis).toBe('premium-fill');
+    expect(journal.pnl_r_basis).toBe('premium-fill');
+    expect(book.pnl_r).toBe(journal.pnl_r);
+    expect(book.premium_basis_usd).toBe(117);
+    // NEGATIVE CONTROL — the same twin without the field still reads open-mark
+    // on the book side, so the label above is read off the field and not off
+    // the twin's presence (the pre-ticket rule).
+    const untagged = collectJournalPremiumBases([{ ...twin, atRiskBasis: undefined }], new Set([opt.id]));
+    expect(untagged.get(opt.id)).toEqual({ atRiskUsd: 117, atRiskBasis: null });
+    expect(buildRows({ optionsClosed: [opt], optionPremiumBases: untagged })[0].pnl_r_basis).toBe('premium-open-mark');
+    // …and a bare number (a caller that predates the label) reads the same.
+    expect(rowFromOption(opt, 117).pnl_r_basis).toBe('premium-open-mark');
+  });
+
+  it('a broker-fill RESTATEMENT of a fill-basis twin overlays `\'premium-fill\'`; one that names no label keeps the old default', () => {
+    const opt = bac({ id: '6bbc5d17', premiumPaid: 1.17, contracts: 1, pnl: -3 });
+    const restatement: ExportMoneyRestatement = {
+      gross_pnl_usd: -2.9, fees_usd: 0.1, net_pnl_usd: -3, pnl_r: -0.026,
+      exit_price: 1.14, entry_price: 1.17, broker_order_id: 'ord-bac', premium_basis_usd: 117, pnl_r_basis: 'premium-fill',
+    };
+    const row = buildRows({
+      optionsClosed: [opt],
+      optionPremiumBases: new Map([[opt.id, { atRiskUsd: 117, atRiskBasis: 'fill' as const }]]),
+      optionMoneyRestatements: new Map([[opt.id, restatement]]),
+    })[0];
+    expect(row.pnl_basis).toBe('broker-fill');
+    expect(row.pnl_r_basis).toBe('premium-fill');
+    expect(row.premium_basis_usd).toBe(117);
+    const legacy = applyMoneyRestatement(rowFromOption(opt, 117), { ...restatement, pnl_r_basis: undefined });
+    expect(legacy.pnl_r_basis).toBe('premium-open-mark');
   });
 });

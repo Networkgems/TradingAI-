@@ -124,6 +124,59 @@ export type ExportPnlBasis = 'book' | 'broker-fill';
 export type ExportPnlRBasis = 'premium-open-mark' | 'premium-fill' | 'stop-distance';
 
 /**
+ * TRA-4035 — a journal twin's premium basis WITH its instant, as the export
+ * consumes it. `atRiskUsd` is the divisor (`OptionTradeJournalRecord.atRiskUsd`);
+ * `atRiskBasis` is the journal's own statement of what that dollar figure IS
+ * (TRA-4028): `'fill'` = the lot's attributable ledger fill, `'mark'` = the
+ * figure the book row carried at the write, `null` = the record predates the
+ * field or is an engine-opened row (whose open IS the scanner mark, TRA-4027).
+ *
+ * A bare `number` is accepted everywhere this is consumed, for the hand-built
+ * fixtures and callers that predate the label; it reads as "instant unknown"
+ * and labels `'premium-open-mark'` exactly as before this ticket.
+ */
+export interface ExportJournalPremiumBasis {
+  atRiskUsd: number;
+  atRiskBasis: 'fill' | 'mark' | null;
+}
+
+/**
+ * TRA-4035 — the `pnl_r_basis` label for an R divided by a JOURNAL `atRiskUsd`,
+ * keyed on what the journal says that figure is — not on whether the figure is
+ * present. Before this ticket every journal-basis row was labelled
+ * `'premium-open-mark'` on the strength of `atRiskUsd` being finite, which was
+ * true only while the journal could not say otherwise. TRA-4028 made the basis
+ * self-describing and restated BAC `6bbc5d17` onto its $117 ledger fill
+ * (`atRiskBasis: 'fill'`); the export then published `pnl_r -0.026` (correct,
+ * ÷117) under `'premium-open-mark'` (wrong: $117 is the 1.17 fill, not any
+ * mark). The number was right and the label misnamed its own divisor — and a
+ * reader told `open-mark` pairs it with the wrong instant (TRA-4027).
+ *
+ * `'mark'` and ABSENT both read `'premium-open-mark'`: absent is every
+ * pre-TRA-4028 row and every engine `single_leg_otm` row, whose open is the
+ * scanner mark by definition. Absent is NOT treated as `'fill'` — the journal's
+ * own doc says a reader must treat it as unknown, and the open mark is what
+ * every such row has held since TRA-991 froze it there.
+ */
+export function premiumRBasisLabel(atRiskBasis: 'fill' | 'mark' | null | undefined): ExportPnlRBasis {
+  return atRiskBasis === 'fill' ? 'premium-fill' : 'premium-open-mark';
+}
+
+/** TRA-4035 — normalise the `number | ExportJournalPremiumBasis` a caller may hand over. */
+function journalPremiumBasisOf(
+  basis: number | ExportJournalPremiumBasis | undefined,
+): { atRiskUsd: number; atRiskBasis: 'fill' | 'mark' | null } {
+  if (typeof basis === 'number') return { atRiskUsd: basis, atRiskBasis: null };
+  if (basis && typeof basis === 'object') {
+    return {
+      atRiskUsd: basis.atRiskUsd,
+      atRiskBasis: basis.atRiskBasis === 'fill' || basis.atRiskBasis === 'mark' ? basis.atRiskBasis : null,
+    };
+  }
+  return { atRiskUsd: NaN, atRiskBasis: null };
+}
+
+/**
  * TRA-4031 — WHICH QUANTITY the `entry_price` column holds, per row, so a
  * reader never has to infer it from the clock.
  *
@@ -434,6 +487,15 @@ export interface ExportMoneyRestatement {
    * treated exactly like `null` by {@link applyMoneyRestatement}.
    */
   premium_basis_usd?: number | null;
+  /**
+   * TRA-4035 — what `premium_basis_usd` above IS (the journal's `atRiskBasis`,
+   * TRA-4028, through {@link premiumRBasisLabel}). Travels with the figure so
+   * the overlay never has to guess the instant from the figure's presence.
+   * Absent or null ⇒ `'premium-open-mark'` when `premium_basis_usd` is finite
+   * (the pre-ticket label, and the truth for every fixture that predates the
+   * field); ignored when `premium_basis_usd` is not finite.
+   */
+  pnl_r_basis?: ExportPnlRBasis | null;
 }
 
 /**
@@ -485,7 +547,13 @@ export function applyMoneyRestatement(
     premium_basis_usd: isFiniteNumber(restatement.premium_basis_usd)
       ? restatement.premium_basis_usd
       : (row.premium_basis_usd ?? null),
-    pnl_r_basis: isFiniteNumber(restatement.premium_basis_usd) ? 'premium-open-mark' : row.pnl_r_basis,
+    // TRA-4035 — and the label is the one the restatement NAMES, not one inferred
+    // from the figure being present: a twin restated onto its ledger fill
+    // (TRA-4028) publishes `'premium-fill'` here, an open-mark twin (or a
+    // restatement that predates the label) `'premium-open-mark'`.
+    pnl_r_basis: isFiniteNumber(restatement.premium_basis_usd)
+      ? (restatement.pnl_r_basis ?? 'premium-open-mark')
+      : row.pnl_r_basis,
     // TRA-3985 — identity is NOT restated: `lot_id`/`journal_id` describe which
     // row this is, and the restatement is joined ON `journal_id`, so letting it
     // rewrite the key would make the join unverifiable from the output.
@@ -541,8 +609,14 @@ export interface ExportInput {
    * not: the fill/mark gap opens the moment the mirror reconciles, hours before
    * any close-basis restatement runs. Absent ⇒ every book row divides inline
    * and labels itself `'premium-fill'`, which is the pre-ticket arithmetic.
+   *
+   * TRA-4035 — the value carries the twin's `atRiskBasis` beside the figure
+   * ({@link ExportJournalPremiumBasis}) so the book row's label names the
+   * instant the twin states, not the instant the presence of a twin implied. A
+   * bare `number` is still accepted and reads as "instant unknown" ⇒
+   * `'premium-open-mark'`.
    */
-  optionPremiumBases?: ReadonlyMap<string, number>;
+  optionPremiumBases?: ReadonlyMap<string, number | ExportJournalPremiumBasis>;
 }
 
 /**
@@ -831,9 +905,11 @@ export function rowFromPosition(pos: Position, market: 'stocks' | 'crypto'): Exp
  * TRA-4027 — `journalAtRiskUsd` is the journal twin's open-mark premium basis
  * when the caller has one ({@link buildRows} reads it off
  * `ExportInput.optionPremiumBases`). When it is a finite positive number the row
- * divides `pnl_r` by IT and labels the basis `'premium-open-mark'`; otherwise
- * the row divides by its own `premiumPaid × contracts × 100` and says
- * `'premium-fill'`. Either way `premium_basis_usd` publishes the divisor.
+ * divides `pnl_r` by IT and labels the basis by what the twin SAYS it is
+ * (TRA-4035, {@link premiumRBasisLabel}: `atRiskBasis 'fill'` ⇒
+ * `'premium-fill'`, `'mark'`/unknown ⇒ `'premium-open-mark'`); otherwise the row
+ * divides by its own `premiumPaid × contracts × 100` and says `'premium-fill'`.
+ * Either way `premium_basis_usd` publishes the divisor.
  *
  * `entry_price` is NOT moved to the mark on a twinned row. It is a PRICE column
  * — what this lot paid per share, which after the mirror reconcile is the
@@ -841,7 +917,10 @@ export function rowFromPosition(pos: Position, market: 'stocks' | 'crypto'): Exp
  * about the fill to keep an identity (`entry_price × 100 × quantity`) that the
  * basis column now carries honestly instead.
  */
-export function rowFromOption(opt: OptionPosition, journalAtRiskUsd?: number): ExportTradeRow {
+export function rowFromOption(
+  opt: OptionPosition,
+  journalPremiumBasis?: number | ExportJournalPremiumBasis,
+): ExportTradeRow {
   // TRA-3989 — `pnl_r` divides by the PREMIUM (the journal's `atRiskUsd`), never
   // by the stop distance: a book-served row and its journal-served twin must
   // publish the same R, and the twin has no stop to divide by. The stop-basis
@@ -849,10 +928,15 @@ export function rowFromOption(opt: OptionPosition, journalAtRiskUsd?: number): E
   //
   // TRA-4027 — ...and by the premium at the SAME INSTANT the twin reads it: the
   // open mark, not the fill `premiumPaid` becomes once the mirror reconciles.
-  const twinRisk = isFiniteNumber(journalAtRiskUsd) && journalAtRiskUsd > 0 ? journalAtRiskUsd : NaN;
+  //
+  // TRA-4035 — ...and the LABEL is the instant the twin states (`atRiskBasis`,
+  // TRA-4028), not "open-mark because a twin exists": a twin restated onto its
+  // ledger fill divides by the fill and must say so.
+  const twin = journalPremiumBasisOf(journalPremiumBasis);
+  const twinRisk = isFiniteNumber(twin.atRiskUsd) && twin.atRiskUsd > 0 ? twin.atRiskUsd : NaN;
   const inlineRisk = optionPremiumRiskUsd(opt);
   const premiumRisk = isFiniteNumber(twinRisk) ? twinRisk : inlineRisk;
-  const pnlRBasis: ExportPnlRBasis = isFiniteNumber(twinRisk) ? 'premium-open-mark' : 'premium-fill';
+  const pnlRBasis: ExportPnlRBasis = isFiniteNumber(twinRisk) ? premiumRBasisLabel(twin.atRiskBasis) : 'premium-fill';
   const stopRisk = optionStopRiskUsd(opt);
   const net = moneyOrNull(opt.pnl);
   return {
