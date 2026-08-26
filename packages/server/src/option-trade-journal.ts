@@ -480,6 +480,17 @@ export interface OptionTradeJournalClose {
    * `premiumAtFire` is `null` when the exit path carried no mark.
    */
   openingRangeSuppressed?: OptionTradeJournalOpeningRangeSuppression;
+  /**
+   * TRA-4030 (R4, the PDT column) — how the day-one PDT hold treated this
+   * row's profit FLOOR: ticks refused for want of day-trade capacity, the ET
+   * day-keys held on (restart-durable — it rode the position snapshot), the
+   * mark when the floor first wanted to fire and the mark at the eventual
+   * exit. Absent ↔ the hold never refused the floor on this row. Written on
+   * the flag-off cohort too (the floor is read as a shadow there).
+   * `premiumAtFirstHold − premiumAtFire` is the give-back the hold cost — the
+   * same subtraction as `openingRangeSuppressed`, so one grader reads both.
+   */
+  profitFloorHeldForPdt?: OptionTradeJournalProfitFloorPdtHold;
 }
 
 /** TRA-4020 (R4) — see {@link OptionTradeJournalClose.openingRangeSuppressed}. */
@@ -488,6 +499,16 @@ export interface OptionTradeJournalOpeningRangeSuppression {
   firstSuppressedAt: number;
   lastSuppressedAt: number;
   premiumAtSuppression: number;
+  premiumAtFire: number | null;
+}
+
+/** TRA-4030 (R4) — see {@link OptionTradeJournalClose.profitFloorHeldForPdt}. */
+export interface OptionTradeJournalProfitFloorPdtHold {
+  holds: number;
+  firstHeldAt: number;
+  lastHeldAt: number;
+  etDayKeys: string[];
+  premiumAtFirstHold: number;
   premiumAtFire: number | null;
 }
 
@@ -544,6 +565,8 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
   peakPremiumAt?: number;
   /** TRA-4020 (R4) — opening-range refusals on this row, folded from the CLOSE row. */
   openingRangeSuppressed?: OptionTradeJournalOpeningRangeSuppression;
+  /** TRA-4030 (R4) — PDT-capacity holds of the profit floor on this row, folded from the CLOSE row. */
+  profitFloorHeldForPdt?: OptionTradeJournalProfitFloorPdtHold;
   /**
    * TRA-2895 — partial exits realized before the full close, in append order.
    *
@@ -1702,6 +1725,15 @@ function foldLine(
       : {}),
     ...(line.close.openingRangeSuppressed !== undefined
       ? { openingRangeSuppressed: { ...line.close.openingRangeSuppressed } }
+      : {}),
+    // TRA-4030 (R4) — the PDT column, beside it; absent stays absent.
+    ...(line.close.profitFloorHeldForPdt !== undefined
+      ? {
+          profitFloorHeldForPdt: {
+            ...line.close.profitFloorHeldForPdt,
+            etDayKeys: [...(line.close.profitFloorHeldForPdt.etDayKeys ?? [])],
+          },
+        }
       : {}),
   });
 }

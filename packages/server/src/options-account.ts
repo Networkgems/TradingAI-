@@ -21,8 +21,8 @@ import type {
   EntryQuoteStamp,
   OptionAdmissionStamp,
 } from '@trading-app/shared';
-import { buildEntryQuoteStamp } from '@trading-app/shared';
-import type { ProfitFloorLadderStep } from '@trading-app/shared';
+import { buildEntryQuoteStamp, PROFIT_FLOOR_LADDER } from '@trading-app/shared';
+import type { ProfitFloorLadderStep, OptionProfitFloorPdtHold } from '@trading-app/shared';
 import { recordEntryQuoteStampOutcome } from './entry-quote-stamp.js';
 import { computePortfolioGreeks } from './reports/portfolio-greeks.js';
 import { etDateKey, etWallClockToUtcMs } from './et-clock.js';
@@ -850,6 +850,60 @@ function noteOpeningRangeSuppression(opt: OptionPosition, mark: number, now: num
 function stampOpeningRangeFire(opt: OptionPosition, mark: number): void {
   const s = opt.openingRangeSuppressed;
   if (s !== undefined && s.premiumAtFire === undefined) s.premiumAtFire = mark;
+}
+
+/**
+ * TRA-4030 (R4, the PDT column) — record that the day-one PDT hold refused the
+ * profit FLOOR on this tick for want of day-trade capacity. Same shape and
+ * same dedupe as `noteOpeningRangeSuppression` (one tick counts once), plus the
+ * ET day-key set that makes the record readable across a restart: the record
+ * rides the position snapshot, so a hold that spans a deploy is still one hold
+ * on one row. Returns `true` when this is the FIRST hold on `dayKey` for the
+ * row — the once-per-row-per-day event the log line and the since-boot
+ * counter are keyed on.
+ *
+ * Written regardless of the TRA-4020 flag — it is an instrument, and the
+ * flag-off cohort is the one that needs pricing.
+ */
+function noteProfitFloorPdtHold(opt: OptionPosition, mark: number, now: number, dayKey: string): boolean {
+  const h = opt.profitFloorHeldForPdt;
+  if (h === undefined) {
+    opt.profitFloorHeldForPdt = {
+      holds: 1,
+      firstHeldAt: now,
+      lastHeldAt: now,
+      etDayKeys: [dayKey],
+      premiumAtFirstHold: mark,
+    };
+    return true;
+  }
+  const firstOnDay = !h.etDayKeys.includes(dayKey);
+  if (firstOnDay) h.etDayKeys.push(dayKey);
+  if (h.lastHeldAt === now) return firstOnDay;
+  h.holds += 1;
+  h.lastHeldAt = now;
+  return firstOnDay;
+}
+
+/** TRA-4030 (R4) — the mark at the row's eventual exit, stamped once. */
+function stampProfitFloorPdtFire(opt: OptionPosition, mark: number): void {
+  const h = opt.profitFloorHeldForPdt;
+  if (h !== undefined && h.premiumAtFire === undefined) h.premiumAtFire = mark;
+}
+
+/**
+ * TRA-4030 — is this a well-formed {@link OptionProfitFloorPdtHold}? The field
+ * was a bare `string` day-key before TRA-4030 and a snapshot written by that
+ * build would otherwise arrive here as a value `.holds` cannot be read off.
+ */
+function isProfitFloorPdtHoldRecord(v: unknown): v is OptionProfitFloorPdtHold {
+  if (v === null || typeof v !== 'object') return false;
+  const r = v as Record<string, unknown>;
+  return typeof r['holds'] === 'number'
+    && typeof r['firstHeldAt'] === 'number'
+    && typeof r['lastHeldAt'] === 'number'
+    && Array.isArray(r['etDayKeys'])
+    && typeof r['premiumAtFirstHold'] === 'number';
 }
 
 /** Minutes in a regular 9:30–16:00 ET session. */
@@ -4469,7 +4523,12 @@ export class PaperOptionsAccount {
   private chandelierDailyCloseHolds = 0;
   /** TRA-4020 (R3) — since-boot count of profit FLOOR exits this process fired (`profit_floor`). */
   private profitFloorFires = 0;
-  /** TRA-4020 (R3) — since-boot count of armed profit floors HELD by the day-one PDT hold for want of day-trade capacity (one per row per ET day). */
+  /**
+   * TRA-4020 (R3) — since-boot count of profit floors HELD by the day-one PDT
+   * hold for want of day-trade capacity (one per row per ET day). TRA-4030 —
+   * counts the SHADOW floor too (flag off), and is no longer the record of
+   * anything: the durable, per-row count is `OptionPosition.profitFloorHeldForPdt`.
+   */
   private profitFloorPdtHolds = 0;
   /**
    * TRA-3943 — OTM intraday stops this process FIRED, split by leg. Since-boot.
@@ -5358,7 +5417,16 @@ export class PaperOptionsAccount {
         // TRA-4020 (R4) — MFE + the opening-range refusal record, off the
         // position. Absent stays absent (a row that never ticked has no peak
         // worth the name; a row the window never refused has no record).
+        // TRA-4030 — and the PDT-hold record, the same way, so one read of the
+        // close row grades both columns.
         const suppressed = position.openingRangeSuppressed;
+        const pdtHeld = isProfitFloorPdtHoldRecord(position.profitFloorHeldForPdt)
+          ? position.profitFloorHeldForPdt
+          : undefined;
+        const markAtClose =
+          Number.isFinite(position.currentPremium) && position.currentPremium > 0
+            ? position.currentPremium
+            : null;
         const close = {
           closeTs,
           outcome: outcomeForR(realizedR),
@@ -5378,11 +5446,19 @@ export class PaperOptionsAccount {
                   firstSuppressedAt: suppressed.firstSuppressedAt,
                   lastSuppressedAt: suppressed.lastSuppressedAt,
                   premiumAtSuppression: suppressed.premiumAtSuppression,
-                  premiumAtFire:
-                    suppressed.premiumAtFire
-                    ?? (Number.isFinite(position.currentPremium) && position.currentPremium > 0
-                      ? position.currentPremium
-                      : null),
+                  premiumAtFire: suppressed.premiumAtFire ?? markAtClose,
+                },
+              }
+            : {}),
+          ...(pdtHeld !== undefined
+            ? {
+                profitFloorHeldForPdt: {
+                  holds: pdtHeld.holds,
+                  firstHeldAt: pdtHeld.firstHeldAt,
+                  lastHeldAt: pdtHeld.lastHeldAt,
+                  etDayKeys: [...pdtHeld.etDayKeys],
+                  premiumAtFirstHold: pdtHeld.premiumAtFirstHold,
+                  premiumAtFire: pdtHeld.premiumAtFire ?? markAtClose,
                 },
               }
             : {}),
@@ -8711,18 +8787,28 @@ export class PaperOptionsAccount {
       // gap on the opening print, which is exactly the sale TRA-3902 exists to
       // refuse (caught by `tra4020-profit-floor-trail.test.ts`). Between 0R and
       // the floor the give-back leg below still applies, under its windows.
+      //
+      // TRA-4030 (R4) — the floor is read TWICE-IN-ONE: `profitFloorTrigger` is
+      // the DECISION and is null unless the flag is on; `profitFloorShadow` is
+      // the same read off the shipped `PROFIT_FLOOR_LADDER` whether or not the
+      // flag is on, and feeds ONLY the PDT-hold instrument below. With the flag
+      // off nothing downstream reads the shadow but the bookkeeping, so every
+      // decision stays byte-identical to the pre-TRA-4020 pass — measured by
+      // `tra4020-profit-floor-trail.test.ts`. `profitLockDecision` is pure.
       let profitFloorTrigger: { floorR: number; currentR: number; peakR: number } | null = null;
-      if (profitFloorLadder !== undefined && exitRisk && !opt.legs && !opt.riskUnmanagedReason) {
+      let profitFloorShadow: { floorR: number; currentR: number; peakR: number } | null = null;
+      if (exitRisk && !opt.legs && !opt.riskUnmanagedReason) {
         const floorRead = profitLockDecision({
           side: 'buy',
           entry: opt.premiumPaid,
           initialStop: opt.stopLossPremium,
           peakPrice: opt.peakPremium,
           currentPrice: mark,
-          floorLadder: profitFloorLadder,
+          floorLadder: profitFloorLadder ?? PROFIT_FLOOR_LADDER,
         });
         if (floorRead.floor?.floorLeg && floorRead.currentR >= 0) {
-          profitFloorTrigger = { floorR: floorRead.floor.floorR, currentR: floorRead.currentR, peakR: floorRead.peakR };
+          profitFloorShadow = { floorR: floorRead.floor.floorR, currentR: floorRead.currentR, peakR: floorRead.peakR };
+          if (profitFloorLadder !== undefined) profitFloorTrigger = profitFloorShadow;
         }
       }
       // The PDT exemption is CAPACITY-GATED, the one place this build reads the
@@ -8764,18 +8850,27 @@ export class PaperOptionsAccount {
       // account with day-trade capacity. Without capacity the floor is held
       // like everything else, and says so once per row per ET day.
       if (pdtHeldToday && otmStopTrigger === null && !profitFloorClearsPdt) {
-        if (profitFloorTrigger !== null) {
-          const dayKey = etDateKey(Date.now());
-          if (opt.profitFloorHeldForPdt !== dayKey) {
-            opt.profitFloorHeldForPdt = dayKey;
+        // TRA-4030 (R4) — the PDT column of the R4 instrument. Counted off the
+        // SHADOW read (flag on or off) and only when the refusal is for
+        // CAPACITY: with the flag off and capacity present the row is held by
+        // the plain PDT hold, which is the flag's cost, not this column's.
+        if (profitFloorShadow !== null && options.otmDayOneStop?.release.released !== true) {
+          const now = Date.now();
+          const dayKey = etDateKey(now);
+          if (noteProfitFloorPdtHold(opt, mark, now, dayKey)) {
             this.profitFloorPdtHolds += 1;
             accountLog.warn('profit FLOOR HELD on day one — no day-trade capacity', {
-              issue: 'TRA-4020',
+              issue: profitFloorTrigger !== null ? 'TRA-4020' : 'TRA-4030',
               optionSymbol: opt.optionSymbol,
               mark,
-              floorR: profitFloorTrigger.floorR,
-              currentR: profitFloorTrigger.currentR,
-              peakR: profitFloorTrigger.peakR,
+              floorR: profitFloorShadow.floorR,
+              currentR: profitFloorShadow.currentR,
+              peakR: profitFloorShadow.peakR,
+              // `false` ⇒ the floor is a shadow: nothing was armed, the hold is
+              // priced for the flag-off cohort and no decision was changed.
+              floorArmed: profitFloorTrigger !== null,
+              holdsOnRow: opt.profitFloorHeldForPdt?.holds ?? null,
+              etDayKeys: opt.profitFloorHeldForPdt?.etDayKeys ?? null,
               releaseReason: options.otmDayOneStop?.release.reason ?? 'release_absent',
               accountType: options.otmDayOneStop?.release.accountType ?? null,
             });
@@ -8848,6 +8943,7 @@ export class PaperOptionsAccount {
           );
           if (reason === 'supertrend_flip' || reason === 'ma20_close_through' || reason === 'time_stop') {
             stampOpeningRangeFire(opt, mark); // TRA-4020 (R4)
+            stampProfitFloorPdtFire(opt, mark); // TRA-4030 (R4)
             if (waitAndHold) {
               // TRA-2984 — same escalation as the SL/trail staging site below:
               // a structural exit whose previous order expired unfilled is
@@ -9062,7 +9158,9 @@ export class PaperOptionsAccount {
         exitPremium = mark;
         exitKind = 'trail';
         exitJournalReason = 'profit_floor';
-        delete opt.profitFloorHeldForPdt;
+        // TRA-4030 — `profitFloorHeldForPdt` is no longer cleared here: it is
+        // the durable per-row record, and the fire stamps `premiumAtFire` on
+        // it below (with every other exit) instead.
         this.profitFloorFires += 1;
         accountLog.info('profit FLOOR fired', {
           issue: 'TRA-4020',
@@ -9348,6 +9446,7 @@ export class PaperOptionsAccount {
         // Stamped at the STAGE on the live path (the fill lands later, on a
         // different tick) and at the close on the paper path.
         stampOpeningRangeFire(opt, mark);
+        stampProfitFloorPdtFire(opt, mark); // TRA-4030 (R4)
         if (waitAndHold) {
           // TRA-354 — stage the full exit at the trigger (SL or trailing)
           // price; engine submits a Tradier limit sell_to_close. The paper
@@ -10383,10 +10482,12 @@ export class PaperOptionsAccount {
   }
 
   /**
-   * TRA-4020 (R3) — since-boot count of armed profit floors HELD by the day-one
-   * PDT hold because the account had no day-trade capacity (one per row per ET
+   * TRA-4020 (R3) — since-boot count of profit floors HELD by the day-one PDT
+   * hold because the account had no day-trade capacity (one per row per ET
    * day). A non-zero here is a row the floor wanted to lock and could not
-   * without a PDT violation.
+   * without a PDT violation. TRA-4030 — the shadow floor (flag off) counts too,
+   * and this is NOT the record: it is zeroed by every restart, which is why
+   * the per-row `OptionPosition.profitFloorHeldForPdt` exists. Read that.
    */
   getProfitFloorPdtHolds(): number {
     return this.profitFloorPdtHolds;
@@ -13719,6 +13820,18 @@ export class PaperOptionsAccount {
     // carrying real premium right now.
     for (const o of snap.openOptions) {
       healPersistedThresholds(o);
+      // TRA-4030 — `profitFloorHeldForPdt` was a bare day-key `string` under the
+      // TRA-4020 build. It carried no mark and no count, so there is nothing to
+      // migrate it INTO; drop it rather than let `.holds` be read off a string.
+      // The record shape rides through JSON as-is.
+      if (o.profitFloorHeldForPdt !== undefined && !isProfitFloorPdtHoldRecord(o.profitFloorHeldForPdt)) {
+        accountLog.info('dropped a legacy scalar profitFloorHeldForPdt on snapshot import', {
+          issue: 'TRA-4030',
+          optionSymbol: o.optionSymbol,
+          legacy: o.profitFloorHeldForPdt,
+        });
+        delete o.profitFloorHeldForPdt;
+      }
       this.openOptions.set(o.id, o);
     }
     this.stampLegacyUnmanagedRows();

@@ -379,11 +379,20 @@ describe('TRA-4020 R3 — an armed FLOOR fires through all three suppressions as
     held.tick(1.20, RISK_ON, { otmDayOneStop: { rule: OTM_STOP_OFF, release: HELD } });
     vi.setSystemTime(D1_1000 + 5 * MIN);
     expect(held.tick(1.04, RISK_ON, { otmDayOneStop: { rule: OTM_STOP_OFF, release: HELD } })).toHaveLength(0);
-    expect(held.row().profitFloorHeldForPdt).toBe('2024-06-05');
+    // TRA-4030 — the latch is now the per-row record; its day-key set is the latch.
+    expect(held.row().profitFloorHeldForPdt).toEqual({
+      holds: 1,
+      firstHeldAt: D1_1000 + 5 * MIN,
+      lastHeldAt: D1_1000 + 5 * MIN,
+      etDayKeys: ['2024-06-05'],
+      premiumAtFirstHold: 1.04,
+    });
     expect(held.acct.getProfitFloorPdtHolds()).toBe(1);
     vi.setSystemTime(D1_1000 + 30 * MIN);
     expect(held.tick(1.04, RISK_ON, { otmDayOneStop: { rule: OTM_STOP_OFF, release: HELD } })).toHaveLength(0);
-    expect(held.acct.getProfitFloorPdtHolds()).toBe(1);
+    expect(held.acct.getProfitFloorPdtHolds()).toBe(1); // once per row per day …
+    expect(held.row().profitFloorHeldForPdt!.holds).toBe(2); // … but every held TICK on the row
+    expect(held.row().profitFloorHeldForPdt!.etDayKeys).toEqual(['2024-06-05']);
 
     // No release object at all ⇒ fail closed: held.
     const absent = liveAccount(D1_1000);
@@ -394,12 +403,14 @@ describe('TRA-4020 R3 — an armed FLOOR fires through all three suppressions as
     expect(absent.acct.getProfitFloorPdtHolds()).toBe(1);
 
     // NEGATIVE CONTROL — flag OFF with capacity: the PDT hold still holds everything.
+    // TRA-4030 — and that hold is NOT a capacity hold, so the PDT column stays absent.
     const off = liveAccount(D1_1000);
     vi.setSystemTime(D1_1000 + 2 * MIN);
     off.tick(1.20, RISK_OFF, { otmDayOneStop: { rule: OTM_STOP_OFF, release: RELEASED } });
     vi.setSystemTime(D1_1000 + 30 * MIN);
     expect(off.tick(1.04, RISK_OFF, { otmDayOneStop: { rule: OTM_STOP_OFF, release: RELEASED } })).toHaveLength(0);
     expect(off.acct.getProfitFloorPdtHolds()).toBe(0);
+    expect(off.row().profitFloorHeldForPdt).toBeUndefined();
   });
 
   it('through the swing hold (demo RV row under `swingHoldOptions`) as `profit_floor`; held with the flag OFF', () => {
@@ -496,5 +507,191 @@ describe('TRA-4020 R4 — the journal close row carries MFE and the refusal reco
     expect(rec.peakPremium).toBe(1.20);
     expect(rec.peakPremiumAt).toBe(TRADING_TIME);
     expect(rec.openingRangeSuppressed).toBeUndefined();
+    expect(rec.profitFloorHeldForPdt).toBeUndefined();
+  });
+});
+
+// TRA-4030 (parent TRA-4029) — the PDT column of the R4 instrument. The
+// opening-range half above already persists per row; the PDT half was a
+// since-boot counter that every restart zeroed and that could not be joined to
+// the row it held. These scenarios are the done bar, in order: accrues with the
+// flag OFF (the cohort being priced), survives a snapshot round trip, lands on
+// the journal close row beside `openingRangeSuppressed`, and is served by the
+// `?rows=all` dump the TRA-4029 read runs against.
+describe('TRA-4030 R4 — the PDT hold is per-row, restart-durable, and on the journal close', () => {
+  const D1_1000 = D1_OPEN + 30 * MIN;
+  const HELD_OPTS = { otmDayOneStop: { rule: OTM_STOP_OFF, release: HELD } };
+  let tmpFile: string;
+  let fileCounter = 0;
+
+  beforeEach(() => {
+    process.env['ENABLE_OPTION_TRADE_JOURNAL'] = '1';
+    tmpFile = join(tmpdir(), `tra4030-journal-${process.pid}-${fileCounter++}.jsonl`);
+    setOptionTradeJournalFileForTests(tmpFile);
+  });
+
+  afterEach(async () => {
+    delete process.env['ENABLE_OPTION_TRADE_JOURNAL'];
+    setOptionTradeJournalFileForTests(null);
+    await rm(tmpFile, { force: true });
+  });
+
+  it('flag OFF (PROFIT_FLOOR_TRAIL_ENABLED unset): a held SHADOW floor accrues the record per tick and changes no decision', () => {
+    expect(process.env['PROFIT_FLOOR_TRAIL_ENABLED']).toBeUndefined();
+    const { acct, tick, row } = liveAccount(D1_1000);
+    vi.setSystemTime(D1_1000 + 2 * MIN);
+    expect(tick(1.20, RISK_OFF, HELD_OPTS)).toHaveLength(0); // peakR 1.0 ⇒ shadow floor +0.25R = 1.05
+    expect(row().profitFloorHeldForPdt).toBeUndefined(); // above the floor: nothing to hold
+    vi.setSystemTime(D1_1000 + 5 * MIN);
+    expect(tick(1.04, RISK_OFF, HELD_OPTS)).toHaveLength(0); // under the floor, no capacity ⇒ HELD
+    expect(row().profitFloorHeldForPdt).toEqual({
+      holds: 1,
+      firstHeldAt: D1_1000 + 5 * MIN,
+      lastHeldAt: D1_1000 + 5 * MIN,
+      etDayKeys: ['2024-06-05'],
+      premiumAtFirstHold: 1.04,
+    });
+    // A second read on the SAME tick is one wait, not two.
+    expect(tick(1.03, RISK_OFF, HELD_OPTS)).toHaveLength(0);
+    expect(row().profitFloorHeldForPdt!.holds).toBe(1);
+    vi.setSystemTime(D1_1000 + 6 * MIN);
+    expect(tick(1.03, RISK_OFF, HELD_OPTS)).toHaveLength(0);
+    expect(row().profitFloorHeldForPdt!.holds).toBe(2);
+    expect(row().profitFloorHeldForPdt!.lastHeldAt).toBe(D1_1000 + 6 * MIN);
+    expect(row().profitFloorHeldForPdt!.premiumAtFirstHold).toBe(1.04); // first hold's mark, never overwritten
+    // The flag is OFF: no `profit_floor` fired, the row is still open, the
+    // since-boot counter says one row-day.
+    expect(acct.getProfitFloorFires()).toBe(0);
+    expect(acct.getState().openOptions).toHaveLength(1);
+    expect(acct.getProfitFloorPdtHolds()).toBe(1);
+    // An absent release object fails closed the same way.
+    const absent = liveAccount(D1_1000);
+    vi.setSystemTime(D1_1000 + 2 * MIN);
+    absent.tick(1.20, RISK_OFF);
+    vi.setSystemTime(D1_1000 + 5 * MIN);
+    expect(absent.tick(1.04, RISK_OFF)).toHaveLength(0);
+    expect(absent.row().profitFloorHeldForPdt!.holds).toBe(1);
+  });
+
+  it('the record rides the position snapshot: a hold that spans a restart is one hold on one row, and the next ET day appends its key', () => {
+    const { acct, tick, row } = liveAccount(D1_1000);
+    vi.setSystemTime(D1_1000 + 2 * MIN);
+    tick(1.20, RISK_OFF, HELD_OPTS);
+    vi.setSystemTime(D1_1000 + 5 * MIN);
+    tick(1.04, RISK_OFF, HELD_OPTS);
+    expect(row().profitFloorHeldForPdt!.holds).toBe(1);
+    expect(acct.getProfitFloorPdtHolds()).toBe(1);
+
+    // RESTART — through the durable boundary: JSON out, JSON in, a fresh process.
+    const snap = JSON.parse(JSON.stringify(acct.exportSnapshot()));
+    const restarted = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      holdLiveOptionsOvernightForPdt: true,
+    });
+    restarted.importSnapshot(snap);
+    expect(restarted.getProfitFloorPdtHolds()).toBe(0); // the since-boot counter is what a restart zeroes …
+    const row2 = () => restarted.getState().openOptions[0]!;
+    expect(row2().profitFloorHeldForPdt).toEqual({          // … the row is what it does not
+      holds: 1,
+      firstHeldAt: D1_1000 + 5 * MIN,
+      lastHeldAt: D1_1000 + 5 * MIN,
+      etDayKeys: ['2024-06-05'],
+      premiumAtFirstHold: 1.04,
+    });
+    const sym = row2().optionSymbol!;
+    const tick2 = (mark: number, options: Parameters<PaperOptionsAccount['checkExits']>[3] = {}) =>
+      restarted.checkExits(new Map([['AAPL', 200]]), new Map([[sym, mark]]), 'live', options, undefined, RISK_OFF);
+    // Same ET day, after the restart: the count CONTINUES, the day-key set does not grow.
+    vi.setSystemTime(D1_1000 + 10 * MIN);
+    expect(tick2(1.04, HELD_OPTS)).toHaveLength(0);
+    expect(row2().profitFloorHeldForPdt!.holds).toBe(2);
+    expect(row2().profitFloorHeldForPdt!.etDayKeys).toEqual(['2024-06-05']);
+    expect(restarted.getProfitFloorPdtHolds()).toBe(0); // not a new row-day ⇒ the log/counter event does not re-fire
+    // A restart in the middle of the next session: the row opened yesterday
+    // (2024-06-05 ET), so it is no longer day-one and the PDT hold releases it.
+    // Under the flag-off rule the give-back leg (`profit_lock`, level +0.6R)
+    // takes it, and the record is stamped with the mark at the fire.
+    const D2_1000 = D1_1000 + 24 * 60 * MIN;
+    vi.setSystemTime(D2_1000);
+    const closed = tick2(1.04, HELD_OPTS);
+    expect(closed).toHaveLength(1);
+    expect(closed[0]!.exitReason).toBe('profit_lock');
+    expect(closed[0]!.profitFloorHeldForPdt).toEqual({
+      holds: 2,
+      firstHeldAt: D1_1000 + 5 * MIN,
+      lastHeldAt: D1_1000 + 10 * MIN,
+      etDayKeys: ['2024-06-05'],
+      premiumAtFirstHold: 1.04,
+      premiumAtFire: 1.04,
+    });
+  });
+
+  it('a snapshot written by the TRA-4020 build (bare day-key string) imports cleanly: the scalar is dropped, not read as a record', () => {
+    const { acct, tick } = liveAccount(D1_1000);
+    vi.setSystemTime(D1_1000 + 2 * MIN);
+    tick(1.20, RISK_OFF, HELD_OPTS);
+    const snap = JSON.parse(JSON.stringify(acct.exportSnapshot()));
+    snap.openOptions[0].profitFloorHeldForPdt = '2024-06-05';
+    const restarted = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5, holdLiveOptionsOvernightForPdt: true });
+    restarted.importSnapshot(snap);
+    const row2 = () => restarted.getState().openOptions[0]!;
+    expect(row2().profitFloorHeldForPdt).toBeUndefined();
+    const sym = row2().optionSymbol!;
+    vi.setSystemTime(D1_1000 + 5 * MIN);
+    restarted.checkExits(new Map([['AAPL', 200]]), new Map([[sym, 1.04]]), 'live', HELD_OPTS, undefined, RISK_OFF);
+    expect(row2().profitFloorHeldForPdt!.holds).toBe(1); // a fresh record starts from the first post-migration hold
+  });
+
+  it('flag OFF: the journal close row carries profitFloorHeldForPdt beside openingRangeSuppressed, and it is served by ?rows=all', async () => {
+    const { acct, tick } = liveAccount(D1_1000);
+    await acct.flushOptionTradeJournal();
+    vi.setSystemTime(D1_1000 + 2 * MIN);
+    tick(1.20, RISK_OFF, HELD_OPTS);
+    vi.setSystemTime(D1_1000 + 5 * MIN);
+    tick(1.04, RISK_OFF, HELD_OPTS);
+    vi.setSystemTime(D1_1000 + 6 * MIN);
+    tick(1.04, RISK_OFF, HELD_OPTS);
+    // Day 2, INSIDE the opening-range window: the give-back off yesterday's
+    // peak is refused by the window (the opening-range column accrues on the
+    // same row), then fires at 09:45 as `profit_lock`.
+    const D2_OPEN = D1_OPEN + 24 * 60 * MIN;
+    vi.setSystemTime(D2_OPEN + 5 * MIN);
+    expect(tick(1.02, RISK_OFF, HELD_OPTS)).toHaveLength(0);
+    vi.setSystemTime(D2_OPEN + 15 * MIN);
+    const closed = tick(1.02, RISK_OFF, HELD_OPTS);
+    expect(closed).toHaveLength(1);
+    expect(closed[0]!.exitReason).toBe('profit_lock');
+    await acct.flushOptionTradeJournal();
+
+    const rec = (await listOptionTradeJournal())[0]!;
+    expect(rec.outcome).not.toBe('OPEN');
+    expect(rec.openingRangeSuppressed).toEqual({
+      fires: 1,
+      firstSuppressedAt: D2_OPEN + 5 * MIN,
+      lastSuppressedAt: D2_OPEN + 5 * MIN,
+      premiumAtSuppression: 1.02,
+      premiumAtFire: 1.02,
+    });
+    expect(rec.profitFloorHeldForPdt).toEqual({
+      holds: 2,
+      firstHeldAt: D1_1000 + 5 * MIN,
+      lastHeldAt: D1_1000 + 6 * MIN,
+      etDayKeys: ['2024-06-05'],
+      premiumAtFirstHold: 1.04,
+      premiumAtFire: 1.02,
+    });
+    // One grader, two columns: the same subtraction on each.
+    expect(rec.profitFloorHeldForPdt!.premiumAtFirstHold - rec.profitFloorHeldForPdt!.premiumAtFire!).toBeCloseTo(0.02, 9);
+    expect(rec.openingRangeSuppressed!.premiumAtSuppression - rec.openingRangeSuppressed!.premiumAtFire!).toBeCloseTo(0, 9);
+
+    // The read TRA-4029 runs: `/api/health/option-journal?rows=all` dumps the
+    // folded record verbatim, so both columns are on the wire together.
+    const { buildOptionJournalReport } = await import('./observability/health-routes.js');
+    const report = buildOptionJournalReport(await listOptionTradeJournal(), Date.now(), true, undefined, undefined, 'all');
+    expect(report.rowsMode).toBe('all');
+    const dumped = report.rows!.find((r) => r.id === rec.id)!;
+    expect(dumped.profitFloorHeldForPdt).toEqual(rec.profitFloorHeldForPdt);
+    expect(dumped.openingRangeSuppressed).toEqual(rec.openingRangeSuppressed);
   });
 });

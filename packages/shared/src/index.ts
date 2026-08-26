@@ -2344,6 +2344,34 @@ export interface OptionOpeningRangeSuppression {
   /** The mark on the tick the row's exit actually fired. */
   premiumAtFire?: number;
 }
+/**
+ * TRA-4030 (R4, the PDT column) — see `OptionPosition.profitFloorHeldForPdt`.
+ * The per-row, restart-durable twin of `OptionOpeningRangeSuppression`: how
+ * many ticks the ladder's FLOOR leg wanted to fire on a day-one live row and
+ * was refused because the account had no day-trade capacity. `etDayKeys` is
+ * the restart-durable part — it rides the position snapshot, so a hold that
+ * spans a deploy or the memory watchdog's pm2 self-restart (TRA-2203 /
+ * TRA-2261, which writes no deploy record) is still one hold on one row, not a
+ * zeroed counter. `premiumAtFirstHold − premiumAtFire` is the give-back the
+ * hold cost — the same subtraction TRA-4029 runs on the opening-range record.
+ * Written regardless of `PROFIT_FLOOR_TRAIL_ENABLED`: with the flag off the
+ * floor is read off `PROFIT_FLOOR_LADDER` as a SHADOW (no decision changes),
+ * so the flag-off cohort is the one priced.
+ */
+export interface OptionProfitFloorPdtHold {
+  /** Ticks on which the floor leg was refused for want of day-trade capacity. */
+  holds: number;
+  /** ms epoch of the first refused tick. */
+  firstHeldAt: number;
+  /** ms epoch of the most recent refused tick (also the per-tick dedupe key). */
+  lastHeldAt: number;
+  /** ET day-keys (`YYYY-MM-DD`) on which at least one tick was held, ascending, unique. */
+  etDayKeys: string[];
+  /** The mark on the first refused tick — where the floor first wanted to fire. */
+  premiumAtFirstHold: number;
+  /** The mark on the tick the row's exit actually fired; absent while open. */
+  premiumAtFire?: number;
+}
 export const PROFIT_FLOOR_LADDER: readonly ProfitFloorLadderStep[] = Object.freeze([
   { peakR: PROFIT_FLOOR_ARM_R, giveBackR: PROFIT_LOCK_GIVEBACK_R, floorR: PROFIT_FLOOR_RUNG1_FLOOR_R },
   { peakR: PROFIT_FLOOR_RUNG2_PEAK_R, giveBackR: PROFIT_LOCK_GIVEBACK_R, floorR: PROFIT_FLOOR_RUNG2_FLOOR_R },
@@ -3353,14 +3381,22 @@ export interface OptionPosition {
    */
   otmStopHeldForPdt?: string;
   /**
-   * TRA-4020 (R3) — the ET date key on which this live row's armed profit
-   * FLOOR was last HELD by the day-one PDT hold because the account had no
-   * day-trade capacity (the TRA-3943 release read `released: false`). Same
-   * once-per-row-per-day latch shape as `otmStopHeldForPdt`; cleared when the
-   * floor fires. The floor is exempt from the hold only where firing is not a
-   * PDT violation — on a cash account or a margin account with DTBP.
+   * TRA-4020 (R3) / TRA-4030 (R4) — the record of this live row's profit FLOOR
+   * being HELD by the day-one PDT hold because the account had no day-trade
+   * capacity (the TRA-3943 release read `released: false` or was absent). The
+   * floor is exempt from the hold only where firing is not a PDT violation —
+   * on a cash account or a margin account with DTBP.
+   *
+   * Until TRA-4030 this was a bare ET day-key latch (`string`) that was deleted
+   * when the floor fired, and the count lived in a since-boot counter that a
+   * restart zeroed. It is now the per-row, restart-durable
+   * {@link OptionProfitFloorPdtHold} record: NEVER cleared (the fire stamps
+   * `premiumAtFire` instead), folded onto the journal close row beside
+   * `openingRangeSuppressed`, and written whether or not the ladder flag is on.
+   * Absent ↔ the hold never refused the floor on this row. A legacy `string`
+   * value in a persisted snapshot is dropped on import (it carried no mark).
    */
-  profitFloorHeldForPdt?: string;
+  profitFloorHeldForPdt?: OptionProfitFloorPdtHold;
   /**
    * TRA-3909 — the risk schedule a `desk_add` lot is managed on: the sleeve that
    * opened the ENGINE's sibling contract on the same OCC symbol, read from the
