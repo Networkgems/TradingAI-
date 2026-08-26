@@ -134,14 +134,27 @@ export const OTM_EVALUATION_REQUIRED_LIVE = [
 /** Bound on the persisted pause-span log — the count is kept separately. */
 export const OTM_EVALUATION_DRIFT_SPANS_MAX = 50;
 
+/**
+ * The hand-written terminals. `verdict_insufficient_population` is the one the
+ * `populationRuling` (QuantTrader 88ccac56) always named and the writer never
+ * accepted: the population was STARVED, not graded — it is accepted only while
+ * `n < targetCloses`, because a full sample is graded pass/fail, never retired.
+ * (QuantTrader fd917f86, 2026-08-26: $6.74 of fleet admission against a $50
+ * contract floor under the $500 cap ⇒ zero new rows ⇒ the window cannot
+ * converge; the ruling on WHICH lever moves is the board's, not the code's.)
+ */
+export const OTM_EVALUATION_VERDICT_STATUSES = [
+  'verdict_pass', 'verdict_fail', 'verdict_insufficient_population',
+] as const;
+export type OtmEvaluationVerdictStatus = (typeof OTM_EVALUATION_VERDICT_STATUSES)[number];
+
 export type OtmEvaluationWindowStatus =
   | 'armed'
   | 'counting'
   | 'paused'
   | 'extended'
   | 'inconclusive_terminal'
-  | 'verdict_pass'
-  | 'verdict_fail';
+  | OtmEvaluationVerdictStatus;
 
 /** The process identity the predicate was evaluated on. */
 export interface OtmEvaluationBuildPin {
@@ -286,11 +299,13 @@ export interface OtmEvaluationBaseline {
 }
 
 export interface OtmEvaluationVerdict {
-  status: 'verdict_pass' | 'verdict_fail';
+  status: OtmEvaluationVerdictStatus;
   /** Must carry the grader's ticket reference. */
   note: string;
   at: number;
   by: string;
+  /** The counted `n` the verdict was written at; `null` on a legacy record. */
+  atN?: number | null;
 }
 
 /** The persisted part. Everything else is derived on read. */
@@ -498,6 +513,62 @@ function etDay(ms: number): string {
 
 function targetFor(state: OtmEvaluationWindowState): number {
   return OTM_EVALUATION_TARGET_CLOSES + (state.extension.used ? state.extension.closes : 0);
+}
+
+const ET_WEEKDAY_FMT = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday: 'short' });
+const HALF_DAY_MS = 43_200_000;
+
+export interface OtmEvaluationCadence {
+  asOf: string;
+  /** ET weekdays whose 16:00 ET close is at or before `asOf`, since the stamp. */
+  rthSessionsElapsed: number;
+  closesPerSession: number | null;
+  /** `null` when the rate is zero — at that pace the window NEVER reaches target; never `0`. */
+  projectedSessionsToTarget: number | null;
+  method: string;
+}
+
+/**
+ * TRA-3945 (QuantTrader fd917f86, 2026-08-26) — the window's own PACE, on the
+ * record, so `counting` can never be read as "still gathering evidence" once
+ * the entry population is starved. Exchange holidays are NOT subtracted: they
+ * read as a session with 0 closes, which biases `closesPerSession` LOW and the
+ * projection HIGH — the conservative direction for a reader deciding whether
+ * the window can converge.
+ */
+export function otmEvaluationCadence(
+  state: OtmEvaluationWindowState,
+  n: number,
+  asOf: number,
+): OtmEvaluationCadence | null {
+  if (state.startedAt === null || !Number.isFinite(asOf) || asOf < state.startedAt) return null;
+  const startDay = etDay(state.startedAt);
+  const startBeforeClose = etHour(state.startedAt) < 16;
+  const asOfDay = etDay(asOf);
+  const asOfAfterClose = etHour(asOf) >= 16;
+  const seen = new Set<string>();
+  let sessions = 0;
+  // 12h steps so a 23h spring-forward ET day cannot be stepped over; dedupe by ET day.
+  for (let t = state.startedAt; t <= asOf; t += HALF_DAY_MS) {
+    const day = etDay(t);
+    if (seen.has(day)) continue;
+    seen.add(day);
+    const wd = ET_WEEKDAY_FMT.format(new Date(t));
+    if (wd === 'Sat' || wd === 'Sun') continue;
+    if (day === startDay && !startBeforeClose) continue;
+    if (day > asOfDay || (day === asOfDay && !asOfAfterClose)) continue;
+    sessions += 1;
+  }
+  const target = targetFor(state);
+  const rate = sessions > 0 ? n / sessions : null;
+  const remaining = Math.max(0, target - n);
+  return {
+    asOf: new Date(asOf).toISOString(),
+    rthSessionsElapsed: sessions,
+    closesPerSession: rate === null ? null : round6(rate),
+    projectedSessionsToTarget: rate !== null && rate > 0 && remaining > 0 ? Math.ceil(remaining / rate) : (remaining === 0 ? 0 : null),
+    method: 'an ET weekday counts once its 16:00 ET close is at or before asOf; the stamp day only if the window opened before that close; holidays NOT subtracted (biases the projection HIGH, the conservative direction); projectedSessionsToTarget = ceil((target - n) / closesPerSession), null on a zero rate',
+  };
 }
 
 /**
@@ -724,17 +795,37 @@ export function stepOtmEvaluationWindow(
   return { state, changed };
 }
 
-/** Hand-run only. Refuses a note without a ticket reference. */
+/**
+ * Hand-run only (the verdict route or the offline script — never the tick).
+ * Refuses a note without a ticket reference, a window that never opened, a
+ * second verdict, and a starved-population terminal on a FULL sample.
+ */
 export function applyOtmEvaluationVerdict(
   state: OtmEvaluationWindowState,
-  verdict: { status: 'verdict_pass' | 'verdict_fail'; note: string; by: string },
+  verdict: { status: OtmEvaluationVerdictStatus; note: string; by: string; atN?: number | null },
   now: number,
 ): OtmEvaluationWindowState {
+  if (!OTM_EVALUATION_VERDICT_STATUSES.includes(verdict.status)) {
+    throw new Error(`TRA-3945: verdict status must be one of ${OTM_EVALUATION_VERDICT_STATUSES.join('|')}, got ${String(verdict.status)}`);
+  }
   if (!/TRA-\d+/.test(verdict.note)) {
     throw new Error('TRA-3945: a verdict note must carry the grader\'s ticket reference (TRA-nnnn)');
   }
   if (state.startedAt === null) throw new Error('TRA-3945: cannot write a verdict on a window that never opened');
-  return { ...state, verdict: { ...verdict, at: now } };
+  if (state.verdict) {
+    throw new Error(`TRA-3945: a verdict is already written (${state.verdict.status} by ${state.verdict.by} at ${new Date(state.verdict.at).toISOString()})`);
+  }
+  const atN = typeof verdict.atN === 'number' && Number.isFinite(verdict.atN) ? verdict.atN : null;
+  if (verdict.status === 'verdict_insufficient_population') {
+    if (atN === null) {
+      throw new Error('TRA-3945: verdict_insufficient_population needs the counted n it is written at (atN)');
+    }
+    const target = targetFor(state);
+    if (atN >= target) {
+      throw new Error(`TRA-3945: verdict_insufficient_population refused at n=${atN} >= target ${target}: a full sample is graded pass/fail, never retired as starved`);
+    }
+  }
+  return { ...state, verdict: { status: verdict.status, note: verdict.note, by: verdict.by, atN, at: now } };
 }
 
 // ── The published record ────────────────────────────────────────────────────
@@ -833,6 +924,26 @@ export function buildOtmEvaluationWindowRecord(
       },
     },
     onFail: 'REPORT ONLY - drop the arm, do not re-tune; QuantTrader files the verdict to the board',
+    // ── QuantTrader fd917f86 (2026-08-26) — the starved-population terminal ──
+    //
+    // The populationRuling above always said "grade that as
+    // insufficient_population", and until this build nothing could WRITE it:
+    // the verdict set was pass|fail and the only writer was a shell script
+    // against the host's data dir, which the verdict owner (an agent) cannot
+    // reach. `cadence` is the window's own pace, so the record itself says
+    // whether `counting` means gathering evidence or waiting on capital.
+    insufficientPopulation: {
+      status: 'verdict_insufficient_population' as const,
+      rule: 'hand-written by the verdict owner ONLY while n < targetCloses (a full sample is graded pass/fail, never retired); the note must name the gate that starved the population',
+      observed: 'fd917f86 2026-08-26T02:18Z: sumAdmissibleEntryUsd $6.74 fleet-wide vs otmContractFloor.premiumMin 0.50 ($50/contract) under fleetCapUsd $500 => zero new rows; 1 close in 2 sessions => ~58 sessions to 30. The 30-close bar and the $500 authorization cannot both hold; which one moves is the board\'s call (routed via TRA-3927).',
+    },
+    cadence: otmEvaluationCadence(state, readout.n, state.lastTickAt ?? state.startedAt ?? Number.NaN),
+    verdictWriter: {
+      route: 'POST /api/health/otm-evaluation-window/verdict (admin) body {status, by, note with a TRA-nnnn ref}; dry-run by default, apply=true requires confirm=TRA-3945; atN is read off the fold in the same beat, never supplied',
+      statuses: OTM_EVALUATION_VERDICT_STATUSES,
+      onceOnly: true as const,
+      offlineFallback: 'scripts/tra3945-otm-window-verdict.mjs against the data-dir file (the running process caches the state - a restart is needed for the wire to reflect it)',
+    },
     baseline: state.baseline,
     n: readout.n,
     avgR: readout.avgR,

@@ -359,7 +359,14 @@ import { OTM_SLEEVE_MANDATE_STRUCTURE } from './otm-sleeve-mandate.js';
 import {
   tickOtmEvaluationWindow,
   OTM_EVALUATION_WINDOW_ID,
+  OTM_EVALUATION_VERDICT_STATUSES,
+  applyOtmEvaluationVerdict,
+  foldOtmEvaluationWindow,
+  loadOtmEvaluationWindowState,
+  otmEvaluationWindowStatus,
+  saveOtmEvaluationWindowState,
   type OtmEvaluationLivenessInputs,
+  type OtmEvaluationVerdictStatus,
 } from './otm-evaluation-window.js';
 // TRA-3974 — the post-pin cost accumulator must be subscribed BEFORE the
 // live-enforce ledger hydrates (see the hydrate block below for why).
@@ -11012,6 +11019,64 @@ async function tickOtmEvaluationWindowNow(): Promise<Awaited<ReturnType<typeof t
     records: await listOptionTradeJournal(),
   });
 }
+
+// TRA-3945 — the verdict WRITER on the wire (QuantTrader fd917f86, 2026-08-26).
+//
+// The verdict owner is an agent with no shell on the host's data dir, so the
+// hand-run script alone left every terminal — including the starved
+// `verdict_insufficient_population` the record's own `populationRuling`
+// names — unwritable. Same shape as TRA-4004's supersede: dry-run by default,
+// `apply=true` requires `confirm=TRA-3945`, admin only, once only. The code
+// still never pronounces — this route only carries a human's ruling onto the
+// record, and `atN` is read off the fold in the same beat, never supplied.
+app.post('/api/health/otm-evaluation-window/verdict', requireAuth, requireAdmin, async (req, res) => {
+  const q = req.query as Record<string, unknown>;
+  const wantsApply = q['apply'] === 'true' || q['apply'] === '1';
+  const confirmed = q['confirm'] === 'TRA-3945';
+  if (wantsApply && !confirmed) {
+    res.status(400).json({
+      ok: false,
+      error: 'apply=true requires confirm=TRA-3945',
+      detail: 'A verdict freezes the pre-registered window for good (once only, no overwrite). The confirmation is what keeps a mistyped flag in the dry-run branch.',
+    });
+    return;
+  }
+  const apply = wantsApply && confirmed;
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const status = typeof body['status'] === 'string' ? body['status'] : null;
+  const by = typeof body['by'] === 'string' && body['by'].trim() !== '' ? body['by'].trim() : null;
+  const note = typeof body['note'] === 'string' && body['note'].trim() !== '' ? body['note'].trim() : null;
+  if (!status || !(OTM_EVALUATION_VERDICT_STATUSES as readonly string[]).includes(status) || !by || !note) {
+    res.status(400).json({
+      ok: false,
+      error: `body requires {status: ${OTM_EVALUATION_VERDICT_STATUSES.join('|')}, by, note containing a TRA-nnnn ref}`,
+    });
+    return;
+  }
+  try {
+    const now = Date.now();
+    const prev = await loadOtmEvaluationWindowState();
+    const readout = foldOtmEvaluationWindow(await listOptionTradeJournal(), prev, now);
+    const next = applyOtmEvaluationVerdict(prev, { status: status as OtmEvaluationVerdictStatus, by, note, atN: readout.n }, now);
+    const summary = {
+      statusBefore: otmEvaluationWindowStatus(prev),
+      n: readout.n,
+      closesRemaining: readout.closesRemaining,
+      criteria: readout.criteria,
+      verdict: next.verdict,
+    };
+    if (!apply) {
+      res.json({ ok: true, applied: false, wouldWrite: summary, note: 'dry run - add ?apply=true&confirm=TRA-3945 to write' });
+      return;
+    }
+    await saveOtmEvaluationWindowState(next);
+    log.warn('TRA-3945 OTM evaluation window VERDICT written by hand', { ...summary, by });
+    const record = await tickOtmEvaluationWindowNow();
+    res.json({ ok: true, applied: true, ...summary, statusAfter: record.status, wire: 'GET /api/health/options-live .evaluationWindow' });
+  } catch (err) {
+    res.status(409).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+});
 
 app.get('/api/health/options-live', async (_req, res) => {
   try {

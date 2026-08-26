@@ -14,6 +14,7 @@ import {
   emptyOtmEvaluationWindowState,
   evaluateOtmEvaluationLiveness,
   foldOtmEvaluationWindow,
+  otmEvaluationCadence,
   otmEvaluationStats,
   otmEvaluationWindowStatus,
   resolveOtmEvaluationPopulationCell,
@@ -292,6 +293,58 @@ describe('TRA-3945 extension + verdict', () => {
     expect(after.changed).toBe(false);
     expect(otmEvaluationWindowStatus(after.state)).toBe('verdict_fail');
     expect(() => applyOtmEvaluationVerdict(emptyOtmEvaluationWindowState(), { status: 'verdict_pass', note: 'TRA-3945', by: 'QuantTrader' }, T0)).toThrow(/never opened/);
+  });
+
+  it('verdict_insufficient_population (QuantTrader fd917f86) is accepted ONLY while n < target, once, and freezes the machine', () => {
+    const s = opened();
+    const L = evaluateOtmEvaluationLiveness(ALL_TRUE);
+    // needs the counted n it is written at
+    expect(() => applyOtmEvaluationVerdict(s, { status: 'verdict_insufficient_population', note: 'TRA-3945: starved', by: 'QuantTrader' }, T0)).toThrow(/atN/);
+    // a FULL sample is graded pass/fail, never retired as starved
+    expect(() => applyOtmEvaluationVerdict(s, { status: 'verdict_insufficient_population', note: 'TRA-3945', by: 'QuantTrader', atN: OTM_EVALUATION_TARGET_CLOSES }, T0)).toThrow(/never retired/);
+    // the live shape: n=1 against $6.74 of admission vs a $50 floor
+    const v = applyOtmEvaluationVerdict(s, { status: 'verdict_insufficient_population', note: 'TRA-3945: sumAdmissibleEntryUsd $6.74 vs $50 contract floor', by: 'QuantTrader', atN: 1 }, T0);
+    expect(otmEvaluationWindowStatus(v)).toBe('verdict_insufficient_population');
+    expect(v.verdict?.atN).toBe(1);
+    // one verdict, ever
+    expect(() => applyOtmEvaluationVerdict(v, { status: 'verdict_pass', note: 'TRA-3945', by: 'QuantTrader', atN: 30 }, T0)).toThrow(/already written/);
+    // an unknown status is refused before anything else is checked
+    expect(() => applyOtmEvaluationVerdict(s, { status: 'verdict_maybe' as never, note: 'TRA-3945', by: 'QuantTrader' }, T0)).toThrow(/must be one of/);
+    // the state machine is frozen and the record echoes the terminal
+    const after = stepOtmEvaluationWindow(v, evaluateOtmEvaluationLiveness({ ...ALL_TRUE, liveOtmRouting: false }), PIN, [], T0 + H);
+    expect(after.changed).toBe(false);
+    const rec = buildOtmEvaluationWindowRecord(after.state, L, true, foldOtmEvaluationWindow([], after.state, T0 + H));
+    expect(rec.status).toBe('verdict_insufficient_population');
+    expect(rec.verdictWriter.statuses).toContain('verdict_insufficient_population');
+    expect(rec.insufficientPopulation.status).toBe('verdict_insufficient_population');
+  });
+
+  it('cadence: RTH sessions completed since the stamp, closes per session, projection; a zero rate projects null, never 0', () => {
+    // opened() stamps at T0 - H = 2026-08-24T12:30Z = 08:30 ET Monday, before that day's close
+    const s = opened();
+    const L = evaluateOtmEvaluationLiveness(ALL_TRUE);
+    const wedPreOpen = Date.UTC(2026, 7, 26, 12, 0); // 08:00 ET Wed: Mon + Tue complete, Wed not
+    expect(otmEvaluationCadence(s, 0, wedPreOpen)).toEqual(expect.objectContaining({
+      rthSessionsElapsed: 2, closesPerSession: 0, projectedSessionsToTarget: null,
+    }));
+    // the live arithmetic in fd917f86: 1 close / 2 sessions => 29 more is 58 sessions
+    const c1 = otmEvaluationCadence(s, 1, wedPreOpen);
+    expect(c1?.closesPerSession).toBe(0.5);
+    expect(c1?.projectedSessionsToTarget).toBe(58);
+    // Wed counts once its 16:00 ET close has passed; the weekend adds nothing
+    expect(otmEvaluationCadence(s, 1, Date.UTC(2026, 7, 26, 20, 30))?.rthSessionsElapsed).toBe(3);
+    expect(otmEvaluationCadence(s, 1, Date.UTC(2026, 7, 29, 20, 30))?.rthSessionsElapsed).toBe(5);
+    // a window that opened AFTER the close does not count its own stamp day
+    const lateOpen = { ...s, startedAt: Date.UTC(2026, 7, 24, 21, 0) }; // 17:00 ET Mon
+    expect(otmEvaluationCadence(lateOpen, 0, Date.UTC(2026, 7, 25, 21, 0))?.rthSessionsElapsed).toBe(1);
+    // target reached => 0 sessions to go
+    expect(otmEvaluationCadence(s, OTM_EVALUATION_TARGET_CLOSES, wedPreOpen)?.projectedSessionsToTarget).toBe(0);
+    // armed (never stamped) => null, and the record keys the read off lastTickAt
+    expect(otmEvaluationCadence(emptyOtmEvaluationWindowState(), 0, wedPreOpen)).toBeNull();
+    const st = stepOtmEvaluationWindow(s, L, PIN, [], wedPreOpen).state;
+    const rec = buildOtmEvaluationWindowRecord(st, L, true, foldOtmEvaluationWindow([], st, wedPreOpen));
+    expect(rec.cadence?.rthSessionsElapsed).toBe(2);
+    expect(rec.cadence?.asOf).toBe(new Date(wedPreOpen).toISOString());
   });
 });
 
