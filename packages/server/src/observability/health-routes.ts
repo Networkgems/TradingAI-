@@ -5482,7 +5482,12 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // Observe-only: reading this never routes an order.
   app.get('/api/health/live-nav-tripwire', (_req, res) => {
     const nowMs = now();
-    const summary = summarizeLiveNavTripwire();
+    // TRA-4001 — the read instant is passed in so "is today's row due yet" is decided
+    // against the same clock the response is stamped with.
+    const summary = summarizeLiveNavTripwire(45, undefined, nowMs);
+    // TRA-4001 — the observation-window suffix every coverage-bearing note carries, so a
+    // reader can see the denominator's edges without opening `coverage`.
+    const windowSuffix = `Observing since ${summary.observation?.startEtDay ?? 'UNKNOWN'} (${summary.observation?.source ?? 'no marker'}); ${summary.coverage.marketDaysPending.length} pending (not yet due), ${summary.coverage.marketDaysNotMeasured.length} NOT MEASURED (pre-observation) of ${summary.coverage.marketDaysInWindow} calendar session(s).`;
     res.json({
       ok: true,
       time: new Date(nowMs).toISOString(),
@@ -5490,21 +5495,25 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       etDay: etDateString(new Date(nowMs)),
       ...summary,
       note:
-        summary.verdict === null
-          ? 'BLIND — no NYSE session in the window. Not a clean bill of health.'
-          : summary.verdict === 'fail'
-            ? `FAIL — live-money NAV tripwire fired. Last fail ${summary.lastFailDay}. See byDay[].axes and lagBooks.`
-            : summary.consecutiveMissingSessions > 0
-              ? `WRITER DOWN — ${summary.consecutiveMissingSessions} consecutive session(s) with no assertion row. Realized coverage ${summary.coverage.marketDaysRecorded}/${summary.coverage.marketDaysExpected}. This is the TRA-3449 failure mode itself, one layer down.`
-              : summary.verdict === 'blind'
-                ? `BLIND — graded, not clean. ${summary.coverage.marketDaysMissing.length} missing session(s); latest ungraded books: ${
-                    (summary.latest?.ungradedBooks ?? []).map((b) => `${b.username}=${b.reason}`).join(', ') || 'none'
-                  }.`
-                : summary.verdict === 'vacuous'
-                  ? `VACUOUS — the tripwire RAN and had NOTHING to grade. ${summary.vacuity.consecutiveVacuousSessions} consecutive graded session(s) with a ZERO post-onset trip-capable denominator; ${summary.vacuity.sessionsWithTripCapableEvidence}/${summary.coverage.marketDaysRecorded} recorded session(s) carried any evidence. Books at zero: ${
-                      summary.vacuity.vacuousBooks.map((b) => `${b.username}=${b.reason}`).join(', ') || 'none'
-                    }. This is NOT a pass — see TRA-3450.`
-                  : `CLEAN — every NYSE session in the window has a graded, passing row over a NON-EMPTY post-onset trip-capable denominator (${summary.coverage.marketDaysRecorded}/${summary.coverage.marketDaysExpected}).${
+        summary.driver?.reason === 'no_observation_start'
+          ? `NOT MEASURED — no observation-start marker and no row: the ledger has no denominator, so coverage cannot be reported. Not a clean bill of health. ${windowSuffix} See TRA-4001.`
+          : summary.verdict === null
+            ? summary.coverage.marketDaysInWindow === 0
+              ? 'BLIND — no NYSE session in the window. Not a clean bill of health.'
+              : `NOT MEASURED — no session has fallen DUE since observation started. Not a clean bill of health and not a failure. ${windowSuffix} See TRA-4001.`
+            : summary.verdict === 'fail'
+              ? `FAIL — live-money NAV tripwire fired. Last fail ${summary.lastFailDay}. See byDay[].axes and lagBooks.`
+              : summary.consecutiveMissingSessions > 0
+                ? `WRITER DOWN — ${summary.consecutiveMissingSessions} consecutive DUE session(s) with no assertion row. Realized coverage ${summary.coverage.marketDaysRecorded}/${summary.coverage.marketDaysExpected} over due sessions since observation start. This is the TRA-3449 failure mode itself, one layer down. ${windowSuffix}`
+                : summary.verdict === 'blind'
+                  ? `BLIND — graded, not clean. ${summary.coverage.marketDaysMissing.length} missing DUE session(s); latest ungraded books: ${
+                      (summary.latest?.ungradedBooks ?? []).map((b) => `${b.username}=${b.reason}`).join(', ') || 'none'
+                    }. ${windowSuffix}`
+                  : summary.verdict === 'vacuous'
+                    ? `VACUOUS — the tripwire RAN and had NOTHING to grade. ${summary.vacuity.consecutiveVacuousSessions} consecutive graded session(s) with a ZERO post-onset trip-capable denominator; ${summary.vacuity.sessionsWithTripCapableEvidence}/${summary.coverage.marketDaysRecorded} recorded session(s) carried any evidence. Books at zero: ${
+                        summary.vacuity.vacuousBooks.map((b) => `${b.username}=${b.reason}`).join(', ') || 'none'
+                      }. This is NOT a pass — see TRA-3450. ${windowSuffix}`
+                    : `CLEAN — every DUE NYSE session since observation start has a graded, passing row over a NON-EMPTY post-onset trip-capable denominator (${summary.coverage.marketDaysRecorded}/${summary.coverage.marketDaysExpected}). ${windowSuffix}${
                       // TRA-3952 — a clean that was graded over a SCOPED cohort says so, by name.
                       (summary.vacuity.latestScope?.excludedNoOnset.length ?? 0) > 0
                         ? ` Outside the lagDenominator gate (no live-options onset, no options P&L): ${summary.vacuity.latestScope!.excludedNoOnset.join(', ')} — see vacuity.latestScope (TRA-3952).`

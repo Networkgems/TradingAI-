@@ -187,6 +187,54 @@
  * A fetch that throws, times out, or returns non-200 STILL writes a row —
  * `source: 'unreachable'`, `verdict: 'blind'`. Only a process that is not running at all
  * leaves no row, and that is what the calendar-derived `missing` day catches.
+ *
+ * ## TRA-4001 — the coverage axis had no OBSERVATION-START marker
+ *
+ * Measured on the served endpoint at 2026-08-25T18:43Z, twelve sessions into the ledger's
+ * life: `WRITER DOWN - 1 consecutive session(s)`, `realizedCoverage 0.25` (8/32) — while the
+ * ledger held an UNBROKEN run of 12 served rows, 2026-08-13..2026-08-24, `appendErrors 0`.
+ * The 24 sessions scored `missing` decomposed as 23 that PREDATE the ledger's own first row
+ * and 1 that was TODAY, pulled at 14:44 ET against a writer that fires at 21:00 ET.
+ *
+ * Both readings fall out of one omission: `summarizeLiveNavTripwire` denominated over a
+ * fixed 45-calendar-day window with no notion of WHEN the ledger started observing or WHEN a
+ * session's row falls due. "Never observed" was reported as "observed and absent", and an
+ * in-flight session was reported as a lost one — so the route said WRITER DOWN for ~21 hours
+ * of every 24, and 25% coverage over a writer that was 12-of-12. That reading is IDENTICAL
+ * to the real writer-down state this ledger was built to catch (STEP J of routine 8d2c80a9:
+ * three lost fires, 0% coverage 08-06..08-12). It is the pinned-red mirror of the false-green
+ * TRA-3449 exists to prevent, and equally unusable: a reader who sees WRITER DOWN every day
+ * stops reading, which is exactly how the next genuinely lost fire goes unnoticed.
+ *
+ * ### The repair, in four parts
+ *
+ *  (a) A persisted per-deployment **observation-start marker**
+ *      (`live-nav-tripwire.observation-start.json`, written beside the ledger on the first
+ *      hydrate that finds none, never moved forward). The effective observation start is the
+ *      EARLIER of that marker and the ledger's first row, so a writer that is dead from its
+ *      first boot is still caught — a marker that only appeared with the first row would
+ *      make "never wrote anything" permanently unmeasurable, which is the memory lesson
+ *      behind `boot-arm-repair-ledger.ts` applied here.
+ *  (b) A session is **DUE** only once its 21:00 ET writer slot plus a short grace has
+ *      passed ({@link liveNavWriterDueAtMs}). Before that it sits in its own `pending`
+ *      bucket — never `missing`.
+ *  (c) Sessions whose writer slot precedes the observation start are **`not_measured`** —
+ *      published as a named, counted bucket (`coverage.marketDaysNotMeasured`), neither
+ *      folded into `missing` nor into `recorded` nor silently dropped. Zero rows under the
+ *      window floor is NOT MEASURED; it is not clean and it is not a failure.
+ *  (d) The `writer` / `no_assertion_row` driver, `consecutiveMissingSessions` and
+ *      `realizedCoverage` all key on DUE sessions since observation start, so WRITER DOWN
+ *      can only fire when a session that genuinely owed a row has none.
+ *
+ * The calendar count of the window is kept, renamed `coverage.marketDaysInWindow`;
+ * `marketDaysExpected` is now the MEASURED denominator (`recorded + missing`) and the
+ * `signalClasses` partition holds over it exactly as before. The four buckets partition the
+ * window's sessions: `recorded + missing + pending + notMeasured === marketDaysInWindow`.
+ *
+ * Both branches stay reachable, and the tests hold them: a served row deleted or torn inside
+ * the observation window produces EXACTLY one `missing` DUE session (positive control); a
+ * same-day pull before the writer slot reports that day `pending` at 100% realized coverage
+ * (negative control). A repair that only loosened the failing branch would be a softening.
  */
 
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
@@ -208,6 +256,30 @@ export const LIVE_NAV_TRIPWIRE_FILENAME = 'live-nav-tripwire.jsonl';
  * is not for the per-book ledgers.
  */
 const RETAIN_MS = 400 * 24 * 60 * 60 * 1000;
+
+/**
+ * TRA-4001 — the observation-start sidecar. A separate file rather than a marker line in
+ * the JSONL: `validRecord` (and every build before this one) drops non-`assert` lines on
+ * compaction, so a marker row would not survive a rollback. The sidecar is inert to old
+ * builds and is never compacted.
+ */
+export const LIVE_NAV_OBSERVATION_START_FILENAME = 'live-nav-tripwire.observation-start.json';
+
+/**
+ * TRA-4001 — the ET hour the writer is scheduled for. The tick hangs LAST off the
+ * `onArchive` hook, which the scheduler fires at-or-after 21:00 ET once per ET day
+ * (`scheduler.ts`, TRA-388). A session's row is not owed before this.
+ */
+export const LIVE_NAV_WRITER_EXPECTED_ET_HOUR = 21;
+
+/**
+ * TRA-4001 — how long after the 21:00 ET slot a session is still `pending` rather than
+ * `missing`. The archive chain runs several closes before this tick (measured ~50s on
+ * 2026-08-24: row `payloadTime` 2026-08-25T01:00:50Z), and a post-21:00 restart re-fires the
+ * archive on boot. Thirty minutes covers both without hiding a real outage past the same
+ * evening — a writer that is down at 21:30 ET reads WRITER DOWN at 21:30 ET.
+ */
+export const LIVE_NAV_WRITER_DUE_GRACE_MS = 30 * 60 * 1000;
 
 /** The four served scalars this gate keys on. Named once so the ungradeable cross-check can use them. */
 export const LIVE_NAV_GRADED_FIELDS = [
@@ -544,6 +616,36 @@ export interface LiveNavTripwireRecord extends LiveNavGrade {
 export function liveNavEtDay(utcMs: number): string {
   const shifted = utcMs + getEasternUtcOffset(utcMs) * 3_600_000;
   return new Date(shifted).toISOString().slice(0, 10);
+}
+
+/**
+ * TRA-4001 — UTC ms of an ET wall-clock instant on an ET calendar day (DST-aware).
+ *
+ * Solved by fixed point rather than by a guessed offset: take the EDT reading, ask the
+ * shared offset function what the offset actually is AT that instant, and re-derive. The
+ * two agree everywhere except inside the DST transition hour, where the second pass lands
+ * on the correct side.
+ */
+export function liveNavEtWallClockToUtcMs(etDay: string, hour: number, minute = 0): number {
+  const [y, m, d] = etDay.split('-').map(Number);
+  const naive = Date.UTC(y!, m! - 1, d!, hour, minute);
+  let guess = naive - getEasternUtcOffset(naive + 4 * 3_600_000) * 3_600_000;
+  const off = getEasternUtcOffset(guess);
+  guess = naive - off * 3_600_000;
+  return guess;
+}
+
+/** TRA-4001 — the instant the writer is SCHEDULED for on an ET session day (21:00 ET). */
+export function liveNavWriterExpectedAtMs(etDay: string): number {
+  return liveNavEtWallClockToUtcMs(etDay, LIVE_NAV_WRITER_EXPECTED_ET_HOUR, 0);
+}
+
+/**
+ * TRA-4001 — the instant a session's row falls DUE: scheduled slot plus grace. Before this
+ * a session with no row is `pending`; at or after it, `missing`.
+ */
+export function liveNavWriterDueAtMs(etDay: string): number {
+  return liveNavWriterExpectedAtMs(etDay) + LIVE_NAV_WRITER_DUE_GRACE_MS;
 }
 
 // ── Grading (pure) ───────────────────────────────────────────────────────────
@@ -905,8 +1007,35 @@ let appendErrors = 0;
 let lastAppendError: string | null = null;
 let hydratedRecords = 0;
 
+/**
+ * TRA-4001 — the persisted observation-start marker, as stored in the sidecar.
+ *
+ * `firstBootTs` is the instant this ledger FIRST hydrated against this data dir, and it is
+ * never moved forward: a later boot only bumps `boots` / `lastBootTs`. That is what makes
+ * a multi-day outage read as `missing` rather than as a fresh start — the marker belongs to
+ * the data dir, not to the process (an ephemeral dir loses it, and `durability.ephemeral`
+ * says so).
+ */
+export interface LiveNavObservationMarker {
+  kind: 'observation_start';
+  firstBootTs: number;
+  firstBootEtDay: string;
+  lastBootTs: number;
+  /** Hydrates seen. `>= 2` with `hydratedRecords >= 1` is a production proof rows survive a restart. */
+  boots: number;
+}
+
+let observationMarker: LiveNavObservationMarker | null = null;
+let observationMarkerError: string | null = null;
+/** Test seam only — see {@link seedLiveNavObservationStartForTest}. */
+let observationStartOverride: number | null = null;
+
 export function liveNavTripwireLogPath(dir: string): string {
   return join(dir, LIVE_NAV_TRIPWIRE_FILENAME);
+}
+
+export function liveNavObservationStartPath(dir: string): string {
+  return join(dir, LIVE_NAV_OBSERVATION_START_FILENAME);
 }
 
 export function clearLiveNavTripwire(): void {
@@ -915,11 +1044,123 @@ export function clearLiveNavTripwire(): void {
   appendErrors = 0;
   lastAppendError = null;
   hydratedRecords = 0;
+  observationMarker = null;
+  observationMarkerError = null;
+  observationStartOverride = null;
 }
 
 /** Test seam — inject rows without touching disk. */
 export function seedLiveNavTripwireForTest(recs: LiveNavTripwireRecord[]): void {
   for (const r of recs) rows.set(r.etDay, r);
+}
+
+/**
+ * Test seam — pin the observation start without a hydrate or a row. Takes part in the
+ * same MIN fold as the marker and the first row, so it can only move the start EARLIER.
+ */
+export function seedLiveNavObservationStartForTest(ts: number | null): void {
+  observationStartOverride = ts;
+}
+
+function validMarker(v: unknown): LiveNavObservationMarker | null {
+  if (typeof v !== 'object' || v === null) return null;
+  const m = v as Record<string, unknown>;
+  if (m.kind !== 'observation_start') return null;
+  if (typeof m.firstBootTs !== 'number' || !Number.isFinite(m.firstBootTs)) return null;
+  return {
+    kind: 'observation_start',
+    firstBootTs: m.firstBootTs,
+    firstBootEtDay:
+      typeof m.firstBootEtDay === 'string' ? m.firstBootEtDay : liveNavEtDay(m.firstBootTs),
+    lastBootTs: typeof m.lastBootTs === 'number' && Number.isFinite(m.lastBootTs) ? m.lastBootTs : m.firstBootTs,
+    boots: typeof m.boots === 'number' && Number.isFinite(m.boots) && m.boots >= 1 ? Math.floor(m.boots) : 1,
+  };
+}
+
+/**
+ * TRA-4001 — load-or-create the observation-start marker on hydrate.
+ *
+ * Memory first, disk best-effort, same discipline as `appendRow`: a sidecar that cannot be
+ * written must not cost the boot, and the in-memory marker still pins the start for this
+ * process's lifetime. `observationMarkerError` is published under `observation` so a
+ * memory-only marker cannot pass for a durable one.
+ */
+function loadOrCreateObservationMarker(dir: string, now: number): void {
+  const path = liveNavObservationStartPath(dir);
+  let existing: LiveNavObservationMarker | null = null;
+  try {
+    existing = validMarker(JSON.parse(readFileSync(path, 'utf8')));
+  } catch {
+    existing = null;
+  }
+  const next: LiveNavObservationMarker = existing
+    ? { ...existing, lastBootTs: now, boots: existing.boots + 1 }
+    : {
+        kind: 'observation_start',
+        firstBootTs: now,
+        firstBootEtDay: liveNavEtDay(now),
+        lastBootTs: now,
+        boots: 1,
+      };
+  observationMarker = next;
+  observationMarkerError = null;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+  } catch {
+    // exists / unwritable — the write below surfaces it
+  }
+  try {
+    writeFileSync(path, JSON.stringify(next) + '\n', 'utf8');
+  } catch (err) {
+    observationMarkerError = err instanceof Error ? err.message : String(err);
+    log.warn('live-nav-tripwire observation-start marker write failed (TRA-4001)', {
+      reason: observationMarkerError,
+    });
+  }
+}
+
+/** TRA-4001 — where the effective observation start came from. */
+export type LiveNavObservationStartSource = 'marker' | 'first_row' | 'test';
+
+export interface LiveNavObservationStart {
+  /** The EARLIEST of the marker's first boot and the ledger's first row. */
+  startTs: number;
+  startEtDay: string;
+  source: LiveNavObservationStartSource;
+  /** The persisted marker, or `null` when no hydrate has run in this process. */
+  marker: LiveNavObservationMarker | null;
+  /** Non-null when the marker exists in memory but could not be written to disk. */
+  markerError: string | null;
+  /** Earliest row's `etDay`, or `null` on an empty ledger. */
+  firstRowEtDay: string | null;
+}
+
+/**
+ * TRA-4001 — resolve the observation start. `null` only when NOTHING pins it: no hydrate
+ * has run, the ledger is empty, and no test seam is set. That state is an instrument hole
+ * (nothing can be measured against it) and the summary grades it `blind`, never clean.
+ */
+export function resolveLiveNavObservationStart(): LiveNavObservationStart | null {
+  let best: { ts: number; source: LiveNavObservationStartSource } | null = null;
+  const consider = (ts: number | null | undefined, source: LiveNavObservationStartSource): void => {
+    if (typeof ts !== 'number' || !Number.isFinite(ts)) return;
+    if (best === null || ts < best.ts) best = { ts, source };
+  };
+  consider(observationMarker?.firstBootTs, 'marker');
+  let firstRow: LiveNavTripwireRecord | null = null;
+  for (const r of rows.values()) if (firstRow === null || r.ts < firstRow.ts) firstRow = r;
+  consider(firstRow?.ts, 'first_row');
+  consider(observationStartOverride, 'test');
+  if (best === null) return null;
+  const chosen = best as { ts: number; source: LiveNavObservationStartSource };
+  return {
+    startTs: chosen.ts,
+    startEtDay: liveNavEtDay(chosen.ts),
+    source: chosen.source,
+    marker: observationMarker,
+    markerError: observationMarkerError,
+    firstRowEtDay: firstRow === null ? null : (firstRow as LiveNavTripwireRecord).etDay,
+  };
 }
 
 function validRecord(v: unknown): LiveNavTripwireRecord | null {
@@ -1087,17 +1328,43 @@ export function hydrateLiveNavTripwireFromDisk(dir: string, now: number = Date.n
   }
 
   hydratedRecords = kept.length;
+
+  // TRA-4001 — pin the observation start. AFTER the rows so a ledger copied in from an older
+  // deployment keeps its own (earlier) start via the MIN fold in `resolveLiveNavObservationStart`.
+  loadOrCreateObservationMarker(dir, now);
+
   return { days: rows.size, records: kept.length };
 }
 
 // ── Health summary ───────────────────────────────────────────────────────────
 
+/**
+ * TRA-4001 — which coverage bucket a day sits in. The four session buckets PARTITION the
+ * window's sessions; `non_session` is a weekend/holiday and carries no expectation.
+ *
+ * - `recorded`     — a row exists (any verdict).
+ * - `missing`      — DUE, inside the observation window, and no row. THE writer-down state.
+ * - `pending`      — inside the observation window but the writer slot (+ grace) has not
+ *                    passed yet. Today, before 21:30 ET. Never a miss.
+ * - `not_measured` — the writer slot precedes the observation start; the ledger did not
+ *                    exist to observe it. Neither clean nor failed, and never silent.
+ */
+export type LiveNavDayBucket = 'recorded' | 'missing' | 'pending' | 'not_measured' | 'non_session';
+
 /** A day in the window that SHOULD have a row. `missing` is the whole point of this module. */
 export interface LiveNavDaySummary extends LiveNavSignals {
   etDay: string;
   marketDay: boolean;
-  /** `missing` — the assertion did not run at all that day. Distinguishable from `clean`. */
-  verdict: LiveNavVerdict | 'missing';
+  /**
+   * `missing` — the assertion was DUE and did not run. Distinguishable from `clean`.
+   * TRA-4001 — `pending` (not yet due) and `not_measured` (pre-observation) are their own
+   * verdicts so neither can read as a miss OR as a clean.
+   */
+  verdict: LiveNavVerdict | 'missing' | 'pending' | 'not_measured';
+  /** TRA-4001 — the coverage bucket, published so the partition is checkable per day. */
+  bucket: LiveNavDayBucket;
+  /** TRA-4001 — ISO instant the session's row falls due; `null` on a non-session. */
+  dueAt: string | null;
   source: 'served' | 'unreachable' | null;
   axes: LiveNavTripwireRecord['axes'] | null;
   lagBooks: Array<{ username: string; dates: string[] }>;
@@ -1139,19 +1406,44 @@ export interface LiveNavTripwireSummary extends LiveNavSignals {
   /** Newest first. */
   byDay: LiveNavDaySummary[];
   coverage: {
-    /** NYSE sessions in the window, from the INDEPENDENT calendar — not from the rows. */
+    /**
+     * TRA-4001 — names the denominator so a consumer cannot mistake it for the calendar
+     * count it used to be.
+     */
+    denominator: 'due_sessions_since_observation_start';
+    /** NYSE sessions in the CALENDAR window, from the independent calendar — not from the rows. */
+    marketDaysInWindow: number;
+    /**
+     * Sessions that OWED a row: `marketDaysRecorded + marketDaysMissing.length`. Before
+     * TRA-4001 this was the calendar count, which counted sessions the ledger never
+     * existed for and today's not-yet-due session as writer failures.
+     */
     marketDaysExpected: number;
     /** Sessions with a row of any verdict. */
     marketDaysRecorded: number;
-    /** Sessions with NO row. THE metric TRA-3449 exists to publish. */
+    /** DUE sessions since observation start with NO row. THE metric TRA-3449 exists to publish. */
     marketDaysMissing: string[];
-    /** `marketDaysRecorded / marketDaysExpected`, or `null` on an empty window. */
+    /** TRA-4001 — sessions inside the observation window whose row is not yet due. Newest first. */
+    marketDaysPending: string[];
+    /** TRA-4001 — sessions the ledger did not exist to observe. Newest first. A named bucket, never dropped. */
+    marketDaysNotMeasured: string[];
+    /** `marketDaysRecorded / marketDaysExpected`, or `null` when nothing was owed. */
     realizedCoverage: number | null;
   };
+  /**
+   * TRA-4001 — the observation start the coverage axis denominates from. `null` when nothing
+   * pins it (no hydrate, no row), in which case the window grades `blind` /
+   * `no_observation_start` — an instrument with no start cannot report coverage.
+   */
+  observation: LiveNavObservationStart | null;
   latest: LiveNavTripwireRecord | null;
   /** Most recent day whose verdict was `fail`, or null. */
   lastFailDay: string | null;
-  /** Consecutive most-recent market days with no row. >0 means the writer is down NOW. */
+  /**
+   * Consecutive most-recent DUE sessions with no row. >0 means the writer is down NOW.
+   * TRA-4001 — a `pending` session is skipped over, not counted and not a break; a
+   * `not_measured` one ends the run.
+   */
   consecutiveMissingSessions: number;
   /**
    * TRA-3450 — the vacuity record. Separate from `coverage`: coverage answers "did the check
@@ -1207,29 +1499,64 @@ function prevDay(iso: string): string {
  *
  * `windowEndEtDay` is normally today. It is a parameter so the tests can pin a window and
  * so a caller can ask "what did the last 30 sessions look like as of the 12th".
+ *
+ * TRA-4001 — `nowMs` is the read instant, needed to decide whether a session's row is DUE
+ * yet. The window end defaults to its ET day. A test that pins `windowEndEtDay` in the past
+ * without `nowMs` sees every session in that window as due, which is the pre-TRA-4001
+ * reading for a window that is entirely behind us — the right one.
  */
 export function summarizeLiveNavTripwire(
   dayLimit = 45,
-  windowEndEtDay: string = liveNavEtDay(Date.now()),
+  windowEndEtDay?: string,
+  nowMs: number = Date.now(),
 ): LiveNavTripwireSummary {
+  const windowEnd = windowEndEtDay ?? liveNavEtDay(nowMs);
   const calendarDays: string[] = [];
-  let cursor = windowEndEtDay;
+  let cursor = windowEnd;
   for (let i = 0; i < dayLimit; i += 1) {
     calendarDays.push(cursor);
     cursor = prevDay(cursor);
   }
 
+  const observation = resolveLiveNavObservationStart();
+
   const byDay: LiveNavDaySummary[] = calendarDays.map((etDay) => {
     const rec = rows.get(etDay);
     const marketDay = isMarketDayIso(etDay);
+    const dueAtMs = marketDay ? liveNavWriterDueAtMs(etDay) : null;
+    const dueAt = dueAtMs === null ? null : new Date(dueAtMs).toISOString();
     if (!rec) {
+      // TRA-4001 — bucket a rowless session by WHEN it was owed, not merely by whether it
+      // was a session. Order matters: a session whose writer slot precedes the observation
+      // start is `not_measured` even if it is also long past due — the ledger did not exist
+      // to miss it. A session inside the observation window that is not yet due is
+      // `pending`. Only a DUE session inside the window is `missing`.
+      const bucket: LiveNavDayBucket = !marketDay
+        ? 'non_session'
+        : observation === null || liveNavWriterExpectedAtMs(etDay) < observation.startTs
+          ? 'not_measured'
+          : nowMs < (dueAtMs as number)
+            ? 'pending'
+            : 'missing';
+      const missing = bucket === 'missing';
       return {
         etDay,
         marketDay,
+        bucket,
+        dueAt,
         // A non-session with no row is NOT a miss — the assertion is only expected after
         // the 21:00 archive on a trading day. Folding weekends in would bury a real miss
-        // under ~30% expected absence (the TRA-2930 denominator mistake).
-        verdict: marketDay ? ('missing' as const) : ('clean' as const),
+        // under ~30% expected absence (the TRA-2930 denominator mistake). A pending or
+        // pre-observation session is not a miss either, and is not `clean`: it carries its
+        // own verdict so it cannot be read as either.
+        verdict:
+          bucket === 'non_session'
+            ? ('clean' as const)
+            : bucket === 'missing'
+              ? ('missing' as const)
+              : bucket === 'pending'
+                ? ('pending' as const)
+                : ('not_measured' as const),
         // TRA-3711 — a session the writer never reached is a COVERAGE fact, so it rides
         // `degraded`, not `alarm`. It stays just as loud: `attention`, the named
         // `coverage.marketDaysMissing`, `consecutiveMissingSessions` and the route's
@@ -1237,9 +1564,9 @@ export function summarizeLiveNavTripwire(
         // channel, because the week TRA-3449 was filed for would then read the same as a
         // real-money NAV overstatement.
         alarm: false,
-        degraded: marketDay,
-        attention: marketDay,
-        driver: marketDay
+        degraded: missing,
+        attention: missing,
+        driver: missing
           ? { axis: 'writer', kind: 'coverage' as const, status: 'blind' as const, reason: 'no_assertion_row' }
           : null,
         source: null,
@@ -1256,6 +1583,8 @@ export function summarizeLiveNavTripwire(
     return {
       etDay,
       marketDay,
+      bucket: marketDay ? ('recorded' as const) : ('non_session' as const),
+      dueAt,
       verdict: rec.verdict,
       ...signals,
       source: rec.source,
@@ -1268,16 +1597,26 @@ export function summarizeLiveNavTripwire(
     };
   });
 
-  const sessions = byDay.filter((d) => d.marketDay);
-  const missing = sessions.filter((d) => d.verdict === 'missing').map((d) => d.etDay);
-  const recorded = sessions.length - missing.length;
+  const calendarSessions = byDay.filter((d) => d.marketDay);
+  const missing = calendarSessions.filter((d) => d.bucket === 'missing').map((d) => d.etDay);
+  const pending = calendarSessions.filter((d) => d.bucket === 'pending').map((d) => d.etDay);
+  const notMeasured = calendarSessions.filter((d) => d.bucket === 'not_measured').map((d) => d.etDay);
+  const recorded = calendarSessions.filter((d) => d.bucket === 'recorded').length;
+  // TRA-4001 — the sessions that OWED a row. Everything below folds over THIS set: a
+  // pending or pre-observation session carries no verdict and no signal, so it can neither
+  // drag the window red nor pad it green.
+  const sessions = calendarSessions.filter((d) => d.bucket === 'recorded' || d.bucket === 'missing');
 
-  // Only sessions carry a verdict. `fail` > `blind`/`missing` > `vacuous` > `clean`.
+  // Only owed sessions carry a verdict. `fail` > `blind`/`missing` > `vacuous` > `clean`.
   const anyFail = sessions.some((d) => d.verdict === 'fail');
   const anyBlind = sessions.some((d) => d.verdict === 'blind' || d.verdict === 'missing');
   const anyVacuous = sessions.some((d) => d.verdict === 'vacuous');
-  const verdict: LiveNavVerdict | null =
-    sessions.length === 0
+  // TRA-4001 — an instrument with NO observation start cannot report coverage at all. That
+  // is a hole in the instrument (`blind`), not a clean window and not an empty one.
+  const noObservationStart = observation === null && calendarSessions.length > 0;
+  const verdict: LiveNavVerdict | null = noObservationStart
+    ? 'blind'
+    : sessions.length === 0
       ? null
       : anyFail
         ? 'fail'
@@ -1292,19 +1631,25 @@ export function summarizeLiveNavTripwire(
   // session, picked by the same status rank, so `driver.axis` names the axis a reader
   // should go look at.
   const windowAlarm = sessions.some((d) => d.alarm);
-  const windowDegraded = sessions.some((d) => d.degraded);
-  const windowDriver =
-    sessions
-      .map((d) => d.driver)
-      .filter((d): d is LiveNavDriver => d !== null)
-      .sort((a, b) => (STATUS_RANK[b.status] ?? 0) - (STATUS_RANK[a.status] ?? 0))[0] ?? null;
+  const windowDegraded = noObservationStart || sessions.some((d) => d.degraded);
+  const windowDriver: LiveNavDriver | null = noObservationStart
+    ? { axis: 'writer', kind: 'coverage', status: 'blind', reason: 'no_observation_start' }
+    : (sessions
+        .map((d) => d.driver)
+        .filter((d): d is LiveNavDriver => d !== null)
+        .sort((a, b) => (STATUS_RANK[b.status] ?? 0) - (STATUS_RANK[a.status] ?? 0))[0] ?? null);
 
   const sessionsTrip = sessions.filter((d) => d.alarm).length;
   const sessionsDegradedOnly = sessions.filter((d) => !d.alarm && d.degraded).length;
 
+  // TRA-4001 — newest first over the CALENDAR sessions: a pending session is stepped over
+  // (it is not a miss and not evidence of recovery), a recorded one ends the run, and a
+  // pre-observation one ends it too — the writer cannot have been down for a session the
+  // ledger did not exist for.
   let consecutiveMissing = 0;
-  for (const d of sessions) {
-    if (d.verdict === 'missing') consecutiveMissing += 1;
+  for (const d of calendarSessions) {
+    if (d.bucket === 'pending') continue;
+    if (d.bucket === 'missing') consecutiveMissing += 1;
     else break;
   }
 
@@ -1314,7 +1659,7 @@ export function summarizeLiveNavTripwire(
   // TRA-3450 — vacuity is counted over GRADED sessions only. A `missing` session is a coverage
   // fact, already counted above; folding it in here would double-count the same absence under
   // two headings and make "the tripwire had nothing to grade" unreadable.
-  const gradedSessions = sessions.filter((d) => d.verdict !== 'missing');
+  const gradedSessions = sessions.filter((d) => d.bucket === 'recorded');
   const sessionsVacuous = gradedSessions.filter((d) => d.verdict === 'vacuous').length;
   const sessionsWithTripCapableEvidence = gradedSessions.filter(
     (d) => (d.postOnsetTripCapablePairs ?? 0) > 0,
@@ -1342,11 +1687,16 @@ export function summarizeLiveNavTripwire(
     },
     byDay,
     coverage: {
+      denominator: 'due_sessions_since_observation_start',
+      marketDaysInWindow: calendarSessions.length,
       marketDaysExpected: sessions.length,
       marketDaysRecorded: recorded,
       marketDaysMissing: missing,
+      marketDaysPending: pending,
+      marketDaysNotMeasured: notMeasured,
       realizedCoverage: sessions.length === 0 ? null : recorded / sessions.length,
     },
+    observation,
     latest,
     lastFailDay: sessions.find((d) => d.verdict === 'fail')?.etDay ?? null,
     consecutiveMissingSessions: consecutiveMissing,

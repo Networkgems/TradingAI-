@@ -21,7 +21,14 @@ import {
   summarizeLiveNavTripwire,
   clearLiveNavTripwire,
   liveNavTripwireLogPath,
+  liveNavObservationStartPath,
   liveNavEtDay,
+  liveNavEtWallClockToUtcMs,
+  liveNavWriterDueAtMs,
+  resolveLiveNavObservationStart,
+  seedLiveNavObservationStartForTest,
+  LIVE_NAV_OBSERVATION_START_FILENAME,
+  LIVE_NAV_WRITER_DUE_GRACE_MS,
   LIVE_NAV_TRIPWIRE_FILENAME,
   LIVE_NAV_GRADED_FIELDS,
   LIVE_NAV_FORBIDDEN_FIELDS,
@@ -373,6 +380,11 @@ describe('TRA-3449 AC2 — durable, and a missed day is distinguishable from a c
     dir = mkdtempSync(join(tmpdir(), 'tra3449-'));
     clearLiveNavTripwire();
     hydrateLiveNavTripwireFromDisk(dir, T('2026-08-13'));
+    // TRA-4001 — this block replays the 08-06..08-12 outage AS IF the ledger had been
+    // observing it. The hydrate above pins the marker at 08-13, which would (correctly, for
+    // the real ledger that did not exist then) file the whole window NOT MEASURED. Pin the
+    // start before the window so the replay grades what it was written to grade.
+    seedLiveNavObservationStartForTest(Date.parse('2026-08-05T00:00:00-04:00'));
   });
   afterEach(() => {
     clearLiveNavTripwire();
@@ -1040,6 +1052,9 @@ describe('TRA-3711 — the per-class split, measured on the same rows', () => {
     dir = mkdtempSync(join(tmpdir(), 'tra3711-'));
     clearLiveNavTripwire();
     hydrateLiveNavTripwireFromDisk(dir, T('2026-08-13'));
+    // TRA-4001 — see the AC2 block: the rowless 08-06/08-07 sessions below are meant to
+    // read `missing`, which needs an observation start before the window.
+    seedLiveNavObservationStartForTest(Date.parse('2026-08-05T00:00:00-04:00'));
   });
   afterEach(() => {
     clearLiveNavTripwire();
@@ -1597,5 +1612,275 @@ describe('TRA-3947 — FAIL-A is unsatisfiable, and that is an invariant, not a 
     // If this ever reads empty, the control has stopped biting and the assertion above
     // is no longer evidence — fix the control before trusting the green.
     expect(offenders.length).toBeGreaterThan(0);
+  });
+});
+
+// ── TRA-4001 — the coverage axis has an observation start, and a session is only owed once DUE ──
+
+describe('TRA-4001 — observation-start marker, DUE sessions, and the NOT MEASURED bucket', () => {
+  /**
+   * The served state at 2026-08-25T18:43:21Z, reconstructed row for row: 12 served rows on
+   * EVERY calendar day 2026-08-13..2026-08-24 (the archive fires daily, weekends included),
+   * each written at the writer's real slot (~21:00:50 ET), `appendErrors 0`. The reading the
+   * route gave for it was `WRITER DOWN - 1 consecutive session(s)` and `realizedCoverage
+   * 0.25` (8/32). This block pins what it must read instead, and — so the repaired axis is
+   * not itself unfalsifiable — what it must STILL read when a row is genuinely lost.
+   */
+  const LEDGER_DAYS = [
+    '2026-08-13', '2026-08-14', '2026-08-15', '2026-08-16', '2026-08-17', '2026-08-18',
+    '2026-08-19', '2026-08-20', '2026-08-21', '2026-08-22', '2026-08-23', '2026-08-24',
+  ];
+  /** The 23 sessions 2026-07-13..2026-08-12 that PREDATE the ledger. */
+  const PRE_LEDGER_SESSION_COUNT = 23;
+  /** The 8 sessions inside the ledger's life: 08-13, 14, 17, 18, 19, 20, 21, 24. */
+  const LEDGER_SESSIONS = ['2026-08-24', '2026-08-21', '2026-08-20', '2026-08-19', '2026-08-18', '2026-08-17', '2026-08-14', '2026-08-13'];
+  /** The filing pull: 2026-08-25 14:43 ET, ~6h before the writer's slot. */
+  const PULL_NOW = Date.parse('2026-08-25T18:43:21Z');
+  /** First boot of the build carrying this fix, well after the ledger's first row. */
+  const POST_DEPLOY_BOOT = Date.parse('2026-08-26T03:00:00Z');
+  const writerSlot = (etDay: string): number => Date.parse(`${etDay}T21:00:50-04:00`);
+
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'tra4001-'));
+    clearLiveNavTripwire();
+  });
+  afterEach(() => {
+    clearLiveNavTripwire();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Write the production ledger to disk, then boot against it the way index.ts does. */
+  function bootProductionLedger(opts: { drop?: string[]; tear?: string[] } = {}): void {
+    hydrateLiveNavTripwireFromDisk(dir, Date.parse('2026-08-13T00:00:00Z'));
+    seedLiveNavObservationStartForTest(null);
+    for (const d of LEDGER_DAYS) {
+      recordLiveNavTripwireAssertion({
+        grade: gradeLiveNavTripwirePayload(servedPayload()),
+        source: 'served',
+        payloadTime: new Date(writerSlot(d)).toISOString(),
+        now: writerSlot(d),
+      });
+    }
+    // Reshape the file on disk, then hydrate it fresh — the marker written by the boot
+    // above is deleted so the post-deploy boot creates its own, later, marker exactly as
+    // the first boot of this build will on bqb1.
+    const path = liveNavTripwireLogPath(dir);
+    const lines = readFileSync(path, 'utf8').split('\n').filter((l) => l.trim() !== '');
+    const kept = lines
+      .filter((l) => !(opts.drop ?? []).some((d) => l.includes(`"etDay":"${d}"`)))
+      .map((l) => ((opts.tear ?? []).some((d) => l.includes(`"etDay":"${d}"`)) ? l.slice(0, 40) : l));
+    writeFileSync(path, kept.join('\n') + '\n', 'utf8');
+    rmSync(liveNavObservationStartPath(dir), { force: true });
+    clearLiveNavTripwire();
+    hydrateLiveNavTripwireFromDisk(dir, POST_DEPLOY_BOOT);
+  }
+
+  it('DUE is 21:00 ET plus grace, DST-aware', () => {
+    expect(liveNavEtWallClockToUtcMs('2026-08-25', 21)).toBe(Date.parse('2026-08-26T01:00:00Z')); // EDT
+    expect(liveNavEtWallClockToUtcMs('2026-12-01', 21)).toBe(Date.parse('2026-12-02T02:00:00Z')); // EST
+    expect(liveNavWriterDueAtMs('2026-08-25')).toBe(
+      Date.parse('2026-08-26T01:00:00Z') + LIVE_NAV_WRITER_DUE_GRACE_MS,
+    );
+  });
+
+  it('NEGATIVE CONTROL — the filing pull reads 100% realized coverage, today PENDING, 23 NOT MEASURED, no writer driver', () => {
+    bootProductionLedger();
+    const s = summarizeLiveNavTripwire(45, undefined, PULL_NOW);
+
+    // The observation start is the ledger's FIRST ROW, not the post-deploy boot — the MIN
+    // fold keeps the twelve days already on disk inside the window.
+    expect(s.observation).toMatchObject({ startEtDay: '2026-08-13', source: 'first_row', firstRowEtDay: '2026-08-13' });
+    expect(s.observation?.marker).toMatchObject({ boots: 1, firstBootEtDay: '2026-08-25' });
+
+    expect(s.coverage.marketDaysInWindow).toBe(32);
+    expect(s.coverage.marketDaysNotMeasured).toHaveLength(PRE_LEDGER_SESSION_COUNT);
+    expect(s.coverage.marketDaysNotMeasured[0]).toBe('2026-08-12');
+    expect(s.coverage.marketDaysNotMeasured.at(-1)).toBe('2026-07-13');
+    expect(s.coverage.marketDaysPending).toEqual(['2026-08-25']);
+    expect(s.coverage.marketDaysMissing).toEqual([]);
+    expect(s.coverage.marketDaysExpected).toBe(8);
+    expect(s.coverage.marketDaysRecorded).toBe(8);
+    expect(s.coverage.realizedCoverage).toBe(1);
+    expect(s.consecutiveMissingSessions).toBe(0);
+    // The four buckets partition the calendar sessions.
+    expect(
+      s.coverage.marketDaysRecorded +
+        s.coverage.marketDaysMissing.length +
+        s.coverage.marketDaysPending.length +
+        s.coverage.marketDaysNotMeasured.length,
+    ).toBe(s.coverage.marketDaysInWindow);
+    // ...and so do the signal classes, over the MEASURED denominator.
+    const c = s.signalClasses;
+    expect(c.sessionsTrip + c.sessionsDegradedOnly + c.sessionsClean).toBe(s.coverage.marketDaysExpected);
+
+    // The writer driver must be nowhere in the window. What IS there is the real state:
+    // every row is coverage-blind on v0nni, which is a different finding (TRA-3711).
+    expect(s.driver?.axis).not.toBe('writer');
+    expect(s.byDay.filter((d) => d.driver?.axis === 'writer')).toEqual([]);
+
+    const today = s.byDay.find((d) => d.etDay === '2026-08-25')!;
+    expect(today).toMatchObject({
+      marketDay: true,
+      bucket: 'pending',
+      verdict: 'pending',
+      alarm: false,
+      degraded: false,
+      attention: false,
+      driver: null,
+      dueAt: '2026-08-26T01:30:00.000Z',
+    });
+    const preLedger = s.byDay.find((d) => d.etDay === '2026-08-12')!;
+    expect(preLedger).toMatchObject({ bucket: 'not_measured', verdict: 'not_measured', attention: false, driver: null });
+    // Not measured is NOT clean either — no pre-observation session may read as a pass.
+    expect(s.byDay.filter((d) => d.marketDay && d.verdict === 'clean')).toEqual([]);
+    for (const d of LEDGER_SESSIONS) {
+      expect(s.byDay.find((x) => x.etDay === d)?.bucket).toBe('recorded');
+    }
+  });
+
+  it('POSITIVE CONTROL — one served row DELETED inside the window is EXACTLY one missing DUE session', () => {
+    bootProductionLedger({ drop: ['2026-08-19'] });
+    const s = summarizeLiveNavTripwire(45, undefined, PULL_NOW);
+    expect(s.coverage.marketDaysMissing).toEqual(['2026-08-19']);
+    expect(s.coverage.marketDaysExpected).toBe(8);
+    expect(s.coverage.marketDaysRecorded).toBe(7);
+    expect(s.coverage.realizedCoverage).toBeCloseTo(7 / 8);
+    expect(s.coverage.marketDaysPending).toEqual(['2026-08-25']);
+    expect(s.coverage.marketDaysNotMeasured).toHaveLength(PRE_LEDGER_SESSION_COUNT);
+    // The lost session is named, loud, and on the coverage channel — not the trip channel.
+    const lost = s.byDay.find((d) => d.etDay === '2026-08-19')!;
+    expect(lost).toMatchObject({
+      bucket: 'missing',
+      verdict: 'missing',
+      alarm: false,
+      degraded: true,
+      attention: true,
+      driver: { axis: 'writer', kind: 'coverage', status: 'blind', reason: 'no_assertion_row' },
+    });
+    // 08-24 is recorded, so the writer is not down NOW — a historical miss is not a live one.
+    expect(s.consecutiveMissingSessions).toBe(0);
+  });
+
+  it('POSITIVE CONTROL — one served row TORN on disk reads the same as a deleted one', () => {
+    bootProductionLedger({ tear: ['2026-08-19'] });
+    expect(readFileSync(liveNavTripwireLogPath(dir), 'utf8').trim().split('\n')).toHaveLength(11); // compacted
+    const s = summarizeLiveNavTripwire(45, undefined, PULL_NOW);
+    expect(s.coverage.marketDaysMissing).toEqual(['2026-08-19']);
+    expect(s.coverage.marketDaysRecorded).toBe(7);
+    expect(s.durability.hydratedRecords).toBe(11);
+  });
+
+  it('POSITIVE CONTROL — the LATEST due session lost is WRITER DOWN 1, with the writer as window driver', () => {
+    bootProductionLedger({ drop: ['2026-08-24'] });
+    const s = summarizeLiveNavTripwire(45, undefined, PULL_NOW);
+    expect(s.coverage.marketDaysMissing).toEqual(['2026-08-24']);
+    // Today is pending and is stepped OVER, not counted and not a break.
+    expect(s.coverage.marketDaysPending).toEqual(['2026-08-25']);
+    expect(s.consecutiveMissingSessions).toBe(1);
+    expect(s.driver).toEqual({ axis: 'writer', kind: 'coverage', status: 'blind', reason: 'no_assertion_row' });
+    expect(s.degraded).toBe(true);
+    expect(s.alarm).toBe(false);
+  });
+
+  it('the DUE boundary: today is PENDING one second before its slot+grace and MISSING at it', () => {
+    bootProductionLedger();
+    const dueAt = liveNavWriterDueAtMs('2026-08-25');
+    const before = summarizeLiveNavTripwire(45, undefined, dueAt - 1_000);
+    expect(before.coverage.marketDaysPending).toEqual(['2026-08-25']);
+    expect(before.coverage.marketDaysMissing).toEqual([]);
+    expect(before.consecutiveMissingSessions).toBe(0);
+    expect(before.coverage.realizedCoverage).toBe(1);
+
+    const at = summarizeLiveNavTripwire(45, undefined, dueAt);
+    expect(at.coverage.marketDaysPending).toEqual([]);
+    expect(at.coverage.marketDaysMissing).toEqual(['2026-08-25']);
+    expect(at.consecutiveMissingSessions).toBe(1);
+    expect(at.coverage.marketDaysExpected).toBe(9);
+    expect(at.coverage.realizedCoverage).toBeCloseTo(8 / 9);
+    expect(at.driver?.axis).toBe('writer');
+  });
+
+  it('a row that lands INSIDE the grace window is recorded, and the bucket is recorded, not pending', () => {
+    bootProductionLedger();
+    recordLiveNavTripwireAssertion({
+      grade: gradeLiveNavTripwirePayload(servedPayload()),
+      source: 'served',
+      now: writerSlot('2026-08-25'),
+    });
+    const s = summarizeLiveNavTripwire(45, undefined, writerSlot('2026-08-25') + 60_000);
+    expect(s.byDay.find((d) => d.etDay === '2026-08-25')?.bucket).toBe('recorded');
+    expect(s.coverage.marketDaysPending).toEqual([]);
+    expect(s.coverage.marketDaysExpected).toBe(9);
+    expect(s.coverage.realizedCoverage).toBe(1);
+  });
+
+  it('the marker is written on first hydrate, survives a re-hydrate unmoved, and counts boots', () => {
+    const firstBoot = Date.parse('2026-08-20T13:00:00Z'); // Thu 09:00 ET
+    hydrateLiveNavTripwireFromDisk(dir, firstBoot);
+    expect(existsSync(join(dir, LIVE_NAV_OBSERVATION_START_FILENAME))).toBe(true);
+    const m1 = JSON.parse(readFileSync(liveNavObservationStartPath(dir), 'utf8'));
+    expect(m1).toMatchObject({ kind: 'observation_start', firstBootTs: firstBoot, firstBootEtDay: '2026-08-20', boots: 1 });
+
+    clearLiveNavTripwire();
+    const secondBoot = firstBoot + 3 * 86_400_000;
+    hydrateLiveNavTripwireFromDisk(dir, secondBoot);
+    const m2 = JSON.parse(readFileSync(liveNavObservationStartPath(dir), 'utf8'));
+    expect(m2).toMatchObject({ firstBootTs: firstBoot, lastBootTs: secondBoot, boots: 2 });
+    expect(resolveLiveNavObservationStart()).toMatchObject({ startTs: firstBoot, source: 'marker' });
+  });
+
+  it('a writer that is DEAD FROM ITS FIRST BOOT is caught by the marker — no first row is needed', () => {
+    // Deployed Thursday 08-20 at 09:00 ET, never wrote a row. Read Friday 08-21 at 22:00 ET.
+    hydrateLiveNavTripwireFromDisk(dir, Date.parse('2026-08-20T13:00:00Z'));
+    const s = summarizeLiveNavTripwire(45, undefined, Date.parse('2026-08-22T02:00:00Z'));
+    expect(s.observation?.source).toBe('marker');
+    expect(s.coverage.marketDaysMissing).toEqual(['2026-08-21', '2026-08-20']);
+    expect(s.consecutiveMissingSessions).toBe(2);
+    expect(s.coverage.realizedCoverage).toBe(0);
+    expect(s.coverage.marketDaysNotMeasured[0]).toBe('2026-08-19');
+    expect(s.driver).toEqual({ axis: 'writer', kind: 'coverage', status: 'blind', reason: 'no_assertion_row' });
+    expect(s.verdict).toBe('blind');
+  });
+
+  it('a boot AFTER the slot does not owe that day: 08-20 boot at 22:00 ET makes 08-20 NOT MEASURED, 08-21 missing', () => {
+    hydrateLiveNavTripwireFromDisk(dir, Date.parse('2026-08-21T02:00:00Z'));
+    const s = summarizeLiveNavTripwire(45, undefined, Date.parse('2026-08-22T02:00:00Z'));
+    expect(s.coverage.marketDaysMissing).toEqual(['2026-08-21']);
+    expect(s.coverage.marketDaysNotMeasured[0]).toBe('2026-08-20');
+    expect(s.consecutiveMissingSessions).toBe(1);
+  });
+
+  it('NO observation start at all is BLIND / no_observation_start — never clean, never 0% coverage', () => {
+    // No hydrate, no row, no seam: nothing pins a start. An instrument with no denominator
+    // cannot say "0 of 5" any more than it can say "5 of 5".
+    const s = summarizeLiveNavTripwire(7, '2026-08-12');
+    expect(s.observation).toBeNull();
+    expect(s.verdict).toBe('blind');
+    expect(s.driver).toEqual({ axis: 'writer', kind: 'coverage', status: 'blind', reason: 'no_observation_start' });
+    expect(s.degraded).toBe(true);
+    expect(s.attention).toBe(true);
+    expect(s.coverage.marketDaysMissing).toEqual([]);
+    expect(s.coverage.marketDaysExpected).toBe(0);
+    expect(s.coverage.realizedCoverage).toBeNull();
+    expect(s.coverage.marketDaysNotMeasured).toHaveLength(5);
+  });
+
+  it('a fresh deployment mid-morning with nothing due yet is NOT MEASURED (verdict null), not blind and not clean', () => {
+    hydrateLiveNavTripwireFromDisk(dir, Date.parse('2026-08-25T13:00:00Z')); // Tue 09:00 ET
+    const s = summarizeLiveNavTripwire(45, undefined, PULL_NOW);
+    expect(s.verdict).toBeNull();
+    expect(s.degraded).toBe(false);
+    expect(s.attention).toBe(false);
+    expect(s.driver).toBeNull();
+    expect(s.coverage.marketDaysPending).toEqual(['2026-08-25']);
+    expect(s.coverage.marketDaysExpected).toBe(0);
+    expect(s.coverage.realizedCoverage).toBeNull();
+    expect(s.coverage.marketDaysNotMeasured).toHaveLength(31);
+  });
+
+  it('the marker etDay follows the row etDay convention (ET, not UTC)', () => {
+    // A marker written at 2026-08-26T03:00Z is 2026-08-25 23:00 ET — same ET day as the last row.
+    expect(liveNavEtDay(POST_DEPLOY_BOOT)).toBe('2026-08-25');
   });
 });
