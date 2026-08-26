@@ -385,6 +385,22 @@ function startOfWeek(): string {
   return anchor.toISOString().slice(0, 10);
 }
 
+/**
+ * TRA-4003 — the longest run of consecutive NON-session ET days the anchor
+ * check will walk before giving up. A Thu/Fri holiday pair around a weekend is
+ * 4; 10 leaves margin and bounds the loop so a malformed date cannot spin
+ * (same figure `scheduler.ts` uses for its session lookback).
+ */
+const ANCHOR_NON_SESSION_SPAN_MAX_DAYS = 10;
+
+/** `YYYY-MM-DD` + `days`, arithmetic done at 12:00 UTC so no DST edge moves the date. */
+function addDaysIso(dateIso: string, days: number): string {
+  const [y, m, d] = dateIso.split('-').map(Number);
+  const t = new Date(Date.UTC(y as number, (m as number) - 1, d as number, 12));
+  t.setUTCDate(t.getUTCDate() + days);
+  return t.toISOString().slice(0, 10);
+}
+
 export class PnlTracker {
   private readonly stateFile: string;
   private readonly snapshotsFile: string;
@@ -392,9 +408,21 @@ export class PnlTracker {
   private hadSavedState: boolean;
   private state: PersistedState;
   private snapshots: DailySnapshot[] = [];
+  /**
+   * TRA-4003 — the exchange calendar, `YYYY-MM-DD` → is that ET day a session.
+   * `null` = no calendar supplied: every day is treated as a session, which is
+   * byte-for-byte the pre-TRA-4003 behaviour (the crypto tracker, and every
+   * test that constructs a tracker without one).
+   */
+  private readonly isMarketDay: ((dateIso: string) => boolean) | null;
 
-  constructor(dataDir: string, initialEquity = 25_000) {
+  constructor(
+    dataDir: string,
+    initialEquity = 25_000,
+    opts?: { isMarketDay?: (dateIso: string) => boolean },
+  ) {
     if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
+    this.isMarketDay = opts?.isMarketDay ?? null;
     this.initialEquity = initialEquity;
     this.stateFile = join(dataDir, 'equity-state.json');
     this.snapshotsFile = join(dataDir, 'daily-snapshots.json');
@@ -469,14 +497,75 @@ export class PnlTracker {
    * A `syncOpeningEquity` rebase breaks the equality (it moves the anchor off the
    * close on purpose), so this correctly returns false there and the rebase keeps
    * its TRA-138 day-roll behaviour.
+   *
+   * TRA-4003 — THE SECOND ROLL ACROSS A WEEKEND CLOBBERED THE ANCHOR TRA-3039
+   * HAD JUST PRESERVED.
+   *
+   * The preserve branch below stamps `openingDate = today`, and the test above
+   * was `latest.date === openingDate`. That equality survives exactly ONE roll.
+   * On a weekday that is enough: the day rolled into closes at 21:00 ET and
+   * `saveSnapshot` re-establishes the pair. On a NON-session day nothing closes,
+   * so after a Saturday boot the state reads `openingDate: Sat` against
+   * `latest.date: Fri`, and the next boot — Sunday, or Monday itself — fails
+   * the equality and falls through to the `state.equity` roll. That is the
+   * TRA-3039 defect again, gated to weekends and holidays, and only when the
+   * process restarts on more than one distinct ET day between a Friday close
+   * and the Monday one.
+   *
+   * Live bqb1, session 2026-08-24 (Render deploys Sat 08-22, Sun 08-23T20:45Z,
+   * Mon 08-24T20:12Z/20:43Z): **41 of 64 demo books** wrote an 08-24 row with
+   * `openingEquityBasis: 'day-roll-state-equity'` and `openingEquity !==
+   * closingEquity(08-21)`, against 0 of 64 on every weekday session 08-18 →
+   * 08-25 and 15 of 64 on the previous Monday (08-17). 19 of the 41 booked a
+   * non-zero `stockDaily` on a session whose equity did not move. On 6 of them
+   * `state.equity` had last been written by the trade path BEFORE Friday's
+   * option credit reached `PaperAccount`, so the stale anchor was short by
+   * exactly `optionsDaily(08-21)` and the row read `stockDaily(08-24) ===
+   * optionsDaily(08-21)` to the cent — the TRA-2630 Defect B signature,
+   * produced with an intact credit counter. TRA-2636's tripwire filed that as a
+   * Defect B recurrence; it is this.
+   *
+   * THE RULE NOW. The anchor is still the prior session's close when the newest
+   * recorded close is the anchor's value AND every ET day STRICTLY BETWEEN that
+   * close and today is a non-session day — measured against TODAY, not against
+   * `openingDate`, because `openingDate` is exactly the field the preserve
+   * branch keeps moving. A session day in that span with no row is the case
+   * TRA-3039 kept the lossy roll for (server down at the 21:00 ET archive) and
+   * it still rolls. Without a calendar the test degrades to the strict
+   * equality — a caller that cannot name the sessions gets the old behaviour,
+   * never a guess.
    */
-  private anchorIsPriorSessionClose(): boolean {
+  private anchorIsPriorSessionClose(today: string): boolean {
     const latest = this.latestSnapshot();
-    if (latest === null || latest.date !== this.state.openingDate) return false;
+    if (latest === null) return false;
+    if (latest.date !== this.state.openingDate
+      && !this.onlyNonSessionsBetween(latest.date, today)) return false;
     const close = latest.closingEquity;
     if (close === null || !Number.isFinite(close)) return false;
     if (!Number.isFinite(this.state.openingEquity)) return false;
     return Math.abs(close - this.state.openingEquity) <= ANCHOR_MATCH_EPSILON_USD;
+  }
+
+  /**
+   * TRA-4003 — is every ET day in the OPEN interval `(closeDate, today)` a
+   * non-session day? `today` itself is excluded: it is the session this roll
+   * opens, and it has not had the chance to close yet. `false` without a
+   * calendar, on a malformed or non-increasing pair, and on a span longer than
+   * {@link ANCHOR_NON_SESSION_SPAN_MAX_DAYS}: each of those is "cannot prove
+   * it", and the caller treats that as the strict equality failing, which is
+   * the pre-fix branch.
+   */
+  private onlyNonSessionsBetween(closeDate: string, today: string): boolean {
+    if (this.isMarketDay === null) return false;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(closeDate) || !/^\d{4}-\d{2}-\d{2}$/.test(today)) return false;
+    if (!(today > closeDate)) return false;
+    let d = closeDate;
+    for (let i = 0; i < ANCHOR_NON_SESSION_SPAN_MAX_DAYS; i++) {
+      d = addDaysIso(d, 1);
+      if (!(d < today)) return true;
+      if (this.isMarketDay(d)) return false;
+    }
+    return false;
   }
 
   /**
@@ -594,7 +683,7 @@ export class PnlTracker {
       this.attestAnchorAgainstLatestClose();
       return;
     }
-    if (this.anchorIsPriorSessionClose()) {
+    if (this.anchorIsPriorSessionClose(today)) {
       // The anchor is already `closingEquity(N-1)`. Stamp the new day onto it and
       // leave the equity/options anchors untouched, so the rows telescope.
       this.state.openingDate = today;

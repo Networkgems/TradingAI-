@@ -898,3 +898,178 @@ describe('TRA-3421 (secondary) — window boundaries come from the ET date, not 
     expect(t.getCumulativeStats(25_500).yearlyPnl).toBeCloseTo(500, 6);  // pre-fix: 0
   });
 });
+
+// TRA-4003 — THE SECOND ROLL ACROSS A WEEKEND CLOBBERED THE ANCHOR TRA-3039
+// HAD JUST PRESERVED.
+//
+// `anchorIsPriorSessionClose()` tested `latest.date === openingDate`, and the
+// preserve branch stamps `openingDate = today`. On a weekday the day rolled
+// into closes and `saveSnapshot` re-establishes the pair; on a weekend nothing
+// closes, so after a Saturday boot the pair reads (Fri, Sat), the next boot —
+// Sunday or Monday — fails the equality and takes the `state.equity` roll.
+//
+// Live bqb1, session 2026-08-24, deploys Sat 08-22 / Sun 08-23T20:45Z / Mon
+// 08-24T20:12Z+20:43Z: 41 of 64 demo books wrote an 08-24 row with basis
+// `day-roll-state-equity` and `openingEquity !== closingEquity(08-21)` (0 of 64
+// on every weekday session 08-18 → 08-25). Six of them had `state.equity` last
+// written by the trade path BEFORE Friday's option credit landed, so the stale
+// anchor was short by exactly `optionsDaily(08-21)` and the row reproduced the
+// TRA-2630 Defect B signature — `stockDaily(t) === optionsDaily(t-1)` — with an
+// intact credit counter. `qa_tra2251_7b0483ee` below is that book, to the cent.
+describe('TRA-4003 — the anchor survives a weekend with more than one boot', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'pnl-tracker-4003-'));
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // NYSE calendar the way `scheduler.isMarketDayIso` expresses it: weekends
+  // plus the one holiday these cases need. Kept local so the test names its
+  // own sessions instead of depending on the production holiday table.
+  const HOLIDAYS = new Set(['2026-09-07']); // Labor Day
+  const isMarketDay = (iso: string): boolean => {
+    if (HOLIDAYS.has(iso)) return false;
+    const [y, m, d] = iso.split('-').map(Number);
+    const dow = new Date(Date.UTC(y as number, (m as number) - 1, d as number)).getUTCDay();
+    return dow !== 0 && dow !== 6;
+  };
+  // 15:00Z = 11:00 ET on every date used here, safely inside the ET day.
+  const bootOn = (iso: string): void => {
+    vi.setSystemTime(new Date(iso + 'T15:00:00.000Z'));
+  };
+  const nextStockDaily = (t: PnlTracker, equity: number, creditWindow: number): number =>
+    Math.round(((equity - t.getOpeningEquity()) - creditWindow) * 100) / 100;
+
+  // qa_tra2251_7b0483ee, live figures. 08-21: stock +23.49, option credit +54.
+  const CLOSE_0820 = 25_198.83;
+  const CLOSE_0821 = 25_276.32;
+  const TRADE_PATH_CACHE = 25_222.32; // = CLOSE_0820 + 23.49: last `saveEquity`, pre-credit
+  const CREDIT_0821 = 54;
+
+  const closeFriday = (): void => {
+    bootOn('2026-08-21');
+    const t = new PnlTracker(dir, 25_000, { isMarketDay });
+    t.saveEquity(TRADE_PATH_CACHE, 0);
+    t.saveSnapshot(snap('2026-08-21', CLOSE_0820, CLOSE_0821));
+    expect(t.getOpeningEquity()).toBeCloseTo(CLOSE_0821, 6);
+  };
+
+  it('qa_tra2251_7b0483ee — Sat, Sun and Mon boots all keep the Friday close', () => {
+    closeFriday();
+
+    bootOn('2026-08-22'); // Saturday — the one roll the old rule survived
+    const sat = new PnlTracker(dir, 25_000, { isMarketDay });
+    expect(sat.getOpeningEquity()).toBeCloseTo(CLOSE_0821, 6);
+    expect(sat.getAnchorState().openingEquityBasis).toBe(ANCHOR_BASIS_VERIFIED);
+
+    bootOn('2026-08-23'); // Sunday — pre-fix: `latest.date (Fri) !== openingDate (Sat)` → lossy
+    const sun = new PnlTracker(dir, 25_000, { isMarketDay });
+    expect(sun.getOpeningEquity()).toBeCloseTo(CLOSE_0821, 6);
+    expect(sun.getOpeningEquity()).not.toBeCloseTo(TRADE_PATH_CACHE, 3);
+    expect(sun.getAnchorState().openingEquityBasis).toBe(ANCHOR_BASIS_VERIFIED);
+
+    bootOn('2026-08-24'); // Monday — the process that wrote the 08-24 row
+    const mon = new PnlTracker(dir, 25_000, { isMarketDay });
+    expect(mon.getOpeningEquity()).toBeCloseTo(CLOSE_0821, 6);
+    expect(mon.getAnchorState().openingEquityBasis).toBe(ANCHOR_BASIS_VERIFIED);
+    // An idle Monday books nothing. Live, pre-fix, this row read stockDaily
+    // 54.00 === optionsDaily(08-21) — the Defect B triple, from the anchor.
+    expect(nextStockDaily(mon, CLOSE_0821, 0)).toBeCloseTo(0, 6);
+    expect(nextStockDaily(mon, CLOSE_0821, 0)).not.toBeCloseTo(CREDIT_0821, 3);
+  });
+
+  it('a Saturday boot followed directly by the Monday boot keeps the close too', () => {
+    // One weekend boot is enough to arm the old defect: (Fri, Sat) then Monday.
+    closeFriday();
+    bootOn('2026-08-22');
+    new PnlTracker(dir, 25_000, { isMarketDay });
+    bootOn('2026-08-24');
+    const mon = new PnlTracker(dir, 25_000, { isMarketDay });
+    expect(mon.getOpeningEquity()).toBeCloseTo(CLOSE_0821, 6);
+    expect(mon.getAnchorState().openingEquityBasis).toBe(ANCHOR_BASIS_VERIFIED);
+  });
+
+  it('a weekend plus a Monday holiday (Labor Day) is still one non-session span', () => {
+    bootOn('2026-09-04');
+    const fri = new PnlTracker(dir, 25_000, { isMarketDay });
+    fri.saveEquity(TRADE_PATH_CACHE, 0);
+    fri.saveSnapshot(snap('2026-09-04', CLOSE_0820, CLOSE_0821));
+    for (const day of ['2026-09-05', '2026-09-06', '2026-09-07', '2026-09-08']) {
+      bootOn(day);
+      const t = new PnlTracker(dir, 25_000, { isMarketDay });
+      expect(t.getOpeningEquity()).toBeCloseTo(CLOSE_0821, 6);
+      expect(t.getAnchorState().openingEquityBasis).toBe(ANCHOR_BASIS_VERIFIED);
+    }
+  });
+
+  // ── Controls: the branches that must KEEP rolling ────────────────────────
+
+  it('CONTROL — a SESSION that never closed still rolls from state.equity (TRA-3039)', () => {
+    // Fri close, Monday boot (preserved), no Monday 21:00 ET row, Tuesday boot.
+    // Monday is a session with no close: the span test finds it and the lossy
+    // roll TRA-3039 kept for exactly this case still runs.
+    closeFriday();
+    bootOn('2026-08-24');
+    const mon = new PnlTracker(dir, 25_000, { isMarketDay });
+    expect(mon.getOpeningEquity()).toBeCloseTo(CLOSE_0821, 6);
+    mon.saveEquity(26_000, 0); // Monday traded; nothing archived it
+
+    bootOn('2026-08-25');
+    const tue = new PnlTracker(dir, 25_000, { isMarketDay });
+    expect(tue.getOpeningEquity()).toBeCloseTo(26_000, 6);
+    expect(tue.getAnchorState().openingEquityBasis).toBe('day-roll-state-equity');
+  });
+
+  it('CONTROL — a rebase across the weekend still re-anchors (TRA-138)', () => {
+    closeFriday();
+    bootOn('2026-08-22');
+    const sat = new PnlTracker(dir, 25_000, { isMarketDay });
+    sat.saveEquity(50_000, 0);
+    sat.syncOpeningEquity(50_000, 0);
+    bootOn('2026-08-24');
+    const mon = new PnlTracker(dir, 25_000, { isMarketDay });
+    expect(mon.getOpeningEquity()).toBeCloseTo(50_000, 6);
+    expect(nextStockDaily(mon, 50_000, 0)).toBeCloseTo(0, 6);
+  });
+
+  it('CONTROL — without a calendar the strict equality is unchanged (the pre-fix branch)', () => {
+    // A caller that cannot name the sessions (the crypto tracker) gets the old
+    // rule byte-for-byte: the Sunday boot rolls from `state.equity`. This pins
+    // the injection as the thing that changes behaviour, and reproduces the
+    // live 08-24 row as the negative control.
+    bootOn('2026-08-21');
+    const fri = new PnlTracker(dir, 25_000);
+    fri.saveEquity(TRADE_PATH_CACHE, 0);
+    fri.saveSnapshot(snap('2026-08-21', CLOSE_0820, CLOSE_0821));
+    bootOn('2026-08-22');
+    new PnlTracker(dir, 25_000);
+    bootOn('2026-08-23');
+    const sun = new PnlTracker(dir, 25_000);
+    expect(sun.getOpeningEquity()).toBeCloseTo(TRADE_PATH_CACHE, 6);
+    expect(sun.getAnchorState().openingEquityBasis).toBe('day-roll-state-equity');
+    expect(nextStockDaily(sun, CLOSE_0821, 0)).toBeCloseTo(CREDIT_0821, 6); // the live row
+  });
+
+  it('CONTROL — a span longer than the walk bound is not vouched for', () => {
+    // Twelve non-session days cannot occur on the NYSE calendar; a state that
+    // claims one is malformed and must fall to the lossy branch, not be trusted.
+    // The span is measured to TODAY, not to `openingDate` (still 08-22 here
+    // from the Saturday roll) — measuring to `openingDate` would have vouched
+    // for this anchor on the strength of a single Saturday.
+    const everyDayClosed = (): boolean => false;
+    bootOn('2026-08-21');
+    const t1 = new PnlTracker(dir, 25_000, { isMarketDay: everyDayClosed });
+    t1.saveEquity(TRADE_PATH_CACHE, 0);
+    t1.saveSnapshot(snap('2026-08-21', CLOSE_0820, CLOSE_0821));
+    bootOn('2026-08-22');
+    new PnlTracker(dir, 25_000, { isMarketDay: everyDayClosed });
+    bootOn('2026-09-03'); // 13 days after the close
+    const t2 = new PnlTracker(dir, 25_000, { isMarketDay: everyDayClosed });
+    expect(t2.getAnchorState().openingEquityBasis).toBe('day-roll-state-equity');
+    expect(t2.getOpeningEquity()).toBeCloseTo(TRADE_PATH_CACHE, 6);
+  });
+});

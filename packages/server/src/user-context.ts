@@ -12,6 +12,7 @@ import {
 import type { LiveBrokerArmField } from './signal-engine.js';
 import { CryptoSignalEngine } from './crypto-engine.js';
 import { PnlTracker } from './pnl-tracker.js';
+import { isMarketDayIso } from './scheduler.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
 import {
   loadSettings,
@@ -971,6 +972,13 @@ async function createUserContext(username: string): Promise<UserContext> {
   const tracker = new PnlTracker(
     dataDir,
     settings.mode === 'live' ? 0 : (settings.demoEquityStocks ?? settings.demoEquity),
+    // TRA-4003 — the STOCKS tracker rolls its daily-P&L anchor on the exchange
+    // calendar. Without this, a boot on a weekend/holiday followed by another
+    // boot before the next 21:00 ET close re-anchored `openingEquity` off the
+    // stale trade-path cache and the next row booked phantom stock P&L
+    // (41 of 64 demo books, session 2026-08-24). The crypto tracker is NOT
+    // given the calendar: that book trades and closes seven days a week.
+    { isMarketDay: isMarketDayIso },
   );
   const cryptoTracker = new PnlTracker(
     cryptoDir,
