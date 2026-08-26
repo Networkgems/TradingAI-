@@ -1,0 +1,1 @@
+{"ts":"2026-08-26T10:16:36.280Z","slot":"adhoc","verdict":"PENDING","reason":"no qualifying live close since the fix build","pin":{"commit":"fbc80542083b8955b250cdd5bf2160eba83fa865","pid":77,"startedAt":"2026-08-26T09:59:48.498Z"},"sources":{"book":0,"journal":1},"qualifying":[],"since":"2026-08-26T09:33:28.525Z"}
