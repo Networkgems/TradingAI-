@@ -871,6 +871,38 @@ export function deriveRestoreTarget({ item, blockers, pendingInteractions }) {
  * (measured 6/6). Step 1 alone clears the strand; step 2 was unexecutable and
  * unnecessary.
  */
+/**
+ * Is this row a routine spawn whose non-terminal rest is SUPPRESSING its own
+ * routine? (TRA-4041)
+ *
+ * Measured 2026-08-26: 28 of 43 active routines last fired 2026-08-16 or
+ * earlier while every one of them reported a FUTURE `nextRunAt`. Of the 15 still
+ * firing, ZERO have a non-terminal latest leaf; 8 of the 28 frozen ones do. On
+ * `concurrencyPolicy: coalesce_if_active` (all three drain arms) a fire that
+ * lands while the previous execution issue is still open COALESCES into it
+ * instead of running, so one leaf left at `todo` or `in_progress` silently
+ * stops the routine — and `nextRunAt` keeps advancing, which is why a census
+ * reads it as armed.
+ *
+ * The sting: `todo` is the RIGHT restore for a durable strand and the WRONG one
+ * for a per-fire spawn. Restoring a drain leaf to `todo` disables the drain. The
+ * routines' own RESTING DISPOSITION block already rules on this — "per-fire
+ * spawn (originKind: routine_execution) that blocks nothing -> status done" —
+ * and the drain, which knows nothing about routine spawns, writes `todo` to
+ * everything.
+ *
+ * ⛔ This is a REPORT, not a write. The correct disposition is `done`, and
+ * `done` is banned in the automated writer for a good reason (it destroys unrun
+ * work if the class is ever misjudged). Widening an unattended twice-daily
+ * writer's authority to include `done` is a bigger decision than naming the
+ * class, so this names it and prints the one step, for the routine's OWNER to
+ * run. Conservative on both unknowns: an absent `blocks` key reads as "gates
+ * something" (do not touch), never as empty.
+ */
+export function suppressesOwnRoutine(f) {
+  return f.originKind === 'routine_execution' && f.blocksKnown === true && f.blocksIdentifiers.length === 0;
+}
+
 export function deriveRepair(f) {
   const no = (why) => ({ eligible: false, status: null, assigneeAgentId: null, restoredFrom: null, why });
 
@@ -975,6 +1007,14 @@ export function classifyIssue(item, roster, { graph = null, now = null } = {}) {
     blocksIdentifiers: Array.isArray(item.blocks)
       ? item.blocks.map((b) => `${b.identifier || b.id}${b.status ? `:${b.status}` : ''}`)
       : [],
+    // ⛔ ABSENT IS NOT EMPTY. `blocksIdentifiers` falls back to `[]` on a payload
+    // that carries no `blocks` key at all, so it alone cannot answer "does this
+    // gate anything?" — and the suppressing-leaf rule below turns on exactly
+    // that question. Keep the two readable apart (TRA-4041).
+    blocksKnown: Array.isArray(item.blocks),
+    // Read for the suppressing-leaf rule. `routine_execution` is a per-fire
+    // spawn; anything else is durable work.
+    originKind: item.originKind || null,
     // Filled in by sweep() once the interaction route has been read. A finding
     // that never got there keeps `null` (= unknown), which SUPPRESSES any
     // demoting target rather than asserting there is no card.
@@ -1375,6 +1415,24 @@ export function renderReport(result) {
         );
       } else if (rep) {
         L.push(`     no repair command (the TRA-2396 rule stands here): ${rep.why}`);
+      }
+      // TRA-4041 — the class that disables the automation that would fix it.
+      if (suppressesOwnRoutine(f)) {
+        L.push(
+          '     ⛔ SUPPRESSING LEAF — this is a `routine_execution` spawn that gates nothing, resting non-terminal. ' +
+            'On `coalesce_if_active` every later fire of its routine COALESCES into it instead of running, so that ' +
+            'routine is OFF while still reporting a future nextRunAt. Measured 2026-08-26: 28/43 active routines ' +
+            'last fired 08-16 or earlier; 0 of the 15 still firing have a non-terminal leaf.',
+        );
+        L.push(
+          `       Correct disposition is \`done\`, NOT \`todo\` (the routines' own RESTING DISPOSITION block: "per-fire ` +
+            'spawn that blocks nothing -> done"). Restoring a spawn to `todo` is what keeps its routine off. This is ' +
+            'the ONE row class where the generic restore is actively harmful.',
+        );
+        L.push(
+          '       NOT written by the drain, deliberately: `done` destroys unrun work if the class is ever misjudged, ' +
+            "and widening an unattended twice-daily writer to send it is the routine owner's call, not this script's.",
+        );
       }
       // The cause branch and the anchor verdict. Both are here because both were
       // getting improvised into filings (TRA-2396): the cause asserted from a
@@ -2667,6 +2725,31 @@ async function selftest() {
   console.log(
     `${noCmd ? 'ok  ' : 'FAIL'}  GLOBAL — no rendering of ANY control board emits a copy-pasteable repair PATCH\n` +
       `        (checked the concatenated report of every case above for 'blockedByIssueIds' / 'PATCH /api/issues')`,
+  );
+
+  // TRA-4041 SUPPRESSING LEAF. Both directions, and both unknowns pinned to the
+  // SAFE side: an absent `blocks` key must never be read as "gates nothing".
+  const sup = [
+    [{ originKind: 'routine_execution', blocksKnown: true, blocksIdentifiers: [] }, true, 'spawn, gates nothing'],
+    [{ originKind: 'manual', blocksKnown: true, blocksIdentifiers: [] }, false, 'durable work is never this class'],
+    [
+      { originKind: 'routine_execution', blocksKnown: true, blocksIdentifiers: ['TRA-1:todo'] },
+      false,
+      'a spawn that GATES something is not a free `done`',
+    ],
+    [
+      { originKind: 'routine_execution', blocksKnown: false, blocksIdentifiers: [] },
+      false,
+      'absent `blocks` key is UNKNOWN, not empty',
+    ],
+    [{ originKind: null, blocksKnown: true, blocksIdentifiers: [] }, false, 'unknown origin is not a spawn'],
+  ];
+  const supOk = sup.every(([f, want]) => suppressesOwnRoutine(f) === want);
+  if (!supOk) failed += 1;
+  console.log(
+    `${supOk ? 'ok  ' : 'FAIL'}  TRA-4041 SUPPRESSING LEAF — a routine_execution spawn that gates nothing is named; ` +
+      'every other shape, and both unknowns, are NOT\n' +
+      `        ${sup.map(([, w, why]) => `${w ? 'YES' : 'no '} ${why}`).join(' | ')}`,
   );
 
   // TRA-4041 NEGATIVE CONTROL. The whitelist above only proves the CURRENT
