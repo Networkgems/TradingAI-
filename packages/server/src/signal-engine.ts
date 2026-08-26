@@ -8774,6 +8774,14 @@ export class SignalEngine {
      * the board answered for.
      */
     deskAddExempt: number;
+    /**
+     * TRA-3976 — staging sites refused because the reconcile had already
+     * recorded this OCC leaving the book. The account has published it since
+     * TRA-3976 shipped; this wrapper never carried it, so it was never on the
+     * wire (the "a census published through a wrapper has two types and one of
+     * them will be forgotten" defect, measured on `netOfCloses` on 08-24).
+     */
+    reconcileTerminal: number;
     lastRefusalAt: number | null;
     /**
      * TRA-3926 (2026-08-25) — the REASON on the newest refusal, on the wire.
@@ -8781,6 +8789,18 @@ export class SignalEngine {
      * being refused as `foreign_authority`, and nothing published said so.
      */
     lastRefusalReason: string | null;
+    /**
+     * TRA-3926 (2026-08-26) — refusals still STAMPED on open rows, read off the
+     * durable row at publication time. Every column above is since-boot; this
+     * one survives a restart because the row does. See the account's docblock
+     * for the 2026-08-25 double-restart that motivated it.
+     */
+    outstanding: {
+      rows: number;
+      refusedContracts: number;
+      latestAt: number | null;
+      latestReason: string | null;
+    };
   } {
     let checked = 0;
     let bounded = 0;
@@ -8789,8 +8809,13 @@ export class SignalEngine {
     let suppressedExits = 0;
     let netOfCloses = 0;
     let deskAddExempt = 0;
+    let reconcileTerminal = 0;
     let lastRefusalAt: number | null = null;
     let lastRefusalReason: string | null = null;
+    let outstandingRows = 0;
+    let outstandingContracts = 0;
+    let outstandingLatestAt: number | null = null;
+    let outstandingLatestReason: string | null = null;
     for (const env of ['sandbox', 'production'] as const) {
       const c = this.optionsAccounts[env].getExitQuantityBoundCensus();
       checked += c.checked;
@@ -8800,15 +8825,29 @@ export class SignalEngine {
       suppressedExits += c.suppressedExits;
       netOfCloses += c.netOfCloses;
       deskAddExempt += c.deskAddExempt;
+      reconcileTerminal += c.reconcileTerminal;
       const at = c.last?.at ?? null;
       if (at !== null && (lastRefusalAt === null || at > lastRefusalAt)) {
         lastRefusalAt = at;
         lastRefusalReason = c.last?.reason ?? null;
       }
+      outstandingRows += c.outstanding.rows;
+      outstandingContracts += c.outstanding.refusedContracts;
+      if (c.outstanding.latestAt !== null
+        && (outstandingLatestAt === null || c.outstanding.latestAt > outstandingLatestAt)) {
+        outstandingLatestAt = c.outstanding.latestAt;
+        outstandingLatestReason = c.outstanding.latestReason;
+      }
     }
     return {
       checked, bounded, refusedContracts, blindRows, suppressedExits, netOfCloses, deskAddExempt,
-      lastRefusalAt, lastRefusalReason,
+      reconcileTerminal, lastRefusalAt, lastRefusalReason,
+      outstanding: {
+        rows: outstandingRows,
+        refusedContracts: outstandingContracts,
+        latestAt: outstandingLatestAt,
+        latestReason: outstandingLatestReason,
+      },
     };
   }
 

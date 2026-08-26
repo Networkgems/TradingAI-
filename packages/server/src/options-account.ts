@@ -10319,7 +10319,48 @@ export class PaperOptionsAccount {
       reason: string;
       oracleRefused: boolean;
     } | null;
+    /**
+     * TRA-3926 (2026-08-26) — refusals STILL STAMPED on open rows, read off the
+     * durable `exitQuantityRefusal` at publication time. NOT a counter, and
+     * deliberately not folded into the columns above: every one of those is
+     * since-boot, and on 2026-08-25 the box restarted TWICE after a 19:58:16Z
+     * refusal of `RIG260925C00006000`, so the route served `refusedContracts 0 /
+     * lastRefusalAt null` over a row that still carried the refusal. A reader
+     * grading this ticket off the counters after a restart would have read a
+     * clean bound that had in fact been exercised on real money.
+     *
+     * The two quantities answer different questions and must stay in different
+     * columns: the counters say what THIS PROCESS did; this block says what is
+     * OUTSTANDING at the broker right now, whichever process stamped it. It
+     * clears exactly when the row's stamp clears — the bound stops biting, or
+     * the row leaves the book — so a zero here means "no refusal outstanding",
+     * which is the sentence the counters' zero was being misread as.
+     */
+    outstanding: {
+      /** Open rows carrying an `exitQuantityRefusal` stamp. */
+      rows: number;
+      /** Contracts those stamps say are open at the broker, unsold by us. */
+      refusedContracts: number;
+      /** Newest stamp's `at`, or null when nothing is outstanding. */
+      latestAt: number | null;
+      /** That stamp's `reason` — a durable `foreign_authority` outlives the build that wrote it. */
+      latestReason: string | null;
+    };
   } {
+    let outstandingRows = 0;
+    let outstandingContracts = 0;
+    let latestAt: number | null = null;
+    let latestReason: string | null = null;
+    for (const opt of this.openOptions.values()) {
+      const stamp = opt.exitQuantityRefusal;
+      if (!stamp) continue;
+      outstandingRows += 1;
+      outstandingContracts += Number.isFinite(stamp.refusedContracts) ? stamp.refusedContracts : 0;
+      if (Number.isFinite(stamp.at) && (latestAt === null || stamp.at > latestAt)) {
+        latestAt = stamp.at;
+        latestReason = stamp.reason;
+      }
+    }
     return {
       checked: this.exitQuantityChecked,
       bounded: this.exitQuantityBounded,
@@ -10330,6 +10371,12 @@ export class PaperOptionsAccount {
       reconcileTerminal: this.exitQuantityReconcileTerminal,
       deskAddExempt: this.exitQuantityDeskAddExempt,
       last: this.exitQuantityLastRefusal === null ? null : { ...this.exitQuantityLastRefusal },
+      outstanding: {
+        rows: outstandingRows,
+        refusedContracts: outstandingContracts,
+        latestAt,
+        latestReason,
+      },
     };
   }
 

@@ -142,6 +142,26 @@ check('D5  the census publishes `deskAddExempt` + `lastRefusalReason` (desk_add 
     ? `deskAddExempt ${bound.deskAddExempt} / lastRefusalReason ${bound.lastRefusalReason}`
     : 'ABSENT — this build predates the desk_add carve-out');
 
+// TRA-3926 (2026-08-26) — the DURABLE half. Measured on 2026-08-25: the bound
+// refused RIG at 19:58:16Z, the box restarted at 20:49Z and again at 02:29Z,
+// and after BOTH the census served `refusedContracts 0 / lastRefusalAt null`
+// over a row still carrying the stamp. Every other column is since-boot;
+// `outstanding` is read off the open rows at publication time. Its VALUE is
+// not graded here (a durable `foreign_authority` stamp from a pre-carve-out
+// build is expected to persist until the next session tick re-derives it);
+// its PRESENCE is the deployed-bytes proof, and it is printed on every run so
+// a post-restart zero can never again be read as a clean bound.
+const OUTSTANDING_KEYS = ['rows', 'refusedContracts', 'latestAt', 'latestReason'];
+const outstanding = bound && typeof bound === 'object' ? bound.outstanding : undefined;
+const outstandingPresent = !!outstanding && typeof outstanding === 'object'
+  && OUTSTANDING_KEYS.every(k => k in outstanding);
+check('D6  the census publishes `outstanding` (durable row-stamp bytes; survives a restart)',
+  outstandingPresent,
+  outstandingPresent
+    ? `rows ${outstanding.rows} / refusedContracts ${outstanding.refusedContracts} / latest `
+      + `${outstanding.latestAt ? new Date(outstanding.latestAt).toISOString() : 'none'} ${outstanding.latestReason ?? ''}`.trim()
+    : 'ABSENT — this build predates the durable block; a since-boot zero here is NOT "no refusals"');
+
 if (!census) {
   print();
   console.error('FAIL — the detector is not on this build; nothing below is gradeable.');
@@ -282,7 +302,15 @@ const boundExercised = !!bound && typeof bound.checked === 'number' && bound.che
 const unauthorizedAdopted = optionsLive?.liveUnmanagedRisk?.byReason?.adopted_not_authorized ?? 0;
 
 console.log('');
+const outstandingRows = outstandingPresent && typeof outstanding.rows === 'number' ? outstanding.rows : 0;
+const outstandingLine = outstandingPresent
+  ? `${outstanding.rows} row(s) / ${outstanding.refusedContracts} contract(s), latest `
+    + `${outstanding.latestAt ? new Date(outstanding.latestAt).toISOString() : 'none'}`
+    + `${outstanding.latestReason ? ` ${outstanding.latestReason}` : ''}`
+  : 'key ABSENT on this build';
+
 console.log(`# BOUND CENSUS (this boot only, ${before.uptimeSec}s):  ${JSON.stringify(bound)}`);
+console.log(`# OUTSTANDING refusals on open rows (DURABLE, survives a restart):  ${outstandingLine}`);
 console.log(`# the gate that owns the denominator:  liveUnmanagedRisk.byReason.adopted_not_authorized = ${unauthorizedAdopted}`);
 
 if (failed.length > 0) {
@@ -296,6 +324,11 @@ if (!boundExercised) {
     + (unauthorizedAdopted > 0
       ? `\n        And the population is currently held UPSTREAM: ${unauthorizedAdopted} adopted row(s) sit `
         + `\`adopted_not_authorized\`, refused by ruling B's gate before the bound is ever consulted.`
+      : '')
+    + (outstandingRows > 0
+      ? `\n        ⚠ NOT a quiet bound: ${outstandingLine} — OUTSTANDING on open rows from a PREVIOUS boot. `
+        + `The since-boot zero above is the counter resetting, not the refusal clearing; those contracts are `
+        + `still open at the broker with the engine declining to sell them.`
       : ''));
   process.exit(3);
 }

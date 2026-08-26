@@ -275,6 +275,101 @@ describe('TRA-3926 AC3 — the widened row stages ONE contract, not two', () => 
   });
 });
 
+// ─── The DURABLE half of the census (2026-08-26) ─────────────────────────────
+// Measured on bqb1 on 2026-08-25: the bound refused `RIG260925C00006000` at
+// 19:58:16Z (`foreign_authority`, 1 of 1), the box restarted at 20:49:08Z and
+// again at 02:29:59Z, and after BOTH restarts `/api/health/options-live`
+// served `exitQuantityBound { refusedContracts: 0, lastRefusalAt: null }` over
+// a row that still carried the stamp. Every counter is since-boot; the row is
+// not. `outstanding` is read off the rows, so its zero means "nothing
+// outstanding at the broker" rather than "nothing since I last restarted".
+
+describe('TRA-3926 — `outstanding` is read off the rows and survives a restart', () => {
+  it('reports the refusal from the row stamp, beside the since-boot counters', () => {
+    recordEngineOpen(1, 1.08, 142603071);
+    recordDeskImport(1, 0.85);
+    const acct = liveBook(widenedRow());
+    tick(acct);
+
+    const census = acct.getExitQuantityBoundCensus();
+    const stamp = acct.getState().openOptions[0]!.exitQuantityRefusal!;
+    expect(census.outstanding).toEqual({
+      rows: 1,
+      refusedContracts: 1,
+      latestAt: stamp.at,
+      latestReason: 'engine_partial',
+    });
+  });
+
+  it('the 2026-08-25 shape: a fresh process over the same rows reads counters 0 / outstanding 1', () => {
+    recordEngineOpen(1, 1.08, 142603071);
+    recordDeskImport(1, 0.85);
+    const before = liveBook(widenedRow());
+    tick(before);
+    const stamped = before.getState().openOptions[0]!;
+    expect(stamped.exitQuantityRefusal).toBeDefined();
+    delete stamped.pendingExit;
+
+    // A NEW account instance hydrated from the durable state — what boot does.
+    // No tick has run in this process.
+    const after = liveBook(stamped);
+    const census = after.getExitQuantityBoundCensus();
+    expect(census).toMatchObject({
+      checked: 0,
+      bounded: 0,
+      refusedContracts: 0,
+      last: null,
+    });
+    // ...and the counters' zero is NOT a clean bound. The row says so.
+    expect(census.outstanding).toEqual({
+      rows: 1,
+      refusedContracts: 1,
+      latestAt: stamped.exitQuantityRefusal!.at,
+      latestReason: 'engine_partial',
+    });
+  });
+
+  it('clears when the stamp clears — the bound stopped biting', () => {
+    recordEngineOpen(1, 1.08, 142603071);
+    recordDeskImport(1, 0.85);
+    const acct = liveBook(widenedRow());
+    tick(acct);
+    expect(acct.getExitQuantityBoundCensus().outstanding.rows).toBe(1);
+
+    const row = acct.getState().openOptions[0]!;
+    delete row.pendingExit;
+    acct.importSnapshot({
+      openOptions: [row],
+      closedOptions: [],
+      optionsPnl: 0,
+      dailyCount: 0,
+      currentDayKey: '2026-08-21',
+      cash: 1_035.94,
+      equity: 1_035.94,
+    });
+    recordEngineOpen(1, 0.85, 142603072, OPENED_AT + 1_000);
+    tick(acct);
+
+    expect(acct.getExitQuantityBoundCensus().outstanding).toEqual({
+      rows: 0,
+      refusedContracts: 0,
+      latestAt: null,
+      latestReason: null,
+    });
+  });
+
+  it('is zero on a book with no stamped row, whatever the counters say', () => {
+    // A row the oracle cannot answer for is BLIND — counted, exit unbounded,
+    // and NO stamp (the blind branch deletes it). `outstanding` must not
+    // invent a refusal out of a blind read.
+    const acct = liveBook(widenedRow());
+    tick(acct);
+    const census = acct.getExitQuantityBoundCensus();
+    expect(census.blindRows).toBe(1);
+    expect(census.outstanding).toEqual({ rows: 0, refusedContracts: 0, latestAt: null, latestReason: null });
+  });
+});
+
 // ─── AC4 — the negative control. Without it the fix is "always exit 1" ───────
 
 describe('TRA-3926 AC4 — a genuine engine 2-lot still exits TWO', () => {

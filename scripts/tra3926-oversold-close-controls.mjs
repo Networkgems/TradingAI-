@@ -23,6 +23,9 @@
 //   C9  pin commit ≠ --expect                → 3 BLIND   (grades the named build or nothing)
 //   C10 `deskAddExempt` DELETED              → 1 FAIL    (D5; the carve-out's bytes can be seen absent)
 //   C11 last refusal = `foreign_authority`   → 1 FAIL    (G9; the two gates disagreeing is caught)
+//   C12 `outstanding` DELETED                → 1 FAIL    (D6; the durable block's bytes can be seen absent)
+//   C13 census ZERO but `outstanding` = 1 row → 3 BLIND, AND the verdict names the outstanding refusal
+//                                                        (the post-restart shape of 2026-08-25 cannot read as calm)
 //
 // ⚠ C8 is the one that matters most and it is the cheapest to get wrong: with
 // the live box at `checked 0`, a grader whose PASS branch was unreachable would
@@ -64,16 +67,28 @@ if (optionsLive.exitQuantityBound && !('deskAddExempt' in optionsLive.exitQuanti
   console.log('# PRE-DEPLOY capture — `deskAddExempt` / `lastRefusalReason` SEEDED so the controls can grade the grader; '
     + 'the live grader\'s D5 still fails on this box and that is the negative control.');
 }
+// TRA-3926 (2026-08-26) — same seeding for the DURABLE block on a capture that
+// predates it. The live grader's D6 FAILS on such a box; that is its negative
+// control, and these controls grade the grader, not the box.
+if (optionsLive.exitQuantityBound && !('outstanding' in optionsLive.exitQuantityBound)) {
+  optionsLive.exitQuantityBound.outstanding = { rows: 0, refusedContracts: 0, latestAt: null, latestReason: null };
+  console.log('# PRE-DEPLOY capture — `outstanding` SEEDED so the controls can grade the grader; '
+    + 'the live grader\'s D6 still fails on this box and that is the negative control.');
+}
 const ZERO_CENSUS = {
   checked: 0, bounded: 0, refusedContracts: 0, blindRows: 0, suppressedExits: 0, netOfCloses: 0,
   deskAddExempt: 0, lastRefusalAt: null, lastRefusalReason: null,
+  outstanding: { rows: 0, refusedContracts: 0, latestAt: null, latestReason: null },
 };
 
 const clone = o => JSON.parse(JSON.stringify(o));
 const root = mkdtempSync(join(tmpdir(), 'tra3926-controls-'));
 let failed = 0;
 
-const run = (name, expectExit, mutate, expectSha = COMMIT) => {
+// `expectOut` — an optional regex the grader's COMBINED output must match. The
+// exit code alone cannot tell "BLIND and named the outstanding refusal" from
+// "BLIND and read as calm", and the second is the defect C13 exists to catch.
+const run = (name, expectExit, mutate, expectSha = COMMIT, expectOut = null) => {
   const ol = clone(optionsLive);
   const fs2 = clone(fee);
   mutate(ol, fs2);
@@ -81,10 +96,14 @@ const run = (name, expectExit, mutate, expectSha = COMMIT) => {
   writeFileSync(join(dir, 'options-live.json'), JSON.stringify(ol));
   writeFileSync(join(dir, 'fee-slippage.json'), JSON.stringify(fs2));
   const r = spawnSync(process.execPath, [GRADER, `--fixture=${dir}`, `--expect=${expectSha}`], { encoding: 'utf8' });
-  const ok = r.status === expectExit;
+  const out = r.stdout + r.stderr;
+  const exitOk = r.status === expectExit;
+  const outOk = expectOut === null || expectOut.test(out);
+  const ok = exitOk && outOk;
   if (!ok) failed += 1;
-  console.log(`${ok ? 'ok  ' : 'FAIL'}  ${name}  — expected exit ${expectExit}, got ${r.status}`);
-  if (!ok) console.log((r.stdout + r.stderr).split('\n').filter(l => /FAIL|BLIND|PASS/.test(l)).slice(0, 6).map(l => `        ${l}`).join('\n'));
+  console.log(`${ok ? 'ok  ' : 'FAIL'}  ${name}  — expected exit ${expectExit}, got ${r.status}`
+    + (expectOut === null ? '' : `; output ${outOk ? 'names' : 'DOES NOT name'} ${expectOut}`));
+  if (!ok) console.log(out.split('\n').filter(l => /FAIL|BLIND|PASS|OUTSTANDING/.test(l)).slice(0, 6).map(l => `        ${l}`).join('\n'));
 };
 
 run('C1  census forced to ZERO → BLIND (an unexercised bound is never a pass)', 3, ol => {
@@ -126,6 +145,20 @@ run('C11 last refusal = `foreign_authority` with the bound exercised → FAIL (G
     deskAddExempt: 0, lastRefusalReason: 'foreign_authority',
   };
 });
+run('C12 `outstanding` DELETED → FAIL (D6 sees the durable block\'s bytes ABSENT)', 1, ol => {
+  ol.exitQuantityBound = { ...ol.exitQuantityBound, checked: 1, bounded: 1, refusedContracts: 1, lastRefusalReason: 'engine_partial' };
+  delete ol.exitQuantityBound.outstanding;
+});
+// The 2026-08-25 post-restart shape, byte for byte: counters zero, one durable
+// `foreign_authority` stamp on an open row. The verdict must stay BLIND (an
+// unexercised bound is still not a pass) AND must NAME the outstanding refusal
+// — a BLIND that reads as calm is the defect QuantTrader measured twice.
+run('C13 census ZERO + `outstanding` 1 row → BLIND that NAMES the outstanding refusal', 3, ol => {
+  ol.exitQuantityBound = {
+    ...ol.exitQuantityBound, ...ZERO_CENSUS,
+    outstanding: { rows: 1, refusedContracts: 1, latestAt: Date.parse('2026-08-25T19:58:16.789Z'), latestReason: 'foreign_authority' },
+  };
+}, COMMIT, /NOT a quiet bound: 1 row\(s\) \/ 1 contract\(s\), latest 2026-08-25T19:58:16\.789Z foreign_authority/);
 
 rmSync(root, { recursive: true, force: true });
 console.log(failed === 0 ? '\nCONTROLS PASS — every verdict is reachable and each is reached for its own reason.'

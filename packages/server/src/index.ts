@@ -12052,10 +12052,29 @@ app.get('/api/health/options-live', async (_req, res) => {
             // of 245 "exercised" checks can say whether they were findings or a
             // board grant being refused (which is what 245 of them were).
             deskAddExempt: acc.deskAddExempt + s.deskAddExempt,
+            // TRA-3976 — never reached the wire until 2026-08-26; the wrapper
+            // and this reducer both forgot it.
+            reconcileTerminal: acc.reconcileTerminal + s.reconcileTerminal,
             ...(s.lastRefusalAt !== null
               && (acc.lastRefusalAt === null || s.lastRefusalAt > acc.lastRefusalAt)
               ? { lastRefusalAt: s.lastRefusalAt, lastRefusalReason: s.lastRefusalReason }
               : { lastRefusalAt: acc.lastRefusalAt, lastRefusalReason: acc.lastRefusalReason }),
+            // TRA-3926 (2026-08-26) — the DURABLE half. Everything above is
+            // since-boot and was read as "no refusals" across two restarts on
+            // 2026-08-25 while `RIG260925C00006000` still carried a 19:58:16Z
+            // `foreign_authority` stamp. `outstanding` is read off the open
+            // rows at publication time, so its zero means "nothing outstanding
+            // at the broker", not "nothing since I last restarted". Read the
+            // pair: `refusedContracts 0 / outstanding.rows 1` is exactly the
+            // post-restart shape and it is NOT a clean bound.
+            outstanding: {
+              rows: acc.outstanding.rows + s.outstanding.rows,
+              refusedContracts: acc.outstanding.refusedContracts + s.outstanding.refusedContracts,
+              ...(s.outstanding.latestAt !== null
+                && (acc.outstanding.latestAt === null || s.outstanding.latestAt > acc.outstanding.latestAt)
+                ? { latestAt: s.outstanding.latestAt, latestReason: s.outstanding.latestReason }
+                : { latestAt: acc.outstanding.latestAt, latestReason: acc.outstanding.latestReason }),
+            },
           };
         },
         {
@@ -12066,8 +12085,15 @@ app.get('/api/health/options-live', async (_req, res) => {
           suppressedExits: 0,
           netOfCloses: 0,
           deskAddExempt: 0,
+          reconcileTerminal: 0,
           lastRefusalAt: null as number | null,
           lastRefusalReason: null as string | null,
+          outstanding: {
+            rows: 0,
+            refusedContracts: 0,
+            latestAt: null as number | null,
+            latestReason: null as string | null,
+          },
         },
       ),
     });
