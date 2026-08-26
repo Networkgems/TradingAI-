@@ -2345,6 +2345,54 @@ export interface OptionOpeningRangeSuppression {
   premiumAtFire?: number;
 }
 /**
+ * TRA-4055 (parent TRA-4045) — WHERE THE NUMBER THE EXIT RULE READ CAME FROM.
+ *
+ * `checkExits` evaluates every stop against one scalar `mark`, and that scalar
+ * has three possible origins that the wire could not tell apart:
+ *
+ *   • `quote`          — the two-sided book's midpoint, `(bid + ask) / 2`;
+ *   • `last`           — the contract's last PRINT, when the book was one-sided
+ *                        or absent (`getOptionMark`'s second branch);
+ *   • `delta_backstop` — no mark at all. A SYNTHETIC number extrapolated off the
+ *                        underlying: `premiumPaid + (spot − underlyingEntryPrice)
+ *                        × |entryDelta|`, reached after `STALE_MARK_BACKSTOP_TICKS`
+ *                        consecutive chain misses on the OTM/RV sleeve, or on the
+ *                        FIRST miss for an ATM/imported row (which gets no tick
+ *                        tolerance).
+ *   • `null`           — undecidable on this pass. The quote-detail capability was
+ *                        not wired, or the chain row moved between the mark read
+ *                        and the quote read. NEVER guessed: a fabricated provenance
+ *                        is worse than an absent one.
+ *
+ * The distinction is not academic. On 2026-08-24T15:15:54Z the OTM sleeve's −35%
+ * day-one stop closed `RIG260925C00006000` on a mark of `0.1916970168819763` — a
+ * number no quote can produce (both `getOptionMark` branches are multiples of
+ * $0.005). It was the delta backstop, and it sat 3.2c ABOVE the real mid the
+ * submit path read 0.26 s later (bid 0.12 / ask 0.20). Establishing that took a
+ * Render log line, the journal row's `entryDelta`, the fire log's `spot` and an
+ * arithmetic back-solve for `underlyingEntryPrice`. This record makes it a read.
+ *
+ * `quoteAtFire` is stamped whenever the two-sided quote WAS served on the pass —
+ * including when `markSource` is `delta_backstop`, which is the most valuable
+ * case of all: it is the price the rule could not see, beside the price it acted
+ * on. `null`, never `0`, when absent (the TRA-3990 discipline).
+ *
+ * Observe-only. Nothing in this record reaches an order, a level or a cadence.
+ */
+export interface OptionMarkProvenance {
+  markSource: 'quote' | 'last' | 'delta_backstop' | null;
+  /**
+   * `OptionPosition.staleMarkTicks` AT EVALUATION — consecutive chain misses
+   * behind this mark. `0` on a served mark. `null` only when the row carried no
+   * counter at all.
+   */
+  staleMarkTicks: number | null;
+  /** The two-sided quote served for this contract on the SAME pass, or `null`. */
+  quoteAtFire: { bid: number; ask: number } | null;
+  /** ms epoch of the evaluation that produced the mark. */
+  at: number;
+}
+/**
  * TRA-4030 (R4, the PDT column) — see `OptionPosition.profitFloorHeldForPdt`.
  * The per-row, restart-durable twin of `OptionOpeningRangeSuppression`: how
  * many ticks the ladder's FLOOR leg wanted to fire on a day-one live row and
@@ -3063,6 +3111,17 @@ export interface OptionPosition {
    * row.
    */
   openingRangeSuppressed?: OptionOpeningRangeSuppression;
+  /**
+   * TRA-4055 — the provenance of the mark the exit rule that closed this row
+   * actually READ, stamped at the fire (the same seam as
+   * `openingRangeSuppressed.premiumAtFire`) and folded onto the journal close
+   * row. Absent ↔ the row has not fired an engine exit on this build.
+   *
+   * Deliberately NOT re-stamped every tick: this is a record of the DECISION,
+   * and a per-tick overwrite would leave the last quiet tick's provenance on a
+   * row whose stop fired three ticks earlier.
+   */
+  exitMarkProvenance?: OptionMarkProvenance;
   trailingActive: boolean;    // true once price is up 20% and trailing mode engaged
   trailingStopPremium: number; // current trailing stop level (peak * (1 - 0.12))
   underlyingEntryPrice: number;

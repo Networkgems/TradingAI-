@@ -1309,6 +1309,7 @@ describe('SignalEngine — relative-value scanner bridge', () => {
       getState: () => ({ openOptions: positions }),
       refreshLiveDisplayMarks: vi.fn(),
       refreshOptionQuotes: vi.fn(),
+      refreshOptionMarkSources: vi.fn(), // TRA-4055 — fanned on the same loop
     });
     (engine as unknown as { optionsAccounts: unknown }).optionsAccounts = {
       sandbox: book([row('demo', 0.5)]),
@@ -1356,6 +1357,7 @@ describe('SignalEngine — relative-value scanner bridge', () => {
         getState: () => ({ openOptions: positions }),
         refreshLiveDisplayMarks: vi.fn(),
         refreshOptionQuotes: vi.fn(),
+        refreshOptionMarkSources: vi.fn(), // TRA-4055 — fanned on the same loop
       });
       (engine as unknown as { optionsAccounts: unknown }).optionsAccounts = {
         sandbox: book(rows.filter((r) => r.mode === 'demo')),

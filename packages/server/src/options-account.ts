@@ -22,7 +22,7 @@ import type {
   OptionAdmissionStamp,
 } from '@trading-app/shared';
 import { buildEntryQuoteStamp, PROFIT_FLOOR_LADDER } from '@trading-app/shared';
-import type { ProfitFloorLadderStep, OptionProfitFloorPdtHold } from '@trading-app/shared';
+import type { ProfitFloorLadderStep, OptionProfitFloorPdtHold, OptionMarkProvenance } from '@trading-app/shared';
 import { recordEntryQuoteStampOutcome } from './entry-quote-stamp.js';
 import { computePortfolioGreeks } from './reports/portfolio-greeks.js';
 import { etDateKey, etWallClockToUtcMs } from './et-clock.js';
@@ -889,6 +889,35 @@ function noteProfitFloorPdtHold(opt: OptionPosition, mark: number, now: number, 
 function stampProfitFloorPdtFire(opt: OptionPosition, mark: number): void {
   const h = opt.profitFloorHeldForPdt;
   if (h !== undefined && h.premiumAtFire === undefined) h.premiumAtFire = mark;
+}
+
+/**
+ * TRA-4055 (parent TRA-4045) — THE ONE STAMP. Records, on the row, where the
+ * mark this exit fired on came from.
+ *
+ * ## Why one call site and not three
+ *
+ * The ticket asked for the stamp at three branches — the OTM intraday stop, the
+ * generic `sl`, and `sl_catastrophic` — with a source-level grep so a fourth
+ * stop could not fire unstamped. This ships the stronger version of that
+ * guarantee: `mark` is computed ONCE PER ROW PER TICK, above the whole exit
+ * cascade, so its provenance is a property of the tick and not of the branch.
+ * Every branch would therefore stamp the identical value. Stamping instead at
+ * the single unconditional seam every fire already funnels through
+ * (`exitPremium !== null && exitKind !== null`, beside `stampOpeningRangeFire`)
+ * makes "a fourth stop fires unstamped" UNREACHABLE rather than merely tested
+ * for — and it covers `sl_daily_close` and the trail family too, both of which
+ * decide on the same possibly-synthetic mark and neither of which the three-site
+ * design would have caught. `tra4055-mark-provenance.test.ts` pins the seam.
+ *
+ * Stamped ONCE (first fire wins). A row can reach here twice — a staged
+ * `pendingExit` that lapses and re-fires next session — and the provenance that
+ * matters is the one belonging to the decision, not to the retry.
+ *
+ * Observe-only: nothing downstream reads this into a price, a level or an order.
+ */
+function stampExitMarkProvenance(opt: OptionPosition, provenance: OptionMarkProvenance): void {
+  if (opt.exitMarkProvenance === undefined) opt.exitMarkProvenance = provenance;
 }
 
 /**
@@ -1905,6 +1934,23 @@ export function mergeLiveStopActionability(
  * hole is OTM-specific; it is not (the hold is `signalType`-blind), and the
  * split is how a reader sees which sleeve is actually carrying it.
  */
+/**
+ * TRA-4055 (parent TRA-4045) — OTM day-one stop fires split by the PROVENANCE of
+ * the mark each one was evaluated against. See
+ * `OptionsAccount.otmDayOneStopFiresByMarkSource`.
+ *
+ * `quote + last + delta_backstop + unknown === fires.premiumPct +
+ * fires.atrInvalidation` on every reading. `pdtHeld` is NOT in this identity —
+ * a held fire never reached an exit, so it has no mark to attribute.
+ */
+export interface OtmDayOneStopMarkSourceCounts {
+  quote: number;
+  last: number;
+  delta_backstop: number;
+  /** Provenance undecidable on the pass (quote-detail unwired, or a moved chain row). */
+  unknown: number;
+}
+
 export interface DayOneStopPosture {
   /**
    * The FLEET basis, folded from {@link stopBasisBySleeve} (TRA-3943).
@@ -1982,7 +2028,20 @@ export interface DayOneStopPosture {
      * are the cumulative twin. `pdtHeld > 0` means the rule triggered and the
      * release refused — the remedy is armed and NOT in force.
      */
-    fires: { premiumPct: number; atrInvalidation: number; pdtHeld: number };
+    fires: {
+      premiumPct: number;
+      atrInvalidation: number;
+      pdtHeld: number;
+      /**
+       * TRA-4055 — the same fires, split by MARK PROVENANCE. `delta_backstop > 0`
+       * means this sleeve has closed real money on a SYNTHETIC price extrapolated
+       * off the underlying, not on anything the book was showing — which is what
+       * the one realized fire on 2026-08-24 turned out to be, and which took a
+       * Render log line and an arithmetic back-solve to establish because no
+       * field said it. Countable here without the journal.
+       */
+      byMarkSource: OtmDayOneStopMarkSourceCounts;
+    };
   } | null;
   /**
    * TRA-3985 — WHAT WAS COUNTED, as a literal on the wire rather than as a
@@ -2049,7 +2108,18 @@ export interface DayOneStopPostureContext {
    * ({@link OptionsAccount.getOtmDayOneStopCounters}). Zeros when absent, which
    * is what a caller with no account to ask gets.
    */
-  otmDayOneStopCounters?: { premiumPct: number; atrInvalidation: number; pdtHeld: number };
+  otmDayOneStopCounters?: {
+    premiumPct: number;
+    atrInvalidation: number;
+    pdtHeld: number;
+    /** TRA-4055 — see {@link OtmDayOneStopMarkSourceCounts}. */
+    byMarkSource: OtmDayOneStopMarkSourceCounts;
+  };
+}
+
+/** TRA-4055 — the all-zero split, for the "no counters attached" reading. */
+function zeroMarkSourceCounts(): OtmDayOneStopMarkSourceCounts {
+  return { quote: 0, last: 0, delta_backstop: 0, unknown: 0 };
 }
 
 function r2usd(v: number): number {
@@ -2139,7 +2209,7 @@ export function summarizeDayOneStopPosture(
         atrLegInertRows,
         atrLegPopulationRows: atrLegRows + atrLegInertRows,
         fires: ctx.otmDayOneStopCounters
-          ?? { premiumPct: 0, atrInvalidation: 0, pdtHeld: 0 },
+          ?? { premiumPct: 0, atrInvalidation: 0, pdtHeld: 0, byMarkSource: zeroMarkSourceCounts() },
       },
     population: 'live_held_rows_opened_today',
     // One summary is one book. The fold counts them (`mergeDayOneStopPosture`).
@@ -2192,7 +2262,16 @@ export function mergeDayOneStopPosture(
   // TRA-3985 — counted off the SUMMARIES, and summed rather than incremented, so
   // a nested fold (a merge of merges) still reports books and not merge-calls.
   let books = 0;
-  const fires = { premiumPct: 0, atrInvalidation: 0, pdtHeld: 0 };
+  const fires = {
+    premiumPct: 0,
+    atrInvalidation: 0,
+    pdtHeld: 0,
+    // TRA-4055 — folded per bucket, like every other counter here. A book on an
+    // older build reports no split; its fires land in the leg totals and in NO
+    // bucket, so the identity above would not hold for that fleet — which is the
+    // honest reading, not a hidden one, because `books` is on the wire beside it.
+    byMarkSource: zeroMarkSourceCounts(),
+  };
   for (const s of summaries) {
     books += s.books;
     rows += s.rows;
@@ -2211,6 +2290,14 @@ export function mergeDayOneStopPosture(
       fires.premiumPct += s.otmDayOneStop.fires.premiumPct;
       fires.atrInvalidation += s.otmDayOneStop.fires.atrInvalidation;
       fires.pdtHeld += s.otmDayOneStop.fires.pdtHeld;
+      // TRA-4055 — `?? {}` rather than a required read: a summary minted by an
+      // older build (or by a hand-built fixture) has no split, and the fold must
+      // add zero from it rather than throw on the health route's happy path.
+      const bms = s.otmDayOneStop.fires.byMarkSource ?? zeroMarkSourceCounts();
+      fires.byMarkSource.quote += bms.quote ?? 0;
+      fires.byMarkSource.last += bms.last ?? 0;
+      fires.byMarkSource.delta_backstop += bms.delta_backstop ?? 0;
+      fires.byMarkSource.unknown += bms.unknown ?? 0;
       if (otmDayOneStop === null) otmDayOneStop = s.otmDayOneStop;
     }
     if (s.releasesAt !== null && (earliest === null || s.releasesAt < earliest)) {
@@ -4543,6 +4630,27 @@ export class PaperOptionsAccount {
     atr_invalidation: 0,
   };
   /**
+   * TRA-4055 (parent TRA-4045) — the SAME fires, split by the PROVENANCE of the
+   * mark each one was evaluated against. Since-boot, per book.
+   *
+   * The leg split above says WHICH RULE fired. This says whether the number the
+   * rule read was a price the market was showing or one the engine synthesised
+   * off the underlying after three dark chain snapshots. On 2026-08-24 the
+   * sleeve's only realized stop was the second kind, 3.2c above the mid the
+   * submit path saw 0.26 s later — and no counter anywhere could have said so.
+   *
+   * `unknown` is a real bucket, not a rounding error: it carries fires whose
+   * provenance was undecidable on the pass. It exists so the vector SUMS to
+   * `premiumPct + atrInvalidation`; a split that silently drops its
+   * undecidables reads as full coverage of a population it never covered.
+   */
+  private otmDayOneStopFiresByMarkSource: OtmDayOneStopMarkSourceCounts = {
+    quote: 0,
+    last: 0,
+    delta_backstop: 0,
+    unknown: 0,
+  };
+  /**
    * TRA-3943 — OTM intraday stops this process could NOT fire on day one because
    * the account had no day-trade capacity (one per row per ET day).
    *
@@ -4587,6 +4695,16 @@ export class PaperOptionsAccount {
    * exactly today's shipped behaviour.
    */
   private optionQuotes = new Map<string, { bid: number; ask: number }>();
+  /**
+   * TRA-4055 — this tick's per-OCC mark PROVENANCE (`quote` | `last`), refreshed
+   * wholesale by {@link refreshOptionMarkSources}. A symbol absent from this map
+   * is UNDECIDED, not `last`: the quote-detail capability may not be wired at
+   * all, and a default here would manufacture the exact column this ticket
+   * exists to stop manufacturing.
+   *
+   * Not persisted and not seeded, same as {@link optionQuotes}.
+   */
+  private optionMarkSources = new Map<string, 'quote' | 'last'>();
   private currentDayKey = toDateKey(Date.now());
   /**
    * TRA-991 — serialized tail of pending option-trade-journal appends. The
@@ -5460,6 +5578,14 @@ export class PaperOptionsAccount {
                 },
               }
             : {}),
+          // TRA-4055 (parent TRA-4045) — the provenance of the mark the exit rule
+          // READ, off the row where the fire stamped it. Absent stays absent: a
+          // close booked by a path that never evaluated a mark (expiry settle,
+          // broker reconcile, a row closed on an older build) has no provenance,
+          // and ⛔ a reconstructed one is a fabricated column.
+          ...(position.exitMarkProvenance !== undefined
+            ? { markProvenance: { ...position.exitMarkProvenance } }
+            : {}),
           ...(pdtHeld !== undefined
             ? {
                 profitFloorHeldForPdt: {
@@ -6087,6 +6213,21 @@ export class PaperOptionsAccount {
    */
   refreshOptionQuotes(quotesByOcc: Map<string, { bid: number; ask: number }>): void {
     this.optionQuotes = new Map(quotesByOcc);
+  }
+
+  /**
+   * TRA-4055 (parent TRA-4045) — install this tick's MARK PROVENANCE, decided at
+   * the `refreshOptionMarks` seam (the only place `getOptionMark`'s two branches
+   * are separable) and read back at the fire sites in `checkExits`.
+   *
+   * Same WHOLESALE-REPLACE contract as {@link refreshOptionQuotes} above and for
+   * the same reason: a provenance describes ONE pass's mark. A symbol missing
+   * from the map is `markSource: null` — undecidable — never a default.
+   *
+   * Purely an instrument. Nothing reads this into a level, a price or a cadence.
+   */
+  refreshOptionMarkSources(sourcesByOcc: Map<string, 'quote' | 'last'>): void {
+    this.optionMarkSources = new Map(sourcesByOcc);
   }
 
   /**
@@ -8360,8 +8501,24 @@ export class PaperOptionsAccount {
       if (opt.pendingExit) continue;
       const liveMark = opt.optionSymbol ? optionMarks?.get(opt.optionSymbol) : undefined;
       let mark: number;
+      // TRA-4055 (parent TRA-4045) — the mark's ORIGIN, decided in the same
+      // three branches that decide the mark itself, so the two can never drift.
+      // `null` until one of them assigns it; the live branch may legitimately
+      // leave it `null` when the seam could not separate mid from last-print.
+      let markSource: OptionMarkProvenance['markSource'] = null;
+      // The two-sided quote this pass served for the contract, if any. Read
+      // OUTSIDE the branches on purpose: the most informative case is a
+      // `delta_backstop` fire WITH a served quote — the price the rule could not
+      // see, beside the price it acted on. `null`, never `0`, when absent.
+      const quoteAtFire = this.liveQuoteFor(opt);
       if (typeof liveMark === 'number' && liveMark > 0) {
         mark = liveMark;
+        // TRA-4055 — a served mark, so `getOptionMark` took one of its two
+        // branches; which one was decided at the `refreshOptionMarks` seam and
+        // handed here by `refreshOptionMarkSources`. Absent ⇒ undecidable on
+        // this pass (quote-detail capability unwired, chain row moved between
+        // the two reads, or a caller that never fans the map) ⇒ stays `null`.
+        markSource = (opt.optionSymbol ? this.optionMarkSources.get(opt.optionSymbol) : undefined) ?? null;
         // Fresh mark this tick — clear the stale-mark backstop counter.
         opt.staleMarkTicks = 0;
       } else if (opt.signalType === 'otm_mispricing' || opt.signalType === 'relative_value') {
@@ -8398,6 +8555,10 @@ export class PaperOptionsAccount {
             : ATM_DELTA;
         const premiumMove = underlyingMove * deltaMag * (opt.optionType === 'call' ? 1 : -1);
         mark = Math.max(0.01, opt.premiumPaid + premiumMove);
+        // TRA-4055 — THE branch the 2026-08-24 RIG stop fired on. This number is
+        // not a price; it is an extrapolation, and every rule below reads it as
+        // though it were one.
+        markSource = 'delta_backstop';
       } else {
         const currentUnderlying = underlyingPrices.get(opt.symbol);
         if (currentUnderlying == null) continue;
@@ -8409,7 +8570,23 @@ export class PaperOptionsAccount {
         const underlyingMove = currentUnderlying - opt.underlyingEntryPrice;
         const premiumMove = underlyingMove * ATM_DELTA * (opt.optionType === 'call' ? 1 : -1);
         mark = Math.max(0.01, opt.premiumPaid + premiumMove);
+        // TRA-4055 — the SAME synthesis, off `ATM_DELTA` instead of the stamped
+        // entry delta, and reached on the FIRST miss because this branch has no
+        // tick tolerance at all. `staleMarkTicks` therefore reads 0 here, which
+        // is the true count and NOT a claim that the mark was served.
+        markSource = 'delta_backstop';
       }
+      // TRA-4055 — assembled once, above the whole exit cascade, because `mark`
+      // is one value per row per tick and so is its provenance. Every fire below
+      // stamps THIS object (see `stampExitMarkProvenance`).
+      const markProvenance: OptionMarkProvenance = {
+        markSource,
+        staleMarkTicks: typeof opt.staleMarkTicks === 'number' && Number.isFinite(opt.staleMarkTicks)
+          ? opt.staleMarkTicks
+          : null,
+        quoteAtFire,
+        at: Date.now(),
+      };
 
       // OTM positions follow the OTM_RISK_PARAMS trail/partial schedule;
       // RV positions follow RV_RISK_PARAMS (TRA-191); ATM legacy paths stay on
@@ -9145,6 +9322,12 @@ export class PaperOptionsAccount {
         exitKind = 'sl';
         exitJournalReason = OTM_DAY_ONE_STOP_JOURNAL_REASON[otmStopTrigger];
         this.otmDayOneStopFires[otmStopTrigger] += 1;
+        // TRA-4055 — the same fire, binned by the PROVENANCE of the mark it was
+        // evaluated on, so `delta_backstop > 0` is answerable off
+        // `/api/health/options-live` without opening the journal. An undecidable
+        // provenance goes to `unknown` rather than nowhere: the split has to sum
+        // to the leg totals or it is a coverage claim it cannot support.
+        this.otmDayOneStopFiresByMarkSource[markProvenance.markSource ?? 'unknown'] += 1;
         accountLog.warn('OTM intraday stop FIRED', {
           issue: 'TRA-3943',
           optionSymbol: opt.optionSymbol,
@@ -9155,6 +9338,13 @@ export class PaperOptionsAccount {
           atrInvalidationLevel: opt.otmAtrInvalidationLevel ?? null,
           spot: underlyingPrices.get(opt.symbol) ?? null,
           openedToday: openedTodayKey,
+          // TRA-4055 — `mark` above is a scalar with three possible origins and
+          // this is which one. On 2026-08-24 this line carried the 0.19169…
+          // that only a Render log, the journal's `entryDelta` and an
+          // arithmetic back-solve for `underlyingEntryPrice` could attribute.
+          markSource: markProvenance.markSource,
+          staleMarkTicks: markProvenance.staleMarkTicks,
+          quoteAtFire: markProvenance.quoteAtFire,
         });
       }
 
@@ -9410,6 +9600,11 @@ export class PaperOptionsAccount {
               premiumPaid: opt.premiumPaid,
               catastrophicLevel,
               stopLossPremium: opt.stopLossPremium,
+              // TRA-4055 — this branch fires AT the mark, so its provenance is
+              // the provenance of the exit price itself, not just of the trigger.
+              markSource: markProvenance.markSource,
+              staleMarkTicks: markProvenance.staleMarkTicks,
+              quoteAtFire: markProvenance.quoteAtFire,
             });
           } else if (opt.slHeldForDailyClose !== dayKey) {
             // Held until the close window. Latched once per row per ET day so
@@ -9433,6 +9628,21 @@ export class PaperOptionsAccount {
           exitPremium = opt.stopLossPremium;
           exitKind = 'sl';
           exitJournalReason = exitJournalReason ?? 'sl';
+          // TRA-4055 — the generic hard stop had no log line at all. It rests at
+          // the LEVEL rather than at the mark, but `slBreached` was decided on
+          // `mark`, so a synthetic mark can trip it exactly as it tripped the
+          // OTM rule on 2026-08-24 — and until now nothing on the wire said so.
+          accountLog.warn('hard premium stop FIRED', {
+            issue: 'TRA-4055',
+            optionSymbol: opt.optionSymbol,
+            mode: opt.mode ?? 'demo',
+            mark,
+            stopLossPremium: opt.stopLossPremium,
+            premiumPaid: opt.premiumPaid,
+            markSource: markProvenance.markSource,
+            staleMarkTicks: markProvenance.staleMarkTicks,
+            quoteAtFire: markProvenance.quoteAtFire,
+          });
         // TRA-3217 item 2 — the premium-space trail is gated by the live
         // opening-range window like the chandelier (the hard SL above is
         // exempt by design). Its ratchet does NOT get the re-anchor
@@ -9457,6 +9667,12 @@ export class PaperOptionsAccount {
         // different tick) and at the close on the paper path.
         stampOpeningRangeFire(opt, mark);
         stampProfitFloorPdtFire(opt, mark); // TRA-4030 (R4)
+        // TRA-4055 (parent TRA-4045) — WHERE the mark this exit fired on came
+        // from. UNCONDITIONAL and at the one seam every engine exit funnels
+        // through, so no stop — present or future — can fire unstamped. See the
+        // header on `stampExitMarkProvenance` for why this is one call site and
+        // not the three the ticket enumerated.
+        stampExitMarkProvenance(opt, markProvenance);
         if (waitAndHold) {
           // TRA-354 — stage the full exit at the trigger (SL or trailing)
           // price; engine submits a Tradier limit sell_to_close. The paper
@@ -10525,11 +10741,15 @@ export class PaperOptionsAccount {
     premiumPct: number;
     atrInvalidation: number;
     pdtHeld: number;
+    byMarkSource: OtmDayOneStopMarkSourceCounts;
   } {
     return {
       premiumPct: this.otmDayOneStopFires.premium_pct,
       atrInvalidation: this.otmDayOneStopFires.atr_invalidation,
       pdtHeld: this.otmDayOneStopPdtHolds,
+      // TRA-4055 — copied, not aliased: this leaves the class on a health route
+      // and a caller holding the live object could watch it move mid-render.
+      byMarkSource: { ...this.otmDayOneStopFiresByMarkSource },
     };
   }
 

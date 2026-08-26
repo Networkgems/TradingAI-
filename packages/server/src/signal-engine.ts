@@ -8443,9 +8443,33 @@ export class SignalEngine {
     // modeled `h`, which is exactly what that constant's own header says it is for.
     const quotes = new Map<string, { bid: number; ask: number }>();
     const canQuoteDetail = typeof this.rvScanner.getOptionQuoteDetail === 'function';
+    // TRA-4055 (parent TRA-4045) — the mark's PROVENANCE, decided HERE and only
+    // here. `getOptionMark` collapses two different prices into one scalar:
+    // `(bid + ask) / 2` when the book is two-sided and sane, else `row.last`.
+    // Downstream — `checkExits`, the fire log, the journal close row — that
+    // scalar is indistinguishable, which is why the 2026-08-24 RIG stop took a
+    // Render log line and an arithmetic back-solve to attribute.
+    //
+    // It is decidable at THIS seam and nowhere else, because `getOptionMark` and
+    // `getOptionQuoteDetail` read the SAME cached chain row on the SAME pass and
+    // apply the SAME usability predicate (`bid > 0 && ask > 0 && ask >= bid`;
+    // `relative-value-scanner.ts:637` vs `options-scanner.ts:271`). So a served
+    // mark whose quote resolved `quoted` came off the mid, and one whose quote
+    // resolved `one_sided` came off `last` — a read, not an inference.
+    //
+    // Every other outcome (`no_capability`, `absent`, `breaker_open`, `no_client`,
+    // `error`) leaves the symbol OUT of this map, and an absent entry reads as
+    // `markSource: null` downstream. `absent` in particular is a CONTRADICTION —
+    // `getOptionMark` found the row and the quote read did not, so the chain moved
+    // underneath us — and a contradiction must not be resolved by picking a side.
+    const markSources = new Map<string, 'quote' | 'last'>();
     await Promise.all(
       [...chains.values()].map(async (group) => {
         for (const o of group) {
+          // TRA-4055 — the mark THIS position actually contributed to the map
+          // (i.e. not withheld by the TRA-2927 jump bound, which is a MISS
+          // downstream and must not be labelled with a provenance).
+          let servedMark: number | null = null;
           try {
             const mark = await this.rvScanner!.getOptionMark(o.symbol, o.expiration!, o.optionSymbol!);
             if (mark != null && mark > 0) {
@@ -8504,6 +8528,7 @@ export class SignalEngine {
                 });
               } else {
                 marks.set(o.optionSymbol!, mark);
+                servedMark = mark; // TRA-4055
               }
             }
           } catch (err: unknown) {
@@ -8553,6 +8578,13 @@ export class SignalEngine {
             mode: quoteMode,
             now: Date.now(),
           });
+          // TRA-4055 — see the header on `markSources`. Only the two outcomes
+          // that pin `getOptionMark`'s branch are recorded; everything else stays
+          // absent and reads `null` rather than a guess.
+          if (servedMark !== null) {
+            if (outcome === 'served') markSources.set(o.optionSymbol!, 'quote');
+            else if (outcome === 'one_sided') markSources.set(o.optionSymbol!, 'last');
+          }
         }
       }),
     );
@@ -8572,6 +8604,14 @@ export class SignalEngine {
     // exited at is not.)
     for (const acct of this.allOptionsAccounts()) {
       acct.refreshOptionQuotes(quotes);
+      // TRA-4055 — fanned on the SAME loop and with the same wholesale-REPLACE
+      // contract as the quotes beside it, and for the same reason: a provenance
+      // is a statement about ONE pass's mark, so a tick that decided none must
+      // clear the previous tick's rather than leave a stale label standing in
+      // for a live one. An empty map ⇒ every mark reads `markSource: null`,
+      // which is what a caller that never fans this gets (unit tests calling
+      // `checkExits` directly; a scanner with no quote-detail capability).
+      acct.refreshOptionMarkSources(markSources);
     }
     return marks;
   }

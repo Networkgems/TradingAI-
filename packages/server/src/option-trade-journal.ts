@@ -2,7 +2,7 @@ import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { deriveEntrySpreadPct } from '@trading-app/shared';
-import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason, OptionAdmissionStamp } from '@trading-app/shared';
+import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason, OptionAdmissionStamp, OptionMarkProvenance } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { STOP_DISTANCE_FRACTION_OF_MARK } from './option-spread-cost.js';
 import type { RiskThrottleSizingPath, RiskThrottleSizingScope } from './risk-throttle-sizing.js';
@@ -510,6 +510,22 @@ export interface OptionTradeJournalClose {
    * same subtraction as `openingRangeSuppressed`, so one grader reads both.
    */
   profitFloorHeldForPdt?: OptionTradeJournalProfitFloorPdtHold;
+  /**
+   * TRA-4055 (parent TRA-4045) — WHERE THE MARK THIS EXIT FIRED ON CAME FROM:
+   * the two-sided quote's mid, the last print, or the synthetic underlying-delta
+   * backstop; the `staleMarkTicks` count behind it; and the two-sided quote the
+   * pass served, when it served one.
+   *
+   * See `OptionMarkProvenance` in `@trading-app/shared` for the full argument.
+   * Short version: the one realized close of the −35% OTM day-one stop fired on
+   * `0.1916970168819763`, which is not a price any quote can produce, and there
+   * was no column on this row that said so. Absent on every row closed before
+   * this shipped and on every close booked by a path that never evaluated a mark
+   * (expiry settle, broker reconcile).
+   *
+   * ⛔ NEVER BACKFILLED. A reconstructed provenance is a fabricated column.
+   */
+  markProvenance?: OptionMarkProvenance;
 }
 
 /** TRA-4020 (R4) — see {@link OptionTradeJournalClose.openingRangeSuppressed}. */
@@ -591,6 +607,12 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
   openingRangeSuppressed?: OptionTradeJournalOpeningRangeSuppression;
   /** TRA-4030 (R4) — PDT-capacity holds of the profit floor on this row, folded from the CLOSE row. */
   profitFloorHeldForPdt?: OptionTradeJournalProfitFloorPdtHold;
+  /**
+   * TRA-4055 — where the mark this exit fired on came from, folded from the
+   * CLOSE row. Absent on a pre-stamp close and on any close booked by a path
+   * that never evaluated a mark. ⛔ Never backfilled.
+   */
+  markProvenance?: OptionMarkProvenance;
   /**
    * TRA-2895 — partial exits realized before the full close, in append order.
    *
@@ -1772,6 +1794,19 @@ function foldLine(
           profitFloorHeldForPdt: {
             ...line.close.profitFloorHeldForPdt,
             etDayKeys: [...(line.close.profitFloorHeldForPdt.etDayKeys ?? [])],
+          },
+        }
+      : {}),
+    // TRA-4055 — the mark's provenance, beside them; absent stays absent. Copied
+    // (`quoteAtFire` nested) so a replayed line cannot alias the ledger's object.
+    ...(line.close.markProvenance !== undefined
+      ? {
+          markProvenance: {
+            ...line.close.markProvenance,
+            quoteAtFire: line.close.markProvenance.quoteAtFire === null
+              || line.close.markProvenance.quoteAtFire === undefined
+              ? null
+              : { ...line.close.markProvenance.quoteAtFire },
           },
         }
       : {}),

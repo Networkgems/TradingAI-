@@ -650,7 +650,16 @@ describe('TRA-3943 AC2 — the posture endpoint', () => {
     const { acct, tick } = liveOtmRow();
     expect(tick(0.64, 200)).toHaveLength(1);
     const p = acct.dayOneStopPosture(MIDDAY, ARMED);
-    expect(p.otmDayOneStop!.fires).toEqual({ premiumPct: 1, atrInvalidation: 0, pdtHeld: 0 });
+    // TRA-4055 — `byMarkSource` is the additive split of the same fire. This
+    // fixture never fans a provenance map (no `refreshOptionMarkSources`), so
+    // the fire is `unknown`: undecidable, and counted as such rather than
+    // defaulted into a bucket it was never observed in.
+    expect(p.otmDayOneStop!.fires).toEqual({
+      premiumPct: 1,
+      atrInvalidation: 0,
+      pdtHeld: 0,
+      byMarkSource: { quote: 0, last: 0, delta_backstop: 0, unknown: 1 },
+    });
     // `rows: 0` after the close — which is exactly why the cumulative twin has
     // to exist: the live row count says nothing about whether the rule fired.
     expect(p.rows).toBe(0);
