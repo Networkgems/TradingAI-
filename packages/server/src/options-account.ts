@@ -5228,7 +5228,7 @@ export class PaperOptionsAccount {
         };
         if (rec.outcome !== 'OPEN') {
           // TRA-4004 — the row is already closed. This used to be a bare
-          // `return`, and on 2026-08-24T20:51Z it swallowed a real, broker-filled
+          // `return`, and on 2026-08-24T19:31Z it swallowed a real, broker-filled
           // close: the desk's residual BAC lot (`6bbc5d17`, TRA-3933) had had
           // the ENGINE's exit written onto its row by the TRA-3547 sweep three
           // days earlier, so when THIS position — the lot itself — exited under

@@ -12652,7 +12652,7 @@ app.post('/api/health/option-journal/repair', requireAuth, requireAdmin, async (
 //
 // The forward fix lives in `queueJournalClose`: an engine close arriving on an
 // already-closed row now supersedes the close it finds. That cannot reach the
-// close that already vanished — the 2026-08-24T20:51:08Z BAC exit (order
+// close that already vanished — the 2026-08-24T19:31:08Z BAC exit (order
 // 143160792, `chandelier_daily_close`, −$3.00) ran on a build that dropped it,
 // and its book copy went at the archive. This route writes THAT close, and any
 // future one of the same shape, from the durable fill ledger.

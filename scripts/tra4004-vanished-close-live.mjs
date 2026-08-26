@@ -27,7 +27,12 @@ const BASE = String(args.base ?? process.env.TRA4004_BASE ?? 'https://tradingai-
 const ROW_ID = String(args.id ?? '6bbc5d17-40da-4999-ab4e-f8920fe42adb');
 const OCC = String(args.occ ?? 'BAC260925C00063000');
 const ORDER = String(args.order ?? '143160792');
-const REAL_CLOSE_ISO = '2026-08-24T20:51:08.062Z';
+// The close's timestamp is READ off the ledger fill below, never hard-coded.
+// The first cut of this reader pinned '2026-08-24T20:51:08.062Z' — an 80-minute
+// derivation error; the tape ("tradier sell_to_close submitted" 19:31:07.987Z)
+// and the ledger (19:31:08.062Z) agree — and would have scored AC4 "NO" against
+// a correct apply. The reader's own constant is the first suspect when the
+// subject fails and the ledger passes.
 
 const user = process.env.TRADING_ADMIN_USERNAME;
 const pass = process.env.TRADING_ADMIN_PASSWORD;
@@ -62,6 +67,14 @@ const b = live.body.build ?? {};
 console.log(`TRA-4004 live grade  ${new Date().toISOString()}`);
 console.log(`  pin      ${b.commitShort ?? b.commit} pid ${b.pid} startedAt ${b.startedAt}`);
 
+// ── 1b. the fill — read FIRST, it is the ruler every other line grades against ─
+const fill = (fs.body.records ?? []).find((f) => String(f.orderId) === ORDER && f.optionSymbol === OCC);
+if (!fill || !Number.isFinite(fill.ts)) {
+  console.error(`ledger fill for order ${ORDER} on ${OCC} NOT FOUND — no ruler, BLIND`);
+  process.exit(3);
+}
+const REAL_CLOSE_ISO = new Date(fill.ts).toISOString();
+
 // ── 2. export ───────────────────────────────────────────────────────────────
 const trades = exp.body.trades ?? [];
 const bac = trades.filter((t) => t.symbol === OCC);
@@ -89,9 +102,8 @@ for (const s of (w?.recent ?? []).slice(-5)) {
   console.log(`           ${s.id.slice(0, 8)} applied=${s.applied} refusal=${s.refusal} reason=${s.reason} ${s.supersededCloseTs ? new Date(s.supersededCloseTs).toISOString() : null} -> ${s.closeTs ? new Date(s.closeTs).toISOString() : null} pnl ${s.supersededRealizedPnlUsd} -> ${s.realizedPnlUsd}`);
 }
 
-// ── 4. the fill ─────────────────────────────────────────────────────────────
-const fill = (fs.body.records ?? []).find((f) => String(f.orderId) === ORDER && f.optionSymbol === OCC);
-console.log(`  AC5      ledger fill ord ${ORDER}: ${fill ? `${new Date(fill.ts).toISOString()} ${fill.side} ${fill.contracts} @ ${fill.filledPrice} fees ${fill.fees} (${fill.feeSource}) origin=${fill.origin}` : 'NOT FOUND'}`);
+// ── 4. the fill (read in 1b; printed here beside the Tradier lot) ───────────
+console.log(`  AC5      ledger fill ord ${ORDER}: ${REAL_CLOSE_ISO} ${fill.side} ${fill.contracts} @ ${fill.filledPrice} fees ${fill.fees} (${fill.feeSource}) origin=${fill.origin}`);
 const gl = (fs.body.autoReconcile?.lastGainLossSample ?? []).find((l) => l.symbol === OCC && l.closeDate === '2026-08-24');
 if (gl) console.log(`           Tradier gainloss lot: qty ${gl.quantity} cost ${gl.cost} proceeds ${gl.proceeds} open ${gl.openDate} close ${gl.closeDate}`);
 

@@ -18,7 +18,7 @@
 //                             broker.
 //   2026-08-22               the lot is handed to the engine (TRA-3829) and its
 //                             basis pinned to the desk's 1.17 (TRA-3958).
-//   2026-08-24T20:51:08.062Z  the engine exits the lot for real: order 143160792,
+//   2026-08-24T19:31:08.062Z  the engine exits the lot for real: order 143160792,
 //                             sell_to_close 1 @ 1.14, fees 0.13,
 //                             `chandelier_daily_close`, −$3.00. `queueJournalClose`
 //                             resolves `6bbc5d17`, finds it CLOSED, returns.
@@ -63,8 +63,8 @@ const OCC = 'BAC260925C00063000';
 const ENGINE_OPEN = Date.parse('2026-08-20T13:36:22.482Z');
 /** 2026-08-21T17:05:10.473Z — the ENGINE's exit, which the reconstruction wrote onto the wrong row. */
 const RECONSTRUCTED_CLOSE = Date.parse('2026-08-21T17:05:10.473Z');
-/** 2026-08-24T20:51:08.062Z — the lot's REAL exit (order 143160792). */
-const REAL_CLOSE = Date.parse('2026-08-24T20:51:08.062Z');
+/** 2026-08-24T19:31:08.062Z — the lot's REAL exit (order 143160792). */
+const REAL_CLOSE = Date.parse('2026-08-24T19:31:08.062Z');
 const REAL_EXIT_FILL = 1.14;
 const REAL_ORDER_ID = 143160792;
 const ENGINE_PREMIUM = 1.65;

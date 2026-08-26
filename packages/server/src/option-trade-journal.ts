@@ -600,7 +600,7 @@ export interface OptionTradeSupersededClose {
  * TRA-4004 — what {@link recordOptionTradeClose} did. It used to return `void`
  * and swallow the `already closed` case, which is how a real, broker-filled
  * close could vanish with no log line on the tape (there was NOTHING to grep
- * for at 2026-08-24T20:51Z). The fold guard itself is unchanged — see
+ * for at 2026-08-24T19:31Z). The fold guard itself is unchanged — see
  * `AmendCloseBasisLine` for why it is load-bearing — but a caller now learns
  * WHICH branch it hit and can route a genuine close elsewhere.
  */
@@ -1644,7 +1644,7 @@ export async function recordOptionTradePartialClose(
  * outcome. No-op when the trade is unknown or already closed, or when the flag
  * is off — and since TRA-4004 it SAYS WHICH, both in the return value and on
  * the log. The `already_closed` branch used to be a bare `return`; on
- * 2026-08-24T20:51Z it swallowed a real, broker-filled −$3.00 close and left
+ * 2026-08-24T19:31Z it swallowed a real, broker-filled −$3.00 close and left
  * nothing on the tape to find it by.
  */
 export async function recordOptionTradeClose(
@@ -1693,7 +1693,7 @@ export async function recordOptionTradeClose(
  * and the ENGINE's exit fill (order 142899523, already the close of row
  * `0e180e8c`) to it: `closeTs 2026-08-21T17:05:10.473Z`, −$74,
  * `reconstructed-TRA-3472`. The lot was still at the broker. When the engine
- * really exited it on 2026-08-24T20:51:08Z (`chandelier_daily_close`, order
+ * really exited it on 2026-08-24T19:31:08Z (`chandelier_daily_close`, order
  * 143160792, 1 ct @ 1.14 against the operator-pinned 1.17 basis, −$3.00),
  * `queueJournalClose` resolved the row, found `outcome !== 'OPEN'`, and
  * returned. The book row was the only record; the 21:00 ET archive took it.
