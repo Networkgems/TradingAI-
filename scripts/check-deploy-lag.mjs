@@ -295,6 +295,17 @@ export function rthOverlapMin(fromMs, toMs) {
   return Math.round(total);
 }
 
+// Point predicate: is instant `ms` inside Mon–Fri 13:30–20:00Z? Do NOT derive this from
+// rthOverlapMin over a 1 ms interval — that rounds to 0 minutes and reads "outside RTH"
+// at every instant (measured 2026-08-26T13:43Z, the first RTH-open read: inRthNow=false).
+export function isRthAt(ms) {
+  const d = new Date(ms);
+  const dow = d.getUTCDay();
+  if (dow === 0 || dow === 6) return false;
+  const min = d.getUTCHours() * 60 + d.getUTCMinutes();
+  return min >= RTH_OPEN_MIN && min < RTH_CLOSE_MIN;
+}
+
 // ── Live leg ─────────────────────────────────────────────────────────────────
 export async function readLiveCommit(host, timeoutMs = 25_000) {
   const url = `${host.replace(/\/+$/, '')}/api/health/version`;
@@ -344,7 +355,7 @@ async function runLive() {
       c.lagMin = Number.isFinite(t) ? Math.round((nowMs - t) / 60_000) : null;
       c.rthMin = Number.isFinite(t) ? rthOverlapMin(t, nowMs) : null;
     }
-    const inRth = rthOverlapMin(nowMs - 1, nowMs) > 0;
+    const inRth = isRthAt(nowMs);
     const out = {
       script: 'check-deploy-lag',
       ticket: 'TRA-3991',
@@ -692,6 +703,16 @@ function selftest() {
   check('rth: Sat→Sun = 0', 0, () => rthOverlapMin(Date.parse('2026-08-22T00:00:00Z'), Date.parse('2026-08-23T23:59:00Z')));
   check('rth: Fri 19:00Z→Mon 14:00Z = 60 + 30', 90, () => rthOverlapMin(Date.parse('2026-08-21T19:00:00Z'), Date.parse('2026-08-24T14:00:00Z')));
   check('rth: empty interval = 0', 0, () => rthOverlapMin(5, 5));
+
+  // isRthAt — the point predicate behind inRthNow
+  check('isRthAt: Wed 2026-08-26 13:43Z is INSIDE', true, () => isRthAt(Date.parse('2026-08-26T13:43:37Z')));
+  check('isRthAt: 13:29Z is outside, 13:30Z is inside', 'false,true', () => [isRthAt(Date.parse('2026-08-26T13:29:59Z')), isRthAt(Date.parse('2026-08-26T13:30:00Z'))].join(','));
+  check('isRthAt: 19:59Z is inside, 20:00Z is outside', 'true,false', () => [isRthAt(Date.parse('2026-08-26T19:59:59Z')), isRthAt(Date.parse('2026-08-26T20:00:00Z'))].join(','));
+  check('isRthAt: Sat 2026-08-22 15:00Z is outside', false, () => isRthAt(Date.parse('2026-08-22T15:00:00Z')));
+  check('control of the control: the 1 ms overlap form reads OUTSIDE at 13:43Z (the old defect)', 0, () => {
+    const t = Date.parse('2026-08-26T13:43:37Z');
+    return rthOverlapMin(t - 1, t);
+  });
 
   // methodTable rejects statements and control flow.
   check('methodTable: statements and control flow are not headers', 'stageableExitContracts,unrelatedReport', () =>
