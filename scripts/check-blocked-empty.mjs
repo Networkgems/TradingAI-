@@ -105,19 +105,46 @@
  *   `evidence.previousStatus` AND `returnOwnerAgentId` — the two values the CTO
  *   and CEO typed by hand 31 times on 2026-08-12 with zero judgement calls. For
  *   that cohort exactly (and only when the interaction route confirmed ZERO
- *   pending cards) the report emits the two-step restore, in order:
+ *   pending cards) the report emits the restore:
  *
  *        PATCH {"status":"todo"}                    ← never `done`; `todo` is
  *                                                     queue-visible AND still
  *                                                     counts upstream
- *        PATCH {"assigneeAgentId": returnOwner}     ← LAST; it is one-way
  *
  *   It NEVER re-sends the write-only blocker key: there is no open anchor, and
  *   an empty write-key list reproduces the born-blocked state. The generic
  *   shape-1 no-repair rule is untouched — the discriminator is `restore target:
  *   KNOWN` vs `NONE`, which this script already computes. `deriveRepair()` is
- *   the branch; the global control now allows ONLY those two verbs and still
+ *   the branch; the global control now allows ONLY that one verb and still
  *   forbids the blocker key everywhere.
+ *
+ *   ⛔ AMENDED AGAIN (TRA-4041, MEASURED 2026-08-26). This block used to print a
+ *   SECOND step — `PATCH {"assigneeAgentId": returnOwner}` — annotated "LAST; it
+ *   is one-way". Both halves of that annotation were wrong, and the recipe as
+ *   printed could not be executed by anybody:
+ *
+ *     · The predicted wall was a 403 from the assignee boundary. The REAL wall is
+ *       `409 {"error":"Issue run ownership conflict"}`, and it is not the
+ *       boundary at all — minting a live status on a strand SPAWNS A RUN, which
+ *       takes the issue checkout lock. `checkoutRunId` goes null -> set on the
+ *       step-1 PATCH; from that instant `actorRunId` no longer matches and every
+ *       further PATCH on that row 409s.
+ *     · So the prescribed ORDER is the one order that guarantees step 2 fails.
+ *       The CFO ran it on 6 rows: step 1 succeeded 6/6, step 2 409'd 6/6.
+ *     · And there is no order that works. Assignee-first hands the row away
+ *       while it is still `blocked` + empty — still a strand — and 403s you out
+ *       of fixing it. Status-first locks you out with the 409.
+ *
+ *   The second step was never load-bearing. Step 1 ALONE fully clears the
+ *   strand: `activeRecoveryAction` went `stranded_assigned_issue:active` -> null
+ *   on all 6 rows, and it is null on all four re-read here (TRA-3748/3755/3786/
+ *   3758). So the recipe is ONE step. The return owner is still READ and still
+ *   printed — as a NOTE for the platform, never as an agent-runnable verb.
+ *
+ *   ⚠ The step-1 PATCH does not always STORE `todo`: on a row a run picks up
+ *   immediately it reads back `in_progress` (TRA-3758). That is fine and it is
+ *   why the pass predicate is `activeRecoveryAction == null`, NOT `status ===
+ *   'todo'` — the strand is the recovery action, not the status word.
  *
  * ⛔ THE CAUSE IS A BRANCH, NOT A SENTENCE (TRA-2396). Two different writers
  * produce `blocked` + empty, and they need OPPOSITE repairs:
@@ -837,8 +864,12 @@ export function deriveRestoreTarget({ item, blockers, pendingInteractions }) {
  * re-blocks. `todo` is queue-visible AND still counts as an unresolved blocker
  * upstream, so nothing is lost. And never `done` — that discards the work.
  *
- * ⛔ The assignee write goes LAST. It is one-way: once the issue leaves this
- * actor's boundary the status PATCH would 403.
+ * ⛔ There is NO assignee write (TRA-4041). `assigneeAgentId` is still returned
+ * here — it is a READ off the payload and the report names it — but it is not a
+ * step. The status PATCH spawns a run that takes the issue checkout lock, so
+ * every subsequent PATCH on that row returns `409 Issue run ownership conflict`
+ * (measured 6/6). Step 1 alone clears the strand; step 2 was unexecutable and
+ * unnecessary.
  */
 export function deriveRepair(f) {
   const no = (why) => ({ eligible: false, status: null, assigneeAgentId: null, restoredFrom: null, why });
@@ -1320,17 +1351,27 @@ export function renderReport(result) {
       const rep = f.repair || null;
       if (rep && rep.eligible) {
         const back = (result.roster.get(rep.assigneeAgentId) || {}).name || rep.assigneeAgentId;
-        L.push('     repair KNOWN (stranded_assigned_issue) — two steps, in THIS order:');
-        L.push(`       RESTORE-PATCH 1/2  PATCH /api/issues/${f.id} {"status":"${rep.status}"}`);
-        L.push(`       RESTORE-PATCH 2/2  PATCH /api/issues/${f.id} {"assigneeAgentId":"${rep.assigneeAgentId}"}   # -> ${back}`);
+        L.push('     repair KNOWN (stranded_assigned_issue) — ONE step, and one step only:');
+        L.push(`       RESTORE-PATCH 1/1  PATCH /api/issues/${f.id} {"status":"${rep.status}"}`);
         L.push(`       ${rep.why}`);
         L.push(
           `       \`${rep.status}\`, never \`done\` and never the read \`${rep.restoredFrom}\`: todo is queue-visible AND ` +
             'still counts as an unresolved blocker upstream, while in_progress is what the reconciler mints strands FROM.',
         );
         L.push(
-          '       Assign LAST — it is one-way; after it the status PATCH is a 403. Do NOT re-send the WRITE-ONLY ' +
-            'blocker key: there is no open anchor, and an empty write-key list reproduces the born-blocked state.',
+          '       Do NOT re-send the WRITE-ONLY blocker key: there is no open anchor, and an empty write-key list ' +
+            'reproduces the born-blocked state.',
+        );
+        L.push(
+          `       VERIFY by re-read on \`activeRecoveryAction == null\`, NOT on \`status === "${rep.status}"\`. The strand ` +
+            'IS the recovery action; on a row a run picks up at once the status reads back `in_progress` and that is ' +
+            'still a clean drain (TRA-4041, TRA-3758).',
+        );
+        L.push(
+          `       NOTE, not a step — returnOwnerAgentId on the payload is \`${rep.assigneeAgentId}\` (${back}). This ` +
+            'file used to print a second PATCH restoring it. DO NOT RUN ONE: the status PATCH above spawns a run that ' +
+            'takes the issue checkout lock, so any further PATCH on this row returns 409 Issue run ownership conflict ' +
+            '(measured 6/6, TRA-4041). The re-home is the platform\'s to make, not an agent verb.',
         );
       } else if (rep) {
         L.push(`     no repair command (the TRA-2396 rule stands here): ${rep.why}`);
@@ -1936,7 +1977,8 @@ const CASES = [
     },
   },
   {
-    name: 'TRA-3451 REPAIR — previousStatus + returnOwnerAgentId both READ => the two-step RESTORE-PATCH is emitted',
+    name: 'TRA-4041 REPAIR — previousStatus + returnOwnerAgentId both READ => ONE RESTORE-PATCH, and the assignee step is ABSENT',
+    note: 'was the two-step recipe; step 2 409d 6/6 on the run lock',
     expect: 'FINDINGS',
     opts: { now: NOW_STALE },
     build: () => transportFor(fakeBoard([recoveryStrand('s1', 'TRA-8630', 'agent-cfo', { returnOwner: 'agent-qt' })])),
@@ -1946,16 +1988,24 @@ const CASES = [
       return (
         f.repair.eligible === true &&
         f.repair.status === 'todo' &&
+        // still READ off the payload — it is printed as a note, just never as a verb
         f.repair.assigneeAgentId === 'agent-qt' &&
         f.repair.restoredFrom === 'in_progress' &&
         f.recoveryReturnOwnerAgentId === 'agent-qt' &&
-        /RESTORE-PATCH 1\/2 {2}PATCH \/api\/issues\/s1 \{"status":"todo"\}/.test(out) &&
-        /RESTORE-PATCH 2\/2 {2}PATCH \/api\/issues\/s1 \{"assigneeAgentId":"agent-qt"\}/.test(out) &&
-        // the two ways to get this wrong, both pinned as ABSENT
+        /RESTORE-PATCH 1\/1 {2}PATCH \/api\/issues\/s1 \{"status":"todo"\}/.test(out) &&
+        // EXACTLY one step. A 2/2 line, or any second RESTORE-PATCH, is the defect.
+        out.split('\n').filter((l) => /RESTORE-PATCH/.test(l)).length === 1 &&
+        !/RESTORE-PATCH 2\//.test(out) &&
+        // the unexecutable verb, pinned as ABSENT anywhere in the report
+        !/PATCH \/api\/issues\/\S+ \{"assigneeAgentId"/.test(out) &&
+        // the owner is still NAMED, as prose
+        /returnOwnerAgentId on the payload is `agent-qt`/.test(out) &&
+        /409 Issue run ownership conflict/.test(out) &&
+        // the verify predicate is the recovery action, not the status word
+        /activeRecoveryAction == null/.test(out) &&
+        // the two ways to get the status wrong, both pinned as ABSENT
         !/\{"status":"done"\}/.test(out) &&
-        !/\{"status":"in_progress"\}/.test(out) &&
-        // and the assignee write must come SECOND — it is one-way
-        out.indexOf('RESTORE-PATCH 1/2') < out.indexOf('RESTORE-PATCH 2/2')
+        !/\{"status":"in_progress"\}/.test(out)
       );
     },
   },
@@ -2560,20 +2610,27 @@ async function rollupMaskControl() {
  * inside a report that also argued against running it — prose loses to
  * copy-paste, so the string must simply never be emitted.
  *
- * TRA-3451 narrows it rather than dropping it. Exactly two verbs are now
- * sanctioned, both on lines carrying the `RESTORE-PATCH` sentinel, and the
- * blocker key stays banned EVERYWHERE including on those lines:
+ * TRA-3451 narrows it rather than dropping it. TRA-4041 narrows it again, to
+ * exactly ONE verb, on a line carrying the `RESTORE-PATCH` sentinel, with the
+ * blocker key still banned EVERYWHERE including on that line:
  *
  *   {"status":"todo"}                — never `done`, never a raw previousStatus
- *   {"assigneeAgentId":"<id>"}       — the return owner, read off the payload
+ *
+ * `{"assigneeAgentId":"<id>"}` was the second sanctioned verb until 2026-08-26.
+ * It is now BANNED, and the ban is the point of this control rather than a
+ * tidy-up: printing it emitted a recipe whose second step 409'd 6 times out of 6
+ * (`Issue run ownership conflict` — the step-1 PATCH spawns a run that takes the
+ * issue checkout lock). An unexecutable printed step is worse than no step, so
+ * a future edit that re-introduces it must go red HERE, in the suite, and not in
+ * somebody's hands at 06:15Z. The step counter is pinned to `1/1` for the same
+ * reason: `2/2` cannot be printed without failing.
  *
  * Any other `PATCH /api/issues` anywhere in any report, or any sanctioned line
- * whose body is not one of those two, fails the suite. The sentinel is what
- * keeps this a whitelist instead of a hole: a future edit that starts printing
- * `{"status":"done"}` or a third verb goes red here, not in production.
+ * whose body is not that one verb, fails the suite. The sentinel is what keeps
+ * this a whitelist instead of a hole.
  */
 const RESTORE_PATCH_LINE = /^\s*RESTORE-PATCH /;
-const SANCTIONED_VERB = /^\s*RESTORE-PATCH \d\/2 {2}PATCH \/api\/issues\/\S+ (\{"status":"todo"\}|\{"assigneeAgentId":"[^"]+"\})(\s|$)/;
+const SANCTIONED_VERB = /^\s*RESTORE-PATCH 1\/1 {2}PATCH \/api\/issues\/\S+ \{"status":"todo"\}(\s|$)/;
 
 function assertNoRepairCommand(rendered) {
   if (/blockedByIssueIds/.test(rendered)) return false;
@@ -2610,6 +2667,23 @@ async function selftest() {
   console.log(
     `${noCmd ? 'ok  ' : 'FAIL'}  GLOBAL — no rendering of ANY control board emits a copy-pasteable repair PATCH\n` +
       `        (checked the concatenated report of every case above for 'blockedByIssueIds' / 'PATCH /api/issues')`,
+  );
+
+  // TRA-4041 NEGATIVE CONTROL. The whitelist above only proves the CURRENT
+  // report is clean. This proves the whitelist would REFUSE the exact string
+  // this ticket deleted — otherwise a regex that accidentally matched
+  // everything would read green on both halves.
+  const reintroduced =
+    '     repair KNOWN (stranded_assigned_issue):\n' +
+    '       RESTORE-PATCH 1/1  PATCH /api/issues/s1 {"status":"todo"}\n' +
+    '       RESTORE-PATCH 2/2  PATCH /api/issues/s1 {"assigneeAgentId":"agent-qt"}   # -> QuantTrader\n';
+  const twoTwo =
+    '       RESTORE-PATCH 1/2  PATCH /api/issues/s1 {"status":"todo"}\n';
+  const rejects = !assertNoRepairCommand(reintroduced) && !assertNoRepairCommand(twoTwo);
+  if (!rejects) failed += 1;
+  console.log(
+    `${rejects ? 'ok  ' : 'FAIL'}  TRA-4041 NEGATIVE — the whitelist REFUSES a re-introduced assignee PATCH, and refuses a \`n/2\` step counter\n` +
+      '        (the step that returned 409 Issue run ownership conflict 6/6 on 2026-08-26)',
   );
 
   const miss = await naiveMissControl();

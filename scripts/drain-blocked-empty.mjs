@@ -11,24 +11,48 @@
  * It is NOT a second detector. It does not re-implement the cohort predicate,
  * the shape grading, the pending-card guard, or the repair derivation — it
  * imports `sweep()` from `check-blocked-empty.mjs` and executes the
- * `finding.repair` that detector already emits as `RESTORE-PATCH 1/2` and
- * `2/2`. That import is the whole point: a drain with its own copy of the
- * predicate silently repairs a DIFFERENT population than the one being graded,
- * and the two drift apart on the first edit to either. One predicate, one
- * cohort, two readers.
+ * `finding.repair` that detector already emits as `RESTORE-PATCH 1/1`. That
+ * import is the whole point: a drain with its own copy of the predicate
+ * silently repairs a DIFFERENT population than the one being graded, and the
+ * two drift apart on the first edit to either. One predicate, one cohort, two
+ * readers.
  *
- * THE THREE WRITES, IN THIS ORDER, PER ROW
- * ----------------------------------------
+ * THE TWO WRITES, IN THIS ORDER, PER ROW
+ * --------------------------------------
  *   1. POST /comments            the audit trail
- *   2. PATCH {"status":"todo"}
- *   3. PATCH {"assigneeAgentId": returnOwnerAgentId}      <-- LAST, always
+ *   2. PATCH {"status":"todo"}   <-- the LAST write this row will ever accept
  *
- * The order is not stylistic. Assignment is ONE-WAY: the moment a row leaves
- * this actor's authorization boundary, both the status PATCH and the comment
- * come back `403 {"error":"Issue is outside this actor's authorization
- * boundary"}` (measured repeatedly; see the CFO hand-back on TRA-3397). So the
- * comment must be written while the row is still ours, and the assignee write
- * must be the last thing we ever do to it.
+ * The comment goes first because it must be written while the row is still ours:
+ * the moment a row leaves this actor's authorization boundary, both the status
+ * PATCH and the comment come back `403 {"error":"Issue is outside this actor's
+ * authorization boundary"}` (measured repeatedly; see the CFO hand-back on
+ * TRA-3397).
+ *
+ * ⛔ THERE IS NO THIRD WRITE (TRA-4041, MEASURED 2026-08-26). Until 2026-08-26
+ * this file sent `PATCH {"assigneeAgentId": returnOwnerAgentId}` as step 3,
+ * annotated "LAST, always -- assignment is ONE-WAY". That step could not
+ * succeed, from here or from anywhere:
+ *
+ *   The status PATCH in step 2 MINTS A LIVE STATUS, and minting one SPAWNS A RUN
+ *   that takes the issue checkout lock. `checkoutRunId` goes null -> set on the
+ *   step-2 write. From that instant this actor's `actorRunId` no longer matches
+ *   the row's `executionRunId`, so step 3 returns
+ *   `409 {"error":"Issue run ownership conflict"}` -- 6 attempts, 6 409s, run
+ *   by hand by the CFO across all six of their rows.
+ *
+ * That 409 is NOT the authorization boundary, and `isBoundary403` never matched
+ * it, so a row this script had ALREADY REPAIRED fell through to `WRITE_FAILED`
+ * and coloured the fire exit 2 FAILED. The order that was documented as
+ * load-bearing was in fact the order that guaranteed a false red on every
+ * successful drain.
+ *
+ * And no other order exists. Assignee-first hands the row away while it is
+ * still `blocked` + empty -- still a strand -- and 403s us out of ever fixing
+ * it. Status-first locks us out with the 409. The step was also never needed:
+ * step 2 ALONE clears the strand (`activeRecoveryAction`
+ * `stranded_assigned_issue:active` -> null, 6/6). The re-home to
+ * `returnOwnerAgentId` is the platform's to make. This file READS that id, names
+ * it in the audit comment, and does not write it.
  *
  * ⛔ NEVER `done`. `todo` is queue-visible AND still counts as an unresolved
  * blocker upstream, so parents stay correctly blocked and no unrun work is
@@ -178,6 +202,20 @@ export function gradeWriteBody(step, body) {
     );
   }
 
+  // TRA-4041: the `assignee` step is REFUSED, not merely unused. Deleting the
+  // call site alone would let a future edit re-add it silently; this makes the
+  // re-add throw at the send, and go red in the controls. Checked BEFORE the
+  // per-step branches so that smuggling the key onto the status body fails with
+  // THIS reason, not with a generic arity complaint that hides the why.
+  if (step === 'assignee' || keys.includes('assigneeAgentId')) {
+    return bad(
+      'writes `assigneeAgentId`. That step is BANNED (TRA-4041): the status PATCH spawns a run that takes the ' +
+        'issue checkout lock, so this write returns `409 Issue run ownership conflict` -- 6/6, measured ' +
+        '2026-08-26 -- on a row the status PATCH had ALREADY repaired. It is unexecutable in either order and it ' +
+        'was never load-bearing: the status write alone clears the strand. The re-home is the platform\'s.',
+    );
+  }
+
   if (step === 'status') {
     if (keys.length !== 1 || keys[0] !== 'status') return bad(`expected exactly {"status"}, got {${keys.join(',')}}`);
     if (body.status === 'done') {
@@ -188,16 +226,6 @@ export function gradeWriteBody(step, body) {
         `would write \`${body.status}\`. Only \`todo\` is sanctioned: \`in_progress\` is what the reconciler mints ` +
           'strands FROM, so a literal restore re-strands the leaf on the next pass.',
       );
-    }
-    return { ok: true };
-  }
-
-  if (step === 'assignee') {
-    if (keys.length !== 1 || keys[0] !== 'assigneeAgentId') {
-      return bad(`expected exactly {"assigneeAgentId"}, got {${keys.join(',')}}`);
-    }
-    if (!body.assigneeAgentId || typeof body.assigneeAgentId !== 'string') {
-      return bad('assigneeAgentId is empty — the return owner would be a guess');
     }
     return { ok: true };
   }
@@ -225,14 +253,17 @@ export function drainComment(f, runId) {
     `Read live immediately before this write: status \`blocked\`, \`blockedBy\` empty, pendingInteractions 0 ` +
     `(a KNOWN zero, not an unread route), \`evidence.previousStatus\` \`${rep.restoredFrom}\`, ` +
     `\`returnOwnerAgentId\` \`${rep.assigneeAgentId}\`.\n\n` +
-    `Repair applied, the same two-step run by hand 47 times on 2026-08-12:\n` +
+    `Repair applied -- ONE write (TRA-4041):\n` +
     `- PATCH status -> \`todo\` (NOT \`done\`: \`todo\` is queue-visible and still counts as an unresolved ` +
     `blocker upstream, so any parent stays correctly blocked and no unrun work is destroyed)\n` +
-    `- PATCH assigneeAgentId -> \`${rep.assigneeAgentId}\` (the returnOwnerAgentId off the recovery payload, ` +
-    `NOT the current assignee -- the reconciler re-homed this row to a boss)\n` +
-    `- \`blockedByIssueIds\` deliberately NOT re-sent.\n\n` +
-    `No content judgement was made on the underlying work; the strand is cleared and the ticket is yours. ` +
-    `Commented before the reassign because assignment is one-way.\n\n` +
+    `- \`blockedByIssueIds\` deliberately NOT re-sent.\n` +
+    `- assigneeAgentId deliberately NOT written. The recovery payload names \`${rep.assigneeAgentId}\` as the ` +
+    `returnOwnerAgentId, and until 2026-08-26 this drain PATCHed it as a second step. That step cannot succeed: ` +
+    `the status write above spawns a run that takes this issue's checkout lock, so any further PATCH returns ` +
+    `409 Issue run ownership conflict (6/6, measured). It is also unnecessary -- the status write alone clears ` +
+    `the recovery action. If this row is homed on the wrong seat, that re-home is the platform's to make.\n\n` +
+    `No content judgement was made on the underlying work; the strand is cleared and the ticket is queue-visible ` +
+    `again. Commented BEFORE the status write, because the status write is the last one this row accepts.\n\n` +
     `Drained by scripts/drain-blocked-empty.mjs${runId ? ` (run ${runId})` : ''}.`
   );
 }
@@ -314,9 +345,28 @@ export const OUTCOME = {
   FOREIGN: 'FOREIGN',
   WRITE_FAILED: 'WRITE_FAILED',
   NOT_VERIFIED: 'NOT_VERIFIED',
+  // TRA-4041 — a live run holds the row's checkout lock. Ours, not foreign;
+  // transient, not a rejection. Retryable by the NEXT fire, not by this one.
+  RUN_LOCKED: 'RUN_LOCKED',
 };
 
 const isBoundary403 = (err) => /\b403\b/.test(String(err?.message || err)) || /authorization boundary/i.test(String(err?.message || err));
+
+/**
+ * TRA-4041. `409 Issue run ownership conflict` is a THIRD thing, and it must not
+ * be folded into either of the other two.
+ *
+ * It is not the authorization boundary (403) -- the row IS ours, and no twin arm
+ * on another seat can drain it either, so reporting FOREIGN would send it to a
+ * queue that cannot help. And it is not WRITE_FAILED in the useful sense of "the
+ * write was rejected": it means a live run holds this row's checkout lock right
+ * now, which the NEXT fire will very likely not hit. Distinct outcome, its own
+ * sentence, and it colours REMAINDER (somebody should look) rather than FAILED.
+ */
+const isRunLock409 = (err) => {
+  const s = String(err?.message || err);
+  return /\b409\b/.test(s) || /run ownership conflict/i.test(s);
+};
 
 /**
  * Execute the repair on ONE row, or plan it if `apply` is false.
@@ -349,11 +399,21 @@ export async function drainRow(transport, row, { apply = false, runId = null } =
     await send('comment', () => transport.postComment(f.id, { body: drainComment(f, runId) }), {
       body: drainComment(f, runId),
     });
+    // The LAST write this row will accept: it mints a live status, which spawns
+    // a run, which takes the checkout lock (TRA-4041). Nothing follows it.
     await send('status', () => transport.patchIssue(f.id, { status: rep.status }), { status: rep.status });
-    await send('assignee', () => transport.patchIssue(f.id, { assigneeAgentId: rep.assigneeAgentId }), {
-      assigneeAgentId: rep.assigneeAgentId,
-    });
   } catch (err) {
+    if (isRunLock409(err)) {
+      return {
+        outcome: OUTCOME.RUN_LOCKED,
+        steps,
+        why:
+          `409 Issue run ownership conflict on the \`${steps[steps.length - 1]?.step || 'first'}\` step -- a live run ` +
+          'already holds this row\'s checkout lock, so this actor\'s run id does not match its executionRunId. The row ' +
+          'IS ours (this is not the 403 boundary and no other seat\'s arm can take it), and nothing was half-written. ' +
+          'Leave it: the next fire runs against a row whose run has ended.',
+      };
+    }
     if (isBoundary403(err)) {
       return {
         outcome: OUTCOME.FOREIGN,
@@ -383,10 +443,31 @@ export async function drainRow(transport, row, { apply = false, runId = null } =
     };
   }
   const problems = [];
-  if (after.status !== rep.status) problems.push(`status is \`${after.status}\`, expected \`${rep.status}\``);
-  if (after.assigneeAgentId !== rep.assigneeAgentId) {
-    problems.push(`assigneeAgentId is \`${after.assigneeAgentId}\`, expected \`${rep.assigneeAgentId}\``);
+  // ⛔ TRA-4041 — the pass predicate is `status != blocked AND
+  // activeRecoveryAction == null`, NOT `status === 'todo'`.
+  //
+  // The strand IS the recovery action; the status word is only its symptom. And
+  // the write does not reliably STORE `todo`: on a row the queue picks up
+  // immediately the re-read comes back `in_progress` (TRA-3758, live). Asserting
+  // the literal `todo` would have called that row NOT_VERIFIED and coloured the
+  // fire FAILED over a drain that worked. What must never be true afterwards is
+  // that the row is still `blocked`, or still carries a live recovery action.
+  if (after.status === 'blocked') {
+    problems.push(`status is \`${after.status}\`, expected anything but \`blocked\` (asked for \`${rep.status}\`)`);
   }
+  if (!Object.prototype.hasOwnProperty.call(after, 'activeRecoveryAction')) {
+    problems.push(
+      "the re-read carries no 'activeRecoveryAction' key, so the drain cannot be verified -- absent is not cleared",
+    );
+  } else if (after.activeRecoveryAction && after.activeRecoveryAction.status !== 'resolved') {
+    problems.push(
+      `activeRecoveryAction is STILL live (\`${after.activeRecoveryAction.kind}\`` +
+        `${after.activeRecoveryAction.status ? `:${after.activeRecoveryAction.status}` : ''}) -- the status moved but ` +
+        'the strand did not clear, which is the one failure a status-only check cannot see',
+    );
+  }
+  // NOT verified: assigneeAgentId. Nothing here writes it any more (TRA-4041),
+  // so asserting the return owner would fail every genuinely drained row.
   // The blocker key must be untouched and still empty. If something re-populated
   // it, the row was not drained, it was re-blocked, and reporting DRAINED would
   // be a false green.
@@ -397,7 +478,13 @@ export async function drainRow(transport, row, { apply = false, runId = null } =
   }
   if (problems.length) return { outcome: OUTCOME.NOT_VERIFIED, steps, why: problems.join('; ') };
 
-  return { outcome: OUTCOME.DRAINED, steps, why: `verified by re-read: \`${after.status}\` -> ${rep.assigneeAgentId}` };
+  return {
+    outcome: OUTCOME.DRAINED,
+    steps,
+    why:
+      `verified by re-read: status \`${after.status}\`, activeRecoveryAction null. Return owner ` +
+      `${rep.assigneeAgentId} was READ and NOT written (TRA-4041).`,
+  };
 }
 
 /* ------------------------------------------------------------------ *
@@ -432,7 +519,12 @@ export function verdictFor({ blind, plan, results }) {
   if (blind) return 'BLIND';
   const bad = results.filter((r) => r.outcome === OUTCOME.WRITE_FAILED || r.outcome === OUTCOME.NOT_VERIFIED);
   if (bad.length) return 'FAILED';
-  const unowned = plan.counts.ineligible + results.filter((r) => r.outcome === OUTCOME.FOREIGN).length;
+  // RUN_LOCKED joins FOREIGN here rather than FAILED (TRA-4041): nothing was
+  // half-written and nothing is broken, but a row was not drained and the next
+  // fire has to pick it up, so it must not read as a clean DRAINED either.
+  const unowned =
+    plan.counts.ineligible +
+    results.filter((r) => r.outcome === OUTCOME.FOREIGN || r.outcome === OUTCOME.RUN_LOCKED).length;
   if (unowned > 0) return 'REMAINDER';
   // ⛔ The whole point of a separate verdict here. An empty cohort exercised
   // NOTHING; folding it into a success verdict is how a fleet of green logs
@@ -502,7 +594,7 @@ export function renderDrain(out) {
   for (const r of out.results) {
     const mark =
       r.outcome === OUTCOME.DRAINED ? 'DRAINED ' : r.outcome === OUTCOME.PLANNED ? 'WOULD   ' : `${r.outcome} `;
-    L.push(`${mark} ${r.identifier}  -> todo, assignee ${r.repair.assigneeAgentId}`);
+    L.push(`${mark} ${r.identifier}  -> todo  (return owner ${r.repair.assigneeAgentId} READ, not written -- TRA-4041)`);
     L.push(`         ${r.why}`);
     for (const s of r.steps) L.push(`         ${s.sent ? 'sent' : 'plan'} ${s.step}  ${JSON.stringify(s.body).slice(0, 120)}`);
   }
@@ -574,7 +666,13 @@ const shape2Row = (id, ident) => ({
  * A transport over a fake board that RECORDS every write and can be told to
  * 403, to lie (2xx that does not stick), or to refuse reads.
  */
-function fakeTransport(rows, { pending = {}, on403 = null, lieOnPatch = false, total = 2350 } = {}) {
+function fakeTransport(
+  rows,
+  { pending = {}, on403 = null, on409 = null, lieOnPatch = false, keepRecovery = false, total = 2350 } = {},
+) {
+  // TRA-4041 — ids whose checkout lock has been taken by the run the status
+  // PATCH spawned. Once in here, every further PATCH on that row 409s.
+  const locked = new Set();
   const writes = [];
   const byId = new Map(rows.map((r) => [r.id, JSON.parse(JSON.stringify(r))]));
   const filler = Array.from({ length: total - rows.length }, (_, i) => ({
@@ -612,10 +710,24 @@ function fakeTransport(rows, { pending = {}, on403 = null, lieOnPatch = false, t
       if (on403 === 'status' && body.status) {
         throw new Error('HTTP 403 — {"error":"Issue is outside this actor\'s authorization boundary"}');
       }
-      if (on403 === 'assignee' && body.assigneeAgentId) {
-        throw new Error('HTTP 403 — {"error":"Issue is outside this actor\'s authorization boundary"}');
+      // TRA-4041 — model the run lock the live platform actually takes. The
+      // FIRST status PATCH sets checkoutRunId; every PATCH after it on the same
+      // row 409s. This is not decoration: it is what made the old third step
+      // unexecutable, and without it in the fake, a re-added assignee write
+      // would pass the controls exactly as it used to.
+      if (locked.has(id) || (on409 === 'status' && body.status)) {
+        throw new Error(
+          'HTTP 409 — {"error":"Issue run ownership conflict","details":{"checkoutRunId":"a9424370",' +
+            '"executionRunId":"a9424370","actorRunId":"d1e6e234"}}',
+        );
       }
       writes.push({ verb: 'PATCH', id, body });
+      if (body.status) {
+        locked.add(id);
+        // …and clear the recovery action, which is what the status write really
+        // does and what the drain is verified on.
+        if (!lieOnPatch && !keepRecovery) byId.get(id).activeRecoveryAction = null;
+      }
       if (!lieOnPatch) Object.assign(byId.get(id), body);
       return { ok: true };
     },
@@ -624,7 +736,7 @@ function fakeTransport(rows, { pending = {}, on403 = null, lieOnPatch = false, t
 
 const CONTROLS = [
   {
-    name: 'POSITIVE — an eligible strand drains: comment, then status, then assignee LAST, then verified by re-read',
+    name: 'POSITIVE — an eligible strand drains in TWO writes: comment, then status. There is no third write (TRA-4041)',
     build: () => fakeTransport([strandRow('s1', 'TRA-8001')]),
     apply: true,
     assert: (out, t) => {
@@ -633,10 +745,11 @@ const CONTROLS = [
         out.verdict === 'DRAINED' &&
         out.results.length === 1 &&
         out.results[0].outcome === OUTCOME.DRAINED &&
-        t.writes.length === 3 &&
+        t.writes.length === 2 &&
         verbs[0].startsWith('POST') &&
         verbs[1] === 'PATCH {"status":"todo"}' &&
-        verbs[2] === `PATCH {"assigneeAgentId":"${AGENT_BACK}"}`
+        // the banned step, pinned as never sent
+        t.writes.every((w) => !('assigneeAgentId' in w.body))
       );
     },
     detail: (out, t) => `${t.writes.length} write(s): ${t.writes.map((w) => `${w.verb} ${Object.keys(w.body).join('+')}`).join(' -> ')}`,
@@ -662,7 +775,7 @@ const CONTROLS = [
       t.writes.length === 0 &&
       out.results.length === 1 &&
       out.results[0].outcome === OUTCOME.PLANNED &&
-      out.results[0].steps.map((s) => s.step).join(',') === 'comment,status,assignee' &&
+      out.results[0].steps.map((s) => s.step).join(',') === 'comment,status' &&
       out.results[0].steps.every((s) => s.sent === false),
     detail: (out, t) => `${t.writes.length} write(s) sent; steps planned: ${out.results[0].steps.map((s) => s.step).join(',')}`,
   },
@@ -838,7 +951,7 @@ const CONTROLS = [
     apply: true,
     // The control that a membership list could never pass. This is what stops
     // the carve-out outliving its reason.
-    assert: (out, t) => out.verdict === 'DRAINED' && out.plan.counts.excluded === 0 && t.writes.length === 3,
+    assert: (out, t) => out.verdict === 'DRAINED' && out.plan.counts.excluded === 0 && t.writes.length === 2,
     detail: (out) => `verdict ${out.verdict}, excluded ${out.plan.counts.excluded}`,
   },
   {
@@ -874,7 +987,7 @@ const CONTROLS = [
       out.verdict === 'REMAINDER' &&
       out.plan.counts.drain === 1 &&
       out.plan.counts.ineligible === 1 &&
-      t.writes.length === 3 &&
+      t.writes.length === 2 &&
       t.writes.every((w) => w.id === 's1'),
     detail: (out, t) => `drained ${out.plan.counts.drain}, ineligible ${out.plan.counts.ineligible}, writes ${t.writes.length}`,
   },
@@ -892,18 +1005,97 @@ const CONTROLS = [
     apply: true,
     opts: { only: ['TRA-8002'] },
     assert: (out, t) =>
-      t.writes.length === 3 && t.writes.every((w) => w.id === 's2') && out.plan.counts.notSelected === 1,
+      t.writes.length === 2 && t.writes.every((w) => w.id === 's2') && out.plan.counts.notSelected === 1,
     detail: (out, t) => `wrote to ${[...new Set(t.writes.map((w) => w.id))].join(',')}, notSelected ${out.plan.counts.notSelected}`,
   },
   {
-    name: 'ORDER IS LOAD-BEARING — reversing it (assignee before status) would 403 the status write, so it is asserted, not assumed',
+    name: 'ORDER IS LOAD-BEARING — comment FIRST (while the row is still ours), status LAST (it takes the run lock)',
     build: () => fakeTransport([strandRow('s1', 'TRA-8001')]),
     apply: true,
     assert: (out) => {
       const steps = out.results[0].steps.map((s) => s.step);
-      return steps.indexOf('comment') === 0 && steps.indexOf('status') < steps.indexOf('assignee') && steps.length === 3;
+      return steps.length === 2 && steps[0] === 'comment' && steps[1] === 'status' && !steps.includes('assignee');
     },
     detail: (out) => out.results[0].steps.map((s) => s.step).join(' -> '),
+  },
+  {
+    // The control this ticket exists for. If someone re-adds the third write,
+    // THIS is what stops it -- at the request body, before the transport.
+    name: 'TRA-4041 BANNED STEP — gradeWriteBody REFUSES any assignee write, by step name AND by key',
+    unit: () => {
+      const a = gradeWriteBody('assignee', { assigneeAgentId: AGENT_BACK });
+      const b = gradeWriteBody('status', { status: 'todo', assigneeAgentId: AGENT_BACK });
+      const c = gradeWriteBody('status', { status: 'todo' });
+      return {
+        ok:
+          !a.ok && /409 Issue run ownership conflict/.test(a.why) &&
+          !b.ok && /409 Issue run ownership conflict/.test(b.why) &&
+          c.ok,
+        detail: 'assignee step refused, assignee key smuggled onto the status body refused, plain status allowed',
+      };
+    },
+  },
+  {
+    // The negative control for the fake itself. Without a run lock in the
+    // transport, the deleted third step would still pass every control here --
+    // which is exactly how it survived from 2026-08-13 to 2026-08-26.
+    name: 'TRA-4041 THE FAKE HAS TEETH — the status PATCH takes the run lock, so a SECOND PATCH on that row 409s',
+    build: () => fakeTransport([strandRow('s1', 'TRA-8001')]),
+    apply: true,
+    assert: async (out, t) => {
+      let second = 'NO THROW';
+      try {
+        await t.patchIssue('s1', { status: 'todo' });
+      } catch (err) {
+        second = String(err.message);
+      }
+      return out.verdict === 'DRAINED' && /409/.test(second) && /run ownership conflict/.test(second);
+    },
+    detail: () => 'a post-drain PATCH on the drained row throws 409, as the live platform does',
+  },
+  {
+    name: 'TRA-4041 RUN_LOCKED — a 409 on the status step is its OWN outcome: not FOREIGN (no twin arm helps), not FAILED',
+    build: () => fakeTransport([strandRow('s1', 'TRA-8001')], { on409: 'status' }),
+    apply: true,
+    assert: (out, t) =>
+      out.results[0].outcome === OUTCOME.RUN_LOCKED &&
+      out.verdict === 'REMAINDER' &&
+      DRAIN_EXIT[out.verdict] === 1 &&
+      /live run already holds/.test(out.results[0].why) &&
+      // the comment landed; the status did not; nothing is half-written
+      t.writes.length === 1 &&
+      t.writes[0].verb === 'POST',
+    detail: (out) => out.results[0].why.slice(0, 100),
+  },
+  {
+    name: 'TRA-4041 VERIFY — the status moved but activeRecoveryAction is STILL live => NOT_VERIFIED, never DRAINED',
+    build: () => fakeTransport([strandRow('s1', 'TRA-8001')], { keepRecovery: true }),
+    apply: true,
+    assert: (out) =>
+      out.verdict === 'FAILED' &&
+      out.results[0].outcome === OUTCOME.NOT_VERIFIED &&
+      /activeRecoveryAction is STILL live/.test(out.results[0].why),
+    detail: (out) => out.results[0].why.slice(0, 110),
+  },
+  {
+    // TRA-3758, live: the write does not always STORE `todo`.
+    name: 'TRA-4041 VERIFY — a row the queue picks up reads back `in_progress`; recovery cleared => still DRAINED',
+    build: () => {
+      const t = fakeTransport([strandRow('s1', 'TRA-8001')]);
+      const inner = t.getIssue;
+      t.getIssue = async (id) => {
+        const r = await inner(id);
+        if (r.status === 'todo') r.status = 'in_progress';
+        return r;
+      };
+      return t;
+    },
+    apply: true,
+    assert: (out) =>
+      out.verdict === 'DRAINED' &&
+      out.results[0].outcome === OUTCOME.DRAINED &&
+      /status `in_progress`/.test(out.results[0].why),
+    detail: (out) => out.results[0].why.slice(0, 110),
   },
 ];
 
@@ -925,7 +1117,7 @@ async function selftest() {
         const out = await run(t, { apply: c.apply, ...(c.opts || {}) });
         seenVerdicts.add(out.verdict);
         for (const r of out.results) seenOutcomes.add(r.outcome);
-        ok = c.assert(out, t);
+        ok = await c.assert(out, t);
         detail = c.detail ? c.detail(out, t) : '';
       }
     } catch (err) {
@@ -939,7 +1131,7 @@ async function selftest() {
   // branch. Every verdict and every row outcome must be REACHED by some case,
   // or the suite is smaller than it looks.
   const wantVerdicts = ['VACUOUS', 'DRAINED', 'REMAINDER', 'FAILED', 'BLIND'];
-  const wantOutcomes = [OUTCOME.DRAINED, OUTCOME.PLANNED, OUTCOME.FOREIGN, OUTCOME.NOT_VERIFIED];
+  const wantOutcomes = [OUTCOME.DRAINED, OUTCOME.PLANNED, OUTCOME.FOREIGN, OUTCOME.NOT_VERIFIED, OUTCOME.RUN_LOCKED];
   for (const [label, want, seen] of [
     ['verdict', wantVerdicts, seenVerdicts],
     ['row outcome', wantOutcomes, seenOutcomes],
