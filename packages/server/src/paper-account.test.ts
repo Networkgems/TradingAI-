@@ -241,15 +241,17 @@ describe('PaperAccount.checkExits — ATR chandelier + profit-lock (TRA-1268)', 
     const { acc } = seedLong({ stopLoss: 90, takeProfit: 500 });
     const risk = { atrBySymbol: new Map([['AAPL', 3]]) };
 
-    // Run to +3R (price 130): armed, peakR 3.0, tightened give-back 0.5R.
+    // Run to +3R (price 130): armed, peakR 3.0, tightened give-back 0.25R
+    // (TRA-4006; was 0.5R).
     expect(acc.checkExits(new Map([['AAPL', 130]]), risk)).toHaveLength(0);
 
-    // Retrace to +2.5R (price 125 = peakR−0.5R) → profit-lock exit; chandelier
+    // Retrace to +2.75R (price 127.5 = peakR−0.25R) → profit-lock exit; chandelier
     // trail (130−9 = 121) has NOT been hit, proving it's the give-back cap.
-    const closed = acc.checkExits(new Map([['AAPL', 125]]), risk);
+    // (Pre-TRA-4006 this pinned price 125 = peakR−0.5R.)
+    const closed = acc.checkExits(new Map([['AAPL', 127.5]]), risk);
     expect(closed).toHaveLength(1);
     expect(closed[0].exitReason).toBe('profit_lock');
-    expect(closed[0].exitPrice).toBe(125);
+    expect(closed[0].exitPrice).toBe(127.5);
   });
 
   it('mirrors the chandelier for a short (trail ratchets down, exit on rebound)', () => {

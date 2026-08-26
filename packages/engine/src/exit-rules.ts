@@ -179,7 +179,10 @@ export interface ProfitLockDecision {
   currentR: number;
   /** True once peakR ≥ armR (profit-lock is active). */
   armed: boolean;
-  /** The give-back allowance in R currently in force (1.0R, or 0.5R once big). */
+  /**
+   * The give-back allowance in R currently in force (`PROFIT_LOCK_GIVEBACK_R`,
+   * or `PROFIT_LOCK_TIGHTEN_GIVEBACK_R` once peakR ≥ `PROFIT_LOCK_TIGHTEN_PEAK_R`).
+   */
   giveBackR: number;
   /** True ⇒ close the position now (open R retraced past the allowance). */
   shouldExit: boolean;
@@ -187,8 +190,16 @@ export interface ProfitLockDecision {
 
 /**
  * Profit-lock give-back cap. Track peakR (peak favorable excursion / R). Once
- * peakR ≥ 1.0, exit if open R retraces 1.0R from the peak; tighten the allowance
- * to 0.5R once peakR ≥ 2.0 so a big winner keeps more of its gain.
+ * peakR ≥ armR, exit if open R retraces giveBackR from the peak; tighten the
+ * allowance to tightenGiveBackR once peakR ≥ tightenPeakR so a big winner keeps
+ * more of its gain.
+ *
+ * TRA-4006 — the allowance must be a STRICT fraction of the gain that arms it
+ * (`giveBackR < armR`). With the two equal (both 1.0R until 2026-08-26) the exit
+ * floor in the first armed state was `peakR − armR ≈ 0`: the rule armed on a
+ * +1R winner and then released it at breakeven. Defaults come from
+ * `@trading-app/shared` (0.75 / 0.40 / 2.0 / 0.25); the inequality is asserted
+ * in `tra4006-profit-lock-giveback-invariant.test.ts`.
  */
 export function profitLockDecision(p: ProfitLockParams): ProfitLockDecision {
   const armR = p.armR ?? PROFIT_LOCK_ARM_R;

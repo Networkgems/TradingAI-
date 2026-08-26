@@ -2274,10 +2274,22 @@ export const EXIT_CHANDELIER_ATR_MULT = 3.0;          // default trail width = 3
 export const EXIT_CHANDELIER_ATR_MULT_HIGHBETA = 3.5; // widen for high-beta names to avoid noise stop-outs
 export const EXIT_CHANDELIER_HIGHBETA_ATRPCT = 0.05;  // ATR/price above ~5% ⇒ treat as high-beta
 // Rule 2 — trade-level profit-lock (give-back cap per position)
-export const PROFIT_LOCK_ARM_R = 1.0;                 // arm once peak favorable excursion ≥ 1.0R
-export const PROFIT_LOCK_GIVEBACK_R = 1.0;            // exit if open R retraces 1.0R from peak
+//
+// TRA-4006 (QuantTrader ruling, 2026-08-26) — the arm threshold and the give-back
+// allowance were BOTH 1.0R, so in the rule's first armed state the exit floor
+// was `peakR − 1.0 ≈ 0`: any winner peaking in [1.0R, 2.0R) was released
+// somewhere in [0R, 1R), and a winner that peaked just over the arm was
+// released at breakeven (live NVTS261002C00012500 2026-08-25: peak ≥ +$31.20,
+// realised +$1.00, ≥ 96.8% given back). The allowance is now a strict fraction
+// of the gain that arms it. Invariants, asserted in
+// `packages/engine/src/tra4006-profit-lock-giveback-invariant.test.ts`:
+//   PROFIT_LOCK_GIVEBACK_R         < PROFIT_LOCK_ARM_R
+//   PROFIT_LOCK_TIGHTEN_GIVEBACK_R < PROFIT_LOCK_GIVEBACK_R
+// The specific numbers are a calibration; the inequalities are the defect.
+export const PROFIT_LOCK_ARM_R = 0.75;                // arm once peak favorable excursion ≥ 0.75R (was 1.0)
+export const PROFIT_LOCK_GIVEBACK_R = 0.40;           // exit if open R retraces 0.40R from peak (was 1.0)
 export const PROFIT_LOCK_TIGHTEN_PEAK_R = 2.0;        // once peakR ≥ 2.0R …
-export const PROFIT_LOCK_TIGHTEN_GIVEBACK_R = 0.5;    // … tighten the give-back to 0.5R (lock more of a big winner)
+export const PROFIT_LOCK_TIGHTEN_GIVEBACK_R = 0.25;   // … tighten the give-back to 0.25R (lock more of a big winner; was 0.5)
 // Rule 3 — book-level daily give-back cap (the board's headline ask)
 export const BOOK_GIVEBACK_CAP_PCT = 0.40;            // flatten + halt after surrendering >40% of the day's peak open gain
 // TRA-3218 — the session stop arms at max(BOOK_SESSION_STOP_R × 1R,

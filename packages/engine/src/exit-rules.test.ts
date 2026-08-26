@@ -101,35 +101,56 @@ describe('Rule 1 (live path) — stopModifyDecision', () => {
   });
 });
 
+// TRA-4006 re-pinned the Rule 2 schedule: arm 1.0R → 0.75R, give-back 1.0R →
+// 0.40R, tightened give-back 0.5R → 0.25R (tighten peak 2.0R unchanged). The
+// pre-change pins are kept in the comments so the intent of each case survives.
 describe('Rule 2 — trade-level profit-lock', () => {
-  it('disarmed until peak favorable excursion reaches 1.0R', () => {
-    // entry 100, stop 95 → R = 5. Peak 104 → peakR 0.8 (not armed).
-    const d = profitLockDecision({ side: 'buy', entry: 100, initialStop: 95, peakPrice: 104, currentPrice: 101 });
+  it('disarmed until peak favorable excursion reaches 0.75R', () => {
+    // entry 100, stop 95 → R = 5. Peak 103 → peakR 0.6 (not armed).
+    // (Pre-TRA-4006 this case used peak 104 = 0.8R against a 1.0R arm; 0.8R now
+    // arms, so the disarmed case has to sit below 0.75R.)
+    const d = profitLockDecision({ side: 'buy', entry: 100, initialStop: 95, peakPrice: 103, currentPrice: 101 });
     expect(d.R).toBe(5);
     expect(d.armed).toBe(false);
     expect(d.shouldExit).toBe(false);
   });
 
-  it('armed at +1R: exits on a 1.0R give-back from peak', () => {
-    // R = 5. Peak 106 → peakR 1.2. Current 100 → currentR 0 ≤ 1.2 − 1.0 → exit.
+  it('armed at +0.75R: exits on a 0.40R give-back from peak', () => {
+    // R = 5. Peak 106 → peakR 1.2. Current 100 → currentR 0 ≤ 1.2 − 0.4 = 0.8 → exit.
     const d = profitLockDecision({ side: 'buy', entry: 100, initialStop: 95, peakPrice: 106, currentPrice: 100 });
     expect(d.armed).toBe(true);
-    expect(d.giveBackR).toBe(1.0);
+    expect(d.giveBackR).toBe(0.40); // was 1.0 before TRA-4006
     expect(d.shouldExit).toBe(true);
   });
 
-  it('armed but still holding when give-back is within 1.0R', () => {
-    // Peak 106 (1.2R), current 104 (0.8R). 0.8 ≤ 1.2 − 1.0 = 0.2 ? no → hold.
-    const d = profitLockDecision({ side: 'buy', entry: 100, initialStop: 95, peakPrice: 106, currentPrice: 104 });
+  it('armed but still holding when give-back is within 0.40R', () => {
+    // Peak 106 (1.2R), current 105 (1.0R). 1.0 ≤ 1.2 − 0.4 = 0.8 ? no → hold.
+    // (Pre-TRA-4006: current 104 = 0.8R held against a 1.0R allowance; under the
+    // 0.40R allowance 0.8R IS the release level for a 1.2R peak — pinned below.)
+    const d = profitLockDecision({ side: 'buy', entry: 100, initialStop: 95, peakPrice: 106, currentPrice: 105 });
     expect(d.shouldExit).toBe(false);
+    // One tick under the release level (peakR − giveBackR = 0.8R) → exit, and
+    // the row is released with ~+0.8R still on it, not at breakeven. (Exactly
+    // 104 is a float tie — 0.8 vs 1.2 − 0.4 = 0.7999… — so the pin sits a tick
+    // inside.)
+    const atLevel = profitLockDecision({ side: 'buy', entry: 100, initialStop: 95, peakPrice: 106, currentPrice: 103.99 });
+    expect(atLevel.currentR).toBeCloseTo(0.8, 2);
+    expect(atLevel.shouldExit).toBe(true);
   });
 
-  it('tightens to a 0.5R give-back once peakR ≥ 2.0', () => {
-    // Peak 111 → peakR 2.2 → allowance 0.5R. Current 108 → currentR 1.6.
-    // 1.6 ≤ 2.2 − 0.5 = 1.7 → exit (would still be holding under the 1.0R rule).
-    const d = profitLockDecision({ side: 'buy', entry: 100, initialStop: 95, peakPrice: 111, currentPrice: 108 });
-    expect(d.giveBackR).toBe(0.5);
+  it('tightens to a 0.25R give-back once peakR ≥ 2.0', () => {
+    // Peak 111 → peakR 2.2 → allowance 0.25R. Current 109.5 → currentR 1.9.
+    // 1.9 ≤ 2.2 − 0.25 = 1.95 → exit (would still be holding under the 0.40R
+    // rule: 1.9 ≤ 1.8 is false).
+    // (Pre-TRA-4006: allowance 0.5R, current 108 = 1.6R ≤ 1.7 → exit.)
+    const d = profitLockDecision({ side: 'buy', entry: 100, initialStop: 95, peakPrice: 111, currentPrice: 109.5 });
+    expect(d.giveBackR).toBe(0.25); // was 0.5 before TRA-4006
     expect(d.shouldExit).toBe(true);
+    const underBase = profitLockDecision({
+      side: 'buy', entry: 100, initialStop: 95, peakPrice: 111, currentPrice: 109.5, tightenPeakR: Infinity,
+    });
+    expect(underBase.giveBackR).toBe(0.40);
+    expect(underBase.shouldExit).toBe(false);
   });
 
   it('short side mirrors long', () => {

@@ -161,11 +161,14 @@ describe('TRA-3941 AC2 — an overnight gap does not re-anchor the OTM trail', (
   //
   //   session 1, 14:00Z  underlying 200 → 210, mark 1.00 → 1.40
   //                      (below TP1 1.50, so no partial; trail arms at 1.30)
-  //   session 2, 13:34Z  underlying GAPS to 197, mark 1.32
-  //                      197 is through the 198 chandelier level; 1.32 is above
-  //                      the 1.12 premium trail AND above the 1.30 profit-lock
+  //   session 2, 13:34Z  underlying GAPS to 197, mark 1.36
+  //                      197 is through the 198 chandelier level; 1.36 is above
+  //                      the 1.12 premium trail AND above the 1.35 profit-lock
   //                      give-back level (see the `profit_lock` test below for
   //                      why that second clearance has to be stated).
+  //                      (TRA-4006 re-pinned this mark from 1.32: the lock level
+  //                      on this rig moved 1.30 → 1.35 when the tightened
+  //                      give-back went 0.5R → 0.25R.)
   function runToTheGap(rule: 'trail' | 'chandelier') {
     const { acct, sym } = openOtmCall();
     const opts = { otmSleeveExitRule: rule } as const;
@@ -177,7 +180,7 @@ describe('TRA-3941 AC2 — an overnight gap does not re-anchor the OTM trail', (
 
     vi.setSystemTime(SESSION_2_OPEN);
     const closed = acct.checkExits(
-      new Map([['AAPL', 197]]), new Map([[sym, 1.32]]), 'demo', opts, undefined, RISK,
+      new Map([['AAPL', 197]]), new Map([[sym, 1.36]]), 'demo', opts, undefined, RISK,
     );
     return { acct, sym, closed, opts };
   }
@@ -188,7 +191,7 @@ describe('TRA-3941 AC2 — an overnight gap does not re-anchor the OTM trail', (
     // The exact defect the board ruled on: sold at the next open, on the
     // underlying trail, with the premium trail nowhere near.
     expect(closed[0].exitReason).toBe('chandelier');
-    expect(closed[0].currentPremium).toBeCloseTo(1.32, 6);
+    expect(closed[0].currentPremium).toBeCloseTo(1.36, 6);
   });
 
   it('SUBJECT — under the ruling the row survives the gap, and the anchor is the PRIOR session high', () => {
@@ -244,15 +247,15 @@ describe('TRA-3941 AC2 — an overnight gap does not re-anchor the OTM trail', (
 
   it('SUBJECT — a deeper gap that would breach ANY re-seeded anchor still does not exit', () => {
     // 190 is 8 points below the session-1 chandelier level and would re-seed an
-    // underlying trail at 178 under the legacy veto. Mark 1.32 clears both the
-    // 1.12 premium trail and the 1.30 profit-lock level.
+    // underlying trail at 178 under the legacy veto. Mark 1.36 clears both the
+    // 1.12 premium trail and the 1.35 profit-lock level (TRA-4006 schedule).
     const { acct, sym } = openOtmCall();
     const opts = { otmSleeveExitRule: 'trail' } as const;
     vi.setSystemTime(SESSION_1);
     acct.checkExits(new Map([['AAPL', 210]]), new Map([[sym, 1.40]]), 'demo', opts, undefined, RISK);
     vi.setSystemTime(SESSION_2_OPEN);
     expect(
-      acct.checkExits(new Map([['AAPL', 190]]), new Map([[sym, 1.32]]), 'demo', opts, undefined, RISK),
+      acct.checkExits(new Map([['AAPL', 190]]), new Map([[sym, 1.36]]), 'demo', opts, undefined, RISK),
     ).toHaveLength(0);
     expect(acct.getState().openOptions[0].peakPremium).toBeCloseTo(1.40, 6);
     expect(acct.getState().openOptions[0].chandelierStop).toBeUndefined();
@@ -267,11 +270,14 @@ describe('TRA-3941 AC2 — an overnight gap does not re-anchor the OTM trail', (
 // OTM schedule it is strictly tighter:
 //
 //   R          = premiumPaid − stopLossPremium = 0.20 × premium  (OTM_SL_PCT 0.20)
-//   profit lock exits at  peak − 1.0R  (or peak − 0.5R once peakR ≥ 2)
+//   profit lock exits at  peak − 0.40R  (or peak − 0.25R once peakR ≥ 2)
+//                         (TRA-4006; was peak − 1.0R / peak − 0.5R)
 //   premium trail exits at peak × 0.80 = peak − 0.20 × peak
 //
-// At peak 1.40 that is 1.30 vs 1.12: the lock fires $0.18 earlier. So an armed
-// OTM row with a cached underlying ATR closes as `profit_lock`, not `trail`.
+// At peak 1.40 (= 2.0R on this rig, so the tightened allowance applies) that is
+// 1.35 vs 1.12: the lock fires $0.23 earlier (was 1.30 vs 1.12, $0.18, before
+// TRA-4006). So an armed OTM row with a cached underlying ATR closes as
+// `profit_lock`, not `trail`.
 //
 // This is NOT the defect TRA-3941 was filed on and is NOT in its accepted scope:
 // `profit_lock` anchors on `peakPremium`, a running high that carries across
@@ -287,7 +293,8 @@ describe('TRA-3941 — RESIDUAL: profit_lock still outranks the trail on an arme
     vi.setSystemTime(SESSION_1);
     acct.checkExits(new Map([['AAPL', 210]]), new Map([[sym, 1.40]]), 'demo', opts, undefined, RISK);
     vi.setSystemTime(SESSION_2_OPEN);
-    // 1.25 is under the 1.30 lock level and over the 1.12 trail level.
+    // 1.25 is under the 1.35 lock level (TRA-4006; was 1.30) and over the 1.12
+    // trail level.
     const closed = acct.checkExits(
       new Map([['AAPL', 197]]), new Map([[sym, 1.25]]), 'demo', opts, undefined, RISK,
     );
