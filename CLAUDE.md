@@ -247,3 +247,48 @@ an order against some other service's deploys. It also fails to `UNREAD`, never 
 history starts after the deadline, when a pre-deadline deploy carries a commit this checkout does
 not know, or when nothing in the window carries the commit at all — the expensive direction of a
 grader over other people's deploys is the false accusation.
+
+## A timed wait rests in a monitor, never in `blocked` with an empty `blockedBy`
+
+You finished the work but have to come back at a time — a close, a soak window, an external check.
+The resting state for that is a **scheduled issue monitor**, and it is agent-reachable. It is not a
+sub-route; it is a field on the ordinary issue PATCH. Every route an agent guesses (`/monitor`,
+`/monitor/schedule`, `/monitors`) 404s, and the one monitor route that does exist
+(`POST /api/issues/{id}/monitor/check-now`) presupposes a monitor you already armed. There is no path
+from the `422` remedy text to the working call — which is why TRA-4060 was filed twice as a platform
+bug and looped a watchdog subtree for days.
+
+```
+PATCH /api/issues/{id}
+{"status":"in_review",
+ "executionPolicy":{"monitor":{"nextCheckAt":"2026-08-26T20:30:00.000Z",
+                               "scheduledBy":"assignee",
+                               "notes":"<why you are coming back>",
+                               "recoveryPolicy":"wake_owner"}}}
+```
+
+`nextCheckAt` is the only required key. `scheduledBy` ∈ `assignee|board`. `recoveryPolicy` ∈
+`wake_owner|create_recovery_issue|escalate_to_board` (default `wake_owner`). Only the **assignee
+agent** or a board user may arm or trigger one.
+
+⚠️ **The monitor is ONE-SHOT and nothing re-arms it.** When it fires — from the scheduler *or* from
+your own `check-now` — the platform nulls `monitorNextCheckAt` and **deletes** the `monitor` block
+out of `executionPolicy` (`buildIssueMonitorTriggeredPatch`). It never reschedules. So when a monitor
+wake lands, **finish the issue or arm the next monitor in the same heartbeat**; waking up, posting a
+comment and leaving it `in_review` yields a stopped leaf that looks compliant to every status query
+and is owned by nobody. The `invalid_issue_disposition` guard cannot catch it — that guard runs only
+on the *transition into* `in_review`, not when the monitor later burns. 18 issues were sitting in
+exactly that state company-wide on 2026-08-26.
+
+⚠️ **`check-now` is a manual dispatch, not a status read** — it spends the monitor. To read monitor
+state just `GET /api/issues/{id}`; there is no top-level `monitorRecoveryPolicy`/`monitorStatus`
+field (looking for one is how this got misdiagnosed twice). It is nested:
+`executionState.monitor.{status,recoveryPolicy,attemptCount,maxAttempts,clearReason}`, alongside
+top-level `monitorNextCheckAt`. **Spent** = `monitorNextCheckAt == null` &&
+`executionState.monitor.status == "triggered"`.
+
+⛔ Do **not** rest a timed wait in `blocked` with an empty `blockedBy`. That is the strand condition
+itself, and the TRA-3541 drain arms will "repair" it — they hit TRA-4060 twice in seven minutes.
+A clock/threshold gate that another issue `blocks` rests `todo` (TRA-3058), and stays assigned.
+
+Full field table, authorization rules and the source trace: `docs/agent-issue-monitor-TRA-4073.md`.
