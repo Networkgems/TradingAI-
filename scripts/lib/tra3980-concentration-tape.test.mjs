@@ -14,7 +14,7 @@
 // from.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { foldTape, renderReport, quantile, shareOf, SAMPLE, REFUSAL } from './tra3980-concentration-tape.mjs';
+import { foldTape, renderReport, quantile, shareOf, dollarsOf, SAMPLE, REFUSAL } from './tra3980-concentration-tape.mjs';
 
 const pin = { commit: 'deadbeef', pid: 42, startedAt: '2026-08-25T20:00:00.000Z' };
 
@@ -148,6 +148,74 @@ test('renderReport states the lower-bound census beside the figures', () => {
   assert.match(md, /UNDER-state concentration/);
   assert.match(md, /68\.7%/);
   assert.match(md, /NOTE-MARKER/);
+});
+
+// ── AC2 amendment: the DOLLAR axis (CEO, TRA-3980 `20187555` / TRA-3703 `6245c427`) ──
+//
+// ⚠ CONTROL: the dollar axis must NOT be derivable from the share axis. Two
+// samples with the SAME share and DIFFERENT fleets carry different dollars —
+// which is the whole reason the CEO ruled dollars: `share × fleet` loosens as
+// the fleet grows. A fold that computed dollars as `share × fleetAtRiskUsd`
+// would pass a same-fleet fixture and still be reading the wrong field on a
+// lower-bound sample (unpriced rows are in neither numerator).
+test('CONTROL — the dollar axis reads `atRiskUsd`, not share × fleet', () => {
+  const lines = [
+    // 50% of a $200 fleet = $100
+    sample({ session: 'A', fleetAtRiskUsd: 200,
+      maxContract: { ...sample().maxContract, atRiskUsd: 100, shareOfFleetAtRisk: 0.5 },
+      maxUnderlying: { ...sample().maxUnderlying, atRiskUsd: 100, shareOfFleetAtRisk: 0.5 } }),
+    // 50% of a $500 fleet = $250 — same share, 2.5x the dollars
+    sample({ session: 'B', fleetAtRiskUsd: 500,
+      maxContract: { ...sample().maxContract, atRiskUsd: 250, shareOfFleetAtRisk: 0.5 },
+      maxUnderlying: { ...sample().maxUnderlying, atRiskUsd: 250, shareOfFleetAtRisk: 0.5 } }),
+  ];
+  const f = foldTape(lines);
+  assert.equal(f.perSample.maxContract.quantiles.p0, 0.5);
+  assert.equal(f.perSample.maxContract.quantiles.p100, 0.5, 'share axis is flat across both');
+  assert.equal(f.perSample.maxContractUsd.quantiles.p0, 100);
+  assert.equal(f.perSample.maxContractUsd.quantiles.p100, 250, 'the dollar axis is not');
+  assert.equal(f.perSession.maxContractUsd.n, 2);
+  assert.equal(f.perSession.maxUnderlyingUsd.quantiles.p100, 250);
+  assert.equal(f.sessions[1].maxContractUsd, 250);
+  // The dollar field is read, never recomputed: a sample whose share and dollars
+  // disagree (lower-bound shape) must surface the dollars it carries.
+  const g = foldTape([sample({ session: 'C', fleetAtRiskUsd: 1000,
+    maxContract: { ...sample().maxContract, atRiskUsd: 305, shareOfFleetAtRisk: 0.9 },
+    maxUnderlying: { ...sample().maxUnderlying, atRiskUsd: 305, shareOfFleetAtRisk: 0.9 } })]);
+  assert.equal(g.perSample.maxContractUsd.quantiles.p50, 305, 'not 900');
+});
+
+test('the dollar axis carries the same HARD split and the same empty ⇒ $0 rule', () => {
+  const lines = [
+    sample({ session: 'A', concentrationIsLowerBound: true,
+      maxContract: { ...sample().maxContract, atRiskUsd: 20 }, maxUnderlying: { ...sample().maxUnderlying, atRiskUsd: 20 } }),
+    sample({ session: 'B', concentrationIsLowerBound: false,
+      maxContract: { ...sample().maxContract, atRiskUsd: 305 }, maxUnderlying: { ...sample().maxUnderlying, atRiskUsd: 305 } }),
+    sample({ session: 'C', status: 'empty', maxContract: null, maxUnderlying: null, fleetAtRiskUsd: 0, distinctContracts: null }),
+    sample({ session: 'D', status: 'unwired', maxContract: null, maxUnderlying: null }),
+  ];
+  const f = foldTape(lines);
+  assert.equal(f.perSample.maxContractUsd.n, 3, 'A, B and the empty C; unwired D is a refusal');
+  assert.equal(f.perSample.maxContractUsd.quantiles.p0, 0, 'a flat fleet held $0 in its top bucket');
+  assert.equal(f.perSample.maxContractUsdHardOnly.n, 2, 'B and C — the soft A is out');
+  assert.equal(f.perSample.maxContractUsdHardOnly.quantiles.p100, 305);
+  assert.equal(f.perSample.maxContractUsd.quantiles.p50, 20);
+  assert.equal(f.perSample.maxContractUsdHardOnly.quantiles.p50, 152.5,
+    'the soft sample must not be able to pull the HARD median down');
+  assert.equal(dollarsOf(sample({ maxContract: { ...sample().maxContract, atRiskUsd: null } }), 'contract'), null,
+    'an unpriced top bucket is not $0');
+  assert.equal(dollarsOf({ kind: REFUSAL }, 'contract'), null);
+});
+
+test('renderReport carries the dollar rows beside the share rows, with the census', () => {
+  const f = foldTape([sample({ concentrationIsLowerBound: true })]);
+  const md = renderReport(f);
+  assert.match(md, /Dollar axis \(AC2 amendment/);
+  assert.match(md, /\(1 of 1 soft\)/, 'the same census is stated on the dollar block');
+  assert.match(md, /`maxContract\.atRiskUsd` — per sample, ALL \| 1 \| \$305\.00/);
+  assert.match(md, /`maxContract\.atRiskUsd` — per sample, HARD only \| 0 \| n\/a/);
+  assert.match(md, /`maxUnderlying\.atRiskUsd` — per SESSION peak \| 1 \| \$305\.00/);
+  assert.match(md, /peak contract \$/, 'per-session detail names the dollar column');
 });
 
 test('renderReport does NOT narrate a soft census over a tape with zero lower bounds', () => {

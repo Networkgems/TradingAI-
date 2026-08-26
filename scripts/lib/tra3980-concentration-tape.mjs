@@ -90,6 +90,29 @@ export function shareOf(sample, pick) {
   return b.shareOfFleetAtRisk;
 }
 
+/**
+ * The DOLLARS a sample's top bucket carries, or `null` if the sample offers no
+ * reading of it. CEO amendment to AC2 (TRA-3980 comment `20187555`, ruled on
+ * TRA-3703 `6245c427`): a ceiling, if one is ever set, is denominated in
+ * DOLLARS — a share ceiling's dollar bite is `share × fleet`, tightest when the
+ * fleet is SMALLEST and loosening as total risk rises. So the tape carries the
+ * dollar axis beside the share axis, over the SAME samples, with the SAME
+ * lower-bound census. Same `empty ⇒ 0` rule as `shareOf`: a flat fleet's most
+ * concentrated bucket held $0, which is a reading.
+ *
+ * ⚠ THE DOLLAR AXIS IS SOFT IN THE SAME DIRECTION AS THE SHARE AXIS. An unpriced
+ * row contributes $0 to every bucket, so a lower-bound sample UNDER-states the
+ * top bucket's dollars too. The HARD split applies to both.
+ */
+export function dollarsOf(sample, pick) {
+  if (!sample || sample.kind !== SAMPLE) return null;
+  if (sample.status === 'empty') return 0;
+  if (sample.status !== 'measured') return null;
+  const b = pick === 'contract' ? sample.maxContract : sample.maxUnderlying;
+  if (!b || !isFiniteNum(b.atRiskUsd)) return null;
+  return b.atRiskUsd;
+}
+
 function distribution(values) {
   const sorted = values.slice().sort((a, b) => a - b);
   const out = { n: sorted.length, quantiles: {} };
@@ -124,6 +147,7 @@ export function foldTape(lines) {
       sessions.set(key, {
         session: key, samples: [], slots: new Set(), lowerBound: 0,
         maxContractShare: null, maxUnderlyingShare: null,
+        maxContractUsd: null, maxUnderlyingUsd: null,
         distinctContracts: null, statuses: new Set(), pins: new Set(),
       });
     }
@@ -137,6 +161,10 @@ export function foldTape(lines) {
     const u = shareOf(s, 'underlying');
     if (c !== null) g.maxContractShare = Math.max(g.maxContractShare ?? 0, c);
     if (u !== null) g.maxUnderlyingShare = Math.max(g.maxUnderlyingShare ?? 0, u);
+    const cUsd = dollarsOf(s, 'contract');
+    const uUsd = dollarsOf(s, 'underlying');
+    if (cUsd !== null) g.maxContractUsd = Math.max(g.maxContractUsd ?? 0, cUsd);
+    if (uUsd !== null) g.maxUnderlyingUsd = Math.max(g.maxUnderlyingUsd ?? 0, uUsd);
     const dc = s.status === 'empty' ? 0 : s.distinctContracts;
     if (isFiniteNum(dc)) g.distinctContracts = Math.max(g.distinctContracts ?? 0, dc);
   }
@@ -148,6 +176,12 @@ export function foldTape(lines) {
     (a.session < b.session ? -1 : a.session > b.session ? 1 : 0));
   const sessionShares = pick => sessionList
     .map(g => (pick === 'contract' ? g.maxContractShare : g.maxUnderlyingShare))
+    .filter(v => v !== null);
+  // The DOLLAR axis — same samples, same HARD split, same session-peak rule.
+  const sampleUsd = pick => graded.map(s => dollarsOf(s, pick)).filter(v => v !== null);
+  const hardUsd = pick => hard.map(s => dollarsOf(s, pick)).filter(v => v !== null);
+  const sessionUsd = pick => sessionList
+    .map(g => (pick === 'contract' ? g.maxContractUsd : g.maxUnderlyingUsd))
     .filter(v => v !== null);
 
   // AC3 — every multi-book occurrence NAMED, not counted.
@@ -187,10 +221,17 @@ export function foldTape(lines) {
       maxUnderlying: distribution(sampleShares('underlying')),
       maxContractHardOnly: distribution(hardShares('contract')),
       maxUnderlyingHardOnly: distribution(hardShares('underlying')),
+      // AC2 amendment — dollars beside share, over the same population.
+      maxContractUsd: distribution(sampleUsd('contract')),
+      maxUnderlyingUsd: distribution(sampleUsd('underlying')),
+      maxContractUsdHardOnly: distribution(hardUsd('contract')),
+      maxUnderlyingUsdHardOnly: distribution(hardUsd('underlying')),
     },
     perSession: {
       maxContract: distribution(sessionShares('contract')),
       maxUnderlying: distribution(sessionShares('underlying')),
+      maxContractUsd: distribution(sessionUsd('contract')),
+      maxUnderlyingUsd: distribution(sessionUsd('underlying')),
     },
     sessions: sessionList.map(g => ({
       session: g.session,
@@ -201,6 +242,8 @@ export function foldTape(lines) {
       pins: Array.from(g.pins).sort(),
       maxContractShare: g.maxContractShare,
       maxUnderlyingShare: g.maxUnderlyingShare,
+      maxContractUsd: g.maxContractUsd,
+      maxUnderlyingUsd: g.maxUnderlyingUsd,
       distinctContracts: g.distinctContracts,
       multiBook: multiBookSessions.has(g.session),
     })),
@@ -213,11 +256,13 @@ export function foldTape(lines) {
 
 const pct = v => (v === null || v === undefined ? 'n/a' : `${(v * 100).toFixed(1)}%`);
 
-function qLine(label, d) {
+const usd = v => (v === null || v === undefined ? 'n/a' : `$${Number(v).toFixed(2)}`);
+
+function qLine(label, d, fmt = pct) {
   if (d.n === 0) return `| ${label} | 0 | n/a | n/a | n/a | n/a | n/a | n/a |`;
   const q = d.quantiles;
-  return `| ${label} | ${d.n} | ${pct(q.p0)} | ${pct(q.p25)} | ${pct(q.p50)} | `
-    + `${pct(q.p75)} | ${pct(q.p90)} | ${pct(q.p100)} |`;
+  return `| ${label} | ${d.n} | ${fmt(q.p0)} | ${fmt(q.p25)} | ${fmt(q.p50)} | `
+    + `${fmt(q.p75)} | ${fmt(q.p90)} | ${fmt(q.p100)} |`;
 }
 
 /** Renders the fold as the markdown that goes on the ticket. Pure. */
@@ -260,6 +305,23 @@ export function renderReport(fold, opts = {}) {
   L.push(qLine('`maxContract` share — per SESSION peak', fold.perSession.maxContract));
   L.push(qLine('`maxUnderlying` share — per SESSION peak', fold.perSession.maxUnderlying));
   L.push('');
+  // AC2 amendment (CEO, TRA-3703 `6245c427`): the DOLLAR axis beside the share
+  // axis, same samples, same census. A share ceiling's dollar bite is
+  // `share × fleet` — tightest when the fleet is smallest — so the number a
+  // ceiling would be set against is the top bucket's DOLLARS, not its share.
+  L.push('**Dollar axis (AC2 amendment — a ceiling, if set, is in DOLLARS):** the same '
+    + `samples and the same lower-bound census (${c.samplesLowerBound} of ${c.samplesGraded} `
+    + 'soft) as the share rows above. A soft sample UNDER-states dollars too.');
+  L.push('');
+  L.push('| population | n | p0 | p25 | p50 | p75 | p90 | p100 |');
+  L.push('|---|---:|---:|---:|---:|---:|---:|---:|');
+  L.push(qLine('`maxContract.atRiskUsd` — per sample, ALL', fold.perSample.maxContractUsd, usd));
+  L.push(qLine('`maxContract.atRiskUsd` — per sample, HARD only', fold.perSample.maxContractUsdHardOnly, usd));
+  L.push(qLine('`maxUnderlying.atRiskUsd` — per sample, ALL', fold.perSample.maxUnderlyingUsd, usd));
+  L.push(qLine('`maxUnderlying.atRiskUsd` — per sample, HARD only', fold.perSample.maxUnderlyingUsdHardOnly, usd));
+  L.push(qLine('`maxContract.atRiskUsd` — per SESSION peak', fold.perSession.maxContractUsd, usd));
+  L.push(qLine('`maxUnderlying.atRiskUsd` — per SESSION peak', fold.perSession.maxUnderlyingUsd, usd));
+  L.push('');
   L.push(`#### Multi-book contracts — the hazard (${fold.multiBook.sessions} of `
     + `${c.sessionsObserved} sessions)`);
   if (fold.multiBook.occurrences.length === 0) {
@@ -279,13 +341,13 @@ export function renderReport(fold, opts = {}) {
   L.push('#### Per-session detail');
   L.push('');
   L.push('| session | slots | samples | lower-bound | statuses | distinct contracts | '
-    + 'peak contract share | peak underlying share | pins |');
-  L.push('|---|---|---:|---:|---|---:|---:|---:|---|');
+    + 'peak contract share | peak contract $ | peak underlying share | peak underlying $ | pins |');
+  L.push('|---|---|---:|---:|---|---:|---:|---:|---:|---:|---|');
   for (const s of fold.sessions) {
     L.push(`| ${s.session} | ${s.slots.join(',') || '-'} | ${s.samples} | `
       + `${s.lowerBoundSamples} | ${s.statuses.join(',')} | `
-      + `${s.distinctContracts ?? 'n/a'} | ${pct(s.maxContractShare)} | `
-      + `${pct(s.maxUnderlyingShare)} | ${s.pins.join(' ')} |`);
+      + `${s.distinctContracts ?? 'n/a'} | ${pct(s.maxContractShare)} | ${usd(s.maxContractUsd)} | `
+      + `${pct(s.maxUnderlyingShare)} | ${usd(s.maxUnderlyingUsd)} | ${s.pins.join(' ')} |`);
   }
   if (opts.note) { L.push(''); L.push(opts.note); }
   return L.join('\n');
