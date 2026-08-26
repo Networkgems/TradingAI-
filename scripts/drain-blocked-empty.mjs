@@ -20,7 +20,7 @@
  * THE TWO WRITES, IN THIS ORDER, PER ROW
  * --------------------------------------
  *   1. POST /comments            the audit trail
- *   2. PATCH {"status":"todo"}   <-- the LAST write this row will ever accept
+ *   2. PATCH {"status": <-- CLASS-DEPENDENT}   the LAST write this row accepts
  *
  * The comment goes first because it must be written while the row is still ours:
  * the moment a row leaves this actor's authorization boundary, both the status
@@ -54,9 +54,48 @@
  * `returnOwnerAgentId` is the platform's to make. This file READS that id, names
  * it in the audit comment, and does not write it.
  *
- * ⛔ NEVER `done`. `todo` is queue-visible AND still counts as an unresolved
- * blocker upstream, so parents stay correctly blocked and no unrun work is
- * destroyed. `done` destroys it.
+ * THE ROW CLASS DECIDES THE STATUS (TRA-4063, MEASURED 2026-08-26)
+ * ---------------------------------------------------------------
+ * Until 2026-08-26 this file wrote `todo` to every drainable row and the banner
+ * here read "⛔ NEVER `done`". That was right for durable work and WRONG for one
+ * class, and the wrong direction switches detectors off:
+ *
+ *   DURABLE STRAND   real work the reconciler blocked. -> `todo`. `done`
+ *                    destroys unrun work and stays banned on this class.
+ *   SUPPRESSING LEAF a per-fire routine spawn (`originKind: routine_execution`)
+ *                    that gates nothing. -> `done`. Under BOTH
+ *                    `skip_if_active` and `coalesce_if_active`, a fire landing
+ *                    while the previous execution issue is still open is
+ *                    dropped or merged, so a leaf left NON-TERMINAL silently
+ *                    switches its own routine OFF -- while `nextRunAt` keeps
+ *                    advancing and every census keeps reading it ARMED.
+ *                    `todo` IS non-terminal. Draining a drain leaf to `todo`
+ *                    disables the drain (TRA-4041).
+ *
+ * This is not a theoretical widening. The fire of 2026-08-26T12:30Z planned
+ * `-> todo` for TRA-4058, the per-fire spawn of routine 82daa7b2 "TRA-4017
+ * armed-liveness detector", `status: active`, `concurrencyPolicy:
+ * skip_if_active`, `blocks: []`. It would have switched a live sibling detector
+ * off, on this same seat. It did not happen only because a human read the dry
+ * run before `--apply` (TRA-4063).
+ *
+ * ⛔ THE `done` AUTHORITY IS SCOPED TO THAT ONE CLASS AND ENFORCED ON THE WIRE.
+ * `gradeWriteBody` takes the class and refuses `done` for anything else -- and
+ * refuses `todo` FOR a suppressing leaf, because writing the generic status onto
+ * this class is the defect, not a lesser outcome. It also refuses BOTH when no
+ * class is supplied: a caller that forgets to classify must not inherit the old
+ * default, which is exactly how this bug survived.
+ *
+ * ⛔ BOTH UNKNOWNS REFUSE TO WRITE. A row with no `originKind`, or a
+ * `routine_execution` row whose `blocks` key is absent (absent is not empty),
+ * cannot be told apart from the class it must not be given. It is reported
+ * UNCLASSIFIABLE, nothing is sent, and it colours REMAINDER. Falling back to
+ * `todo` on an unclassifiable row is the failure this ticket is about.
+ *
+ * ⛔ ONE PREDICATE, TWO READERS. The class comes from `suppressesOwnRoutine()`
+ * imported from the detector -- the same rule the report prints. A drain with
+ * its own copy classifies a different population than the one being graded, and
+ * the two drift on the first edit to either.
  *
  * ⛔ NEVER re-send `blockedByIssueIds`. There is no open anchor left, and an
  * empty write-key list reproduces the unroutable born-blocked state this whole
@@ -117,7 +156,7 @@
  */
 
 import { pathToFileURL } from 'node:url';
-import { sweep, SHAPE, SEVERITY, renderReport } from './check-blocked-empty.mjs';
+import { sweep, SHAPE, SEVERITY, renderReport, suppressesOwnRoutine } from './check-blocked-empty.mjs';
 
 const argv = process.argv.slice(2);
 const argOf = (name, fallback) => {
@@ -173,7 +212,88 @@ export const ACTION = {
   SKIP_SHAPE_2: 'SKIP_SHAPE_2',
   SKIP_INELIGIBLE: 'SKIP_INELIGIBLE',
   SKIP_NOT_SELECTED: 'SKIP_NOT_SELECTED',
+  // TRA-4063 — the class could not be decided, so NEITHER status is safe.
+  SKIP_UNCLASSIFIABLE: 'SKIP_UNCLASSIFIABLE',
 };
+
+/* ------------------------------------------------------------------ *
+ * The row class — which status this row gets (TRA-4063)
+ * ------------------------------------------------------------------ */
+
+export const ROW_CLASS = {
+  DURABLE_STRAND: 'DURABLE_STRAND',
+  SUPPRESSING_LEAF: 'SUPPRESSING_LEAF',
+  UNCLASSIFIABLE: 'UNCLASSIFIABLE',
+};
+
+/** Statuses a row can rest at without its own routine treating it as still open. */
+const TERMINAL_STATUSES = new Set(['done', 'cancelled']);
+
+/**
+ * Decide the class, and with it the ONE status this row may be written.
+ *
+ * Pure, and deliberately reads nothing but the sweep finding: the class must not
+ * depend on a second network read, or an unreachable routines route becomes a
+ * third unknown and the safe branch swallows the cohort. The origin routine IS
+ * fetched later, but only to NAME it in the audit trail — never to decide this.
+ *
+ * The three answers are not symmetric. `todo` on a suppressing leaf switches a
+ * routine off silently; `done` on a durable strand destroys unrun work loudly.
+ * Neither is recoverable by the next fire, so an ambiguous row gets neither.
+ */
+export function classifyDisposition(f) {
+  const originKind = f.originKind || null;
+  const blocksKnown = f.blocksKnown === true;
+
+  if (suppressesOwnRoutine(f)) {
+    return {
+      klass: ROW_CLASS.SUPPRESSING_LEAF,
+      status: 'done',
+      why:
+        `originKind=\`routine_execution\` and \`blocks\` was READ and is EMPTY -- this is a per-fire spawn that ` +
+        'gates nothing. Its routine treats a NON-TERMINAL leaf as still running (skip_if_active drops the next ' +
+        'fire, coalesce_if_active merges into it), so the generic `todo` restore would leave the routine OFF while ' +
+        'nextRunAt keeps advancing and every census reads it ARMED. Resting disposition for this class is `done` ' +
+        '(TRA-4041 / TRA-4063). There is no unrun work to destroy: the fire is over, the spawn is its record.',
+    };
+  }
+
+  // Ordered AFTER the positive test on purpose. `suppressesOwnRoutine` already
+  // requires `blocksKnown`, so a spawn with an unreadable `blocks` key falls
+  // through to here rather than being silently graded durable.
+  if (!originKind) {
+    return {
+      klass: ROW_CLASS.UNCLASSIFIABLE,
+      status: null,
+      why:
+        'the payload carries NO `originKind` (absent or null), so this row cannot be told apart from a routine ' +
+        'spawn. Writing `todo` on a spawn switches its routine off and writing `done` on durable work destroys it, ' +
+        'so NEITHER is sent. Measured 2026-08-26: the item route populates this field (`manual`, ' +
+        '`routine_execution`, `task_watchdog_product_bug` all observed live), so a null here is a real unknown on ' +
+        'this row, not a uniformly unread field.',
+    };
+  }
+  if (originKind === 'routine_execution' && !blocksKnown) {
+    return {
+      klass: ROW_CLASS.UNCLASSIFIABLE,
+      status: null,
+      why:
+        'a `routine_execution` spawn whose `blocks` key is ABSENT. Absent is not empty: this row may be gating a ' +
+        'subtree, in which case `done` buries it, or it may be gating nothing, in which case `todo` switches its ' +
+        'routine off. The one thing that decides between them could not be read, so nothing is sent.',
+    };
+  }
+
+  return {
+    klass: ROW_CLASS.DURABLE_STRAND,
+    status: 'todo',
+    why:
+      `originKind=\`${originKind}\` -- durable work, not a per-fire spawn` +
+      (originKind === 'routine_execution' ? ` (it is a spawn, but it GATES ${f.blocksIdentifiers.join(', ')})` : '') +
+      '. `todo` is queue-visible AND still counts as an unresolved blocker upstream, so any parent stays correctly ' +
+      'blocked and no unrun work is destroyed.',
+  };
+}
 
 /* ------------------------------------------------------------------ *
  * The write-body guard — graded on what we SEND
@@ -186,9 +306,21 @@ export const ACTION = {
  *
  * Exactly two verbs are legal, matching the two the detector is allowed to
  * print (its SANCTIONED_VERB whitelist). Anything else — a third key, a
- * `done`, a blocker-key write, a merged one-shot body — is a defect.
+ * blocker-key write, a merged one-shot body — is a defect.
+ *
+ * TRA-4063 — the sanctioned STATUS is class-dependent, so the class is an
+ * argument, not an assumption. The three status branches are mutually
+ * exclusive on purpose:
+ *
+ *   klass omitted           `todo` AND `done` both refused. A caller that did
+ *                           not classify does not get the old default.
+ *   DURABLE_STRAND          `todo` only. `done` destroys unrun work.
+ *   SUPPRESSING_LEAF        `done` only. `todo` is NON-TERMINAL and leaves the
+ *                           spawn's own routine switched off, which is the
+ *                           whole defect -- so it is an ERROR here, not a
+ *                           merely-suboptimal write.
  */
-export function gradeWriteBody(step, body) {
+export function gradeWriteBody(step, body, { klass = null } = {}) {
   const bad = (why) => ({ ok: false, why: `${step}: ${why}` });
   if (!body || typeof body !== 'object' || Array.isArray(body)) return bad('body is not an object');
   const keys = Object.keys(body);
@@ -218,8 +350,33 @@ export function gradeWriteBody(step, body) {
 
   if (step === 'status') {
     if (keys.length !== 1 || keys[0] !== 'status') return bad(`expected exactly {"status"}, got {${keys.join(',')}}`);
+
+    // TRA-4063 — refused BEFORE either per-class branch, so a caller that
+    // skipped classification cannot inherit the pre-4063 default. The old
+    // default was `todo` for everything, and that default is the bug.
+    if (klass !== ROW_CLASS.DURABLE_STRAND && klass !== ROW_CLASS.SUPPRESSING_LEAF) {
+      return bad(
+        `carries no row class (got \`${klass || 'none'}\`), and the sanctioned status DEPENDS on it (TRA-4063): ` +
+          '`todo` for a DURABLE_STRAND, `done` for a SUPPRESSING_LEAF. Guessing either way switches a routine off ' +
+          'or destroys unrun work, so an unclassified row is not written at all.',
+      );
+    }
+
+    if (klass === ROW_CLASS.SUPPRESSING_LEAF) {
+      if (body.status === 'done') return { ok: true };
+      return bad(
+        `would write \`${body.status}\` on a SUPPRESSING LEAF. Only \`done\` is sanctioned for this class: a ` +
+          'per-fire `routine_execution` spawn that gates nothing is treated by its own routine as STILL RUNNING ' +
+          'while it rests non-terminal, so `todo` leaves that routine OFF with nextRunAt still advancing. This is ' +
+          'an error, not a lesser write -- it is the exact defect TRA-4063 was filed for.',
+      );
+    }
+
     if (body.status === 'done') {
-      return bad('would write `done`, which DESTROYS unrun work. The restore is `todo` and only `todo`.');
+      return bad(
+        'would write `done` on a DURABLE_STRAND, which DESTROYS unrun work. The restore is `todo` and only `todo`. ' +
+          '`done` is reachable ONLY for a SUPPRESSING_LEAF (TRA-4063), where there is no unrun work to destroy.',
+      );
     }
     if (body.status !== 'todo') {
       return bad(
@@ -242,9 +399,70 @@ export function gradeWriteBody(step, body) {
   return bad('unknown write step');
 }
 
+/**
+ * Render the ORIGIN ROUTINE sentence for a suppressing leaf (TRA-4063).
+ *
+ * `origin` is a best-effort read. It is NEVER a classification input -- the
+ * class was already decided off the issue payload -- so an unread routine
+ * degrades this sentence to UNREAD and changes no write. It must still be
+ * printed either way: "the routine this write is keeping alive" is the single
+ * fact that makes a `done` on an automated writer auditable after the fact.
+ */
+export function originSentence(f, origin) {
+  const id = f.originId || '(no originId on the payload)';
+  if (!origin) {
+    return (
+      `Origin routine \`${id}\` -- UNREAD (the routines route was not queried or did not answer). The class was ` +
+      'decided from this issue\'s own `originKind` + `blocks`, which is why an unread routine does not change the ' +
+      'write. Its concurrencyPolicy is therefore UNKNOWN here, and under BOTH known policies (skip_if_active, ' +
+      'coalesce_if_active) a non-terminal leaf suppresses the next fire.'
+    );
+  }
+  if (origin.unread) {
+    return `Origin routine \`${id}\` -- UNREAD: ${origin.unread}. Same note as above: the class did not depend on it.`;
+  }
+  return (
+    `Origin routine \`${id}\` = "${origin.title || '(untitled)'}", status \`${origin.status || 'unknown'}\`, ` +
+    `concurrencyPolicy \`${origin.concurrencyPolicy || 'unknown'}\`, owner \`${origin.assigneeAgentId || 'none'}\`. ` +
+    'That policy is why this row gets `done`: a fire landing while THIS execution issue is still open is ' +
+    (origin.concurrencyPolicy === 'skip_if_active'
+      ? 'DROPPED outright'
+      : origin.concurrencyPolicy === 'coalesce_if_active'
+        ? 'MERGED into it instead of running'
+        : 'suppressed') +
+    ', so resting this leaf non-terminal switches that routine OFF while its nextRunAt keeps advancing.'
+  );
+}
+
 /** The audit comment. ASCII only, and written BEFORE the row leaves our boundary. */
-export function drainComment(f, runId) {
+export function drainComment(f, runId, disp = null, origin = null) {
   const rep = f.repair;
+  const d = disp || classifyDisposition(f);
+  if (d.klass === ROW_CLASS.SUPPRESSING_LEAF) {
+    return (
+      `Automated strand drain (TRA-3541), SUPPRESSING LEAF branch (TRA-4041 / TRA-4063). This row was \`blocked\` ` +
+      `with an EMPTY \`blockedBy\` and carried an active \`${f.recoveryKind}\` recovery action, which is the ` +
+      `platform's terminal-run recovery writing the block -- no agent ever intended an anchor.\n\n` +
+      `CLASS: SUPPRESSING LEAF. ${d.why}\n\n` +
+      `${originSentence(f, origin)}\n\n` +
+      `Read live immediately before this write: status \`blocked\`, \`blockedBy\` empty, \`blocks\` READ and EMPTY ` +
+      `(absent would NOT have counted), \`originKind\` \`${f.originKind}\`, pendingInteractions 0 (a KNOWN zero, ` +
+      `not an unread route), \`evidence.previousStatus\` \`${rep.restoredFrom}\`, \`returnOwnerAgentId\` ` +
+      `\`${rep.assigneeAgentId}\`.\n\n` +
+      `Repair applied -- ONE write (TRA-4041):\n` +
+      `- PATCH status -> \`done\`. THIS IS THE \`done\` BRANCH, taken deliberately and taken only for this class. ` +
+      `The generic restore for this cohort is \`todo\`, and \`todo\` here would be the defect: it is non-terminal, ` +
+      `so the origin routine would keep treating this finished fire as live and would never run again. There is no ` +
+      `unrun work to destroy -- the fire is over and this spawn is its record.\n` +
+      `- \`blockedByIssueIds\` deliberately NOT re-sent.\n` +
+      `- assigneeAgentId deliberately NOT written. The recovery payload names \`${rep.assigneeAgentId}\` as the ` +
+      `returnOwnerAgentId; the status write above spawns a run that takes this issue's checkout lock, so any ` +
+      `further PATCH returns 409 Issue run ownership conflict (6/6, measured). The re-home is the platform's.\n\n` +
+      `If this classification is wrong, the recoverable direction is to reopen this row -- not to re-drain it. ` +
+      `Commented BEFORE the status write, because the status write is the last one this row accepts.\n\n` +
+      `Drained by scripts/drain-blocked-empty.mjs${runId ? ` (run ${runId})` : ''}.`
+    );
+  }
   return (
     `Automated strand drain (TRA-3541). This row was \`blocked\` with an EMPTY \`blockedBy\` and carried an ` +
     `active \`${f.recoveryKind}\` recovery action, which is the platform's terminal-run recovery writing the ` +
@@ -316,21 +534,36 @@ export function planDrain(result, { only = null, exclude = carveOut } = {}) {
       });
       continue;
     }
-    rows.push({ f, action: ACTION.DRAIN, why: rep.why });
+    // TRA-4063 — the LAST gate before a row becomes writable, and the only one
+    // that decides WHICH status it gets. A row the class cannot decide leaves
+    // here, unwritten, and colours the exit.
+    const disp = classifyDisposition(f);
+    if (disp.klass === ROW_CLASS.UNCLASSIFIABLE) {
+      rows.push({ f, action: ACTION.SKIP_UNCLASSIFIABLE, disp, why: disp.why });
+      continue;
+    }
+    rows.push({ f, action: ACTION.DRAIN, disp, why: `${rep.why}\n           class ${disp.klass}: ${disp.why}` });
   }
 
   const by = (a) => rows.filter((r) => r.action === a);
+  const drainRows = by(ACTION.DRAIN);
   return {
     rows,
-    drain: by(ACTION.DRAIN),
+    drain: drainRows,
     counts: {
       findings: (result.findings || []).length,
       shape1: (result.findings || []).filter((f) => f.shape === SHAPE.EMPTY_BLOCKED_BY).length,
-      drain: by(ACTION.DRAIN).length,
+      drain: drainRows.length,
       excluded: by(ACTION.SKIP_EXCLUDED).length,
       shape2: by(ACTION.SKIP_SHAPE_2).length,
       ineligible: by(ACTION.SKIP_INELIGIBLE).length,
       notSelected: by(ACTION.SKIP_NOT_SELECTED).length,
+      // Broken out rather than folded into `drain`: a fire that dispositioned
+      // five routine spawns is a different event from one that restored five
+      // strands, and a single count renders them identically.
+      unclassifiable: by(ACTION.SKIP_UNCLASSIFIABLE).length,
+      suppressingLeaf: drainRows.filter((r) => r.disp.klass === ROW_CLASS.SUPPRESSING_LEAF).length,
+      durableStrand: drainRows.filter((r) => r.disp.klass === ROW_CLASS.DURABLE_STRAND).length,
     },
   };
 }
@@ -348,6 +581,9 @@ export const OUTCOME = {
   // TRA-4041 — a live run holds the row's checkout lock. Ours, not foreign;
   // transient, not a rejection. Retryable by the NEXT fire, not by this one.
   RUN_LOCKED: 'RUN_LOCKED',
+  // TRA-4063 — the class could not be decided, so no status is safe. Its own
+  // outcome and not WRITE_FAILED: nothing was rejected, nothing was attempted.
+  UNCLASSIFIABLE: 'UNCLASSIFIABLE',
 };
 
 const isBoundary403 = (err) => /\b403\b/.test(String(err?.message || err)) || /authorization boundary/i.test(String(err?.message || err));
@@ -382,9 +618,18 @@ const isRunLock409 = (err) => {
 export async function drainRow(transport, row, { apply = false, runId = null } = {}) {
   const f = row.f;
   const rep = f.repair;
+  const disp = row.disp || classifyDisposition(f);
   const steps = [];
+
+  // TRA-4063 — belt and braces. `planDrain` already routed UNCLASSIFIABLE rows
+  // away from here, but `drainRow` is exported and callable directly, and the
+  // one thing this class must never do is fall through to a default status.
+  if (disp.klass === ROW_CLASS.UNCLASSIFIABLE || !disp.status) {
+    return { outcome: OUTCOME.UNCLASSIFIABLE, steps, disp, why: disp.why };
+  }
+
   const send = async (step, fn, body) => {
-    const graded = gradeWriteBody(step, body);
+    const graded = gradeWriteBody(step, body, { klass: disp.klass });
     if (!graded.ok) {
       // Not a skip. The caller built a body this file does not sanction, which
       // is a code defect, and continuing would write it.
@@ -395,18 +640,42 @@ export async function drainRow(transport, row, { apply = false, runId = null } =
     return fn();
   };
 
+  // Best-effort, and BEFORE the comment so the audit trail can name it. Failing
+  // this read is not failing the row: the class was decided off the issue
+  // payload, so an unreachable routines route degrades one sentence and nothing
+  // else. Pinned that way deliberately -- a report read that can veto a write
+  // is a fourth unknown, and unknowns here refuse to write.
+  let origin = null;
+  if (disp.klass === ROW_CLASS.SUPPRESSING_LEAF && f.originId && typeof transport.getRoutine === 'function') {
+    try {
+      const r = await transport.getRoutine(f.originId);
+      const body = r && r.routine ? r.routine : r;
+      origin = body
+        ? {
+            title: body.title || body.name || null,
+            status: body.status || null,
+            concurrencyPolicy: body.concurrencyPolicy || null,
+            assigneeAgentId: body.assigneeAgentId || null,
+          }
+        : { unread: 'the routines route returned nothing' };
+    } catch (err) {
+      origin = { unread: String(err?.message || err).slice(0, 160) };
+    }
+  }
+
   try {
-    await send('comment', () => transport.postComment(f.id, { body: drainComment(f, runId) }), {
-      body: drainComment(f, runId),
+    await send('comment', () => transport.postComment(f.id, { body: drainComment(f, runId, disp, origin) }), {
+      body: drainComment(f, runId, disp, origin),
     });
     // The LAST write this row will accept: it mints a live status, which spawns
     // a run, which takes the checkout lock (TRA-4041). Nothing follows it.
-    await send('status', () => transport.patchIssue(f.id, { status: rep.status }), { status: rep.status });
+    await send('status', () => transport.patchIssue(f.id, { status: disp.status }), { status: disp.status });
   } catch (err) {
     if (isRunLock409(err)) {
       return {
         outcome: OUTCOME.RUN_LOCKED,
         steps,
+        disp,
         why:
           `409 Issue run ownership conflict on the \`${steps[steps.length - 1]?.step || 'first'}\` step -- a live run ` +
           'already holds this row\'s checkout lock, so this actor\'s run id does not match its executionRunId. The row ' +
@@ -418,6 +687,7 @@ export async function drainRow(transport, row, { apply = false, runId = null } =
       return {
         outcome: OUTCOME.FOREIGN,
         steps,
+        disp,
         why:
           `403 outside this actor's authorization boundary on the \`${steps[steps.length - 1]?.step || 'first'}\` ` +
           `step. This row is currently assigned to ${f.assigneeName || f.assigneeAgentId || 'nobody'} and only that ` +
@@ -425,10 +695,17 @@ export async function drainRow(transport, row, { apply = false, runId = null } =
           "arm's row, not a retry.",
       };
     }
-    return { outcome: OUTCOME.WRITE_FAILED, steps, why: String(err?.message || err) };
+    return { outcome: OUTCOME.WRITE_FAILED, steps, disp, why: String(err?.message || err) };
   }
 
-  if (!apply) return { outcome: OUTCOME.PLANNED, steps, why: 'dry run -- nothing was sent' };
+  if (!apply) {
+    return {
+      outcome: OUTCOME.PLANNED,
+      steps,
+      disp,
+      why: `dry run -- nothing was sent. Class ${disp.klass}, would write \`${disp.status}\``,
+    };
+  }
 
   // Verify by VALUE, not by the 2xx. A PATCH that returns 200 and does not
   // stick is the failure mode a status-code check cannot see.
@@ -439,6 +716,7 @@ export async function drainRow(transport, row, { apply = false, runId = null } =
     return {
       outcome: OUTCOME.NOT_VERIFIED,
       steps,
+      disp,
       why: `both writes returned ok but the re-read threw (${String(err?.message || err)}) -- the repair is UNPROVEN`,
     };
   }
@@ -453,7 +731,21 @@ export async function drainRow(transport, row, { apply = false, runId = null } =
   // fire FAILED over a drain that worked. What must never be true afterwards is
   // that the row is still `blocked`, or still carries a live recovery action.
   if (after.status === 'blocked') {
-    problems.push(`status is \`${after.status}\`, expected anything but \`blocked\` (asked for \`${rep.status}\`)`);
+    problems.push(`status is \`${after.status}\`, expected anything but \`blocked\` (asked for \`${disp.status}\`)`);
+  }
+  // TRA-4063 — and for a SUPPRESSING LEAF that is not enough. The point of the
+  // `done` branch is TERMINALITY: the origin routine treats any non-terminal
+  // leaf as still running. A row that read back `todo` or `in_progress` here
+  // would clear the recovery action and leave the routine off -- a green drain
+  // over an unfixed defect, which is the failure this whole class is about. So
+  // this class asserts the LITERAL terminal status, unlike the durable one
+  // where a queue pickup to `in_progress` is a clean drain (TRA-3758).
+  if (disp.klass === ROW_CLASS.SUPPRESSING_LEAF && !TERMINAL_STATUSES.has(after.status)) {
+    problems.push(
+      `SUPPRESSING LEAF read back \`${after.status}\`, which is NOT terminal (${[...TERMINAL_STATUSES].join('/')}). ` +
+        'The strand may have cleared, but the origin routine still sees an open execution issue and stays OFF. ' +
+        'Terminality IS the repair for this class, so a non-terminal read-back is NOT a drain',
+    );
   }
   if (!Object.prototype.hasOwnProperty.call(after, 'activeRecoveryAction')) {
     problems.push(
@@ -476,14 +768,16 @@ export async function drainRow(transport, row, { apply = false, runId = null } =
   } else if (Array.isArray(after.blockedBy) && after.blockedBy.length !== 0) {
     problems.push(`blockedBy is no longer empty (${after.blockedBy.length} entr(ies)) -- this row was re-blocked`);
   }
-  if (problems.length) return { outcome: OUTCOME.NOT_VERIFIED, steps, why: problems.join('; ') };
+  if (problems.length) return { outcome: OUTCOME.NOT_VERIFIED, steps, disp, why: problems.join('; ') };
 
   return {
     outcome: OUTCOME.DRAINED,
     steps,
+    disp,
     why:
-      `verified by re-read: status \`${after.status}\`, activeRecoveryAction null. Return owner ` +
-      `${rep.assigneeAgentId} was READ and NOT written (TRA-4041).`,
+      `verified by re-read: status \`${after.status}\`, activeRecoveryAction null. Class ${disp.klass}, wrote ` +
+      `\`${disp.status}\`${disp.klass === ROW_CLASS.SUPPRESSING_LEAF ? ' (the TRA-4063 `done` branch, taken)' : ''}. ` +
+      `Return owner ${rep.assigneeAgentId} was READ and NOT written (TRA-4041).`,
   };
 }
 
@@ -522,9 +816,16 @@ export function verdictFor({ blind, plan, results }) {
   // RUN_LOCKED joins FOREIGN here rather than FAILED (TRA-4041): nothing was
   // half-written and nothing is broken, but a row was not drained and the next
   // fire has to pick it up, so it must not read as a clean DRAINED either.
+  // TRA-4063 — UNCLASSIFIABLE joins them for the same reason. A row whose class
+  // could not be decided is a row nobody has drained, and the SAFE refusal is
+  // only safe if it is also LOUD: a silent skip would read as a clean fire on a
+  // board that still has the strand.
   const unowned =
     plan.counts.ineligible +
-    results.filter((r) => r.outcome === OUTCOME.FOREIGN || r.outcome === OUTCOME.RUN_LOCKED).length;
+    plan.counts.unclassifiable +
+    results.filter(
+      (r) => r.outcome === OUTCOME.FOREIGN || r.outcome === OUTCOME.RUN_LOCKED || r.outcome === OUTCOME.UNCLASSIFIABLE,
+    ).length;
   if (unowned > 0) return 'REMAINDER';
   // ⛔ The whole point of a separate verdict here. An empty cohort exercised
   // NOTHING; folding it into a success verdict is how a fleet of green logs
@@ -547,7 +848,16 @@ export async function run(transport, opts = {}) {
     // buys nothing on a cohort this size and makes a partial failure harder to
     // read back.
     const r = await drainRow(transport, row, { apply, runId: opts.runId || null });
-    results.push({ ...r, identifier: row.f.identifier || row.f.id, id: row.f.id, repair: row.f.repair });
+    results.push({
+      ...r,
+      identifier: row.f.identifier || row.f.id,
+      id: row.f.id,
+      repair: row.f.repair,
+      // TRA-4063 — carried so the report can NAME the routine each `done` keeps
+      // alive without re-reading the sweep.
+      originId: row.f.originId || null,
+      originKind: row.f.originKind || null,
+    });
   }
 
   return {
@@ -578,7 +888,16 @@ export function renderDrain(out) {
   L.push(`cohort    ${c.shape1} shape-1 (empty blockedBy) of ${c.findings} strand finding(s)`);
   L.push(
     `plan      ${c.drain} drainable | ${c.ineligible} ineligible | ${c.excluded} excluded | ` +
-      `${c.shape2} shape-2 (out of scope)${c.notSelected ? ` | ${c.notSelected} not selected` : ''}`,
+      `${c.shape2} shape-2 (out of scope)${c.notSelected ? ` | ${c.notSelected} not selected` : ''}` +
+      `${c.unclassifiable ? ` | ${c.unclassifiable} UNCLASSIFIABLE` : ''}`,
+  );
+  // TRA-4063 — printed on EVERY fire, including the fires where it is 0. The
+  // split is the thing that was missing when the drain planned `-> todo` for a
+  // live detector's spawn, and a count that only appears when it is non-zero
+  // teaches nobody to look for it.
+  L.push(
+    `class     ${c.durableStrand} DURABLE STRAND -> todo | ${c.suppressingLeaf} SUPPRESSING LEAF -> done ` +
+      `(TRA-4063: a routine_execution spawn gating nothing; todo would leave its routine OFF)`,
   );
   L.push('');
 
@@ -594,9 +913,35 @@ export function renderDrain(out) {
   for (const r of out.results) {
     const mark =
       r.outcome === OUTCOME.DRAINED ? 'DRAINED ' : r.outcome === OUTCOME.PLANNED ? 'WOULD   ' : `${r.outcome} `;
-    L.push(`${mark} ${r.identifier}  -> todo  (return owner ${r.repair.assigneeAgentId} READ, not written -- TRA-4041)`);
+    // ⛔ The target status is READ off the row's class, never spelled here.
+    // This line was the literal string "-> todo" until TRA-4063, which meant a
+    // report control could assert the drain's own intent and still be blind to
+    // the one row where that intent was wrong.
+    const klass = r.disp ? r.disp.klass : 'UNKNOWN';
+    const target = r.disp && r.disp.status ? r.disp.status : 'NOTHING';
+    L.push(
+      `${mark} ${r.identifier}  -> ${target}  [${klass}]  ` +
+        `(return owner ${r.repair.assigneeAgentId} READ, not written -- TRA-4041)`,
+    );
     L.push(`         ${r.why}`);
     for (const s of r.steps) L.push(`         ${s.sent ? 'sent' : 'plan'} ${s.step}  ${JSON.stringify(s.body).slice(0, 120)}`);
+  }
+
+  // TRA-4063 — the SUPPRESSING LEAF roll-up. Named as a class, with the routine
+  // each write is keeping alive, because "an automated writer sent `done`" is
+  // the line a reader must be able to find without reconstructing it from the
+  // per-row bodies above.
+  const leaves = out.results.filter((r) => r.disp && r.disp.klass === ROW_CLASS.SUPPRESSING_LEAF);
+  if (leaves.length) {
+    L.push('');
+    L.push(`SUPPRESSING LEAF  ${leaves.length} row(s) took the \`done\` branch, NOT \`todo\` (TRA-4041 / TRA-4063).`);
+    L.push('         Each is a per-fire `routine_execution` spawn whose `blocks` was READ and is EMPTY. Resting one');
+    L.push('         non-terminal switches its OWN routine off while nextRunAt keeps advancing and every census');
+    L.push('         reads it ARMED. On 2026-08-26T12:30Z this drain planned `-> todo` for TRA-4058, the spawn of');
+    L.push('         the `skip_if_active` TRA-4017 armed-liveness detector; only a hand catch stopped it.');
+    for (const r of leaves) {
+      L.push(`         ${r.identifier}  origin routine ${r.originId || r.repair?.originId || '(none on payload)'}`);
+    }
   }
 
   const skipped = out.plan.rows.filter((r) => r.action !== ACTION.DRAIN);
@@ -628,8 +973,41 @@ export function renderDrain(out) {
 const AGENT_SELF = 'agent-cto';
 const AGENT_BACK = 'agent-qt';
 
-/** A blocked+empty row carrying a live stranded_assigned_issue payload. */
-const strandRow = (id, ident, { kind = 'stranded_assigned_issue', previousStatus = 'in_progress', returnOwner = AGENT_BACK, assignee = AGENT_SELF } = {}) => ({
+const ROUTINE_ID = '82daa7b2-fake';
+
+/**
+ * A blocked+empty row carrying a live stranded_assigned_issue payload.
+ *
+ * TRA-4063 — `originKind` and `blocks` are now part of the DEFAULT shape,
+ * because they are part of the live shape: measured 2026-08-26, the item route
+ * populates `originKind` on every row (`manual`, `routine_execution` and
+ * `task_watchdog_product_bug` all observed) and carries `blocks` as an array.
+ * A fake that omitted them made every control take the UNCLASSIFIABLE branch,
+ * which would have hidden the drain path behind a suite that still read green.
+ * The unknowns are exercised by controls that pass `originKind: undefined` /
+ * `blocks: undefined` EXPLICITLY, so the absence is the case under test rather
+ * than an accident of the fixture.
+ */
+const strandRow = (
+  id,
+  ident,
+  {
+    kind = 'stranded_assigned_issue',
+    previousStatus = 'in_progress',
+    returnOwner = AGENT_BACK,
+    assignee = AGENT_SELF,
+    originKind = 'manual',
+    originId = null,
+    blocks = [],
+    // ⛔ NOT `originKind: undefined`. A JS default parameter fires on
+    // `undefined`, so passing it would silently hand the fixture back the
+    // DEFAULT `manual` -- the control would read green while testing the exact
+    // opposite of the absent-key case it names. Caught by this suite on the
+    // first run (TRA-4063). The omission has to be its own flag.
+    omitOriginKind = false,
+    omitBlocks = false,
+  } = {},
+) => ({
   id,
   identifier: ident,
   title: `strand ${ident}`,
@@ -637,6 +1015,9 @@ const strandRow = (id, ident, { kind = 'stranded_assigned_issue', previousStatus
   assigneeAgentId: assignee,
   parentId: null,
   blockedBy: [],
+  ...(omitOriginKind ? {} : { originKind }),
+  originId,
+  ...(omitBlocks ? {} : { blocks }),
   activeRecoveryAction: {
     kind,
     cause: 'issue_continuation_needed',
@@ -658,6 +1039,9 @@ const shape2Row = (id, ident) => ({
   status: 'blocked',
   assigneeAgentId: AGENT_SELF,
   parentId: null,
+  originKind: 'manual',
+  originId: null,
+  blocks: [],
   blockedBy: [{ id: 'g1', identifier: 'TRA-7001', status: 'done', assigneeAgentId: AGENT_SELF }],
   activeRecoveryAction: null,
 });
@@ -668,11 +1052,25 @@ const shape2Row = (id, ident) => ({
  */
 function fakeTransport(
   rows,
-  { pending = {}, on403 = null, on409 = null, lieOnPatch = false, keepRecovery = false, total = 2350 } = {},
+  {
+    pending = {},
+    on403 = null,
+    on409 = null,
+    lieOnPatch = false,
+    keepRecovery = false,
+    total = 2350,
+    routineUnread = false,
+    // TRA-4063 — model a queue that picks the row up and flips it, per
+    // TRA-3758. On a DURABLE strand that is still a clean drain; on a
+    // SUPPRESSING LEAF it means the leaf never went terminal and the routine is
+    // still off, which must NOT read as DRAINED.
+    flipTo = null,
+  } = {},
 ) {
   // TRA-4041 — ids whose checkout lock has been taken by the run the status
   // PATCH spawned. Once in here, every further PATCH on that row 409s.
   const locked = new Set();
+  const written = new Set();
   const writes = [];
   const byId = new Map(rows.map((r) => [r.id, JSON.parse(JSON.stringify(r))]));
   const filler = Array.from({ length: total - rows.length }, (_, i) => ({
@@ -697,7 +1095,23 @@ function fakeTransport(
     getIssue: async (id) => {
       const r = byId.get(id);
       if (!r) throw new Error(`no such issue ${id}`);
-      return JSON.parse(JSON.stringify(r));
+      const copy = JSON.parse(JSON.stringify(r));
+      if (flipTo && written.has(id)) copy.status = flipTo;
+      return copy;
+    },
+    // TRA-4063 — the routines route, modelled with the two fields the audit
+    // trail names. It is deliberately allowed to THROW: the class must not
+    // depend on it, and the control that proves it degrades to UNREAD without
+    // changing the write is the one that pins that.
+    getRoutine: async (id) => {
+      if (routineUnread) throw new Error(`HTTP 500 on GET /api/routines/${id}`);
+      return {
+        id,
+        title: 'TRA-4017 armed-liveness detector -- paused routines that read falsely ARMED',
+        status: 'active',
+        concurrencyPolicy: 'skip_if_active',
+        assigneeAgentId: AGENT_SELF,
+      };
     },
     getComments: async () => [],
     getInteractions: async (id) => Array.from({ length: pending[id] || 0 }, () => ({ status: 'pending' })),
@@ -724,6 +1138,7 @@ function fakeTransport(
       writes.push({ verb: 'PATCH', id, body });
       if (body.status) {
         locked.add(id);
+        written.add(id);
         // …and clear the recovery action, which is what the status write really
         // does and what the drain is verified on.
         if (!lieOnPatch && !keepRecovery) byId.get(id).activeRecoveryAction = null;
@@ -794,19 +1209,88 @@ const CONTROLS = [
   {
     name: 'NEVER a blocker key — gradeWriteBody REFUSES any body carrying blockedByIssueIds, on every step',
     unit: () => {
-      const a = gradeWriteBody('status', { status: 'todo', blockedByIssueIds: [] });
-      const b = gradeWriteBody('assignee', { assigneeAgentId: 'x', blockedBy: [] });
-      const c = gradeWriteBody('status', { status: 'done' });
-      const d = gradeWriteBody('status', { status: 'in_progress' });
-      const e = gradeWriteBody('status', { status: 'todo' });
+      const D = { klass: ROW_CLASS.DURABLE_STRAND };
+      const a = gradeWriteBody('status', { status: 'todo', blockedByIssueIds: [] }, D);
+      const b = gradeWriteBody('assignee', { assigneeAgentId: 'x', blockedBy: [] }, D);
+      const c = gradeWriteBody('status', { status: 'done' }, D);
+      const d = gradeWriteBody('status', { status: 'in_progress' }, D);
+      const e = gradeWriteBody('status', { status: 'todo' }, D);
+      // The blocker-key ban outranks the class gate: it must still fire on a
+      // SUPPRESSING LEAF body, where `done` is otherwise legal.
+      const g = gradeWriteBody('status', { status: 'done', blockedByIssueIds: [] }, { klass: ROW_CLASS.SUPPRESSING_LEAF });
       return {
         ok:
           !a.ok && /blocker write-key/.test(a.why) &&
           !b.ok && /blocker write-key/.test(b.why) &&
           !c.ok && /DESTROYS unrun work/.test(c.why) &&
           !d.ok && /re-strands the leaf/.test(d.why) &&
+          !g.ok && /blocker write-key/.test(g.why) &&
           e.ok,
-        detail: 'blockedByIssueIds refused, blockedBy refused, done refused, in_progress refused, todo allowed',
+        detail:
+          'blockedByIssueIds refused, blockedBy refused, done-on-durable refused, in_progress refused, ' +
+          'blocker key still refused on the SUPPRESSING LEAF body, todo allowed',
+      };
+    },
+  },
+  {
+    // TRA-4063, direction 1 of 2 at the wire. The class is what makes `done`
+    // legal, so it has to be impossible to reach `done` without one.
+    name: 'TRA-4063 CLASS GATE — `done` is reachable ONLY for a SUPPRESSING_LEAF, and `todo` is REFUSED for one',
+    unit: () => {
+      const noClass = gradeWriteBody('status', { status: 'todo' });
+      const noClassDone = gradeWriteBody('status', { status: 'done' });
+      const leafDone = gradeWriteBody('status', { status: 'done' }, { klass: ROW_CLASS.SUPPRESSING_LEAF });
+      const leafTodo = gradeWriteBody('status', { status: 'todo' }, { klass: ROW_CLASS.SUPPRESSING_LEAF });
+      const durTodo = gradeWriteBody('status', { status: 'todo' }, { klass: ROW_CLASS.DURABLE_STRAND });
+      const durDone = gradeWriteBody('status', { status: 'done' }, { klass: ROW_CLASS.DURABLE_STRAND });
+      const bogus = gradeWriteBody('status', { status: 'done' }, { klass: 'SOMETHING_ELSE' });
+      return {
+        ok:
+          // an unclassified caller gets NEITHER status -- no inherited default
+          !noClass.ok && /carries no row class/.test(noClass.why) &&
+          !noClassDone.ok && /carries no row class/.test(noClassDone.why) &&
+          !bogus.ok && /carries no row class/.test(bogus.why) &&
+          // both directions of the real gate
+          leafDone.ok &&
+          !leafTodo.ok && /Only `done` is sanctioned for this class/.test(leafTodo.why) &&
+          durTodo.ok &&
+          !durDone.ok && /DESTROYS unrun work/.test(durDone.why),
+        detail:
+          'no-class: todo AND done both refused | SUPPRESSING_LEAF: done ok, todo REFUSED | ' +
+          'DURABLE_STRAND: todo ok, done REFUSED',
+      };
+    },
+  },
+  {
+    // TRA-4063, the classifier itself. Both directions and BOTH unknowns, on
+    // the pure function, so the branches are pinned independently of any
+    // transport that might not reach them.
+    name: 'TRA-4063 CLASSIFIER — spawn-gating-nothing => done; durable => todo; both unknowns => NEITHER',
+    unit: () => {
+      const c = (o) => classifyDisposition({ blocksIdentifiers: [], ...o });
+      const leaf = c({ originKind: 'routine_execution', blocksKnown: true, blocksIdentifiers: [] });
+      const durable = c({ originKind: 'manual', blocksKnown: true, blocksIdentifiers: [] });
+      const watchdog = c({ originKind: 'task_watchdog_product_bug', blocksKnown: true, blocksIdentifiers: [] });
+      // a spawn that DOES gate something is durable: it has a dependent, so
+      // `done` would bury it and `todo` correctly re-queues it
+      const gating = c({ originKind: 'routine_execution', blocksKnown: true, blocksIdentifiers: ['TRA-1:todo'] });
+      // unknown 1 -- no originKind at all
+      const noOrigin = c({ originKind: null, blocksKnown: true, blocksIdentifiers: [] });
+      // unknown 2 -- a spawn whose `blocks` key was ABSENT (absent is not empty)
+      const noBlocks = c({ originKind: 'routine_execution', blocksKnown: false, blocksIdentifiers: [] });
+      return {
+        ok:
+          leaf.klass === ROW_CLASS.SUPPRESSING_LEAF && leaf.status === 'done' &&
+          durable.klass === ROW_CLASS.DURABLE_STRAND && durable.status === 'todo' &&
+          watchdog.klass === ROW_CLASS.DURABLE_STRAND && watchdog.status === 'todo' &&
+          gating.klass === ROW_CLASS.DURABLE_STRAND && gating.status === 'todo' &&
+          noOrigin.klass === ROW_CLASS.UNCLASSIFIABLE && noOrigin.status === null &&
+          /NO `originKind`/.test(noOrigin.why) &&
+          noBlocks.klass === ROW_CLASS.UNCLASSIFIABLE && noBlocks.status === null &&
+          /Absent is not empty/.test(noBlocks.why),
+        detail:
+          `spawn/gates-nothing=${leaf.status} | manual=${durable.status} | watchdog=${watchdog.status} | ` +
+          `spawn/gates-something=${gating.status} | no-originKind=${noOrigin.status} | no-blocks=${noBlocks.status}`,
       };
     },
   },
@@ -819,15 +1303,41 @@ const CONTROLS = [
     },
   },
   {
-    name: 'The REAL comment body this script ships is ASCII-clean (the template itself is under control)',
+    name: 'The REAL comment bodies this script ships are ASCII-clean — BOTH templates (durable and suppressing leaf)',
     unit: () => {
-      const f = {
+      const base = {
         identifier: 'TRA-8001',
         recoveryKind: 'stranded_assigned_issue',
+        blocksIdentifiers: [],
         repair: { restoredFrom: 'in_progress', assigneeAgentId: AGENT_BACK, status: 'todo' },
       };
-      const g = gradeWriteBody('comment', { body: drainComment(f, 'run-1') });
-      return { ok: g.ok, detail: g.ok ? 'template is ASCII' : g.why };
+      const durable = { ...base, originKind: 'manual', blocksKnown: true };
+      const leaf = { ...base, originKind: 'routine_execution', blocksKnown: true, originId: ROUTINE_ID };
+      const a = gradeWriteBody('comment', { body: drainComment(durable, 'run-1') });
+      // TRA-4063 — and the leaf template in BOTH of its origin states: named,
+      // and UNREAD. A template that is only ASCII-clean on the happy path
+      // lands mojibake in the permanent audit trail on the day the route 500s.
+      const named = drainComment(leaf, 'run-1', classifyDisposition(leaf), {
+        title: 'TRA-4017 armed-liveness detector',
+        status: 'active',
+        concurrencyPolicy: 'skip_if_active',
+        assigneeAgentId: AGENT_SELF,
+      });
+      const b = gradeWriteBody('comment', { body: named });
+      const c = gradeWriteBody('comment', { body: drainComment(leaf, 'run-1', classifyDisposition(leaf), { unread: 'HTTP 500' }) });
+      const d = gradeWriteBody('comment', { body: drainComment(leaf, 'run-1', classifyDisposition(leaf), null) });
+      return {
+        ok:
+          a.ok && b.ok && c.ok && d.ok &&
+          // the leaf body must SAY it took the done branch and NAME the routine
+          /SUPPRESSING LEAF/.test(named) &&
+          /`done` BRANCH, taken deliberately/.test(named) &&
+          named.includes(ROUTINE_ID) &&
+          /concurrencyPolicy `skip_if_active`/.test(named) &&
+          // ...and must not claim `todo` anywhere as its own write
+          !/PATCH status -> `todo`/.test(named),
+        detail: a.ok && b.ok && c.ok && d.ok ? 'both templates ASCII; leaf names class, routine and policy' : (a.why || b.why || c.why || d.why),
+      };
     },
   },
   {
@@ -1023,15 +1533,22 @@ const CONTROLS = [
     // THIS is what stops it -- at the request body, before the transport.
     name: 'TRA-4041 BANNED STEP — gradeWriteBody REFUSES any assignee write, by step name AND by key',
     unit: () => {
-      const a = gradeWriteBody('assignee', { assigneeAgentId: AGENT_BACK });
-      const b = gradeWriteBody('status', { status: 'todo', assigneeAgentId: AGENT_BACK });
-      const c = gradeWriteBody('status', { status: 'todo' });
+      const D = { klass: ROW_CLASS.DURABLE_STRAND };
+      const a = gradeWriteBody('assignee', { assigneeAgentId: AGENT_BACK }, D);
+      const b = gradeWriteBody('status', { status: 'todo', assigneeAgentId: AGENT_BACK }, D);
+      const c = gradeWriteBody('status', { status: 'todo' }, D);
+      // the ban outranks the TRA-4063 class gate too, on the class where `done`
+      // is legal -- an assignee key must not ride in on the new branch
+      const d = gradeWriteBody('status', { status: 'done', assigneeAgentId: AGENT_BACK }, { klass: ROW_CLASS.SUPPRESSING_LEAF });
       return {
         ok:
           !a.ok && /409 Issue run ownership conflict/.test(a.why) &&
           !b.ok && /409 Issue run ownership conflict/.test(b.why) &&
+          !d.ok && /409 Issue run ownership conflict/.test(d.why) &&
           c.ok,
-        detail: 'assignee step refused, assignee key smuggled onto the status body refused, plain status allowed',
+        detail:
+          'assignee step refused, assignee key smuggled onto the status body refused, still refused on the ' +
+          'SUPPRESSING LEAF body, plain status allowed',
       };
     },
   },
@@ -1078,6 +1595,162 @@ const CONTROLS = [
     detail: (out) => out.results[0].why.slice(0, 110),
   },
   {
+    // THE control this ticket exists for, end to end, over the exact live shape
+    // of TRA-4058: a per-fire spawn of an active skip_if_active detector,
+    // gating nothing, resting blocked+empty. Before TRA-4063 this row was
+    // planned `-> todo`, which switches that detector OFF.
+    name: 'TRA-4063 SUPPRESSING LEAF — a routine_execution spawn gating nothing is written `done`, NEVER `todo`',
+    build: () =>
+      fakeTransport([strandRow('s1', 'TRA-4058', { originKind: 'routine_execution', originId: ROUTINE_ID, blocks: [] })]),
+    apply: true,
+    assert: (out, t) => {
+      const rendered = renderDrain(out).join('\n');
+      const status = t.writes.find((w) => w.body.status);
+      const comment = t.writes.find((w) => w.verb === 'POST');
+      return (
+        out.verdict === 'DRAINED' &&
+        out.results[0].outcome === OUTCOME.DRAINED &&
+        out.results[0].disp.klass === ROW_CLASS.SUPPRESSING_LEAF &&
+        t.writes.length === 2 &&
+        // the write itself -- `done`, and NOT `todo`
+        JSON.stringify(status.body) === '{"status":"done"}' &&
+        out.plan.counts.suppressingLeaf === 1 &&
+        out.plan.counts.durableStrand === 0 &&
+        // the class is NAMED in the report, with the routine it keeps alive
+        /SUPPRESSING LEAF/.test(rendered) &&
+        /-> done  \[SUPPRESSING_LEAF\]/.test(rendered) &&
+        rendered.includes(ROUTINE_ID) &&
+        // ...and the ledger says which branch it took
+        /`done` BRANCH, taken deliberately/.test(comment.body.body) &&
+        /concurrencyPolicy `skip_if_active`/.test(comment.body.body)
+      );
+    },
+    detail: (out, t) =>
+      `class ${out.results[0].disp.klass}, wrote ${JSON.stringify(t.writes.find((w) => w.body.status)?.body)}`,
+  },
+  {
+    // The negative direction, on the SAME transport. Without it, a classifier
+    // that returned SUPPRESSING_LEAF for everything would pass the control
+    // above and destroy every strand it touched.
+    name: 'TRA-4063 NEGATIVE — a durable `manual` strand still gets `todo`, and `done` is never sent for it',
+    build: () => fakeTransport([strandRow('s1', 'TRA-8001', { originKind: 'manual', blocks: [] })]),
+    apply: true,
+    assert: (out, t) =>
+      out.verdict === 'DRAINED' &&
+      out.results[0].disp.klass === ROW_CLASS.DURABLE_STRAND &&
+      JSON.stringify(t.writes.find((w) => w.body.status).body) === '{"status":"todo"}' &&
+      out.plan.counts.durableStrand === 1 &&
+      out.plan.counts.suppressingLeaf === 0 &&
+      t.writes.every((w) => w.body.status !== 'done'),
+    detail: (out, t) =>
+      `class ${out.results[0].disp.klass}, wrote ${JSON.stringify(t.writes.find((w) => w.body.status)?.body)}`,
+  },
+  {
+    // A spawn WITH a dependent. The discriminator is `blocks`, not
+    // `originKind` alone, and this is the row that proves the drain reads it.
+    name: 'TRA-4063 A SPAWN THAT GATES SOMETHING is durable — `done` would bury the dependent, so it gets `todo`',
+    build: () =>
+      fakeTransport([
+        strandRow('s1', 'TRA-8001', {
+          originKind: 'routine_execution',
+          originId: ROUTINE_ID,
+          blocks: [{ id: 'd1', identifier: 'TRA-9001', status: 'todo' }],
+        }),
+      ]),
+    apply: true,
+    assert: (out, t) =>
+      out.results[0].disp.klass === ROW_CLASS.DURABLE_STRAND &&
+      JSON.stringify(t.writes.find((w) => w.body.status).body) === '{"status":"todo"}' &&
+      /it GATES TRA-9001:todo/.test(out.results[0].disp.why),
+    detail: (out) => out.results[0].disp.why.slice(0, 120),
+  },
+  {
+    // UNKNOWN 1 of 2. Pinned to the SAFE side: no write at all, and LOUD.
+    name: 'TRA-4063 UNKNOWN — a row with NO originKind is written NEITHER status, and colours REMAINDER',
+    build: () => fakeTransport([strandRow('s1', 'TRA-8001', { omitOriginKind: true })]),
+    apply: true,
+    assert: (out, t) => {
+      const rendered = renderDrain(out).join('\n');
+      return (
+        t.writes.length === 0 &&
+        out.verdict === 'REMAINDER' &&
+        DRAIN_EXIT[out.verdict] === 1 &&
+        out.plan.counts.unclassifiable === 1 &&
+        out.plan.counts.drain === 0 &&
+        /SKIP_UNCLASSIFIABLE/.test(rendered) &&
+        /NO `originKind`/.test(rendered)
+      );
+    },
+    detail: (out) => `${out.verdict}, unclassifiable=${out.plan.counts.unclassifiable}, 0 writes`,
+  },
+  {
+    // UNKNOWN 2 of 2. The dangerous one: this row LOOKS like a spawn, and the
+    // one field that would tell us whether `done` buries a subtree is absent.
+    name: 'TRA-4063 UNKNOWN — a routine_execution row whose `blocks` key is ABSENT is written NEITHER status',
+    build: () =>
+      fakeTransport([
+        strandRow('s1', 'TRA-8001', { originKind: 'routine_execution', originId: ROUTINE_ID, omitBlocks: true }),
+      ]),
+    apply: true,
+    assert: (out, t) =>
+      t.writes.length === 0 &&
+      out.verdict === 'REMAINDER' &&
+      out.plan.counts.unclassifiable === 1 &&
+      /Absent is not empty/.test(out.plan.rows[0].why),
+    detail: (out) => out.plan.rows[0].why.slice(0, 110),
+  },
+  {
+    // The verify direction for the new class. `done` is only a repair if it
+    // STUCK as terminal -- a leaf that reads back `todo` cleared the strand and
+    // left the routine off, which is a green log over the unfixed defect.
+    name: 'TRA-4063 VERIFY — a SUPPRESSING LEAF that reads back NON-TERMINAL is NOT_VERIFIED, never DRAINED',
+    build: () =>
+      fakeTransport(
+        [strandRow('s1', 'TRA-4058', { originKind: 'routine_execution', originId: ROUTINE_ID, blocks: [] })],
+        { flipTo: 'in_progress' },
+      ),
+    apply: true,
+    assert: (out) =>
+      out.verdict === 'FAILED' &&
+      DRAIN_EXIT[out.verdict] === 2 &&
+      out.results[0].outcome === OUTCOME.NOT_VERIFIED &&
+      /NOT terminal/.test(out.results[0].why) &&
+      /stays OFF/.test(out.results[0].why),
+    detail: (out) => out.results[0].why.slice(0, 130),
+  },
+  {
+    // ...and the SAME flip on a DURABLE row is still a clean drain (TRA-3758).
+    // Without this pair, the assertion above could just be "always require
+    // done" and nobody would notice it had re-broken the durable class.
+    name: 'TRA-4063 VERIFY — the SAME `in_progress` read-back on a DURABLE row is still DRAINED (TRA-3758 stands)',
+    build: () => fakeTransport([strandRow('s1', 'TRA-8001', { originKind: 'manual' })], { flipTo: 'in_progress' }),
+    apply: true,
+    assert: (out) => out.verdict === 'DRAINED' && out.results[0].outcome === OUTCOME.DRAINED,
+    detail: (out) => out.results[0].why.slice(0, 110),
+  },
+  {
+    // The routine read is REPORT-ONLY. If it could veto, an unreachable
+    // routines route would become a third unknown and silently shrink the
+    // cohort -- so it must degrade to UNREAD and ship the same status.
+    name: 'TRA-4063 ORIGIN READ IS NOT A GATE — a routines route that 500s still writes `done`, and says UNREAD',
+    build: () =>
+      fakeTransport(
+        [strandRow('s1', 'TRA-4058', { originKind: 'routine_execution', originId: ROUTINE_ID, blocks: [] })],
+        { routineUnread: true },
+      ),
+    apply: true,
+    assert: (out, t) => {
+      const comment = t.writes.find((w) => w.verb === 'POST');
+      return (
+        out.verdict === 'DRAINED' &&
+        JSON.stringify(t.writes.find((w) => w.body.status).body) === '{"status":"done"}' &&
+        /UNREAD/.test(comment.body.body) &&
+        /HTTP 500/.test(comment.body.body)
+      );
+    },
+    detail: () => 'routine unread => comment says UNREAD, the `done` write is unchanged',
+  },
+  {
     // TRA-3758, live: the write does not always STORE `todo`.
     name: 'TRA-4041 VERIFY — a row the queue picks up reads back `in_progress`; recovery cleared => still DRAINED',
     build: () => {
@@ -1103,6 +1776,11 @@ async function selftest() {
   let failed = 0;
   const seenVerdicts = new Set();
   const seenOutcomes = new Set();
+  // TRA-4063 — the classes get their own reachability set. A suite in which
+  // every control happens to run over durable rows proves the durable branch
+  // and nothing else, which is precisely the state this file was in the day it
+  // planned `-> todo` for a live detector's spawn.
+  const seenClasses = new Set();
 
   for (const c of CONTROLS) {
     let ok = false;
@@ -1116,7 +1794,11 @@ async function selftest() {
         const t = c.build();
         const out = await run(t, { apply: c.apply, ...(c.opts || {}) });
         seenVerdicts.add(out.verdict);
-        for (const r of out.results) seenOutcomes.add(r.outcome);
+        for (const r of out.results) {
+          seenOutcomes.add(r.outcome);
+          if (r.disp) seenClasses.add(r.disp.klass);
+        }
+        for (const r of out.plan ? out.plan.rows : []) if (r.disp) seenClasses.add(r.disp.klass);
         ok = await c.assert(out, t);
         detail = c.detail ? c.detail(out, t) : '';
       }
@@ -1132,9 +1814,11 @@ async function selftest() {
   // or the suite is smaller than it looks.
   const wantVerdicts = ['VACUOUS', 'DRAINED', 'REMAINDER', 'FAILED', 'BLIND'];
   const wantOutcomes = [OUTCOME.DRAINED, OUTCOME.PLANNED, OUTCOME.FOREIGN, OUTCOME.NOT_VERIFIED, OUTCOME.RUN_LOCKED];
+  const wantClasses = [ROW_CLASS.DURABLE_STRAND, ROW_CLASS.SUPPRESSING_LEAF, ROW_CLASS.UNCLASSIFIABLE];
   for (const [label, want, seen] of [
     ['verdict', wantVerdicts, seenVerdicts],
     ['row outcome', wantOutcomes, seenOutcomes],
+    ['row class', wantClasses, seenClasses],
   ]) {
     const missing = want.filter((v) => !seen.has(v));
     if (missing.length) failed += 1;
@@ -1144,7 +1828,7 @@ async function selftest() {
     );
   }
 
-  console.log(`\n${CONTROLS.length + 2 - failed}/${CONTROLS.length + 2} controls pass`);
+  console.log(`\n${CONTROLS.length + 3 - failed}/${CONTROLS.length + 3} controls pass`);
   return failed === 0 ? 0 : 1;
 }
 
@@ -1203,6 +1887,12 @@ export function liveTransport() {
     getIssuesPage: async ({ limit, offset }) =>
       unwrap(await get(`${BASE}/api/companies/${CO}/issues?limit=${limit}&offset=${offset}`), 'issues'),
     getIssue: async (id) => get(`${BASE}/api/issues/${id}`),
+    // TRA-4063 — report-only, and the FULL uuid off `originId`. The short-id
+    // form of this route 500s; the uuid form answered 200 with `title`,
+    // `status`, `concurrencyPolicy` and `assigneeAgentId` when measured
+    // 2026-08-26 against routine 82daa7b2. Nothing here is a write gate: if it
+    // throws, the audit comment says UNREAD and the same status still ships.
+    getRoutine: async (id) => get(`${BASE}/api/routines/${id}`),
     getComments: async (id) => unwrap(await get(`${BASE}/api/issues/${id}/comments`), 'comments'),
     getInteractions: async (id) => unwrap(await get(`${BASE}/api/issues/${id}/interactions`), 'interactions'),
     postComment: async (id, body) => json('POST', `${BASE}/api/issues/${id}/comments`, body),

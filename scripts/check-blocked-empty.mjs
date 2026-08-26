@@ -891,13 +891,25 @@ export function deriveRestoreTarget({ item, blockers, pendingInteractions }) {
  * and the drain, which knows nothing about routine spawns, writes `todo` to
  * everything.
  *
- * ⛔ This is a REPORT, not a write. The correct disposition is `done`, and
- * `done` is banned in the automated writer for a good reason (it destroys unrun
- * work if the class is ever misjudged). Widening an unattended twice-daily
- * writer's authority to include `done` is a bigger decision than naming the
- * class, so this names it and prints the one step, for the routine's OWNER to
- * run. Conservative on both unknowns: an absent `blocks` key reads as "gates
- * something" (do not touch), never as empty.
+ * Not only `coalesce_if_active`. TRA-4058's origin routine 82daa7b2 is
+ * `skip_if_active`, where the later fire is DROPPED rather than merged — same
+ * end state, one degree worse, because a coalesced fire at least runs once.
+ * The rule keys on the SHAPE of the row, not on the policy, so it catches both
+ * without having to read the routine at all.
+ *
+ * ⛔ THIS PREDICATE NOW AUTHORISES A WRITE (TRA-4063, 2026-08-26). It was a
+ * report-only class for exactly one day, on the reasoning that widening an
+ * unattended writer to send `done` was the routine owner's call. The 08-26T12:30Z
+ * drain fire settled that: it planned `-> todo` for TRA-4058 and only a hand
+ * catch stopped it, so the report-only version was strictly worse than no class
+ * at all — it named the harm in the log while the sibling script did it. The
+ * drain consumes THIS function (`drain-blocked-empty.mjs`), so there is one
+ * predicate and two readers, and `done` is unreachable for any row it rejects.
+ *
+ * Conservative on both unknowns: an absent `blocks` key reads as "gates
+ * something" (do not touch), never as empty, and an absent `originKind` reads as
+ * "not known to be durable either" — the drain refuses BOTH statuses on those
+ * rows rather than falling back to the generic one.
  */
 export function suppressesOwnRoutine(f) {
   return f.originKind === 'routine_execution' && f.blocksKnown === true && f.blocksIdentifiers.length === 0;
@@ -1015,6 +1027,16 @@ export function classifyIssue(item, roster, { graph = null, now = null } = {}) {
     // Read for the suppressing-leaf rule. `routine_execution` is a per-fire
     // spawn; anything else is durable work.
     originKind: item.originKind || null,
+    // ⛔ ABSENT IS NOT `manual`, exactly as absent is not empty one field up.
+    // `originKind || null` collapses "the route did not send the key" into
+    // "the value is null", and the drain writes a DIFFERENT status per class
+    // (TRA-4063), so the two have to stay readable apart at the decision.
+    originKnown: Object.prototype.hasOwnProperty.call(item, 'originKind') && !!item.originKind,
+    // WHICH routine spawned it. Not a classification input — the class is
+    // decided by `originKind` + `blocks` off this same payload — but the drain
+    // has to NAME the routine it is keeping alive, and a report that says
+    // "some routine" is not auditable.
+    originId: item.originId || null,
     // Filled in by sweep() once the interaction route has been read. A finding
     // that never got there keeps `null` (= unknown), which SUPPRESSES any
     // demoting target rather than asserting there is no card.
@@ -1430,8 +1452,12 @@ export function renderReport(result) {
             'the ONE row class where the generic restore is actively harmful.',
         );
         L.push(
-          '       NOT written by the drain, deliberately: `done` destroys unrun work if the class is ever misjudged, ' +
-            "and widening an unattended twice-daily writer to send it is the routine owner's call, not this script's.",
+          '       WRITTEN BY THE DRAIN as of TRA-4063 (2026-08-26). Until then this line said "not written, ' +
+            'deliberately" and the drain planned `todo` for this class with no discrimination at all -- so the ' +
+            'fire of 2026-08-26T12:30Z planned `-> todo` for TRA-4058, the per-fire spawn of the `skip_if_active` ' +
+            'TRA-4017 armed-liveness detector, which would have switched that detector OFF. The `done` authority ' +
+            'is scoped to THIS class and to nothing else, and both unknowns (no `originKind`, unreadable `blocks`) ' +
+            'refuse to write at all rather than fall back to `todo`.',
         );
       }
       // The cause branch and the anchor verdict. Both are here because both were
