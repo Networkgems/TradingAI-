@@ -131,6 +131,9 @@ import {
 import { selectWeeklyPcs } from '@trading-app/engine';
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd, liveOptionTestAggregateHeadroomSignedUsd, resolveLiveOptionTestFleetRiskFraction, resolveLiveOptionTestBookAggregateCapUsd, sumLiveOtmFleetCapitalUsd, resolveEffectiveFleetRiskFraction, resolveLiveOtmSizingBasisUsd, sumLiveOtmFleetAtRiskUsd, resolveLiveOtmAdmissibleEntryUsd, fitsLiveOtmReachableBound, foldUnsettledLivePremiumUsd, resolveSettledAvailableCashUsd, isLivePremiumUnsettled } from './option-exec-flag.js';
 import type { LiveOtmAdmissibleBoundBy } from './option-exec-flag.js';
+// TRA-3997 (parent TRA-3703) — freeze the order site's admission reading onto
+// the row it is about to open. See the OTM bounded-test site below.
+import { buildOptionAdmissionStamp } from './option-exec-flag.js';
 import type { LiveOtmFleetCapitalRow, LiveOtmFleetSizingReason, UnsettledLivePremiumFill } from './option-exec-flag.js';
 // TRA-3879 — the cross-engine balance READ that makes `Σ B_i ≤ A` structural.
 // A read of a derived scalar, not the shared mutable accumulator TRA-3445
@@ -11432,6 +11435,15 @@ export class SignalEngine {
             filledPrice: outcome.avgFillPrice,
             fees: null,
             orderId: outcome.orderId,
+            // TRA-3997 — THE BOUND SIDE OF THE ENTRY DECISION, beside the price
+            // side. Copied VERBATIM from the row (the OTM order site froze it
+            // before the paper open, so `openPremiumAtRiskUsd` is the PRE-order
+            // fold). A sleeve that never consulted the reachable bound (RV,
+            // directional) has no reading to keep and says so explicitly —
+            // `not_evaluated_on_path`, never a fabricated stamp and never an
+            // omitted key, so ABSENT keeps meaning "written before TRA-3997".
+            admission: opened.admission ?? null,
+            admissionReason: opened.admission ? null : 'not_evaluated_on_path',
           });
         }
         const midStr = outcome.mid == null ? 'n/a' : `$${outcome.mid.toFixed(2)}`;
@@ -12620,6 +12632,37 @@ export class SignalEngine {
             continue;
           }
 
+          // ── TRA-3997 — KEEP THE READING THE ORDER SITE JUST SAID YES ON ─────
+          //
+          // Everything above compared `testNotional` against a cap, a basis, an
+          // at-risk fold and a fleet operand — and then threw all four away. The
+          // fill row kept the PRICE side (`submittedLimit`, `askAtSubmit`,
+          // `filledPrice`, both slippages) and nothing about the BOUND side, so
+          // "was this order admitted inside its headroom?" was permanently
+          // unanswerable for every live order this sleeve has placed. Measured
+          // 2026-08-25 on `07cc4ba43af6`: `v0nni` at `headroomSignedUsd −0.35`
+          // after two fills ten seconds apart, and the tape could not say
+          // whether that was a commission shrinking the cap under an open row
+          // or an over-admission against a stale denominator.
+          //
+          // Frozen HERE, before `openOptionFromCandidate`, so `atRisk.usd` is
+          // the PRE-order fold by construction — the same figure the cap, the
+          // basis and `admissible` were derived from (AC2). It rides the setup
+          // into the paper open, which puts it on the row at birth and on the
+          // journal `open` line as the same object; the mirror copies it onto
+          // the fee/slippage fill record. Instrumentation only (AC6): nothing
+          // below reads it back.
+          const admissionStamp = buildOptionAdmissionStamp({
+            admissible,
+            openPremiumAtRiskUsd: atRisk.usd,
+            capUsd: aggregateCapUsd,
+            phiEff: fleetSizing.phiEffective,
+            sizingBasisUsd: aggregateBasisUsd,
+            fleetCapUsd,
+            entryNotionalUsd: testNotional,
+            at: Date.now(),
+          });
+
           const underlyingSpotLive =
             typeof result.spot === 'number' && result.spot > 0 ? result.spot : undefined;
           const otmLiveJournalSetup: OptionTradeJournalSetup = {
@@ -12629,6 +12672,8 @@ export class SignalEngine {
             sentiment: null,
             sentimentIcBand: null,
             agentConviction: null,
+            // TRA-3997 — see `admissionStamp` above.
+            admission: admissionStamp,
             // TRA-2333 — the bounded-live test passes an explicit contract-count
             // override, which bypasses the sized-contract path entirely, so no
             // throttle term reaches this ticket.

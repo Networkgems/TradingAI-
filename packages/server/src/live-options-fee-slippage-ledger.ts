@@ -32,6 +32,8 @@
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import type { TradierTradeHistoryFill, TradierGainLossLot } from '@trading-app/engine';
+import type { OptionAdmissionAbsentReason, OptionAdmissionBoundBy, OptionAdmissionStamp } from '@trading-app/shared';
+import { isCoherentOptionAdmissionStamp } from '@trading-app/shared';
 import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
 
@@ -287,6 +289,26 @@ export interface LiveOptionFillRecord {
   orderId: number | null;
   /** TRA-2959 — fill-time capture vs reconcile-time history reconstruction. */
   origin: LiveFillOrigin;
+  /**
+   * TRA-3997 (parent TRA-3703) — THE BOUND SIDE of the entry decision, beside
+   * the price side this row has always kept. What the order site READ when it
+   * admitted a `buy_to_open`: the pre-order at-risk, the cap in force, the
+   * admissible figure, which operand bound it, and the terms the cap came from
+   * (see `OptionAdmissionStamp`). Copied VERBATIM from the row by the mirror.
+   *
+   * `null` ⇒ no reading on this row, and `admissionReason` says why. ALWAYS
+   * written by this build (`toRecord` never omits the pair), so a hydrated
+   * pre-cut line reads `null` + `unstamped` rather than an absent key. Optional
+   * on the TYPE only so fixtures and record literals written before this cut
+   * still compile; a reader must treat an absent key exactly as `unstamped`.
+   *
+   * ⛔ BACKFILL IS OUT OF SCOPE (AC5). A row with `admission: null` is BLIND —
+   * "was it admitted inside its headroom?" has no answer — and blind must never
+   * be graded as compliant. Instrumentation only: nothing here feeds a bound.
+   */
+  admission?: OptionAdmissionStamp | null;
+  /** TRA-3997 — WHY `admission` is `null`; `null` whenever `admission` is an object. */
+  admissionReason?: OptionAdmissionAbsentReason | null;
 }
 
 /** The mutable inputs a caller hands {@link recordLiveOptionFill}; the module fills ts/etDay/derived slippage. */
@@ -313,6 +335,17 @@ export interface LiveOptionFillInput {
   orderId?: number | null;
   /** Defaults to 'fill' — only the reconcile importer passes 'history_import'. */
   origin?: LiveFillOrigin;
+  /**
+   * TRA-3997 — the row's admission stamp, or `null`/absent when the caller has
+   * none. An object that fails `isCoherentOptionAdmissionStamp` is refused
+   * WHOLE and recorded as `malformed_stamp` — never half-applied.
+   */
+  admission?: OptionAdmissionStamp | null;
+  /**
+   * TRA-3997 — why the caller has no stamp. Only consulted when `admission` is
+   * not a coherent object; a caller that passes neither is recorded `unstamped`.
+   */
+  admissionReason?: OptionAdmissionAbsentReason | null;
 }
 
 // ── In-memory store (backs the durable records + the health endpoint) ─────────
@@ -411,12 +444,42 @@ function finiteOrNull(n: number | null | undefined): number | null {
   return typeof n === 'number' && Number.isFinite(n) ? n : null;
 }
 
+const ADMISSION_ABSENT_REASONS: readonly OptionAdmissionAbsentReason[] = ['not_evaluated_on_path', 'unstamped', 'malformed_stamp'];
+function isAdmissionAbsentReason(v: unknown): v is OptionAdmissionAbsentReason {
+  return typeof v === 'string' && (ADMISSION_ABSENT_REASONS as readonly string[]).includes(v);
+}
+
+/**
+ * TRA-3997 — resolve the (stamp, reason) pair a record carries. Exactly one of
+ * the two is non-null. A coherent object wins; an incoherent object is refused
+ * whole as `malformed_stamp` (the refusal IS the finding — a half-applied stamp
+ * would read as a partial reading); no object ⇒ the caller's reason, or
+ * `unstamped` when the caller gave none (the hydrate path for every pre-cut line).
+ */
+function resolveAdmission(input: Pick<LiveOptionFillInput, 'admission' | 'admissionReason'>): {
+  admission: OptionAdmissionStamp | null;
+  admissionReason: OptionAdmissionAbsentReason | null;
+} {
+  if (isCoherentOptionAdmissionStamp(input.admission)) {
+    return { admission: { ...input.admission }, admissionReason: null };
+  }
+  if (input.admission !== null && input.admission !== undefined) {
+    return { admission: null, admissionReason: 'malformed_stamp' };
+  }
+  return {
+    admission: null,
+    admissionReason: isAdmissionAbsentReason(input.admissionReason) ? input.admissionReason : 'unstamped',
+  };
+}
+
 /** Build a fully-derived record from a caller input (shared by record + a hydrate re-derive). */
 function toRecord(input: LiveOptionFillInput): LiveOptionFillRecord {
   const filledPrice = finiteOrNull(input.filledPrice);
   const askAtSubmit = finiteOrNull(input.askAtSubmit);
   const midAtSubmit = finiteOrNull(input.midAtSubmit);
   const fees = finiteOrNull(input.fees);
+  // TRA-3997 — resolved once, written unconditionally (both keys, always).
+  const { admission, admissionReason } = resolveAdmission(input);
   return {
     mode: 'live',
     ts: input.ts,
@@ -443,7 +506,62 @@ function toRecord(input: LiveOptionFillInput): LiveOptionFillRecord {
     // Rows written before TRA-2959 carry no origin on disk; they were all
     // captured by fill-time chokepoints, so 'fill' is the honest default.
     origin: isOrigin(input.origin) ? input.origin : 'fill',
+    // TRA-3997 — the bound side of the entry decision. A pre-cut line hydrates
+    // as `null` + `unstamped`: BLIND, never back-filled (AC5).
+    admission,
+    admissionReason,
   };
+}
+
+/**
+ * TRA-3997 — census of the admission stamp over the `buy_to_open` fills on the
+ * tape, for `/api/health/live-options-fee-slippage`. Answers "is the stamp
+ * being exercised, and does `admissibleBoundBy` DISCRIMINATE?" (AC4) without
+ * a reader having to fold `records` by hand.
+ *
+ * `rows` is the `buy_to_open` population; `stamped + Σ absent = rows`.
+ * `byBoundBy` is keyed on the full vocabulary so a key that reads `0` is a
+ * measured zero and a missing key is impossible. `lastStampedAt` is `null`
+ * until the first stamped open — never-exercised, not clean.
+ */
+export function summarizeLiveOptionAdmissionStamps(
+  records: readonly LiveOptionFillRecord[],
+): {
+  rows: number;
+  stamped: number;
+  byBoundBy: Record<OptionAdmissionBoundBy, number>;
+  absent: Record<OptionAdmissionAbsentReason, number>;
+  /** Stamped opens whose `entryNotionalUsd ≤ admissibleEntryUsd` — the one comparison the stamp exists to make. */
+  insideHeadroom: number;
+  lastStampedAt: number | null;
+} {
+  const byBoundBy: Record<OptionAdmissionBoundBy, number> = {
+    book: 0, fleet_reachable: 0, both: 0, fleet_unreadable: 0, none: 0,
+  };
+  const absent: Record<OptionAdmissionAbsentReason, number> = {
+    not_evaluated_on_path: 0, unstamped: 0, malformed_stamp: 0,
+  };
+  let rows = 0;
+  let stamped = 0;
+  let insideHeadroom = 0;
+  let lastStampedAt: number | null = null;
+  for (const r of records) {
+    if (r.side !== 'buy_to_open') continue;
+    rows += 1;
+    if (isCoherentOptionAdmissionStamp(r.admission)) {
+      stamped += 1;
+      byBoundBy[r.admission.admissibleBoundBy] += 1;
+      if (Math.round(r.admission.entryNotionalUsd * 100) <= Math.round(r.admission.admissibleEntryUsd * 100)) {
+        insideHeadroom += 1;
+      }
+      if (lastStampedAt === null || r.ts > lastStampedAt) lastStampedAt = r.ts;
+    } else {
+      // An absent key on a record that never went through `toRecord` (a
+      // fixture) is the pre-cut shape: `unstamped`.
+      absent[isAdmissionAbsentReason(r.admissionReason) ? r.admissionReason : 'unstamped'] += 1;
+    }
+  }
+  return { rows, stamped, byBoundBy, absent, insideHeadroom, lastStampedAt };
 }
 
 /**
@@ -1640,6 +1758,11 @@ export function hydrateLiveOptionsFeeSlippageFromDisk(
       feeSource: sourced ? rec.feeSource : null,
       orderId: rec.orderId,
       origin: rec.origin,
+      // TRA-3997 — pass the pair through untouched. A line with neither key
+      // resolves to `null` + `unstamped` inside `toRecord`; there is NO
+      // back-fill here and there must not be (AC5).
+      admission: rec.admission,
+      admissionReason: rec.admissionReason,
     });
     fills.push(clean);
     // TRA-3977 — a hydrated row is a witness too: a file carrying two books'
@@ -1817,6 +1940,10 @@ function recordToInput(
     feeSource: feesOverride !== undefined ? feeSourceOverride ?? null : rec.feeSource,
     orderId: rec.orderId,
     origin: rec.origin,
+    // TRA-3997 — a fee back-fill re-derives the row; the admission stamp must
+    // survive it verbatim (it is a fact about the admit, not about the fee).
+    admission: rec.admission,
+    admissionReason: rec.admissionReason,
   };
 }
 

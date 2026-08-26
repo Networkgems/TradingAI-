@@ -2752,6 +2752,166 @@ export function buildEntryQuoteStamp(
   return { entryBidAtOpen: null, entryAskAtOpen: null, entrySpreadPct: null, entryQuoteSource: source, entryQuoteReason: reason };
 }
 
+/**
+ * TRA-3997 (parent TRA-3703) — WHICH operand of the reachable bound held the
+ * admissible figure down at the moment an order was admitted. ONE vocabulary:
+ * the server's `LiveOtmAdmissibleBoundBy` (`option-exec-flag.ts`) aliases this
+ * type, so the value stamped on a row is byte-identical to the value the gate
+ * ledger and `/api/health/live-options-fee-slippage` publish.
+ *
+ *  - `book`             — `cap_i − atRisk_i` bound it (this book's own budget).
+ *  - `fleet_reachable`  — `A − Σ_j atRisk_j` bound it (the FLEET's headroom).
+ *  - `both`             — the two operands agreed to the cent.
+ *  - `fleet_unreadable` — `Σ_j atRisk_j` could not be read ⇒ per-book only.
+ *  - `none`             — nothing admissible: at/over cap, or the fleet at `A`.
+ */
+export type OptionAdmissionBoundBy = 'book' | 'fleet_reachable' | 'both' | 'fleet_unreadable' | 'none';
+
+/**
+ * TRA-3997 — WHY a fill record carries no admission stamp. Stamped INSTEAD of
+ * the object, never beside one.
+ *
+ *  - `not_evaluated_on_path` — the open path that placed this order does not
+ *    consult the reachable bound (the RV / directional sleeves; the sleeve caps
+ *    cover the OTM sleeve only — see the TRA-3836 note at the mirror seam).
+ *    There was no admission reading to keep.
+ *  - `unstamped` — the row predates this cut (hydrated from a line with no
+ *    `admission` key), or was written by a path that never reached the mirror
+ *    seam (history import). BLIND, not compliant — see AC5 on the row docs.
+ *  - `malformed_stamp` — a caller handed the ledger an object that fails
+ *    {@link isCoherentOptionAdmissionStamp}. Refused whole rather than
+ *    half-recorded; the refusal is the finding.
+ */
+export type OptionAdmissionAbsentReason = 'not_evaluated_on_path' | 'unstamped' | 'malformed_stamp';
+
+/**
+ * TRA-3997 — THE ADMISSION READING, as the ORDER SITE read it, kept on the row.
+ *
+ * ── Why ────────────────────────────────────────────────────────────────────
+ * The fill row has always kept the PRICE side of the entry decision
+ * (`submittedLimit`, `askAtSubmit`, `midAtSubmit`, `filledPrice`, both
+ * slippages) and nothing at all about the BOUND side. Measured on bqb1
+ * `07cc4ba43af6` 2026-08-25: `v0nni` opened `XLF260930C00058000` ($116) and
+ * `BULL261002C00009000` ($71) ten seconds apart and then sat at
+ * `headroomSignedUsd −0.35`. Two explanations survive — the commission on the
+ * second order shrank the cap under an open row (`f ≥ $0.72`), or the order
+ * site over-admitted by up to $0.35 against a stale at-risk denominator — and
+ * the tape cannot separate them, because nothing recorded what the order site
+ * READ when it said yes. Today the blindness is worth 35 cents; it covers a
+ * $300 admission identically (TRA-3926 is on the board because a quantity got
+ * past a correct authorization check).
+ *
+ * ── What is stamped ─────────────────────────────────────────────────────────
+ * The four figures the ask names, AS READ AT ADMIT — never a re-derivation at
+ * publish time (AC2): `openPremiumAtRiskUsd` is the PRE-order fold (the row
+ * being opened is not in it), `capUsd` is the cap in force, `admissibleEntryUsd`
+ * the `max(0, min(cap − atRisk, A − Σ atRisk))` the entry was compared against,
+ * `admissibleBoundBy` which operand bound it. Plus the two terms `capUsd` was
+ * derived from (AC3) so the cap is re-derivable FROM THE ROW ALONE:
+ *
+ *     capUsd === deriveOptionAdmissionCapUsd(phiEff, sizingBasisUsd, fleetCapUsd)
+ *              = min( floor(sizingBasisUsd × phiEff × 100) / 100 , fleetCapUsd )
+ *
+ * and the fleet operand's own input (`fleetAtRiskUsd`) so the admissible figure
+ * is re-derivable too. `entryNotionalUsd` is the order that was admitted
+ * against it, so "was this order inside its headroom?" is ONE comparison on
+ * one row: `entryNotionalUsd ≤ admissibleEntryUsd`.
+ *
+ * ── Three states on a row (AC5) ─────────────────────────────────────────────
+ *   ABSENT  — written before TRA-3997, or by an open path that does not
+ *             consult the reachable bound. **BLIND. Backfill is explicitly OUT
+ *             of scope and a pre-cut row must never be graded as compliant** —
+ *             the reading at a past admit is not recoverable, and any
+ *             reconstruction would be a fabricated number sitting in the column
+ *             a verdict reads.
+ *   object  — stamped by this build at the order site. Every numeric field is
+ *             finite; `sizingBasisUsd` / `fleetAtRiskUsd` are `null` only when
+ *             the order site itself read them as unreadable, in which case
+ *             `capUsd` is 0 / `admissibleBoundBy` is `fleet_unreadable` and the
+ *             row says so rather than hiding it.
+ *
+ * INSTRUMENTATION ONLY (AC6): nothing reads this back into a bound, a cap, or
+ * a refusal. It rides `exportSnapshot`/`importSnapshot` with the row and is
+ * mirrored VERBATIM onto the journal `open` line and the fee/slippage fill
+ * record, so the three surfaces cannot disagree.
+ */
+export interface OptionAdmissionStamp {
+  /** `max(0, min(cap_i − atRisk_i, A − Σ_j atRisk_j))`, floored to cents, as the order site read it. */
+  admissibleEntryUsd: number;
+  /** The book's premium at risk BEFORE this order — the row being opened is NOT in it (AC2). */
+  openPremiumAtRiskUsd: number;
+  /** `B_i = min(φ_eff · E_i, A)` in force at admit. */
+  capUsd: number;
+  /** Which operand bound `admissibleEntryUsd`. Discriminates; never a constant (AC4). */
+  admissibleBoundBy: OptionAdmissionBoundBy;
+  /** φ_eff the cap was derived from (AC3). */
+  phiEff: number;
+  /** `E_i = availableCash + openPremiumAtRisk` the cap was derived from (AC3); `null` ⇒ cash unreadable ⇒ `capUsd` 0. */
+  sizingBasisUsd: number | null;
+  /** `A`, the fleet authorization the cap and the fleet operand were both bounded by. */
+  fleetCapUsd: number;
+  /** `Σ_j atRisk_j` as folded at admit; `null` ⇒ unreadable ⇒ `admissibleBoundBy: 'fleet_unreadable'`. */
+  fleetAtRiskUsd: number | null;
+  /** The entry premium (USD) this reading admitted. */
+  entryNotionalUsd: number;
+  /** Wall clock of the read, ms epoch. */
+  admittedAt: number;
+  /** Which gate produced the reading. One value today; the field exists so a second gate cannot be mistaken for this one. */
+  admissionSource: 'otm_reachable_bound';
+}
+
+/**
+ * TRA-3997 (AC3) — re-derive `capUsd` from the two terms stamped beside it:
+ * `min(floor(E_i × φ_eff × 100) / 100, A)`. Byte-for-byte the server's
+ * `resolveLiveOptionTestBookAggregateCapUsd` arithmetic, so a stamped row can
+ * be checked with no server import. `null` when the basis is `null` (cash
+ * unreadable) — the order site fails that case closed to a `0` cap, which the
+ * caller compares separately; this helper does not invent a `0`.
+ */
+export function deriveOptionAdmissionCapUsd(
+  phiEff: number,
+  sizingBasisUsd: number | null,
+  fleetCapUsd: number,
+): number | null {
+  if (typeof sizingBasisUsd !== 'number' || !Number.isFinite(sizingBasisUsd)) return null;
+  if (!Number.isFinite(phiEff) || phiEff <= 0) return null;
+  if (!Number.isFinite(fleetCapUsd) || fleetCapUsd <= 0) return null;
+  const proRata = Math.floor(sizingBasisUsd * phiEff * 100) / 100;
+  return Math.min(proRata, fleetCapUsd);
+}
+
+const OPTION_ADMISSION_BOUND_BY: readonly OptionAdmissionBoundBy[] = ['book', 'fleet_reachable', 'both', 'fleet_unreadable', 'none'];
+
+/**
+ * TRA-3997 — structural coherence of a stamp: every required number finite
+ * (non-negative where a sign would be a defect), the two nullable terms either
+ * finite or `null`, `admissibleBoundBy` in the vocabulary, the source known.
+ *
+ * ⚠ Deliberately does NOT assert the AC3 identity (`capUsd` vs the derived
+ * cap). The stamp records what the order site READ; if the arithmetic ever
+ * drifts from the row's own terms, that drift is the finding, and a writer
+ * that refused to record it would delete the evidence. The identity is graded
+ * by the reader (`deriveOptionAdmissionCapUsd`), not enforced by the writer.
+ */
+export function isCoherentOptionAdmissionStamp(q: unknown): q is OptionAdmissionStamp {
+  if (!q || typeof q !== 'object') return false;
+  const s = q as Partial<OptionAdmissionStamp>;
+  const fin = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+  const finOrNull = (v: unknown): boolean => v === null || fin(v);
+  if (!fin(s.admissibleEntryUsd) || s.admissibleEntryUsd < 0) return false;
+  if (!fin(s.openPremiumAtRiskUsd) || s.openPremiumAtRiskUsd < 0) return false;
+  if (!fin(s.capUsd) || s.capUsd < 0) return false;
+  if (!OPTION_ADMISSION_BOUND_BY.includes(s.admissibleBoundBy as OptionAdmissionBoundBy)) return false;
+  if (!fin(s.phiEff)) return false;
+  if (!finOrNull(s.sizingBasisUsd)) return false;
+  if (!fin(s.fleetCapUsd)) return false;
+  if (!finOrNull(s.fleetAtRiskUsd)) return false;
+  if (!fin(s.entryNotionalUsd) || s.entryNotionalUsd <= 0) return false;
+  if (!fin(s.admittedAt)) return false;
+  if (s.admissionSource !== 'otm_reachable_bound') return false;
+  return true;
+}
+
 export interface OptionPosition {
   id: string;
   symbol: string;
@@ -3326,6 +3486,24 @@ export interface OptionPosition {
   entrySpreadPct?: number | null;
   entryQuoteSource?: EntryQuoteSource;
   entryQuoteReason?: EntryQuoteReason | null;
+  /**
+   * TRA-3997 (parent TRA-3703) — THE ADMISSION READING the order site took
+   * before it said yes to this row: the pre-order at-risk, the cap in force,
+   * the admissible figure the entry was compared against, which operand bound
+   * it, and the two terms the cap was derived from. See
+   * {@link OptionAdmissionStamp} for the full contract.
+   *
+   * Written ONLY by the live OTM bounded-test order site, at the admit, and
+   * carried onto the row BY the paper open (via `OptionTradeJournalSetup`) so
+   * the row is born with it and the journal `open` line carries the same object.
+   * The mirror copies it VERBATIM onto the fee/slippage fill record.
+   *
+   * ABSENT ⇒ pre-TRA-3997, or an open path that never consulted the reachable
+   * bound (RV / directional / demo / imported). **Backfill is OUT of scope
+   * (AC5): a row without this stamp is BLIND, and blind must never be graded
+   * as compliant.**
+   */
+  admission?: OptionAdmissionStamp;
   /**
    * TRA-348 — Tradier order id for an in-flight `sell_to_close` against an
    * imported position. Set when the close order was accepted but did not

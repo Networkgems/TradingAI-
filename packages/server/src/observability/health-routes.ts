@@ -84,6 +84,7 @@ import {
 } from '../option-exec-flag.js';
 import {
   summarizeLiveOptionsFeeSlippage, // TRA-1929
+  summarizeLiveOptionAdmissionStamps, // TRA-3997
   phantomOpenEpisodeCensus, // TRA-3976
 } from '../live-options-fee-slippage-ledger.js';
 import { getLiveOptionsFeeReconcileState } from '../live-options-fee-reconcile.js'; // TRA-2810
@@ -4849,6 +4850,14 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       durability: summary.durability,
       lastRecordAt: summary.lastRecordAt,
       records: summary.records,
+      // TRA-3997 — is the ADMISSION stamp on `buy_to_open` rows being exercised,
+      // and does `admissibleBoundBy` discriminate (AC4)? Each `records[]` entry
+      // carries `admission` / `admissionReason` verbatim; this is the fold.
+      // ⭐ The PRESENCE of this key is the deployed-bytes proof the stamp
+      // shipped (a build without it lacks the key). `stamped: 0` with
+      // `rows > 0` after a live open on this build is a regression, not quiet.
+      // `absent.unstamped` counts pre-cut rows — BLIND, never compliant (AC5).
+      admissionStamp: summarizeLiveOptionAdmissionStamps(summary.records),
       // TRA-2810 — provenance of the AUTOMATIC fee back-fill (boot kick + hourly
       // tick). `ticks: 0` ⇒ the pass never ran on this boot — the one state the
       // TRA-1954 admin-POST era could not distinguish from healthy-quiescent.

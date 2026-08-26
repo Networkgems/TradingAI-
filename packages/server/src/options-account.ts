@@ -19,6 +19,7 @@ import type {
   PortfolioGreeks,
   SignalType,
   EntryQuoteStamp,
+  OptionAdmissionStamp,
 } from '@trading-app/shared';
 import { buildEntryQuoteStamp } from '@trading-app/shared';
 import { recordEntryQuoteStampOutcome } from './entry-quote-stamp.js';
@@ -310,6 +311,21 @@ export interface OptionTradeJournalSetup {
    * the path that was consulted and the two cannot drift apart.
    */
   riskThrottleSizingPath: RiskThrottleSizingPath | null;
+  /**
+   * TRA-3997 (parent TRA-3703) — the ADMISSION READING the order site took
+   * before it admitted this entry (see `OptionAdmissionStamp`). Supplied ONLY
+   * by the live OTM bounded-test site, which is the one open path that
+   * consults the reachable bound. {@link PaperOptionsAccount.openOptionFromCandidate}
+   * puts it on the row it creates AND on the journal `open` line, as the same
+   * object, so the row is born with it (a failed broker mirror rolls the row
+   * back and takes the stamp with it) and the two surfaces cannot disagree.
+   *
+   * Optional, unlike the throttle triple, because ABSENT is the honest value
+   * for every other open path: they have no admission reading to keep, and
+   * a fabricated one would be exactly the compliant-looking blind row AC5
+   * forbids.
+   */
+  admission?: OptionAdmissionStamp;
 }
 
 const MS_PER_DAY = 86_400_000;
@@ -4783,6 +4799,12 @@ export class PaperOptionsAccount {
           entryQuoteReason: position.entryQuoteReason ?? null,
         }
         : {}),
+      // TRA-3997 — the admission reading, copied VERBATIM from the row (the
+      // same object `openOptionFromCandidate` put there from the setup), so
+      // the archive-served row carries what the order site read. Only when the
+      // row has one: every other open path omits the key and folds back as
+      // "never stamped" — BLIND, exactly like a pre-TRA-3997 row (AC5).
+      ...(position.admission ? { admission: position.admission } : {}),
       // TRA-1475 — stamp the owning book so the DESK fold can exclude QA/test
       // accounts. Only when bound (un-owned engines omit it → kept by the filter).
       ...(this.owner ? { account: this.owner } : {}),
@@ -6445,6 +6467,10 @@ export class PaperOptionsAccount {
       // row this build wrote is never mistaken for a pre-TRA-3990 one. On a
       // live row the mirror supersedes this with the broker-submit quote.
       ...stampEntryQuoteFromScanner(quoteOf(signal, rawMark)),
+      // TRA-3997 — the admission reading the caller took BEFORE this open, on
+      // the row from birth. Only the live OTM bounded-test site supplies one;
+      // absent ⇒ the key is omitted, never a fabricated stamp (AC5).
+      ...(journalSetup?.admission ? { admission: journalSetup.admission } : {}),
     };
 
     this.openOptions.set(position.id, position);

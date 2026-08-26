@@ -2,7 +2,7 @@ import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { deriveEntrySpreadPct } from '@trading-app/shared';
-import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason } from '@trading-app/shared';
+import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason, OptionAdmissionStamp } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { STOP_DISTANCE_FRACTION_OF_MARK } from './option-spread-cost.js';
 import type { RiskThrottleSizingPath, RiskThrottleSizingScope } from './risk-throttle-sizing.js';
@@ -244,6 +244,22 @@ export interface OptionTradeJournalOpen {
   entrySpreadPct?: number | null;
   entryQuoteSource?: EntryQuoteSource;
   entryQuoteReason?: EntryQuoteReason | null;
+  /**
+   * TRA-3997 (parent TRA-3703) — the ADMISSION READING the order site took
+   * before it admitted this row, mirrored VERBATIM from `OptionPosition.admission`
+   * on the `open` line (see the field docs on `OptionAdmissionStamp`). The
+   * durable copy: the book row is gone once the position closes, and the
+   * question this answers — "was this order inside its headroom when it was
+   * admitted?" — is asked AFTER the fact, off the archive-served row.
+   *
+   * Optional: ABSENT ⇒ written before TRA-3997, or by an open path that does
+   * not consult the reachable bound (RV / directional / demo). **BLIND, and
+   * backfill is OUT of scope (AC5): a row without it must never be graded as
+   * compliant** — the reading at a past admit is not recoverable. Never
+   * amended: the reading at admit is a fact about one instant, so unlike the
+   * entry quote there is no later, better snapshot to supersede it with.
+   */
+  admission?: OptionAdmissionStamp;
   /**
    * TRA-1475 — the owning demo book's username, stamped so the firm-wide DESK
    * fold (`reports/desk-calendar.ts`) can exclude QA/test accounts (`qa*`,

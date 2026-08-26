@@ -18,6 +18,8 @@
 // research ledger is accruing or silence the ledger whenever execution is gated —
 // both wrong, hence the distinct env var.
 
+import type { OptionAdmissionBoundBy, OptionAdmissionStamp } from '@trading-app/shared';
+
 export const OPTION_EXEC_FLAG = 'ENABLE_OPTION_EXEC_SELECTOR';
 
 function flagOn(raw: string | undefined): boolean {
@@ -2414,18 +2416,20 @@ export function sumLiveOtmFleetAtRiskUsd(
   return { fleetAtRiskUsd: acc / 100, books, selfIncluded };
 }
 
-/** Which term is holding {@link LiveOtmAdmissibleEntry.admissibleUsd} down. */
-export type LiveOtmAdmissibleBoundBy =
-  /** `cap_i − atRisk_i` binds — this book's own budget. The pre-TRA-3911 posture. */
-  | 'book'
-  /** `A − Σ_j atRisk_j` binds — the FLEET's reachable headroom. The new term. */
-  | 'fleet_reachable'
-  /** Both operands agree to the cent. Published as itself so neither can claim it. */
-  | 'both'
-  /** `Σ_j atRisk_j` unreadable ⇒ per-book only, i.e. the bound in force before this ticket. */
-  | 'fleet_unreadable'
-  /** No admissible entry at all: the book is at or over its cap, or the fleet is at `A`. */
-  | 'none';
+/**
+ * Which term is holding {@link LiveOtmAdmissibleEntry.admissibleUsd} down.
+ *
+ *  - `book`             — `cap_i − atRisk_i` binds: this book's own budget (the pre-TRA-3911 posture).
+ *  - `fleet_reachable`  — `A − Σ_j atRisk_j` binds: the FLEET's reachable headroom (the new term).
+ *  - `both`             — both operands agree to the cent; published as itself so neither can claim it.
+ *  - `fleet_unreadable` — `Σ_j atRisk_j` unreadable ⇒ per-book only, i.e. the bound in force before TRA-3911.
+ *  - `none`             — no admissible entry at all: the book is at/over its cap, or the fleet is at `A`.
+ *
+ * TRA-3997 — an ALIAS of the shared `OptionAdmissionBoundBy`, so the value the
+ * order site stamps on the row ({@link buildOptionAdmissionStamp}) and the value
+ * the gate ledger / health route publish are one vocabulary by construction.
+ */
+export type LiveOtmAdmissibleBoundBy = OptionAdmissionBoundBy;
 
 /** TRA-3911 — the largest new premium this book may add, with both operands attached. */
 export interface LiveOtmAdmissibleEntry {
@@ -2538,6 +2542,61 @@ export function fitsLiveOtmReachableBound(
 ): boolean {
   if (!Number.isFinite(entryNotionalUsd) || entryNotionalUsd <= 0) return false;
   return cents(entryNotionalUsd) <= cents(admissible.admissibleUsd);
+}
+
+/**
+ * TRA-3997 (parent TRA-3703) — freeze the admission reading the order site just
+ * compared an entry against, in the shape the row keeps
+ * ({@link OptionAdmissionStamp}).
+ *
+ * Called at the ONE place that holds every operand at once — immediately after
+ * {@link fitsLiveOtmReachableBound} admits, BEFORE the paper open — so:
+ *
+ *   • `openPremiumAtRiskUsd` is the PRE-order fold by construction (AC2). It is
+ *     the same `atRisk.usd` the cap, the basis and the admissible figure were
+ *     all computed from, not a re-read after the row landed;
+ *   • `capUsd` / `phiEff` / `sizingBasisUsd` / `fleetCapUsd` are the terms the
+ *     order site actually used, so the AC3 identity holds on the row alone;
+ *   • `admissibleBoundBy` is whatever `resolveLiveOtmAdmissibleEntryUsd`
+ *     returned — it discriminates because the operand it names varies (AC4).
+ *
+ * Pure: takes the numbers, returns the stamp. It NEVER reads a bound, moves a
+ * cap, or refuses anything (AC6). A caller that has no admission reading (the
+ * RV / directional sleeves) does not call it; the mirror seam records
+ * `not_evaluated_on_path` for those instead of inventing a stamp.
+ */
+export function buildOptionAdmissionStamp(read: {
+  admissible: LiveOtmAdmissibleEntry;
+  /** The PRE-order at-risk the admissible figure was derived from. */
+  openPremiumAtRiskUsd: number;
+  /** `B_i` in force at admit. */
+  capUsd: number;
+  /** φ_eff the cap was derived from. */
+  phiEff: number;
+  /** `E_i` the cap was derived from; `null` ⇒ cash unreadable. */
+  sizingBasisUsd: number | null;
+  /** `A`. */
+  fleetCapUsd: number;
+  /** The entry premium (USD) being admitted. */
+  entryNotionalUsd: number;
+  /** Wall clock of the read, ms epoch. */
+  at: number;
+}): OptionAdmissionStamp {
+  return {
+    admissibleEntryUsd: read.admissible.admissibleUsd,
+    openPremiumAtRiskUsd: read.openPremiumAtRiskUsd,
+    capUsd: read.capUsd,
+    admissibleBoundBy: read.admissible.boundBy,
+    phiEff: read.phiEff,
+    sizingBasisUsd: typeof read.sizingBasisUsd === 'number' && Number.isFinite(read.sizingBasisUsd)
+      ? read.sizingBasisUsd
+      : null,
+    fleetCapUsd: read.fleetCapUsd,
+    fleetAtRiskUsd: read.admissible.fleetAtRiskUsd,
+    entryNotionalUsd: read.entryNotionalUsd,
+    admittedAt: read.at,
+    admissionSource: 'otm_reachable_bound',
+  };
 }
 
 // --------------------------------------------------------------------------
