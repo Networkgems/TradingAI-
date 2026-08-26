@@ -22,6 +22,8 @@ import {
   markSanityNote,
   OBSERVE_JUMP_X,
   MAX_SAMPLES,
+  // TRA-2927 (A) — the enforcement half.
+  MAX_MARK_JUMP_X,
   // TRA-2945 — the durable, per-book, distribution-keeping half.
   hydrateMarkSanityFromDisk,
   markSanityLogPath,
@@ -45,7 +47,11 @@ const obs = (over: Partial<Parameters<typeof recordMarkObservation>[0]> = {}) =>
 
 describe('TRA-2927 classifyMarkJump', () => {
   it('flags a jump above the capture threshold and reports the ratio', () => {
-    expect(classifyMarkJump({ mark: 30, priorMark: 0.3 })).toEqual({ flagged: true, jumpX: 100 });
+    expect(classifyMarkJump({ mark: 30, priorMark: 0.3 })).toEqual({
+      flagged: true,
+      rejected: true, // 100x is also past the 25x ENFORCEMENT bound
+      jumpX: 100,
+    });
   });
 
   it('does not flag an ordinary move', () => {
@@ -67,6 +73,10 @@ describe('TRA-2927 classifyMarkJump', () => {
   ])('returns jumpX null for a %s', (_label, priorMark) => {
     expect(classifyMarkJump({ mark: 5, priorMark: priorMark as number })).toEqual({
       flagged: false,
+      // NOT rejected either. There is no scale to reject against, and rejecting on
+      // no evidence suppresses a peak, which DISARMS the give-back cap — the
+      // dangerous direction. An unmeasurable mark is passed through, not withheld.
+      rejected: false,
       jumpX: null,
     });
   });
@@ -113,7 +123,14 @@ describe('TRA-2927 mark sanity tape', () => {
     expect(s.observed).toBe(2);
     expect(s.flagged).toBe(1);
     expect(s.maxJumpX).toBe(100);
-    expect(s.note).toMatch(/^FLAGGED/);
+    // TRA-2927 (A) — 100x is past the 25x enforcement bound, so the headline is
+    // REJECTED, which OUTRANKS flagged: this is the one state in which the module
+    // changed the book's marks, and it must not be reachable only by reading past a
+    // headline that says nothing happened.
+    expect(s.note).toMatch(/^REJECTED/);
+    expect(s.rejected).toBe(1);
+    // …and the attribution below still exists, because a rejected mark is STILL
+    // observed and STILL sampled. Enforcement must not censor its own tape.
 
     const [sample] = s.samples;
     expect(sample.optionSymbol).toBe('SPY260803C00500000');
@@ -159,6 +176,100 @@ describe('TRA-2927 mark sanity tape', () => {
     obs({ mark: 30, priorMark: 0.3 });
     summarizeMarkSanity().samples.pop();
     expect(summarizeMarkSanity().samples).toHaveLength(1);
+  });
+});
+
+// ── TRA-2927 (A) — ENFORCEMENT ──────────────────────────────────────────────
+//
+// The bound is 25x, DERIVED on TRA-2945 from 418,384 marks and pre-registered
+// before that tape existed. These assertions cover the three ways enforcement
+// could be wrong in a way that reads fine:
+//
+//   1. the two thresholds collapse into one (2x starts rejecting, or 25x stops
+//      capturing) — the capture line feeds the histogram that justifies the bound,
+//      so they must stay separate lines;
+//   2. a rejection is invisible (no counter) — a withheld mark is absent from every
+//      downstream number by construction, so "never fired" and "not wired" read
+//      identically without one;
+//   3. enforcement censors its own tape (a rejected mark stops being observed /
+//      binned) — which would cut the up-tail off any future re-derivation.
+describe('TRA-2927 (A) the 25x enforcement bound', () => {
+  beforeEach(() => clearMarkSanityTape());
+
+  it('is 25 — the pre-registered value, and a RATIO, not the dollars of giveBackArmFloor', () => {
+    expect(MAX_MARK_JUMP_X).toBe(25);
+    expect(summarizeMarkSanity().maxMarkJumpX).toBe(25);
+  });
+
+  it('is a SEPARATE, HIGHER line than the capture threshold', () => {
+    expect(MAX_MARK_JUMP_X).toBeGreaterThan(OBSERVE_JUMP_X);
+    // 3x: past the capture line, nowhere near the bound. Flagged, NOT rejected —
+    // if these two ever collapse into one line, this is what fails.
+    const d = classifyMarkJump({ mark: 0.9, priorMark: 0.3 });
+    expect(d.flagged).toBe(true);
+    expect(d.rejected).toBe(false);
+  });
+
+  it('is a strict > — exactly the bound is ACCEPTED (ties go the loose way)', () => {
+    expect(classifyMarkJump({ mark: 0.3 * MAX_MARK_JUMP_X, priorMark: 0.3 }).rejected).toBe(false);
+    expect(classifyMarkJump({ mark: 0.3 * MAX_MARK_JUMP_X * 1.0001, priorMark: 0.3 }).rejected).toBe(true);
+  });
+
+  // The negative control for the whole bound: the largest ratio ever recorded in
+  // 418,384 marks is 1.7593x, and 24.9x is an order of magnitude past that. If this
+  // ever fails, someone tightened the threshold, which is the DANGEROUS direction
+  // (a suppressed peak lowers retainedFloor and disarms the give-back cap).
+  it('does NOT reject a 24.9x mark', () => {
+    const d = classifyMarkJump({ mark: 0.3 * 24.9, priorMark: 0.3 });
+    expect(d.rejected).toBe(false);
+    expect(d.flagged).toBe(true); // still captured for the histogram
+  });
+
+  it('counts a rejection per book, and still observes and bins it', () => {
+    obs({ mark: 0.31 }); // ordinary tick — a real denominator
+    obs({ mark: 30, priorMark: 0.3, mode: 'live' }); // 100x
+    const s = summarizeMarkSanity();
+    expect(s.rejected).toBe(1);
+    expect(s.byMode.live.rejected).toBe(1);
+    expect(s.byMode.demo.rejected).toBe(0);
+    // (3) enforcement does not censor its own tape.
+    expect(s.byMode.live.observed).toBe(2);
+    expect(s.byMode.live.histogram[jumpBucketIndex(100)]).toBe(1); // the 100x ratio is still binned
+    expect(s.byMode.live.maxJumpX).toBe(100);
+  });
+
+  it('counts a peer-suppressed mark apart from a rejected one', () => {
+    // The seam withheld the mark symbol-wide, but THIS book's own ratio was inside
+    // the bound. Folding this into `rejected` would claim the book saw an
+    // out-of-bound mark it never saw; dropping it would hide a suppression from the
+    // book it actually hit.
+    obs({ mark: 0.35, priorMark: 0.3, mode: 'demo', withheld: true });
+    const s = summarizeMarkSanity();
+    expect(s.rejected).toBe(0);
+    expect(s.suppressedByPeer).toBe(1);
+    expect(s.byMode.demo.suppressedByPeer).toBe(1);
+    expect(s.byMode.demo.rejected).toBe(0);
+    expect(s.note).toMatch(/^REJECTED/); // a suppression is never a silent CLEAN
+  });
+
+  it('credits a suppression even when the book has NO measurable ratio', () => {
+    // A book with no positive prior mark cannot be rejected on its own evidence,
+    // but it can still LOSE the mark to a peer's rejection — and that suppression
+    // must not fall down the undefined-ratio early return.
+    obs({ mark: 5, priorMark: 0, mode: 'live', withheld: true });
+    const s = summarizeMarkSanity();
+    expect(s.undefinedRatio).toBe(1);
+    expect(s.suppressedByPeer).toBe(1);
+    expect(s.byMode.live.suppressedByPeer).toBe(1);
+  });
+
+  it('the CLEAN note names the bound, so a clean read says WHAT was enforced', () => {
+    obs({ mark: 0.35, mode: 'live' });
+    obs({ mark: 0.35, mode: 'demo' }); // both books lit, so the per-book line is the non-dark one
+    const note = markSanityNote();
+    expect(note).toMatch(/^CLEAN/);
+    expect(note).toContain(`${MAX_MARK_JUMP_X}x`);
+    expect(note).toContain('0 rejected');
   });
 });
 

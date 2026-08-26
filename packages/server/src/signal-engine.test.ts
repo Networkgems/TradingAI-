@@ -1326,6 +1326,110 @@ describe('SignalEngine — relative-value scanner bridge', () => {
     clearMarkSanityTape();
   });
 
+  // ── TRA-2927 (A) — the ENFORCEMENT controls, driven through the LIVE CALL SITE ──
+  //
+  // Deliberately NOT `classifyMarkJump` in isolation. A control that grades a local
+  // copy against a literal agrees with itself; the question here is whether the
+  // 25x bound is WIRED into the seam that feeds `opt.currentPremium`, and the only
+  // thing that answers it is running `refreshOptionMarks` and reading the map it
+  // returns. Both consumers (`checkExits`, `refreshImportedMarks`) read that map,
+  // so a mark absent from it cannot reach either book's positions — which is the
+  // whole mechanism.
+  describe('the 25x mark-jump bound', () => {
+    const rowFor = (mode: 'demo' | 'live', currentPremium: number) => ({
+      id: `row-${mode}`,
+      symbol: 'SPY',
+      optionSymbol: 'SPY260807C00650000',
+      expiration: '2026-08-07',
+      signalType: 'otm_mispricing',
+      mode,
+      currentPremium,
+      premiumPaid: 0.3,
+      contracts: 4,
+      contractsRemaining: 4,
+    });
+    const engineWith = (mark: number, rows: ReturnType<typeof rowFor>[]) => {
+      const scanner = new StubScanner();
+      scanner.getOptionMark.mockResolvedValue(mark);
+      const engine = new SignalEngine(undefined, undefined, scanner);
+      const book = (positions: ReturnType<typeof rowFor>[]) => ({
+        getState: () => ({ openOptions: positions }),
+        refreshLiveDisplayMarks: vi.fn(),
+        refreshOptionQuotes: vi.fn(),
+      });
+      (engine as unknown as { optionsAccounts: unknown }).optionsAccounts = {
+        sandbox: book(rows.filter((r) => r.mode === 'demo')),
+        production: book(rows.filter((r) => r.mode === 'live')),
+      };
+      return engine;
+    };
+    const refresh = (engine: SignalEngine) =>
+      (engine as unknown as { refreshOptionMarks: () => Promise<Map<string, number>> }).refreshOptionMarks();
+
+    beforeEach(() => clearMarkSanityTape());
+    afterEach(() => clearMarkSanityTape());
+
+    // POSITIVE CONTROL. 30 / 0.3 = 100x — the shape of the 2026-08-03 phantom.
+    it('withholds a 100x mark from the map, on both books, and counts it', async () => {
+      const rows = [rowFor('demo', 0.3), rowFor('live', 0.3)];
+      const marks = await refresh(engineWith(30, rows));
+
+      // (a) the mark never reaches the map, so it cannot reach `currentPremium`,
+      //     `computeBookMark`, or the monotonic `peakOpenGain`…
+      expect(marks.has('SPY260807C00650000')).toBe(false);
+      // …and the rows are left on their PRIOR mark, not on 30.
+      expect(rows.map((r) => r.currentPremium)).toEqual([0.3, 0.3]);
+
+      const s = summarizeMarkSanity();
+      // (b) the suppression is COUNTED, on the right books — without this a
+      //     withheld mark is invisible in every downstream number and "never fired"
+      //     reads exactly like "not wired".
+      expect(s.byMode.demo.rejected).toBe(1);
+      expect(s.byMode.live.rejected).toBe(1);
+      // (c) …and it is STILL OBSERVED, so enforcement does not censor the tape the
+      //     bound was derived from.
+      expect(s.byMode.demo.observed).toBe(1);
+      expect(s.byMode.live.observed).toBe(1);
+      expect(s.byMode.live.maxJumpX).toBe(100);
+      // (d) the headline says so.
+      expect(s.note).toMatch(/^REJECTED/);
+    });
+
+    // NEGATIVE CONTROL, at 24.9x — an order of magnitude past the largest ratio in
+    // the 418,384-mark tape (1.7593x) and still ACCEPTED. If this ever fails,
+    // someone tightened the bound, which is the direction that disarms the
+    // give-back cap.
+    it('accepts a 24.9x mark — the bound is loose on purpose', async () => {
+      const rows = [rowFor('live', 0.3)];
+      const marks = await refresh(engineWith(0.3 * 24.9, rows));
+
+      expect(marks.get('SPY260807C00650000')).toBeCloseTo(7.47, 10);
+      const s = summarizeMarkSanity();
+      expect(s.byMode.live.rejected).toBe(0);
+      expect(s.byMode.live.observed).toBe(1);
+      expect(s.byMode.live.flagged).toBe(1); // still CAPTURED for the histogram
+      expect(s.note).toMatch(/^FLAGGED/);
+    });
+
+    // The map is keyed by OCC symbol and shared, so a rejection is symbol-wide. The
+    // book that did not itself see an out-of-bound ratio still LOSES the mark, and
+    // that has to land in its own counter rather than be folded into `rejected`
+    // (which would claim it saw a bad mark) or dropped (which would hide the
+    // suppression from the book it hit).
+    it('counts the peer book’s loss of the mark apart from its own rejection', async () => {
+      // demo prior 0.3 → 100x (rejects); live prior 20 → 1.5x (inside the bound).
+      const rows = [rowFor('demo', 0.3), rowFor('live', 20)];
+      const marks = await refresh(engineWith(30, rows));
+
+      expect(marks.has('SPY260807C00650000')).toBe(false);
+      const s = summarizeMarkSanity();
+      expect(s.byMode.demo.rejected).toBe(1);
+      expect(s.byMode.demo.suppressedByPeer).toBe(0);
+      expect(s.byMode.live.rejected).toBe(0);
+      expect(s.byMode.live.suppressedByPeer).toBe(1);
+    });
+  });
+
   it('dedups subsequent scans on the same OCC within the 1h dedup window', async () => {
     const scanner = new StubScanner();
     scanner.scan.mockResolvedValue({

@@ -255,7 +255,7 @@ import { recordLiveEnforceDecision, type LiveEnforceNominator } from './live-enf
 import { resolveCanaryCeiling, gradeCanaryCeiling } from './canary-ceiling.js';
 import { recordGiveBackState, getBookSessionPeak, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
 import { recordOptionsBreakerState, getOptionsBreakerRestoreState } from './options-breaker-ledger.js'; // TRA-3218
-import { recordMarkObservation } from './option-mark-sanity.js'; // TRA-2927
+import { recordMarkObservation, classifyMarkJump, MAX_MARK_JUMP_X } from './option-mark-sanity.js'; // TRA-2927
 import { recordEntryGreeksVerdict } from './entry-greeks-ledger.js';
 import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
 import { isMultiLegExitEnabled } from './multileg-exit-flag.js';
@@ -8458,7 +8458,28 @@ export class SignalEngine {
               // One record per BOOK holding this contract (TRA-2945). `priorMark`
               // is each book's own `currentPremium`, so the jump ratio stays a
               // per-book statistic rather than one book's ratio stamped twice.
-              for (const holder of holdersBySymbol.get(o.optionSymbol!) ?? [o]) {
+              //
+              // TRA-2927 (A) — and this is now the ENFORCEMENT point too. The
+              // decision is taken PER HOLDER, against that book's own prior mark,
+              // and then applied symbol-wide because `marks` is keyed by OCC symbol
+              // and shared by both consumers. Rejecting on ANY holder rather than
+              // on all of them is deliberate: two books holding the same contract
+              // track the same mark from the first refresh onward, so a >25x ratio
+              // on either one is a statement about the QUOTE, not about that book —
+              // and 25x sits 14.2x above the largest ratio in a 418,384-mark tape.
+              //
+              // Withholding is the whole mechanism: `checkExits` and
+              // `refreshImportedMarks` both read this map, so a mark that never
+              // enters it cannot reach `opt.currentPremium`, cannot reach
+              // `unrealizedPnlForMode` → `computeBookMark`, and cannot latch
+              // `peakOpenGain`. The row keeps its prior premium and reads as a
+              // MISSED mark, which after STALE_MARK_BACKSTOP_TICKS falls through to
+              // the underlying-delta backstop — stops stay evaluable.
+              const holders = holdersBySymbol.get(o.optionSymbol!) ?? [o];
+              const withheld = holders.some(
+                (holder) => classifyMarkJump({ mark, priorMark: holder.currentPremium }).rejected,
+              );
+              for (const holder of holders) {
                 recordMarkObservation({
                   optionSymbol: holder.optionSymbol!,
                   symbol: holder.symbol,
@@ -8468,9 +8489,22 @@ export class SignalEngine {
                   entryPremium: holder.premiumPaid,
                   contracts: holder.contractsRemaining ?? holder.contracts,
                   now: Date.now(),
+                  withheld,
                 });
               }
-              marks.set(o.optionSymbol!, mark);
+              if (withheld) {
+                // Loud on purpose. A suppression that only shows up as a counter on
+                // a health route is a suppression nobody reads at 09:31 ET.
+                log.warn('option mark REJECTED — exceeds TRA-2927 jump bound, withheld from the mark map', {
+                  optionSymbol: o.optionSymbol,
+                  symbol: o.symbol,
+                  mark,
+                  maxMarkJumpX: MAX_MARK_JUMP_X,
+                  priorMarks: holders.map((h) => `${h.mode === 'live' ? 'live' : 'demo'}:${h.currentPremium}`),
+                });
+              } else {
+                marks.set(o.optionSymbol!, mark);
+              }
             }
           } catch (err: unknown) {
             log.warn('getOptionMark failed', { optionSymbol: o.optionSymbol, reason: err instanceof Error ? err.message : String(err) });
