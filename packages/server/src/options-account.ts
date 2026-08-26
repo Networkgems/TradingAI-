@@ -13743,6 +13743,10 @@ export class PaperOptionsAccount {
     contractsRemaining: number;
     pendingCloseSubmittedAt?: number;
     pendingCloseRepriceSteps?: number;
+    // TRA-3926 (2026-08-26) — the row's authority rides along so the sweep's
+    // close record can be stamped `exitGrant` like every other close path.
+    adoptionAuthority?: OptionPosition['adoptionAuthority'];
+    engineHandover?: OptionPosition['engineHandover'];
   }> {
     const out: Array<{
       optionId: string;
@@ -13752,6 +13756,8 @@ export class PaperOptionsAccount {
       contractsRemaining: number;
       pendingCloseSubmittedAt?: number;
       pendingCloseRepriceSteps?: number;
+      adoptionAuthority?: OptionPosition['adoptionAuthority'];
+      engineHandover?: OptionPosition['engineHandover'];
     }> = [];
     for (const opt of this.openOptions.values()) {
       if (opt.pendingCloseOrderId === undefined) continue;
@@ -13766,6 +13772,8 @@ export class PaperOptionsAccount {
         contractsRemaining: opt.contractsRemaining,
         pendingCloseSubmittedAt: opt.pendingCloseSubmittedAt,
         pendingCloseRepriceSteps: opt.pendingCloseRepriceSteps,
+        adoptionAuthority: opt.adoptionAuthority,
+        engineHandover: opt.engineHandover,
       });
     }
     return out;

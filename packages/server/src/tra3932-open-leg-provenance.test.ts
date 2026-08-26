@@ -78,6 +78,9 @@ function blindCensus(over: Partial<OversoldCloseCensus> = {}): OversoldCloseCens
     importedCloses: 0,
     excessContracts: 0,
     findings: [],
+    // TRA-3926 (2026-08-26) — the grant partition; nothing here is granted.
+    grantedCloses: [],
+    grantedContracts: 0,
     blindCloses: [
       {
         optionSymbol: OCC,

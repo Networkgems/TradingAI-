@@ -151,6 +151,8 @@ import {
   registerLiveOptionBook,
   type LiveFillSleeve,
 } from './live-options-fee-slippage-ledger.js';
+// TRA-3926 (2026-08-26) — the close record carries the row's authority.
+import { resolveCloseGrant } from './tra3926-oversold-close-detector.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 // TRA-2193 — per-scan liveness for the paths that journal `single_leg_rv`.
 import { beginRvScan } from './rv-scan-telemetry.js';
@@ -11632,7 +11634,17 @@ export class SignalEngine {
     // reconcile sweep (which only holds a row snapshot, not the position) can
     // record its fills too. A caller with no signalType gets the ledger-open
     // sleeve join or an honest 'unattributed', never a guessed sleeve.
-    position: { optionSymbol?: string; signalType?: string },
+    position: {
+      optionSymbol?: string;
+      signalType?: string;
+      // TRA-3926 (2026-08-26) — the row's authority, so the close record can
+      // say WHY the engine sold a contract its own opens did not cover. Every
+      // caller passes the row (or the pending-close projection, which now
+      // carries both); a caller with neither key stamps `'none'` — it saw a
+      // row, and the row carried nothing.
+      adoptionAuthority?: unknown;
+      engineHandover?: { grantedAt?: unknown; grantedBy?: unknown } | null;
+    },
     qty: number,
     submittedLimit: number | null,
     filledPrice: number | null,
@@ -11686,6 +11698,10 @@ export class SignalEngine {
         filledPrice,
         fees: null,
         orderId,
+        // TRA-3926 (2026-08-26) — a granted sale and an unauthorised one were
+        // the same bytes on the tape until this stamp; the over-sell detector
+        // partitions on it. Stamped from the ROW, in the bound's own order.
+        exitGrant: resolveCloseGrant(position),
       });
     } catch {
       // accounting must never break the exit path
@@ -18718,7 +18734,7 @@ export class SignalEngine {
                 // measured by the gainloss back-fill.
                 if (env === 'production') {
                   this.recordLiveOptionCloseToLedger(
-                    { optionSymbol: row.optionSymbol },
+                    { optionSymbol: row.optionSymbol, adoptionAuthority: row.adoptionAuthority, engineHandover: row.engineHandover },
                     row.contractsRemaining,
                     null,
                     outcome.avgFillPrice,
@@ -18742,7 +18758,7 @@ export class SignalEngine {
                 // real live close and must reach the fee/slippage ledger.
                 if (env === 'production') {
                   this.recordLiveOptionCloseToLedger(
-                    { optionSymbol: row.optionSymbol },
+                    { optionSymbol: row.optionSymbol, adoptionAuthority: row.adoptionAuthority, engineHandover: row.engineHandover },
                     row.contractsRemaining,
                     null,
                     outcome.avgFillPrice,
@@ -18786,7 +18802,7 @@ export class SignalEngine {
               // TRA-2959 — the booked partial slice is a real live close fill.
               if (env === 'production') {
                 this.recordLiveOptionCloseToLedger(
-                  { optionSymbol: row.optionSymbol },
+                  { optionSymbol: row.optionSymbol, adoptionAuthority: row.adoptionAuthority, engineHandover: row.engineHandover },
                   outcome.filledQty,
                   null,
                   outcome.avgFillPrice,
@@ -18854,7 +18870,7 @@ export class SignalEngine {
                     // snapshot, so slippage stays a named-unmeasured leg.
                     if (env === 'production') {
                       this.recordLiveOptionCloseToLedger(
-                        { optionSymbol: row.optionSymbol },
+                        { optionSymbol: row.optionSymbol, adoptionAuthority: row.adoptionAuthority, engineHandover: row.engineHandover },
                         remainder,
                         resub.limitPrice,
                         resub.avgFillPrice,

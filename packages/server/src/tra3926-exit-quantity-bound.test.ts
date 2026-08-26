@@ -36,10 +36,12 @@ import {
   clearLiveOptionsFeeSlippageLedger,
   recordLiveOptionFill,
   engineNetOpenContracts,
+  summarizeLiveOptionsFeeSlippage,
+  reconcileLedgerFees,
   type LiveOptionFillRecord,
 } from './live-options-fee-slippage-ledger.js';
 import { boundExitContractsToEngineShare } from './option-exec-flag.js';
-import { detectOversoldEngineCloses } from './tra3926-oversold-close-detector.js';
+import { detectOversoldEngineCloses, resolveCloseGrant } from './tra3926-oversold-close-detector.js';
 import type { OptionPosition } from '@trading-app/shared';
 
 const XLF = 'XLF260925C00057500';
@@ -991,6 +993,188 @@ describe('TRA-3926 AC5 — the detector for the condition that has ALREADY occur
 // WRITER. That is what these tests pin, and why the repair is a SECOND oracle
 // rather than a change to the first one — `foldOpenPremiumAtRisk` is the first
 // one's other caller and TRA-3911 closed on its numbers.
+// ─── 2026-08-26 — a GRANTED excess close is not a finding ────────────────────
+//
+// `RIG260925C00006000`, real money, verbatim from `records[]` + the closed row
+// on `/api/state` (`adoptionAuthority: 'desk_add'`, `closedAt` === the close's
+// `ts` to the millisecond):
+//
+//     08-21 18:04:24Z  buy_to_open   ct=1  @0.33  origin=fill            oid=142920548
+//     08-24 15:15:55Z  sell_to_close ct=1  @0.18  origin=fill            oid=143048620
+//     08-24 17:00:00Z  buy_to_open   ct=1  @0.22  origin=history_import  oid=null
+//     08-26 13:45:31Z  sell_to_close ct=1  @0.15  origin=fill            oid=143384264
+//
+// The last close is the board's TRA-3909 exemption being exercised — the auth
+// gate admitted the row, the bound stood aside (`desk_add_exempt`) — and the
+// detector, on the lifetime witness, filed it `exhausted` / excess 1. A granted
+// sale and an unauthorised one were the same bytes. The stamp is the
+// discriminator; the SHAPE of the tape is deliberately identical across the
+// pair below.
+describe('TRA-3926 (2026-08-26) — a GRANTED excess close is partitioned out, never accused', () => {
+  const RIG = 'RIG260925C00006000';
+  const RIG_OPEN_AT = 1_787_335_464_983;
+  const RIG_FIRST_CLOSE_AT = 1_787_584_555_328;
+  const RIG_DESK_AT = 1_787_590_800_000;
+  const RIG_GRANTED_CLOSE_AT = 1_787_751_931_275;
+
+  function rigTape(lastClose: Partial<LiveOptionFillRecord>): LiveOptionFillRecord[] {
+    return [
+      ledgerRow({ optionSymbol: RIG, ts: RIG_OPEN_AT, etDay: '2026-08-21', contracts: 1, filledPrice: 0.33, orderId: 142920548 }),
+      ledgerRow({ optionSymbol: RIG, ts: RIG_FIRST_CLOSE_AT, etDay: '2026-08-24', side: 'sell_to_close', contracts: 1, filledPrice: 0.18, orderId: 143048620 }),
+      ledgerRow({ optionSymbol: RIG, ts: RIG_DESK_AT, etDay: '2026-08-24', contracts: 1, filledPrice: 0.22, orderId: null, origin: 'history_import', sleeve: 'unattributed' }),
+      ledgerRow({ optionSymbol: RIG, ts: RIG_GRANTED_CLOSE_AT, etDay: '2026-08-26', side: 'sell_to_close', contracts: 1, filledPrice: 0.15, orderId: 143384264, ...lastClose }),
+    ];
+  }
+  const RIG_SHAPE = {
+    optionSymbol: RIG,
+    orderId: 143384264,
+    soldContracts: 1,
+    engineOpenContracts: 0,
+    importedOpenContracts: 1,
+    excessContracts: 1,
+    basis: 'exhausted',
+    engineOpensSeenContracts: 1,
+    engineClosesSeenContracts: 1,
+  };
+
+  it('the RIG close stamped `desk_add` at the chokepoint is GRANTED — judged, listed, not accused', () => {
+    const census = detectOversoldEngineCloses(rigTape({ exitGrant: 'desk_add' }), null);
+    expect(census.status).toBe('clean');
+    expect(census.findings).toEqual([]);
+    expect(census.excessContracts).toBe(0);
+    expect(census.grantedContracts).toBe(1);
+    expect(census.grantedCloses).toHaveLength(1);
+    expect(census.grantedCloses[0]).toMatchObject({ ...RIG_SHAPE, grant: 'desk_add', grantSource: 'record' });
+    // Granted closes are JUDGED: the walk saw them and the books moved. The
+    // 08-24 close is the engine's own lot; the 08-26 one is the grant.
+    expect(census.judgedCloses).toBe(2);
+    expect(census.blindCloses).toEqual([]);
+  });
+
+  it('the PAIR: the same tape stamped `none` is a FINDING — the stamp discriminates, not the shape', () => {
+    const census = detectOversoldEngineCloses(rigTape({ exitGrant: 'none' }), null);
+    expect(census.status).toBe('oversold');
+    expect(census.findings).toHaveLength(1);
+    expect(census.findings[0]).toMatchObject(RIG_SHAPE);
+    expect(census.excessContracts).toBe(1);
+    expect(census.grantedCloses).toEqual([]);
+    expect(census.grantedContracts).toBe(0);
+  });
+
+  it('`none` is a FINAL answer — the closed-row fallback is never consulted over a stamped record', () => {
+    let consulted = 0;
+    const census = detectOversoldEngineCloses(rigTape({ exitGrant: 'none' }), () => { consulted += 1; return 'desk_add'; });
+    expect(consulted).toBe(0);
+    expect(census.findings).toHaveLength(1);
+  });
+
+  it('an UNSTAMPED pre-cut record consults the closed-row lookup, keyed to the millisecond, for the excess close only', () => {
+    const asked: Array<[string, number]> = [];
+    const lookup = (symbol: string, ts: number) => {
+      asked.push([symbol, ts]);
+      return symbol === RIG && ts === RIG_GRANTED_CLOSE_AT ? ('desk_add' as const) : null;
+    };
+    const unstamped = rigTape({});
+    expect('exitGrant' in unstamped[3]).toBe(false);
+    const census = detectOversoldEngineCloses(unstamped, lookup);
+    // Consulted ONCE — for the excess close — never for the covered 08-24 close.
+    expect(asked).toEqual([[RIG, RIG_GRANTED_CLOSE_AT]]);
+    expect(census.findings).toEqual([]);
+    expect(census.grantedCloses).toHaveLength(1);
+    expect(census.grantedCloses[0]).toMatchObject({ ...RIG_SHAPE, grant: 'desk_add', grantSource: 'closed_row' });
+  });
+
+  it('an UNSTAMPED record whose closed row the lookup cannot key stays a FINDING', () => {
+    const offByOneMs = (symbol: string, ts: number) =>
+      symbol === RIG && ts === RIG_GRANTED_CLOSE_AT + 1 ? ('desk_add' as const) : null;
+    const census = detectOversoldEngineCloses(rigTape({}), offByOneMs);
+    expect(census.findings).toHaveLength(1);
+    expect(census.grantedCloses).toEqual([]);
+    // ...and with no lookup registered at all, the same: a grant must be READ, never assumed.
+    expect(detectOversoldEngineCloses(rigTape({}), null).findings).toHaveLength(1);
+  });
+
+  it('a grant on a COVERED close changes nothing — a grant withholds an accusation, it does not manufacture one', () => {
+    const census = detectOversoldEngineCloses([
+      ledgerRow({ optionSymbol: RIG, ts: RIG_OPEN_AT, contracts: 1, filledPrice: 0.33, orderId: 142920548 }),
+      ledgerRow({ optionSymbol: RIG, ts: RIG_FIRST_CLOSE_AT, side: 'sell_to_close', contracts: 1, filledPrice: 0.18, orderId: 143048620, exitGrant: 'desk_add' }),
+    ], null);
+    expect(census.status).toBe('clean');
+    expect(census.judgedCloses).toBe(1);
+    expect(census.grantedCloses).toEqual([]);
+    expect(census.grantedContracts).toBe(0);
+  });
+
+  it('a `handed_over` stamp is honoured the same way (ruling B, per-row)', () => {
+    const census = detectOversoldEngineCloses(rigTape({ exitGrant: 'handed_over' }), null);
+    expect(census.findings).toEqual([]);
+    expect(census.grantedCloses[0]).toMatchObject({ grant: 'handed_over', grantSource: 'record' });
+  });
+
+  it('the XLF / QQQ / BAC findings are UNTOUCHED — none of those rows carried a grant', () => {
+    // The three anchors the ticket rests on must still accuse under the new
+    // partition; a partition that also swallowed them would be the deleted
+    // alarm wearing a grant's name.
+    const census = detectOversoldEngineCloses(THE_EVENT.map(r => ({ ...r, exitGrant: r.side === 'sell_to_close' ? 'none' as const : null })), null);
+    expect(census.findings).toHaveLength(1);
+    expect(census.findings[0].orderId).toBe(142806015);
+    expect(census.grantedCloses).toEqual([]);
+  });
+
+  it('`resolveCloseGrant` mirrors the bound: hand-over first, then desk_add, `none` otherwise, malformed is not a grant', () => {
+    const grant = { grantedAt: '2026-08-22T06:27:15.918Z', grantedBy: 'admin' };
+    expect(resolveCloseGrant({ adoptionAuthority: 'desk_add' })).toBe('desk_add');
+    expect(resolveCloseGrant({ adoptionAuthority: 'foreign', engineHandover: grant })).toBe('handed_over');
+    expect(resolveCloseGrant({ adoptionAuthority: 'desk_add', engineHandover: grant })).toBe('handed_over');
+    expect(resolveCloseGrant({ adoptionAuthority: 'engine_origin' })).toBe('none');
+    expect(resolveCloseGrant({})).toBe('none');
+    expect(resolveCloseGrant({ adoptionAuthority: 'foreign', engineHandover: { grantedAt: 'soon', grantedBy: 'admin' } })).toBe('none');
+    expect(resolveCloseGrant({ adoptionAuthority: 'foreign', engineHandover: { grantedAt: grant.grantedAt, grantedBy: '' } })).toBe('none');
+  });
+
+  it('the ledger writes the stamp verbatim, refuses garbage to `null` (UNSTAMPED), and never coerces to `none`', () => {
+    clearLiveOptionsFeeSlippageLedger();
+    const base = {
+      ts: RIG_GRANTED_CLOSE_AT, etDay: '2026-08-26', sleeve: 'single_leg_otm' as const, book: 'admin',
+      optionSymbol: RIG, side: 'sell_to_close' as const, contracts: 1, filledPrice: 0.15, orderId: 143384264,
+    };
+    recordLiveOptionFill({ ...base, exitGrant: 'desk_add' });
+    recordLiveOptionFill({ ...base, ts: base.ts + 1, orderId: 1, exitGrant: 'none' });
+    recordLiveOptionFill({ ...base, ts: base.ts + 2, orderId: 2, exitGrant: 'granted' as never });
+    recordLiveOptionFill({ ...base, ts: base.ts + 3, orderId: 3 });
+    const byOrder = new Map(summarizeLiveOptionsFeeSlippage().records.map(r => [r.orderId, r]));
+    expect(byOrder.get(143384264)?.exitGrant).toBe('desk_add');
+    expect(byOrder.get(1)?.exitGrant).toBe('none');
+    expect(byOrder.get(2)?.exitGrant).toBeNull();
+    expect(byOrder.get(3)?.exitGrant).toBeNull();
+    // ALWAYS written: an absent key on a record this build wrote would be
+    // indistinguishable from a pre-cut line.
+    expect('exitGrant' in byOrder.get(3)!).toBe(true);
+    clearLiveOptionsFeeSlippageLedger();
+  });
+
+  it('the stamp AND the book survive a reconcile pass — `recordToInput` ate `book` (TRA-3977\'s `book: null` on 5/5 post-deploy fills)', () => {
+    // Every reconcile pass re-derives EVERY row through `recordToInput` →
+    // `toRecord`, matched or not. Until 2026-08-26 that converter omitted
+    // `book`, so the first gainloss/history pass after a fill wrote it back
+    // UNATTRIBUTED — the chokepoint stamped the book, the reconciler stripped
+    // it, and every book-scoped oracle then refused the row. A stamp is a fact
+    // about the fill; nothing downstream may launder it.
+    const stamped = ledgerRow({
+      optionSymbol: RIG, ts: RIG_GRANTED_CLOSE_AT, etDay: '2026-08-26', side: 'sell_to_close',
+      contracts: 1, filledPrice: 0.15, orderId: 143384264, book: 'admin', exitGrant: 'desk_add',
+    });
+    const { records } = reconcileLedgerFees([stamped], []);
+    expect(records).toHaveLength(1);
+    expect(records[0]!.book).toBe('admin');
+    expect(records[0]!.exitGrant).toBe('desk_add');
+    // ...and the pre-cut shape stays pre-cut: an unstamped line is not
+    // promoted to `'none'` by being re-derived.
+    const { records: pre } = reconcileLedgerFees([ledgerRow({ side: 'sell_to_close', orderId: 9 })], []);
+    expect(pre[0]!.exitGrant).toBeNull();
+  });
+});
+
 describe('TRA-3926 second oracle — the engine may not sell what its own closes already consumed', () => {
   const BAC = 'BAC260925C00063000';
   const BAC_ENGINE_AT = Date.parse('2026-08-20T13:36:23Z');

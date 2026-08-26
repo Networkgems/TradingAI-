@@ -75,6 +75,26 @@ if (optionsLive.exitQuantityBound && !('outstanding' in optionsLive.exitQuantity
   console.log('# PRE-DEPLOY capture — `outstanding` SEEDED so the controls can grade the grader; '
     + 'the live grader\'s D6 still fails on this box and that is the negative control.');
 }
+// TRA-3926 (2026-08-26) — and the GRANT PARTITION on a capture that predates
+// it. A pre-partition box serves no `grantedCloses` / `grantedContracts` and
+// files the desk's granted `RIG260925C00006000` close (order 143384264, sold
+// under the board's `desk_add` exemption) as a FINDING; seeded here the way the
+// two blocks above are, so every control below sees the partition's shape. The
+// live grader's D7 FAILS on such a box — that is its negative control.
+if (fee.oversoldCloses && !('grantedCloses' in fee.oversoldCloses)) {
+  const rig = fee.oversoldCloses.findings.find(x => x.orderId === 143384264);
+  if (rig) {
+    fee.oversoldCloses.findings = fee.oversoldCloses.findings.filter(x => x !== rig);
+    fee.oversoldCloses.excessContracts -= rig.excessContracts;
+    fee.oversoldCloses.grantedCloses = [{ ...rig, grant: 'desk_add', grantSource: 'closed_row' }];
+    fee.oversoldCloses.grantedContracts = rig.excessContracts;
+  } else {
+    fee.oversoldCloses.grantedCloses = [];
+    fee.oversoldCloses.grantedContracts = 0;
+  }
+  console.log(`# PRE-DEPLOY capture — \`grantedCloses\` / \`grantedContracts\` SEEDED (${rig ? 'RIG 143384264 → desk_add/closed_row' : 'empty; no RIG finding in the capture'}) `
+    + 'so the controls can grade the grader; the live grader\'s D7 still fails on this box and that is the negative control.');
+}
 const ZERO_CENSUS = {
   checked: 0, bounded: 0, refusedContracts: 0, blindRows: 0, suppressedExits: 0, netOfCloses: 0,
   deskAddExempt: 0, lastRefusalAt: null, lastRefusalReason: null,
@@ -159,6 +179,51 @@ run('C13 census ZERO + `outstanding` 1 row → BLIND that NAMES the outstanding 
     outstanding: { rows: 1, refusedContracts: 1, latestAt: Date.parse('2026-08-25T19:58:16.789Z'), latestReason: 'foreign_authority' },
   };
 }, COMMIT, /NOT a quiet bound: 1 row\(s\) \/ 1 contract\(s\), latest 2026-08-25T19:58:16\.789Z foreign_authority/);
+
+// TRA-3926 (2026-08-26) — the GRANT partition (seeded on a pre-partition
+// capture at the top of this file, the way D5/D6 are). The permissive direction
+// is the one that matters: a route that hides a finding by calling it granted.
+// C15 pins the RIG anchor (a `closed_row` grant the grader cannot verify from
+// the tape, so the anchor is the only thing that catches its promotion); C16 and
+// C17 are G10's two limbs; C18 proves the partition's PASS branch is reachable.
+run('C14 `grantedCloses` DELETED → FAIL (D7 sees the partition\'s bytes ABSENT)', 1, (ol, f) => {
+  ol.exitQuantityBound = { ...ol.exitQuantityBound, checked: 1, bounded: 1, refusedContracts: 1, lastRefusalReason: 'engine_partial' };
+  delete f.oversoldCloses.grantedCloses;
+});
+run('C15 the RIG grant PROMOTED back to a finding → FAIL (the granted anchor is accused)', 1, (ol, f) => {
+  ol.exitQuantityBound = { ...ol.exitQuantityBound, checked: 1, bounded: 1, refusedContracts: 1, lastRefusalReason: 'engine_partial' };
+  const g = f.oversoldCloses.grantedCloses.find(x => x.orderId === 143384264);
+  if (!g) throw new Error('no RIG 143384264 grant in the capture to promote');
+  f.oversoldCloses.grantedCloses = f.oversoldCloses.grantedCloses.filter(x => x !== g);
+  f.oversoldCloses.grantedContracts -= g.excessContracts;
+  const { grant, grantSource, ...finding } = g;
+  f.oversoldCloses.findings.push(finding);
+  f.oversoldCloses.excessContracts += finding.excessContracts;
+});
+run('C16 a FINDING demoted to `record`-granted with NO stamp on its record → FAIL (G10: unbacked grant)', 1, (ol, f) => {
+  ol.exitQuantityBound = { ...ol.exitQuantityBound, checked: 1, bounded: 1, refusedContracts: 1, lastRefusalReason: 'engine_partial' };
+  const x = f.oversoldCloses.findings.find(z => z.orderId === 142806015);
+  if (!x) throw new Error('no XLF finding to demote');
+  f.oversoldCloses.findings = f.oversoldCloses.findings.filter(z => z !== x);
+  f.oversoldCloses.excessContracts -= x.excessContracts;
+  f.oversoldCloses.grantedCloses.push({ ...x, grant: 'desk_add', grantSource: 'record' });
+  f.oversoldCloses.grantedContracts += x.excessContracts;
+});
+run('C17 a FINDING demoted to `closed_row`-granted while its record says `none` → FAIL (G10: a stamped record is final)', 1, (ol, f) => {
+  ol.exitQuantityBound = { ...ol.exitQuantityBound, checked: 1, bounded: 1, refusedContracts: 1, lastRefusalReason: 'engine_partial' };
+  const x = f.oversoldCloses.findings.find(z => z.orderId === 142806015);
+  if (!x) throw new Error('no XLF finding to demote');
+  const rec = f.records.find(r => r.orderId === 142806015);
+  if (!rec) throw new Error('no XLF close record');
+  rec.exitGrant = 'none';
+  f.oversoldCloses.findings = f.oversoldCloses.findings.filter(z => z !== x);
+  f.oversoldCloses.excessContracts -= x.excessContracts;
+  f.oversoldCloses.grantedCloses.push({ ...x, grant: 'desk_add', grantSource: 'closed_row' });
+  f.oversoldCloses.grantedContracts += x.excessContracts;
+});
+run('C18 the partition untouched, with the bound exercised → PASS (the grant partition\'s pass branch is REACHABLE)', 0, ol => {
+  ol.exitQuantityBound = { ...ol.exitQuantityBound, checked: 1, bounded: 1, refusedContracts: 1, lastRefusalReason: 'engine_partial' };
+});
 
 rmSync(root, { recursive: true, force: true });
 console.log(failed === 0 ? '\nCONTROLS PASS — every verdict is reachable and each is reached for its own reason.'

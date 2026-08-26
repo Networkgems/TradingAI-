@@ -45,7 +45,12 @@
 // discipline `recordedOpenFillCount` exists to enforce one level down.
 // ---------------------------------------------------------------------------
 
-import type { LiveOptionFillRecord } from './live-options-fee-slippage-ledger.js';
+import type {
+  LiveCloseGrant,
+  LiveCloseGrantStamp,
+  LiveOptionFillRecord,
+} from './live-options-fee-slippage-ledger.js';
+import { hasEngineHandover } from './option-exec-flag.js';
 
 /** One `sell_to_close` this engine submitted for more than its own opens cover. */
 export interface OversoldCloseFinding {
@@ -95,6 +100,46 @@ export interface OversoldCloseFinding {
   engineOpensSeenContracts: number;
   /** Contracts the engine's own PRIOR closes on this OCC already consumed. */
   engineClosesSeenContracts: number;
+}
+
+/**
+ * TRA-3926 (2026-08-26) — a `sell_to_close` that exceeded the engine's own
+ * opens AND was made under a grant the board or a human gave the engine over
+ * somebody else's contract. NOT a finding: the excess is the desk's contract
+ * and selling it was the instruction.
+ *
+ * Measured on real money, 2026-08-26T13:45:31Z, order 143384264:
+ *
+ *     RIG260925C00006000  08-21 18:04:24Z  buy_to_open   1 @0.33  origin=fill
+ *                         08-24 15:15:55Z  sell_to_close 1 @0.18  origin=fill
+ *                         08-24 17:00:00Z  buy_to_open   1 @0.22  origin=history_import
+ *                         08-26 13:45:31Z  sell_to_close 1 @0.15  origin=fill   ← this one
+ *
+ * The row was `adoptionAuthority: 'desk_add'`; the authorisation gate admitted
+ * it (TRA-3909, card `d4f622fb`), the exit bound stood aside
+ * (`desk_add_exempt`), the trailing stop had been breached since 08-25, and
+ * the engine sold it — exactly the ratified behaviour. And this detector, on
+ * the LIFETIME witness, called it `basis: 'exhausted'`, `excessContracts 1`.
+ * Both gates had been taught the grant; the detector had not. Fifth face of
+ * "carry every upstream grant down": a detector that cannot see a grant files
+ * the grant's every exercise as the defect, and a permanent false alarm and a
+ * deleted alarm end in the same place (TRA-3881).
+ *
+ * `grantSource` says WHERE the grant was read:
+ * - `record`     — the close's own fill record carries `exitGrant` (stamped by
+ *   the chokepoint from the row, from this cut onward). Verifiable from the
+ *   tape alone.
+ * - `closed_row` — the record predates the stamp (`exitGrant` absent/`null`)
+ *   and a live/production closed row on the same OCC with `closedAt === ts`
+ *   carries the authority. Read at publication time through
+ *   {@link setClosedRowGrantLookup}; NOT verifiable from the tape alone, and a
+ *   grader must say so. Consulted ONLY for unstamped records: a record this
+ *   build wrote says `'none'` when the row carried nothing, and that answer is
+ *   final.
+ */
+export interface GrantedClose extends OversoldCloseFinding {
+  grant: LiveCloseGrant;
+  grantSource: 'record' | 'closed_row';
 }
 
 /**
@@ -180,6 +225,55 @@ export interface OversoldCloseCensus {
   excessContracts: number;
   findings: OversoldCloseFinding[];
   blindCloses: BlindClose[];
+  /**
+   * TRA-3926 (2026-08-26) — excess closes made under a grant. Judged (they
+   * are inside `judgedCloses`), NOT findings, NOT in `excessContracts`. A
+   * reader who wants "every contract the engine sold that its own opens did
+   * not cover" adds `grantedContracts` back; a reader who wants "every
+   * contract the engine sold WITHOUT authority" reads `excessContracts`. The
+   * two were one number until the first exercise of the board's exemption.
+   */
+  grantedCloses: GrantedClose[];
+  /** Contracts sold beyond the engine's own opens UNDER A GRANT, summed over `grantedCloses`. */
+  grantedContracts: number;
+}
+
+/**
+ * TRA-3926 (2026-08-26) — the fallback authority for records written before
+ * `exitGrant` existed: `(optionSymbol, ts)` → the grant a live/production
+ * CLOSED row on that OCC with `closedAt === ts` carried, or `null`. Registered
+ * once by the composition root (it needs every book's state, which this module
+ * must not reach for); a detector call may also receive one explicitly, which
+ * keeps the function pure under test.
+ */
+export type ClosedRowGrantLookup = (optionSymbol: string, ts: number) => LiveCloseGrant | null;
+
+let registeredClosedRowGrantLookup: ClosedRowGrantLookup | null = null;
+
+export function setClosedRowGrantLookup(lookup: ClosedRowGrantLookup | null): void {
+  registeredClosedRowGrantLookup = lookup;
+}
+
+/**
+ * TRA-3926 (2026-08-26) — the row's authority at close time, in the vocabulary
+ * the fill record carries. The SAME two carve-outs `boundExitContractsToEngineShare`
+ * honours, checked in the same order (hand-over first), so the stamp and the
+ * bound cannot disagree about which grant a row carried. A malformed
+ * `engineHandover` is not a grant here for the same reason it is not one there
+ * (`hasEngineHandover`). `'none'` is a positive statement — the chokepoint saw
+ * the row and it carried nothing — and is distinct from an UNSTAMPED `null`.
+ */
+export function resolveCloseGrant(row: {
+  adoptionAuthority?: unknown;
+  engineHandover?: { grantedAt?: unknown; grantedBy?: unknown } | null;
+}): LiveCloseGrantStamp {
+  if (hasEngineHandover(row)) return 'handed_over';
+  if (row.adoptionAuthority === 'desk_add') return 'desk_add';
+  return 'none';
+}
+
+function isGrant(v: unknown): v is LiveCloseGrant {
+  return v === 'desk_add' || v === 'handed_over';
 }
 
 /**
@@ -212,8 +306,11 @@ export interface OversoldCloseCensus {
  */
 export function detectOversoldEngineCloses(
   records: readonly LiveOptionFillRecord[],
+  closedRowGrants: ClosedRowGrantLookup | null = registeredClosedRowGrantLookup,
 ): OversoldCloseCensus {
   const sorted = [...records].sort((a, b) => a.ts - b.ts);
+  const grantedCloses: GrantedClose[] = [];
+  let grantedContracts = 0;
   /** Outstanding contracts per OCC, split by who the ledger says opened them. */
   const engineOpen = new Map<string, number>();
   const importedOpen = new Map<string, number>();
@@ -327,8 +424,7 @@ export function detectOversoldEngineCloses(
       // the 2026-08-24T19:31:08Z BAC close (order 143160792) walked through
       // unnamed on the build that was live at the time.
       const excess = qty - ours;
-      excessContracts += excess;
-      findings.push({
+      const shape: OversoldCloseFinding = {
         optionSymbol: symbol,
         ts: f.ts,
         etDay: f.etDay,
@@ -340,7 +436,29 @@ export function detectOversoldEngineCloses(
         basis: ours > 0 ? 'outstanding' : 'exhausted',
         engineOpensSeenContracts: seenOpens,
         engineClosesSeenContracts: seenCloses,
-      });
+      };
+      // TRA-3926 (2026-08-26) — WAS THE EXCESS GRANTED? The record's own stamp
+      // is authoritative; `'none'` is a final answer and the closed-row
+      // fallback is consulted ONLY on an UNSTAMPED record (pre-cut line). The
+      // books move the same way either way — the desk's contract was sold —
+      // only the accusation is withheld.
+      const stamp = f.exitGrant ?? null;
+      const grant: { grant: LiveCloseGrant; grantSource: GrantedClose['grantSource'] } | null =
+        isGrant(stamp)
+          ? { grant: stamp, grantSource: 'record' }
+          : stamp === null && closedRowGrants
+            ? (() => {
+                const fromRow = closedRowGrants(symbol, f.ts);
+                return isGrant(fromRow) ? { grant: fromRow, grantSource: 'closed_row' as const } : null;
+              })()
+            : null;
+      if (grant) {
+        grantedContracts += excess;
+        grantedCloses.push({ ...shape, ...grant });
+      } else {
+        excessContracts += excess;
+        findings.push(shape);
+      }
       engineOpen.set(symbol, 0);
       importedOpen.set(symbol, Math.max(0, theirs - excess));
       continue;
@@ -356,5 +474,7 @@ export function detectOversoldEngineCloses(
     excessContracts,
     findings,
     blindCloses,
+    grantedCloses,
+    grantedContracts,
   };
 }

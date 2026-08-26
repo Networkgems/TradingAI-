@@ -168,6 +168,22 @@ if (!census) {
   process.exit(1);
 }
 
+// TRA-3926 (2026-08-26) — the GRANT PARTITION's deployed-bytes proof. Measured
+// on `56804e1a`: the engine sold the desk's `RIG260925C00006000` contract at
+// 13:45:31Z under the board's TRA-3909 exemption — auth gate admitted, bound
+// `desk_add_exempt`, exactly the ratified behaviour — and the detector filed it
+// as a 4th finding (`exhausted`, excess 1) because a fill record could not say
+// WHY an excess was sold. Neither key exists on `56804e1a` or earlier.
+const grantedKeysPresent = 'grantedCloses' in census && 'grantedContracts' in census;
+check('D7  the census publishes `grantedCloses` + `grantedContracts` (grant-partition bytes)',
+  grantedKeysPresent,
+  grantedKeysPresent
+    ? `grantedCloses ${Array.isArray(census.grantedCloses) ? census.grantedCloses.length : '?'} / grantedContracts ${census.grantedContracts}`
+    : 'ABSENT — this build predates the grant partition; a granted sale reads as an over-sell here');
+const granted = grantedKeysPresent && Array.isArray(census.grantedCloses) ? census.grantedCloses : [];
+const grantedContracts = grantedKeysPresent && typeof census.grantedContracts === 'number' ? census.grantedContracts : 0;
+const isGrant = v => v === 'desk_add' || v === 'handed_over';
+
 // ── the ORDER-FREE re-derivation ───────────────────────────────────────────
 // Deliberately not the shipped walk: per-OCC totals, no sort, no interleaving.
 const agg = new Map();
@@ -203,15 +219,31 @@ const blinds = Array.isArray(census.blindCloses) ? census.blindCloses : [];
 const publishedExcess = new Map(findings.map(f => [f.optionSymbol, f.excessContracts]));
 const publishedImportOnly = new Set(blinds.filter(b => b.reason === 'import_only').map(b => b.optionSymbol));
 
+// TRA-3926 (2026-08-26) — the fold cannot see a GRANT (a grant is a fact about
+// the row, not about the tape's arithmetic), so the derived "uncovered" total
+// is the SUM of what the route serves as accused and as granted, and the
+// accused set is the uncovered set NET of the served grants, per symbol and
+// per contract. What keeps that from being circular is G10 below: every served
+// grant must be backed by the record's own stamp, or be a PRE-CUT record (no
+// stamp at all) — a record this build wrote with `exitGrant: 'none'` can never
+// be served as granted.
+const grantedBySymbol = new Map();
+for (const g of granted) grantedBySymbol.set(g.optionSymbol, (grantedBySymbol.get(g.optionSymbol) ?? 0) + (g.excessContracts ?? 0));
+const derivedAccused = new Map();
+for (const [s, x] of derivedExcess) {
+  const net = x - (grantedBySymbol.get(s) ?? 0);
+  if (net > 0) derivedAccused.set(s, net);
+}
+
 // ── G — the detector against the independent fold ──────────────────────────
-const derivedStatus = derivedExcess.size > 0 ? 'oversold' : (census.judgedCloses > 0 ? 'clean' : 'vacuous');
+const derivedStatus = derivedAccused.size > 0 ? 'oversold' : (census.judgedCloses > 0 ? 'clean' : 'vacuous');
 check(`G1  status agrees with the order-free fold  (served ${census.status})`,
   census.status === derivedStatus, `derived ${derivedStatus}`);
-check(`G2  excessContracts agrees  (served ${census.excessContracts})`,
-  census.excessContracts === derivedExcessTotal, `derived ${derivedExcessTotal}`);
-check('G3  the ACCUSED symbol set agrees exactly',
-  setEq(new Set(publishedExcess.keys()), new Set(derivedExcess.keys())),
-  `served [${[...publishedExcess.keys()].join(' ')}] vs derived [${[...derivedExcess.keys()].join(' ')}]`);
+check(`G2  excessContracts + grantedContracts agrees with the uncovered total  (served ${census.excessContracts} + ${grantedContracts})`,
+  census.excessContracts + grantedContracts === derivedExcessTotal, `derived ${derivedExcessTotal}`);
+check('G3  the ACCUSED symbol set agrees exactly (uncovered NET of served grants)',
+  setEq(new Set(publishedExcess.keys()), new Set(derivedAccused.keys())),
+  `served [${[...publishedExcess.keys()].join(' ')}] vs derived [${[...derivedAccused.keys()].join(' ')}]`);
 // ⛔ THE POSITIVE STATEMENT IS THE LIFETIME COUNT, NOT THE BALANCE. This check
 // read `engineOpenContracts > 0` until 2026-08-24, which is the same running
 // balance the detector's `import_only` branch was using — so a grader and the
@@ -247,6 +279,30 @@ check('G8  every blind carries a reason this build knows',
 check('G9  no refusal on this boot names a population the authorisation gate admits (`foreign_authority` at the bound = the gates disagree)',
   !deskKeysPresent || bound.lastRefusalReason !== 'foreign_authority',
   deskKeysPresent ? `lastRefusalReason ${bound.lastRefusalReason}` : 'key absent — see D5');
+// ⛔ A GRANT IS ONLY AS GOOD AS ITS PROVENANCE. `record` ⇒ the close's own fill
+// record carries the same stamp (verifiable from the tape). `closed_row` ⇒ the
+// record is UNSTAMPED (a pre-cut line — `exitGrant` absent or `null`), and the
+// route read the grant off a closed row at publication time; that half is NOT
+// verifiable from these two routes and is printed as such below. A record this
+// build wrote says `'none'` when the row carried nothing, and serving THAT as
+// granted is the route hiding a finding — the permissive direction, and the
+// one this check exists for.
+const recordByOrder = new Map(records.filter(r => r.orderId != null).map(r => [r.orderId, r]));
+const grantProvenanceOk = g => {
+  if (!isGrant(g.grant) || !['record', 'closed_row'].includes(g.grantSource)) return false;
+  const rec = recordByOrder.get(g.orderId);
+  if (!rec) return false;
+  if (g.grantSource === 'record') return rec.exitGrant === g.grant;
+  return rec.exitGrant === null || rec.exitGrant === undefined;
+};
+check('G10 every served grant is backed by its record\'s own stamp, or is a PRE-CUT record read off a closed row',
+  !grantedKeysPresent || granted.every(grantProvenanceOk),
+  grantedKeysPresent
+    ? (granted.map(g => `${g.optionSymbol}:${g.orderId}:${g.grant}/${g.grantSource}:${grantProvenanceOk(g) ? 'ok' : 'UNBACKED'}`).join(' ') || 'no grants')
+    : 'key absent — see D7');
+check('G11 no served FINDING sits on a record that carries a grant stamp (a stamped grant must never be accused)',
+  findings.every(f => !isGrant(recordByOrder.get(f.orderId)?.exitGrant)),
+  findings.map(f => `${f.optionSymbol}:${recordByOrder.get(f.orderId)?.exitGrant ?? 'unstamped'}`).join(' ') || 'no findings');
 
 // ── R — the two events the ticket was filed on. A REGRESSION ANCHOR. ───────
 // Both are inside the ledger's 30-day retention as of 2026-08-21. When
@@ -277,6 +333,44 @@ for (const k of KNOWN) {
   check(`R  ${k.symbol} order ${k.orderId} is still reported (sold ${k.sold} / ours ${k.ours} / ${k.basis})`,
     !!f && f.soldContracts === k.sold && f.engineOpenContracts === k.ours && f.basis === k.basis,
     f ? `sold ${f.soldContracts} ours ${f.engineOpenContracts} excess ${f.excessContracts} basis ${f.basis}` : 'NOT REPORTED');
+}
+// ⛔ THE FOURTH ANCHOR IS THE ONE THAT MUST **NOT** BE ACCUSED. `RIG260925C00006000`
+// order 143384264, 2026-08-26T13:45:31Z, real money: the engine sold the desk's
+// contract under the board's `desk_add` exemption — the ratified behaviour — and
+// the pre-partition detector filed it `exhausted` / excess 1. Its record predates
+// the stamp, so it can only ever be served `closed_row`; when it ages out the
+// anchor is BLIND about itself, not a pass. Graded only where D7 has the keys.
+const KNOWN_GRANTED = [
+  { symbol: 'RIG260925C00006000', orderId: 143384264, sold: 1, ours: 0, basis: 'exhausted', grant: 'desk_add', source: 'closed_row' },
+];
+for (const k of KNOWN_GRANTED) {
+  if (!records.some(r => r.orderId === k.orderId)) {
+    notes.push(`R  ${k.symbol} order ${k.orderId} has aged out of the tape (oldest record ${new Date(oldestTs).toISOString()}) — granted anchor NOT assertable, not a pass`);
+    continue;
+  }
+  if (!grantedKeysPresent) {
+    notes.push(`R  ${k.symbol} order ${k.orderId} — D7 keys ABSENT on this build; the granted anchor cannot be graded (it reads as a finding here)`);
+    continue;
+  }
+  const g = granted.find(x => x.orderId === k.orderId);
+  const accused = findings.find(x => x.orderId === k.orderId);
+  check(`R  ${k.symbol} order ${k.orderId} is reported GRANTED, not accused (sold ${k.sold} / ours ${k.ours} / ${k.basis} / ${k.grant} via ${k.source})`,
+    !!g && !accused && g.soldContracts === k.sold && g.engineOpenContracts === k.ours && g.basis === k.basis
+      && g.grant === k.grant && g.grantSource === k.source,
+    g ? `sold ${g.soldContracts} ours ${g.engineOpenContracts} basis ${g.basis} grant ${g.grant} via ${g.grantSource}${accused ? ' AND ACCUSED' : ''}`
+      : (accused ? 'ACCUSED — served as a finding' : 'NOT REPORTED'));
+}
+
+// ── the grants, always printed — a withheld accusation is a decision, and a
+// `closed_row` grant is one this grader cannot verify from the tape ─────────
+if (grantedKeysPresent) {
+  notes.push(`GRANTED  ${granted.length} excess close(s) / ${grantedContracts} contract(s) sold under a grant, NOT accused — `
+    + (granted.map(g => `${g.optionSymbol}(${g.orderId},${g.excessContracts},${g.grant}/${g.grantSource})`).join(' ') || 'none'));
+  const unverifiable = granted.filter(g => g.grantSource === 'closed_row');
+  if (unverifiable.length > 0) {
+    notes.push(`GRANTED  ${unverifiable.length} of those are \`closed_row\` grants: PRE-CUT records whose authority was read off a closed row at `
+      + 'publication time. G10 proves only that the record is unstamped; the row itself is behind auth and is NOT verified here.');
+  }
 }
 
 // ── the residual fail-open, always printed ─────────────────────────────────
@@ -335,7 +429,8 @@ if (!boundExercised) {
 console.log(`\nPASS${FIXTURE ? ' (FIXTURE — proves the pass branch is REACHABLE; says nothing about the box)' : ''}`
   + ` — ${rows.length}/${rows.length}; the bound was exercised ${bound.checked}× on this boot `
   + `(bounded ${bound.bounded}, contracts refused ${bound.refusedContracts}, blind ${bound.blindRows}, `
-  + `desk_add exempt ${bound.deskAddExempt ?? '—'}, last refusal ${bound.lastRefusalReason ?? 'none'}).`);
+  + `desk_add exempt ${bound.deskAddExempt ?? '—'}, last refusal ${bound.lastRefusalReason ?? 'none'}); `
+  + `detector: findings ${findings.length} / granted ${grantedKeysPresent ? granted.length : '—'} / blind ${blinds.length}.`);
 process.exit(0);
 
 function print() {

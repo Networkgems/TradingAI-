@@ -227,6 +227,31 @@ function isOrigin(v: unknown): v is LiveFillOrigin {
 }
 
 /**
+ * TRA-3926 (2026-08-26) — the AUTHORITY the row carried when this engine
+ * closed it, stamped by the close chokepoint from the row's own durable fields:
+ * - 'desk_add'    — `adoptionAuthority: 'desk_add'`, the board's TRA-3909
+ *   exemption ("the bot should manage added positions"; card `d4f622fb`).
+ * - 'handed_over' — a well-formed per-row `engineHandover` (TRA-3829 ruling B).
+ * - 'none'        — the chokepoint LOOKED and the row carried neither.
+ * `null` on the record ⇒ UNSTAMPED: a line written before this field existed,
+ * or a caller that could not see the row (the reconcile importer).
+ *
+ * Why it exists: on 2026-08-26T13:45:31Z the engine sold the desk's
+ * `RIG260925C00006000` contract under the exemption — exactly as the board
+ * instructed and as the exit bound admitted (`desk_add_exempt`) — and the
+ * over-sell detector charged it as a finding, because a fill record could not
+ * say WHY the engine sold a contract its own opens did not cover. A granted
+ * sale and an unauthorised one were the same bytes. This is the discriminator;
+ * the detector partitions on it and never on the count alone.
+ */
+export type LiveCloseGrant = 'desk_add' | 'handed_over';
+export type LiveCloseGrantStamp = LiveCloseGrant | 'none';
+
+function isCloseGrantStamp(v: unknown): v is LiveCloseGrantStamp {
+  return v === 'desk_add' || v === 'handed_over' || v === 'none';
+}
+
+/**
  * One real Tradier fill, open or close. Every price is per-contract (per-share ×
  * 1). Slippage is signed in the direction of cost: for a BUY, `filled − ask` > 0
  * means we paid up through the ask; for a SELL it is `filled − ask` in the same
@@ -309,6 +334,13 @@ export interface LiveOptionFillRecord {
   admission?: OptionAdmissionStamp | null;
   /** TRA-3997 — WHY `admission` is `null`; `null` whenever `admission` is an object. */
   admissionReason?: OptionAdmissionAbsentReason | null;
+  /**
+   * TRA-3926 — see {@link LiveCloseGrantStamp}. Meaningful on `sell_to_close`
+   * rows only; a `buy_to_open` carries `null`. ALWAYS written by this build
+   * (`toRecord` never omits it); optional on the TYPE only so fixtures and
+   * pre-cut record literals compile. A reader treats an absent key as `null`.
+   */
+  exitGrant?: LiveCloseGrantStamp | null;
 }
 
 /** The mutable inputs a caller hands {@link recordLiveOptionFill}; the module fills ts/etDay/derived slippage. */
@@ -346,6 +378,12 @@ export interface LiveOptionFillInput {
    * not a coherent object; a caller that passes neither is recorded `unstamped`.
    */
   admissionReason?: OptionAdmissionAbsentReason | null;
+  /**
+   * TRA-3926 — the row's authority at close time (see {@link LiveCloseGrantStamp}).
+   * The close chokepoint passes `resolveCloseGrant(row)`; anything else is
+   * recorded `null` (UNSTAMPED), never coerced to `'none'`.
+   */
+  exitGrant?: LiveCloseGrantStamp | null;
 }
 
 // ── In-memory store (backs the durable records + the health endpoint) ─────────
@@ -532,6 +570,11 @@ function toRecord(input: LiveOptionFillInput): LiveOptionFillRecord {
     // as `null` + `unstamped`: BLIND, never back-filled (AC5).
     admission,
     admissionReason,
+    // TRA-3926 — the row's authority at close time. A pre-cut line or a caller
+    // with no row hydrates `null` (UNSTAMPED); never back-filled to `'none'`,
+    // because "we looked and there was no grant" is a statement only the
+    // chokepoint that saw the row can make.
+    exitGrant: isCloseGrantStamp(input.exitGrant) ? input.exitGrant : null,
   };
 }
 
@@ -1785,6 +1828,9 @@ export function hydrateLiveOptionsFeeSlippageFromDisk(
       // back-fill here and there must not be (AC5).
       admission: rec.admission,
       admissionReason: rec.admissionReason,
+      // TRA-3926 — pass the close grant through untouched; a line with no key
+      // hydrates `null` (UNSTAMPED) and there is no back-fill.
+      exitGrant: rec.exitGrant,
     });
     fills.push(clean);
     // TRA-3977 — a hydrated row is a witness too: a file carrying two books'
@@ -1951,6 +1997,14 @@ function recordToInput(
     ts: rec.ts,
     etDay: rec.etDay,
     sleeve: rec.sleeve,
+    // ⛔ TRA-3977 / TRA-3926 (2026-08-26) — THE BOOK MUST SURVIVE A BACK-FILL.
+    // This converter omitted `book`, so every fee / price reconcile pass
+    // re-derived the row through `toRecord` with `book: undefined` and wrote
+    // it back UNATTRIBUTED. That is the `book: null` on 5/5 post-deploy fills
+    // TRA-3977 measured on 2026-08-25: the chokepoint stamped the book and the
+    // next gainloss pass stripped it. A stamp is a fact about the fill, not
+    // about the fee; every stamp on the row rides through here verbatim.
+    book: rec.book,
     optionSymbol: rec.optionSymbol,
     side: rec.side,
     contracts: rec.contracts,
@@ -1966,6 +2020,8 @@ function recordToInput(
     // survive it verbatim (it is a fact about the admit, not about the fee).
     admission: rec.admission,
     admissionReason: rec.admissionReason,
+    // TRA-3926 — and so must the close grant (a fact about the close).
+    exitGrant: rec.exitGrant,
   };
 }
 

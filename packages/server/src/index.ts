@@ -352,7 +352,11 @@ import {
   summarizeEngineSubmitWitness,
   engineSubmittedProductionOrderIds,
 } from './tra3939-order-provenance-capture.js';
-import { detectOversoldEngineCloses } from './tra3926-oversold-close-detector.js';
+import {
+  detectOversoldEngineCloses,
+  resolveCloseGrant,
+  setClosedRowGrantLookup,
+} from './tra3926-oversold-close-detector.js';
 // TRA-2820 — live-book "is it actually stopped?" counter for /api/health/options-live.
 import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability, mergeDayOneStopPosture, blindDayOneStopPosture, mergeOtmSleeveStopCoverage, blindOtmSleeveStopCoverage, type PaperOptionsAccount } from './options-account.js';
 import { resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule } from './exit-risk-rules-flag.js';
@@ -6361,6 +6365,25 @@ registerLiveHealthRoutes(app, {
 setLiveOtmFleetCapitalProvider(() =>
   getAllUserContexts().map(ctx => ctx.engine.getLiveOtmFleetCapitalRow()),
 );
+
+// TRA-3926 (2026-08-26) — the over-sell detector's FALLBACK authority for
+// close records written before `exitGrant` existed: a live/production CLOSED
+// row on the same OCC whose `closedAt` is the record's fill `ts` to the
+// millisecond (both are stamped from the same fill event; measured identical
+// on `RIG260925C00006000` order 143384264). Whole fleet, every book, because
+// the tape is fleet-wide and a pre-cut record carries `book: null`. Consulted
+// only on unstamped records — see `GrantedClose.grantSource`.
+setClosedRowGrantLookup((optionSymbol, ts) => {
+  for (const ctx of getAllUserContexts()) {
+    for (const row of ctx.engine.getState().options.closedOptions ?? []) {
+      if (row.mode !== 'live' || row.tradierEnv !== 'production') continue;
+      if (row.optionSymbol !== optionSymbol || row.closedAt !== ts) continue;
+      const grant = resolveCloseGrant(row);
+      return grant === 'none' ? null : grant;
+    }
+  }
+  return null;
+});
 
 // TRA-1004 — autonomous demo-loop status. Unauthenticated by design (parity with
 // the other `/api/health/*` probes): the snapshot carries only the flag state,
