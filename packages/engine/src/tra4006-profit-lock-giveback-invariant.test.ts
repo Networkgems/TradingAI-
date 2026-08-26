@@ -13,6 +13,23 @@
 //   shouldExit ⇒ peakR ≥ currentR + 1.0 = 1.0331 ⇒ peakPremium ≥ 1.822
 //   ⇒ peak open gain ≥ $31.20, realised $1.00, ≥ 96.8% given back.
 //
+// PROVENANCE OF THE ANCHOR (do not "correct" `entry 1.51` to the export's
+// later `1.395`). The figures above were read off the BOOK-sourced export row
+// (`export.ts` `rowFromOption`: `entry_price ← opt.premiumPaid`, plus the
+// book-only columns `exit_price` and `pnl_r_stop_basis`, which is how we know
+// which path served it) between the 13:45Z close and the 21:00 ET archive.
+// After `archiveClosedOptions()` the same close is served from the JOURNAL
+// (row `63a5bc3a`, order `143196771`), and `export-history.ts`
+// `rowFromJournalRecord` publishes `entry_price ← entryMarkUsd` on an
+// unrestated row — the scanner's PRE-TRADE MID stamped at open
+// (`options-account.ts` open write: `entryMarkUsd: quote.mark`), NOT the
+// broker-reconciled basis `restateEngineOpenedBasis()` installs into
+// `premiumPaid` and that `profitLockDecision` consumes. So the export's
+// 1.395 and this fixture's 1.51 are two different quantities, and only 1.51 is
+// the `entry` the exit rule saw. The journal row carries neither `premiumPaid`
+// nor `stopLossPremium` (and `peakPremium` only since TRA-4020, forward-only),
+// so this anchor is not re-readable from outside the box after the archive.
+//
 // The ruling (QuantTrader, on the ticket) decouples the arm from the allowance:
 // arm 0.75R, give-back 0.40R, tighten at 2.0R to 0.25R. The specific numbers are
 // a calibration; the INEQUALITIES are the defect, and they are what this file
