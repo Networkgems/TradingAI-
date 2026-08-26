@@ -6,6 +6,7 @@ import {
   PROFIT_LOCK_GIVEBACK_R,
   PROFIT_LOCK_TIGHTEN_PEAK_R,
   PROFIT_LOCK_TIGHTEN_GIVEBACK_R,
+  type ProfitFloorLadderStep,
   BOOK_GIVEBACK_CAP_PCT,
   TAKE_PROFIT_EARLY_CAPTURE_PCT,
   CORRELATED_EXPOSURE_CAP_PCT,
@@ -168,6 +169,29 @@ export interface ProfitLockParams {
   giveBackR?: number;
   tightenPeakR?: number;
   tightenGiveBackR?: number;
+  /**
+   * TRA-4020 (R1) — the ratcheting profit-floor ladder, rungs ascending in
+   * `peakR`. PRESENT ⇒ the rung in force is the highest one whose `peakR` the
+   * position has reached; the rule arms at the first rung and the exit level is
+   * `max(peakR − rung.giveBackR, rung.floorR)`. The four scalar params above are
+   * ignored while a ladder is supplied. ABSENT ⇒ the shipped rule, byte for byte.
+   */
+  floorLadder?: readonly ProfitFloorLadderStep[];
+}
+
+/** TRA-4020 — the floor-ladder half of a {@link ProfitLockDecision}; present only when a ladder was supplied. */
+export interface ProfitFloorDecision {
+  /** The rung's locked floor (in R). */
+  floorR: number;
+  /** `max(peakR − giveBackR, floorR)` — the level `shouldExit` tests against. */
+  exitLevelR: number;
+  /**
+   * True ⇒ the FLOOR leg is through (`armed && currentR ≤ floorR`). This is the
+   * leg that is exempt from the opening-range / PDT / swing suppressions and is
+   * journalled `profit_floor`; the give-back leg (`shouldExit && !floorLeg`)
+   * stays trail-family.
+   */
+  floorLeg: boolean;
 }
 
 export interface ProfitLockDecision {
@@ -186,6 +210,8 @@ export interface ProfitLockDecision {
   giveBackR: number;
   /** True ⇒ close the position now (open R retraced past the allowance). */
   shouldExit: boolean;
+  /** TRA-4020 — present iff `floorLadder` was supplied and R is non-degenerate. */
+  floor?: ProfitFloorDecision;
 }
 
 /**
@@ -200,24 +226,57 @@ export interface ProfitLockDecision {
  * +1R winner and then released it at breakeven. Defaults come from
  * `@trading-app/shared` (0.75 / 0.40 / 2.0 / 0.25); the inequality is asserted
  * in `tra4006-profit-lock-giveback-invariant.test.ts`.
+ *
+ * TRA-4020 (R1) — with `floorLadder` supplied, the exit level becomes
+ * `max(peakR − giveBackR, floorR)` off the highest rung reached. The floor is
+ * monotone in peakR, so once armed the level never falls, and with the shipped
+ * `PROFIT_FLOOR_LADDER` it is NO LOOSER than the flag-off rule at every peakR
+ * (the rung give-backs ARE the shipped allowances; the floors only add a
+ * lower bound) — it can only exit earlier with more locked, never open a loss
+ * path the shipped rule did not have. That is a property of the constants, not
+ * of this function, and `tra4020-profit-floor-ladder.test.ts` asserts it
+ * rather than trusting this sentence.
  */
 export function profitLockDecision(p: ProfitLockParams): ProfitLockDecision {
   const armR = p.armR ?? PROFIT_LOCK_ARM_R;
   const baseGiveBack = p.giveBackR ?? PROFIT_LOCK_GIVEBACK_R;
   const tightenPeakR = p.tightenPeakR ?? PROFIT_LOCK_TIGHTEN_PEAK_R;
   const tightenGiveBack = p.tightenGiveBackR ?? PROFIT_LOCK_TIGHTEN_GIVEBACK_R;
+  const ladder = p.floorLadder !== undefined && p.floorLadder.length > 0 ? p.floorLadder : undefined;
 
   const R = Math.abs(p.entry - p.initialStop);
   // Degenerate risk unit (no room between entry and stop): can't compute R
   // multiples, so the profit-lock stays disarmed and defers to other exits.
   if (!(R > 0)) {
-    return { R: 0, peakR: 0, currentR: 0, armed: false, giveBackR: baseGiveBack, shouldExit: false };
+    return { R: 0, peakR: 0, currentR: 0, armed: false, giveBackR: ladder?.[0]?.giveBackR ?? baseGiveBack, shouldExit: false };
   }
 
   const favPeak = p.side === 'buy' ? p.peakPrice - p.entry : p.entry - p.peakPrice;
   const favNow = p.side === 'buy' ? p.currentPrice - p.entry : p.entry - p.currentPrice;
   const peakR = favPeak / R;
   const currentR = favNow / R;
+
+  if (ladder !== undefined) {
+    // The highest rung reached. Rungs are ascending; a NaN peakR reaches none.
+    let rung: ProfitFloorLadderStep | undefined;
+    for (const step of ladder) {
+      if (peakR >= step.peakR) rung = step;
+      else break;
+    }
+    if (rung === undefined) {
+      return { R, peakR, currentR, armed: false, giveBackR: ladder[0]!.giveBackR, shouldExit: false };
+    }
+    const exitLevelR = Math.max(peakR - rung.giveBackR, rung.floorR);
+    return {
+      R,
+      peakR,
+      currentR,
+      armed: true,
+      giveBackR: rung.giveBackR,
+      shouldExit: currentR <= exitLevelR,
+      floor: { floorR: rung.floorR, exitLevelR, floorLeg: currentR <= rung.floorR },
+    };
+  }
 
   const armed = peakR >= armR;
   const giveBackR = peakR >= tightenPeakR ? tightenGiveBack : baseGiveBack;

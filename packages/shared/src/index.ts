@@ -2290,6 +2290,68 @@ export const PROFIT_LOCK_ARM_R = 0.75;                // arm once peak favorable
 export const PROFIT_LOCK_GIVEBACK_R = 0.40;           // exit if open R retraces 0.40R from peak (was 1.0)
 export const PROFIT_LOCK_TIGHTEN_PEAK_R = 2.0;        // once peakR ≥ 2.0R …
 export const PROFIT_LOCK_TIGHTEN_GIVEBACK_R = 0.25;   // … tighten the give-back to 0.25R (lock more of a big winner; was 0.5)
+//
+// TRA-4020 (parent TRA-4010, QuantTrader rule) — the RATCHETING PROFIT FLOOR.
+// One rung of the ladder `profitLockDecision` consumes when the
+// `PROFIT_FLOOR_TRAIL_ENABLED` flag hands it `floorLadder`: once `peakR` has
+// reached `peakR`, the exit level is `max(peakR − giveBackR, floorR)`. Rungs
+// are ascending in `peakR`; the rung in force is the highest one reached, so the
+// level is monotone in the peak and, once armed, never falls.
+//
+// Two legs share the level. The GIVE-BACK leg (`currentR ≤ peakR − giveBackR`)
+// is trail-family and stays subject to the live opening-range window / PDT /
+// swing holds (TRA-3217). The FLOOR leg (`currentR ≤ floorR`) is a locked level
+// that fires through all three — journalled `profit_floor`, never `profit_lock`.
+//
+// Calibration note (LeadDev, 2026-08-26): the TRA-4020 spec tabulated the
+// give-backs as 0.50 / 0.50 / 0.40 against the pre-TRA-4006 schedule (arm 1.0R,
+// give-back 1.0R). TRA-4006 landed two hours later and is what bqb1 runs
+// (`a989598`): 0.40R, tightened to 0.25R at 2.0R — TIGHTER than the spec's
+// column. The spec's own safety property ("strictly tighter than the shipped
+// rule at every peakR, so it cannot create a loss path that did not exist") is
+// the contract, and it is asserted in `tra4020-profit-floor-ladder.test.ts`; so
+// the rung give-backs here are the shipped `PROFIT_LOCK_*` allowances, and the
+// FLOORS are the spec's numbers. A looser give-back is a one-line recalibration
+// of this table, and the test will say which peakR it loosens at.
+export interface ProfitFloorLadderStep {
+  /** Peak favourable excursion (in R) at which this rung is reached. */
+  peakR: number;
+  /** Give-back allowance from the peak (in R) while this rung is in force. */
+  giveBackR: number;
+  /** Locked floor (in R): the exit level never sits below it once this rung is reached. */
+  floorR: number;
+}
+export const PROFIT_FLOOR_ARM_R = PROFIT_LOCK_ARM_R;   // the ladder arms where the lock arms (0.75R)
+export const PROFIT_FLOOR_RUNG1_FLOOR_R = 0.25;        // peakR ≥ 0.75 → never below +0.25R
+export const PROFIT_FLOOR_RUNG2_PEAK_R = 1.50;
+export const PROFIT_FLOOR_RUNG2_FLOOR_R = 1.00;        // peakR ≥ 1.50 → never below +1.00R
+export const PROFIT_FLOOR_RUNG3_PEAK_R = 2.50;
+export const PROFIT_FLOOR_RUNG3_FLOOR_R = 2.00;        // peakR ≥ 2.50 → never below +2.00R
+/**
+ * TRA-4020 (R4) — see `OptionPosition.openingRangeSuppressed`. `fires` counts
+ * ticks, not rules: a tick on which two trail-family rules were both refused
+ * counts once. `premiumAtFire` is stamped at the row's eventual exit (any
+ * reason) and stays absent while the row is open.
+ */
+export interface OptionOpeningRangeSuppression {
+  fires: number;
+  /** ms epoch of the first refused tick. */
+  firstSuppressedAt: number;
+  /** ms epoch of the most recent refused tick (also the per-tick dedupe key). */
+  lastSuppressedAt: number;
+  /** The mark on the first refused tick. */
+  premiumAtSuppression: number;
+  /** The mark on the tick the row's exit actually fired. */
+  premiumAtFire?: number;
+}
+export const PROFIT_FLOOR_LADDER: readonly ProfitFloorLadderStep[] = Object.freeze([
+  { peakR: PROFIT_FLOOR_ARM_R, giveBackR: PROFIT_LOCK_GIVEBACK_R, floorR: PROFIT_FLOOR_RUNG1_FLOOR_R },
+  { peakR: PROFIT_FLOOR_RUNG2_PEAK_R, giveBackR: PROFIT_LOCK_GIVEBACK_R, floorR: PROFIT_FLOOR_RUNG2_FLOOR_R },
+  // The shipped tighten step, reproduced so the ladder is never looser than the
+  // flag-off rule between 2.0R and 2.5R.
+  { peakR: PROFIT_LOCK_TIGHTEN_PEAK_R, giveBackR: PROFIT_LOCK_TIGHTEN_GIVEBACK_R, floorR: PROFIT_FLOOR_RUNG2_FLOOR_R },
+  { peakR: PROFIT_FLOOR_RUNG3_PEAK_R, giveBackR: PROFIT_LOCK_TIGHTEN_GIVEBACK_R, floorR: PROFIT_FLOOR_RUNG3_FLOOR_R },
+]);
 // Rule 3 — book-level daily give-back cap (the board's headline ask)
 export const BOOK_GIVEBACK_CAP_PCT = 0.40;            // flatten + halt after surrendering >40% of the day's peak open gain
 // TRA-3218 — the session stop arms at max(BOOK_SESSION_STOP_R × 1R,
@@ -2952,6 +3014,27 @@ export interface OptionPosition {
   tp1Hit: boolean;            // true once 50% has been exited at TP1
   stopLossPremium: number;    // hard stop loss at -25% (improved from -35%)
   peakPremium: number;        // highest mark seen (used for trailing stop)
+  /**
+   * TRA-4020 (R2/R4) — ms epoch of the tick that last ADVANCED `peakPremium`.
+   * Stamped only when the peak actually moves, never on a flat tick, so it
+   * dates the max favourable excursion rather than the last mark. Read by the
+   * freshness-scoped opening-range guard: a trail-family exit inside the live
+   * window is refused only when the peak it gives back from predates today's
+   * 09:30 ET open. ABSENT (a row persisted by an older build, or one that has
+   * not made a new high since) reads as STALE — the guard stays in force, which
+   * is today's behaviour. Persisted with the row; folded onto the journal close.
+   */
+  peakPremiumAt?: number;
+  /**
+   * TRA-4020 (R4) — bookkeeping for the live opening-range window: how many
+   * ticks a trail-family exit (chandelier / profit-lock / premium trail) was
+   * refused by the window, the mark at the FIRST refusal and the mark at the
+   * eventual exit. Written regardless of `PROFIT_FLOOR_TRAIL_ENABLED` (it is
+   * an instrument, not a decision), so the cost of the wait is measurable on
+   * the flag-off cohort too. Absent ↔ the window never refused an exit on this
+   * row.
+   */
+  openingRangeSuppressed?: OptionOpeningRangeSuppression;
   trailingActive: boolean;    // true once price is up 20% and trailing mode engaged
   trailingStopPremium: number; // current trailing stop level (peak * (1 - 0.12))
   underlyingEntryPrice: number;
@@ -3269,6 +3352,15 @@ export interface OptionPosition {
    * cleared the moment the stop stops triggering or the release opens.
    */
   otmStopHeldForPdt?: string;
+  /**
+   * TRA-4020 (R3) — the ET date key on which this live row's armed profit
+   * FLOOR was last HELD by the day-one PDT hold because the account had no
+   * day-trade capacity (the TRA-3943 release read `released: false`). Same
+   * once-per-row-per-day latch shape as `otmStopHeldForPdt`; cleared when the
+   * floor fires. The floor is exempt from the hold only where firing is not a
+   * PDT violation — on a cash account or a margin account with DTBP.
+   */
+  profitFloorHeldForPdt?: string;
   /**
    * TRA-3909 — the risk schedule a `desk_add` lot is managed on: the sleeve that
    * opened the ENGINE's sibling contract on the same OCC symbol, read from the
@@ -3731,6 +3823,15 @@ export interface OptionPosition {
    * rules-off snapshot.
    */
   peakUnderlying?: number;
+  /**
+   * TRA-4020 (R2) — ms epoch of the tick that last ADVANCED `peakUnderlying`
+   * (a higher high for a call, a lower low for a put). Same contract as
+   * `peakPremiumAt`: stamped only when the extreme moves; absent reads as
+   * STALE for the freshness-scoped opening-range guard. A seed or a TRA-3217
+   * re-anchor sets the extreme without stamping it — neither is a print that
+   * advanced the trail.
+   */
+  peakUnderlyingAt?: number;
   /**
    * TRA-1268 (TRA-1250 Rule 1) — last computed chandelier trail-stop level in
    * UNDERLYING price space. Persisted as the `prevTrailStop` so the trail only

@@ -462,6 +462,39 @@ export function isTakeProfitEarlyLiveEnabled(env: NodeJS.ProcessEnv = process.en
   return flagOn(env[TAKE_PROFIT_EARLY_LIVE_FLAG]);
 }
 
+// TRA-4020 (parent TRA-4010) — the ratcheting profit floor + freshness-scoped
+// opening-range guard on the options exit pass. ONE flag for all of R1–R3:
+//
+//   R1  `profitLockDecision` runs off `PROFIT_FLOOR_LADDER` (exit level
+//       `max(peakR − giveBackR, floorR)`, monotone in the peak);
+//   R2  the live opening-range window refuses a trail-family exit ONLY when the
+//       extreme it gives back from predates today's 09:30 ET open (absent
+//       timestamp ⇒ stale ⇒ refused, i.e. today's behaviour);
+//   R3  the FLOOR leg fires through the window, the PDT hold (only where the
+//       account has day-trade capacity) and the swing hold, journalled
+//       `profit_floor`.
+//
+// R4 (the `peakPremiumAt` / `openingRangeSuppressed` instrument) is NOT behind
+// this flag: it changes no decision and QuantTrader needs it on the flag-off
+// cohort to price the wait.
+//
+// Deliberately its OWN flag, not `EXIT_RISK_RULES_ENABLED`, so it can be
+// reverted without disarming the loss-side rules — but it RIDES the exit-risk
+// input (`OptionExitRiskInput`, which only exists while the master is on), so
+// the master is required: the floor is a leg of the profit-lock and there is no
+// profit-lock to attach it to with the master off. Live reads `process.env`
+// only; the demo book may arm through the `demo-flags.json` overlay (the
+// TRA-1294 / TRA-2949 split). OFF by default. Arming on bqb1 is a board /
+// operator call graded by QuantTrader (first 40 trail-family closes, revert if
+// mean R does not beat flag-off by ≥ +0.10R or `chandelier_deferred_breach`
+// goes non-zero). Accepts 1/true/yes/on.
+export const PROFIT_FLOOR_TRAIL_FLAG = 'PROFIT_FLOOR_TRAIL_ENABLED';
+
+/** True iff the TRA-4020 profit floor is armed: the exit-risk master AND its own flag. */
+export function isProfitFloorTrailEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isExitRiskRulesEnabled(env) && flagOn(env[PROFIT_FLOOR_TRAIL_FLAG]);
+}
+
 // TRA-3218 (parent TRA-2760) — the SCOPE of the book session-stop / give-back
 // halt as seen by the OPTIONS entry gates.
 //

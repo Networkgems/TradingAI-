@@ -22,6 +22,7 @@ import type {
   OptionAdmissionStamp,
 } from '@trading-app/shared';
 import { buildEntryQuoteStamp } from '@trading-app/shared';
+import type { ProfitFloorLadderStep } from '@trading-app/shared';
 import { recordEntryQuoteStampOutcome } from './entry-quote-stamp.js';
 import { computePortfolioGreeks } from './reports/portfolio-greeks.js';
 import { etDateKey, etWallClockToUtcMs } from './et-clock.js';
@@ -520,6 +521,20 @@ export interface OptionExitRiskInput {
    * (default 15; `0` disables). Absent → no guard (legacy callers/tests).
    */
   openingRangeGuardMin?: number;
+  /**
+   * TRA-4020 (parent TRA-4010) — the ratcheting profit-floor ladder. PRESENT ⇔
+   * the caller armed `PROFIT_FLOOR_TRAIL_ENABLED` (live: `process.env`; demo:
+   * the demo-flags overlay). When present, three things change on single-leg
+   * rows: the profit-lock runs off the ladder (R1, exit level
+   * `max(peakR − giveBackR, floorR)`); the live opening-range window refuses a
+   * trail-family exit only when the extreme it gives back from predates today's
+   * 09:30 ET open (R2, `peakPremiumAt` / `peakUnderlyingAt`, absent ⇒ stale);
+   * and the FLOOR leg fires through the window / PDT (with day-trade capacity)
+   * / swing holds as `profit_floor` (R3). ABSENT ⇒ every decision is byte-
+   * identical to the pre-TRA-4020 pass. The R4 instrument (`peakPremiumAt`,
+   * `openingRangeSuppressed`) is written either way.
+   */
+  profitFloorLadder?: readonly ProfitFloorLadderStep[];
 }
 
 /**
@@ -776,6 +791,57 @@ function minutesSinceRthOpen(now: number): number | null {
   const openMs = etWallClockToUtcMs(etDateKey(now), 9, 30);
   if (openMs == null) return null;
   return (now - openMs) / 60_000;
+}
+
+/**
+ * TRA-4020 (R2) — was the extreme last ADVANCED by a print at/after today's
+ * 09:30 ET open? `at` is the `peakPremiumAt` / `peakUnderlyingAt` stamp. The
+ * same open `minutesSinceRthOpen` measures from, read off the same calendar
+ * helper so the two cannot disagree about where the session starts.
+ *
+ * Fails CLOSED on every unknown — an absent or non-finite stamp (a row
+ * persisted by an older build, or one that has not made a new extreme since),
+ * a pre-open `now`, or a failed ET calendar read all answer `false` ("stale"),
+ * which leaves the TRA-3217 window in force. An absent stamp reading as
+ * "fresh" would silently disarm the guard on exactly the rows it was built
+ * for, and would read identically to a working guard on any session that does
+ * not gap.
+ */
+function extremeAdvancedThisSession(at: number | undefined, now: number): boolean {
+  if (at === undefined || !Number.isFinite(at)) return false;
+  const openMs = etWallClockToUtcMs(etDateKey(now), 9, 30);
+  if (openMs == null || now < openMs) return false;
+  return at >= openMs;
+}
+
+/**
+ * TRA-4020 (R4) — record that the live opening-range window refused a
+ * trail-family exit on this tick. One tick counts once, however many rules
+ * were refused on it (two refusals on one tick are one wait, not two). The
+ * first refusal captures the mark; `stampOpeningRangeFire` captures the mark
+ * at the row's eventual exit. Written regardless of the TRA-4020 flag — it is
+ * an instrument, and the flag-off cohort is the one that needs pricing.
+ */
+function noteOpeningRangeSuppression(opt: OptionPosition, mark: number, now: number): void {
+  const s = opt.openingRangeSuppressed;
+  if (s === undefined) {
+    opt.openingRangeSuppressed = {
+      fires: 1,
+      firstSuppressedAt: now,
+      lastSuppressedAt: now,
+      premiumAtSuppression: mark,
+    };
+    return;
+  }
+  if (s.lastSuppressedAt === now) return;
+  s.fires += 1;
+  s.lastSuppressedAt = now;
+}
+
+/** TRA-4020 (R4) — the mark at the row's eventual exit, stamped once. */
+function stampOpeningRangeFire(opt: OptionPosition, mark: number): void {
+  const s = opt.openingRangeSuppressed;
+  if (s !== undefined && s.premiumAtFire === undefined) s.premiumAtFire = mark;
 }
 
 /** Minutes in a regular 9:30–16:00 ET session. */
@@ -4393,6 +4459,10 @@ export class PaperOptionsAccount {
   private slDailyCloseHolds = 0;
   /** TRA-3902 (08-21) — live rows whose breached chandelier trail was held until the daily-close window, one per row per ET day. */
   private chandelierDailyCloseHolds = 0;
+  /** TRA-4020 (R3) — since-boot count of profit FLOOR exits this process fired (`profit_floor`). */
+  private profitFloorFires = 0;
+  /** TRA-4020 (R3) — since-boot count of armed profit floors HELD by the day-one PDT hold for want of day-trade capacity (one per row per ET day). */
+  private profitFloorPdtHolds = 0;
   /**
    * TRA-3943 — OTM intraday stops this process FIRED, split by leg. Since-boot.
    *
@@ -5217,6 +5287,10 @@ export class PaperOptionsAccount {
         }
         const realizedR = rec.atRiskUsd > 0 ? realizedPnlUsd / rec.atRiskUsd : 0;
         const holdDays = Math.max(0, (closeTs - rec.openTs) / MS_PER_DAY);
+        // TRA-4020 (R4) — MFE + the opening-range refusal record, off the
+        // position. Absent stays absent (a row that never ticked has no peak
+        // worth the name; a row the window never refused has no record).
+        const suppressed = position.openingRangeSuppressed;
         const close = {
           closeTs,
           outcome: outcomeForR(realizedR),
@@ -5225,6 +5299,25 @@ export class PaperOptionsAccount {
           exitReason,
           holdDays,
           brokerOrderId,
+          ...(Number.isFinite(position.peakPremium) ? { peakPremium: position.peakPremium } : {}),
+          ...(position.peakPremiumAt !== undefined && Number.isFinite(position.peakPremiumAt)
+            ? { peakPremiumAt: position.peakPremiumAt }
+            : {}),
+          ...(suppressed !== undefined
+            ? {
+                openingRangeSuppressed: {
+                  fires: suppressed.fires,
+                  firstSuppressedAt: suppressed.firstSuppressedAt,
+                  lastSuppressedAt: suppressed.lastSuppressedAt,
+                  premiumAtSuppression: suppressed.premiumAtSuppression,
+                  premiumAtFire:
+                    suppressed.premiumAtFire
+                    ?? (Number.isFinite(position.currentPremium) && position.currentPremium > 0
+                      ? position.currentPremium
+                      : null),
+                },
+              }
+            : {}),
         };
         if (rec.outcome !== 'OPEN') {
           // TRA-4004 — the row is already closed. This used to be a bare
@@ -8188,7 +8281,13 @@ export class PaperOptionsAccount {
 
       opt.currentPremium = mark;
 
-      if (mark > opt.peakPremium) opt.peakPremium = mark;
+      // TRA-4020 (R2/R4) — stamp the peak ONLY when it moves. `peakPremiumAt`
+      // dates the max favourable excursion; a flat tick must not refresh it or
+      // the freshness test below would read every held row as "advanced today".
+      if (mark > opt.peakPremium) {
+        opt.peakPremium = mark;
+        opt.peakPremiumAt = Date.now();
+      }
 
       // TRA-3946 — the average-down SHADOW, on the same mark the stops read.
       // Observe-only: writes the row's running MAE and a journal verdict, and
@@ -8211,7 +8310,37 @@ export class PaperOptionsAccount {
         && (positionIsLive || this.swingHoldOptions)
         && openedTodayKey;
       const inOpeningRange = withinOpeningRange && positionIsLive;
-      const trailExitSuppressed = pdtHeldToday || swingHeldToday || inOpeningRange;
+      // TRA-4020 (R2) — the FRESHNESS-SCOPED window for the trail family. The
+      // TRA-3217 docstring states the assumption out loud ("the peak it gives
+      // back from is yesterday's") and never checks it; on NVTS 2026-08-25 the
+      // peak was set at 09:33 THAT session and the clock still refused the exit
+      // until 09:45, into a −6.4% roll-over. Under the flag, a trail-family exit
+      // is refused inside the window only when the extreme it gives back from
+      // was last advanced BEFORE today's open — per extreme, because the
+      // chandelier trails `peakUnderlying` and the lock / premium trail trail
+      // `peakPremium`. Flag off ⇒ both collapse to the clock, byte for byte.
+      //
+      // Deliberately NOT applied to `inOpeningRange` itself: the TRA-3902 hard-
+      // stop hold and the TRA-3943 OTM day-one stop read the CLOCK window, and a
+      // fresh peak says nothing about whether the opening print is noise for a
+      // stop. Only the three trail-family consumers take the scoped predicate.
+      //
+      // And a fresh peak releases the window ONLY while the row is still in
+      // profit (`mark ≥ premiumPaid`). A peak set at 09:32 and a −1R print at
+      // 09:35 are BOTH opening prints; letting the give-back leg sell the second
+      // one would realise, via a side door, exactly the loss the TRA-3902 hold
+      // refuses to realise via the stop. Inside the window nothing sells a
+      // loser — fresh-peak exits LOCK profit; they do not book losses. (Caught
+      // by `tra4020-profit-floor-trail.test.ts` before it shipped.)
+      const profitFloorLadder = exitRisk?.profitFloorLadder;
+      const freshPeakReleasesWindow = profitFloorLadder !== undefined && mark >= opt.premiumPaid;
+      const premiumTrailInOpeningRange =
+        inOpeningRange
+        && !(freshPeakReleasesWindow && extremeAdvancedThisSession(opt.peakPremiumAt, Date.now()));
+      const chandelierInOpeningRange =
+        inOpeningRange
+        && !(freshPeakReleasesWindow && extremeAdvancedThisSession(opt.peakUnderlyingAt, Date.now()));
+      const trailExitSuppressed = pdtHeldToday || swingHeldToday || chandelierInOpeningRange;
 
       // TRA-3943 (parent TRA-3927, board card `a29b2db8`) — the OTM sleeve's
       // INTRADAY stop, evaluated HERE rather than down in the exit cascade
@@ -8361,9 +8490,14 @@ export class PaperOptionsAccount {
             }
             delete opt.chandelierStop;
           }
+          // TRA-4020 (R2) — stamp `peakUnderlyingAt` only when the extreme
+          // actually moves (a seed from the entry anchor or from spot is not a
+          // print that advanced the trail, and neither is a flat tick).
+          const priorPeakUnderlying = opt.peakUnderlying;
           opt.peakUnderlying = chandelierUSide === 'buy'
             ? Math.max(opt.peakUnderlying, chandelierUnderlying)
             : Math.min(opt.peakUnderlying, chandelierUnderlying);
+          if (opt.peakUnderlying !== priorPeakUnderlying) opt.peakUnderlyingAt = Date.now();
           opt.chandelierStop = chandelierStop({
             side: chandelierUSide,
             initialStop: chandelierUSide === 'buy' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY,
@@ -8489,6 +8623,52 @@ export class PaperOptionsAccount {
       // trailing state above still updates, same as the rejection breaker.
       if ((opt.exitExpiredCount ?? 0) >= MAX_CONSECUTIVE_EXIT_EXPIRIES) continue;
 
+      // TRA-4020 (R3) — the profit FLOOR, evaluated HERE for the reason the
+      // TRA-3943 OTM stop is evaluated above the cascade: the two holds it is
+      // exempt from (`pdtHeldToday`, `swingHeldToday`) `continue` before the
+      // cascade runs. The floor is the locked-profit leg of the ladder
+      // (`currentR ≤ floorR`), not the trailing give-back leg — that one stays
+      // trail-family and is refused by the same windows as before.
+      //
+      // Scope: single-leg, flag on, and NOT a row the engine has declined to
+      // manage (`riskUnmanagedReason`, TRA-2820) — a rule that fires through
+      // three holds must not be the side door back into an unmanaged row.
+      //
+      // And ONLY while the row still holds profit (`currentR ≥ 0`). The floor
+      // is a PROFIT lock: it exists so a winner is not ridden back to flat. A
+      // row that has gapped through the floor into a loss is no longer this
+      // rule's — the loss-side rules (the hard stop and its TRA-3902 hold /
+      // daily-close policy, the catastrophic stop) own it, with the holds the
+      // board ordered. Without this bound the exempt leg would realise a −1R
+      // gap on the opening print, which is exactly the sale TRA-3902 exists to
+      // refuse (caught by `tra4020-profit-floor-trail.test.ts`). Between 0R and
+      // the floor the give-back leg below still applies, under its windows.
+      let profitFloorTrigger: { floorR: number; currentR: number; peakR: number } | null = null;
+      if (profitFloorLadder !== undefined && exitRisk && !opt.legs && !opt.riskUnmanagedReason) {
+        const floorRead = profitLockDecision({
+          side: 'buy',
+          entry: opt.premiumPaid,
+          initialStop: opt.stopLossPremium,
+          peakPrice: opt.peakPremium,
+          currentPrice: mark,
+          floorLadder: profitFloorLadder,
+        });
+        if (floorRead.floor?.floorLeg && floorRead.currentR >= 0) {
+          profitFloorTrigger = { floorR: floorRead.floor.floorR, currentR: floorRead.currentR, peakR: floorRead.peakR };
+        }
+      }
+      // The PDT exemption is CAPACITY-GATED, the one place this build reads the
+      // spec differently from its letter ("fires regardless of pdtHeldToday").
+      // A same-day round trip on a margin account with no day-trade capacity is
+      // a PDT violation the broker rejects or flags — an account-level harm no
+      // profit rule should risk. TRA-3943 already resolves exactly that read off
+      // the live balance snapshot (`otmDayOneStop.release`: cash account or
+      // positive DTBP ⇒ released); the floor reuses it, and fails CLOSED when
+      // the release is absent or says no — held, counted, logged once per day.
+      const profitFloorClearsPdt =
+        profitFloorTrigger !== null
+        && (!pdtHeldToday || options.otmDayOneStop?.release.released === true);
+
       // TRA-483 — PDT-aware overnight hold. Same-day round trips on a live
       // position count as a day trade and burn DTBP; the issue's wake comment
       // makes overnight hold the required default for live so the engine
@@ -8512,7 +8692,27 @@ export class PaperOptionsAccount {
       // still refuses the TP1 partial, take-profit-early and the trail on day one.
       // `otmStopTrigger` is null unless the release said yes, so the fail-closed
       // direction is spelled at the site that computes it, not here.
-      if (pdtHeldToday && otmStopTrigger === null) {
+      // TRA-4020 (R3) — ...and the SECOND exception: an armed profit floor on an
+      // account with day-trade capacity. Without capacity the floor is held
+      // like everything else, and says so once per row per ET day.
+      if (pdtHeldToday && otmStopTrigger === null && !profitFloorClearsPdt) {
+        if (profitFloorTrigger !== null) {
+          const dayKey = etDateKey(Date.now());
+          if (opt.profitFloorHeldForPdt !== dayKey) {
+            opt.profitFloorHeldForPdt = dayKey;
+            this.profitFloorPdtHolds += 1;
+            accountLog.warn('profit FLOOR HELD on day one — no day-trade capacity', {
+              issue: 'TRA-4020',
+              optionSymbol: opt.optionSymbol,
+              mark,
+              floorR: profitFloorTrigger.floorR,
+              currentR: profitFloorTrigger.currentR,
+              peakR: profitFloorTrigger.peakR,
+              releaseReason: options.otmDayOneStop?.release.reason ?? 'release_absent',
+              accountType: options.otmDayOneStop?.release.accountType ?? null,
+            });
+          }
+        }
         continue;
       }
 
@@ -8543,7 +8743,11 @@ export class PaperOptionsAccount {
       // the user turns this on.
       // TRA-3217 — predicate computed above, next to the trail bookkeeping it
       // must stay in lockstep with.
-      if (swingHeldToday) {
+      // TRA-4020 (R3) — an armed profit FLOOR is exempt from the swing hold (the
+      // rule as QuantTrader specified it: the floor is locked profit, and a
+      // hold that lets a locked +1R ride back to flat is the defect, not the
+      // policy). Every other exit stays held.
+      if (swingHeldToday && profitFloorTrigger === null) {
         continue;
       }
 
@@ -8575,6 +8779,7 @@ export class PaperOptionsAccount {
             rvExitParams ?? DEFAULT_EXIT_PARAMS,
           );
           if (reason === 'supertrend_flip' || reason === 'ma20_close_through' || reason === 'time_stop') {
+            stampOpeningRangeFire(opt, mark); // TRA-4020 (R4)
             if (waitAndHold) {
               // TRA-2984 — same escalation as the SL/trail staging site below:
               // a structural exit whose previous order expired unfilled is
@@ -8779,6 +8984,33 @@ export class PaperOptionsAccount {
         });
       }
 
+      // TRA-4020 (R3) — the profit FLOOR fires next: through the opening-range
+      // window (no `inOpeningRange` term — that is the exemption), and, having
+      // passed the two gates above, through the PDT / swing holds. Journalled
+      // as its OWN reason: TRA-3217 item 4 already paid for collapsing three
+      // mechanisms into one label. `exitKind: 'trail'` is only the broker
+      // order-pricing bucket (a LIMIT at the mark, like `profit_lock`).
+      if (exitPremium === null && profitFloorTrigger !== null) {
+        exitPremium = mark;
+        exitKind = 'trail';
+        exitJournalReason = 'profit_floor';
+        delete opt.profitFloorHeldForPdt;
+        this.profitFloorFires += 1;
+        accountLog.info('profit FLOOR fired', {
+          issue: 'TRA-4020',
+          optionSymbol: opt.optionSymbol,
+          mode: opt.mode ?? 'demo',
+          mark,
+          peakPremium: opt.peakPremium,
+          floorR: profitFloorTrigger.floorR,
+          currentR: profitFloorTrigger.currentR,
+          peakR: profitFloorTrigger.peakR,
+          throughOpeningRange: inOpeningRange,
+          throughPdtHold: pdtHeldToday,
+          throughSwingHold: swingHeldToday,
+        });
+      }
+
       // TRA-1268 (TRA-1250 Rules 1-2) — evaluate the give-back rules first so a
       // ratchet-trail break or a profit give-back exits at the live mark BEFORE
       // the hard premium stop is reached. Both close the full remaining position
@@ -8812,7 +9044,7 @@ export class PaperOptionsAccount {
           }
         }
 
-        const chandelierBreachedNow =
+        const chandelierBreachRaw =
           exitPremium === null
           // TRA-3941 — stated at the FIRE as well as at the ratchet. The three
           // conjuncts below are already all false for a retired row (the block
@@ -8825,11 +9057,13 @@ export class PaperOptionsAccount {
           && chandelierUSide !== null
           && chandelierUnderlying != null
           && opt.chandelierStop !== undefined
-          // TRA-3217 item 2 — no trail-driven fires inside the live
-          // opening-range window; the bookkeeping above holds the breach for a
-          // post-window re-test instead.
-          && !inOpeningRange
           && chandelierExitTriggered(chandelierUSide, chandelierUnderlying, opt.chandelierStop);
+        // TRA-3217 item 2 — no trail-driven fires inside the live opening-range
+        // window; the bookkeeping above holds the breach for a post-window
+        // re-test instead. TRA-4020 (R2) — the window is the freshness-scoped
+        // one for this extreme, and (R4) a refusal is counted on the row.
+        if (chandelierBreachRaw && chandelierInOpeningRange) noteOpeningRangeSuppression(opt, mark, Date.now());
+        const chandelierBreachedNow = chandelierBreachRaw && !chandelierInOpeningRange;
         // TRA-3902 (board, 2026-08-21, comment 427fa1f4) — under the live
         // `daily_close` policy the chandelier, like the −20% premium stop, is a
         // level on the CLOSE: it is read only inside the last `closeWindowMin`
@@ -8885,24 +9119,35 @@ export class PaperOptionsAccount {
                 : opt.chandelierTrailNote === 'spot_seeded'
                   ? 'chandelier_spot_seeded'
                   : 'chandelier';
-        } else if (exitPremium === null && !inOpeningRange) {
+        } else if (exitPremium === null) {
           // Rule 2 — trade-level profit-lock on premium-derived R (we are always
           // LONG the premium, so entry = premiumPaid, stop = stopLossPremium).
           // TRA-3217 item 2 — a give-back lock is trail-family, so the live
           // opening-range window refuses it too (the peak it gives back from
           // is yesterday's; fifteen minutes of session tell us whether the
           // give-back is real).
+          // TRA-4020 — (R1) the ladder rides in when the flag is on, so this
+          // give-back leg exits at `max(peakR − giveBackR, floorR)`; (R2) the
+          // window that refuses it is the freshness-scoped one — "the peak is
+          // yesterday's" is now checked rather than assumed; (R4) the decision
+          // is evaluated INSIDE the window too (pure, no side effect) so a
+          // refusal is counted on the row instead of vanishing.
           const lock = profitLockDecision({
             side: 'buy',
             entry: opt.premiumPaid,
             initialStop: opt.stopLossPremium,
             peakPrice: opt.peakPremium,
             currentPrice: mark,
+            ...(profitFloorLadder !== undefined ? { floorLadder: profitFloorLadder } : {}),
           });
           if (lock.shouldExit) {
-            exitPremium = mark;
-            exitKind = 'trail';
-            exitJournalReason = 'profit_lock';
+            if (premiumTrailInOpeningRange) {
+              noteOpeningRangeSuppression(opt, mark, Date.now());
+            } else {
+              exitPremium = mark;
+              exitKind = 'trail';
+              exitJournalReason = 'profit_lock';
+            }
           }
         }
       }
@@ -9018,14 +9263,23 @@ export class PaperOptionsAccount {
         // bookkeeping yet — the 3/3 live dumps were all `chandelier`, and a
         // premium trail only arms after the position is up `trailActivatePct`
         // — recorded as a residual on the ticket.
-        } else if (!inOpeningRange && opt.trailingActive && isArmedThreshold(opt.trailingStopPremium) && mark <= opt.trailingStopPremium) {
-          exitPremium = opt.trailingStopPremium;
-          exitKind = 'trail';
-          exitJournalReason = 'trail';
+        } else if (opt.trailingActive && isArmedThreshold(opt.trailingStopPremium) && mark <= opt.trailingStopPremium) {
+          // TRA-4020 — (R2) freshness-scoped window; (R4) the refusal is counted.
+          if (premiumTrailInOpeningRange) {
+            noteOpeningRangeSuppression(opt, mark, Date.now());
+          } else {
+            exitPremium = opt.trailingStopPremium;
+            exitKind = 'trail';
+            exitJournalReason = 'trail';
+          }
         }
       }
 
       if (exitPremium !== null && exitKind !== null) {
+        // TRA-4020 (R4) — the mark at the eventual fire, whichever rule fired.
+        // Stamped at the STAGE on the live path (the fill lands later, on a
+        // different tick) and at the close on the paper path.
+        stampOpeningRangeFire(opt, mark);
         if (waitAndHold) {
           // TRA-354 — stage the full exit at the trigger (SL or trailing)
           // price; engine submits a Tradier limit sell_to_close. The paper
@@ -10053,6 +10307,21 @@ export class PaperOptionsAccount {
    */
   getSlOpeningRangeHolds(): number {
     return this.slOpeningRangeHolds;
+  }
+
+  /** TRA-4020 (R3) — since-boot count of `profit_floor` exits this process fired. */
+  getProfitFloorFires(): number {
+    return this.profitFloorFires;
+  }
+
+  /**
+   * TRA-4020 (R3) — since-boot count of armed profit floors HELD by the day-one
+   * PDT hold because the account had no day-trade capacity (one per row per ET
+   * day). A non-zero here is a row the floor wanted to lock and could not
+   * without a PDT violation.
+   */
+  getProfitFloorPdtHolds(): number {
+    return this.profitFloorPdtHolds;
   }
 
   /**

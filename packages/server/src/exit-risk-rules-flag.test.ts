@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, OTM_DELTA_FLOOR_DEFAULT, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, entryDeltaCeilingReject, entryDeltaCeilingVerdict, OPTION_ENTRY_DELTA_CEILING_DEFAULT, isRvExitRetuneEnabled, resolveRvExitConfirmBars, RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled, isRvExitRetuneLiveEnabled, isTakeProfitEarlyLiveEnabled, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isProfitFloorTrailEnabled, isTakeProfitEarlyEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, OTM_DELTA_FLOOR_DEFAULT, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, entryDeltaCeilingReject, entryDeltaCeilingVerdict, OPTION_ENTRY_DELTA_CEILING_DEFAULT, isRvExitRetuneEnabled, resolveRvExitConfirmBars, RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled, isRvExitRetuneLiveEnabled, isTakeProfitEarlyLiveEnabled, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT } from './exit-risk-rules-flag.js';
 
 // TRA-1250 / TRA-1269 / TRA-1294 / TRA-1295 — master switch + the isolated sub-flags.
 
@@ -317,6 +317,21 @@ describe('TRA-2949 live swing-exit flags', () => {
   it('the demo re-tune flag does NOT arm the live port (and vice versa)', () => {
     expect(isRvExitRetuneLiveEnabled({ RV_EXIT_RETUNE_ENABLED: '1' })).toBe(false);
     expect(isRvExitRetuneEnabled({ RV_EXIT_RETUNE_LIVE_ENABLED: '1' })).toBe(false);
+  });
+  // TRA-4020 — its own flag (revertible without disarming the loss-side rules)
+  // that nonetheless REQUIRES the master, because the floor is a leg of the
+  // profit-lock and there is no profit-lock to attach it to with the master off.
+  it('PROFIT_FLOOR_TRAIL_ENABLED defaults off, needs the exit-risk master, and never rides another flag', () => {
+    expect(isProfitFloorTrailEnabled({})).toBe(false);
+    expect(isProfitFloorTrailEnabled({ PROFIT_FLOOR_TRAIL_ENABLED: '1' })).toBe(false);
+    expect(isProfitFloorTrailEnabled({ EXIT_RISK_RULES_ENABLED: '1' })).toBe(false);
+    for (const v of ['1', 'true', 'YES', ' on ']) {
+      expect(isProfitFloorTrailEnabled({ EXIT_RISK_RULES_ENABLED: '1', PROFIT_FLOOR_TRAIL_ENABLED: v })).toBe(true);
+    }
+    expect(isProfitFloorTrailEnabled({ EXIT_RISK_RULES_ENABLED: '1', PROFIT_FLOOR_TRAIL_ENABLED: 'off' })).toBe(false);
+    expect(isProfitFloorTrailEnabled({ EXIT_RISK_RULES_ENABLED: '1', TAKE_PROFIT_EARLY_LIVE_ENABLED: '1' })).toBe(false);
+    // And the master alone does not switch the floor on (the whole point of a separate flag).
+    expect(isExitRiskRulesEnabled({ EXIT_RISK_RULES_ENABLED: '1' })).toBe(true);
   });
   it('TAKE_PROFIT_EARLY_LIVE_ENABLED defaults off, is standalone, and never rides the demo flag', () => {
     expect(isTakeProfitEarlyLiveEnabled({})).toBe(false);

@@ -303,6 +303,14 @@ export const DEMO_FLAG_ALLOWLIST = [
   // be armed daemon-free on the self-hosted host (no PM2/admin).
   'ENABLE_MARKETABLE_OPEN_MTM',
   'MARKETABLE_OPEN_MTM_HALF_SPREAD_FRAC',
+  // TRA-4020 (parent TRA-4010) — the ratcheting profit floor + freshness-scoped
+  // opening-range guard on the options exit pass. Consulted on the demo branch of
+  // `buildOptionExitRisk` only; the LIVE book reads `process.env` (the TRA-1294 /
+  // TRA-2949 split), so a file flip can never change a live exit. On the demo book
+  // it can only ever exit a paper winner EARLIER with MORE locked (the ladder is
+  // no looser than the shipped give-back at any peakR — asserted in
+  // `tra4020-profit-floor-ladder.test.ts`). Default OFF.
+  'PROFIT_FLOOR_TRAIL_ENABLED',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';

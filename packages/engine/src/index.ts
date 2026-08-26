@@ -128,6 +128,7 @@ export type {
   StopModifyDecision,
   ProfitLockParams,
   ProfitLockDecision,
+  ProfitFloorDecision,
   BookGiveBackParams,
   BookHaltReason,
   BookGiveBackDecision,

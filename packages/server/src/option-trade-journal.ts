@@ -423,6 +423,34 @@ export interface OptionTradeJournalClose {
    * counter; the close is still counted). Never read by any capital path.
    */
   brokerOrderId?: string | number | null;
+  /**
+   * TRA-4020 (R4) — the row's MAX FAVOURABLE EXCURSION: the highest mark the
+   * book saw while the position was open (`OptionPosition.peakPremium`), and
+   * the ms epoch of the tick that last advanced it. Absent on rows closed by a
+   * path that never ticked the position (a broker reconcile of a row the
+   * engine never marked). The twin of {@link OptionTradeJournalRecord.mae}:
+   * together they make "how much of the peak did this exit rule give back"
+   * a subtraction rather than an inference.
+   */
+  peakPremium?: number;
+  peakPremiumAt?: number;
+  /**
+   * TRA-4020 (R4) — how the live opening-range window (TRA-3217, default 15
+   * min) treated this row: the number of ticks on which a trail-family exit
+   * was refused by the window, the mark at the first refusal and the mark at
+   * the eventual exit. Absent ↔ the window never refused an exit on this row.
+   * `premiumAtFire` is `null` when the exit path carried no mark.
+   */
+  openingRangeSuppressed?: OptionTradeJournalOpeningRangeSuppression;
+}
+
+/** TRA-4020 (R4) — see {@link OptionTradeJournalClose.openingRangeSuppressed}. */
+export interface OptionTradeJournalOpeningRangeSuppression {
+  fires: number;
+  firstSuppressedAt: number;
+  lastSuppressedAt: number;
+  premiumAtSuppression: number;
+  premiumAtFire: number | null;
 }
 
 /**
@@ -473,6 +501,11 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
   exitSlippageUsd?: number;
   /** TRA-3945 — broker order id of the realising close, folded from the CLOSE row. */
   brokerOrderId?: string | number | null;
+  /** TRA-4020 (R4) — MFE: peak mark + when it was set, folded from the CLOSE row. */
+  peakPremium?: number;
+  peakPremiumAt?: number;
+  /** TRA-4020 (R4) — opening-range refusals on this row, folded from the CLOSE row. */
+  openingRangeSuppressed?: OptionTradeJournalOpeningRangeSuppression;
   /**
    * TRA-2895 — partial exits realized before the full close, in append order.
    *
@@ -1427,6 +1460,16 @@ function foldLine(
     ...(line.close.exitSlippageUsd !== undefined ? { exitSlippageUsd: line.close.exitSlippageUsd } : {}),
     // TRA-3945 — the dedupe handle for the evaluation window; absent stays absent.
     ...(line.close.brokerOrderId !== undefined ? { brokerOrderId: line.close.brokerOrderId } : {}),
+    // TRA-4020 (R4) — MFE + the opening-range refusal record; absent stays absent.
+    ...(typeof line.close.peakPremium === 'number' && Number.isFinite(line.close.peakPremium)
+      ? { peakPremium: line.close.peakPremium }
+      : {}),
+    ...(typeof line.close.peakPremiumAt === 'number' && Number.isFinite(line.close.peakPremiumAt)
+      ? { peakPremiumAt: line.close.peakPremiumAt }
+      : {}),
+    ...(line.close.openingRangeSuppressed !== undefined
+      ? { openingRangeSuppressed: { ...line.close.openingRangeSuppressed } }
+      : {}),
   });
 }
 
