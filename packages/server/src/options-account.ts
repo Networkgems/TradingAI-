@@ -5435,6 +5435,16 @@ export class PaperOptionsAccount {
           exitReason,
           holdDays,
           brokerOrderId,
+          // TRA-4031 — the basis this close was PRICED against: `premiumPaid`
+          // as it stands NOW, i.e. after `restateEngineOpenedBasis` (mirror
+          // reconcile) or an operator pin moved it off the open mark. The OPEN
+          // row froze `entryMarkUsd` at the scanner's mid and nothing restates
+          // it; the TRA-2819 sweep skips `fees_unmeasured` lots; so without
+          // this the archived export row publishes an entry the engine never
+          // traded on (NVTS 2026-08-25: 1.395 served for a 1.51 basis).
+          ...(Number.isFinite(position.premiumPaid) && position.premiumPaid > 0
+            ? { entryBasisPremium: position.premiumPaid }
+            : {}),
           ...(Number.isFinite(position.peakPremium) ? { peakPremium: position.peakPremium } : {}),
           ...(position.peakPremiumAt !== undefined && Number.isFinite(position.peakPremiumAt)
             ? { peakPremiumAt: position.peakPremiumAt }

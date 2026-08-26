@@ -2,6 +2,7 @@ import type { AccountMode } from '@trading-app/shared';
 import type {
   ExportCoverage,
   ExportCoverageSource,
+  ExportEntryPriceBasis,
   ExportFilters,
   ExportMarket,
   ExportMarketCoverage,
@@ -413,6 +414,26 @@ export function rowFromJournalRecord(r: OptionTradeJournalRecord): ExportTradeRo
   const net = isFiniteNumber(r.realizedPnlUsd) ? Math.round((r.realizedPnlUsd + Number.EPSILON) * 100) / 100 : null;
   const fees = isFiniteNumber(r.feesUsd) ? Math.round((r.feesUsd + Number.EPSILON) * 100) / 100 : 0;
   const gross = net === null ? null : Math.round((net + fees + Number.EPSILON) * 100) / 100;
+  // TRA-4031 — ONE basis per row, NAMED. In order of strength:
+  //   1. a TRA-2819 restatement's broker ENTRY FILL (`'broker-fill'`, TRA-3875);
+  //   2. the book's post-reconcile `premiumPaid` the CLOSE row carried
+  //      (`entryBasisPremium`, `'book-basis'`) — the figure the book-sourced
+  //      row of this same close published, so the two reads agree across the
+  //      21:00 ET archive (AC1/AC2);
+  //   3. the scanner's pre-trade mid frozen at the OPEN write (`entryMarkUsd`,
+  //      `'pre-trade-mid'`) — a row closed before the stamp shipped keeps it,
+  //      and SAYS so, rather than being backfilled (AC4).
+  // On `NVTS261002C00012500` (2026-08-25) the sweep skipped the lot
+  // (`fees_unmeasured`), so (1) was closed to it and it fell through to (3):
+  // 1.395 served for a 1.51 basis, a number the engine never traded on.
+  const entry: { price: number | null; basis: ExportEntryPriceBasis | null } =
+    restated && isFiniteNumber(r.entryFillPremium)
+      ? { price: r.entryFillPremium, basis: 'broker-fill' }
+      : isFiniteNumber(r.entryBasisPremium) && r.entryBasisPremium > 0
+        ? { price: r.entryBasisPremium, basis: 'book-basis' }
+        : isFiniteNumber(r.entryMarkUsd)
+          ? { price: r.entryMarkUsd, basis: 'pre-trade-mid' }
+          : { price: null, basis: null };
   return {
     symbol: r.optionSymbol ?? r.symbol,
     market: 'options',
@@ -428,10 +449,11 @@ export function rowFromJournalRecord(r: OptionTradeJournalRecord): ExportTradeRo
     // `entryCost / contracts / 100` — per share, same unit as `entryMarkUsd` and
     // as `rowFromOption`'s `premiumPaid`). Publishing the pre-trade MID next to a
     // broker-settled P&L is the same internal contradiction this ticket is about,
-    // one column over. Unrestated rows keep the mark, unchanged.
-    entry_price: restated && isFiniteNumber(r.entryFillPremium)
-      ? r.entryFillPremium
-      : (isFiniteNumber(r.entryMarkUsd) ? r.entryMarkUsd : null),
+    // one column over. Unrestated rows used to keep the mark, unchanged —
+    // TRA-4031 now prefers the CLOSE row's `entryBasisPremium` over it (see
+    // `entry` above) and labels whichever it published.
+    entry_price: entry.price,
+    entry_price_basis: entry.basis,
     exit_time: isFiniteNumber(r.closeTs) ? new Date(r.closeTs).toISOString() : '',
     // TRA-3875 — and the exit premium the doc-comment above says the journal
     // "never recorded" IS recorded, on restated rows only, as `exitFillPremium`.
@@ -636,6 +658,10 @@ function restatementFromRecord(r: OptionTradeJournalRecord): ExportMoneyRestatem
     pnl_r: mapped.pnl_r,
     exit_price: mapped.exit_price,
     entry_price: mapped.entry_price,
+    // TRA-4031 — and the label of that entry travels with it (a restated record
+    // always has `entryFillPremium`, so this reads `'broker-fill'`; the overlay
+    // does not have to guess).
+    entry_price_basis: mapped.entry_price_basis ?? null,
     // TRA-3985 — the order id travels with the money for the same reason `pnl_r`
     // does: it is measured by the SAME broker-fill restatement, and a book row
     // that adopts a broker-settled figure without the handle that settled it

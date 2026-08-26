@@ -462,6 +462,25 @@ export interface OptionTradeJournalClose {
    */
   brokerOrderId?: string | number | null;
   /**
+   * TRA-4031 — the BOOK's per-share entry basis AT CLOSE: `OptionPosition.
+   * premiumPaid` as the close path found it, i.e. AFTER `restateEngineOpenedBasis`
+   * (mirror reconcile) or an operator pin has moved it to the broker fill. This
+   * is the figure the stop schedule, `profitLockDecision` and the row's own
+   * `pnl` were computed against — the basis the exit rule CONSUMED.
+   *
+   * It is NOT `entryMarkUsd` (the scanner's pre-trade mid, stamped at the OPEN
+   * write and never restated) and NOT `entryFillPremium` (the volume-weighted
+   * broker fill the TRA-2819 sweep installs, which SKIPS every lot whose fills
+   * carry `fees: null`). Measured on `NVTS261002C00012500` 2026-08-25: mid
+   * 1.395, basis 1.51 (+8.2%), sweep `skip: fees_unmeasured` — so the journal
+   * held the mid forever and the archived export row published an
+   * `entry_price` the engine never traded on. Carried on the CLOSE row (same
+   * fold as `peakPremium`) so a journal-served export row can publish the same
+   * `entry_price` the book row did. Absent on pre-stamp rows and on a close
+   * whose position carried no finite positive basis.
+   */
+  entryBasisPremium?: number;
+  /**
    * TRA-4020 (R4) — the row's MAX FAVOURABLE EXCURSION: the highest mark the
    * book saw while the position was open (`OptionPosition.peakPremium`), and
    * the ms epoch of the tick that last advanced it. Absent on rows closed by a
@@ -560,6 +579,11 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
   exitSlippageUsd?: number;
   /** TRA-3945 — broker order id of the realising close, folded from the CLOSE row. */
   brokerOrderId?: string | number | null;
+  /**
+   * TRA-4031 — the book's per-share basis the exit rule consumed (post-reconcile
+   * `premiumPaid`), folded from the CLOSE row. Absent on a pre-stamp close.
+   */
+  entryBasisPremium?: number;
   /** TRA-4020 (R4) — MFE: peak mark + when it was set, folded from the CLOSE row. */
   peakPremium?: number;
   peakPremiumAt?: number;
@@ -1683,9 +1707,13 @@ function foldLine(
       exitFillPremium: _exitFillPremium,
       realizedPnlUsdBeforeRestatement: _before,
       exitSlippageUsd: _exitSlippage,
+      // TRA-4031 — the replaced close's entry basis goes with it too: it was
+      // the basis of a close that was never this position's, and `kept` would
+      // otherwise carry it onto a close it did not price.
+      entryBasisPremium: _entryBasis,
       ...kept
     } = rec;
-    void _pnlBasis; void _feesUsd; void _entryFillPremium; void _exitFillPremium; void _before; void _exitSlippage;
+    void _pnlBasis; void _feesUsd; void _entryFillPremium; void _exitFillPremium; void _before; void _exitSlippage; void _entryBasis;
     map.set(line.id, {
       ...kept,
       outcome: c.outcome,
@@ -1696,6 +1724,11 @@ function foldLine(
       holdDays: c.holdDays,
       ...(c.exitSlippageUsd !== undefined ? { exitSlippageUsd: c.exitSlippageUsd } : {}),
       brokerOrderId: c.brokerOrderId ?? null,
+      // TRA-4031 — the superseding close names its own basis, or the field is
+      // absent (never the replaced close's).
+      ...(typeof c.entryBasisPremium === 'number' && Number.isFinite(c.entryBasisPremium) && c.entryBasisPremium > 0
+        ? { entryBasisPremium: c.entryBasisPremium }
+        : {}),
       supersededCloses: [...(rec.supersededCloses ?? []), prior],
     });
     return;
@@ -1716,6 +1749,13 @@ function foldLine(
     ...(line.close.exitSlippageUsd !== undefined ? { exitSlippageUsd: line.close.exitSlippageUsd } : {}),
     // TRA-3945 — the dedupe handle for the evaluation window; absent stays absent.
     ...(line.close.brokerOrderId !== undefined ? { brokerOrderId: line.close.brokerOrderId } : {}),
+    // TRA-4031 — the basis the exit rule consumed; absent stays absent (a
+    // pre-stamp row keeps publishing the mid, labelled as such — AC4).
+    ...(typeof line.close.entryBasisPremium === 'number'
+      && Number.isFinite(line.close.entryBasisPremium)
+      && line.close.entryBasisPremium > 0
+      ? { entryBasisPremium: line.close.entryBasisPremium }
+      : {}),
     // TRA-4020 (R4) — MFE + the opening-range refusal record; absent stays absent.
     ...(typeof line.close.peakPremium === 'number' && Number.isFinite(line.close.peakPremium)
       ? { peakPremium: line.close.peakPremium }

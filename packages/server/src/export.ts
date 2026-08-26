@@ -124,6 +124,47 @@ export type ExportPnlBasis = 'book' | 'broker-fill';
 export type ExportPnlRBasis = 'premium-open-mark' | 'premium-fill' | 'stop-distance';
 
 /**
+ * TRA-4031 — WHICH QUANTITY the `entry_price` column holds, per row, so a
+ * reader never has to infer it from the clock.
+ *
+ * `/api/trades/export` published `entry_price` in TWO bases for the SAME closed
+ * option row, selected by whether the 21:00 ET `archiveClosedOptions()` had
+ * run — the clock-selected-unit shape TRA-3989 found on `pnl_r`, one column
+ * over. Measured on `NVTS261002C00012500` (live, `otm_mispricing`, journal row
+ * `63a5bc3a`): the book-sourced row read `entry_price 1.51` (2026-08-25, pre-
+ * archive) and the journal-sourced row read `1.395` (2026-08-26T04:3xZ, post-
+ * archive). `1.51 / 1.395 = 1.082`: the mirror reconcile had rebased the row
+ * +8.2% to broker truth after open and the journal-served export never learned
+ * it, because the journal's OPEN write froze the scanner's mid (`entryMarkUsd`)
+ * and the only restating path (the TRA-2819 close-basis sweep) skips every lot
+ * whose fills carry `fees: null`. Any reader deriving R, slippage or the
+ * give-back the exit rule saw from that column after 21:00 ET was computing
+ * against a number the engine never traded on.
+ *
+ *   * `'broker-fill'`   — the volume-weighted broker ENTRY fill, from a
+ *     TRA-2819 restatement (`entryFillPremium`). Strongest; only on restated
+ *     rows.
+ *   * `'book-basis'`    — the book's `premiumPaid` as the close path found it:
+ *     post-reconcile, the basis the stop schedule / `profitLockDecision` /
+ *     the row's `pnl` were computed against. Every book-sourced row; and every
+ *     journal-sourced row closed since the CLOSE write carries it
+ *     (`OptionTradeJournalClose.entryBasisPremium`).
+ *   * `'pre-trade-mid'` — the scanner's mid at the OPEN write (`entryMarkUsd`).
+ *     Only on a journal-sourced row closed BEFORE the stamp shipped (AC4:
+ *     forward-only, no backfill — the discontinuity is visible in the column,
+ *     not hidden).
+ *   * `null`            — the row states no entry price at all.
+ *
+ * Equity/crypto rows read `'book-basis'`: `Position.entryPrice` is the book's
+ * fill and nothing restates it.
+ *
+ * ⚠️ JSON-only, exactly like `source`/`pnl_basis`/`pnl_r_basis`: `toCsv` maps
+ * {@link EXPORT_COLUMNS} explicitly, so the design §2.3 CSV header stays
+ * byte-identical and no existing consumer is touched.
+ */
+export type ExportEntryPriceBasis = 'broker-fill' | 'book-basis' | 'pre-trade-mid';
+
+/**
  * TRA-3985 (Defect 2) — WHICH LOT this row's exit consumed.
  *
  * ── Why this exists ─────────────────────────────────────────────────────────
@@ -240,6 +281,12 @@ export interface ExportTradeRow {
    */
   pnl_r_basis?: ExportPnlRBasis;
   /**
+   * TRA-4031 — which quantity `entry_price` holds, JSON-only (see
+   * {@link ExportEntryPriceBasis}). `null` when `entry_price` is null. Optional
+   * on the TYPE for the same reason as `pnl_r_stop_basis`; every mapper sets it.
+   */
+  entry_price_basis?: ExportEntryPriceBasis | null;
+  /**
    * TRA-4027 — the USD figure `pnl_r` was divided by, JSON-only. On an options
    * row this is the journal twin's `atRiskUsd` (`pnl_r_basis: 'premium-open-
    * mark'`) or the inline `premiumPaid × contracts × 100` (`'premium-fill'`),
@@ -352,6 +399,16 @@ export interface ExportMoneyRestatement {
   /** Broker ENTRY fill per share; null when the restatement measured none. */
   entry_price: number | null;
   /**
+   * TRA-4031 — what `entry_price` above holds. A restatement's entry is the
+   * broker fill (`'broker-fill'`) whenever it states one; the label travels
+   * with the figure so {@link applyMoneyRestatement} never has to guess. Absent
+   * ⇒ `'broker-fill'` when `entry_price` is finite (every hand-built fixture
+   * that predates this field is a broker-fill restatement). Ignored when
+   * `entry_price` is null — an unmeasured fill deletes neither the book's
+   * figure nor its label.
+   */
+  entry_price_basis?: ExportEntryPriceBasis | null;
+  /**
    * TRA-3985 — the realising close's broker order id (TRA-3945), when the fill
    * ledger measured one. It rides on the RESTATEMENT rather than being read off
    * the book row for the same reason the fills do: it is a thing the broker
@@ -403,9 +460,16 @@ export function applyMoneyRestatement(
   stopRiskUsd?: number,
 ): ExportTradeRow {
   if (!restatement) return row;
+  const restatedEntry = isFiniteNumber(restatement.entry_price);
   return {
     ...row,
     entry_price: restatement.entry_price ?? row.entry_price,
+    // TRA-4031 — the label follows the figure: a restated entry is the broker
+    // fill (or whatever basis the restatement names); an unmeasured one leaves
+    // the book's figure AND its label, same rule as the price one line up.
+    entry_price_basis: restatedEntry
+      ? (restatement.entry_price_basis ?? 'broker-fill')
+      : (row.entry_price_basis ?? null),
     exit_price: restatement.exit_price ?? row.exit_price,
     gross_pnl_usd: restatement.gross_pnl_usd,
     fees_usd: restatement.fees_usd,
@@ -731,6 +795,8 @@ export function rowFromPosition(pos: Position, market: 'stocks' | 'crypto'): Exp
     quantity: pos.quantity,
     entry_time: isoOrEmpty(pos.openedAt),
     entry_price: isFiniteNumber(pos.entryPrice) ? pos.entryPrice : null,
+    // TRA-4031 — the book's own fill; nothing restates an equity/crypto entry.
+    entry_price_basis: isFiniteNumber(pos.entryPrice) ? 'book-basis' : null,
     exit_time: isoOrEmpty(pos.closedAt),
     exit_price: isFiniteNumber(pos.exitPrice) ? pos.exitPrice : null,
     exit_reason: pos.exitReason ?? '',
@@ -799,6 +865,11 @@ export function rowFromOption(opt: OptionPosition, journalAtRiskUsd?: number): E
     quantity: opt.contracts,
     entry_time: isoOrEmpty(opt.openedAt),
     entry_price: isFiniteNumber(opt.premiumPaid) ? opt.premiumPaid : null,
+    // TRA-4031 — `premiumPaid` is the basis the exit rule consumed (post-
+    // reconcile); the journal's CLOSE row now carries the same figure as
+    // `entryBasisPremium`, so a journal-served twin publishes the same
+    // `entry_price` under the same label after the 21:00 ET archive.
+    entry_price_basis: isFiniteNumber(opt.premiumPaid) ? 'book-basis' : null,
     exit_time: isoOrEmpty(opt.closedAt),
     // The last mark recorded on the closed option is its exit premium.
     exit_price: isFiniteNumber(opt.currentPremium) ? opt.currentPremium : null,
