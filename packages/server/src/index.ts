@@ -119,6 +119,11 @@ import {
   getOptionTradeVoids,
   recordOptionTradeCloseBasis,
   getOptionTradeCloseBasisAmends,
+  // TRA-4004 — the measured backfill of a close a reconstruction displaced.
+  recordOptionTradeCloseSupersede,
+  getOptionTradeCloseSupersedes,
+  getOptionTradeJournalRecord,
+  outcomeForR,
   // TRA-3930 — the ONE spelling of the book↔journal id join. The export used to
   // carry a second, wrong one.
   journalIdForPosition,
@@ -12595,13 +12600,17 @@ app.post('/api/health/option-journal/repair', requireAuth, requireAdmin, async (
           detail: ok ? 'row retracted through the replay fold' : 'REFUSED by the fold (row unknown or already CLOSED)',
         });
       } else if (row.treatment === 'backfill_close' && row.close) {
-        await recordOptionTradeClose(row.id, row.close);
+        // TRA-4004 — the write now reports its branch; `ok: true` used to be
+        // asserted unconditionally over a call that could have refused.
+        const wrote = await recordOptionTradeClose(row.id, row.close);
         applied.push({
           id: row.id,
           optionSymbol: row.optionSymbol,
           treatment: 'backfill_close',
-          ok: true,
-          detail: `CLOSE written: ${row.close.outcome} ${row.close.realizedPnlUsd} USD, exitReason ${row.close.exitReason}`,
+          ok: wrote === 'written',
+          detail: wrote === 'written'
+            ? `CLOSE written: ${row.close.outcome} ${row.close.realizedPnlUsd} USD, exitReason ${row.close.exitReason}`
+            : `CLOSE REFUSED by the fold (${wrote})`,
         });
       } else {
         applied.push({
@@ -12636,6 +12645,148 @@ app.post('/api/health/option-journal/repair', requireAuth, requireAdmin, async (
     note: apply
       ? `Applied: ${plan.counts.retract} retracted, ${plan.counts.backfillClose} closes back-filled, ${plan.counts.noAction} refused.`
       : `DRY RUN — nothing written. Plan: ${plan.counts.retract} retract / ${plan.counts.backfillClose} backfill_close / ${plan.counts.noAction} no_action. Re-POST with ?apply=true&confirm=TRA-3485 to execute.`,
+  });
+});
+
+// TRA-4004 — the MEASURED backfill of a close that a reconstruction displaced.
+//
+// The forward fix lives in `queueJournalClose`: an engine close arriving on an
+// already-closed row now supersedes the close it finds. That cannot reach the
+// close that already vanished — the 2026-08-24T20:51:08Z BAC exit (order
+// 143160792, `chandelier_daily_close`, −$3.00) ran on a build that dropped it,
+// and its book copy went at the archive. This route writes THAT close, and any
+// future one of the same shape, from the durable fill ledger.
+//
+// Narrow by construction: the row must be CLOSED under `reconstructed-TRA-3472`
+// (an engine-OBSERVED exit decision is never overwritten by hand), the
+// `sell_to_close` must exist in the live fill ledger under the order id given,
+// on the row's OCC, for the row's contract count, and the entry basis must be
+// supplied WITH a provenance naming a ticket — the ledger cannot supply it for
+// this shape (the row's own `atRiskUsd` is the two-lot blend, TRA-3933; the lot
+// paid the operator-pinned 1.17, TRA-3958). The realized figure is written
+// GROSS in the engine's convention (`(fill − basis) × contracts × 100`) so the
+// TRA-3730 sweep may net fees later exactly as it does for every other close.
+//
+// DRY RUN BY DEFAULT. Mutating needs `?apply=true&confirm=TRA-4004`.
+app.post('/api/health/option-journal/supersede-close', requireAuth, requireAdmin, async (req, res) => {
+  if (!isOptionTradeJournalEnabled()) {
+    res.status(409).json({ ok: false, error: 'option trade journal is disabled on this host; nothing to supersede' });
+    return;
+  }
+  const q = req.query as Record<string, unknown>;
+  const wantsApply = q['apply'] === 'true' || q['apply'] === '1';
+  const confirmed = q['confirm'] === 'TRA-4004';
+  if (wantsApply && !confirmed) {
+    res.status(400).json({
+      ok: false,
+      error: 'apply=true requires confirm=TRA-4004',
+      detail:
+        'A supersession replaces the CLOSE on a settled journal row through the replay fold and '
+        + 'cannot be undone. The confirmation is what keeps a mistyped flag in the dry-run branch.',
+    });
+    return;
+  }
+  const apply = wantsApply && confirmed;
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const id = typeof body['id'] === 'string' ? body['id'] : null;
+  const brokerOrderId = typeof body['brokerOrderId'] === 'number' || typeof body['brokerOrderId'] === 'string'
+    ? body['brokerOrderId'] : null;
+  const exitReason = typeof body['exitReason'] === 'string' && body['exitReason'] !== '' ? body['exitReason'] : null;
+  const entryPremium = typeof body['entryPremium'] === 'number' && Number.isFinite(body['entryPremium']) && body['entryPremium'] > 0
+    ? body['entryPremium'] : null;
+  const provenance = typeof body['provenance'] === 'string' ? body['provenance'] : '';
+  if (!id || brokerOrderId === null || !exitReason || entryPremium === null || !/TRA-\d+/.test(provenance)) {
+    res.status(400).json({
+      ok: false,
+      error: 'body requires {id, brokerOrderId, exitReason, entryPremium > 0, provenance containing a TRA-nnnn ref}',
+    });
+    return;
+  }
+  if (exitReason === RECONSTRUCTED_EXIT_REASON) {
+    res.status(400).json({ ok: false, error: 'exitReason must be the OBSERVED exit decision, not the reconstruction marker' });
+    return;
+  }
+  const rec = await getOptionTradeJournalRecord(id);
+  if (!rec) { res.status(404).json({ ok: false, error: 'no journal row under that id' }); return; }
+  if (rec.outcome === 'OPEN') {
+    res.status(409).json({ ok: false, error: 'row is OPEN; a supersede is not a close — use the close path' });
+    return;
+  }
+  if (rec.exitReason !== RECONSTRUCTED_EXIT_REASON) {
+    res.status(409).json({
+      ok: false,
+      error: `row's close is ${rec.exitReason ?? 'unlabelled'}, not ${RECONSTRUCTED_EXIT_REASON}; an observed exit decision is never overwritten by hand`,
+    });
+    return;
+  }
+  if (!rec.optionSymbol || !Number.isFinite(rec.contracts) || !(rec.contracts! > 0)) {
+    res.status(409).json({ ok: false, error: 'row carries no optionSymbol/contracts; cannot join it to the fill ledger' });
+    return;
+  }
+  const ledger = summarizeLiveOptionsFeeSlippage();
+  const ledgerUsable = !ledger.durability.ephemeral && ledger.durability.appendErrors === 0 && ledger.n > 0;
+  if (!ledgerUsable) {
+    res.status(409).json({ ok: false, error: 'fill ledger is not usable; refusing to price a close off it', durability: ledger.durability, n: ledger.n });
+    return;
+  }
+  const fill = ledger.records.find(
+    (f) => f.mode === rec.mode && f.side === 'sell_to_close' && f.optionSymbol === rec.optionSymbol
+      && String(f.orderId) === String(brokerOrderId),
+  );
+  if (!fill) {
+    res.status(404).json({ ok: false, error: `no sell_to_close under order ${String(brokerOrderId)} on ${rec.optionSymbol} (${rec.mode}) in the fill ledger` });
+    return;
+  }
+  if (fill.contracts !== rec.contracts) {
+    res.status(409).json({ ok: false, error: `fill sold ${fill.contracts} contract(s); the row holds ${rec.contracts}`, fill });
+    return;
+  }
+  if (!Number.isFinite(fill.filledPrice) || !(fill.filledPrice! > 0)) {
+    res.status(409).json({ ok: false, error: 'the ledger fill carries no filledPrice; the proceeds are unmeasured', fill });
+    return;
+  }
+  const realizedPnlUsd = Math.round((fill.filledPrice! - entryPremium) * rec.contracts! * 100 * 100) / 100;
+  const realizedR = rec.atRiskUsd > 0 ? Math.round((realizedPnlUsd / rec.atRiskUsd) * 10_000) / 10_000 : 0;
+  const close = {
+    closeTs: fill.ts,
+    outcome: outcomeForR(realizedR),
+    realizedPnlUsd,
+    realizedR,
+    exitReason,
+    holdDays: Math.max(0, (fill.ts - rec.openTs) / 86_400_000),
+    brokerOrderId: fill.orderId ?? brokerOrderId,
+  };
+  const before = { closeTs: rec.closeTs ?? null, exitReason: rec.exitReason ?? null, realizedPnlUsd: rec.realizedPnlUsd ?? null, realizedR: rec.realizedR ?? null, atRiskUsd: rec.atRiskUsd, supersededCloses: rec.supersededCloses ?? [] };
+  let result: { applied: boolean; refusal: string | null } | null = null;
+  if (apply) {
+    result = await recordOptionTradeCloseSupersede(id, close, {
+      reason: `admin_backfill:${provenance}`,
+      issue: 'TRA-4004',
+    });
+  }
+  const after = apply ? await getOptionTradeJournalRecord(id) : null;
+  res.status(apply && result && !result.applied ? 409 : 200).json({
+    ok: !apply || (result?.applied ?? false),
+    time: new Date().toISOString(),
+    build: resolveBuildInfo(),
+    applied: apply,
+    id,
+    optionSymbol: rec.optionSymbol,
+    mode: rec.mode,
+    fill,
+    entryPremium,
+    provenance,
+    planned: close,
+    // `atRiskUsd` is NOT restated here — the row's R divides by the basis the
+    // row carries (the blend, on the incident), and moving that is TRA-3933's
+    // ruling to make, not this route's. Published so the reader sees which
+    // denominator produced `realizedR`.
+    note: `realizedR divides by the row's atRiskUsd ${rec.atRiskUsd} (unchanged); realizedPnlUsd is GROSS off the supplied entry basis and the ledger exit fill`,
+    before,
+    after: after ? { closeTs: after.closeTs ?? null, exitReason: after.exitReason ?? null, realizedPnlUsd: after.realizedPnlUsd ?? null, realizedR: after.realizedR ?? null, outcome: after.outcome, brokerOrderId: after.brokerOrderId ?? null, supersededCloses: after.supersededCloses ?? [] } : null,
+    result,
+    witness: getOptionTradeCloseSupersedes(),
+    hint: apply ? undefined : 'DRY RUN — nothing written. Re-POST with ?apply=true&confirm=TRA-4004 to execute.',
   });
 });
 

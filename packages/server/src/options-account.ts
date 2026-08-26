@@ -178,6 +178,9 @@ import {
   isOptionTradeJournalEnabled,
   recordOptionTradeOpen,
   recordOptionTradeClose,
+  // TRA-4004 — a real close landing on an already-closed row supersedes it.
+  recordOptionTradeCloseSupersede,
+  SAME_CLOSE_TOLERANCE_MS,
   // TRA-2895 — the dated partial-exit row; see `queueJournalPartial`.
   recordOptionTradePartialClose,
   getOptionTradeJournalRecord,
@@ -5212,10 +5215,9 @@ export class PaperOptionsAccount {
           });
           return;
         }
-        if (rec.outcome !== 'OPEN') return;
         const realizedR = rec.atRiskUsd > 0 ? realizedPnlUsd / rec.atRiskUsd : 0;
         const holdDays = Math.max(0, (closeTs - rec.openTs) / MS_PER_DAY);
-        await recordOptionTradeClose(journalId, {
+        const close = {
           closeTs,
           outcome: outcomeForR(realizedR),
           realizedPnlUsd,
@@ -5223,7 +5225,58 @@ export class PaperOptionsAccount {
           exitReason,
           holdDays,
           brokerOrderId,
-        });
+        };
+        if (rec.outcome !== 'OPEN') {
+          // TRA-4004 — the row is already closed. This used to be a bare
+          // `return`, and on 2026-08-24T20:51Z it swallowed a real, broker-filled
+          // close: the desk's residual BAC lot (`6bbc5d17`, TRA-3933) had had
+          // the ENGINE's exit written onto its row by the TRA-3547 sweep three
+          // days earlier, so when THIS position — the lot itself — exited under
+          // `chandelier_daily_close` (order 143160792, −$3.00) the journal
+          // never heard of it, and the 21:00 ET archive took the book copy.
+          //
+          // A position closes ONCE. So either the close on the row IS this
+          // close reported twice (`finalizePendingExit` + `recordImportedFill`
+          // both stamp `closedAt` off one event; a `Date.now()` fallback on the
+          // second call lands within a millisecond or two) — and it must still
+          // be dropped, that guard is load-bearing — or it is at a different
+          // time, in which case it was never this position's and the real one
+          // must SUPERSEDE it. The tolerance that tells the two apart is the
+          // journal's, not a re-spelling here.
+          const existingCloseTs = Number.isFinite(rec.closeTs) ? (rec.closeTs as number) : null;
+          if (existingCloseTs !== null && Math.abs(existingCloseTs - closeTs) <= SAME_CLOSE_TOLERANCE_MS) {
+            accountLog.info('option trade journal close dropped: same close already on the row', {
+              issue: 'TRA-4004',
+              id,
+              journalId,
+              optionSymbol: position.optionSymbol,
+              exitReason,
+              existingCloseTs,
+              closeTs,
+            });
+            return;
+          }
+          accountLog.warn('option trade journal close landed on an ALREADY-CLOSED row; superseding', {
+            issue: 'TRA-4004',
+            id,
+            journalId,
+            optionSymbol: position.optionSymbol,
+            mode: position.mode ?? 'demo',
+            exitReason,
+            realizedPnlUsd,
+            closeTs,
+            existingCloseTs,
+            existingExitReason: rec.exitReason ?? null,
+            existingRealizedPnlUsd: rec.realizedPnlUsd ?? null,
+            brokerOrderId,
+          });
+          await recordOptionTradeCloseSupersede(journalId, close, {
+            reason: 'engine_close_on_already_closed_row',
+            issue: 'TRA-4004',
+          });
+          return;
+        }
+        await recordOptionTradeClose(journalId, close);
       })
       // TRA-3078 — nothing to unbind. The binding lives on the position, which
       // has already left `openOptions` for `closedOptions` by the time this

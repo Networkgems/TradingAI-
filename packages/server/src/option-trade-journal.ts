@@ -566,7 +566,45 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
    * n ≥ 20 read.
    */
   averageDownShadow?: OptionTradeJournalAverageDownShadow[];
+  /**
+   * TRA-4004 — the CLOSES this row carried BEFORE the one it carries now, in
+   * supersession order. ABSENT means the row has been closed exactly once.
+   *
+   * A row is closed once by the position it describes — but it can be closed
+   * FIRST by something else: the TRA-3485/TRA-3547 reconstruction wrote the
+   * ENGINE's exit (its millisecond, its −$74) onto the DESK lot's row
+   * `6bbc5d17`, and when the engine then really closed that lot on 2026-08-24
+   * (`chandelier_daily_close`, order 143160792, −$3.00) the close path found the
+   * row already closed and dropped the real close on the floor. The loss then
+   * vanished from `/api/trades/export` at the 21:00 ET archive, because the
+   * book copy was the only record of it. See {@link recordOptionTradeCloseSupersede}.
+   */
+  supersededCloses?: OptionTradeSupersededClose[];
 }
+
+/** TRA-4004 — one close this row USED to carry. See {@link OptionTradeJournalRecord.supersededCloses}. */
+export interface OptionTradeSupersededClose {
+  closeTs: number;
+  outcome: OptionTradeOutcome;
+  realizedPnlUsd: number;
+  realizedR: number;
+  exitReason: string;
+  brokerOrderId: string | number | null;
+  /** When the supersession was written. */
+  supersededAt: number;
+  /** Why — free text naming the writer, e.g. `engine_close_on_already_closed_row`. */
+  reason: string;
+}
+
+/**
+ * TRA-4004 — what {@link recordOptionTradeClose} did. It used to return `void`
+ * and swallow the `already closed` case, which is how a real, broker-filled
+ * close could vanish with no log line on the tape (there was NOTHING to grep
+ * for at 2026-08-24T20:51Z). The fold guard itself is unchanged — see
+ * `AmendCloseBasisLine` for why it is load-bearing — but a caller now learns
+ * WHICH branch it hit and can route a genuine close elsewhere.
+ */
+export type OptionTradeCloseWriteResult = 'written' | 'unknown' | 'already_closed' | 'disabled';
 
 /** TRA-3946 — see {@link OptionTradeJournalRecord.mae}. */
 export interface OptionTradeJournalMae {
@@ -698,6 +736,35 @@ type AverageDownShadowLine = { kind: 'average_down_shadow'; id: string; shadow: 
 // is contacted, so the row carries the scanner quote until the smart-open walk
 // fills and reports the bid/ask it walked against. Folded on OPEN rows only.
 type AmendEntryQuoteLine = { kind: 'amend_entry_quote'; id: string; quote: EntryQuoteStamp };
+// TRA-4004 — REPLACE the close on an already-CLOSED row with a DIFFERENT close.
+//
+// The third correction kind, and the narrowest. `void` retracts a row for a
+// trade that never happened; `amend_close_basis` keeps a close and corrects what
+// it EARNED; this one keeps the row and corrects WHICH CLOSE it carries — for the
+// one shape where a row's close was never the close of the lot it describes: a
+// reconstruction (TRA-3485 / the TRA-3547 sweep) allocated another lot's exit
+// fill to this row, and the row's OWN exit arrived later and found the door shut.
+//
+// A separate kind rather than a relaxed `close`, for exactly the reason
+// `amend_close_basis` gives above: `recordOptionTradeClose`'s OPEN guard is what
+// stops a duplicate close event from double-counting a round trip, and every
+// caller of that path would inherit a re-close capability if it were loosened.
+// The fold below refuses (and WITNESSES) a supersede whose `closeTs` is within
+// `SAME_CLOSE_TOLERANCE_MS` of the close already on the row — that is the
+// duplicate-event case, and it must still be dropped.
+//
+// `supersedes` carries the close being replaced ON THE LINE so a replay of the
+// file can audit the move without the pre-state, the same reason `void` carries
+// `ts`/`reason`.
+type SupersedeCloseLine = {
+  kind: 'supersede_close';
+  id: string;
+  ts: number;
+  close: OptionTradeJournalClose;
+  reason: string;
+  /** The ticket authorising the writer (`TRA-4004` for both the engine path and the admin route). */
+  issue: string;
+};
 type JournalLine =
   | OpenLine
   | CloseLine
@@ -707,7 +774,20 @@ type JournalLine =
   | AmendCloseBasisLine
   | MaeLine
   | AverageDownShadowLine
-  | AmendEntryQuoteLine;
+  | AmendEntryQuoteLine
+  | SupersedeCloseLine;
+
+/**
+ * TRA-4004 — two closes of ONE position closer together than this are the SAME
+ * close reported twice (`finalizePendingExit` and `recordImportedFill` both
+ * stamp `closedAt` off the same event; a bare `Date.now()` fallback on a second
+ * call lands within a millisecond or two). Genuine sequential exits of one
+ * contract differ by seconds at minimum (TRA-3930), and the incident's two
+ * closes were three days apart. One position closes ONCE, so a second close
+ * outside this tolerance cannot be a duplicate of the first — it is evidence
+ * the first was never this position's.
+ */
+export const SAME_CLOSE_TOLERANCE_MS = 1_000;
 
 /**
  * TRA-3472 — a retraction that leaves no trace is ungradeable.
@@ -879,6 +959,82 @@ export function getOptionTradeCloseBasisAmends(): {
   };
 }
 
+/**
+ * TRA-4004 — one witnessed supersession of a closed row's CLOSE.
+ *
+ * Same rationale as the two witnesses above: the row carries
+ * `supersededCloses[]` and can testify to supersessions that HAPPENED, and only
+ * a ledger can testify to the ones the fold REFUSED — a supersede pointed at an
+ * OPEN row (something is closing a live position twice), an unknown id, or a
+ * `closeTs` inside the same-close tolerance (a duplicate close event that the
+ * guard correctly dropped). All three are the silent branches this ticket exists
+ * to make loud.
+ */
+export interface OptionTradeCloseSupersedeRecord {
+  id: string;
+  ts: number | null;
+  applied: boolean;
+  /** Why the fold refused; `null` when applied. */
+  refusal: 'unknown_row' | 'row_open' | 'same_close' | 'malformed' | null;
+  reason: string | null;
+  issue: string | null;
+  mode: 'demo' | 'live' | null;
+  symbol: string | null;
+  optionSymbol: string | null;
+  /** The close being replaced, read off the record BEFORE the move; `null` when refused/unknown. */
+  supersededCloseTs: number | null;
+  supersededExitReason: string | null;
+  supersededRealizedPnlUsd: number | null;
+  /** The close now on the row; `null` when refused. */
+  closeTs: number | null;
+  exitReason: string | null;
+  realizedPnlUsd: number | null;
+  brokerOrderId: string | number | null;
+}
+
+/** Same cap as {@link VOID_LEDGER_CAP} — a witness, not a second journal. */
+const CLOSE_SUPERSEDE_LEDGER_CAP = 500;
+let closeSupersedeLedger: OptionTradeCloseSupersedeRecord[] = [];
+let closeSupersedeDropped = 0;
+
+function pushCloseSupersede(
+  sink: OptionTradeCloseSupersedeRecord[],
+  rec: OptionTradeCloseSupersedeRecord,
+): void {
+  sink.push(rec);
+  while (sink.length > CLOSE_SUPERSEDE_LEDGER_CAP) {
+    sink.shift();
+    closeSupersedeDropped += 1;
+  }
+}
+
+/**
+ * TRA-4004 — supersessions observed by the last load plus every one written
+ * since. Served by `/api/health/option-journal` as `closeSupersedes`.
+ *
+ * Read `applied` against `refused`: a refused `same_close` is the duplicate
+ * close event the guard exists for and is the healthy quiet state; a refused
+ * `row_open` means something tried to re-close a LIVE position and is a
+ * finding.
+ */
+export function getOptionTradeCloseSupersedes(): {
+  total: number;
+  dropped: number;
+  applied: number;
+  refused: number;
+  live: number;
+  recent: OptionTradeCloseSupersedeRecord[];
+} {
+  return {
+    total: closeSupersedeLedger.length,
+    dropped: closeSupersedeDropped,
+    applied: closeSupersedeLedger.filter((s) => s.applied).length,
+    refused: closeSupersedeLedger.filter((s) => !s.applied).length,
+    live: closeSupersedeLedger.filter((s) => s.mode === 'live').length,
+    recent: closeSupersedeLedger.map((s) => ({ ...s })),
+  };
+}
+
 function defaultStoreFile(): string {
   const root = resolveDataDir();
   return join(root, 'option-trade-journal.jsonl');
@@ -894,6 +1050,9 @@ export function setOptionTradeJournalFileForTests(path: string | null): void {
   // re-point would let one test's retraction be read as another's.
   voidLedger = [];
   voidLedgerDropped = 0;
+  // TRA-4004 — same for the supersession witnesses.
+  closeSupersedeLedger = [];
+  closeSupersedeDropped = 0;
 }
 function storeFile(): string {
   return storeFileOverride ?? defaultStoreFile();
@@ -968,6 +1127,8 @@ function foldLine(
   // published only once the load completed, so a half-built witness from a
   // failed read is never served as a complete one.
   amendSink: OptionTradeCloseBasisAmendRecord[] = closeBasisAmendLedger,
+  // TRA-4004 — same contract again for the supersession witness.
+  supersedeSink: OptionTradeCloseSupersedeRecord[] = closeSupersedeLedger,
 ): void {
   if (line.kind === 'open') {
     if (!map.has(line.rec.id)) map.set(line.rec.id, { ...line.rec, outcome: 'OPEN' });
@@ -1150,6 +1311,106 @@ function foldLine(
     });
     return;
   }
+  if (line.kind === 'supersede_close') {
+    // TRA-4004 — replace the close on a CLOSED row with a DIFFERENT close.
+    //
+    // Three refusals, every one witnessed:
+    //   • unknown id — never resurrects a row (same posture as every amend);
+    //   • row still OPEN — a supersede is not a close. Something is trying to
+    //     settle a live position through the correction path, and `close` is
+    //     the only path allowed to do that;
+    //   • `closeTs` within SAME_CLOSE_TOLERANCE_MS of the close already on the
+    //     row — this is the duplicate close EVENT the `recordOptionTradeClose`
+    //     guard exists for, arriving by another door. Dropped, as it must be,
+    //     but recorded, so the count of dropped duplicates is readable.
+    const rec = map.get(line.id);
+    const c = line.close;
+    const ts = typeof line.ts === 'number' && Number.isFinite(line.ts) ? line.ts : null;
+    const base = {
+      id: line.id,
+      ts,
+      reason: typeof line.reason === 'string' ? line.reason : null,
+      issue: typeof line.issue === 'string' ? line.issue : null,
+      mode: rec?.mode ?? null,
+      symbol: rec?.symbol ?? null,
+      optionSymbol: rec?.optionSymbol ?? null,
+      supersededCloseTs: rec && Number.isFinite(rec.closeTs) ? (rec.closeTs as number) : null,
+      supersededExitReason: rec?.exitReason ?? null,
+      supersededRealizedPnlUsd: rec && Number.isFinite(rec.realizedPnlUsd) ? (rec.realizedPnlUsd as number) : null,
+    };
+    const refuse = (refusal: OptionTradeCloseSupersedeRecord['refusal']): void => {
+      pushCloseSupersede(supersedeSink, {
+        ...base,
+        applied: false,
+        refusal,
+        closeTs: null,
+        exitReason: null,
+        realizedPnlUsd: null,
+        brokerOrderId: null,
+      });
+    };
+    if (!c || !Number.isFinite(c.closeTs) || !Number.isFinite(c.realizedPnlUsd) || !Number.isFinite(c.realizedR)
+      || typeof c.exitReason !== 'string' || c.exitReason === '') {
+      refuse('malformed');
+      return;
+    }
+    if (!rec) { refuse('unknown_row'); return; }
+    if (rec.outcome === 'OPEN') { refuse('row_open'); return; }
+    if (Number.isFinite(rec.closeTs) && Math.abs((rec.closeTs as number) - c.closeTs) <= SAME_CLOSE_TOLERANCE_MS) {
+      refuse('same_close');
+      return;
+    }
+    const prior: OptionTradeSupersededClose = {
+      closeTs: rec.closeTs as number,
+      outcome: rec.outcome,
+      realizedPnlUsd: rec.realizedPnlUsd as number,
+      realizedR: rec.realizedR as number,
+      exitReason: rec.exitReason ?? '',
+      brokerOrderId: rec.brokerOrderId ?? null,
+      supersededAt: ts ?? 0,
+      reason: base.reason ?? '',
+    };
+    pushCloseSupersede(supersedeSink, {
+      ...base,
+      applied: true,
+      refusal: null,
+      closeTs: c.closeTs,
+      exitReason: c.exitReason,
+      realizedPnlUsd: c.realizedPnlUsd,
+      brokerOrderId: c.brokerOrderId ?? null,
+    });
+    // The superseded close's MONEY goes with it. A TRA-2819 restatement
+    // (`pnlBasis: 'broker-fill'`, fees, fill premiums) was measured against the
+    // fills of the close being replaced, so carrying it across would label the
+    // NEW close's figure as broker-settled when it was never settled at all.
+    // Dropping the keys returns the row to the engine-basis state every fresh
+    // close starts in; the TRA-3730 sweep may restate it later against the
+    // right fills, and `realizedPnlUsdBeforeRestatement` is dropped for the
+    // same reason (it remembered the OLD close's pre-state).
+    const {
+      pnlBasis: _pnlBasis,
+      feesUsd: _feesUsd,
+      entryFillPremium: _entryFillPremium,
+      exitFillPremium: _exitFillPremium,
+      realizedPnlUsdBeforeRestatement: _before,
+      exitSlippageUsd: _exitSlippage,
+      ...kept
+    } = rec;
+    void _pnlBasis; void _feesUsd; void _entryFillPremium; void _exitFillPremium; void _before; void _exitSlippage;
+    map.set(line.id, {
+      ...kept,
+      outcome: c.outcome,
+      closeTs: c.closeTs,
+      realizedPnlUsd: c.realizedPnlUsd,
+      realizedR: c.realizedR,
+      exitReason: c.exitReason,
+      holdDays: c.holdDays,
+      ...(c.exitSlippageUsd !== undefined ? { exitSlippageUsd: c.exitSlippageUsd } : {}),
+      brokerOrderId: c.brokerOrderId ?? null,
+      supersededCloses: [...(rec.supersededCloses ?? []), prior],
+    });
+    return;
+  }
   const existing = map.get(line.id);
   if (!existing) return; // a close with no open is ignored, never resurrected
   map.set(line.id, {
@@ -1180,6 +1441,8 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
   // TRA-2819 — the restatement witness replays into a local sink for the same
   // reason, and is published beside `voidLedger` below.
   const amendSink: OptionTradeCloseBasisAmendRecord[] = [];
+  // TRA-4004 — and the supersession witness.
+  const supersedeSink: OptionTradeCloseSupersedeRecord[] = [];
   if (existsSync(path)) {
     try {
       const raw = await readFile(path, 'utf-8');
@@ -1187,7 +1450,7 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
         const trimmed = rawLine.trim();
         if (!trimmed) continue;
         try {
-          foldLine(map, JSON.parse(trimmed) as JournalLine, voidSink, amendSink);
+          foldLine(map, JSON.parse(trimmed) as JournalLine, voidSink, amendSink, supersedeSink);
         } catch {
           // Skip a single corrupt line rather than losing the whole journal — but
           // COUNT it, so a dropped row cannot pass for a clean load.
@@ -1209,6 +1472,7 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
   // tells a reader to VOID rather than trust either.
   voidLedger = voidSink;
   closeBasisAmendLedger = amendSink;
+  closeSupersedeLedger = supersedeSink;
 
   // TRA-1681 — do NOT cache a book we could not read.
   //
@@ -1378,16 +1642,34 @@ export async function recordOptionTradePartialClose(
 /**
  * Append a CLOSE row, labelling a previously opened trade with its realized
  * outcome. No-op when the trade is unknown or already closed, or when the flag
- * is off.
+ * is off — and since TRA-4004 it SAYS WHICH, both in the return value and on
+ * the log. The `already_closed` branch used to be a bare `return`; on
+ * 2026-08-24T20:51Z it swallowed a real, broker-filled −$3.00 close and left
+ * nothing on the tape to find it by.
  */
 export async function recordOptionTradeClose(
   id: string,
   close: OptionTradeJournalClose,
-): Promise<void> {
-  if (!isOptionTradeJournalEnabled()) return;
+): Promise<OptionTradeCloseWriteResult> {
+  if (!isOptionTradeJournalEnabled()) return 'disabled';
   const map = await ensureLoaded();
   const existing = map.get(id);
-  if (!existing || existing.outcome !== 'OPEN') return;
+  if (!existing) return 'unknown';
+  if (existing.outcome !== 'OPEN') {
+    log.warn('option trade journal close REFUSED: row already closed', {
+      issue: 'TRA-4004',
+      id,
+      optionSymbol: existing.optionSymbol ?? null,
+      mode: existing.mode,
+      existingCloseTs: existing.closeTs ?? null,
+      existingExitReason: existing.exitReason ?? null,
+      attemptedCloseTs: close.closeTs,
+      attemptedExitReason: close.exitReason,
+      attemptedPnl: close.realizedPnlUsd,
+      deltaMs: Number.isFinite(existing.closeTs) ? close.closeTs - (existing.closeTs as number) : null,
+    });
+    return 'already_closed';
+  }
   foldLine(map, { kind: 'close', id, close });
   await appendLine({ kind: 'close', id, close });
   log.info('option trade journal closed', {
@@ -1397,6 +1679,88 @@ export async function recordOptionTradeClose(
   // refresh subscribers so the next selection read recomputes (intraday) rather
   // than waiting for the EOD snapshot.
   notifyClose(id, close);
+  return 'written';
+}
+
+/**
+ * TRA-4004 — REPLACE the close on an already-closed row with a DIFFERENT close.
+ *
+ * ── The hole this closes ───────────────────────────────────────────────────
+ *
+ * `6bbc5d17` is the desk's residual BAC lot (TRA-3933). The TRA-3547 sweep,
+ * 55 minutes after the reconciler minted it, read it as a 28-hour-old zombie
+ * and back-filled a close from the ledger — allocating the ENGINE's entry fill
+ * and the ENGINE's exit fill (order 142899523, already the close of row
+ * `0e180e8c`) to it: `closeTs 2026-08-21T17:05:10.473Z`, −$74,
+ * `reconstructed-TRA-3472`. The lot was still at the broker. When the engine
+ * really exited it on 2026-08-24T20:51:08Z (`chandelier_daily_close`, order
+ * 143160792, 1 ct @ 1.14 against the operator-pinned 1.17 basis, −$3.00),
+ * `queueJournalClose` resolved the row, found `outcome !== 'OPEN'`, and
+ * returned. The book row was the only record; the 21:00 ET archive took it.
+ *
+ * ── Why supersede, not a fresh row ─────────────────────────────────────────
+ *
+ * The row IS this lot's row (`journalIdForPosition` binds them). A position
+ * closes exactly once, so a close arriving on a row that already carries a
+ * DIFFERENT close is proof the earlier close was never this position's. A
+ * fresh row would leave the wrong close in place — still counting the engine's
+ * −$74 twice (the TRA-3930 duplicate) — and put a third record on the OCC.
+ * Superseding corrects the one row and keeps the replaced close on it
+ * (`supersededCloses[]`) so the move is auditable from the row alone.
+ *
+ * ── What it refuses ────────────────────────────────────────────────────────
+ *
+ * Unknown id, a row still OPEN, and a `closeTs` within
+ * {@link SAME_CLOSE_TOLERANCE_MS} of the existing one — that last is the
+ * duplicate close EVENT that `recordOptionTradeClose`'s guard exists for, and
+ * this path must not become the door around it. Every refusal is witnessed on
+ * {@link getOptionTradeCloseSupersedes}.
+ */
+export async function recordOptionTradeCloseSupersede(
+  id: string,
+  close: OptionTradeJournalClose,
+  meta: { reason: string; issue: string },
+  // Test seam — pin the witness clock. Defaults to wall time.
+  ts: number = Date.now(),
+): Promise<{ applied: boolean; refusal: OptionTradeCloseSupersedeRecord['refusal'] }> {
+  if (!isOptionTradeJournalEnabled()) return { applied: false, refusal: null };
+  const map = await ensureLoaded();
+  const existing = map.get(id);
+  const line: SupersedeCloseLine = { kind: 'supersede_close', id, ts, close, reason: meta.reason, issue: meta.issue };
+  const before = closeSupersedeLedger.length;
+  foldLine(map, line);
+  const witness = closeSupersedeLedger[closeSupersedeLedger.length - 1];
+  const applied = closeSupersedeLedger.length > before && witness !== undefined && witness.id === id && witness.applied;
+  if (!applied) {
+    log.warn('option trade journal close supersede REFUSED', {
+      issue: meta.issue,
+      id,
+      reason: meta.reason,
+      refusal: witness?.refusal ?? null,
+      existingCloseTs: existing?.closeTs ?? null,
+      attemptedCloseTs: close.closeTs,
+    });
+    return { applied: false, refusal: witness?.refusal ?? null };
+  }
+  await appendLine(line);
+  log.warn('option trade journal close SUPERSEDED', {
+    issue: meta.issue,
+    id,
+    reason: meta.reason,
+    optionSymbol: existing?.optionSymbol ?? null,
+    mode: existing?.mode ?? null,
+    supersededCloseTs: witness.supersededCloseTs,
+    supersededExitReason: witness.supersededExitReason,
+    supersededPnl: witness.supersededRealizedPnlUsd,
+    closeTs: close.closeTs,
+    exitReason: close.exitReason,
+    pnl: close.realizedPnlUsd,
+    brokerOrderId: close.brokerOrderId ?? null,
+  });
+  // The learner and every close subscriber saw the OLD close; the row's
+  // realized outcome has moved, so tell them again.
+  notifyClose(id, close);
+  return { applied: true, refusal: null };
 }
 
 /**

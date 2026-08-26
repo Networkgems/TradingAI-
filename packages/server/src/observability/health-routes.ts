@@ -251,6 +251,7 @@ import {
   getOptionTradeJournalIntegrity,
   getOptionTradeVoids, // TRA-3472 — the acceptance witness for the never-filled retraction
   getOptionTradeCloseBasisAmends, // TRA-2819 — the acceptance witness for the broker-basis restatement
+  getOptionTradeCloseSupersedes, // TRA-4004 — the acceptance witness for a real close landing on an already-closed row
   GATE_R_BASIS_STRUCTURES, // TRA-2590 — which structures have a valid premium→gate R conversion
   type OptionTradeJournalSummary,
   type OptionTradeJournalIntegrity,
@@ -6526,6 +6527,14 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       ),
       voids,
       closeBasisAmends,
+      // TRA-4004 — the third correction witness. A row's CLOSE was replaced
+      // because the position it describes closed for real AFTER a
+      // reconstruction had already closed the row with another lot's exit
+      // (the 2026-08-24 BAC −$3.00 that vanished at the archive edge). Read
+      // `applied` for supersessions that landed; `refused` with
+      // `refusal: 'same_close'` is the duplicate close event the guard drops
+      // and is the healthy quiet state; `refusal: 'row_open'` is a finding.
+      closeSupersedes: getOptionTradeCloseSupersedes(),
       // TRA-3547 — the zombie alarm, unauthenticated like the rest of this
       // route. A live `OPEN` row the broker tape says is NOT open sat silently
       // for 10 days because nothing published the contradiction; `summary` alone
