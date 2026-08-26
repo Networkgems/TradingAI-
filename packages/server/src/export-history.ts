@@ -522,7 +522,12 @@ export function rowFromJournalRecord(r: OptionTradeJournalRecord): ExportTradeRo
  * ungrouped and served on its own merits — collapsing on `mode|closeTs` alone
  * would merge two genuinely different contracts closed in the same batch.
  */
-function closeIdentityKey(r: OptionTradeJournalRecord): string | null {
+// TRA-3933 — EXPORTED so the duplicate-close census
+// (`scripts/tra3933-duplicate-close-census.mjs`) enumerates the population with
+// this predicate rather than a re-spelling of it. A census that answers "how many
+// rows does the export collapse" with its own private definition of "same close"
+// is measuring a different question than the one the export answers.
+export function closeIdentityKey(r: OptionTradeJournalRecord): string | null {
   if (!r.optionSymbol) return null;
   if (!isFiniteNumber(r.closeTs)) return null;
   return `${r.mode}|${r.optionSymbol}|${r.closeTs}`;
