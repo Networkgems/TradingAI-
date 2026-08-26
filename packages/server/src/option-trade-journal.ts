@@ -228,6 +228,26 @@ export interface OptionTradeJournalOpen {
   /** TRA-1656 — contracts filled; the basis for the round-trip commission-in-R term. */
   contracts?: number;
   /**
+   * TRA-4025 (parent TRA-4004) — wall-clock ms at which THIS ROW was written,
+   * as distinct from `openTs`, which describes the POSITION.
+   *
+   * On an engine-opened row the two agree to the millisecond. On a reconciler
+   * MINT (`structure: tradier_import`) they can be DAYS apart: the mint copies
+   * `openTs` from the broker's OCC-level aggregate, whose `date_acquired` is
+   * the FIRST lot's — on 2026-08-21 the desk's residual BAC lot `6bbc5d17` was
+   * minted at 17:06:09.836Z carrying the engine lot's 08-20T13:36:22.761Z, and
+   * the unattended zombie sweep read a 55-minute-old row as a 28.4-hour zombie,
+   * cleared its age floor, and closed it on another lot's exit (TRA-3933 →
+   * TRA-4004). An age gate that protects the FIRST MINUTES of a row's life must
+   * read the row's own write time, never a stamp copied from another lot.
+   *
+   * Stamped by `queueJournalImportOpen` at the mint. Optional: ABSENT on every
+   * import row written before this field existed, which the sweep reads as
+   * "write time UNKNOWN" and HOLDS — it does not fall back to `openTs`, because
+   * `openTs` on an import is exactly the stamp that cannot be trusted as an age.
+   */
+  mintedAt?: number;
+  /**
    * TRA-3990 (parent TRA-3945) — the row's entry-quote stamp, mirrored
    * VERBATIM from `OptionPosition` (see the field docs there). Kept SEPARATE
    * from TRA-1656's `entryBid`/`entryAsk`/`entryMarkUsd` on purpose: those are

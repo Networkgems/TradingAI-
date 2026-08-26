@@ -7,11 +7,15 @@ import type {
 import { outcomeForR } from './option-trade-journal.js';
 import {
   allocate,
+  claimFillsBySiblingRows,
   ENTRY_MATCH_WINDOW_MS,
   isFinitePositive,
+  partitionClaimedFills,
   round2,
   round4,
   type AllocatedFill,
+  type ExcludedFill,
+  type FillClaims,
 } from './tra3485-stale-open-repair.js';
 
 // TRA-2819 asks 1+2 (CTO, 2026-08-14) — restate the MONEY on live journal rows
@@ -81,6 +85,13 @@ export type CloseBasisSkipReason =
   | 'no_option_symbol'
   | 'no_contract_count'
   | 'no_at_risk_basis'
+  /**
+   * TRA-4025 — the contract HAS fills, but every one is already the entry or
+   * exit of ANOTHER journal row. Named separately from `no_entry_fill_in_window`
+   * because the remedy differs: the window says "look wider", this says "the
+   * fills exist and belong to someone else" (the BAC `6bbc5d17` shape).
+   */
+  | 'fills_claimed_by_sibling'
   | 'no_entry_fill_in_window'
   | 'entry_partially_covered'
   | 'entry_price_unmeasured'
@@ -139,8 +150,11 @@ export interface CloseBasisPlanRow {
   entryBasisDeltaUsd: number | null;
   feeDeltaUsd: number | null;
   allocations: AllocatedFill[];
-  /** Ledger fills on this contract that were NOT claimed, each with a why. */
-  excluded: { ts: number; side: string; contracts: number; origin: string; why: string }[];
+  /**
+   * Ledger fills on this contract that were NOT claimed, each with a why.
+   * Includes (TRA-4025) fills wholly owned by a SIBLING journal row, named.
+   */
+  excluded: ExcludedFill[];
   /** The restatement to write; present iff `treatment === 'restate'`. */
   basis?: OptionTradeCloseBasis;
 }
@@ -189,9 +203,17 @@ export function planCloseBasisRestate(
     byContract.set(f.optionSymbol, list);
   }
 
+  // TRA-4025 (AC4) — the SAME sibling-claim pass the stale-OPEN planner runs
+  // (TRA-3986), over ALL live rows (open and closed): a fill that is another
+  // row's entry or exit is not on offer here either. Without it this pass would
+  // re-price the desk's BAC row `6bbc5d17` off the ENGINE's 1.65 entry and 0.91
+  // exit — the very write TRA-4004 superseded — the moment it saw the row
+  // without `pnlBasis`.
+  const claims = claimFillsBySiblingRows(rows, byContract);
+
   const planned = [...live]
     .sort((a, b) => a.openTs - b.openTs)
-    .map((row) => planOne(row, byContract.get(row.optionSymbol ?? '') ?? []));
+    .map((row) => planOne(row, byContract.get(row.optionSymbol ?? '') ?? [], claims));
 
   const restate = planned.filter((r) => r.treatment === 'restate');
   const skipsByReason: Record<string, number> = {};
@@ -207,7 +229,10 @@ export function planCloseBasisRestate(
   };
 }
 
-function planOne(row: OptionTradeJournalRecord, fills: LiveOptionFillRecord[]): CloseBasisPlanRow {
+function planOne(row: OptionTradeJournalRecord, allFills: LiveOptionFillRecord[], claims: FillClaims): CloseBasisPlanRow {
+  // TRA-4025 — shared helper, not a re-spelling: what a sibling row already
+  // owns leaves the candidate set here, named in `excluded`.
+  const { fills, available, excluded: claimedExcluded } = partitionClaimedFills(row.id, allFills, claims);
   const before = Number.isFinite(row.realizedPnlUsd) ? (row.realizedPnlUsd as number) : null;
   const base = {
     id: row.id,
@@ -229,7 +254,7 @@ function planOne(row: OptionTradeJournalRecord, fills: LiveOptionFillRecord[]): 
     entryBasisDeltaUsd: null,
     feeDeltaUsd: null,
     allocations: [] as AllocatedFill[],
-    excluded: [] as CloseBasisPlanRow['excluded'],
+    excluded: claimedExcluded,
   };
   const skip = (skipReason: CloseBasisSkipReason, reason: string, extra: Partial<CloseBasisPlanRow> = {}): CloseBasisPlanRow => ({
     ...base,
@@ -265,8 +290,21 @@ function planOne(row: OptionTradeJournalRecord, fills: LiveOptionFillRecord[]): 
     return skip('no_at_risk_basis', 'row carries no atRiskUsd; realizedR could not be recomputed alongside the money');
   }
 
+  // TRA-4025 — the contract has fills and every one is a sibling's. Refuse by
+  // name rather than fall through to "none in the window": the fills are right
+  // there, and the honest reading is that they are spoken for.
+  if (allFills.length > 0 && fills.length === 0) {
+    return skip(
+      'fills_claimed_by_sibling',
+      `ledger has ${allFills.filter((f) => f.side === 'buy_to_open').length} buy_to_open / `
+        + `${allFills.filter((f) => f.side === 'sell_to_close').length} sell_to_close on this contract, and every one is `
+        + 'already the entry or exit of another journal row — re-pricing this row off them would book a sibling\'s '
+        + 'round trip twice (the 2026-08-21 BAC write, TRA-4004)',
+    );
+  }
+
   const sorted = [...fills].sort((a, b) => a.ts - b.ts);
-  const excluded: CloseBasisPlanRow['excluded'] = [];
+  const excluded: CloseBasisPlanRow['excluded'] = [...claimedExcluded];
 
   const entryCandidates = sorted.filter(
     (f) => f.side === 'buy_to_open' && Math.abs(f.ts - row.openTs) <= ENTRY_MATCH_WINDOW_MS,
@@ -290,7 +328,7 @@ function planOne(row: OptionTradeJournalRecord, fills: LiveOptionFillRecord[]): 
     );
   }
 
-  const entry = allocate(entryCandidates, contracts);
+  const entry = allocate(entryCandidates, contracts, available);
   if (entry.remaining > 0) {
     return skip(
       'entry_partially_covered',
@@ -335,7 +373,7 @@ function planOne(row: OptionTradeJournalRecord, fills: LiveOptionFillRecord[]): 
     );
   }
 
-  const exit = allocate(exitCandidates, contracts);
+  const exit = allocate(exitCandidates, contracts, available);
   if (exit.remaining > 0) {
     return skip(
       'exit_partially_covered',

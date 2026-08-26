@@ -232,6 +232,26 @@ describe('TRA-3933 — the reconcile mint after the engine row has closed', () =
     expect(rows.find(r => r.id === engineJournalId)!.outcome).not.toBe('OPEN');
   });
 
+  // TRA-4025 (AC3) — NOT a remedy for the legs below: the mint still inherits
+  // the engine lot's openTs. What it adds is the row's OWN write time, so the
+  // zombie sweep's age floor can be measured from the mint instead of from a
+  // stamp copied off another lot (55 min read as 28.4 h on 08-21).
+  it('stamps its own write time (mintedAt) beside the inherited openTs', async () => {
+    const { engineJournalId } = await runIncidentLifecycle();
+
+    const rows = await listOptionTradeJournal();
+    const engineRow = rows.find(r => r.id === engineJournalId)!;
+    const minted = rows.filter(r => r.id !== engineJournalId);
+    expect(minted).toHaveLength(1);
+    // The reconcile that minted ran at ENGINE_CLOSE + 59 s, and that — not the
+    // broker's date_acquired — is when this row came into existence.
+    expect(minted[0]!.mintedAt).toBe(ENGINE_CLOSE + 59_000);
+    // The engine row was written by the open path and carries no mint stamp.
+    expect(engineRow.mintedAt).toBeUndefined();
+    // Both facts on one row: 27.5 h "old" by openTs, 59 s old by write time.
+    expect(minted[0]!.mintedAt! - minted[0]!.openTs).toBeGreaterThan(24 * 3_600_000);
+  });
+
   // ── THE DEFECT ─────────────────────────────────────────────────────────────
   // `it.fails` — the first use of it in this repo, so it is worth saying why.
   //

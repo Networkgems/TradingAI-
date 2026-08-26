@@ -56,6 +56,7 @@ import type {
   OptionTradeJournalClose,
   OptionTradeJournalRecord,
 } from './option-trade-journal.js';
+import { TRADIER_IMPORT_STRUCTURE } from './option-trade-journal.js';
 import { planStaleOpenRepair, type StaleOpenPlan, type StaleOpenPlanRow } from './tra3485-stale-open-repair.js';
 import { logger } from './observability/index.js';
 
@@ -122,10 +123,53 @@ export interface ZombieSweepCounts {
    * no exit yet) AND unjoinable rows. Reported, never rounded into "clean".
    */
   noAction: number;
-  /** Zombies held back by {@link ZOMBIE_MIN_AGE_MS}. */
+  /**
+   * Zombies held back by {@link ZOMBIE_MIN_AGE_MS} — measured from the row's
+   * WRITE time ({@link zombieAgeAnchorTs}), never from an inherited `openTs`.
+   * Includes `ageUnknownHeld`.
+   */
   youngHeld: number;
-  /** Age of the oldest zombie in hours, or null when there are none. */
+  /**
+   * TRA-4025 — zombies whose age could not be read at all: `tradier_import`
+   * rows written before `mintedAt` existed. Held, and counted separately so a
+   * legacy import can never hide inside "young".
+   */
+  ageUnknownHeld: number;
+  /** Age of the oldest zombie in hours (write-time basis), or null when none is measurable. */
   oldestZombieAgeHours: number | null;
+}
+
+/**
+ * TRA-4025 (AC3) — the instant the age floor is measured FROM, per row.
+ *
+ * On 2026-08-21T18:01:50Z this sweep read the desk's residual BAC lot
+ * `6bbc5d17` — minted by the reconciler at 17:06:09.836Z, FIFTY-FIVE MINUTES
+ * earlier — as a 28.4-hour zombie, because its `openTs` was the broker
+ * aggregate's `date_acquired`, i.e. the ENGINE lot's 08-20T13:36:22.761Z. The
+ * floor that exists to protect a row's first day of life was cleared by a stamp
+ * the reconciler had copied from another lot, and the sweep closed the row on
+ * that other lot's exit (TRA-4004).
+ *
+ *  - an engine-written row: `openTs` IS its write time (the journal OPEN is
+ *    written before the broker is contacted), so it stands;
+ *  - a reconciler mint (`tradier_import`): `mintedAt`, the row's own write time,
+ *    and `null` when the row predates the stamp. NOT `openTs` as a fallback —
+ *    on an import that is precisely the number this function exists to refuse.
+ */
+export function zombieAgeAnchorTs(row: Pick<StaleOpenPlanRow, 'structure' | 'mintedAt' | 'openTs'>): number | null {
+  if (row.structure !== TRADIER_IMPORT_STRUCTURE) return row.openTs;
+  return row.mintedAt;
+}
+
+function ageHoursOf(row: StaleOpenPlanRow, now: number): number | null {
+  const anchor = zombieAgeAnchorTs(row);
+  return anchor === null ? null : Math.round(((now - anchor) / 3_600_000) * 10) / 10;
+}
+
+/** Above the floor on a MEASURABLE age. Unknown age is never "old enough". */
+function clearsAgeFloor(row: StaleOpenPlanRow, now: number): boolean {
+  const anchor = zombieAgeAnchorTs(row);
+  return anchor !== null && now - anchor >= ZOMBIE_MIN_AGE_MS;
 }
 
 export interface ZombieSweepState {
@@ -151,7 +195,8 @@ export interface ZombieSweepState {
     id: string;
     optionSymbol: string | null;
     treatment: string;
-    ageHours: number;
+    /** Write-time basis ({@link zombieAgeAnchorTs}); `null` = unreadable (legacy import). */
+    ageHours: number | null;
     applied: boolean;
     reason: string;
   }[];
@@ -228,15 +273,16 @@ function isZombie(row: StaleOpenPlanRow): boolean {
 
 function countsFrom(plan: StaleOpenPlan, now: number): ZombieSweepCounts {
   const zombies = plan.rows.filter(isZombie);
-  const ages = zombies.map((r) => (now - r.openTs) / 3_600_000);
+  const ages = zombies.map((r) => ageHoursOf(r, now)).filter((h): h is number => h !== null);
   return {
     liveOpenRows: plan.scanned,
     zombieOpenRows: zombies.length,
     retract: plan.counts.retract,
     backfillClose: plan.counts.backfillClose,
     noAction: plan.counts.noAction,
-    youngHeld: zombies.filter((r) => now - r.openTs < ZOMBIE_MIN_AGE_MS).length,
-    oldestZombieAgeHours: ages.length > 0 ? Math.round(Math.max(...ages) * 10) / 10 : null,
+    youngHeld: zombies.filter((r) => !clearsAgeFloor(r, now)).length,
+    ageUnknownHeld: zombies.filter((r) => zombieAgeAnchorTs(r) === null).length,
+    oldestZombieAgeHours: ages.length > 0 ? Math.max(...ages) : null,
   };
 }
 
@@ -282,7 +328,10 @@ export async function runZombieOpenSweep(deps: ZombieSweepDeps): Promise<ZombieS
     const ledgerUsable = !ledger.durability.ephemeral && ledger.durability.appendErrors === 0 && ledger.n > 0;
     state.ledgerUsable = ledgerUsable;
 
-    const eligible = plan.rows.filter((r) => isZombie(r) && at - r.openTs >= ZOMBIE_MIN_AGE_MS);
+    // TRA-4025 — the floor is measured from the row's WRITE time. See
+    // `zombieAgeAnchorTs`: an import's `openTs` is a stamp copied from the
+    // broker aggregate and read a 55-minute-old row as 28.4h on 08-21.
+    const eligible = plan.rows.filter((r) => isZombie(r) && clearsAgeFloor(r, at));
     const evidence: ZombieSweepState['lastRows'] = [];
     const mayWrite = ledgerUsable && !observeOnly;
 
@@ -315,7 +364,7 @@ export async function runZombieOpenSweep(deps: ZombieSweepDeps): Promise<ZombieS
         id: row.id,
         optionSymbol: row.optionSymbol,
         treatment: row.treatment,
-        ageHours: Math.round(((at - row.openTs) / 3_600_000) * 10) / 10,
+        ageHours: ageHoursOf(row, at),
         applied,
         reason: detail,
       });
@@ -325,7 +374,7 @@ export async function runZombieOpenSweep(deps: ZombieSweepDeps): Promise<ZombieS
     // vanishes from the readout is a zombie nobody can see.
     for (const row of plan.rows.filter(isZombie)) {
       if (evidence.some((e) => e.id === row.id)) continue;
-      const ageHours = Math.round(((at - row.openTs) / 3_600_000) * 10) / 10;
+      const ageHours = ageHoursOf(row, at);
       evidence.push({
         id: row.id,
         optionSymbol: row.optionSymbol,
@@ -336,7 +385,10 @@ export async function runZombieOpenSweep(deps: ZombieSweepDeps): Promise<ZombieS
           ? (observeOnly
               ? 'observe-only: measured, not written'
               : 'fill ledger is not a usable discriminator; refusing to write')
-          : `held: ${ageHours}h old, below the ${ZOMBIE_MIN_AGE_MS / 3_600_000}h floor for an unattended pass`,
+          : ageHours === null
+            ? `held: write time UNKNOWN — a ${TRADIER_IMPORT_STRUCTURE} row written before mintedAt existed, and its openTs `
+              + 'is a stamp inherited from the broker aggregate that cannot be read as an age (TRA-4025); repair by hand via the admin route'
+            : `held: ${ageHours}h old (write-time basis), below the ${ZOMBIE_MIN_AGE_MS / 3_600_000}h floor for an unattended pass`,
       });
     }
     state.lastRows = evidence.slice(0, ROW_EVIDENCE_MAX);

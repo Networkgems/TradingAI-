@@ -5096,6 +5096,12 @@ export class PaperOptionsAccount {
           ...(optionSymbol ? { optionSymbol } : {}),
           ...(Number.isFinite(position.contracts) ? { contracts: position.contracts } : {}),
           ...(this.owner ? { account: this.owner } : {}),
+          // TRA-4025 — the row's OWN write time. `openTs` above is
+          // `position.openedAt`, which on an import is the broker aggregate's
+          // `date_acquired` — the FIRST lot's, not necessarily this one's — and
+          // the zombie sweep's age floor must not be measured from a stamp that
+          // was copied from another lot (the 08-21 BAC write, TRA-4004).
+          mintedAt: Date.now(),
           // No sizing chokepoint was consulted — an import is not sized by us at
           // all — so `1` / `1` / `null` is the literal truth here, the same values
           // the defined-risk and wheel open paths pass.

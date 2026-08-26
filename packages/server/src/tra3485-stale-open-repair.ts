@@ -109,6 +109,14 @@ export interface StaleOpenPlanRow {
   symbol: string;
   optionSymbol: string | null;
   openTs: number;
+  /** TRA-4025 — carried so the sweep can tell a reconciler mint from an engine row. */
+  structure: string;
+  /**
+   * TRA-4025 — the row's OWN write time (`OptionTradeJournalOpen.mintedAt`), or
+   * `null` when the row predates the stamp. The zombie sweep's age floor reads
+   * THIS on an import row, never `openTs` — see the field docs on the journal.
+   */
+  mintedAt: number | null;
   /** Journalled contract count; `null` on an older row that predates the field. */
   contracts: number | null;
   atRiskUsd: number;
@@ -125,7 +133,7 @@ export interface StaleOpenPlanRow {
    * rather than dropped — an unexplained exclusion is how a wrong basis hides.
    * Includes (TRA-3986) fills wholly claimed by ANOTHER journal row, named.
    */
-  excluded: { ts: number; side: string; contracts: number; origin: string; why: string }[];
+  excluded: ExcludedFill[];
   /** The CLOSE that would be (or was) written. Present only for `backfill_close`. */
   close?: OptionTradeJournalClose;
   /**
@@ -304,20 +312,48 @@ export function claimFillsBySiblingRows(
   return claims;
 }
 
-function planOne(row: OptionTradeJournalRecord, allFills: LiveOptionFillRecord[], claims: FillClaims): StaleOpenPlanRow {
-  // TRA-3986 — what OTHER rows on this contract already own is not this row's
-  // to allocate. Fully-claimed fills leave the candidate set here and are named
-  // in `excluded`; partially-claimed ones stay, with only the remainder on offer.
-  const claimedExcluded: StaleOpenPlanRow['excluded'] = [];
+/** One ledger fill declined by a planner, and why. Shared by both planners (TRA-4025). */
+export interface ExcludedFill {
+  ts: number;
+  side: string;
+  contracts: number;
+  origin: string;
+  why: string;
+}
+
+/**
+ * TRA-4025 (AC1/AC4) — split a contract's ledger fills into what THIS row may
+ * still allocate from and what a SIBLING row already owns.
+ *
+ * This is the one spelling of the consumed-fill exclusion. The stale-OPEN
+ * planner (TRA-3485/TRA-3547) and the close-basis restatement (TRA-2819/
+ * TRA-3730) both allocate by the same window rule and both, until now, saw
+ * every fill on the contract; the restatement would have re-priced the desk's
+ * superseded BAC row `6bbc5d17` off the ENGINE's 1.65 entry the moment it saw a
+ * row without `pnlBasis`. Two copies of "which fills are spoken for" is how the
+ * two passes would quietly disagree about who owns a fill.
+ *
+ * - `fills` — fills with contracts still on offer to `rowId` (partially-claimed
+ *   fills stay, with only the remainder in `available`);
+ * - `available` — the remainder per fill, for {@link allocate};
+ * - `excluded` — fills WHOLLY owned by other rows, each naming its owner(s).
+ *
+ * The row's OWN claim (it is in `rows` too) is not a competitor — only what
+ * OTHER rows took is subtracted.
+ */
+export function partitionClaimedFills(
+  rowId: string,
+  allFills: LiveOptionFillRecord[],
+  claims: FillClaims,
+): { fills: LiveOptionFillRecord[]; available: Map<LiveOptionFillRecord, number>; excluded: ExcludedFill[] } {
+  const excluded: ExcludedFill[] = [];
   const available = new Map<LiveOptionFillRecord, number>();
   const fills: LiveOptionFillRecord[] = [];
   for (const f of allFills) {
-    // The row's OWN claim (it is in `rows` too) is not a competitor — subtract
-    // only what other rows took.
-    const others = claimedByOthers(claims, f, row.id);
+    const others = claimedByOthers(claims, f, rowId);
     const remainder = f.contracts - others.reduce((s, c) => s + c.contracts, 0);
     if (others.length > 0 && remainder <= 0) {
-      claimedExcluded.push({
+      excluded.push({
         ts: f.ts,
         side: f.side,
         contracts: f.contracts,
@@ -329,12 +365,22 @@ function planOne(row: OptionTradeJournalRecord, allFills: LiveOptionFillRecord[]
     available.set(f, remainder);
     fills.push(f);
   }
+  return { fills, available, excluded };
+}
+
+function planOne(row: OptionTradeJournalRecord, allFills: LiveOptionFillRecord[], claims: FillClaims): StaleOpenPlanRow {
+  // TRA-3986 — what OTHER rows on this contract already own is not this row's
+  // to allocate. Fully-claimed fills leave the candidate set here and are named
+  // in `excluded`; partially-claimed ones stay, with only the remainder on offer.
+  const { fills, available, excluded: claimedExcluded } = partitionClaimedFills(row.id, allFills, claims);
 
   const base = {
     id: row.id,
     symbol: row.symbol,
     optionSymbol: row.optionSymbol ?? null,
     openTs: row.openTs,
+    structure: row.structure,
+    mintedAt: typeof row.mintedAt === 'number' && Number.isFinite(row.mintedAt) ? row.mintedAt : null,
     contracts: row.contracts ?? null,
     atRiskUsd: row.atRiskUsd,
     ledgerOpens: allFills.filter((f) => f.side === 'buy_to_open').length,
