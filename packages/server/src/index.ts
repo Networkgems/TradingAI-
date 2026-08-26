@@ -143,6 +143,14 @@ import { resolveAverageDownConfig, AVERAGE_DOWN_SHADOW_REASONS } from './option-
 // gross-of-fees arithmetic onto the broker's fills. Same pure-planner shape, so
 // the correction can be read in full before a byte is appended.
 import { planCloseBasisRestate } from './tra2819-close-basis-restate.js';
+// TRA-4082 — the repair for a lot rebound onto its sibling's journal row whose
+// close then superseded the sibling's real fill (RIG 08-24 / 08-26).
+import {
+  planDetachReboundClose,
+  applyDetachReboundClose,
+  summarizeDetachRow,
+  type DetachReboundCloseRequest,
+} from './tra4082-detach-rebound-close.js';
 // TRA-3730 — that restatement, SELF-DRIVING, for the reason TRA-3547 exists one
 // import below: the route it fires is admin-gated, admin writes are unreachable
 // on bqb1, and the defect is RECURRING (commission is unknowable at close time,
@@ -13013,6 +13021,89 @@ app.post('/api/health/option-journal/supersede-close', requireAuth, requireAdmin
     result,
     witness: getOptionTradeCloseSupersedes(),
     hint: apply ? undefined : 'DRY RUN — nothing written. Re-POST with ?apply=true&confirm=TRA-4004 to execute.',
+  });
+});
+
+// TRA-4082 — DETACH a rebound lot's close off its sibling's journal row.
+//
+// The forward fix (`queueJournalImportOpen`: a desk-add lot never rebinds;
+// `queueJournalClose`: a witnessed close under another order is never
+// superseded) cannot reach the row that already moved: on 2026-08-26T13:45:31Z
+// the RIG residual `96b0dc72` closed onto the engine lot's row `8a849902` and
+// superseded its 08-24 `sl_otm_premium_pct` fill (order 143048620, −$15.24).
+// This route restores that fill as the row's primary and writes the residual's
+// close (order 143384264, −$7) as the residual's OWN row, so both fills export.
+// See `tra4082-detach-rebound-close.ts` for the shape and its refusal set.
+//
+// DRY RUN BY DEFAULT. Mutating needs `?apply=true&confirm=TRA-4082`. On apply,
+// the CLOSED book twin of the lot (if it is still on the caller's book — the
+// 21:00 ET archive takes it) is re-pointed at the new journal row, or the export
+// would serve the moved close twice until the archive.
+app.post('/api/health/option-journal/detach-rebound-close', requireAuth, requireAdmin, async (req, res) => {
+  if (!isOptionTradeJournalEnabled()) {
+    res.status(409).json({ ok: false, error: 'option trade journal is disabled on this host; nothing to detach' });
+    return;
+  }
+  const q = req.query as Record<string, unknown>;
+  const wantsApply = q['apply'] === 'true' || q['apply'] === '1';
+  const confirmed = q['confirm'] === 'TRA-4082';
+  if (wantsApply && !confirmed) {
+    res.status(400).json({
+      ok: false,
+      error: 'apply=true requires confirm=TRA-4082',
+      detail: 'A detach writes three journal lines through the replay fold and cannot be undone. The confirmation keeps a mistyped flag in the dry-run branch.',
+    });
+    return;
+  }
+  const apply = wantsApply && confirmed;
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const lotOpenRaw = body['lotOpenTs'];
+  const lotOpenTs = typeof lotOpenRaw === 'number' ? lotOpenRaw
+    : typeof lotOpenRaw === 'string' ? Date.parse(lotOpenRaw) : Number.NaN;
+  const request: DetachReboundCloseRequest = {
+    journalId: body['journalId'] as string,
+    lotId: body['lotId'] as string,
+    lotOpenTs,
+    lotBasisPremium: body['lotBasisPremium'] as number,
+    restoreBrokerOrderId: body['restoreBrokerOrderId'] as string | number,
+    ...(body['restoreEntryBasisPremium'] !== undefined ? { restoreEntryBasisPremium: body['restoreEntryBasisPremium'] as number } : {}),
+    provenance: body['provenance'] as string,
+  };
+  const rec = typeof request.journalId === 'string' ? await getOptionTradeJournalRecord(request.journalId) : null;
+  const lotRow = typeof request.lotId === 'string' ? await getOptionTradeJournalRecord(request.lotId) : null;
+  const before = { row: summarizeDetachRow(rec), lot: summarizeDetachRow(lotRow) };
+  const plan = planDetachReboundClose(rec, lotRow, request, Date.now());
+  if (!plan.ok) {
+    res.status(plan.refusal === 'unknown_row' ? 404 : plan.refusal === 'bad_request' ? 400 : 409).json({
+      ...plan, time: new Date().toISOString(), build: resolveBuildInfo(), applied: false, request, before,
+    });
+    return;
+  }
+  if (!apply) {
+    res.json({
+      ok: true, time: new Date().toISOString(), build: resolveBuildInfo(), applied: false, request, before, plan,
+      hint: 'DRY RUN — nothing written. Re-POST with ?apply=true&confirm=TRA-4082 to execute.',
+    });
+    return;
+  }
+  const result = await applyDetachReboundClose(plan, Date.now());
+  // The book twin, if the lot is still on this book (pre-archive). `not_found`
+  // after the archive is the expected reading, not a failure.
+  const ctx = await userCtx(res);
+  const book = ctx.engine.rebindClosedOptionJournalId(plan.lotId, plan.lotId);
+  res.status(result.ok ? 200 : 409).json({
+    ok: result.ok,
+    time: new Date().toISOString(),
+    build: resolveBuildInfo(),
+    applied: true,
+    request,
+    plan,
+    before,
+    after: { row: summarizeDetachRow(result.row), lot: summarizeDetachRow(result.lot) },
+    steps: { opened: result.opened, closed: result.closed, restored: result.restored },
+    book,
+    witness: getOptionTradeCloseSupersedes(),
+    note: 'the restored close is written back through supersede_close, so the row\'s supersededCloses[] now also carries the MOVED close (reason names the lot it moved to); the export reads the primary only',
   });
 });
 

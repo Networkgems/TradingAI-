@@ -18562,6 +18562,22 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-4082 (repair) — re-point a CLOSED lot's `journalId` at its own journal
+   * row after the admin detach route has minted that row. Searched across both
+   * Tradier envs by position id for the reason the restatement above is.
+   */
+  rebindClosedOptionJournalId(
+    lotId: string,
+    journalId: string,
+  ): ReturnType<PaperOptionsAccount['rebindClosedOptionJournalId']> & { env: TradierEnv | null } {
+    for (const env of ['sandbox', 'production'] as const) {
+      const outcome = this.optionsAccounts[env].rebindClosedOptionJournalId(lotId, journalId);
+      if (outcome.status !== 'not_found') return { ...outcome, env };
+    }
+    return { status: 'not_found', env: null };
+  }
+
+  /**
    * TRA-3829 (board ruling B, card `331ddc56`) — hand ONE adopted broker row
    * to the engine, or take it back. Thin dispatch over the env buckets; the
    * decision and the schedule re-install live on `PaperOptionsAccount`.

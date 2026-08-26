@@ -104,6 +104,10 @@ import {
 // TRA-4028 — an imported lot's journal basis comes from its OWN ledger fill when
 // one is attributable, else from the mark AND says so. Pure; see the module.
 import { resolveImportOpenBasis } from './tra4028-import-open-basis.js';
+// TRA-4082 — the close path must tell a RECONSTRUCTED close (supersede it,
+// TRA-4004) from an OBSERVED broker-filled close on a row two lots share
+// (detach: the second lot writes its own row).
+import { RECONSTRUCTED_EXIT_REASON } from './tra3485-stale-open-repair.js';
 import {
   appendEngineBasisRestatement,
   engineBasisRestatementDataDir,
@@ -5181,16 +5185,13 @@ export class PaperOptionsAccount {
     // The whole mechanism joins on the OCC symbol (TRA-1656 put it on the row);
     // with no contract identity there is nothing to adopt and nothing a future
     // reader could join back, so mint plainly rather than half-doing it.
-    const entryDte = position.expiration
-      ? dteFromExpiration(position.expiration, position.openedAt) ?? 0
-      : 0;
     // A long option's max loss IS its premium, so the premium is the true basis
     // for `realizedR` — not an approximation standing in for a missing stop.
     // WHICH premium is TRA-4028's question, answered inside the task below
-    // (`resolveImportOpenBasis`): the book row's `premiumPaid` on a reconcile
-    // import is the broker's OCC-level BLEND, and on 2026-08-21 that blend
-    // (½·(1.65 + 1.17) = 1.41) was written as the desk lot's $141 basis while
-    // the ledger held the lot's own 1.17 fill.
+    // (`buildImportOpenRow` → `resolveImportOpenBasis`): the book row's
+    // `premiumPaid` on a reconcile import is the broker's OCC-level BLEND, and
+    // on 2026-08-21 that blend (½·(1.65 + 1.17) = 1.41) was written as the desk
+    // lot's $141 basis while the ledger held the lot's own 1.17 fill.
     this.journalWrites = this.journalWrites
       .then(async () => {
         // TRA-3078 — re-checked INSIDE the task, not just at the call site: two
@@ -5209,7 +5210,35 @@ export class PaperOptionsAccount {
             return;
           }
           const adoptable = open.filter((r) => r.id !== id);
-          if (adoptable.length === 1) {
+          // TRA-4082 — a DESK-ADD lot is a SECOND lot on the contract, never a
+          // re-import of the position that owns the OPEN row, so the rebind
+          // below is the wrong answer for it by construction. On 2026-08-21
+          // the RIG residual (`96b0dc72`, `residual_identity` 0.22) was rebound
+          // onto the engine lot's row `8a849902` (0.33); when the residual
+          // closed on 08-26 the row was already closed by the engine lot's
+          // 08-24 `sl_otm_premium_pct` fill (order 143048620, −$15.24, the
+          // TRA-3943 AC3 breach), and `engine_close_on_already_closed_row`
+          // DEMOTED that real fill into `supersededCloses[]`. The export then
+          // served one RIG row where there had been two, +$8.24 with no fill
+          // behind the move. "A position closes once" is true of a position and
+          // false of a row two positions share. The rebind stays for what it
+          // was written for (TRA-2937: the SAME position re-imported after a
+          // restart, `adoptionAuthority` absent or `engine_origin`); the
+          // desk-add lot writes its OWN row under its own id, and its close
+          // settles that row.
+          const deskAdd = position.adoptionAuthority === 'desk_add';
+          if (deskAdd && adoptable.length > 0) {
+            accountLog.info('desk-add lot NOT rebound onto its sibling\'s journal row; minting its own', {
+              issue: 'TRA-4082',
+              origin,
+              optionSymbol,
+              mode,
+              positionId: id,
+              siblingOpenRows: adoptable.map((r) => r.id),
+              deskAddBasisSource: position.deskAddBasis?.source ?? null,
+              note: 'a desk-add residual is a SECOND lot on the contract; the sibling row belongs to the engine lot and its close must stay that lot\'s',
+            });
+          } else if (adoptable.length === 1) {
             const existing = adoptable[0]!;
             position.journalId = existing.id;
             // TRA-3553 (TRA-2820 ask 2) — the ADOPT branch has just PROVED this
@@ -5248,8 +5277,7 @@ export class PaperOptionsAccount {
               note: 'close will settle the ORIGINAL row; no duplicate OPEN written',
             });
             return;
-          }
-          if (adoptable.length > 1) {
+          } else if (adoptable.length > 1) {
             accountLog.warn('refusing to rebind an imported row: multiple OPEN journal rows', {
               issue: 'TRA-2937',
               origin,
@@ -5262,93 +5290,7 @@ export class PaperOptionsAccount {
             });
           }
         }
-        // TRA-4028 — price the row off the lot's OWN fill when the ledger can
-        // attribute one (every sibling row on the contract claims its fills
-        // first, TRA-3986), else off the book figure — and SAY WHICH. Read
-        // inside the task so the sibling set is the one the journal holds at
-        // the write, not at the enqueue.
-        const basis = resolveImportOpenBasis(
-          {
-            id,
-            optionSymbol,
-            mode,
-            contracts: position.contracts,
-            premiumPaid: position.premiumPaid,
-            deskAddBasis: position.deskAddBasis,
-            operatorBasisPin: position.operatorBasisPin,
-          },
-          optionSymbol
-            ? (await listOptionTradeJournal({ mode })).filter((r) => r.optionSymbol === optionSymbol)
-            : [],
-          optionSymbol && mode === 'live' ? liveOptionFillsForContract(optionSymbol) : [],
-        );
-        if (basis.atRiskBasis === 'mark') {
-          accountLog.warn('import journal OPEN priced off the MARK — no ledger fill attributable to this lot', {
-            issue: 'TRA-4028',
-            origin,
-            positionId: id,
-            optionSymbol,
-            mode,
-            contracts: position.contracts,
-            premiumPaid: position.premiumPaid,
-            atRiskUsd: basis.atRiskUsd,
-            markReason: basis.markReason,
-            note: 'the figure is the book row\'s premium (the broker blend on a reconcile import); every R on this row divides by it until an amend_open_basis line names the fill',
-          });
-        } else {
-          accountLog.info('import journal OPEN priced off the lot\'s own fill', {
-            issue: 'TRA-4028',
-            origin,
-            positionId: id,
-            optionSymbol,
-            mode,
-            contracts: position.contracts,
-            bookPremiumPaid: position.premiumPaid,
-            fillPremium: basis.premiumPerContract,
-            atRiskUsd: basis.atRiskUsd,
-            provenance: basis.atRiskProvenance,
-          });
-        }
-        const open: OptionTradeJournalOpen = {
-          id,
-          openTs: position.openedAt,
-          symbol: position.symbol,
-          structure: TRADIER_IMPORT_STRUCTURE,
-          mode,
-          // Honest-unknown throughout. None of these were measured, because no
-          // selector ran: the broker handed us a contract we did not pick. They
-          // are written as unknowns rather than as plausible defaults so a future
-          // reader cannot mistake a fabricated regime for a measured one — and
-          // the row is kept out of the learner by its STRUCTURE, never by a
-          // reader happening to interpret these sentinels correctly.
-          ivRank: null,
-          trend: 'unknown',
-          sentiment: null,
-          sentimentIcBand: null,
-          entryDelta: 0,
-          entryDte,
-          atRiskUsd: basis.atRiskUsd,
-          // TRA-4028 — which instrument priced the basis, ON the row.
-          atRiskBasis: basis.atRiskBasis,
-          atRiskProvenance: basis.atRiskProvenance,
-          agentConviction: null,
-          ...(optionSymbol ? { optionSymbol } : {}),
-          ...(Number.isFinite(position.contracts) ? { contracts: position.contracts } : {}),
-          ...(this.owner ? { account: this.owner } : {}),
-          // TRA-4025 — the row's OWN write time. `openTs` above is
-          // `position.openedAt`, which on an import is the broker aggregate's
-          // `date_acquired` — the FIRST lot's, not necessarily this one's — and
-          // the zombie sweep's age floor must not be measured from a stamp that
-          // was copied from another lot (the 08-21 BAC write, TRA-4004).
-          mintedAt: Date.now(),
-          // No sizing chokepoint was consulted — an import is not sized by us at
-          // all — so `1` / `1` / `null` is the literal truth here, the same values
-          // the defined-risk and wheel open paths pass.
-          riskThrottleMultiplier: 1,
-          riskThrottleArmedScope: riskThrottleSizingScope(),
-          riskThrottleDecided: 1,
-          riskThrottleSizingPath: null,
-        };
+        const open = await this.buildImportOpenRow(position, origin);
         await recordOptionTradeOpen(open);
         // TRA-3078 — stamp AFTER the write lands. Identity is the truth here,
         // and recording it explicitly is what tells the repair sweep this row is
@@ -5366,6 +5308,153 @@ export class PaperOptionsAccount {
           reason: err instanceof Error ? err.message : String(err),
         });
       });
+  }
+
+  /**
+   * TRA-4082 — build (do NOT write) the journal OPEN row for an imported /
+   * adopted position under ITS OWN id, priced by TRA-4028's basis resolution.
+   *
+   * Extracted from {@link queueJournalImportOpen} so the close path can mint
+   * the same row for a lot that was REBOUND onto a sibling's journal row on an
+   * older build and is only discovered to be a second lot when it closes (see
+   * the detach branch in {@link queueJournalClose}). One builder, so the two
+   * sites cannot price or label the row differently. Must run INSIDE the
+   * `journalWrites` chain: the sibling set it prices against is the one the
+   * journal holds at the write, not at the enqueue.
+   *
+   * `origin` names the caller on the log line only.
+   */
+  private async buildImportOpenRow(
+    position: OptionPosition,
+    origin: 'reconcile_add' | 'reconcile_repair' | 'close_detach',
+  ): Promise<OptionTradeJournalOpen> {
+    const id = position.id;
+    const optionSymbol = position.optionSymbol;
+    const mode = (position.mode ?? 'demo') as 'demo' | 'live';
+    const entryDte = position.expiration
+      ? dteFromExpiration(position.expiration, position.openedAt) ?? 0
+      : 0;
+    // TRA-4028 — price the row off the lot's OWN fill when the ledger can
+    // attribute one (every sibling row on the contract claims its fills
+    // first, TRA-3986), else off the book figure — and SAY WHICH.
+    const basis = resolveImportOpenBasis(
+      {
+        id,
+        optionSymbol,
+        mode,
+        contracts: position.contracts,
+        premiumPaid: position.premiumPaid,
+        deskAddBasis: position.deskAddBasis,
+        operatorBasisPin: position.operatorBasisPin,
+      },
+      optionSymbol
+        ? (await listOptionTradeJournal({ mode })).filter((r) => r.optionSymbol === optionSymbol)
+        : [],
+      optionSymbol && mode === 'live' ? liveOptionFillsForContract(optionSymbol) : [],
+    );
+    if (basis.atRiskBasis === 'mark') {
+      accountLog.warn('import journal OPEN priced off the MARK — no ledger fill attributable to this lot', {
+        issue: 'TRA-4028',
+        origin,
+        positionId: id,
+        optionSymbol,
+        mode,
+        contracts: position.contracts,
+        premiumPaid: position.premiumPaid,
+        atRiskUsd: basis.atRiskUsd,
+        markReason: basis.markReason,
+        note: 'the figure is the book row\'s premium (the broker blend on a reconcile import); every R on this row divides by it until an amend_open_basis line names the fill',
+      });
+    } else {
+      accountLog.info('import journal OPEN priced off the lot\'s own fill', {
+        issue: 'TRA-4028',
+        origin,
+        positionId: id,
+        optionSymbol,
+        mode,
+        contracts: position.contracts,
+        bookPremiumPaid: position.premiumPaid,
+        fillPremium: basis.premiumPerContract,
+        atRiskUsd: basis.atRiskUsd,
+        provenance: basis.atRiskProvenance,
+      });
+    }
+    return {
+      id,
+      openTs: position.openedAt,
+      symbol: position.symbol,
+      // A desk-add lot is managed on the engine sibling's sleeve schedule
+      // (`deskAddSleeve`), but its ENTRY was not the selector's: the structure
+      // stays `tradier_import` so the learner excludes it by STRUCTURE, the
+      // one exclusion every capital-adjacent fold already honours (TRA-2937).
+      structure: TRADIER_IMPORT_STRUCTURE,
+      mode,
+      // Honest-unknown throughout. None of these were measured, because no
+      // selector ran: the broker handed us a contract we did not pick. They
+      // are written as unknowns rather than as plausible defaults so a future
+      // reader cannot mistake a fabricated regime for a measured one — and
+      // the row is kept out of the learner by its STRUCTURE, never by a
+      // reader happening to interpret these sentinels correctly.
+      ivRank: null,
+      trend: 'unknown',
+      sentiment: null,
+      sentimentIcBand: null,
+      entryDelta: 0,
+      entryDte,
+      atRiskUsd: basis.atRiskUsd,
+      // TRA-4028 — which instrument priced the basis, ON the row.
+      atRiskBasis: basis.atRiskBasis,
+      atRiskProvenance: basis.atRiskProvenance,
+      agentConviction: null,
+      ...(optionSymbol ? { optionSymbol } : {}),
+      ...(Number.isFinite(position.contracts) ? { contracts: position.contracts } : {}),
+      ...(this.owner ? { account: this.owner } : {}),
+      // TRA-4025 — the row's OWN write time. `openTs` above is
+      // `position.openedAt`, which on an import is the broker aggregate's
+      // `date_acquired` — the FIRST lot's, not necessarily this one's — and
+      // the zombie sweep's age floor must not be measured from a stamp that
+      // was copied from another lot (the 08-21 BAC write, TRA-4004).
+      mintedAt: Date.now(),
+      // No sizing chokepoint was consulted — an import is not sized by us at
+      // all — so `1` / `1` / `null` is the literal truth here, the same values
+      // the defined-risk and wheel open paths pass.
+      riskThrottleMultiplier: 1,
+      riskThrottleArmedScope: riskThrottleSizingScope(),
+      riskThrottleDecided: 1,
+      riskThrottleSizingPath: null,
+    };
+  }
+
+  /**
+   * TRA-4082 (repair) — re-point a CLOSED book row's `journalId` at a journal
+   * row, for the one shape the admin detach route produces: a lot that was
+   * rebound onto its sibling's row on an older build has just been given its
+   * own journal row under its own id, and the book copy must join to THAT row
+   * or `/api/trades/export` serves the moved close twice until the 21:00 ET
+   * archive (the book row's `journal_id` is what suppresses the journal twin,
+   * `selectJournalExportRows`). Refuses anything but that shape.
+   */
+  rebindClosedOptionJournalId(
+    lotId: string,
+    journalId: string,
+  ): { status: 'rebound' | 'already_bound' | 'not_found' | 'refused'; reason?: string; before?: string | null } {
+    const row = this.closedOptions.find((o) => o.id === lotId);
+    if (!row) return { status: 'not_found' };
+    const before = row.journalId ?? null;
+    if (journalId !== lotId) {
+      return { status: 'refused', reason: 'a closed lot may only be rebound to its OWN id', before };
+    }
+    if (journalIdForPosition(row) === journalId) return { status: 'already_bound', before };
+    row.journalId = journalId;
+    accountLog.warn('closed lot rebound onto its own journal row', {
+      issue: 'TRA-4082',
+      lotId,
+      optionSymbol: row.optionSymbol,
+      mode: row.mode ?? 'demo',
+      before,
+      after: journalId,
+    });
+    return { status: 'rebound', before };
   }
 
   /**
@@ -5629,6 +5718,83 @@ export class PaperOptionsAccount {
             });
             return;
           }
+          // TRA-4082 — "a position closes once" is true of a POSITION and
+          // false of a ROW that two positions share. A desk-add residual minted
+          // on a build before TRA-4082 was REBOUND onto its engine sibling's
+          // row (`journalId !== id`); when the sibling's OBSERVED, broker-filled
+          // close is already on that row under a DIFFERENT order, the close
+          // arriving now is a SECOND lot's, and superseding would demote a
+          // real fill (RIG 08-24, order 143048620, −$15.24 → `supersededCloses[]`,
+          // gone from every export query). The supersede stays for what
+          // TRA-4004 wrote it for — a RECONSTRUCTED close (`reconstructed-
+          // TRA-3472`) or one with no broker order, i.e. a close nobody
+          // witnessed at the broker — and a witnessed close that is not ours
+          // is left where it is: this lot writes its OWN row and settles that.
+          const existingOrder = rec.brokerOrderId ?? null;
+          const rebound = journalId !== id;
+          const existingIsObserved = rec.exitReason !== RECONSTRUCTED_EXIT_REASON;
+          const existingIsAnotherOrder =
+            existingOrder !== null && (brokerOrderId === null || String(existingOrder) !== String(brokerOrderId));
+          if (rebound && existingIsObserved && existingIsAnotherOrder) {
+            accountLog.warn('option trade journal close landed on a SIBLING lot\'s closed row; DETACHING to this lot\'s own row', {
+              issue: 'TRA-4082',
+              id,
+              journalId,
+              optionSymbol: position.optionSymbol,
+              mode: position.mode ?? 'demo',
+              adoptionAuthority: position.adoptionAuthority ?? null,
+              exitReason,
+              realizedPnlUsd,
+              closeTs,
+              brokerOrderId,
+              existingCloseTs,
+              existingExitReason: rec.exitReason ?? null,
+              existingRealizedPnlUsd: rec.realizedPnlUsd ?? null,
+              existingBrokerOrderId: existingOrder,
+              note: 'the row\'s close is a witnessed broker fill under another order; superseding it would demote a real fill. The sibling row is left untouched.',
+            });
+            const ownRow = await getOptionTradeJournalRecord(id);
+            if (ownRow) {
+              // Unreachable by construction (a rebound lot has no row under its
+              // own id — that is what rebinding means), but if it ever is, do
+              // not mint a second one: settle whatever is there.
+              accountLog.warn('detach found a row already under this lot\'s own id; settling it instead of minting', {
+                issue: 'TRA-4082', id, journalId, outcome: ownRow.outcome,
+              });
+            } else {
+              await recordOptionTradeOpen(await this.buildImportOpenRow(position, 'close_detach'));
+            }
+            position.journalId = id;
+            // The book twin in `closedOptions` is a COPY taken before this task
+            // ran (`recordImportedFill` / `finalizePendingExit` push `{...opt}`
+            // first), and its `journalId` is what `/api/trades/export` keys the
+            // book-vs-journal dedupe on until the 21:00 ET archive. Left at the
+            // sibling's id it would hide the sibling's journal row and let this
+            // lot's new row serve beside its own book copy.
+            this.rebindClosedOptionJournalId(id, id);
+            const own = await getOptionTradeJournalRecord(id);
+            if (!own) return;
+            // The row's own basis is the denominator — not the sibling's.
+            const ownR = own.atRiskUsd > 0 ? realizedPnlUsd / own.atRiskUsd : 0;
+            const ownClose = {
+              ...close,
+              outcome: outcomeForR(ownR),
+              realizedR: ownR,
+              holdDays: Math.max(0, (closeTs - own.openTs) / MS_PER_DAY),
+            };
+            const wrote = await recordOptionTradeClose(id, ownClose);
+            accountLog.warn('detached lot close written to its own journal row', {
+              issue: 'TRA-4082',
+              id,
+              siblingJournalId: journalId,
+              result: wrote,
+              atRiskUsd: own.atRiskUsd,
+              realizedR: ownR,
+              exitReason,
+              brokerOrderId,
+            });
+            return;
+          }
           accountLog.warn('option trade journal close landed on an ALREADY-CLOSED row; superseding', {
             issue: 'TRA-4004',
             id,
@@ -5642,6 +5808,8 @@ export class PaperOptionsAccount {
             existingExitReason: rec.exitReason ?? null,
             existingRealizedPnlUsd: rec.realizedPnlUsd ?? null,
             brokerOrderId,
+            rebound,
+            existingBrokerOrderId: existingOrder,
           });
           await recordOptionTradeCloseSupersede(journalId, close, {
             reason: 'engine_close_on_already_closed_row',
