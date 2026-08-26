@@ -149,3 +149,14 @@ test('renderReport states the lower-bound census beside the figures', () => {
   assert.match(md, /68\.7%/);
   assert.match(md, /NOTE-MARKER/);
 });
+
+test('renderReport does NOT narrate a soft census over a tape with zero lower bounds', () => {
+  // First live sample 08-26 (0 of 1 lower-bound) rendered "shares are soft ...
+  // the ALL rows UNDER-state concentration" -- the inverse of what the tape held.
+  const f = foldTape([sample({ concentrationIsLowerBound: false })]);
+  const md = renderReport(f, { note: 'NOTE-MARKER' });
+  assert.match(md, /0 of 1 graded samples carry/);
+  assert.match(md, /every share below is a HARD reading/);
+  assert.doesNotMatch(md, /UNDER-state concentration/);
+  assert.doesNotMatch(md, /shares are soft/);
+});

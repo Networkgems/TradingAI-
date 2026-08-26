@@ -234,14 +234,22 @@ export function renderReport(fold, opts = {}) {
   // ⛔ On an all-refusal tape there is no lower-bound story to tell, and telling
   // one anyway ("0 of 0 samples are soft") reads as a clean measurement of a
   // week nobody observed. Say the refusal instead.
+  // A census of ZERO lower bounds is the HARD case, not a soft one — narrating
+  // "shares are soft, the ALL rows under-state" over a tape where every sample
+  // was fully keyed and priced (first live sample 08-26: 0 of 1) inverts the
+  // reading. Say which case the tape is actually in.
   L.push(c.samplesGraded === 0
     ? '⛔ **Nothing was graded.** Every line on the tape is a refusal, so there is no '
       + 'population to take a quantile over. The rows below are empty by construction, '
       + 'NOT a reading of low concentration.'
-    : `⚠ **${c.samplesLowerBound} of ${c.samplesGraded} graded samples carry `
-      + '`concentrationIsLowerBound: true`** — their shares are soft in the PERMISSIVE '
-      + 'direction, so the ALL rows below UNDER-state concentration. The HARD rows are the '
-      + 'ones a ceiling may be reasoned from.');
+    : c.samplesLowerBound === 0
+      ? `✅ **0 of ${c.samplesGraded} graded samples carry `
+        + '`concentrationIsLowerBound: true`** — every share below is a HARD reading '
+        + '(all rows keyed and priced); the ALL and HARD-only rows are the same population.'
+      : `⚠ **${c.samplesLowerBound} of ${c.samplesGraded} graded samples carry `
+        + '`concentrationIsLowerBound: true`** — their shares are soft in the PERMISSIVE '
+        + 'direction, so the ALL rows below UNDER-state concentration. The HARD rows are the '
+        + 'ones a ceiling may be reasoned from.');
   L.push('');
   L.push('| population | n | p0 | p25 | p50 | p75 | p90 | p100 |');
   L.push('|---|---:|---:|---:|---:|---:|---:|---:|');
