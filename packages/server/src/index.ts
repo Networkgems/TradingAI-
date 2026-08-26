@@ -582,6 +582,13 @@ import {
   compactChainPartitions,
   chainPartitionStorageReport,
 } from './chain-partition-compactor.js';
+// TRA-4059 — completeness census: a 0-file partition is not a captured day.
+import {
+  summarizeChainCaptureCompleteness,
+  trailingTradingDays,
+  type ChainPartitionObservation,
+  type ChainCaptureStatus,
+} from './chain-capture-completeness.js';
 // TRA-2420 — per-subdirectory attribution of DATA_DIR for the admin
 // `/api/health/storage/detail` (TRA-2599 moved it off the open route).
 import { dataDirUsageCached } from './data-dir-usage.js';
@@ -5573,6 +5580,27 @@ async function runChainCompaction(trigger: 'boot' | 'post-capture'): Promise<voi
   }
 }
 
+// TRA-4059 — the last capture this PROCESS ran, published on
+// `/api/health/chain-capture` as `lastRun`. A wholesale skip (written 0 of
+// N>0) is an outage and is readable here the moment it happens, not only after
+// someone opens the partition's `_meta.json`. Since-boot: `null` until the
+// first capture after a restart — read the on-disk `completeness` census for
+// history, this only for "what did the hook just do".
+let lastChainRecordRun: {
+  at: string;
+  date: string;
+  universe: number;
+  written: number;
+  skipped: number;
+  outcomeCounts: Record<string, number>;
+  passes: number;
+  rescuedByRetry: string[];
+  wholesaleSkip: boolean;
+  /** Distinct refusing HTTP statuses seen, e.g. `[429]`. */
+  feedErrorStatuses: number[];
+  severity: 'complete' | 'partial' | 'wholesale_skip';
+} | null = null;
+
 /** Returns true iff a capture ran (so the caller can stamp the per-day marker
  * — a token-less no-op must stay retryable within the day, see TRA-2476). */
 async function runChainRecord(): Promise<boolean> {
@@ -5606,21 +5634,64 @@ async function runChainRecord(): Promise<boolean> {
     dte: `[${minDteDays},${maxDteDays}]`,
     outDir: CHAIN_RECORD_OUT_DIR,
   });
+  // TRA-4059 — bounded in-session retry of every symbol that did not write.
+  // `CHAINS_RETRY_MAX` / `CHAINS_RETRY_DELAY_MS` override without a deploy.
+  const maxRetries = Number((process.env['CHAINS_RETRY_MAX'] ?? '').trim());
+  const retryDelayMs = Number((process.env['CHAINS_RETRY_DELAY_MS'] ?? '').trim());
   const result = await recordOptionChains({
     symbols,
     client,
     outDir: CHAIN_RECORD_OUT_DIR,
     minDteDays,
     maxDteDays,
+    maxRetries: Number.isFinite(maxRetries) && maxRetries >= 0 && process.env['CHAINS_RETRY_MAX'] ? maxRetries : undefined,
+    retryDelayMs: Number.isFinite(retryDelayMs) && retryDelayMs >= 0 && process.env['CHAINS_RETRY_DELAY_MS'] ? retryDelayMs : undefined,
+    onRetry: ({ pass, pending, delayMs }) =>
+      log.warn('chain-recorder retry pass', { pass, pending: pending.length, symbols: pending, delayMs }),
   });
-  const written = result.symbols.filter((s) => s.outcome === 'written').length;
+  const written = result.written;
   const errored = result.symbols.filter((s) => s.outcome === 'error');
-  log.info('chain-recorder complete', {
+  const feedErrorStatuses = Array.from(
+    new Set(result.symbols.filter((s) => s.outcome === 'feed_error').map((s) => s.httpStatus ?? 0)),
+  ).sort((a, b) => a - b);
+  const severity = result.wholesaleSkip ? 'wholesale_skip' : written < result.symbols.length ? 'partial' : 'complete';
+  lastChainRecordRun = {
+    at: new Date().toISOString(),
+    date: result.date,
+    universe: result.symbols.length,
+    written,
+    skipped: result.skipped,
+    outcomeCounts: result.outcomeCounts,
+    passes: result.passes,
+    rescuedByRetry: result.rescuedByRetry,
+    wholesaleSkip: result.wholesaleSkip,
+    feedErrorStatuses,
+    severity,
+  };
+  const summary = {
     date: result.date,
     written,
+    skipped: result.skipped,
     total: result.symbols.length,
+    outcomeCounts: result.outcomeCounts,
+    passes: result.passes,
+    rescuedByRetry: result.rescuedByRetry,
+    feedErrorStatuses,
     dir: result.outDir,
-  });
+  };
+  // TRA-4059 — a session that wrote NOTHING is an outage, not a partition:
+  // the store accrues forward only, so this day is gone from the archive for
+  // good. Loud at `error`; a partial session at `warn` with the losers named.
+  if (result.wholesaleSkip) {
+    log.error('chain-recorder WHOLESALE SKIP — zero symbols written, the trading day is lost from the archive', summary);
+  } else if (written < result.symbols.length) {
+    log.warn('chain-recorder partial capture — skipped symbol-days are unrecoverable', {
+      ...summary,
+      skippedSymbols: result.symbols.filter((s) => s.outcome !== 'written').map((s) => `${s.symbol}:${s.outcome}${s.httpStatus ? `(${s.httpStatus})` : ''}`),
+    });
+  } else {
+    log.info('chain-recorder complete', summary);
+  }
   for (const s of errored) {
     log.warn('chain-recorder symbol error', {
       symbol: s.symbol,
@@ -8351,18 +8422,67 @@ app.get('/api/health/chain-capture', async (_req, res) => {
     retentionTradingDays: RETENTION_REPORT_TRADING_DAYS,
   });
 
+  // TRA-4059 — completeness census. A partition directory exists from the
+  // recorder's `mkdir` onward, before a single symbol is fetched, so counting
+  // partitions counted the 0-file 2026-08-18 as a captured day. Grade the
+  // trailing retention window of EXPECTED trading days instead: a day with no
+  // partition is `absent`, a partition with no files is `empty`, fewer files
+  // than the universe is `partial`. The most recent expected session is
+  // today only once the capture window has closed (20:00 ET); before that
+  // it is the previous session, so a pre-capture read does not manufacture
+  // an outage.
+  const nowEt = new Date();
+  const etHour = Number(nowEt.toLocaleString('en-US', { timeZone: 'America/New_York', hour: 'numeric', hour12: false }));
+  const todayEt = etDateString(nowEt);
+  const lastExpected = etHour >= 20 && isMarketDayIso(todayEt) ? todayEt : previousMarketDayIso(todayEt) ?? todayEt;
+  const expectedDates = trailingTradingDays(lastExpected, RETENTION_REPORT_TRADING_DAYS, isMarketDayIso);
+  const expectedSet = new Set(expectedDates);
+  const observations: ChainPartitionObservation[] = [];
+  for (const p of storage.perPartition) {
+    if (!expectedSet.has(p.date)) continue;
+    let meta: ChainPartitionObservation['meta'] = null;
+    try {
+      meta = JSON.parse(await readFile(join(outDir, p.date, '_meta.json'), 'utf-8')) as ChainPartitionObservation['meta'];
+    } catch {
+      meta = null;
+    }
+    observations.push({ date: p.date, files: p.files, meta });
+  }
+  const completeness = summarizeChainCaptureCompleteness({
+    partitions: observations,
+    expectedDates,
+    configuredUniverse: configuredUniverse.length,
+  });
+  // Days that hold at least one snapshot — what a replay can actually read.
+  const nonEmptyPartitions = storage.perPartition.filter((p) => p.files > 0).length;
+  const completePartitions = storage.perPartition.filter((p) => p.files >= configuredUniverse.length && p.files > 0).length;
+  // A capture that just ran and wrote nothing is an outage even if the disk
+  // census has not caught up (the partition is `empty` there too, but this
+  // does not depend on the census window containing it).
+  const captureStatus: ChainCaptureStatus =
+    lastChainRecordRun?.wholesaleSkip && lastChainRecordRun.date === todayEt ? 'outage' : completeness.status;
+
   res.json({
     issue: 'TRA-779',
     outDir,
     tokenConfigured,
     capturing: tokenConfigured && dates.length > 0,
-    tradingDaysCaptured: dates.length,
-    progressToThirtyDays: { captured: dates.length, target: 30 },
+    // TRA-4059 — `green` | `degraded` | `outage` | `no_data`. `capturing: true`
+    // above only says a token is set and a directory exists; THIS is the
+    // health. Reason in `completeness.statusReason`.
+    captureStatus,
+    // TRA-4059 — a 0-file partition is NOT a captured day. `partitions` is the
+    // raw directory count this field used to be.
+    tradingDaysCaptured: nonEmptyPartitions,
+    partitions: dates.length,
+    progressToThirtyDays: { captured: nonEmptyPartitions, complete: completePartitions, target: 30 },
     firstDate: dates[0] ?? null,
     lastDate: dates[dates.length - 1] ?? null,
     universeSource: rawUniverse ? 'CHAINS_WATCHLIST' : 'WATCHLIST',
     configuredUniverse,
     latest,
+    completeness,
+    lastRun: lastChainRecordRun,
     phase2BaselineCoverage: {
       required: PHASE2_BASELINE,
       covered: baselineCovered,

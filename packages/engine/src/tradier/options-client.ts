@@ -28,6 +28,15 @@ export interface TradierOptionQuote {
   quoteTimeMs?: number;
 }
 
+/**
+ * TRA-4059 — a broker GET with its HTTP outcome kept. `ok:false` is a refusal
+ * (rate-limit, outage, auth) and carries the status; `ok:true` carries the
+ * parsed value, which may legitimately be empty.
+ */
+export type TradierFetchResult<T> =
+  | { ok: true; httpStatus: number; value: T }
+  | { ok: false; httpStatus: number };
+
 interface TradierExpirationsEnvelope {
   expirations?: { date?: string | string[] } | string | null;
 }
@@ -669,21 +678,51 @@ export class TradierOptionsClient extends TradierOrderClient {
     };
   }
 
-  private async getJson<T>(path: string): Promise<T | null> {
+  /**
+   * TRA-4059 — the status-preserving GET. `getJson` below collapses EVERY
+   * non-2xx (429 rate-limit, 5xx, 401) into `null`, and the list readers on top
+   * of it collapse `null` into `[]` — so a Tradier refusal was byte-identical to
+   * "this symbol lists no expirations". The option-chain recorder filed 25/25
+   * symbols as `no_expirations` on 2026-08-18 (a sweep that finished in <60s)
+   * and the day is gone from the archive for good. Readers that must tell the
+   * two apart use the `fetch*` variants, which return the HTTP status instead.
+   */
+  private async getJsonChecked<T>(path: string): Promise<TradierFetchResult<T>> {
     const resp = await fetch(`${this.baseUrl}${path}`, {
       headers: { Authorization: this.headers.Authorization, Accept: 'application/json' },
     });
-    if (!resp.ok) return null;
-    return (await resp.json()) as T;
+    if (!resp.ok) return { ok: false, httpStatus: resp.status };
+    return { ok: true, httpStatus: resp.status, value: (await resp.json()) as T };
+  }
+
+  private async getJson<T>(path: string): Promise<T | null> {
+    const r = await this.getJsonChecked<T>(path);
+    return r.ok ? r.value : null;
   }
 
   /** List option expirations for a symbol (YYYY-MM-DD strings, ascending). */
   async getExpirations(underlyingSymbol: string): Promise<string[]> {
-    const data = await this.getJson<TradierExpirationsEnvelope>(
+    const r = await this.fetchExpirations(underlyingSymbol);
+    return r.ok ? r.value : [];
+  }
+
+  /**
+   * TRA-4059 — `getExpirations` with the HTTP outcome preserved. `ok:false`
+   * is a feed refusal (status attached); `ok:true` with `value: []` is the
+   * broker genuinely listing nothing. The recorder retries the former and
+   * counts it; the scanners keep the collapsed `getExpirations` contract.
+   */
+  async fetchExpirations(underlyingSymbol: string): Promise<TradierFetchResult<string[]>> {
+    const r = await this.getJsonChecked<TradierExpirationsEnvelope>(
       `/markets/options/expirations?symbol=${encodeURIComponent(underlyingSymbol)}`,
     );
-    if (!data || typeof data.expirations !== 'object' || data.expirations == null) return [];
-    return asArray(data.expirations.date).filter((d): d is string => typeof d === 'string');
+    if (!r.ok) return r;
+    const data = r.value;
+    const value =
+      !data || typeof data.expirations !== 'object' || data.expirations == null
+        ? []
+        : asArray(data.expirations.date).filter((d): d is string => typeof d === 'string');
+    return { ok: true, httpStatus: r.httpStatus, value };
   }
 
   /** Fetch the full options chain for an expiration. */
@@ -720,14 +759,27 @@ export class TradierOptionsClient extends TradierOrderClient {
     underlyingSymbol: string,
     expiration: string,
   ): Promise<OptionChainRow[]> {
+    const r = await this.fetchChainSnapshot(underlyingSymbol, expiration);
+    return r.ok ? r.value : [];
+  }
+
+  /** TRA-4059 — `getChainSnapshot` with the HTTP outcome preserved (see `fetchExpirations`). */
+  async fetchChainSnapshot(
+    underlyingSymbol: string,
+    expiration: string,
+  ): Promise<TradierFetchResult<OptionChainRow[]>> {
     const params = new URLSearchParams({
       symbol: underlyingSymbol,
       expiration,
       greeks: 'true',
     });
-    const data = await this.getJson<TradierChainEnvelope>(`/markets/options/chains?${params}`);
-    if (!data || typeof data.options !== 'object' || data.options == null) return [];
-    return asArray(data.options.option).map((o) => ({
+    const r = await this.getJsonChecked<TradierChainEnvelope>(`/markets/options/chains?${params}`);
+    if (!r.ok) return r;
+    const data = r.value;
+    if (!data || typeof data.options !== 'object' || data.options == null) {
+      return { ok: true, httpStatus: r.httpStatus, value: [] };
+    }
+    const value: OptionChainRow[] = asArray(data.options.option).map((o) => ({
       optionSymbol: o.symbol,
       underlying: o.underlying,
       optionType: o.option_type,
@@ -741,6 +793,7 @@ export class TradierOptionsClient extends TradierOrderClient {
       midIv: o.greeks?.mid_iv && o.greeks.mid_iv > 0 ? o.greeks.mid_iv : undefined,
       smvVol: o.greeks?.smv_vol && o.greeks.smv_vol > 0 ? o.greeks.smv_vol : undefined,
     }));
+    return { ok: true, httpStatus: r.httpStatus, value };
   }
 
   /** Find the nearest ATM contract expiring 2-5 weeks out (matches Alpaca client window). */

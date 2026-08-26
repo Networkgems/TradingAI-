@@ -42,6 +42,7 @@ export type {
   TradierCashEvent,
   TradierCorporateAction,
   TradierGainLossLot,
+  TradierFetchResult,
   TradierMultilegSide,
   TradierMultilegLeg,
   TradierMultilegPricing,
