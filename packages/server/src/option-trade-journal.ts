@@ -175,6 +175,24 @@ export interface OptionTradeJournalOpen {
   entryDte: number;
   /** Capital at risk (max loss), USD — the basis realized R is measured from. */
   atRiskUsd: number;
+  /**
+   * TRA-4028 — WHERE `atRiskUsd` came from on an IMPORTED / ADOPTED row.
+   *
+   * `'fill'` = the ledger's own `buy_to_open` fill(s) attributable to THIS lot
+   * (TRA-3986 sibling claims), or a source that already names one (a TRA-3958
+   * operator pin, a TRA-3909 desk-add capture). `'mark'` = the figure the book
+   * row carried at the write — on a reconcile import that is the broker's
+   * OCC-level cost-basis BLEND, which on 2026-08-21 priced the desk's BAC lot
+   * `6bbc5d17` at $141 (½·(1.65 + 1.17)) while the ledger held its 1.17 fill.
+   *
+   * Optional: ABSENT on every row written before this field existed and on
+   * every ENGINE-opened row (whose basis is the open mark by definition —
+   * `pnl_r_basis: 'premium-open-mark'`, TRA-4027). A reader must treat absent
+   * as UNKNOWN, never as `'mark'`.
+   */
+  atRiskBasis?: 'fill' | 'mark';
+  /** TRA-4028 — the source, named: `ledger_fill:142603649`, `operator_pin:TRA-3958`, `mark:remainder_excess`. */
+  atRiskProvenance?: string;
   /** Agent conviction [0,1] when an LLM advisory approved it; null otherwise. */
   agentConviction?: number | null;
   /**
@@ -633,6 +651,34 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
    * book copy was the only record of it. See {@link recordOptionTradeCloseSupersede}.
    */
   supersededCloses?: OptionTradeSupersededClose[];
+  /**
+   * TRA-4028 — the ENTRY BASES this row carried BEFORE the one it carries now,
+   * in amendment order. ABSENT means `atRiskUsd` is the figure the OPEN wrote.
+   *
+   * The mirror of `supersededCloses` on the other leg: a `supersede_close`
+   * corrects WHICH exit a row carries, an `amend_close_basis` corrects what it
+   * EARNED, and an `amend_open_basis` corrects what it RISKED — the denominator
+   * of every R on the row. Kept ON the row so the move is auditable without the
+   * pre-state (the same reason `realizedPnlUsdBeforeRestatement` exists).
+   */
+  supersededOpenBasis?: OptionTradeSupersededOpenBasis[];
+}
+
+/** TRA-4028 — one entry basis this row USED to carry. See {@link OptionTradeJournalRecord.supersededOpenBasis}. */
+export interface OptionTradeSupersededOpenBasis {
+  atRiskUsd: number;
+  atRiskBasis: 'fill' | 'mark' | null;
+  atRiskProvenance: string | null;
+  /** The R the superseded basis produced; `null` while the row was OPEN. */
+  realizedR: number | null;
+  /** The row's outcome at the amendment — `'OPEN'` when only the basis moved. */
+  outcome: OptionTradeOutcome | 'OPEN';
+  /** When the amendment was written. */
+  supersededAt: number;
+  /** Why — free text naming the writer, e.g. `admin_restatement:TRA-3958`. */
+  reason: string;
+  /** The ticket authorising the writer. */
+  issue: string;
 }
 
 /** TRA-4004 — one close this row USED to carry. See {@link OptionTradeJournalRecord.supersededCloses}. */
@@ -818,6 +864,36 @@ type SupersedeCloseLine = {
   /** The ticket authorising the writer (`TRA-4004` for both the engine path and the admin route). */
   issue: string;
 };
+// TRA-4028 — RESTATE the ENTRY BASIS (`atRiskUsd`) on a row, OPEN or CLOSED.
+//
+// The fourth correction kind. `void` retracts a row; `amend_close_basis`
+// corrects what a row EARNED; `supersede_close` corrects WHICH close it
+// carries; this one corrects what it RISKED — the denominator of every R the
+// row publishes. It exists for the one shape where the OPEN itself was priced
+// off the wrong instrument: a reconcile import that copied the broker's
+// OCC-level cost-basis BLEND (`6bbc5d17`, $141 = ½·(1.65 + 1.17)) while the
+// ledger held the lot's own 1.17 fill. Applied to a CLOSED row it re-derives
+// `realizedR` (and the outcome) off the row's own `realizedPnlUsd`; the money,
+// the close, the exit reason and the partial slices do NOT move — a basis says
+// what a trade risked, never what it earned or why it was exited.
+//
+// The fold refuses (and WITNESSES) an unknown id, a malformed figure, and a
+// figure equal to the one already on the row — a no-op amend is recorded, not
+// silently dropped, so "restated to the same number" and "never restated" stay
+// distinguishable (the same reason the close-basis witness records zero-delta
+// skips).
+type AmendOpenBasisLine = {
+  kind: 'amend_open_basis';
+  id: string;
+  ts: number;
+  atRiskUsd: number;
+  atRiskBasis: 'fill' | 'mark';
+  /** The citation for the figure, e.g. `TRA-3958` (the operator-pinned desk basis). */
+  provenance: string;
+  reason: string;
+  /** The ticket authorising the writer (`TRA-4028` for the admin route). */
+  issue: string;
+};
 type JournalLine =
   | OpenLine
   | CloseLine
@@ -828,7 +904,8 @@ type JournalLine =
   | MaeLine
   | AverageDownShadowLine
   | AmendEntryQuoteLine
-  | SupersedeCloseLine;
+  | SupersedeCloseLine
+  | AmendOpenBasisLine;
 
 /**
  * TRA-4004 — two closes of ONE position closer together than this are the SAME
@@ -1088,6 +1165,75 @@ export function getOptionTradeCloseSupersedes(): {
   };
 }
 
+/**
+ * TRA-4028 — one witnessed restatement of a row's ENTRY BASIS.
+ *
+ * Same rationale as the three witnesses above: the row carries
+ * `supersededOpenBasis[]` and can testify to amendments that HAPPENED; only a
+ * ledger can testify to the ones the fold REFUSED — an unknown id, a malformed
+ * figure, or a figure equal to the one already on the row. That last is the
+ * idempotence tell: a re-POST of the same correction is `refused: unchanged`,
+ * never a second silent no-op that reads like a second restatement.
+ */
+export interface OptionTradeOpenBasisAmendRecord {
+  id: string;
+  ts: number | null;
+  applied: boolean;
+  /** Why the fold refused; `null` when applied. */
+  refusal: 'unknown_row' | 'unchanged' | 'malformed' | null;
+  reason: string | null;
+  issue: string | null;
+  provenance: string | null;
+  mode: 'demo' | 'live' | null;
+  symbol: string | null;
+  optionSymbol: string | null;
+  /** The basis being replaced, read off the record BEFORE the move; `null` when unknown. */
+  atRiskUsdBefore: number | null;
+  /** The basis now on the row; `null` when refused. */
+  atRiskUsdAfter: number | null;
+  /** The R the old basis produced (closed rows only); `null` when OPEN / refused. */
+  realizedRBefore: number | null;
+  realizedRAfter: number | null;
+}
+
+/** Same cap as {@link VOID_LEDGER_CAP} — a witness, not a second journal. */
+const OPEN_BASIS_AMEND_LEDGER_CAP = 500;
+let openBasisAmendLedger: OptionTradeOpenBasisAmendRecord[] = [];
+let openBasisAmendDropped = 0;
+
+function pushOpenBasisAmend(
+  sink: OptionTradeOpenBasisAmendRecord[],
+  rec: OptionTradeOpenBasisAmendRecord,
+): void {
+  sink.push(rec);
+  while (sink.length > OPEN_BASIS_AMEND_LEDGER_CAP) {
+    sink.shift();
+    openBasisAmendDropped += 1;
+  }
+}
+
+/**
+ * TRA-4028 — entry-basis amendments observed by the last load plus every one
+ * written since. Served by `/api/health/option-journal` as `openBasisAmends`.
+ */
+export function getOptionTradeOpenBasisAmends(): {
+  total: number;
+  dropped: number;
+  applied: number;
+  refused: number;
+  live: number;
+  recent: OptionTradeOpenBasisAmendRecord[];
+} {
+  return {
+    total: openBasisAmendLedger.length,
+    dropped: openBasisAmendDropped,
+    applied: openBasisAmendLedger.filter((s) => s.applied).length,
+    refused: openBasisAmendLedger.filter((s) => !s.applied).length,
+    live: openBasisAmendLedger.filter((s) => s.mode === 'live').length,
+    recent: openBasisAmendLedger.map((s) => ({ ...s })),
+  };
+}
+
 function defaultStoreFile(): string {
   const root = resolveDataDir();
   return join(root, 'option-trade-journal.jsonl');
@@ -1106,6 +1252,9 @@ export function setOptionTradeJournalFileForTests(path: string | null): void {
   // TRA-4004 — same for the supersession witnesses.
   closeSupersedeLedger = [];
   closeSupersedeDropped = 0;
+  // TRA-4028 — and the entry-basis witnesses.
+  openBasisAmendLedger = [];
+  openBasisAmendDropped = 0;
 }
 function storeFile(): string {
   return storeFileOverride ?? defaultStoreFile();
@@ -1182,6 +1331,8 @@ function foldLine(
   amendSink: OptionTradeCloseBasisAmendRecord[] = closeBasisAmendLedger,
   // TRA-4004 — same contract again for the supersession witness.
   supersedeSink: OptionTradeCloseSupersedeRecord[] = closeSupersedeLedger,
+  // TRA-4028 — and once more for the entry-basis witness.
+  openBasisSink: OptionTradeOpenBasisAmendRecord[] = openBasisAmendLedger,
 ): void {
   if (line.kind === 'open') {
     if (!map.has(line.rec.id)) map.set(line.rec.id, { ...line.rec, outcome: 'OPEN' });
@@ -1364,6 +1515,68 @@ function foldLine(
     });
     return;
   }
+  if (line.kind === 'amend_open_basis') {
+    // TRA-4028 — restate the ENTRY BASIS on a row, OPEN or CLOSED.
+    //
+    // Three refusals, every one witnessed: a malformed figure (non-finite,
+    // non-positive, an unknown basis label, an empty provenance); an unknown id
+    // (never resurrects a row); and a figure equal to the one already on the
+    // row (idempotence — recorded as `unchanged`, never silently dropped).
+    //
+    // On a CLOSED row the R is RE-DERIVED from the row's own `realizedPnlUsd`
+    // and the new denominator, and the outcome with it — a scratch can become
+    // a loss when the basis shrinks. The money is NOT touched: this line says
+    // what the trade risked, not what it earned. On an OPEN row only the basis
+    // moves; the eventual close divides by it.
+    const rec = map.get(line.id);
+    const ts = typeof line.ts === 'number' && Number.isFinite(line.ts) ? line.ts : null;
+    const atRiskUsd = line.atRiskUsd;
+    const base = {
+      id: line.id,
+      ts,
+      reason: typeof line.reason === 'string' ? line.reason : null,
+      issue: typeof line.issue === 'string' ? line.issue : null,
+      provenance: typeof line.provenance === 'string' ? line.provenance : null,
+      mode: rec?.mode ?? null,
+      symbol: rec?.symbol ?? null,
+      optionSymbol: rec?.optionSymbol ?? null,
+      atRiskUsdBefore: rec && Number.isFinite(rec.atRiskUsd) ? rec.atRiskUsd : null,
+      realizedRBefore: rec && Number.isFinite(rec.realizedR) ? (rec.realizedR as number) : null,
+    };
+    const refuse = (refusal: OptionTradeOpenBasisAmendRecord['refusal']): void => {
+      pushOpenBasisAmend(openBasisSink, { ...base, applied: false, refusal, atRiskUsdAfter: null, realizedRAfter: null });
+    };
+    const malformed = typeof atRiskUsd !== 'number' || !Number.isFinite(atRiskUsd) || !(atRiskUsd > 0)
+      || (line.atRiskBasis !== 'fill' && line.atRiskBasis !== 'mark')
+      || typeof line.provenance !== 'string' || line.provenance === '';
+    if (malformed) { refuse('malformed'); return; }
+    if (!rec) { refuse('unknown_row'); return; }
+    if (Math.abs(rec.atRiskUsd - atRiskUsd) <= 1e-6) { refuse('unchanged'); return; }
+    const prior: OptionTradeSupersededOpenBasis = {
+      atRiskUsd: rec.atRiskUsd,
+      atRiskBasis: rec.atRiskBasis ?? null,
+      atRiskProvenance: rec.atRiskProvenance ?? null,
+      realizedR: Number.isFinite(rec.realizedR) ? (rec.realizedR as number) : null,
+      outcome: rec.outcome,
+      supersededAt: ts ?? 0,
+      reason: base.reason ?? '',
+      issue: base.issue ?? '',
+    };
+    const closed = rec.outcome !== 'OPEN' && Number.isFinite(rec.realizedPnlUsd);
+    const realizedR = closed
+      ? Math.round(((rec.realizedPnlUsd as number) / atRiskUsd) * 10_000) / 10_000
+      : null;
+    pushOpenBasisAmend(openBasisSink, { ...base, applied: true, refusal: null, atRiskUsdAfter: atRiskUsd, realizedRAfter: realizedR });
+    map.set(line.id, {
+      ...rec,
+      atRiskUsd,
+      atRiskBasis: line.atRiskBasis,
+      atRiskProvenance: line.provenance,
+      ...(realizedR !== null ? { realizedR, outcome: outcomeForR(realizedR) } : {}),
+      supersededOpenBasis: [...(rec.supersededOpenBasis ?? []), prior],
+    });
+    return;
+  }
   if (line.kind === 'supersede_close') {
     // TRA-4004 — replace the close on a CLOSED row with a DIFFERENT close.
     //
@@ -1506,6 +1719,8 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
   const amendSink: OptionTradeCloseBasisAmendRecord[] = [];
   // TRA-4004 — and the supersession witness.
   const supersedeSink: OptionTradeCloseSupersedeRecord[] = [];
+  // TRA-4028 — and the entry-basis witness.
+  const openBasisSink: OptionTradeOpenBasisAmendRecord[] = [];
   if (existsSync(path)) {
     try {
       const raw = await readFile(path, 'utf-8');
@@ -1513,7 +1728,7 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
         const trimmed = rawLine.trim();
         if (!trimmed) continue;
         try {
-          foldLine(map, JSON.parse(trimmed) as JournalLine, voidSink, amendSink, supersedeSink);
+          foldLine(map, JSON.parse(trimmed) as JournalLine, voidSink, amendSink, supersedeSink, openBasisSink);
         } catch {
           // Skip a single corrupt line rather than losing the whole journal — but
           // COUNT it, so a dropped row cannot pass for a clean load.
@@ -1536,6 +1751,7 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
   voidLedger = voidSink;
   closeBasisAmendLedger = amendSink;
   closeSupersedeLedger = supersedeSink;
+  openBasisAmendLedger = openBasisSink;
 
   // TRA-1681 — do NOT cache a book we could not read.
   //
@@ -1977,6 +2193,73 @@ export async function recordOptionTradeCloseBasis(
     feesUsd: basis.feesUsd,
   });
   return true;
+}
+
+/**
+ * TRA-4028 — RESTATE the ENTRY BASIS (`atRiskUsd`) on ONE row, witnessed.
+ *
+ * The mirror of {@link recordOptionTradeCloseSupersede} on the entry leg. Used
+ * by the admin route for the measured 2026-08-21 BAC mint (`6bbc5d17`, $141
+ * blend → $117 desk fill per TRA-3958); the engine itself never calls it — a
+ * mint that can name its fill writes the right basis on the OPEN
+ * (`atRiskBasis: 'fill'`) and one that cannot says `'mark'`.
+ *
+ * Folds first, appends only if the fold APPLIED, so the file never carries a
+ * line the replay would refuse. Does NOT re-notify close listeners: the row's
+ * realized MONEY is unchanged, and the learner keys its fold on `realizedR`
+ * only through the journal it re-reads (TRA-1046), which now serves the
+ * restated figure. See the `AmendOpenBasisLine` note for what does not move.
+ */
+export async function recordOptionTradeOpenBasis(
+  id: string,
+  basis: { atRiskUsd: number; atRiskBasis: 'fill' | 'mark'; provenance: string },
+  meta: { reason: string; issue: string },
+  // Test seam — pin the witness clock. Defaults to wall time.
+  ts: number = Date.now(),
+): Promise<{ applied: boolean; refusal: OptionTradeOpenBasisAmendRecord['refusal'] }> {
+  if (!isOptionTradeJournalEnabled()) return { applied: false, refusal: null };
+  const map = await ensureLoaded();
+  const existing = map.get(id);
+  const line: AmendOpenBasisLine = {
+    kind: 'amend_open_basis',
+    id,
+    ts,
+    atRiskUsd: basis.atRiskUsd,
+    atRiskBasis: basis.atRiskBasis,
+    provenance: basis.provenance,
+    reason: meta.reason,
+    issue: meta.issue,
+  };
+  const before = openBasisAmendLedger.length;
+  foldLine(map, line);
+  const witness = openBasisAmendLedger[openBasisAmendLedger.length - 1];
+  const applied = openBasisAmendLedger.length > before && witness !== undefined && witness.id === id && witness.applied;
+  if (!applied) {
+    log.warn('option trade journal entry-basis restatement REFUSED', {
+      issue: meta.issue,
+      id,
+      reason: meta.reason,
+      refusal: witness?.refusal ?? null,
+      existingAtRiskUsd: existing?.atRiskUsd ?? null,
+      attemptedAtRiskUsd: basis.atRiskUsd,
+    });
+    return { applied: false, refusal: witness?.refusal ?? null };
+  }
+  await appendLine(line);
+  log.warn('option trade journal ENTRY BASIS RESTATED', {
+    issue: meta.issue,
+    id,
+    reason: meta.reason,
+    provenance: basis.provenance,
+    optionSymbol: existing?.optionSymbol ?? null,
+    mode: existing?.mode ?? null,
+    atRiskUsdBefore: witness.atRiskUsdBefore,
+    atRiskUsdAfter: witness.atRiskUsdAfter,
+    atRiskBasis: basis.atRiskBasis,
+    realizedRBefore: witness.realizedRBefore,
+    realizedRAfter: witness.realizedRAfter,
+  });
+  return { applied: true, refusal: null };
 }
 
 /**

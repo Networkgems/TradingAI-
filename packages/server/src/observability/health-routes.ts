@@ -252,6 +252,7 @@ import {
   getOptionTradeVoids, // TRA-3472 — the acceptance witness for the never-filled retraction
   getOptionTradeCloseBasisAmends, // TRA-2819 — the acceptance witness for the broker-basis restatement
   getOptionTradeCloseSupersedes, // TRA-4004 — the acceptance witness for a real close landing on an already-closed row
+  getOptionTradeOpenBasisAmends, // TRA-4028 — the acceptance witness for an entry-basis restatement (blend → own fill)
   GATE_R_BASIS_STRUCTURES, // TRA-2590 — which structures have a valid premium→gate R conversion
   type OptionTradeJournalSummary,
   type OptionTradeJournalIntegrity,
@@ -6535,6 +6536,13 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // `refusal: 'same_close'` is the duplicate close event the guard drops
       // and is the healthy quiet state; `refusal: 'row_open'` is a finding.
       closeSupersedes: getOptionTradeCloseSupersedes(),
+      // TRA-4028 — the fourth correction witness: a row's ENTRY BASIS was
+      // restated from the broker blend a reconcile import copied to the lot's
+      // own ledger fill (the 08-21 BAC `6bbc5d17`, $141 → $117). Read
+      // `applied`; a `refused: unchanged` is an idempotent re-POST, and a
+      // `refused: unknown_row` is a finding. Per-row, `rows[].atRiskBasis`
+      // says which instrument priced every import row minted since this cut.
+      openBasisAmends: getOptionTradeOpenBasisAmends(),
       // TRA-3547 — the zombie alarm, unauthenticated like the rest of this
       // route. A live `OPEN` row the broker tape says is NOT open sat silently
       // for 10 days because nothing published the contradiction; `summary` alone

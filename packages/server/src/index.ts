@@ -122,6 +122,10 @@ import {
   // TRA-4004 — the measured backfill of a close a reconstruction displaced.
   recordOptionTradeCloseSupersede,
   getOptionTradeCloseSupersedes,
+  // TRA-4028 — the witnessed entry-basis restatement (the mirror of the above
+  // on the OPEN leg) for the one row a reconcile import priced off the blend.
+  recordOptionTradeOpenBasis,
+  getOptionTradeOpenBasisAmends,
   getOptionTradeJournalRecord,
   outcomeForR,
   // TRA-3930 — the ONE spelling of the book↔journal id join. The export used to
@@ -12866,6 +12870,164 @@ app.post('/api/health/option-journal/supersede-close', requireAuth, requireAdmin
     result,
     witness: getOptionTradeCloseSupersedes(),
     hint: apply ? undefined : 'DRY RUN — nothing written. Re-POST with ?apply=true&confirm=TRA-4004 to execute.',
+  });
+});
+
+// TRA-4028 — restate the ENTRY BASIS (`atRiskUsd`) on ONE journal row to the
+// lot's own ledger fill.
+//
+// The mirror of the supersede route above on the OPEN leg, for the one shape
+// that route explicitly declined to touch (see its `note`): a reconcile import
+// whose OPEN was priced off the broker's OCC-level cost-basis BLEND. On
+// 2026-08-21 the desk's residual BAC lot `6bbc5d17` was minted at $141 =
+// ½·(1.65 engine fill + 1.17 desk fill) while the ledger held the desk's 1.17
+// the whole time; the row's real −$3.00 exit (TRA-4004) then published R
+// −0.021 instead of −0.026, and `/api/trades/export` copied it to the digit.
+//
+// What it refuses: an unknown id; a row with no OCC / contracts (nothing to
+// join to the ledger); an entry basis the fill ledger does NOT hold as a
+// `buy_to_open` on the row's OCC at that price (the basis is a LEDGER FACT, not
+// a request body — the same posture as the supersede route's `sell_to_close`
+// requirement); and a provenance that names no ticket. The fold refuses an
+// unchanged figure (`unchanged`) so a re-POST is idempotent and witnessed.
+//
+// ⛔ REAL-MONEY HOST. Refuses `apply` inside RTH (13:30–20:00Z Mon–Fri) unless
+// `rth_override=TRA-4028` is also present: the TRA-3945 window and every
+// expectancy fold re-read the restated R on their next tick, and a denominator
+// moving mid-session on a live book is not a thing to do without a reason on
+// the record.
+//
+// DRY RUN BY DEFAULT. Mutating needs `?apply=true&confirm=TRA-4028`.
+app.post('/api/health/option-journal/amend-open-basis', requireAuth, requireAdmin, async (req, res) => {
+  if (!isOptionTradeJournalEnabled()) {
+    res.status(409).json({ ok: false, error: 'option trade journal is disabled on this host; nothing to restate' });
+    return;
+  }
+  const q = req.query as Record<string, unknown>;
+  const wantsApply = q['apply'] === 'true' || q['apply'] === '1';
+  const confirmed = q['confirm'] === 'TRA-4028';
+  if (wantsApply && !confirmed) {
+    res.status(400).json({
+      ok: false,
+      error: 'apply=true requires confirm=TRA-4028',
+      detail:
+        'An entry-basis restatement moves the denominator of every R on a settled journal row through the '
+        + 'replay fold and cannot be undone. The confirmation is what keeps a mistyped flag in the dry-run branch.',
+    });
+    return;
+  }
+  const apply = wantsApply && confirmed;
+  const nowMs = Date.now();
+  const utc = new Date(nowMs);
+  const dow = utc.getUTCDay();
+  const minutes = utc.getUTCHours() * 60 + utc.getUTCMinutes();
+  const insideRth = dow >= 1 && dow <= 5 && minutes >= 13 * 60 + 30 && minutes < 20 * 60;
+  if (apply && insideRth && q['rth_override'] !== 'TRA-4028') {
+    res.status(409).json({
+      ok: false,
+      error: 'refusing to restate a live journal basis inside RTH (13:30–20:00Z Mon–Fri)',
+      detail: 'Re-POST pre-open, post-close or on a weekend; `rth_override=TRA-4028` overrides with the reason on the record.',
+      now: utc.toISOString(),
+    });
+    return;
+  }
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const id = typeof body['id'] === 'string' ? body['id'] : null;
+  const entryPremium = typeof body['entryPremium'] === 'number' && Number.isFinite(body['entryPremium']) && body['entryPremium'] > 0
+    ? body['entryPremium'] : null;
+  const provenance = typeof body['provenance'] === 'string' ? body['provenance'] : '';
+  if (!id || entryPremium === null || !/TRA-\d+/.test(provenance)) {
+    res.status(400).json({
+      ok: false,
+      error: 'body requires {id, entryPremium > 0, provenance containing a TRA-nnnn ref}',
+    });
+    return;
+  }
+  const rec = await getOptionTradeJournalRecord(id);
+  if (!rec) { res.status(404).json({ ok: false, error: 'no journal row under that id' }); return; }
+  if (!rec.optionSymbol || !Number.isFinite(rec.contracts) || !(rec.contracts! > 0)) {
+    res.status(409).json({ ok: false, error: 'row carries no optionSymbol/contracts; cannot join it to the fill ledger' });
+    return;
+  }
+  const ledger = summarizeLiveOptionsFeeSlippage();
+  const ledgerUsable = !ledger.durability.ephemeral && ledger.durability.appendErrors === 0 && ledger.n > 0;
+  if (!ledgerUsable) {
+    res.status(409).json({ ok: false, error: 'fill ledger is not usable; refusing to price a basis off it', durability: ledger.durability, n: ledger.n });
+    return;
+  }
+  const fill = ledger.records.find(
+    (f) => f.mode === rec.mode && f.side === 'buy_to_open' && f.optionSymbol === rec.optionSymbol
+      && Number.isFinite(f.filledPrice) && Math.abs((f.filledPrice as number) - entryPremium) <= 1e-6,
+  );
+  if (!fill) {
+    res.status(404).json({
+      ok: false,
+      error: `no buy_to_open at ${entryPremium} on ${rec.optionSymbol} (${rec.mode}) in the fill ledger — an entry basis is a ledger fact, not a request body`,
+      ledgerBuys: ledger.records
+        .filter((f) => f.side === 'buy_to_open' && f.optionSymbol === rec.optionSymbol)
+        .map((f) => ({ ts: new Date(f.ts).toISOString(), contracts: f.contracts, filledPrice: f.filledPrice, orderId: f.orderId, origin: f.origin })),
+    });
+    return;
+  }
+  const atRiskUsd = Math.round(entryPremium * rec.contracts! * 100 * 100) / 100;
+  const closed = rec.outcome !== 'OPEN' && Number.isFinite(rec.realizedPnlUsd);
+  const plannedR = closed ? Math.round(((rec.realizedPnlUsd as number) / atRiskUsd) * 10_000) / 10_000 : null;
+  const planned = {
+    atRiskUsd,
+    atRiskBasis: 'fill' as const,
+    provenance,
+    realizedR: plannedR,
+    outcome: plannedR === null ? rec.outcome : outcomeForR(plannedR),
+  };
+  const before = {
+    atRiskUsd: rec.atRiskUsd,
+    atRiskBasis: rec.atRiskBasis ?? null,
+    atRiskProvenance: rec.atRiskProvenance ?? null,
+    realizedPnlUsd: rec.realizedPnlUsd ?? null,
+    realizedR: rec.realizedR ?? null,
+    outcome: rec.outcome,
+    supersededOpenBasis: rec.supersededOpenBasis ?? [],
+  };
+  let result: { applied: boolean; refusal: string | null } | null = null;
+  if (apply) {
+    result = await recordOptionTradeOpenBasis(
+      id,
+      { atRiskUsd, atRiskBasis: 'fill', provenance },
+      { reason: `admin_restatement:${provenance}`, issue: 'TRA-4028' },
+    );
+  }
+  const after = apply ? await getOptionTradeJournalRecord(id) : null;
+  res.status(apply && result && !result.applied ? 409 : 200).json({
+    ok: !apply || (result?.applied ?? false),
+    time: new Date().toISOString(),
+    build: resolveBuildInfo(),
+    applied: apply,
+    id,
+    optionSymbol: rec.optionSymbol,
+    mode: rec.mode,
+    contracts: rec.contracts,
+    fill,
+    entryPremium,
+    provenance,
+    planned,
+    note: closed
+      ? `realizedPnlUsd ${rec.realizedPnlUsd} is NOT restated (a basis says what the trade risked, not what it earned); realizedR re-derives to ${plannedR} = ${rec.realizedPnlUsd} / ${atRiskUsd}`
+      : 'row is OPEN: only the basis moves; the eventual close divides by it',
+    before,
+    after: after
+      ? {
+          atRiskUsd: after.atRiskUsd,
+          atRiskBasis: after.atRiskBasis ?? null,
+          atRiskProvenance: after.atRiskProvenance ?? null,
+          realizedPnlUsd: after.realizedPnlUsd ?? null,
+          realizedR: after.realizedR ?? null,
+          outcome: after.outcome,
+          supersededOpenBasis: after.supersededOpenBasis ?? [],
+        }
+      : null,
+    result,
+    witness: getOptionTradeOpenBasisAmends(),
+    hint: apply ? undefined : 'DRY RUN — nothing written. Re-POST with ?apply=true&confirm=TRA-4028 to execute (outside RTH).',
   });
 });
 

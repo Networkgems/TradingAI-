@@ -396,6 +396,28 @@ export function knownLiveOptionBooks(): string[] {
 }
 
 /**
+ * TRA-4028 — every retained fill on ONE OCC contract, oldest-first, as copies.
+ *
+ * The raw material for a SIBLING-CLAIM allocation (`claimFillsBySiblingRows`,
+ * TRA-3986): the import mint needs to know which `buy_to_open` on the contract
+ * is already some other journal row's entry before it may price its own row off
+ * the remainder. Neither episode oracle above answers that — `openEpisodeWindow`
+ * is a provenance walk and `recordedEngineOpenBasis` a basis walk, and both are
+ * scoped to the ENGINE's own episode, while the row being minted is precisely
+ * the one the engine did not place. Unscoped by book on purpose: the claim
+ * pass attributes by journal row, and a fill that belongs to a sibling book's
+ * row is excluded by that row's claim, not by a scope guess here.
+ *
+ * Observe-only; returns copies so a caller cannot mutate the store.
+ */
+export function liveOptionFillsForContract(optionSymbol: string): LiveOptionFillRecord[] {
+  return fills
+    .filter((f) => f.optionSymbol === optionSymbol)
+    .map((f) => ({ ...f }))
+    .sort((a, b) => a.ts - b.ts);
+}
+
+/**
  * TRA-3977 — is the book-attribution question REACHABLE in this process?
  *
  * ⭐ This is the measured condition AC4's negative control rests on. With at

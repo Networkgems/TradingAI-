@@ -98,7 +98,12 @@ import {
   // rows it answered FROM belonged to the fleet while the row it answered ABOUT
   // belonged to one book.
   type LedgerBookScope,
+  // TRA-4028 — the raw fills on one OCC, for the import mint's basis allocation.
+  liveOptionFillsForContract,
 } from './live-options-fee-slippage-ledger.js';
+// TRA-4028 — an imported lot's journal basis comes from its OWN ledger fill when
+// one is attributable, else from the mark AND says so. Pure; see the module.
+import { resolveImportOpenBasis } from './tra4028-import-open-basis.js';
 import {
   appendEngineBasisRestatement,
   engineBasisRestatementDataDir,
@@ -182,6 +187,9 @@ import {
   // TRA-4004 — a real close landing on an already-closed row supersedes it.
   recordOptionTradeCloseSupersede,
   SAME_CLOSE_TOLERANCE_MS,
+  // TRA-4028 — the import mint reads every sibling row on the contract so the
+  // TRA-3986 claim pass can say which ledger fills are already spoken for.
+  listOptionTradeJournal,
   // TRA-2895 — the dated partial-exit row; see `queueJournalPartial`.
   recordOptionTradePartialClose,
   getOptionTradeJournalRecord,
@@ -4999,9 +5007,13 @@ export class PaperOptionsAccount {
     const entryDte = position.expiration
       ? dteFromExpiration(position.expiration, position.openedAt) ?? 0
       : 0;
-    // A long option's max loss IS its premium, so this is the true basis for
-    // `realizedR` — not an approximation standing in for a missing stop.
-    const atRiskUsd = position.premiumPaid * position.contracts * 100;
+    // A long option's max loss IS its premium, so the premium is the true basis
+    // for `realizedR` — not an approximation standing in for a missing stop.
+    // WHICH premium is TRA-4028's question, answered inside the task below
+    // (`resolveImportOpenBasis`): the book row's `premiumPaid` on a reconcile
+    // import is the broker's OCC-level BLEND, and on 2026-08-21 that blend
+    // (½·(1.65 + 1.17) = 1.41) was written as the desk lot's $141 basis while
+    // the ledger held the lot's own 1.17 fill.
     this.journalWrites = this.journalWrites
       .then(async () => {
         // TRA-3078 — re-checked INSIDE the task, not just at the call site: two
@@ -5073,6 +5085,53 @@ export class PaperOptionsAccount {
             });
           }
         }
+        // TRA-4028 — price the row off the lot's OWN fill when the ledger can
+        // attribute one (every sibling row on the contract claims its fills
+        // first, TRA-3986), else off the book figure — and SAY WHICH. Read
+        // inside the task so the sibling set is the one the journal holds at
+        // the write, not at the enqueue.
+        const basis = resolveImportOpenBasis(
+          {
+            id,
+            optionSymbol,
+            mode,
+            contracts: position.contracts,
+            premiumPaid: position.premiumPaid,
+            deskAddBasis: position.deskAddBasis,
+            operatorBasisPin: position.operatorBasisPin,
+          },
+          optionSymbol
+            ? (await listOptionTradeJournal({ mode })).filter((r) => r.optionSymbol === optionSymbol)
+            : [],
+          optionSymbol && mode === 'live' ? liveOptionFillsForContract(optionSymbol) : [],
+        );
+        if (basis.atRiskBasis === 'mark') {
+          accountLog.warn('import journal OPEN priced off the MARK — no ledger fill attributable to this lot', {
+            issue: 'TRA-4028',
+            origin,
+            positionId: id,
+            optionSymbol,
+            mode,
+            contracts: position.contracts,
+            premiumPaid: position.premiumPaid,
+            atRiskUsd: basis.atRiskUsd,
+            markReason: basis.markReason,
+            note: 'the figure is the book row\'s premium (the broker blend on a reconcile import); every R on this row divides by it until an amend_open_basis line names the fill',
+          });
+        } else {
+          accountLog.info('import journal OPEN priced off the lot\'s own fill', {
+            issue: 'TRA-4028',
+            origin,
+            positionId: id,
+            optionSymbol,
+            mode,
+            contracts: position.contracts,
+            bookPremiumPaid: position.premiumPaid,
+            fillPremium: basis.premiumPerContract,
+            atRiskUsd: basis.atRiskUsd,
+            provenance: basis.atRiskProvenance,
+          });
+        }
         const open: OptionTradeJournalOpen = {
           id,
           openTs: position.openedAt,
@@ -5091,7 +5150,10 @@ export class PaperOptionsAccount {
           sentimentIcBand: null,
           entryDelta: 0,
           entryDte,
-          atRiskUsd,
+          atRiskUsd: basis.atRiskUsd,
+          // TRA-4028 — which instrument priced the basis, ON the row.
+          atRiskBasis: basis.atRiskBasis,
+          atRiskProvenance: basis.atRiskProvenance,
           agentConviction: null,
           ...(optionSymbol ? { optionSymbol } : {}),
           ...(Number.isFinite(position.contracts) ? { contracts: position.contracts } : {}),
