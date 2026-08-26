@@ -48,6 +48,15 @@ import { journalIdForPosition } from './option-trade-journal.js';
 //         than at 02:00Z, with the losers (which terminate at a stop and are
 //         read same-day) amplified and the winners not. See
 //         {@link optionPremiumRiskUsd} for why the premium is the reference.
+//         ⚠ TRA-4027 — "the premium" is read at an INSTANT, and the two emitters
+//         read it at different ones: the book's `premiumPaid` is overwritten
+//         with the broker FILL once the mirror reconciles
+//         (`restateEngineOpenedBasis`), while the journal's `atRiskUsd` is the
+//         OPEN MARK, frozen at open (TRA-991). A book-served row with a journal
+//         twin now divides by the TWIN's `atRiskUsd` (threaded in through
+//         `ExportInput.optionPremiumBases`), so the figure no longer changes
+//         across the archive edge; a twin-less row keeps the inline arithmetic
+//         and says so. `premium_basis_usd` (JSON) is the number divided by.
 //     `pnl_r_basis` (JSON) names the unit per row so no reader has to know this.
 //   * pnl_r_stop_basis — TRA-3989: the stop-distance R, RELABELLED rather than
 //     deleted. On options rows this is the gate-basis reading (`pnl ÷
@@ -86,12 +95,33 @@ export type ExportPnlBasis = 'book' | 'broker-fill';
  * TRA-3989 — the UNIT of the `pnl_r` column, per row, so a reader never has to
  * infer it from `market` (or, as before this ticket, from the clock).
  *
- * `'premium'` = pnl ÷ full premium at open (options; the journal's `realizedR`
- * basis). `'stop-distance'` = pnl ÷ entry→stop distance (equity/crypto, whose
- * risk unit IS the stop). The stop-distance reading for options is published
- * separately as `pnl_r_stop_basis` and is never what `pnl_r` holds.
+ * `'stop-distance'` = pnl ÷ entry→stop distance (equity/crypto, whose risk unit
+ * IS the stop). The stop-distance reading for options is published separately as
+ * `pnl_r_stop_basis` and is never what `pnl_r` holds.
+ *
+ * TRA-4027 — the options value `'premium'` is SPLIT by the INSTANT the premium
+ * was read at, because one unit at two instants is still two denominators:
+ *
+ *   * `'premium-open-mark'` = pnl ÷ the journal's `atRiskUsd`, the premium at
+ *     the OPEN MARK. This is the journal's `realizedR` basis (TRA-991 freezes it
+ *     at open; nothing restates it to the fill) and therefore the reference —
+ *     every journal-served row is in it, and since TRA-4027 so is every
+ *     book-served row that has a journal twin to read it from.
+ *   * `'premium-fill'` = pnl ÷ the book row's own `premiumPaid × contracts ×
+ *     100`, computed inline because NO journal twin exists. `premiumPaid` is the
+ *     open mark until `restateEngineOpenedBasis` overwrites it with the broker
+ *     fill (mirror reconcile), so on a reconciled live row this is the FILL
+ *     basis — 8.2% off the mark on `NVTS261002C00012500` 2026-08-25 (1.51 vs
+ *     1.395) — and on an unreconciled or demo row it is the mark. The label says
+ *     which SOURCE the basis came from, not which of those two the row happened
+ *     to hold; a reader who needs the mark basis partitions on this value and
+ *     `premium_basis_usd` carries the exact figure either way.
+ *
+ * The bare `'premium'` is retired rather than kept as a third value: a row that
+ * still published it would be one whose instant a reader could not tell, which
+ * is the defect.
  */
-export type ExportPnlRBasis = 'premium' | 'stop-distance';
+export type ExportPnlRBasis = 'premium-open-mark' | 'premium-fill' | 'stop-distance';
 
 /**
  * TRA-3985 (Defect 2) — WHICH LOT this row's exit consumed.
@@ -210,6 +240,18 @@ export interface ExportTradeRow {
    */
   pnl_r_basis?: ExportPnlRBasis;
   /**
+   * TRA-4027 — the USD figure `pnl_r` was divided by, JSON-only. On an options
+   * row this is the journal twin's `atRiskUsd` (`pnl_r_basis: 'premium-open-
+   * mark'`) or the inline `premiumPaid × contracts × 100` (`'premium-fill'`),
+   * so `pnl_r == net_pnl_usd / premium_basis_usd` reconciles to 3dp on EVERY
+   * options row regardless of `source` — the identity TRA-3989 AC2 stated as
+   * `entry_price × 100 × quantity`, which a fill/mark split breaks by
+   * construction (`entry_price` is a PRICE column and stays the fill; see
+   * {@link rowFromOption}). `null` on equity/crypto rows and on an options row
+   * that could state no premium at all (then `pnl_r` is null too).
+   */
+  premium_basis_usd?: number | null;
+  /**
    * TRA-3875 — provenance, JSON-only (see {@link ExportRowSource}). Optional on
    * the TYPE so a fixture or an older caller that builds a row by hand still
    * type-checks; every mapper in this module and in `export-history.ts` sets
@@ -321,6 +363,20 @@ export interface ExportMoneyRestatement {
    * the same rule `exit_price`/`entry_price` follow one field up.
    */
   broker_order_id: string | number | null;
+  /**
+   * TRA-4027 — the journal's `atRiskUsd`, the denominator of the `pnl_r` this
+   * restatement carries (`realizedR = realizedPnlUsd / atRiskUsd`, re-derived
+   * against the SAME open-mark basis by the close-basis restatement — see
+   * `OptionTradeCloseBasis.realizedR`). Travels with `pnl_r` so the row's
+   * `premium_basis_usd` reconciles against the R it actually publishes.
+   * `null` when the journal record states no basis.
+   *
+   * Optional on the TYPE only — `tsc -b` compiles the test files (TRA-3695) and
+   * the hand-built restatement fixtures in `tra3985-lot-attribution.test.ts`
+   * predate this field. `restatementFromRecord` always sets it; an ABSENT one is
+   * treated exactly like `null` by {@link applyMoneyRestatement}.
+   */
+  premium_basis_usd?: number | null;
 }
 
 /**
@@ -357,6 +413,15 @@ export function applyMoneyRestatement(
     pnl_r: restatement.pnl_r,
     pnl_r_stop_basis: rMultiple(restatement.net_pnl_usd ?? undefined, stopRiskUsd ?? NaN),
     pnl_basis: 'broker-fill',
+    // TRA-4027 — the R that just landed is the journal's, over the journal's
+    // open-mark `atRiskUsd`; the basis figure and its label travel with it.
+    // A restatement that states no basis (null, absent, or non-finite) leaves
+    // the row's own figure AND label (same rule as `entry_price`/`exit_price`
+    // above: an unmeasured figure deletes nothing).
+    premium_basis_usd: isFiniteNumber(restatement.premium_basis_usd)
+      ? restatement.premium_basis_usd
+      : (row.premium_basis_usd ?? null),
+    pnl_r_basis: isFiniteNumber(restatement.premium_basis_usd) ? 'premium-open-mark' : row.pnl_r_basis,
     // TRA-3985 — identity is NOT restated: `lot_id`/`journal_id` describe which
     // row this is, and the restatement is joined ON `journal_id`, so letting it
     // rewrite the key would make the join unverifiable from the output.
@@ -398,6 +463,22 @@ export interface ExportInput {
    * Absent ⇒ nothing is overlaid, which is the pre-ticket behaviour exactly.
    */
   optionMoneyRestatements?: ReadonlyMap<string, ExportMoneyRestatement>;
+  /**
+   * TRA-4027 — the journal twin's `atRiskUsd` (premium at the OPEN MARK) for
+   * each of `optionsClosed`, keyed like `optionMoneyRestatements` by the id the
+   * JOURNAL knows the position by (`journalIdForPosition`). Built by
+   * `collectJournalPremiumBases` in `export-history.ts` and consumed by
+   * {@link rowFromOption} through {@link buildRows}, so a book-served row divides
+   * `pnl_r` by the same figure its journal-served twin will divide by after the
+   * 21:00 ET archive — instead of by `premiumPaid`, which the mirror reconcile
+   * has by then overwritten with the broker FILL (`restateEngineOpenedBasis`).
+   *
+   * Unlike the restatement map this is populated for EVERY twin, restated or
+   * not: the fill/mark gap opens the moment the mirror reconciles, hours before
+   * any close-basis restatement runs. Absent ⇒ every book row divides inline
+   * and labels itself `'premium-fill'`, which is the pre-ticket arithmetic.
+   */
+  optionPremiumBases?: ReadonlyMap<string, number>;
 }
 
 /**
@@ -663,6 +744,8 @@ export function rowFromPosition(pos: Position, market: 'stocks' | 'crypto'): Exp
     // relabelled column carries the same figure as `pnl_r` and the basis says so.
     pnl_r_stop_basis: rMultiple(pos.pnl, risk),
     pnl_r_basis: 'stop-distance',
+    // TRA-4027 — a premium basis is an options measurement; null, never 0.
+    premium_basis_usd: null,
     source: 'book',
     pnl_basis: 'book',
     // TRA-3985 — equity/crypto rows have a lot id and no option-trade journal.
@@ -676,13 +759,34 @@ export function rowFromPosition(pos: Position, market: 'stocks' | 'crypto'): Exp
   };
 }
 
-/** Map a closed `OptionPosition` (always long premium) into an export row. */
-export function rowFromOption(opt: OptionPosition): ExportTradeRow {
+/**
+ * Map a closed `OptionPosition` (always long premium) into an export row.
+ *
+ * TRA-4027 — `journalAtRiskUsd` is the journal twin's open-mark premium basis
+ * when the caller has one ({@link buildRows} reads it off
+ * `ExportInput.optionPremiumBases`). When it is a finite positive number the row
+ * divides `pnl_r` by IT and labels the basis `'premium-open-mark'`; otherwise
+ * the row divides by its own `premiumPaid × contracts × 100` and says
+ * `'premium-fill'`. Either way `premium_basis_usd` publishes the divisor.
+ *
+ * `entry_price` is NOT moved to the mark on a twinned row. It is a PRICE column
+ * — what this lot paid per share, which after the mirror reconcile is the
+ * broker fill — and rewriting it to the journal's mark would make the row lie
+ * about the fill to keep an identity (`entry_price × 100 × quantity`) that the
+ * basis column now carries honestly instead.
+ */
+export function rowFromOption(opt: OptionPosition, journalAtRiskUsd?: number): ExportTradeRow {
   // TRA-3989 — `pnl_r` divides by the PREMIUM (the journal's `atRiskUsd`), never
   // by the stop distance: a book-served row and its journal-served twin must
   // publish the same R, and the twin has no stop to divide by. The stop-basis
   // figure survives one column over as `pnl_r_stop_basis`.
-  const premiumRisk = optionPremiumRiskUsd(opt);
+  //
+  // TRA-4027 — ...and by the premium at the SAME INSTANT the twin reads it: the
+  // open mark, not the fill `premiumPaid` becomes once the mirror reconciles.
+  const twinRisk = isFiniteNumber(journalAtRiskUsd) && journalAtRiskUsd > 0 ? journalAtRiskUsd : NaN;
+  const inlineRisk = optionPremiumRiskUsd(opt);
+  const premiumRisk = isFiniteNumber(twinRisk) ? twinRisk : inlineRisk;
+  const pnlRBasis: ExportPnlRBasis = isFiniteNumber(twinRisk) ? 'premium-open-mark' : 'premium-fill';
   const stopRisk = optionStopRiskUsd(opt);
   const net = moneyOrNull(opt.pnl);
   return {
@@ -712,7 +816,12 @@ export function rowFromOption(opt: OptionPosition): ExportTradeRow {
     pnl_r: rMultiple(opt.pnl, premiumRisk),
     hold_duration: formatHoldDuration(opt.openedAt, opt.closedAt),
     pnl_r_stop_basis: rMultiple(opt.pnl, stopRisk),
-    pnl_r_basis: 'premium',
+    pnl_r_basis: pnlRBasis,
+    // TRA-4027 — the divisor itself, so the reconcile is against the number
+    // used and not against a price column that means something else. Rounded
+    // only to strip float noise (`0.33 × 100` is `33.00000000000001`); at 6dp a
+    // 3dp R cannot tell the difference.
+    premium_basis_usd: isFiniteNumber(premiumRisk) ? round(premiumRisk, 6) : null,
     source: 'book',
     // TRA-3875 — the ENGINE's close arithmetic, unless `buildRows` overlays a
     // broker-fill restatement over it (see {@link applyMoneyRestatement}). The
@@ -760,7 +869,11 @@ export function buildRows(input: ExportInput): ExportTradeRow[] {
     // BOOK's id and the two differ on any reconcile-rebound import.
     rows.push(
       applyMoneyRestatement(
-        rowFromOption(o),
+        // TRA-4027 — the twin's open-mark basis, joined on the SAME accessor as
+        // the restatement one line down (a source-text guard in
+        // `export-history.test.ts` pins both to `journalIdForPosition`, never a
+        // bare `o.id`); absent ⇒ the mapper divides inline and says so.
+        rowFromOption(o, input.optionPremiumBases?.get(journalIdForPosition(o))),
         input.optionMoneyRestatements?.get(journalIdForPosition(o)),
         // TRA-3989 — the stop risk is only recoverable HERE, where the position
         // is still in hand; the overlay re-derives `pnl_r_stop_basis` against

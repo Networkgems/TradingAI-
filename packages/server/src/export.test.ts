@@ -168,7 +168,10 @@ describe('rowFromOption', () => {
     // `pnl_r_stop_basis`, explicitly labelled.
     expect(row.pnl_r).toBe(0.5);
     expect(row.pnl_r_stop_basis).toBe(2);
-    expect(row.pnl_r_basis).toBe('premium');
+    // TRA-4027 — no journal twin was handed in, so the basis is the row's own
+    // `premiumPaid` and the label names that source; the divisor is published.
+    expect(row.pnl_r_basis).toBe('premium-fill');
+    expect(row.premium_basis_usd).toBe(800);
   });
 
   it('falls back to the underlying symbol when optionSymbol is absent', () => {

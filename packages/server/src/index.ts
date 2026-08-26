@@ -827,6 +827,7 @@ import {
   checkExportRangeServable,
   // TRA-3875 — the restated money columns a surviving BOOK row must adopt.
   collectJournalMoneyRestatements,
+  collectJournalPremiumBases,
   coverageHeaderValue,
   resolveExportCoverage,
   selectJournalExportRows,
@@ -9909,6 +9910,18 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
     // row here, so the answer no longer moves on a clock.
     const optionMoneyRestatements = collectJournalMoneyRestatements(bookJournalRows, bookOptionIds);
 
+    // TRA-4027 — nor does it win the R DENOMINATOR. The mirror reconcile
+    // overwrites the book's `premiumPaid` with the broker FILL minutes after
+    // open (`restateEngineOpenedBasis`), while the journal's `atRiskUsd` is the
+    // open MARK, frozen at open (TRA-991). So a book-served row divided `pnl_r`
+    // by the fill and its journal-served twin by the mark — one unit, two
+    // instants, 8.2% apart on `NVTS261002C00012500` (2026-08-25), selected by
+    // the same archive edge. The twin's basis is joined onto the book row here
+    // (same key as the restatement, same book-scoped input) so the R no longer
+    // moves on the clock either. Populated for EVERY twin, not only restated
+    // ones — the fill/mark gap opens long before any restatement runs.
+    const optionPremiumBases = collectJournalPremiumBases(bookJournalRows, bookOptionIds);
+
     const { rows, summary } = buildExport(
       {
         stocksClosed: stocksSnap?.closedPositions ?? [],
@@ -9916,6 +9929,7 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
         optionsClosed,
         preMappedRows: journalExportRows,
         optionMoneyRestatements,
+        optionPremiumBases,
       },
       filters,
     );

@@ -456,7 +456,14 @@ export function rowFromJournalRecord(r: OptionTradeJournalRecord): ExportTradeRo
     // re-tuned (the `0.25` in `GATE_R_PER_PREMIUM_R` already is: the live OTM
     // stop is `premium × 0.80`, a 5× not a 4×).
     pnl_r_stop_basis: null,
-    pnl_r_basis: 'premium',
+    // TRA-4027 — and the premium it divides by is the one captured at the OPEN
+    // MARK (`atRiskUsd`, frozen at open by TRA-991), which is why the label
+    // names the instant and not merely the unit. `premium_basis_usd` is that
+    // figure, so `pnl_r == net_pnl_usd / premium_basis_usd` reconciles here
+    // exactly as it does on a book row. Null — never 0 — when the record states
+    // no basis (a reconstructed lot; then `realizedR` is not finite either).
+    pnl_r_basis: 'premium-open-mark',
+    premium_basis_usd: isFiniteNumber(r.atRiskUsd) && r.atRiskUsd > 0 ? r.atRiskUsd : null,
     source: 'journal',
     pnl_basis: restated ? 'broker-fill' : 'book',
     // TRA-3985 — the journal knows this close by `r.id`, which is
@@ -634,6 +641,10 @@ function restatementFromRecord(r: OptionTradeJournalRecord): ExportMoneyRestatem
     // that adopts a broker-settled figure without the handle that settled it
     // cannot be reconciled against the broker afterwards.
     broker_order_id: mapped.broker_order_id ?? null,
+    // TRA-4027 — and so does the basis the restated R was divided by: the
+    // journal's open-mark `atRiskUsd`, unchanged by the restatement
+    // (`OptionTradeCloseBasis.realizedR` — "same denominator as before").
+    premium_basis_usd: mapped.premium_basis_usd ?? null,
   };
 }
 
@@ -664,6 +675,60 @@ export function collectJournalMoneyRestatements(
     const money = moneyRecordFor(group);
     if (!money) continue;
     out.set(group.bookJournalId, restatementFromRecord(money));
+  }
+  return out;
+}
+
+/**
+ * TRA-4027 — the journal twin's `atRiskUsd` for every book close that has one,
+ * keyed like {@link collectJournalMoneyRestatements} by the id the JOURNAL knows
+ * the book row by. `export.ts`'s `rowFromOption` divides `pnl_r` by this figure
+ * on the book-served row so it publishes the SAME R its journal-served twin will
+ * after the 21:00 ET archive.
+ *
+ * ── Why a second map, and not a field on the restatement ────────────────────
+ *
+ * The restatement map is populated only for `pnlBasis: 'broker-fill'` records —
+ * a MEASURED disagreement over the money. The premium basis is different: the
+ * book's `premiumPaid` is overwritten with the broker fill the moment the mirror
+ * reconciles (`restateEngineOpenedBasis`, minutes after open), while the
+ * journal's `atRiskUsd` is the open MARK, frozen at open (TRA-991) and never
+ * restated to the fill. So the two denominators diverge on EVERY reconciled
+ * live row, restated or not, hours before any close-basis restatement runs —
+ * `NVTS261002C00012500` 2026-08-25 published `pnl_r` over $151 (fill) before
+ * the archive and over $139.5 (mark) after it, 8.2% apart, on a row the
+ * restatement never touched. Riding on the restatement map would have left
+ * exactly that row uncovered.
+ *
+ * ── What is joined ──────────────────────────────────────────────────────────
+ *
+ * Every record whose id is in `bookJournalIds`, INCLUDING one still `OPEN`: the
+ * journal close is written through an async queue, so a book row can be closed
+ * for a beat while its twin still reads `OPEN` — and `atRiskUsd` is captured at
+ * the open write, so it is already the right figure. This is deliberately wider
+ * than {@link groupJournalCloses}, which skips `OPEN` rows because it is
+ * grouping CLOSES; here the open row IS the evidence.
+ *
+ * Records with no finite positive `atRiskUsd` are skipped, not zero-filled: the
+ * book row then divides inline and labels itself `'premium-fill'`, which is
+ * true. The reconstructed-lot `atRiskUsd` miss on `BAC260925C00063000` is a
+ * reference-row defect with its own child and is not papered over here.
+ *
+ * ⚠️ Same precondition as the sibling collectors — `rows` must ALREADY be
+ * book-scoped by `journalRowsForBook`, or one account's open mark lands on
+ * another's row.
+ */
+export function collectJournalPremiumBases(
+  rows: readonly OptionTradeJournalRecord[],
+  bookJournalIds: ReadonlySet<string>,
+): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const r of rows) {
+    if (!bookJournalIds.has(r.id)) continue;
+    if (!isFiniteNumber(r.atRiskUsd) || r.atRiskUsd <= 0) continue;
+    // First finite basis per id wins. The journal folds one record per id, so
+    // a second hit is the same record seen twice, never a competing figure.
+    if (!out.has(r.id)) out.set(r.id, r.atRiskUsd);
   }
   return out;
 }
