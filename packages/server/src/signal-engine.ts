@@ -16846,6 +16846,37 @@ export class SignalEngine {
     const funnelMode = this.mode;
     const funnelEngineId = this.feedContextKey; // TRA-1834 — split per engine, never pooled
     recordEquityCandidate(funnelMode, funnelEngineId, source);
+    // TRA-2628 / TRA-3390 AC4 — the currency refusal, and it runs FIRST here for
+    // the same reason it runs ahead of the capital-gate manifest bail in
+    // `openSma200Pullback`: A GATE THAT BLOCKS THE HAZARD FOR AN UNRELATED REASON
+    // IS A COINCIDENCE WITH AN EXPIRY DATE.
+    //
+    // It used to sit further down, behind the TRA-952 swing-universe gate. Under
+    // EQUITY_SWING_MODE (ON in prod) that gate eats EVERY foreign row first,
+    // because the swing universe is 21 US names — so `non_usd_quote_currency`
+    // read 0 on all 67 engines on bqb1 `56804e1a69db`, and a 0 that means "an
+    // unrelated liquidity filter got there first" is byte-identical to a 0 that
+    // means "the currency guard is broken" (TRA-2590). Ordered here, the tape
+    // names the guard that is actually load-bearing on the hazard this ticket
+    // was filed on.
+    //
+    // Ahead of `no_quote` on purpose, which reverses the original placement note:
+    // the verdict reads the SymbolState currency, not the `price` argument, and
+    // for a foreign-suffixed row the refusal holds with or without a quote — so
+    // the retryable `no_quote` bucket loses nothing (a US ticker with a cold row
+    // is ADMITTED by the verdict and still falls through to it), while a foreign
+    // row on a cold tick gets named for the reason that will never change.
+    const currencyVerdict = this.quoteCurrencyEntryVerdict(sym);
+    if (!currencyVerdict.allowed) {
+      signal.signalSkipReason = currencyVerdict.reason;
+      log.warn('equity signal suppressed: quote currency is not the book currency', {
+        component: 'equity-scan', issue: 'TRA-3390', via: source, sym,
+        signalType: signal.type, currency: this.symbolState.get(sym)?.currency ?? null,
+        reason: currencyVerdict.reason,
+      });
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'non_usd_quote_currency');
+      return null;
+    }
     // TRA-952 — swing universe gate (backstop for the agent-gating path; the
     // deterministic scan already skips off-universe symbols before evaluation).
     // Block equity entries on names outside the curated liquid universe (thin
@@ -16897,21 +16928,10 @@ export class SignalEngine {
       return null;
     }
 
-    // TRA-3390 AC4 — a non-USD-quoted instrument may not open a position. Placed
-    // AFTER `no_quote` deliberately: the verdict is about the currency of the
-    // quote we are sizing against, so "no quote at all" must stay its own
-    // (retryable) rejection rather than being absorbed into this one.
-    const currencyVerdict = this.quoteCurrencyEntryVerdict(sym);
-    if (!currencyVerdict.allowed) {
-      signal.signalSkipReason = currencyVerdict.reason;
-      log.warn('equity signal suppressed: quote currency is not the book currency', {
-        component: 'equity-scan', issue: 'TRA-3390', via: source, sym,
-        signalType: signal.type, currency: this.symbolState.get(sym)?.currency ?? null,
-        reason: currencyVerdict.reason,
-      });
-      recordEquityEntryRejected(funnelMode, funnelEngineId, 'non_usd_quote_currency');
-      return null;
-    }
+    // TRA-2628 — the AC4 currency refusal used to sit HERE, after `no_quote`.
+    // It moved to the top of this method (see the note there): behind the TRA-952
+    // swing-universe gate its funnel counter could never increment while swing
+    // mode was on, so it could not be told apart from a broken guard.
 
     // TRA-231 — stamp the active mode so the dashboard's Signals panel
     // can scope this entry to the demo (or live) mode it fired under.
