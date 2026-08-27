@@ -53,6 +53,7 @@ import { dirname, join } from 'node:path';
 import { logger, flushLogs } from './observability/index.js';
 import { getPhaseAttribution, type PhaseAttribution, type SlowPhase } from './phase-timing.js';
 import { getStdioBlockSnapshot, type StdioBlockSnapshot } from './stdio-block-meter.js';
+import { getGcPauseSnapshot, onGcPause, type GcPause, type GcPauseSnapshot } from './gc-pause-meter.js';
 
 const log = logger.child({ module: 'event-loop-watchdog' });
 
@@ -149,6 +150,15 @@ export interface PersistedTrip {
    * pre-existing trip files stay readable.
    */
   stdio?: StdioBlockSnapshot;
+  /**
+   * TRA-3660 (fourth instance, 2026-08-27) — the GC pause meter at trip time
+   * (see `gc-pause-meter.ts`). A stop-the-world collection is a block with no JS
+   * frame at all, so neither a phase, the write meter, nor a stack sample can
+   * name it; only the `gc` performance observer can. `recent` holds the pauses
+   * around the trip; the classifier reads them into {@link BlockAttribution.gc}.
+   * Optional so pre-existing trip files stay readable.
+   */
+  gc?: GcPauseSnapshot;
 }
 
 /**
@@ -164,9 +174,16 @@ export interface PersistedTrip {
  * - `unattributed-stale`— the only `sync` phase on record ended before this block
  *                         even started. It is a fossil, not the culprit.
  * - `unattributed-none` — no `sync` phase at all. THE 2026-08-13 SHAPE.
+ * - `gc-attributed`     — (fourth instance, 2026-08-27) a garbage-collection
+ *                         pause ended inside this block's window and is long
+ *                         enough to account for most of the lag. Checked FIRST:
+ *                         a collector pause is a block with no JS frame at all,
+ *                         so when one is present it is the more precise culprit
+ *                         than whatever phase happened to be allocating.
  */
 export type BlockAttributionVerdict =
   | 'not-a-block-trip'
+  | 'gc-attributed'
   | 'attributed'
   | 'partial'
   | 'unattributed-stale'
@@ -194,6 +211,14 @@ export interface BlockAttribution {
    * chunk is nameable. Absent when the ledger is not being kept.
    */
   sampler?: SamplerAttribution;
+  /**
+   * TRA-3660 (fourth instance, 2026-08-27) — the longest GC pause that ended
+   * inside the candidate window, whether or not it was long enough to carry the
+   * verdict. Present-but-short is itself a reading: the collector was running
+   * but is not what held the loop. Null when no pause fell in the window;
+   * absent when the meter was not consulted.
+   */
+  gc?: GcPause | null;
 }
 
 /**
@@ -224,26 +249,52 @@ export function classifyBlockAttribution(input: {
   lagMaxMs: number;
   sampleMs: number;
   slowSyncPhase: SlowPhase | null | undefined;
+  /**
+   * TRA-3660 (fourth instance) — GC pauses known at classification time. Omit
+   * (not `[]`) when the meter was not consulted, so the output can distinguish
+   * "no pause in the window" (`gc: null`) from "nobody looked" (`gc` absent).
+   */
+  gcPauses?: readonly GcPause[];
 }): BlockAttribution {
   const windowMs = Math.max(0, input.lagMaxMs) + Math.max(0, input.sampleMs) + ATTRIBUTION_SLACK_MS;
   if (input.reason !== 'block' && input.reason !== 'lag') {
     return { verdict: 'not-a-block-trip', windowMs, syncPhaseAgeMs: null, explainedFraction: null };
   }
+  // A GC pause is placed by its END: the observer only ever reports a completed
+  // collection, and the watchdog can only evaluate after the loop resumes, so a
+  // pause that ended inside the window is a pause that overlapped this block.
+  // A pause whose end is beyond `tripAtMs` by more than the slack belongs to a
+  // LATER block (or to the restart itself) and is not this one's culprit.
+  const gcWindow = input.gcPauses == null
+    ? undefined
+    : input.gcPauses
+        .filter((p) => {
+          const endMs = p.atMs + Math.max(0, p.durationMs);
+          return endMs >= input.tripAtMs - windowMs && endMs <= input.tripAtMs + ATTRIBUTION_SLACK_MS;
+        })
+        .sort((a, b) => b.durationMs - a.durationMs)[0] ?? null;
+  const withGc = (r: BlockAttribution): BlockAttribution => (gcWindow === undefined ? r : { ...r, gc: gcWindow });
+  if (gcWindow && input.lagMaxMs > 0) {
+    const explainedByGc = gcWindow.durationMs / input.lagMaxMs;
+    if (explainedByGc >= ATTRIBUTION_EXPLAINED_MIN) {
+      return { verdict: 'gc-attributed', windowMs, syncPhaseAgeMs: null, explainedFraction: explainedByGc, gc: gcWindow };
+    }
+  }
   const phase = input.slowSyncPhase;
   if (!phase) {
-    return { verdict: 'unattributed-none', windowMs, syncPhaseAgeMs: null, explainedFraction: null };
+    return withGc({ verdict: 'unattributed-none', windowMs, syncPhaseAgeMs: null, explainedFraction: null });
   }
   const ageMs = input.tripAtMs - phase.atMs;
   if (!(ageMs <= windowMs)) {
-    return { verdict: 'unattributed-stale', windowMs, syncPhaseAgeMs: ageMs, explainedFraction: null };
+    return withGc({ verdict: 'unattributed-stale', windowMs, syncPhaseAgeMs: ageMs, explainedFraction: null });
   }
   // Guard the denominator: a zero/negative lag cannot be a share of anything, and
   // dividing by it would publish Infinity as a confident-looking number.
   const explained = input.lagMaxMs > 0 ? phase.durationMs / input.lagMaxMs : null;
   if (explained == null || !(explained >= ATTRIBUTION_EXPLAINED_MIN)) {
-    return { verdict: 'partial', windowMs, syncPhaseAgeMs: ageMs, explainedFraction: explained };
+    return withGc({ verdict: 'partial', windowMs, syncPhaseAgeMs: ageMs, explainedFraction: explained });
   }
-  return { verdict: 'attributed', windowMs, syncPhaseAgeMs: ageMs, explainedFraction: explained };
+  return withGc({ verdict: 'attributed', windowMs, syncPhaseAgeMs: ageMs, explainedFraction: explained });
 }
 
 /**
@@ -1106,6 +1157,13 @@ export interface WatchdogStatus {
    * post-grace sample.
    */
   lagLedger?: SamplerAttribution;
+  /**
+   * TRA-3660 (fourth instance, 2026-08-27) — live GC pause meter, readable
+   * WITHOUT waiting for a trip. A box paying 1-3s major pauses under the 4s
+   * acute threshold is invisible to every trip-based instrument and shows up
+   * here as `byKind.major.maxMs` / `recent`. Absent when the meter is not installed.
+   */
+  gc?: GcPauseSnapshot;
 }
 
 export interface WatchdogHandle {
@@ -1138,6 +1196,20 @@ export interface StartWatchdogOptions {
    * without stalling a real pipe.
    */
   readStdioBlock?: () => StdioBlockSnapshot;
+  /**
+   * TRA-3660 (fourth instance) — GC pause meter reader (defaults to the module
+   * getter). Injectable so a test can drive the "the block was a collector
+   * pause" path without scheduling a real multi-second GC.
+   */
+  readGcPauses?: () => GcPauseSnapshot;
+  /**
+   * TRA-3660 (fourth instance) — subscribe to late-delivered GC pauses (defaults
+   * to the module `onGcPause`). The pause that caused a trip is reported by V8
+   * on a LATER loop turn than the watchdog timer that evaluated the trip, so the
+   * trip path subscribes once and amends the persisted record if the culprit
+   * arrives before exit. Injectable so tests can deliver the late entry by hand.
+   */
+  subscribeGcPause?: (listener: (pause: GcPause) => void) => () => void;
 }
 
 let lastStatus: WatchdogStatus | null = null;
@@ -1213,6 +1285,16 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
       return null;
     }
   };
+  // TRA-3660 (fourth instance) — same guard for the GC meter: a read that throws
+  // must degrade to "not consulted", never abort the trip.
+  const readGc = (): GcPauseSnapshot | null => {
+    try {
+      return (opts.readGcPauses ?? getGcPauseSnapshot)();
+    } catch {
+      return null;
+    }
+  };
+  const subscribeGc = opts.subscribeGcPause ?? onGcPause;
   const now = opts.now ?? Date.now;
   const startedAtMs = now();
   const state: WatchdogState = { consecutiveHeapBreaches: 0, consecutiveLagBreaches: 0 };
@@ -1289,6 +1371,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
     // TRA-3660 — same discipline for the write-block meter: read once per publish
     // so the live status and the liveness heartbeat agree with each other.
     const livePublishStdio = readStdio();
+    const livePublishGc = readGc();
     // Only fold steady-state (post-grace) samples into the peak/ring so warmup's
     // legitimate synchronous candle-load blocks don't pollute the evidence.
     if (now() - startedAtMs >= cfg.bootGraceMs) {
@@ -1367,6 +1450,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
       priorLiveness,
       phaseAttribution,
       ...(livePublishStdio ? { stdio: livePublishStdio } : {}),
+      ...(livePublishGc?.enabled ? { gc: livePublishGc } : {}),
       ...(lagLedger.length > 0
         ? {
             lagLedger: summarizeLagLedger({
@@ -1450,12 +1534,19 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
         // block. Without this a null `slowSyncPhase` is silent: it reads as "no
         // block" to a hurried reader and as "unknowable" to a careful one, and
         // there is nothing in the artifact that separates the two.
+        // TRA-3660 (fourth instance) — consult the GC meter FIRST. A collector
+        // pause is the one block none of the other instruments can see, and the
+        // 2026-08-27 trip (heap 88.6% of the cap, `lagMean ≈ lagMax`) has its
+        // shape. `recent` only holds pauses ≥ recordMs, which is the population
+        // that could explain a ≥4s block anyway.
+        const tripGc = readGc();
         const attribution = classifyBlockAttribution({
           reason: decision.reason,
           tripAtMs,
           lagMaxMs: sample.lagMaxMs,
           sampleMs: cfg.sampleMs,
           slowSyncPhase: tripAttribution.lastSlowSyncPhase,
+          ...(tripGc?.enabled ? { gcPauses: tripGc.recent } : {}),
         });
         // TRA-3660 — attach the sampler's own view of the SAME candidate window.
         // `publish(sample)` ran on line ~1250 above, so this trip's sample is
@@ -1492,29 +1583,82 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
             samplerTopShare: attribution.sampler?.top?.share ?? null,
             samplerTopStraddleSamples: attribution.sampler?.top?.straddleSamples ?? null,
             samplerSamples: attribution.sampler?.samples ?? null,
+            // TRA-3660 (fourth instance) — what the collector was doing. A null
+            // `gcInWindowMs` with `gcMeter: true` is a REAL negative: the meter
+            // looked and found no pause; absent meter is "nobody looked".
+            gcMeter: tripGc?.enabled ?? false,
+            gcInWindowMs: attribution.gc ? Math.round(attribution.gc.durationMs) : null,
+            gcInWindowKind: attribution.gc?.kind ?? null,
+            gcMajorMaxMs: tripGc?.enabled ? Math.round(tripGc.byKind.major.maxMs) : null,
+            heapPct: sample.heapLimitBytes > 0 ? Number((sample.heapUsedBytes / sample.heapLimitBytes).toFixed(3)) : null,
+          });
+        } else if (attribution.verdict === 'gc-attributed') {
+          log.error('BLOCK ATTRIBUTED TO GC — a stop-the-world collection held the event loop', {
+            lagMaxMs: Math.round(sample.lagMaxMs),
+            gcDurationMs: Math.round(attribution.gc?.durationMs ?? 0),
+            gcKind: attribution.gc?.kind ?? null,
+            explainedFraction: attribution.explainedFraction,
+            heapPct: sample.heapLimitBytes > 0 ? Number((sample.heapUsedBytes / sample.heapLimitBytes).toFixed(3)) : null,
+            samplerTopPhase: attribution.sampler?.top?.name ?? null,
           });
         }
-        persistTripRecord(
-          {
-            reason: decision.reason,
-            detail: decision.detail ?? '',
-            atMs: tripAtMs,
-            uptimeSecAtTrip: Math.round((now() - startedAtMs) / 1000),
-            heapUsedMB: Math.round(sample.heapUsedBytes / 1e6),
-            heapLimitMB: Math.round(sample.heapLimitBytes / 1e6),
-            rssMB: Math.round(sample.rssBytes / 1e6),
-            externalMB: sample.externalBytes != null ? Math.round(sample.externalBytes / 1e6) : undefined,
-            arrayBuffersMB: sample.arrayBuffersBytes != null ? Math.round(sample.arrayBuffersBytes / 1e6) : undefined,
-            lagMeanMs: Math.round(sample.lagMeanMs),
-            lagMaxMs: Math.round(sample.lagMaxMs),
-            slowPhase: tripAttribution.lastSlowPhase,
-            slowSyncPhase: tripAttribution.lastSlowSyncPhase,
-            activePhase: tripAttribution.activePhase,
-            attribution,
-            ...(stdio ? { stdio } : {}),
-          },
-          opts.env,
-        );
+        const tripRecord: PersistedTrip = {
+          reason: decision.reason,
+          detail: decision.detail ?? '',
+          atMs: tripAtMs,
+          uptimeSecAtTrip: Math.round((now() - startedAtMs) / 1000),
+          heapUsedMB: Math.round(sample.heapUsedBytes / 1e6),
+          heapLimitMB: Math.round(sample.heapLimitBytes / 1e6),
+          rssMB: Math.round(sample.rssBytes / 1e6),
+          externalMB: sample.externalBytes != null ? Math.round(sample.externalBytes / 1e6) : undefined,
+          arrayBuffersMB: sample.arrayBuffersBytes != null ? Math.round(sample.arrayBuffersBytes / 1e6) : undefined,
+          lagMeanMs: Math.round(sample.lagMeanMs),
+          lagMaxMs: Math.round(sample.lagMaxMs),
+          slowPhase: tripAttribution.lastSlowPhase,
+          slowSyncPhase: tripAttribution.lastSlowSyncPhase,
+          activePhase: tripAttribution.activePhase,
+          attribution,
+          ...(stdio ? { stdio } : {}),
+          ...(tripGc?.enabled ? { gc: tripGc } : {}),
+        };
+        persistTripRecord(tripRecord, opts.env);
+        // TRA-3660 (fourth instance) — the pause that caused THIS trip is very
+        // likely not in the ring yet: V8 enqueues the `gc` entry after the
+        // collection and delivers it on a later turn, while this timer callback
+        // runs first. `defaultOnTrip` holds the exit ~2s for the log flush, which
+        // is time enough for the entry to land. Subscribe once; if a pause that
+        // explains the block arrives, re-classify and re-persist so the NEXT boot
+        // reads the culprit. Nothing here delays or gates the restart.
+        if (tripGc?.enabled && attribution.verdict !== 'gc-attributed' && (decision.reason === 'block' || decision.reason === 'lag')) {
+          const unsubscribe = subscribeGc((late) => {
+            try {
+              const lateGc = readGc();
+              const amended = classifyBlockAttribution({
+                reason: decision.reason,
+                tripAtMs,
+                lagMaxMs: sample.lagMaxMs,
+                sampleMs: cfg.sampleMs,
+                slowSyncPhase: tripAttribution.lastSlowSyncPhase,
+                gcPauses: [...(lateGc?.recent ?? []), late],
+              });
+              if (amended.verdict !== 'gc-attributed') return;
+              unsubscribe();
+              amended.sampler = attribution.sampler;
+              tripRecord.attribution = amended;
+              if (lateGc?.enabled) tripRecord.gc = lateGc;
+              persistTripRecord(tripRecord, opts.env);
+              log.error('BLOCK ATTRIBUTED TO GC (late delivery) — collector pause reported after the trip evaluated', {
+                lagMaxMs: Math.round(sample.lagMaxMs),
+                gcDurationMs: Math.round(late.durationMs),
+                gcKind: late.kind,
+                explainedFraction: amended.explainedFraction,
+                deliveredAfterTripMs: Math.max(0, Date.now() - tripAtMs),
+              });
+            } catch {
+              // An amend must never be able to break the exit path.
+            }
+          });
+        }
       }
       if (cfg.restartEnabled) {
         onTrip(decision, sample);

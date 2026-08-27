@@ -783,6 +783,7 @@ import {
 import { sendPasswordResetEmail, sendOtpEmail, sendWelcomeEmail } from './email.js';
 import { startEventLoopWatchdog, type WatchdogHandle } from './event-loop-watchdog.js';
 import { installStdioBlockMeter } from './stdio-block-meter.js';
+import { installGcPauseMeter } from './gc-pause-meter.js';
 import {
   logger,
   flushLogs,
@@ -18635,6 +18636,13 @@ httpServer.listen(PORT, () => {
 // place the block is visible, and it lands in `slowSyncPhase` — the field the
 // 2026-08-13T14:18:47Z trip read as `null`.
 installStdioBlockMeter();
+// TRA-3660 (fourth instance, 2026-08-27T13:26:17Z) — a block with NO JS frame at
+// all: a V8 stop-the-world collection. That trip read `heapUsedMB 1605/1812`
+// (88.6%) after 24.5h uptime with `slowSyncPhase: null`, `stdio.slowWrites 0`,
+// and the sampler naming an `async` fan-out — every instrument above said "not
+// me". Only a `gc` performance observer can name a collector pause, and it must
+// be installed BEFORE the watchdog so the trip path can read it.
+installGcPauseMeter();
 
 // TRA-1080 — event-loop/heap starvation watchdog. Detects the bqb1 "HTTP
 // listener dead while worker timers live" state from inside the process.
