@@ -290,17 +290,24 @@ describe('TRA-4025 AC4 — the close-basis restatement applies the same exclusio
   });
   const ledgerToday = (): LiveOptionFillRecord[] => [engineEntry(), deskEntryImport(), engineExit(), deskExit0824()];
 
-  it('POSITIVE CONTROL: with the engine row absent the restatement BORROWS the engine\'s 1.65 entry and 0.91 exit', () => {
+  it('POSITIVE CONTROL: with the engine row absent the restatement BORROWS the engine\'s 1.65 entry (the exit is the row\'s own order — TRA-4082)', () => {
     // This is the write the ticket warns about: a row without pnlBasis, and
     // the sibling's fills inside its windows. Oldest-first takes the engine's
-    // round trip and restates the desk's −3 to the engine's −74.26.
+    // ENTRY (the entry leg has no order-id witness, so the sibling claim in the
+    // next case is what keeps it off this row). The EXIT no longer borrows:
+    // since TRA-4082 a row that names its own close order (143160792) prices
+    // off THAT fill when the ledger holds it, and the engine's 0.91 is excluded
+    // by name. Before TRA-4082 this control read 1.65→0.91 = −74.26.
     const plan = planCloseBasisRestate([deskRowToday()], ledgerToday());
     const r = plan.rows[0]!;
     expect(r.treatment).toBe('restate');
     expect(r.entryFillPremium).toBe(1.65);
-    expect(r.exitFillPremium).toBe(0.91);
-    expect(r.realizedPnlUsdAfter).toBe(-74.26);
-    expect(r.deltaUsd).toBe(-71.26);
+    expect(r.exitFillPremium).toBe(1.14);
+    // (1.14 − 1.65) × 100 − (0.13 + 0.13)
+    expect(r.realizedPnlUsdAfter).toBe(-51.26);
+    expect(r.deltaUsd).toBe(-48.26);
+    const engineExitExcluded = r.excluded.find((f) => f.side === 'sell_to_close' && f.ts === T('2026-08-21T17:05:10.473Z'))!;
+    expect(engineExitExcluded.why).toMatch(/witnessed order beats the clock \(TRA-4082\)/);
   });
 
   it('with the engine row present, the desk row is SKIPPED and both engine fills are excluded naming 0e180e8c', () => {

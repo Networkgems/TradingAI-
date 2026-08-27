@@ -84,7 +84,15 @@ export type DetachReboundCloseRefusal =
   | 'no_superseded_closes'
   | 'restore_close_not_found'
   | 'primary_is_restore_order'
-  | 'primary_has_no_broker_order';
+  | 'primary_has_no_broker_order'
+  /**
+   * The shared row's primary was RESTATED (`pnlBasis: 'broker-fill'`) after the
+   * wrongful supersession, and the row no longer remembers what the moved close
+   * itself said (`realizedPnlUsdBeforeRestatement` absent). The restated money
+   * was priced off the SIBLING's fills (see the 08-27 note in the planner), so
+   * it cannot be moved onto the lot; and inventing a figure is not a repair.
+   */
+  | 'moved_close_restated_unrecoverable';
 
 export interface DetachReboundClosePlan {
   ok: true;
@@ -98,6 +106,13 @@ export interface DetachReboundClosePlan {
   restoreClose: OptionTradeJournalClose;
   /** The `supersededCloses[]` entry `restoreClose` was read from. */
   restoredFrom: OptionTradeSupersededClose;
+  /**
+   * Where `movedClose.realizedPnlUsd` was read from: the row's primary figure,
+   * or — when a close-basis restatement has since overwritten the primary with
+   * the sibling's fills — the pre-restatement figure the close path wrote for
+   * this lot (`realizedPnlUsdBeforeRestatement`).
+   */
+  movedPnlSource: 'primary' | 'pre_restatement';
   reason: string;
 }
 
@@ -189,7 +204,33 @@ export function planDetachReboundClose(
     riskThrottleSizingPath: null,
   };
 
-  const movedPnl = rec.realizedPnlUsd as number;
+  // ── 2026-08-27 read of the live row: the primary's MONEY is not the moved
+  // close's own figure any more. Fifteen minutes after the wrongful supersession
+  // (14:01:03Z on 08-26) the TRA-3730 close-basis sweep re-priced `8a849902`'s
+  // primary — which the supersede had returned to engine basis, −7.00 — against
+  // the fills it could see on the OCC: the SIBLING's 0.33 entry and 0.18 exit,
+  // −15.24 net of 0.24 fees. The row then read `exitReason: profit_lock, order
+  // 143384264` (the residual's) with `realizedPnlUsd −15.24` (the engine lot's)
+  // and `realizedPnlUsdBeforeRestatement −7` — the only place the residual's own
+  // −7 still existed. Copying `rec.realizedPnlUsd` here would have booked −15.24
+  // on BOTH rows and lost the −7 fill, the very shape this repair exists to undo.
+  //
+  // So: a restated primary contributes its PRE-restatement figure to the moved
+  // close (that is what the close path wrote for THIS lot), and a restated
+  // primary that no longer carries one is a refusal, never a guess. The lot's
+  // row then starts on engine basis, and the sweep may restate it later against
+  // its OWN fills — which, after the sibling-claim pass (TRA-4025/TRA-3986),
+  // cannot be the sibling's.
+  const restated = rec.pnlBasis === 'broker-fill';
+  const preRestatement = rec.realizedPnlUsdBeforeRestatement;
+  if (restated && !(typeof preRestatement === 'number' && Number.isFinite(preRestatement))) {
+    return refuse(
+      'moved_close_restated_unrecoverable',
+      `the row's primary was restated to broker fills (${rec.realizedPnlUsd} USD, fills ${rec.entryFillPremium ?? '?'}→${rec.exitFillPremium ?? '?'}) and carries no realizedPnlUsdBeforeRestatement; the moved close's own figure is not on the row`,
+    );
+  }
+  const movedPnlSource: DetachReboundClosePlan['movedPnlSource'] = restated ? 'pre_restatement' : 'primary';
+  const movedPnl = restated ? (preRestatement as number) : (rec.realizedPnlUsd as number);
   const movedR = atRiskUsd > 0 ? round4(movedPnl / atRiskUsd) : 0;
   const movedClose: OptionTradeJournalClose = {
     closeTs: rec.closeTs as number,
@@ -228,6 +269,7 @@ export function planDetachReboundClose(
     movedClose,
     restoreClose,
     restoredFrom,
+    movedPnlSource,
     reason: `admin_detach_restore:${req.provenance}:moved_to:${req.lotId}`,
   };
 }

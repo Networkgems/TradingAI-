@@ -348,9 +348,25 @@ function planOne(row: OptionTradeJournalRecord, allFills: LiveOptionFillRecord[]
   // before this row's own close (so a LATER position's exit cannot be either).
   const lastEntryTs = Math.max(...entry.allocations.map((a) => a.ts));
   const closeCeiling = base.closeTs === null ? Infinity : base.closeTs + EXIT_MATCH_GRACE_MS;
-  const exitCandidates = sorted.filter(
+  const windowed = sorted.filter(
     (f) => f.side === 'sell_to_close' && f.ts >= lastEntryTs && f.ts <= closeCeiling,
   );
+  // TRA-4082 — a witnessed order beats the clock. When the row names its own
+  // close order (`brokerOrderId`) and the ledger holds a `sell_to_close` under
+  // that order inside the window, THAT fill is the exit; the window's other
+  // sells are another lot's. Measured 2026-08-26T14:01Z on RIG `8a849902`: the
+  // row's primary carried order 143384264 (0.15, 08-26) and the window held the
+  // sibling's 143048620 (0.18, 08-24) two days earlier; oldest-first took 0.18
+  // and priced this row's close off the other lot's fill. The sibling-claim
+  // pass keys its exit claim on the order id already; the allocation here did
+  // not, so a row could be handed its own order by `claims` and still price off
+  // a neighbour. Fallback (no order on the row, or none of the window's fills
+  // carries it) is the window rule, unchanged.
+  const rowOrder = row.brokerOrderId == null ? null : String(row.brokerOrderId);
+  const ownOrder = rowOrder === null
+    ? []
+    : windowed.filter((f) => f.orderId != null && String(f.orderId) === rowOrder);
+  const exitCandidates = ownOrder.length > 0 ? ownOrder : windowed;
   for (const f of sorted) {
     if (f.side === 'sell_to_close' && !exitCandidates.includes(f)) {
       excluded.push({
@@ -359,9 +375,11 @@ function planOne(row: OptionTradeJournalRecord, allFills: LiveOptionFillRecord[]
         contracts: f.contracts,
         origin: f.origin,
         why:
-          f.ts < lastEntryTs
-            ? "sell_to_close predates this row's entry fill; it closed an earlier position on the same contract"
-            : `sell_to_close ${Math.round((f.ts - (base.closeTs ?? 0)) / 1000)}s after this row's closeTs, outside the ${EXIT_MATCH_GRACE_MS / 1000}s grace — it closed a LATER position on the same contract`,
+          windowed.includes(f)
+            ? `sell_to_close inside the window under order ${String(f.orderId)}, but this row's own close is order ${rowOrder} and the ledger holds that fill — a witnessed order beats the clock (TRA-4082)`
+            : f.ts < lastEntryTs
+              ? "sell_to_close predates this row's entry fill; it closed an earlier position on the same contract"
+              : `sell_to_close ${Math.round((f.ts - (base.closeTs ?? 0)) / 1000)}s after this row's closeTs, outside the ${EXIT_MATCH_GRACE_MS / 1000}s grace — it closed a LATER position on the same contract`,
       });
     }
   }
