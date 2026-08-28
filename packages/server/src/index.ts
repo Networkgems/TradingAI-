@@ -90,6 +90,12 @@ import {
   decideCalendarRowWrite,
   triageForceDates,
 } from './reports/calendar-write-decision.js';
+// TRA-4201 — the realized companion written BESIDE a protected row's own figure,
+// so a day the clobber guard refuses still carries the broker-fill measure.
+import {
+  applyBrokerRealizedCompanion,
+  buildBrokerRealizedCompanion,
+} from './reports/broker-realized-companion.js';
 // TRA-2407 — default-deny scope for the TRA-1572 firm-wide demo fold.
 import {
   mayViewFirmWideDemoFold,
@@ -3893,6 +3899,12 @@ function makeRealizedBackfillReport(
   existing: ReturnType<typeof generateEodReport> | null,
   equityNote: string,
   superseded: EodReport['supersededPnl'] | null = null,
+  // TRA-4201 — carried on backfill-owned rows too, so the realized VIEW reads one
+  // field on every row instead of branching on `pnlSource` and then having no
+  // close count to work with. It is redundant here by construction — same inputs,
+  // same pass — which is the point: two numbers that cannot disagree. It is never
+  // summed with `combinedPnl`; a view picks exactly one measure per day.
+  brokerRealized: EodReport['brokerRealized'] | null = null,
 ): ReturnType<typeof generateEodReport> {
   const sign = (n: number) => (n >= 0 ? '+' : '') + n.toFixed(2);
   const dayRealized = Number((dayOptionsRealized + dayEquityRealized).toFixed(2));
@@ -3952,6 +3964,12 @@ function makeRealizedBackfillReport(
     // over an already-forced row must not manufacture one either, so this is
     // written only when THIS pass overwrote something protected.
     ...(superseded ? { supersededPnl: superseded } : {}),
+    // TRA-4201 — a companion inherited from `existing` (this row was a protected
+    // snapshot until an operator forced it) describes a figure reconstructed by
+    // an EARLIER pass, so it is replaced outright — and DROPPED, not carried,
+    // when this pass has none. Merging a stale block onto a rewritten row is how
+    // a cell ends up with two figures and no way to tell which is current.
+    brokerRealized: brokerRealized ?? undefined,
     markdown: `${header}\n\n${body}`,
   };
 }
@@ -3977,6 +3995,12 @@ type LiveRealizedBackfillOutcome = {
   candidates: number;
   /** Candidates skipped because a real snapshot owns the cell and force was not asked for it. */
   protectedRows: number;
+  /**
+   * TRA-4201 — protected dates whose realized COMPANION was written or updated
+   * this pass. Subset of the protected rows, and disjoint from `written`: not a
+   * single authoritative field moved on any of these. Empty is the steady state.
+   */
+  companionsWritten: string[];
 };
 
 /**
@@ -4104,17 +4128,29 @@ async function backfillLiveRealizedCalendar(
   const forceSet = triage.accepted;
   for (const d of forceSet) candidates.add(d);
 
-  const outcome = (written: Record<string, number>, forced: string[], protectedRows: number) => ({
+  const outcome = (
+    written: Record<string, number>,
+    forced: string[],
+    protectedRows: number,
+    companionsWritten: string[] = [],
+  ) => ({
     written,
     forced,
     refusedForce,
     candidates: candidates.size,
     protectedRows,
+    companionsWritten,
   });
   if (candidates.size === 0) return outcome({}, [], 0);
 
+  // TRA-4201 — one timestamp for the whole pass. Per-row `new Date()` would make
+  // two rows written by the same pass disagree about when they were built, for
+  // no gain: the figures come from one history fetch.
+  const reconstructedAt = new Date().toISOString();
+
   const written: Record<string, number> = {};
   const forced: string[] = [];
+  const companionsWritten: string[] = [];
   let protectedRows = 0;
   for (const date of [...candidates].sort()) {
     const dayRealized = Number((realizedByDate.get(date) ?? 0).toFixed(2));
@@ -4130,6 +4166,19 @@ async function backfillLiveRealizedCalendar(
       }
     }
     const dayCloseCount = closeCountByDate.get(date) ?? 0;
+    // TRA-4201 — the realized figure for this day, reconstructed for EVERY
+    // candidate rather than only the writable ones. Before this it was computed
+    // inside the `write` branch and thrown away everywhere else, which on the
+    // live book is almost everywhere: a 9 PM `tradier-balance` snapshot owns the
+    // cell, the guard says `protected_snapshot`, and the broker-truth number the
+    // pass just derived went in the bin.
+    const companion = buildBrokerRealizedCompanion({
+      optionsPnl: optionsRealizedByDate.get(date) ?? 0,
+      equityPnl: equityRealizedByDate.get(date) ?? 0,
+      closeCount: dayCloseCount,
+      equityIncluded: includeEquity,
+      reconstructedAt,
+    });
     // TRA-3100 — the write decision proper. It lives in
     // `reports/calendar-write-decision.ts` so a test can grade the gate itself
     // rather than a reproduction of it that agrees with itself by construction.
@@ -4139,13 +4188,34 @@ async function backfillLiveRealizedCalendar(
       dayCloseCount,
       forced: forceSet.has(date),
     });
+    // TRA-4201 — a protected row keeps its own figure and gains the companion
+    // BESIDE it. `applyBrokerRealizedCompanion` rebuilds by spread, so every
+    // authoritative field (`combinedPnl`, `pnlSource`, `realizedPnl`,
+    // `optionsPnl`, `markdown`, the TRA-3101/3102 audit blocks) keeps its value
+    // AND its key order — the serialized file differs only in the companion. And
+    // when the figures already match it does not write at all, so a re-run over
+    // an unchanged day leaves the file byte-identical rather than churning a
+    // timestamp on every startup pass.
+    const persistCompanionOnProtectedRow = async (): Promise<void> => {
+      if (!existing) return;
+      const applied = applyBrokerRealizedCompanion(existing, companion);
+      if (!applied.changed) return;
+      await writeFile(filePath, JSON.stringify(applied.row, null, 2), 'utf-8');
+      companionsWritten.push(date);
+    };
     if (decision.action === 'refuse_force') {
       refusedForce.push({ date, reason: decision.reason });
       protectedRows++;
+      await persistCompanionOnProtectedRow();
       continue;
     }
     if (decision.action === 'skip') {
-      if (decision.reason === 'protected_snapshot') protectedRows++;
+      if (decision.reason === 'protected_snapshot') {
+        protectedRows++;
+        await persistCompanionOnProtectedRow();
+      }
+      // `no_activity_no_row` has no file to carry a companion, and inventing one
+      // would be the phantom `$0.00` row the guard exists to avoid.
       continue;
     }
     const superseded: EodReport['supersededPnl'] | null = decision.superseded
@@ -4159,6 +4229,7 @@ async function backfillLiveRealizedCalendar(
       existing,
       equityNote,
       superseded,
+      companion,
     );
     // TRA-3064 — JSON only. The `<date>.md` sidecar this used to write beside it
     // was a verbatim copy of `report.markdown`, a field on the object being
@@ -4177,13 +4248,18 @@ async function backfillLiveRealizedCalendar(
     protectedRows,
     forced,
     refusedForce,
+    // TRA-4201 — protected rows that gained (or changed) a realized companion
+    // this pass. Distinct from `written`: no authoritative field moved on any of
+    // them. An empty list on a pass with `protectedRows > 0` is the healthy
+    // steady state (nothing changed), not a failure.
+    companionsWritten,
     // TRA-2876 — an abstention that is not reported reads exactly like a window
     // with no corporate actions in it.
     equityIncluded: includeEquity,
     equityExcludedSymbols: caScope ? [...caScope.excludeSymbols] : null,
     corporateActionsSeen: corporateActions?.length ?? null,
   });
-  return outcome(written, forced, protectedRows);
+  return outcome(written, forced, protectedRows, companionsWritten);
 }
 
 /**

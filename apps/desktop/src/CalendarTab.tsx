@@ -121,7 +121,16 @@ function MixedMeasureNote({ reports }: { reports: EodReport[] }) {
 }
 
 /** The small measure marker shown in the corner of a calendar cell. */
-function MeasureBadge({ report }: { report: EodReport | undefined }) {
+function MeasureBadge({ report, view }: { report: EodReport | undefined; view: PnlView }) {
+  // TRA-4201 — under the realized view every rendered figure is the SAME measure
+  // by construction (the broker-fill companion), so the badge states that one
+  // measure rather than the row's own `pnlSource`, which describes the figure
+  // this view is not showing.
+  if (view === 'R') {
+    if (!report?.brokerRealized) return null;
+    const r = PNL_MEASURES['realized-backfill'];
+    return <span className="cal-pnl-src" title={`${r.label}. ${r.title}`}>{r.code}</span>;
+  }
   const m = pnlMeasure(report);
   if (!m) return null;
   return <span className="cal-pnl-src" title={`${m.label}. ${m.title}`}>{m.code}</span>;
@@ -191,6 +200,128 @@ function measuredDays(reports: EodReport[]): EodReport[] {
   return reports.filter(r => !isUnbelievableDay(r));
 }
 
+// ── TRA-4201 — TWO MEASURES, ONE GRID ────────────────────────────────────────
+//
+// Everything above reads exactly one number per day: `combinedPnl`, whatever it
+// happens to measure. On the live book that is almost always `tradier-balance` —
+// the change in ACCOUNT VALUE, which includes unrealized mark-to-market — and
+// reading it as a strategy scorecard is what TRA-4199 measured going wrong:
+//
+//   · one round trip renders as TWO loss days (the opening mark, then that mark
+//     reversing into the realized loss). Aug 08-17/08-18 = a single −393.92.
+//   · fee-and-mark residue on a flat book (−0.42, −0.13, −0.12, −0.10, −0.08,
+//     −0.04) counts as six losing days.
+//   · the win-rate denominator counts days nobody traded — Aug read 1/18 with
+//     three of those days flat and untraded.
+//
+// The server now stores the broker-fill realized figure BESIDE the authoritative
+// one (`EodReport.brokerRealized`, TRA-4201). This is the reader for it.
+//
+// `R` is opt-in and `B` stays the default. Which measure should OWN the default
+// is a board decision, not an implementation one.
+export type PnlView = 'B' | 'R';
+
+/**
+ * What one day contributes under one view. Cells and totals both go through
+ * this, so the grid and the summary bar cannot disagree about which days count —
+ * the same reason `CellPnl` was centralised for TRA-3101.
+ */
+type DayReading =
+  /** No report for this day at all. */
+  | { state: 'absent' }
+  /** R only: this row has no realized reconstruction (outside the backfill window, or today's intraday cell). */
+  | { state: 'no_companion' }
+  /** R only: reconstructed, and the broker matched ZERO closes. The day did not trade. */
+  | { state: 'no_closes' }
+  /** TRA-3101 — measured against a stale anchor. Not a claim. */
+  | { state: 'unknown' }
+  /** TRA-3102 — the row's own figure was never broker-confirmed. Shown, never counted. */
+  | { state: 'unreconciled'; pnl: number | null }
+  /** A figure this view is entitled to render AND to sum. */
+  | { state: 'counted'; pnl: number };
+
+/**
+ * Resolve one day under one view.
+ *
+ * The TRA-3101 / TRA-3102 exclusions are checked FIRST and apply to both views.
+ * A realized view is not a licence to re-admit a day the broker never confirmed:
+ * those rows are flagged, not corrected, and the flag is a property of the row,
+ * not of the measure being read off it.
+ */
+function readDay(report: EodReport | undefined, view: PnlView): DayReading {
+  if (!report) return { state: 'absent' };
+  if (isUnknownDay(report)) return { state: 'unknown' };
+  const companion = report.brokerRealized;
+  if (isUnreconciledDay(report)) {
+    // Under R the flagged cell must NOT print `combinedPnl` — that is the
+    // engine-measure figure, and printing it in a realized cell would put a
+    // number from the other measure on screen under this view's heading.
+    return {
+      state: 'unreconciled',
+      pnl: view === 'B' ? report.combinedPnl : companion && companion.closeCount > 0 ? companion.combinedPnl : null,
+    };
+  }
+  if (view === 'B') return { state: 'counted', pnl: report.combinedPnl };
+  if (!companion) return { state: 'no_companion' };
+  // TRA-3101's rule, one level down: absence is not zero. A day the broker
+  // matched no closes on did not trade, and a `$0.00` here would put it back in
+  // the win-rate denominator — the exact defect this view exists to remove.
+  if (companion.closeCount === 0) return { state: 'no_closes' };
+  return { state: 'counted', pnl: companion.combinedPnl };
+}
+
+/** The figures a total under `view` is entitled to be computed from. */
+function countedPnls(reports: readonly (EodReport | undefined)[], view: PnlView): number[] {
+  const out: number[] = [];
+  for (const r of reports) {
+    const reading = readDay(r, view);
+    if (reading.state === 'counted') out.push(reading.pnl);
+  }
+  return out;
+}
+
+/** Net / trading days / win-rate for one view, over one set of days. */
+function summarise(reports: readonly (EodReport | undefined)[], view: PnlView) {
+  const pnls = countedPnls(reports, view);
+  const wins = pnls.filter(p => p > 0).length;
+  const losses = pnls.filter(p => p < 0).length;
+  return {
+    net: pnls.reduce((s, p) => s + p, 0),
+    days: pnls.length,
+    wins,
+    losses,
+    winRate: pnls.length ? ((wins / pnls.length) * 100).toFixed(0) : null,
+  };
+}
+
+/**
+ * The banner above an `R` grid.
+ *
+ * Under `B` the reader can mistake an account-value chart for a strategy
+ * scorecard, which is the parent finding. Under `R` the opposite mistake is
+ * available — reading a realized-only series as the account's performance — so
+ * the view states what it drops.
+ */
+function RealizedViewNote({ reports }: { reports: EodReport[] }) {
+  const withCompanion = reports.filter(r => r.brokerRealized);
+  const optionsOnly = withCompanion.filter(r => r.brokerRealized?.equityIncluded === false);
+  const noCompanion = reports.length - withCompanion.length;
+  return (
+    <div className="cal-summary-mixed" title="Realized P&L on positions the broker recorded as CLOSED that day, FIFO-matched from Tradier fills. Days with no matched closes did not trade and are shown as `--`, not $0.00.">
+      <strong>Realized (R)</strong> — broker fills only. Days the broker matched no closes on show{' '}
+      <code>--</code> and are excluded from every figure below; they did not trade.
+      {noCompanion > 0 && (
+        <> {noCompanion} day{noCompanion === 1 ? ' has' : 's have'} no realized reconstruction at all
+        (outside the backfill window, or not yet settled).</>
+      )}
+      {optionsOnly.length > 0 && (
+        <> ⚠ {optionsOnly.length} day{optionsOnly.length === 1 ? '' : 's'} are OPTIONS-ONLY — stock
+        realized was withheld because the corporate-action feed could not be trusted for that pass.</>
+      )}
+    </div>
+  );
+}
+
 /** Rendered under any total that had to drop days it could not measure. */
 function UnknownDaysNote({ reports }: { reports: EodReport[] }) {
   const unknown = reports.filter(isUnknownDay);
@@ -234,45 +365,82 @@ function UnreconciledDaysNote({ reports }: { reports: EodReport[] }) {
  * The in-cell figure. One place, so the grid and the week strip cannot drift on
  * the one distinction this ticket is about.
  */
-function CellPnl({ report }: { report: EodReport | undefined }) {
-  if (!report) return <span className="cal-pnl cal-pnl--empty">--</span>;
-  if (isUnknownDay(report)) {
-    return (
-      <span
-        className="cal-pnl cal-pnl--unknown"
-        title={report.pnlUnknown?.detail ?? 'P&L for this day could not be established.'}
-      >
-        ?
-      </span>
-    );
+function CellPnl({ report, view }: { report: EodReport | undefined; view: PnlView }) {
+  const reading = readDay(report, view);
+  switch (reading.state) {
+    case 'absent':
+      return <span className="cal-pnl cal-pnl--empty">--</span>;
+    case 'unknown':
+      return (
+        <span
+          className="cal-pnl cal-pnl--unknown"
+          title={report?.pnlUnknown?.detail ?? 'P&L for this day could not be established.'}
+        >
+          ?
+        </span>
+      );
+    case 'unreconciled':
+      // TRA-3102 — the figure stays visible (it is what is stored) but carries
+      // the flag and never the win/loss tint. A fabricated +$739.00 rendering
+      // exactly like a real one is the defect.
+      return (
+        <span
+          className="cal-pnl cal-pnl--unreconciled"
+          title={report?.pnlUnreconciled?.detail ?? 'This figure is not broker-confirmed.'}
+        >
+          {reading.pnl === null ? '--' : fmtCompact(reading.pnl)}
+          <span className="cal-pnl-flag">!</span>
+        </span>
+      );
+    // TRA-4201 — the two R-view absences. They are NOT the same absence and they
+    // do not share a class: `no_closes` is "the broker matched no closes here, so
+    // this day did not trade", `no_companion` is "no realized figure was ever
+    // reconstructed for this day". Neither is $0.00, and a day that traded FLAT
+    // renders $0.00 and is visually distinct from both.
+    case 'no_closes':
+      return (
+        <span
+          className="cal-pnl cal-pnl--noclose"
+          title="No positions closed this day — the broker matched 0 closes. Not a flat day: nothing traded, so it is excluded from Net P&L and from the win-rate denominator."
+        >
+          --
+        </span>
+      );
+    case 'no_companion':
+      return (
+        <span
+          className="cal-pnl cal-pnl--empty"
+          title="No realized reconstruction for this day — it is outside the broker-fill backfill window, or has not settled yet. Switch to the Account value (B) view to see the stored figure."
+        >
+          --
+        </span>
+      );
+    case 'counted':
+      return <span className="cal-pnl">{fmtCompact(reading.pnl)}</span>;
   }
-  if (isUnreconciledDay(report)) {
-    // TRA-3102 — the figure stays visible (it is what is stored) but carries the
-    // flag and never the win/loss tint. A fabricated +$739.00 rendering exactly
-    // like a real one is the defect.
-    return (
-      <span
-        className="cal-pnl cal-pnl--unreconciled"
-        title={report.pnlUnreconciled?.detail ?? 'This figure is not broker-confirmed.'}
-      >
-        {fmtCompact(report.combinedPnl)}
-        <span className="cal-pnl-flag">!</span>
-      </span>
-    );
-  }
-  return <span className="cal-pnl">{fmtCompact(report.combinedPnl)}</span>;
 }
 
 /** The win/loss/unknown tint for a cell. An unknown day gets NEITHER win nor loss. */
-function cellStateClass(report: EodReport | undefined): string {
-  if (!report) return '';
-  if (isUnknownDay(report)) return ' cal-cell--unknown';
-  // TRA-3102 — same rule, same reason: a number the broker never confirmed must
-  // not be coloured as though it were money that moved.
-  if (isUnreconciledDay(report)) return ' cal-cell--unreconciled';
-  if (report.combinedPnl > 0) return ' cal-cell--win';
-  if (report.combinedPnl < 0) return ' cal-cell--loss';
-  return '';
+function cellStateClass(report: EodReport | undefined, view: PnlView): string {
+  const reading = readDay(report, view);
+  switch (reading.state) {
+    case 'absent':
+      return '';
+    case 'unknown':
+      return ' cal-cell--unknown';
+    // TRA-3102 — same rule, same reason: a number the broker never confirmed
+    // must not be coloured as though it were money that moved.
+    case 'unreconciled':
+      return ' cal-cell--unreconciled';
+    // TRA-4201 — an untraded / unreconstructed day is neither a win nor a loss.
+    case 'no_closes':
+    case 'no_companion':
+      return '';
+    case 'counted':
+      if (reading.pnl > 0) return ' cal-cell--win';
+      if (reading.pnl < 0) return ' cal-cell--loss';
+      return '';
+  }
 }
 
 function fmt(n: number, decimals = 2) {
@@ -343,10 +511,11 @@ function buildMonthWeeks(year: number, month: number, cols: 5 | 7): (number | nu
 
 // ── Month grid ──────────────────────────────────────────────────────────────
 
-function MonthGrid({ year, month, reports, onSelectDate, cols }: {
+function MonthGrid({ year, month, reports, onSelectDate, cols, view }: {
   year: number; month: number; reports: Record<string, EodReport>;
   onSelectDate: (date: string) => void;
   cols: 5 | 7;
+  view: PnlView; // TRA-4201
 }) {
   const today  = new Date();
   const weeks  = buildMonthWeeks(year, month, cols);
@@ -370,7 +539,7 @@ function MonthGrid({ year, month, reports, onSelectDate, cols }: {
 
             let cls = 'cal-cell';
             if (isToday)                               cls += ' cal-cell--today';
-            cls += cellStateClass(report); // TRA-3101 — unknown is neither win nor loss
+            cls += cellStateClass(report, view); // TRA-3101 — unknown is neither win nor loss
             if (clickable)                             cls += ' cal-cell--clickable';
 
             return (
@@ -382,8 +551,8 @@ function MonthGrid({ year, month, reports, onSelectDate, cols }: {
                 title={clickable ? 'View EOD report' : undefined}
               >
                 <span className="cal-day-num">{isToday ? 'Today' : dayNum}</span>
-                <MeasureBadge report={report} />
-                <CellPnl report={report} />
+                <MeasureBadge report={report} view={view} />
+                <CellPnl report={report} view={view} />
               </div>
             );
           })}
@@ -395,8 +564,9 @@ function MonthGrid({ year, month, reports, onSelectDate, cols }: {
 
 // ── Month summary bar ────────────────────────────────────────────────────────
 
-function MonthSummary({ year, month, reports }: {
+function MonthSummary({ year, month, reports, view }: {
   year: number; month: number; reports: Record<string, EodReport>;
+  view: PnlView; // TRA-4201
 }) {
   const prefix = `${year}-${String(month + 1).padStart(2, '0')}-`;
   const monthly = Object.values(reports).filter(r => r.date.startsWith(prefix));
@@ -407,41 +577,54 @@ function MonthSummary({ year, month, reports }: {
   // TRA-3101 — totals are computed over MEASURED days only. A day whose balance
   // snapshot never landed is not a flat day, and counting it as one inflates
   // Trading Days and deflates Win Rate against a denominator nobody measured.
+  // TRA-4201 — and under `R` the denominator narrows further to days the broker
+  // matched closes on. `summarise` is the single place both rules live, shared
+  // with the cell renderer, so a total can never count a day the grid renders
+  // `--`.
+  const s = summarise(monthly, view);
   const measured = measuredDays(monthly);
-  const net    = measured.reduce((s, r) => s + r.combinedPnl, 0);
-  const wins   = measured.filter(r => r.combinedPnl > 0).length;
-  const losses = measured.filter(r => r.combinedPnl < 0).length;
-  const wr     = measured.length ? ((wins / measured.length) * 100).toFixed(0) : '—';
 
   return (
     <>
     <div className="cal-summary">
       <div className="cal-summary-stat">
         <span className="cal-summary-label">Net P&L</span>
-        <span className={`cal-summary-value ${net >= 0 ? 'green' : 'red'}`}>
-          {net >= 0 ? '+' : ''}${Math.abs(net).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+        <span className={`cal-summary-value ${s.net >= 0 ? 'green' : 'red'}`}>
+          {s.net >= 0 ? '+' : ''}${Math.abs(s.net).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
         </span>
       </div>
       <div className="cal-summary-stat">
-        <span className="cal-summary-label">Trading Days</span>
-        <span className="cal-summary-value">{measured.length}</span>
+        <span className="cal-summary-label">{view === 'R' ? 'Days Traded' : 'Trading Days'}</span>
+        <span className="cal-summary-value">{s.days}</span>
       </div>
       <div className="cal-summary-stat">
         <span className="cal-summary-label">Win Days</span>
-        <span className="cal-summary-value green">{wins}</span>
+        <span className="cal-summary-value green">{s.wins}</span>
       </div>
       <div className="cal-summary-stat">
         <span className="cal-summary-label">Loss Days</span>
-        <span className="cal-summary-value red">{losses}</span>
+        <span className="cal-summary-value red">{s.losses}</span>
       </div>
       <div className="cal-summary-stat">
         <span className="cal-summary-label">Win Rate</span>
-        <span className="cal-summary-value">{wr}{wr === '—' ? '' : '%'}</span>
+        {/* TRA-4201 — the denominator travels with the rate. "6%" over 18 cells
+            of which 3 were never traded is a different claim from "1 / 15
+            traded", and only the second one is checkable. */}
+        <span className="cal-summary-value" title={s.winRate === null ? undefined : `${s.wins} of ${s.days} ${view === 'R' ? 'days that traded' : 'measured days'}`}>
+          {s.winRate === null ? '—' : `${s.winRate}%`}
+          {s.winRate !== null && (
+            <span className="cal-summary-denom"> ({s.wins} / {s.days} {view === 'R' ? 'traded' : 'measured'})</span>
+          )}
+        </span>
       </div>
     </div>
+    {view === 'R' && <RealizedViewNote reports={monthly} />}
     <UnknownDaysNote reports={monthly} />
     <UnreconciledDaysNote reports={monthly} />
-    <MixedMeasureNote reports={measured} />
+    {/* TRA-4201 — `R` is homogeneous by construction (one measure, from one
+        reconstruction), so the mixed-measure warning has nothing to warn about
+        and firing it anyway would teach the reader to ignore it. */}
+    {view === 'B' && <MixedMeasureNote reports={measured} />}
     </>
   );
 }
@@ -454,10 +637,11 @@ function MonthSummary({ year, month, reports }: {
 // summary. Reads from the same fully-loaded `reports` map (all available dates),
 // so a week that straddles a month boundary renders correctly.
 
-function WeekView({ weekStart, cols, reports, onSelectDate }: {
+function WeekView({ weekStart, cols, reports, onSelectDate, view }: {
   weekStart: Date; cols: 5 | 7;
   reports: Record<string, EodReport>;
   onSelectDate: (date: string) => void;
+  view: PnlView; // TRA-4201
 }) {
   const today     = new Date();
   const todayIso  = isoDate(today.getFullYear(), today.getMonth(), today.getDate());
@@ -467,12 +651,10 @@ function WeekView({ weekStart, cols, reports, onSelectDate }: {
   const weekReports = days
     .map(d => reports[isoDate(d.getFullYear(), d.getMonth(), d.getDate())])
     .filter((r): r is EodReport => !!r);
-  // TRA-3101 — same measured-days rule as the month summary.
+  // TRA-3101 / TRA-4201 — same measured-days + realized-view rules as the month
+  // summary, through the same helper.
   const measured = measuredDays(weekReports);
-  const net    = measured.reduce((s, r) => s + r.combinedPnl, 0);
-  const wins   = measured.filter(r => r.combinedPnl > 0).length;
-  const losses = measured.filter(r => r.combinedPnl < 0).length;
-  const wr     = measured.length ? ((wins / measured.length) * 100).toFixed(0) : '0';
+  const s = summarise(weekReports, view);
 
   return (
     <>
@@ -489,7 +671,7 @@ function WeekView({ weekStart, cols, reports, onSelectDate }: {
 
             let cls = 'cal-cell';
             if (isToday)                          cls += ' cal-cell--today';
-            cls += cellStateClass(report); // TRA-3101
+            cls += cellStateClass(report, view); // TRA-3101
             if (clickable)                        cls += ' cal-cell--clickable';
 
             return (
@@ -503,8 +685,8 @@ function WeekView({ weekStart, cols, reports, onSelectDate }: {
                 <span className="cal-day-num">
                   {isToday ? 'Today' : `${MONTH_SHORT[d.getMonth()]} ${d.getDate()}`}
                 </span>
-                <MeasureBadge report={report} />
-                <CellPnl report={report} />
+                <MeasureBadge report={report} view={view} />
+                <CellPnl report={report} view={view} />
               </div>
             );
           })}
@@ -514,41 +696,49 @@ function WeekView({ weekStart, cols, reports, onSelectDate }: {
         <div className="cal-summary">
           <div className="cal-summary-stat">
             <span className="cal-summary-label">Net P&L</span>
-            <span className={`cal-summary-value ${net >= 0 ? 'green' : 'red'}`}>
-              {net >= 0 ? '+' : ''}${Math.abs(net).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            <span className={`cal-summary-value ${s.net >= 0 ? 'green' : 'red'}`}>
+              {s.net >= 0 ? '+' : ''}${Math.abs(s.net).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
             </span>
           </div>
           <div className="cal-summary-stat">
-            <span className="cal-summary-label">Trading Days</span>
-            <span className="cal-summary-value">{measured.length}</span>
+            <span className="cal-summary-label">{view === 'R' ? 'Days Traded' : 'Trading Days'}</span>
+            <span className="cal-summary-value">{s.days}</span>
           </div>
           <div className="cal-summary-stat">
             <span className="cal-summary-label">Win Days</span>
-            <span className="cal-summary-value green">{wins}</span>
+            <span className="cal-summary-value green">{s.wins}</span>
           </div>
           <div className="cal-summary-stat">
             <span className="cal-summary-label">Loss Days</span>
-            <span className="cal-summary-value red">{losses}</span>
+            <span className="cal-summary-value red">{s.losses}</span>
           </div>
           <div className="cal-summary-stat">
             <span className="cal-summary-label">Win Rate</span>
-            <span className="cal-summary-value">{wr}%</span>
+            {/* TRA-4201 — the denominator travels with the rate. */}
+            <span className="cal-summary-value">
+              {s.winRate === null ? '—' : `${s.winRate}%`}
+              {s.winRate !== null && (
+                <span className="cal-summary-denom"> ({s.wins} / {s.days} {view === 'R' ? 'traded' : 'measured'})</span>
+              )}
+            </span>
           </div>
         </div>
       )}
+      {weekReports.length > 0 && view === 'R' && <RealizedViewNote reports={weekReports} />}
       {weekReports.length > 0 && <UnknownDaysNote reports={weekReports} />}
       {weekReports.length > 0 && <UnreconciledDaysNote reports={weekReports} />}
-      {weekReports.length > 0 && <MixedMeasureNote reports={measured} />}
+      {weekReports.length > 0 && view === 'B' && <MixedMeasureNote reports={measured} />}
     </>
   );
 }
 
 // ── Year overview ────────────────────────────────────────────────────────────
 
-function YearView({ year, reports, onMonthClick }: {
+function YearView({ year, reports, onMonthClick, view }: {
   year: number;
   reports: Record<string, EodReport>;
   onMonthClick: (month: number) => void;
+  view: PnlView; // TRA-4201
 }) {
   const months = Array.from({ length: 12 }, (_, m) => {
     const prefix  = `${year}-${String(m + 1).padStart(2, '0')}-`;
@@ -556,31 +746,41 @@ function YearView({ year, reports, onMonthClick }: {
     // TRA-3101 — measured days only, and carry the unknown COUNT up so the tile
     // can flag a month whose figure is missing days rather than quietly
     // presenting a partial year as a complete one.
+    // TRA-4201 — under `R` the excluded set also covers days the broker matched
+    // no closes on. Those are NOT "unmeasured" — they are days that did not
+    // trade — so they are counted separately and do not inflate the `?` badge.
     const measured = measuredDays(monthly);
     const unknown  = monthly.length - measured.length;
-    const net      = measured.reduce((s, r) => s + r.combinedPnl, 0);
-    const wins     = measured.filter(r => r.combinedPnl > 0).length;
-    const losses   = measured.filter(r => r.combinedPnl < 0).length;
-    return { m, net, wins, losses, unknown, hasData: monthly.length > 0 };
+    const s        = summarise(monthly, view);
+    const untraded = view === 'R' ? measured.length - s.days : 0;
+    return { m, net: s.net, wins: s.wins, losses: s.losses, unknown, untraded, hasData: monthly.length > 0 };
   });
 
   const yearNet     = months.reduce((s, x) => s + (x.hasData ? x.net : 0), 0);
   const yearWins    = months.reduce((s, x) => s + x.wins, 0);
   const yearLosses  = months.reduce((s, x) => s + x.losses, 0);
   const yearUnknown = months.reduce((s, x) => s + x.unknown, 0);
+  const yearUntraded = months.reduce((s, x) => s + x.untraded, 0);
 
   return (
     <>
       <div className="cal-year-grid">
-        {months.map(({ m, net, wins, losses, unknown, hasData }) => (
+        {months.map(({ m, net, wins, losses, unknown, untraded, hasData }) => (
           <div
             key={m}
             className={`cal-year-cell${!hasData ? ' cal-year-cell--empty' : net >= 0 ? ' cal-year-cell--win' : ' cal-year-cell--loss'}`}
             onClick={() => hasData && onMonthClick(m)}
             style={{ cursor: hasData ? 'pointer' : 'default' }}
-            title={unknown > 0
-              ? `${unknown} day${unknown === 1 ? '' : 's'} in ${MONTH_SHORT[m]} could not be measured (balance snapshot missing) and ${unknown === 1 ? 'is' : 'are'} excluded from this figure.`
-              : undefined}
+            title={[
+              unknown > 0
+                ? `${unknown} day${unknown === 1 ? '' : 's'} in ${MONTH_SHORT[m]} could not be measured (balance snapshot missing) and ${unknown === 1 ? 'is' : 'are'} excluded from this figure.`
+                : null,
+              // TRA-4201 — a realized figure over a month that mostly did not
+              // trade needs to say so, or "flat" reads as "measured and flat".
+              untraded > 0
+                ? `${untraded} day${untraded === 1 ? '' : 's'} in ${MONTH_SHORT[m]} had no broker closes (did not trade) and ${untraded === 1 ? 'is' : 'are'} excluded from this realized figure.`
+                : null,
+            ].filter(Boolean).join(' ') || undefined}
           >
             <span className="cal-year-month">{MONTH_SHORT[m]}</span>
             {hasData ? (
@@ -631,6 +831,21 @@ function YearView({ year, reports, onMonthClick }: {
             </span>
           </div>
         )}
+        {/* TRA-4201 — distinct from Unmeasured. These days WERE measured; the
+            broker simply matched no closes on them, so under the realized view
+            they did not trade. Folding them into "unmeasured" would claim a data
+            gap where there is none. */}
+        {yearUntraded > 0 && (
+          <div className="cal-summary-stat">
+            <span className="cal-summary-label">Days Not Traded</span>
+            <span
+              className="cal-summary-value cal-summary-value--unknown"
+              title="Days with a realized reconstruction and ZERO broker closes. Nothing traded, so they are excluded from Net P&L, Win Days, Loss Days and the win-rate denominator."
+            >
+              {yearUntraded}
+            </span>
+          </div>
+        )}
       </div>
     </>
   );
@@ -656,6 +871,8 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
   // be told the number is the engine's, not the broker's, before reading anything
   // else on the page.
   const unreconciled = report.pnlUnreconciled;
+  // TRA-4201 — the realized companion, when the backfill reconstructed one.
+  const companion = report.brokerRealized;
   return (
     <section className="eod-panel">
       <div className="eod-header" style={{ cursor: 'default' }}>
@@ -742,6 +959,33 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
             </>
           )}
         </div>
+        {/* TRA-4201 — the SECOND measure, stated next to the first rather than
+            instead of it. On a protected row the figure above is the account-value
+            delta and this is the broker-fill realized figure for the same day;
+            they are two measures of one day and are never added together. The
+            option/stock split is kept because folding them would tie the day out
+            while misattributing which sleeve earned it (TRA-2876). */}
+        {companion && (
+          <div className="cal-measure-banner" title="Realized P&L on positions the broker recorded as CLOSED this day, FIFO-matched from Tradier fills. Stored beside the authoritative figure, never instead of it.">
+            <strong>Realized (broker fills):</strong>{' '}
+            {companion.closeCount === 0 ? (
+              <em>no positions closed this day — 0 broker closes. Not $0.00; this day did not trade.</em>
+            ) : (
+              <>
+                <span className={companion.combinedPnl >= 0 ? 'green' : 'red'}>
+                  {fmtDollar(companion.combinedPnl)}
+                </span>{' '}
+                (options {fmtDollar(companion.optionsPnl)} · stocks {fmtDollar(companion.equityPnl)})
+                {' '}· {companion.closeCount} close{companion.closeCount === 1 ? '' : 's'}
+                {!companion.equityIncluded && (
+                  <> · <strong>⚠ options only</strong> — stock realized was withheld this pass
+                  (corporate-action feed unreadable or a split invalidated the lot book), so this
+                  will not tie to an all-instrument statement.</>
+                )}
+              </>
+            )}
+          </div>
+        )}
         <div className="eod-stats-row">
           <div className="eod-stat">
             <span className="eod-stat-label">Realized P&amp;L</span>
@@ -988,6 +1232,11 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
   // app reload. Read-only: it only re-fetches saved reports, it does not
   // regenerate them (avoids writing into the wrong per-account bucket).
   const [refreshTick, setRefreshTick] = useState(0);
+  // TRA-4201 — which MEASURE the grid renders. `B` (account value change) is the
+  // existing behaviour and stays the default: which measure should own the
+  // default is a board decision, and shipping `R` as the default inside an
+  // implementation ticket would make it an implementation one.
+  const [pnlView, setPnlView] = useState<PnlView>('B');
   // TRA-1413 — data-source segment: 'account' = the existing per-user reports
   // (unchanged), 'desk' = the firm-wide demo Option-Trade Journal aggregation
   // (`/api/reports/desk`, all demo books, NOT this user's account). Only the
@@ -1009,6 +1258,13 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
   // market hours, no weekend closes). The per-user path/market are untouched.
   const reportsPathEff = isDesk ? '/api/reports/desk' : reportsPath;
   const marketEff: CalendarMarket = isDesk ? 'stocks' : market;
+
+  // TRA-4201 — the Desk fold is ALREADY a realized-options series (the firm-wide
+  // Option-Trade Journal), and its cells carry no `brokerRealized` companion
+  // because no broker-fill reconstruction runs against a demo book. Offering `R`
+  // there would render a whole grid of `--` and teach the reader the toggle is
+  // broken. The segment is hidden and the effective view pinned to `B`.
+  const pnlViewEff: PnlView = isDesk ? 'B' : pnlView;
 
   // TRA-244 — append `?mode=<bucket>` so server reads from the matching
   // per-account folder (or omit when no mode is supplied). The Desk endpoint is
@@ -1155,6 +1411,26 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
               >Desk (all demo books)</button>
             </div>
           )}
+          {/* TRA-4201 — MEASURE segment. The grid can only render one number per
+              day, and until now that number was always whichever measure owned
+              the stored row — on the live book, the change in account value. `R`
+              switches every cell and every total to the broker-fill realized
+              series stored beside it. Hidden on the Desk fold (already realized;
+              no companion exists there). */}
+          {!isDesk && (
+            <div className="cal-view-toggle" title="Which P&L measure the calendar renders">
+              <button
+                className={`cal-toggle-btn${pnlViewEff === 'B' ? ' active' : ''}`}
+                onClick={() => { setPnlView('B'); setSelectedDate(null); }}
+                title={PNL_MEASURES['tradier-balance'].title}
+              >Account value (B)</button>
+              <button
+                className={`cal-toggle-btn${pnlViewEff === 'R' ? ' active' : ''}`}
+                onClick={() => { setPnlView('R'); setSelectedDate(null); }}
+                title={PNL_MEASURES['realized-backfill'].title}
+              >Realized (R)</button>
+            </div>
+          )}
           <div className="cal-view-toggle">
             <button
               className={`cal-toggle-btn${view === 'month' ? ' active' : ''}`}
@@ -1275,18 +1551,38 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
             reports={reports}
             onSelectDate={setSelectedDate}
             cols={marketEff === 'stocks' ? 5 : 7}
+            view={pnlViewEff}
           />
-          <MonthSummary year={year} month={month} reports={reports} />
+          <MonthSummary year={year} month={month} reports={reports} view={pnlViewEff} />
           {/* TRA-1228 — the board asked why "today" reads low / flat vs the
               "Daily Opts P&L" figure in the footer. Spell out that each cell is
               a *realized* per-day P&L (closed trades only); open-position gains
               are excluded until the position is closed, so unrealized MTM shown
               elsewhere on the dashboard will not appear here. */}
+          {/* TRA-4201 — this note used to claim every cell was realized-only,
+              unconditionally. On the live book that is false: a `tradier-balance`
+              cell is the change in account VALUE and includes open MTM, which is
+              why one round trip renders as two loss days. The note now describes
+              the measure actually on screen. */}
           <p className="cal-note muted" style={{ fontSize: '0.8rem', marginTop: '0.75rem' }}>
-            Each day shows <strong>realized</strong> P&amp;L only — closed stock trades plus
-            options closed that day. Open-position gains (unrealized mark-to-market) are
-            excluded until you close the position, so this view will differ from the
-            “Daily Opts P&amp;L” figure in the footer, which includes open MTM.
+            {pnlViewEff === 'R' ? (
+              <>
+                Each day shows <strong>realized</strong> P&amp;L only — positions the broker
+                recorded as <em>closed</em> that day, FIFO-matched from fills. Open-position
+                gains (unrealized mark-to-market) are excluded until you close the position.
+                Days with no matched closes show <code>--</code>; they did not trade and are
+                not in any figure above.
+              </>
+            ) : (
+              <>
+                Each day shows whichever measure the stored row carries — see the corner badge.
+                On a live broker account most days are <strong>account value change</strong>{' '}
+                (<code>B</code>), which <em>includes</em> unrealized mark-to-market on open
+                positions: a position opened one day and closed the next therefore appears as
+                two cells, not one. Switch to <strong>Realized (R)</strong> for the
+                broker-statement measure.
+              </>
+            )}
           </p>
         </>
       )}
@@ -1297,6 +1593,7 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
             cols={marketEff === 'stocks' ? 5 : 7}
             reports={reports}
             onSelectDate={setSelectedDate}
+            view={pnlViewEff}
           />
           <p className="cal-note muted" style={{ fontSize: '0.8rem', marginTop: '0.75rem' }}>
             Each day shows <strong>realized</strong> P&amp;L only — closed stock trades plus
@@ -1309,6 +1606,7 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
           year={year}
           reports={reports}
           onMonthClick={m => { setView('month'); setMonth(m); }}
+          view={pnlViewEff}
         />
       )}
     </div>

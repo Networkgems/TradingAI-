@@ -2053,6 +2053,31 @@ tr:hover td { background: var(--bg-hover); }
 .cal-cell--loss .cal-pnl { color: var(--red); }
 .cal-pnl--empty { color: var(--muted); font-weight: 400; }
 
+/* ── TRA-4201 — the realized view's "did not trade" state ───────────────────
+   Distinct from `.cal-pnl--empty` above, and the distinction is load-bearing.
+   `--empty` means "no figure exists for this day"; this means "a figure was
+   reconstructed and the broker matched ZERO closes" — the day is measured and
+   it did not trade. Both render `--` (neither is $0.00, which is what a day
+   that traded FLAT renders), and the dotted underline is what separates them
+   at a glance without adding a fourth colour to the grid. */
+.cal-pnl--noclose {
+  color: var(--muted);
+  font-weight: 400;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: help;
+}
+
+/* TRA-4201 — the win-rate denominator, rendered beside the rate. "6%" over a
+   month with three untraded days in the denominator is not the same claim as
+   "1 / 15 traded", and only the second one can be checked. */
+.cal-summary-denom {
+  margin-left: 0.3rem;
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 0.78em;
+}
+
 /* TRA-3100 — the measure marker. A realized-close figure and an account-value
    delta were rendered identically; this is the one-character tell, with the
    full explanation on hover. Deliberately low-contrast: it labels the number,

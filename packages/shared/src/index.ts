@@ -5592,6 +5592,53 @@ export interface EodReport {
   /** TRA-2214 — the census behind {@link EodReport.journalBasis}. */
   journalBasisCounts?: JournalBasisCounts;
 
+  /**
+   * TRA-4201 — the SECOND measure for this day, and explicitly **NOT
+   * authoritative**. `combinedPnl` above keeps whatever measure owns the row
+   * (usually `tradier-balance`, i.e. the change in account value INCLUDING
+   * unrealized mark-to-market); this block carries the broker-fill **realized**
+   * figure for the same day, FIFO-matched from the Tradier trade history by the
+   * TRA-244 pass.
+   *
+   * It exists because a row can hold exactly one `combinedPnl`, so on every day
+   * a 9 PM balance snapshot already owns the cell the realized figure was
+   * computed and then discarded — the clobber guard
+   * (`decideCalendarRowWrite` → `skip / protected_snapshot`) refuses the write,
+   * correctly. This is the figure stored BESIDE the protected one rather than
+   * instead of it.
+   *
+   * Two reader rules, both load-bearing:
+   *  1. **Never sum it with `combinedPnl`.** They are two measures of the same
+   *     day. A view picks one.
+   *  2. **`closeCount === 0` means the day did not trade.** Render `--`, never
+   *     `$0.00`, and exclude it from totals and from the win-rate denominator.
+   *     That is TRA-3101's absence rule; re-introducing the ambiguity here would
+   *     put days nobody traded back into the denominator (Aug 2026 read 1/18
+   *     with three such days in it).
+   *
+   * Absent on rows written before TRA-4201, and on rows outside the backfill's
+   * write window. Absent is "not reconstructed", which is NOT `closeCount: 0`.
+   */
+  brokerRealized?: {
+    /** `optionsPnl + equityPnl`, to the cent. The realized-view cell figure. */
+    combinedPnl: number;
+    /** Realized P&L on OPTION positions closed this day. */
+    optionsPnl: number;
+    /** Realized P&L on STOCK positions closed this day (TRA-2876 sleeve split). */
+    equityPnl: number;
+    /** Broker closes FIFO-matched to this date. The evidence count. */
+    closeCount: number;
+    /**
+     * TRA-2876 — false when the corporate-action feed was unreadable or a split
+     * invalidated the lot book. `equityPnl` is then 0 by ABSTENTION and
+     * `combinedPnl` is options-only, so it will not tie to an all-instrument
+     * statement.
+     */
+    equityIncluded: boolean;
+    /** ISO timestamp of the reconstructing pass. */
+    reconstructedAt: string;
+  };
+
   // Markdown report body
   markdown: string;
 }
