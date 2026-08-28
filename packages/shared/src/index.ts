@@ -5670,6 +5670,56 @@ export interface EodReport {
     reconstructedAt: string;
   };
 
+  /**
+   * TRA-4203 — WHOSE money this cell is.
+   *
+   * Every other provenance field on this interface answers "what does this
+   * number measure" (`pnlSource`, {@link EodReport.brokerRealized}) or "can it
+   * be believed" ({@link EodReport.pnlUnknown},
+   * {@link EodReport.pnlUnreconciled}). None of them answers the question the
+   * demo calendar actually gets wrong, which is **whose book earned it**.
+   *
+   * `GET /api/reports/:date?mode=demo` serves the per-account calendar. When
+   * the personal book is hollow for the day AND the caller is an operator book,
+   * TRA-1572's fold serves the FIRM-WIDE demo Option-Trade Journal cell instead
+   * — byte-identical to `/api/reports/desk/{date}`, every demo book in the
+   * company. That behaviour is correct and TRA-2407 already scoped WHO may see
+   * it. What was missing is that the served cell arrived **unlabelled**, so it
+   * rendered under the "My Account" heading with no tell at all.
+   *
+   * Measured on TRA-4199 (2026-08-28, live `092d087775dc`): 65% of the demo
+   * account calendar's July 2026 total and **100%** of its August total were
+   * this fold — including single rows of +$1,298.55 and -$918.00 against a book
+   * whose equity is ~$2,008. The board read the July figure as the account's
+   * own month.
+   *
+   * Reader rule: a cell carrying `cellScope` is **not this account's money**.
+   * It may be rendered and it may be summed (the fold's arithmetic is not
+   * changed by this field), but it must be labelled, and any subtotal that
+   * mixes it with account cells must state the two parts separately.
+   *
+   * Absent means "this account's own book" — the ordinary case. Absence is the
+   * default because the fold is the exception, and a stamp that had to be
+   * applied on the common path to mean "mine" would fail open.
+   */
+  cellScope?: {
+    /** The only scope that exists today: the firm-wide demo Desk fold. */
+    kind: 'firm_wide_demo_desk_fold';
+    /** One-character grid badge, sibling of the `B` / `R` / `E` measure codes. */
+    code: 'D';
+    /** Short human label for banners and tooltips. */
+    label: string;
+    /** Full sentence for the detail view and the badge's hover text. */
+    detail: string;
+    /**
+     * Journal rows behind this figure. These are firm-wide trades — the count
+     * is deliberately here so a reader can see the cell is not one book's.
+     */
+    tradeCount: number;
+    /** The admin route serving the identical bytes, for verification. */
+    equivalentTo: string;
+  };
+
   // Markdown report body
   markdown: string;
 }

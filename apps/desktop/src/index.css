@@ -2083,15 +2083,89 @@ tr:hover td { background: var(--bg-hover); }
    full explanation on hover. Deliberately low-contrast: it labels the number,
    it does not compete with it. */
 .cal-pnl-src {
-  position: absolute;
-  top: 3px;
-  right: 5px;
   font-size: 0.56rem;
   font-weight: 700;
   line-height: 1;
   color: var(--muted);
   opacity: 0.75;
   cursor: help;
+}
+
+/* TRA-4203 — the corner now holds TWO markers (scope, then measure). They were
+   each absolutely positioned at the same coordinates, so the second would have
+   landed on top of the first; the container owns the position and they lay out
+   in it. */
+.cal-cell-badges {
+  position: absolute;
+  top: 3px;
+  right: 5px;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  line-height: 1;
+}
+
+/* TRA-4203 — "this cell is the firm-wide Desk fold, not your account".
+   Deliberately the same one-character weight as `.cal-pnl-src`: it is a peer of
+   the B/R/E measure codes, not an error state — the number is correct, it just
+   belongs to somebody else. The box outline is what separates it at a glance
+   from the bare measure letter beside it. Teal, so it collides with neither
+   TRA-3101's amber ("nobody measured this") nor TRA-3102's violet ("the broker
+   never confirmed this") — three different claims, three different colours. */
+.cal-scope-desk {
+  font-size: 0.56rem;
+  font-weight: 800;
+  line-height: 1;
+  color: var(--teal, #3aa8a0);
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  padding: 0 2px;
+  cursor: help;
+}
+
+.cal-year-fold { color: var(--teal, #3aa8a0); font-weight: 700; }
+
+/* The parts under a Net P&L total that mixes two books. Sits inside the stat
+   tile, under the figure — the strip is what gets screenshotted, so the split
+   has to be inside the crop. */
+.cal-summary-split {
+  display: block;
+  margin-top: 0.15rem;
+  color: var(--muted);
+  font-size: 0.62rem;
+  line-height: 1.3;
+  white-space: nowrap;
+  cursor: help;
+}
+
+/* The footer note. Same shape as the mixed-measure / unknown / unreconciled
+   notes it sits beside, in the scope colour. */
+.cal-summary-fold {
+  margin-top: 0.4rem;
+  padding: 0.4rem 0.75rem;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--teal, #3aa8a0);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.68rem;
+  line-height: 1.35;
+  cursor: help;
+}
+
+/* The detail-view banner. Louder than the footer note because this is the screen
+   an auditor opens to check one cell, and the trade log under it is other
+   people's books. */
+.cal-scope-banner {
+  margin-bottom: 0.7rem;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--teal, #3aa8a0);
+  border-left: 3px solid var(--teal, #3aa8a0);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--teal, #3aa8a0) 7%, var(--surface));
+  color: var(--text);
+  font-size: 0.74rem;
+  line-height: 1.45;
 }
 
 .cal-cell { position: relative; }

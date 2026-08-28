@@ -120,6 +120,144 @@ function MixedMeasureNote({ reports }: { reports: EodReport[] }) {
   );
 }
 
+// ── TRA-4203 — WHOSE money is in this cell ───────────────────────────────────
+//
+// Everything above labels the MEASURE. None of it labels the BOOK, and on the
+// demo calendar the book is the thing that was wrong.
+//
+// `/api/reports/:date?mode=demo` folds the FIRM-WIDE demo Option-Trade Journal
+// into a day this account's own book has nothing for (TRA-1572, scoped to
+// operator books by TRA-2407). That is correct and is not changed here. What was
+// missing is that the folded cell arrived indistinguishable from a cell the
+// account actually traded, under a heading that says "My Account":
+//
+//   · July 2026: $2,259.16 of the +$3,488.26 total — 65% — was the fold.
+//   · August 2026: -$228.09, ALL of it, because this book had zero demo option
+//     closes between 07-30 and 08-28.
+//   · single folded rows read +$1,298.55 (NKE, 07-02) and -$918.00 (STRC,
+//     07-01) against a book whose equity is ~$2,008.
+//
+// The board read July as the demo engine's month and asked how the account made
+// that money. Producing the honest answer took an API-level diff. This is the
+// label that makes it readable off the screen instead.
+//
+// The fold's ARITHMETIC is deliberately untouched: folded days still count in
+// Net P&L. They are labelled in the cell and stated as their own subtotal in the
+// strip, so a screenshot of the strip can no longer imply the whole figure is
+// this account's.
+
+/** The scope block, when this cell is the firm-wide fold rather than the account's. */
+function deskFoldScope(report: EodReport | undefined) {
+  const s = report?.cellScope;
+  return s && s.kind === 'firm_wide_demo_desk_fold' ? s : null;
+}
+
+export function isDeskFoldCell(report: EodReport | undefined): boolean {
+  return deskFoldScope(report) !== null;
+}
+
+/**
+ * The `D` marker. Same corner and same weight as the measure badge — it is a
+ * peer of `B` / `R` / `E`, not an alarm. The cell is not wrong; it is not yours.
+ * Rendered under BOTH views: which book a figure belongs to is a property of the
+ * row, not of the measure being read off it.
+ */
+export function ScopeBadge({ report }: { report: EodReport | undefined }) {
+  const scope = deskFoldScope(report);
+  if (!scope) return null;
+  return (
+    <span className="cal-scope-desk" title={`${scope.label}. ${scope.detail}`}>
+      {scope.code}
+    </span>
+  );
+}
+
+/**
+ * Both corner markers, in one slot. They were separate absolutely-positioned
+ * spans before this ticket; a shared flex container is what stops the second one
+ * from landing on top of the first.
+ */
+function CellBadges({ report, view }: { report: EodReport | undefined; view: PnlView }) {
+  return (
+    <span className="cal-cell-badges">
+      <ScopeBadge report={report} />
+      <MeasureBadge report={report} view={view} />
+    </span>
+  );
+}
+
+/**
+ * A total split by WHOSE book it came from.
+ *
+ * Runs every day through `readDay`, so the split can never count a day the grid
+ * renders `--` — the same single-source rule `summarise` follows, for the same
+ * reason. `account + fold` is exactly `summarise(...).net`; this ticket states
+ * the parts, it does not restate the whole.
+ */
+export function scopeSplit(reports: readonly (EodReport | undefined)[], view: PnlView) {
+  let account = 0;
+  let fold = 0;
+  let accountDays = 0;
+  let foldDays = 0;
+  for (const r of reports) {
+    const reading = readDay(r, view);
+    if (reading.state !== 'counted') continue;
+    if (isDeskFoldCell(r)) {
+      fold += reading.pnl;
+      foldDays += 1;
+    } else {
+      account += reading.pnl;
+      accountDays += 1;
+    }
+  }
+  return { account, fold, accountDays, foldDays };
+}
+
+/**
+ * The line under Net P&L. Present ONLY when a folded day is actually in the
+ * total — a permanently-visible "of which $0.00 is not yours" would be noise on
+ * every ordinary account and would stop being read before it ever mattered.
+ */
+export function ScopeSplitLine({ reports, view }: {
+  reports: readonly (EodReport | undefined)[]; view: PnlView;
+}) {
+  const split = scopeSplit(reports, view);
+  if (split.foldDays === 0) return null;
+  return (
+    <span
+      className="cal-summary-split"
+      title={
+        'This total mixes two books. "this account" is the days this account\'s own demo book traded. ' +
+        '"Desk fold (D)" is the firm-wide demo Option-Trade Journal — every demo book in the company — ' +
+        "folded into days this account has nothing for. It is not this account's money."
+      }
+    >
+      this account {fmtDollar(split.account)} ({split.accountDays}d) · Desk fold{' '}
+      {fmtDollar(split.fold)} ({split.foldDays}d)
+    </span>
+  );
+}
+
+/** The footer note under a strip whose month contains folded cells. */
+export function DeskFoldNote({ reports, view }: {
+  reports: readonly (EodReport | undefined)[]; view: PnlView;
+}) {
+  const split = scopeSplit(reports, view);
+  if (split.foldDays === 0) return null;
+  return (
+    <div
+      className="cal-summary-fold"
+      title="Served by /api/reports/:date?mode=demo when this account's own demo book has no activity for the day. Identical to /api/reports/desk/{date}, the admin Desk view."
+    >
+      <strong>D</strong> — {split.foldDays} day{split.foldDays === 1 ? '' : 's'} totalling{' '}
+      {fmtDollar(split.fold)} {split.foldDays === 1 ? 'is' : 'are'} the <strong>firm-wide Desk
+      fold</strong>, not this account: every demo book in the company, folded in because this
+      account&rsquo;s own demo book has nothing for {split.foldDays === 1 ? 'that day' : 'those days'}.
+      They are included in the figures above.
+    </div>
+  );
+}
+
 /** The small measure marker shown in the corner of a calendar cell. */
 function MeasureBadge({ report, view }: { report: EodReport | undefined; view: PnlView }) {
   // TRA-4201 — under the realized view every rendered figure is the SAME measure
@@ -551,7 +689,7 @@ function MonthGrid({ year, month, reports, onSelectDate, cols, view }: {
                 title={clickable ? 'View EOD report' : undefined}
               >
                 <span className="cal-day-num">{isToday ? 'Today' : dayNum}</span>
-                <MeasureBadge report={report} view={view} />
+                <CellBadges report={report} view={view} />
                 <CellPnl report={report} view={view} />
               </div>
             );
@@ -592,6 +730,10 @@ function MonthSummary({ year, month, reports, view }: {
         <span className={`cal-summary-value ${s.net >= 0 ? 'green' : 'red'}`}>
           {s.net >= 0 ? '+' : ''}${Math.abs(s.net).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
         </span>
+        {/* TRA-4203 — THE STRIP IS WHAT GETS SCREENSHOTTED. A single figure here
+            under a "My Account" heading is what the board read as this account's
+            July. The parts travel with the whole. */}
+        <ScopeSplitLine reports={monthly} view={view} />
       </div>
       <div className="cal-summary-stat">
         <span className="cal-summary-label">{view === 'R' ? 'Days Traded' : 'Trading Days'}</span>
@@ -619,6 +761,8 @@ function MonthSummary({ year, month, reports, view }: {
       </div>
     </div>
     {view === 'R' && <RealizedViewNote reports={monthly} />}
+    {/* TRA-4203 — one line when any cell in the rendered month is the fold. */}
+    <DeskFoldNote reports={monthly} view={view} />
     <UnknownDaysNote reports={monthly} />
     <UnreconciledDaysNote reports={monthly} />
     {/* TRA-4201 — `R` is homogeneous by construction (one measure, from one
@@ -685,7 +829,7 @@ function WeekView({ weekStart, cols, reports, onSelectDate, view }: {
                 <span className="cal-day-num">
                   {isToday ? 'Today' : `${MONTH_SHORT[d.getMonth()]} ${d.getDate()}`}
                 </span>
-                <MeasureBadge report={report} view={view} />
+                <CellBadges report={report} view={view} />
                 <CellPnl report={report} view={view} />
               </div>
             );
@@ -699,6 +843,8 @@ function WeekView({ weekStart, cols, reports, onSelectDate, view }: {
             <span className={`cal-summary-value ${s.net >= 0 ? 'green' : 'red'}`}>
               {s.net >= 0 ? '+' : ''}${Math.abs(s.net).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
             </span>
+            {/* TRA-4203 — same rule as the month strip. */}
+            <ScopeSplitLine reports={weekReports} view={view} />
           </div>
           <div className="cal-summary-stat">
             <span className="cal-summary-label">{view === 'R' ? 'Days Traded' : 'Trading Days'}</span>
@@ -725,6 +871,7 @@ function WeekView({ weekStart, cols, reports, onSelectDate, view }: {
         </div>
       )}
       {weekReports.length > 0 && view === 'R' && <RealizedViewNote reports={weekReports} />}
+      {weekReports.length > 0 && <DeskFoldNote reports={weekReports} view={view} />}
       {weekReports.length > 0 && <UnknownDaysNote reports={weekReports} />}
       {weekReports.length > 0 && <UnreconciledDaysNote reports={weekReports} />}
       {weekReports.length > 0 && view === 'B' && <MixedMeasureNote reports={measured} />}
@@ -753,7 +900,14 @@ function YearView({ year, reports, onMonthClick, view }: {
     const unknown  = monthly.length - measured.length;
     const s        = summarise(monthly, view);
     const untraded = view === 'R' ? measured.length - s.days : 0;
-    return { m, net: s.net, wins: s.wins, losses: s.losses, unknown, untraded, hasData: monthly.length > 0 };
+    // TRA-4203 — the year view is where a folded month is easiest to mistake for
+    // the account's, because the tile is a single number with no cells under it.
+    const split    = scopeSplit(monthly, view);
+    return {
+      m, net: s.net, wins: s.wins, losses: s.losses, unknown, untraded,
+      foldNet: split.fold, foldDays: split.foldDays, accountNet: split.account,
+      hasData: monthly.length > 0,
+    };
   });
 
   const yearNet     = months.reduce((s, x) => s + (x.hasData ? x.net : 0), 0);
@@ -761,11 +915,14 @@ function YearView({ year, reports, onMonthClick, view }: {
   const yearLosses  = months.reduce((s, x) => s + x.losses, 0);
   const yearUnknown = months.reduce((s, x) => s + x.unknown, 0);
   const yearUntraded = months.reduce((s, x) => s + x.untraded, 0);
+  const yearFoldDays = months.reduce((s, x) => s + x.foldDays, 0);
+  const yearFoldNet  = months.reduce((s, x) => s + (x.hasData ? x.foldNet : 0), 0);
+  const yearAcctNet  = months.reduce((s, x) => s + (x.hasData ? x.accountNet : 0), 0);
 
   return (
     <>
       <div className="cal-year-grid">
-        {months.map(({ m, net, wins, losses, unknown, untraded, hasData }) => (
+        {months.map(({ m, net, wins, losses, unknown, untraded, foldNet, foldDays, hasData }) => (
           <div
             key={m}
             className={`cal-year-cell${!hasData ? ' cal-year-cell--empty' : net >= 0 ? ' cal-year-cell--win' : ' cal-year-cell--loss'}`}
@@ -779,6 +936,11 @@ function YearView({ year, reports, onMonthClick, view }: {
               // trade needs to say so, or "flat" reads as "measured and flat".
               untraded > 0
                 ? `${untraded} day${untraded === 1 ? '' : 's'} in ${MONTH_SHORT[m]} had no broker closes (did not trade) and ${untraded === 1 ? 'is' : 'are'} excluded from this realized figure.`
+                : null,
+              // TRA-4203 — a tile is one number with no cells under it, so the
+              // badge in the grid cannot reach it. The hover has to.
+              foldDays > 0
+                ? `${fmtDollar(foldNet)} of this figure (${foldDays} day${foldDays === 1 ? '' : 's'}) is the firm-wide Desk fold — every demo book in the company — not this account.`
                 : null,
             ].filter(Boolean).join(' ') || undefined}
           >
@@ -794,6 +956,10 @@ function YearView({ year, reports, onMonthClick, view }: {
                       Without this the year view is the one place a partial
                       figure can still pass as a complete one. */}
                   {unknown > 0 && <>&nbsp;<span className="cal-year-unknown">?:{unknown}</span></>}
+                  {/* TRA-4203 — same reason as the `?` marker one line up: the
+                      year view is the last place a figure that is not this
+                      account's can still pass as one. */}
+                  {foldDays > 0 && <>&nbsp;<span className="cal-year-fold">D:{foldDays}</span></>}
                 </span>
               </>
             ) : (
@@ -808,6 +974,17 @@ function YearView({ year, reports, onMonthClick, view }: {
           <span className={`cal-summary-value ${yearNet >= 0 ? 'green' : 'red'}`}>
             {yearNet >= 0 ? '+' : ''}${Math.abs(yearNet).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
           </span>
+          {/* TRA-4203 — the year figure is the one most likely to be quoted, so
+              "how much of it is even this account's" travels with it. */}
+          {yearFoldDays > 0 && (
+            <span
+              className="cal-summary-split"
+              title="Desk fold = the firm-wide demo Option-Trade Journal (every demo book in the company), folded into days this account's own demo book has nothing for. It is not this account's money."
+            >
+              this account {fmtDollar(yearAcctNet)} · Desk fold {fmtDollar(yearFoldNet)} (
+              {yearFoldDays}d)
+            </span>
+          )}
         </div>
         <div className="cal-summary-stat">
           <span className="cal-summary-label">Win Days</span>
@@ -873,6 +1050,11 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
   const unreconciled = report.pnlUnreconciled;
   // TRA-4201 — the realized companion, when the backfill reconstructed one.
   const companion = report.brokerRealized;
+  // TRA-4203 — and WHOSE book this day is. This screen is the one an auditor
+  // opens to check a cell, and until this ticket it printed the firm-wide fold's
+  // trade log — other people's books — under an "EOD Report" header with nothing
+  // saying so.
+  const scope = deskFoldScope(report);
   return (
     <section className="eod-panel">
       <div className="eod-header" style={{ cursor: 'default' }}>
@@ -898,6 +1080,26 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
       </div>
 
       <div className="eod-body">
+        {/* TRA-4203 — FIRST, above every measure banner. "What does this number
+            measure" is the wrong question to answer first when the answer to
+            "whose money is it" is `not yours`. */}
+        {scope && (
+          <div className="cal-scope-banner">
+            <div>
+              <strong>
+                ⚠ This day is the FIRM-WIDE Desk fold — it is NOT this account&rsquo;s money.
+              </strong>
+            </div>
+            <div className="cal-unknown-detail">{scope.detail}</div>
+            <div className="cal-unknown-detail">
+              The trade log below is the firm&rsquo;s demo Option-Trade Journal —{' '}
+              {scope.tradeCount} trade{scope.tradeCount === 1 ? '' : 's'} across every demo book in
+              the company, not this account&rsquo;s. This account&rsquo;s own demo book has no
+              activity for {report.date}, which is the condition the fold exists to fill
+              (TRA-1572). Nothing here is wrong; it is simply somebody else&rsquo;s.
+            </div>
+          </div>
+        )}
         {unknown && (
           <div className="cal-unknown-banner">
             <div>

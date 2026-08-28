@@ -102,6 +102,9 @@ import {
   shouldServeFirmWideDemoFold,
   isReservedOperatorBookName,
 } from './reports/demo-calendar-fill-scope.js';
+// TRA-4203 — and the LABEL on the cell that gate admits. Scope answers "who may
+// see it"; this answers "how does the reader know it is not their money".
+import { stampFirmWideDemoFoldScope } from './reports/demo-calendar-fold-provenance.js';
 // TRA-2508 — the shared precondition for every route that WRITES an account name
 // (signup + the two admin identity-writes). The reserve rule used to be an inline
 // `if` at signup only, which is how both admin routes came to skip it.
@@ -14037,7 +14040,13 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
     try {
       const cell = (await demoJournalCalendarCells()).get(date);
       if (cell && cell.totalTrades > 0) {
-        res.json(stampMoverProvenance(cell));
+        // TRA-4203 — and it goes out LABELLED. The bytes below are the firm-wide
+        // Desk cell; served bare they render under the "My Account" heading with
+        // no tell, and 65% of July / 100% of August of that heading's total was
+        // this fold (TRA-4199). `stampFirmWideDemoFoldScope` is the ONLY thing
+        // this ticket changes on the fold path: it adds `cellScope`, and touches
+        // neither the arithmetic above nor the gate above that.
+        res.json(stampMoverProvenance(stampFirmWideDemoFoldScope(cell)));
         return;
       }
     } catch (err) {
