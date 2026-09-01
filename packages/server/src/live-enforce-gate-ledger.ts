@@ -1219,11 +1219,142 @@ export interface NetEdgeShadowSummary {
   sweep: NetEdgeShadowSweepRow[];
 }
 
+/**
+ * TRA-4154 — the per-ET-day CELL row. Deliberately LEANER than
+ * {@link LiveEnforceCellSummary}: no `costRQuantiles`. A per-day quantile block on
+ * 14 gates × 30 days would multiply the payload for a distribution nobody reads
+ * per-day, and — worse — a cell-day with two samples would publish a p10/p90 that
+ * looks like a distribution. The pooled `byCell` keeps the quantiles; this axis
+ * answers WHEN, which is the only thing the pooled one cannot.
+ */
+export interface LiveEnforceDayCellSummary {
+  cell: string;
+  evaluated: number;
+  blocked: number;
+  /** blocked / evaluated; `null` when the cell decided nothing THAT DAY (never 0). */
+  blockRate: number | null;
+}
+
+/** TRA-4154 — the per-ET-day NOMINATOR-BRANCH row. Lean for the same reason: the
+ *  chain-shape means are folded over their own denominators on the pooled axis and
+ *  a one-row day would publish a "mean" of a single observation. */
+export interface LiveEnforceDaySelectionSummary {
+  selection: string;
+  evaluated: number;
+  blocked: number;
+  blockRate: number | null;
+}
+
+/**
+ * TRA-4154 — rows this gate ruled on THAT DAY which carry no key on a partial
+ * axis. Published rather than left to arithmetic because both partial axes here
+ * (`byCell`, `bySelection`) are stamped only by some call sites and only since
+ * some deploy, so `Σ byCell[].blocked` does NOT reconcile with the day's
+ * `blocked` — on the live retained fold read 2026-09-01 that gap is 1759 of 4342
+ * cost_bar blocks. An unpublished remainder is how partial coverage reads as a
+ * rate (the TRA-3216 shape, and the same reason `blockedUnclassified` exists).
+ */
+export interface LiveEnforceUnstampedTally {
+  evaluated: number;
+  blocked: number;
+}
+
+/**
+ * TRA-4154 (container shared with TRA-3731) — ONE ET DAY of one gate.
+ *
+ * ## Why this exists
+ *
+ * `retained.byGate[]` is a 30-day fold and the since-boot `byGate[]` is zeroed by
+ * every redeploy, so between them there was no read that could answer **when**. A
+ * cell that admitted for fifteen days and has refused every candidate since
+ * pools to a mid-range `blockRate` — on the live fold read 2026-09-01,
+ * `single_leg_otm::0.50-0.55` reads `blockRate 0.3112` over 20 ET days, which is
+ * the arithmetic mean of a working gate and a self-disarmed one and is not a
+ * description of either. A self-disarmed sleeve and a quiet market therefore
+ * rendered IDENTICALLY on any single day, and TRA-2879's disarm criterion
+ * (`avgR < 0 over >= 20 closes`) is structurally unable to fire in the state it
+ * exists to detect, because a sleeve admitting nothing produces no closes.
+ *
+ * ## Where the numbers come from — the TRA-3501 placement question, answered
+ *
+ * NOTHING new is counted at any call site. This roll re-reads the day dimension
+ * that {@link byDay} has always keyed on and that {@link accumulateAllDays}
+ * throws away: the pooled `retained.byGate[]` totals and these rows are folded
+ * from the SAME `GateTallies` objects, so `Σ byEtDay[].evaluated` equals the
+ * gate's `evaluated` exactly, by construction rather than by agreement.
+ *
+ * That is what makes the TRA-3501 trap inapplicable here. A shadow counter placed
+ * downstream of a gate that `continue`s is pinned to zero; this is not a counter,
+ * it is a projection of rows {@link apply} already folded — and `apply` is fed by
+ * {@link recordLiveEnforceDecision} at the refusal site ITSELF
+ * (`signal-engine.ts` `costAwareGateReject`, both the flat-form branch and the
+ * net-edge branch, each of which records BEFORE returning the rejection reason).
+ * Above that site sit `entry_window`, `contract_floor` and `universe`, which is
+ * why a cost-bar day can read `evaluated: 0` on a day the box was up: read those
+ * gates' rows for the same day before concluding the bar saw a quiet market.
+ *
+ * ## Durability
+ *
+ * Free, and for the same reason. {@link byDay} is rebuilt from the JSONL under
+ * `DATA_DIR` by {@link hydrateLiveEnforceGateFromDisk} on every boot, keyed by
+ * `etDay` off the persisted row. So this roll survives a redeploy inside the same
+ * ET fold exactly as far as the pooled fold does — no further, no less. Read
+ * `durability.ephemeral` first: TRUE ⇒ neither view is durable.
+ */
+export interface LiveEnforceGateDaySummary {
+  /** ET calendar day (America/New_York, YYYY-MM-DD). */
+  etDay: string;
+  /**
+   * Rows this gate ruled on that day. `0` means this gate recorded NOTHING that
+   * day — which is a real and common state (the box was down, the sleeve was
+   * dark, or an upstream gate ate the whole population) and is NOT the same as
+   * the day being absent from the fold. Every day in `retained.etDays` gets a row
+   * on every gate for precisely that reason.
+   */
+  evaluated: number;
+  blocked: number;
+  /** blocked / evaluated; **`null` when the gate ruled on nothing that day** — never 0. */
+  blockRate: number | null;
+  /**
+   * ⚠️ There is deliberately NO per-day `byScope`. It is the one axis here with
+   * UNBOUNDED cardinality — on `spread` and `universe` the scope key is the
+   * underlying symbol, and the live retained fold read 2026-09-01 carries **178**
+   * of them on `universe` alone. Crossed with 30 retained days and 12 gates that
+   * is a ~250 KB payload for a split whose per-day shape nothing asks for; the
+   * three axes below are bounded (7 cells, 6 selections, a fixed reason
+   * vocabulary). The pooled `byScope` on the gate is unchanged.
+   */
+  /** Per-tape-cell split for the day, admits included. **The AC2/AC3 axis.** */
+  byCell: LiveEnforceDayCellSummary[];
+  /** Per-nominator-branch split for the day, admits included. */
+  bySelection: LiveEnforceDaySelectionSummary[];
+  /** Per-reason split of the day's BLOCKS; `share` is of the DAY's blocked total. */
+  byReason: LiveEnforceReasonSummary[];
+  /** The day's blocks carrying no `reasonCode` — `byReason`'s missing denominator. */
+  blockedUnclassified: number;
+  /** The day's rows carrying no `cell` stamp — `byCell`'s missing denominator. */
+  cellUnstamped: LiveEnforceUnstampedTally;
+  /** The day's rows carrying no `nominator` stamp — `bySelection`'s missing denominator. */
+  selectionUnstamped: LiveEnforceUnstampedTally;
+}
+
 export interface LiveEnforceGateSummary {
   gate: LiveEnforceGate;
   evaluated: number;
   blocked: number;
   blockRate: number | null;
+  /**
+   * TRA-4154 — the per-ET-day roll of this gate, ascending by day. **This is the
+   * axis that answers WHEN**; see {@link LiveEnforceGateDaySummary}.
+   *
+   * On `retained.byGate[]` it carries one row for EVERY day in
+   * `retained.etDays`, including days this gate recorded nothing on — so
+   * "silent that day" is a value you can read rather than an absence you have to
+   * notice. On the per-day `byGate[]` view it is the single row for that day
+   * (redundant there, published anyway so the field is never `null` and can
+   * never be misread as "not deployed").
+   */
+  byEtDay: LiveEnforceGateDaySummary[];
   /** Per-scope split, busiest first. */
   byScope: LiveEnforceScopeSummary[];
   /** Per-reason split of the BLOCKS, heaviest first (TRA-3216). */
@@ -1402,12 +1533,107 @@ function netEdgeShadow(
   };
 }
 
+/**
+ * TRA-4154 — fold ONE gate's ONE-DAY tallies into a {@link LiveEnforceGateDaySummary}.
+ *
+ * `tallies === undefined` is the "this gate recorded nothing that day" case and
+ * folds to an all-zero row with `blockRate: null` — NOT an omitted row. The
+ * caller drives this off `etDays`, so the roll's length is the fold's length on
+ * every gate and a silent day is readable instead of inferable.
+ */
+function foldGateDay(etDay: string, tallies: GateTallies | undefined): LiveEnforceGateDaySummary {
+  const t = tallies ?? emptyTallies();
+
+  // The day's totals are summed from `byScope`, which every record bumps exactly
+  // once — the same denominator the pooled fold uses, which is what makes
+  // `Σ byEtDay[].evaluated === gate.evaluated` an identity. The per-scope ROWS
+  // are not published (see the interface: unbounded symbol cardinality); only
+  // the total is taken from them. `byCell` / `bySelection` are bumped AT MOST
+  // once per record, which is what makes the two `*Unstamped` remainders below
+  // exact subtractions rather than estimates.
+  let evaluated = 0;
+  let blocked = 0;
+  for (const s of t.byScope.values()) {
+    evaluated += s.evaluated;
+    blocked += s.blocked;
+  }
+
+  let cellEvaluated = 0;
+  let cellBlocked = 0;
+  const byCell: LiveEnforceDayCellSummary[] = [];
+  for (const [cell, c] of t.byCell.entries()) {
+    cellEvaluated += c.evaluated;
+    cellBlocked += c.blocked;
+    byCell.push({
+      cell,
+      evaluated: c.evaluated,
+      blocked: c.blocked,
+      blockRate: c.evaluated > 0 ? round(c.blocked / c.evaluated) : null,
+    });
+  }
+  byCell.sort((a, b) => b.evaluated - a.evaluated || a.cell.localeCompare(b.cell));
+
+  let selEvaluated = 0;
+  let selBlocked = 0;
+  const bySelection: LiveEnforceDaySelectionSummary[] = [];
+  for (const [selection, s] of t.bySelection.entries()) {
+    selEvaluated += s.evaluated;
+    selBlocked += s.blocked;
+    bySelection.push({
+      selection,
+      evaluated: s.evaluated,
+      blocked: s.blocked,
+      blockRate: s.evaluated > 0 ? round(s.blocked / s.evaluated) : null,
+    });
+  }
+  bySelection.sort((a, b) => b.evaluated - a.evaluated || a.selection.localeCompare(b.selection));
+
+  // `share` is of the DAY's blocked total (which includes the unclassified rows),
+  // never of the `byReason` rows' own sum — renormalizing would make a day with
+  // partial coverage read as a complete classification, which is the exact
+  // defect `blockedUnclassified` was added to expose on the pooled fold.
+  const byReason: LiveEnforceReasonSummary[] = [];
+  for (const [reasonCode, r] of t.byReason.entries()) {
+    byReason.push({
+      reasonCode,
+      blocked: r.blocked,
+      share: blocked > 0 ? round(r.blocked / blocked) : null,
+    });
+  }
+  byReason.sort((a, b) => b.blocked - a.blocked || a.reasonCode.localeCompare(b.reasonCode));
+
+  return {
+    etDay,
+    evaluated,
+    blocked,
+    blockRate: evaluated > 0 ? round(blocked / evaluated) : null,
+    byCell,
+    bySelection,
+    byReason,
+    blockedUnclassified: t.blockedUnclassified,
+    cellUnstamped: {
+      evaluated: Math.max(0, evaluated - cellEvaluated),
+      blocked: Math.max(0, blocked - cellBlocked),
+    },
+    selectionUnstamped: {
+      evaluated: Math.max(0, evaluated - selEvaluated),
+      blocked: Math.max(0, blocked - selBlocked),
+    },
+  };
+}
+
 /** Fold a gate->tallies map for one or more days into the per-gate rows. */
 function foldGates(
   acc: Map<LiveEnforceGate, GateTallies>,
   etDay: string | null,
   etDays: string[],
   shadowOpts: NetEdgeShadowOptions,
+  // TRA-4154 — the UNPOOLED source for the per-day roll. `acc` has already lost
+  // the day dimension (see `accumulateAllDays`), so the roll cannot be derived
+  // from it; it is folded from the same per-day `GateTallies` objects `acc` was
+  // built out of, which is what makes `Σ byEtDay[].evaluated === evaluated` hold
+  // by construction rather than by two code paths agreeing.
+  perDay: Map<string, Map<LiveEnforceGate, GateTallies>>,
 ): LiveEnforceGateSummary[] {
   const out: LiveEnforceGateSummary[] = [];
   for (const gate of GATES) {
@@ -1518,6 +1744,10 @@ function foldGates(
       evaluated,
       blocked,
       blockRate: evaluated > 0 ? round(blocked / evaluated) : null,
+      // TRA-4154 — driven off `etDays`, not off the keys `perDay` happens to hold
+      // for this gate: a day on which this gate recorded nothing must publish a
+      // zero row, not vanish. `etDays` is ascending on both callers.
+      byEtDay: etDays.map((d) => foldGateDay(d, perDay.get(d)?.get(gate))),
       byScope,
       byReason,
       blockedUnclassified: tallies.blockedUnclassified,
@@ -1617,11 +1847,16 @@ export function summarizeLiveEnforceGate(
   const retainedDays = [...byDay.keys()].sort();
   return {
     decisionsRecorded: decisionsTotal,
-    byGate: foldGates(day, etDay, [etDay], shadowOpts),
+    // TRA-4154 — the day view's roll is the requested day alone, whether or not
+    // anything was recorded on it. Passing a one-entry map (rather than `byDay`)
+    // keeps this view scoped to `etDay` exactly as before.
+    byGate: foldGates(day, etDay, [etDay], shadowOpts, new Map([[etDay, day]])),
     retained: {
       etDays: retainedDays,
       retentionDays: RETAIN_MS / (24 * 60 * 60 * 1000),
-      byGate: foldGates(accumulateAllDays(), null, retainedDays, shadowOpts),
+      // TRA-4154 — `byDay` is the store hydrated from `/data` on boot, so the roll
+      // is durable on exactly the same terms as the pooled totals beside it.
+      byGate: foldGates(accumulateAllDays(), null, retainedDays, shadowOpts, byDay),
     },
     durability: {
       dataDir,

@@ -5495,6 +5495,28 @@ describe('durabilityNote (TRA-3011)', () => {
 // Deliverable 2 of the ticket is "publish the allowlist and COUNT ITS REJECTS".
 // A scanner-level filter whose rejects are invisible is indistinguishable from an
 // inert one, so the publishing IS the deliverable and it needs its own instrument.
+/** TRA-4154 — one gate row as the route serves it, including the per-ET-day roll. */
+type GateRow = {
+  gate: string;
+  evaluated: number;
+  blocked: number;
+  byScope: Array<{ scope: string }>;
+  byReason: Array<{ reasonCode: string; blocked: number; share: number | null }>;
+  byBook: Array<{ book: string; evaluated: number; blocked: number }>;
+  byEtDay: Array<{
+    etDay: string;
+    evaluated: number;
+    blocked: number;
+    blockRate: number | null;
+    byCell: Array<{ cell: string; evaluated: number; blocked: number; blockRate: number | null }>;
+    bySelection: Array<{ selection: string; evaluated: number; blocked: number }>;
+    byReason: Array<{ reasonCode: string; blocked: number; share: number | null }>;
+    blockedUnclassified: number;
+    cellUnstamped: { evaluated: number; blocked: number };
+    selectionUnstamped: { evaluated: number; blocked: number };
+  }>;
+};
+
 describe('GET /api/health/live-enforce-gates (TRA-3216)', () => {
   const UNIVERSE_VAR = OPTION_LIVE_OTM_UNIVERSE_VAR;
   let savedUniverse: string | undefined;
@@ -5527,14 +5549,10 @@ describe('GET /api/health/live-enforce-gates (TRA-3216)', () => {
         universe: { var: string; restricted: boolean; symbols: string[]; source: string; raw: string | null };
         costBar: { bar: { barR: number; barPinnedByFloor: boolean; dominantTerm: string } };
       };
-      byGate: Array<{
-        gate: string;
-        evaluated: number;
-        blocked: number;
-        byScope: Array<{ scope: string }>;
-        byReason: Array<{ reasonCode: string; blocked: number; share: number | null }>;
-        byBook: Array<{ book: string; evaluated: number; blocked: number }>;
-      }>;
+      byGate: GateRow[];
+      // TRA-4154 — the multi-day fold, which is where the per-day roll matters:
+      // the day view self-clears at ET midnight.
+      retained: { etDays: string[]; retentionDays: number; byGate: GateRow[] };
       note: string;
     };
   }
@@ -5691,6 +5709,94 @@ describe('GET /api/health/live-enforce-gates (TRA-3216)', () => {
       { reasonCode: 'shortfall_gte_0.50', blocked: 2, share: 0.6667 },
       { reasonCode: 'shortfall_lt_0.10', blocked: 1, share: 0.3333 },
     ]);
+  });
+
+  // ── TRA-4154 — the per-ET-day roll, asserted THROUGH THE ROUTE ─────────────
+  //
+  // The ledger's own suite proves the fold. These prove the ROUTE serves it,
+  // which is what the ticket's AC1 is written against: a fold nobody can reach
+  // over HTTP has fixed nothing, and the failure this replaces was a reader
+  // misreading this exact payload.
+  describe('per-ET-day roll (TRA-4154)', () => {
+    const TODAY = etDateString(new Date(NOW));
+    // DERIVED, not a literal: the roll is ordered ascending by ET day, and this
+    // suite's `NOW` is a small test epoch — a hardcoded 2026 date would sort
+    // AFTER "today" and the ordering assertions would be testing the literal.
+    const PRIOR = etDateString(new Date(NOW - 24 * 60 * 60 * 1000));
+    const CELL = 'single_leg_otm::0.50-0.55';
+
+    function costCell(day: string, blocked: boolean) {
+      recordLiveEnforceDecision('cost_bar', 'single_leg_otm', blocked, day, 'r', NOW, {
+        ...(blocked ? { reasonCode: 'shortfall_lt_0.10' } : {}),
+        cell: CELL,
+        book: 'admin',
+      });
+    }
+
+    it('ACCEPTANCE (AC1/AC2/AC3): the endpoint separates an admitting day from a self-disarmed one', () => {
+      // PRIOR: the cell admits 3 of 5. TODAY: the bar self-disarmed — same cell,
+      // same candidate volume, nothing flipped by hand, 5 of 5 refused.
+      for (let i = 0; i < 3; i += 1) costCell(PRIOR, false);
+      for (let i = 0; i < 2; i += 1) costCell(PRIOR, true);
+      for (let i = 0; i < 5; i += 1) costCell(TODAY, true);
+
+      const cb = serve().retained.byGate.find((g) => g.gate === 'cost_bar')!;
+
+      // AC1 — a non-null per-ET-day roll with evaluated/blocked per gate per day.
+      expect(Object.prototype.hasOwnProperty.call(cb, 'byEtDay')).toBe(true);
+      expect(cb.byEtDay.map((d) => d.etDay)).toEqual([PRIOR, TODAY]);
+
+      // The POOLED cell is the instrument as deployed today: it reads 0.70 and
+      // describes neither day. Kept as an assertion so the failure stays visible.
+      expect(cb.byScope[0]!.scope).toBe('single_leg_otm');
+      const pooled = (cb as unknown as { byCell: Array<{ cell: string; blockRate: number }> })
+        .byCell.find((c) => c.cell === CELL)!;
+      expect(pooled.blockRate).toBe(0.7);
+
+      // AC2/AC3 — the roll carries byCell, and the two days are separable.
+      const prior = cb.byEtDay.find((d) => d.etDay === PRIOR)!;
+      const today = cb.byEtDay.find((d) => d.etDay === TODAY)!;
+      expect(prior.byCell.find((c) => c.cell === CELL)!.blockRate).toBe(0.4);
+      expect(today.byCell.find((c) => c.cell === CELL)!.blockRate).toBe(1);
+    });
+
+    it('AC5: blockedUnclassified rides the per-day row, and the roll reconciles with the gate', () => {
+      costCell(TODAY, true);
+      // A block with no reasonCode and no cell — the pre-stamping shape that is
+      // ~40% of the live cost_bar blocks.
+      recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, TODAY, 'legacy', NOW);
+
+      const cb = serve().retained.byGate.find((g) => g.gate === 'cost_bar')!;
+      const day = cb.byEtDay.find((d) => d.etDay === TODAY)!;
+      expect(day).toMatchObject({ evaluated: 2, blocked: 2, blockedUnclassified: 1 });
+      expect(day.cellUnstamped).toEqual({ evaluated: 1, blocked: 1 });
+      expect(cb.byEtDay.reduce((a, d) => a + d.evaluated, 0)).toBe(cb.evaluated);
+    });
+
+    it('a day this gate was SILENT on is a present zero row, on every gate', () => {
+      recordLiveEnforceDecision('universe', 'KVYO', true, PRIOR, 'no', NOW, { reasonCode: 'not_in_universe' });
+      costCell(TODAY, true);
+
+      const body = serve();
+      expect(body.retained.etDays).toEqual([PRIOR, TODAY]);
+      for (const g of body.retained.byGate) {
+        expect(g.byEtDay.map((d) => d.etDay)).toEqual([PRIOR, TODAY]);
+      }
+      // cost_bar recorded nothing on PRIOR: a row at zero with a NULL rate, which
+      // is the "quiet market" reading — not the same as a self-disarmed 1.00.
+      const cb = body.retained.byGate.find((g) => g.gate === 'cost_bar')!;
+      expect(cb.byEtDay.find((d) => d.etDay === PRIOR)).toMatchObject({
+        evaluated: 0, blocked: 0, blockRate: null,
+      });
+    });
+
+    it('the note tells a reader the roll exists and how the two zeros differ', () => {
+      const note = serve().note;
+      expect(note).toMatch(/TRA-4154/);
+      expect(note).toMatch(/byEtDay/);
+      expect(note).toMatch(/PRESENT row at `evaluated: 0, blockRate: null`/);
+      expect(note).toMatch(/cellUnstamped/);
+    });
   });
 });
 

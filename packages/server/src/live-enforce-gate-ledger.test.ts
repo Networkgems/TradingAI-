@@ -602,4 +602,144 @@ describe('live-enforce-gate-ledger', () => {
       expect(row.admitRate).not.toBeNull();
     }
   });
+
+  // ── TRA-4154 — the per-ET-day roll on the retained fold ────────────────────
+  //
+  // The defect: `retained.byGate[]` is a 30-day fold, so a cell that ADMITTED for
+  // most of the fold and has refused everything since pools to a mid-range
+  // `blockRate` that describes neither state. On the live read of 2026-09-01,
+  // `single_leg_otm::0.50-0.55` published `blockRate 0.3112` across 20 ET days —
+  // which is why a self-disarmed sleeve and a quiet market rendered identically.
+  describe('per-ET-day roll (TRA-4154)', () => {
+    const ADMIT_DAY = '2026-07-16';
+    const DARK_DAY = '2026-07-17';
+    const CELL = 'single_leg_otm::0.50-0.55';
+
+    /** One cost_bar verdict in the governing cell, on a named day. */
+    function cellRow(day: string, blocked: boolean, ts: number, cell: string | null = CELL) {
+      recordLiveEnforceDecision(
+        'cost_bar', 'single_leg_otm', blocked, day,
+        blocked ? 'under bar' : undefined, ts,
+        {
+          ...(blocked ? { reasonCode: 'shortfall_lt_0.10' } : {}),
+          ...(cell === null ? {} : { cell }),
+        },
+      );
+    }
+
+    function retainedCostBar() {
+      return summarizeLiveEnforceGate(DARK_DAY).retained.byGate.find((g) => g.gate === 'cost_bar')!;
+    }
+
+    it('THE DISCRIMINATOR (AC3): a day the cell admitted reads < 1.00, the day it self-disarmed reads exactly 1.00', () => {
+      hydrateLiveEnforceGateFromDisk(dir, 1_000);
+      // ADMIT_DAY: the cell is admitting — 6 of 10 pass, mirroring a working bar.
+      for (let i = 0; i < 6; i += 1) cellRow(ADMIT_DAY, false, 1_001 + i);
+      for (let i = 0; i < 4; i += 1) cellRow(ADMIT_DAY, true, 1_010 + i);
+      // DARK_DAY: the bar self-disarmed by arithmetic — the SAME cell now refuses
+      // every candidate. Nothing about the volume of candidates changed.
+      for (let i = 0; i < 10; i += 1) cellRow(DARK_DAY, true, 1_100 + i);
+
+      const cb = retainedCostBar();
+
+      // The POOLED axis — the state of the deployed instrument — cannot separate
+      // them. This assertion is the reason the ticket exists: it must keep
+      // holding, so that the failure the roll fixes stays visible in the suite.
+      expect(cb.byCell.find((c) => c.cell === CELL)).toMatchObject({
+        evaluated: 20, blocked: 14, blockRate: 0.7,
+      });
+
+      // The NEW axis separates them.
+      const admitDay = cb.byEtDay.find((d) => d.etDay === ADMIT_DAY)!;
+      const darkDay = cb.byEtDay.find((d) => d.etDay === DARK_DAY)!;
+      expect(admitDay.byCell.find((c) => c.cell === CELL)!.blockRate).toBe(0.4);
+      expect(darkDay.byCell.find((c) => c.cell === CELL)!.blockRate).toBe(1);
+      // Stated as the ticket asks: strictly below 1.00 on the admitting day.
+      expect(admitDay.byCell.find((c) => c.cell === CELL)!.blockRate!).toBeLessThan(1);
+    });
+
+    it('a silent day is a ZERO ROW with blockRate null, never an absent one', () => {
+      hydrateLiveEnforceGateFromDisk(dir, 1_000);
+      cellRow(ADMIT_DAY, true, 1_001);
+      // A different gate fires on DARK_DAY, so the day is in the fold while
+      // cost_bar recorded nothing on it — the "quiet market" reading that must
+      // not be confused with "self-disarmed".
+      recordLiveEnforceDecision('entry_window', 'single_leg_otm', true, DARK_DAY, 'closed', 1_002);
+
+      const cb = retainedCostBar();
+      expect(cb.byEtDay.map((d) => d.etDay)).toEqual([ADMIT_DAY, DARK_DAY]);
+      const quiet = cb.byEtDay.find((d) => d.etDay === DARK_DAY)!;
+      expect(quiet).toMatchObject({ evaluated: 0, blocked: 0, blockRate: null });
+      expect(quiet.byCell).toEqual([]);
+      // The pooled `byScope` is untouched by this change; the day row carries no
+      // scope split on purpose (unbounded symbol cardinality — 178 on `universe`).
+      expect(quiet).not.toHaveProperty('byScope');
+      expect(cb.byScope.length).toBeGreaterThan(0);
+      // Every gate gets a row on every retained day, not just the busy ones.
+      for (const g of summarizeLiveEnforceGate(DARK_DAY).retained.byGate) {
+        expect(g.byEtDay.map((d) => d.etDay)).toEqual([ADMIT_DAY, DARK_DAY]);
+      }
+    });
+
+    it('the roll RECONCILES with the pooled totals by construction (AC1)', () => {
+      hydrateLiveEnforceGateFromDisk(dir, 1_000);
+      for (let i = 0; i < 5; i += 1) cellRow(ADMIT_DAY, i % 2 === 0, 1_001 + i);
+      for (let i = 0; i < 7; i += 1) cellRow(DARK_DAY, true, 1_100 + i);
+      recordLiveEnforceDecision('spread', 'AAPL', true, DARK_DAY, 'wide', 1_200);
+
+      for (const g of summarizeLiveEnforceGate(DARK_DAY).retained.byGate) {
+        expect(g.byEtDay.reduce((a, d) => a + d.evaluated, 0)).toBe(g.evaluated);
+        expect(g.byEtDay.reduce((a, d) => a + d.blocked, 0)).toBe(g.blocked);
+        expect(g.byEtDay.reduce((a, d) => a + d.blockedUnclassified, 0)).toBe(g.blockedUnclassified);
+      }
+    });
+
+    it('AC5: blockedUnclassified and the unstamped-axis remainders are carried PER DAY', () => {
+      hydrateLiveEnforceGateFromDisk(dir, 1_000);
+      // A classified, cell-stamped block; a block with neither stamp.
+      cellRow(DARK_DAY, true, 1_001);
+      recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, DARK_DAY, 'legacy row', 1_002);
+      // An ADMIT with no cell stamp — the axis is partial on admits too, so the
+      // remainder has to be an `evaluated` count, not just a `blocked` one.
+      cellRow(DARK_DAY, false, 1_003, null);
+
+      const day = retainedCostBar().byEtDay.find((d) => d.etDay === DARK_DAY)!;
+      expect(day).toMatchObject({ evaluated: 3, blocked: 2, blockedUnclassified: 1 });
+      // byCell saw 1 of the 3 rows; the other 2 carried no cell.
+      expect(day.byCell.reduce((a, c) => a + c.evaluated, 0)).toBe(1);
+      expect(day.cellUnstamped).toEqual({ evaluated: 2, blocked: 1 });
+      // No row carried a nominator at all.
+      expect(day.bySelection).toEqual([]);
+      expect(day.selectionUnstamped).toEqual({ evaluated: 3, blocked: 2 });
+      // `share` is of the DAY's blocked total (2), NOT of the byReason rows' sum
+      // (1) — so partial coverage cannot renormalize itself to look complete.
+      expect(day.byReason).toEqual([{ reasonCode: 'shortfall_lt_0.10', blocked: 1, share: 0.5 }]);
+    });
+
+    it('AC4: the roll survives a rehydrate from disk with the day keys intact', () => {
+      hydrateLiveEnforceGateFromDisk(dir, 1_000);
+      for (let i = 0; i < 3; i += 1) cellRow(ADMIT_DAY, false, 1_001 + i);
+      for (let i = 0; i < 3; i += 1) cellRow(DARK_DAY, true, 1_100 + i);
+
+      const before = retainedCostBar().byEtDay.map((d) => [d.etDay, d.evaluated, d.blocked]);
+      // Redeploy: same DATA_DIR, fresh process. `byDay` is rebuilt from the JSONL,
+      // so the roll is durable on exactly the same terms as the pooled totals.
+      clearLiveEnforceGateLedger();
+      const h = hydrateLiveEnforceGateFromDisk(dir, 1_200);
+      expect(h.records).toBe(6);
+      expect(h.days).toBe(2);
+      expect(retainedCostBar().byEtDay.map((d) => [d.etDay, d.evaluated, d.blocked])).toEqual(before);
+      expect(summarizeLiveEnforceGate(DARK_DAY).durability.hydratedDays).toBe(2);
+    });
+
+    it('the DAY view publishes its own single-row roll (never null)', () => {
+      hydrateLiveEnforceGateFromDisk(dir, 1_000);
+      cellRow(DARK_DAY, true, 1_001);
+      for (const g of summarizeLiveEnforceGate(DARK_DAY).byGate) {
+        expect(g.byEtDay).toHaveLength(1);
+        expect(g.byEtDay[0]!.etDay).toBe(DARK_DAY);
+        expect(g.byEtDay[0]!.evaluated).toBe(g.evaluated);
+      }
+    });
+  });
 });
