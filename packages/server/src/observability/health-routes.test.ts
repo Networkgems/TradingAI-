@@ -6613,6 +6613,188 @@ describe('GET /api/health/live-enforce-gates — arm.universe.ratification (TRA-
   });
 });
 
+// ─── TRA-4258 (parent TRA-4256) — the RATIFICATION STAMP on the COST BAR ─────
+// `arm.costBar.bar` published the resolved margin and nothing about its
+// AUTHORIZATION, so a board-ratified 0.10 and a quietly-cut one rendered
+// BYTE-IDENTICALLY. That gap alone produced a CRITICAL live-risk escalation on
+// 2026-09-01 that was WRONG and fully retracted. As with TRA-3694 above, every
+// case reads the SHIPPED route handler's JSON body, not the pure resolver: the
+// deliverable is the field ON THE ROUTE.
+describe('GET /api/health/live-enforce-gates — arm.costBar.ratification (TRA-4258)', () => {
+  const MARGIN_VAR = 'OPTION_COST_GATE_SAFETY_MARGIN_R';
+  const RATIFIED_VAR = 'OPTION_COST_GATE_SAFETY_MARGIN_R_RATIFIED';
+  const RATIFIED_BY_VAR = 'OPTION_COST_GATE_SAFETY_MARGIN_R_RATIFIED_BY';
+  const VARS = [MARGIN_VAR, RATIFIED_VAR, RATIFIED_BY_VAR];
+  /** The board-ratified margin (card `10fd2af1`, executed on TRA-4168). */
+  const RATIFIED_MARGIN = '0.10';
+  const CARD = '10fd2af1';
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const k of VARS) { saved[k] = process.env[k]; delete process.env[k]; }
+    clearLiveEnforceGateLedger();
+  });
+  afterEach(() => {
+    for (const k of VARS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k]!;
+    }
+    clearLiveEnforceGateLedger();
+  });
+
+  type NumStamp = {
+    var: string; byVar: string | null; raw: string | null; ratifiedBy: string | null;
+    matchesLive: boolean | 'unstamped'; reason: string; note: string;
+    ratifiedValue: number | null; liveValue: number;
+  };
+  type CostBarBlock = {
+    bar: { safetyMarginR: number; barR: number; costModelR: number; dominantTerm: string };
+    edge: { otmCells: unknown[] };
+    ratification: NumStamp;
+  };
+
+  function serveGates(): { costBar: CostBarBlock; note: string } {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => undefined) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const res = fakeRes();
+    routes.get('/api/health/live-enforce-gates')![0]!({}, res);
+    const body = res.body as { arm: { costBar: CostBarBlock }; note: string };
+    return { costBar: body.arm.costBar, note: body.note };
+  }
+
+  // ── AC1 — POSITIVE control ────────────────────────────────────────────────
+  it('reads TRUE when the stamp is the live 0.10 margin, and names the card', () => {
+    process.env[MARGIN_VAR] = '0.10';
+    process.env[RATIFIED_VAR] = RATIFIED_MARGIN;
+    process.env[RATIFIED_BY_VAR] = CARD;
+    const { costBar, note } = serveGates();
+    expect(costBar.bar.safetyMarginR).toBe(0.1);
+    expect(costBar.ratification.matchesLive).toBe(true);
+    expect(costBar.ratification.reason).toBe('match');
+    expect(costBar.ratification.ratifiedBy).toBe(CARD);
+    expect(costBar.ratification.ratifiedValue).toBe(0.1);
+    expect(costBar.ratification.liveValue).toBe(0.1);
+    expect(costBar.ratification.var).toBe(RATIFIED_VAR);
+    expect(costBar.ratification.byVar).toBe(RATIFIED_BY_VAR);
+    expect(note).not.toMatch(/RATIFICATION MISMATCH — live margin/);
+  });
+
+  // ── AC2 — the NEGATIVE control. THE load-bearing case ─────────────────────
+  // A `matchesLive` only ever observed `true` is UNFAILABLE and grades nothing.
+  // The stamp says 0.15, the live margin is 0.10 — this is the render an
+  // operator who cut the bar without a card must produce.
+  it('reads FALSE when the stamp is 0.15 against a live 0.10 margin, and publishes BOTH values', () => {
+    process.env[MARGIN_VAR] = '0.10';
+    process.env[RATIFIED_VAR] = '0.15';
+    process.env[RATIFIED_BY_VAR] = CARD;
+    const { costBar, note } = serveGates();
+    expect(costBar.ratification.matchesLive).toBe(false);
+    expect(costBar.ratification.matchesLive).not.toBe(true);
+    expect(costBar.ratification.reason).toBe('mismatch');
+    // BOTH sides on the payload — the verdict is the deliverable, the numbers
+    // are the evidence, and a bare `false` is not actionable without them.
+    expect(costBar.ratification.ratifiedValue).toBe(0.15);
+    expect(costBar.ratification.liveValue).toBe(0.1);
+    expect(costBar.ratification.raw).toBe('0.15');
+    // The DIRECTION: live is LOOSER than the authorization — the one that
+    // spends real money — and the note must say so, not just "mismatch".
+    expect(costBar.ratification.note).toMatch(/LOOSER than the authorization/);
+    expect(note).toMatch(/RATIFICATION MISMATCH — live margin 0\.1 vs ratified 0\.15/);
+  });
+
+  it('also reads FALSE in the TIGHTER direction, and says which direction it is', () => {
+    process.env[MARGIN_VAR] = '0.25';
+    process.env[RATIFIED_VAR] = RATIFIED_MARGIN;
+    const { costBar } = serveGates();
+    expect(costBar.ratification.matchesLive).toBe(false);
+    expect(costBar.ratification.note).toMatch(/TIGHTER than the authorization/);
+  });
+
+  // ── AC3 — an unset stamp is UNKNOWN, and UNKNOWN is not OK ────────────────
+  it("reads 'unstamped' when unset — explicitly NEITHER true NOR false", () => {
+    process.env[MARGIN_VAR] = '0.10'; // the ratified value: a "compare to the
+    // default and pass" implementation would report a spurious `true` here.
+    const { costBar, note } = serveGates();
+    expect(costBar.bar.safetyMarginR).toBe(0.1);
+    expect(costBar.ratification.matchesLive).toBe('unstamped');
+    expect(costBar.ratification.matchesLive).not.toBe(true);
+    expect(costBar.ratification.matchesLive).not.toBe(false);
+    expect(costBar.ratification.reason).toBe('absent');
+    expect(costBar.ratification.raw).toBeNull();
+    expect(costBar.ratification.ratifiedValue).toBeNull();
+    expect(costBar.ratification.ratifiedBy).toBeNull();
+    expect(costBar.ratification.note).toMatch(/NOT a pass/);
+    expect(note).toMatch(/cost-bar safety margin: RATIFICATION UNSTAMPED|RATIFICATION UNSTAMPED \(OPTION_COST_GATE_SAFETY_MARGIN_R_RATIFIED/);
+  });
+
+  it('a BLANK stamp is unstamped, not a zero ratified value', () => {
+    process.env[RATIFIED_VAR] = '   ';
+    const { costBar } = serveGates();
+    expect(costBar.ratification.matchesLive).toBe('unstamped');
+    expect(costBar.ratification.ratifiedValue).toBeNull();
+  });
+
+  // ── The trap: a stamp that is SET but garbage must be LOUD, not silent ────
+  it('a SET-but-unparseable stamp reads FALSE, never unstamped and never true', () => {
+    process.env[MARGIN_VAR] = '0.10';
+    process.env[RATIFIED_VAR] = 'ten percent';
+    const { costBar } = serveGates();
+    expect(costBar.ratification.matchesLive).toBe(false);
+    expect(costBar.ratification.reason).toBe('unparseable');
+    expect(costBar.ratification.ratifiedValue).toBeNull();
+  });
+
+  // ── The comparison is on the RESOLVED margin, not the raw env ────────────
+  it('grades the ENFORCED margin: a malformed live var enforces the 0.20 default and is graded as 0.20', () => {
+    process.env[MARGIN_VAR] = 'not-a-number'; // resolveCostGateConfig falls back
+    process.env[RATIFIED_VAR] = RATIFIED_MARGIN;
+    const { costBar } = serveGates();
+    expect(costBar.bar.safetyMarginR).toBe(0.2); // the shipped default is in force
+    expect(costBar.ratification.liveValue).toBe(0.2);
+    expect(costBar.ratification.matchesLive).toBe(false); // 0.20 enforced vs 0.10 ratified
+  });
+
+  it('matches on the QUANTITY, not the spelling — "0.1" and "0.100" both ratify 0.10', () => {
+    process.env[MARGIN_VAR] = '0.10';
+    for (const spelling of ['0.1', '0.100', ' 0.10 ', '1e-1']) {
+      process.env[RATIFIED_VAR] = spelling;
+      expect(serveGates().costBar.ratification.matchesLive).toBe(true);
+    }
+  });
+
+  it('the 1e-9 tolerance absorbs a last-bit float difference but NOT a real cut', () => {
+    process.env[MARGIN_VAR] = '0.10';
+    process.env[RATIFIED_VAR] = '0.1000000000001'; // ~1e-13 off — not a drift
+    expect(serveGates().costBar.ratification.matchesLive).toBe(true);
+    process.env[RATIFIED_VAR] = '0.1001'; // 1e-4 — far above tolerance, a REAL cut
+    expect(serveGates().costBar.ratification.matchesLive).toBe(false);
+  });
+
+  // ── AC4 — the stamp changes NOTHING it grades ────────────────────────────
+  it('is an ATTESTATION: bar and edge.otmCells are byte-identical with and without the stamp', () => {
+    process.env[MARGIN_VAR] = '0.10';
+    const unstamped = serveGates().costBar;
+    process.env[RATIFIED_VAR] = RATIFIED_MARGIN;
+    process.env[RATIFIED_BY_VAR] = CARD;
+    const stampedMatch = serveGates().costBar;
+    process.env[RATIFIED_VAR] = '0.15'; // and under a MISMATCH, which must not bite
+    const stampedMismatch = serveGates().costBar;
+
+    expect(JSON.stringify(stampedMatch.bar)).toBe(JSON.stringify(unstamped.bar));
+    expect(JSON.stringify(stampedMismatch.bar)).toBe(JSON.stringify(unstamped.bar));
+    expect(JSON.stringify(stampedMismatch.edge.otmCells)).toBe(JSON.stringify(unstamped.edge.otmCells));
+    // The verdicts genuinely differ — otherwise the assertion above is vacuous.
+    expect(stampedMismatch.ratification.matchesLive).toBe(false);
+    expect(stampedMatch.ratification.matchesLive).toBe(true);
+    expect(unstamped.ratification.matchesLive).toBe('unstamped');
+  });
+});
+
 // TRA-3694 — the same stamp on the resolved caps. A cap value reads identically
 // whether the board authorised it or not, which is the identical defect.
 describe('GET /api/health/live-options-fee-slippage — capRatification (TRA-3694)', () => {

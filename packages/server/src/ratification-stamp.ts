@@ -67,6 +67,27 @@ export const LIVE_OPTION_TEST_AGGREGATE_CAP_RATIFIED_VAR = 'OPTION_LIVE_TEST_AGG
 export const LIVE_OPTION_TEST_CAPS_RATIFIED_BY_VAR = 'OPTION_LIVE_TEST_CAPS_RATIFIED_BY';
 
 /**
+ * TRA-4258 — the board-ratified `single_leg_otm` cost-gate SAFETY MARGIN, in R.
+ *
+ * Same defect as the universe stamp one section up, on the knob that sets the
+ * live admission bar: `arm.costBar.bar.safetyMarginR: 0.1` reads IDENTICALLY
+ * whether the board ratified `0.10` or somebody quietly cut it. On 2026-09-01 a
+ * reader filed a CRITICAL live-risk escalation (TRA-4256) claiming exactly that
+ * drift, off nothing but this gap; the value WAS ratified (card `10fd2af1`,
+ * accepted 2026-08-28T14:31:02.263Z, executed on TRA-4168) and the escalation was
+ * retracted in full. The archaeology that produced the false alarm spanned two
+ * tickets, thirty comments and six interaction cards. This stamp makes it a GET.
+ *
+ * ⚠️ The margin itself is BOARD-RATIFIED AT `0.10` AND IS THE FLOOR (TRA-4168's
+ * closing comment). This stamp attests it; it must never be read as licence to
+ * retune it.
+ */
+export const OPTION_COST_GATE_SAFETY_MARGIN_R_RATIFIED_VAR = 'OPTION_COST_GATE_SAFETY_MARGIN_R_RATIFIED';
+
+/** Free-text provenance for the margin stamp above — the accepted card id (e.g. `10fd2af1`). */
+export const OPTION_COST_GATE_SAFETY_MARGIN_R_RATIFIED_BY_VAR = 'OPTION_COST_GATE_SAFETY_MARGIN_R_RATIFIED_BY';
+
+/**
  * The published verdict. `'unstamped'` is a THIRD state, not a falsy `false` and
  * emphatically not `true`: the var is absent, so authorization is UNKNOWN.
  */
@@ -282,6 +303,35 @@ export function resolveLiveOtmUniverseRatification(
  * Same tri-state and same fail direction as the universe stamp. Comparison is on
  * the PARSED number, so `"350"` and `"350.00"` match — the authorization is a
  * quantity, not a spelling.
+ *
+ * `opts.toleranceAbs` (TRA-4258) is the absolute slack on that comparison and
+ * DEFAULTS TO 0, which is bit-for-bit the `parsed === liveValue` this shipped
+ * with — the two cap stamps above are unchanged by its introduction. It exists
+ * because a stamp is a decimal STRING and the live value is a float: the caps
+ * are integer dollars and compare exactly, but a sub-1 R margin is the shape
+ * where `Number("0.1")` and a config-resolved `0.1` can differ in the last bit
+ * and manufacture a mismatch nobody caused. Keep it far below the smallest
+ * ratification step that could ever be meaningful (`1e-9` vs steps of `0.005`),
+ * so it can never absorb a real drift: this widens what counts as a MATCH, and a
+ * loosened comparison on an authorization check is the direction that hides
+ * things.
+ *
+ * ⚠️ `opts.polarity` (TRA-4258) decides WHICH DIRECTION IS THE DANGEROUS ONE,
+ * and it is NOT cosmetic — it is the only thing that makes a `false` actionable.
+ * The note published here answers "which way did real money move", and the
+ * answer INVERTS with the kind of knob:
+ *
+ *   • `'cap'` (the default, and what the two cap stamps above are): a CEILING.
+ *     Live ABOVE the ratified value is LOOSER — bigger positions than authorized.
+ *   • `'floor'`: a MINIMUM, like the `single_leg_otm` cost-gate safety margin.
+ *     Live BELOW the ratified value is LOOSER — a LOWER admission bar admits
+ *     MORE trades, which is the direction that spends real money.
+ *
+ * Shipping one polarity for both would print a confident sentence naming the
+ * WRONG direction on half its callers, which is worse than printing none: the
+ * whole point of the stamp is that the reader stops re-deriving and trusts it.
+ * (Caught by the TRA-4258 negative control, which is why that control is the
+ * load-bearing acceptance item.)
  */
 export function resolveNumericRatification(
   varName: string,
@@ -289,7 +339,10 @@ export function resolveNumericRatification(
   label: string,
   liveValue: number,
   env: NodeJS.ProcessEnv = process.env,
+  opts: { toleranceAbs?: number; polarity?: 'cap' | 'floor' } = {},
 ): NumericRatificationStamp {
+  const toleranceAbs = opts.toleranceAbs ?? 0;
+  const polarity = opts.polarity ?? 'cap';
   const raw = readEnv(env, varName);
   const ratifiedBy = byVar === null ? null : readEnv(env, byVar);
   const base = { var: varName, byVar, raw, ratifiedBy, liveValue };
@@ -319,7 +372,9 @@ export function resolveNumericRatification(
     };
   }
 
-  const matches = parsed === liveValue;
+  // `<= 0` is exactly `===` for two finite numbers, so the default tolerance
+  // preserves the original predicate rather than approximating it.
+  const matches = Math.abs(parsed - liveValue) <= toleranceAbs;
   return {
     ...base,
     matchesLive: matches,
@@ -330,7 +385,10 @@ export function resolveNumericRatification(
         `${ratifiedBy === null ? '' : ` (${ratifiedBy})`}.`
       : `⚠️ MISMATCH: the live ${label} resolves to ${liveValue} but the stamp ratifies ${parsed}` +
         `${ratifiedBy === null ? '' : ` (${ratifiedBy})`}. ` +
-        `${parsed < liveValue ? 'Live is LOOSER than the authorization — the direction that risks real money.' : 'Live is TIGHTER than the authorization.'}`,
+        // A CAP is breached UPWARD, a FLOOR is breached DOWNWARD. See `polarity`.
+        `${(polarity === 'cap' ? liveValue > parsed : liveValue < parsed)
+          ? 'Live is LOOSER than the authorization — the direction that risks real money.'
+          : 'Live is TIGHTER than the authorization.'}`,
   };
 }
 
