@@ -11,6 +11,7 @@ import {
   readLastTrip,
   resolveLivenessLogPath,
   readLastLiveness,
+  isUnexplainedDeath,
   _resetWatchdogForTests,
   readCgroupMemoryLimitBytes,
   DEFAULT_WATCHDOG,
@@ -541,6 +542,59 @@ describe('TRA-1463 — periodic liveness breadcrumb (external-kill attribution)'
     handle!.sampleNow();
     expect(handle!.status().priorLiveness).toBeNull();
     handle!.stop();
+  });
+
+  describe('TRA-4158 — isUnexplainedDeath: a graceful self-restart must NOT also report an external kill', () => {
+    const IV = 15_000; // the shipped WATCHDOG_LIVENESS_INTERVAL_MS default
+
+    it('a heartbeat with NO trip beside it is the real external-kill signature', () => {
+      expect(isUnexplainedDeath({ lastTripAtMs: null, priorLivenessAtMs: 1_000, livenessIntervalMs: IV })).toBe(true);
+    });
+
+    it('no heartbeat at all attributes nothing', () => {
+      expect(isUnexplainedDeath({ lastTripAtMs: 5_000, priorLivenessAtMs: null, livenessIntervalMs: IV })).toBe(false);
+      expect(isUnexplainedDeath({ lastTripAtMs: null, priorLivenessAtMs: null, livenessIntervalMs: IV })).toBe(false);
+    });
+
+    // The regression. Under the old flat 5s threshold every gap here returned true
+    // and emitted a spurious external-kill line beside a perfectly good trip record.
+    it.each([6_000, 9_900, 14_999, 15_000, 29_999])(
+      'stays silent for a %ims stale heartbeat — within one heartbeat interval of the trip',
+      (gap) => {
+        expect(isUnexplainedDeath({ lastTripAtMs: 0, priorLivenessAtMs: gap, livenessIntervalMs: IV })).toBe(false);
+      },
+    );
+
+    it('still fires once the gap exceeds two heartbeat intervals', () => {
+      expect(isUnexplainedDeath({ lastTripAtMs: 0, priorLivenessAtMs: 30_001, livenessIntervalMs: IV })).toBe(true);
+      expect(isUnexplainedDeath({ lastTripAtMs: 0, priorLivenessAtMs: 120_000, livenessIntervalMs: IV })).toBe(true);
+    });
+
+    it('is symmetric — a heartbeat written just AFTER the trip record is still the same death', () => {
+      expect(isUnexplainedDeath({ lastTripAtMs: 20_000, priorLivenessAtMs: 8_000, livenessIntervalMs: IV })).toBe(false);
+    });
+
+    it('scales with the configured interval rather than a hard-coded constant', () => {
+      // A 1s heartbeat makes a 6s gap genuinely anomalous; a 60s heartbeat does not.
+      expect(isUnexplainedDeath({ lastTripAtMs: 0, priorLivenessAtMs: 6_000, livenessIntervalMs: 1_000 })).toBe(true);
+      expect(isUnexplainedDeath({ lastTripAtMs: 0, priorLivenessAtMs: 6_000, livenessIntervalMs: 60_000 })).toBe(false);
+    });
+
+    // Pinned to the live bqb1 tape: each of these deaths emitted BOTH the
+    // self-restart line and the external-kill line at the same instant.
+    it('the four measured bqb1 double-classifications all resolve to "explained"', () => {
+      const measured = [
+        { boot: '2026-09-01T18:05:07.381Z', tripAt: 1788285892434, liveAt: 1788285882452 }, // 9982ms
+        { boot: '2026-08-28T01:49:54.110Z', tripAt: 1000_000, liveAt: 1000_000 - 9_982 },
+        { boot: '2026-08-31T13:45:22.411Z', tripAt: 2000_000, liveAt: 2000_000 - 12_400 },
+        { boot: '2026-09-01T15:01:45.430Z', tripAt: 3000_000, liveAt: 3000_000 - 7_100 },
+      ];
+      for (const m of measured) {
+        expect(
+          isUnexplainedDeath({ lastTripAtMs: m.tripAt, priorLivenessAtMs: m.liveAt, livenessIntervalMs: IV }),
+        ).toBe(false);
+      }
+    });
   });
 
   it('honours WATCHDOG_LIVENESS_PERSIST=false (no heartbeat written)', () => {

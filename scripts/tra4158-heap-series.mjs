@@ -278,6 +278,133 @@ function reportRestarts(events, sinceIso) {
   }
 }
 
+/**
+ * TRA-4158 `--deaths` — partition the deaths by MODE, which `--restarts` cannot do.
+ *
+ * Render's event stream emits a bare `server_failed` for every non-zero exit; a
+ * watchdog self-restart and a platform SIGKILL are indistinguishable there. The
+ * discriminator lives only in the app's own boot lines, which classify the PRIOR
+ * process's death:
+ *
+ *   "prior watchdog self-restart detected on boot"                 -> the watchdog did it
+ *   "prior process died WITHOUT a watchdog trip — external kill ..."-> nobody owns it
+ *
+ * ## Why this does not simply trust those lines
+ *
+ * They are not mutually exclusive on the live build. The emitter suppressed the
+ * second line only when the two breadcrumbs landed within 5s of each other, while
+ * the liveness breadcrumb is written every 15s — so half of all graceful
+ * self-restarts ALSO announce an external kill. Measured 2026-08-28..09-01: 28
+ * deaths, 14 double-classified, ZERO standalone external-kill lines.
+ *
+ * So this PAIRS the lines by timestamp and reports a death as `external-kill` only
+ * when no self-restart line sits beside it. The double-classified count is printed
+ * as its own row, because while it is non-zero every mode census off the raw tape
+ * is inflated — and reading it as a second death mode is exactly the trap this
+ * mode exists to keep a reader out of.
+ *
+ * The emitter fix ships with this commit; until it is DEPLOYED the pairing here is
+ * what makes the tape readable, and after it deploys `doubleClassified` should
+ * decay to 0. That decay is the fix's acceptance signal.
+ */
+const SELF_RESTART_RE = /^prior watchdog self-restart detected on boot/;
+const EXTERNAL_KILL_RE = /^prior process died WITHOUT a watchdog trip/;
+/** Two lines describing the same death land within a few ms of each other. */
+const PAIR_WINDOW_MS = 100;
+
+async function fetchBootClassifications(serviceId, key, ownerId, sinceIso) {
+  const endTime = new Date().toISOString();
+  const rows = [];
+  // Two narrow text queries rather than one broad one: the API's `text` filter is
+  // case-insensitive substring, so "WATCHDOG TRIP" also matches the external-kill
+  // line's "...WITHOUT a watchdog trip". Classify on the PARSED msg, never on the
+  // query that found the line.
+  for (const text of ['detected on boot', 'external kill']) {
+    const u = new URL('https://api.render.com/v1/logs');
+    u.searchParams.set('resource', serviceId);
+    u.searchParams.set('ownerId', ownerId);
+    u.searchParams.set('startTime', sinceIso);
+    u.searchParams.set('endTime', endTime);
+    u.searchParams.set('limit', '100'); // MAX 100 — larger returns an error OBJECT at HTTP 200
+    u.searchParams.set('text', text);
+    const res = await fetch(u, {
+      headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!res.ok) throw new Error(`logs -> HTTP ${res.status}`);
+    const body = await res.json();
+    // FAIL CLOSED on a non-array: reading an error object as [] turns "could not
+    // measure" into "measured zero deaths", which is the worst possible verdict here.
+    if (body.logs !== null && !Array.isArray(body.logs)) {
+      throw new Error('logs field is neither null nor an array — refusing to read it as zero');
+    }
+    // A truncated page is an UNDERCOUNT of deaths. Refuse rather than under-report.
+    if (body.hasMore === true) {
+      throw new Error(`log page for "${text}" is truncated (hasMore) — narrow --since; an undercount is not a census`);
+    }
+    for (const line of body.logs ?? []) {
+      let msg;
+      try {
+        msg = JSON.parse(line.message);
+      } catch {
+        continue; // non-JSON platform line
+      }
+      const at = Date.parse(msg.ts ?? line.timestamp);
+      if (!Number.isFinite(at)) continue;
+      if (SELF_RESTART_RE.test(msg.msg ?? '')) {
+        rows.push({ at, iso: msg.ts, mode: 'self-restart', reason: msg.reason ?? null, uptimeSecAtTrip: msg.uptimeSecAtTrip ?? null, rssMB: msg.rssMB ?? null });
+      } else if (EXTERNAL_KILL_RE.test(msg.msg ?? '')) {
+        rows.push({ at, iso: msg.ts, mode: 'external-kill', reason: null, uptimeSecAtTrip: msg.lastAliveUptimeSec ?? null, rssMB: msg.lastAliveRssMB ?? null });
+      }
+    }
+  }
+  return rows.sort((a, b) => a.at - b.at);
+}
+
+function reportDeaths(rows, sinceIso) {
+  const selfRestarts = rows.filter(r => r.mode === 'self-restart');
+  const externalKills = rows.filter(r => r.mode === 'external-kill');
+  const paired = [];
+  const orphans = [];
+  for (const kill of externalKills) {
+    const beside = selfRestarts.find(s => Math.abs(s.at - kill.at) <= PAIR_WINDOW_MS);
+    (beside ? paired : orphans).push(kill);
+  }
+  // One death per self-restart line, plus any external kill that stands alone.
+  const deaths = selfRestarts.length + orphans.length;
+
+  console.log(`[tra4158] boot-time death classification since ${sinceIso}`);
+  console.log('');
+  console.log('  boot ts                    prior death     reason  uptimeAtTrip   rssMB');
+  const attributed = [...selfRestarts, ...orphans].sort((a, b) => a.at - b.at);
+  for (const r of attributed) {
+    console.log(
+      `  ${r.iso}  ${r.mode.padEnd(14)}  ${String(r.reason ?? '-').padEnd(6)}  ${String(r.uptimeSecAtTrip ?? '-').padStart(11)}  ${String(r.rssMB ?? '-').padStart(6)}`,
+    );
+  }
+  console.log('');
+  console.log(`  distinct deaths ....................... ${deaths}`);
+  console.log(`    watchdog self-restart ............... ${selfRestarts.length}`);
+  console.log(`    external kill (unexplained) ......... ${orphans.length}`);
+  const reasons = {};
+  for (const r of selfRestarts) reasons[r.reason ?? 'null'] = (reasons[r.reason ?? 'null'] ?? 0) + 1;
+  console.log(`  watchdog trip reason breakdown ........ ${JSON.stringify(reasons)}`);
+  console.log('');
+  console.log(`  double-classified (BOTH lines, one death) ${paired.length}/${deaths}`);
+  if (paired.length > 0) {
+    console.log('    ^ emitter defect, fixed but not yet deployed. Until this reads 0, any');
+    console.log('      census that partitions on the raw lines OVERCOUNTS external kills.');
+  }
+  // An OOM death is exactly what a heap-exhaustion failure looks like from outside,
+  // so a standalone external kill is the one observation that would corroborate the
+  // heap hypothesis. Say so explicitly rather than leaving a bare zero to be read.
+  if (orphans.length === 0) {
+    console.log('');
+    console.log('  NOTE: zero unexplained kills => no OOM-shaped death in this window.');
+    console.log('        Every death here was the watchdog choosing to restart.');
+  }
+}
+
 async function fetchEvents(serviceId, key, pages = 6) {
   const out = [];
   let cursor = '';
@@ -301,12 +428,41 @@ async function fetchEvents(serviceId, key, pages = 6) {
 }
 
 async function main() {
-  if (flag('help') || (!flag('once') && !flag('report') && !flag('restarts'))) {
+  if (flag('help') || (!flag('once') && !flag('report') && !flag('restarts') && !flag('deaths'))) {
     console.log(
-      'usage: tra4158-heap-series.mjs (--once | --report | --restarts) [--tape=<path>] [--base=<url>]\n' +
-        '       --restarts [--since=<iso>] [--pages=<n>]  needs RENDER_API_KEY (+ RENDER_SERVICE_ID or --service=)',
+      'usage: tra4158-heap-series.mjs (--once | --report | --restarts | --deaths) [--tape=<path>] [--base=<url>]\n' +
+        '       --restarts [--since=<iso>] [--pages=<n>]  needs RENDER_API_KEY (+ RENDER_SERVICE_ID or --service=)\n' +
+        '       --deaths   [--since=<iso>] [--owner=<id>] partition deaths by mode; needs the same, plus an owner id',
     );
     process.exit(2);
+  }
+
+  if (flag('deaths')) {
+    const key = process.env.RENDER_API_KEY;
+    const serviceId = arg('service', process.env.RENDER_SERVICE_ID);
+    const since = arg('since', '') || new Date(Date.now() - 7 * 86_400_000).toISOString();
+    if (!key || !serviceId) {
+      console.error('[tra4158] BLIND — RENDER_API_KEY and RENDER_SERVICE_ID (or --service=) are required');
+      process.exit(3);
+    }
+    try {
+      // The logs API rejects a query with no ownerId (HTTP 400), and the owner is
+      // not derivable from the service id, so resolve it rather than hard-code it.
+      let ownerId = arg('owner', process.env.RENDER_OWNER_ID ?? '');
+      if (!ownerId) {
+        const res = await fetch('https://api.render.com/v1/owners?limit=1', {
+          headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' },
+          signal: AbortSignal.timeout(30_000),
+        });
+        if (!res.ok) throw new Error(`owners -> HTTP ${res.status}`);
+        ownerId = (await res.json())?.[0]?.owner?.id ?? '';
+        if (!ownerId) throw new Error('could not resolve a Render owner id — pass --owner=');
+      }
+      reportDeaths(await fetchBootClassifications(serviceId, key, ownerId, since), since);
+    } catch (err) {
+      console.error(`[tra4158] BLIND — ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(3);
+    }
   }
 
   if (flag('restarts')) {

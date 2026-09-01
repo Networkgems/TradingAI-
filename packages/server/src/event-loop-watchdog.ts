@@ -502,6 +502,42 @@ export interface PersistedLiveness {
 }
 
 /**
+ * TRA-4158 — is the prior death UNEXPLAINED, i.e. is there no watchdog trip that
+ * accounts for it? Only then is "external kill suspected" the right story.
+ *
+ * The two breadcrumbs are written by two different clocks: `watchdog-last-trip.json`
+ * on the trip path, `watchdog-liveness.json` every `livenessIntervalMs`. After a
+ * GRACEFUL self-restart BOTH files exist, and the gap between them is not evidence
+ * of anything — it is just "how stale was the last heartbeat when the trip fired",
+ * which is uniform over [0, livenessIntervalMs].
+ *
+ * The original guard compared that gap against a flat 5s while the heartbeat
+ * interval defaults to 15s, so any graceful self-restart whose last heartbeat
+ * happened to be more than 5s old ALSO emitted the external-kill line. Measured on
+ * bqb1 over 2026-08-28..2026-09-01: 28 deaths, 14 of them double-classified, and
+ * ZERO standalone external-kill lines. A reader (CTO, off TRA-4264) reasonably read
+ * that tape as "two distinct death modes in the same tape" — it was ONE death mode
+ * reported twice, and it would have skewed any census that partitioned on it.
+ *
+ * A gap only means something relative to the clock that produced it, so the
+ * threshold is the heartbeat interval itself plus one interval of slack — the very
+ * block that trips the watchdog also delays the heartbeat that precedes it, so a
+ * legitimate self-restart can show a gap somewhat wider than one nominal interval.
+ */
+export function isUnexplainedDeath(args: {
+  lastTripAtMs: number | null;
+  priorLivenessAtMs: number | null;
+  livenessIntervalMs: number;
+}): boolean {
+  // No liveness breadcrumb at all: nothing to attribute, so nothing to shout about.
+  if (args.priorLivenessAtMs == null) return false;
+  // A heartbeat with NO trip beside it is the real external-kill signature.
+  if (args.lastTripAtMs == null) return true;
+  const gapMs = Math.abs(args.priorLivenessAtMs - args.lastTripAtMs);
+  return gapMs > args.livenessIntervalMs * 2;
+}
+
+/**
  * Resolve the trip-breadcrumb path to `<DATA_DIR>/watchdog-last-trip.json` (the
  * Render persistent disk, so it survives the restart), or an explicit
  * WATCHDOG_TRIP_LOG_PATH override. Returns null when NEITHER is configured —
@@ -1299,6 +1335,11 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
   const startedAtMs = now();
   const state: WatchdogState = { consecutiveHeapBreaches: 0, consecutiveLagBreaches: 0 };
 
+  // TRA-4158 — resolved BEFORE the boot-classification lines below, which compare a
+  // breadcrumb gap against it. It used to be computed after them, which is why that
+  // comparison ran against a hard-coded 5s instead of the interval that produces the gap.
+  const livenessIntervalMs = envNum(opts.env?.[WATCHDOG_LIVENESS_INTERVAL_MS_VAR] ?? process.env[WATCHDOG_LIVENESS_INTERVAL_MS_VAR], 15_000, 1_000, 300_000);
+
   // TRA-1463 — surface the PRIOR self-restart's cause (persisted to the DATA_DIR
   // breadcrumb before the last exit). Read once at boot; immutable thereafter.
   const lastTrip = readLastTrip(opts.env);
@@ -1319,11 +1360,14 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
   // so only this boot-time snapshot reflects the DEAD instance's final state).
   const priorLiveness = readLastLiveness(opts.env);
   if (priorLiveness) {
-    const gapFromTrip = lastTrip ? Math.abs(priorLiveness.atMs - lastTrip.atMs) : null;
-    // Only shout about it when there is NO matching graceful trip — that is the
-    // external-kill case this breadcrumb exists to catch. (A graceful self-restart
-    // writes both files within the same second; suppress the redundant line then.)
-    if (!lastTrip || (gapFromTrip != null && gapFromTrip > 5_000)) {
+    // TRA-4158 — only shout when NO trip explains the death. The gap is measured
+    // against the heartbeat interval that produced it, not a flat constant; see
+    // `isUnexplainedDeath` for the 14-of-28 double-classification this fixes.
+    if (isUnexplainedDeath({
+      lastTripAtMs: lastTrip?.atMs ?? null,
+      priorLivenessAtMs: priorLiveness.atMs,
+      livenessIntervalMs,
+    })) {
       log.warn('prior process died WITHOUT a watchdog trip — external kill (SIGKILL 137 / health-check SIGTERM) suspected', {
         lastAliveUptimeSec: priorLiveness.uptimeSec,
         lastAliveRssMB: priorLiveness.rssMB,
@@ -1333,7 +1377,6 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
       });
     }
   }
-  const livenessIntervalMs = envNum(opts.env?.[WATCHDOG_LIVENESS_INTERVAL_MS_VAR] ?? process.env[WATCHDOG_LIVENESS_INTERVAL_MS_VAR], 15_000, 1_000, 300_000);
   let lastLivenessWriteMs = 0;
 
   // ns-resolution event-loop delay histogram. Reset each window so lag reflects
