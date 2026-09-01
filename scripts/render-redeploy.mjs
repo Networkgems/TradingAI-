@@ -96,6 +96,12 @@
 //   --allow-rollback="reason"  deploy something OLDER than what is serving anyway. Fifth
 //                       and last, and the only one whose hazard is created by the caller
 //                       typing MORE, not less — see the gate note below.
+//   --override-hold="<TRA-####> reason"  deploy past an open REPO-RESIDENT HOLD in
+//                       ops/deploy-hold.json anyway. Sixth override, and the only one that
+//                       demands the TICKET as well as a reason — the other five guard a
+//                       condition this script can itself measure (a clock, a sha, a secret),
+//                       so a bare reason is enough; this one guards a DECISION somebody else
+//                       is holding, and naming it is the cheapest proof the hold was read.
 //   --dry-run           print the gate decision and the intended call, POST nothing.
 //
 // ── Exit codes ────────────────────────────────────────────────────────────────
@@ -106,8 +112,12 @@
 //   6  REFUSED — the deploy would carry a HELD COMMIT, or it cannot be proven not to
 //   7  REFUSED — the host's live AUTH_SECRET is unusable, or it cannot be READ (BLIND)
 //   8  REFUSED — the deploy would ROLL THE HOST BACK, or it cannot be proven not to
+//   9  REFUSED — an open hold in ops/deploy-hold.json covers this service, or that file
+//      exists and cannot be trusted (BLIND). Runs FIRST, before RENDER_API_KEY is read and
+//      before any byte reaches Render — TRA-4261.
 
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { classifyAuthSecret } from './lib/auth-secret-predicate.mjs';
 // The shallow-graft ancestry grader (TRA-3699, moved to lib by TRA-3721). Imported for
@@ -512,6 +522,191 @@ export function commitHoldState(now, target, table = COMMIT_HOLDS) {
   return { verdict: 'CLEAR', hold: null, active, target, why: null };
 }
 
+// ── Gate −1: the repo-resident DEPLOY HOLD (TRA-4261) ─────────────────────────
+// Every gate above is a TABLE IN THIS FILE. That is right for the ones it is right for —
+// the RTH window is a property of the market, and a commit hold is keyed on a sha nobody
+// can write without a commit. It is wrong for the case this gate exists for: a hold that
+// is opened and closed by a BOARD DECISION on a running week, by whoever is holding the
+// ticket, possibly not the owner of this script.
+//
+// THE CONDITION THAT PRODUCED IT (TRA-4261, off TRA-4217, 2026-09-01). `e1dbf341`
+// (TRA-4218) landed on main. It runs at SNAPSHOT IMPORT — at boot — and on the three open
+// real-money rows in Tradier ***0154 it deletes `closeRejectCount`, drops the
+// `close_reject` `exitBreakerTrip`, and re-arms the exit path through one backoff step.
+// This script ships the TIP, not a pin. So any owner deploying bqb1 for an entirely
+// unrelated reason performed that migration on live money — and NOTHING IN THE REPO SAID
+// SO. The only signal was prose in a ticket thread, and prose in a ticket thread is not a
+// gate: it does not execute, and it is not discoverable from the code you are shipping.
+//
+// WHY A FILE AND NOT ANOTHER TABLE HERE. Three properties a table cannot have:
+//   1. `git log ops/deploy-hold.json` is the hold's whole history, in one command, with
+//      no ticket access. A table row is buried in the diff of a 1400-line script.
+//   2. It ships on the tip, so the artefact and the warning about the artefact travel
+//      together. Editing it is a one-file diff a reviewer can read in ten seconds.
+//   3. It has no `until`. EMBARGOES and COMMIT_HOLDS are self-expiring because they
+//      protect a measurement that finishes. This protects a DECISION that has not been
+//      taken, and a decision does not expire on a clock — inventing an expiry for it would
+//      hand the answer to the calendar. It clears when somebody deletes the entry, which
+//      is a recorded, attributable act.
+//
+// FAILS CLOSED, in the same spirit as gates 2 and 4. Unparseable JSON, a non-array
+// `holds`, or a hold missing a required field is BLIND ⇒ REFUSE. A hold file that
+// silently degrades to "allowed" the moment somebody fat-fingers a comma is not a hold.
+// The one thing that reads CLEAR is an ABSENT file or an EMPTY `holds` array, and that is
+// deliberate: it is the state this repo was in before this commit, and AC2 of TRA-4261 is
+// that behaviour with no hold present is unchanged.
+//
+// ⚠ NAMED LIMITATION, so nobody reads more into this than it does: the hold is a
+// convention, not a permission system. Anyone who can deploy can delete the file. That is
+// accepted on purpose and is the same reason `--override-hold` exists at all — a hold that
+// cannot be broken gets deleted instead of respected, and a deletion leaves a much worse
+// record than an override does. What this gate buys is that the deploy is a DECISION
+// somebody took and signed, instead of a side effect nobody saw.
+export const DEPLOY_HOLD_FILE = 'ops/deploy-hold.json';
+const DEPLOY_HOLD_REQUIRED_FIELDS = ['ticket', 'reason', 'openedAt', 'openedBy', 'emits'];
+
+// Read + VALIDATE the hold file. Separated from the predicate below so the predicate stays
+// pure and the control suite can drive it with injected rows (the TRA-3699 lesson: a
+// commit-hold suite that injected every input never once reached the real predicate).
+// Returns { verdict: 'CLEAR' | 'HOLDS' | 'BLIND', holds, why, path }.
+export function readDeployHolds(root = REPO_ROOT, file = DEPLOY_HOLD_FILE) {
+  const path = new URL(file, pathToFileURL(root.endsWith('/') ? root : `${root}/`));
+  let raw;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch (err) {
+    // ENOENT is the ONLY clear read. Anything else (EACCES, EISDIR, an I/O error) is a
+    // file we cannot rule out the contents of, and that is BLIND, not clear.
+    if (err && err.code === 'ENOENT') return { verdict: 'CLEAR', holds: [], why: null, path: file };
+    return { verdict: 'BLIND', holds: [], why: `${file} could not be read (${err?.code ?? err?.message ?? err})`, path: file };
+  }
+  let doc;
+  try {
+    doc = JSON.parse(raw);
+  } catch (err) {
+    return { verdict: 'BLIND', holds: [], why: `${file} is not valid JSON (${err?.message ?? err})`, path: file };
+  }
+  const holds = doc?.holds;
+  if (!Array.isArray(holds)) {
+    return { verdict: 'BLIND', holds: [], why: `${file} has no \`holds\` array (found ${typeof holds})`, path: file };
+  }
+  for (const [i, h] of holds.entries()) {
+    if (!h || typeof h !== 'object') {
+      return { verdict: 'BLIND', holds: [], why: `${file} holds[${i}] is not an object`, path: file };
+    }
+    const missing = DEPLOY_HOLD_REQUIRED_FIELDS.filter(k => {
+      const v = h[k];
+      if (k === 'emits') return !Array.isArray(v) || v.length === 0;
+      return typeof v !== 'string' || !v.trim();
+    });
+    if (missing.length) {
+      return {
+        verdict: 'BLIND',
+        holds: [],
+        // Name the ticket if we can read it — a refusal that says "holds[0]" makes the
+        // operator open the file to find out who to talk to.
+        why: `${file} holds[${i}]${typeof h.ticket === 'string' ? ` (${h.ticket})` : ''} is missing required field(s): ${missing.join(', ')}`,
+        path: file,
+      };
+    }
+  }
+  return { verdict: holds.length ? 'HOLDS' : 'CLEAR', holds, why: null, path: file };
+}
+
+// Which Render service is this invocation ACTUALLY going to talk to, decided WITHOUT the
+// network? Mirrors resolveService() exactly, including its precedence: RENDER_SERVICE_ID
+// wins outright and the name is not consulted. Mirroring rather than re-deriving is the
+// point — a scoping rule that disagrees with the resolver is a hold on the wrong host.
+export function requestedServiceRef(idEnv = SERVICE_ID_ENV, nameEnv = SERVICE_NAME) {
+  return idEnv ? { kind: 'id', value: idEnv } : { kind: 'name', value: nameEnv };
+}
+
+// Does `hold` cover the service this invocation is aimed at? A hold with no `service` key
+// covers EVERY service — that is the fail-closed default, so an under-specified hold holds
+// too much rather than too little.
+export function deployHoldCoversService(hold, ref) {
+  const scope = hold?.service;
+  if (!scope || (!Array.isArray(scope.ids) && !Array.isArray(scope.names))) return true;
+  const eq = (a, b) => String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
+  const list = ref.kind === 'id' ? scope.ids : scope.names;
+  return Array.isArray(list) && list.some(v => eq(v, ref.value));
+}
+
+// The predicate main() evaluates. Pure: no fs, no network, no clock (a hold has no expiry
+// on purpose — see the block comment above).
+//   BLIND     the file exists and could not be trusted  ⇒ REFUSE
+//   HELD      at least one hold covers this service     ⇒ REFUSE
+//   OUT_OF_SCOPE  holds exist, none covers this service ⇒ proceed, but SAY SO
+//   CLEAR     no holds at all                           ⇒ proceed silently (AC2)
+export function deployHoldState(read, ref) {
+  if (read.verdict === 'BLIND') return { verdict: 'BLIND', applicable: [], skipped: [], why: read.why, ref };
+  const applicable = read.holds.filter(h => deployHoldCoversService(h, ref));
+  const skipped = read.holds.filter(h => !deployHoldCoversService(h, ref));
+  if (applicable.length) return { verdict: 'HELD', applicable, skipped, why: null, ref };
+  if (skipped.length) return { verdict: 'OUT_OF_SCOPE', applicable, skipped, why: null, ref };
+  return { verdict: 'CLEAR', applicable, skipped, why: null, ref };
+}
+
+export function deployHoldBlocks(verdict) {
+  return verdict === 'HELD' || verdict === 'BLIND';
+}
+
+// The TRA-NNNN tokens an --override-hold reason must name at least one of. Requiring the
+// ticket is not ceremony: it is the cheapest available proof that the operator read the
+// hold they are breaking rather than pasting the flag out of the usage text. It costs
+// seconds to satisfy, so it does not stand between anyone and a genuine emergency.
+// A hold whose `ticket` carries no TRA token contributes no requirement — this gate does
+// not invent a lock it cannot state.
+export function deployHoldOverrideTokens(holds) {
+  const out = new Set();
+  for (const h of holds) for (const m of String(h.ticket).matchAll(/TRA-\d+/g)) out.add(m[0]);
+  return [...out];
+}
+
+export function deployHoldOverrideNames(reason, tokens) {
+  if (tokens.length === 0) return true;
+  const r = String(reason).toUpperCase();
+  return tokens.some(t => r.includes(t));
+}
+
+export function renderDeployHoldRefusal(state, { file = DEPLOY_HOLD_FILE } = {}) {
+  if (state.verdict === 'BLIND') {
+    return (
+      `[render-redeploy] REFUSED: the deploy-hold file exists and CANNOT BE TRUSTED, so this gate\n` +
+      `  is BLIND and fails closed — TRA-4261.\n` +
+      `  file    : ${file}\n` +
+      `  blind   : ${state.why}\n` +
+      `  A hold file that degrades to "allowed" when it is malformed is not a hold. FIX THE FILE\n` +
+      `  (every hold needs ticket, reason, openedAt, openedBy and a non-empty emits[]), or, if the\n` +
+      `  deploy genuinely cannot wait, re-run with --override-hold="TRA-#### why" (recorded).`
+    );
+  }
+  const lines = [
+    `[render-redeploy] REFUSED: this host is under a REPO-RESIDENT DEPLOY HOLD — TRA-4261.`,
+    `  file    : ${file}  (${state.applicable.length} hold(s) apply to ${state.ref.kind}=${state.ref.value})`,
+  ];
+  for (const h of state.applicable) {
+    lines.push('');
+    lines.push(`  ── ${h.ticket} — opened ${h.openedAt} by ${h.openedBy}`);
+    // VERBATIM, unwrapped, unsummarised. The reason is the whole point of the gate; a
+    // refusal that paraphrases it is a refusal the operator has to go and check.
+    lines.push(`  ${h.reason}`);
+    lines.push(`  WHAT A DEPLOY WOULD EMIT:`);
+    for (const e of h.emits) lines.push(`    ⚠ ${e}`);
+    if (h.clearedBy) lines.push(`  CLEARED BY: ${h.clearedBy}`);
+  }
+  lines.push('');
+  lines.push(
+    `  This gate runs BEFORE the Render API is contacted and before RENDER_API_KEY is even read,\n` +
+      `  so nothing has been asked of Render and no deploy exists. It is NOT the RTH freeze and NOT\n` +
+      `  a dated embargo: waiting until 20:00Z does not clear it. It clears when somebody DELETES the\n` +
+      `  entry from ${file} — a recorded, attributable act — or when it is broken with\n` +
+      `  --override-hold="<TRA-####> why this cannot wait", which is echoed into this command's own\n` +
+      `  output so the breach is on the record.`,
+  );
+  return lines.join('\n');
+}
+
 // ── The env-write escape hatch underneath Gate 0 (TRA-2306) ───────────────────
 // Gate 0 (AUTH_SECRET, exit 7) runs BEFORE the commit-hold and embargo gates, and its
 // remediation — "set a real AUTH_SECRET on the service" — is an ENV WRITE. It exits before
@@ -869,6 +1064,8 @@ const HAS_AUTH_SECRET_OVERRIDE = argv.some(
 );
 const ROLLBACK_OVERRIDE_REASON = valOf('--allow-rollback');
 const HAS_ROLLBACK_OVERRIDE = argv.some(a => a === '--allow-rollback' || a.startsWith('--allow-rollback='));
+const HOLD_OVERRIDE_REASON = valOf('--override-hold');
+const HAS_HOLD_OVERRIDE = argv.some(a => a === '--override-hold' || a.startsWith('--override-hold='));
 
 function fail(code, msg) {
   console.error(`[render-redeploy] ERROR: ${msg}`);
@@ -1073,6 +1270,69 @@ export function embargoState(now, table = EMBARGOES) {
 }
 
 async function main() {
+  // ── Gate −1: the repo-resident deploy hold (TRA-4261) ───────────────────────
+  // FIRST, ahead of the API key check and therefore ahead of every byte on the wire. Two
+  // reasons, and the second is the one that matters:
+  //   1. It is the only gate that needs nothing from the network, so making the operator
+  //      supply a key before being told they may not deploy is pure friction.
+  //   2. AC1 of TRA-4261 is that the refusal lands BEFORE Render is contacted. Running it
+  //      here makes that structural rather than a claim: at this point in main() no fetch
+  //      has been issued and no deploy object exists anywhere.
+  // It is NOT scoped to isSoakHost, because isSoakHost is only knowable after a Render
+  // round-trip. Scope lives in the hold's own `service` block and is evaluated against the
+  // service ref this invocation is aimed at (see requestedServiceRef, which mirrors
+  // resolveService's precedence exactly).
+  const holdRead = readDeployHolds();
+  const holdRef = requestedServiceRef();
+  const deployHold = deployHoldState(holdRead, holdRef);
+
+  if (deployHoldBlocks(deployHold.verdict) && !HAS_HOLD_OVERRIDE) {
+    console.error(renderDeployHoldRefusal(deployHold));
+    process.exit(9);
+  }
+
+  if (deployHoldBlocks(deployHold.verdict) && HAS_HOLD_OVERRIDE) {
+    if (!HOLD_OVERRIDE_REASON || !HOLD_OVERRIDE_REASON.trim()) {
+      fail(2, '--override-hold requires a non-empty reason, e.g. --override-hold="TRA-4217 board cleared it on card 438ed4c5".');
+    }
+    const tokens = deployHoldOverrideTokens(deployHold.applicable);
+    if (!deployHoldOverrideNames(HOLD_OVERRIDE_REASON, tokens)) {
+      fail(
+        2,
+        `--override-hold must NAME the hold it breaks. Active hold(s): ${tokens.join(', ')}. ` +
+          `Re-run with the ticket in the reason, e.g. --override-hold="${tokens[0]} why this cannot wait". ` +
+          `Got: "${HOLD_OVERRIDE_REASON}".`,
+      );
+    }
+    // Echoed on the way IN, before anything is deployed, so the breach is in the same
+    // scrollback as the deploy it authorised and not appended after the fact.
+    console.error(
+      `[render-redeploy] ⚠ OVERRIDING ${
+        deployHold.verdict === 'BLIND' ? 'an UNREADABLE deploy-hold file' : `${deployHold.applicable.length} REPO-RESIDENT DEPLOY HOLD(S)`
+      } at ${new Date().toISOString()} — TRA-4261.\n` +
+        `  override: --override-hold="${HOLD_OVERRIDE_REASON}"\n` +
+        (deployHold.verdict === 'BLIND'
+          ? `  blind   : ${deployHold.why}\n`
+          : deployHold.applicable
+              .map(h => `  broken  : ${h.ticket} (opened ${h.openedAt} by ${h.openedBy})\n  emits   : ${h.emits.join('\n            ')}\n`)
+              .join('')) +
+        `  Tell the hold's owner BEFORE the box boots, not after. If the hold is genuinely dead,\n` +
+        `  delete the entry from ${DEPLOY_HOLD_FILE} in a commit — an override is a breach on the\n` +
+        `  record, not a way to leave a stale hold standing.`,
+    );
+  }
+
+  // Holds exist but none covers this service. Not a refusal, and deliberately not silent:
+  // "I read the hold file and it does not apply to you" is a different fact from "there is
+  // no hold file", and an operator who is one identity field from the money host should be
+  // told which one they got.
+  if (deployHold.verdict === 'OUT_OF_SCOPE') {
+    console.log(
+      `[render-redeploy] NOTE: ${deployHold.skipped.length} deploy hold(s) in ${DEPLOY_HOLD_FILE} ` +
+        `(${deployHold.skipped.map(h => h.ticket).join(', ')}) do NOT cover ${holdRef.kind}=${holdRef.value}. TRA-4261.`,
+    );
+  }
+
   if (!API_KEY) fail(2, 'RENDER_API_KEY is required (never commit it).');
 
   const service = await resolveService();

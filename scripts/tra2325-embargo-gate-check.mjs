@@ -27,6 +27,14 @@ import {
   gradeCarries,
   carriesFromVerdict,
   isShallowCheckout,
+  readDeployHolds,
+  deployHoldState,
+  deployHoldBlocks,
+  deployHoldCoversService,
+  deployHoldOverrideTokens,
+  deployHoldOverrideNames,
+  requestedServiceRef,
+  DEPLOY_HOLD_FILE,
   EMBARGOES,
   COMMIT_HOLDS,
   DEPLOY_LEAD_MIN,
@@ -266,8 +274,130 @@ const NOTE_CASES = [
   [pin('nosuch'), FULL.D, 'QUIET', 'unanswerable ancestry must not manufacture a note'],
 ];
 
+// ── Gate −1: the repo-resident deploy hold (TRA-4261) ────────────────────────
+// Same discipline as every section above: each REFUSE case is paired with a PROCEED case
+// differing by ONE variable, and the run fails if any verdict is unreachable.
+//
+// ⚠ THE TRA-3699 LESSON IS APPLIED HERE DELIBERATELY. That defect shipped because every
+// commit-hold case INJECTED its input, so the suite never once reached the real predicate.
+// So this section drives `readDeployHolds` against the REAL FILE ON DISK as well (the
+// LIVE arm at the bottom) — an injected `holds` array grades the scoping and validation
+// logic, and only a real read grades the reader.
+const HELD_ROW = {
+  ticket: 'TRA-0000',
+  reason: 'fixture',
+  openedAt: '2026-09-01T00:00:00Z',
+  openedBy: 'fixture',
+  emits: ['fixture'],
+  service: { ids: ['srv-money'], names: ['MoneyHost', 'money-host'] },
+};
+const UNSCOPED_ROW = { ...HELD_ROW, ticket: 'TRA-0001', service: undefined };
+const NO_TICKET_ROW = { ...HELD_ROW, ticket: 'the friday hold', service: undefined };
+const read = (verdict, holds, why = null) => ({ verdict, holds, why, path: DEPLOY_HOLD_FILE });
+
+const dhVerdict = (r, ref) => {
+  const st = deployHoldState(r, ref);
+  return deployHoldBlocks(st.verdict) ? `REFUSE_${st.verdict}` : st.verdict;
+};
+
+const REF_MONEY_ID = { kind: 'id', value: 'srv-money' };
+const REF_MONEY_NAME = { kind: 'name', value: 'money-host' };
+const REF_OTHER_ID = { kind: 'id', value: 'srv-elsewhere' };
+const REF_OTHER_NAME = { kind: 'name', value: 'elsewhere' };
+
+const DEPLOY_HOLD_CASES = [
+  // The absent file — the state the repo was in before TRA-4261, and AC2's subject.
+  [read('CLEAR', []), REF_MONEY_ID, 'CLEAR', 'no hold file at all — must be indistinguishable from before this gate existed'],
+  [read('HOLDS', []), REF_MONEY_ID, 'CLEAR', 'file present with an EMPTY holds[] — the cleared state, still silent'],
+  // The refusals.
+  [read('HOLDS', [HELD_ROW]), REF_MONEY_ID, 'REFUSE_HELD', 'hold scoped BY ID to the host being deployed'],
+  [read('HOLDS', [HELD_ROW]), REF_MONEY_NAME, 'REFUSE_HELD', 'same hold reached by NAME/slug — TRA-3743: the money host answers to three strings'],
+  [read('HOLDS', [UNSCOPED_ROW]), REF_OTHER_ID, 'REFUSE_HELD', 'a hold with NO service block covers EVERY service — under-specified must hold too MUCH, not too little'],
+  [read('BLIND', [], 'not valid JSON'), REF_OTHER_ID, 'REFUSE_BLIND', 'an unreadable hold file refuses even for a service no hold names — we cannot know what it said'],
+  // ⚠ THE ONE-SIDEDNESS CONTROL. If these went REFUSE the gate would be a brick, and a
+  // brick passes every refusal test above.
+  [read('HOLDS', [HELD_ROW]), REF_OTHER_ID, 'OUT_OF_SCOPE', 'scoped hold, DIFFERENT service by id — must not refuse'],
+  [read('HOLDS', [HELD_ROW]), REF_OTHER_NAME, 'OUT_OF_SCOPE', 'scoped hold, DIFFERENT service by name — must not refuse'],
+];
+
+// The override predicate. Separated because it is the half that must NOT be a brick: a
+// hold that cannot be broken gets deleted instead of respected.
+const OVERRIDE_CASES = [
+  [[HELD_ROW], 'TRA-0000 board cleared it', true, 'names the active hold — accepted'],
+  [[HELD_ROW], 'tra-0000 board cleared it', true, 'case-insensitive: the operator should not have to shout'],
+  [[HELD_ROW], 'just ship it', false, 'a bare reason does NOT break a hold — name the ticket you are breaking'],
+  [[HELD_ROW], 'TRA-9999 wrong ticket', false, 'naming SOME ticket is not naming THIS one'],
+  [[HELD_ROW, UNSCOPED_ROW], 'TRA-0001 only this one', true, 'two holds, one named — permitted, and the WARNING lists both'],
+  [[NO_TICKET_ROW], 'because the box is down', true, 'a hold whose ticket carries no TRA token states no requirement — the gate must not invent a lock it cannot print'],
+];
+
 let pass = 0;
 const failures = [];
+for (const [r, ref, expected, why] of DEPLOY_HOLD_CASES) {
+  const got = dhVerdict(r, ref);
+  const label = `${ref.kind}=${ref.value}`;
+  if (got === expected) {
+    pass += 1;
+    console.log(`  ok   ${label.padEnd(22)} ${got.padEnd(20)} ${why}`);
+  } else {
+    failures.push({ iso: `deploy-hold ${label}`, expected, got, why });
+    console.log(`  FAIL ${label.padEnd(22)} expected ${expected}, got ${got}  — ${why}`);
+  }
+}
+
+const dhProduced = new Set(DEPLOY_HOLD_CASES.map(([r, ref]) => dhVerdict(r, ref)));
+const dhMissing = ['CLEAR', 'OUT_OF_SCOPE', 'REFUSE_HELD', 'REFUSE_BLIND'].filter(v => !dhProduced.has(v));
+
+for (const [holds, reason, expected, why] of OVERRIDE_CASES) {
+  const got = deployHoldOverrideNames(reason, deployHoldOverrideTokens(holds));
+  if (got === expected) {
+    pass += 1;
+    console.log(`  ok   override            ${String(got).padEnd(20)} ${why}`);
+  } else {
+    failures.push({ iso: 'deploy-hold override', expected, got, why });
+    console.log(`  FAIL override            expected ${expected}, got ${got}  — ${why}`);
+  }
+}
+
+const ovProduced = new Set(OVERRIDE_CASES.map(([h, r]) => deployHoldOverrideNames(r, deployHoldOverrideTokens(h))));
+const ovMissing = [true, false].filter(v => !ovProduced.has(v)).map(v => `override:${v}`);
+
+// ── LIVE arm: the real file, the real reader, the real service ref ───────────
+// Injected rows cannot grade the READER, and the reader is where a fail-open would hide
+// (TRA-3699). This runs the shipped path against whatever is actually committed. It
+// asserts a PROPERTY, never a specific hold — the suite must stay green after the
+// TRA-4217 hold is cleared, or it becomes a reason not to clear it.
+{
+  const liveRead = readDeployHolds();
+  const liveOk =
+    ['CLEAR', 'HOLDS', 'BLIND'].includes(liveRead.verdict) &&
+    Array.isArray(liveRead.holds) &&
+    liveRead.verdict !== 'BLIND';
+  if (liveOk) {
+    pass += 1;
+    console.log(
+      `  ok   live-read            ${liveRead.verdict.padEnd(20)} ${DEPLOY_HOLD_FILE} parses and validates (${liveRead.holds.length} hold(s))`,
+    );
+  } else {
+    failures.push({
+      iso: 'deploy-hold live-read',
+      expected: 'CLEAR|HOLDS',
+      got: liveRead.verdict,
+      why: liveRead.why ?? 'the committed hold file must be readable by its own reader',
+    });
+    console.log(`  FAIL live-read            got ${liveRead.verdict} — ${liveRead.why ?? 'unreadable'}`);
+  }
+  // And the ref this checkout would actually be scoped against, printed so a reader can
+  // see WHICH host the live holds are being graded for.
+  const ref = requestedServiceRef();
+  console.log(`  note live-ref             ${ref.kind}=${ref.value} → ${deployHoldState(liveRead, ref).verdict}`);
+  // Every committed hold must state a scope the coverage predicate can actually evaluate.
+  for (const h of liveRead.holds) {
+    const covers = deployHoldCoversService(h, ref);
+    console.log(`  note live-hold            ${h.ticket} covers ${ref.kind}=${ref.value}: ${covers}`);
+  }
+}
+
 for (const [iso, target, isSoak, expected, why] of WARN_CASES) {
   const got = warnVerdict(iso, target, isSoak);
   if (got === expected) {
@@ -441,8 +571,26 @@ const noteProduced = new Set(NOTE_CASES.map(([t, s]) => noteVerdict(t, s)));
 const noteMissing = ['NOTED', 'QUIET'].filter(v => !noteProduced.has(v));
 
 const TOTAL =
-  CASES.length + HOLD_CASES.length + WARN_CASES.length + ROLLBACK_CASES.length + NOTE_CASES.length + CARRY_CASES.length + 1;
-const allMissing = [...missing, ...holdMissing, ...warnMissing, ...rbMissing, ...noteMissing, ...carryMissing];
+  CASES.length +
+  HOLD_CASES.length +
+  WARN_CASES.length +
+  ROLLBACK_CASES.length +
+  NOTE_CASES.length +
+  CARRY_CASES.length +
+  DEPLOY_HOLD_CASES.length +
+  OVERRIDE_CASES.length +
+  1 + // the blind-shallow composition case
+  1; // the deploy-hold LIVE read
+const allMissing = [
+  ...missing,
+  ...holdMissing,
+  ...warnMissing,
+  ...rbMissing,
+  ...noteMissing,
+  ...carryMissing,
+  ...dhMissing,
+  ...ovMissing,
+];
 
 console.log('');
 console.log(`freeze  : ${FREEZE_OPEN_MIN}–${FREEZE_CLOSE_MIN} UTC min-of-day (lead ${DEPLOY_LEAD_MIN} min)`);
@@ -450,9 +598,10 @@ console.log(`embargos: ${EMBARGOES.length} row(s) — ${EMBARGOES.map(e => `${e.
 console.log(
   `holds   : ${COMMIT_HOLDS.length} row(s) — ${COMMIT_HOLDS.map(h => `${h.commit.slice(0, 7)}→${h.until} (${h.ticket})`).join(', ')}`,
 );
+console.log(`dholds  : ${DEPLOY_HOLD_FILE} — ${readDeployHolds().holds.map(h => h.ticket).join(', ') || 'none'} (TRA-4261)`);
 console.log(`cases   : ${pass}/${TOTAL} pass`);
 console.log(
-  `verdicts: reached ${[...new Set([...produced, ...holdProduced, ...warnProduced, ...rbProduced, ...noteProduced, ...carryProduced])].sort().join(', ')}`,
+  `verdicts: reached ${[...new Set([...produced, ...holdProduced, ...warnProduced, ...rbProduced, ...noteProduced, ...carryProduced, ...dhProduced])].sort().join(', ')}`,
 );
 console.log(`checkout: ${isShallowCheckout() ? 'SHALLOW — a negative ancestry answer is BLIND here (TRA-3699)' : 'complete'}`);
 
@@ -464,6 +613,6 @@ if (failures.length) {
   console.error(`[tra2325] FAIL: ${failures.length} case(s) failed.`);
   process.exit(1);
 }
-console.log('[tra2325] PASS — freeze, embargo, commit-hold, rollback and stale-pin all discriminate,');
+console.log('[tra2325] PASS — freeze, embargo, commit-hold, rollback, stale-pin and deploy-hold all discriminate,');
 console.log('[tra2325] and every verdict is reachable.');
 process.exit(0);

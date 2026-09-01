@@ -1,0 +1,22 @@
+{
+  "_readme": "TRA-4261 — the repo-resident deploy hold read by scripts/render-redeploy.mjs. See ops/README-deploy-hold.md for the shape and the rules. This file is on the TIP, so it ships with whatever ships and is discoverable by `git log ops/deploy-hold.json` and by grep — not only by whoever happened to read a ticket thread. An empty `holds` array is the cleared state; DELETING the file is also the cleared state. Every gate in render-redeploy.mjs fails CLOSED, and so does this one: an unparseable file or a hold missing a required field REFUSES, it does not degrade to allowed.",
+  "holds": [
+    {
+      "ticket": "TRA-4217",
+      "openedAt": "2026-09-01T14:32:00Z",
+      "openedBy": "LeadDev (d3355d6d) — raised by CEO on TRA-4261, off TRA-4217",
+      "reason": "Deploying bqb1 right now RUNS THE TRA-4218 HEAL ON THREE OPEN REAL-MONEY ROWS. e1dbf341 is already an ancestor of origin/main and this script ships the TIP, not a pin (TRA-3888: a pinned --commit ages, drop it, ship the tip), so a deploy taken for any UNRELATED reason performs that migration on live money in production Tradier ***0154. The heal is not a code path that waits to be called: it runs at snapshot import, i.e. at boot, in OptionsAccount.importSnapshot (packages/server/src/options-account.ts, the TRA-4218 block). Whether that migration should run tonight is a board decision and it is NOT this gate's to make — it is card 438ed4c5 on TRA-4217, human_only. This hold exists so that the decision is TAKEN rather than inherited by whoever deploys next.",
+      "emits": [
+        "e1dbf341ae28c27159f884ffd0f21a568626f751 (TRA-4218) boots into OptionsAccount.importSnapshot and, for every open row whose exitErrorReason matches TRANSPORT_STRANDED_REASON_RE (5xx / 429 / 408 / fetch failure), DELETES closeRejectCount.",
+        "On the same rows it DELETES exitBreakerTrip where exitBreakerTrip.breaker === 'close_reject' (TRA-4225), which un-latches the close-reject breaker that is presently refusing the exits.",
+        "It then RE-ARMS through one backoff step: exitTransportFailCount = 1 and exitRetryNotBeforeMs = now + exitTransportBackoffMs(1). After that step expires the exit path is live again, so this is a change that can PLACE ORDERS, not merely a change to a counter.",
+        "Population as measured on 2026-08-31: ALL THREE open real-money OTM rows in production Tradier account ***0154, two of them under a BREACHED stop. There is no smaller blast radius available — the heal is unconditional on the rows that match."
+      ],
+      "service": {
+        "ids": ["srv-d7mb7rr7uimc73ev0chg"],
+        "names": ["TradingAI-", "tradingai-bqb1"]
+      },
+      "clearedBy": "The board answering card 438ed4c5 on TRA-4217. On `clear`: delete this entry in the same commit as the deploy carrier, so the hold and its release are one reviewable diff. On `hold`: leave it and say on TRA-4217 what the new condition is. Do NOT clear it because it is inconvenient — --override-hold exists for the genuine emergency and records itself."
+    }
+  ]
+}
