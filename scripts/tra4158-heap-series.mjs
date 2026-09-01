@@ -31,8 +31,17 @@
  *   node scripts/tra4158-heap-series.mjs --once            # append one row
  *   node scripts/tra4158-heap-series.mjs --report          # fold the tape
  *   node scripts/tra4158-heap-series.mjs --once --report   # both
+ *   node scripts/tra4158-heap-series.mjs --restarts        # boot-lifetime census
  *   --tape=<path>   default reports/tra4158-heap-series.jsonl
  *   --base=<url>    default https://tradingai-bqb1.onrender.com
+ *   --since=<iso>   --restarts only: scope the reachability stats to boots
+ *                   starting at or after this instant
+ *
+ * `--restarts` answers a question this ticket cannot skip: AC1 wants two heap
+ * reads on ONE boot, ~+1h and ~+8h apart, and whether such a boot exists is a
+ * measurement. It folds Render's event stream into boot segments and prints the
+ * fraction reaching each uptime. See `reportRestarts` for why a succeeded
+ * deploy has to count as a boundary.
  *
  * Exit codes: 0 OK · 2 usage · 3 BLIND (host unreachable / unparseable).
  * BLIND is never 0: "could not measure" and "measured and it is fine" must not
@@ -183,11 +192,141 @@ function report(rows) {
   }
 }
 
+/**
+ * Fold Render's service events into the census of BOOT SEGMENTS.
+ *
+ * Why this lives here and not in a notebook: AC1 asks for two heap reads on one
+ * boot, at ~+1h and ~+8h. Whether that pair is even OBTAINABLE is a property of
+ * how long this service stays up, and that is a measurement, not an assumption.
+ * Answering it by hand once produces a number that is stale the next day.
+ *
+ * Two boundaries, and using only one of them is the trap:
+ *
+ *  - `server_failed` — the container exited non-zero. This is what a watchdog
+ *    self-restart looks like from outside.
+ *  - `deploy_ended` with `deployStatus: succeeded` — Render swaps the instance
+ *    with NO `server_failed`/`server_available` pair at all. A deploy is
+ *    therefore an INVISIBLE boot boundary in the server_* stream, and a fold
+ *    that ignores it OVERSTATES lifetimes.
+ *
+ * The cross-check that this fold is right: the 2026-08-27T13:26 trip reported
+ * `uptimeSecAtTrip 88217` (24.505h) from inside the process. Segmenting on
+ * server_* alone dates that boot to 2026-08-25T20:15 (41.19h — wrong by 16.7h);
+ * counting the 2026-08-26T12:56:02 deploy as a boundary dates it to 24.51h,
+ * which matches the process's own clock. Prefer the process clock when present;
+ * this fold is what you get when the process is already gone.
+ */
+function reportRestarts(events, sinceIso) {
+  const P = s => Date.parse(s);
+  const bounds = [];
+  for (const e of events) {
+    if (e.type === 'server_available') bounds.push({ at: P(e.timestamp), iso: e.timestamp, kind: 'restart-boot' });
+    else if (e.type === 'deploy_ended' && e.details?.deployStatus === 'succeeded')
+      bounds.push({ at: P(e.timestamp), iso: e.timestamp, kind: 'deploy' });
+    else if (e.type === 'server_failed') bounds.push({ at: P(e.timestamp), iso: e.timestamp, kind: 'CRASH' });
+  }
+  bounds.sort((a, b) => a.at - b.at);
+
+  const segments = [];
+  let cur = null;
+  for (const b of bounds) {
+    if (b.kind === 'CRASH') {
+      if (cur) segments.push({ ...cur, endedBy: 'CRASH', hours: (b.at - cur.at) / 3_600_000 });
+      cur = null;
+    } else {
+      if (cur) segments.push({ ...cur, endedBy: b.kind, hours: (b.at - cur.at) / 3_600_000 });
+      cur = b;
+    }
+  }
+  if (cur) segments.push({ ...cur, endedBy: '(still up)', hours: (Date.now() - cur.at) / 3_600_000 });
+
+  const crashes = bounds.filter(b => b.kind === 'CRASH');
+  // RTH in UTC. The claim being tested is that this service only ever dies
+  // while the market is open; a crash count alone cannot show that.
+  const inRth = c => {
+    const hhmm = new Date(c.at).toISOString().slice(11, 16);
+    return hhmm >= '13:30' && hhmm < '20:00';
+  };
+  const firstTwoHours = c => {
+    const hhmm = new Date(c.at).toISOString().slice(11, 16);
+    return hhmm >= '13:30' && hhmm < '15:30';
+  };
+
+  const scope = sinceIso ? segments.filter(s => s.iso >= sinceIso) : segments;
+  const reachable = h => scope.filter(s => s.hours >= h).length;
+
+  console.log(`[tra4158] ${events.length} events -> ${segments.length} boot segment(s), ${crashes.length} crash(es)`);
+  if (sinceIso) console.log(`[tra4158] scoped to boots starting >= ${sinceIso}: ${scope.length}`);
+  console.log('');
+  console.log('  boot start            started-by     ended-by      lifetime_h');
+  for (const s of scope) {
+    console.log(
+      `  ${s.iso.slice(0, 19)}   ${s.kind.padEnd(13)} ${s.endedBy.padEnd(12)} ${s.hours.toFixed(2).padStart(9)}`,
+    );
+  }
+  console.log('');
+  console.log(`  crashes inside RTH 13:30-20:00Z .... ${crashes.filter(inRth).length}/${crashes.length}`);
+  console.log(`  crashes in first 2h 13:30-15:30Z ... ${crashes.filter(firstTwoHours).length}/${crashes.length}`);
+  console.log('');
+  // The AC1 verdict. A snapshot PAIR needs one boot to survive past the late
+  // read, so the +8h column is the one that decides whether AC1 as filed can be
+  // scheduled at all or only caught opportunistically.
+  for (const h of [1, 4, 8, 24]) {
+    const n = reachable(h);
+    const pct = scope.length ? ((n / scope.length) * 100).toFixed(0) : '0';
+    console.log(`  boots reaching +${String(h).padStart(2)}h uptime ... ${n}/${scope.length} (${pct}%)`);
+  }
+}
+
+async function fetchEvents(serviceId, key, pages = 6) {
+  const out = [];
+  let cursor = '';
+  for (let i = 0; i < pages; i += 1) {
+    const url =
+      `https://api.render.com/v1/services/${serviceId}/events?limit=100` + (cursor ? `&cursor=${cursor}` : '');
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!res.ok) throw new Error(`${url} -> HTTP ${res.status}`);
+    const page = await res.json();
+    if (!Array.isArray(page) || page.length === 0) break;
+    for (const row of page) out.push(row.event);
+    cursor = page[page.length - 1]?.cursor ?? '';
+    if (!cursor) break;
+  }
+  // The API pages newest-first and pages can overlap at the seam.
+  const seen = new Set();
+  return out.filter(e => (seen.has(e.id) ? false : (seen.add(e.id), true))).sort((a, b) => (a.timestamp < b.timestamp ? -1 : 1));
+}
+
 async function main() {
-  if (flag('help') || (!flag('once') && !flag('report'))) {
-    console.log('usage: tra4158-heap-series.mjs (--once | --report) [--tape=<path>] [--base=<url>]');
+  if (flag('help') || (!flag('once') && !flag('report') && !flag('restarts'))) {
+    console.log(
+      'usage: tra4158-heap-series.mjs (--once | --report | --restarts) [--tape=<path>] [--base=<url>]\n' +
+        '       --restarts [--since=<iso>] [--pages=<n>]  needs RENDER_API_KEY (+ RENDER_SERVICE_ID or --service=)',
+    );
     process.exit(2);
   }
+
+  if (flag('restarts')) {
+    const key = process.env.RENDER_API_KEY;
+    const serviceId = arg('service', process.env.RENDER_SERVICE_ID);
+    if (!key || !serviceId) {
+      // BLIND, not OK: "no crashes found" and "could not ask" must not share an
+      // exit code — this whole mode exists to grade an absence.
+      console.error('[tra4158] BLIND — RENDER_API_KEY and RENDER_SERVICE_ID (or --service=) are required');
+      process.exit(3);
+    }
+    try {
+      const events = await fetchEvents(serviceId, key, Number(arg('pages', '6')));
+      reportRestarts(events, arg('since', ''));
+    } catch (err) {
+      console.error(`[tra4158] BLIND — ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(3);
+    }
+  }
+
   const tapePath = resolve(arg('tape', DEFAULT_TAPE));
   const base = arg('base', DEFAULT_BASE).replace(/\/$/, '');
 
