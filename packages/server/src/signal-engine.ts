@@ -1,6 +1,7 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, supertrendLatest, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, blackScholesGreeks, daysToExpiration, bookGiveBackDecision, correlatedExposureDecision, entryGreeksGateDecision, chandelierStop, stopModifyDecision, selectRvLongCandidate, RV_LONG_DELTA_FLOOR, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, computePutCallRatio, computeOiTotals, rsi, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, TRADIER_TERMINAL_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
 import { buildExposureBuckets, DEFAULT_EXIT_PARAMS, DEFAULT_MULTILEG_EXIT_PARAMS } from '@trading-app/engine';
 import { evaluateLiquidityGate, DEFAULT_LIQUIDITY_GATE_CONFIG } from '@trading-app/engine'; // TRA-2048 — live spread veto
+import { isTransportOrderFailure } from '@trading-app/engine'; // TRA-4218 — a 5xx is not a refusal
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, ExitParams, MultiLegExitParams, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, ExposurePositionRisk, CorrelatedExposureDecision, BookHaltReason } from '@trading-app/engine';
 import type { TradierAccountBalance, TradierEquityQuote, TradierPositionsRead } from '@trading-app/engine';
 // TRA-3067 — read-only out-of-band-close detector (see the module doc).
@@ -10127,7 +10128,14 @@ export class SignalEngine {
       // armed — the one thing that must not happen is resting on a latch that
       // points at a cancelled order.
       const reason = `TRA-3418 escalated sell_to_close submit threw: ${err instanceof Error ? err.message : String(err)}`;
-      this.optionsAccount.clearPendingExit(snapshot.id, reason);
+      // TRA-4218 — same classification as the primary submit site. This branch
+      // is strictly worse to mis-count: the capped order is already cancelled,
+      // so a latch here leaves the row with no working exit AND no retry.
+      this.optionsAccount.clearPendingExit(
+        snapshot.id,
+        reason,
+        isTransportOrderFailure(err) ? { transport: true } : {},
+      );
       log.warn(reason, base);
       return { kind: 'aborted' };
     }
@@ -10249,8 +10257,14 @@ export class SignalEngine {
             );
       } catch (err: unknown) {
         const reason = `Tradier sell_to_close submit threw: ${err instanceof Error ? err.message : String(err)}`;
-        acct.clearPendingExit(snapshot.id, reason);
-        log.warn(reason, { optionSymbol: snapshot.optionSymbol });
+        // TRA-4218 — THE SITE. A Tradier 500 used to land here and be counted as
+        // the broker refusing the contract, which tripped the TRA-450 latch on
+        // the third one and permanently detached the stop from a live position.
+        // The classification comes off the thrown error's `kind`, not the
+        // message text.
+        const transport = isTransportOrderFailure(err);
+        acct.clearPendingExit(snapshot.id, reason, transport ? { transport: true } : {});
+        log.warn(reason, { optionSymbol: snapshot.optionSymbol, transport });
         continue;
       }
 
@@ -18453,7 +18467,11 @@ export class SignalEngine {
         log.warn('manual-close', { optionSymbol, env, reason });
         return { status: 'reconciled', reason };
       }
-      acct.clearPendingExit(optionId, reason);
+      // TRA-4218 — a 5xx on the MANUAL path must not consume the auto-close
+      // budget either. The operator pressing Close is the recovery path for a
+      // tripped breaker; letting a broker outage burn that budget on the way
+      // through would trip the breaker the operator is trying to escape.
+      acct.clearPendingExit(optionId, reason, isTransportOrderFailure(err) ? { transport: true } : {});
       log.warn('manual-close', { optionSymbol, env, reason });
       return { status: 'rejected', reason };
     }

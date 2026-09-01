@@ -657,6 +657,54 @@ const MAX_CONSECUTIVE_CLOSE_REJECTS = 3;
 const MAX_CONSECUTIVE_EXIT_EXPIRIES = 3;
 
 /**
+ * TRA-4218 — the transport backoff ladder, in ms, indexed by consecutive
+ * transport failures (1st failure → 30s, 2nd → 2m, 3rd → 5m, 4th+ → 15m).
+ *
+ * A THIRD outcome, in the TRA-2984 shape: a submit the broker never decided on
+ * is neither a refusal nor an expiry. It takes a THIRD remedy, and the remedy is
+ * the one thing neither breaker can do — wait, then try again, with no human.
+ *
+ * Why a ladder and not a fixed interval: the failure this exists for was a
+ * Tradier backend fault that cleared in minutes, but the same shape covers an
+ * outage that lasts hours. Ramping to 15m bounds the order rate at 4/hour/row
+ * against a broker that is down — which is what {@link MAX_CONSECUTIVE_CLOSE_REJECTS}
+ * was protecting against — while keeping the FIRST retry fast enough to matter
+ * to a stop that has just been breached.
+ *
+ * Deliberately NO terminal state. The counter never disarms the exit, because
+ * "the broker is unreachable" is not evidence about the contract, and a stop
+ * that silently stops existing because of someone else's 500 is the defect.
+ * The row still surfaces `exitErrorReason` throughout, so the condition is
+ * visible and closeable by hand at any point.
+ */
+const EXIT_TRANSPORT_BACKOFF_LADDER_MS = [30_000, 120_000, 300_000, 900_000];
+
+/** TRA-4218 — backoff for the Nth consecutive transport failure (N ≥ 1). */
+function exitTransportBackoffMs(consecutiveFailures: number): number {
+  const idx = Math.min(
+    Math.max(Math.floor(consecutiveFailures), 1) - 1,
+    EXIT_TRANSPORT_BACKOFF_LADDER_MS.length - 1,
+  );
+  return EXIT_TRANSPORT_BACKOFF_LADDER_MS[idx] as number;
+}
+
+/**
+ * TRA-4218 — the signature a `closeRejectCount` accrued from Tradier 5xx
+ * transport faults leaves on the row, used ONLY by the one-shot snapshot heal
+ * in {@link OptionsAccount.importSnapshot}.
+ *
+ * String-matching a reason is not how the live path classifies anything (the
+ * submit throw now carries `kind`, see `isTransportOrderFailure`). It is the
+ * only thing available for rows that were STRANDED BEFORE that classification
+ * existed, and those rows are the population that matters: three real-money
+ * positions on the 2026-08-31 book, two under a breached stop, whose counter
+ * rides the snapshot and would otherwise stay latched across the very deploy
+ * that fixes the bug.
+ */
+const TRANSPORT_STRANDED_REASON_RE =
+  /Tradier order failed \((?:5\d\d|429|408)\)|fetch failed/i;
+
+/**
  * TRA-2799 — consecutive Tradier portfolio reconciles an ENGINE-OPENED live
  * row must be missing from the broker's `/positions` payload before
  * {@link OptionsAccount.reconcileTradierPositions} closes it locally.
@@ -1487,6 +1535,16 @@ export type LiveStopInertReason =
   | 'close_reject_breaker'
   /** TRA-2984 (`:5025`) — the expiry breaker has withdrawn staging. */
   | 'exit_expired_breaker'
+  /**
+   * TRA-4218 — the transport backoff is holding this row's next submit because
+   * the broker did not respond to the last one.
+   *
+   * Read it like `pdt_hold_today`, NOT like the two breakers above it: this one
+   * has a known release stamped on the row (`exitRetryNotBeforeMs`) and clears
+   * itself. A non-zero count is a broker that is currently unreachable, which is
+   * worth an alert; it is not a stop that has been abandoned.
+   */
+  | 'exit_transport_backoff'
   /** TRA-483 (`:5041`) — the PDT overnight hold. Has a known release. */
   | 'pdt_hold_today'
   /** TRA-495/TRA-1136 (`:5072`) — the swing hold. Has a known release. */
@@ -1756,6 +1814,14 @@ export function summarizeLiveStopActionability(
       continue;
     } else if ((opt.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS) {
       reason = 'close_reject_breaker';
+    } else if (
+      // TRA-4218 — same position in the walk as the `continue` in `checkExits`:
+      // after the reject breaker, before the expiry breaker.
+      typeof opt.exitRetryNotBeforeMs === 'number'
+      && Number.isFinite(opt.exitRetryNotBeforeMs)
+      && now < opt.exitRetryNotBeforeMs
+    ) {
+      reason = 'exit_transport_backoff';
     } else if ((opt.exitExpiredCount ?? 0) >= MAX_CONSECUTIVE_EXIT_EXPIRIES) {
       reason = 'exit_expired_breaker';
     } else if (otmActs) {
@@ -9113,6 +9179,17 @@ export class PaperOptionsAccount {
       // live — only NEW order submission is suppressed.
       if ((opt.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS) continue;
 
+      // TRA-4218 — the transport BACKOFF. Sits with the two breakers because it
+      // suppresses submission the same way, and is deliberately unlike them in
+      // the one respect that matters: it releases on a clock, with nobody in the
+      // loop. Mark / trailing state above still updates, so the row keeps
+      // tracking its stop through the wait and fires the moment it lifts.
+      if (
+        typeof opt.exitRetryNotBeforeMs === 'number'
+        && Number.isFinite(opt.exitRetryNotBeforeMs)
+        && Date.now() < opt.exitRetryNotBeforeMs
+      ) continue;
+
       // TRA-2984 — the expiry breaker. Its own counter and its own threshold,
       // because an expiry is not a rejection: the first one ESCALATES the next
       // stop re-stage to MARKET (at the staging sites below) rather than
@@ -10147,6 +10224,14 @@ export class PaperOptionsAccount {
   ): boolean {
     const opt = this.openOptions.get(optionId);
     if (!opt || !opt.pendingExit) return false;
+    // TRA-4218 — the broker just accepted a submit and handed back an order id,
+    // so the transport streak is over BY DEFINITION. Clear it here rather than
+    // at the fill: the thing being counted is "could we reach Tradier", and that
+    // question is answered the moment an id comes back. Waiting for a fill would
+    // leave a row that reconnected but then rested unfilled carrying a stale
+    // backoff into its next stop.
+    delete opt.exitTransportFailCount;
+    delete opt.exitRetryNotBeforeMs;
     opt.pendingExit.tradierOrderId = tradierOrderId;
     if (
       typeof submittedLimitPrice === 'number'
@@ -10185,6 +10270,9 @@ export class PaperOptionsAccount {
     // a future exit on the remainder (TP1 / manual partial) starts fresh and
     // the circuit breaker only ever counts *consecutive* failures.
     delete opt.closeRejectCount;
+    // TRA-4218 — and the transport streak + its backoff, same reason.
+    delete opt.exitTransportFailCount;
+    delete opt.exitRetryNotBeforeMs;
     // TRA-2984 — and the expiry counter, for the same reason: it gates a MARKET
     // escalation, so a stale one would make the NEXT exit on the remainder
     // (a TP1 trim leaves the row open) cross the spread on the strength of a
@@ -10318,6 +10406,11 @@ export class PaperOptionsAccount {
     // counter climbs again from zero; a deliberate user retry always gets a
     // clean slate rather than inheriting the engine's abandoned-retry state.
     delete opt.closeRejectCount;
+    // TRA-4218 — and the transport backoff. The user is submitting NOW; holding
+    // their order behind a wait the engine chose would be the same defect in a
+    // smaller window.
+    delete opt.exitTransportFailCount;
+    delete opt.exitRetryNotBeforeMs;
     // TRA-2984 — same clean slate for the expiry counter. The user is working
     // this order themselves and chose their own pricing; inheriting the
     // engine's escalation state would silently convert their next engine-fired
@@ -10348,11 +10441,21 @@ export class PaperOptionsAccount {
    * {@link OptionPosition.exitExpiredCount} instead, which escalates the next
    * `sl`/`trail` re-stage to MARKET (see the staging site in `checkExits`) and
    * has its own, separate {@link MAX_CONSECUTIVE_EXIT_EXPIRIES} breaker.
+   *
+   * TRA-4218 — pass `{ transport: true }` when the submit never reached a broker
+   * DECISION (HTTP 5xx / 429 / 408, or `fetch` itself failing). That is a
+   * FOURTH outcome and it takes the opposite remedy from a rejection: back off
+   * and retry, never disarm. Routing it through the rejection counter was the
+   * defect — a Tradier 500 tripped the TRA-450 breaker on all three open
+   * real-money rows in one cadence, and because that counter is persisted and
+   * only a fill or a human clears it, the stop stayed detached across a restart.
+   * Callers classify with `isTransportOrderFailure(err)`; they must NOT
+   * string-match the message.
    */
   clearPendingExit(
     optionId: string,
     reason?: string,
-    options: { countRejection?: boolean; expired?: boolean } = {},
+    options: { countRejection?: boolean; expired?: boolean; transport?: boolean } = {},
   ): boolean {
     const opt = this.openOptions.get(optionId);
     if (!opt || !opt.pendingExit) return false;
@@ -10360,6 +10463,23 @@ export class PaperOptionsAccount {
     const expiredQty = opt.pendingExit.qty;
     delete opt.pendingExit;
     if (reason) opt.exitErrorReason = reason;
+    // TRA-4218 — checked BEFORE `expired`, and before the rejection default, so
+    // a transport fault can never fall through to either counter.
+    if (options.transport === true) {
+      opt.exitTransportFailCount = (opt.exitTransportFailCount ?? 0) + 1;
+      const waitMs = exitTransportBackoffMs(opt.exitTransportFailCount);
+      opt.exitRetryNotBeforeMs = Date.now() + waitMs;
+      // Say RETRYING, not paused. The two words drive different human action and
+      // the row is the only place either is visible; a reader who sees the
+      // TRA-450 "close this position manually" text on a row that is in fact
+      // going to try again in 30s will close a position the engine still owns.
+      opt.exitErrorReason =
+        `${reason ? `${reason} — ` : ''}broker did not respond ` +
+        `(${opt.exitTransportFailCount} consecutive transport failures); auto-close is ` +
+        `RETRYING at ${new Date(opt.exitRetryNotBeforeMs).toISOString()}, not paused. ` +
+        `Close manually only if you want out sooner.`;
+      return true;
+    }
     if (options.expired === true) {
       opt.exitExpiredCount = (opt.exitExpiredCount ?? 0) + 1;
       this.expiredExits += 1;
@@ -12779,7 +12899,20 @@ export class PaperOptionsAccount {
             ? 'adopted_not_authorized' as const
             : !stopArmed
               ? 'stop_not_armed' as const
-              : null;
+              // TRA-4218 — the three RUN-TIME suppressions, in `checkExits`
+              // order (`:9162`+). Omitting them let this census publish
+              // `engineMayAct: true` on a row whose auto-close had been paused
+              // for eleven hours by the TRA-450 breaker — the exact "reads
+              // identically to a managed row" defect the route was built to end.
+              : (opt.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS
+                ? 'close_reject_breaker' as const
+                : (typeof opt.exitRetryNotBeforeMs === 'number'
+                  && Number.isFinite(opt.exitRetryNotBeforeMs)
+                  && Date.now() < opt.exitRetryNotBeforeMs)
+                  ? 'exit_transport_backoff' as const
+                  : (opt.exitExpiredCount ?? 0) >= MAX_CONSECUTIVE_EXIT_EXPIRIES
+                    ? 'exit_expired_breaker' as const
+                    : null;
       adopted.push({
         positionId: opt.id,
         optionSymbol: opt.optionSymbol ?? '',
@@ -13411,6 +13544,8 @@ export class PaperOptionsAccount {
     // half-counted miss streak would only be noise in the archive.
     delete opt.closeRejectCount;
     delete opt.exitExpiredCount; // TRA-2984 — same, and it gates a MARKET escalation.
+    delete opt.exitTransportFailCount; // TRA-4218 — same.
+    delete opt.exitRetryNotBeforeMs;
     delete opt.brokerMissingSweeps;
     // A rejected close leaves no live order behind, but clear the staged
     // intent so `closeOption` archives a clean row rather than one that looks
@@ -14237,6 +14372,43 @@ export class PaperOptionsAccount {
           legacy: o.profitFloorHeldForPdt,
         });
         delete o.profitFloorHeldForPdt;
+      }
+      // TRA-4218 — heal a `closeRejectCount` that was accrued from BROKER
+      // TRANSPORT FAULTS, not from the broker refusing the contract.
+      //
+      // This has to happen on the way IN, for the same reason TRA-2957's
+      // threshold heal does: the counter rides the snapshot, so without this the
+      // very deploy that stops mis-counting 5xx would boot with the previously
+      // stranded rows still latched, and the fix would not reach the population
+      // it was written for. On 2026-08-31 that population was all three open
+      // real-money rows, two of them under a breached stop.
+      //
+      // Narrow on purpose. It fires only when the row's own `exitErrorReason`
+      // names a 5xx/429/408 or a `fetch` failure — i.e. the LAST thing that
+      // happened to this row was a transport fault. A row whose counter was
+      // filled by genuine refusals carries the broker's refusal text instead and
+      // keeps its breaker: healing that one would spray a broker that has
+      // already said no three times. `exitErrorReason` is left in place either
+      // way, so the operator still sees what happened.
+      if (
+        (o.closeRejectCount ?? 0) > 0
+        && typeof o.exitErrorReason === 'string'
+        && TRANSPORT_STRANDED_REASON_RE.test(o.exitErrorReason)
+      ) {
+        accountLog.warn('TRA-4218 — cleared a close-reject breaker accrued from broker transport faults', {
+          issue: 'TRA-4218',
+          optionSymbol: o.optionSymbol,
+          mode: o.mode ?? 'demo',
+          clearedCount: o.closeRejectCount,
+          exitErrorReason: o.exitErrorReason,
+        });
+        delete o.closeRejectCount;
+        // Re-arm through the backoff rather than instantly: a boot that follows
+        // the outage by seconds should not fire three stops into a broker that
+        // is still down. One ladder step is enough to make the retry orderly and
+        // it releases on its own.
+        o.exitTransportFailCount = 1;
+        o.exitRetryNotBeforeMs = Date.now() + exitTransportBackoffMs(1);
       }
       this.openOptions.set(o.id, o);
     }

@@ -3813,8 +3813,39 @@ export interface OptionPosition {
    * refusing the contract; it is our own limit never being hit, and the two need
    * opposite remedies (stop trying vs. try harder). Expiries go to
    * {@link exitExpiredCount}.
+   *
+   * TRA-4218 — nor is a submit that never reached a broker DECISION (a Tradier
+   * 5xx / 429, or `fetch` itself failing). That is a transport fault, and it is
+   * the one failure mode where "stop trying" is exactly wrong. Those go to
+   * {@link exitTransportFailCount} and {@link exitRetryNotBeforeMs}.
    */
   closeRejectCount?: number;
+  /**
+   * TRA-4218 — consecutive `sell_to_close` submits for this position that the
+   * broker never DECIDED on: HTTP 5xx / 429 / 408, or a network-level `fetch`
+   * failure. Reset on a successful submit ({@link OptionPosition.pendingExit}
+   * getting a broker order id), on a fill, and on a user re-stage.
+   *
+   * Why it is not {@link closeRejectCount}: that counter's breaker is a LATCH.
+   * It is persisted with the row and its only clear sites are a fill and a
+   * human, so once it trips on an unattended engine the position's stop is
+   * detached until someone notices. That is defensible when the broker has
+   * looked at the contract three times and refused it — no amount of retrying
+   * will place that order. It is indefensible for a backend outage, which is
+   * transient by construction. On 2026-08-31 a Tradier 500 tripped it on all
+   * three open real-money rows inside one exit cadence; two were already
+   * through their stop and could not exit for the next eleven hours.
+   *
+   * This counter drives a BACKOFF, not a latch — see {@link exitRetryNotBeforeMs}.
+   */
+  exitTransportFailCount?: number;
+  /**
+   * TRA-4218 — epoch ms before which `checkExits` will not re-stage an exit for
+   * this row, set by the transport backoff. Unlike the two breakers this has a
+   * KNOWN RELEASE: the row re-arms itself with no human in the loop, which is
+   * the whole point. Absent ↔ no backoff outstanding.
+   */
+  exitRetryNotBeforeMs?: number;
   /**
    * TRA-2984 — consecutive staged `sell_to_close` orders for this position that
    * reached the broker, rested, and **expired unfilled** at the end of the

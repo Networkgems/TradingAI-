@@ -161,6 +161,8 @@ export { TradierFeed } from './feed/index.js';
 export type { TradierFeedEvents } from './feed/index.js';
 export {
   TradierOrderClient,
+  TradierOrderError, // TRA-4218 — carries the HTTP status so a 5xx is not read as a refusal
+  isTransportOrderFailure, // TRA-4218
   TradierOptionsClient,
   TradierStocksClient,
   tradierBaseUrl,

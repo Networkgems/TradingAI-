@@ -18,6 +18,72 @@ export interface TradierOrderResponse {
 }
 
 /**
+ * TRA-4218 — an order submit that did not reach a broker DECISION.
+ *
+ * `postOrder` used to throw a bare `Error` for every non-2xx, which made a
+ * Tradier 500 ("An error occurred while communicating with the backend")
+ * indistinguishable at the catch site from a 400-class refusal. The exit path
+ * counted both onto `closeRejectCount`, so three seconds of broker backend
+ * trouble tripped the TRA-450 auto-close breaker and PERMANENTLY detached the
+ * stop from a live position: the counter is persisted in the account snapshot
+ * and its only two clear sites are a fill (unreachable — the engine has stopped
+ * submitting) and a human pressing Close. On 2026-08-31 that stranded all three
+ * open real-money rows, two of them already through their stop.
+ *
+ * `kind` is the classification the caller needs and MUST NOT be re-derived by
+ * string-matching the message:
+ *  - `transport` — 5xx, 429, or a network-level failure. The broker never
+ *    decided. Retry is correct; consuming a refusal budget is not.
+ *  - `refused` — 4xx, or a 2xx envelope carrying `errors.error`. The broker
+ *    looked at the order and said no. This is what the TRA-450 breaker counts.
+ *  - `malformed` — a 2xx with no `order` payload. Neither of the above.
+ *
+ * The `message` format is unchanged on purpose: `exitErrorReason` strings from
+ * it are already on persisted rows and on the dashboard.
+ */
+export class TradierOrderError extends Error {
+  readonly kind: 'transport' | 'refused' | 'malformed';
+
+  readonly status?: number;
+
+  constructor(
+    message: string,
+    kind: 'transport' | 'refused' | 'malformed',
+    status?: number,
+  ) {
+    super(message);
+    this.name = 'TradierOrderError';
+    this.kind = kind;
+    this.status = status;
+  }
+}
+
+/**
+ * TRA-4218 — classify a thrown submit. Returns true when the broker never
+ * reached a decision, so the failure must NOT consume a rejection budget.
+ *
+ * Defaults to `false` for anything unrecognised: an unknown throw is treated as
+ * a refusal, which is the conservative side (it can only stop us trading, never
+ * make us spray orders at a broker that is refusing them).
+ */
+export function isTransportOrderFailure(err: unknown): boolean {
+  if (err instanceof TradierOrderError) return err.kind === 'transport';
+  // `fetch` itself failing (DNS, TLS, socket reset, abort) never reached the
+  // broker either. Node surfaces these as a bare `TypeError: fetch failed`.
+  if (err instanceof TypeError) return true;
+  return false;
+}
+
+/**
+ * TRA-4218 — an HTTP status the broker returned WITHOUT deciding on the order.
+ * 5xx is the observed case (500 backend error); 429 and 408 are the same shape
+ * — the request was shed, not refused.
+ */
+function isTransportStatus(status: number): boolean {
+  return status >= 500 || status === 429 || status === 408;
+}
+
+/**
  * TRA-319 — full order detail returned by `/accounts/{id}/orders/{order_id}`.
  * `status` transitions through `open`/`pending` and lands on a terminal state
  * (`filled`, `canceled`, `rejected`, `expired`, `error`). `reason_description`
@@ -581,17 +647,28 @@ export class TradierOrderClient {
 
     if (!resp.ok) {
       const text = await resp.text();
-      throw new Error(`Tradier order failed (${resp.status}): ${text}`);
+      // TRA-4218 — same message, but the STATUS now rides the throw so the exit
+      // path can tell "the broker refused this contract" from "the broker's
+      // backend fell over". Those take opposite remedies.
+      throw new TradierOrderError(
+        `Tradier order failed (${resp.status}): ${text}`,
+        isTransportStatus(resp.status) ? 'transport' : 'refused',
+        resp.status,
+      );
     }
 
     const data = (await resp.json()) as TradierOrderEnvelope;
     const errors = data.errors?.error ?? data.order?.errors?.error;
     if (errors) {
       const msg = Array.isArray(errors) ? errors.join('; ') : errors;
-      throw new Error(`Tradier order rejected: ${msg}`);
+      throw new TradierOrderError(`Tradier order rejected: ${msg}`, 'refused', resp.status);
     }
     if (!data.order) {
-      throw new Error('Tradier order response missing order payload');
+      throw new TradierOrderError(
+        'Tradier order response missing order payload',
+        'malformed',
+        resp.status,
+      );
     }
     // TRA-3939 — THE SUBMIT-TIME ID CHOKEPOINT. Emitted here, after the broker has
     // acknowledged an id and before this returns to any caller, so a walk step we

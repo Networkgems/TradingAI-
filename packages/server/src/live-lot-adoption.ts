@@ -469,12 +469,25 @@ export interface AdoptedLotView {
    * TRA-3916 — the FIRST gate in the `checkExits` walk that refuses this row, in
    * that walk's own order, or `null` when nothing does. A bare boolean cannot be
    * acted on; this can.
+   *
+   * TRA-4218 — the three run-time suppressions below were MISSING from this
+   * walk, and their absence was measured live: adopted row `a2f9c8cd`
+   * (NOK261002C00010500) published `engineMayAct: true, exitInertReason: null,
+   * stopArmed: true` on 2026-09-01T02:47Z while carrying `closeRejectCount: 3`
+   * — its auto-close had been paused for eleven hours. This route exists to
+   * break the "reads identically to a managed row" shape and it was reproducing
+   * that shape itself, because the walk was re-implemented from the STATIC
+   * gates only. The gates a row acquires while it trades are exactly the ones a
+   * census is for.
    */
   exitInertReason:
     | 'imported_auto_manage_off'
     | 'imported_no_broker_mirror'
     | 'adopted_not_authorized'
     | 'stop_not_armed'
+    | 'close_reject_breaker'
+    | 'exit_transport_backoff'
+    | 'exit_expired_breaker'
     | null;
   stopArmed: boolean;
   riskUnmanagedReason: string | null;

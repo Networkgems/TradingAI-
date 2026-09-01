@@ -1,5 +1,7 @@
 export {
   TradierOrderClient,
+  TradierOrderError, // TRA-4218
+  isTransportOrderFailure, // TRA-4218
   tradierBaseUrl,
   parseTradierEquityPositions,
   parseTradierOrderLegs,
