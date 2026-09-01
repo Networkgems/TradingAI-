@@ -228,6 +228,21 @@ export interface LiveArmCensusReport {
      */
     brokerPermissionBlockedCount: number | null;
     brokerRedBookCount: number | null;
+    /**
+     * TRA-4226 — live books carrying at least one `transport` (broker 5xx /
+     * gateway) reject today, and the total count of those rejects across the
+     * fleet. The pair is the "is the BROKER down, or is one ACCOUNT broken?"
+     * read, and it is not answerable from any single row: on 2026-08-31 one
+     * Tradier backend incident refused `v0nni`'s 4 opens and `admin`'s 3 closes
+     * with a byte-identical `(500)`, and each book on its own looked like its
+     * own private fault. `null` when the broker join did not run — same
+     * discipline as the two counts above, for the same reason.
+     *
+     * Counts only. The reject TEXT stays authenticated/server-side (TRA-2163);
+     * nothing here widens what the no-auth health route discloses.
+     */
+    brokerTransportBookCount: number | null;
+    brokerTransportRejectCount: number | null;
   };
   /**
    * TRA-3905 — the ET day the {@link LiveArmCensusRow.brokerOutcome} join was
@@ -338,6 +353,13 @@ export function summarizeLiveArmCensus(
         : null,
       brokerRedBookCount: brokerCensus
         ? rows.filter(r => r.brokerOutcome?.verdict === 'red').length
+        : null,
+      // TRA-4226 — same `null`-not-`0` rule: an unread count must not render clean.
+      brokerTransportBookCount: brokerCensus
+        ? rows.filter(r => (r.brokerOutcome?.rejects.transport ?? 0) > 0).length
+        : null,
+      brokerTransportRejectCount: brokerCensus
+        ? rows.reduce((a, r) => a + (r.brokerOutcome?.rejects.transport ?? 0), 0)
         : null,
     },
   };

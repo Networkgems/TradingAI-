@@ -88,6 +88,22 @@ export type BrokerRejectClass =
   | 'client_unavailable'
   /** The broker call threw (network/auth/parse). */
   | 'throw'
+  /**
+   * TRA-4226 — the BROKER'S OWN INFRASTRUCTURE failed: an HTTP 5xx, a gateway
+   * error, or a transport-level fault. **Nothing was refused.** The contract was
+   * never evaluated, no account state was consulted, and the correct operator
+   * response is "retry when the broker is back" — NOT "investigate the account".
+   *
+   * Distinct from its two neighbours in both directions:
+   *   • `throw` — OUR client raised (network/auth/parse) and no broker verdict
+   *     of any kind came back. `transport` is the broker ANSWERING that it is
+   *     broken.
+   *   • `other` — the broker returned a refusal we cannot read. That is a
+   *     genuine unknown and may well be terminal; a 5xx is known and is not.
+   * Sharing one bucket made a broker outage and an unexplained reject the same
+   * reading — see {@link classifyBrokerRejectText}.
+   */
+  | 'transport'
   /** The breaker refused to submit; nothing reached the broker. */
   | 'permission_blocked'
   /** Broker refused for a reason this module does not recognise. */
@@ -106,6 +122,7 @@ export const BROKER_REJECT_CLASSES: readonly BrokerRejectClass[] = [
   'policy',
   'client_unavailable',
   'throw',
+  'transport',
   'permission_blocked',
   'other',
 ] as const;
@@ -226,6 +243,37 @@ function cellFor(etDay: string, book: string): BookDayCell {
  *
  * The 2026-08-20 string, verbatim:
  *   `Account is restricted for option trading. Please contact 980-272-3880 …`
+ *
+ * ## TRA-4226 — `transport` is carved out of `other`, and ONLY out of `other`
+ *
+ * On 2026-08-31 the `v0nni` book went 4 submitted / 0 filled and the census
+ * correctly read `degraded` — but all 4 rejects landed in `other`, so the
+ * instrument could say the book was broken and could not say why. The retained
+ * text, verbatim and identical on all four (`/api/health/option-journal`
+ * `voids.recent[]`, 14:38:33Z · 14:39:31Z · 15:15:46Z · 19:07:56Z):
+ *
+ *   `Tradier order rejected: Tradier order failed (500): An error occurred
+ *    while communicating with the backend.`
+ *
+ * — byte-identical to the `(500)` the production `admin` book's three refused
+ * closes carry the same day. **One Tradier backend incident, two books.** That
+ * is not an unexplained refusal: nothing was decided, and "retry when the broker
+ * is back" is a different operator action from "investigate the account".
+ *
+ * The ordering below is load-bearing and is the whole safety argument. The 5xx
+ * arm sits BELOW `permission` and `buying_power`, so it can only ever consume
+ * text that previously fell through to `other`. Every input that classified as
+ * `permission` (and so arms the breaker) or `buying_power` before this change
+ * still does, by construction rather than by test coverage — the breaker's
+ * behaviour cannot regress from a change that never runs on its inputs. The
+ * asymmetry the paragraph above states therefore holds unchanged: the default is
+ * still `other`, and `transport` inherits `other`'s transience, adding only the
+ * reason.
+ *
+ * The 5xx patterns are deliberately anchored on FAILURE wording rather than on a
+ * bare `(5\d\d)`: `Quantity (500) exceeds …` is a refusal, not an outage, and a
+ * parenthesised number on its own is not a status code. The observed string
+ * matches two of these arms independently.
  */
 export function classifyBrokerRejectText(text: string | null | undefined): BrokerRejectClass {
   const t = (text ?? '').toLowerCase();
@@ -241,6 +289,20 @@ export function classifyBrokerRejectText(text: string | null | undefined): Broke
     return 'permission';
   }
   if (/buying power|insufficient funds|insufficient buying/.test(t)) return 'buying_power';
+  if (
+    // Tradier's own 2026-08-31 wording — each half stands alone.
+    /fail(?:ed|ure|s)?\s*\(5\d\d\)/.test(t) ||
+    /error occurred while communicating with the backend/.test(t) ||
+    // An explicitly labelled 5xx, however the wrapper spelled it.
+    /\b(?:http|https|status)\s*(?:code\s*)?[:=]?\s*5\d\d\b/.test(t) ||
+    // The standard gateway/5xx reason phrases, which arrive with no number.
+    /internal server error|bad gateway|service unavailable|gateway time-?out/.test(t) ||
+    // Transport faults that surfaced as a broker ANSWER rather than a throw.
+    /econnreset|econnrefused|etimedout|enotfound|epipe|socket hang up/.test(t) ||
+    /network error|fetch failed|upstream (?:error|timeout)/.test(t)
+  ) {
+    return 'transport';
+  }
   return 'other';
 }
 
@@ -391,6 +453,14 @@ export interface BrokerSubmitCensusReport {
     filled: number;
     brokerRejects: number;
     permissionRejects: number;
+    /**
+     * TRA-4226 — 5xx/transport rejects across every graded book. This is a
+     * FLEET-level read on purpose: the 2026-08-31 incident hit `v0nni` and
+     * `admin` with the identical `(500)`, and the question it answers ("is the
+     * broker down, or is one account broken?") is not answerable from any one
+     * row. Count only — the raw text is never folded up here (TRA-2163).
+     */
+    transportRejects: number;
     /** Books the breaker has halted. Non-zero is an incident. */
     permissionBlockedBookCount: number;
     redBookCount: number;
@@ -474,6 +544,7 @@ export function summarizeBrokerSubmitCensus(
       filled: rows.reduce((a, r) => a + r.filled, 0),
       brokerRejects: rows.reduce((a, r) => a + r.brokerRejects, 0),
       permissionRejects: rows.reduce((a, r) => a + r.permissionRejects, 0),
+      transportRejects: rows.reduce((a, r) => a + r.rejects.transport, 0),
       permissionBlockedBookCount: rows.filter(r => r.brokerPermissionBlocked).length,
       redBookCount: rows.filter(r => r.verdict === 'red').length,
       degradedBookCount: rows.filter(r => r.verdict === 'degraded').length,
