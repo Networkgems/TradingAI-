@@ -92,7 +92,11 @@ import { getLiveOptionsFeeReconcileState } from '../live-options-fee-reconcile.j
 import { getZombieOpenSweepState } from '../zombie-open-journal-sweep.js'; // TRA-3547
 import { getCloseBasisSweepState } from '../tra3730-close-basis-sweep.js'; // TRA-3730
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
-import { summarizeRvScanPath, RV_SCAN_PATH_STRUCTURE_LABEL } from '../rv-scan-telemetry.js'; // TRA-2193 / TRA-2245
+import {
+  summarizeRvScanPath,
+  RV_SCAN_PATH_STRUCTURE_LABEL,
+  type RvScanAdmissibilityLedgerRead, // TRA-4255
+} from '../rv-scan-telemetry.js'; // TRA-2193 / TRA-2245
 import { summarizeShortPremiumScans } from '../short-premium-scanner.js';
 import { buildWheelPromotionGateSummary } from '../wheel-promotion-gate-store.js'; // TRA-2028
 import { isPerpFundingCarryEnabled } from '../perp-funding-carry-flag.js';
@@ -6873,6 +6877,27 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       ? summarizeOptionsPipeline(deps.optionsPipeline(), now()).rvScannerConfigured
       : null;
 
+    // TRA-4255 — the DURABLE cost-aware bar ledger, folded across its whole
+    // retained window, so each path can publish whether its candidates can reach
+    // an open AT ALL. `scanning` is a statement about the loop turning and sits
+    // upstream of every admission gate: the directional sleeve published
+    // `scanning` + a full universe sweep for 19 days while clearing 0 of 17,727
+    // candidates at the bar. This read is what makes that legible HERE, on the
+    // liveness route someone actually opens, instead of only on
+    // /api/health/cost-aware-gate where you have to already suspect it.
+    //
+    // Retained (not since-boot) on purpose: this box reboots daily and the
+    // sleeve's silence is 19 days long, so a since-boot fold could not see it.
+    // Wrapped because an unreadable ledger must yield `unmeasured`, never a
+    // fabricated zero that would read as a confident accusation.
+    let costAwareLedger: RvScanAdmissibilityLedgerRead | null = null;
+    try {
+      const retained = summarizeCostAwareGate(etDateString(new Date(now()))).retained;
+      costAwareLedger = { etDays: retained.etDays, byStructure: retained.byStructure };
+    } catch {
+      costAwareLedger = null;
+    }
+
     const paths = [
       // Instrumented: the demo directional pass. This is the one that actually
       // fed what WAS the `single_leg_rv` bucket (now `single_leg_directional` since
@@ -6880,12 +6905,14 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       summarizeRvScanPath('directional', {
         enabled: directionalEnabled,
         instrumented: true,
+        costAwareLedger,
       }),
       // Instrumented, but held shut by the compile-time TRA-1207 kill switch.
       // Wired now so that re-arming it is self-evidencing on the first tick.
       summarizeRvScanPath('rv_scan', {
         enabled: isRvEngineEnabled(),
         instrumented: true,
+        costAwareLedger,
       }),
       // TRA-3557 — the OTM sleeve, and the one that needed this most: it is the path
       // under live-money acceptance and was the only option entry path with no scan
@@ -6910,12 +6937,14 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       summarizeRvScanPath('otm', {
         enabled: chainConfigured !== false,
         instrumented: true,
+        costAwareLedger,
       }),
       // NOT instrumented this iteration. Reports null counters rather than zeros —
       // see the null discipline above.
       summarizeRvScanPath('iv_rv_buy_premium', {
         enabled: ivRvRoutingEnabled,
         instrumented: false,
+        costAwareLedger,
       }),
     ];
 

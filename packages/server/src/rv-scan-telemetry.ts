@@ -77,6 +77,185 @@ export const RV_SCAN_PATH_STRUCTURE_LABEL: Readonly<Record<RvScanPathId, string>
 };
 
 /**
+ * TRA-4255 — the cost-aware-ledger structure key each path's COST-BAR decisions
+ * are recorded under. **This is deliberately NOT {@link RV_SCAN_PATH_STRUCTURE_LABEL}.**
+ *
+ * The directional sleeve is split across TWO keys in that ledger and reading the
+ * wrong one is silent:
+ *   • `single_leg_directional` — what the sleeve JOURNALS, and what the SPREAD
+ *     ceiling records against (`DIRECTIONAL_STRUCTURE_LABEL`). Its cost-bar
+ *     columns are permanently `admitted: 0 / rejected: 0`.
+ *   • `directional` — the literal the engine passes to `costAwareGateReject`
+ *     (`signal-engine.ts`, the `dirCostReject` call). This is where the bar's own
+ *     verdicts land.
+ *
+ * Keying the admissibility fold off `structureLabel` therefore folds 0/0 and
+ * classifies a provably-dead sleeve as `not_reached` — the exact false-quiet this
+ * whole module exists to kill, re-created one layer in. Measured live 2026-09-01:
+ * `single_leg_directional` = 0 admitted / 0 rejected, `directional` = 0 admitted /
+ * **17,727** rejected.
+ *
+ * `null` = this path has no `costAwareGateReject` call site, so the bar can say
+ * nothing about it. Null, never a string that happens to fold to zero.
+ */
+export const RV_SCAN_PATH_COST_BAR_KEY: Readonly<Record<RvScanPathId, string | null>> = {
+  rv_scan: 'single_leg_rv',
+  directional: 'directional',
+  // No cost-bar call site of its own; it is not instrumented on this route either.
+  iv_rv_buy_premium: null,
+  otm: 'single_leg_otm',
+};
+
+/**
+ * TRA-4255 — can this path's candidates reach an OPEN at all?
+ *
+ * `scanning` answers "is the loop turning", which is upstream of every admission
+ * gate, so an armed path walking its full universe and admitting nothing reads
+ * byte-identically to a healthy one. That is the state the directional sleeve sat
+ * in for 19 days (last open 2026-08-12T19:51Z) while publishing
+ * `verdict: "scanning"`, `enabled: true` and a full 229-symbol sweep every tick.
+ *
+ *  • `admitting`        — the bar cleared ≥ 1 candidate in the retained window.
+ *  • `admitting_nothing`— the bar RULED on candidates and cleared **zero**. The
+ *                         admissible set is empty BY MEASUREMENT, not inferred
+ *                         from an absence of opens (the TRA-1718 method).
+ *  • `not_reached`      — the bar ruled on nothing. Says nothing about
+ *                         admissibility; the starve is upstream of the bar.
+ *  • `unmeasured`       — no usable ledger read. Distinct from every above state
+ *                         on purpose: "we could not look" must never render as
+ *                         "we looked and it is fine".
+ */
+export type RvScanAdmissibilityStatus =
+  | 'admitting'
+  | 'admitting_nothing'
+  | 'not_reached'
+  | 'unmeasured';
+
+/** The subset of the cost-aware ledger the admissibility fold needs. */
+export interface RvScanAdmissibilityLedgerRead {
+  /** Every ET day retained by the ledger, ascending. The window the fold covers. */
+  etDays: readonly string[];
+  byStructure: ReadonlyArray<{ structure: string; admitted: number; rejected: number }>;
+}
+
+export interface RvScanAdmissibility {
+  status: RvScanAdmissibilityStatus;
+  /** The ledger key actually folded. Published so the two-key trap above is auditable. */
+  costBarStructure: string | null;
+  /** Null — never 0 — when there was no reading. Absence is not a zero. */
+  admitted: number | null;
+  rejected: number | null;
+  /** `null` when the bar ruled on nothing; a 0 here is the ALARM, not the quiet state. */
+  admitRate: number | null;
+  windowEtDays: readonly string[] | null;
+  /**
+   * A SIBLING structure in the SAME ledger read that IS admitting.
+   *
+   * This is what turns our zero into a measurement rather than a dead instrument:
+   * same route, same fold, same window, non-zero. Without one, a wiped ledger and
+   * a dead sleeve are the same observation — so its absence DOWNGRADES the verdict
+   * to `unmeasured` rather than being reported as a stronger claim than we hold.
+   */
+  positiveControl: { structure: string; admitted: number; rejected: number } | null;
+  /** Why this status, in words, so the payload does not need the source to read. */
+  reason: string;
+}
+
+/**
+ * Classify one path's admissibility off a cost-aware ledger read. Pure.
+ *
+ * Fails toward `unmeasured` in every ambiguous direction. A false `admitting_nothing`
+ * accuses a healthy sleeve of being dead and would send someone bisecting deploys for
+ * a defect that is not there — the expensive direction here is the false positive.
+ */
+export function classifyRvScanAdmissibility(
+  path: RvScanPathId,
+  ledger: RvScanAdmissibilityLedgerRead | null,
+): RvScanAdmissibility {
+  const costBarStructure = RV_SCAN_PATH_COST_BAR_KEY[path];
+  const base = {
+    costBarStructure,
+    admitted: null,
+    rejected: null,
+    admitRate: null,
+    windowEtDays: null,
+    positiveControl: null,
+  } as const;
+
+  if (costBarStructure === null) {
+    return {
+      ...base,
+      status: 'unmeasured',
+      reason: `path \`${path}\` has no cost-aware bar call site, so the bar can say nothing about its admissibility`,
+    };
+  }
+  if (!ledger) {
+    return {
+      ...base,
+      status: 'unmeasured',
+      reason: 'cost-aware gate ledger is not readable from this process',
+    };
+  }
+
+  const row = ledger.byStructure.find((s) => s.structure === costBarStructure) ?? null;
+  if (!row) {
+    // ABSENT ≠ 0. A missing row means the ledger has never keyed this structure,
+    // which is a different fact from "keyed it and cleared nothing".
+    return {
+      ...base,
+      status: 'unmeasured',
+      reason: `no cost-aware ledger row keyed \`${costBarStructure}\` — absent, which is not the same reading as zero`,
+    };
+  }
+
+  const ruledOn = row.admitted + row.rejected;
+  const window = ledger.etDays;
+  const measured = {
+    costBarStructure,
+    admitted: row.admitted,
+    rejected: row.rejected,
+    admitRate: ruledOn > 0 ? row.admitted / ruledOn : null,
+    windowEtDays: window,
+  };
+
+  if (row.admitted > 0) {
+    return {
+      ...measured,
+      status: 'admitting',
+      positiveControl: null,
+      reason: `bar cleared ${row.admitted} of ${ruledOn} candidates across ${window.length} retained ET day(s)`,
+    };
+  }
+  if (ruledOn === 0) {
+    return {
+      ...measured,
+      status: 'not_reached',
+      positiveControl: null,
+      reason: `cost-aware bar ruled on 0 candidates for \`${costBarStructure}\` across ${window.length} retained ET day(s) — the starve is UPSTREAM of the bar; this says nothing about admissibility`,
+    };
+  }
+
+  // admitted === 0 && rejected > 0. Only claim it with a live control on the same read.
+  const control = ledger.byStructure
+    .filter((s) => s.structure !== costBarStructure && s.admitted > 0)
+    .sort((a, b) => b.admitted - a.admitted)[0] ?? null;
+  if (!control) {
+    return {
+      ...measured,
+      status: 'unmeasured',
+      positiveControl: null,
+      reason: `\`${costBarStructure}\` cleared 0 of ${ruledOn}, but NO sibling structure in this ledger read admitted anything either — a wiped/stalled ledger cannot be excluded, so this is not yet a measurement`,
+    };
+  }
+  return {
+    ...measured,
+    status: 'admitting_nothing',
+    positiveControl: { structure: control.structure, admitted: control.admitted, rejected: control.rejected },
+    reason: `cost-aware bar cleared 0 of ${ruledOn} \`${costBarStructure}\` candidates across ${window.length} retained ET day(s), while \`${control.structure}\` cleared ${control.admitted} on the SAME read — the admissible set is empty by measurement, not by absence of candidates`,
+  };
+}
+
+/**
  * The bucket name used for symbols that entered the loop, did not pass, and were
  * not tagged with a gate. Non-zero means an untagged `continue` exists upstream —
  * a real finding, not noise.
@@ -318,8 +497,20 @@ export function beginRvScan(
  * `unwatched` is the fourth state and is NOT a verdict about arming: it means
  * this module does not observe the path, so `disarmed`/`scanning` are both
  * unknowable — the same null discipline the counters follow.
+ *
+ * TRA-4255 — a FIFTH state, `armed_admitting_nothing`, ranked BELOW `scanning`
+ * and reached only from it. `scanning` asserts the loop is turning; it is
+ * upstream of every admission gate and therefore cannot distinguish a sleeve
+ * that is trading from one whose admissible set is empty. The directional sleeve
+ * held `scanning` for 19 days while clearing 0 of 17,727 candidates. A path that
+ * provably cannot open must not wear the same word as one that can.
  */
-export type RvScanPathVerdict = 'unwatched' | 'disarmed' | 'armed_but_never_ran' | 'scanning';
+export type RvScanPathVerdict =
+  | 'unwatched'
+  | 'disarmed'
+  | 'armed_but_never_ran'
+  | 'armed_admitting_nothing'
+  | 'scanning';
 
 /** Read-only view of one path, shaped for the health route. */
 export interface RvScanPathView {
@@ -334,8 +525,14 @@ export interface RvScanPathView {
    * did not take.
    */
   instrumented: boolean;
-  /** TRA-3557 — this path's own three-way verdict. See {@link RvScanPathVerdict}. */
+  /** TRA-3557 — this path's own per-path verdict. See {@link RvScanPathVerdict}. */
   verdict: RvScanPathVerdict;
+  /**
+   * TRA-4255 — can candidates on this path reach an open AT ALL, measured off the
+   * DURABLE cost-aware ledger rather than inferred from an absence of opens.
+   * Always present; `status: 'unmeasured'` when there was no usable read.
+   */
+  admissibility: RvScanAdmissibility;
   lastScanAt: number | null;
   scanCountSinceBoot: number | null;
   lastScan: RvScanRecord | null;
@@ -349,9 +546,20 @@ export interface RvScanPathView {
  */
 export function summarizeRvScanPath(
   path: RvScanPathId,
-  opts: { enabled: boolean; instrumented: boolean },
+  opts: {
+    enabled: boolean;
+    instrumented: boolean;
+    /**
+     * TRA-4255 — the durable cost-aware ledger read. OMITTED (or null) yields
+     * `admissibility.status: 'unmeasured'` and leaves the verdict untouched: a
+     * caller that cannot supply the ledger must not thereby manufacture a
+     * healthy-looking `scanning`, nor a dead-looking accusation.
+     */
+    costAwareLedger?: RvScanAdmissibilityLedgerRead | null;
+  },
 ): RvScanPathView {
   const s = store.get(path);
+  const admissibility = classifyRvScanAdmissibility(path, opts.costAwareLedger ?? null);
   if (!opts.instrumented || !s) {
     return {
       path,
@@ -366,6 +574,7 @@ export function summarizeRvScanPath(
         : opts.enabled
           ? 'armed_but_never_ran'
           : 'disarmed',
+      admissibility,
       // Never-ran and never-watched both report null. They are distinguished by
       // `instrumented`, not by a fabricated zero.
       lastScanAt: null,
@@ -383,11 +592,17 @@ export function summarizeRvScanPath(
     // `scanning` is asserted off the SCAN COUNT, never off `lastScanAt` alone —
     // both move together today, but a count is the input-side fact and a
     // timestamp is derived from it (rule 2 in the module header).
+    // TRA-4255 — `armed_admitting_nothing` is reached ONLY from what would
+    // otherwise be `scanning`: the loop demonstrably turned, and the durable bar
+    // ledger says none of what it produced can open. Ordering matters — a
+    // disarmed or never-ran path must keep its own (more specific) verdict,
+    // because a stale ledger window can outlive the arm that filled it.
     verdict: !opts.enabled
       ? 'disarmed'
       : s.scanCountSinceBoot > 0
-        ? 'scanning'
+        ? (admissibility.status === 'admitting_nothing' ? 'armed_admitting_nothing' : 'scanning')
         : 'armed_but_never_ran',
+    admissibility,
     lastScanAt: s.lastScanAt,
     scanCountSinceBoot: s.scanCountSinceBoot,
     lastScan: s.lastScan,
