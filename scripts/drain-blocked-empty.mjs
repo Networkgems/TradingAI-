@@ -1433,9 +1433,12 @@ const CONTROLS = [
       // The title is an EXPLICIT field, never `title: undefined` -- a JS
       // default parameter fires on undefined and would hand the control an
       // ASCII default, making it read green against the wrong input. The
-      // string is the live d8ec9395 title that broke the 2026-08-27 fire.
+      // string is the live d8ec9395 title that broke the 2026-08-27 fire,
+      // extended per TRA-4146 with a curly-quoted word and a non-Latin
+      // character so all three adversarial classes ride through the COMPOSED
+      // body, not just the asciiFold unit table.
       const origin = {
-        title: 'TRA-2134 SANDBOX multi-strategy options runner (CSP/CC/long) — $0 notional',
+        title: 'TRA-2134 SANDBOX multi-strategy options runner (CSP/CC/long) — ‘pinned’ 样本 $0 notional',
         status: 'active',
         concurrencyPolicy: 'always_enqueue',
         assigneeAgentId: AGENT_SELF,
@@ -1458,7 +1461,14 @@ const CONTROLS = [
       return {
         ok:
           graded.ok &&
-          /\(CSP\/CC\/long\) -- \$0 notional/.test(body) &&
+          // the three adversarial classes each land in their FOLDED spelling
+          // on the sanitized path (TRA-4146): em dash, curly quotes, and the
+          // non-Latin characters as printed escapes -- never a silent drop
+          /\(CSP\/CC\/long\) -- 'pinned' \(U\+6837\)\(U\+672C\) \$0 notional/.test(body) &&
+          // ...and the SANITIZED body still carries the two facts the audit
+          // trail exists for: the routine id and its concurrencyPolicy
+          body.includes(ROUTINE_ID) &&
+          /concurrencyPolicy `always_enqueue`/.test(body) &&
           // ...and the body SAYS a fold happened, so the trail records the
           // title was transformed rather than silently altered
           /ASCII-FOLDED/.test(body) &&
