@@ -753,6 +753,14 @@ const TRANSPORT_STRANDED_REASON_RE =
 export type PausedExitInAppRefusal =
   /** Route site index.ts (imported branch) — a broker close is already working. */
   | 'close_already_in_flight'
+  /**
+   * TRA-4259 — route site index.ts (BOTH branches): an ENGINE exit is staged or
+   * working on this row. Distinct from `close_already_in_flight`, which is an
+   * OPERATOR close the route itself tagged: this one has an in-app withdrawal
+   * (`/cancel-pending-exit`) and that one does not, so they cannot share a
+   * sentence without one of them naming a path the row lacks.
+   */
+  | 'staged_exit_working'
   /** Route site index.ts (engine-opened branch) — TRA-598 same-session round trip. */
   | 'day_trade_guard'
   /** Route site index.ts — nothing sellable, so both branches 409/400 out. */
@@ -782,8 +790,10 @@ export function pausedExitRecoveryPaths(
     ({ broker: true, inAppClose: false, inAppCloseRefusedBy });
   const hasContracts = Number.isFinite(opt.contractsRemaining) && opt.contractsRemaining > 0;
   if (opt.importedFromTradier === true) {
-    // TRA-407 (C4) double-submit guard, then the OCC/contracts check.
+    // TRA-407 (C4) double-submit guard, then TRA-4259's staged-exit guard, then
+    // the OCC/contracts check — the route's own order.
     if (opt.pendingCloseOrderId !== undefined) return refused('close_already_in_flight');
+    if (opt.pendingExit) return refused('staged_exit_working');
     if (!opt.optionSymbol) return refused('missing_occ');
     if (!hasContracts) return refused('no_contracts');
     return { broker: true, inAppClose: true };
@@ -792,7 +802,12 @@ export function pausedExitRecoveryPaths(
   // it is the first refusal an operator meets — and it is the one shape where
   // the old fixed sentence promised a button that answers 409.
   if (!checkDiscretionaryClose(opt.openedAt, now, guardrail).allowed) return refused('day_trade_guard');
-  if (opt.pendingExit) return refused('close_already_in_flight');
+  // TRA-4259 — this used to report `close_already_in_flight`, which is the
+  // TRA-407 reason for an OPERATOR close the route tagged itself. The field the
+  // route actually reads here is `pendingExit`, which only a STAGED exit sets,
+  // and that one has an in-app withdrawal the other does not. One field, one
+  // reason, on both branches.
+  if (opt.pendingExit) return refused('staged_exit_working');
   if (!hasContracts) return refused('no_contracts');
   return { broker: true, inAppClose: true };
 }
@@ -813,6 +828,15 @@ export function pausedExitRecoverySentence(paths: PausedExitRecoveryPaths): stri
     case 'close_already_in_flight':
       return 'a close order is already working at the broker for this row, so the in-app Close button '
         + 'is refused; cancel that order first, or close on Tradier.';
+    case 'staged_exit_working':
+      // TRA-4259 — this reason DOES have an in-app withdrawal, so it names it.
+      // `cancelManualPendingExit` reaches imported rows as well as engine-opened
+      // ones, and an intent that never got an order id is additionally reaped by
+      // TRA-2819. Saying only "cancel it" would repeat TRA-4224's defect one
+      // sentence down.
+      return 'an exit order is already staged or working at the broker for this row, so the in-app '
+        + 'Close button is refused; withdraw it first with the Cancel button beside the Pending badge '
+        + '(POST /api/options/:id/cancel-pending-exit), or close on Tradier.';
     case 'missing_occ':
       return 'close this position on Tradier — this row carries no OCC symbol, so the in-app Close '
         + 'button cannot route an order for it.';

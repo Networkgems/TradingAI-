@@ -15848,6 +15848,51 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
       });
       return;
     }
+    // TRA-4259 — the SECOND in-flight shape, and the one TRA-407 could not see.
+    //
+    // TRA-407 was written when imported rows were display-only, so the only
+    // exit that could exist on one was an operator close, tagged
+    // `pendingCloseOrderId` by this very handler. That is no longer true: the
+    // ENGINE stages and submits exits on imported rows
+    // (`autoManageImportedTradierOptions` defaults true; the submit path logs
+    // `imported: snapshot.importedFromTradier === true`), and an engine exit is
+    // tagged `pendingExit`, never `pendingCloseOrderId`. So an operator Close
+    // landing on a row with a working engine `sell_to_close` submitted a SECOND
+    // full-size (`contractsRemaining`) sell against one long, on the production
+    // `admin` book. The engine-opened branch below has always refused this
+    // (`if (engineOpened.position.pendingExit) 409`); the two branches simply
+    // disagreed about the same hazard.
+    //
+    // Tradier is a partial backstop, NOT a substitute — see the AC4 note in
+    // `tra4259-imported-close-pending-exit.test.ts`. It only reserves quantity
+    // for an order it already HOLDS (`tradierOrderId !== ''`). A staged intent
+    // that has not been submitted yet reserves nothing, the operator's close can
+    // fill first, and the engine then submits into a reduced/flat position —
+    // where `reconcileFlatBrokerRejection` bails on `importedFromTradier` and the
+    // row burns a TRA-450 reject instead of self-healing. Both shapes refuse here.
+    //
+    // The message names the in-app escape hatch, because TRA-4224 is the ticket
+    // about refusals that leave an operator with no route. `cancelManualPendingExit`
+    // does NOT filter imported rows, so `/cancel-pending-exit` genuinely reaches
+    // this row in both shapes; an unattached intent is additionally reaped by
+    // TRA-2819's `reapAbandonedStagedExits`. Both are asserted, not assumed.
+    if (imported.position.pendingExit) {
+      const staged = imported.position.pendingExit;
+      res.status(409).json({
+        error: 'An exit order is already staged or working at the broker for this position '
+          + `(${staged.kind}, ${staged.qty} contract${staged.qty === 1 ? '' : 's'}) — closing now would `
+          + 'submit a second sell against the same long. Cancel it first with the Cancel button beside '
+          + 'the Pending badge (POST /api/options/:id/cancel-pending-exit), then close.',
+        cancelPath: `/api/options/${id}/cancel-pending-exit`,
+        pendingExit: {
+          kind: staged.kind,
+          qty: staged.qty,
+          tradierOrderId: staged.tradierOrderId,
+          submittedAt: staged.submittedAt,
+        },
+      });
+      return;
+    }
     const settings = getSettings(username);
     // ⛔ TRA-3112 item B — this is a REAL-MONEY SELL into whatever account the
     // creds resolve to, behind `requireAuth` alone. Before this ticket it built

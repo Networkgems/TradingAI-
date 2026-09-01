@@ -207,7 +207,11 @@ describe('TRA-4224 — the paused-exit notice names only paths the row actually 
   });
 
   it('every refusal reason has a sentence, and no sentence promises a path it just refused', () => {
-    const reasons = ['close_already_in_flight', 'day_trade_guard', 'no_contracts', 'missing_occ'] as const;
+    // TRA-4259 added `staged_exit_working`. Keep this list exhaustive — it is the
+    // only control that a new refusal cannot ship without a sentence.
+    const reasons = [
+      'close_already_in_flight', 'staged_exit_working', 'day_trade_guard', 'no_contracts', 'missing_occ',
+    ] as const;
     for (const inAppCloseRefusedBy of reasons) {
       const sentence = pausedExitRecoverySentence({ broker: true, inAppClose: false, inAppCloseRefusedBy });
       expect(sentence).not.toContain('or with the Close button');
@@ -254,6 +258,9 @@ describe('TRA-4224 — the paused-exit notice names only paths the row actually 
         DAY_TRADING_GUARDRAIL,
       ).inAppCloseRefusedBy,
     ).toBe('day_trade_guard');
+    // TRA-4259 — was `close_already_in_flight`. The field the engine-opened
+    // branch reads is `pendingExit`, which only a STAGED exit sets, and that
+    // shape has an in-app withdrawal the TRA-407 operator-close shape does not.
     expect(
       pausedExitRecoveryPaths(
         {
@@ -265,6 +272,6 @@ describe('TRA-4224 — the paused-exit notice names only paths the row actually 
         NOW,
         DAY_TRADING_GUARDRAIL,
       ).inAppCloseRefusedBy,
-    ).toBe('close_already_in_flight');
+    ).toBe('staged_exit_working');
   });
 });
