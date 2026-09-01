@@ -108,13 +108,43 @@ import { join } from 'node:path';
  * `submitManualOptionClose` — the operator's Close button on an engine-opened
  * row, which on 08-31 failed on the same Tradier 500.
  *
- * ⛔ NOT INSTRUMENTED: the IMPORTED-position close route
- * (`index.ts`, `submitSmartSellToClose` on a row carrying `pendingCloseOrderId`
- * rather than a `pendingExit`). Its outcomes are absent from this fold, so a
- * book whose only close activity went through that route still reads
- * `closeAttempts: 0`. Named here rather than left silent, because "an absent
- * cell must not read like a clean one" is the property this whole module is
- * built around and it applies to its own coverage first. Tracked separately.
+ * ## TRA-4260 — the `pendingCloseOrderId` machinery, the second close shape
+ *
+ * The four seams above all key off `pendingExit`. There is a SECOND close shape
+ * in the codebase — a row carrying `pendingCloseOrderId` — reached by the
+ * IMPORTED-position branch of `POST /api/options/:id/close` (`index.ts`) and
+ * resolved by the engine's per-tick `reconcilePendingCloses`. It was not
+ * instrumented, so a book whose only close activity went through it read
+ * `closeAttempts: 0, closeVerdict: "idle"` — the same absent-reads-clean shape
+ * TRA-4223 was filed against, one route over. It is now instrumented end to end:
+ *
+ *   • `index.ts` imported branch → {@link SignalEngine.recordBrokerCloseCensusEvent}
+ *     fed by {@link smartSellCloseCensusEvents}, so the route needs no clock, no
+ *     book key and no taxonomy of its own — it lands on the SAME census row as
+ *     the four engine seams;
+ *   • `reconcilePendingCloses` — the terminal outcome (`filled` / `partial_fill`
+ *     / `rejected`) of an order those routes left `pending`, the fill-chaser's
+ *     reprice re-submits, and the partial-fill remainder re-submit.
+ *
+ * The terminal leg is not optional bonus coverage: recording `submitted` at the
+ * route and nothing at the sweep would leave a book that closed cleanly 30s
+ * later reading `closeAttempts: 1, closeFilled: 0` ⇒ `degraded`, forever. A
+ * false `degraded` desensitises the instrument exactly as a false `idle` blinds
+ * it.
+ *
+ * `submitSmartSellToClose` RETURNS its failures rather than throwing them, so
+ * the TRA-4223 reached-Tradier-vs-threw split cannot be read off `status`
+ * alone — its `rejected` covers BOTH a broker refusal and a submit that threw.
+ * The helper therefore publishes the split itself (`failure`, and
+ * `submittedOrders` for the multi-attempt walk); see `tradier-smart-close.ts`.
+ *
+ * ⛔ NOT INSTRUMENTED, and deliberately: PAPER closes. The demo / no-creds
+ * sub-path of the same route (and `manualClosePosition` on the equity book)
+ * never contacts a broker, so it has nothing to say about broker outcomes and
+ * counting it would inflate the denominator this fold publishes. Named here
+ * rather than left silent, because "an absent cell must not read like a clean
+ * one" is the property this whole module is built around and it applies to its
+ * own coverage first.
  */
 
 /**
@@ -244,6 +274,32 @@ export const UNATTRIBUTED_BOOK = '(unattributed)';
  *     reach the broker. `expired` is separate for the same reason TRA-2984 gave
  *     it its own counter on the position: the order reached the broker and
  *     lapsed unfilled, which is not the broker refusing anything.
+ *
+ * ## TRA-4260 — `no_quote_abort`, the close leg's PRE-SUBMIT abort
+ *
+ * `submitSmartSellToClose` refuses to place a `sell_to_close` it cannot price:
+ * the quote lookup threw, the OCC returned nothing usable, or the walk's next
+ * step rounded to ≤ 0. Nothing is handed to Tradier. That is a THIRD stage,
+ * neither "reached the broker" nor "the submit threw", and the ticket that added
+ * it required the choice be stated rather than silently dropped. It is:
+ *
+ *   • **counted**, in its own field ({@link BookDayCell.closeNoQuoteAborts}),
+ *     never folded into `closeSubmitted` — the reached-vs-threw split above is
+ *     the one TRA-4223 turns on and a pre-submit abort clears neither bar; and
+ *   • **inside {@link BrokerSubmitCensusRow.closeAttempts}**, so it makes the
+ *     book non-`idle`.
+ *
+ * The second half is the load-bearing one, and it is where this leg parts
+ * company with the entry leg on purpose. On entries a pre-submit abort is
+ * excluded from the `idle` denominator (`preSubmitAborts` is published but does
+ * not grade), because an entry we refused to place costs an opportunity and
+ * nothing else. **An exit we refused to place leaves live capital unprotected**
+ * — the module docblock already names that asymmetry as the reason the two legs
+ * are counted apart. An operator who pressed Close three times and got three
+ * `no_quote` refusals has a book that tried to get flat and did not, and a
+ * census that reads `idle` over that is the defect, not the fix. So the same
+ * sentence TRA-4223 wrote about throws — "still an exit this book tried and
+ * failed to place" — governs here, and yields `degraded`.
  */
 export type BrokerCloseEvent =
   | 'submitted'
@@ -251,7 +307,8 @@ export type BrokerCloseEvent =
   | 'rejected'
   | 'expired'
   | 'transport_fault'
-  | 'submit_throw';
+  | 'submit_throw'
+  | 'no_quote_abort';
 
 interface BookDayCell {
   /** Orders handed to the broker. Never incremented by a pre-submit abort. */
@@ -286,6 +343,8 @@ interface BookDayCell {
   closeTransportFaults: number;
   /** Close submits that threw for a non-broker reason (network/auth/parse). */
   closeSubmitThrows: number;
+  /** TRA-4260 — closes we refused to price. Nothing reached Tradier. */
+  closeNoQuoteAborts: number;
 }
 
 /** etDay -> book -> cell. */
@@ -317,6 +376,7 @@ function emptyCell(): BookDayCell {
     closeExpired: 0,
     closeTransportFaults: 0,
     closeSubmitThrows: 0,
+    closeNoQuoteAborts: 0,
   };
 }
 
@@ -469,6 +529,9 @@ export function recordBrokerCloseEvent(book: string, etDay: string, event: Broke
     case 'submit_throw':
       cell.closeSubmitThrows += 1;
       break;
+    case 'no_quote_abort':
+      cell.closeNoQuoteAborts += 1;
+      break;
   }
   persistCensusDayIfArmed(etDay);
 }
@@ -595,9 +658,16 @@ export interface BrokerSubmitCensusRow {
   /** Close submits that threw for a non-broker reason (network/auth/parse). */
   closeSubmitThrows: number;
   /**
-   * Every close order this book TRIED to place: reached + threw. This is the
-   * denominator that makes `idle` mean "did nothing" again — it is non-zero for
-   * a book whose only broker activity was N failed exits.
+   * TRA-4260 — closes the smart-close layer refused to price, so no order was
+   * ever built. Published on its own because it is a THIRD stage: neither
+   * reached-the-broker nor threw. See {@link BrokerCloseEvent}.
+   */
+  closeNoQuoteAborts: number;
+  /**
+   * Every close order this book TRIED to place: reached + threw + refused to
+   * price (TRA-4260). This is the denominator that makes `idle` mean "did
+   * nothing" again — it is non-zero for a book whose only broker activity was N
+   * failed exits.
    */
   closeAttempts: number;
   /**
@@ -671,6 +741,13 @@ export interface BrokerSubmitCensusReport {
     closeTransportFaults: number;
     /** Books with ≥1 close submit that threw on a broker fault. */
     closeTransportBookCount: number;
+    /**
+     * TRA-4260 — closes the fleet refused to price. Fleet-level for the same
+     * reason its neighbours are: a dead-quote day is a market-wide condition
+     * (a halted underlying, a stale feed), and one row cannot tell it apart
+     * from one book holding one untradeable OCC. Count only (TRA-2163).
+     */
+    closeNoQuoteAborts: number;
     /** Books that tried to close and filled none. The unprotected-capital count. */
     closeDegradedBookCount: number;
   };
@@ -718,11 +795,16 @@ function gradeRow(book: string, etDay: string, cell: BookDayCell | undefined): B
   const closeSubmitted = cell?.closeSubmitted ?? 0;
   const closeTransportFaults = cell?.closeTransportFaults ?? 0;
   const closeSubmitThrows = cell?.closeSubmitThrows ?? 0;
+  const closeNoQuoteAborts = cell?.closeNoQuoteAborts ?? 0;
   const closeFilled = cell?.closeFilled ?? 0;
   // TRA-4223 — the throws are IN the denominator on purpose: a submit that never
   // reached Tradier is still an exit this book tried and failed to place, and
   // leaving it out is precisely what let three failed closes read `idle`.
-  const closeAttempts = closeSubmitted + closeTransportFaults + closeSubmitThrows;
+  // TRA-4260 — and so is a `no_quote` pre-submit abort, by the same sentence: an
+  // exit we refused to price leaves the capital just as unprotected. This is the
+  // one place the close leg deliberately parts company with the entry leg, whose
+  // `preSubmitAborts` are published but do not grade. See {@link BrokerCloseEvent}.
+  const closeAttempts = closeSubmitted + closeTransportFaults + closeSubmitThrows + closeNoQuoteAborts;
   const entryVerdict = gradeLeg(submitted, filled);
   const closeVerdict = gradeLeg(closeAttempts, closeFilled);
   const worseLeg =
@@ -749,6 +831,7 @@ function gradeRow(book: string, etDay: string, cell: BookDayCell | undefined): B
     closeExpired: cell?.closeExpired ?? 0,
     closeTransportFaults,
     closeSubmitThrows,
+    closeNoQuoteAborts,
     closeAttempts,
     entryVerdict,
     closeVerdict,
@@ -792,6 +875,7 @@ export function summarizeBrokerSubmitCensus(
       closeRejected: rows.reduce((a, r) => a + r.closeRejected, 0),
       closeTransportFaults: rows.reduce((a, r) => a + r.closeTransportFaults, 0),
       closeTransportBookCount: rows.filter(r => r.closeTransportFaults > 0).length,
+      closeNoQuoteAborts: rows.reduce((a, r) => a + r.closeNoQuoteAborts, 0),
       closeDegradedBookCount: rows.filter(r => r.closeVerdict === 'degraded').length,
     },
     retainedEtDays: [...store.keys()].sort(),
@@ -883,6 +967,11 @@ function deserializeDay(raw: Record<string, unknown>): Map<string, BookDayCell> 
       closeExpired: Number(cell['closeExpired'] ?? 0),
       closeTransportFaults: Number(cell['closeTransportFaults'] ?? 0),
       closeSubmitThrows: Number(cell['closeSubmitThrows'] ?? 0),
+      // TRA-4260 — same `?? 0` migration as the TRA-4223 fields above: a
+      // snapshot written before this ticket carries no `closeNoQuoteAborts`,
+      // and reading it back as `NaN` would poison `closeAttempts` and every
+      // sum downstream, rendering as `null` through JSON.
+      closeNoQuoteAborts: Number(cell['closeNoQuoteAborts'] ?? 0),
     });
   }
   return day;

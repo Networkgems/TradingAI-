@@ -4,8 +4,10 @@ import {
   type TradierOrderDetail,
   TRADIER_REJECTED_STATUSES,
   TRADIER_TERMINAL_STATUSES,
+  isTransportOrderFailure, // TRA-4260 — a 5xx is not a refusal
   roundToCent,
 } from '@trading-app/engine';
+import type { BrokerCloseEvent } from './broker-submit-census.js';
 import { logger } from './observability/index.js';
 import {
   recordCancelReplaceLatency,
@@ -28,6 +30,28 @@ const closeLog = logger.child({ module: 'tradier-smart-close' });
  *    this OCC; we refuse to submit a market order against a dead contract
  *    (the whole point of the smart-pricing layer is to avoid filling at $0
  *    or a wide-spread bid). Response is 409.
+ *
+ * ## TRA-4260 — the two fields the broker census needs and `status` cannot give
+ *
+ * The census close leg (`broker-submit-census.ts`) turns on ONE distinction:
+ * did the order reach a broker DECISION. This helper's `status` cannot answer
+ * it, in two independent ways, and both were silently wrong before this ticket:
+ *
+ *   • `rejected` has TWO producers — `sellContractsLimit` THREW (nothing
+ *     reached a decision; on 2026-08-31 this is what a Tradier HTTP 500 did) and
+ *     the broker drove the order to a rejected terminal status (it very much
+ *     did). {@link SmartSellFailureKind} publishes the split, computed from the
+ *     thrown error's `kind` via `isTransportOrderFailure` — never from the
+ *     message text, so it agrees with every other close seam in the tree.
+ *   • the walk submits up to `maxAttempts` orders and returns ONE outcome, so a
+ *     caller counting outcomes under-counts the orders Tradier actually
+ *     accepted. `submittedOrders` is that count, and it is on EVERY variant
+ *     (including `no_quote`: attempt 1 can round to ≤ 0 after attempt 0 was
+ *     already accepted and cancelled).
+ *
+ * Callers fold both through {@link smartSellCloseCensusEvents} rather than
+ * re-deriving them; a caller that pattern-matches `status` by hand is how the
+ * imported-close route came to be the one uninstrumented close seam.
  */
 export type SmartSellOutcome =
   | {
@@ -41,10 +65,86 @@ export type SmartSellOutcome =
        * the caller compute realised close-side slippage vs mid for telemetry.
        */
       mid: number | null;
+      /** TRA-4260 — orders Tradier ACCEPTED during the walk. See above. */
+      submittedOrders: number;
     }
-  | { status: 'rejected'; orderId?: number; reason: string }
-  | { status: 'pending'; orderId: number; limitPrice: number }
-  | { status: 'no_quote'; reason: string };
+  | {
+      status: 'rejected';
+      orderId?: number;
+      reason: string;
+      /** TRA-4260 — did this reach a broker decision, or did the submit throw? */
+      failure: SmartSellFailureKind;
+      submittedOrders: number;
+    }
+  | { status: 'pending'; orderId: number; limitPrice: number; submittedOrders: number }
+  | { status: 'no_quote'; reason: string; submittedOrders: number };
+
+/**
+ * TRA-4260 — why a {@link SmartSellOutcome} came back `rejected`, on the one
+ * axis the broker census grades. Deliberately three members, not a boolean:
+ * `transport_fault` and `submit_throw` both mean "no broker decision", but they
+ * take different operator actions (wait for Tradier vs investigate our client),
+ * which is the TRA-4226 line the census already draws on the entry leg.
+ */
+export type SmartSellFailureKind = 'broker_rejected' | 'submit_threw' | 'transport_fault';
+
+/**
+ * TRA-4260 — classify a throw off the error's `kind`, never its message text.
+ * The return type excludes `broker_rejected` by construction: a throw is, by
+ * definition, the absence of a broker decision.
+ */
+function failureKindForThrow(err: unknown): Exclude<SmartSellFailureKind, 'broker_rejected'> {
+  return isTransportOrderFailure(err) ? 'transport_fault' : 'submit_threw';
+}
+
+/**
+ * TRA-4260 — fold a {@link SmartSellOutcome} into the close-leg census events it
+ * represents, in submission order. THE single place the mapping lives, so the
+ * imported-close route, the fill-chaser's remainder re-submit and any future
+ * caller cannot disagree about it.
+ *
+ * Emits one `submitted` per order Tradier accepted, then AT MOST one terminal
+ * event for the outcome the caller is holding:
+ *
+ *   • `filled`   → `submitted` × n, then `filled`.
+ *   • `pending`  → `submitted` × n and nothing else. The order is still working;
+ *     its terminal event is recorded later by `reconcilePendingCloses`, and
+ *     stamping one here would double-count the same order.
+ *   • `rejected` → `submitted` × n, then `rejected` (the broker decided) or
+ *     `transport_fault` / `submit_throw` (it did not). A throw is NEVER
+ *     `rejected`: `submitted` means "the broker saw it and did not fill it", and
+ *     a throw did not clear that bar.
+ *   • `no_quote` → `submitted` × n (usually 0), then `no_quote_abort`.
+ *
+ * `expired` is not reachable from here: `submitSmartSellToClose` folds every
+ * `TRADIER_REJECTED_STATUSES` member — expired included — into `rejected`
+ * without publishing which one, so claiming `expired` would be a guess. The
+ * sweep that DOES see the raw status records it.
+ */
+export function smartSellCloseCensusEvents(outcome: SmartSellOutcome): BrokerCloseEvent[] {
+  const events: BrokerCloseEvent[] = [];
+  for (let i = 0; i < outcome.submittedOrders; i += 1) events.push('submitted');
+  switch (outcome.status) {
+    case 'filled':
+      events.push('filled');
+      break;
+    case 'pending':
+      break;
+    case 'no_quote':
+      events.push('no_quote_abort');
+      break;
+    case 'rejected':
+      events.push(
+        outcome.failure === 'broker_rejected'
+          ? 'rejected'
+          : outcome.failure === 'transport_fault'
+            ? 'transport_fault'
+            : 'submit_throw',
+      );
+      break;
+  }
+  return events;
+}
 
 export interface SmartSellOptions {
   /** TRA-352 — wait window per attempt (defaults to 5s to match TRA-348). */
@@ -96,6 +196,11 @@ export async function submitSmartSellToClose(
   const sleep = options.sleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
   const clock = options.clock ?? Date.now;
 
+  // TRA-4260 — orders Tradier ACCEPTED across the whole walk. Carried on every
+  // return so a caller folding this into the broker census counts the orders the
+  // broker saw, not the outcomes we returned.
+  let submittedOrders = 0;
+
   let quote: TradierOptionQuote | null = null;
   try {
     quote = await client.getOptionQuote(optionSymbol);
@@ -103,6 +208,7 @@ export async function submitSmartSellToClose(
     return {
       status: 'no_quote',
       reason: `Tradier quote lookup failed: ${err instanceof Error ? err.message : String(err)}`,
+      submittedOrders,
     };
   }
 
@@ -111,6 +217,7 @@ export async function submitSmartSellToClose(
     return {
       status: 'no_quote',
       reason: 'No quote available — close this contract manually on Tradier.',
+      submittedOrders,
     };
   }
 
@@ -124,6 +231,7 @@ export async function submitSmartSellToClose(
       return {
         status: 'no_quote',
         reason: 'No quote available — close this contract manually on Tradier.',
+        submittedOrders,
       };
     }
 
@@ -135,9 +243,14 @@ export async function submitSmartSellToClose(
       return {
         status: 'rejected',
         reason: err instanceof Error ? err.message : String(err),
+        // TRA-4260 — the submit THREW: nothing reached a broker decision, so
+        // this must never fold to the census's `rejected`.
+        failure: failureKindForThrow(err),
+        submittedOrders,
         ...(lastOrderId !== undefined ? { orderId: lastOrderId } : {}),
       };
     }
+    submittedOrders += 1;
     // TRA-2046 — attempt > 0 is a reprice re-submit (the "replace" leg); capture
     // its submit->ack latency. Attempt 0 is the initial submit, not a replace.
     if (attempt > 0) {
@@ -168,6 +281,7 @@ export async function submitSmartSellToClose(
         // TRA-1601 — mid only exists on a two-sided (mid) path; a single-sided
         // `last` fallback can't triangulate one, so telemetry drops the datum.
         mid: limitPath.kind === 'mid' ? (limitPath.bid + limitPath.ask) / 2 : null,
+        submittedOrders,
       };
     }
     if (TRADIER_REJECTED_STATUSES.has(status)) {
@@ -175,6 +289,9 @@ export async function submitSmartSellToClose(
         status: 'rejected',
         orderId: order.id,
         reason: detail?.reason_description?.trim() || status,
+        // TRA-4260 — the broker HELD this order and decided against it.
+        failure: 'broker_rejected',
+        submittedOrders,
       };
     }
     // Still pending / open after the wait window. Cancel before walking the
@@ -213,12 +330,19 @@ export async function submitSmartSellToClose(
     return {
       status: 'rejected',
       reason: lastDetail?.reason_description?.trim() || 'Tradier did not accept the close order.',
+      // TRA-4260 — defensive-unreachable (`maxAttempts` ≥ 1 and every path out
+      // of the loop body either returns or sets `lastOrderId`). If it ever does
+      // fire, no order id exists, so no order reached a decision: `submit_threw`
+      // is the honest read and `broker_rejected` would be an invented one.
+      failure: 'submit_threw',
+      submittedOrders,
     };
   }
   return {
     status: 'pending',
     orderId: lastOrderId,
     limitPrice: roundToCent(priceForAttempt(limitPath, maxAttempts - 1)),
+    submittedOrders,
   };
 }
 
@@ -273,7 +397,20 @@ interface NoPath {
 export type ReconcileOutcome =
   | { status: 'filled'; orderId: number | string; avgFillPrice: number; limitPrice?: number }
   | { status: 'partial_fill'; orderId: number | string; avgFillPrice: number; filledQty: number }
-  | { status: 'rejected'; orderId: number | string; reason: string }
+  | {
+      status: 'rejected';
+      orderId: number | string;
+      reason: string;
+      /**
+       * TRA-4260 — the BROKER's own terminal status (`expired`, `canceled`,
+       * `rejected`, `error`, …), verbatim. `reason` is free text and is often
+       * this same word, but a caller must never key on free text; the census
+       * splits `expired` out of `rejected` for the TRA-2984 reason (the order
+       * reached the broker and lapsed — the broker refused nothing) and needs
+       * the enum to do it. Empty string only when Tradier sent no status at all.
+       */
+      terminalStatus: string;
+    }
   | { status: 'pending'; orderId: number | string }
   | { status: 'unknown'; orderId: number | string; reason: string };
 
@@ -352,6 +489,7 @@ export async function reconcilePendingCloseOrder(
       status: 'rejected',
       orderId,
       reason: detail.reason_description?.trim() || status,
+      terminalStatus: status, // TRA-4260
     };
   }
   if (TRADIER_TERMINAL_STATUSES.has(status)) {
@@ -363,7 +501,7 @@ export async function reconcilePendingCloseOrder(
     if (partial) {
       return { status: 'partial_fill', orderId, avgFillPrice: partial.avgFillPrice, filledQty: partial.filledQty };
     }
-    return { status: 'rejected', orderId, reason: status };
+    return { status: 'rejected', orderId, reason: status, terminalStatus: status }; // TRA-4260
   }
   return { status: 'pending', orderId };
 }
@@ -632,11 +770,22 @@ const CHASE_START_FRACTION = 0.2;
  *  - `error` → the cancel went through but the resubmit failed; the original
  *    order is gone. Caller clears the pending marker so the row re-renders
  *    Close (imported) or lets `checkExits` retry (engine-opened).
+ *
+ * TRA-4260 — `error` carries {@link SmartSellFailureKind} for the same reason
+ * `SmartSellOutcome.rejected` does: the resubmit THREW, so nothing reached a
+ * broker decision, and the census has to tell a Tradier outage apart from our
+ * own client breaking. It is never `broker_rejected` — a refusal the broker
+ * actually returned arrives as a terminal order status on a later sweep, not as
+ * a throw here.
+ *
+ * `held` carries no census event at all, and that is not an omission: the
+ * ORIGINAL order is still live and working at the broker. Nothing was
+ * submitted, nothing was aborted, and the exit is still in flight.
  */
 export type RepriceOutcome =
   | { status: 'repriced'; orderId: number; limitPrice: number; step: number }
   | { status: 'held'; reason: string }
-  | { status: 'error'; reason: string };
+  | { status: 'error'; reason: string; failure: Exclude<SmartSellFailureKind, 'broker_rejected'> };
 
 /**
  * TRA-392 — compute the limit price for the n-th fill-chaser reprice step,
@@ -726,7 +875,12 @@ export async function repricePendingCloseOrder(
   try {
     order = await client.sellContractsLimit(optionSymbol, qty, limitPrice);
   } catch (err: unknown) {
-    return { status: 'error', reason: err instanceof Error ? err.message : String(err) };
+    return {
+      status: 'error',
+      reason: err instanceof Error ? err.message : String(err),
+      // TRA-4260 — off the error's `kind`, never its message text.
+      failure: failureKindForThrow(err),
+    };
   }
   return { status: 'repriced', orderId: order.id, limitPrice, step };
 }

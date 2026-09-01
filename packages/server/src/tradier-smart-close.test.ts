@@ -247,6 +247,9 @@ describe('submitSmartSellToClose', () => {
       avgFillPrice: 0.11,
       limitPrice: 0.11,
       mid: (0.05 + 0.17) / 2,
+      // TRA-4260 — one order reached Tradier. The broker census counts ORDERS
+      // the broker accepted, and the walk can submit more than one per outcome.
+      submittedOrders: 1,
     });
     // Midpoint of (0.05 + 0.17) / 2 = 0.11, rounded to a cent.
     expect(sellSpy).toHaveBeenCalledWith('X', 2, 0.11);
@@ -304,6 +307,10 @@ describe('submitSmartSellToClose', () => {
       status: 'rejected',
       orderId: 300,
       reason: 'insufficient buying power',
+      // TRA-4260 — the broker HELD this order and decided against it, which is
+      // the half of `rejected` that counts as `submitted` on the close census.
+      failure: 'broker_rejected',
+      submittedOrders: 1,
     });
   });
 
@@ -430,7 +437,10 @@ describe('reconcilePendingCloseOrder', () => {
   it('falls back to the raw status string when Tradier omits reason_description', async () => {
     const client = buildStatusClient({ id: 2, status: 'expired' } as TradierOrderDetail);
     const outcome = await reconcilePendingCloseOrder(client, 2);
-    expect(outcome).toEqual({ status: 'rejected', orderId: 2, reason: 'expired' });
+    // TRA-4260 — `terminalStatus` is the broker's status ENUM, published so the
+    // census can split `expired` (the order lapsed) from `rejected` (the broker
+    // refused) without keying on `reason`, which is free text.
+    expect(outcome).toEqual({ status: 'rejected', orderId: 2, reason: 'expired', terminalStatus: 'expired' });
   });
 
   it('reports pending when Tradier still shows the order as open / pending', async () => {

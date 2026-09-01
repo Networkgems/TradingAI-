@@ -920,7 +920,7 @@ import {
   type TradierCashEvent,
   type TradierTradeHistoryFill,
 } from '@trading-app/engine';
-import { submitSmartSellToClose } from './tradier-smart-close.js';
+import { smartSellCloseCensusEvents, submitSmartSellToClose } from './tradier-smart-close.js';
 import { recordMakerFill } from './option-maker-fill-ledger.js';
 import {
   validateOptionsSmokeRequest,
@@ -15913,6 +15913,28 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
       return;
     }
     const outcome = await submitSmartSellToClose(client, optionSymbol, contracts);
+    // TRA-4260 — THE CLOSE-LEG CENSUS SEAM for the imported-position route.
+    //
+    // Until this ticket the four instrumented close seams were all in
+    // `signal-engine.ts` and all keyed off `pendingExit`; this route is the
+    // second close shape (`pendingCloseOrderId`) and was the one hole named in
+    // `broker-submit-census.ts`. A book whose only close activity came through
+    // here read `closeAttempts: 0, closeVerdict: "idle"` — a book that tried to
+    // get flat and could not, byte-identical to a book that did nothing.
+    //
+    // Two things are deliberately NOT done inline here. The outcome is not
+    // pattern-matched into census events — `submitSmartSellToClose` RETURNS its
+    // failures instead of throwing, so its `rejected` covers both a broker
+    // decision and a submit that threw, and re-deriving that split per caller is
+    // how seams drift apart; `smartSellCloseCensusEvents` owns it. And the book
+    // key is not built from `username` + a local clock — it comes from the
+    // engine, so this row lands on the SAME census cell as the engine's own
+    // seams rather than a second row a reader has to join by hand.
+    //
+    // It sits ABOVE every response branch on purpose: each `return` below is a
+    // different outcome, and a per-branch call is one refactor away from a
+    // branch that quietly forgets to count.
+    for (const ev of smartSellCloseCensusEvents(outcome)) ctx.engine.recordBrokerCloseCensusEvent(ev);
     // TRA-1601 — close-side maker-fill telemetry. Fire-and-forget; positive
     // realizedVsMid = received below mid = cost. `production` is the live book.
     recordMakerFill({

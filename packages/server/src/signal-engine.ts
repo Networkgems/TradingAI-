@@ -381,6 +381,7 @@ import {
   liveSellLimitDetailed,
   reconcilePendingCloseOrder,
   repricePendingCloseOrder,
+  smartSellCloseCensusEvents, // TRA-4260
   submitSmartSellToClose,
 } from './tradier-smart-close.js';
 import { submitSmartBuyToOpen } from './tradier-smart-open.js';
@@ -10277,6 +10278,30 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-4260 — the PUBLIC face of {@link recordCloseCensus}, for the one close
+   * seam that does not live on this class: the IMPORTED-position branch of
+   * `POST /api/options/:id/close` (`index.ts`), an Express handler holding
+   * `ctx.engine` and a `username`.
+   *
+   * The engine's public surface is widened by exactly one method rather than
+   * letting the route call `recordBrokerCloseEvent` directly, and the reason is
+   * the census KEY. The four in-class seams book against
+   * `alertUsername ?? UNATTRIBUTED_BOOK` and `etDateString(new Date())`. A route
+   * passing its own `res.locals.authUser` and its own clock would be right most
+   * of the time and wrong in exactly the cases that matter — an engine booted
+   * without a username, or a close landing either side of the ET boundary — and
+   * the failure mode is TWO rows for one book, which is the "reader has to join
+   * them by hand" defect TRA-4223 wrote this seam to avoid. Routing through here
+   * makes the key unforgeable rather than merely conventional.
+   *
+   * Callers fold a {@link SmartSellOutcome} with `smartSellCloseCensusEvents`
+   * and pass the events through; they do not classify outcomes themselves.
+   */
+  recordBrokerCloseCensusEvent(event: BrokerCloseEvent): void {
+    this.recordCloseCensus(event);
+  }
+
+  /**
    * TRA-4223 — classify a close submit that THREW. `transport_fault` is the
    * broker's own infrastructure (5xx / timeout — retry when it is back);
    * `submit_throw` is ours (network / auth / parse — investigate the client).
@@ -18964,6 +18989,14 @@ export class SignalEngine {
               const closed = acct.recordImportedFill(row.optionId, outcome.avgFillPrice);
               if (closed) {
                 filled += 1;
+                // TRA-4260 — the terminal event for an order one of the
+                // `pendingCloseOrderId` routes left `pending`. Gated on `closed`
+                // (not on the outcome) because that is the idempotency latch: a
+                // row whose local book-keeping did not take stays in
+                // `listPendingCloses()` and re-reads `filled` on every 30s tick,
+                // so recording off the outcome alone would count one fill
+                // forever.
+                this.recordCloseCensus('filled');
                 // TRA-2959 — this sweep is a REAL live close fill like any other:
                 // on 2026-08-04, 7 of 11 filled orders reached the book through
                 // here (and the sites below) with NO fee/slippage ledger row and
@@ -18993,6 +19026,7 @@ export class SignalEngine {
               const closed = acct.closeOption(row.optionId, outcome.avgFillPrice);
               if (closed) {
                 filled += 1;
+                this.recordCloseCensus('filled'); // TRA-4260 — see the imported branch above
                 // TRA-2959 — see the imported branch above: a sweep fill is a
                 // real live close and must reach the fee/slippage ledger.
                 if (env === 'production') {
@@ -19038,6 +19072,12 @@ export class SignalEngine {
               stillPending += 1;
             } else {
               filled += 1;
+              // TRA-4260 — a partially-filled order DID reach the broker and DID
+              // fill, so the census terminal event is `filled`, not `expired`:
+              // `bookPartialClose`'s own idempotency stamp (it refuses to re-book
+              // the same terminal order id) is what keeps this to one event per
+              // order across repeated sweeps.
+              this.recordCloseCensus('filled');
               // TRA-2959 — the booked partial slice is a real live close fill.
               if (env === 'production') {
                 this.recordLiveOptionCloseToLedger(
@@ -19076,6 +19116,12 @@ export class SignalEngine {
                   remainder,
                   { maxAttempts: 1 },
                 );
+                // TRA-4260 — the remainder re-submit is a fresh order handed to
+                // Tradier and gets the full fold: `submitted` per order accepted,
+                // then its terminal event. Folded through the shared helper so
+                // this site cannot disagree with the imported-close route about
+                // what a `rejected` means.
+                for (const ev of smartSellCloseCensusEvents(resub)) this.recordCloseCensus(ev);
                 // TRA-1601 — close-side maker-fill telemetry for the remainder
                 // resubmit. Fire-and-forget; positive realizedVsMid = cost.
                 recordMakerFill({
@@ -19149,6 +19195,13 @@ export class SignalEngine {
           } else if (outcome.status === 'rejected') {
             if (acct.clearPendingCloseOrderId(row.optionId)) {
               cleared += 1;
+              // TRA-4260 — the broker HELD this order and drove it to a terminal
+              // non-fill, so it is a census `rejected`/`expired`, never a throw
+              // class. Split off the broker's own status ENUM, matching
+              // `submitManualOptionClose`; `reason` is free text and is never
+              // keyed on. Same `clearPendingCloseOrderId`-gated idempotency as
+              // the fill branch.
+              this.recordCloseCensus(outcome.terminalStatus === 'expired' ? 'expired' : 'rejected');
               log.warn('sell_to_close terminal-no-fill — cleared pending so user can retry', {
                 component: 'tradier-reconcile',
                 optionSymbol: row.optionSymbol,
@@ -19177,6 +19230,11 @@ export class SignalEngine {
                 PENDING_CLOSE_MAX_REPRICE_STEPS,
               );
               if (rp.status === 'repriced') {
+                // TRA-4260 — the chaser cancelled our own order and handed
+                // Tradier a NEW one, so it is a second `submitted`, exactly as
+                // `escalateCappedExit` treats its re-submit. The cancelled order
+                // was cancelled by US and is never a broker reject.
+                this.recordCloseCensus('submitted');
                 acct.markPendingCloseRepriced(row.optionId, rp.orderId, nextStep);
                 repriced += 1;
                 log.info('sell_to_close repriced', {
@@ -19189,6 +19247,15 @@ export class SignalEngine {
                   limitPrice: rp.limitPrice,
                 });
               } else if (rp.status === 'error') {
+                // TRA-4260 — the re-submit THREW, so nothing reached a broker
+                // decision. This is the worst branch on the sweep to leave
+                // uncounted: the original order is already cancelled, so the row
+                // ends with NO working exit and the census would otherwise show
+                // no trace of the attempt. Split off the error's `kind`, not its
+                // text, so it agrees with every other close seam.
+                this.recordCloseCensus(
+                  rp.failure === 'transport_fault' ? 'transport_fault' : 'submit_throw',
+                );
                 // Cancel went through but the resubmit failed — the old
                 // order is gone. Clear pending so the row re-renders Close
                 // (imported) / `checkExits` can retry (engine-opened).
