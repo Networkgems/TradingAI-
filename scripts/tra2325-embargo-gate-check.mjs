@@ -15,6 +15,9 @@
 //   exit 0 = all cases pass · 1 = a case failed
 
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   freezeState,
   embargoState,
@@ -33,6 +36,10 @@ import {
   deployHoldCoversService,
   deployHoldOverrideTokens,
   deployHoldOverrideNames,
+  deployHoldStaleness,
+  renderDeployHoldStaleness,
+  renderDeployHoldRefusal,
+  gitEnumerationProbe,
   requestedServiceRef,
   DEPLOY_HOLD_FILE,
   EMBARGOES,
@@ -398,6 +405,199 @@ const ovMissing = [true, false].filter(v => !ovProduced.has(v)).map(v => `overri
   }
 }
 
+// ── Gate −1b: is the hold's enumeration STILL CURRENT? (TRA-4262) ────────────
+// `emits` is a snapshot of a MOVING TIP — this script ships the tip, never a pin, so the
+// list goes stale the next time anybody pushes. Same discipline as every section above:
+// each LOUD status is paired with the CURRENT case it differs from by one variable, and
+// the run fails if any status is unreachable.
+const HEAD_A = 'aaaaaaaaaaaa1111111111111111111111111111';
+const HEAD_B = 'bbbbbbbbbbbb2222222222222222222222222222';
+const stampedRow = tip => ({ ...HELD_ROW, enumeratedTip: tip, enumeratedAt: '2026-09-01T15:15:00Z' });
+
+// Injected probe. `delta` is a canned answer, so these cases grade the PREDICATE.
+const fakeProbe = (head, delta) => ({
+  head: () => head,
+  delta: () => delta,
+});
+const okDelta = (commits, paths, shallow = false) => ({ ok: true, shallow, commits, paths });
+const C1 = [{ sha: 'c0ffee1', subject: 'feat(TRA-4255): publish admissibility' }];
+const C2 = [...C1, { sha: 'dec0de2', subject: 'feat(TRA-4154): roll byEtDay' }];
+
+const STALENESS_CASES = [
+  [
+    stampedRow(HEAD_A),
+    fakeProbe({ sha: HEAD_A, source: 'local origin/main' }, okDelta([], [])),
+    'CURRENT',
+    'the enumeration was taken against exactly what would ship — the ONE silent status',
+  ],
+  [
+    { ...stampedRow(HEAD_A), enumeratedTip: HEAD_A.slice(0, 12) },
+    fakeProbe({ sha: HEAD_A, source: 'local origin/main' }, okDelta(C1, ['packages/server/src/x.ts'])),
+    'CURRENT',
+    'an ABBREVIATED stamp against the same commit is CURRENT — a stamp that only matched at 40 chars would read stale against its own tip',
+  ],
+  [
+    stampedRow(HEAD_A),
+    fakeProbe({ sha: HEAD_B, source: 'local origin/main' }, okDelta(C2, ['packages/server/src/rv-scan-telemetry.ts', 'ops/deploy-hold.json'])),
+    'STALE',
+    'two commits landed since the enumeration — the defect TRA-4262 filed',
+  ],
+  [
+    { ...HELD_ROW, enumeratedTip: undefined },
+    fakeProbe({ sha: HEAD_B, source: 'local origin/main' }, okDelta(C2, [])),
+    'UNSTAMPED',
+    'a hold with no stamp: staleness is undetectable by inspection, which is the pre-TRA-4262 state of the file',
+  ],
+  [
+    stampedRow(HEAD_A),
+    fakeProbe({ sha: HEAD_B, source: 'local origin/main' }, okDelta([], ['packages/server/src/x.ts'])),
+    'DIVERGED',
+    'shas differ but nothing is in tip..head — the stamp is not an ancestor of what would ship, so CURRENT cannot be claimed',
+  ],
+  [
+    stampedRow(HEAD_A),
+    fakeProbe({ sha: HEAD_B, source: 'local origin/main' }, { ok: false, shallow: false, error: 'git log failed (status 128)' }),
+    'BLIND',
+    'git could not answer — "cannot tell" must NEVER collapse into CURRENT',
+  ],
+  [
+    stampedRow(HEAD_A),
+    fakeProbe({ sha: HEAD_B, source: 'local origin/main' }, okDelta([], [], true)),
+    'BLIND',
+    'an EMPTY tip..head in a SHALLOW checkout is a graft, not currency (TRA-3699) — the same input reads DIVERGED when the history is complete',
+  ],
+  [
+    stampedRow(HEAD_A),
+    fakeProbe({ sha: null, error: 'could not resolve origin/main' }, okDelta(C2, [])),
+    'BLIND',
+    'the sha that would ship is unresolvable — no comparison exists to make',
+  ],
+];
+
+for (const [hold, probe, expected, why] of STALENESS_CASES) {
+  const got = deployHoldStaleness(hold, probe).status;
+  if (got === expected) {
+    pass += 1;
+    console.log(`  ok   staleness            ${got.padEnd(20)} ${why}`);
+  } else {
+    failures.push({ iso: 'deploy-hold staleness', expected, got, why });
+    console.log(`  FAIL staleness            expected ${expected}, got ${got}  — ${why}`);
+  }
+}
+
+const stProduced = new Set(STALENESS_CASES.map(([h, p]) => deployHoldStaleness(h, p).status));
+const stMissing = ['CURRENT', 'STALE', 'UNSTAMPED', 'DIVERGED', 'BLIND'].filter(v => !stProduced.has(v));
+
+// The one-sidedness control on the RENDERER: only CURRENT is silent, and every loud status
+// must actually reach the refusal text. A staleness grader nobody can read is not a gate.
+{
+  const silent = renderDeployHoldStaleness(deployHoldStaleness(STALENESS_CASES[0][0], STALENESS_CASES[0][1]));
+  if (silent.length === 0) {
+    pass += 1;
+    console.log(`  ok   staleness-render     ${'CURRENT'.padEnd(20)} a current enumeration prints NOTHING — a line on every read is a line nobody reads`);
+  } else {
+    failures.push({ iso: 'staleness-render CURRENT', expected: '0 lines', got: `${silent.length} lines`, why: 'CURRENT must be silent' });
+    console.log(`  FAIL staleness-render     CURRENT printed ${silent.length} line(s)`);
+  }
+}
+
+// ── LIVE arm: REAL ancestry out of THIS repo, through the REAL refusal renderer ──
+// AC4 of TRA-4262: the staleness must be proven against a hold whose enumeratedTip is an
+// actual ancestor of HEAD, not a hand-written fixture sha — an injected probe grades the
+// predicate and can never grade `gitEnumerationProbe`. This drives the shipped probe
+// against the shipped renderer and asserts the REFUSAL NAMES the drift.
+let staleLiveArms = 0;
+{
+  const headSha = (spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout ?? '').trim();
+  const ancestor = (spawnSync('git', ['rev-parse', 'HEAD~1'], { encoding: 'utf8' }).stdout ?? '').trim();
+  if (!headSha || !ancestor) {
+    // A shallow or graftless checkout cannot supply an ancestor. That is not a failure of
+    // the gate — but it must not read as a pass either, so it prints and is not counted.
+    console.log(`  note staleness-live       SKIPPED — this checkout cannot resolve HEAD~1 (shallow?), so no real ancestry is available`);
+    stProduced.add('STALE'); // covered by the injected arm above; do not fail reachability on a shallow CI box
+  } else {
+    staleLiveArms = 2;
+    const liveHold = { ...HELD_ROW, ticket: 'TRA-4262', enumeratedTip: ancestor, enumeratedAt: '2026-09-01T15:15:00Z' };
+    const st = deployHoldStaleness(liveHold, gitEnumerationProbe(headSha));
+    const text = renderDeployHoldRefusal(
+      { verdict: 'HELD', applicable: [liveHold], skipped: [], why: null, ref: REF_MONEY_ID },
+      { staleness: new Map([[liveHold, st]]) },
+    );
+    const namesIt =
+      st.status === 'STALE' &&
+      st.commits.length >= 1 &&
+      text.includes('ENUMERATION IS STALE') &&
+      text.includes(ancestor.slice(0, 12)) &&
+      text.includes(headSha.slice(0, 12)) &&
+      text.includes(`${st.commits.length} commit(s) have landed since`) &&
+      st.commits.every(c => text.includes(c.sha));
+    if (namesIt) {
+      pass += 1;
+      console.log(
+        `  ok   staleness-live       ${'STALE'.padEnd(20)} real ancestry ${ancestor.slice(0, 7)}..${headSha.slice(0, 7)}: ${st.commits.length} commit(s), ${st.serverPaths.length}/${st.paths.length} server-byte path(s), and the refusal names them`,
+      );
+    } else {
+      failures.push({
+        iso: 'staleness-live',
+        expected: 'STALE, named in the refusal text',
+        got: `${st.status}${st.why ? ` (${st.why})` : ''}`,
+        why: 'a real ancestor of HEAD must grade STALE and the refusal must print the drift',
+      });
+      console.log(`  FAIL staleness-live       got ${st.status} — ${st.why ?? 'refusal did not name the drift'}`);
+    }
+    // The paired PROCEED case, one variable apart: the SAME probe, stamped at HEAD itself.
+    const currentHold = { ...liveHold, enumeratedTip: headSha };
+    const stCur = deployHoldStaleness(currentHold, gitEnumerationProbe(headSha));
+    const curText = renderDeployHoldRefusal(
+      { verdict: 'HELD', applicable: [currentHold], skipped: [], why: null, ref: REF_MONEY_ID },
+      { staleness: new Map([[currentHold, stCur]]) },
+    );
+    // Not `!includes('TRA-4262')` — the fixture's own TICKET is TRA-4262 and the refusal
+    // prints it. Assert on the staleness HEADLINES, which is what must be absent.
+    const STALE_MARKERS = ['ENUMERATION IS STALE', 'CARRIES NO enumeratedTip', 'NOT AN ANCESTOR OF WHAT WOULD SHIP', 'COULD NOT TELL WHETHER'];
+    const quiet = stCur.status === 'CURRENT' && !STALE_MARKERS.some(m => curText.includes(m));
+    if (quiet) {
+      pass += 1;
+      console.log(`  ok   staleness-live-ctl   ${'CURRENT'.padEnd(20)} same probe, stamp moved to HEAD — the refusal says NOTHING about staleness`);
+    } else {
+      failures.push({ iso: 'staleness-live-ctl', expected: 'CURRENT and silent', got: stCur.status, why: 'the grader must not be a brick that shouts on every hold' });
+      console.log(`  FAIL staleness-live-ctl   got ${stCur.status} — a stamp AT the tip must be silent`);
+    }
+  }
+}
+
+// ── The REQUIRED-FIELD arm: a hold with no enumeratedTip is BLIND (TRA-4262) ──
+// Driven through the REAL reader against a REAL file, because that is the half an injected
+// `holds` array cannot reach — and paired with the identical file plus the stamp.
+{
+  const tmp = mkdtempSync(join(tmpdir(), 'tra4262-hold-'));
+  const row = {
+    ticket: 'TRA-4262',
+    reason: 'fixture',
+    openedAt: '2026-09-01T15:15:00Z',
+    openedBy: 'fixture',
+    emits: ['fixture'],
+  };
+  const cases = [
+    [row, 'BLIND', 'a hold with no enumeratedTip REFUSES — an emits[] with no tip beside it enumerates A deploy, not THIS one'],
+    [{ ...row, enumeratedTip: HEAD_A }, 'HOLDS', 'the SAME file with the stamp added reads normally — one variable apart'],
+  ];
+  for (const [h, expected, why] of cases) {
+    const name = `hold-${expected}.json`;
+    writeFileSync(join(tmp, name), JSON.stringify({ holds: [h] }));
+    const got = readDeployHolds(tmp, name);
+    const ok = got.verdict === expected && (expected !== 'BLIND' || /enumeratedTip/.test(got.why ?? ''));
+    if (ok) {
+      pass += 1;
+      console.log(`  ok   staleness-required   ${got.verdict.padEnd(20)} ${why}`);
+    } else {
+      failures.push({ iso: 'staleness-required', expected, got: `${got.verdict} (${got.why ?? '—'})`, why });
+      console.log(`  FAIL staleness-required   expected ${expected}, got ${got.verdict} — ${why}`);
+    }
+  }
+  rmSync(tmp, { recursive: true, force: true });
+}
+
 for (const [iso, target, isSoak, expected, why] of WARN_CASES) {
   const got = warnVerdict(iso, target, isSoak);
   if (got === expected) {
@@ -579,6 +779,10 @@ const TOTAL =
   CARRY_CASES.length +
   DEPLOY_HOLD_CASES.length +
   OVERRIDE_CASES.length +
+  STALENESS_CASES.length + // TRA-4262
+  1 + // the CURRENT-is-silent renderer control
+  staleLiveArms + // the real-ancestry live arm + its paired CURRENT control (0 in a shallow checkout)
+  2 + // enumeratedTip is REQUIRED: the BLIND file and its one-variable-apart pair
   1 + // the blind-shallow composition case
   1; // the deploy-hold LIVE read
 const allMissing = [
@@ -590,6 +794,7 @@ const allMissing = [
   ...carryMissing,
   ...dhMissing,
   ...ovMissing,
+  ...stMissing.map(v => `staleness:${v}`),
 ];
 
 console.log('');

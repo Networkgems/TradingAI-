@@ -42,6 +42,9 @@ needs three properties a table in a 1400-line script cannot have:
       "openedAt": "2026-09-01T14:32:00Z",      // required. ISO, Z.
       "openedBy": "LeadDev (d3355d6d) — …",    // required. Who to talk to.
       "emits":    ["…", "…"],                 // required, non-empty. What a deploy WOULD DO if performed.
+      "enumeratedTip": "8061bbf62c76…",        // required. The origin/main sha `emits` was taken against.
+      "enumeratedAt":  "2026-09-01T15:15:00Z", // expected. When. ISO, Z.
+      "enumeratedBy":  "LeadDev (d3355d6d) …", // expected. Who took it, and off what.
       "service":  {                            // optional. ABSENT MEANS EVERY SERVICE.
         "ids":   ["srv-d7mb7rr7uimc73ev0chg"],
         "names": ["TradingAI-", "tradingai-bqb1"]
@@ -55,6 +58,85 @@ needs three properties a table in a 1400-line script cannot have:
 `emits` is the field that earns the mechanism. A hold that only says *don't deploy* makes the
 next owner go and ask why; a hold that says *this boot deletes `closeRejectCount` on three
 real-money rows and re-arms the exit path* lets them decide without asking anyone.
+
+## `emits` describes a TIP, and tips move (TRA-4262)
+
+**Read this before you open a hold, and again before you clear one.**
+
+`render-redeploy.mjs` ships the **tip**, never a pin (TRA-3888: *a pinned `--commit` ages —
+drop it, ship the tip*). So the set of bytes a hold is holding back **grows every time anybody
+pushes**, while the `emits` array stays exactly where it was typed. An `emits` list is therefore
+a **snapshot of a moving target**, and it is a **lower bound** on what a deploy would carry from
+the moment it is written.
+
+This is not a discipline problem, and it was not caught by inspection. On 2026-09-01 **two
+independent enumerations of the same deploy went stale inside thirty minutes** — the TRA-4217
+hold's `emits`, written at 14:32Z against `4e0f4438`, and card `438ed4c5`'s scope on TRA-4217,
+which named the same tip. `77047ea0` (TRA-4255, +223/+31 server bytes) was already in the box and
+named in neither; `8061bbf6` (TRA-4154) landed while the ticket about it was being written. The
+consequence was specific and on real money: whoever cleared the hold would have read an honest,
+complete description of the TRA-4218 heal, deployed, and also shipped a published-telemetry change
+to production Tradier `***0154` without ever being told it was in the box.
+
+The structural point:
+
+> **An unpinned deploy authorization cannot be enumerated in advance. The enumeration is an act
+> performed AT CLEAR TIME, by the clearer.**
+
+So, for **every** hold, not just this one:
+
+1. **Stamp it.** `enumeratedTip` is a **required field** — a hold without it is BLIND and refuses,
+   same as one missing `emits`. It is the `origin/main` sha the list was taken against, and it is
+   what makes staleness answerable by inspection instead of undetectable:
+   ```bash
+   git log       <enumeratedTip>..origin/main   # what has landed since
+   git diff --name-only <enumeratedTip>..origin/main
+   ```
+2. **Re-enumerate before you clear.** The clearing commit must either **extend `emits`** with what
+   the delta emits, or **state that the delta touches no server byte** and why that is safe.
+   `packages/**` outside tests is what the Render build compiles and the box then runs; `ops/`,
+   `scripts/` and `docs/` do not ship in the server image. One reviewable diff, and it is the
+   clearer's act — not a promise the hold's author could have made on their behalf.
+3. **Re-stamp if you leave it standing.** A hold you decide to *keep* also gets a fresh
+   `enumeratedTip`/`enumeratedAt` for whatever you just measured against. A hold left open on a
+   stale enumeration is the defect this section exists for.
+4. **The stamp cannot name its own commit.** Whatever you write, the commit that writes it lands
+   *after* the sha it names, so the first entry in `git log <enumeratedTip>..origin/main` will
+   normally be the hold edit itself. That is expected and reads as exactly what it is in the
+   refusal text — a one-commit, zero-server-byte delta.
+
+### The script says it out loud
+
+`render-redeploy.mjs` computes the drift and prints it **directly under `emits`** in the refusal,
+and again in the `--override-hold` echo:
+
+```
+  ⚠ THIS HOLD'S BLAST-RADIUS ENUMERATION IS STALE — TRA-4262.
+    enumerated against : 8061bbf62c76 (2026-09-01T15:15:00Z)
+    would ship         : 1f4c0a9be331 — local origin/main (…a lower bound on the real tip)
+    2 commit(s) have landed since, and the emits[] above does NOT describe them:
+      · 1f4c0a9 feat(TRA-4268): …
+      · 9ab21ce fix(TRA-4270): …
+    1 of the 3 changed path(s) are SERVER BYTES this box will run:
+      · packages/server/src/options-account.ts
+    RE-ENUMERATE BEFORE YOU CLEAR: git log 8061bbf62c76..origin/main — …
+```
+
+Five statuses, and only `CURRENT` is silent: `STALE` · `UNSTAMPED` · `DIVERGED` (the stamp is not
+an ancestor of what would ship) · `BLIND` (git could not answer — **never** collapsed into
+`CURRENT`; a shallow checkout returning an empty list is BLIND, TRA-3699) · `CURRENT`.
+
+Three deliberate limits, because a check that overstates itself is worse than none:
+
+- **It augments, it never decides.** Staleness cannot turn `CLEAR` into a refusal and cannot lift
+  a hold. A hold that applies already refuses; this makes that refusal honest. Gating on a
+  housekeeping property would just get the stamp deleted rather than re-taken.
+- **It takes no network.** Gate −1 landing before `RENDER_API_KEY` is read is load-bearing, so the
+  comparison sha is your **local** `origin/main` (or `--commit`, which is what Render would build).
+  An unfetched checkout makes the reported delta a **lower bound** — it can under-report drift,
+  never invent it. The refusal says so.
+- **"No server byte" is a claim about PATHS, not about behaviour.** The classifier recognises
+  `packages/**` minus tests. Everything else is *unclassified*, never *inert* — read the files.
 
 ## Scoping
 

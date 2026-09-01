@@ -563,7 +563,12 @@ export function commitHoldState(now, target, table = COMMIT_HOLDS) {
 // record than an override does. What this gate buys is that the deploy is a DECISION
 // somebody took and signed, instead of a side effect nobody saw.
 export const DEPLOY_HOLD_FILE = 'ops/deploy-hold.json';
-const DEPLOY_HOLD_REQUIRED_FIELDS = ['ticket', 'reason', 'openedAt', 'openedBy', 'emits'];
+// `enumeratedTip` joined this list on TRA-4262. It is required for the same reason `emits`
+// is: an `emits` array with no tip stamped beside it is an enumeration of A deploy, not of
+// THIS one, and nothing in the file says which. Requiring it costs one `git rev-parse` at
+// the moment the hold is written and makes staleness answerable in one command
+// (`git log <enumeratedTip>..origin/main`) instead of undetectable by inspection.
+const DEPLOY_HOLD_REQUIRED_FIELDS = ['ticket', 'reason', 'openedAt', 'openedBy', 'emits', 'enumeratedTip'];
 
 // Read + VALIDATE the hold file. Separated from the predicate below so the predicate stays
 // pure and the control suite can drive it with injected rows (the TRA-3699 lesson: a
@@ -651,6 +656,229 @@ export function deployHoldBlocks(verdict) {
   return verdict === 'HELD' || verdict === 'BLIND';
 }
 
+// ── Gate −1b: is the hold's blast-radius enumeration STILL CURRENT? (TRA-4262) ─
+// `emits` is the field that earns this whole mechanism — it is what lets the next owner
+// decide without asking anyone. But it is a SNAPSHOT OF A MOVING TIP. This script ships
+// the tip, never a pin (TRA-3888), so the set of bytes a hold is holding back GROWS with
+// every push while the `emits` array stays exactly where it was typed.
+//
+// That is not hypothetical and it is not "someone forgot to update a file". On 2026-09-01
+// TWO independent enumerations of the SAME deploy went stale inside thirty minutes: the
+// TRA-4217 hold's `emits` (written at 14:32Z against `4e0f4438`) and card `438ed4c5`'s
+// scope on TRA-4217. `77047ea0` (TRA-4255) was already in the box and named in neither;
+// `8061bbf6` (TRA-4154) landed while this ticket was being written.
+//
+// THE STRUCTURAL POINT: an UNPINNED deploy authorization cannot be enumerated in advance.
+// The enumeration is an act performed AT CLEAR TIME, by the clearer. `clearedBy` on the
+// TRA-4217 entry now says so, and this gate makes the drift LOUD instead of invisible —
+// which is the whole thesis of TRA-4261 applied to TRA-4261's own artefact.
+//
+// ⚠ THIS IS AN AUGMENTATION, NEVER A VERDICT. It cannot turn CLEAR into REFUSE and it
+// cannot lift a hold. A hold that applies already refuses; this only tells the operator
+// reading that refusal that the `emits` they are about to trust describes an older tip.
+// Making staleness itself refuse would be a gate on a HOUSEKEEPING property, and the first
+// person it inconvenienced would delete the stamp rather than re-enumerate.
+//
+// ⚠ OFFLINE BY DESIGN. Gate −1 needs nothing from the network — that property is load
+// bearing (it is why the refusal lands before RENDER_API_KEY is read), so the comparison
+// sha comes from the LOCAL remote-tracking ref, not from `git ls-remote`. The consequence
+// is stated in the refusal rather than hidden: a local `origin/main` behind the real one
+// makes the reported delta a LOWER BOUND. It can under-report drift, never invent it.
+export const DEPLOY_HOLD_ENUM_REF = 'origin/main';
+
+// Two shas name the same commit if either is a prefix of the other, ≥7 hex. Abbreviated
+// shas are what people paste into JSON, and a stamp that only matched at 40 chars would
+// read STALE against its own tip.
+export function sameCommitSha(a, b) {
+  const x = String(a ?? '').trim().toLowerCase();
+  const y = String(b ?? '').trim().toLowerCase();
+  if (!/^[0-9a-f]{7,40}$/.test(x) || !/^[0-9a-f]{7,40}$/.test(y)) return false;
+  const [short, long] = x.length <= y.length ? [x, y] : [y, x];
+  return long.startsWith(short);
+}
+
+// Is this path a SERVER BYTE — something the Render build compiles and the box then runs?
+// Deliberately one-sided: `packages/**` minus tests is what this classifier can RECOGNISE,
+// and everything else is `other`, NEVER "clean". `scripts/` and `ops/` do not ship in the
+// server image today, but "the classifier did not recognise it" is a different sentence
+// from "it is inert", and only the operator can say the second one.
+export function isServerBytePath(p) {
+  const s = String(p ?? '').trim().replace(/\\/g, '/');
+  if (!s.startsWith('packages/')) return false;
+  if (/(^|\/)__tests__\//.test(s)) return false;
+  if (/\.(test|spec)\.[cm]?[jt]sx?$/.test(s)) return false;
+  if (/\.(md|snap)$/.test(s)) return false;
+  return true;
+}
+
+// Pure. `probe` is injected so the control suite can drive every status without a repo
+// (and so the LIVE arm can drive the REAL one) — the TRA-3699 lesson again.
+//   probe.head()            -> { sha, source, error? }
+//   probe.delta(tip, head)  -> { ok, commits: [{sha, subject}], paths: [string], shallow, error? }
+// Statuses:
+//   UNSTAMPED  no `enumeratedTip` — nothing says which tip `emits` describes
+//   CURRENT    the enumeration was taken against exactly what is about to ship
+//   STALE      N commits have landed since the enumeration  ⇒ SAY SO, LOUDLY
+//   DIVERGED   the shas differ and the target is not ahead — cannot claim CURRENT
+//   BLIND      git could not answer. Never collapsed into CURRENT (see gradeCarries).
+export function deployHoldStaleness(hold, probe) {
+  const tip = typeof hold?.enumeratedTip === 'string' ? hold.enumeratedTip.trim() : '';
+  const base = {
+    tip: tip || null,
+    enumeratedAt: typeof hold?.enumeratedAt === 'string' ? hold.enumeratedAt : null,
+    head: null,
+    source: null,
+    commits: [],
+    paths: [],
+    serverPaths: [],
+    why: null,
+  };
+  if (!tip) {
+    return {
+      ...base,
+      status: 'UNSTAMPED',
+      why: 'the hold carries no `enumeratedTip`, so nothing in the file says which tip its `emits` describes (TRA-4262)',
+    };
+  }
+  const head = probe.head();
+  if (!head?.sha) {
+    return { ...base, status: 'BLIND', why: head?.error ?? 'could not resolve the sha this deploy would ship' };
+  }
+  const at = { ...base, head: head.sha, source: head.source ?? null };
+  if (sameCommitSha(tip, head.sha)) return { ...at, status: 'CURRENT' };
+  const delta = probe.delta(tip, head.sha);
+  if (!delta?.ok) {
+    return { ...at, status: 'BLIND', why: delta?.error ?? `could not list ${tip.slice(0, 12)}..${head.sha.slice(0, 12)}` };
+  }
+  const commits = Array.isArray(delta.commits) ? delta.commits : [];
+  const paths = Array.isArray(delta.paths) ? delta.paths : [];
+  if (commits.length === 0) {
+    // The shas differ and nothing is in tip..head. Either the target is BEHIND the stamp,
+    // or the two diverged — or the history between them was grafted away by a shallow
+    // clone, which produces the identical empty list (TRA-3699). An empty answer out of a
+    // shallow checkout is NOT evidence of currency, so it is graded BLIND, not DIVERGED.
+    if (delta.shallow) {
+      return {
+        ...at,
+        status: 'BLIND',
+        why: `${tip.slice(0, 12)}..${head.sha.slice(0, 12)} is empty in a SHALLOW checkout — a graft hides history, so this is not evidence the enumeration is current (${BLIND_ANCESTRY_CAUSES})`,
+      };
+    }
+    return {
+      ...at,
+      status: 'DIVERGED',
+      why: `nothing is in ${tip.slice(0, 12)}..${head.sha.slice(0, 12)}, yet the shas differ — the stamped tip is not an ancestor of what would ship`,
+    };
+  }
+  return { ...at, status: 'STALE', commits, paths, serverPaths: paths.filter(isServerBytePath) };
+}
+
+export function deployHoldStalenessIsLoud(status) {
+  return status === 'STALE' || status === 'UNSTAMPED' || status === 'DIVERGED' || status === 'BLIND';
+}
+
+// The refusal lines for one hold's staleness. Pure, and returns [] for CURRENT — a hold
+// whose enumeration is current has nothing to say, and a line that prints on every read is
+// a line nobody reads.
+export function renderDeployHoldStaleness(st, { maxCommits = 10, maxPaths = 8 } = {}) {
+  if (!st || st.status === 'CURRENT') return [];
+  const head = st.head ? st.head.slice(0, 12) : '(unresolved)';
+  const tip = st.tip ? st.tip.slice(0, 12) : '(unstamped)';
+  if (st.status === 'STALE') {
+    const lines = [
+      `  ⚠ THIS HOLD'S BLAST-RADIUS ENUMERATION IS STALE — TRA-4262.`,
+      `    enumerated against : ${tip}${st.enumeratedAt ? ` (${st.enumeratedAt})` : ''}`,
+      `    would ship         : ${head}${st.source ? ` — ${st.source}` : ''}`,
+      `    ${st.commits.length} commit(s) have landed since, and the emits[] above does NOT describe them:`,
+    ];
+    for (const c of st.commits.slice(0, maxCommits)) lines.push(`      · ${c.sha} ${c.subject}`);
+    if (st.commits.length > maxCommits) lines.push(`      · … ${st.commits.length - maxCommits} more`);
+    if (st.serverPaths.length) {
+      lines.push(`    ${st.serverPaths.length} of the ${st.paths.length} changed path(s) are SERVER BYTES this box will run:`);
+      for (const p of st.serverPaths.slice(0, maxPaths)) lines.push(`      · ${p}`);
+      if (st.serverPaths.length > maxPaths) lines.push(`      · … ${st.serverPaths.length - maxPaths} more`);
+    } else {
+      lines.push(
+        `    No changed path was RECOGNISED as a server byte (packages/** minus tests). That is a\n` +
+          `    statement about PATHS, not about behaviour — read the ${st.paths.length} changed file(s) yourself.`,
+      );
+    }
+    lines.push(
+      `    RE-ENUMERATE BEFORE YOU CLEAR: git log ${tip}..${DEPLOY_HOLD_ENUM_REF} — then either extend\n` +
+        `    emits[] or say in the clearing commit that the delta is server-byte-free, and re-stamp\n` +
+        `    enumeratedTip. The comparison is against your LOCAL ${DEPLOY_HOLD_ENUM_REF} (this gate takes no\n` +
+        `    network), so an unfetched checkout makes this count a LOWER BOUND.`,
+    );
+    return lines;
+  }
+  if (st.status === 'UNSTAMPED') {
+    return [
+      `  ⚠ THIS HOLD'S emits[] CARRIES NO enumeratedTip — TRA-4262.`,
+      `    Nothing in the file says which tip it describes, so its staleness is undetectable by`,
+      `    inspection. Treat the list as a LOWER BOUND on what a deploy would emit.`,
+    ];
+  }
+  if (st.status === 'DIVERGED') {
+    return [
+      `  ⚠ THIS HOLD'S enumeratedTip IS NOT AN ANCESTOR OF WHAT WOULD SHIP — TRA-4262.`,
+      `    enumerated against : ${tip}`,
+      `    would ship         : ${head}${st.source ? ` — ${st.source}` : ''}`,
+      `    ${st.why}. The emits[] may describe a different line of history entirely.`,
+    ];
+  }
+  return [
+    `  ⚠ COULD NOT TELL WHETHER THIS HOLD'S emits[] IS CURRENT — TRA-4262.`,
+    `    enumerated against : ${tip}`,
+    `    blind              : ${st.why}`,
+    `    "Cannot tell" is not "current". Re-enumerate by hand before trusting the list above.`,
+  ];
+}
+
+// The impure half: resolves what this invocation would ship and what landed since, WITHOUT
+// the network. `--commit` wins because that is what Render would build; otherwise the local
+// remote-tracking ref, which is the honest offline stand-in for the tip this script ships.
+export function gitEnumerationProbe(requestedCommit = COMMIT, ref = DEPLOY_HOLD_ENUM_REF) {
+  return {
+    head() {
+      if (requestedCommit) return { sha: String(requestedCommit), source: '--commit' };
+      const r = git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], 10000);
+      const sha = r.status === 0 ? (r.stdout ?? '').trim() : '';
+      if (!sha) {
+        return {
+          sha: null,
+          error: `could not resolve ${ref} in this checkout (git rev-parse status ${r.status}${r.error ? `, ${r.error.message}` : ''}) — run \`git fetch origin\``,
+        };
+      }
+      return { sha, source: `local ${ref} (this gate takes no network — a lower bound on the real tip)` };
+    },
+    delta(tip, head) {
+      const shallow = isShallowCheckout();
+      const log = git(['log', '--no-color', '--format=%h%x09%s', `${tip}..${head}`], 20000);
+      if (log.status !== 0) {
+        return {
+          ok: false,
+          shallow,
+          error: `git log ${String(tip).slice(0, 12)}..${String(head).slice(0, 12)} failed (status ${log.status}${
+            shallow ? ', and this is a SHALLOW checkout' : ''
+          }) — the stamped tip may not be in this checkout`,
+        };
+      }
+      const commits = (log.stdout ?? '')
+        .split('\n')
+        .map(l => l.trim())
+        .filter(Boolean)
+        .map(l => {
+          const [sha, ...rest] = l.split('\t');
+          return { sha, subject: rest.join('\t') };
+        });
+      const diff = git(['diff', '--name-only', `${tip}..${head}`], 20000);
+      const paths =
+        diff.status === 0 ? (diff.stdout ?? '').split('\n').map(s => s.trim()).filter(Boolean) : [];
+      return { ok: true, shallow, commits, paths };
+    },
+  };
+}
+
 // The TRA-NNNN tokens an --override-hold reason must name at least one of. Requiring the
 // ticket is not ceremony: it is the cheapest available proof that the operator read the
 // hold they are breaking rather than pasting the flag out of the usage text. It costs
@@ -669,7 +897,9 @@ export function deployHoldOverrideNames(reason, tokens) {
   return tokens.some(t => r.includes(t));
 }
 
-export function renderDeployHoldRefusal(state, { file = DEPLOY_HOLD_FILE } = {}) {
+// `staleness` is a Map from hold object → deployHoldStaleness() result, or null. Passed in
+// rather than computed here so this stays pure and the suite can drive both halves.
+export function renderDeployHoldRefusal(state, { file = DEPLOY_HOLD_FILE, staleness = null } = {}) {
   if (state.verdict === 'BLIND') {
     return (
       `[render-redeploy] REFUSED: the deploy-hold file exists and CANNOT BE TRUSTED, so this gate\n` +
@@ -677,7 +907,8 @@ export function renderDeployHoldRefusal(state, { file = DEPLOY_HOLD_FILE } = {})
       `  file    : ${file}\n` +
       `  blind   : ${state.why}\n` +
       `  A hold file that degrades to "allowed" when it is malformed is not a hold. FIX THE FILE\n` +
-      `  (every hold needs ticket, reason, openedAt, openedBy and a non-empty emits[]), or, if the\n` +
+      `  (every hold needs ticket, reason, openedAt, openedBy, a non-empty emits[] and the\n` +
+      `  enumeratedTip that emits[] was taken against — TRA-4262), or, if the\n` +
       `  deploy genuinely cannot wait, re-run with --override-hold="TRA-#### why" (recorded).`
     );
   }
@@ -693,6 +924,10 @@ export function renderDeployHoldRefusal(state, { file = DEPLOY_HOLD_FILE } = {})
     lines.push(`  ${h.reason}`);
     lines.push(`  WHAT A DEPLOY WOULD EMIT:`);
     for (const e of h.emits) lines.push(`    ⚠ ${e}`);
+    // …and whether that list still describes the tip about to ship (TRA-4262). Printed
+    // directly under emits[], because the two are one claim: the list is only as good as
+    // the tip it was taken against.
+    for (const l of renderDeployHoldStaleness(staleness?.get?.(h) ?? null)) lines.push(l);
     if (h.clearedBy) lines.push(`  CLEARED BY: ${h.clearedBy}`);
   }
   lines.push('');
@@ -1286,8 +1521,18 @@ async function main() {
   const holdRef = requestedServiceRef();
   const deployHold = deployHoldState(holdRead, holdRef);
 
+  // Gate −1b (TRA-4262): does each applicable hold's `emits` still describe the tip this
+  // invocation would ship? Read-only — it can make a refusal louder, never lift one, and
+  // never turns a proceed into a refusal. Still no network: the comparison sha comes from
+  // the local remote-tracking ref (or --commit), so the reported drift is a lower bound.
+  const holdStaleness = new Map();
+  if (deployHold.applicable.length) {
+    const enumProbe = gitEnumerationProbe();
+    for (const h of deployHold.applicable) holdStaleness.set(h, deployHoldStaleness(h, enumProbe));
+  }
+
   if (deployHoldBlocks(deployHold.verdict) && !HAS_HOLD_OVERRIDE) {
-    console.error(renderDeployHoldRefusal(deployHold));
+    console.error(renderDeployHoldRefusal(deployHold, { staleness: holdStaleness }));
     process.exit(9);
   }
 
@@ -1314,7 +1559,18 @@ async function main() {
         (deployHold.verdict === 'BLIND'
           ? `  blind   : ${deployHold.why}\n`
           : deployHold.applicable
-              .map(h => `  broken  : ${h.ticket} (opened ${h.openedAt} by ${h.openedBy})\n  emits   : ${h.emits.join('\n            ')}\n`)
+              .map(h => {
+                // TRA-4262: the override echo is the LAST place the emits list is read
+                // before bytes move, so it is the last place its staleness can be said.
+                const st = holdStaleness.get(h);
+                const stale =
+                  st && st.status !== 'CURRENT'
+                    ? `  ⚠ stale   : ${st.status} — emits[] was enumerated against ${st.tip ? st.tip.slice(0, 12) : '(unstamped)'}${
+                        st.status === 'STALE' ? `, ${st.commits.length} commit(s) and ${st.serverPaths.length} server-byte path(s) since` : ''
+                      }. You are overriding a list that does NOT describe what you are shipping (TRA-4262).\n`
+                    : '';
+                return `  broken  : ${h.ticket} (opened ${h.openedAt} by ${h.openedBy})\n  emits   : ${h.emits.join('\n            ')}\n${stale}`;
+              })
               .join('')) +
         `  Tell the hold's owner BEFORE the box boots, not after. If the hold is genuinely dead,\n` +
         `  delete the entry from ${DEPLOY_HOLD_FILE} in a commit — an override is a breach on the\n` +
