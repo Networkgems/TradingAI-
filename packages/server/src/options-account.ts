@@ -22,7 +22,12 @@ import type {
   OptionAdmissionStamp,
 } from '@trading-app/shared';
 import { buildEntryQuoteStamp, PROFIT_FLOOR_LADDER } from '@trading-app/shared';
-import type { ProfitFloorLadderStep, OptionProfitFloorPdtHold, OptionMarkProvenance } from '@trading-app/shared';
+import type {
+  ProfitFloorLadderStep,
+  OptionProfitFloorPdtHold,
+  OptionMarkProvenance,
+  OptionPeakStampBasis,
+} from '@trading-app/shared';
 import { recordEntryQuoteStampOutcome } from './entry-quote-stamp.js';
 import { computePortfolioGreeks } from './reports/portfolio-greeks.js';
 import { etDateKey, etWallClockToUtcMs } from './et-clock.js';
@@ -875,6 +880,103 @@ function extremeAdvancedThisSession(at: number | undefined, now: number): boolea
 }
 
 /**
+ * TRA-4160 — `peakPremium` has five writers and, until this ticket, exactly one
+ * of them stamped `peakPremiumAt`. The other four raise the peak silently, so a
+ * row could carry a peak 16% above its basis next to a null stamp and the two
+ * fields would flatly contradict each other about whether a ratchet happened.
+ *
+ * Measured on bqb1 2026-08-31 (`092d0877`, 3471 journal rows): 183 closes carry
+ * a peak, 145 carry a stamp. Of the 38 unstamped, **28 have `peak == basis`** —
+ * the mint seed, never ratcheted, an absent stamp is CORRECT. The other 10
+ * ratcheted for real (XLF `1.16 -> 1.34759`, +16%, against a 1.16 entry ask, so
+ * not a restatement artifact) and every one of them opened 08-24/08-25, i.e.
+ * BEFORE the stamp writer's first tick — the earliest stamp anywhere in the
+ * journal is 2026-08-26T12:04:07.092Z, the first boot carrying `e1b9744`
+ * (committed 2026-08-26T05:51:51Z). Their peaks were set by a build with no
+ * stamp writer and were never re-exceeded afterwards.
+ *
+ * So the defect was never durability. These helpers make the stamp a property
+ * of the ratchet rather than of one call site.
+ *
+ * ⛔ Peak equality is compared with a RELATIVE epsilon, never `>`. The live
+ * tape carries float noise at 1e-16 on both sides of the basis (`ONDS`
+ * 0.695 -> 0.6950000000000001, `RIOT` 1.9600000000000002 -> 1.96), and a strict
+ * comparison classifies that noise as a ratchet — or as a give-back.
+ */
+const PEAK_RATCHET_EPSILON_REL = 1e-9;
+
+export function peakIsMateriallyAbove(peak: number, basis: number): boolean {
+  if (!Number.isFinite(peak) || !Number.isFinite(basis)) return false;
+  return peak - basis > Math.max(Math.abs(basis), 1) * PEAK_RATCHET_EPSILON_REL;
+}
+
+/**
+ * A live mark exceeded the peak: raise it AND date it. The only writer allowed
+ * to set `peakPremiumStamp = 'observed'`, because it is the only one holding a
+ * price the market actually printed while we were watching. Returns whether the
+ * peak moved, so a caller can log or count the ratchet.
+ */
+export function ratchetObservedPeakPremium(opt: OptionPosition, mark: number, now: number): boolean {
+  if (!Number.isFinite(mark)) return false;
+  if (!(mark > opt.peakPremium)) return false;
+  opt.peakPremium = mark;
+  opt.peakPremiumAt = now;
+  opt.peakPremiumStamp = 'observed';
+  return true;
+}
+
+/**
+ * A basis restatement or a broker-adoption merge raised the peak to a figure
+ * that is a BASIS, not an observed excursion.
+ *
+ * The stamp is CLEARED rather than moved to `Date.now()`. Two reasons, and they
+ * point the same way: the surviving stamp dates a *lower* peak and would now be
+ * attached to a value it never described, and `Date.now()` would assert a max
+ * favourable excursion at an instant nothing printed — which is precisely the
+ * fabricated column {@link extremeAdvancedThisSession} fails closed to avoid.
+ * Absent-and-labelled reads as STALE there, i.e. today's behaviour, so this
+ * cannot loosen a guard.
+ *
+ * No-op when the raise does not actually move the peak: an unchanged peak keeps
+ * whatever provenance it already earned.
+ */
+export function raisePeakPremiumForBookkeeping(opt: OptionPosition, premium: number): boolean {
+  if (!Number.isFinite(premium)) return false;
+  if (!(premium > opt.peakPremium)) return false;
+  opt.peakPremium = premium;
+  delete opt.peakPremiumAt;
+  opt.peakPremiumStamp = 'bookkeeping';
+  return true;
+}
+
+/**
+ * TRA-4160 ask 4 — the sentinel, installed at the snapshot boundary.
+ *
+ * A row arriving from disk with a peak materially above its basis and NO stamp
+ * was ratcheted by a build that had no stamp writer. That instant is gone: the
+ * tick that set it was never recorded anywhere, and reconstructing one from the
+ * open/close window would be a fabricated column. Label it instead, so a reader
+ * can tell "peak predates this instrument" from "peak never moved" — the two
+ * shapes that were indistinguishable as `null` and the reason TRA-4117 step 5
+ * had to exclude all 21 of 21 cohort rows on 2026-08-26.
+ *
+ * Only fills a GAP: a row that already carries a stamp or a basis keeps it, so
+ * this is idempotent across the many restarts a long-held row survives.
+ */
+export function stampCarriedPeakOnImport(opt: OptionPosition): void {
+  if (opt.peakPremiumStamp !== undefined) return;
+  if (opt.peakPremiumAt !== undefined && Number.isFinite(opt.peakPremiumAt)) {
+    // A stamp from the TRA-4020 writer, persisted before this field existed.
+    opt.peakPremiumStamp = 'observed';
+    return;
+  }
+  if (peakIsMateriallyAbove(opt.peakPremium, opt.premiumPaid)) {
+    opt.peakPremiumStamp = 'unstamped_carry';
+  }
+  // Otherwise the peak is still the mint seed. Absent/absent is the truth.
+}
+
+/**
  * TRA-4020 (R4) — record that the live opening-range window refused a
  * trail-family exit on this tick. One tick counts once, however many rules
  * were refused on it (two refusals on one tick are one wait, not two). The
@@ -1097,7 +1199,21 @@ function healPersistedThresholds(opt: OptionPosition): void {
   if (!Number.isFinite(opt.tp1Premium)) opt.tp1Premium = Number.POSITIVE_INFINITY;
   if (!Number.isFinite(opt.stopLossPremium)) opt.stopLossPremium = 0;
   if (!Number.isFinite(opt.trailingStopPremium)) opt.trailingStopPremium = 0;
-  if (!Number.isFinite(opt.peakPremium)) opt.peakPremium = opt.premiumPaid;
+  if (!Number.isFinite(opt.peakPremium)) {
+    // TRA-4160 (ask 3) — ⚠️ this is the ONLY thing that touches `peakPremium`
+    // on import, and it fires ONLY on a non-finite value. A real persisted peak
+    // is NOT laundered: it crosses the snapshot boundary intact, exactly like
+    // any other number on the row. TRA-4117 step 5 assumed the opposite and
+    // therefore excluded every row whose `openTs` predated the boot — 21 of 21
+    // of the 2026-08-26 cohort. It does not need to.
+    //
+    // On the reseed path the peak is being replaced by the MINT SEED, so any
+    // surviving provenance describes a value that no longer exists. Drop both,
+    // which restores the honest absent/absent shape ("never ratcheted").
+    opt.peakPremium = opt.premiumPaid;
+    delete opt.peakPremiumAt;
+    delete opt.peakPremiumStamp;
+  }
 }
 
 /**
@@ -3517,7 +3633,10 @@ function restateEngineOpenedBasis(opt: OptionPosition, brokerPremium: number): v
   //   • `currentPremium` — on an engine row this is a live quote maintained by
   //     the mark refresher. The imported branch overwrites it because an
   //     imported row has no other source; here it would corrupt the mark.
-  opt.peakPremium = Math.max(opt.peakPremium, brokerPremium);
+  // TRA-4160 — a restated basis is BOOKKEEPING. `Math.max` here used to raise
+  // the peak with no stamp at all, which is one of the four silent writers that
+  // let `peakPremium` and `peakPremiumAt` contradict each other.
+  raisePeakPremiumForBookkeeping(opt, brokerPremium);
 
   // TRA-2957 — the "sentinels rescale to themselves" identity above
   // (`Infinity × r = Infinity`, `0 × r = 0`) holds only for the IN-MEMORY
@@ -5721,6 +5840,13 @@ export class PaperOptionsAccount {
           ...(Number.isFinite(position.peakPremium) ? { peakPremium: position.peakPremium } : {}),
           ...(position.peakPremiumAt !== undefined && Number.isFinite(position.peakPremiumAt)
             ? { peakPremiumAt: position.peakPremiumAt }
+            : {}),
+          // TRA-4160 — and WHY the stamp is what it is, so a null
+          // `peakPremiumAt` on the archived row is readable years later. Absent
+          // on a pre-TRA-4160 close and on a row whose peak is still the mint
+          // seed; ⛔ never reconstructed.
+          ...(position.peakPremiumStamp !== undefined
+            ? { peakPremiumStamp: position.peakPremiumStamp }
             : {}),
           ...(suppressed !== undefined
             ? {
@@ -8849,10 +8975,10 @@ export class PaperOptionsAccount {
       // TRA-4020 (R2/R4) — stamp the peak ONLY when it moves. `peakPremiumAt`
       // dates the max favourable excursion; a flat tick must not refresh it or
       // the freshness test below would read every held row as "advanced today".
-      if (mark > opt.peakPremium) {
-        opt.peakPremium = mark;
-        opt.peakPremiumAt = Date.now();
-      }
+      // TRA-4160 — via the shared ratchet, which also records that THIS peak is
+      // an `observed` one. Byte-identical behaviour for `peakPremium` /
+      // `peakPremiumAt`; the provenance is additive.
+      ratchetObservedPeakPremium(opt, mark, Date.now());
 
       // TRA-3946 — the average-down SHADOW, on the same mark the stops read.
       // Observe-only: writes the row's running MAE and a journal verdict, and
@@ -12421,7 +12547,9 @@ export class PaperOptionsAccount {
           // Mark current premium as the entry premium until a fresh quote
           // refreshes it — better than zero or stale data.
           existing.currentPremium = incoming.premiumPaid;
-          existing.peakPremium = Math.max(existing.peakPremium, incoming.premiumPaid);
+          // TRA-4160 — the adopted broker basis is BOOKKEEPING, not an observed
+          // excursion: nothing here watched a mark print at this level.
+          raisePeakPremiumForBookkeeping(existing, incoming.premiumPaid);
           // TRA-361 — premium just shifted (partial-fill / adjustment), so
           // re-derive SL/TP1/trailing thresholds off the new entry price.
           // Without this the SL fires off a stale `premiumPaid` snapshot.
@@ -13775,7 +13903,10 @@ export class PaperOptionsAccount {
       const mark = marks.get(opt.optionSymbol);
       if (typeof mark !== 'number' || !(mark > 0)) continue;
       opt.currentPremium = mark;
-      if (mark > opt.peakPremium) opt.peakPremium = mark;
+      // TRA-4160 — this IS an observed mark (a freshly-fetched per-OCC quote),
+      // so it stamps like one. `checkExits` skips imported rows entirely, so
+      // until now an imported row's peak could ONLY ever move unstamped.
+      ratchetObservedPeakPremium(opt, mark, Date.now());
       updated += 1;
     }
     return updated;
@@ -14361,6 +14492,11 @@ export class PaperOptionsAccount {
     // carrying real premium right now.
     for (const o of snap.openOptions) {
       healPersistedThresholds(o);
+      // TRA-4160 (ask 4) — label a peak that crossed the boundary without a
+      // stamp BEFORE anything reads it, so `peakPremiumAt == null` stops
+      // meaning two different things. Runs after `healPersistedThresholds`
+      // because that is what guarantees `peakPremium` is finite here.
+      stampCarriedPeakOnImport(o);
       // TRA-4030 — `profitFloorHeldForPdt` was a bare day-key `string` under the
       // TRA-4020 build. It carried no mark and no count, so there is nothing to
       // migrate it INTO; drop it rather than let `.holds` be read off a string.

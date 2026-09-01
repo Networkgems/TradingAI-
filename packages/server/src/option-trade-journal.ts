@@ -2,7 +2,7 @@ import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { deriveEntrySpreadPct } from '@trading-app/shared';
-import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason, OptionAdmissionStamp, OptionMarkProvenance } from '@trading-app/shared';
+import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason, OptionAdmissionStamp, OptionMarkProvenance, OptionPeakStampBasis } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { STOP_DISTANCE_FRACTION_OF_MARK } from './option-spread-cost.js';
 import type { RiskThrottleSizingPath, RiskThrottleSizingScope } from './risk-throttle-sizing.js';
@@ -492,6 +492,17 @@ export interface OptionTradeJournalClose {
   peakPremium?: number;
   peakPremiumAt?: number;
   /**
+   * TRA-4160 — provenance of `peakPremium`, so a null `peakPremiumAt` is
+   * readable. `observed` ⇒ `peakPremiumAt` dates a mark the market printed and
+   * the row is gradeable for freshness. `bookkeeping` ⇒ the peak was raised to
+   * a restated/adopted basis, no excursion was seen at that level.
+   * `unstamped_carry` ⇒ the peak was ratcheted by a build predating the stamp
+   * writer (`e1b9744`, first tick 2026-08-26T12:04:07Z) and the instant is
+   * unreconstructable. Absent ⇒ pre-TRA-4160 close, or the peak is still the
+   * mint seed (⇒ MFE is zero and no stamp was ever owed).
+   */
+  peakPremiumStamp?: OptionPeakStampBasis;
+  /**
    * TRA-4020 (R4) — how the live opening-range window (TRA-3217, default 15
    * min) treated this row: the number of ticks on which a trail-family exit
    * was refused by the window, the mark at the first refusal and the mark at
@@ -603,6 +614,13 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
   /** TRA-4020 (R4) — MFE: peak mark + when it was set, folded from the CLOSE row. */
   peakPremium?: number;
   peakPremiumAt?: number;
+  /**
+   * TRA-4160 — why `peakPremiumAt` holds what it holds, folded from the CLOSE
+   * row. ⚠️ Only `observed` licenses a per-row claim about WHEN the peak was
+   * set; `bookkeeping` / `unstamped_carry` are ungradeable-by-construction and
+   * must be EXCLUDED from a freshness read, never defaulted.
+   */
+  peakPremiumStamp?: OptionPeakStampBasis;
   /** TRA-4020 (R4) — opening-range refusals on this row, folded from the CLOSE row. */
   openingRangeSuppressed?: OptionTradeJournalOpeningRangeSuppression;
   /** TRA-4030 (R4) — PDT-capacity holds of the profit floor on this row, folded from the CLOSE row. */
@@ -1784,6 +1802,11 @@ function foldLine(
       : {}),
     ...(typeof line.close.peakPremiumAt === 'number' && Number.isFinite(line.close.peakPremiumAt)
       ? { peakPremiumAt: line.close.peakPremiumAt }
+      : {}),
+    // TRA-4160 — the stamp's provenance; absent stays absent (a pre-TRA-4160
+    // close, or a peak still sitting on the mint seed).
+    ...(line.close.peakPremiumStamp !== undefined
+      ? { peakPremiumStamp: line.close.peakPremiumStamp }
       : {}),
     ...(line.close.openingRangeSuppressed !== undefined
       ? { openingRangeSuppressed: { ...line.close.openingRangeSuppressed } }

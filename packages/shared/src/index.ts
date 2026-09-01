@@ -2328,6 +2328,12 @@ export const PROFIT_FLOOR_RUNG2_FLOOR_R = 1.00;        // peakR ≥ 1.50 → nev
 export const PROFIT_FLOOR_RUNG3_PEAK_R = 2.50;
 export const PROFIT_FLOOR_RUNG3_FLOOR_R = 2.00;        // peakR ≥ 2.50 → never below +2.00R
 /**
+ * TRA-4160 — see `OptionPosition.peakPremiumStamp`. Names WHY `peakPremiumAt`
+ * holds what it holds, so an absent stamp is never read as an absent ratchet.
+ */
+export type OptionPeakStampBasis = 'observed' | 'bookkeeping' | 'unstamped_carry';
+
+/**
  * TRA-4020 (R4) — see `OptionPosition.openingRangeSuppressed`. `fires` counts
  * ticks, not rules: a tick on which two trail-family rules were both refused
  * counts once. `premiumAtFire` is stamped at the row's eventual exit (any
@@ -3099,8 +3105,45 @@ export interface OptionPosition {
    * 09:30 ET open. ABSENT (a row persisted by an older build, or one that has
    * not made a new high since) reads as STALE — the guard stays in force, which
    * is today's behaviour. Persisted with the row; folded onto the journal close.
+   *
+   * TRA-4160 — it IS persisted, and always was: `exportSnapshot` serialises the
+   * whole `OptionPosition` and `healPersistedThresholds` never touches this
+   * field. When it is absent next to a peak that plainly moved, the peak was
+   * raised by a writer that does not stamp — see {@link peakPremiumStamp},
+   * which says WHICH, so "never ratcheted" and "ratcheted, unstamped" stop
+   * reading alike.
    */
   peakPremiumAt?: number;
+  /**
+   * TRA-4160 — the provenance of the CURRENT value of {@link peakPremium}, so a
+   * null `peakPremiumAt` is never ambiguous.
+   *
+   * `peakPremium` has five writers and only one of them stamps. The mint seeds
+   * it to `premiumPaid`; `checkExits` ratchets it on an observed mark (and
+   * stamps, since TRA-4020/`e1b9744`, live 2026-08-26T12:04Z); the imported-mark
+   * refresher ratchets it on an observed quote; and a basis restatement and the
+   * broker-adoption merge both RAISE it to a *basis*, which is bookkeeping, not
+   * a favourable excursion. Absent ⇔ the peak is still the mint seed — it has
+   * never been raised by anything, so an absent `peakPremiumAt` is CORRECT and
+   * the row's MFE is zero.
+   *
+   * - `observed` — a live mark exceeded the peak. `peakPremiumAt` dates it.
+   * - `bookkeeping` — the peak was raised to a restated/adopted basis. No
+   *   excursion was observed at this level, so `peakPremiumAt` is cleared
+   *   rather than moved: the old stamp dated a lower peak, and `Date.now()`
+   *   would assert an MFE that never printed.
+   * - `unstamped_carry` — the sentinel of ask 4. Installed on snapshot import
+   *   for a row whose peak sits materially above its basis with no stamp: the
+   *   peak was ratcheted by a build predating the stamp writer and the instant
+   *   is UNRECONSTRUCTABLE. Distinguishes "peak predates this instrument" from
+   *   "never ratcheted", which is exactly the discrimination TRA-4117 step 5
+   *   needs and could not make.
+   *
+   * ⚠️ Only `observed` licenses a per-row claim about WHEN the peak was set.
+   * The other two are ungradeable-by-construction and must be excluded from any
+   * freshness read rather than defaulted.
+   */
+  peakPremiumStamp?: OptionPeakStampBasis;
   /**
    * TRA-4020 (R4) — bookkeeping for the live opening-range window: how many
    * ticks a trail-family exit (chandelier / profit-lock / premium trail) was
