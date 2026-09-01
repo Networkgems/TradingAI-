@@ -144,6 +144,108 @@ async function loadTape(path) {
 }
 
 /**
+ * ## The RTH-hours ruler — why wall-clock uptime is the WRONG denominator
+ *
+ * AC1 as filed asks for two reads "~+1h and ~+8h" of UPTIME. Measured
+ * 2026-09-01 over the 26 deaths that carry an rss at trip, `rssMB` at death
+ * correlates with wall-clock uptime at r=0.560 and with RTH-hours at r=0.839.
+ * The sharpest pair: a 68.15h boot spanning a WEEKEND died at 1703MB, while a
+ * 24.50h boot spanning one full session died at 2606MB — 2.8x the uptime, 41%
+ * of the RTH exposure, 65% of the RSS.
+ *
+ * So a weekend boot satisfies "+1h and +8h apart" while carrying ~0 RTH-hours
+ * and showing no growth. That is a STRUCTURAL false negative, not bad luck, and
+ * an eligibility rule stated in wall-clock hours cannot exclude it. AC1 is
+ * therefore restated as **>= 4 RTH-hours apart on ONE boot** and graded here.
+ *
+ * ⚠️ DIRECTION OF THE ERROR. The calendar below models weekends, the 2026 US
+ * market holidays and the three 2026 half-days. Anything it gets wrong
+ * OVERSTATES exposure, which would let a thin pair read ELIGIBLE — the
+ * permissive direction for a gate. `RTH_CALENDAR_THROUGH` is therefore checked
+ * by the fold: past it the calendar degrades to the weekday rule, and the
+ * report says so out loud rather than quietly reverting to an upper bound.
+ */
+const RTH_OPEN_MIN = 13 * 60 + 30; // 13:30Z
+const RTH_CLOSE_MIN = 20 * 60; // 20:00Z
+const DAY_MS = 86_400_000;
+
+// UTC dates on which the US equity market is CLOSED in 2026 (weekdays only —
+// weekend closure is handled by the day-of-week rule and needs no table).
+const RTH_HOLIDAYS_2026 = new Set([
+  '2026-01-01', // New Year's Day
+  '2026-01-19', // MLK Jr Day
+  '2026-02-16', // Washington's Birthday
+  '2026-04-03', // Good Friday
+  '2026-05-25', // Memorial Day
+  '2026-06-19', // Juneteenth
+  '2026-07-03', // Independence Day (observed; Jul 4 is a Saturday)
+  '2026-09-07', // Labor Day
+  '2026-11-26', // Thanksgiving
+  '2026-12-25', // Christmas Day
+]);
+
+// Half-days: the close moves to 13:00 ET = 17:00Z. The open does not move.
+const RTH_EARLY_CLOSE_2026 = new Map([
+  ['2026-07-02', 17 * 60],
+  ['2026-11-27', 17 * 60],
+  ['2026-12-24', 17 * 60],
+]);
+
+const RTH_CALENDAR_THROUGH = Date.parse('2026-12-31T23:59:59Z');
+
+/**
+ * Hours of regular trading time inside [startMs, endMs). Pure; no clock read.
+ *
+ * Returns 0 rather than a negative for an inverted or degenerate interval: a
+ * negative exposure would silently cancel a real one when summed.
+ */
+function rthHoursBetween(startMs, endMs) {
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return 0;
+  let total = 0;
+  const first = new Date(startMs);
+  let dayStart = Date.UTC(first.getUTCFullYear(), first.getUTCMonth(), first.getUTCDate());
+  for (; dayStart < endMs; dayStart += DAY_MS) {
+    const d = new Date(dayStart);
+    const dow = d.getUTCDay();
+    if (dow === 0 || dow === 6) continue;
+    const key = d.toISOString().slice(0, 10);
+    if (RTH_HOLIDAYS_2026.has(key)) continue;
+    const closeMin = RTH_EARLY_CLOSE_2026.get(key) ?? RTH_CLOSE_MIN;
+    const lo = Math.max(dayStart + RTH_OPEN_MIN * 60_000, startMs);
+    const hi = Math.min(dayStart + closeMin * 60_000, endMs);
+    if (hi > lo) total += hi - lo;
+  }
+  return total / 3_600_000;
+}
+
+/** AC1's restated threshold: the two reads must straddle >= 4 RTH-hours. */
+const AC1_MIN_RTH_HOURS = 4;
+
+/**
+ * Grade one boot's reads against the restated AC1.
+ *
+ * Deliberately keyed on the widest pair WITHIN a boot: a pair spanning a
+ * restart is not a measurement of retention at all, which is the same reason
+ * `report` segments on `startedAt`.
+ */
+function ac1Eligibility(segRows) {
+  if (!Array.isArray(segRows) || segRows.length < 2) {
+    return { eligible: false, rthHours: 0, reason: 'fewer than two reads on this boot' };
+  }
+  const firstAt = Date.parse(segRows[0].atIso);
+  const lastAt = Date.parse(segRows[segRows.length - 1].atIso);
+  const rthHours = rthHoursBetween(firstAt, lastAt);
+  return {
+    eligible: rthHours >= AC1_MIN_RTH_HOURS,
+    rthHours,
+    reason:
+      rthHours >= AC1_MIN_RTH_HOURS
+        ? `pair straddles ${rthHours.toFixed(2)} RTH-hours`
+        : `pair straddles only ${rthHours.toFixed(2)} RTH-hours (need >= ${AC1_MIN_RTH_HOURS.toFixed(1)})`,
+  };
+}
+
+/**
  * Fold the tape into one block per BOOT.
  *
  * Segmenting on `startedAt` is the whole point: the defect is "climbs through
@@ -163,32 +265,62 @@ function report(rows) {
   }
 
   console.log(`[tra4158] ${rows.length} rows across ${segments.length} boot(s)\n`);
+  let bestPair = 0;
   for (const seg of segments) {
     const first = seg.rows[0];
     const last = seg.rows[seg.rows.length - 1];
     const peakHeap = Math.max(...seg.rows.map(r => r.heapUsedMB));
     const peakRss = Math.max(...seg.rows.map(r => r.rssMB));
     console.log(`boot ${seg.startedAt} pid ${seg.pid} commit ${seg.commit} — ${seg.rows.length} read(s)`);
-    console.log('  atIso                     uptimeH  heapMB  heapPct   rssMB  peakRssMB  gcMajor  gcMajorMaxMs');
+    console.log('  atIso                     uptimeH   rthH  heapMB  heapPct   rssMB  peakRssMB  gcMajor  gcMajorMaxMs');
     for (const r of seg.rows) {
       const upH = r.uptimeSec === null ? '   ?  ' : (r.uptimeSec / 3600).toFixed(2).padStart(6);
+      // RTH exposure of this BOOT at the moment of the read — the ruler that
+      // correlates with the growth (r=0.839) rather than the one that does not.
+      const bootAt = Date.parse(seg.startedAt ?? '');
+      const rthH = Number.isFinite(bootAt)
+        ? rthHoursBetween(bootAt, Date.parse(r.atIso)).toFixed(2).padStart(5)
+        : '    ?';
       console.log(
-        `  ${r.atIso}  ${upH}  ${String(r.heapUsedMB).padStart(6)}  ${String(r.heapPct ?? '?').padStart(6)}` +
+        `  ${r.atIso}  ${upH}  ${rthH}  ${String(r.heapUsedMB).padStart(6)}  ${String(r.heapPct ?? '?').padStart(6)}` +
           `  ${String(r.rssMB).padStart(6)}  ${String(r.peakRssMB).padStart(9)}` +
           `  ${String(r.gcMajorCount ?? '?').padStart(7)}  ${String(r.gcMajorMaxMs === null ? '?' : round1(r.gcMajorMaxMs)).padStart(12)}`,
       );
     }
     if (seg.rows.length >= 2) {
       const hours = (Date.parse(last.atIso) - Date.parse(first.atIso)) / 3_600_000;
+      const ac1 = ac1Eligibility(seg.rows);
       console.log(
         `  Δheap ${round1(last.heapUsedMB - first.heapUsedMB)}MB over ${round1(hours)}h` +
           ` · peak heap ${peakHeap}MB (${round1((peakHeap / (last.heapLimitMB || 1812)) * 100)}% of cap)` +
           ` · peak rss ${peakRss}MB`,
       );
+      console.log(`  AC1 pair: ${ac1.eligible ? 'ELIGIBLE' : 'NOT ELIGIBLE'} — ${ac1.reason}`);
+      bestPair = Math.max(bestPair, ac1.rthHours);
     } else {
       console.log('  (single read in this boot — a delta needs two, and one across a restart is not one)');
     }
     console.log('');
+  }
+
+  // The tape-level AC1 verdict. Stated as its own line because "no eligible
+  // pair exists yet" is the finding — it is what says the measurement is
+  // blocked on boot lifetime (TRA-3660), not on someone remembering to poll.
+  if (bestPair >= AC1_MIN_RTH_HOURS) {
+    console.log(`AC1 EVIDENCE PRESENT — widest in-boot pair straddles ${bestPair.toFixed(2)} RTH-hours.`);
+  } else {
+    console.log(
+      `AC1 EVIDENCE ABSENT — widest in-boot pair straddles ${bestPair.toFixed(2)} RTH-hours,` +
+        ` below the ${AC1_MIN_RTH_HOURS.toFixed(1)} the restated AC1 requires.` +
+        ' A read pair on a boot that did not survive a session cannot grade retention.',
+    );
+  }
+  const latest = Math.max(...rows.map(r => Date.parse(r.atIso)).filter(Number.isFinite));
+  if (latest > RTH_CALENDAR_THROUGH) {
+    console.log(
+      '⚠️ RTH calendar coverage ends 2026-12-31; later rows are folded on the weekday rule alone,' +
+        ' which OVERSTATES exposure (the permissive direction). Extend the holiday table.',
+    );
   }
 }
 
@@ -405,6 +537,96 @@ function reportDeaths(rows, sinceIso) {
   }
 }
 
+/**
+ * `--selftest` — controls for the RTH ruler and the AC1 gate.
+ *
+ * The two that carry the weight are the FALSE-NEGATIVE and FALSE-POSITIVE
+ * controls: `weekend-boot-68h` is the real 2026-08-28..08-31 boot that
+ * satisfies AC1-as-filed on wall clock and carries 41% of one session's
+ * exposure, and `overnight-pair-8h` is a pair 8 wall-clock hours apart that
+ * measures nothing. If either passes the gate, the gate is not the ruler this
+ * ticket restated it to be.
+ */
+function selftest() {
+  const results = [];
+  const near = (a, b, eps = 0.005) => Math.abs(a - b) <= eps;
+  const check = (name, ok, detail) => {
+    results.push({ name, ok, detail });
+    console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name.padEnd(26)} ${detail}`);
+  };
+  const H = iso => Date.parse(iso);
+
+  console.log('[tra4158] --selftest: RTH ruler + AC1 eligibility controls\n');
+
+  const fullSession = rthHoursBetween(H('2026-09-01T13:30:00Z'), H('2026-09-01T20:00:00Z'));
+  check('full-session', near(fullSession, 6.5), `${fullSession.toFixed(3)}h (expect 6.500)`);
+
+  const clipped = rthHoursBetween(H('2026-09-01T00:00:00Z'), H('2026-09-02T00:00:00Z'));
+  check('clips-to-window', near(clipped, 6.5), `${clipped.toFixed(3)}h over a whole UTC day (expect 6.500)`);
+
+  // The measured contrast this ruler exists for. Both are real boots.
+  const weekend = rthHoursBetween(H('2026-08-28T17:23:52Z'), H('2026-08-31T13:33:30Z'));
+  check(
+    'weekend-boot-68h',
+    near(weekend, 2.658, 0.01) && weekend < AC1_MIN_RTH_HOURS,
+    `${weekend.toFixed(3)} RTH-h across 68.16 WALL-clock hours — below the ${AC1_MIN_RTH_HOURS}h gate`,
+  );
+  const fullDay = rthHoursBetween(H('2026-08-26T12:56:02Z'), H('2026-08-27T13:26:17Z'));
+  check(
+    'session-boot-24h',
+    near(fullDay, 6.5) && fullDay >= AC1_MIN_RTH_HOURS,
+    `${fullDay.toFixed(3)} RTH-h across 24.51 wall-clock hours — 2.4x the 68h boot's exposure`,
+  );
+
+  const weekendOnly = rthHoursBetween(H('2026-08-29T00:00:00Z'), H('2026-08-31T00:00:00Z'));
+  check('weekend-is-zero', weekendOnly === 0, `${weekendOnly.toFixed(3)}h Sat+Sun (expect 0)`);
+
+  const laborDay = rthHoursBetween(H('2026-09-07T00:00:00Z'), H('2026-09-08T00:00:00Z'));
+  check('holiday-is-zero', laborDay === 0, `${laborDay.toFixed(3)}h on Labor Day 2026-09-07 (expect 0)`);
+
+  const halfDay = rthHoursBetween(H('2026-11-27T00:00:00Z'), H('2026-11-28T00:00:00Z'));
+  check('half-day-closes-1700Z', near(halfDay, 3.5), `${halfDay.toFixed(3)}h on 2026-11-27 (expect 3.500)`);
+
+  const inverted = rthHoursBetween(H('2026-09-01T20:00:00Z'), H('2026-09-01T13:30:00Z'));
+  check('inverted-is-zero', inverted === 0, `${inverted.toFixed(3)}h (a negative would cancel a real one)`);
+
+  const nan = rthHoursBetween(Number.NaN, H('2026-09-01T20:00:00Z'));
+  check('unparseable-is-zero', nan === 0, `${nan.toFixed(3)}h for an unparseable boot stamp`);
+
+  // AC1 gate.
+  const row = iso => ({ atIso: iso });
+  const single = ac1Eligibility([row('2026-09-01T13:45:00Z')]);
+  check('single-read-refused', !single.eligible, single.reason);
+
+  const overnight = ac1Eligibility([row('2026-09-01T20:30:00Z'), row('2026-09-02T04:30:00Z')]);
+  check(
+    'overnight-pair-8h',
+    !overnight.eligible && overnight.rthHours === 0,
+    `8 WALL-clock hours, ${overnight.rthHours.toFixed(2)} RTH-h — AC1-as-filed would have PASSED this`,
+  );
+
+  const inSession = ac1Eligibility([row('2026-09-01T13:45:00Z'), row('2026-09-01T19:45:00Z')]);
+  check('in-session-pair', inSession.eligible && near(inSession.rthHours, 6.0), inSession.reason);
+
+  const exactly4 = ac1Eligibility([row('2026-09-01T13:45:00Z'), row('2026-09-01T17:45:00Z')]);
+  check('boundary-is-inclusive', exactly4.eligible, `exactly ${exactly4.rthHours.toFixed(2)} RTH-h must pass (>=)`);
+
+  const justUnder = ac1Eligibility([row('2026-09-01T13:45:00Z'), row('2026-09-01T17:44:00Z')]);
+  check('boundary-just-under', !justUnder.eligible, justUnder.reason);
+
+  // Today's actual post-close boot, so the control suite states the live verdict.
+  const live = ac1Eligibility([row('2026-09-01T18:04:59.811Z'), row('2026-09-01T23:48:16.025Z')]);
+  check(
+    'live-boot-2026-09-01',
+    !live.eligible && near(live.rthHours, 1.917, 0.01),
+    `the 18:04:59Z boot carries ${live.rthHours.toFixed(2)} RTH-h by the close — NOT gradeable`,
+  );
+
+  const failed = results.filter(r => !r.ok);
+  console.log(`\n[tra4158] ${results.length - failed.length}/${results.length} controls green`);
+  return failed.length === 0;
+}
+
 async function fetchEvents(serviceId, key, pages = 6) {
   const out = [];
   let cursor = '';
@@ -428,11 +650,16 @@ async function fetchEvents(serviceId, key, pages = 6) {
 }
 
 async function main() {
+  if (flag('selftest')) {
+    process.exit(selftest() ? 0 : 1);
+  }
+
   if (flag('help') || (!flag('once') && !flag('report') && !flag('restarts') && !flag('deaths'))) {
     console.log(
-      'usage: tra4158-heap-series.mjs (--once | --report | --restarts | --deaths) [--tape=<path>] [--base=<url>]\n' +
+      'usage: tra4158-heap-series.mjs (--once | --report | --restarts | --deaths | --selftest) [--tape=<path>] [--base=<url>]\n' +
         '       --restarts [--since=<iso>] [--pages=<n>]  needs RENDER_API_KEY (+ RENDER_SERVICE_ID or --service=)\n' +
-        '       --deaths   [--since=<iso>] [--owner=<id>] partition deaths by mode; needs the same, plus an owner id',
+        '       --deaths   [--since=<iso>] [--owner=<id>] partition deaths by mode; needs the same, plus an owner id\n' +
+        '       --selftest                               controls for the RTH ruler and the AC1 eligibility gate',
     );
     process.exit(2);
   }
