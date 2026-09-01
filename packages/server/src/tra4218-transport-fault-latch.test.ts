@@ -321,6 +321,71 @@ describe('TRA-4218 — the latch survives a restart, so the fix has to reach the
     expect(lot!.engineMayAct).toBe(false);
   });
 
+  it('heals the ADOPTED row too — the deploy restores 3 of 3, not 2 of 3', () => {
+    // Filed against this ticket 2026-09-01 (comment d30af907, off the TRA-4217
+    // trace): "deploying e1dbf34 will not restore protection to the adopted
+    // (imported) NOK row … two rows get their exit back, the third does not,
+    // and no published field will distinguish them."
+    //
+    // The trace behind that is accurate about the SHIPPED build and wrong about
+    // this fix, in two independent places, so it is pinned here as a test
+    // rather than argued in a comment:
+    //
+    //  1. The two reset sites it names (`finalizePendingExit` on a fill,
+    //     `stageManualPendingExit` on a re-stage — the latter refusing imported
+    //     rows) are the only two THAT BUILD had. This fix adds a THIRD, in
+    //     `importSnapshot`, and that one has no `importedFromTradier` filter:
+    //     it keys on the row's own `exitErrorReason` naming a transport fault,
+    //     which is a fact about the BROKER, not about the row's provenance.
+    //
+    //  2. "the auto-exit loop does not filter imported rows" is inverted. It
+    //     does — `autoManageImportedTradierOptions`, `waitAndHold` and
+    //     `engineMayActOnAdoptedRow` all `continue` ~470 lines ABOVE the
+    //     breaker. The live row reaches the breaker for the opposite reason:
+    //     it PASSES all three (`desk_add` is board-exempt, TRA-3909), which is
+    //     how it accrued `closeRejectCount: 3` in the first place. A row the
+    //     loop skipped could never have counted a reject.
+    //
+    // So the adopted row is not a special case of the heal. It is the ordinary
+    // case, and this test fails the moment anyone narrows the heal to
+    // engine-origin rows.
+    const acct = new PaperOptionsAccount({ initialEquity: 1_035.94, tradierEnv: 'production' });
+    const opened = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live', undefined, 200);
+    expect(opened).not.toBeNull();
+    const snap = acct.exportSnapshot();
+    const deskRow = snap.openOptions[0] as OptionPosition;
+    // The a2f9c8cd shape: imported bookkeeping, desk_add authority, own sleeve.
+    deskRow.importedFromTradier = true;
+    deskRow.adoptionAuthority = 'desk_add';
+    deskRow.deskAddSleeve = 'single_leg_otm';
+    deskRow.tradierEnv = 'production';
+    deskRow.closeRejectCount = MAX_CONSECUTIVE_CLOSE_REJECTS;
+    deskRow.exitErrorReason =
+      `${LIVE_500_REASON} — auto-close paused after 3 rejected attempts; `
+      + 'close this position manually on Tradier or with the Close button.';
+
+    const restarted = new PaperOptionsAccount({ initialEquity: 1_035.94, tradierEnv: 'production' });
+    restarted.updateConfig({ autoManageImportedTradierOptions: true, actOnAdoptedBrokerRows: true });
+    restarted.importSnapshot(snap);
+
+    const r = row(restarted);
+    // The reset the filing says does not exist for this row.
+    expect(r.closeRejectCount).toBeUndefined();
+    expect(r.exitTransportFailCount).toBe(1);
+    expect(r.exitRetryNotBeforeMs).toBe(TRADING_TIME + FIRST_BACKOFF_MS);
+
+    // …and it is not merely un-latched on paper: the row reaches the submit
+    // path through the SAME loop as an engine row once the ladder releases.
+    // Before the release the backoff still holds it — the heal re-arms through
+    // the ladder, it does not fire on boot.
+    const sym = deskRow.optionSymbol!;
+    expect(restarted.checkExits(new Map(), new Map([[sym, 0.01]]), undefined, { waitAndHold: true }))
+      .toHaveLength(0);
+    vi.setSystemTime(TRADING_TIME + FIRST_BACKOFF_MS + 1);
+    expect(restarted.checkExits(new Map(), new Map([[sym, 0.01]]), undefined, { waitAndHold: true }))
+      .toHaveLength(1);
+  });
+
   it('does NOT heal a breaker accrued from genuine refusals', () => {
     const { snap } = strandedSnapshot();
     // Same latch, different cause: the broker refused the contract three times.
