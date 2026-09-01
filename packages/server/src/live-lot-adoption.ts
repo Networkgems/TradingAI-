@@ -437,6 +437,20 @@ export interface LotAdoptionPlan {
   refusals: LotAdoptionRefusal[];
 }
 
+/**
+ * TRA-3916 / TRA-4218 — the `checkExits` gates that can refuse a single-leg long
+ * desk lot, in that walk's own order. `multi_leg_combo` / `covered_write` cannot
+ * reach a row this pass mints, so they are not in the union.
+ */
+export type AdoptedLotExitGate =
+  | 'imported_auto_manage_off'
+  | 'imported_no_broker_mirror'
+  | 'adopted_not_authorized'
+  | 'stop_not_armed'
+  | 'close_reject_breaker'
+  | 'exit_transport_backoff'
+  | 'exit_expired_breaker';
+
 /** TRA-3909 — one adopted desk lot, as the route publishes it. */
 export interface AdoptedLotView {
   positionId: string;
@@ -480,15 +494,20 @@ export interface AdoptedLotView {
    * gates only. The gates a row acquires while it trades are exactly the ones a
    * census is for.
    */
-  exitInertReason:
-    | 'imported_auto_manage_off'
-    | 'imported_no_broker_mirror'
-    | 'adopted_not_authorized'
-    | 'stop_not_armed'
-    | 'close_reject_breaker'
-    | 'exit_transport_backoff'
-    | 'exit_expired_breaker'
-    | null;
+  exitInertReason: AdoptedLotExitGate | null;
+  /**
+   * TRA-4225 — EVERY gate refusing this row, in the same walk order, not just
+   * the first. `exitInertReasons[0] === exitInertReason` always.
+   *
+   * The first-gate answer above is right about "which gate did the not-acting"
+   * and wrong as an inventory of what is wrong with the row. On 2026-08-31 the
+   * production book's adopted row carried BOTH `adopted_not_authorized` and a
+   * latched `close_reject_breaker` from a Tradier 500 — and only the first was
+   * published, so the fleet's three identically-latched rows read as three
+   * different hazards. Clearing the gate a surface names and finding the row
+   * still inert is the failure mode this closes.
+   */
+  exitInertReasons: AdoptedLotExitGate[];
   stopArmed: boolean;
   riskUnmanagedReason: string | null;
   /**

@@ -375,7 +375,7 @@ import {
   setClosedRowGrantLookup,
 } from './tra3926-oversold-close-detector.js';
 // TRA-2820 — live-book "is it actually stopped?" counter for /api/health/options-live.
-import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability, mergeDayOneStopPosture, blindDayOneStopPosture, mergeOtmSleeveStopCoverage, blindOtmSleeveStopCoverage, type PaperOptionsAccount } from './options-account.js';
+import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability, mergeLiveStopGovernance, blindLiveStopGovernance, mergeDayOneStopPosture, blindDayOneStopPosture, mergeOtmSleeveStopCoverage, blindOtmSleeveStopCoverage, type PaperOptionsAccount } from './options-account.js';
 import { resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule } from './exit-risk-rules-flag.js';
 // TRA-3941 — the frozen sleeve KEY the exit ruling is scoped to, so the wire
 // field names the same join column the journal tape and the gate ledger use.
@@ -11900,6 +11900,45 @@ app.get('/api/health/options-live', async (_req, res) => {
           // which is this ticket's own defect one level up.
           return {
             ...blindLiveStopActionability(),
+            instrumentBlind: true as const,
+            blindReason: err instanceof Error ? err.message : String(err),
+          };
+        }
+      })(),
+      // TRA-4225 — THE PARTITION its neighbour above cannot express.
+      //
+      // `liveStopActionability` is keyed on a BREACH and names the FIRST gate
+      // that refused. Both are right, and on 2026-08-31 they meant that three
+      // real-money rows latched by ONE Tradier 500 published as `0` / `1` / `2`
+      // across three fields — the third row's breaker masked by
+      // `imported_auto_manage_off` winning its walk. This field is every open
+      // live row split by whether ANYTHING will act on its stop, with EVERY gate
+      // holding each held row (`heldBy`), the breaker's cause class and trip
+      // instant (`breakerLatched`), and what it would take to un-hold each row
+      // (`recovery` — `close_position_only` is the imported case, where the only
+      // way to un-hold the row is to give up the position; the Close button
+      // itself works there, which is TRA-4224's measurement).
+      //
+      // ⚠️ Read `heldBy` and `byClass` together: `heldBy` deliberately does not
+      // sum to `ungoverned` (a row held by three gates appears three times), and
+      // `multiHeld` is the overlap. Same fleet/book caveat as its neighbours —
+      // this folds `getAllUserContexts()` and `/api/state` serves one book.
+      //
+      // Counts, gate names and cause classes only. No OCC symbols (TRA-2163).
+      liveStopGovernance: (() => {
+        try {
+          return {
+            ...mergeLiveStopGovernance(
+              getAllUserContexts().map(c => c.engine.getLiveStopGovernance()),
+            ),
+            instrumentBlind: false as const,
+            blindReason: null,
+          };
+        } catch (err) {
+          // Same discipline as above, same reason: the blind shape is TYPED off
+          // the success shape, so a field cannot ship on one branch only.
+          return {
+            ...blindLiveStopGovernance(),
             instrumentBlind: true as const,
             blindReason: err instanceof Error ? err.message : String(err),
           };

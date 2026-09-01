@@ -20,6 +20,8 @@ import type {
   SignalType,
   EntryQuoteStamp,
   OptionAdmissionStamp,
+  ExitBreakerCauseClass,
+  ExitBreakerName,
 } from '@trading-app/shared';
 import { buildEntryQuoteStamp, PROFIT_FLOOR_LADDER } from '@trading-app/shared';
 import type {
@@ -149,6 +151,7 @@ import {
 import {
   planLotAdoption,
   type AdoptedLotView,
+  type AdoptedLotExitGate,
   type LiveLotAdoptionReport,
   type LotAdoptionPlan,
   type LotAdoptionRefusal,
@@ -165,6 +168,9 @@ import {
   summarizeEngineSubmitWitness,
   etDayOf,
 } from './tra3939-order-provenance-capture.js';
+// TRA-4225 — the ONE reject-text classifier (TRA-4226). Leaf module: it imports
+// `node:fs`/`node:path` and nothing of ours, so this import is acyclic.
+import { classifyBrokerRejectText } from './broker-submit-census.js';
 export type {
   AdoptedLotView,
   LiveLotAdoptionReport,
@@ -814,6 +820,113 @@ export function pausedExitRecoverySentence(paths: PausedExitRecoveryPaths): stri
       return 'close this position on Tradier — this row has no contracts left to sell, so the in-app '
         + 'Close button is refused.';
   }
+}
+
+/**
+ * TRA-4225 — the machine-readable cause class of a `close_reject` trip, read off
+ * the broker's own text.
+ *
+ * It DELEGATES to {@link classifyBrokerRejectText} rather than carrying a second
+ * pattern list. That function is TRA-4226's, it is the one the submit census
+ * already grades every reject with, and its `transport` arm is a strict superset
+ * of {@link TRANSPORT_STRANDED_REASON_RE} (the TRA-4218 heal's narrower probe) —
+ * the 2026-08-31 string matches both, and the suite pins that. Two lists would
+ * eventually disagree about the same string, and the two readings would then be
+ * a broker outage on one surface and an account problem on the other.
+ *
+ * Empty / absent text is `unknown`, never `broker_refusal`: "we did not record
+ * why" and "the broker refused it" are different facts and the second one is an
+ * accusation. Anything the classifier can read but does not recognise as
+ * transport IS a refusal for this purpose — the broker answered.
+ */
+export function classifyExitBreakerCause(
+  reason: string | null | undefined,
+): ExitBreakerCauseClass {
+  const text = (reason ?? '').trim();
+  if (text.length === 0) return 'unknown';
+  return classifyBrokerRejectText(text) === 'transport' ? 'transport_fault' : 'broker_refusal';
+}
+
+/**
+ * TRA-4225 — stamp the trip, ONCE, at the crossing.
+ *
+ * Idempotent by construction: a row that already carries a stamp for this
+ * breaker keeps its original `at`. The counter's threshold branch re-runs on
+ * every subsequent `clearPendingExit` at or above the threshold, and re-stamping
+ * there would answer "when was this row last re-read" while claiming to answer
+ * "when did it trip" — which is the same ask-2 hole one field further along.
+ *
+ * A trip by the OTHER breaker overwrites: both cannot be the live latch, and the
+ * one that fired last is the one holding the row now.
+ */
+function stampExitBreakerTrip(
+  opt: OptionPosition,
+  breaker: ExitBreakerName,
+  count: number,
+  causeClass: ExitBreakerCauseClass,
+  now: number = Date.now(),
+): void {
+  if (opt.exitBreakerTrip !== undefined && opt.exitBreakerTrip.breaker === breaker) return;
+  opt.exitBreakerTrip = { breaker, at: now, causeClass, count };
+}
+
+/**
+ * TRA-4225 — is one of the two auto-close breakers latching this row right now,
+ * and if so, when did it latch and why?
+ *
+ * The LATCH is read off the counters, never off the stamp: the counters are what
+ * `checkExits` actually gates on, and a stamp is evidence ABOUT a latch, not the
+ * latch itself. That direction matters for the population this ticket was filed
+ * on — three real-money rows latched on 2026-08-31, i.e. before this field
+ * existed. They carry no stamp and they are unambiguously latched.
+ *
+ * So the cause class has two provenances and the caller can tell them apart:
+ *
+ *   • `stamped`  — recorded at the crossing. `at` is the trip instant.
+ *   • `inferred` — no stamp, so the class is read off the row's `exitErrorReason`
+ *     and `at` is `null`. It is a real answer (the 08-31 rows say `(500)` in
+ *     their own text) but it is the LAST thing that happened to the row, which
+ *     is not necessarily the reject that carried the counter over. Published as
+ *     a separate count rather than folded in, because a bounded answer and a
+ *     recorded one must not read alike.
+ */
+export interface ExitBreakerLatch {
+  breaker: ExitBreakerName;
+  causeClass: ExitBreakerCauseClass;
+  /** Epoch ms of the trip; `null` when it was never stamped. */
+  at: number | null;
+  provenance: 'stamped' | 'inferred';
+  count: number;
+}
+
+export function describeExitBreakerLatch(opt: OptionPosition): ExitBreakerLatch | null {
+  const rejects = opt.closeRejectCount ?? 0;
+  const expiries = opt.exitExpiredCount ?? 0;
+  const rejectLatched = rejects >= MAX_CONSECUTIVE_CLOSE_REJECTS;
+  const expiryLatched = expiries >= MAX_CONSECUTIVE_EXIT_EXPIRIES;
+  if (!rejectLatched && !expiryLatched) return null;
+  // Both latched is possible on a row that was refused and then lapsed. The
+  // reject breaker is named, because it is the gate `checkExits` hits first.
+  const breaker: ExitBreakerName = rejectLatched ? 'close_reject' : 'exit_expired';
+  const count = rejectLatched ? rejects : expiries;
+  const stamp = opt.exitBreakerTrip;
+  if (stamp !== undefined && stamp.breaker === breaker) {
+    return {
+      breaker,
+      causeClass: stamp.causeClass,
+      at: Number.isFinite(stamp.at) ? stamp.at : null,
+      provenance: 'stamped',
+      count,
+    };
+  }
+  return {
+    breaker,
+    causeClass:
+      breaker === 'exit_expired' ? 'expiry' : classifyExitBreakerCause(opt.exitErrorReason),
+    at: null,
+    provenance: 'inferred',
+    count,
+  };
 }
 
 /**
@@ -1908,21 +2021,238 @@ export interface LiveStopActionabilitySummary {
  * only exists inside a running `checkExits`. A row whose mark has gone stale
  * therefore grades on its last known mid — the same number `/api/state` shows.
  */
+/**
+ * TRA-4225 — the per-call terms the walk resolves ONCE, exactly as `checkExits`
+ * resolves them once per pass. Split out so the two folds that walk these gates
+ * cannot resolve them differently.
+ */
+interface LiveStopWalkClock {
+  now: number;
+  /** UTC day key — what the two date-keyed holds actually compare against. */
+  nowKey: string;
+  openingRangeMins: number | null;
+  dailyClosePhase: ReturnType<typeof resolveDailyCloseStopPhase> | null;
+}
+
+function resolveLiveStopWalkClock(ctx: LiveStopActionabilityContext): LiveStopWalkClock {
+  const now = ctx.now ?? Date.now();
+  return {
+    now,
+    nowKey: toDateKey(now),
+    // `null` when the window is off (0) or the ET calendar math fails, and
+    // `null` never reads as "inside".
+    openingRangeMins: ctx.openingRangeGuardMin > 0 ? minutesSinceRthOpen(now) : null,
+    dailyClosePhase:
+      ctx.liveStopPolicy?.policy === 'daily_close'
+        ? resolveDailyCloseStopPhase(now, ctx.liveStopPolicy.closeWindowMin)
+        : null,
+  };
+}
+
+/**
+ * TRA-4225 — EVERY `checkExits` gate holding one live row, not just the first.
+ *
+ * ## Why the walk had to grow a second answer
+ *
+ * The first-matching-gate walk is RIGHT about the question it answers — "which
+ * gate did the not-acting" — and TRA-3822's `byReason` keeps answering exactly
+ * that, unchanged. But on 2026-08-31 all three real-money rows were latched by
+ * the SAME close-reject breaker from the SAME Tradier 500, and the published
+ * surfaces reported `0`, `1` and `2`: the third row's latch was invisible
+ * because `imported_auto_manage_off` sits upstream of the breaker branch and
+ * won the walk. A reader could not see one cause; they saw three hazards.
+ *
+ * A row can be held by several gates at once, and the count of rows a gate holds
+ * is a different question from the count of rows it is the FIRST to hold. Both
+ * are published now — `byReason` (first) on {@link LiveStopActionabilitySummary}
+ * and `heldBy` (every) on {@link LiveStopGovernanceSummary}.
+ *
+ * ## Order is still load-bearing
+ *
+ * `held` is in `checkExits` loop order, so `held[0]` is byte-identical to what
+ * the old chain produced — that is the property that lets TRA-3822's 26-test
+ * suite keep pinning `actionable`'s meaning through this refactor.
+ *
+ * Two gates deliberately STOP the walk rather than being collected past:
+ *
+ *   • `pendingExit` (TRA-354) — an exit is working at the broker, and
+ *     `checkExits` `continue`s there. Nothing below it is refusing anything on
+ *     this row, so nothing below it may be reported as holding it.
+ *   • the OTM day-one stop (TRA-3943) — when it fires it OUTRANKS the PDT hold
+ *     and the `daily_close` deferral (`:7129` / `:7378`), so those two are not
+ *     holding a row the rule is acting on.
+ *
+ * That is the difference between "this gate's predicate is true of the row" and
+ * "this gate is holding the row", and only the second one is a hazard.
+ */
+export interface LiveStopGateReading {
+  /** Every gate holding this row, in `checkExits` order. Empty ⇒ nothing holds it. */
+  held: LiveStopInertReason[];
+  /** Epoch ms each held gate lifts. A gate ABSENT from this map has no clock. */
+  releaseAt: Partial<Record<LiveStopInertReason, number>>;
+  /** An exit is staged/working at the broker and no upstream gate holds the row. */
+  inFlight: boolean;
+  /** `isArmedThreshold(stop) && mark <= stop` — the `:5332` predicate. */
+  slBreached: boolean;
+  /** TRA-3943 — the OTM sleeve's PREMIUM leg is through (the ATR leg is unreadable here). */
+  otmPremiumLegThrough: boolean;
+  /** The OTM rule fires AND is not held by its own day-one release. */
+  otmActs: boolean;
+  /** TRA-3902 — the exit pass held this row's chandelier trail for today's close window. */
+  chandelierHeldToday: boolean;
+  /** Is there an armed stop on this row at all? `false` ⇒ nothing to act on. */
+  stopArmed: boolean;
+  /** TRA-3981 — the OTM day-one rule GOVERNS this row (it has a leg to evaluate). */
+  otmGoverned: boolean;
+}
+
+export function liveStopGateReading(
+  opt: OptionPosition,
+  ctx: LiveStopActionabilityContext,
+  clock: LiveStopWalkClock,
+): LiveStopGateReading {
+  const { now, nowKey, openingRangeMins, dailyClosePhase } = clock;
+  const held: LiveStopInertReason[] = [];
+  const releaseAt: Partial<Record<LiveStopInertReason, number>> = {};
+
+  // Fact 1 — the breach, using the SAME predicate as the SL branch at `:5332`.
+  // `isArmedThreshold` first: `stopLossPremium: 0` means "no stop", and a
+  // `null` from disk ToNumber-coerces in `mark <= null` (TRA-2957).
+  const mark = opt.currentPremium;
+  const stopArmed = isArmedThreshold(opt.stopLossPremium);
+  const slBreached = stopArmed && Number.isFinite(mark) && mark <= opt.stopLossPremium;
+
+  // TRA-3943 — the OTM sleeve's intraday stop, re-derived here by calling the
+  // ONE exported verdict `checkExits` calls, for the reason TRA-3829's
+  // `engineMayActOnAdoptedRow` note gives: a re-implementation would drift
+  // from the gate it claims to predict.
+  //
+  // ⚠️ The PREMIUM leg only. This walk has no underlying price (the same
+  // limitation that forces the chandelier read below to use a persisted latch
+  // rather than re-derive a breach), so `underlyingSpot` is passed `undefined`
+  // and the ATR leg cannot fire here. That direction is PESSIMISTIC — an
+  // ATR-only fire still reads held — and it is disclosed rather than papered
+  // over with a stale spot.
+  //
+  // TRA-3981 — governance is asked of the SHARED resolver, not re-spelled as
+  // `rule.armed`: a row whose premium anchor is a restated basis and whose ATR
+  // level was never stamped has no leg this rule can evaluate, and the walk
+  // must not count it as one this rule will act on.
+  const otmGoverned =
+    ctx.otmDayOneStop !== undefined
+    && !opt.legs
+    && isOtmSleeveRow(opt)
+    && otmDayOneStopGovernance(otmDayOneStopSubject(opt), ctx.otmDayOneStop.rule).governs;
+  // `inOpeningRange` is NOT overridden by this rule (`:6845` gates the verdict
+  // on it), so the window still wins and the row falls through to
+  // `opening_range_hold` below.
+  const otmInOpeningRange = openingRangeMins !== null && openingRangeMins < ctx.openingRangeGuardMin;
+  const otmPremiumLegThrough =
+    otmGoverned
+    && !otmInOpeningRange
+    && otmDayOneStopVerdict(
+      otmDayOneStopSubject(opt),
+      { mark, underlyingSpot: undefined, rule: ctx.otmDayOneStop!.rule },
+    ).fires;
+  // `:6865` exactly: on day one the fire is held unless the release said yes,
+  // and it fails CLOSED. A row opened on an EARLIER day is not day-one and the
+  // release is never consulted for it.
+  const otmDayOne = ctx.holdLiveOptionsOvernightForPdt && toDateKey(opt.openedAt) === nowKey;
+  const otmActs = otmPremiumLegThrough && !(otmDayOne && !ctx.otmDayOneStop!.release.released);
+
+  const chandelierHeldToday =
+    dailyClosePhase !== null
+    && !dailyClosePhase.inCloseWindow
+    && opt.chandelierHeldForDailyClose !== undefined
+    && opt.chandelierHeldForDailyClose === etDateKey(now)
+    && !opt.pendingExit;
+
+  const base: Omit<LiveStopGateReading, 'held' | 'releaseAt' | 'inFlight'> = {
+    slBreached,
+    otmPremiumLegThrough,
+    otmActs,
+    chandelierHeldToday,
+    stopArmed,
+    otmGoverned,
+  };
+
+  // Gates ABOVE the TRA-354 in-flight `continue`, in loop order.
+  if (opt.legs && opt.legs.length > 1) held.push('multi_leg_combo');
+  if (opt.coveredWrite) held.push('covered_write');
+  if (opt.importedFromTradier === true && !ctx.autoManageImportedTradierOptions) {
+    held.push('imported_auto_manage_off');
+  }
+  if (opt.importedFromTradier === true && !ctx.brokerMirroring) {
+    held.push('imported_no_broker_mirror');
+  }
+  // TRA-3829 — same predicate, same position in the walk as the `continue` in
+  // `checkExits`. Not a re-implementation: both call the one exported function,
+  // so this summary cannot drift from the gate it is claiming to predict.
+  if (!engineMayActOnAdoptedRow(opt, ctx.actOnAdoptedBrokerRows)) held.push('adopted_not_authorized');
+
+  if (opt.pendingExit) {
+    // TRA-354 holds the row because an exit is already in flight. Nothing below
+    // is reached, so nothing below is reported. `inFlight` is true only when
+    // this is the FIRST thing holding it — a row already refused upstream is
+    // held by that gate, whatever is staged.
+    return { ...base, held, releaseAt, inFlight: held.length === 0 };
+  }
+
+  if ((opt.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS) held.push('close_reject_breaker');
+  // TRA-4218 — after the reject breaker, before the expiry breaker, exactly as
+  // in `checkExits`. The one gate here with a stamped release.
+  if (
+    typeof opt.exitRetryNotBeforeMs === 'number'
+    && Number.isFinite(opt.exitRetryNotBeforeMs)
+    && now < opt.exitRetryNotBeforeMs
+  ) {
+    held.push('exit_transport_backoff');
+    releaseAt.exit_transport_backoff = opt.exitRetryNotBeforeMs;
+  }
+  if ((opt.exitExpiredCount ?? 0) >= MAX_CONSECUTIVE_EXIT_EXPIRIES) held.push('exit_expired_breaker');
+
+  // TRA-3943 — the OTM rule outranks the four gates below, so when it acts they
+  // are not holding this row. Above it every gate is a `continue` that fires
+  // before `:7129`, so the OTM stop never reaches its fire site on those rows —
+  // which is why this sits HERE and not at the top.
+  if (otmActs) return { ...base, held, releaseAt, inFlight: false };
+
+  if (ctx.holdLiveOptionsOvernightForPdt && toDateKey(opt.openedAt) === nowKey) {
+    held.push('pdt_hold_today');
+    releaseAt.pdt_hold_today = nextUtcDayStart(opt.openedAt);
+  }
+  if (opt.signalType === 'relative_value' && toDateKey(opt.openedAt) === nowKey) {
+    // `swingHeldToday` at `:4823` is `(positionIsLive || swingHoldOptions)`, and
+    // every row here is already live — so the knob cannot un-latch it.
+    held.push('swing_hold_today');
+    releaseAt.swing_hold_today = nextUtcDayStart(opt.openedAt);
+  }
+  if (openingRangeMins !== null && openingRangeMins < ctx.openingRangeGuardMin) {
+    // TRA-3902 — same predicate as `inOpeningRange` in `checkExits` (a pre-open
+    // tick, negative minutes, counts as inside), and the same position.
+    held.push('opening_range_hold');
+    releaseAt.opening_range_hold = now + (ctx.openingRangeGuardMin - openingRangeMins) * 60_000;
+  }
+  if (dailyClosePhase !== null && !dailyClosePhase.inCloseWindow) {
+    // TRA-3902 (ruling B) — outside the close window only the catastrophic level
+    // fires, and only inside the session.
+    const catastrophicLevel = opt.premiumPaid * (1 - ctx.liveStopPolicy!.catastrophicLossPct);
+    const catastrophic = opt.premiumPaid > 0 && Number.isFinite(mark) && mark <= catastrophicLevel;
+    if (!(dailyClosePhase.inSession && catastrophic)) {
+      held.push('daily_close_hold');
+      if (dailyClosePhase.releaseAt != null) releaseAt.daily_close_hold = dailyClosePhase.releaseAt;
+    }
+  }
+
+  return { ...base, held, releaseAt, inFlight: false };
+}
+
 export function summarizeLiveStopActionability(
   positions: Iterable<OptionPosition>,
   ctx: LiveStopActionabilityContext,
 ): LiveStopActionabilitySummary {
-  const now = ctx.now ?? Date.now();
-  const nowKey = toDateKey(now);
-  // TRA-3902 — resolved once per call, exactly as `checkExits` resolves it once
-  // per pass. `null` when the window is off (0) or the ET calendar math fails,
-  // and `null` never reads as "inside".
-  const openingRangeMins = ctx.openingRangeGuardMin > 0 ? minutesSinceRthOpen(now) : null;
-  // TRA-3902 (ruling B) — the SAME helper `checkExits` resolves its phase from.
-  const dailyClosePhase =
-    ctx.liveStopPolicy?.policy === 'daily_close'
-      ? resolveDailyCloseStopPhase(now, ctx.liveStopPolicy.closeWindowMin)
-      : null;
+  const clock = resolveLiveStopWalkClock(ctx);
+  const dailyClosePhase = clock.dailyClosePhase;
   const byReason: Partial<Record<LiveStopInertReason, number>> = {};
   let breached = 0;
   let actionable = 0;
@@ -1935,53 +2265,12 @@ export function summarizeLiveStopActionability(
   for (const opt of positions) {
     if ((opt.mode ?? 'demo') !== 'live') continue;
     if (opt.closedAt !== undefined) continue;
-    // Fact 1 — the breach, using the SAME predicate as the SL branch at `:5332`.
-    // `isArmedThreshold` first: `stopLossPremium: 0` means "no stop", and a
-    // `null` from disk ToNumber-coerces in `mark <= null` (TRA-2957).
-    const mark = opt.currentPremium;
-    const slBreached =
-      isArmedThreshold(opt.stopLossPremium) && Number.isFinite(mark) && mark <= opt.stopLossPremium;
-
-    // TRA-3943 — the OTM sleeve's intraday stop, re-derived here by calling the
-    // ONE exported verdict `checkExits` calls, for the reason TRA-3829's
-    // `engineMayActOnAdoptedRow` note gives: a re-implementation would drift
-    // from the gate it claims to predict.
-    //
-    // ⚠️ The PREMIUM leg only. This walk has no underlying price (the same
-    // limitation that forced the chandelier branch below to read a persisted
-    // latch rather than re-derive a breach), so `underlyingSpot` is passed
-    // `undefined` and the ATR leg cannot fire here. That direction is
-    // PESSIMISTIC — an ATR-only fire still reads `inert` — and it is disclosed
-    // rather than papered over with a stale spot.
-    //
-    // TRA-3981 — governance is asked of the SHARED resolver, not re-spelled as
-    // `rule.armed`: a row whose premium anchor is a restated basis and whose ATR
-    // level was never stamped has no leg this rule can evaluate, and the walk
-    // must not count it as one this rule will act on. It falls through to the
-    // `daily_close` / chandelier branches below, which is where it actually sits.
-    const otmGoverned =
-      ctx.otmDayOneStop !== undefined
-      && !opt.legs
-      && isOtmSleeveRow(opt)
-      && otmDayOneStopGovernance(otmDayOneStopSubject(opt), ctx.otmDayOneStop.rule).governs;
-    // `inOpeningRange` is NOT overridden by this rule (`:6845` gates the verdict
-    // on it), so the window still wins and the row falls through to
-    // `opening_range_hold` below.
-    const otmInOpeningRange = openingRangeMins !== null && openingRangeMins < ctx.openingRangeGuardMin;
-    const otmPremiumLegThrough =
-      otmGoverned
-      && !otmInOpeningRange
-      && otmDayOneStopVerdict(
-        otmDayOneStopSubject(opt),
-        { mark, underlyingSpot: undefined, rule: ctx.otmDayOneStop!.rule },
-      ).fires;
-    // `:6865` exactly: on day one the fire is held unless the release said yes,
-    // and it fails CLOSED. A row opened on an EARLIER day is not day-one and the
-    // release is never consulted for it.
-    const otmDayOne =
-      ctx.holdLiveOptionsOvernightForPdt && toDateKey(opt.openedAt) === nowKey;
-    const otmActs =
-      otmPremiumLegThrough && !(otmDayOne && !ctx.otmDayOneStop!.release.released);
+    // TRA-4225 — Facts 1 and 2 both come off the ONE walk now (see
+    // {@link liveStopGateReading}). `held[0]` is the gate this summary has always
+    // reported; `held` in full is what its sibling `liveStopGovernance`
+    // publishes, and neither can drift from the other or from `checkExits`.
+    const reading = liveStopGateReading(opt, ctx, clock);
+    const { slBreached, otmPremiumLegThrough } = reading;
 
     // A row through −35% is through an armed stop even if `stopLossPremium` is
     // not also breached (the −20% level is the tighter bound in practice, but
@@ -1993,17 +2282,11 @@ export function summarizeLiveStopActionability(
       // The walk cannot re-derive that breach (no underlying price here), so
       // it reads the exit pass's own persisted latch for today's ET day. A row
       // that is past the latch's day, or whose window is open, is not held.
-      if (
-        dailyClosePhase !== null
-        && !dailyClosePhase.inCloseWindow
-        && opt.chandelierHeldForDailyClose !== undefined
-        && opt.chandelierHeldForDailyClose === etDateKey(now)
-        && !opt.pendingExit
-      ) {
+      if (reading.chandelierHeldToday) {
         breached += 1;
         inert += 1;
         byReason.chandelier_daily_close_hold = (byReason.chandelier_daily_close_hold ?? 0) + 1;
-        if (dailyClosePhase.releaseAt != null) {
+        if (dailyClosePhase != null && dailyClosePhase.releaseAt != null) {
           const release = dailyClosePhase.releaseAt;
           if (earliestRelease === null || release < earliestRelease) earliestRelease = release;
           if (latestRelease === null || release > latestRelease) latestRelease = release;
@@ -2015,68 +2298,16 @@ export function summarizeLiveStopActionability(
     }
     breached += 1;
 
-    // Fact 2 — walk the `continue` gates in `checkExits` loop order and stop at
-    // the FIRST one that refuses. Order matters: a row can satisfy several, and
-    // only the first is the one that actually did the not-acting.
-    let reason: LiveStopInertReason | null = null;
-    if (opt.legs && opt.legs.length > 1) reason = 'multi_leg_combo';
-    else if (opt.coveredWrite) reason = 'covered_write';
-    else if (opt.importedFromTradier === true && !ctx.autoManageImportedTradierOptions) {
-      reason = 'imported_auto_manage_off';
-    } else if (opt.importedFromTradier === true && !ctx.brokerMirroring) {
-      reason = 'imported_no_broker_mirror';
-    } else if (!engineMayActOnAdoptedRow(opt, ctx.actOnAdoptedBrokerRows)) {
-      // TRA-3829 — same predicate, same position in the walk as the `continue`
-      // in `checkExits`. Not a re-implementation: both call the one exported
-      // function, so this summary cannot drift from the gate it is claiming to
-      // predict (the failure mode TRA-3822's docblock calls out).
-      reason = 'adopted_not_authorized';
-    } else if (opt.pendingExit) {
+    // Fact 2 — the FIRST gate that refuses, off the shared walk. A row can
+    // satisfy several and only the first is the one that actually did the
+    // not-acting; `held` is ordered, so `held[0]` IS that gate. (Every gate
+    // holding the row is published by `liveStopGovernance` — see TRA-4225.)
+    if (reading.inFlight) {
       // NOT inert — TRA-354 holds the row because an exit is already in flight.
       inFlight += 1;
       continue;
-    } else if ((opt.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS) {
-      reason = 'close_reject_breaker';
-    } else if (
-      // TRA-4218 — same position in the walk as the `continue` in `checkExits`:
-      // after the reject breaker, before the expiry breaker.
-      typeof opt.exitRetryNotBeforeMs === 'number'
-      && Number.isFinite(opt.exitRetryNotBeforeMs)
-      && now < opt.exitRetryNotBeforeMs
-    ) {
-      reason = 'exit_transport_backoff';
-    } else if ((opt.exitExpiredCount ?? 0) >= MAX_CONSECUTIVE_EXIT_EXPIRIES) {
-      reason = 'exit_expired_breaker';
-    } else if (otmActs) {
-      // TRA-3943 — ACTIONABLE, and `reason` stays null so it is counted as such
-      // below. This branch sits HERE and not earlier because every gate above it
-      // is a `continue` in `checkExits` that fires before `:7129`, so the OTM
-      // stop never reaches its fire site on those rows either. Below it are the
-      // only two gates the rule outranks: the PDT hold (skipped at `:7129`) and
-      // the `daily_close` deferral (made unreachable by the `exitPremium`
-      // assignment at `:7378`).
-    } else if (ctx.holdLiveOptionsOvernightForPdt && toDateKey(opt.openedAt) === nowKey) {
-      reason = 'pdt_hold_today';
-    } else if (
-      opt.signalType === 'relative_value'
-      && toDateKey(opt.openedAt) === nowKey
-    ) {
-      // `swingHeldToday` at `:4823` is `(positionIsLive || swingHoldOptions)`,
-      // and every row here is already live — so the knob cannot un-latch it.
-      reason = 'swing_hold_today';
-    } else if (openingRangeMins !== null && openingRangeMins < ctx.openingRangeGuardMin) {
-      // TRA-3902 — same predicate as `inOpeningRange` in `checkExits` (a
-      // pre-open tick, negative minutes, counts as inside), and the same
-      // position in the walk: it sits AT the SL branch, after every `continue`.
-      reason = 'opening_range_hold';
-    } else if (dailyClosePhase !== null && !dailyClosePhase.inCloseWindow) {
-      // TRA-3902 (ruling B) — same predicate as the `daily_close` branch in
-      // `checkExits`: outside the close window, only the catastrophic level
-      // fires, and only inside the session.
-      const catastrophicLevel = opt.premiumPaid * (1 - ctx.liveStopPolicy!.catastrophicLossPct);
-      const catastrophic = opt.premiumPaid > 0 && mark <= catastrophicLevel;
-      if (!(dailyClosePhase.inSession && catastrophic)) reason = 'daily_close_hold';
     }
+    const reason: LiveStopInertReason | null = reading.held[0] ?? null;
 
     if (reason === null) {
       actionable += 1;
@@ -2085,21 +2316,22 @@ export function summarizeLiveStopActionability(
     inert += 1;
     byReason[reason] = (byReason[reason] ?? 0) + 1;
 
-    // Fact 3 — the horizon. Only the two date-keyed holds have one: they test
-    // `toDateKey(openedAt) === toDateKey(now)`, so they release the instant the
-    // UTC day rolls past the row's open date.
-    if (reason === 'pdt_hold_today' || reason === 'swing_hold_today') {
-      const release = nextUtcDayStart(opt.openedAt);
-      if (earliestRelease === null || release < earliestRelease) earliestRelease = release;
-      if (latestRelease === null || release > latestRelease) latestRelease = release;
-    } else if (reason === 'opening_range_hold') {
-      // TRA-3902 — releases when the window closes: now + (window − elapsed).
-      const release = now + (ctx.openingRangeGuardMin - (openingRangeMins as number)) * 60_000;
-      if (earliestRelease === null || release < earliestRelease) earliestRelease = release;
-      if (latestRelease === null || release > latestRelease) latestRelease = release;
-    } else if (reason === 'daily_close_hold' && dailyClosePhase?.releaseAt != null) {
-      // TRA-3902 (ruling B) — releases when the close window opens.
-      const release = dailyClosePhase.releaseAt;
+    // Fact 3 — the horizon, off the same walk's `releaseAt` map: the two
+    // date-keyed holds release when the UTC day rolls past the row's open date,
+    // `opening_range_hold` when the window closes, `daily_close_hold` when the
+    // close window opens. Everything else needs a human.
+    //
+    // ⚠️ `exit_transport_backoff` is excluded HERE and only here. It does carry
+    // a release (`exitRetryNotBeforeMs`) and the walk publishes it — but this
+    // surface has counted it `indefinite` since TRA-4218 shipped, and that is
+    // the PESSIMISTIC direction (it over-reports the half that needs a human).
+    // Changing it would move `indefinite` / `fullyReleasesAt` on a live P0
+    // instrument as a side effect of a refactor, which is not this ticket.
+    // TRA-4225's own surface reads the map straight and classifies it as
+    // released-on-a-clock, which is what AC4 asks for.
+    const release =
+      reason === 'exit_transport_backoff' ? undefined : reading.releaseAt[reason];
+    if (release !== undefined) {
       if (earliestRelease === null || release < earliestRelease) earliestRelease = release;
       if (latestRelease === null || release > latestRelease) latestRelease = release;
     } else {
@@ -2173,6 +2405,411 @@ export function mergeLiveStopActionability(
     releasesAt: earliest,
     fullyReleasesAt: anyFullyUnknown ? null : latest,
     indefinite,
+  };
+}
+
+/**
+ * TRA-4225 — how a held row gets un-held. See {@link LiveStopGovernanceSummary}.
+ *
+ * The distinction AC4 is about: `releasesAt: null` on `liveStopActionability` is
+ * true about AUTOMATED release and reads as "there is no way out of this", which
+ * is false for most rows and true for one specific kind.
+ *
+ *   • `automatic`        — a clock lifts it. No human needed.
+ *   • `config_change`    — a settings/arm write lifts it (auto-manage imported
+ *     rows, broker mirroring, the TRA-3829 adopted-row grant). The row is fine;
+ *     the deployment is refusing on purpose.
+ *   • `manual_restage`   — a human acting ON THIS ROW clears it:
+ *     `stageManualPendingExit` deletes `closeRejectCount`, `exitExpiredCount`
+ *     and the transport backoff, so pressing Close/re-stage releases the latch
+ *     AND keeps the position.
+ *   • `close_position_only` — the operator can act, but only by GIVING UP THE
+ *     POSITION. `stageManualPendingExit` refuses imported rows at its first line
+ *     (`:10516`) and it is the only site that clears these counters short of a
+ *     fill, so on an imported row there is no action that releases the latch and
+ *     leaves the row open. A multi-leg combo and a covered write are here for
+ *     the same structural reason.
+ *
+ *     ⚠️ This is NOT "you must go to Tradier". TRA-4224 measured the opposite
+ *     and the distinction is exactly the one that ticket exists for: the in-app
+ *     Close button DOES work on an imported row — `POST /api/options/:id/close`
+ *     routes on ORIGIN and imported rows take the TRA-323 `submitSmartSellToClose`
+ *     sub-path, which never touches `stageManualPendingExit`. Whether that button
+ *     will route TODAY is `pausedExitRecoveryPaths`' question, and it is the one
+ *     the operator NOTICE answers. This field answers a different one — what it
+ *     costs to get the row governed again — and for these rows the answer is the
+ *     position itself.
+ *
+ * Precedence when a row carries several: the HARDEST wins, in the order above.
+ * A row that can only be un-held by closing it is not made easier by also
+ * carrying a clock on one of its other gates.
+ */
+export type LiveStopRecoveryPath =
+  | 'automatic'
+  | 'config_change'
+  | 'manual_restage'
+  | 'close_position_only';
+
+const RECOVERY_RANK: Record<LiveStopRecoveryPath, number> = {
+  automatic: 0,
+  config_change: 1,
+  manual_restage: 2,
+  close_position_only: 3,
+};
+
+/**
+ * TRA-4225 — the recovery path for ONE gate on ONE row.
+ *
+ * Keyed on the gate, then on the row, because the same gate takes a different
+ * action on different rows: a latched breaker is a re-stage away on an
+ * engine-opened row, and on an imported one costs the position.
+ */
+function gateRecoveryPath(
+  gate: LiveStopInertReason,
+  opt: OptionPosition,
+  reading: LiveStopGateReading,
+): LiveStopRecoveryPath {
+  if (reading.releaseAt[gate] !== undefined) return 'automatic';
+  switch (gate) {
+    case 'imported_auto_manage_off':
+    case 'imported_no_broker_mirror':
+    case 'adopted_not_authorized':
+      return 'config_change';
+    case 'close_reject_breaker':
+    case 'exit_expired_breaker':
+      // The one asymmetry this ticket's AC4 names. `stageManualPendingExit`
+      // returns `null` for an imported row, and it is the ONLY site that clears
+      // these counters short of a fill — so on an imported row nothing releases
+      // the latch with the position still open. (The Close button works on that
+      // row; it just ends the row. TRA-4224 measured it.)
+      return opt.importedFromTradier === true ? 'close_position_only' : 'manual_restage';
+    case 'multi_leg_combo':
+    case 'covered_write':
+      // Structural: the engine has no exit schedule for these shapes at all.
+      return 'close_position_only';
+    default:
+      // Every clocked gate is caught by the `releaseAt` test above; reaching
+      // here means a clock we could not resolve (a `daily_close` phase with no
+      // `releaseAt`), which is a human's problem, not a clock's.
+      return 'manual_restage';
+  }
+}
+
+/**
+ * TRA-4225 — THE PARTITION. Every open live row, split by whether anything will
+ * act on its stop.
+ *
+ * ## The defect
+ *
+ * On 2026-08-31 all three real-money OTM rows in the production `admin` book
+ * carried `closeRejectCount: 3` from ONE fault — a Tradier HTTP 500 on the
+ * `sell_to_close` submit. Three published surfaces described that one population
+ * and no two agreed:
+ *
+ *   • `liveUnmanagedRisk.total`            = 0  (a stop IS written on each row)
+ *   • `otmSleeveStopCoverage.ungovernedRows` = 1
+ *   • `liveStopActionability.inert`        = 2  (`byReason.close_reject_breaker: 2`)
+ *
+ * Every one of those numbers is correct for the question its field asks. The
+ * third row's latch is missing from the last one because the walk names the
+ * FIRST refusing gate and `imported_auto_manage_off` sits upstream of the
+ * breaker branch. The board asked for **the partition, not a fourth count** —
+ * so this fold does not add another number next to those three; it is the one
+ * surface on which all three rows land in one population, under one cause.
+ *
+ * ## What is different from `liveStopActionability`
+ *
+ * Three things, and each is why this could not be a widening:
+ *
+ *   1. **The denominator is every open live row**, not the breached ones. "Will
+ *      anything act on this stop" is answerable before the mark crosses, and the
+ *      08-31 book spent hours in the state where it mattered and nothing was
+ *      breached yet.
+ *   2. **Every gate holding a row is counted** (`heldBy`), not just the first.
+ *      `byReason` on the sibling field keeps naming the one that did the
+ *      not-acting, which is the right answer to a different question — a row can
+ *      be held by several and only one of them refused it today.
+ *   3. **Release is a taxonomy, not a timestamp.** See {@link LiveStopRecoveryPath}.
+ *
+ * ## Disclosure
+ *
+ * Counts, gate names, cause classes and two timestamps. **Never OCC symbols** —
+ * same no-auth `/api/health/options-live`, same TRA-2163 standing as its
+ * neighbours.
+ */
+export type LiveStopGovernanceClass =
+  /** Nothing holds this row: the exit pass reaches its stop. */
+  | 'governed'
+  /** An exit is staged/working at the broker (TRA-354). Something IS acting. */
+  | 'in_flight'
+  /** Held, and every gate holding it lifts on a clock. */
+  | 'held_with_release'
+  /** Held by at least one gate with no clock. Needs a human or a config write. */
+  | 'held_indefinite'
+  /**
+   * No armed stop and no OTM rule governing it — there is nothing for the engine
+   * to act ON. Its remedy is `liveUnmanagedRisk`'s (TRA-2820), not a gate's, so
+   * it is partitioned OUT rather than folded into `held_*`; `nothingWillAct`
+   * below is the union for a reader who wants the whole exposed population.
+   */
+  | 'no_stop_written';
+
+export interface LiveStopGovernanceSummary {
+  /** Every open live row. The denominator: `rows === Σ byClass`. */
+  rows: number;
+  byClass: Record<LiveStopGovernanceClass, number>;
+  /** `held_with_release + held_indefinite` — rows a gate is holding. */
+  ungoverned: number;
+  /** …of those, already through their stop. The urgent half. */
+  ungovernedBreached: number;
+  /** `ungoverned + no_stop_written` — every row nothing will act on. */
+  nothingWillAct: number;
+  /**
+   * EVERY gate holding a row, so a row held by three appears under all three.
+   * ⚠️ Deliberately does NOT sum to `ungoverned` — see `multiHeld`.
+   */
+  heldBy: Partial<Record<LiveStopInertReason, number>>;
+  /** Held rows carrying MORE than one gate. `Σ heldBy − multiHeld` overlap. */
+  multiHeld: number;
+  /**
+   * The two auto-close breakers, across every held row — the number the 08-31
+   * book needed and none of the three surfaces could produce.
+   */
+  breakerLatched: {
+    rows: number;
+    /** Every class emitted at 0 when unseen; an absent key would read clean. */
+    byCause: Record<ExitBreakerCauseClass, number>;
+    /** Trips with a recorded instant (TRA-4225 and later). */
+    stamped: number;
+    /** Trips whose class was read back off the row's text; `at` is unknown. */
+    inferred: number;
+    /** Earliest / latest STAMPED trip. `null` when nothing is stamped. */
+    firstTrippedAt: string | null;
+    lastTrippedAt: string | null;
+  };
+  /** Held rows by the hardest recovery path any of their gates requires. */
+  recovery: Record<LiveStopRecoveryPath, number>;
+  /** Earliest instant any held row's gate lifts on a clock. */
+  releasesAt: string | null;
+}
+
+const EMPTY_CAUSE_COUNTS = (): Record<ExitBreakerCauseClass, number> => ({
+  broker_refusal: 0,
+  transport_fault: 0,
+  expiry: 0,
+  unknown: 0,
+});
+
+const EMPTY_RECOVERY_COUNTS = (): Record<LiveStopRecoveryPath, number> => ({
+  automatic: 0,
+  config_change: 0,
+  manual_restage: 0,
+  close_position_only: 0,
+});
+
+const EMPTY_GOVERNANCE_CLASSES = (): Record<LiveStopGovernanceClass, number> => ({
+  governed: 0,
+  in_flight: 0,
+  held_with_release: 0,
+  held_indefinite: 0,
+  no_stop_written: 0,
+});
+
+export function summarizeLiveStopGovernance(
+  positions: Iterable<OptionPosition>,
+  ctx: LiveStopActionabilityContext,
+): LiveStopGovernanceSummary {
+  const clock = resolveLiveStopWalkClock(ctx);
+  const byClass = EMPTY_GOVERNANCE_CLASSES();
+  const byCause = EMPTY_CAUSE_COUNTS();
+  const recovery = EMPTY_RECOVERY_COUNTS();
+  const heldBy: Partial<Record<LiveStopInertReason, number>> = {};
+  let rows = 0;
+  let ungoverned = 0;
+  let ungovernedBreached = 0;
+  let multiHeld = 0;
+  let breakerRows = 0;
+  let stamped = 0;
+  let inferred = 0;
+  let firstTrippedAt: number | null = null;
+  let lastTrippedAt: number | null = null;
+  let earliestRelease: number | null = null;
+
+  for (const opt of positions) {
+    if ((opt.mode ?? 'demo') !== 'live') continue;
+    if (opt.closedAt !== undefined) continue;
+    rows += 1;
+    const reading = liveStopGateReading(opt, ctx, clock);
+
+    // A row the engine has nothing to act on is its own class. Checked FIRST:
+    // "held by a gate" is a claim about a stop that exists.
+    if (!reading.stopArmed && !reading.otmGoverned) {
+      byClass.no_stop_written += 1;
+      continue;
+    }
+    if (reading.held.length === 0) {
+      byClass[reading.inFlight ? 'in_flight' : 'governed'] += 1;
+      continue;
+    }
+
+    ungoverned += 1;
+    // The chandelier latch is a hold this walk can see but cannot express as a
+    // gate on an unbreached row (no underlying price here), so breach is the
+    // union of the two premium legs, exactly as on the sibling surface.
+    if (reading.slBreached || reading.otmPremiumLegThrough || reading.chandelierHeldToday) {
+      ungovernedBreached += 1;
+    }
+    if (reading.held.length > 1) multiHeld += 1;
+
+    let clocked = true;
+    let hardest: LiveStopRecoveryPath = 'automatic';
+    for (const gate of reading.held) {
+      heldBy[gate] = (heldBy[gate] ?? 0) + 1;
+      const release = reading.releaseAt[gate];
+      if (release === undefined) clocked = false;
+      else if (earliestRelease === null || release < earliestRelease) earliestRelease = release;
+      const path = gateRecoveryPath(gate, opt, reading);
+      if (RECOVERY_RANK[path] > RECOVERY_RANK[hardest]) hardest = path;
+    }
+    byClass[clocked ? 'held_with_release' : 'held_indefinite'] += 1;
+    recovery[hardest] += 1;
+
+    // The cause, on the rows where a breaker is the thing holding them.
+    const latch = describeExitBreakerLatch(opt);
+    if (latch !== null) {
+      breakerRows += 1;
+      byCause[latch.causeClass] += 1;
+      if (latch.provenance === 'stamped' && latch.at !== null) {
+        stamped += 1;
+        if (firstTrippedAt === null || latch.at < firstTrippedAt) firstTrippedAt = latch.at;
+        if (lastTrippedAt === null || latch.at > lastTrippedAt) lastTrippedAt = latch.at;
+      } else {
+        inferred += 1;
+      }
+    }
+  }
+
+  return {
+    rows,
+    byClass,
+    ungoverned,
+    ungovernedBreached,
+    nothingWillAct: ungoverned + byClass.no_stop_written,
+    heldBy,
+    multiHeld,
+    breakerLatched: {
+      rows: breakerRows,
+      byCause,
+      stamped,
+      inferred,
+      firstTrippedAt: firstTrippedAt === null ? null : new Date(firstTrippedAt).toISOString(),
+      lastTrippedAt: lastTrippedAt === null ? null : new Date(lastTrippedAt).toISOString(),
+    },
+    recovery,
+    releasesAt: earliestRelease === null ? null : new Date(earliestRelease).toISOString(),
+  };
+}
+
+/**
+ * TRA-4225 — fold the per-book partitions into the fleet figure the no-auth
+ * route publishes.
+ *
+ * Counts sum; `releasesAt` extremises to the EARLIEST (when the pile starts
+ * unwinding, same convention as its neighbour); the two trip instants extremise
+ * outward, so `firstTrippedAt` is the fleet's first trip and `lastTrippedAt` its
+ * most recent. A `null` from a book with nothing stamped contributes nothing
+ * rather than nulling the fold.
+ */
+export function mergeLiveStopGovernance(
+  summaries: Iterable<LiveStopGovernanceSummary>,
+): LiveStopGovernanceSummary {
+  const out: LiveStopGovernanceSummary = {
+    rows: 0,
+    byClass: EMPTY_GOVERNANCE_CLASSES(),
+    ungoverned: 0,
+    ungovernedBreached: 0,
+    nothingWillAct: 0,
+    heldBy: {},
+    multiHeld: 0,
+    breakerLatched: {
+      rows: 0,
+      byCause: EMPTY_CAUSE_COUNTS(),
+      stamped: 0,
+      inferred: 0,
+      firstTrippedAt: null,
+      lastTrippedAt: null,
+    },
+    recovery: EMPTY_RECOVERY_COUNTS(),
+    releasesAt: null,
+  };
+  for (const s of summaries) {
+    out.rows += s.rows;
+    for (const k of Object.keys(out.byClass) as LiveStopGovernanceClass[]) {
+      out.byClass[k] += s.byClass[k];
+    }
+    out.ungoverned += s.ungoverned;
+    out.ungovernedBreached += s.ungovernedBreached;
+    out.nothingWillAct += s.nothingWillAct;
+    out.multiHeld += s.multiHeld;
+    for (const [k, v] of Object.entries(s.heldBy)) {
+      const gate = k as LiveStopInertReason;
+      out.heldBy[gate] = (out.heldBy[gate] ?? 0) + (v ?? 0);
+    }
+    out.breakerLatched.rows += s.breakerLatched.rows;
+    out.breakerLatched.stamped += s.breakerLatched.stamped;
+    out.breakerLatched.inferred += s.breakerLatched.inferred;
+    for (const k of Object.keys(out.breakerLatched.byCause) as ExitBreakerCauseClass[]) {
+      out.breakerLatched.byCause[k] += s.breakerLatched.byCause[k];
+    }
+    for (const k of Object.keys(out.recovery) as LiveStopRecoveryPath[]) {
+      out.recovery[k] += s.recovery[k];
+    }
+    if (
+      s.releasesAt !== null
+      && (out.releasesAt === null || s.releasesAt < out.releasesAt)
+    ) {
+      out.releasesAt = s.releasesAt;
+    }
+    if (
+      s.breakerLatched.firstTrippedAt !== null
+      && (out.breakerLatched.firstTrippedAt === null
+        || s.breakerLatched.firstTrippedAt < out.breakerLatched.firstTrippedAt)
+    ) {
+      out.breakerLatched.firstTrippedAt = s.breakerLatched.firstTrippedAt;
+    }
+    if (
+      s.breakerLatched.lastTrippedAt !== null
+      && (out.breakerLatched.lastTrippedAt === null
+        || s.breakerLatched.lastTrippedAt > out.breakerLatched.lastTrippedAt)
+    ) {
+      out.breakerLatched.lastTrippedAt = s.breakerLatched.lastTrippedAt;
+    }
+  }
+  return out;
+}
+
+/**
+ * TRA-4225 — the BLIND reading, typed off {@link LiveStopGovernanceSummary}
+ * itself for the reason TRA-3839 gives one field over: a key that is a number
+ * when the instrument works and ABSENT when it is blind deserialises to
+ * `undefined`, which every reader coerces to 0 — publishing "nothing is
+ * ungoverned" as the reading for "we could not tell". The mapped type makes the
+ * next field added here a compile error until the blind shape names it too.
+ */
+export type BlindLiveStopGovernance = { [K in keyof LiveStopGovernanceSummary]: null };
+
+export function blindLiveStopGovernance(): BlindLiveStopGovernance {
+  return {
+    rows: null,
+    byClass: null,
+    ungoverned: null,
+    ungovernedBreached: null,
+    nothingWillAct: null,
+    heldBy: null,
+    multiHeld: null,
+    breakerLatched: null,
+    recovery: null,
+    releasesAt: null,
   };
 }
 
@@ -10511,6 +11148,10 @@ export class PaperOptionsAccount {
     // (a TP1 trim leaves the row open) cross the spread on the strength of a
     // lapse that has already been superseded by a fill.
     delete opt.exitExpiredCount;
+    // TRA-4225 — the trip record goes with the counters it describes. A stamp
+    // that outlived its latch would publish a breaker on a row nothing is
+    // holding, which is the opposite failure to the one this field exists for.
+    delete opt.exitBreakerTrip;
     const pending = opt.pendingExit;
     const price = (typeof fillPrice === 'number' && Number.isFinite(fillPrice) && fillPrice > 0)
       ? fillPrice
@@ -10649,6 +11290,10 @@ export class PaperOptionsAccount {
     // engine's escalation state would silently convert their next engine-fired
     // exit into a market order off a lapse they already responded to.
     delete opt.exitExpiredCount;
+    // TRA-4225 — and the trip record. This IS the recovery path the fold
+    // publishes as `manual_restage`; leaving the stamp behind would keep the row
+    // in `breakerLatched` after the very action that released it.
+    delete opt.exitBreakerTrip;
     return { ...opt };
   }
 
@@ -10735,6 +11380,9 @@ export class PaperOptionsAccount {
           `${reason ? `${reason} — ` : ''}auto-close paused after ` +
           `${opt.exitExpiredCount} exit orders expired unfilled ` +
           `(last: ${expiredKind} ×${expiredQty}); ${recovery()}`;
+        // TRA-4225 — WHEN and WHAT. An expiry breaker's cause class is not read
+        // off text: the order reached the broker and lapsed, which IS the class.
+        stampExitBreakerTrip(opt, 'exit_expired', opt.exitExpiredCount, 'expiry');
       }
       return true;
     }
@@ -10744,6 +11392,19 @@ export class PaperOptionsAccount {
         // The breaker just tripped — make the surfaced reason explain why
         // the engine has stopped retrying so the dashboard notice is
         // actionable rather than just echoing the raw broker status.
+        //
+        // TRA-4225 — classify BEFORE the decoration overwrites the text. The
+        // string this branch is about to write ("auto-close paused after 3
+        // rejected attempts…") is OURS; the broker's own words are in `reason`,
+        // and they are the only thing that can tell a refusal from an outage.
+        // Classifying the decorated string would read every trip as
+        // `broker_refusal`, which is the exact conflation this ticket is about.
+        stampExitBreakerTrip(
+          opt,
+          'close_reject',
+          opt.closeRejectCount,
+          classifyExitBreakerCause(reason ?? opt.exitErrorReason),
+        );
         opt.exitErrorReason =
           `${reason ? `${reason} — ` : ''}auto-close paused after ` +
           `${opt.closeRejectCount} rejected attempts; ${recovery()}`;
@@ -13132,28 +13793,38 @@ export class PaperOptionsAccount {
       // single-leg long desk lot; `multi_leg_combo` / `covered_write` cannot
       // reach a row this pass minted.
       const stopArmed = isArmedThreshold(opt.stopLossPremium);
-      const exitInertReason = !this.autoManageImportedTradierOptions
-        ? 'imported_auto_manage_off' as const
-        : !opts.brokerMirroring
-          ? 'imported_no_broker_mirror' as const
-          : !engineMayActOnAdoptedRow(opt, this.actOnAdoptedBrokerRows)
-            ? 'adopted_not_authorized' as const
-            : !stopArmed
-              ? 'stop_not_armed' as const
-              // TRA-4218 — the three RUN-TIME suppressions, in `checkExits`
-              // order (`:9162`+). Omitting them let this census publish
-              // `engineMayAct: true` on a row whose auto-close had been paused
-              // for eleven hours by the TRA-450 breaker — the exact "reads
-              // identically to a managed row" defect the route was built to end.
-              : (opt.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS
-                ? 'close_reject_breaker' as const
-                : (typeof opt.exitRetryNotBeforeMs === 'number'
-                  && Number.isFinite(opt.exitRetryNotBeforeMs)
-                  && Date.now() < opt.exitRetryNotBeforeMs)
-                  ? 'exit_transport_backoff' as const
-                  : (opt.exitExpiredCount ?? 0) >= MAX_CONSECUTIVE_EXIT_EXPIRIES
-                    ? 'exit_expired_breaker' as const
-                    : null;
+      // TRA-4225 — COLLECT the gates instead of stopping at the first. A row can
+      // be held by several and clearing the one a surface names is not the same
+      // as freeing the row: on 2026-08-31 this census's own subject carried both
+      // `adopted_not_authorized` and a latched `close_reject_breaker`, and only
+      // the first was ever published. Order is unchanged, so `[0]` is exactly
+      // what the chain used to return.
+      const exitInertReasons: AdoptedLotExitGate[] = [];
+      if (!this.autoManageImportedTradierOptions) exitInertReasons.push('imported_auto_manage_off');
+      if (!opts.brokerMirroring) exitInertReasons.push('imported_no_broker_mirror');
+      if (!engineMayActOnAdoptedRow(opt, this.actOnAdoptedBrokerRows)) {
+        exitInertReasons.push('adopted_not_authorized');
+      }
+      if (!stopArmed) exitInertReasons.push('stop_not_armed');
+      // TRA-4218 — the three RUN-TIME suppressions, in `checkExits` order
+      // (`:9162`+). Omitting them let this census publish `engineMayAct: true`
+      // on a row whose auto-close had been paused for eleven hours by the
+      // TRA-450 breaker — the exact "reads identically to a managed row" defect
+      // the route was built to end.
+      if ((opt.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS) {
+        exitInertReasons.push('close_reject_breaker');
+      }
+      if (
+        typeof opt.exitRetryNotBeforeMs === 'number'
+        && Number.isFinite(opt.exitRetryNotBeforeMs)
+        && Date.now() < opt.exitRetryNotBeforeMs
+      ) {
+        exitInertReasons.push('exit_transport_backoff');
+      }
+      if ((opt.exitExpiredCount ?? 0) >= MAX_CONSECUTIVE_EXIT_EXPIRIES) {
+        exitInertReasons.push('exit_expired_breaker');
+      }
+      const exitInertReason: AdoptedLotExitGate | null = exitInertReasons[0] ?? null;
       adopted.push({
         positionId: opt.id,
         optionSymbol: opt.optionSymbol ?? '',
@@ -13169,6 +13840,7 @@ export class PaperOptionsAccount {
         // whole walk, not the authority test alone — see `AdoptedLotView`.
         engineMayAct: exitInertReason === null,
         exitInertReason,
+        exitInertReasons, // TRA-4225 — every gate, not just the first.
         stopArmed,
         riskUnmanagedReason: opt.riskUnmanagedReason ?? null,
         // TRA-3960 — read off the row's stamp; `null` on pre-stamp mints, never
@@ -13602,6 +14274,38 @@ export class PaperOptionsAccount {
   }
 
   /**
+   * TRA-4225 — this book's rows partitioned by whether ANYTHING will act on
+   * their stop. See {@link summarizeLiveStopGovernance}.
+   *
+   * It takes the identical context to `liveStopActionabilitySummary` above and
+   * builds it the identical way — every term off the ENGINE or off this
+   * account's RESOLVED fields, never off a default — because the two folds walk
+   * the same gates and a book that resolved them differently on two surfaces
+   * would recreate the disagreement this ticket exists to end.
+   */
+  liveStopGovernanceSummary(
+    opts: {
+      brokerMirroring: boolean;
+      openingRangeGuardMin: number;
+      liveStopPolicy?: LiveOptionStopPolicy;
+      otmDayOneStop?: { rule: OtmDayOneStopRule; release: OtmDayOneStopRelease };
+      now?: number;
+    },
+  ): LiveStopGovernanceSummary {
+    return summarizeLiveStopGovernance(this.openOptions.values(), {
+      brokerMirroring: opts.brokerMirroring,
+      ...(opts.otmDayOneStop === undefined ? {} : { otmDayOneStop: opts.otmDayOneStop }),
+      ...(opts.liveStopPolicy === undefined ? {} : { liveStopPolicy: opts.liveStopPolicy }),
+      openingRangeGuardMin: opts.openingRangeGuardMin,
+      autoManageImportedTradierOptions: this.autoManageImportedTradierOptions,
+      actOnAdoptedBrokerRows: this.actOnAdoptedBrokerRows,
+      holdLiveOptionsOvernightForPdt: this.holdLiveOptionsOvernightForPdt,
+      swingHoldOptions: this.swingHoldOptions,
+      now: opts.now,
+    });
+  }
+
+  /**
    * TRA-3892 — premium this book holds under a stop that cannot fire today.
    * Reads the RESOLVED PDT knob for the same reason the method above does.
    */
@@ -13787,6 +14491,7 @@ export class PaperOptionsAccount {
     delete opt.exitExpiredCount; // TRA-2984 — same, and it gates a MARKET escalation.
     delete opt.exitTransportFailCount; // TRA-4218 — same.
     delete opt.exitRetryNotBeforeMs;
+    delete opt.exitBreakerTrip; // TRA-4225 — the trip record follows its counters.
     delete opt.brokerMissingSweeps;
     // A rejected close leaves no live order behind, but clear the staged
     // intent so `closeOption` archives a clean row rather than one that looks
@@ -14652,6 +15357,10 @@ export class PaperOptionsAccount {
           exitErrorReason: o.exitErrorReason,
         });
         delete o.closeRejectCount;
+        // TRA-4225 — the latch is gone, so its trip record goes with it. Guarded
+        // on the breaker name: this heal touches ONLY the reject counter, and an
+        // expiry trip on the same row is a different latch that survives.
+        if (o.exitBreakerTrip?.breaker === 'close_reject') delete o.exitBreakerTrip;
         // Re-arm through the backoff rather than instantly: a boot that follows
         // the outage by seconds should not fire three stops into a broker that
         // is still down. One ladder step is enough to make the retry orderly and

@@ -373,7 +373,7 @@ import {
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount, type EquityExitRiskInput } from './paper-account.js';
-import { PaperOptionsAccount, qualifyLiveStopActionability, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary, type LiveStopActionabilityQualified, type LiveExitPassStatus, type DayOneStopPosture, type OtmSleeveStopCoverage, type EngineBasisRepairOutcome, type AdoptedBasisRestatementOutcome, type LiveLotAdoptionReport } from './options-account.js';
+import { PaperOptionsAccount, qualifyLiveStopActionability, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary, type LiveStopActionabilityQualified, type LiveStopGovernanceSummary, type LiveExitPassStatus, type DayOneStopPosture, type OtmSleeveStopCoverage, type EngineBasisRepairOutcome, type AdoptedBasisRestatementOutcome, type LiveLotAdoptionReport } from './options-account.js';
 import { bindOptionsPnlToEquityBook } from './options-equity-bridge.js';
 import {
   PENDING_CLOSE_MAX_REPRICE_STEPS,
@@ -9379,6 +9379,26 @@ export class SignalEngine {
       // `getDayOneStopPosture` are the other two). Without it this walk reports
       // `daily_close_hold` / `pdt_hold_today` against rows the exit pass is
       // actually firing; see `LiveStopActionabilityContext.otmDayOneStop`.
+      otmDayOneStop: this.resolveOtmDayOneStop(),
+      ...(now === undefined ? {} : { now }),
+    });
+  }
+
+  /**
+   * TRA-4225 — this book's OPEN LIVE rows partitioned by whether anything will
+   * act on their stop, with every gate holding each held row.
+   *
+   * The same four resolved terms as `getLiveStopActionabilityRows` above, from
+   * the same resolvers, for the same reason: the two folds walk the same gates
+   * and must not be able to resolve the window, the policy, the OTM rule or the
+   * mirroring arm differently.
+   */
+  getLiveStopGovernance(now?: number): LiveStopGovernanceSummary {
+    return this.optionsAccount.liveStopGovernanceSummary({
+      brokerMirroring:
+        this.mode === 'live' && this.tradierLiveOptionsEnabled && this.tradierLiveClient !== null,
+      openingRangeGuardMin: resolveOptionOpeningRangeMin(),
+      liveStopPolicy: resolveLiveOptionStopPolicy(),
       otmDayOneStop: this.resolveOtmDayOneStop(),
       ...(now === undefined ? {} : { now }),
     });

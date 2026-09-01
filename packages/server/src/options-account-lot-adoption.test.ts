@@ -619,6 +619,42 @@ describe('per-lot adoption of desk-added Tradier lots (TRA-3909)', () => {
       .toBeCloseTo(0.68, 10);
   });
 
+  it('★ TRA-4225 — a lot held by TWO gates publishes both, and `[0]` is still the first', () => {
+    // The 2026-08-31 shape on this census: the production adopted row carried
+    // `adopted_not_authorized` AND a `close_reject_breaker` latched by a Tradier
+    // 500, and the first-gate field could only ever say one of them. Clearing
+    // the gate a surface names and finding the row still inert is the failure
+    // this closes.
+    const acct = freshAccount();
+    acct.reconcileTradierPositions(BROKER_AT_2338, 'live');
+    // Latch the breaker on every desk lot, the way the live rows are latched.
+    const deskIds = acct.getState().openOptions
+      .filter(r => r.adoptionAuthority === 'desk_add')
+      .map(r => r.id);
+    expect(deskIds.length).toBeGreaterThan(0);
+    const snap = acct.exportSnapshot();
+    const latched = new PaperOptionsAccount({ initialEquity: 1_035.94, tradierEnv: 'production' });
+    latched.importSnapshot({
+      ...snap,
+      openOptions: snap.openOptions.map(r =>
+        deskIds.includes(r.id)
+          ? { ...r, closeRejectCount: 3, exitErrorReason: 'Tradier order rejected: bad symbol' }
+          : r),
+    });
+    latched.updateConfig({ autoManageImportedTradierOptions: false });
+
+    const report = latched.liveLotAdoptionReport({ brokerMirroring: true });
+    expect(report.adopted.length).toBeGreaterThan(0);
+    for (const lot of report.adopted) {
+      // Unchanged: the first gate is still the one that did the not-acting.
+      expect(lot.exitInertReason).toBe('imported_auto_manage_off');
+      expect(lot.exitInertReasons[0]).toBe(lot.exitInertReason);
+      // New: the latch is no longer invisible behind it.
+      expect(lot.exitInertReasons).toContain('close_reject_breaker');
+      expect(lot.exitInertReasons.length).toBeGreaterThan(1);
+    }
+  });
+
   it('⛔ places no order and closes nothing', () => {
     const acct = freshAccount();
     const closedBefore = acct.getState().closedOptions.length;

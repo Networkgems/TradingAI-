@@ -3068,6 +3068,51 @@ export function isCoherentOptionAdmissionStamp(q: unknown): q is OptionAdmission
   return true;
 }
 
+/**
+ * TRA-4225 — which of the two auto-close breakers latched a row.
+ *
+ * Not the transport BACKOFF (TRA-4218): that one releases itself on a clock and
+ * is not a latch. Only the two gates that stop the engine re-staging until a
+ * fill or a human intervenes are named here.
+ */
+export type ExitBreakerName = 'close_reject' | 'exit_expired';
+
+/**
+ * TRA-4225 — the machine-readable cause class of a breaker trip.
+ *
+ * The classes are the OUTCOMES that take different operator action, which is
+ * the same test TRA-4226 applied to `BrokerRejectClass.transport`:
+ *
+ *   • `broker_refusal`  — the broker looked at the contract and said no. No
+ *     amount of retrying places that order; the account or the order needs
+ *     investigating.
+ *   • `transport_fault` — the submit never reached a broker DECISION (5xx /
+ *     429 / 408 / `fetch` failure). Nothing was refused; the remedy is "retry
+ *     when the broker is back". TRA-4218 stops NEW faults of this class from
+ *     reaching the reject counter at all, so a `close_reject` trip carrying
+ *     this class is either a pre-TRA-4218 row or a caller that did not
+ *     classify — both worth seeing, and neither visible before.
+ *   • `expiry`          — the order reached the broker, rested and lapsed
+ *     unfilled (TRA-2984). Nothing refused it either; it never filled.
+ *   • `unknown`         — no reason text was recorded to classify from. The
+ *     CONSERVATIVE value: it must never read as one of the three above.
+ */
+export type ExitBreakerCauseClass =
+  | 'broker_refusal'
+  | 'transport_fault'
+  | 'expiry'
+  | 'unknown';
+
+/** TRA-4225 — see {@link OptionPosition.exitBreakerTrip}. */
+export interface ExitBreakerTrip {
+  breaker: ExitBreakerName;
+  /** Epoch ms the counter CROSSED its threshold. Not re-stamped afterwards. */
+  at: number;
+  causeClass: ExitBreakerCauseClass;
+  /** The counter's value at the crossing (the threshold, normally). */
+  count: number;
+}
+
 export interface OptionPosition {
   id: string;
   symbol: string;
@@ -3889,6 +3934,23 @@ export interface OptionPosition {
    * the whole point. Absent ↔ no backoff outstanding.
    */
   exitRetryNotBeforeMs?: number;
+  /**
+   * TRA-4225 — WHEN one of the two exit breakers latched this row, and WHAT
+   * class of fault latched it. Absent ↔ no breaker has tripped on this row
+   * since the last fill / manual re-stage.
+   *
+   * The ask this exists for is "name what latched `close_reject_breaker` and
+   * when", and before this field nothing on the row could answer either half:
+   * {@link closeRejectCount} is a bare integer with no instant, and
+   * {@link exitErrorReason} is free text a human has to read. On 2026-08-31 the
+   * trip could only be BOUNDED after the fact, off `exitMarkProvenance.at`.
+   *
+   * Stamped ONCE, at the crossing — the first `clearPendingExit` that carries
+   * the counter to its threshold — so `at` dates the trip and not the last
+   * time something re-read a latched row. Every site that clears the underlying
+   * counter clears this too, so a stamp without a live latch cannot survive.
+   */
+  exitBreakerTrip?: ExitBreakerTrip;
   /**
    * TRA-2984 — consecutive staged `sell_to_close` orders for this position that
    * reached the broker, rested, and **expired unfilled** at the end of the
