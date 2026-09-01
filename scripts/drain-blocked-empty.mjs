@@ -400,6 +400,63 @@ export function gradeWriteBody(step, body, { klass = null } = {}) {
 }
 
 /**
+ * TRA-4145 — ASCII-fold EXTERNALLY-SOURCED text at the interpolation site.
+ *
+ * A routine title is written by whoever named the routine; nobody naming one
+ * knows they are writing into a body `gradeWriteBody` grades ASCII-only. On
+ * 2026-08-27 an em dash in an origin title made the drain refuse its OWN
+ * audit comment, and because the comment goes first the row got NEITHER
+ * write — the exact suppressing-leaf outcome the drain exists to clear. The
+ * fix is here, not in the guard: mojibake in a permanent audit trail is the
+ * thing the guard exists to stop, so it stays exactly as strict.
+ *
+ * Common typographic characters fold to their ASCII spelling; anything else
+ * above 0x7E becomes a printed `(U+XXXX)` escape, so the trail still says
+ * WHAT was there rather than dropping it.
+ */
+const ASCII_FOLD_MAP = new Map([
+  ['—', '--'], // em dash -- the measured offender (TRA-4083 / TRA-4089)
+  ['–', '--'], // en dash
+  ['‘', "'"], // left single quote
+  ['’', "'"], // right single quote / apostrophe
+  ['“', '"'], // left double quote
+  ['”', '"'], // right double quote
+  ['…', '...'], // ellipsis
+  [' ', ' '], // no-break space
+]);
+
+export function asciiFold(s) {
+  if (typeof s !== 'string') return s;
+  let out = '';
+  for (const ch of s) {
+    const cp = ch.codePointAt(0);
+    if ((cp >= 0x20 && cp <= 0x7e) || ch === '\n' || ch === '\r' || ch === '\t') {
+      out += ch;
+      continue;
+    }
+    const mapped = ASCII_FOLD_MAP.get(ch);
+    out += mapped !== undefined ? mapped : `(U+${cp.toString(16).toUpperCase().padStart(4, '0')})`;
+  }
+  return out;
+}
+
+/** A per-body fold that REMEMBERS whether it changed anything, so the body can say so. */
+const foldTracker = () => {
+  const fold = (s) => {
+    const out = asciiFold(s);
+    if (out !== s) fold.changed = true;
+    return out;
+  };
+  fold.changed = false;
+  return fold;
+};
+
+const FOLD_NOTE =
+  'NOTE (TRA-4145): non-ASCII characters in externally-sourced text above (routine title or platform field ' +
+  'values) were ASCII-FOLDED at the interpolation site, because this platform grades comment bodies ASCII-only. ' +
+  'The live records are unmodified; unmapped characters are printed as (U+XXXX) escapes.';
+
+/**
  * Render the ORIGIN ROUTINE sentence for a suppressing leaf (TRA-4063).
  *
  * `origin` is a best-effort read. It is NEVER a classification input -- the
@@ -407,55 +464,69 @@ export function gradeWriteBody(step, body, { klass = null } = {}) {
  * degrades this sentence to UNREAD and changes no write. It must still be
  * printed either way: "the routine this write is keeping alive" is the single
  * fact that makes a `done` on an automated writer auditable after the fact.
+ *
+ * TRA-4145 — every field of `origin` is externally controlled text and is
+ * folded HERE, at the interpolation site. The policy BRANCH below still reads
+ * the raw value: folding is display-only and must never steer a comparison.
  */
 export function originSentence(f, origin) {
-  const id = f.originId || '(no originId on the payload)';
+  const fold = foldTracker();
+  const id = fold(f.originId || '(no originId on the payload)');
+  let s;
   if (!origin) {
-    return (
+    s =
       `Origin routine \`${id}\` -- UNREAD (the routines route was not queried or did not answer). The class was ` +
       'decided from this issue\'s own `originKind` + `blocks`, which is why an unread routine does not change the ' +
       'write. Its concurrencyPolicy is therefore UNKNOWN here, and under BOTH known policies (skip_if_active, ' +
-      'coalesce_if_active) a non-terminal leaf suppresses the next fire.'
-    );
+      'coalesce_if_active) a non-terminal leaf suppresses the next fire.';
+  } else if (origin.unread) {
+    s = `Origin routine \`${id}\` -- UNREAD: ${fold(origin.unread)}. Same note as above: the class did not depend on it.`;
+  } else {
+    s =
+      `Origin routine \`${id}\` = "${fold(origin.title || '(untitled)')}", status \`${fold(origin.status || 'unknown')}\`, ` +
+      `concurrencyPolicy \`${fold(origin.concurrencyPolicy || 'unknown')}\`, owner \`${fold(origin.assigneeAgentId || 'none')}\`. ` +
+      'That policy is why this row gets `done`: a fire landing while THIS execution issue is still open is ' +
+      (origin.concurrencyPolicy === 'skip_if_active'
+        ? 'DROPPED outright'
+        : origin.concurrencyPolicy === 'coalesce_if_active'
+          ? 'MERGED into it instead of running'
+          : 'suppressed') +
+      ', so resting this leaf non-terminal switches that routine OFF while its nextRunAt keeps advancing.';
   }
-  if (origin.unread) {
-    return `Origin routine \`${id}\` -- UNREAD: ${origin.unread}. Same note as above: the class did not depend on it.`;
-  }
-  return (
-    `Origin routine \`${id}\` = "${origin.title || '(untitled)'}", status \`${origin.status || 'unknown'}\`, ` +
-    `concurrencyPolicy \`${origin.concurrencyPolicy || 'unknown'}\`, owner \`${origin.assigneeAgentId || 'none'}\`. ` +
-    'That policy is why this row gets `done`: a fire landing while THIS execution issue is still open is ' +
-    (origin.concurrencyPolicy === 'skip_if_active'
-      ? 'DROPPED outright'
-      : origin.concurrencyPolicy === 'coalesce_if_active'
-        ? 'MERGED into it instead of running'
-        : 'suppressed') +
-    ', so resting this leaf non-terminal switches that routine OFF while its nextRunAt keeps advancing.'
-  );
+  return fold.changed ? `${s} [${FOLD_NOTE}]` : s;
 }
 
-/** The audit comment. ASCII only, and written BEFORE the row leaves our boundary. */
+/**
+ * The audit comment. ASCII only, and written BEFORE the row leaves our boundary.
+ *
+ * TRA-4145 — platform-sourced field values (`recoveryKind`, `originKind`,
+ * `evidence.previousStatus`, agent ids) are folded at their interpolation
+ * sites, same as the origin routine fields: they are the same shape of risk
+ * as the title, just not yet the measured offender.
+ */
 export function drainComment(f, runId, disp = null, origin = null) {
   const rep = f.repair;
   const d = disp || classifyDisposition(f);
+  const fold = foldTracker();
+  const withFoldNote = (body) => (fold.changed ? `${body}\n\n${FOLD_NOTE}` : body);
   if (d.klass === ROW_CLASS.SUPPRESSING_LEAF) {
-    return (
+    return withFoldNote(
       `Automated strand drain (TRA-3541), SUPPRESSING LEAF branch (TRA-4041 / TRA-4063). This row was \`blocked\` ` +
-      `with an EMPTY \`blockedBy\` and carried an active \`${f.recoveryKind}\` recovery action, which is the ` +
+      `with an EMPTY \`blockedBy\` and carried an active \`${fold(f.recoveryKind)}\` recovery action, which is the ` +
       `platform's terminal-run recovery writing the block -- no agent ever intended an anchor.\n\n` +
       `CLASS: SUPPRESSING LEAF. ${d.why}\n\n` +
       `${originSentence(f, origin)}\n\n` +
       `Read live immediately before this write: status \`blocked\`, \`blockedBy\` empty, \`blocks\` READ and EMPTY ` +
-      `(absent would NOT have counted), \`originKind\` \`${f.originKind}\`, pendingInteractions 0 (a KNOWN zero, ` +
-      `not an unread route), \`evidence.previousStatus\` \`${rep.restoredFrom}\`, \`returnOwnerAgentId\` ` +
-      `\`${rep.assigneeAgentId}\`.\n\n` +
+      `(absent would NOT have counted), \`originKind\` \`${fold(f.originKind)}\`, pendingInteractions 0 (a KNOWN zero, ` +
+      `not an unread route), \`evidence.previousStatus\` \`${fold(rep.restoredFrom)}\`, \`returnOwnerAgentId\` ` +
+      `\`${fold(rep.assigneeAgentId)}\`.\n\n` +
       `Repair applied -- ONE write (TRA-4041):\n` +
       `- PATCH status -> \`done\`. THIS IS THE \`done\` BRANCH, taken deliberately and taken only for this class. ` +
       `The generic restore for this cohort is \`todo\`, and \`todo\` here would be the defect: it is non-terminal, ` +
       `so the origin routine would keep treating this finished fire as live and would never run again. There is no ` +
       `unrun work to destroy -- the fire is over and this spawn is its record.\n` +
       `- \`blockedByIssueIds\` deliberately NOT re-sent.\n` +
-      `- assigneeAgentId deliberately NOT written. The recovery payload names \`${rep.assigneeAgentId}\` as the ` +
+      `- assigneeAgentId deliberately NOT written. The recovery payload names \`${fold(rep.assigneeAgentId)}\` as the ` +
       `returnOwnerAgentId; the status write above spawns a run that takes this issue's checkout lock, so any ` +
       `further PATCH returns 409 Issue run ownership conflict (6/6, measured). The re-home is the platform's.\n\n` +
       `If this classification is wrong, the recoverable direction is to reopen this row -- not to re-drain it. ` +
@@ -463,19 +534,19 @@ export function drainComment(f, runId, disp = null, origin = null) {
       `Drained by scripts/drain-blocked-empty.mjs${runId ? ` (run ${runId})` : ''}.`
     );
   }
-  return (
+  return withFoldNote(
     `Automated strand drain (TRA-3541). This row was \`blocked\` with an EMPTY \`blockedBy\` and carried an ` +
-    `active \`${f.recoveryKind}\` recovery action, which is the platform's terminal-run recovery writing the ` +
+    `active \`${fold(f.recoveryKind)}\` recovery action, which is the platform's terminal-run recovery writing the ` +
     `block -- no agent ever intended an anchor. That state fails the TRA-1272 STRAND TEST and raises no blocker ` +
     `wake, so nothing drains it on its own.\n\n` +
     `Read live immediately before this write: status \`blocked\`, \`blockedBy\` empty, pendingInteractions 0 ` +
-    `(a KNOWN zero, not an unread route), \`evidence.previousStatus\` \`${rep.restoredFrom}\`, ` +
-    `\`returnOwnerAgentId\` \`${rep.assigneeAgentId}\`.\n\n` +
+    `(a KNOWN zero, not an unread route), \`evidence.previousStatus\` \`${fold(rep.restoredFrom)}\`, ` +
+    `\`returnOwnerAgentId\` \`${fold(rep.assigneeAgentId)}\`.\n\n` +
     `Repair applied -- ONE write (TRA-4041):\n` +
     `- PATCH status -> \`todo\` (NOT \`done\`: \`todo\` is queue-visible and still counts as an unresolved ` +
     `blocker upstream, so any parent stays correctly blocked and no unrun work is destroyed)\n` +
     `- \`blockedByIssueIds\` deliberately NOT re-sent.\n` +
-    `- assigneeAgentId deliberately NOT written. The recovery payload names \`${rep.assigneeAgentId}\` as the ` +
+    `- assigneeAgentId deliberately NOT written. The recovery payload names \`${fold(rep.assigneeAgentId)}\` as the ` +
     `returnOwnerAgentId, and until 2026-08-26 this drain PATCHed it as a second step. That step cannot succeed: ` +
     `the status write above spawns a run that takes this issue's checkout lock, so any further PATCH returns ` +
     `409 Issue run ownership conflict (6/6, measured). It is also unnecessary -- the status write alone clears ` +
@@ -1060,6 +1131,10 @@ function fakeTransport(
     keepRecovery = false,
     total = 2350,
     routineUnread = false,
+    // TRA-4145 — lets a control serve an origin routine whose TITLE carries
+    // non-ASCII text, the externally-controlled input that made the drain
+    // refuse its own audit body on 2026-08-27.
+    routineTitle = 'TRA-4017 armed-liveness detector -- paused routines that read falsely ARMED',
     // TRA-4063 — model a queue that picks the row up and flips it, per
     // TRA-3758. On a DURABLE strand that is still a clean drain; on a
     // SUPPRESSING LEAF it means the leaf never went terminal and the routine is
@@ -1107,7 +1182,7 @@ function fakeTransport(
       if (routineUnread) throw new Error(`HTTP 500 on GET /api/routines/${id}`);
       return {
         id,
-        title: 'TRA-4017 armed-liveness detector -- paused routines that read falsely ARMED',
+        title: routineTitle,
         status: 'active',
         concurrencyPolicy: 'skip_if_active',
         assigneeAgentId: AGENT_SELF,
@@ -1339,6 +1414,83 @@ const CONTROLS = [
         detail: a.ok && b.ok && c.ok && d.ok ? 'both templates ASCII; leaf names class, routine and policy' : (a.why || b.why || c.why || d.why),
       };
     },
+  },
+  {
+    // TRA-4145 — the origin routine's TITLE is externally controlled text.
+    // On 2026-08-27 an em dash in one made the drain refuse its OWN audit
+    // body, and because the comment goes first the row got NEITHER write.
+    name: 'TRA-4145 ASCII FOLD — a non-ASCII origin title folds at the interpolation site; the guard itself did NOT widen',
+    unit: () => {
+      const leaf = {
+        identifier: 'TRA-8002',
+        recoveryKind: 'stranded_assigned_issue',
+        blocksIdentifiers: [],
+        repair: { restoredFrom: 'in_progress', assigneeAgentId: AGENT_BACK, status: 'todo' },
+        originKind: 'routine_execution',
+        blocksKnown: true,
+        originId: ROUTINE_ID,
+      };
+      // The title is an EXPLICIT field, never `title: undefined` -- a JS
+      // default parameter fires on undefined and would hand the control an
+      // ASCII default, making it read green against the wrong input. The
+      // string is the live d8ec9395 title that broke the 2026-08-27 fire.
+      const origin = {
+        title: 'TRA-2134 SANDBOX multi-strategy options runner (CSP/CC/long) — $0 notional',
+        status: 'active',
+        concurrencyPolicy: 'always_enqueue',
+        assigneeAgentId: AGENT_SELF,
+      };
+      const body = drainComment(leaf, 'run-1', classifyDisposition(leaf), origin);
+      const graded = gradeWriteBody('comment', { body });
+      // Negative control: the raw title alone must STILL be refused. The fix
+      // sanitizes the interpolation, it does not relax the guard.
+      const rawStillRefused = gradeWriteBody('comment', { body: origin.title });
+      const foldTable =
+        asciiFold('—') === '--' &&
+        asciiFold('–') === '--' &&
+        asciiFold('‘x’') === "'x'" &&
+        asciiFold('“x”') === '"x"' &&
+        asciiFold('a…') === 'a...' &&
+        asciiFold('a b') === 'a b' &&
+        // anything unmapped becomes a printed escape, never a silent drop
+        asciiFold('⚠') === '(U+26A0)' &&
+        asciiFold('\u{1F600}') === '(U+1F600)';
+      return {
+        ok:
+          graded.ok &&
+          /\(CSP\/CC\/long\) -- \$0 notional/.test(body) &&
+          // ...and the body SAYS a fold happened, so the trail records the
+          // title was transformed rather than silently altered
+          /ASCII-FOLDED/.test(body) &&
+          !rawStillRefused.ok && /non-ASCII/.test(rawStillRefused.why) &&
+          foldTable,
+        detail: graded.ok
+          ? 'folded body grades ok, states the fold, raw title still refused, fold table pinned'
+          : graded.why,
+      };
+    },
+  },
+  {
+    // TRA-4145 at the transport — acceptance shape 1: a DRY RUN over a cohort
+    // whose suppressing leaf has a non-ASCII origin title plans BOTH writes
+    // and refuses NOTHING. Before the fix this exact case exited WRITE_FAILED
+    // ("REFUSED to send an unsanctioned comment body") without sending a byte.
+    name: 'TRA-4145 END TO END — dry run over a leaf whose origin title carries U+2014 plans comment,status with NO refusal',
+    build: () =>
+      fakeTransport(
+        [strandRow('s1', 'TRA-8001', { originKind: 'routine_execution', originId: ROUTINE_ID })],
+        { routineTitle: 'TRA-2134 SANDBOX multi-strategy options runner (CSP/CC/long) — $0 notional' },
+      ),
+    apply: false,
+    assert: (out, t) =>
+      t.writes.length === 0 &&
+      out.results.length === 1 &&
+      out.results[0].outcome === OUTCOME.PLANNED &&
+      out.results[0].steps.map((s) => s.step).join(',') === 'comment,status' &&
+      /ASCII-FOLDED/.test(out.results[0].steps[0].body.body) &&
+      !/—/.test(out.results[0].steps[0].body.body),
+    detail: (out) =>
+      `outcome ${out.results[0]?.outcome}, steps ${out.results[0]?.steps.map((s) => s.step).join(',') || 'none'}: ${out.results[0]?.why || ''}`,
   },
   {
     name: 'PENDING CARD — a live interaction blocks the drain (demoting a leaf holding a card buries a decision)',
