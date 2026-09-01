@@ -710,6 +710,113 @@ const TRANSPORT_STRANDED_REASON_RE =
   /Tradier order failed \((?:5\d\d|429|408)\)|fetch failed/i;
 
 /**
+ * TRA-4224 — which recovery paths the auto-close-paused notice is allowed to
+ * NAME on the row it is being stamped on.
+ *
+ * The breaker messages below used to end in one fixed sentence — "close this
+ * position manually on Tradier or with the Close button" — emitted with no
+ * knowledge of the row. That sentence is an instruction to an operator on a
+ * real-money position, so every path it names has to be a path that row
+ * actually has.
+ *
+ * ⚠️ The predicate is NOT `stageManualPendingExit`, and reading it as such is
+ * how TRA-4224 was filed. That method refuses `importedFromTradier` rows at its
+ * first line — but the Close button never reaches it for an imported row.
+ * `POST /api/options/:id/close` routes on ORIGIN, and imported rows take the
+ * TRA-323 sub-path (`submitSmartSellToClose`) which stages nothing locally;
+ * `findEngineOpenedOption` filters imported rows out of the branch that calls
+ * `stageManualPendingExit` at all. The desktop panel mirrors that split
+ * (`isLiveEngineOpened = !isImported && mode === 'live'`), so an imported row
+ * gets the direct close, not the limit drawer. Measured on bqb1 `092d087775dc`
+ * 2026-09-01: the adopted `NOK261002C00010500` row (`desk_add`, $57) has a
+ * WORKING in-app Close button, and telling its operator otherwise would have
+ * been the same class of falsehood pointed the other way.
+ *
+ * So this walks the close ROUTE's own gates, in the route's order, and returns
+ * the first one that refuses. Two callers (the two breaker messages) share one
+ * walk, for the reason `engineMayActOnAdoptedRow` is shared by `checkExits` and
+ * the inert-reason summary: a second copy would eventually disagree with the
+ * route it is claiming to predict.
+ *
+ * ⚠️ This is a MESSAGE-side predicate only. It grants nothing, and in
+ * particular it does not touch TRA-3829's per-row adoption grant — that grant
+ * gates the ENGINE acting unattended in `checkExits`
+ * (`engineMayActOnAdoptedRow`), and has never gated an operator's explicit
+ * click. No byte here widens it.
+ */
+export type PausedExitInAppRefusal =
+  /** Route site index.ts (imported branch) — a broker close is already working. */
+  | 'close_already_in_flight'
+  /** Route site index.ts (engine-opened branch) — TRA-598 same-session round trip. */
+  | 'day_trade_guard'
+  /** Route site index.ts — nothing sellable, so both branches 409/400 out. */
+  | 'no_contracts'
+  /** Route site index.ts (imported branch) — no OCC to sell. */
+  | 'missing_occ';
+
+export interface PausedExitRecoveryPaths {
+  /** Tradier's own web/app close. We never gate it, so it is always offered. */
+  broker: true;
+  /** Would `POST /api/options/:id/close` reach a broker submit for this row now? */
+  inAppClose: boolean;
+  /** The FIRST route gate that refuses; present only when `inAppClose` is false. */
+  inAppCloseRefusedBy?: PausedExitInAppRefusal;
+}
+
+/** TRA-4224 — walk the `/api/options/:id/close` gates for `opt`, in route order. */
+export function pausedExitRecoveryPaths(
+  opt: Pick<
+    OptionPosition,
+    'importedFromTradier' | 'openedAt' | 'contractsRemaining' | 'optionSymbol' | 'pendingExit' | 'pendingCloseOrderId'
+  >,
+  now: number,
+  guardrail: DayTradingGuardrailConfig,
+): PausedExitRecoveryPaths {
+  const refused = (inAppCloseRefusedBy: PausedExitInAppRefusal): PausedExitRecoveryPaths =>
+    ({ broker: true, inAppClose: false, inAppCloseRefusedBy });
+  const hasContracts = Number.isFinite(opt.contractsRemaining) && opt.contractsRemaining > 0;
+  if (opt.importedFromTradier === true) {
+    // TRA-407 (C4) double-submit guard, then the OCC/contracts check.
+    if (opt.pendingCloseOrderId !== undefined) return refused('close_already_in_flight');
+    if (!opt.optionSymbol) return refused('missing_occ');
+    if (!hasContracts) return refused('no_contracts');
+    return { broker: true, inAppClose: true };
+  }
+  // Engine-opened. The day-trade guardrail runs BEFORE the live/demo split, so
+  // it is the first refusal an operator meets — and it is the one shape where
+  // the old fixed sentence promised a button that answers 409.
+  if (!checkDiscretionaryClose(opt.openedAt, now, guardrail).allowed) return refused('day_trade_guard');
+  if (opt.pendingExit) return refused('close_already_in_flight');
+  if (!hasContracts) return refused('no_contracts');
+  return { broker: true, inAppClose: true };
+}
+
+/**
+ * TRA-4224 — the recovery clause that closes a breaker notice, built from the
+ * walk above. Kept beside it so a new refusal reason cannot be added without a
+ * sentence to surface it.
+ */
+export function pausedExitRecoverySentence(paths: PausedExitRecoveryPaths): string {
+  if (paths.inAppClose) {
+    return 'close this position manually on Tradier or with the Close button.';
+  }
+  switch (paths.inAppCloseRefusedBy) {
+    case 'day_trade_guard':
+      return 'close this position on Tradier — the in-app Close button is REFUSED on this row for the '
+        + 'rest of this session by the no-day-trading guardrail, and becomes available next session.';
+    case 'close_already_in_flight':
+      return 'a close order is already working at the broker for this row, so the in-app Close button '
+        + 'is refused; cancel that order first, or close on Tradier.';
+    case 'missing_occ':
+      return 'close this position on Tradier — this row carries no OCC symbol, so the in-app Close '
+        + 'button cannot route an order for it.';
+    default:
+      return 'close this position on Tradier — this row has no contracts left to sell, so the in-app '
+        + 'Close button is refused.';
+  }
+}
+
+/**
  * TRA-2799 — consecutive Tradier portfolio reconciles an ENGINE-OPENED live
  * row must be missing from the broker's `/positions` payload before
  * {@link OptionsAccount.reconcileTradierPositions} closes it locally.
@@ -10589,6 +10696,14 @@ export class PaperOptionsAccount {
     const expiredQty = opt.pendingExit.qty;
     delete opt.pendingExit;
     if (reason) opt.exitErrorReason = reason;
+    // TRA-4224 — resolved AFTER the `pendingExit` delete on purpose: the notice
+    // below is read by an operator standing on the row as it is NOW, and the
+    // intent that just failed is gone. Resolving it before would make the
+    // engine-opened walk report `close_already_in_flight` against an order the
+    // broker has already refused.
+    const recovery = () => pausedExitRecoverySentence(
+      pausedExitRecoveryPaths(opt, Date.now(), this.dayTradingGuardrail),
+    );
     // TRA-4218 — checked BEFORE `expired`, and before the rejection default, so
     // a transport fault can never fall through to either counter.
     if (options.transport === true) {
@@ -10619,8 +10734,7 @@ export class PaperOptionsAccount {
         opt.exitErrorReason =
           `${reason ? `${reason} — ` : ''}auto-close paused after ` +
           `${opt.exitExpiredCount} exit orders expired unfilled ` +
-          `(last: ${expiredKind} ×${expiredQty}); close this position manually ` +
-          `on Tradier or with the Close button.`;
+          `(last: ${expiredKind} ×${expiredQty}); ${recovery()}`;
       }
       return true;
     }
@@ -10632,8 +10746,7 @@ export class PaperOptionsAccount {
         // actionable rather than just echoing the raw broker status.
         opt.exitErrorReason =
           `${reason ? `${reason} — ` : ''}auto-close paused after ` +
-          `${opt.closeRejectCount} rejected attempts; close this position ` +
-          `manually on Tradier or with the Close button.`;
+          `${opt.closeRejectCount} rejected attempts; ${recovery()}`;
       }
     }
     return true;
