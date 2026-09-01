@@ -134,7 +134,23 @@ export type LiveEnforceGate =
    *
    * Recorded on BOTH verdicts, same reason as `entry_window`.
    */
-  | 'contract_floor';
+  | 'contract_floor'
+  /**
+   * TRA-4144 (parent TRA-3703, axis 4) — the UNDERLYING ASSET CLASS of the
+   * candidate, at the entry site. The second NAME-axis gate (beside
+   * `universe`) and the only one that keys on what the name IS rather than
+   * whether it is listed: the 08-25 $128 ETHA call passed every gate on this
+   * roster correctly, because "crypto OFF" was scoped on the crypto MODULE and
+   * a spot-ether ETF arrives as an equity option. A control scoped on a venue
+   * is blind to the same exposure arriving through a wrapper.
+   *
+   * Recorded on BOTH verdicts whenever the live path evaluates a candidate —
+   * including while the refusal flag is OFF (`blocked` is then always false),
+   * because the census question "what classes reach the entry site" must be
+   * answerable BEFORE the board arms the refusal, not only after.
+   * `reasonCode` on blocks is `asset_class_<class>`.
+   */
+  | 'underlying_asset_class';
 
 /** One durable ARMED-LIVE enforcement decision — a write-through of the verdict. */
 export interface LiveEnforceRecord {
@@ -586,6 +602,12 @@ const GATES: LiveEnforceGate[] = [
   // `evaluated` is the in-window nominee population — one chain per symbol per
   // sweep — and a zero here is the SLEEVE's zero, not a tighter sibling's.
   'contract_floor',
+  // TRA-4144 — the UNDERLYING ASSET CLASS admission gate. Listed for the same
+  // deployed-bytes reason as every row above: the key's PRESENCE in this
+  // census is the env-independent proof the control shipped (AC5 grades on
+  // field presence against a pinned build, never a deploy order's commit), and
+  // it must publish `evaluated: 0` before the first live nominee reaches it.
+  'underlying_asset_class',
 ];
 
 /**

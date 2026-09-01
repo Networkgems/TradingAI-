@@ -69,6 +69,10 @@ describe('live-enforce-gate-ledger', () => {
       'fleet_reachable_bound',
       'otm_delta_floor',
       'spread',
+      // TRA-4144 — `underlying_asset_class` joins: the second NAME-axis gate,
+      // and the only one keyed on what the name IS rather than whether it is
+      // listed. Its zero row is the deployed-bytes proof AC5 grades on.
+      'underlying_asset_class',
       'universe',
     ]);
     for (const g of s.byGate) {

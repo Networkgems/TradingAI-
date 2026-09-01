@@ -8151,7 +8151,13 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
     // for a clock verdict to stamp. The fixture ($0.82 ask, 31 DTE, band
     // widened for this file) is an ADMIT. Same discipline: named row, exact total.
     expect(retained.find((g) => g.gate === 'contract_floor')).toMatchObject({ evaluated: 1, blocked: 0 });
-    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(6);
+    // TRA-4144 — and a SEVENTH: the UNDERLYING ASSET CLASS gate classifies and
+    // records every live candidate even while its refusal flag is OFF (the
+    // census must be answerable BEFORE the board arms it). AAPL classifies
+    // `equity` off the static list ⇒ an ADMIT. Same discipline: named row,
+    // exact total.
+    expect(retained.find((g) => g.gate === 'underlying_asset_class')).toMatchObject({ evaluated: 1, blocked: 0 });
+    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(7);
   });
 
   // ─── TRA-3942 — the ORDERING claim, graded BEHAVIOURALLY ────────────────────

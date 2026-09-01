@@ -456,6 +456,16 @@ export function liveOptionFillsForContract(optionSymbol: string): LiveOptionFill
 }
 
 /**
+ * TRA-4144 — the WHOLE retained tape, for the asset-class census (AC2b): the
+ * historical half of "which classes has real money actually reached", folded by
+ * `gradeUnderlyingAssetClassHealth`. Same contract as the per-contract reader
+ * above: observe-only, copies, never the live array.
+ */
+export function liveOptionFillRecords(): LiveOptionFillRecord[] {
+  return fills.map((f) => ({ ...f })).sort((a, b) => a.ts - b.ts);
+}
+
+/**
  * TRA-3977 — is the book-attribution question REACHABLE in this process?
  *
  * ⭐ This is the measured condition AC4's negative control rests on. With at

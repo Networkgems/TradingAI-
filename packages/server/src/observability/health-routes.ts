@@ -86,6 +86,7 @@ import {
   summarizeLiveOptionsFeeSlippage, // TRA-1929
   summarizeLiveOptionAdmissionStamps, // TRA-3997
   phantomOpenEpisodeCensus, // TRA-3976
+  liveOptionFillRecords, // TRA-4144
 } from '../live-options-fee-slippage-ledger.js';
 import { getLiveOptionsFeeReconcileState } from '../live-options-fee-reconcile.js'; // TRA-2810
 import { getZombieOpenSweepState } from '../zombie-open-journal-sweep.js'; // TRA-3547
@@ -123,6 +124,10 @@ import { summarizeLiveEnforceGate } from '../live-enforce-gate-ledger.js'; // TR
 import { gradeCanaryCeilingHealth } from '../canary-ceiling.js'; // TRA-3836
 // TRA-3979 — fleet concentration. ADVISORY: no order site consults it.
 import { gradeFleetConcentration, type FleetConcentrationBookRow } from '../fleet-concentration.js';
+// TRA-4144 — the underlying ASSET CLASS census (axis 4): classifier + open-row
+// and retained-tape folds + the entry-site evaluation census + the
+// `entryPathBehavior` publication for the flag-gated (default-OFF) refusal.
+import { gradeUnderlyingAssetClassHealth } from '../underlying-asset-class.js';
 import {
   summarizeEodArchiveParticipation,
   type EodParticipationSessionAnomaly,
@@ -4619,6 +4624,11 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // census as "cannot say", not as "the fleet holds nothing", which would
     // grade every open ledger episode a phantom.
     const heldLiveOptionSymbols = deps.liveOpenOptionSymbols?.() ?? null;
+    // TRA-4144 — read ONCE, for the same reason as `aggregateExposureRows`
+    // above (TRA-3723): `fleetConcentration` and `underlyingAssetClass` below
+    // must grade the SAME fleet snapshot, and two provider calls walk every
+    // engine twice and could disagree on this one response.
+    const concentrationBooks = deps.liveOtmConcentration?.() ?? null;
     res.json({
       ok: true,
       time: new Date(nowMs).toISOString(),
@@ -4826,7 +4836,38 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
        * two is reading a population the other is not — grade that, do not
        * average it.
        */
-      fleetConcentration: gradeFleetConcentration(deps.liveOtmConcentration?.() ?? null),
+      fleetConcentration: gradeFleetConcentration(concentrationBooks),
+      /**
+       * ⭐ TRA-4144 (parent TRA-3703, axis 4) — the UNDERLYING ASSET CLASS of
+       * every open live row, of the retained tape, and of every candidate the
+       * entry site has evaluated since boot.
+       *
+       * On 2026-08-25 the OTM sleeve opened a $128 call on `ETHA` — a
+       * spot-ether ETF — in the production `admin` book, against a ratified
+       * "Options + Stock, crypto OFF" posture, and NOTHING BREACHED: every
+       * crypto control is scoped on the crypto MODULE, and the exposure
+       * arrived as an equity option on a wrapper. A CONTROL SCOPED ON A VENUE
+       * IS BLIND TO THE SAME EXPOSURE ARRIVING THROUGH A WRAPPER.
+       *
+       * ⛔ Read `entryPathBehavior` FIRST — `advisory_no_refusal` is the
+       * shipped default: the classifier runs at the entry site and REFUSES
+       * NOTHING until the board answers TRA-3703 Q5 and someone arms
+       * `ENABLE_OPTION_ENTRY_ASSET_CLASS_REFUSAL`. A row that cannot be
+       * classified publishes `unknown`, NEVER `equity`
+       * (`unknownNeverReadsAsEquity`), and any `unknown`/blind book makes the
+       * census a LOWER bound (`censusIsLowerBound`) — say so when citing it.
+       *
+       * ⭐ The PRESENCE of this key is the deployed-bytes proof (AC5; assert
+       * with `hasOwnProperty` against a pinned `build.pid` + `startedAt`).
+       * The entry-site half also appears as gate `underlying_asset_class` on
+       * /api/health/live-enforce-gates, which is the DURABLE twin of the
+       * ephemeral since-boot census here.
+       */
+      underlyingAssetClass: gradeUnderlyingAssetClassHealth(
+        concentrationBooks,
+        liveOptionFillRecords(),
+        liveEnv,
+      ),
       // The ACTUAL arm each order site consults: raw flag AND the window. `windowOpen`
       // false ⇒ both sleeves read OFF regardless of their booleans (fail-closed).
       arm: {

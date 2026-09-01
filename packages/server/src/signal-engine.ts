@@ -484,6 +484,12 @@ import {
 // handed the full ~614-name watchlist; this is the only universe restriction on
 // the real-money path.
 import { resolveLiveOtmUniverse, isSymbolInLiveOtmUniverse } from './otm-live-universe-flag.js';
+// TRA-4144 — the underlying ASSET CLASS gate on the live OTM entry path: the
+// classifier + the flag-gated (default-OFF) refusal + the entry-site census.
+import {
+  assetClassRefusalReason,
+  recordEntrySiteAssetClassEvaluation,
+} from './underlying-asset-class.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
 import type { DailySignalRecord, ReportInput } from './reports/eod-report.js';
 import type { PnlTracker } from './pnl-tracker.js';
@@ -7491,6 +7497,59 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-4144 (parent TRA-3703, axis 4) — the UNDERLYING ASSET CLASS gate on
+   * the live OTM entry path.
+   *
+   * The second name-axis cut, beside the allowlist above, and the only control
+   * anywhere in the options entry path that keys on what the name IS: on
+   * 2026-08-25 the sleeve opened a $128 call on `ETHA` — a spot-ether ETF — in
+   * the production `admin` book, against a ratified "Options + Stock, crypto
+   * OFF" posture, and NOTHING BREACHED, because every crypto control is scoped
+   * on the crypto MODULE and this exposure arrived as an equity option. A
+   * control scoped on a venue is blind to the same exposure arriving through a
+   * wrapper.
+   *
+   * Scoped `mode === 'live'`, like the allowlist: demo is the graded book and
+   * keeps its wide universe. Evaluated per SYMBOL, at admission, before any
+   * order — an asset class is a property of the NAME and cannot drift after
+   * entry, so entry-time-only is sufficient on this axis (AC4; the axis-3
+   * mirror image does not apply).
+   *
+   * ⛔ SHIPS DISARMED (AC3). The refusal is armed only by
+   * `ENABLE_OPTION_ENTRY_ASSET_CLASS_REFUSAL`, OFF by default, because the
+   * posture call is TRA-3703 Q5 and belongs to the BOARD — this method makes
+   * the rule WRITABLE in the entry path, it does not write it. While disarmed
+   * it still CLASSIFIES and RECORDS every live candidate (both the enforce
+   * ledger and the entry-site census on
+   * `/api/health/live-options-fee-slippage`), refusing nothing: the census
+   * question must be answerable before the board rules, not only after.
+   * `unknown` refuses when armed — never default to permissive (TRA-3440).
+   */
+  private liveOtmAssetClassRejectReason(
+    symbol: string,
+    nominator?: LiveEnforceNominator | null,
+  ): string | null {
+    if (this.mode !== 'live') return null;
+    const { classification, reason } = assetClassRefusalReason(symbol, process.env);
+    const blocked = reason !== null;
+    recordEntrySiteAssetClassEvaluation(classification, blocked, this.alertUsername ?? null);
+    recordLiveEnforceDecision(
+      'underlying_asset_class',
+      symbol,
+      blocked,
+      etDateString(new Date()),
+      reason ?? undefined,
+      Date.now(),
+      {
+        reasonCode: blocked ? `asset_class_${classification.assetClass}` : undefined,
+        book: this.alertUsername ?? null,
+        nominator: nominator ?? null,
+      },
+    );
+    return reason;
+  }
+
+  /**
    * TRA-3942 (parent TRA-3927, board card `a29b2db8` accepted 2026-08-22T04:18Z)
    * — the ENTRY-TIME WINDOW on the `single_leg_otm` sleeve.
    *
@@ -12169,6 +12228,31 @@ export class SignalEngine {
             sym, optionSymbol: cheap.optionSymbol, reason: otmUniverseReject,
           });
           scanRun.reject('live_universe');
+          continue;
+        }
+
+        // TRA-4144 (parent TRA-3703, axis 4) — UNDERLYING ASSET CLASS, the
+        // OTHER name-axis cut. Ordered directly under the allowlist (an
+        // allowlist admit is a statement about the NAME being listed, not about
+        // what the name IS) and ABOVE the cost bar, so its `evaluated` is the
+        // allowlist-admitted population rather than the ~0.7% that survives the
+        // bar (the TRA-3504 hoist lesson). ⛔ Ships DISARMED: while
+        // ENABLE_OPTION_ENTRY_ASSET_CLASS_REFUSAL is off this classifies and
+        // records every live candidate and refuses nothing — the ETHA-shaped
+        // refusal only becomes reachable when the board answers TRA-3703 Q5.
+        const otmAssetClassReject = this.liveOtmAssetClassRejectReason(sym, nominator);
+        if (otmAssetClassReject) {
+          signal.mode = 'live';
+          signal.liveSkipReason = otmAssetClassReject;
+          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.dailySignals.push({
+            id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
+          });
+          log.info('live OTM open rejected by underlying asset class (TRA-4144)', {
+            sym, optionSymbol: cheap.optionSymbol, reason: otmAssetClassReject,
+          });
+          scanRun.reject('asset_class_refused');
           continue;
         }
 
