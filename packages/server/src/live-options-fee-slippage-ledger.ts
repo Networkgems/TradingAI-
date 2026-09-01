@@ -315,6 +315,22 @@ export interface LiveOptionFillRecord {
   /** TRA-2959 — fill-time capture vs reconcile-time history reconstruction. */
   origin: LiveFillOrigin;
   /**
+   * TRA-4143 — TRUE when `ts` is a SYNTHESISED constant, not an observed fill
+   * time. Broker account-history carries the trade DATE only (basis verified
+   * trade-date, not settlement, on 2026-09-01: `/history` dated the
+   * engine-anchored PLTR 08-04T13:43Z buy 08-04 — settlement would read 08-05),
+   * so every `history_import` row is stamped `<etDay>T17:00:00Z` — date
+   * resolution ONLY. The confirmed 08-04 PLTR same-day round trip hid behind
+   * exactly this: a fabricated 17:00Z read like a measured afternoon close.
+   * ⛔ A reader must NEVER order a `tsSynthetic` row intraday against any other
+   * row on the same day — the comparison has no meaning. `toRecord` always
+   * writes it (derived from `origin` when the caller is silent, which also
+   * retrofits pre-cut lines at hydrate); optional on the TYPE only so
+   * pre-existing fixtures compile — a reader treats an absent key as
+   * `origin === 'history_import'`.
+   */
+  tsSynthetic?: boolean;
+  /**
    * TRA-3997 (parent TRA-3703) — THE BOUND SIDE of the entry decision, beside
    * the price side this row has always kept. What the order site READ when it
    * admitted a `buy_to_open`: the pre-order at-risk, the cap in force, the
@@ -367,6 +383,8 @@ export interface LiveOptionFillInput {
   orderId?: number | null;
   /** Defaults to 'fill' — only the reconcile importer passes 'history_import'. */
   origin?: LiveFillOrigin;
+  /** TRA-4143 — see {@link LiveOptionFillRecord.tsSynthetic}; derived from origin when absent. */
+  tsSynthetic?: boolean;
   /**
    * TRA-3997 — the row's admission stamp, or `null`/absent when the caller has
    * none. An object that fails `isCoherentOptionAdmissionStamp` is refused
@@ -550,6 +568,9 @@ function toRecord(input: LiveOptionFillInput): LiveOptionFillRecord {
   const fees = finiteOrNull(input.fees);
   // TRA-3997 — resolved once, written unconditionally (both keys, always).
   const { admission, admissionReason } = resolveAdmission(input);
+  // Rows written before TRA-2959 carry no origin on disk; they were all
+  // captured by fill-time chokepoints, so 'fill' is the honest default.
+  const origin = isOrigin(input.origin) ? input.origin : 'fill';
   return {
     mode: 'live',
     ts: input.ts,
@@ -573,9 +594,12 @@ function toRecord(input: LiveOptionFillInput): LiveOptionFillRecord {
     slippageVsAsk: filledPrice !== null && askAtSubmit !== null ? filledPrice - askAtSubmit : null,
     slippageVsMid: filledPrice !== null && midAtSubmit !== null ? filledPrice - midAtSubmit : null,
     orderId: input.orderId ?? null,
-    // Rows written before TRA-2959 carry no origin on disk; they were all
-    // captured by fill-time chokepoints, so 'fill' is the honest default.
-    origin: isOrigin(input.origin) ? input.origin : 'fill',
+    origin,
+    // TRA-4143 — a caller's explicit stamp is honoured; otherwise derived from
+    // origin. Every writer of a 'history_import' row synthesises its ts from a
+    // date-only broker record, so the derivation is exact today AND retrofits
+    // pre-cut import lines at hydrate (they re-enter through this function).
+    tsSynthetic: input.tsSynthetic === true || origin === 'history_import',
     // TRA-3997 — the bound side of the entry decision. A pre-cut line hydrates
     // as `null` + `unstamped`: BLIND, never back-filled (AC5).
     admission,
@@ -1833,6 +1857,9 @@ export function hydrateLiveOptionsFeeSlippageFromDisk(
       feeSource: sourced ? rec.feeSource : null,
       orderId: rec.orderId,
       origin: rec.origin,
+      // TRA-4143 — pass an explicit stamp through; an absent one re-derives
+      // from origin inside toRecord (which is what retrofits pre-cut lines).
+      tsSynthetic: rec.tsSynthetic,
       // TRA-3997 — pass the pair through untouched. A line with neither key
       // resolves to `null` + `unstamped` inside `toRecord`; there is NO
       // back-fill here and there must not be (AC5).
@@ -2768,6 +2795,7 @@ export function diffMissingFillsFromHistory(
         fees: null,
         orderId: f.orderId ?? null,
         origin: 'history_import',
+        tsSynthetic: true, // TRA-4143 — the 17:00Z above is a constant, not a measurement
       });
     }
   }
@@ -2814,6 +2842,7 @@ function importedInput(
     fees: null,
     orderId: f.orderId ?? null,
     origin: 'history_import',
+    tsSynthetic: true, // TRA-4143 — the 17:00Z above is a constant, not a measurement
   };
 }
 

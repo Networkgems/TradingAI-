@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -7,6 +7,7 @@ import {
   runLiveOptionsFeeReconcile,
   getLiveOptionsFeeReconcileState,
   clearLiveOptionsFeeReconcileState,
+  detectPdtDayTradeLots,
   type FeeReconcileHistoryClient,
 } from './live-options-fee-reconcile.js';
 import {
@@ -637,5 +638,134 @@ describe('live-options fee reconcile coverage + partition (TRA-2959)', () => {
     first.lastGainLossRejections!.length = 0;
     first.lastGainLossSample = null;
     expect(getLiveOptionsFeeReconcileState().lastGainLossRejections!.length).toBe(2);
+  });
+});
+
+// TRA-4143 — the confirmed 2026-08-04 PLTR260911C00170000 same-day round trip
+// (broker /gainloss: open_date === close_date, term 0) was closed OUT-OF-BAND,
+// so holdLiveOptionsOvernightForPdt — engine-fired exits only — never saw it,
+// and the ledger's fabricated import timestamps made an etDay-keyed detector
+// undecidable in both directions (it manufactured the 08-24 RIG false pair AND
+// could not confirm the true PLTR one). The decidable discriminator is the
+// broker's own lot pairing, which this pass already fetches.
+describe('PDT day-trade detection off broker gainloss lots (TRA-4143)', () => {
+  function lot(over: Partial<TradierGainLossLot> = {}): TradierGainLossLot {
+    return {
+      symbol: 'PLTR260911C00170000',
+      quantity: 1,
+      cost: 444.11,
+      proceeds: 599.86,
+      gainLoss: 155.75,
+      openDate: '2026-08-04',
+      closeDate: '2026-08-04',
+      ...over,
+    };
+  }
+
+  it('detects a same-day lot and passes multi-day lots — including ISO-stamped dates', () => {
+    const sameDay = lot();
+    const isoSameDay = lot({ openDate: '2026-08-04T00:00:00.000Z', closeDate: '2026-08-04T00:00:00.000Z' });
+    const overnight = lot({ openDate: '2026-08-04', closeDate: '2026-08-05' });
+    expect(detectPdtDayTradeLots([sameDay, isoSameDay, overnight])).toEqual([sameDay, isoSameDay]);
+  });
+
+  it('an empty/absent open date never pairs — absent must not resolve to a value that matches', () => {
+    expect(detectPdtDayTradeLots([lot({ openDate: '', closeDate: '' })])).toEqual([]);
+  });
+
+  it('is null before any gainloss fetch — undetected must never read as a measured zero', async () => {
+    const s = getLiveOptionsFeeReconcileState();
+    expect(s.lastPdtDayTradeCount).toBeNull();
+    expect(s.lastPdtDayTradeLots).toBeNull();
+  });
+
+  it('stays null when the gainloss fetch fails even though history survived', async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    seedCloseFill({ etDay: '2026-07-29', ts: NOW - 86_400_000 });
+    const client: FeeReconcileHistoryClient = {
+      listAccountHistory: async () => [],
+      listGainLoss: async () => { throw new Error('503 from Tradier'); },
+    };
+    const s = await runLiveOptionsFeeReconcile(async () => client, NOW);
+    expect(s.lastPdtDayTradeCount).toBeNull();
+    expect(s.lastPdtDayTradeLots).toBeNull();
+  });
+
+  it('publishes the day trade on the state (the alert surface) — and a clean fetch reads a MEASURED zero', async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    seedCloseFill({ etDay: '2026-07-29', ts: NOW - 86_400_000 });
+    const dayTrade = lot();
+    const { client } = fakeClient([], [dayTrade, lot({ symbol: 'RIG260925C00006000', openDate: '2026-08-21', closeDate: '2026-08-24' })]);
+    const s = await runLiveOptionsFeeReconcile(async () => client, NOW);
+    expect(s.lastPdtDayTradeCount).toBe(1);
+    expect(s.lastPdtDayTradeLots).toEqual([
+      {
+        symbol: 'PLTR260911C00170000',
+        quantity: 1,
+        cost: 444.11,
+        proceeds: 599.86,
+        openDate: '2026-08-04',
+        closeDate: '2026-08-04',
+      },
+    ]);
+
+    clearLiveOptionsFeeReconcileState();
+    const cleanClient = fakeClient([], [lot({ openDate: '2026-08-03', closeDate: '2026-08-04' })]).client;
+    const clean = await runLiveOptionsFeeReconcile(async () => cleanClient, NOW);
+    expect(clean.lastPdtDayTradeCount).toBe(0); // measured zero — distinct from the null above
+    expect(clean.lastPdtDayTradeLots).toEqual([]);
+  });
+});
+
+// TRA-4143 ask 4 — the closing PLTR leg carried `ts` of exactly 17:00:00.000Z,
+// a synthesised constant that read like a measured afternoon fill. Every row
+// now says whether its ts was observed or fabricated, and hydrate retrofits
+// the stamp onto pre-cut lines (they re-enter through toRecord).
+describe('tsSynthetic stamp on import rows (TRA-4143)', () => {
+  it('an imported row is stamped tsSynthetic:true, an engine fill row false — and both survive hydrate', async () => {
+    const dir = freshDir();
+    hydrateLiveOptionsFeeSlippageFromDisk(dir, NOW);
+    seedCloseFill({ etDay: '2026-07-29', ts: NOW - 86_400_000 });
+    // a prior-day broker fill the ledger is missing → minted as history_import
+    const { client } = fakeClient([
+      histFill({
+        date: '2026-07-29',
+        symbol: 'MSFT260904C00520000',
+        description: 'Buy to Open 1 MSFT260904C00520000 @ 1.10',
+        quantity: 1,
+        amount: -110,
+        commission: 0,
+        orderId: null,
+        transactionId: 't-import',
+      }),
+    ]);
+    await runLiveOptionsFeeReconcile(async () => client, NOW);
+    const byOrigin = Object.fromEntries(
+      summarizeLiveOptionsFeeSlippage().records.map((r) => [r.origin, r.tsSynthetic]),
+    );
+    expect(byOrigin).toEqual({ fill: false, history_import: true });
+
+    // hydrate re-derives through toRecord — the stamps hold after a restart
+    hydrateLiveOptionsFeeSlippageFromDisk(dir, NOW);
+    const rehydrated = Object.fromEntries(
+      summarizeLiveOptionsFeeSlippage().records.map((r) => [r.origin, r.tsSynthetic]),
+    );
+    expect(rehydrated).toEqual({ fill: false, history_import: true });
+  });
+
+  it('retrofits a pre-cut import line that carries no tsSynthetic key on disk', () => {
+    const dir = freshDir();
+    const preCut = {
+      mode: 'live', ts: NOW - 86_400_000, etDay: '2026-07-29', sleeve: 'single_leg_otm',
+      optionSymbol: 'PLTR260911C00170000', side: 'sell_to_close', contracts: 1,
+      submittedLimit: null, askAtSubmit: null, midAtSubmit: null, filledPrice: 6,
+      fees: null, feeSource: null, slippageVsAsk: null, slippageVsMid: null,
+      orderId: null, origin: 'history_import',
+    };
+    writeFileSync(join(dir, 'live-options-fee-slippage.jsonl'), JSON.stringify(preCut) + '\n', 'utf8');
+    hydrateLiveOptionsFeeSlippageFromDisk(dir, NOW);
+    const rec = summarizeLiveOptionsFeeSlippage().records[0]!;
+    expect(rec.origin).toBe('history_import');
+    expect(rec.tsSynthetic).toBe(true);
   });
 });

@@ -104,6 +104,14 @@ export const GAINLOSS_SAMPLE_MAX = 40;
 export const GAINLOSS_REJECTION_MAX = 25;
 
 /**
+ * TRA-4143 — how many same-day round-trip lots the state republishes. Observed
+ * volume is 0–1 per window (one confirmed instance in 4 weeks of live trading),
+ * so the cap sits far above it: `lastPdtDayTradeCount <= this` ⇒ the sample is
+ * the whole detection, same presence-test reasoning as {@link GAINLOSS_SAMPLE_MAX}.
+ */
+export const PDT_DAY_TRADE_SAMPLE_MAX = 10;
+
+/**
  * TRA-3563 — how many RAW history fills the state republishes. The old cap of 5
  * against 37 observed fills was a SPOT CHECK, not a presence test: diagnosing
  * TRA-3563 needed the executions of one 2026-08-04 group and the sample held
@@ -215,6 +223,40 @@ export interface LiveOptionsFeeReconcileState {
    * the payload was clean; null = no gainloss fetch has run.
    */
   lastGainLossPrefixRepairs: GainLossPrefixRepair[] | null;
+  /**
+   * TRA-4143 — same-day live round trips (PDT day trades) in the last gainloss
+   * fetch, per the BROKER'S OWN lot attribution: a settled `/gainloss` lot whose
+   * `openDate` equals its `closeDate`. This is the ONE discriminator the
+   * fabricated `history_import` timestamps cannot poison: an `etDay`-keyed join
+   * over the ledger both manufactures false pairs (the 08-24 RIG artefact — an
+   * engine close of a PRIOR lot colliding with a same-day imported open) and
+   * cannot confirm true ones, because all import rows carry a synthesised
+   * constant `17:00:00.000Z`. The broker pairs open to close per LOT, so
+   * `openDate === closeDate` is a day trade by construction — no join heuristics.
+   *
+   * Why here: `holdLiveOptionsOvernightForPdt` suppresses ENGINE-fired same-day
+   * exits only (options-account.ts, mode 'live' + same-date-key). The confirmed
+   * 2026-08-04 PLTR260911C00170000 round trip (term 0 at the broker, verified
+   * against trade-dated `/history` on 2026-09-01) was closed OUT-OF-BAND — the
+   * close reached the ledger via `history_import`, a path the gate structurally
+   * never sees. Detection therefore rides the pass that already reads the
+   * broker's lot report; the fetch window covers the measurable horizon
+   * (FEE_MEASURABLE_HORIZON_DAYS = 7 days ≥ the 5-business-day PDT window).
+   *
+   * `null` until a gainloss fetch has run — an unfetched detector must never
+   * read as a measured zero. `[]`/`0` after a fetch IS a measured zero.
+   * Count is NOT capped; the lot list caps at {@link PDT_DAY_TRADE_SAMPLE_MAX}.
+   */
+  lastPdtDayTradeLots: Array<{
+    symbol: string;
+    quantity: number;
+    cost: number;
+    proceeds: number;
+    openDate: string;
+    closeDate: string;
+  }> | null;
+  /** TRA-4143 — count over the WHOLE fetch (never capped); null until a gainloss fetch has run. */
+  lastPdtDayTradeCount: number | null;
   /** Rows back-filled by the last attempt, both sources (null when none ran). */
   lastUpdated: number | null;
   /** TRA-2850 — of `lastUpdated`, rows measured by the gainloss derivation. */
@@ -306,6 +348,16 @@ export interface LiveOptionsFeeReconcileState {
 
 let state: LiveOptionsFeeReconcileState = emptyState();
 
+/**
+ * TRA-4143 — lots already warn-logged as day trades, keyed on the full lot
+ * identity. The pass re-fetches a rolling window every tick, so without this an
+ * ongoing violation would re-alert every ~90s and train readers to ignore it;
+ * the STATE republishes the full detection every pass regardless. Since-boot on
+ * purpose: a restart re-warns once, which for a real-money PDT event is the
+ * right direction to fail in.
+ */
+const warnedPdtDayTradeKeys = new Set<string>();
+
 function emptyState(): LiveOptionsFeeReconcileState {
   return {
     ticks: 0,
@@ -320,6 +372,8 @@ function emptyState(): LiveOptionsFeeReconcileState {
     lastGainLossRejections: null,
     lastGainLossRejectionCounts: null,
     lastGainLossPrefixRepairs: null,
+    lastPdtDayTradeLots: null,
+    lastPdtDayTradeCount: null,
     lastUpdated: null,
     lastGainLossUpdated: null,
     totalUpdated: 0,
@@ -342,6 +396,7 @@ function emptyState(): LiveOptionsFeeReconcileState {
 /** Test seam — reset the provenance between cases. */
 export function clearLiveOptionsFeeReconcileState(): void {
   state = emptyState();
+  warnedPdtDayTradeKeys.clear();
 }
 
 /** Snapshot for the health payload (a copy — callers cannot mutate the pass). */
@@ -357,6 +412,8 @@ export function getLiveOptionsFeeReconcileState(): LiveOptionsFeeReconcileState 
       state.lastGainLossRejectionCounts === null ? null : { ...state.lastGainLossRejectionCounts },
     lastGainLossPrefixRepairs:
       state.lastGainLossPrefixRepairs === null ? null : state.lastGainLossPrefixRepairs.map((r) => ({ ...r })),
+    lastPdtDayTradeLots:
+      state.lastPdtDayTradeLots === null ? null : state.lastPdtDayTradeLots.map((l) => ({ ...l })),
     coverage: state.coverage === null ? null : { ...state.coverage },
     lastImportPriceRepairs:
       state.lastImportPriceRepairs === null ? null : state.lastImportPriceRepairs.map((r) => ({ ...r })),
@@ -398,6 +455,20 @@ export function partitionUnmeasured(
     (basisDay < cutoffDay ? aged : actionable).push(r);
   }
   return { actionable, awaitingClose, aged };
+}
+
+/**
+ * TRA-4143 — same-day round-trip (PDT day-trade) lots, per the broker's own
+ * lot attribution: `openDate === closeDate` compared on the calendar-day part
+ * (the normaliser emits `YYYY-MM-DD`, but raw ISO stamps like
+ * `2026-08-04T00:00:00.000Z` are tolerated). A lot with an empty/unparseable
+ * open date is NOT matched — absent must never resolve to a value that pairs.
+ * Pure; see {@link LiveOptionsFeeReconcileState.lastPdtDayTradeLots} for why
+ * this is the one decidable discriminator.
+ */
+export function detectPdtDayTradeLots(lots: readonly TradierGainLossLot[]): TradierGainLossLot[] {
+  const day = (d: string): string => (typeof d === 'string' ? d.slice(0, 10) : '');
+  return lots.filter((l) => day(l.openDate) !== '' && day(l.openDate) === day(l.closeDate));
 }
 
 /**
@@ -578,6 +649,41 @@ export async function runLiveOptionsFeeReconcile(
     for (const r of gainLoss.rejections) counts[r.reason] += 1;
     state.lastGainLossRejectionCounts = counts;
     state.lastGainLossPrefixRepairs = gainLoss.prefixRepairs;
+    // TRA-4143 — day-trade detection off the broker's OWN lot pairing. Runs on
+    // the raw lots (pre-filter, pre-join): a lot the fee join rejects is still a
+    // round trip the account performed.
+    const dayTrades = detectPdtDayTradeLots(lots);
+    state.lastPdtDayTradeCount = dayTrades.length;
+    state.lastPdtDayTradeLots = dayTrades.slice(0, PDT_DAY_TRADE_SAMPLE_MAX).map((l) => ({
+      symbol: l.symbol,
+      quantity: l.quantity,
+      cost: l.cost,
+      proceeds: l.proceeds,
+      openDate: l.openDate,
+      closeDate: l.closeDate,
+    }));
+    const unseen = dayTrades.filter((l) => {
+      const key = `${l.symbol}|${l.openDate.slice(0, 10)}|${l.closeDate.slice(0, 10)}|${l.quantity}|${l.cost}|${l.proceeds}`;
+      if (warnedPdtDayTradeKeys.has(key)) return false;
+      warnedPdtDayTradeKeys.add(key);
+      return true;
+    });
+    if (unseen.length > 0) {
+      // The alert ask 2 of TRA-4143 exists for: a same-day live round trip on
+      // the sub-$25k PDT account, discovered at the broker, must surface as a
+      // warning — not sit as a silent ledger row. The engine-side overnight gate
+      // (holdLiveOptionsOvernightForPdt) cannot see out-of-band closes; this can.
+      log.warn(
+        'live-options PDT DAY TRADE at the broker — same-day round trip on a live lot (TRA-4143)',
+        {
+          dayTrades: unseen.map(
+            (l) => `${l.symbol} ${l.openDate.slice(0, 10)} x${l.quantity} cost ${l.cost} proceeds ${l.proceeds}`,
+          ),
+          totalInWindow: dayTrades.length,
+          window: { start, end },
+        },
+      );
+    }
   }
 
   state.lastUpdated = updated;
@@ -628,6 +734,8 @@ export async function runLiveOptionsFeeReconcile(
       .slice(0, 5)
       .map((r) => `${r.symbol} ${r.day} ${r.side}: ${r.reason} (${r.observed} vs ${r.expected})`),
     partialFetchError: state.lastError,
+    // TRA-4143 — null = no gainloss fetch this pass (undetected ≠ zero).
+    pdtDayTradeCount: state.lastPdtDayTradeCount,
     coverage: state.coverage,
     // TRA-3563 — coverage reads clean (missingContracts 0) on exactly the defect
     // this repairs, so the repair has to speak for itself in the same line.
