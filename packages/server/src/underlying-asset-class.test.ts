@@ -18,7 +18,9 @@ import {
   clearEntrySiteAssetClassCensus,
   OPTION_ENTRY_ASSET_CLASS_REFUSAL_FLAG,
   REFUSED_ASSET_CLASSES,
+  gradeAssetClassArmPrecondition,
 } from './underlying-asset-class.js';
+import { OPTION_LIVE_OTM_UNIVERSE_VAR as UNIVERSE_VAR } from './otm-live-universe-flag.js';
 
 const FLAG = OPTION_ENTRY_ASSET_CLASS_REFUSAL_FLAG;
 
@@ -230,5 +232,146 @@ describe('TRA-4144 AC1 — the entry-site census', () => {
       underlying: 'ETHA', refused: true, book: 'admin', ts: 3_000,
     });
     expect(h.entrySite.durability).toBe('ephemeral_since_boot');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-4144 — THE ARM PRECONDITION (CEO ask, 2026-09-01)
+//
+// "What does the classifier emit for an ordinary equity? If unclassified
+// underlyings fall through to `unknown`, then refusing `unknown` does not refuse
+// crypto wrappers -- it refuses the entire sleeve, and we ship a full stop-trade
+// believing we shipped a narrow carve-out."
+//
+// Measured that day: 3 of the 10 names in the PRODUCTION allowlist (GIS, TFC,
+// MO) classified `unknown`. The registry gap is closed; these fixtures pin BOTH
+// the closure and the instrument that keeps it closed after the next env edit,
+// because `OPTION_LIVE_OTM_UNIVERSE` is an env var and a list patch expires.
+describe('TRA-4144 — the arm precondition (what the gate emits on the MODAL world)', () => {
+  // The value in force on bqb1, board-ratified 2026-08-13 (TRA-3417).
+  const PROD_UNIVERSE = 'AAPL,SPY,QQQ,PLTR,TSLA,GIS,TFC,MO,VZ,UPS';
+  const envWith = (universe?: string): NodeJS.ProcessEnv =>
+    (universe === undefined ? {} : { [UNIVERSE_VAR]: universe }) as NodeJS.ProcessEnv;
+
+  it('the measured 2026-09-01 defect is CLOSED: all 10 production names classify, none refused in error', () => {
+    const p = gradeAssetClassArmPrecondition(envWith(PROD_UNIVERSE));
+    expect(p.universeSource).toBe('env');
+    expect(p.evaluated).toBe(10);
+    // The three that used to fall through. Named individually: a count cannot
+    // tell a closed gap from a shrunken universe.
+    for (const sym of ['GIS', 'TFC', 'MO']) {
+      expect(classifyUnderlyingAssetClass(sym)).toEqual({
+        underlying: sym, assetClass: 'equity', source: 'static_list',
+      });
+    }
+    expect(p.unknownUnderlyings).toEqual([]);
+    expect(p.unknownCount).toBe(0);
+    expect(p.coverage).toBe(1);
+    expect(p.satisfied).toBe(true);
+    expect(p.blockers).toEqual([]);
+    expect(p.statement).toContain('SAFE TO ARM');
+  });
+
+  it('POSITIVE CONTROL — an unclassifiable name in the allowlist BLOCKS the arm and is named', () => {
+    // The exact pre-fix state, reproduced with a synthetic name so the control
+    // cannot be silently voided by a later registry addition.
+    const p = gradeAssetClassArmPrecondition(envWith('AAPL,SPY,ZZQQ'));
+    expect(p.evaluated).toBe(3);
+    expect(p.unknownUnderlyings).toEqual(['ZZQQ']);
+    expect(p.coverage).toBeCloseTo(0.6667, 4);
+    expect(p.satisfied).toBe(false);
+    expect(p.blockers.join(' ')).toContain('ZZQQ');
+    expect(p.blockers.join(' ')).toContain('REFUSED IN ERROR');
+    expect(p.statement).toContain('NOT SAFE TO ARM');
+    // …and the remedy named on the wire is the list, never the fallback.
+    expect(p.blockers.join(' ')).toContain('never widen the fallback');
+  });
+
+  it('an INTENDED refusal is not a blocker — refusing the wrapper is the deliverable', () => {
+    // A crypto wrapper inside the allowlist is exactly what this ticket exists
+    // to reject. It must NOT read as collateral damage, or the instrument would
+    // refuse to arm the very gate it is grading.
+    const p = gradeAssetClassArmPrecondition(envWith('AAPL,ETHA,SPY'));
+    expect(p.intendedRefusals).toEqual(['ETHA']);
+    expect(p.unknownUnderlyings).toEqual([]);
+    expect(p.coverage).toBe(1);
+    expect(p.satisfied).toBe(true);
+    expect(p.symbols.find((s) => s.underlying === 'ETHA')).toMatchObject({
+      assetClass: 'crypto_proxy_etf', wouldRefuse: true,
+    });
+    expect(p.statement).toContain('ETHA');
+  });
+
+  it('an UNRESTRICTED universe is NOT a pass — the denominator is unmeasurable', () => {
+    for (const sentinel of ['*', 'ALL', 'all']) {
+      const p = gradeAssetClassArmPrecondition(envWith(sentinel));
+      expect(p.universeRestricted).toBe(false);
+      expect(p.universeSource).toBe('env_unrestricted');
+      expect(p.evaluated).toBe(0);
+      // A share of an unenumerable population is not 100% — it is unknown.
+      expect(p.coverage).toBeNull();
+      expect(p.satisfied).toBe(false);
+      expect(p.blockers.join(' ')).toContain('UNRESTRICTED');
+      expect(p.blockers.join(' ')).toContain('UNMEASURED');
+    }
+  });
+
+  it('an unset / malformed universe grades the RESTRICTIVE fallback the gate would actually enforce', () => {
+    const unset = gradeAssetClassArmPrecondition(envWith());
+    expect(unset.universeSource).toBe('default');
+    expect(unset.evaluated).toBe(5);
+    expect(unset.satisfied).toBe(true);
+
+    const invalid = gradeAssetClassArmPrecondition(envWith(',,,'));
+    expect(invalid.universeSource).toBe('env_invalid');
+    // Same five names as `default`, and the source discriminates the two: an
+    // operator who set an unparseable value believes something else is live.
+    expect(invalid.symbols.map((s) => s.underlying)).toEqual(unset.symbols.map((s) => s.underlying));
+    expect(invalid.satisfied).toBe(true);
+  });
+
+  it('THE INSTRUMENT AGREES WITH THE GATE — `wouldRefuse` is checked against the real refusal path', () => {
+    // An instrument that can disagree with its gate is not an instrument. For
+    // every allowlisted name the predicted verdict must equal what
+    // `assetClassRefusalReason` ACTUALLY does with the flag armed.
+    const universe = 'AAPL,SPY,QQQ,PLTR,TSLA,GIS,TFC,MO,VZ,UPS,ETHA,IBIT,COIN,ZZQQ';
+    const p = gradeAssetClassArmPrecondition(envWith(universe));
+    const armed = { [FLAG]: '1' } as NodeJS.ProcessEnv;
+    expect(p.symbols).toHaveLength(14);
+    for (const s of p.symbols) {
+      const { reason } = assetClassRefusalReason(s.underlying, armed);
+      expect({ sym: s.underlying, refused: s.wouldRefuse }).toEqual({
+        sym: s.underlying, refused: reason !== null,
+      });
+    }
+    // …and the two refusal REASONS stay separated on that mixed universe.
+    expect(p.intendedRefusals).toEqual(['ETHA', 'IBIT']);
+    expect(p.unknownUnderlyings).toEqual(['ZZQQ']);
+    // COIN is published, NOT refused — widening to it is a board edit (header).
+    expect(p.symbols.find((s) => s.underlying === 'COIN')).toMatchObject({
+      assetClass: 'crypto_adjacent_equity', wouldRefuse: false,
+    });
+  });
+
+  it('the DEFAULT BRANCH is unchanged by the registry patch — a name with no rule is still `unknown`', () => {
+    // The gap was closed by NAMING five symbols, not by making misses permissive.
+    for (const sym of ['ZZQQ', 'QQZZ', 'NOTATICKER']) {
+      expect(classifyUnderlyingAssetClass(sym)).toEqual({
+        underlying: sym, assetClass: 'unknown', source: 'none',
+      });
+    }
+    expect(REFUSED_ASSET_CLASSES).toContain('unknown');
+  });
+
+  it('the precondition rides the health payload, so the arm question is a READ', () => {
+    const h = gradeUnderlyingAssetClassHealth([], [], envWith(PROD_UNIVERSE));
+    expect(h.armPrecondition.satisfied).toBe(true);
+    expect(h.armPrecondition.universeVar).toBe(UNIVERSE_VAR);
+    expect(h.reason).toContain('ARM PRECONDITION SATISFIED');
+
+    const blocked = gradeUnderlyingAssetClassHealth([], [], envWith('AAPL,ZZQQ'));
+    expect(blocked.armPrecondition.satisfied).toBe(false);
+    expect(blocked.reason).toContain('ARM PRECONDITION NOT SATISFIED');
+    expect(blocked.reason).toContain('1 unknown');
   });
 });

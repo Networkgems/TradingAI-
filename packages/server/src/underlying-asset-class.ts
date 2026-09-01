@@ -60,6 +60,11 @@
  */
 
 import { underlyingFromOcc } from '@trading-app/engine';
+import {
+  OPTION_LIVE_OTM_UNIVERSE_VAR,
+  resolveLiveOtmUniverse,
+  type LiveOtmUniverseSource,
+} from './otm-live-universe-flag.js';
 
 // ─── Vocabulary ──────────────────────────────────────────────────────────────
 
@@ -204,6 +209,16 @@ const EQUITY_ETFS = new Set<string>([
 const KNOWN_COMMON_STOCKS = new Set<string>([
   // names on this system's own live tape / tickets
   'KVYO', 'TROW', 'ABCL', 'NVTS', 'RIG', 'SOFI', 'KO', 'NOK',
+  // ⭐ THE MEASURED GAP (2026-09-01, CEO's arm precondition). GIS / TFC / MO are
+  // in the PRODUCTION `OPTION_LIVE_OTM_UNIVERSE` and classified `unknown`, so
+  // arming the refusal would have rejected 3 of the 10 board-ratified live
+  // names. BULL (Webull, on the 30d tape) and XYZ (Block, ex-SQ, in the base
+  // WATCHLIST) were the same shape one step out. All five are ordinary US
+  // common stocks; each line here is a DETERMINATION, not a guess.
+  // ⚠️ This patch fixed one build. `gradeAssetClassArmPrecondition` is what
+  // keeps the question answered after the next env edit — extend the list when
+  // it reports a blocker, and NEVER widen the fallback instead.
+  'GIS', 'TFC', 'MO', 'BULL', 'XYZ',
   // mega caps
   'AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'GOOG', 'META', 'TSLA', 'AVGO',
   'BRK.B', 'LLY', 'JPM', 'V', 'MA', 'UNH', 'XOM', 'WMT', 'JNJ', 'PG', 'HD',
@@ -289,6 +304,149 @@ export function assetClassRefusalReason(
       + `${classification.assetClass} (source ${classification.source}) — ${why} `
       + `[${OPTION_ENTRY_ASSET_CLASS_REFUSAL_FLAG} armed; refused classes: ${REFUSED_ASSET_CLASSES.join(', ')}; `
       + `posture ruling: TRA-3703 Q5]`,
+  };
+}
+
+// ─── The ARM PRECONDITION (CEO, 2026-09-01) ──────────────────────────────────
+/**
+ * ⭐⭐⭐ WHAT DOES THIS GATE EMIT ON THE **MODAL** WORLD?
+ *
+ * The CEO gated the `ENABLE_OPTION_ENTRY_ASSET_CLASS_REFUSAL` env write on one
+ * measurement: if ordinary equities fall through to `unknown`, then refusing
+ * `unknown` does not refuse crypto wrappers — IT REFUSES THE SLEEVE, and we
+ * ship a full stop-trade believing we shipped a narrow carve-out.
+ *
+ * Measured 2026-09-01 against the shipped classifier: **3 of the 10 names in
+ * the production `OPTION_LIVE_OTM_UNIVERSE` classify `unknown`** — GIS, TFC and
+ * MO, three plain common stocks — so on that build arming the flag would have
+ * refused 30% of the live sleeve's universe. The fear was not hypothetical.
+ * (The registry gap is closed below; this instrument is why we know.)
+ *
+ * ── Why a list patch is NOT the fix ──────────────────────────────────────────
+ * `OPTION_LIVE_OTM_UNIVERSE` is an **env var**. The board can add a name to it
+ * without a deploy, and the day it does, that name classifies `unknown` and —
+ * under an armed refusal — is silently refused, with nothing saying so. A
+ * one-time registry patch answers the question for one build; it cannot keep
+ * answering it. So the answer ships as a **standing read**, folded from the
+ * SAME resolver the gate itself calls (`resolveLiveOtmUniverse`), never from a
+ * copy of the list — an instrument that can disagree with its gate is not an
+ * instrument.
+ *
+ * ⚠️ `restricted === false` (the `*` / `ALL` sentinel) makes the population the
+ * runtime-accumulated ~614-name watchlist, which no fold here can enumerate.
+ * That is published as `coverage: null` / precondition NOT satisfied — an
+ * unmeasurable denominator is never a pass ("a criterion that cannot fail on
+ * this run's data is not a pass").
+ */
+export interface AssetClassArmPrecondition {
+  /** Mirrors the gate's own resolution — provenance, not a re-derivation. */
+  universeVar: string;
+  universeSource: LiveOtmUniverseSource;
+  universeRaw: string | null;
+  /** FALSE ⇒ `*`/`ALL` ⇒ the population is unbounded and cannot be graded here. */
+  universeRestricted: boolean;
+  /** Every allowlisted name with its class. Empty iff the universe is unbounded. */
+  symbols: Array<{
+    underlying: string;
+    assetClass: UnderlyingAssetClass;
+    source: UnderlyingAssetClassSource;
+    /** Would the ENFORCING mode refuse this name, as `REFUSED_ASSET_CLASSES` stands? */
+    wouldRefuse: boolean;
+  }>;
+  evaluated: number;
+  /**
+   * THE COLLATERAL DAMAGE. Allowlisted names the classifier cannot place — each
+   * one refused, wrongly, the moment the flag is armed. This list is the whole
+   * difference between a narrow carve-out and an accidental kill switch.
+   */
+  unknownUnderlyings: string[];
+  unknownCount: number;
+  /**
+   * THE DELIVERABLE. Allowlisted names refused ON PURPOSE (a crypto wrapper the
+   * board ratified out). Kept separate from `unknownUnderlyings` because an
+   * intended refusal must never read as a defect, nor a defect as a feature.
+   */
+  intendedRefusals: string[];
+  /** Share of the allowlist the classifier can place. `null` ⇔ unbounded universe. */
+  coverage: number | null;
+  /** ⛔ THE GATE ON THE ENV WRITE. */
+  satisfied: boolean;
+  blockers: string[];
+  statement: string;
+}
+
+/**
+ * Grade the arm precondition. PURE over `env`. Answers, for the universe THIS
+ * process would actually enforce against: how many allowlisted names would the
+ * armed refusal reject, and which of those rejections are the point vs the cost.
+ */
+export function gradeAssetClassArmPrecondition(
+  env: NodeJS.ProcessEnv = process.env,
+): AssetClassArmPrecondition {
+  const resolution = resolveLiveOtmUniverse(env);
+  const symbols: AssetClassArmPrecondition['symbols'] = [];
+  const unknownUnderlyings: string[] = [];
+  const intendedRefusals: string[] = [];
+
+  for (const sym of resolution.symbols) {
+    const c = classifyUnderlyingAssetClass(sym);
+    const wouldRefuse = REFUSED_ASSET_CLASSES.includes(c.assetClass);
+    symbols.push({
+      underlying: c.underlying ?? sym,
+      assetClass: c.assetClass,
+      source: c.source,
+      wouldRefuse,
+    });
+    if (c.assetClass === 'unknown') unknownUnderlyings.push(c.underlying ?? sym);
+    else if (wouldRefuse) intendedRefusals.push(c.underlying ?? sym);
+  }
+
+  const evaluated = symbols.length;
+  const blockers: string[] = [];
+  if (!resolution.restricted) {
+    blockers.push(
+      `${OPTION_LIVE_OTM_UNIVERSE_VAR} is UNRESTRICTED (${resolution.raw ?? '*'}) — the live population is `
+      + 'the runtime-accumulated watchlist (~614 names on bqb1), which this fold cannot enumerate, so the '
+      + 'share of it that classifies `unknown` is UNMEASURED. Arming the refusal against an unmeasurable '
+      + 'denominator is a stop-trade of unknown size.',
+    );
+  } else if (evaluated === 0) {
+    blockers.push('the resolved allowlist is empty — nothing to grade, which is not the same as a pass.');
+  }
+  if (unknownUnderlyings.length > 0) {
+    blockers.push(
+      `${String(unknownUnderlyings.length)} of ${String(evaluated)} allowlisted underlying(s) classify `
+      + `\`unknown\` and would be REFUSED IN ERROR when armed: ${unknownUnderlyings.join(', ')}. `
+      + 'Add each to the static registry (a determination, per name) — never widen the fallback.',
+    );
+  }
+
+  const coverage = resolution.restricted && evaluated > 0
+    ? Math.round(((evaluated - unknownUnderlyings.length) / evaluated) * 10000) / 10000
+    : null;
+  const satisfied = blockers.length === 0;
+
+  return {
+    universeVar: OPTION_LIVE_OTM_UNIVERSE_VAR,
+    universeSource: resolution.source,
+    universeRaw: resolution.raw,
+    universeRestricted: resolution.restricted,
+    symbols,
+    evaluated,
+    unknownUnderlyings,
+    unknownCount: unknownUnderlyings.length,
+    intendedRefusals,
+    coverage,
+    satisfied,
+    blockers,
+    statement: satisfied
+      ? `SAFE TO ARM: all ${String(evaluated)} name(s) in the live OTM allowlist classify, `
+        + `${String(intendedRefusals.length)} refused on purpose `
+        + `(${intendedRefusals.join(', ') || 'none'}), 0 refused in error. Arming `
+        + `${OPTION_ENTRY_ASSET_CLASS_REFUSAL_FLAG} enforces the ratified "crypto OFF" and narrows the `
+        + 'tradeable universe by nothing else.'
+      : `⛔ NOT SAFE TO ARM: ${blockers.join(' ')} Arming ${OPTION_ENTRY_ASSET_CLASS_REFUSAL_FLAG} today `
+        + 'would refuse names the board has ratified as tradeable — a stop-trade wearing a carve-out\'s name.',
   };
 }
 
@@ -446,6 +604,12 @@ export interface UnderlyingAssetClassHealth {
   unknownNeverReadsAsEquity: true;
   /** AC4 — which axis this control sits on and why entry-time-only suffices. */
   axis: string;
+  /**
+   * ⛔ THE ARM PRECONDITION (CEO 2026-09-01). What the gate emits on the MODAL
+   * world, re-measured every fold against the live allowlist. Read this before
+   * writing the env var — `satisfied: false` means arming is a stop-trade.
+   */
+  armPrecondition: AssetClassArmPrecondition;
   openRows: {
     status: 'unwired' | 'empty' | 'measured';
     rows: Array<{
@@ -575,6 +739,8 @@ export function gradeUnderlyingAssetClassHealth(
   entryByClass.sort((x, y) => (y.evaluated - x.evaluated)
     || (x.assetClass < y.assetClass ? -1 : x.assetClass > y.assetClass ? 1 : 0));
 
+  const armPrecondition = gradeAssetClassArmPrecondition(env);
+
   const openBuckets = finishClasses(openByClass, openAtRisk);
   const tapeBuckets = finishClasses(tapeByClass, tapePremium);
   const crypto = (b: AssetClassBucket[]): AssetClassBucket | undefined =>
@@ -589,7 +755,10 @@ export function gradeUnderlyingAssetClassHealth(
     + `; tape ${tapeStatus}: ${String(tapeOpens)} open fill(s), $${round2(tapePremium).toFixed(2)} premium`
     + `, crypto_proxy_etf $${(crypto(tapeBuckets)?.atRiskUsd ?? 0).toFixed(2)}`
     + (tapeUnknown > 0 ? `, ${String(tapeUnknown)} unknown ⇒ LOWER BOUND` : '')
-    + `; entry site ${String(entrySiteEvaluated)} evaluated / ${String(entrySiteRefused)} refused since boot`;
+    + `; entry site ${String(entrySiteEvaluated)} evaluated / ${String(entrySiteRefused)} refused since boot`
+    + `; ARM PRECONDITION ${armPrecondition.satisfied ? 'SATISFIED' : 'NOT SATISFIED'}`
+    + ` (live allowlist ${String(armPrecondition.evaluated)} name(s), `
+    + `${String(armPrecondition.unknownCount)} unknown ⇒ would be refused IN ERROR)`;
 
   return {
     entryPathBehavior: behavior,
@@ -604,6 +773,7 @@ export function gradeUnderlyingAssetClassHealth(
       + 'placed. An underlying\'s asset class is a property of the SYMBOL and cannot drift after '
       + 'entry (unlike axis-3 concentration), so an entry-time check is sufficient and this '
       + 'fold-time census is visibility, not control.',
+    armPrecondition,
     openRows: {
       status: openStatus,
       rows: openRowsOut,
