@@ -61,6 +61,21 @@ if (c.samplesGraded === 0) {
 } else {
   verdict.push(`✅ ${c.samplesHard}/${c.samplesGraded} graded samples are HARD readings.`);
 }
+// ⭐ A FOURTH, AND IT IS *NOT* THE SOFT/HARD SPLIT ABOVE. `concentrationIsLowerBound`
+// grades the ROWS a probe could see; this grades WHETHER THE PROBE LOOKED WHILE
+// THE ENGINE WAS TRADING. A session sampled only pre-open is a fully HARD reading
+// of yesterday's book, and it will report `samplesHard == samplesGraded` while
+// having observed nothing the entry window did. Kept separate so a clean soft
+// census cannot vouch for coverage it never measured.
+if (c.sessionsObserved > 0 && c.sessionsPreOpenOnly > 0) {
+  verdict.push(`⚠ **${c.sessionsPreOpenOnly}/${c.sessionsObserved} observed session(s) have NO `
+    + 'sample at or after their own 09:30 ET open** — a pre-open probe sees only positions that '
+    + 'already existed, so those sessions did not observe the entry window the 08-24 event '
+    + 'happened inside. Their peaks are floors on the session. This is coverage, not row '
+    + 'softness: it is invisible to `concentrationIsLowerBound`.');
+} else if (c.sessionsObserved > 0) {
+  verdict.push(`✅ All ${c.sessionsObserved} observed session(s) were sampled at or after the open.`);
+}
 if (fold.multiBook.sessions > 0) {
   verdict.push(`🔴 **The hazard reproduced in ${fold.multiBook.sessions} of `
     + `${c.sessionsObserved} observed session(s)** — one contract held by more than one `
@@ -84,6 +99,10 @@ console.log(renderReport(fold, {
       ? '**The observation is strong enough to carry a board ceiling decision.** '
         + 'This report does NOT propose a value — a refusal at the `buy_to_open` path is a '
         + 'change to a ratified arm and the number is the board\'s (TRA-3979 scope note).'
+        + (c.sessionsPreOpenOnly > 0
+          ? ` ⚠ Qualified: ${c.sessionsPreOpenOnly} of those sessions were sampled only pre-open `
+            + '(see the coverage line above), so the per-SESSION rows are floors for those days.'
+          : '')
       : '**The observation is NOT yet strong enough to carry a ceiling decision.** '
         + 'No value is proposed and none should be inferred from the rows above.',
     '',

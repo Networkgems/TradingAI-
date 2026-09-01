@@ -14,7 +14,7 @@
 // from.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { foldTape, renderReport, quantile, shareOf, dollarsOf, SAMPLE, REFUSAL } from './tra3980-concentration-tape.mjs';
+import { foldTape, renderReport, quantile, shareOf, dollarsOf, etClock, isAfterSessionOpen, SAMPLE, REFUSAL } from './tra3980-concentration-tape.mjs';
 
 const pin = { commit: 'deadbeef', pid: 42, startedAt: '2026-08-25T20:00:00.000Z' };
 
@@ -216,6 +216,82 @@ test('renderReport carries the dollar rows beside the share rows, with the censu
   assert.match(md, /`maxContract\.atRiskUsd` — per sample, HARD only \| 0 \| n\/a/);
   assert.match(md, /`maxUnderlying\.atRiskUsd` — per SESSION peak \| 1 \| \$305\.00/);
   assert.match(md, /peak contract \$/, 'per-session detail names the dollar column');
+});
+
+// ── Session COVERAGE: a session sampled only before its own open ─────────────
+//
+// ⚠ THE CONTROL HERE IS THAT COVERAGE AND ROW-SOFTNESS ARE ORTHOGONAL. A
+// pre-open probe returns a perfectly HARD reading — every row keyed and priced —
+// of a book that predates the entry window. So a fold that reused
+// `concentrationIsLowerBound` to express coverage would report
+// `samplesHard == samplesGraded` on exactly the tape that observed nothing, and
+// every assertion in the HARD-split test above would still pass.
+
+test('etClock reads the ET wall clock, not a hardcoded UTC offset', () => {
+  // EDT (UTC-4): 13:36Z is 09:36 ET, six minutes after the bell.
+  assert.deepEqual(etClock('2026-08-26T13:36:12.980Z'), { date: '2026-08-26', minutes: 9 * 60 + 36 });
+  // EST (UTC-5): the SAME UTC clock time is 08:36 ET — pre-open. A 13:30-20:00Z
+  // window would have called this in-session.
+  assert.deepEqual(etClock('2026-01-14T13:36:00.000Z'), { date: '2026-01-14', minutes: 8 * 60 + 36 });
+  assert.equal(etClock('not-a-date'), null);
+  assert.equal(etClock(undefined), null);
+});
+
+test('CONTROL — coverage is NOT an alias of the HARD/soft split', () => {
+  const lines = [
+    // A: sampled 05:28 ET only. Fully HARD, and blind to everything opened that day.
+    sample({ session: '2026-09-01', slot: 'adhoc', at: '2026-09-01T09:28:55.160Z',
+      concentrationIsLowerBound: false }),
+    // B: sampled 09:36 ET. Also fully HARD, and it saw the entry window.
+    sample({ session: '2026-08-26', slot: 'open', at: '2026-08-26T13:36:12.980Z',
+      concentrationIsLowerBound: false }),
+  ];
+  const f = foldTape(lines);
+  assert.equal(f.census.samplesHard, 2, 'both samples are HARD readings');
+  assert.equal(f.census.samplesLowerBound, 0, '...and the soft census sees nothing wrong');
+  // ...yet exactly one session observed its own entry window.
+  assert.equal(f.census.sessionsPreOpenOnly, 1);
+  assert.equal(f.census.sessionsCovered, 1);
+  assert.equal(f.census.samplesAfterOpen, 1);
+  const a = f.sessions.find(s => s.session === '2026-09-01');
+  const b = f.sessions.find(s => s.session === '2026-08-26');
+  assert.equal(a.peakIsSessionLowerBound, true);
+  assert.equal(a.samplesAfterOpen, 0);
+  assert.equal(b.peakIsSessionLowerBound, false);
+  assert.equal(b.samplesAfterOpen, 1);
+});
+
+test('one after-open sample covers the session; post-close counts, pre-open does not', () => {
+  const f = foldTape([
+    sample({ session: '2026-08-26', slot: 'adhoc', at: '2026-08-26T07:21:58.413Z' }),
+    // 16:15 ET post-close: a position opened intraday is still held, so this SEES it.
+    sample({ session: '2026-08-26', slot: 'post', at: '2026-08-26T20:15:00.000Z' }),
+  ]);
+  assert.equal(f.census.sessionsPreOpenOnly, 0, 'a post-close read is not blind to the session');
+  assert.equal(f.sessions[0].samplesAfterOpen, 1);
+  assert.equal(f.sessions[0].peakIsSessionLowerBound, false);
+  // Exactly at the bell is in.
+  assert.equal(isAfterSessionOpen(sample({ session: '2026-08-26', at: '2026-08-26T13:30:00.000Z' })), true);
+  assert.equal(isAfterSessionOpen(sample({ session: '2026-08-26', at: '2026-08-26T13:29:59.000Z' })), false);
+  // A sample filed under a session it was not taken in cannot vouch for it —
+  // conservative direction: it can only ADD softness.
+  assert.equal(isAfterSessionOpen(sample({ session: '2026-08-27', at: '2026-08-26T18:00:00.000Z' })), false);
+  assert.equal(isAfterSessionOpen({ kind: REFUSAL, at: '2026-08-26T18:00:00.000Z' }), false);
+});
+
+test('renderReport states the coverage gap and marks the soft session peaks', () => {
+  const soft = foldTape([sample({ session: '2026-09-01', at: '2026-09-01T09:28:55.160Z' })]);
+  const md = renderReport(soft);
+  assert.match(md, /1 of 1 observed session\(s\) were sampled\s+ONLY before their own 09:30 ET open/);
+  assert.match(md, /LOWER BOUNDS ON THE SESSION/);
+  assert.match(md, /no sample at or after its own 09:30 ET open/);
+  assert.match(md, /68\.7% ≥/, 'the peak itself carries the marker');
+  // ...and the clean case must NOT narrate a gap it does not have.
+  const covered = foldTape([sample({ session: '2026-08-26', at: '2026-08-26T13:36:12.980Z' })]);
+  const md2 = renderReport(covered);
+  assert.match(md2, /All 1 observed session\(s\) carry at least one sample/);
+  assert.doesNotMatch(md2, /LOWER BOUNDS ON THE SESSION/);
+  assert.doesNotMatch(md2, /68\.7% ≥/);
 });
 
 test('renderReport does NOT narrate a soft census over a tape with zero lower bounds', () => {
