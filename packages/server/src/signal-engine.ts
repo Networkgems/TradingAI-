@@ -373,7 +373,7 @@ import {
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount, type EquityExitRiskInput } from './paper-account.js';
-import { PaperOptionsAccount, qualifyLiveStopActionability, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary, type LiveStopActionabilityQualified, type LiveStopGovernanceSummary, type LiveExitPassStatus, type DayOneStopPosture, type OtmSleeveStopCoverage, type EngineBasisRepairOutcome, type AdoptedBasisRestatementOutcome, type LiveLotAdoptionReport } from './options-account.js';
+import { PaperOptionsAccount, qualifyLiveStopActionability, foldImportProvenanceCensuses, type ImportProvenanceCensus, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary, type LiveStopActionabilityQualified, type LiveStopGovernanceSummary, type LiveExitPassStatus, type DayOneStopPosture, type OtmSleeveStopCoverage, type EngineBasisRepairOutcome, type AdoptedBasisRestatementOutcome, type LiveLotAdoptionReport } from './options-account.js';
 import { bindOptionsPnlToEquityBook } from './options-equity-bridge.js';
 import {
   PENDING_CLOSE_MAX_REPRICE_STEPS,
@@ -9375,6 +9375,31 @@ export class SignalEngine {
   /** TRA-3946 — this book's since-boot average-down shadow liveness fold. */
   getAverageDownShadowSinceBoot(): ReturnType<PaperOptionsAccount['averageDownShadowSinceBoot']> {
     return this.optionsAccount.averageDownShadowSinceBoot();
+  }
+
+  /**
+   * TRA-3553 — this book's since-boot import-provenance census, summed over
+   * BOTH env buckets.
+   *
+   * Reads `allOptionsAccounts()`, never `this.optionsAccount`. TRA-383 is the
+   * standing precedent: imported rows land in whichever bucket the user synced
+   * against (`reconcileTradierPositions(env, …)`), so the active-env account is
+   * a SUBSET of the adopted cohort and publishing it would be a floor of unknown
+   * depth wearing the name of a total. That matters more here than anywhere
+   * else, because `adopted` is this census's blindness discriminator: a fold
+   * that misses the bucket the imports actually landed in reports `adopted: 0`
+   * — indistinguishable from "the import branch never ran" — which is the exact
+   * misreading the census was built to make impossible.
+   *
+   * Counters are since-boot and monotonic per account, so the sum is a sum of
+   * counts, not of live rows; no dedupe question arises (a contract present in
+   * both buckets was adopted twice, and that is two adoptions).
+   */
+  getImportProvenanceCensus(): ImportProvenanceCensus {
+    const { blind: _blind, ...total } = foldImportProvenanceCensuses(
+      this.allOptionsAccounts().map(a => a.importProvenanceSummary()),
+    );
+    return total;
   }
 
   getLiveStopActionabilityRows(now?: number): LiveStopActionabilitySummary {

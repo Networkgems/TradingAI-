@@ -1788,6 +1788,75 @@ export function summarizeLiveUnmanagedRisk(
   return { total, byReason, unexplained, uncoveredBrokerContracts };
 }
 
+/** TRA-3553 — one account's since-boot tally of what the import path did. */
+export interface ImportProvenanceCensus {
+  adopted: number;
+  engineOrigin: number;
+  foreign: number;
+  unresolved: number;
+  underlyingBackfilled: number;
+  underlyingUnknown: number;
+  entryDeltaRestored: number;
+}
+
+/** TRA-3553 — the fleet fold, plus the discriminator that must be read first. */
+export interface ImportProvenanceFleetSummary extends ImportProvenanceCensus {
+  /**
+   * `adopted === 0` — the import branch NEVER RAN anywhere in the fleet.
+   *
+   * This is not "the imports were all clean". It is the absence of a
+   * measurement, and the two are byte-identical in every other field.
+   */
+  blind: boolean;
+}
+
+const EMPTY_IMPORT_PROVENANCE_CENSUS: ImportProvenanceCensus = {
+  adopted: 0,
+  engineOrigin: 0,
+  foreign: 0,
+  unresolved: 0,
+  underlyingBackfilled: 0,
+  underlyingUnknown: 0,
+  entryDeltaRestored: 0,
+};
+
+/**
+ * TRA-3553 — sum per-book import-provenance censuses into the shape
+ * `/api/health/options-live` publishes.
+ *
+ * ── Why `blind` is a field and not left to the reader ────────────────────────
+ * TRA-3553 was filed with this trap stated in its own body: the live admin book
+ * is FLAT most days, so there are zero `tradier_import` rows and every
+ * `every(...)` predicate over the imported cohort is VACUOUSLY true. An all-zero
+ * census is therefore what a reader gets whether the import path preserves risk
+ * params perfectly or does nothing at all — the ticket's words: "a live read of
+ * this fix is VACUOUS, not passing."
+ *
+ * `adopted` is the denominator that separates those, and a denominator only
+ * protects a reader who knows to check it. Every consumer of an all-zero vector
+ * has to re-derive the same inference, and the failure direction is a silent
+ * all-clear over an unmeasured real-money book. So the inference is made once,
+ * here, and published as a word.
+ *
+ * Empty input is `blind: true`, not a thrown error: a fleet with no books is
+ * exactly the unmeasured state the flag names.
+ */
+export function foldImportProvenanceCensuses(
+  censuses: Iterable<ImportProvenanceCensus>,
+): ImportProvenanceFleetSummary {
+  const total: ImportProvenanceCensus = { ...EMPTY_IMPORT_PROVENANCE_CENSUS };
+  for (const one of censuses) {
+    total.adopted += one.adopted;
+    total.engineOrigin += one.engineOrigin;
+    total.foreign += one.foreign;
+    total.unresolved += one.unresolved;
+    total.underlyingBackfilled += one.underlyingBackfilled;
+    total.underlyingUnknown += one.underlyingUnknown;
+    total.entryDeltaRestored += one.entryDeltaRestored;
+  }
+  return { ...total, blind: total.adopted === 0 };
+}
+
 /**
  * TRA-3822 — the runtime facts `summarizeLiveStopActionability` needs and that
  * a row cannot carry, because they live on the ENGINE and on the account's
@@ -14151,15 +14220,7 @@ export class PaperOptionsAccount {
    * this ticket was filed with: the live book is flat, so every `every(...)`
    * predicate over the imported cohort is vacuously true.
    */
-  importProvenanceSummary(): {
-    adopted: number;
-    engineOrigin: number;
-    foreign: number;
-    unresolved: number;
-    underlyingBackfilled: number;
-    underlyingUnknown: number;
-    entryDeltaRestored: number;
-  } {
+  importProvenanceSummary(): ImportProvenanceCensus {
     return { ...this.importProvenanceCensus };
   }
 

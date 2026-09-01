@@ -375,7 +375,7 @@ import {
   setClosedRowGrantLookup,
 } from './tra3926-oversold-close-detector.js';
 // TRA-2820 — live-book "is it actually stopped?" counter for /api/health/options-live.
-import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability, mergeLiveStopGovernance, blindLiveStopGovernance, mergeDayOneStopPosture, blindDayOneStopPosture, mergeOtmSleeveStopCoverage, blindOtmSleeveStopCoverage, type PaperOptionsAccount } from './options-account.js';
+import { summarizeLiveUnmanagedRisk, foldImportProvenanceCensuses, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability, mergeLiveStopGovernance, blindLiveStopGovernance, mergeDayOneStopPosture, blindDayOneStopPosture, mergeOtmSleeveStopCoverage, blindOtmSleeveStopCoverage, type PaperOptionsAccount } from './options-account.js';
 import { resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule } from './exit-risk-rules-flag.js';
 // TRA-3941 — the frozen sleeve KEY the exit ruling is scoped to, so the wire
 // field names the same join column the journal tape and the gate ledger use.
@@ -11654,6 +11654,30 @@ app.get('/api/health/options-live', async (_req, res) => {
           }
           return total;
         })(),
+      ),
+      // TRA-3553 — what the tradier_import path DID, fleet-wide and since boot.
+      //
+      // The fix (4cac8b70) shipped its own witness, `importProvenanceSummary()`,
+      // and then nothing published it: it had NO production caller for 19 days,
+      // so the one thing that makes this fix observable was reachable only from
+      // its own tests. That is why TRA-3553's definition of done — "verify by
+      // field presence on the live health route, not by the push" — could not be
+      // satisfied even though the code was live and serving the whole time.
+      //
+      // ⚠️ `blind` IS THE FIELD. Read it before any counter below it.
+      // `adopted` is the denominator, and TRA-3553 was filed with the trap in
+      // its own title: the live book is flat most days, so every `every(...)`
+      // predicate over the imported cohort is VACUOUSLY true and an all-zero
+      // vector is what a reader gets whether this fix works perfectly or does
+      // nothing at all. `adopted: 0` therefore means the import branch NEVER
+      // RAN — not that it ran clean — and `blind: true` says so in a word rather
+      // than trusting every future reader to re-derive it from a zero.
+      //
+      // Counts only — no OCC symbols, no per-row detail. This route is no-auth
+      // and TRA-2163 is the standing reason not to widen what it says about the
+      // real-money book.
+      importProvenance: foldImportProvenanceCensuses(
+        getAllUserContexts().map(c => c.engine.getImportProvenanceCensus()),
       ),
       // TRA-3822 — the counter `liveUnmanagedRisk` above is STRUCTURALLY UNABLE
       // to contain: is a live stop that is already THROUGH going to be acted on?
