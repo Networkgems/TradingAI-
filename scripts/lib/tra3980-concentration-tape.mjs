@@ -111,6 +111,34 @@ export const REFUSAL_REASONS = Object.freeze([
 const isFiniteNum = n => typeof n === 'number' && Number.isFinite(n);
 
 /**
+ * A stable identity for ONE sample inside its session, used to say WHICH
+ * sample a session peak came from. `at` is the probe instant and is what the
+ * tape actually pins; `slot` is a label and two samples can share it (a
+ * re-run, or two `adhoc` reads), so it cannot stand alone as the key.
+ */
+const sampleKey = s => (s?.at ?? `${s?.session ?? '?'}#${s?.slot ?? '?'}`);
+
+/**
+ * Do BOTH axes of a session's peak row come from the same sample?
+ *
+ * ⛔ `true` is the only reading under which "peak share" and "peak $" may be
+ * read as one moment. A session with a single sample is trivially true. A
+ * session where one axis never read at all (`null` witness) is NOT claimed to
+ * agree — there is nothing to agree with.
+ */
+function peakAxesAgree(g) {
+  const pairs = [
+    [g.maxContractShareAt, g.maxContractUsdAt],
+    [g.maxUnderlyingShareAt, g.maxUnderlyingUsdAt],
+  ];
+  for (const [a, b] of pairs) {
+    if (a === null || b === null) return false;
+    if (a !== b) return false;
+  }
+  return true;
+}
+
+/**
  * Linear-interpolation quantile over a sorted ascending array, the same
  * definition as numpy's default. `null` on an empty sample — NEVER 0, which
  * would read as "we measured zero concentration".
@@ -206,6 +234,11 @@ export function foldTape(lines) {
         session: key, samples: [], slots: new Set(), lowerBound: 0, afterOpen: 0,
         maxContractShare: null, maxUnderlyingShare: null,
         maxContractUsd: null, maxUnderlyingUsd: null,
+        // ⚠ WHICH SAMPLE each peak came from. The share peak and the dollar
+        // peak are INDEPENDENT maxima over the session's samples and are not
+        // in general the same moment — see `peakAxesAgree` below.
+        maxContractShareAt: null, maxContractUsdAt: null,
+        maxUnderlyingShareAt: null, maxUnderlyingUsdAt: null,
         distinctContracts: null, statuses: new Set(), pins: new Set(),
       });
     }
@@ -218,12 +251,23 @@ export function foldTape(lines) {
     if (s.pin?.commit) g.pins.add(`${s.pin.commit}/${s.pin.pid}`);
     const c = shareOf(s, 'contract');
     const u = shareOf(s, 'underlying');
-    if (c !== null) g.maxContractShare = Math.max(g.maxContractShare ?? 0, c);
-    if (u !== null) g.maxUnderlyingShare = Math.max(g.maxUnderlyingShare ?? 0, u);
+    // Track the ARGMAX, not just the max: the sample that produced each peak.
+    // `>` (not `>=`) makes the FIRST sample attaining a tied peak the witness,
+    // so a later duplicate cannot silently re-attribute the row.
+    if (c !== null && c > (g.maxContractShare ?? -Infinity)) {
+      g.maxContractShare = c; g.maxContractShareAt = sampleKey(s);
+    }
+    if (u !== null && u > (g.maxUnderlyingShare ?? -Infinity)) {
+      g.maxUnderlyingShare = u; g.maxUnderlyingShareAt = sampleKey(s);
+    }
     const cUsd = dollarsOf(s, 'contract');
     const uUsd = dollarsOf(s, 'underlying');
-    if (cUsd !== null) g.maxContractUsd = Math.max(g.maxContractUsd ?? 0, cUsd);
-    if (uUsd !== null) g.maxUnderlyingUsd = Math.max(g.maxUnderlyingUsd ?? 0, uUsd);
+    if (cUsd !== null && cUsd > (g.maxContractUsd ?? -Infinity)) {
+      g.maxContractUsd = cUsd; g.maxContractUsdAt = sampleKey(s);
+    }
+    if (uUsd !== null && uUsd > (g.maxUnderlyingUsd ?? -Infinity)) {
+      g.maxUnderlyingUsd = uUsd; g.maxUnderlyingUsdAt = sampleKey(s);
+    }
     const dc = s.status === 'empty' ? 0 : s.distinctContracts;
     if (isFiniteNum(dc)) g.distinctContracts = Math.max(g.distinctContracts ?? 0, dc);
   }
@@ -312,6 +356,15 @@ export function foldTape(lines) {
       maxUnderlyingShare: g.maxUnderlyingShare,
       maxContractUsd: g.maxContractUsd,
       maxUnderlyingUsd: g.maxUnderlyingUsd,
+      // ⛔ A FOURTH SOFTNESS — of the ROW, not of any sample. The share peak
+      // and the dollar peak are separate maxima; when they land on different
+      // samples the pair describes a fleet state that never existed, and
+      // `peakShare x peakFleet` is not any real dollar figure.
+      maxContractShareAt: g.maxContractShareAt,
+      maxContractUsdAt: g.maxContractUsdAt,
+      maxUnderlyingShareAt: g.maxUnderlyingShareAt,
+      maxUnderlyingUsdAt: g.maxUnderlyingUsdAt,
+      peakAxesAgree: peakAxesAgree(g),
       distinctContracts: g.distinctContracts,
       multiBook: multiBookSessions.has(g.session),
     })),
@@ -433,12 +486,25 @@ export function renderReport(fold, opts = {}) {
     // for "the biggest number we saw" must not be able to read a pre-open-only
     // session's peak as a measured session peak.
     const soft = s.peakIsSessionLowerBound ? ' ≥' : '';
+    // ⛔ `†` = the two axes of THIS ROW are from different samples. Without it
+    // a reader recovers a fleet size by dividing peak-$ by peak-share and gets
+    // a number no probe ever saw.
+    const split = s.peakAxesAgree === false ? ' †' : '';
     L.push(`| ${s.session} | ${s.slots.join(',') || '-'} | ${s.samples} | `
       + `${s.samplesAfterOpen}${s.peakIsSessionLowerBound ? ' ⚠' : ''} | `
       + `${s.lowerBoundSamples} | ${s.statuses.join(',')} | `
-      + `${s.distinctContracts ?? 'n/a'} | ${pct(s.maxContractShare)}${soft} | `
-      + `${usd(s.maxContractUsd)}${soft} | `
-      + `${pct(s.maxUnderlyingShare)}${soft} | ${usd(s.maxUnderlyingUsd)}${soft} | ${s.pins.join(' ')} |`);
+      + `${s.distinctContracts ?? 'n/a'} | ${pct(s.maxContractShare)}${soft}${split} | `
+      + `${usd(s.maxContractUsd)}${soft}${split} | `
+      + `${pct(s.maxUnderlyingShare)}${soft}${split} | `
+      + `${usd(s.maxUnderlyingUsd)}${soft}${split} | ${s.pins.join(' ')} |`);
+  }
+  if (fold.sessions.some(s => s.peakAxesAgree === false)) {
+    L.push('');
+    L.push('_`†` marks a session whose **peak share and peak dollars come from DIFFERENT samples**. '
+      + 'Both figures are real, but they are not one moment: the share peak is attained when the '
+      + 'fleet denominator is SMALLEST and the dollar peak when the position is LARGEST, which are '
+      + 'systematically different instants. Do not divide one by the other to recover a fleet size, '
+      + 'and do not read the pair as a single observed state._');
   }
   if (fold.sessions.some(s => s.peakIsSessionLowerBound)) {
     L.push('');

@@ -304,3 +304,83 @@ test('renderReport does NOT narrate a soft census over a tape with zero lower bo
   assert.doesNotMatch(md, /UNDER-state concentration/);
   assert.doesNotMatch(md, /shares are soft/);
 });
+
+test('a session peak row whose two axes come from DIFFERENT samples is marked', () => {
+  // The divergence is systematic, not a coincidence: share peaks when the fleet
+  // denominator is smallest, dollars peak when the position is largest.
+  //   sample 1: $100 in a $150 fleet -> 66.7%, $100
+  //   sample 2: $200 in a $600 fleet -> 33.3%, $200
+  // Peak share 66.7% (sample 1) and peak $ $200 (sample 2) describe a $300
+  // fleet that never existed.
+  const f = foldTape([
+    sample({ session: '2026-09-01', slot: 'open', at: '2026-09-01T13:35:00.000Z',
+      fleetAtRiskUsd: 150,
+      maxContract: { key: 'AAA261002C00010000', atRiskUsd: 100, contracts: 1, books: ['admin'], bookCount: 1, shareOfFleetAtRisk: 2 / 3 },
+      maxUnderlying: { key: 'AAA', atRiskUsd: 100, contracts: 1, books: ['admin'], bookCount: 1, shareOfFleetAtRisk: 2 / 3 } }),
+    sample({ session: '2026-09-01', slot: 'mid', at: '2026-09-01T16:30:00.000Z',
+      fleetAtRiskUsd: 600,
+      maxContract: { key: 'AAA261002C00010000', atRiskUsd: 200, contracts: 2, books: ['admin'], bookCount: 1, shareOfFleetAtRisk: 1 / 3 },
+      maxUnderlying: { key: 'AAA', atRiskUsd: 200, contracts: 2, books: ['admin'], bookCount: 1, shareOfFleetAtRisk: 1 / 3 } }),
+  ]);
+  const s = f.sessions[0];
+  assert.equal(s.peakAxesAgree, false);
+  assert.equal(s.maxContractShareAt, '2026-09-01T13:35:00.000Z');
+  assert.equal(s.maxContractUsdAt, '2026-09-01T16:30:00.000Z');
+  assert.ok(Math.abs(s.maxContractShare - 2 / 3) < 1e-9);
+  assert.equal(s.maxContractUsd, 200);
+  const md = renderReport(f);
+  assert.match(md, /66\.7% †/);
+  assert.match(md, /\$200\.00 †/);
+  assert.match(md, /peak share and peak dollars come from DIFFERENT samples/);
+  // ⛔ THE CONTROL FOR THIS MARKER: the session IS covered and every sample is
+  // HARD, so `†` cannot be an alias of the coverage flag or the soft census.
+  assert.equal(s.peakIsSessionLowerBound, false);
+  assert.equal(f.census.samplesLowerBound, 0);
+  assert.doesNotMatch(md, /66\.7% ≥/);
+});
+
+test('CONTROL — peaks from ONE sample agree, and the report stays silent', () => {
+  // Same numbers, but the larger position arrives with the SMALLER fleet, so
+  // both maxima land on sample 2. A fold that always emitted `†` on a
+  // multi-sample session would pass the test above and fail here.
+  const f = foldTape([
+    sample({ session: '2026-09-01', slot: 'open', at: '2026-09-01T13:35:00.000Z',
+      fleetAtRiskUsd: 600,
+      maxContract: { key: 'AAA261002C00010000', atRiskUsd: 100, contracts: 1, books: ['admin'], bookCount: 1, shareOfFleetAtRisk: 1 / 6 },
+      maxUnderlying: { key: 'AAA', atRiskUsd: 100, contracts: 1, books: ['admin'], bookCount: 1, shareOfFleetAtRisk: 1 / 6 } }),
+    sample({ session: '2026-09-01', slot: 'mid', at: '2026-09-01T16:30:00.000Z',
+      fleetAtRiskUsd: 300,
+      maxContract: { key: 'AAA261002C00010000', atRiskUsd: 200, contracts: 2, books: ['admin'], bookCount: 1, shareOfFleetAtRisk: 2 / 3 },
+      maxUnderlying: { key: 'AAA', atRiskUsd: 200, contracts: 2, books: ['admin'], bookCount: 1, shareOfFleetAtRisk: 2 / 3 } }),
+  ]);
+  const s = f.sessions[0];
+  assert.equal(s.peakAxesAgree, true);
+  assert.equal(s.maxContractShareAt, s.maxContractUsdAt);
+  const md = renderReport(f);
+  assert.doesNotMatch(md, /†/);
+  assert.doesNotMatch(md, /DIFFERENT samples/);
+  // A single-sample session is trivially one moment.
+  assert.equal(foldTape([sample()]).sessions[0].peakAxesAgree, true);
+});
+
+test('a TIE on one axis attributes the row to the FIRST sample that attained it', () => {
+  // The live 09-01 shape: the same contract at the same dollars in both
+  // samples, but the fleet grew, so only the SHARE moved. The dollar axis is
+  // tied -- and a `>=` argmax would hand the row to the later sample and
+  // report the axes as agreeing when the share peak is genuinely elsewhere.
+  const f = foldTape([
+    sample({ session: '2026-09-01', slot: 'adhoc', at: '2026-09-01T09:28:55.160Z',
+      fleetAtRiskUsd: 313,
+      maxContract: { key: 'KO261002C00090000', atRiskUsd: 183, contracts: 1, books: ['admin'], bookCount: 1, shareOfFleetAtRisk: 0.585 },
+      maxUnderlying: { key: 'KO', atRiskUsd: 183, contracts: 1, books: ['admin'], bookCount: 1, shareOfFleetAtRisk: 0.585 } }),
+    sample({ session: '2026-09-01', slot: 'mid', at: '2026-09-01T16:37:00.000Z',
+      fleetAtRiskUsd: 409,
+      maxContract: { key: 'KO261002C00090000', atRiskUsd: 183, contracts: 1, books: ['admin'], bookCount: 1, shareOfFleetAtRisk: 0.447 },
+      maxUnderlying: { key: 'KO', atRiskUsd: 183, contracts: 1, books: ['admin'], bookCount: 1, shareOfFleetAtRisk: 0.447 } }),
+  ]);
+  const s = f.sessions[0];
+  assert.equal(s.maxContractShareAt, '2026-09-01T09:28:55.160Z');
+  assert.equal(s.maxContractUsdAt, '2026-09-01T09:28:55.160Z', 'the tie goes to the first attainer');
+  assert.equal(s.peakAxesAgree, true, 'and the row IS one moment: 58.5% of $313 is $183');
+  assert.equal(s.maxContractUsd, 183);
+});
