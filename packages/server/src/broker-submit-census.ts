@@ -98,6 +98,23 @@ import { join } from 'node:path';
  * {@link BrokerSubmitCensusRow.verdict}) — a book whose entries all filled must
  * not read `green` while its exits are all failing, and a book with no entries
  * and N failed exits must not read `idle`. That last sentence is the ticket.
+ *
+ * ### What the close leg covers, stated so a zero cannot be mistaken for coverage
+ *
+ * INSTRUMENTED (all in `signal-engine.ts`): `submitStagedOptionExits` — the
+ * engine's staged SL/TP/trail exits, which is the 2026-08-31 path;
+ * `escalateCappedExit` — the TRA-3418 re-submit; `resolvePendingOptionExits` —
+ * the async terminal outcome of an order submitted on an earlier tick; and
+ * `submitManualOptionClose` — the operator's Close button on an engine-opened
+ * row, which on 08-31 failed on the same Tradier 500.
+ *
+ * ⛔ NOT INSTRUMENTED: the IMPORTED-position close route
+ * (`index.ts`, `submitSmartSellToClose` on a row carrying `pendingCloseOrderId`
+ * rather than a `pendingExit`). Its outcomes are absent from this fold, so a
+ * book whose only close activity went through that route still reads
+ * `closeAttempts: 0`. Named here rather than left silent, because "an absent
+ * cell must not read like a clean one" is the property this whole module is
+ * built around and it applies to its own coverage first. Tracked separately.
  */
 
 /**
