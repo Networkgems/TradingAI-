@@ -17432,6 +17432,17 @@ app.post('/api/health/tradier-sandbox/smoke-order', async (req, res) => {
     return;
   }
   const { apiToken, accountId } = creds;
+  // TRA-4264 — same ENTRY-log treatment as the options route below it, for the same
+  // reason: an arriving request must leave a trace before the process can die under it.
+  const smokeReqId = `ses-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  log.info('TRA-2126 sandbox smoke order STARTING', {
+    marker: 'sandbox-equity-smoke-entry',
+    reqId: smokeReqId,
+    symbol,
+    side,
+    qty,
+    processStartedAt: resolveBuildInfo().startedAt,
+  });
   try {
     const client = new TradierOptionsClient(apiToken, accountId, 'sandbox');
     const order = await client.submitEquityOrder({ symbol, side, qty, type: 'market', duration: 'day' });
@@ -17442,6 +17453,8 @@ app.post('/api/health/tradier-sandbox/smoke-order', async (req, res) => {
       intervalMs: 750,
     });
     log.info('TRA-2126 sandbox smoke order placed', {
+      marker: 'sandbox-equity-smoke-complete',
+      reqId: smokeReqId,
       symbol,
       side,
       qty,
@@ -17464,6 +17477,15 @@ app.post('/api/health/tradier-sandbox/smoke-order', async (req, res) => {
       ts: new Date().toISOString(),
     });
   } catch (err: unknown) {
+    // TRA-4264 — see the options route: a caught failure must not be server-side silent.
+    log.error('TRA-2126 sandbox smoke order FAILED', {
+      marker: 'sandbox-equity-smoke-failed',
+      reqId: smokeReqId,
+      symbol,
+      side,
+      qty,
+      error: err instanceof Error ? err.message : String(err),
+    });
     res.status(200).json({
       ok: false,
       env: 'sandbox',
@@ -17496,6 +17518,27 @@ app.post('/api/health/tradier-sandbox/options-smoke-order', async (req, res) => 
   }
   const { underlying, qty } = validation;
   const { apiToken, accountId } = creds;
+  // TRA-4264 — ENTRY log. This route used to log ONLY on success, and its catch
+  // logged nothing, so three different outcomes were byte-identical in the server
+  // logs (all three were silence): (1) the request never arrived, (2) it arrived and
+  // the round trip threw, (3) it arrived and the PROCESS WAS KILLED MID-FLIGHT. On
+  // 2026-09-01 the 15:00Z fire hit (3) — bqb1's event-loop watchdog self-restarted
+  // three times across the window and took the in-flight request with it, surfacing
+  // to the caller as HTTP 500 (a status this handler cannot itself produce: bad shape
+  // is 400, every throw is 200 ok:false). Diagnosing it needed the Render tape plus a
+  // code read, because `text=smoke` returned 0 lines and on its own that zero is
+  // uninformative. An arriving request must leave a trace BEFORE it can die:
+  //   entry line + no completion line ⇒ died mid-flight (host)
+  //   no entry line                   ⇒ never arrived (dispatch)
+  const smokeReqId = `sos-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  log.info('TRA-2130/2134 sandbox options smoke round-trip STARTING', {
+    marker: 'sandbox-smoke-entry',
+    reqId: smokeReqId,
+    underlying,
+    qty,
+    cspEnabled: demoFlagEnv().ENABLE_SANDBOX_CSP_COVERED_CALL === '1',
+    processStartedAt: resolveBuildInfo().startedAt,
+  });
   try {
     // Hard-pinned 'sandbox' — NO prod fallback (see resolveSandboxTradierCreds).
     const client = new TradierOptionsClient(apiToken, accountId, 'sandbox');
@@ -17537,6 +17580,8 @@ app.post('/api/health/tradier-sandbox/options-smoke-order', async (req, res) => 
       if (rec) { recordSandboxStrategy(rec); journalRecorded += 1; }
     }
     log.info('TRA-2130/2134 sandbox options smoke round-trip', {
+      marker: 'sandbox-smoke-complete',
+      reqId: smokeReqId,
       underlying,
       qty,
       callOk: call.ok,
@@ -17575,6 +17620,15 @@ app.post('/api/health/tradier-sandbox/options-smoke-order', async (req, res) => 
       ts: new Date().toISOString(),
     });
   } catch (err: unknown) {
+    // TRA-4264 — a caught failure returns 200 ok:false to the caller; without this it
+    // wrote NOTHING server-side, so a failed fire and an absent one read identically.
+    log.error('TRA-2130/2134 sandbox options smoke round-trip FAILED', {
+      marker: 'sandbox-smoke-failed',
+      reqId: smokeReqId,
+      underlying,
+      qty,
+      error: err instanceof Error ? err.message : String(err),
+    });
     res.status(200).json({
       ok: false,
       env: 'sandbox',
