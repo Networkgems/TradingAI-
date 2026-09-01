@@ -3909,6 +3909,28 @@ export interface OptionPosition {
    */
   closeRejectCount?: number;
   /**
+   * TRA-4218 — set to `true` alongside every increment of
+   * {@link closeRejectCount} made by a build that routes transport faults away
+   * from that counter. It exists for exactly one reader: the one-shot
+   * `importSnapshot` heal, which needs to tell a counter accrued under the
+   * PRE-fix build (where a Tradier 5xx incremented it) from one accrued under
+   * the post-fix build (where only a real broker refusal can).
+   *
+   * The heal cannot answer that from `exitErrorReason`. That string records the
+   * LAST thing that happened to the row, not what filled the counter, so a row
+   * holding two genuine refusals whose next attempt hit a 500 carries transport
+   * text over a refusal-built counter — and the heal, keyed on text alone, would
+   * erase two refusals and hand a broker that has already said no twice a fresh
+   * three-attempt budget. This flag is the only thing on the row that a pre-fix
+   * build provably could not have written, which is what makes it a sound
+   * migration discriminator where the text is not.
+   *
+   * Deleted wherever {@link closeRejectCount} is deleted, so a later accrual
+   * re-stamps it rather than inheriting a retired streak's provenance.
+   * Absent ↔ legacy (pre-TRA-4218) counter, or no counter at all.
+   */
+  closeRejectRefusalsOnly?: boolean;
+  /**
    * TRA-4218 — consecutive `sell_to_close` submits for this position that the
    * broker never DECIDED on: HTTP 5xx / 429 / 408, or a network-level `fetch`
    * failure. Reset on a successful submit ({@link OptionPosition.pendingExit}

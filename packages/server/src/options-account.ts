@@ -11233,6 +11233,10 @@ export class PaperOptionsAccount {
     // a future exit on the remainder (TP1 / manual partial) starts fresh and
     // the circuit breaker only ever counts *consecutive* failures.
     delete opt.closeRejectCount;
+    // TRA-4218 — the provenance stamp follows the counter it describes; a flag
+    // left on a row with no counter would be read by the heal as "this row's
+    // (absent) streak is refusal-only", which is not a claim about anything.
+    delete opt.closeRejectRefusalsOnly;
     // TRA-4218 — and the transport streak + its backoff, same reason.
     delete opt.exitTransportFailCount;
     delete opt.exitRetryNotBeforeMs;
@@ -11373,6 +11377,7 @@ export class PaperOptionsAccount {
     // counter climbs again from zero; a deliberate user retry always gets a
     // clean slate rather than inheriting the engine's abandoned-retry state.
     delete opt.closeRejectCount;
+    delete opt.closeRejectRefusalsOnly; // TRA-4218 — provenance follows its counter.
     // TRA-4218 — and the transport backoff. The user is submitting NOW; holding
     // their order behind a wait the engine chose would be the same defect in a
     // smaller window.
@@ -11481,6 +11486,15 @@ export class PaperOptionsAccount {
     }
     if (options.countRejection !== false) {
       opt.closeRejectCount = (opt.closeRejectCount ?? 0) + 1;
+      // TRA-4218 — stamp the counter's PROVENANCE, not just its value. Reaching
+      // this line at all means the transport branch above declined this failure,
+      // so every increment under this build is a broker that looked and refused.
+      // The `importSnapshot` heal reads this to tell a legacy counter (which a
+      // 5xx could inflate) from one it must never touch; without it the heal has
+      // only `exitErrorReason`, which describes the LAST failure rather than the
+      // counter, and would eat genuine refusals off a row whose most recent
+      // attempt happened to hit a 500.
+      opt.closeRejectRefusalsOnly = true;
       if (opt.closeRejectCount >= MAX_CONSECUTIVE_CLOSE_REJECTS) {
         // The breaker just tripped — make the surfaced reason explain why
         // the engine has stopped retrying so the dashboard notice is
@@ -14573,6 +14587,7 @@ export class PaperOptionsAccount {
     // The row is leaving the open book; a tripped auto-close breaker and a
     // half-counted miss streak would only be noise in the archive.
     delete opt.closeRejectCount;
+    delete opt.closeRejectRefusalsOnly; // TRA-4218 — provenance follows its counter.
     delete opt.exitExpiredCount; // TRA-2984 — same, and it gates a MARKET escalation.
     delete opt.exitTransportFailCount; // TRA-4218 — same.
     delete opt.exitRetryNotBeforeMs;
@@ -15422,15 +15437,40 @@ export class PaperOptionsAccount {
       // it was written for. On 2026-08-31 that population was all three open
       // real-money rows, two of them under a breached stop.
       //
-      // Narrow on purpose. It fires only when the row's own `exitErrorReason`
-      // names a 5xx/429/408 or a `fetch` failure — i.e. the LAST thing that
-      // happened to this row was a transport fault. A row whose counter was
-      // filled by genuine refusals carries the broker's refusal text instead and
-      // keeps its breaker: healing that one would spray a broker that has
-      // already said no three times. `exitErrorReason` is left in place either
-      // way, so the operator still sees what happened.
+      // Narrow on purpose, and narrow on TWO independent terms.
+      //
+      // (1) `closeRejectRefusalsOnly` must be ABSENT. That flag is stamped by
+      // this build's rejection branch on every increment, so its absence is the
+      // only sound way to say "this counter was accrued by a build that could
+      // still inflate it with a 5xx" — i.e. this is a LEGACY counter, which is
+      // the entire population this heal exists for. A post-fix counter can only
+      // hold real broker refusals and must never be cleared here.
+      //
+      // (2) the row's own `exitErrorReason` must name a 5xx/429/408 or a `fetch`
+      // failure. `exitErrorReason` is left in place either way, so the operator
+      // still sees what happened.
+      //
+      // Term (2) alone is NOT sufficient, and shipping it alone was a defect in
+      // the first cut of this heal. `exitErrorReason` records the LAST thing
+      // that happened to the row, not what filled the counter: a row carrying
+      // two GENUINE refusals whose next attempt hit a 500 wears transport text
+      // over a refusal-built counter (the transport branch of
+      // `clearPendingExit` prefixes the broker's own `reason`, so the 500
+      // substring is right there), and a text-only heal would delete those two
+      // refusals and hand a broker that has already said no twice a fresh
+      // three-attempt budget. A breaker's THRESHOLD and its ACCRUAL are two
+      // different populations, and a heal scoped to the trip can still eat the
+      // accrual. Term (1) is what closes that, because it is a fact about which
+      // BUILD wrote the counter rather than about any string.
+      //
+      // Measured against the live population this was written for: all three
+      // open real-money rows on 2026-09-01 carry `closeRejectCount: 3` with no
+      // `closeRejectRefusalsOnly` and no `exitTransportFailCount` (the fields
+      // did not exist when they latched), so term (1) admits all three and this
+      // narrowing is a no-op on them.
       if (
         (o.closeRejectCount ?? 0) > 0
+        && o.closeRejectRefusalsOnly !== true
         && typeof o.exitErrorReason === 'string'
         && TRANSPORT_STRANDED_REASON_RE.test(o.exitErrorReason)
       ) {

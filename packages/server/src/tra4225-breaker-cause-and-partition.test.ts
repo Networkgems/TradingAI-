@@ -282,8 +282,18 @@ describe('TRA-4225 AC1 — a breaker trip records WHEN and WHY', () => {
   it('the TRA-4218 transport heal takes the trip record with the counter', () => {
     const { acct, sym, id } = openCall();
     tripCloseRejectBreaker(acct, sym, id, LIVE_500_REASON);
+    const snap = acct.exportSnapshot();
+    // TRA-4218 — `tripCloseRejectBreaker` drives the CURRENT rejection branch to
+    // stand in for the pre-fix build, and that branch now stamps
+    // `closeRejectRefusalsOnly`. The heal reads its absence as "legacy counter",
+    // which is the whole population it exists for; the 08-31 rows latched before
+    // the field existed. Strip it so this row is the legacy row it represents.
+    // Everything else on the row, including the reason string, still comes from
+    // the producer.
+    expect(snap.openOptions[0]!.closeRejectRefusalsOnly).toBe(true);
+    delete snap.openOptions[0]!.closeRejectRefusalsOnly;
     const restored = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
-    restored.importSnapshot(acct.exportSnapshot());
+    restored.importSnapshot(snap);
     const r = row(restored);
     expect(r.closeRejectCount).toBeUndefined();
     expect(r.exitBreakerTrip).toBeUndefined();

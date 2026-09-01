@@ -339,6 +339,15 @@ describe('TRA-4218 — the latch survives a restart, so the fix has to reach the
     // Now the restart, on that string and no other.
     const snap = acct.exportSnapshot();
     expect(snap.openOptions[0]!.exitErrorReason).toBe(written);
+    // The one thing this build wrote that the PRE-FIX build could not: the
+    // rejection branch now stamps `closeRejectRefusalsOnly` on every increment,
+    // and the heal reads its ABSENCE as "legacy counter". The bqb1 rows latched
+    // before that field existed, so drop it to make this row the legacy row it
+    // is standing in for. Deliberately the ONLY thing edited by hand here — the
+    // point of this case is that the STRING comes from the producer, and it
+    // still does.
+    expect(snap.openOptions[0]!.closeRejectRefusalsOnly).toBe(true);
+    delete snap.openOptions[0]!.closeRejectRefusalsOnly;
     const bootAt = Date.now();
     const restarted = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     restarted.importSnapshot(snap);
@@ -464,6 +473,105 @@ describe('TRA-4218 — the latch survives a restart, so the fix has to reach the
     const restarted = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     restarted.importSnapshot(snap);
 
+    expect(row(restarted).closeRejectCount).toBe(MAX_CONSECUTIVE_CLOSE_REJECTS);
+    expect(row(restarted).exitTransportFailCount).toBeUndefined();
+  });
+
+  /**
+   * The case the first cut of this heal got wrong, raised on the 2026-09-01
+   * 15:33Z beat against my own commit and closed here.
+   *
+   * The heal's narrowing was a claim about `exitErrorReason`, and that string
+   * records the LAST thing that happened to the row — not what filled the
+   * counter. A row can hold GENUINE refusals and still wear transport text: the
+   * transport branch of `clearPendingExit` prefixes the broker's own `reason`,
+   * so `Tradier order failed (500)` sits in the RETRYING notice, and
+   * `TRANSPORT_STRANDED_REASON_RE` is a substring search.
+   *
+   * That row never trips the breaker (2 < 3, so the engine is still submitting)
+   * and so it never appears in any `close_reject_breaker` census — the defect is
+   * invisible right up until the next recycle silently hands a broker that has
+   * already refused twice a fresh three-attempt budget. A breaker's THRESHOLD
+   * and its ACCRUAL are two different populations, and a heal scoped to the trip
+   * can still eat the accrual.
+   *
+   * The fix is `closeRejectRefusalsOnly`, stamped by the rejection branch on
+   * every increment: absence means "a build that could inflate this counter with
+   * a 5xx wrote it", which is what LEGACY means, and it is the only fact on the
+   * row that no pre-fix build could have forged.
+   */
+  it('does NOT eat a PARTIAL accrual of genuine refusals whose latest failure was transport', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live', undefined, 200);
+    expect(pos).not.toBeNull();
+    const sym = pos!.optionSymbol!;
+    const id = pos!.id;
+
+    // Two REAL refusals — the broker looked at the contract and said no. Below
+    // the threshold, so nothing is latched and the engine is still trying.
+    for (let i = 0; i < 2; i += 1) {
+      vi.setSystemTime(Date.now() + 60_000);
+      expect(acct.checkExits(new Map(), new Map([[sym, 0.7]]), undefined, { waitAndHold: true }))
+        .toHaveLength(1);
+      expect(acct.clearPendingExit(id, 'Tradier order rejected: no bid')).toBe(true);
+    }
+    expect(row(acct).closeRejectCount).toBe(2);
+
+    // Then one transport fault, classified correctly by the post-fix caller. It
+    // must not touch the rejection counter — and it rewrites `exitErrorReason`
+    // to the RETRYING notice, which carries the 500 text as a prefix.
+    vi.setSystemTime(Date.now() + 60_000);
+    expect(acct.checkExits(new Map(), new Map([[sym, 0.7]]), undefined, { waitAndHold: true }))
+      .toHaveLength(1);
+    expect(acct.clearPendingExit(id, LIVE_500_REASON, { transport: true })).toBe(true);
+
+    const tripped = row(acct);
+    expect(tripped.closeRejectCount).toBe(2);
+    // The trap, asserted rather than assumed: the row's reason DOES satisfy the
+    // heal's text predicate. If this ever goes false the case below stops
+    // testing anything.
+    expect(tripped.exitErrorReason ?? '').toContain('Tradier order failed (500)');
+
+    const snap = acct.exportSnapshot();
+    const restarted = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    restarted.importSnapshot(snap);
+
+    // Both real refusals survive the boot. Remove `closeRejectRefusalsOnly`
+    // from the heal's guard and this is 2 -> undefined: a broker that has said
+    // no twice gets three more attempts, with nothing published to say so.
+    expect(row(restarted).closeRejectCount).toBe(2);
+    // …and the transport ladder is untouched by the boot either way, so the row
+    // is still backing off rather than latched.
+    expect(row(restarted).exitTransportFailCount).toBe(1);
+  });
+
+  it('a post-fix TRIPPED refusal breaker is not healed even if its last failure was transport', () => {
+    // The threshold sibling of the case above: three genuine refusals latch the
+    // breaker, and a transport fault on the next cadence re-writes the reason.
+    // `exitErrorReason` alone would say "heal me"; the provenance stamp says no.
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live', undefined, 200);
+    expect(pos).not.toBeNull();
+    const id = pos!.id;
+    const sym = pos!.optionSymbol!;
+
+    for (let i = 0; i < MAX_CONSECUTIVE_CLOSE_REJECTS; i += 1) {
+      vi.setSystemTime(Date.now() + 60_000);
+      expect(acct.checkExits(new Map(), new Map([[sym, 0.7]]), undefined, { waitAndHold: true }))
+        .toHaveLength(1);
+      expect(acct.clearPendingExit(id, 'Tradier order rejected: no bid')).toBe(true);
+    }
+    expect(row(acct).closeRejectCount).toBe(MAX_CONSECUTIVE_CLOSE_REJECTS);
+
+    // A hand re-stage is the only in-app path that reaches a latched engine row;
+    // it clears the counter, so drive the transport text on directly instead —
+    // this is the row as an operator's failed manual attempt would leave it.
+    const latched = row(acct);
+    latched.exitErrorReason = `${LIVE_500_REASON} — broker did not respond`;
+
+    const snap = acct.exportSnapshot();
+    const restarted = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    restarted.importSnapshot(snap);
     expect(row(restarted).closeRejectCount).toBe(MAX_CONSECUTIVE_CLOSE_REJECTS);
     expect(row(restarted).exitTransportFailCount).toBeUndefined();
   });
