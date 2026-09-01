@@ -412,11 +412,12 @@ import {
   claimPermissionBlockAlert,
   classifyBrokerRejectText,
   getBrokerPermissionBlock,
+  recordBrokerCloseEvent,
   recordBrokerFill,
   recordBrokerReject,
   recordBrokerSubmit,
 } from './broker-submit-census.js';
-import type { BrokerRejectClass } from './broker-submit-census.js';
+import type { BrokerCloseEvent, BrokerRejectClass } from './broker-submit-census.js';
 import { isLiveEntryGatePassed } from './capital-gate-manifest.js';
 import { isSma200DemoForwardTestEnabled } from './sma200-forward-test-flag.js';
 import { resolveDemoFlagEnv } from './demo-flags.js';
@@ -9127,6 +9128,11 @@ export class SignalEngine {
           if (status === 'filled') {
             const hasAvg = typeof detail.avg_fill_price === 'number' && detail.avg_fill_price > 0;
             const fill = hasAvg ? (detail.avg_fill_price as number) : pendingExit.limitPrice;
+            // TRA-4223 — the ASYNC half of the close leg. An order submitted on
+            // an earlier tick is counted `submitted` there and terminates here;
+            // without this the census would see every slow fill as a submit that
+            // never filled and grade a healthy book `degraded`.
+            this.recordCloseCensus('filled');
             acct.finalizePendingExit(opt.id, fill);
             // TRA-1929 — record the real close fill (async fill on a later tick).
             this.recordLiveOptionCloseToLedger(
@@ -9147,6 +9153,10 @@ export class SignalEngine {
           } else if (TRADIER_REJECTED_STATUSES.has(status)) {
             const reasonSuffix = detail.reason_description ? `: ${detail.reason_description}` : '';
             const reason = `Tradier sell_to_close ${status}${reasonSuffix}`;
+            // TRA-4223 — the async half of the reject/expiry outcome, stamped
+            // ahead of the TRA-2799 self-heal for the same reason the submit
+            // site does: the broker refused a real order either way.
+            this.recordCloseCensus(status === 'expired' ? 'expired' : 'rejected');
             // TRA-2799 — a "not closing a long position" refusal can mean the
             // broker is flat, in which case retrying forever is pointless and
             // the row must be closed locally instead of left open.
@@ -10210,6 +10220,9 @@ export class SignalEngine {
       // TRA-4218 — same classification as the primary submit site. This branch
       // is strictly worse to mis-count: the capped order is already cancelled,
       // so a latch here leaves the row with no working exit AND no retry.
+      // TRA-4223 — and the census leg, for the same reason: this is the ONE
+      // close branch that ends with the row holding no working exit at all.
+      this.recordCloseCensus(this.closeThrowEvent(err));
       this.optionsAccount.clearPendingExit(
         snapshot.id,
         reason,
@@ -10218,6 +10231,12 @@ export class SignalEngine {
       log.warn(reason, base);
       return { kind: 'aborted' };
     }
+    // TRA-4223 — the escalation is a SECOND order handed to Tradier, so it is a
+    // second `submitted`. The census counts ORDERS the broker saw, not exit
+    // intents: the capped order was cancelled by US (never a broker reject, so
+    // never counted as one) and this replacement is what the outcome branches in
+    // `submitStagedOptionExits` will grade.
+    this.recordCloseCensus('submitted');
     this.optionsAccount.attachPendingExit(snapshot.id, next.id, escalateTo);
     log.info('capped exit ESCALATED — book would not meet the cap, conceding to the un-capped price', {
       ...base,
@@ -10238,6 +10257,37 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-4223 — THE CLOSE-LEG CENSUS SEAM. One line, so every exit path can
+   * afford to carry it and none has an excuse to be the blind one.
+   *
+   * Keyed on the SAME `alertUsername` / ET day the entry seam
+   * (`mirrorLiveOptionOpen`) uses, so the two legs land on one census row and a
+   * reader never has to join them by hand. `UNATTRIBUTED_BOOK` rather than a
+   * skip when the engine carries no username: an unattributed close failure must
+   * still be COUNTED (the entry leg makes the identical choice, and for the
+   * identical reason — an absent cell reads clean).
+   *
+   * ⚠️ Deliberately NOT gated on `mode === 'live'` or on which env bucket the
+   * account came from. Every caller below is already inside a live Tradier
+   * client path, and a gate here would be a second, quieter place for the seam
+   * to go dark — which is the whole shape of the defect this fixes.
+   */
+  private recordCloseCensus(event: BrokerCloseEvent): void {
+    recordBrokerCloseEvent(this.alertUsername ?? UNATTRIBUTED_BOOK, etDateString(new Date()), event);
+  }
+
+  /**
+   * TRA-4223 — classify a close submit that THREW. `transport_fault` is the
+   * broker's own infrastructure (5xx / timeout — retry when it is back);
+   * `submit_throw` is ours (network / auth / parse — investigate the client).
+   * Off the thrown error's `kind` via `isTransportOrderFailure`, never the
+   * message text, so it agrees with the counter `clearPendingExit` bumps.
+   */
+  private closeThrowEvent(err: unknown): BrokerCloseEvent {
+    return isTransportOrderFailure(err) ? 'transport_fault' : 'submit_throw';
+  }
+
+  /**
    * TRA-354 — submit Tradier `sell_to_close` LIMIT orders for every exit
    * intent that `checkExits({ waitAndHold: true })` just staged. The
    * staged `OptionPosition` snapshots carry `pendingExit.qty` and the
@@ -10246,6 +10296,12 @@ export class SignalEngine {
    * reject is reflected on this tick instead of the next one. On submit
    * failure the position keeps `pendingExit` cleared and surfaces the
    * reason so the dashboard can render it.
+   *
+   * TRA-4223 — and every one of those outcomes is now stamped on the broker
+   * census's CLOSE leg via {@link recordCloseCensus}. This is the path that was
+   * structurally invisible on 2026-08-31: three staged exits on real money, all
+   * three threw on a Tradier 500, and the book's census cell read
+   * `verdict:"idle"` — indistinguishable from a book that did nothing.
    */
   private async submitStagedOptionExits(staged: import('@trading-app/shared').OptionPosition[]): Promise<void> {
     if (!this.tradierLiveClient) return;
@@ -10342,10 +10398,20 @@ export class SignalEngine {
         // The classification comes off the thrown error's `kind`, not the
         // message text.
         const transport = isTransportOrderFailure(err);
+        // TRA-4223 — the count that did not exist. NOT `submitted`: nothing
+        // reached a broker decision, and `submitted` means "the broker saw it
+        // and did not fill it". A third outcome, per the ticket.
+        this.recordCloseCensus(this.closeThrowEvent(err));
         acct.clearPendingExit(snapshot.id, reason, transport ? { transport: true } : {});
         log.warn(reason, { optionSymbol: snapshot.optionSymbol, transport });
         continue;
       }
+      // TRA-4223 — the broker accepted it and handed back an id. THIS is the
+      // close-leg `submitted`, stamped after the call rather than before it for
+      // exactly the reason the entry leg stamps `recordBrokerSubmit` after its
+      // own guards: a count that includes attempts the broker never saw stops
+      // meaning anything.
+      this.recordCloseCensus('submitted');
 
       // Stamp the order id AND the price we actually submitted at, so a fill
       // that comes back without an `avg_fill_price` books P&L at the live
@@ -10386,6 +10452,7 @@ export class SignalEngine {
         if (detail.status === 'filled') {
           const hasAvg = typeof detail.avg_fill_price === 'number' && detail.avg_fill_price > 0;
           const fill = hasAvg ? (detail.avg_fill_price as number) : submitLimit;
+          this.recordCloseCensus('filled'); // TRA-4223
           acct.finalizePendingExit(snapshot.id, fill);
           // TRA-1929 — record the real close fill (market exits carry no submit limit/quote).
           this.recordLiveOptionCloseToLedger(
@@ -10399,6 +10466,11 @@ export class SignalEngine {
         } else if (TRADIER_REJECTED_STATUSES.has(detail.status)) {
           const reasonSuffix = detail.reason_description ? `: ${detail.reason_description}` : '';
           const reason = `Tradier sell_to_close ${detail.status}${reasonSuffix}`;
+          // TRA-4223 — stamped BEFORE the TRA-2799 self-heal below. That branch
+          // resolves the row locally and `continue`s, but the broker still
+          // refused a real order, and a census that only counts the refusals we
+          // failed to recover from under-reports the exact thing it measures.
+          this.recordCloseCensus(detail.status === 'expired' ? 'expired' : 'rejected');
           // TRA-2799 — see `reconcileFlatBrokerRejection`: when the refusal is
           // "not closing a long position" AND /positions confirms the broker is
           // flat, the row is stranded and closing it locally is the only exit.
@@ -18564,6 +18636,12 @@ export class SignalEngine {
       resp = await client.sellContractsLimit(optionSymbol, intent.qty, intent.limitPrice, intent.duration ?? 'day');
     } catch (err: unknown) {
       const reason = `Tradier sell_to_close submit threw: ${err instanceof Error ? err.message : String(err)}`;
+      // TRA-4223 — the OPERATOR's close attempt is broker close activity on this
+      // book too, and it is the path an operator takes to rescue a row the
+      // engine's exits could not place. On 2026-08-31 both failed on the same
+      // Tradier 500; a census that saw only the engine's attempts would have
+      // under-counted the incident it exists to make visible.
+      this.recordCloseCensus(this.closeThrowEvent(err));
       // TRA-2799 — Tradier surfaces the flat-account refusal on the submit call
       // itself (HTTP 400) as often as it does on a terminal order status, so the
       // throw branch needs the same self-heal as the rejected branch below.
@@ -18580,6 +18658,7 @@ export class SignalEngine {
       return { status: 'rejected', reason };
     }
 
+    this.recordCloseCensus('submitted'); // TRA-4223
     acct.attachPendingExit(optionId, resp.id);
     log.info('manual sell_to_close', {
       optionSymbol,
@@ -18597,6 +18676,7 @@ export class SignalEngine {
         if (detail.status === 'filled') {
           const hasAvg = typeof detail.avg_fill_price === 'number' && detail.avg_fill_price > 0;
           const fill = hasAvg ? (detail.avg_fill_price as number) : intent.limitPrice;
+          this.recordCloseCensus('filled'); // TRA-4223
           acct.finalizePendingExit(optionId, fill);
           // TRA-1929 — record the real manual close fill.
           this.recordLiveOptionCloseToLedger(
@@ -18616,6 +18696,7 @@ export class SignalEngine {
         if (TRADIER_REJECTED_STATUSES.has(detail.status)) {
           const reasonSuffix = detail.reason_description ? `: ${detail.reason_description}` : '';
           const reason = `Tradier sell_to_close ${detail.status}${reasonSuffix}`;
+          this.recordCloseCensus(detail.status === 'expired' ? 'expired' : 'rejected'); // TRA-4223
           // TRA-2799 — the user clicked Close on a row the broker no longer
           // holds. Returning `rejected` here is what left the position
           // unclosable: the Close button was the documented remedy for a

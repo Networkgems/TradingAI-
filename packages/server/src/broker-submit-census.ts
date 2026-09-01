@@ -64,6 +64,40 @@ import { join } from 'node:path';
  * correct behaviour (an approval can land between sessions). The census fold it
  * shares is retained {@link RETAIN_DAYS} ET days so the evidence outlives the
  * bounded `voids.recent[]` witness that could not hold it.
+ *
+ * ## TRA-4223 — the census had ONE leg. Closes are the other one.
+ *
+ * Everything above describes the ENTRY leg, and until this ticket that was the
+ * whole module: {@link recordBrokerSubmit} / {@link recordBrokerReject} had
+ * exactly two call sites, both inside `mirrorLiveOptionOpen`. The close path
+ * was never observed at all.
+ *
+ * Measured on real money 2026-08-31: the production `admin` book (Tradier
+ * ***0154) staged exits on 3 live rows, all 3 submits threw on a Tradier HTTP
+ * 500, and all 3 tripped the TRA-450 close-reject breaker — leaving three
+ * unprotected real-money rows with breached stops. The census cell for that
+ * book read `observed:false, submitted:0, brokerRejects:0, verdict:"idle"`. It
+ * was not miscounting; it was structurally blind. **A book that attempted three
+ * exits and failed all three was byte-identical to a book that did nothing** —
+ * the same silent-clean shape the entry leg was built to kill, one seam over.
+ *
+ * The close leg is counted in its OWN fields ({@link BookDayCell.closeSubmitted}
+ * and friends), never folded into `submitted`/`filled`. Two reasons, both
+ * load-bearing:
+ *
+ *   • `submitted` vs `filled` is the TRA-3905 discriminator for *account
+ *     permission*, and it means "the broker saw an OPEN and did not fill it".
+ *     Adding closes to that numerator would silently redefine the one pair this
+ *     module exists to publish.
+ *   • The two legs fail for different reasons and take different operator
+ *     actions. An entry that never submits costs an opportunity; a close that
+ *     never submits leaves live capital unprotected. A reader has to be able to
+ *     tell them apart on the row, without arithmetic.
+ *
+ * `verdict` therefore grades BOTH legs and reports the worse of the two (see
+ * {@link BrokerSubmitCensusRow.verdict}) — a book whose entries all filled must
+ * not read `green` while its exits are all failing, and a book with no entries
+ * and N failed exits must not read `idle`. That last sentence is the ticket.
  */
 
 /**
@@ -165,6 +199,43 @@ const RETAIN_DAYS = 30;
  */
 export const UNATTRIBUTED_BOOK = '(unattributed)';
 
+/**
+ * TRA-4223 — what happened to one staged CLOSE.
+ *
+ * Its own taxonomy, deliberately NOT {@link BrokerRejectClass}. That enum is
+ * the entry leg's, it is wired to the permission breaker, and its members
+ * (`walk_exhausted`, `spread_veto`, `permission_blocked`) describe refusals only
+ * the open path can produce. Reusing it would have forced a close outcome into
+ * a bucket whose name lies, and would have coupled two circuits the ticket
+ * explicitly says must stay independent.
+ *
+ * The split that matters here is **did the order reach Tradier**:
+ *
+ *   • `submitted` — the broker accepted it and handed back an order id. This is
+ *     the close-leg analogue of `submitted` on the entry leg, and it carries the
+ *     same meaning: from here on, any failure is the broker's verdict.
+ *   • `transport_fault` / `submit_throw` — the submit THREW. Nothing reached a
+ *     broker decision, so neither may be counted as `submitted`; the entry
+ *     seam's docblock (`signal-engine.ts`) is explicit that `submitted` means
+ *     "the broker saw it and did not fill it", and a throw did not clear that
+ *     bar. They are split from each other on the TRA-4226 line: a Tradier 5xx /
+ *     timeout is the BROKER'S infrastructure failing (`transport_fault`, retry
+ *     when it is back) while anything else is OURS (`submit_throw`, investigate
+ *     the client). Callers classify with `isTransportOrderFailure(err)` and must
+ *     NOT string-match the message.
+ *   • `filled` / `rejected` / `expired` — terminal outcomes of an order that DID
+ *     reach the broker. `expired` is separate for the same reason TRA-2984 gave
+ *     it its own counter on the position: the order reached the broker and
+ *     lapsed unfilled, which is not the broker refusing anything.
+ */
+export type BrokerCloseEvent =
+  | 'submitted'
+  | 'filled'
+  | 'rejected'
+  | 'expired'
+  | 'transport_fault'
+  | 'submit_throw';
+
 interface BookDayCell {
   /** Orders handed to the broker. Never incremented by a pre-submit abort. */
   submitted: number;
@@ -185,6 +256,19 @@ interface BookDayCell {
   refusedByBreaker: number;
   /** Has the trip already alerted? Keeps a 4.5-hour scan loop to one page. */
   alerted: boolean;
+  // ── TRA-4223: the CLOSE leg. Never folded into the four fields above. ──
+  /** `sell_to_close` orders Tradier ACCEPTED (an order id came back). */
+  closeSubmitted: number;
+  /** …of those, the ones that filled. */
+  closeFilled: number;
+  /** …of those, the ones the broker refused / cancelled / errored. */
+  closeRejected: number;
+  /** …of those, the ones that reached the broker and lapsed unfilled. */
+  closeExpired: number;
+  /** Close submits that threw on a BROKER infrastructure fault (5xx/timeout). */
+  closeTransportFaults: number;
+  /** Close submits that threw for a non-broker reason (network/auth/parse). */
+  closeSubmitThrows: number;
 }
 
 /** etDay -> book -> cell. */
@@ -210,6 +294,12 @@ function emptyCell(): BookDayCell {
     blockedReason: null,
     refusedByBreaker: 0,
     alerted: false,
+    closeSubmitted: 0,
+    closeFilled: 0,
+    closeRejected: 0,
+    closeExpired: 0,
+    closeTransportFaults: 0,
+    closeSubmitThrows: 0,
   };
 }
 
@@ -324,6 +414,48 @@ export function recordBrokerFill(book: string, etDay: string): void {
   persistCensusDayIfArmed(etDay);
 }
 
+/**
+ * TRA-4223 — one event on the CLOSE leg. See {@link BrokerCloseEvent}.
+ *
+ * ⛔ This function deliberately touches NEITHER `consecutivePermission`,
+ * `blockedSince` NOR `refusedByBreaker`. The TRA-3905 permission breaker and the
+ * TRA-450 `close_reject_breaker` are two independent circuits with two different
+ * latches and two different remedies, and `submissionsRefusedByBreaker` is the
+ * published count of the FORMER. Fusing them — the remedy the filing originally
+ * proposed — would have made a broker outage on the exit path read as an account
+ * permission halt, damaging TRA-3905's instrument to fix TRA-4223's. There is a
+ * regression test pinned on exactly this (`tra4223-close-census.test.ts`).
+ *
+ * It also does not reset the permission run on a close FILL. A close filling is
+ * not proof the account may OPEN options — the 2026-08-20 restricted book could
+ * still have sold anything it held — and `recordBrokerFill`'s reset exists for
+ * that proof specifically.
+ */
+export function recordBrokerCloseEvent(book: string, etDay: string, event: BrokerCloseEvent): void {
+  const cell = cellFor(etDay, book);
+  switch (event) {
+    case 'submitted':
+      cell.closeSubmitted += 1;
+      break;
+    case 'filled':
+      cell.closeFilled += 1;
+      break;
+    case 'rejected':
+      cell.closeRejected += 1;
+      break;
+    case 'expired':
+      cell.closeExpired += 1;
+      break;
+    case 'transport_fault':
+      cell.closeTransportFaults += 1;
+      break;
+    case 'submit_throw':
+      cell.closeSubmitThrows += 1;
+      break;
+  }
+  persistCensusDayIfArmed(etDay);
+}
+
 export interface BrokerRejectOutcome {
   /** The breaker tripped on THIS reject (false when already tripped). */
   tripped: boolean;
@@ -431,6 +563,34 @@ export interface BrokerSubmitCensusRow {
   brokerPermissionBlockedSince: number | null;
   brokerPermissionBlockedReason: string | null;
   submissionsRefusedByBreaker: number;
+  // ── TRA-4223: the CLOSE leg, counts only (TRA-2163) ───────────────────────
+  /** `sell_to_close` orders Tradier ACCEPTED. Throws are NOT in here. */
+  closeSubmitted: number;
+  closeFilled: number;
+  closeRejected: number;
+  closeExpired: number;
+  /**
+   * Close submits that threw on the BROKER's own infrastructure (5xx/timeout).
+   * The 2026-08-31 admin shape is `closeTransportFaults: 3` with everything else
+   * on the leg at 0 — three staged exits, none of which reached a decision.
+   */
+  closeTransportFaults: number;
+  /** Close submits that threw for a non-broker reason (network/auth/parse). */
+  closeSubmitThrows: number;
+  /**
+   * Every close order this book TRIED to place: reached + threw. This is the
+   * denominator that makes `idle` mean "did nothing" again — it is non-zero for
+   * a book whose only broker activity was N failed exits.
+   */
+  closeAttempts: number;
+  /**
+   * The two legs graded separately, so a reader can see WHICH one is broken
+   * rather than inferring it from the counts. Same scale as {@link verdict};
+   * `red` never appears here — the permission breaker is an entry-side circuit
+   * and is reported on {@link verdict} alone.
+   */
+  entryVerdict: BrokerSubmitVerdict;
+  closeVerdict: BrokerSubmitVerdict;
   /**
    * The one-glance read, so the negative control does not depend on a reader
    * doing the arithmetic:
@@ -438,6 +598,21 @@ export interface BrokerSubmitCensusRow {
    *   • `degraded` — the broker saw orders and filled none, all transient.
    *   • `idle`     — nothing submitted. Says nothing about health either way.
    *   • `green`    — at least one fill and no permission reject.
+   *
+   * TRA-4223 — this is now the WORSE of {@link entryVerdict} and
+   * {@link closeVerdict} (`red` > `degraded` > `green` > `idle`), because both
+   * of the single-leg readings are false in the field:
+   *   • entries-only made a book that failed 3 exits and opened nothing read
+   *     `idle`, which is the defect this ticket was filed for;
+   *   • grading the union of the two legs' counters would let 2 filled entries
+   *     mask 3 failed exits, which is the same defect wearing a `green` label.
+   *
+   * ⚠️ A non-zero {@link closeTransportFaults} does NOT by itself force
+   * `degraded` — a day that lost one close to a 5xx and then filled it on the
+   * retry genuinely is green, and `degraded` is defined as "filled none". The
+   * fault count is published on the row and rolled up fleet-wide instead
+   * (TRA-4226's shape), so an outage is readable without overloading a verdict
+   * that other gates already key on.
    */
   verdict: BrokerSubmitVerdict;
 }
@@ -465,6 +640,22 @@ export interface BrokerSubmitCensusReport {
     permissionBlockedBookCount: number;
     redBookCount: number;
     degradedBookCount: number;
+    // ── TRA-4223: the close leg, fleet-wide ───────────────────────────────
+    /** Every close order the fleet tried to place today, reached or not. */
+    closeAttempts: number;
+    closeFilled: number;
+    closeRejected: number;
+    /**
+     * Close submits that never reached a broker decision because Tradier's own
+     * infrastructure failed. Fleet-level for the same reason `transportRejects`
+     * is: "is the broker down, or is one book broken?" is not answerable from
+     * one row, and on 2026-08-31 the identical `(500)` hit both books at once.
+     */
+    closeTransportFaults: number;
+    /** Books with ≥1 close submit that threw on a broker fault. */
+    closeTransportBookCount: number;
+    /** Books that tried to close and filled none. The unprotected-capital count. */
+    closeDegradedBookCount: number;
   };
   /** ET days currently held, oldest first — the retention window, measured. */
   retainedEtDays: string[];
@@ -483,6 +674,23 @@ function zeroRejects(): Record<BrokerRejectClass, number> {
   return out;
 }
 
+/**
+ * TRA-4223 — grade one leg. `attempts` is every order the leg TRIED to place
+ * (reached the broker or not); `fills` is what came back filled.
+ */
+function gradeLeg(attempts: number, fills: number): BrokerSubmitVerdict {
+  if (attempts === 0) return 'idle';
+  return fills === 0 ? 'degraded' : 'green';
+}
+
+/** Worse-of, on `red > degraded > green > idle`. See {@link BrokerSubmitCensusRow.verdict}. */
+const VERDICT_SEVERITY: Record<BrokerSubmitVerdict, number> = {
+  idle: 0,
+  green: 1,
+  degraded: 2,
+  red: 3,
+};
+
 function gradeRow(book: string, etDay: string, cell: BookDayCell | undefined): BrokerSubmitCensusRow {
   const rejects = zeroRejects();
   if (cell) for (const [c, n] of cell.rejects) rejects[c] = n;
@@ -490,14 +698,19 @@ function gradeRow(book: string, etDay: string, cell: BookDayCell | undefined): B
   const blocked = (cell?.blockedSince ?? null) !== null;
   const submitted = cell?.submitted ?? 0;
   const filled = cell?.filled ?? 0;
-  const verdict: BrokerSubmitVerdict =
-    blocked || permissionRejects > 0
-      ? 'red'
-      : submitted === 0
-        ? 'idle'
-        : filled === 0
-          ? 'degraded'
-          : 'green';
+  const closeSubmitted = cell?.closeSubmitted ?? 0;
+  const closeTransportFaults = cell?.closeTransportFaults ?? 0;
+  const closeSubmitThrows = cell?.closeSubmitThrows ?? 0;
+  const closeFilled = cell?.closeFilled ?? 0;
+  // TRA-4223 — the throws are IN the denominator on purpose: a submit that never
+  // reached Tradier is still an exit this book tried and failed to place, and
+  // leaving it out is precisely what let three failed closes read `idle`.
+  const closeAttempts = closeSubmitted + closeTransportFaults + closeSubmitThrows;
+  const entryVerdict = gradeLeg(submitted, filled);
+  const closeVerdict = gradeLeg(closeAttempts, closeFilled);
+  const worseLeg =
+    VERDICT_SEVERITY[closeVerdict] > VERDICT_SEVERITY[entryVerdict] ? closeVerdict : entryVerdict;
+  const verdict: BrokerSubmitVerdict = blocked || permissionRejects > 0 ? 'red' : worseLeg;
   return {
     book,
     etDay,
@@ -513,6 +726,15 @@ function gradeRow(book: string, etDay: string, cell: BookDayCell | undefined): B
     brokerPermissionBlockedSince: cell?.blockedSince ?? null,
     brokerPermissionBlockedReason: cell?.blockedReason ?? null,
     submissionsRefusedByBreaker: cell?.refusedByBreaker ?? 0,
+    closeSubmitted,
+    closeFilled,
+    closeRejected: cell?.closeRejected ?? 0,
+    closeExpired: cell?.closeExpired ?? 0,
+    closeTransportFaults,
+    closeSubmitThrows,
+    closeAttempts,
+    entryVerdict,
+    closeVerdict,
     verdict,
   };
 }
@@ -548,6 +770,12 @@ export function summarizeBrokerSubmitCensus(
       permissionBlockedBookCount: rows.filter(r => r.brokerPermissionBlocked).length,
       redBookCount: rows.filter(r => r.verdict === 'red').length,
       degradedBookCount: rows.filter(r => r.verdict === 'degraded').length,
+      closeAttempts: rows.reduce((a, r) => a + r.closeAttempts, 0),
+      closeFilled: rows.reduce((a, r) => a + r.closeFilled, 0),
+      closeRejected: rows.reduce((a, r) => a + r.closeRejected, 0),
+      closeTransportFaults: rows.reduce((a, r) => a + r.closeTransportFaults, 0),
+      closeTransportBookCount: rows.filter(r => r.closeTransportFaults > 0).length,
+      closeDegradedBookCount: rows.filter(r => r.closeVerdict === 'degraded').length,
     },
     retainedEtDays: [...store.keys()].sort(),
     fromSnapshot: hydratedDays.has(etDay),
@@ -628,6 +856,16 @@ function deserializeDay(raw: Record<string, unknown>): Map<string, BookDayCell> 
       blockedReason: cell['blockedReason'] != null ? String(cell['blockedReason']) : null,
       refusedByBreaker: Number(cell['refusedByBreaker'] ?? 0),
       alerted: Boolean(cell['alerted']),
+      // TRA-4223 — `?? 0` is the migration: a snapshot written before this
+      // ticket carries no close leg at all, and reading it back must yield a
+      // zeroed leg rather than `NaN`, which would poison every sum downstream
+      // and render as `null` through JSON.
+      closeSubmitted: Number(cell['closeSubmitted'] ?? 0),
+      closeFilled: Number(cell['closeFilled'] ?? 0),
+      closeRejected: Number(cell['closeRejected'] ?? 0),
+      closeExpired: Number(cell['closeExpired'] ?? 0),
+      closeTransportFaults: Number(cell['closeTransportFaults'] ?? 0),
+      closeSubmitThrows: Number(cell['closeSubmitThrows'] ?? 0),
     });
   }
   return day;

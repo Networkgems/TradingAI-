@@ -243,6 +243,10 @@ export interface LiveArmCensusReport {
      */
     brokerTransportBookCount: number | null;
     brokerTransportRejectCount: number | null;
+    // TRA-4223 — the close leg. `null` when the broker-outcome join did not run.
+    brokerCloseAttemptCount: number | null;
+    brokerCloseDegradedBookCount: number | null;
+    brokerCloseTransportFaultCount: number | null;
   };
   /**
    * TRA-3905 — the ET day the {@link LiveArmCensusRow.brokerOutcome} join was
@@ -360,6 +364,21 @@ export function summarizeLiveArmCensus(
         : null,
       brokerTransportRejectCount: brokerCensus
         ? rows.reduce((a, r) => a + (r.brokerOutcome?.rejects.transport ?? 0), 0)
+        : null,
+      // TRA-4223 — the CLOSE leg, same `null`-not-`0` rule. Before this the arm
+      // census could only ever say something about ENTRIES: a book that failed
+      // every exit it staged contributed 0 to every count above and rendered
+      // identically to a quiet one.
+      brokerCloseAttemptCount: brokerCensus
+        ? rows.reduce((a, r) => a + (r.brokerOutcome?.closeAttempts ?? 0), 0)
+        : null,
+      /** Books that tried to close and filled none — capital left unprotected. */
+      brokerCloseDegradedBookCount: brokerCensus
+        ? rows.filter(r => r.brokerOutcome?.closeVerdict === 'degraded').length
+        : null,
+      /** Close submits that never reached a broker decision (5xx / timeout). */
+      brokerCloseTransportFaultCount: brokerCensus
+        ? rows.reduce((a, r) => a + (r.brokerOutcome?.closeTransportFaults ?? 0), 0)
         : null,
     },
   };
