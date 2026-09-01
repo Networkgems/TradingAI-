@@ -300,6 +300,7 @@ import {
 import { isExternalIntelEnabled } from '../external-intel.js';
 import { getColdStartPrefetchStatus } from '../daily-prefetch-flag.js';
 import { getWatchdogStatus } from '../event-loop-watchdog.js';
+import { getHeapCensusStatus } from '../heap-census-sampler.js';
 import { isAnalystAgentEnabled, buildAnalystHealth } from '../analyst-agent.js';
 import {
   loadSourceQualityWeights,
@@ -7058,6 +7059,41 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       time: new Date(now()).toISOString(),
       build: resolveBuildInfo(),
       watchdog,
+    });
+  });
+
+  // TRA-4158 — WHICH container retains the RTH heap. `/api/health/watchdog`
+  // above reports the level (`heapUsedMB 1605 / 1812` at the 2026-08-27 trip);
+  // this reports the population, and the tape reports the population's SHAPE
+  // across the session, which is the only read that separates "big" from
+  // "growing and never released".
+  //
+  // Unauthenticated and secrets-free by the same rule as the watchdog probe:
+  // the payload is container NAMES and integer COUNTS. Per-user identity is
+  // deliberately NOT carried — 67 usernames on an open route is a tenant
+  // disclosure and buys the measurement nothing, so the fold reports `owners`
+  // and `maxEntries` instead (see `CensusSubject.klass`).
+  //
+  // `?deep=1` adds the O(entries) nested sum, which is what separates a
+  // `Map<string, Candle[]>` gaining KEYS (universe drift) from the same map's
+  // arrays getting longer (an append with no trim). It is off by default and
+  // must stay off on any RTH poll: the sampled path has to remain cheap enough
+  // to run on a live money-adjacent host mid-session.
+  app.get('/api/health/heap-census', (req, res) => {
+    const deep = req.query.deep === '1' || req.query.deep === 'true';
+    const mem = process.memoryUsage();
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      process: {
+        heapUsedMB: Math.round((mem.heapUsed / 1048576) * 10) / 10,
+        heapTotalMB: Math.round((mem.heapTotal / 1048576) * 10) / 10,
+        rssMB: Math.round((mem.rss / 1048576) * 10) / 10,
+        externalMB: Math.round((mem.external / 1048576) * 10) / 10,
+        arrayBuffersMB: Math.round((mem.arrayBuffers / 1048576) * 10) / 10,
+      },
+      census: getHeapCensusStatus({ deep }),
     });
   });
 

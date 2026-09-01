@@ -790,6 +790,8 @@ import { sendPasswordResetEmail, sendOtpEmail, sendWelcomeEmail } from './email.
 import { startEventLoopWatchdog, type WatchdogHandle } from './event-loop-watchdog.js';
 import { installStdioBlockMeter } from './stdio-block-meter.js';
 import { installGcPauseMeter } from './gc-pause-meter.js';
+import { startHeapCensusSampler, type HeapCensusSamplerHandle } from './heap-census-sampler.js';
+import type { CensusSubject } from './heap-retainer-census.js';
 import {
   logger,
   flushLogs,
@@ -18724,6 +18726,27 @@ installGcPauseMeter();
 // listener dead while worker timers live" state from inside the process.
 const eventLoopWatchdog: WatchdogHandle | null = startEventLoopWatchdog();
 
+// TRA-4158 — the watchdog above reports HOW MUCH heap is retained. Nothing
+// reported WHAT retains it, which is why `render.yaml`'s "RTH heap peaks at
+// ~475 MB" premise survived three sessions of being wrong by 3x (1605 MB /
+// 1812 MB at the 2026-08-27T13:26:17Z trip, and FLAT overnight afterwards).
+//
+// The census walks each per-user object's own container fields reflectively —
+// one `SignalEngine` + one `CryptoSignalEngine` + two `PnlTracker`s per user,
+// against 67 users, so every per-engine container carries a x67 multiplier and
+// a hand-written suspect list would only ever find a retainer someone already
+// suspected. Shallow (`.size`/`.length`, O(1) per field) on the sampled path;
+// the O(entries) deep sum is opt-in per request on `/api/health/heap-census`.
+const heapCensusSampler: HeapCensusSamplerHandle | null = startHeapCensusSampler({
+  subjects: () =>
+    getAllUserContexts().flatMap((ctx): CensusSubject[] => [
+      { klass: 'signalEngine', target: ctx.engine },
+      { klass: 'cryptoEngine', target: ctx.cryptoEngine },
+      { klass: 'pnlTracker', target: ctx.tracker },
+      { klass: 'cryptoPnlTracker', target: ctx.cryptoTracker },
+    ]),
+});
+
 /**
  * TRA-407 (C5) — upper bound on how long shutdown waits for in-progress ticks
  * to drain. A tick that ignores the timer (e.g. a wedged socket) must not
@@ -18751,6 +18774,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
   externalIntelSchedule.stop();
   autonomousDemoSchedule.stop();
   eventLoopWatchdog?.stop();
+  heapCensusSampler?.stop();
   const all = getAllUserContexts();
   // Clear each engine's tick timer first so no new tick starts; the in-flight
   // tick (if any) keeps running and is drained next.
