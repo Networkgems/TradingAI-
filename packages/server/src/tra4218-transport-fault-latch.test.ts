@@ -285,6 +285,74 @@ describe('TRA-4218 — the latch survives a restart, so the fix has to reach the
       .toHaveLength(1);
   });
 
+  /**
+   * The same stranded row, with the reason produced by the REAL trip site
+   * instead of hand-composed by this file.
+   *
+   * `strandedSnapshot()` above writes `exitErrorReason` itself, so every heal
+   * assertion resting on it proves the heal against a string a TEST believes the
+   * engine writes. That is one edit away from vacuous. The trip site in
+   * `clearPendingExit` OVERWRITES `exitErrorReason` when the breaker closes, and
+   * the heal survives only because that site PREFIXES the broker's own `reason`
+   * ahead of our "auto-close paused" clause. Drop the prefix — which is what
+   * "make the paused notice read cleanly" looks like at that line — and
+   * `TRANSPORT_STRANDED_REASON_RE` has no `(500)` left to match: the heal goes
+   * inert on exactly the population it was written for, and every other test in
+   * this file still passes.
+   *
+   * Raised on the 2026-09-01T14:30Z TRA-4217 beat, which pulled the three open
+   * real-money rows off bqb1 `/api/state` (`092d087775dc`, pid 52) and evaluated
+   * the regex against their actual `exitErrorReason` — HEAL_WOULD_FIRE on all
+   * three, and `liveExitErrors.stagingStopped: 3` on the same read, either of
+   * which could have replaced the transport wording. This pins that result to
+   * the code instead of to a one-off read.
+   */
+  it('heals the string the TRIP SITE writes, not the one this file believes it writes', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live', undefined, 200);
+    expect(pos).not.toBeNull();
+    const sym = pos!.optionSymbol!;
+    const id = pos!.id;
+
+    // The PRE-FIX classification, verbatim: `clearPendingExit` with no
+    // `transport` flag is what the old catch site did with a 500, because
+    // `postOrder` threw a bare `Error` and nothing downstream could tell it from
+    // a refusal. Three of those, inside one exit cadence, is the bqb1 row.
+    for (let i = 0; i < MAX_CONSECUTIVE_CLOSE_REJECTS; i += 1) {
+      vi.setSystemTime(Date.now() + 60_000);
+      const staged = acct.checkExits(new Map(), new Map([[sym, 0.7]]), undefined, { waitAndHold: true });
+      expect(staged).toHaveLength(1);
+      expect(acct.clearPendingExit(id, LIVE_500_REASON)).toBe(true);
+    }
+
+    const tripped = row(acct);
+    expect(tripped.closeRejectCount).toBe(MAX_CONSECUTIVE_CLOSE_REJECTS);
+    const written = tripped.exitErrorReason ?? '';
+    // The load-bearing bytes. Asserted on the ORDER, not just on presence: a
+    // site that appended the broker text after its own clause would still
+    // `toContain` it, and would still be one refactor from losing it.
+    expect(written.startsWith(LIVE_500_REASON)).toBe(true);
+    expect(written).toContain('auto-close paused after 3 rejected attempts');
+    expect(written.indexOf('Tradier order failed (500)'))
+      .toBeLessThan(written.indexOf('auto-close paused'));
+
+    // Now the restart, on that string and no other.
+    const snap = acct.exportSnapshot();
+    expect(snap.openOptions[0]!.exitErrorReason).toBe(written);
+    const bootAt = Date.now();
+    const restarted = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    restarted.importSnapshot(snap);
+
+    const r = row(restarted);
+    expect(r.closeRejectCount).toBeUndefined();
+    expect(r.exitTransportFailCount).toBe(1);
+    expect(r.exitRetryNotBeforeMs).toBe(bootAt + FIRST_BACKOFF_MS);
+
+    vi.setSystemTime(bootAt + FIRST_BACKOFF_MS + 1);
+    expect(restarted.checkExits(new Map(), new Map([[sym, 0.7]]), undefined, { waitAndHold: true }))
+      .toHaveLength(1);
+  });
+
   it('the adopted-lot census reports a PAUSED row as inert, not as engineMayAct', () => {
     // The live read that found this: adopted row a2f9c8cd (NOK261002C00010500)
     // published `engineMayAct: true, exitInertReason: null, stopArmed: true` on
