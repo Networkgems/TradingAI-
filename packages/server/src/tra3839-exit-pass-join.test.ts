@@ -49,9 +49,10 @@ const ONE_INERT: LiveStopActionabilitySummary = {
   ...FLAT,
   breached: 1,
   inert: 1,
+  // TRA-4280 — the hold is ET-day keyed, so the release is ET midnight (EDT).
   byReason: { pdt_hold_today: 1 },
-  releasesAt: '2026-08-19T00:00:00.000Z',
-  fullyReleasesAt: '2026-08-19T00:00:00.000Z',
+  releasesAt: '2026-08-19T04:00:00.000Z',
+  fullyReleasesAt: '2026-08-19T04:00:00.000Z',
 };
 
 const REACHING: LiveExitPassStatus = {
@@ -313,8 +314,8 @@ describe('TRA-3839 mergeQualifiedLiveStopActionability', () => {
     expect(merged).toMatchObject({
       breached: 2, actionable: 1, inert: 1, inFlight: 0,
       byReason: { pdt_hold_today: 1 },
-      releasesAt: '2026-08-19T00:00:00.000Z',
-      fullyReleasesAt: '2026-08-19T00:00:00.000Z',
+      releasesAt: '2026-08-19T04:00:00.000Z',
+      fullyReleasesAt: '2026-08-19T04:00:00.000Z',
       unacted: 1,
     });
   });

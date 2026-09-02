@@ -35,13 +35,13 @@ const SPY_OPENED = Date.UTC(2026, 7, 17, 17, 4, 49);
 /** 2026-08-17T22:41:00Z — the instant the incident was measured. Still 08-17 in UTC. */
 const MEASURED_AT = Date.UTC(2026, 7, 17, 22, 41, 0);
 /**
- * The release: `toDateKey` is `toISOString().slice(0, 10)`, a **UTC** day, so the
- * latch on rows opened 2026-08-17 expires at 2026-08-18T00:00:00.000Z — 20:00 ET
- * Monday, NOT ET midnight. Four hours earlier than the intuitive reading, and in
- * the direction that matters (the exposure ends sooner, unattended, and outside
- * RTH).
+ * The release: TRA-4280 keyed the latch on `etDateKey` — an **ET** day — so the
+ * hold on rows opened 2026-08-17 expires at ET midnight, 2026-08-18T04:00:00Z
+ * (August is EDT). Until TRA-4280 it was UTC-keyed and expired at 00:00Z =
+ * 20:00 ET Monday, four hours early — and from 2026-11-01 (EST) would have
+ * expired at 19:00 ET, one hour inside the extended session.
  */
-const RELEASE_ISO = '2026-08-18T00:00:00.000Z';
+const RELEASE_ISO = '2026-08-18T04:00:00.000Z';
 
 /** The money book's live runtime on 08-17: PDT hold on, broker mirror up. */
 const MONEY_BOOK: LiveStopActionabilityContext = {
@@ -137,7 +137,7 @@ function spyRow(overrides: Partial<OptionPosition> = {}): OptionPosition {
 // ─── POSITIVE: it must contain the 2026-08-17 incident ───────────────────────
 
 describe('TRA-3822 positive control — the 2026-08-17 ***0154 pair', () => {
-  it('flags BOTH rows inert under pdt_hold_today, with the UTC-day release', () => {
+  it('flags BOTH rows inert under pdt_hold_today, with the ET-day release', () => {
     const s = summarizeLiveStopActionability([pltrRow(), spyRow()], MONEY_BOOK);
     expect(s).toEqual({
       breached: 2,
@@ -166,13 +166,14 @@ describe('TRA-3822 positive control — the 2026-08-17 ***0154 pair', () => {
     expect(summarizeLiveStopActionability(rows, MONEY_BOOK).inert).toBe(2);
   });
 
-  it('the release is 00:00Z, NOT ET midnight — a four-hour error in the unsafe direction', () => {
+  it('the release is ET midnight, NOT 00:00Z — TRA-4280 closed the four-hour early release', () => {
     const s = summarizeLiveStopActionability([pltrRow()], MONEY_BOOK);
-    // ET midnight on 08-17 would be 2026-08-18T04:00:00Z. The latch is UTC-keyed,
-    // so it releases four hours earlier — into a closed market, unattended, with
-    // the next tick that sees a mark firing the stop at Tuesday's open.
+    // This assertion used to pin the OPPOSITE: the UTC-keyed latch released at
+    // 2026-08-18T00:00:00Z (20:00 ET), four hours early, into a closed market,
+    // unattended. TRA-4280 keyed it on the ET day, so the release is now the
+    // literal expiry of `etDateKey(openedAt) === etDateKey(now)`.
     expect(s.releasesAt).toBe(RELEASE_ISO);
-    expect(new Date(s.releasesAt!).getTime()).toBeLessThan(Date.UTC(2026, 7, 18, 4, 0, 0));
+    expect(new Date(s.releasesAt!).getTime()).toBe(Date.UTC(2026, 7, 18, 4, 0, 0));
   });
 
   it('a breach the hold has already released from reads ACTIONABLE, not inert', () => {
@@ -181,7 +182,11 @@ describe('TRA-3822 positive control — the 2026-08-17 ***0154 pair', () => {
     // clock, and the engine went from "cannot act" to "will act unattended".
     const s = summarizeLiveStopActionability([pltrRow(), spyRow()], {
       ...MONEY_BOOK,
-      now: Date.UTC(2026, 7, 18, 0, 0, 1),
+      // Past the ET-day roll (TRA-4280) AND past Tuesday's opening-range window
+      // — at 00:00:01 ET itself the TRA-3902 pre-open hold would pick the rows
+      // up (negative minutes-since-open count as inside), which is that gate's
+      // job, not this one's. 14:00Z = 10:00 ET Tuesday.
+      now: Date.UTC(2026, 7, 18, 14, 0, 0),
     });
     expect(s).toEqual({
       breached: 2,

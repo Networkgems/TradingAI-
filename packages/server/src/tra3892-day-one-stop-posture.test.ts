@@ -27,7 +27,8 @@ const BAC_OPENED = Date.UTC(2026, 7, 20, 13, 36, 23, 573);
 const NOON = Date.UTC(2026, 7, 20, 16, 0, 0);
 /** The 20:33Z read on which one row was through its stop. */
 const POST_CLOSE = Date.UTC(2026, 7, 20, 20, 33, 5);
-const RELEASE_ISO = '2026-08-21T00:00:00.000Z';
+/** TRA-4280 — ET midnight after the 08-20 opens (EDT), no longer 00:00Z. */
+const RELEASE_ISO = '2026-08-21T04:00:00.000Z';
 
 function otmRow(
   id: string,
@@ -79,6 +80,10 @@ describe('TRA-3892 positive control — the 2026-08-20 pair, BEFORE the breach',
       // TRA-3985 — the population literal and the book count. One summarize call
       // is one book; the 2026-08-20 reading is otherwise unchanged.
       population: 'live_held_rows_opened_today',
+      // TRA-4280 — the counted day and its roll boundary, on the wire.
+      populationDayKey: '2026-08-20',
+      populationCalendar: 'et',
+      populationRollsAt: RELEASE_ISO,
       books: 1,
       rows: 2,
       premiumAtRiskUsd: 273,
@@ -132,11 +137,11 @@ describe('TRA-3892 positive control — the 2026-08-20 pair, BEFORE the breach',
   });
 });
 
-describe('TRA-3892 release — the hold is a UTC-day key', () => {
-  it('one second past 00:00Z the same rows contribute nothing', () => {
+describe('TRA-3892/TRA-4280 release — the hold is an ET-day key', () => {
+  it('one second past 00:00 ET (04:00:01Z under EDT) the same rows contribute nothing', () => {
     const p = summarizeDayOneStopPosture([xlf(), bac()], {
       holdLiveOptionsOvernightForPdt: true,
-      now: Date.UTC(2026, 7, 21, 0, 0, 1),
+      now: Date.UTC(2026, 7, 21, 4, 0, 1),
     });
     // TRA-3943 — an EMPTY counted population folds to `full_premium` and an
     // empty sleeve map, never to the rule token: a dark book is blind, not
@@ -148,12 +153,47 @@ describe('TRA-3892 release — the hold is a UTC-day key', () => {
       // TRA-3985 — an EMPTY book is still A BOOK. `books: 0` here would say "no
       // book was read", which is the blind twin's reading, not this one's.
       population: 'live_held_rows_opened_today',
+      // TRA-4280 — the boundary survives the empty population: THIS is how a
+      // reader tells "the day rolled" from "no day-one rows opened".
+      populationDayKey: '2026-08-21',
+      populationCalendar: 'et',
+      populationRollsAt: '2026-08-22T04:00:00.000Z',
       books: 1,
       rows: 0,
       premiumAtRiskUsd: 0,
       premiumBySleeveUsd: {},
       releasesAt: null,
     });
+  });
+
+  it('TRA-4280 regression — a 20:06 ET read still counts the day\'s rows (the 2026-09-01 hole)', () => {
+    // The filed incident: two live day-one holds at 19:57 ET, and nine minutes
+    // later `rows: 0` — because 00:00Z had rolled while the ET day had not.
+    // Same instants, this build: the population survives to ET midnight.
+    const opened = Date.UTC(2026, 8, 1, 19, 8, 15); // 15:08 ET Tue 09-01
+    const p = summarizeDayOneStopPosture([xlf({ openedAt: opened })], {
+      holdLiveOptionsOvernightForPdt: true,
+      now: Date.UTC(2026, 8, 2, 0, 6, 56), // 20:06 ET Tue 09-01 — the read-B instant
+    });
+    expect(p.rows).toBe(1);
+    expect(p.premiumAtRiskUsd).toBe(108);
+    expect(p.populationDayKey).toBe('2026-09-01');
+    expect(p.releasesAt).toBe('2026-09-02T04:00:00.000Z');
+  });
+
+  it('TRA-4280 Consequence 2 — under EST the key holds through 19:00–20:00 ET (the DST seam)', () => {
+    // US DST ends 2026-11-01; from 11-02 ET is UTC-5 and 00:00Z is 19:00 ET.
+    // UTC-keyed, a row opened that same ET day read `openedToday: false` from
+    // 19:00 ET — dropping `pdtHeldToday`/`swingHeldToday` one hour before the
+    // extended session ends. ET-keyed, the hold runs to 00:00 ET (05:00Z).
+    const opened = Date.UTC(2026, 10, 2, 15, 0, 0); // 10:00 ET Mon 11-02 (EST)
+    const p = summarizeDayOneStopPosture([xlf({ openedAt: opened })], {
+      holdLiveOptionsOvernightForPdt: true,
+      now: Date.UTC(2026, 10, 3, 0, 30, 0), // 19:30 ET Mon 11-02 — inside the old seam
+    });
+    expect(p.rows).toBe(1);
+    expect(p.populationDayKey).toBe('2026-11-02');
+    expect(p.releasesAt).toBe('2026-11-03T05:00:00.000Z'); // 00:00 ET under EST
   });
 });
 
@@ -219,6 +259,9 @@ describe('TRA-3892 fleet fold and blind twin', () => {
       // `/api/state`, and the empty third book still counts: "a book that holds
       // nothing" and "a book that was not read" are different facts.
       population: 'live_held_rows_opened_today',
+      populationDayKey: '2026-08-20',
+      populationCalendar: 'et',
+      populationRollsAt: RELEASE_ISO,
       books: 3,
       rows: 2,
       premiumAtRiskUsd: 273,
@@ -239,6 +282,11 @@ describe('TRA-3892 fleet fold and blind twin', () => {
       // is not: it says what this instrument would have counted, which is true
       // whether or not the count succeeded (its neighbour's literal, same rule).
       population: 'live_held_rows_opened_today',
+      // TRA-4280 — the calendar is a literal and survives with `population`;
+      // the day key and roll boundary are clock READINGS and null with the rest.
+      populationDayKey: null,
+      populationCalendar: 'et',
+      populationRollsAt: null,
       books: null,
       rows: null,
       premiumAtRiskUsd: null,

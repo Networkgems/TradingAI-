@@ -2239,8 +2239,9 @@ export interface LiveStopActionabilitySummary {
    * every inert row is `indefinite`.
    *
    * ⚠️ This is when the GATE lifts, not when a fill happens. `pdtHeldToday` /
-   * `swingHeldToday` are keyed on `toDateKey`, which is `toISOString().slice(0,10)`
-   * — a **UTC** day, so the release is the next 00:00Z, NOT ET midnight.
+   * `swingHeldToday` are keyed on `etDateKey` — an **ET** calendar day
+   * (TRA-4280; UTC until then), so the release is the next 00:00 ET
+   * (04:00Z under EDT, 05:00Z under EST), NOT the next 00:00Z.
    */
   releasesAt: string | null;
   /**
@@ -2321,7 +2322,13 @@ export interface LiveStopActionabilitySummary {
  */
 interface LiveStopWalkClock {
   now: number;
-  /** UTC day key — what the two date-keyed holds actually compare against. */
+  /**
+   * ET day key — what the two date-keyed holds actually compare against.
+   * TRA-4280 moved this (and `checkExits`' `openedTodayKey`, in the same
+   * commit) from the UTC calendar: keyed on UTC the population emptied at
+   * 20:00 ET under EDT, and from 2026-11-01 (EST) the holds would have
+   * released at 19:00 ET — one hour INSIDE the extended session.
+   */
   nowKey: string;
   openingRangeMins: number | null;
   dailyClosePhase: ReturnType<typeof resolveDailyCloseStopPhase> | null;
@@ -2331,7 +2338,7 @@ function resolveLiveStopWalkClock(ctx: LiveStopActionabilityContext): LiveStopWa
   const now = ctx.now ?? Date.now();
   return {
     now,
-    nowKey: toDateKey(now),
+    nowKey: etDateKey(now),
     // `null` when the window is off (0) or the ET calendar math fails, and
     // `null` never reads as "inside".
     openingRangeMins: ctx.openingRangeGuardMin > 0 ? minutesSinceRthOpen(now) : null,
@@ -2450,7 +2457,7 @@ export function liveStopGateReading(
   // `:6865` exactly: on day one the fire is held unless the release said yes,
   // and it fails CLOSED. A row opened on an EARLIER day is not day-one and the
   // release is never consulted for it.
-  const otmDayOne = ctx.holdLiveOptionsOvernightForPdt && toDateKey(opt.openedAt) === nowKey;
+  const otmDayOne = ctx.holdLiveOptionsOvernightForPdt && etDateKey(opt.openedAt) === nowKey;
   const otmActs = otmPremiumLegThrough && !(otmDayOne && !ctx.otmDayOneStop!.release.released);
 
   const chandelierHeldToday =
@@ -2522,15 +2529,15 @@ export function liveStopGateReading(
   // which is why this sits HERE and not at the top.
   if (otmActs) return { ...base, held, releaseAt, inFlight: false };
 
-  if (ctx.holdLiveOptionsOvernightForPdt && toDateKey(opt.openedAt) === nowKey) {
+  if (ctx.holdLiveOptionsOvernightForPdt && etDateKey(opt.openedAt) === nowKey) {
     held.push('pdt_hold_today');
-    releaseAt.pdt_hold_today = nextUtcDayStart(opt.openedAt);
+    releaseAt.pdt_hold_today = nextEtDayStart(opt.openedAt);
   }
-  if (opt.signalType === 'relative_value' && toDateKey(opt.openedAt) === nowKey) {
+  if (opt.signalType === 'relative_value' && etDateKey(opt.openedAt) === nowKey) {
     // `swingHeldToday` at `:4823` is `(positionIsLive || swingHoldOptions)`, and
     // every row here is already live — so the knob cannot un-latch it.
     held.push('swing_hold_today');
-    releaseAt.swing_hold_today = nextUtcDayStart(opt.openedAt);
+    releaseAt.swing_hold_today = nextEtDayStart(opt.openedAt);
   }
   if (openingRangeMins !== null && openingRangeMins < ctx.openingRangeGuardMin) {
     // TRA-3902 — same predicate as `inOpeningRange` in `checkExits` (a pre-open
@@ -2622,7 +2629,7 @@ export function summarizeLiveStopActionability(
     byReason[reason] = (byReason[reason] ?? 0) + 1;
 
     // Fact 3 — the horizon, off the same walk's `releaseAt` map: the two
-    // date-keyed holds release when the UTC day rolls past the row's open date,
+    // date-keyed holds release when the ET day rolls past the row's open date,
     // `opening_range_hold` when the window closes, `daily_close_hold` when the
     // close window opens. Everything else needs a human.
     //
@@ -3177,7 +3184,7 @@ export function blindLiveStopGovernance(): BlindLiveStopGovernance {
  * on a sub-$25k account) as the regression. But composed with "an unattended
  * entry may be placed at any hour of the session", they mean that on day 1 the
  * realistic downside of every live option row is the **full premium**, not the
- * stop distance: there is no lever between a breach and the next UTC day.
+ * stop distance: there is no lever between a breach and the next ET day.
  *
  * The backtest the OTM sleeve was admitted on (TRA-375, "~59% hard-SL rate",
  * `OTM_OPTIONS_SL_PCT` 0.20) fires that stop intraday. The live sleeve cannot.
@@ -3186,7 +3193,8 @@ export function blindLiveStopGovernance(): BlindLiveStopGovernance {
  * ## Both directions
  *
  * Counts rows the date-keyed holds currently bind — live, open, opened in the
- * current UTC day, and either the PDT knob is on or the row is RV. A row opened
+ * current ET day (TRA-4280; UTC until then), and either the PDT knob is on or
+ * the row is RV. A row opened
  * yesterday contributes nothing even if it is inert for another reason (that is
  * `liveStopActionability.indefinite`'s job). A demo row contributes nothing. A
  * row with a working exit IS counted: the premium is at risk until the fill, and
@@ -3324,10 +3332,28 @@ export interface DayOneStopPosture {
    * `/api/state` showed and declared self-inconsistent, when the population was
    * the 2 rows opened THAT DAY across every book in the process.
    *
-   * ⚠️ `_today` is keyed on the UTC date of `openedAt`, matching `releasesAt`
-   * (next 00:00Z), NOT on the ET session date.
+   * ⚠️ `_today` is keyed on the ET calendar date of `openedAt`, matching
+   * `releasesAt` (next 00:00 ET). TRA-4280 — it was the UTC date until then,
+   * which emptied this surface at 20:00 ET (EDT) and would have released the
+   * exit-path holds at 19:00 ET once EST started 2026-11-01.
    */
   population: 'live_held_rows_opened_today';
+  /**
+   * TRA-4280 — the day key the population was counted against, ON THE WIRE.
+   * A `rows: 0` read minutes after the day rolls is byte-identical to "no
+   * day-one rows opened" without it — which is exactly how the 2026-09-01
+   * 20:06 ET read (2 live holds, `rows: 0`) went unflagged.
+   */
+  populationDayKey: string;
+  /** TRA-4280 — the calendar `populationDayKey` is keyed on. A literal. */
+  populationCalendar: 'et';
+  /**
+   * TRA-4280 — ISO of the instant `populationDayKey` next rolls (the next
+   * 00:00 ET after `now`). Unlike `releasesAt` it SURVIVES an empty
+   * population: it is derived from the clock, not from the counted rows, so
+   * the boundary stays visible on both of its sides.
+   */
+  populationRollsAt: string;
   /**
    * TRA-3985 — how many BOOKS this reading folds
    * ({@link mergeDayOneStopPosture}'s input length; 1 straight out of
@@ -3351,7 +3377,8 @@ export interface DayOneStopPosture {
   premiumBySleeveUsd: Record<string, number>;
   /**
    * ISO of the instant the EARLIEST of these rows becomes actionable — the next
-   * 00:00Z after its open (UTC day key, NOT ET midnight). `null` when `rows` is 0.
+   * 00:00 ET after its open (TRA-4280; next 00:00Z until then). `null` when
+   * `rows` is 0 — read `populationRollsAt` for the boundary in that state.
    */
   releasesAt: string | null;
 }
@@ -3402,7 +3429,7 @@ export function summarizeDayOneStopPosture(
   ctx: DayOneStopPostureContext,
 ): DayOneStopPosture {
   const now = ctx.now ?? Date.now();
-  const nowKey = toDateKey(now);
+  const nowKey = etDateKey(now);
   const premiumBySleeveUsd: Record<string, number> = {};
   // TRA-3943 — per-sleeve basis, accumulated over the SAME counted population as
   // the dollars above it so the two can never describe different row sets.
@@ -3415,7 +3442,7 @@ export function summarizeDayOneStopPosture(
   for (const opt of positions) {
     if ((opt.mode ?? 'demo') !== 'live') continue;
     if (opt.closedAt !== undefined) continue;
-    if (toDateKey(opt.openedAt) !== nowKey) continue;
+    if (etDateKey(opt.openedAt) !== nowKey) continue;
     // The SAME two predicates as `pdtHeldToday` / `swingHeldToday` in
     // `checkExits` (`positionIsLive` is already established above, and
     // `swingHeldToday` is `(positionIsLive || swingHoldOptions)`, so the knob
@@ -3457,7 +3484,7 @@ export function summarizeDayOneStopPosture(
       if (level !== undefined && Number.isFinite(level) && level > 0) atrLegRows += 1;
       else atrLegInertRows += 1;
     }
-    const release = nextUtcDayStart(opt.openedAt);
+    const release = nextEtDayStart(opt.openedAt);
     if (earliestRelease === null || release < earliestRelease) earliestRelease = release;
   }
   for (const k of Object.keys(premiumBySleeveUsd)) {
@@ -3482,6 +3509,9 @@ export function summarizeDayOneStopPosture(
           ?? { premiumPct: 0, atrInvalidation: 0, pdtHeld: 0, byMarkSource: zeroMarkSourceCounts() },
       },
     population: 'live_held_rows_opened_today',
+    populationDayKey: nowKey,
+    populationCalendar: 'et',
+    populationRollsAt: new Date(nextEtDayStart(now)).toISOString(),
     // One summary is one book. The fold counts them (`mergeDayOneStopPosture`).
     books: 1,
     rows,
@@ -3522,6 +3552,12 @@ export function mergeDayOneStopPosture(
   let rows = 0;
   let premiumAtRiskUsd = 0;
   let earliest: string | null = null;
+  // TRA-4280 — one process resolves one clock, so the folded books normally
+  // agree on the day key; on a midnight-race straddle the LATEST key wins
+  // (that is the day the reader is in) and the EARLIEST roll boundary wins
+  // (same pessimistic direction as `releasesAt`).
+  let populationDayKey: string | null = null;
+  let populationRollsAt: string | null = null;
   // TRA-3943 — the rule is a PROCESS-level resolution, identical across this
   // process's books, so the fold takes the first non-null and adds the row
   // counters. A book that reported none (an older engine) contributes rows to
@@ -3573,6 +3609,16 @@ export function mergeDayOneStopPosture(
     if (s.releasesAt !== null && (earliest === null || s.releasesAt < earliest)) {
       earliest = s.releasesAt;
     }
+    // `??` guards the older-build / hand-built-fixture summary, same as
+    // `byMarkSource` above: it contributes nothing rather than throwing.
+    const sKey = s.populationDayKey ?? null;
+    if (sKey !== null && (populationDayKey === null || sKey > populationDayKey)) {
+      populationDayKey = sKey;
+    }
+    const sRolls = s.populationRollsAt ?? null;
+    if (sRolls !== null && (populationRollsAt === null || sRolls < populationRollsAt)) {
+      populationRollsAt = sRolls;
+    }
   }
   return {
     stopBasis: foldDayOneStopBasis(Object.values(stopBasisBySleeve)),
@@ -3587,6 +3633,12 @@ export function mergeDayOneStopPosture(
         fires,
       },
     population: 'live_held_rows_opened_today',
+    // An EMPTY fold (or one over pre-TRA-4280 summaries) still publishes the
+    // boundary: the fold itself ran at a knowable instant, and a key derived
+    // here is exactly the one a summarize call at this instant would carry.
+    populationDayKey: populationDayKey ?? etDateKey(Date.now()),
+    populationCalendar: 'et',
+    populationRollsAt: populationRollsAt ?? new Date(nextEtDayStart(Date.now())).toISOString(),
     books,
     rows,
     premiumAtRiskUsd: r2usd(premiumAtRiskUsd),
@@ -3606,8 +3658,12 @@ export function blindDayOneStopPosture(): {
     // TRA-3985 — `population` survives blindness for the same reason its
     // neighbour's does: it says what this instrument WOULD have counted, which
     // is true whether or not the count succeeded. `books` does NOT — that is a
-    // measurement, and a blind fold must not publish one.
-    : K extends 'population' ? DayOneStopPosture['population'] : null
+    // measurement, and a blind fold must not publish one. TRA-4280's
+    // `populationCalendar` is a literal of the same kind and survives with it;
+    // its two siblings (`populationDayKey`, `populationRollsAt`) are clock
+    // readings the blind branch never took, and null with the measurements.
+    : K extends 'population' ? DayOneStopPosture['population']
+      : K extends 'populationCalendar' ? DayOneStopPosture['populationCalendar'] : null
 } {
   return {
     // TRA-3943 — the blind twin keeps `full_premium`, and that is deliberate: a
@@ -3619,6 +3675,9 @@ export function blindDayOneStopPosture(): {
     stopBasisBySleeve: null,
     otmDayOneStop: null,
     population: 'live_held_rows_opened_today',
+    populationDayKey: null,
+    populationCalendar: 'et',
+    populationRollsAt: null,
     books: null,
     rows: null,
     premiumAtRiskUsd: null,
@@ -4137,13 +4196,34 @@ export function mergeQualifiedLiveStopActionability(
 }
 
 /**
- * TRA-3822 — 00:00:00.000Z of the UTC day AFTER `ts`'s UTC day. This is the
- * literal expiry of a `toDateKey(openedAt) === toDateKey(now)` latch, because
- * {@link toDateKey} is `toISOString().slice(0, 10)` — a **UTC** calendar day.
- * It is NOT ET midnight, and the four-hour difference is a whole evening of
- * unattended exposure in the wrong direction if you assume otherwise.
+ * TRA-4280 (superseding TRA-3822's UTC version) — the UTC instant of 00:00 ET
+ * on the ET day AFTER `ts`'s ET day. This is the literal expiry of an
+ * `etDateKey(openedAt) === etDateKey(now)` latch — the moment the two keys
+ * stop comparing equal — so the published release and the gate's actual
+ * behaviour cannot drift.
+ *
+ * The UTC predecessor is why this exists: keyed on `toISOString().slice(0,10)`
+ * the day-one holds expired at 20:00 ET under EDT, and from 2026-11-01 (EST)
+ * would have expired at 19:00 ET — one hour inside the extended session, in
+ * the permissive direction.
  */
-function nextUtcDayStart(ts: number): number {
+function nextEtDayStart(ts: number): number {
+  const key = etDateKey(ts);
+  const m = key.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  // `etDateKey` renders `en-CA`, which is YYYY-MM-DD by construction, and
+  // 00:00 always exists in ET (DST transitions are at 02:00 local) — so both
+  // fallbacks below are for a clock so broken the ET render failed, where the
+  // next UTC midnight is the closest honest answer (it is EARLIER, i.e. the
+  // hold under-extends rather than silently over-extending on garbage input).
+  if (!m) return nextUtcMidnight(ts);
+  const nextKey = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + 1))
+    .toISOString()
+    .slice(0, 10);
+  return etWallClockToUtcMs(nextKey, 0, 0) ?? nextUtcMidnight(ts);
+}
+
+/** The unreachable-in-practice fallback for {@link nextEtDayStart}. */
+function nextUtcMidnight(ts: number): number {
   const d = new Date(ts);
   return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1);
 }
@@ -10155,7 +10235,11 @@ export class PaperOptionsAccount {
       // self-imposed one, live-only, during which trail-driven fires are
       // refused below (hard SL and structural exits are exempt).
       const positionIsLive = (opt.mode ?? 'demo') === 'live';
-      const openedTodayKey = toDateKey(opt.openedAt) === toDateKey(Date.now());
+      // TRA-4280 — ET calendar, like the chandelier latch and `otmStopHeldForPdt`
+      // below, NOT `toDateKey`'s UTC: keyed on UTC these holds released at
+      // 20:00 ET under EDT and at 19:00 ET under EST — inside the extended
+      // session for the last two months of the live OTM window.
+      const openedTodayKey = etDateKey(opt.openedAt) === etDateKey(Date.now());
       const pdtHeldToday =
         this.holdLiveOptionsOvernightForPdt && positionIsLive && openedTodayKey;
       const swingHeldToday =
@@ -11169,7 +11253,7 @@ export class PaperOptionsAccount {
           // owner's positions into the open: 10 of the 12 live closes since
           // 07-30 landed in 13:30–13:47Z, and the two most recent (08-18,
           // 13:30Z and 13:45Z) were `sl` on hand-placed rows. The PDT hold
-          // releases at 00:00Z, so a stop breached on day 0 is re-read against
+          // releases at 00:00 ET, so a stop breached on day 0 is re-read against
           // the first opening print of day 1 — the widest, least informative
           // quote of the session — and fires before the market has picked a
           // direction. The board's directive is to hold through that print.
