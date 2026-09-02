@@ -19509,7 +19509,11 @@ export class SignalEngine {
     const client = this.tradierOptionsClientByEnv[env];
     if (!client) {
       this.lastBrokerPositionDriftCheckAt = now;
-      return record(darkBrokerPositionDriftReport('no_client', now));
+      // TRA-4292 — stamp WHICH env this dark is about. A credential-less
+      // live-mode book pointed at sandbox is not a money-book coverage hole,
+      // and without the stamp its permanent dark pinned the fleet fold's
+      // `liveBookStatus` at "dark" over the money book's real clean checks.
+      return record(darkBrokerPositionDriftReport('no_client', now, env));
     }
 
     const rows = this.optionsAccounts[env].getStateForMode('live').openOptions;
@@ -19521,7 +19525,7 @@ export class SignalEngine {
     // TRA-323's import path's business, not this detector's.
     if (rows.length === 0) {
       this.lastBrokerPositionDriftCheckAt = now;
-      return record(diffLiveBrokerPositions({ ok: true, positions: [] }, [], now));
+      return record(diffLiveBrokerPositions({ ok: true, positions: [] }, [], now, undefined, env));
     }
 
     // `readOpenOptionPositions`, NOT `listOpenOptionPositions`: the latter maps
@@ -19552,7 +19556,7 @@ export class SignalEngine {
         const recorded = recordedEngineOpenBasis(sym, this.alertUsername ?? null);
         if (!recorded || recorded.unpricedFills > 0) return null;
         return recorded.contracts;
-      }),
+      }, env),
     );
 
     if (report.absorbedContracts > 0) {

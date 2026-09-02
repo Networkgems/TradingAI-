@@ -11640,15 +11640,26 @@ app.get('/api/health/options-live', async (_req, res) => {
         // contract. Only a third source neither the row nor the broker wrote can
         // see it, so the number comes from the drift detector.
         //
-        // FAILS TO `null`, NEVER TO 0: if ANY context's last drift check was
-        // blind/dark/never-ran, the fleet total would be a floor of unknown
-        // depth, and a floor published as a count is exactly the all-clear this
-        // field exists to withhold.
+        // FAILS TO `null`, NEVER TO 0: if any MONEY-relevant context's last
+        // drift check was blind/dark/never-ran, the fleet total would be a
+        // floor of unknown depth, and a floor published as a count is exactly
+        // the all-clear this field exists to withhold.
+        //
+        // TRA-4292 — "money-relevant" is the load-bearing word. As written
+        // originally this nulled on ANY dark, and a demo context is dark
+        // (`not_live`) on every check, so on a host with any demo book this
+        // field was STRUCTURALLY null — it never published a number in its
+        // life. A demo book and a sandbox-env book cannot hold money-broker
+        // contracts, so their darkness is not a gap in THIS total; a
+        // production-env dark, a blind, an unstamped report, or a never-ran
+        // context still withholds it.
         (() => {
           const lasts = getAllUserContexts().map(c => c.engine.getLiveBrokerPositionDriftState().last);
           if (lasts.length === 0) return null;
           let total = 0;
           for (const last of lasts) {
+            if (last && last.status === 'dark' && last.darkReason === 'not_live') continue;
+            if (last && last.tradierEnv !== null && last.tradierEnv !== 'production') continue;
             if (!last || last.status === 'blind' || last.status === 'dark') return null;
             total += last.excessContracts + last.brokerOnlyContracts;
           }
@@ -12281,6 +12292,13 @@ app.get('/api/health/options-live', async (_req, res) => {
       // `clean`. Read `liveBookStatus` for the live book's own verdict and
       // `contextsByLastStatus` for who is dark; `cleanChecks`/`excessChecks`
       // are counted, so a clean run is no longer inferred by subtraction.
+      //
+      // TRA-4292 — `liveBookStatus` is scoped to books addressing the MONEY
+      // env: a credential-less live-mode book resolving to sandbox reported
+      // `dark`/`no_client` forever and pinned the headline at "dark" over 615
+      // real clean checks of the money book. Such books now land in
+      // `sandboxLiveContexts`; a production-env `no_client` dark still folds
+      // in, because a money book with no broker client IS a coverage hole.
       brokerPositionDrift: (() => {
         const states = getAllUserContexts().map(c => c.engine.getLiveBrokerPositionDriftState());
         const fold = foldLiveBrokerDriftStatuses(states.map(s => s.last));
@@ -12348,7 +12366,7 @@ app.get('/api/health/options-live', async (_req, res) => {
             checkedAt: null as number | null,
           },
         );
-        return { status: fold.status, liveBookStatus: fold.liveBookStatus, liveContexts: fold.liveContexts, notLiveContexts: fold.notLiveContexts, contextsByLastStatus: fold.contextsByLastStatus, ...agg };
+        return { status: fold.status, liveBookStatus: fold.liveBookStatus, liveContexts: fold.liveContexts, notLiveContexts: fold.notLiveContexts, sandboxLiveContexts: fold.sandboxLiveContexts, contextsByLastStatus: fold.contextsByLastStatus, ...agg };
       })(),
       // TRA-2984 — staged exits that reached Tradier and EXPIRED unfilled.
       //

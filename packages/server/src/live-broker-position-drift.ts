@@ -62,7 +62,7 @@
  * the row that most needs it.
  */
 import type { TradierOpenOptionPosition } from '@trading-app/engine';
-import type { OptionPosition } from '@trading-app/shared';
+import type { OptionPosition, TradierEnv } from '@trading-app/shared';
 
 /**
  * A position read that kept its failure state. `ok: false` is NOT an empty
@@ -270,6 +270,23 @@ export interface LiveBrokerPositionDriftReport {
   blindReason: BrokerReadFailure | null;
   /** Set iff `status === 'dark'`. */
   darkReason: 'not_live' | 'no_client' | null;
+  /**
+   * TRA-4292 — WHICH broker env this check addressed. `production` is the
+   * money account; `sandbox` is paper. `null` only when no env was ever
+   * selected: a `not_live` dark (demo book), or a caller that predates the
+   * stamp.
+   *
+   * This exists because the fleet fold's `liveBookStatus` needs to separate
+   * "a money book is unwatched" from "a book that structurally cannot touch
+   * money is unwatched". A live-mode book with `tradierEnv: sandbox` and no
+   * saved creds reports `dark`/`no_client` on every check forever, and before
+   * this stamp that dark was indistinguishable from the money book's own —
+   * so one such book (Richard, 2026-09-02) held the headline at "dark" across
+   * 615 clean checks of the real-money book. The env is known even on the
+   * `no_client` path (it is resolved before the client lookup), so the report
+   * carries it rather than making the fold guess.
+   */
+  tradierEnv: TradierEnv | null;
   checkedAt: number;
   /** Denominator: eligible engine live open rows. */
   engineRowsChecked: number;
@@ -342,11 +359,15 @@ const EMPTY_INELIGIBLE: Record<DriftIneligibleReason, number> = {
 export function darkBrokerPositionDriftReport(
   reason: 'not_live' | 'no_client',
   now: number,
+  // TRA-4292 — the env a `no_client` dark WOULD have addressed. A demo book's
+  // `not_live` dark never selected one, so it stays null there.
+  tradierEnv: TradierEnv | null = null,
 ): LiveBrokerPositionDriftReport {
   return {
     status: 'dark',
     blindReason: null,
     darkReason: reason,
+    tradierEnv,
     checkedAt: now,
     engineRowsChecked: 0,
     engineSymbolsChecked: 0,
@@ -480,11 +501,14 @@ export function diffLiveBrokerPositions(
   rows: readonly OptionPosition[],
   now: number,
   recordedEngineContracts: RecordedEngineContractsOracle = NO_RECORDED_CONTRACTS_ORACLE,
+  // TRA-4292 — the env the caller's read addressed; see the report field.
+  tradierEnv: TradierEnv | null = null,
 ): LiveBrokerPositionDriftReport {
   const base: LiveBrokerPositionDriftReport = {
     status: 'clean',
     blindReason: null,
     darkReason: null,
+    tradierEnv,
     checkedAt: now,
     engineRowsChecked: 0,
     engineSymbolsChecked: 0,
@@ -790,22 +814,40 @@ export type LiveBrokerDriftFoldStatus = LiveBrokerDriftStatus | 'never_ran';
  *
  * Two things fix that without weakening the fold:
  *   • `liveBookStatus` — the same fold over only the contexts whose check is
- *     structurally able to run (everything except `dark`/`not_live`). A
- *     `no_client` dark still counts: a live book with no broker client IS a
- *     coverage hole on the live book.
+ *     structurally able to watch the MONEY book. A `no_client` dark on a
+ *     production-env book still counts: a money book with no broker client IS
+ *     a coverage hole on the money book.
  *   • `contextsByLastStatus` — how many contexts sit in each state, so a reader
  *     can see "1 live context clean, 9 demo contexts dark" instead of one word.
  *
- * `liveContexts === 0` means there is no live book at all; `liveBookStatus` is
- * then `never_ran`, which the rank treats as a coverage gap, not a green.
+ * TRA-4292 narrows the `liveBookStatus` cohort by ENV. The original rule was
+ * "everything except `dark`/`not_live`", and that admitted a live-MODE book
+ * whose creds resolve to the SANDBOX env with no client at all (Richard,
+ * 2026-09-02: `tradierEnv: sandbox`, `clientPresent: false`). Such a book
+ * reports `dark`/`no_client` on every check forever, it structurally cannot
+ * touch the money account, and — `dark` outranking `clean` — it pinned the
+ * headline at "dark" across 615 real clean checks of the money book. Anyone
+ * grading coverage off the field (including TRA-4278's starting facts)
+ * concluded the detector never read: the instrument read identically in pass
+ * and fail. So a context whose report is stamped with a NON-production env now
+ * lands in `sandboxLiveContexts` instead of the money fold. An UNSTAMPED
+ * (`tradierEnv: null`) non-demo report still folds in — when the env is
+ * unknown, excluding it could hide a real money book, which is the expensive
+ * direction.
+ *
+ * `liveContexts === 0` means there is no money-capable book at all;
+ * `liveBookStatus` is then `never_ran`, which the rank treats as a coverage
+ * gap, not a green.
  */
 export function foldLiveBrokerDriftStatuses(
-  lasts: readonly (Pick<LiveBrokerPositionDriftReport, 'status' | 'darkReason'> | null)[],
+  lasts: readonly (Pick<LiveBrokerPositionDriftReport, 'status' | 'darkReason' | 'tradierEnv'> | null)[],
 ): {
   status: LiveBrokerDriftFoldStatus;
   liveBookStatus: LiveBrokerDriftFoldStatus;
   liveContexts: number;
   notLiveContexts: number;
+  /** TRA-4292 — live-mode contexts addressed at a non-money env. */
+  sandboxLiveContexts: number;
   contextsByLastStatus: Record<LiveBrokerDriftFoldStatus, number>;
 } {
   const contextsByLastStatus: Record<LiveBrokerDriftFoldStatus, number> = {
@@ -825,12 +867,21 @@ export function foldLiveBrokerDriftStatuses(
   let liveBookStatus: LiveBrokerDriftFoldStatus | null = null;
   let liveContexts = 0;
   let notLiveContexts = 0;
+  let sandboxLiveContexts = 0;
   for (const last of lasts) {
     const s: LiveBrokerDriftFoldStatus = last ? last.status : 'never_ran';
     contextsByLastStatus[s] += 1;
     status = status === null ? s : worseBrokerDriftStatus(status, s);
     if (last && last.status === 'dark' && last.darkReason === 'not_live') {
       notLiveContexts += 1;
+      continue;
+    }
+    // TRA-4292 — a book whose check addressed a non-money env cannot be a
+    // money-book coverage hole; counted apart so it stays visible without
+    // pinning the money verdict. `null` env (unstamped) deliberately falls
+    // through into the money fold — see the function doc.
+    if (last && last.tradierEnv !== null && last.tradierEnv !== 'production') {
+      sandboxLiveContexts += 1;
       continue;
     }
     liveContexts += 1;
@@ -841,6 +892,7 @@ export function foldLiveBrokerDriftStatuses(
     liveBookStatus: liveBookStatus ?? 'never_ran',
     liveContexts,
     notLiveContexts,
+    sandboxLiveContexts,
     contextsByLastStatus,
   };
 }

@@ -540,7 +540,29 @@ describe('TRA-3067 — the detector is actually wired and reachable', () => {
     const report = await engine.checkLiveBrokerPositionDrift({ force: true });
     expect(report?.status).toBe('dark');
     expect(report?.darkReason).toBe('not_live');
+    // TRA-4292 — a demo book never selected a broker env; the stamp stays null.
+    expect(report?.tradierEnv).toBeNull();
     expect(engine.getLiveBrokerPositionDriftState().darkChecks).toBe(1);
+  });
+
+  it('TRA-4292: a no_client dark carries the env it would have addressed', async () => {
+    // The Richard shape: live MODE, creds resolving to SANDBOX, no client at
+    // all. The report must say which env this dark is about, because the fleet
+    // fold's money verdict hangs on the difference.
+    const engine = new SignalEngine();
+    const priv = engine as unknown as EnginePrivates;
+    priv.mode = 'live';
+    priv.tradierEnv = 'sandbox';
+    const report = await engine.checkLiveBrokerPositionDrift({ force: true });
+    expect(report?.status).toBe('dark');
+    expect(report?.darkReason).toBe('no_client');
+    expect(report?.tradierEnv).toBe('sandbox');
+  });
+
+  it('TRA-4292: a measured check is stamped with the env it read', async () => {
+    const engine = engineWith({ ok: true, positions: [] }, [row({ id: 'r1' })]);
+    const report = await engine.checkLiveBrokerPositionDrift({ force: true });
+    expect(report?.tradierEnv).toBe('production');
   });
 
   it('an idle live book is VACUOUS and pays no broker round-trip', async () => {
@@ -681,6 +703,61 @@ describe('TRA-3067 — the published projection', () => {
     // No context at all: never_ran, never clean.
     expect(foldLiveBrokerDriftStatuses([]).liveBookStatus).toBe('never_ran');
     expect(foldLiveBrokerDriftStatuses([null]).contextsByLastStatus.never_ran).toBe(1);
+  });
+
+  it('TRA-4292: a credential-less SANDBOX live book cannot pin the money verdict at dark', () => {
+    // The 2026-09-02 shape: one live-mode book whose creds resolve to sandbox
+    // with no client (permanently dark/no_client) sat next to a money book
+    // that had run 615 clean checks — and the headline read "dark".
+    const richard = darkBrokerPositionDriftReport('no_client', NOW, 'sandbox');
+    const demoDark = darkBrokerPositionDriftReport('not_live', NOW);
+    const moneyClean = diffLiveBrokerPositions(
+      { ok: true, positions: [brokerPos(PLTR, 1)] },
+      [row({ id: 'r1' })],
+      NOW,
+      undefined,
+      'production',
+    );
+    const fold = foldLiveBrokerDriftStatuses([demoDark, richard, moneyClean]);
+    expect(fold.liveBookStatus).toBe('clean');
+    expect(fold.liveContexts).toBe(1);
+    expect(fold.sandboxLiveContexts).toBe(1);
+    expect(fold.notLiveContexts).toBe(1);
+    // Nothing is hidden, only re-homed: the fleet-worst headline still shows
+    // the dark, and the distribution still counts it.
+    expect(fold.status).toBe('dark');
+    expect(fold.contextsByLastStatus.dark).toBe(2);
+
+    // A PRODUCTION-env no_client dark is a real money coverage hole and still
+    // pins — TRA-3890's contract survives the narrowing.
+    const prodHole = darkBrokerPositionDriftReport('no_client', NOW, 'production');
+    expect(foldLiveBrokerDriftStatuses([moneyClean, prodHole]).liveBookStatus).toBe('dark');
+
+    // An UNSTAMPED no_client dark folds in: an unknown env must not be able to
+    // hide a real money book (the expensive direction is exclusion).
+    const unstamped = darkBrokerPositionDriftReport('no_client', NOW);
+    expect(foldLiveBrokerDriftStatuses([moneyClean, unstamped]).liveBookStatus).toBe('dark');
+
+    // A sandbox book that RUNS checks is measured, visible in the distribution,
+    // and still not the money verdict — in either direction.
+    const sandboxClean = diffLiveBrokerPositions(
+      { ok: true, positions: [brokerPos(PLTR, 1)] },
+      [row({ id: 'r1' })],
+      NOW,
+      undefined,
+      'sandbox',
+    );
+    const prodBlind = diffLiveBrokerPositions(
+      { ok: false, reason: 'http_status' },
+      [row({ id: 'r1' })],
+      NOW,
+      undefined,
+      'production',
+    );
+    const f2 = foldLiveBrokerDriftStatuses([sandboxClean, prodBlind]);
+    expect(f2.liveBookStatus).toBe('blind');
+    expect(f2.sandboxLiveContexts).toBe(1);
+    expect(f2.contextsByLastStatus.clean).toBe(1);
   });
 
   it('the aggregate never lets one clean book hide another that is blind or dark', () => {
