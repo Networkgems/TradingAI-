@@ -39,6 +39,13 @@ import {
   deployHoldStaleness,
   renderDeployHoldStaleness,
   renderDeployHoldRefusal,
+  deployHoldBaseline,
+  deployHoldBaselineIsLoud,
+  renderDeployHoldBaseline,
+  deployHoldPinDrift,
+  deployHoldPinDriftIsLoud,
+  renderDeployHoldPinDrift,
+  extractShaPrefix,
   gitEnumerationProbe,
   requestedServiceRef,
   DEPLOY_HOLD_FILE,
@@ -566,11 +573,19 @@ let staleLiveArms = 0;
   }
 }
 
-// ── The REQUIRED-FIELD arm: a hold with no enumeratedTip is BLIND (TRA-4262) ──
+// ── The REQUIRED-FIELD arm: the two stamps are BOTH required (TRA-4262/TRA-4268) ──
 // Driven through the REAL reader against a REAL file, because that is the half an injected
-// `holds` array cannot reach — and paired with the identical file plus the stamp.
+// `holds` array cannot reach — and every REFUSE paired with the file one variable away.
+//
+// TRA-4268 AC1 asked for the "does it join DEPLOY_HOLD_REQUIRED_FIELDS" call to be
+// deliberate. It does, and these are the cases that pin the consequence: a hold with no
+// live-pin baseline REFUSES, and — the one an operator will actually hit — a baseline that
+// is PRESENT but carries no leading sha refuses too, with a `why` that says which mistake
+// it is. A field that may be prose is a field nobody can check.
+let requiredFieldArms = 0;
 {
   const tmp = mkdtempSync(join(tmpdir(), 'tra4262-hold-'));
+  const PIN = 'fedcba9876543210fedcba9876543210fedcba98';
   const row = {
     ticket: 'TRA-4262',
     reason: 'fixture',
@@ -578,15 +593,40 @@ let staleLiveArms = 0;
     openedBy: 'fixture',
     emits: ['fixture'],
   };
+  const stamped = { ...row, enumeratedTip: HEAD_A, enumeratedFromLivePin: PIN };
   const cases = [
-    [row, 'BLIND', 'a hold with no enumeratedTip REFUSES — an emits[] with no tip beside it enumerates A deploy, not THIS one'],
-    [{ ...row, enumeratedTip: HEAD_A }, 'HOLDS', 'the SAME file with the stamp added reads normally — one variable apart'],
+    [
+      { ...row, enumeratedFromLivePin: PIN },
+      'BLIND',
+      /enumeratedTip/,
+      'no enumeratedTip REFUSES — an emits[] with no tip beside it enumerates A deploy, not THIS one (TRA-4262)',
+    ],
+    [
+      { ...row, enumeratedTip: HEAD_A },
+      'BLIND',
+      /enumeratedFromLivePin/,
+      'no enumeratedFromLivePin REFUSES — a list with a head and no START describes a window nobody stated (TRA-4268)',
+    ],
+    [
+      { ...row, enumeratedTip: HEAD_A, enumeratedFromLivePin: 'the sha bqb1 is running, I checked, honest' },
+      'BLIND',
+      /PRESENT but carries no leading commit sha/,
+      'a baseline that is PROSE ONLY refuses, and says so as a DIFFERENT mistake from absent — a field that may be prose cannot be checked',
+    ],
+    [
+      { ...stamped, enumeratedFromLivePin: `${PIN} — bqb1 pid 52, startedAt 2026-09-01T18:04:59.811Z, re-read off /api/health/options-live` },
+      'HOLDS',
+      null,
+      'sha FIRST then provenance reads normally — the prose is load bearing (which boot, off what route) and must not have to be dropped to satisfy the gate',
+    ],
+    [stamped, 'HOLDS', null, 'both stamps present, bare shas — one variable from every refusal above'],
   ];
-  for (const [h, expected, why] of cases) {
-    const name = `hold-${expected}.json`;
+  requiredFieldArms = cases.length;
+  for (const [h, expected, whyRe, why] of cases) {
+    const name = `hold-${expected}-${requiredFieldArms--}.json`;
     writeFileSync(join(tmp, name), JSON.stringify({ holds: [h] }));
     const got = readDeployHolds(tmp, name);
-    const ok = got.verdict === expected && (expected !== 'BLIND' || /enumeratedTip/.test(got.why ?? ''));
+    const ok = got.verdict === expected && (!whyRe || whyRe.test(got.why ?? ''));
     if (ok) {
       pass += 1;
       console.log(`  ok   staleness-required   ${got.verdict.padEnd(20)} ${why}`);
@@ -595,7 +635,248 @@ let staleLiveArms = 0;
       console.log(`  FAIL staleness-required   expected ${expected}, got ${got.verdict} — ${why}`);
     }
   }
+  requiredFieldArms = cases.length;
   rmSync(tmp, { recursive: true, force: true });
+}
+
+// ── Gate −1c: WHICH WINDOW does emits[] cover? (TRA-4268) ────────────────────
+// Gate −1b grades the list's HEAD. This grades its START. The defect: four consecutive
+// correct re-takes all measured `<a tip>..origin/main` while a deploy ships
+// `<the live pin>..origin/main`, and on the TRA-4217 hold those differed by 22 commits, 13
+// of them shipping server bytes. Same discipline as every section above: each LOUD status
+// paired with the quiet case it differs from by one variable, and the run fails if any
+// status is unreachable.
+const PIN_A = '092d087775dc3e4cbb1724427c4bae8df303740f';
+const PIN_B = '4e0f4438aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const ancProbe = answer => ({ head: () => ({ sha: HEAD_A }), delta: () => ({ ok: true, commits: [], paths: [] }), ancestor: () => answer });
+const baseRow = (pin, tip) => ({ ...HELD_ROW, enumeratedFromLivePin: pin, enumeratedTip: tip });
+
+const BASELINE_CASES = [
+  [
+    baseRow(PIN_A, HEAD_A),
+    ancProbe(true),
+    'WINDOW',
+    'the baseline is an ancestor of the stamped head — the window emits[] claims to cover EXISTS',
+  ],
+  [
+    baseRow(PIN_A, PIN_A.slice(0, 12)),
+    ancProbe(null),
+    'WINDOW',
+    'baseline === head (abbreviated on one side) is a legitimate EMPTY window — the box is already at the head, so the deploy is a restart. Answered without git, so the null probe is never consulted',
+  ],
+  [
+    { ...HELD_ROW, enumeratedTip: HEAD_A },
+    ancProbe(true),
+    'UNSTAMPED',
+    'no enumeratedFromLivePin at all — this is the pre-TRA-4268 state of every hold in the file, and it read as coverage',
+  ],
+  [
+    baseRow('the commit bqb1 is running', HEAD_A),
+    ancProbe(true),
+    'UNSTAMPED',
+    'a baseline that is PROSE with no leading sha is UNSTAMPED, not "probably fine" — the parse fails CLOSED',
+  ],
+  [
+    baseRow(PIN_B, HEAD_A),
+    ancProbe(false),
+    'NOT_ANCESTOR',
+    'the baseline is NOT an ancestor of the head, so `git log base..head` is empty and the stamped window does not exist',
+  ],
+  [
+    baseRow(PIN_B, HEAD_A),
+    ancProbe(null),
+    'BLIND',
+    'ancestry unanswerable (a graft, TRA-3699) — "cannot tell" must NEVER collapse into WINDOW, and it is the SAME input that reads NOT_ANCESTOR when git can answer',
+  ],
+  [
+    { ...HELD_ROW, enumeratedFromLivePin: PIN_A },
+    ancProbe(true),
+    'BLIND',
+    'a baseline with no usable head has nothing to be tested against — the window has one end',
+  ],
+];
+
+for (const [hold, probe, expected, why] of BASELINE_CASES) {
+  const got = deployHoldBaseline(hold, probe).status;
+  if (got === expected) {
+    pass += 1;
+    console.log(`  ok   baseline             ${got.padEnd(20)} ${why}`);
+  } else {
+    failures.push({ iso: 'deploy-hold baseline', expected, got, why });
+    console.log(`  FAIL baseline             expected ${expected}, got ${got}  — ${why}`);
+  }
+}
+
+const blProduced = new Set(BASELINE_CASES.map(([h, p]) => deployHoldBaseline(h, p).status));
+const blMissing = ['WINDOW', 'UNSTAMPED', 'NOT_ANCESTOR', 'BLIND'].filter(v => !blProduced.has(v));
+
+// AC2: the refusal must PRINT THE WINDOW, not only its head. Unlike the staleness renderer
+// this one is never silent — the window IS the header of the list under it, and a reader
+// who sees only the head cannot tell a complete enumeration from one that is 22 commits
+// short. Driven through the REAL refusal renderer, not the line builder, because "it is in
+// the array" and "it reaches the operator" are different claims.
+{
+  const hold = baseRow(PIN_A, HEAD_A);
+  const st = deployHoldBaseline(hold, ancProbe(true));
+  const text = renderDeployHoldRefusal(
+    { verdict: 'HELD', applicable: [hold], skipped: [], why: null, ref: REF_MONEY_ID },
+    { baselines: new Map([[hold, st]]) },
+  );
+  const window = `${PIN_A.slice(0, 12)}..${HEAD_A.slice(0, 12)}`;
+  if (text.includes(window) && text.indexOf(window) < text.indexOf('WHAT A DEPLOY WOULD EMIT')) {
+    pass += 1;
+    console.log(`  ok   baseline-render      ${'WINDOW'.padEnd(20)} the refusal prints ${window} ABOVE emits[] — the list's start point is readable without opening the file`);
+  } else {
+    failures.push({ iso: 'baseline-render', expected: `${window} above emits[]`, got: text.includes(window) ? 'printed BELOW emits[]' : 'not printed at all', why: 'AC2: the refusal must state the window, not only its head' });
+    console.log(`  FAIL baseline-render      the refusal did not print ${window} above emits[]`);
+  }
+  // …and the loud case actually reaches the operator through the same path.
+  const blind = baseRow(PIN_B, HEAD_A);
+  const blindText = renderDeployHoldRefusal(
+    { verdict: 'HELD', applicable: [blind], skipped: [], why: null, ref: REF_MONEY_ID },
+    { baselines: new Map([[blind, deployHoldBaseline(blind, ancProbe(false))]]) },
+  );
+  if (blindText.includes('THAT WINDOW DOES NOT EXIST')) {
+    pass += 1;
+    console.log(`  ok   baseline-render      ${'NOT_ANCESTOR'.padEnd(20)} the loud status reaches the refusal text — a grader nobody can read is not a gate`);
+  } else {
+    failures.push({ iso: 'baseline-render', expected: 'THAT WINDOW DOES NOT EXIST in the refusal', got: 'absent', why: 'every loud baseline status must reach the operator' });
+    console.log(`  FAIL baseline-render      NOT_ANCESTOR did not reach the refusal text`);
+  }
+}
+
+// ── LIVE arm: REAL ancestry out of THIS repo (AC3) ──────────────────────────
+// The injected cases above grade the predicate and can never grade `gitEnumerationProbe`'s
+// new `ancestor()` leg. This drives the SHIPPED probe against real shas, both ways round:
+// HEAD~2..HEAD~1 is a window that exists, and the same two shas SWAPPED is one that does
+// not. An ancestry check that answered `true` unconditionally would pass the first and
+// fail the second.
+let baselineLiveArms = 0;
+{
+  const older = (spawnSync('git', ['rev-parse', 'HEAD~2'], { encoding: 'utf8' }).stdout ?? '').trim();
+  const newer = (spawnSync('git', ['rev-parse', 'HEAD~1'], { encoding: 'utf8' }).stdout ?? '').trim();
+  if (!older || !newer) {
+    console.log(`  note baseline-live        SKIPPED — this checkout cannot resolve HEAD~2 (shallow?), so no real ancestry is available`);
+    blProduced.add('WINDOW');
+    blProduced.add('NOT_ANCESTOR');
+  } else {
+    baselineLiveArms = 2;
+    const probe = gitEnumerationProbe();
+    const fwd = deployHoldBaseline(baseRow(older, newer), probe);
+    if (fwd.status === 'WINDOW') {
+      pass += 1;
+      console.log(`  ok   baseline-live        ${'WINDOW'.padEnd(20)} real ancestry ${older.slice(0, 7)}..${newer.slice(0, 7)} out of this repo — the window exists`);
+    } else {
+      failures.push({ iso: 'baseline-live', expected: 'WINDOW', got: `${fwd.status} (${fwd.why ?? '—'})`, why: 'a real ancestor must grade WINDOW through the shipped probe' });
+      console.log(`  FAIL baseline-live        got ${fwd.status} — ${fwd.why ?? 'real ancestry misgraded'}`);
+    }
+    const rev = deployHoldBaseline(baseRow(newer, older), probe);
+    if (rev.status === 'NOT_ANCESTOR') {
+      pass += 1;
+      console.log(`  ok   baseline-live-ctl    ${'NOT_ANCESTOR'.padEnd(20)} the SAME two shas swapped — a stamp taken in the wrong order describes a window that does not exist`);
+    } else {
+      failures.push({ iso: 'baseline-live-ctl', expected: 'NOT_ANCESTOR', got: `${rev.status} (${rev.why ?? '—'})`, why: 'an ancestry check that cannot say NO is not a check' });
+      console.log(`  FAIL baseline-live-ctl    got ${rev.status} — swapping the stamps must be caught`);
+    }
+  }
+}
+
+// ── The NETWORK half: is the stamped baseline STILL what the box runs? (AC4) ─
+// Lives at Gate 4, which has already resolved the live pin for the rollback test — NOT at
+// gate −1, whose offline-ness is why its refusal precedes any byte on the wire. Read-only:
+// it warns, it never refuses. `live` is the shape `fetchLiveCommit()` returns, injected.
+const PIN_DRIFT_CASES = [
+  [
+    baseRow(PIN_A, HEAD_A),
+    { sha: PIN_A, reported: PIN_A.slice(0, 12), startedAt: '2026-09-01T18:04:59.811Z' },
+    'MATCHES',
+    'baseline present and CURRENT — the box is running the sha emits[] was enumerated from, so the list describes this deploy',
+  ],
+  [
+    baseRow(PIN_A, HEAD_A),
+    { sha: PIN_B, reported: PIN_B.slice(0, 12), startedAt: '2026-09-01T22:10:00.000Z' },
+    'REBOOTED',
+    'baseline present but the box has since REBOOTED onto a different sha — emits[] covers a window that is not the one this deploy ships (TRA-4158: this host restarts itself)',
+  ],
+  [
+    { ...HELD_ROW, enumeratedTip: HEAD_A },
+    { sha: PIN_A, startedAt: '2026-09-01T18:04:59.811Z' },
+    'UNSTAMPED',
+    'baseline MISSING — nothing to compare, and the box being readable does not supply it',
+  ],
+  [
+    baseRow(PIN_A, HEAD_A),
+    { sha: null, error: 'GET /api/health/version failed: timeout' },
+    'BLIND',
+    'the live pin is unreadable — "cannot tell" must never collapse into MATCHES',
+  ],
+];
+
+for (const [hold, live, expected, why] of PIN_DRIFT_CASES) {
+  const st = deployHoldPinDrift(hold, live);
+  const loudOk = deployHoldPinDriftIsLoud(st.status) === (expected !== 'MATCHES');
+  if (st.status === expected && loudOk) {
+    pass += 1;
+    console.log(`  ok   pin-drift            ${st.status.padEnd(20)} ${why}`);
+  } else {
+    failures.push({ iso: 'pin-drift', expected, got: `${st.status}${loudOk ? '' : ' (loudness inverted)'}`, why });
+    console.log(`  FAIL pin-drift            expected ${expected}, got ${st.status}  — ${why}`);
+  }
+}
+
+const pdProduced = new Set(PIN_DRIFT_CASES.map(([h, l]) => deployHoldPinDrift(h, l).status));
+const pdMissing = ['MATCHES', 'REBOOTED', 'UNSTAMPED', 'BLIND'].filter(v => !pdProduced.has(v));
+
+// The REBOOTED notice must name BOTH shas and the boot it read them from — a warning that
+// says "drift" without saying drift from WHAT to WHAT sends the operator back to the file.
+{
+  const hold = baseRow(PIN_A, HEAD_A);
+  const st = deployHoldPinDrift(hold, { sha: PIN_B, reported: PIN_B.slice(0, 12), startedAt: '2026-09-01T22:10:00.000Z' });
+  const text = renderDeployHoldPinDrift(hold, st);
+  const names =
+    text.includes(PIN_A.slice(0, 12)) &&
+    text.includes(PIN_B.slice(0, 12)) &&
+    text.includes('2026-09-01T22:10:00.000Z') &&
+    text.includes('startedAt');
+  if (names) {
+    pass += 1;
+    console.log(`  ok   pin-drift-render     ${'REBOOTED'.padEnd(20)} the notice names the stamped baseline, the live sha and the boot it was read from`);
+  } else {
+    failures.push({ iso: 'pin-drift-render', expected: 'both shas + startedAt', got: 'incomplete', why: 'a drift warning that does not say drift from WHAT is not readable' });
+    console.log(`  FAIL pin-drift-render     the REBOOTED notice did not name both shas and the boot`);
+  }
+  // Paired quiet control: MATCHES must NOT carry the loud headline.
+  const quiet = renderDeployHoldPinDrift(hold, deployHoldPinDrift(hold, { sha: PIN_A, startedAt: 'x' }));
+  if (!quiet.includes('NO LONGER WHAT THE BOX IS RUNNING')) {
+    pass += 1;
+    console.log(`  ok   pin-drift-render     ${'MATCHES'.padEnd(20)} same hold, box on the stamped sha — the notice confirms, it does not shout`);
+  } else {
+    failures.push({ iso: 'pin-drift-render', expected: 'no drift headline', got: 'shouted on a MATCHES', why: 'a grader that shouts on every read is a brick' });
+    console.log(`  FAIL pin-drift-render     MATCHES printed the drift headline`);
+  }
+}
+
+// The sha parser, one line apart in each direction. It is the single point where a stamp
+// stops being prose and becomes checkable, so a silent widening here would re-open the
+// whole hole under a green suite.
+const SHA_PARSE_CASES = [
+  [PIN_A, PIN_A, 'a bare 40-char sha'],
+  [`${PIN_A} — bqb1 pid 52, startedAt …`, PIN_A, 'sha FIRST, provenance after — the shape the live file uses'],
+  ['`092d0877` off /api/health/options-live', '092d0877', 'a backticked short sha, as pasted from a ticket'],
+  ['the commit bqb1 is running is 092d0877', null, 'sha NOT first is NOT accepted — a field whose sha can be anywhere is a field that needs a parser nobody audits'],
+  ['092d08', null, 'six hex chars is too short to name a commit unambiguously'],
+  [undefined, null, 'absent'],
+  ['', null, 'empty'],
+];
+for (const [input, expected, why] of SHA_PARSE_CASES) {
+  const got = extractShaPrefix(input);
+  if (got === expected) {
+    pass += 1;
+    console.log(`  ok   sha-parse            ${String(got ?? 'null').slice(0, 20).padEnd(20)} ${why}`);
+  } else {
+    failures.push({ iso: 'sha-parse', expected: String(expected), got: String(got), why });
+    console.log(`  FAIL sha-parse            expected ${expected}, got ${got}  — ${why}`);
+  }
 }
 
 for (const [iso, target, isSoak, expected, why] of WARN_CASES) {
@@ -782,7 +1063,13 @@ const TOTAL =
   STALENESS_CASES.length + // TRA-4262
   1 + // the CURRENT-is-silent renderer control
   staleLiveArms + // the real-ancestry live arm + its paired CURRENT control (0 in a shallow checkout)
-  2 + // enumeratedTip is REQUIRED: the BLIND file and its one-variable-apart pair
+  requiredFieldArms + // both stamps are REQUIRED: the BLIND files and their one-variable-apart pairs
+  BASELINE_CASES.length + // TRA-4268, gate −1c: which WINDOW does emits[] cover
+  2 + // the baseline renderer: the window prints ABOVE emits[], and a loud status reaches the text
+  baselineLiveArms + // real ancestry through the shipped probe, both ways round (0 in a shallow checkout)
+  PIN_DRIFT_CASES.length + // TRA-4268, the network half at Gate 4
+  2 + // the pin-drift renderer: REBOOTED names both shas + the boot, MATCHES stays quiet
+  SHA_PARSE_CASES.length + // the stamp parser, the point where prose becomes checkable
   1 + // the blind-shallow composition case
   1; // the deploy-hold LIVE read
 const allMissing = [
@@ -795,6 +1082,8 @@ const allMissing = [
   ...dhMissing,
   ...ovMissing,
   ...stMissing.map(v => `staleness:${v}`),
+  ...blMissing.map(v => `baseline:${v}`),
+  ...pdMissing.map(v => `pin-drift:${v}`),
 ];
 
 console.log('');
@@ -818,6 +1107,9 @@ if (failures.length) {
   console.error(`[tra2325] FAIL: ${failures.length} case(s) failed.`);
   process.exit(1);
 }
+console.log(
+  `baseline: emits[] window graded ${[...blProduced].sort().join('/')} · live-pin drift ${[...pdProduced].sort().join('/')} (TRA-4268)`,
+);
 console.log('[tra2325] PASS — freeze, embargo, commit-hold, rollback, stale-pin and deploy-hold all discriminate,');
 console.log('[tra2325] and every verdict is reachable.');
 process.exit(0);

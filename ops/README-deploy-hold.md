@@ -42,7 +42,10 @@ needs three properties a table in a 1400-line script cannot have:
       "openedAt": "2026-09-01T14:32:00Z",      // required. ISO, Z.
       "openedBy": "LeadDev (d3355d6d) — …",    // required. Who to talk to.
       "emits":    ["…", "…"],                 // required, non-empty. What a deploy WOULD DO if performed.
-      "enumeratedTip": "8061bbf62c76…",        // required. The origin/main sha `emits` was taken against.
+      "enumeratedTip": "8061bbf62c76…",        // required. The origin/main sha `emits` was taken against — its HEAD.
+      "enumeratedFromLivePin": "092d0877… — pid 52, startedAt …, re-read off /api/health/options-live at …",
+                                               // required (TRA-4268). The sha THE BOX IS RUNNING — `emits`'
+                                               // BASELINE. SHA FIRST, provenance after; the prose is parsed past.
       "enumeratedAt":  "2026-09-01T15:15:00Z", // expected. When. ISO, Z.
       "enumeratedBy":  "LeadDev (d3355d6d) …", // expected. Who took it, and off what.
       "service":  {                            // optional. ABSENT MEANS EVERY SERVICE.
@@ -92,14 +95,18 @@ So, for **every** hold, not just this one:
    git log       <enumeratedTip>..origin/main   # what has landed since
    git diff --name-only <enumeratedTip>..origin/main
    ```
+   ⛔ **That pair of commands is HALF the check** — it answers *"has anything landed since I
+   looked"*, not *"does this list cover what the box gains"*. Run the **live-pin** pair beside it,
+   every time; see **`emits` is measured FROM the box, not from a tip (TRA-4268)** below.
 2. **Re-enumerate before you clear.** The clearing commit must either **extend `emits`** with what
    the delta emits, or **state that the delta touches no server byte** and why that is safe.
    `packages/**` outside tests is what the Render build compiles and the box then runs; `ops/`,
    `scripts/` and `docs/` do not ship in the server image. One reviewable diff, and it is the
    clearer's act — not a promise the hold's author could have made on their behalf.
 3. **Re-stamp if you leave it standing.** A hold you decide to *keep* also gets a fresh
-   `enumeratedTip`/`enumeratedAt` for whatever you just measured against. A hold left open on a
-   stale enumeration is the defect this section exists for.
+   `enumeratedTip`/`enumeratedAt` for whatever you just measured against — **and a re-read
+   `enumeratedFromLivePin`, never a recalled one.** A hold left open on a stale enumeration is the
+   defect this section exists for.
 4. **The stamp cannot name its own commit.** Whatever you write, the commit that writes it lands
    *after* the sha it names, so the first entry in `git log <enumeratedTip>..origin/main` will
    normally be the hold edit itself. That is expected and reads as exactly what it is in the
@@ -137,6 +144,89 @@ Three deliberate limits, because a check that overstates itself is worse than no
   never invent it. The refusal says so.
 - **"No server byte" is a claim about PATHS, not about behaviour.** The classifier recognises
   `packages/**` minus tests. Everything else is *unclassified*, never *inert* — read the files.
+
+## `emits` is measured FROM the box, not from a tip (TRA-4268)
+
+> **The baseline for `emits` is the LIVE DEPLOYED PIN, never the enumerator's starting tip.**
+
+Read the section above and then read this one, because the section above is **half the check** and
+on its own it reads as the whole one.
+
+`enumeratedTip` answers *"has anything landed since I last looked"*. That is a real question and
+the gate answers it truthfully. It is **not** the question a reader asks of an `emits` list, which
+is *"does this describe what the box GAINS"* — and **a deploy does not move the box from
+`enumeratedTip` to the tip. It moves it from the sha the box is running to the tip.** Those
+coincide only when the box is already caught up, which under a deploy hold is precisely the case
+that does not hold: **the hold is why it is behind.**
+
+**Measured, on the TRA-4217 hold, 2026-09-01.** bqb1 was running `092d087775dc`. The hold's first
+enumeration was taken against `4e0f4438` — **22 commits later**. So the list described
+`4e0f4438..tip` while a deploy shipped `092d0877..tip`. `git log 092d087775dc..4e0f4438` is 22
+commits, **14** changing `packages/**` outside tests, ~4,300 added lines across 20 non-test server
+files. **Exactly one** of the 14 appeared anywhere in `emits`, and only because the hold was
+opened for it. **The other 13 shipped to the box and were described nowhere** — among them a
+refusal added to the imported-row **close** route, a byte in the live OTM **entry** path, and a
+rewrite of where `peakPremium` persists, which feeds the profit-lock exit.
+
+**The instrument was not lying, and that is the point.** `deployHoldStaleness` compares
+`enumeratedTip..origin/main` and reported `CURRENT`/`STALE` **correctly** through four consecutive
+re-enumerations while the list was structurally short by 22 commits. The live pin never entered
+the comparison **by design** — gate −1 is offline so its refusal lands before `RENDER_API_KEY` is
+read, and resolving the pin needs the network. **An unstated hole read as coverage.** The defect
+class is not a wrong answer; it is a **missing operand**, and the remedy is a second stamp.
+
+So `enumeratedFromLivePin` is a **required field**, exactly like `enumeratedTip`: a hold without a
+readable one is `BLIND` and refuses. That was a deliberate call, not a side effect — it makes
+every unstamped hold refuse until backfilled, and the reasoning (plus what it cost on this repo:
+**nothing**, because the one live hold already carried the field) is written out at
+`DEPLOY_HOLD_REQUIRED_FIELDS` in `render-redeploy.mjs`.
+
+**Write the sha FIRST, then the provenance.** The field is parsed for a leading `[0-9a-f]{7,40}`
+and the rest is prose the gate never reads but a human must — *which boot* (`startedAt`), off
+*which route*, at *what time*, and that it was **re-read rather than recalled**. `pid` is **not** a
+boot identity; key on `startedAt` (TRA-4158: this host restarts itself). A field that is prose only
+is `BLIND`, and the refusal says *present but carries no leading commit sha* so the mistake is not
+mistaken for the field being absent.
+
+```bash
+curl -s https://tradingai-bqb1.onrender.com/api/health/options-live | jq '.build.commit, .build.startedAt'
+git log       <that sha>..origin/main   # THE WINDOW A DEPLOY SHIPS
+git log <enumeratedTip>..origin/main    # only "has anything landed since I looked"
+```
+
+### Two halves, at two gates, for one reason
+
+| half | question | gate | needs network |
+| --- | --- | --- | --- |
+| **−1c**, `deployHoldBaseline` | does the stamped window **exist**? (`baseline` an ancestor of `enumeratedTip`) | −1, with the refusal | **no** — both shas are local |
+| Gate 4, `deployHoldPinDrift` | is the baseline **still what the box runs**? | 4, beside the rollback gate | yes — and it is **already resolved there** |
+
+The split is not tidiness. **Gate −1 taking no network is load-bearing** — it is why the hold
+refusal precedes any byte on the wire — so the network half was put where the live pin already
+exists rather than dragging a `fetch` in front of the refusal.
+
+Gate −1c prints the window **above** `emits`, always, including when it is fine:
+
+```
+  emits[] COVERS: 092d087775dc..b50a9bf1
+    Baseline is the LIVE DEPLOYED PIN, not the enumerator's starting tip (TRA-4268). RE-READ it
+    off GET /api/health/options-live before you clear — this box reboots on its own (TRA-4158),
+    and `pid` is not a boot identity: key on `startedAt`.
+```
+
+Four statuses, and **none is silent** — unlike staleness, because the window *is* the header of
+the list under it, and a reader who sees only the head cannot tell a complete enumeration from one
+that is 22 commits short: `WINDOW` · `UNSTAMPED` (a head and no start) · `NOT_ANCESTOR` (**the
+stamped window does not exist** — a sha off another history, or the two stamps taken in the wrong
+order) · `BLIND` (git could not answer; **never** collapsed into `WINDOW`).
+
+The Gate 4 half **warns, it never refuses**. A refusal there would be a second lock
+`--override-hold` cannot clear, needing a second flag, and the first person it inconvenienced would
+delete the stamp rather than re-read the pin. Its statuses are `MATCHES` · `REBOOTED` ·
+`UNSTAMPED` · `BLIND`. Note its **reachability**, which is stated rather than left to be found: a
+hold that applies exits at gate −1 with code 9, so this only runs when the operator **broke the
+hold with `--override-hold`** — which is the last read of `emits` before bytes move, and exactly
+the moment somebody is trusting a list whose baseline may have rebooted out from under it.
 
 ## Scoping
 
@@ -206,3 +296,12 @@ injected every input never once reached the real predicate — a **LIVE arm that
 reader against the committed file**. That arm asserts a *property* (the file parses and
 validates), never a specific hold, so the suite stays green after a hold is cleared. A test that
 went red when you cleared a hold would be a reason not to clear it.
+
+For TRA-4268 specifically it carries: every `deployHoldBaseline` status paired with the quiet case
+it differs from by one variable; a **real-ancestry arm** driving the shipped `gitEnumerationProbe`
+against `HEAD~2`/`HEAD~1` **both ways round**, because an ancestry check that cannot say *no* is
+not a check; every `deployHoldPinDrift` status against an injected live-pin read (**missing** ·
+**present and current** · **rebooted onto a different sha** · **unreadable**); the sha parser in
+both directions, since that is the single point where a stamp stops being prose and becomes
+checkable; and an assertion that the window is printed **above** `emits` in the **real** refusal
+renderer — *"it is in the array"* and *"it reaches the operator"* being different claims.

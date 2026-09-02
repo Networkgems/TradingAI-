@@ -114,7 +114,9 @@
 //   8  REFUSED — the deploy would ROLL THE HOST BACK, or it cannot be proven not to
 //   9  REFUSED — an open hold in ops/deploy-hold.json covers this service, or that file
 //      exists and cannot be trusted (BLIND). Runs FIRST, before RENDER_API_KEY is read and
-//      before any byte reaches Render — TRA-4261.
+//      before any byte reaches Render — TRA-4261. A hold missing either stamp is BLIND:
+//      `enumeratedTip` (the list's HEAD, TRA-4262) and `enumeratedFromLivePin` (the list's
+//      BASELINE — the sha THE BOX IS RUNNING, sha first then provenance, TRA-4268).
 
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -568,7 +570,50 @@ export const DEPLOY_HOLD_FILE = 'ops/deploy-hold.json';
 // THIS one, and nothing in the file says which. Requiring it costs one `git rev-parse` at
 // the moment the hold is written and makes staleness answerable in one command
 // (`git log <enumeratedTip>..origin/main`) instead of undetectable by inspection.
-const DEPLOY_HOLD_REQUIRED_FIELDS = ['ticket', 'reason', 'openedAt', 'openedBy', 'emits', 'enumeratedTip'];
+//
+// `enumeratedFromLivePin` joined it on TRA-4268, and AC1 of that ticket asks for the call
+// to be DELIBERATE rather than a side effect, so here it is in full:
+//
+//   WHAT IT COSTS. Every hold missing the field reads BLIND ⇒ exit 9. That is fail-closed
+//   in direction (both HELD and BLIND refuse; nothing is admitted that was not admitted
+//   before) but it is NOT free: a BLIND read discards `holds`, so the operator is shown
+//   "fix the file" instead of the hold's `reason` and `emits`. It also widens a malformed
+//   hold's refusal to services the hold does not cover, because validation runs before
+//   scoping. Both of those are already true of `enumeratedTip` and are accepted for the
+//   same reason.
+//   WHAT IT COSTS TODAY, MEASURED not assumed: `ops/deploy-hold.json` carries exactly ONE
+//   hold (TRA-4217) and it already stamps the field (backfilled by `74a8c5aa`). So the
+//   live behaviour change on this repo, right now, is NIL — and the suite's LIVE arm
+//   drives the real reader against the committed file, so a regression is loud.
+//   WHY REQUIRED AND NOT MERELY GRADED. The baseline is not decoration on the list, it is
+//   the list's START POINT. A hold that stamps a head and no start describes the window
+//   `<somebody's tip>..<head>` while a deploy ships `<live pin>..<tip>` — which on the
+//   TRA-4217 hold differed by 22 commits, 13 of them shipping server bytes, under FOUR
+//   consecutive re-takes that were each individually correct. Grading it without requiring
+//   it leaves that hole re-acquirable by whoever writes the next hold, which is exactly
+//   the failure mode this ticket exists to close. The stamp costs one `curl` the author is
+//   already told to run.
+const DEPLOY_HOLD_REQUIRED_FIELDS = [
+  'ticket',
+  'reason',
+  'openedAt',
+  'openedBy',
+  'emits',
+  'enumeratedTip',
+  'enumeratedFromLivePin',
+];
+
+// The leading commit sha of a stamp field. `enumeratedFromLivePin` carries the sha AND the
+// provenance that makes it checkable by a human — which boot (`startedAt`), off which
+// route, at what time, and that it was RE-READ rather than recalled. That prose is load
+// bearing (a pin recalled instead of re-read is the staleness this whole section exists to
+// name), so the field is PARSED rather than required to be bare.
+// FAILS CLOSED: prose with no leading hex token yields null, and null is UNSTAMPED —
+// never "it says something, it is probably fine".
+export function extractShaPrefix(v) {
+  const m = /^\s*`?([0-9a-f]{7,40})\b/i.exec(String(v ?? ''));
+  return m ? m[1].toLowerCase() : null;
+}
 
 // Read + VALIDATE the hold file. Separated from the predicate below so the predicate stays
 // pure and the control suite can drive it with injected rows (the TRA-3699 lesson: a
@@ -602,15 +647,28 @@ export function readDeployHolds(root = REPO_ROOT, file = DEPLOY_HOLD_FILE) {
     const missing = DEPLOY_HOLD_REQUIRED_FIELDS.filter(k => {
       const v = h[k];
       if (k === 'emits') return !Array.isArray(v) || v.length === 0;
+      // TRA-4268: this one is required to carry a READABLE SHA, not merely to be non-empty.
+      // A baseline nobody can parse is a baseline nobody can check, and the check is the
+      // whole point of the field.
+      if (k === 'enumeratedFromLivePin') return !extractShaPrefix(v);
       return typeof v !== 'string' || !v.trim();
     });
     if (missing.length) {
+      // Present-but-unparseable is a different mistake from absent, and an operator told
+      // "missing enumeratedFromLivePin" while staring at a populated field will go looking
+      // for the wrong bug.
+      const pin = h.enumeratedFromLivePin;
+      const detail =
+        missing.includes('enumeratedFromLivePin') && typeof pin === 'string' && pin.trim()
+          ? ` (enumeratedFromLivePin is PRESENT but carries no leading commit sha — it must START with the` +
+            ` sha the box is running, provenance after it: ${JSON.stringify(pin.trim().slice(0, 48))}…)`
+          : '';
       return {
         verdict: 'BLIND',
         holds: [],
         // Name the ticket if we can read it — a refusal that says "holds[0]" makes the
         // operator open the file to find out who to talk to.
-        why: `${file} holds[${i}]${typeof h.ticket === 'string' ? ` (${h.ticket})` : ''} is missing required field(s): ${missing.join(', ')}`,
+        why: `${file} holds[${i}]${typeof h.ticket === 'string' ? ` (${h.ticket})` : ''} is missing required field(s): ${missing.join(', ')}${detail}`,
         path: file,
       };
     }
@@ -834,6 +892,138 @@ export function renderDeployHoldStaleness(st, { maxCommits = 10, maxPaths = 8 } 
   ];
 }
 
+// ── Gate −1c: WHICH WINDOW DOES emits[] CLAIM TO COVER? (TRA-4268) ────────────
+// Gate −1b fixed staleness at the HEAD of the enumeration: `emits` is a snapshot of a
+// moving tip, so stamp the tip and re-take at clear time. That is correct, it is
+// instrumented, and it worked — four re-takes landed on the TRA-4217 hold on 2026-09-01
+// alone. AND EVERY ONE OF THEM MEASURED FORWARD FROM A TIP.
+//
+// A DEPLOY DOES NOT MOVE THE BOX FROM `enumeratedTip` TO THE TIP. IT MOVES IT FROM THE
+// LIVE DEPLOYED PIN TO THE TIP. Those two windows coincide only when the box is already
+// caught up, which under a deploy hold is exactly the case that does not hold: the hold is
+// WHY it is behind.
+//
+// MEASURED, on the hold this was written for. bqb1 was running `092d087775dc`; the
+// TRA-4217 hold's first enumeration was taken against `4e0f4438` — TWENTY-TWO COMMITS
+// LATER. `git log 092d087775dc..4e0f4438` is 22 commits, 14 of them changing `packages/**`
+// outside tests (~4,300 added lines across 20 non-test server files). EXACTLY ONE of the
+// 14 appears anywhere in `emits`, and only because the hold was opened for it. The other
+// thirteen ship to the box and were described nowhere — among them a refusal added to the
+// imported-row CLOSE route, a byte in the live OTM ENTRY path, and a rewrite of where
+// `peakPremium` persists, which feeds the profit-lock exit.
+//
+// ⚠ THE INSTRUMENT WAS NOT LYING, AND THIS IS THE POINT. `deployHoldStaleness` compares
+// `enumeratedTip..origin/main` and reported CURRENT/STALE TRUTHFULLY the whole time, while
+// the list was structurally short by 22 commits. It answered a NARROWER question than its
+// readers asked of it, and the unstated hole read as coverage. The defect class is not a
+// wrong answer — it is a MISSING OPERAND, and the remedy is a second stamp, not a better
+// comparison.
+//
+// OFFLINE, like the rest of gate −1: both operands are shas already in the file, so this
+// asks git only for ancestry and never touches the network. The NETWORK half — "is the
+// stamped baseline still what the box is RUNNING" — cannot live here and does not; see
+// `deployHoldPinDrift`, which runs at Gate 4 where the live pin has already been resolved.
+//
+// Statuses:
+//   UNSTAMPED     no usable `enumeratedFromLivePin` — emits[] states a HEAD and no START
+//   WINDOW        the baseline is an ancestor of (or equal to) the stamped head ⇒ the
+//                 window emits[] claims to cover EXISTS and is enumerable
+//   NOT_ANCESTOR  the baseline is NOT an ancestor of the head ⇒ `git log <base>..<head>`
+//                 is empty and the stamped window DOES NOT EXIST
+//   BLIND         git could not answer. NEVER collapsed into WINDOW (the gradeCarries
+//                 lesson: a grafted-away path and a genuine absence look identical)
+export function deployHoldBaseline(hold, probe) {
+  const baseline = extractShaPrefix(hold?.enumeratedFromLivePin);
+  const head = extractShaPrefix(hold?.enumeratedTip);
+  const base = { baseline, head, degenerate: false, why: null };
+  if (!baseline) {
+    return {
+      ...base,
+      status: 'UNSTAMPED',
+      why:
+        'the hold carries no usable `enumeratedFromLivePin`, so emits[] states a HEAD and no START — ' +
+        'nothing in the file says which window it claims to cover (TRA-4268)',
+    };
+  }
+  if (!head) {
+    return {
+      ...base,
+      status: 'BLIND',
+      why: 'the hold carries no usable `enumeratedTip`, so the baseline has no head to be tested against',
+    };
+  }
+  // Ancestry is reflexive, and an equal pair is a legitimate (empty) window: the box is
+  // already at the stamped head, so a deploy is a restart. Answer it without asking git,
+  // which also keeps the abbreviated-vs-full sha case out of `merge-base`.
+  if (sameCommitSha(baseline, head)) return { ...base, status: 'WINDOW', degenerate: true };
+  const anc = probe.ancestor(baseline, head);
+  if (anc === null) {
+    return {
+      ...base,
+      status: 'BLIND',
+      why: `cannot test whether ${baseline.slice(0, 12)} is an ancestor of ${head.slice(0, 12)} (${BLIND_ANCESTRY_CAUSES})`,
+    };
+  }
+  if (anc === false) {
+    return {
+      ...base,
+      status: 'NOT_ANCESTOR',
+      why:
+        `${baseline.slice(0, 12)} is NOT an ancestor of ${head.slice(0, 12)}, so ` +
+        `\`git log ${baseline.slice(0, 12)}..${head.slice(0, 12)}\` is EMPTY — the window emits[] stamps does not exist`,
+    };
+  }
+  return { ...base, status: 'WINDOW', degenerate: false };
+}
+
+export function deployHoldBaselineIsLoud(status) {
+  return status === 'UNSTAMPED' || status === 'NOT_ANCESTOR' || status === 'BLIND';
+}
+
+// AC2 of TRA-4268: the refusal must PRINT THE WINDOW `emits[]` claims to cover, not only
+// its head — a reader must be able to see the list's START POINT without opening the file.
+// So unlike the staleness renderer, this one is NEVER silent: the good case still prints
+// one line, because the window IS the header of the list underneath it. It is one line on
+// a refusal that is already dozens, and it is the line the 22-commit hole hid behind.
+export function renderDeployHoldBaseline(st) {
+  if (!st) return [];
+  const head = st.head ? st.head.slice(0, 12) : '(unstamped)';
+  const baseline = st.baseline ? st.baseline.slice(0, 12) : '(no baseline)';
+  if (st.status === 'WINDOW') {
+    return [
+      `  emits[] COVERS: ${baseline}..${head}${
+        st.degenerate ? '  (EMPTY — the baseline IS the stamped head, so this describes a RESTART)' : ''
+      }`,
+      `    Baseline is the LIVE DEPLOYED PIN, not the enumerator's starting tip (TRA-4268). RE-READ it` +
+        `\n    off GET /api/health/options-live before you clear — this box reboots on its own (TRA-4158),` +
+        `\n    and \`pid\` is not a boot identity: key on \`startedAt\`.`,
+    ];
+  }
+  if (st.status === 'UNSTAMPED') {
+    return [
+      `  emits[] COVERS: ???..${head}  ⚠ NO BASELINE — TRA-4268.`,
+      `    This hold stamps the tip its list was taken AGAINST and not the sha the box is RUNNING, so`,
+      `    the list describes <somebody's tip>..${head} while a deploy ships <live pin>..<tip>. On the`,
+      `    TRA-4217 hold those two windows differed by 22 commits, 13 of which shipped server bytes and`,
+      `    were described nowhere, under four consecutive re-enumerations that were each correct.`,
+      `    Treat emits[] as a LOWER BOUND and re-enumerate FROM THE LIVE PIN before clearing.`,
+    ];
+  }
+  if (st.status === 'NOT_ANCESTOR') {
+    return [
+      `  emits[] COVERS: ${baseline}..${head}  ⚠ THAT WINDOW DOES NOT EXIST — TRA-4268.`,
+      `    ${st.why}.`,
+      `    A baseline that is not an ancestor of the head is a sha off another history, or the two`,
+      `    stamps were taken in the wrong order. Either way the list enumerates nothing checkable.`,
+    ];
+  }
+  return [
+    `  emits[] COVERS: ${baseline}..${head}  ⚠ COULD NOT VERIFY THE WINDOW — TRA-4268.`,
+    `    blind : ${st.why}`,
+    `    "Cannot tell" is not "the window exists". Check it by hand before trusting the list below.`,
+  ];
+}
+
 // The impure half: resolves what this invocation would ship and what landed since, WITHOUT
 // the network. `--commit` wins because that is what Render would build; otherwise the local
 // remote-tracking ref, which is the honest offline stand-in for the tip this script ships.
@@ -876,6 +1066,13 @@ export function gitEnumerationProbe(requestedCommit = COMMIT, ref = DEPLOY_HOLD_
         diff.status === 0 ? (diff.stdout ?? '').split('\n').map(s => s.trim()).filter(Boolean) : [];
       return { ok: true, shallow, commits, paths };
     },
+    // TRA-4268. Deliberately `gitCarries`, the same graded ancestry every other gate here
+    // uses: it returns null rather than false for a grafted or unresolvable answer, so a
+    // shallow checkout reads BLIND instead of manufacturing NOT_ANCESTOR against a window
+    // that is perfectly real (TRA-3699).
+    ancestor(a, b) {
+      return gitCarries(a, b);
+    },
   };
 }
 
@@ -899,7 +1096,7 @@ export function deployHoldOverrideNames(reason, tokens) {
 
 // `staleness` is a Map from hold object → deployHoldStaleness() result, or null. Passed in
 // rather than computed here so this stays pure and the suite can drive both halves.
-export function renderDeployHoldRefusal(state, { file = DEPLOY_HOLD_FILE, staleness = null } = {}) {
+export function renderDeployHoldRefusal(state, { file = DEPLOY_HOLD_FILE, staleness = null, baselines = null } = {}) {
   if (state.verdict === 'BLIND') {
     return (
       `[render-redeploy] REFUSED: the deploy-hold file exists and CANNOT BE TRUSTED, so this gate\n` +
@@ -907,9 +1104,11 @@ export function renderDeployHoldRefusal(state, { file = DEPLOY_HOLD_FILE, stalen
       `  file    : ${file}\n` +
       `  blind   : ${state.why}\n` +
       `  A hold file that degrades to "allowed" when it is malformed is not a hold. FIX THE FILE\n` +
-      `  (every hold needs ticket, reason, openedAt, openedBy, a non-empty emits[] and the\n` +
-      `  enumeratedTip that emits[] was taken against — TRA-4262), or, if the\n` +
-      `  deploy genuinely cannot wait, re-run with --override-hold="TRA-#### why" (recorded).`
+      `  (every hold needs ticket, reason, openedAt, openedBy, a non-empty emits[], the\n` +
+      `  enumeratedTip that emits[] was taken against — TRA-4262 — and the enumeratedFromLivePin\n` +
+      `  emits[] was enumerated FROM, i.e. the sha the box is running, sha first — TRA-4268),\n` +
+      `  or, if the deploy genuinely cannot wait, re-run with --override-hold="TRA-#### why"\n` +
+      `  (recorded).`
     );
   }
   const lines = [
@@ -922,6 +1121,10 @@ export function renderDeployHoldRefusal(state, { file = DEPLOY_HOLD_FILE, stalen
     // VERBATIM, unwrapped, unsummarised. The reason is the whole point of the gate; a
     // refusal that paraphrases it is a refusal the operator has to go and check.
     lines.push(`  ${h.reason}`);
+    // TRA-4268: the WINDOW comes FIRST, above the list, because it is what the list is a
+    // list OF. A reader who sees only the head cannot tell a complete enumeration from one
+    // that is structurally short by 22 commits — which is precisely how this was missed.
+    for (const l of renderDeployHoldBaseline(baselines?.get?.(h) ?? null)) lines.push(l);
     lines.push(`  WHAT A DEPLOY WOULD EMIT:`);
     for (const e of h.emits) lines.push(`    ⚠ ${e}`);
     // …and whether that list still describes the tip about to ship (TRA-4262). Printed
@@ -1178,6 +1381,105 @@ export function stalePinNote(target, tipSha, isAncestor = gitCarries) {
     `            This is an UNDER-ship, not a rollback (nothing serving is removed), so it is\n` +
     `            allowed — but check:deploy-drift will read STALE against this host afterwards.\n` +
     `            If you meant "ship what is on main", drop --commit and let Render take the tip.`
+  );
+}
+
+// ── The NETWORK half of the emits[] baseline (TRA-4268) ───────────────────────
+// `deployHoldBaseline` (gate −1c) answers "does the stamped window EXIST", offline. It
+// cannot answer the other half — "is `enumeratedFromLivePin` STILL what the box is
+// running" — because that needs the live pin, and gate −1 takes no network BY DESIGN. That
+// property is load bearing: it is why the hold refusal lands before RENDER_API_KEY is read
+// and before any byte is on the wire, and AC4 of TRA-4268 says in as many words that it is
+// not to be traded away for this. So the network half runs HERE, at the gate that has
+// already resolved the live sha for the rollback test, and pays nothing extra for it.
+//
+// ⚠ REACHABILITY, stated rather than left to be discovered. A hold that APPLIES exits at
+// gate −1 with code 9, so control only reaches this point with applicable holds when the
+// operator BROKE them with --override-hold. That is not a consolation prize: the override
+// path is the last read of emits[] before bytes move, and an override is exactly the
+// moment somebody is trusting a list whose baseline may have rebooted out from under it.
+//
+// ⚠ IT WARNS, IT DOES NOT REFUSE. A refusal here would be a second lock that
+// --override-hold cannot clear, needing a second flag; the first person it inconvenienced
+// would delete the stamp rather than re-read the pin. Same reasoning that keeps gate −1b
+// an augmentation. What it buys is that the drift is in the same scrollback as the deploy.
+//
+// ⚠ TWO ROUTES, ONE PIN — MEASURED, NOT ASSUMED. The hold's `enumeratedFromLivePin` is
+// stamped off `GET /api/health/options-live` (`build.commit`), and `fetchLiveCommit()`
+// above reads `GET /api/health/version` (`commit`). A comparison across two routes is only
+// meaningful if they agree, so it was checked against the live box on 2026-09-01T23:0xZ:
+// BOTH returned `092d087775dc3e4cbb1724427c4bae8df303740f`, `commitSource: git`, and the
+// SAME `startedAt` 2026-09-01T18:04:59.811Z. They are two projections of one boot's own
+// answer, so they cannot diverge without the process serving two shas — and if they ever
+// did, this reads REBOOTED, which is the conservative direction.
+//
+//   UNSTAMPED  no baseline to compare (gate −1c has already said so, loudly)
+//   MATCHES    the box is running the sha emits[] was enumerated from
+//   REBOOTED   the box is on a DIFFERENT sha ⇒ emits[] describes a window that is not the
+//              one this deploy ships
+//   BLIND      the live pin could not be read — never collapsed into MATCHES
+export function deployHoldPinDrift(hold, live) {
+  const baseline = extractShaPrefix(hold?.enumeratedFromLivePin);
+  const at = {
+    baseline,
+    live: live?.sha ?? null,
+    reported: live?.reported ?? null,
+    startedAt: live?.startedAt ?? null,
+    why: null,
+  };
+  if (!baseline) {
+    return { ...at, status: 'UNSTAMPED', why: 'the hold carries no usable `enumeratedFromLivePin` to compare against the box' };
+  }
+  if (!live?.sha) {
+    return {
+      ...at,
+      status: 'BLIND',
+      why: live?.error ?? 'the live commit could not be read, so "is the baseline still what is running" is unanswerable',
+    };
+  }
+  if (sameCommitSha(baseline, live.sha)) return { ...at, status: 'MATCHES' };
+  return { ...at, status: 'REBOOTED', why: `the box is running ${short(live.sha)}, not the stamped ${baseline.slice(0, 12)}` };
+}
+
+export function deployHoldPinDriftIsLoud(status) {
+  return status === 'REBOOTED' || status === 'UNSTAMPED' || status === 'BLIND';
+}
+
+export function renderDeployHoldPinDrift(hold, st) {
+  const ticket = hold?.ticket ?? '(untitled hold)';
+  const baseline = st.baseline ? st.baseline.slice(0, 12) : '(no baseline)';
+  const boot = st.startedAt ? `, booted ${st.startedAt}` : '';
+  if (st.status === 'MATCHES') {
+    return (
+      `[render-redeploy] ${ticket}: emits[] BASELINE CONFIRMED LIVE — ${baseline} is what the host is ` +
+      `running${boot}. The window emits[] describes is the window this deploy ships. TRA-4268.`
+    );
+  }
+  if (st.status === 'REBOOTED') {
+    return (
+      `[render-redeploy] ⚠ ${ticket}: THE emits[] BASELINE IS NO LONGER WHAT THE BOX IS RUNNING — TRA-4268.\n` +
+      `  enumerated from : ${baseline}\n` +
+      `  box is running  : ${short(st.live)}${st.reported ? `  [reported ${st.reported}]` : ''}${boot}\n` +
+      `  emits[] describes ${baseline}..<its stamped head>; this deploy ships ${short(st.live)}..<the tip>.\n` +
+      `  Those are DIFFERENT WINDOWS, so that list is not an enumeration of what you are about to do.\n` +
+      `  RE-ENUMERATE FROM THE PIN ABOVE: git log ${short(st.live)}..${DEPLOY_HOLD_ENUM_REF}\n` +
+      `  ⚠ \`pid\` is NOT a boot identity — key on \`startedAt\`. This host restarts itself (TRA-4158),\n` +
+      `  so a baseline recalled from the file rather than re-read is stale by construction.`
+    );
+  }
+  if (st.status === 'UNSTAMPED') {
+    return (
+      `[render-redeploy] ⚠ ${ticket}: emits[] HAS NO LIVE-PIN BASELINE, so nothing can be said about\n` +
+      `  whether it covers what this deploy ships — TRA-4268. The host is running ` +
+      `${short(st.live)}${boot}.\n` +
+      `  Run \`git log ${short(st.live)}..${DEPLOY_HOLD_ENUM_REF}\` yourself: THAT is the window.`
+    );
+  }
+  return (
+    `[render-redeploy] ⚠ ${ticket}: COULD NOT CHECK THE emits[] BASELINE AGAINST THE BOX — TRA-4268.\n` +
+    `  enumerated from : ${baseline}\n` +
+    `  blind           : ${st.why}\n` +
+    `  "Cannot tell" is not "still current". The list may describe a window that closed.`
   );
 }
 
@@ -1525,14 +1827,21 @@ async function main() {
   // invocation would ship? Read-only — it can make a refusal louder, never lift one, and
   // never turns a proceed into a refusal. Still no network: the comparison sha comes from
   // the local remote-tracking ref (or --commit), so the reported drift is a lower bound.
+  // Gate −1c (TRA-4268): and WHICH WINDOW does that `emits` claim to cover? −1b grades the
+  // list's HEAD; this grades its START. Also offline — both operands are shas in the file,
+  // so it costs one `merge-base --is-ancestor` and no network.
   const holdStaleness = new Map();
+  const holdBaseline = new Map();
   if (deployHold.applicable.length) {
     const enumProbe = gitEnumerationProbe();
-    for (const h of deployHold.applicable) holdStaleness.set(h, deployHoldStaleness(h, enumProbe));
+    for (const h of deployHold.applicable) {
+      holdStaleness.set(h, deployHoldStaleness(h, enumProbe));
+      holdBaseline.set(h, deployHoldBaseline(h, enumProbe));
+    }
   }
 
   if (deployHoldBlocks(deployHold.verdict) && !HAS_HOLD_OVERRIDE) {
-    console.error(renderDeployHoldRefusal(deployHold, { staleness: holdStaleness }));
+    console.error(renderDeployHoldRefusal(deployHold, { staleness: holdStaleness, baselines: holdBaseline }));
     process.exit(9);
   }
 
@@ -1569,7 +1878,18 @@ async function main() {
                         st.status === 'STALE' ? `, ${st.commits.length} commit(s) and ${st.serverPaths.length} server-byte path(s) since` : ''
                       }. You are overriding a list that does NOT describe what you are shipping (TRA-4262).\n`
                     : '';
-                return `  broken  : ${h.ticket} (opened ${h.openedAt} by ${h.openedBy})\n  emits   : ${h.emits.join('\n            ')}\n${stale}`;
+                // TRA-4268: and say what window the list covers, in the same breath. The
+                // override echo is the last place emits[] is read before bytes move, so it
+                // is the last place its START POINT can be said.
+                const bl = holdBaseline.get(h);
+                const window = bl
+                  ? `  window  : ${bl.baseline ? bl.baseline.slice(0, 12) : '???'}..${bl.head ? bl.head.slice(0, 12) : '???'}${
+                      deployHoldBaselineIsLoud(bl.status)
+                        ? `  ⚠ ${bl.status} — ${bl.why}. The baseline for emits[] is the LIVE DEPLOYED PIN, never the enumerator's starting tip (TRA-4268).`
+                        : '  (from the live deployed pin — re-read it, do not recall it)'
+                    }\n`
+                  : '';
+                return `  broken  : ${h.ticket} (opened ${h.openedAt} by ${h.openedBy})\n${window}  emits   : ${h.emits.join('\n            ')}\n${stale}`;
               })
               .join('')) +
         `  Tell the hold's owner BEFORE the box boots, not after. If the hold is genuinely dead,\n` +
@@ -1719,6 +2039,21 @@ async function main() {
   // answer a question the caller did not ask.
   const live = isSoakHost ? await fetchLiveCommit() : null;
   const rollback = isSoakHost ? rollbackState(target, live) : { verdict: 'NOT_GATED', why: null };
+
+  // ── The NETWORK half of the emits[] baseline (TRA-4268, AC4) ───────────────
+  // Here, and NOT at gate −1, because gate −1 is offline by design and that is why its
+  // refusal precedes any byte on the wire. This point already holds the live pin, so the
+  // check is free. Read-only: it never refuses and never lifts anything. It is printed
+  // BEFORE the rollback refusal below, so it is on the record even when Gate 4 then exits.
+  // Reachable only when applicable holds were overridden — which is the moment it matters.
+  if (isSoakHost && deployHold.applicable.length) {
+    for (const h of deployHold.applicable) {
+      const drift = deployHoldPinDrift(h, live);
+      const text = renderDeployHoldPinDrift(h, drift);
+      if (deployHoldPinDriftIsLoud(drift.status)) console.error(text);
+      else console.log(text);
+    }
+  }
 
   if (isSoakHost && rollbackBlocks(rollback.verdict) && !HAS_ROLLBACK_OVERRIDE) {
     const dropped =
