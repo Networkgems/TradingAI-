@@ -246,7 +246,9 @@ import {
 } from '../session-edge-blackout-flag.js'; // TRA-2049
 // TRA-1001 — since-boot counters for the risk-throttle sizing consumer.
 import { snapshotRiskThrottleSizing } from '../risk-throttle-sizing.js';
-import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, OPTION_ENTRY_DELTA_CEILING_FLAG, isExitRiskRulesEnabled, EXIT_RISK_RULES_FLAG, isBookGiveBackArmFloorEnabled, BOOK_GIVEBACK_ARM_FLOOR_FLAG, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_FLAG, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, isTakeProfitEarlyLiveEnabled, TAKE_PROFIT_EARLY_LIVE_FLAG, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_VALUE, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, resolveOptionsHaltScope, OPTIONS_HALT_SCOPE_VAR, type OptionsHaltScopeResolution } from '../exit-risk-rules-flag.js';
+import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, OPTION_ENTRY_DELTA_CEILING_FLAG, isExitRiskRulesEnabled, EXIT_RISK_RULES_FLAG, isBookGiveBackArmFloorEnabled, BOOK_GIVEBACK_ARM_FLOOR_FLAG, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_FLAG, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, isTakeProfitEarlyLiveEnabled, TAKE_PROFIT_EARLY_LIVE_FLAG, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_VALUE, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, resolveOptionsHaltScope, OPTIONS_HALT_SCOPE_VAR, isOtmTp1FullExit1LotEnabled, OTM_TP1_FULL_EXIT_1LOT_FLAG, type OptionsHaltScopeResolution } from '../exit-risk-rules-flag.js';
+// TRA-4244 — the env-resolved OTM profit-side schedule, surfaced beside barR.
+import { describeOtmProfitSchedule } from '../otm-profit-schedule.js';
 import { summarizeOptionsBreakerLedger } from '../options-breaker-ledger.js'; // TRA-3218
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX, ENTRY_DELTA_THETA_RATIO_FLOOR, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
@@ -5492,6 +5494,41 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
           floor: resolveOptionOtmDeltaFloorLive(liveEnv),
           /** The RAW env value, so a typo'd `OPTION_OTM_DELTA_FLOOR_LIVE` (which falls back to the default) is visible, not inferred. */
           floorValueRaw: liveEnv[OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR] ?? null,
+        },
+        /**
+         * TRA-4244 (parent TRA-4238) — the PROFIT side of the same sleeve. Every
+         * other block here is an ADMISSION gate; this one is the exit schedule
+         * the admitted row is then managed under, and it was the half nothing
+         * published. TRA-4238 measured the consequence: with the compiled TP1 at
+         * +50% and the profit lock arming at 0.75R, the two rules that are
+         * supposed to monetize a winner never fired on the live sleeve, and no
+         * surface said which numbers were in force.
+         *
+         * Same contract as `costBar.bar` (TRA-3515's `barR`): the RESOLVED value
+         * beside its SOURCE, so an override that silently failed to parse reads
+         * as `source: 'compiled'` with a named rejection instead of a deliberate
+         * default. ⭐ The four knobs fail closed as a SET — `rejected` non-empty
+         * means every override was discarded, not just the offending one.
+         *
+         * ⚠️ Resolved from `process.env` AT REQUEST TIME; the account resolved
+         * its copy AT BOOT. An env write that has not been applied by a redeploy
+         * (TRA-3724) therefore shows up HERE before it is in force in the engine.
+         * That is deliberate — it is the only way to see a pending re-cut — but
+         * it means this block answers "what would a restart run", and the live
+         * build's SHA (`build` above) is what says whether it already does.
+         */
+        profitSchedule: {
+          ...describeOtmProfitSchedule(liveEnv),
+          /**
+           * TRA-4244 (b) — without this, TP1 is dead on the live sleeve at ANY
+           * threshold: the partial branch is gated on `contractsRemaining > 1`
+           * and every live OTM row is a 1-lot. So `effective.tp1Pct` above is
+           * only a REACHABLE number while this reads `armed: true`.
+           */
+          tp1FullExit1Lot: {
+            flag: OTM_TP1_FULL_EXIT_1LOT_FLAG,
+            armed: isOtmTp1FullExit1LotEnabled(liveEnv),
+          },
         },
       },
       tighteningOnly: true,

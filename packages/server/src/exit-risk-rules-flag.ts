@@ -495,6 +495,32 @@ export function isProfitFloorTrailEnabled(env: NodeJS.ProcessEnv = process.env):
   return isExitRiskRulesEnabled(env) && flagOn(env[PROFIT_FLOOR_TRAIL_FLAG]);
 }
 
+// TRA-4244 (parent TRA-4238) — TP1 as a FULL exit on a 1-lot row.
+//
+// The TP1 partial branch is gated on `contractsRemaining > 1` and then floors
+// the slice at `floor(n × partialExitRatio)`, which is 0 for n ≤ 2 at the OTM
+// sleeve's 0.4 ratio. Every row the live OTM sleeve has ever opened is a 1-lot,
+// so TP1 is not "rarely reached" on that book — it is STRUCTURALLY DEAD, at any
+// threshold. Re-cutting `OTM_TP1_PCT_OVERRIDE` down to the fitted 0.12 changes
+// nothing on its own; this flag is what makes the fitted TP1 reachable.
+//
+// Armed ⇒ a 1-lot row that touches `tp1Premium` exits the WHOLE position at
+// `tp1Premium` through the ordinary staging path, journalled `tp1`. Rows with
+// 2+ contracts are untouched and keep taking the partial.
+//
+// Deliberately STANDALONE (not behind `EXIT_RISK_RULES_ENABLED`): TP1 is a base
+// rule that has always run with the master off, so riding this on the master
+// would make the flag mean different things on the two books. Live reads
+// `process.env` only. OFF by default — a single env write arms it and a single
+// env write reverts it, which is the board's re-cuttability ask (TRA-4236
+// interaction `bbd294af`). Accepts 1/true/yes/on.
+export const OTM_TP1_FULL_EXIT_1LOT_FLAG = 'OTM_TP1_FULL_EXIT_1LOT';
+
+/** True iff a 1-lot row may take TP1 as a full exit (TRA-4244). Standalone flag. */
+export function isOtmTp1FullExit1LotEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[OTM_TP1_FULL_EXIT_1LOT_FLAG]);
+}
+
 // TRA-3218 (parent TRA-2760) — the SCOPE of the book session-stop / give-back
 // halt as seen by the OPTIONS entry gates.
 //

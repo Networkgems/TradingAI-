@@ -23,7 +23,7 @@ import type {
   ExitBreakerCauseClass,
   ExitBreakerName,
 } from '@trading-app/shared';
-import { buildEntryQuoteStamp, PROFIT_FLOOR_LADDER } from '@trading-app/shared';
+import { buildEntryQuoteStamp } from '@trading-app/shared';
 import type {
   ProfitFloorLadderStep,
   OptionProfitFloorPdtHold,
@@ -235,7 +235,15 @@ import {
   type AverageDownShadowReason,
 } from './option-average-down-shadow.js';
 import { resolveCanaryCeiling } from './canary-ceiling.js';
-import { resolveOptionOpeningRangeMin, resolveLiveOptionStopPolicy } from './exit-risk-rules-flag.js';
+import { resolveOptionOpeningRangeMin, resolveLiveOptionStopPolicy, isOtmTp1FullExit1LotEnabled } from './exit-risk-rules-flag.js';
+// TRA-4244 — the env-resolved profit-side schedule (TP1 %, lock arm / give-backs)
+// and the floor ladder derived from it. Pure over env; resolved once per account.
+import {
+  resolveOtmProfitSchedule,
+  otmRiskParamsFor,
+  buildProfitFloorLadder,
+  type OtmProfitSchedule,
+} from './otm-profit-schedule.js';
 // TRA-2333 — the arming scope stamped onto every journal open row.
 import { riskThrottleSizingScope, type RiskThrottleSizingPath } from './risk-throttle-sizing.js';
 
@@ -415,6 +423,35 @@ function journalStructureForSpread(strategy: string): string {
 const guardLog = logger.child({ module: 'day-trading-guardrail' });
 // TRA-912 — surfaces *why* a defined-risk multi-leg open was refused (pre-trade gate).
 const accountLog = logger.child({ module: 'options-account' });
+
+/**
+ * TRA-4244 — the issue's "log which key was rejected". `resolveOtmProfitSchedule`
+ * is PURE (the health route calls it per request), so the log lives here, at the
+ * one site that runs once per account rather than once per read.
+ *
+ * Latched per process and keyed by the rejection set: several accounts are
+ * constructed on one boot and they all read the same env, so an unlatched log
+ * would repeat the same warning per book. A DIFFERENT rejection set — only
+ * reachable from an injected schedule in tests — still logs.
+ */
+const loggedProfitScheduleRejections = new Set<string>();
+function noteOtmProfitScheduleRejections(schedule: OtmProfitSchedule): void {
+  if (schedule.rejected.length === 0) return;
+  const key = schedule.rejected.map((r) => `${r.key}=${r.raw ?? ''}:${r.reason}`).join('|');
+  if (loggedProfitScheduleRejections.has(key)) return;
+  loggedProfitScheduleRejections.add(key);
+  accountLog.warn('OTM profit-side override REJECTED — whole set failed closed to compiled defaults', {
+    issue: 'TRA-4244',
+    rejected: schedule.rejected,
+    effective: {
+      tp1Pct: schedule.tp1Pct,
+      armR: schedule.armR,
+      giveBackR: schedule.giveBackR,
+      tightenGiveBackR: schedule.tightenGiveBackR,
+    },
+    surface: '/api/health/live-enforce-gates → arm.profitSchedule',
+  });
+}
 
 /**
  * TRA-1656 (TRA-1602B) — lift the fill-time two-sided quote off an option signal
@@ -4730,6 +4767,23 @@ interface OptionsAccountConfig {
    */
   otmRiskParams?: OtmRiskParams;
   /**
+   * TRA-4244 (parent TRA-4238) — the env-resolved PROFIT-SIDE schedule (TP1 %,
+   * profit-lock arm and give-backs). When omitted the account resolves it from
+   * `process.env` at construction, which with no keys set is the compiled
+   * bundle — bit-identical to the pre-TRA-4244 build. Injected in tests so the
+   * schedule is an argument rather than an ambient env read.
+   *
+   * ⚠️ An explicit `otmRiskParams` WINS on `tp1Pct`: a caller that hands over a
+   * whole risk bundle (the backtest replays, the sweep) has asserted its own
+   * schedule and must not have an env key on the box silently rewritten into it.
+   */
+  otmProfitSchedule?: OtmProfitSchedule;
+  /**
+   * TRA-4244 — arm TP1 as a FULL exit on a 1-lot row. Defaults to the
+   * `OTM_TP1_FULL_EXIT_1LOT` env flag (OFF unless set).
+   */
+  tp1FullExit1Lot?: boolean;
+  /**
    * Relative-value scanner risk overrides (TRA-191). When omitted, the account
    * uses `RV_RISK_PARAMS` from `@trading-app/shared`.
    */
@@ -5329,6 +5383,17 @@ export class PaperOptionsAccount {
   private riskPerTrade: number;
   private optionsDailyTradesLimit: number;
   private otmRiskParams: OtmRiskParams;
+  /**
+   * TRA-4244 — the effective profit-side schedule, resolved ONCE at construction
+   * (env is read at boot, applied by redeploy; TRA-3724). Every profit-side call
+   * site takes its numbers from here rather than importing the compiled
+   * constants, so an env re-cut cannot land on half the rule.
+   */
+  private otmProfitSchedule: OtmProfitSchedule;
+  /** TRA-4244 — the TRA-4020 floor ladder rebuilt against {@link otmProfitSchedule}. */
+  private effectiveFloorLadder: readonly ProfitFloorLadderStep[];
+  /** TRA-4244 — 1-lot rows may take TP1 as a full exit. OFF unless armed by env. */
+  private tp1FullExit1Lot: boolean;
   private equity: number;
   private cash: number;
   private openOptions: Map<string, OptionPosition> = new Map();
@@ -5972,7 +6037,14 @@ export class PaperOptionsAccount {
     // risk setting silently inverting the budget.
     this.riskPerTrade = normalizeNonNegative(config.riskPerTrade, DEFAULT_ACCOUNT_SETTINGS.riskPerTrade);
     this.optionsDailyTradesLimit = config.optionsDailyTradesLimit ?? DEFAULT_ACCOUNT_SETTINGS.optionsDailyTradesLimit;
-    this.otmRiskParams = config.otmRiskParams ?? OTM_RISK_PARAMS;
+    // TRA-4244 — resolve the profit-side schedule BEFORE the risk bundle: the
+    // bundle's `tp1Pct` is a member of it. An explicit `otmRiskParams` still
+    // wins (see the config doc), so injected bundles are untouched.
+    this.otmProfitSchedule = config.otmProfitSchedule ?? resolveOtmProfitSchedule();
+    this.effectiveFloorLadder = buildProfitFloorLadder(this.otmProfitSchedule);
+    this.tp1FullExit1Lot = config.tp1FullExit1Lot ?? isOtmTp1FullExit1LotEnabled();
+    noteOtmProfitScheduleRejections(this.otmProfitSchedule);
+    this.otmRiskParams = config.otmRiskParams ?? otmRiskParamsFor(this.otmProfitSchedule);
     this.rvRiskParams = config.rvRiskParams ?? RV_RISK_PARAMS;
     // ⭐ TRA-3977 — the book is read LAZILY, at call time, not captured here:
     // `setOwner` runs AFTER construction (the per-user engine wire-up), so a
@@ -10410,7 +10482,11 @@ export class PaperOptionsAccount {
           initialStop: opt.stopLossPremium,
           peakPrice: opt.peakPremium,
           currentPrice: mark,
-          floorLadder: profitFloorLadder ?? PROFIT_FLOOR_LADDER,
+          // TRA-4244 — the SHADOW's default ladder is the effective one, so the
+          // flag-off cohort TRA-4030 prices is measured against the schedule the
+          // box is actually running. `profitFloorLadder` (flag ON) already
+          // arrives built from the same schedule via the signal engine.
+          floorLadder: profitFloorLadder ?? this.effectiveFloorLadder,
         });
         if (floorRead.floor?.floorLeg && floorRead.currentR >= 0) {
           profitFloorShadow = { floorR: floorRead.floor.floorR, currentR: floorRead.currentR, peakR: floorRead.peakR };
@@ -10624,8 +10700,28 @@ export class PaperOptionsAccount {
       // near-disjoint (`mark >= tp1Premium` vs `mark <= 0.65 × premiumPaid`), but
       // "near-disjoint" is an argument about today's thresholds, not a scope, and
       // the ATR leg does not read the mark at all.
-      if (otmStopTrigger === null && !opt.tp1Hit && isArmedThreshold(opt.tp1Premium) && mark >= opt.tp1Premium && opt.contractsRemaining > 1) {
-        const exitContracts = Math.floor(opt.contractsRemaining * partialExitRatio);
+      // TRA-4244 (parent TRA-4238) — the 1-LOT FULL EXIT.
+      //
+      // `contractsRemaining > 1` plus `floor(n × partialExitRatio)` makes TP1
+      // unreachable on a 1-lot row TWICE OVER: the guard rejects it, and the
+      // floor would size the slice at 0 anyway (0.4 × 1 → 0; 0.4 × 2 → 0). Every
+      // row the live OTM sleeve has opened is a 1-lot, so on that book TP1 is
+      // not a rule that rarely fires — it is dead at any threshold, which is why
+      // re-cutting `OTM_TP1_PCT_OVERRIDE` alone would have changed nothing.
+      //
+      // Armed, a 1-lot row takes the WHOLE position at `tp1Premium` down the
+      // same staging path (`kind: 'tp1'`, `journalReason: 'tp1'`) — and
+      // `finalizePendingExit` already routes a `tp1` fill that sold the last
+      // contracts to its full-close branch, so the live half needs no new
+      // lifecycle. Rows with 2+ contracts are untouched.
+      const tp1FullExit = this.tp1FullExit1Lot && opt.contractsRemaining === 1;
+      if (
+        otmStopTrigger === null && !opt.tp1Hit && isArmedThreshold(opt.tp1Premium) && mark >= opt.tp1Premium
+        && (opt.contractsRemaining > 1 || tp1FullExit)
+      ) {
+        const exitContracts = tp1FullExit
+          ? opt.contractsRemaining
+          : Math.floor(opt.contractsRemaining * partialExitRatio);
         if (exitContracts > 0) {
           if (waitAndHold) {
             // TRA-354 — stage the partial exit at the TP1 trigger price; engine
@@ -10695,6 +10791,22 @@ export class PaperOptionsAccount {
           // on the close row being genuinely cumulative.
           opt.pnl = (opt.pnl ?? 0) + partialPnl - exitFee;
           opt.contractsRemaining -= exitContracts;
+          // TRA-4244 — the demo/backtest twin of the live full-exit. The row is
+          // FLAT now, so it must be retired rather than left in `openOptions`
+          // with `contractsRemaining: 0` (an open row nothing can ever close),
+          // and the journal owes a CLOSE row, not a partial: `realizedR` and the
+          // learned-weights fold both key off the close.
+          if (tp1FullExit) {
+            opt.tp1Hit = true;
+            opt.exitReason = 'tp1';
+            opt.closedAt = Date.now();
+            opt.currentPremium = effectiveExit;
+            this.openOptions.delete(id);
+            this.closedOptions.push({ ...opt });
+            this.queueJournalClose(opt, 'tp1');
+            closed.push({ ...opt });
+            continue;
+          }
           opt.tp1Hit = true;
           // TRA-2895 — date the slice on the day it realized, so the day cell
           // sources `journal` instead of a zero that reads as proven.
@@ -10917,12 +11029,23 @@ export class PaperOptionsAccount {
           // yesterday's" is now checked rather than assumed; (R4) the decision
           // is evaluated INSIDE the window too (pure, no side effect) so a
           // refusal is counted on the row instead of vanishing.
+          // TRA-4244 — the four scalars come from the env-resolved schedule
+          // instead of `profitLockDecision`'s own compiled defaults. With no
+          // override keys set they ARE those defaults, so this call is
+          // bit-identical to the pre-TRA-4244 one; the params already existed on
+          // `ProfitLockParams` and this call site simply never passed them.
+          // Ignored while a `floorLadder` is supplied (the ladder carries its own
+          // give-backs — built from this same schedule).
           const lock = profitLockDecision({
             side: 'buy',
             entry: opt.premiumPaid,
             initialStop: opt.stopLossPremium,
             peakPrice: opt.peakPremium,
             currentPrice: mark,
+            armR: this.otmProfitSchedule.armR,
+            giveBackR: this.otmProfitSchedule.giveBackR,
+            tightenPeakR: this.otmProfitSchedule.tightenPeakR,
+            tightenGiveBackR: this.otmProfitSchedule.tightenGiveBackR,
             ...(profitFloorLadder !== undefined ? { floorLadder: profitFloorLadder } : {}),
           });
           if (lock.shouldExit) {

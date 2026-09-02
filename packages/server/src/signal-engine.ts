@@ -11,7 +11,7 @@ import {
   type LiveBrokerPositionDriftReport,
 } from './live-broker-position-drift.js';
 import { roundToCent } from '@trading-app/engine';
-import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, PROFIT_FLOOR_LADDER, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
+import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-3390 (impl child of TRA-2628) — the entry-path currency refusal. See
@@ -191,6 +191,7 @@ import {
 } from './wheel-iv-entry-filter.js';
 import { recordWheelBookSnapshot } from './wheel-promotion-gate-store.js';
 import type { WheelBookPosition } from './wheel-vol-stress-harness.js';
+import { buildProfitFloorLadder, resolveOtmProfitSchedule } from './otm-profit-schedule.js';
 import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isProfitFloorTrailEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, resolveOptionOpeningRangeMin, resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
 // TRA-3401 — nominate an OTM strike inside the band the cost bar can admit.
 import { selectAdmissibleOtmCandidate, isOtmAdmissibleStrikeEnabled, resolveAdmissibleBand } from './otm-admissible-strike.js';
@@ -2951,10 +2952,17 @@ export class SignalEngine {
     // exit-risk master (the floor is a leg of the profit-lock, which only
     // exists while `exitRisk` does). Ships OFF; arming on bqb1 is a board /
     // operator call graded by QuantTrader.
+    // TRA-4244 — the ladder is built against the EFFECTIVE give-backs, so an env
+    // re-cut of `PROFIT_LOCK_GIVEBACK_R_OVERRIDE` cannot leave the flag-on rule
+    // running the compiled allowance while the flag-off rule runs the new one.
+    // The VALUES are read from `process.env` on both books (they are a boot
+    // config applied by redeploy, TRA-3724), unlike the ARM above, which keeps
+    // its live / demo-overlay split. With no override keys set
+    // `buildProfitFloorLadder` returns the compiled `PROFIT_FLOOR_LADDER` itself.
     const profitFloorLadder = isProfitFloorTrailEnabled(
       this.mode === 'live' ? process.env : this.resolveDemoFlagEnv(),
     )
-      ? PROFIT_FLOOR_LADDER
+      ? buildProfitFloorLadder(resolveOtmProfitSchedule())
       : undefined;
     if (
       underlyingAtrBySymbol.size === 0
