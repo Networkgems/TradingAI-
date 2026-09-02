@@ -127,6 +127,15 @@ describe('option resolvers', () => {
     expect(getOptionOpenSortValue(opt({ trailingActive: false }), 'status')).toBe('open');
   });
 
+  // TRA-4282 — the cell renders LATCHED over TRAILING/OPEN; the sort must
+  // group on the same precedence so a latched row cannot hide among open ones.
+  it('ranks a close-reject-latched row as latched, outranking trailing', () => {
+    expect(getOptionOpenSortValue(opt({ closeRejectCount: 3 }), 'status')).toBe('latched');
+    expect(getOptionOpenSortValue(opt({ closeRejectCount: 3, trailingActive: true }), 'status')).toBe('latched');
+    // Below the engine cap is NOT latched — the failing direction.
+    expect(getOptionOpenSortValue(opt({ closeRejectCount: 2 }), 'status')).toBe('open');
+  });
+
   it('computes closed-option P&L % from exit premium vs entry', () => {
     // (1.5 - 1.0) / 1.0 * 100 = +50%
     expect(getOptionClosedSortValue(opt(), 'pnlPct')).toBeCloseTo(50);

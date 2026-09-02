@@ -6,6 +6,7 @@ import type { Position, OptionPosition } from '@trading-app/shared';
 import { displayOptionMark } from '@trading-app/shared';
 import type { SymbolState } from '../types/app';
 import { isQuoteMoveUnreliable } from './format';
+import { closeRejectLatch } from './optionRowState';
 
 // TRA-339 — Stock-dashboard sort keys mirror the Crypto set, minus the
 // perp-only leverage / liquidation columns (Stocks have no perps), and
@@ -94,7 +95,10 @@ export function getOptionOpenSortValue(o: OptionPosition, key: OptionOpenSortKey
       const unrealized = (displayOptionMark(o) - o.premiumPaid) * o.contractsRemaining * 100;
       return unrealized + (o.pnl ?? 0);
     }
-    case 'status': return o.trailingActive ? 'trailing' : 'open';
+    // TRA-4282 — the cell renders LATCHED over TRAILING/OPEN, so sort on the
+    // same precedence; a latched row must group with latched rows, not hide
+    // among open ones.
+    case 'status': return closeRejectLatch(o) ? 'latched' : o.trailingActive ? 'trailing' : 'open';
     case 'opened': return o.openedAt;
   }
 }

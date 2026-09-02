@@ -8,6 +8,7 @@ import { fmt, fmtDollar, fmtPct, formatTime, formatExpirationShort, signalLabel 
 import { useTableSort, sortRows, SortableTH } from '../../lib/sort.tsx';
 import { getOptionOpenSortValue, getOptionClosedSortValue } from '../../lib/stockSort';
 import type { OptionOpenSortKey, OptionClosedSortKey } from '../../lib/stockSort';
+import { stopBreachState, closeRejectLatch } from '../../lib/optionRowState';
 import { useStockOptionClose } from '../../hooks/useStockOptionClose';
 import { CloseOptionDrawer } from './CloseOptionDrawer';
 import { AccountSummaryCard } from './AccountSummaryCard';
@@ -95,6 +96,11 @@ export function StockOptionsPanel({
                 // Auto-managed imports get RV-default thresholds; legacy imports
                 // with auto-management off keep sentinels and render "—".
                 const hasStopSchedule = o.stopLossPremium > 0 && Number.isFinite(o.tp1Premium);
+                // TRA-4282 — breach graded on the engine's own basis
+                // (`currentPremium`, the mid), and the close-reject latch that
+                // stops the engine staging any new exit for the row.
+                const breach = stopBreachState(o);
+                const latch = closeRejectLatch(o);
                 return (
                   <tr key={o.id}>
                     <td className="symbol">
@@ -122,15 +128,48 @@ export function StockOptionsPanel({
                     <td className={!hasMark ? 'muted' : (pnlDollar >= 0 ? 'green' : 'red')}>
                       {hasMark ? fmtDollar(pnlDollar) : '—'}
                     </td>
-                    <td className={o.trailingActive ? 'green' : 'muted'}>
-                      {o.trailingActive ? 'TRAILING' : 'OPEN'}
+                    {/* TRA-4282 — a latched row must not read OPEN: the engine
+                        has stopped staging exit orders for it (closeRejectCount
+                        at the cap), which is a different fact from "no exit rule
+                        has fired". The latch outranks TRAILING for the same
+                        reason: a trailing stop nobody will submit is not
+                        trailing anything. */}
+                    <td
+                      className={latch ? 'red' : o.trailingActive ? 'green' : 'muted'}
+                      title={latch
+                        ? `Auto-exit latched: ${latch.count} consecutive rejected sell_to_close attempts`
+                          + ` (engine cap ${latch.max}) — the engine stages no new exit order for this row.`
+                          + (o.exitBreakerTrip ? ` Tripped ${formatTime(o.exitBreakerTrip.at)} (${o.exitBreakerTrip.causeClass}).` : '')
+                          + (latch.probeNotBeforeMs
+                            ? ` Half-open retest not before ${formatTime(latch.probeNotBeforeMs)}.`
+                            : ' No scheduled release — indefinite until a fill or a manual re-stage.')
+                        : undefined}
+                    >
+                      {latch ? (
+                        <>
+                          {`LATCHED ${latch.count}/${latch.max}`}
+                          <div style={{ fontSize: '0.7rem', fontWeight: 'normal' }}>
+                            {`close rejected ×${latch.count} · `}
+                            {latch.probeNotBeforeMs ? `retest ${formatTime(latch.probeNotBeforeMs)}` : 'indefinite'}
+                          </div>
+                        </>
+                      ) : o.trailingActive ? 'TRAILING' : 'OPEN'}
                     </td>
-                    <td className={hasStopSchedule ? 'red' : 'muted'}>
+                    {/* TRA-4282 — red means BREACHED (engine basis: mid ≤ stop),
+                        not "a stop exists". A set-but-unbreached stop renders
+                        undecorated; a dark mid grades set, never breached. */}
+                    <td
+                      className={!hasStopSchedule ? 'muted' : breach === 'breached' ? 'red' : ''}
+                      title={!hasStopSchedule ? undefined
+                        : breach === 'breached'
+                          ? `Stop breached: mid $${fmt(o.currentPremium)} is at/below the stop — the engine's exit condition is met.`
+                          : `Stop set, not breached: mid $${fmt(o.currentPremium)} is above the stop.`}
+                    >
                       {!hasStopSchedule
                         ? '—'
                         : o.trailingActive
-                          ? `$${fmt(o.trailingStopPremium)} (trail)`
-                          : `$${fmt(o.stopLossPremium)} (SL)`}
+                          ? `$${fmt(o.trailingStopPremium)} (trail${breach === 'breached' ? ' · breached' : ''})`
+                          : `$${fmt(o.stopLossPremium)} (SL${breach === 'breached' ? ' · breached' : ''})`}
                     </td>
                     <td>{signalLabel(o.signalType)}</td>
                     <td className="muted">{formatTime(o.openedAt)}</td>
@@ -180,16 +219,27 @@ export function StockOptionsPanel({
                           );
                         }
                         const closeInFlight = closingOptions[o.id] === true;
+                        // TRA-4282 — on a latched row the button stays ENABLED
+                        // (it is the operator's designed escape hatch) but must
+                        // not be silent about the state. The label describes the
+                        // latch only: whether a manual close can actually route
+                        // is decided by the close route's own gates, and the
+                        // row's server-composed notice below (TRA-4224) is the
+                        // authority on that — this label instructs nothing.
                         return (
                           <button
                             className="btn-close-pos"
                             disabled={closeInFlight}
                             onClick={() => openCloseDrawer(o, isLiveEngineOpened)}
-                            title={isLiveEngineOpened
-                              ? 'Open the limit-close panel (mirrors Tradier price/qty/duration)'
-                              : 'Close this position'}
+                            title={latch
+                              ? `Auto-exit latched (${latch.count}/${latch.max} rejected close attempts); the engine`
+                                + ' stages no new exit order for this row. This button starts a manual close attempt —'
+                                + ' whether it can route is decided by the close route’s own gates (see the notice below).'
+                              : isLiveEngineOpened
+                                ? 'Open the limit-close panel (mirrors Tradier price/qty/duration)'
+                                : 'Close this position'}
                           >
-                            {closeInFlight ? 'Closing…' : 'Close'}
+                            {closeInFlight ? 'Closing…' : latch ? 'Close (latched)' : 'Close'}
                           </button>
                         );
                       })()}

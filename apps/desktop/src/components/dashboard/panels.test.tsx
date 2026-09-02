@@ -392,6 +392,127 @@ describe('StockOptionsPanel (TRA-422)', () => {
   });
 });
 
+// TRA-4282 — the open table previously had NO failing direction on either of
+// the two facts that matter on a breached real-money row: the Trail/SL cell
+// was red whenever a stop EXISTED (a +30% winner rendered identically to a row
+// through its stop), and `closeRejectCount` — the latch that stops the engine
+// staging any exit — had zero occurrences in apps/desktop/src. These tests pin
+// the instrument in the direction it failed on 2026-09-01 (three live rows
+// below their stops, latched 3/3, all reading OPEN with an unannotated Close).
+describe('StockOptionsPanel breach + latch instrumentation (TRA-4282)', () => {
+  const renderOpen = (rows: OptionPosition[]) => renderWithToast(
+    <StockOptionsPanel
+      token="t" tradierEnv="production" accountMode="live" account={undefined}
+      optionsState={undefined} openOptions={rows} closedOptions={[]} optionsDailyLimit={5}
+    />,
+  );
+
+  it('marks a breached stop red with a "breached" label (engine basis: mid ≤ stop)', () => {
+    renderOpen([optionPos({
+      id: 'b1', symbol: 'KO', premiumPaid: 2.0, currentPremium: 0.95,
+      stopLossPremium: 1.464, tp1Premium: 2.5,
+    })]);
+    const cell = screen.getByText('$1.46 (SL · breached)');
+    expect(cell.closest('td')!.className).toContain('red');
+  });
+
+  it('does NOT mark a set-but-unbreached stop red — red must mean breached, not "a stop exists"', () => {
+    // The planted value the old cell could not distinguish: +30% winner, stop set.
+    renderOpen([optionPos({
+      id: 'b2', symbol: 'KO', premiumPaid: 2.0, currentPremium: 2.6,
+      stopLossPremium: 1.464, tp1Premium: 2.5,
+    })]);
+    const cell = screen.getByText('$1.46 (SL)');
+    expect(cell.closest('td')!.className).not.toContain('red');
+    expect(screen.queryByText(/breached/)).not.toBeInTheDocument();
+  });
+
+  it('grades a trailing stop against the trail premium', () => {
+    renderOpen([optionPos({
+      id: 'b3', symbol: 'NOK', premiumPaid: 2.0, currentPremium: 0.9,
+      stopLossPremium: 0.5, tp1Premium: 2.5, trailingActive: true, trailingStopPremium: 1.0,
+    })]);
+    const cell = screen.getByText('$1.00 (trail · breached)');
+    expect(cell.closest('td')!.className).toContain('red');
+  });
+
+  it('grades a dark mid as set, never breached — no reading is not a low reading', () => {
+    renderOpen([optionPos({
+      id: 'b4', symbol: 'KO', premiumPaid: 2.0, currentPremium: 0,
+      stopLossPremium: 1.464, tp1Premium: 2.5,
+    })]);
+    expect(screen.getByText('$1.46 (SL)')).toBeInTheDocument();
+    expect(screen.queryByText(/breached/)).not.toBeInTheDocument();
+  });
+
+  it('renders a latched row as LATCHED 3/3 with the reason, never OPEN', () => {
+    renderOpen([optionPos({
+      id: 'l1', symbol: 'KO', premiumPaid: 2.0, currentPremium: 0.95,
+      stopLossPremium: 1.464, tp1Premium: 2.5, closeRejectCount: 3,
+      exitBreakerTrip: { breaker: 'close_reject', at: 1756668000000, causeClass: 'broker_refusal', count: 3 },
+    })]);
+    const status = screen.getByText('LATCHED 3/3');
+    expect(status.closest('td')!.className).toContain('red');
+    expect(status.closest('td')!.getAttribute('title')).toMatch(/broker_refusal/);
+    expect(screen.getByText(/close rejected ×3/)).toBeInTheDocument();
+    expect(screen.queryByText('OPEN')).not.toBeInTheDocument();
+  });
+
+  it('shows "indefinite" when the latch carries no release instant (today\'s live shape)', () => {
+    renderOpen([optionPos({
+      id: 'l2', symbol: 'KO', premiumPaid: 2.0, currentPremium: 0.95,
+      stopLossPremium: 1.464, tp1Premium: 2.5, closeRejectCount: 3,
+    })]);
+    expect(screen.getByText(/indefinite/)).toBeInTheDocument();
+    expect(screen.queryByText(/retest/)).not.toBeInTheDocument();
+  });
+
+  it('shows the half-open release instant instead of "indefinite" once TRA-4266 stamps one', () => {
+    renderOpen([optionPos({
+      id: 'l3', symbol: 'KO', premiumPaid: 2.0, currentPremium: 0.95,
+      stopLossPremium: 1.464, tp1Premium: 2.5, closeRejectCount: 3,
+      closeRejectProbeNotBeforeMs: Date.now() + 5 * 60_000,
+    })]);
+    expect(screen.getByText(/retest/)).toBeInTheDocument();
+    expect(screen.queryByText(/indefinite/)).not.toBeInTheDocument();
+  });
+
+  it('does NOT latch below the cap — closeRejectCount 2 still reads OPEN with a plain Close', () => {
+    renderOpen([optionPos({
+      id: 'l4', symbol: 'KO', premiumPaid: 2.0, currentPremium: 0.95,
+      stopLossPremium: 1.464, tp1Premium: 2.5, closeRejectCount: 2,
+    })]);
+    expect(screen.getByText('OPEN')).toBeInTheDocument();
+    expect(screen.queryByText(/LATCHED/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Close' })).toBeInTheDocument();
+  });
+
+  it('annotates the Close button on a latched row without disabling it', () => {
+    renderOpen([optionPos({
+      id: 'l5', symbol: 'KO', premiumPaid: 2.0, currentPremium: 0.95,
+      stopLossPremium: 1.464, tp1Premium: 2.5, closeRejectCount: 3,
+    })]);
+    const btn = screen.getByRole('button', { name: 'Close (latched)' });
+    expect(btn).toBeEnabled();
+    expect(btn.getAttribute('title')).toMatch(/latched/i);
+  });
+
+  it('the latch annotation instructs nothing — recovery instructions belong to the row\'s server-composed notice (TRA-4224)', () => {
+    // On imported row a2f9c8cd the old fixed sentence ("close … with the Close
+    // button") can be false; the close route's gates decide. The UI label must
+    // describe the state only, never repeat an instruction the route may refuse.
+    renderOpen([optionPos({
+      id: 'l6', symbol: 'NOK', premiumPaid: 2.0, currentPremium: 0.425,
+      stopLossPremium: 0.456, tp1Premium: 2.5, closeRejectCount: 3,
+      importedFromTradier: true,
+    })]);
+    const btn = screen.getByRole('button', { name: 'Close (latched)' });
+    expect(btn.getAttribute('title')).not.toMatch(/close (this position )?manually|on Tradier/i);
+    const status = screen.getByText('LATCHED 3/3');
+    expect(status.closest('td')!.getAttribute('title')).not.toMatch(/close (this position )?manually|with the Close button/i);
+  });
+});
+
 describe('OptionsAlertsPanel (TRA-1125)', () => {
   const alertsBody = JSON.stringify({
     chainDates: ['2026-06-24', '2026-06-25'],
