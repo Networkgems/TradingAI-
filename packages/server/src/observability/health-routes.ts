@@ -325,6 +325,12 @@ export interface HealthEngineLike {
   getRiskThrottle?(): number;
   /** TRA-995 — the rolling risk-autopilot action log. */
   getAutopilotActions?(): import('../risk-autopilot.js').AutopilotAction[];
+  /**
+   * TRA-4281 — the book's live stop-actionability fold (the TRA-3839 join).
+   * Optional on the TYPE for test doubles, but a live book without it reads as
+   * `instrumentBlind`, not as green — see `summarizeForContext`.
+   */
+  getLiveStopActionability?(now?: number): import('../options-account.js').LiveStopActionabilityQualified;
 }
 export interface HealthUserContext {
   username: string;
@@ -2973,6 +2979,27 @@ function summarizeForContext(
     // TRA-1001 — and whether per-trade sizing actually CONSUMES that throttle,
     // with since-boot trim counts so "armed" and "ever ran" stay separable.
     throttleSizing: snapshotRiskThrottleSizing(),
+    // TRA-4281 — the exit dimension, read from the fold that already exists
+    // (`getLiveStopActionability`, the TRA-3839 join), never re-derived here.
+    // A throw — or an engine that does not expose the fold — publishes
+    // `instrumentBlind: true`, which the summarizer refuses to read as green on
+    // a live book: blind and clean must not share a status.
+    liveStopActionability: (() => {
+      try {
+        const read = ctx.engine.getLiveStopActionability?.(now);
+        return read !== undefined
+          ? { instrumentBlind: false as const, ...read }
+          : {
+              instrumentBlind: true as const,
+              blindReason: 'engine does not expose getLiveStopActionability',
+            };
+      } catch (err) {
+        return {
+          instrumentBlind: true as const,
+          blindReason: err instanceof Error ? err.message : String(err),
+        };
+      }
+    })(),
   });
 }
 

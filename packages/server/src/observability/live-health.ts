@@ -15,10 +15,26 @@
 
 import type { AccountMode, TradierEnv } from '@trading-app/shared';
 import { MAX_QUOTE_AGE_MS } from '../feed-freshness.js';
+import type { LiveStopActionabilitySummary } from '../options-account.js';
 import type { AutopilotAction } from '../risk-autopilot.js';
 import type { RiskThrottleSizingSnapshot } from '../risk-throttle-sizing.js';
 
 export type HealthStatus = 'green' | 'yellow' | 'red';
+
+/**
+ * TRA-4281 — the exit dimension of live health, as READ FROM the fold that
+ * already exists (`getLiveStopActionability()` /
+ * `summarizeLiveStopActionability`), never a second derivation. The type is an
+ * intersection with `LiveStopActionabilitySummary` itself so this surface
+ * cannot drift from the instrument it is quoting.
+ *
+ * `instrumentBlind: true` is a first-class reading, not an absence: "could not
+ * measure" and "measured clean" must not share a status (the route's blind
+ * branch supplies it when the fold throws or the engine does not expose it).
+ */
+export type LiveStopExitHealth =
+  | ({ instrumentBlind: false } & LiveStopActionabilitySummary)
+  | { instrumentBlind: true; blindReason: string | null };
 
 /** A market-data feed is "down" when no tick has landed in this long. */
 export const MAX_TICK_AGE_MS = 5 * 60_000;
@@ -64,6 +80,19 @@ export interface LiveHealthInput {
    * "never consulted" and "not measured" are different states).
    */
   throttleSizing?: RiskThrottleSizingSnapshot;
+  /**
+   * TRA-4281 — whether the book's breached live stops will actually be acted
+   * on. Before this key existed, `LiveHealthInput` had no member for a
+   * position, an order, a stop, or a close outcome — so NO input value could
+   * make the panel non-green for an exit-path failure, and three unexitable
+   * real-money rows rendered as "All systems healthy".
+   *
+   * Optional ONLY for pure-function callers/tests that predate the dimension;
+   * the production route always supplies it (measured, or `instrumentBlind:
+   * true` when the fold threw / is unavailable). Absent ⇒ the summary omits the
+   * echo, same discipline as `throttleSizing`.
+   */
+  liveStopActionability?: LiveStopExitHealth;
 }
 
 export interface FeedHealth {
@@ -118,6 +147,26 @@ export interface LiveHealthSummary {
      */
     sizing?: RiskThrottleSizingSnapshot;
   };
+  /**
+   * TRA-4281 — the exit-dimension reading this verdict consumed, echoed
+   * verbatim so the panel can render the counts next to the issue string.
+   * Omitted (not zeroed) when the caller didn't measure it.
+   */
+  liveStopActionability?: LiveStopExitHealth;
+}
+
+/**
+ * TRA-4281 — render `byReason` for an issue string: reasons only (the fold
+ * already guarantees no OCC symbols), largest first, counts included only when
+ * there is more than one reason (with one reason the row count already said it).
+ */
+function inertReasonList(byReason: LiveStopActionabilitySummary['byReason']): string {
+  const entries = Object.entries(byReason)
+    .filter((e): e is [string, number] => typeof e[1] === 'number' && e[1] > 0)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  if (entries.length === 0) return 'no refusing gate recorded';
+  if (entries.length === 1) return entries[0]![0];
+  return entries.map(([reason, n]) => `${reason}×${n}`).join(', ');
 }
 
 /** Per-feed health from an engine's symbol snapshot. Pure. */
@@ -165,11 +214,18 @@ export function summarizeFeed(
  *   • live mode with a missing broker credential (the silent "live with no
  *     creds" foot-gun TRA-506 guards against, surfaced here for monitoring);
  *   • market open but the data feed is stale (no fresh quotes / engine stalled)
- *     — the literal "nothing works" symptom.
+ *     — the literal "nothing works" symptom;
+ *   • TRA-4281: live rows breached with NONE actionable and at least one inert
+ *     — real money past its stop that nothing in the engine will exit. This is
+ *     the state that let TRA-4277's condition run for a day while the panel
+ *     said "All systems healthy".
  * YELLOW — degraded or intentionally paused, worth a look but not an outage:
  *   • trading halted (risk circuit-breaker or kill switch engaged);
  *   • auto-trading switched off while in live mode;
- *   • some — but not all — symbols stale.
+ *   • some — but not all — symbols stale;
+ *   • TRA-4281: some breached live rows inert while others are still being
+ *     acted on, or (on a live book) the stop-actionability instrument is BLIND
+ *     — a blind instrument and a clean book must never share a status.
  * GREEN — none of the above.
  *
  * Market-closed is never itself an issue: a stale feed outside market hours is
@@ -205,6 +261,45 @@ export function summarizeLiveHealth(input: LiveHealthInput): LiveHealthSummary {
     );
     escalate('red');
   }
+
+  // TRA-4281 — the exit dimension. `breached === actionable + inFlight + inert`
+  // (the fold's own identity), so with `actionable === 0`:
+  //   • `inert > 0`  — at least one breached row was REFUSED by a gate and
+  //     nothing will act on it → RED. The issue names the count, the refusing
+  //     reasons, and whether a release is even scheduled.
+  //   • `inert === 0` (all in flight) — every breached row already has a
+  //     working exit order at the broker; something IS acting, and whether that
+  //     order is stalling is `staleWorkingExits`' measurement, not this one.
+  //     AC2's literal `breached > 0 && actionable === 0` predicate would flash
+  //     RED on every healthy stop fire (a row gains `pendingExit` the moment
+  //     its close is staged), so the in-flight-only case is deliberately not an
+  //     issue here.
+  // A blind instrument on a live book is YELLOW, never green: "could not
+  // measure" and "measured clean" must not share a status (AC4). On a demo book
+  // blindness is quiet for the same reason missing live creds are: the fold
+  // only ever counts LIVE rows, so there is nothing it could have seen.
+  const stops = input.liveStopActionability;
+  if (stops !== undefined) {
+    if (stops.instrumentBlind) {
+      if (isLive) {
+        issues.push(
+          `Live stop-actionability instrument is BLIND (${stops.blindReason ?? 'no reason captured'}) — a breached, unexitable book would be invisible`,
+        );
+        escalate('yellow');
+      }
+    } else if (stops.breached > 0 && stops.actionable === 0 && stops.inert > 0) {
+      issues.push(
+        `${stops.breached} live row${stops.breached === 1 ? '' : 's'} breached, 0 actionable (${inertReasonList(stops.byReason)}) — ${stops.releasesAt !== null ? `earliest release ${stops.releasesAt}` : 'no release scheduled'}`,
+      );
+      escalate('red');
+    } else if (stops.inert > 0) {
+      issues.push(
+        `${stops.inert}/${stops.breached} breached live rows are inert (${inertReasonList(stops.byReason)}) — the rest are actionable or in flight`,
+      );
+      escalate('yellow');
+    }
+  }
+
   if (input.tradingHalted) {
     issues.push(input.haltReason ? `Trading halted: ${input.haltReason}` : 'Trading halted');
     escalate('yellow');
@@ -268,5 +363,8 @@ export function summarizeLiveHealth(input: LiveHealthInput): LiveHealthSummary {
       // TRA-1001 — omitted (not zeroed) when the caller didn't measure it.
       ...(input.throttleSizing ? { sizing: input.throttleSizing } : {}),
     },
+    // TRA-4281 — omitted (not zeroed) when the caller didn't measure it; the
+    // production route always supplies measured-or-blind.
+    ...(stops !== undefined ? { liveStopActionability: stops } : {}),
   };
 }

@@ -232,6 +232,43 @@ describe('registerLiveHealthRoutes', () => {
     expect(body.build).toBeDefined();
     expect(body.feed.trackedSymbols).toBe(1);
   });
+
+  // TRA-4281 — the route feeds the engine's OWN stop-actionability fold through
+  // to the verdict (never a re-derivation), and the reading can turn the panel
+  // red. The demo double above has no fold at all, which must stay green on a
+  // demo book (blindness over a book the fold could not have counted).
+  it('GET /api/health/live goes RED off the engine stop-actionability fold (TRA-4281)', async () => {
+    const { app, routes } = fakeApp();
+    const engine: HealthUserContext['engine'] = {
+      getState: () => engineState({ marketOpen: false }),
+      getLiveStopActionability: () => ({
+        breached: 3,
+        actionable: 0,
+        inFlight: 0,
+        inert: 3,
+        byReason: { close_reject_breaker: 3 },
+        releasesAt: null,
+        fullyReleasesAt: null,
+        indefinite: 3,
+        exitPass: { reaches: true, blockedBy: null, resumesAt: null, lastPassAgeMs: 1_000 },
+        unacted: 3,
+        unactedByCause: { rowGate: 3, noExitPass: 0 },
+      }),
+    };
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => undefined) as never,
+      userCtx: async () => ({ username: 'admin', engine }),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const res = fakeRes();
+    await routes.get('/api/health/live')![1]!({}, res);
+    const body = res.body as { status: string; issues: string[] };
+    expect(body.status).toBe('red');
+    expect(body.issues[0]).toBe(
+      '3 live rows breached, 0 actionable (close_reject_breaker) — no release scheduled',
+    );
+  });
 });
 
 describe('TRA-580 live-equity acceptance probe', () => {
