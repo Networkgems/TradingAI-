@@ -10130,6 +10130,18 @@ export class PaperOptionsAccount {
       // `peakPremiumAt`; the provenance is additive.
       ratchetObservedPeakPremium(opt, mark, Date.now());
 
+      // TRA-4285 — the EXECUTABLE peak, ratcheted beside the mid ratchet so the
+      // two bases can never drift a tick apart. A long premium closes at the
+      // BID; a peak the book could never have sold at must not arm a rule whose
+      // job is to bank a gain. Ratcheted only off a usable two-sided quote
+      // (`liveQuoteFor`'s predicate) with a REAL bid — `bid: 0` passes that
+      // predicate but is "nobody will buy this", not a price a peak can rest on.
+      if (quoteAtFire !== null && quoteAtFire.bid > 0) {
+        if (!(typeof opt.peakPremiumExec === 'number' && opt.peakPremiumExec >= quoteAtFire.bid)) {
+          opt.peakPremiumExec = quoteAtFire.bid;
+        }
+      }
+
       // TRA-3946 — the average-down SHADOW, on the same mark the stops read.
       // Observe-only: writes the row's running MAE and a journal verdict, and
       // NOTHING else — no order, no row, no field the stop engine consumes.
@@ -10865,6 +10877,18 @@ export class PaperOptionsAccount {
       let exitPremium: number | null = null;
       let exitKind: 'sl' | 'trail' | null = null;
       let exitJournalReason: string | null = null;
+      // TRA-4285 — the profit leg's marketable STAGE price. Set only by the
+      // `profit_lock` fire, and only when this tick served a usable bid: the
+      // staged intent then carries a LIMIT at the BID (immediately marketable —
+      // it fills at or above it) instead of a limit at the mid that nothing
+      // lifts. This is the SUBMIT-SEAM FALLBACK price: `submitStagedOptionExits`
+      // reprices `trail`-kind limits off a fresh quote (TRA-450, bid level with
+      // the TRA-3418 concession cap) and only falls back to the staged price
+      // when that lookup fails — which is exactly when a mid-limit would have
+      // rested unfilled all day. `exitPremium` stays the MID so every booking
+      // path (`demoExitFillPrice`'s own-quote branch books the exact bid off
+      // the quote's own mid) is byte-identical.
+      let exitStageLimit: number | null = null;
 
       // TRA-3943 (parent TRA-3927, board card `a29b2db8`) — the OTM sleeve's
       // intraday stop, FIRST in the cascade because it is the PRIMARY rule on
@@ -11076,12 +11100,33 @@ export class PaperOptionsAccount {
           // `ProfitLockParams` and this call site simply never passed them.
           // Ignored while a `floorLadder` is supplied (the ladder carries its own
           // give-backs — built from this same schedule).
+          // TRA-4285 — three prices, one basis, and until this ticket it was
+          // the wrong one for a sell. The row sees the MID (`mark`), the ARM
+          // used to read the mid high-water mark (`peakPremium`), and the FILL
+          // happens at the BID (`liveSellLimitDetailed(quote, 'bid')` at the
+          // submit seam; `demoExitFillPrice`'s marketable branch on paper). On
+          // this sleeve the median spread is ≈ 0.357R against a 0.40R give-back
+          // allowance (TRA-3990, TRA-3944 fold), so arming and releasing half a
+          // spread above any attainable fill priced the +0.35R design floor
+          // away before the rule ever chose: live/desk `profit_lock` closes
+          // averaged +0.10R stop-basis, 0 of 3 at the floor. When this tick
+          // serves a usable bid, BOTH the peak that arms (`peakPremiumExec`,
+          // ratcheted above) and the price that releases are the executable
+          // bid; the fill then lands on the same basis and the floor survives
+          // the round trip. An unquoted tick keeps the pre-TRA-4285 mid read —
+          // with no bid there is no executable basis to price against, and a
+          // dark quote must not disarm the rule.
+          const execBid =
+            quoteAtFire !== null && quoteAtFire.bid > 0 ? quoteAtFire.bid : null;
           const lock = profitLockDecision({
             side: 'buy',
             entry: opt.premiumPaid,
             initialStop: opt.stopLossPremium,
-            peakPrice: opt.peakPremium,
-            currentPrice: mark,
+            // The ratchet above ran with this same quote, so when `execBid` is
+            // set `peakPremiumExec` is guaranteed ≥ it; the fallback only
+            // satisfies the type, it cannot loosen the arm test.
+            peakPrice: execBid !== null ? (opt.peakPremiumExec ?? execBid) : opt.peakPremium,
+            currentPrice: execBid ?? mark,
             armR: this.otmProfitSchedule.armR,
             giveBackR: this.otmProfitSchedule.giveBackR,
             tightenPeakR: this.otmProfitSchedule.tightenPeakR,
@@ -11095,6 +11140,8 @@ export class PaperOptionsAccount {
               exitPremium = mark;
               exitKind = 'trail';
               exitJournalReason = 'profit_lock';
+              // TRA-4285 — marketable limit at the bid on the FIRST staging.
+              exitStageLimit = execBid;
             }
           }
         }
@@ -11286,8 +11333,19 @@ export class PaperOptionsAccount {
           // back; paying market to capture a partial profit is a worse trade
           // than waiting. The asymmetry is the point: only the leg that carries
           // risk gets to cross.
+          // TRA-4285 — `profit_lock` is `exitKind: 'trail'` only as a broker
+          // order-pricing bucket (TRA-2940); it is a PROFIT-TAKING leg, not a
+          // risk-reducing one, and inheriting the stop family's cross-the-
+          // spread escalation is what turned an expired limit into a MARKET
+          // sell at the bid — the other half of the fill that ate the 0.40R
+          // allowance. Like `tp1` above, an unfilled profit-lock re-arms on the
+          // next tick and re-stages as a fresh marketable limit at the
+          // then-current bid, which books the same price a market order would,
+          // with limit protection. Only the legs that carry risk get to cross.
           const expiryEscalation =
-            (opt.exitExpiredCount ?? 0) > 0 && (exitKind === 'sl' || exitKind === 'trail');
+            (opt.exitExpiredCount ?? 0) > 0
+            && (exitKind === 'sl' || exitKind === 'trail')
+            && exitJournalReason !== 'profit_lock';
           const useMarket = deepUnderwaterSL || expiryEscalation;
           // TRA-2957 — same refusal as the TP1 staging site. A MARKET escalation
           // carries no price so it stays tradable, but a LIMIT at a non-finite
@@ -11295,7 +11353,9 @@ export class PaperOptionsAccount {
           // an unfillable staged exit is strictly worse than no staged exit: it
           // latches `pendingExit` and detaches the rules that would have closed
           // the row. Fail to the next tick, which still sees the position.
-          if (!useMarket && !isArmedThreshold(exitPremium)) continue;
+          // TRA-4285 — tested on the price that will actually be staged, so a
+          // refusal here and the order below can never disagree about the level.
+          if (!useMarket && !isArmedThreshold(exitStageLimit ?? exitPremium)) continue;
           // TRA-3926 — the site that actually fired on 2026-08-21. `contracts`
           // was 2 because the pre-TRA-3896 reconcile widened the row onto the
           // broker's whole lot; the engine had bought 1 and sold both.
@@ -11310,7 +11370,9 @@ export class PaperOptionsAccount {
           opt.pendingExit = {
             tradierOrderId: '',
             qty: exitQty,
-            limitPrice: exitPremium,
+            // TRA-4285 — the profit leg stages at the BID when this tick served
+            // one; every other exit stages at its trigger level as before.
+            limitPrice: exitStageLimit ?? exitPremium,
             submittedAt: Date.now(),
             pricing: useMarket ? 'market' : 'limit',
             kind: exitKind,

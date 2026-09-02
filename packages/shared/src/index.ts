@@ -3190,6 +3190,21 @@ export interface OptionPosition {
    */
   peakPremiumStamp?: OptionPeakStampBasis;
   /**
+   * TRA-4285 — the highest EXECUTABLE price observed on this row: the bid a
+   * long premium could actually have been sold at, ratcheted on every tick
+   * that serves a usable two-sided quote with a real bid. `peakPremium` (the
+   * mid high-water mark) sits half a spread above any attainable fill, so a
+   * profit-lock armed off it starts its give-back count from a price the book
+   * never offered — on the OTM sleeve (median spread ≈ 0.357R vs a 0.40R
+   * allowance, TRA-3990/TRA-3944 fold) that priced the whole +0.35R design
+   * floor away before the rule got to choose. The give-back leg reads its
+   * arm/release off THIS peak whenever the tick serves a quote. ABSENT ⇔ no
+   * usable quote has ever been served (model-marked / delta-backstop
+   * contracts), in which case the lock falls back to the mid basis — the
+   * pre-TRA-4285 read. Persisted with the row via `exportSnapshot`.
+   */
+  peakPremiumExec?: number;
+  /**
    * TRA-4020 (R4) — bookkeeping for the live opening-range window: how many
    * ticks a trail-family exit (chandelier / profit-lock / premium trail) was
    * refused by the window, the mark at the FIRST refusal and the mark at the
