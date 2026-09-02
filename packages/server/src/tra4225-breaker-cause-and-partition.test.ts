@@ -16,6 +16,10 @@
 //   otmSleeveStopCoverage.ungovernedRows = 1
 //   liveStopActionability.inert          = 2   byReason { close_reject_breaker: 2 }
 //
+// (TRA-4217 later corrected its own filing: the middle count grades only the
+// day-one rule's claim — `a2f9c8cd` carried a breached `stopLossPremium` the
+// whole time — and it is since renamed `dayOneStopUngovernedRows`.)
+//
 // Every number is correct for the question its field asks. The third row's latch
 // is missing from the last one because the walk names the FIRST refusing gate
 // and the adopted/imported gates sit upstream of the breaker branch. The board
@@ -392,8 +396,8 @@ describe('TRA-4225 AC2 — the 2026-08-31 admin book is ONE population with ONE 
   it('publishes all three rows as one latched population under one cause', () => {
     const g = summarizeLiveStopGovernance(ADMIN_BOOK_0831(), MONEY_BOOK);
     expect(g.rows).toBe(3);
-    expect(g.ungoverned).toBe(3);
-    // TRA-4266 — still three ungoverned rows under one cause, which is this
+    expect(g.held).toBe(3);
+    // TRA-4266 — still three held rows under one cause, which is this
     // ticket's claim. What changed is the CLASS: the breaker now retests, so the
     // hold lifts on a clock instead of on a human.
     //
@@ -401,7 +405,7 @@ describe('TRA-4225 AC2 — the 2026-08-31 admin book is ONE population with ONE 
     // has no release, and a row is only `held_with_release` when EVERY gate on
     // it lifts on a clock. That is this suite's own rule read in the other
     // direction, and clearing the breaker on that row would still leave it
-    // ungoverned — which is the fact the partition exists to publish.
+    // held — which is the fact the partition exists to publish.
     expect(g.byClass.held_with_release).toBe(2);
     expect(g.byClass.held_indefinite).toBe(1);
     expect(g.byClass.governed).toBe(0);
@@ -430,8 +434,8 @@ describe('TRA-4225 AC2 — the 2026-08-31 admin book is ONE population with ONE 
       breached: 0, inert: 0, byReason: {},
     });
     const g = summarizeLiveStopGovernance(only, MONEY_BOOK);
-    expect(g.ungoverned).toBe(1);
-    expect(g.ungovernedBreached).toBe(0);
+    expect(g.held).toBe(1);
+    expect(g.heldBreached).toBe(0);
     expect(g.breakerLatched.rows).toBe(1);
   });
 
@@ -471,7 +475,7 @@ describe('TRA-4225 AC2 — the 2026-08-31 admin book is ONE population with ONE 
     const g = summarizeLiveStopGovernance(ADMIN_BOOK_0831(), MONEY_BOOK);
     const gateTotal = Object.values(g.heldBy).reduce((a, b) => a + (b ?? 0), 0);
     expect(gateTotal).toBe(4);          // 3 breakers + 1 adoption refusal
-    expect(g.ungoverned).toBe(3);
+    expect(g.held).toBe(3);
     expect(g.multiHeld).toBe(1);
   });
 
@@ -617,7 +621,7 @@ describe('TRA-4225 negative controls', () => {
     const healthy = liveRow({ id: 'healthy', currentPremium: 1.9 });
     const g = summarizeLiveStopGovernance([healthy], MONEY_BOOK);
     expect(g.byClass.governed).toBe(1);
-    expect(g.ungoverned).toBe(0);
+    expect(g.held).toBe(0);
     expect(g.nothingWillAct).toBe(0);
     expect(g.heldBy).toEqual({});
     expect(g.multiHeld).toBe(0);
@@ -652,7 +656,7 @@ describe('TRA-4225 negative controls', () => {
     });
     const g = summarizeLiveStopGovernance([working], MONEY_BOOK);
     expect(g.byClass.in_flight).toBe(1);
-    expect(g.ungoverned).toBe(0);
+    expect(g.held).toBe(0);
     expect(g.heldBy).toEqual({});
   });
 
@@ -660,7 +664,7 @@ describe('TRA-4225 negative controls', () => {
     const noStop = liveRow({ id: 'nostop', stopLossPremium: 0 });
     const g = summarizeLiveStopGovernance([noStop], MONEY_BOOK);
     expect(g.byClass.no_stop_written).toBe(1);
-    expect(g.ungoverned).toBe(0);
+    expect(g.held).toBe(0);
     // …but it IS in the union, because nothing will act on it either.
     expect(g.nothingWillAct).toBe(1);
   });
@@ -676,8 +680,8 @@ describe('TRA-4225 negative controls', () => {
     const total = Object.values(g.byClass).reduce((a, b) => a + b, 0);
     expect(g.rows).toBe(5);
     expect(total).toBe(5);
-    expect(g.ungoverned).toBe(g.byClass.held_with_release + g.byClass.held_indefinite);
-    expect(g.nothingWillAct).toBe(g.ungoverned + g.byClass.no_stop_written);
+    expect(g.held).toBe(g.byClass.held_with_release + g.byClass.held_indefinite);
+    expect(g.nothingWillAct).toBe(g.held + g.byClass.no_stop_written);
   });
 
   it('an empty book publishes zeros, not nulls — blind is a different reading', () => {
@@ -714,7 +718,7 @@ describe('TRA-4225 — the fleet fold', () => {
     const bookB = summarizeLiveStopGovernance([stampedRow], MONEY_BOOK);
     const fleet = mergeLiveStopGovernance([bookA, bookB]);
     expect(fleet.rows).toBe(2);
-    expect(fleet.ungoverned).toBe(2);
+    expect(fleet.held).toBe(2);
     expect(fleet.heldBy.close_reject_breaker).toBe(2);
     expect(fleet.breakerLatched.rows).toBe(2);
     expect(fleet.breakerLatched.byCause).toEqual({

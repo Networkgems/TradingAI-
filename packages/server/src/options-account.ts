@@ -2821,6 +2821,14 @@ function gateRecoveryPath(
  *   • `otmSleeveStopCoverage.ungovernedRows` = 1
  *   • `liveStopActionability.inert`        = 2  (`byReason.close_reject_breaker: 2`)
  *
+ * (TRA-4217 later corrected its own filing: the middle count was never a view
+ * of this hazard — it grades the DAY-ONE rule's claim, and the row it counted
+ * carried a breached `stopLossPremium` all along. It is since renamed
+ * `dayOneStopUngovernedRows`. This partition is accordingly built ONLY from
+ * the gate walk that `liveStopActionability` shares — folding a day-one
+ * governance count in would file a row under a reason that is not the reason
+ * it is stuck.)
+ *
  * Every one of those numbers is correct for the question its field asks. The
  * third row's latch is missing from the last one because the walk names the
  * FIRST refusing gate and `imported_auto_manage_off` sits upstream of the
@@ -2869,15 +2877,22 @@ export interface LiveStopGovernanceSummary {
   /** Every open live row. The denominator: `rows === Σ byClass`. */
   rows: number;
   byClass: Record<LiveStopGovernanceClass, number>;
-  /** `held_with_release + held_indefinite` — rows a gate is holding. */
-  ungoverned: number;
+  /**
+   * `held_with_release + held_indefinite` — rows a gate is holding.
+   *
+   * Named `held`, not "ungoverned": TRA-4217's correction showed the bare word
+   * on the neighbouring day-one surface reading as "this money has no stop" in
+   * a P0 filing, and this route must not publish the same word with a second
+   * meaning one field over (TRA-4225).
+   */
+  held: number;
   /** …of those, already through their stop. The urgent half. */
-  ungovernedBreached: number;
-  /** `ungoverned + no_stop_written` — every row nothing will act on. */
+  heldBreached: number;
+  /** `held + no_stop_written` — every row nothing will act on. */
   nothingWillAct: number;
   /**
    * EVERY gate holding a row, so a row held by three appears under all three.
-   * ⚠️ Deliberately does NOT sum to `ungoverned` — see `multiHeld`.
+   * ⚠️ Deliberately does NOT sum to `held` — see `multiHeld`.
    */
   heldBy: Partial<Record<LiveStopInertReason, number>>;
   /** Held rows carrying MORE than one gate. `Σ heldBy − multiHeld` overlap. */
@@ -2895,7 +2910,7 @@ export interface LiveStopGovernanceSummary {
    * managed one" is the exact defect this fold exists to break, and coupling
    * the census to the hold re-created it one release-mechanism later.
    *
-   * So `rows` here is NOT a subset of `ungoverned` and must not be read as one.
+   * So `rows` here is NOT a subset of `held` and must not be read as one.
    */
   breakerLatched: {
     rows: number;
@@ -2947,8 +2962,8 @@ export function summarizeLiveStopGovernance(
   const recovery = EMPTY_RECOVERY_COUNTS();
   const heldBy: Partial<Record<LiveStopInertReason, number>> = {};
   let rows = 0;
-  let ungoverned = 0;
-  let ungovernedBreached = 0;
+  let held = 0;
+  let heldBreached = 0;
   let multiHeld = 0;
   let breakerRows = 0;
   let stamped = 0;
@@ -2991,12 +3006,12 @@ export function summarizeLiveStopGovernance(
       continue;
     }
 
-    ungoverned += 1;
+    held += 1;
     // The chandelier latch is a hold this walk can see but cannot express as a
     // gate on an unbreached row (no underlying price here), so breach is the
     // union of the two premium legs, exactly as on the sibling surface.
     if (reading.slBreached || reading.otmPremiumLegThrough || reading.chandelierHeldToday) {
-      ungovernedBreached += 1;
+      heldBreached += 1;
     }
     if (reading.held.length > 1) multiHeld += 1;
 
@@ -3017,9 +3032,9 @@ export function summarizeLiveStopGovernance(
   return {
     rows,
     byClass,
-    ungoverned,
-    ungovernedBreached,
-    nothingWillAct: ungoverned + byClass.no_stop_written,
+    held,
+    heldBreached,
+    nothingWillAct: held + byClass.no_stop_written,
     heldBy,
     multiHeld,
     breakerLatched: {
@@ -3051,8 +3066,8 @@ export function mergeLiveStopGovernance(
   const out: LiveStopGovernanceSummary = {
     rows: 0,
     byClass: EMPTY_GOVERNANCE_CLASSES(),
-    ungoverned: 0,
-    ungovernedBreached: 0,
+    held: 0,
+    heldBreached: 0,
     nothingWillAct: 0,
     heldBy: {},
     multiHeld: 0,
@@ -3072,8 +3087,8 @@ export function mergeLiveStopGovernance(
     for (const k of Object.keys(out.byClass) as LiveStopGovernanceClass[]) {
       out.byClass[k] += s.byClass[k];
     }
-    out.ungoverned += s.ungoverned;
-    out.ungovernedBreached += s.ungovernedBreached;
+    out.held += s.held;
+    out.heldBreached += s.heldBreached;
     out.nothingWillAct += s.nothingWillAct;
     out.multiHeld += s.multiHeld;
     for (const [k, v] of Object.entries(s.heldBy)) {
@@ -3118,7 +3133,7 @@ export function mergeLiveStopGovernance(
  * itself for the reason TRA-3839 gives one field over: a key that is a number
  * when the instrument works and ABSENT when it is blind deserialises to
  * `undefined`, which every reader coerces to 0 — publishing "nothing is
- * ungoverned" as the reading for "we could not tell". The mapped type makes the
+ * held" as the reading for "we could not tell". The mapped type makes the
  * next field added here a compile error until the blind shape names it too.
  */
 export type BlindLiveStopGovernance = { [K in keyof LiveStopGovernanceSummary]: null };
@@ -3127,8 +3142,8 @@ export function blindLiveStopGovernance(): BlindLiveStopGovernance {
   return {
     rows: null,
     byClass: null,
-    ungoverned: null,
-    ungovernedBreached: null,
+    held: null,
+    heldBreached: null,
     nothingWillAct: null,
     heldBy: null,
     multiHeld: null,
@@ -3642,6 +3657,17 @@ export interface OtmSleeveStopCoverage {
    */
   population: 'all_open_live_otm_sleeve_rows';
   /**
+   * TRA-4225 (off TRA-4217's own correction) — WHICH rule the `governed` /
+   * `ungoverned` split below is graded against, as a literal on the payload for
+   * the same reason `population` is. The bare word "ungoverned" read, to an
+   * operator scanning for unprotected money, as "this money has no stop" — and
+   * that reading reached a P0 filing (TRA-4217 listed this count as one of
+   * three views of the breaker hazard; row `a2f9c8cd` carried a breached
+   * `stopLossPremium` the whole time). This field says what the split actually
+   * claims: the DAY-ONE rule's reach, nothing about the row's other stops.
+   */
+  rule: 'otm_day_one_stop';
+  /**
    * TRA-3985 — how many BOOKS this reading folds. See
    * {@link DayOneStopPosture.books}: the health route is fleet-wide and
    * `/api/state` is one book, and a coverage claim that does not say how many
@@ -3651,10 +3677,20 @@ export interface OtmSleeveStopCoverage {
   rows: number;
   /** Rows with at least one evaluable leg — the rule IS these rows' stop. */
   governedRows: number;
-  /** Rows the rule reaches and does not govern. `rows − governedRows`. */
-  ungovernedRows: number;
-  /** Σ `premiumPaid × contractsRemaining × 100` over the ungoverned rows, 2dp. */
-  ungovernedPremiumUsd: number;
+  /**
+   * Rows the DAY-ONE rule reaches and does not claim. `rows − governedRows`.
+   *
+   * ⚠️ NOT "rows with no stop". A row this rule declines falls through to the
+   * pre-existing cascade — its own `stopLossPremium` if written, the
+   * `daily_close` −20% backstop, the −50% catastrophic (`otm-day-one-stop.ts`)
+   * — which is the posture it was on before this sleeve had a day-one lever.
+   * Whether anything will ACT on those stops is `liveStopGovernance`'s
+   * question, not this field's. Named `dayOneStop*` because the bare word
+   * "ungoverned" invited exactly the wrong remedy (TRA-4225).
+   */
+  dayOneStopUngovernedRows: number;
+  /** Σ `premiumPaid × contractsRemaining × 100` over those rows, 2dp. */
+  dayOneStopUngovernedPremiumUsd: number;
   /** Rows carrying a FILL-GRADE premium anchor — the premium leg can evaluate. */
   premiumLegRows: number;
   /** Rows whose premium anchor is a restatement or an unstamped adoption. */
@@ -3736,12 +3772,13 @@ export function summarizeOtmSleeveStopCoverage(
   }
   return {
     population: 'all_open_live_otm_sleeve_rows',
+    rule: 'otm_day_one_stop',
     // One summary is one book; `mergeOtmSleeveStopCoverage` sums them.
     books: 1,
     rows,
     governedRows,
-    ungovernedRows: rows - governedRows,
-    ungovernedPremiumUsd: r2usd(ungovernedPremiumUsd),
+    dayOneStopUngovernedRows: rows - governedRows,
+    dayOneStopUngovernedPremiumUsd: r2usd(ungovernedPremiumUsd),
     premiumLegRows,
     premiumLegInertRows: rows - premiumLegRows,
     atrLegRows,
@@ -3760,11 +3797,12 @@ export function mergeOtmSleeveStopCoverage(
 ): OtmSleeveStopCoverage {
   const out: OtmSleeveStopCoverage = {
     population: 'all_open_live_otm_sleeve_rows',
+    rule: 'otm_day_one_stop',
     books: 0,
     rows: 0,
     governedRows: 0,
-    ungovernedRows: 0,
-    ungovernedPremiumUsd: 0,
+    dayOneStopUngovernedRows: 0,
+    dayOneStopUngovernedPremiumUsd: 0,
     premiumLegRows: 0,
     premiumLegInertRows: 0,
     atrLegRows: 0,
@@ -3780,8 +3818,9 @@ export function mergeOtmSleeveStopCoverage(
     out.books += s.books;
     out.rows += s.rows;
     out.governedRows += s.governedRows;
-    out.ungovernedRows += s.ungovernedRows;
-    out.ungovernedPremiumUsd = r2usd(out.ungovernedPremiumUsd + s.ungovernedPremiumUsd);
+    out.dayOneStopUngovernedRows += s.dayOneStopUngovernedRows;
+    out.dayOneStopUngovernedPremiumUsd
+      = r2usd(out.dayOneStopUngovernedPremiumUsd + s.dayOneStopUngovernedPremiumUsd);
     out.premiumLegRows += s.premiumLegRows;
     out.premiumLegInertRows += s.premiumLegInertRows;
     out.atrLegRows += s.atrLegRows;
@@ -3807,17 +3846,18 @@ export function mergeOtmSleeveStopCoverage(
  * must not manufacture it.
  */
 export function blindOtmSleeveStopCoverage(): {
-  [K in keyof OtmSleeveStopCoverage]: K extends 'population'
-    ? OtmSleeveStopCoverage['population']
+  [K in keyof OtmSleeveStopCoverage]: K extends 'population' | 'rule'
+    ? OtmSleeveStopCoverage[K]
     : null
 } {
   return {
     population: 'all_open_live_otm_sleeve_rows',
+    rule: 'otm_day_one_stop',
     books: null,
     rows: null,
     governedRows: null,
-    ungovernedRows: null,
-    ungovernedPremiumUsd: null,
+    dayOneStopUngovernedRows: null,
+    dayOneStopUngovernedPremiumUsd: null,
     premiumLegRows: null,
     premiumLegInertRows: null,
     atrLegRows: null,

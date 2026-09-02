@@ -11944,7 +11944,7 @@ app.get('/api/health/options-live', async (_req, res) => {
       // itself works there, which is TRA-4224's measurement).
       //
       // ⚠️ Read `heldBy` and `byClass` together: `heldBy` deliberately does not
-      // sum to `ungoverned` (a row held by three gates appears three times), and
+      // sum to `held` (a row held by three gates appears three times), and
       // `multiHeld` is the overlap. Same fleet/book caveat as its neighbours —
       // this folds `getAllUserContexts()` and `/api/state` serves one book.
       //
@@ -12053,9 +12053,16 @@ app.get('/api/health/options-live', async (_req, res) => {
       // — a −35% stop declining until −57%). Read these fields in this order:
       //
       //   • `rows` / `governedRows` — how much of the sleeve this rule is
-      //     actually the stop for. `ungovernedRows > 0` means rows on this sleeve
-      //     are on the `daily_close` backstop and nothing else, and
-      //     `ungovernedPremiumUsd` is what that is worth.
+      //     actually the stop for. `dayOneStopUngovernedRows > 0` means rows the
+      //     DAY-ONE rule declines to claim; such rows keep whatever they already
+      //     had — their own `stopLossPremium`, the `daily_close` −20% backstop,
+      //     the −50% catastrophic — and `dayOneStopUngovernedPremiumUsd` is what
+      //     they are worth. ⚠️ NOT "this money has no stop": that misreading of
+      //     the old `ungovernedRows` name reached a P0 filing (TRA-4217, row
+      //     `a2f9c8cd`, breached `stopLossPremium 0.4560` on the row the whole
+      //     time). Whether anything will ACT on a row's stop is
+      //     `liveStopGovernance`'s question; the `rule` literal on this payload
+      //     names what the split here actually grades (TRA-4225).
       //   • `premiumLegInertRows` — rows with NO fill-grade anchor. The premium
       //     leg refuses these rather than anchoring on a restatement, because the
       //     sign of a basis error is the sign of the stop error and an

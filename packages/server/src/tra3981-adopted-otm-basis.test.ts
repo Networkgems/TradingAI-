@@ -283,12 +283,15 @@ describe('TRA-3981 AC2 — the coverage counter counts the rule’s REACH, not t
 
     const coverage = summarizeOtmSleeveStopCoverage(book, { otmDayOneStop: ARMED });
     expect(coverage.population).toBe('all_open_live_otm_sleeve_rows');
+    // TRA-4225 — the payload names the rule its governed/ungoverned split is
+    // graded against, so the count cannot read as "this money has no stop".
+    expect(coverage.rule).toBe('otm_day_one_stop');
     expect(coverage.rows).toBe(1);
     expect(coverage.atrLegInertRows).toBe(1);
     expect(coverage.premiumLegInertRows).toBe(1);
     expect(coverage.governedRows).toBe(0);
-    expect(coverage.ungovernedRows).toBe(1);
-    expect(coverage.ungovernedPremiumUsd).toBeCloseTo(RESTATED * 100, 2);
+    expect(coverage.dayOneStopUngovernedRows).toBe(1);
+    expect(coverage.dayOneStopUngovernedPremiumUsd).toBeCloseTo(RESTATED * 100, 2);
     expect(coverage.ruleArmed).toBe(true);
   });
 
@@ -311,7 +314,7 @@ describe('TRA-3981 AC2 — the coverage counter counts the rule’s REACH, not t
     const coverage = summarizeOtmSleeveStopCoverage([], { otmDayOneStop: ARMED });
     expect(coverage.rows).toBe(0);
     expect(coverage.governedRows).toBe(0);
-    expect(coverage.ungovernedRows).toBe(0);
+    expect(coverage.dayOneStopUngovernedRows).toBe(0);
     expect(coverage.ruleArmed).toBe(true);
   });
 
@@ -354,7 +357,7 @@ describe('TRA-3981 AC4 — the wire carries the adopted population and how it is
     expect(c.atrLegRows).toBe(1);
     expect(c.atrLegInertRows).toBe(3);
     expect(c.governedRows).toBe(2);   // engine (both legs) + desk-capture (premium)
-    expect(c.ungovernedRows).toBe(2); // desk-restated + foreign
+    expect(c.dayOneStopUngovernedRows).toBe(2); // desk-restated + foreign
   });
 
   it('the fleet MERGE adds the counters and folds the arm PESSIMISTICALLY', () => {
@@ -364,7 +367,7 @@ describe('TRA-3981 AC4 — the wire carries the adopted population and how it is
     });
     const m = mergeOtmSleeveStopCoverage([a, b]);
     expect(m.rows).toBe(5);
-    expect(m.ungovernedRows).toBe(3);
+    expect(m.dayOneStopUngovernedRows).toBe(3);
     expect(m.basisSourceRows.restated_residual).toBe(2);
     expect(m.ruleArmed).toBe(false);
     expect(m.population).toBe('all_open_live_otm_sleeve_rows');
