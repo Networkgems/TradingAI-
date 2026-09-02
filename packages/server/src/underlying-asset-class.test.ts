@@ -19,6 +19,7 @@ import {
   OPTION_ENTRY_ASSET_CLASS_REFUSAL_FLAG,
   REFUSED_ASSET_CLASSES,
   gradeAssetClassArmPrecondition,
+  setAssetClassWatchlistProvider,
 } from './underlying-asset-class.js';
 import { OPTION_LIVE_OTM_UNIVERSE_VAR as UNIVERSE_VAR } from './otm-live-universe-flag.js';
 
@@ -31,6 +32,7 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env[FLAG];
   clearEntrySiteAssetClassCensus();
+  setAssetClassWatchlistProvider(null);
 });
 
 describe('TRA-4144 AC1 — the classifier, and never default to permissive', () => {
@@ -302,18 +304,91 @@ describe('TRA-4144 — the arm precondition (what the gate emits on the MODAL wo
     expect(p.statement).toContain('ETHA');
   });
 
-  it('an UNRESTRICTED universe is NOT a pass — the denominator is unmeasurable', () => {
+  it('an UNRESTRICTED universe with NO watchlist read is NOT a pass — the denominator is unmeasurable', () => {
     for (const sentinel of ['*', 'ALL', 'all']) {
       const p = gradeAssetClassArmPrecondition(envWith(sentinel));
       expect(p.universeRestricted).toBe(false);
       expect(p.universeSource).toBe('env_unrestricted');
+      expect(p.population).toBe('unenumerable');
+      expect(p.watchlistProviderWired).toBe(false);
       expect(p.evaluated).toBe(0);
       // A share of an unenumerable population is not 100% — it is unknown.
       expect(p.coverage).toBeNull();
       expect(p.satisfied).toBe(false);
       expect(p.blockers.join(' ')).toContain('UNRESTRICTED');
       expect(p.blockers.join(' ')).toContain('UNMEASURED');
+      expect(p.blockers.join(' ')).toContain('NOT WIRED');
     }
+  });
+
+  it('CEO a86d95de — an UNRESTRICTED universe grades the RUNTIME WATCHLIST when the provider is wired', () => {
+    // Production is `*`: the gate above (`universe`) admits the full watchlist,
+    // so the precondition's denominator is the watchlist, not any allowlist —
+    // and the read publishes the COUNT of unplaceables, not a bare false.
+    setAssetClassWatchlistProvider(() => ['aapl', 'AAPL', ' spy ', 'ETHA', 'ZZQQ', 'QQZZ', '']);
+    const p = gradeAssetClassArmPrecondition(envWith('*'));
+    expect(p.universeRestricted).toBe(false);
+    expect(p.population).toBe('runtime_watchlist');
+    expect(p.watchlistProviderWired).toBe(true);
+    expect(p.evaluated).toBe(5); // deduped, trimmed, uppercased, empties dropped
+    expect(p.unknownUnderlyings.slice().sort()).toEqual(['QQZZ', 'ZZQQ']);
+    expect(p.unknownCount).toBe(2);
+    expect(p.coverage).toBeCloseTo(0.6, 4);
+    expect(p.satisfied).toBe(false);
+    expect(p.blockers.join(' ')).toContain('2 of 5');
+    expect(p.blockers.join(' ')).toContain('runtime watchlist');
+    // The intended refusal stays a deliverable, never a blocker, on this population too.
+    expect(p.intendedRefusals).toEqual(['ETHA']);
+    // Per-name rows are allowlist-only wire; the watchlist is counts + lists.
+    expect(p.symbols).toEqual([]);
+  });
+
+  it('a fully-classifiable wired watchlist CAN satisfy the precondition — and says it graded a snapshot', () => {
+    setAssetClassWatchlistProvider(() => ['AAPL', 'SPY', 'ETHA']);
+    const p = gradeAssetClassArmPrecondition(envWith('*'));
+    expect(p.population).toBe('runtime_watchlist');
+    expect(p.unknownCount).toBe(0);
+    expect(p.coverage).toBe(1);
+    expect(p.satisfied).toBe(true);
+    expect(p.statement).toContain('SAFE TO ARM');
+    expect(p.statement).toContain('SNAPSHOT');
+  });
+
+  it('a provider that THROWS or returns an EMPTY watchlist never reads as a pass', () => {
+    setAssetClassWatchlistProvider(() => { throw new Error('engine dark'); });
+    const threw = gradeAssetClassArmPrecondition(envWith('*'));
+    // Unreadable ≠ empty: a throw is `unenumerable`, wired-but-unreadable.
+    expect(threw.population).toBe('unenumerable');
+    expect(threw.watchlistProviderWired).toBe(true);
+    expect(threw.satisfied).toBe(false);
+    expect(threw.blockers.join(' ')).toContain('UNREADABLE');
+
+    setAssetClassWatchlistProvider(() => []);
+    const empty = gradeAssetClassArmPrecondition(envWith('*'));
+    expect(empty.population).toBe('runtime_watchlist');
+    expect(empty.evaluated).toBe(0);
+    expect(empty.coverage).toBeNull();
+    expect(empty.satisfied).toBe(false);
+    expect(empty.blockers.join(' ')).toContain('empty');
+  });
+
+  it('the published unknown list is CAPPED but the count never is', () => {
+    const names = Array.from({ length: 60 }, (_, i) => `ZZQ${String(i).padStart(3, '0')}`);
+    setAssetClassWatchlistProvider(() => names);
+    const p = gradeAssetClassArmPrecondition(envWith('*'));
+    expect(p.unknownCount).toBe(60);
+    expect(p.unknownUnderlyings).toHaveLength(50);
+    expect(p.unknownUnderlyingsTruncated).toBe(true);
+    expect(p.blockers.join(' ')).toContain('60 of 60');
+    expect(p.blockers.join(' ')).toContain('+10 more');
+  });
+
+  it('a RESTRICTED universe ignores the watchlist provider — the allowlist is the enforced population', () => {
+    setAssetClassWatchlistProvider(() => ['ZZQQ', 'QQZZ']); // would fail if consulted
+    const p = gradeAssetClassArmPrecondition(envWith(PROD_UNIVERSE));
+    expect(p.population).toBe('resolved_allowlist');
+    expect(p.evaluated).toBe(10);
+    expect(p.satisfied).toBe(true);
   });
 
   it('an unset / malformed universe grades the RESTRICTIVE fallback the gate would actually enforce', () => {

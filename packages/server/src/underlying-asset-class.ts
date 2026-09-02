@@ -307,6 +307,45 @@ export function assetClassRefusalReason(
   };
 }
 
+// ─── The runtime watchlist (CEO correction, 2026-09-01, comment a86d95de) ────
+// Production's `OPTION_LIVE_OTM_UNIVERSE` is `*` — the universe gate ABOVE this
+// one admits the FULL runtime watchlist (~614 names on bqb1), so the arm
+// precondition's real denominator is that watchlist, not any allowlist. The
+// watchlist lives on the engines; it reaches this env-pure module the same way
+// the fleet balance reaches the order site (`setLiveOtmFleetCapitalProvider`):
+// a provider wired ONCE at boot from `index.ts`, `null`-unwired in tests.
+
+let watchlistProvider: (() => readonly string[]) | null = null;
+
+/** Wire the fleet watchlist read. Called once at boot; `null` unwires (tests). */
+export function setAssetClassWatchlistProvider(
+  next: (() => readonly string[]) | null,
+): void {
+  watchlistProvider = next;
+}
+
+/**
+ * The deduped, normalized runtime watchlist, or `null` when unwired or the
+ * provider threw. ⚠ `null`, never `[]` — an empty array is a CLAIM ("the
+ * admitted population is empty"), and under an unrestricted universe that claim
+ * would grade `coverage: 1` over nothing, i.e. read as SAFE TO ARM. Unreadable
+ * must stay distinguishable from empty (the `blindBooks` convention).
+ */
+function readRuntimeWatchlist(): readonly string[] | null {
+  if (watchlistProvider === null) return null;
+  try {
+    const out = new Set<string>();
+    for (const sym of watchlistProvider()) {
+      if (typeof sym !== 'string') continue;
+      const s = sym.trim().toUpperCase();
+      if (s !== '') out.add(s);
+    }
+    return [...out].sort();
+  } catch {
+    return null;
+  }
+}
+
 // ─── The ARM PRECONDITION (CEO, 2026-09-01) ──────────────────────────────────
 /**
  * ⭐⭐⭐ WHAT DOES THIS GATE EMIT ON THE **MODAL** WORLD?
@@ -333,19 +372,40 @@ export function assetClassRefusalReason(
  * instrument.
  *
  * ⚠️ `restricted === false` (the `*` / `ALL` sentinel) makes the population the
- * runtime-accumulated ~614-name watchlist, which no fold here can enumerate.
- * That is published as `coverage: null` / precondition NOT satisfied — an
- * unmeasurable denominator is never a pass ("a criterion that cannot fail on
- * this run's data is not a pass").
+ * runtime-accumulated ~614-name watchlist — and PRODUCTION IS `*` (CEO,
+ * 2026-09-01: `arm.universe` on pid 52 read `env_unrestricted`, and 13 of the
+ * 17 underlyings on the 30d tape sit outside the five-name fallback). "The
+ * population a gate meets is set by the gate ABOVE it" applies to this
+ * instrument too: under `*` the gate above (`universe`) admits everything, so
+ * grading the 10-name allowlist was grading a population nothing enforces.
+ * When the watchlist provider is wired the precondition therefore grades the
+ * ACTUAL watchlist and publishes the COUNT of unplaceable names — the board
+ * can price a number, it cannot price a `false`. Only when the population is
+ * truly unenumerable (provider unwired / threw) does it publish
+ * `coverage: null` / NOT satisfied — an unmeasurable denominator is never a
+ * pass ("a criterion that cannot fail on this run's data is not a pass").
  */
 export interface AssetClassArmPrecondition {
   /** Mirrors the gate's own resolution — provenance, not a re-derivation. */
   universeVar: string;
   universeSource: LiveOtmUniverseSource;
   universeRaw: string | null;
-  /** FALSE ⇒ `*`/`ALL` ⇒ the population is unbounded and cannot be graded here. */
+  /** FALSE ⇒ `*`/`ALL` ⇒ the admitted population is the runtime watchlist. */
   universeRestricted: boolean;
-  /** Every allowlisted name with its class. Empty iff the universe is unbounded. */
+  /**
+   * WHICH population `evaluated`/`coverage`/`satisfied` were measured over —
+   * a `satisfied` that does not say satisfied-over-WHAT is the same defect
+   * class as a bare count that cannot tell a finding from a refused grant.
+   * `resolved_allowlist` = the restricted universe the gate above enforces;
+   * `runtime_watchlist` = the full watchlist (universe unrestricted, provider
+   * wired) — a SNAPSHOT of a population that accumulates at runtime, re-measured
+   * on every read; `unenumerable` = unrestricted AND the provider is unwired or
+   * threw, so nothing here was graded.
+   */
+  population: 'resolved_allowlist' | 'runtime_watchlist' | 'unenumerable';
+  /** Published so `unenumerable` is never confused with an empty watchlist. */
+  watchlistProviderWired: boolean;
+  /** Per-name rows for the RESTRICTED allowlist only (the watchlist would be ~614 rows of wire). */
   symbols: Array<{
     underlying: string;
     assetClass: UnderlyingAssetClass;
@@ -360,6 +420,8 @@ export interface AssetClassArmPrecondition {
    * difference between a narrow carve-out and an accidental kill switch.
    */
   unknownUnderlyings: string[];
+  /** TRUE ⇒ the list above is a sample; `unknownCount` is always the full count. */
+  unknownUnderlyingsTruncated: boolean;
   unknownCount: number;
   /**
    * THE DELIVERABLE. Allowlisted names refused ON PURPOSE (a crypto wrapper the
@@ -380,49 +442,77 @@ export interface AssetClassArmPrecondition {
  * process would actually enforce against: how many allowlisted names would the
  * armed refusal reject, and which of those rejections are the point vs the cost.
  */
+/** Cap on the PUBLISHED unknown-name list; `unknownCount` is never capped. */
+const MAX_PUBLISHED_UNKNOWNS = 50;
+
 export function gradeAssetClassArmPrecondition(
   env: NodeJS.ProcessEnv = process.env,
 ): AssetClassArmPrecondition {
   const resolution = resolveLiveOtmUniverse(env);
+  const watchlist = resolution.restricted ? null : readRuntimeWatchlist();
+  const population: AssetClassArmPrecondition['population'] = resolution.restricted
+    ? 'resolved_allowlist'
+    : watchlist !== null
+      ? 'runtime_watchlist'
+      : 'unenumerable';
+  const graded: readonly string[] = resolution.restricted
+    ? resolution.symbols
+    : watchlist ?? [];
+
   const symbols: AssetClassArmPrecondition['symbols'] = [];
   const unknownUnderlyings: string[] = [];
   const intendedRefusals: string[] = [];
 
-  for (const sym of resolution.symbols) {
+  for (const sym of graded) {
     const c = classifyUnderlyingAssetClass(sym);
     const wouldRefuse = REFUSED_ASSET_CLASSES.includes(c.assetClass);
-    symbols.push({
-      underlying: c.underlying ?? sym,
-      assetClass: c.assetClass,
-      source: c.source,
-      wouldRefuse,
-    });
+    // Per-name rows only for the small enforced allowlist; the ~614-name
+    // watchlist is published as its refusal/unknown lists + counts.
+    if (population === 'resolved_allowlist') {
+      symbols.push({
+        underlying: c.underlying ?? sym,
+        assetClass: c.assetClass,
+        source: c.source,
+        wouldRefuse,
+      });
+    }
     if (c.assetClass === 'unknown') unknownUnderlyings.push(c.underlying ?? sym);
     else if (wouldRefuse) intendedRefusals.push(c.underlying ?? sym);
   }
 
-  const evaluated = symbols.length;
+  const evaluated = graded.length;
+  const unknownCount = unknownUnderlyings.length;
+  const populationLabel = population === 'resolved_allowlist'
+    ? 'the live OTM allowlist'
+    : 'the runtime watchlist (the admitted population under an UNRESTRICTED universe)';
   const blockers: string[] = [];
-  if (!resolution.restricted) {
+  if (population === 'unenumerable') {
     blockers.push(
-      `${OPTION_LIVE_OTM_UNIVERSE_VAR} is UNRESTRICTED (${resolution.raw ?? '*'}) — the live population is `
-      + 'the runtime-accumulated watchlist (~614 names on bqb1), which this fold cannot enumerate, so the '
+      `${OPTION_LIVE_OTM_UNIVERSE_VAR} is UNRESTRICTED (${resolution.raw ?? '*'}) — the admitted population is `
+      + 'the runtime-accumulated watchlist (~614 names on bqb1) and the watchlist provider is '
+      + `${watchlistProvider === null ? 'NOT WIRED on this build' : 'wired but UNREADABLE (threw)'}, so the `
       + 'share of it that classifies `unknown` is UNMEASURED. Arming the refusal against an unmeasurable '
       + 'denominator is a stop-trade of unknown size.',
     );
   } else if (evaluated === 0) {
-    blockers.push('the resolved allowlist is empty — nothing to grade, which is not the same as a pass.');
-  }
-  if (unknownUnderlyings.length > 0) {
     blockers.push(
-      `${String(unknownUnderlyings.length)} of ${String(evaluated)} allowlisted underlying(s) classify `
-      + `\`unknown\` and would be REFUSED IN ERROR when armed: ${unknownUnderlyings.join(', ')}. `
+      population === 'resolved_allowlist'
+        ? 'the resolved allowlist is empty — nothing to grade, which is not the same as a pass.'
+        : 'the runtime watchlist is empty — nothing to grade, which is not the same as a pass.',
+    );
+  }
+  if (unknownCount > 0) {
+    const sample = unknownUnderlyings.slice(0, MAX_PUBLISHED_UNKNOWNS);
+    blockers.push(
+      `${String(unknownCount)} of ${String(evaluated)} underlying(s) in ${populationLabel} classify `
+      + `\`unknown\` and would be REFUSED IN ERROR when armed: ${sample.join(', ')}`
+      + `${unknownCount > sample.length ? ` … (+${String(unknownCount - sample.length)} more)` : ''}. `
       + 'Add each to the static registry (a determination, per name) — never widen the fallback.',
     );
   }
 
-  const coverage = resolution.restricted && evaluated > 0
-    ? Math.round(((evaluated - unknownUnderlyings.length) / evaluated) * 10000) / 10000
+  const coverage = population !== 'unenumerable' && evaluated > 0
+    ? Math.round(((evaluated - unknownCount) / evaluated) * 10000) / 10000
     : null;
   const satisfied = blockers.length === 0;
 
@@ -431,20 +521,27 @@ export function gradeAssetClassArmPrecondition(
     universeSource: resolution.source,
     universeRaw: resolution.raw,
     universeRestricted: resolution.restricted,
+    population,
+    watchlistProviderWired: watchlistProvider !== null,
     symbols,
     evaluated,
-    unknownUnderlyings,
-    unknownCount: unknownUnderlyings.length,
+    unknownUnderlyings: unknownUnderlyings.slice(0, MAX_PUBLISHED_UNKNOWNS),
+    unknownUnderlyingsTruncated: unknownCount > MAX_PUBLISHED_UNKNOWNS,
+    unknownCount,
     intendedRefusals,
     coverage,
     satisfied,
     blockers,
     statement: satisfied
-      ? `SAFE TO ARM: all ${String(evaluated)} name(s) in the live OTM allowlist classify, `
+      ? `SAFE TO ARM: all ${String(evaluated)} name(s) in ${populationLabel} classify, `
         + `${String(intendedRefusals.length)} refused on purpose `
         + `(${intendedRefusals.join(', ') || 'none'}), 0 refused in error. Arming `
         + `${OPTION_ENTRY_ASSET_CLASS_REFUSAL_FLAG} enforces the ratified "crypto OFF" and narrows the `
         + 'tradeable universe by nothing else.'
+        + (population === 'runtime_watchlist'
+          ? ' ⚠ Graded over a SNAPSHOT of a population that accumulates at runtime — re-read this'
+            + ' precondition in the same beat as the env write.'
+          : '')
       : `⛔ NOT SAFE TO ARM: ${blockers.join(' ')} Arming ${OPTION_ENTRY_ASSET_CLASS_REFUSAL_FLAG} today `
         + 'would refuse names the board has ratified as tradeable — a stop-trade wearing a carve-out\'s name.',
   };
@@ -757,7 +854,7 @@ export function gradeUnderlyingAssetClassHealth(
     + (tapeUnknown > 0 ? `, ${String(tapeUnknown)} unknown ⇒ LOWER BOUND` : '')
     + `; entry site ${String(entrySiteEvaluated)} evaluated / ${String(entrySiteRefused)} refused since boot`
     + `; ARM PRECONDITION ${armPrecondition.satisfied ? 'SATISFIED' : 'NOT SATISFIED'}`
-    + ` (live allowlist ${String(armPrecondition.evaluated)} name(s), `
+    + ` (population ${armPrecondition.population}, ${String(armPrecondition.evaluated)} name(s), `
     + `${String(armPrecondition.unknownCount)} unknown ⇒ would be refused IN ERROR)`;
 
   return {

@@ -993,6 +993,7 @@ import {
 // TRA-3879 — the cross-engine fleet-capital read (`Σ E_i`) behind
 // `φ_eff = min(φ, A / Σ E_i)`. Wired near `liveOtmAggregateExposure` below.
 import { setLiveOtmFleetCapitalProvider } from './live-otm-fleet-capital.js';
+import { setAssetClassWatchlistProvider } from './underlying-asset-class.js';
 import {
   resolveTradierOptionsCreds,
   isLiveTradierOptionsEnabled,
@@ -6454,6 +6455,20 @@ registerLiveHealthRoutes(app, {
 // unit test (the TRA-2650 `fleetBooks` lesson, ~20 lines up).
 setLiveOtmFleetCapitalProvider(() =>
   getAllUserContexts().map(ctx => ctx.engine.getLiveOtmFleetCapitalRow()),
+);
+
+// TRA-4144 (CEO correction 2026-09-01) — the asset-class ARM PRECONDITION's
+// denominator under an UNRESTRICTED `OPTION_LIVE_OTM_UNIVERSE` (`*`, which is
+// production's value) is the runtime watchlist, not any allowlist. Wired here
+// for the same reason as the fleet-capital provider above: this is the only
+// module that can enumerate every engine without an import cycle, and wiring
+// once at boot means the precondition cannot come into existence blind.
+// ⚠ UNION ACROSS THE FLEET, BOTH MODES — the OTM scan runs per-engine on that
+// engine's own `getActiveSymbols()`, so the admitted population is the union;
+// a single-book read would silently shrink the denominator (the TRA-2650
+// `fleetBooks` lesson).
+setAssetClassWatchlistProvider(() =>
+  getAllUserContexts().flatMap(ctx => ctx.engine.getActiveSymbols()),
 );
 
 // TRA-3926 (2026-08-26) — the over-sell detector's FALLBACK authority for
