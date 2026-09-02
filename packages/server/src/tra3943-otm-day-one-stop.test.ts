@@ -846,9 +846,16 @@ describe('TRA-3943 — the actionability walk knows about the OTM intraday stop'
   it('a gate ABOVE the rule still refuses — the branch is placed, not prepended', () => {
     // `checkExits` `continue`s on the close-reject breaker long before `:7129`,
     // so the OTM stop never reaches its fire site on this row either.
-    const s = summarizeLiveStopActionability([otmRow({ closeRejectCount: 5 })], WITH_RULE);
+    // TRA-4266 — pinned on the EXHAUSTED latch, which refuses on every instant.
+    // A probing latch also `continue`s here, but only until its next retest, and
+    // a clock-dependent fixture would grade the clock rather than the placement
+    // of the branch.
+    const s = summarizeLiveStopActionability(
+      [otmRow({ closeRejectCount: 5, closeRejectProbeCount: 4 })],
+      WITH_RULE,
+    );
     expect(s.actionable).toBe(0);
-    expect(s.byReason).toEqual({ close_reject_breaker: 1 });
+    expect(s.byReason).toEqual({ close_reject_breaker_exhausted: 1 });
   });
 
   it('a row through −35% with NO armed premium stop is still counted as breached', () => {

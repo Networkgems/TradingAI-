@@ -700,6 +700,148 @@ function exitTransportBackoffMs(consecutiveFailures: number): number {
 }
 
 /**
+ * TRA-4266 — the HALF-OPEN ladder for the close-reject breaker, in ms, indexed
+ * by probes already spent (0 probes spent → 5m to the first retest, then 15m,
+ * 1h, 4h).
+ *
+ * ## Why the TRA-450 breaker needed one at all
+ *
+ * TRA-4218 gave a transport fault its own counter and its own backoff, so an
+ * outage can no longer disarm a stop. It did nothing for the other half: a
+ * counter accrued from GENUINE refusals still latched forever. Its only exits
+ * were a fill (which it prevents) and a human write, and `closeRejectCount` is
+ * persisted with the row — so on 2026-08-31 three real-money positions, all
+ * three through their stops, stayed inert across four process restarts and a
+ * full trading session after the fault that tripped them had cleared.
+ *
+ * A breaker whose only exit is a human is not a breaker; it is a permanent
+ * disarm, applied to exactly the rows that most need to exit. Every breaker
+ * worth the name retests the circuit.
+ *
+ * ## Why a ladder, and why these rungs
+ *
+ * The conditions that make a broker refuse a `sell_to_close` — no bid, a halt,
+ * a limit the book has moved away from, a momentary account state — clear on
+ * minutes-to-hours timescales, so the first retest has to be soon enough to
+ * matter to a breached stop and the last one far enough out to still be inside
+ * the same session. 5m/15m/1h/4h spans ~5h 20m of retesting from the trip: one
+ * RTH session, which is the horizon over which "the condition cleared" is a
+ * live hypothesis.
+ *
+ * ## Why it is bounded (TRA-4266 AC4)
+ *
+ * The refusals this counter is built from are also the shape TRA-450 exists to
+ * stop: 1,476 doomed `sell_to_close` orders against three contracts. A row
+ * whose broker really has refused it — `Account is restricted for option
+ * trading` is in the live `voids.recent[]` — must not be re-asked forever. The
+ * probe budget converts "forever" into "for one session", after which the row
+ * is genuinely a human's and SAYS so (`close_reject_breaker_exhausted`).
+ */
+const DEFAULT_CLOSE_REJECT_PROBE_LADDER_MS = [300_000, 900_000, 3_600_000, 14_400_000];
+
+/** TRA-4266 AC4 — how many half-open probes one latch may spend before it is a human's. */
+const DEFAULT_MAX_CLOSE_REJECT_PROBES = 4;
+
+/** TRA-4266 — the half-open policy, resolved from the env like its neighbours. */
+export interface CloseRejectProbePolicy {
+  /** Cooldown before the Nth probe, indexed by probes already spent; last rung repeats. */
+  ladderMs: number[];
+  /** AC4's cap. `0` disables the half-open entirely (the pre-TRA-4266 latch). */
+  maxProbes: number;
+}
+
+function parsePositiveInt(raw: string | undefined): number | null {
+  if (raw === undefined) return null;
+  const n = Number.parseInt(raw.trim(), 10);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/**
+ * TRA-4266 AC1 — "a configurable cooldown". Both rungs and cap are env-tunable
+ * so the ladder can be shortened for a soak without a deploy, and neither knob
+ * can widen the blast radius: a malformed value falls back to the default
+ * rather than to "unbounded", and `maxProbes: 0` is the strictly-safer old
+ * behaviour, never a strictly-riskier one.
+ */
+export function resolveCloseRejectProbePolicy(
+  env: NodeJS.ProcessEnv = process.env,
+): CloseRejectProbePolicy {
+  const rungs = (env.CLOSE_REJECT_PROBE_LADDER_MS ?? '')
+    .split(',')
+    .map(s => parsePositiveInt(s))
+    .filter((n): n is number => n !== null && n > 0);
+  const maxProbes = parsePositiveInt(env.CLOSE_REJECT_MAX_PROBES);
+  return {
+    ladderMs: rungs.length > 0 ? rungs : DEFAULT_CLOSE_REJECT_PROBE_LADDER_MS,
+    maxProbes: maxProbes ?? DEFAULT_MAX_CLOSE_REJECT_PROBES,
+  };
+}
+
+/** TRA-4266 — cooldown before the next probe, given how many are already spent. */
+function closeRejectProbeCooldownMs(probesSpent: number, policy: CloseRejectProbePolicy): number {
+  const ladder = policy.ladderMs;
+  const idx = Math.min(Math.max(Math.floor(probesSpent), 0), ladder.length - 1);
+  return ladder[idx] as number;
+}
+
+/** TRA-4266 — what the close-reject breaker is doing to this row right now. */
+export interface CloseRejectBreakerHold {
+  /** `closeRejectCount` is at or over the threshold. */
+  latched: boolean;
+  /** Latched AND not admitting a probe on this instant ⇒ `checkExits` suppresses staging. */
+  held: boolean;
+  /** Epoch ms the row next admits a probe. `null` ⇒ no release exists (budget spent). */
+  releaseAt: number | null;
+  probesSpent: number;
+  probeBudget: number;
+  /** Budget spent: the latch is now permanent until a human acts. TRA-4266 AC4. */
+  exhausted: boolean;
+}
+
+/**
+ * TRA-4266 — THE gate. One function, called by `checkExits` (which acts on it)
+ * and by `liveStopGateReading` (which publishes it), for the reason
+ * `engineMayActOnAdoptedRow` is shared: a second copy of a half-open would
+ * eventually disagree with the loop it claims to describe, and the disagreement
+ * would be invisible — a surface saying "retesting at 20:15Z" over a loop that
+ * never retests is worse than the latch it replaced.
+ *
+ * ⚠️ An ABSENT `closeRejectProbeNotBeforeMs` on a latched row resolves to DUE
+ * NOW, not to indefinite. That is a deliberate migration decision and it is the
+ * one that reaches the population this ticket was filed on: the three 2026-08-31
+ * rows latched before this field existed, so nothing on them can date their
+ * cooldown, and the honest reading of "latched, no scheduled retest, breaker
+ * that retests" is that the retest is overdue. The cost is bounded to ONE
+ * `sell_to_close` per such row on the first tick after deploy — the probe is
+ * consumed by its own refusal and the row then takes the ladder like any other.
+ */
+export function closeRejectBreakerHold(
+  opt: OptionPosition,
+  nowMs: number = Date.now(),
+  policy: CloseRejectProbePolicy = resolveCloseRejectProbePolicy(),
+): CloseRejectBreakerHold {
+  const probesSpent = Math.max(0, Math.floor(opt.closeRejectProbeCount ?? 0));
+  const probeBudget = policy.maxProbes;
+  if ((opt.closeRejectCount ?? 0) < MAX_CONSECUTIVE_CLOSE_REJECTS) {
+    return { latched: false, held: false, releaseAt: null, probesSpent, probeBudget, exhausted: false };
+  }
+  if (probesSpent >= probeBudget) {
+    return { latched: true, held: true, releaseAt: null, probesSpent, probeBudget, exhausted: true };
+  }
+  const stamped = opt.closeRejectProbeNotBeforeMs;
+  const releaseAt =
+    typeof stamped === 'number' && Number.isFinite(stamped) ? stamped : nowMs;
+  return {
+    latched: true,
+    held: nowMs < releaseAt,
+    releaseAt,
+    probesSpent,
+    probeBudget,
+    exhausted: false,
+  };
+}
+
+/**
  * TRA-4218 — the signature a `closeRejectCount` accrued from Tradier 5xx
  * transport faults leaves on the row, used ONLY by the one-shot snapshot heal
  * in {@link OptionsAccount.importSnapshot}.
@@ -1960,8 +2102,29 @@ export type LiveStopInertReason =
    * backlog, and it has no release horizon because there is nothing pending.
    */
   | 'adopted_not_authorized'
-  /** TRA-450 (`:5016`) — the close-reject circuit breaker has withdrawn staging. */
+  /**
+   * TRA-450 (`:5016`) — the close-reject circuit breaker has withdrawn staging.
+   *
+   * TRA-4266 — this value now means "withdrawn UNTIL the next half-open probe",
+   * and the walk stamps that instant in `releaseAt`. It is a clocked hold, like
+   * `exit_transport_backoff` and unlike its old self. A latch whose probe budget
+   * is spent is a different value — `close_reject_breaker_exhausted` — precisely
+   * so that `indefinite` on the actionability fold cannot be fed by a row that
+   * is in fact going to retry (TRA-4266 AC2).
+   */
   | 'close_reject_breaker'
+  /**
+   * TRA-4266 (AC4) — the close-reject breaker latched, spent every half-open
+   * probe its policy allows, and was refused every time. THIS one has no
+   * release: the broker has now looked at the contract `3 + maxProbes` times
+   * across a session and said no each time, which is the population TRA-450 was
+   * written to stop spraying orders at.
+   *
+   * A non-zero count here is the only honest `indefinite` this breaker can
+   * produce, and it is an operator's row: re-stage it by hand (which resets the
+   * counter and the budget) or close the position.
+   */
+  | 'close_reject_breaker_exhausted'
   /** TRA-2984 (`:5025`) — the expiry breaker has withdrawn staging. */
   | 'exit_expired_breaker'
   /**
@@ -2291,7 +2454,19 @@ export function liveStopGateReading(
     return { ...base, held, releaseAt, inFlight: held.length === 0 };
   }
 
-  if ((opt.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS) held.push('close_reject_breaker');
+  // TRA-4266 — the reject breaker, off the SHARED half-open read, so this
+  // surface cannot claim a retest the loop will not make (or hide one it will).
+  // A row inside its cooldown is held WITH a release; a row whose probe budget
+  // is spent is held with none, and only the second may feed `indefinite`.
+  const rejectBreaker = closeRejectBreakerHold(opt, now);
+  if (rejectBreaker.held) {
+    if (rejectBreaker.exhausted) {
+      held.push('close_reject_breaker_exhausted');
+    } else {
+      held.push('close_reject_breaker');
+      if (rejectBreaker.releaseAt !== null) releaseAt.close_reject_breaker = rejectBreaker.releaseAt;
+    }
+  }
   // TRA-4218 — after the reject breaker, before the expiry breaker, exactly as
   // in `checkExits`. The one gate here with a stamped release.
   if (
@@ -2568,7 +2743,13 @@ function gateRecoveryPath(
     case 'imported_no_broker_mirror':
     case 'adopted_not_authorized':
       return 'config_change';
+    // TRA-4266 — `close_reject_breaker` no longer reaches this switch while it
+    // is probing: the walk stamps its next-probe instant in `releaseAt`, so the
+    // test above returns `automatic` for it. It arrives here only when the
+    // stamp is somehow unresolvable; the EXHAUSTED value arrives here always,
+    // and it is the one that genuinely costs a human.
     case 'close_reject_breaker':
+    case 'close_reject_breaker_exhausted':
     case 'exit_expired_breaker':
       // The one asymmetry this ticket's AC4 names. `stageManualPendingExit`
       // returns `null` for an imported row, and it is the ONLY site that clears
@@ -2665,8 +2846,19 @@ export interface LiveStopGovernanceSummary {
   /** Held rows carrying MORE than one gate. `Σ heldBy − multiHeld` overlap. */
   multiHeld: number;
   /**
-   * The two auto-close breakers, across every held row — the number the 08-31
-   * book needed and none of the three surfaces could produce.
+   * The two auto-close breakers, across every OPEN LIVE row — the number the
+   * 08-31 book needed and none of the three surfaces could produce.
+   *
+   * TRA-4266 — "every open live row", not "every HELD row", and the widening is
+   * the point. A latched close-reject breaker whose half-open cooldown has
+   * elapsed is not holding its row on this instant, so it lands in `governed`
+   * and would leave this count — while the row still carries the counter, is
+   * still one refusal from re-latching, and can sit that way for hours if no
+   * exit rule happens to fire. "A latched row that reads identically to a
+   * managed one" is the exact defect this fold exists to break, and coupling
+   * the census to the hold re-created it one release-mechanism later.
+   *
+   * So `rows` here is NOT a subset of `ungoverned` and must not be read as one.
    */
   breakerLatched: {
     rows: number;
@@ -2734,6 +2926,23 @@ export function summarizeLiveStopGovernance(
     rows += 1;
     const reading = liveStopGateReading(opt, ctx, clock);
 
+    // The cause, on every row carrying a latched breaker — read off the COUNTERS
+    // and hoisted above the class `continue`s on purpose (TRA-4266). A latch
+    // between half-open probes reads `governed` for as long as no exit rule
+    // fires, and a census that only looked at held rows would lose it there.
+    const latch = describeExitBreakerLatch(opt);
+    if (latch !== null) {
+      breakerRows += 1;
+      byCause[latch.causeClass] += 1;
+      if (latch.provenance === 'stamped' && latch.at !== null) {
+        stamped += 1;
+        if (firstTrippedAt === null || latch.at < firstTrippedAt) firstTrippedAt = latch.at;
+        if (lastTrippedAt === null || latch.at > lastTrippedAt) lastTrippedAt = latch.at;
+      } else {
+        inferred += 1;
+      }
+    }
+
     // A row the engine has nothing to act on is its own class. Checked FIRST:
     // "held by a gate" is a claim about a stop that exists.
     if (!reading.stopArmed && !reading.otmGoverned) {
@@ -2766,20 +2975,6 @@ export function summarizeLiveStopGovernance(
     }
     byClass[clocked ? 'held_with_release' : 'held_indefinite'] += 1;
     recovery[hardest] += 1;
-
-    // The cause, on the rows where a breaker is the thing holding them.
-    const latch = describeExitBreakerLatch(opt);
-    if (latch !== null) {
-      breakerRows += 1;
-      byCause[latch.causeClass] += 1;
-      if (latch.provenance === 'stamped' && latch.at !== null) {
-        stamped += 1;
-        if (firstTrippedAt === null || latch.at < firstTrippedAt) firstTrippedAt = latch.at;
-        if (lastTrippedAt === null || latch.at > lastTrippedAt) lastTrippedAt = latch.at;
-      } else {
-        inferred += 1;
-      }
-    }
   }
 
   return {
@@ -3928,7 +4123,13 @@ export function summarizeLiveExitErrors(
     total += 1;
     if ((opt.exitExpiredCount ?? 0) > 0) expired += 1;
     if (
-      (opt.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS
+      // TRA-4266 — EXHAUSTED, not merely latched. This number's whole contract
+      // is "the engine has given up and is waiting for a person who has not been
+      // told", and a latch that retests on a ladder has not given up. Counting
+      // it here would page a human for a row that is going to try again in five
+      // minutes, and would leave nothing to distinguish that row from the one
+      // that has genuinely run out of retests.
+      closeRejectBreakerHold(opt).exhausted
       || (opt.exitExpiredCount ?? 0) >= MAX_CONSECUTIVE_EXIT_EXPIRIES
       // TRA-2820 — `checkExits` disarms a sentinel-stamped row outright, so no
       // future tick will stage the exit that would clear this error.
@@ -10140,7 +10341,17 @@ export class PaperOptionsAccount {
       // transient hiccup never strands a position that could still close. We
       // still update the mark / trailing state above so the dashboard stays
       // live — only NEW order submission is suppressed.
-      if ((opt.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS) continue;
+      //
+      // TRA-4266 — and the suppression now RELEASES. `closeRejectBreakerHold` is
+      // the shared half-open read: latched and inside its cooldown ⇒ `continue`
+      // exactly as before; latched with the cooldown elapsed and probe budget
+      // left ⇒ fall through and let this tick stage ONE `sell_to_close`. Nothing
+      // is booked here, because the probe is spent by its own REFUSAL in
+      // `clearPendingExit` — consuming it on admission would let a tick where no
+      // exit rule fires burn the budget with no order ever going out, which caps
+      // the ticks instead of the probes. Only one order can be in flight at a
+      // time anyway: `pendingExit` is the gate above this one.
+      if (closeRejectBreakerHold(opt).held) continue;
 
       // TRA-4218 — the transport BACKOFF. Sits with the two breakers because it
       // suppresses submission the same way, and is deliberately unlike them in
@@ -11237,6 +11448,11 @@ export class PaperOptionsAccount {
     // left on a row with no counter would be read by the heal as "this row's
     // (absent) streak is refusal-only", which is not a claim about anything.
     delete opt.closeRejectRefusalsOnly;
+    // TRA-4266 — and the half-open state. This IS the success the probe was
+    // looking for: the circuit closed. A surviving budget would bound the NEXT
+    // latch by a streak that has already been resolved by a fill.
+    delete opt.closeRejectProbeCount;
+    delete opt.closeRejectProbeNotBeforeMs;
     // TRA-4218 — and the transport streak + its backoff, same reason.
     delete opt.exitTransportFailCount;
     delete opt.exitRetryNotBeforeMs;
@@ -11378,6 +11594,13 @@ export class PaperOptionsAccount {
     // clean slate rather than inheriting the engine's abandoned-retry state.
     delete opt.closeRejectCount;
     delete opt.closeRejectRefusalsOnly; // TRA-4218 — provenance follows its counter.
+    // TRA-4266 — and the half-open budget. A deliberate user retry gets a clean
+    // slate, and that has to include the retest budget: this is the
+    // `manual_restage` recovery path the governance fold publishes, so a row
+    // that keeps `closeRejectProbeCount: 4` across it would re-latch straight
+    // into `close_reject_breaker_exhausted` on its first refusal.
+    delete opt.closeRejectProbeCount;
+    delete opt.closeRejectProbeNotBeforeMs;
     // TRA-4218 — and the transport backoff. The user is submitting NOW; holding
     // their order behind a wait the engine chose would be the same defect in a
     // smaller window.
@@ -11506,15 +11729,52 @@ export class PaperOptionsAccount {
         // and they are the only thing that can tell a refusal from an outage.
         // Classifying the decorated string would read every trip as
         // `broker_refusal`, which is the exact conflation this ticket is about.
-        stampExitBreakerTrip(
-          opt,
-          'close_reject',
-          opt.closeRejectCount,
-          classifyExitBreakerCause(reason ?? opt.exitErrorReason),
-        );
+        const causeClass = classifyExitBreakerCause(reason ?? opt.exitErrorReason);
+        stampExitBreakerTrip(opt, 'close_reject', opt.closeRejectCount, causeClass);
+        // TRA-4266 — HALF-OPEN bookkeeping. Reaching this line at or above the
+        // threshold is one of exactly two events:
+        //   • the CROSSING (`=== MAX`) — the trip. No probe has been spent;
+        //     schedule the first retest one rung up the ladder.
+        //   • a REFUSED PROBE (`> MAX`) — the only way `checkExits` can have
+        //     staged another order on a latched row. Spend the probe, and
+        //     schedule the next retest one rung further out.
+        // Spending it HERE, on the refusal, rather than at the admission gate is
+        // what makes the cap a cap on probes and not on ticks.
+        const probePolicy = resolveCloseRejectProbePolicy();
+        if (opt.closeRejectCount > MAX_CONSECUTIVE_CLOSE_REJECTS) {
+          opt.closeRejectProbeCount = (opt.closeRejectProbeCount ?? 0) + 1;
+        }
+        const probesSpent = opt.closeRejectProbeCount ?? 0;
+        const probesExhausted = probesSpent >= probePolicy.maxProbes;
+        if (probesExhausted) {
+          // AC4 — the budget is gone and the row is a human's. Drop the instant
+          // rather than leaving a stale one: a "retesting at" a surface can read
+          // over a loop that will never retest again is the defect this ticket
+          // is about, pointed the other way.
+          delete opt.closeRejectProbeNotBeforeMs;
+        } else {
+          opt.closeRejectProbeNotBeforeMs =
+            Date.now() + closeRejectProbeCooldownMs(probesSpent, probePolicy);
+        }
+        // TRA-4266 AC3 — the row NAMES its cause class. Under this build the
+        // transport branch above has already declined this failure, so a
+        // `transport_fault` reading here can only come from a broker string that
+        // looks like an outage on a decision the broker did make; say what was
+        // read rather than asserting a refusal the text does not support.
+        const causeLabel =
+          causeClass === 'broker_refusal' ? 'BROKER REFUSAL'
+            : causeClass === 'transport_fault' ? 'TRANSPORT FAULT'
+              : 'CAUSE NOT RECORDED';
         opt.exitErrorReason =
-          `${reason ? `${reason} — ` : ''}auto-close paused after ` +
-          `${opt.closeRejectCount} rejected attempts; ${recovery()}`;
+          `${reason ? `${reason} — ` : ''}auto-close paused after `
+          + `${opt.closeRejectCount} rejected attempts [${causeLabel}]; `
+          + (probesExhausted
+            ? `all ${probePolicy.maxProbes} half-open retests are spent, so auto-close will NOT `
+              + `try again on its own; `
+            : `auto-close RETESTS this contract once at `
+              + `${new Date(opt.closeRejectProbeNotBeforeMs as number).toISOString()} `
+              + `(retest ${probesSpent + 1} of ${probePolicy.maxProbes}); `)
+          + `${recovery()}`;
       }
     }
     return true;
@@ -13918,8 +14178,13 @@ export class PaperOptionsAccount {
       // on a row whose auto-close had been paused for eleven hours by the
       // TRA-450 breaker — the exact "reads identically to a managed row" defect
       // the route was built to end.
-      if ((opt.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS) {
-        exitInertReasons.push('close_reject_breaker');
+      // TRA-4266 — the shared half-open read, so this census cannot publish a
+      // latch on a row the loop is about to probe (nor hide an exhausted one).
+      const rejectBreakerHold = closeRejectBreakerHold(opt);
+      if (rejectBreakerHold.held) {
+        exitInertReasons.push(
+          rejectBreakerHold.exhausted ? 'close_reject_breaker_exhausted' : 'close_reject_breaker',
+        );
       }
       if (
         typeof opt.exitRetryNotBeforeMs === 'number'
@@ -14588,6 +14853,8 @@ export class PaperOptionsAccount {
     // half-counted miss streak would only be noise in the archive.
     delete opt.closeRejectCount;
     delete opt.closeRejectRefusalsOnly; // TRA-4218 — provenance follows its counter.
+    delete opt.closeRejectProbeCount; // TRA-4266 — the half-open state follows the latch.
+    delete opt.closeRejectProbeNotBeforeMs;
     delete opt.exitExpiredCount; // TRA-2984 — same, and it gates a MARKET escalation.
     delete opt.exitTransportFailCount; // TRA-4218 — same.
     delete opt.exitRetryNotBeforeMs;
@@ -15482,6 +15749,12 @@ export class PaperOptionsAccount {
           exitErrorReason: o.exitErrorReason,
         });
         delete o.closeRejectCount;
+        // TRA-4266 — the half-open state describes a latch this heal has just
+        // removed, so it goes too. Leaving a spent budget behind would bound the
+        // NEXT latch — one accrued from genuine refusals — by probes spent on a
+        // transport fault that never belonged on this counter.
+        delete o.closeRejectProbeCount;
+        delete o.closeRejectProbeNotBeforeMs;
         // TRA-4225 — the latch is gone, so its trip record goes with it. Guarded
         // on the breaker name: this heal touches ONLY the reject counter, and an
         // expiry trip on the same row is a different latch that survives.
@@ -15492,6 +15765,37 @@ export class PaperOptionsAccount {
         // it releases on its own.
         o.exitTransportFailCount = 1;
         o.exitRetryNotBeforeMs = Date.now() + exitTransportBackoffMs(1);
+      }
+      // TRA-4266 — give a LATCHED row that arrived without a scheduled retest an
+      // orderly one, on the way in, for the reason the heal above happens here:
+      // the counter rides the snapshot, so the deploy that adds the half-open
+      // boots holding rows that were latched by a build which had none.
+      //
+      // The pure read (`closeRejectBreakerHold`) already resolves an absent
+      // instant to DUE NOW — that is what stops an unstamped latch reading as
+      // permanent, and it is the fallback that must never be removed. This is
+      // the same choice TRA-4218 made one block up: re-arm through the ladder
+      // rather than instantly, so a boot that follows an outage by seconds does
+      // not fire every stranded stop on its first tick. One rung, and it
+      // releases on its own with nobody in the loop.
+      if (
+        (o.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS
+        && typeof o.closeRejectProbeNotBeforeMs !== 'number'
+      ) {
+        const probePolicy = resolveCloseRejectProbePolicy();
+        const spent = Math.max(0, Math.floor(o.closeRejectProbeCount ?? 0));
+        if (spent < probePolicy.maxProbes) {
+          o.closeRejectProbeNotBeforeMs =
+            Date.now() + closeRejectProbeCooldownMs(spent, probePolicy);
+          accountLog.warn('TRA-4266 — scheduled a half-open retest for a latched close-reject breaker', {
+            issue: 'TRA-4266',
+            optionSymbol: o.optionSymbol,
+            mode: o.mode ?? 'demo',
+            closeRejectCount: o.closeRejectCount,
+            probesSpent: spent,
+            retestAt: new Date(o.closeRejectProbeNotBeforeMs).toISOString(),
+          });
+        }
       }
       this.openOptions.set(o.id, o);
     }

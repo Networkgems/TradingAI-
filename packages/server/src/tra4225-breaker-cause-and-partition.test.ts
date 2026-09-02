@@ -97,10 +97,27 @@ function liveRow(overrides: Partial<OptionPosition> = {}): OptionPosition {
   };
 }
 
+/**
+ * TRA-4266 — the retest instant these rows carry under the build that has a
+ * half-open. On 2026-08-31 the field did not exist, and the ABSENCE of it is
+ * what this ticket's sibling turned out to be about: the latch had no release
+ * because nothing ever scheduled one. The fixtures are restated rather than
+ * frozen, because the population they stand for (three real-money rows, one
+ * cause) is unchanged — only the answer to "when does it lift" is.
+ *
+ * `importSnapshot` stamps exactly this on the way in for a latched row that
+ * arrives without one, so it is what the incident book looks like today.
+ */
+const FIRST_PROBE_AT = MEASURED_AT + 300_000;
+
+/** A latch that has spent its whole probe budget — the only one with NO release. */
+const EXHAUSTED_LATCH = { closeRejectCount: 7, closeRejectProbeCount: 4 } as const;
+
 /** f3b34f34 — engine-opened, through its stop, latched by the 500. */
 const KO_ROW = (): OptionPosition => liveRow({
   id: 'f3b34f34',
   closeRejectCount: 3,
+  closeRejectProbeNotBeforeMs: FIRST_PROBE_AT,
   exitErrorReason: `${LIVE_500_REASON} — auto-close paused after 3 rejected attempts; `
     + 'close this position manually on Tradier or with the Close button.',
 });
@@ -115,6 +132,7 @@ const NOK_THROUGH = (): OptionPosition => liveRow({
   currentPremium: 0.505,
   stopLossPremium: 0.584,
   closeRejectCount: 3,
+  closeRejectProbeNotBeforeMs: FIRST_PROBE_AT, // TRA-4266
   exitErrorReason: `${LIVE_500_REASON} — auto-close paused after 3 rejected attempts; `
     + 'close this position manually on Tradier or with the Close button.',
 });
@@ -137,6 +155,7 @@ const NOK_ADOPTED = (): OptionPosition => liveRow({
   importedFromTradier: true,
   tradierEnv: 'production',
   closeRejectCount: 3,
+  closeRejectProbeNotBeforeMs: FIRST_PROBE_AT, // TRA-4266
   exitErrorReason: `${LIVE_500_REASON} — auto-close paused after 3 rejected attempts; `
     + 'close this position manually on Tradier or with the Close button.',
 });
@@ -362,14 +381,29 @@ describe('TRA-4225 AC2 — the 2026-08-31 admin book is ONE population with ONE 
     expect(s.byReason).toEqual({ close_reject_breaker: 2 });
     // …and the third row, latched by the identical fault, is nowhere in it.
     expect(s.breached + s.actionable).toBe(2);
-    expect(s.releasesAt).toBeNull();
+    // TRA-4266 — this WAS `null`, and that null is the sibling ticket: a latch
+    // with no scheduled retest. The disagreement under test here (0 / 1 / 2) is
+    // about which rows the surface can SEE, not about when they lift, and it is
+    // unchanged.
+    expect(s.releasesAt).toBe(new Date(FIRST_PROBE_AT).toISOString());
+    expect(s.indefinite).toBe(0);
   });
 
   it('publishes all three rows as one latched population under one cause', () => {
     const g = summarizeLiveStopGovernance(ADMIN_BOOK_0831(), MONEY_BOOK);
     expect(g.rows).toBe(3);
     expect(g.ungoverned).toBe(3);
-    expect(g.byClass.held_indefinite).toBe(3);
+    // TRA-4266 — still three ungoverned rows under one cause, which is this
+    // ticket's claim. What changed is the CLASS: the breaker now retests, so the
+    // hold lifts on a clock instead of on a human.
+    //
+    // Two, not three: `a2f9c8cd` is ALSO held by `adopted_not_authorized`, which
+    // has no release, and a row is only `held_with_release` when EVERY gate on
+    // it lifts on a clock. That is this suite's own rule read in the other
+    // direction, and clearing the breaker on that row would still leave it
+    // ungoverned — which is the fact the partition exists to publish.
+    expect(g.byClass.held_with_release).toBe(2);
+    expect(g.byClass.held_indefinite).toBe(1);
     expect(g.byClass.governed).toBe(0);
     // The number the incident could not produce anywhere: 3, not 0 / 1 / 2.
     expect(g.heldBy.close_reject_breaker).toBe(3);
@@ -445,12 +479,16 @@ describe('TRA-4225 AC2 — the 2026-08-31 admin book is ONE population with ONE 
     // Outside the close window every row picks up `daily_close_hold`, which has
     // a release. The latched rows must still read `held_indefinite`: one gate
     // with a clock does not lift the gate without one.
+    //
+    // TRA-4266 — graded on the EXHAUSTED latch now, because that is the only
+    // close-reject state left with no release of its own; a probing latch is
+    // legitimately `held_with_release` and would make this control vacuous.
     const ctx: LiveStopActionabilityContext = {
       ...MONEY_BOOK,
       liveStopPolicy: { policy: 'daily_close', closeWindowMin: 30, catastrophicLossPct: 0.5 },
     };
-    const g = summarizeLiveStopGovernance([KO_ROW()], ctx);
-    expect(g.heldBy.close_reject_breaker).toBe(1);
+    const g = summarizeLiveStopGovernance([liveRow({ ...EXHAUSTED_LATCH })], ctx);
+    expect(g.heldBy.close_reject_breaker_exhausted).toBe(1);
     expect(g.byClass.held_indefinite).toBe(1);
     expect(g.byClass.held_with_release).toBe(0);
   });
@@ -470,16 +508,31 @@ describe('TRA-4225 AC4 — "no automated release" is not "no way out"', () => {
     vi.useRealTimers();
   });
 
-  it('an engine-opened latched row is a Close button away — `manual_restage`', () => {
+  it('a PROBING latch is `automatic` — the retest is the release', () => {
+    // TRA-4266 — this was `manual_restage` with a null `releasesAt`, and that
+    // pair is precisely what the sibling ticket calls a permanent disarm. While
+    // the breaker still has retests, no human is required and the fold must not
+    // ask for one.
     const g = summarizeLiveStopGovernance([KO_ROW()], MONEY_BOOK);
+    expect(g.recovery).toEqual({
+      automatic: 1, config_change: 0, manual_restage: 0, close_position_only: 0,
+    });
+    expect(g.releasesAt).toBe(new Date(FIRST_PROBE_AT).toISOString());
+  });
+
+  it('an EXHAUSTED engine-opened latch is a Close button away — `manual_restage`', () => {
+    const g = summarizeLiveStopGovernance([liveRow({ ...EXHAUSTED_LATCH })], MONEY_BOOK);
     expect(g.recovery).toEqual({
       automatic: 0, config_change: 0, manual_restage: 1, close_position_only: 0,
     });
     expect(g.releasesAt).toBeNull();
   });
 
-  it('an IMPORTED latched row can only be un-held by giving up the position', () => {
-    const g = summarizeLiveStopGovernance([NOK_ADOPTED()], MONEY_BOOK);
+  it('an IMPORTED exhausted latch can only be un-held by giving up the position', () => {
+    const g = summarizeLiveStopGovernance(
+      [{ ...NOK_ADOPTED(), ...EXHAUSTED_LATCH, closeRejectProbeNotBeforeMs: undefined }],
+      MONEY_BOOK,
+    );
     // `close_position_only` beats the adopted row's own `config_change`: arming
     // adoption would not clear the breaker, and clearing the breaker is the
     // thing with no path that keeps the row.
@@ -649,6 +702,7 @@ describe('TRA-4225 — the fleet fold', () => {
     const stampedRow = liveRow({
       id: 'stamped',
       closeRejectCount: 3,
+      closeRejectProbeNotBeforeMs: FIRST_PROBE_AT + 60_000, // TRA-4266
       exitErrorReason: LIVE_REFUSAL_REASON,
       exitBreakerTrip: {
         breaker: 'close_reject',
@@ -673,7 +727,11 @@ describe('TRA-4225 — the fleet fold', () => {
       .toBe(new Date(MEASURED_AT - 3_600_000).toISOString());
     expect(fleet.breakerLatched.lastTrippedAt)
       .toBe(new Date(MEASURED_AT - 3_600_000).toISOString());
-    expect(fleet.recovery.manual_restage).toBe(2);
+    // TRA-4266 — both books' latches are still probing, so the fleet's recovery
+    // path is the clock, not a person. `releasesAt` extremises to the EARLIEST.
+    expect(fleet.recovery.automatic).toBe(2);
+    expect(fleet.recovery.manual_restage).toBe(0);
+    expect(fleet.releasesAt).toBe(new Date(FIRST_PROBE_AT).toISOString());
   });
 
   it('folds an empty fleet to zeros', () => {

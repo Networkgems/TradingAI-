@@ -448,6 +448,8 @@ export type AdoptedLotExitGate =
   | 'adopted_not_authorized'
   | 'stop_not_armed'
   | 'close_reject_breaker'
+  /** TRA-4266 — latched AND every half-open retest spent; the only one with no release. */
+  | 'close_reject_breaker_exhausted'
   | 'exit_transport_backoff'
   | 'exit_expired_breaker';
 

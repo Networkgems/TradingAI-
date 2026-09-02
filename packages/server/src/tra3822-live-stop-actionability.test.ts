@@ -304,7 +304,11 @@ describe('TRA-3822 gate attribution', () => {
   it.each([
     ['multi_leg_combo', { legs: [{}, {}] as never }],
     ['covered_write', { coveredWrite: 'covered_call' as const }],
-    ['close_reject_breaker', { closeRejectCount: 3 }],
+    // TRA-4266 — `close_reject_breaker` LEFT this list. A latched row now
+    // retests on a ladder, so it is a clocked hold and belongs with
+    // `pdt_hold_today`; only the state that has spent every retest is a human's,
+    // and it says so with its own gate name rather than sharing one.
+    ['close_reject_breaker_exhausted', { closeRejectCount: 7, closeRejectProbeCount: 4 }],
     ['exit_expired_breaker', { exitExpiredCount: 3 }],
   ])('%s is INDEFINITE — no clock releases it, a human must', (reason, overrides) => {
     const s = summarizeLiveStopActionability([pltrRow(overrides)], NO_HOLD);

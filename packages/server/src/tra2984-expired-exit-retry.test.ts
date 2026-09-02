@@ -286,10 +286,17 @@ describe('TRA-2984 — summarizeLiveExitErrors makes `exitErrorReason` countable
     ]);
     expect(byExpiry.stagingStopped).toBe(1);
 
+    // TRA-4266 — "GIVEN UP" means the rejection breaker has spent its half-open
+    // probe budget. A latch that still has retests has not given up, and
+    // counting it here would page a human for a row that is going to try again
+    // by itself in five minutes.
     const byRejection = summarizeLiveExitErrors([
-      pos({ exitErrorReason: 'auto-close paused …', closeRejectCount: 3 }),
+      pos({ exitErrorReason: 'auto-close paused …', closeRejectCount: 7, closeRejectProbeCount: 4 }),
     ]);
     expect(byRejection.stagingStopped).toBe(1);
+    expect(summarizeLiveExitErrors([
+      pos({ exitErrorReason: 'auto-close paused …', closeRejectCount: 3 }),
+    ]).stagingStopped).toBe(0);
     // A rejection is not an expiry — the two must stay distinguishable here too.
     expect(byRejection.expired).toBe(0);
   });

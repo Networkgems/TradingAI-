@@ -3931,6 +3931,40 @@ export interface OptionPosition {
    */
   closeRejectRefusalsOnly?: boolean;
   /**
+   * TRA-4266 — epoch ms before which the latched close-reject breaker refuses to
+   * admit its next HALF-OPEN probe. This is the field that turns
+   * {@link closeRejectCount} from a permanent disarm into a circuit breaker.
+   *
+   * Written at the crossing (the `clearPendingExit` that carries the counter to
+   * `MAX_CONSECUTIVE_CLOSE_REJECTS`) and re-written after every probe that also
+   * fails, each time one rung further up the cooldown ladder. Once it is in the
+   * past and the probe budget is unspent, `checkExits` admits exactly ONE
+   * `sell_to_close`; a fill clears the whole latch, a refusal re-latches it.
+   *
+   * ⚠️ ABSENT DOES NOT MEAN "NEVER". A row latched by a build that predates this
+   * field carries no instant, and the read
+   * (`closeRejectBreakerHold`) resolves that to **due now** rather than to
+   * "indefinite" — which is the whole point of the ticket. Three real-money rows
+   * sat latched across four process restarts and a full session precisely
+   * because the absence of a release read as the absence of a retry.
+   */
+  closeRejectProbeNotBeforeMs?: number;
+  /**
+   * TRA-4266 — half-open probes SPENT on the current latch: `sell_to_close`
+   * attempts the breaker admitted after its cooldown and the broker refused
+   * again. Bounded by `MAX_CLOSE_REJECT_PROBES`, after which the row is
+   * genuinely indefinite and needs a human — that bound is TRA-4266 AC4, and it
+   * is what stops a broker that has really said no (`Account is restricted for
+   * option trading`) from being re-asked forever.
+   *
+   * Counted on the REFUSAL, not on the admission. Counting admissions would let
+   * a tick on which no exit rule fired burn the budget without an order ever
+   * going out, i.e. cap the ticks rather than the probes. Deleted wherever
+   * {@link closeRejectCount} is deleted, so a fill or a manual re-stage restores
+   * the full budget along with the counter it bounds.
+   */
+  closeRejectProbeCount?: number;
+  /**
    * TRA-4218 — consecutive `sell_to_close` submits for this position that the
    * broker never DECIDED on: HTTP 5xx / 429 / 408, or a network-level `fetch`
    * failure. Reset on a successful submit ({@link OptionPosition.pendingExit}
