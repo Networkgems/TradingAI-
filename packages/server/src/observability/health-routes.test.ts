@@ -5569,6 +5569,82 @@ describe('GET /api/health/live-enforce-gates (TRA-3216)', () => {
     expect(body.note).toMatch(/universe=RESTRICTED to \[AAPL,SPY,QQQ,PLTR,TSLA\]/);
   });
 
+  // ─── TRA-4244 (parent TRA-4238) — the PROFIT side of the same sleeve ────────
+  // Every other block on `arm` is an ADMISSION gate; this one is the exit
+  // schedule the admitted row is then managed under, and nothing published it.
+  // The resolver's own semantics are pinned in `tra4244-otm-profit-schedule.test.ts`;
+  // what is measured HERE is that the route actually serves them.
+  describe('TRA-4244 — arm.profitSchedule', () => {
+    const KEYS = [
+      'OTM_TP1_PCT_OVERRIDE',
+      'PROFIT_LOCK_ARM_R_OVERRIDE',
+      'PROFIT_LOCK_GIVEBACK_R_OVERRIDE',
+      'PROFIT_LOCK_TIGHTEN_GIVEBACK_R_OVERRIDE',
+      'OTM_TP1_FULL_EXIT_1LOT',
+    ];
+    const saved: Record<string, string | undefined> = {};
+    beforeEach(() => {
+      for (const k of KEYS) { saved[k] = process.env[k]; delete process.env[k]; }
+    });
+    afterEach(() => {
+      for (const k of KEYS) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+    });
+    type ProfitScheduleBlock = {
+      source: string;
+      effective: { tp1Pct: number; armR: number; giveBackR: number; tightenGiveBackR: number };
+      compiled: { tp1Pct: number };
+      keys: Record<string, { raw: string | null; applied: boolean; source: string; rejectedReason: string | null }>;
+      rejected: Array<{ key: string; reason: string }>;
+      note: string;
+      tp1FullExit1Lot: { flag: string; armed: boolean };
+    };
+    const block = () => (serve().arm as unknown as { profitSchedule: ProfitScheduleBlock }).profitSchedule;
+
+    it('publishes the COMPILED schedule with per-key attribution when nothing is overridden', () => {
+      const s = block();
+      expect(s.source).toBe('compiled');
+      expect(s.effective).toMatchObject({ tp1Pct: 0.50, armR: 0.75, giveBackR: 0.40, tightenGiveBackR: 0.25 });
+      expect(s.keys['OTM_TP1_PCT_OVERRIDE']).toEqual({
+        raw: null, applied: false, source: 'compiled', rejectedReason: null,
+      });
+      expect(s.rejected).toEqual([]);
+      // The 1-lot arm rides here because `effective.tp1Pct` is only a REACHABLE
+      // number while it is on — every live OTM row is a 1-lot.
+      expect(s.tp1FullExit1Lot).toEqual({ flag: 'OTM_TP1_FULL_EXIT_1LOT', armed: false });
+    });
+
+    it('publishes the EFFECTIVE value and names the key it came from', () => {
+      process.env['OTM_TP1_PCT_OVERRIDE'] = '0.12';
+      process.env['OTM_TP1_FULL_EXIT_1LOT'] = '1';
+      const s = block();
+      expect(s.source).toBe('env');
+      expect(s.effective.tp1Pct).toBe(0.12);
+      expect(s.compiled.tp1Pct).toBe(0.50); // what a revert returns to
+      expect(s.keys['OTM_TP1_PCT_OVERRIDE']).toMatchObject({ raw: '0.12', applied: true, source: 'env' });
+      expect(s.tp1FullExit1Lot.armed).toBe(true);
+    });
+
+    it('a rejected override reads `compiled` WITH a reason — never as a deliberate default', () => {
+      // The failure this block exists to prevent: an operator writes a value,
+      // it fails to parse, and the wire renders identically to never having
+      // written it. TRA-3216's `env_invalid` pattern, one sleeve over.
+      process.env['OTM_TP1_PCT_OVERRIDE'] = '0.12';
+      process.env['PROFIT_LOCK_GIVEBACK_R_OVERRIDE'] = '0.90'; // >= the 0.75 arm
+      const s = block();
+      expect(s.source).toBe('compiled');
+      expect(s.effective.tp1Pct).toBe(0.50);
+      // ⭐ Whole-set: the VALID key reads `applied: false` too.
+      expect(s.keys['OTM_TP1_PCT_OVERRIDE']).toMatchObject({ raw: '0.12', applied: false });
+      expect(s.rejected).toEqual([
+        { key: 'PROFIT_LOCK_GIVEBACK_R_OVERRIDE', raw: '0.90', reason: 'giveback_not_below_arm' },
+      ]);
+      expect(s.note).toContain('OVERRIDES DISCARDED');
+    });
+  });
+
   it('makes a typo\'d override visible as env_invalid rather than passing as the default', () => {
     process.env[UNIVERSE_VAR] = ',,,';
     const body = serve();
