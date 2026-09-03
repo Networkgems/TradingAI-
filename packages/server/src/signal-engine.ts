@@ -374,7 +374,7 @@ import {
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount, type EquityExitRiskInput } from './paper-account.js';
-import { PaperOptionsAccount, qualifyLiveStopActionability, foldImportProvenanceCensuses, type ImportProvenanceCensus, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary, type LiveStopActionabilityQualified, type LiveStopGovernanceSummary, type LiveExitPassStatus, type DayOneStopPosture, type OtmSleeveStopCoverage, type EngineBasisRepairOutcome, type AdoptedBasisRestatementOutcome, type LiveLotAdoptionReport } from './options-account.js';
+import { PaperOptionsAccount, qualifyLiveStopActionability, gradeLiveOtmEntryExitInterlock, foldImportProvenanceCensuses, type ImportProvenanceCensus, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary, type LiveStopActionabilityQualified, type LiveStopGovernanceSummary, type LiveExitPassStatus, type DayOneStopPosture, type OtmSleeveStopCoverage, type EngineBasisRepairOutcome, type AdoptedBasisRestatementOutcome, type LiveLotAdoptionReport } from './options-account.js';
 import { bindOptionsPnlToEquityBook } from './options-equity-bridge.js';
 import {
   PENDING_CLOSE_MAX_REPRICE_STEPS,
@@ -12991,6 +12991,88 @@ export class SignalEngine {
               username: this.alertUsername ?? null,
             });
             scanRun.reject('over_fleet_reachable_bound');
+            continue;
+          }
+
+          // ── TRA-4276 — ENTRY ADMISSION CONSULTS EXIT ACTIONABILITY ─────────
+          //
+          // Every gate above sized this entry against a capital bound. None of
+          // them asked whether the book this row is about to land on can
+          // currently CLOSE a row. On 2026-09-01 that admitted $150 (SOUN $54,
+          // TTD $96) on a process whose `liveStopActionability` read
+          // `breached 3 / actionable 0 / inert 3 / indefinite 3`
+          // (`close_reject_breaker: 3`) continuously — the admission enum's
+          // four values (`book|fleet_reachable|both|none`) had no way to say
+          // "the close path is refusing" (TRA-4276, parent TRA-4217).
+          //
+          // PER-BOOK by construction (AC4, CEO recommendation): this reads
+          // `this.optionsAccount`'s own summary — the same walk the health
+          // route publishes for this book — so a latched SIBLING book never
+          // refuses a healthy one here. The sibling note lives on the
+          // published `entryExitInterlock` block, not in this verdict.
+          //
+          // FAIL CLOSED (AC3): a throwing instrument grades `blind`, and blind
+          // REFUSES — an entry is never admitted on the strength of a missing
+          // reading. LAST in the funnel, directly above the admission stamp,
+          // so its `evaluated` counts candidates that would otherwise have
+          // been opened — the strongest reading of AC2's "attempted and
+          // refused" (a refusal upstream of a counter is invisible to that
+          // counter, the parent's Defect 1; this gate records BOTH verdicts).
+          const exitInterlockRead = (() => {
+            try {
+              return { blind: false as const, summary: this.getLiveStopActionabilityRows() };
+            } catch (err) {
+              return {
+                blind: true as const,
+                reason: err instanceof Error ? err.message : String(err),
+              };
+            }
+          })();
+          const exitInterlock = gradeLiveOtmEntryExitInterlock(exitInterlockRead);
+          const exitInterlockReason = exitInterlock.admit
+            ? undefined
+            : exitInterlock.cause === 'exit_instrument_blind'
+              ? `OTM live test skipped — ENTRY↔EXIT interlock: this book's exit-actionability `
+                + `instrument is BLIND (${exitInterlock.blindReason ?? 'unknown'}). An entry is not `
+                + `admitted on the strength of a missing reading (TRA-4276 AC3, fail closed)`
+              : `OTM live test skipped — ENTRY↔EXIT interlock: this book's own close path is `
+                + `non-actionable (${exitInterlock.breached} breached / ${exitInterlock.actionable} `
+                + `actionable / ${exitInterlock.inFlight} in flight / ${exitInterlock.inert} inert; `
+                + `${Object.entries(exitInterlock.byReason).map(([r, n]) => `${r}: ${n}`).join(', ') || 'no reasons'}; `
+                + `${exitInterlock.releasesAt !== null ? `earliest release ${exitInterlock.releasesAt}` : 'no release scheduled'}). `
+                + `A book that cannot currently CLOSE a row does not OPEN one (TRA-4276; scope `
+                + `per-book — sibling books' close paths are graded on their own rows only)`;
+          recordLiveEnforceDecision(
+            'exit_actionability',
+            'single_leg_otm',
+            !exitInterlock.admit,
+            etDateString(new Date()),
+            exitInterlockReason,
+            Date.now(),
+            {
+              reasonCode: exitInterlock.admit ? undefined : exitInterlock.cause,
+              book: this.alertUsername ?? null,
+            },
+          );
+          if (!exitInterlock.admit) {
+            surfaceOtmLiveSkip(exitInterlockReason!);
+            log.info('live OTM bounded test: entry refused — exit path non-actionable (TRA-4276)', {
+              sym,
+              optionSymbol: cheap.optionSymbol,
+              cause: exitInterlock.cause,
+              ...(exitInterlock.cause === 'exit_path_latched'
+                ? {
+                    breached: exitInterlock.breached,
+                    actionable: exitInterlock.actionable,
+                    inFlight: exitInterlock.inFlight,
+                    inert: exitInterlock.inert,
+                    byReason: exitInterlock.byReason,
+                    releasesAt: exitInterlock.releasesAt,
+                  }
+                : { blindReason: exitInterlock.blindReason }),
+              username: this.alertUsername ?? null,
+            });
+            scanRun.reject(exitInterlock.cause);
             continue;
           }
 

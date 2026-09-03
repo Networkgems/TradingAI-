@@ -150,7 +150,25 @@ export type LiveEnforceGate =
    * answerable BEFORE the board arms the refusal, not only after.
    * `reasonCode` on blocks is `asset_class_<class>`.
    */
-  | 'underlying_asset_class';
+  | 'underlying_asset_class'
+  /**
+   * TRA-4276 (parent TRA-4217) — the ENTRY↔EXIT interlock on the
+   * `single_leg_otm` sleeve: a live entry into a book whose OWN close path is
+   * currently non-actionable is refused. Its own gate because it is the only
+   * cut on this roster keyed on the EXIT side of the book — on 09-01 the
+   * sleeve admitted $150 while `liveStopActionability` read 3/0/0/3
+   * (`close_reject_breaker: 3`) on the same process, and no capital axis can
+   * express that refusal. `reasonCode` on blocks is `exit_path_latched`
+   * (this book's breached rows have nothing acting on them) or
+   * `exit_instrument_blind` (the exit read threw — fail closed, AC3).
+   *
+   * Recorded on BOTH verdicts: the admits are the AC2 denominator that tells
+   * "no entry was attempted" apart from "attempted and refused for exit-path
+   * reasons" — the exact distinction the parent's Defect 1 (a refusal
+   * upstream of a counter is invisible to that counter) says must not be
+   * re-committed here.
+   */
+  | 'exit_actionability';
 
 /** One durable ARMED-LIVE enforcement decision — a write-through of the verdict. */
 export interface LiveEnforceRecord {
@@ -608,6 +626,12 @@ const GATES: LiveEnforceGate[] = [
   // field presence against a pinned build, never a deploy order's commit), and
   // it must publish `evaluated: 0` before the first live nominee reaches it.
   'underlying_asset_class',
+  // TRA-4276 — the ENTRY↔EXIT interlock. Listed for the deployed-bytes reason
+  // (the row's presence at `evaluated: 0` is the proof the control shipped —
+  // AC5 turns on exactly this on a pinned build), and its healthy read is
+  // `evaluated > 0, blocked = 0`: on most days no book is latched, which is
+  // precisely the reading an absent row would forge.
+  'exit_actionability',
 ];
 
 /**

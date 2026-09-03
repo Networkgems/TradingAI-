@@ -375,7 +375,7 @@ import {
   setClosedRowGrantLookup,
 } from './tra3926-oversold-close-detector.js';
 // TRA-2820 — live-book "is it actually stopped?" counter for /api/health/options-live.
-import { summarizeLiveUnmanagedRisk, foldImportProvenanceCensuses, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability, mergeLiveStopGovernance, blindLiveStopGovernance, mergeDayOneStopPosture, blindDayOneStopPosture, mergeOtmSleeveStopCoverage, blindOtmSleeveStopCoverage, type PaperOptionsAccount } from './options-account.js';
+import { summarizeLiveUnmanagedRisk, foldImportProvenanceCensuses, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability, mergeLiveStopGovernance, blindLiveStopGovernance, mergeDayOneStopPosture, blindDayOneStopPosture, mergeOtmSleeveStopCoverage, blindOtmSleeveStopCoverage, summarizeLiveOtmEntryExitInterlock, blindLiveOtmEntryExitInterlock, type LiveOtmEntryExitInterlockBookInput, type PaperOptionsAccount } from './options-account.js';
 import { resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule } from './exit-risk-rules-flag.js';
 // TRA-3941 — the frozen sleeve KEY the exit ruling is scoped to, so the wire
 // field names the same join column the journal tape and the gate ledger use.
@@ -11958,6 +11958,53 @@ app.get('/api/health/options-live', async (_req, res) => {
           // which is this ticket's own defect one level up.
           return {
             ...blindLiveStopActionability(),
+            instrumentBlind: true as const,
+            blindReason: err instanceof Error ? err.message : String(err),
+          };
+        }
+      })(),
+      // TRA-4276 — the ENTRY↔EXIT interlock, per book, as the ORDER SITE would
+      // grade it right now: would a live OTM entry attempt into each gate-open
+      // book be refused for exit-path reasons? Same grader
+      // (`gradeLiveOtmEntryExitInterlock`) as the order site, over the same
+      // per-book summary, so the payload and the gate cannot disagree. AC4's
+      // sibling note is `siblingLatchedBooks` on every row — a healthy book
+      // SAYS a sibling latch was seen and did not travel, rather than leaving
+      // "unaffected" to be inferred from silence. A book whose read throws
+      // publishes as a REFUSED blind row (the order site's own posture), and
+      // only a failure of the fold itself blinds the whole block.
+      entryExitInterlock: (() => {
+        try {
+          return {
+            ...summarizeLiveOtmEntryExitInterlock(
+              getAllUserContexts().map((c): LiveOtmEntryExitInterlockBookInput => {
+                const capitalRow = c.engine.getLiveOtmFleetCapitalRow();
+                let read: LiveOtmEntryExitInterlockBookInput['read'];
+                try {
+                  read = { blind: false, summary: c.engine.getLiveStopActionabilityRows() };
+                } catch (err) {
+                  read = {
+                    blind: true,
+                    reason: err instanceof Error ? err.message : String(err),
+                  };
+                }
+                return {
+                  book: capitalRow.book,
+                  liveEntryGateOpen: capitalRow.liveEntryGateOpen,
+                  read,
+                };
+              }),
+            ),
+            instrumentBlind: false as const,
+            blindReason: null,
+          };
+        } catch (err) {
+          // Blind shape TYPED off the success shape (mapped type), same
+          // discipline as `liveStopActionability` above and for the same
+          // reason: a key that is numeric when the instrument works and absent
+          // when it is blind reads as 0 to every consumer.
+          return {
+            ...blindLiveOtmEntryExitInterlock(),
             instrumentBlind: true as const,
             blindReason: err instanceof Error ? err.message : String(err),
           };

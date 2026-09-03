@@ -4196,6 +4196,231 @@ export function mergeQualifiedLiveStopActionability(
 }
 
 /**
+ * TRA-4276 — what the ENTRY admission path reads off the EXIT instrument for
+ * one book. Either the book's own TRA-3822 summary, or an admission that the
+ * instrument could not be read at all — and those two must be distinguishable
+ * at the type level, because the whole ticket is that a missing reading was
+ * being treated as headroom one surface over.
+ */
+export type LiveOtmEntryExitInterlockRead =
+  | { blind: false; summary: LiveStopActionabilitySummary }
+  | { blind: true; reason: string | null };
+
+/**
+ * TRA-4276 — the interlock's verdict on one book. `admit: false` carries the
+ * cause as a discriminant so the order site, the gate ledger and the health
+ * payload all publish the same two names:
+ *
+ *   • `exit_path_latched`     — this book's OWN close path is refusing: rows
+ *     are through their stops (`breached > 0`), nothing will act
+ *     (`actionable === 0`) and at least one row is held by a row gate
+ *     (`inert > 0`) — the 09-01 shape (3/0/0/3, `close_reject_breaker: 3`).
+ *   • `exit_instrument_blind` — the exit instrument threw. FAIL CLOSED
+ *     (AC3): an entry is never admitted on the strength of a missing reading.
+ */
+export type LiveOtmEntryExitInterlockVerdict =
+  | {
+      admit: true;
+      cause: null;
+      instrumentBlind: false;
+      breached: number;
+      actionable: number;
+      inFlight: number;
+      inert: number;
+    }
+  | {
+      admit: false;
+      cause: 'exit_path_latched';
+      instrumentBlind: false;
+      breached: number;
+      actionable: number;
+      inFlight: number;
+      inert: number;
+      /** The refusing gates, verbatim from the summary, so the refusal is self-attributing. */
+      byReason: Partial<Record<LiveStopInertReason, number>>;
+      /** When the earliest suppression lifts — `null` on an indefinite latch (the 09-01 case). */
+      releasesAt: string | null;
+    }
+  | {
+      admit: false;
+      cause: 'exit_instrument_blind';
+      instrumentBlind: true;
+      blindReason: string | null;
+    };
+
+/**
+ * TRA-4276 — should a live OTM ENTRY into this book be admitted, given what
+ * this book's EXIT path can currently do?
+ *
+ * ## The gap this closes
+ *
+ * On 2026-09-01 the sleeve admitted $150 of fresh OTM premium (SOUN $54,
+ * TTD $96) on a process whose `liveStopActionability` read
+ * `breached 3 / actionable 0 / inert 3 / indefinite 3`
+ * (`close_reject_breaker: 3`) the whole time. The admission enum
+ * (`book | fleet_reachable | both | none`) had NO value meaning "the close
+ * path is refusing" — admission was sized against four capital bounds and
+ * never asked whether the book it was adding a row to could CLOSE one.
+ *
+ * ## The predicate, and its two deliberate edges
+ *
+ * Refuse iff `breached > 0 && actionable === 0 && inert > 0` — the same
+ * degraded predicate the TRA-4281 health fold uses, byte-for-byte, so the
+ * entry gate and the health dimension cannot disagree about what "latched"
+ * means. Two carve-outs, both in the ADMIT direction and both intentional:
+ *
+ *   • `inFlight` rows do not refuse. A row carrying a `pendingExit` has a
+ *     working order at the broker — the close path is demonstrably
+ *     transmitting, and whether that order is STALLING is a different
+ *     measurement with its own instruments (`staleWorkingExits` /
+ *     `abandonedStagedExits`). Folding it in here would re-create the
+ *     over-matching TRA-3822's shape notes were written to avoid.
+ *   • The TRA-3839 pass-reach axis (`noExitPass`) is NOT folded in. That is a
+ *     book-level cadence fact with its own gate names and its own remedies,
+ *     and an entry attempt only exists while the engine is running its live
+ *     path anyway. Widening this predicate onto it would refuse entries for
+ *     states (`engine_mode_demo`, arm-dark) that already refuse entries one
+ *     gate earlier, and make this refusal unattributable — the TRA-3216 shape.
+ *
+ * ## Scope: PER-BOOK, by construction (AC4)
+ *
+ * The ticket's ask 3, per the CEO recommendation: the input is ONE book's own
+ * summary (the order site reads `this.optionsAccount`), so a latched sibling
+ * cannot refuse a healthy book here. The sibling note the CEO asked for lives
+ * on the published payload ({@link summarizeLiveOtmEntryExitInterlock}), not
+ * in this verdict.
+ *
+ * Pure — takes the read, returns the verdict, touches nothing. The order site
+ * owns the try/catch that turns a throwing instrument into `blind: true`.
+ */
+export function gradeLiveOtmEntryExitInterlock(
+  read: LiveOtmEntryExitInterlockRead,
+): LiveOtmEntryExitInterlockVerdict {
+  if (read.blind) {
+    return {
+      admit: false,
+      cause: 'exit_instrument_blind',
+      instrumentBlind: true,
+      blindReason: read.reason,
+    };
+  }
+  const s = read.summary;
+  if (s.breached > 0 && s.actionable === 0 && s.inert > 0) {
+    return {
+      admit: false,
+      cause: 'exit_path_latched',
+      instrumentBlind: false,
+      breached: s.breached,
+      actionable: s.actionable,
+      inFlight: s.inFlight,
+      inert: s.inert,
+      byReason: s.byReason,
+      releasesAt: s.releasesAt,
+    };
+  }
+  return {
+    admit: true,
+    cause: null,
+    instrumentBlind: false,
+    breached: s.breached,
+    actionable: s.actionable,
+    inFlight: s.inFlight,
+    inert: s.inert,
+  };
+}
+
+/** TRA-4276 — one book's input to the published interlock block. */
+export interface LiveOtmEntryExitInterlockBookInput {
+  /** `alertUsername`, so a refusal is attributable to a book. */
+  book: string | null;
+  /** The TRA-3445 discriminator — only gate-open books can attempt a live entry. */
+  liveEntryGateOpen: boolean;
+  read: LiveOtmEntryExitInterlockRead;
+}
+
+/** TRA-4276 — one book's row on the published block. */
+export interface LiveOtmEntryExitInterlockBookRow {
+  book: string | null;
+  /** The verdict a live OTM entry attempt into this book would get RIGHT NOW. */
+  entryRefused: boolean;
+  cause: 'exit_path_latched' | 'exit_instrument_blind' | null;
+  instrumentBlind: boolean;
+  breached: number | null;
+  actionable: number | null;
+  inFlight: number | null;
+  inert: number | null;
+  releasesAt: string | null;
+  /**
+   * AC4, explicitly: gate-open SIBLING books whose entry the interlock is
+   * refusing. A healthy book admits — this field is the payload SAYING that a
+   * sibling latch was seen and deliberately did not travel, rather than
+   * leaving "unaffected" to be inferred from silence.
+   */
+  siblingLatchedBooks: string[];
+}
+
+/** TRA-4276 — the block `/api/health/options-live` publishes. */
+export interface LiveOtmEntryExitInterlockSummary {
+  /** The control's scope, stated as data (ticket ask 3: per-book, not book-family). */
+  scope: 'per_book';
+  /** Gate-open books only — the population that can attempt a live entry. */
+  books: LiveOtmEntryExitInterlockBookRow[];
+  gateOpenBooks: number;
+  refusedBooks: number;
+}
+
+/**
+ * TRA-4276 — fold the per-book verdicts into the published block.
+ *
+ * Gate-closed books are dropped from `books` (a demo engine cannot attempt a
+ * live entry, and ~64 permanent healthy rows would bury the two that matter)
+ * but a blind read on a gate-OPEN book publishes as a refused row — same fail
+ * closed direction as the order site.
+ */
+export function summarizeLiveOtmEntryExitInterlock(
+  inputs: LiveOtmEntryExitInterlockBookInput[],
+): LiveOtmEntryExitInterlockSummary {
+  const graded = inputs
+    .filter(i => i.liveEntryGateOpen)
+    .map(i => ({ book: i.book, verdict: gradeLiveOtmEntryExitInterlock(i.read) }));
+  const latched = graded
+    .filter(g => !g.verdict.admit && g.book !== null)
+    .map(g => g.book as string);
+  const books = graded.map(({ book, verdict }): LiveOtmEntryExitInterlockBookRow => ({
+    book,
+    entryRefused: !verdict.admit,
+    cause: verdict.admit ? null : verdict.cause,
+    instrumentBlind: verdict.instrumentBlind,
+    breached: verdict.instrumentBlind ? null : verdict.breached,
+    actionable: verdict.instrumentBlind ? null : verdict.actionable,
+    inFlight: verdict.instrumentBlind ? null : verdict.inFlight,
+    inert: verdict.instrumentBlind ? null : verdict.inert,
+    releasesAt: !verdict.admit && verdict.cause === 'exit_path_latched' ? verdict.releasesAt : null,
+    siblingLatchedBooks: latched.filter(b => b !== book),
+  }));
+  return {
+    scope: 'per_book',
+    books,
+    gateOpenBooks: graded.length,
+    refusedBooks: graded.filter(g => !g.verdict.admit).length,
+  };
+}
+
+/**
+ * TRA-4276 — the blind twin of {@link LiveOtmEntryExitInterlockSummary}, typed
+ * off the success shape (the TRA-3839 mapped-type discipline): a field cannot
+ * ship on the success branch without a null twin here, so a blind block can
+ * never publish a key that reads as 0.
+ */
+export type BlindLiveOtmEntryExitInterlock = {
+  [K in keyof LiveOtmEntryExitInterlockSummary]: null;
+};
+
+export function blindLiveOtmEntryExitInterlock(): BlindLiveOtmEntryExitInterlock {
+  return { scope: null, books: null, gateOpenBooks: null, refusedBooks: null };
+}
+
+/**
  * TRA-4280 (superseding TRA-3822's UTC version) — the UTC instant of 00:00 ET
  * on the ET day AFTER `ts`'s ET day. This is the literal expiry of an
  * `etDateKey(openedAt) === etDateKey(now)` latch — the moment the two keys
