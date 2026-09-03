@@ -26,6 +26,8 @@
 //   C12 `outstanding` DELETED                → 1 FAIL    (D6; the durable block's bytes can be seen absent)
 //   C13 census ZERO but `outstanding` = 1 row → 3 BLIND, AND the verdict names the outstanding refusal
 //                                                        (the post-restart shape of 2026-08-25 cannot read as calm)
+//   C14–C18 grant partition (2026-08-26): bytes-absent / RIG promotion / G10's two limbs / PASS reachable
+//   C19 an `anchor` grant the grader does not pin → 1 FAIL (G10; an anchor added to quiet a finding is caught)
 //
 // ⚠ C8 is the one that matters most and it is the cheapest to get wrong: with
 // the live box at `checked 0`, a grader whose PASS branch was unreachable would
@@ -86,14 +88,31 @@ if (fee.oversoldCloses && !('grantedCloses' in fee.oversoldCloses)) {
   if (rig) {
     fee.oversoldCloses.findings = fee.oversoldCloses.findings.filter(x => x !== rig);
     fee.oversoldCloses.excessContracts -= rig.excessContracts;
-    fee.oversoldCloses.grantedCloses = [{ ...rig, grant: 'desk_add', grantSource: 'closed_row' }];
+    fee.oversoldCloses.grantedCloses = [{ ...rig, grant: 'desk_add', grantSource: 'anchor' }];
     fee.oversoldCloses.grantedContracts = rig.excessContracts;
   } else {
     fee.oversoldCloses.grantedCloses = [];
     fee.oversoldCloses.grantedContracts = 0;
   }
-  console.log(`# PRE-DEPLOY capture — \`grantedCloses\` / \`grantedContracts\` SEEDED (${rig ? 'RIG 143384264 → desk_add/closed_row' : 'empty; no RIG finding in the capture'}) `
+  console.log(`# PRE-DEPLOY capture — \`grantedCloses\` / \`grantedContracts\` SEEDED (${rig ? 'RIG 143384264 → desk_add/anchor' : 'empty; no RIG finding in the capture'}) `
     + 'so the controls can grade the grader; the live grader\'s D7 still fails on this box and that is the negative control.');
+}
+// TRA-3926 (2026-09-03) — a capture from the PRE-ANCHOR partition build: the
+// keys are present but RIG 143384264 is ACCUSED, because its closed row was
+// archived before the partition ever deployed and the `closed_row` fallback
+// can never answer for the pre-cut population. Re-partitioned here to the
+// anchor shape the fixed build serves; the live grader's R4 still FAILS on
+// this box and that is the negative control that found the defect.
+if (fee.oversoldCloses && 'grantedCloses' in fee.oversoldCloses) {
+  const rig = fee.oversoldCloses.findings.find(x => x.orderId === 143384264);
+  if (rig && !fee.oversoldCloses.grantedCloses.some(x => x.orderId === 143384264)) {
+    fee.oversoldCloses.findings = fee.oversoldCloses.findings.filter(x => x !== rig);
+    fee.oversoldCloses.excessContracts -= rig.excessContracts;
+    fee.oversoldCloses.grantedCloses.push({ ...rig, grant: 'desk_add', grantSource: 'anchor' });
+    fee.oversoldCloses.grantedContracts += rig.excessContracts;
+    console.log('# PRE-ANCHOR capture — RIG 143384264 was ACCUSED (closed row archived before the partition deployed); '
+      + 're-partitioned to desk_add/anchor so the controls can grade the grader. The live grader\'s R4 still fails on this box.');
+  }
 }
 const ZERO_CENSUS = {
   checked: 0, bounded: 0, refusedContracts: 0, blindRows: 0, suppressedExits: 0, netOfCloses: 0,
@@ -219,6 +238,19 @@ run('C17 a FINDING demoted to `closed_row`-granted while its record says `none` 
   f.oversoldCloses.findings = f.oversoldCloses.findings.filter(z => z !== x);
   f.oversoldCloses.excessContracts -= x.excessContracts;
   f.oversoldCloses.grantedCloses.push({ ...x, grant: 'desk_add', grantSource: 'closed_row' });
+  f.oversoldCloses.grantedContracts += x.excessContracts;
+});
+// TRA-3926 (2026-09-03) — the anchor's own permissive limb: an `anchor` grant
+// served for an order this grader does NOT pin in KNOWN_GRANTED is UNBACKED.
+// Without this, adding a row to the ROUTE's anchor table to quiet a finding
+// would sail through — the deleted alarm wearing the anchor's name.
+run('C19 a FINDING demoted to `anchor`-granted for an order the grader does not pin → FAIL (G10: unbacked anchor)', 1, (ol, f) => {
+  ol.exitQuantityBound = { ...ol.exitQuantityBound, checked: 1, bounded: 1, refusedContracts: 1, lastRefusalReason: 'engine_partial' };
+  const x = f.oversoldCloses.findings.find(z => z.orderId === 142806015);
+  if (!x) throw new Error('no XLF finding to demote');
+  f.oversoldCloses.findings = f.oversoldCloses.findings.filter(z => z !== x);
+  f.oversoldCloses.excessContracts -= x.excessContracts;
+  f.oversoldCloses.grantedCloses.push({ ...x, grant: 'desk_add', grantSource: 'anchor' });
   f.oversoldCloses.grantedContracts += x.excessContracts;
 });
 run('C18 the partition untouched, with the bound exercised → PASS (the grant partition\'s pass branch is REACHABLE)', 0, ol => {

@@ -136,10 +136,75 @@ export interface OversoldCloseFinding {
  *   grader must say so. Consulted ONLY for unstamped records: a record this
  *   build wrote says `'none'` when the row carried nothing, and that answer is
  *   final.
+ *
+ *   ⛔ Measured 2026-09-03: on the live box this source can never answer for
+ *   the population it was built for. The surface it reads is EVAPORATING —
+ *   `archiveClosedOptions()` (TRA-219) empties the closed list nightly at
+ *   21:00 ET, `getState()` caps it at the last 20, and the whole array dies
+ *   with the process — while every record that NEEDS the fallback is, by
+ *   construction, older than the stamp cut (2026-08-27T20:16Z). RIG
+ *   143384264's closed row was archived 2026-08-27T01:00Z, BEFORE the
+ *   partition ever deployed, so the grant was never once served on a live
+ *   boot and `grantedCloses` sat at 0 on the very build that shipped it. The
+ *   seam stays (tests inject it; a same-session pre-archive answer is still
+ *   correct), but the durable answer for the pre-cut population is `anchor`.
+ * - `anchor`     — the record predates the stamp AND matches, on ALL THREE of
+ *   (`optionSymbol`, `orderId`, `ts`), an entry in
+ *   {@link PRE_STAMP_CLOSE_GRANT_ANCHORS}: the finite, closed set of pre-cut
+ *   grants that were measured on the wire while their closed rows still
+ *   existed, each carrying its witness. Verifiable against the repo (the
+ *   table is code), never against the tape; consulted ONLY after the stamp
+ *   (`'none'` is final) and the closed-row lookup both decline.
  */
 export interface GrantedClose extends OversoldCloseFinding {
   grant: LiveCloseGrant;
-  grantSource: 'record' | 'closed_row';
+  grantSource: 'record' | 'closed_row' | 'anchor';
+}
+
+/**
+ * TRA-3926 (2026-09-03) — the pre-stamp grant population, closed and finite.
+ *
+ * Every close record written since the `exitGrant` cut (2026-08-27T20:16Z,
+ * `a7acc8c` live) is stamped at the chokepoint, so nothing can ever enter this
+ * set: it is exactly the pre-cut excess closes that carried a grant, and there
+ * is one. No durable surface still holds its authority — the closed row was
+ * archived nightly (TRA-219) before the partition deployed, the journal row
+ * was superseded by the close itself (the defect TRA-4082 later fixed), and
+ * the EOD report keeps only P&L sums — so the measured fact is carried here,
+ * with its witness, instead of being re-derived from a surface that no longer
+ * exists. The alternative is a permanent false finding on a board-ratified
+ * sale, and a permanent false alarm and a deleted alarm end in the same place
+ * (TRA-3881).
+ *
+ * ⚠ An entry must cite a measurement made while the closed row was live. Do
+ * NOT add entries to quiet a finding — that is the deleted alarm again.
+ */
+export const PRE_STAMP_CLOSE_GRANT_ANCHORS: ReadonlyArray<{
+  optionSymbol: string;
+  orderId: number;
+  ts: number;
+  grant: LiveCloseGrant;
+  witness: string;
+}> = [
+  {
+    // Measured on the wire 2026-08-26T13:5xZ (ticket TRA-3926, monitor beat):
+    // closed row `adoptionAuthority: 'desk_add'`, `closedAt === ts` to the
+    // millisecond (1787751931275), board exemption TRA-3909 card `d4f622fb`,
+    // sold under `desk_add_exempt` with the trailing stop breached — the
+    // bound's own falsifier PASS.
+    optionSymbol: 'RIG260925C00006000',
+    orderId: 143384264,
+    ts: 1787751931275,
+    grant: 'desk_add',
+    witness: 'TRA-3926 2026-08-26 wire measurement; board grant TRA-3909 d4f622fb',
+  },
+];
+
+function anchoredGrant(symbol: string, orderId: unknown, ts: number): LiveCloseGrant | null {
+  const hit = PRE_STAMP_CLOSE_GRANT_ANCHORS.find(
+    a => a.optionSymbol === symbol && a.orderId === orderId && a.ts === ts,
+  );
+  return hit ? hit.grant : null;
 }
 
 /**
@@ -438,18 +503,22 @@ export function detectOversoldEngineCloses(
         engineClosesSeenContracts: seenCloses,
       };
       // TRA-3926 (2026-08-26) — WAS THE EXCESS GRANTED? The record's own stamp
-      // is authoritative; `'none'` is a final answer and the closed-row
-      // fallback is consulted ONLY on an UNSTAMPED record (pre-cut line). The
-      // books move the same way either way — the desk's contract was sold —
-      // only the accusation is withheld.
+      // is authoritative; `'none'` is a final answer and BOTH fallbacks are
+      // consulted ONLY on an UNSTAMPED record (pre-cut line). The closed-row
+      // lookup goes first (it reads the row itself, when one still exists);
+      // the anchor table answers the pre-cut population whose rows have
+      // evaporated (2026-09-03). The books move the same way either way — the
+      // desk's contract was sold — only the accusation is withheld.
       const stamp = f.exitGrant ?? null;
       const grant: { grant: LiveCloseGrant; grantSource: GrantedClose['grantSource'] } | null =
         isGrant(stamp)
           ? { grant: stamp, grantSource: 'record' }
-          : stamp === null && closedRowGrants
+          : stamp === null
             ? (() => {
-                const fromRow = closedRowGrants(symbol, f.ts);
-                return isGrant(fromRow) ? { grant: fromRow, grantSource: 'closed_row' as const } : null;
+                const fromRow = closedRowGrants ? closedRowGrants(symbol, f.ts) : null;
+                if (isGrant(fromRow)) return { grant: fromRow, grantSource: 'closed_row' as const };
+                const fromAnchor = anchoredGrant(symbol, f.orderId, f.ts);
+                return isGrant(fromAnchor) ? { grant: fromAnchor, grantSource: 'anchor' as const } : null;
               })()
             : null;
       if (grant) {

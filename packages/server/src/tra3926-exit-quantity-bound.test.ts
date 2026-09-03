@@ -1085,13 +1085,46 @@ describe('TRA-3926 (2026-08-26) — a GRANTED excess close is partitioned out, n
   });
 
   it('an UNSTAMPED record whose closed row the lookup cannot key stays a FINDING', () => {
+    // The close order id is moved OFF the RIG anchor so this test still
+    // exercises the lookup limb alone — the anchor limb has its own tests.
     const offByOneMs = (symbol: string, ts: number) =>
       symbol === RIG && ts === RIG_GRANTED_CLOSE_AT + 1 ? ('desk_add' as const) : null;
-    const census = detectOversoldEngineCloses(rigTape({}), offByOneMs);
+    const census = detectOversoldEngineCloses(rigTape({ orderId: 999999001 }), offByOneMs);
     expect(census.findings).toHaveLength(1);
     expect(census.grantedCloses).toEqual([]);
     // ...and with no lookup registered at all, the same: a grant must be READ, never assumed.
-    expect(detectOversoldEngineCloses(rigTape({}), null).findings).toHaveLength(1);
+    expect(detectOversoldEngineCloses(rigTape({ orderId: 999999001 }), null).findings).toHaveLength(1);
+  });
+
+  it('the RIG ANCHOR: the measured pre-cut grant is served with NO lookup and NO closed row — the surface it was read from no longer exists (2026-09-03)', () => {
+    // This is the live 2026-09-03 shape exactly: `closedOptions` empty
+    // (archived nightly since 08-27T01:00Z), record unstamped (pre-cut), and
+    // the board-ratified sale was being ACCUSED on the build carrying the
+    // partition. The anchor is the durable carrier of the 08-26 measurement.
+    const census = detectOversoldEngineCloses(rigTape({}), null);
+    expect(census.status).toBe('clean');
+    expect(census.findings).toEqual([]);
+    expect(census.grantedCloses).toHaveLength(1);
+    expect(census.grantedCloses[0]).toMatchObject({ ...RIG_SHAPE, grant: 'desk_add', grantSource: 'anchor' });
+    expect(census.grantedContracts).toBe(1);
+  });
+
+  it('the anchor keys on ALL THREE of symbol, orderId and ts — one mismatch and the record stays a FINDING', () => {
+    expect(detectOversoldEngineCloses(rigTape({ orderId: 999999001 }), null).findings).toHaveLength(1);
+    expect(detectOversoldEngineCloses(rigTape({ ts: RIG_GRANTED_CLOSE_AT + 1 }), null).findings).toHaveLength(1);
+  });
+
+  it('a live closed row OUTRANKS the anchor — the row itself is the better witness when one still exists', () => {
+    const lookup = (symbol: string, ts: number) =>
+      symbol === RIG && ts === RIG_GRANTED_CLOSE_AT ? ('handed_over' as const) : null;
+    const census = detectOversoldEngineCloses(rigTape({}), lookup);
+    expect(census.grantedCloses[0]).toMatchObject({ grant: 'handed_over', grantSource: 'closed_row' });
+  });
+
+  it('the anchor never overrides a stamp — a record this build wrote with `none` stays a FINDING on anchor-matching keys', () => {
+    const census = detectOversoldEngineCloses(rigTape({ exitGrant: 'none' }), null);
+    expect(census.findings).toHaveLength(1);
+    expect(census.grantedCloses).toEqual([]);
   });
 
   it('a grant on a COVERED close changes nothing — a grant withholds an accusation, it does not manufacture one', () => {

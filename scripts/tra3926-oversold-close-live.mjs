@@ -288,12 +288,35 @@ check('G9  no refusal on this boot names a population the authorisation gate adm
 // granted is the route hiding a finding — the permissive direction, and the
 // one this check exists for.
 const recordByOrder = new Map(records.filter(r => r.orderId != null).map(r => [r.orderId, r]));
+// ⛔ THE ANCHOR THAT MUST **NOT** BE ACCUSED (declared here because G10 consults
+// it; graded as R4 below). `RIG260925C00006000` order 143384264,
+// 2026-08-26T13:45:31Z, real money: the engine sold the desk's contract under
+// the board's `desk_add` exemption (TRA-3909) — the ratified behaviour — and
+// the pre-partition detector filed it `exhausted` / excess 1. Its record
+// predates the stamp; its closed row was archived 2026-08-27T01:00Z (nightly,
+// TRA-219) BEFORE the partition deployed, so `closed_row` can never serve it —
+// the durable carrier is the repo's PRE_STAMP_CLOSE_GRANT_ANCHORS table and
+// the expected source is `anchor` (2026-09-03).
+const KNOWN_GRANTED = [
+  { symbol: 'RIG260925C00006000', orderId: 143384264, sold: 1, ours: 0, basis: 'exhausted', grant: 'desk_add', source: 'anchor' },
+];
+// `anchor` ⇒ the record is UNSTAMPED and the grant was read off the repo's
+// PRE_STAMP_CLOSE_GRANT_ANCHORS table (2026-09-03: the closed-row surface is
+// archived nightly, so the pre-cut population can only ever be served this
+// way). This grader carries its OWN pin of the same measurement
+// (KNOWN_GRANTED below), so an anchor grant is verifiable HERE: one served
+// for an order this grader does not pin is UNBACKED and fails G10.
 const grantProvenanceOk = g => {
-  if (!isGrant(g.grant) || !['record', 'closed_row'].includes(g.grantSource)) return false;
+  if (!isGrant(g.grant) || !['record', 'closed_row', 'anchor'].includes(g.grantSource)) return false;
   const rec = recordByOrder.get(g.orderId);
   if (!rec) return false;
   if (g.grantSource === 'record') return rec.exitGrant === g.grant;
-  return rec.exitGrant === null || rec.exitGrant === undefined;
+  const unstamped = rec.exitGrant === null || rec.exitGrant === undefined;
+  if (g.grantSource === 'anchor') {
+    return unstamped && KNOWN_GRANTED.some(k =>
+      k.orderId === g.orderId && k.symbol === g.optionSymbol && k.grant === g.grant);
+  }
+  return unstamped;
 };
 check('G10 every served grant is backed by its record\'s own stamp, or is a PRE-CUT record read off a closed row',
   !grantedKeysPresent || granted.every(grantProvenanceOk),
@@ -334,15 +357,9 @@ for (const k of KNOWN) {
     !!f && f.soldContracts === k.sold && f.engineOpenContracts === k.ours && f.basis === k.basis,
     f ? `sold ${f.soldContracts} ours ${f.engineOpenContracts} excess ${f.excessContracts} basis ${f.basis}` : 'NOT REPORTED');
 }
-// ⛔ THE FOURTH ANCHOR IS THE ONE THAT MUST **NOT** BE ACCUSED. `RIG260925C00006000`
-// order 143384264, 2026-08-26T13:45:31Z, real money: the engine sold the desk's
-// contract under the board's `desk_add` exemption — the ratified behaviour — and
-// the pre-partition detector filed it `exhausted` / excess 1. Its record predates
-// the stamp, so it can only ever be served `closed_row`; when it ages out the
+// ⛔ THE FOURTH ANCHOR IS THE ONE THAT MUST **NOT** BE ACCUSED — declared above
+// G10 (which consults it), graded here. When it ages out of the tape the
 // anchor is BLIND about itself, not a pass. Graded only where D7 has the keys.
-const KNOWN_GRANTED = [
-  { symbol: 'RIG260925C00006000', orderId: 143384264, sold: 1, ours: 0, basis: 'exhausted', grant: 'desk_add', source: 'closed_row' },
-];
 for (const k of KNOWN_GRANTED) {
   if (!records.some(r => r.orderId === k.orderId)) {
     notes.push(`R  ${k.symbol} order ${k.orderId} has aged out of the tape (oldest record ${new Date(oldestTs).toISOString()}) — granted anchor NOT assertable, not a pass`);
@@ -370,6 +387,11 @@ if (grantedKeysPresent) {
   if (unverifiable.length > 0) {
     notes.push(`GRANTED  ${unverifiable.length} of those are \`closed_row\` grants: PRE-CUT records whose authority was read off a closed row at `
       + 'publication time. G10 proves only that the record is unstamped; the row itself is behind auth and is NOT verified here.');
+  }
+  const anchored = granted.filter(g => g.grantSource === 'anchor');
+  if (anchored.length > 0) {
+    notes.push(`GRANTED  ${anchored.length} of those are \`anchor\` grants: PRE-CUT records whose closed rows were archived before the partition `
+      + 'deployed. Verified against this grader\'s own KNOWN_GRANTED pin of the 2026-08-26 wire measurement (G10), not against the tape.');
   }
 }
 
