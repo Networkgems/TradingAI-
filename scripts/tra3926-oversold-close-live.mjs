@@ -204,11 +204,23 @@ for (const f of records) {
 // has demonstrably missed our own fills (TRA-2959: 7 of 11), so accusing there
 // is a false accusation — it is the branch the detector's first version got
 // wrong against this very tape.
+// ⛔ `engineBuy === 0` is TWO populations, and the route names them apart
+// (2026-09-03, measured live): opens that exist and are ALL imports serve
+// `import_only`; a close with NO open record of either origin in retention
+// serves `no_open_record`. The tape's 30-day horizon MANUFACTURES the second
+// class out of the first — an open leg ages out while its close survives —
+// so a derivation that lumps them false-accuses the route the afternoon the
+// horizon crosses an open (it did, between 13:10Z and 20:20Z on 2026-09-03).
 const derivedExcess = new Map();
 const derivedImportOnly = new Map();
+const derivedNoOpen = new Map();
 for (const [s, a] of agg) {
   if (!(a.engineSell > 0)) continue;
-  if (a.engineBuy === 0) { derivedImportOnly.set(s, a.engineSell); continue; }
+  if (a.engineBuy === 0) {
+    if (a.importBuy > 0) derivedImportOnly.set(s, a.engineSell);
+    else derivedNoOpen.set(s, a.engineSell);
+    continue;
+  }
   if (a.engineSell > a.engineBuy) derivedExcess.set(s, a.engineSell - a.engineBuy);
 }
 const derivedExcessTotal = [...derivedExcess.values()].reduce((x, y) => x + y, 0);
@@ -218,6 +230,7 @@ const findings = Array.isArray(census.findings) ? census.findings : [];
 const blinds = Array.isArray(census.blindCloses) ? census.blindCloses : [];
 const publishedExcess = new Map(findings.map(f => [f.optionSymbol, f.excessContracts]));
 const publishedImportOnly = new Set(blinds.filter(b => b.reason === 'import_only').map(b => b.optionSymbol));
+const publishedNoOpen = new Set(blinds.filter(b => b.reason === 'no_open_record').map(b => b.optionSymbol));
 
 // TRA-3926 (2026-08-26) — the fold cannot see a GRANT (a grant is a fact about
 // the row, not about the tape's arithmetic), so the derived "uncovered" total
@@ -264,6 +277,9 @@ check('G5  every finding is self-consistent (excess === sold − engineOpen)',
 check('G6  the import-only BLIND set agrees exactly (the false-accusation guard)',
   setEq(publishedImportOnly, new Set(derivedImportOnly.keys())),
   `served [${[...publishedImportOnly].join(' ')}] vs derived [${[...derivedImportOnly.keys()].join(' ')}]`);
+check('G6b the no-open-record BLIND set agrees exactly (the aged-out-open guard)',
+  setEq(publishedNoOpen, new Set(derivedNoOpen.keys())),
+  `served [${[...publishedNoOpen].join(' ')}] vs derived [${[...derivedNoOpen.keys()].join(' ')}]`);
 check('G7  the census closes over its own population (judged + blind === engineCloses)',
   census.judgedCloses + blinds.length === census.engineCloses,
   `${census.judgedCloses} + ${blinds.length} === ${census.engineCloses}`);
@@ -340,9 +356,22 @@ check('G11 no served FINDING sits on a record that carries a grant stamp (a stam
 // refuses 13:25–20:00Z. It is anchored as `ours: 0` / `basis: exhausted`: the
 // engine's own 08-21 close had already consumed its own lot, so a check written
 // against the running balance CANNOT see it. That is the whole finding.
+// ⚠ A CLOSE AND ITS OPENS AGE OUT ON DIFFERENT DAYS. The opens strictly
+// predate the close, so the retention horizon crosses THEM first, and for that
+// window the close is still in tape while everything that judged it is gone —
+// the route (correctly, off its surface) degrades the row to a
+// `no_open_record` BLIND. `opensAgedOutObserved` pins the measured transition:
+// the run at the stamped instant served the full finding, the next run did
+// not, which brackets the opens' own ts inside (stamp − 30d, nextRead − 30d).
+// After that instant the pin asserts the exact DEGRADATION (blind, that
+// reason, that quantity) — a silent disappearance still fails.
 const KNOWN = [
   { symbol: 'XLF260925C00057500', orderId: 142806015, sold: 2, ours: 1, basis: 'outstanding' },
-  { symbol: 'QQQ260911P00545000', orderId: 140287732, sold: 5, ours: 4, basis: 'outstanding' },
+  // opens served (`ours 4`) at 2026-09-03T13:10Z, `no_open_record` by 20:20Z
+  // on identical detector bytes ⇒ opens ts ∈ [08-04T13:10Z, 08-04T20:25Z];
+  // RETAIN_MS=30d, live-options-fee-slippage-ledger.ts:59.
+  { symbol: 'QQQ260911P00545000', orderId: 140287732, sold: 5, ours: 4, basis: 'outstanding',
+    opensAgedOutObserved: '2026-09-03T13:10Z' },
   { symbol: 'BAC260925C00063000', orderId: 143160792, sold: 1, ours: 0, basis: 'exhausted' },
 ];
 const oldestTs = Math.min(...records.map(r => r.ts).filter(t => Number.isFinite(t)));
@@ -350,6 +379,14 @@ for (const k of KNOWN) {
   const closeInTape = records.some(r => r.orderId === k.orderId);
   if (!closeInTape) {
     notes.push(`R  ${k.symbol} order ${k.orderId} has aged out of the tape (oldest record ${new Date(oldestTs).toISOString()}) — anchor NOT assertable, not a pass`);
+    continue;
+  }
+  const opensInTape = records.some(r => r.optionSymbol === k.symbol && r.side === 'buy_to_open');
+  if (k.opensAgedOutObserved && !opensInTape) {
+    const b = blinds.find(x => x.optionSymbol === k.symbol && x.soldContracts === k.sold);
+    check(`R  ${k.symbol} order ${k.orderId} open leg aged out (observed ${k.opensAgedOutObserved}) — served as the exact degradation (blind, no_open_record, sold ${k.sold})`,
+      !!b && b.reason === 'no_open_record',
+      b ? `blind reason ${b.reason} sold ${b.soldContracts}` : 'NOT SERVED AT ALL — the close is in tape and the row vanished');
     continue;
   }
   const f = findings.find(x => x.orderId === k.orderId);
