@@ -417,6 +417,68 @@ export function resolvePnlBaselineDate(
 }
 
 /**
+ * TRA-4337 — the basis stamped on a live book's published anchor when
+ * {@link resolveLiveAnchorState} has repointed it at the newest prior archived
+ * close. A value no other writer produces, so its presence names this repair.
+ */
+export const ANCHOR_BASIS_LIVE_PRIOR_ARCHIVED_CLOSE = 'live-prior-archived-close';
+
+/** The tracker's anchor declaration as published on `engines[].anchor`. */
+export interface AnchorState {
+  openingDate: string;
+  openingEquity: number;
+  openingEquityBasis: string | null;
+}
+
+/**
+ * TRA-4337 — repoint a LIVE book's published anchor at the broker basis.
+ *
+ * `getAnchorState()` resolves off `state.openingEquity`, which on a live book is
+ * the FROZEN pre-TRA-3349 demo paper-book equity: `liveRowShape` overrides the
+ * archived ROW with broker figures at the 21:00 ET write but never writes
+ * `state.openingEquity`, so the day roll never rewrites it (TRA-4279 root
+ * cause, established on TRA-4334). Measured live 2026-09-03: both live books
+ * stale (admin 2603.49 vs broker close 438.06; v0nni 25000 vs 383.38), 0 of 64
+ * demo books — demo `state.openingEquity` IS the book's own equity and rolls.
+ *
+ * The repair mirrors the row treatment at the read site: the anchor a live book
+ * publishes is that book's newest archived close STRICTLY BEFORE the anchor's
+ * `openingDate` — the same broker-shaped `closingEquity` the archived `days[]`
+ * row carries, which is exactly the value routine 8d2c80a9 item 6 pairs it
+ * against. Rows whose close is `null` (NOT MEASURED, TRA-2829) are skipped, not
+ * zeroed. With no measurable prior close the tracker's declaration is returned
+ * unchanged — an honest `day-roll-state-equity`, never a fabricated number.
+ *
+ * Deliberately NOT a fix to `state.openingEquity` itself, and deliberately not
+ * a widening of `ANCHOR_MATCH_EPSILON_USD`: the frozen byte and the broker
+ * balance are two different SURFACES, not rounding drift, and no non-test
+ * caller beyond this route ever computes with the live `state.openingEquity`
+ * (TRA-4334 caller census). Demo/sandbox anchors are returned by reference,
+ * byte-identical to before this ticket.
+ */
+export function resolveLiveAnchorState(
+  anchor: AnchorState,
+  mode: string,
+  snapshots: ReadonlyArray<Pick<DailySnapshot, 'date' | 'closingEquity'>>,
+): AnchorState & { openingEquityPairedCloseDate?: string } {
+  if (mode !== 'live') return anchor;
+  let paired: { date: string; closingEquity: number } | null = null;
+  for (const s of snapshots) {
+    if (!(s.date < anchor.openingDate)) continue;
+    const close = s.closingEquity;
+    if (typeof close !== 'number' || !Number.isFinite(close)) continue;
+    if (paired === null || s.date > paired.date) paired = { date: s.date, closingEquity: close };
+  }
+  if (paired === null) return anchor;
+  return {
+    openingDate: anchor.openingDate,
+    openingEquity: paired.closingEquity,
+    openingEquityBasis: ANCHOR_BASIS_LIVE_PRIOR_ARCHIVED_CLOSE,
+    openingEquityPairedCloseDate: paired.date,
+  };
+}
+
+/**
  * TRA-2302 — one ET day's option-close census read off the DURABLE option-trade
  * journal (`option-trade-journal.jsonl`), for the book being reconciled.
  *

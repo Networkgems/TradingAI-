@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   reconcilePnl,
+  resolveLiveAnchorState,
+  ANCHOR_BASIS_LIVE_PRIOR_ARCHIVED_CLOSE,
   resolvePnlBaselineDate,
   foldJournalClosesByEtDay,
   liveOptionsOnsetEtDate,
@@ -3996,5 +3998,76 @@ describe('TRA-3867 — the gateable verdict subtracts the RULED set, and only th
     expect(s.journalDayCellNoNewSupersessionOk).toBe(s.journalDayCellAgreementOk);
     expect(s.journalDayCellUnacknowledgedCount).toBe(3);
     expect(s.journalDayCellAcknowledgedCount).toBe(0);
+  });
+});
+
+describe('TRA-4337 — resolveLiveAnchorState repoints a LIVE anchor at the broker basis', () => {
+  const frozen = {
+    // The measured v0nni defect verbatim: the frozen pre-TRA-3349 paper equity,
+    // republished every fire with the day-roll label.
+    openingDate: '2026-09-03',
+    openingEquity: 25_000,
+    openingEquityBasis: 'day-roll-state-equity',
+  };
+  const row = (date: string, closingEquity: number | null) => ({ date, closingEquity });
+
+  it('a live book pairs with its newest archived close STRICTLY before openingDate', () => {
+    const out = resolveLiveAnchorState(frozen, 'live', [
+      row('2026-08-29', 395.30),
+      row('2026-09-02', 383.38),
+      // Same-date row must NOT pair: openingDate's own close is today's, not prior.
+      row('2026-09-03', 999.99),
+    ]);
+    expect(out.openingEquity).toBe(383.38);
+    expect(out.openingEquityBasis).toBe(ANCHOR_BASIS_LIVE_PRIOR_ARCHIVED_CLOSE);
+    expect(out.openingEquityPairedCloseDate).toBe('2026-09-02');
+    expect(out.openingDate).toBe('2026-09-03');
+  });
+
+  it('an unsorted snapshot list still pairs the NEWEST prior close', () => {
+    const out = resolveLiveAnchorState(frozen, 'live', [
+      row('2026-09-02', 383.38),
+      row('2026-08-28', 401.12),
+    ]);
+    expect(out.openingEquity).toBe(383.38);
+    expect(out.openingEquityPairedCloseDate).toBe('2026-09-02');
+  });
+
+  it('a NULL close (NOT MEASURED, TRA-2829) is skipped, never zeroed', () => {
+    const out = resolveLiveAnchorState(frozen, 'live', [
+      row('2026-08-29', 395.30),
+      row('2026-09-02', null),
+    ]);
+    expect(out.openingEquity).toBe(395.30);
+    expect(out.openingEquityPairedCloseDate).toBe('2026-08-29');
+  });
+
+  it('with NO measurable prior close the tracker declaration passes through unchanged', () => {
+    // Honest absent: never a fabricated number, and the stale label survives so
+    // the tripwire can keep annotating the condition.
+    const out = resolveLiveAnchorState(frozen, 'live', [row('2026-09-02', null)]);
+    expect(out).toBe(frozen);
+    expect(out.openingEquityBasis).toBe('day-roll-state-equity');
+  });
+
+  it('demo and sandbox anchors are returned BY REFERENCE, byte-identical', () => {
+    for (const mode of ['demo', 'sandbox']) {
+      const out = resolveLiveAnchorState(frozen, mode, [row('2026-09-02', 383.38)]);
+      expect(out).toBe(frozen);
+    }
+  });
+
+  it('an already-verified live anchor is still repointed to the SAME value it verified against', () => {
+    // On a healthy live book the newest prior close IS what the attestation
+    // matched, so the repair is value-neutral there — only the basis string and
+    // paired date are added. Guards against the repair moving a sound anchor.
+    const sound = {
+      openingDate: '2026-09-03',
+      openingEquity: 438.06,
+      openingEquityBasis: 'verified-prior-session-close',
+    };
+    const out = resolveLiveAnchorState(sound, 'live', [row('2026-09-02', 438.06)]);
+    expect(out.openingEquity).toBe(438.06);
+    expect(out.openingEquityBasis).toBe(ANCHOR_BASIS_LIVE_PRIOR_ARCHIVED_CLOSE);
   });
 });

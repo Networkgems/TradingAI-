@@ -31,6 +31,7 @@ import { decideEodReportWrite } from './reports/eod-write-gate.js';
 import { annotateReportProvenance } from './reports/mover-provenance.js';
 import {
   reconcilePnl,
+  resolveLiveAnchorState,
   resolvePnlBaselineDate,
   foldJournalClosesByEtDay,
   liveOptionsOnsetEtDate,
@@ -6723,7 +6724,14 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
           // write that spends today's grade. `openingEquityBasis:
           // 'verified-prior-session-close'` means a boot checked this number
           // against the newest recorded close and they matched.
-          anchor: ctx.tracker.getAnchorState(),
+          //
+          // TRA-4337 — on a LIVE book the tracker's declaration is the FROZEN
+          // demo paper-book equity (`liveRowShape` broker-overrides the
+          // archived row but never rewrites `state.openingEquity`), so the
+          // published anchor is repointed at the newest prior archived close —
+          // the broker-shaped `closingEquity` the paired `days[]` row carries.
+          // Demo/sandbox anchors pass through byte-identical.
+          anchor: resolveLiveAnchorState(ctx.tracker.getAnchorState(), mode, snapshots),
           openLiveJournalRowCount: openLiveRows == null ? null : openLiveRows.length,
           openLiveJournalAtRiskUsd: openLiveRows == null
             ? null
