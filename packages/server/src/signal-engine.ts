@@ -226,6 +226,7 @@ import {
   recordChurnBrakeOpen,
   recordChurnBrakeOpenRejected,
   recordChurnBrakeDcaHalt,
+  recordChurnBrakeGuardEvent, // TRA-4335 — the durable presented/evaluated/rejected denominator
 } from './churn-brake-ledger.js';
 import {
   isDirectionalQualityGateEnabled,
@@ -6266,7 +6267,20 @@ export class SignalEngine {
           : this.riskGovernor.isHalted() ? 'risk_halted'
             : !isStockMarketOpen() ? 'market_closed'
               : null;
-    if (equityPassGate !== null) recordEquityEntryPassGated(this.mode, this.feedContextKey, equityPassGate);
+    if (equityPassGate !== null) {
+      // TRA-4335 defect 3 — when the reason is `strategies_inactive_on_tick` on a
+      // LIVE engine, say WHICH half of the conjunction failed. The two halves are
+      // opposite verdicts (a deliberate opt-out vs unresolved creds), and on
+      // 2026-09-03 one of three live engines sat on this reason with no way to
+      // tell them apart from the route. Demo engines are active by construction
+      // (`equityStrategiesActiveOnTick` is unconditionally true there), so the
+      // detail is live-only.
+      const gateDetail =
+        equityPassGate === 'strategies_inactive_on_tick' && this.mode === 'live'
+          ? (!this.liveTradeEquitiesTradier ? 'live_equity_toggle_off' : 'live_equity_client_missing')
+          : null;
+      recordEquityEntryPassGated(this.mode, this.feedContextKey, equityPassGate, Date.now(), gateDetail);
+    }
     if (equityPassGate === null) {
       // TRA-1793 — the universe sweep OPENS the pass and counts every symbol it skips.
       // It is the loop; nothing here re-implements it.
@@ -8146,7 +8160,19 @@ export class SignalEngine {
   ): { blocked: boolean; count: number; cap: number } {
     if (this.mode === 'live') return { blocked: false, count: 0, cap: 0 };
     const env = this.resolveDemoFlagEnv();
-    if (!isChurnLossBrakeEnabled(env)) return { blocked: false, count: 0, cap: 0 };
+    if (!isChurnLossBrakeEnabled(env)) {
+      // TRA-4335 — presented-but-DARK. Recorded so `opensEvaluated: 0` against a
+      // non-zero `opensPresented` is readable as "the brake did not run", which a
+      // bare reject count of 0 can never say (same denominator rule as TRA-2598).
+      recordChurnBrakeGuardEvent({
+        ts: now,
+        etDay: etDateString(new Date(now)),
+        symbol,
+        guardEnabled: false,
+        blocked: false,
+      });
+      return { blocked: false, count: 0, cap: 0 };
+    }
     // TRA-1486 D2 — read through `opensTodayFor`, which maxes the in-memory counter
     // with the reboot-durable JSONL count, so this cap survives a mid-session reboot.
     const count = this.opensTodayFor(symbol, now);
@@ -8157,6 +8183,18 @@ export class SignalEngine {
     // Nth+1 opens the cap actually refused is observable via
     // `/api/health/churn-brake` instead of only inferable from desk churn.
     if (blocked) recordChurnBrakeOpenRejected(symbol, count, cap, now);
+    // TRA-4335 — the DURABLE twin of the since-boot counters above: one guard
+    // event per verdict, restart-safe, so a post-reboot read can still grade the
+    // session's enforcement instead of inferring it from the journal's shape.
+    recordChurnBrakeGuardEvent({
+      ts: now,
+      etDay: etDateString(new Date(now)),
+      symbol,
+      guardEnabled: true,
+      blocked,
+      count,
+      cap,
+    });
     return { blocked, count, cap };
   }
 

@@ -15982,6 +15982,41 @@ export class PaperOptionsAccount {
     // path passes Tradier's avg fill) the close price is already net of
     // real broker slippage, so we still skip the modelled haircut.
     const positionMode = opt.mode ?? 'demo';
+    // TRA-4335 defect 2 — make the book-halt flatten's exit attribution a function
+    // of the ROW'S OWN STATE, not of tick phase. The flatten runs AFTER the tick's
+    // exit pass, so a row it reaches is one whose own trade-level rule either had
+    // not yet crossed at that engine's sampled quote or was held by the
+    // opening-range window — and the SAME close, on a byte-identical twin whose
+    // engine ticked seconds later, lands as `profit_lock`. On 2026-09-03 two
+    // IONQ261009C00039000 twins closed 6.8s apart with identical realized R and
+    // two different exitReasons, which makes the `byExitReason` histogram noisy at
+    // an unknown rate. So: when the halt flatten closes a row whose own
+    // profit-lock would fire at this very close mark, stamp `profit_lock` — the
+    // trade-level rule already demanded this exit; the halt merely executed it.
+    // `book_halt_flat` remains for rows the halt ALONE closed. Evaluated with the
+    // same schedule and the same unquoted-tick basis (mid + `peakPremium`) as the
+    // exit cascade's Rule 2; the TRA-4020 floor ladder is deliberately omitted —
+    // this path cannot know whether the ladder was armed for the tick, and
+    // omitting it only UNDER-stamps `profit_lock` (conservative), never over.
+    if (
+      exitReason === 'book_halt_flat'
+      && Number.isFinite(opt.premiumPaid)
+      && Number.isFinite(opt.peakPremium)
+      && Number.isFinite(opt.stopLossPremium)
+    ) {
+      const lock = profitLockDecision({
+        side: 'buy',
+        entry: opt.premiumPaid,
+        initialStop: opt.stopLossPremium,
+        peakPrice: opt.peakPremium as number,
+        currentPrice: closePrice,
+        armR: this.otmProfitSchedule.armR,
+        giveBackR: this.otmProfitSchedule.giveBackR,
+        tightenPeakR: this.otmProfitSchedule.tightenPeakR,
+        tightenGiveBackR: this.otmProfitSchedule.tightenGiveBackR,
+      });
+      if (lock.shouldExit) exitReason = 'profit_lock';
+    }
     // TRA-2233 — demo manual close fills at the marketable bid/ask when armed; MID otherwise.
     // (Live path already substituted the broker's real avg fill into `closePrice`.)
     const effectiveExit = this.demoExitFillPrice(closePrice, opt);

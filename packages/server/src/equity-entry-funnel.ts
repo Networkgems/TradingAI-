@@ -129,6 +129,27 @@ export type EquityEntryPassGateReason =
   | 'market_closed';
 
 /**
+ * TRA-4335 defect 3 — WHY `strategies_inactive_on_tick`, on a LIVE engine.
+ *
+ * On a live engine that reason is the conjunction failing:
+ * `liveTradeEquitiesTradier && tradierLiveEquityClient !== null` — and the two
+ * halves are opposite verdicts. The toggle off is a deliberate per-account
+ * opt-out (by design); a missing client is creds that did not resolve (usually
+ * a defect). On 2026-09-03 one of three live engines reported
+ * `strategies_inactive_on_tick` while its siblings said `market_closed`, and the
+ * route could not say WHICH half — so "inactive by design or by defect?" needed
+ * a code dive. This detail answers it on the wire.
+ *
+ * The reason enum above is deliberately UNCHANGED (pre-registered read rules —
+ * the TRA-1793 goalposts rule); the detail rides beside it and is `null` for
+ * every other reason and on demo engines (where the strategies are active by
+ * construction).
+ */
+export type EquityEntryPassGateDetail =
+  | 'live_equity_toggle_off'      // the user/account opted out of live equity mirroring
+  | 'live_equity_client_missing'; // Tradier live equity client not built (creds unresolved)
+
+/**
  * TRA-1793 — why a symbol inside an ITERATING pass never reached strategy evaluation.
  *
  * The hole this closes: the pass gate above proves the loop iterated, but three
@@ -207,6 +228,8 @@ interface ModeLedger {
   passesTruncated: number;
   lastPassAt: number | null;
   lastPassGateBlockedReason: EquityEntryPassGateReason | null;
+  /** TRA-4335 — sub-cause of `strategies_inactive_on_tick` on a live engine; null otherwise. */
+  lastPassGateBlockedDetail: EquityEntryPassGateDetail | null;
   lastAdmittedAt: number | null;
 
   /** Last ITERATED pass only. `null` until one has run. */
@@ -257,6 +280,7 @@ function emptyLedger(): ModeLedger {
     passesTruncated: 0,
     lastPassAt: null,
     lastPassGateBlockedReason: null,
+    lastPassGateBlockedDetail: null,
     lastAdmittedAt: null,
     lastPassCandidates: null,
     lastPassAdmitted: null,
@@ -381,6 +405,7 @@ export function beginEquityEntryPass(
   led.iteratedPassCount += 1;
   led.lastPassAt = at;
   led.lastPassGateBlockedReason = null;
+  led.lastPassGateBlockedDetail = null;
   slot.open = {
     candidates: 0,
     admitted: 0,
@@ -433,6 +458,10 @@ export function recordEquityEntryPassGated(
   engineId: string,
   reason: EquityEntryPassGateReason,
   at: number = Date.now(),
+  // TRA-4335 — sub-cause, only meaningful with `strategies_inactive_on_tick` on a
+  // live engine. Trailing + optional so the two positional test callers above it
+  // and the production call site migrate independently.
+  detail: EquityEntryPassGateDetail | null = null,
 ): void {
   const slot = slotFor(mode, engineId);
   const led = slot.led;
@@ -440,6 +469,9 @@ export function recordEquityEntryPassGated(
   led.gatedPassCount += 1;
   led.lastPassAt = at;
   led.lastPassGateBlockedReason = reason;
+  // Keyed to the reason it explains: a stray detail on any other reason is dropped
+  // rather than published, so the pair can never disagree on the wire.
+  led.lastPassGateBlockedDetail = reason === 'strategies_inactive_on_tick' ? detail : null;
   // TRA-1834 — nulling a still-iterating pass is the disease itself: the pass was cut off
   // mid-sweep and every symbol after this is dropped. With per-engine keying the gate
   // only ever reaches THIS engine's slot, and this engine's tick gates XOR sweeps, so its
@@ -597,6 +629,13 @@ export interface EquityEntryFunnelView {
   lastPassAt: string | null;
   /** Which gate held the most recent pass; null when it iterated. */
   passGateBlockedReason: EquityEntryPassGateReason | null;
+  /**
+   * TRA-4335 — WHY `strategies_inactive_on_tick`, on a live engine:
+   * `live_equity_toggle_off` (a deliberate per-account opt-out — by design) vs
+   * `live_equity_client_missing` (Tradier creds did not resolve into a client —
+   * usually a defect). `null` for every other reason and on demo engines.
+   */
+  passGateBlockedDetail: EquityEntryPassGateDetail | null;
   lastAdmittedAt: string | null;
   /** The most recent ITERATED pass. All null until one has run. */
   lastPass: {
@@ -658,6 +697,7 @@ function viewOf(led: ModeLedger): EquityEntryFunnelView {
     passesTruncated: led.passesTruncated,
     lastPassAt: led.lastPassAt === null ? null : new Date(led.lastPassAt).toISOString(),
     passGateBlockedReason: led.lastPassGateBlockedReason,
+    passGateBlockedDetail: led.lastPassGateBlockedDetail,
     lastAdmittedAt: led.lastAdmittedAt === null ? null : new Date(led.lastAdmittedAt).toISOString(),
     lastPass: {
       candidatesEvaluated: led.lastPassCandidates,

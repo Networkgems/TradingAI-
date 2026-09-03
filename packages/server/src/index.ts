@@ -304,6 +304,7 @@ import {
 } from './options-ideas-credit-width-ledger.js';
 import { hydrateScaleoutLadderFromDisk } from './scaleout-ladder-ledger.js';
 import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
+import { hydrateChurnBrakeGuardFromDisk } from './churn-brake-ledger.js';
 import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
 // TRA-3434 — boot warm for the TRA-3391 tape-expectancy fold the live cost bar
@@ -4856,6 +4857,22 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
 // bit. Rebuilding the current-ET-day counts from disk lets the cap survive a
 // mid-session reboot. Best-effort; the ledger is compacted to a short retention
 // window on read so it stays tiny.
+// TRA-4335 — hydrate the DURABLE churn-brake open-cap guard ledger and remember
+// DATA_DIR for subsequent appends. The since-boot reject counters on
+// `/api/health/churn-brake` zero on every reboot, so the daily journal review's
+// post-boot read could not distinguish "enforcing perfectly" from "completely
+// dark"; this retained per-ET-day presented/evaluated/rejected fold is what a
+// multi-session read grades instead. Best-effort; compacted to a 30-day window.
+{
+  const h = hydrateChurnBrakeGuardFromDisk(DATA_DIR);
+  if (h.records > 0) {
+    log.info('churn-brake open-cap guard ledger hydrated (TRA-4335)', {
+      records: h.records,
+      days: h.days,
+    });
+  }
+}
+
 {
   const h = hydrateDirectionalOpensFromDisk(DATA_DIR);
   if (h.records > 0 || h.rejects > 0) {

@@ -121,7 +121,7 @@ import {
   resolveConvictionDcaDeployAnchor,
   parseConvictionDcaPaging,
 } from '../conviction-dca-ledger.js';
-import { summarizeChurnBrake } from '../churn-brake-ledger.js';
+import { summarizeChurnBrake, summarizeChurnBrakeGuard } from '../churn-brake-ledger.js';
 import { summarizeDirectionalGate, summarizeDirectionalArm } from '../directional-open-ledger.js';
 import { summarizeEntryGreeksGate } from '../entry-greeks-ledger.js';
 import { RV_LONG_DELTA_FLOOR } from '@trading-app/engine';
@@ -4379,6 +4379,12 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         ? `ARMED (demo-only): rejects the ${cap + 1}th same-session open per name and halts a conviction-DCA add into a same-day net-negative name; live path unchanged.`
         : `DISARMED: set ${CHURN_LOSS_BRAKE_FLAG}=1 (render.yaml env or DATA_DIR/demo-flags.json) to arm on the demo book.`,
       ...summarizeChurnBrake(),
+      // TRA-4335 — the DURABLE per-ET-day guard fold. Everything above this line is
+      // since-boot and zeroes on every deploy; `retained` survives the reboot and
+      // carries the presented/evaluated/rejected denominator, so a post-boot read
+      // can tell an enforcing-and-quiet cap from a dark one (state: live_clean vs
+      // dark) instead of inferring it from the journal's open distribution.
+      retained: summarizeChurnBrakeGuard(),
     });
   });
 
