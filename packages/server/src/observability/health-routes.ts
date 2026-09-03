@@ -55,6 +55,8 @@ import {
   isOptionLiveTestWindowOpen,
   isOptionLiveOtmArmed,
   isOptionLiveRvLongArmed,
+  isOptionLiveDirectionalEnabled, // TRA-4288
+  isOptionLiveDirectionalArmed, // TRA-4288
   parseOptionLiveTestUntil,
   LIVE_OPTION_TEST_NOTIONAL_CAP_USD,
   LIVE_OPTION_TEST_NOTIONAL_CEILING_USD,
@@ -4915,6 +4917,12 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         testUntilIso: testUntil !== null ? new Date(testUntil).toISOString() : null,
         otmArmed: isOptionLiveOtmArmed(liveEnv, nowMs),
         rvArmed: isOptionLiveRvLongArmed(liveEnv, nowMs),
+        // TRA-4288 — the directional sleeve was the one live arm consumed as a
+        // raw flag with no OPTION_LIVE_TEST_UNTIL conjunct (it would never have
+        // expired). Publish the same decision the order sites now consult —
+        // the pure function, not a re-derived conjunct (TRA-3689 pattern).
+        directionalFlagOn: isOptionLiveDirectionalEnabled(liveEnv),
+        directionalArmed: isOptionLiveDirectionalArmed(liveEnv, nowMs),
       },
       n: summary.n,
       opens: summary.opens,

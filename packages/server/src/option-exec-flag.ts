@@ -3584,6 +3584,24 @@ export function isOptionLiveOtmArmed(
   return isOptionLiveOtmEnabled(env) && isOptionLiveTestWindowOpen(env, now);
 }
 
+/**
+ * True iff the DARK live directional (call/put) single-leg path is ACTUALLY
+ * armed: the `ENABLE_OPTION_LIVE_DIRECTIONAL` boolean is on AND the arm window
+ * is open. TRA-4288 — before this, the directional order sites consumed the raw
+ * flag alone, so the one live sleeve WITHOUT the dated fail-closed window was
+ * the one that would have armed with no expiry. All three live consumption
+ * sites (gate, method guard, broker-submit re-check) must consult this, never
+ * `isOptionLiveDirectionalEnabled`, so the window's fail-closed semantics
+ * (unset/malformed/expired `OPTION_LIVE_TEST_UNTIL` ⇒ disarmed) bind the
+ * directional sleeve identically to OTM and RV.
+ */
+export function isOptionLiveDirectionalArmed(
+  env: NodeJS.ProcessEnv = process.env,
+  now: number = Date.now(),
+): boolean {
+  return isOptionLiveDirectionalEnabled(env) && isOptionLiveTestWindowOpen(env, now);
+}
+
 // --------------------------------------------------------------------------
 // TRA-2048 (parent TRA-2044 "how to reduce slippage", board-funded fork) —
 // promote the two already-built, shadow-only pre-trade gates from OBSERVE to

@@ -130,7 +130,7 @@ import {
   PCS_ENTRY_DTE_BAND,
 } from './pcs-shadow-ledger.js';
 import { selectWeeklyPcs } from '@trading-app/engine';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd, liveOptionTestAggregateHeadroomSignedUsd, resolveLiveOptionTestFleetRiskFraction, resolveLiveOptionTestBookAggregateCapUsd, sumLiveOtmFleetCapitalUsd, resolveEffectiveFleetRiskFraction, resolveLiveOtmSizingBasisUsd, sumLiveOtmFleetAtRiskUsd, resolveLiveOtmAdmissibleEntryUsd, fitsLiveOtmReachableBound, foldUnsettledLivePremiumUsd, resolveSettledAvailableCashUsd, isLivePremiumUnsettled } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalArmed, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd, liveOptionTestAggregateHeadroomSignedUsd, resolveLiveOptionTestFleetRiskFraction, resolveLiveOptionTestBookAggregateCapUsd, sumLiveOtmFleetCapitalUsd, resolveEffectiveFleetRiskFraction, resolveLiveOtmSizingBasisUsd, sumLiveOtmFleetAtRiskUsd, resolveLiveOtmAdmissibleEntryUsd, fitsLiveOtmReachableBound, foldUnsettledLivePremiumUsd, resolveSettledAvailableCashUsd, isLivePremiumUnsettled } from './option-exec-flag.js';
 import type { LiveOtmAdmissibleBoundBy } from './option-exec-flag.js';
 // TRA-3997 (parent TRA-3703) — freeze the order site's admission reading onto
 // the row it is about to open. See the OTM bounded-test site below.
@@ -6600,8 +6600,10 @@ export class SignalEngine {
     // TRA-382 + TRA-1436. Gated to market hours and throttled on the RV cadence;
     // wholly skipped when neither flag is on, so the default prod path is
     // unchanged.
+    // TRA-4288 — the ARM (flag AND OPTION_LIVE_TEST_UNTIL window), not the raw
+    // flag, so the directional sleeve expires with OTM/RV instead of never.
     const directionalDemoOn = this.mode === 'demo' && isOptionDemoDirectionalEnabled();
-    const directionalLiveOn = this.mode === 'live' && isOptionLiveDirectionalEnabled(process.env);
+    const directionalLiveOn = this.mode === 'live' && isOptionLiveDirectionalArmed(process.env);
 
     // TRA-3080 — leave a RETAINED trace of what this gate decided, per book, per ET
     // day. Written HERE and not inside the pass on purpose: `evaluateDemoDirectional`
@@ -13993,7 +13995,7 @@ export class SignalEngine {
     // the live book. Demo requires the demo flag; live requires the DARK live
     // arm flag (read from process env only — never the demo-flags file override).
     const demoOn = this.mode === 'demo' && isOptionDemoDirectionalEnabled();
-    const liveOn = this.mode === 'live' && isOptionLiveDirectionalEnabled(process.env);
+    const liveOn = this.mode === 'live' && isOptionLiveDirectionalArmed(process.env);
     if ((!demoOn && !liveOn) || !this.rvScanner) return;
 
     const asOf = Date.now();
@@ -14385,7 +14387,7 @@ export class SignalEngine {
         // open back and surfaces the reason when the broker leg fails → skip.
         if (
           this.mode === 'live'
-          && isOptionLiveDirectionalEnabled(process.env)
+          && isOptionLiveDirectionalArmed(process.env)
           && this.tradierLiveOptionsEnabled
         ) {
           // TRA-2245 — tag the live-fill fee/slippage ledger with the renamed

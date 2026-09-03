@@ -18,6 +18,9 @@ import {
   isOptionLiveTestWindowOpen,
   isOptionLiveOtmArmed,
   isOptionLiveRvLongArmed,
+  isOptionLiveDirectionalEnabled, // TRA-4288
+  isOptionLiveDirectionalArmed, // TRA-4288
+  OPTION_LIVE_DIRECTIONAL_FLAG,
   parseOptionLiveTestUntil,
   isOptionCostGateLiveEnforceEnabled,
   isOptionLiquidityLiveEnforceEnabled,
@@ -153,6 +156,24 @@ describe('TRA-1929 — live OTM flag + self-expiring bounded-test window', () =>
     expect(isOptionLiveRvLongArmed({ [OPTION_LIVE_RV_LONG_FLAG]: '1' }, 1000)).toBe(false);
     expect(isOptionLiveRvLongArmed({ [OPTION_LIVE_RV_LONG_FLAG]: '1', [OPTION_LIVE_TEST_UNTIL_VAR]: PAST }, 1000)).toBe(false);
     expect(isOptionLiveRvLongArmed({ [OPTION_LIVE_RV_LONG_FLAG]: '1', [OPTION_LIVE_TEST_UNTIL_VAR]: FUTURE }, 1000)).toBe(true);
+  });
+
+  it('TRA-4288 — the DIRECTIONAL arm is window-gated too: flag alone can NEVER arm it', () => {
+    // Before TRA-4288 the order sites consumed the raw flag, so this sleeve was
+    // the one live arm with no expiry. These controls prove the conjunct.
+    // flag on, window unset (fail-closed) ⇒ NOT armed
+    expect(isOptionLiveDirectionalArmed({ [OPTION_LIVE_DIRECTIONAL_FLAG]: '1' }, 1000)).toBe(false);
+    // flag on, window malformed ⇒ NOT armed
+    expect(isOptionLiveDirectionalArmed({ [OPTION_LIVE_DIRECTIONAL_FLAG]: '1', [OPTION_LIVE_TEST_UNTIL_VAR]: 'nope' }, 1000)).toBe(false);
+    // flag on, window expired ⇒ NOT armed
+    expect(isOptionLiveDirectionalArmed({ [OPTION_LIVE_DIRECTIONAL_FLAG]: '1', [OPTION_LIVE_TEST_UNTIL_VAR]: PAST }, 1000)).toBe(false);
+    // window open, flag off ⇒ NOT armed
+    expect(isOptionLiveDirectionalArmed({ [OPTION_LIVE_TEST_UNTIL_VAR]: FUTURE }, 1000)).toBe(false);
+    // both ⇒ armed
+    expect(isOptionLiveDirectionalArmed({ [OPTION_LIVE_DIRECTIONAL_FLAG]: '1', [OPTION_LIVE_TEST_UNTIL_VAR]: FUTURE }, 1000)).toBe(true);
+    // ISOLATED control (TRA-3897): the raw flag DOES read on under the same env
+    // the arm refuses — so the refusal above is the window conjunct, not a dead flag.
+    expect(isOptionLiveDirectionalEnabled({ [OPTION_LIVE_DIRECTIONAL_FLAG]: '1' })).toBe(true);
   });
 
   it('OTM live flag is a STANDALONE toggle — exec-selector neither arms nor blocks it', () => {

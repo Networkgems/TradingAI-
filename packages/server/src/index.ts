@@ -626,6 +626,7 @@ import {
   // TRA-3689 — the EFFECTIVE arms (flag AND window), i.e. what the order sites call.
   isOptionLiveOtmArmed,
   isOptionLiveRvLongArmed,
+  isOptionLiveDirectionalArmed, // TRA-4288
   // TRA-3829 (ruling B) — master arm gating the per-row hand-over surface.
   isEngineActionOnAdoptedRowsArmed,
   parseOptionLiveTestUntil,
@@ -11632,6 +11633,13 @@ app.get('/api/health/options-live', async (_req, res) => {
       // null ⇒ unset/malformed ⇒ window CLOSED (fail-closed) ⇒ both sleeves dark.
       liveOtmRouting: isOptionLiveOtmArmed(process.env),
       liveRvLongRouting: isOptionLiveRvLongArmed(process.env),
+      // TRA-4288 — same pattern for the directional sleeve. `liveDirectionalArmed`
+      // above is the raw flag (kept for its documented readers); THIS is the value
+      // the three directional order sites in signal-engine consult since TRA-4288
+      // gave the sleeve the same fail-closed OPTION_LIVE_TEST_UNTIL conjunct as
+      // OTM/RV. Before that cut the sleeve had NO routing twin here because the
+      // raw flag WAS the whole arm — an arm with no expiry.
+      liveDirectionalRouting: isOptionLiveDirectionalArmed(process.env),
       liveTestUntilIso: (() => {
         const until = parseOptionLiveTestUntil(process.env);
         return until === null ? null : new Date(until).toISOString();
