@@ -80,8 +80,10 @@
  *   3  BLIND    — the population or a row is untrustworthy. NOT a pass.
  *   4  GRACE    — stalled rows exist but ALL are inside the grace window.
  *                 Not clean, not paged; expect the next sweep to decide.
+ *   5  CLUSTER  — armed monitors sharing a nextCheckAt instant (n > 3). Pre-burst
+ *                 warning: fires BEFORE the scheduler drains them. No stalled rows.
  *
- * Precedence: BLIND > STALLED > GRACE > CLEAN.
+ * Precedence: BLIND > STALLED > CLUSTER > GRACE > CLEAN.
  *
  * Usage:
  *   node scripts/check-stalled-reviews.mjs [--json] [--owner=<agentId>] [--grace-hours=24]
@@ -95,13 +97,34 @@ const PAGE_LIMIT = 200;
 const MAX_PAGES = 200;
 const DEFAULT_GRACE_HOURS = 24;
 
-export const VERDICT_EXIT = { CLEAN: 0, STALLED: 1, USAGE: 2, BLIND: 3, GRACE: 4 };
+// Exit codes: CLEAN=0 STALLED=1 USAGE=2 BLIND=3 GRACE=4 CLUSTER=5
+// Precedence: BLIND > STALLED > CLUSTER > GRACE > CLEAN
+export const VERDICT_EXIT = { CLEAN: 0, STALLED: 1, USAGE: 2, BLIND: 3, GRACE: 4, CLUSTER: 5 };
 
 export const NON_TERMINAL = new Set(['todo', 'in_progress', 'in_review', 'blocked', 'backlog']);
 export const TERMINAL = new Set(['done', 'cancelled', 'completed', 'closed', 'archived']);
 const ATTENTION_STATES = new Set(['none', 'covered', 'stalled']);
 
+// Paths manufactured solely by the monitor fire event itself (TRA-4316).
+const FIRE_MANUFACTURED = new Set(['active_run', 'queued_wake']);
+
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * A row is fire-manufactured-covered when:
+ *   (a) the platform says "covered" but every path in reviewAttention.paths is
+ *       active_run or queued_wake — both created by the monitor fire itself, and
+ *   (b) monitorNextCheckAt is null — the monitor was already spent.
+ * In that state the coverage is an illusion: the row will fall to stalled as
+ * soon as the wakes are consumed without a re-arm. Grade on the underlying state.
+ * If paths is absent or empty we cannot determine this; trust the platform verdict.
+ */
+function isFireManufacturedCover(row) {
+  const paths = row.reviewAttention?.paths;
+  if (!Array.isArray(paths) || paths.length === 0) return false;
+  if (row.monitorNextCheckAt != null) return false; // monitor still armed
+  return paths.every((p) => FIRE_MANUFACTURED.has(p));
+}
 
 /** Grade a single row. Returns {state, detail, ageMs?}. */
 export function gradeRow(row, nowMs, graceMs) {
@@ -130,7 +153,14 @@ export function gradeRow(row, nowMs, graceMs) {
   if (typeof state !== 'string' || !ATTENTION_STATES.has(state)) {
     return { state: 'BLIND', detail: `${id}: unrecognised reviewAttention.state ${JSON.stringify(state)}` };
   }
-  if (state !== 'stalled') return { state: 'HEALTHY' };
+
+  // Fire-manufactured-path exclusion (TRA-4316 ask 1): a "covered" row whose
+  // only paths are active_run/queued_wake AND whose monitor is spent is not
+  // actually covered — the platform computed coverage from paths the fire itself
+  // injected. Fall through to the stalled age logic.
+  if (state !== 'stalled' && !(state === 'covered' && isFireManufacturedCover(row))) {
+    return { state: 'HEALTHY' };
+  }
 
   // Stalled. Fresh or aged? Age-unknown fails TOWARD the alarm (TRA-3942:
   // a monitor scheduled-then-vanished has no fire timestamp and had been
@@ -180,7 +210,7 @@ export function ageBucket(ageMs) {
 
 export async function run(transport, { owner = null, nowMs = Date.now(), graceMs = DEFAULT_GRACE_HOURS * 3600_000 } = {}) {
   const { rows, blind, pages } = await enumerateIssues(transport.getIssues);
-  if (blind) return { verdict: 'BLIND', blind, scanned: 0, pages, aged: [], fresh: [], blindRows: [] };
+  if (blind) return { verdict: 'BLIND', blind, scanned: 0, pages, aged: [], fresh: [], blindRows: [], clusters: [] };
 
   // TRAP 2 — zero rows scanned is BLIND, not CLEAN.
   if (rows.length === 0) {
@@ -192,6 +222,7 @@ export async function run(transport, { owner = null, nowMs = Date.now(), graceMs
       aged: [],
       fresh: [],
       blindRows: [],
+      clusters: [],
     };
   }
 
@@ -205,12 +236,29 @@ export async function run(transport, { owner = null, nowMs = Date.now(), graceMs
     else if (g.state === 'STALLED_FRESH') fresh.push({ row, ageMs: g.ageMs });
   }
 
+  // Clustering check (TRA-4316 ask 2): group ARMED monitors by their nextCheckAt
+  // instant. Any instant shared by more than 3 rows is a pre-burst warning — the
+  // only signal that fires BEFORE the scheduler drains them all at once.
+  const armedByInstant = new Map();
+  for (const row of rows) {
+    const at = row.monitorNextCheckAt;
+    if (!at) continue;
+    if (!armedByInstant.has(at)) armedByInstant.set(at, []);
+    armedByInstant.get(at).push(row.identifier ?? row.id);
+  }
+  const clusters = [...armedByInstant.entries()]
+    .filter(([, ids]) => ids.length > 3)
+    .map(([instant, ids]) => ({ instant, count: ids.length, ids }))
+    .sort((a, b) => b.count - a.count);
+
   const scope = (list) => (owner ? list.filter((f) => f.row.assigneeAgentId === owner) : list);
   const scopedAged = scope(aged);
   const scopedFresh = scope(fresh);
 
+  // Precedence: BLIND > STALLED > CLUSTER > GRACE > CLEAN
   let verdict = 'CLEAN';
   if (scopedFresh.length) verdict = 'GRACE';
+  if (clusters.length) verdict = 'CLUSTER';
   if (scopedAged.length) verdict = 'STALLED';
   if (blindRows.length) verdict = 'BLIND'; // outranks everything
 
@@ -224,6 +272,7 @@ export async function run(transport, { owner = null, nowMs = Date.now(), graceMs
     allAged: aged,
     allFresh: fresh,
     blindRows,
+    clusters,
   };
 }
 
@@ -244,6 +293,16 @@ export function render(result) {
   }
   if (result.verdict === 'CLEAN') {
     out.push('VERDICT: CLEAN — no non-terminal issue reads reviewAttention.state == "stalled"');
+    if (result.clusters?.length) {
+      out.push(`⚠️ CLUSTER WARNING (${result.clusters.length}): armed monitors sharing a nextCheckAt instant (pre-burst indicator):`);
+      for (const c of result.clusters) out.push(`  n=${c.count}  at=${c.instant}  ${c.ids.join(', ')}`);
+    }
+    return out.join('\n');
+  }
+  // Cluster verdict: no stalled rows but armed monitors are bunching.
+  if (result.verdict === 'CLUSTER') {
+    out.push(`VERDICT: CLUSTER — no stalled rows yet, but ${result.clusters.length} group(s) of armed monitors share a nextCheckAt instant (n > 3). This is the pre-burst shape of TRA-4141. Owners should stagger nextCheckAt or investigate the batch.`);
+    for (const c of result.clusters) out.push(`  n=${c.count}  at=${c.instant}  ${c.ids.join(', ')}`);
     return out.join('\n');
   }
 
@@ -293,6 +352,11 @@ export function render(result) {
   if (result.fresh.length) {
     out.push(`\n  in grace (report-only, no page): ` + result.fresh.map((f) => `${f.row.identifier}(${fmtAge(f.ageMs)})`).join(', '));
   }
+  // Also surface any armed-monitor clusters even when stalled rows dominate.
+  if (result.clusters?.length) {
+    out.push(`\n⚠️ ARMED CLUSTER (pre-burst warning): ${result.clusters.length} group(s) of armed monitors share a nextCheckAt instant (n > 3):`);
+    for (const c of result.clusters) out.push(`  n=${c.count}  at=${c.instant}  ${c.ids.join(', ')}`);
+  }
   return out.join('\n');
 }
 
@@ -324,7 +388,43 @@ const CONTROLS = [
     expect: { verdict: 'STALLED', aged: 1 },
   },
   {
-    name: 'covered is HEALTHY — a live wake path exists (the raw-predicate false positive)',
+    name: 'covered with durable paths is HEALTHY — real wake path exists',
+    rows: [stalledRow({ reviewAttention: { state: 'covered', paths: ['interaction'] } })],
+    expect: { verdict: 'CLEAN', aged: 0 },
+  },
+  {
+    name: 'TRA-4316 ask 1: covered with ONLY fire-manufactured paths + spent monitor => STALLED_AGED (fresh)',
+    rows: [stalledRow({
+      reviewAttention: { state: 'covered', paths: ['active_run', 'queued_wake'] },
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: '2026-09-02T11:00:00Z', // 1h ago = fresh
+    })],
+    expect: { verdict: 'GRACE', aged: 0 },
+  },
+  {
+    name: 'TRA-4316 ask 1: fire-manufactured covered + spent monitor + aged => STALLED',
+    rows: [stalledRow({
+      reviewAttention: { state: 'covered', paths: ['active_run', 'queued_wake'] },
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: '2026-08-27T13:23:15.305Z', // 6d old => aged
+    })],
+    expect: { verdict: 'STALLED', aged: 1 },
+  },
+  {
+    name: 'TRA-4316 ask 1: covered with fire paths but monitor STILL ARMED => HEALTHY (not a false cover)',
+    rows: [stalledRow({
+      reviewAttention: { state: 'covered', paths: ['active_run', 'queued_wake'] },
+      monitorNextCheckAt: '2026-09-03T20:00:00.000Z', // still armed
+    })],
+    expect: { verdict: 'CLEAN', aged: 0 },
+  },
+  {
+    name: 'TRA-4316 ask 1: covered with paths=[] (cannot determine fire-manufactured) => HEALTHY, trust platform',
+    rows: [stalledRow({ reviewAttention: { state: 'covered', paths: [] }, monitorNextCheckAt: null })],
+    expect: { verdict: 'CLEAN', aged: 0 },
+  },
+  {
+    name: 'covered with no paths field (legacy row) => HEALTHY, trust platform',
     rows: [stalledRow({ reviewAttention: { state: 'covered' } })],
     expect: { verdict: 'CLEAN', aged: 0 },
   },
@@ -382,6 +482,41 @@ const CONTROLS = [
     rows: [stalledRow({ assigneeAgentId: 'other-agent' })],
     owner: 'me',
     expect: { verdict: 'CLEAN', aged: 0 },
+  },
+  // TRA-4316 ask 2: clustering check
+  {
+    name: 'TRA-4316 ask 2: 4 armed monitors sharing a nextCheckAt instant => CLUSTER (pre-burst warning)',
+    rows: [
+      ...Array.from({ length: 4 }, (_, i) => ({
+        id: String(i), identifier: `TRA-${i}`, status: 'in_review',
+        reviewAttention: { state: 'none' },
+        monitorNextCheckAt: '2026-09-04T20:00:00.000Z',
+      })),
+    ],
+    expect: { verdict: 'CLUSTER', aged: 0 },
+  },
+  {
+    name: 'TRA-4316 ask 2: 3 armed monitors sharing an instant is fine (threshold is > 3)',
+    rows: [
+      ...Array.from({ length: 3 }, (_, i) => ({
+        id: String(i), identifier: `TRA-${i}`, status: 'in_review',
+        reviewAttention: { state: 'none' },
+        monitorNextCheckAt: '2026-09-04T20:00:00.000Z',
+      })),
+    ],
+    expect: { verdict: 'CLEAN', aged: 0 },
+  },
+  {
+    name: 'TRA-4316 ask 2: STALLED outranks CLUSTER — stalled row beats a cluster warning',
+    rows: [
+      stalledRow({}),
+      ...Array.from({ length: 4 }, (_, i) => ({
+        id: String(i + 10), identifier: `TRA-${i + 10}`, status: 'in_review',
+        reviewAttention: { state: 'none' },
+        monitorNextCheckAt: '2026-09-04T20:00:00.000Z',
+      })),
+    ],
+    expect: { verdict: 'STALLED', aged: 1 },
   },
 ];
 
