@@ -184,6 +184,24 @@ const granted = grantedKeysPresent && Array.isArray(census.grantedCloses) ? cens
 const grantedContracts = grantedKeysPresent && typeof census.grantedContracts === 'number' ? census.grantedContracts : 0;
 const isGrant = v => v === 'desk_add' || v === 'handed_over';
 
+// TRA-3926 (2026-09-04) — the DURABLE CARRIER's deployed-bytes proof. The
+// detector re-derives from a 30-day tape, so every judgement above is on a
+// countdown: QQQ crossed the horizon 2026-09-03 (measured — full finding at
+// 13:10Z, `no_open_record` blind at 20:20Z on identical bytes), XLF follows
+// ~09-19, BAC and RIG behind it. `judgedOversoldDurable` captures each served
+// finding/grant into an append-only store on DATA_DIR at serve time, so the
+// first read on the carrying build ALREADY testifies. Key absent on any build
+// before 2026-09-04.
+const judged = fee.judgedOversoldDurable;
+const JUDGED_KEYS = ['lines', 'closes', 'rows', 'ephemeral', 'capture'];
+const judgedPresent = !!judged && typeof judged === 'object' && JUDGED_KEYS.every(k => k in judged)
+  && Array.isArray(judged.rows);
+check('D8  the route publishes `judgedOversoldDurable` (judgement-carrier bytes; survives the tape horizon)',
+  judgedPresent,
+  judgedPresent
+    ? `lines ${judged.lines} / closes ${judged.closes} / ephemeral ${judged.ephemeral} / appendErrors ${judged.capture?.appendErrors}`
+    : 'ABSENT — this build predates the carrier; every R-pin below evaporates with its evidence (~09-19 for XLF)');
+
 // ── the ORDER-FREE re-derivation ───────────────────────────────────────────
 // Deliberately not the shipped walk: per-OCC totals, no sort, no interleaving.
 const agg = new Map();
@@ -413,6 +431,40 @@ for (const k of KNOWN_GRANTED) {
       && g.grant === k.grant && g.grantSource === k.source,
     g ? `sold ${g.soldContracts} ours ${g.engineOpenContracts} basis ${g.basis} grant ${g.grant} via ${g.grantSource}${accused ? ' AND ACCUSED' : ''}`
       : (accused ? 'ACCUSED — served as a finding' : 'NOT REPORTED'));
+}
+
+// ── Rd — the DURABLE pins. These are the ones that outlive the tape. ───────
+// Graded only where D8 has the key. After a pinned close ages off the tape the
+// R-pin above degrades to a note; the Rd-pin below keeps asserting the exact
+// judgement forever, because the carrier is append-only and horizon-free.
+// QQQ is pinned ABSENT: its judgement evaporated 2026-09-03, before the
+// carrier existed — a QQQ row appearing in the store could only be fabricated
+// testimony, which is the C19 shape pointed at findings instead of grants.
+const DURABLE_PINS = [
+  { symbol: 'XLF260925C00057500', orderId: 142806015, judgement: 'finding', sold: 2, ours: 1, basis: 'outstanding' },
+  { symbol: 'BAC260925C00063000', orderId: 143160792, judgement: 'finding', sold: 1, ours: 0, basis: 'exhausted' },
+  { symbol: 'RIG260925C00006000', orderId: 143384264, judgement: 'granted', sold: 1, ours: 0, basis: 'exhausted', grant: 'desk_add' },
+];
+if (!judgedPresent) {
+  notes.push('Rd  durable carrier ABSENT on this build — the three pins above have no surface that outlives the tape; the next deploy owns the falsifier (3 rows, judgements finding/finding/granted)');
+} else {
+  for (const k of DURABLE_PINS) {
+    const row = judged.rows.find(r => r.orderId === k.orderId && r.optionSymbol === k.symbol);
+    const ok = !!row && row.judgement === k.judgement
+      && row.soldContracts === k.sold && row.engineOpenContracts === k.ours && row.basis === k.basis
+      && (k.grant === undefined || row.grant === k.grant);
+    check(`Rd ${k.symbol} order ${k.orderId} testifies DURABLY as ${k.judgement} (sold ${k.sold} / ours ${k.ours} / ${k.basis})`,
+      ok,
+      row
+        ? `judgement ${row.judgement} sold ${row.soldContracts} ours ${row.engineOpenContracts} basis ${row.basis} grant ${row.grant ?? 'none'} attempts ${row.attempts} onLiveTape ${row.onLiveTape}`
+        : 'NOT IN STORE — the capture has not run on a build that could still derive this judgement');
+  }
+  check('Rd the carrier is on a durable disk with a working write path',
+    judged.ephemeral === false && judged.capture.appendErrors === 0,
+    `ephemeral ${judged.ephemeral} / appendErrors ${judged.capture.appendErrors}`);
+  const qqq = judged.rows.find(r => r.orderId === 140287732);
+  check('Rd QQQ260911P00545000 order 140287732 is NOT in the store (judgement evaporated 2026-09-03, pre-carrier; presence = fabricated testimony)',
+    !qqq, qqq ? `PRESENT as ${qqq.judgement} — UNBACKED` : 'absent, as it must be');
 }
 
 // ── the grants, always printed — a withheld accusation is a decision, and a

@@ -40,6 +40,13 @@ import {
 // money: an engine `sell_to_close` for more contracts than the engine's own
 // opens covered. Independent of the exit-path bound by design.
 import { detectOversoldEngineCloses } from '../tra3926-oversold-close-detector.js';
+// TRA-3926 (2026-09-04) — capture served judgements durably: the tape that
+// feeds the detector retains 30 days, so every finding it can serve is on a
+// countdown, and the fired 2026-08-21 event's evidence ages out ~2026-09-19.
+import {
+  captureJudgedOversoldCloses,
+  summarizeJudgedOversoldCloses,
+} from '../tra3926-judged-oversold-store.js';
 import { summarizeStoredProvenance } from '../tra3932-open-leg-provenance.js';
 import {
   isOptionExecEnabled,
@@ -4639,6 +4646,11 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     const liveEnv = process.env;
     const nowMs = now();
     const summary = summarizeLiveOptionsFeeSlippage();
+    // TRA-3926 — derive ONCE and serve the same snapshot (TRA-3723's read-once
+    // rule); capture BEFORE summarizing the durable store so a judgement served
+    // on this response is never transiently absent from its own carrier.
+    const oversoldCloseCensus = detectOversoldEngineCloses(summary.records);
+    const judgedOversoldCapture = captureJudgedOversoldCloses(oversoldCloseCensus);
     const testUntil = parseOptionLiveTestUntil(liveEnv);
     // TRA-3694 — the same principle as `arm.universe.ratification`, applied to the
     // resolved caps. `notionalCapUsd: 350` reads IDENTICALLY whether the board
@@ -4989,7 +5001,25 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       //
       // Counts + OCC symbols only — no user identifiers (TRA-2163); the symbols
       // are already published on `records[]` immediately below.
-      oversoldCloses: detectOversoldEngineCloses(summary.records),
+      oversoldCloses: oversoldCloseCensus,
+      // TRA-3926 (2026-09-04) — the DURABLE CARRIER for the judgements above.
+      // `oversoldCloses` is re-derived from a 30-day tape on every read, so its
+      // findings evaporate with their evidence (the fired 2026-08-21 XLF event
+      // ages out ~2026-09-19; QQQ already did on 2026-09-03). Every finding and
+      // granted close served here is captured, idempotently, into an append-only
+      // store the archive tick / restart / retention horizon cannot reach.
+      //
+      // Read `rows[].onLiveTape`: `true` = the live census still corroborates
+      // this judgement; `false` = the evidence has aged out and this block is
+      // the ONLY remaining testimony — preserved judgement, not a live
+      // re-derivation. `attempts > 1` means the judgement CHANGED (RIG
+      // 143384264 went finding → granted when the anchor partition landed).
+      // `capture.appendErrors > 0` or `ephemeral: true` means the carrier is
+      // NOT doing its job — read those before trusting a quiet tape.
+      judgedOversoldDurable: {
+        ...summarizeJudgedOversoldCloses(oversoldCloseCensus),
+        capture: judgedOversoldCapture,
+      },
       // TRA-3932 — WHO OPENED the contracts `oversoldCloses` could not attribute.
       //
       // This is the DURABLE STORE, not a re-derivation: it reports what the

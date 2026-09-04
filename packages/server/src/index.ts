@@ -361,6 +361,8 @@ import {
   summarizeStoredProvenance,
   engineFilledOrderIds,
 } from './tra3932-open-leg-provenance.js';
+// TRA-3926 — the durable carrier for judgements the 30-day tape will outlive.
+import { setJudgedOversoldDataDir } from './tra3926-judged-oversold-store.js';
 // TRA-3939 — the two captures that make the question above ANSWERABLE next time:
 // a submit-time order-id ledger and a daily capture of the broker's one-day
 // order window.
@@ -5196,6 +5198,12 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
 // because its lines are verdicts about historical contracts reached from broker
 // evidence that expires, not measurements a later run could retake.
 setOpenLegProvenanceDataDir(DATA_DIR);
+// TRA-3926 (2026-09-04) — bind the judged-oversold durable carrier to the same
+// resolved DATA_DIR. The detector's findings evaporate with the 30-day fill
+// tape (the fired 2026-08-21 XLF event ages out ~2026-09-19); this store is
+// where a judgement, once served, survives the horizon. Nothing to hydrate:
+// read on demand, never compacted.
+setJudgedOversoldDataDir(DATA_DIR);
 
 // TRA-3939 — ARM THE TWO CAPTURES. Both stores hang off the same resolved
 // DATA_DIR and neither is compacted (see the module docblock: they hold evidence
