@@ -1,6 +1,6 @@
 // TRA-422 — the Stocks Signals tab, extracted from Dashboard.tsx. Owns the
 // "Reset Signals" mutation; the signal list and regime context are passed in.
-import type { TradeSignal, EngineMarketReviewState } from '@trading-app/shared';
+import type { TradeSignal, Sma200Signal, EngineMarketReviewState } from '@trading-app/shared';
 import { HTTP_URL } from '../../server-url';
 import { logger } from '../../lib/logger';
 import { useToast } from '../../lib/toast.tsx';
@@ -19,7 +19,7 @@ export function StockSignalsPanel({
   marketOpen,
 }: {
   token: string;
-  signals: TradeSignal[];
+  signals: (TradeSignal | Sma200Signal)[];
   symbols: SymbolState[];
   marketReview: EngineMarketReviewState | undefined;
   // TRA-1350 — last completed engine scan (ms) + session state, so the tab can
@@ -55,7 +55,10 @@ export function StockSignalsPanel({
   // TRA-451 — the SMA-200 daily trend signals get their own Signals-tab
   // category; the intraday strategy signals keep the existing card list.
   const sma200Signals = signals.filter(isSma200Signal);
-  const tradeSignals = signals.filter(s => !isSma200Signal(s));
+  // TRA-3688 — the negative arm must be a typed predicate: only genuine
+  // `TradeSignal`s (numeric takeProfit / R:R) may reach the generic card's
+  // Target and R:R chips; an SMA-200 row's `null` has no rendering there.
+  const tradeSignals = signals.filter((s): s is TradeSignal => !isSma200Signal(s));
 
   return (
     <div className="signals-panel">

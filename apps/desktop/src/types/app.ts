@@ -1,5 +1,5 @@
 // TRA-419 — App-level interfaces extracted from App.tsx.
-import type { TradeSignal, AccountState, Position, OptionsAccountState, EngineMarketReviewState, AgentRecommendation } from '@trading-app/shared';
+import type { TradeSignal, Sma200Signal, AccountState, Position, OptionsAccountState, EngineMarketReviewState, AgentRecommendation } from '@trading-app/shared';
 
 export interface SymbolState {
   symbol: string;
@@ -39,7 +39,9 @@ export interface SymbolState {
 
 export interface AppState {
   symbols: SymbolState[];
-  signals: TradeSignal[];
+  // TRA-3688 — SMA-200 rows carry null takeProfit/riskRewardRatio (no exit
+  // model), so the feed is the explicit union; `isSma200Signal` partitions.
+  signals: (TradeSignal | Sma200Signal)[];
   account: AccountState;
   closedPositions: Position[];
   options: OptionsAccountState;

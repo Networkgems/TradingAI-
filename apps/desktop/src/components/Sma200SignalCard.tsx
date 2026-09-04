@@ -7,8 +7,14 @@
 import type { TradeSignal, Sma200Signal } from '@trading-app/shared';
 import { fmt, fmtQuoteLevel, formatTime, signalLabel } from '../lib/format';
 
-/** Narrow a generic signal to an Sma200Signal. */
-export function isSma200Signal(sig: TradeSignal): sig is Sma200Signal {
+/**
+ * Narrow a feed signal to an Sma200Signal. TRA-3688 — `Sma200Signal` no longer
+ * extends `TradeSignal` (its `takeProfit`/`riskRewardRatio` are `null`: no
+ * exit model, no fabricated target), so the feed is the explicit union and
+ * this predicate is the partition point that keeps SMA-200 rows off the
+ * generic Target/R:R card.
+ */
+export function isSma200Signal(sig: TradeSignal | Sma200Signal): sig is Sma200Signal {
   return sig.type === 'sma200_pullback' || sig.type === 'sma200_reclaim';
 }
 

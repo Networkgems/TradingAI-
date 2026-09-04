@@ -408,7 +408,9 @@ function toSetup(s: {
   side: string;
   entryPrice?: number;
   stopLoss?: number;
-  takeProfit?: number;
+  // TRA-3688 — SMA-200 rows publish `takeProfit: null` (no exit model); the
+  // isFinite guard below maps that to "no target" exactly like `undefined`.
+  takeProfit?: number | null;
 }): BriefSetup {
   return {
     symbol: s.symbol,
@@ -416,7 +418,7 @@ function toSetup(s: {
     side: s.side,
     entryPrice: Number.isFinite(s.entryPrice) ? s.entryPrice : undefined,
     stopLoss: Number.isFinite(s.stopLoss) ? s.stopLoss : undefined,
-    takeProfit: Number.isFinite(s.takeProfit) ? s.takeProfit : undefined,
+    takeProfit: typeof s.takeProfit === 'number' && Number.isFinite(s.takeProfit) ? s.takeProfit : undefined,
   };
 }
 

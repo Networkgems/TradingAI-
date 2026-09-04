@@ -276,6 +276,42 @@ export interface RelativeValueSignal extends TradeSignal {
 }
 
 /**
+ * TRA-3688 — the literal stop rule an SMA-200 signal's `stopLoss` was computed
+ * under, stamped on every emitted record so a future stop variant cannot hide
+ * behind an unlabeled number.
+ */
+export type Sma200StopBasis = 'sma200_minus_1atr' | 'min_swinglow_sma200_minus_1p5atr';
+
+/** TRA-3688 S-3 — why a resting SMA-200 signal was voided off the feed. */
+export type Sma200VoidReason = 'bar_rollover' | 'price_drift';
+
+/**
+ * TRA-3688 S-3 — durable record of a voided SMA-200 signal. Voided signals are
+ * REMOVED from the feed and RECORDED here, never silently dropped, so the void
+ * rate is measurable (a silent drop is what made the original filing
+ * unmeasurable). Surfaced on `EngineState.sma200SignalVoids`.
+ */
+export interface Sma200SignalVoidRecord {
+  /** `id` of the voided signal. */
+  signalId: string;
+  symbol: string;
+  kind: 'sma200_pullback' | 'sma200_reclaim';
+  voidReason: Sma200VoidReason;
+  /** Daily bar the voided signal was computed on. */
+  barTimestamp?: number;
+  entryPrice: number;
+  /**
+   * `price_drift` only — the quote that breached the 0.5×ATR14 drift bound.
+   * Absent on `bar_rollover` (the void is calendar-driven, not price-driven).
+   */
+  lastPrice?: number;
+  /** ATR(14) ruler the drift bound was measured in (absent on legacy rows). */
+  atr14?: number;
+  /** Wall-clock (ms) the void was recorded. */
+  voidedAt: number;
+}
+
+/**
  * TRA-451 — signal emitted by the SMA-200 trend-filter scanner. Covers the
  * pullback-to-200 bounce (`sma200_pullback`) and the 200-SMA reclaim reversal
  * (`sma200_reclaim`), both computed on daily bars. `entryPrice` is the latest
@@ -286,10 +322,51 @@ export interface RelativeValueSignal extends TradeSignal {
  * TRA-460 — `sma200_pullback` (Signal 2 v2) cleared the TRA-455 acceptance
  * gate and the engine opens a live position off it; `sma200_reclaim`
  * (Signal 3) failed validation and stays display-only.
+ *
+ * TRA-3688 (S-2) — `takeProfit` and `riskRewardRatio` are `null` on every
+ * emitted record: there is NO exit model for these signals, so the old
+ * `entry + 2·risk` target and the literal `2` R:R were fabrications that
+ * consumers read as real (NBIS printed a +112% "target"). This interface
+ * therefore no longer `extends TradeSignal` directly — it overrides the two
+ * bracket fields as `number | null`. `null` means "no target"; renderers must
+ * print an explicit no-target state, never `0` / `NaN` / `-`. A `number` can
+ * appear only on legacy rows persisted before TRA-3688 (and those are dropped
+ * at snapshot import because they also lack the `atr14` ruler below).
  */
-export interface Sma200Signal extends TradeSignal {
+export interface Sma200Signal extends Omit<TradeSignal, 'takeProfit' | 'riskRewardRatio'> {
   type: 'sma200_pullback' | 'sma200_reclaim';
   side: 'buy';
+  /** TRA-3688 S-2b — always `null` on emit: no exit model, no target. */
+  takeProfit: number | null;
+  /** TRA-3688 S-2a — always `null` on emit: no exit model, no R:R. */
+  riskRewardRatio: number | null;
+  /**
+   * TRA-3688 C1 — the ATR(14) the engine actually used at the fire bar. The
+   * load-bearing field: a record that reports the ruler it used cannot be
+   * graded against the wrong one (the original filing got DOW wrong by 2x
+   * reaching for an external ATR).
+   */
+  atr14: number;
+  /**
+   * TRA-3688 C1 — stop distance in ATR14 units: `(entryPrice − stopLoss) /
+   * atr14`. For a pullback this equals `distAtr + 1.0` exactly.
+   */
+  stopAtr: number;
+  /** TRA-3688 C1 — literal stop rule in force (see {@link Sma200StopBasis}). */
+  stopBasis: Sma200StopBasis;
+  /**
+   * TRA-3688 C1/S-1 — the `SMA200_PULLBACK_MAX_DIST_ATR` gate value in force
+   * at fire time. Ships defaulting to `Infinity` (gate dark) until the sweep
+   * earns a finite number.
+   */
+  maxDistAtr: number;
+  /**
+   * TRA-3688 S-3a — the daily bar this signal is valid FOR (same value as
+   * `barTimestamp`). The signal is void the moment a newer daily bar exists
+   * for the symbol; expressed as a bar identity, not an hours threshold, so
+   * XETRA's session and NYSE's are both handled correctly.
+   */
+  validForBarTimestamp: number;
   /** RSI(14) at the fire bar. */
   rsi: number;
   /** (close − SMA200) / ATR(14) — distance to the 200-SMA in ATRs. */

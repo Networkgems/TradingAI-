@@ -12,7 +12,7 @@ import {
 } from './live-broker-position-drift.js';
 import { roundToCent } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Sma200SignalVoidRecord, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-3390 (impl child of TRA-2628) — the entry-path currency refusal. See
 // `quoteCurrencyEntryVerdict` below for where it is consulted.
@@ -84,6 +84,7 @@ import { withPhase, timeSyncPhase } from './phase-timing.js';
 import { TickExitWorkMeter, type TickExitWorkTerms } from './tick-exit-work.js';
 import { TickExitRegionMeter, classifyExitInterval, type TickExitRegionRthTerms } from './tick-exit-region.js';
 import { trySma200ScanSlot, releaseSma200ScanSlot } from './sma200-scan-admission.js';
+import { resolveSma200PullbackMaxDistAtr, sma200VoidVerdict } from './sma200-validity.js';
 import { getLatestReviewBlock } from './research-store.js';
 import { earningsInDaysSync } from './earnings-store.js';
 import {
@@ -645,7 +646,16 @@ export interface SymbolState {
 
 export interface EngineState {
   symbols: SymbolState[];
-  signals: TradeSignal[];
+  // TRA-3688 — SMA-200 rows carry null takeProfit/riskRewardRatio (no exit
+  // model), so the feed is the explicit union rather than TradeSignal alone.
+  signals: (TradeSignal | Sma200Signal)[];
+  /**
+   * TRA-3688 S-3 — voided SMA-200 signals (bar rollover / 0.5-ATR price
+   * drift), newest last, capped at 50. The measurable trace of the validity
+   * rule: an empty feed plus a populated void ledger reads "signals expired",
+   * not "scanner dead". Optional so pre-TRA-3688 fixtures still type-check.
+   */
+  sma200SignalVoids?: Sma200SignalVoidRecord[];
   /**
    * TRA-787 — SupertrendConfluence SHADOW channel. Observe-only signals the
    * supertrend engine computes off the live tape each tick. These are
@@ -2851,7 +2861,18 @@ export class SignalEngine {
   /** Wall-clock of the last `denominator-flip candidate` info line (rate limit). */
   private lastDenominatorFlipLogAt = 0;
   private candleCache: Map<string, Candle[]> = new Map();
-  private recentSignals: TradeSignal[] = [];
+  // TRA-3688 — `Sma200Signal` no longer extends `TradeSignal` (its takeProfit /
+  // riskRewardRatio are `null`: no exit model, no fabricated target), so the
+  // display feed is the explicit union.
+  private recentSignals: (TradeSignal | Sma200Signal)[] = [];
+  /**
+   * TRA-3688 S-3 — voided SMA-200 signals, newest last, capped. A voided
+   * signal is REMOVED from `recentSignals` and RECORDED here so the void rate
+   * is measurable — a silent drop is what made the original filing
+   * unmeasurable. Persisted in the snapshot so the witness survives a restart.
+   */
+  private sma200SignalVoids: Sma200SignalVoidRecord[] = [];
+  private static readonly SMA200_VOID_MAX = 50;
   /**
    * TRA-787 — per-symbol 5m candle series for the SupertrendConfluence shadow
    * scan, resampled from a deeper minute-bar pull than the ORB cache. Refreshed
@@ -6893,7 +6914,7 @@ export class SignalEngine {
    * D2 OOS grade + QuantTrader Stage-3 sign-off. Returns the decision so a
    * future D2 enforcement wiring can gate on `.gated` at the call site.
    */
-  private evaluateCatalystGateShadow(signal: TradeSignal, asOf: number): CatalystGateDecision {
+  private evaluateCatalystGateShadow(signal: TradeSignal | Sma200Signal, asOf: number): CatalystGateDecision {
     const decision = evaluateCatalystGate({
       symbol: signal.symbol,
       strategy: signal.type,
@@ -6935,10 +6956,57 @@ export class SignalEngine {
    * fresh pullback but no-ops behind the capital-gate manifest until the
    * strategy is registered as gate-passed.
    */
+  /**
+   * TRA-3688 S-3 — void resting SMA-200 signals for `symbol` against the given
+   * context (`latestBarTs` → S-3a bar rollover; `lastPrice` → S-3b 0.5-ATR
+   * drift). Voided rows are removed from the display feed and appended to
+   * {@link sma200SignalVoids} with their `voidReason` — removal without a
+   * record is the silent drop the spec forbids.
+   */
+  private voidSma200Signals(
+    symbol: string,
+    ctx: { latestBarTs?: number; lastPrice?: number },
+  ): void {
+    this.recentSignals = this.recentSignals.filter(sig => {
+      if (sig.symbol !== symbol) return true;
+      if (sig.type !== 'sma200_pullback' && sig.type !== 'sma200_reclaim') return true;
+      const s = sig as Sma200Signal;
+      const reason = sma200VoidVerdict(s, ctx);
+      if (reason === null) return true;
+      this.sma200SignalVoids.push({
+        signalId: s.id,
+        symbol: s.symbol,
+        kind: s.type,
+        voidReason: reason,
+        barTimestamp: s.barTimestamp,
+        entryPrice: s.entryPrice,
+        ...(reason === 'price_drift' ? { lastPrice: ctx.lastPrice } : {}),
+        ...(Number.isFinite(s.atr14) ? { atr14: s.atr14 } : {}),
+        voidedAt: Date.now(),
+      });
+      log.info('sma200 signal voided', {
+        component: 'sma200-scan', issue: 'TRA-3688',
+        sym: s.symbol, kind: s.type, voidReason: reason,
+        barTimestamp: s.barTimestamp,
+        ...(reason === 'price_drift'
+          ? { entryPrice: s.entryPrice, lastPrice: ctx.lastPrice, atr14: s.atr14 }
+          : { latestBarTs: ctx.latestBarTs }),
+      });
+      return false;
+    });
+    if (this.sma200SignalVoids.length > SignalEngine.SMA200_VOID_MAX) {
+      this.sma200SignalVoids.splice(0, this.sma200SignalVoids.length - SignalEngine.SMA200_VOID_MAX);
+    }
+  }
+
   private async runSma200Scan(symbols: string[]): Promise<void> {
     if (symbols.length === 0) return;
     const SCAN_BATCH = 5;
     let fired = 0;
+    // TRA-3688 S-1 — the max-dist gate value in force for this whole sweep.
+    // Resolved once per scan (not per symbol) so every signal fired by one
+    // sweep is stamped with the same `maxDistAtr`. Default `Infinity` = dark.
+    const pullbackMaxDistAtr = resolveSma200PullbackMaxDistAtr(process.env);
     for (let i = 0; i < symbols.length; i += SCAN_BATCH) {
       await Promise.all(
         symbols.slice(i, i + SCAN_BATCH).map(async (sym) => {
@@ -6953,8 +7021,13 @@ export class SignalEngine {
             return;
           }
           if (candles.length < SMA200_MIN_BARS) return;
-          const evalResult = evaluateSma200(sym, candles);
+          const evalResult = evaluateSma200(sym, candles, { pullbackMaxDistAtr });
           const latestBarTs = candles[candles.length - 1].timestamp;
+          // TRA-3688 S-3a — bar-rollover voiding, run on every scanned symbol
+          // whether or not anything fired: a resting signal computed on an
+          // OLDER daily bar is void the moment this fetch proves a newer bar
+          // exists. Removed AND recorded (never silently dropped).
+          this.voidSma200Signals(sym, { latestBarTs });
           for (const result of evalResult.signals) {
             const key = `${sym}:${result.kind}`;
             const latestBarDay = sma200BarDay(latestBarTs);
@@ -6988,7 +7061,6 @@ export class SignalEngine {
                 continue;
               }
             }
-            const risk = result.entry - result.stop;
             const signal: Sma200Signal = {
               id: randomUUID(),
               symbol: sym,
@@ -6996,10 +7068,13 @@ export class SignalEngine {
               side: 'buy',
               entryPrice: result.entry,
               stopLoss: result.stop,
-              // Display-only 2R projection — the spec defines no profit
-              // target (QuantTrader's backtest owns the exit model).
-              takeProfit: risk > 0 ? result.entry + 2 * risk : result.entry,
-              riskRewardRatio: 2,
+              // TRA-3688 S-2 — there is NO exit model for these signals, so
+              // there is no target and no R:R to report. The old display-only
+              // `entry + 2·risk` projection was a width times a constant that
+              // consumers read as a forecast (NBIS: +112%). A null cannot be
+              // mis-ranked; a fabricated 540.55 can.
+              takeProfit: null,
+              riskRewardRatio: null,
               timestamp: Date.now(),
               mode: this.mode,
               rsi: result.rsi,
@@ -7010,6 +7085,13 @@ export class SignalEngine {
               // TRA-1926 — source daily-bar time, used by the restart-proof
               // dedupe above and by `importTradeSnapshot`'s debounce rehydrate.
               barTimestamp: latestBarTs,
+              // TRA-3688 C1 — the record reports its own ruler.
+              atr14: result.atr14,
+              stopAtr: result.stopAtr,
+              stopBasis: result.stopBasis,
+              maxDistAtr: result.maxDistAtr,
+              // TRA-3688 S-3a — the daily bar this signal is valid FOR.
+              validForBarTimestamp: latestBarTs,
             };
             this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
             if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
@@ -7172,6 +7254,21 @@ export class SignalEngine {
     // Entry = the signal's daily close (carried on `entryPrice`).
     const price = signal.entryPrice;
 
+    // TRA-3688 S-2 — the PUBLISHED record carries `takeProfit: null` /
+    // `riskRewardRatio: null` (no exit model, no fabricated target). The
+    // paper/live order seam below, however, keeps the TRA-1289 forward-test
+    // book's historical 2R bracket, so its accrual stays comparable across the
+    // spec change: the 2R level is derived HERE, at the order seam, consumed
+    // only by the bracket/paper mechanics, and never published on the signal.
+    // Defining a real exit model is QuantTrader's backtest deliverable, not
+    // this ticket's.
+    const bracketRisk = signal.entryPrice - signal.stopLoss;
+    const orderSignal: TradeSignal = {
+      ...signal,
+      takeProfit: bracketRisk > 0 ? signal.entryPrice + 2 * bracketRisk : signal.entryPrice,
+      riskRewardRatio: 2,
+    };
+
     // TRA-1408 — per-name same-session open cap (DEMO-scoped, DARK until armed).
     const churnCap = this.churnOpenCapVerdict(signal.symbol);
     if (churnCap.blocked) {
@@ -7183,15 +7280,18 @@ export class SignalEngine {
     // TRA-1301 (Rule 5) — correlated-exposure cap on the SMA-200 pullback swing
     // entry, consulted before the broker order (shares the equity chokepoint
     // helper). DARK until CORRELATED_EXPOSURE_CAP_ENABLED is armed.
-    const correlatedCapScale = this.applyEquityCorrelatedCap(signal, price);
+    const correlatedCapScale = this.applyEquityCorrelatedCap(orderSignal, price);
     if (correlatedCapScale === null) {
+      // The cap helper stamps its skip reason on the signal it was handed —
+      // mirror it onto the PUBLISHED feed row, not just the order-seam copy.
+      if (orderSignal.signalSkipReason) signal.signalSkipReason = orderSignal.signalSkipReason;
       recordEquityEntryRejected(funnelMode, funnelEngineId, 'correlated_exposure_cap');
       return;
     }
 
     let liveOrderId: number | string | null = null;
     if (this.mode === 'live') {
-      const placement = await this.placeTradierEquityBracket(signal, price, correlatedCapScale);
+      const placement = await this.placeTradierEquityBracket(orderSignal, price, correlatedCapScale);
       if (!placement.ok) {
         signal.liveSkipReason = placement.reason;
         recordEquityEntryRejected(funnelMode, funnelEngineId, 'live_order_rejected');
@@ -7204,10 +7304,10 @@ export class SignalEngine {
     }
 
     const pos = this.mode === 'live'
-      ? this.openLiveEquityMirror(signal, price, liveOrderId!, correlatedCapScale)
+      ? this.openLiveEquityMirror(orderSignal, price, liveOrderId!, correlatedCapScale)
       // TRA-1001 — the demo book consumes the same tighten-only autopilot
       // throttle as the live path (folded into the sizing scalar below).
-      : this.account.openPosition(signal, price, this.activeRiskSizingMultiplier('equity_demo') * correlatedCapScale);
+      : this.account.openPosition(orderSignal, price, this.activeRiskSizingMultiplier('equity_demo') * correlatedCapScale);
     if (pos) {
       pos.mode = this.mode;
       // TRA-2333 — make this fill's throttle trim attributable (always stamped).
@@ -7220,7 +7320,7 @@ export class SignalEngine {
       this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
       recordEquityEntryAdmitted(funnelMode, funnelEngineId); // TRA-1768 — reached the book
       // TRA-1980 — SHADOW-first pre-trade liquidity record on the live-equity mirror.
-      if (this.mode === 'live') void this.recordEquityLiquidityShadow(signal, pos);
+      if (this.mode === 'live') void this.recordEquityLiquidityShadow(orderSignal, pos);
     } else {
       recordEquityEntryRejected(funnelMode, funnelEngineId, 'sizing_returned_no_position'); // TRA-1768
     }
@@ -15643,21 +15743,40 @@ export class SignalEngine {
    */
   private pruneInvalidSignals(prices: Map<string, number>): void {
     const now = Date.now();
+    // TRA-3688 S-3b — the drift backstop runs FIRST, per symbol, so a voided
+    // SMA-200 row leaves a `price_drift` record rather than falling through to
+    // any silent filter below. S-3a (bar rollover) lives in the daily scan,
+    // which is where a newer bar is actually observed.
+    const sma200Symbols = new Set<string>();
+    for (const sig of this.recentSignals) {
+      if (sig.type === 'sma200_pullback' || sig.type === 'sma200_reclaim') sma200Symbols.add(sig.symbol);
+    }
+    for (const sym of sma200Symbols) {
+      const lastPrice = prices.get(sym);
+      if (lastPrice !== undefined) this.voidSma200Signals(sym, { lastPrice });
+    }
     this.recentSignals = this.recentSignals.filter(sig => {
       // TRA-451 — SMA-200 signals fire on daily bars and get a multi-day TTL
       // so they survive the 30-minute intraday-signal window.
       const isSma200 = sig.type === 'sma200_pullback' || sig.type === 'sma200_reclaim';
       const ttl = isSma200 ? SMA200_SIGNAL_VALID_MS : SIGNAL_VALID_MS;
       if (sig.timestamp < now - ttl) return false;
+      // TRA-3688 — SMA-200 validity is S-3a/S-3b above (`takeProfit` is null
+      // now, so the generic stop/target prune below cannot apply; the 0.5-ATR
+      // drift bound triggers well before a ≥1-ATR stop would anyway).
+      if (isSma200) return true;
       if (sig.type === 'otm_mispricing' || sig.type === 'relative_value') return true;
       const price = prices.get(sig.symbol);
       if (!price) return true;
+      // `takeProfit` is nullable on the union only because of the SMA-200
+      // rows, which never reach here — narrowed explicitly for the compiler.
+      const takeProfit = sig.takeProfit;
       if (sig.side === 'buy') {
         if (price <= sig.stopLoss) return false;
-        if (price >= sig.takeProfit) return false;
+        if (takeProfit !== null && price >= takeProfit) return false;
       } else {
         if (price >= sig.stopLoss) return false;
-        if (price <= sig.takeProfit) return false;
+        if (takeProfit !== null && price <= takeProfit) return false;
       }
       return true;
     });
@@ -18173,7 +18292,7 @@ export class SignalEngine {
   }
 
   /** Emit a new-signal alert. Accepts equity or RV option signals. */
-  private emitSignalAlert(signal: TradeSignal | RelativeValueSignal): void {
+  private emitSignalAlert(signal: TradeSignal | RelativeValueSignal | Sma200Signal): void {
     if (!this.alertUsername) return;
     const market: 'stocks' | 'options' = signal.type === 'relative_value' ? 'options' : 'stocks';
     emitAlert({
@@ -18185,7 +18304,9 @@ export class SignalEngine {
       side: signal.side,
       entryPrice: signal.entryPrice,
       stopLoss: signal.stopLoss,
-      takeProfit: signal.takeProfit,
+      // TRA-3688 — SMA-200 rows carry `takeProfit: null` (no exit model); the
+      // alert renderer's `!= null` guard prints no TP level for those.
+      takeProfit: signal.takeProfit ?? undefined,
     });
   }
 
@@ -20348,6 +20469,8 @@ export class SignalEngine {
       return {
         symbols,
         signals: scopedSignals,
+        // TRA-3688 S-3 — voided SMA-200 signals (the measurable removal trace).
+        sma200SignalVoids: this.sma200SignalVoids,
         // TRA-787 — observe-only supertrend shadow channel (never routed).
         supertrendShadowSignals: this.supertrendShadowSignals,
         // TRA-1972 — observe-only catalyst earnings/macro proximity gate decisions.
@@ -20405,6 +20528,8 @@ export class SignalEngine {
     return {
       symbols,
       signals: scopedSignals,
+      // TRA-3688 S-3 — voided SMA-200 signals (the measurable removal trace).
+      sma200SignalVoids: this.sma200SignalVoids,
       // TRA-787 — observe-only supertrend shadow channel (never routed).
       supertrendShadowSignals: this.supertrendShadowSignals,
       // TRA-1972 — observe-only catalyst earnings/macro proximity gate decisions.
@@ -20780,7 +20905,12 @@ export class SignalEngine {
   /** Snapshot trade history + accounts for durable storage (TRA-140). */
   exportTradeSnapshot(): {
     closedPositions: Position[];
-    recentSignals: TradeSignal[];
+    recentSignals: (TradeSignal | Sma200Signal)[];
+    /**
+     * TRA-3688 S-3 — persisted void ledger so the "removed and recorded"
+     * witness survives a restart. Optional: absent on pre-TRA-3688 snapshots.
+     */
+    sma200SignalVoids?: Sma200SignalVoidRecord[];
     dailySignals: DailySignalRecord[];
     positionSignalType: Array<[string, SignalType]>;
     account: ReturnType<PaperAccount['exportSnapshot']>;
@@ -20812,6 +20942,7 @@ export class SignalEngine {
       closedPositions: [...this.allClosedPositions],
       lastArchivedAt: this.lastArchivedAt,
       recentSignals: [...this.recentSignals],
+      sma200SignalVoids: [...this.sma200SignalVoids],
       dailySignals: [...this.dailySignals],
       positionSignalType: Array.from(this.positionSignalType.entries()),
       account: this.account.exportSnapshot(),
@@ -20897,7 +21028,28 @@ export class SignalEngine {
     } else {
       this.allClosedPositions = [...snap.closedPositions];
     }
-    this.recentSignals = [...snap.recentSignals];
+    // TRA-3688 — drop LEGACY SMA-200 rows (persisted before the spec: no
+    // `atr14` ruler, a fabricated `takeProfit`/`riskRewardRatio: 2`) at the
+    // import boundary. A restored legacy row would violate the new record
+    // contract on the very state route it is graded on; dropping it here is
+    // safe because the boot scan re-fires the current daily bar's signal with
+    // the full new shape (the TRA-1926 dedupe below only suppresses SAME-day
+    // duplicates still on the feed, and these rows are no longer on it).
+    const legacySma200 = snap.recentSignals.filter(s =>
+      (s.type === 'sma200_pullback' || s.type === 'sma200_reclaim')
+      && !Number.isFinite((s as Sma200Signal).atr14),
+    );
+    this.recentSignals = snap.recentSignals.filter(s => !legacySma200.includes(s));
+    if (legacySma200.length > 0) {
+      log.info('TRA-3688: dropped pre-spec sma200 rows at snapshot import (boot scan re-fires current-bar signals with the new record shape)', {
+        component: 'sma200-scan',
+        dropped: legacySma200.length,
+        symbols: legacySma200.map(s => s.symbol),
+      });
+    }
+    this.sma200SignalVoids = Array.isArray(snap.sma200SignalVoids)
+      ? [...snap.sma200SignalVoids]
+      : [];
     // TRA-1926 — rebuild the SMA-200 one-per-symbol-per-bar debounce from the
     // restored feed. The map is otherwise in-memory only, so a redeploy wipes it
     // and the boot scan re-fires every daily-bar signal still on the feed (the

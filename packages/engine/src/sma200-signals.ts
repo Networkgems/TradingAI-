@@ -17,7 +17,7 @@
  * (reclaim) failed validation and stays display-only. This module only
  * computes the signals — the entry wiring lives in the SignalEngine.
  */
-import type { Candle } from '@trading-app/shared';
+import type { Candle, Sma200StopBasis } from '@trading-app/shared';
 import { atr } from './indicators/atr.js';
 import { rsi } from './indicators/rsi.js';
 
@@ -85,6 +85,44 @@ export interface Sma200SignalResult {
   label: string;
   /** Timestamp of the fire (latest) daily bar. */
   timestamp: number;
+  /**
+   * TRA-3688 C1 — the ATR(14) the engine actually used at the fire bar. The
+   * record reports its own ruler so no consumer ever reaches for an external
+   * ATR (which is how the TRA-3688 filing got DOW wrong by 2x).
+   */
+  atr14: number;
+  /**
+   * TRA-3688 C1 — stop distance in ATR14: `(entry − stop) / atr14`. For the
+   * pullback this is exactly `distAtr + 1.0` (stop = SMA200 − 1·ATR); for the
+   * reclaim it is the actual measured distance of `min(swingLow, SMA200 −
+   * 1.5·ATR)` and carries no closed-form identity.
+   */
+  stopAtr: number;
+  /** TRA-3688 C1 — literal stop rule this signal's `stop` was computed under. */
+  stopBasis: Sma200StopBasis;
+  /**
+   * TRA-3688 S-1 — the pullback max-dist gate value in force at fire time
+   * (`Infinity` while the gate ships dark). Stamped on BOTH kinds so a graded
+   * record always states the admission regime it fired under.
+   */
+  maxDistAtr: number;
+}
+
+/**
+ * TRA-3688 S-1 — optional evaluation knobs.
+ */
+export interface Sma200EvalOptions {
+  /**
+   * Entry-side gate on the pullback fire bar: reject the signal unless
+   * `distAtr <= pullbackMaxDistAtr`. This bounds stop distance to
+   * `pullbackMaxDistAtr + 1.0` ATR while leaving the stop STRUCTURAL — the
+   * defect it kills is upstream of the stop (a close 4.3 ATR above the
+   * 200-SMA is a momentum breakout wearing a pullback's clothes, not a
+   * pullback). Defaults to `Infinity`: gate dark, zero behavior change. The
+   * finite number is a backtest output (QuantTrader's sweep), never asserted
+   * here.
+   */
+  pullbackMaxDistAtr?: number;
 }
 
 /** Full evaluation result for one symbol's daily series. */
@@ -142,7 +180,18 @@ function rangeOf(candles: Candle[], start: number, end: number): number {
  * symbol's daily series. `candles` must be chronologically ascending; only the
  * latest bar is treated as "today".
  */
-export function evaluateSma200(symbol: string, candles: Candle[]): Sma200Evaluation {
+export function evaluateSma200(
+  symbol: string,
+  candles: Candle[],
+  opts: Sma200EvalOptions = {},
+): Sma200Evaluation {
+  // TRA-3688 S-1 — a non-finite or non-positive gate value means "gate dark",
+  // never 0 (a 0 would reject every pullback silently — the TRA-3440 class of
+  // defect this parse guard exists to block).
+  const pullbackMaxDistAtr =
+    Number.isFinite(opts.pullbackMaxDistAtr) && (opts.pullbackMaxDistAtr as number) > 0
+      ? (opts.pullbackMaxDistAtr as number)
+      : Infinity;
   const empty: Sma200Evaluation = {
     symbol,
     indicators: null,
@@ -223,7 +272,13 @@ export function evaluateSma200(symbol: string, candles: Candle[]): Sma200Evaluat
   const trendStrength = sma200Slope20 >= SMA200_PULLBACK_MIN_SLOPE20;
   // Trigger: a decisive up-close above the highs of *both* prior bars.
   const decisiveUpClose = today.close > candles[t - 1].high && today.close > candles[t - 2].high;
-  if (trendQuality && trendStrength && pullbackTouched && holdConfirmed && decisiveUpClose) {
+  // TRA-3688 S-1 — entry-side max-distance gate: a fire bar whose CLOSE sits
+  // more than `pullbackMaxDistAtr` ATRs above the 200-SMA is REJECTED, not
+  // clamped. Clamping would park the stop mid-air above the MA the strategy's
+  // premise says is the support (NBIS worked example: a 3.0-ATR clamp puts the
+  // stop 34.76 ABOVE the SMA200). Dark by default (`Infinity`).
+  const withinMaxDist = distAtr <= pullbackMaxDistAtr;
+  if (trendQuality && trendStrength && pullbackTouched && holdConfirmed && decisiveUpClose && withinMaxDist) {
     const stop = sma200 - 1.0 * atr14;
     // TRA-520 — guard against a non-positive / above-entry stop. When daily
     // data is spiky (an outlier bar inflates ATR(14) past the SMA200 level)
@@ -243,6 +298,12 @@ export function evaluateSma200(symbol: string, candles: Candle[]): Sma200Evaluat
         // mis-decoded downstream and rendered as mojibake.
         label: 'continuation - trend was already up',
         timestamp: today.timestamp,
+        // TRA-3688 C1 — record the ruler. `stopAtr` is measured off the actual
+        // stop, which for the pullback equals `distAtr + 1.0` exactly.
+        atr14,
+        stopAtr: (today.close - stop) / atr14,
+        stopBasis: 'sma200_minus_1atr',
+        maxDistAtr: pullbackMaxDistAtr,
       });
     }
   }
@@ -297,6 +358,14 @@ export function evaluateSma200(symbol: string, candles: Candle[]): Sma200Evaluat
         ? 'trend-change reclaim - golden cross confirmed'
         : 'trend-change reclaim',
       timestamp: today.timestamp,
+      // TRA-3688 C1 — record the ruler. The reclaim's stop has no closed-form
+      // ATR identity (`min(swingLow, sma200 − 1.5·ATR)`), so `stopAtr` is the
+      // measured distance; its stop rule itself is NOT ruled on by TRA-3688
+      // (0 live reclaim rows to measure — separate ticket when one fires).
+      atr14,
+      stopAtr: (today.close - stop) / atr14,
+      stopBasis: 'min_swinglow_sma200_minus_1p5atr',
+      maxDistAtr: pullbackMaxDistAtr,
     });
   }
 

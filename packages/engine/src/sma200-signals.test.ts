@@ -155,7 +155,7 @@ describe('evaluateSma200 — Signal 1 trend/quality filter', () => {
  * bar's high over today's close so the decisive-up-close trigger cannot fire.
  */
 function pullbackSeries(
-  opts: { flattenSlope?: boolean; maskTrigger?: boolean } = {},
+  opts: { flattenSlope?: boolean; maskTrigger?: boolean; spread?: number } = {},
 ): Candle[] {
   // 100 bars @ 70, then a 144-bar grind up ⇒ rising SMA200 well below price.
   const base = flat(100, 70);
@@ -174,7 +174,10 @@ function pullbackSeries(
   // Mask the trigger: the t-1 bar's high towers above today's close.
   const highs: number[] = [];
   if (opts.maskTrigger) highs[closes.length - 2] = 112;
-  return buildSeries(closes, { spread: 1, lows, highs });
+  // TRA-3688 — a wider per-bar spread inflates ATR(14) without moving any
+  // close, which lowers dist_atr on the same fire-bar shape: spread 1 ⇒
+  // dist_atr ≈ 4.20 (the reject arm), spread 4 ⇒ ≈ 1.66 (the admit arm).
+  return buildSeries(closes, { spread: opts.spread ?? 1, lows, highs });
 }
 
 describe('evaluateSma200 — Signal 2 v2 pullback-to-200 bounce', () => {
@@ -218,6 +221,94 @@ describe('evaluateSma200 — Signal 2 v2 pullback-to-200 bounce', () => {
     const closes = [...base, ...tail].slice(0, 260);
     const res = evaluateSma200('TEST', buildSeries(closes, { spread: 1.5 }));
     expect(res.signals.find(s => s.kind === 'sma200_pullback')).toBeUndefined();
+  });
+});
+
+// TRA-3688 — C1 record-the-ruler fields + the S-1 max-dist entry gate.
+describe('evaluateSma200 — TRA-3688 C1 ruler fields', () => {
+  it('stamps atr14 / stopAtr / stopBasis / maxDistAtr on a pullback, with both AC3 identities', () => {
+    const candles = pullbackSeries();
+    const res = evaluateSma200('TEST', candles);
+    const sig = res.signals.find(s => s.kind === 'sma200_pullback')!;
+    const ind = res.indicators!;
+    // AC2 shape — finite and positive, not merely non-null (a NaN passes a
+    // null check and lands in the permissive branch, TRA-3440).
+    expect(Number.isFinite(sig.atr14) && sig.atr14 > 0).toBe(true);
+    expect(Number.isFinite(sig.stopAtr) && sig.stopAtr > 0).toBe(true);
+    expect(sig.atr14).toBeCloseTo(ind.atr14, 10);
+    expect(sig.stopBasis).toBe('sma200_minus_1atr');
+    // Gate dark by default ⇒ the stamped regime is Infinity.
+    expect(sig.maxDistAtr).toBe(Infinity);
+    // AC3, both equalities. The first (stopAtr = distAtr + 1) can pass even
+    // with a wrong atr14; only the second ((entry − stop) / atr14 = stopAtr)
+    // separates a correct ruler from a plausible-but-wrong one.
+    expect(Math.abs(sig.stopAtr - (sig.distAtr + 1.0))).toBeLessThan(1e-6);
+    expect(Math.abs((sig.entry - sig.stop) / sig.atr14 - sig.stopAtr)).toBeLessThan(1e-3);
+  });
+
+  it('stamps the ruler on a reclaim too — stopAtr is the MEASURED distance (no +1 identity)', () => {
+    const { candles } = reclaimSeries();
+    const res = evaluateSma200('TEST', candles);
+    const sig = res.signals.find(s => s.kind === 'sma200_reclaim')!;
+    expect(Number.isFinite(sig.atr14) && sig.atr14 > 0).toBe(true);
+    expect(sig.stopBasis).toBe('min_swinglow_sma200_minus_1p5atr');
+    expect(sig.maxDistAtr).toBe(Infinity);
+    // AC3's second (load-bearing) equality holds for the reclaim as well.
+    expect(Math.abs((sig.entry - sig.stop) / sig.atr14 - sig.stopAtr)).toBeLessThan(1e-3);
+  });
+});
+
+describe('evaluateSma200 — TRA-3688 S-1 max-dist gate (ships DARK)', () => {
+  // AC4 requires BOTH arms: a gate exercised only on its reject arm proves
+  // nothing. spread 1 puts the fire bar ≈ 4.2 ATRs over the 200-SMA (the
+  // NBIS/KOPN shape — a momentum breakout wearing a pullback's clothes);
+  // spread 4 puts the SAME bar shape ≈ 1.66 ATRs over.
+  it('MAX_DIST_ATR = 2.0 REJECTS a fire bar with dist_atr ≈ 4.2', () => {
+    const candles = pullbackSeries();
+    // Control: the identical series fires with the gate dark…
+    const ungated = evaluateSma200('TEST', candles);
+    const fired = ungated.signals.find(s => s.kind === 'sma200_pullback');
+    expect(fired).toBeDefined();
+    expect(fired!.distAtr).toBeGreaterThan(2.0);
+    expect(fired!.distAtr).toBeCloseTo(4.2, 0);
+    // …so the gate is the ONLY thing standing between this bar and the feed.
+    const gated = evaluateSma200('TEST', candles, { pullbackMaxDistAtr: 2.0 });
+    expect(gated.signals.find(s => s.kind === 'sma200_pullback')).toBeUndefined();
+  });
+
+  it('MAX_DIST_ATR = 2.0 ADMITS a fire bar with dist_atr ≈ 1.66, stamped with the gate value', () => {
+    const candles = pullbackSeries({ spread: 4 });
+    const res = evaluateSma200('TEST', candles, { pullbackMaxDistAtr: 2.0 });
+    const sig = res.signals.find(s => s.kind === 'sma200_pullback');
+    expect(sig).toBeDefined();
+    expect(sig!.distAtr).toBeLessThan(2.0);
+    expect(sig!.distAtr).toBeCloseTo(1.66, 1);
+    expect(sig!.maxDistAtr).toBe(2.0);
+    // The stop stays STRUCTURAL under the gate — reject-not-clamp.
+    const ind = res.indicators!;
+    expect(sig!.stop).toBeCloseTo(ind.sma200 - ind.atr14);
+  });
+
+  it('the shipped default (no opts) is byte-identical to an explicit Infinity — zero behavior change', () => {
+    const candles = pullbackSeries();
+    const dflt = evaluateSma200('TEST', candles);
+    const inf = evaluateSma200('TEST', candles, { pullbackMaxDistAtr: Infinity });
+    expect(dflt.signals).toEqual(inf.signals);
+    expect(dflt.signals.length).toBeGreaterThan(0);
+  });
+
+  it('a non-positive or non-finite gate value means DARK, never reject-everything (TRA-3440 guard)', () => {
+    const candles = pullbackSeries();
+    for (const bad of [0, -1, NaN]) {
+      const res = evaluateSma200('TEST', candles, { pullbackMaxDistAtr: bad });
+      expect(res.signals.find(s => s.kind === 'sma200_pullback')).toBeDefined();
+    }
+  });
+
+  it('does not gate the reclaim (S-1 is pullback-only)', () => {
+    const { candles } = reclaimSeries();
+    const res = evaluateSma200('TEST', candles, { pullbackMaxDistAtr: 0.001 });
+    expect(res.signals.find(s => s.kind === 'sma200_reclaim')).toBeDefined();
   });
 });
 

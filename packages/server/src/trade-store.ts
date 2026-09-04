@@ -4,7 +4,7 @@ import { existsSync } from 'fs';
 import { constants as FS } from 'fs';
 import { join, dirname, basename } from 'path';
 import { accountDeletedAt, DELETED_ACCOUNTS_FILENAME } from './deleted-accounts.js';
-import type { AccountMode, Position, TradeSignal, OptionPosition, SignalType, TradierEnv } from '@trading-app/shared';
+import type { AccountMode, Position, TradeSignal, Sma200Signal, Sma200SignalVoidRecord, OptionPosition, SignalType, TradierEnv } from '@trading-app/shared';
 import type { DailySignalRecord } from './reports/eod-report.js';
 import type { PaperAccountSnapshot } from './paper-account.js';
 import { isEphemeralDataDir, resolveDataDir } from './data-dir.js';
@@ -162,7 +162,15 @@ export interface StocksTradeSnapshot {
   savedAt: string;
   openPositions: Position[];
   closedPositions: Position[];
-  recentSignals: TradeSignal[];
+  // TRA-3688 — SMA-200 rows carry null takeProfit/riskRewardRatio, so the
+  // persisted feed is the explicit union.
+  recentSignals: (TradeSignal | Sma200Signal)[];
+  /**
+   * TRA-3688 S-3 — voided SMA-200 signals (`bar_rollover` / `price_drift`),
+   * persisted so the "removed AND recorded" witness survives a restart.
+   * Absent on snapshots written before the field.
+   */
+  sma200SignalVoids?: Sma200SignalVoidRecord[];
   dailySignals: DailySignalRecord[];
   positionSignalType: Array<[string, SignalType]>; // serialized Map
   /**

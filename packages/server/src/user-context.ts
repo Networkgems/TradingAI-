@@ -1083,6 +1083,8 @@ async function createUserContext(username: string): Promise<UserContext> {
       engine.importTradeSnapshot({
         closedPositions: stocksSnap.closedPositions ?? [],
         recentSignals: stocksSnap.recentSignals ?? [],
+        // TRA-3688 S-3 — restore the void ledger so the witness survives a boot.
+        sma200SignalVoids: stocksSnap.sma200SignalVoids ?? [],
         dailySignals: stocksSnap.dailySignals ?? [],
         positionSignalType: stocksSnap.positionSignalType ?? [],
         // TRA-2629 — routed through the single durability seam in `trade-store`.
@@ -1316,6 +1318,8 @@ export async function persistStocksNow(ctx: UserContext): Promise<void> {
       openPositions: snap.account.openPositions,
       closedPositions: snap.closedPositions,
       recentSignals: snap.recentSignals,
+      // TRA-3688 S-3 — persist the void ledger (removed AND recorded).
+      sma200SignalVoids: snap.sma200SignalVoids,
       dailySignals: snap.dailySignals,
       positionSignalType: snap.positionSignalType,
       options: snap.options,

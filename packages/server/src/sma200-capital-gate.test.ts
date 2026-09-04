@@ -42,8 +42,9 @@ function makePullbackSignal(overrides: Partial<Sma200Signal> = {}): Sma200Signal
     side: 'buy',
     entryPrice: 108,
     stopLoss: 90,
-    takeProfit: 144,
-    riskRewardRatio: 2,
+    // TRA-3688 S-2 — no exit model, no target: both null on every emitted row.
+    takeProfit: null,
+    riskRewardRatio: null,
     timestamp: TRADING_TIME,
     mode: 'live',
     rsi: 60,
@@ -51,6 +52,13 @@ function makePullbackSignal(overrides: Partial<Sma200Signal> = {}): Sma200Signal
     trendQuality: true,
     goldenCross: true,
     context: 'continuation — pullback-to-200 bounce',
+    // TRA-3688 C1 — the record reports its own ruler: (108 − 90) / 7.2 = 2.5
+    // = distAtr + 1.0 exactly, per the pullback stop identity.
+    atr14: 7.2,
+    stopAtr: 2.5,
+    stopBasis: 'sma200_minus_1atr',
+    maxDistAtr: Infinity,
+    validForBarTimestamp: TRADING_TIME,
     ...overrides,
   };
 }
