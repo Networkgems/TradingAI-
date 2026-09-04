@@ -123,6 +123,7 @@ import {
 } from '../conviction-dca-ledger.js';
 import { summarizeChurnBrake, summarizeChurnBrakeGuard } from '../churn-brake-ledger.js';
 import { summarizeDirectionalGate, summarizeDirectionalArm } from '../directional-open-ledger.js';
+import { summarizeRvScanCensus } from '../rv-scan-census-ledger.js'; // TRA-4350
 import { summarizeEntryGreeksGate } from '../entry-greeks-ledger.js';
 import { RV_LONG_DELTA_FLOOR } from '@trading-app/engine';
 import { summarizeCostAwareGate } from '../cost-aware-gate-ledger.js';
@@ -7169,6 +7170,43 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         + '`reachable`, `accountClass` and `books` are exact from the first tick — grade '
         + 'on those, never on an exact tick count.',
       armRetentionDays: 30,
+
+      // ── TRA-4350 — the RETAINED per-ET-day scan census ────────────────────
+      //
+      // `armByEtDay` above answers "could the pass REACH this book". This answers
+      // the next question down, which nothing on the box could answer before:
+      // "and what did it DECIDE". The option journal held zero opens in either
+      // book from 2026-09-01T19:08:14Z to the 09-04 filing, and all three causes
+      // rendered as that same zero — ran-and-declined, never-ran, and
+      // passed-but-never-journalled. `paths[].lastScan` carries exactly the right
+      // columns but holds ONE cycle, and `scanCountSinceBoot` is a since-boot
+      // latch on a box the watchdog self-restarts 6–12 times a session
+      // (TRA-4158), so by the time anyone reads this route the evidence is gone.
+      //
+      // Reading it: `state` is the discriminator. `ran_and_declined` +
+      // `rejectionsByGate` names the gate that consumed the candidates;
+      // `passed_but_no_open` is the journal-side failure and must never be pooled
+      // with a drought; `ran_unfed` means the loop turned over an empty universe,
+      // so the cause is upstream of every gate on this path. An ABSENT cell is
+      // the absence of a reading — not a zero, and not `ran_unfed`.
+      censusByEtDay: summarizeRvScanCensus(),
+      censusNote:
+        'TRA-4350. The retained twin of `paths[].lastScan`, which holds ONE cycle and is '
+        + 'wiped by every restart. Keyed by (ET day × path × accountClass × mode), summed '
+        + 'across boots, retained on disk 30d. `state` separates the three readings that '
+        + 'were previously the same zero: `ran_and_declined` (a drought — '
+        + '`rejectionsByGate` names which gate), `passed_but_no_open` (candidates cleared '
+        + 'and no open reached the journal — a WRITER fault, never a drought), `ran_unfed` '
+        + '(the loop turned over an empty universe, so look upstream of this path) and '
+        + '`ran_and_opened`. An ABSENT (etDay, path, accountClass) cell means no book of '
+        + 'that class completed a pass — that is the absence of a reading, NOT a zero; '
+        + 'read it against `armByEtDay` to tell an unreachable pass from an idle one. '
+        + '`scans`/`candidatesEvaluated` are LOWER BOUNDS (5-min flush throttle, and the '
+        + 'watchdog kills this process mid-otm-scan routinely); `opensPlaced` is flushed '
+        + 'on sight precisely so a session that TRADED can never read back as a drought. '
+        + 'Books are attributed by class because ~63 QA fixture books share this process '
+        + 'with the desk (TRA-2355) — a non-zero `fixture` cell says nothing about `desk`.',
+      censusRetentionDays: 30,
     });
   });
 

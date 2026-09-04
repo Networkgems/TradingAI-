@@ -306,6 +306,7 @@ import {
 import { hydrateScaleoutLadderFromDisk } from './scaleout-ladder-ledger.js';
 import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
 import { hydrateChurnBrakeGuardFromDisk } from './churn-brake-ledger.js';
+import { hydrateRvScanCensusFromDisk } from './rv-scan-census-ledger.js'; // TRA-4350
 import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 // TRA-4343 — the durable entry-site census + the since-boot vacuity disclosure.
 import { hydrateEntrySiteCensusFromDisk } from './entry-site-census-ledger.js';
@@ -4896,6 +4897,23 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
       records: h.records,
       rejects: h.rejects,
       days: h.days,
+    });
+  }
+}
+
+// TRA-4350 — hydrate the RETAINED per-ET-day scan census before any pass runs, so
+// a mid-session restart ADDS to the day instead of resetting it. Without this the
+// route's census would be a since-boot latch wearing a durable name, which is the
+// exact failure it was built to fix: on 2026-09-02..09-04 the option journal held
+// zero opens in either book and NOTHING on the box could say whether the engine
+// had run, declined, or never scanned.
+{
+  const h = hydrateRvScanCensusFromDisk(DATA_DIR);
+  if (h.tallies > 0 || h.dropped > 0) {
+    log.info('rv-scan per-ET-day census hydrated (TRA-4350)', {
+      tallies: h.tallies,
+      days: h.days,
+      dropped: h.dropped,
     });
   }
 }

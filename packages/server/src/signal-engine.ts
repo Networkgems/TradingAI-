@@ -156,7 +156,11 @@ import {
 import { resolveCloseGrant } from './tra3926-oversold-close-detector.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 // TRA-2193 — per-scan liveness for the paths that journal `single_leg_rv`.
-import { beginRvScan } from './rv-scan-telemetry.js';
+import { beginRvScan, type RvScanPathId, type RvScanRecord } from './rv-scan-telemetry.js';
+// TRA-4350 — the RETAINED half of that liveness. `beginRvScan`'s counters are
+// since-boot on a box that self-restarts 6–12 times a session, so they cannot
+// testify about the day someone is actually asking about.
+import { recordRvScanCensus } from './rv-scan-census-ledger.js';
 // TRA-2262 (parent TRA-2203) — per-tick wall-clock budget + rotating cursor for
 // the three unbounded doTick fan-out sinks named by the Friday RTH tape.
 import { runBudgetedSweep, nextSweepDelayMs, sweepCursors, type SweepPass } from './tick-sweep-budget.js';
@@ -11368,7 +11372,7 @@ export class SignalEngine {
         scanRun.fetchError(`${sym}: ${reason}`);
       }
     }
-    scanRun.finish();
+    this.commitScanCensus('rv_scan', scanRun.finish());
   }
 
   /**
@@ -13349,8 +13353,39 @@ export class SignalEngine {
       },
       'iv_rv_cap_headroom',
     );
-    scanRun.finish();
+    this.commitScanCensus('otm', scanRun.finish());
     return pass;
+  }
+
+  /**
+   * TRA-4350 — commit a finished pass to the RETAINED per-ET-day census.
+   *
+   * Every instrumented `beginRvScan` site funnels its `finish()` through here so
+   * the durable tape and the since-boot counters can never disagree about how
+   * many passes ran. Attribution is the book's, not the process's: this engine is
+   * constructed per username, and pooling the ~63 QA fixture books with the desk
+   * is what made `spreadCeilingEvaluated` unreadable in TRA-2355.
+   *
+   * Best-effort and non-throwing — the census must never be able to break a scan.
+   */
+  private commitScanCensus(path: RvScanPathId, record: RvScanRecord): void {
+    try {
+      recordRvScanCensus(
+        {
+          etDay: etDateString(new Date()),
+          account: this.alertUsername ?? '',
+          accountClass: classifySpreadCeilingAccount(this.alertUsername),
+          mode: this.mode,
+        },
+        path,
+        record,
+      );
+    } catch (err: unknown) {
+      log.warn('rv-scan census commit failed', {
+        path,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /** Build account state augmented with cumulative P&L pulled from the tracker. */
@@ -14551,7 +14586,7 @@ export class SignalEngine {
         scanRun.fetchError(`${sym}: ${reason}`);
       }
     }
-    scanRun.finish();
+    this.commitScanCensus('directional', scanRun.finish());
   }
 
   /**
