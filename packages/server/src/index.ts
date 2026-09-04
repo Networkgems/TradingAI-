@@ -307,6 +307,9 @@ import { hydrateScaleoutLadderFromDisk } from './scaleout-ladder-ledger.js';
 import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
 import { hydrateChurnBrakeGuardFromDisk } from './churn-brake-ledger.js';
 import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
+// TRA-4343 — the durable entry-site census + the since-boot vacuity disclosure.
+import { hydrateEntrySiteCensusFromDisk } from './entry-site-census-ledger.js';
+import { gradeSinceBootSessionCoverage } from './session-coverage.js';
 import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
 // TRA-3434 — boot warm for the TRA-3391 tape-expectancy fold the live cost bar
 // admits on. Without it the first candidates after every process start decline
@@ -4899,6 +4902,25 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
     log.info('entry-greeks gate ledger hydrated (TRA-1682)', {
       admitted: h.admitted,
       rejects: h.rejects,
+      days: h.days,
+    });
+  }
+}
+
+// TRA-4343 — rebuild the DURABLE entry-site asset-class census and remember DATA_DIR
+// for subsequent appends. Same failure as TRA-1682, one axis over: on 2026-09-03 the
+// 18:40 ET postmarket slot did not fire, bqb1 restarted at 21:11 ET onto `a22668a3`,
+// and the 21:59 ET retry read `evaluated: 0, refused: 0, byClass: []` for a session
+// that may have evaluated hundreds of candidates. `render-redeploy.mjs` REFUSES
+// 13:25–20:00Z on weekdays, so the safest time to deploy IS the only time an
+// in-memory since-boot census exists — the erasure recurs on every post-close deploy.
+// Compacted to a 14-day window.
+{
+  const h = hydrateEntrySiteCensusFromDisk(DATA_DIR);
+  if (h.evaluated > 0) {
+    log.info('entry-site asset-class census hydrated (TRA-4343)', {
+      evaluated: h.evaluated,
+      refused: h.refused,
       days: h.days,
     });
   }
@@ -11421,6 +11443,13 @@ app.get('/api/health/options-live', async (_req, res) => {
     // fail-soft inside `persistCensusDaySync` so a write error never breaks this route.
     const etDayNow = etDateString(new Date());
     persistCensusDaySync(etDayNow, DATA_DIR);
+    // TRA-4343 — every `sinceBoot` block below is zeroed by a redeploy, and
+    // `render-redeploy.mjs` REFUSES 13:25–20:00Z on weekdays, so the deploy
+    // policy sends every deploy into the post-close window these counters are
+    // read in. On 2026-09-03 a 21:11 ET restart left `evaluations: 0` /
+    // `stamped: 0` behind and the 21:59 ET review read it as a quiet session.
+    // One grade, attached to each block, so a 0 cannot be read as a measurement.
+    const sinceBootSessionCoverage = gradeSinceBootSessionCoverage(resolveBuildInfo().startedAt);
     // TRA-3946 (TRA-3907 phase 1) — the average-down SHADOW readout. The
     // durable half (n, by reason, MAE) is folded from the journal; the
     // since-boot half is liveness only. ABSENT ≠ 0: an unreadable journal
@@ -11440,7 +11469,7 @@ app.get('/api/health/options-live', async (_req, res) => {
       } catch {
         sinceBoot = null;
       }
-      const sinceBootFold = sinceBoot === null ? null : sinceBoot.reduce(
+      const sinceBootFoldRaw = sinceBoot === null ? null : sinceBoot.reduce(
         (acc, f) => ({
           evaluations: acc.evaluations + f.evaluations,
           maeUpdates: acc.maeUpdates + f.maeUpdates,
@@ -11455,6 +11484,12 @@ app.get('/api/health/options-live', async (_req, res) => {
           byReason: Object.fromEntries(AVERAGE_DOWN_SHADOW_REASONS.map(r => [r, 0])) as Record<string, number>,
         },
       );
+      // TRA-4343 — the block carries its own coverage grade. `sessionCoverage`
+      // rides INSIDE `sinceBoot`, not beside it, so it cannot be dropped by a
+      // reader that destructures the counters.
+      const sinceBootFold = sinceBootFoldRaw === null
+        ? null
+        : { ...sinceBootFoldRaw, sessionCoverage: sinceBootSessionCoverage };
       if (!isOptionTradeJournalEnabled()) {
         return { ...flag, ...phase, shadow: null, mae: null, sinceBoot: sinceBootFold, blindReason: 'journal_disabled' as const };
       }
@@ -11511,7 +11546,9 @@ app.get('/api/health/options-live', async (_req, res) => {
     // `sinceBoot` is writer liveness in THIS process only. Blind, never
     // absent, on a journal that cannot be read: `durable: null` with a reason.
     const entryQuoteStamp = await (async () => {
-      const sinceBoot = entryQuoteStampSinceBoot();
+      // TRA-4343 — same disclosure as `averageDown.sinceBoot`. `durable` here
+      // already survives a restart; this says whether the twin beside it does.
+      const sinceBoot = { ...entryQuoteStampSinceBoot(), sessionCoverage: sinceBootSessionCoverage };
       if (!isOptionTradeJournalEnabled()) {
         return { issue: 'TRA-3990' as const, sinceBoot, durable: null, blindReason: 'journal_disabled' as const };
       }

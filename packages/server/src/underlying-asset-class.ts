@@ -65,6 +65,18 @@ import {
   resolveLiveOtmUniverse,
   type LiveOtmUniverseSource,
 } from './otm-live-universe-flag.js';
+// TRA-4343 — the durable twin + the vacuity disclosure for the since-boot half.
+import { etDateKey } from './et-clock.js';
+import {
+  recordEntrySiteCensus,
+  summarizeEntrySiteCensus,
+  type EntrySiteCensusDurable,
+} from './entry-site-census-ledger.js';
+import {
+  gradeSinceBootSessionCoverage,
+  mostRecentClosedSession,
+  type SinceBootSessionCoverage,
+} from './session-coverage.js';
 
 // ─── Vocabulary ──────────────────────────────────────────────────────────────
 
@@ -548,9 +560,17 @@ export function gradeAssetClassArmPrecondition(
 }
 
 // ─── Entry-site census (AC1 — "every candidate evaluated at the entry site") ─
-// In-memory, since boot, EPHEMERAL — disclosed as such on the wire. The durable
-// twin is the `underlying_asset_class` gate in the live-enforce ledger; this
-// census exists because that ledger's admits do not retain the CLASS.
+// In-memory, since boot, EPHEMERAL — disclosed as such on the wire.
+//
+// TRA-4343: the ephemeral half is no longer the whole story. It used to name
+// the `underlying_asset_class` gate in the live-enforce ledger as its durable
+// twin, but that ledger stamps `reasonCode` (which carries the CLASS) only on
+// BLOCKS — and while the refusal ships disarmed nothing blocks, so every admit
+// lands there class-less. On 2026-09-03 a 21:11 ET redeploy zeroed this census
+// before the (late) postmarket read, and `evaluated: 0, refused: 0` read as a
+// quiet session rather than as an unmeasured one. Every evaluation is now ALSO
+// appended to `entry-site-census-ledger.ts`, an ET-day-keyed JSONL under
+// DATA_DIR, published beside these counters as `entrySite.durable`.
 
 interface EntrySiteEval {
   ts: number;
@@ -575,6 +595,17 @@ export function recordEntrySiteAssetClassEvaluation(
 ): void {
   entrySiteEvaluated += 1;
   if (refused) entrySiteRefused += 1;
+  // TRA-4343 — the durable twin, written from HERE rather than from the engine
+  // call site so the two counters cannot drift: a second caller of this
+  // recorder can never acquire the ephemeral half without the durable one.
+  recordEntrySiteCensus(
+    classification.assetClass,
+    classification.source,
+    refused,
+    book,
+    etDateKey(now),
+    now,
+  );
   let c = entrySiteByClass.get(classification.assetClass);
   if (c === undefined) {
     c = { evaluated: 0, refused: 0 };
@@ -745,10 +776,30 @@ export interface UnderlyingAssetClassHealth {
       refused: number;
     }>;
     recent: EntrySiteEval[];
-    /** Since-boot, in-memory. The durable twin is gate `underlying_asset_class`. */
+    /** Since-boot, in-memory. ⛔ Read `sessionCoverage` before reading a 0 here. */
     durability: 'ephemeral_since_boot';
+    /**
+     * TRA-4343 — whether the counters above cover the most recently CLOSED ET
+     * session. `status: 'boot_after_close'` ⇒ every 0 above is VACUOUS, not
+     * quiet. This is what a post-close redeploy looks like on the wire.
+     */
+    sessionCoverage: SinceBootSessionCoverage;
+    /**
+     * TRA-4343 — the DURABLE per-ET-day twin (JSONL under DATA_DIR), which
+     * survives the redeploy the ephemeral counters do not. `session` is the
+     * most recently closed session. ⛔ Check `wired` first: `false` ⇒ nothing
+     * was persisted, so an absent day is not a zero.
+     */
+    durable: EntrySiteCensusDurable;
   };
   reason: string;
+}
+
+/** TRA-4343 — boot/clock inputs the entry-site vacuity disclosure needs. */
+export interface UnderlyingAssetClassGradeOptions {
+  /** Process boot stamp — on this server, `resolveBuildInfo().startedAt`. */
+  bootedAt?: string | null;
+  now?: number;
 }
 
 /**
@@ -761,6 +812,7 @@ export function gradeUnderlyingAssetClassHealth(
   openBooks: readonly AssetClassOpenBookInput[] | null,
   tapeFills: readonly AssetClassTapeFillInput[] | null,
   env: NodeJS.ProcessEnv = process.env,
+  opts: UnderlyingAssetClassGradeOptions = {},
 ): UnderlyingAssetClassHealth {
   const behavior = assetClassEntryPathBehavior(env);
 
@@ -836,6 +888,19 @@ export function gradeUnderlyingAssetClassHealth(
   entryByClass.sort((x, y) => (y.evaluated - x.evaluated)
     || (x.assetClass < y.assetClass ? -1 : x.assetClass > y.assetClass ? 1 : 0));
 
+  // TRA-4343 — the two halves that keep a post-close redeploy from rendering as
+  // a quiet session: the disclosure (is this block vacuous?) and the twin (what
+  // did the entry site actually do that session?).
+  const nowMs = opts.now ?? Date.now();
+  const sessionCoverage = gradeSinceBootSessionCoverage(opts.bootedAt ?? null, nowMs);
+  // Grade the durable twin against the session `sessionCoverage` names, so the
+  // two can never answer about different days. `unknown` coverage selects no
+  // day rather than falling back to today's calendar date — a day nobody asked
+  // about, rendered under the label of the one they did, is the misread again.
+  const durable = summarizeEntrySiteCensus(
+    sessionCoverage.sessionDate ?? mostRecentClosedSession(nowMs)?.date ?? null,
+  );
+
   const armPrecondition = gradeAssetClassArmPrecondition(env);
 
   const openBuckets = finishClasses(openByClass, openAtRisk);
@@ -853,6 +918,12 @@ export function gradeUnderlyingAssetClassHealth(
     + `, crypto_proxy_etf $${(crypto(tapeBuckets)?.atRiskUsd ?? 0).toFixed(2)}`
     + (tapeUnknown > 0 ? `, ${String(tapeUnknown)} unknown ⇒ LOWER BOUND` : '')
     + `; entry site ${String(entrySiteEvaluated)} evaluated / ${String(entrySiteRefused)} refused since boot`
+    // TRA-4343 — the since-boot pair above is the one a post-close redeploy
+    // zeroes. Say so IN THE REASON LINE, which is what a reader scans, not only
+    // in the nested block they may not open.
+    + ` (${sessionCoverage.status}, a 0 reads ${sessionCoverage.zeroReading}`
+    + `; durable ${durable.wired ? 'twin' : '⛔ NOT WIRED'} for ${durable.sessionDate ?? 'no session'}: `
+    + `${durable.session === null ? 'no record' : `${String(durable.session.evaluated)} evaluated / ${String(durable.session.refused)} refused`})`
     + `; ARM PRECONDITION ${armPrecondition.satisfied ? 'SATISFIED' : 'NOT SATISFIED'}`
     + ` (population ${armPrecondition.population}, ${String(armPrecondition.evaluated)} name(s), `
     + `${String(armPrecondition.unknownCount)} unknown ⇒ would be refused IN ERROR)`;
@@ -899,6 +970,8 @@ export function gradeUnderlyingAssetClassHealth(
       byClass: entryByClass,
       recent: entrySiteEvals.slice(),
       durability: 'ephemeral_since_boot',
+      sessionCoverage,
+      durable,
     },
     reason,
   };

@@ -4912,6 +4912,11 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         concentrationBooks,
         liveOptionFillRecords(),
         liveEnv,
+        // TRA-4343 — hand it the boot stamp so `entrySite.sessionCoverage` can
+        // say whether the since-boot counters cover the session being graded.
+        // Without this a post-close redeploy renders `evaluated: 0` and a
+        // reader calls it a quiet day (2026-09-03, 21:11 ET restart).
+        { bootedAt: resolveBuildInfo().startedAt, now: nowMs },
       ),
       // The ACTUAL arm each order site consults: raw flag AND the window. `windowOpen`
       // false ⇒ both sleeves read OFF regardless of their booleans (fail-closed).
