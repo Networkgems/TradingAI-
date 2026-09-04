@@ -73,7 +73,7 @@ function seedCapture(orders: TradierAccountOrder[], opts: { bootBeforeOpen?: boo
     orderId: ENGINE_ORDER, ackStatus: 'ok', env: 'production', accountId: 'acct', orderClass: 'option',
     side: 'buy_to_open', symbol: 'BAC', optionSymbol: BAC, quantity: 1, limitPrice: 1.65, submittedAt: OPENED,
   });
-  const res = captureBrokerOrderDay({ etDay: '2026-08-20', orders, capturedAt: NOW - 60_000, accountEnv: 'production' });
+  const res = captureBrokerOrderDay({ etDay: '2026-08-20', orders, capturedAt: NOW - 60_000, accountEnv: 'production', account: 'admin' });
   expect(res.written).toBe(true);
 }
 

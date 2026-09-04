@@ -14,6 +14,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { TradierAccountOrder, TradierOrderSubmitEvent } from '@trading-app/engine';
+import type { CapturedBrokerOrderRow } from './tra3939-order-provenance-capture.js';
 import {
   __resetOrderProvenanceCaptureForTest,
   armEngineSubmitRecorder,
@@ -21,6 +22,10 @@ import {
   brokerOrderCaptureLogPath,
   captureBrokerOrderDay,
   capturedBrokerOrders,
+  capturedBrokerOrderRows,
+  maskAccountId,
+  setOrderProvenanceLegacyAccount,
+  UNATTRIBUTED_ACCOUNT,
   censusCapturedOrders,
   engineSubmitLogPath,
   engineSubmittedProductionOrderIds,
@@ -71,6 +76,15 @@ function order(over: Partial<TradierAccountOrder> = {}): TradierAccountOrder {
     tag: null,
     ...over,
   };
+}
+
+/**
+ * TRA-4009 — an archive row as the census now receives it: the order PLUS the
+ * account it was read from. The census can no longer be handed a bare order list,
+ * which is the point — a verdict that cannot name its account is the defect.
+ */
+function src(o: TradierAccountOrder, account = 'admin'): CapturedBrokerOrderRow {
+  return { order: o, account, accountIdMasked: maskAccountId('6YA00154'), captureEtDay: etDayOf(Date.parse(o.createDate ?? '2026-08-21T14:00:00.000Z')) };
 }
 
 beforeEach(() => {
@@ -157,7 +171,7 @@ describe('TRA-3939 daily broker order capture', () => {
       etDay: '2026-08-21',
       orders: [order()],
       capturedAt: Date.parse('2026-08-21T21:00:00.000Z'),
-      accountEnv: 'production',
+      accountEnv: 'production', account: 'admin',
     });
     expect(r.written).toBe(true);
     expect(r.line!.etDaysCovered).toEqual(['2026-08-21']);
@@ -170,13 +184,13 @@ describe('TRA-3939 daily broker order capture', () => {
       etDay: '2026-08-21',
       orders: [order()],
       capturedAt: 1,
-      accountEnv: 'production',
+      accountEnv: 'production', account: 'admin',
     });
     const second = captureBrokerOrderDay({
       etDay: '2026-08-21',
       orders: [order()],
       capturedAt: 2,
-      accountEnv: 'production',
+      accountEnv: 'production', account: 'admin',
     });
     expect(first.written).toBe(true);
     expect(second.written).toBe(false);
@@ -193,7 +207,7 @@ describe('TRA-3939 daily broker order capture', () => {
       orders: null,
       error: 'HTTP 401',
       capturedAt: 1,
-      accountEnv: 'production',
+      accountEnv: 'production', account: 'admin',
     });
     expect(blind.written).toBe(true);
     expect(blind.line!.read).toBe(false);
@@ -202,7 +216,7 @@ describe('TRA-3939 daily broker order capture', () => {
       etDay: '2026-08-21',
       orders: [order()],
       capturedAt: 2,
-      accountEnv: 'production',
+      accountEnv: 'production', account: 'admin',
     });
     expect(retry.written).toBe(true);
     const day = summarizeBrokerOrderCaptures().days.find(d => d.etDay === '2026-08-21')!;
@@ -212,7 +226,7 @@ describe('TRA-3939 daily broker order capture', () => {
 
   it('a later BLIND retry cannot un-capture a day that already succeeded', () => {
     armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
-    captureBrokerOrderDay({ etDay: '2026-08-21', orders: [order()], capturedAt: 1, accountEnv: 'production' });
+    captureBrokerOrderDay({ etDay: '2026-08-21', orders: [order()], capturedAt: 1, accountEnv: 'production', account: 'admin' });
     // Force a second line past the idempotence guard by writing it directly — the
     // shape a future caller could produce.
     const path = brokerOrderCaptureLogPath(dir);
@@ -232,7 +246,7 @@ describe('TRA-3939 daily broker order capture', () => {
           attestation: 'blind',
           recorderBootedAt: null,
           submitLedgerLines: 0,
-          accountEnv: 'production',
+          accountEnv: 'production', account: 'admin',
         })
         + '\n',
       'utf8',
@@ -246,7 +260,7 @@ describe('TRA-3939 daily broker order capture', () => {
     armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
     // Mon 2026-08-17 and Wed 2026-08-19 captured; Tue 2026-08-18 never ran.
     for (const d of ['2026-08-17', '2026-08-19']) {
-      captureBrokerOrderDay({ etDay: d, orders: [], capturedAt: 1, accountEnv: 'production' });
+      captureBrokerOrderDay({ etDay: d, orders: [], capturedAt: 1, accountEnv: 'production', account: 'admin' });
     }
     const s = summarizeBrokerOrderCaptures();
     expect(s.gapEtDays).toEqual(['2026-08-18']);
@@ -258,7 +272,7 @@ describe('TRA-3939 daily broker order capture', () => {
   it('weekends are not gaps', () => {
     armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
     for (const d of ['2026-08-21', '2026-08-24']) {
-      captureBrokerOrderDay({ etDay: d, orders: [], capturedAt: 1, accountEnv: 'production' });
+      captureBrokerOrderDay({ etDay: d, orders: [], capturedAt: 1, accountEnv: 'production', account: 'admin' });
     }
     expect(summarizeBrokerOrderCaptures().gapEtDays).toEqual([]);
   });
@@ -269,20 +283,20 @@ describe('TRA-3939 daily broker order capture', () => {
       etDay: '2026-08-20',
       orders: [order({ id: 111, createDate: '2026-08-20T14:00:00.000Z' })],
       capturedAt: 1,
-      accountEnv: 'production',
+      accountEnv: 'production', account: 'admin',
     });
     captureBrokerOrderDay({
       etDay: '2026-08-21',
       orders: [order({ id: 222 })],
       capturedAt: 2,
-      accountEnv: 'production',
+      accountEnv: 'production', account: 'admin',
     });
     expect(capturedBrokerOrders().map(o => o.id).sort((a, b) => a - b)).toEqual([111, 222]);
   });
 
   it('a BLIND day contributes no rows to the archive', () => {
     armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
-    captureBrokerOrderDay({ etDay: '2026-08-21', orders: null, error: 'boom', capturedAt: 1, accountEnv: 'production' });
+    captureBrokerOrderDay({ etDay: '2026-08-21', orders: null, error: 'boom', capturedAt: 1, accountEnv: 'production', account: 'admin' });
     expect(capturedBrokerOrders()).toEqual([]);
   });
 });
@@ -307,7 +321,7 @@ describe('TRA-3939 attestation — the coverage axis behind a desk_placed', () =
 
   it('a full-session boot yields an ATTESTED day; the ledger may speak about it', () => {
     armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
-    captureBrokerOrderDay({ etDay: '2026-08-21', orders: [order()], capturedAt: 1, accountEnv: 'production' });
+    captureBrokerOrderDay({ etDay: '2026-08-21', orders: [order()], capturedAt: 1, accountEnv: 'production', account: 'admin' });
     const w = summarizeEngineSubmitWitness();
     expect(w.coveredEtDays).toEqual(['2026-08-21']);
     expect(w.uncoveredCapturedEtDays).toEqual([]);
@@ -323,7 +337,7 @@ describe('TRA-3939 attestation — the coverage axis behind a desk_placed', () =
       etDay: '2026-08-21',
       orders: [order()],
       capturedAt: 1,
-      accountEnv: 'production',
+      accountEnv: 'production', account: 'admin',
     });
     expect(r.line!.attestation).toBe('partial');
     const w = summarizeEngineSubmitWitness();
@@ -335,7 +349,7 @@ describe('TRA-3939 attestation — the coverage axis behind a desk_placed', () =
 
   it('a BLIND day is never attested', () => {
     armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
-    captureBrokerOrderDay({ etDay: '2026-08-21', orders: null, error: 'boom', capturedAt: 1, accountEnv: 'production' });
+    captureBrokerOrderDay({ etDay: '2026-08-21', orders: null, error: 'boom', capturedAt: 1, accountEnv: 'production', account: 'admin' });
     expect(summarizeEngineSubmitWitness().coveredEtDays).toEqual([]);
   });
 
@@ -350,7 +364,7 @@ describe('TRA-3939 AC4 — the per-order census fires the terminal branches on e
 
   it('an id in the submit ledger is engine_placed on ANY day — a positive match needs no coverage claim', () => {
     const c = censusCapturedOrders({
-      orders: [order({ id: 1, createDate: '2026-08-21T14:00:00.000Z' })],
+      orders: [src(order({ id: 1, createDate: '2026-08-21T14:00:00.000Z' }))],
       submittedIds: new Set([1]),
       attestedEtDays: ATTESTED,
     });
@@ -362,8 +376,8 @@ describe('TRA-3939 AC4 — the per-order census fires the terminal branches on e
   it('absent from both ledgers on an ATTESTED day is desk_placed; on an unattested day it is a blind', () => {
     const c = censusCapturedOrders({
       orders: [
-        order({ id: 1, createDate: '2026-08-24T14:00:00.000Z' }),
-        order({ id: 2, createDate: '2026-08-25T14:00:00.000Z' }),
+        src(order({ id: 1, createDate: '2026-08-24T14:00:00.000Z' })),
+        src(order({ id: 2, createDate: '2026-08-25T14:00:00.000Z' })),
       ],
       submittedIds: new Set([999]),
       attestedEtDays: ATTESTED,
@@ -379,7 +393,7 @@ describe('TRA-3939 AC4 — the per-order census fires the terminal branches on e
 
   it('the fill ledger is a second positive witness, ranked below the submit ledger', () => {
     const c = censusCapturedOrders({
-      orders: [order({ id: 7, createDate: '2026-08-24T14:00:00.000Z' })],
+      orders: [src(order({ id: 7, createDate: '2026-08-24T14:00:00.000Z' }))],
       submittedIds: new Set(),
       filledIds: new Set([7]),
       attestedEtDays: ATTESTED,
@@ -391,9 +405,9 @@ describe('TRA-3939 AC4 — the per-order census fires the terminal branches on e
   it('NON-OPTION orders are skipped and counted — the ledger hooks the options client, so their absence is not evidence', () => {
     const c = censusCapturedOrders({
       orders: [
-        order({ id: 1, orderClass: 'equity', optionSymbol: null, createDate: '2026-08-24T14:00:00.000Z' }),
-        order({ id: 2, createDate: '2026-08-24T14:00:00.000Z' }),
-        order({ id: 2, createDate: '2026-08-24T14:00:00.000Z' }), // same id captured twice
+        src(order({ id: 1, orderClass: 'equity', optionSymbol: null, createDate: '2026-08-24T14:00:00.000Z' })),
+        src(order({ id: 2, createDate: '2026-08-24T14:00:00.000Z' })),
+        src(order({ id: 2, createDate: '2026-08-24T14:00:00.000Z' })), // same id captured twice
       ],
       submittedIds: new Set(),
       attestedEtDays: ATTESTED,
@@ -405,12 +419,240 @@ describe('TRA-3939 AC4 — the per-order census fires the terminal branches on e
 
   it('an UNDATED row is a blind, never a desk_placed — no day, no attestation', () => {
     const c = censusCapturedOrders({
-      orders: [order({ id: 1, createDate: null })],
+      orders: [src(order({ id: 1, createDate: null }))],
       submittedIds: new Set(),
       attestedEtDays: ATTESTED,
     });
     expect(c.orders[0]!.issuer).toBe('blind_no_issuer_witness');
     expect(c.orders[0]!.witness).toBe('undated');
+  });
+});
+
+// ── TRA-4009: the archive reaches EVERY production account, or says whose it misses ──
+
+describe('TRA-4009 — the capture is per (ET day, ACCOUNT)', () => {
+  const KNOWN = { knownAccounts: ['admin', 'v0nni'] };
+
+  it('THE DEFECT, as a negative control — the day key alone let one book suppress its sibling', () => {
+    // Pre-TRA-4009 the idempotence key was `etDay`. admin captured first, the day
+    // then read "already captured", and v0nni's read never happened — while the
+    // surface reported the day covered. The key is now `(etDay, account)`.
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    const a = captureBrokerOrderDay({
+      etDay: '2026-08-24',
+      orders: [order({ id: 143032832 })],
+      capturedAt: 1,
+      accountEnv: 'production',
+      account: 'admin',
+      accountId: '6YA00154',
+    });
+    const v = captureBrokerOrderDay({
+      etDay: '2026-08-24',
+      orders: [order({ id: 143021643 })],
+      capturedAt: 2,
+      accountEnv: 'production',
+      account: 'v0nni',
+      accountId: '6YB09876',
+    });
+    expect(a.written).toBe(true);
+    // The line the old key refused to write. This is the whole ticket.
+    expect(v.written).toBe(true);
+    expect(v.skippedAlreadyCaptured).toBe(false);
+    // …and re-running the SAME account is still idempotent.
+    const again = captureBrokerOrderDay({
+      etDay: '2026-08-24',
+      orders: [order({ id: 143021643 })],
+      capturedAt: 3,
+      accountEnv: 'production',
+      account: 'v0nni',
+    });
+    expect(again.written).toBe(false);
+    expect(again.skippedAlreadyCaptured).toBe(true);
+  });
+
+  it('AC2 — the archive UNIONS the per-account captures; the day key alone discarded the sibling', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    captureBrokerOrderDay({
+      etDay: '2026-08-24', orders: [order({ id: 143032832 })], capturedAt: 1,
+      accountEnv: 'production', account: 'admin', accountId: '6YA00154',
+    });
+    captureBrokerOrderDay({
+      etDay: '2026-08-24', orders: [order({ id: 143021643 })], capturedAt: 2,
+      accountEnv: 'production', account: 'v0nni', accountId: '6YB09876',
+    });
+    expect(capturedBrokerOrders().map(o => o.id).sort((a, b) => a - b)).toEqual([143021643, 143032832]);
+    const rows = capturedBrokerOrderRows();
+    expect(rows.find(r => r.order.id === 143021643)!.account).toBe('v0nni');
+    expect(rows.find(r => r.order.id === 143021643)!.accountIdMasked).toBe('***9876');
+    expect(rows.find(r => r.order.id === 143032832)!.account).toBe('admin');
+  });
+
+  it('AC2 — every census row names the account it was read from', () => {
+    const c = censusCapturedOrders({
+      orders: [
+        src(order({ id: 143032832, createDate: '2026-08-24T14:44:34.000Z' }), 'admin'),
+        src(order({ id: 143021643, createDate: '2026-08-24T14:25:07.000Z' }), 'v0nni'),
+      ],
+      submittedIds: new Set([143032832, 143021643]),
+      attestedEtDays: new Set(['2026-08-24']),
+    });
+    expect(c.orders.map(r => r.account)).toEqual(['v0nni', 'admin']);
+    expect(c.byAccount.map(a => [a.account, a.orders, a.terminalOrders])).toEqual([
+      ['admin', 1, 1],
+      ['v0nni', 1, 1],
+    ]);
+    expect(c.idsSeenOnMultipleAccounts).toBe(0);
+  });
+
+  it('a broker-global id served by TWO accounts is COUNTED, never silently merged', () => {
+    // Tradier ids are broker-global, so this can only mean two books resolved the
+    // same brokerage account. An invariant nobody measures is a hope.
+    const c = censusCapturedOrders({
+      orders: [
+        src(order({ id: 5, createDate: '2026-08-24T14:00:00.000Z' }), 'admin'),
+        src(order({ id: 5, createDate: '2026-08-24T14:00:00.000Z' }), 'v0nni'),
+      ],
+      submittedIds: new Set([5]),
+      attestedEtDays: new Set(['2026-08-24']),
+    });
+    expect(c.orders).toHaveLength(1);
+    expect(c.idsSeenOnMultipleAccounts).toBe(1);
+  });
+
+  it('AC1 — a day captured for admin and NOT for v0nni is a named gap on v0nni, never a captured day', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    captureBrokerOrderDay({
+      etDay: '2026-08-24', orders: [order()], capturedAt: 1,
+      accountEnv: 'production', account: 'admin', accountId: '6YA00154',
+    });
+    const s = summarizeBrokerOrderCaptures(KNOWN);
+    const day = s.days.find(d => d.etDay === '2026-08-24')!;
+    // Some book answered…
+    expect(day.captured).toBe(true);
+    // …but the FLEET did not, and the missing book is NAMED.
+    expect(day.fleetCaptured).toBe(false);
+    expect(day.capturedAccounts).toEqual(['admin']);
+    expect(day.missingAccounts).toEqual(['v0nni']);
+    expect(s.fleetCapturedEtDays).toEqual([]);
+    expect(s.accounts.find(a => a.account === 'v0nni')!.missingEtDays).toEqual(['2026-08-24']);
+    expect(s.accountGapEtDays).toEqual([{ account: 'v0nni', etDays: ['2026-08-24'] }]);
+  });
+
+  it('AC1 — an account that has NEVER been captured is still named, which a disk-only roster cannot do', () => {
+    // This is the live shape: 14 contiguous admin days, zero v0nni lines. Without
+    // the caller's roster, v0nni is not in the data and the surface reads clean.
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    captureBrokerOrderDay({
+      etDay: '2026-08-24', orders: [order()], capturedAt: 1,
+      accountEnv: 'production', account: 'admin',
+    });
+    expect(summarizeBrokerOrderCaptures().knownAccounts).toEqual(['admin']);
+    const withRoster = summarizeBrokerOrderCaptures(KNOWN);
+    expect(withRoster.knownAccounts).toEqual(['admin', 'v0nni']);
+    const v = withRoster.accounts.find(a => a.account === 'v0nni')!;
+    expect(v.lines).toBe(0);
+    expect(v.firstEtDay).toBeNull();
+    expect(v.missingEtDays).toEqual(['2026-08-24']);
+  });
+
+  it('AC1 — a fully captured day IS a fleet day, and each account keeps its own attestation', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    for (const account of ['admin', 'v0nni']) {
+      captureBrokerOrderDay({
+        etDay: '2026-08-24', orders: [order()], capturedAt: 1,
+        accountEnv: 'production', account, accountId: `6Y-${account}`,
+      });
+    }
+    const s = summarizeBrokerOrderCaptures(KNOWN);
+    expect(s.fleetCapturedEtDays).toEqual(['2026-08-24']);
+    expect(s.days[0]!.missingAccounts).toEqual([]);
+    expect(s.accounts.map(a => a.attestedEtDays)).toEqual([['2026-08-24'], ['2026-08-24']]);
+    expect(s.accountGapEtDays).toEqual([]);
+  });
+
+  it('AC5 — one account failing and the other succeeding leaves TWO independent lines, not one verdict', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    captureBrokerOrderDay({
+      etDay: '2026-08-24', orders: [order()], capturedAt: 1,
+      accountEnv: 'production', account: 'admin',
+    });
+    captureBrokerOrderDay({
+      etDay: '2026-08-24', orders: null, error: 'HTTP 401', capturedAt: 2,
+      accountEnv: 'production', account: 'v0nni',
+    });
+    const s = summarizeBrokerOrderCaptures(KNOWN);
+    const admin = s.accounts.find(a => a.account === 'admin')!;
+    const v0nni = s.accounts.find(a => a.account === 'v0nni')!;
+    expect(admin.days[0]!.captured).toBe(true);
+    expect(admin.days[0]!.attestation).toBe('full');
+    expect(v0nni.days[0]!.captured).toBe(false);
+    expect(v0nni.days[0]!.attestation).toBe('blind');
+    expect(v0nni.days[0]!.lastError).toBe('HTTP 401');
+    // The fleet row refuses to call the day covered, and says whose read is missing.
+    expect(s.days[0]!.fleetCaptured).toBe(false);
+    expect(s.days[0]!.missingAccounts).toEqual(['v0nni']);
+  });
+
+  it('THE TWO FOLDS ARE NOT THE SAME FOLD — attestation is UNION (process), reach is INTERSECTION (archive)', () => {
+    // admin read cleanly on a full-session boot; v0nni's read failed. The RECORDER
+    // was demonstrably resident all day — that is what admin's capture proves — so
+    // the day stays attested and the submit ledger may still speak about it. But we
+    // do NOT hold v0nni's orders, so the day is not fleet-captured. Collapsing these
+    // into one field either retracts residency we proved or claims reach we lack.
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    captureBrokerOrderDay({
+      etDay: '2026-08-24', orders: [order()], capturedAt: 1,
+      accountEnv: 'production', account: 'admin',
+    });
+    captureBrokerOrderDay({
+      etDay: '2026-08-24', orders: null, error: 'HTTP 500', capturedAt: 2,
+      accountEnv: 'production', account: 'v0nni',
+    });
+    const s = summarizeBrokerOrderCaptures(KNOWN);
+    expect(s.attestedEtDays).toEqual(['2026-08-24']);
+    expect(s.fleetCapturedEtDays).toEqual([]);
+    expect(summarizeEngineSubmitWitness().coveredEtDays).toEqual(['2026-08-24']);
+  });
+
+  it('UNSTAMPED legacy lines attribute to the caller-declared account, and to NOBODY without one', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    // A pre-TRA-4009 line: no `account` on the record at all.
+    writeFileSync(
+      brokerOrderCaptureLogPath(dir),
+      JSON.stringify({
+        kind: 'broker_order_capture',
+        etDay: '2026-08-21',
+        capturedAt: 1,
+        read: true,
+        error: null,
+        orders: [order()],
+        etDaysCovered: ['2026-08-21'],
+        oldestCreateDate: '2026-08-21T14:00:00.000Z',
+        newestCreateDate: '2026-08-21T14:00:00.000Z',
+        attestation: 'full',
+        recorderBootedAt: BOOT_BEFORE_OPEN,
+        submitLedgerLines: 1,
+        accountEnv: 'production',
+      }) + '\n',
+      'utf8',
+    );
+    // Undeclared: visible, joined to nobody, never folded into a real book.
+    expect(summarizeBrokerOrderCaptures().knownAccounts).toEqual([UNATTRIBUTED_ACCOUNT]);
+    expect(capturedBrokerOrderRows()[0]!.account).toBe(UNATTRIBUTED_ACCOUNT);
+    // Declared by the layer that holds the fact — the boot resolves the operator.
+    setOrderProvenanceLegacyAccount('admin');
+    expect(summarizeBrokerOrderCaptures().knownAccounts).toEqual(['admin']);
+    expect(capturedBrokerOrderRows()[0]!.account).toBe('admin');
+    expect(summarizeBrokerOrderCaptures({ knownAccounts: ['admin'] }).fleetCapturedEtDays).toEqual([
+      '2026-08-21',
+    ]);
+  });
+
+  it('maskAccountId publishes enough to tell two books apart and not enough to be an account number', () => {
+    expect(maskAccountId('6YA00154')).toBe('***0154');
+    expect(maskAccountId('12')).toBe('***');
+    expect(maskAccountId('')).toBeNull();
+    expect(maskAccountId(null)).toBeNull();
   });
 });
 

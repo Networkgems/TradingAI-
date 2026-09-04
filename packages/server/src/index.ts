@@ -369,10 +369,13 @@ import {
   recordEngineOrderSubmit,
   captureBrokerOrderDay,
   capturedBrokerOrders,
+  capturedBrokerOrderRows,
   censusCapturedOrders,
   summarizeBrokerOrderCaptures,
   summarizeEngineSubmitWitness,
   engineSubmittedProductionOrderIds,
+  setOrderProvenanceLegacyAccount,
+  maskAccountId,
 } from './tra3939-order-provenance-capture.js';
 import {
   detectOversoldEngineCloses,
@@ -5187,6 +5190,14 @@ setOpenLegProvenanceDataDir(DATA_DIR);
 // whole safety property of the witness (an empty set read as testimony is how a
 // blind becomes an accusation against the desk).
 setOrderProvenanceCaptureDataDir(DATA_DIR);
+// TRA-4009 — attribute the UNSTAMPED capture lines already on this disk. Every one
+// of them was written by the pre-TRA-4009 `runBrokerOrderDayCapture`, which built
+// exactly one client — `resolveLiveBrokerOperator()`'s production account — and no
+// other. So this is a fact the boot layer holds, handed to a leaf module that must
+// not import the resolver, NOT an inference the leaf makes. Without it those 14 days
+// would read as `unattributed_pre_tra4009` and the operator's own book would report
+// as never captured.
+setOrderProvenanceLegacyAccount(resolveLiveBrokerOperator());
 armEngineSubmitRecorder({
   bootedAt: Date.now() - Math.round(process.uptime() * 1000),
   commit: process.env.RENDER_GIT_COMMIT ?? null,
@@ -12704,7 +12715,113 @@ app.get('/api/health/options-live', async (_req, res) => {
  * are attested for is EVIDENCE ("the account held no orders"), and it is the only
  * thing that makes a later absence mean anything. Skipping quiet days would leave
  * exactly the holes this ticket was filed about.
+ *
+ * ## TRA-4009 — ONCE PER ET DAY **PER PRODUCTION ACCOUNT**
+ *
+ * `listOrders()` is per Tradier account, and the fleet trades two live books. The
+ * first cut resolved `resolveLiveBrokerOperator()`'s client and nothing else, so
+ * `v0nni`'s orders were never archived while the surface reported the day captured
+ * — a provenance question on that book still expired with the broker's one-day
+ * window, which is the exact failure TRA-3939 exists to end. The pass now iterates
+ * every operator whose settings resolve a PRODUCTION account client, writes one
+ * line per `(etDay, account)`, and never lets one account's outcome stand in for
+ * another's (AC5).
  */
+
+/** TRA-4009 — one production book the daily capture is responsible for. */
+interface ProductionCaptureAccount {
+  /** Operator/book username — the account KEY, already public via `crossBookEpisodes.books`. */
+  account: string;
+  /** Tradier account number. Durable on the capture line, masked on the wire. */
+  accountId: string;
+  client: TradierOptionsClient;
+}
+
+/**
+ * TRA-4009 — every operator whose settings resolve a PRODUCTION Tradier account
+ * client, which is exactly AC1's population.
+ *
+ * The roster is `getAllUsers()` (the registry) with the pinned live operator forced
+ * in: the operator can resolve through the `TRADIER_*` env fallback with no saved
+ * creds at all and would otherwise be missing from its own capture on a keyless
+ * box. Sandbox is out of scope by construction — the question is real-money
+ * provenance and a sandbox id sharing a production id would manufacture a verdict
+ * about an account nobody traded.
+ *
+ * De-duplicated on **accountId**, not on username: two books whose creds point at
+ * the same brokerage account are ONE order surface, and capturing it twice would
+ * mint two lines claiming to be independent evidence about different books. The
+ * operator sorts first so it wins that tie and the shared account keeps the name
+ * the rest of this file already uses for it.
+ */
+async function resolveProductionCaptureAccounts(): Promise<{
+  accounts: ProductionCaptureAccount[];
+  /** Roster size considered — published so "we found one book" is never a silent zero. */
+  considered: number;
+  /** Usernames that resolved no production client. Named, never inferred from a count. */
+  withoutClient: string[];
+  /** Usernames dropped because a sibling already owns their brokerage account. */
+  duplicateAccountIds: Array<{ account: string; sameAs: string }>;
+}> {
+  const operator = resolveLiveBrokerOperator();
+  const usernames = [
+    ...new Set([
+      ...(operator.length > 0 ? [operator] : []),
+      ...getAllUsers().map(u => u.username),
+    ]),
+  ];
+  const accounts: ProductionCaptureAccount[] = [];
+  const withoutClient: string[] = [];
+  const duplicateAccountIds: Array<{ account: string; sameAs: string }> = [];
+  const byAccountId = new Map<string, string>();
+  for (const username of usernames) {
+    let settings: AccountSettings;
+    try {
+      settings = await loadSettings(username);
+    } catch (err) {
+      withoutClient.push(username);
+      log.warn('tra4009 capture roster: settings unreadable', {
+        username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      continue;
+    }
+    // TRA-3112 — ACCOUNT surface. `isLiveBrokerOperator` gates the shared env
+    // fallback exactly as every other account-scoped caller does, so a non-operator
+    // book is captured on ITS OWN saved creds or not at all. Borrowing the
+    // operator's here would archive the operator's orders twice under two names.
+    const resolved = resolveTradierAccountCreds(settings, 'production', isLiveBrokerOperator(username));
+    if (!resolved.ok) {
+      withoutClient.push(username);
+      continue;
+    }
+    const owner = byAccountId.get(resolved.creds.accountId);
+    if (owner !== undefined) {
+      duplicateAccountIds.push({ account: username, sameAs: owner });
+      continue;
+    }
+    byAccountId.set(resolved.creds.accountId, username);
+    accounts.push({
+      account: username,
+      accountId: resolved.creds.accountId,
+      client: new TradierOptionsClient(resolved.creds.apiToken, resolved.creds.accountId, 'production'),
+    });
+  }
+  return { accounts, considered: usernames.length, withoutClient, duplicateAccountIds };
+}
+
+/** TRA-4009 — one account's outcome for today. Never folded into a sibling's. */
+interface BrokerOrderDayCaptureAccountResult {
+  account: string;
+  accountIdMasked: string | null;
+  written: boolean;
+  skippedAlreadyCaptured: boolean;
+  orders: number;
+  read: boolean;
+  attestation: string | null;
+  error: string | null;
+}
+
 async function runBrokerOrderDayCapture(opts: { force?: boolean } = {}): Promise<{
   ran: boolean;
   reason: string;
@@ -12715,6 +12832,22 @@ async function runBrokerOrderDayCapture(opts: { force?: boolean } = {}): Promise
   read: boolean;
   attestation: string | null;
   error: string | null;
+  // TRA-4009 — the per-account truth. The scalars above are a fleet ROLL-UP kept for
+  // the pre-existing callers, and they are deliberately conservative: `read` is the
+  // AND across accounts, so one book's failure can never present as a clean pass.
+  accounts: BrokerOrderDayCaptureAccountResult[];
+  accountsConsidered: number;
+  accountsWithProductionClient: number;
+  accountsWithoutProductionClient: string[];
+  duplicateAccountIds: Array<{ account: string; sameAs: string }>;
+  /**
+   * TRA-4009 — the production books the pass is RESPONSIBLE for, whether or not it
+   * captured any of them this run. Distinct from `accounts` (this run's outcomes):
+   * an early return captured nothing, and a caller that sourced its roster from the
+   * outcomes would then summarise against an empty roster — the exact fallback in
+   * which an account that has never been captured is invisible.
+   */
+  rosterAccounts: string[];
 }> {
   const etDay = etDateString(new Date());
   const base = {
@@ -12725,6 +12858,12 @@ async function runBrokerOrderDayCapture(opts: { force?: boolean } = {}): Promise
     read: false,
     attestation: null as string | null,
     error: null as string | null,
+    accounts: [] as BrokerOrderDayCaptureAccountResult[],
+    accountsConsidered: 0,
+    accountsWithProductionClient: 0,
+    accountsWithoutProductionClient: [] as string[],
+    duplicateAccountIds: [] as Array<{ account: string; sameAs: string }>,
+    rosterAccounts: [] as string[],
   };
   // The window, not a schedule: capture only once the session's orders are all in.
   // `--force` exists for the operator path (and for the day this shipped, which is
@@ -12732,21 +12871,46 @@ async function runBrokerOrderDayCapture(opts: { force?: boolean } = {}): Promise
   if (!opts.force && etHour() < 16) {
     return { ...base, ran: false, reason: `before the 16:00 ET close (etHour=${etHour()})` };
   }
-  if (summarizeBrokerOrderCaptures().days.some(d => d.etDay === etDay && d.captured)) {
-    return { ...base, ran: false, reason: 'already captured this ET day', skippedAlreadyCaptured: true };
+
+  const roster = await resolveProductionCaptureAccounts();
+  const summaryBefore = summarizeBrokerOrderCaptures({
+    knownAccounts: roster.accounts.map(a => a.account),
+  });
+  const today = summaryBefore.days.find(d => d.etDay === etDay) ?? null;
+  // ⚠ TRA-4009 — the early-out is on the FLEET fold, never on `captured`. `captured`
+  // is true as soon as ANY book answered, and that is precisely the reading that let
+  // one account's success suppress its sibling's read for a fortnight.
+  if (
+    roster.accounts.length > 0
+    && today !== null
+    && today.fleetCaptured
+  ) {
+    return {
+      ...base,
+      ran: false,
+      reason: `already captured this ET day for all ${roster.accounts.length} production account(s)`,
+      skippedAlreadyCaptured: true,
+      accountsConsidered: roster.considered,
+      accountsWithProductionClient: roster.accounts.length,
+      accountsWithoutProductionClient: roster.withoutClient,
+      duplicateAccountIds: roster.duplicateAccountIds,
+      rosterAccounts: roster.accounts.map(a => a.account),
+    };
   }
-  const operator = resolveLiveBrokerOperator();
-  const settings = await loadSettings(operator);
-  const client = buildTradierAccountClientForEnv(settings, 'production', operator);
-  if (!client) {
+
+  if (roster.accounts.length === 0) {
     // A day we could not even ask about still gets a line — "no client" is a named
-    // blind, and its absence would be indistinguishable from a day nobody ran.
+    // blind, and its absence would be indistinguishable from a day nobody ran. It is
+    // filed under the pinned operator because that is the book whose credentials the
+    // fleet is missing; an anonymous blind would be evidence about nobody.
+    const account = resolveLiveBrokerOperator() || 'admin';
     const r = captureBrokerOrderDay({
       etDay,
       orders: null,
-      error: 'no production Tradier options credentials resolvable for the live operator',
+      error: 'no production Tradier options credentials resolvable for any operator on the roster',
       capturedAt: Date.now(),
       accountEnv: 'production',
+      account,
     });
     return {
       ...base,
@@ -12755,41 +12919,103 @@ async function runBrokerOrderDayCapture(opts: { force?: boolean } = {}): Promise
       written: r.written,
       error: r.line?.error ?? null,
       attestation: r.line?.attestation ?? null,
+      accountsConsidered: roster.considered,
+      accountsWithoutProductionClient: roster.withoutClient,
+      duplicateAccountIds: roster.duplicateAccountIds,
+      rosterAccounts: roster.accounts.map(a => a.account),
+      accounts: [
+        {
+          account,
+          accountIdMasked: null,
+          written: r.written,
+          skippedAlreadyCaptured: false,
+          orders: 0,
+          read: false,
+          attestation: r.line?.attestation ?? null,
+          error: r.line?.error ?? null,
+        },
+      ],
     };
   }
-  let orders: TradierAccountOrder[] | null = null;
-  let error: string | null = null;
-  try {
-    orders = await client.listOrders();
-  } catch (err) {
-    error = err instanceof Error ? err.message : String(err);
-    log.warn('tra3939 broker order capture: listOrders failed', { etDay, reason: error });
-  }
-  const result = captureBrokerOrderDay({
-    etDay,
-    orders,
-    error,
-    capturedAt: Date.now(),
-    accountEnv: 'production',
-  });
-  if (result.written) {
-    log.info('tra3939 broker order window captured (TRA-3939)', {
+
+  const results: BrokerOrderDayCaptureAccountResult[] = [];
+  for (const acct of roster.accounts) {
+    let orders: TradierAccountOrder[] | null = null;
+    let error: string | null = null;
+    try {
+      orders = await acct.client.listOrders();
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+      log.warn('tra3939 broker order capture: listOrders failed', {
+        etDay,
+        account: acct.account,
+        reason: error,
+      });
+    }
+    const result = captureBrokerOrderDay({
       etDay,
+      orders,
+      error,
+      capturedAt: Date.now(),
+      accountEnv: 'production',
+      account: acct.account,
+      accountId: acct.accountId,
+    });
+    if (result.written) {
+      log.info('tra3939 broker order window captured (TRA-3939/TRA-4009)', {
+        etDay,
+        account: acct.account,
+        orders: result.line?.orders.length ?? 0,
+        etDaysCovered: result.line?.etDaysCovered ?? [],
+        attestation: result.line?.attestation ?? null,
+      });
+    }
+    results.push({
+      account: acct.account,
+      accountIdMasked: maskAccountId(acct.accountId),
+      written: result.written,
+      skippedAlreadyCaptured: result.skippedAlreadyCaptured,
       orders: result.line?.orders.length ?? 0,
-      etDaysCovered: result.line?.etDaysCovered ?? [],
+      read: result.line?.read ?? false,
       attestation: result.line?.attestation ?? null,
+      error: result.line?.error ?? null,
     });
   }
+
+  // AC5 — the roll-up folds CONSERVATIVELY. `read`/`attestation` are the AND across
+  // accounts, so a run where admin read cleanly and v0nni failed reports `read:false`
+  // and carries BOTH lines; the per-account array is the authority and the scalars
+  // exist only so no pre-TRA-4009 caller reads a partial as a clean pass.
+  const attempted = results.filter(r => !r.skippedAlreadyCaptured);
+  const errors = results.filter(r => r.error !== null);
   return {
     ran: true,
-    reason: result.written ? 'captured' : result.skippedAlreadyCaptured ? 'already captured' : 'append failed',
+    reason:
+      results.some(r => r.written)
+        ? `captured ${results.filter(r => r.written).length}/${results.length} production account(s)`
+        : results.every(r => r.skippedAlreadyCaptured)
+          ? 'already captured'
+          : 'append failed',
     etDay,
-    written: result.written,
-    skippedAlreadyCaptured: result.skippedAlreadyCaptured,
-    orders: result.line?.orders.length ?? 0,
-    read: result.line?.read ?? false,
-    attestation: result.line?.attestation ?? null,
-    error: result.line?.error ?? null,
+    written: results.some(r => r.written),
+    skippedAlreadyCaptured: results.every(r => r.skippedAlreadyCaptured),
+    orders: results.reduce((n, r) => n + r.orders, 0),
+    read: attempted.length > 0 && attempted.every(r => r.read),
+    attestation:
+      attempted.length === 0
+        ? null
+        : attempted.some(r => r.attestation === 'blind')
+          ? 'blind'
+          : attempted.some(r => r.attestation === 'partial')
+            ? 'partial'
+            : 'full',
+    error: errors.length === 0 ? null : errors.map(r => `${r.account}: ${r.error}`).join('; '),
+    accounts: results,
+    accountsConsidered: roster.considered,
+    accountsWithProductionClient: roster.accounts.length,
+    accountsWithoutProductionClient: roster.withoutClient,
+    duplicateAccountIds: roster.duplicateAccountIds,
+    rosterAccounts: roster.accounts.map(a => a.account),
   };
 }
 
@@ -12800,13 +13026,28 @@ async function runBrokerOrderDayCapture(opts: { force?: boolean } = {}): Promise
  * grader surface on this box: it publishes COUNTS, COVERAGE and GAPS — never a
  * token, an account id or a price. `orderIds` is a cardinality, not the ids.
  */
-app.get('/api/health/order-provenance-capture', (_req, res) => {
+app.get('/api/health/order-provenance-capture', async (_req, res) => {
   const witness = summarizeEngineSubmitWitness();
-  const captures = summarizeBrokerOrderCaptures();
+  // TRA-4009 — the roster is resolved for the READ too, not only for the write.
+  // Without it an account that has NEVER been captured is invisible here: the
+  // summary can only name books that already appear on disk, and the whole defect
+  // was a book that never did. Resolving creds builds no client and makes no broker
+  // call; a settings read is all it costs.
+  const roster = await resolveProductionCaptureAccounts().catch(err => {
+    log.warn('tra4009 capture roster unresolvable on the read path', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  });
+  const captures = summarizeBrokerOrderCaptures({
+    knownAccounts: roster?.accounts.map(a => a.account) ?? [],
+  });
   // TRA-3939 AC4 — the issuer join run over EVERY captured option order, so the
   // terminal branches fire on real bytes without waiting for the next over-sell.
+  // TRA-4009 — fed the ACCOUNT-STAMPED rows, so every verdict says which book it
+  // was read from instead of implying the archive is one surface.
   const orderCensus = censusCapturedOrders({
-    orders: capturedBrokerOrders(),
+    orders: capturedBrokerOrderRows(),
     submittedIds: witness.armed ? engineSubmittedProductionOrderIds() : new Set<number>(),
     filledIds: engineFilledOrderIds(summarizeLiveOptionsFeeSlippage().records),
     attestedEtDays: new Set(witness.coveredEtDays),
@@ -12835,6 +13076,37 @@ app.get('/api/health/order-provenance-capture', (_req, res) => {
       days: captures.days,
       // A MISSED DAY IS A NAMED GAP, NEVER AN EMPTY ONE (AC2).
       gapEtDays: captures.gapEtDays,
+      /**
+       * TRA-4009 AC1 — the per-book picture, and the two folds kept apart.
+       *
+       * `fleetCapturedEtDays` (INTERSECTION) is the only field that entitles a
+       * reader to say "we hold the fleet's orders for that day". `attestedEtDays`
+       * above is a claim about the RECORDER's residency and folds by union —
+       * different question, different answer, both published so neither has to be
+       * guessed from the other.
+       */
+      accounts: captures.accounts,
+      knownAccounts: captures.knownAccounts,
+      fleetCapturedEtDays: captures.fleetCapturedEtDays,
+      accountGapEtDays: captures.accountGapEtDays,
+      /**
+       * The roster the read was taken against. `null` ⇒ settings were unreadable
+       * this call, so `knownAccounts` fell back to whatever is already on disk and
+       * an account that has never been captured could still be invisible. A blind
+       * roster must not read like a roster of one.
+       */
+      productionAccountRoster:
+        roster === null
+          ? null
+          : {
+              accounts: roster.accounts.map(a => ({
+                account: a.account,
+                accountIdMasked: maskAccountId(a.accountId),
+              })),
+              considered: roster.considered,
+              withoutProductionClient: roster.withoutClient.length,
+              duplicateAccountIds: roster.duplicateAccountIds,
+            },
     },
     /**
      * The days on which absence from the submit ledger MEANS something. This is
@@ -12863,7 +13135,14 @@ app.post('/api/health/order-provenance-capture', requireAuth, requireAdmin, asyn
   const force = String((req.query as Record<string, unknown>)['force'] ?? '') === 'true';
   try {
     const result = await runBrokerOrderDayCapture({ force });
-    res.json({ ok: true, force, ...result, captures: summarizeBrokerOrderCaptures() });
+    // TRA-4009 — the summary is taken against the roster the pass just resolved, so
+    // a book the run could not capture is named here rather than being absent.
+    res.json({
+      ok: true,
+      force,
+      ...result,
+      captures: summarizeBrokerOrderCaptures({ knownAccounts: result.rosterAccounts }),
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
   }
@@ -12875,14 +13154,17 @@ app.post(
   requireAdmin,
   async (_req, res) => {
     const operator = resolveLiveBrokerOperator();
-    const settings = await loadSettings(operator);
     // TRA-3112 — `/accounts/{id}/orders` is the ACCOUNT surface, same scope as
-    // `listAccountHistory`. Resolved AS the operator; the route is already admin.
-    const client = buildTradierAccountClientForEnv(settings, 'production', operator);
-    if (!client) {
+    // `listAccountHistory`. Resolved AS each operator; the route is already admin.
+    // TRA-4009 — every production book, not just the pinned operator's. The
+    // archive union below was widened by this ticket; leaving the LIVE fetch on one
+    // account would have left today's sibling orders unreachable until the daily
+    // capture ran, which is the same one-account blindness with a shorter fuse.
+    const roster = await resolveProductionCaptureAccounts();
+    if (roster.accounts.length === 0) {
       res.status(409).json({
         ok: false,
-        error: 'No production Tradier options credentials resolvable for the live operator',
+        error: 'No production Tradier options credentials resolvable for any operator on the roster',
       });
       return;
     }
@@ -12891,17 +13173,32 @@ app.post(
     // AT THE CLIENT. This is the one place that can tell them apart, and it
     // must: a failed fetch presenting as "the broker holds no orders" is the
     // closed-world reading that turns a blind into a false accusation.
-    let liveOrders: Awaited<ReturnType<typeof client.listOrders>> | null = null;
-    let fetchError: string | null = null;
-    try {
-      liveOrders = await client.listOrders();
-    } catch (err) {
-      fetchError = err instanceof Error ? err.message : String(err);
-      log.warn('tra3932 open-leg provenance: broker order fetch failed', {
-        operator,
-        reason: fetchError,
-      });
+    //
+    // ⚠ TRA-4009 AC5 — per account, and the failures are NOT folded into one flag.
+    // `liveOrders` stays `null` unless EVERY account answered: a partial read that
+    // presented as a complete one would re-create the closed-world reading at the
+    // fleet level, which is strictly worse than the per-client version because it
+    // looks like it covered two books.
+    const perAccountFetch: Array<{ account: string; orders: number | null; error: string | null }> = [];
+    const liveRows: TradierAccountOrder[] = [];
+    for (const acct of roster.accounts) {
+      try {
+        const rows = await acct.client.listOrders();
+        liveRows.push(...rows);
+        perAccountFetch.push({ account: acct.account, orders: rows.length, error: null });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        perAccountFetch.push({ account: acct.account, orders: null, error: reason });
+        log.warn('tra3932 open-leg provenance: broker order fetch failed', {
+          operator: acct.account,
+          reason,
+        });
+      }
     }
+    const failed = perAccountFetch.filter(f => f.error !== null);
+    const liveOrders: TradierAccountOrder[] | null = failed.length === 0 ? liveRows : null;
+    const fetchError =
+      failed.length === 0 ? null : failed.map(f => `${f.account}: ${f.error}`).join('; ');
     // TRA-3939 — the live fetch UNION the durable daily archive, de-duplicated on
     // order id. This is the half of the remedy that widens REACH: the live call
     // serves one trading day, and every day we captured is a day that stays
@@ -12971,7 +13268,9 @@ app.post(
       brokerOrderCapture: {
         archivedOrders: archived.length,
         liveOrders: liveOrders === null ? null : liveOrders.length,
-        ...summarizeBrokerOrderCaptures(),
+        // TRA-4009 AC5 — two independent lines, never one folded verdict.
+        liveOrdersByAccount: perAccountFetch,
+        ...summarizeBrokerOrderCaptures({ knownAccounts: roster.accounts.map(a => a.account) }),
       },
     });
   },

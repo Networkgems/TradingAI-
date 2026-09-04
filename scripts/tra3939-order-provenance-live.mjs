@@ -27,6 +27,17 @@
  * graded as a FAIL rather than a blind because the evidence is not recoverable:
  * a missed capture is a permanent hole, not a re-runnable measurement.
  *
+ * ## TRA-4009 — G3 grades EVERY production account; one uncaptured account is a FAIL
+ *
+ * `listOrders()` is per Tradier account and the fleet trades two live books. G3 used
+ * to grade `days[].captured`, which is the OR across accounts — true the moment ANY
+ * book answered. So a day on which only the admin account was archived read as a
+ * clean pass while the sibling's orders expired unarchived every night for a
+ * fortnight. G3 now gates on `fleetCaptured` (the AND) and NAMES the missing books,
+ * and G9 grades that the archive reaches every account on the roster at all. A
+ * roster the surface cannot resolve is BLIND, never a pass: without it, an account
+ * that has NEVER been captured cannot appear as missing.
+ *
  * USAGE
  *   node scripts/tra3939-order-provenance-live.mjs [--expect=<sha>] [--base=<url>] [--capture]
  *
@@ -175,24 +186,50 @@ async function main() {
     pass('G2 durable', `ephemeral=false dataDir=${payload.durability?.dataDir}`);
   }
 
-  // G3 — the time-critical one. Post-close on a market day, TODAY must be captured.
+  // G3 — the time-critical one. Post-close on a market day, TODAY must be captured
+  // FOR EVERY PRODUCTION ACCOUNT (TRA-4009 AC3).
+  //
+  // ⚠ `today.captured` is the OR across books — true the moment ANY account
+  // answered. Grading on it is what let one uncaptured account read as a partial
+  // pass for a fortnight while v0nni's orders expired unarchived every night. The
+  // gate is `fleetCaptured` (the AND) and it names who is missing.
   const today = days.find((d) => d.etDay === et.day) ?? null;
+  const roster = capture.productionAccountRoster ?? null;
+  const rosterNames = Array.isArray(roster?.accounts) ? roster.accounts.map((a) => a.account) : null;
+  const fleetKnown = typeof today?.fleetCaptured === 'boolean';
   if (!et.isWeekday) {
     pass('G3 today captured', `${et.day} is a weekend — no session to capture`);
   } else if (et.hour < 16) {
     pass('G3 today captured', `etHour=${et.hour} — before the 16:00 ET close; the window is not open yet`);
-  } else if (today && today.captured) {
+  } else if (today === null) {
+    fail(
+      'G3 today captured (every production account)',
+      `${et.day} is a market day, it is ${et.hour}:00 ET (post-close), and the broker's ONE-DAY window `
+        + 'holds today\'s orders RIGHT NOW — but there is NO capture attempt at all for today, on any '
+        + 'account. This evidence is not recoverable after the ET rollover.',
+    );
+  } else if (!fleetKnown) {
+    blind(
+      'brokerOrderCapture.days[].fleetCaptured is absent — this build predates TRA-4009 and its '
+        + '"captured" flag is the OR across accounts, so one uncaptured production book would read '
+        + 'as a captured day. The gate cannot be evaluated.',
+    );
+  } else if (today.fleetCaptured) {
     pass(
-      'G3 today captured',
-      `${et.day}: orders=${today.orders} optionOrders=${today.optionOrders} attestation=${today.attestation}`,
+      'G3 today captured (every production account)',
+      `${et.day}: accounts=[${(today.capturedAccounts ?? []).join(', ')}] orders=${today.orders} `
+        + `optionOrders=${today.optionOrders} attestation=${today.attestation}`,
     );
   } else {
     fail(
-      'G3 today captured',
+      'G3 today captured (every production account)',
       `${et.day} is a market day, it is ${et.hour}:00 ET (post-close), and the broker's ONE-DAY window `
-        + `holds today's orders RIGHT NOW — but no successful capture exists for it`
-        + (today ? ` (${today.attempts} attempt(s), lastError=${today.lastError})` : ' (no attempt at all)')
-        + '. This evidence is not recoverable after the ET rollover.',
+        + `holds today's orders RIGHT NOW — but ${(today.missingAccounts ?? ['?']).length} production `
+        + `account(s) have NO successful capture for it: ${(today.missingAccounts ?? ['?']).join(', ')}`
+        + ` (captured: ${(today.capturedAccounts ?? []).join(', ') || 'none'};`
+        + ` ${today.attempts} attempt(s), lastError=${today.lastError}).`
+        + ' ONE uncaptured account is a FAIL, not a partial pass — this evidence is not recoverable'
+        + ' after the ET rollover, and it is the whole of TRA-4009.',
     );
   }
 
@@ -283,6 +320,55 @@ async function main() {
       blind(
         `the census holds ${rows.length} option order(s) and reached NO terminal verdict — nothing captured on an `
           + `attested day and nothing in the submit ledger. The branches are still unexercised on real bytes.`,
+      );
+    }
+  }
+
+  // G9 — TRA-4009 AC1/AC2/AC5. The archive must REACH every production account and
+  // publish which one each row came from. The two failure shapes graded here are
+  // the ones a count cannot see:
+  //   • the roster is unreadable ⇒ BLIND, because `knownAccounts` then falls back to
+  //     whatever is already on disk and an account that has NEVER been captured is
+  //     invisible — which is exactly the state this ticket was filed on;
+  //   • a book with no `accountIdMasked` anywhere on its rows ⇒ its lines predate
+  //     the stamp, so "which account" is still an inference.
+  if (roster === null) {
+    blind(
+      'brokerOrderCapture.productionAccountRoster is absent or unreadable. Without it '
+        + '`knownAccounts` is sourced from the capture file alone, so a production account that has '
+        + 'never been captured cannot appear as missing — the surface reads clean for the exact '
+        + 'defect TRA-4009 is about. This build may predate TRA-4009.',
+    );
+  } else if (rosterNames.length === 0) {
+    fail(
+      'G9 archive reaches every production account',
+      'the roster resolved ZERO production accounts — no book can be captured, and every provenance '
+        + 'question on this host will expire with the broker\'s one-day window',
+    );
+  } else {
+    const accts = Array.isArray(capture.accounts) ? capture.accounts : [];
+    const unseen = rosterNames.filter((n) => !accts.some((a) => a.account === n && a.lines > 0));
+    const unstamped = accts.filter((a) => a.lines > 0 && a.accountIdMasked === null).map((a) => a.account);
+    const behind = (capture.accountGapEtDays ?? [])
+      .map((g) => `${g.account} missing ${g.etDays.length} day(s)`)
+      .join('; ');
+    if (unseen.length > 0) {
+      fail(
+        'G9 archive reaches every production account',
+        `${unseen.length} of ${rosterNames.length} production account(s) have NO capture line on this `
+          + `disk at all: ${unseen.join(', ')}. A provenance question on those books expires with the `
+          + `broker's one-day window every night.`,
+      );
+    } else {
+      pass(
+        'G9 archive reaches every production account',
+        `accounts=[${rosterNames.join(', ')}] all have lines`
+          + (unstamped.length > 0 ? `; NOT YET account-stamped: ${unstamped.join(', ')}` : '; all account-stamped')
+          + `; fleetCapturedEtDays=${(capture.fleetCapturedEtDays ?? []).length}`
+          + (behind ? `; historical per-account gaps — ${behind}` : '; no per-account gaps')
+          + (census && census.idsSeenOnMultipleAccounts > 0
+            ? `; ⚠ ${census.idsSeenOnMultipleAccounts} order id(s) served by TWO accounts`
+            : ''),
       );
     }
   }

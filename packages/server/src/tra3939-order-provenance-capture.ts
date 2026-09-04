@@ -83,6 +83,57 @@
  * with `DATA_DIR` unset these files land inside the build bundle and evaporate on
  * the next redeploy with no error to catch. `ephemeral` is published on both
  * summaries and MUST be read first.
+ *
+ * ## TRA-4009 — A CAPTURED DAY IS A CLAIM ABOUT **ONE ACCOUNT** UNTIL THE LINE SAYS WHICH
+ *
+ * `listOrders()` is per Tradier account. The first cut of half (2) resolved ONE
+ * production client (`resolveLiveBrokerOperator()`'s — the admin's) and wrote one
+ * line per ET day with no account on it, while the fleet trades TWO live books.
+ * Measured 2026-08-25: the fill ledger held two NVTS `buy_to_open` fills on 08-24
+ * (`143021643` @1.54, `143032832` @1.51) and two `sell_to_close` on 08-25
+ * (`143196771`, `143197015`); the captures held ONE of each, and the admin
+ * account's own broker history agreed with the capture to the row. The other
+ * account's orders were never archived at all — so a provenance question on a
+ * `v0nni` contract lands `blind_broker_window` / `blind_no_order_record` FOREVER,
+ * on a day the surface reported as captured. That is the defect TRA-3939 was
+ * filed to end, surviving intact on the sibling book.
+ *
+ * The submit half never had this problem: it records `accountId` on every line and
+ * `engineSubmittedProductionOrderIds()` unions both books. So the ID SET was
+ * fleet-wide while the ORDER ARCHIVE was one-account — the worst possible pairing,
+ * because the fleet-wide half makes the one-account half look complete.
+ *
+ * Every capture line therefore carries `account` (the operator/book it was read AS)
+ * and `accountId` (the Tradier account number the rows came from), and the archive
+ * is keyed on `(etDay, account)`. A day captured for one account and not another is
+ * a NAMED GAP on the one that is missing.
+ *
+ * ### The two folds this module publishes, and why they are NOT the same fold
+ *
+ * Conflating them is the whole trap, so they are named separately:
+ *
+ *   • **`attestedEtDays` — a PROCESS property.** "The submit recorder was resident
+ *     for the whole window in which an order could have been placed on this day."
+ *     It is what a `desk_placed` verdict stands on, and the submit ledger it
+ *     licenses is fleet-wide. One account's successful, full-session capture already
+ *     proves the process was up and armed, so this folds by **union** across
+ *     accounts. Intersecting would silently retract residency we actually proved.
+ *   • **`fleetCapturedEtDays` — a REACH property.** "We hold the order rows for
+ *     EVERY known production account on this day." It is what an *archive* claim
+ *     stands on, and it folds by **intersection**: an account we did not capture is
+ *     an account whose contracts are unanswerable, whatever the sibling read. The
+ *     per-day `missingAccounts` names exactly who is missing.
+ *
+ * A day can be attested (the recorder was up) and NOT fleet-captured (we did not
+ * archive v0nni's orders). Both statements are true at once and both are published.
+ *
+ * ### One account's read failing must never fold into the other's verdict (AC5)
+ *
+ * Each account gets its OWN capture line, with its own `read`/`error`/`attestation`.
+ * A failed read for `v0nni` and a clean read for `admin` on the same day produce two
+ * independent lines and two independent per-account rows — never one merged verdict
+ * whose `read:true` came from whichever account happened to answer. The fleet row for
+ * that day reads `fleetCaptured:false` and names `v0nni` in `missingAccounts`.
  */
 
 import { appendFileSync, mkdirSync, readFileSync } from 'fs';
@@ -115,6 +166,40 @@ export function etDayOf(ms: number): string {
     day: '2-digit',
   }).format(new Date(ms));
 }
+
+/**
+ * TRA-4009 — how a Tradier account number appears on a PUBLIC surface.
+ *
+ * `/api/health/order-provenance-capture` is unauthenticated by design and publishes
+ * counts, coverage and gaps — never a token, a price, or an account number. But AC2
+ * asks every census row to say which account it was read from, and "which account"
+ * has to be legible to a reader who is looking at two books.
+ *
+ * So the two identities are split: `account` (the operator/book NAME — `admin`,
+ * `v0nni`, already public via `crossBookEpisodes.books`) is the key a reader joins
+ * on, and the raw `accountId` stays on disk where the evidence lives. What reaches
+ * the wire is this mask, which is enough to tell two accounts apart and to match a
+ * brokerage statement, and not enough to be an account number.
+ */
+export function maskAccountId(accountId: string | null | undefined): string | null {
+  if (typeof accountId !== 'string') return null;
+  const trimmed = accountId.trim();
+  if (trimmed === '') return null;
+  return trimmed.length <= 4 ? '***' : `***${trimmed.slice(-4)}`;
+}
+
+/**
+ * The account key a capture line written BEFORE TRA-4009 belongs to.
+ *
+ * Those lines carry no `account` field because the writer only ever had one client.
+ * Which client that was is not a guess — the pre-TRA-4009 `runBrokerOrderDayCapture`
+ * built `buildTradierAccountClientForEnv(settings, 'production', resolveLiveBrokerOperator())`
+ * and nothing else. But this module is a LEAF (data-dir + observability only) and must
+ * not import the operator resolver, so the attribution is supplied BY THE CALLER, which
+ * has it. A caller that does not supply one gets this sentinel rather than a guessed
+ * `'admin'`: an unattributed line must not silently become somebody's evidence.
+ */
+export const UNATTRIBUTED_ACCOUNT = 'unattributed_pre_tra4009';
 
 // ── half (1): the submit-time id ledger ──────────────────────────────────────
 
@@ -159,6 +244,8 @@ type SubmitLine = EngineSubmittedOrderLine | EngineSubmitArmLine;
 
 let dataDir: string | null = null;
 let bootedAt: number | null = null;
+/** TRA-4009 — who unstamped (pre-TRA-4009) capture lines belong to. Set at boot. */
+let legacyAccount: string | null = null;
 let submitAppendErrors = 0;
 let lastSubmitAppendError: string | null = null;
 let captureAppendErrors = 0;
@@ -168,6 +255,26 @@ let currentBook: string | null = null;
 
 export function setOrderProvenanceCaptureDataDir(dir: string | null): void {
   dataDir = dir;
+}
+
+/**
+ * TRA-4009 — declare which account the UNSTAMPED capture lines on this disk belong to.
+ *
+ * Set once at boot from `resolveLiveBrokerOperator()`, which is provably the client
+ * the pre-TRA-4009 writer used (it built no other). This is an ATTRIBUTION, supplied
+ * by the layer that has the fact, not an inference made by this leaf module. Left
+ * unset, unstamped lines read as {@link UNATTRIBUTED_ACCOUNT} — visible, joined to
+ * nobody, and never silently folded into a real book's coverage.
+ */
+export function setOrderProvenanceLegacyAccount(account: string | null): void {
+  legacyAccount = account && account.length > 0 ? account : null;
+}
+
+/** The account key a capture line answers to, legacy lines included. */
+function accountOf(line: BrokerOrderCaptureLine): string {
+  const stamped = line.account;
+  if (typeof stamped === 'string' && stamped.length > 0) return stamped;
+  return legacyAccount ?? UNATTRIBUTED_ACCOUNT;
 }
 
 export function engineSubmitLogPath(dir: string): string {
@@ -186,6 +293,7 @@ export function __resetOrderProvenanceCaptureForTest(): void {
   lastSubmitAppendError = null;
   captureAppendErrors = 0;
   currentBook = null;
+  legacyAccount = null;
 }
 
 /**
@@ -437,6 +545,16 @@ export interface BrokerOrderCaptureLine {
   /** Submit-ledger lines on disk at capture time — the co-witness, not a guess. */
   submitLedgerLines: number;
   accountEnv: string;
+  /**
+   * TRA-4009 — the operator/book this day was read AS. `listOrders()` is per
+   * account, so without this the line is a claim about SOME account, and the
+   * reader cannot tell which. Absent on lines written before TRA-4009; readers
+   * resolve those through {@link UNATTRIBUTED_ACCOUNT} or the caller's
+   * `legacyAccount`.
+   */
+  account?: string;
+  /** TRA-4009 — the Tradier account number the rows came from. Masked on the wire. */
+  accountId?: string | null;
 }
 
 /**
@@ -484,6 +602,14 @@ export interface CaptureBrokerOrderDayInput {
   error?: string | null;
   capturedAt: number;
   accountEnv: string;
+  /**
+   * TRA-4009 — the operator/book whose client served (or failed to serve) these
+   * rows. REQUIRED: `listOrders()` is per account, so an unlabelled capture is a
+   * claim about an account the reader cannot name — which is the whole defect.
+   */
+  account: string;
+  /** The Tradier account number behind the read, when the caller resolved one. */
+  accountId?: string | null;
 }
 
 export interface CaptureBrokerOrderDayResult {
@@ -495,13 +621,15 @@ export interface CaptureBrokerOrderDayResult {
 }
 
 /**
- * Capture ONE ET day's broker order list.
+ * Capture ONE ET day's broker order list, FOR ONE ACCOUNT.
  *
- * Idempotent on SUCCESS only: a day already holding a `read:true` line is skipped,
- * so a scheduler that fires hourly after the close writes once. A day holding only
- * BLIND lines is retried — the whole point of the retry window is that a failed
- * read at 16:00 ET can still succeed at 17:00 ET, while the broker's one-day window
- * is open.
+ * Idempotent on SUCCESS only, and the idempotence key is `(etDay, account)` — not
+ * `etDay` (TRA-4009). Keying on the day alone is exactly how the second book went
+ * un-archived for a fortnight: the admin capture landed first, the day then read as
+ * "already captured", and v0nni's read was skipped without ever being attempted.
+ * A day holding only BLIND lines for this account is retried — the whole point of
+ * the retry window is that a failed read at 16:00 ET can still succeed at 17:00 ET,
+ * while the broker's one-day window is open.
  *
  * Never throws: the caller is a scheduler tick shared with unrelated work.
  */
@@ -533,11 +661,17 @@ export function captureBrokerOrderDay(input: CaptureBrokerOrderDayInput): Captur
     recorderBootedAt: bootedAt,
     submitLedgerLines: readSubmitLines().lines.length,
     accountEnv: input.accountEnv,
+    account: input.account,
+    accountId: input.accountId ?? null,
   };
   if (dataDir == null) {
     return { written: false, skippedAlreadyCaptured: false, appendError: null, line };
   }
-  const already = readBrokerOrderCaptures().some(l => l.etDay === input.etDay && l.read);
+  // TRA-4009 — `(etDay, account)`, never `etDay`. See the docblock: the day-only
+  // key made the first account to answer suppress every sibling read.
+  const already = readBrokerOrderCaptures().some(
+    l => l.etDay === input.etDay && l.read && accountOf(l) === input.account,
+  );
   if (already) {
     return { written: false, skippedAlreadyCaptured: true, appendError: null, line: null };
   }
@@ -545,6 +679,7 @@ export function captureBrokerOrderDay(input: CaptureBrokerOrderDayInput): Captur
     captureAppendErrors += 1;
     log.warn('tra3939 broker order capture append failed', {
       etDay: input.etDay,
+      account: input.account,
       reason: lastSubmitAppendError,
     });
     return { written: false, skippedAlreadyCaptured: false, appendError: lastSubmitAppendError, line };
@@ -583,6 +718,39 @@ export interface BrokerOrderCaptureDayRow {
   attestation: 'full' | 'partial' | 'blind';
   lastError: string | null;
   capturedAt: number | null;
+  /**
+   * TRA-4009 — accounts with a successful capture for this day, and the known
+   * production accounts WITHOUT one. `captured` above is the OR across accounts
+   * (some book's orders are archived); `fleetCaptured` is the AND (every known
+   * book's are). A day captured for `admin` and missing `v0nni` reads
+   * `captured:true, fleetCaptured:false, missingAccounts:['v0nni']` — never as a
+   * clean day.
+   */
+  capturedAccounts: string[];
+  missingAccounts: string[];
+  fleetCaptured: boolean;
+}
+
+/** TRA-4009 — one production book's own coverage picture, folded by nobody. */
+export interface BrokerOrderCaptureAccountSummary {
+  account: string;
+  /** Masked; the raw number stays on disk. `null` until a line records one. */
+  accountIdMasked: string | null;
+  lines: number;
+  days: BrokerOrderCaptureDayRow[];
+  capturedEtDays: string[];
+  attestedEtDays: string[];
+  unattestedEtDays: string[];
+  /** Weekday gaps inside THIS account's own first..last capture span. */
+  gapEtDays: string[];
+  /**
+   * Days some OTHER account captured that this one did not — including days
+   * before this account was ever read. This is the field AC1 is about: without
+   * it, an account that started being captured on day 14 reads as gap-free.
+   */
+  missingEtDays: string[];
+  firstEtDay: string | null;
+  lastEtDay: string | null;
 }
 
 export interface BrokerOrderCaptureSummary {
@@ -591,10 +759,27 @@ export interface BrokerOrderCaptureSummary {
   retention: string;
   lines: number;
   days: BrokerOrderCaptureDayRow[];
-  /** Days with a successful, FULL-session capture. The witness authority. */
+  /**
+   * Days the SUBMIT RECORDER is attested for — a PROCESS property, folded by
+   * UNION across accounts. One account's full-session capture already proves the
+   * recorder was resident and armed for that whole day, and the submit ledger it
+   * licenses is fleet-wide. This is the authority a `desk_placed` stands on.
+   *
+   * ⚠ It is NOT an archive-reach claim. See {@link fleetCapturedEtDays}.
+   */
   attestedEtDays: string[];
   /** Days captured but not attestable. Named, so `full` is never inferred. */
   unattestedEtDays: string[];
+  /**
+   * TRA-4009 — days on which EVERY known production account was captured. A REACH
+   * property, folded by INTERSECTION. This is the only field that entitles a reader
+   * to say "we hold the fleet's orders for that day".
+   */
+  fleetCapturedEtDays: string[];
+  /** TRA-4009 — per book. `accounts.length > 1` is the property this ticket added. */
+  accounts: BrokerOrderCaptureAccountSummary[];
+  /** The account set the intersection was taken over, published so it is auditable. */
+  knownAccounts: string[];
   /**
    * ET weekdays between the first capture and the newest one with NO line at all.
    *
@@ -605,6 +790,24 @@ export interface BrokerOrderCaptureSummary {
    * a real gap read as clean costs a contract.
    */
   gapEtDays: string[];
+  /**
+   * TRA-4009 — `(etDay, account)` pairs a known account is missing on a day some
+   * sibling captured. The per-account gap, made countable at the fleet level; a
+   * fleet `gapEtDays` of `[]` says nothing about these.
+   */
+  accountGapEtDays: Array<{ account: string; etDays: string[] }>;
+}
+
+export interface SummarizeBrokerOrderCapturesOptions {
+  /**
+   * Production accounts that OUGHT to be captured — the roster the intersection
+   * and `missingAccounts` are taken over. Supplied by the caller because this leaf
+   * cannot resolve settings. Accounts that appear on disk are unioned in, so a
+   * caller that passes nothing still gets an honest per-account picture; what it
+   * loses is the ability to name an account that has NEVER been captured, which is
+   * exactly the v0nni case and exactly why the route passes the live roster.
+   */
+  knownAccounts?: readonly string[];
 }
 
 /** Every ET weekday in `[from, to]` inclusive. Bounded by construction. */
@@ -623,40 +826,130 @@ function etWeekdaysBetween(from: string, to: string): string[] {
   return out;
 }
 
-export function summarizeBrokerOrderCaptures(): BrokerOrderCaptureSummary {
+/**
+ * Fold ONE group of capture lines (all same day, and — for the per-account rows —
+ * all same account) into a day row's measurable part.
+ *
+ * The successful line is the authority; a later blind retry cannot un-capture a day.
+ */
+function foldCaptureGroup(group: readonly BrokerOrderCaptureLine[]): {
+  captured: boolean;
+  attempts: number;
+  orders: number;
+  optionOrders: number;
+  attestation: 'full' | 'partial' | 'blind';
+  lastError: string | null;
+  capturedAt: number | null;
+} {
+  const good = group.find(l => l.read) ?? null;
+  const chosen = good ?? group[group.length - 1]!;
+  return {
+    captured: good !== null,
+    attempts: group.length,
+    orders: chosen.orders.length,
+    optionOrders: chosen.orders.filter(o => typeof o.optionSymbol === 'string' && o.optionSymbol !== '').length,
+    attestation: chosen.attestation,
+    lastError: group[group.length - 1]!.error,
+    capturedAt: good?.capturedAt ?? null,
+  };
+}
+
+export function summarizeBrokerOrderCaptures(
+  opts: SummarizeBrokerOrderCapturesOptions = {},
+): BrokerOrderCaptureSummary {
   const lines = readBrokerOrderCaptures();
   const byDay = new Map<string, BrokerOrderCaptureLine[]>();
-  for (const l of lines) {
-    const g = byDay.get(l.etDay);
+  const byAccount = new Map<string, BrokerOrderCaptureLine[]>();
+  const byDayAccount = new Map<string, BrokerOrderCaptureLine[]>();
+  const push = (m: Map<string, BrokerOrderCaptureLine[]>, k: string, l: BrokerOrderCaptureLine): void => {
+    const g = m.get(k);
     if (g) g.push(l);
-    else byDay.set(l.etDay, [l]);
+    else m.set(k, [l]);
+  };
+  for (const l of lines) {
+    const acct = accountOf(l);
+    push(byDay, l.etDay, l);
+    push(byAccount, acct, l);
+    push(byDayAccount, `${l.etDay} ${acct}`, l);
   }
+
+  // The roster the intersection is taken over: what the caller says OUGHT to be
+  // captured, unioned with everything actually on disk. An account that appears on
+  // disk but not in the roster (a book whose creds were removed) must not silently
+  // vanish from its own history, and an account in the roster that was never
+  // captured must not be invisible — which is the v0nni case.
+  const knownAccounts = [...new Set([...(opts.knownAccounts ?? []), ...byAccount.keys()])].sort();
+
   const days: BrokerOrderCaptureDayRow[] = [];
   const attested: string[] = [];
   const unattested: string[] = [];
+  const fleetCaptured: string[] = [];
   for (const [etDay, group] of [...byDay.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
-    // The successful line is the authority; a later blind retry cannot un-capture a day.
-    const good = group.find(l => l.read) ?? null;
-    const chosen = good ?? group[group.length - 1]!;
+    const fold = foldCaptureGroup(group);
+    const capturedAccounts = [
+      ...new Set(group.filter(l => l.read).map(accountOf)),
+    ].sort();
+    const missingAccounts = knownAccounts.filter(a => !capturedAccounts.includes(a));
     days.push({
       etDay,
-      captured: good !== null,
-      attempts: group.length,
-      orders: chosen.orders.length,
-      optionOrders: chosen.orders.filter(o => typeof o.optionSymbol === 'string' && o.optionSymbol !== '')
-        .length,
-      attestation: chosen.attestation,
-      lastError: group[group.length - 1]!.error,
-      capturedAt: good?.capturedAt ?? null,
+      ...fold,
+      capturedAccounts,
+      missingAccounts,
+      fleetCaptured: capturedAccounts.length > 0 && missingAccounts.length === 0,
     });
-    if (good !== null && good.attestation === 'full') attested.push(etDay);
+    // ATTESTATION FOLDS BY UNION — it is a claim about the RECORDER's residency,
+    // and any account's full-session capture proves it. See the module docblock.
+    if (group.some(l => l.read && l.attestation === 'full')) attested.push(etDay);
     else unattested.push(etDay);
+    // REACH FOLDS BY INTERSECTION — an account we did not archive is an account
+    // whose contracts are unanswerable, whatever its sibling read.
+    if (capturedAccounts.length > 0 && missingAccounts.length === 0) fleetCaptured.push(etDay);
   }
-  const known = days.map(d => d.etDay);
+
+  const knownDays = days.map(d => d.etDay);
   const gapEtDays =
-    known.length === 0
+    knownDays.length === 0
       ? []
-      : etWeekdaysBetween(known[0]!, known[known.length - 1]!).filter(d => !byDay.has(d));
+      : etWeekdaysBetween(knownDays[0]!, knownDays[knownDays.length - 1]!).filter(d => !byDay.has(d));
+
+  const anyCapturedDay = new Set(days.filter(d => d.captured).map(d => d.etDay));
+  const accounts: BrokerOrderCaptureAccountSummary[] = knownAccounts.map(account => {
+    const own = byAccount.get(account) ?? [];
+    const ownDayKeys = [...new Set(own.map(l => l.etDay))].sort();
+    const ownDays: BrokerOrderCaptureDayRow[] = ownDayKeys.map(etDay => {
+      const group = byDayAccount.get(`${etDay} ${account}`)!;
+      const fold = foldCaptureGroup(group);
+      return {
+        etDay,
+        ...fold,
+        capturedAccounts: fold.captured ? [account] : [],
+        missingAccounts: fold.captured ? [] : [account],
+        fleetCaptured: false, // meaningless on a single-account row; the fleet row owns it
+      };
+    });
+    const capturedEtDays = ownDays.filter(d => d.captured).map(d => d.etDay);
+    const capturedSet = new Set(capturedEtDays);
+    return {
+      account,
+      accountIdMasked:
+        maskAccountId([...own].reverse().find(l => typeof l.accountId === 'string' && l.accountId !== '')?.accountId ?? null),
+      lines: own.length,
+      days: ownDays,
+      capturedEtDays,
+      attestedEtDays: ownDays.filter(d => d.captured && d.attestation === 'full').map(d => d.etDay),
+      unattestedEtDays: ownDays.filter(d => !d.captured || d.attestation !== 'full').map(d => d.etDay),
+      gapEtDays:
+        ownDayKeys.length === 0
+          ? []
+          : etWeekdaysBetween(ownDayKeys[0]!, ownDayKeys[ownDayKeys.length - 1]!).filter(d => !capturedSet.has(d)),
+      // Every day SOMEBODY captured that this account did not. Spans days before
+      // this account's own first line, which its `gapEtDays` cannot reach.
+      missingEtDays: [...anyCapturedDay].filter(d => !capturedSet.has(d)).sort(),
+      firstEtDay: ownDayKeys[0] ?? null,
+      lastEtDay: ownDayKeys[ownDayKeys.length - 1] ?? null,
+    };
+  });
+
   return {
     dataDir,
     ephemeral: isEphemeralDataDir(dataDir),
@@ -665,27 +958,64 @@ export function summarizeBrokerOrderCaptures(): BrokerOrderCaptureSummary {
     days,
     attestedEtDays: attested,
     unattestedEtDays: unattested,
+    fleetCapturedEtDays: fleetCaptured,
+    accounts,
+    knownAccounts,
     gapEtDays,
+    accountGapEtDays: accounts
+      .filter(a => a.missingEtDays.length > 0)
+      .map(a => ({ account: a.account, etDays: a.missingEtDays })),
   };
 }
 
+/** TRA-4009 — one archived order row, WITH the account it was read from (AC2). */
+export interface CapturedBrokerOrderRow {
+  order: TradierAccountOrder;
+  /** The operator/book whose client served this row. */
+  account: string;
+  /** Masked account number, safe for the public surface. */
+  accountIdMasked: string | null;
+  /** The ET day of the CAPTURE the row came out of (not the order's create_date). */
+  captureEtDay: string;
+}
+
 /**
- * Every order row we have ever captured, newest capture per day.
+ * Every order row we have ever captured, per `(etDay, account)`.
  *
  * This is what turns the broker's one-day window into a growing archive: the
  * resolver joins against THIS, not against a live fetch, so a contract opened on a
  * day we captured stays answerable forever.
+ *
+ * ⚠ TRA-4009 — the de-dup key is `(etDay, account)`. Keying on `etDay` alone (the
+ * pre-TRA-4009 shape) discarded the sibling account's whole archive for every day
+ * both were captured, which is the same one-account blindness one layer down.
  */
-export function capturedBrokerOrders(): TradierAccountOrder[] {
-  const out: TradierAccountOrder[] = [];
-  const seenDay = new Set<string>();
+export function capturedBrokerOrderRows(): CapturedBrokerOrderRow[] {
+  const out: CapturedBrokerOrderRow[] = [];
+  const seen = new Set<string>();
   for (const l of readBrokerOrderCaptures()) {
     if (!l.read) continue;
-    if (seenDay.has(l.etDay)) continue;
-    seenDay.add(l.etDay);
-    out.push(...l.orders);
+    const account = accountOf(l);
+    const key = `${l.etDay} ${account}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const accountIdMasked = maskAccountId(l.accountId ?? null);
+    for (const order of l.orders) out.push({ order, account, accountIdMasked, captureEtDay: l.etDay });
   }
   return out;
+}
+
+/**
+ * The archive as a flat order list, de-duplicated on broker order id.
+ *
+ * Tradier order ids are broker-GLOBAL, so unioning the per-account archives cannot
+ * collide two different orders onto one id — which is why AC2 leaves the resolver's
+ * id join exactly as it was and only widens what feeds it.
+ */
+export function capturedBrokerOrders(): TradierAccountOrder[] {
+  const byId = new Map<number, TradierAccountOrder>();
+  for (const r of capturedBrokerOrderRows()) byId.set(r.order.id, r.order);
+  return [...byId.values()];
 }
 
 export function orderProvenanceCaptureAppendErrors(): { submit: number; capture: number } {
@@ -715,6 +1045,9 @@ export interface CapturedOrderCensusRow {
   issuer: CapturedOrderIssuer;
   /** The evidence the issuer verdict stands on. */
   witness: 'submit_ledger' | 'fill_ledger' | 'attested_absence' | 'unattested_day' | 'undated';
+  /** TRA-4009 AC2 — the account this row was READ FROM. Never inferred. */
+  account: string;
+  accountIdMasked: string | null;
 }
 
 export interface CapturedOrderCensusDay {
@@ -726,18 +1059,42 @@ export interface CapturedOrderCensusDay {
   blind_no_issuer_witness: number;
 }
 
+/** TRA-4009 — the same rollup, per production book. */
+export interface CapturedOrderCensusAccount {
+  account: string;
+  accountIdMasked: string | null;
+  orders: number;
+  engine_placed: number;
+  desk_placed: number;
+  blind_no_issuer_witness: number;
+  terminalOrders: number;
+}
+
 export interface CapturedOrderCensus {
   /** Option orders only — the submit ledger hooks the OPTIONS client, so an equity order's absence from it is not evidence. */
   orders: CapturedOrderCensusRow[];
   skippedNonOption: number;
   byIssuer: Record<CapturedOrderIssuer, number>;
   byDay: CapturedOrderCensusDay[];
+  /** TRA-4009 AC2 — the census split by the account each row was read from. */
+  byAccount: CapturedOrderCensusAccount[];
+  /**
+   * TRA-4009 — order ids served by MORE THAN ONE account's archive. Tradier ids are
+   * broker-global, so this should be zero; a non-zero value means two books read the
+   * same account (a cred mix-up) and the per-account split is not what it claims.
+   * Counted rather than assumed away — an invariant nobody measures is a hope.
+   */
+  idsSeenOnMultipleAccounts: number;
   /** engine_placed + desk_placed — the count of terminal verdicts reached on real rows. */
   terminalOrders: number;
 }
 
 export interface CapturedOrderCensusInput {
-  orders: readonly TradierAccountOrder[];
+  /**
+   * TRA-4009 — account-stamped archive rows. Was a bare `TradierAccountOrder[]`,
+   * which structurally could not answer AC2's "which account was this read from".
+   */
+  orders: readonly CapturedBrokerOrderRow[];
   /** Production ids the submit ledger holds. */
   submittedIds: ReadonlySet<number>;
   /** Ids our fill ledger holds, when the caller has them. A positive witness on any day. */
@@ -762,11 +1119,20 @@ export interface CapturedOrderCensusInput {
  */
 export function censusCapturedOrders(input: CapturedOrderCensusInput): CapturedOrderCensus {
   const rows: CapturedOrderCensusRow[] = [];
-  const seen = new Set<number>();
+  const seen = new Map<number, string>();
   let skippedNonOption = 0;
-  for (const o of input.orders) {
-    if (typeof o.id !== 'number' || !Number.isFinite(o.id) || seen.has(o.id)) continue;
-    seen.add(o.id);
+  let idsSeenOnMultipleAccounts = 0;
+  for (const src of input.orders) {
+    const o = src.order;
+    if (typeof o.id !== 'number' || !Number.isFinite(o.id)) continue;
+    const firstAccount = seen.get(o.id);
+    if (firstAccount !== undefined) {
+      // Broker-global ids: the same id under two accounts means two books resolved
+      // the same brokerage account. Count it, keep the first, never merge silently.
+      if (firstAccount !== src.account) idsSeenOnMultipleAccounts += 1;
+      continue;
+    }
+    seen.set(o.id, src.account);
     if (typeof o.optionSymbol !== 'string' || o.optionSymbol === '') {
       skippedNonOption += 1;
       continue;
@@ -802,6 +1168,8 @@ export function censusCapturedOrders(input: CapturedOrderCensusInput): CapturedO
       execQuantity: o.execQuantity,
       issuer,
       witness,
+      account: src.account,
+      accountIdMasked: src.accountIdMasked,
     });
   }
   rows.sort((a, b) => (a.createDate ?? '').localeCompare(b.createDate ?? '') || a.id - b.id);
@@ -811,8 +1179,25 @@ export function censusCapturedOrders(input: CapturedOrderCensusInput): CapturedO
     blind_no_issuer_witness: 0,
   };
   const dayMap = new Map<string, CapturedOrderCensusDay>();
+  const acctMap = new Map<string, CapturedOrderCensusAccount>();
   for (const r of rows) {
     byIssuer[r.issuer] += 1;
+    let a = acctMap.get(r.account);
+    if (!a) {
+      a = {
+        account: r.account,
+        accountIdMasked: r.accountIdMasked,
+        orders: 0,
+        engine_placed: 0,
+        desk_placed: 0,
+        blind_no_issuer_witness: 0,
+        terminalOrders: 0,
+      };
+      acctMap.set(r.account, a);
+    }
+    a.orders += 1;
+    a[r.issuer] += 1;
+    if (r.issuer !== 'blind_no_issuer_witness') a.terminalOrders += 1;
     const key = r.etDay ?? 'undated';
     let d = dayMap.get(key);
     if (!d) {
@@ -835,6 +1220,8 @@ export function censusCapturedOrders(input: CapturedOrderCensusInput): CapturedO
     skippedNonOption,
     byIssuer,
     byDay,
+    byAccount: [...acctMap.values()].sort((a, b) => a.account.localeCompare(b.account)),
+    idsSeenOnMultipleAccounts,
     terminalOrders: byIssuer.engine_placed + byIssuer.desk_placed,
   };
 }
