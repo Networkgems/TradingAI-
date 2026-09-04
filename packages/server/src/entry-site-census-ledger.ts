@@ -65,6 +65,34 @@ interface EntrySiteCensusRecord {
   book?: string;
 }
 
+/**
+ * ⭐ THE LEDGER'S OWN BIRTH STAMP, and it is not bookkeeping.
+ *
+ * Caught on this instrument's FIRST live read (bqb1 pid 76, 2026-09-04T02:36Z):
+ * with the file freshly created, `wired: true` + no record for 2026-09-03 was
+ * rendered as "the entry site evaluated nothing that session" — a durable ZERO
+ * for a session that ended before this code existed. That is the ticket's own
+ * defect, one layer down: A LEDGER CANNOT DISTINGUISH AN EMPTY DAY FROM A DAY
+ * IT WAS NOT ALIVE FOR UNLESS IT RECORDS WHEN IT OPENED.
+ *
+ * So the first line of the file is a marker, and every fold publishes
+ * `observingSince`. On compaction the marker is CLAMPED FORWARD to the
+ * retention cutoff rather than aged out — "I have been observing since at
+ * least the retention edge" stays true, and anything older is unanswerable
+ * anyway.
+ */
+interface EntrySiteCensusMarker {
+  ts: number;
+  kind: 'ledger_opened';
+}
+
+function isMarker(v: unknown): v is EntrySiteCensusMarker {
+  return typeof v === 'object' && v !== null
+    && (v as { kind?: unknown }).kind === 'ledger_opened'
+    && typeof (v as { ts?: unknown }).ts === 'number'
+    && Number.isFinite((v as { ts: number }).ts);
+}
+
 interface DayAccum {
   evaluated: number;
   refused: number;
@@ -83,6 +111,8 @@ interface DayAccum {
 
 let dataDir: string | null = null;
 const byDay = new Map<string, DayAccum>();
+/** ms epoch this ledger has been observing from. `null` ⇒ not wired. */
+let observingSince: number | null = null;
 
 export function entrySiteCensusLogPath(dir: string): string {
   return join(dir, ENTRY_SITE_CENSUS_LOG_FILENAME);
@@ -92,6 +122,7 @@ export function entrySiteCensusLogPath(dir: string): string {
 export function clearEntrySiteCensusLedger(): void {
   dataDir = null;
   byDay.clear();
+  observingSince = null;
 }
 
 /** Apply one evaluation to the in-memory counts (shared by record + hydrate). */
@@ -203,6 +234,10 @@ export function hydrateEntrySiteCensusFromDisk(
   const kept: string[] = [];
   let evaluated = 0;
   let refused = 0;
+  // The earliest instant the file can speak for. A marker older than the
+  // retention cutoff is CLAMPED FORWARD rather than dropped — see
+  // {@link EntrySiteCensusMarker}. Absent entirely ⇒ this boot opened it.
+  let openedAt: number | null = null;
   for (const line of raw.split('\n')) {
     const trimmed = line.trim();
     if (trimmed === '') continue;
@@ -211,6 +246,11 @@ export function hydrateEntrySiteCensusFromDisk(
       rec = JSON.parse(trimmed) as EntrySiteCensusRecord;
     } catch {
       // skip a torn/partial line rather than abort the hydrate
+      continue;
+    }
+    if (isMarker(rec)) {
+      const at = Math.max(rec.ts, cutoff);
+      openedAt = openedAt === null ? at : Math.min(openedAt, at);
       continue;
     }
     if (typeof rec.ts !== 'number' || !Number.isFinite(rec.ts) || rec.ts < cutoff) continue;
@@ -231,14 +271,22 @@ export function hydrateEntrySiteCensusFromDisk(
     if (normalized.refused) refused += 1;
   }
 
-  // Compact: rewrite the file to the retained lines only (best-effort). Skipped
-  // when nothing was dropped, to avoid a needless rewrite on every clean boot.
+  // No marker in the file ⇒ either it did not exist, or it predates this field.
+  // Either way THIS boot is the earliest instant we can honestly claim, and a
+  // day before it must never read as a durable zero.
+  const markerWasPresent = openedAt !== null;
+  observingSince = openedAt ?? now;
+
+  // Compact: rewrite the file to the marker plus the retained lines
+  // (best-effort). Skipped when nothing was dropped AND the marker is already
+  // on disk, to avoid a needless rewrite on every clean boot.
   const nonEmptyLines = raw.split('\n').filter((l) => l.trim() !== '').length;
-  if (kept.length < nonEmptyLines) {
+  const markerLine = JSON.stringify({ ts: observingSince, kind: 'ledger_opened' });
+  if (!markerWasPresent || kept.length + 1 < nonEmptyLines) {
     const path = entrySiteCensusLogPath(dir);
     try {
       mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, kept.length > 0 ? kept.join('\n') + '\n' : '', 'utf8');
+      writeFileSync(path, [markerLine, ...kept].join('\n') + '\n', 'utf8');
     } catch (err) {
       log.warn('entry-site census compaction failed', {
         reason: err instanceof Error ? err.message : String(err),
@@ -276,14 +324,27 @@ export interface EntrySiteCensusDurable {
   days: EntrySiteCensusDay[];
   /**
    * The day the caller asked about — normally the most recently closed ET
-   * session. `null` ⇒ that day is not in the retained window, which with
-   * `wired: true` IS a measurement (nothing was evaluated) and with
-   * `wired: false` is not.
+   * session. `null` ⇒ no record retained for it. ⛔ That is only a ZERO when
+   * `sessionObservation === 'observed'`; read that field first.
    */
   session: EntrySiteCensusDay | null;
   /** The ET day `session` was selected by; `null` when the caller named none. */
   sessionDate: string | null;
+  /** ISO of the earliest instant this ledger can speak for. `null` ⇒ not wired. */
+  observingSince: string | null;
+  /**
+   * Whether this ledger was alive for the session it is being asked about.
+   * ⛔ `not_observed` ⇒ `session: null` is NOT a zero — the ledger did not
+   * exist yet (a deploy, a wiped DATA_DIR, a day past retention).
+   */
+  sessionObservation: 'observed' | 'partial' | 'not_observed' | 'unknown';
   statement: string;
+}
+
+/** The ET session window `summarizeEntrySiteCensus` grades `observingSince` against. */
+export interface EntrySiteCensusSessionWindow {
+  openMs: number;
+  closeMs: number;
 }
 
 function renderDay(etDay: string, d: DayAccum): EntrySiteCensusDay {
@@ -312,7 +373,10 @@ function renderDay(etDay: string, d: DayAccum): EntrySiteCensusDay {
  * `sessionDate` is the ET day the reader is grading (the most recently CLOSED
  * session, per `session-coverage.ts`), NOT necessarily today.
  */
-export function summarizeEntrySiteCensus(sessionDate: string | null = null): EntrySiteCensusDurable {
+export function summarizeEntrySiteCensus(
+  sessionDate: string | null = null,
+  sessionWindow: EntrySiteCensusSessionWindow | null = null,
+): EntrySiteCensusDurable {
   const days = [...byDay.entries()]
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
     .slice(-MAX_DAYS_PUBLISHED)
@@ -322,16 +386,39 @@ export function summarizeEntrySiteCensus(sessionDate: string | null = null): Ent
     ? renderDay(sessionDate, sessionAccum)
     : null;
   const wired = dataDir !== null;
+
+  // ⛔ The half this instrument's own first live read got wrong: an absent day
+  // is a ZERO only if the ledger was open across that day. `observingSince`
+  // decides it, and a missing window is `unknown` — never `observed`.
+  let sessionObservation: EntrySiteCensusDurable['sessionObservation'] = 'unknown';
+  if (wired && observingSince !== null && sessionWindow !== null) {
+    if (observingSince <= sessionWindow.openMs) sessionObservation = 'observed';
+    else if (observingSince <= sessionWindow.closeMs) sessionObservation = 'partial';
+    else sessionObservation = 'not_observed';
+  }
+
+  const dayLabel = sessionDate ?? '(no session named)';
   const statement = !wired
     ? '⛔ NOT WIRED — no DATA_DIR configured, so nothing is persisted and an absent day means '
       + '"never stored", not "never evaluated" (TRA-4343).'
     : session !== null
-      ? `${sessionDate ?? ''}: ${String(session.evaluated)} evaluated / ${String(session.refused)} refused `
-        + `at the entry site, DURABLE — survives a post-close redeploy (TRA-4343).`
-      : sessionDate !== null
-        ? `${sessionDate}: no entry-site evaluation retained. With wired: true this IS a measurement — `
-          + 'the entry site evaluated nothing that session (TRA-4343).'
-        : `${String(days.length)} ET day(s) retained; name a sessionDate to select one (TRA-4343).`;
+      ? `${dayLabel}: ${String(session.evaluated)} evaluated / ${String(session.refused)} refused `
+        + `at the entry site, DURABLE — survives a post-close redeploy (observation: `
+        + `${sessionObservation}) (TRA-4343).`
+      : sessionDate === null
+        ? `${String(days.length)} ET day(s) retained; name a sessionDate to select one (TRA-4343).`
+        : sessionObservation === 'observed'
+          ? `${dayLabel}: no entry-site evaluation retained, and this ledger was open across the whole `
+            + 'session ⇒ this IS a measurement: the entry site evaluated nothing (TRA-4343).'
+          : sessionObservation === 'partial'
+            ? `⚠ ${dayLabel}: no entry-site evaluation retained, but this ledger only opened MID-session `
+              + `(${new Date(observingSince ?? 0).toISOString()}) ⇒ a LOWER BOUND, not a zero (TRA-4343).`
+            : sessionObservation === 'not_observed'
+              ? `⛔ ${dayLabel}: NOT OBSERVED — this ledger has only been recording since `
+                + `${new Date(observingSince ?? 0).toISOString()}, after that session closed. The absence `
+                + 'of a record is NOT a zero and NOT a quiet day; the session is UNMEASURED (TRA-4343).'
+              : `⛔ ${dayLabel}: observation window UNKNOWN (no session window supplied) ⇒ an absent day `
+                + 'cannot be read as a zero (TRA-4343).';
   return {
     issue: 'TRA-4343',
     wired,
@@ -339,6 +426,8 @@ export function summarizeEntrySiteCensus(sessionDate: string | null = null): Ent
     days,
     session,
     sessionDate,
+    observingSince: observingSince === null ? null : new Date(observingSince).toISOString(),
+    sessionObservation,
     statement,
   };
 }

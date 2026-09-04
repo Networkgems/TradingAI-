@@ -894,11 +894,24 @@ export function gradeUnderlyingAssetClassHealth(
   const nowMs = opts.now ?? Date.now();
   const sessionCoverage = gradeSinceBootSessionCoverage(opts.bootedAt ?? null, nowMs);
   // Grade the durable twin against the session `sessionCoverage` names, so the
-  // two can never answer about different days. `unknown` coverage selects no
-  // day rather than falling back to today's calendar date — a day nobody asked
-  // about, rendered under the label of the one they did, is the misread again.
+  // two can never answer about different days. When the boot stamp is
+  // unreadable the coverage grade is `unknown` but the CALENDAR still is not,
+  // so the session is re-derived rather than left null — a durable twin that
+  // goes blind because the ephemeral half did would be the same misread again.
+  const session = sessionCoverage.sessionDate !== null
+    && sessionCoverage.sessionOpenAt !== null
+    && sessionCoverage.sessionCloseAt !== null
+    ? {
+        date: sessionCoverage.sessionDate,
+        openMs: Date.parse(sessionCoverage.sessionOpenAt),
+        closeMs: Date.parse(sessionCoverage.sessionCloseAt),
+      }
+    : mostRecentClosedSession(nowMs);
+  // ⛔ The window is what lets the twin tell an empty day from a day it was not
+  // alive for. Absent ⇒ `sessionObservation: 'unknown'`, never `observed`.
   const durable = summarizeEntrySiteCensus(
-    sessionCoverage.sessionDate ?? mostRecentClosedSession(nowMs)?.date ?? null,
+    session?.date ?? null,
+    session === null ? null : { openMs: session.openMs, closeMs: session.closeMs },
   );
 
   const armPrecondition = gradeAssetClassArmPrecondition(env);
@@ -923,7 +936,7 @@ export function gradeUnderlyingAssetClassHealth(
     // in the nested block they may not open.
     + ` (${sessionCoverage.status}, a 0 reads ${sessionCoverage.zeroReading}`
     + `; durable ${durable.wired ? 'twin' : '⛔ NOT WIRED'} for ${durable.sessionDate ?? 'no session'}: `
-    + `${durable.session === null ? 'no record' : `${String(durable.session.evaluated)} evaluated / ${String(durable.session.refused)} refused`})`
+    + `${durable.session === null ? `no record, observation ${durable.sessionObservation}` : `${String(durable.session.evaluated)} evaluated / ${String(durable.session.refused)} refused`})`
     + `; ARM PRECONDITION ${armPrecondition.satisfied ? 'SATISFIED' : 'NOT SATISFIED'}`
     + ` (population ${armPrecondition.population}, ${String(armPrecondition.evaluated)} name(s), `
     + `${String(armPrecondition.unknownCount)} unknown ⇒ would be refused IN ERROR)`;

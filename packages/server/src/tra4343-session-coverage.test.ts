@@ -33,6 +33,7 @@ const CLOSE_0903 = Date.parse('2026-09-03T20:00:00Z'); // 16:00 ET
 const OPEN_0903 = Date.parse('2026-09-03T13:30:00Z'); // 09:30 ET
 const BOOT_2111_ET = Date.parse('2026-09-04T01:11:00Z'); // 21:11 ET on 09-03
 const REVIEW_2159_ET = Date.parse('2026-09-04T01:59:00Z'); // 21:59 ET on 09-03
+const WINDOW_0903 = { openMs: OPEN_0903, closeMs: CLOSE_0903 };
 
 describe('TRA-4343 session coverage — the boot_after_close disclosure', () => {
   it('names the session that just closed, not the calendar day of the read', () => {
@@ -153,17 +154,56 @@ describe('TRA-4343 durable entry-site census — the twin that survives the rede
   it('⛔ an unwired ledger is NOT a durable zero', () => {
     // No hydrate ⇒ no DATA_DIR ⇒ nothing persisted.
     recordEntrySiteCensus('equity', 'static_list', false, 'admin', '2026-09-03', OPEN_0903);
-    const s = summarizeEntrySiteCensus('2026-09-03');
+    const s = summarizeEntrySiteCensus('2026-09-03', WINDOW_0903);
     expect(s.wired).toBe(false);
+    expect(s.observingSince).toBeNull();
+    expect(s.sessionObservation).toBe('unknown');
     expect(s.statement).toMatch(/NOT WIRED/);
   });
 
-  it('a wired ledger with no record for the session IS a measurement', () => {
+  it('⛔ THE INSTRUMENT\'S OWN FIRST-READ DEFECT: a ledger born after the close is NOT a zero', () => {
+    // Exactly what bqb1 pid 76 published at 2026-09-04T02:36Z: file freshly
+    // created, no record for 2026-09-03, and it read as "evaluated nothing".
     hydrateEntrySiteCensusFromDisk(dir, REVIEW_2159_ET);
-    const s = summarizeEntrySiteCensus('2026-09-03');
+    const s = summarizeEntrySiteCensus('2026-09-03', WINDOW_0903);
     expect(s.wired).toBe(true);
     expect(s.session).toBeNull();
+    expect(s.observingSince).toBe(new Date(REVIEW_2159_ET).toISOString());
+    expect(s.sessionObservation).toBe('not_observed');
+    expect(s.statement).toMatch(/NOT OBSERVED/);
+    expect(s.statement).not.toMatch(/IS a measurement/);
+  });
+
+  it('a ledger open across the whole session DOES read an absent day as a zero', () => {
+    hydrateEntrySiteCensusFromDisk(dir, OPEN_0903 - 60_000);
+    const s = summarizeEntrySiteCensus('2026-09-03', WINDOW_0903);
+    expect(s.sessionObservation).toBe('observed');
+    expect(s.session).toBeNull();
     expect(s.statement).toMatch(/IS a measurement/);
+  });
+
+  it('a ledger opened mid-session is a LOWER BOUND, not a zero', () => {
+    hydrateEntrySiteCensusFromDisk(dir, OPEN_0903 + 60 * 60 * 1000);
+    const s = summarizeEntrySiteCensus('2026-09-03', WINDOW_0903);
+    expect(s.sessionObservation).toBe('partial');
+    expect(s.statement).toMatch(/LOWER BOUND/);
+  });
+
+  it('the birth marker is durable across a restart, so day 2 reads as observed', () => {
+    // Boot 1 opens the ledger before the open and writes the marker.
+    hydrateEntrySiteCensusFromDisk(dir, OPEN_0903 - 60_000);
+    // Boot 2 is the post-close redeploy — it must NOT reset `observingSince`.
+    hydrateEntrySiteCensusFromDisk(dir, REVIEW_2159_ET);
+    const s = summarizeEntrySiteCensus('2026-09-03', WINDOW_0903);
+    expect(s.observingSince).toBe(new Date(OPEN_0903 - 60_000).toISOString());
+    expect(s.sessionObservation).toBe('observed');
+  });
+
+  it('⛔ no session window supplied ⇒ unknown, never observed', () => {
+    hydrateEntrySiteCensusFromDisk(dir, OPEN_0903 - 60_000);
+    const s = summarizeEntrySiteCensus('2026-09-03', null);
+    expect(s.sessionObservation).toBe('unknown');
+    expect(s.statement).toMatch(/UNKNOWN/);
   });
 
   it('drops records past retention and compacts the file; a torn line does not abort the hydrate', () => {
@@ -177,8 +217,11 @@ describe('TRA-4343 durable entry-site census — the twin that survives the rede
 
     const h = hydrateEntrySiteCensusFromDisk(dir, REVIEW_2159_ET);
     expect(h).toEqual({ days: 1, evaluated: 1, refused: 0 });
-    expect(readFileSync(path, 'utf8').trim().split('\n')).toHaveLength(1);
-    expect(summarizeEntrySiteCensus('2026-08-05').session).toBeNull();
+    // Marker first, then the one retained record; the stale line is gone.
+    const lines = readFileSync(path, 'utf8').trim().split('\n');
+    expect(lines).toHaveLength(2);
+    expect(JSON.parse(lines[0]).kind).toBe('ledger_opened');
+    expect(summarizeEntrySiteCensus('2026-08-05', WINDOW_0903).session).toBeNull();
   });
 });
 
