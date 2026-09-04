@@ -102,6 +102,12 @@ import { logger } from './observability/index.js';
 import { resolveDataDir } from './data-dir.js';
 import type { OptionTradeJournalRecord } from './option-trade-journal.js';
 import { OTM_SLEEVE_MANDATE_STRUCTURE } from './otm-sleeve-mandate.js';
+import {
+  formatOtmEntryWindows,
+  resolveOtmEntryWindows,
+  type OtmEntryWindowResolution,
+  type OtmEntryWindowSource,
+} from './otm-entry-window.js';
 // TRA-3974 — the two reads the pre-registration assumed were free.
 import {
   armOtmWindowCostAccumulator,
@@ -518,12 +524,74 @@ function targetFor(state: OtmEvaluationWindowState): number {
 const ET_WEEKDAY_FMT = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday: 'short' });
 const HALF_DAY_MS = 43_200_000;
 
+// ── TRA-4345 — can the population still be PRODUCED? ────────────────────────
+//
+// The cadence's `closesPerSession` is a HISTORICAL average. When the entry
+// gate is structurally shut — no configured entry window intersects the
+// 09:30–16:00 ET options session — the forward rate is 0 regardless of what
+// the average says, and a projection divided off the average is a phantom ETA.
+// This read is taken from live `OTM_ENTRY_WINDOWS_ET` resolution at record
+// build time (a health read is also a tick), never stored.
+
+/** Options RTH as minutes past ET midnight: 09:30 and 16:00. */
+const RTH_START_ET_MIN = 9 * 60 + 30;
+const RTH_END_ET_MIN = 16 * 60;
+
+export interface OtmEntryAccrual {
+  /** FALSE ⇒ the entry gate cannot open inside the session ⇒ forward close rate is structurally 0. */
+  canAccrue: boolean;
+  /** Machine-greppable cause, `null` when `canAccrue` is true. */
+  cannotAccrueReason: string | null;
+  /** The effective windows, ET (`10:15-11:30,15:00-15:45` shape), for the reader. */
+  entryWindowsEt: string;
+  entryWindowsSource: OtmEntryWindowSource;
+}
+
+/**
+ * TRA-4345 AC3 — derived from the effective entry-window resolution, at read
+ * time. A window `[startMin, endMin)` intersects RTH iff it starts before the
+ * 16:00 ET close and ends after the 09:30 ET open (both half-open, so a
+ * `09:00-09:30` window does NOT intersect). An empty/invalid env string never
+ * reaches here as an empty list — {@link resolveOtmEntryWindows} resolves it
+ * to the board's defaults with `source: 'env_invalid'`.
+ */
+export function assessOtmEntryAccrual(
+  resolution: OtmEntryWindowResolution = resolveOtmEntryWindows(),
+): OtmEntryAccrual {
+  const intersectsRth = resolution.windows.some(
+    (w) => w.startMin < RTH_END_ET_MIN && w.endMin > RTH_START_ET_MIN,
+  );
+  return {
+    canAccrue: intersectsRth,
+    cannotAccrueReason: intersectsRth ? null : 'entry_window_never_intersects_rth',
+    entryWindowsEt: formatOtmEntryWindows(resolution.windows),
+    entryWindowsSource: resolution.source,
+  };
+}
+
+/**
+ * The read-time accrual, failing to `null` — "unreadable", never a verdict —
+ * if the env resolution itself throws. `null` is spent differently by the two
+ * consumers: the cadence fails CLOSED (no ETA is published off an unreadable
+ * gate), the staleness check fails toward "check me" (`null`, never `false`).
+ */
+export function readOtmEntryAccrual(): OtmEntryAccrual | null {
+  try {
+    return assessOtmEntryAccrual(resolveOtmEntryWindows());
+  } catch {
+    return null;
+  }
+}
+
 export interface OtmEvaluationCadence {
   asOf: string;
   /** ET weekdays whose 16:00 ET close is at or before `asOf`, since the stamp. */
   rthSessionsElapsed: number;
   closesPerSession: number | null;
-  /** `null` when the rate is zero — at that pace the window NEVER reaches target; never `0`. */
+  /** TRA-4345 — FALSE ⇒ the entry gate is structurally shut and the forward rate is 0, whatever `closesPerSession` says. */
+  canAccrue: boolean;
+  cannotAccrueReason: string | null;
+  /** `null` when the rate is zero OR when `canAccrue` is false — at that pace the window NEVER reaches target; never `0`. */
   projectedSessionsToTarget: number | null;
   method: string;
 }
@@ -540,6 +608,8 @@ export function otmEvaluationCadence(
   state: OtmEvaluationWindowState,
   n: number,
   asOf: number,
+  /** TRA-4345 — read-time entry-gate accrual; `null` = unreadable ⇒ fail closed (no ETA). */
+  accrual: OtmEntryAccrual | null = readOtmEntryAccrual(),
 ): OtmEvaluationCadence | null {
   if (state.startedAt === null || !Number.isFinite(asOf) || asOf < state.startedAt) return null;
   const startDay = etDay(state.startedAt);
@@ -562,12 +632,22 @@ export function otmEvaluationCadence(
   const target = targetFor(state);
   const rate = sessions > 0 ? n / sessions : null;
   const remaining = Math.max(0, target - n);
+  // TRA-4345 AC3 — a historical average hides a zero FORWARD rate. When the
+  // entry gate cannot open inside the session the remaining closes cannot be
+  // produced, so the projection is `null` ("never at this pace"), not a number.
+  // A reached target (`remaining === 0`) still reads 0 — nothing left to accrue.
+  const canAccrue = accrual !== null && accrual.canAccrue;
   return {
     asOf: new Date(asOf).toISOString(),
     rthSessionsElapsed: sessions,
     closesPerSession: rate === null ? null : round6(rate),
-    projectedSessionsToTarget: rate !== null && rate > 0 && remaining > 0 ? Math.ceil(remaining / rate) : (remaining === 0 ? 0 : null),
-    method: 'an ET weekday counts once its 16:00 ET close is at or before asOf; the stamp day only if the window opened before that close; holidays NOT subtracted (biases the projection HIGH, the conservative direction); projectedSessionsToTarget = ceil((target - n) / closesPerSession), null on a zero rate',
+    canAccrue,
+    cannotAccrueReason: accrual === null ? 'entry_window_state_unreadable' : accrual.cannotAccrueReason,
+    projectedSessionsToTarget:
+      remaining === 0 ? 0
+        : !canAccrue ? null
+          : rate !== null && rate > 0 ? Math.ceil(remaining / rate) : null,
+    method: 'an ET weekday counts once its 16:00 ET close is at or before asOf; the stamp day only if the window opened before that close; holidays NOT subtracted (biases the projection HIGH, the conservative direction); projectedSessionsToTarget = ceil((target - n) / closesPerSession), null on a zero rate AND null when canAccrue is false (TRA-4345: the entry gate cannot open inside the session, so the forward rate is 0 whatever the average says)',
   };
 }
 
@@ -842,8 +922,17 @@ export function buildOtmEvaluationWindowRecord(
     costAccumulator: OtmWindowCostAccumulatorRecord;
     entryQuote: OtmEntryQuoteRecord;
   },
+  /** TRA-4345 — read-time entry-gate accrual. Defaults to the live env read;
+   * `null` = unreadable, which the staleness check publishes as `null`
+   * ("check me"), never as `false`. */
+  entryAccrual: OtmEntryAccrual | null = readOtmEntryAccrual(),
 ) {
   const status = otmEvaluationWindowStatus(state);
+  // TRA-4345 AC2 — the accused gate is `entry_window`; "still blocking" is the
+  // structural predicate (no configured window intersects RTH), computed off
+  // live state in this beat, never stored.
+  const observedGateStillBlocking: boolean | null =
+    entryAccrual === null ? null : entryAccrual.canAccrue === false;
   return {
     issue: 'TRA-3945',
     windowId: state.windowId,
@@ -931,13 +1020,28 @@ export function buildOtmEvaluationWindowRecord(
     // the verdict set was pass|fail and the only writer was a shell script
     // against the host's data dir, which the verdict owner (an agent) cannot
     // reach. `cadence` is the window's own pace, so the record itself says
-    // whether `counting` means gathering evidence or waiting on capital.
+    // whether `counting` means gathering evidence or waiting on a gate.
+    //
+    // TRA-4345 — the 08-26 diagnosis (capital starvation, sumAdmissibleEntryUsd
+    // $6.74 vs the $50 floor) went stale while the string sat here: capital
+    // cleared to $394.09 and the window stayed starved, by the ENTRY gate. The
+    // note now names its gate and its instant, and `observedGateStillBlocking`
+    // is recomputed off live state every read so the NEXT supersession declares
+    // itself on the wire instead of waiting for a hand re-derivation.
     insufficientPopulation: {
       status: 'verdict_insufficient_population' as const,
       rule: 'hand-written by the verdict owner ONLY while n < targetCloses (a full sample is graded pass/fail, never retired); the note must name the gate that starved the population',
-      observed: 'fd917f86 2026-08-26T02:18Z: sumAdmissibleEntryUsd $6.74 fleet-wide vs otmContractFloor.premiumMin 0.50 ($50/contract) under fleetCapUsd $500 => zero new rows; 1 close in 2 sessions => ~58 sessions to 30. The 30-close bar and the $500 authorization cannot both hold; which one moves is the board\'s call (routed via TRA-3927).',
+      observed: 'TRA-4342 2026-09-04T02:12Z: starved by the ENTRY GATE, not by capital. otmEntryWindows = 03:00-03:01 ET from env OTM_ENTRY_WINDOWS_ET, openNow false, reasonCode entry_window_closed, appliesTo [paper,live] - a 60s window that does not intersect the 09:30-16:00 ET session, so the forward close rate is structurally 0. entry_window blocked 607/607 (09-02) and 671/671 (09-03); last buy_to_open 09-01. This is the executed form of the board\'s holdyes answer on TRA-4217 card ec5ba87f (human, 2026-09-02T01:21:35Z), not a defect. Capital is NOT binding: sumAdmissibleEntryUsd $394.09 vs a $50 contract floor, fleet bound within, $0 overage. Neither the $500 authorization nor the 30-close bar is what stopped this window.',
+      observedAt: '2026-09-04T02:12:00Z',
+      observedGate: 'entry_window' as const,
+      /** Recomputed at read time from the live entry-window resolution; `null` = unreadable ("check me"), never `false`. */
+      observedGateStillBlocking,
+      /** TRUE ⇒ the accused gate has CLEARED since `observedAt` — the `observed` diagnosis is superseded; re-diagnose before routing any decision off it. */
+      stale: observedGateStillBlocking === null ? null : observedGateStillBlocking === false,
     },
-    cadence: otmEvaluationCadence(state, readout.n, state.lastTickAt ?? state.startedAt ?? Number.NaN),
+    cadence: otmEvaluationCadence(state, readout.n, state.lastTickAt ?? state.startedAt ?? Number.NaN, entryAccrual),
+    /** TRA-4345 — the effective entry windows the two reads above were computed against, `null` = unreadable. */
+    entryAccrual,
     verdictWriter: {
       route: 'POST /api/health/otm-evaluation-window/verdict (admin) body {status, by, note with a TRA-nnnn ref}; dry-run by default, apply=true requires confirm=TRA-3945; atN is read off the fold in the same beat, never supplied',
       statuses: OTM_EVALUATION_VERDICT_STATUSES,
