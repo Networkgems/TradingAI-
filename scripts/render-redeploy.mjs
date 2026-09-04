@@ -265,7 +265,12 @@ const SOAK_HOST_SLUG = BQB1.slug; //  `tradingai-bqb1` — Render `service.slug`
 // The one-paragraph version, printed wherever this file used to print the wrong claim.
 // Single source of truth on purpose: the defect TRA-3724 fixed was seven copies drifting
 // together. If you need to say this somewhere new, CALL this — do not paraphrase it.
-const ENV_WRITE_CAVEAT_SHORT =
+// Exported for the same reason: tra2387-auth-secret-gate-check.mjs asserts that this text
+// REACHES stdout, and it has to assert on the constant, not on a hand-copied excerpt of it.
+// A copy is exactly the drift this comment forbids — and it bit us: that suite pinned the
+// literal `service_updated`, TRA-3724 correctly removed the claim, and `pnpm pretest` went
+// red on main for everyone until TRA-3744.
+export const ENV_WRITE_CAVEAT_SHORT =
   'This gate sees DEPLOYS only. An env/settings write does not pass through it. A SETTINGS\n' +
   '  write (PATCH /services) can still redeploy from the BRANCH TIP unguarded — hold those by\n' +
   '  hand. An ENV-VAR write has produced no deploy on this host since 2026-07-23 (TRA-3724),\n' +

@@ -25,6 +25,7 @@ import {
   authSecretGateState,
   authSecretBlocks,
   AUTH_SECRET_REQUIRED_ON,
+  ENV_WRITE_CAVEAT_SHORT,
 } from './render-redeploy.mjs';
 import {
   classifyAuthSecret,
@@ -318,7 +319,22 @@ const E2E = [
     stub: { service: OTHER, envVars: [PORT, { key: 'AUTH_SECRET', value: 'a-real-secret-value' }] },
     args: ['--dry-run'],
     code: 0,
-    stdoutHas: ['auth    : AUTH_SECRET present', 'it does not guard the WRITE', 'service_updated'],
+    // Two different obligations, deliberately graded by two different kinds of string:
+    //
+    //   ENV_WRITE_CAVEAT_SHORT — the IMPORTED CONSTANT, never a copy of its text. This
+    //     grades only "the caveat reached stdout", which is this suite's business. Its
+    //     WORDING is TRA-3724's business, so a reword must not be able to fail this case.
+    //     The previous version pinned the literal `service_updated`; TRA-3724 rewrote the
+    //     caveat (an ENV-VAR write produces no deploy on this host, so the old claim was a
+    //     category error), the literal survived only in comments, and `pnpm pretest` — hence
+    //     `pnpm test` — exited 1 on main for every developer until TRA-3744.
+    //
+    //   'PATCH /services' — a deliberate CONTENT anchor, and the one thing `service_updated`
+    //     was really standing for: that the caveat still discloses the settings-write escape
+    //     hatch, the one verb here that can still redeploy from the branch tip unguarded.
+    //     Dropping that disclosure is the reword this case must go red on. Keep it narrow and
+    //     keep it a verb — do not grow this into a second copy of the paragraph.
+    stdoutHas: ['auth    : AUTH_SECRET present', 'it does not guard the WRITE', ENV_WRITE_CAVEAT_SHORT, 'PATCH /services'],
   },
   {
     why: 'other service + no AUTH_SECRET at all -> exit 0. Severity is scoped: no false-block.',
