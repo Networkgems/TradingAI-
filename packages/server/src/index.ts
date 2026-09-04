@@ -551,7 +551,14 @@ import {
 } from './watchlist-store.js';
 import { scanStocksMarket, scanCryptoMarket } from './market-scanner.js';
 import { runPremarketForAllUsers } from './premarket-watchlist.js';
-import { runMorningBriefForAllUsers, buildBriefForUser, buildMacroSection } from './morning-brief.js';
+import {
+  runMorningBriefForAllUsers,
+  buildBriefForUser,
+  buildMacroSection,
+  buildOvernightSection,
+  getOvernightScan,
+  isOvernightSetupsEnabled,
+} from './morning-brief.js';
 // TRA-2252 — scheduled P&L + trade-summary report emails.
 // TRA-2284 — the pure builders are also driven by the on-demand self-test route
 // below, which is the failing state the 21:00-ET-only path never had.
@@ -15492,7 +15499,14 @@ async function executeRoutineForUser(
       // renderer's plain-text body so the routine push matches the 8:30 brief.
       const macro = await buildMacroSection();
       const now = new Date();
-      const event = buildBriefForUser(ctx, macro, etDateString(now), now.getTime());
+      // TRA-4303 — the on-demand brief carries the overnight section too, or the
+      // routine push and the 08:30 email would say different things. A user can
+      // schedule this at any hour, so the pull goes through `getOvernightScan`'s
+      // TTL cache (≤1 screener pull per 30 min process-wide) rather than
+      // `scanStocksMarket` directly.
+      const scan = isOvernightSetupsEnabled() ? await getOvernightScan() : null;
+      const overnight = scan ? await buildOvernightSection(ctx, scan) : undefined;
+      const event = buildBriefForUser(ctx, macro, etDateString(now), now.getTime(), overnight);
       const rendered = renderAlert(event, now.getTime());
       return { title: 'Routine: morning brief', body: rendered.text };
     }

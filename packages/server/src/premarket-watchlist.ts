@@ -143,8 +143,15 @@ const WEIGHTS: Record<string, number> = {
  * safer without changing, because the archive it reads is now written by a
  * `top5Movers` that already dropped the session-condemned rows upstream. The rule is
  * re-executed here anyway, as the belt-and-braces this docblock describes.
+ *
+ * TRA-4303 — EXPORTED for the 08:30 morning brief's overnight-setups section,
+ * which reads the same `latest.json` off the same disk and therefore inherits
+ * the same blind spot verbatim. It is exported rather than reimplemented so the
+ * two consumers cannot drift: a second hand-rolled copy of this rule is exactly
+ * how a fabricated mover reaches the board's inbox. The brief is READ-ONLY — it
+ * ranks and renders, it never seeds a symbol.
  */
-function suspectMover(mover: EodMover): { reason: string; impliedPrevClose: number | null; ratio: number | null } | null {
+export function suspectMover(mover: EodMover): { reason: string; impliedPrevClose: number | null; ratio: number | null } | null {
   if (!isMoveSuspect(mover)) return null;
   const v = assessQuotePlausibility({ price: mover.price, changePct: mover.changePct });
   return {
@@ -157,8 +164,15 @@ function suspectMover(mover: EodMover): { reason: string; impliedPrevClose: numb
   };
 }
 
-/** Read the prior-session EOD report for a user's active stocks mode. */
-async function loadLatestEodReport(ctx: UserContext): Promise<EodReport | null> {
+/**
+ * Read the prior-session EOD report for a user's active stocks mode.
+ *
+ * TRA-4303 — EXPORTED for the morning brief's overnight-setups section. Same
+ * file, same mode resolution, same `null`-on-any-failure contract; the brief
+ * degrades that `null` into a named "prior-session report unavailable" note
+ * rather than failing its run.
+ */
+export async function loadLatestEodReport(ctx: UserContext): Promise<EodReport | null> {
   const mode = stockModeKey(getSettings(ctx.username));
   const file = join(stockReportsDirFor(ctx, mode), 'latest.json');
   if (!existsSync(file)) return null;

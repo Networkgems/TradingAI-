@@ -178,10 +178,92 @@ describe('renderAlert', () => {
     };
     const r = renderAlert(e);
     expect(r.title).toBe('🟢 TradingAI — Morning Brief 2026-05-17');
-    expect(r.text).toContain('Watchlist setups (0)');
+    // TRA-4303 — relabelled: this section is the engine's `recentSignals` tail,
+    // which at the 08:30 fire is the PRIOR session's, never today's.
+    expect(r.text).toContain('Prior-session engine signals (0)');
+    expect(r.text).not.toContain('Watchlist setups');
     expect(r.text).toContain('Open positions (0)');
     expect(r.text).toContain('Overnight news (0)');
+    // TRA-4303 — still 3, not 4: this event carries no `overnight`, and an
+    // absent overnight read is omitted rather than rendered as an empty one.
+    expect(r.text).not.toContain('Overnight setups');
     expect(r.text.match(/• none/g)?.length).toBe(3);
+  });
+
+  // ── TRA-4303 overnight setups ──────────────────────────────────────────────
+
+  /** A brief carrying only the fields the overnight assertions need. */
+  function briefWith(overnight: BriefingAlertEvent['overnight']): BriefingAlertEvent {
+    return {
+      kind: 'briefing',
+      username: 'alice',
+      timestamp: TS,
+      date: '2026-05-17',
+      macro: { regime: 'green', rationale: '', indexes: [] },
+      setups: [],
+      positions: [],
+      news: [],
+      ...(overnight ? { overnight } : {}),
+    };
+  }
+
+  it('renders overnight setups above the prior-session signals, with legs and move size', () => {
+    const r = renderAlert(
+      briefWith({
+        available: true,
+        rows: [
+          { symbol: 'NVDA', legs: ['prior-close mover', 'pre-market gainer'], changePct: 8.421, score: 9 },
+          { symbol: 'SOFI', legs: ['traded yesterday'], score: 3 },
+        ],
+      }),
+    );
+    expect(r.text).toContain('Overnight setups (2)');
+    expect(r.text).toContain('NVDA · prior-close mover + pre-market gainer · +8.42%');
+    // No move size on hand ⇒ the row still renders, without a fabricated number.
+    expect(r.text).toContain('SOFI · traded yesterday');
+    expect(r.text).not.toMatch(/SOFI[^\n]*%/);
+    // Ordering: the overnight read is the only section that knows about last
+    // night, so it comes first.
+    expect(r.text.indexOf('Overnight setups')).toBeLessThan(
+      r.text.indexOf('Prior-session engine signals'),
+    );
+    // Email path carries it too — that is the channel the board reads.
+    expect(r.html).toContain('Overnight setups (2)');
+    expect(r.html).toContain('+8.42%');
+  });
+
+  it('distinguishes an unavailable overnight section from an empty one', () => {
+    const dead = renderAlert(
+      briefWith({ available: false, rows: [], note: 'prior-session report unavailable; pre-market scan unavailable' }),
+    );
+    expect(dead.text).toContain('Overnight setups');
+    expect(dead.text).toContain('• unavailable — prior-session report unavailable; pre-market scan unavailable');
+    expect(dead.text).not.toContain('Overnight setups (0)');
+
+    const empty = renderAlert(briefWith({ available: true, rows: [] }));
+    expect(empty.text).toContain('Overnight setups (0)');
+    expect(empty.text).not.toContain('unavailable');
+  });
+
+  it('keeps a one-legged overnight read but says which leg died', () => {
+    const r = renderAlert(
+      briefWith({
+        available: true,
+        rows: [{ symbol: 'AMD', legs: ['pre-market gainer'], changePct: -3.1, score: 4 }],
+        note: 'prior-session report unavailable',
+      }),
+    );
+    expect(r.text).toContain('AMD · pre-market gainer · -3.10%');
+    expect(r.text).toContain('(partial — prior-session report unavailable)');
+  });
+
+  it('HTML-escapes overnight setup strings', () => {
+    const r = renderAlert(
+      briefWith({ available: true, rows: [{ symbol: '<script>x</script>', legs: ['A&B'], score: 1 }] }),
+    );
+    expect(r.html).toContain('&lt;script&gt;');
+    expect(r.html).toContain('A&amp;B');
+    expect(r.html).not.toContain('<script>x');
   });
 
   it('HTML-escapes brief news + setup strings', () => {

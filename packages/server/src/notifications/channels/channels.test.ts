@@ -3,7 +3,7 @@ import { DEFAULT_ALERT_PREFERENCES, resolveAlertPreferences } from '@trading-app
 import type { AlertPreferences } from '@trading-app/shared';
 import { EmailChannelAdapter } from './email.js';
 import { TelegramChannelAdapter } from './telegram.js';
-import { DiscordChannelAdapter, isValidDiscordWebhook } from './discord.js';
+import { DiscordChannelAdapter, fitDiscordContent, isValidDiscordWebhook } from './discord.js';
 import type { ExitAlertEvent } from '../dispatcher.js';
 
 process.env['LOG_NO_FILE'] = '1';
@@ -153,6 +153,18 @@ describe('DiscordChannelAdapter', () => {
     const a = new DiscordChannelAdapter({ fetchFn: vi.fn(async () => okResponse()) });
     const prefs = prefsWith((p) => { p.channels.discord.discordWebhookUrl = 'bad'; });
     await expect(a.send(exitEvent, prefs)).rejects.toThrow(/invalid discord webhook/);
+  });
+
+  // TRA-4303 — the 2000-char cap used to slice silently, so an over-length
+  // morning brief arrived looking complete with its tail sections missing.
+  it('says so when it has to truncate, and never exceeds the cap', () => {
+    const short = 'a'.repeat(2000);
+    expect(fitDiscordContent(short)).toBe(short);
+
+    const long = fitDiscordContent('b'.repeat(2500));
+    expect(long.length).toBe(2000);
+    expect(long).toContain('truncated');
+    expect(long).toContain('see the email brief');
   });
 
   it('throws on a non-OK Discord response', async () => {

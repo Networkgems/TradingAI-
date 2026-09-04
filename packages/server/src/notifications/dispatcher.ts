@@ -127,6 +127,50 @@ export interface BriefHeadline {
 }
 
 /**
+ * TRA-4303 — one row of the brief's overnight/pre-close setups section.
+ *
+ * Distinct from {@link BriefSetup}, which is an engine TRADE SIGNAL (entry / stop
+ * / target) drawn from `getState().signals`. At 08:30 ET no bar has evaluated
+ * since yesterday's close, so that section is by construction the PRIOR session's
+ * signal log. This row is the thing the board actually asked for: a name that
+ * earned attention from what happened before the close or overnight, with the
+ * reason attached and no levels implied.
+ */
+export interface BriefOvernightSetup {
+  symbol: string;
+  /**
+   * Why the symbol is listed — one human label per contributing leg
+   * ("prior-close mover", "pre-market gainer", …). Multiple legs mean multiple
+   * sources agreed, which is exactly what the shared scorer ranks on.
+   */
+  legs: string[];
+  /**
+   * Move size behind the listing: the pre-market screener's %-change when there
+   * is one, else the prior session's. Absent when neither leg carries a
+   * TRUSTED number (a prior-session row that fails the plausibility rule is
+   * dropped, never rendered — see `suspectMover`).
+   */
+  changePct?: number;
+  /** Rank score from the shared watchlist scorer; higher = more legs agreed. */
+  score: number;
+}
+
+/**
+ * TRA-4303 — the overnight-setups section as a whole.
+ *
+ * `available: false` is NOT the same as an empty `rows`: the first means both
+ * source legs failed and the section could not be computed, the second means it
+ * was computed and found nothing. The renderer keeps them distinguishable
+ * ("unavailable" vs "none") — same posture as the macro gate's neutral fallback.
+ */
+export interface BriefOvernightSection {
+  available: boolean;
+  rows: BriefOvernightSetup[];
+  /** Degradation note naming whichever leg failed, when one did. */
+  note?: string;
+}
+
+/**
  * TRA-849 — scheduled pre-market morning briefing. Fired once per trading day
  * (~8:30 ET) by the scheduler's `onMorningBrief` hook and dispatched per user
  * through the existing fan-out pipeline. Carries the four structured sections the
@@ -146,9 +190,22 @@ export interface BriefingAlertEvent extends AlertEventBase {
     rationale: string;
     indexes: BriefMacroIndex[];
   };
+  /**
+   * TRA-4303 — the engine's most recent trade signals. At the 08:30 fire these
+   * are the PRIOR session's: `recentSignals` only grows when a bar evaluates and
+   * no bar evaluates overnight. The renderer labels it accordingly; the
+   * overnight read is the separate {@link overnight} section.
+   */
   setups: BriefSetup[];
   positions: BriefPosition[];
   news: BriefHeadline[];
+  /**
+   * TRA-4303 — overnight / pre-close setups. Optional so a producer that has no
+   * overnight read (or has it switched off) emits a brief byte-identical to the
+   * pre-TRA-4303 one; the renderer then omits the section entirely rather than
+   * printing a misleading empty one.
+   */
+  overnight?: BriefOvernightSection;
 }
 
 /**

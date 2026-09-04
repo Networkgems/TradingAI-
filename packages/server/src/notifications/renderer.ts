@@ -19,6 +19,8 @@ import type {
   AlertEvent,
   BriefingAlertEvent,
   BriefMacroIndex,
+  BriefOvernightSection,
+  BriefOvernightSetup,
   BriefPosition,
   BriefSetup,
   ExitAlertEvent,
@@ -296,6 +298,42 @@ function fmtSetup(s: BriefSetup): string {
   return [bits.join(' · '), ...levels].join(' · ');
 }
 
+/** Signed percent with 2dp, e.g. "+8.42%" / "-3.10%". */
+function fmtSignedPct(n: number): string {
+  if (!Number.isFinite(n)) return '—';
+  const sign = n >= 0 ? '+' : '-';
+  return `${sign}${Math.abs(n).toFixed(2)}%`;
+}
+
+/**
+ * TRA-4303 — format one overnight-setup row:
+ * "NVDA · prior-close mover + pre-market gainer · +8.42%".
+ *
+ * No entry/stop/target: this row is a REASON TO LOOK, not a signal. Rendering
+ * levels beside it would read as an order the engine never generated.
+ */
+function fmtOvernightSetup(s: BriefOvernightSetup): string {
+  const why = s.legs.length ? s.legs.join(' + ') : 'unattributed';
+  const move = s.changePct != null && Number.isFinite(s.changePct)
+    ? ` · ${fmtSignedPct(s.changePct)}`
+    : '';
+  return `${s.symbol} · ${why}${move}`;
+}
+
+/**
+ * TRA-4303 — the overnight section's rows, in render order.
+ *
+ * Three distinguishable states, deliberately: "unavailable" (both source legs
+ * failed — nothing was measured), "none" (measured, found nothing) and the rows
+ * themselves. A partial degradation keeps its rows AND carries the note, so a
+ * one-legged read is never silently passed off as a two-legged one.
+ */
+function overnightRows(sec: BriefOvernightSection): string[] {
+  if (!sec.available) return [`unavailable${sec.note ? ` — ${sec.note}` : ''}`];
+  const rows = sec.rows.length ? sec.rows.map(fmtOvernightSetup) : ['none'];
+  return sec.note ? [...rows, `(partial — ${sec.note})`] : rows;
+}
+
 /** Format one open position row: "ETH-USD CRYPTO · long 2 @ 3,140 · P&L +$84.20". */
 function fmtPosition(p: BriefPosition): string {
   const head = `${p.symbol} ${p.market.toUpperCase()}`;
@@ -309,6 +347,13 @@ function fmtPosition(p: BriefPosition): string {
  * TRA-849 — render the multi-section morning brief into one channel-agnostic
  * message. Pure. Empty sections render an explicit "none" line rather than being
  * dropped, so the reader can tell "no open positions" from "section missing".
+ *
+ * TRA-4303 — five sections now, and the ONE optional one is `overnight`: it is
+ * omitted rather than rendered empty when the producer supplied none, because
+ * "this build has no overnight read" and "the overnight read found nothing" are
+ * different facts and only the second belongs on a brief. Both bodies (text and
+ * HTML) are built from the same `overnightRows` / `overnightHeading` values, so
+ * email and the Telegram/Discord push cannot say different things.
  */
 function renderBriefing(event: BriefingAlertEvent, ts: number): RenderedAlert {
   const emoji = REGIME_EMOJI[event.macro.regime.toLowerCase()] ?? '⚪';
@@ -326,7 +371,25 @@ function renderBriefing(event: BriefingAlertEvent, ts: number): RenderedAlert {
   }
   lines.push('');
 
-  lines.push(`🎯 Watchlist setups (${event.setups.length})`);
+  // TRA-4303 — the overnight read goes ABOVE the signal log: at 08:30 ET it is
+  // the only section on the brief that knows anything about last night. Omitted
+  // entirely (not rendered empty) when the producer supplied none.
+  const overnightHeading = event.overnight
+    ? event.overnight.available
+      ? `Overnight setups (${event.overnight.rows.length})`
+      : 'Overnight setups'
+    : null;
+  if (event.overnight && overnightHeading) {
+    lines.push(`🌙 ${overnightHeading}`);
+    for (const r of overnightRows(event.overnight)) lines.push(`   • ${r}`);
+    lines.push('');
+  }
+
+  // TRA-4303 — labelled for what it IS. `setups` is the engine's `recentSignals`
+  // tail, which only grows when a bar evaluates; at the 08:30 fire the newest
+  // entries are the prior session's. The old "Watchlist setups" heading read as
+  // "today's plan" and was the second half of the board's complaint.
+  lines.push(`🎯 Prior-session engine signals (${event.setups.length})`);
   if (event.setups.length) {
     for (const s of event.setups) lines.push(`   • ${fmtSetup(s)}`);
   } else {
@@ -377,7 +440,12 @@ function renderBriefing(event: BriefingAlertEvent, ts: number): RenderedAlert {
     `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#c9d1d9;background:#0d1117;padding:24px;border-radius:8px;max-width:560px;">`,
     `<div style="font-size:18px;font-weight:600;margin-bottom:8px;">${esc(title)}</div>`,
     section(`Macro gate: ${regimeLabel}`, macroRows),
-    section(`Watchlist setups (${event.setups.length})`, setupRows),
+    // TRA-4303 — same order and same omit-when-absent rule as the text body, so
+    // the email the board reads and the Telegram/Discord push cannot drift.
+    ...(event.overnight && overnightHeading
+      ? [section(overnightHeading, overnightRows(event.overnight))]
+      : []),
+    section(`Prior-session engine signals (${event.setups.length})`, setupRows),
     section(`Open positions (${event.positions.length})`, posRows),
     section(`Overnight news (${event.news.length})`, newsRows),
     `<div style="color:#484f58;font-size:12px;margin-top:14px;">${esc(stamp)}</div>`,
