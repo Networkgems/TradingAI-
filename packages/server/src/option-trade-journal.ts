@@ -2,7 +2,7 @@ import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { deriveEntrySpreadPct } from '@trading-app/shared';
-import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason, OptionAdmissionStamp, OptionMarkProvenance, OptionPeakStampBasis } from '@trading-app/shared';
+import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason, OptionAdmissionStamp, OptionMarkProvenance, OptionPeakStampBasis, OptionProfitLockFire } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { STOP_DISTANCE_FRACTION_OF_MARK } from './option-spread-cost.js';
 import type { RiskThrottleSizingPath, RiskThrottleSizingScope } from './risk-throttle-sizing.js';
@@ -537,6 +537,16 @@ export interface OptionTradeJournalClose {
    * ⛔ NEVER BACKFILLED. A reconstructed provenance is a fabricated column.
    */
   markProvenance?: OptionMarkProvenance;
+  /**
+   * TRA-4317 (AC1) — the profit-lock give-back rule's own release level at the
+   * firing tick (`levelPremium` = the price the rule intended to keep,
+   * `markAtFire` / `execBidAtFire` = what the tick served). The one quantity a
+   * reader of a `profit_lock` close cannot re-derive; 4/4 armed releases
+   * 2026-08-26..09-03 filled mean −0.417R under it and the gap had to be
+   * reconstructed by hand. Absent on every non-profit-lock close and on rows
+   * closed before this shipped. ⛔ Never backfilled.
+   */
+  profitLockFire?: OptionProfitLockFire;
 }
 
 /** TRA-4020 (R4) — see {@link OptionTradeJournalClose.openingRangeSuppressed}. */
@@ -631,6 +641,11 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
    * that never evaluated a mark. ⛔ Never backfilled.
    */
   markProvenance?: OptionMarkProvenance;
+  /**
+   * TRA-4317 (AC1) — the profit-lock release level at the firing tick, folded
+   * from the CLOSE row. Absent on non-profit-lock closes and pre-stamp rows.
+   */
+  profitLockFire?: OptionProfitLockFire;
   /**
    * TRA-2895 — partial exits realized before the full close, in append order.
    *
@@ -1832,6 +1847,11 @@ function foldLine(
               : { ...line.close.markProvenance.quoteAtFire },
           },
         }
+      : {}),
+    // TRA-4317 (AC1) — the profit-lock release level, beside the provenance of
+    // the mark it read; absent stays absent. Copied for the same aliasing reason.
+    ...(line.close.profitLockFire !== undefined
+      ? { profitLockFire: { ...line.close.profitLockFire } }
       : {}),
   });
 }

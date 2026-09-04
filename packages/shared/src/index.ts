@@ -2399,6 +2399,31 @@ export interface OptionMarkProvenance {
   at: number;
 }
 /**
+ * TRA-4317 (AC1) — the profit-lock give-back rule's OWN release level, stamped
+ * at the tick it chose to exit. The level is the one quantity a reader of the
+ * close row cannot re-derive (`markProvenance.quoteAtFire` gives the quote,
+ * the close row gives the fill, but `max(peakR − giveBackR, floorR)` needs the
+ * peak/allowance AS THE RULE SAW THEM on the firing tick — including whether
+ * the executable-bid basis (TRA-4285) or the mid fallback was in force).
+ * Measured on 4/4 armed releases (2026-08-26..09-03 desk): realized fills
+ * landed mean −0.417R under the level, and without this stamp that gap had to
+ * be reconstructed from constants. Stamped on the FIRST firing tick only, the
+ * same semantics as `exitMarkProvenance` — a re-staged unfilled leg keeps the
+ * original decision's record.
+ */
+export interface OptionProfitLockFire {
+  /** ms epoch of the tick the give-back rule chose to exit. */
+  at: number;
+  /** The release level in stop-basis R: `floor.exitLevelR`, else `peakR − giveBackR`. */
+  levelR: number;
+  /** The same level in premium terms: `premiumPaid + levelR × R`. */
+  levelPremium: number;
+  /** The MID the tick served (`mark`) — the granularity half of the level-to-fill gap. */
+  markAtFire: number;
+  /** The executable bid the decision priced against (TRA-4285), `null` on an unquoted tick. */
+  execBidAtFire: number | null;
+}
+/**
  * TRA-4030 (R4, the PDT column) — see `OptionPosition.profitFloorHeldForPdt`.
  * The per-row, restart-durable twin of `OptionOpeningRangeSuppression`: how
  * many ticks the ladder's FLOOR leg wanted to fire on a day-one live row and
@@ -3225,6 +3250,13 @@ export interface OptionPosition {
    * row whose stop fired three ticks earlier.
    */
   exitMarkProvenance?: OptionMarkProvenance;
+  /**
+   * TRA-4317 (AC1) — the profit-lock release level at the tick the give-back
+   * rule fired, stamped beside `exitMarkProvenance` (first fire only, same
+   * rationale) and folded onto the journal close row. Absent ↔ no profit-lock
+   * fire on this build. ⛔ Never backfilled.
+   */
+  profitLockFire?: OptionProfitLockFire;
   trailingActive: boolean;    // true once price is up 20% and trailing mode engaged
   trailingStopPremium: number; // current trailing stop level (peak * (1 - 0.12))
   underlyingEntryPrice: number;

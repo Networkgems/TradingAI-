@@ -7322,6 +7322,13 @@ export class PaperOptionsAccount {
           ...(position.exitMarkProvenance !== undefined
             ? { markProvenance: { ...position.exitMarkProvenance } }
             : {}),
+          // TRA-4317 (AC1) — the profit-lock release level as the rule computed
+          // it at the firing tick, beside the provenance of the mark it read.
+          // Absent stays absent: only a profit-lock fire writes one, and ⛔ a
+          // reconstructed level is a fabricated column.
+          ...(position.profitLockFire !== undefined
+            ? { profitLockFire: { ...position.profitLockFire } }
+            : {}),
           ...(pdtHeld !== undefined
             ? {
                 profitFloorHeldForPdt: {
@@ -11451,6 +11458,21 @@ export class PaperOptionsAccount {
               exitJournalReason = 'profit_lock';
               // TRA-4285 — marketable limit at the bid on the FIRST staging.
               exitStageLimit = execBid;
+              // TRA-4317 (AC1) — the rule's own release level, in the basis it
+              // actually decided on, stamped at the FIRST firing tick (a
+              // re-staged unfilled leg keeps the original decision's record,
+              // same semantics as `stampExitMarkProvenance`). The level is the
+              // one quantity the close row's reader cannot re-derive.
+              if (opt.profitLockFire === undefined) {
+                const levelR = lock.floor?.exitLevelR ?? lock.peakR - lock.giveBackR;
+                opt.profitLockFire = {
+                  at: Date.now(),
+                  levelR,
+                  levelPremium: opt.premiumPaid + levelR * lock.R,
+                  markAtFire: mark,
+                  execBidAtFire: execBid,
+                };
+              }
             }
           }
         }
@@ -16015,7 +16037,23 @@ export class PaperOptionsAccount {
         tightenPeakR: this.otmProfitSchedule.tightenPeakR,
         tightenGiveBackR: this.otmProfitSchedule.tightenGiveBackR,
       });
-      if (lock.shouldExit) exitReason = 'profit_lock';
+      if (lock.shouldExit) {
+        exitReason = 'profit_lock';
+        // TRA-4317 (AC1) — this relabelled close publishes `profit_lock` too,
+        // so it owes the journal the same level column. Mid basis and no
+        // fire-tick bid by construction (this path runs off the halt's close
+        // mark, not a quoted exit-pass tick).
+        if (opt.profitLockFire === undefined) {
+          const levelR = lock.floor?.exitLevelR ?? lock.peakR - lock.giveBackR;
+          opt.profitLockFire = {
+            at: Date.now(),
+            levelR,
+            levelPremium: opt.premiumPaid + levelR * lock.R,
+            markAtFire: closePrice,
+            execBidAtFire: null,
+          };
+        }
+      }
     }
     // TRA-2233 — demo manual close fills at the marketable bid/ask when armed; MID otherwise.
     // (Live path already substituted the broker's real avg fill into `closePrice`.)
