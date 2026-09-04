@@ -43,16 +43,28 @@
  */
 
 import type { EodReport, NewsItem, Position, OptionPosition } from '@trading-app/shared';
+import { WATCHLIST, WATCHLIST_MIN_PRICE } from '@trading-app/shared';
 import {
   emitAlert,
+  type BriefGateReadout,
   type BriefHeadline,
   type BriefingAlertEvent,
   type BriefMacroIndex,
+  type BriefOvernightEligibility,
   type BriefOvernightSection,
   type BriefOvernightSetup,
   type BriefPosition,
   type BriefSetup,
 } from './notifications/index.js';
+import { resolveOtmContractFloor } from './otm-contract-floor.js';
+import { resolveAdmissibleBand } from './otm-admissible-strike.js';
+import { resolveCostGateConfig } from './option-cost-gate.js';
+import {
+  OPTION_LIVE_OTM_UNIVERSE_VAR,
+  isSymbolInLiveOtmUniverse,
+  resolveLiveOtmUniverse,
+  type LiveOtmUniverseResolution,
+} from './otm-live-universe-flag.js';
 import { getFreshMarketReview } from './market-review.js';
 import { loadLatestEodReport, scoreSymbols, suspectMover } from './premarket-watchlist.js';
 import { scanStocksMarket, type ScanResult } from './market-scanner.js';
@@ -207,6 +219,88 @@ const LEG_LABEL: Record<string, string> = {
   trending: 'trending',
 };
 
+// ── TRA-4303 AC-4: eligibility is a column, not a claim ──────────────────────
+
+/**
+ * Publish the gate values IN FORCE, resolved from live config by the SAME
+ * resolvers the enforcement path calls — never from source literals. That is
+ * AC-4's actual requirement and it is not decoration: on TRA-3515 a verdict was
+ * published against `barR`'s source default while the env held a different
+ * number, and the two were indistinguishable on the surface a human read.
+ *
+ * The split is by DECIDABILITY at 08:30, which is the honest cut:
+ *
+ *   • `decidedPreOpen` — gates over the UNDERLYING. The per-row column below
+ *     really rules on these.
+ *   • `deferred` — gates over a specific OPTION CONTRACT. Every one of them
+ *     needs a live option quote for a chosen strike, and US options do not
+ *     quote pre-market: a 08:30 verdict would be computed off yesterday's
+ *     closing chain and is not the verdict the 09:30+ order site faces.
+ *     Measured on the 2026-09-03 session (TRA-4303 AC-5), this is where the
+ *     whole population actually dies. Of the 13 names the 09:00 build added for
+ *     `v0nni` that day, 10 produced a directional attempt and **9 reached
+ *     contract selection with a real quote** — every one refused there by the
+ *     spread ceiling and/or the cost bar (the 10th, CHPT, died one step earlier
+ *     at the quality/liquidity gate). **0 orders.** Guessing those verdicts at
+ *     08:30 would be the single most misleading thing this section could print,
+ *     so it prints the thresholds and says they are not adjudicated yet.
+ */
+export function buildGateReadout(env: NodeJS.ProcessEnv = process.env): BriefGateReadout {
+  const universe = resolveLiveOtmUniverse(env);
+  const floor = resolveOtmContractFloor(env);
+  const band = resolveAdmissibleBand(env);
+  const cost = resolveCostGateConfig(env);
+
+  const universeLine = universe.restricted
+    ? `live options universe: RESTRICTED to [${universe.symbols.join(', ')}] (${OPTION_LIVE_OTM_UNIVERSE_VAR}, source ${universe.source})`
+    : `live options universe: UNRESTRICTED (${OPTION_LIVE_OTM_UNIVERSE_VAR}, source ${universe.source})`;
+
+  return {
+    decidedPreOpen: [
+      // Not env-tunable, and said so rather than implying a knob exists.
+      `watchlist price floor $${WATCHLIST_MIN_PRICE.toFixed(2)} (shared constant, no env override)`,
+      universeLine,
+    ],
+    deferred: [
+      `contract premium floor $${floor.premiumMin.toFixed(2)} · |delta| [${floor.deltaMin}, ${floor.deltaMax}] · DTE [${floor.dteMin}, ${floor.dteMax}] (source ${floor.source}${floor.invalidKeys.length ? `; INVALID: ${floor.invalidKeys.join(', ')}` : ''})`,
+      `nominator |delta| band [${band.min}, ${band.max})`,
+      `cost-bar safety margin ${cost.safetyMarginR}R · options min-gross floor ${cost.optionsMinGrossR}R`,
+      'spread ceiling — the top blocker on the 2026-09-03 tape',
+    ],
+  };
+}
+
+/**
+ * The per-row admission column.
+ *
+ * `price` is whatever trusted pre-open price the section has on hand (a
+ * plausibility-guarded prior-session close). Absent ⇒ `unknown`, NOT `eligible`:
+ * the 09:00 build prices unknown newcomers off a live quote and DROPS the ones
+ * that miss the floor (`filterByPriceFloor`), so claiming eligibility without a
+ * price would be exactly the unbacked claim AC-4 exists to end.
+ */
+export function classifyEligibility(
+  symbol: string,
+  price: number | undefined,
+  universe: LiveOtmUniverseResolution,
+  baseWatchlist: ReadonlySet<string>,
+  minPrice: number = WATCHLIST_MIN_PRICE,
+): BriefOvernightEligibility {
+  if (universe.restricted && !isSymbolInLiveOtmUniverse(symbol, universe)) {
+    return { status: 'blocked', gate: `live options universe (not in the ${universe.symbols.length}-name allowlist)` };
+  }
+  if (price != null && Number.isFinite(price) && price < minPrice) {
+    return { status: 'blocked', gate: `watchlist price floor $${minPrice.toFixed(2)} (last $${price.toFixed(2)})` };
+  }
+  // Checked AFTER the blocks: a base-watchlist name is already watched, but it
+  // is not exempt from the live universe restriction.
+  if (baseWatchlist.has(symbol)) return { status: 'watched' };
+  if (price == null || !Number.isFinite(price)) {
+    return { status: 'unknown', gate: 'watchlist price floor — no pre-open price; the 09:00 build prices it off a live quote' };
+  }
+  return { status: 'eligible' };
+}
+
 /**
  * Build one user's overnight-setups section from the prior-session EOD report
  * (per-user: it is that user's mode's `latest.json`) and the shared pre-market
@@ -226,6 +320,8 @@ const LEG_LABEL: Record<string, string> = {
 export async function buildOvernightSection(
   ctx: UserContext,
   scan: OvernightScan,
+  /** Injected so the AC-4 gate resolution is testable without mutating the process env. */
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<BriefOvernightSection> {
   let eod: EodReport | null = null;
   try {
@@ -263,6 +359,10 @@ export async function buildOvernightSection(
   // `changePct` be rendered beside a legitimately-ranked symbol. Guard the
   // price/move seed too, exactly as `filterByPriceFloor` does.
   const changeBySymbol = new Map<string, number>();
+  // TRA-4303 AC-4 — the same guard governs the PRICE we hand the eligibility
+  // column. A price off a condemned archived row would produce a price-floor
+  // verdict on a number that never happened, which is worse than `unknown`.
+  const priceBySymbol = new Map<string, number>();
   for (const r of scan.rows) {
     if (typeof r.changePct === 'number' && Number.isFinite(r.changePct)) {
       changeBySymbol.set(r.symbol.toUpperCase(), r.changePct);
@@ -275,8 +375,12 @@ export async function buildOvernightSection(
       if (!changeBySymbol.has(sym) && Number.isFinite(mover.changePct)) {
         changeBySymbol.set(sym, mover.changePct);
       }
+      if (Number.isFinite(mover.price) && mover.price > 0) priceBySymbol.set(sym, mover.price);
     }
   }
+
+  const universe = resolveLiveOtmUniverse(env);
+  const baseWatchlist = new Set((WATCHLIST as readonly string[]).map((s) => s.toUpperCase()));
 
   const rows: BriefOvernightSetup[] = ranked.slice(0, MAX_OVERNIGHT).map((r) => {
     const changePct = changeBySymbol.get(r.symbol);
@@ -285,6 +389,7 @@ export async function buildOvernightSection(
       legs: r.sources.map((s) => LEG_LABEL[s] ?? s),
       score: r.score,
       ...(changePct != null ? { changePct } : {}),
+      eligibility: classifyEligibility(r.symbol, priceBySymbol.get(r.symbol), universe, baseWatchlist),
     };
   });
 
@@ -292,6 +397,7 @@ export async function buildOvernightSection(
     available: true,
     rows,
     ...(notes.length ? { note: notes.join('; ') } : {}),
+    gates: buildGateReadout(env),
   };
 }
 

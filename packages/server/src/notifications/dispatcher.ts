@@ -136,6 +136,48 @@ export interface BriefHeadline {
  * earned attention from what happened before the close or overnight, with the
  * reason attached and no levels implied.
  */
+/**
+ * TRA-4303 AC-4 — "eligibility is a column, not a claim."
+ *
+ * What the row's admission looks like AT 08:30, against the gate values read
+ * from LIVE CONFIG (never source literals — the TRA-3515 `barR` failure mode).
+ *
+ * ⛔ Deliberately scoped to the gates that are DECIDABLE PRE-OPEN. The three
+ * gates the scope note named — the $0.50 premium floor, the |Δ| band and the
+ * cost-bar margin — are all per-CONTRACT: each needs a live option quote for a
+ * specific strike, and US options do not quote pre-market. A 08:30 verdict on
+ * them would be computed off yesterday's closing chain and would not be the
+ * verdict the 09:30+ order site faces. They are published as values-in-force on
+ * {@link BriefGateReadout.deferred} instead of being guessed at per row.
+ */
+export interface BriefOvernightEligibility {
+  /**
+   * `watched`   — already in the engine's base universe; no 09:00 add needed.
+   * `eligible`  — newcomer that clears every pre-open-decidable gate.
+   * `blocked`   — a pre-open-decidable gate rejects it; {@link gate} names which.
+   * `unknown`   — no pre-open price on hand, so the 09:00 price floor cannot be
+   *               pre-decided. NOT the same as `eligible`: the 09:00 build
+   *               prices these off a live quote and drops the ones that miss.
+   */
+  status: 'watched' | 'eligible' | 'blocked' | 'unknown';
+  /** The gate behind a `blocked` / `unknown` status, with the value in force. */
+  gate?: string;
+}
+
+/**
+ * TRA-4303 AC-4 — the gate values in force, resolved from live config at compose
+ * time by the same resolvers the enforcement path uses.
+ *
+ * Split by DECIDABILITY, not by importance: `decidedPreOpen` are the gates the
+ * per-row column above actually ruled on, `deferred` are the ones that need a
+ * live option quote and therefore cannot be ruled on at 08:30. Publishing them
+ * together as one list would let a reader take the second group as adjudicated.
+ */
+export interface BriefGateReadout {
+  decidedPreOpen: string[];
+  deferred: string[];
+}
+
 export interface BriefOvernightSetup {
   symbol: string;
   /**
@@ -153,6 +195,8 @@ export interface BriefOvernightSetup {
   changePct?: number;
   /** Rank score from the shared watchlist scorer; higher = more legs agreed. */
   score: number;
+  /** TRA-4303 AC-4 — admission status against the gates decidable at 08:30. */
+  eligibility: BriefOvernightEligibility;
 }
 
 /**
@@ -168,6 +212,8 @@ export interface BriefOvernightSection {
   rows: BriefOvernightSetup[];
   /** Degradation note naming whichever leg failed, when one did. */
   note?: string;
+  /** TRA-4303 AC-4 — the gate values in force behind the eligibility column. */
+  gates?: BriefGateReadout;
 }
 
 /**

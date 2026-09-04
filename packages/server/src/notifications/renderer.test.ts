@@ -212,8 +212,8 @@ describe('renderAlert', () => {
       briefWith({
         available: true,
         rows: [
-          { symbol: 'NVDA', legs: ['prior-close mover', 'pre-market gainer'], changePct: 8.421, score: 9 },
-          { symbol: 'SOFI', legs: ['traded yesterday'], score: 3 },
+          { symbol: 'NVDA', legs: ['prior-close mover', 'pre-market gainer'], changePct: 8.421, score: 9, eligibility: { status: 'eligible' } },
+          { symbol: 'SOFI', legs: ['traded yesterday'], score: 3, eligibility: { status: 'watched' } },
         ],
       }),
     );
@@ -249,7 +249,7 @@ describe('renderAlert', () => {
     const r = renderAlert(
       briefWith({
         available: true,
-        rows: [{ symbol: 'AMD', legs: ['pre-market gainer'], changePct: -3.1, score: 4 }],
+        rows: [{ symbol: 'AMD', legs: ['pre-market gainer'], changePct: -3.1, score: 4, eligibility: { status: 'eligible' } }],
         note: 'prior-session report unavailable',
       }),
     );
@@ -257,9 +257,58 @@ describe('renderAlert', () => {
     expect(r.text).toContain('(partial — prior-session report unavailable)');
   });
 
+  // TRA-4303 AC-4 — eligibility is a column, not a claim.
+  it('renders the eligibility column, and a rejection names its gate', () => {
+    const r = renderAlert(
+      briefWith({
+        available: true,
+        rows: [
+          { symbol: 'NVDA', legs: ['prior-close mover'], score: 5, eligibility: { status: 'eligible' } },
+          { symbol: 'AAPL', legs: ['traded yesterday'], score: 3, eligibility: { status: 'watched' } },
+          {
+            symbol: 'FAMI',
+            legs: ['pre-market gainer'],
+            changePct: 41.2,
+            score: 4,
+            eligibility: { status: 'blocked', gate: 'watchlist price floor $5.00 (last $0.15)' },
+          },
+          {
+            symbol: 'VSXY',
+            legs: ['trending'],
+            score: 1,
+            eligibility: { status: 'unknown', gate: 'watchlist price floor - no pre-open price' },
+          },
+        ],
+      }),
+    );
+    expect(r.text).toContain('NVDA · prior-close mover · eligible');
+    expect(r.text).toContain('AAPL · traded yesterday · already watched');
+    expect(r.text).toContain('FAMI · pre-market gainer · +41.20% · BLOCKED (watchlist price floor $5.00 (last $0.15))');
+    // Absent price must NOT read as eligible.
+    expect(r.text).toContain('VSXY · trending · eligibility unknown');
+    expect(r.text).not.toContain('VSXY · trending · eligible');
+  });
+
+  it('publishes the gate values in force, split by whether they were decidable pre-open', () => {
+    const r = renderAlert(
+      briefWith({
+        available: true,
+        rows: [{ symbol: 'NVDA', legs: ['prior-close mover'], score: 5, eligibility: { status: 'eligible' } }],
+        gates: {
+          decidedPreOpen: ['watchlist price floor $5.00 (shared constant, no env override)'],
+          deferred: ['contract premium floor $0.50 · |delta| [0.25, 0.4]'],
+        },
+      }),
+    );
+    expect(r.text).toContain('gates in force: watchlist price floor $5.00');
+    // The deferred group must never read as adjudicated.
+    expect(r.text).toContain('not decidable pre-open (needs a live option quote): contract premium floor $0.50');
+    expect(r.html).toContain('not decidable pre-open');
+  });
+
   it('HTML-escapes overnight setup strings', () => {
     const r = renderAlert(
-      briefWith({ available: true, rows: [{ symbol: '<script>x</script>', legs: ['A&B'], score: 1 }] }),
+      briefWith({ available: true, rows: [{ symbol: '<script>x</script>', legs: ['A&B'], score: 1, eligibility: { status: 'blocked', gate: '<b>g&g</b>' } }] }),
     );
     expect(r.html).toContain('&lt;script&gt;');
     expect(r.html).toContain('A&amp;B');

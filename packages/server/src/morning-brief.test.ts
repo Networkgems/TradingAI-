@@ -18,11 +18,14 @@ vi.mock('./market-scanner.js', () => ({
 
 import {
   buildBriefForUser,
+  buildGateReadout,
   buildOvernightSection,
+  classifyEligibility,
   getOvernightScan,
   isOvernightSetupsEnabled,
   resetOvernightScanCache,
 } from './morning-brief.js';
+import { resolveLiveOtmUniverse } from './otm-live-universe-flag.js';
 import type { UserContext } from './user-context.js';
 
 const addSymbolSpy = vi.fn();
@@ -142,7 +145,7 @@ describe('buildBriefForUser', () => {
   });
 
   it('threads a supplied overnight section onto the event', () => {
-    const section = { available: true, rows: [{ symbol: 'NVDA', legs: ['prior-close mover'], score: 5 }] };
+    const section = { available: true, rows: [{ symbol: 'NVDA', legs: ['prior-close mover'], score: 5, eligibility: { status: 'eligible' as const } }] };
     const e = buildBriefForUser(fakeCtx({}), MACRO, '2026-05-17', TS, section);
     expect(e.overnight).toEqual(section);
   });
@@ -274,6 +277,125 @@ describe('buildOvernightSection', () => {
     // Acceptance #3 — the 09:00 build stays the only writer of the watchlist.
     expect(addSymbolSpy).not.toHaveBeenCalled();
     expect(refreshSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ── TRA-4303 AC-4: eligibility is a column, not a claim ──────────────────────
+
+describe('classifyEligibility', () => {
+  const base = new Set(['AAPL']);
+  const unrestricted = resolveLiveOtmUniverse({ OPTION_LIVE_OTM_UNIVERSE: '*' });
+  const restricted = resolveLiveOtmUniverse({ OPTION_LIVE_OTM_UNIVERSE: 'NVDA,AMD' });
+
+  it('names the gate that rejected the row', () => {
+    expect(classifyEligibility('FAMI', 0.15, unrestricted, base)).toEqual({
+      status: 'blocked',
+      gate: 'watchlist price floor $5.00 (last $0.15)',
+    });
+    const off = classifyEligibility('SOFI', 12, restricted, base);
+    expect(off.status).toBe('blocked');
+    expect(off.gate).toContain('live options universe');
+  });
+
+  it('does not pass a priceless row off as eligible', () => {
+    const e = classifyEligibility('VSXY', undefined, unrestricted, base);
+    expect(e.status).toBe('unknown');
+    expect(e.gate).toContain('no pre-open price');
+  });
+
+  it('separates already-watched from a newcomer that clears the gates', () => {
+    expect(classifyEligibility('AAPL', 230, unrestricted, base).status).toBe('watched');
+    expect(classifyEligibility('NVDA', 900, unrestricted, base).status).toBe('eligible');
+  });
+
+  it('does not exempt a base-watchlist name from the live universe restriction', () => {
+    expect(classifyEligibility('AAPL', 230, restricted, base).status).toBe('blocked');
+  });
+});
+
+describe('buildGateReadout', () => {
+  it('reads the values from live config, not from source literals', () => {
+    const readout = buildGateReadout({
+      OPTION_LIVE_OTM_UNIVERSE: 'NVDA,AMD',
+      OTM_CONTRACT_FLOOR_PREMIUM_MIN: '0.75',
+      OTM_ADMISSIBLE_DELTA_MIN: '0.40',
+      OTM_ADMISSIBLE_DELTA_MAX: '0.60',
+    });
+    const all = [...readout.decidedPreOpen, ...readout.deferred].join('\n');
+    expect(all).toContain('RESTRICTED to [NVDA, AMD]');
+    expect(all).toContain('$0.75'); // the env value, NOT the 0.50 default
+    expect(all).toContain('[0.4, 0.6)'); // the env band, NOT [0.495, 0.55)
+  });
+
+  it('keeps the pre-open-decidable gates apart from the ones needing a live quote', () => {
+    const readout = buildGateReadout({ OPTION_LIVE_OTM_UNIVERSE: '*' });
+    expect(readout.decidedPreOpen.join('\n')).toContain('UNRESTRICTED');
+    // The three contract-level gates the scope note named are ALL deferred:
+    // they need a live option quote and options do not trade pre-market.
+    const deferred = readout.deferred.join('\n');
+    expect(deferred).toContain('premium floor');
+    expect(deferred).toContain('delta');
+    expect(deferred).toContain('cost-bar safety margin');
+    expect(readout.decidedPreOpen.join('\n')).not.toContain('premium floor');
+  });
+
+  it('surfaces a malformed knob rather than silently serving the default', () => {
+    const readout = buildGateReadout({ OTM_CONTRACT_FLOOR_PREMIUM_MIN: 'banana' });
+    expect(readout.deferred.join('\n')).toContain('INVALID: OTM_CONTRACT_FLOOR_PREMIUM_MIN');
+  });
+});
+
+describe('buildOvernightSection eligibility wiring', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetOvernightScanCache();
+    loadLatestEodReportMock.mockResolvedValue(null);
+  });
+
+  it('stamps every row and attaches the gate readout', async () => {
+    loadLatestEodReportMock.mockResolvedValue(
+      eodReport({
+        top5Movers: [
+          // NVDA is a base-WATCHLIST member; ZZTOPX is a newcomer.
+          { symbol: 'NVDA', price: 900, changePct: 6.2 },
+          { symbol: 'ZZTOPX', price: 42, changePct: 9.1 },
+          { symbol: 'FAMI', price: 0.15, changePct: 41.2 },
+        ],
+        trades: [],
+      } as unknown as Partial<EodReport>),
+    );
+    const sec = await buildOvernightSection(
+      fakeCtx({}),
+      { ok: true, rows: [{ symbol: 'VSXY', reason: 'trending' }] },
+      { OPTION_LIVE_OTM_UNIVERSE: '*' },
+    );
+
+    expect(sec.rows.every((r) => r.eligibility != null)).toBe(true);
+    expect(sec.rows.find((r) => r.symbol === 'NVDA')!.eligibility.status).toBe('watched');
+    expect(sec.rows.find((r) => r.symbol === 'ZZTOPX')!.eligibility.status).toBe('eligible');
+    // Priced off the guarded prior-session close, so the floor CAN be pre-decided.
+    expect(sec.rows.find((r) => r.symbol === 'FAMI')!.eligibility).toEqual({
+      status: 'blocked',
+      gate: 'watchlist price floor $5.00 (last $0.15)',
+    });
+    // Scan-only row: no pre-open price on hand.
+    expect(sec.rows.find((r) => r.symbol === 'VSXY')!.eligibility.status).toBe('unknown');
+    expect(sec.gates?.decidedPreOpen.length).toBeGreaterThan(0);
+    expect(sec.gates?.deferred.length).toBeGreaterThan(0);
+  });
+
+  it('never prices the eligibility column off a condemned archived row', async () => {
+    // Same +8,951% row as above: implausible, so it must not supply a price.
+    loadLatestEodReportMock.mockResolvedValue(
+      eodReport({ top5Movers: [{ symbol: 'FAKE', price: 12, changePct: 8951 }] } as unknown as Partial<EodReport>),
+    );
+    const sec = await buildOvernightSection(
+      fakeCtx({}),
+      { ok: true, rows: [{ symbol: 'FAKE', reason: 'trending' }] },
+      { OPTION_LIVE_OTM_UNIVERSE: '*' },
+    );
+    // $12 would have cleared the $5 floor and read `eligible` off a fabricated row.
+    expect(sec.rows.find((r) => r.symbol === 'FAKE')!.eligibility.status).toBe('unknown');
   });
 });
 

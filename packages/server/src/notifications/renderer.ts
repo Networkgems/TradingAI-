@@ -317,7 +317,25 @@ function fmtOvernightSetup(s: BriefOvernightSetup): string {
   const move = s.changePct != null && Number.isFinite(s.changePct)
     ? ` · ${fmtSignedPct(s.changePct)}`
     : '';
-  return `${s.symbol} · ${why}${move}`;
+  return `${s.symbol} · ${why}${move}${fmtEligibility(s.eligibility)}`;
+}
+
+/**
+ * TRA-4303 AC-4 — the eligibility column. A rejection NAMES its gate; a row with
+ * no pre-open price says so rather than passing as eligible.
+ */
+function fmtEligibility(e: BriefOvernightSetup['eligibility'] | undefined): string {
+  if (!e) return '';
+  switch (e.status) {
+    case 'blocked':
+      return ` · BLOCKED${e.gate ? ` (${e.gate})` : ''}`;
+    case 'unknown':
+      return ` · eligibility unknown${e.gate ? ` (${e.gate})` : ''}`;
+    case 'watched':
+      return ' · already watched';
+    default:
+      return ' · eligible';
+  }
 }
 
 /**
@@ -331,7 +349,25 @@ function fmtOvernightSetup(s: BriefOvernightSetup): string {
 function overnightRows(sec: BriefOvernightSection): string[] {
   if (!sec.available) return [`unavailable${sec.note ? ` — ${sec.note}` : ''}`];
   const rows = sec.rows.length ? sec.rows.map(fmtOvernightSetup) : ['none'];
-  return sec.note ? [...rows, `(partial — ${sec.note})`] : rows;
+  const out = sec.note ? [...rows, `(partial — ${sec.note})`] : [...rows];
+  // TRA-4303 AC-4 — the gate values the column above ruled under, and the ones
+  // it could NOT rule on. Printed under the rows so a reader can never take the
+  // deferred group as adjudicated.
+  //
+  // Two joined lines, not one per gate: the brief already sits near Discord's
+  // 2000-char `content` cap (see `fitDiscordContent`), and six more full-width
+  // lines here would push a normal brief into truncation on that channel. The
+  // two-line form keeps every value AND the decidable/deferred split, which are
+  // the parts that carry meaning; only the repeated prefix is dropped.
+  if (sec.gates) {
+    if (sec.gates.decidedPreOpen.length) {
+      out.push(`gates in force: ${sec.gates.decidedPreOpen.join(' · ')}`);
+    }
+    if (sec.gates.deferred.length) {
+      out.push(`not decidable pre-open (needs a live option quote): ${sec.gates.deferred.join(' · ')}`);
+    }
+  }
+  return out;
 }
 
 /** Format one open position row: "ETH-USD CRYPTO · long 2 @ 3,140 · P&L +$84.20". */

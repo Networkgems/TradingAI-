@@ -30,6 +30,8 @@ export type {
   BriefHeadline,
   BriefOvernightSetup,
   BriefOvernightSection,
+  BriefOvernightEligibility,
+  BriefGateReadout,
   ChannelAdapter,
   DispatcherDeps,
 } from './dispatcher.js';
