@@ -313,7 +313,14 @@ async function run(transport, opts) {
     };
   }
 
-  const check = verifyResumed(after, target.id, Date.now(), expectedOwnerId);
+  // `now`, NOT `Date.now()`. Every other clock read in this function honours the injected
+  // parameter; this one did not, so the read-back graded a fixture against the wall clock.
+  // In production the two are the same value seconds apart, which is why it looked harmless
+  // — but it made the end-to-end selftest a TIME BOMB: its fixture pins nextRunAt to
+  // 2026-08-26T20:45Z, so at that instant the control flipped to NOT_VERIFIED and `pnpm
+  // pretest` — and therefore `pnpm test` — went red on main for everyone, on a clock rather
+  // than on a commit. Found while fixing TRA-3744, which is a different cause of the same red.
+  const check = verifyResumed(after, target.id, now, expectedOwnerId);
   const afterTrigger = (triggersOf(after) || []).find((t) => t && t.id === target.id) || {};
   emit(
     'read-back',
