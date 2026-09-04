@@ -3845,6 +3845,21 @@ describe('TRA-2193 GET /api/health/rv-scan', () => {
     expect(String(body.armNote)).toContain('FLEET-BLIND');
     expect(body.armRetentionDays as unknown as number).toBe(30);
 
+    // TRA-4359 — the note must carry its own SCOPE. This exact desk cell
+    // (`live_arm_off` / `reachable: false`) was cited as proof the live entry path
+    // was structurally unreachable, while 14 live OTM opens sat inside the same
+    // retention window. The axis is directional-only; the note has to say so, and
+    // has to hand the reader the sleeve-correct instrument instead.
+    const armNote = String(body.armNote);
+    expect(armNote).toContain('DIRECTIONAL-ONLY');
+    expect(armNote).toContain('ONE call site');
+    // Names the sleeve that actually trades and its separate arm…
+    expect(armNote).toContain('isOptionLiveOtmArmed');
+    // …and the per-ET-day instrument that CAN discriminate, which is the whole
+    // remedy — a scope warning with no forwarding address just strands the reader.
+    expect(armNote).toContain('entry_window');
+    expect(armNote).toContain('live-enforce-gates');
+
     clearDirectionalOpenLedger();
   });
 });

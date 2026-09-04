@@ -7188,6 +7188,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // `reachable: true` means they DID scan, so silence there is a reject question.
       // NO cell for a class on a day is a THIRD state: no engine of that class ticked
       // during RTH, and it must not be read as either of the other two.
+      //
+      // ⚠️ TRA-4359 — SCOPE. Every one of these words is about the DIRECTIONAL pass
+      // and only it. `recordDirectionalArm` has exactly ONE call site — the
+      // `directionalDemoOn || directionalLiveOn` gate in signal-engine — so the live
+      // OTM sleeve, which has its OWN arm (`isOptionLiveOtmArmed`) checked at its own
+      // order site, writes NO cell here and is invisible on this axis. `reachable`
+      // therefore answers "could the DIRECTIONAL pass reach this book", NOT "could
+      // this book open a position". Do not read a `live_arm_off` desk cell as the
+      // live entry path being shut: see `armNote`.
       armByEtDay,
       armNote:
         'TRA-3080. `enabled` above is process-wide flag state and is FLEET-BLIND — it '
@@ -7198,12 +7207,33 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         + 'not evidence the pass was off. `ticks` is a LOWER BOUND (persistence is '
         + 'throttled to 5 min, so a died-boot tail is missing); `disposition`, '
         + '`reachable`, `accountClass` and `books` are exact from the first tick — grade '
-        + 'on those, never on an exact tick count.',
+        + 'on those, never on an exact tick count. '
+        // TRA-4359 — QuantTrader read "could the pass REACH this book" as "could this
+        // book open a position", cited an 18/18 `live_arm_off` desk run as proof the
+        // live entry path was structurally unreachable, and was about to re-point an
+        // acceptance cohort on it. 14 live OTM opens had landed inside that same run.
+        // The note has to carry its own scope or the next reader repeats it.
+        + '⚠️ SCOPE — this axis is DIRECTIONAL-ONLY. `recordDirectionalArm` has exactly '
+        + 'ONE call site (the `directional` entry gate in signal-engine), so `reachable` '
+        + 'means "could the DIRECTIONAL pass reach this book", NOT "could this book open '
+        + 'a position". The live OTM sleeve is a SEPARATE entry path with a SEPARATE arm '
+        + '(`isOptionLiveOtmArmed` = ENABLE_OPTION_LIVE_OTM AND the OPTION_LIVE_TEST_UNTIL '
+        + 'window) and writes NO cell here. A `desk`/`live` cell reading `live_arm_off` / '
+        + '`reachable: false` is therefore FULLY CONSISTENT with live option opens on that '
+        + 'same ET day, and 14 of them landed on days that read exactly that (2026-08-17 '
+        + 'through 2026-08-28). Never cite this axis for whether real money could enter. '
+        + 'For that read `arm.otmArmed` / `arm.directionalArmed` on '
+        + '/api/health/options-live (point-in-time, both sleeves), and gate `entry_window` '
+        + 'under `retained.byGate[].byEtDay[]` on /api/health/live-enforce-gates, which is '
+        + 'the per-ET-day (30d, on-disk) record of whether the live OTM entry gate ADMITTED '
+        + 'anything — `blockRate` 0.5733 on 2026-08-28 (390 admitted) vs 1 on 2026-09-03 '
+        + '(none), the discrimination this axis cannot make.',
       armRetentionDays: 30,
 
       // ── TRA-4350 — the RETAINED per-ET-day scan census ────────────────────
       //
-      // `armByEtDay` above answers "could the pass REACH this book". This answers
+      // `armByEtDay` above answers "could the DIRECTIONAL pass REACH this book"
+      // (TRA-4359 — that scope qualifier is load-bearing). This answers
       // the next question down, which nothing on the box could answer before:
       // "and what did it DECIDE". The option journal held zero opens in either
       // book from 2026-09-01T19:08:14Z to the 09-04 filing, and all three causes

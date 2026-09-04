@@ -726,6 +726,16 @@ export interface DirectionalArmDay {
  *     directional arm is off — the TRA-3080 desk answer);
  *   • NO cell for a class on that ET day ⇒ no engine of that class ticked during RTH
  *     at all, which is a third fact and must not be read as either of the above.
+ *
+ * ⚠️ TRA-4359 — "the pass" above is the DIRECTIONAL pass, exclusively. The only writer
+ * into `armTallies` is {@link recordDirectionalArm}, called from the single
+ * `directionalDemoOn || directionalLiveOn` gate in signal-engine, so `reachable` is
+ * scoped to that one entry path and NOT to "could this book open a position". The live
+ * OTM sleeve arms separately (`isOptionLiveOtmArmed`) and appears nowhere in this fold —
+ * 14 live OTM opens landed on 2026-08-17..2026-08-28, every one of which reads
+ * `live_arm_off` / `reachable: false` here. A reader grading real-money reachability off
+ * this fold is reading the wrong sleeve; send them to gate `entry_window` on
+ * /api/health/live-enforce-gates, which is per-ET-day and covers the sleeve that trades.
  */
 export function summarizeDirectionalArm(): DirectionalArmDay[] {
   interface Agg {
