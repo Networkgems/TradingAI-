@@ -4,7 +4,7 @@ import type {
   OptionTradeJournalRecord,
   OptionTradeOutcome,
 } from './option-trade-journal.js';
-import { outcomeForR, SAME_CLOSE_TOLERANCE_MS } from './option-trade-journal.js';
+import { outcomeForR, RECONSTRUCTED_EXIT_REASON, SAME_CLOSE_TOLERANCE_MS } from './option-trade-journal.js';
 
 // TRA-3485 (parent TRA-3472, CTO ruling 2026-08-13) — repair the stale live
 // `OPEN` journal rows, PARTITIONED.
@@ -67,8 +67,15 @@ export type StaleOpenTreatment = 'retract' | 'backfill_close' | 'no_action';
  * cannot be reconstructed from broker fills, which record what happened and not
  * why. A reconstructed close wearing `stop` would assert a decision nobody made
  * and would silently join the `byExitReason` rollup as if it had been observed.
+ *
+ * TRA-4241 moved the declaration into `option-trade-journal.ts` and re-exports
+ * it here, unchanged, so every existing importer keeps working. The supersede
+ * fold has to tell a reconstructed close from a witnessed one, and this module
+ * imports the journal — the dependency cannot run the other way, and two copies
+ * of the marker string is precisely the drift that would let the fold and its
+ * writer disagree about what "reconstructed" means.
  */
-export const RECONSTRUCTED_EXIT_REASON = 'reconstructed-TRA-3472';
+export { RECONSTRUCTED_EXIT_REASON };
 
 /**
  * How far from the journal's `openTs` a `buy_to_open` fill may sit and still be

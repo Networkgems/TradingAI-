@@ -764,6 +764,47 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
    * pre-state (the same reason `realizedPnlUsdBeforeRestatement` exists).
    */
   supersededOpenBasis?: OptionTradeSupersededOpenBasis[];
+  /**
+   * TRA-4241 — the close supersessions this row REFUSED, in arrival order.
+   * ABSENT means none was ever refused on it.
+   *
+   * `supersededCloses[]` above testifies to the moves that HAPPENED. This is
+   * the other half, and it exists because a refusal is invisible on the row
+   * without it: the fold declines, nothing on the row changes, and the only
+   * record is the bounded in-memory `closeSupersedes.recent` ring, which a
+   * restart empties and 500 entries evict. A grade published against a row has
+   * to stay re-derivable FROM THAT ROW — including the fact that something
+   * tried to restate it and was told no, and which broker order it named.
+   */
+  refusedCloseSupersedes?: OptionTradeRefusedCloseSupersede[];
+}
+
+/**
+ * TRA-4241 — one close supersession this row REFUSED. See
+ * {@link OptionTradeJournalRecord.refusedCloseSupersedes}.
+ *
+ * The `close…` fields are the close that was TURNED AWAY; the `retained…`
+ * fields are what the row kept, restated here rather than left implicit so the
+ * entry reads as a complete statement after the row moves on under some later
+ * amendment.
+ */
+export interface OptionTradeRefusedCloseSupersede {
+  refusal: 'witnessed_other_order';
+  /** When the refusal was folded. */
+  refusedAt: number;
+  closeTs: number;
+  exitReason: string;
+  realizedPnlUsd: number;
+  brokerOrderId: string | number | null;
+  /** The close the row KEPT — the one the refusal protected. */
+  retainedCloseTs: number | null;
+  retainedExitReason: string | null;
+  retainedRealizedPnlUsd: number | null;
+  retainedBrokerOrderId: string | number | null;
+  /** Why — free text naming the writer, e.g. `engine_close_on_already_closed_row`. */
+  reason: string;
+  /** The ticket authorising the writer. */
+  issue: string;
 }
 
 /** TRA-4028 — one entry basis this row USED to carry. See {@link OptionTradeJournalRecord.supersededOpenBasis}. */
@@ -965,6 +1006,21 @@ type SupersedeCloseLine = {
   reason: string;
   /** The ticket authorising the writer (`TRA-4004` for both the engine path and the admin route). */
   issue: string;
+  /**
+   * TRA-4241 — the writer ASSERTS it means to replace a close the broker
+   * witnessed under a different order, and accepts the demotion.
+   *
+   * On the LINE, not just in the call, because the fold is replayed: an
+   * overridden supersession that lived only in the caller's arguments would be
+   * re-refused on the next cold load and the row would silently revert to a
+   * state nobody chose. No production caller sets it — the engine path must
+   * never demote a real fill, the TRA-4004 admin backfill already refuses any
+   * row whose close is not the reconstruction marker, and the TRA-4082 detach
+   * repair authorises itself off the row's own `supersededCloses[]`. It exists
+   * so that a writer who genuinely has to can, VISIBLY: every use is stamped
+   * `overrodeWitnessedClose` on `closeSupersedes.recent`.
+   */
+  override?: true;
 };
 // TRA-4028 — RESTATE the ENTRY BASIS (`atRiskUsd`) on a row, OPEN or CLOSED.
 //
@@ -1020,6 +1076,17 @@ type JournalLine =
  * the first was never this position's.
  */
 export const SAME_CLOSE_TOLERANCE_MS = 1_000;
+
+/**
+ * The `exitReason` the TRA-3485/TRA-3547 reconstruction stamps on a close it
+ * BUILT rather than observed — i.e. a close no broker order witnessed.
+ *
+ * Canonical here, and re-exported by `tra3485-stale-open-repair.ts` (its
+ * original home) because that module imports this one and the dependency
+ * cannot run the other way. The supersede fold has to be able to tell a
+ * reconstructed close from a witnessed one without importing its writer.
+ */
+export const RECONSTRUCTED_EXIT_REASON = 'reconstructed-TRA-3472';
 
 /**
  * TRA-3472 — a retraction that leaves no trace is ungradeable.
@@ -1207,7 +1274,7 @@ export interface OptionTradeCloseSupersedeRecord {
   ts: number | null;
   applied: boolean;
   /** Why the fold refused; `null` when applied. */
-  refusal: 'unknown_row' | 'row_open' | 'same_close' | 'malformed' | null;
+  refusal: 'unknown_row' | 'row_open' | 'same_close' | 'malformed' | 'witnessed_other_order' | null;
   reason: string | null;
   issue: string | null;
   mode: 'demo' | 'live' | null;
@@ -1222,10 +1289,24 @@ export interface OptionTradeCloseSupersedeRecord {
   exitReason: string | null;
   realizedPnlUsd: number | null;
   brokerOrderId: string | number | null;
+  /**
+   * TRA-4241 — this supersession replaced a WITNESSED broker fill because the
+   * writer explicitly asked to. `false` on every ordinary record. A `true` here
+   * on a live row is the thing to go and read the reason for.
+   */
+  overrodeWitnessedClose: boolean;
 }
 
 /** Same cap as {@link VOID_LEDGER_CAP} — a witness, not a second journal. */
 const CLOSE_SUPERSEDE_LEDGER_CAP = 500;
+
+/**
+ * TRA-4241 — how many refused supersessions one row keeps in
+ * {@link OptionTradeJournalRecord.refusedCloseSupersedes}. Bounded because this
+ * lives on every dumped row and a repeatedly-retried writer must not be able to
+ * grow the journal without limit.
+ */
+const REFUSED_SUPERSEDE_CAP_PER_ROW = 32;
 let closeSupersedeLedger: OptionTradeCloseSupersedeRecord[] = [];
 let closeSupersedeDropped = 0;
 
@@ -1705,6 +1786,7 @@ function foldLine(
       supersededCloseTs: rec && Number.isFinite(rec.closeTs) ? (rec.closeTs as number) : null,
       supersededExitReason: rec?.exitReason ?? null,
       supersededRealizedPnlUsd: rec && Number.isFinite(rec.realizedPnlUsd) ? (rec.realizedPnlUsd as number) : null,
+      overrodeWitnessedClose: false,
     };
     const refuse = (refusal: OptionTradeCloseSupersedeRecord['refusal']): void => {
       pushCloseSupersede(supersedeSink, {
@@ -1728,6 +1810,81 @@ function foldLine(
       refuse('same_close');
       return;
     }
+    // TRA-4241 — the fourth refusal, and the one that keys on the BROKER ORDER
+    // rather than the clock (the TRA-4082 rule).
+    //
+    // On 2026-08-26T13:45:31Z this fold applied `engine_close_on_already_closed_row`
+    // to `8a849902` — a settled, real-money row whose close was order 143048620,
+    // a WITNESSED sell_to_close filled on 08-24 — and replaced it with the close
+    // of order 143384264, a DIFFERENT witnessed fill two days later. The broker
+    // tape (TRA-3939 capture) holds two `buy_to_open` fills and two
+    // `sell_to_close` fills on `RIG260925C00006000`: the row described one lot
+    // and the incoming close was the other lot's. The economics survived; the
+    // two columns a strategy grade reads — WHEN the row closed and WHY — did
+    // not, and TRA-3957's closed BREACH verdict stopped being re-derivable from
+    // the ledger it was graded on.
+    //
+    // A position closes once. So when the close already on the row is one the
+    // BROKER witnessed under some order, a close arriving under a DIFFERENT
+    // order is not a correction of it — it is a second lot's exit, and applying
+    // it demotes a real fill into `supersededCloses[]` where no export query
+    // looks. TRA-4082 installed this test at the engine's call site, but only
+    // behind `rebound` (`journalId !== id`); the fold is where it belongs,
+    // because the fold is what every writer shares and the demotion is wrong
+    // whatever the caller believed about rebinding.
+    //
+    // Two closes it must NOT refuse:
+    //   • a RECONSTRUCTED close (`RECONSTRUCTED_EXIT_REASON`, or one carrying no
+    //     broker order at all) — nobody witnessed it, so nothing real is being
+    //     demoted. That is the shape TRA-4004 built this path for (`6bbc5d17`);
+    //   • a RESTORE — an incoming close whose order already appears in this
+    //     row's own `supersededCloses[]`. The row testifies it once carried that
+    //     close, so putting it back cannot demote it; this is the exit the
+    //     TRA-4082 detach repair leaves through, and it is self-authorising off
+    //     the row rather than off a caller's flag.
+    const existingOrder = rec.brokerOrderId ?? null;
+    const incomingOrder = c.brokerOrderId ?? null;
+    const existingIsWitnessed = existingOrder !== null && rec.exitReason !== RECONSTRUCTED_EXIT_REASON;
+    const namesAnotherOrder = existingOrder !== null
+      && (incomingOrder === null || String(existingOrder) !== String(incomingOrder));
+    const isRestoreOfOwnSupersededClose = incomingOrder !== null
+      && (rec.supersededCloses ?? []).some(
+        (s) => s.brokerOrderId !== null && String(s.brokerOrderId) === String(incomingOrder),
+      );
+    const demotesWitnessedClose = existingIsWitnessed && namesAnotherOrder && !isRestoreOfOwnSupersededClose;
+    if (demotesWitnessedClose && line.override !== true) {
+      refuse('witnessed_other_order');
+      // The refusal goes ON THE ROW as well as into the ring (AC3). The ring is
+      // bounded and in-memory; the row is the surface a grade is re-derived
+      // from, and "nothing changed" is indistinguishable from "nothing was ever
+      // attempted" unless the row says so. `recordOptionTradeCloseSupersede`
+      // makes the refused line durable for exactly this reason, so a replay
+      // rebuilds this entry instead of forgetting it at the next restart.
+      const refusedEntry: OptionTradeRefusedCloseSupersede = {
+        refusal: 'witnessed_other_order',
+        refusedAt: ts ?? 0,
+        closeTs: c.closeTs,
+        exitReason: c.exitReason,
+        realizedPnlUsd: c.realizedPnlUsd,
+        brokerOrderId: incomingOrder,
+        retainedCloseTs: base.supersededCloseTs,
+        retainedExitReason: base.supersededExitReason,
+        retainedRealizedPnlUsd: base.supersededRealizedPnlUsd,
+        retainedBrokerOrderId: existingOrder,
+        reason: base.reason ?? '',
+        issue: base.issue ?? '',
+      };
+      // Capped for the same reason the ledgers are: an audit trail on a row, not
+      // a second journal. The OLDEST entries go — the first refusal on a row is
+      // the interesting one, but a row taking 32 of them is a live defect and
+      // the RECENT ones are what describe it.
+      const refusedSoFar = [...(rec.refusedCloseSupersedes ?? []), refusedEntry];
+      map.set(line.id, {
+        ...rec,
+        refusedCloseSupersedes: refusedSoFar.slice(-REFUSED_SUPERSEDE_CAP_PER_ROW),
+      });
+      return;
+    }
     const prior: OptionTradeSupersededClose = {
       closeTs: rec.closeTs as number,
       outcome: rec.outcome,
@@ -1746,6 +1903,10 @@ function foldLine(
       exitReason: c.exitReason,
       realizedPnlUsd: c.realizedPnlUsd,
       brokerOrderId: c.brokerOrderId ?? null,
+      // TRA-4241 — true only when the guard WOULD have refused and the writer
+      // said to go ahead anyway. Not `line.override`: a flag set on a
+      // supersession the guard never objected to says nothing happened.
+      overrodeWitnessedClose: demotesWitnessedClose,
     });
     // The superseded close's MONEY goes with it. A TRA-2819 restatement
     // (`pnlBasis: 'broker-fill'`, fees, fill premiums) was measured against the
@@ -2144,18 +2305,28 @@ export async function recordOptionTradeClose(
  * duplicate close EVENT that `recordOptionTradeClose`'s guard exists for, and
  * this path must not become the door around it. Every refusal is witnessed on
  * {@link getOptionTradeCloseSupersedes}.
+ *
+ * TRA-4241 added a fourth: an incoming close naming a broker order DIFFERENT
+ * from the witnessed one already on the row. That refusal is the only one
+ * whose line is APPENDED to the journal file, because it is the only one that
+ * writes to the row (`refusedCloseSupersedes[]`) and the row's testimony has to
+ * survive a replay. The other three touch nothing, so a durable line would only
+ * make every reload re-refuse them.
  */
 export async function recordOptionTradeCloseSupersede(
   id: string,
   close: OptionTradeJournalClose,
-  meta: { reason: string; issue: string },
+  meta: { reason: string; issue: string; overridesWitnessedClose?: boolean },
   // Test seam — pin the witness clock. Defaults to wall time.
   ts: number = Date.now(),
 ): Promise<{ applied: boolean; refusal: OptionTradeCloseSupersedeRecord['refusal'] }> {
   if (!isOptionTradeJournalEnabled()) return { applied: false, refusal: null };
   const map = await ensureLoaded();
   const existing = map.get(id);
-  const line: SupersedeCloseLine = { kind: 'supersede_close', id, ts, close, reason: meta.reason, issue: meta.issue };
+  const line: SupersedeCloseLine = {
+    kind: 'supersede_close', id, ts, close, reason: meta.reason, issue: meta.issue,
+    ...(meta.overridesWitnessedClose === true ? { override: true as const } : {}),
+  };
   const before = closeSupersedeLedger.length;
   foldLine(map, line);
   const witness = closeSupersedeLedger[closeSupersedeLedger.length - 1];
@@ -2167,8 +2338,17 @@ export async function recordOptionTradeCloseSupersede(
       reason: meta.reason,
       refusal: witness?.refusal ?? null,
       existingCloseTs: existing?.closeTs ?? null,
+      existingBrokerOrderId: existing?.brokerOrderId ?? null,
       attemptedCloseTs: close.closeTs,
+      attemptedBrokerOrderId: close.brokerOrderId ?? null,
     });
+    // TRA-4241 — this refusal WROTE to the row (`refusedCloseSupersedes[]`), so
+    // its line is durable. Without the append, the next process would replay a
+    // file that never heard of the attempt and rebuild a row that cannot say it
+    // was ever made — exactly the bounded-ring blindness the row entry exists to
+    // fix. The fold is deterministic, so replaying it re-refuses and rebuilds
+    // the same single entry.
+    if (witness?.refusal === 'witnessed_other_order') await appendLine(line);
     return { applied: false, refusal: witness?.refusal ?? null };
   }
   await appendLine(line);

@@ -394,7 +394,16 @@ describe('TRA-4082 (e) — the repair, on the incident\'s exact numbers', () => 
       closeTs: RESIDUAL_CLOSE, outcome: 'LOSS', realizedPnlUsd: -7, realizedR: -7 / 33,
       exitReason: 'profit_lock', holdDays: (RESIDUAL_CLOSE - ENGINE_OPEN) / 86_400_000,
       brokerOrderId: RESIDUAL_ORDER, entryBasisPremium: RESIDUAL_BASIS,
-    }, { reason: 'engine_close_on_already_closed_row', issue: 'TRA-4004' }, RESIDUAL_CLOSE + 3);
+    }, {
+      reason: 'engine_close_on_already_closed_row', issue: 'TRA-4004',
+      // TRA-4241 — the wrongful supersession is no longer REACHABLE through this
+      // path: the fold now refuses a close naming a broker order different from
+      // the witnessed one already on the row. That is the fix. These tests are
+      // about the REPAIR of a row it already happened to, so the damaged state is
+      // declared here rather than smuggled in — and the declaration is exactly
+      // what the ledger stamps `overrodeWitnessedClose` on.
+      overridesWitnessedClose: true,
+    }, RESIDUAL_CLOSE + 3);
     expect(sup.applied).toBe(true);
     const e = (await getOptionTradeJournalRecord('E'))!;
     expect(e.exitReason).toBe('profit_lock');
@@ -549,7 +558,16 @@ describe('TRA-4082 (e2) — the repair on the row as the live journal carried it
       closeTs: RESIDUAL_CLOSE, outcome: 'LOSS', realizedPnlUsd: -7, realizedR: -7 / 33,
       exitReason: 'profit_lock', holdDays: (RESIDUAL_CLOSE - ENGINE_OPEN) / 86_400_000,
       brokerOrderId: RESIDUAL_ORDER, entryBasisPremium: RESIDUAL_BASIS,
-    }, { reason: 'engine_close_on_already_closed_row', issue: 'TRA-4004' }, RESIDUAL_CLOSE + 3);
+    }, {
+      reason: 'engine_close_on_already_closed_row', issue: 'TRA-4004',
+      // TRA-4241 — the wrongful supersession is no longer REACHABLE through this
+      // path: the fold now refuses a close naming a broker order different from
+      // the witnessed one already on the row. That is the fix. These tests are
+      // about the REPAIR of a row it already happened to, so the damaged state is
+      // declared here rather than smuggled in — and the declaration is exactly
+      // what the ledger stamps `overrodeWitnessedClose` on.
+      overridesWitnessedClose: true,
+    }, RESIDUAL_CLOSE + 3);
     expect(sup.applied).toBe(true);
     expect(await recordOptionTradeCloseBasis('E', {
       realizedPnlUsd: -15.24, realizedR: -0.4618, outcome: 'LOSS', feesUsd: 0.24,
@@ -613,7 +631,16 @@ describe('TRA-4082 (e2) — the repair on the row as the live journal carried it
     await recordOptionTradeCloseSupersede('E', {
       closeTs: RESIDUAL_CLOSE, outcome: 'LOSS', realizedPnlUsd: -7, realizedR: -7 / 33,
       exitReason: 'profit_lock', holdDays: 4.82, brokerOrderId: RESIDUAL_ORDER, entryBasisPremium: RESIDUAL_BASIS,
-    }, { reason: 'engine_close_on_already_closed_row', issue: 'TRA-4004' }, RESIDUAL_CLOSE + 3);
+    }, {
+      reason: 'engine_close_on_already_closed_row', issue: 'TRA-4004',
+      // TRA-4241 — the wrongful supersession is no longer REACHABLE through this
+      // path: the fold now refuses a close naming a broker order different from
+      // the witnessed one already on the row. That is the fix. These tests are
+      // about the REPAIR of a row it already happened to, so the damaged state is
+      // declared here rather than smuggled in — and the declaration is exactly
+      // what the ledger stamps `overrodeWitnessedClose` on.
+      overridesWitnessedClose: true,
+    }, RESIDUAL_CLOSE + 3);
     const plan = planDetachReboundClose(await getOptionTradeJournalRecord('E'), null, REQ, NOW);
     expect(plan.ok).toBe(true);
     if (!plan.ok) return;
