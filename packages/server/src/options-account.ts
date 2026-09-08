@@ -225,6 +225,10 @@ import {
   type OptionTradeJournalOpen,
   type SentimentIcBand,
 } from './option-trade-journal.js';
+// TRA-4246 (AC1) — the row's own stop-basis R, captured at the close write
+// while `stopLossPremium` is still in scope. See that module for why this is
+// per-row and not a per-sleeve constant.
+import { computeOptionStopBasisR } from './option-stop-basis-r.js';
 // TRA-3946 — the observe-only average-down shadow (phase 1, zero capital).
 import {
   resolveAverageDownConfig,
@@ -7274,6 +7278,19 @@ export class PaperOptionsAccount {
           Number.isFinite(position.currentPremium) && position.currentPremium > 0
             ? position.currentPremium
             : null;
+        // TRA-4246 (AC1) — the row's OWN stop-basis R, computed HERE because
+        // this is the last place `stopLossPremium` and the post-reconcile
+        // `premiumPaid` are both in hand. Once the close row is written the
+        // position leaves the book and the stop is unrecoverable — which is
+        // exactly why the export published `pnl_r_stop_basis: null` on 106 of
+        // 106 journal-served rows and readers re-scaled premium R through a
+        // gate constant that models a different sleeve's stop.
+        const stopBasis = computeOptionStopBasisR({
+          premiumPaid: position.premiumPaid,
+          stopLossPremium: position.stopLossPremium,
+          contracts: position.contracts,
+          realizedPnlUsd,
+        });
         const close = {
           closeTs,
           outcome: outcomeForR(realizedR),
@@ -7282,6 +7299,18 @@ export class PaperOptionsAccount {
           exitReason,
           holdDays,
           brokerOrderId,
+          // TRA-4246 (AC1) — ALWAYS written, `null` included: the null is the
+          // verdict "this row had no armed stop", and the reason beside it is
+          // what stops that reading as "we forgot to stamp". Forward-only —
+          // ⛔ nothing backfills a closed row's stop.
+          pnlRStopBasis: stopBasis.pnlRStopBasis,
+          ...(stopBasis.reason !== undefined ? { pnlRStopBasisReason: stopBasis.reason } : {}),
+          ...(stopBasis.stopBasisPremium !== undefined
+            ? { stopBasisPremium: stopBasis.stopBasisPremium }
+            : {}),
+          ...(stopBasis.stopBasisRPerPremiumR !== undefined
+            ? { stopBasisRPerPremiumR: stopBasis.stopBasisRPerPremiumR }
+            : {}),
           // TRA-4031 — the basis this close was PRICED against: `premiumPaid`
           // as it stands NOW, i.e. after `restateEngineOpenedBasis` (mirror
           // reconcile) or an operator pin moved it off the open mark. The OPEN
@@ -11492,6 +11521,18 @@ export class PaperOptionsAccount {
                   levelPremium: opt.premiumPaid + levelR * lock.R,
                   markAtFire: mark,
                   execBidAtFire: execBid,
+                  // TRA-4246 (AC2) — the decision's own operands, off the SAME
+                  // `lock` the level came from. `peakPremiumAtFire` is the peak
+                  // the rule CONSUMED, which under TRA-4285 is the executable
+                  // peak on a quoted tick and the mid high-water mark on a dark
+                  // one — the same expression this call site passed as
+                  // `peakPrice`, not a re-read of `opt.peakPremium`.
+                  armed: lock.armed,
+                  peakPremiumAtFire:
+                    execBid !== null ? (opt.peakPremiumExec ?? execBid) : opt.peakPremium,
+                  peakR: lock.peakR,
+                  giveBackR: lock.giveBackR,
+                  stopBasisPremium: lock.R,
                 };
               }
             }
@@ -16072,6 +16113,15 @@ export class PaperOptionsAccount {
             levelPremium: opt.premiumPaid + levelR * lock.R,
             markAtFire: closePrice,
             execBidAtFire: null,
+            // TRA-4246 (AC2) — same operands, same decision. `execBidAtFire` is
+            // null here by construction, so `peakPremiumAtFire` is the MID
+            // high-water mark: this path evaluated the mid basis, and the stamp
+            // must say what the decision read, not what a quoted tick would.
+            armed: lock.armed,
+            peakPremiumAtFire: opt.peakPremium as number,
+            peakR: lock.peakR,
+            giveBackR: lock.giveBackR,
+            stopBasisPremium: lock.R,
           };
         }
       }

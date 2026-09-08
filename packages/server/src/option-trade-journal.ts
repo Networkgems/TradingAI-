@@ -547,7 +547,78 @@ export interface OptionTradeJournalClose {
    * closed before this shipped. ⛔ Never backfilled.
    */
   profitLockFire?: OptionProfitLockFire;
+  /**
+   * TRA-4246 (AC1) — THE ROW'S OWN STOP-BASIS R, and the divisor it was
+   * computed with, captured at the close write.
+   *
+   * `realizedPnlUsd ÷ (|premiumPaid − stopLossPremium| × contracts × 100)`,
+   * where BOTH operands are the ones the exit evaluation consumed on this row
+   * at this close — `premiumPaid` post-reconcile (the same figure
+   * `entryBasisPremium` publishes) and `stopLossPremium` as the row carried it.
+   * It is the journal-side twin of `optionStopRiskUsd`'s book figure, so an
+   * archive-served export row and the book row it replaces agree.
+   *
+   * ── Why this is a per-ROW field and not a constant ──────────────────────
+   * The export used to publish `null` here on every journal-served row, with
+   * the comment "the journal records no stop"; a reader who needed the number
+   * therefore re-scaled premium R by the cell's `gateRPerPremiumR` (4, from the
+   * gate's modelled `mark × 0.75`). The live OTM sleeve stops at
+   * `premium × 0.80` — a 5× — so every stop-basis magnitude derived that way
+   * was 4/5 of true, understated by 20%, across the whole CFO TRA-4243 table.
+   * One cell-level constant cannot span two sleeves with different `slPct`,
+   * and a per-sleeve TABLE of constants goes red the day a third sleeve
+   * arrives. The row knows its own stop. It publishes it.
+   *
+   * ⛔ NULL IS A VERDICT, NEVER A DEFAULT. `stopLossPremium: 0` is the book's
+   * "never stop" sentinel (an unauthorized adopted lot carries it), and a
+   * distance measured off a stop that does not exist would silently equal the
+   * PREMIUM basis and read as a coincidence rather than as "no stop". So a
+   * degenerate stop persists `pnlRStopBasis: null` PLUS
+   * {@link pnlRStopBasisReason}, and never a number.
+   *
+   * ⚠️ FORWARD-ONLY, the same posture as TRA-4020's `peakPremium`: a row closed
+   * before this shipped carries neither field, and ⛔ neither is backfilled —
+   * the stop that was armed at some past close is not recoverable from the
+   * archived row, and a reconstructed divisor is a fabricated column.
+   */
+  pnlRStopBasis?: number | null;
+  /**
+   * TRA-4246 (AC1) — WHY {@link pnlRStopBasis} is null, so a blank is readable
+   * rather than ambiguous with "not stamped".
+   *
+   * `stop_unarmed` ⇒ `stopLossPremium` was absent, non-finite or the `0`
+   * sentinel. `nonpositive_r` ⇒ a stop was present but `|premiumPaid −
+   * stopLossPremium|` came out ≤ 0 (a stop AT the basis; the row has no risk
+   * unit). `basis_unknown` ⇒ no finite positive `premiumPaid`. `pnl_unknown` ⇒
+   * the risk unit is fine but the close carried no finite `realizedPnlUsd`.
+   * ABSENT alongside a non-null `pnlRStopBasis` means the figure is good;
+   * ABSENT alongside a null one means the row predates this stamp.
+   */
+  pnlRStopBasisReason?: OptionStopBasisNullReason;
+  /**
+   * TRA-4246 (AC1/AC3) — the DIVISOR, published beside the number it divided.
+   *
+   * `stopBasisPremium` is the risk unit per share (`|premiumPaid −
+   * stopLossPremium|`) and `stopBasisRPerPremiumR` is `premiumPaid ÷
+   * stopBasisPremium` — the row's OWN premium-R→stop-R conversion (5.0 on the
+   * `OTM_OPTIONS_SL_PCT 0.20` sleeve, 4.0 on an `OPTIONS_SL_PCT 0.25` one).
+   * That second number is the whole of AC3 done per row: a reader converting
+   * between the two bases now reads the factor off the row instead of taking
+   * the sleeve cell's gate constant for it.
+   *
+   * Both absent when {@link pnlRStopBasis} is null — there is no divisor to
+   * publish when there is no risk unit.
+   */
+  stopBasisPremium?: number;
+  stopBasisRPerPremiumR?: number;
 }
+
+/** TRA-4246 (AC1) — see {@link OptionTradeJournalClose.pnlRStopBasisReason}. */
+export type OptionStopBasisNullReason =
+  | 'stop_unarmed'
+  | 'nonpositive_r'
+  | 'basis_unknown'
+  | 'pnl_unknown';
 
 /** TRA-4020 (R4) — see {@link OptionTradeJournalClose.openingRangeSuppressed}. */
 export interface OptionTradeJournalOpeningRangeSuppression {
@@ -644,8 +715,22 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
   /**
    * TRA-4317 (AC1) — the profit-lock release level at the firing tick, folded
    * from the CLOSE row. Absent on non-profit-lock closes and pre-stamp rows.
+   *
+   * ⚠️ TRA-4246 (AC2) — a `profit_lock` row with NO `profitLockFire` at all is
+   * not "a fire we forgot to stamp": on a post-stamp build it is a RELABEL —
+   * a supersede that overwrote the reason, or a close path that never ran the
+   * decision. Read the absence, do not fill it.
    */
   profitLockFire?: OptionProfitLockFire;
+  /**
+   * TRA-4246 (AC1) — the row's own stop-basis R, its null-reason and its
+   * divisor, folded from the CLOSE row. Forward-only; ⛔ never backfilled.
+   * See {@link OptionTradeJournalClose.pnlRStopBasis} for the full argument.
+   */
+  pnlRStopBasis?: number | null;
+  pnlRStopBasisReason?: OptionStopBasisNullReason;
+  stopBasisPremium?: number;
+  stopBasisRPerPremiumR?: number;
   /**
    * TRA-2895 — partial exits realized before the full close, in append order.
    *
@@ -2013,6 +2098,25 @@ function foldLine(
     // the mark it read; absent stays absent. Copied for the same aliasing reason.
     ...(line.close.profitLockFire !== undefined
       ? { profitLockFire: { ...line.close.profitLockFire } }
+      : {}),
+    // TRA-4246 (AC1) — the row's own stop-basis R and the divisor it used.
+    // `pnlRStopBasis` is folded when the KEY is present, `null` included: a
+    // null here is a stamped verdict ("this row had no armed stop"), and the
+    // reason column beside it is what makes it readable. `undefined` — a
+    // pre-stamp close — stays absent, because absent and "stamped null" are
+    // different facts and only one of them licenses a claim about the row.
+    ...('pnlRStopBasis' in line.close
+      ? { pnlRStopBasis: line.close.pnlRStopBasis ?? null }
+      : {}),
+    ...(line.close.pnlRStopBasisReason !== undefined
+      ? { pnlRStopBasisReason: line.close.pnlRStopBasisReason }
+      : {}),
+    ...(typeof line.close.stopBasisPremium === 'number' && Number.isFinite(line.close.stopBasisPremium)
+      ? { stopBasisPremium: line.close.stopBasisPremium }
+      : {}),
+    ...(typeof line.close.stopBasisRPerPremiumR === 'number'
+      && Number.isFinite(line.close.stopBasisRPerPremiumR)
+      ? { stopBasisRPerPremiumR: line.close.stopBasisRPerPremiumR }
       : {}),
   });
 }

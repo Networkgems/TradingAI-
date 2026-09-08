@@ -2302,8 +2302,26 @@ export interface OptionJournalStructureExitCell {
   minR: number | null;
   /** Up to 12 most-negative finite `realizedR` values (< 0), ascending. */
   leftTailR: number[];
-  /** premium→gate R factor (4) where valid; `null` where no conversion exists. */
+  /**
+   * premium→GATE R factor (4) where valid; `null` where no conversion exists.
+   *
+   * ⛔ TRA-4246 (AC3) — the gate's R is its MODEL of a stop (`mark × 0.75`),
+   * not the sleeve's armed stop. `single_leg_otm` stops at 0.20 (a 5×), so
+   * this constant converts premium R to GATE R and must never be used to
+   * convert it to STOP-BASIS R — doing so understates that sleeve by 20%.
+   * The stop-basis divisor is per-row (`stopBasisRPerPremiumR` on the journal
+   * close row) and folded per cell on the sleeve grid.
+   */
   gateRPerPremiumR: number | null;
+  /**
+   * TRA-4246 (AC3) — closed rows in this cell carrying a per-row stop-basis
+   * divisor, and the distinct values they carry, ascending. `n: 0` with `[]`
+   * ⇒ no row here can be converted to stop basis at all (pre-stamp closes, or
+   * every row closed with an unarmed stop) — which is a fact to publish, not a
+   * gap to fill with the gate constant. More than one value ⇒ the cell spans
+   * different stop rules and NO single divisor describes it.
+   */
+  stopRPerPremiumRObserved: { n: number; values: number[] };
 }
 
 /** TRA-2590 — the cross-tab plus its own residual check. */
@@ -2392,6 +2410,20 @@ function crossTabStructureExit(
         gateRPerPremiumR: GATE_R_BASIS_STRUCTURES.has(structure)
           ? 1 / STOP_DISTANCE_FRACTION_OF_MARK
           : null,
+        // TRA-4246 (AC3) — and what this cell's OWN rows measured. Distinct,
+        // rounded to 4dp so float hair on one row cannot manufacture a second
+        // "sleeve"; ascending, so a reader sees the spread at a glance.
+        stopRPerPremiumRObserved: (() => {
+          const seen = new Set<number>();
+          let n = 0;
+          for (const r of list) {
+            const v = r.stopBasisRPerPremiumR;
+            if (typeof v !== 'number' || !Number.isFinite(v) || !(v > 0)) continue;
+            n += 1;
+            seen.add(Math.round(v * 10000) / 10000);
+          }
+          return { n, values: [...seen].sort((a, b) => a - b) };
+        })(),
       };
     })
     .sort((a, b) => b.closed - a.closed || Math.abs(b.realizedPnlUsd) - Math.abs(a.realizedPnlUsd));
@@ -2408,9 +2440,13 @@ function crossTabStructureExit(
     rBasis: 'premium',
     note:
       'Cells are (structure × exitReason) over RESOLVED rows. R is PREMIUM R '
-      + '(realizedPnlUsd / atRiskUsd, atRisk = full premium) — the cost-aware gate\'s R is the '
-      + 'STOP DISTANCE = 0.25 × premium, so gateR = 4 × the numbers here wherever '
-      + 'gateRPerPremiumR is non-null. Histogram edges sit EXACTLY on -1.00R and -0.50R; '
+      + '(realizedPnlUsd / atRiskUsd, atRisk = full premium) — the cost-aware gate\'s R is its '
+      + 'MODELLED stop distance = 0.25 × premium, so gateR = 4 × the numbers here wherever '
+      + 'gateRPerPremiumR is non-null. TRA-4246: that is the GATE\'s basis and NOT the sleeve\'s '
+      + 'armed stop — single_leg_otm stops at OTM_OPTIONS_SL_PCT 0.20 (a 5×), so 4× converts to '
+      + 'GATE R and NEVER to STOP-BASIS R (doing so understates that sleeve by 20%). '
+      + 'stopRPerPremiumRObserved is the divisor this cell\'s own rows measured; more than one '
+      + 'value means no single divisor describes the cell. Histogram edges sit EXACTLY on -1.00R and -0.50R; '
       + 'closesBelowMinus050R / closesBelowMinus100R are STRICT (< edge), so a close landing ON '
       + '-0.50R is NOT a violation of TRA-2202\'s "zero closes below -0.50R". minR >= -0.50 '
       + 'settles the criterion for this cell with no float-epsilon question at all.',
