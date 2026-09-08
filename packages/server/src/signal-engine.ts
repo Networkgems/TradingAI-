@@ -80,7 +80,7 @@ import { evaluateExecutionGate, buildOrderAudit, killSwitchClear } from './agent
 import { recordExecutedOrder } from './agent-execution-caps-store.js';
 import { getUserMemorySync, recordInteractionOutcome } from './user-trading-memory-store.js';
 import { getLatestMarketReview } from './market-review.js';
-import { withPhase, timeSyncPhase } from './phase-timing.js';
+import { withPhase, timeSyncPhase, SyncSliceMeter } from './phase-timing.js';
 import { TickExitWorkMeter, type TickExitWorkTerms } from './tick-exit-work.js';
 import { TickExitRegionMeter, classifyExitInterval, type TickExitRegionRthTerms } from './tick-exit-region.js';
 import { trySma200ScanSlot, releaseSma200ScanSlot } from './sma200-scan-admission.js';
@@ -920,14 +920,45 @@ const EVAL_YIELD_BUDGET_MS = 750;
  */
 class EvalYielder {
   private lastYieldAt = Date.now();
-  shouldYield(symIdx: number): boolean {
+  // TRA-3660 — sync-slice attribution. The yielder BOUNDS a contiguous stretch
+  // but never MEASURES it, so a single un-preemptible 8s slice (trips #7-#11,
+  // all `slowSyncPhase: null` under a 22s async envelope) had no instrument
+  // that could name it. Constructed with a phase name, the yielder now records
+  // (a) its own slow slices with the symbol range that blocked, and (b) slow
+  // yield-resume delays as `yield-preempt@<phase>` — foreign uninstrumented
+  // work starving the loop DURING the yield, the reading that stops a straddle
+  // sample from convicting the innocent yielded envelope. Nameless construction
+  // is byte-identical to the old behaviour.
+  private readonly meter: SyncSliceMeter | null;
+  constructor(phase?: string) {
+    this.meter = phase != null ? new SyncSliceMeter(phase) : null;
+  }
+  shouldYield(symIdx: number, label?: string): boolean {
     const overCount = symIdx > 0 && symIdx % EQUITY_EVAL_YIELD_EVERY === 0;
     const overTime = Date.now() - this.lastYieldAt >= EVAL_YIELD_BUDGET_MS;
     if (overCount || overTime) {
+      this.meter?.endSlice(label);
       this.lastYieldAt = Date.now();
       return true;
     }
     return false;
+  }
+  /**
+   * TRA-3660 — yield via the yielder (instead of a bare `yieldToEventLoop()`)
+   * so the scheduled→resumed delay is measured: a slow resume means the loop
+   * ran someone ELSE's work for that long, and the meter records it as a
+   * `yield-preempt@<phase>` observation. Also re-stamps the slice clock at the
+   * RESUME, so queue time is never charged to the loop's own next slice.
+   */
+  async yieldNow(label?: string): Promise<void> {
+    const scheduledAtMs = Date.now();
+    await yieldToEventLoop();
+    this.meter?.onYieldResumed(scheduledAtMs, label);
+    this.lastYieldAt = Date.now();
+  }
+  /** Close out the final slice at loop end (no-op when constructed nameless). */
+  finish(label?: string): void {
+    this.meter?.endSlice(label);
   }
 }
 
@@ -965,6 +996,14 @@ class EvalYielder {
 const TICK_PACER_BUDGET_MS = 500;
 class TickPacer {
   private lastYieldAt = Date.now();
+  // TRA-3660 — same sync-slice attribution as EvalYielder, at tick-body
+  // granularity: a slow pacer slice names the doTick REGION (the label passed
+  // at the boundary) rather than the coarse parent, and a slow yield-resume
+  // records `yield-preempt@signal.doTick.pacer` (foreign work, not this tick).
+  private readonly meter: SyncSliceMeter | null;
+  constructor(phase?: string) {
+    this.meter = phase != null ? new SyncSliceMeter(phase) : null;
+  }
   /**
    * SYNCHRONOUS decision: true (resetting the clock) once more than
    * TICK_PACER_BUDGET_MS have elapsed since the last macrotask yield. Kept sync
@@ -972,12 +1011,20 @@ class TickPacer {
    * real `yieldToEventLoop()` ONLY when a yield is actually due, so a tick whose
    * awaits already hit real I/O (macrotask boundaries) adds zero extra hops.
    */
-  shouldYield(): boolean {
+  shouldYield(label?: string): boolean {
     if (Date.now() - this.lastYieldAt >= TICK_PACER_BUDGET_MS) {
+      this.meter?.endSlice(label);
       this.lastYieldAt = Date.now();
       return true;
     }
     return false;
+  }
+  /** TRA-3660 — see {@link EvalYielder.yieldNow}: measures the resume delay. */
+  async yieldNow(label?: string): Promise<void> {
+    const scheduledAtMs = Date.now();
+    await yieldToEventLoop();
+    this.meter?.onYieldResumed(scheduledAtMs, label);
+    this.lastYieldAt = Date.now();
   }
 }
 
@@ -5273,13 +5320,13 @@ export class SignalEngine {
     // so the other two buckets are readable against a known baseline.
     const swingMode = this.equitySwingModeEnabled();
     const evaluable: Array<{ sym: string; candles: Candle[] }> = [];
-    const evalYielder = new EvalYielder();
+    const evalYielder = new EvalYielder('signal.doTick.equity-entry-sweep');
     for (let symIdx = 0; symIdx < activeSymbols.length; symIdx++) {
       const sym = activeSymbols[symIdx]!;
       // TRA-1082 / TRA-1905 — yield mid-sweep so the whole universe never runs as one
       // synchronous burst that starves Render's 5s health check. Time-bounded (see
       // EvalYielder): control returns once the contiguous stretch crosses the budget.
-      if (evalYielder.shouldYield(symIdx)) await yieldToEventLoop();
+      if (evalYielder.shouldYield(symIdx, sym)) await evalYielder.yieldNow(sym);
       // TRA-1835 — is this one of the curated swing names? Only IN-UNIVERSE tickers are
       // NAMED in the funnel (the ~134 off-universe skips are counted but not listed — that
       // benign cut is not what QuantTrader is hunting). When swing mode is off there is no
@@ -5307,6 +5354,9 @@ export class SignalEngine {
       recordEquitySymbolEvaluated(this.mode, this.feedContextKey);
       evaluable.push({ sym, candles });
     }
+    // TRA-3660 — close out the final sync slice so a block in the tail of the
+    // sweep (after the last yield) is still named with its symbol range.
+    evalYielder.finish();
     // TRA-1834 — the sweep finished iterating. Finalize the pass so a LATER tick's gate,
     // which nulls this lingering slot, is not miscounted as a mid-sweep truncation.
     endEquityEntryPass(this.mode, this.feedContextKey);
@@ -6107,7 +6157,7 @@ export class SignalEngine {
     // whenever the contiguous synchronous stretch since the last real yield
     // crosses the budget, so the SUM of many sub-1s cache-served phases can never
     // hold the event loop past the 4s watchdog budget. See {@link TickPacer}.
-    const tickPacer = new TickPacer();
+    const tickPacer = new TickPacer('signal.doTick.pacer');
     if (Date.now() - this.lastNewsRefresh > NEWS_REFRESH_MS) {
       // TRA-2203 — named sink: whole-universe news fan-out on the 5-min cadence.
       const news = await withPhase('signal.doTick.news-refresh', () =>
@@ -6232,7 +6282,7 @@ export class SignalEngine {
       const earlyState = timeSyncPhase('signal.doTick.getstate-broadcast', () => this.getState());
       for (const h of this.handlers) h(earlyState);
     }
-    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
+    if (tickPacer.shouldYield('early-state-broadcast')) await tickPacer.yieldNow('early-state-broadcast'); // TRA-1942 tick pacer + TRA-3660 slice meter
 
     // TRA-220 — split trading paths by account mode:
     //   • Demo mode: BOTH stocks AND options trade. Stock paper trading runs
@@ -6253,7 +6303,7 @@ export class SignalEngine {
     // understates PREFIX, which makes narrowing the interlock look cheaper than
     // it is — the expensive direction on a money-book interlock.
     this.tickExitWork.measure(() => this.runEquityExitPass(prices));
-    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
+    if (tickPacer.shouldYield('equity-exit-pass')) await tickPacer.yieldNow('equity-exit-pass'); // TRA-1942 tick pacer + TRA-3660 slice meter
 
     // TRA-220 fix: options exits run in BOTH demo and live so the demo paper
     // options account also unwinds at SL/TP. TRA-159 — refresh option marks
@@ -6354,7 +6404,7 @@ export class SignalEngine {
     // pass is safe to run alongside, and that is where the 853s lives.
     this.stampExitPass('tick');
     this.releaseTickExitRegion();
-    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
+    if (tickPacer.shouldYield('exit-region-release')) await tickPacer.yieldNow('exit-region-release'); // TRA-1942 tick pacer + TRA-3660 slice meter
 
     // TRA-154: tag symbols that have an open position or a recent signal as
     // "active interest". The Twelve Data candle fallback (800/day cap) is gated
@@ -6509,7 +6559,7 @@ export class SignalEngine {
       // awaiting `routeEquitySignal` on each fire. Deliberately NOT nested inside
       // the sweep label — the two are siblings, so the global Σsub/Σ doTick ratio
       // stays free of double-counting.
-      const evalYielder = new EvalYielder();
+      const evalYielder = new EvalYielder('signal.doTick.equity-eval-loop');
       await withPhase('signal.doTick.equity-eval-loop', async () => {
       for (let symIdx = 0; symIdx < evaluable.length; symIdx++) {
         const { sym, candles } = evaluable[symIdx]!;
@@ -6518,7 +6568,7 @@ export class SignalEngine {
         // only awaits when a signal fires (routeEquitySignal below); in a flat market
         // it is otherwise pure sync. `activePhase = signal.doTick` at the 9420ms trip
         // named THIS loop as the block — so the yield is now time-bounded, not counted.
-        if (evalYielder.shouldYield(symIdx)) await yieldToEventLoop();
+        if (evalYielder.shouldYield(symIdx, sym)) await evalYielder.yieldNow(sym);
 
         // TRA-952 — swing cadence: disable the intraday churners (ORB
         // opening-range breakout and the 1h-bar BbFade) whose tight intraday
@@ -6553,6 +6603,8 @@ export class SignalEngine {
           await this.routeEquitySignal(signal, prices.get(signal.symbol), 'deterministic');
         }
       }
+      // TRA-3660 — close out the final sync slice (tail of the eval loop).
+      evalYielder.finish();
       }); // TRA-2203 — end signal.doTick.equity-eval-loop
       // TRA-954 — conviction-DCA scale-in pass. Hard no-op unless
       // CONVICTION_DCA.enabled (ships false; live promotion gated on the
@@ -6571,7 +6623,7 @@ export class SignalEngine {
       // and holds the per-symbol notional cap + the fixed-stop R invariant.
       await withPhase('signal.doTick.conviction-dca-adds', () => this.evaluateLiveConvictionDcaAdds(prices));
     }
-    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
+    if (tickPacer.shouldYield('equity-entries-dca')) await tickPacer.yieldNow('equity-entries-dca'); // TRA-1942 tick pacer + TRA-3660 slice meter
 
     // TRA-787 — SupertrendConfluence SHADOW pass. Evaluates every watchlist
     // symbol off the live tape and surfaces the result on the dedicated
@@ -6701,7 +6753,7 @@ export class SignalEngine {
       this.supertrendSeriesSweep = null;
       _noteSharedShadowRotation(Date.now(), false);
     }
-    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
+    if (tickPacer.shouldYield('shadow-rotation')) await tickPacer.yieldNow('shadow-rotation'); // TRA-1942 tick pacer + TRA-3660 slice meter
 
     // TRA-191: relative-value scanner — the sole stock-options strategy in
     // this iteration. Routes the highest-scoring `cheap` candidate per symbol
@@ -7083,7 +7135,7 @@ export class SignalEngine {
       }
     }
 
-    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
+    if (tickPacer.shouldYield('pre-tick-complete')) await tickPacer.yieldNow('pre-tick-complete'); // TRA-1942 tick pacer + TRA-3660 slice meter
     // TRA-1350 — mark the tick complete before pushing state so getState()
     // (and the WS `state` frame) carry a fresh scan timestamp on this cycle.
     this.lastScanAt = Date.now();
@@ -14015,13 +14067,13 @@ export class SignalEngine {
    */
   private async evaluateSupertrendShadow(symbols: string[]): Promise<void> {
     const emitted: TradeSignal[] = [];
-    const evalYielder = new EvalYielder();
+    const evalYielder = new EvalYielder('signal.supertrendShadowEval');
     for (let symIdx = 0; symIdx < symbols.length; symIdx++) {
       const sym = symbols[symIdx];
       // TRA-1082 / TRA-1905 — yield mid-sweep so the per-symbol supertrend()/
       // confluenceSide() indicator math over the full watchlist never runs as one
       // synchronous burst; time-bounded so a heavy batch can't blow the 5s budget.
-      if (evalYielder.shouldYield(symIdx)) await yieldToEventLoop();
+      if (evalYielder.shouldYield(symIdx, sym)) await evalYielder.yieldNow(sym);
       const fiveMin = this.shadowCandleCache.get(sym);
       if (!fiveMin || fiveMin.length === 0) continue;
       // Uses the TRA-728 shipped defaults end-to-end: confluenceSide for the
@@ -14260,10 +14312,10 @@ export class SignalEngine {
    * loop past the 4s watchdog ceiling once the open set is large.
    */
   private async labelOpenShadowSignals(): Promise<void> {
-    const yielder = new EvalYielder();
+    const yielder = new EvalYielder('signal.supertrendShadowLabel');
     const open = openShadowSignalsSync();
     for (let idx = 0; idx < open.length; idx++) {
-      if (yielder.shouldYield(idx)) await yieldToEventLoop();
+      if (yielder.shouldYield(idx, open[idx]?.symbol)) await yielder.yieldNow(open[idx]?.symbol);
       const rec = open[idx]!;
       const bars = this.shadowCandleCache.get(rec.symbol);
       if (!bars || bars.length === 0) continue;
@@ -14288,14 +14340,14 @@ export class SignalEngine {
    */
   private async evaluateReversalShadow(symbols: string[]): Promise<void> {
     if (!isReversalShadowEnabled()) return;
-    const evalYielder = new EvalYielder();
+    const evalYielder = new EvalYielder('signal.reversalShadowEval');
     for (let symIdx = 0; symIdx < symbols.length; symIdx++) {
       const sym = symbols[symIdx];
       // TRA-1082 / TRA-1905 — yield mid-sweep so the per-symbol reversalChecklist()
       // pass over the full watchlist doesn't starve the event loop. ENABLE_REVERSAL_
       // SHADOW is ON in prod (TRA-1064), so this loop runs the full universe; the
       // yield is time-bounded so a heavy batch can't blow the 5s health-check budget.
-      if (evalYielder.shouldYield(symIdx)) await yieldToEventLoop();
+      if (evalYielder.shouldYield(symIdx, sym)) await evalYielder.yieldNow(sym);
       const fiveMin = this.shadowCandleCache.get(sym);
       if (!fiveMin || fiveMin.length === 0) continue;
       const lastBar = fiveMin[fiveMin.length - 1];
@@ -14385,10 +14437,10 @@ export class SignalEngine {
    * still resolves in one synchronous pass (no added microtask hops — TRA-936).
    */
   private async labelOpenReversalShadowSignals(): Promise<void> {
-    const yielder = new EvalYielder();
+    const yielder = new EvalYielder('signal.reversalShadowLabel');
     const open = openReversalShadowSignalsSync();
     for (let idx = 0; idx < open.length; idx++) {
-      if (yielder.shouldYield(idx)) await yieldToEventLoop();
+      if (yielder.shouldYield(idx, open[idx]?.symbol)) await yielder.yieldNow(open[idx]?.symbol);
       const rec = open[idx]!;
       const bars = this.shadowCandleCache.get(rec.symbol);
       if (!bars || bars.length === 0) continue;
@@ -15644,7 +15696,7 @@ export class SignalEngine {
     const asOf = Date.now();
     const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
 
-    const evalYielder = new EvalYielder();
+    const evalYielder = new EvalYielder('signal.optionShadowEval');
     for (let symIdx = 0; symIdx < symbols.length; symIdx++) {
       // TRA-1894 / TRA-1905 — yield to the event loop (macrotask, via setImmediate)
       // mid-sweep so the watchdog's setInterval and Render's health-check I/O can
@@ -15652,7 +15704,7 @@ export class SignalEngine {
       // queue (cache-resolved Promise), which does NOT unblock setInterval /
       // setImmediate callers — leaving the full 519-symbol burst as one macrotask-
       // level block. Now time-bounded so a heavy batch can't cross the 5s budget.
-      if (evalYielder.shouldYield(symIdx)) await yieldToEventLoop();
+      if (evalYielder.shouldYield(symIdx, symbols[symIdx]!)) await evalYielder.yieldNow(symbols[symIdx]!);
       const sym = symbols[symIdx]!;
       try {
         // Underlying technicals come from the SAME TRA-734 5m shadow series the

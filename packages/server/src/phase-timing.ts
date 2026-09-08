@@ -193,6 +193,79 @@ export async function withPhase<T>(name: string, fn: () => Promise<T>): Promise<
   }
 }
 
+/**
+ * TRA-3660 — sync-SLICE attribution for a cooperative per-symbol loop.
+ *
+ * Trips #7/#8/#9/#11 (2026-09-03..09-08) were all single clean 6-9s blocks with
+ * `slowSyncPhase: null` while a 22s ASYNC envelope (`equity-entry-sweep`,
+ * `news-refresh`, `quote-batch`) was in flight. The envelopes are paced by
+ * yielders that BOUND a contiguous stretch by yielding once control returns —
+ * but the yielders never MEASURE the stretch, so a single un-preemptible slice
+ * (one symbol's work, one huge parse) blocks 8s and no instrument names it. And
+ * a block by FOREIGN work that runs during the loop's own yield is charged, via
+ * the straddle read, to the innocent yielded envelope.
+ *
+ * This meter closes both gaps from inside the loop (the only place a sync block
+ * is visible — the watchdog's timer cannot fire during one):
+ *
+ * - `endSlice(label)` — called when the loop's yielder decides a yield is due
+ *   (and once at loop end). Measures the loop's OWN synchronous slice since the
+ *   last boundary; a slow one is recorded as a `sync` phase named
+ *   `<phase>#slice[<from>..<to>]`, so the trip breadcrumb carries the symbol
+ *   range that blocked instead of the async envelope.
+ * - `onYieldResumed(scheduledAtMs, label)` — called when the loop's yield
+ *   resolves. The scheduled→resumed delay is time the event loop spent running
+ *   OTHER tasks; a slow delay is recorded as `yield-preempt@<phase>`, which
+ *   reads as "the loop was starved by uninstrumented work OUTSIDE <phase>,
+ *   observed from <phase>'s yield" — the opposite verdict from a slice, and the
+ *   one that stops a straddle read from convicting the yielded envelope. The
+ *   name is an OBSERVATION, not a culprit: <phase> is the witness, never the
+ *   blocker.
+ *
+ * Slice names are bounded by the ring (512) and only recorded past the slow
+ * threshold, so per-symbol labels cannot explode cardinality anywhere that
+ * aggregates by name.
+ */
+export class SyncSliceMeter {
+  private sliceStartMs = Date.now();
+  private sliceStartLabel: string | undefined;
+  constructor(
+    private readonly phase: string,
+    private readonly env: NodeJS.ProcessEnv = process.env,
+  ) {}
+
+  /** End the current sync slice (yield due / loop end); records it if slow. */
+  endSlice(label?: string): void {
+    const nowMs = Date.now();
+    const durationMs = nowMs - this.sliceStartMs;
+    if (durationMs >= resolveSlowMs(this.env)) {
+      const from = this.sliceStartLabel ?? '<start>';
+      recordPhaseDuration(
+        `${this.phase}#slice[${from}..${label ?? '?'}]`,
+        durationMs, nowMs, this.env, 'sync',
+      );
+    }
+    this.sliceStartMs = nowMs;
+    this.sliceStartLabel = label;
+  }
+
+  /**
+   * Stamp the resume of a yield. Records a slow scheduled→resumed delay as
+   * `yield-preempt@<phase>` (foreign work starved the loop during the yield),
+   * and starts the next slice AT THE RESUME so the yield's queue time is never
+   * counted against the loop's own next slice.
+   */
+  onYieldResumed(scheduledAtMs: number, label?: string): void {
+    const nowMs = Date.now();
+    const delayMs = nowMs - scheduledAtMs;
+    if (delayMs >= resolveSlowMs(this.env)) {
+      recordPhaseDuration(`yield-preempt@${this.phase}`, delayMs, nowMs, this.env, 'sync');
+    }
+    this.sliceStartMs = nowMs;
+    this.sliceStartLabel = label;
+  }
+}
+
 /** Snapshot surfaced by the watchdog + `/api/health/watchdog`. */
 export interface PhaseAttribution {
   /**
