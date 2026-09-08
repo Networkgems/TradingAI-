@@ -20,8 +20,15 @@ set -uo pipefail
 cd "${PAPERCLIP_WORKSPACE_CWD:?PAPERCLIP_WORKSPACE_CWD unset}" || exit 3
 
 ISSUE_ID=12726290-bd16-4b4c-8f76-3b4e3306f46b   # TRA-4357
-COMMIT=97b7c2dd619d35392704be5a160a5ef985d942d0
 BODY_FILE=.tra4357-ac3.md
+
+# The FLOOR: the AC3 commit. Anything at or above this carries AC1-AC4.
+# Pinning the deploy to it exactly would be self-defeating -- committing this
+# script already moved the tip past it, and every later fix would need a re-pin.
+# So resolve the tip at run time and assert the floor is an ancestor of it, which
+# is the property that actually matters. A tip that does NOT contain the floor
+# means someone rewrote history; refuse rather than deploy something unexpected.
+FLOOR=97b7c2dd619d35392704be5a160a5ef985d942d0
 MARKER='AC3 GRADED, and it does not reproduce as filed'
 
 BASE="${PAPERCLIP_API_URL%/}"; BASE="${BASE%/api}"
@@ -67,6 +74,14 @@ if [ "$drift" = "0" ]; then
 elif [ "$drift" = "3" ]; then
   echo "[land] BLIND -- refusing to deploy against an unmeasured host. Investigate first."
 else
+  git fetch origin main --quiet
+  COMMIT=$(git rev-parse origin/main)
+  if ! git merge-base --is-ancestor "$FLOOR" "$COMMIT"; then
+    echo "[land] REFUSING: origin/main ($COMMIT) does not contain the AC3 floor $FLOOR."
+    echo "[land] History was rewritten. Do not deploy blind -- re-derive by hand."
+    exit 3
+  fi
+  echo "[land] deploying origin/main tip $COMMIT (contains floor $FLOOR)"
   if [ -z "${RENDER_API_KEY:-}" ]; then
     echo "[land] RENDER_API_KEY unset -- cannot deploy from this wake."
   else
