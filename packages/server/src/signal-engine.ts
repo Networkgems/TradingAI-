@@ -14282,8 +14282,29 @@ export class SignalEngine {
         // Live chain (rides the scanner's warm 60s cache). Picks the nearest-
         // the-money liquid contract of the wanted type: a two-sided quote and a
         // positive mid, preferring real open interest so the fill is realistic.
-        const snap = await this.rvScanner.getSelectorChain(sym, dtePrefs);
-        if (!snap || !(snap.spot > 0) || snap.rows.length === 0) { scanRun.reject('no_chain'); continue; }
+        // TRA-4357 — resolve WITH the reason. `getSelectorChain` returns a bare
+        // null for six distinct failures and this call site stamped all six
+        // `no_chain`, while the OTM path (which calls the same resolver through
+        // `scanOtm`) reports them as `scan:<reason>`. One failure, two names.
+        //
+        // ⚠ RELABEL, NOT A FIX. Counts that used to land under `no_chain` on the
+        // `directional` path now land under `scan:no_spot` / `scan:breaker_open`
+        // / etc. `no_chain` keeps its literal meaning — the resolver succeeded
+        // and returned an EMPTY chain — so it is still truthful, just much
+        // rarer. Any predicate keyed on directional `no_chain` counts is voided
+        // by this commit and must be re-cut on the `scan:*` keys; grade the
+        // VALUE (does spot resolve) rather than the label.
+        const detail = this.rvScanner.getSelectorChainDetailed
+          ? await this.rvScanner.getSelectorChainDetailed(sym, dtePrefs)
+          : { snapshot: await this.rvScanner.getSelectorChain(sym, dtePrefs), reason: 'ok' as const };
+        const snap = detail.snapshot;
+        if (!snap || !(snap.spot > 0) || snap.rows.length === 0) {
+          // A non-`ok` reason names the precondition that failed upstream of the
+          // chain. `ok` here means the resolver DID return rows and they were
+          // unusable/empty — the only case that is genuinely `no_chain`.
+          scanRun.reject(detail.reason === 'ok' ? 'no_chain' : `scan:${detail.reason}`);
+          continue;
+        }
         // TRA-2193 — a usable chain came back, so the market-data leg is healthy
         // as of now. This is what lets `dataSource.lastFetchOkAt` separate a dead
         // feed from a quiet tape.

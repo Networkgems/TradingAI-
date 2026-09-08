@@ -12,7 +12,18 @@ import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'relative-value-scanner' });
 
-const CHAIN_CACHE_TTL_MS = 60_000;
+/**
+ * How long a fetched chain snapshot is served from cache.
+ *
+ * TRA-4357 — EXPORTED because it is the coherent bound for the underlying SPOT
+ * this scanner pairs the chain with, and `index.ts` now wires `fetchSpot` to it
+ * by name. Every strike/delta decision in this module reads a spot and a chain
+ * TOGETHER; holding the spot to a tighter freshness bound than the chain it is
+ * compared against buys no accuracy (the chain is already up to this old) and
+ * costs an upstream quote call per symbol per sweep. See the note at the
+ * `fetchSpot` wiring for the quota failure that made this explicit.
+ */
+export const CHAIN_CACHE_TTL_MS = 60_000;
 const EXPIRATIONS_CACHE_TTL_MS = 6 * 60 * 60_000;
 
 // TRA-943 (TRA-908 Phase A) — bound the retained working set of these caches.
@@ -150,7 +161,7 @@ export type OtmScanReason =
  * TRA-161 — the snapshot resolution outcome. Exactly one of `snapshot` (with
  * `reason: 'ok'`) or a non-ok `reason` is meaningful.
  */
-interface SelectorChainResolution {
+export interface SelectorChainResolution {
   snapshot: SelectorChainSnapshot | null;
   reason: OtmScanReason;
   errorMessage?: string;
@@ -206,6 +217,26 @@ export interface RelativeValueScannerService {
    * expiration / chain are unavailable. Never trades.
    */
   getSelectorChain(symbol: string, dtePrefs?: DtePrefs): Promise<SelectorChainSnapshot | null>;
+  /**
+   * TRA-4357 — {@link getSelectorChain}, with the failure reason PRESERVED.
+   *
+   * `getSelectorChain` collapses `no_spot`, `no_expirations`, `no_chain`,
+   * `breaker_open`, `fetch_error` and `no_credentials` into one bare `null`.
+   * `scanOtm` already keeps the discriminated reason off the same resolver, so
+   * the OTM and directional paths were reporting the SAME underlying failure
+   * under two different names: the OTM ledger said `scan:no_spot` while the
+   * directional ledger said `no_chain`. TRA-4357 was filed on exactly that
+   * artifact — it read as "one path prices these names, the other cannot",
+   * when in fact neither did.
+   *
+   * OPTIONAL on the interface, same contract as {@link getOptionLastTrade}: a
+   * scanner without it still works through `getSelectorChain`, it just cannot
+   * name which precondition failed.
+   */
+  getSelectorChainDetailed?(
+    symbol: string,
+    dtePrefs?: DtePrefs,
+  ): Promise<SelectorChainResolution>;
   /**
    * Scan a symbol for RV opportunities. `dtePrefs` lets callers override the
    * scanner's hardcoded DTE window per-call (TRA-373) — used by the signal
@@ -487,6 +518,18 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     // behaviour are unchanged (null on any failure); the discriminated reason
     // is only consumed by `scanOtm` / the desktop panel.
     return (await this.resolveSelectorChain(symbol, dtePrefs)).snapshot;
+  }
+
+  /**
+   * TRA-4357 — the reason-preserving twin of {@link getSelectorChain}. Same
+   * resolver, same cache, same breaker, same upstream cost; it simply does not
+   * throw the reason away. See the interface declaration for why that mattered.
+   */
+  async getSelectorChainDetailed(
+    symbol: string,
+    dtePrefs: DtePrefs = {},
+  ): Promise<SelectorChainResolution> {
+    return this.resolveSelectorChain(symbol, dtePrefs);
   }
 
   /**

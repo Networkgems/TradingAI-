@@ -907,7 +907,7 @@ import {
   parseExportMarkets,
   parseExportModes,
 } from './export-request.js';
-import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
+import { TradierRelativeValueScannerService, CHAIN_CACHE_TTL_MS } from './relative-value-scanner.js';
 import { applyTheoFloor, OTM_PANEL_THEO_FLOOR } from './otm-theo-floor.js';
 import { applyDeltaFloor, OTM_PANEL_DELTA_FLOOR } from './otm-delta-floor.js';
 import { findVerticalArbitrage, toArbitrageDiagnostic } from './otm-theo-arbitrage.js';
@@ -1243,11 +1243,34 @@ const relativeValueScannerService = new TradierRelativeValueScannerService({
   fetchSpot: async (symbol) => {
     // TRA-552 — the RV scanner only needs an underlying spot for options
     // mispricing math, which tolerates a few seconds of staleness. Reuse a
-    // recent watchlist/engine quote (up to 15s old) from the shared quote cache
-    // instead of firing a fresh per-symbol Tradier call — Tradier is now the
-    // sole stock-quote source and these per-symbol spot fetches were a large
-    // slice of the daily request counter.
-    const quotes = await fetchQuotes([symbol], { maxStaleMs: 15_000 });
+    // recent watchlist/engine quote from the shared quote cache instead of
+    // firing a fresh per-symbol Tradier call — Tradier is now the sole
+    // stock-quote source and these per-symbol spot fetches were a large slice
+    // of the daily request counter.
+    //
+    // TRA-4357 — the bound was a hardcoded 15s, and that is what starved the
+    // whole OTM sleeve. Three facts compound:
+    //
+    //   1. 15s is TIGHTER than `QUOTE_CACHE_TTL_MS` itself (20s default), so
+    //      the one caller documented as staleness-TOLERANT was the strictest
+    //      in the process. Almost every call missed the cache by construction.
+    //   2. A miss is not free: `fetchQuotes` re-fires the upstream batch. This
+    //      call site runs once PER SYMBOL PER SWEEP, and ~64 demo/fixture
+    //      engines (TRA-2355) share this process, each walking a ~343-name
+    //      universe — order 10^4 forced quote round-trips per scan round.
+    //   3. That is enough to trip the Tradier quota breaker; measured on bqb1
+    //      2026-09-08T13:31Z, `/api/health/quotes` read `tradier.open: true,
+    //      reason: "quota"` with the Yahoo secondary simultaneously 429'd. With
+    //      both sources dark `fetchQuotes` returns nothing, so this returns
+    //      null and EVERY name rejects on `scan:no_spot` — 13,383 of 13,873 on
+    //      the fixture cell that morning.
+    //
+    // Bound it to the scanner's own chain-snapshot TTL instead. The scanner
+    // compares this spot against a chain that is ALREADY up to
+    // `CHAIN_CACHE_TTL_MS` old, so a tighter spot bound buys no accuracy it
+    // can actually use — it only converts cache hits into quota spend. Named
+    // rather than repeated so the two cannot drift apart again.
+    const quotes = await fetchQuotes([symbol], { maxStaleMs: CHAIN_CACHE_TTL_MS });
     const q = quotes.get(symbol);
     return q && q.price > 0 ? q.price : null;
   },
