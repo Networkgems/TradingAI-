@@ -17,7 +17,15 @@
 # the agent (CLAUDE.md, "Do not fix this by giving the trains an unattended executor").
 set -uo pipefail
 
-cd "${PAPERCLIP_WORKSPACE_CWD:?PAPERCLIP_WORKSPACE_CWD unset}" || exit 3
+# ⛔ NOT $PAPERCLIP_WORKSPACE_CWD. That variable points at
+# projects/<companyId>/<projectId>/_default, which on this seat is an EMPTY directory --
+# the checkout lives under workspaces/<agentId>/ instead. The 2026-09-08T18:5xZ draft of
+# this script cd'd there, so BOTH halves would have failed silently: no .tra4357-ac3.md
+# to post and no package.json to run the drift check from. Derive the repo root from the
+# script's OWN location, which is true in every checkout regardless of seat layout.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || exit 3
+cd "$REPO_ROOT" || exit 3
+[ -f package.json ] || { echo "[land] $REPO_ROOT is not the repo root"; exit 3; }
 
 ISSUE_ID=12726290-bd16-4b4c-8f76-3b4e3306f46b   # TRA-4357
 BODY_FILE=.tra4357-ac3.md
@@ -36,30 +44,44 @@ BASE="${PAPERCLIP_API_URL%/}"; BASE="${BASE%/api}"
 echo "== TRA-4357 land =="
 
 # ---- 1. comment ------------------------------------------------------------
+# ⛔ NO curl. The Bash tool on this seat ships git-bash WITHOUT curl, so the original
+# `existing=$(curl ...)` did not merely fail -- it failed OPEN: an empty $existing makes
+# the marker grep miss, and the guard then re-posts a DUPLICATE of a 6 KB comment. node
+# is guaranteed present here (the deploy half already depends on it), so both the read
+# and the write go through node's own fetch. A read that ERRORS is treated as "unknown",
+# which SKIPS the post -- an unposted comment is recoverable, a double-post is not.
 if [ ! -f "$BODY_FILE" ]; then
   echo "[land] MISSING $BODY_FILE -- comment half cannot run"
 else
-  existing=$(curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-    "$BASE/api/issues/$ISSUE_ID/comments?limit=50" || echo '')
-  if printf '%s' "$existing" | grep -qF "$MARKER"; then
-    echo "[land] comment ALREADY POSTED -- skipping (idempotent)"
-  else
-    node -e '
-      const fs = require("fs");
-      fs.writeFileSync(
-        process.argv[2],
-        JSON.stringify({ body: fs.readFileSync(process.argv[1], "utf8") }),
-      );
-    ' "$BODY_FILE" .tra4357-payload.json
-    code=$(curl -s -o .tra4357-resp.json -w '%{http_code}' -X POST \
-      -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-      -H "Content-Type: application/json" \
-      --data-binary @.tra4357-payload.json \
-      "$BASE/api/issues/$ISSUE_ID/comments")
-    echo "[land] comment POST -> HTTP $code"
-    [ "$code" = "403" ] && echo "[land] still walled: this wake is not issue-bound either. Re-run next wake."
-    rm -f .tra4357-payload.json
-  fi
+  node -e '
+    const fs = require("fs");
+    const [base, issueId, bodyFile, marker] = process.argv.slice(1);
+    const key = process.env.PAPERCLIP_API_KEY;
+    const auth = { Authorization: "Bearer " + key };
+    (async () => {
+      let existing;
+      try {
+        const r = await fetch(`${base}/api/issues/${issueId}/comments?limit=50`, { headers: auth });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        existing = JSON.stringify(await r.json());
+      } catch (e) {
+        console.log("[land] comment READ FAILED (" + e.message + ") -- SKIPPING the post rather than risking a duplicate.");
+        return;
+      }
+      if (existing.includes(marker)) {
+        console.log("[land] comment ALREADY POSTED -- skipping (idempotent)");
+        return;
+      }
+      const r = await fetch(`${base}/api/issues/${issueId}/comments`, {
+        method: "POST",
+        headers: { ...auth, "Content-Type": "application/json",
+                   "X-Paperclip-Run-Id": process.env.PAPERCLIP_RUN_ID ?? "" },
+        body: JSON.stringify({ body: fs.readFileSync(bodyFile, "utf8") }),
+      });
+      console.log("[land] comment POST -> HTTP " + r.status);
+      if (r.status === 403) console.log("[land] still walled: this wake is not issue-bound either. Re-run next wake.");
+    })();
+  ' "$BASE" "$ISSUE_ID" "$BODY_FILE" "$MARKER"
 fi
 
 # ---- 2. deploy -------------------------------------------------------------
