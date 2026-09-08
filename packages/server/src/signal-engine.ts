@@ -253,6 +253,17 @@ import {
   recordEntryDeltaCeilingObserved,
   recordSpreadCeilingDecision,
 } from './cost-aware-gate-ledger.js';
+// TRA-4378 — the board-approved bounded exploration allowance for the demo
+// directional sleeve. Consulted ONLY on the demo branch of costAwareGateReject
+// (that containment is the demo-only / live-unreachable property) and committed
+// only at the directional open site behind a taken grant.
+import {
+  EXPLORATION_CAPS,
+  EXPLORATION_GATE_STRUCTURE,
+  explorationBypassGrant,
+  takeExplorationGrant,
+  commitExplorationOpen,
+} from './directional-exploration-allowance.js';
 // TRA-2295 — the entry-path spread ceiling reads its thresholds from the SAME table
 // the cost model quotes, so the two cannot drift apart again.
 import {
@@ -7447,6 +7458,30 @@ export class SignalEngine {
         );
         return verdict.admit ? null : verdict.reason;
       }
+      // TRA-4378 — the board-approved bounded exploration allowance. When the
+      // flat bar REJECTS a demo `directional` candidate and the allowance is
+      // armed and inside every cap (25 rows / −$600 / 2 concurrent / 2 per
+      // session / 40-session box / $150 per open), ADMIT it instead so the
+      // sleeve can buy the desk evidence its own gate starves it of (the
+      // TRA-4053 deadlock). The admit is recorded as an ordinary `directional`
+      // admit — that row is what pre-registered control 1 reads. The grant is a
+      // pure cap check plus a one-shot token; the row of budget is spent only
+      // when the directional open site COMMITS the open the token authorized.
+      // Demo-only by construction: this branch is `mode === 'demo'`, and the
+      // live branch below never consults the allowance.
+      if (!tape.admit && structure === EXPLORATION_GATE_STRUCTURE) {
+        const grant = explorationBypassGrant(env, etDateString(new Date()), inputs.mark * 100);
+        if (grant.granted) {
+          recordCostAwareGateDecision(
+            structure,
+            true,
+            tapeEdgeR(tape),
+            tape.barR,
+            etDateString(new Date()),
+          );
+          return null;
+        }
+      }
       // TRA-1602 arm (board interaction `427b57ee`) — a working admission gate's
       // evidence is the trades that DIDN'T happen, so record every armed verdict for
       // `/api/health/cost-aware-gate`. Observe-only, best-effort on IO — never breaks
@@ -14517,6 +14552,13 @@ export class SignalEngine {
           // TRA-3272 — the candidate's own quote, for the net-edge bar form
           // (inert on this structure until OPTION_NET_EDGE_STRUCTURES adds it).
         }, { bid: best.row.bid, ask: best.row.ask });
+        // TRA-4378 — consume the exploration grant UNCONDITIONALLY on the line
+        // after the gate call, so a one-shot token can never leak onto a later
+        // candidate (the gate sets it only when it just admitted THIS candidate
+        // under the allowance). Non-null ⇒ this open is an exploration open:
+        // its sizing is clamped to the $150 per-open at-risk cap below and the
+        // committed open spends one of the 25 budgeted rows.
+        const explorationGrant = takeExplorationGrant();
         if (dirCostReject) {
           log.info('demo directional rejected by cost-aware fire bar (TRA-1602)', {
             symbol: sym, reason: dirCostReject,
@@ -14640,8 +14682,24 @@ export class SignalEngine {
           directionalJournalSetup,
           // TRA-1001 — tighten-only autopilot throttle on the directional sleeve.
           this.activeRiskSizingMultiplier('options_single_leg'),
+          // TRA-4378 — exploration opens are clamped to the board's $150
+          // per-open at-risk cap (contracts × premium × 100); non-exploration
+          // opens pass undefined and size exactly as before.
+          explorationGrant ? EXPLORATION_CAPS.perOpenAtRiskCapUsd : undefined,
         );
         if (!opened) continue;
+        // TRA-4378 — the granted open actually happened: spend one exploration
+        // row. `opened.id` is the journal row id, which is how the close
+        // notification later settles this row's realized P&L (never a
+        // sleeve-stamp re-derivation — TRA-3926).
+        if (explorationGrant) {
+          commitExplorationOpen({
+            id: opened.id,
+            occ: opened.optionSymbol ?? null,
+            atRiskUsd: opened.contracts * opened.premiumPaid * 100,
+            etDay: explorationGrant.etDay,
+          });
+        }
         // TRA-1662 — shadow the maker chase this demo open did NOT route.
         this.beginShadowMakerChase('directional', signal, opened);
 

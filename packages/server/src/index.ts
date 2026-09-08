@@ -144,8 +144,15 @@ import {
   // TRA-3946 — the durable average-down shadow / MAE fold.
   summarizeOptionJournalAverageDown,
   getOptionTradeJournalIntegrity,
+  // TRA-4378 — the exploration allowance settles its per-row realized P&L off
+  // the journal's own close notification (id join, never a sleeve re-stamp).
+  onOptionTradeClose,
   type OptionTradeJournalRecord,
 } from './option-trade-journal.js';
+import {
+  hydrateExplorationAllowanceFromDisk,
+  handleExplorationJournalClose,
+} from './directional-exploration-allowance.js';
 import { resolveAverageDownConfig, AVERAGE_DOWN_SHADOW_REASONS } from './option-average-down-shadow.js';
 // TRA-2819 — the money-side sibling of the repair below. That one decides
 // whether a stale OPEN row is a trade at all; this one takes rows that are
@@ -5034,6 +5041,28 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
       days: h.days,
     });
   }
+}
+
+// TRA-4378 — rebuild the bounded exploration-allowance state (arm day, rows
+// used, realized P&L, terminal disarms) and remember DATA_DIR for appends. The
+// caps are enforced off THIS state, so it must survive the nightly reboot; an
+// unreadable file fails every grant closed rather than presuming caps unbound.
+// The close listener settles each committed exploration row's realized P&L by
+// journal row id — the etDay stamped is the CLOSE's ET day.
+{
+  const h = hydrateExplorationAllowanceFromDisk(DATA_DIR);
+  if (h.events > 0 || h.unreadable) {
+    log.info('exploration allowance hydrated (TRA-4378)', {
+      events: h.events,
+      rowsUsed: h.rowsUsed,
+      armedEtDay: h.armedEtDay,
+      disarmedReason: h.disarmedReason,
+      unreadable: h.unreadable,
+    });
+  }
+  onOptionTradeClose((id, close) => {
+    handleExplorationJournalClose(id, { realizedPnlUsd: close.realizedPnlUsd }, etDateString(new Date()));
+  });
 }
 
 // TRA-1892 (parent TRA-1592 → TRA-1435) — rebuild the DURABLE give-back arm-floor

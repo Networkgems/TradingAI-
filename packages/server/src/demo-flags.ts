@@ -224,6 +224,16 @@ export const DEMO_FLAG_ALLOWLIST = [
   'OPTION_COST_GATE_SAFETY_MARGIN_R',
   'OPTION_COST_GATE_COMMISSION_R',
   'OPTION_COST_GATE_SPREAD_CROSS_R',
+  // TRA-4378 (parent TRA-4053, CEO ruling `fe0369d7`) — the bounded exploration
+  // allowance that bypasses the cost bar for demo `directional` candidates
+  // under board-approved hard caps (25 opens / $150 at-risk each / −$600
+  // realized / 2 concurrent / 2 per session / 40-session auto-expiring box).
+  // Default OFF; consulted ONLY inside `costAwareGateReject`'s demo branch, so
+  // a file flip can never alter a live open. The CAPS have no env knobs on
+  // purpose — they are board numbers, changeable only by a new ruling and a
+  // code change. Allowlisted so QuantTrader can arm/disarm the exploration
+  // daemon-free, same as the gate flag above.
+  'ENABLE_DIRECTIONAL_EXPLORATION_ALLOWANCE',
   // TRA-3391 — `OPTION_COST_GATE_WIN_PROB_DELTA_MULT`, `_DEFAULT_REWARD_R` and
   // `_WIN_PROB_CAP` were removed from this allowlist with the estimator they
   // parameterised. QuantTrader's TRA-3388 ruling rejected the CONSTRUCTION, not a

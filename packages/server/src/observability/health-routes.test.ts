@@ -1947,6 +1947,58 @@ describe('TRA-1602 cost-aware fire-bar health route', () => {
       delete process.env.ENABLE_OPTION_COST_AWARE_GATE;
     }
   });
+
+  // TRA-4378 — control 2 of the exploration pre-registration: the allowance's
+  // own state block must be ON THE WIRE even when it has never been armed,
+  // because an absent block is UNREAD and reads identically to a failed arm.
+  it('publishes the explorationAllowance block (TRA-4378), default-off with real zero counters', () => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const res = fakeRes();
+    routes.get('/api/health/cost-aware-gate')![0]!({}, res);
+    const body = res.body as {
+      explorationAllowance: {
+        armed: boolean;
+        flag: string;
+        structure: string;
+        gateLedgerKey: string;
+        rowsUsed: number | null;
+        rowCap: number;
+        pnlUsd: number | null;
+        pnlCapUsd: number;
+        perOpenAtRiskCapUsd: number;
+        maxConcurrent: number;
+        maxPerSession: number;
+        sessionBox: number;
+        disarmedReason: string | null;
+        demoOnly: boolean;
+        liveCapitalReachable: boolean;
+      };
+    };
+    const ea = body.explorationAllowance;
+    expect(ea).toBeDefined();
+    expect(ea.armed).toBe(false); // default-off: no env flag set in the test process
+    expect(ea.flag).toBe('ENABLE_DIRECTIONAL_EXPLORATION_ALLOWANCE');
+    expect(ea.disarmedReason).toBe('flag_off');
+    expect(ea.structure).toBe('single_leg_directional');
+    expect(ea.gateLedgerKey).toBe('directional'); // the row control 1 reads (barR != null twin)
+    expect(ea.rowsUsed).toBe(0);
+    expect(ea.pnlUsd).toBe(0);
+    // The board caps, verbatim — enforced in code, published on the wire.
+    expect(ea.rowCap).toBe(25);
+    expect(ea.pnlCapUsd).toBe(-600);
+    expect(ea.perOpenAtRiskCapUsd).toBe(150);
+    expect(ea.maxConcurrent).toBe(2);
+    expect(ea.maxPerSession).toBe(2);
+    expect(ea.sessionBox).toBe(40);
+    expect(ea.demoOnly).toBe(true);
+    expect(ea.liveCapitalReachable).toBe(false);
+  });
 });
 
 // TRA-2311 (parent TRA-2295) — the spread ceiling's ARM BIT.

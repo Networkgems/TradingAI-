@@ -8784,6 +8784,17 @@ export class PaperOptionsAccount {
      * composed scalar can only ever shrink the contract count.
      */
     sizeMultiplier = 1,
+    /**
+     * TRA-4378 — hard dollar cap on this entry's premium notional
+     * (contracts × premiumPaid × 100, the same figure journaled as
+     * `atRiskUsd`). Applied AFTER sizing and the multiplier: contracts are
+     * clamped down until the notional fits, and an entry whose single
+     * contract already exceeds the cap is refused. Tightening-only and
+     * absent everywhere except the exploration-allowance open (which passes
+     * the board's $150 per-open cap), so every pre-existing caller is
+     * byte-for-byte unchanged.
+     */
+    maxAtRiskUsd?: number,
   ): OptionPosition | null {
     this.resetDayIfNeeded();
     this.lastEntryRejection = null;
@@ -8819,16 +8830,26 @@ export class PaperOptionsAccount {
     // TRA-1001 — the same scalar now also carries the risk-autopilot throttle
     // (the caller composes cap × throttle), so the reason names both sources
     // rather than blaming the cap for a de-risk the autopilot ordered.
-    const contracts = sizeMultiplier < 1
+    const throttledContracts = sizeMultiplier < 1
       ? Math.floor(sizedContracts * sizeMultiplier)
       : sizedContracts;
-    if (sizedContracts > 0 && contracts <= 0)
+    if (sizedContracts > 0 && throttledContracts <= 0)
       return this.rejectEntry(
         `position-size multiplier ${sizeMultiplier.toFixed(2)} (correlated-exposure cap Rule 5 × risk-autopilot throttle) trimmed the size below one contract — token add skipped`,
       );
-    if (contracts <= 0)
+    if (throttledContracts <= 0)
       return this.rejectEntry(
         `contract premium $${(costPerContract).toFixed(2)} exceeds the per-trade options budget — too large for this account`,
+      );
+    // TRA-4378 — hard per-open at-risk cap (exploration-allowance opens only).
+    // Clamp the count so premium notional ≤ the cap; refuse when one contract
+    // can't fit. Tightening-only: absent ⇒ byte-for-byte the prior sizing.
+    const contracts = maxAtRiskUsd !== undefined
+      ? Math.min(throttledContracts, Math.floor(maxAtRiskUsd / costPerContract))
+      : throttledContracts;
+    if (contracts <= 0)
+      return this.rejectEntry(
+        `per-open at-risk cap $${maxAtRiskUsd!.toFixed(2)} cannot cover one contract at $${costPerContract.toFixed(2)} (TRA-4378 exploration cap)`,
       );
 
     const totalCost = contracts * costPerContract;

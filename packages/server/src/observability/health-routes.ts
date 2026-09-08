@@ -134,6 +134,10 @@ import { summarizeRvScanCensus } from '../rv-scan-census-ledger.js'; // TRA-4350
 import { summarizeEntryGreeksGate } from '../entry-greeks-ledger.js';
 import { RV_LONG_DELTA_FLOOR } from '@trading-app/engine';
 import { summarizeCostAwareGate } from '../cost-aware-gate-ledger.js';
+// TRA-4378 — the bounded exploration allowance's own state (pre-registered
+// control 2). Published on the same route as the gate it exempts so "armed and
+// quiet" and "never armed" can never render identically.
+import { summarizeExplorationAllowance } from '../directional-exploration-allowance.js';
 import { summarizeLiveEnforceGate } from '../live-enforce-gate-ledger.js'; // TRA-2048
 import { gradeCanaryCeilingHealth } from '../canary-ceiling.js'; // TRA-3836
 // TRA-3979 — fleet concentration. ADVISORY: no order site consults it.
@@ -5330,6 +5334,12 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
             : `DISARMED — ${OPTION_SPREAD_CEILING_ENFORCE_FLAG} is explicitly set to '${env[OPTION_SPREAD_CEILING_ENFORCE_FLAG] ?? ''}' (0|false|no|off). The TRA-2295 entry ceiling is NOT in force: no open is being rejected for spread, and spreadCeilingEvaluated stays 0 no matter how many entries fire. Any TRA-2295 verification computed in this state is MEANINGLESS — do not grade it, re-arm first by REMOVING the flag (absent ⇒ armed).`,
         };
       })(),
+      // TRA-4378 — the bounded exploration allowance for `directional`
+      // (board-approved carve-out, TRA-4053). Resolved off the SAME demo-flag
+      // env the gate itself consults, so the arm bit here is the arm bit the
+      // trade pass reads. Counters are `null` (never 0) when the durable state
+      // is unreadable — absent ⇒ UNREAD.
+      explorationAllowance: summarizeExplorationAllowance(env, etDay),
       ...summarizeCostAwareGate(etDay),
     });
   });

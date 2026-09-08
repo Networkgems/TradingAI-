@@ -112,3 +112,47 @@ describe('no-day-trading discretionary-close guard (same-session round trip)', (
     expect(acct.checkDayTradingClose('nope', TRADING_TIME).allowed).toBe(true);
   });
 });
+
+// TRA-4378 — the per-open at-risk clamp on `openOptionFromRvCandidate`.
+// The exploration allowance's $150 cap is enforced HERE, at sizing, not by
+// convention: contracts are clamped until premium notional fits, and an entry
+// whose single contract cannot fit is refused outright. Absent ⇒ byte-for-byte
+// the prior sizing (the tightening-only contract).
+describe('TRA-4378 per-open at-risk cap (maxAtRiskUsd)', () => {
+  const open = (maxAtRiskUsd?: number, mark = 1.0) => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    return {
+      acct,
+      pos: acct.openOptionFromRvCandidate(
+        buildRvSignal({ mark }),
+        'demo',
+        undefined,
+        undefined,
+        undefined,
+        1,
+        maxAtRiskUsd,
+      ),
+    };
+  };
+
+  it('clamps contracts so premium notional never exceeds the cap', () => {
+    const { pos } = open(150);
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts * pos!.premiumPaid * 100).toBeLessThanOrEqual(150);
+    expect(pos!.contracts).toBeGreaterThan(0);
+  });
+
+  it('refuses the entry when one contract already exceeds the cap', () => {
+    // mark 2.00 ⇒ one contract ≈ $200+ notional > a $150 cap.
+    const { acct, pos } = open(150, 2.0);
+    expect(pos).toBeNull();
+    expect(acct.getState().dailyOptionsCount).toBe(0); // nothing consumed
+  });
+
+  it('a non-binding cap is byte-for-byte the uncapped sizing (tightening-only)', () => {
+    const uncapped = open(undefined);
+    const generous = open(1_000_000);
+    expect(generous.pos).not.toBeNull();
+    expect(generous.pos!.contracts).toBe(uncapped.pos!.contracts);
+  });
+});
