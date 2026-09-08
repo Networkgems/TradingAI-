@@ -7265,7 +7265,18 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         + 'watchdog kills this process mid-otm-scan routinely); `opensPlaced` is flushed '
         + 'on sight precisely so a session that TRADED can never read back as a drought. '
         + 'Books are attributed by class because ~63 QA fixture books share this process '
-        + 'with the desk (TRA-2355) — a non-zero `fixture` cell says nothing about `desk`.',
+        + 'with the desk (TRA-2355) — a non-zero `fixture` cell says nothing about `desk`. '
+        + 'TRA-4357: `blindScans` counts the passes that rejected their ENTIRE non-empty '
+        + 'universe on a SINGLE gate, and `universeSum` retains what the sweeps were '
+        + 'HANDED (divide by `scans` for the mean). Read `blindScans` as a RATIO against '
+        + '`scans` — it is the blind-vs-declining discriminator, and it is the only field '
+        + 'here that survives the daily summing that pools those two: a day of blind '
+        + 'cycles and a day of mixed strategy declines can carry the SAME dominant gate in '
+        + '`rejectionsByGate`. `blindScans === scans` is the TRA-4357 condition itself. '
+        + '⚠️ `blindScans`/`universeSum` are 0 on lines written before 2026-09-08, which '
+        + 'means NOT MEASURED rather than "none" — check `etDay` before reading a zero as '
+        + 'evidence. The counter is gate-AGNOSTIC on purpose: hard-coding `scan:no_spot` '
+        + 'would make it blind to the next gate that saturates.',
       censusRetentionDays: 30,
     });
   });

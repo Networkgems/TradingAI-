@@ -31,6 +31,7 @@ import {
 } from './relative-value-scanner.js';
 import { partitionCachedQuotes } from './yahoo-feed.js';
 import { beginRvScan, UNATTRIBUTED_GATE } from './rv-scan-telemetry.js';
+import { isBlindScan } from './rv-scan-census-ledger.js';
 import type { OptionChainRow, TradierOptionsClient } from '@trading-app/engine';
 
 const NOW_BASE = Date.parse('2024-01-15T15:00:00Z');
@@ -186,6 +187,61 @@ describe('TRA-4357 AC2 wiring — the scanner spot fetch is bound to the named c
     const call = /fetchQuotes\(\[symbol\],\s*\{\s*maxStaleMs:\s*([A-Za-z0-9_]+)\s*\}\)/.exec(src);
     expect(call, 'the scanner fetchSpot -> fetchQuotes call site moved').not.toBeNull();
     expect(call![1]).toBe('CHAIN_CACHE_TTL_MS');
+  });
+});
+
+describe('TRA-4357 AC4 — the census can tell a BLIND cycle from a strategy decline', () => {
+  const pass = (evaluated: number, passed: number, gates: Record<string, number>) => ({
+    candidatesEvaluated: evaluated, candidatesPassed: passed, rejectionsByGate: gates,
+  });
+
+  it('counts a pass that lost its whole universe to ONE gate', () => {
+    expect(isBlindScan(pass(531, 0, { 'scan:no_spot': 531 }))).toBe(true);
+  });
+
+  it('does NOT count a mixed ledger, however dominant the top gate', () => {
+    // The 2026-09-04 343-name cycle: 54% one gate, but the strategy DID rule.
+    expect(isBlindScan(pass(343, 0, {
+      no_candidates: 76, 'scan:no_spot': 186, 'scan:no_expirations': 30,
+      contract_floor_delta: 23, recent_duplicate: 19, 'scan:no_chain': 7,
+      no_in_band_strike: 1, entry_window_closed: 1,
+    }))).toBe(false);
+  });
+
+  it('is gate-agnostic — a saturating gate that is not `scan:no_spot` still counts', () => {
+    // The whole point: this must catch the NEXT gate that saturates.
+    expect(isBlindScan(pass(200, 0, { entry_window_closed: 200 }))).toBe(true);
+  });
+
+  it('does not count an EMPTY pass — that is `ran_unfed`, a different reading', () => {
+    expect(isBlindScan(pass(0, 0, {}))).toBe(false);
+  });
+
+  it('does not count a pass where anything cleared', () => {
+    expect(isBlindScan(pass(100, 1, { 'scan:no_spot': 99 }))).toBe(false);
+  });
+
+  it('separates two days that carry the SAME dominant gate — the AC4 requirement', () => {
+    // Both days sum to `scan:no_spot` on top. Only `blindScans` tells them apart.
+    const blindDay = [pass(100, 0, { 'scan:no_spot': 100 }), pass(100, 0, { 'scan:no_spot': 100 })];
+    const decliningDay = [
+      pass(100, 0, { 'scan:no_spot': 60, no_candidates: 25, contract_floor_delta: 15 }),
+      pass(100, 0, { 'scan:no_spot': 60, no_candidates: 25, contract_floor_delta: 15 }),
+    ];
+
+    const topGate = (day: typeof blindDay) => {
+      const summed: Record<string, number> = {};
+      for (const p of day) for (const [g, n] of Object.entries(p.rejectionsByGate)) {
+        summed[g] = (summed[g] ?? 0) + n;
+      }
+      return Object.entries(summed).sort((a, b) => b[1] - a[1])[0]![0];
+    };
+
+    // Indistinguishable on the pre-TRA-4357 payload...
+    expect(topGate(blindDay)).toBe(topGate(decliningDay));
+    // ...and separated by the new counter.
+    expect(blindDay.filter(isBlindScan).length).toBe(2);
+    expect(decliningDay.filter(isBlindScan).length).toBe(0);
   });
 });
 
