@@ -46,6 +46,23 @@ interface AlertEventBase {
    * to one delivery inside the dedup window.
    */
   dedupKey?: string;
+  /**
+   * TRA-4388 — per-event override of the dispatcher's dedup window (default
+   * 60s). The default TTL assumes the emitter re-fires on a TICK cadence, so a
+   * minute is enough to collapse a burst. It is NOT enough for an emitter whose
+   * repeats are minutes-to-hours apart, and it is not enough to collapse the
+   * SAME condition observed independently by several engines: bqb1 runs 67
+   * engine instances, each with its own `DailyRiskGovernor`, and a firm-wide
+   * market-data outage transitions each of them separately. Those transitions
+   * are not synchronised to within 60s, so the same user was mailed once per
+   * engine per episode.
+   *
+   * An emitter that knows the horizon over which its condition is ONE event
+   * states it here. Ignored unless it exceeds the dispatcher default — an
+   * emitter may widen its own collapse window, never narrow it below the
+   * baseline burst protection.
+   */
+  dedupTtlMs?: number;
 }
 
 export interface FillAlertEvent extends AlertEventBase {
@@ -673,7 +690,11 @@ export class NotificationDispatcher {
     const key = this.dedupKey(event);
     const existing = this.dedup.get(key);
     if (existing != null && existing > ts) return true;
-    this.dedup.set(key, ts + this.dedupTtlMs);
+    // TRA-4388 — an emitter may WIDEN its own collapse window, never narrow it.
+    // `max` (not `??`) so a stale/short caller value cannot weaken the baseline
+    // burst protection every other event class relies on.
+    const ttl = Math.max(this.dedupTtlMs, event.dedupTtlMs ?? 0);
+    this.dedup.set(key, ts + ttl);
     return false;
   }
 

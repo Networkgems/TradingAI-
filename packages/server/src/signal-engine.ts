@@ -2109,6 +2109,57 @@ export type HaltKind =
   | 'session_stop'
   | 'feed_stale';
 
+/**
+ * TRA-4388 — how long the feed must be CONTINUOUSLY stale before the first mail.
+ * The gate itself trips at `MAX_CANDLE_AGE_MS` = 720s over a refresh cadence
+ * TRA-1539 sized at ~450s, leaving ~270s of margin, and `runColdBarScan` is
+ * budget-bounded and resumes on the next tick — so ordinary sweep truncation
+ * walks the universe across 720s and back without anything being wrong. Stacked
+ * on the 720s gate this puts the first mail at ≈22 min with no fresh bar
+ * anywhere, which is an outage rather than jitter.
+ */
+const FEED_STALE_ALERT_DEBOUNCE_MS = 10 * 60_000;
+/**
+ * TRA-4388 — how long the feed must be CONTINUOUSLY fresh before the next
+ * outage counts as a NEW episode. A flapping feed is one event, not one event
+ * per edge; without this the debounce alone still mails on every round trip
+ * that happens to exceed it, which is the reported hourly repeat.
+ */
+const FEED_STALE_EPISODE_CLEAR_MS = 20 * 60_000;
+/**
+ * TRA-4388 — hard backstop on feed-stale mail per ET day. The debounce and the
+ * episode window are both clock-derived; this one is not, so a pathological
+ * flap (or a clock that misbehaves) still cannot fill an inbox. Two is chosen
+ * so a genuine second outage later in the session is still reported.
+ */
+const FEED_STALE_ALERTS_PER_DAY = 2;
+/**
+ * TRA-4388 — the collapse window handed to the dispatcher for a feed-stale
+ * mail. One market-data outage is observed independently by every engine on the
+ * box (bqb1: `engineCount: 67`), each with its own governor transitioning on
+ * its own tick, minutes apart. The dispatcher's 60s default cannot collapse
+ * those; this can, and it is deliberately equal to the episode window so the
+ * dispatcher and the governor agree on how long "one episode" lasts.
+ */
+const FEED_STALE_ALERT_DEDUP_TTL_MS = FEED_STALE_EPISODE_CLEAR_MS;
+
+/**
+ * TRA-4388 — dispatcher routing hints carried alongside a risk_halt reason.
+ *
+ * The halt listener used to take a bare reason string, which left the
+ * dispatcher deriving its dedup key from the reason TEXT. For the feed-stale
+ * halt that text embeds `Math.round(age/1000)` seconds, so the key moved on
+ * every single fire and the 60s dedup window was structurally unreachable for
+ * this event class. An emitter that knows what makes two of its alerts "the
+ * same event" states it here instead of hoping the prose happens to match.
+ */
+export interface RiskHaltAlertOptions {
+  /** Stable identity of the underlying EPISODE — must carry no measurement. */
+  dedupKey?: string;
+  /** How long two emits are the same episode. Widens the dispatcher default only. */
+  dedupTtlMs?: number;
+}
+
 export class DailyRiskGovernor {
   private consecutiveLosses = 0;
   private dailyPnl = 0;
@@ -2184,7 +2235,29 @@ export class DailyRiskGovernor {
    * and only the automatic breakers fire it — the manual kill switch does not,
    * so a restart that re-engages a persisted kill switch never re-alerts.
    */
-  private haltListener: ((reason: string) => void) | null = null;
+  private haltListener: ((reason: string, opts?: RiskHaltAlertOptions) => void) | null = null;
+
+  /**
+   * TRA-4388 — ms epoch the CURRENT continuous stale run began, or null while
+   * the feed is fresh. This is the debounce clock: a stale→fresh→stale flap
+   * restarts it, so only genuinely uninterrupted staleness ages toward a mail.
+   */
+  private feedStaleSince: number | null = null;
+  /**
+   * TRA-4388 — ms epoch the CURRENT continuous FRESH run began, or null while
+   * the feed is stale. Once this exceeds {@link FEED_STALE_EPISODE_CLEAR_MS}
+   * the episode latch below clears and the next outage is a new event.
+   */
+  private feedFreshSince: number | null = null;
+  /**
+   * TRA-4388 — whether the current feed-stale EPISODE has already been
+   * accounted for, either because it mailed or because a day-latched halt owned
+   * the mail instead. Set once per episode, cleared only by a sustained
+   * recovery or the ET day roll — never by a flap.
+   */
+  private feedStaleEpisodeSpent = false;
+  /** TRA-4388 — feed-stale mails sent this ET day; capped at {@link FEED_STALE_ALERTS_PER_DAY}. */
+  private feedStaleAlertsToday = 0;
 
   /**
    * TRA-995 — the risk-autopilot throttle. A tighten-only per-trade risk
@@ -2205,8 +2278,28 @@ export class DailyRiskGovernor {
   }
 
   /** TRA-563 — register the risk_halt alert listener (see {@link haltListener}). */
-  setHaltListener(listener: (reason: string) => void): void {
+  setHaltListener(listener: (reason: string, opts?: RiskHaltAlertOptions) => void): void {
     this.haltListener = listener;
+  }
+
+  /**
+   * TRA-4388 — the feed-stale ALERT state, for health surfacing and tests. This
+   * describes the notifier only; the risk posture is {@link isFeedStale} /
+   * {@link getHaltKind} and is deliberately not derived from anything here.
+   */
+  getFeedStaleAlertState(): {
+    alertsToday: number;
+    staleSince: number | null;
+    freshSince: number | null;
+    episodeSpent: boolean;
+  } {
+    this.resetIfNewDay();
+    return {
+      alertsToday: this.feedStaleAlertsToday,
+      staleSince: this.feedStaleSince,
+      freshSince: this.feedFreshSince,
+      episodeSpent: this.feedStaleEpisodeSpent,
+    };
   }
 
   private resetIfNewDay(): void {
@@ -2221,6 +2314,17 @@ export class DailyRiskGovernor {
       // overnight can't surface on the fresh day before the first autopilot tick.
       this.feedStaleGate = false;
       this.feedStaleReason = null;
+      // TRA-4388 — the feed-stale ALERT state is daily too. The cap is
+      // per-ET-day by definition, and the episode latch must clear with it:
+      // carrying yesterday's spent episode into a fresh session would silence
+      // the first real outage of the new day. `feedStaleSince` resets to null
+      // rather than to `now` on purpose — the first stale tick of the new day
+      // re-seeds it, so the debounce is measured from that tick and an
+      // overnight stale carry can never mail the instant the session opens.
+      this.feedStaleSince = null;
+      this.feedFreshSince = null;
+      this.feedStaleEpisodeSpent = false;
+      this.feedStaleAlertsToday = 0;
       // TRA-1267 — the book give-back peak + session halt are DAILY state: they
       // reset on the same ET day roll that clears `dailyPnl`, so the peak is
       // rebuilt from zero each session and yesterday's give-back halt never
@@ -2602,7 +2706,6 @@ export class DailyRiskGovernor {
     assertTightenOnly(decision);
 
     const wasHalted = this.halted;
-    const wasFeedStale = this.feedStaleGate;
 
     // Throttle: ratchet DOWN only. min() guarantees we never loosen mid-day.
     const proposed = clampThrottle(decision.riskThrottle);
@@ -2636,16 +2739,60 @@ export class DailyRiskGovernor {
       }
     }
 
-    // Fire the risk_halt alert on the false→true transition only (mirrors the
-    // automatic breaker path), so an autopilot halt is surfaced like any other.
-    // A latched halt takes precedence; otherwise a fresh feed-stale transition
-    // alerts once (it won't re-fire while the feed stays stale tick after tick).
+    // TRA-4388 — advance the feed-stale ALERT clocks. This is bookkeeping only:
+    // it runs every tick regardless of whether anything will be mailed, so the
+    // debounce and the episode window measure real elapsed time rather than
+    // "time since we last thought about alerting". `wasFeedStale` is no longer
+    // consulted for the mail — an EDGE is exactly the wrong trigger for a gate
+    // that legitimately flaps (defect 1).
+    const nowMs = this.now().getTime();
+    if (this.feedStaleGate) {
+      this.feedFreshSince = null;
+      // A stale run that is already open keeps its original start, so only
+      // UNINTERRUPTED staleness ages toward a mail.
+      this.feedStaleSince ??= nowMs;
+    } else {
+      this.feedStaleSince = null;
+      this.feedFreshSince ??= nowMs;
+      // A SUSTAINED recovery — not a momentary one — ends the episode, so the
+      // next outage is a genuinely new event and mails again. Anything shorter
+      // is a flap and deliberately does not re-arm.
+      if (nowMs - this.feedFreshSince >= FEED_STALE_EPISODE_CLEAR_MS) {
+        this.feedStaleEpisodeSpent = false;
+      }
+    }
+    // A book already stopped for a day-latched reason owns the notification;
+    // spend the feed episode outright rather than merely suppressing it tick by
+    // tick, so the intent survives a later change to the halt state.
+    if (this.feedStaleGate && (this.halted || this.sessionHalted || this.killSwitchEngaged)) {
+      this.feedStaleEpisodeSpent = true;
+    }
+
+    // Fire the risk_halt alert. A latched halt (loss-streak / daily drawdown)
+    // still alerts on its false→true transition, exactly as before.
     if (this.haltListener) {
       try {
         if (!wasHalted && this.halted) {
           this.haltListener(this.haltReason ?? 'Risk autopilot halted new entries');
-        } else if (!wasFeedStale && this.feedStaleGate) {
-          this.haltListener(this.feedStaleReason ?? 'Market-data feed stale during market hours');
+          // The book is stopped for a day-latched reason that outranks a
+          // transient data gap. Spend the feed episode so it does not add a
+          // second mail carrying no separate action for the reader.
+          if (this.feedStaleGate) this.feedStaleEpisodeSpent = true;
+        } else if (this.shouldAlertFeedStale(nowMs)) {
+          const staleMs = nowMs - (this.feedStaleSince ?? nowMs);
+          const staleMin = Math.round(staleMs / 60_000);
+          this.feedStaleEpisodeSpent = true;
+          this.feedStaleAlertsToday += 1;
+          const base = this.feedStaleReason ?? 'Market-data feed stale during market hours';
+          this.haltListener(`${base} — continuously stale for ${staleMin} min.`, {
+            // Identity of the EPISODE. Deliberately carries no measurement:
+            // the candle age used to leak into the derived key and made it
+            // unique on every fire (defect 2). The ET date + per-day sequence
+            // is stable for the whole episode and identical across every
+            // engine on the box, which is what collapses defect 3.
+            dedupKey: `feed_stale:${this.currentDay}:${this.feedStaleAlertsToday}`,
+            dedupTtlMs: FEED_STALE_ALERT_DEDUP_TTL_MS,
+          });
         }
       } catch {
         // A notification failure must never break the governor accounting.
@@ -2653,6 +2800,29 @@ export class DailyRiskGovernor {
     }
 
     return decision.actions;
+  }
+
+  /**
+   * TRA-4388 — may the feed-stale condition mail RIGHT NOW?
+   *
+   * ⚠️ This governs the EMAIL only. {@link feedStaleGate} — the thing that
+   * actually pauses equity/options entries — is assigned above on the very
+   * first stale tick and is not consulted here in either direction. Silencing a
+   * notification must never be implemented by loosening a live risk gate.
+   */
+  private shouldAlertFeedStale(nowMs: number): boolean {
+    if (!this.feedStaleGate) return false;
+    // Already accounted for by this episode's mail, or by a day-latched halt.
+    if (this.feedStaleEpisodeSpent) return false;
+    if (this.feedStaleAlertsToday >= FEED_STALE_ALERTS_PER_DAY) return false;
+    // A book already stopped for a day-latched reason is not additionally
+    // actionable because the data is also stale. Read the halt STATE, not "did
+    // a breaker fire on this tick": `recordTrade` fires the drawdown alert on
+    // the trade that latched it, so the autopilot tick that follows sees no
+    // edge at all — an edge-shaped test here mails twice.
+    if (this.halted || this.sessionHalted || this.killSwitchEngaged) return false;
+    if (this.feedStaleSince == null) return false;
+    return nowMs - this.feedStaleSince >= FEED_STALE_ALERT_DEBOUNCE_MS;
   }
 
   /**
@@ -3896,7 +4066,8 @@ export class SignalEngine {
     this.mode = settings?.mode === 'live' ? 'live' : 'demo';
     // TRA-563 — bridge the risk-governor circuit-breaker transition to a
     // risk_halt alert. Fire-and-forget; never blocks the governor.
-    this.riskGovernor.setHaltListener((reason) => this.emitRiskHaltAlert(reason));
+    // TRA-4388 — carry the governor's dedup identity through to the dispatcher.
+    this.riskGovernor.setHaltListener((reason, opts) => this.emitRiskHaltAlert(reason, opts));
     // TRA-1023 — same bridge for the options-sleeve breaker so a sleeve halt
     // (cumulative −2R / −5% sleeve drawdown) surfaces a risk_halt alert too.
     this.optionsBreaker.setHaltListener((reason) => this.emitRiskHaltAlert(reason));
@@ -18397,14 +18568,24 @@ export class SignalEngine {
     });
   }
 
-  /** Emit a risk_halt alert — bridged from the governor circuit breaker. */
-  private emitRiskHaltAlert(reason: string): void {
+  /**
+   * Emit a risk_halt alert — bridged from the governor circuit breaker.
+   *
+   * TRA-4388 — `opts` carries the emitter's own dedup identity through to the
+   * dispatcher. Omitted, the dispatcher falls back to deriving a key from the
+   * reason TEXT, which for the feed-stale halt embeds the candle age in seconds
+   * and therefore never repeats. Callers that know what makes two of their
+   * alerts the same episode say so; every other caller is unchanged.
+   */
+  private emitRiskHaltAlert(reason: string, opts?: RiskHaltAlertOptions): void {
     if (!this.alertUsername) return;
     emitAlert({
       kind: 'risk_halt',
       username: this.alertUsername,
       mode: this.alertMode(),
       reason,
+      ...(opts?.dedupKey ? { dedupKey: opts.dedupKey } : {}),
+      ...(opts?.dedupTtlMs ? { dedupTtlMs: opts.dedupTtlMs } : {}),
     });
   }
 
