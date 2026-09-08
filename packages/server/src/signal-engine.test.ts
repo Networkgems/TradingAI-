@@ -6979,10 +6979,12 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
     vi.setSystemTime(TRADING_TIME); // 10:20 ET — inside the options trading window (TRA-3942)
     delete process.env[OPTION_DEMO_DIRECTIONAL_FLAG];
     delete process.env[OPTION_LIVE_DIRECTIONAL_FLAG];
+    delete process.env[OPTION_LIVE_TEST_UNTIL_VAR];
   });
   afterEach(() => {
     delete process.env[OPTION_DEMO_DIRECTIONAL_FLAG];
     delete process.env[OPTION_LIVE_DIRECTIONAL_FLAG];
+    delete process.env[OPTION_LIVE_TEST_UNTIL_VAR];
     vi.useRealTimers();
   });
 
@@ -7260,6 +7262,8 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
 
   it('live + flag ON (armed) — opens a live directional long AND mirrors a real buy_to_open', async () => {
     process.env[OPTION_LIVE_DIRECTIONAL_FLAG] = '1';
+    // TRA-4288 — the arm is flag AND OPTION_LIVE_TEST_UNTIL window; open it.
+    process.env[OPTION_LIVE_TEST_UNTIL_VAR] = FAR_FUTURE_TEST_UNTIL;
     const stub: DirLiveStub = {
       getAccountBalance: vi.fn().mockResolvedValue({ totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000 }),
       // Tight quote around the ATM call mark (~0.9 — see chainRows/TRA-3872) so
@@ -7284,6 +7288,8 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
 
   it('live + flag ON but broker rejects — voids the open and surfaces a live skip-reason (no phantom fill)', async () => {
     process.env[OPTION_LIVE_DIRECTIONAL_FLAG] = '1';
+    // TRA-4288 — the arm is flag AND OPTION_LIVE_TEST_UNTIL window; open it.
+    process.env[OPTION_LIVE_TEST_UNTIL_VAR] = FAR_FUTURE_TEST_UNTIL;
     const stub: DirLiveStub = {
       getAccountBalance: vi.fn().mockResolvedValue({ totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000 }),
       // ~0.9 ATM (TRA-3872) — the order must clear the canary ceiling so the
@@ -7309,6 +7315,31 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
     expect(surfaced).toBeDefined();
     expect(surfaced!.mode).toBe('live');
     expect(surfaced!.liveSkipReason).toMatch(/rejected|insufficient/i);
+  });
+
+  it('live + flag ON but OPTION_LIVE_TEST_UNTIL unset — the arm stays closed at the ORDER SITE (TRA-4288): no open, no broker call', async () => {
+    // The unit controls on isOptionLiveDirectionalArmed prove flag-alone refuses;
+    // this locks the same fact where it spends money. Without it, the arm's
+    // window conjunct is invisible in this suite — which is exactly how the two
+    // armed tests above went red for five days before anyone attributed it
+    // (TRA-4394).
+    process.env[OPTION_LIVE_DIRECTIONAL_FLAG] = '1';
+    // OPTION_LIVE_TEST_UNTIL deliberately absent (beforeEach cleared it).
+    const stub: DirLiveStub = {
+      getAccountBalance: vi.fn().mockResolvedValue({ totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000 }),
+      getOptionQuote: vi.fn().mockResolvedValue({ symbol: 'UPPC100', bid: 0.86, ask: 0.94 }),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 57, status: 'ok' }),
+      cancelOrder: vi.fn(),
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 57, status: 'filled', exec_quantity: 1, avg_fill_price: 0.91 })),
+    };
+    const svc = scannerFor({ UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainRows('UPP', 100, 0.45, 0.9) } });
+    const engine = liveDirEngine(svc, stub);
+    seedTrend(engine, 'UPP', sawUp(480));
+
+    await run(engine, ['UPP']);
+
+    expect(engine.getState().options.openOptions).toHaveLength(0);
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
   });
 
   // ── TRA-2295 (parent TRA-2291) — the spread ceiling, enforced at the ENTRY ────
@@ -8174,7 +8205,12 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
     // `equity` off the static list ⇒ an ADMIT. Same discipline: named row,
     // exact total.
     expect(retained.find((g) => g.gate === 'underlying_asset_class')).toMatchObject({ evaluated: 1, blocked: 0 });
-    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(7);
+    // TRA-4276 — and an EIGHTH: entry admission consults EXIT actionability and
+    // records its verdict on every live candidate (a book that cannot CLOSE a
+    // row does not OPEN one). The fixture book's exit path is healthy ⇒ an
+    // ADMIT. Same discipline: named row, exact total.
+    expect(retained.find((g) => g.gate === 'exit_actionability')).toMatchObject({ evaluated: 1, blocked: 0 });
+    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(8);
   });
 
   // ─── TRA-3942 — the ORDERING claim, graded BEHAVIOURALLY ────────────────────
