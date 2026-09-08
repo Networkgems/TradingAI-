@@ -22,6 +22,7 @@
 
 import {
   HeapCensusTape,
+  type BootRetainerTrend,
   type CensusOptions,
   type CensusSubject,
   type HeapCensusSample,
@@ -84,6 +85,14 @@ export interface HeapCensusStatus {
   tape: HeapCensusSample[];
   /** Retainers ranked by growth across the tape, biggest riser first. */
   trends: RetainerTrend[];
+  /**
+   * Retainers ranked by growth since BOOT, off aggregates the ring cannot
+   * evict. `trends` answers for the tape's window (24 h once wrapped); this
+   * answers for the whole boot, so a read that arrives late — the platform
+   * scheduler has gone dark for days at a stretch — still grades the sessions
+   * the ring has already forgotten.
+   */
+  bootTrends: BootRetainerTrend[];
 }
 
 let tape: HeapCensusTape | null = null;
@@ -203,5 +212,6 @@ export function getHeapCensusStatus(opts: CensusOptions = {}): HeapCensusStatus 
     deep: opts.deep === true,
     tape: samples,
     trends: tape ? tape.trends() : [],
+    bootTrends: tape ? tape.bootTrends() : [],
   };
 }

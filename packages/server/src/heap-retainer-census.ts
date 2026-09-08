@@ -244,6 +244,34 @@ export interface RetainerTrend {
   ratio: number | null;
 }
 
+/**
+ * The growth verdict for one retainer since BOOT, immune to ring eviction.
+ *
+ * Exists because `trends()` is computed off the ring, and the ring holds 24 h:
+ * on 2026-09-08 a monitor wake landed ~89 h late (armed 09-04T19:45Z, delivered
+ * 09-08T12:52Z — the platform scheduler going dark is a measured recurring
+ * event, TRA-4141) and the live boot was 92.6 h old, so every census sample
+ * covering the boot's only RTH session had been evicted. `trends()` answered
+ * for a closed-market Sunday→Monday window while claiming nothing about what
+ * it could no longer see. These aggregates are updated at record() time and
+ * never evicted, so a late reader still gets "what grew since birth" — at the
+ * cost of losing the shape between first and peak, which the ring still
+ * carries whenever the read is on time.
+ */
+export interface BootRetainerTrend {
+  name: string;
+  /** Entries at the first sample that carried this name (sampler runs at boot). */
+  first: number;
+  firstAtMs: number;
+  /** Entries at the most recent sample (0 = released — the shape we WANT). */
+  last: number;
+  peak: number;
+  peakAtMs: number;
+  delta: number;
+  /** `last / first`, or `null` when `first` is 0. Rank on `delta`. */
+  ratio: number | null;
+}
+
 const BYTES_PER_MB = 1024 * 1024;
 
 function toMB(bytes: number): number {
@@ -261,6 +289,13 @@ function toMB(bytes: number): number {
  */
 export class HeapCensusTape {
   private readonly samples: HeapCensusSample[] = [];
+  /** Boot-scoped first/peak per name — never evicted. Bounded by #names (~56). */
+  private readonly bootStats = new Map<
+    string,
+    { first: number; firstAtMs: number; peak: number; peakAtMs: number }
+  >();
+  private lastCounts: Record<string, number> = {};
+  private lastAtMs = 0;
 
   constructor(private readonly capacity = 288) {
     if (!Number.isInteger(capacity) || capacity < 1) {
@@ -288,6 +323,17 @@ export class HeapCensusTape {
     };
     this.samples.push(sample);
     while (this.samples.length > this.capacity) this.samples.shift();
+    for (const [name, entries] of Object.entries(counts)) {
+      const stat = this.bootStats.get(name);
+      if (!stat) {
+        this.bootStats.set(name, { first: entries, firstAtMs: nowMs, peak: entries, peakAtMs: nowMs });
+      } else if (entries > stat.peak) {
+        stat.peak = entries;
+        stat.peakAtMs = nowMs;
+      }
+    }
+    this.lastCounts = counts;
+    this.lastAtMs = nowMs;
     return sample;
   }
 
@@ -330,6 +376,33 @@ export class HeapCensusTape {
         peak,
         delta: last - first,
         ratio: first > 0 ? Math.round((last / first) * 100) / 100 : null,
+      });
+    }
+    return out.sort((a, b) => b.delta - a.delta || a.name.localeCompare(b.name));
+  }
+
+  /**
+   * Rank retainers by growth since BOOT, off the never-evicted aggregates.
+   *
+   * `first`/`peak` come from {@link bootStats}; `last` comes from the most
+   * recent sample, with a name absent there scored `last = 0` (released) for
+   * the same reason `trends()` does. When the ring has not yet wrapped this
+   * agrees with `trends()` by construction; when it has, this is the only one
+   * of the two still telling the truth about the boot.
+   */
+  bootTrends(): BootRetainerTrend[] {
+    const out: BootRetainerTrend[] = [];
+    for (const [name, stat] of this.bootStats) {
+      const last = this.lastCounts[name] ?? 0;
+      out.push({
+        name,
+        first: stat.first,
+        firstAtMs: stat.firstAtMs,
+        last,
+        peak: stat.peak,
+        peakAtMs: stat.peakAtMs,
+        delta: last - stat.first,
+        ratio: stat.first > 0 ? Math.round((last / stat.first) * 100) / 100 : null,
       });
     }
     return out.sort((a, b) => b.delta - a.delta || a.name.localeCompare(b.name));

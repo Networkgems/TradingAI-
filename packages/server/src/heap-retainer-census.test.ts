@@ -239,5 +239,77 @@ describe('HeapCensusTape', () => {
 
   it('returns no trends from an empty tape instead of throwing', () => {
     expect(new HeapCensusTape(4).trends()).toEqual([]);
+    expect(new HeapCensusTape(4).bootTrends()).toEqual([]);
+  });
+
+  it('bootTrends survives ring eviction — the late-reader case trends() structurally cannot serve', () => {
+    // Measured 2026-09-08: a monitor wake landed 89 h late on a 92.6 h boot,
+    // so every sample covering the boot's only RTH session had been evicted
+    // and trends() answered for a closed-market window. The boot aggregates
+    // must keep telling the truth after the ring has forgotten.
+    const e = new EngineLike();
+    const tape = new HeapCensusTape(2);
+
+    // Session: the cache climbs to its peak…
+    e.candleCache.set('AAPL', [1]);
+    tape.record([{ klass: 'signalEngine', target: e }], 1000);
+    for (let i = 0; i < 9; i += 1) e.candleCache.set(`S${i}`, [1]);
+    tape.record([{ klass: 'signalEngine', target: e }], 2000);
+    // …then partially releases overnight, and the ring wraps past the peak.
+    e.candleCache.clear();
+    e.candleCache.set('AAPL', [1]);
+    e.candleCache.set('MSFT', [1]);
+    e.candleCache.set('NVDA', [1]);
+    tape.record([{ klass: 'signalEngine', target: e }], 3000);
+    tape.record([{ klass: 'signalEngine', target: e }], 4000);
+
+    // The ring now starts at the post-release sample: the climb is invisible.
+    const ringRow = tape.trends().find(t => t.name === 'signalEngine.candleCache');
+    expect(ringRow).toMatchObject({ first: 3, last: 3, peak: 3, delta: 0 });
+
+    // The boot aggregates still carry birth and peak, with their timestamps.
+    const bootRow = tape.bootTrends().find(t => t.name === 'signalEngine.candleCache');
+    expect(bootRow).toMatchObject({
+      first: 1,
+      firstAtMs: 1000,
+      peak: 10,
+      peakAtMs: 2000,
+      last: 3,
+      delta: 2,
+      ratio: 3,
+    });
+  });
+
+  it('bootTrends scores a released retainer negative instead of dropping it', () => {
+    // Same discipline as trends(): a name the last sample no longer carries is
+    // last = 0 — the eviction AC2 wants to prove must not read as blindness.
+    const e = new EngineLike();
+    e.candleCache.set('AAPL', [1]);
+    e.candleCache.set('MSFT', [1]);
+    const tape = new HeapCensusTape(10);
+    tape.record([{ klass: 'signalEngine', target: e }], 1000);
+    e.candleCache.clear();
+    tape.record([{ klass: 'signalEngine', target: e }], 2000);
+
+    const row = tape.bootTrends().find(t => t.name === 'signalEngine.candleCache');
+    expect(row).toMatchObject({ first: 2, peak: 2, last: 0, delta: -2, ratio: 0 });
+  });
+
+  it('bootTrends agrees with trends() while the ring has not wrapped', () => {
+    const e = new EngineLike();
+    const tape = new HeapCensusTape(10);
+    for (let step = 0; step < 5; step += 1) {
+      e.candleCache.set(`C${step}`, [1]);
+      tape.record([{ klass: 'signalEngine', target: e }], 1000 + step);
+    }
+    const ring = tape.trends().find(t => t.name === 'signalEngine.candleCache');
+    const boot = tape.bootTrends().find(t => t.name === 'signalEngine.candleCache');
+    expect(boot).toMatchObject({
+      first: ring?.first,
+      last: ring?.last,
+      peak: ring?.peak,
+      delta: ring?.delta,
+      ratio: ring?.ratio,
+    });
   });
 });
