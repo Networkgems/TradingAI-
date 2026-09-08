@@ -111,6 +111,7 @@ import {
   OPTION_SHORT_PREMIUM_SCANNER_FLAG,
   OPTION_WHEEL_ROUTING_FLAG,
   OPTION_LIVE_RV_LONG_FLAG,
+  RV_ENGINE_FLAG, // TRA-4385
   OPTION_LIVE_OTM_FLAG,
   OPTION_LIVE_TEST_UNTIL_VAR,
   OPTION_OTM_DELTA_FLOOR_LIVE_FLAG,
@@ -335,9 +336,12 @@ describe('SignalEngine — relative-value scanner bridge', () => {
   // `RV_ENGINE_ENABLED=false`). TRA-895 re-enabled it for the Jun 15-18 demo, and
   // on the TRA-1158 regression the board chose **defer** (RV stayed `true`).
   // TRA-1207 (board directive, 2026-06-30) SUPERSEDES that: "OTM Mispricing back
-  // on and turn off Relative Value." `RV_ENGINE_ENABLED` is now the compiled
-  // `false` kill switch (signal-engine.ts), so even with every other condition
-  // favorable the RV gate stands down — no new RV option tickets in any mode.
+  // on and turn off Relative Value." That shipped as a compiled `false` kill
+  // switch; TRA-4385 (board ruling TRA-4383, option c-rv-demo) env-resolved it
+  // as `RV_ENGINE_ENABLED` (option-exec-flag.ts), DEFAULT OFF — so with the env
+  // unset the RV gate still stands down even with every other condition
+  // favorable, and arming the env starts the scan (demo evidence accrual; the
+  // live entry stays dark behind `isOptionLiveRvLongArmed`).
   // The OTM engine below is armed in its place (see `shouldRunOtmScan` tests).
   // Existing managed RV exits run elsewhere and are intentionally not gated here.
   const favorable = {
@@ -347,17 +351,24 @@ describe('SignalEngine — relative-value scanner bridge', () => {
     marketOpen: true,
     skipOptionsForLiveEquityOnly: false,
   };
+  const rvEngineArmed = { RV_ENGINE_ENABLED: '1' };
 
-  it('shouldRunRelativeValueScan stays down even when every condition is favorable — RV paused (TRA-1207)', () => {
-    expect(shouldRunRelativeValueScan(favorable)).toBe(false);
+  it('shouldRunRelativeValueScan stays down even when every condition is favorable — RV_ENGINE_ENABLED unset defaults OFF (TRA-1207/TRA-4385)', () => {
+    expect(shouldRunRelativeValueScan(favorable, {})).toBe(false);
   });
 
-  it('shouldRunRelativeValueScan stands down whenever any single gate input is unfavorable', () => {
-    expect(shouldRunRelativeValueScan({ ...favorable, autoTradingEnabled: false })).toBe(false);
-    expect(shouldRunRelativeValueScan({ ...favorable, halted: true })).toBe(false);
-    expect(shouldRunRelativeValueScan({ ...favorable, hasScanner: false })).toBe(false);
-    expect(shouldRunRelativeValueScan({ ...favorable, marketOpen: false })).toBe(false);
-    expect(shouldRunRelativeValueScan({ ...favorable, skipOptionsForLiveEquityOnly: true })).toBe(false);
+  it('TRA-4385 — arming the RV_ENGINE_ENABLED env flag starts the scan when conditions are favorable', () => {
+    expect(shouldRunRelativeValueScan(favorable, rvEngineArmed)).toBe(true);
+  });
+
+  it('shouldRunRelativeValueScan stands down whenever any single gate input is unfavorable — even with the engine flag armed', () => {
+    // Pre-TRA-4385 these asserted with the kill switch down, so every case was
+    // vacuously false. Arm the engine flag so each input is load-bearing.
+    expect(shouldRunRelativeValueScan({ ...favorable, autoTradingEnabled: false }, rvEngineArmed)).toBe(false);
+    expect(shouldRunRelativeValueScan({ ...favorable, halted: true }, rvEngineArmed)).toBe(false);
+    expect(shouldRunRelativeValueScan({ ...favorable, hasScanner: false }, rvEngineArmed)).toBe(false);
+    expect(shouldRunRelativeValueScan({ ...favorable, marketOpen: false }, rvEngineArmed)).toBe(false);
+    expect(shouldRunRelativeValueScan({ ...favorable, skipOptionsForLiveEquityOnly: true }, rvEngineArmed)).toBe(false);
   });
 
   // TRA-1207 — board directive (local-board): "OTM Mispricing back on and turn
@@ -1796,10 +1807,12 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
   // gets its own coverage below ('live RV entry is suppressed while the dark flag
   // is off'), which is what actually protects real capital. (TRA-1677)
   beforeEach(() => {
+    process.env[RV_ENGINE_FLAG] = '1'; // TRA-4385 — the arm now also requires a live producer
     process.env[OPTION_LIVE_RV_LONG_FLAG] = '1';
     process.env[OPTION_LIVE_TEST_UNTIL_VAR] = FAR_FUTURE_TEST_UNTIL; // TRA-1929 window open
   });
   afterEach(() => {
+    delete process.env[RV_ENGINE_FLAG];
     delete process.env[OPTION_LIVE_RV_LONG_FLAG];
     delete process.env[OPTION_LIVE_TEST_UNTIL_VAR];
   });
@@ -2276,10 +2289,12 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
 describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => {
   // TRA-1677 — armed-path mechanics; see the TRA-319 block for why.
   beforeEach(() => {
+    process.env[RV_ENGINE_FLAG] = '1'; // TRA-4385 — the arm now also requires a live producer
     process.env[OPTION_LIVE_RV_LONG_FLAG] = '1';
     process.env[OPTION_LIVE_TEST_UNTIL_VAR] = FAR_FUTURE_TEST_UNTIL; // TRA-1929 window open
   });
   afterEach(() => {
+    delete process.env[RV_ENGINE_FLAG];
     delete process.env[OPTION_LIVE_RV_LONG_FLAG];
     delete process.env[OPTION_LIVE_TEST_UNTIL_VAR];
   });
@@ -5247,10 +5262,12 @@ describe('SignalEngine — TRA-495 live stocks + options coexistence', () => {
   // TRA-1677 — the options leg of this coexistence check is the live RV long, so
   // it needs TRA-1491's dark flag armed; see the TRA-319 block.
   beforeEach(() => {
+    process.env[RV_ENGINE_FLAG] = '1'; // TRA-4385 — the arm now also requires a live producer
     process.env[OPTION_LIVE_RV_LONG_FLAG] = '1';
     process.env[OPTION_LIVE_TEST_UNTIL_VAR] = FAR_FUTURE_TEST_UNTIL; // TRA-1929 window open
   });
   afterEach(() => {
+    delete process.env[RV_ENGINE_FLAG];
     delete process.env[OPTION_LIVE_RV_LONG_FLAG];
     delete process.env[OPTION_LIVE_TEST_UNTIL_VAR];
   });

@@ -135,7 +135,7 @@ import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakout
 import type { LiveOtmAdmissibleBoundBy } from './option-exec-flag.js';
 // TRA-3997 (parent TRA-3703) — freeze the order site's admission reading onto
 // the row it is about to open. See the OTM bounded-test site below.
-import { buildOptionAdmissionStamp } from './option-exec-flag.js';
+import { buildOptionAdmissionStamp, isRvEngineEnabled } from './option-exec-flag.js';
 import type { LiveOtmFleetCapitalRow, LiveOtmFleetSizingReason, UnsettledLivePremiumFill } from './option-exec-flag.js';
 // TRA-3879 — the cross-engine balance READ that makes `Σ B_i ≤ A` structural.
 // A read of a derived scalar, not the shared mutable accumulator TRA-3445
@@ -1817,7 +1817,14 @@ const IV_RV_RESERVED_CAP_SLOTS = 2;
 // and turn off Relative Value." RV is PAUSED again (no new RV entries in any
 // mode); the OTM-mispricing engine below is re-armed in its place. Existing RV
 // positions still get marks via refreshOptionMarks() and exit normally.
-const RV_ENGINE_ENABLED: boolean = false;
+// TRA-4385 (board ruling TRA-4383, option c-rv-demo) — the compile-time
+// `const RV_ENGINE_ENABLED = false` that lived here is now the env-resolved
+// `RV_ENGINE_FLAG` in option-exec-flag.ts (`isRvEngineEnabled`, default OFF), so
+// the host can arm DEMO evidence accrual without a build. The live entry is
+// unaffected by that flip: `runRelativeValueScan` suppresses the entire live
+// entry pre-open unless `isOptionLiveRvLongArmed` reads armed (TRA-1491), and
+// that arm itself now also requires the engine flag (no green over a dead
+// producer).
 
 // TRA-2245 / TRA-2295 / TRA-2345 — `DIRECTIONAL_STRUCTURE_LABEL` used to be declared
 // here, module-local. It now lives in `option-spread-cost.ts` beside
@@ -1827,24 +1834,18 @@ const RV_ENGINE_ENABLED: boolean = false;
 // Declare a second one here and the two drift silently. Read the constant's own
 // docblock for why that divergence has no failing state.
 
-/**
- * TRA-2193 — read the RV kill switch from outside this module.
- *
- * `/api/health/rv-scan` has to say whether the RV entry path is ARMED, and this
- * arm is a compile-time constant rather than an env flag — so unlike every other
- * option sleeve it cannot be read off `process.env` by a health route. Without
- * this accessor the route would have to hardcode a duplicate of the value, which
- * is exactly the kind of second copy that drifts and then lies.
- */
-export function isRvEngineEnabled(): boolean {
-  return RV_ENGINE_ENABLED;
-}
+// TRA-2193 — `isRvEngineEnabled` was born here as the accessor for the
+// compile-time kill switch (so `/api/health/rv-scan` did not hardcode a second
+// copy that drifts and then lies). TRA-4385 moved the definition to
+// option-exec-flag.ts beside the other option env flags; re-exported here so
+// existing readers (health-routes) keep their import path.
+export { isRvEngineEnabled, RV_ENGINE_FLAG } from './option-exec-flag.js';
 
 // TRA-1207 — master on/off switch for the OTM-mispricing options engine (the
 // original TRA-158/TRA-159 strategy: long-only far-OTM contracts trading cheap
 // vs. a Black-Scholes theo off Tradier's smoothed IV). Retired when RV replaced
-// it (TRA-191); re-armed here at the board's request. Mirrors RV_ENGINE_ENABLED
-// as a one-line compiled kill switch so it survives a restart with no reliance
+// it (TRA-191); re-armed here at the board's request. A one-line compiled kill
+// switch (as RV_ENGINE_ENABLED was before TRA-4385) so it survives a restart with no reliance
 // on persisted settings. When false the OTM *opening* side short-circuits;
 // existing OTM positions still mark + exit via the shared exit path.
 const OTM_ENGINE_ENABLED: boolean = true;
@@ -1855,10 +1856,16 @@ const OTM_SCAN_INTERVAL_MS = 5 * 60_000;
 /**
  * TRA-811 — the single gate that decides whether the per-tick loop arms a new
  * relative-value scan/open. Factored out of the tick so the kill switch is
- * unit-testable: `RV_ENGINE_ENABLED` dominates, so while RV is paused this
+ * unit-testable: the engine flag dominates, so while RV is paused this
  * returns `false` even when every other condition (auto-trading on, not halted,
  * scanner wired, market open, options not opted out) is favorable. All other
  * engines (SMA-200, supertrend shadow, agents) are unaffected.
+ *
+ * TRA-4385 — the kill switch is now the env-resolved `RV_ENGINE_ENABLED`
+ * (default OFF; see option-exec-flag.ts). Arming it starts the SCAN; a
+ * live-mode engine's entries remain suppressed pre-open inside
+ * `runRelativeValueScan` unless `isOptionLiveRvLongArmed` separately reads
+ * armed, so the env flip alone accrues DEMO evidence only.
  */
 export function shouldRunRelativeValueScan(opts: {
   autoTradingEnabled: boolean;
@@ -1866,9 +1873,9 @@ export function shouldRunRelativeValueScan(opts: {
   hasScanner: boolean;
   marketOpen: boolean;
   skipOptionsForLiveEquityOnly: boolean;
-}): boolean {
+}, env: NodeJS.ProcessEnv = process.env): boolean {
   return (
-    RV_ENGINE_ENABLED &&
+    isRvEngineEnabled(env) &&
     opts.autoTradingEnabled &&
     !opts.halted &&
     opts.hasScanner &&
@@ -6539,8 +6546,8 @@ export class SignalEngine {
     // no paper opens (and no Tradier orders) fire. Demo mode is unaffected;
     // existing live option positions still get marks via refreshOptionMarks().
     const skipOptionsForLiveEquityOnly = this.mode === 'live' && !this.tradierLiveOptionsEnabled;
-    // TRA-776: RV_ENGINE_ENABLED is the hard kill — the relative-value engine is
-    // retired and must not open new option tickets in any mode.
+    // TRA-776: the RV engine flag is the hard kill; env-resolved since TRA-4385
+    // (default OFF ⇒ retired unless the host arms demo evidence accrual).
     // TRA-895: RV is options-specific and independent of the equity agent layer.
     // Pass isAutoTradingEnabled() (not isDeterministicAutoTradingEnabled()) so
     // the options scanner still fires when the equity Trading-Agents mode is ON.
@@ -8094,7 +8101,8 @@ export class SignalEngine {
    *
    * The 0.10 ceiling this sleeve is documented to honour lives at
    * `relative-value.ts:396`, inside the RV SCANNER's `prepareChain` — and
-   * `RV_ENGINE_ENABLED` has been a compile-time `false` since TRA-1207, while the
+   * `RV_ENGINE_ENABLED` was a compile-time `false` from TRA-1207 until TRA-4385
+   * (env-resolved, still default OFF), while the
    * directional caller reads `getSelectorChain`, which returns RAW chain rows and
    * never touches that filter. So the sleeve inherited a ceiling from dead code:
    * 59 of 83 desk entries crossed it, up to 1.933 (19×), on books quoted
@@ -10785,11 +10793,11 @@ export class SignalEngine {
       ? { minDailyVolume: resolveRvMinDailyVolume() }
       : undefined;
 
-    // TRA-2193 — instrumented even though `RV_ENGINE_ENABLED` has held this path
-    // shut since TRA-1207 (2026-06-30). That is the point: the day the board
-    // re-arms it, the very first tick has to be able to PROVE it fired, instead
-    // of leaving us to infer liveness from journal rows that three other sleeves
-    // also write (TRA-1682).
+    // TRA-2193 — instrumented even though `RV_ENGINE_ENABLED` held this path
+    // shut from TRA-1207 (2026-06-30) until the TRA-4385 env-resolve. That is
+    // the point: the day the board re-arms it, the very first tick has to be
+    // able to PROVE it fired, instead of leaving us to infer liveness from
+    // journal rows that three other sleeves also write (TRA-1682).
     const scanRun = beginRvScan('rv_scan', activeSymbols.length);
 
     for (const sym of activeSymbols) {

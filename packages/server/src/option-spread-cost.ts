@@ -42,8 +42,9 @@
 //     against a 0.20 ceiling, 0/27 over. THAT is what an enforced ceiling reads
 //     like, and it is the positive control for the formula below.
 //   • `single_leg_rv` — the reject at `relative-value.ts:396` sits inside the RV
-//     SCANNER, and `RV_ENGINE_ENABLED = false` has been a compile-time constant
-//     since TRA-1207 (2026-06-30). The code path never executes.
+//     SCANNER, dead behind `RV_ENGINE_ENABLED` (compile-time false TRA-1207 →
+//     TRA-4385; env-resolved since, default OFF — the path executes only on a
+//     host that arms the demo evidence accrual).
 //   • the DIRECTIONAL sleeve (`evaluateDemoDirectional` → `openOptionFromRvCandidate`,
 //     journal label `single_leg_directional` since TRA-2245, `single_leg_rv`
 //     before it) reads `RelativeValueScanner.getSelectorChain`, which returns the
@@ -202,9 +203,14 @@ export const SLEEVE_GATED_ARCHETYPES: Readonly<Record<string, SleeveGatedArchety
   // `otm-mispricing.ts:185` — inside the scanner chain filter, so it runs before
   // anything downstream can pick a contract, for every archetype under the key.
   single_leg_otm: 'all',
-  // `relative-value.ts:396` — inside the RV scanner chain filter, which NEVER RUNS
-  // (`RV_ENGINE_ENABLED` is a compile-time false since TRA-1207/2026-06-30). No live
-  // sleeve is gated by this entry, so NOTHING under this key may be graded as gated.
+  // `relative-value.ts:396` — inside the RV scanner chain filter. Dead from
+  // TRA-1207 until TRA-4385 env-resolved the engine flag (default OFF; arming it
+  // is DEMO evidence accrual only). Kept `'none'` deliberately even so: the
+  // pre-TRA-2245 journal rows wearing this label came from the UNGATED
+  // directional reader, so crediting the key as gated would retroactively grade
+  // those rows as bounded. `'none'` only ever under-credits — the safe
+  // direction. Revisit with a date-aware split when the TRA-4344 demo evidence
+  // is graded.
   single_leg_rv: 'none',
   // TRA-2295, `signal-engine.ts` `spreadCeilingRejectReason` — on the directional
   // ENTRY PATH itself, not in a scanner. Only rows stamped

@@ -18,6 +18,8 @@ import {
   isOptionLiveTestWindowOpen,
   isOptionLiveOtmArmed,
   isOptionLiveRvLongArmed,
+  isRvEngineEnabled, // TRA-4385
+  RV_ENGINE_FLAG, // TRA-4385
   isOptionLiveDirectionalEnabled, // TRA-4288
   isOptionLiveDirectionalArmed, // TRA-4288
   OPTION_LIVE_DIRECTIONAL_FLAG,
@@ -152,10 +154,28 @@ describe('TRA-1929 — live OTM flag + self-expiring bounded-test window', () =>
   });
 
   it('RV arm is ALSO window-gated so the window closing disarms real money on both sleeves', () => {
+    // TRA-4385 — every case below arms the engine flag, because the arm now
+    // additionally requires a live producer; the window conjunct is what is
+    // under test here.
+    const engineOn = { [RV_ENGINE_FLAG]: '1' };
     // RV flag on but window closed ⇒ NOT armed (the missed-manual-disable safety)
-    expect(isOptionLiveRvLongArmed({ [OPTION_LIVE_RV_LONG_FLAG]: '1' }, 1000)).toBe(false);
-    expect(isOptionLiveRvLongArmed({ [OPTION_LIVE_RV_LONG_FLAG]: '1', [OPTION_LIVE_TEST_UNTIL_VAR]: PAST }, 1000)).toBe(false);
-    expect(isOptionLiveRvLongArmed({ [OPTION_LIVE_RV_LONG_FLAG]: '1', [OPTION_LIVE_TEST_UNTIL_VAR]: FUTURE }, 1000)).toBe(true);
+    expect(isOptionLiveRvLongArmed({ ...engineOn, [OPTION_LIVE_RV_LONG_FLAG]: '1' }, 1000)).toBe(false);
+    expect(isOptionLiveRvLongArmed({ ...engineOn, [OPTION_LIVE_RV_LONG_FLAG]: '1', [OPTION_LIVE_TEST_UNTIL_VAR]: PAST }, 1000)).toBe(false);
+    expect(isOptionLiveRvLongArmed({ ...engineOn, [OPTION_LIVE_RV_LONG_FLAG]: '1', [OPTION_LIVE_TEST_UNTIL_VAR]: FUTURE }, 1000)).toBe(true);
+  });
+
+  it('TRA-4385 — the RV arm can NEVER read green over a dead producer: engine flag off ⇒ not armed, even with the live flag on and the window open', () => {
+    // This exact combination read `true` before TRA-4385 — `arm.rvArmed:true`
+    // with zero fills forever, the false-green the guard exists to kill.
+    expect(isOptionLiveRvLongArmed({ [OPTION_LIVE_RV_LONG_FLAG]: '1', [OPTION_LIVE_TEST_UNTIL_VAR]: FUTURE }, 1000)).toBe(false);
+    // Engine resolver itself: default OFF, accepts the standard truthy forms.
+    expect(isRvEngineEnabled({})).toBe(false);
+    expect(isRvEngineEnabled({ [RV_ENGINE_FLAG]: '0' })).toBe(false);
+    expect(isRvEngineEnabled({ [RV_ENGINE_FLAG]: '1' })).toBe(true);
+    expect(isRvEngineEnabled({ [RV_ENGINE_FLAG]: 'true' })).toBe(true);
+    // Engine armed alone does NOT arm live capital — the live flag + window
+    // conjuncts still bind (the demo-only property of the TRA-4385 env flip).
+    expect(isOptionLiveRvLongArmed({ [RV_ENGINE_FLAG]: '1', [OPTION_LIVE_TEST_UNTIL_VAR]: FUTURE }, 1000)).toBe(false);
   });
 
   it('TRA-4288 — the DIRECTIONAL arm is window-gated too: flag alone can NEVER arm it', () => {

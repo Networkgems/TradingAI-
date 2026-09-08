@@ -6130,7 +6130,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
           single_leg_otm:
             'otm-mispricing.ts:185, inside the OTM scanner chain filter. RUNS. Positive control: live desk journal max spreadPct 0.196 vs the 0.20 ceiling, 0/27 over.',
           single_leg_rv:
-            'relative-value.ts:396, inside the RV scanner chain filter — which NEVER RUNS (RV_ENGINE_ENABLED is a compile-time false since TRA-1207/2026-06-30). No live sleeve is gated by this entry.',
+            'relative-value.ts:396, inside the RV scanner chain filter. Runs only when the RV_ENGINE_ENABLED env flag is armed (env-resolved since TRA-4385; compile-time false TRA-1207→TRA-4385) — see /api/health/rv-scan paths[path=rv_scan].enabled for the live answer. Even armed, the flip is demo evidence accrual only: the live entry stays dark behind ENABLE_OPTION_LIVE_RV_LONG, so no live sleeve is gated by this entry.',
           single_leg_directional:
             'signal-engine.ts `spreadCeilingRejectReason`, on the entry path itself, from TRA-2295. Applied to the same quote journaled as entryBid/entryAsk. Before TRA-2295 this sleeve ran NO spread gate: it read raw getSelectorChain rows and 59 of 83 desk entries crossed the 0.10 ceiling, worst 1.933 (19×).',
         },
@@ -7078,8 +7078,9 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         instrumented: true,
         costAwareLedger,
       }),
-      // Instrumented, but held shut by the compile-time TRA-1207 kill switch.
-      // Wired now so that re-arming it is self-evidencing on the first tick.
+      // Instrumented. Held shut by the compile-time TRA-1207 kill switch until
+      // TRA-4385 env-resolved it (RV_ENGINE_ENABLED, default OFF) — wired so
+      // that re-arming it is self-evidencing on the first tick.
       summarizeRvScanPath('rv_scan', {
         enabled: isRvEngineEnabled(),
         instrumented: true,

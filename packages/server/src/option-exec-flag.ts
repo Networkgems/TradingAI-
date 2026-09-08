@@ -1391,6 +1391,24 @@ export function isOptionLiveRvLongEnabled(env: NodeJS.ProcessEnv = process.env):
   return flagOn(env[OPTION_LIVE_RV_LONG_FLAG]);
 }
 
+export const RV_ENGINE_FLAG = 'RV_ENGINE_ENABLED';
+
+/**
+ * TRA-4385 (board ruling TRA-4383, option c-rv-demo) — the relative-value
+ * engine master switch, env-resolved. From TRA-1207 (2026-06-30) until now this
+ * was a module-local compile-time `const RV_ENGINE_ENABLED = false` in
+ * signal-engine.ts that NO env var read, which meant the producer was dead in
+ * every build regardless of host configuration — and `isOptionLiveRvLongArmed`
+ * below could in principle read green over it. Default OFF (accepts
+ * 1/true/yes/on). Setting it arms the RV SCAN only — demo evidence accrual.
+ * The live entry stays dark behind `ENABLE_OPTION_LIVE_RV_LONG` + the test
+ * window exactly as before (signal-engine `runRelativeValueScan` suppresses the
+ * entire live entry pre-open when that arm is off, TRA-1491/TRA-1929).
+ */
+export function isRvEngineEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[RV_ENGINE_FLAG]);
+}
+
 // --------------------------------------------------------------------------
 // TRA-1490 (parent TRA-1479 "Demo to Live", family options-directional) — DARK
 // live-capital gate on the deterministic DIRECTIONAL (near-ATM single-leg long
@@ -3558,12 +3576,18 @@ export function isOptionLiveTestWindowOpen(
  * `ENABLE_OPTION_LIVE_RV_LONG` boolean is on AND the arm window is open. This is
  * the value the order-decision sites must consult (not the raw flag) so the dated
  * auto-disable holds for RV too (TRA-1929).
+ *
+ * TRA-4385 — additionally requires {@link isRvEngineEnabled}: with the RV
+ * producer dead (engine flag off), an armed live flag is a flag over a path
+ * that can never produce an order, and `arm.rvArmed:true` on the health route
+ * would be a green reading over a dead producer. The arm now cannot read green
+ * unless the engine that feeds it is actually running.
  */
 export function isOptionLiveRvLongArmed(
   env: NodeJS.ProcessEnv = process.env,
   now: number = Date.now(),
 ): boolean {
-  return isOptionLiveRvLongEnabled(env) && isOptionLiveTestWindowOpen(env, now);
+  return isRvEngineEnabled(env) && isOptionLiveRvLongEnabled(env) && isOptionLiveTestWindowOpen(env, now);
 }
 
 /**
