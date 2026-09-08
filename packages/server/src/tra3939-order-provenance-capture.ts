@@ -669,8 +669,16 @@ export function captureBrokerOrderDay(input: CaptureBrokerOrderDayInput): Captur
   }
   // TRA-4009 — `(etDay, account)`, never `etDay`. See the docblock: the day-only
   // key made the first account to answer suppress every sibling read.
+  //
+  // ⚠ And only a SEALED (post-16:00 ET) read closes the key. A forced mid-session
+  // capture is a real read of a PREFIX of the day; letting it satisfy idempotence
+  // would refuse the post-close line and lose every order placed after it, on a
+  // broker window that never reopens. The pre-close line is kept — it is evidence,
+  // and superseding it is the reader's job (`foldCaptureGroup` takes the last
+  // successful read) — but it does not end the day. Two sealed reads still collapse
+  // to one, so the hourly scheduler is unchanged.
   const already = readBrokerOrderCaptures().some(
-    l => l.etDay === input.etDay && l.read && accountOf(l) === input.account,
+    l => l.etDay === input.etDay && accountOf(l) === input.account && isSealedCapture(l),
   );
   if (already) {
     return { written: false, skippedAlreadyCaptured: true, appendError: null, line: null };
@@ -729,6 +737,23 @@ export interface BrokerOrderCaptureDayRow {
   capturedAccounts: string[];
   missingAccounts: string[];
   fleetCaptured: boolean;
+  /**
+   * This account's (or, on a fleet row, ANY account's) only successful reads for
+   * the day landed before the 16:00 ET close, so the archive holds a PREFIX of the
+   * day rather than the day. On a per-account row this is that account's own
+   * verdict; on a fleet row see {@link provisionalAccounts}.
+   */
+  provisional: boolean;
+  /** Fleet row only — the captured accounts whose read is a pre-close prefix. */
+  provisionalAccounts: string[];
+  /**
+   * Every known production account captured, and every one of those captures taken
+   * after the close. This — NOT `fleetCaptured` — is the predicate a caller must
+   * use to decide a day needs no further read: `fleetCaptured` is satisfied by a
+   * mid-session prefix, and treating that as done seals the day against the
+   * post-close capture that would have held the rest of it.
+   */
+  fleetSealed: boolean;
 }
 
 /** TRA-4009 — one production book's own coverage picture, folded by nobody. */
@@ -739,6 +764,8 @@ export interface BrokerOrderCaptureAccountSummary {
   lines: number;
   days: BrokerOrderCaptureDayRow[];
   capturedEtDays: string[];
+  /** Captured days whose only successful read landed before the 16:00 ET close. */
+  provisionalEtDays: string[];
   attestedEtDays: string[];
   unattestedEtDays: string[];
   /** Weekday gaps inside THIS account's own first..last capture span. */
@@ -776,6 +803,13 @@ export interface BrokerOrderCaptureSummary {
    * to say "we hold the fleet's orders for that day".
    */
   fleetCapturedEtDays: string[];
+  /**
+   * Days every known production account was captured AND every one of those reads
+   * was taken after the 16:00 ET close. The subset of {@link fleetCapturedEtDays}
+   * that is a claim about whole days. A day here and not there was archived from a
+   * mid-session prefix — see `days[].provisionalAccounts`.
+   */
+  fleetSealedEtDays: string[];
   /** TRA-4009 — per book. `accounts.length > 1` is the property this ticket added. */
   accounts: BrokerOrderCaptureAccountSummary[];
   /** The account set the intersection was taken over, published so it is auditable. */
@@ -827,10 +861,38 @@ function etWeekdaysBetween(from: string, to: string): string[] {
 }
 
 /**
+ * The ET instant the regular session closes, as ms since ET midnight. 16:00 ET.
+ * A successful read taken at or after this covers the whole of the day's order
+ * window; one taken before it covers only as much of the day as had happened.
+ */
+export const SESSION_CLOSE_ET_MINUTES = 16 * 60;
+
+/**
+ * Was this line's read taken after the session closed — i.e. is it a claim about
+ * the WHOLE day rather than a prefix of it?
+ *
+ * Derived from the line's own `capturedAt`, so it is true of every line already on
+ * disk; no new field and no backfill. A line that did not read is never sealed —
+ * a blind is not a complete claim about anything.
+ */
+function isSealedCapture(line: BrokerOrderCaptureLine): boolean {
+  if (!line.read) return false;
+  const minutes = etMinutesOfDay(line.capturedAt);
+  return Number.isFinite(minutes) && minutes >= SESSION_CLOSE_ET_MINUTES;
+}
+
+/**
  * Fold ONE group of capture lines (all same day, and — for the per-account rows —
  * all same account) into a day row's measurable part.
  *
  * The successful line is the authority; a later blind retry cannot un-capture a day.
+ *
+ * ⚠ Among SUCCESSFUL lines the authority is the LAST, not the first. The broker's
+ * order list for a day only accumulates, so a later read is a strict superset of an
+ * earlier one; taking the first would report a mid-session prefix forever and hide
+ * every order placed after it. Attestation is exempt and folds by UNION — it is a
+ * claim about the RECORDER's residency, which one full-session line already proves
+ * and a later capture taken after a restart cannot retract.
  */
 function foldCaptureGroup(group: readonly BrokerOrderCaptureLine[]): {
   captured: boolean;
@@ -840,17 +902,22 @@ function foldCaptureGroup(group: readonly BrokerOrderCaptureLine[]): {
   attestation: 'full' | 'partial' | 'blind';
   lastError: string | null;
   capturedAt: number | null;
+  provisional: boolean;
 } {
-  const good = group.find(l => l.read) ?? null;
+  const reads = group.filter(l => l.read);
+  const good = reads.length > 0 ? reads[reads.length - 1]! : null;
   const chosen = good ?? group[group.length - 1]!;
   return {
     captured: good !== null,
     attempts: group.length,
     orders: chosen.orders.length,
     optionOrders: chosen.orders.filter(o => typeof o.optionSymbol === 'string' && o.optionSymbol !== '').length,
-    attestation: chosen.attestation,
+    attestation: reads.some(l => l.attestation === 'full') ? 'full' : chosen.attestation,
     lastError: group[group.length - 1]!.error,
     capturedAt: good?.capturedAt ?? null,
+    // Captured, but every successful read landed BEFORE the close ⇒ the day is
+    // archived only up to that instant. Not a gap and not a clean day: a third thing.
+    provisional: good !== null && !group.some(isSealedCapture),
   };
 }
 
@@ -884,19 +951,30 @@ export function summarizeBrokerOrderCaptures(
   const attested: string[] = [];
   const unattested: string[] = [];
   const fleetCaptured: string[] = [];
+  const fleetSealed: string[] = [];
   for (const [etDay, group] of [...byDay.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
     const fold = foldCaptureGroup(group);
     const capturedAccounts = [
       ...new Set(group.filter(l => l.read).map(accountOf)),
     ].sort();
     const missingAccounts = knownAccounts.filter(a => !capturedAccounts.includes(a));
+    // Per account, because sealing is per read: admin may have captured post-close
+    // while v0nni holds only a forced mid-session prefix, and one folded flag would
+    // report whichever answered last.
+    const provisionalAccounts = capturedAccounts.filter(
+      a => !group.some(l => accountOf(l) === a && isSealedCapture(l)),
+    );
+    const fleetCapturedDay = capturedAccounts.length > 0 && missingAccounts.length === 0;
     days.push({
       etDay,
       ...fold,
       capturedAccounts,
       missingAccounts,
-      fleetCaptured: capturedAccounts.length > 0 && missingAccounts.length === 0,
+      fleetCaptured: fleetCapturedDay,
+      provisionalAccounts,
+      fleetSealed: fleetCapturedDay && provisionalAccounts.length === 0,
     });
+    if (fleetCapturedDay && provisionalAccounts.length === 0) fleetSealed.push(etDay);
     // ATTESTATION FOLDS BY UNION — it is a claim about the RECORDER's residency,
     // and any account's full-session capture proves it. See the module docblock.
     if (group.some(l => l.read && l.attestation === 'full')) attested.push(etDay);
@@ -925,6 +1003,8 @@ export function summarizeBrokerOrderCaptures(
         capturedAccounts: fold.captured ? [account] : [],
         missingAccounts: fold.captured ? [] : [account],
         fleetCaptured: false, // meaningless on a single-account row; the fleet row owns it
+        provisionalAccounts: fold.provisional ? [account] : [],
+        fleetSealed: false, // likewise — a book cannot speak for the fleet
       };
     });
     const capturedEtDays = ownDays.filter(d => d.captured).map(d => d.etDay);
@@ -936,6 +1016,8 @@ export function summarizeBrokerOrderCaptures(
       lines: own.length,
       days: ownDays,
       capturedEtDays,
+      /** This book's captured days whose read is only a pre-close prefix. */
+      provisionalEtDays: ownDays.filter(d => d.provisional).map(d => d.etDay),
       attestedEtDays: ownDays.filter(d => d.captured && d.attestation === 'full').map(d => d.etDay),
       unattestedEtDays: ownDays.filter(d => !d.captured || d.attestation !== 'full').map(d => d.etDay),
       gapEtDays:
@@ -959,6 +1041,7 @@ export function summarizeBrokerOrderCaptures(
     attestedEtDays: attested,
     unattestedEtDays: unattested,
     fleetCapturedEtDays: fleetCaptured,
+    fleetSealedEtDays: fleetSealed,
     accounts,
     knownAccounts,
     gapEtDays,
@@ -991,17 +1074,30 @@ export interface CapturedBrokerOrderRow {
  * both were captured, which is the same one-account blindness one layer down.
  */
 export function capturedBrokerOrderRows(): CapturedBrokerOrderRow[] {
-  const out: CapturedBrokerOrderRow[] = [];
-  const seen = new Set<string>();
+  // Successful lines for one (day, account) are UNIONED on broker order id, with a
+  // LATER read winning the row. Taking only the first — which is what this did —
+  // published a forced mid-session capture's PREFIX and dropped every order placed
+  // after it, even though the post-close line holding them was right there on disk.
+  // Union rather than last-line-wins so a short read (broker paging, a partial page)
+  // can only ever ADD reach; last-write-wins on the id so a row's status and fill
+  // price are the freshest the archive holds, not the 11:00 ET `open` snapshot.
+  const byKey = new Map<string, Map<number, CapturedBrokerOrderRow>>();
+  const order: string[] = [];
   for (const l of readBrokerOrderCaptures()) {
     if (!l.read) continue;
     const account = accountOf(l);
     const key = `${l.etDay} ${account}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
+    let rows = byKey.get(key);
+    if (rows === undefined) {
+      rows = new Map();
+      byKey.set(key, rows);
+      order.push(key);
+    }
     const accountIdMasked = maskAccountId(l.accountId ?? null);
-    for (const order of l.orders) out.push({ order, account, accountIdMasked, captureEtDay: l.etDay });
+    for (const o of l.orders) rows.set(o.id, { order: o, account, accountIdMasked, captureEtDay: l.etDay });
   }
+  const out: CapturedBrokerOrderRow[] = [];
+  for (const key of order) for (const row of byKey.get(key)!.values()) out.push(row);
   return out;
 }
 

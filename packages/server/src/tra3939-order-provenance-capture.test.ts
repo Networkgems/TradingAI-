@@ -664,3 +664,153 @@ describe('TRA-3939 etDayOf', () => {
     expect(etDayOf(Date.parse('2026-08-22T04:30:00.000Z'))).toBe('2026-08-22');
   });
 });
+
+// â”€â”€ TRA-4009 follow-on: a FORCED mid-session capture must not seal the day â”€â”€â”€â”€â”€â”€
+//
+// `runBrokerOrderDayCapture({force:true})` bypasses the 16:00 ET window so the day a
+// change ships can still be captured before the ET rollover erases the broker's
+// one-day window. That forced read is a real read of a PREFIX of the day. Two
+// separate gates keyed on "already captured successfully" â€” this module's
+// idempotence and the caller's fleet early-out â€” would both treat that prefix as the
+// day being done, and the post-close capture that would have held the rest never
+// runs. The orders placed after the forced read are then lost permanently, because
+// the broker window does not reopen.
+
+describe('TRA-4009 â€” a pre-close capture is evidence, but never seals the ET day', () => {
+  const KNOWN_ = { knownAccounts: ['admin', 'v0nni'] };
+  /** 2026-08-21 11:00 ET â€” mid-session, before the 16:00 close. */
+  const MID_SESSION = Date.parse('2026-08-21T15:00:00.000Z');
+  /** 2026-08-21 17:00 ET â€” after the close. */
+  const POST_CLOSE = Date.parse('2026-08-21T21:00:00.000Z');
+
+  it('POSITIVE CONTROL â€” a forced mid-session read does NOT block the post-close capture', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    // 11:00 ET: the operator forces a capture. One order has been placed so far.
+    const forced = captureBrokerOrderDay({
+      etDay: '2026-08-21',
+      orders: [order({ id: 143021643 })],
+      capturedAt: MID_SESSION,
+      accountEnv: 'production',
+      account: 'admin',
+    });
+    expect(forced.written).toBe(true);
+    // 17:00 ET: the hourly hook runs. Two more orders were placed after the force.
+    // Under the old key this returned written:false / skippedAlreadyCaptured:true
+    // and orders 143032832 + 143196771 were never archived at all.
+    const sealed = captureBrokerOrderDay({
+      etDay: '2026-08-21',
+      orders: [order({ id: 143021643 }), order({ id: 143032832 }), order({ id: 143196771 })],
+      capturedAt: POST_CLOSE,
+      accountEnv: 'production',
+      account: 'admin',
+    });
+    expect(sealed.written).toBe(true);
+    expect(sealed.skippedAlreadyCaptured).toBe(false);
+
+    // The reader supersedes: the LAST successful read is the authority, because the
+    // broker's list for a day only accumulates.
+    const day = summarizeBrokerOrderCaptures(KNOWN_).days.find(d => d.etDay === '2026-08-21')!;
+    expect(day.orders).toBe(3);
+    expect(day.attempts).toBe(2);
+    expect(day.fleetSealed).toBe(false); // v0nni is still owed a read
+    // â€¦and all three orders are reachable, not just the prefix.
+    expect(capturedBrokerOrders().map(o => o.id).sort((a, b) => a - b)).toEqual([
+      143021643, 143032832, 143196771,
+    ]);
+  });
+
+  it('is STILL idempotent once sealed â€” the hourly scheduler writes one line per (day, account)', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    const first = captureBrokerOrderDay({
+      etDay: '2026-08-21', orders: [order()], capturedAt: POST_CLOSE,
+      accountEnv: 'production', account: 'admin',
+    });
+    const second = captureBrokerOrderDay({
+      etDay: '2026-08-21', orders: [order()], capturedAt: POST_CLOSE + 3_600_000,
+      accountEnv: 'production', account: 'admin',
+    });
+    expect(first.written).toBe(true);
+    expect(second.written).toBe(false);
+    expect(second.skippedAlreadyCaptured).toBe(true);
+  });
+
+  it('a pre-close-only day reads PROVISIONAL and is NOT fleetSealed â€” so the caller re-reads it', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    // Both books captured mid-session. `fleetCaptured` is satisfied â€” every known
+    // account answered â€” and that is exactly the reading that is not good enough.
+    captureBrokerOrderDay({
+      etDay: '2026-08-21', orders: [order()], capturedAt: MID_SESSION,
+      accountEnv: 'production', account: 'admin',
+    });
+    captureBrokerOrderDay({
+      etDay: '2026-08-21', orders: [order()], capturedAt: MID_SESSION,
+      accountEnv: 'production', account: 'v0nni',
+    });
+    const s = summarizeBrokerOrderCaptures(KNOWN_);
+    const day = s.days.find(d => d.etDay === '2026-08-21')!;
+    expect(day.captured).toBe(true);
+    expect(day.fleetCaptured).toBe(true); // the permissive readingâ€¦
+    expect(day.fleetSealed).toBe(false); // â€¦and the one the early-out now uses
+    expect(day.provisionalAccounts).toEqual(['admin', 'v0nni']);
+    expect(s.fleetCapturedEtDays).toEqual(['2026-08-21']);
+    expect(s.fleetSealedEtDays).toEqual([]);
+  });
+
+  it('names WHICH book is provisional â€” one sealed, one prefix, never one folded verdict (AC5)', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    captureBrokerOrderDay({
+      etDay: '2026-08-21', orders: [order()], capturedAt: POST_CLOSE,
+      accountEnv: 'production', account: 'admin',
+    });
+    captureBrokerOrderDay({
+      etDay: '2026-08-21', orders: [order()], capturedAt: MID_SESSION,
+      accountEnv: 'production', account: 'v0nni',
+    });
+    const s = summarizeBrokerOrderCaptures(KNOWN_);
+    const day = s.days.find(d => d.etDay === '2026-08-21')!;
+    expect(day.fleetCaptured).toBe(true);
+    expect(day.fleetSealed).toBe(false);
+    // The named half. A count could not tell this from "nobody captured".
+    expect(day.provisionalAccounts).toEqual(['v0nni']);
+    expect(s.accounts.find(a => a.account === 'v0nni')!.provisionalEtDays).toEqual(['2026-08-21']);
+    expect(s.accounts.find(a => a.account === 'admin')!.provisionalEtDays).toEqual([]);
+  });
+
+  it('a sealed read supersedes a pre-close one, but a later BLIND retry still cannot un-capture', () => {
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    captureBrokerOrderDay({
+      etDay: '2026-08-21', orders: [order()], capturedAt: MID_SESSION,
+      accountEnv: 'production', account: 'admin',
+    });
+    const blind = captureBrokerOrderDay({
+      etDay: '2026-08-21', orders: null, error: 'HTTP 401', capturedAt: POST_CLOSE,
+      accountEnv: 'production', account: 'admin',
+    });
+    expect(blind.written).toBe(true);
+    const day = summarizeBrokerOrderCaptures(KNOWN_).days.find(d => d.etDay === '2026-08-21')!;
+    expect(day.captured).toBe(true); // the successful prefix still stands
+    expect(day.orders).toBe(1);
+    expect(day.provisional).toBe(true); // â€¦and the day is still owed a sealed read
+    expect(day.lastError).toBe('HTTP 401');
+  });
+
+  it('attestation folds by UNION across attempts â€” a post-restart re-read cannot retract `full`', () => {
+    // The superseding read is chosen for ORDER COUNTS. Attestation is a claim about
+    // the recorder's residency, which a full-session line already proved; a later
+    // capture taken after a mid-day restart is `partial` and must not downgrade it.
+    armEngineSubmitRecorder({ bootedAt: BOOT_BEFORE_OPEN });
+    captureBrokerOrderDay({
+      etDay: '2026-08-21', orders: [order()], capturedAt: MID_SESSION,
+      accountEnv: 'production', account: 'admin',
+    });
+    armEngineSubmitRecorder({ bootedAt: Date.parse('2026-08-21T18:00:00.000Z') }); // rebooted mid-session
+    captureBrokerOrderDay({
+      etDay: '2026-08-21', orders: [order(), order({ id: 2 })], capturedAt: POST_CLOSE,
+      accountEnv: 'production', account: 'admin',
+    });
+    const day = summarizeBrokerOrderCaptures(KNOWN_).days.find(d => d.etDay === '2026-08-21')!;
+    expect(day.orders).toBe(2); // superseded
+    expect(day.attestation).toBe('full'); // but not retracted
+  });
+});
+

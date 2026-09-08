@@ -12906,15 +12906,23 @@ async function runBrokerOrderDayCapture(opts: { force?: boolean } = {}): Promise
   // ⚠ TRA-4009 — the early-out is on the FLEET fold, never on `captured`. `captured`
   // is true as soon as ANY book answered, and that is precisely the reading that let
   // one account's success suppress its sibling's read for a fortnight.
+  //
+  // ⚠ And it is on `fleetSealed`, never `fleetCaptured`. `force` bypasses the 16:00
+  // ET window (it exists so the day this ships can be captured before the rollover
+  // erases it), so a forced mid-session run writes a successful line holding only the
+  // orders placed SO FAR. Keyed on `fleetCaptured` that prefix would satisfy this
+  // early-out and the post-close hook would skip the day — permanently losing every
+  // order placed after the forced read, on a broker window that does not reopen. A
+  // pre-close capture is kept as evidence but never seals the day.
   if (
     roster.accounts.length > 0
     && today !== null
-    && today.fleetCaptured
+    && today.fleetSealed
   ) {
     return {
       ...base,
       ran: false,
-      reason: `already captured this ET day for all ${roster.accounts.length} production account(s)`,
+      reason: `already captured this ET day after the close for all ${roster.accounts.length} production account(s)`,
       skippedAlreadyCaptured: true,
       accountsConsidered: roster.considered,
       accountsWithProductionClient: roster.accounts.length,
@@ -13114,6 +13122,15 @@ app.get('/api/health/order-provenance-capture', async (_req, res) => {
       accounts: captures.accounts,
       knownAccounts: captures.knownAccounts,
       fleetCapturedEtDays: captures.fleetCapturedEtDays,
+      /**
+       * The subset of the above whose every read was taken AFTER the 16:00 ET
+       * close, i.e. is a claim about the whole day rather than a prefix of it.
+       * A day in `fleetCapturedEtDays` and NOT here was archived mid-session and
+       * is missing whatever was placed after that read — see
+       * `days[].provisionalAccounts` for which book. This is the field the capture
+       * pass keys its "nothing left to do today" early-out on.
+       */
+      fleetSealedEtDays: captures.fleetSealedEtDays,
       accountGapEtDays: captures.accountGapEtDays,
       /**
        * The roster the read was taken against. `null` ⇒ settings were unreadable

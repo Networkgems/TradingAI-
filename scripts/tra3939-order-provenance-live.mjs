@@ -214,11 +214,25 @@ async function main() {
         + '"captured" flag is the OR across accounts, so one uncaptured production book would read '
         + 'as a captured day. The gate cannot be evaluated.',
     );
+  } else if (today.fleetCaptured && today.fleetSealed === false) {
+    // Post-close, every book answered, and yet the day is NOT sealed — so every
+    // successful read landed before 16:00 ET (a forced mid-session capture). The
+    // archive holds a PREFIX and the post-close read that would have held the rest
+    // has not happened. `fleetCaptured` alone would have called this a clean day.
+    fail(
+      'G3 today captured (every production account)',
+      `${et.day}: every production account has a capture, but it is ${et.hour}:00 ET (post-close) and `
+        + `${(today.provisionalAccounts ?? ['?']).length} of them hold only a PRE-CLOSE read: `
+        + `${(today.provisionalAccounts ?? ['?']).join(', ')}. The archive is a mid-session PREFIX of `
+        + 'today — every order placed after that read is still unarchived, and the broker window closes '
+        + 'at the ET rollover. Re-run the capture now; a provisional day is not a captured day.',
+    );
   } else if (today.fleetCaptured) {
     pass(
       'G3 today captured (every production account)',
       `${et.day}: accounts=[${(today.capturedAccounts ?? []).join(', ')}] orders=${today.orders} `
-        + `optionOrders=${today.optionOrders} attestation=${today.attestation}`,
+        + `optionOrders=${today.optionOrders} attestation=${today.attestation}`
+        + `${typeof today.fleetSealed === 'boolean' ? ` fleetSealed=${today.fleetSealed}` : ''}`,
     );
   } else {
     fail(
