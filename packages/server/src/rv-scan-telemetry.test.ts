@@ -147,6 +147,114 @@ describe('TRA-2193 rv-scan telemetry — the buckets must sum', () => {
   });
 });
 
+describe('TRA-4357 AC3 — the ledger reconciles, and says WHICH denominator it reconciles against', () => {
+  it('THE FILED SHAPE: a budget-truncated sweep is BALANCED — the "67 lost candidates" were never walked', () => {
+    // TRA-4357 reported the 16:16:38Z cycle as `candidatesEvaluated: 343` with a
+    // `rejectionsByGate` summing to 276 and concluded 67 candidates were silently
+    // dropped. Reconstructed here: 343 was the UNIVERSE, 276 was the slice the
+    // budget bought, and nothing was lost. This test pins that reading.
+    const run = beginRvScan('otm', 343, clock);
+    for (let i = 0; i < 276; i += 1) {
+      run.enterSymbol();
+      run.reject('scan:no_spot');
+    }
+    run.noteSweep({
+      startIndex: 0,
+      processed: 276,
+      complete: false,
+      budgetExhausted: true,
+      stopped: false,
+      resumeAt: 'ZM',
+    });
+    const rec = run.finish();
+
+    const summed = Object.values(rec.rejectionsByGate).reduce((a, b) => a + b, 0);
+    expect(summed).toBe(276);
+    expect(rec.universeSize).toBe(343);
+    expect(rec.candidatesEvaluated).toBe(276);
+
+    // Against the universe the reader sees a 67-candidate hole. Against the
+    // denominator the gates actually cover, the set is exact.
+    expect(rec.universeSize - summed).toBe(67);
+    expect(rec.bucketsBalance).toBe(true);
+    expect(rec.reconciliation.balances).toBe(true);
+    expect(rec.reconciliation.denominator).toBe(276);
+    expect(rec.reconciliation.accountedFor).toBe(276);
+
+    // And the 67 are NAMED with their cause, so the misread is not available.
+    expect(rec.reconciliation.universeNotWalked).toBe(67);
+    expect(rec.reconciliation.notWalkedReason).toBe('sweep_budget_exhausted');
+  });
+
+  it('AC3 INVARIANT: sum(rejectionsByGate) + candidatesPassed === candidatesEvaluated, residual named', () => {
+    const run = beginRvScan('otm', 5, clock);
+    run.enterSymbol(); run.reject('scan:no_spot');
+    run.enterSymbol(); run.reject('contract_floor_delta');
+    run.enterSymbol(); // untagged `continue`
+    run.enterSymbol(); run.pass(); run.opened();
+    run.enterSymbol(); run.pass();
+    const rec = run.finish();
+
+    const summed = Object.values(rec.rejectionsByGate).reduce((a, b) => a + b, 0);
+    expect(summed + rec.candidatesPassed).toBe(rec.candidatesEvaluated);
+    expect(rec.reconciliation.accountedFor).toBe(rec.reconciliation.denominator);
+    expect(rec.reconciliation.balances).toBe(true);
+    // The residual is visible rather than missing — AC3's stated alternative.
+    expect(rec.rejectionsByGate[UNATTRIBUTED_GATE]).toBe(1);
+    // Nothing went unwalked here, so there is no remainder and no reason for one.
+    expect(rec.reconciliation.universeNotWalked).toBe(0);
+    expect(rec.reconciliation.notWalkedReason).toBeNull();
+  });
+
+  it('MUTATION CHECK: an overshoot makes `accountedFor` EXCEED the denominator — never clamped', () => {
+    const run = beginRvScan('otm', 2, clock);
+    run.enterSymbol(); run.reject('scan:no_spot'); run.reject('scan:no_chain');
+    run.enterSymbol(); run.pass();
+    const rec = run.finish();
+
+    expect(rec.reconciliation.denominator).toBe(2);
+    // 2 tagged + 1 passed = 3 against a denominator of 2. A clamp here would hide
+    // the double-count, which is the whole point of not clamping.
+    expect(rec.reconciliation.accountedFor).toBe(3);
+    expect(rec.reconciliation.balances).toBe(false);
+    expect(rec.bucketsBalance).toBe(false);
+  });
+
+  it('a RESUMED tail names its remainder too — a full-universe read of it would invent a drop', () => {
+    // Measured live 2026-09-08T18:39:29Z: universe 269, only 91 walked, complete.
+    const run = beginRvScan('otm', 269, clock);
+    for (let i = 0; i < 91; i += 1) { run.enterSymbol(); run.reject('scan:no_chain'); }
+    run.noteSweep({
+      startIndex: 178,
+      processed: 91,
+      complete: true,
+      budgetExhausted: false,
+      stopped: false,
+      resumeAt: null,
+    });
+    const rec = run.finish();
+
+    expect(rec.reconciliation.balances).toBe(true);
+    expect(rec.reconciliation.universeNotWalked).toBe(178);
+    // `complete: true` with a 178-symbol gap is the case most likely to be read as
+    // a crash; the reason disambiguates it.
+    expect(rec.reconciliation.notWalkedReason).toBe('sweep_resumed_tail');
+  });
+
+  it('an UNEXPLAINED gap keeps a null reason — the signal that something really did vanish', () => {
+    // No stopEarly(), no noteSweep(): the loop simply stopped. `universeNotWalked`
+    // non-zero with a null reason is the shape that IS a defect, and it must stay
+    // distinguishable from the two benign ones above.
+    const run = beginRvScan('otm', 10, clock);
+    for (let i = 0; i < 4; i += 1) { run.enterSymbol(); run.reject('scan:no_spot'); }
+    const rec = run.finish();
+
+    expect(rec.reconciliation.balances).toBe(true);
+    expect(rec.reconciliation.universeNotWalked).toBe(6);
+    expect(rec.reconciliation.notWalkedReason).toBeNull();
+  });
+});
+
 describe('TRA-2193 rv-scan telemetry — counting the input, not the output', () => {
   it('an ALL-CONTINUE scan reports the symbols it considered, not zero', () => {
     const run = beginRvScan('directional', 5, clock);

@@ -37,9 +37,17 @@ const DESK: RvScanCensusOwner = {
   mode: 'demo',
 };
 
-/** A finished pass. Defaults describe the TRA-4350 state: evaluated, none passed. */
+/**
+ * A finished pass. Defaults describe the TRA-4350 state: evaluated, none passed.
+ *
+ * TRA-4357 AC3 — `reconciliation` is DERIVED from the finished fields rather than
+ * hard-coded, so an override of `universeSize`/`candidatesEvaluated` cannot leave
+ * this fixture asserting a reconciliation that contradicts its own counters. An
+ * explicit `reconciliation` in `over` still wins, for the cases that pin a
+ * deliberately inconsistent record.
+ */
 function pass(over: Partial<RvScanRecord> = {}): RvScanRecord {
-  return {
+  const base = {
     atMs: 1_788_000_000_000,
     universeSize: 152,
     candidatesEvaluated: 152,
@@ -50,6 +58,18 @@ function pass(over: Partial<RvScanRecord> = {}): RvScanRecord {
     stoppedEarlyReason: null,
     sweep: null,
     ...over,
+  };
+  const tagged = Object.values(base.rejectionsByGate).reduce((a, b) => a + b, 0);
+  const notWalked = Math.max(0, base.universeSize - base.candidatesEvaluated);
+  return {
+    ...base,
+    reconciliation: over.reconciliation ?? {
+      denominator: base.candidatesEvaluated,
+      accountedFor: tagged + base.candidatesPassed,
+      balances: tagged === base.candidatesEvaluated - base.candidatesPassed,
+      universeNotWalked: notWalked,
+      notWalkedReason: notWalked > 0 ? base.stoppedEarlyReason : null,
+    },
   };
 }
 

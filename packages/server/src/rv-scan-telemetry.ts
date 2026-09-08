@@ -37,6 +37,13 @@
 //         the invariant exists to catch.
 //     `bucketsBalance` is the assertion, in the payload, on every response.
 //
+//     TRA-4357 — and it must say WHICH denominator it balances against. The
+//     record ships two plausible ones and only `candidatesEvaluated` is covered
+//     by the gates; on the budgeted `otm` path the other (`universeSize`) is
+//     routinely larger, so a reader who picks it manufactures a shortfall out of
+//     a balanced ledger. That misread was filed as a second defect on TRA-4357
+//     and it is the reason {@link RvScanReconciliation} exists.
+//
 // TRA-3557 — a FOURTH path, `otm`, and the one that needed this most: it is the
 // sleeve under live-money acceptance, and it was the only option entry path with
 // no scan run at all. Its `continue` on an empty/failed chain sits UPSTREAM of the
@@ -289,6 +296,63 @@ export interface RvScanSweepSlice {
   resumeAt: string | null;
 }
 
+/**
+ * TRA-4357 AC3 — the reconciliation identity, stated IN the payload rather than
+ * left for the reader to reconstruct.
+ *
+ * `bucketsBalance` was already correct and has never been observed false (40/40
+ * distinct live cycles on 2026-09-08, both instrumented paths). The defect this
+ * exists to kill is one layer out: the record ships TWO plausible denominators —
+ * `universeSize` and `candidatesEvaluated` — and only the second one is the one
+ * the gates cover. On the three unbudgeted paths they are always equal, so the
+ * distinction is invisible; on `otm`, the one path behind `runBudgetedSweep`, a
+ * truncated or resumed pass makes them differ by design (see {@link RvScanSweepSlice}).
+ *
+ * A reader who picks `universeSize` therefore computes a shortfall out of a
+ * perfectly balanced ledger and reports a silent drop that is not there. That is
+ * not hypothetical: TRA-4357 was filed with exactly that finding — "343 evaluated,
+ * rejections sum to 276, sixty-seven candidates neither passed nor appear under
+ * any gate". 343 was the universe, 276 was the slice actually walked, the missing
+ * 67 were never handed to a gate because the sweep budget ended the pass first,
+ * and `bucketsBalance` was `true` throughout. Re-measured live on 2026-09-08 the
+ * same shape reproduced twice in four minutes: 238→157 (`sweep_budget_exhausted`)
+ * and 269→91 (`sweep_resumed_tail`), both balanced.
+ *
+ * The remedy is not another invariant — it is naming the remainder. A reader who
+ * sees `universeNotWalked: 67` alongside `notWalkedReason: "sweep_budget_exhausted"`
+ * cannot mistake a budget boundary for a lost candidate, and a reader who sees
+ * `universeNotWalked: 0` needs no denominator judgement at all.
+ */
+export interface RvScanReconciliation {
+  /**
+   * The ONLY denominator `rejectionsByGate` covers: `candidatesEvaluated`.
+   * Deliberately not `universeSize` — symbols the sweep never handed to the loop
+   * cannot have been rejected by a gate, so charging them to one would be a
+   * fabricated attribution.
+   */
+  denominator: number;
+  /** `sum(rejectionsByGate) + candidatesPassed`. */
+  accountedFor: number;
+  /**
+   * `accountedFor === denominator`. Same assertion as {@link RvScanRecord.bucketsBalance},
+   * restated against the explicit denominator so the two cannot be read apart.
+   */
+  balances: boolean;
+  /**
+   * `universeSize - candidatesEvaluated` — symbols HANDED to the scanner that the
+   * pass never walked. Normal and non-zero on a budgeted sweep; a genuine finding
+   * on any other path. Named, never left as a subtraction the reader has to know
+   * to perform.
+   */
+  universeNotWalked: number;
+  /**
+   * Why those symbols went unwalked ({@link RvScanRecord.stoppedEarlyReason}), or
+   * null when none did. Non-null with `universeNotWalked: 0`, or null with a
+   * non-zero one, is itself the bug signal — an unexplained gap.
+   */
+  notWalkedReason: string | null;
+}
+
 /** One completed scan pass over a symbol universe. */
 export interface RvScanRecord {
   atMs: number;
@@ -303,6 +367,11 @@ export interface RvScanRecord {
   rejectionsByGate: Record<string, number>;
   /** True iff `sum(rejectionsByGate) === candidatesEvaluated - candidatesPassed`. */
   bucketsBalance: boolean;
+  /**
+   * TRA-4357 AC3 — the same invariant with its denominator named, plus the
+   * budgeted-sweep remainder. See {@link RvScanReconciliation}.
+   */
+  reconciliation: RvScanReconciliation;
   /** Why the loop stopped before consuming the universe, or null if it did not. */
   stoppedEarlyReason: string | null;
   /**
@@ -449,6 +518,19 @@ export class RvScanRun {
       tagged = expected;
     }
 
+    // TRA-4357 AC3 — publish the identity with its denominator named. `tagged` is
+    // post-residual, so `accountedFor` is what a reader summing the SHIPPED
+    // `rejectionsByGate` gets, not an internal pre-attribution figure; on the
+    // overshoot branch it therefore exceeds the denominator, which is the point.
+    const universeNotWalked = Math.max(0, this.universeSize - this.evaluated);
+    const reconciliation: RvScanReconciliation = {
+      denominator: this.evaluated,
+      accountedFor: tagged + this.passed,
+      balances: tagged === expected,
+      universeNotWalked,
+      notWalkedReason: universeNotWalked > 0 ? this.stoppedEarly : null,
+    };
+
     const record: RvScanRecord = {
       atMs: this.clock(),
       universeSize: this.universeSize,
@@ -457,6 +539,7 @@ export class RvScanRun {
       opensPlaced: this.opens,
       rejectionsByGate,
       bucketsBalance: tagged === expected,
+      reconciliation,
       stoppedEarlyReason: this.stoppedEarly,
       sweep: this.sweep,
     };
