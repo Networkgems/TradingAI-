@@ -247,8 +247,8 @@ describe('live-options fee auto-reconcile (TRA-2810)', () => {
     const s = await runLiveOptionsFeeReconcile(async () => client, NOW);
     expect(s.lastOutcome).toBe('backfilled');
     expect(s.lastGainLossUpdated).toBe(1);
-    // partial failure must not self-report clean
-    expect(s.lastError).toBe('502 from Tradier');
+    // partial failure must not self-report clean (TRA-4295: named per source)
+    expect(s.lastError).toBe('history: 502 from Tradier');
     const rec = summarizeLiveOptionsFeeSlippage().records[0]!;
     expect(rec.fees).toBeCloseTo(0.44, 6);
     expect(rec.feeSource).toBe('gainloss_derived');
@@ -580,6 +580,7 @@ describe('live-options fee reconcile coverage + partition (TRA-2959)', () => {
         proceeds: 479.56,
         openDate: '2026-07-29',
         closeDate: '2026-07-29',
+        book: null,
       },
     ]);
   });
@@ -706,6 +707,7 @@ describe('PDT day-trade detection off broker gainloss lots (TRA-4143)', () => {
         proceeds: 599.86,
         openDate: '2026-08-04',
         closeDate: '2026-08-04',
+        book: null,
       },
     ]);
 
@@ -767,5 +769,155 @@ describe('tsSynthetic stamp on import rows (TRA-4143)', () => {
     const rec = summarizeLiveOptionsFeeSlippage().records[0]!;
     expect(rec.origin).toBe('history_import');
     expect(rec.tsSynthetic).toBe(true);
+  });
+});
+
+// TRA-4295 — the v0nni stall. The ledger is process-global and holds every live
+// book's fills, but the pass fetched exactly ONE Tradier account (the pinned
+// operator's). The moment a second book traded, its lots settled in an account
+// the pass never queried: every one of its groups rejected 'no-lot' forever,
+// consecutiveNoMatch climbed monotonically (7 by 2026-09-01, spanning process
+// restarts), and its rows aged toward permanently-unmeasured. The pass now
+// takes the full production account roster and joins over the union of every
+// account's lots.
+describe('multi-account roster reconcile (TRA-4295)', () => {
+  function v0nniOpenFill(): void {
+    recordLiveOptionFill({
+      ts: NOW - 50_000,
+      etDay: '2026-07-30',
+      book: 'v0nni',
+      sleeve: 'single_leg_otm',
+      optionSymbol: 'TTD261009C00014000',
+      side: 'buy_to_open',
+      contracts: 1,
+      submittedLimit: 0.6,
+      askAtSubmit: 0.6,
+      midAtSubmit: 0.55,
+      filledPrice: 0.6,
+      fees: null,
+      orderId: 222222222,
+    });
+  }
+
+  it("measures a sibling book's row from ITS OWN account's gainloss — the exact shape the single-account pass stalled on", async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    seedOpenFill(); // operator book: AAPL x4 @ 1.04 (gross 416.00)
+    v0nniOpenFill(); // sibling book: TTD x1 @ 0.60 (gross 60.00)
+    const adminLots: TradierGainLossLot[] = [
+      { symbol: 'AAPL260904P00280000', quantity: 4, cost: 416.44, proceeds: 500, gainLoss: 83.56, openDate: '2026-07-30', closeDate: '2026-07-31' },
+    ];
+    const v0nniLots: TradierGainLossLot[] = [
+      { symbol: 'TTD261009C00014000', quantity: 1, cost: 60.11, proceeds: 70, gainLoss: 9.89, openDate: '2026-07-30', closeDate: '2026-07-31' },
+    ];
+    const admin = fakeClient([], adminLots);
+    const v0nni = fakeClient([], v0nniLots);
+    const s = await runLiveOptionsFeeReconcile(
+      async () => [
+        { book: 'admin', client: admin.client },
+        { book: 'v0nni', client: v0nni.client },
+      ],
+      NOW,
+    );
+    expect(s.lastOutcome).toBe('backfilled');
+    expect(s.lastUpdated).toBe(2);
+    expect(s.lastGainLossLots).toBe(2); // the UNION of both accounts' fetches
+    expect(s.lastGainLossSample!.map((l) => l.book)).toEqual(['admin', 'v0nni']);
+    expect(s.lastAccounts).toEqual([
+      { book: 'admin', historyFills: 0, gainLossLots: 1, historyError: null, gainLossError: null, coverage: expect.anything() },
+      { book: 'v0nni', historyFills: 0, gainLossLots: 1, historyError: null, gainLossError: null, coverage: expect.anything() },
+    ]);
+    const bySymbol = Object.fromEntries(
+      summarizeLiveOptionsFeeSlippage().records.map((r) => [r.optionSymbol, r.fees]),
+    );
+    expect(bySymbol['AAPL260904P00280000']).toBeCloseTo(0.44, 6);
+    expect(bySymbol['TTD261009C00014000']).toBeCloseTo(0.11, 6);
+  });
+
+  it("stamps an imported row with the book whose account the history came from — never the operator's", async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    seedCloseFill({ etDay: '2026-07-29', ts: NOW - 86_400_000 }); // keeps the pass non-quiescent
+    const v0nni = fakeClient([
+      histFill({
+        date: '2026-07-29',
+        symbol: 'SOUN261009C00007000',
+        description: 'Buy to Open 1 SOUN261009C00007000 @ 0.55',
+        quantity: 1,
+        amount: -55,
+        commission: 0,
+        orderId: null,
+        transactionId: 't-v0nni-import',
+      }),
+    ]);
+    await runLiveOptionsFeeReconcile(
+      async () => [
+        { book: 'admin', client: fakeClient([]).client },
+        { book: 'v0nni', client: v0nni.client },
+      ],
+      NOW,
+    );
+    const imported = summarizeLiveOptionsFeeSlippage().records.find((r) => r.origin === 'history_import');
+    expect(imported).toBeDefined();
+    expect(imported!.optionSymbol).toBe('SOUN261009C00007000');
+    expect(imported!.book).toBe('v0nni');
+  });
+
+  it("one account's total outage neither stops a sibling's join nor goes unrecorded", async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    v0nniOpenFill();
+    const dead: FeeReconcileHistoryClient = {
+      listAccountHistory: async () => { throw new Error('502 from Tradier'); },
+      listGainLoss: async () => { throw new Error('503 from Tradier'); },
+    };
+    const v0nni = fakeClient([], [
+      { symbol: 'TTD261009C00014000', quantity: 1, cost: 60.11, proceeds: 70, gainLoss: 9.89, openDate: '2026-07-30', closeDate: '2026-07-31' },
+    ]);
+    const s = await runLiveOptionsFeeReconcile(
+      async () => [
+        { book: 'admin', client: dead },
+        { book: 'v0nni', client: v0nni.client },
+      ],
+      NOW,
+    );
+    expect(s.lastOutcome).toBe('backfilled');
+    expect(s.lastGainLossUpdated).toBe(1);
+    expect(s.lastError).toContain('admin history: 502 from Tradier');
+    expect(s.lastError).toContain('admin gainloss: 503 from Tradier');
+    expect(s.lastAccounts![0]).toMatchObject({ book: 'admin', historyFills: null, gainLossLots: null });
+  });
+
+  it('every account failing every fetch reads fetch-failed with every error named', async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    seedOpenFill();
+    const dead = (msg: string): FeeReconcileHistoryClient => ({
+      listAccountHistory: async () => { throw new Error(`${msg} history`); },
+      listGainLoss: async () => { throw new Error(`${msg} gainloss`); },
+    });
+    const s = await runLiveOptionsFeeReconcile(
+      async () => [
+        { book: 'admin', client: dead('A') },
+        { book: 'v0nni', client: dead('B') },
+      ],
+      NOW,
+    );
+    expect(s.lastOutcome).toBe('fetch-failed');
+    expect(s.lastError).toContain('admin history: A history');
+    expect(s.lastError).toContain('v0nni gainloss: B gainloss');
+    expect(summarizeLiveOptionsFeeSlippage().records[0]!.fees).toBeNull();
+  });
+
+  it('an EMPTY roster reads no-client — a box with no resolvable production account must not read fetch-failed', async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    seedOpenFill();
+    const s = await runLiveOptionsFeeReconcile(async () => [], NOW);
+    expect(s.lastOutcome).toBe('no-client');
+  });
+
+  it('index.ts resolves the roster from resolveProductionCaptureAccounts, not a single-operator client (TRA-4295 wiring)', () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'index.ts'), 'utf8');
+    expect(src).toContain('buildLiveFeeReconcileAccounts');
+    expect(src).toMatch(/buildLiveFeeReconcileAccounts[\s\S]{0,400}?resolveProductionCaptureAccounts\(\)/);
+    // both call sites ride the roster factory
+    const calls = src.match(/runLiveOptionsFeeReconcile\(\s*buildLiveFeeReconcileAccounts/g) ?? [];
+    expect(calls.length).toBe(2);
   });
 });

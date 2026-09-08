@@ -444,7 +444,7 @@ import {
 import { summarizeLiveArmCensus } from './live-arm-census.js';
 // TRA-3937 — durable broker-census snapshot: hydrate on boot, persist on read.
 import { hydrateCensusFromDir, persistCensusDaySync } from './broker-submit-census.js';
-import { runLiveOptionsFeeReconcile } from './live-options-fee-reconcile.js'; // TRA-2810/TRA-2850
+import { runLiveOptionsFeeReconcile, type FeeReconcileAccount } from './live-options-fee-reconcile.js'; // TRA-2810/TRA-2850/TRA-4295
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
 // TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
@@ -5348,16 +5348,17 @@ setTradierOrderSubmitObserver(recordEngineOrderSubmit);
 // stays a no-op.
 configureEngineBasisRestatementLog(DATA_DIR);
 
-// TRA-2810 — the fee back-fill pass resolves the live operator's PRODUCTION options
-// client exactly like the TRA-1954 admin reconcile route. Null when no production
-// creds resolve (the pass records 'no-client' and stays quiet).
-async function buildLiveFeeReconcileClient(): Promise<TradierOptionsClient | null> {
-  const operator = resolveLiveBrokerOperator();
-  const settings = await loadSettings(operator);
-  // TRA-3112 — `listAccountHistory` / `listGainLoss`: account surface. The
-  // operator is passed explicitly, so this pass is unaffected by the pin (it is
-  // the one caller that is BY CONSTRUCTION the operator).
-  return buildTradierAccountClientForEnv(settings, 'production', operator);
+// TRA-2810 — the fee back-fill pass resolves PRODUCTION options clients. Empty
+// when no production creds resolve (the pass records 'no-client' and stays quiet).
+// TRA-4295 — the FULL account roster, not just the pinned operator: the ledger
+// is process-global and holds every live book's fills, and a book whose lots
+// settle in an account the pass never fetched rejects 'no-lot' forever (the
+// v0nni stall — consecutiveNoMatch 7 by 2026-09-01, spanning restarts). Rides
+// the same TRA-4009 roster resolution as the daily order-provenance capture,
+// so the two surfaces can never disagree about which accounts exist.
+async function buildLiveFeeReconcileAccounts(): Promise<FeeReconcileAccount[]> {
+  const roster = await resolveProductionCaptureAccounts();
+  return roster.accounts.map((a) => ({ book: a.account, client: a.client }));
 }
 
 // TRA-2810 — kick ONE fee reconcile shortly after boot (the hourly tick also runs it).
@@ -5366,15 +5367,10 @@ async function buildLiveFeeReconcileClient(): Promise<TradierOptionsClient | nul
 // 90s so boot IO settles first; .unref() so the timer can never hold the process open;
 // the pass itself never throws and makes no broker call when nothing is unmeasured.
 setTimeout(() => {
-  // TRA-3977 — the third argument is the BOOK. `buildLiveFeeReconcileClient`
-  // resolves `resolveLiveBrokerOperator()`'s PRODUCTION account, so every
-  // `history_import` row this pass mints belongs to that operator's book. The
-  // two must be resolved from the same call or the stamp would be a guess.
-  void runLiveOptionsFeeReconcile(
-    buildLiveFeeReconcileClient,
-    Date.now(),
-    resolveLiveBrokerOperator(),
-  );
+  // TRA-3977/TRA-4295 — each roster account carries its own book, so every
+  // `history_import` row is stamped with the account its history actually
+  // came from; no separate book argument to fall out of sync.
+  void runLiveOptionsFeeReconcile(buildLiveFeeReconcileAccounts, Date.now());
 }, 90_000).unref();
 
 // TRA-3547 — everything the zombie-open sweep touches, in one place. Injected
@@ -19236,12 +19232,8 @@ scheduler.start({
     // TRA-2810 — join Tradier account-history commission onto any live fee/slippage
     // ledger row still fees:null. Self-quenching (zero IO once nothing is unmeasured)
     // and internally best-effort — it cannot throw into this tick.
-    // TRA-3977 — same book resolution as the boot kick above.
-    await runLiveOptionsFeeReconcile(
-      buildLiveFeeReconcileClient,
-      Date.now(),
-      resolveLiveBrokerOperator(),
-    );
+    // TRA-3977/TRA-4295 — same roster resolution as the boot kick above.
+    await runLiveOptionsFeeReconcile(buildLiveFeeReconcileAccounts, Date.now());
     // TRA-3547 — resolve live journal rows the broker tape says are NOT open:
     // back-fill the CLOSE for a real round trip, retract a row that never
     // filled, refuse anything ambiguous. Runs AFTER the fee reconcile above so a

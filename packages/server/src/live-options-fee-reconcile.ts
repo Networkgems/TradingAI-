@@ -44,6 +44,21 @@
 // (STALLED_AFTER_NO_MATCH consecutive no-matches) is the NON-GREEN state —
 // TRA-2850's original symptom was three no-match ticks self-reporting healthy
 // via `lastError: null`.
+//
+// ── WHY A ROSTER, NOT ONE CLIENT (TRA-4295) ─────────────────────────────────
+// The ledger is process-global and holds fills from EVERY live book, but until
+// TRA-4295 the pass fetched exactly one Tradier account — the pinned operator's.
+// The moment a second book (`v0nni`) started trading, its lots settled in an
+// account the pass never queried: every one of its groups rejected 'no-lot'
+// forever, `consecutiveNoMatch` climbed monotonically (7 by 2026-09-01, spanning
+// process restarts), and its rows aged toward permanently-unmeasured while the
+// operator's own lots kept fetching fine. The pass now takes the full production
+// account roster: history is fetched and imported PER ACCOUNT (an imported row's
+// `book` stamp is exactly as attributable as the account it came from,
+// TRA-3977), and the gainloss join runs ONCE over the UNION of every account's
+// lots — each (symbol, day, side) group's lots live in exactly one account, so
+// the union finds them wherever they settled, including for legacy `book: null`
+// rows that predate attribution.
 
 import type { TradierTradeHistoryFill, TradierGainLossLot } from '@trading-app/engine';
 import {
@@ -141,6 +156,21 @@ export interface FeeReconcileHistoryClient {
 }
 
 /**
+ * TRA-4295 — one production account the pass reconciles against. `book` is the
+ * operator/book username whose creds resolve `client` (the TRA-3977 stamp every
+ * `history_import` row minted from that account's history carries). The factory
+ * may still return a bare {@link FeeReconcileHistoryClient} — it is treated as
+ * a one-account roster under the legacy `book` argument.
+ */
+export interface FeeReconcileAccount {
+  book: string | null;
+  client: FeeReconcileHistoryClient;
+}
+
+/** What the client factory may resolve — see {@link FeeReconcileAccount}. */
+export type FeeReconcileClients = FeeReconcileHistoryClient | FeeReconcileAccount[] | null;
+
+/**
  * Outcome of one pass invocation:
  * - 'no-unmeasured' — every retained row already has a measured fee (or the
  *   ledger is empty). The quiescent/healthy end state; NO broker call was made.
@@ -154,10 +184,12 @@ export interface FeeReconcileHistoryClient {
  *   account will never report) or an open leg whose position has not closed
  *   yet (`unmeasuredAwaitingClose` — no lot EXISTS to derive from). Not
  *   evidence of a stall: does not feed `consecutiveNoMatch`.
- * - 'no-client'     — no production Tradier options credentials resolvable (or
- *   the client factory threw). Expected on boxes without live creds.
- * - 'fetch-failed'  — BOTH broker requests threw; see `lastError`. (A partial
- *   failure keeps the surviving source's outcome and still records the error.)
+ * - 'no-client'     — no production Tradier options credentials resolvable for
+ *   ANY account (or the client factory threw). Expected on boxes without live
+ *   creds.
+ * - 'fetch-failed'  — EVERY broker request on EVERY account threw; see
+ *   `lastError`. (A partial failure keeps the surviving fetches' outcome and
+ *   still records every error, per account.)
  */
 export type LiveOptionsFeeReconcileOutcome =
   | 'no-unmeasured'
@@ -180,10 +212,24 @@ export interface LiveOptionsFeeReconcileState {
   lastOutcome: LiveOptionsFeeReconcileOutcome | null;
   /** ET-day window of the last fetch (min unmeasured etDay → today). */
   lastWindow: { start: string; end: string } | null;
-  /** History fills returned by the last successful fetch (null when none ran). */
+  /** History fills returned by the last successful fetch, ALL accounts (null when none ran). */
   lastHistoryFills: number | null;
-  /** TRA-2850 — settled gainloss lots returned by the last successful fetch. */
+  /** TRA-2850 — settled gainloss lots returned by the last successful fetch, ALL accounts. */
   lastGainLossLots: number | null;
+  /**
+   * TRA-4295 — per-account fetch provenance for the last attempt. The scalars
+   * above fold over every account; this is the only surface that can say WHICH
+   * account a fetch (or a failure) belongs to — the exact question the v0nni
+   * stall was undiagnosable without. Null before the first attempt.
+   */
+  lastAccounts: Array<{
+    book: string | null;
+    historyFills: number | null;
+    gainLossLots: number | null;
+    historyError: string | null;
+    gainLossError: string | null;
+    coverage: LedgerCoverageResult | null;
+  }> | null;
   /**
    * TRA-3558 — RAW settled lots from the last gainloss fetch, PRE-filter and
    * PRE-join, capped at {@link GAINLOSS_SAMPLE_MAX}. The counterpart of
@@ -191,7 +237,8 @@ export interface LiveOptionsFeeReconcileState {
    * with `lastGainLossRejections`: a group rejected `no-lot` whose symbol does
    * NOT appear here was never fetched; one whose symbol DOES appear here is
    * mis-keyed, and the lot dates/quantity printed here say on which field.
-   * Truncated iff `lastGainLossLots > GAINLOSS_SAMPLE_MAX`.
+   * Truncated iff `lastGainLossLots > GAINLOSS_SAMPLE_MAX`. `book` (TRA-4295)
+   * names the account the lot was fetched from.
    */
   lastGainLossSample: Array<{
     symbol: string;
@@ -200,6 +247,7 @@ export interface LiveOptionsFeeReconcileState {
     proceeds: number;
     openDate: string;
     closeDate: string;
+    book: string | null;
   }> | null;
   /**
    * TRA-3558 — WHICH test rejected each still-unmeasured (symbol, day, side)
@@ -254,6 +302,8 @@ export interface LiveOptionsFeeReconcileState {
     proceeds: number;
     openDate: string;
     closeDate: string;
+    /** TRA-4295 — the account the lot settled in (PDT is enforced per account). */
+    book: string | null;
   }> | null;
   /** TRA-4143 — count over the WHOLE fetch (never capped); null until a gainloss fetch has run. */
   lastPdtDayTradeCount: number | null;
@@ -293,6 +343,8 @@ export interface LiveOptionsFeeReconcileState {
     commission: number;
     price: number;
     quantity: number;
+    /** TRA-4295 — the account the fill was fetched from. */
+    book: string | null;
   }> | null;
   /**
    * How many history fills could actually enter the commission join (tradeType
@@ -324,6 +376,8 @@ export interface LiveOptionsFeeReconcileState {
    * `missingContracts > 0` means broker fills existed that NO code path
    * recorded; the same pass appends them as `origin: 'history_import'` rows,
    * so the gap both alarms and heals. Null until a history fetch has run.
+   * TRA-4295 — folded (summed) across every account whose history fetched;
+   * the per-account results live on `lastAccounts`.
    */
   coverage: LedgerCoverageResult | null;
   /** Rows imported from history since boot (cumulative across passes). */
@@ -368,6 +422,7 @@ function emptyState(): LiveOptionsFeeReconcileState {
     lastWindow: null,
     lastHistoryFills: null,
     lastGainLossLots: null,
+    lastAccounts: null,
     lastGainLossSample: null,
     lastGainLossRejections: null,
     lastGainLossRejectionCounts: null,
@@ -404,6 +459,10 @@ export function getLiveOptionsFeeReconcileState(): LiveOptionsFeeReconcileState 
   return {
     ...state,
     lastWindow: state.lastWindow === null ? null : { ...state.lastWindow },
+    lastAccounts:
+      state.lastAccounts === null
+        ? null
+        : state.lastAccounts.map((a) => ({ ...a, coverage: a.coverage === null ? null : { ...a.coverage } })),
     lastHistorySample: state.lastHistorySample === null ? null : state.lastHistorySample.map((s) => ({ ...s })),
     lastGainLossSample: state.lastGainLossSample === null ? null : state.lastGainLossSample.map((s) => ({ ...s })),
     lastGainLossRejections:
@@ -474,23 +533,27 @@ export function detectPdtDayTradeLots(lots: readonly TradierGainLossLot[]): Trad
 /**
  * Run one fee back-fill pass: if any retained ledger row is `fees: null`, fetch
  * Tradier account-history AND the settled gain/loss report over
- * [min unmeasured etDay, today ET], then (TRA-2959) import any broker fill the
- * ledger is missing, and back-fill via the commission join (positive
- * commissions only) and the gainloss derivation (TRA-2850). All writers rewrite
- * the durable JSONL so the rows survive a redeploy. `buildClient` is invoked
- * ONLY when there is something to measure, so the quiescent path costs no
- * settings read and no broker call. Never throws — see the file header.
+ * [min unmeasured etDay, today ET] — from EVERY production account on the
+ * roster (TRA-4295) — then (TRA-2959) import any broker fill the ledger is
+ * missing, and back-fill via the commission join (positive commissions only)
+ * and the gainloss derivation (TRA-2850) over the union of every account's
+ * lots. All writers rewrite the durable JSONL so the rows survive a redeploy.
+ * `buildClient` is invoked ONLY when there is something to measure, so the
+ * quiescent path costs no settings read and no broker call. Never throws — see
+ * the file header.
  */
 export async function runLiveOptionsFeeReconcile(
-  buildClient: () => Promise<FeeReconcileHistoryClient | null>,
+  buildClient: () => Promise<FeeReconcileClients>,
   now: number = Date.now(),
   /**
-   * ⭐ TRA-3977 — the BOOK whose Tradier account `buildClient` resolves. Every
-   * `history_import` row this pass mints is the broker's record of a fill on
-   * THAT account, and until this argument existed those rows landed in a
-   * process-global array shared by two live books with nothing saying whose
-   * they were. Absent ⇒ the rows are honestly UNATTRIBUTED and every oracle
-   * refuses to answer from them once a second book is known.
+   * ⭐ TRA-3977 — the BOOK whose Tradier account `buildClient` resolves, WHEN
+   * it resolves a bare single client. Every `history_import` row this pass
+   * mints is the broker's record of a fill on ONE account, and until this
+   * argument existed those rows landed in a process-global array shared by two
+   * live books with nothing saying whose they were. Absent ⇒ the rows are
+   * honestly UNATTRIBUTED and every oracle refuses to answer from them once a
+   * second book is known. Ignored when the factory returns a
+   * {@link FeeReconcileAccount} roster — each account carries its own book.
    */
   book: string | null = null,
 ): Promise<LiveOptionsFeeReconcileState> {
@@ -521,14 +584,18 @@ export async function runLiveOptionsFeeReconcile(
   state.attempts += 1;
   state.lastAttemptAt = now;
 
-  let client: FeeReconcileHistoryClient | null = null;
+  let resolved: FeeReconcileClients = null;
   try {
-    client = await buildClient();
+    resolved = await buildClient();
   } catch (err) {
     state.lastError = err instanceof Error ? err.message : String(err);
-    client = null;
+    resolved = null;
   }
-  if (client === null) {
+  // TRA-4295 — normalize to a roster: a bare client is a one-account roster
+  // under the legacy `book` argument.
+  const accounts: FeeReconcileAccount[] =
+    resolved === null ? [] : Array.isArray(resolved) ? resolved : [{ book, client: resolved }];
+  if (accounts.length === 0) {
     state.lastOutcome = 'no-client';
     log.warn('live-options fee reconcile: no production client — rows stay unmeasured', {
       unmeasured: unmeasured.length,
@@ -549,92 +616,175 @@ export async function runLiveOptionsFeeReconcile(
   const end = today >= start ? today : start;
   state.lastWindow = { start, end };
 
-  // Fetch the two sources INDEPENDENTLY — the gainloss derivation is the one that
-  // measures real production fees (TRA-2850), so a history outage must not stop it.
-  let historyFills: TradierTradeHistoryFill[] | null = null;
-  let historyError: string | null = null;
-  try {
-    historyFills = await client.listAccountHistory({ start, end, type: 'trade', limit: 2000 });
-  } catch (err) {
-    historyError = err instanceof Error ? err.message : String(err);
+  // TRA-4295 — fetch every source on every account INDEPENDENTLY: the gainloss
+  // derivation is the one that measures real production fees (TRA-2850), so a
+  // history outage must not stop it, and one account's outage must not stop a
+  // sibling's reconcile.
+  interface AccountFetch {
+    book: string | null;
+    historyFills: TradierTradeHistoryFill[] | null;
+    historyError: string | null;
+    lots: TradierGainLossLot[] | null;
+    gainLossError: string | null;
+    coverage: LedgerCoverageResult | null;
   }
-  let lots: TradierGainLossLot[] | null = null;
-  let gainLossError: string | null = null;
-  try {
-    lots = await client.listGainLoss({ start, end, limit: 2000 });
-  } catch (err) {
-    gainLossError = err instanceof Error ? err.message : String(err);
+  const fetches: AccountFetch[] = [];
+  for (const account of accounts) {
+    const f: AccountFetch = {
+      book: account.book,
+      historyFills: null,
+      historyError: null,
+      lots: null,
+      gainLossError: null,
+      coverage: null,
+    };
+    try {
+      f.historyFills = await account.client.listAccountHistory({ start, end, type: 'trade', limit: 2000 });
+    } catch (err) {
+      f.historyError = err instanceof Error ? err.message : String(err);
+    }
+    try {
+      f.lots = await account.client.listGainLoss({ start, end, limit: 2000 });
+    } catch (err) {
+      f.gainLossError = err instanceof Error ? err.message : String(err);
+    }
+    fetches.push(f);
   }
+  // Every fetch error, per account and per source — a partial fetch failure is
+  // still a failure and the state must never self-report cleaner than it ran.
+  const label = (b: string | null, source: string): string => (b === null ? source : `${b} ${source}`);
+  const fetchErrors = fetches.flatMap((f) => [
+    ...(f.historyError !== null ? [`${label(f.book, 'history')}: ${f.historyError}`] : []),
+    ...(f.gainLossError !== null ? [`${label(f.book, 'gainloss')}: ${f.gainLossError}`] : []),
+  ]);
 
-  if (historyFills === null && lots === null) {
+  if (fetches.every((f) => f.historyFills === null && f.lots === null)) {
     state.lastOutcome = 'fetch-failed';
-    state.lastError = `history: ${historyError} | gainloss: ${gainLossError}`;
-    log.warn('live-options fee reconcile: both broker fetches failed', {
+    state.lastError = fetchErrors.join(' | ');
+    log.warn('live-options fee reconcile: every broker fetch failed on every account', {
       start,
       end,
-      historyError,
-      gainLossError,
+      errors: fetchErrors,
     });
     return getLiveOptionsFeeReconcileState();
   }
 
   let updated = 0;
   let gainLossUpdated = 0;
-  if (historyFills !== null) {
-    // TRA-2959 — coverage cross-check FIRST, so a fill no chokepoint recorded
-    // becomes a ledger row before the fee joins run (a missing row otherwise
-    // breaks its whole symbol/day/side group's qty reconciliation in the
-    // gainloss join — one silent fill poisoned the group's fees too).
-    const coverage = importMissingLiveOptionFills(historyFills, today, book);
-    state.coverage = coverage;
-    state.totalImportedRows += coverage.importedRows;
-    // TRA-3563 — then RE-PRICE any imported row the old attribution minted at a
-    // sibling execution's price. It runs AFTER the import (which establishes the
-    // contract coverage the repair requires) and BEFORE the fee joins, so a
-    // repaired price is the one the gainloss derivation reconciles against on
-    // this same pass. It is NOT counted in `updated`: that counter means "rows
-    // that gained a fee", and a pass that only fixed a price must not report
-    // 'backfilled'.
-    const repriced = repriceImportedLiveOptionFills(historyFills);
-    state.lastImportPriceRepairs = repriced.repairs;
-    state.totalImportPriceRepairs += repriced.repairs.length;
-    updated += backfillLiveOptionFees(historyFills).updated;
-    state.lastHistoryFills = historyFills.length;
-    // Mirror the join's ACTUAL eligibility (incl. commission > 0) — a diagnostic
-    // that counts fills the join is required to skip advertises progress that
-    // cannot happen (the TRA-2850 "14 joinable, 0 updated forever" shape).
-    state.lastJoinableCount = historyFills.filter(
-      (f) => f.tradeType === 'option'
-        && historyFillSide(f.description, f.amount) !== null
-        && typeof f.quantity === 'number' && Number.isFinite(f.quantity) && f.quantity > 0
-        && typeof f.commission === 'number' && Number.isFinite(f.commission) && f.commission > 0,
-    ).length;
-    // Take fills from the raw array BEFORE the join filters them — include fills
-    // regardless of tradeType/side so we can diagnose filter drops.
-    state.lastHistorySample = historyFills.slice(0, HISTORY_SAMPLE_MAX).map((f) => ({
-      symbol: f.symbol,
-      date: f.date,
-      description: f.description.slice(0, 80), // truncate long descriptions
-      orderId: f.orderId,
-      commission: f.commission,
-      price: f.price,
-      quantity: f.quantity,
-    }));
+  const anyHistory = fetches.some((f) => f.historyFills !== null);
+  if (anyHistory) {
+    let historyTotal = 0;
+    const coverageFold = {
+      brokerContracts: 0,
+      ledgerContracts: 0,
+      missingContracts: 0,
+      importedRows: 0,
+      comparedContracts: 0,
+      sameDayContractsExcluded: 0,
+    };
+    const historySample: NonNullable<LiveOptionsFeeReconcileState['lastHistorySample']> = [];
+    const repairs: ImportedPriceRepair[] = [];
+    let joinable = 0;
+    for (const f of fetches) {
+      if (f.historyFills === null) continue;
+      const historyFills = f.historyFills;
+      // TRA-2959 — coverage cross-check FIRST, so a fill no chokepoint recorded
+      // becomes a ledger row before the fee joins run (a missing row otherwise
+      // breaks its whole symbol/day/side group's qty reconciliation in the
+      // gainloss join — one silent fill poisoned the group's fees too). Per
+      // account, so every imported row carries the book whose account the
+      // history was actually fetched from (TRA-3977/TRA-4295).
+      const coverage = importMissingLiveOptionFills(historyFills, today, f.book);
+      f.coverage = coverage;
+      coverageFold.brokerContracts += coverage.brokerContracts;
+      coverageFold.ledgerContracts += coverage.ledgerContracts;
+      coverageFold.missingContracts += coverage.missingContracts;
+      coverageFold.importedRows += coverage.importedRows;
+      coverageFold.comparedContracts += coverage.comparedContracts;
+      coverageFold.sameDayContractsExcluded += coverage.sameDayContractsExcluded;
+      state.totalImportedRows += coverage.importedRows;
+      // TRA-3563 — then RE-PRICE any imported row the old attribution minted at a
+      // sibling execution's price. It runs AFTER the import (which establishes the
+      // contract coverage the repair requires) and BEFORE the fee joins, so a
+      // repaired price is the one the gainloss derivation reconciles against on
+      // this same pass. It is NOT counted in `updated`: that counter means "rows
+      // that gained a fee", and a pass that only fixed a price must not report
+      // 'backfilled'.
+      const repriced = repriceImportedLiveOptionFills(historyFills);
+      repairs.push(...repriced.repairs);
+      state.totalImportPriceRepairs += repriced.repairs.length;
+      updated += backfillLiveOptionFees(historyFills).updated;
+      historyTotal += historyFills.length;
+      // Mirror the join's ACTUAL eligibility (incl. commission > 0) — a diagnostic
+      // that counts fills the join is required to skip advertises progress that
+      // cannot happen (the TRA-2850 "14 joinable, 0 updated forever" shape).
+      joinable += historyFills.filter(
+        (h) => h.tradeType === 'option'
+          && historyFillSide(h.description, h.amount) !== null
+          && typeof h.quantity === 'number' && Number.isFinite(h.quantity) && h.quantity > 0
+          && typeof h.commission === 'number' && Number.isFinite(h.commission) && h.commission > 0,
+      ).length;
+      // Take fills from the raw array BEFORE the join filters them — include fills
+      // regardless of tradeType/side so we can diagnose filter drops.
+      for (const h of historyFills) {
+        if (historySample.length >= HISTORY_SAMPLE_MAX) break;
+        historySample.push({
+          symbol: h.symbol,
+          date: h.date,
+          description: h.description.slice(0, 80), // truncate long descriptions
+          orderId: h.orderId,
+          commission: h.commission,
+          price: h.price,
+          quantity: h.quantity,
+          book: f.book,
+        });
+      }
+    }
+    state.lastHistoryFills = historyTotal;
+    state.lastHistorySample = historySample;
+    state.lastJoinableCount = joinable;
+    state.lastImportPriceRepairs = repairs;
+    state.coverage = {
+      ...coverageFold,
+      verdict:
+        coverageFold.comparedContracts === 0
+          ? 'unmeasured'
+          : coverageFold.missingContracts > 0
+            ? 'missing'
+            : 'complete',
+    };
   }
-  if (lots !== null) {
-    const gainLoss = backfillLiveOptionFeesFromGainLoss(lots);
+  const anyGainLoss = fetches.some((f) => f.lots !== null);
+  if (anyGainLoss) {
+    // TRA-4295 — the join runs ONCE over the UNION of every account's lots.
+    // Each (symbol, day, side) group's lots settle in exactly one account, so
+    // the union finds them wherever they live — including for `book: null`
+    // legacy rows no static attribution could route to an account. `lotBooks`
+    // rides along index-parallel so the published sample can still say which
+    // account each lot came from.
+    const unionLots: TradierGainLossLot[] = [];
+    const lotBooks: Array<string | null> = [];
+    for (const f of fetches) {
+      if (f.lots === null) continue;
+      for (const l of f.lots) {
+        unionLots.push(l);
+        lotBooks.push(f.book);
+      }
+    }
+    const gainLoss = backfillLiveOptionFeesFromGainLoss(unionLots);
     gainLossUpdated = gainLoss.updated;
     updated += gainLossUpdated;
-    state.lastGainLossLots = lots.length;
+    state.lastGainLossLots = unionLots.length;
     // TRA-3558 — the RAW lots, before any filter or key derivation, so an ABSENT
     // lot is distinguishable from a MIS-KEYED one without source access.
-    state.lastGainLossSample = lots.slice(0, GAINLOSS_SAMPLE_MAX).map((l) => ({
+    state.lastGainLossSample = unionLots.slice(0, GAINLOSS_SAMPLE_MAX).map((l, i) => ({
       symbol: l.symbol,
       quantity: l.quantity,
       cost: l.cost,
       proceeds: l.proceeds,
       openDate: l.openDate,
       closeDate: l.closeDate,
+      book: lotBooks[i]!,
     }));
     state.lastGainLossRejections = gainLoss.rejections.slice(0, GAINLOSS_REJECTION_MAX);
     // Counted over ALL rejections, not the published slice — a truncated list
@@ -651,19 +801,26 @@ export async function runLiveOptionsFeeReconcile(
     state.lastGainLossPrefixRepairs = gainLoss.prefixRepairs;
     // TRA-4143 — day-trade detection off the broker's OWN lot pairing. Runs on
     // the raw lots (pre-filter, pre-join): a lot the fee join rejects is still a
-    // round trip the account performed.
-    const dayTrades = detectPdtDayTradeLots(lots);
+    // round trip the account performed. Per account — PDT is enforced per
+    // account, and the warn key carries the book so two accounts' identical
+    // round trips cannot deduplicate each other.
+    const dayTrades: Array<{ lot: TradierGainLossLot; book: string | null }> = [];
+    for (const f of fetches) {
+      if (f.lots === null) continue;
+      for (const lot of detectPdtDayTradeLots(f.lots)) dayTrades.push({ lot, book: f.book });
+    }
     state.lastPdtDayTradeCount = dayTrades.length;
-    state.lastPdtDayTradeLots = dayTrades.slice(0, PDT_DAY_TRADE_SAMPLE_MAX).map((l) => ({
+    state.lastPdtDayTradeLots = dayTrades.slice(0, PDT_DAY_TRADE_SAMPLE_MAX).map(({ lot: l, book: b }) => ({
       symbol: l.symbol,
       quantity: l.quantity,
       cost: l.cost,
       proceeds: l.proceeds,
       openDate: l.openDate,
       closeDate: l.closeDate,
+      book: b,
     }));
-    const unseen = dayTrades.filter((l) => {
-      const key = `${l.symbol}|${l.openDate.slice(0, 10)}|${l.closeDate.slice(0, 10)}|${l.quantity}|${l.cost}|${l.proceeds}`;
+    const unseen = dayTrades.filter(({ lot: l, book: b }) => {
+      const key = `${b ?? ''}|${l.symbol}|${l.openDate.slice(0, 10)}|${l.closeDate.slice(0, 10)}|${l.quantity}|${l.cost}|${l.proceeds}`;
       if (warnedPdtDayTradeKeys.has(key)) return false;
       warnedPdtDayTradeKeys.add(key);
       return true;
@@ -677,7 +834,8 @@ export async function runLiveOptionsFeeReconcile(
         'live-options PDT DAY TRADE at the broker — same-day round trip on a live lot (TRA-4143)',
         {
           dayTrades: unseen.map(
-            (l) => `${l.symbol} ${l.openDate.slice(0, 10)} x${l.quantity} cost ${l.cost} proceeds ${l.proceeds}`,
+            ({ lot: l, book: b }) =>
+              `${b ?? 'unattributed'} ${l.symbol} ${l.openDate.slice(0, 10)} x${l.quantity} cost ${l.cost} proceeds ${l.proceeds}`,
           ),
           totalInWindow: dayTrades.length,
           window: { start, end },
@@ -685,9 +843,17 @@ export async function runLiveOptionsFeeReconcile(
       );
     }
   }
+  state.lastAccounts = fetches.map((f) => ({
+    book: f.book,
+    historyFills: f.historyFills === null ? null : f.historyFills.length,
+    gainLossLots: f.lots === null ? null : f.lots.length,
+    historyError: f.historyError,
+    gainLossError: f.gainLossError,
+    coverage: f.coverage,
+  }));
 
   state.lastUpdated = updated;
-  state.lastGainLossUpdated = lots !== null ? gainLossUpdated : null;
+  state.lastGainLossUpdated = anyGainLoss ? gainLossUpdated : null;
   state.totalUpdated += updated;
   // TRA-2959 — re-partition AFTER import + joins: imports add unmeasured rows,
   // joins remove them. `stalled` keys on the ACTIONABLE population only — rows
@@ -710,14 +876,18 @@ export async function runLiveOptionsFeeReconcile(
   state.consecutiveNoMatch = state.lastOutcome === 'no-match' ? state.consecutiveNoMatch + 1 : 0;
   state.stalled = state.consecutiveNoMatch >= STALLED_AFTER_NO_MATCH;
   // A partial fetch failure is still a failure — record it even when the other
-  // source produced an outcome, so the state never self-reports cleaner than it ran.
-  state.lastError = historyError ?? gainLossError ?? null;
+  // fetches produced an outcome, so the state never self-reports cleaner than it
+  // ran. TRA-4295 — every failed fetch is named, per account and per source.
+  state.lastError = fetchErrors.length > 0 ? fetchErrors.join(' | ') : null;
   const summary = summarizeLiveOptionsFeeSlippage();
   const logFields = {
     outcome: state.lastOutcome,
     window: { start, end },
-    historyFills: historyFills?.length ?? null,
-    gainLossLots: lots?.length ?? null,
+    historyFills: state.lastHistoryFills,
+    gainLossLots: state.lastGainLossLots,
+    accounts: (state.lastAccounts ?? []).map(
+      (a) => `${a.book ?? 'unattributed'}: history ${a.historyFills ?? 'FAILED'} / gainloss ${a.gainLossLots ?? 'FAILED'}`,
+    ),
     updated,
     gainLossUpdated: state.lastGainLossUpdated,
     feesMeasured: summary.feesMeasured,
