@@ -808,6 +808,133 @@ describe('gainloss join rejection reasons (TRA-3558)', () => {
   });
 });
 
+describe('gainloss wash-sale basis recovery (TRA-4408)', () => {
+  // The live 2026-09-09 residue, real numbers: Tradier's `/gainloss` reports
+  // the TAX basis — a lot bought back inside the wash window carries the
+  // sibling's disallowed loss ADDED to its cost, so the open-side derivation
+  // reads fee ≈ loss and the sanity bound (correctly) refuses it forever.
+  function washRow(over: Partial<LiveOptionFillRecord> = {}): LiveOptionFillRecord {
+    return {
+      mode: 'live', ts: 1000, etDay: '2026-08-20', sleeve: 'single_leg_otm',
+      book: null,
+      optionSymbol: 'BAC260925C00063000', side: 'buy_to_open', contracts: 1,
+      submittedLimit: null, askAtSubmit: null, midAtSubmit: null, filledPrice: 1.65,
+      fees: null, feeSource: null, slippageVsAsk: null, slippageVsMid: null,
+      orderId: null, origin: 'fill',
+      ...over,
+    };
+  }
+  function washLot(over: Partial<TradierGainLossLot> = {}): TradierGainLossLot {
+    return {
+      symbol: 'BAC260925C00063000',
+      quantity: 1,
+      cost: 165.11,
+      proceeds: 90.87,
+      gainLoss: -74.24,
+      openDate: '2026-08-20',
+      closeDate: '2026-08-21',
+      ...over,
+    };
+  }
+
+  it('recovers the fee when exactly ONE same-symbol realized loss bridges it into the bound (live BAC shape)', () => {
+    const rows = [
+      washRow({ ts: 1, filledPrice: 1.65 }),
+      washRow({ ts: 2, filledPrice: 1.17, origin: 'history_import' }),
+    ];
+    // Lot A closed 08-21 at a 74.24 loss; lot B's cost is the 1.17 execution
+    // (117.11 with its real fee) PLUS that disallowed loss = 191.35.
+    const lots = [
+      washLot(), // loss lot: 165.11 → 90.87
+      washLot({ cost: 191.35, proceeds: 113.87, gainLoss: -77.48, closeDate: '2026-08-24' }),
+    ];
+    const r = reconcileLedgerFeesFromGainLoss(rows, lots);
+    expect(r.rejections).toEqual([]);
+    expect(r.updated).toBe(2);
+    for (const rec of r.records) {
+      expect(rec.fees).toBeCloseTo(0.11, 6); // the fee every other measured open carries
+      expect(rec.feeSource).toBe('gainloss_derived');
+    }
+    expect(r.washRepairs).toEqual([
+      {
+        symbol: 'BAC260925C00063000',
+        day: '2026-08-20',
+        side: 'buy_to_open',
+        contracts: 2,
+        rawDerived: 74.46, // (165.11 + 191.35) − (165 + 117)
+        washAdjustment: 74.24,
+        fee: 0.22,
+        lossCloseDays: ['2026-08-21'],
+      },
+    ]);
+  });
+
+  it('the loss lot may sit INSIDE the group being repaired (live NOK shape — both lots same open day)', () => {
+    const rows = [
+      washRow({ ts: 1, optionSymbol: 'NOK261002C00010500', etDay: '2026-08-28', filledPrice: 0.73 }),
+      washRow({ ts: 2, optionSymbol: 'NOK261002C00010500', etDay: '2026-08-28', filledPrice: 0.57, origin: 'history_import' }),
+    ];
+    const lots = [
+      // Both opened 08-28, both closed 09-02. The 0.73 lot lost 39.24; that
+      // loss washed onto the 0.57 sibling: 57.11 + 39.24 = 96.35.
+      washLot({ symbol: 'NOK261002C00010500', cost: 73.11, proceeds: 33.87, gainLoss: -39.24, openDate: '2026-08-28', closeDate: '2026-09-02' }),
+      washLot({ symbol: 'NOK261002C00010500', cost: 96.35, proceeds: 33.87, gainLoss: -62.48, openDate: '2026-08-28', closeDate: '2026-09-02' }),
+    ];
+    const r = reconcileLedgerFeesFromGainLoss(rows, lots);
+    expect(r.rejections).toEqual([]);
+    expect(r.updated).toBe(2);
+    for (const rec of r.records) expect(rec.fees).toBeCloseTo(0.11, 6);
+    expect(r.washRepairs).toHaveLength(1);
+    expect(r.washRepairs[0]!.rawDerived).toBeCloseTo(39.46, 6);
+    expect(r.washRepairs[0]!.washAdjustment).toBeCloseTo(39.24, 6);
+    expect(r.washRepairs[0]!.fee).toBeCloseTo(0.22, 6);
+  });
+
+  it('refuses when MULTIPLE candidate adjustments land in-bound — ambiguity is a rejection, not a choice', () => {
+    const rows = [
+      washRow({ ts: 1, filledPrice: 1.65 }),
+      washRow({ ts: 2, filledPrice: 1.17 }),
+    ];
+    const lots = [
+      washLot(), // loss 74.24 → candidate fee 0.22 (group fee 74.46 = 356.46 − 282)
+      washLot({ cost: 191.35, proceeds: 117.25, gainLoss: -74.1, closeDate: '2026-08-24' }), // loss 74.10 → candidate fee 0.36
+    ];
+    const r = reconcileLedgerFeesFromGainLoss(rows, lots);
+    expect(r.updated).toBe(0);
+    expect(r.washRepairs).toEqual([]);
+    expect(r.rejections.map((x) => x.reason)).toEqual(['above-bound']);
+    expect(r.rejections[0]!.detail).toContain('MULTIPLE candidate adjustments');
+  });
+
+  it('a loss closed OUTSIDE the wash window is not a candidate', () => {
+    const rows = [washRow({ ts: 1, filledPrice: 1.17 })];
+    const lots = [
+      washLot({ cost: 191.35, proceeds: 113.87, closeDate: '2026-08-24' }), // group lot, wash-adjusted
+      washLot({ openDate: '2026-06-01', closeDate: '2026-06-02' }), // loss 74.24, 79 days before the open
+    ];
+    const r = reconcileLedgerFeesFromGainLoss(rows, lots);
+    expect(r.updated).toBe(0);
+    expect(r.washRepairs).toEqual([]);
+    expect(r.rejections.map((x) => x.reason)).toEqual(['above-bound']);
+  });
+
+  it('never applies to a CLOSE-side group — proceeds are reported raw, an above-bound close stays rejected', () => {
+    const rows = [
+      washRow({ ts: 1, side: 'sell_to_close', etDay: '2026-08-21', filledPrice: 1.65 }),
+    ];
+    const lots = [
+      // Close-side derivation: 165.00 − 90.87 = 74.13 — way above bound. The
+      // same-symbol loss (74.00) would bridge it to 0.13; it must not.
+      washLot({ proceeds: 90.87 }),
+      washLot({ cost: 190.87, proceeds: 116.87, gainLoss: -74.0, openDate: '2026-08-19', closeDate: '2026-08-20' }),
+    ];
+    const r = reconcileLedgerFeesFromGainLoss(rows, lots);
+    expect(r.updated).toBe(0);
+    expect(r.washRepairs).toEqual([]);
+    expect(r.rejections.map((x) => x.reason)).toEqual(['above-bound']);
+  });
+});
+
 describe('diffMissingFillsFromHistory (TRA-2959)', () => {
   function rec(over: Partial<LiveOptionFillRecord>): LiveOptionFillRecord {
     return {

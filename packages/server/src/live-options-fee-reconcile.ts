@@ -65,10 +65,12 @@ import {
   backfillLiveOptionFees,
   backfillLiveOptionFeesFromGainLoss,
   importMissingLiveOptionFills,
+  ledgerCoverageAgainstHistory,
   repriceImportedLiveOptionFills,
   summarizeLiveOptionsFeeSlippage,
   historyFillSide,
   type GainLossPrefixRepair,
+  type GainLossWashRepair,
   type ImportedPriceRepair,
   type GainLossRejection,
   type GainLossRejectionReason,
@@ -184,6 +186,13 @@ export type FeeReconcileClients = FeeReconcileHistoryClient | FeeReconcileAccoun
  *   account will never report) or an open leg whose position has not closed
  *   yet (`unmeasuredAwaitingClose` — no lot EXISTS to derive from). Not
  *   evidence of a stall: does not feed `consecutiveNoMatch`.
+ * - 'residue'       — TRA-4408: data fetched, nothing joined, and every
+ *   actionable unmeasured row belongs to a group whose rejection is
+ *   DETERMINISTIC and IDENTICAL to the previous attempt's (same reason, same
+ *   operands — re-running the same arithmetic on the same inputs). Not
+ *   evidence of a stall: does not feed `consecutiveNoMatch`. Before this
+ *   outcome existed, 5 permanently-rejecting rows pinned `stalled: true`
+ *   forever — the alarm's own false-positive mode.
  * - 'no-client'     — no production Tradier options credentials resolvable for
  *   ANY account (or the client factory threw). Expected on boxes without live
  *   creds.
@@ -196,8 +205,27 @@ export type LiveOptionsFeeReconcileOutcome =
   | 'backfilled'
   | 'no-match'
   | 'no-actionable'
+  | 'residue'
   | 'no-client'
   | 'fetch-failed';
+
+/**
+ * TRA-4408 — the rejection reasons that are DETERMINISTIC given their inputs:
+ * lots and rows are both present and the join's own arithmetic refused them
+ * ('above-bound' / 'negative-fee' — a basis artifact; 'qty-mismatch' — totals
+ * that do not reconcile). When one of these repeats with identical operands on
+ * the next attempt, re-attempting is not evidence of a stall — the exact same
+ * refusal is guaranteed. 'no-lot' is deliberately EXCLUDED: an absent lot
+ * looks identical whether it is pending settlement or permanently missing,
+ * and the TRA-4295 incident (v0nni's account never fetched) was a no-lot
+ * streak — the one shape `stalled` must always catch. 'priceless-row' is
+ * excluded because the reprice pass can heal it between attempts.
+ */
+const DETERMINISTIC_REJECTION_REASONS: ReadonlySet<GainLossRejectionReason> = new Set([
+  'above-bound',
+  'negative-fee',
+  'qty-mismatch',
+]);
 
 /** Provenance for the health payload — see the file header on how to read it. */
 export interface LiveOptionsFeeReconcileState {
@@ -272,6 +300,15 @@ export interface LiveOptionsFeeReconcileState {
    */
   lastGainLossPrefixRepairs: GainLossPrefixRepair[] | null;
   /**
+   * TRA-4408 — open-side groups whose fee was recovered from under a
+   * wash-sale-adjusted `/gainloss` cost basis on the last pass. A fee written
+   * off an inferred broker adjustment must be visible: each entry carries the
+   * raw derivation the bound rejected, the loss subtracted, and the loss
+   * lot(s)' close day(s). Empty = no adjusted lots; null = no gainloss fetch
+   * has run.
+   */
+  lastGainLossWashRepairs: GainLossWashRepair[] | null;
+  /**
    * TRA-4143 — same-day live round trips (PDT day trades) in the last gainloss
    * fetch, per the BROKER'S OWN lot attribution: a settled `/gainloss` lot whose
    * `openDate` equals its `closeDate`. This is the ONE discriminator the
@@ -315,8 +352,10 @@ export interface LiveOptionsFeeReconcileState {
   totalUpdated: number;
   /**
    * TRA-2850 — consecutive attempts that ended 'no-match'. Reset by
-   * 'backfilled' / 'no-unmeasured'; carried across 'no-client'/'fetch-failed'
-   * (those attempts are not evidence either way).
+   * 'backfilled' / 'no-unmeasured' / 'no-actionable' / 'residue' (TRA-4408 —
+   * a fully-explained pass is a complete read, not stall evidence); carried
+   * across 'no-client'/'fetch-failed' (those attempts are not evidence either
+   * way).
    */
   consecutiveNoMatch: number;
   /**
@@ -363,11 +402,18 @@ export interface LiveOptionsFeeReconcileState {
    *   settled lot can exist for them yet, whatever their age.
    * - aged: past the horizon — named unmeasurable exclusion (the concrete
    *   population: fills predating the account migration).
+   * TRA-4408 adds a fourth bucket carved OUT of actionable:
+   * - residue: rows whose group was rejected for a DETERMINISTIC reason with
+   *   operands identical to the previous attempt's — re-attempting cannot
+   *   measure them, so they must not feed `consecutiveNoMatch`/`stalled`
+   *   either. Named and counted, never silent.
    */
   unmeasuredTotal: number;
   unmeasuredActionable: number;
   unmeasuredAwaitingClose: number;
   unmeasuredAged: number;
+  /** TRA-4408 — see the partition note above; rows in deterministically-rejected groups. */
+  unmeasuredResidue: number;
   /**
    * TRA-2959 — fill-coverage cross-check against broker account-history, the
    * independent denominator `durability.appendErrors` structurally lacks (a
@@ -376,8 +422,10 @@ export interface LiveOptionsFeeReconcileState {
    * `missingContracts > 0` means broker fills existed that NO code path
    * recorded; the same pass appends them as `origin: 'history_import'` rows,
    * so the gap both alarms and heals. Null until a history fetch has run.
-   * TRA-4295 — folded (summed) across every account whose history fetched;
-   * the per-account results live on `lastAccounts`.
+   * TRA-4408 — a UNION read across every account whose history fetched, each
+   * ledger row counted once (the TRA-4295 summed fold double-counted
+   * `book: null` rows in groups two accounts share); the per-account
+   * pre-import results live on `lastAccounts`.
    */
   coverage: LedgerCoverageResult | null;
   /** Rows imported from history since boot (cumulative across passes). */
@@ -412,6 +460,19 @@ let state: LiveOptionsFeeReconcileState = emptyState();
  */
 const warnedPdtDayTradeKeys = new Set<string>();
 
+/**
+ * TRA-4408 — fingerprints (group key + reason + operands) of the DETERMINISTIC
+ * rejections the previous gainloss join produced. A rejection present here that
+ * recurs identically is residue, not stall evidence. Updated only on attempts
+ * where the gainloss join actually ran — a failed fetch is not evidence the
+ * inputs changed, so it must not launder a repeat back into "new".
+ */
+let prevDeterministicRejections = new Set<string>();
+
+function rejectionFingerprint(r: GainLossRejection): string {
+  return `${r.symbol}|${r.day}|${r.side}|${r.reason}|${r.observed}|${r.expected}`;
+}
+
 function emptyState(): LiveOptionsFeeReconcileState {
   return {
     ticks: 0,
@@ -427,6 +488,7 @@ function emptyState(): LiveOptionsFeeReconcileState {
     lastGainLossRejections: null,
     lastGainLossRejectionCounts: null,
     lastGainLossPrefixRepairs: null,
+    lastGainLossWashRepairs: null,
     lastPdtDayTradeLots: null,
     lastPdtDayTradeCount: null,
     lastUpdated: null,
@@ -441,6 +503,7 @@ function emptyState(): LiveOptionsFeeReconcileState {
     unmeasuredActionable: 0,
     unmeasuredAwaitingClose: 0,
     unmeasuredAged: 0,
+    unmeasuredResidue: 0,
     coverage: null,
     totalImportedRows: 0,
     lastImportPriceRepairs: null,
@@ -452,6 +515,7 @@ function emptyState(): LiveOptionsFeeReconcileState {
 export function clearLiveOptionsFeeReconcileState(): void {
   state = emptyState();
   warnedPdtDayTradeKeys.clear();
+  prevDeterministicRejections = new Set();
 }
 
 /** Snapshot for the health payload (a copy — callers cannot mutate the pass). */
@@ -471,6 +535,10 @@ export function getLiveOptionsFeeReconcileState(): LiveOptionsFeeReconcileState 
       state.lastGainLossRejectionCounts === null ? null : { ...state.lastGainLossRejectionCounts },
     lastGainLossPrefixRepairs:
       state.lastGainLossPrefixRepairs === null ? null : state.lastGainLossPrefixRepairs.map((r) => ({ ...r })),
+    lastGainLossWashRepairs:
+      state.lastGainLossWashRepairs === null
+        ? null
+        : state.lastGainLossWashRepairs.map((r) => ({ ...r, lossCloseDays: [...r.lossCloseDays] })),
     lastPdtDayTradeLots:
       state.lastPdtDayTradeLots === null ? null : state.lastPdtDayTradeLots.map((l) => ({ ...l })),
     coverage: state.coverage === null ? null : { ...state.coverage },
@@ -568,6 +636,9 @@ export async function runLiveOptionsFeeReconcile(
   state.unmeasuredActionable = partition.actionable.length;
   state.unmeasuredAwaitingClose = partition.awaitingClose.length;
   state.unmeasuredAged = partition.aged.length;
+  // TRA-4408 — residue is confirmed per attempt by this pass's own join; until
+  // then the rows count as actionable (the honest, alarm-preserving direction).
+  state.unmeasuredResidue = 0;
   // TRA-2959 — the coverage cross-check must run even when every ledger row is
   // measured: the fill it exists to find is one the ledger does NOT contain, so
   // "nothing unmeasured" is not evidence there is nothing to do. Quench only
@@ -674,14 +745,9 @@ export async function runLiveOptionsFeeReconcile(
   const anyHistory = fetches.some((f) => f.historyFills !== null);
   if (anyHistory) {
     let historyTotal = 0;
-    const coverageFold = {
-      brokerContracts: 0,
-      ledgerContracts: 0,
-      missingContracts: 0,
-      importedRows: 0,
-      comparedContracts: 0,
-      sameDayContractsExcluded: 0,
-    };
+    let importedRowsThisPass = 0;
+    let missingContractsThisPass = 0;
+    const unionHistoryFills: TradierTradeHistoryFill[] = [];
     const historySample: NonNullable<LiveOptionsFeeReconcileState['lastHistorySample']> = [];
     const repairs: ImportedPriceRepair[] = [];
     let joinable = 0;
@@ -696,13 +762,10 @@ export async function runLiveOptionsFeeReconcile(
       // history was actually fetched from (TRA-3977/TRA-4295).
       const coverage = importMissingLiveOptionFills(historyFills, today, f.book);
       f.coverage = coverage;
-      coverageFold.brokerContracts += coverage.brokerContracts;
-      coverageFold.ledgerContracts += coverage.ledgerContracts;
-      coverageFold.missingContracts += coverage.missingContracts;
-      coverageFold.importedRows += coverage.importedRows;
-      coverageFold.comparedContracts += coverage.comparedContracts;
-      coverageFold.sameDayContractsExcluded += coverage.sameDayContractsExcluded;
+      importedRowsThisPass += coverage.importedRows;
+      missingContractsThisPass += coverage.missingContracts;
       state.totalImportedRows += coverage.importedRows;
+      unionHistoryFills.push(...historyFills);
       // TRA-3563 — then RE-PRICE any imported row the old attribution minted at a
       // sibling execution's price. It runs AFTER the import (which establishes the
       // contract coverage the repair requires) and BEFORE the fee joins, so a
@@ -744,17 +807,32 @@ export async function runLiveOptionsFeeReconcile(
     state.lastHistorySample = historySample;
     state.lastJoinableCount = joinable;
     state.lastImportPriceRepairs = repairs;
+    // TRA-4408 — the published contract totals are a UNION read (each ledger
+    // row counted once against the union of every account's history), not a
+    // per-account sum: summing double-counted `book: null` rows in groups two
+    // accounts share and manufactured a phantom "over-recorded" ledger (see
+    // {@link ledgerCoverageAgainstHistory}). `missingContracts`/`importedRows`
+    // keep their per-account-sum semantics — the gap FOUND this pass and the
+    // rows appended to heal it (a broker fill belongs to exactly one account,
+    // so those sums cannot double-count) — and the verdict keys on the found
+    // gap. Per-account (pre-import) coverage stays on `lastAccounts`.
+    const unionCoverage = ledgerCoverageAgainstHistory(unionHistoryFills, today);
     state.coverage = {
-      ...coverageFold,
+      ...unionCoverage,
+      missingContracts: missingContractsThisPass,
+      importedRows: importedRowsThisPass,
       verdict:
-        coverageFold.comparedContracts === 0
+        unionCoverage.comparedContracts === 0
           ? 'unmeasured'
-          : coverageFold.missingContracts > 0
+          : missingContractsThisPass > 0
             ? 'missing'
             : 'complete',
     };
   }
   const anyGainLoss = fetches.some((f) => f.lots !== null);
+  // TRA-4408 — the FULL (uncapped) rejection list of this pass's join, for the
+  // deterministic-residue detection below. Null when no gainloss join ran.
+  let gainLossRejections: GainLossRejection[] | null = null;
   if (anyGainLoss) {
     // TRA-4295 — the join runs ONCE over the UNION of every account's lots.
     // Each (symbol, day, side) group's lots settle in exactly one account, so
@@ -799,6 +877,18 @@ export async function runLiveOptionsFeeReconcile(
     for (const r of gainLoss.rejections) counts[r.reason] += 1;
     state.lastGainLossRejectionCounts = counts;
     state.lastGainLossPrefixRepairs = gainLoss.prefixRepairs;
+    state.lastGainLossWashRepairs = gainLoss.washRepairs;
+    gainLossRejections = gainLoss.rejections;
+    if (gainLoss.washRepairs.length > 0) {
+      // A fee written off an inferred broker basis adjustment must announce
+      // itself in the log as well as the state (TRA-4408).
+      log.warn('live-options fee reconcile recovered fee(s) from wash-sale-adjusted gainloss basis (TRA-4408)', {
+        washRepairs: gainLoss.washRepairs.map(
+          (r) =>
+            `${r.symbol} ${r.day} ${r.side} x${r.contracts}: raw ${r.rawDerived} − wash ${r.washAdjustment} = ${r.fee} (loss closed ${r.lossCloseDays.join(',')})`,
+        ),
+      });
+    }
     // TRA-4143 — day-trade detection off the broker's OWN lot pairing. Runs on
     // the raw lots (pre-filter, pre-join): a lot the fee join rejects is still a
     // round trip the account performed. Per account — PDT is enforced per
@@ -862,9 +952,31 @@ export async function runLiveOptionsFeeReconcile(
   const after = summarizeLiveOptionsFeeSlippage().records;
   partition = partitionUnmeasured(after, cutoffDay);
   state.unmeasuredTotal = after.filter((r) => r.fees === null).length;
-  state.unmeasuredActionable = partition.actionable.length;
   state.unmeasuredAwaitingClose = partition.awaitingClose.length;
   state.unmeasuredAged = partition.aged.length;
+  // TRA-4408 — carve the deterministic residue out of the actionable set: a
+  // group rejected 'above-bound'/'negative-fee'/'qty-mismatch' with operands
+  // IDENTICAL to the previous attempt's is re-running settled arithmetic, and
+  // its rows must not feed `consecutiveNoMatch` — before this, 5 such rows
+  // pinned `stalled: true` structurally. The first sighting of a rejection
+  // still counts as no-match (one honest warm-up tick, incl. across restarts);
+  // only a confirmed repeat is residue. Fingerprints update ONLY when a join
+  // ran — a failed fetch must not launder a repeat back into "new".
+  let residueGroupKeys = new Set<string>();
+  if (gainLossRejections !== null) {
+    const deterministic = gainLossRejections.filter((r) => DETERMINISTIC_REJECTION_REASONS.has(r.reason));
+    residueGroupKeys = new Set(
+      deterministic
+        .filter((r) => prevDeterministicRejections.has(rejectionFingerprint(r)))
+        .map((r) => `${r.symbol}|${r.day}|${r.side}`),
+    );
+    prevDeterministicRejections = new Set(deterministic.map(rejectionFingerprint));
+  }
+  const residueRows = partition.actionable.filter((r) =>
+    residueGroupKeys.has(`${r.optionSymbol}|${r.etDay}|${r.side}`),
+  );
+  state.unmeasuredActionable = partition.actionable.length - residueRows.length;
+  state.unmeasuredResidue = residueRows.length;
   state.lastOutcome =
     updated > 0
       ? 'backfilled'
@@ -872,7 +984,9 @@ export async function runLiveOptionsFeeReconcile(
         ? 'no-unmeasured'
         : state.unmeasuredActionable > 0
           ? 'no-match'
-          : 'no-actionable';
+          : residueRows.length > 0
+            ? 'residue'
+            : 'no-actionable';
   state.consecutiveNoMatch = state.lastOutcome === 'no-match' ? state.consecutiveNoMatch + 1 : 0;
   state.stalled = state.consecutiveNoMatch >= STALLED_AFTER_NO_MATCH;
   // A partial fetch failure is still a failure — record it even when the other
@@ -917,7 +1031,13 @@ export async function runLiveOptionsFeeReconcile(
       actionable: state.unmeasuredActionable,
       awaitingClose: state.unmeasuredAwaitingClose,
       aged: state.unmeasuredAged,
+      // TRA-4408 — deterministically-rejected rows, named so a 'residue'
+      // outcome is readable off the log line alone.
+      residue: state.unmeasuredResidue,
     },
+    washRepairs: (state.lastGainLossWashRepairs ?? []).map(
+      (r) => `${r.symbol} ${r.day} ${r.side}: raw ${r.rawDerived} − wash ${r.washAdjustment} = ${r.fee}`,
+    ),
   };
   if (state.stalled) {
     log.warn('live-options fee reconcile STALLED — repeated no-match, nothing ever written (TRA-2850)', logFields);

@@ -296,6 +296,10 @@ describe('live-options fee auto-reconcile (TRA-2810)', () => {
     const s3 = await runLiveOptionsFeeReconcile(async () => client, NOW + 7_200_000);
     expect(s3.consecutiveNoMatch).toBe(3);
     expect(s3.stalled).toBe(true);
+    // TRA-4408 — 'no-lot' repeats are NOT residue: an absent lot looks the same
+    // pending settlement as permanently missing (the TRA-4295 v0nni shape), so
+    // this streak must keep flipping the alarm.
+    expect(s3.unmeasuredResidue).toBe(0);
     // a successful back-fill clears it
     const { client: good } = fakeClient(
       [],
@@ -919,5 +923,159 @@ describe('multi-account roster reconcile (TRA-4295)', () => {
     // both call sites ride the roster factory
     const calls = src.match(/runLiveOptionsFeeReconcile\(\s*buildLiveFeeReconcileAccounts/g) ?? [];
     expect(calls.length).toBe(2);
+  });
+});
+
+// ── TRA-4408: deterministic residue must not pin `stalled` ───────────────────
+//
+// Live 2026-09-09: 5 rows in three above-bound groups (wash-sale-adjusted
+// gainloss basis) re-rejected identically every tick, and `consecutiveNoMatch`
+// climbed forever — the alarm TRA-4295 was filed on became a structural false
+// positive. A rejection that is deterministic given its inputs ('above-bound' /
+// 'negative-fee' / 'qty-mismatch') and IDENTICAL to the previous attempt's is
+// residue: named, counted, excluded from the actionable population — and NOT
+// stall evidence. 'no-lot' deliberately keeps feeding the streak (see the
+// stalled test above).
+
+describe('deterministic residue and wash recovery in the pass (TRA-4408)', () => {
+  /** An above-bound CLOSE group: gross 480 vs lot proceeds 400 → fee 80 ≫ 3.60 bound. */
+  const aboveBoundLots: TradierGainLossLot[] = [
+    { symbol: 'AAPL260904P00280000', quantity: 4, cost: 300, proceeds: 400, gainLoss: 100, openDate: '2026-07-28', closeDate: '2026-07-29' },
+  ];
+
+  it("an identical repeat of a deterministic rejection reads 'residue', not 'no-match' — stalled stays honest", async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    seedCloseFill({ etDay: '2026-07-29', ts: NOW - 86_400_000 });
+    const { client } = fakeClient([], aboveBoundLots);
+    const s1 = await runLiveOptionsFeeReconcile(async () => client, NOW);
+    // First sighting is still no-match: one honest warm-up tick.
+    expect(s1.lastOutcome).toBe('no-match');
+    expect(s1.consecutiveNoMatch).toBe(1);
+    expect(s1.unmeasuredResidue).toBe(0);
+    expect(s1.unmeasuredActionable).toBe(1);
+    const s2 = await runLiveOptionsFeeReconcile(async () => client, NOW + 3_600_000);
+    expect(s2.lastOutcome).toBe('residue');
+    expect(s2.consecutiveNoMatch).toBe(0);
+    expect(s2.unmeasuredResidue).toBe(1);
+    expect(s2.unmeasuredActionable).toBe(0);
+    // Four more ticks over the same residue: the pre-4408 pass read stalled
+    // here (streak 5); now the flag can only mean an UNEXPLAINED dry streak.
+    let s = s2;
+    for (let i = 2; i <= 5; i++) s = await runLiveOptionsFeeReconcile(async () => client, NOW + i * 3_600_000);
+    expect(s.lastOutcome).toBe('residue');
+    expect(s.consecutiveNoMatch).toBe(0);
+    expect(s.stalled).toBe(false);
+  });
+
+  it("changed operands are NEW evidence — the same group rejecting differently reverts to 'no-match'", async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    seedCloseFill({ etDay: '2026-07-29', ts: NOW - 86_400_000 });
+    const { client } = fakeClient([], aboveBoundLots);
+    await runLiveOptionsFeeReconcile(async () => client, NOW);
+    const s2 = await runLiveOptionsFeeReconcile(async () => client, NOW + 3_600_000);
+    expect(s2.lastOutcome).toBe('residue');
+    const { client: shifted } = fakeClient([], [
+      { ...aboveBoundLots[0]!, proceeds: 401 }, // fee 79, not 80 — different arithmetic
+    ]);
+    const s3 = await runLiveOptionsFeeReconcile(async () => shifted, NOW + 7_200_000);
+    expect(s3.lastOutcome).toBe('no-match');
+    expect(s3.consecutiveNoMatch).toBe(1);
+    expect(s3.unmeasuredResidue).toBe(0);
+  });
+
+  it("residue plus ONE fresh actionable row still reads 'no-match' — residue never buries live evidence", async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    seedCloseFill({ etDay: '2026-07-29', ts: NOW - 86_400_000 });
+    seedCloseFill({ etDay: '2026-07-29', ts: NOW - 86_300_000, optionSymbol: 'MSFT260904P00500000' }); // no lot ever
+    const { client } = fakeClient([], aboveBoundLots);
+    await runLiveOptionsFeeReconcile(async () => client, NOW);
+    const s2 = await runLiveOptionsFeeReconcile(async () => client, NOW + 3_600_000);
+    expect(s2.lastOutcome).toBe('no-match'); // the MSFT no-lot group is unexplained residue-wise
+    expect(s2.consecutiveNoMatch).toBe(2);
+    expect(s2.unmeasuredResidue).toBe(1); // ...but the AAPL residue is still named and carved out
+    expect(s2.unmeasuredActionable).toBe(1);
+  });
+
+  it('a wash-recovered group backfills through the pass and publishes lastGainLossWashRepairs', async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    seedOpenFill({ etDay: '2026-07-28', ts: NOW - 2 * 86_400_000 }); // 4 @ 1.04 → gross 416, fees null
+    seedCloseFill({ etDay: '2026-07-29', ts: NOW - 86_400_000, fees: 0.52 }); // close measured — open is actionable
+    const { client } = fakeClient([], [
+      // The lot's cost carries a 50.22 disallowed loss on top of the 0.22 real
+      // fee; its own realized loss is the unique in-bound bridge.
+      { symbol: 'AAPL260904P00280000', quantity: 4, cost: 466.44, proceeds: 416.22, gainLoss: -50.22, openDate: '2026-07-28', closeDate: '2026-07-29' },
+    ]);
+    const s = await runLiveOptionsFeeReconcile(async () => client, NOW);
+    expect(s.lastOutcome).toBe('backfilled');
+    expect(s.lastGainLossWashRepairs).toHaveLength(1);
+    expect(s.lastGainLossWashRepairs![0]).toMatchObject({
+      symbol: 'AAPL260904P00280000',
+      day: '2026-07-28',
+      side: 'buy_to_open',
+      washAdjustment: 50.22,
+      fee: 0.22,
+    });
+    const open = summarizeLiveOptionsFeeSlippage().records.find((r) => r.side === 'buy_to_open');
+    expect(open!.fees).toBeCloseTo(0.22, 6);
+    expect(open!.feeSource).toBe('gainloss_derived');
+  });
+
+  it('published coverage is a UNION read — book-null rows in a group two accounts share are counted once', async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    // The live NVTS261002C00012500 shape: 1 contract filled on EACH account,
+    // both ledger rows pre-attribution book:null and already measured.
+    for (const orderId of [111, 222]) {
+      recordLiveOptionFill({
+        ts: NOW - 86_400_000,
+        etDay: '2026-07-29',
+        sleeve: 'single_leg_otm',
+        optionSymbol: 'NVTS261002C00012500',
+        side: 'buy_to_open',
+        contracts: 1,
+        submittedLimit: 0.5,
+        askAtSubmit: 0.5,
+        midAtSubmit: 0.45,
+        filledPrice: 0.5,
+        fees: 0.11,
+        orderId,
+      });
+    }
+    const nvtsFill = (transactionId: string): TradierTradeHistoryFill => histFill({
+      date: '2026-07-29',
+      symbol: 'NVTS261002C00012500',
+      description: 'Buy to Open 1 NVTS261002C00012500 @ 0.50',
+      price: 0.5,
+      quantity: 1,
+      amount: -50,
+      commission: 0,
+      orderId: null,
+      transactionId,
+    });
+    const admin = fakeClient([nvtsFill('t-admin')]);
+    const v0nni = fakeClient([nvtsFill('t-v0nni')]);
+    const s = await runLiveOptionsFeeReconcile(
+      async () => [
+        { book: 'admin', client: admin.client },
+        { book: 'v0nni', client: v0nni.client },
+      ],
+      NOW,
+    );
+    // The pre-4408 summed fold read ledger 4 vs broker 2 here — "2 contracts
+    // over-recorded" against a ledger that exactly matches the broker. That
+    // phantom was cited as corroboration on TRA-4408's own filing.
+    expect(s.coverage).toEqual({
+      brokerContracts: 2,
+      ledgerContracts: 2,
+      missingContracts: 0,
+      importedRows: 0,
+      verdict: 'complete',
+      comparedContracts: 2,
+      sameDayContractsExcluded: 0,
+    });
+    // The per-account view keeps its documented ambiguity (null rows count for
+    // every account that traded the group) — it lives on lastAccounts only.
+    expect(s.lastAccounts![0]!.coverage).toMatchObject({ brokerContracts: 1, ledgerContracts: 2 });
+    // and no phantom import was minted by either account's diff
+    expect(summarizeLiveOptionsFeeSlippage().records.filter((r) => r.origin === 'history_import')).toEqual([]);
   });
 });

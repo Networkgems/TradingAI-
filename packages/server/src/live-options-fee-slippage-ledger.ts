@@ -2187,6 +2187,30 @@ export function reconcileLedgerFees(
 // The bound sits between the two populations, so it admits every plausible fee
 // and rejects every join artifact. Negative ⇒ the lot didn't come from these
 // fills ⇒ skip (null), never clamp.
+//
+// ── TRA-4408: WASH-SALE-ADJUSTED COST BASIS ──────────────────────────────────
+// Tradier's `/gainloss` reports the TAX basis, not the trade basis: when a lot
+// is closed at a loss and a substantially-identical lot is bought within the
+// wash window, the disallowed loss is ADDED to the replacement lot's `cost`.
+// Measured live 2026-09-09 on ***: three open-side groups (NOK/RIG/BAC) each
+// held one lot whose cost exceeded its execution gross by EXACTLY the realized
+// loss of a same-symbol lot closed within days — e.g. BAC260925C00063000:
+// replacement bought 08-20 @ $117.11, sibling lot closed 08-21 at a $74.24
+// loss, reported cost 117.11 + 74.24 = 191.35. The open-side derivation
+// (cost − gross) then reads fee ≈ loss and the sanity bound rejects it — the
+// bound working as designed, but the rows would sit unmeasured forever.
+//
+// The fee is still recoverable, because the adjustment is itself in the fetch:
+// the loss lot's raw cost/proceeds ARE reported (only the replacement's cost
+// is inflated). So for an above-bound OPEN-side group, subtract candidate
+// realized losses of same-symbol lots closed within the wash window; iff
+// EXACTLY ONE candidate lands the fee inside [0, bound], that is the fee (on
+// the live incident all three groups resolve to the $0.11/contract every
+// other measured open carries). Ambiguity or no candidate ⇒ reject exactly as
+// before — the recovery only ever narrows the rejection, never the bound.
+// Close-side groups are untouched: proceeds are reported fees-net and raw.
+// Every recovery is PUBLISHED as a {@link GainLossWashRepair} — a rewrite in
+// a money path must be visible, not merely correct.
 
 /** Per-contract ceiling a gainloss-derived fee must clear to be written (see above). */
 const GAINLOSS_FEE_MAX_PER_CONTRACT_USD = 0.9;
@@ -2260,6 +2284,30 @@ export interface GainLossPrefixRepair {
  */
 const TRUNCATED_OCC_SYMBOL = /^[A-Z]{1,6}\d{6}[CP]\d{0,7}$/;
 
+/**
+ * TRA-4408 — one open-side group whose fee was recovered from under a
+ * wash-sale-adjusted cost basis (see the section header). `rawDerived` is what
+ * the naive derivation read (the number the bound rejected), `washAdjustment`
+ * the disallowed loss subtracted, `fee` what was written. `lossCloseDays`
+ * names the ET close day(s) of the loss lot(s) whose realized loss supplied
+ * the adjustment — the reader's path to verifying it against the lot sample.
+ */
+export interface GainLossWashRepair {
+  symbol: string;
+  day: string;
+  side: LiveFillSide;
+  contracts: number;
+  rawDerived: number;
+  washAdjustment: number;
+  fee: number;
+  lossCloseDays: string[];
+}
+
+/** How close (in calendar days) a loss lot's close must sit to the group's open
+ * day to be a wash-sale adjustment candidate. The IRS window is ±30 days;
+ * 31 absorbs date-boundary noise without admitting unrelated history. */
+const WASH_SALE_WINDOW_DAYS = 31;
+
 /** {@link FeeBackfillResult} plus the named reason for every group that did NOT derive. */
 export interface GainLossBackfillResult extends FeeBackfillResult {
   /**
@@ -2274,6 +2322,12 @@ export interface GainLossBackfillResult extends FeeBackfillResult {
    * pass resolved it, which the reader is entitled to see.
    */
   prefixRepairs: GainLossPrefixRepair[];
+  /**
+   * TRA-4408 — open-side groups whose fee was recovered from under a
+   * wash-sale-adjusted cost basis this pass. Empty on a payload with no
+   * adjusted lots (the common case).
+   */
+  washRepairs: GainLossWashRepair[];
 }
 
 function round2(n: number): number {
@@ -2328,11 +2382,23 @@ export function reconcileLedgerFeesFromGainLoss(
     prefixRepairs.push({ lotSymbol: symbol, resolvedSymbol, day, side });
     return resolvedSymbol;
   };
+  // TRA-4408 — realized losses per (close-resolved) symbol: the wash-recovery
+  // candidates. Only closed lots appear in `/gainloss`, so `cost − proceeds > 0`
+  // IS the realized loss; the loss lot's own cost/proceeds are reported raw
+  // (only the REPLACEMENT lot's cost carries the adjustment).
+  const lossLotsBySymbol = new Map<string, Array<{ loss: number; closeDay: string }>>();
   for (const lot of lots) {
     const openSymbol = resolveLotSymbol(lot.symbol, lot.openDate, 'buy_to_open');
     const closeSymbol = resolveLotSymbol(lot.symbol, lot.closeDate, 'sell_to_close');
     addLot(feeMatchKey(openSymbol, lot.openDate, 'buy_to_open', 0), lot.quantity, lot.cost);
     addLot(feeMatchKey(closeSymbol, lot.closeDate, 'sell_to_close', 0), lot.quantity, lot.proceeds);
+    const loss = round2(lot.cost - lot.proceeds);
+    if (loss > 0) {
+      const entry = { loss, closeDay: lot.closeDate.slice(0, 10) };
+      const g = lossLotsBySymbol.get(closeSymbol);
+      if (g) g.push(entry);
+      else lossLotsBySymbol.set(closeSymbol, [entry]);
+    }
   }
 
   // ALL ledger rows per group — measured rows participate in the totals (their
@@ -2347,6 +2413,7 @@ export function reconcileLedgerFeesFromGainLoss(
 
   const feeByIndex = new Map<number, number>();
   const rejections: GainLossRejection[] = [];
+  const washRepairs: GainLossWashRepair[] = [];
   for (const [key, indices] of rowGroups) {
     const unmeasuredRows = indices.filter((i) => records[i]!.fees === null).length;
     if (unmeasuredRows === 0) continue; // nothing to measure — not a rejection
@@ -2427,20 +2494,68 @@ export function reconcileLedgerFeesFromGainLoss(
       continue;
     }
     const bound = round2(GAINLOSS_FEE_MAX_PER_CONTRACT_USD * rowQty);
+    let writeFee = groupFee;
     if (groupFee > bound) {
-      reject(
-        'above-bound',
-        groupFee,
-        bound,
-        `derived fee ${groupFee} exceeds the ${GAINLOSS_FEE_MAX_PER_CONTRACT_USD}/contract sanity bound (${bound} for ${rowQty} contract(s)) — a mis-pairing artifact, not a fee`,
-      );
-      continue;
+      // TRA-4408 — before rejecting an OPEN-side group, try the wash-sale
+      // recovery (see the section header): iff EXACTLY ONE candidate realized
+      // loss of a same-symbol lot closed inside the wash window lands the fee
+      // in [0, bound], the excess was the broker's basis adjustment, not a
+      // mis-pairing. Candidates are each single loss plus (when several) their
+      // sum — multiple same-symbol wash lots stack onto one replacement.
+      let recovered: { fee: number; adjustment: number; lossCloseDays: string[] } | null = null;
+      let ambiguous = false;
+      if (side === 'buy_to_open') {
+        const groupDayMs = Date.parse(first.etDay);
+        const eligible = (lossLotsBySymbol.get(first.optionSymbol) ?? []).filter(
+          (l) =>
+            Number.isFinite(groupDayMs)
+            && Number.isFinite(Date.parse(l.closeDay))
+            && Math.abs(Date.parse(l.closeDay) - groupDayMs) <= WASH_SALE_WINDOW_DAYS * 86_400_000,
+        );
+        const candidates: Array<{ fee: number; adjustment: number; lossCloseDays: string[] }> = [];
+        for (const l of eligible) {
+          const fee = round2(groupFee - l.loss);
+          if (fee >= 0 && fee <= bound) candidates.push({ fee, adjustment: l.loss, lossCloseDays: [l.closeDay] });
+        }
+        if (eligible.length > 1) {
+          const total = round2(eligible.reduce((s, l) => s + l.loss, 0));
+          const fee = round2(groupFee - total);
+          if (fee >= 0 && fee <= bound) {
+            candidates.push({ fee, adjustment: total, lossCloseDays: eligible.map((l) => l.closeDay) });
+          }
+        }
+        const distinctFees = new Set(candidates.map((c) => c.fee));
+        if (distinctFees.size === 1) recovered = candidates[0]!;
+        else if (distinctFees.size > 1) ambiguous = true;
+      }
+      if (recovered === null) {
+        reject(
+          'above-bound',
+          groupFee,
+          bound,
+          `derived fee ${groupFee} exceeds the ${GAINLOSS_FEE_MAX_PER_CONTRACT_USD}/contract sanity bound (${bound} for ${rowQty} contract(s)) — a mis-pairing artifact, not a fee${
+            ambiguous ? '; wash-sale recovery found MULTIPLE candidate adjustments and refused to choose (TRA-4408)' : ''
+          }`,
+        );
+        continue;
+      }
+      washRepairs.push({
+        symbol: first.optionSymbol,
+        day: first.etDay,
+        side,
+        contracts: rowQty,
+        rawDerived: groupFee,
+        washAdjustment: recovered.adjustment,
+        fee: recovered.fee,
+        lossCloseDays: recovered.lossCloseDays,
+      });
+      writeFee = recovered.fee;
     }
 
     for (const i of indices) {
       const r = records[i]!;
       if (r.fees !== null) continue; // keep an existing measurement
-      feeByIndex.set(i, round2((groupFee * r.contracts) / rowQty));
+      feeByIndex.set(i, round2((writeFee * r.contracts) / rowQty));
     }
   }
   // Most recent ET day first: the ACTIONABLE groups are the newest, and a
@@ -2454,7 +2569,7 @@ export function reconcileLedgerFeesFromGainLoss(
     }
     return toRecord(recordToInput(r));
   });
-  return { updated, records: out, rejections, prefixRepairs };
+  return { updated, records: out, rejections, prefixRepairs, washRepairs };
 }
 
 /** Swap a reconcile result into the store and, when rows changed, REWRITE the durable JSONL. */
@@ -2863,6 +2978,27 @@ function sleeveOfLastOpenIn(
  * appending one durable JSONL line per imported row (the same counted,
  * best-effort append semantics as a fill-time record).
  */
+/**
+ * TRA-4408 — coverage of the UNION of every account's history by the ledger,
+ * each ledger row counted ONCE. The per-account results this replaces as the
+ * publishable fold double-counted `book: null` rows: a (symbol, day, side)
+ * group with fills on TWO accounts (live NVTS261002C00012500, 1 contract on
+ * each of admin/v0nni, both rows pre-attribution `book: null`) had its ledger
+ * rows counted against BOTH accounts' broker qty, so the summed fold read
+ * ledgerContracts 40 vs brokerContracts 36 — "4 contracts over-recorded" —
+ * against a ledger that holds exactly the broker's 36. That phantom overage
+ * was cited as corroboration on TRA-4408's own filing. Read-only: computes
+ * the diff against the live store and discards its would-be imports (the
+ * per-account import pass remains the writer, since only it knows which
+ * account a missing fill belongs to).
+ */
+export function ledgerCoverageAgainstHistory(
+  historyFills: readonly TradierTradeHistoryFill[],
+  todayEt: string,
+): LedgerCoverageResult {
+  return diffMissingFillsFromHistory(fills, historyFills, todayEt, null).coverage;
+}
+
 export function importMissingLiveOptionFills(
   historyFills: readonly TradierTradeHistoryFill[],
   todayEt: string,
