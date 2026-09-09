@@ -1,9 +1,31 @@
 # Swing setup taxonomy (A–E) + dislocation→confirmation sequencing — DESIGN
 
-**TRA-4421** · CTO · 2026-09-08 · DESIGN ONLY — no code lands before **2026-09-18** (TRA-4383 feature
-freeze, carrier TRA-4384; TRA-4385 is the freeze's only code exception).
+**TRA-4421** · CTO · 2026-09-08 · Spec source: board comment `031e6ff0` on TRA-4412
+(2026-09-09T02:17:52Z).
 
-Spec source: board comment `031e6ff0` on TRA-4412 (2026-09-09T02:17:52Z).
+> ## STATUS — 2026-09-09, two board actions and one shipped item
+>
+> **1. APPROVED.** Board card `70e36987` on plan rev 1 was **accepted 2026-09-09T12:50:48Z** by
+> `local-board`, clean — no counter-proposal, no reject reason. That ratifies **the build order 0→6**
+> and **the four §11 defaults**, which are now board policy rather than CTO preference.
+>
+> **2. UNFROZEN.** The header of this doc used to read *"DESIGN ONLY — no code lands before
+> 2026-09-18"*. Board comment `adaebaa2` on TRA-4412 (2026-09-09T11:13:38Z) — *"Unfreeze this,
+> authorize by the board to implement the tasks on this TRA-4412 ticket"* — overtook that. The
+> TRA-4383 freeze still stands for everything outside this family.
+>
+> **3. ⚠ ITEM 6 HAS ALREADY SHIPPED, and it takes a §5 net-new item with it.** LeadDev landed
+> `fdc9efab` *"cross-expiration term-structure RV pass + skew-coefficient export"* and `c442353d`
+> (shadow wiring + counters) under **TRA-4413**, whose item 4 was the same work. Verified by symbol,
+> not by commit message: `fitSkewCurves()` (`relative-value.ts:568`) exports the `{a,b,c}`
+> coefficients, and `findTermStructureDislocations()` (`:746`) implements §7's grouping verbatim.
+> ⇒ **§7 / item 6 are done, and setups A and B no longer carry any net-new quant at all.**
+>
+> **⛔ What the acceptance does NOT cover.** The card payload was written 03:28Z; the *fifth*
+> decision — that the enforce flip must relocate the refusal **below** `entry_window`, because an
+> enforcing gate above it would eat that gate's denominator — was discovered at 11:41Z, after. An
+> acceptance ratifies the payload it was asked about, not a comment appended later. That decision is
+> open and carried on **TRA-4422**.
 
 ---
 
@@ -116,10 +138,10 @@ the OTM open.
 
 ### Genuinely absent (the real net-new list)
 
-1. **Cross-EXPIRATION relative value** — `relative-value.ts:371` groups by `${expiration}|${type}`, so
-   nothing compares the same delta across expiries. (Board item #5.)
-2. **Term structure** — corollary of (1). (Board item #7.)
-3. **Relative strength vs a benchmark** — 0 symbols anywhere.
+1. ~~**Cross-EXPIRATION relative value**~~ — **SHIPPED 2026-09-09**, TRA-4413 `fdc9efab`.
+   `findTermStructureDislocations()` (`relative-value.ts:746`). (Board item #5.)
+2. ~~**Term structure**~~ — **SHIPPED** with (1), same commit. (Board item #7.)
+3. **Relative strength vs a benchmark** — 0 symbols anywhere. Still absent.
 4. **A reusable gap / gap-fill predicate** — the arithmetic exists inline in the news path; there is no
    shared detector and no gap-fill state.
 5. **IV-collapse (post-event crush) detector** — `iv-rank-archive` holds the history to compute it;
@@ -268,7 +290,7 @@ evaluated, blocked, byReasonCode }`. Grading rules that follow from prior incide
 |---|---|
 | ≥5% recent decline | ✓ closes |
 | elevated IV | ✓ `ivRankSync` |
-| steep put skew | ✓ `relative-value.ts` fit — **+ export the `{a,b,c}` coefficients** (currently internal to `findRelativeValueOpportunities`) |
+| steep put skew | ✓ **`fitSkewCurves()` — SHIPPED, TRA-4413 `fdc9efab`.** Was listed here as net-new; it no longer is |
 | at support | ✓ `supportResistance()` |
 | reversal confirmation | ✓ **`reversalChecklist()`, `side==='long'`, `score ≥ 3`** |
 
@@ -276,7 +298,7 @@ evaluated, blocked, byReasonCode }`. Grading rules that follow from prior incide
 | leg | primitive |
 |---|---|
 | ≥5–10% rally | ✓ closes |
-| rich call wing | ✓ skew fit (same coefficient export as A) |
+| rich call wing | ✓ `fitSkewCurves()` — SHIPPED (same export as A) |
 | at resistance | ✓ `supportResistance()` |
 | momentum divergence | ✓ **`rsiDivergence()`** |
 | breakdown confirmation | ✓ `reversalChecklist()`, `side==='short'` |
@@ -306,9 +328,15 @@ evaluated, blocked, byReasonCode }`. Grading rules that follow from prior incide
 | vol expansion | ✓ **`volumeConfirmedBreakout()`** + `atr` expansion |
 | option not yet repriced | ✓ **this is the existing mispricing leg** — see §6 |
 
-Net-new across all five: **six small pieces** (skew-coefficient export, gap predicate, gap-fill state,
-IV-collapse detector, relative strength, and the taxonomy/sequencer scaffolding). Not the greenfield the
-issue body implied.
+Net-new across all five, **as revised 2026-09-09**: the skew-coefficient export shipped with TRA-4413,
+so **four** small pieces remain (gap predicate, gap-fill state, IV-collapse detector, relative
+strength) plus the taxonomy/sequencer scaffolding — and a **seventh item the original list missed**:
+
+⚠ **A daily-bar source (TRA-4424).** Every setup here is a multi-day thesis, and the only series at
+the seam holds **~6.15 trading days** (2400 one-minute bars → ~480 five-minute bars). That passes
+every `length >= N` guard while answering a swing question with intraday structure. A/B's "≥5% recent
+decline / ≥5–10% rally", C's gap-and-crush, D's gap-fill and E's consolidation are all uncomputable
+on it. This is a **prerequisite**, not a nicety, and it blocks setup E (TRA-4423).
 
 ---
 
@@ -325,7 +353,13 @@ a different, and much weaker, object than "this contract satisfies both tests" �
 top-N lists is dominated by list length and is empty for reasons that have nothing to do with the
 contract. The predicate is evaluated on the nominee, after nomination, or not at all.
 
-## 7. Scope item 4 — cross-expiration RV and term structure
+## 7. Scope item 4 — cross-expiration RV and term structure ✅ SHIPPED 2026-09-09
+
+**Done, by LeadDev under TRA-4413 (`fdc9efab` + `c442353d`) — not by this programme.** The design
+below was implemented as written: `findTermStructureDislocations()` (`relative-value.ts:746`) groups
+`${type}|${deltaBucket}` across expiries, fits IV against `√T` and z-scores the residual, reusing the
+same machinery; `fitSkewCurves()` (`:568`) exports the `{a,b,c}` coefficients. Kept below as the
+record of what was specified. **Do not rebuild it** — grep `findTermStructureDislocations` first.
 
 `relative-value.ts:371` groups `${expiration}|${type}`. Add a **second pass** keyed
 `${type}|${deltaBucket}` **across** expiries, fitting IV against `√T` (or `log T`) and z-scoring the
@@ -375,7 +409,7 @@ Revised from the order in the TRA-4421 issue body, because §2 changed the inven
 | 3 | **A / B — Panic & Blow-Off Reversal** | **Moved up from the issue body's order.** They were ranked late on the belief we had no reversal-confirmation model. We do: `reversalChecklist()`. A/B now need only the skew-coefficient export and (B) `rsiDivergence`, both present. |
 | 4 | **D — Post-Earnings Reversal** | Needs gap-fill state, the least prior support of the five. |
 | 5 | **The sequencer** | Only meaningful once ≥2 setups exist; before that "detect → hold → confirm" collapses to "confirm". |
-| 6 | **Cross-expiry RV + term structure** | Independent of A–E; parallelisable to a different owner at any point. |
+| ~~6~~ | ~~**Cross-expiry RV + term structure**~~ ✅ **SHIPPED** | Was "parallelisable to a different owner at any point" — and that is exactly what happened: LeadDev landed it under TRA-4413 (`fdc9efab`) on 2026-09-09, before this order was ratified. |
 
 **Two changes from the issue body's stated order**, both consequences of §2: the instrument precedes E,
 and A/B move ahead of D.
@@ -399,10 +433,29 @@ Named explicitly so a reject can name one. Each is a policy call, not an enginee
 
 ---
 
-## 12. Acceptance
+## 12. Acceptance ✅ MET 2026-09-09
 
-- This document, approved by the board via a `request_confirmation` on the plan revision, **before** any
-  implementation subtask is created. Which setups to build, in what order, is a capital-allocation call.
-- On approval: implementation subtasks are created for item 0 and item 1 only, both blocked on the
-  2026-09-18 freeze lift (TRA-4384). Later items are filed as approval lands per setup.
-- No code before 2026-09-18.
+- ✅ This document, approved by the board via `request_confirmation` `70e36987` on plan rev 1 —
+  **accepted 2026-09-09T12:50:48Z**, clean. Which setups to build, in what order, was a
+  capital-allocation call and the board made it.
+- ✅ Implementation subtasks filed for **item 0** (**TRA-4422** — the instrument) and **item 1**
+  (**TRA-4423** — setup E), plus the prerequisite discovered while building item 0
+  (**TRA-4424** — the daily-bar source, which now also blocks TRA-4423).
+- ~~No code before 2026-09-18~~ — overtaken by the board's 11:13Z unfreeze of this family
+  (`adaebaa2` on TRA-4412). The TRA-4383 freeze stands everywhere else.
+
+### The remaining items are filed as approval lands per setup — this is deliberate
+
+Items **2 (C)**, **3 (A/B)**, **4 (D)** and **5 (the sequencer)** are ratified in the build order but
+are **not yet filed as issues**, and should not be. Each is downstream of a soak that has not started:
+item 0 is code-complete but **not deployed**, and item 1 is blocked on both. Filing four rows that
+cannot begin for a fortnight buys nothing and puts four stalled leaves on a queue.
+
+**The trigger to file item 2 is TRA-4423's observe-soak grade** (§9: `evaluated`/`blocked`/
+`byReasonCode`, the admit-set counterfactual, and the negative control). TRA-4423 carries that, and
+it is where the next filing decision belongs.
+
+⛔ **Before filing any of them, grep the symbol first.** Item 6 was ratified in the build order on
+2026-09-09 having already shipped four hours earlier under someone else's ticket. The same can happen
+to the gap predicate, the IV-collapse detector or relative strength — all four remaining net-new
+pieces sit in territory TRA-4413 is actively working.
