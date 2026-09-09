@@ -9,6 +9,9 @@ import {
   resolveSetupTaxonomySetups,
   evaluateOtmSetupGate,
   setupTaxonomyHealth,
+  scanWindowOpenMsSince,
+  SETUP_CONFIRMATION_EXPECT_ROWS_AFTER_OPEN_MS,
+  SETUP_CONFIRMATION_SCAN_WINDOW_MAX_LOOKBACK_MS,
   OTM_SETUP_TAXONOMY_MODE_DEFAULT,
 } from './otm-setup-gate.js';
 import {
@@ -310,5 +313,92 @@ describe('TRA-4422 — the gate is WIRED into the OTM open, in the load-bearing 
     // is PRESENT does not assert the intraday one is ABSENT, and a seam that
     // fetched both and scored the wrong one would pass the line above.
     expect(body).not.toMatch(/shadowCandleCache/);
+  });
+});
+
+/**
+ * TRA-4422 Finding 3 — the escalation term behind `crossCheck`.
+ *
+ * The guard shipped in Finding 2 told the reader to escalate when the box had
+ * been up for hours with `comparable` still false. Out of hours that rule is
+ * false BY CONSTRUCTION: the scan is gated on `isStockMarketOpen()`, so no row
+ * can be written and `comparable` cannot turn true however long the box runs.
+ * These controls pin the discriminator that separates the two.
+ */
+describe('setup_confirmation cross-check: in-window time, not uptime (TRA-4422 Finding 3)', () => {
+  // 2026-09-09 is a Wednesday; EDT, so RTH is 13:30Z-20:00Z.
+  const RTH_MID = Date.parse('2026-09-09T14:00:00Z');
+  const CLOSE = Date.parse('2026-09-09T20:00:00Z');
+
+  it('THE INCIDENT, REPRODUCED: booted after the close, hours of uptime, zero in-window time', () => {
+    // The real 2026-09-09 reading: boot 21:08:11Z, read 23:03Z, uptime 1.93h.
+    const start = Date.parse('2026-09-09T21:08:11.359Z');
+    const now = Date.parse('2026-09-09T23:03:00.000Z');
+    const w = scanWindowOpenMsSince(start, now);
+    expect(now - start).toBeGreaterThan(90 * 60_000); // hours of WALL-CLOCK uptime...
+    expect(w.openMsSinceStart).toBe(0);               // ...and no opportunity at all.
+    expect(w.marketOpenNow).toBe(false);
+    // ⛔ The whole point: this must NOT escalate.
+    expect(w.expectRows).toBe(false);
+  });
+
+  it('NEGATIVE CONTROL: in-window uptime past the threshold DOES escalate', () => {
+    // A guard that never opens would suppress a real "sleeve is not scanning"
+    // alarm forever and read exactly like a healthy box.
+    const w = scanWindowOpenMsSince(RTH_MID, RTH_MID + 40 * 60_000);
+    expect(w.marketOpenNow).toBe(true);
+    expect(w.openMsSinceStart).toBe(40 * 60_000);
+    expect(w.expectRows).toBe(true);
+  });
+
+  it('inside the session but below the threshold does not escalate yet', () => {
+    const w = scanWindowOpenMsSince(RTH_MID, RTH_MID + 6 * 60_000);
+    expect(w.marketOpenNow).toBe(true);
+    expect(w.openMsSinceStart).toBe(6 * 60_000);
+    expect(w.expectRows).toBe(false);
+  });
+
+  it('integrates only the in-window part of a span that straddles the close', () => {
+    // Boot 15 minutes before the close, read an hour after it: exactly 15
+    // minutes of opportunity, which is the threshold boundary.
+    const w = scanWindowOpenMsSince(CLOSE - 15 * 60_000, CLOSE + 60 * 60_000);
+    expect(w.openMsSinceStart).toBe(15 * 60_000);
+    expect(w.marketOpenNow).toBe(false);
+    expect(w.expectRows).toBe(true); // >= threshold, inclusive
+  });
+
+  it('a whole weekend of uptime accrues zero in-window time', () => {
+    const sat = Date.parse('2026-09-12T15:00:00Z');
+    const sun = Date.parse('2026-09-13T15:00:00Z');
+    const w = scanWindowOpenMsSince(sat, sun);
+    expect(sun - sat).toBe(24 * 60 * 60_000);
+    expect(w.openMsSinceStart).toBe(0);
+    expect(w.expectRows).toBe(false);
+  });
+
+  it('degenerate spans are zero, never negative, and never escalate', () => {
+    expect(scanWindowOpenMsSince(RTH_MID, RTH_MID).openMsSinceStart).toBe(0);
+    expect(scanWindowOpenMsSince(RTH_MID + 60_000, RTH_MID).expectRows).toBe(false);
+    expect(scanWindowOpenMsSince(Number.NaN, RTH_MID).expectRows).toBe(false);
+    expect(scanWindowOpenMsSince(RTH_MID, Number.NaN).expectRows).toBe(false);
+  });
+
+  it('reports truncation rather than silently understating a very old process', () => {
+    const now = Date.parse('2026-09-09T18:00:00Z');
+    const w = scanWindowOpenMsSince(now - SETUP_CONFIRMATION_SCAN_WINDOW_MAX_LOOKBACK_MS - 60_000, now);
+    expect(w.truncated).toBe(true);
+    expect(w.openMsSinceStart).toBeGreaterThan(0);
+  });
+
+  it('the threshold stays tied to the scan cadence it was derived from', () => {
+    // ⛔ `OTM_SCAN_INTERVAL_MS` cannot be imported (signal-engine imports THIS
+    // module), so the tie is asserted against the source. If someone retunes the
+    // sweep cadence, this fails rather than leaving the threshold stale.
+    const HERE2 = dirname(fileURLToPath(import.meta.url));
+    const engineSrc = readFileSync(join(HERE2, 'signal-engine.ts'), 'utf8');
+    const m = /const OTM_SCAN_INTERVAL_MS = (\d+) \* 60_000;/.exec(engineSrc);
+    expect(m).not.toBeNull();
+    const cadenceMs = Number(m![1]) * 60_000;
+    expect(SETUP_CONFIRMATION_EXPECT_ROWS_AFTER_OPEN_MS).toBe(3 * cadenceMs);
   });
 });
