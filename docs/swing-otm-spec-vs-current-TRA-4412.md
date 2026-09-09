@@ -265,3 +265,131 @@ sharpen what TRA-4053 has to prove.
 
 Under the TRA-4383 feature freeze (to 2026-09-18) nothing here is code work today. Items 1–5 are
 post-freeze; items 6–9 are decisions that can be taken now.
+
+---
+
+## 5. Addendum — the longer spec posted as a comment (2026-09-09T00:37Z)
+
+§§0–4 above were written against the issue **description**. The board then posted the fuller
+original conversation as comment `0f7af044`. It is a **superset** in five places. Four of those turn
+out to be things we already have; one is a control we do not have at all.
+
+### 5.1 Universe filters (comment §1) — the numbers exist, but not on this sleeve
+
+The description asked for liquidity qualitatively ("tight spread, adequate OI"). The comment gives
+thresholds, so they can be graded:
+
+| Comment §1 | Us | Verdict |
+|---|---|---|
+| Stock price > $10 | `ignition-quality-gate.ts` `minUnderlyingPrice` default **10** | exact match — but **demo-only and directional-only**; the health route says in as many words *"Live options path unchanged"* |
+| Avg stock volume > 1M shares | `minAvgDollarVolume` (dollar-volume, not share-count) + `minDollarVolumeSamples` warmup fail-closed | equivalent-or-better, same demo-only scope |
+| Bid/ask spread < 10% of mid | `SLEEVE_SPREAD_CEILINGS` — `single_leg_rv` **0.10**, `single_leg_directional` **0.10**, **`single_leg_otm` 0.20** | RV and directional match exactly; ⚠️ **the OTM sleeve is at twice the spec's ceiling** |
+| Option OI > 500 | `otm-admissible-strike` has a `minOpenInterest` knob; `options-research-input` seeds at a min-OI floor | spelled, not ratified at 500 |
+| Option volume > 100 | — | ❌ no contract-level *volume* filter anywhere |
+
+Two things to carry out of this. First, `single_leg_otm` at `maxSpreadPct` **0.20** is a live
+divergence from the spec on the exact sleeve this issue is about, and it is not a small one — spread
+is already our dominant cost term (`spreadCrossR` 0.235 of a 0.385 bar). Second, all of it is moot
+until `ENABLE_OPTION_LIQUIDITY_LIVE_ENFORCE` is armed; it reads `armed: false` today, so these
+ceilings bind the scanner's selection and not the live gate.
+
+### 5.2 The spec's own score weights are not stable
+
+The description and the comment give **different** weights for the same composite:
+
+| Term | Description | Comment §5 |
+|---|---|---|
+| Technical setup | **30%** | **20%** |
+| Option mispricing | 25% | 25% |
+| Expected move | 15% | 15% |
+| IV percentile / vol regime | 10% | 15% |
+| Liquidity | 10% | 10% |
+| Catalyst | **5%** | **10%** |
+| Market / sector | 5% | 5% |
+
+Ten points on the largest term, and catalyst doubles. Same author, same week, same strategy. This is
+the cleanest possible argument for §3 item 10 above: these weights are authorial preference, not
+measurement, and the ≥75 threshold sitting on top of them inherits that. Pre-register per TRA-3392
+§6; do not port either column into code.
+
+### 5.3 The paper-trading gate (comment §12) is shipped, and it is quantified
+
+This is the comment's largest net-new section and we answer it in full.
+`packages/shared/src/promotion-gate.ts`, `DEFAULT_PROMOTION_THRESHOLDS`:
+
+- **Stage 1, backtest:** Sharpe ≥ 1.0 · profit factor ≥ 1.3 · max drawdown ≤ 20% · ≥ 100 trades ·
+  expectancy strictly > 0 — and a six-guard verdict that *supersedes* the raw metrics, so strong
+  headline numbers cannot mint a pass on their own.
+- **Stage 2, paper:** ≥ 50 trades · expectancy > 0 · **expectancy ≥ 0.5 × backtest expectancy** ·
+  Sharpe ≥ 0.8 (`null` when the span is under `MIN_PAPER_SHARPE_YEARS_SPAN` — and a `null` Sharpe is
+  a *fail*, not a skip) · **slippage ≤ 1.5 × backtest**. There is also a burst guard, so 50 trades
+  crammed into a day does not clear a gate meant to measure a soak.
+- **Stage 3:** human sign-off, append-only `PromotionDecision` records, and any threshold override
+  requires written justification.
+
+`minExpectancyVsBacktestRatio: 0.5` and `maxSlippageRatio: 1.5` *are* the comment's "compare
+backtest / paper / live and flag material divergence", already reduced to numbers. The comment asks
+for "a configurable paper-trading period and minimum number of trades"; we have named values, a
+`null`-fails-closed rule, and a sign-off stage the spec does not have.
+
+**The real gap, and it is the one genuinely new control in the comment.** Ours is an **admission**
+gate: it runs to decide whether to promote. The comment asks for something standing — *"if actual
+results materially diverge from backtest assumptions, **disable** live trading and flag the strategy
+for review."* There is no demotion path in the codebase (grep for `demote`/`unpromote` finds only
+news-catalyst name demotion and a mover-provenance filter). Our standing controls — give-back halt,
+drawdown brake, fleet caps — are all **P&L-shaped**, not divergence-shaped: they fire when we lose
+money, not when live stops resembling the backtest that authorized it. A strategy can drift well off
+its promotion basis while still being mildly profitable, and nothing today notices.
+
+⇒ **Net-new build item: a standing backtest-vs-live divergence demotion.** It is the same statistic
+Stage 2 already computes (`computePaperGateMetrics` against `BacktestGateMetrics`); what is missing
+is running it on a schedule post-promotion and giving it an arm to pull. Cheap, because the
+comparator exists.
+
+### 5.4 We run the comment's signal priority inverted
+
+Comment §4 and its closing section rank the signals explicitly:
+
+> 1. Underlying directional setup → 2. OTM relative-value dislocation → 3. OTM absolute mispricing
+> → 4. Liquidity/execution → 5. Risk/reward
+
+…and states the rule directly: *"Do NOT trade based solely on IV mispricing."*
+
+What we actually run ranks on `|mispricingPct|` and the RV z-score, and the two underlying-
+confirmation archetypes are **shipped and switched off** — `OPTION_EMA_PULLBACK_FLAG`
+(`option-exec-flag.ts:1168`) and `OPTION_VOLUME_BREAKOUT_FLAG` (`:1181`). The layer the comment puts
+**first** is the layer we built and disabled.
+
+This is not a theoretical objection. TRA-3942 measured the consequence: 15 of 17 live entries filled
+13:35–13:51Z, because the overnight gap is the largest mispricing print on the chain — the scanner
+ranked the gap, not the setup. That is precisely the failure the comment's ordering exists to
+prevent, and we have already paid for it once.
+
+⇒ This is the highest-value line in the comment and it costs a **flag, not a build**. It is inside
+the TRA-4383 freeze, and it should be the first thing evaluated when the freeze lifts on 09-18 —
+ahead of the term-structure work in §3 item 4, which is strictly larger and strictly less proven.
+
+### 5.5 Two smaller corrections to §3 above
+
+- **§3 item 1 is smaller than I wrote it.** The "cheap for a legitimate reason" rejector does not
+  need building from scratch: `packages/shared/src/news-catalyst.ts` already demotes a name whose
+  earnings fall within N sessions and tags it `EARNINGS_IV_CRUSH_RISK`. The work is *routing the OTM
+  nomination through an existing demoter*, not writing a new one.
+- **Comment §6 (the EV gate) is our cost bar in different units.** The comment says reject when EV
+  ≤ 0 after commissions, spread and slippage. We enforce `costAwareGateReject` against `barR` 0.385
+  and require the **lower 95% bound** to clear it, not a point estimate — strictly stronger than
+  what the comment asks for. What we genuinely lack from its §6 list is published **theta / vega /
+  delta exposure** on a card, which folds into the consolidated trade card (§3 item 3).
+
+### 5.6 Does the comment change the disposition?
+
+No. It adds **one** net-new build item (5.3, standing divergence demotion), **sharpens the priority**
+of an existing one (5.4, and it re-orders TRA-4413's queue), **shrinks** another (5.5), and adds
+**one decision** to the four already pending on interaction `2d618a1c`:
+
+> **Decision 5 — `single_leg_otm` `maxSpreadPct` is 0.20 against the spec's 0.10, on the sleeve this
+> issue is about, while `single_leg_rv` and `single_leg_directional` already sit at 0.10.**
+> Hold 0.20, or bring OTM into line with its siblings?
+
+Everything in this addendum remains post-freeze work. Nothing here changes what trades today: the
+sleeve is still held closed by TRA-4217 and the cost bar still admits nothing.
