@@ -45,10 +45,18 @@
 // separated from the board-blocked population. It was applied here; they failed it.
 //
 // ---------------------------------------------------------------------------------------------
-// WRITE BUDGET. The cross-issue cap is 20 writes per run and a status+comment PATCH spends 2.
-// Five rows = 10. The sibling AC5 script spends 2 more. 12 of 20 if both run in the same
-// heartbeat, which is intended and safe. Rows are ordered most-consequential first so that a cap
-// hit (or a 409) truncates the tail rather than the head.
+// A SEVENTH row rides along that is NOT a strand repair: TRA-1659, comment-only. Its sole blocker
+// edge (TRA-3824) is `done`, which is the SILENT strand shape -- created by a close, announced by
+// nothing -- and it `blocks` three rows. Re-reading its three-step unblock found steps 1 and 3
+// satisfied, step 3 verified from DEPLOYED BYTES this beat rather than inferred from its ticket
+// being `done` (a `done` on a specify-ticket is not an enforced cap). Its status is deliberately
+// left alone: it gates real money and `blocked` is the safe direction.
+//
+// WRITE BUDGET. The cross-issue cap is 20 writes per run and a status+comment PATCH spends 2;
+// a comment-only PATCH spends 1. Five status rows (10) + TRA-1659 comment-only (1) = 11. The
+// sibling AC5 script spends 2 more: 13 of 20 if both run in the same heartbeat, which is intended
+// and safe. Rows are ordered most-consequential first so that a cap hit (or a 409) truncates the
+// tail rather than the head.
 
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -102,6 +110,58 @@ const ROWS = [
       '`todo`, still assigned to CTO, is the sanctioned rest for a row that has real work left and',
       'no live continuation path. The work itself is unchanged and is stated in the description:',
       'the TRA-4432 re-arm co-armed 10 monitors on one instant, and that needs unpicking.',
+    ].join('\n'),
+  },
+  {
+    key: 'TRA-1659',
+    id: 'db7464d9-cc6d-47b6-a60a-e2726d97c351',
+    // COMMENT ONLY -- no `status`, deliberately. See the body: this row is a real-money gate and
+    // `blocked` is the SAFE direction. The point of this write is that two of its three unblock
+    // conditions are now provably met and nobody knows.
+    status: null,
+    marker: 'Unblock steps 1 and 3 are now SATISFIED; only the board card remains',
+    body: [
+      'Unblock steps 1 and 3 are now SATISFIED; only the board card remains.',
+      '',
+      'Measured on the CTO seat 2026-09-09T16:3xZ. Status is deliberately NOT changed by this',
+      'comment: this row gates real money, `blocked` is the safe direction, and nothing below is a',
+      'release. The suspension stays in force.',
+      '',
+      'What prompted the check: the only blocker edge on this row is TRA-3824, which is `done`. A',
+      'row whose sole blocker has closed is the silent strand shape -- it is created BY a close and',
+      'nothing announces it. This row `blocks` three others (TRA-2646, TRA-3666, TRA-1717), so it',
+      'was holding them behind a gate whose state nobody had re-read since 09-02.',
+      '',
+      'The description names a three-step unblock sequence. Re-measured, in order:',
+      '',
+      '  1. TRA-3826 (broker-side forensics, the board\'s own named re-ask trigger) -- **done**.',
+      '  2. Board RE-ANSWERS the ceiling question on a fresh card -- **NOT DONE. No card exists.**',
+      '  3. TRA-3827 lands a fails-closed premium cap verified FROM DEPLOYED BYTES -- **satisfied,',
+      '     verified live this beat**, not inferred from the ticket being `done`.',
+      '',
+      'Step 3 was checked properly because a `done` on a specify-ticket is not an enforced cap.',
+      '`GET https://tradingai-bqb1.onrender.com/api/health/live-options-fee-slippage` returns HTTP',
+      '200 with the `canaryCeiling` key PRESENT, which is the deployed-bytes proof the module',
+      'shipped (a build without it simply lacks the key -- the TRA-3394 gate-key pattern):',
+      '',
+      '    entryPathBehavior: "enforcing"     verdict: "within"',
+      '    resolved: perOrderUsd 300, aggregateUsd 500, source "compiled_default"',
+      '    hardMaxUsd 300 / aggregateHardMaxUsd 500   envVar LIVE_OPTION_CANARY_CEILING_USD',
+      '    books: admin 0.00 at risk (residual 500, 0 unpriced), v0nni same. breachedBooks: []',
+      '',
+      'Note the numbers are $300/$500, not <=$100: TRA-3870 (board, 2026-08-19) re-ratified them for',
+      'the small-account posture. `source: compiled_default` means the control is CODE-ONLY armed --',
+      'no env write was needed and there is no window where the code is live and the ceiling is not.',
+      '',
+      'THE OPEN QUESTION, which is the board\'s and not mine. TRA-3870 re-ratified the ceiling',
+      'NUMBERS on 2026-08-19, after the 08-17 `defer`. Whether that already IS the step-2 re-answer,',
+      'or whether step 2 still needs its own card naming this canary specifically, is a call I am',
+      'not making unilaterally -- the description is explicit that `defer` is not a standing',
+      'authorization, and re-ratifying a number is not obviously the same act as releasing a',
+      'suspended live-money procedure.',
+      '',
+      'NEXT ACTION for whoever runs this: post that board card against this row. Until it is',
+      'answered, `node tra1659_canary.mjs place` stays suspended and this row stays blocked.',
     ].join('\n'),
   },
   {
@@ -291,7 +351,11 @@ async function landOne(row) {
 
   // ONE PATCH carrying comment AND status together. A status PATCH spawns a run that holds the
   // checkout lock, so a SECOND PATCH against the same row 409s. Do not split these.
-  const payload = { status: row.status, comment: row.body };
+  // A comment-only row (status === null) sends NO `status` key at all. That is not a shortcut:
+  // omitting it means the PATCH does not spawn a status run, so it cannot take the checkout lock,
+  // and it cannot accidentally release a gate whose current rest is the safe direction.
+  const payload = { comment: row.body };
+  if (row.status) payload.status = row.status;
   if (row.nextCheckAt) {
     payload.executionPolicy = {
       monitor: {
@@ -325,8 +389,14 @@ async function landOne(row) {
     console.error(`[strand-land] ${row.key}: WARNING monitor did NOT arm -- still stranded, fix by hand.`);
     return 'failed';
   }
-  if (iss.status !== row.status) {
+  if (row.status && iss.status !== row.status) {
     console.error(`[strand-land] ${row.key}: WARNING stored status ${iss.status} != requested ${row.status}.`);
+    return 'failed';
+  }
+  if (!row.status && iss.status !== 'blocked') {
+    // The comment-only row is comment-only precisely so its rest does not move. If it moved
+    // anyway, something else wrote to it and the gate needs a human look.
+    console.error(`[strand-land] ${row.key}: WARNING status is now ${iss.status}, expected blocked.`);
     return 'failed';
   }
   return 'landed';
