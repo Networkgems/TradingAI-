@@ -72,7 +72,7 @@ import { dirname, join } from 'path';
 import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
 import { isMarketDayIso } from './scheduler.js';
-import { DIRECTIONAL_STRUCTURE_LABEL } from './option-spread-cost.js';
+import { DIRECTIONAL_STRUCTURE_LABEL, classifySpreadCeilingAccount } from './option-spread-cost.js';
 
 const log = logger.child({ module: 'directional-exploration-allowance' });
 
@@ -386,11 +386,27 @@ export interface ExplorationGrantResult {
  * per-open cap is refused here; multi-contract sizing is clamped to the cap at
  * the open site (`maxAtRiskUsd`), so between the two checks no exploration
  * open can put more than $150 at risk.
+ *
+ * `account` is the candidate's OWNING BOOK (`alertUsername` — the same string
+ * the journal row will carry). TRA-4418: the allowance was authorized to buy
+ * DESK evidence, and the ~63 QA fixture books scan in `mode: 'demo'` too
+ * (99.86% of this gate's addressable rejects on 2026-09-08), so without this
+ * check the 25-row budget is spent on rows the expectancy basis excludes by
+ * design (TRA-3391). Classified by the ONE decision-time classifier
+ * (`classifySpreadCeilingAccount`, TRA-2355) on the same env basis as the
+ * spread-ceiling stamps, so the two ceiling cross-checks cannot disagree by
+ * construction (TRA-2948). Only `desk` proceeds: `fixture` refuses
+ * `fixture_book`; a blank/unbound book refuses `unattributed_book` rather than
+ * folding into either — an unbound `alertUsername` wire must not read as QA
+ * traffic, and defaulting it to desk would manufacture desk evidence out of an
+ * unknown owner. A non-desk consult mutates NO state (no arm, no terminal
+ * persist): the 40-session box starts on the first DESK-eligible consult.
  */
 export function explorationBypassGrant(
   env: NodeJS.ProcessEnv,
   etDay: string,
   estPerContractUsd: number,
+  account: string | undefined | null,
   now: number = Date.now(),
 ): ExplorationGrantResult {
   const refuse = (refusal: string): ExplorationGrantResult => {
@@ -398,6 +414,10 @@ export function explorationBypassGrant(
     return { granted: false, refusal };
   };
   if (!isExplorationAllowanceFlagOn(env)) return refuse('flag_off');
+  const accountClass = classifySpreadCeilingAccount(account);
+  if (accountClass !== 'desk') {
+    return refuse(accountClass === 'fixture' ? 'fixture_book' : 'unattributed_book');
+  }
   if (stateUnreadable) return refuse('state_unreadable');
   if (armedEtDay == null) appendEvent({ kind: 'arm', etDay, ts: now });
   const terminal = terminalReason(etDay);
@@ -562,7 +582,7 @@ export function summarizeExplorationAllowance(
     note: stateUnreadable
       ? 'STATE UNREADABLE — the on-disk allowance ledger exists but could not be read; every grant fails closed and every counter above is null. This is UNREAD, not quiet.'
       : armed
-        ? `ARMED (demo-only, TRA-4378): a flat cost-bar reject on demo '${EXPLORATION_GATE_STRUCTURE}' is admitted while every cap holds; admits land on retained.byStructure[${EXPLORATION_GATE_STRUCTURE}] (assert barR != null on the row you read — the '${DIRECTIONAL_STRUCTURE_LABEL}' twin carries spread-ceiling counters only). Caps: ${EXPLORATION_CAPS.rowCap} opens, $${EXPLORATION_CAPS.perOpenAtRiskCapUsd} at-risk/open, ${EXPLORATION_CAPS.pnlCapUsd} USD realized, ${EXPLORATION_CAPS.maxConcurrent} concurrent / ${EXPLORATION_CAPS.maxPerSession} per session, ${EXPLORATION_CAPS.sessionBox}-session box (expires after ${armedEtDay != null ? boxExpiryEtDay(armedEtDay) : 'n/a'}). Zero live-capital reach: consulted only on the demo branch of the gate.`
+        ? `ARMED (demo-only, TRA-4378): a flat cost-bar reject on a DESK-book demo '${EXPLORATION_GATE_STRUCTURE}' candidate is admitted while every cap holds (fixture/unattributed books refuse fixture_book/unattributed_book — TRA-4418); admits land on retained.byStructure[${EXPLORATION_GATE_STRUCTURE}] (assert barR != null on the row you read — the '${DIRECTIONAL_STRUCTURE_LABEL}' twin carries spread-ceiling counters only). Caps: ${EXPLORATION_CAPS.rowCap} opens, $${EXPLORATION_CAPS.perOpenAtRiskCapUsd} at-risk/open, ${EXPLORATION_CAPS.pnlCapUsd} USD realized, ${EXPLORATION_CAPS.maxConcurrent} concurrent / ${EXPLORATION_CAPS.maxPerSession} per session, ${EXPLORATION_CAPS.sessionBox}-session box (expires after ${armedEtDay != null ? boxExpiryEtDay(armedEtDay) : 'n/a'}). Zero live-capital reach: consulted only on the demo branch of the gate.`
         : disarmedReason === 'flag_off'
           ? `DISARMED (default-off): set ${DIRECTIONAL_EXPLORATION_FLAG}=1 (DATA_DIR/demo-flags.json or env) to arm. No exploration open can occur while this reads false.${armedEtDay != null ? ' Previously armed — counters above are the durable record and still bind on re-arm.' : ''}`
           : `SELF-DISARMED (${String(disarmedReason)}) — terminal and durable; re-setting the flag does NOT re-arm past a bound cap. Rider R1: no extension.`,

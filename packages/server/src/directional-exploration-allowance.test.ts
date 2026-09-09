@@ -21,14 +21,17 @@ import {
   summarizeExplorationAllowance,
   takeExplorationGrant,
 } from './directional-exploration-allowance.js';
+import { classifySpreadCeilingAccount } from './option-spread-cost.js';
 
 // 2026-06-01 is a Monday and not in MARKET_HOLIDAYS.
 const ARM_DAY = '2026-06-01';
 const ON: NodeJS.ProcessEnv = { [DIRECTIONAL_EXPLORATION_FLAG]: '1' };
 const OFF: NodeJS.ProcessEnv = {};
 
-const grant = (env: NodeJS.ProcessEnv, day = ARM_DAY, est = 100) =>
-  explorationBypassGrant(env, day, est, 1_000);
+// TRA-4418 — every grant names its OWNING BOOK now; `admin` is a KNOWN_DESK_BOOKS
+// entry, so the pre-4418 tests exercise exactly the desk path they always did.
+const grant = (env: NodeJS.ProcessEnv, day = ARM_DAY, est = 100, account: string | undefined = 'admin') =>
+  explorationBypassGrant(env, day, est, account, 1_000);
 
 /** Grant + commit one exploration open in one call (the engine's two-step, collapsed). */
 function openOne(id: string, day = ARM_DAY, atRiskUsd = 100): void {
@@ -280,6 +283,72 @@ describe('directional-exploration-allowance', () => {
     expect(s.refusalsSinceBoot.flag_off).toBe(1);
     expect(s.refusalsSinceBoot.per_open_at_risk).toBe(1);
   });
+
+  // ── TRA-4418: the account-class gate ───────────────────────────────────────
+  it('AC1: a fixture book is refused fixture_book, tallied on refusalsSinceBoot, and mutates NOTHING', () => {
+    for (const fixture of ['qa_reg_777', 'qtverify_1757', 'tra4418v1', 'ceo2251v130001']) {
+      expect(grant(ON, ARM_DAY, 100, fixture)).toEqual({ granted: false, refusal: 'fixture_book' });
+      expect(takeExplorationGrant()).toBeNull();
+    }
+    const s = summarizeExplorationAllowance(ON, ARM_DAY);
+    expect(s.refusalsSinceBoot.fixture_book).toBe(4);
+    // No arm, no row, no terminal event: a fixture consult must not start the
+    // 40-session box the desk evidence is supposed to get all 40 sessions of.
+    expect(s.armedEtDay).toBeNull();
+    expect(s.rowsUsed).toBe(0);
+    // Nothing durable either: a re-hydrate of the same dir finds zero events.
+    expect(hydrateExplorationAllowanceFromDisk(dir).events).toBe(0);
+  });
+
+  it('AC1: a blank/unbound book refuses unattributed_book — an unwired alertUsername must not read as QA traffic', () => {
+    // Direct call: the helper's default param would swallow an explicit undefined.
+    expect(explorationBypassGrant(ON, ARM_DAY, 100, undefined, 1_000))
+      .toEqual({ granted: false, refusal: 'unattributed_book' });
+    expect(grant(ON, ARM_DAY, 100, '   ')).toEqual({ granted: false, refusal: 'unattributed_book' });
+    expect(takeExplorationGrant()).toBeNull();
+    expect(summarizeExplorationAllowance(ON, ARM_DAY).refusalsSinceBoot.unattributed_book).toBe(2);
+  });
+
+  it('AC2 strict narrowing: every desk book still grants, including the case/whitespace variants the roster carries', () => {
+    // `Richard` with a capital R is the live journal's second-largest desk stamp
+    // (TRA-2554) — the classifier compares trimmed + lowercased, so must we.
+    for (const desk of ['admin', 'enock', 'Richard', ' richard ']) {
+      const g = grant(ON, ARM_DAY, 100, desk);
+      expect(g).toEqual({ granted: true, refusal: null });
+      expect(takeExplorationGrant()).not.toBeNull();
+    }
+  });
+
+  it('AC3: fixture refusals cannot spend rows, and the desk path is unaffected by any amount of fixture traffic', () => {
+    // Simulate 09-08's mix: a wall of fixture rejects around one desk candidate.
+    for (let i = 0; i < 50; i++) {
+      expect(grant(ON, ARM_DAY, 100, `qa_reg_${i}`).granted).toBe(false);
+    }
+    expect(takeExplorationGrant()).toBeNull(); // nothing pending — AC3's ledger half
+    const g = grant(ON, ARM_DAY, 100, 'enock');
+    expect(g.granted).toBe(true);
+    expect(takeExplorationGrant()).not.toBeNull();
+    commitExplorationOpen({ id: 'desk1', occ: null, atRiskUsd: 100, etDay: ARM_DAY }, 1_001);
+    const s = summarizeExplorationAllowance(ON, ARM_DAY);
+    expect(s.rowsUsed).toBe(1); // the desk open, and ONLY the desk open
+    expect(s.refusalsSinceBoot.fixture_book).toBe(50);
+    expect(s.armedEtDay).toBe(ARM_DAY); // armed by the desk consult, not the fixture wall
+  });
+
+  it('AC4: the gate is the ONE shared classifier — a name that is desk to classifySpreadCeilingAccount is desk here', () => {
+    // Not a second pattern set: drive both through the same names and demand
+    // agreement (TRA-2948 — two pattern sets disagree by construction).
+    for (const [name, cls] of [
+      ['admin', 'desk'],
+      ['monitor_qa', 'fixture'],
+      ['qtprobe3', 'fixture'],
+      ['aqua', 'desk'], // contains 'qa' but not anchored — a real book must stay desk
+    ] as const) {
+      expect(classifySpreadCeilingAccount(name)).toBe(cls);
+      expect(grant(ON, ARM_DAY, 100, name).refusal).toBe(cls === 'desk' ? null : 'fixture_book');
+      takeExplorationGrant();
+    }
+  });
 });
 
 // ── AC2 + AC4: the gate integration, driven through the REAL private method ──
@@ -294,11 +363,19 @@ import { clearCostAwareGateLedger, summarizeCostAwareGate } from './cost-aware-g
 import { etDateString } from './scheduler.js';
 
 type GateInternals = {
+  setAlertUsername(username: string): void;
   costAwareGateReject(
     structure: string,
     inputs: { mark: number; delta: number },
   ): string | null;
 };
+
+/** A demo engine bound to a book via the REAL public binding (TRA-4418). */
+function demoEngine(book?: string): GateInternals {
+  const e = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' }) as unknown as GateInternals;
+  if (book != null) e.setAlertUsername(book);
+  return e;
+}
 
 describe('TRA-4378 gate integration (costAwareGateReject demo branch)', () => {
   beforeEach(() => {
@@ -315,8 +392,8 @@ describe('TRA-4378 gate integration (costAwareGateReject demo branch)', () => {
     clearCostAwareGateLedger();
   });
 
-  it('ARMED: a bar-rejected directional candidate is ADMITTED, recorded on the directional row, with a one-shot grant', () => {
-    const e = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' }) as unknown as GateInternals;
+  it('ARMED: a bar-rejected DESK directional candidate is ADMITTED, recorded on the directional row, with a one-shot grant', () => {
+    const e = demoEngine('admin');
     const verdict = e.costAwareGateReject('directional', { mark: 1.0, delta: 0.5 });
     expect(verdict).toBeNull(); // admitted under the allowance
     expect(takeExplorationGrant()).not.toBeNull();
@@ -330,9 +407,28 @@ describe('TRA-4378 gate integration (costAwareGateReject demo branch)', () => {
     });
   });
 
-  it('NEGATIVE CONTROL (AC1): allowance flag off ⇒ the same candidate is rejected and no grant exists', () => {
+  it('TRA-4418 (AC1/AC3): a FIXTURE-book engine is refused fixture_book through the real gate — reject stands, no token, no row', () => {
+    const e = demoEngine('qa_reg_4418');
+    const verdict = e.costAwareGateReject('directional', { mark: 1.0, delta: 0.5 });
+    expect(typeof verdict).toBe('string'); // the flat bar's reject stands
+    expect(takeExplorationGrant()).toBeNull(); // AC3: nothing a commit could spend
+    const s = summarizeExplorationAllowance(process.env, etDateString(new Date()));
+    expect(s.refusalsSinceBoot.fixture_book).toBe(1); // AC1: the ledger names it
+    expect(s.rowsUsed).toBe(0);
+    expect(s.armedEtDay).toBeNull(); // a fixture consult does not start the box
+  });
+
+  it('TRA-4418 (AC1): an engine with NO bound book refuses unattributed_book — unbound is not desk', () => {
+    const e = demoEngine();
+    expect(typeof e.costAwareGateReject('directional', { mark: 1.0, delta: 0.5 })).toBe('string');
+    expect(takeExplorationGrant()).toBeNull();
+    const s = summarizeExplorationAllowance(process.env, etDateString(new Date()));
+    expect(s.refusalsSinceBoot.unattributed_book).toBe(1);
+  });
+
+  it('NEGATIVE CONTROL (AC1): allowance flag off ⇒ the same DESK candidate is rejected and no grant exists', () => {
     delete process.env[DIRECTIONAL_EXPLORATION_FLAG];
-    const e = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' }) as unknown as GateInternals;
+    const e = demoEngine('admin');
     const verdict = e.costAwareGateReject('directional', { mark: 1.0, delta: 0.5 });
     expect(typeof verdict).toBe('string'); // the flat bar's reject stands
     expect(takeExplorationGrant()).toBeNull();

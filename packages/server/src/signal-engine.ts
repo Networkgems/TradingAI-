@@ -7700,7 +7700,15 @@ export class SignalEngine {
       // Demo-only by construction: this branch is `mode === 'demo'`, and the
       // live branch below never consults the allowance.
       if (!tape.admit && structure === EXPLORATION_GATE_STRUCTURE) {
-        const grant = explorationBypassGrant(env, etDateString(new Date()), inputs.mark * 100);
+        // TRA-4418 — the OWNING BOOK rides along so the allowance can refuse the
+        // ~63 QA fixture books (they scan in demo mode too, and were 99.86% of
+        // this gate's addressable rejects). Same string the journal row carries.
+        const grant = explorationBypassGrant(
+          env,
+          etDateString(new Date()),
+          inputs.mark * 100,
+          this.alertUsername,
+        );
         if (grant.granted) {
           recordCostAwareGateDecision(
             structure,
