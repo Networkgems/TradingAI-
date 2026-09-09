@@ -43,6 +43,16 @@ const EXEMPT: ReadonlyArray<{ readonly match: string; readonly why: string }> = 
     why: 'TRA-1942 tick-pacer macrotask yield — bounded and near-zero by construction',
   },
   {
+    match: '.yieldNow(',
+    // The same pacer yield as above, now routed through the yielder so the
+    // scheduled→resumed delay is MEASURED: a slow resume is recorded by the
+    // SyncSliceMeter as `yield-preempt@<phase>` (kind sync), which is strictly
+    // more attribution than a withPhase wrapper here could give — wrapping the
+    // yield in an async phase would only ever time the queue wait and mislabel
+    // foreign starvation as this tick's own phase.
+    why: 'TRA-3660 metered pacer yield — the SyncSliceMeter already attributes a slow resume',
+  },
+  {
     match: 'this.runOptionsExitPass(',
     // A CONTAINER, not a leaf: it already emits option-marks, resolve-option-exits
     // and submit-option-exits from inside. Wrapping it would nest those labels and

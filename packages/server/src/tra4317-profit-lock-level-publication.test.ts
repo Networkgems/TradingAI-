@@ -139,6 +139,19 @@ describe('TRA-4317 AC1 — the profit-lock release level is published on the clo
     expect(fire.markAtFire).toBeCloseTo(1.42, 9);
     expect(fire.execBidAtFire).toBe(1.37);
 
+    // TRA-4246 (AC2) — the decision's own operands ride the same stamp, so
+    // "did the rule arm, and from what peak" is a READ. `peakPremiumAtFire` is
+    // 1.48, the EXECUTABLE peak (`peakPremiumExec`) this quoted tick decided
+    // on, NOT the mid high-water mark 1.58 — grading the level against the mid
+    // peak is the half-spread error TRA-4285 removed.
+    expect(fire.armed).toBe(true);
+    expect(fire.peakPremiumAtFire).toBeCloseTo(1.48, 9);
+    expect(fire.peakR).toBeCloseTo(0.78125, 9);
+    expect(fire.giveBackR).toBeCloseTo(0.4, 9);
+    expect(fire.stopBasisPremium).toBeCloseTo(R_UNIT, 9); // 0.256 = the row's OWN R
+    // …and `levelR` reconciles to them without any constant: peakR − giveBackR.
+    expect(fire.peakR - fire.giveBackR).toBeCloseTo(fire.levelR, 9);
+
     // …and the close row publishes it verbatim, beside the fill it explains:
     // level 1.3776 vs fill 1.37 — the gap TRA-4317 measured, now a column.
     const finalised = acct.finalizePendingExit(id, 1.37);
@@ -147,12 +160,21 @@ describe('TRA-4317 AC1 — the profit-lock release level is published on the clo
     const rows = await listOptionTradeJournal();
     expect(rows).toHaveLength(1);
     expect(rows[0]!.outcome).not.toBe('OPEN');
+    // `toEqual` on the WHOLE object on purpose: the close row must carry the
+    // stamp verbatim, and a field added to the stamp that never reaches the
+    // journal is the exact defect TRA-4246 (AC2) is about. This assertion goes
+    // red when a writer forgets to plumb one.
     expect(rows[0]!.profitLockFire).toEqual({
       at: FIRE_TIME,
       levelR: fire.levelR,
       levelPremium: fire.levelPremium,
       markAtFire: fire.markAtFire,
       execBidAtFire: 1.37,
+      armed: true,
+      peakPremiumAtFire: fire.peakPremiumAtFire,
+      peakR: fire.peakR,
+      giveBackR: fire.giveBackR,
+      stopBasisPremium: fire.stopBasisPremium,
     });
   });
 

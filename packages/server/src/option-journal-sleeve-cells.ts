@@ -2,6 +2,7 @@ import {
   GATE_R_BASIS_STRUCTURES,
   GATE_R_PER_PREMIUM_R,
   type OptionTradeJournalRecord,
+  type OptionTradeSupersededClose,
 } from './option-trade-journal.js';
 import {
   UNSPECIFIED_ENTRY_ARCHETYPE,
@@ -213,6 +214,51 @@ export interface OptionSleeveExitSlice {
   minSampleForVerdict: number;
 }
 
+/**
+ * TRA-4246 (AC4) — ONE closed row whose headline `exitReason` was written by a
+ * SUPERSEDE, naming both reasons. See {@link OptionSleeveCellGrid.exitReasonSupersedes}.
+ */
+export interface OptionSleeveExitReasonSupersede {
+  journalId: string;
+  optionSymbol: string;
+  accountClass: SpreadCeilingAccountClass;
+  structure: string;
+  /** What `byExitReason` counts this row under TODAY. */
+  headlineExitReason: string;
+  headlineBrokerOrderId: string | number | null;
+  /** What the displaced close said — the reason the fold is no longer counting. */
+  supersededExitReason: string;
+  supersededBrokerOrderId: string | number | null;
+  supersededCloseTs: number;
+  /** The writer, e.g. `engine_close_on_already_closed_row`. */
+  supersedeReason: string;
+  supersededAt: number;
+}
+
+/**
+ * TRA-4246 (AC3) — the premium→stop-basis R divisor, MEASURED on a cell's rows.
+ * See {@link OptionSleeveCell.stopRPerPremiumR}.
+ */
+export interface OptionSleeveStopBasisDivisor {
+  /** Closed rows in the cell carrying a per-row divisor. Never 0 (the field is null instead). */
+  n: number;
+  /**
+   * Closed rows carrying NONE — pre-stamp closes plus rows whose stop was
+   * unarmed at the close. Published so `n` is read against its own
+   * denominator: `n = 1, missing = 40` is not a cell-wide conversion.
+   */
+  missing: number;
+  min: number;
+  max: number;
+  /** Lower median at even n — a real observed row's divisor, never an interpolation. */
+  median: number;
+  /**
+   * `max − min < 1e-9`. TRUE ⇒ a single divisor describes every measured row.
+   * FALSE ⇒ it does not, and a reader must convert PER ROW.
+   */
+  unanimous: boolean;
+}
+
 /** Per-exit-reason attribution inside one cell — how the slices were built. */
 export interface OptionSleeveExitReasonStat {
   exitReason: string;
@@ -250,8 +296,40 @@ export interface OptionSleeveCell {
   exitOwnerCountsSumToClosed: boolean;
   /** Non-empty reasons in the cell, descending by count. Empty at n = 0. */
   byExitReason: OptionSleeveExitReasonStat[];
-  /** premium→gate R factor (4) where the structure has a valid conversion, else null. */
+  /**
+   * The COST-AWARE GATE's premium→R factor (4 = `1 / STOP_DISTANCE_FRACTION_OF_MARK`)
+   * where the structure has a valid conversion, else null.
+   *
+   * ⛔ TRA-4246 (AC3) — THIS IS NOT THE SLEEVE'S STOP. It is the gate's MODEL
+   * of a stop (`mark × 0.75`), used to price spread-cross in R at admission.
+   * The OTM sleeve that actually trades stops at `OTM_OPTIONS_SL_PCT 0.20` —
+   * `premium × 0.80`, a **5×**. Converting a premium-R figure to stop-basis R
+   * through this constant understates the magnitude by 20% on that sleeve, and
+   * that is not hypothetical: it is what happened to every row of the CFO's
+   * TRA-4243 give-back table, because this was the only divisor any surface
+   * published. Read {@link stopRPerPremiumR} instead — it is MEASURED on this
+   * cell's own rows and cannot be wrong about which sleeve it describes.
+   */
   gateRPerPremiumR: number | null;
+  /**
+   * TRA-4246 (AC3) — the premium→stop-basis R factor MEASURED on this cell's
+   * own closed rows, `null` when no row in the cell carries one.
+   *
+   * Each closed row stamps its own `premiumPaid ÷ |premiumPaid −
+   * stopLossPremium|` at the close (TRA-4246 AC1). This folds them. It is not a
+   * constant, not a table keyed on sleeve, and not a default — a cell whose
+   * rows all predate the stamp, or all closed with an unarmed stop, publishes
+   * `null` and a reader learns that the conversion is unavailable rather than
+   * being handed the gate's number by omission.
+   *
+   * `unanimous` is the field that matters for a fold: TRUE ⇒ one stop rule
+   * governed every measured row in the cell and a single divisor is a sound
+   * summary of it. FALSE ⇒ the cell spans rows with different stop distances
+   * (a re-tune mid-window, an adopted lot, a pinned stop) and NO single divisor
+   * describes it — which is exactly the "one constant cannot cover mixed
+   * sleeves" failure, caught here instead of shipped as a number.
+   */
+  stopRPerPremiumR: OptionSleeveStopBasisDivisor | null;
   /**
    * True when this cell exists only because the axis floor demanded it — no row
    * in the filtered set landed here. Published so "no trades" is a POSITIVE
@@ -316,8 +394,64 @@ export interface OptionSleeveCellGrid {
   unclassifiedExitReasons: string[];
   /** The classification rule itself, on the wire. */
   exitOwnerTable: readonly OptionExitReasonRule[];
+  /**
+   * TRA-4246 (AC4) — every closed row in this fold whose headline `exitReason`
+   * was written by a SUPERSEDE over a different reason, naming both.
+   *
+   * ── Why a `byExitReason` count is not enough on its own ─────────────────
+   * `RIG260925C00006000` closed 2026-08-24 under `sl_otm_premium_pct` (broker
+   * 143048620, a filled sell). On 08-26 an `engine_close_on_already_closed_row`
+   * supersede replaced that close with a DIFFERENT filled sell's (broker
+   * 143384264), and the row's headline reason became `profit_lock`. Nothing on
+   * any surface said so, so `byExitReason` attributed a STOP fire to the
+   * give-back rule — and a −2.31R stop landed in the population whose whole
+   * question is "how much does the give-back rule keep". One row is enough to
+   * flip a give-back verdict at these sample sizes.
+   *
+   * ⛔ This list is NOT the fix for the incident. **TRA-4241 owns that**: the
+   * `supersede_close` fold now refuses a supersede that would demote a close
+   * the broker witnessed under a different order, keyed on the broker order and
+   * not on the clock, and — because the fold is the log's interpreter — that
+   * refusal applies on REPLAY to bytes already on disk. AC4 is scoped here to
+   * the journal SURFACE, per this ticket's own coordination clause: publish the
+   * displaced reason so the supersedes that legitimately DO apply (a
+   * reconstructed close, a TRA-4082 restore) are readable as relabels instead
+   * of being silently folded as give-back releases.
+   *
+   * Empty means no closed row in the window carries a reason-changing
+   * supersede. A row whose supersede did not change the label is not listed —
+   * there is nothing for a reader to correct.
+   */
+  exitReasonSupersedes: OptionSleeveExitReasonSupersede[];
   rBasis: 'premium';
   note: string;
+}
+
+/**
+ * TRA-4246 (AC3) — fold the per-row stop-basis divisors a cell's closed rows
+ * carry. `null` when none of them does, never a constant standing in.
+ */
+function foldStopBasisDivisor(
+  closedList: OptionTradeJournalRecord[],
+): OptionSleeveStopBasisDivisor | null {
+  const values = closedList
+    .map((r) => r.stopBasisRPerPremiumR)
+    .filter((v): v is number => typeof v === 'number' && Number.isFinite(v) && v > 0)
+    .sort((a, b) => a - b);
+  if (values.length === 0) return null;
+  const min = values[0] as number;
+  const max = values[values.length - 1] as number;
+  return {
+    n: values.length,
+    missing: closedList.length - values.length,
+    min,
+    max,
+    // Lower median: at even n this is a divisor some row actually carried. An
+    // interpolated midpoint between 4 and 5 would be 4.5 — a conversion factor
+    // no sleeve in this book uses, published as if it were measured.
+    median: values[Math.floor((values.length - 1) / 2)] as number,
+    unanimous: max - min < 1e-9,
+  };
 }
 
 function slice(
@@ -410,6 +544,33 @@ export function foldOptionSleeveCells(rows: OptionTradeJournalRecord[]): OptionS
     if (!EXIT_OWNER_BY_REASON.has(reason)) unclassified.add(reason);
   }
 
+  // TRA-4246 (AC4) — every closed row in the fold whose headline `exitReason`
+  // was WRITTEN BY A SUPERSEDE rather than by the close that realized the P&L.
+  // See {@link OptionSleeveCellGrid.exitReasonSupersedes}.
+  const exitReasonSupersedes: OptionSleeveExitReasonSupersede[] = [];
+  for (const r of closedRows) {
+    const prior = r.supersededCloses;
+    if (prior === undefined || prior.length === 0) continue;
+    // The LAST superseded close is the one this row's current reason displaced.
+    const last = prior[prior.length - 1] as OptionTradeSupersededClose;
+    const headline = r.exitReason ?? 'unknown';
+    if (last.exitReason === headline) continue; // the move did not change the label
+    exitReasonSupersedes.push({
+      journalId: r.id,
+      optionSymbol: r.optionSymbol ?? r.symbol,
+      accountClass: classifySpreadCeilingAccount(r.account),
+      structure: r.structure,
+      headlineExitReason: headline,
+      headlineBrokerOrderId: r.brokerOrderId ?? null,
+      supersededExitReason: last.exitReason,
+      supersededBrokerOrderId: last.brokerOrderId,
+      supersededCloseTs: last.closeTs,
+      supersedeReason: last.reason,
+      supersededAt: last.supersededAt,
+    });
+  }
+  exitReasonSupersedes.sort((a, b) => b.supersededAt - a.supersededAt || a.journalId.localeCompare(b.journalId));
+
   const axisPairs = [...pairs.values()];
   const cells: OptionSleeveCell[] = [];
   for (const klass of SPREAD_CEILING_ACCOUNT_CLASSES) {
@@ -455,6 +616,10 @@ export function foldOptionSleeveCells(rows: OptionTradeJournalRecord[]): OptionS
           strategyExits.n + harnessExits.n + unknownExits.n === closedList.length,
         byExitReason,
         gateRPerPremiumR: GATE_R_BASIS_STRUCTURES.has(pair.structure) ? GATE_R_PER_PREMIUM_R : null,
+        // TRA-4246 (AC3) — and the divisor this cell's OWN rows measured,
+        // beside the gate's constant, so the two can never be mistaken for
+        // each other again.
+        stopRPerPremiumR: foldStopBasisDivisor(closedList),
         emptyByConstruction: list.length === 0,
       });
     }
@@ -481,6 +646,7 @@ export function foldOptionSleeveCells(rows: OptionTradeJournalRecord[]): OptionS
     underpoweredCells: cells.filter((c) => c.all.underpowered).map((c) => c.cell),
     unclassifiedExitReasons: [...unclassified].sort(),
     exitOwnerTable: OPTION_EXIT_REASON_TABLE,
+    exitReasonSupersedes,
     rBasis: 'premium',
     note:
       'TRA-3715. One cell per accountClass x structure x entryArchetype, emitted for ALL THREE '
@@ -492,8 +658,18 @@ export function foldOptionSleeveCells(rows: OptionTradeJournalRecord[]): OptionS
       + 'does not list lands in `unknownExits` and is named in `unclassifiedExitReasons`, never '
       + 'absorbed into strategy. Any slice with n < ' + SLEEVE_CELL_MIN_N + ' is labelled '
       + 'UNDERPOWERED and its avgR must not be read as a verdict. R is PREMIUM R '
-      + '(realizedPnlUsd / atRiskUsd); the cost-aware gate\'s R is 4x that wherever '
-      + 'gateRPerPremiumR is non-null. Window this with ?sinceEtDay=/&untilEtDay= (ET session '
+      + '(realizedPnlUsd / atRiskUsd); the COST-AWARE GATE\'s R is 4x that wherever '
+      + 'gateRPerPremiumR is non-null. TRA-4246: that 4x is the GATE\'S MODELLED stop '
+      + '(mark x 0.75) and is NOT the sleeve\'s armed stop -- single_leg_otm stops at '
+      + 'OTM_OPTIONS_SL_PCT 0.20 (premium x 0.80), a 5x, so converting premium R to '
+      + 'STOP-BASIS R through gateRPerPremiumR understates the magnitude by 20% on that '
+      + 'sleeve. Use stopRPerPremiumR, which is MEASURED on each cell\'s own closed rows '
+      + '(null where no row carries one; unanimous:false means NO single divisor describes '
+      + 'the cell and you must convert per row off the journal row\'s own '
+      + 'stopBasisRPerPremiumR). exitReasonSupersedes names every row whose headline '
+      + 'exitReason was written by a supersede over a different reason -- byExitReason '
+      + 'counts those rows under the NEW label, so a fold that cares which rule fired must '
+      + 'read that list. Window this with ?sinceEtDay=/&untilEtDay= (ET session '
       + 'days on closeTs) or the epoch-ms cohort params; unwindowed it is a LIFETIME fold.',
   };
 }

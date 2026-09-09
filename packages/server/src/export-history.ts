@@ -473,12 +473,26 @@ export function rowFromJournalRecord(r: OptionTradeJournalRecord): ExportTradeRo
     // TRA-3989 — `realizedR` is `realizedPnlUsd / atRiskUsd` = pnl ÷ FULL PREMIUM,
     // and `rowFromOption` now divides by the same thing, so a book-served row
     // and this one agree on `pnl_r` (the regression in
-    // `tra3989-export-r-basis.test.ts` holds the two mappers to it). The journal
-    // records no stop, so the stop-basis column is null here — a blank, never a
-    // premium figure re-scaled by a constant that is stale the day the stop is
-    // re-tuned (the `0.25` in `GATE_R_PER_PREMIUM_R` already is: the live OTM
-    // stop is `premium × 0.80`, a 5× not a 4×).
-    pnl_r_stop_basis: null,
+    // `tra3989-export-r-basis.test.ts` holds the two mappers to it).
+    //
+    // TRA-4246 (AC1) — the stop-basis column used to be a HARD `null` here,
+    // with the comment "the journal records no stop … never a premium figure
+    // re-scaled by a constant that is stale the day the stop is re-tuned (the
+    // `0.25` in `GATE_R_PER_PREMIUM_R` already is: the live OTM stop is
+    // `premium × 0.80`, a 5× not a 4×)". The refusal to re-scale was right and
+    // stands. What was wrong was the premise: the journal DOES record a stop
+    // now — the close row captures `|premiumPaid − stopLossPremium|` at the
+    // write, from the row's own operands, and publishes the divisor beside it
+    // (`stopBasisRPerPremiumR`). So this is the ROW's figure, never a constant
+    // applied to it, and a row that had no armed stop still publishes `null`
+    // with `pnlRStopBasisReason` on the journal record saying which kind of
+    // nothing it was.
+    //
+    // ⚠️ Forward-only. Every row closed before the stamp shipped carries no
+    // key at all and lands here as `null` — indistinguishable in THIS column
+    // from a stamped null, which is why the reason lives on the journal record
+    // and a grader reading the census must window on close date.
+    pnl_r_stop_basis: isFiniteNumber(r.pnlRStopBasis) ? r.pnlRStopBasis : null,
     // TRA-4027 — and the premium it divides by is the one captured at the OPEN
     // MARK (`atRiskUsd`, frozen at open by TRA-991), which is why the label
     // names the instant and not merely the unit. `premium_basis_usd` is that

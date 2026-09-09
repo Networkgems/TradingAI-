@@ -2499,6 +2499,41 @@ export interface OptionProfitLockFire {
   markAtFire: number;
   /** The executable bid the decision priced against (TRA-4285), `null` on an unquoted tick. */
   execBidAtFire: number | null;
+  /**
+   * TRA-4246 (AC2) — the decision's OWN operands, so "did the rule arm" and
+   * "where did it arm from" stop being inferences off a constant.
+   *
+   * `armed` is `ProfitLockDecision.armed` verbatim. On the give-back leg it is
+   * always `true` (an unarmed decision cannot set `shouldExit`), and it is
+   * published anyway BECAUSE it is: a `profit_lock` label on a row whose stamp
+   * says `armed:false` — or a `profit_lock` label carrying NO stamp at all —
+   * is a relabel artifact (a supersede, or the TRA-4317 close-path stamp), not
+   * a give-back release. That discrimination is the whole point of AC2, and it
+   * cannot be made from a field that is only written when it would read `true`
+   * unless the field EXISTS.
+   *
+   * ⛔ `peakPremiumAtFire` is NOT `OptionPosition.peakPremium`. Under TRA-4285
+   * the decision reads the EXECUTABLE peak (`peakPremiumExec`) whenever the
+   * tick served a usable bid, and only falls back to the mid high-water mark on
+   * an unquoted tick. Grading a release level against the mid peak when the
+   * rule decided on the bid peak reintroduces exactly the half-spread error
+   * TRA-4285 removed. This field is the peak the rule CONSUMED; which of the
+   * two it is, is readable off `execBidAtFire` (non-null ⇒ executable basis).
+   */
+  armed: boolean;
+  peakPremiumAtFire: number;
+  /** `ProfitLockDecision.peakR` — the peak excursion in stop-basis R. */
+  peakR: number;
+  /** The give-back allowance in force on this tick (base, tightened, or the rung's). */
+  giveBackR: number;
+  /**
+   * `ProfitLockDecision.R` — the stop-basis risk unit IN PREMIUM TERMS
+   * (`|premiumPaid − stopLossPremium|`) the rule divided by. This is the
+   * divisor AC3 is about, captured per row at the instant it was used, so
+   * `levelR` never has to be re-derived through a cell-level constant that
+   * models a different sleeve's stop.
+   */
+  stopBasisPremium: number;
 }
 /**
  * TRA-4030 (R4, the PDT column) — see `OptionPosition.profitFloorHeldForPdt`.

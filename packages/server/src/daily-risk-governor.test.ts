@@ -152,14 +152,32 @@ describe('DailyRiskGovernor — TRA-995 risk autopilot (tighten-only)', () => {
   });
 
   it('gates the equity leg on a stale feed and fires the halt listener exactly once', () => {
-    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    // TRA-4388 — the GATE half of this test is unchanged and is the load-bearing
+    // half: the equity leg is paused on the very first stale tick. What changed
+    // is the ALERT half. This used to fire on the raw false→true edge, and the
+    // gate legitimately flaps (720s threshold over a ~450s refresh cadence), so
+    // every round trip mailed — the reported "Risk Halt Triggered" hourly spam.
+    // The listener is now debounced on CONTINUOUS staleness, so the clock has to
+    // move for it to fire at all. Full behaviour + negative controls live in
+    // tra4388-feed-stale-alert-debounce.test.ts.
+    let now = Date.parse('2026-06-02T15:00:00Z');
+    const gov = new DailyRiskGovernor(() => new Date(now));
     const reasons: string[] = [];
     gov.setHaltListener((r) => reasons.push(r));
     gov.runAutopilot({ managedEquity: 100_000, feedStale: true });
-    gov.runAutopilot({ managedEquity: 100_000, feedStale: true }); // still stale
+
+    // The pause is immediate and is NOT debounced — only the email is.
     expect(gov.isHalted()).toBe(true);
     expect(gov.getHaltReason()).toMatch(/feed stale/i);
-    expect(reasons).toHaveLength(1); // false→true transition only
+    expect(reasons).toHaveLength(0);
+
+    // Ten ticks over an hour of unbroken staleness: one mail, not ten.
+    for (let i = 0; i < 10; i++) {
+      now += 6 * 60_000;
+      gov.runAutopilot({ managedEquity: 100_000, feedStale: true });
+    }
+    expect(gov.isHalted()).toBe(true);
+    expect(reasons).toHaveLength(1); // one EPISODE, however many ticks
   });
 
   // TRA-1072 AC1 — feed_stale is TRANSIENT + self-clearing, NOT day-latched. A
