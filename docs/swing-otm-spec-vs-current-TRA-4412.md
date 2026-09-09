@@ -39,7 +39,7 @@
 |---|---|---|
 | `liveOtmArmed` / `liveOtmRouting` | `true` / `true` | sleeve armed |
 | `otmEntryWindows` | `03:00-03:01 ET` (env) | **cannot intersect RTH** — the TRA-4217 hold |
-| `otmContractFloor.deltaBand` | **[0.495, 0.55]** (env) | compiled/ratified default is [0.25, 0.40] |
+| `otmContractFloor.deltaBand` | **[0.495, 0.55]** (env) | ⚠️ **this env IS the ratified TRA-3392/3394 mandate band** (`authorized`, n=100). The compiled default [0.25, 0.40] is the *stale* value — see §11 |
 | `otmContractFloor.dteBand` | **[10, 45]** (env) | compiled/ratified default is [21, 45] |
 | `otmContractFloor.premiumMin` | $0.50 | matches the card |
 | `otmContractFloor.dteHardFloor` | 7 | unspellable hard refuse |
@@ -90,7 +90,7 @@ Legend: ✅ shipped · 🟡 partial / shipped-but-off · ❌ absent
 |---|---|
 | DTE 21–60 (pref 25–45) | 🟡 ratified default [21,45] ✅; **live env is [10,45]** — looser than both the spec and our own card |
 | No 0DTE, no 1–7 DTE | ✅ `DAY_TRADING_GUARDRAIL.minEntryDteDays=7`, `minIdeaDteDays=21`, plus `dteHardFloor: 7` that is not env-spellable |
-| \|Δ\| 0.25–0.40 | 🟡 ratified default ✅ (`otm-contract-floor.ts`), **live env [0.495,0.55]** on TRA-3392 evidence |
+| \|Δ\| 0.25–0.40 | ❌ **and deliberately so.** The live [0.495,0.55] is the *ratified* band (TRA-3392/3394); 0.20–0.45 is `insufficient_evidence` on the mandate. The [0.25,0.40] in `otm-contract-floor.ts` is a stale compiled default, **not** an authorization — §11 |
 | Avoid extremely far OTM | ✅ and better than the spec — we have the tape proving why (n=695) |
 | Avoid illiquid / wide spread | 🟡 `option-spread-cost.ts`, `liquidity-gate.ts`, `pre-trade-liquidity` exist; `ENABLE_OPTION_LIQUIDITY_LIVE_ENFORCE` is **`armed: false`** |
 
@@ -157,7 +157,7 @@ exactly the kind of number that later gets retuned to fit the result.
 | Underlying price action as primary exit | ✅ `otmAtrInvalidationLevel` stamped at entry (`underlyingEntryPrice ∓ atrMult × ATR(14)`) — this *is* the structural-invalidation stop |
 | Profit target ladder, tested not assumed | ✅ `otm-profit-schedule.ts` — TP1 50%, profit-lock arm 0.75R, give-back 0.40R, tighten 0.25R, all env-recuttable with whole-set fail-closed |
 | Trailing stop on underlying | ✅ chandelier / trail exits (TRA-3941) |
-| Re-evaluate after 7–10 trading days | ⚠️ **we run 4.** `OPTION_SWING_TIME_STOP_TRADING_DAYS` defaults to **4** trading days — materially tighter than the spec, and tighter than our own 3–20 day target hold |
+| Re-evaluate after 7–10 trading days | ✅ **we run 10.** *(Corrected 2026-09-09 — this row previously read "we run 4", which was the **compiled default**, not the running value. `GET /api/health/option-swing-exits` on build `c7b452c0`: `{"tradingDays":10,"default":4,"overridden":true}`; Render env carries `OPTION_SWING_TIME_STOP_TRADING_DAYS="10"`. We are already inside the spec's 7–10 band.)* |
 | Never decay into final 14 DTE without reason | ❌ no explicit min-DTE exit rule |
 | Absolute max loss | ✅ premium stop −35% intraday from day one (TRA-3943) + −20% daily-close backstop |
 
@@ -231,10 +231,12 @@ evaluation windows with a named human verdict owner (TRA-3945). Paper mirrors li
 
 **Decide (not build):**
 
-6. **The 4-day vs 7–10-day time stop.** Direct contradiction between shipped behaviour and both the
-   spec and our own stated 3–20 day hold. Env-recuttable, no code change. QuantTrader's call.
+6. ~~**The 4-day vs 7–10-day time stop.**~~ **WITHDRAWN 2026-09-09 — there was no contradiction.**
+   The live value is **10** trading days; the 4 I reported was `OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT`,
+   the compiled constant. Nothing to decide. See §10.
 7. **Live DTE floor 10 vs ratified 21.** The live env is looser than the board card. Either
-   re-ratify 10 or restore 21; today they silently disagree.
+   re-ratify 10 or restore 21; today they silently disagree. **DECIDED 2026-09-09T01:42Z: restore 21**
+   (board card `2d618a1c`); executing in the 04:00–07:00Z 09-09 slot.
 8. **Risk per trade 1.0% vs the spec's 0.5–1.0%.** We sit at the ceiling by default.
 9. **`entryDeltaCeiling` still `observe`.** TRA-3392 §3 called arming this "the first item of the
    implementation ticket" on 2026-08-12. It is still observe-only, so the live admitted set exceeds
@@ -393,3 +395,72 @@ of an existing one (5.4, and it re-orders TRA-4413's queue), **shrinks** another
 
 Everything in this addendum remains post-freeze work. Nothing here changes what trades today: the
 sleeve is still held closed by TRA-4217 and the cost bar still admits nothing.
+
+---
+
+# §11 — CORRECTION (2026-09-09): the delta band. I had the authorization backwards.
+
+Board card `2d618a1c` was answered 2026-09-09T01:42Z: **restore_21 · widen_10 · widen_live ·
+arm_now**. Re-reading each answer against the **live routes** before executing surfaced that two of
+the four questions I asked carried a wrong premise, both from the same mistake — **I quoted compiled
+`_DEFAULT` constants as if they were the running configuration.** The time-stop case is fixed above
+and is harmless. This one is not, so it is recorded in full.
+
+## What I told the board
+
+> "Live |delta| band is [0.495, 0.55]; the spec (and our compiled default) says [0.25, 0.40]. The
+> 0.20-0.40 tape is n=190, positive means, no significance. … Unproven, not disproven."
+
+That frames the live band as an unexplained env pin sitting next to a friendlier default.
+
+## What `GET /api/health/otm-sleeve-mandate` actually ratifies
+
+```
+sleeve.authorizedBand = { from: 0.495, to: 0.55 }
+  "Half-open [from, to). BOUNDED ON BOTH SIDES — that is the point of the ticket."
+
+[0.00,0.20)   de_authorized          n=691   permanent; both cells clear Bonferroni, both negative
+[0.20,0.45)   insufficient_evidence  n=216   <-- the band this spec (and the compiled default) prefers
+[0.45,0.495)  not_authorized         n=59    measured AND powered; fails the lo95 >= 0.485 bar
+[0.495,0.55)  authorized             n=100   <-- what is live today
+[0.55,inf)    insufficient_evidence  n=20
+```
+
+**The live `[0.495, 0.55]` env is the enforcement of the ratified TRA-3392 / TRA-3394 mandate.** It is
+not drift. `[0.25, 0.40]` is a stale compiled constant in `otm-contract-floor.ts` plus this external
+spec — neither is a ratification.
+
+⛔ **`otm-contract-floor.ts` defaults are NOT the authorization.** The authorization lives in
+`/api/health/otm-sleeve-mandate`. These are two different artifacts and they disagree today.
+
+## Why this is not a pedantic distinction
+
+1. **DTE and delta diverge in opposite directions on the same file.** DTE: env 10 is the drift, card
+   21 is right → restoring 21 is correct. Delta: the env is right and the *default* is stale. A
+   single "restore the compiled defaults" sweep would fix one and break the other.
+2. **Widening live to [0.25, 0.40] puts 100% of admitted contracts outside the authorized band**, and
+   the mandate's own §5 pre-registers how that band reopens: **demo-only, five live-universe names,
+   n ≥ 100, PASS iff lo95 ≥ 0.485** — i.e. TRA-4053, armed 2026-09-08. Widening live now bypasses a
+   ratified protocol rather than merely preceding it.
+3. **It contradicts the board's own `arm_now` answer.** The entry-delta ceiling is a **ceiling only** —
+   its single reason code is `above_mandate_ceiling` and it never tests the lower edge. Arming it
+   while moving the floor to 0.25 produces a gate that is armed and **structurally cannot see** the
+   unauthorized population beneath it. That is our most-repeated failure shape, not a new one.
+4. **It is not inert.** `otmEntryWindows` is a 1-minute pin with `appliesTo: ["paper","live"]`, but it
+   opens — next open **2026-09-09T07:00:00Z** — with `liveOtmArmed: true` and two real-money books.
+   (The earlier claim in this doc that "nothing here changes what trades today" rested on the TRA-4217
+   hold; the hold throttles the window to one minute, it does not close it.)
+
+## Disposition
+
+- **Executing** items 1 (`OTM_CONTRACT_FLOOR_DTE_MIN` 10 → 21) and 4
+  (`ENABLE_OPTION_ENTRY_DELTA_CEILING_LIVE=1`; `mandateCeiling` is 0.55, non-null, so it bites) —
+  both tightenings, both closing a real gap.
+- **Item 2 is already the live state.** No action.
+- **Item 3 is HELD** and re-asked with the table above on card `439c4e46`. If the answer is unchanged
+  with the real authorization in view I execute it as given, paired with a TRA-3392 mandate amendment
+  so the selector and the authorization do not end up silently disagreeing in the other direction.
+
+**Grading rule this leaves behind:** `mandateCeiling === null` forces `mode:'off'` regardless of the
+flag, so the presence of the env key is *not* evidence the ceiling bites. Grade
+`mandate.ceiling.mode === 'enforce'`.
