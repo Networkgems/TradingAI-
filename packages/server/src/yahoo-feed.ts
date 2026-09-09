@@ -2996,7 +2996,23 @@ export async function testTwelveData(): Promise<{ symbol: string; bars: number }
   return { symbol: 'AAPL', bars: bars.length };
 }
 
-/** Whether the Yahoo rate-limit circuit breaker is currently open. */
+/**
+ * Whether the Yahoo rate-limit circuit breaker is currently open.
+ *
+ * TRA-4457 — this flag is GLOBAL to the whole Yahoo client (`rateLimitedUntil`,
+ * checked at the top of every `withRetry`), so it gates the daily-BAR pull
+ * `fetchDailyCandles` just as hard as the quote fan-out that usually trips it.
+ * That is the opposite arrangement to the Tradier breaker above, which TRA-1996
+ * deliberately split PER SOURCE so a bar-pull storm backs off bar pulls only. A
+ * caller that reads an empty bar array therefore cannot tell "upstream had
+ * nothing" from "we never asked" without consulting this.
+ *
+ * ⚠️ For diagnostics it is a SAMPLE, not a proof: the breaker can open or close
+ * during a caller's sweep, so a reading taken after a failed call attributes the
+ * most recent state, not necessarily the state at the moment of that call. Good
+ * enough to separate a starved sweep from a quiet one in aggregate; not good
+ * enough to attribute any single symbol with certainty.
+ */
 export function isYahooBreakerOpen(): boolean {
   return isRateLimited();
 }
