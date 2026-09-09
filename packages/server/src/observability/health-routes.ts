@@ -194,6 +194,17 @@ import {
   OTM_SLEEVE_MANDATE_PROVENANCE,
   OTM_SLEEVE_MANDATE_STRUCTURE,
 } from '../otm-sleeve-mandate.js';
+// TRA-4422 (parent TRA-4421) — the setup-taxonomy instrument's LIVE read.
+// ⛔ `setupTaxonomyHealth` is passed the live env explicitly; the compiled
+// default is never the answer to "what is the box doing".
+import {
+  setupTaxonomyHealth,
+  SETUP_CONFIRMATION_GATE,
+  OTM_SETUP_TAXONOMY_MODE_ENV,
+  OTM_SETUP_TAXONOMY_MODE_DEFAULT,
+  OTM_SETUP_TAXONOMY_SETUPS_ENV,
+} from '../otm-setup-gate.js';
+import { SETUP_TAXONOMY_REASON_CODES } from '@trading-app/engine';
 import {
   ENTRY_DELTA_CEILING_GATE,
   ENTRY_DELTA_CEILING_REASON_CODE,
@@ -5222,6 +5233,104 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         },
         durability: summary.durability,
       },
+      /**
+       * TRA-4422 (parent TRA-4421) — THE SETUP-TAXONOMY INSTRUMENT.
+       *
+       * ⛔ EVERY FIELD HERE IS A LIVE READ. `setupTaxonomyHealth` is handed
+       * `liveEnv`, never a compiled constant, because this desk has shipped a
+       * false green off a compiled default twice in the week before this
+       * landed (`otm-contract-floor.ts`'s band, and the swing time stop that
+       * compiles to 4 and runs at 10). `modeSource` says WHERE the live value
+       * came from, and `env_invalid` is its own value — an unparseable flag
+       * resolves to `observe` (the safe direction) but must never read back as
+       * though nobody set it. UNKNOWN IS NOT OFF.
+       */
+      setupTaxonomy: (() => {
+        const health = setupTaxonomyHealth(liveEnv);
+        const today = gateToday(SETUP_CONFIRMATION_GATE);
+        const retained = gateRetained(SETUP_CONFIRMATION_GATE);
+        // ⛔ DENSE OVER THE VOCABULARY, and an ARRAY. Two separate traps:
+        //  - Absent is not zero. The ledger's `byReason` only carries codes
+        //    that actually blocked, so a missing row would render as "no data"
+        //    when it means "this reason never fired". Every code gets a row.
+        //  - `.find(x => x.code === ...)`, never an index. The sibling
+        //    `retained.byGate` is an array and indexing it yields `undefined`,
+        //    which renders as accrual death (the TRA-4154 trap).
+        const denseByReasonCode = (rows: readonly { reasonCode: string; blocked: number; share: number | null }[] | undefined) =>
+          SETUP_TAXONOMY_REASON_CODES.map((code) => {
+            const hit = rows?.find((r) => r.reasonCode === code) ?? null;
+            return { code, blocked: hit?.blocked ?? 0, share: hit?.share ?? null };
+          });
+        const evaluated = retained?.evaluated ?? 0;
+        const blocked = retained?.blocked ?? 0;
+        // ⛔ `evaluated: 0` IS `unmeasured`, NEVER `pass`. A gate that never ran
+        // is not a gate that never bit, and the two are what this whole item
+        // exists to keep apart. `observing` is likewise distinct from any pass
+        // state: in observe the gate CANNOT block, so `blocked: 0` there is a
+        // property of the mode and carries no information about the taxonomy.
+        const status = evaluated === 0
+          ? 'unmeasured'
+          : health.mode === 'observe'
+            ? 'observing'
+            : blocked > 0 ? 'enforcing_biting' : 'enforcing_never_bit';
+        return {
+          issue: 'TRA-4422',
+          authorization: 'TRA-4421 §10 item 0; board comment adaebaa2 on TRA-4412 (2026-09-09)',
+          gate: SETUP_CONFIRMATION_GATE,
+          /** The LIVE mode, and where it came from. */
+          mode: health.mode,
+          modeSource: health.modeSource,
+          modeRaw: health.modeRaw,
+          source: `${OTM_SETUP_TAXONOMY_MODE_ENV} on this process (live read, not the compiled default `
+            + `'${OTM_SETUP_TAXONOMY_MODE_DEFAULT}')`,
+          flags: {
+            mode: OTM_SETUP_TAXONOMY_MODE_ENV,
+            setups: OTM_SETUP_TAXONOMY_SETUPS_ENV,
+          },
+          /** Armed setups. EMPTY is the shipped day-1 state, not a fault. */
+          setupsEnabled: health.setupsEnabled,
+          /** Names in the enable list matching no registered setup — reported, never dropped. */
+          setupsUnknown: health.setupsUnknown,
+          /** Every setup compiled into THIS build. The deployed-bytes read. */
+          setupsRegistered: health.setupsRegistered,
+          reasonCodeVocabulary: SETUP_TAXONOMY_REASON_CODES,
+          status,
+          evaluated,
+          blocked,
+          blockRate: retained?.blockRate ?? null,
+          byReasonCode: denseByReasonCode(retained?.byReason),
+          /** Blocks carrying no reason code — `byReasonCode`'s missing denominator. */
+          blockedUnclassified: retained?.blockedUnclassified ?? 0,
+          today: {
+            evaluated: today?.evaluated ?? 0,
+            blocked: today?.blocked ?? 0,
+            blockRate: today?.blockRate ?? null,
+            byReasonCode: denseByReasonCode(today?.byReason),
+            blockedUnclassified: today?.blockedUnclassified ?? 0,
+          },
+          note:
+            status === 'unmeasured'
+              ? 'UNMEASURED — the gate recorded NOTHING. This is NOT a pass. Either the seam is not '
+                + 'deployed on this build (check `build` above against the commit that shipped '
+                + '`otm-setup-gate.ts`), or no OTM nominee reached it at all. The seam is ordered '
+                + 'immediately ABOVE `entry_window` and below the nominator, so '
+                + '`setup_confirmation.evaluated` must EQUAL `entry_window.evaluated` on '
+                + '/api/health/live-enforce-gates; if that sibling is non-zero and this is 0, the '
+                + 'recorder is broken, not the sleeve idle.'
+              : health.mode === 'observe'
+                ? 'OBSERVE — the gate scores every nominee and REFUSES NOTHING, so `blocked: 0` here is a '
+                  + 'property of the mode and says nothing about the taxonomy. The counterfactual '
+                  + '("what would this have refused") is on the `TRA-4422, observe-safe` log line as '
+                  + '`wouldBlock`, with `setupsScored` beside it. ⛔ `setupsRegistered: []` means the '
+                  + 'registry is EMPTY, so every verdict is `series_unreadable` or `no_setup_matched` at '
+                  + '`setupsScored: 0` — read that as UNMEASURED per-row, never as "the taxonomy looked '
+                  + 'and found nothing". The enforce flip is a separate board act (card `70e36987`) and '
+                  + 'must relocate the refusal BELOW `entry_window` first.'
+                : 'ENFORCE — the gate is refusing. ⚠️ In this position (above `entry_window`) an '
+                  + 'enforcing gate SHRINKS that sibling\'s `evaluated`; the relocation owed at the '
+                  + 'enforce flip has not happened if you are reading this.',
+        };
+      })(),
       /**
        * How to read the counters, spelled out because the healthy read is a ZERO
        * and a zero is exactly what an inert gate produces.

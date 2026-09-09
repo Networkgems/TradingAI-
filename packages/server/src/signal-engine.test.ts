@@ -8210,7 +8210,14 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
     // row does not OPEN one). The fixture book's exit path is healthy ⇒ an
     // ADMIT. Same discipline: named row, exact total.
     expect(retained.find((g) => g.gate === 'exit_actionability')).toMatchObject({ evaluated: 1, blocked: 0 });
-    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(8);
+    // TRA-4422 — and a NINTH: the SETUP TAXONOMY scores every nominee and
+    // records the verdict in OBSERVE, where it cannot refuse. An ADMIT, and
+    // `blocked: 0` here is a property of the mode rather than of the taxonomy —
+    // the registry is empty, so nothing was scored. The row exists anyway,
+    // because a gate that only appears once it blocks cannot be graded on a
+    // quiet day. Same discipline: named row, exact total.
+    expect(retained.find((g) => g.gate === 'setup_confirmation')).toMatchObject({ evaluated: 1, blocked: 0 });
+    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(9);
   });
 
   // ─── TRA-3942 — the ORDERING claim, graded BEHAVIOURALLY ────────────────────
@@ -8259,8 +8266,20 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
     // exists). It is an ADMIT here and it is NOT in `BELOW_THE_WINDOW`, which
     // is the point — the window still starves everything beneath it.
     expect(refused.find((g) => g.gate === 'contract_floor')).toMatchObject({ evaluated: 1, blocked: 0 });
-    // Two decisions on the whole pass (chain admit + window block), and no broker order.
-    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(2);
+    // TRA-4422 — the SECOND gate that legitimately records above the window, and
+    // for this one the position is the whole deliverable rather than an accident
+    // of what it measures. ⛔ THIS ASSERTION IS THE BEHAVIOURAL PROOF OF THE
+    // PLACEMENT: the clock is refusing 100% of nominees under the TRA-4217 hold
+    // (03:00–03:01 ET, which cannot intersect RTH — 607/607 on 09-02, 671/671 on
+    // 09-03), so a setup gate ordered BELOW the window would read `evaluated: 0`
+    // here, forever, and be indistinguishable from never having been wired in.
+    // It reads 1. It is an ADMIT because observe cannot refuse, which is also
+    // what makes it safe up here: it eats none of `entry_window`'s denominator.
+    // ⚠️ That safety expires at the enforce flip — see `otmSetupTaxonomyDecision`.
+    expect(refused.find((g) => g.gate === 'setup_confirmation')).toMatchObject({ evaluated: 1, blocked: 0 });
+    // Three decisions on the whole pass (chain admit + taxonomy admit + window
+    // block), and no broker order.
+    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(3);
     expect(refusedStub.buyContractsLimit).not.toHaveBeenCalled();
 
     // POSITIVE CONTROL — move ONLY the clock, into the morning window (10:20 ET).

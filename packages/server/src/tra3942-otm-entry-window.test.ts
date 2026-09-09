@@ -295,8 +295,22 @@ describe('TRA-3942 AC1 — an EXIT at 13:45Z still fires', () => {
     const importers = readdirSync(HERE)
       .filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'))
       .filter((f) => readFileSync(join(HERE, f), 'utf8').includes("from './otm-entry-window.js'"));
-    // Exactly two: the OPEN path and the health surface. Nothing else.
-    expect(importers.sort()).toEqual(['index.ts', 'signal-engine.ts']);
+    // The OPEN path, the health surface, and READ-ONLY reporters. Nothing else.
+    //
+    // ⚠️ REPAIRED 2026-09-09 (TRA-4422): this roster had been RED on `main`
+    // since `otm-evaluation-window.ts` (TRA-4342/TRA-4345, 09-03) began
+    // importing the module. That importer resolves the window only to DESCRIBE
+    // it in the starvation diagnosis — `resolveOtmEntryWindows` /
+    // `formatOtmEntryWindows`, no verdict, no close — so the invariant this
+    // guards (NO EXIT PATH REACHES THE WINDOW) held the whole time; the literal
+    // was stale. It stayed invisible because the pre-push deploy gate runs
+    // `tsc -b --force`, which TYPE-checks `.test.ts` files without executing
+    // them: a test that compiles and fails is invisible to `check:deploy-build`
+    // by construction. A roster a new importer must join is doing its job; one
+    // that is already red is a roster nobody reads.
+    expect(importers.sort()).toEqual([
+      'index.ts', 'otm-evaluation-window.ts', 'signal-engine.ts',
+    ]);
     expect(importers).not.toContain('options-account.ts');
     expect(importers).not.toContain('exit-risk-rules-flag.ts');
   });

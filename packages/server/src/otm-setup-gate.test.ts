@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { Candle } from '@trading-app/shared';
 import type { SetupTaxonomyDefinition } from '@trading-app/engine';
 import {
@@ -193,5 +196,108 @@ describe('ledger census', () => {
     expect(row!.evaluated).toBe(2);
     expect(row!.blocked).toBe(1);
     clearLiveEnforceGateLedger();
+  });
+});
+
+// ─── THE SEAM, source-level (TRA-4422 §4) ────────────────────────────────────
+// The tra2331/tra3218/tra3942 house pattern: line numbers shift, symbols do
+// not. A predicate that is correct and unreached is the vacuous pass this repo
+// keeps paying for — and for THIS gate it is worse than vacuous, because an
+// unreached recorder publishes `evaluated: 0`, which is the exact reading the
+// instrument exists to make impossible.
+describe('TRA-4422 — the gate is WIRED into the OTM open, in the load-bearing position', () => {
+  const HERE = dirname(fileURLToPath(import.meta.url));
+  // Normalised to LF: the checkout is CRLF on Windows, and a source-level
+  // matcher that silently depends on the line ending is a grader that is green
+  // on one developer's box and red on another's.
+  const SRC = readFileSync(join(HERE, 'signal-engine.ts'), 'utf8').replace(/\r\n/g, '\n');
+  const CALL = 'const setupDecision = this.otmSetupTaxonomyDecision(';
+
+  it('the OTM scan calls it', () => {
+    expect(SRC.indexOf(CALL)).toBeGreaterThan(-1);
+    expect(SRC).toContain('private otmSetupTaxonomyDecision(');
+    expect(SRC).toContain("from './otm-setup-gate.js'");
+  });
+
+  // ⛔ THE PLACEMENT IS THE INSTRUMENT. Both bounds are load-bearing and they
+  // fail in opposite directions, so both are asserted.
+  it('is ordered BELOW the nominator and ABOVE `entry_window`', () => {
+    const call = SRC.indexOf(CALL);
+    const nominator = SRC.indexOf('const otmPick = selectAdmissibleOtmCandidate(');
+    const window = SRC.indexOf('const otmWindowReject = this.otmEntryWindowRejectReason(');
+    const costBar = SRC.indexOf("const otmCostReject = this.costAwareGateReject('single_leg_otm'");
+
+    // Above the nominator there is no nominee to stamp — nothing to score and
+    // nothing to record.
+    expect(call).toBeGreaterThan(nominator);
+
+    // ⛔ BELOW `entry_window` THE DENOMINATOR IS STRUCTURALLY ZERO. The TRA-4217
+    // hold pins the entry window to 03:00-03:01 ET, which cannot intersect RTH
+    // (refusals were 607/607 on 09-02 and 671/671 on 09-03). A gate ordered
+    // under it would be BORN reading `evaluated: 0` — indistinguishable from
+    // never having been wired in, which is the failure this item exists to
+    // detect. The design doc said only "above `cost_bar`"; that is necessary
+    // and NOT sufficient, and this assertion is the difference.
+    expect(window).toBeGreaterThan(call);
+    expect(costBar).toBeGreaterThan(call);
+  });
+
+  it('nothing sits between it and `entry_window`, so the two denominators are EQUAL', () => {
+    const call = SRC.indexOf(CALL);
+    const window = SRC.indexOf('const otmWindowReject = this.otmEntryWindowRejectReason(');
+    // `setup_confirmation.evaluated === entry_window.evaluated` is a checkable
+    // invariant on /api/health/live-enforce-gates ONLY while no other `continue`
+    // can fire between them. A new refusal slipped in here would silently break
+    // the equality — and the equality is how an operator tells "the recorder
+    // stopped" from "the sleeve went quiet".
+    const between = SRC.slice(call, window);
+    const guard = between.slice(between.indexOf('if (setupDecision.blocked) {'));
+    const tail = guard.slice(guard.indexOf('\n        }\n'));
+    expect(tail).not.toMatch(/\bcontinue;/);
+    expect(tail).not.toMatch(/scanRun\.reject\(/);
+  });
+
+  // ⛔ OBSERVE IS THE SHIPPED DEFAULT AND THE CALL SITE MUST NOT ASSUME IT.
+  // The refusal branch is WIRED, not stubbed: a mode flag that reads `enforce`
+  // and does nothing is the same class of lie this instrument was built to
+  // catch, and a branch that cannot execute cannot be a negative control.
+  it('wires a REAL refusal for enforce, surfaced on the feed and in `scanRun`', () => {
+    const call = SRC.indexOf(CALL);
+    const block = SRC.slice(call, SRC.indexOf('\n        }\n', call));
+    expect(block).toMatch(/if \(setupDecision\.blocked\) \{/);
+    expect(block).toMatch(/signal\.signalSkipReason = /);
+    expect(block).toMatch(/signal\.signalSkipReasonCode = /);
+    expect(block).toMatch(/this\.recentSignals\.unshift\(signal\); this\.emitSignalAlert\(signal\);/);
+    expect(block).toMatch(/scanRun\.reject\(/);
+    expect(block).toMatch(/\n\s+continue;/);
+  });
+
+  // The recorder writes on BOTH verdicts. Only the admits supply `evaluated`,
+  // and without a denominator "never had to bite" and "never wired in" are the
+  // same JSON — which is the whole thesis of this item.
+  it('records on BOTH verdicts, on the shared gate key, live-scoped like its siblings', () => {
+    const at = SRC.indexOf('private otmSetupTaxonomyDecision(');
+    const body = SRC.slice(at, SRC.indexOf('\n  }\n', at));
+    // Recorded OUTSIDE any `blocked` guard — the call is unconditional within
+    // the live branch.
+    expect(body).toMatch(/if \(this\.mode === 'live'\) \{[\s\S]*recordLiveEnforceDecision\(/);
+    // ⛔ AND NOTHING CONDITIONAL SITS BETWEEN THE TWO. Recording only the
+    // refusals is the single most common way this gate could be wrong and stay
+    // green: `evaluated` would then equal `blocked` forever, the denominator
+    // would be gone, and "the taxonomy never had to bite" would once again be
+    // unreadable — which is the entire defect this item was filed against. The
+    // regex above alone does NOT catch that; this does.
+    const anchor = "if (this.mode === 'live') {";
+    const live = body.slice(body.indexOf(anchor) + anchor.length);
+    const preamble = live.slice(0, live.indexOf('recordLiveEnforceDecision('));
+    expect(preamble).not.toMatch(/\bif \(/);
+    expect(preamble).not.toMatch(/\breturn\b/);
+    expect(body).toMatch(/'setup_confirmation',\s*\n\s*'single_leg_otm',\s*\n\s*decision\.blocked,/);
+    // No early return that would skip scoring — the verdict is computed on both
+    // branches, which is what buys the admit/refuse counterfactual.
+    expect(body).not.toMatch(/if \(this\.mode !== 'live'\) return/);
+    // ⛔ A cold cache becomes an EMPTY SERIES, which the taxonomy reads as
+    // `series_unreadable`. It must never be laundered into `no_setup_matched`.
+    expect(body).toMatch(/this\.shadowCandleCache\.get\(sym\) \?\? \[\]/);
   });
 });

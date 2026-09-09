@@ -319,7 +319,15 @@ describe('TRA-3944 AC4 — source-level: arm / row size / 2-row cap untouched; o
   it('no exit path imports the module', () => {
     const files = readdirSync(HERE).filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'));
     const importers = files.filter((f) => readFileSync(join(HERE, f), 'utf8').includes("from './otm-contract-floor.js'"));
-    expect(importers.sort()).toEqual(['index.ts', 'options-account.ts', 'signal-engine.ts']);
+    // ⚠️ REPAIRED 2026-09-09 (TRA-4422): RED on `main` since `morning-brief.ts`
+    // (TRA-3688, 09-04) began importing the module. It calls
+    // `resolveOtmContractFloor(env)` to REPORT the floor in the brief — a read,
+    // no verdict, no close — so the invariant (NO EXIT PATH REACHES THE FLOOR)
+    // held; the literal was stale. Invisible because `check:deploy-build` runs
+    // `tsc -b --force`, which type-checks test files without running them.
+    expect(importers.sort()).toEqual([
+      'index.ts', 'morning-brief.ts', 'options-account.ts', 'signal-engine.ts',
+    ]);
     // And inside the engine, no `checkExits`-side call.
     const exitsAt = ENGINE_SRC.indexOf('runOptionsExitPass');
     expect(exitsAt).toBeGreaterThan(-1);

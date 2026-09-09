@@ -36,6 +36,15 @@ import { TEST_ACCOUNT_PREFIX_ENV } from '../test-accounts.js'; // TRA-2478
 // TRA-3216 — the live OTM underlying allowlist + the enforcement-gate ledger it publishes through.
 import { OPTION_LIVE_OTM_UNIVERSE_VAR } from '../otm-live-universe-flag.js';
 import { clearLiveEnforceGateLedger, recordLiveEnforceDecision } from '../live-enforce-gate-ledger.js';
+// TRA-4422 — the setup-taxonomy readout. Imported as SYMBOLS rather than
+// retyped as literals: a test that grades a local copy of a string against
+// another local copy agrees with itself and proves nothing about the route.
+import {
+  SETUP_CONFIRMATION_GATE,
+  OTM_SETUP_TAXONOMY_MODE_ENV,
+  OTM_SETUP_TAXONOMY_SETUPS_ENV,
+} from '../otm-setup-gate.js';
+import { SETUP_TAXONOMY_REASON_CODES } from '@trading-app/engine';
 import type { OptionTradeJournalRecord, OptionTradeJournalOpen } from '../option-trade-journal.js';
 import {
   OPTION_TRADE_JOURNAL_FLAG,
@@ -6132,6 +6141,209 @@ describe('GET /api/health/otm-sleeve-mandate (TRA-3394)', () => {
     expect(body.ceiling.inForce).toBe(0.55); // the mandate stands
     expect(body.ceiling.rawOverride).toBe('0.80');
     expect(body.ceiling.overrideRejectedReason).toMatch(/ABOVE/);
+  });
+});
+
+// ─── TRA-4422 (parent TRA-4421) — the setup-taxonomy readout ──────────────────
+// Item 0 ships an instrument, not a setup, so the PAYLOAD is the deliverable and
+// every assertion below is a discriminator rather than a checkbox. The thing
+// being defended against is specific: a directional gate is a RESTRICTION, so a
+// working one and a dead one both push `opensPlaced` down and read identically
+// on every metric this sleeve publishes today. These tests exist to make the
+// two render differently.
+describe('GET /api/health/otm-sleeve-mandate — setupTaxonomy (TRA-4422)', () => {
+  const VARS = [OTM_SETUP_TAXONOMY_MODE_ENV, OTM_SETUP_TAXONOMY_SETUPS_ENV];
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const v of VARS) { saved[v] = process.env[v]; delete process.env[v]; }
+    clearLiveEnforceGateLedger();
+  });
+  afterEach(() => {
+    for (const v of VARS) {
+      if (saved[v] === undefined) delete process.env[v];
+      else process.env[v] = saved[v]!;
+    }
+    clearLiveEnforceGateLedger();
+  });
+
+  interface ReasonRow { code: string; blocked: number; share: number | null }
+  interface TaxonomyBlock {
+    gate: string;
+    mode: string;
+    modeSource: string;
+    modeRaw: string | null;
+    source: string;
+    setupsEnabled: string[];
+    setupsUnknown: string[];
+    setupsRegistered: string[];
+    reasonCodeVocabulary: string[];
+    status: string;
+    evaluated: number;
+    blocked: number;
+    blockRate: number | null;
+    byReasonCode: ReasonRow[];
+    blockedUnclassified: number;
+    today: { evaluated: number; blocked: number; byReasonCode: ReasonRow[] };
+    note: string;
+  }
+
+  function taxonomy(): TaxonomyBlock {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => undefined) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const res = fakeRes();
+    routes.get('/api/health/otm-sleeve-mandate')![0]!({}, res);
+    return (res.body as { setupTaxonomy: TaxonomyBlock }).setupTaxonomy;
+  }
+
+  function recordVerdict(blocked: boolean, reasonCode?: string) {
+    recordLiveEnforceDecision(
+      SETUP_CONFIRMATION_GATE, 'single_leg_otm', blocked, etDateString(new Date(NOW)),
+      blocked ? 'setup taxonomy refused' : undefined, NOW,
+      blocked ? { reasonCode } : {},
+    );
+  }
+
+  // ⛔ THE CENTRAL ACCEPTANCE. `evaluated: 0` is a gate that NEVER RAN, which is
+  // not a gate that never bit. If those two render alike the instrument is
+  // pointless, because "never wired in" is the failure mode it was built for.
+  it('renders a gate that recorded NOTHING as `unmeasured`, never as a pass', () => {
+    const t = taxonomy();
+    expect(t.evaluated).toBe(0);
+    expect(t.status).toBe('unmeasured');
+    expect(t.status).not.toBe('pass');
+    expect(t.note).toMatch(/UNMEASURED/);
+    expect(t.note).toMatch(/NOT a pass/);
+    // `blockRate` is null, never 0 — 0/0 is not a rate (TRA-1707/TRA-1682).
+    expect(t.blockRate).toBeNull();
+    // The zero must be attributable: the note names the sibling whose equality
+    // separates "recorder broken" from "sleeve idle".
+    expect(t.note).toMatch(/entry_window\.evaluated/);
+  });
+
+  // ⛔ THE TRA-4154 TRAP, asserted directly. `retained.byGate` is an ARRAY and
+  // indexing it returns `undefined`, which renders as accrual death. This field
+  // is an array too, so the test states the access pattern it requires.
+  it('publishes `byReasonCode` as an ARRAY, dense over the whole vocabulary', () => {
+    const t = taxonomy();
+    expect(Array.isArray(t.byReasonCode)).toBe(true);
+    // ABSENT IS NOT ZERO — every code has a row even though none has fired.
+    expect(t.byReasonCode.map((r) => r.code).sort())
+      .toEqual([...SETUP_TAXONOMY_REASON_CODES].sort());
+    expect(t.byReasonCode.find((r) => r.code === 'series_unreadable')!.blocked).toBe(0);
+    // Read with `.find`, not by index. This asserts the trap is live rather
+    // than merely commented: keying by name works, keying by position does not.
+    expect((t.byReasonCode as unknown as Record<string, ReasonRow>)['series_unreadable'])
+      .toBeUndefined();
+    // The vocabulary is published beside the counts so a reader can tell a code
+    // that scored zero from a code this build does not know about at all.
+    expect(t.reasonCodeVocabulary).toEqual([...SETUP_TAXONOMY_REASON_CODES]);
+    expect(t.reasonCodeVocabulary).toContain('series_unreadable');
+  });
+
+  // ⛔ THE NEGATIVE CONTROL. An unfailable field is not an instrument. This
+  // forces a refusal and asserts the published counter MOVES.
+  it('NEGATIVE CONTROL — a recorded refusal drives `blocked` off zero and out of `unmeasured`', () => {
+    const before = taxonomy();
+    expect(before.blocked).toBe(0);
+    expect(before.evaluated).toBe(0);
+    expect(before.status).toBe('unmeasured');
+
+    process.env[OTM_SETUP_TAXONOMY_MODE_ENV] = 'enforce';
+    recordVerdict(true, 'no_setup_matched');
+
+    const after = taxonomy();
+    expect(after.blocked).toBe(1);
+    expect(after.evaluated).toBe(1);
+    expect(after.blockRate).toBe(1);
+    expect(after.status).toBe('enforcing_biting');
+    expect(after.status).not.toBe('unmeasured');
+    // ...and the block lands on ITS OWN reason row, not in a lump.
+    expect(after.byReasonCode.find((r) => r.code === 'no_setup_matched')!.blocked).toBe(1);
+    expect(after.byReasonCode.find((r) => r.code === 'series_unreadable')!.blocked).toBe(0);
+    expect(after.blockedUnclassified).toBe(0);
+  });
+
+  // The split that keeps a broken box out of a bucket that is SUPPOSED to be
+  // large — same reason `entry_window` splits `clock_unreadable` from `closed`.
+  it('keeps `series_unreadable` in its own bucket, apart from the real negative', () => {
+    process.env[OTM_SETUP_TAXONOMY_MODE_ENV] = 'enforce';
+    recordVerdict(true, 'series_unreadable');
+    recordVerdict(true, 'series_unreadable');
+    recordVerdict(true, 'no_setup_matched');
+    const t = taxonomy();
+    expect(t.byReasonCode.find((r) => r.code === 'series_unreadable')!.blocked).toBe(2);
+    expect(t.byReasonCode.find((r) => r.code === 'no_setup_matched')!.blocked).toBe(1);
+    // A cold cache must never be laundered into "the taxonomy looked and found
+    // nothing" — the whole point of the split is that these two numbers differ.
+    expect(t.byReasonCode.find((r) => r.code === 'series_unreadable')!.blocked)
+      .not.toBe(t.byReasonCode.find((r) => r.code === 'no_setup_matched')!.blocked);
+  });
+
+  // An OBSERVE gate cannot block, so `blocked: 0` there is a property of the
+  // MODE. It must not read as a pass either — that is a different zero from the
+  // enforcing one and the payload has to say which it is holding.
+  it('distinguishes an OBSERVING zero from an enforcing one', () => {
+    recordVerdict(false); // an admit — the denominator the whole instrument is for
+    const t = taxonomy();
+    expect(t.mode).toBe('observe');
+    expect(t.evaluated).toBe(1);
+    expect(t.blocked).toBe(0);
+    expect(t.status).toBe('observing');
+    expect(t.status).not.toBe('unmeasured'); // it DID run
+    expect(t.note).toMatch(/REFUSES NOTHING/);
+    expect(t.note).toMatch(/property of the mode/);
+    // The empty registry has to be stated, or `no_setup_matched` reads as a
+    // real negative when nothing was ever scored.
+    expect(t.setupsRegistered).toEqual([]);
+    expect(t.note).toMatch(/registry is EMPTY/);
+  });
+
+  // ⛔ THE LIVE MODE, NOT THE COMPILED DEFAULT. Two false greens on this sleeve
+  // in the week before this shipped came from reading a `_DEFAULT` constant as
+  // the running value.
+  it('reports the LIVE mode with its source, and never launders a typo into the default', () => {
+    const dflt = taxonomy();
+    expect(dflt.mode).toBe('observe');
+    expect(dflt.modeSource).toBe('default');
+    expect(dflt.modeRaw).toBeNull();
+    expect(dflt.source).toMatch(new RegExp(OTM_SETUP_TAXONOMY_MODE_ENV));
+
+    process.env[OTM_SETUP_TAXONOMY_MODE_ENV] = 'enforce';
+    const set = taxonomy();
+    expect(set.mode).toBe('enforce');
+    expect(set.modeSource).toBe('env');
+
+    // UNKNOWN IS NOT OFF. A plausible typo resolves to the SAFE direction but
+    // must not read back as though nobody set the flag — otherwise an operator
+    // who believes the gate is armed and a gate that is not are the same JSON.
+    process.env[OTM_SETUP_TAXONOMY_MODE_ENV] = 'enforced';
+    const typo = taxonomy();
+    expect(typo.mode).toBe('observe');
+    expect(typo.modeSource).toBe('env_invalid');
+    expect(typo.modeSource).not.toBe('default');
+    expect(typo.modeRaw).toBe('enforced');
+  });
+
+  it('reports a setup id that matches nothing rather than dropping it', () => {
+    process.env[OTM_SETUP_TAXONOMY_SETUPS_ENV] = 'E,not_a_setup';
+    const t = taxonomy();
+    expect(t.setupsEnabled).toEqual([]); // registry is empty — nothing can arm
+    // "I enabled setup E" over a typo'd id is otherwise indistinguishable from
+    // "setup E is enabled and never confirms".
+    expect(t.setupsUnknown).toEqual(['E', 'not_a_setup']);
+  });
+
+  it('joins the ledger on the SAME gate key the recorder writes', () => {
+    expect(SETUP_CONFIRMATION_GATE).toBe('setup_confirmation');
+    recordVerdict(false);
+    expect(taxonomy().gate).toBe(SETUP_CONFIRMATION_GATE);
+    expect(taxonomy().evaluated).toBe(1);
   });
 });
 

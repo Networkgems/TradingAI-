@@ -367,7 +367,12 @@ describe('TRA-3953 — the predicate is WIRED into the OTM dedup', () => {
     for (const m of allStamps) {
       const line = ENGINE_SRC.slice(m.index!, ENGINE_SRC.indexOf('\n', m.index!));
       // Every other writer stamps a NAMED code from another module, never a literal.
-      expect(line).toMatch(/= (OTM_ENTRY_WINDOW_CLOSED_CODE|otmFloorPick\.code);/);
+      // TRA-4422 added a THIRD writer (the setup taxonomy), and it joins this
+      // roster rather than being exempted from it: `skipReasonCode` is resolved
+      // inside `otm-setup-gate.ts`, which owns the vocabulary, precisely so this
+      // line stays a named read. A census a new writer can slip past silently is
+      // not a census.
+      expect(line).toMatch(/= (OTM_ENTRY_WINDOW_CLOSED_CODE|otmFloorPick\.code|setupDecision\.skipReasonCode);/);
     }
   });
 });

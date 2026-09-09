@@ -33,6 +33,23 @@ export type SetupTaxonomyMode = 'observe' | 'enforce';
  */
 export type SetupTaxonomyModeSource = 'default' | 'env' | 'env_invalid';
 
+/**
+ * The gate key, shared by the recorder in `signal-engine.ts` and the health
+ * readout. ⛔ ONE CONSTANT, not two literals — the ledger is keyed on this
+ * string, and a health route folding on a typo'd copy reports `evaluated: 0`
+ * for a gate that is recording perfectly, which is the exact false reading this
+ * whole instrument exists to make impossible.
+ */
+export const SETUP_CONFIRMATION_GATE = 'setup_confirmation' as const;
+
+/**
+ * The code a refusal carries when the verdict somehow arrived without one.
+ * Unreachable in practice (`blocked` implies `!confirmed` implies a code) and
+ * exported anyway, so the engine's refusal branch can name it instead of
+ * spelling a string literal into the dedup key.
+ */
+export const SETUP_TAXONOMY_DEFAULT_REFUSAL_CODE: SetupTaxonomyReasonCode = 'no_setup_matched';
+
 export const OTM_SETUP_TAXONOMY_MODE_ENV = 'OTM_SETUP_TAXONOMY_MODE';
 export const OTM_SETUP_TAXONOMY_SETUPS_ENV = 'OTM_SETUP_TAXONOMY_SETUPS';
 
@@ -102,6 +119,23 @@ export interface OtmSetupGateDecision {
   readonly blocked: boolean;
   /** Null when the taxonomy confirmed; otherwise the low-cardinality code. */
   readonly reasonCode: SetupTaxonomyReasonCode | null;
+  /**
+   * The code to stamp on a refused signal, non-null EXACTLY when
+   * {@link OtmSetupGateDecision.blocked} is. Distinct from `reasonCode`, which
+   * is populated on admits-that-would-have-blocked too (the observe
+   * counterfactual) and would therefore mislabel an admitted signal.
+   *
+   * ⛔ IT EXISTS SO THE ENGINE CALL SITE STAMPS A NAMED CODE FROM THIS MODULE
+   * RATHER THAN A LITERAL. `signal-engine.ts` has one census
+   * (`tra3953-otm-window-refusal-dedupe.test.ts`) asserting that every writer of
+   * `signalSkipReasonCode` does exactly that: the field is the dedup's key, so
+   * two spellings of one refusal silently become two refusals.
+   *
+   * `undefined` rather than `null` so it assigns straight onto
+   * `SignalRecord.signalSkipReasonCode` (`string | undefined`) with no coercion
+   * at the call site — a `?? 'literal'` there is exactly what the census forbids.
+   */
+  readonly skipReasonCode: SetupTaxonomyReasonCode | undefined;
   readonly verdict: SetupTaxonomyVerdict;
   readonly mode: SetupTaxonomyMode;
   /**
@@ -135,6 +169,13 @@ export function evaluateOtmSetupGate(
   return {
     blocked,
     reasonCode: verdict.reasonCode,
+    // Non-null iff blocked. The `??` is unreachable in practice — `blocked`
+    // implies `!verdict.confirmed`, which implies a code — but it is the
+    // conservative direction and it keeps the literal HERE, in the module that
+    // owns the vocabulary, instead of at the engine call site.
+    skipReasonCode: blocked
+      ? (verdict.reasonCode ?? SETUP_TAXONOMY_DEFAULT_REFUSAL_CODE)
+      : undefined,
     verdict,
     mode,
     reason: blocked

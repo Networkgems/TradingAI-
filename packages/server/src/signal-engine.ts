@@ -224,6 +224,15 @@ import {
   type OtmContractFloorCode,
   type OtmContractFloorImportedAudit,
 } from './otm-contract-floor.js';
+// TRA-4422 (parent TRA-4421) — WHETHER THE UNDERLYING AGREES WITH THE WING.
+// OBSERVE-MODE INSTRUMENT: `evaluateOtmSetupGate` never refuses at the shipped
+// default and the registry is empty, so this import changes no capital
+// behaviour. It exists to give the first real setup a denominator.
+import {
+  evaluateOtmSetupGate,
+  SETUP_TAXONOMY_DEFAULT_REFUSAL_CODE,
+  type OtmSetupGateDecision,
+} from './otm-setup-gate.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
 import { sessionEdgeBlackoutVerdict } from './session-edge-blackout-flag.js';
@@ -8018,6 +8027,108 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-4422 (parent TRA-4421) — THE SETUP-TAXONOMY SEAM. Score the nominee's
+   * UNDERLYING and record the verdict under gate `setup_confirmation`.
+   *
+   * ⛔ OBSERVE BY DEFAULT: `evaluateOtmSetupGate` returns `blocked: false`
+   * unless `OTM_SETUP_TAXONOMY_MODE=enforce`, and the registry is empty, so at
+   * the shipped default this method refuses nothing and the caller ignores its
+   * `blocked` field. It is a recorder. The whole point is to have the
+   * admit/refuse counterfactual on live tape BEFORE any capital behaviour
+   * changes — a directional trigger is a restriction, and `opensPlaced` falls
+   * identically whether one works or is broken and confirming nothing.
+   *
+   * PLACEMENT, and it is load-bearing in both directions:
+   *
+   *  - BELOW the nominator (`selectAdmissibleOtmCandidate`). Above it there is
+   *    no nominee to stamp, so there is nothing to score and nothing to record.
+   *  - ABOVE `entry_window`. The design doc said only "above `cost_bar`", which
+   *    is necessary and NOT sufficient: the TRA-4217 hold currently pins the
+   *    entry window to 03:00-03:01 ET, which cannot intersect RTH (refusals were
+   *    607/607 on 09-02, 671/671 on 09-03). Anything ordered below the window
+   *    therefore has a STRUCTURALLY ZERO denominator for as long as that hold
+   *    stands — the instrument would be born reading `evaluated: 0`, which is
+   *    precisely the failure state it exists to detect and is indistinguishable
+   *    from never having been wired in.
+   *  - Immediately below the hour dedup, so `setup_confirmation.evaluated` and
+   *    `entry_window.evaluated` are the SAME population. That equality is a
+   *    checkable invariant on `/api/health/live-enforce-gates`; a divergence
+   *    means one of the two stopped recording.
+   *
+   * ⚠️ THE SAFETY OF SITTING ABOVE `entry_window` EXPIRES AT THE ENFORCE FLIP.
+   * It is safe here only because an observe gate cannot refuse and therefore
+   * cannot eat a sibling's denominator. An ENFORCING gate in this position would
+   * shrink `entry_window.evaluated` — the exact trap that gate's own comment
+   * block warns about. The enforce flip must relocate the refusal below
+   * `entry_window`, and that belongs with the four policy defaults still pending
+   * on board card `70e36987`, not here.
+   *
+   * ⚠️ SERIES TIMEFRAME. The only series available at this seam is the 5-minute
+   * `shadowCandleCache`, filled from `SUPERTREND_SHADOW_MINUTE_BARS = 2400`
+   * one-minute bars — 2400/390 ≈ 6.15 trading days. Every setup in the TRA-4421
+   * taxonomy is a multi-day thesis, so this depth is readable and still the
+   * WRONG TIMEFRAME for one. That is not papered over: `verdict.seriesSpanMs`
+   * is published on the tape precisely so the span is measured rather than
+   * re-derived from source later, and a daily-bar source is a named prerequisite
+   * for setup E (TRA-4423).
+   *
+   * LIVE-ONLY recording, matching `entry_window` and every other member of this
+   * ledger — it is the LIVE-enforce gate ledger, and a demo row in it would
+   * inflate a denominator the live sleeve did not produce.
+   */
+  private otmSetupTaxonomyDecision(
+    sym: string,
+    nomineeSide: OptionType,
+    nominator?: LiveEnforceNominator | null,
+  ): OtmSetupGateDecision {
+    const decision = evaluateOtmSetupGate({
+      symbol: sym,
+      // Absent from the cache ⇒ empty series ⇒ `series_unreadable`, which is a
+      // DIFFERENT bucket from `no_setup_matched` by construction. A cold cache
+      // must never launder into a real negative.
+      series: this.shadowCandleCache.get(sym) ?? [],
+      nomineeSide,
+    });
+    if (this.mode === 'live') {
+      recordLiveEnforceDecision(
+        'setup_confirmation',
+        'single_leg_otm',
+        decision.blocked,
+        etDateString(new Date()),
+        decision.reason ?? undefined,
+        Date.now(),
+        {
+          // ⛔ THE REASON CODE IS STAMPED ON BOTH VERDICTS' WORTH OF
+          // INFORMATION, but the ledger only retains `reasonCode` on BLOCKS
+          // (see `recordLiveEnforceDecision`). In observe nothing blocks, so
+          // `byReason` is empty by construction and the histogram the enforce
+          // decision needs comes off the structured log line below plus
+          // `evaluated`. That asymmetry is the ledger's, not this gate's, and
+          // it is why the observe verdict is ALSO logged with its code.
+          reasonCode: decision.blocked ? (decision.reasonCode ?? undefined) : undefined,
+          book: this.alertUsername ?? null,
+          nominator: nominator ?? null,
+        },
+      );
+      // The observe-mode counterfactual, at info level with a low-cardinality
+      // code. `wouldBlock` is the field the enforce proposal is argued from:
+      // it says what this gate WOULD have refused while refusing nothing.
+      log.info('OTM setup taxonomy verdict (TRA-4422, observe-safe)', {
+        sym,
+        mode: decision.mode,
+        confirmed: decision.verdict.confirmed,
+        reasonCode: decision.verdict.reasonCode,
+        wouldBlock: !decision.verdict.confirmed,
+        blocked: decision.blocked,
+        setupsScored: decision.verdict.setupsScored,
+        bars: decision.verdict.bars,
+        seriesSpanMs: decision.verdict.seriesSpanMs,
+      });
+    }
+    return decision;
+  }
+
+  /**
    * TRA-3944 — the OTM contract floor as THIS process resolves it. ONE
    * resolver for the scan path and the health surface (TRA-3829's rule: a
    * health route that re-derives a rule can report a refusal the scan is not
@@ -12660,6 +12771,55 @@ export class SignalEngine {
           mispricingPct: cheap.mispricingPct,
           delta: cheap.delta,
         };
+
+        // TRA-4422 (parent TRA-4421) — THE SETUP-TAXONOMY INSTRUMENT.
+        //
+        // Ordered here — below the nominator and the dedup, ABOVE
+        // `entry_window` — for the reasons in `otmSetupTaxonomyDecision`'s
+        // header. Nothing sits between this line and the window check, so
+        // `setup_confirmation.evaluated === entry_window.evaluated` is an exact
+        // invariant and a divergence means one of the two stopped recording.
+        //
+        // ⛔ AT THE SHIPPED DEFAULT THIS REFUSES NOTHING. `mode` is `observe`
+        // and the registry is empty, so `blocked` is unconditionally false and
+        // this is a pure recorder — a directional restriction is not shipping
+        // under an issue whose four governing policy defaults are still
+        // unratified on board card `70e36987`.
+        //
+        // The enforce branch below is nonetheless WIRED, not stubbed, because a
+        // mode flag that reads `enforce` and does nothing is the same class of
+        // lie this instrument exists to catch. It is also what makes the
+        // negative control able to move `blocked` off zero. ⚠️ An operator who
+        // sets `OTM_SETUP_TAXONOMY_MODE=enforce` against an EMPTY registry
+        // refuses the ENTIRE sleeve — every nominee scores `series_unreadable`
+        // or `no_setup_matched` — and the refusal must be loud on the feed
+        // rather than a silent zero, which is why it parks the signal exactly
+        // as the window refusal does.
+        const setupDecision = this.otmSetupTaxonomyDecision(sym, cheap.optionType, nominator);
+        if (setupDecision.blocked) {
+          const setupReject = setupDecision.reason ?? 'setup taxonomy refused';
+          signal.signalSkipReason = setupReject;
+          // TRA-3953's census: the low-cardinality twin is a NAMED code from
+          // the gate module, never a literal spelled at this call site — the
+          // dedup keys on this VALUE, so two spellings of one refusal become
+          // two refusals.
+          signal.signalSkipReasonCode = setupDecision.skipReasonCode;
+          if (this.mode === 'live') signal.liveSkipReason = setupReject;
+          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.dailySignals.push({
+            id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
+          });
+          log.warn('OTM open refused by setup taxonomy (TRA-4422, ENFORCE)', {
+            sym,
+            optionSymbol: cheap.optionSymbol,
+            mode: this.mode,
+            reasonCode: setupDecision.reasonCode,
+            setupsScored: setupDecision.verdict.setupsScored,
+          });
+          scanRun.reject(setupDecision.skipReasonCode ?? SETUP_TAXONOMY_DEFAULT_REFUSAL_CODE);
+          continue;
+        }
 
         // TRA-3942 (parent TRA-3927, board card `a29b2db8`) — THE ENTRY-TIME
         // WINDOW, and the FIRST cut on the OTM open in BOTH books.
