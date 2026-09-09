@@ -464,3 +464,87 @@ spec — neither is a ratification.
 **Grading rule this leaves behind:** `mandateCeiling === null` forces `mode:'off'` regardless of the
 flag, so the presence of the env key is *not* evidence the ceiling bites. Grade
 `mandate.ceiling.mode === 'enforce'`.
+
+---
+
+# Addendum 2 — the board reaffirmed, and the band turned out to be TWO knobs (2026-09-09T02:00Z)
+
+Card `439c4e46` was answered **`widen_live_anyway`** at 01:58:46Z, with the authorization table
+above in view. That is a decision made on correct facts and it is not re-opened here.
+
+## The execution trap: `deltaBand` and `selectorBand` are configured independently
+
+The live sleeve trades the **intersection** of two separately-configured bands. Measured off
+`/api/health/options-live` at 2026-09-09T02:03Z, build `c7b452c0`:
+
+| role | live value | env keys | module |
+|---|---|---|---|
+| contract floor — what the gate **admits** | `deltaBand [0.495, 0.55]` | `OTM_CONTRACT_FLOOR_DELTA_MIN` / `_MAX` | `otm-contract-floor.ts` |
+| selector — what the scanner **nominates** | `selectorBand [0.50, 0.55]` | `OTM_ADMISSIBLE_DELTA_MIN` / `_MAX` | `otm-admissible-strike.ts` |
+| composed verdict | `bandIntersectsSelector: true` | — | `otmContractFloorBandIntersects` |
+
+**Setting only the contract floor to [0.25, 0.40] does not widen the sleeve — it closes it.** The
+selector keeps nominating 0.50–0.55; the floor then refuses 100% of those nominations on
+`contract_floor_delta`; `bandIntersectsSelector` flips to `false`, which is also part of the
+evaluation window's own opening predicate (`otm-evaluation-window.ts:279`).
+
+The dangerous part is the instrument, not the outcome: after that half-execution the health route
+reports `deltaBand: [0.25, 0.40]` — **precisely the value that was requested** — over a sleeve that
+can no longer nominate anything. A pass and a total stop render identically.
+
+> **Grading rule.** Never grade a delta-band move on the band alone. The discriminator is
+> **`bandIntersectsSelector === true`**, asserted alongside both bands.
+
+This is not a new discovery about the code so much as one the code already warned about, in
+`otm-contract-floor.ts:77-86`: *"Composed as written — floor first, selector second — the live sleeve
+nominates NOTHING until one of the two bands moves … Which band moves is the board's call."* The
+answer is now on the record: **both** move.
+
+## Executed set (monitor 2026-09-09T04:15Z, one deploy)
+
+Six single-key upserts — never `PUT /env-vars`, which replaces the whole set:
+
+```
+OTM_CONTRACT_FLOOR_DTE_MIN              10    -> 21
+OTM_CONTRACT_FLOOR_DELTA_MIN            0.495 -> 0.25
+OTM_CONTRACT_FLOOR_DELTA_MAX            0.55  -> 0.40
+OTM_ADMISSIBLE_DELTA_MIN                0.50  -> 0.25
+OTM_ADMISSIBLE_DELTA_MAX                0.55  -> 0.40
+ENABLE_OPTION_ENTRY_DELTA_CEILING_LIVE  unset -> 1
+```
+
+then `node scripts/render-redeploy.mjs --commit=c7b452c0` — the SHA already serving, so this is a
+zero-byte code delta and stays inside the TRA-4383 feature freeze. DTE ceiling stays **45** (the
+ratified card), not the external spec's 60; widening it was never asked for.
+
+**Acceptance:** `deltaBand == [0.25, 0.4]` ∧ `selectorBand == [0.25, 0.4]` ∧
+`bandIntersectsSelector == true` ∧ `dteBand == [21, 45]` ∧ `mandate.ceiling.mode == 'enforce'`.
+
+## Why this is not money-moving on arrival — and the expiry on that claim
+
+Two independent reasons the admitted population stays empty:
+
+1. **TRA-4217's hold** still pins the live entry window to a 60-second slot that cannot intersect RTH.
+2. **The cost bar refuses the newly-opened cells on merit** — `barR = 0.385` against 0.20–0.30
+   (n=66, lo95 −0.063) and 0.30–0.40 (n=124, lo95 −0.215).
+
+⚠️ Reason 2 is a **rolling window, not a guarantee**. It holds only while those cells' lo95 stays
+below `barR`; the moment either crosses, this configuration becomes money-moving with no further
+human decision. That is the accepted risk, and it is why **TRA-4416** exists.
+
+## The armed ceiling is blind to the population it now sits above
+
+`ENABLE_OPTION_ENTRY_DELTA_CEILING_LIVE=1` arms a gate whose only reason code is
+`above_mandate_ceiling` (0.55). Every contract in [0.25, 0.40] passes it untouched, so
+`ceiling.mode: 'enforce'` will read green over a gate that structurally cannot bite. A ceiling-only
+gate cannot police a floor that was moved down.
+
+Also note `ENABLE_OPTION_ENTRY_DELTA_CEILING_LIVE_OBSERVE=1` is already set, and **enforce supersedes
+shadow** — verdicts move from the `entry_delta_ceiling_shadow` ledger gate to `entry_delta_ceiling`.
+The shadow gate going quiet is by design, not a regression.
+
+**TRA-4416** (`blocked` on the TRA-4384 freeze carrier through 09-18) carries the reconciliation:
+record the `439c4e46` override in `otm-sleeve-mandate` itself, expose a "selector band ⊆ authorized
+band" boolean so the disagreement is visible rather than implicit, have the ceiling declare
+`coversAdmittedBand: false` when it cannot bite, and prove TRA-4053's **demo** cohort stays disjoint
+from the new **live** [0.25, 0.40] population so its pre-registered n≥100 test is not contaminated.
