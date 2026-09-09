@@ -7387,8 +7387,40 @@ export class SignalEngine {
     return voided;
   }
 
+  /**
+   * TRA-4457 — stamp a completed sweep census onto the engine and log it.
+   *
+   * Factored out so the EMPTY-UNIVERSE sweep goes through the same publish as a
+   * real one. It used to `return` before any counter existed, which left
+   * `NO_UNIVERSE` reachable only from a unit test — i.e. the one verdict whose
+   * whole job is to name a distinct upstream fault was, in production, another
+   * silent sweep. That is the defect this ticket is about, one layer up.
+   */
+  private publishSma200Census(stats: Sma200ScanStats): void {
+    stats.finishedAt = Date.now();
+    this.lastSma200ScanStats = stats;
+    const starved = sma200SweepStarved(stats);
+    const verdict = sma200SweepVerdict(stats);
+    log.info('sma200 scan swept', {
+      component: 'sma200-scan', issue: 'TRA-4457',
+      considered: stats.considered,
+      evaluated: stats.evaluated,
+      starvedBreakerOpen: stats.starvedBreakerOpen,
+      starvedShortHistory: stats.starvedShortHistory,
+      fetchFailed: stats.fetchFailed,
+      fired: stats.fired,
+      voided: stats.voided,
+      maxDistAtr: stats.maxDistAtr,
+      durationMs: stats.finishedAt - stats.startedAt,
+      // The one field a grader actually needs: did this sweep have a population
+      // to find anything IN? `BLIND` means it did not, and no conclusion about
+      // the market may be drawn from the resulting empty feed.
+      starved,
+      verdict,
+    });
+  }
+
   private async runSma200Scan(symbols: string[]): Promise<void> {
-    if (symbols.length === 0) return;
     const SCAN_BATCH = 5;
     let fired = 0;
     // TRA-4457 — the sweep's own census. Measured 2026-09-09: while the Yahoo
@@ -7411,6 +7443,14 @@ export class SignalEngine {
       voided: 0,
       maxDistAtr: null,
     };
+    // TRA-4457 — an empty universe still owes a census. It is a DIFFERENT fault
+    // from a starved feed (the watchlist upstream, not the bar feed), which is
+    // why `sma200SweepVerdict` keeps `NO_UNIVERSE` separate from `BLIND`; a bare
+    // `return` here would have made that distinction unobservable in production.
+    if (symbols.length === 0) {
+      this.publishSma200Census(stats);
+      return;
+    }
     // TRA-3688 S-1 — the max-dist gate value in force for this whole sweep.
     // Resolved once per scan (not per symbol) so every signal fired by one
     // sweep is stamped with the same `maxDistAtr`. Default `Infinity` = dark.
@@ -7543,28 +7583,8 @@ export class SignalEngine {
     // a sweep starved by an open Yahoo breaker read zero bars for all 751
     // symbols and left no trace anywhere, so a 4h log query for `sma200-scan`
     // came back with 0 lines — indistinguishable from a healthy quiet sweep.
-    stats.finishedAt = Date.now();
     stats.fired = fired;
-    this.lastSma200ScanStats = stats;
-    const starved = sma200SweepStarved(stats);
-    const verdict = sma200SweepVerdict(stats);
-    log.info('sma200 scan swept', {
-      component: 'sma200-scan', issue: 'TRA-4457',
-      considered: stats.considered,
-      evaluated: stats.evaluated,
-      starvedBreakerOpen: stats.starvedBreakerOpen,
-      starvedShortHistory: stats.starvedShortHistory,
-      fetchFailed: stats.fetchFailed,
-      fired: stats.fired,
-      voided: stats.voided,
-      maxDistAtr: stats.maxDistAtr,
-      durationMs: stats.finishedAt - stats.startedAt,
-      // The one field a grader actually needs: did this sweep have a population
-      // to find anything IN? `BLIND` means it did not, and no conclusion about
-      // the market may be drawn from the resulting empty feed.
-      starved,
-      verdict,
-    });
+    this.publishSma200Census(stats);
   }
 
   /**

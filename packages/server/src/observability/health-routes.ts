@@ -202,6 +202,8 @@ import {
   setupTaxonomyHealth,
   SETUP_CONFIRMATION_GATE,
   SETUP_CONFIRMATION_SIBLING_GATE,
+  SETUP_CONFIRMATION_EXPECT_ROWS_AFTER_OPEN_MS,
+  scanWindowOpenMsSince,
   OTM_SETUP_TAXONOMY_MODE_ENV,
   OTM_SETUP_TAXONOMY_MODE_DEFAULT,
   OTM_SETUP_TAXONOMY_SETUPS_ENV,
@@ -5289,17 +5291,20 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         // started. Until it does, NOTHING has been recorded by anything, the
         // comparison has no subject, and the note below must not accuse.
         //
-        // ⛔ `comparable: false` is not a pass either. It says "ask again after
-        // the sleeve's next sweep", which is why `sinceProcessStartMs` is
-        // published beside it — a box that has been up for hours with
-        // `comparable` still false is a sleeve that is not scanning at all, and
-        // that is a real finding wearing the same clothes.
+        // ⛔ `comparable: false` is not a pass either — but it is NOT an alarm on
+        // its own, and the FIRST out-of-hours read proved that (Finding 3, see
+        // `scanWindowOpenMsSince`). The scan is gated on `isStockMarketOpen()`,
+        // so outside 09:30-16:00 ET `comparable` cannot become true however long
+        // the box is up. The escalation term is therefore `scanWindow.expectRows`
+        // — IN-WINDOW time since boot — never wall-clock `sinceProcessStartMs`,
+        // which is published only as the raw reading behind it.
         const setupBuild = resolveBuildInfo();
         const processStartMs = Date.parse(setupBuild.startedAt);
         const siblingToday = gateToday(SETUP_CONFIRMATION_SIBLING_GATE);
         const comparable = Number.isFinite(processStartMs)
           && typeof summary.lastDecisionAt === 'number'
           && summary.lastDecisionAt >= processStartMs;
+        const scanWindow = scanWindowOpenMsSince(processStartMs, nowMs);
         const crossCheck = {
           sibling: SETUP_CONFIRMATION_SIBLING_GATE,
           /** Both are the `today` (ET-day) folds — the same scope, or the comparison is meaningless. */
@@ -5312,14 +5317,45 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
             : null,
           processStartedAt: setupBuild.startedAt,
           sinceProcessStartMs: Number.isFinite(processStartMs) ? Math.max(0, nowMs - processStartMs) : null,
+          /**
+           * TRA-4422 Finding 3 — the OPPORTUNITY the ledger has actually had.
+           * `marketOpenNow` is the scan's own gating predicate; `openMsSinceStart`
+           * integrates it from boot to now; `expectRows` is the only term that
+           * may be read as escalation. ⛔ `expectRows: false` beside
+           * `comparable: false` is NOT RUN (out of window), not a quiet box.
+           */
+          scanWindow: {
+            marketOpenNow: scanWindow.marketOpenNow,
+            openMsSinceStart: scanWindow.openMsSinceStart,
+            openMsTruncated: scanWindow.truncated,
+            expectRows: scanWindow.expectRows,
+            thresholdMs: SETUP_CONFIRMATION_EXPECT_ROWS_AFTER_OPEN_MS,
+            gatedOn: 'shouldRunOtmScan({ marketOpen: isStockMarketOpen() }) — signal-engine.ts',
+          },
           /** Only meaningful when `comparable`; `null` says so rather than forging a verdict. */
           holds: comparable ? (today?.evaluated ?? 0) === (siblingToday?.evaluated ?? 0) : null,
+          /**
+           * ⛔ THE ESCALATION FLAG, and the only field here that should page.
+           * True ONLY when the box has had real in-window time and still wrote
+           * nothing — that is a sleeve that is not scanning during the session.
+           */
+          notScanning: !comparable && scanWindow.expectRows,
           reason: comparable
             ? 'this process has written ledger rows, so the ET-day folds are its own and the equality binds'
-            : 'NOT COMPARABLE — the ledger has recorded nothing since this process started, so every row in '
-              + 'both `today` folds was hydrated from disk and written by a PREVIOUS build. A non-zero '
-              + 'sibling beside a zero here proves NOTHING about the recorder (measured 2026-09-09, the '
-              + '21:08:11Z swap onto 8e51be03). Re-read after the OTM sweep has run once.',
+            : scanWindow.expectRows
+              ? 'NOT COMPARABLE AND OVERDUE — this process has had '
+                + `${Math.round(scanWindow.openMsSinceStart / 60_000)} minutes of market-open time since boot `
+                + 'and has still written no ledger row. The out-of-window explanation does NOT apply. '
+                + 'Treat as a sleeve that is not scanning during the session and investigate '
+                + '`shouldRunOtmScan`\'s other terms (autoTradingEnabled, halted, hasScanner, '
+                + 'skipOptionsForLiveEquityOnly).'
+              : 'NOT RUN (out of window) — the ledger has recorded nothing since this process started, so '
+                + 'every row in both `today` folds was hydrated from disk and written by a PREVIOUS build. '
+                + 'A non-zero sibling beside a zero here proves NOTHING about the recorder (measured '
+                + '2026-09-09, the 21:08:11Z swap onto 8e51be03). The scan is gated on isStockMarketOpen(), '
+                + `and only ${Math.round(scanWindow.openMsSinceStart / 60_000)} minutes of market-open time `
+                + 'have elapsed since boot, so this zero is STRUCTURALLY GUARANTEED and carries no '
+                + 'information either way. Re-read inside 09:30-16:00 ET.',
         };
         // ⛔ `evaluated: 0` IS `unmeasured`, NEVER `pass`. A gate that never ran
         // is not a gate that never bit, and the two are what this whole item
@@ -5383,7 +5419,17 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
                     ? 'comparable=true and the equality HOLDS — this zero is the sleeve\'s own.'
                     : 'comparable=true and the equality is VIOLATED — the recorder is broken, not the '
                       + 'sleeve idle. This is the alarm.')
-                  : 'comparable=false right now, so the sibling carries no information about this gate.')
+                  : crossCheck.notScanning
+                    ? 'comparable=false, and ⛔ `crossCheck.notScanning` is TRUE — the box has had '
+                      + `${Math.round(crossCheck.scanWindow.openMsSinceStart / 60_000)} minutes of `
+                      + 'market-open time since boot and wrote no ledger row at all. This is the alarm: '
+                      + 'the sleeve is not scanning during the session.'
+                    : 'comparable=false and `crossCheck.scanWindow.expectRows` is FALSE — the OTM scan is '
+                      + 'gated on isStockMarketOpen() and has had '
+                      + `${Math.round(crossCheck.scanWindow.openMsSinceStart / 60_000)} minutes of `
+                      + 'market-open time since boot, so this zero is NOT RUN (out of window). It is '
+                      + 'structurally guaranteed, it is not an alarm, and it is not a pass. Re-read '
+                      + 'inside 09:30-16:00 ET.')
               : health.mode === 'observe'
                 ? 'OBSERVE — the gate scores every nominee and REFUSES NOTHING, so `blocked: 0` here is a '
                   + 'property of the mode and says nothing about the taxonomy. The counterfactual '
