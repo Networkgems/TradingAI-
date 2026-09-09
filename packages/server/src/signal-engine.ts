@@ -158,6 +158,7 @@ import { resolveCloseGrant } from './tra3926-oversold-close-detector.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 // TRA-2193 — per-scan liveness for the paths that journal `single_leg_rv`.
 import { beginRvScan, type RvScanPathId, type RvScanRecord } from './rv-scan-telemetry.js';
+import { maybeCaptureTermStructureShadow } from './term-structure-shadow.js'; // TRA-4413 item 4
 // TRA-4350 — the RETAINED half of that liveness. `beginRvScan`'s counters are
 // since-boot on a box that self-restarts 6–12 times a session, so they cannot
 // testify about the day someone is actually asking about.
@@ -11160,7 +11161,21 @@ export class SignalEngine {
       scanRun.enterSymbol();
       try {
         const result = await this.rvScanner.scan(sym, scanOpts, dtePrefs);
-        if (result.reason === 'ok') scanRun.fetchOk();
+        if (result.reason === 'ok') {
+          scanRun.fetchOk();
+          // TRA-4413 item 4 — flag-gated (default OFF), throttled, observe-only
+          // term-structure SHADOW capture. Fired off the healthy-chain read (not
+          // the candidate pick) because it grades the SURFACE, and a zero-
+          // candidate chain is exactly as informative to it. Fire-and-forget:
+          // the module never throws, and the entry decision below must not wait
+          // on the extra chain fetches.
+          void maybeCaptureTermStructureShadow({
+            symbol: sym,
+            scanner: this.rvScanner,
+            dtePrefs,
+            spot: result.spot,
+          });
+        }
         if (result.reason !== 'ok' || result.candidates.length === 0) {
           scanRun.reject(result.reason !== 'ok' ? `scan:${result.reason}` : 'no_candidates');
           continue;
@@ -12569,7 +12584,19 @@ export class SignalEngine {
         // A usable chain came back, so the market-data leg is healthy as of now.
         // This is what lets `dataSource.lastFetchOkAt` separate a dead feed from
         // a quiet tape on the OTM axis specifically.
-        if (result.reason === 'ok') scanRun.fetchOk();
+        if (result.reason === 'ok') {
+          scanRun.fetchOk();
+          // TRA-4413 item 4 — same flag-gated term-structure SHADOW capture as
+          // the RV loop. Wired HERE too because this is the path that actually
+          // runs in prod (RV_ENGINE_ENABLED default-off retires the RV loop);
+          // the module's per-symbol throttle dedupes when both fire.
+          void maybeCaptureTermStructureShadow({
+            symbol: sym,
+            scanner: this.rvScanner!,
+            dtePrefs,
+            spot: result.spot,
+          });
+        }
         // TRA-3557 — SPLIT, not pooled. A provider/data failure and a genuinely
         // empty chain are different facts about the world and pooling them
         // re-creates this ticket's own ambiguity one level down: `no_candidates`

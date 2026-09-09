@@ -2,11 +2,14 @@ import {
   TradierOptionsClient,
   findRelativeValueOpportunities,
   findMispricedOtmContracts,
+  findTermStructureDislocations,
   type OptionChainRow,
   type RelativeValueCandidate,
   type OtmMispricingCandidate,
   type OtmScannerOptions,
   type RelativeValueScannerOptions,
+  type TermStructureOptions,
+  type TermStructureReport,
 } from '@trading-app/engine';
 import { logger } from './observability/index.js';
 
@@ -111,6 +114,42 @@ export interface RelativeValueScanResult {
     | 'no_expirations'
     | 'no_chain'
     | 'breaker_open'
+    | 'fetch_error';
+  errorMessage?: string;
+}
+
+/**
+ * TRA-4413 item 4 — how many chains (one per expiration) a single
+ * term-structure scan may fetch. The engine's term fit needs ≥3 distinct
+ * expirations per delta bucket to z-score anything, so 4 buys one point of
+ * redundancy; a fifth chain costs another Tradier call per symbol per capture
+ * for marginal fit leverage. When the DTE window holds more than 4, the pick
+ * is spread evenly across the ascending list (first/last always included) so
+ * the √T axis keeps its span instead of clustering short-dated.
+ */
+export const MAX_TERM_EXPIRATIONS = 4;
+
+/**
+ * TRA-4413 item 4 — cross-expiration term-structure scan result. Mirrors
+ * {@link RelativeValueScanResult}'s discriminated-reason contract; `report` is
+ * the engine's {@link TermStructureReport} (present iff `reason === 'ok'`).
+ * `no_expirations` here means "fewer than 2 listed expirations inside the DTE
+ * window" — a single-expiration chain has no term axis at all, so the scan
+ * refuses loudly rather than letting the engine report empty buckets.
+ */
+export interface TermStructureScanResult {
+  symbol: string;
+  spot: number | null;
+  /** Expirations whose chains fed the report (ascending). Empty on failure. */
+  expirations: string[];
+  report: TermStructureReport | null;
+  reason:
+    | 'ok'
+    | 'no_credentials'
+    | 'breaker_open'
+    | 'no_spot'
+    | 'no_expirations'
+    | 'no_chain'
     | 'fetch_error';
   errorMessage?: string;
 }
@@ -265,6 +304,25 @@ export interface RelativeValueScannerService {
     opts?: OtmScannerOptions,
     dtePrefs?: DtePrefs,
   ): Promise<OtmMispricingScanResult>;
+  /**
+   * TRA-4413 item 4 — SHADOW cross-expiration term-structure scan. Fetches up
+   * to {@link MAX_TERM_EXPIRATIONS} chains inside the caller's DTE window
+   * (riding the same 60s chain cache + breaker as {@link scan}) and runs the
+   * engine's `findTermStructureDislocations` over the concatenated rows.
+   * `opts.spot` lets a caller that JUST resolved the underlying spot (every
+   * scan-path caller has) skip the second `fetchSpot` — the spot leg is the
+   * quota-constrained one (TRA-4357). Observe-only: never trades, and the
+   * result's `markCalendarViolations` is the negative control that voids the
+   * scan's own dislocations when non-zero.
+   *
+   * OPTIONAL on the interface, same contract as {@link getOptionQuote}: a
+   * scanner without it simply produces no term-structure shadow rows.
+   */
+  scanTermStructure?(
+    symbol: string,
+    dtePrefs?: DtePrefs,
+    opts?: { spot?: number | null; termOptions?: TermStructureOptions },
+  ): Promise<TermStructureScanResult>;
   /**
    * Look up the current per-share mark for a contract belonging to `symbol`'s
    * `expiration` chain. Reads from the same cached snapshot used by `scan()`
@@ -508,6 +566,103 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     }
     const candidates = findMispricedOtmContracts(snap.rows, snap.spot, { now: this.now(), ...opts });
     return { symbol: snap.symbol, spot: snap.spot, expiration: snap.expiration, candidates, reason: 'ok' };
+  }
+
+  /**
+   * TRA-4413 item 4 — see the interface doc. Chain fetches ride the 60s cache,
+   * so a capture that follows a same-symbol RV/OTM scan re-uses that scan's
+   * chain for its expiration and pays only for the ADDITIONAL expirations
+   * (≤ {@link MAX_TERM_EXPIRATIONS} − 1 upstream calls when the cache is warm).
+   */
+  async scanTermStructure(
+    symbol: string,
+    dtePrefs: DtePrefs = {},
+    opts: { spot?: number | null; termOptions?: TermStructureOptions } = {},
+  ): Promise<TermStructureScanResult> {
+    const upper = symbol.trim().toUpperCase();
+    const fail = (
+      reason: TermStructureScanResult['reason'],
+      spot: number | null = null,
+      errorMessage?: string,
+    ): TermStructureScanResult => ({
+      symbol: upper,
+      spot,
+      expirations: [],
+      report: null,
+      reason,
+      ...(errorMessage === undefined ? {} : { errorMessage }),
+    });
+
+    if (!this.client) return fail('no_credentials');
+    if (this.isBreakerOpen()) return fail('breaker_open');
+
+    // Spot: trust a caller-provided read (the scan paths resolved one moments
+    // ago against the SAME 60s-coherent chain cache — TRA-4357) and only fetch
+    // when running standalone.
+    let spot: number | null;
+    if (opts.spot != null && Number.isFinite(opts.spot) && opts.spot > 0) {
+      spot = opts.spot;
+    } else {
+      try {
+        spot = await this.fetchSpot(upper);
+      } catch (err) {
+        return fail('fetch_error', null, err instanceof Error ? err.message : String(err));
+      }
+      if (spot == null || !Number.isFinite(spot) || spot <= 0) return fail('no_spot');
+    }
+
+    let windowed: Awaited<ReturnType<typeof this.resolveWindowedExpirations>>;
+    try {
+      windowed = await this.resolveWindowedExpirations(upper, dtePrefs);
+    } catch (err) {
+      this.tripBreaker(`getExpirations(${upper}) failed`, err);
+      return fail('fetch_error', spot, err instanceof Error ? err.message : String(err));
+    }
+    // A term axis needs at least two expirations; below that the scan refuses
+    // with its own reason rather than handing the engine a degenerate input
+    // (whose per-bucket `insufficient_expirations` would misattribute a
+    // symbol-level fact to every bucket).
+    if (!windowed || windowed.inWindow.length < 2) return fail('no_expirations', spot);
+
+    // Up to MAX_TERM_EXPIRATIONS, spread evenly across the ascending in-window
+    // list with first/last always kept — the √T fit's leverage lives in the
+    // span, not in adjacent weeklies.
+    const all = windowed.inWindow;
+    let picked: Array<{ d: string; ms: number }>;
+    if (all.length <= MAX_TERM_EXPIRATIONS) {
+      picked = all;
+    } else {
+      const idx = new Set<number>();
+      for (let i = 0; i < MAX_TERM_EXPIRATIONS; i += 1) {
+        idx.add(Math.round((i * (all.length - 1)) / (MAX_TERM_EXPIRATIONS - 1)));
+      }
+      picked = [...idx].sort((a, b) => a - b).map((i) => all[i]!);
+    }
+
+    const rows: OptionChainRow[] = [];
+    for (const exp of picked) {
+      let chain: OptionChainRow[];
+      try {
+        chain = await this.fetchChain(upper, exp.d);
+      } catch (err) {
+        this.tripBreaker(`getChainSnapshot(${upper},${exp.d}) failed`, err);
+        return fail('fetch_error', spot, err instanceof Error ? err.message : String(err));
+      }
+      if (chain) rows.push(...chain);
+    }
+    if (rows.length === 0) return fail('no_chain', spot);
+
+    const report = findTermStructureDislocations(rows, spot, {
+      now: this.now(),
+      ...opts.termOptions,
+    });
+    return {
+      symbol: upper,
+      spot,
+      expirations: picked.map((e) => e.d),
+      report,
+      reason: 'ok',
+    };
   }
 
   async getSelectorChain(
@@ -782,6 +937,34 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
   }
 
   private async pickExpiration(symbol: string, dtePrefs: DtePrefs = {}): Promise<string | null> {
+    const windowed = await this.resolveWindowedExpirations(symbol, dtePrefs);
+    if (!windowed || windowed.inWindow.length === 0) return null;
+
+    // Pick the expiration closest to `target`. On ties (equal absolute
+    // distance) prefer the earlier expiration — matches the spec example
+    // (target=35; 30d and 45d both 5d off → pick 30d) and biases sizing
+    // toward shorter dated, less theta-sensitive contracts.
+    const byTarget = [...windowed.inWindow].sort((a, b) => {
+      const da = Math.abs(a.ms - windowed.targetMs);
+      const db = Math.abs(b.ms - windowed.targetMs);
+      if (da !== db) return da - db;
+      return a.ms - b.ms;
+    });
+    return byTarget[0]!.d;
+  }
+
+  /**
+   * TRA-4413 item 4 — the DTE-window resolution `pickExpiration` has always
+   * performed, extracted so the term-structure scan can read the WHOLE
+   * in-window list instead of the single target-nearest pick. Same cache,
+   * same coercion rules, same window arithmetic; `pickExpiration`'s selection
+   * semantics are unchanged (its target-distance sort now runs on a copy).
+   * Returns the in-window expirations ASCENDING by date.
+   */
+  private async resolveWindowedExpirations(
+    symbol: string,
+    dtePrefs: DtePrefs = {},
+  ): Promise<{ inWindow: Array<{ d: string; ms: number }>; targetMs: number } | null> {
     const cached = this.expirationsCache.get(symbol);
     let expirations: string[];
     if (cached && this.now() - cached.at < EXPIRATIONS_CACHE_TTL_MS) {
@@ -829,20 +1012,9 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
 
     const inWindow = expirations
       .map((d) => ({ d, ms: Date.parse(`${d}T00:00:00Z`) }))
-      .filter((e) => Number.isFinite(e.ms) && e.ms >= minMs && e.ms <= maxMs);
-    if (inWindow.length === 0) return null;
-
-    // Pick the expiration closest to `target`. On ties (equal absolute
-    // distance) prefer the earlier expiration — matches the spec example
-    // (target=35; 30d and 45d both 5d off → pick 30d) and biases sizing
-    // toward shorter dated, less theta-sensitive contracts.
-    inWindow.sort((a, b) => {
-      const da = Math.abs(a.ms - targetMs);
-      const db = Math.abs(b.ms - targetMs);
-      if (da !== db) return da - db;
-      return a.ms - b.ms;
-    });
-    return inWindow[0]!.d;
+      .filter((e) => Number.isFinite(e.ms) && e.ms >= minMs && e.ms <= maxMs)
+      .sort((a, b) => a.ms - b.ms);
+    return { inWindow, targetMs };
   }
 
   private async fetchChain(symbol: string, expiration: string): Promise<OptionChainRow[]> {
