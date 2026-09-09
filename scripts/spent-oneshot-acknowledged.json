@@ -4,14 +4,6 @@
   "//scope": "An entry SUPPRESSES THE EXIT CODE ONLY. Acknowledged rows are still printed in full, under their own heading, on every run. This ledger can never make a finding invisible.",
   "//expiry": "An entry is pinned to `cronExpression` + `nextRunAt` of EVERY spent trigger on that routine. If the row re-arms, grows a second spent trigger, or its slot moves, the pin stops matching and the row is a live finding again. An entry that matches nothing is reported as STALE_ACK — trim it.",
   "//required": "Every entry MUST carry `trackedBy` (a live issue that owns the repair) and `reason`. An acknowledgement with no owner is a deletion with extra steps.",
-  "acknowledged": [
-    {
-      "routineId": "e1b97e28-4ae6-47d0-a3b6-1038e4e39442",
-      "spent": [{ "cronExpression": "17 13 30 6 *", "nextRunAt": "2027-06-30T17:17:00.000Z" }],
-      "trackedBy": "TRA-2974",
-      "reason": "ORPHAN. Assignee 2fc6fe3b has departed the roster, so EVERY agent write against this routine is 403 — there is no agent on this board that can archive it. It needs a BOARD re-home, which is exactly the deliverable already open on TRA-2974 (same orphan cluster as TRA-381/TRA-382). Never fired, so its FAR_NEVER_FIRED slot is stable at 2027-06-30.",
-      "acknowledgedAt": "2026-08-06",
-      "acknowledgedBy": "CTO"
-    }
-  ]
+  "//trimmed-2026-09-09": "TRA-1621/TRA-1627 — the only entry (e1b97e28, the departed-agent orphan, tracked by TRA-2974) was reported STALE_ACK and removed. It did not get archived: on 2026-08-28T03:30:48Z a board operator set the routine ROOT to `status: paused`, and paused IS a real disarm — `tickScheduledTriggers` selects due rows under `eq(routines.status, \"active\")` (@paperclipai/server/dist/services/routines.js:2534), so the trigger cannot fire even though it still reads `enabled: true` with `nextRunAt 2027-06-30`. This check's `status === 'active'` population filter (line 375) is therefore correct and the row legitimately left the population; `check-slot-loss.mjs:493` and `check-phantom-rest.mjs:345` filter the root the same way. ⛔ The pin still applies in reverse: un-pausing that routine after 2027-06-30T17:17 ET fires the past-due run IMMEDIATELY (pause excludes the row BEFORE the claim-update, so nextRunAt is frozen, not consumed; `catchUpPolicy: enqueue_missed_with_cap`). If it is ever re-homed to a live agent, archive it in the same write — never un-pause to test — and if it re-enters this population, file, do not re-acknowledge against the closed TRA-2974.",
+  "acknowledged": []
 }

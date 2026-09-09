@@ -946,14 +946,45 @@ async function selftest() {
   // GLOBAL control: the SHIPPED ledger is well-formed. A hand-edit typo that
   // drops `trackedBy` would otherwise silently un-suppress (or, worse, ship an
   // ownerless suppression) with nothing to say so.
+  //
+  // ⛔ AN EMPTY COHORT IS NOT AN INERT LEDGER. This control used to assert
+  // `acks.length > 0` under the banner "the file is present but inert" — so it
+  // went RED at the exact moment its subject was REPAIRED. It did on 2026-09-09
+  // (TRA-1621): the last entry, the departed-agent orphan e1b97e28, left the
+  // population for real when a board operator paused the routine ROOT, and
+  // trimming the now-STALE_ACK entry failed the control. Every genuinely inert
+  // shape — a renamed/absent `acknowledged` key, an entry with no routineId, no
+  // `trackedBy`/`reason`, or no `spent` pin — is ALREADY a warning out of
+  // parseAcknowledgements, so `warnings.length` is the real inertness detector
+  // and the count assertion was only ever able to fire on the success state.
+  // Proven below by mutating the shipped file rather than asserting a count.
   try {
     const shipped = loadAcknowledgements();
     if (shipped.warnings.length) throw new Error(`shipped ledger warns: ${shipped.warnings.join(' · ')}`);
-    if (shipped.acks.length === 0) throw new Error('shipped ledger has zero usable entries — the file is present but inert');
     for (const a of shipped.acks) {
       if (!/^TRA-\d+$/.test(a.trackedBy)) throw new Error(`entry ${a.routineId.slice(0, 8)} trackedBy ${JSON.stringify(a.trackedBy)} is not an issue identifier`);
     }
-    console.log(`ok    GLOBAL shipped ledger well-formed (${shipped.acks.length} entries, each pinned and owned)`);
+    // MUTATION: the shipped file's own bytes, with the array key renamed, must
+    // still be caught. This is what "present but inert" actually means, and it
+    // holds whether the cohort is empty or full.
+    const shippedRaw = JSON.parse(readFileSync(ACK_PATH, 'utf8'));
+    const { acknowledged, ...renamed } = shippedRaw;
+    const inert = parseAcknowledgements(renamed);
+    if (inert.warnings.length !== 1 || inert.acks.length !== 0) {
+      throw new Error('renaming the shipped ledger\'s `acknowledged` key did not read as inert');
+    }
+    // MUTATION: an entry stripped of its owner must be IGNORED and warn. Vacuous
+    // on an empty cohort, so it is driven off a synthetic row in that case —
+    // never skipped, because "no entries" must not silently mean "not tested".
+    const owner = { ...(shipped.acks[0] ?? { routineId: 'synthetic-row', spent: [{ cronExpression: '0 0 1 1 *', nextRunAt: '2027-01-01T00:00:00.000Z' }] }), trackedBy: undefined };
+    const ownerless = parseAcknowledgements({ acknowledged: [owner] });
+    if (ownerless.acks.length !== 0 || ownerless.warnings.length !== 1) {
+      throw new Error('an ownerless entry was not dropped with a warning');
+    }
+    const cohort = shipped.acks.length === 0
+      ? 'cohort EMPTY — nothing is being suppressed (the repaired state, not an inert file)'
+      : `${shipped.acks.length} entries, each pinned and owned`;
+    console.log(`ok    GLOBAL shipped ledger well-formed (${cohort}); inert-shape mutations still caught`);
     pass += 1;
   } catch (err) {
     console.log(`FAIL  GLOBAL shipped-ledger control\n        ${err.message}`);
