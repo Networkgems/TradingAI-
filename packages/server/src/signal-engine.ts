@@ -198,7 +198,10 @@ import {
 import { recordWheelBookSnapshot } from './wheel-promotion-gate-store.js';
 import type { WheelBookPosition } from './wheel-vol-stress-harness.js';
 import { buildProfitFloorLadder, resolveOtmProfitSchedule } from './otm-profit-schedule.js';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isProfitFloorTrailEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, resolveOptionOpeningRangeMin, resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isProfitFloorTrailEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, resolveSwingTimeStopTradingDays, resolveOptionOpeningRangeMin, resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
+// TRA-4436 — the RV exit re-tune param set, extracted so the shipped demo/live
+// construction is testable and its demo-effective ma20 gate publishable.
+import { buildRvExitParams } from './rv-exit-params.js';
 // TRA-3401 — nominate an OTM strike inside the band the cost bar can admit.
 import { selectAdmissibleOtmCandidate, isOtmAdmissibleStrikeEnabled, resolveAdmissibleBand } from './otm-admissible-strike.js';
 // TRA-3942 — WHEN the OTM sleeve may open. Entry-side only; nothing on any exit
@@ -5998,30 +6001,15 @@ export class SignalEngine {
     const swingTimeStopTradingDays = resolveSwingTimeStopTradingDays(
       this.mode === 'live' ? process.env : this.resolveDemoFlagEnv(),
     );
-    const rvExitParams: ExitParams | undefined =
-      this.mode === 'demo' && isRvExitRetuneEnabled(this.resolveDemoFlagEnv())
-        ? {
-            ...DEFAULT_EXIT_PARAMS,
-            supertrendFlipConfirmBars: resolveRvExitConfirmBars(this.resolveDemoFlagEnv()),
-            supertrendFlipMinLossPctToExit: resolveRvExitFlipMinLossPct(this.resolveDemoFlagEnv()),
-            timeStopTradingDays: swingTimeStopTradingDays,
-          }
-        : // TRA-2949 — LIVE port of the exit re-tune: confirmed 2-bar flip +
-          // winner-protect gate (a flip only closes a position down ≥20%) + the
-          // same confirm-bars gate on ma20_close_through. Spec-fixed values, no
-          // env tuning; armed by RV_EXIT_RETUNE_LIVE_ENABLED via process.env
-          // only (never demo-flags.json). OFF → legacy live single-bar flip.
-          this.mode === 'live' && isRvExitRetuneLiveEnabled()
-          ? {
-              ...DEFAULT_EXIT_PARAMS,
-              supertrendFlipConfirmBars: RV_EXIT_RETUNE_LIVE_CONFIRM_BARS,
-              supertrendFlipMinLossPctToExit: RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT,
-              ma20ConfirmBars: RV_EXIT_RETUNE_LIVE_CONFIRM_BARS,
-              timeStopTradingDays: swingTimeStopTradingDays,
-            }
-          : swingTimeStopTradingDays !== OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT
-            ? { ...DEFAULT_EXIT_PARAMS, timeStopTradingDays: swingTimeStopTradingDays }
-            : undefined;
+    // TRA-4436 (parent TRA-4053) — extracted to `rv-exit-params.ts` so the
+    // shipped construction (not a copy) is testable and publishable; that
+    // extraction also carries the fix: the demo branch now sets the
+    // `ma20ConfirmBars` gate the live branch has had since TRA-2949.
+    const rvExitParams: ExitParams | undefined = buildRvExitParams(
+      this.mode,
+      this.mode === 'live' ? process.env : this.resolveDemoFlagEnv(),
+      swingTimeStopTradingDays,
+    );
 
     // TRA-1268 (TRA-1250 Rules 1-2) — underlying ATR(14) on 5m bars for the
     // options ATR chandelier trail + premium-R profit-lock. Dark unless

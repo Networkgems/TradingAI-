@@ -276,13 +276,16 @@ import {
 } from '../session-edge-blackout-flag.js'; // TRA-2049
 // TRA-1001 — since-boot counters for the risk-throttle sizing consumer.
 import { snapshotRiskThrottleSizing } from '../risk-throttle-sizing.js';
-import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, OPTION_ENTRY_DELTA_CEILING_FLAG, isExitRiskRulesEnabled, EXIT_RISK_RULES_FLAG, isBookGiveBackArmFloorEnabled, BOOK_GIVEBACK_ARM_FLOOR_FLAG, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_FLAG, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, isTakeProfitEarlyLiveEnabled, TAKE_PROFIT_EARLY_LIVE_FLAG, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_VALUE, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, resolveOptionsHaltScope, OPTIONS_HALT_SCOPE_VAR, isOtmTp1FullExit1LotEnabled, OTM_TP1_FULL_EXIT_1LOT_FLAG, type OptionsHaltScopeResolution } from '../exit-risk-rules-flag.js';
+import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, OPTION_ENTRY_DELTA_CEILING_FLAG, isExitRiskRulesEnabled, EXIT_RISK_RULES_FLAG, isBookGiveBackArmFloorEnabled, BOOK_GIVEBACK_ARM_FLOOR_FLAG, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_FLAG, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, isRvExitRetuneEnabled, RV_EXIT_RETUNE_FLAG, isTakeProfitEarlyLiveEnabled, TAKE_PROFIT_EARLY_LIVE_FLAG, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_VALUE, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, resolveOptionsHaltScope, OPTIONS_HALT_SCOPE_VAR, isOtmTp1FullExit1LotEnabled, OTM_TP1_FULL_EXIT_1LOT_FLAG, type OptionsHaltScopeResolution } from '../exit-risk-rules-flag.js';
 // TRA-4244 — the env-resolved OTM profit-side schedule, surfaced beside barR.
 import { describeOtmProfitSchedule } from '../otm-profit-schedule.js';
 import { summarizeOptionsBreakerLedger } from '../options-breaker-ledger.js'; // TRA-3218
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX, ENTRY_DELTA_THETA_RATIO_FLOOR, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
 import { resolveDemoFlagEnv, DEMO_FLAG_ALLOWLIST } from '../demo-flags.js';
+// TRA-4436 — demo-effective ma20 confirm bars, derived from the shipped
+// `buildRvExitParams` so the option-swing-exits readout cannot drift from it.
+import { demoEffectiveMa20ConfirmBars } from '../rv-exit-params.js';
 import {
   isSma200DemoForwardTestEnabled,
   SMA200_DEMO_FORWARD_TEST_FLAG,
@@ -6671,6 +6674,25 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         confirmBars: RV_EXIT_RETUNE_LIVE_CONFIRM_BARS,
         flipMinLossPctToExit: RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT,
       },
+      // TRA-4436 (parent TRA-4053) — the DEMO book's effective ma20 confirm
+      // gate, beside the live one. This route used to publish `confirmBars: 2`
+      // for the (dark) live arm and NOTHING for the demo path, which is where
+      // 100% of evidence accrual happens — the demo book running an unguarded
+      // single-bar ma20_close_through (32 of 77 directional ma20 exits closed
+      // in <1 min, 23 at exactly R=0) was unreadable from any surface.
+      // `ma20ConfirmBars` is derived from the SAME `buildRvExitParams` the
+      // engine calls, over the same env view (process.env + demo-flags.json
+      // overlay, file wins), so this readout cannot drift from the decision
+      // site: 1 here IS the defect state, 2 is the guarded state.
+      rvExitRetuneDemo: (() => {
+        const dir = process.env.DATA_DIR;
+        const demoEnv = dir ? resolveDemoFlagEnv(dir) : process.env;
+        return {
+          flag: RV_EXIT_RETUNE_FLAG,
+          enabled: isRvExitRetuneEnabled(demoEnv),
+          ma20ConfirmBars: demoEffectiveMa20ConfirmBars(demoEnv),
+        };
+      })(),
       // LIVE arm of the take-profit-early capture exit (demo cohort: 43/43
       // wins, avgR +1.03). Ships dark; the board arms it by env flip.
       takeProfitEarlyLive: {
