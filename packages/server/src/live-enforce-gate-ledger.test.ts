@@ -66,8 +66,27 @@ describe('live-enforce-gate-ledger', () => {
       'entry_delta_ceiling',
       'entry_delta_ceiling_shadow',
       'entry_window',
+      // TRA-4276 — `exit_actionability` joins: the ENTRY↔EXIT interlock, whose
+      // healthy read is `evaluated > 0, blocked = 0` on most days (no book
+      // latched), which is precisely the reading an absent row would forge.
+      //
+      // ⚠️ ADDED RETROACTIVELY ON TRA-4422. It was in `GATES` from TRA-4276 and
+      // never in this expectation, so this assertion was RED ON `main` — and it
+      // stayed invisible because `tsc -b --force` (what the pre-push deploy gate
+      // runs) TYPE-checks test files without executing them. A roster census
+      // that nobody can add a gate to without going red is doing its job; one
+      // that is already red is a census nobody reads. Do not add a gate below
+      // without adding it here.
+      'exit_actionability',
       'fleet_reachable_bound',
       'otm_delta_floor',
+      // TRA-4422 — `setup_confirmation` joins, and leans hardest of all on the
+      // deployed-bytes reason: it ships in OBSERVE with an EMPTY setup registry,
+      // so its healthy arrival read is `evaluated > 0, blocked = 0` — which is
+      // byte-identical to an absent row folded to zero AND to a gate wired in
+      // backwards. The row's presence here at `evaluated: 0` is what says the
+      // control shipped at all.
+      'setup_confirmation',
       'spread',
       // TRA-4144 — `underlying_asset_class` joins: the second NAME-axis gate,
       // and the only one keyed on what the name IS rather than whether it is

@@ -594,6 +594,23 @@ export type {
   VolumeBreakoutOptions,
   VolumeBreakoutResult,
 } from './options/swing-entries.js';
+// TRA-4422 (parent TRA-4421) — the setup-taxonomy instrument. Ships with an
+// EMPTY registry: the gate above it admits everything and only the reason-code
+// histogram is live. See the module header for why that is a deliverable.
+export {
+  evaluateSetupTaxonomy,
+  SETUP_TAXONOMY_REGISTRY,
+  SETUP_TAXONOMY_REASON_CODES,
+  SETUP_TAXONOMY_MIN_BARS,
+} from './options/setup-taxonomy.js';
+export type {
+  SetupTaxonomySide,
+  SetupTaxonomyReasonCode,
+  SetupTaxonomyMatch,
+  SetupTaxonomyDefinition,
+  SetupTaxonomyInput,
+  SetupTaxonomyVerdict,
+} from './options/setup-taxonomy.js';
 export {
   EarningsCalendarClient,
   parseFinnhubEarnings,
