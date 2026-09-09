@@ -98,3 +98,89 @@ full server suite carries 5 failing tests in non-sma200 files (pre-existing on m
 tracks the red pretest) — the three captured by name: `live-enforce-gate-ledger.test.ts`,
 `tra4225-breaker-cause-and-partition.test.ts`, `tra4020-profit-floor-trail.test.ts`, 1 test each,
 none touching any C1-C4 surface. Engine suite fully green 1214/1214.
+
+---
+
+# 2026-09-09T21:40-21:50Z re-grade (monitor fire) — the empty queue has a CAUSE
+
+Live pin this beat: `GET /api/health/options-live` -> commit **`8e51be03261c`**, pid **52**,
+`startedAt` **2026-09-09T21:08:11.359Z**, `mode: live`. Impl commit `3308eb12` re-verified as an
+ancestor of `8e51be03` (`git merge-base --is-ancestor` -> true), so the C1-C4 bytes are still the
+bytes serving.
+
+## The live read is EMPTY for the second consecutive post-close grade
+
+`GET /api/state` at 21:40:22Z: `signals: []`, `sma200SignalVoids: []`,
+`supertrendShadowSignals: []`, `catalystGateShadowDecisions: []`, `agentRecommendations: []`,
+against `symbols: 751` and a fresh `lastScanAt` of 21:40:42Z. `marketReview.enabled` is `false`
+with `gatedStrategies: []`, so nothing is gating the strategy.
+
+`scripts/tra3693-grade-live.mjs` therefore printed `AC1 PASS | AC2 PASS | AC3 PASS |
+AC4-live-dark PASS` over **zero rows**. That is the vacuous-pass shape, and it is NOT claimed.
+
+## What is new: the emptiness is NOT a quiet market
+
+Added `scripts/tra3693-replay-emit-path.mjs`, which calls the same two production units the server
+calls (`fetchDailyCandles` then `evaluateSma200`) with the same constants, and reports bar depth
+per symbol. Run over the first 120 names of the live 751-symbol universe at 21:43Z:
+
+```
+FEED: 114 symbols with >=250 bars, 6 starved/failed. FIRES: 2
+SUNE sma200_pullback entry=4.510000228881836 stop=1.390267545876486 atr14=0.3800824520015886
+     distAtr=7.208041877693187 stopAtr=8.208041877693187 basis=sma200_minus_1atr
+     maxDistAtr=null rr=null tp=null   e1=0.00e+0  e2=0.00e+0
+TER  sma200_pullback entry=383.69000244140625 stop=296.20818015319446 atr14=22.200618827518465
+     distAtr=2.940512783354262 stopAtr=3.9405127833542606 basis=sma200_minus_1atr
+     maxDistAtr=null rr=null tp=null   e1=1.33e-15 e2=0.00e+0
+replay AC2 PASS | replay AC3 PASS
+```
+
+Two `sma200_pullback` signals fire on today's settled bars, in the first 16% of the universe, off
+the same code the live host is running. The live queue holds zero. An as-of sweep shows TER also
+fires on the **2026-09-08** bar, so this is not a bar-settlement race either.
+
+⚠️ These replay rows are evidence about the **code**, not about the live queue. AC1/AC2/AC3 are
+pre-registered against `/api/state` and remain **UNGRADED**. What the replay does discharge is the
+question the pre-registration could not anticipate: whether an empty queue means "no setup" (it
+does not).
+
+## Root cause: a Yahoo QUOTE 429 storm silently disables the DAILY-BAR pull
+
+bqb1 service log, same beat:
+
+```
+21:45:26Z [yahoo-feed] circuit breaker tripped for 90s after quote(ADYEN.AS):
+          Failed to get crumb, status 429, statusText: Too Many Requests
+21:45:26Z [yahoo-feed] circuit breaker tripped for 90s after quote(BNS.TO): ...429...
+21:45:20Z [yahoo-feed] fetchQuotes: 99 symbols dropped across 26 calls in the last 10s
+          (Yahoo breaker open, pre-fanout short-circuit; coalesced -- episode total
+           13206 symbols / 4807 calls ...)
+```
+
+The breaker is re-tripping continuously. Three code sites compose into a silent starve:
+
+1. `yahoo-feed.ts:85-88` — `rateLimitedUntil` is **one global flag for the whole Yahoo client**.
+   Unlike the Tradier breaker, which `yahoo-feed.ts:214-224` made **per source** under TRA-1996
+   for precisely this reason ("a BAR-pull quota storm backs off bar pulls only, while the cheap
+   quote path keeps serving"), Yahoo's was never split.
+2. `yahoo-feed.ts:125-128` — `withRetry` opens with `if (isRateLimited()) return null;`. Every
+   Yahoo call goes through it, so a **quote**-tripped breaker returns `null` to
+   `fetchDailyCandles`'s `yf.chart(...)` without one request being attempted.
+   `yahoo-feed.ts:1930` then turns that `null` into `[]`.
+3. `signal-engine.ts:7330` — `if (candles.length < SMA200_MIN_BARS) return;`. **No log line, no
+   counter, at any of the three layers.**
+
+Net: while the quote breaker is open, `runSma200Scan` walks the whole watchlist, reads zero bars,
+fires nothing, voids nothing, and emits **not one log line**. `sma200-scan` returned **0 lines**
+over a 4-hour Render log query this beat, which is exactly what a healthy quiet scan also looks
+like.
+
+This is the failure the AC5 pre-registration was written against ("an empty queue is not a pass"),
+and it is why re-grading on a third monitor cycle would not have been progress: the instrument
+cannot tell a starved scan from a quiet market, so no number of repeat reads can discharge AC5.
+
+## Disposition
+
+C1-C4 are implemented, deployed and live; AC4 (unit, both arms), AC6 and AC7 stand as graded on
+2026-09-08. AC1/AC2/AC3/AC5 stay **UNGRADED** and TRA-3693 blocks on the starve-visibility fix,
+filed as a child of this ticket. Nothing here changes a C1-C4 surface.
