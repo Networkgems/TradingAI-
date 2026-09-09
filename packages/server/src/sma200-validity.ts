@@ -70,3 +70,56 @@ export function sma200VoidVerdict(
   }
   return null;
 }
+
+/**
+ * TRA-4457 — the subset of a sweep census needed to decide whether an empty
+ * `signals[]` carries any information. Structurally compatible with
+ * `Sma200ScanStats`; kept narrow so this stays a pure helper with no dependency
+ * on the engine module.
+ */
+export interface Sma200SweepCensus {
+  /** Symbols handed to the sweep. */
+  considered: number;
+  /** Symbols that yielded >= SMA200_MIN_BARS bars and were actually scored. */
+  evaluated: number;
+  /** Came back short while the Yahoo breaker was open — we never asked. */
+  starvedBreakerOpen: number;
+  /** Came back short with the breaker closed — genuinely short listing history. */
+  starvedShortHistory: number;
+  /** Fetch threw outright. */
+  fetchFailed: number;
+}
+
+/**
+ * TRA-4457 — what a sweep's empty feed is allowed to mean.
+ *
+ * - `SWEPT`   — at least one symbol was scored. An empty `signals[]` is a real
+ *               "no setup fired" and may be reported as such.
+ * - `BLIND`   — nothing was scored though symbols were offered. The feed is
+ *               empty because the sweep could not look, so NO conclusion about
+ *               the market may be drawn from it.
+ * - `NO_UNIVERSE` — the sweep was handed no symbols at all. A different fault
+ *               (upstream watchlist) from a starved feed, so it is not folded
+ *               into `BLIND`.
+ */
+export type Sma200SweepVerdict = 'SWEPT' | 'BLIND' | 'NO_UNIVERSE';
+
+/**
+ * Grade a sweep census.
+ *
+ * ⚠️ The load-bearing case is the one that looks like nothing: a HEALTHY sweep
+ * that scored symbols and fired nothing must read `SWEPT`, not `BLIND` — that is
+ * the arm that separates a quiet market from a starved one, and it is the whole
+ * reason this function exists. Grading on `fired` instead of `evaluated` would
+ * collapse both into one verdict and re-create the defect.
+ */
+export function sma200SweepVerdict(c: Sma200SweepCensus): Sma200SweepVerdict {
+  if (c.considered <= 0) return 'NO_UNIVERSE';
+  if (c.evaluated > 0) return 'SWEPT';
+  return 'BLIND';
+}
+
+/** Total symbols the sweep failed to score, by any cause. */
+export function sma200SweepStarved(c: Sma200SweepCensus): number {
+  return c.starvedBreakerOpen + c.starvedShortHistory + c.fetchFailed;
+}

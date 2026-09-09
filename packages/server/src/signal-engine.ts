@@ -86,7 +86,7 @@ import { withPhase, timeSyncPhase, SyncSliceMeter } from './phase-timing.js';
 import { TickExitWorkMeter, type TickExitWorkTerms } from './tick-exit-work.js';
 import { TickExitRegionMeter, classifyExitInterval, type TickExitRegionRthTerms } from './tick-exit-region.js';
 import { trySma200ScanSlot, releaseSma200ScanSlot } from './sma200-scan-admission.js';
-import { resolveSma200PullbackMaxDistAtr, sma200VoidVerdict } from './sma200-validity.js';
+import { resolveSma200PullbackMaxDistAtr, sma200VoidVerdict, sma200SweepVerdict, sma200SweepStarved } from './sma200-validity.js';
 import { getLatestReviewBlock } from './research-store.js';
 import { earningsInDaysSync } from './earnings-store.js';
 import {
@@ -687,6 +687,56 @@ export interface SymbolState {
   currency?: string;
 }
 
+/**
+ * TRA-4457 — census of one `runSma200Scan` sweep.
+ *
+ * Exists because an empty `signals[]` is ambiguous and the ambiguity is
+ * load-bearing: on 2026-09-09 bqb1 served `signals: []` against 751 warm symbols
+ * while the identical code, run offline over the same daily bars, fired two
+ * `sma200_pullback` signals inside the first 120 names. The cause was an open
+ * Yahoo 429 breaker — `rateLimitedUntil` is global, so a quote-side storm makes
+ * `fetchDailyCandles` return `[]` without issuing a request, every symbol falls
+ * out of the `< SMA200_MIN_BARS` guard, and (before this) nothing logged.
+ *
+ * The discriminating field is `evaluated`. `evaluated === 0` means the sweep had
+ * no population to search, so the empty feed carries NO information about the
+ * market and no verdict may be drawn from it.
+ */
+export interface Sma200ScanStats {
+  /** ms epoch the sweep began. */
+  startedAt: number;
+  /** ms epoch the sweep finished. */
+  finishedAt: number;
+  /** Symbols handed to the sweep. */
+  considered: number;
+  /** Symbols that yielded >= `SMA200_MIN_BARS` bars and were actually scored. */
+  evaluated: number;
+  /**
+   * Symbols that came back short WHILE the Yahoo breaker was open — i.e. we
+   * never asked. Attributed by a post-hoc sample of `isYahooBreakerOpen()`, so
+   * it is sound in aggregate but not per-symbol.
+   */
+  starvedBreakerOpen: number;
+  /**
+   * Symbols that came back short with the breaker CLOSED — a genuinely short
+   * listing history (a recent IPO, a delisted ticker). A different condition
+   * from the above with a different remedy, so it gets its own counter.
+   */
+  starvedShortHistory: number;
+  /** Symbols whose fetch threw outright. */
+  fetchFailed: number;
+  /** Signals emitted by this sweep. */
+  fired: number;
+  /** Resting signals voided by this sweep (TRA-3688 S-3). */
+  voided: number;
+  /**
+   * The TRA-3688 S-1 gate value in force for this sweep, or `null` when it is
+   * the shipped `Infinity` default (dark). Same convention as the per-signal
+   * `maxDistAtr`, which JSON-serialises `Infinity` to `null`.
+   */
+  maxDistAtr: number | null;
+}
+
 export interface EngineState {
   symbols: SymbolState[];
   // TRA-3688 — SMA-200 rows carry null takeProfit/riskRewardRatio (no exit
@@ -699,6 +749,22 @@ export interface EngineState {
    * not "scanner dead". Optional so pre-TRA-3688 fixtures still type-check.
    */
   sma200SignalVoids?: Sma200SignalVoidRecord[];
+  /**
+   * TRA-4457 — census of the most recent `runSma200Scan` sweep, or `null` if no
+   * sweep has completed in this process yet.
+   *
+   * `signals: []` has two causes that are otherwise byte-identical on the wire:
+   * the market produced no setup, or the sweep never got any bars to look at
+   * (the Yahoo 429 breaker is global, so a quote-side storm silently starves the
+   * daily-bar pull; measured on bqb1 2026-09-09). Reading `evaluated` next to
+   * `signals` tells them apart in one call — a zero is only a zero once you can
+   * see its eligible denominator (TRA-3514).
+   *
+   * Optional: a row served by an older build genuinely lacks it, so declaring it
+   * required would assert at the type level exactly what the wire does not
+   * guarantee (TRA-3913).
+   */
+  sma200ScanStats?: Sma200ScanStats | null;
   /**
    * TRA-787 — SupertrendConfluence SHADOW channel. Observe-only signals the
    * supertrend engine computes off the live tape each tick. These are
@@ -3139,6 +3205,14 @@ export class SignalEngine {
    * unmeasurable. Persisted in the snapshot so the witness survives a restart.
    */
   private sma200SignalVoids: Sma200SignalVoidRecord[] = [];
+  /**
+   * TRA-4457 — census of the last completed `runSma200Scan` sweep, `null` until
+   * one completes. Deliberately NOT snapshot-persisted: it describes THIS
+   * process's most recent sweep, and a restored stale census would be worse than
+   * none (a reader would credit a `evaluated: 700` from before a restart to a
+   * sweep that never ran).
+   */
+  private lastSma200ScanStats: Sma200ScanStats | null = null;
   private static readonly SMA200_VOID_MAX = 50;
   /**
    * TRA-787 — per-symbol 5m candle series for the SupertrendConfluence shadow
@@ -7274,7 +7348,11 @@ export class SignalEngine {
   private voidSma200Signals(
     symbol: string,
     ctx: { latestBarTs?: number; lastPrice?: number },
-  ): void {
+  ): number {
+    // TRA-4457 — return the count so `runSma200Scan` can publish it in the
+    // sweep census. A void is the ONLY positive evidence the validity rule ran,
+    // so a sweep that voids nothing has to be able to say so out loud.
+    let voided = 0;
     this.recentSignals = this.recentSignals.filter(sig => {
       if (sig.symbol !== symbol) return true;
       if (sig.type !== 'sma200_pullback' && sig.type !== 'sma200_reclaim') return true;
@@ -7300,21 +7378,44 @@ export class SignalEngine {
           ? { entryPrice: s.entryPrice, lastPrice: ctx.lastPrice, atr14: s.atr14 }
           : { latestBarTs: ctx.latestBarTs }),
       });
+      voided++;
       return false;
     });
     if (this.sma200SignalVoids.length > SignalEngine.SMA200_VOID_MAX) {
       this.sma200SignalVoids.splice(0, this.sma200SignalVoids.length - SignalEngine.SMA200_VOID_MAX);
     }
+    return voided;
   }
 
   private async runSma200Scan(symbols: string[]): Promise<void> {
     if (symbols.length === 0) return;
     const SCAN_BATCH = 5;
     let fired = 0;
+    // TRA-4457 — the sweep's own census. Measured 2026-09-09: while the Yahoo
+    // 429 breaker is open, `fetchDailyCandles` returns `[]` WITHOUT issuing a
+    // request (`withRetry` short-circuits on `isRateLimited()`), every symbol
+    // falls out of the `< SMA200_MIN_BARS` guard below, and the whole sweep
+    // emits not one log line — because the only summary log was behind
+    // `fired > 0`. An empty `signals[]` then reads identically to a quiet
+    // market, which is exactly the ambiguity TRA-3688's AC5 was written against
+    // ("an empty queue is not a pass"). A zero needs its eligible denominator.
+    const stats: Sma200ScanStats = {
+      startedAt: Date.now(),
+      finishedAt: 0,
+      considered: symbols.length,
+      evaluated: 0,
+      starvedBreakerOpen: 0,
+      starvedShortHistory: 0,
+      fetchFailed: 0,
+      fired: 0,
+      voided: 0,
+      maxDistAtr: null,
+    };
     // TRA-3688 S-1 — the max-dist gate value in force for this whole sweep.
     // Resolved once per scan (not per symbol) so every signal fired by one
     // sweep is stamped with the same `maxDistAtr`. Default `Infinity` = dark.
     const pullbackMaxDistAtr = resolveSma200PullbackMaxDistAtr(process.env);
+    stats.maxDistAtr = Number.isFinite(pullbackMaxDistAtr) ? pullbackMaxDistAtr : null;
     for (let i = 0; i < symbols.length; i += SCAN_BATCH) {
       await Promise.all(
         symbols.slice(i, i + SCAN_BATCH).map(async (sym) => {
@@ -7322,20 +7423,33 @@ export class SignalEngine {
           try {
             candles = await fetchDailyCandles(sym, SMA200_DAILY_BARS);
           } catch (err: unknown) {
+            stats.fetchFailed++;
             log.warn('sma200: daily candle fetch failed', {
               component: 'sma200-scan', sym,
               reason: err instanceof Error ? err.message : String(err),
             });
             return;
           }
-          if (candles.length < SMA200_MIN_BARS) return;
+          if (candles.length < SMA200_MIN_BARS) {
+            // TRA-4457 — attribute the starve. `isYahooBreakerOpen()` is a
+            // sample taken after the fact, not a proof for this symbol (the
+            // breaker can flip mid-sweep), but across a sweep it cleanly
+            // separates "we never asked" from "this ticker has < 250 sessions
+            // of history", which are different conditions with different
+            // remedies. Still no per-symbol log line: at 751 symbols a starved
+            // sweep would emit 751 of them. The summary below is the trace.
+            if (isYahooBreakerOpen()) stats.starvedBreakerOpen++;
+            else stats.starvedShortHistory++;
+            return;
+          }
+          stats.evaluated++;
           const evalResult = evaluateSma200(sym, candles, { pullbackMaxDistAtr });
           const latestBarTs = candles[candles.length - 1].timestamp;
           // TRA-3688 S-3a — bar-rollover voiding, run on every scanned symbol
           // whether or not anything fired: a resting signal computed on an
           // OLDER daily bar is void the moment this fetch proves a newer bar
           // exists. Removed AND recorded (never silently dropped).
-          this.voidSma200Signals(sym, { latestBarTs });
+          stats.voided += this.voidSma200Signals(sym, { latestBarTs });
           for (const result of evalResult.signals) {
             const key = `${sym}:${result.kind}`;
             const latestBarDay = sma200BarDay(latestBarTs);
@@ -7424,9 +7538,33 @@ export class SignalEngine {
         }),
       );
     }
-    if (fired > 0) {
-      log.info('sma200 scan emitted signals', { component: 'sma200-scan', count: fired });
-    }
+    // TRA-4457 — publish the census UNCONDITIONALLY. The previous
+    // `if (fired > 0)` meant the silent case was the ONE case that never spoke:
+    // a sweep starved by an open Yahoo breaker read zero bars for all 751
+    // symbols and left no trace anywhere, so a 4h log query for `sma200-scan`
+    // came back with 0 lines — indistinguishable from a healthy quiet sweep.
+    stats.finishedAt = Date.now();
+    stats.fired = fired;
+    this.lastSma200ScanStats = stats;
+    const starved = sma200SweepStarved(stats);
+    const verdict = sma200SweepVerdict(stats);
+    log.info('sma200 scan swept', {
+      component: 'sma200-scan', issue: 'TRA-4457',
+      considered: stats.considered,
+      evaluated: stats.evaluated,
+      starvedBreakerOpen: stats.starvedBreakerOpen,
+      starvedShortHistory: stats.starvedShortHistory,
+      fetchFailed: stats.fetchFailed,
+      fired: stats.fired,
+      voided: stats.voided,
+      maxDistAtr: stats.maxDistAtr,
+      durationMs: stats.finishedAt - stats.startedAt,
+      // The one field a grader actually needs: did this sweep have a population
+      // to find anything IN? `BLIND` means it did not, and no conclusion about
+      // the market may be drawn from the resulting empty feed.
+      starved,
+      verdict,
+    });
   }
 
   /**
@@ -21186,6 +21324,9 @@ export class SignalEngine {
         signals: scopedSignals,
         // TRA-3688 S-3 — voided SMA-200 signals (the measurable removal trace).
         sma200SignalVoids: this.sma200SignalVoids,
+        // TRA-4457 — the sweep census, so a reader can see the denominator that
+        // makes an empty `signals` array mean something.
+        sma200ScanStats: this.lastSma200ScanStats,
         // TRA-787 — observe-only supertrend shadow channel (never routed).
         supertrendShadowSignals: this.supertrendShadowSignals,
         // TRA-1972 — observe-only catalyst earnings/macro proximity gate decisions.
@@ -21245,6 +21386,9 @@ export class SignalEngine {
       signals: scopedSignals,
       // TRA-3688 S-3 — voided SMA-200 signals (the measurable removal trace).
       sma200SignalVoids: this.sma200SignalVoids,
+      // TRA-4457 — the sweep census, so a reader can see the denominator that
+      // makes an empty `signals` array mean something.
+      sma200ScanStats: this.lastSma200ScanStats,
       // TRA-787 — observe-only supertrend shadow channel (never routed).
       supertrendShadowSignals: this.supertrendShadowSignals,
       // TRA-1972 — observe-only catalyst earnings/macro proximity gate decisions.

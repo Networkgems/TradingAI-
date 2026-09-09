@@ -4,6 +4,8 @@ import {
   resolveSma200PullbackMaxDistAtr,
   sma200VoidVerdict,
   SMA200_DRIFT_VOID_ATR,
+  sma200SweepVerdict,
+  sma200SweepStarved,
 } from './sma200-validity.js';
 
 describe('resolveSma200PullbackMaxDistAtr (TRA-3440-guarded parse)', () => {
@@ -61,5 +63,46 @@ describe('sma200VoidVerdict (S-3)', () => {
   it('a dark / broken quote (non-finite, 0) never voids — TRA-3440: a dark feed is not a low reading', () => {
     expect(sma200VoidVerdict(sig, { lastPrice: NaN })).toBeNull();
     expect(sma200VoidVerdict(sig, { lastPrice: 0 })).toBeNull();
+  });
+});
+
+describe('sma200SweepVerdict (TRA-4457 — what an empty signal feed may mean)', () => {
+  const base = {
+    considered: 751, evaluated: 0,
+    starvedBreakerOpen: 0, starvedShortHistory: 0, fetchFailed: 0,
+  };
+
+  it('BLIND: the whole sweep was starved by an open Yahoo breaker — the measured 2026-09-09 bqb1 shape', () => {
+    // fetchDailyCandles returns [] without issuing a request while the global
+    // rate-limit flag is set, so every symbol falls out of the < 250-bar guard.
+    expect(sma200SweepVerdict({ ...base, starvedBreakerOpen: 751 })).toBe('BLIND');
+  });
+
+  it('SWEPT with zero fires: a HEALTHY quiet market — the arm that separates quiet from starved', () => {
+    // This is the load-bearing control. `evaluated > 0` and nothing fired is a
+    // real "no setup today"; grading on `fired` instead would call it BLIND and
+    // re-create the exact ambiguity this verdict exists to remove.
+    expect(sma200SweepVerdict({ ...base, evaluated: 745, starvedShortHistory: 6 })).toBe('SWEPT');
+  });
+
+  it('SWEPT: one scored symbol is enough — the feed is interpretable even if most of the sweep starved', () => {
+    expect(sma200SweepVerdict({ ...base, evaluated: 1, starvedBreakerOpen: 750 })).toBe('SWEPT');
+  });
+
+  it('NO_UNIVERSE is NOT folded into BLIND — an empty watchlist is a different fault with a different remedy', () => {
+    expect(sma200SweepVerdict({ ...base, considered: 0 })).toBe('NO_UNIVERSE');
+  });
+
+  it('a short-history starve with the breaker CLOSED is still BLIND when nothing scored, but is attributed separately', () => {
+    const census = { ...base, considered: 3, starvedShortHistory: 3 };
+    expect(sma200SweepVerdict(census)).toBe('BLIND');
+    expect(census.starvedBreakerOpen).toBe(0); // not blamed on the feed
+  });
+
+  it('sma200SweepStarved totals every unscored cause', () => {
+    expect(sma200SweepStarved({
+      considered: 10, evaluated: 4,
+      starvedBreakerOpen: 3, starvedShortHistory: 2, fetchFailed: 1,
+    })).toBe(6);
   });
 });
