@@ -13,7 +13,14 @@
 //   TRA-4241 -> done      AC4 PASS (closeSupersedes 3/1/2, witnessed_other_order refusal)
 //   TRA-4350 -> done      AC1 PASS (ran_and_declined / 112594 / entry_window_closed)
 //   TRA-4009 -> in_review AC4 FAILS on real bytes; re-armed to run the v0nni backfill
-//   TRA-4145 -> blocked   arms still board-paused; rests on TRA-4229, a REAL blocker
+//   TRA-4145 -> in_review arms still board-paused; monitor re-armed for after the 09-18 freeze
+//
+// ALL FOUR LANDED 2026-09-09 from the TRA-4431 stalled-review sweep leaf, three of them verbatim
+// as staged. TRA-4145 did NOT: it was staged `blocked` on TRA-4229, TRA-4229 closed `done` at
+// 13:32Z (~40 min before this batch ran), and the PATCH was correctly refused 422. It was re-graded
+// by hand in that same beat and the row here now records what actually landed, so a re-run
+// verifies rather than re-posts. See assertStagedBlockersStillOpen() for the guard that stops the
+// next batch being refused the same way.
 //
 // IDEMPOTENCE. Guarded by a marker string searched in each issue's EXISTING comments -- never by a
 // local flag file, which cannot see a comment that landed from a different checkout. The guard
@@ -41,7 +48,9 @@ if (!BASE || !KEY) {
 }
 const H = { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' };
 
-const TRA_4229 = '066bd364-c0f1-4008-9912-8cc5a45467db';
+// (TRA-4229 was the staged blocker for TRA-4145. It closed `done` 2026-09-09T13:32Z, the staged
+// edge was refused 422, and that row now rests in a monitor instead -- see the row and
+// assertStagedBlockersStillOpen() below. The id is deliberately gone: nothing should reference it.)
 
 /**
  * Server-side cap on `executionPolicy.monitor.notes` (zod `too_big`, maximum 500), measured
@@ -69,6 +78,54 @@ function assertMonitorNotesFit(rows) {
     console.error(`[land] REFUSING TO RUN -- monitor notes exceed ${MONITOR_NOTES_MAX}:`);
     for (const b of bad) console.error(`  ${b}`);
     console.error('[land] Move the detail into the row\'s comment body; keep the note as the order.');
+    process.exit(2);
+  }
+}
+
+/**
+ * A staged `blockedByIssueIds` edge carries the world-state of the beat that GRADED it, and a
+ * blocker is the part of that state most likely to have moved by the time the batch lands.
+ *
+ * Measured 2026-09-09: this file staged TRA-4145 -> `blocked` on TRA-4229 during the 00:0xZ
+ * on_demand beat, while TRA-4229 was open. TRA-4229 closed `done` at 13:32:18Z. The batch ran at
+ * ~14:1xZ and the row came back
+ *   HTTP 422 {"error":"Entering blocked requires unresolved blockers, ..."}
+ * -- the platform being right and the staged grade being stale. The other three rows, none of
+ * which asserted a relationship to another live row, landed clean.
+ *
+ * So: re-read every blocker target immediately before the batch and refuse if any has gone
+ * terminal. FAILS CLOSED -- an unreadable target refuses too, because "I could not check" and
+ * "I checked and it is open" must not share an outcome. Refusing here is strictly better than
+ * being refused by the server: it names the row and the resolved blocker rather than leaving a
+ * bare 422 in the middle of a batch whose other rows have already landed.
+ */
+async function assertStagedBlockersStillOpen(rows) {
+  const TERMINAL = new Set(['done', 'cancelled']);
+  const bad = [];
+  for (const row of rows) {
+    const patch = typeof row.patch === 'function' ? row.patch() : row.patch;
+    for (const blockerId of patch?.blockedByIssueIds ?? []) {
+      let blocker;
+      try {
+        const res = await fetch(`${BASE}/api/issues/${blockerId}`, { headers: H });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        blocker = await res.json();
+      } catch (e) {
+        bad.push(`${row.key}: blocker ${blockerId} unreadable (${e.message}) -- cannot confirm it is open`);
+        continue;
+      }
+      if (TERMINAL.has(blocker.status)) {
+        bad.push(
+          `${row.key}: blocker ${blocker.identifier ?? blockerId} is ${blocker.status}, not open -- ` +
+            'the staged grade is stale; re-grade this row by hand',
+        );
+      }
+    }
+  }
+  if (bad.length) {
+    console.error('[land] REFUSING TO RUN -- a staged blocker edge is no longer valid:');
+    for (const b of bad) console.error(`  ${b}`);
+    console.error('[land] A `blocked` row whose blockers are all resolved IS the strand condition.');
     process.exit(2);
   }
 }
@@ -136,22 +193,41 @@ const ROWS = [
         : `status=${r.status} monitorNextCheckAt=${r.monitorNextCheckAt}`,
   },
   {
+    // RE-GRADED BY HAND 2026-09-09T14:1xZ from the TRA-4431 sweep leaf, after the staged
+    // `blocked`-on-TRA-4229 patch below was refused 422 (TRA-4229 had closed `done` at 13:32Z).
+    // The wait is real but now has a DATE: the board froze all 41 routines and 2 seats through
+    // 2026-09-18, so this rests in a monitor -- disposition (1) of TRA-4073 -- not on a blocker.
+    // Kept in the batch so a re-run VERIFIES the landed state instead of re-posting it.
     key: 'TRA-4145',
     id: '133f9e4d-9c01-4ed0-8a1e-96876a0128a2',
     body: '.land-4145.md',
-    marker: 'Converting this from a spent monitor to a first-class blocker',
-    patch: { status: 'blocked', blockedByIssueIds: [TRA_4229] },
-    verify: (r) => {
-      const bb = (r.blockedBy || []).map((x) => (typeof x === 'string' ? x : x.id));
-      if (r.status !== 'blocked') return `status=${r.status}, wanted blocked`;
-      // An empty blockedBy on a `blocked` row IS the strand condition -- refuse to call that landed.
-      return bb.includes(TRA_4229) ? null : `blockedBy=[${bb.join(',')}] missing TRA-4229`;
+    marker: 'AC4 still ungradeable -- but the reason CHANGED today',
+    patch: {
+      status: 'in_review',
+      executionPolicy: {
+        monitor: {
+          nextCheckAt: '2026-09-21T14:00:00.000Z',
+          scheduledBy: 'assignee',
+          recoveryPolicy: 'wake_owner',
+          notes:
+            'TRA-4145 AC4. Board froze all 41 routines + 2 seats through 2026-09-18 (TRA-4229 ' +
+            'ruling, 09-09T14:07Z), so arms 9cff4e6f/02abcd1b/db971fb9 stay paused; last fires ' +
+            '08-28, pre-fix 7465ba6d. On wake: if any arm fired post-fix, grade the exit code ' +
+            '(0 DRAINED, or VACUOUS with zero refusals = pass; exit 2 on a refusal reopens). If ' +
+            'still paused, check the freeze was not extended before re-arming again.',
+        },
+      },
     },
+    verify: (r) =>
+      r.status === 'in_review' && r.monitorNextCheckAt
+        ? null
+        : `status=${r.status} monitorNextCheckAt=${r.monitorNextCheckAt}`,
   },
 ];
 
 async function main() {
   assertMonitorNotesFit(ROWS);
+  await assertStagedBlockersStillOpen(ROWS);
 
   let posted = 0;
   let skipped = 0;
@@ -227,4 +303,4 @@ if (INVOKED_DIRECTLY) {
   });
 }
 
-export { ROWS, assertMonitorNotesFit, MONITOR_NOTES_MAX };
+export { ROWS, assertMonitorNotesFit, assertStagedBlockersStillOpen, MONITOR_NOTES_MAX };
