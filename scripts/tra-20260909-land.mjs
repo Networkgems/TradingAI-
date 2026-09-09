@@ -26,7 +26,7 @@
 // Not an unattended executor: it runs only when a heartbeat wakes the agent.
 
 import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // Derive the repo root from THIS FILE, never from $PAPERCLIP_WORKSPACE_CWD -- on some seats that
@@ -42,6 +42,36 @@ if (!BASE || !KEY) {
 const H = { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' };
 
 const TRA_4229 = '066bd364-c0f1-4008-9912-8cc5a45467db';
+
+/**
+ * Server-side cap on `executionPolicy.monitor.notes` (zod `too_big`, maximum 500), measured
+ * 2026-09-09 when TRA-4009's 850-char note came back HTTP 400 while its neighbours came back 403.
+ *
+ * This is checked BEFORE any network call, against every row, because the failure it prevents is
+ * order-dependent and therefore easy to never see: the 400 only became visible because the three
+ * 403 rows did not abort the loop. On a wake where the writes are permitted, a long note fails a
+ * single row in the middle of a batch whose other rows have already landed -- which reads as a
+ * partial success rather than as a bug in this file.
+ */
+const MONITOR_NOTES_MAX = 500;
+
+/** Throw on any monitor note that the server would reject, naming the row and the overflow. */
+function assertMonitorNotesFit(rows) {
+  const bad = [];
+  for (const row of rows) {
+    const patch = typeof row.patch === 'function' ? row.patch() : row.patch;
+    const notes = patch?.executionPolicy?.monitor?.notes;
+    if (typeof notes === 'string' && notes.length > MONITOR_NOTES_MAX) {
+      bad.push(`${row.key}: notes ${notes.length} chars, ${notes.length - MONITOR_NOTES_MAX} over`);
+    }
+  }
+  if (bad.length) {
+    console.error(`[land] REFUSING TO RUN -- monitor notes exceed ${MONITOR_NOTES_MAX}:`);
+    for (const b of bad) console.error(`  ${b}`);
+    console.error('[land] Move the detail into the row\'s comment body; keep the note as the order.');
+    process.exit(2);
+  }
+}
 
 /** Next occurrence of 21:05Z that is at least 30 min out, so a late run never arms the past. */
 function nextPostClose() {
@@ -85,18 +115,18 @@ const ROWS = [
           nextCheckAt: nextPostClose(),
           scheduledBy: 'assignee',
           recoveryPolicy: 'wake_owner',
+          // MUST stay under MONITOR_NOTES_MAX. The v1 note here was 850 chars and the server
+          // rejects at 500 (`too_big` on executionPolicy.monitor.notes) -- so this row would have
+          // failed on a correct issue-bound wake too, not just on the on_demand beat that found
+          // it. The reasoning it used to carry is not lost: it is the comment body .land-4009.md,
+          // which lands in the same PATCH and has no such cap. Note = the ORDER; body = the case.
           notes:
-            'TRA-4009 AC4 backfill. AC1 PASSES (09-08 line: capturedAccounts [admin,v0nni], ' +
-            'missingAccounts [], fleetSealed true; all 18 prior lines name v0nni as a gap). AC4 ' +
-            'FAILS: orderCensus.byAccount has ONLY admin, 0 non-admin rows, and neither 143021643 ' +
-            'nor 143197015 appears. Waiting cannot fix it -- the 09-08 capture sealed on orders:0 ' +
-            '(tape dark since 09-02, TRA-4350) and the originals sit on days the daily pass never ' +
-            'revisits. DO: run captureBrokerOrderDay for (etDay, v0nni) over the 7 blind days that ' +
-            'still carry orders -- 08-21, 08-24, 08-25, 08-26, 08-27, 08-28, 09-02. The key is ' +
-            '(etDay, account) and (day, v0nni) was NEVER captured, so the admin seal does not ' +
-            'block it. Both ids are in the submit ledger => expect engine_placed. If Tradier ' +
-            'listOrders() no longer reaches 08-21, that is a real answer: re-cut AC4 to say so, ' +
-            'measured not assumed. Post-close only; no ?force=true pre-close.',
+            'TRA-4009 AC4 backfill. AC4 FAILS: orderCensus.byAccount holds admin only, 0 ' +
+            'non-admin rows. Waiting cannot fix it -- the originals sit on days the daily pass ' +
+            'never revisits. DO: run captureBrokerOrderDay for (etDay, v0nni) over the 7 blind ' +
+            'days still carrying orders: 08-21, 08-24, 08-25, 08-26, 08-27, 08-28, 09-02. Key is ' +
+            '(etDay, account), so the admin seal does not block it. If listOrders() cannot reach ' +
+            '08-21, re-cut AC4 to say so. Post-close only; no ?force=true.',
         },
       },
     }),
@@ -121,6 +151,8 @@ const ROWS = [
 ];
 
 async function main() {
+  assertMonitorNotesFit(ROWS);
+
   let posted = 0;
   let skipped = 0;
   let failed = 0;
@@ -180,7 +212,19 @@ async function main() {
   process.exit(failed ? 1 : 0);
 }
 
-main().catch((e) => {
-  console.error('[land] fatal', e);
-  process.exit(3);
-});
+// Run ONLY when executed directly. A bare top-level `main()` means any `import()` of this file --
+// including one meant merely to read ROWS or re-measure a note length -- fires the whole batch of
+// live PATCHes as a side effect. That happened on 2026-09-09 while measuring the note overflow.
+// The batch is idempotent so nothing was double-posted, but on a wake where writes ARE permitted
+// the same slip lands four real dispositions that nobody decided to land in that beat.
+const INVOKED_DIRECTLY =
+  process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
+
+if (INVOKED_DIRECTLY) {
+  main().catch((e) => {
+    console.error('[land] fatal', e);
+    process.exit(3);
+  });
+}
+
+export { ROWS, assertMonitorNotesFit, MONITOR_NOTES_MAX };
