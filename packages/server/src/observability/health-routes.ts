@@ -5415,8 +5415,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
        * is the span the TAXONOMY computed, not one this route re-derived: 60
        * five-minute bars and 60 daily bars are the same bar COUNT and a
        * different question, so "the seam reads daily bars now" is only
-       * checkable as a measured span. A sub-day span here with the refresh
-       * healthy means the seam is reading the wrong cache.
+       * checkable as a measured span.
+       *
+       * ⛔⛔ GRADE IT AGAINST `verdicts.minThesisSpanMs` (30 days), NEVER
+       * AGAINST ONE DAY. The series this ticket replaced is ~480 five-minute
+       * bars spanning ~8.6 CALENDAR days — a "multi-day" test passes on the
+       * broken build. `verdicts.allReadableSpansSwingHorizon` is the boolean
+       * that discriminates, and it is `null` (never `false`) when no row in the
+       * window was readable, because a cold cache is the refresh's defect and a
+       * short span is the seam's.
        */
       dailySeries: (() => {
         const health = otmDailySeriesHealth(nowMs);

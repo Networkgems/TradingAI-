@@ -18,6 +18,7 @@ import {
   OTM_DAILY_SERIES_BUDGET_MS,
   OTM_DAILY_SERIES_MAX_AGE_MS,
   OTM_DAILY_SERIES_SAMPLE_CAP,
+  OTM_DAILY_SERIES_MIN_THESIS_SPAN_MS,
 } from './otm-daily-series.js';
 
 /**
@@ -246,25 +247,66 @@ describe('verdict samples — the published span is the TAXONOMY\'s, and the win
   it('⛔ an EMPTY window is null, never a measured `false`', () => {
     const v = otmDailySeriesHealth(T0).verdicts;
     expect(v.window).toBe(0);
-    expect(v.allSpansMultiDay).toBeNull();
+    expect(v.readable).toBe(0);
+    expect(v.allReadableSpansSwingHorizon).toBeNull();
     expect(v.spanMsMin).toBeNull();
   });
 
-  it('a sub-day span in the window flips `allSpansMultiDay` to false', () => {
-    noteOtmDailySeriesVerdict(sample(119 * DAY_MS));
-    expect(otmDailySeriesHealth(T0).verdicts.allSpansMultiDay).toBe(true);
-    noteOtmDailySeriesVerdict(sample(119 * FIVE_MIN_MS));
+  /**
+   * ⛔⛔ THE CONTROL THAT MATTERS, AND THE ONE THE FIRST CUT GOT WRONG.
+   *
+   * The published boolean used to be `allSpansMultiDay`, graded at `>= 1 day`,
+   * and this test used a 119-bar 5-minute fixture (≈9.9h) to "prove" it could
+   * go false. But the series TRA-4424 actually replaced is ~480 five-minute
+   * bars — 2400 one-minute bars, ~6.15 RTH sessions, a WALL-CLOCK SPAN of ~8.6
+   * calendar days. THAT clears a one-day bar. So the instrument's own headline
+   * field read TRUE on the broken build and TRUE on the fixed one, and the
+   * control agreed because its fixture was smaller than the real defect.
+   *
+   * The negative control is now the REAL intraday shape, not a convenient one.
+   */
+  it('⛔ the REAL 5-minute series (480 bars over ~6.15 RTH sessions) FAILS the bar', () => {
+    // The shape the seam used to read: 480 bars, 5 minutes apart, but spanning
+    // ~8.6 CALENDAR days once the overnight gaps are counted.
+    const intradaySpanMs = Math.round(6.15 * (7 / 5) * DAY_MS); // ≈ 8.6 days
+    expect(intradaySpanMs).toBeGreaterThan(DAY_MS); // ← it IS "multi-day"
+    noteOtmDailySeriesVerdict(sample(intradaySpanMs));
     const v = otmDailySeriesHealth(T0).verdicts;
-    expect(v.allSpansMultiDay).toBe(false);
-    expect(v.spanMsMin).toBe(119 * FIVE_MIN_MS);
-    expect(v.spanMsMax).toBe(119 * DAY_MS);
+    expect(v.readable).toBe(1);
+    expect(v.allReadableSpansSwingHorizon).toBe(false);
+    expect(v.minThesisSpanMs).toBe(OTM_DAILY_SERIES_MIN_THESIS_SPAN_MS);
   });
 
-  // A null span (an unreadable row) is NOT multi-day. Treating it as one would
-  // let a wholly dead source publish `allSpansMultiDay: true`.
-  it('a null span is not multi-day', () => {
+  it('the DAILY series (120 bars ≈ 168 calendar days) clears it, and one intraday row flips it', () => {
+    noteOtmDailySeriesVerdict(sample(Math.round(119 * (7 / 5) * DAY_MS)));
+    expect(otmDailySeriesHealth(T0).verdicts.allReadableSpansSwingHorizon).toBe(true);
+    noteOtmDailySeriesVerdict(sample(119 * FIVE_MIN_MS));
+    const v = otmDailySeriesHealth(T0).verdicts;
+    expect(v.allReadableSpansSwingHorizon).toBe(false);
+    expect(v.spanMsMin).toBe(119 * FIVE_MIN_MS);
+  });
+
+  /**
+   * A null span is an UNREADABLE row — no series was scored, so it carries no
+   * evidence about the timeframe either way. It must not be graded as a
+   * wrong-timeframe failure (that names the wrong owner: a cold cache is the
+   * refresh's problem, not the seam's), and it must not be silently forgiven.
+   * It is counted in its own field.
+   */
+  it('⛔ a null span is counted as UNREADABLE, not as a timeframe failure', () => {
     noteOtmDailySeriesVerdict(sample(null));
-    expect(otmDailySeriesHealth(T0).verdicts.allSpansMultiDay).toBe(false);
+    const v = otmDailySeriesHealth(T0).verdicts;
+    expect(v.window).toBe(1);
+    expect(v.readable).toBe(0);
+    expect(v.unreadable).toBe(1);
+    // No readable row ⇒ the timeframe claim is UNMEASURED, never `false`.
+    expect(v.allReadableSpansSwingHorizon).toBeNull();
+  });
+
+  it('a wholly dead source cannot publish a passing timeframe claim', () => {
+    for (let i = 0; i < 10; i++) noteOtmDailySeriesVerdict(sample(null));
+    expect(otmDailySeriesHealth(T0).verdicts.allReadableSpansSwingHorizon).toBeNull();
+    expect(otmDailySeriesHealth(T0).verdicts.unreadable).toBe(10);
   });
 
   it('the ring is bounded, and the lifetime total is NOT', () => {

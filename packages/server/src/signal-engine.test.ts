@@ -10480,7 +10480,13 @@ describe('TRA-4424 — the OTM setup seam reads a DAILY series, off the order pa
     // never "the taxonomy looked and found nothing".
     expect(v.reasonCode).toBe('no_setup_matched');
     expect(v.confirmed).toBe(false);
-    expect(otmDailySeriesHealth().verdicts.allSpansMultiDay).toBe(true);
+    // ⛔ Graded at the SWING-HORIZON bar (30 days), not a one-day one: the
+    // 5-minute series this replaced spans ~8.6 calendar days and would clear
+    // "multi-day" on the broken build too.
+    const hv = otmDailySeriesHealth().verdicts;
+    expect(hv.allReadableSpansSwingHorizon).toBe(true);
+    expect(hv.readable).toBe(1);
+    expect(hv.unreadable).toBe(0);
   });
 
   // ⛔ NEGATIVE CONTROL #2 — STALE, a different fact from ABSENT that must not
@@ -10537,7 +10543,7 @@ describe('TRA-4424 — the OTM setup seam reads a DAILY series, off the order pa
     expect(otmDailySeriesHealth().status).toBe('unmeasured');
     expect(otmDailySeriesHealth().note).toContain('UNMEASURED');
     // …and an empty verdict window is null, never a measured `false`.
-    expect(otmDailySeriesHealth().verdicts.allSpansMultiDay).toBeNull();
+    expect(otmDailySeriesHealth().verdicts.allReadableSpansSwingHorizon).toBeNull();
   });
 
   // The refresh is a separate pass from the scan. If the SEAM ever fetched, a

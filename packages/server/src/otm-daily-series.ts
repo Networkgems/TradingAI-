@@ -345,21 +345,57 @@ export interface OtmDailySeriesHealth {
     readonly recorded: number;
     /** How many of the most recent verdicts the spans below are computed over. */
     readonly window: number;
+    /**
+     * The window split into the two things a single boolean used to conflate:
+     * rows that carried a span (the seam read SOMETHING) and rows that did not
+     * (`series_unreadable` — a cold, stale or dead cache). A warm-up session and
+     * a wrong-timeframe series are different defects with different owners, and
+     * pooling them is how one hides behind the other.
+     */
+    readonly readable: number;
+    readonly unreadable: number;
     readonly spanMsMin: number | null;
     readonly spanMsMax: number | null;
+    /** The bar `allReadableSpansSwingHorizon` is graded against, published so the reader need not know it. */
+    readonly minThesisSpanMs: number;
     /**
-     * Whether every span in the window cleared a multi-day bar. ⛔ NULL when the
-     * window is empty — an empty window is UNMEASURED, and `false` there would
-     * read as a measured failure.
+     * Whether every READABLE span in the window clears
+     * {@link OTM_DAILY_SERIES_MIN_THESIS_SPAN_MS} — i.e. whether the series
+     * reaching the seam is the daily one rather than an intraday one.
+     *
+     * ⛔ NULL when NO row in the window is readable — that is UNMEASURED, and a
+     * `false` there would read as a measured wrong-timeframe failure when the
+     * cache is merely cold. The unreadable rows are counted above; they are not
+     * silently forgiven.
      */
-    readonly allSpansMultiDay: boolean | null;
+    readonly allReadableSpansSwingHorizon: boolean | null;
     readonly recent: readonly OtmDailySeriesVerdictSample[];
   };
   readonly note: string;
 }
 
-/** One trading day of wall clock, the unit the "multi-day" claim is made in. */
+/** One day of wall clock. */
 const DAY_MS = 24 * 60 * 60_000;
+
+/**
+ * THE ACCEPTANCE BAR OF THIS TICKET, AND IT IS NOT "MULTI-DAY".
+ *
+ * ⛔ A ONE-DAY BAR CANNOT SEE THE DEFECT TRA-4424 EXISTS TO FIX. The series
+ * this issue replaced was `shadowCandleCache`: 2400 one-minute bars resampled
+ * to 5m, i.e. ~6.15 RTH sessions — a WALL-CLOCK SPAN of roughly 8.6 calendar
+ * days. That is `>= DAY_MS`. So a `spanMs >= 1 day` predicate returns TRUE on
+ * the broken build and TRUE on the fixed one: the published boolean would have
+ * read identically in pass and fail, which is the exact failure this whole
+ * instrument was written to make impossible.
+ *
+ * 30 days is chosen to sit >3x above that 8.6-day intraday span and far below
+ * what {@link OTM_DAILY_SERIES_BARS} daily bars actually span (120 sessions ≈
+ * 168 calendar days), so the two populations are separated by more than an
+ * order of magnitude of slack in both directions. It is a DISCRIMINATOR, not a
+ * sufficiency claim about any particular setup: the TRA-4421 theses run 3–20
+ * day holds and each setup states its own `minBars`.
+ */
+export const OTM_DAILY_SERIES_MIN_THESIS_SPAN_MS = 30 * DAY_MS;
 
 export function otmDailySeriesHealth(nowMs: number = Date.now()): OtmDailySeriesHealth {
   const snapshot: OtmDailySeriesCounters = {
@@ -397,11 +433,18 @@ export function otmDailySeriesHealth(nowMs: number = Date.now()): OtmDailySeries
     verdicts: {
       recorded: verdictsRecorded,
       window: window.length,
+      readable: spans.length,
+      unreadable: window.length - spans.length,
       spanMsMin,
       spanMsMax,
-      allSpansMultiDay: window.length === 0
+      minThesisSpanMs: OTM_DAILY_SERIES_MIN_THESIS_SPAN_MS,
+      // Graded over the READABLE rows only, and null when there are none. An
+      // unreadable row says nothing about the timeframe of the series — there
+      // was no series — so folding it in here would report "wrong timeframe"
+      // for a cold cache and hand the next reader the wrong owner.
+      allReadableSpansSwingHorizon: spans.length === 0
         ? null
-        : window.every((s) => typeof s.seriesSpanMs === 'number' && s.seriesSpanMs >= DAY_MS),
+        : spans.every((s) => s >= OTM_DAILY_SERIES_MIN_THESIS_SPAN_MS),
       recent: window.slice(-5),
     },
     note: noteFor(status, snapshot, nowMs),
@@ -440,8 +483,11 @@ function noteFor(
         + `SINCE-BOOT (from ${new Date(c.since).toISOString()}, `
         + `${Math.round((nowMs - c.since) / 60_000)} min ago); a restart zeroes them, so a low `
         + 'total is not evidence of a quiet session. ⛔ `status: ok` says the SOURCE is healthy, '
-        + 'never that the taxonomy confirmed anything — read `verdicts.spanMsMin` for whether the '
-        + 'series reaching the seam is actually multi-day.';
+        + 'never that the taxonomy confirmed anything — read '
+        + '`verdicts.allReadableSpansSwingHorizon` (graded against '
+        + `${Math.round(OTM_DAILY_SERIES_MIN_THESIS_SPAN_MS / DAY_MS)} days, NOT one day: the `
+        + '5-minute series this ticket replaced spans ~8.6 calendar days and would clear a '
+        + 'one-day bar) for whether the series reaching the seam is the daily one.';
   }
 }
 
