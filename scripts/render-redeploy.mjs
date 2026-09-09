@@ -75,8 +75,11 @@
 //                       what the onrender hostname tracks) also resolves. That default
 //                       read `tradingai-bqb1` and resolved to `[]`, and the refusal blamed
 //                       the API key for it — TRA-3743, see scripts/lib/render-service-resolve.mjs.
-//   --commit=<sha>      (optional) deploy a specific commit; default = tip of the
-//                       service's branch (Render picks it).
+//   --commit=<sha>      deploy a specific commit. THE STANDING RULE (TRA-1665).
+//   --tip               deploy whatever origin/<branch> is at this instant. REQUIRED to be
+//                       explicit since TRA-4420: this used to be the DEFAULT, so a typo'd
+//                       --commit (or --help) shipped the tip and exited 0. Exactly one of
+//                       --commit / --tip must be given.
 //   --clear-cache       (optional) deploy with a cleared build cache.
 //   --force-rth-override="reason"   deploy during the RTH freeze anyway. REQUIRES a
 //                       non-empty reason; it is echoed so the breach is on the record.
@@ -103,10 +106,17 @@
 //                       so a bare reason is enough; this one guards a DECISION somebody else
 //                       is holding, and naming it is the cheapest proof the hold was read.
 //   --dry-run           print the gate decision and the intended call, POST nothing.
+//   --help, -h          print usage and exit 0 WITHOUT deploying. Added by TRA-4420: on
+//                       2026-09-09 this flag was unrecognised, therefore ignored, and the
+//                       run deployed bqb1. See the ARGUMENT GUARD block below.
+//
+// ⛔ VALUES ATTACH WITH '='. There is no space form. `--commit <sha>` and `--commmit=<sha>`
+//   are both REFUSED (exit 2) since TRA-4420; before it they were silently ignored and the
+//   BRANCH TIP shipped under a green exit 0.
 //
 // ── Exit codes ────────────────────────────────────────────────────────────────
-//   0  deploy triggered (or dry-run allowed)
-//   2  usage / auth / API error
+//   0  deploy triggered (or dry-run allowed, or --help printed)
+//   2  usage / unknown-or-malformed argument / auth / API error
 //   4  REFUSED — RTH freeze in effect on the soak host and no override given
 //   5  REFUSED — a dated embargo covers this instant and no override given
 //   6  REFUSED — the deploy would carry a HELD COMMIT, or it cannot be proven not to
@@ -1275,7 +1285,11 @@ export function resolveTarget(branch, requestedCommit) {
       carries: () => null,
     };
   }
-  return { sha, source: `origin/${branch} tip (no --commit given)`, carries: held => gitCarries(held, sha) };
+  // TRA-4420: this used to read "(no --commit given)", which was accurate and useless — it
+  // described what the operator FAILED to type, at a point where the deploy was already
+  // decided. Reaching here now requires an explicit `--tip`, so the echo names the flag that
+  // authorised it.
+  return { sha, source: `origin/${branch} tip (--tip)`, carries: held => gitCarries(held, sha) };
 }
 
 // ── The stale-pin ROLLBACK gate (TRA-3625) ────────────────────────────────────
@@ -1608,10 +1622,324 @@ const ROLLBACK_OVERRIDE_REASON = valOf('--allow-rollback');
 const HAS_ROLLBACK_OVERRIDE = argv.some(a => a === '--allow-rollback' || a.startsWith('--allow-rollback='));
 const HOLD_OVERRIDE_REASON = valOf('--override-hold');
 const HAS_HOLD_OVERRIDE = argv.some(a => a === '--override-hold' || a.startsWith('--override-hold='));
+const WANTS_TIP = has('--tip');
 
 function fail(code, msg) {
   console.error(`[render-redeploy] ERROR: ${msg}`);
   process.exit(code);
+}
+
+// ── The ARGUMENT GUARD (TRA-4420) ─────────────────────────────────────────────
+//
+// Every flag above is looked up POSITIVELY — `argv.includes('--dry-run')`,
+// `argv.find(a => a.startsWith('--commit='))`. Nothing enumerated argv, so anything this
+// script did not recognise was SILENTLY IGNORED and the run proceeded as a real deploy.
+// Measured 2026-09-09 on the live money host: `node scripts/render-redeploy.mjs --help`
+// printed no usage, ran all four gates and triggered `dep-dagcbqp5efls73ac5d40` on bqb1.
+// Nothing was harmed because the tip happened to be the commit TRA-4419 had ordered — luck,
+// not design.
+//
+// ⛔ AND `--help` IS THE HARMLESS INSTANCE. The one that costs us bytes on the host is the
+// near-miss on the flag that names WHICH BYTES:
+//
+//     node scripts/render-redeploy.mjs --commmit=<pinned sha>   # typo, two m's
+//     node scripts/render-redeploy.mjs --commit <pinned sha>    # space instead of '='
+//
+// Both used to read as "no --commit given" and deploy the branch TIP instead of the sha the
+// operator named — exit 0, cheerful output, wrong bytes on bqb1. That inverts TRA-1665's
+// deploy-by-commit-id rule, and it degrades in the direction this repo keeps paying for: an
+// operator pins a sha precisely BECAUSE the tip is not safe to ship.
+//
+// So the load-bearing half of this guard is not `--help`. It is the REJECTION: enumerate
+// argv, match against the table below, and refuse (exit 2) naming the offender. A flag this
+// script does not understand is an instruction it did not carry out, and a deploy trigger
+// must not carry out an instruction it did not understand.
+//
+// Three further silent-wrong-bytes shapes in the same family, all refused here:
+//   · `--commit=` (empty)      — valOf returns '', which is falsy, which was the tip again.
+//   · `--commit=a --commit=b`  — argv.find takes the FIRST; the second was discarded without
+//                                a word. Two conflicting statements about what to ship is
+//                                not a thing to resolve by array order.
+//   · `--dry-run=true`         — a no-value flag written with a value. `has()` compares for
+//                                EQUALITY, so this did not enable --dry-run: it armed a REAL
+//                                deploy while the operator believed they had asked for a
+//                                rehearsal. The worst shape on this list.
+//
+// ⚠️ The override flags are `value: 'reason'`, NOT 'required', on purpose. Written bare they
+// are already accepted here and refused one layer down by the gate itself, with the specific
+// message that names what a reason has to contain (and, for --override-hold, the ticket).
+// Promoting them to a generic usage error here would REPLACE those messages with a worse one.
+//
+// The table is the single source of truth for both the refusal and `--help`, so a flag can
+// never be documented in usage and rejected by the parser, or vice versa.
+export const KNOWN_ARGS = [
+  { flag: '--help', alias: '-h', value: 'none', help: 'print this usage and exit 0 WITHOUT deploying.' },
+  {
+    flag: '--commit',
+    value: 'required',
+    arg: '<sha>',
+    help: 'deploy this exact commit. THE STANDING RULE (TRA-1665) — deploy by commit id.',
+  },
+  {
+    flag: '--tip',
+    value: 'none',
+    help: "deploy whatever origin/<branch> is right now. The explicit opt-in for the old default; you must say it.",
+  },
+  { flag: '--clear-cache', value: 'none', help: 'deploy with a cleared build cache.' },
+  { flag: '--dry-run', value: 'none', help: 'print the gate decision and the intended call, POST nothing.' },
+  {
+    flag: '--force-rth-override',
+    value: 'reason',
+    arg: '"reason"',
+    help: 'deploy during the RTH freeze anyway (exit 4). Reason required, and echoed.',
+  },
+  {
+    flag: '--force-embargo-override',
+    value: 'reason',
+    arg: '"reason"',
+    help: 'deploy during a dated embargo anyway (exit 5). Reason required, and echoed.',
+  },
+  {
+    flag: '--force-commit-hold-override',
+    value: 'reason',
+    arg: '"reason"',
+    help: 'deploy a held commit anyway (exit 6). Reason required, and echoed.',
+  },
+  {
+    flag: '--force-auth-secret-override',
+    value: 'reason',
+    arg: '"reason"',
+    help: "deploy onto a host whose live AUTH_SECRET is unusable/unreadable anyway (exit 7).",
+  },
+  {
+    flag: '--allow-rollback',
+    value: 'reason',
+    arg: '"reason"',
+    help: 'deploy something OLDER than what is serving anyway (exit 8). Reason required.',
+  },
+  {
+    flag: '--override-hold',
+    value: 'reason',
+    arg: '"<TRA-####> reason"',
+    help: 'deploy past an open hold in ops/deploy-hold.json anyway (exit 9). Must NAME the hold.',
+  },
+];
+
+// Levenshtein, bounded — only used to say "did you mean". A suggestion is a courtesy; the
+// REFUSAL is the fix, so this never decides anything.
+function editDistance(a, b) {
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  const cur = new Array(b.length + 1);
+  for (let i = 1; i <= a.length; i += 1) {
+    cur[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    for (let j = 0; j <= b.length; j += 1) prev[j] = cur[j];
+  }
+  return prev[b.length];
+}
+
+function nearestFlag(name, known) {
+  let best = null;
+  let bestD = Infinity;
+  for (const k of known) {
+    const d = editDistance(name, k.flag);
+    if (d < bestD) {
+      bestD = d;
+      best = k.flag;
+    }
+  }
+  // 3 covers a doubled letter, a dropped dash and a transposition; beyond that a "did you
+  // mean" is noise attached to a refusal that already stands on its own.
+  return bestD <= 3 ? best : null;
+}
+
+/**
+ * Enumerate argv and grade every token against KNOWN_ARGS.
+ *
+ * PURE, and exported, so scripts/tra4420-arg-guard-check.mjs can grade the predicate — but
+ * the suite's load-bearing arms are REAL INVOCATIONS of this file, because the defect being
+ * fixed was never a wrong predicate. It was the absence of a call site. (Same reasoning as
+ * check:deploy-gates:shallow-repro: a table cannot reach the thing a table stands in for.)
+ *
+ * Returns { help, problems: [{arg, kind, why, suggestion}] }. `help` wins over `problems`:
+ * asking for usage is a read, and refusing to explain yourself to somebody who mistyped a
+ * flag is the exact unhelpfulness that made `--help` get typed at a deploy trigger.
+ */
+export function classifyArgs(argv, known = KNOWN_ARGS) {
+  const byName = new Map();
+  for (const k of known) {
+    byName.set(k.flag, k);
+    if (k.alias) byName.set(k.alias, k);
+  }
+  const problems = [];
+  const seen = new Set();
+  let help = false;
+  let target = null; // '--commit' | '--tip'
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    const eq = a.indexOf('=');
+    const name = eq === -1 ? a : a.slice(0, eq);
+    const value = eq === -1 ? undefined : a.slice(eq + 1);
+
+    if (!name.startsWith('-')) {
+      // A bare word. Overwhelmingly this is the space-form of the flag before it, which is
+      // THE case that used to ship the tip, so say that rather than a generic complaint.
+      const prevSpec = i > 0 ? byName.get(argv[i - 1]) : undefined;
+      problems.push({
+        arg: a,
+        kind: 'positional',
+        why:
+          prevSpec && prevSpec.value !== 'none'
+            ? `bare value after ${prevSpec.flag}. This script does not take space-separated values — ` +
+              `write \`${prevSpec.flag}=${a}\`, with an '='. Without the '=' the flag was ignored and the BRANCH TIP shipped.`
+            : 'a bare positional argument. This script takes flags only.',
+      });
+      continue;
+    }
+
+    const spec = byName.get(name);
+    if (!spec) {
+      const near = nearestFlag(name, known);
+      problems.push({
+        arg: a,
+        kind: 'unknown',
+        why: 'not a flag this script understands, so it would have been SILENTLY IGNORED (TRA-4420).',
+        suggestion: near,
+      });
+      continue;
+    }
+
+    if (spec.flag === '--help') {
+      help = true;
+      continue;
+    }
+
+    if (seen.has(spec.flag)) {
+      problems.push({
+        arg: a,
+        kind: 'duplicate',
+        why: `${spec.flag} was given more than once. The parser takes the FIRST and discards the rest; ` +
+          'two different answers to "what do I ship" is a decision for you, not for array order.',
+      });
+      continue;
+    }
+    seen.add(spec.flag);
+
+    if (spec.value === 'none' && eq !== -1) {
+      problems.push({
+        arg: a,
+        kind: 'unexpected-value',
+        why: `${spec.flag} takes no value. Written with one it does NOT match, so the flag had no effect at all — ` +
+          `write it bare as \`${spec.flag}\`.`,
+      });
+      continue;
+    }
+
+    if (spec.value === 'required' && eq === -1) {
+      problems.push({
+        arg: a,
+        kind: 'missing-value',
+        why: `${spec.flag} takes a value and must be written \`${spec.flag}=${spec.arg}\`, with an '='. ` +
+          'Written bare it was ignored and the BRANCH TIP shipped.',
+      });
+      continue;
+    }
+
+    if (spec.value === 'required' && (value ?? '').trim() === '') {
+      problems.push({
+        arg: a,
+        kind: 'empty-value',
+        why: `${spec.flag} was given an empty value, which is indistinguishable from not giving it at all — ` +
+          'i.e. the BRANCH TIP. Say what you mean to ship.',
+      });
+      continue;
+    }
+
+    if (spec.flag === '--commit' || spec.flag === '--tip') {
+      if (target && target !== spec.flag) {
+        problems.push({
+          arg: a,
+          kind: 'conflicting-target',
+          why: '--commit and --tip both name WHAT to ship, and they disagree. Pass exactly one.',
+        });
+        continue;
+      }
+      target = spec.flag;
+    }
+  }
+
+  // TRA-4420 item 3: the bare `origin/main` tip default is retired. It was a hole in the
+  // deploy-by-commit-id rule that could be fallen into by SAYING NOTHING — including by
+  // every typo above, before they were refused. `--tip` keeps the capability and costs one
+  // token; what it removes is the ability to ship the tip by accident.
+  //
+  // Not applied under --help: usage is a read, and demanding a deploy target before agreeing
+  // to explain the flags is the loop this ticket exists to close.
+  if (!help && !target) {
+    problems.push({
+      arg: '(none)',
+      kind: 'no-target',
+      why:
+        'no deploy target. Pass `--commit=<sha>` (the standing rule — TRA-1665) or, if you really do mean ' +
+        'whatever origin/<branch> is at this instant, say `--tip` explicitly. Until TRA-4420 saying nothing ' +
+        'meant the tip, which is how a mistyped --commit shipped it.',
+    });
+  }
+
+  return { help, problems };
+}
+
+export function renderUsage() {
+  const rows = KNOWN_ARGS.map(k => ({
+    left: `${k.flag}${k.value === 'none' ? '' : `=${k.arg}`}${k.alias ? `, ${k.alias}` : ''}`,
+    help: k.help,
+  }));
+  const w = Math.max(...rows.map(r => r.left.length));
+  return [
+    'render-redeploy.mjs — the gated deploy trigger for Render (TRA-1996/TRA-1648).',
+    '',
+    'USAGE',
+    '  RENDER_API_KEY=… node scripts/render-redeploy.mjs --commit=<sha> [options]',
+    '  RENDER_API_KEY=… node scripts/render-redeploy.mjs --tip [options]',
+    '',
+    'A deploy target is REQUIRED: exactly one of --commit=<sha> or --tip (TRA-4420).',
+    'Values are attached with `=`. There is no space form: `--commit <sha>` is refused.',
+    '',
+    'OPTIONS',
+    ...rows.map(r => `  ${r.left.padEnd(w)}  ${r.help}`),
+    '',
+    'ENVIRONMENT',
+    '  RENDER_API_KEY       required for anything that touches Render (never commit it).',
+    '  RENDER_SERVICE_ID    optional `srv-…`. Default: the soak host bqb1.',
+    '  RENDER_SERVICE_NAME  optional. Default `TradingAI-` (slug `tradingai-bqb1` also resolves).',
+    '',
+    'EXIT CODES',
+    '  0  deploy triggered (or --dry-run allowed, or --help printed)',
+    '  2  usage / unknown argument / auth / API error',
+    '  4  REFUSED — RTH freeze on the soak host, no override',
+    '  5  REFUSED — a dated embargo covers this instant, no override',
+    '  6  REFUSED — the deploy would carry a HELD COMMIT, or cannot be proven not to',
+    '  7  REFUSED — the live AUTH_SECRET is unusable, or cannot be READ (BLIND)',
+    '  8  REFUSED — the deploy would ROLL THE HOST BACK, or cannot be proven not to',
+    '  9  REFUSED — an open hold in ops/deploy-hold.json covers this service (or it is BLIND)',
+    '',
+    'THIS PRINTS AND EXITS. It deploys nothing. Before TRA-4420 it deployed the branch tip.',
+  ].join('\n');
+}
+
+export function renderArgRefusal(problems) {
+  return (
+    `[render-redeploy] REFUSED (usage): ${problems.length} argument problem(s). NOTHING WAS DEPLOYED.\n` +
+    problems
+      .map(p => `  ✗ ${p.arg}\n      ${p.why}${p.suggestion ? `\n      Did you mean \`${p.suggestion}\`?` : ''}`)
+      .join('\n') +
+    '\n  Run `node scripts/render-redeploy.mjs --help` for usage (it prints and exits, it does not deploy).\n' +
+    '  TRA-4420: an argument this script does not understand used to be ignored, and the run\n' +
+    '  proceeded as a real deploy of the BRANCH TIP.'
+  );
 }
 
 async function api(path, init) {
@@ -1812,6 +2140,27 @@ export function embargoState(now, table = EMBARGOES) {
 }
 
 async function main() {
+  // ── Gate −2: the ARGUMENT GUARD (TRA-4420) ──────────────────────────────────
+  // FIRST — ahead of even the deploy hold, which was previously the first thing to run.
+  // Nothing here reads a file, a git ref, an env var or the network, so a run refused at
+  // this point cannot have had any effect anywhere. That property is the whole fix: on
+  // 2026-09-09 `--help` reached the bottom of this function and POSTed a deploy to bqb1.
+  //
+  // It lives INSIDE main() rather than at module scope on purpose: this file is imported
+  // for its gate predicates by tra2325-embargo-gate-check.mjs and tra3699-shallow-hold-repro
+  // .mjs, and a module-scope process.exit() would fire on THEIR argv.
+  {
+    const args = classifyArgs(argv);
+    if (args.help) {
+      console.log(renderUsage());
+      process.exit(0);
+    }
+    if (args.problems.length) {
+      console.error(renderArgRefusal(args.problems));
+      process.exit(2);
+    }
+  }
+
   // ── Gate −1: the repo-resident deploy hold (TRA-4261) ───────────────────────
   // FIRST, ahead of the API key check and therefore ahead of every byte on the wire. Two
   // reasons, and the second is the one that matters:
@@ -2154,6 +2503,14 @@ async function main() {
     );
   }
 
+  // TRA-4420, second line of defence, AT THE EDGE. Gate −2 already refused an argv with no
+  // target, so this is unreachable — which is the point: an omitted `commitId` means "ship
+  // the tip", and that must never again be something this script can arrive at by falling
+  // through. If a future refactor loses the guard, the failure lands HERE, one statement
+  // before the POST, instead of on the host. (TRA-2262: verify the EDGE, not the node.)
+  if (!COMMIT && !WANTS_TIP) {
+    fail(2, 'internal: reached the deploy with no --commit and no --tip. Refusing to ship the branch tip by default (TRA-4420).');
+  }
   const body = {};
   if (COMMIT) body.commitId = COMMIT;
   if (CLEAR_CACHE) body.clearCache = 'clear';
