@@ -168,7 +168,44 @@ export type LiveEnforceGate =
    * upstream of a counter is invisible to that counter) says must not be
    * re-committed here.
    */
-  | 'exit_actionability';
+  | 'exit_actionability'
+  /**
+   * TRA-4422 (parent TRA-4421, off the TRA-4412 swing-OTM spec) — the SETUP
+   * TAXONOMY on the `single_leg_otm` sleeve: does the UNDERLYING have a
+   * multi-day directional setup on the same side as the wing the mispricing
+   * nominator picked.
+   *
+   * The first gate on this roster that is a property of the UNDERLYING rather
+   * than of the contract, the chain, the clock, the book or the fleet. Every
+   * one of the other 18 cuts on the OTM sweep body vetoes the CONTRACT; none
+   * asks anything about the stock. Since the nominator ranks on
+   * `|mispricingPct|` over a long-only sleeve, the option's SIDE is currently
+   * chosen by whichever wing happens to be cheap.
+   *
+   * Its own gate, not a reason code on `contract_floor`, for the reason every
+   * neighbour here is its own gate: ONLY A GATE CARRIES AN `evaluated`
+   * DENOMINATOR. And this gate needs one more than most, because arming it is a
+   * RESTRICTION — `opensPlaced` falls whether the taxonomy works or is broken
+   * and confirming nothing, so a working gate and a dead one read identically
+   * on every other metric the sleeve publishes.
+   *
+   * SHIPPED IN OBSERVE, WITH ZERO SETUPS REGISTERED (`OTM_SETUP_TAXONOMY_MODE`
+   * defaults to `observe`; `SETUP_TAXONOMY_REGISTRY` is empty). So on arrival
+   * `blocked` is ALWAYS false and the only thing this gate measures is the
+   * reason-code histogram over live nominees — in particular how many arrive
+   * with a series deep enough to run a setup on at all. That precondition has
+   * never been measured on this path.
+   *
+   * Recorded on BOTH verdicts, and while dark, for the same reason
+   * `underlying_asset_class` is: the census question "what would the taxonomy
+   * have said" must be answerable BEFORE the board arms the refusal, not only
+   * after. `reasonCode` is one of `no_setup_matched` / `setup_side_conflict` /
+   * `awaiting_confirmation` / `confirmation_expired` / `series_unreadable`,
+   * where the last is SPLIT OUT because an unreadable input is a runtime defect
+   * that happens to fail closed, and folding it into the ordinary refusal hides
+   * a broken box inside a bucket that is supposed to be large.
+   */
+  | 'setup_confirmation';
 
 /** One durable ARMED-LIVE enforcement decision — a write-through of the verdict. */
 export interface LiveEnforceRecord {
@@ -632,6 +669,16 @@ const GATES: LiveEnforceGate[] = [
   // `evaluated > 0, blocked = 0`: on most days no book is latched, which is
   // precisely the reading an absent row would forge.
   'exit_actionability',
+  // TRA-4422 (parent TRA-4421) — the SETUP TAXONOMY. Listed for the same
+  // deployed-bytes reason as every row above, and this one leans on it hardest:
+  // the gate ships in OBSERVE with an EMPTY setup registry, so its healthy
+  // arrival read is `evaluated > 0, blocked = 0` — byte-identical to an absent
+  // row folded to zero, and byte-identical to a gate wired in backwards. The
+  // key's presence in this census at `evaluated: 0` is what says the control
+  // shipped; `evaluated > 0` is what says it is running; and ONLY the
+  // `byReasonCode` histogram underneath says it is running on real inputs.
+  // ⛔ `evaluated: 0` on this row is UNMEASURED, never a pass.
+  'setup_confirmation',
 ];
 
 /**
