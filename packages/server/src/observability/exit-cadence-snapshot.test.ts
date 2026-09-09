@@ -32,7 +32,6 @@ const rollup = (samples: number, atOrAbove30s: number, maxMs = 41_000): ExitCade
     unknownModeEngineCount: 0,
     liveArmedEngineCount: 1,
     decoupledSkips: 0,
-    tickExitRegionMs: { samples, atOrAbove20s: atOrAbove30s * 2, atOrAbove30s, maxMs },
     books: {
       live: {
         blind: false, blindReason: null, verdict: 'pass', gradeable: true,

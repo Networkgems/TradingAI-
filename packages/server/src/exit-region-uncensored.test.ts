@@ -96,13 +96,6 @@ function routeRead(o: {
     partitionHolds: true,
     ...(b.work ? { exitWorkMs: { samples: b.work.samples, sumMs: b.work.sumMs, maxMs: 99 } } : {}),
   });
-  const fleet: BookCounters = {
-    samples: o.live.samples + o.demo.samples,
-    sumMs: o.live.sumMs + o.demo.sumMs,
-    work: o.live.work && o.demo.work
-      ? { samples: o.live.work.samples + o.demo.work.samples, sumMs: o.live.work.sumMs + o.demo.work.sumMs }
-      : null,
-  };
   const book = (name: string, counters: BookCounters, arm: BookArm) => {
     const armed = 'armedEngineCount' in arm ? arm.armedEngineCount : 3;
     return {
@@ -128,7 +121,7 @@ function routeRead(o: {
       live: book('live', o.live, o.liveArm ?? { enabled: true, armedEngineCount: 3 }),
       demo: book('demo', o.demo, o.demoArm ?? { enabled: true, armedEngineCount: 63 }),
     },
-    tickExitRegionMs: region(fleet),
+    // TRA-3464 Step 4 — the route no longer serves a top-level `tickExitRegionMs`.
   };
 }
 

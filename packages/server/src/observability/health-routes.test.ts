@@ -4959,11 +4959,13 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
       expect(body.note).toContain('no_engine_in_book');
     });
 
-    it('leaves the fleet-summed `tickExitRegionMs` alone — TRA-2305/TRA-2268 grade that exact accumulator', () => {
-      // Moving it per-book would silently change someone else's subject. It is
-      // published fleet-scoped at the top level AND per book, additively.
+    it('TRA-3464 Step 4 — the fleet-summed top-level `tickExitRegionMs` is GONE, and the per-book terms remain', () => {
+      // The unscoped spelling was fleet-summed with no RTH predicate and no
+      // boot guard, so its `maxMs` was one book's lifetime max wearing a fleet
+      // name. The acceptance read is its ABSENCE at the top level with the
+      // per-book scoped terms unchanged.
       const body = rollUpExitCadence(TODAY());
-      expect(body.tickExitRegionMs.samples).toBe(0);
+      expect(body).not.toHaveProperty('tickExitRegionMs');
       expect(body.books.live.tickExitRegionMs).not.toBeNull();
       expect(body.decoupledFireCount).toBe(0);
     });
@@ -4988,7 +4990,7 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
       // asserted only in prose; now the fixture states it.
       const region = regionTerms;
 
-      it('publishes `exitWorkMs` under BOTH books and at the fleet level', () => {
+      it('publishes `exitWorkMs` under BOTH books, and only there', () => {
         const body = rollUpExitCadence([
           exitEngine({
             engine: 'live-1', mode: 'live', lifetime: { under: 10, over: 0 }, rth: { under: 10, over: 0 },
@@ -5004,8 +5006,8 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
         // TRA-2645 removed and TRA-2677 re-litigated.
         expect(body.books.live.tickExitRegionMs!.exitWorkMs).toEqual({ samples: 900, sumMs: 810_000, maxMs: 4_100 });
         expect(body.books.demo.tickExitRegionMs!.exitWorkMs).toEqual({ samples: 400, sumMs: 200_000, maxMs: 9_000 });
-        // Fleet roll-up sums the counters and takes the max of the maxes.
-        expect(body.tickExitRegionMs.exitWorkMs).toEqual({ samples: 1_300, sumMs: 1_010_000, maxMs: 9_000 });
+        // No fleet roll-up any more — the unscoped spelling is deleted (Step 4).
+        expect(body).not.toHaveProperty('tickExitRegionMs');
 
         // THE POINT OF THE TICKET: the split is now computable, exactly, with no
         // threshold anywhere in it. The live book's region was 12.9% exit-critical.
@@ -5025,7 +5027,7 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
             tickExitRegionMs: region({ samples: 400, sumMs: 2_800_000, maxMs: 27_796, work: { samples: 400, sumMs: 200_000, maxMs: 9_000 } }),
           }),
         ]);
-        for (const terms of [body.tickExitRegionMs, body.books.live.tickExitRegionMs!, body.books.demo.tickExitRegionMs!]) {
+        for (const terms of [body.books.live.tickExitRegionMs!, body.books.demo.tickExitRegionMs!]) {
           expect(terms.exitWorkMs!.sumMs).toBeLessThanOrEqual(terms.sumMs);
           expect(terms.exitWorkMs!.maxMs).toBeLessThanOrEqual(terms.maxMs!);
           // One sample per closed region, so the split is over ONE population.
@@ -5040,7 +5042,6 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
         ]);
         expect(body.books.live.tickExitRegionMs!.exitWorkMs).toBeNull();
         expect(body.books.demo.tickExitRegionMs!.exitWorkMs).toBeNull();
-        expect(body.tickExitRegionMs.exitWorkMs).toBeNull();
         // A 0 here would be read as "the region does no exit-critical work",
         // which is the single most expensive wrong answer this route can give
         // TRA-2268: it would make narrowing the interlock look free.
@@ -5127,10 +5128,9 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
         ]);
         expect(body.books.live.tickExitRegionMs!.maxMs).toBe(5_000);
         expect(body.books.demo.tickExitRegionMs!.maxMs).toBe(14_121);
-        // The deprecated top-level spelling still carries the unscoped max — it
-        // is deleted in the next deploy generation, and this asserts WHY.
-        expect(body.tickExitRegionMs.maxMs).toBe(14_121);
-        expect(body.tickExitRegionMs.samples).toBe(334 + 6_810);
+        // The deprecated top-level spelling used to carry exactly this unscoped
+        // max (14_121, the demo book's) wearing a fleet name — Step 4 deleted it.
+        expect(body).not.toHaveProperty('tickExitRegionMs');
       });
 
       it('counts one boot exclusion PER ENGINE and closes the partition over the whole book', () => {

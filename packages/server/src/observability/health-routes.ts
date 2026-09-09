@@ -3199,7 +3199,8 @@ export interface ExitCadenceLifetimeTerms {
    * TRA-3464 — the interlock-region accumulator, DEMOTED to where it belongs.
    *
    * These are the exact numbers that used to be published as
-   * `books.<book>.tickExitRegionMs` (and fleet-summed at the top level): every
+   * `books.<book>.tickExitRegionMs` (and, until TRA-3464 Step 4 deleted the
+   * unscoped spelling, fleet-summed at the top level): every
    * closed region since boot, no market-hours predicate, no boot guard. They are
    * the right population for "is the interlock being held at all" and the WRONG
    * one for TRA-2268's narrowing decision. Same demotion, same reason, as the
@@ -3431,27 +3432,15 @@ export interface ExitCadenceRollup {
   tickPassCount: number;
   decoupledFireCount: number;
   decoupledSkips: Record<DecoupledExitSkipReason, number>;
-  /**
-   * doTick's exit-interlock suppression window, FLEET-SUMMED over every engine
-   * with no RTH predicate and no boot guard.
-   *
-   * ⛔ TRA-3464 — DEPRECATED, AND SCHEDULED FOR DELETION IN THE NEXT DEPLOY
-   * GENERATION. Do not add a reader.
-   *
-   * It survives exactly one generation because TRA-2698's migration order is
-   * ADD-then-verify-then-migrate-then-REMOVE, and compressing that would take
-   * the field out from under TRA-2305/TRA-2268 before either had a replacement
-   * path named on its own thread. The replacements, both already live beside it:
-   *
-   *   - `books.<book>.tickExitRegionMs`          — RTH-scoped, boot-guarded
-   *   - `books.<book>.lifetime.tickExitRegionMs` — these exact numbers, per book
-   *
-   * Its defect is not just the missing predicate: it is FLEET-summed, so on
-   * 2026-08-13 its `{samples 7143}` was `books.live {333}` + `books.demo {6810}`
-   * and its published `maxMs 14121` was the LIVE book's max wearing an unscoped
-   * name. There is no population this field is a statement about.
+  /*
+   * TRA-3464 Step 4 — the top-level `tickExitRegionMs` is GONE, completing
+   * TRA-2698's ADD-then-verify-then-migrate-then-REMOVE order. It was
+   * fleet-summed with no RTH predicate and no boot guard, so its `maxMs` was
+   * whichever book's LIFETIME max wearing an unscoped name. The replacements
+   * are `books.<book>.tickExitRegionMs` (RTH-scoped, boot-guarded) and
+   * `books.<book>.lifetime.tickExitRegionMs` (the old numbers, per book).
+   * Its ABSENCE at the top level is the acceptance read; do not re-add it.
    */
-  tickExitRegionMs: ExitCadenceTickRegionTerms;
   rthDecoupledShareFloor: number;
   note: string;
 }
@@ -3913,7 +3902,6 @@ export function rollUpExitCadence(engines: ExitCadenceHealth[]): ExitCadenceRoll
       for (const r of DECOUPLED_EXIT_SKIP_REASONS) acc[r] += e.decoupledSkips[r];
       return acc;
     }, emptyDecoupledExitSkips()),
-    tickExitRegionMs: sumTickExitRegion(engines),
     rthDecoupledShareFloor: RTH_DECOUPLED_SHARE_FLOOR,
     note:
       'TRA-2645: THERE IS NO FLEET-WIDE GRADE HERE. `partitionedBy: "mode"` marks that the graded '
@@ -3963,12 +3951,12 @@ export function rollUpExitCadence(engines: ExitCadenceHealth[]): ExitCadenceRoll
       + 'published `maxMs` — is excluded ahead of the RTH test and PUBLISHED as `bootRegionMaxMs` / '
       + '`bootRegionSumMs` rather than dropped: a guard whose effect is unobservable cannot be told '
       + 'apart from a guard that never fired. The pre-TRA-3464 lifetime numbers are not gone, they '
-      + 'are DEMOTED unchanged to `books.<book>.lifetime.tickExitRegionMs`. ⛔ The TOP-LEVEL '
-      + '`tickExitRegionMs` is DEPRECATED and is deleted in the next deploy generation: it is '
-      + 'fleet-summed with no RTH predicate and no boot guard, so on 2026-08-13 its `samples 7143` '
-      + 'was `books.live 333` + `books.demo 6810` and its `maxMs 14121` was the LIVE book\'s max '
-      + 'wearing an unscoped name. Read `books.<book>.tickExitRegionMs`; do not add a reader of the '
-      + 'top-level spelling. A payload whose `books.<book>.tickExitRegionMs` carries NO `window` key '
+      + 'are DEMOTED unchanged to `books.<book>.lifetime.tickExitRegionMs`. The TOP-LEVEL '
+      + '`tickExitRegionMs` is DELETED as of TRA-3464 Step 4: it was fleet-summed with no RTH '
+      + 'predicate and no boot guard, so on 2026-08-13 its `samples 7143` was `books.live 333` + '
+      + '`books.demo 6810` and its `maxMs 14121` was the LIVE book\'s max wearing an unscoped name. '
+      + 'A payload that still carries a top-level `tickExitRegionMs` is a pre-Step-4 build. Read '
+      + '`books.<book>.tickExitRegionMs`. A payload whose `books.<book>.tickExitRegionMs` carries NO `window` key '
       + 'is a pre-TRA-3464 build where that field is the LIFETIME accumulator sitting among '
       + 'RTH-scoped siblings — FAIL CLOSED on its absence, do not read it as the graded scope.',
   };
