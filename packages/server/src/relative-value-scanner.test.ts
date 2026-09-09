@@ -468,3 +468,86 @@ describe('TradierRelativeValueScannerService.scanOtm — discriminated reasons (
     }
   });
 });
+
+// TRA-4413 item 4 — the cross-expiration term-structure scan transport. The
+// FOLD's behaviour (buckets, √T fit, z-scores, calendar control) is covered by
+// the engine's own suite; these tests pin the scanner-side plumbing — reason
+// discrimination, expiration selection/capping, the provided-spot fast path,
+// and breaker integration.
+describe('scanTermStructure (TRA-4413 item 4)', () => {
+  // Three in-window expirations for NOW_BASE (21–60d window: 2024-02-05..2024-03-15).
+  const T_EXPS = ['2024-02-09', '2024-02-23', '2024-03-08'];
+
+  function rowAt(exp: string, strike: number, iv: number): OptionChainRow {
+    const base = row(strike, 'call', iv);
+    return { ...base, expiration: exp, optionSymbol: `TEST${exp}${strike}C` };
+  }
+
+  it('reports no_credentials without a client', async () => {
+    const svc = new TradierRelativeValueScannerService({ fetchSpot: async () => 100 });
+    const result = await svc.scanTermStructure('TEST');
+    expect(result.reason).toBe('no_credentials');
+    expect(result.report).toBeNull();
+  });
+
+  it('refuses with no_expirations when fewer than 2 expirations are in window', async () => {
+    const { svc, client } = makeService();
+    client.getExpirations.mockResolvedValue([EXP]); // exactly one in window
+    const result = await svc.scanTermStructure('TEST');
+    expect(result.reason).toBe('no_expirations');
+    expect(result.expirations).toHaveLength(0);
+    expect(client.getChainSnapshot).not.toHaveBeenCalled();
+  });
+
+  it('fetches one chain per in-window expiration and returns a report', async () => {
+    const { svc, client } = makeService();
+    client.getExpirations.mockResolvedValue(T_EXPS);
+    client.getChainSnapshot.mockImplementation(async (_s, e) => [
+      rowAt(e, 95, 0.32),
+      rowAt(e, 100, 0.30),
+      rowAt(e, 105, 0.28),
+    ]);
+    const result = await svc.scanTermStructure('TEST');
+    expect(result.reason).toBe('ok');
+    expect(result.expirations).toEqual(T_EXPS); // ascending, all three
+    expect(client.getChainSnapshot).toHaveBeenCalledTimes(3);
+    expect(result.report).not.toBeNull();
+    expect(result.report!.rowsIn).toBe(9);
+  });
+
+  it('uses a caller-provided spot without a second fetchSpot call', async () => {
+    const fetchSpotImpl = vi.fn(async () => 100);
+    const { svc, client } = makeService({ fetchSpotImpl });
+    client.getExpirations.mockResolvedValue(T_EXPS);
+    client.getChainSnapshot.mockResolvedValue([rowAt(T_EXPS[0]!, 100, 0.30)]);
+    const result = await svc.scanTermStructure('TEST', {}, { spot: 101.5 });
+    expect(result.reason).toBe('ok');
+    expect(result.spot).toBe(101.5);
+    expect(fetchSpotImpl).not.toHaveBeenCalled();
+  });
+
+  it('caps the fetch at MAX_TERM_EXPIRATIONS, keeping the first and last', async () => {
+    const { svc, client } = makeService();
+    // Six in-window expirations (weekly cadence).
+    const six = ['2024-02-09', '2024-02-16', '2024-02-23', '2024-03-01', '2024-03-08', '2024-03-15'];
+    client.getExpirations.mockResolvedValue(six);
+    client.getChainSnapshot.mockImplementation(async (_s, e) => [rowAt(e, 100, 0.30)]);
+    const result = await svc.scanTermStructure('TEST');
+    expect(result.reason).toBe('ok');
+    expect(result.expirations).toHaveLength(4);
+    expect(result.expirations[0]).toBe(six[0]); // span preserved: first…
+    expect(result.expirations[3]).toBe(six[5]); // …and last always kept
+    expect(client.getChainSnapshot).toHaveBeenCalledTimes(4);
+  });
+
+  it('trips the breaker on a chain fetch error and reports fetch_error', async () => {
+    const { svc, client } = makeService();
+    client.getExpirations.mockResolvedValue(T_EXPS);
+    client.getChainSnapshot.mockRejectedValue(new Error('boom'));
+    const result = await svc.scanTermStructure('TEST');
+    expect(result.reason).toBe('fetch_error');
+    expect(svc.diagnostics().breakerOpen).toBe(true);
+    const second = await svc.scanTermStructure('TEST');
+    expect(second.reason).toBe('breaker_open');
+  });
+});

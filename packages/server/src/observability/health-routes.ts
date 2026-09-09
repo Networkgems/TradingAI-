@@ -101,6 +101,7 @@ import { getLiveOptionsFeeReconcileState } from '../live-options-fee-reconcile.j
 import { getZombieOpenSweepState } from '../zombie-open-journal-sweep.js'; // TRA-3547
 import { getCloseBasisSweepState } from '../tra3730-close-basis-sweep.js'; // TRA-3730
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
+import { summarizeTermStructureShadow } from '../term-structure-shadow.js'; // TRA-4413 item 4
 import {
   summarizeRvScanPath,
   RV_SCAN_PATH_STRUCTURE_LABEL,
@@ -4172,6 +4173,23 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       build: resolveBuildInfo(),
       enabled: isOptionIvRvScannerEnabled(),
       ...summarizeIvRvScans(now()),
+    });
+  });
+
+  // TRA-4413 item 4 — unauthenticated, secrets-free cross-expiration
+  // TERM-STRUCTURE SHADOW readout (parity with /iv-rv: counters and structure
+  // only, no balances/PII). `enabled` mirrors ENABLE_TERM_STRUCTURE_SHADOW —
+  // default OFF, so until the board arms it this surface is an honest zero
+  // rather than a 404. The `markCalendarViolations` / `invalidatedScans` pair
+  // is the negative control: any non-zero there says the detector's own inputs
+  // went incoherent, and its findings for those scans were discarded, not
+  // published. Read-only: routes no order.
+  app.get('/api/health/term-structure-shadow', (_req, res) => {
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      ...summarizeTermStructureShadow(),
     });
   });
 
