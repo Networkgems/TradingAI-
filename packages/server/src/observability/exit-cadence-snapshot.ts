@@ -65,8 +65,8 @@ export const RTH_CLOSE_UTC_MIN = 20 * 60;
  * RTH-scoped PREFIX/exit-work split is obtained.
  *
  * TRA-3464 — the unscoped `tickExitRegionMs.maxMs` / `tickExitRegionMs.exitWorkMs.maxMs`
- * entries are GONE, because the top-level field they named is deprecated and is
- * deleted in the next deploy generation. The lifetime maxima that replace them
+ * entries are GONE, because the top-level field they named was deprecated and
+ * Step 4 has since deleted it. The lifetime maxima that replace them
  * are named explicitly: a frozen list of STRING paths is invisible to `tsc`, so
  * a dangling entry here would survive the field it points at and read to every
  * future maintainer as a live rule.

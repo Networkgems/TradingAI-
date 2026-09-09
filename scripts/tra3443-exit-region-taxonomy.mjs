@@ -658,7 +658,9 @@ function zeroReadAtBoot(t1) {
     marketOpen: null,
     marketOpenSource: 'implicit boot read — no payload was served at the boot instant',
     notDifferenceable: null, partialWindow: null,
-    rollup: { books, tickExitRegionMs: zero() },
+    // TRA-3464 Step 4 — no top-level `tickExitRegionMs` any more; the fixture
+    // mirrors the served shape, which is per-book only.
+    rollup: { books },
   };
 }
 
@@ -899,8 +901,8 @@ function gradeUncensored(t0, t1, snapModule) {
   //
   // TRA-3464 — THIS IS SUMMED FROM THE BOOKS, NOT READ OFF `$.tickExitRegionMs`.
   //
-  // It used to read the top-level field, and that field is now deprecated (it is
-  // deleted in the next deploy generation). But the reason to move it is not the
+  // It used to read the top-level field, and that field is now gone (Step 4
+  // deleted it from the payload). But the reason to move it is not the
   // deletion — moving early only avoids a future edit. The reason is that the
   // top-level field was never RTH-scoped, and as of TRA-3464 the per-book fields
   // ARE. Left alone, this "cross-check" would have compared an RTH-scoped
