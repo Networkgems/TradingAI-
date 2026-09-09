@@ -1241,6 +1241,15 @@ export function buildOtmEvaluationWindowRecord(
       monotone: 'FORWARD only: a cut may only move later, so the admitted set can only SHRINK (n a lower bound, seR an upper bound) and a re-cut can only make the pre-registered bar HARDER. A backward cut is refused.',
       preserved: 'baseline and populationCell are NEVER recomputed by a re-cut (the baseline is frozen by ruling; the cell is the ruling\'s cell). extension.used and the inconclusive terminal DO reset - both are properties of a full sample, and the sample is what restarted.',
       writer: 'POST /api/health/otm-evaluation-window/recut (admin) body {startedAt (ISO), build?, by, note with a TRA-nnnn ref}; dry-run by default, apply=true requires confirm=TRA-3945',
+      // A re-cut moves THIS record's cut and nothing else. The TRA-3974 cost
+      // accumulator's pin is write-once by design (a re-arm is refused and
+      // logged; the held pin stands), because its rows come off a ledger whose
+      // 30-day retention has already rolled past them and cannot be re-read. So
+      // after a re-cut its sample is a strict SUPERSET of the window's — say so
+      // on the wire rather than leaving a reader to notice two `startedAt`s.
+      costAccumulatorPin: postPin?.costAccumulator?.startedAt ?? null,
+      costAccumulatorPinFollowsRecut: false as const,
+      costAccumulatorPinNote: 'TRA-3974 pin is write-once and does NOT follow a re-cut. If postPinCost.startedAt is earlier than currentCut, its spreadR/costR sample is a SUPERSET of the counted sample - never cite that p50 beside this avgR without saying the two windows differ.',
       history: (state.recutHistory ?? []).map((h) => ({
         at: new Date(h.at).toISOString(),
         by: h.by,

@@ -157,6 +157,11 @@ describe('TRA-3945 re-cut — the ruled-but-unexecuted TRA-4006 restart', () => 
     expect(rec.recut.history).toEqual([]);
     expect(rec.recut.monotone).toContain('FORWARD only');
     expect(rec.recut.writer).toContain('confirm=TRA-3945');
+    // The one side effect a re-cut CANNOT carry, published rather than left to
+    // a reader to spot: TRA-3974's accumulator pin is write-once.
+    expect(rec.recut.costAccumulatorPinFollowsRecut).toBe(false);
+    expect(rec.recut.costAccumulatorPin).toBeNull(); // no postPin handed in ⇒ null, never omitted
+    expect(rec.recut.costAccumulatorPinNote).toContain('SUPERSET');
     const done = applyOtmEvaluationRecut(
       live,
       { startedAt: ruling.candidateStartedAt, build: ruling.candidateBuild, by: 'QuantTrader', note: 'TRA-3945 a9753fda / TRA-4006', priorN: 9 },
