@@ -205,6 +205,10 @@ import {
   OTM_SETUP_TAXONOMY_MODE_DEFAULT,
   OTM_SETUP_TAXONOMY_SETUPS_ENV,
 } from '../otm-setup-gate.js';
+// TRA-4424 (parent TRA-4421, off TRA-4422 Finding 1) — the DAILY-BAR source the
+// seam above reads. Its counters are what keep "the daily feed is dead" from
+// publishing the same histogram as "the market was quiet".
+import { otmDailySeriesHealth } from '../otm-daily-series.js';
 import { SETUP_TAXONOMY_REASON_CODES } from '@trading-app/engine';
 import {
   ENTRY_DELTA_CEILING_GATE,
@@ -5347,6 +5351,39 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
                 : 'ENFORCE — the gate is refusing. ⚠️ In this position (above `entry_window`) an '
                   + 'enforcing gate SHRINKS that sibling\'s `evaluated`; the relocation owed at the '
                   + 'enforce flip has not happened if you are reading this.',
+        };
+      })(),
+      /**
+       * TRA-4424 (parent TRA-4421, off TRA-4422 Finding 1) — THE DAILY-BAR
+       * SOURCE feeding the seam above.
+       *
+       * ⛔ WHY THIS BLOCK EXISTS AT ALL. A daily fetch that starts failing
+       * degrades into "every nominee scores `series_unreadable`" — and on every
+       * other number this sleeve publishes that is INDISTINGUISHABLE from a
+       * quiet market. `counters.fetchFailed` / `consecutiveFetchFailures` are
+       * the discriminator, and `status: 'unmeasured'` is its own value because
+       * an all-zero counter record is what a box that never ran the refresh
+       * produces, byte-for-byte identical to one where it ran and nothing
+       * failed.
+       *
+       * ⛔ `verdicts.spanMsMin` IS THE ACCEPTANCE CRITERION OF TRA-4424, and it
+       * is the span the TAXONOMY computed, not one this route re-derived: 60
+       * five-minute bars and 60 daily bars are the same bar COUNT and a
+       * different question, so "the seam reads daily bars now" is only
+       * checkable as a measured span. A sub-day span here with the refresh
+       * healthy means the seam is reading the wrong cache.
+       */
+      dailySeries: (() => {
+        const health = otmDailySeriesHealth(nowMs);
+        return {
+          issue: 'TRA-4424',
+          authorization: 'TRA-4421 §10; blocks TRA-4423 (setup E)',
+          status: health.status,
+          /** ⚠️ SINCE-BOOT. A restart zeroes every total here — see `counters.since`. */
+          counters: health.counters,
+          config: health.config,
+          verdicts: health.verdicts,
+          note: health.note,
         };
       })(),
       /**

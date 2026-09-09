@@ -298,6 +298,17 @@ describe('TRA-4422 — the gate is WIRED into the OTM open, in the load-bearing 
     expect(body).not.toMatch(/if \(this\.mode !== 'live'\) return/);
     // ⛔ A cold cache becomes an EMPTY SERIES, which the taxonomy reads as
     // `series_unreadable`. It must never be laundered into `no_setup_matched`.
-    expect(body).toMatch(/this\.shadowCandleCache\.get\(sym\) \?\? \[\]/);
+    //
+    // ⚠️ UPDATED BY TRA-4424. This used to pin `this.shadowCandleCache.get(sym)
+    // ?? []` — the 5-MINUTE cache, ~6.15 trading days deep, against a taxonomy
+    // of multi-day theses. The emptiness property is unchanged and still
+    // asserted; the SERIES is now the daily one, and that swap is graded
+    // behaviourally in `tra4424-otm-daily-series.test.ts` rather than only here.
+    expect(body).toMatch(/const daily = readOtmDailySeries\(sym\);/);
+    expect(body).toMatch(/series: daily\.bars,/);
+    // ⛔ AND THE 5-MINUTE CACHE IS GONE FROM THIS SEAM. Asserting the daily read
+    // is PRESENT does not assert the intraday one is ABSENT, and a seam that
+    // fetched both and scored the wrong one would pass the line above.
+    expect(body).not.toMatch(/shadowCandleCache/);
   });
 });

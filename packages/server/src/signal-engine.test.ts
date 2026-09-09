@@ -72,7 +72,7 @@ vi.mock('./yahoo-feed.js', () => ({
   knownSplits: vi.fn(() => []),
   fetchRecentSplits: vi.fn(async () => []),
 }));
-import { fetchDailyCandles, fetchTradierDailyCandles } from './yahoo-feed.js';
+import { fetchDailyCandles, fetchTradierDailyCandles, isYahooBreakerOpen } from './yahoo-feed.js';
 // TRA-2262 — the per-tick fan-out bound on the doTick sinks.
 import { resetSweepCursors, sweepCursorSnapshot, type SweepPass } from './tick-sweep-budget.js';
 // TRA-3557 — read the OTM scan-run telemetry the engine is supposed to WRITE.
@@ -122,6 +122,15 @@ import {
   summarizeLiveEnforceGate,
 } from './live-enforce-gate-ledger.js'; // TRA-2763
 import { OPTION_LIVE_OTM_UNIVERSE_VAR } from './otm-live-universe-flag.js'; // TRA-3216
+// TRA-4424 — the DAILY-BAR source behind the TRA-4422 setup seam. Read here
+// rather than re-derived: the span this module publishes is the one the pure
+// taxonomy computed, so a suite asserting on it cannot agree with itself while
+// the seam scores some other series.
+import {
+  otmDailySeriesHealth,
+  __resetOtmDailySeriesForTests,
+  OTM_DAILY_SERIES_MAX_AGE_MS,
+} from './otm-daily-series.js';
 import { OTM_ADMISSIBLE_STRIKE_FLAG } from './otm-admissible-strike.js'; // TRA-3510
 import { blackScholesPrice as bsPriceForWheel, daysToExpiration as dteForWheel } from '@trading-app/engine';
 // TRA-3073 — the REAL client, as a value. The acceptance suite for the
@@ -10353,5 +10362,229 @@ describe('SignalEngine — a suspect move survives a failed fetch (TRA-2610)', (
     expect(row?.quoteStatus).toBe('unavailable');
     expect(row?.moveSuspect).toBe(false);
     expect(row?.lastUpdated).toBe(0);
+  });
+});
+
+// ─── TRA-4424 — THE DAILY-BAR SOURCE, GRADED BEHAVIOURALLY ───────────────────
+// Parent TRA-4421, filed off TRA-4422 Finding 1.
+//
+// ⛔ WHY THIS IS A BEHAVIOURAL SUITE AND NOT A SOURCE CENSUS. The defect it
+// closes is a WRONG-TIMEFRAME series that RUNS: 480 five-minute bars clear every
+// `length >= N` guard in `evaluateSetupTaxonomy`, produce confident verdicts and
+// populate the reason-code histogram TRA-4422 shipped, while measuring an
+// intraday range and reporting it as swing structure. A source grep asserting
+// "the seam mentions the daily reader" survives a seam that reads BOTH caches
+// and scores the wrong one — so the load-bearing case below seeds a DEEP
+// 5-minute cache, leaves the daily cache cold, and demands `series_unreadable`.
+// Under the TRA-4422 wiring that case scores `no_setup_matched` off 480 bars.
+describe('TRA-4424 — the OTM setup seam reads a DAILY series, off the order path', () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const FIVE_MIN_MS = 5 * 60 * 1000;
+
+  /** `n` bars spaced `stepMs` apart, ending at `TRADING_TIME`. */
+  function bars(n: number, stepMs: number, symbol = 'AAPL'): Candle[] {
+    return Array.from({ length: n }, (_, i) => ({
+      symbol,
+      timestamp: TRADING_TIME - (n - 1 - i) * stepMs,
+      open: 100, high: 101, low: 99, close: 100.5, volume: 1_000,
+    }));
+  }
+
+  const runOtm = (engine: SignalEngine, syms: string[]) =>
+    (engine as unknown as { runOtmScan: (s: string[]) => Promise<void> }).runOtmScan(syms);
+  const refreshDaily = (engine: SignalEngine, syms: string[]) =>
+    (engine as unknown as { refreshOtmDailySeries: (s: string[]) => Promise<SweepPass> })
+      .refreshOtmDailySeries(syms);
+
+  function otmEngine(): SignalEngine {
+    const scanner = new StubScanner();
+    scanner.scanOtm.mockResolvedValue({
+      symbol: 'AAPL', spot: 195, expiration: '2024-07-05',
+      candidates: [makeOtmCandidate()], reason: 'ok',
+    });
+    return new SignalEngine(undefined, undefined, scanner);
+  }
+
+  /** The verdict the seam actually recorded, newest last. */
+  function lastVerdict() {
+    const recent = otmDailySeriesHealth().verdicts.recent;
+    return recent[recent.length - 1] ?? null;
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(TRADING_TIME);
+    __resetOtmDailySeriesForTests(TRADING_TIME);
+    resetSweepCursors();
+    vi.mocked(fetchDailyCandles).mockReset();
+    vi.mocked(fetchDailyCandles).mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    __resetOtmDailySeriesForTests();
+  });
+
+  // ⛔ THE LOAD-BEARING CASE. A deep 5-minute cache is present and the daily
+  // cache is cold. Under TRA-4422's wiring the seam read the 5-minute cache and
+  // this scored `no_setup_matched` off 480 bars spanning ~1.7 days — the sleeve
+  // would then soak a "directional gate" that was answering an intraday
+  // question confidently. It must read `series_unreadable`, with NO span.
+  it('a DEEP 5-minute cache does NOT satisfy the seam — the daily cache is cold, so the verdict is `series_unreadable`', async () => {
+    const engine = otmEngine();
+    // 480 five-minute bars = the exact depth `SUPERTREND_SHADOW_MINUTE_BARS`
+    // (2400 one-minute bars, ~6.15 trading days) resamples to.
+    (engine as unknown as { shadowCandleCache: Map<string, Candle[]> })
+      .shadowCandleCache.set('AAPL', bars(480, FIVE_MIN_MS));
+
+    await runOtm(engine, ['AAPL']);
+
+    const v = lastVerdict();
+    expect(v).not.toBeNull();
+    expect(v!.symbol).toBe('AAPL');
+    expect(v!.readState).toBe('absent');
+    expect(v!.reasonCode).toBe('series_unreadable');
+    expect(v!.bars).toBe(0);
+    // ⛔ SPAN ABSENT, not merely small. TRA-4424's acceptance names this: a cold
+    // daily source must land in the runtime-defect bucket carrying no span at
+    // all, never a confident negative carrying an intraday one.
+    expect(v!.seriesSpanMs).toBeNull();
+    // …and the read is COUNTED as absent, distinctly from stale.
+    const c = otmDailySeriesHealth().counters;
+    expect(c.readsAbsent).toBe(1);
+    expect(c.readsStale).toBe(0);
+    expect(c.readsFresh).toBe(0);
+  });
+
+  // POSITIVE CONTROL at the same level: change ONLY the daily cache. Same engine
+  // shape, same candidate, same clock.
+  it('with the daily cache warm the SAME scan publishes a MULTI-DAY span', async () => {
+    vi.mocked(fetchDailyCandles).mockResolvedValue(bars(120, DAY_MS));
+    const engine = otmEngine();
+    const pass = await refreshDaily(engine, ['AAPL']);
+    expect(pass.complete).toBe(true);
+    expect(vi.mocked(fetchDailyCandles)).toHaveBeenCalledWith('AAPL', 120);
+
+    await runOtm(engine, ['AAPL']);
+
+    const v = lastVerdict()!;
+    expect(v.readState).toBe('fresh');
+    expect(v.bars).toBe(120);
+    // ⛔ THE ACCEPTANCE CRITERION. 60 five-minute bars and 60 daily bars are the
+    // same bar COUNT and a different question, so "the seam reads daily bars" is
+    // only checkable as a measured SPAN. 119 steps × 1 day.
+    expect(v.seriesSpanMs).toBe(119 * DAY_MS);
+    expect(v.seriesSpanMs!).toBeGreaterThan(20 * DAY_MS);
+    // The registry is still EMPTY (arming is board card `70e36987`), so the
+    // verdict is `no_setup_matched` at `setupsScored: 0` — UNMEASURED per row,
+    // never "the taxonomy looked and found nothing".
+    expect(v.reasonCode).toBe('no_setup_matched');
+    expect(v.confirmed).toBe(false);
+    expect(otmDailySeriesHealth().verdicts.allSpansMultiDay).toBe(true);
+  });
+
+  // ⛔ NEGATIVE CONTROL #2 — STALE, a different fact from ABSENT that must not
+  // pool with it. A series the refresh fetched and then stopped maintaining is
+  // exactly what a dead feed leaves behind.
+  it('a STALE daily cache is `series_unreadable` with the span ABSENT, and counts separately from absent', async () => {
+    vi.mocked(fetchDailyCandles).mockResolvedValue(bars(120, DAY_MS));
+    const engine = otmEngine();
+    await refreshDaily(engine, ['AAPL']);
+
+    // Past the 4h bound. Nothing else changes — the bars are still there.
+    vi.setSystemTime(TRADING_TIME + OTM_DAILY_SERIES_MAX_AGE_MS + 60_000);
+    await runOtm(engine, ['AAPL']);
+
+    const v = lastVerdict()!;
+    expect(v.readState).toBe('stale');
+    expect(v.reasonCode).toBe('series_unreadable');
+    expect(v.bars).toBe(0);
+    expect(v.seriesSpanMs).toBeNull();
+    const c = otmDailySeriesHealth().counters;
+    expect(c.readsStale).toBe(1);
+    expect(c.readsAbsent).toBe(0);
+  });
+
+  // ⛔ THE FAILURE MUST BE COUNTABLE. A daily fetch that starts failing degrades
+  // into "every nominee is unreadable", which is indistinguishable from a quiet
+  // market on every other number this sleeve publishes.
+  it('a failing daily fetch is COUNTED, and `status` separates it from a quiet market', async () => {
+    vi.mocked(fetchDailyCandles).mockRejectedValue(new Error('yahoo 502'));
+    const engine = otmEngine();
+    const pass = await refreshDaily(engine, ['AAPL', 'MSFT']);
+    // The tick survives — a cold feed cannot take the sweep down…
+    expect(pass.complete).toBe(true);
+
+    // …and it is not silent about it.
+    const h = otmDailySeriesHealth();
+    expect(h.counters.fetchFailed).toBe(2);
+    expect(h.counters.fetchOk).toBe(0);
+    expect(h.counters.consecutiveFetchFailures).toBe(2);
+    expect(h.counters.lastFailureReason).toContain('yahoo 502');
+    expect(h.status).toBe('failing');
+    expect(h.note).toContain('FAILING');
+
+    // The scan still runs; the nominee is unreadable, and now the operator can
+    // tell WHY without going to the log tape.
+    await runOtm(engine, ['AAPL']);
+    expect(lastVerdict()!.reasonCode).toBe('series_unreadable');
+  });
+
+  // ⛔ AND THE COUNTER MUST NOT ITSELF READ AS HEALTHY WHEN IT NEVER RAN. Every
+  // total is zero on a box where the refresh was never wired in, byte-identical
+  // to one where it ran and nothing failed.
+  it('a refresh that never ran reads `unmeasured`, NOT `ok`', () => {
+    expect(otmDailySeriesHealth().status).toBe('unmeasured');
+    expect(otmDailySeriesHealth().note).toContain('UNMEASURED');
+    // …and an empty verdict window is null, never a measured `false`.
+    expect(otmDailySeriesHealth().verdicts.allSpansMultiDay).toBeNull();
+  });
+
+  // The refresh is a separate pass from the scan. If the SEAM ever fetched, a
+  // feed stall would become an entry stall on a live order path.
+  //
+  // ⚠️ MEASURED, NOT ASSUMED: `runOtmScan` DOES reach `fetchDailyCandles` — once
+  // per OPEN, at `OTM_DAILY_ATR_BARS = 40`, from `stampOtmAtrInvalidation`
+  // (TRA-3943). That call is POST-FILL and pre-dates this item; it is not the
+  // seam. So the assertion is not "the scan never fetches" (false, and a test
+  // written to that belief would have been a lie the first time it ran) but
+  // "no fetch happens BEFORE the taxonomy scores" — which is the property that
+  // actually keeps latency off the nomination path.
+  it('the SEAM never fetches — the nominee is scored before any daily call the scan makes', async () => {
+    vi.mocked(fetchDailyCandles).mockResolvedValue(bars(40, DAY_MS));
+    const engine = otmEngine();
+    // No nomination has been scored yet, so any fetch counted here would be one
+    // the seam itself made.
+    await runOtm(engine, ['AAPL']);
+
+    const calls = vi.mocked(fetchDailyCandles).mock.calls;
+    // The only daily call on this path is TRA-3943's post-fill ATR pull, at its
+    // own depth — never `OTM_DAILY_SERIES_BARS`.
+    expect(calls.every(([, n]) => n === 40)).toBe(true);
+    // ⛔ AND THE VERDICT WAS COMPUTED OFF THE COLD CACHE. If the seam had
+    // fetched, this would read the 40 bars it just pulled instead.
+    expect(lastVerdict()!.readState).toBe('absent');
+    expect(lastVerdict()!.reasonCode).toBe('series_unreadable');
+    expect(lastVerdict()!.bars).toBe(0);
+  });
+
+  // ⛔ THE FEED BREAKER IS ITS OWN BUCKET. `fetchDailyCandles` short-circuits to
+  // `[]` while Yahoo is rate-limited, so a tripped breaker would otherwise land
+  // in `fetchEmpty` and leave `status: 'ok'` while every nominee scored
+  // `series_unreadable`.
+  it('a tripped feed breaker is SKIPPED and counted, not laundered into `fetchEmpty`', async () => {
+    vi.mocked(isYahooBreakerOpen).mockReturnValue(true);
+    try {
+      const engine = otmEngine();
+      await refreshDaily(engine, ['AAPL', 'MSFT']);
+      expect(vi.mocked(fetchDailyCandles)).not.toHaveBeenCalled();
+      const h = otmDailySeriesHealth();
+      expect(h.counters.skippedFeedBreaker).toBe(2);
+      expect(h.counters.fetchEmpty).toBe(0);
+      expect(h.counters.fetchFailed).toBe(0);
+      expect(h.status).not.toBe('ok');
+    } finally {
+      vi.mocked(isYahooBreakerOpen).mockReturnValue(false);
+    }
   });
 });

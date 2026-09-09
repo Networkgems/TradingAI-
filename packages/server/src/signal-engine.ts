@@ -234,6 +234,24 @@ import {
   SETUP_TAXONOMY_DEFAULT_REFUSAL_CODE,
   type OtmSetupGateDecision,
 } from './otm-setup-gate.js';
+// TRA-4424 (parent TRA-4421, off TRA-4422 Finding 1) — THE DAILY-BAR SOURCE for
+// that seam. The taxonomy's setups are multi-day theses and the only series
+// previously reachable there was ~6.15 trading days of 5-minute bars, which
+// clears every `length >= N` guard and answers a different question
+// confidently. Cache + read policy + counters only; the fetch stays here,
+// off the order path, in `refreshOtmDailySeries`.
+import {
+  readOtmDailySeries,
+  storeOtmDailySeries,
+  noteOtmDailySeriesFailure,
+  noteOtmDailySeriesBreakerSkip,
+  noteOtmDailySeriesPass,
+  noteOtmDailySeriesVerdict,
+  pruneOtmDailySeries,
+  OTM_DAILY_SERIES_BARS,
+  OTM_DAILY_SERIES_BUDGET_MS,
+  OTM_DAILY_SERIES_REFRESH_MS,
+} from './otm-daily-series.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
 import { sessionEdgeBlackoutVerdict } from './session-edge-blackout-flag.js';
@@ -3569,6 +3587,15 @@ export class SignalEngine {
   // NEXT tick, which is what keeps the bound from becoming a coverage cut.
   private mtfSweep: SweepPass | null = null;
   private otmSweep: SweepPass | null = null;
+  /**
+   * TRA-4424 — the last budgeted DAILY-BAR refresh pass for the OTM setup
+   * taxonomy. Incomplete ⇒ the rotation is parked mid-universe and re-enters on
+   * the next tick ahead of {@link OTM_DAILY_SERIES_REFRESH_MS}, so the small 8s
+   * budget slices the rotation rather than cutting its coverage.
+   */
+  private otmDailySeriesSweep: SweepPass | null = null;
+  /** TRA-4424 — start of the last daily-bar ROTATION; gates the 30-minute cadence. */
+  private lastOtmDailyRefreshAt = 0;
   private shortPremiumSweep: SweepPass | null = null;
   /**
    * TRA-3442 — the last budgeted `agents-advisory` pass. Incomplete ⇒ the sweep
@@ -6808,6 +6835,47 @@ export class SignalEngine {
       marketOpen: isStockMarketOpen(),
       skipOptionsForLiveEquityOnly,
     })) {
+      // TRA-4424 (parent TRA-4421) — THE DAILY-BAR REFRESH, ORDERED IMMEDIATELY
+      // ABOVE THE SCAN AND OUTSIDE IT.
+      //
+      // ⛔ "OFF THE ORDER PATH" IS THE WHOLE POINT AND IT IS A PLACEMENT CLAIM.
+      // The setup-taxonomy seam lives inside `runOtmScan`, which is a live order
+      // path: a per-symbol network fetch down there is latency on that path, and
+      // a feed stall becomes an ENTRY STALL. This pass fills the cache the seam
+      // reads; the seam itself only ever does a Map lookup.
+      //
+      // Gated on the SAME `shouldRunOtmScan` predicate as the scan, so it adds
+      // zero feed load whenever the OTM path is not running at all. The cost of
+      // that choice is honest and countable: the first reads after a boot or a
+      // weekend land before the first rotation completes and report `absent` /
+      // `stale` ⇒ `series_unreadable`, which is the correct bucket for a series
+      // that genuinely is not current, and shows up as `readsAbsent` /
+      // `readsStale` on /api/health/otm-sleeve-mandate rather than as silence.
+      //
+      // TRA-2477 — an unfinished rotation re-enters on the NEXT TICK, ahead of
+      // the cadence gate; without that the 8s budget would divide this sink's
+      // symbols-per-minute by the slice count instead of just bounding its
+      // per-tick contribution.
+      const resumingDaily = this.otmDailySeriesSweep != null && !this.otmDailySeriesSweep.complete;
+      if (resumingDaily
+        || Date.now() - this.lastOtmDailyRefreshAt >= OTM_DAILY_SERIES_REFRESH_MS) {
+        if (!resumingDaily) this.lastOtmDailyRefreshAt = Date.now();
+        try {
+          this.otmDailySeriesSweep = await withPhase(
+            'signal.doTick.otm-daily-series',
+            () => this.refreshOtmDailySeries(activeSymbols),
+          );
+        } catch (err: unknown) {
+          // The cursor already advanced past the failing batch inside the sweep;
+          // drop the pass so the sink falls back to its cadence gate rather than
+          // re-entering every tick on a broken feed. Per-symbol failures never
+          // reach here — they are caught and COUNTED inside the run body.
+          this.otmDailySeriesSweep = null;
+          log.warn('OTM daily-series refresh threw (TRA-4424)', {
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
       // TRA-2262 — budgeted + cursored; an unfinished sweep resumes next tick.
       if (Date.now() - this.lastOtmScanAt >= nextSweepDelayMs(this.otmSweep, OTM_SCAN_INTERVAL_MS)) {
         this.lastOtmScanAt = Date.now();
@@ -8064,31 +8132,65 @@ export class SignalEngine {
    * `entry_window`, and that belongs with the four policy defaults still pending
    * on board card `70e36987`, not here.
    *
-   * ⚠️ SERIES TIMEFRAME. The only series available at this seam is the 5-minute
-   * `shadowCandleCache`, filled from `SUPERTREND_SHADOW_MINUTE_BARS = 2400`
-   * one-minute bars — 2400/390 ≈ 6.15 trading days. Every setup in the TRA-4421
-   * taxonomy is a multi-day thesis, so this depth is readable and still the
-   * WRONG TIMEFRAME for one. That is not papered over: `verdict.seriesSpanMs`
-   * is published on the tape precisely so the span is measured rather than
-   * re-derived from source later, and a daily-bar source is a named prerequisite
-   * for setup E (TRA-4423).
+   * ⚠️ SERIES TIMEFRAME — RESOLVED BY TRA-4424, AND IT WAS THE WHOLE PROBLEM.
+   * This seam used to read the 5-minute `shadowCandleCache`, filled from
+   * `SUPERTREND_SHADOW_MINUTE_BARS = 2400` one-minute bars — 2400/390 ≈ 6.15
+   * trading days. Every setup in the TRA-4421 taxonomy is a MULTI-DAY thesis,
+   * so that depth was readable and still the WRONG TIMEFRAME for one: it clears
+   * every `length >= N` guard, produces confident verdicts, and reports an
+   * INTRADAY range as swing structure. Because a directional gate is a
+   * restriction, the resulting soak would have read exactly like a working
+   * gate. It now reads {@link readOtmDailySeries} — a session-scoped daily-bar
+   * cache filled OFF the order path by {@link refreshOtmDailySeries}.
+   *
+   * ⛔ THE READ IS A MAP LOOKUP AND MUST STAY ONE. The OTM sweep is a live
+   * order path; a per-symbol network fetch here is latency on that path, and a
+   * feed stall would become an ENTRY STALL.
+   *
+   * `verdict.seriesSpanMs` is still published on the tape, and it is now the
+   * acceptance criterion rather than a caveat: 60 five-minute bars and 60 daily
+   * bars are the same bar COUNT and a different question, so the span is
+   * MEASURED on live tape instead of re-derived from source later.
    *
    * LIVE-ONLY recording, matching `entry_window` and every other member of this
    * ledger — it is the LIVE-enforce gate ledger, and a demo row in it would
    * inflate a denominator the live sleeve did not produce.
+   *
+   * ⚠️ The daily-series SAMPLE below is recorded in BOTH books, unlike the
+   * ledger row. It is an instrument on the data source, not on live capital,
+   * and scoping it to live would leave the demo engine's seam unreadable — the
+   * one place a wiring fault is cheap to catch.
    */
   private otmSetupTaxonomyDecision(
     sym: string,
     nomineeSide: OptionType,
     nominator?: LiveEnforceNominator | null,
   ): OtmSetupGateDecision {
+    // TRA-4424 — the DAILY series, and an unreadable one arrives here as an
+    // EMPTY array, never as a short or stale one. `absent` (never fetched) and
+    // `stale` (fetched, then abandoned) are both empty to the taxonomy — which
+    // reads them as `series_unreadable` with `seriesSpanMs: null` — and stay
+    // DISTINCT in the counters, because pooling them re-creates one layer down
+    // the ambiguity `series_unreadable` exists to split out of
+    // `no_setup_matched`. A cold cache must never launder into a real negative.
+    const daily = readOtmDailySeries(sym);
     const decision = evaluateOtmSetupGate({
       symbol: sym,
-      // Absent from the cache ⇒ empty series ⇒ `series_unreadable`, which is a
-      // DIFFERENT bucket from `no_setup_matched` by construction. A cold cache
-      // must never launder into a real negative.
-      series: this.shadowCandleCache.get(sym) ?? [],
+      series: daily.bars,
       nomineeSide,
+    });
+    // ⛔ THE SPAN RECORDED IS THE VERDICT'S OWN, never re-derived from `daily`.
+    // A span this call site computed itself would be a local copy graded
+    // against a local literal, and would stay green if the `series` argument
+    // above were switched back to the 5-minute cache.
+    noteOtmDailySeriesVerdict({
+      symbol: sym,
+      at: Date.now(),
+      readState: daily.state,
+      bars: decision.verdict.bars,
+      seriesSpanMs: decision.verdict.seriesSpanMs,
+      reasonCode: decision.verdict.reasonCode,
+      confirmed: decision.verdict.confirmed,
     });
     if (this.mode === 'live') {
       recordLiveEnforceDecision(
@@ -8123,6 +8225,12 @@ export class SignalEngine {
         blocked: decision.blocked,
         setupsScored: decision.verdict.setupsScored,
         bars: decision.verdict.bars,
+        // TRA-4424 — the span, plus WHICH series produced it and what state the
+        // daily cache was in. `seriesSpanMs` alone cannot say whether a small
+        // span means an intraday series or a cold daily one.
+        seriesSource: 'daily',
+        dailyReadState: daily.state,
+        dailyAgeMs: daily.ageMs,
         seriesSpanMs: decision.verdict.seriesSpanMs,
       });
     }
@@ -14239,6 +14347,109 @@ export class SignalEngine {
         }));
       },
     });
+  }
+
+  /**
+   * TRA-4424 (parent TRA-4421, off TRA-4422 Finding 1) — refresh the per-symbol
+   * DAILY candle series that backs the OTM setup-taxonomy seam.
+   *
+   * ⛔ THIS EXISTS SO THE SEAM NEVER FETCHES. The OTM sweep is a live order
+   * path; a per-symbol network call inside it is latency on that path, and a
+   * feed stall there becomes an ENTRY STALL. The seam does a Map lookup
+   * ({@link readOtmDailySeries}) and nothing else — this pass is what fills it,
+   * off the order path, exactly as {@link refreshSupertrendShadowSeries} fills
+   * the 5-minute cache for its readers.
+   *
+   * ── Why a SEPARATE cache rather than deepening the 5m one ──────────────────
+   * `SUPERTREND_SHADOW_MINUTE_BARS = 2400` is ~6.15 trading days. Reaching a
+   * 3–20 day swing horizon by widening it means ~8,000 one-minute bars per
+   * symbol per rotation, for a series every consumer would then resample away.
+   * A daily bar is the same information at 1/390th the payload, and Yahoo's
+   * chart route serves it in one round trip.
+   *
+   * ── Why not {@link otmDailyBarCache}, which already holds daily bars ────────
+   * It exists (TRA-3943) and it is NOT a substitute, for three reasons that each
+   * fail in the silent direction:
+   *
+   *  1. NO FETCH STAMP. Its entries carry no timestamp, so a series pulled three
+   *     days ago reads identically to one pulled five minutes ago. TRA-4424's
+   *     acceptance requires a stale cache to score `series_unreadable`, and that
+   *     verdict is not derivable from a Map with no clock in it.
+   *  2. ITS COVERAGE IS NOT THE OTM UNIVERSE. It is filled opportunistically off
+   *     `refreshTechnicalSnapshot` (active interest, with a cold sweep every 4th
+   *     cycle) and, failing that, by an ON-DEMAND fetch inside `otmDailyAtr` —
+   *     which runs POST-FILL, only for symbols that already opened.
+   *  3. DEPTH. The cold path pulls `OTM_DAILY_ATR_BARS = 40`, below
+   *     `SETUP_TAXONOMY_MIN_BARS = 60`, because the only thing downstream of it
+   *     is a 14-period average. A taxonomy reading that cache would find some
+   *     symbols readable and others not for reasons having nothing to do with
+   *     the market.
+   *
+   * Reusing its 260-bar snapshot-path pull as a free side-fill is a real
+   * optimisation and is deliberately NOT taken here: it would put a second
+   * writer with a different cadence behind the counters below, and those
+   * counters are the load-bearing part of this item.
+   *
+   * ── Budget and cadence ─────────────────────────────────────────────────────
+   * Budgeted and cursored like every other `doTick` fan-out sink (TRA-2262), but
+   * on {@link OTM_DAILY_SERIES_BUDGET_MS} (8s) rather than the shared 30s:
+   * daily bars change once a day, so this sink's urgency is a small fraction of
+   * the intraday sinks that number was sized for — and on the real-money book
+   * `exit-evaluation interval ≡ doTick duration` still holds (TRA-2200's hoist
+   * is deferred), so every millisecond here is live exit latency. An unfinished
+   * rotation re-enters on the NEXT TICK, so the 8s cap slices the rotation
+   * rather than cutting its coverage (the TRA-2477 property); a latency-bound
+   * walk sliced this way cannot exceed the request rate of the unsliced one, so
+   * it cannot become a TRA-1996 feed-quota regression either.
+   *
+   * ── Failure is COUNTED, never swallowed ────────────────────────────────────
+   * A per-symbol failure is caught so a cold feed cannot take the tick down —
+   * and it is recorded. ⛔ THAT IS THE DELIVERABLE, not politeness: a daily
+   * fetch that starts failing degrades into "every nominee is
+   * `series_unreadable`", which is indistinguishable from a quiet market on
+   * every number this sleeve publishes unless the fetch's OWN failures are
+   * countable. See `/api/health/otm-sleeve-mandate` → `dailySeries`.
+   */
+  private async refreshOtmDailySeries(symbols: string[]): Promise<SweepPass> {
+    const BATCH = 4;
+    const pass = await runBudgetedSweep({
+      // Per-engine: `mode` namespaces demo from live so two engines sweeping the
+      // same watchlist do not consume each other's cursor.
+      key: `${this.mode}:otm-daily-series`,
+      symbols,
+      batchSize: BATCH,
+      budgetMs: OTM_DAILY_SERIES_BUDGET_MS,
+      run: async (batch) => {
+        // ⛔ ASK THE BREAKER FIRST, AND COUNT THE SKIP. `fetchDailyCandles` runs
+        // through `withRetry`, which short-circuits to `null` while Yahoo is
+        // rate-limited — so a tripped breaker arrives as an EMPTY RESULT, not a
+        // throw. Left to fall through it would land in `fetchEmpty`, and a
+        // mid-session trip after a healthy morning would publish `status: 'ok'`
+        // while every nominee scored `series_unreadable`. That is exactly the
+        // "a dead feed reads like a quiet market" defect this refresh's counters
+        // exist to prevent, one layer down.
+        if (isYahooBreakerOpen()) {
+          noteOtmDailySeriesBreakerSkip(batch.length);
+          return;
+        }
+        await Promise.all(batch.map(async (sym) => {
+          try {
+            const bars = await fetchDailyCandles(sym, OTM_DAILY_SERIES_BARS);
+            // An EMPTY answer is not a failure and does not evict the last good
+            // series: a symbol that has genuinely stopped printing should age
+            // out through staleness rather than vanish on one empty response.
+            storeOtmDailySeries(sym, bars);
+          } catch (err: unknown) {
+            noteOtmDailySeriesFailure(sym, err instanceof Error ? err.message : String(err));
+          }
+        }));
+      },
+    });
+    noteOtmDailySeriesPass(pass.complete);
+    // Evict only at the end of a COMPLETE rotation. Pruning against a mid-
+    // rotation slice would drop every symbol the pass had not yet reached.
+    if (pass.complete) pruneOtmDailySeries(symbols);
+    return pass;
   }
 
   /**
