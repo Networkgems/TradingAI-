@@ -249,34 +249,39 @@ const PORT = { key: 'PORT', value: '4000' };
 // A sha that is not a commit in any checkout: makes the commit-hold gate resolve without a
 // network round-trip, so these cases stay offline. Whatever it decides is downstream of the
 // gate under test and is only ever asserted as "not 7".
+//
+// TRA-4420: now on EVERY case, not just the two that needed a pin. render-redeploy.mjs no
+// longer accepts an argv with no deploy target — the bare origin/main-tip default was the
+// hole a typo'd --commit fell into — so `['--dry-run']` alone is now a usage refusal (exit 2)
+// and these cases would have been graded on that instead of on the AUTH_SECRET gate.
 const NO_SUCH_SHA = '--commit=0000000000000000000000000000000000000000';
 
 const E2E = [
   {
     why: 'bqb1 + AUTH_SECRET=" " -> REFUSED 7. The whitespace case, through the real main().',
     stub: { service: BQB1, envVars: [PORT, { key: 'AUTH_SECRET', value: ' ' }] },
-    args: ['--dry-run'],
+    args: [NO_SUCH_SHA, '--dry-run'],
     code: 7,
     stderrHas: ['REFUSED', 'WHITESPACE-ONLY'],
   },
   {
     why: 'bqb1 + AUTH_SECRET absent -> REFUSED 7 (the key is declared on this service)',
     stub: { service: BQB1, envVars: [PORT] },
-    args: ['--dry-run'],
+    args: [NO_SUCH_SHA, '--dry-run'],
     code: 7,
     stderrHas: ['REFUSED', 'absent'],
   },
   {
     why: 'bqb1 + env-var read 500 -> REFUSED 7, BLIND. An outage must not permit the deploy.',
     stub: { service: BQB1, envVars: null, envVarsStatus: 500 },
-    args: ['--dry-run'],
+    args: [NO_SUCH_SHA, '--dry-run'],
     code: 7,
     stderrHas: ['REFUSED', 'BLIND'],
   },
   {
     why: 'bqb1 + env-var read 401 -> REFUSED 7, not exit 2. A bad read is a BLIND gate, not a usage error.',
     stub: { service: BQB1, envVars: null, envVarsStatus: 401 },
-    args: ['--dry-run'],
+    args: [NO_SUCH_SHA, '--dry-run'],
     code: 7,
     stderrHas: ['BLIND'],
   },
@@ -286,14 +291,14 @@ const E2E = [
     // booting a process that throws.
     why: 'bqb1 + blank secret + --force-RTH-override -> STILL 7. The wrong override must not open this gate.',
     stub: { service: BQB1, envVars: [PORT, { key: 'AUTH_SECRET', value: ' ' }] },
-    args: ['--dry-run', '--force-rth-override=deploying inside RTH on purpose'],
+    args: [NO_SUCH_SHA, '--dry-run', '--force-rth-override=deploying inside RTH on purpose'],
     code: 7,
     stderrHas: ['REFUSED'],
   },
   {
     why: 'bqb1 + blank secret + --force-embargo-override -> STILL 7. Same, for the embargo flag.',
     stub: { service: BQB1, envVars: [PORT, { key: 'AUTH_SECRET', value: ' ' }] },
-    args: ['--dry-run', '--force-embargo-override=board said so'],
+    args: [NO_SUCH_SHA, '--dry-run', '--force-embargo-override=board said so'],
     code: 7,
     stderrHas: ['REFUSED'],
   },
@@ -317,7 +322,7 @@ const E2E = [
     // output, not only in a refusal.
     why: 'other service + real secret -> exit 0, prints the auth line AND the env-write caveat',
     stub: { service: OTHER, envVars: [PORT, { key: 'AUTH_SECRET', value: 'a-real-secret-value' }] },
-    args: ['--dry-run'],
+    args: [NO_SUCH_SHA, '--dry-run'],
     code: 0,
     // Two different obligations, deliberately graded by two different kinds of string:
     //
@@ -339,7 +344,7 @@ const E2E = [
   {
     why: 'other service + no AUTH_SECRET at all -> exit 0. Severity is scoped: no false-block.',
     stub: { service: OTHER, envVars: [PORT] },
-    args: ['--dry-run'],
+    args: [NO_SUCH_SHA, '--dry-run'],
     code: 0,
     stdoutHas: ['gate N/A on this service'],
   },

@@ -140,6 +140,15 @@ So the manual trigger is **the deploy path, not a fallback**:
 RENDER_API_KEY=… node scripts/render-redeploy.mjs --commit=<sha>
 ```
 
+⛔ **A deploy target is REQUIRED and values attach with `=`** (TRA-4420). Until 2026-09-09 that
+script matched its flags *positively*, so anything it did not recognise was silently ignored and
+the run proceeded as a **real deploy of the branch tip** — `--help` shipped
+`dep-dagcbqp5efls73ac5d40` to the money host, and `--commmit=<sha>` / `--commit <sha>` shipped the
+**tip instead of the sha the operator named**, exit 0. Those are now exit 2 naming the offender,
+`--help` prints usage and exits 0, and the bare-tip default is gone: say `--commit=<sha>`, or
+`--tip` if you mean whatever `origin/main` is at that instant. `pnpm check:arg-guard` (in
+`pretest`) grades it; its ARM 0 re-runs `a187fc14`'s bytes and asserts they still reach the POST.
+
 That script is a **freeze**: it **REFUSES** inside 13:25–20:00Z Mon–Fri (RTH is 13:30–20:00Z; the
 freeze opens 5 min early because a deploy *created* at 13:29Z *boots* the box inside RTH), plus any
 dated embargo in its `EMBARGOES` table. It is **OPEN** pre-open, post-close and all weekend. Do not

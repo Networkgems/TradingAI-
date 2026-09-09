@@ -261,8 +261,12 @@ The only clear read of a *present* file is one that parses and validates.
 ## Overriding
 
 ```
-node scripts/render-redeploy.mjs --override-hold="TRA-4217 why this cannot wait"
+node scripts/render-redeploy.mjs --commit=<sha> --override-hold="TRA-4217 why this cannot wait"
 ```
+
+(The `--commit=<sha>` is not optional decoration: since TRA-4420 a deploy target is **required**
+— `--commit=<sha>`, or `--tip` if you genuinely mean whatever `origin/main` is at that instant.
+The bare form used to default to the tip, which is what a mistyped `--commit` silently fell into.)
 
 The reason must be non-empty **and must name the ticket of an active hold** (case-insensitive).
 This is the only one of the six overrides that demands the ticket: the other five guard a

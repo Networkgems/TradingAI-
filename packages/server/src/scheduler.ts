@@ -202,9 +202,9 @@ export interface EtTick {
 export type RoutineTickCallback = (et: EtTick) => void | Promise<void>;
 
 /**
- * TRA-1404 — persistence port for the 21:00 ET archive dedup key
- * (`lastArchiveDate`). The scheduler itself stays fs-free (so its unit tests
- * need no disk); the concrete file-backed store lives in `scheduler-state.ts`.
+ * TRA-1404 / TRA-4417 — persistence port for the scheduler's per-ET-day dedup
+ * keys. The scheduler itself stays fs-free (so its unit tests need no disk); the
+ * concrete file-backed store lives in `scheduler-state.ts`.
  *
  * Motivation: the archive gate (`this.lastArchiveDate !== todayKey`) is
  * in-memory only. A Render redeploy AFTER 21:00 ET resets it to `''`, so the
@@ -215,22 +215,51 @@ export type RoutineTickCallback = (et: EtTick) => void | Promise<void>;
  * Persisting the key across restarts skips the re-fire entirely, leaving
  * `catchUpMissedEodReports` (writes only MISSING days) as the sole post-archive
  * writer.
+ *
+ * TRA-4417 — widened from the archive key alone to EVERY per-ET-day dedup key,
+ * because the archive was never the only hook with this defect. Measured on
+ * bqb1 2026-09-08: a restart at 08:56 ET landed inside the morning-brief
+ * catch-up window and dispatched the 09-08 brief to all 67 users a SECOND time,
+ * 27 minutes after the first. `onPremarket` — a WRITER — carries the identical
+ * guard behind a 30-minute window.
  */
-export interface ArchiveDateStore {
-  /** The last-archived ET date (`YYYY-MM-DD`) from a prior process, or `''`/undefined if none. */
-  load(): string | undefined;
-  /** Persist `date` (`YYYY-MM-DD`) as the last-archived ET date. Best-effort — must not throw. */
-  save(date: string): void;
+export type SchedulerDedupeKey =
+  | 'lastMarketCloseDate'
+  | 'lastDailyDate'
+  | 'lastArchiveDate'
+  | 'lastPremarketDate'
+  | 'lastMorningBriefDate'
+  | 'lastChainRecordDate'
+  | 'lastWeeklyRollupDate';
+
+/**
+ * TRA-4417 — every key this store carries is an ET date (`YYYY-MM-DD`) produced
+ * by `etDateString`, the SAME `todayKey` the hook compares against in the tick.
+ * Not UTC: these hooks are ET-scheduled and the archive boundary is 21:00 ET, so
+ * a UTC key would roll over mid-evening and re-open an already-closed day.
+ *
+ * `lastHourlyKey` is deliberately NOT in this set. It is `YYYY-MM-DD-HH`, not a
+ * date, and it sits behind an exact `minute === 0` gate — a 60-second exposure
+ * rather than the 30-minute and 5-hour catch-up windows that make the keys above
+ * reachable by an ordinary restart. Whether the funding accrual it guards is
+ * itself idempotent is a separate question and not one this change answers.
+ */
+export interface SchedulerDedupeStore {
+  /** The `key`'s ET date (`YYYY-MM-DD`) from a prior process, or undefined if none. */
+  load(key: SchedulerDedupeKey): string | undefined;
+  /** Persist `date` (`YYYY-MM-DD`) for `key`. Best-effort — must not throw. */
+  save(key: SchedulerDedupeKey, date: string): void;
 }
 
 /** TRA-1404 — optional wiring passed to `MarketScheduler.start`. */
 export interface ScheduleOptions {
   /**
-   * TRA-1404 — persists/restores the 21:00 ET archive dedup key across process
-   * restarts so a post-21:00 redeploy does not re-fire the daily close. Omit
-   * (e.g. in unit tests) to keep the in-memory-only behavior.
+   * TRA-1404 / TRA-4417 — persists/restores the per-ET-day dedup keys across
+   * process restarts, so a redeploy that lands inside a hook's catch-up window
+   * does not re-fire a hook that already ran today. Omit (e.g. in unit tests) to
+   * keep the in-memory-only behavior.
    */
-  archiveDateStore?: ArchiveDateStore;
+  dedupeStore?: SchedulerDedupeStore;
 }
 
 export interface ScheduleCallbacks {
@@ -375,8 +404,40 @@ export class MarketScheduler {
   private lastChainRecordDate = '';
   /** TRA-1971 — last ET Monday date the weekly options roll-up fired. Dedupes per ISO week. */
   private lastWeeklyRollupDate = '';
-  /** TRA-1404 — persists `lastArchiveDate` so a post-21:00 restart doesn't re-fire the archive. */
-  private archiveDateStore: ArchiveDateStore | null = null;
+  /**
+   * TRA-1404 / TRA-4417 — persists the per-ET-day dedup keys so a restart INSIDE a
+   * hook's catch-up window can't re-fire a hook that already ran today.
+   */
+  private dedupeStore: SchedulerDedupeStore | null = null;
+
+  /**
+   * TRA-4417 — mark `key` as fired for `todayKey`, in memory AND (when wired) on
+   * disk. Persisting happens BEFORE the callback runs, deliberately and for the
+   * same reason TRA-1404 chose that order: a crash mid-hook must not leave the day
+   * looking un-fired, because the re-run would repeat whatever side effects the
+   * first attempt already committed. That matters most for `onPremarket`, whose
+   * callback seeds the watchlist via `engine.addSymbol()` and fans a full
+   * `scanStocksMarket()` out per user. The cost of this order is that a hook which
+   * dies early is not retried today — a missed day, which is loud in the same logs
+   * that made this bug visible, versus a silent double-write.
+   */
+  private markFired(key: SchedulerDedupeKey, todayKey: string): void {
+    try {
+      this.dedupeStore?.save(key, todayKey);
+    } catch (err) {
+      // The store contract says `save` never throws, and the file-backed one honours
+      // it — but this call sits on the 60s tick, INSIDE the `if` that has already
+      // decided the hook runs. An exception escaping here would abort the tick before
+      // `runScheduled`, i.e. a broken disk would silently stop the hook it is meant to
+      // protect, and take every later hook in the same tick with it. Degrade to
+      // in-memory-only dedup instead; the day still fires.
+      log.warn('scheduler dedup key persist threw; continuing with in-memory dedup', {
+        key,
+        date: todayKey,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   /**
    * Start polling. Accepts either a single market-close callback (legacy form)
@@ -392,17 +453,47 @@ export class MarketScheduler {
     const cfg: ScheduleCallbacks =
       typeof callbacks === 'function' ? { onMarketClose: callbacks } : callbacks;
 
-    // TRA-1404 — restore the last-archived ET date from disk so a process that
-    // restarts AFTER 21:00 ET on an already-archived day does not re-fire the
-    // daily close. A not-yet-archived day restores a stale/empty key and still
-    // archives normally at 21:00.
-    if (opts.archiveDateStore) {
-      this.archiveDateStore = opts.archiveDateStore;
-      const restored = opts.archiveDateStore.load();
-      if (restored) {
-        this.lastArchiveDate = restored;
-        log.info('restored persisted archive dedup key', { lastArchiveDate: restored });
-      }
+    // TRA-1404 / TRA-4417 — restore each hook's last-fired ET date from disk, so a
+    // process that restarts INSIDE that hook's catch-up window does not run the hook
+    // a second time for a day it already ran. A day the hook has NOT yet run restores
+    // a stale/absent key, which cannot equal `todayKey`, so the hook still fires
+    // normally — the windows below keep their full width and their full healing power
+    // (TRA-2064); all that changes is that "already done today" now survives the
+    // restart the window exists to tolerate.
+    if (opts.dedupeStore) {
+      this.dedupeStore = opts.dedupeStore;
+      const restored: Partial<Record<SchedulerDedupeKey, string>> = {};
+      // A throwing `load` must not kill boot: this runs inside `start()`, which is on
+      // the server's startup path. Fail OPEN, per key — an unreadable key means "has
+      // not fired today", so the hook runs, which is the same place we were before
+      // TRA-4417 and strictly better than a process that does not come up at all.
+      const take = (key: SchedulerDedupeKey): string => {
+        let value: string | undefined;
+        try {
+          value = opts.dedupeStore?.load(key);
+        } catch (err) {
+          log.warn('scheduler dedup key restore threw; treating as not-yet-fired', {
+            key,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+        if (value) restored[key] = value;
+        return value ?? '';
+      };
+      this.lastMarketCloseDate = take('lastMarketCloseDate');
+      this.lastDailyDate = take('lastDailyDate');
+      this.lastArchiveDate = take('lastArchiveDate');
+      this.lastPremarketDate = take('lastPremarketDate');
+      this.lastMorningBriefDate = take('lastMorningBriefDate');
+      this.lastChainRecordDate = take('lastChainRecordDate');
+      this.lastWeeklyRollupDate = take('lastWeeklyRollupDate');
+      // Logged even when empty: "restored nothing" and "never looked" are different
+      // facts, and the second one is what TRA-4417 spent a live incident learning to
+      // tell apart. An empty object here means a fresh disk, not a disabled store.
+      log.info('restored persisted scheduler dedup keys', {
+        restored,
+        count: Object.keys(restored).length,
+      });
     }
 
     // Check every 60 seconds
@@ -413,12 +504,14 @@ export class MarketScheduler {
       if (hour === 16 && minute === 5) {
         if (cfg.onMarketClose && isMarketDay(date) && this.lastMarketCloseDate !== todayKey) {
           this.lastMarketCloseDate = todayKey;
+          this.markFired('lastMarketCloseDate', todayKey);
           log.info('market-close EOD trigger fired', { date: todayKey });
           runScheduled('market-close EOD', cfg.onMarketClose);
         }
 
         if (cfg.onDaily && this.lastDailyDate !== todayKey) {
           this.lastDailyDate = todayKey;
+          this.markFired('lastDailyDate', todayKey);
           log.info('daily EOD trigger fired', { date: todayKey });
           runScheduled('daily EOD', cfg.onDaily);
         }
@@ -431,6 +524,7 @@ export class MarketScheduler {
       if ((hour === 8 && minute >= 30) || (hour === 9 && minute === 0)) {
         if (cfg.onMorningBrief && isMarketDay(date) && this.lastMorningBriefDate !== todayKey) {
           this.lastMorningBriefDate = todayKey;
+          this.markFired('lastMorningBriefDate', todayKey);
           log.info('morning-brief trigger fired', { date: todayKey, etHour: hour, etMinute: minute });
           runScheduled('morning-brief', cfg.onMorningBrief);
         }
@@ -462,6 +556,7 @@ export class MarketScheduler {
       if (hour === 9 && minute < 30) {
         if (cfg.onPremarket && isMarketDay(date) && this.lastPremarketDate !== todayKey) {
           this.lastPremarketDate = todayKey;
+          this.markFired('lastPremarketDate', todayKey);
           log.info('pre-market trigger fired', { date: todayKey });
           runScheduled('pre-market', cfg.onPremarket);
         }
@@ -481,6 +576,7 @@ export class MarketScheduler {
       if ((hour === 15 && minute >= 55) || (hour >= 16 && hour < 20)) {
         if (cfg.onChainRecord && isMarketDay(date) && this.lastChainRecordDate !== todayKey) {
           this.lastChainRecordDate = todayKey;
+          this.markFired('lastChainRecordDate', todayKey);
           log.info('option-chain recorder trigger fired', { date: todayKey, etHour: hour, etMinute: minute });
           runScheduled('option-chain recorder', cfg.onChainRecord);
         }
@@ -493,6 +589,7 @@ export class MarketScheduler {
       if (cfg.onWeeklyRollup && hour >= 7 && hour < 12 && etDayOfWeekIso(todayKey) === 1) {
         if (this.lastWeeklyRollupDate !== todayKey) {
           this.lastWeeklyRollupDate = todayKey;
+          this.markFired('lastWeeklyRollupDate', todayKey);
           log.info('weekly options roll-up trigger fired', { date: todayKey, etHour: hour });
           runScheduled('weekly options roll-up', cfg.onWeeklyRollup);
         }
@@ -510,7 +607,7 @@ export class MarketScheduler {
           this.lastArchiveDate = todayKey;
           // TRA-1404 — persist BEFORE running the close so a crash mid-close
           // can't re-fire the archive on the next boot. Best-effort (never throws).
-          this.archiveDateStore?.save(todayKey);
+          this.markFired('lastArchiveDate', todayKey);
           log.info('archive trigger fired', {
             date: todayKey,
             etTime: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')} ET`,

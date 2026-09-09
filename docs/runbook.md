@@ -399,10 +399,23 @@ gate rather than a convention:
 ```bash
 # REFUSES (exit 4) if it is 13:25–20:00Z Mon–Fri on the soak host; else triggers the deploy
 RENDER_API_KEY=… node scripts/render-redeploy.mjs --commit=<sha>
-node scripts/render-redeploy.mjs --dry-run            # print the gate decision only
+node scripts/render-redeploy.mjs --commit=<sha> --dry-run   # print the gate decision only
+node scripts/render-redeploy.mjs --help                     # usage; prints and exits, deploys nothing
 # genuine emergency only — the reason is recorded and the session is disqualified:
 node scripts/render-redeploy.mjs --commit=<sha> --force-rth-override="why this cannot wait"
 ```
+
+⛔ **A deploy target is REQUIRED, and values attach with `=`** (TRA-4420). Until 2026-09-09 the
+script recognised its flags *positively* — anything else was silently ignored and the run
+proceeded as a **real deploy of the branch tip**. `--help` did exactly that on the money host
+(`dep-dagcbqp5efls73ac5d40`); nothing was harmed because the tip happened to be the commit
+TRA-4419 had ordered, which is luck, not design. The instances that cost bytes are
+`--commmit=<sha>` (typo) and `--commit <sha>` (space) — both read as *"no `--commit` given"* and
+shipped the **tip instead of the sha you named**, exit 0, cheerful output. All of them are now
+**refused with exit 2 naming the offender**, and the bare-tip default is retired: pass
+`--commit=<sha>`, or say `--tip` if you really do mean whatever `origin/main` is at that instant.
+Graded by `pnpm check:arg-guard` (in `pretest`), whose ARM 0 re-runs the pre-fix bytes and
+asserts they still reach `POST /deploys`.
 
 **Four gates, four refusals, four separate overrides.** The first three are scoped to the
 soak host only (every other Render service deploys with no time gate); the fourth is not,
