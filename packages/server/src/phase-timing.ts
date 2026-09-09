@@ -225,14 +225,46 @@ export async function withPhase<T>(name: string, fn: () => Promise<T>): Promise<
  * Slice names are bounded by the ring (512) and only recorded past the slow
  * threshold, so per-symbol labels cannot explode cardinality anywhere that
  * aggregates by name.
+ *
+ * TRA-3660 (2026-09-09, trip-#13 beat) — the slice window is WALL time between
+ * two boundary stamps, and the code between two boundaries may `await` (and 67
+ * per-user meters interleave on one loop), so a raw window is NOT own sync
+ * time: the live box recorded a 20465ms "#slice" on a boot whose worst loop lag
+ * was 1516ms, and three concurrent ~1.16s "#slice"s within 6ms of each other —
+ * sync time is exclusive, so at most one could be real. A fabricated sync name
+ * landing in a trip's `slowSyncPhase` is the plausible-non-null hazard this
+ * meter exists to avoid. The discriminator is the loop itself: a contiguous
+ * sync block cannot let a `setImmediate` fire, so a shared one-shot beacon
+ * (`armTurnBeacon`) bumps a module-global turn epoch whenever the loop turns
+ * over. A slice whose window saw the epoch move provably spans foreign turns
+ * and is recorded as `<phase>#span[..]` with kind `async` (wall-clock span,
+ * never a block verdict); only an un-turned window records as a `sync` #slice.
+ * A mixed window (small await + real sync block inside) demotes to a span and
+ * loses the name — an honest span beats a fabricated culprit; the block's own
+ * surrounding turns bound it for the other meters' yield-preempt records.
  */
+let turnEpoch = 0;
+let turnBeaconPending = false;
+function armTurnBeacon(): void {
+  if (turnBeaconPending) return;
+  turnBeaconPending = true;
+  setImmediate(() => {
+    turnBeaconPending = false;
+    turnEpoch++;
+  });
+}
+
 export class SyncSliceMeter {
   private sliceStartMs = Date.now();
   private sliceStartLabel: string | undefined;
+  private sliceStartEpoch: number;
   constructor(
     private readonly phase: string,
     private readonly env: NodeJS.ProcessEnv = process.env,
-  ) {}
+  ) {
+    this.sliceStartEpoch = turnEpoch;
+    armTurnBeacon();
+  }
 
   /** End the current sync slice (yield due / loop end); records it if slow. */
   endSlice(label?: string): void {
@@ -240,13 +272,19 @@ export class SyncSliceMeter {
     const durationMs = nowMs - this.sliceStartMs;
     if (durationMs >= resolveSlowMs(this.env)) {
       const from = this.sliceStartLabel ?? '<start>';
-      recordPhaseDuration(
-        `${this.phase}#slice[${from}..${label ?? '?'}]`,
-        durationMs, nowMs, this.env, 'sync',
-      );
+      const to = label ?? '?';
+      if (turnEpoch === this.sliceStartEpoch) {
+        recordPhaseDuration(`${this.phase}#slice[${from}..${to}]`, durationMs, nowMs, this.env, 'sync');
+      } else {
+        // The loop turned over inside this window: awaited I/O and/or foreign
+        // tasks ran, so the wall time is a span, not an own sync block.
+        recordPhaseDuration(`${this.phase}#span[${from}..${to}]`, durationMs, nowMs, this.env, 'async');
+      }
     }
     this.sliceStartMs = nowMs;
     this.sliceStartLabel = label;
+    this.sliceStartEpoch = turnEpoch;
+    armTurnBeacon();
   }
 
   /**
@@ -263,6 +301,8 @@ export class SyncSliceMeter {
     }
     this.sliceStartMs = nowMs;
     this.sliceStartLabel = label;
+    this.sliceStartEpoch = turnEpoch;
+    armTurnBeacon();
   }
 }
 

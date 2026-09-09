@@ -69,6 +69,58 @@ describe('SyncSliceMeter — own-slice attribution (shape (a))', () => {
   });
 });
 
+describe('SyncSliceMeter — turn-beacon demotion (a window that spans a loop turn is a span, not a block)', () => {
+  // TRA-3660 trip-#13 beat (2026-09-09): the live box recorded a 20465ms
+  // "#slice" on a boot whose worst loop lag was 1516ms — the window between two
+  // pacer boundaries contained awaited I/O (and 66 other users' interleaved
+  // work), so raw wall time fabricated a sync culprit. A contiguous sync block
+  // cannot let a setImmediate fire; a window in which the loop provably turned
+  // over must therefore never claim `sync`.
+  it('demotes a slow window containing an awaited turn to <phase>#span[..] kind async', async () => {
+    const meter = new SyncSliceMeter('signal.doTick.pacer', ENV);
+    meter.endSlice('early-state-broadcast'); // fast boundary — sets the from-label
+    await new Promise<void>(r => setImmediate(r)); // the loop turns (awaited I/O stand-in)
+    busyBlock(45);
+    meter.endSlice('shadow-rotation');
+    const a = getPhaseAttribution();
+    // Never a sync verdict: lastSlowSyncPhase must NOT carry the fabricated name.
+    expect(a.lastSlowSyncPhase).toBeNull();
+    const span = a.recentSlowPhases.find(r => r.name.includes('#span['));
+    expect(span).toBeDefined();
+    expect(span!.name).toBe('signal.doTick.pacer#span[early-state-broadcast..shadow-rotation]');
+    expect(span!.kind).toBe('async');
+    expect(a.recentSlowPhases.filter(r => r.name.includes('#slice['))).toHaveLength(0);
+  });
+
+  it('still records a true un-turned sync slice AFTER a demoted span (the boundary re-arms)', async () => {
+    const meter = new SyncSliceMeter('p', ENV);
+    await new Promise<void>(r => setImmediate(r)); // turn inside the first window
+    busyBlock(45);
+    meter.endSlice('A'); // demoted span
+    busyBlock(45); // pure sync — no turn possible before the next boundary
+    meter.endSlice('B');
+    const a = getPhaseAttribution();
+    expect(a.lastSlowSyncPhase).not.toBeNull();
+    expect(a.lastSlowSyncPhase!.name).toBe('p#slice[A..B]');
+    expect(a.lastSlowSyncPhase!.kind).toBe('sync');
+  });
+
+  it('two meters interleaved across turns cannot both book the same wall-clock as own sync work', async () => {
+    // The concurrent-pacer shape: three ~1.16s "#slice"s within 6ms on the live
+    // box — sync time is exclusive, at most one could be real. Interleaving
+    // requires the loop to turn, so every interleaved window demotes.
+    const m1 = new SyncSliceMeter('u1.pacer', ENV);
+    const m2 = new SyncSliceMeter('u2.pacer', ENV);
+    m1.endSlice('a'); m2.endSlice('a');
+    await new Promise<void>(r => setImmediate(r));
+    busyBlock(45);
+    m1.endSlice('b'); m2.endSlice('b');
+    const recs = getPhaseAttribution().recentSlowPhases;
+    expect(recs.filter(r => r.name.includes('#slice['))).toHaveLength(0);
+    expect(recs.filter(r => r.name.includes('#span[')).length).toBeGreaterThanOrEqual(2);
+  });
+});
+
 describe('SyncSliceMeter — yield preemption (shape (b))', () => {
   it('records a slow scheduled→resumed delay as yield-preempt@<phase>, an observation not a culprit', () => {
     const meter = new SyncSliceMeter('signal.doTick.equity-entry-sweep', ENV);
