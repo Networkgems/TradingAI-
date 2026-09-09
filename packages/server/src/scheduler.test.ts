@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, etDayOfWeekIso } from './scheduler.js';
+import type { SchedulerDedupeKey } from './scheduler.js';
 
 /**
  * TRA-193 — coverage for the scheduler that drives both the per-market-day
@@ -715,14 +716,14 @@ describe('MarketScheduler — TRA-1404 persisted archive dedup key', () => {
   beforeEach(() => { vi.useFakeTimers(); });
   afterEach(() => { vi.useRealTimers(); });
 
-  /** In-memory ArchiveDateStore standing in for the on-disk file across restarts. */
-  const makeStore = (initial = '') => {
-    let value = initial;
+  /** In-memory SchedulerDedupeStore standing in for the on-disk file across restarts. */
+  const makeStore = (initial: Partial<Record<SchedulerDedupeKey, string>> = {}) => {
+    const state: Partial<Record<SchedulerDedupeKey, string>> = { ...initial };
     return {
-      load: vi.fn(() => value),
-      save: vi.fn((d: string) => { value = d; }),
+      load: vi.fn((k: SchedulerDedupeKey) => state[k]),
+      save: vi.fn((k: SchedulerDedupeKey, d: string) => { state[k] = d; }),
       /** Peek at what a "next boot" would restore. */
-      current: () => value,
+      current: (k: SchedulerDedupeKey) => state[k],
     };
   };
 
@@ -733,12 +734,12 @@ describe('MarketScheduler — TRA-1404 persisted archive dedup key', () => {
     const onArchive = vi.fn();
     const store = makeStore();
     const scheduler = new MarketScheduler();
-    scheduler.start({ onArchive }, { archiveDateStore: store });
+    scheduler.start({ onArchive }, { dedupeStore: store });
 
     vi.advanceTimersByTime(60_000);
     expect(onArchive).toHaveBeenCalledTimes(1);
-    expect(store.save).toHaveBeenCalledWith('2026-05-14');
-    expect(store.current()).toBe('2026-05-14');
+    expect(store.save).toHaveBeenCalledWith('lastArchiveDate', '2026-05-14');
+    expect(store.current('lastArchiveDate')).toBe('2026-05-14');
     scheduler.stop();
   });
 
@@ -748,9 +749,9 @@ describe('MarketScheduler — TRA-1404 persisted archive dedup key', () => {
     // fresh (''), but the restored key must suppress the re-fire.
     vi.setSystemTime(new Date(Date.UTC(2026, 4, 15, 2, 29, 0)));
     const onArchive = vi.fn();
-    const store = makeStore('2026-05-14');
+    const store = makeStore({ lastArchiveDate: '2026-05-14' });
     const scheduler = new MarketScheduler();
-    scheduler.start({ onArchive }, { archiveDateStore: store });
+    scheduler.start({ onArchive }, { dedupeStore: store });
 
     // Run many ticks across the rest of the evening — none should fire.
     for (let i = 0; i < 60; i++) vi.advanceTimersByTime(60_000);
@@ -764,13 +765,13 @@ describe('MarketScheduler — TRA-1404 persisted archive dedup key', () => {
     // today is not yet archived, so the archive must still fire exactly once.
     vi.setSystemTime(new Date(Date.UTC(2026, 4, 15, 2, 29, 0)));
     const onArchive = vi.fn();
-    const store = makeStore('2026-05-13');
+    const store = makeStore({ lastArchiveDate: '2026-05-13' });
     const scheduler = new MarketScheduler();
-    scheduler.start({ onArchive }, { archiveDateStore: store });
+    scheduler.start({ onArchive }, { dedupeStore: store });
 
     vi.advanceTimersByTime(60_000);
     expect(onArchive).toHaveBeenCalledTimes(1);
-    expect(store.current()).toBe('2026-05-14');
+    expect(store.current('lastArchiveDate')).toBe('2026-05-14');
     scheduler.stop();
   });
 
@@ -782,6 +783,193 @@ describe('MarketScheduler — TRA-1404 persisted archive dedup key', () => {
 
     vi.advanceTimersByTime(60_000);
     expect(onArchive).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+});
+
+// ── TRA-4417: a restart INSIDE a catch-up window must not re-fire the day ─────
+//
+// The live incident, bqb1 2026-09-08 (ET = EDT = UTC-4):
+//
+//   12:30:20.021Z  morning brief dispatched  date=2026-09-08  users=67
+//   12:56:17.645Z  EOD scheduler started            <- process restart, 08:56 ET
+//   12:57:18.080Z  morning brief dispatched  date=2026-09-08  users=67
+//
+// 08:57 ET is inside the morning-brief catch-up window `(h===8 && m>=30)`, and the
+// restart had reset `lastMorningBriefDate` to `''`. The window is NOT the bug and is
+// asserted below to still be as wide as it was: these tests pin BOTH directions —
+// suppressed when the day already fired, still fires when it has not.
+
+describe('MarketScheduler — TRA-4417 durable per-day dedup across a restart', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  const makeStore = (initial: Partial<Record<SchedulerDedupeKey, string>> = {}) => {
+    const state: Partial<Record<SchedulerDedupeKey, string>> = { ...initial };
+    return {
+      load: vi.fn((k: SchedulerDedupeKey) => state[k]),
+      save: vi.fn((k: SchedulerDedupeKey, d: string) => { state[k] = d; }),
+      current: (k: SchedulerDedupeKey) => state[k],
+    };
+  };
+
+  /** 08:56 ET on 2026-09-08 — the wall clock of the measured restart. Tick lands 08:57. */
+  const AT_0856_ET = new Date(Date.UTC(2026, 8, 8, 12, 56, 0));
+  /** 09:05 ET on 2026-09-08 — inside the pre-market window (`h===9 && m<30`). */
+  const AT_0905_ET = new Date(Date.UTC(2026, 8, 8, 13, 5, 0));
+
+  // ── the writer first (TRA-4417 asks for `onPremarket` before `onMorningBrief`) ──
+
+  it('does NOT re-fire onPremarket on a restart inside the 09:00-09:30 window', () => {
+    // `onPremarket` rebuilds and re-seeds the watchlist (`engine.addSymbol` +
+    // `engine.refresh`) and fans a full `scanStocksMarket()` out per user. Re-running
+    // it is a duplicate WRITE against a second full upstream pull, 25 minutes before
+    // the bell — the serious half of this ticket.
+    vi.setSystemTime(AT_0905_ET);
+    const onPremarket = vi.fn();
+    const store = makeStore({ lastPremarketDate: '2026-09-08' });
+    const scheduler = new MarketScheduler();
+    scheduler.start({ onPremarket }, { dedupeStore: store });
+
+    // Every remaining tick to the bell — none may fire.
+    for (let i = 0; i < 25; i++) vi.advanceTimersByTime(60_000);
+    expect(onPremarket).not.toHaveBeenCalled();
+    scheduler.stop();
+  });
+
+  it('STILL fires onPremarket late in the window when the day has not run yet', () => {
+    // The TRA-2064 catch-up must keep its full healing power: a restart at 09:05 on a
+    // day the hook has NOT run still builds the watchlist before the bell. A fix that
+    // narrowed the window would fail here.
+    vi.setSystemTime(AT_0905_ET);
+    const onPremarket = vi.fn();
+    const store = makeStore({ lastPremarketDate: '2026-09-04' });
+    const scheduler = new MarketScheduler();
+    scheduler.start({ onPremarket }, { dedupeStore: store });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onPremarket).toHaveBeenCalledTimes(1);
+    expect(store.current('lastPremarketDate')).toBe('2026-09-08');
+    scheduler.stop();
+  });
+
+  it('persists the key BEFORE the callback runs, so a crash mid-hook cannot re-run it', () => {
+    vi.setSystemTime(AT_0905_ET);
+    let keyAtCallTime: string | undefined;
+    const onPremarket = vi.fn(() => { keyAtCallTime = store.current('lastPremarketDate'); });
+    const store = makeStore();
+    const scheduler = new MarketScheduler();
+    scheduler.start({ onPremarket }, { dedupeStore: store });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onPremarket).toHaveBeenCalledTimes(1);
+    expect(keyAtCallTime).toBe('2026-09-08');
+    scheduler.stop();
+  });
+
+  // ── the reported symptom ──
+
+  it('does NOT re-dispatch the morning brief on the measured 08:56 ET restart', () => {
+    vi.setSystemTime(AT_0856_ET);
+    const onMorningBrief = vi.fn();
+    const store = makeStore({ lastMorningBriefDate: '2026-09-08' });
+    const scheduler = new MarketScheduler();
+    scheduler.start({ onMorningBrief }, { dedupeStore: store });
+
+    // 08:57 ET (the duplicate's actual timestamp) plus the rest of the window.
+    for (let i = 0; i < 5; i++) vi.advanceTimersByTime(60_000);
+    expect(onMorningBrief).not.toHaveBeenCalled();
+    scheduler.stop();
+  });
+
+  it('REPRODUCES the duplicate dispatch when no store is wired (control)', () => {
+    // Negative control: without the durable key, the same restart at the same minute
+    // re-sends the brief. If this ever stops failing-open, the test above proves
+    // nothing.
+    vi.setSystemTime(AT_0856_ET);
+    const onMorningBrief = vi.fn();
+    const scheduler = new MarketScheduler();
+    scheduler.start({ onMorningBrief });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onMorningBrief).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  // ── the remaining per-day keys ──
+
+  it('does NOT re-fire the chain recorder on a restart inside its 15:55-20:00 window', () => {
+    // 17:30 ET on 2026-09-08 = 21:30 UTC; tick lands 17:31 ET.
+    vi.setSystemTime(new Date(Date.UTC(2026, 8, 8, 21, 30, 0)));
+    const onChainRecord = vi.fn();
+    const store = makeStore({ lastChainRecordDate: '2026-09-08' });
+    const scheduler = new MarketScheduler();
+    scheduler.start({ onChainRecord }, { dedupeStore: store });
+
+    for (let i = 0; i < 30; i++) vi.advanceTimersByTime(60_000);
+    expect(onChainRecord).not.toHaveBeenCalled();
+    scheduler.stop();
+  });
+
+  it('does NOT re-fire the weekly roll-up on a restart inside its Monday 07:00-12:00 window', () => {
+    // 2026-09-14 is a Monday. 09:00 ET = 13:00 UTC; tick lands 09:01 ET.
+    vi.setSystemTime(new Date(Date.UTC(2026, 8, 14, 13, 0, 0)));
+    const onWeeklyRollup = vi.fn();
+    const store = makeStore({ lastWeeklyRollupDate: '2026-09-14' });
+    const scheduler = new MarketScheduler();
+    scheduler.start({ onWeeklyRollup }, { dedupeStore: store });
+
+    for (let i = 0; i < 30; i++) vi.advanceTimersByTime(60_000);
+    expect(onWeeklyRollup).not.toHaveBeenCalled();
+    scheduler.stop();
+  });
+
+  it('does NOT re-fire the 16:05 close/daily pair on a restart across that minute', () => {
+    // 16:04 ET on 2026-09-08 = 20:04 UTC; tick lands 16:05 ET.
+    vi.setSystemTime(new Date(Date.UTC(2026, 8, 8, 20, 4, 0)));
+    const onMarketClose = vi.fn();
+    const onDaily = vi.fn();
+    const store = makeStore({ lastMarketCloseDate: '2026-09-08', lastDailyDate: '2026-09-08' });
+    const scheduler = new MarketScheduler();
+    scheduler.start({ onMarketClose, onDaily }, { dedupeStore: store });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onMarketClose).not.toHaveBeenCalled();
+    expect(onDaily).not.toHaveBeenCalled();
+    scheduler.stop();
+  });
+
+  // ── the fail-open bias ──
+
+  it('fires normally when the store restores nothing (fresh disk / first boot)', () => {
+    vi.setSystemTime(AT_0856_ET);
+    const onMorningBrief = vi.fn();
+    const store = makeStore();
+    const scheduler = new MarketScheduler();
+    scheduler.start({ onMorningBrief }, { dedupeStore: store });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onMorningBrief).toHaveBeenCalledTimes(1);
+    expect(store.save).toHaveBeenCalledWith('lastMorningBriefDate', '2026-09-08');
+    scheduler.stop();
+  });
+
+  it('keeps firing when save() throws — a broken disk must not wedge a hook shut', () => {
+    // The store contract says `save` never throws, but a hook that silently stops
+    // firing is the failure TRA-1630 / TRA-2064 cost five sessions to find, so the
+    // scheduler must survive a store that breaks the contract rather than take the
+    // whole tick down with it.
+    vi.setSystemTime(AT_0856_ET);
+    const onMorningBrief = vi.fn();
+    const store = {
+      load: () => undefined,
+      save: () => { throw new Error('ENOSPC'); },
+    };
+    const scheduler = new MarketScheduler();
+    scheduler.start({ onMorningBrief }, { dedupeStore: store });
+
+    expect(() => vi.advanceTimersByTime(60_000)).not.toThrow();
+    expect(onMorningBrief).toHaveBeenCalledTimes(1);
     scheduler.stop();
   });
 });

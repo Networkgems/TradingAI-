@@ -17,7 +17,7 @@ import {
   DENOM_FLIP_CHANGEPCT_DELTA_PP,
   type DenominatorFlipTapeDump,
 } from './denominator-flip-tape.js';
-import { createFileArchiveDateStore } from './scheduler-state.js';
+import { createFileSchedulerDedupeStore } from './scheduler-state.js';
 import {
   buildAllowedOrigins,
   corsMiddleware,
@@ -19435,7 +19435,12 @@ scheduler.start({
   // day already archived. Defense-in-depth atop the TRA-1403 write guard: it
   // removes the redundant close work, leaving the missed-day catch-up as the
   // sole post-archive writer.
-  archiveDateStore: createFileArchiveDateStore(),
+  //
+  // TRA-4417 — the same store now carries EVERY per-ET-day dedup key, not just
+  // the archive's. A restart inside the morning-brief catch-up window sent the
+  // 2026-09-08 brief to all 67 users twice; `onPremarket`, which rebuilds and
+  // re-seeds the watchlist, has the identical guard behind a 30-minute window.
+  dedupeStore: createFileSchedulerDedupeStore(),
 });
 
 httpServer.listen(PORT, () => {
