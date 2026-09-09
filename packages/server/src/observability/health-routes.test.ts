@@ -41,6 +41,7 @@ import { clearLiveEnforceGateLedger, recordLiveEnforceDecision } from '../live-e
 // another local copy agrees with itself and proves nothing about the route.
 import {
   SETUP_CONFIRMATION_GATE,
+  SETUP_CONFIRMATION_SIBLING_GATE,
   OTM_SETUP_TAXONOMY_MODE_ENV,
   OTM_SETUP_TAXONOMY_SETUPS_ENV,
 } from '../otm-setup-gate.js';
@@ -6185,6 +6186,17 @@ describe('GET /api/health/otm-sleeve-mandate — setupTaxonomy (TRA-4422)', () =
     byReasonCode: ReasonRow[];
     blockedUnclassified: number;
     today: { evaluated: number; blocked: number; byReasonCode: ReasonRow[] };
+    crossCheck: {
+      sibling: string;
+      siblingEvaluatedToday: number;
+      selfEvaluatedToday: number;
+      comparable: boolean;
+      ledgerLastDecisionAt: string | null;
+      processStartedAt: string;
+      sinceProcessStartMs: number | null;
+      holds: boolean | null;
+      reason: string;
+    };
     note: string;
   }
 
@@ -6224,6 +6236,82 @@ describe('GET /api/health/otm-sleeve-mandate — setupTaxonomy (TRA-4422)', () =
     // The zero must be attributable: the note names the sibling whose equality
     // separates "recorder broken" from "sleeve idle".
     expect(t.note).toMatch(/entry_window\.evaluated/);
+  });
+
+  // ── TRA-4422 Finding 2 — the cross-check's own precondition ───────────────
+  //
+  // Measured on the live 21:08:11Z swap onto `8e51be03` (2026-09-09): the route
+  // read `entry_window: 2297` beside `setup_confirmation: 0` and its note said
+  // "the recorder is broken". It was not. Both counters are ET-DAY folds that
+  // are HYDRATED FROM DISK at boot, so every one of those 2297 rows had been
+  // written by the previous build — which has no `setup_confirmation` writer at
+  // all — and the ledger's `lastDecisionAt` was 68 minutes BEFORE this process
+  // started. A false alarm on every deploy day, inside the instrument built to
+  // catch exactly that class.
+  //
+  // `record(gate, ts)` takes the timestamp SEPARATELY from the ET day, which is
+  // precisely the hydration shape: a row folded into today, written long before
+  // this process existed.
+  function record(gate: typeof SETUP_CONFIRMATION_GATE | typeof SETUP_CONFIRMATION_SIBLING_GATE, ts: number) {
+    recordLiveEnforceDecision(
+      gate, 'single_leg_otm', false, etDateString(new Date(NOW)), undefined, ts, {},
+    );
+  }
+  // ⚠️ `NOW` is 2_000_000_000 **ms**, i.e. 1970-01-24 — it is NOT a future date,
+  // and it sits BEFORE this process started. That makes it a fine stand-in for a
+  // hydrated row and useless as a stand-in for one this process wrote, so the
+  // two branches take their timestamps from different clocks on purpose.
+  const HYDRATED_TS = 1_000_000;
+  /** At/after process start — the only thing that makes `comparable` true. */
+  const liveTs = () => Date.now();
+
+  it('does NOT accuse the recorder when the sibling rows were hydrated from a PREVIOUS build', () => {
+    for (let i = 0; i < 3; i += 1) record(SETUP_CONFIRMATION_SIBLING_GATE, HYDRATED_TS);
+    const t = taxonomy();
+
+    // The incident's exact reading: non-zero sibling, zero self.
+    expect(t.crossCheck.siblingEvaluatedToday).toBe(3);
+    expect(t.crossCheck.selfEvaluatedToday).toBe(0);
+    // ...and the verdict is WITHHELD, not forged in either direction.
+    expect(t.crossCheck.comparable).toBe(false);
+    expect(t.crossCheck.holds).toBeNull();
+    expect(t.crossCheck.reason).toMatch(/NOT COMPARABLE/);
+    expect(t.note).toMatch(/comparable=false/);
+    expect(t.note).not.toMatch(/recorder is broken/);
+  });
+
+  // ⛔ THE GUARD'S OWN NEGATIVE CONTROL. A precondition that is never satisfied
+  // would suppress the alarm forever and read identically to a healthy box —
+  // which is the same defect one layer up. This asserts `comparable` can go TRUE
+  // and the accusation still fires when it is earned.
+  it('NEGATIVE CONTROL — once this process has written rows, a divergence DOES accuse the recorder', () => {
+    let last = 0;
+    for (let i = 0; i < 3; i += 1) { last = liveTs(); record(SETUP_CONFIRMATION_SIBLING_GATE, last); }
+    const t = taxonomy();
+
+    expect(t.crossCheck.comparable).toBe(true);
+    expect(t.crossCheck.holds).toBe(false);
+    expect(t.crossCheck.ledgerLastDecisionAt).toBe(new Date(last).toISOString());
+    expect(t.note).toMatch(/recorder is broken/);
+    expect(t.note).not.toMatch(/comparable=false/);
+  });
+
+  it('reports the equality HOLDING when both gates recorded the same population', () => {
+    for (let i = 0; i < 3; i += 1) {
+      record(SETUP_CONFIRMATION_SIBLING_GATE, liveTs());
+      record(SETUP_CONFIRMATION_GATE, liveTs());
+    }
+    const t = taxonomy();
+    expect(t.crossCheck.comparable).toBe(true);
+    expect(t.crossCheck.selfEvaluatedToday).toBe(3);
+    expect(t.crossCheck.siblingEvaluatedToday).toBe(3);
+    expect(t.crossCheck.holds).toBe(true);
+    expect(t.note).not.toMatch(/recorder is broken/);
+    // The sibling is NAMED from the shared constant, never a literal spelled
+    // here — a typo'd copy would fold on a gate nobody writes and report a
+    // permanent, silent zero.
+    expect(t.crossCheck.sibling).toBe(SETUP_CONFIRMATION_SIBLING_GATE);
+    expect(SETUP_CONFIRMATION_SIBLING_GATE).toBe('entry_window');
   });
 
   // ⛔ THE TRA-4154 TRAP, asserted directly. `retained.byGate` is an ARRAY and

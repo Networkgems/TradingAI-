@@ -43,6 +43,32 @@ export type SetupTaxonomyModeSource = 'default' | 'env' | 'env_invalid';
 export const SETUP_CONFIRMATION_GATE = 'setup_confirmation' as const;
 
 /**
+ * The ledger sibling this gate's `evaluated` is graded against. The seam sits
+ * immediately above it in the OTM open loop with nothing in between, so over one
+ * process's own rows `setup_confirmation.evaluated === entry_window.evaluated`
+ * is exact, and a divergence means one of the two stopped recording.
+ *
+ * ⛔ THE EQUALITY IS AN INVARIANT ONLY OVER ROWS A SINGLE PROCESS WROTE, and
+ * that precondition is NOT free — it is the finding this constant exists to
+ * carry. Both counters are ET-DAY folds and both are HYDRATED FROM DISK at
+ * boot, so on any day bqb1 swaps builds the OLD build's `entry_window` rows land
+ * in the same `today` fold as the NEW build's zero `setup_confirmation`.
+ * Measured 2026-09-09: nine minutes after the seam first went live on
+ * `8e51be03` the route read `entry_window: 2297` beside `setup_confirmation: 0`
+ * and the note accused the recorder. It was wrong — every one of those 2297 rows
+ * was written by `a187fc14`, which has no `setup_confirmation` writer at all,
+ * and `lastDecisionAt` (20:00:09Z) was 68 minutes BEFORE this process started.
+ * Nothing had been recorded by the seam because nothing had been recorded AT
+ * ALL. An instrument that manufactures a false alarm on every deploy day is the
+ * defect class this item exists to catch, shipped inside the catcher.
+ *
+ * The remedy is `setupTaxonomy.crossCheck` on `/api/health/otm-sleeve-mandate`:
+ * the comparison is published WITH its precondition (`comparable`) attached,
+ * rather than as prose the reader has to remember to apply.
+ */
+export const SETUP_CONFIRMATION_SIBLING_GATE = 'entry_window' as const;
+
+/**
  * The code a refusal carries when the verdict somehow arrived without one.
  * Unreachable in practice (`blocked` implies `!confirmed` implies a code) and
  * exported anyway, so the engine's refusal branch can name it instead of

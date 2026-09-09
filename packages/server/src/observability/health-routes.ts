@@ -201,6 +201,7 @@ import {
 import {
   setupTaxonomyHealth,
   SETUP_CONFIRMATION_GATE,
+  SETUP_CONFIRMATION_SIBLING_GATE,
   OTM_SETUP_TAXONOMY_MODE_ENV,
   OTM_SETUP_TAXONOMY_MODE_DEFAULT,
   OTM_SETUP_TAXONOMY_SETUPS_ENV,
@@ -5276,6 +5277,50 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
           });
         const evaluated = retained?.evaluated ?? 0;
         const blocked = retained?.blocked ?? 0;
+        // TRA-4422 Finding 2 — THE CROSS-CHECK, PUBLISHED WITH ITS PRECONDITION.
+        //
+        // See `SETUP_CONFIRMATION_SIBLING_GATE`'s doc block for the measurement.
+        // Short form: both folds are ET-DAY scoped and both are hydrated from
+        // disk at boot, so across a deploy the OLD build's `entry_window` rows
+        // sit beside the NEW build's zero `setup_confirmation` and the equality
+        // is violated by BOOKKEEPING, not by a broken recorder. `comparable` is
+        // the discriminator and it is a MEASUREMENT, not an assumption: the
+        // ledger's own `lastDecisionAt` must fall at or after this process
+        // started. Until it does, NOTHING has been recorded by anything, the
+        // comparison has no subject, and the note below must not accuse.
+        //
+        // ⛔ `comparable: false` is not a pass either. It says "ask again after
+        // the sleeve's next sweep", which is why `sinceProcessStartMs` is
+        // published beside it — a box that has been up for hours with
+        // `comparable` still false is a sleeve that is not scanning at all, and
+        // that is a real finding wearing the same clothes.
+        const setupBuild = resolveBuildInfo();
+        const processStartMs = Date.parse(setupBuild.startedAt);
+        const siblingToday = gateToday(SETUP_CONFIRMATION_SIBLING_GATE);
+        const comparable = Number.isFinite(processStartMs)
+          && typeof summary.lastDecisionAt === 'number'
+          && summary.lastDecisionAt >= processStartMs;
+        const crossCheck = {
+          sibling: SETUP_CONFIRMATION_SIBLING_GATE,
+          /** Both are the `today` (ET-day) folds — the same scope, or the comparison is meaningless. */
+          siblingEvaluatedToday: siblingToday?.evaluated ?? 0,
+          selfEvaluatedToday: today?.evaluated ?? 0,
+          /** MEASURED: has THIS process written a single ledger row yet? */
+          comparable,
+          ledgerLastDecisionAt: typeof summary.lastDecisionAt === 'number'
+            ? new Date(summary.lastDecisionAt).toISOString()
+            : null,
+          processStartedAt: setupBuild.startedAt,
+          sinceProcessStartMs: Number.isFinite(processStartMs) ? Math.max(0, nowMs - processStartMs) : null,
+          /** Only meaningful when `comparable`; `null` says so rather than forging a verdict. */
+          holds: comparable ? (today?.evaluated ?? 0) === (siblingToday?.evaluated ?? 0) : null,
+          reason: comparable
+            ? 'this process has written ledger rows, so the ET-day folds are its own and the equality binds'
+            : 'NOT COMPARABLE — the ledger has recorded nothing since this process started, so every row in '
+              + 'both `today` folds was hydrated from disk and written by a PREVIOUS build. A non-zero '
+              + 'sibling beside a zero here proves NOTHING about the recorder (measured 2026-09-09, the '
+              + '21:08:11Z swap onto 8e51be03). Re-read after the OTM sweep has run once.',
+        };
         // ⛔ `evaluated: 0` IS `unmeasured`, NEVER `pass`. A gate that never ran
         // is not a gate that never bit, and the two are what this whole item
         // exists to keep apart. `observing` is likewise distinct from any pass
@@ -5321,15 +5366,24 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
             byReasonCode: denseByReasonCode(today?.byReason),
             blockedUnclassified: today?.blockedUnclassified ?? 0,
           },
+          crossCheck,
           note:
             status === 'unmeasured'
               ? 'UNMEASURED — the gate recorded NOTHING. This is NOT a pass. Either the seam is not '
-                + 'deployed on this build (check `build` above against the commit that shipped '
-                + '`otm-setup-gate.ts`), or no OTM nominee reached it at all. The seam is ordered '
-                + 'immediately ABOVE `entry_window` and below the nominator, so '
-                + '`setup_confirmation.evaluated` must EQUAL `entry_window.evaluated` on '
-                + '/api/health/live-enforce-gates; if that sibling is non-zero and this is 0, the '
-                + 'recorder is broken, not the sleeve idle.'
+                + 'deployed on this build (`setupsRegistered` above is the deployed-bytes read; check '
+                + '`build` against the commit that shipped `otm-setup-gate.ts`), or no OTM nominee '
+                + 'reached it. The seam is ordered immediately ABOVE `entry_window` and below the '
+                + 'nominator, so over one process\'s own rows `setup_confirmation.evaluated` must EQUAL '
+                + '`entry_window.evaluated`. ⛔ READ `crossCheck.comparable` BEFORE APPLYING THAT: both '
+                + 'counters are ET-day folds hydrated from disk at boot, so across a deploy the previous '
+                + 'build\'s sibling rows sit beside this build\'s zero and the equality fails for '
+                + 'bookkeeping reasons. '
+                + (crossCheck.comparable
+                  ? (crossCheck.holds
+                    ? 'comparable=true and the equality HOLDS — this zero is the sleeve\'s own.'
+                    : 'comparable=true and the equality is VIOLATED — the recorder is broken, not the '
+                      + 'sleeve idle. This is the alarm.')
+                  : 'comparable=false right now, so the sibling carries no information about this gate.')
               : health.mode === 'observe'
                 ? 'OBSERVE — the gate scores every nominee and REFUSES NOTHING, so `blocked: 0` here is a '
                   + 'property of the mode and says nothing about the taxonomy. The counterfactual '
