@@ -446,7 +446,9 @@ check('G3.fleet-at-risk-is-the-TOTAL',
 // C2 — the field-presence test must be able to SEE an absent key. Without this
 // the deployed-bytes proof is worthless, which is the whole basis of G1.
 {
-  const stripped = withRows.map(({ adoptedPremiumAtRiskUsd, ...rest }) => rest);
+  // TRA-4440 — binding renamed, key unchanged: `...rest` still drops
+  // `adoptedPremiumAtRiskUsd`, which is what makes this control able to see an absent key.
+  const stripped = withRows.map(({ adoptedPremiumAtRiskUsd: _adoptedPremiumAtRiskUsd, ...rest }) => rest);
   const present = stripped.filter(r =>
     Object.prototype.hasOwnProperty.call(r, 'adoptedPremiumAtRiskUsd')).length;
   check('C2.presence-can-FAIL', present === 0,

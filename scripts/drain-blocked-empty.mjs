@@ -1780,7 +1780,7 @@ const CONTROLS = [
         out.plan.counts.durableStrand === 0 &&
         // the class is NAMED in the report, with the routine it keeps alive
         /SUPPRESSING LEAF/.test(rendered) &&
-        /-> done  \[SUPPRESSING_LEAF\]/.test(rendered) &&
+        /-> done {2}\[SUPPRESSING_LEAF\]/.test(rendered) &&
         rendered.includes(ROUTINE_ID) &&
         // ...and the ledger says which branch it took
         /`done` BRANCH, taken deliberately/.test(comment.body.body) &&

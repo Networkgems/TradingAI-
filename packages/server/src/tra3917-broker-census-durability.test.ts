@@ -69,6 +69,9 @@ function snapFiles(d: string): string[] {
   }
 }
 
+// TRA-4440 — the census snapshot is read straight off disk and indexed by seat
+// (`['v0nni'].submitted`), so `unknown` would need a cast at every call site here.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function snapFor(d: string, etDay: string): Record<string, any> {
   return JSON.parse(readFileSync(join(d, 'broker-census', `${etDay}.json`), 'utf-8'));
 }

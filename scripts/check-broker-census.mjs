@@ -498,7 +498,7 @@ async function selftest() {
   disarmed.census.liveArmCensus.rollup.brokerPermissionBlockedCount = 0;
   disarmed.census.liveArmCensus.rollup.brokerRedBookCount = 0;
   disarmed.journal.voids.recent = disarmed.journal.voids.recent.filter(r => r.ts < BOOT_MS);
-  arm('a DISARMED v0nni skips the red arm and the >=1 rollups', run(disarmed), EXIT.FAIL, { re: /SKIP  v0nni red arm/ });
+  arm('a DISARMED v0nni skips the red arm and the >=1 rollups', run(disarmed), EXIT.FAIL, { re: /SKIP {2}v0nni red arm/ });
   console.log('        ↑ FAIL is correct here: the attribution subset went EMPTY, which reads UNREAD, not pass.');
 
   const approved = clone(happy());

@@ -210,9 +210,14 @@ const BASELINE = {
   'observability/health-routes.ts': {
     copies: 0,
     exempt: [
-      // 12 report-reads. The health surfaces exist to tell an operator what the box
+      // 13 report-reads. The health surfaces exist to tell an operator what the box
       // actually has set — resolving a root here would hide the very drift they report.
-      { text: 'const dir = process.env.DATA_DIR;', count: 10, reason: R.REPORT },
+      // TRA-4440 — 10 → 11: TRA-4436 (`4bd2bb59`) added the `rvExitRetuneDemo` readout
+      // on /api/health/option-swing-exits, which resolves the demo-flags overlay env
+      // through the same `dir ? resolveDemoFlagEnv(dir) : process.env` idiom as the
+      // ten above it. Same class, same blank-value behaviour (blank ⇒ process.env,
+      // never a root named ' '). Hand-edited here, which is the ratchet working.
+      { text: 'const dir = process.env.DATA_DIR;', count: 11, reason: R.REPORT },
       { text: 'const dataDir = process.env.DATA_DIR ?? null;', count: 1, reason: R.REPORT },
       { text: 'const sebDir = process.env.DATA_DIR;', count: 1, reason: R.REPORT },
       {
@@ -606,7 +611,12 @@ async function selftest() {
   ];
   const r6 = classify(overBudget);
   if (r6.verdict === 'DRIFT' && r6.findings.some((f) => f.cls === 'NEW_COPY')) {
-    ok('CONTROL 6 an 11th `const dir = process.env.DATA_DIR;` exceeds its exempt count and FAILS');
+    // TRA-4440 — the label no longer names a fixed ordinal. The fixture is
+    // `baselineRecords()` + ONE, so it is always "the exempt budget + 1" and stays a
+    // real over-budget test whatever the baseline holds; saying "an 11th" went stale
+    // the moment the budget moved to 11, and a stale label is how a reader starts
+    // trusting the wrong thing about a control.
+    ok('CONTROL 6 one MORE `const dir = process.env.DATA_DIR;` than the exempt budget FAILS');
   } else {
     fail('CONTROL 6 an extra exempt-shaped line FAILS on count', `verdict ${r6.verdict}`);
   }

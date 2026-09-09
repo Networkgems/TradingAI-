@@ -2,7 +2,7 @@
 const BASE = 'https://tradingai-bqb1.onrender.com';
 const SVC = 'srv-d7mb7rr7uimc73ev0chg';
 const RIG = 'RIG260925C00006000';
-async function j(url, init) { const r = await fetch(url, init); let body = null; try { body = await r.json(); } catch {} return { status: r.status, body }; }
+async function j(url, init) { const r = await fetch(url, init); let body = null; try { body = await r.json(); } catch { /* non-JSON body — `body` stays null and the caller grades on `status` */ } return { status: r.status, body }; }
 let pass = process.env.TRADING_ADMIN_PASSWORD;
 if (!pass) {
   const ev = await j(`https://api.render.com/v1/services/${SVC}/env-vars?limit=100`, { headers: { authorization: `Bearer ${process.env.RENDER_API_KEY}` } });

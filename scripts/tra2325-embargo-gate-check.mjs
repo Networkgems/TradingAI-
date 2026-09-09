@@ -40,8 +40,6 @@ import {
   renderDeployHoldStaleness,
   renderDeployHoldRefusal,
   deployHoldBaseline,
-  deployHoldBaselineIsLoud,
-  renderDeployHoldBaseline,
   deployHoldPinDrift,
   deployHoldPinDriftIsLoud,
   renderDeployHoldPinDrift,

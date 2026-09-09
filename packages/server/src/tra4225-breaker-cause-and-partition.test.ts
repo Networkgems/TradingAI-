@@ -584,7 +584,19 @@ describe('TRA-4225 AC4 — "no automated release" is not "no way out"', () => {
     const g = summarizeLiveStopGovernance([heldToday], MONEY_BOOK);
     expect(g.byClass.held_with_release).toBe(1);
     expect(g.recovery.automatic).toBe(1);
-    expect(g.releasesAt).toBe('2026-09-01T00:00:00.000Z');
+    // ⚠️ 04:00Z is MIDNIGHT ET, not a typo for UTC midnight — do not "fix" it back.
+    // This assertion was written on 2026-09-01 (`03106298`), when the PDT/swing hold
+    // was keyed on the UTC calendar day. TRA-4280 (`d2e5e208`, 2026-09-02) repaired
+    // that — the hold emptied at 20:00 ET, and would have released at 19:00 ET once
+    // EST starts on 2026-11-01 — by rolling the release on `nextEtDayStart`. The
+    // expectation here was never updated with it, and CI could not say so: the `Test`
+    // step has not run on `main` since 2026-07-26 (TRA-4440).
+    //
+    // The row opens at MEASURED_AT − 60s = 2026-08-31 15:00 ET, so the next ET day
+    // starts 2026-09-01 00:00 ET. That date is inside EDT (UTC−4) ⇒ 04:00Z. The
+    // fixture is frozen, so this instant is stable; it is NOT 05:00Z-under-EST,
+    // because the fixture never moves into EST.
+    expect(g.releasesAt).toBe('2026-09-01T04:00:00.000Z');
   });
 
   it('a config refusal is `config_change` — a settings write, not a human at the row', () => {

@@ -215,7 +215,9 @@ run('C15 the RIG grant PROMOTED back to a finding → FAIL (the granted anchor i
   if (!g) throw new Error('no RIG 143384264 grant in the capture to promote');
   f.oversoldCloses.grantedCloses = f.oversoldCloses.grantedCloses.filter(x => x !== g);
   f.oversoldCloses.grantedContracts -= g.excessContracts;
-  const { grant, grantSource, ...finding } = g;
+  // TRA-4440 — bindings renamed, keys unchanged: `...finding` still strips `grant`
+  // and `grantSource`, which is what demotes the granted row back to a finding.
+  const { grant: _grant, grantSource: _grantSource, ...finding } = g;
   f.oversoldCloses.findings.push(finding);
   f.oversoldCloses.excessContracts += finding.excessContracts;
 });

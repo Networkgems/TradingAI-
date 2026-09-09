@@ -50,13 +50,10 @@
 // heartbeat, which is intended and safe. Rows are ordered most-consequential first so that a cap
 // hit (or a 409) truncates the tail rather than the head.
 
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-// Derive the repo root from THIS FILE, never from $PAPERCLIP_WORKSPACE_CWD -- on some seats that
-// variable points at an empty `_default` directory and both halves fail silently.
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+// TRA-4440 — the repo-root derivation (and the `node:fs`/`node:path`/`node:url` imports
+// that fed it) is gone: nothing in this script reads a file. Every row below is built
+// inline and posted over the API, so the seat-dependent $PAPERCLIP_WORKSPACE_CWD hazard
+// the old comment warned about cannot arise here.
 
 const BASE = (process.env.PAPERCLIP_API_URL || '').replace(/\/$/, '').replace(/\/api$/, '');
 const KEY = process.env.PAPERCLIP_API_KEY;

@@ -486,7 +486,10 @@ export function computeOtmEvaluationBaseline(
   };
 }
 
-export interface OtmEvaluationSecondaryCell extends OtmEvaluationStats {}
+// TRA-4440 — was `interface ... extends OtmEvaluationStats {}`, which declares no
+// members and is therefore exactly its supertype (`no-empty-object-type`). The alias
+// is the same type, and keeps the named cell for the readout below.
+export type OtmEvaluationSecondaryCell = OtmEvaluationStats;
 
 export interface OtmEvaluationReadout extends OtmEvaluationStats {
   closesRemaining: number;

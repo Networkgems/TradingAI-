@@ -693,5 +693,11 @@ describe('TRA-4030 R4 — the PDT hold is per-row, restart-durable, and on the j
     const dumped = report.rows!.find((r) => r.id === rec.id)!;
     expect(dumped.profitFloorHeldForPdt).toEqual(rec.profitFloorHeldForPdt);
     expect(dumped.openingRangeSuppressed).toEqual(rec.openingRangeSuppressed);
-  });
+    // TRA-4440 — explicit 30s timeout. This case measures 3381ms ALONE (94% of this
+    // file's 3607ms), against vitest's 5000ms default: a 1.6s margin. Under the full
+    // 444-file suite it exceeded 5000ms on both observed runs, while passing solo —
+    // i.e. the failure tracked machine contention, not the assertions. The number is
+    // raised rather than the work reduced because the journal flush + `?rows=all`
+    // round-trip IS what R4 is asserting on.
+  }, 30_000);
 });

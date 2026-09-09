@@ -968,7 +968,9 @@ async function selftest() {
     // still be caught. This is what "present but inert" actually means, and it
     // holds whether the cohort is empty or full.
     const shippedRaw = JSON.parse(readFileSync(ACK_PATH, 'utf8'));
-    const { acknowledged, ...renamed } = shippedRaw;
+    // TRA-4440 — the BINDING is renamed, the KEY is not: `...renamed` still omits
+    // `acknowledged`, which is the whole point of this control.
+    const { acknowledged: _acknowledged, ...renamed } = shippedRaw;
     const inert = parseAcknowledgements(renamed);
     if (inert.warnings.length !== 1 || inert.acks.length !== 0) {
       throw new Error('renaming the shipped ledger\'s `acknowledged` key did not read as inert');

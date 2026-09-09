@@ -83,7 +83,6 @@ function stubClient(opts: StubOpts) {
   const statuses = opts.statuses ?? [];
   return {
     submits: () => submits,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     client: {
       getOptionQuote: async () => {
         if (opts.quoteThrows) throw opts.quoteThrows;

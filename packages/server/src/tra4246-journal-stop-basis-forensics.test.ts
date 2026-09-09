@@ -155,7 +155,11 @@ const JOURNAL_SETUP = {
   riskThrottleDecided: 1,
   riskThrottleSizingPath: 'options_single_leg' as const,
 };
-const RISK: OptionExitRiskInput = { underlyingAtrBySymbol: new Map(), openingRangeGuardMin: 15 };
+// TRA-4440 — underscore-prefixed, not deleted: this fixture is never passed to a
+// call in this file (the cases below build their risk input inline). Kept because it
+// records the shape the forensics were taken against; if a case ever needs the
+// give-back risk operands, this is the fixture it should use.
+const _RISK: OptionExitRiskInput = { underlyingAtrBySymbol: new Map(), openingRangeGuardMin: 15 };
 
 function buildSignal(): OtmMispricingSignal {
   return {

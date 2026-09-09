@@ -38,7 +38,10 @@ const MIN = 60_000;
 // broker-fill entry 1.28 → stopLossPremium 1.024 (−20% OTM stop) → R = 0.256.
 const ENTRY = 1.28;
 const R_UNIT = 0.256;
-const ARM_LEVEL = ENTRY + 0.75 * R_UNIT; // 1.472 — peak that arms the lock
+// TRA-4440 — underscore-prefixed, not deleted: the cases below spell 1.472 as a
+// literal in their comments rather than referencing this constant, so it reads as
+// unused. It is the derivation of that number and stays as the record of it.
+const _ARM_LEVEL = ENTRY + 0.75 * R_UNIT; // 1.472 — peak that arms the lock
 const DESIGN_FLOOR = ENTRY + 0.35 * R_UNIT; // 1.3696 — first-armed release floor
 
 function buildSignal(overrides: Partial<OtmMispricingSignal> = {}): OtmMispricingSignal {

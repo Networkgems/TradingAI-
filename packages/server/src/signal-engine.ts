@@ -1,5 +1,7 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, supertrendLatest, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, blackScholesGreeks, daysToExpiration, bookGiveBackDecision, correlatedExposureDecision, entryGreeksGateDecision, chandelierStop, stopModifyDecision, selectRvLongCandidate, RV_LONG_DELTA_FLOOR, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, computePutCallRatio, computeOiTotals, rsi, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, TRADIER_TERMINAL_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
-import { buildExposureBuckets, DEFAULT_EXIT_PARAMS, DEFAULT_MULTILEG_EXIT_PARAMS } from '@trading-app/engine';
+// TRA-4440 — `DEFAULT_EXIT_PARAMS` left this file with TRA-4436 (`4bd2bb59`), which
+// moved the rvExitParams ternary out to `buildRvExitParams` in rv-exit-params.ts.
+import { buildExposureBuckets, DEFAULT_MULTILEG_EXIT_PARAMS } from '@trading-app/engine';
 import { evaluateLiquidityGate, DEFAULT_LIQUIDITY_GATE_CONFIG } from '@trading-app/engine'; // TRA-2048 — live spread veto
 import { isTransportOrderFailure } from '@trading-app/engine'; // TRA-4218 — a 5xx is not a refusal
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, ExitParams, MultiLegExitParams, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, ExposurePositionRisk, CorrelatedExposureDecision, BookHaltReason } from '@trading-app/engine';
@@ -224,7 +226,6 @@ import {
   capOtmEntryContracts,
   auditOtmContractFloorRows,
   otmContractFloorBandIntersects,
-  OTM_CONTRACT_FLOOR_SIZE_CODE,
   type OtmContractFloorCode,
   type OtmContractFloorImportedAudit,
 } from './otm-contract-floor.js';

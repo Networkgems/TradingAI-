@@ -28,7 +28,6 @@ import type {
   ProfitFloorLadderStep,
   OptionProfitFloorPdtHold,
   OptionMarkProvenance,
-  OptionPeakStampBasis,
 } from '@trading-app/shared';
 import { recordEntryQuoteStampOutcome } from './entry-quote-stamp.js';
 import { computePortfolioGreeks } from './reports/portfolio-greeks.js';
@@ -64,7 +63,6 @@ import {
   OPTIONS_TRAIL_ACTIVATE_PCT,
   OPTIONS_TRAIL_OFFSET_PCT,
   OPTIONS_PARTIAL_EXIT_RATIO,
-  OTM_RISK_PARAMS,
   RV_RISK_PARAMS,
   RV_MIN_MARK_FLOOR,
   isValidTradingWindow,
@@ -5584,8 +5582,13 @@ export function foldOpenPremiumAtRisk(
    * `adoptedRows` split only. Defaults to the process env flag (off), so the
    * split is populated correctly for every existing caller without touching
    * `usd` / `rows` / `unpricedRows`, whose values are unchanged by this ticket.
+   *
+   * ⛔ Underscore-prefixed, NOT deleted (TRA-4440): the body stopped consulting it
+   * deliberately — see the `splitEngineExposureContracts` note below — but it is
+   * still the parameter the exit path resolves, and it holds the POSITION of every
+   * argument after it. Removing it would silently reindex those call sites.
    */
-  armed: boolean = isEngineActionOnAdoptedRowsArmed(),
+  _armed: boolean = isEngineActionOnAdoptedRowsArmed(),
   /**
    * TRA-3913 — the ATTRIBUTION oracle: this engine's own recorded `buy_to_open`
    * fills. Injected so the split is testable without a hydrated ledger on disk,
