@@ -299,9 +299,13 @@ export function render(result) {
     }
     return out.join('\n');
   }
-  // Cluster verdict: no stalled rows but armed monitors are bunching.
-  if (result.verdict === 'CLUSTER') {
-    out.push(`VERDICT: CLUSTER — no stalled rows yet, but ${result.clusters.length} group(s) of armed monitors share a nextCheckAt instant (n > 3). This is the pre-burst shape of TRA-4141. Owners should stagger nextCheckAt or investigate the batch.`);
+  // Cluster verdict with nothing else to report: armed monitors are bunching and that is all.
+  // CLUSTER outranks GRACE (see precedence), so it can ALSO carry in-grace rows — and those must
+  // still be reported. Returning early here claimed "no stalled rows yet" without checking, and
+  // swallowed the grace list the routine's step 3 requires (measured live 2026-09-09, TRA-4466:
+  // 11 in-grace rows and a 6-row consumed-fire cluster were both suppressed by this branch).
+  if (result.verdict === 'CLUSTER' && !result.fresh.length) {
+    out.push(`VERDICT: CLUSTER — no stalled rows, but ${result.clusters.length} group(s) of armed monitors share a nextCheckAt instant (n > 3). This is the pre-burst shape of TRA-4141. Owners should stagger nextCheckAt or investigate the batch.`);
     for (const c of result.clusters) out.push(`  n=${c.count}  at=${c.instant}  ${c.ids.join(', ')}`);
     return out.join('\n');
   }
@@ -329,6 +333,9 @@ export function render(result) {
 
   if (result.verdict === 'GRACE') {
     out.push(`VERDICT: GRACE — ${result.fresh.length} stalled row(s), ALL inside the grace window; owners have not had a heartbeat yet. Not clean; next sweep decides.`);
+  } else if (result.verdict === 'CLUSTER') {
+    // Fell through from the branch above: a pre-burst cluster AND in-grace rows. Both are the report.
+    out.push(`VERDICT: CLUSTER — ${result.clusters.length} group(s) of armed monitors share a nextCheckAt instant (n > 3): the pre-burst shape of TRA-4141. Owners should stagger nextCheckAt or investigate the batch. ALSO ${result.fresh.length} stalled row(s), ALL inside the grace window (report-only, listed below) — treat that half as GRACE.`);
   } else {
     out.push(`VERDICT: STALLED — ${result.aged.length} row(s) stalled past grace (+${result.fresh.length} in grace)`);
   }
@@ -518,6 +525,24 @@ const CONTROLS = [
     ],
     expect: { verdict: 'STALLED', aged: 1 },
   },
+  // TRA-4466: CLUSTER outranks GRACE, so it can carry in-grace rows. The old CLUSTER branch
+  // early-returned with the hardcoded words "no stalled rows yet" and printed neither the grace
+  // list nor the consumed-fire cluster line. Only render() shows it — the verdict/aged asserts
+  // above pass either way, which is exactly why it survived to a live fire.
+  {
+    name: 'TRA-4466: CLUSTER + in-grace rows — render must list the grace rows, not claim "no stalled rows"',
+    rows: [
+      stalledRow({ id: 'g', identifier: 'TRA-GRACE', monitorLastTriggeredAt: '2026-09-02T10:00:00.000Z' }), // 2h old => in grace
+      ...Array.from({ length: 4 }, (_, i) => ({
+        id: String(i + 20), identifier: `TRA-${i + 20}`, status: 'in_review',
+        reviewAttention: { state: 'none' },
+        monitorNextCheckAt: '2026-09-04T20:00:00.000Z',
+      })),
+    ],
+    expect: { verdict: 'CLUSTER', aged: 0 },
+    renderIncludes: ['in grace (report-only, no page)', 'TRA-GRACE', 'armed monitors share a nextCheckAt instant'],
+    renderExcludes: ['no stalled rows'],
+  },
 ];
 
 async function selftest() {
@@ -530,11 +555,17 @@ async function selftest() {
     const res = await run(transport, { owner: c.owner ?? null, nowMs: NOW, graceMs: GRACE });
     const okVerdict = res.verdict === c.expect.verdict;
     const okCount = c.expect.aged === undefined || res.aged.length === c.expect.aged;
-    const ok = okVerdict && okCount;
+    // Grade render() too: a verdict-only assert is blind to what the operator actually reads.
+    const text = render(res);
+    const missing = (c.renderIncludes ?? []).filter((s) => !text.includes(s));
+    const leaked = (c.renderExcludes ?? []).filter((s) => text.includes(s));
+    const ok = okVerdict && okCount && !missing.length && !leaked.length;
     if (!ok) failed += 1;
     console.log(
       `${ok ? 'PASS' : 'FAIL'}  ${c.name}\n      got verdict=${res.verdict} aged=${res.aged.length}` +
-        (ok ? '' : `  EXPECTED verdict=${c.expect.verdict} aged=${c.expect.aged ?? '*'}`),
+        (okVerdict && okCount ? '' : `  EXPECTED verdict=${c.expect.verdict} aged=${c.expect.aged ?? '*'}`) +
+        (missing.length ? `\n      render MISSING: ${missing.map((s) => JSON.stringify(s)).join(', ')}` : '') +
+        (leaked.length ? `\n      render must NOT contain: ${leaked.map((s) => JSON.stringify(s)).join(', ')}` : ''),
     );
   }
   console.log(`\n${CONTROLS.length - failed}/${CONTROLS.length} controls pass`);
