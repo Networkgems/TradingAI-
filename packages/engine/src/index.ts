@@ -524,6 +524,11 @@ export type {
 } from './options/short-premium-scanner.js';
 export {
   findRelativeValueOpportunities,
+  // TRA-4413 item 4 — the per-(expiration, type) skew fit as a read surface,
+  // and the cross-expiration term-structure pass (grouped type|deltaBucket,
+  // IV fitted against √T). Both pure; shadow wiring/flagging is the caller's.
+  fitSkewCurves,
+  findTermStructureDislocations,
   selectRvLongCandidate,
   RV_LONG_DELTA_TARGET_MIN,
   RV_LONG_DELTA_TARGET_MAX,
@@ -541,6 +546,16 @@ export type {
   RelativeValueClassification,
   RvLongTrendSide,
   RvLongSelectionOptions,
+  // TRA-4413 item 4 — skew export + term-structure read surfaces.
+  SkewCurveFit,
+  TermStructureOptions,
+  TermStructureReport,
+  TermStructureDislocation,
+  TermStructureClassification,
+  TermBucketFit,
+  TermBucketSkip,
+  TermBucketSkipReason,
+  CalendarViolation,
 } from './options/relative-value.js';
 export {
   computePutCallRatio,

@@ -385,38 +385,13 @@ export function findRelativeValueOpportunities(
   for (const [, rows] of groups) {
     rows.sort((a, b) => a.strike - b.strike);
 
+    // TRA-4413 — quality filters extracted to `prepareRow` (shared verbatim
+    // with the skew export and the term-structure pass, so all three passes
+    // grade the SAME population).
     const prepared: PreparedRow[] = [];
     for (const row of rows) {
-      const bid = row.bid ?? 0;
-      const ask = row.ask ?? 0;
-      if (bid <= 0 || ask <= 0 || ask < bid) continue;
-      const mark = (bid + ask) / 2;
-      if (mark < opts.minMark) continue;
-      const spreadPct = (ask - bid) / mark;
-      if (spreadPct > opts.maxSpreadPct) continue;
-      const oi = row.openInterest ?? 0;
-      if (oi < opts.minOpenInterest) continue;
-      // TRA-1057 — today-volume liquidity floor (default 0 = off). Complements
-      // the resting-book OI gate above: rejects rows that aren't actually
-      // trading today so a fill is realistic and the mark is fresh.
-      const vol = row.volume ?? 0;
-      if (vol < opts.minDailyVolume) continue;
-
-      const dte = daysToExpiration(row.expiration, now);
-      if (dte <= 0) continue;
-      // TRA-495 — defense in depth on the swing thesis: reject rows whose
-      // expiration is closer than the configured floor (default 7d). The
-      // scanner's auto-pick already filters expirations by `dteMin`/`dteMax`,
-      // but a cached chain for a stale expiration shouldn't slip a near-DTE
-      // lottery ticket through.
-      if (dte < opts.minDaysToExpiry) continue;
-      const T = dte / 365;
-
-      const iv = resolveIv(row, mark, underlyingPrice, T, opts.riskFreeRate, opts.dividendYield);
-      if (iv == null || iv <= 0 || !Number.isFinite(iv)) continue;
-
-      const x = Math.log(row.strike / underlyingPrice);
-      prepared.push({ row, mark, spreadPct, iv, x, dte, T });
+      const p = prepareRow(row, underlyingPrice, opts, now);
+      if (p) prepared.push(p);
     }
 
     if (prepared.length < opts.minGroupSize) continue;
@@ -513,6 +488,464 @@ export function findRelativeValueOpportunities(
 
   allCandidates.sort((a, b) => b.score - a.score);
   return allCandidates;
+}
+
+// ---------------------------------------------------------------------------
+// TRA-4413 item 4 — skew-coefficient export and cross-expiration term structure
+// ---------------------------------------------------------------------------
+
+/**
+ * TRA-4413 / TRA-4421 §2 — the per-(expiration, type) quadratic skew fit,
+ * exported. `findRelativeValueOpportunities` has always computed these
+ * coefficients internally; setups A/B (panic / blow-off reversal) need the
+ * curve itself ("steep put skew", "rich call wing"), not just the per-row
+ * residuals, so the fit becomes a first-class read surface.
+ */
+export interface SkewCurveFit {
+  expiration: string;
+  optionType: OptionType;
+  daysToExpiration: number;
+  /** IV(x) = a + b·x + c·x², x = log(strike / spot). */
+  a: number;
+  b: number;
+  c: number;
+  /** RMSE of the fit's IV residuals — retained disagreement, NOT noise to hide. */
+  rmse: number;
+  /** Rows that survived the quality filters and fed the OLS. */
+  sampleSize: number;
+}
+
+/**
+ * Prepare one chain row for fitting: the exact quality filters
+ * `findRelativeValueOpportunities` has always applied, extracted so the
+ * strike-skew pass and the term-structure pass grade the SAME population.
+ * Returns null when the row is rejected.
+ */
+function prepareRow(
+  row: OptionChainRow,
+  underlyingPrice: number,
+  opts: Required<Omit<RelativeValueScannerOptions, 'now'>>,
+  now: number,
+): PreparedRow | null {
+  const bid = row.bid ?? 0;
+  const ask = row.ask ?? 0;
+  if (bid <= 0 || ask <= 0 || ask < bid) return null;
+  const mark = (bid + ask) / 2;
+  if (mark < opts.minMark) return null;
+  const spreadPct = (ask - bid) / mark;
+  if (spreadPct > opts.maxSpreadPct) return null;
+  const oi = row.openInterest ?? 0;
+  if (oi < opts.minOpenInterest) return null;
+  // TRA-1057 — today-volume liquidity floor (default 0 = off). Complements
+  // the resting-book OI gate above: rejects rows that aren't actually
+  // trading today so a fill is realistic and the mark is fresh.
+  const vol = row.volume ?? 0;
+  if (vol < opts.minDailyVolume) return null;
+
+  const dte = daysToExpiration(row.expiration, now);
+  if (dte <= 0) return null;
+  // TRA-495 — defense in depth on the swing thesis: reject rows whose
+  // expiration is closer than the configured floor (default 7d). The
+  // scanner's auto-pick already filters expirations by `dteMin`/`dteMax`,
+  // but a cached chain for a stale expiration shouldn't slip a near-DTE
+  // lottery ticket through.
+  if (dte < opts.minDaysToExpiry) return null;
+  const T = dte / 365;
+
+  const iv = resolveIv(row, mark, underlyingPrice, T, opts.riskFreeRate, opts.dividendYield);
+  if (iv == null || iv <= 0 || !Number.isFinite(iv)) return null;
+
+  const x = Math.log(row.strike / underlyingPrice);
+  return { row, mark, spreadPct, iv, x, dte, T };
+}
+
+/**
+ * Fit the quadratic IV skew per (expiration, type) group and return the
+ * coefficients. Same filters, grouping and OLS as
+ * {@link findRelativeValueOpportunities}; groups below `minGroupSize` are
+ * omitted (they never had a fit to export).
+ */
+export function fitSkewCurves(
+  chain: OptionChainRow[],
+  underlyingPrice: number,
+  options: RelativeValueScannerOptions = {},
+): SkewCurveFit[] {
+  if (!Number.isFinite(underlyingPrice) || underlyingPrice <= 0) return [];
+  if (chain.length === 0) return [];
+  const opts = { ...DEFAULTS, ...options };
+  const now = options.now ?? Date.now();
+
+  const groups = new Map<string, PreparedRow[]>();
+  for (const row of chain) {
+    const p = prepareRow(row, underlyingPrice, opts, now);
+    if (!p) continue;
+    const key = `${row.expiration}|${row.optionType}`;
+    let bucket = groups.get(key);
+    if (!bucket) {
+      bucket = [];
+      groups.set(key, bucket);
+    }
+    bucket.push(p);
+  }
+
+  const fits: SkewCurveFit[] = [];
+  for (const prepared of groups.values()) {
+    if (prepared.length < opts.minGroupSize) continue;
+    const fit = fitQuadraticSkew(prepared.map((p) => p.x), prepared.map((p) => p.iv));
+    const residuals = prepared.map((p) => p.iv - (fit.a + fit.b * p.x + fit.c * p.x * p.x));
+    const rmse = Math.sqrt(residuals.reduce((s, r) => s + r * r, 0) / residuals.length);
+    fits.push({
+      expiration: prepared[0].row.expiration,
+      optionType: prepared[0].row.optionType,
+      daysToExpiration: prepared[0].dte,
+      a: fit.a,
+      b: fit.b,
+      c: fit.c,
+      rmse,
+      sampleSize: prepared.length,
+    });
+  }
+  fits.sort((a, b) =>
+    a.optionType === b.optionType
+      ? a.daysToExpiration - b.daysToExpiration
+      : a.optionType.localeCompare(b.optionType),
+  );
+  return fits;
+}
+
+/**
+ * Term-structure outcome class. Deliberately low-cardinality (four codes, the
+ * `otm-contract-floor.ts` pattern) so refusals and findings are countable:
+ * two finding codes on rows, two skip codes on buckets.
+ */
+export type TermStructureClassification = 'term_cheap' | 'term_rich';
+export type TermBucketSkipReason = 'insufficient_expirations' | 'degenerate_time_axis';
+
+export interface TermStructureDislocation {
+  optionSymbol: string;
+  underlying: string;
+  optionType: OptionType;
+  strike: number;
+  expiration: string;
+  daysToExpiration: number;
+  /** Lower edge of the |delta| bucket this row was graded in. */
+  deltaBucket: number;
+  /** |BS delta| at the row's OWN resolved σ (see report doc for why). */
+  absDelta: number;
+  ivUsed: number;
+  /** α + β·√T from the bucket's cross-expiration fit. */
+  ivFittedTerm: number;
+  ivResidualTerm: number;
+  zScoreTerm: number;
+  classification: TermStructureClassification;
+  bucketKey: string;
+}
+
+export interface TermBucketFit {
+  bucketKey: string;
+  optionType: OptionType;
+  deltaBucket: number;
+  /** IV(√T) = alpha + beta·√T across the bucket's expirations. */
+  alpha: number;
+  beta: number;
+  /** RMSE of the term fit's residuals — published so over-smoothing is visible. */
+  rmse: number;
+  sampleSize: number;
+  distinctExpirations: number;
+}
+
+export interface TermBucketSkip {
+  bucketKey: string;
+  reason: TermBucketSkipReason;
+  rows: number;
+  distinctExpirations: number;
+}
+
+/**
+ * Same-strike calendar-spread violation on the MARK surface — the negative
+ * control (the `otm-theo-arbitrage.ts` TRA-2669 pattern). For American-style
+ * options a longer-dated contract of the same strike / type dominates a
+ * shorter-dated one, so its mark must not be LOWER (beyond quote-noise slack).
+ * The market satisfies this by construction; a non-zero count means the
+ * detector's inputs (chain pairing, spot/chain coherence) are broken and
+ * INVALIDATES the term arm rather than confirming it.
+ */
+export interface CalendarViolation {
+  optionType: OptionType;
+  strike: number;
+  shortExpiration: string;
+  longExpiration: string;
+  shortMark: number;
+  longMark: number;
+  shortSymbol: string;
+  longSymbol: string;
+}
+
+export interface TermStructureReport {
+  /** Rows in the input chain. */
+  rowsIn: number;
+  /** Rows surviving the shared quality filters. */
+  rowsPrepared: number;
+  /** Rows that were actually graded against a fitted term curve. */
+  rowsEvaluated: number;
+  bucketsTotal: number;
+  bucketsFitted: number;
+  /** Refused buckets WITH the reason — a suppression that ships no counter is unmeasurable. */
+  bucketsSkipped: TermBucketSkip[];
+  bucketFits: TermBucketFit[];
+  dislocations: TermStructureDislocation[];
+  /** Adjacent same-strike expiration pairs tested on the mark surface. */
+  calendarPairsTested: number;
+  /**
+   * Expected 0. Non-zero invalidates `dislocations` for this scan — report it,
+   * do not trade it. See {@link CalendarViolation}.
+   */
+  markCalendarViolations: CalendarViolation[];
+}
+
+export interface TermStructureOptions extends RelativeValueScannerOptions {
+  /** |delta| bucket width (default 0.10). Buckets are [k·w, (k+1)·w). */
+  deltaBucketWidth?: number;
+  /**
+   * Minimum DISTINCT expirations a bucket needs before a term fit is attempted
+   * (default 3). Two points fit a line exactly — zero residual df, nothing to
+   * z-score — so 2 is structurally vacuous, not merely thin.
+   */
+  minExpirationsPerBucket?: number;
+  /** |z| at or above this flags a row (default 2.0, matching the strike pass). */
+  termZScoreThreshold?: number;
+}
+
+const TERM_DEFAULTS = {
+  deltaBucketWidth: 0.1,
+  minExpirationsPerBucket: 3,
+  termZScoreThreshold: 2.0,
+};
+
+/**
+ * TRA-4413 item 4 — cross-expiration relative value ("term structure").
+ *
+ * The strike pass ({@link findRelativeValueOpportunities}) compares a contract
+ * to its same-expiration neighbours; this pass compares it to its same-delta
+ * neighbours ACROSS expirations — the spec's worked example ("comparable
+ * 30-delta calls across expirations: 34–37%") is exactly this read. Per
+ * TRA-4421 §7: group `${type}|${deltaBucket}`, fit IV against √T, z-score the
+ * residual with the same machinery. The fit is LINEAR in √T, not quadratic —
+ * a chain typically carries 3–6 expirations, and a 3-parameter curve through
+ * 3–4 support points reproduces the data and z-scores nothing (the
+ * over-smoothing trap wearing a different hat).
+ *
+ * Rows are bucketed by |delta| at their OWN resolved σ, not the fitted skew's:
+ * bucketing through the strike fit would let an over-smoothed skew relocate
+ * rows between buckets, coupling the two passes exactly where they must stay
+ * independent witnesses.
+ *
+ * Pure — no I/O, no flags. The caller owns shadow wiring, its sub-flag and
+ * counter publication; nothing here arms a capital path.
+ */
+export function findTermStructureDislocations(
+  chain: OptionChainRow[],
+  underlyingPrice: number,
+  options: TermStructureOptions = {},
+): TermStructureReport {
+  const empty: TermStructureReport = {
+    rowsIn: chain.length,
+    rowsPrepared: 0,
+    rowsEvaluated: 0,
+    bucketsTotal: 0,
+    bucketsFitted: 0,
+    bucketsSkipped: [],
+    bucketFits: [],
+    dislocations: [],
+    calendarPairsTested: 0,
+    markCalendarViolations: [],
+  };
+  if (!Number.isFinite(underlyingPrice) || underlyingPrice <= 0) return empty;
+  if (chain.length === 0) return empty;
+
+  const opts = { ...DEFAULTS, ...options };
+  const topts = {
+    deltaBucketWidth: options.deltaBucketWidth ?? TERM_DEFAULTS.deltaBucketWidth,
+    minExpirationsPerBucket:
+      options.minExpirationsPerBucket ?? TERM_DEFAULTS.minExpirationsPerBucket,
+    termZScoreThreshold: options.termZScoreThreshold ?? TERM_DEFAULTS.termZScoreThreshold,
+  };
+  const now = options.now ?? Date.now();
+
+  const prepared: PreparedRow[] = [];
+  for (const row of chain) {
+    const p = prepareRow(row, underlyingPrice, opts, now);
+    if (p) prepared.push(p);
+  }
+
+  // --- Negative control first: same-strike calendar monotonicity on MARK. ---
+  const byStrike = new Map<string, PreparedRow[]>();
+  for (const p of prepared) {
+    const key = `${p.row.optionType}|${p.row.strike}`;
+    let bucket = byStrike.get(key);
+    if (!bucket) {
+      bucket = [];
+      byStrike.set(key, bucket);
+    }
+    bucket.push(p);
+  }
+  let calendarPairsTested = 0;
+  const markCalendarViolations: CalendarViolation[] = [];
+  for (const rows of byStrike.values()) {
+    if (rows.length < 2) continue;
+    rows.sort((a, b) => a.dte - b.dte);
+    for (let i = 0; i + 1 < rows.length; i += 1) {
+      const near = rows[i];
+      const far = rows[i + 1];
+      calendarPairsTested += 1;
+      // Same 2%-of-mark quote-noise slack as the vertical detector above.
+      const slack = Math.max(near.mark * 0.02, far.mark * 0.02, 0.01);
+      if (far.mark < near.mark - slack) {
+        markCalendarViolations.push({
+          optionType: near.row.optionType,
+          strike: near.row.strike,
+          shortExpiration: near.row.expiration,
+          longExpiration: far.row.expiration,
+          shortMark: near.mark,
+          longMark: far.mark,
+          shortSymbol: near.row.optionSymbol,
+          longSymbol: far.row.optionSymbol,
+        });
+      }
+    }
+  }
+
+  // --- Bucket by (type, |delta| at own σ) and fit IV(√T) per bucket. ---
+  interface BucketRow {
+    p: PreparedRow;
+    absDelta: number;
+    u: number; // √T
+  }
+  const buckets = new Map<string, BucketRow[]>();
+  for (const p of prepared) {
+    const delta = blackScholesDelta({
+      spot: underlyingPrice,
+      strike: p.row.strike,
+      timeToExpiryYears: p.T,
+      riskFreeRate: opts.riskFreeRate,
+      volatility: p.iv,
+      optionType: p.row.optionType,
+      dividendYield: opts.dividendYield,
+    });
+    const absDelta = Math.abs(delta);
+    if (!Number.isFinite(absDelta) || absDelta <= 0 || absDelta >= 1) continue;
+    const bucketEdge =
+      Math.floor(absDelta / topts.deltaBucketWidth) * topts.deltaBucketWidth;
+    const key = `${p.row.optionType}|${bucketEdge.toFixed(2)}`;
+    let bucket = buckets.get(key);
+    if (!bucket) {
+      bucket = [];
+      buckets.set(key, bucket);
+    }
+    bucket.push({ p, absDelta, u: Math.sqrt(p.T) });
+  }
+
+  const bucketsSkipped: TermBucketSkip[] = [];
+  const bucketFits: TermBucketFit[] = [];
+  const dislocations: TermStructureDislocation[] = [];
+  let rowsEvaluated = 0;
+  let bucketsFitted = 0;
+
+  for (const [key, rows] of buckets) {
+    const distinctExpirations = new Set(rows.map((r) => r.p.row.expiration)).size;
+    if (distinctExpirations < topts.minExpirationsPerBucket) {
+      bucketsSkipped.push({
+        bucketKey: key,
+        reason: 'insufficient_expirations',
+        rows: rows.length,
+        distinctExpirations,
+      });
+      continue;
+    }
+
+    // OLS of iv on u = √T: alpha + beta·u.
+    const n = rows.length;
+    let Su = 0;
+    let Suu = 0;
+    let Sy = 0;
+    let Suy = 0;
+    for (const r of rows) {
+      Su += r.u;
+      Suu += r.u * r.u;
+      Sy += r.p.iv;
+      Suy += r.u * r.p.iv;
+    }
+    const denom = n * Suu - Su * Su;
+    if (!Number.isFinite(denom) || Math.abs(denom) < 1e-12) {
+      bucketsSkipped.push({
+        bucketKey: key,
+        reason: 'degenerate_time_axis',
+        rows: rows.length,
+        distinctExpirations,
+      });
+      continue;
+    }
+    const beta = (n * Suy - Su * Sy) / denom;
+    const alpha = (Sy - beta * Su) / n;
+
+    const residuals = rows.map((r) => r.p.iv - (alpha + beta * r.u));
+    const rmse = Math.sqrt(residuals.reduce((s, r) => s + r * r, 0) / n);
+    // Same floor as the strike pass: a near-perfect fit must not blow up |z|.
+    const sigmaResid = Math.max(rmse, 0.005);
+
+    bucketsFitted += 1;
+    const optionType = rows[0].p.row.optionType;
+    const deltaBucket =
+      Math.floor(rows[0].absDelta / topts.deltaBucketWidth) * topts.deltaBucketWidth;
+    bucketFits.push({
+      bucketKey: key,
+      optionType,
+      deltaBucket,
+      alpha,
+      beta,
+      rmse,
+      sampleSize: n,
+      distinctExpirations,
+    });
+
+    for (let i = 0; i < rows.length; i += 1) {
+      const r = rows[i];
+      rowsEvaluated += 1;
+      const z = residuals[i] / sigmaResid;
+      if (Math.abs(z) < topts.termZScoreThreshold) continue;
+      dislocations.push({
+        optionSymbol: r.p.row.optionSymbol,
+        underlying: r.p.row.underlying,
+        optionType: r.p.row.optionType,
+        strike: r.p.row.strike,
+        expiration: r.p.row.expiration,
+        daysToExpiration: r.p.dte,
+        deltaBucket,
+        absDelta: r.absDelta,
+        ivUsed: r.p.iv,
+        ivFittedTerm: alpha + beta * r.u,
+        ivResidualTerm: residuals[i],
+        zScoreTerm: z,
+        classification: z < 0 ? 'term_cheap' : 'term_rich',
+        bucketKey: key,
+      });
+    }
+  }
+
+  dislocations.sort((a, b) => Math.abs(b.zScoreTerm) - Math.abs(a.zScoreTerm));
+
+  return {
+    rowsIn: chain.length,
+    rowsPrepared: prepared.length,
+    rowsEvaluated,
+    bucketsTotal: buckets.size,
+    bucketsFitted,
+    bucketsSkipped,
+    bucketFits,
+    dislocations,
+    calendarPairsTested,
+    markCalendarViolations,
+  };
 }
 
 /** Option side the RV single-leg long is permitted to open (TRA-968). */
