@@ -42,6 +42,7 @@ import { clearLiveEnforceGateLedger, recordLiveEnforceDecision } from '../live-e
 import {
   SETUP_CONFIRMATION_GATE,
   SETUP_CONFIRMATION_SIBLING_GATE,
+  SETUP_CONFIRMATION_EXPECT_ROWS_AFTER_OPEN_MS,
   OTM_SETUP_TAXONOMY_MODE_ENV,
   OTM_SETUP_TAXONOMY_SETUPS_ENV,
 } from '../otm-setup-gate.js';
@@ -6194,7 +6195,20 @@ describe('GET /api/health/otm-sleeve-mandate — setupTaxonomy (TRA-4422)', () =
       ledgerLastDecisionAt: string | null;
       processStartedAt: string;
       sinceProcessStartMs: number | null;
+      // TRA-4422 Finding 3 — the IN-WINDOW denominator. Wall-clock uptime is
+      // the wrong one: the scan is gated on isStockMarketOpen(), so out of
+      // hours `comparable` cannot turn true however long the box runs.
+      scanWindow: {
+        marketOpenNow: boolean;
+        openMsSinceStart: number;
+        openMsTruncated: boolean;
+        expectRows: boolean;
+        thresholdMs: number;
+        gatedOn: string;
+      };
       holds: boolean | null;
+      /** ⛔ The only field here that should page. */
+      notScanning: boolean;
       reason: string;
     };
     note: string;
@@ -6275,9 +6289,50 @@ describe('GET /api/health/otm-sleeve-mandate — setupTaxonomy (TRA-4422)', () =
     // ...and the verdict is WITHHELD, not forged in either direction.
     expect(t.crossCheck.comparable).toBe(false);
     expect(t.crossCheck.holds).toBeNull();
-    expect(t.crossCheck.reason).toMatch(/NOT COMPARABLE/);
     expect(t.note).toMatch(/comparable=false/);
     expect(t.note).not.toMatch(/recorder is broken/);
+
+    // ── TRA-4422 Finding 3 — and it must not escalate either ────────────────
+    //
+    // Finding 2 left `sinceProcessStartMs` as the escalation term with the prose
+    // "up for hours and still not comparable ⇒ the sleeve is not scanning". The
+    // 23:03Z out-of-hours read proved that false: the scan is gated on
+    // `isStockMarketOpen()`, so outside the session `comparable` CANNOT turn
+    // true and the rule would fire every night and every weekend.
+    //
+    // ⚠️ Deterministic, not clock-dependent: this test's `processStartedAt` is
+    // the TEST process's own start, seconds ago, so `openMsSinceStart` is at
+    // most one 60s sample against a 15-minute threshold — `expectRows` is false
+    // whether or not the suite happens to run inside RTH.
+    expect(t.crossCheck.scanWindow.openMsSinceStart).toBeLessThan(
+      SETUP_CONFIRMATION_EXPECT_ROWS_AFTER_OPEN_MS,
+    );
+    expect(t.crossCheck.scanWindow.expectRows).toBe(false);
+    expect(t.crossCheck.notScanning).toBe(false);
+    expect(t.crossCheck.scanWindow.thresholdMs).toBe(SETUP_CONFIRMATION_EXPECT_ROWS_AFTER_OPEN_MS);
+    expect(typeof t.crossCheck.scanWindow.marketOpenNow).toBe('boolean');
+    // NOT RUN (out of window) — structurally guaranteed, so neither alarm nor pass.
+    expect(t.crossCheck.reason).toMatch(/NOT RUN \(out of window\)/);
+    expect(t.note).toMatch(/structurally guaranteed/i);
+    expect(t.note).not.toMatch(/notScanning` is TRUE/);
+  });
+
+  // ⛔ COVERAGE BOUNDARY, STATED RATHER THAN IMPLIED. The `notScanning: TRUE`
+  // branch cannot be reached from here: the route reads `resolveBuildInfo()`
+  // and the real clock, and this suite installs no build-info mock, so 15
+  // minutes of in-window time since the TEST process booted is unreachable.
+  // That branch's logic is controlled at the unit level in
+  // `otm-setup-gate.test.ts` ("NEGATIVE CONTROL: in-window uptime past the
+  // threshold DOES escalate"), where both mutations of `expectRows` were caught.
+  // What IS asserted here is the wiring: the field exists, it is published, and
+  // it is false exactly when the recorder is writing.
+  it('never escalates while the recorder IS writing (notScanning wiring)', () => {
+    let last = 0;
+    for (let i = 0; i < 3; i += 1) { last = liveTs(); record(SETUP_CONFIRMATION_SIBLING_GATE, last); }
+    const t = taxonomy();
+    expect(t.crossCheck.comparable).toBe(true);
+    // `notScanning` is `!comparable && expectRows` — comparable alone kills it.
+    expect(t.crossCheck.notScanning).toBe(false);
   });
 
   // ⛔ THE GUARD'S OWN NEGATIVE CONTROL. A precondition that is never satisfied

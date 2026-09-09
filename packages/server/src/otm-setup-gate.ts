@@ -6,6 +6,7 @@ import {
   type SetupTaxonomyReasonCode,
   type SetupTaxonomyVerdict,
 } from '@trading-app/engine';
+import { isStockMarketOpen } from '@trading-app/shared';
 
 /**
  * TRA-4422 (parent TRA-4421) — THE SERVER SEAM for the setup taxonomy: env
@@ -67,6 +68,103 @@ export const SETUP_CONFIRMATION_GATE = 'setup_confirmation' as const;
  * rather than as prose the reader has to remember to apply.
  */
 export const SETUP_CONFIRMATION_SIBLING_GATE = 'entry_window' as const;
+
+/**
+ * TRA-4422 Finding 3 — WALL-CLOCK UPTIME IS THE WRONG DENOMINATOR FOR
+ * `comparable`, AND THE FIRST OUT-OF-RTH READ PROVED IT.
+ *
+ * `crossCheck.comparable` asks "has this process written a ledger row yet?".
+ * Finding 2 published `sinceProcessStartMs` beside it and told the reader to
+ * escalate when the box had been up for hours with `comparable` still false —
+ * "a sleeve that is not scanning at all, and that is a real finding wearing the
+ * same clothes".
+ *
+ * ⛔ THAT ESCALATION RULE IS FALSE OUTSIDE 09:30–16:00 ET. The seam lives inside
+ * `runOtmScan`, and BOTH it and the TRA-4424 daily-series refresh are gated on
+ * `shouldRunOtmScan({ ..., marketOpen: isStockMarketOpen(), ... })`. Outside the
+ * session that predicate is false, so the scan cannot run, so no row can be
+ * written, so `comparable` CANNOT become true no matter how long the box stays
+ * up. Uptime accumulates; the opportunity to record does not.
+ *
+ * Measured 2026-09-09T23:03Z on `8e51be03` — booted 21:08:11Z, 68 minutes AFTER
+ * the 20:00Z close: uptime 1.93h, `setup_confirmation.evaluated: 0`,
+ * `lastDecisionAt` frozen at 20:00:09.136Z (the closing tick), and every
+ * TRA-4424 counter — `refreshPasses` included — still zero against a 30-minute
+ * cadence. All four readings agree, and NONE of them is a defect: the surface
+ * the gate measures does not exist out of hours. Finding 2's rule would have
+ * escalated that, and would do so on every night and every weekend read — which
+ * is most reads. A false alarm that fires on a schedule is the same defect class
+ * as one that fires on every deploy day, one layer further out.
+ *
+ * So the denominator is IN-WINDOW time since boot, not wall-clock time since
+ * boot, and `expectRows` is only true once enough of it has passed.
+ */
+export const SETUP_CONFIRMATION_SCAN_WINDOW_STEP_MS = 60_000;
+
+/**
+ * How much *in-window* time must elapse before a still-empty ledger is worth
+ * escalating. DERIVED, not picked: `OTM_SCAN_INTERVAL_MS` in `signal-engine.ts`
+ * is 5 minutes, and the sweep is budgeted + cursored (TRA-2262), so a single
+ * pass can legitimately span several ticks. Three cadences is the headroom.
+ *
+ * ⛔ Not imported from `signal-engine.ts` on purpose — that module imports THIS
+ * one, and the cycle would be a build failure rather than a nicety. The tie is
+ * asserted by a test instead, so the two cannot drift silently.
+ */
+export const SETUP_CONFIRMATION_EXPECT_ROWS_AFTER_OPEN_MS = 15 * 60_000;
+
+/** How far back {@link scanWindowOpenMsSince} will integrate before truncating. */
+export const SETUP_CONFIRMATION_SCAN_WINDOW_MAX_LOOKBACK_MS = 10 * 24 * 60 * 60 * 1000;
+
+export interface ScanWindowElapsed {
+  /** Is the OTM scan's own gating predicate true right now? */
+  readonly marketOpenNow: boolean;
+  /**
+   * Milliseconds of market-open time between process start and now. This — not
+   * wall-clock uptime — is the window in which a row could have been written.
+   */
+  readonly openMsSinceStart: number;
+  /** True when the integration hit its lookback cap, so `openMsSinceStart` is a floor. */
+  readonly truncated: boolean;
+  /**
+   * MEASURED: has there been enough in-window time that an empty ledger is
+   * genuinely suspicious? ⛔ `false` is NOT a pass — it is "the box has not been
+   * given the chance yet, ask again inside the session".
+   */
+  readonly expectRows: boolean;
+}
+
+/**
+ * Integrate {@link isStockMarketOpen} over `[startMs, nowMs]`.
+ *
+ * Sampled at one-minute steps: the result is used against a 15-minute threshold,
+ * so ±1 minute is far inside the tolerance, and a closed-form second model of
+ * the session boundary sitting beside `isStockMarketOpen` is exactly the
+ * two-models-of-one-thing defect TRA-3839 argues against. The predicate is
+ * injectable so the controls can drive it without touching the clock.
+ */
+export function scanWindowOpenMsSince(
+  startMs: number,
+  nowMs: number,
+  isOpen: (utcMs: number) => boolean = isStockMarketOpen,
+): ScanWindowElapsed {
+  const marketOpenNow = isOpen(nowMs);
+  if (!Number.isFinite(startMs) || !Number.isFinite(nowMs) || nowMs <= startMs) {
+    return { marketOpenNow, openMsSinceStart: 0, truncated: false, expectRows: false };
+  }
+  const floor = nowMs - SETUP_CONFIRMATION_SCAN_WINDOW_MAX_LOOKBACK_MS;
+  const truncated = startMs < floor;
+  let openMs = 0;
+  for (let t = Math.max(startMs, floor); t < nowMs; t += SETUP_CONFIRMATION_SCAN_WINDOW_STEP_MS) {
+    if (isOpen(t)) openMs += Math.min(SETUP_CONFIRMATION_SCAN_WINDOW_STEP_MS, nowMs - t);
+  }
+  return {
+    marketOpenNow,
+    openMsSinceStart: openMs,
+    truncated,
+    expectRows: openMs >= SETUP_CONFIRMATION_EXPECT_ROWS_AFTER_OPEN_MS,
+  };
+}
 
 /**
  * The code a refusal carries when the verdict somehow arrived without one.
