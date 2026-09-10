@@ -1,8 +1,21 @@
 name: Deploy to GitHub Pages
 
+# TRA-4477 — Pages promotes ONLY a SHA that CI has verified green.
+#
+# The external audit (TRA-4473 C4) caught this workflow succeeding while CI was
+# red at the same commit: both fired off the same push, independently. Now this
+# workflow fires when CI COMPLETES on main/master, and the `gate` job re-verifies
+# green AT THE EXACT SHA via scripts/require-green-ci.mjs — which grades the CI
+# run's own /jobs list (every expected job present and green, Test step actually
+# ran), never the run conclusion (TRA-4440). The build job then checks out that
+# exact SHA, so what was verified is what ships. A red CI produces a loud refusal
+# here, not a silent skip; no CI evidence at the SHA reads BLIND and also refuses.
+
 on:
-  push:
-    branches: [master, main]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main, master]
   workflow_dispatch:
 
 # Allow only one concurrent deployment
@@ -14,18 +27,48 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  actions: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  gate:
+    name: Require green CI at the exact SHA
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the SHA being promoted
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "sha=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Refuse unless CI is verified green at that SHA (TRA-4477)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/require-green-ci.mjs --sha=${{ steps.resolve.outputs.sha }}
+
   build:
     name: Build web frontend
+    needs: gate
     runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The gate verified THIS sha; building anything else (e.g. the branch
+          # tip at trigger time) would ship bytes the verdict never saw.
+          ref: ${{ needs.gate.outputs.sha }}
 
       - uses: pnpm/action-setup@v4
         with:

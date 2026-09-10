@@ -14,8 +14,27 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  # TRA-4477 — this workflow carried no lint/typecheck/test job at all (external
+  # audit C4), so a tag on a broken commit shipped installers untested. The gate
+  # requires CI verified green AT THE TAGGED SHA, graded by the CI run's own
+  # /jobs list (scripts/require-green-ci.mjs), never the run conclusion. A tag on
+  # a commit CI never saw reads BLIND and refuses — no evidence is not green.
+  require-green-ci:
+    name: Require green CI at the tagged SHA
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse unless CI is verified green at ${{ github.sha }} (TRA-4477)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/require-green-ci.mjs --sha=${{ github.sha }}
+
   build-windows:
     name: Build – Windows (NSIS installer)
+    needs: require-green-ci
     runs-on: windows-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -57,6 +76,7 @@ jobs:
 
   build-macos:
     name: Build – macOS Universal DMG
+    needs: require-green-ci
     runs-on: macos-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true

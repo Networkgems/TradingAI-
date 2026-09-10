@@ -1,5 +1,21 @@
 name: CI
 
+# TRA-4477 — lint, typecheck and test are INDEPENDENT jobs, not steps of one chain.
+#
+# The old shape was one `ts-checks` job with Test as the final step. TRA-4440
+# measured what that costs: `main` red for 6.5 weeks (runs #1063–#1777) behind a
+# fail-fast step 7, during which typecheck, lint and the whole 9,084-test suite
+# NEVER EXECUTED ONCE — and the run conclusion is the only thing most readers look
+# at. Now every axis runs and reports on every push; the first failure hides
+# nothing behind it.
+#
+# `ci-verdict` is the single REQUIRED status (branch protection on `main` names
+# it). It grades the run by its OWN /jobs step list — presence, conclusion and
+# step durations of every expected job — never by the run conclusion, and its
+# grading logic proves it can refuse via mutation controls on every fire
+# (scripts/ci-verdict.mjs --selftest). Pages and release refuse to promote any
+# SHA this verdict has not verified green (scripts/require-green-ci.mjs).
+
 on:
   push:
     branches: [main, master, develop]
@@ -39,8 +55,11 @@ jobs:
         working-directory: apps/desktop/src-tauri
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-  ts-checks:
-    name: TypeScript (tsc + eslint + vitest)
+  # The guard family stays grouped — these are cheap, ordered on purpose (stale-js
+  # must precede anything that compiles), and none of them gates the suite: lint,
+  # typecheck and test run in their own jobs regardless of what happens here.
+  guards:
+    name: Guards (stale-js / data-dir / cycles / deploy-build gate / prover)
     runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -89,7 +108,7 @@ jobs:
 
       # TRA-1684 — also before build/test. A circular import only throws from SOME
       # entry points, so prod and the suite can enter the same graph through different
-      # doors and only one of them crashes (TRA-1674). A green suite below is not
+      # doors and only one of them crashes (TRA-1674). A green suite is not
       # evidence the import graph is sound; this step is.
       - name: Check for import cycles
         run: pnpm check:cycles
@@ -97,12 +116,12 @@ jobs:
       # TRA-3695 — the DEPLOY'S OWN build command, named as such and run FIRST.
       #
       # `070a188a` reached origin/main with a hard TS error and eight commits landed on top
-      # of it before a live deploy to the money host was the thing that noticed. The steps
-      # below do compile the packages, but they are `pnpm typecheck` and a package glob —
-      # NOT the chain the Render dashboard executes, and the two are not the same set
-      # (`render-build` hardcodes four packages, `web:build` globs five). This step parses
-      # the deploy's own scripts and runs those segments verbatim, so a chain that only the
-      # deploy runs cannot go ungraded here.
+      # of it before a live deploy to the money host was the thing that noticed. The
+      # typecheck job compiles the packages too, but it is `pnpm typecheck` and a package
+      # glob — NOT the chain the Render dashboard executes, and the two are not the same
+      # set (`render-build` hardcodes four packages, `web:build` globs five). This step
+      # parses the deploy's own scripts and runs those segments verbatim, so a chain that
+      # only the deploy runs cannot go ungraded here.
       #
       # `--worktree` is correct in CI and only in CI: actions/checkout gives a pristine tree
       # that IS the commit, so isolation would buy nothing. Locally the gate isolates,
@@ -138,11 +157,110 @@ jobs:
       - name: Monotonicity prover controls (TRA-2361 AC5)
         run: pnpm check:tra2361-prover
 
-      - name: Type check
-        run: pnpm typecheck
+  lint:
+    name: Lint (eslint)
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # eslint.config.mjs is not type-aware (tseslint `recommended`, no
+      # projectService), so no package build is needed here.
       - name: Lint
         run: pnpm lint
 
+  typecheck:
+    name: Typecheck (tsc)
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # `pnpm typecheck` builds the @trading-app/* packages itself, then runs
+      # `tsc --noEmit` across the workspace — self-provisioning by design.
+      - name: Type check
+        run: pnpm typecheck
+
+  test:
+    name: Test (vitest)
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: `pretest` runs the TRA-4420 arg-guard suite, whose ARM 0
+          # reconstitutes a187fc14's bytes via `git show` — unreachable at depth 1.
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Same provisioning the old single-job chain gave the suite: workspace deps
+      # resolve to dist/, and `pretest` (which builds three of the packages) was
+      # written for the local loop, not as the only provisioning.
+      - name: Build shared packages
+        run: pnpm -r --filter './packages/**' build
+
       - name: Test
         run: pnpm test
+
+  # The single REQUIRED status. Grades this very run by its /jobs step list and
+  # durations (TRA-4440's lesson: never the run conclusion), and proves on every
+  # fire that its own grading logic can refuse (mutation selftests). A skipped or
+  # dropped job reads BROKEN/BLIND here, never green.
+  ci-verdict:
+    name: CI verdict
+    needs: [rust-lint, guards, lint, typecheck, test]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verdict gate mutation controls (a gate nobody has seen refuse is not a gate)
+        run: |
+          node scripts/ci-verdict.mjs --selftest
+          node scripts/require-green-ci.mjs --selftest
+
+      - name: Grade this run by its jobs and steps, never the conclusion
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/ci-verdict.mjs
