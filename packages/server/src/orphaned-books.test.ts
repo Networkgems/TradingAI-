@@ -237,15 +237,15 @@ describe('TRA-2410 — the recycled-username adoption hazard', () => {
     const code = auth.generateResetToken(user);
     const otherCode = auth.generateResetToken(other);
     twoFactor.issueChallenge(user);
-    expect(auth.validateResetToken(code)).toBe(user);
+    expect(auth.validateResetToken(code, user)).toBe(user);
 
     const receipt = await orphanedBooks.retireOrphanedBook(user, { dataDir: DATA_DIR, now: T0 });
 
     expect(receipt.resetTokensRevoked).toBe(1);
     expect(receipt.twoFactorStateCleared).toBe(1);
     // The predecessor's reset link must not redeem against the new holder.
-    expect(auth.validateResetToken(code)).toBeNull();
-    expect(auth.validateResetToken(otherCode)).toBe(other);
+    expect(auth.validateResetToken(code, user)).toBeNull();
+    expect(auth.validateResetToken(otherCode, other)).toBe(other);
   });
 
   it('is idempotent, and a second retirement only tightens the epoch', async () => {

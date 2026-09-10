@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { HTTP_URL } from './server-url';
 import PasswordInput from './components/PasswordInput';
+import { MIN_PASSWORD_LENGTH } from './password-policy';
 
 interface Props {
   onSignUp: (token: string) => void;
@@ -19,8 +20,8 @@ export default function SignUpPage({ onSignUp, onBack }: Props) {
     e.preventDefault();
     setError('');
 
-    if (password.length < 6) {
-      setError('Password must be at least 6 characters');
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      setError(`Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
       return;
     }
     if (password !== confirmPassword) {

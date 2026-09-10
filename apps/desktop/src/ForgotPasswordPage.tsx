@@ -1,10 +1,14 @@
 import { useState } from 'react';
 import { HTTP_URL } from './server-url';
 import PasswordInput from './components/PasswordInput';
+import { MIN_PASSWORD_LENGTH } from './password-policy';
 
-function getUrlResetCode(): string {
+// TRA-4479 — the reset link carries the username as well as the code, because a
+// redemption is now keyed by username+code. Both are stripped from the URL below
+// so neither is bookmarked or shared.
+function getUrlResetParams(): { code: string; username: string } {
   const params = new URLSearchParams(window.location.search);
-  return params.get('reset_code') ?? '';
+  return { code: params.get('reset_code') ?? '', username: params.get('reset_user') ?? '' };
 }
 
 type Step = 'request' | 'reset' | 'done';
@@ -14,18 +18,20 @@ interface Props {
 }
 
 export default function ForgotPasswordPage({ onBack }: Props) {
-  const urlCode = getUrlResetCode();
-  const [step, setStep] = useState<Step>(urlCode ? 'reset' : 'request');
+  const urlParams = getUrlResetParams();
+  const [step, setStep] = useState<Step>(urlParams.code ? 'reset' : 'request');
   const [email, setEmail] = useState('');
   const [code, setCode] = useState(() => {
-    if (urlCode) {
+    if (urlParams.code) {
       // Remove the token from the URL so it isn't shared or bookmarked
       const url = new URL(window.location.href);
       url.searchParams.delete('reset_code');
+      url.searchParams.delete('reset_user');
       window.history.replaceState(null, '', url.toString());
     }
-    return urlCode;
+    return urlParams.code;
   });
+  const [username, setUsername] = useState(urlParams.username);
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [error, setError] = useState('');
@@ -60,8 +66,12 @@ export default function ForgotPasswordPage({ onBack }: Props) {
       setError('Passwords do not match');
       return;
     }
-    if (newPassword.length < 6) {
-      setError('Password must be at least 6 characters');
+    if (newPassword.length < MIN_PASSWORD_LENGTH) {
+      setError(`Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
+      return;
+    }
+    if (!username.trim()) {
+      setError('Enter the username shown in your reset email');
       return;
     }
     setLoading(true);
@@ -70,7 +80,7 @@ export default function ForgotPasswordPage({ onBack }: Props) {
       const r = await fetch(`${HTTP_URL}/api/auth/reset-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code, newPassword }),
+        body: JSON.stringify({ code, newPassword, username: username.trim() }),
       });
       const data = await r.json() as { ok?: boolean; error?: string };
       if (r.ok && data.ok) {
@@ -119,8 +129,20 @@ export default function ForgotPasswordPage({ onBack }: Props) {
 
         {step === 'reset' && (
           <>
-            <p className="login-sub">Enter the 8-digit code from your email and your new password</p>
+            <p className="login-sub">Enter the username and 8-digit code from your email, and your new password</p>
             <form onSubmit={handleResetPassword} className="login-form">
+              <label className="login-label">
+                Username
+                <input
+                  className="login-input"
+                  type="text"
+                  value={username}
+                  onChange={e => setUsername(e.target.value)}
+                  autoComplete="username"
+                  required
+                  disabled={loading}
+                />
+              </label>
               <label className="login-label">
                 Reset Code
                 <input
@@ -142,7 +164,7 @@ export default function ForgotPasswordPage({ onBack }: Props) {
                   value={newPassword}
                   onChange={setNewPassword}
                   autoComplete="new-password"
-                  minLength={6}
+                  minLength={MIN_PASSWORD_LENGTH}
                   required
                   disabled={loading}
                 />
@@ -153,7 +175,7 @@ export default function ForgotPasswordPage({ onBack }: Props) {
                   value={confirmPassword}
                   onChange={setConfirmPassword}
                   autoComplete="new-password"
-                  minLength={6}
+                  minLength={MIN_PASSWORD_LENGTH}
                   required
                   disabled={loading}
                 />

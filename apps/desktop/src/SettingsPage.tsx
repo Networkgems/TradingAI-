@@ -29,6 +29,7 @@ import {
   resolveRiskPerTrade,
   riskPerTradeField,
 } from '@trading-app/shared';
+import { MIN_PASSWORD_LENGTH } from './password-policy';
 
 type Market = 'crypto' | 'stocks';
 
@@ -341,7 +342,7 @@ export function ChangePasswordSection({ token, httpUrl }: { token: string; httpU
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (newPassword !== confirmPassword) { setError('Passwords do not match'); return; }
-    if (newPassword.length < 6) { setError('New password must be at least 6 characters'); return; }
+    if (newPassword.length < MIN_PASSWORD_LENGTH) { setError(`New password must be at least ${MIN_PASSWORD_LENGTH} characters`); return; }
     setStatus('saving');
     setError('');
     try {
@@ -388,7 +389,7 @@ export function ChangePasswordSection({ token, httpUrl }: { token: string; httpU
               value={newPassword}
               onChange={setNewPassword}
               autoComplete="new-password"
-              minLength={6}
+              minLength={MIN_PASSWORD_LENGTH}
               required
               disabled={status === 'saving'}
             />
@@ -400,7 +401,7 @@ export function ChangePasswordSection({ token, httpUrl }: { token: string; httpU
               value={confirmPassword}
               onChange={setConfirmPassword}
               autoComplete="new-password"
-              minLength={6}
+              minLength={MIN_PASSWORD_LENGTH}
               required
               disabled={status === 'saving'}
             />
@@ -806,8 +807,8 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
 
   async function handleSetPassword() {
     if (!editUser) return;
-    if (editNewPassword.length < 6) {
-      setPwMessage({ kind: 'err', text: 'Password must be at least 6 characters' });
+    if (editNewPassword.length < MIN_PASSWORD_LENGTH) {
+      setPwMessage({ kind: 'err', text: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` });
       return;
     }
     setPwSetting(true);
@@ -1014,7 +1015,7 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
                   value={editNewPassword}
                   onChange={setEditNewPassword}
                   autoComplete="new-password"
-                  minLength={6}
+                  minLength={MIN_PASSWORD_LENGTH}
                   disabled={pwSetting}
                 />
                 <span className="field-hint">Minimum 6 characters</span>
@@ -1029,7 +1030,7 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
                   type="button"
                   className="btn-primary btn-sm"
                   onClick={handleSetPassword}
-                  disabled={pwSetting || editNewPassword.length < 6}
+                  disabled={pwSetting || editNewPassword.length < MIN_PASSWORD_LENGTH}
                 >
                   {pwSetting ? 'Saving…' : 'Set Password'}
                 </button>
@@ -1109,7 +1110,7 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
                   <PasswordInput
                     value={newPassword}
                     onChange={setNewPassword}
-                    minLength={6}
+                    minLength={MIN_PASSWORD_LENGTH}
                     required
                     disabled={creating}
                   />

@@ -186,7 +186,7 @@ describe('TRA-2421 — the wipe surface', () => {
     const code = auth.generateResetToken(user);
     const otherCode = auth.generateResetToken(other);
     twoFactor.issueChallenge(user);
-    expect(auth.validateResetToken(code)).toBe(user);
+    expect(auth.validateResetToken(code, user)).toBe(user);
 
     const receipt = await accountDeletion.wipeAccountData(user, { now: T0 });
 
@@ -194,10 +194,10 @@ describe('TRA-2421 — the wipe surface', () => {
     expect(receipt.twoFactorStateCleared).toBe(1);
     // The reset code is dead — it must not survive to be redeemed against
     // whoever registers this username next.
-    expect(auth.validateResetToken(code)).toBeNull();
+    expect(auth.validateResetToken(code, user)).toBeNull();
     expect(twoFactor.verifyChallenge(user, '000000')).toBe('no_challenge');
     // Scoped: another account's outstanding code is untouched.
-    expect(auth.validateResetToken(otherCode)).toBe(other);
+    expect(auth.validateResetToken(otherCode, other)).toBe(other);
   });
 });
 

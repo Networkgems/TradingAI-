@@ -199,6 +199,31 @@ of every outstanding code across all 67 accounts**, with unlimited attempts. An 
 pool at once. That upgrades H4a from hardening to a plausible takeover path, and it makes the **throttle**
 (not the CSPRNG) the first fix.
 
+> **Correction, 2026-09-09 (TRA-4479, LeadDev).** One clause above is wrong, and the truth is worse than the
+> clause. There **is** a limiter on the auth routes — `auth-throttle.ts`, shipped by TRA-404/C2, and
+> `/api/auth/reset-password` and `/api/auth/forgot-password` both call it. The finding stands anyway, because
+> the limiter was **not binding**: `index.ts` set `app.set('trust proxy', true)`, which trusts the whole
+> `X-Forwarded-For` chain and makes `req.ip` the **leftmost** entry — the one the caller writes. Render's edge
+> *appends* to that header, it does not replace it. Measured against express in this workspace with
+> `X-Forwarded-For: 9.9.9.9, 203.0.113.7`:
+>
+> | `trust proxy` | `req.ip` | meaning |
+> |---|---|---|
+> | `true` (shipped) | `9.9.9.9` | the forgery — **one header per request buys a fresh throttle bucket** |
+> | `1` (hop count) | `203.0.113.7` | the address the proxy recorded |
+> | `false` | `127.0.0.1` | the edge — the whole internet shares one bucket |
+>
+> So every per-IP bucket on every auth route — login, 2FA, login-code, delete-account, and both reset routes —
+> was a no-op against any attacker who set one header, while reading, from every angle available to us,
+> exactly like a limiter that worked. The per-**username** buckets on `login` and `2fa/verify` were the only
+> ones that bound anything; `reset-password` had no username to bucket on, which is precisely the code-alone
+> keying this section is about. Two defects that each hid the other.
+>
+> This is why "throttle first" was still the right ordering and why the fix could not stop at a throttle:
+> a rate limit keyed on network identity binds only an attacker who cannot change network identity. The
+> bound that holds regardless is the per-account attempt cap that burns the outstanding code — see
+> `recordResetFailure` in `auth.ts`.
+
 The 2FA fail-open at `index.ts:9189-9191` is real but is a **deliberate, commented tradeoff** ("Fail safe by
 letting them in rather than locking them out permanently") and needs an admin to have removed an email from
 a 2FA-enabled account. It should be re-decided — refuse with a recovery path — not merely patched, and it

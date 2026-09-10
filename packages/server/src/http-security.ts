@@ -61,6 +61,45 @@ export const LOCAL_ORIGINS: readonly string[] = [
 export const PAGES_ORIGIN = 'https://networkgems.github.io';
 
 /**
+ * TRA-4479 — the `trust proxy` setting, as a HOP COUNT rather than `true`.
+ *
+ * `app.set('trust proxy', true)` trusts the WHOLE `X-Forwarded-For` chain, and
+ * express then reports the LEFTMOST entry as `req.ip`. The leftmost entry is
+ * whatever the caller typed: Render's edge APPENDS the real address, it does not
+ * replace the header. So `req.ip` was a caller-supplied string.
+ *
+ * Measured 2026-09-09 against express in this workspace, `X-Forwarded-For:
+ * 9.9.9.9, 203.0.113.7` (a forged entry plus the one the proxy appended):
+ *
+ *     trust proxy = true   ->  req.ip = 9.9.9.9      (the forgery)
+ *     trust proxy = 1      ->  req.ip = 203.0.113.7  (the proxy's own record)
+ *     trust proxy = false  ->  req.ip = 127.0.0.1    (the socket; the proxy)
+ *
+ * Every per-IP auth throttle keys on `req.ip`. Under `true`, one extra header
+ * per request bought a brand-new bucket, so the limiter was a no-op against any
+ * attacker who bothered — while reading, from every angle available to us,
+ * exactly like a limiter that was working. `false` is no better: it collapses
+ * every caller onto the edge's address, i.e. ONE shared bucket for the whole
+ * internet, which converts the throttle into a self-DoS.
+ *
+ * A hop count is the only setting that names the real topology. bqb1 sits behind
+ * exactly one Render hop; `TRUST_PROXY_HOPS` exists so that adding a CDN in
+ * front is an env change during a freeze rather than a code change.
+ *
+ * Accepts a positive integer, or `false`/`0` for "no proxy" (direct-to-socket,
+ * for a local run). Anything unparseable falls back to 1 rather than to `true` —
+ * a typo must not silently restore the spoofable setting.
+ */
+export function resolveTrustProxy(raw: string | undefined): number | false {
+  const value = (raw ?? '').trim().toLowerCase();
+  if (value === '') return 1;
+  if (value === 'false' || value === '0') return false;
+  const hops = Number(value);
+  if (!Number.isInteger(hops) || hops < 1) return 1;
+  return hops;
+}
+
+/**
  * Reduce a URL to its origin (`scheme://host[:port]`), or null if unparseable.
  * `APP_URL` is a full app URL with a path in some deployments, and an `Origin`
  * header never carries one, so comparing raw strings would silently never match.

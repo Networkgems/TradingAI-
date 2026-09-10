@@ -22,6 +22,7 @@ import {
   buildAllowedOrigins,
   corsMiddleware,
   notFoundHandler,
+  resolveTrustProxy,
   securityHeadersMiddleware,
 } from './http-security.js';
 import { cspReportRouter, initCspReportStore } from './csp-report-collector.js';
@@ -110,7 +111,7 @@ import { stampFirmWideDemoFoldScope } from './reports/demo-calendar-fold-provena
 // (signup + the two admin identity-writes). The reserve rule used to be an inline
 // `if` at signup only, which is how both admin routes came to skip it.
 import { refuseReservedIdentityWrite } from './identity-write-guard.js';
-import { acceptUsername } from './username-grammar.js';
+import { acceptUsername, normalizeUsername } from './username-grammar.js';
 // TRA-2421 — self-serve account deletion: the wipe surface and the identity
 // tombstone that keeps a recycled username from inheriting the previous holder's
 // shared-journal rows.
@@ -510,7 +511,7 @@ import {
   decideLiveCellSourceDisposition,
   isUnreconciled,
 } from './reports/live-cell-broker-source.js';
-import { createToken, verifyToken, createPendingToken, verifyPendingToken, generateResetToken, consumeResetToken, initResetTokenStore, revokeResetTokensFor } from './auth.js';
+import { createToken, verifyToken, createPendingToken, verifyPendingToken, generateResetToken, consumeResetToken, consumeLegacyResetToken, recordResetFailure, hashSecretValue, initResetTokenStore, revokeResetTokensFor, MIN_PASSWORD_LENGTH } from './auth.js';
 import {
   initTwoFactorStore,
   issueChallenge,
@@ -1594,7 +1595,12 @@ const app = express();
 // TRA-404 — behind Render's proxy the socket address is the proxy, not the
 // client. Trust the X-Forwarded-For chain so `req.ip` is the real caller IP
 // (used to key the auth-endpoint brute-force throttle).
-app.set('trust proxy', true);
+//
+// TRA-4479 — but as a HOP COUNT, not `true`. `true` trusts the entire chain and
+// makes `req.ip` the LEFTMOST X-Forwarded-For entry, which the caller writes —
+// so every per-IP throttle below was one header away from a fresh bucket. See
+// `resolveTrustProxy` for the measurement.
+app.set('trust proxy', resolveTrustProxy(process.env['TRUST_PROXY_HOPS']));
 
 // ── Security headers ─────────────────────────────────────────────────────────
 
@@ -9495,8 +9501,8 @@ app.post('/api/auth/signup', async (req, res) => {
     res.status(400).json({ error: 'A valid email address is required' });
     return;
   }
-  if (typeof password !== 'string' || password.length < 6) {
-    res.status(400).json({ error: 'Password must be at least 6 characters' });
+  if (typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH) {
+    res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` });
     return;
   }
   // TRA-2407 — reserve the operator book names. The demo-calendar fill scope
@@ -9586,9 +9592,19 @@ app.post('/api/auth/forgot-password', async (req, res) => {
   // TRA-404 / C2 — throttle by IP to stop reset-email flooding. Every request
   // counts toward the limit (the endpoint always returns ok, so there is no
   // "success" to clear); honest users only ever call it once or twice.
+  //
+  // TRA-4479 — plus a per-ADDRESS bucket, so rotating source IPs no longer buys
+  // an unbounded mail-bomb against one inbox, and so an attacker cannot mint an
+  // unbounded number of outstanding codes for one account. Keyed by a keyed hash
+  // of the address: the throttle map should not become a directory of who has
+  // an account here. Both buckets are checked BEFORE `getUserByEmail`, so the
+  // work done (and therefore the latency) is identical for a known and an
+  // unknown address.
   const forgotKey = `forgot:ip:${clientKey(req)}`;
-  if (rejectIfThrottled(res, [forgotKey])) return;
+  const forgotAddrKey = `forgot:addr:${hashSecretValue(email.trim().toLowerCase())}`;
+  if (rejectIfThrottled(res, [forgotKey, forgotAddrKey])) return;
   recordFailure(forgotKey);
+  recordFailure(forgotAddrKey);
   const user = getUserByEmail(email);
   if (user) {
     const code = generateResetToken(user.username);
@@ -9603,29 +9619,58 @@ app.post('/api/auth/forgot-password', async (req, res) => {
   res.json({ ok: true, message: 'If an account with that email exists, a reset code has been sent.' });
 });
 
+/**
+ * TRA-4479 — a redemption must NAME the account it is aimed at.
+ *
+ * `username` is accepted as optional on the wire for exactly one reason: a
+ * client build that predates this change sends `{ code, newPassword }` and must
+ * still be able to finish a reset that was already in flight when the deploy
+ * landed. That path resolves ONLY against codes minted by the old store
+ * (`consumeLegacyResetToken`), which expire within an hour of the deploy and are
+ * never replenished — so the code-only lookup, and with it the union-of-all-
+ * accounts search space, removes itself. A code minted after this deploy is
+ * unreachable without its username.
+ */
 app.post('/api/auth/reset-password', async (req, res) => {
-  const { code, newPassword } = req.body as { code?: string; newPassword?: string };
+  const { code, newPassword, username } = req.body as {
+    code?: string;
+    newPassword?: string;
+    username?: string;
+  };
   if (typeof code !== 'string' || typeof newPassword !== 'string') {
     res.status(400).json({ error: 'code and newPassword are required' });
     return;
   }
-  if (newPassword.length < 6) {
-    res.status(400).json({ error: 'Password must be at least 6 characters' });
+  if (newPassword.length < MIN_PASSWORD_LENGTH) {
+    res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` });
     return;
   }
-  // TRA-404 / C2 — the reset code is an 8-digit number; throttle by IP so it
-  // cannot be brute-forced.
-  const resetKey = `reset:ip:${clientKey(req)}`;
-  if (rejectIfThrottled(res, [resetKey])) return;
+  const named = typeof username === 'string' ? normalizeUsername(username) : null;
 
-  const username = consumeResetToken(code);
-  if (!username) {
-    recordFailure(resetKey);
+  // TRA-404 / C2 — the reset code is an 8-digit number; throttle by IP so it
+  // cannot be brute-forced. TRA-4479 — per-IP is necessary and NOT sufficient:
+  // it only binds an attacker who cannot change source address, and until this
+  // ticket `req.ip` was itself caller-supplied. The bound that actually holds is
+  // `recordResetFailure` below, which burns the target account's outstanding
+  // code after RESET_MAX_ATTEMPTS wrong guesses no matter where they came from.
+  const resetKey = `reset:ip:${clientKey(req)}`;
+  const keys = named ? [resetKey, `reset:user:${named}`] : [resetKey];
+  if (rejectIfThrottled(res, keys)) return;
+
+  const redeemed = named ? consumeResetToken(code, named) : consumeLegacyResetToken(code);
+  if (!redeemed) {
+    for (const key of keys) recordFailure(key);
+    // A no-op for an account with nothing outstanding, so this stays silent
+    // about whether `named` exists.
+    if (named) recordResetFailure(named);
     res.status(400).json({ error: 'Invalid or expired reset code' });
     return;
   }
-  recordSuccess(resetKey);
-  await changeUserPassword(username, newPassword);
+  for (const key of keys) recordSuccess(key);
+  // Use the username the STORE holds, not the one the client typed: they differ
+  // only by normalization, and `changeUserPassword` matches the account name
+  // exactly.
+  await changeUserPassword(redeemed, newPassword);
   res.json({ ok: true, message: 'Password has been reset. You can now log in.' });
 });
 
@@ -9639,8 +9684,8 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
     res.status(400).json({ error: 'currentPassword and newPassword are required' });
     return;
   }
-  if (newPassword.length < 6) {
-    res.status(400).json({ error: 'New password must be at least 6 characters' });
+  if (newPassword.length < MIN_PASSWORD_LENGTH) {
+    res.status(400).json({ error: `New password must be at least ${MIN_PASSWORD_LENGTH} characters` });
     return;
   }
   if (!(await validateUserCredentials(username, currentPassword))) {
@@ -9791,8 +9836,8 @@ app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
     res.status(400).json({ error: 'username, email, and password are required' });
     return;
   }
-  if (password.length < 6) {
-    res.status(400).json({ error: 'Password must be at least 6 characters' });
+  if (password.length < MIN_PASSWORD_LENGTH) {
+    res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` });
     return;
   }
   // TRA-4475 — the canonical grammar, ahead of the reserve and (crucially) ahead
@@ -10005,8 +10050,8 @@ app.delete('/api/admin/users/:username', requireAuth, requireAdmin, async (req, 
 app.post('/api/admin/users/:username/password', requireAuth, requireAdmin, async (req, res) => {
   const { username } = req.params as Record<string, string>;
   const { newPassword } = req.body as { newPassword?: string };
-  if (typeof newPassword !== 'string' || newPassword.length < 6) {
-    res.status(400).json({ error: 'newPassword must be at least 6 characters' });
+  if (typeof newPassword !== 'string' || newPassword.length < MIN_PASSWORD_LENGTH) {
+    res.status(400).json({ error: `newPassword must be at least ${MIN_PASSWORD_LENGTH} characters` });
     return;
   }
   if (!getUser(username)) {

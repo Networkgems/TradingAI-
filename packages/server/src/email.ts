@@ -151,8 +151,19 @@ export async function sendNotificationEmail(opts: {
   });
 }
 
+/**
+ * TRA-4479 — the deep link now carries `reset_user` as well as `reset_code`.
+ * A reset is redeemed against username+code, so a link that carries only the
+ * code can no longer complete one. The plain-text body names the username for
+ * the same reason: someone typing the code by hand needs it too.
+ */
+export function buildResetLink(username: string, resetCode: string): string | null {
+  if (!APP_URL) return null;
+  return `${APP_URL}/?reset_code=${encodeURIComponent(resetCode)}&reset_user=${encodeURIComponent(username)}`;
+}
+
 function buildResetEmail(username: string, resetCode: string): { subject: string; text: string; html: string } {
-  const resetLink = APP_URL ? `${APP_URL}/?reset_code=${resetCode}` : null;
+  const resetLink = buildResetLink(username, resetCode);
   const subject = 'TradingAI — Password Reset';
 
   const text = [
@@ -161,8 +172,8 @@ function buildResetEmail(username: string, resetCode: string): { subject: string
     'You requested a password reset for your TradingAI account.',
     '',
     resetLink
-      ? `Click the link below to reset your password:\n${resetLink}\n\nOr enter this 8-digit code in the app:`
-      : 'Enter this 8-digit code in the app to set a new password:',
+      ? `Click the link below to reset your password:\n${resetLink}\n\nOr enter this 8-digit code in the app, for username "${username}":`
+      : `Enter this 8-digit code in the app, for username "${username}", to set a new password:`,
     '',
     `  ${resetCode}`,
     '',
@@ -181,6 +192,7 @@ function buildResetEmail(username: string, resetCode: string): { subject: string
        </p>
        <p style="color:#8b949e;font-size:13px;text-align:center;">Or enter this code manually in the app:</p>`
     : `<p style="color:#c9d1d9;font-size:14px;text-align:center;">Enter this code in the app to set a new password:</p>`;
+  const usernameHint = `<p style="color:#8b949e;font-size:13px;text-align:center;margin:0 0 8px;">Username: <strong style="color:#c9d1d9;">${username}</strong></p>`;
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -197,6 +209,7 @@ function buildResetEmail(username: string, resetCode: string): { subject: string
             You requested a password reset. Use the button or code below — it expires in <strong>1 hour</strong>.
           </p>
           ${linkBlock}
+          ${usernameHint}
           <div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:20px;text-align:center;margin:16px 0;">
             <span style="font-family:monospace;font-size:32px;font-weight:700;letter-spacing:8px;color:#3fb950;">${resetCode}</span>
           </div>
@@ -237,7 +250,8 @@ export async function sendPasswordResetEmail(
     // without SMTP can still complete a password reset.
     console.log(`[email] Password reset for ${username} <${toEmail}> — no SMTP configured.`);
     console.log(`[email]   Code: ${resetCode}`);
-    if (APP_URL) console.log(`[email]   Link: ${APP_URL}/?reset_code=${resetCode}`);
+    const devLink = buildResetLink(username, resetCode);
+    if (devLink) console.log(`[email]   Link: ${devLink}`);
     return;
   }
 
