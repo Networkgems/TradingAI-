@@ -5291,9 +5291,10 @@ export interface CryptoEngineState {
    * skips. Populated only on the live branch — undefined on demo, where the
    * paper account never skips for liquidity reasons.
    *
-   * TODO(TRA-249-E): wire a dashboard surface for this aggregate. Until E
-   * lands the field flows through the API but is not yet rendered; the
-   * existing per-signal `liveSkipReason` channel keeps the user informed.
+   * Rendered by `SkippedSignalsPanel` (mounted from `CryptoPositionsPanel`),
+   * alongside the existing per-signal `liveSkipReason` inline tag on the
+   * Signals panel. (TRA-249-E landed that surface; a stale TODO here said
+   * otherwise until TRA-4473's audit caught it.)
    */
   liveSkips?: LiveSkip[];
   /**
