@@ -163,6 +163,19 @@ export {
   TradierOrderClient,
   TradierOrderError, // TRA-4218 — carries the HTTP status so a 5xx is not read as a refusal
   isTransportOrderFailure, // TRA-4218
+  // TRA-4476 — the unknown-outcome state machine. `isSafeToResubmit` is the
+  // predicate `isTransportOrderFailure` was being misread as.
+  isSafeToResubmit,
+  TRADIER_SUBMIT_TIMEOUT_MS,
+  setOrderIntentJournal,
+  getOrderIntentJournal,
+  getUnknownIntentBreaker,
+  rehydrateBreakerFromJournal,
+  summarizeUnknownIntents,
+  reconcileIntent,
+  intentBreakerKey,
+  InMemoryOrderIntentJournal,
+  __resetUnknownIntentBreakerForTest,
   TradierOptionsClient,
   TradierStocksClient,
   tradierBaseUrl,
@@ -186,6 +199,19 @@ export {
 export type {
   TradierOrderSubmitEvent,
   TradierOrderSubmitObserver,
+  // TRA-4476
+  TradierCancelOutcome,
+  TradierSubmitOutcome,
+  OrderIntent,
+  OrderIntentJournal,
+  OrderIntentShape,
+  OrderIntentStatus,
+  IntentReconcileVerdict,
+  UnknownIntentSummary,
+  UnresolvedReason,
+  UnknownSubmitReason,
+  LatchReason,
+  LatchedIntent,
   TradierEnv,
   TradierBracketOrderParams,
   TradierOrderResponse,

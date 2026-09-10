@@ -2,6 +2,8 @@ export {
   TradierOrderClient,
   TradierOrderError, // TRA-4218
   isTransportOrderFailure, // TRA-4218
+  isSafeToResubmit, // TRA-4476 — the "may I submit again" predicate
+  TRADIER_SUBMIT_TIMEOUT_MS, // TRA-4476
   tradierBaseUrl,
   parseTradierEquityPositions,
   parseTradierOrderLegs,
@@ -19,7 +21,41 @@ export type {
   TradierOrderLeg,
   TradierOrderSubmitEvent,
   TradierOrderSubmitObserver,
+  TradierCancelOutcome, // TRA-4476
+  TradierSubmitOutcome, // TRA-4476
+  PostOrderOptions, // TRA-4476
 } from './order-client.js';
+// TRA-4476 — the unknown-outcome state machine.
+export {
+  InMemoryOrderIntentJournal,
+  UnknownIntentBreaker,
+  getOrderIntentJournal,
+  setOrderIntentJournal,
+  getUnknownIntentBreaker,
+  rehydrateBreakerFromJournal,
+  reconcileIntent,
+  summarizeUnknownIntents,
+  orderRowMatchesIntentShape,
+  intentBreakerKey,
+  shapeFromOrderBody,
+  newIntentId,
+  __resetUnknownIntentBreakerForTest,
+} from './order-intent.js';
+export type {
+  OrderIntent,
+  OrderIntentEnv,
+  OrderIntentShape,
+  OrderIntentStatus,
+  OrderIntentJournal,
+  OrderListRead,
+  ReconcilableOrderRow,
+  IntentReconcileVerdict,
+  UnresolvedReason,
+  UnknownSubmitReason,
+  LatchReason,
+  LatchedIntent,
+  UnknownIntentSummary,
+} from './order-intent.js';
 export {
   TradierOptionsClient,
   underlyingFromOcc,

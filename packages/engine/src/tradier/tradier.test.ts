@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { TradierOrderClient, tradierBaseUrl, parseTradierEquityPositions, parseTradierOrderLegs } from './order-client.js';
+import { __resetUnknownIntentBreakerForTest, setOrderIntentJournal } from './order-intent.js';
 import {
   TradierOptionsClient,
   isBrokerMaintenanceZeroBalances,
@@ -33,6 +34,13 @@ function callInit(idx: number): RequestInit {
 beforeEach(() => {
   fetchMock = vi.fn(async () => jsonResponse({}));
   globalThis.fetch = fetchMock as unknown as typeof fetch;
+  // TRA-4476 — the unknown-intent breaker is a process-wide singleton (see its
+  // docblock for why it has to be). Without this reset a test that drives a 5xx
+  // latches the shape and the NEXT test submitting the same symbol/side/qty is
+  // correctly halted — which is the state machine working, arriving as a
+  // mystery failure three tests later.
+  __resetUnknownIntentBreakerForTest();
+  setOrderIntentJournal(null);
 });
 
 afterEach(() => {

@@ -1,4 +1,18 @@
 import type { Side } from '@trading-app/shared';
+import {
+  type IntentReconcileVerdict,
+  type LatchReason,
+  type OrderIntent,
+  type OrderListRead,
+  type ReconcilableOrderRow,
+  type UnknownSubmitReason,
+  getOrderIntentJournal,
+  getUnknownIntentBreaker,
+  intentBreakerKey,
+  newIntentId,
+  reconcileIntent,
+  shapeFromOrderBody,
+} from './order-intent.js';
 
 export type TradierEnv = 'sandbox' | 'production';
 
@@ -40,31 +54,91 @@ export interface TradierOrderResponse {
  *
  * The `message` format is unchanged on purpose: `exitErrorReason` strings from
  * it are already on persisted rows and on the dashboard.
+ *
+ * ---
+ *
+ * TRA-4476 — **`kind` answers the BUDGET question. It does NOT answer the
+ * EXPOSURE question, and it was being read as though it did.**
+ *
+ * The `transport` docblock above asserts the broker "never decided". For the
+ * purpose it was written for — should this consume the TRA-450 refusal budget —
+ * that is right, and every `kind` value below is byte-for-byte what TRA-4218
+ * shipped. But a socket can reset, and a 500 can be returned, *after* Tradier has
+ * accepted the order. So `transport` does not license a resubmit, and it was
+ * being used as if it did.
+ *
+ * {@link outcome} is the second, orthogonal axis:
+ *
+ *  - `refused` — the broker read the order and declined it. **Provably no order
+ *    exists.** Only a 4xx or an `errors` envelope earns this.
+ *  - `not_placed` — the broker did not decide, AND a reconcile against
+ *    `/accounts/{id}/orders` positively demonstrated our order is absent from a
+ *    list that provably covers our submit instant. Resubmit is safe.
+ *  - `unknown` — an order may exist. Resubmit of this shape is HALTED until a
+ *    reconcile resolves it. See `order-intent.ts`.
+ *
+ * A failure is routinely `kind: 'transport'` (do not count a refusal) **and**
+ * `outcome: 'unknown'` (do not resubmit) at once. Collapsing them onto one axis
+ * is what let the ladder retry into a live order.
  */
 export class TradierOrderError extends Error {
   readonly kind: 'transport' | 'refused' | 'malformed';
 
   readonly status?: number;
 
+  /** TRA-4476 — the exposure axis. See the class docblock. */
+  readonly outcome: 'refused' | 'not_placed' | 'unknown';
+
+  /** TRA-4476 — the durable intent this submit was journalled under. */
+  readonly intentId?: string;
+
+  /** TRA-4476 — populated when `outcome` is `unknown`: where we lost sight. */
+  readonly unknownReason?: UnknownSubmitReason;
+
+  /** TRA-4476 — the reconcile verdict, when one was reached. */
+  readonly reconcile?: IntentReconcileVerdict;
+
   constructor(
     message: string,
     kind: 'transport' | 'refused' | 'malformed',
     status?: number,
+    detail: {
+      outcome?: 'refused' | 'not_placed' | 'unknown';
+      intentId?: string;
+      unknownReason?: UnknownSubmitReason;
+      reconcile?: IntentReconcileVerdict;
+      cause?: unknown;
+    } = {},
   ) {
     super(message);
     this.name = 'TradierOrderError';
     this.kind = kind;
     this.status = status;
+    // Default the exposure axis off the budget axis so an error minted by older
+    // code (or a test) is never silently treated as "provably nothing happened":
+    // only an explicit `refused` kind maps to a provable no-order.
+    this.outcome = detail.outcome ?? (kind === 'refused' ? 'refused' : 'unknown');
+    this.intentId = detail.intentId;
+    this.unknownReason = detail.unknownReason;
+    this.reconcile = detail.reconcile;
+    if (detail.cause !== undefined) (this as { cause?: unknown }).cause = detail.cause;
   }
 }
 
 /**
- * TRA-4218 — classify a thrown submit. Returns true when the broker never
- * reached a decision, so the failure must NOT consume a rejection budget.
+ * TRA-4218 — classify a thrown submit. Returns true when the failure must NOT
+ * consume a rejection budget.
  *
  * Defaults to `false` for anything unrecognised: an unknown throw is treated as
- * a refusal, which is the conservative side (it can only stop us trading, never
- * make us spray orders at a broker that is refusing them).
+ * a refusal, which is the conservative side FOR THE BUDGET (it can only stop us
+ * trading, never make us spray orders at a broker that is refusing them).
+ *
+ * ⚠ TRA-4476 — **this is not the "is it safe to resubmit" predicate and never
+ * was.** Its `true` answer means "the broker did not refuse", which is a
+ * strictly weaker claim than "no order exists". Read
+ * {@link TradierOrderError.outcome} for that question; `'not_placed'` is the
+ * only value that licenses a resubmit, and reaching it costs a broker round trip
+ * the caller does not have to make (`postOrder` has already made it).
  */
 export function isTransportOrderFailure(err: unknown): boolean {
   if (err instanceof TradierOrderError) return err.kind === 'transport';
@@ -72,6 +146,17 @@ export function isTransportOrderFailure(err: unknown): boolean {
   // broker either. Node surfaces these as a bare `TypeError: fetch failed`.
   if (err instanceof TypeError) return true;
   return false;
+}
+
+/**
+ * TRA-4476 — is it safe to submit this order again?
+ *
+ * The predicate `isTransportOrderFailure` was standing in for, incorrectly.
+ * Answers `false` for anything it does not positively recognise as safe.
+ */
+export function isSafeToResubmit(err: unknown): boolean {
+  if (!(err instanceof TradierOrderError)) return false;
+  return err.outcome === 'refused' || err.outcome === 'not_placed';
 }
 
 /**
@@ -392,6 +477,102 @@ function bodyNumber(body: URLSearchParams, ...keys: string[]): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * TRA-4476 — the confirmed outcome of {@link TradierOrderClient.cancelOrderConfirmed}.
+ *
+ * `ackStatus` / `ackError` record what the DELETE itself did. They are kept for
+ * the operator and are deliberately NOT part of the verdict: the whole point of
+ * this type is that the DELETE's status code does not decide anything.
+ */
+export type TradierCancelOutcome =
+  | {
+      kind: 'canceled';
+      /** The terminal state actually reached: `canceled` / `rejected` / `expired` / `error`. */
+      terminalStatus: string;
+      ackStatus: number | null;
+      ackError: string | null;
+      detail: TradierOrderDetail;
+      /** Executed before the cancel landed. `null` = UNMEASURED, never zero. */
+      filledQty: number | null;
+    }
+  | {
+      kind: 'filled';
+      ackStatus: number | null;
+      ackError: string | null;
+      detail: TradierOrderDetail;
+      filledQty: number | null;
+    }
+  | {
+      kind: 'unknown';
+      reason: 'still_working' | 'status_unreadable';
+      ackStatus: number | null;
+      ackError: string | null;
+      detail: TradierOrderDetail | null;
+      filledQty: null;
+    };
+
+/**
+ * TRA-4476 — the outcome of a submit, as a value rather than a return-or-throw.
+ *
+ * `postOrder` keeps its throwing contract (every caller in the tree depends on
+ * it), so this is what {@link TradierOrderClient.submitOrderWithOutcome} returns
+ * for callers that want to branch instead of catch.
+ */
+export type TradierSubmitOutcome =
+  | {
+      kind: 'acknowledged';
+      order: TradierOrderResponse;
+      intent: OrderIntent;
+      /**
+       * True when the ack did not come from the POST response but was RECOVERED
+       * by reconciling a lost response against the broker's order list. The order
+       * is just as real; the flag exists so the operator can see it happened.
+       */
+      recovered: boolean;
+    }
+  | { kind: 'refused'; error: TradierOrderError; intent: OrderIntent }
+  | { kind: 'not_placed'; error: TradierOrderError; intent: OrderIntent }
+  | { kind: 'unknown'; error: TradierOrderError; intent: OrderIntent; latchReason: LatchReason };
+
+/**
+ * TRA-4476 — how long a submit POST may hang before we abort it.
+ *
+ * There was no bound at all: a submit that hung held the tick forever and had no
+ * outcome, unknown or otherwise. 15s is well past Tradier's observed risk-check
+ * pipeline (<2s per TRA-319) so a healthy order is never cut off, and an abort
+ * lands in `unknown` — never in "nothing happened" — so the bound cannot itself
+ * manufacture a duplicate.
+ */
+export const TRADIER_SUBMIT_TIMEOUT_MS = 15_000;
+
+/**
+ * TRA-4476 — did a reconciled order actually put on exposure?
+ *
+ * `terminal` alone is not the question. A terminal `canceled` order left nothing
+ * behind and the shape is free; a terminal `filled` one IS a position, and
+ * treating the two the same is how releasing a halt turns into a second order on
+ * top of a realised fill.
+ *
+ * A reported `exec_quantity` of zero is a real zero here (the broker answered);
+ * an UNREPORTED one is `null` and must not be read as zero (TRA-1707), so it
+ * counts as a fill for the purpose of holding back — the cautious direction.
+ */
+function reconcileFoundAFill(verdict: IntentReconcileVerdict): boolean {
+  if (verdict.kind !== 'placed') return false;
+  if (verdict.rows.some((r) => r.status.trim().toLowerCase() === 'filled')) return true;
+  if (verdict.filledQty === null) return true; // unmeasured ⇒ assume exposure
+  return verdict.filledQty > 0;
+}
+
+export interface PostOrderOptions {
+  /** Override {@link TRADIER_SUBMIT_TIMEOUT_MS}. Tests pass a short one. */
+  timeoutMs?: number;
+  /** Clock seam. */
+  now?: () => number;
+  /** Broker-vs-local clock skew tolerance for the reconcile window. */
+  clockSkewMs?: number;
+}
+
 export class TradierOrderClient {
   protected readonly baseUrl: string;
   protected readonly accountId: string;
@@ -453,6 +634,21 @@ export class TradierOrderClient {
     return this.postOrder(body);
   }
 
+  /**
+   * ⚠ TRA-4476 — **this method cannot tell you the order is gone.** It reports
+   * whether the DELETE was *accepted*, and it swallows 404 and 422 as success.
+   *
+   * 404/422 are exactly the statuses Tradier returns when the order terminated
+   * between our last poll and this call — but "terminated" includes **`filled`**.
+   * Treating them as a successful cancel is how a partially- or fully-filled
+   * order gets replaced by a fresh full-quantity order and the aggregate
+   * exposure ends up above what was requested.
+   *
+   * Kept as-is for the callers that genuinely only want best-effort cleanup and
+   * do not branch on the result. **Anything that replaces, re-prices or resizes
+   * the order afterwards must use {@link cancelOrderConfirmed} instead**, which
+   * requires a terminal state and tells you which one.
+   */
   async cancelOrder(orderId: string | number): Promise<void> {
     const resp = await fetch(
       `${this.baseUrl}/accounts/${encodeURIComponent(this.accountId)}/orders/${encodeURIComponent(String(orderId))}`,
@@ -461,6 +657,84 @@ export class TradierOrderClient {
     if (!resp.ok && resp.status !== 422 && resp.status !== 404) {
       throw new Error(`Tradier cancel failed (${resp.status})`);
     }
+  }
+
+  /**
+   * TRA-4476 — cancel an order and CONFIRM it reached a terminal state.
+   *
+   * `waitForOrderTerminalStatus` (TRA-319) already existed and is the right
+   * primitive; the cancel path simply never used it. The DELETE's status code is
+   * treated as a *request acknowledgement only* — including 404 and 422, which
+   * are not evidence of anything on their own — and the verdict comes from
+   * polling the order's own status afterwards.
+   *
+   * The outcome the caller must branch on:
+   *
+   *  - `canceled` — terminal and unfilled-or-partial. `filledQty` is what the
+   *    broker says executed before the cancel landed; a replacement must be net
+   *    of it, not the original quantity.
+   *  - `filled` — **the cancel lost the race.** The order is done. There is
+   *    nothing to replace and replacing it doubles the position.
+   *  - `unknown` — the order did not reach a terminal state inside the window,
+   *    or its status could not be read. The caller must NOT replace it.
+   *
+   * Note `filledQty` is `null`, never `0`, when the broker did not report an
+   * executed quantity (TRA-1707): unmeasured and zero are different facts and
+   * only one of them is safe to size a replacement from.
+   */
+  async cancelOrderConfirmed(
+    orderId: string | number,
+    options: { timeoutMs?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+  ): Promise<TradierCancelOutcome> {
+    let ackStatus: number | null = null;
+    let ackError: string | null = null;
+    try {
+      const resp = await fetch(
+        `${this.baseUrl}/accounts/${encodeURIComponent(this.accountId)}/orders/${encodeURIComponent(String(orderId))}`,
+        { method: 'DELETE', headers: this.headers },
+      );
+      ackStatus = resp.status;
+    } catch (err) {
+      // A DELETE that threw may still have been served. That is precisely why
+      // the verdict comes from the status poll and not from here.
+      ackError = err instanceof Error ? err.message : String(err);
+    }
+
+    const detail = await this.waitForOrderTerminalStatus(orderId, {
+      timeoutMs: options.timeoutMs ?? 6000,
+      intervalMs: options.intervalMs,
+      sleep: options.sleep,
+    });
+
+    if (detail === null) {
+      return {
+        kind: 'unknown',
+        reason: 'status_unreadable',
+        ackStatus,
+        ackError,
+        detail: null,
+        filledQty: null,
+      };
+    }
+    const status = detail.status.trim().toLowerCase();
+    if (!TRADIER_TERMINAL_STATUSES.has(status)) {
+      return {
+        kind: 'unknown',
+        reason: 'still_working',
+        ackStatus,
+        ackError,
+        detail,
+        filledQty: null,
+      };
+    }
+    const filledQty =
+      typeof detail.exec_quantity === 'number' && Number.isFinite(detail.exec_quantity)
+        ? detail.exec_quantity
+        : null;
+    if (status === 'filled') {
+      return { kind: 'filled', ackStatus, ackError, detail, filledQty };
+    }
+    return { kind: 'canceled', terminalStatus: status, ackStatus, ackError, detail, filledQty };
   }
 
   /**
@@ -639,66 +913,411 @@ export class TradierOrderClient {
     return this.postOrder(body);
   }
 
-  protected async postOrder(body: URLSearchParams): Promise<TradierOrderResponse> {
-    const resp = await fetch(
-      `${this.baseUrl}/accounts/${encodeURIComponent(this.accountId)}/orders`,
-      { method: 'POST', headers: this.headers, body: body.toString() },
-    );
+  /**
+   * TRA-4476 — read `/accounts/{id}/orders` in a form that can say it FAILED.
+   *
+   * `TradierOptionsClient.listOrders()` returns `[]` on auth/network failure and
+   * its own docblock names that ambiguity as by-construction. The reconcile
+   * cannot consume it: `[]` read as "no order exists" licenses an immediate
+   * resubmit into a live order. This is the same fetch with the discriminator
+   * kept.
+   */
+  protected async listOrdersForReconcile(): Promise<OrderListRead> {
+    let resp: Response;
+    try {
+      resp = await fetch(
+        `${this.baseUrl}/accounts/${encodeURIComponent(this.accountId)}/orders?includeTags=true`,
+        { method: 'GET', headers: { Authorization: this.headers.Authorization, Accept: 'application/json' } },
+      );
+    } catch (err) {
+      return { ok: false, reason: `orders fetch threw: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    if (!resp.ok) return { ok: false, reason: `orders read HTTP ${resp.status}` };
+    let data: unknown;
+    try {
+      data = await resp.json();
+    } catch (err) {
+      return { ok: false, reason: `orders body unparseable: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    try {
+      // Dynamic import, deliberately. `parseTradierOrders` lives in
+      // `options-client.ts`, which `extends` this class at module top level — a
+      // static import edge back would be a genuine ESM evaluation cycle (the
+      // subclass's `extends` clause would hit the base class in its TDZ), not
+      // merely a type one. This runs only after a submit already went unknown,
+      // so a cold path's one-time module resolution costs nothing, and it keeps
+      // ONE parser for this envelope rather than a second copy that can drift.
+      const { parseTradierOrders } = await import('./options-client.js');
+      return { ok: true, orders: parseTradierOrders(data as never) as ReconcilableOrderRow[] };
+    } catch (err) {
+      return { ok: false, reason: `orders parse failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
 
+  /**
+   * TRA-4476 — resolve one intent against the broker and move the breaker.
+   * Returns the verdict so callers (and the health surface) can report it.
+   */
+  protected async reconcileOneIntent(
+    intent: OrderIntent,
+    options: PostOrderOptions = {},
+  ): Promise<IntentReconcileVerdict> {
+    const now = options.now ?? Date.now;
+    const read = await this.listOrdersForReconcile();
+    const verdict = reconcileIntent(intent, read, {
+      now: now(),
+      ...(options.clockSkewMs !== undefined ? { clockSkewMs: options.clockSkewMs } : {}),
+    });
+    const key = intentBreakerKey(intent.accountId, intent.shape);
+    const journal = getOrderIntentJournal();
+    const brk = getUnknownIntentBreaker();
+
+    if (verdict.kind === 'placed' && verdict.terminal) {
+      // The order exists and is DONE. Nothing is working, so nothing is at risk
+      // from a later submit of the same shape — release the halt.
+      journal.update({ ...intent, status: 'acknowledged', orderId: verdict.orderId, updatedAt: now() });
+      brk.clear(key);
+      return verdict;
+    }
+    if (verdict.kind === 'placed') {
+      // Alive and non-terminal. The invariant is explicit that a replacement
+      // requires a terminal state first, so this HOLDS the halt rather than
+      // clearing it — even though we now know exactly which order it is.
+      journal.update({ ...intent, status: 'acknowledged', orderId: verdict.orderId, updatedAt: now() });
+      brk.latch(key, { intent, reason: 'order_working', latchedAt: now() });
+      return verdict;
+    }
+    if (verdict.kind === 'not_placed') {
+      journal.update({ ...intent, status: 'not_placed', updatedAt: now() });
+      brk.clear(key);
+      return verdict;
+    }
+    journal.update({ ...intent, status: 'unknown', updatedAt: now() });
+    brk.latch(key, { intent, reason: verdict.reason, latchedAt: now() });
+    return verdict;
+  }
+
+  /**
+   * TRA-4476 — submit, and return the outcome as a value.
+   *
+   * The state machine, in order:
+   *
+   *  1. **Halt check.** If this account already holds an unresolved unknown of
+   *     this shape, try once to resolve it. If it still will not resolve, refuse
+   *     to submit. This is the "one economic order per intent" guarantee.
+   *  2. **Journal the intent BEFORE the POST.** `submitStartedAt` is stamped here
+   *     and nowhere later — a timestamp taken after the failure would exclude the
+   *     very order we would then be hunting for.
+   *  3. **POST under a bounded timeout.**
+   *  4. **Classify** into `acknowledged` / `refused` / `unknown`, at the stage
+   *     that failed rather than by inspecting an exception type after the fact.
+   *  5. On `unknown`, **reconcile**, and latch the breaker unless the reconcile
+   *     resolved to a terminal or absent order.
+   */
+  protected async submitOrderWithOutcome(
+    body: URLSearchParams,
+    options: PostOrderOptions = {},
+  ): Promise<TradierSubmitOutcome> {
+    const now = options.now ?? Date.now;
+    const shape = shapeFromOrderBody(body);
+    const key = intentBreakerKey(this.accountId, shape);
+    const journal = getOrderIntentJournal();
+    const brk = getUnknownIntentBreaker();
+
+    // ── 1. the halt ────────────────────────────────────────────────────────
+    const latched = brk.get(key);
+    if (latched) {
+      const verdict = await this.reconcileOneIntent(latched.intent, options);
+
+      // The order we lost turns out to have FILLED. Clearing the halt and
+      // letting this submit through would place a SECOND order on top of a
+      // realised position — the exact duplication this breaker exists to stop,
+      // arrived at through the resolve path instead of the retry path.
+      //
+      // So the fill is DELIVERED to the caller as a recovered acknowledgement
+      // rather than silently released. `reconcileOneIntent` has already cleared
+      // the latch (a filled order is terminal — nothing is working), which makes
+      // this a one-shot: the caller is told exactly once, and a later submit of
+      // the same shape is ordinary new business.
+      if (verdict.kind === 'placed' && verdict.terminal && reconcileFoundAFill(verdict)) {
+        const recovered: TradierOrderResponse = {
+          id: verdict.orderId,
+          status: verdict.rows[0]?.status ?? 'filled',
+        };
+        this.emitSubmitObserved(new URLSearchParams(), recovered.id, recovered.status, latched.intent);
+        return { kind: 'acknowledged', order: recovered, intent: latched.intent, recovered: true };
+      }
+
+      const stillLatched = brk.get(key);
+      if (stillLatched) {
+        brk.countHalt();
+        const error = new TradierOrderError(
+          `Tradier submit halted: an earlier order of this shape has an unresolved outcome `
+          + `(intent ${stillLatched.intent.intentId}, ${stillLatched.reason}). `
+          + `Resubmitting could duplicate live exposure.`,
+          // Not a refusal — the broker never saw this attempt, so this must not
+          // consume the TRA-450 rejection budget.
+          'transport',
+          undefined,
+          {
+            outcome: 'unknown',
+            intentId: stillLatched.intent.intentId,
+            reconcile: verdict,
+          },
+        );
+        return { kind: 'unknown', error, intent: stillLatched.intent, latchReason: stillLatched.reason };
+      }
+    }
+
+    // ── 2. the durable pre-submit record ───────────────────────────────────
+    const intent: OrderIntent = {
+      intentId: newIntentId(now()),
+      accountId: this.accountId,
+      env: this.env,
+      submitStartedAt: now(),
+      shape,
+      status: 'submitting',
+      updatedAt: now(),
+    };
+    try {
+      journal.record(intent);
+    } catch {
+      // The journal must never turn a healthy order into a failure. A journal
+      // that is failing degrades us to the pre-TRA-4476 behaviour, which is the
+      // status quo, not a new hazard — and the server-side journal counts its
+      // own write failures on its own side.
+    }
+
+    // ── 3. the bounded POST ────────────────────────────────────────────────
+    const timeoutMs = options.timeoutMs ?? TRADIER_SUBMIT_TIMEOUT_MS;
+    let resp: Response;
+    try {
+      resp = await fetch(
+        `${this.baseUrl}/accounts/${encodeURIComponent(this.accountId)}/orders`,
+        {
+          method: 'POST',
+          headers: this.headers,
+          body: body.toString(),
+          signal: AbortSignal.timeout(timeoutMs),
+        },
+      );
+    } catch (err) {
+      // The message is preserved VERBATIM: `exitErrorReason` strings derived
+      // from it are already on persisted rows and on the dashboard (TRA-4218).
+      const isAbort =
+        err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
+      return this.finishUnknown(
+        intent,
+        err instanceof Error ? err.message : String(err),
+        isAbort ? 'timeout' : 'network_throw',
+        undefined,
+        err,
+        options,
+      );
+    }
+
+    // ── 4. classify ────────────────────────────────────────────────────────
     if (!resp.ok) {
-      const text = await resp.text();
+      const text = await resp.text().catch(() => '');
       // TRA-4218 — same message, but the STATUS now rides the throw so the exit
       // path can tell "the broker refused this contract" from "the broker's
       // backend fell over". Those take opposite remedies.
-      throw new TradierOrderError(
-        `Tradier order failed (${resp.status}): ${text}`,
-        isTransportStatus(resp.status) ? 'transport' : 'refused',
+      const message = `Tradier order failed (${resp.status}): ${text}`;
+      if (isTransportStatus(resp.status)) {
+        // TRA-4476 — 5xx/429/408. The broker's edge answered; its order book may
+        // still have taken the order. `kind` stays `transport` so the refusal
+        // budget is untouched, exactly as before.
+        return this.finishUnknown(
+          intent, message, 'broker_transport_status', resp.status, undefined, options,
+        );
+      }
+      // A 4xx IS the broker deciding. Provably no order.
+      const error = new TradierOrderError(message, 'refused', resp.status, {
+        outcome: 'refused',
+        intentId: intent.intentId,
+      });
+      this.settleIntent(intent, 'refused', message, now);
+      return { kind: 'refused', error, intent };
+    }
+
+    let data: TradierOrderEnvelope;
+    try {
+      data = (await resp.json()) as TradierOrderEnvelope;
+    } catch (err) {
+      // A 2xx we could not read is OUR blindness, not the broker's refusal.
+      return this.finishUnknown(
+        intent,
+        `Tradier order response unreadable: ${err instanceof Error ? err.message : String(err)}`,
+        'unreadable_response',
         resp.status,
+        err,
+        options,
       );
     }
 
-    const data = (await resp.json()) as TradierOrderEnvelope;
     const errors = data.errors?.error ?? data.order?.errors?.error;
     if (errors) {
       const msg = Array.isArray(errors) ? errors.join('; ') : errors;
-      throw new TradierOrderError(`Tradier order rejected: ${msg}`, 'refused', resp.status);
+      const message = `Tradier order rejected: ${msg}`;
+      const error = new TradierOrderError(message, 'refused', resp.status, {
+        outcome: 'refused',
+        intentId: intent.intentId,
+      });
+      this.settleIntent(intent, 'refused', message, now);
+      return { kind: 'refused', error, intent };
     }
     if (!data.order) {
-      throw new TradierOrderError(
+      // TRA-4476 — this used to sit beside the refusals as `malformed`. A 2xx is
+      // the broker saying it succeeded; a payload we cannot find is not a
+      // refusal. `kind` stays `malformed` so the budget axis is byte-identical
+      // to TRA-4218; the EXPOSURE axis moves to `unknown`, where it belongs.
+      return this.finishUnknown(
+        intent,
         'Tradier order response missing order payload',
-        'malformed',
+        'missing_order_payload',
         resp.status,
+        undefined,
+        options,
+        'malformed',
       );
     }
-    // TRA-3939 — THE SUBMIT-TIME ID CHOKEPOINT. Emitted here, after the broker has
-    // acknowledged an id and before this returns to any caller, so a walk step we
-    // are about to cancel is recorded exactly like the one that fills.
-    //
-    // Isolated from the order path entirely: a recorder that throws must never
-    // turn an ACKNOWLEDGED live order into a caller-visible failure — the caller
-    // would void a paper open for a real order that is working at the broker. The
-    // observer counts its own failures on its own side (see
-    // `tra3939-order-provenance-capture.ts`); a swallow that nothing counts is the
-    // silent-clean shape this codebase keeps paying for.
-    if (orderSubmitObserver !== null && typeof data.order.id === 'number') {
-      try {
-        orderSubmitObserver({
-          orderId: data.order.id,
-          ackStatus: typeof data.order.status === 'string' ? data.order.status : 'unknown',
-          env: this.env,
-          accountId: this.accountId,
-          orderClass: bodyString(body, 'class'),
-          side: bodyString(body, 'side', 'side[0]'),
-          symbol: bodyString(body, 'symbol', 'symbol[0]'),
-          optionSymbol: bodyString(body, 'option_symbol', 'option_symbol[0]'),
-          quantity: bodyNumber(body, 'quantity', 'quantity[0]'),
-          limitPrice: bodyNumber(body, 'price', 'price[0]'),
-          submittedAt: Date.now(),
-        });
-      } catch {
-        // never into the order path
-      }
+
+    this.emitSubmitObserved(body, data.order.id, data.order.status);
+    this.settleIntent(intent, 'acknowledged', undefined, now, data.order.id);
+    return { kind: 'acknowledged', order: data.order, intent, recovered: false };
+  }
+
+  /** TRA-4476 — write a terminal status onto the journalled intent. Never throws. */
+  private settleIntent(
+    intent: OrderIntent,
+    status: OrderIntent['status'],
+    detail: string | undefined,
+    now: () => number,
+    orderId?: number,
+  ): void {
+    try {
+      getOrderIntentJournal().update({
+        ...intent,
+        status,
+        updatedAt: now(),
+        ...(orderId !== undefined ? { orderId } : {}),
+        ...(detail !== undefined ? { detail } : {}),
+      });
+    } catch {
+      // see `journal.record` above — never into the order path
     }
-    return data.order;
+  }
+
+  /**
+   * TRA-4476 — the `unknown` branch: reconcile, then decide whether the halt
+   * engages. A reconcile that RECOVERS the order returns an `acknowledged`
+   * outcome, which is the whole point — a response lost after the broker
+   * accepted now resolves to the real order instead of a phantom retry.
+   */
+  private async finishUnknown(
+    intent: OrderIntent,
+    message: string,
+    reason: UnknownSubmitReason,
+    status: number | undefined,
+    cause: unknown,
+    options: PostOrderOptions,
+    kind: 'transport' | 'malformed' = 'transport',
+  ): Promise<TradierSubmitOutcome> {
+    const now = options.now ?? Date.now;
+    this.settleIntent({ ...intent, unknownReason: reason }, 'unknown', message, now);
+    const verdict = await this.reconcileOneIntent({ ...intent, unknownReason: reason }, options);
+
+    if (verdict.kind === 'placed') {
+      // The broker HAS the order. Recover the id and hand the caller a real ack.
+      const recovered: TradierOrderResponse = {
+        id: verdict.orderId,
+        status: verdict.rows[0]?.status ?? 'unknown',
+      };
+      // The submit observer's contract is "every id the broker acknowledged,
+      // seen exactly once" (TRA-3939). An id we recovered qualifies, and it is
+      // the case its own docblock says it could not capture.
+      this.emitSubmitObserved(new URLSearchParams(), recovered.id, recovered.status, intent);
+      return { kind: 'acknowledged', order: recovered, intent, recovered: true };
+    }
+
+    if (verdict.kind === 'not_placed') {
+      const error = new TradierOrderError(message, kind, status, {
+        outcome: 'not_placed',
+        intentId: intent.intentId,
+        unknownReason: reason,
+        reconcile: verdict,
+        cause,
+      });
+      return { kind: 'not_placed', error, intent };
+    }
+
+    const error = new TradierOrderError(message, kind, status, {
+      outcome: 'unknown',
+      intentId: intent.intentId,
+      unknownReason: reason,
+      reconcile: verdict,
+      cause,
+    });
+    return { kind: 'unknown', error, intent, latchReason: verdict.reason };
+  }
+
+  /**
+   * TRA-3939 — THE SUBMIT-TIME ID CHOKEPOINT. Emitted after the broker has
+   * acknowledged an id and before the order returns to any caller, so a walk step
+   * we are about to cancel is recorded exactly like the one that fills.
+   *
+   * Isolated from the order path entirely: a recorder that throws must never turn
+   * an ACKNOWLEDGED live order into a caller-visible failure — the caller would
+   * void a paper open for a real order that is working at the broker. The
+   * observer counts its own failures on its own side (see
+   * `tra3939-order-provenance-capture.ts`); a swallow that nothing counts is the
+   * silent-clean shape this codebase keeps paying for.
+   *
+   * TRA-4476 — `intent` is passed on the RECOVERED path, where the submitted body
+   * is not to hand but the intent's shape carries the same fields.
+   */
+  private emitSubmitObserved(
+    body: URLSearchParams,
+    orderId: unknown,
+    ackStatus: unknown,
+    intent?: OrderIntent,
+  ): void {
+    if (orderSubmitObserver === null || typeof orderId !== 'number') return;
+    try {
+      orderSubmitObserver({
+        orderId,
+        ackStatus: typeof ackStatus === 'string' ? ackStatus : 'unknown',
+        env: this.env,
+        accountId: this.accountId,
+        orderClass: intent?.shape.orderClass ?? bodyString(body, 'class'),
+        side: intent?.shape.side ?? bodyString(body, 'side', 'side[0]'),
+        symbol: intent?.shape.symbol ?? bodyString(body, 'symbol', 'symbol[0]'),
+        optionSymbol: intent?.shape.optionSymbol ?? bodyString(body, 'option_symbol', 'option_symbol[0]'),
+        quantity: intent?.shape.quantity ?? bodyNumber(body, 'quantity', 'quantity[0]'),
+        limitPrice: intent?.shape.limitPrice ?? bodyNumber(body, 'price', 'price[0]'),
+        submittedAt: Date.now(),
+      });
+    } catch {
+      // never into the order path
+    }
+  }
+
+  /**
+   * Submit an order, throwing on anything but an acknowledgement.
+   *
+   * The throwing contract is unchanged — every caller in the tree depends on it,
+   * and `kind` on the thrown {@link TradierOrderError} is byte-for-byte what
+   * TRA-4218 shipped. What TRA-4476 adds rides on `outcome`, and on the fact that
+   * an unknown outcome has now already been reconciled and may have HALTED this
+   * shape. Callers that want to branch rather than catch use
+   * {@link submitOrderWithOutcome}.
+   */
+  protected async postOrder(
+    body: URLSearchParams,
+    options: PostOrderOptions = {},
+  ): Promise<TradierOrderResponse> {
+    const outcome = await this.submitOrderWithOutcome(body, options);
+    if (outcome.kind === 'acknowledged') return outcome.order;
+    throw outcome.error;
   }
 }

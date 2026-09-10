@@ -371,6 +371,12 @@ import {
 } from './tra3932-open-leg-provenance.js';
 // TRA-3926 — the durable carrier for judgements the 30-day tape will outlive.
 import { setJudgedOversoldDataDir } from './tra3926-judged-oversold-store.js';
+// TRA-4476 — the durable half of the unknown-outcome state machine: a pre-submit
+// intent journal that survives a restart, and the health readout for the halt.
+import {
+  installOrderIntentJournal,
+  orderIntentHealth,
+} from './tra4476-order-intent-journal.js';
 // TRA-3939 — the two captures that make the question above ANSWERABLE next time:
 // a submit-time order-id ledger and a daily capture of the broker's one-day
 // order window.
@@ -5284,6 +5290,27 @@ armEngineSubmitRecorder({
   commit: process.env.RENDER_GIT_COMMIT ?? null,
 });
 setTradierOrderSubmitObserver(recordEngineOrderSubmit);
+
+// TRA-4476 — install the DURABLE order-intent journal and re-latch anything the
+// previous process left outstanding, BEFORE any client can submit.
+//
+// The ordering matters: `rehydrateBreakerFromJournal` is what turns a restart
+// that happened mid-submit into a halt instead of a duplicate order, and it has
+// to run ahead of the first tick. The memory watchdog's pm2 self-restart writes
+// no deploy record at all (TRA-2203/TRA-2261), so "the process restarted between
+// the POST and the response" is not a hypothetical on this box.
+{
+  const intents = installOrderIntentJournal(DATA_DIR);
+  log.info('TRA-4476 order-intent journal', {
+    installed: intents.installed,
+    path: intents.path,
+    rehydrated: intents.rehydrated,
+    corruptLines: intents.corruptLines,
+    // `journalAbsent` is published rather than folded into `rehydrated: 0`:
+    // a first boot and a boot that found nothing outstanding are different facts.
+    journalAbsent: intents.journalAbsent,
+  });
+}
 
 {
   const h = hydrateLiveOptionsFeeSlippageFromDisk(DATA_DIR);
@@ -11030,6 +11057,25 @@ app.get('/api/health/order-quote-guard', (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read order-quote-guard metrics' });
+  }
+});
+
+// TRA-4476 — the unknown-outcome breaker readout.
+//
+// A submit whose outcome we could not establish HALTS further submits of that
+// shape. That halt is a trading stop, so it must not be silent: this route names
+// every latched shape, why it is latched, and — critically — whether the durable
+// journal is installed at all. `latchedCount: 0` with `journalInstalled: false`
+// means "nothing is watching", not "nothing is wrong", and the two must never
+// read the same. See `tra4476-order-intent-journal.ts`.
+app.get('/api/health/order-intents', (_req, res) => {
+  try {
+    res.json({ issue: 'TRA-4476', ...orderIntentHealth() });
+  } catch (err) {
+    log.error('order-intent health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read order-intent state' });
   }
 });
 
