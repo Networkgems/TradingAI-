@@ -92,3 +92,66 @@ describe('TRA-4457 — the sweep census reaches /api/state', () => {
     expect(new SignalEngine().getState().sma200ScanStats ?? null).toBeNull();
   });
 });
+
+/**
+ * TRA-4457 — the VERDICT is published beside the counters, not left to readers.
+ *
+ * Raised by the TRA-3688 spec owner off the 2026-09-10T00:06:25Z live read: the
+ * verdict was computed and logged inside `publishSma200Census` but never served,
+ * so every grader had to re-derive `SWEPT`/`BLIND`/`NO_UNIVERSE` from the raw
+ * counters — the exact re-implementation the helper exists to prevent — and the
+ * sweep's own ruler sat behind a Render log query.
+ */
+describe('TRA-4457 — the sweep verdict is published, not re-derived', () => {
+  it('serves BLIND beside the counters when the breaker starved the sweep', async () => {
+    const engine = new SignalEngine();
+    vi.spyOn(yahooFeed, 'fetchDailyCandles').mockResolvedValue([]);
+    vi.spyOn(yahooFeed, 'isYahooBreakerOpen').mockReturnValue(true);
+
+    await scan(engine, ['AAA', 'BBB', 'CCC']);
+    const state = engine.getState();
+
+    expect(state.sma200SweepVerdict).toBe('BLIND');
+    // The verdict must agree with the denominator it is served next to. These
+    // travel together or they are worse than nothing.
+    expect(state.sma200ScanStats?.evaluated).toBe(0);
+  });
+
+  it('serves NO_UNIVERSE rather than folding it into BLIND', async () => {
+    const engine = new SignalEngine();
+    await scan(engine, []);
+    // A broken watchlist and a starved bar feed have different owners and
+    // different remedies; collapsing them re-hides one of the two.
+    expect(engine.getState().sma200SweepVerdict).toBe('NO_UNIVERSE');
+  });
+
+  it('serves SWEPT for a healthy sweep that scored symbols and fired NOTHING', async () => {
+    // 🔴 The load-bearing arm, and the one a reader keying on `fired` gets
+    // backwards: a quiet market scores its universe and emits no signal. That
+    // MUST read SWEPT — it is the only thing that separates an honest empty feed
+    // from the starved one this ticket was filed on. 250 flat bars cannot produce
+    // a pullback, so `fired` is 0 for a legitimate reason.
+    const engine = new SignalEngine();
+    const flat = Array.from({ length: 260 }, (_, i) => ({
+      time: TRADING_TIME - (260 - i) * 86_400_000,
+      open: 100, high: 100, low: 100, close: 100, volume: 1_000,
+    }));
+    vi.spyOn(yahooFeed, 'fetchDailyCandles').mockResolvedValue(flat as never);
+    vi.spyOn(yahooFeed, 'isYahooBreakerOpen').mockReturnValue(false);
+
+    await scan(engine, ['AAA', 'BBB']);
+    const state = engine.getState();
+
+    expect(state.sma200ScanStats?.evaluated).toBe(2);
+    expect(state.sma200ScanStats?.fired).toBe(0);
+    expect(state.sma200SweepVerdict).toBe('SWEPT');
+  });
+
+  it('is null before any sweep, so presence of the KEY proves the deployed bytes', () => {
+    // TRA-3913 — `undefined` (old build) and `null` (S1 live, no sweep yet) are
+    // different facts and the grader exits differently on each.
+    const state = new SignalEngine().getState();
+    expect('sma200SweepVerdict' in state).toBe(true);
+    expect(state.sma200SweepVerdict ?? null).toBeNull();
+  });
+});
