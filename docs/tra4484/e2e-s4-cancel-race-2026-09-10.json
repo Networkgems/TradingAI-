@@ -1,0 +1,37 @@
+{
+  "ticket": "TRA-4484",
+  "measuredAt": "2026-09-10T13:50:26.639Z",
+  "host": "https://sandbox.tradier.com/v1",
+  "account": "VA20296703",
+  "scenarios": {
+    "s4_cancel_race": {
+      "scenario": "s4_cancel_race",
+      "verdict": "PASS",
+      "marketState": "open",
+      "orderId": 38467818,
+      "cancelOutcome": {
+        "kind": "filled",
+        "terminalStatus": null,
+        "ackStatus": 400,
+        "ackError": null,
+        "filledQty": 14
+      },
+      "brokerOrderCount": 1,
+      "why": "cancelOrderConfirmed must return a TERMINAL verdict (`canceled` or `filled`) and never `unknown`; `filled` is the cancel losing the race and is a PASS of this test — the point is that the caller is TOLD."
+    }
+  },
+  "cleanup": {
+    "attempted": 1,
+    "results": [
+      {
+        "id": 38467818,
+        "deleteStatus": 400,
+        "finalStatus": "filled"
+      }
+    ],
+    "stillWorking": []
+  },
+  "summary": {
+    "s4_cancel_race": "PASS"
+  }
+}

@@ -1,0 +1,3 @@
+{"at":"2026-09-10T13:49:56.079Z","status":500,"body":"An error occurred while communicating with the backend."}
+{"at":"2026-09-10T13:50:56.297Z","status":200,"body":"{\"order\":{\"id\":38467975,\"status\":\"ok\",\"partner_id\":\"3a8bbee1-5184-4ffe-8a0c-294fbad1aee9\"}}","id":38467975,"deleteStatus":200,"finalStatus":"canceled"}
+BACKEND_UP at 2026-09-10T13:50:56.297Z

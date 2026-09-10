@@ -1,0 +1,169 @@
+{
+  "ticket": "TRA-4484",
+  "measuredAt": "2026-09-10T13:50:50.277Z",
+  "host": "https://sandbox.tradier.com/v1",
+  "account": "VA20296703",
+  "dryRun": false,
+  "ordersCreated": [
+    38467959,
+    38467960,
+    38467961
+  ],
+  "m1_tag": {
+    "roundTrip": {
+      "parameterName": "tag",
+      "requestedVia": "POST /accounts/{id}/orders body field `tag`",
+      "readBackVia": "GET /accounts/{id}/orders?includeTags=true → orders.order[].tag",
+      "sent": [
+        "TRA4484-lat-0",
+        "TRA4484-lat-1"
+      ],
+      "readBack": [
+        "TRA4484-lat-0",
+        "TRA4484-lat-1"
+      ],
+      "allMatched": true
+    },
+    "ladder": {
+      "skipped": "--skip-tag-ladder"
+    }
+  },
+  "m2_cancel": {
+    "matrix": [
+      {
+        "condition": "working order (status pending/open)",
+        "orderId": 38467961,
+        "statusBefore": "open",
+        "deleteHttpStatus": 200,
+        "deleteBody": "{\"order\":{\"id\":38467961,\"status\":\"ok\"}}",
+        "statusAfter": "canceled"
+      },
+      {
+        "condition": "already-terminal (canceled) order, re-cancelled",
+        "orderId": 38467961,
+        "statusBefore": "canceled",
+        "deleteHttpStatus": 400,
+        "deleteBody": "order already in finalized state: canceled",
+        "statusAfter": "canceled"
+      },
+      {
+        "condition": "order id that never existed",
+        "orderId": 1,
+        "getHttpStatus": 401,
+        "getBody": "Unauthorized Account: VA20296703",
+        "deleteHttpStatus": 401,
+        "deleteBody": "Unauthorized Account: VA20296703"
+      },
+      {
+        "condition": "wrong (foreign, non-existent) account in the path",
+        "accountUsed": "VA00000000",
+        "orderId": 38467961,
+        "deleteHttpStatus": 401,
+        "deleteBody": "Unauthorized Account: VA00000000",
+        "getHttpStatus": 401,
+        "getBody": "Unauthorized Account: VA00000000"
+      },
+      {
+        "condition": "cancel of a FILLED order",
+        "orderId": 38467818,
+        "deleteHttpStatus": 400,
+        "deleteBody": "order already in finalized state: filled"
+      }
+    ]
+  },
+  "m3_latency": {
+    "n": 2,
+    "pollIntervalMs": 150,
+    "visibleAfterMs": {
+      "min": 52,
+      "p50": 52,
+      "p95": 127,
+      "max": 127,
+      "all": [
+        52,
+        127
+      ]
+    },
+    "brokerMinusLocalSubmitMs": {
+      "min": 53,
+      "p50": 53,
+      "max": 70,
+      "all": [
+        53,
+        70
+      ]
+    },
+    "submitRttMs": [
+      62,
+      73
+    ],
+    "neverVisible": 0,
+    "statusAtFirstSight": [
+      "open"
+    ],
+    "samples": [
+      {
+        "httpStatus": 200,
+        "id": 38467959,
+        "startedAt": 1789048250593,
+        "returnedAt": 1789048250655,
+        "rttMs": 62,
+        "body": "{\"order\":{\"id\":38467959,\"status\":\"ok\",\"partner_id\":\"3a8bbee1-5184-4ffe-8a0c-294fbad1aee9\"}}",
+        "pollCount": 1,
+        "visibleAfterMs": 52,
+        "visibleAfterPostStartMs": 114,
+        "createDate": "2026-09-10T13:50:50.646Z",
+        "tagReadBack": "TRA4484-lat-0",
+        "statusAtFirstSight": "open",
+        "brokerMinusLocalSubmitMs": 53
+      },
+      {
+        "httpStatus": 200,
+        "id": 38467960,
+        "startedAt": 1789048250920,
+        "returnedAt": 1789048250993,
+        "rttMs": 73,
+        "body": "{\"order\":{\"id\":38467960,\"status\":\"ok\",\"partner_id\":\"3a8bbee1-5184-4ffe-8a0c-294fbad1aee9\"}}",
+        "pollCount": 1,
+        "visibleAfterMs": 127,
+        "visibleAfterPostStartMs": 200,
+        "createDate": "2026-09-10T13:50:50.990Z",
+        "tagReadBack": "TRA4484-lat-1",
+        "statusAtFirstSight": "open",
+        "brokerMinusLocalSubmitMs": 70
+      }
+    ]
+  },
+  "m4_reach": {
+    "httpStatus": 200,
+    "envelopeShapeBefore": "orders.order is an ARRAY (n=27)",
+    "rowCountBefore": 27,
+    "oldestCreateDate": "2026-09-10T04:02:26.395Z",
+    "newestCreateDate": "2026-09-10T13:50:26.911Z",
+    "distinctEtDays": [
+      "2026-09-10"
+    ],
+    "localEtDay": "2026-09-10"
+  },
+  "cleanup": {
+    "attempted": 3,
+    "results": [
+      {
+        "id": 38467959,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38467960,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38467961,
+        "deleteHttpStatus": 400,
+        "finalStatus": "canceled"
+      }
+    ],
+    "stillWorking": []
+  }
+}

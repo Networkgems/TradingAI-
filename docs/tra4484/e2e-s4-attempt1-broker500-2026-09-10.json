@@ -1,0 +1,14 @@
+{
+  "ticket": "TRA-4484",
+  "measuredAt": "2026-09-10T13:48:04.116Z",
+  "host": "https://sandbox.tradier.com/v1",
+  "account": "VA20296703",
+  "scenarios": {},
+  "cleanup": {
+    "attempted": 0,
+    "results": [],
+    "stillWorking": []
+  },
+  "error": "TradierOrderError: Tradier order failed (500): An error occurred while communicating with the backend.\nTradierOrderError: Tradier order failed (500): An error occurred while communicating with the backend.\n    at TradierOrderClient.finishUnknown (file:///C:/Users/eetienne/.paperclip/instances/default/projects/fc64eaf4-0c08-4270-9a4c-31ee16594dec/74473ac3-bd4b-470e-8bc3-5c558ad85d1e/_default/packages/engine/dist/tradier/order-client.js:893:23)\n    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)\n    at async TradierOrderClient.postOrder (file:///C:/Users/eetienne/.paperclip/instances/default/projects/fc64eaf4-0c08-4270-9a4c-31ee16594dec/74473ac3-bd4b-470e-8bc3-5c558ad85d1e/_default/packages/engine/dist/tradier/order-client.js:950:25)\n    at async runCancelRaceScenario (file:///C:/Users/eetienne/.paperclip/instances/default/projects/fc64eaf4-0c08-4270-9a4c-31ee16594dec/74473ac3-bd4b-470e-8bc3-5c558ad85d1e/_default/scripts/tra4484-order-intent-e2e.mjs:403:18)\n    at async file:///C:/Users/eetienne/.paperclip/instances/default/projects/fc64eaf4-0c08-4270-9a4c-31ee16594dec/74473ac3-bd4b-470e-8bc3-5c558ad85d1e/_default/scripts/tra4484-order-intent-e2e.mjs:447:62",
+  "summary": {}
+}

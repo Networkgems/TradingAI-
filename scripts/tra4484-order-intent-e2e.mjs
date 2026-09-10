@@ -400,7 +400,36 @@ async function runCancelRaceScenario() {
   const qty = QTY[name];
   const client = buildClient(Engine);
   const t0 = Date.now();
-  const placed = await client.submitEquityOrder({ symbol: SYMBOL, side: 'buy', qty, type: 'market', duration: 'day' });
+  let placed;
+  try {
+    placed = await client.submitEquityOrder({ symbol: SYMBOL, side: 'buy', qty, type: 'market', duration: 'day' });
+  } catch (err) {
+    // A thrown submit is NOT a harness crash — on 2026-09-10T13:48Z the sandbox
+    // answered a real `500 An error occurred while communicating with the
+    // backend.` A 5xx may still have LANDED, and a landed market order can fill,
+    // so the broker tape is read and every row of this shape goes to cleanup
+    // BEFORE a verdict is written. Aborting here would lose exactly that order.
+    const broker = await brokerRowsForQty(qty, t0);
+    for (const r of broker.rows) created.add(r.id);
+    return {
+      scenario: name,
+      verdict: broker.rows.length === 0 ? 'UNMEASURED' : 'FAIL',
+      marketState: state,
+      submitError: {
+        message: String(err?.message ?? err).slice(0, 300),
+        httpStatus: err?.status ?? null,
+        outcome: err?.outcome ?? null,
+        unknownReason: err?.unknownReason ?? null,
+        reconcile: err?.reconcile ? { kind: err.reconcile.kind, reason: err.reconcile.reason ?? null } : null,
+      },
+      brokerOrderCount: broker.rows.length,
+      brokerOrderIds: broker.rows.map((r) => r.id),
+      why:
+        broker.rows.length === 0
+          ? 'The submit threw and the broker holds no order of this shape, so no race could happen. UNMEASURED, never a pass.'
+          : 'The submit threw but the broker HOLDS an order of this shape — the client did not recover it.',
+    };
+  }
   if (placed?.id) created.add(placed.id);
   const outcome = await client.cancelOrderConfirmed(placed.id, { timeoutMs: 15_000 });
   const broker = await brokerRowsForQty(qty, t0);

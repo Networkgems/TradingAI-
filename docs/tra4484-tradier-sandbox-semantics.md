@@ -2,14 +2,20 @@
 
 **Measured 2026-09-10T04:02Z–04:13Z** against `https://sandbox.tradier.com/v1`, account
 `VA20296703`, market state `closed` (`next_change 07:00`, `next_state premarket`).
+**The two rows that need a fill were measured inside RTH, 2026-09-10T13:48Z–13:51Z**, market state
+`open`. Nothing is UNMEASURED any more.
 Nothing in this document is a doc citation. Every number below has a run behind it, and the raw
 runs are committed beside it:
 
 | file | what |
 |---|---|
-| `docs/tra4484/semantics-run-2026-09-10.json` | items 1–4, raw |
+| `docs/tra4484/semantics-run-2026-09-10.json` | items 1–4, raw (market closed) |
+| `docs/tra4484/semantics-rth-2026-09-10.json` | items 2–4 again inside RTH — includes the FILLED-cancel row |
 | `docs/tra4484/e2e-run-2026-09-10.json` | the end-to-end one-order-per-intent proof |
 | `docs/tra4484/e2e-negative-controls-2026-09-10.json` | the same proof with the guard removed |
+| `docs/tra4484/e2e-s4-cancel-race-2026-09-10.json` | `s4_cancel_race`, inside RTH — PASS |
+| `docs/tra4484/e2e-s4-attempt1-broker500-2026-09-10.json` | the first s4 attempt, killed by a REAL broker 500 (see below) |
+| `docs/tra4484/order-backend-probe-2026-09-10.log` | the probe that timed the sandbox order backend's outage |
 
 Reproduce with:
 
@@ -30,6 +36,13 @@ result is reported rather than assumed. **No production order was placed and bqb
 > 26 rows, `statuses: ["canceled"]`, **0 non-terminal**. Ids: `38453601`, `38453637`–`38453653` (17),
 > `38453672`, `38453739`–`38453741`, `38453773`–`38453776`. Subtract them from any attribution run
 > for that day.
+>
+> **The RTH run added 6 more** (tape re-read 13:51:13Z: **32 rows, 0 non-terminal**):
+> `38467818` (s4, market buy 14, **filled** @ 758.12), `38467959`–`38467961` (latency + cancel matrix,
+> canceled), `38467974` (market **sell 14** @ 758.10, tag `TRA4484-flatten-s4` — flattens the s4
+> fill), `38467975` (backend probe, canceled). The account held **1 SPY** (acquired 2026-09-01, not
+> ours) before the run and holds **exactly 1 SPY** after it — the only position this ticket ever
+> took was opened and closed inside 29 s.
 
 ---
 
@@ -64,7 +77,11 @@ and the "a human placed an identical order in our window" case stops being indis
 | already-terminal (`canceled`), re-cancelled | **400** | `order already in finalized state: canceled` |
 | order id that never existed (`1`) | **401** | `Unauthorized Account: VA20296703` |
 | wrong account in the path (`VA00000000`) | **401** | `Unauthorized Account: VA00000000` |
-| **cancel of a FILLED order** | **UNMEASURED** | needs an open market; see below |
+| **cancel of a FILLED order** (`38467818`, RTH) | **400** | `order already in finalized state: filled` |
+
+The four non-filled rows were re-measured inside RTH on a fresh order (`38467961`) and are
+**byte-identical** to the overnight run (a working order read `open` rather than `pending` in session,
+and cancelled to `canceled` all the same).
 
 Consequences:
 
@@ -79,9 +96,13 @@ Consequences:
 3. **None of this weakens `cancelOrderConfirmed`**, and that is the point of it: it treats every one
    of these codes as an acknowledgement only and takes the verdict from the status poll.
 
-**The `filled` row is deliberately UNMEASURED, not assumed.** Every order this run placed was an
-unfillable limit and the market was shut, so no fill existed to cancel. Do **not** assume it mirrors
-the `canceled` row. See *What is still owed*.
+4. **The `filled` row is the one TRA-4476's hazard turns on, and it is the same code as the benign
+   one.** A cancel that loses to a fill gets `400 order already in finalized state: filled`; a
+   re-cancel of an order we already cancelled gets `400 order already in finalized state: canceled`.
+   Same status, and the body differs only in its last word. **So the DELETE response must never be
+   read as a verdict** — a status-code check cannot tell "nothing to do" from "you now hold the
+   position". Only the status poll distinguishes them, which is exactly what `cancelOrderConfirmed`
+   does (measured end to end below: it returned `filled`, `filledQty: 14`).
 
 ## Item 3 — order-history latency, and the constants re-derived from it
 
@@ -95,6 +116,10 @@ reads) every 150 ms starting the instant the POST returned:
 | never visible inside 30 s | **0 of 8** |
 | status at first sight | `pending` (8/8) |
 | `create_date` − local `submitStartedAt` | **+66 … +87 ms**, 8/8 positive |
+| **RTH re-measure** (n=2, 13:50:50Z) | RTT 62 / 73 ms · visible after 52 / 127 ms (first poll both times) · `create_date` − `submitStartedAt` **+53 / +70 ms** · status at first sight `open` |
+
+In session the offset stays positive (10/10 overall, min **+53 ms**), so the reach proof's
+no-allowance lower edge keeps its margin during trading hours, not only overnight.
 
 **Read the latency number correctly.** Every order was present on the *first* poll, so 46–74 ms is
 one list-GET round trip and nothing else. The true visibility lag is **below this instrument's
@@ -148,6 +173,10 @@ served. After this run's own orders landed, every row returned carried ET day `2
 other. This re-confirms TRA-3932's production finding and `tra3299-sandbox-attribution.mjs`'s
 sandbox finding: **the endpoint's reach is the current ET trading day**.
 
+Re-measured inside RTH at 13:50:50Z: 27 rows, oldest `2026-09-10T04:02:26Z` (this ticket's own first
+probe, 00:02 ET), `distinctEtDays: ["2026-09-10"]`. The boundary is the **ET calendar day**, not the
+session: rows placed at 00:02 ET, 7.5 h before the open, are still served at 09:50 ET.
+
 ### Two envelope shapes the reach test has to survive
 
 | rows | envelope |
@@ -176,7 +205,7 @@ distinct quantities (11/12/13) so they cannot latch each other's breaker.
 | `s1_response_lost` | the POST really lands and Tradier really accepts; the fetch then throws | **1** (`38453739`) | refused, `order_working` | **PASS** |
 | `s2_transport_5xx` | the POST really lands; caller handed a synthetic 503 | **1** (`38453740`) | refused, `order_working` | **PASS** |
 | `s3_process_kill` | `SIGKILL` between the broker's commit and any local record | **1** (`38453741`) | refused, `rehydrated_from_journal` | **PASS** |
-| `s4_cancel_race` | — | — | — | **UNMEASURED** |
+| `s4_cancel_race` (RTH) | none — a genuine market buy, cancelled immediately | **1** (`38467818`) | n/a | **PASS** — cancel lost, caller told `filled`, `filledQty: 14` |
 
 `s3` is the one fixtures cannot do. After the kill the JSONL journal held **exactly one line**,
 `status: "submitting"` — the pre-submit record and nothing else. A fresh process then called
@@ -214,27 +243,52 @@ shape — which is the event the machine exists to prevent. `--controls` exits n
 
 ---
 
-## What is still owed (needs an open market)
+## The two open-market rows — measured 2026-09-10 inside RTH
 
-Two rows are UNMEASURED, and both are UNMEASURED for the same structural reason: **the market was
-closed, so no order could fill.** Neither is reported as a pass.
-
-1. **`DELETE` of a FILLED order** — item 2's last row. Expected by analogy to be `400 order already
-   in finalized state: filled`, but analogy is not measurement and this is the exact row TRA-4476's
-   hazard turns on.
-2. **`s4_cancel_race`** — a genuine cancel-vs-fill race. `cancelOrderConfirmed` must return a
-   TERMINAL verdict (`canceled` *or* `filled`) and never `unknown`; `filled` is the cancel losing the
-   race and is a **PASS** of that test, because the point is that the caller is *told*.
-
-Both are completed by re-running inside RTH with a marketable order:
+Both were UNMEASURED overnight for one structural reason (no order could fill). Both were closed at
+the 13:45Z monitor, market `open`:
 
 ```bash
-node scripts/tra4484-tradier-sandbox-semantics.mjs --skip-tag-ladder --latency-n=2
 node scripts/tra4484-order-intent-e2e.mjs --scenario=s4_cancel_race
+node scripts/tra4484-tradier-sandbox-semantics.mjs --skip-tag-ladder --latency-n=2
 ```
 
-`s4_cancel_race` self-checks `GET /markets/clock` and reports `UNMEASURED` with the market state
-rather than passing, so a re-run outside RTH cannot be mistaken for a completed one.
+1. **`DELETE` of a FILLED order → `400 order already in finalized state: filled`.** Measured twice on
+   `38467818`: once by the s4 harness's cleanup, once by the semantics script's matrix. The overnight
+   analogy guessed right, but it is now a measurement, and item 2 above states why that number is the
+   dangerous one.
+2. **`s4_cancel_race` → PASS.** Market buy 14 SPY, `cancelOrderConfirmed` fired immediately. The
+   broker filled it at 13:50:26.958Z, **47 ms after `create_date`**. The DELETE came back 400, the
+   poll read `filled`, and the verdict was `{kind: "filled", filledQty: 14}` — terminal, never
+   `unknown`. **Scope, stated:** at a 47 ms fill on liquid SPY, only the *cancel-loses* arm of the
+   race is reachable in sandbox with a market order. That is the arm TRA-4476's hazard lives on (a
+   cancel read as success while a fill lands). The *cancel-wins* arm is item 2's working-order row
+   (200 → `canceled`), measured both overnight and in RTH.
+
+### A REAL broker 5xx, at the open — and a harness defect it exposed
+
+The first s4 attempt (13:48:04Z) did not race anything. Sandbox answered the market-order POST with
+**`500 An error occurred while communicating with the backend.`** The order backend then stayed down
+for about 3 minutes: an unfillable $1 limit (the shape that worked overnight) got the same 500 at
+13:49:02Z and 13:49:56Z, and landed at 13:50:56Z (`order-backend-probe-2026-09-10.log`). Reads
+(clock, quotes, `/orders`, `/positions`) answered 200 throughout. `POST /orders` with `preview=true`
+answered `400 Unexpected server error` for both shapes during the same window, so preview is **not**
+a usable validator on this sandbox.
+
+- **None of the three 500s landed.** Tape re-read at 13:48:22Z: still the 26 overnight rows, nothing
+  after 13:00Z. Positions unchanged. So on this broker a 5xx *can* be a clean non-placement, and the
+  client cannot know that at the moment of the response.
+- **The client did the right thing with it:** `postOrder` routed the 500 to `finishUnknown`
+  (`broker_transport_status`) — it did **not** read a 5xx as a refusal. That was s2's premise, and s2
+  could only supply a synthetic 503; this is the real one. **Which** reconcile verdict it reached was
+  not recorded, because of the defect below — so that one fact is unmeasured, and is stated as such.
+- **The harness defect.** `runCancelRaceScenario` let a thrown submit escape to the top-level
+  `catch`, which ended the run as BLIND **before any broker read**. Cleanup only cancels ids it
+  already knows, and a submit that throws hands back no id. So a market order that *landed* behind a
+  500 would have escaped cleanup and, at a 47 ms fill, left an unreported position. Fixed in the same
+  commit as this section: a thrown s4 submit now reads the broker tape for its shape first, puts every
+  row into cleanup, records `outcome` / `unknownReason` / reconcile verdict, and reports `UNMEASURED`
+  (nothing landed) or `FAIL` (landed, not recovered) — never BLIND, never a pass.
 
 ## Follow-up: putting `tag` on a production order body
 
