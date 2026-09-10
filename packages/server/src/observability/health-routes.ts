@@ -361,6 +361,7 @@ import {
 import { isExternalIntelEnabled } from '../external-intel.js';
 import { getColdStartPrefetchStatus } from '../daily-prefetch-flag.js';
 import { getWatchdogStatus } from '../event-loop-watchdog.js';
+import { getLoopYieldGateSnapshot } from '../cooperative-yield.js';
 import { getHeapCensusStatus } from '../heap-census-sampler.js';
 import { isAnalystAgentEnabled, buildAnalystHealth } from '../analyst-agent.js';
 import {
@@ -8083,6 +8084,9 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       time: new Date(now()).toISOString(),
       build: resolveBuildInfo(),
       watchdog,
+      // TRA-4524 — process-wide yield gate counters (deferrals = resumes held
+      // behind a spent run; maxHeldTurns = the round-robin wait, AC3).
+      loopYieldGate: getLoopYieldGateSnapshot(),
     });
   });
 

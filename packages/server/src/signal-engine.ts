@@ -82,7 +82,8 @@ import { evaluateExecutionGate, buildOrderAudit, killSwitchClear } from './agent
 import { recordExecutedOrder } from './agent-execution-caps-store.js';
 import { getUserMemorySync, recordInteractionOutcome } from './user-trading-memory-store.js';
 import { getLatestMarketReview } from './market-review.js';
-import { withPhase, timeSyncPhase, SyncSliceMeter } from './phase-timing.js';
+import { withPhase, timeSyncPhase } from './phase-timing.js';
+import { EvalYielder, TickPacer } from './cooperative-yield.js';
 import { TickExitWorkMeter, type TickExitWorkTerms } from './tick-exit-work.js';
 import { TickExitRegionMeter, classifyExitInterval, type TickExitRegionRthTerms } from './tick-exit-region.js';
 import { trySma200ScanSlot, releaseSma200ScanSlot } from './sma200-scan-admission.js';
@@ -987,169 +988,9 @@ export type EngineEventHandler = (state: EngineState) => void;
 
 const MAX_SIGNALS = 50;
 
-// TRA-1082 — yield to the libuv event loop between batches of the full-universe
-// equity sweeps. Each engine tick iterates the ENTIRE active/watchlist universe
-// running synchronous indicator math (adx/orb/bbFade/ichimoku in the main pass,
-// supertrend()/confluenceSide()/reversalChecklist() in the shadow passes) with
-// no await inside the loop body when nothing fires — one uninterrupted
-// synchronous burst. At full breadth on bqb1 that burst exceeded Render's 5s
-// HTTP health-check budget (logs showed silent 5-8s gaps between `supertrend
-// shadow signal` lines), so `http.accept` never got a turn and Render
-// hard-restarted the instance (~90s flap loop, residual TRA-1082 root cause the
-// crypto fix at 28af16b did NOT cover — that only chunked crypto-engine). This
-// mirrors the crypto-engine treatment verbatim: awaiting a `setImmediate` every
-// EQUITY_EVAL_YIELD_EVERY symbols hands control back so the HTTP listener answers
-// the health probe between chunks, keeping any single synchronous span well
-// under ~1s. `setImmediate` (vs `setTimeout(0)`/microtask) runs after pending
-// I/O callbacks, so queued HTTP accepts are serviced before the next chunk.
-const EQUITY_EVAL_YIELD_EVERY = 25;
-const yieldToEventLoop = (): Promise<void> => new Promise<void>(resolve => setImmediate(resolve));
-
-// TRA-1905 — the count-based yield above ("every 25 symbols") assumes a UNIFORM
-// per-symbol cost. That assumption does not hold: under a wide/heavy universe or a
-// slow indicator recompute, a single 25-symbol batch can still hold the loop past
-// the 4s watchdog budget. The residual bqb1 block proves it — lagMax 9420ms in one
-// window, attributed to the COARSE `signal.doTick` with NO wrapped sync sub-phase
-// (autopilot-introspection, risk-autopilot, prune-signals, getstate-broadcast,
-// equity-checkExits, scaleout-ladder, imported-marks, rv-exit-state-build, the
-// per-symbol supertrend) ever crossing the 1s record threshold, and with the trip's
-// `activePhase` reading `signal.doTick` (the main tick body) rather than a nested
-// shadow-eval phase. That signature is the ACCUMULATED cost of a batch, not any one
-// named op. Bound the CONTIGUOUS synchronous stretch by WALL TIME instead of by an
-// item count: hand control back once more than EVAL_YIELD_BUDGET_MS have elapsed
-// since the last yield, so the loop services the health probe well under the 4s/5s
-// budget no matter how many symbols run or how heavy each one is. The legacy count
-// gate is retained as a cheap secondary floor (yield at least every 25 symbols even
-// when each is fast) so behaviour is a strict superset of the prior yielding.
-const EVAL_YIELD_BUDGET_MS = 750;
-/**
- * Cooperative wall-time yielder for a hot synchronous per-symbol loop. Construct
- * one immediately before the loop, then use it as the loop's yield gate:
- *
- *     if (evalYielder.shouldYield(symIdx)) await yieldToEventLoop();
- *
- * `shouldYield` is SYNCHRONOUS and returns true (resetting its clock) when EITHER
- * more than EVAL_YIELD_BUDGET_MS have elapsed since the last yield (the real bound
- * on the contiguous block) OR the legacy every-EQUITY_EVAL_YIELD_EVERY count is hit
- * (the cheap floor). It must NOT be an `async` method that the caller always awaits:
- * `await asyncFn()` defers the continuation to a microtask even when the method did
- * no internal awaiting, which would add a microtask hop to EVERY iteration and break
- * callers that rely on a single-symbol pass completing synchronously (TRA-936). By
- * keeping the decision sync and awaiting only when a yield is actually due, the
- * behaviour is a strict superset of the prior `symIdx % 25 === 0` gate: identical
- * (fully synchronous) when nothing is due, an extra macrotask yield when a batch
- * runs long. Cost is one `Date.now()` per symbol — negligible against the indicator
- * math it guards.
- */
-class EvalYielder {
-  private lastYieldAt = Date.now();
-  // TRA-3660 — sync-slice attribution. The yielder BOUNDS a contiguous stretch
-  // but never MEASURES it, so a single un-preemptible 8s slice (trips #7-#11,
-  // all `slowSyncPhase: null` under a 22s async envelope) had no instrument
-  // that could name it. Constructed with a phase name, the yielder now records
-  // (a) its own slow slices with the symbol range that blocked, and (b) slow
-  // yield-resume delays as `yield-preempt@<phase>` — foreign uninstrumented
-  // work starving the loop DURING the yield, the reading that stops a straddle
-  // sample from convicting the innocent yielded envelope. Nameless construction
-  // is byte-identical to the old behaviour.
-  private readonly meter: SyncSliceMeter | null;
-  constructor(phase?: string) {
-    this.meter = phase != null ? new SyncSliceMeter(phase) : null;
-  }
-  shouldYield(symIdx: number, label?: string): boolean {
-    const overCount = symIdx > 0 && symIdx % EQUITY_EVAL_YIELD_EVERY === 0;
-    const overTime = Date.now() - this.lastYieldAt >= EVAL_YIELD_BUDGET_MS;
-    if (overCount || overTime) {
-      this.meter?.endSlice(label);
-      this.lastYieldAt = Date.now();
-      return true;
-    }
-    return false;
-  }
-  /**
-   * TRA-3660 — yield via the yielder (instead of a bare `yieldToEventLoop()`)
-   * so the scheduled→resumed delay is measured: a slow resume means the loop
-   * ran someone ELSE's work for that long, and the meter records it as a
-   * `yield-preempt@<phase>` observation. Also re-stamps the slice clock at the
-   * RESUME, so queue time is never charged to the loop's own next slice.
-   */
-  async yieldNow(label?: string): Promise<void> {
-    const scheduledAtMs = Date.now();
-    await yieldToEventLoop();
-    this.meter?.onYieldResumed(scheduledAtMs, label);
-    this.lastYieldAt = Date.now();
-  }
-  /** Close out the final slice at loop end (no-op when constructed nameless). */
-  finish(label?: string): void {
-    this.meter?.endSlice(label);
-  }
-}
-
-// TRA-1942 — the TICK-WIDE macrotask pacer (the root-cause fix for the residual
-// bqb1 `signal.doTick` event-loop-block self-restart loop, parent TRA-1894).
-//
-// The watchdog's `block` trip named the COARSE `signal.doTick` with NO wrapped
-// sub-phase ever crossing the 1s record threshold (every timeSyncPhase region —
-// checkExits, getstate-broadcast, imported-marks, prune-signals, autopilot-
-// introspection, risk-autopilot, scaleout-ladder, rv-exit-state-build — is
-// individually FAST; the withPhase shadow evals name themselves). That signature
-// is not one hot op — it is the SUM of the whole tick body running as ONE
-// contiguous event-loop block.
-//
-// Why the whole body runs contiguously: on the cache-served path (the 2nd tick of
-// each minute, a warm minute-bar cache, or an open feed breaker) EVERY `await`
-// inside doTick — fetchQuotes, refreshCandles, the reconciles, refreshOptionMarks,
-// the RV/OTM/technical scans — resolves from cache SYNCHRONOUSLY, i.e. in a
-// MICROTASK (see fetchMinuteBarsWithSource's cache-hit early return). A chain of
-// microtask-only awaits never lets libuv advance to the timer/check phase, so the
-// watchdog's `setInterval` and the HTTP health listener cannot fire: the loop is
-// starved for the full span of back-to-back synchronous sub-phases even though NO
-// single phase blocks >1s. The cost grows with the session (more open positions /
-// active-interest symbols / accrued state → heavier per-phase sync work), which is
-// the observed grows-with-uptime trip cadence.
-//
-// EvalYielder already paces the two hot per-symbol LOOPS; this paces the tick as a
-// WHOLE. A `setImmediate` (macrotask) yield is inserted between the major phases
-// whenever the contiguous synchronous stretch since the last real yield crosses
-// TICK_PACER_BUDGET_MS, so the event loop reaches its timer/check phase well under
-// the 4s watchdog budget no matter how many sub-1s phases run back-to-back.
-// Behaviour-preserving: it only interleaves a macrotask hop at a phase boundary,
-// and doTick already awaits repeatedly mid-tick, so every boundary is already a
-// legal suspension point. The gate is a single Date.now() read when not due.
-const TICK_PACER_BUDGET_MS = 500;
-class TickPacer {
-  private lastYieldAt = Date.now();
-  // TRA-3660 — same sync-slice attribution as EvalYielder, at tick-body
-  // granularity: a slow pacer slice names the doTick REGION (the label passed
-  // at the boundary) rather than the coarse parent, and a slow yield-resume
-  // records `yield-preempt@signal.doTick.pacer` (foreign work, not this tick).
-  private readonly meter: SyncSliceMeter | null;
-  constructor(phase?: string) {
-    this.meter = phase != null ? new SyncSliceMeter(phase) : null;
-  }
-  /**
-   * SYNCHRONOUS decision: true (resetting the clock) once more than
-   * TICK_PACER_BUDGET_MS have elapsed since the last macrotask yield. Kept sync
-   * for the same reason as {@link EvalYielder.shouldYield} — the caller awaits a
-   * real `yieldToEventLoop()` ONLY when a yield is actually due, so a tick whose
-   * awaits already hit real I/O (macrotask boundaries) adds zero extra hops.
-   */
-  shouldYield(label?: string): boolean {
-    if (Date.now() - this.lastYieldAt >= TICK_PACER_BUDGET_MS) {
-      this.meter?.endSlice(label);
-      this.lastYieldAt = Date.now();
-      return true;
-    }
-    return false;
-  }
-  /** TRA-3660 — see {@link EvalYielder.yieldNow}: measures the resume delay. */
-  async yieldNow(label?: string): Promise<void> {
-    const scheduledAtMs = Date.now();
-    await yieldToEventLoop();
-    this.meter?.onYieldResumed(scheduledAtMs, label);
-    this.lastYieldAt = Date.now();
-  }
-}
+// TRA-1082 / TRA-1905 / TRA-1942 / TRA-4524 — EvalYielder (per-symbol loops) and
+// TickPacer (tick-wide) live in ./cooperative-yield.ts, with their rationale and the
+// process-wide yield gate both of them share.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TRA-1089 — shared per-tick shadow research pass.
@@ -5997,7 +5838,8 @@ export class SignalEngine {
     timeSyncPhase('signal.doTick.imported-marks', () => this.refreshImportedMarksAllAccounts(optionMarks));
     // TRA-1942 tick pacer — only when driven from doTick; the decoupled pass has no
     // pacer (it is short and yields naturally at each await).
-    if (pacer?.shouldYield() ?? false) await yieldToEventLoop();
+    // TRA-4524 — resume through the pacer so the yield goes via the process-wide gate.
+    if (pacer?.shouldYield()) await pacer.yieldNow();
 
     // TRA-354 — wait-and-hold exit policy for ENGINE-FIRED exits (distinct
     // from the TRA-352 USER-initiated close reconciler that ran above).
@@ -14551,7 +14393,8 @@ export class SignalEngine {
         await Promise.all(batch.map(sym => this.refreshCandlesBounded(sym)));
         // TRA-1942 — a cache-served batch resolves in microtasks (no real I/O),
         // so this loop can starve the event loop by itself; pace it.
-        if (pacer?.shouldYield()) await yieldToEventLoop();
+        // TRA-4524 — resume through the pacer so the yield goes via the process-wide gate.
+        if (pacer?.shouldYield()) await pacer.yieldNow();
       },
     });
   }
@@ -15268,7 +15111,18 @@ export class SignalEngine {
     // zero-count scan that would read as "ran, found nothing".
     const scanRun = beginRvScan('directional', symbols.length);
 
+    // TRA-4524 (TRA-3660 trip #14) — this loop had NO yield boundary. Its chain
+    // reads ride a shared warm cache, so when a cold fetch settles, every
+    // per-book engine's remaining symbols resolve in microtasks back to back:
+    // ~11 engines x ~550ms = one 6.1s block, witnessed at `pre-tick-complete`.
+    // A yielder here lets an engine co-resumed into a run a sibling already
+    // spent stop at its NEXT symbol (the process-wide gate in
+    // cooperative-yield.ts). No count floor: a fast pass gains no extra hops.
+    const evalYielder = new EvalYielder('signal.doTick.demo-directional', { countFloor: false });
+    let symIdx = -1;
     for (const sym of symbols) {
+      symIdx++;
+      if (evalYielder.shouldYield(symIdx, sym)) await evalYielder.yieldNow(sym);
       // Count the INPUT. Incremented before the try/continue chain so an
       // all-`continue` pass reports the symbols it CONSIDERED, not zero.
       scanRun.enterSymbol();
@@ -15734,6 +15588,7 @@ export class SignalEngine {
         scanRun.fetchError(`${sym}: ${reason}`);
       }
     }
+    evalYielder.finish();
     this.commitScanCensus('directional', scanRun.finish());
   }
 

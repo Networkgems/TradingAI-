@@ -292,12 +292,22 @@ export class SyncSliceMeter {
    * `yield-preempt@<phase>` (foreign work starved the loop during the yield),
    * and starts the next slice AT THE RESUME so the yield's queue time is never
    * counted against the loop's own next slice.
+   *
+   * TRA-4524 — `heldTurns` is how many extra loop turns the process-wide yield
+   * gate held this waiter (round-robin behind sibling engines). A held wait
+   * spans turns in which timers and I/O ran, so it is NOT one block. It records
+   * as `yield-wait@<phase>` with kind `async`, never as a sync verdict (the
+   * same rule as the #span demotion above).
    */
-  onYieldResumed(scheduledAtMs: number, label?: string): void {
+  onYieldResumed(scheduledAtMs: number, label?: string, heldTurns = 0): void {
     const nowMs = Date.now();
     const delayMs = nowMs - scheduledAtMs;
     if (delayMs >= resolveSlowMs(this.env)) {
-      recordPhaseDuration(`yield-preempt@${this.phase}`, delayMs, nowMs, this.env, 'sync');
+      if (heldTurns > 0) {
+        recordPhaseDuration(`yield-wait@${this.phase}`, delayMs, nowMs, this.env, 'async');
+      } else {
+        recordPhaseDuration(`yield-preempt@${this.phase}`, delayMs, nowMs, this.env, 'sync');
+      }
     }
     this.sliceStartMs = nowMs;
     this.sliceStartLabel = label;
