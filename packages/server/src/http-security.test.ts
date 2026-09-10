@@ -10,6 +10,8 @@ import {
   PAGES_ORIGIN,
   TAURI_ORIGINS,
   LOCAL_ORIGINS,
+  redactQueryString,
+  REDACTED_QUERY_VALUE,
 } from './http-security.js';
 
 // TRA-2298. The expensive failure for this change is not "the header is
@@ -246,5 +248,52 @@ describe('reportOnlyCsp', () => {
   it('omits the socket clause when the host is unknown', () => {
     expect(reportOnlyCsp(undefined)).toContain("connect-src 'self'");
     expect(reportOnlyCsp(undefined)).not.toContain('wss://');
+  });
+});
+
+// TRA-4488 item 4 — query-string redaction for anything that reaches a log.
+describe('redactQueryString', () => {
+  it('keeps the path and every parameter NAME, and destroys every VALUE', () => {
+    expect(redactQueryString('/api/state?token=abc.def&mode=live')).toBe(
+      `/api/state?token=${REDACTED_QUERY_VALUE}&mode=${REDACTED_QUERY_VALUE}`,
+    );
+  });
+
+  it('redacts a parameter nobody has thought of yet', () => {
+    // The point of the whole helper. A denylist of (`token`, `ticket`, `code`)
+    // would pass the case above and leak this one, and the leak would be silent
+    // — the failure direction this issue exists to close.
+    const out = redactQueryString('/api/x?some_new_credential=SECRET');
+    expect(out).not.toContain('SECRET');
+    expect(out).toContain('some_new_credential');
+  });
+
+  it('redacts the WS upgrade URL shape specifically', () => {
+    for (const url of ['/?token=SESSIONTOKEN', '/?ticket=TICKETVALUE']) {
+      expect(redactQueryString(url)).not.toMatch(/SESSIONTOKEN|TICKETVALUE/);
+    }
+  });
+
+  it('passes a query-less URL through unchanged', () => {
+    expect(redactQueryString('/api/health/version')).toBe('/api/health/version');
+  });
+
+  it('drops a fragment, which a Referer can carry', () => {
+    expect(redactQueryString('https://app.example/page?q=SECRET#tok=ALSOSECRET')).toBe(
+      `https://app.example/page?q=${REDACTED_QUERY_VALUE}`,
+    );
+    expect(redactQueryString('https://app.example/page#tok=SECRET')).toBe('https://app.example/page');
+  });
+
+  it('never throws and never returns the input on a malformed query', () => {
+    // `?` with nothing after it, repeated separators, a bare flag, a value
+    // containing `=`. A throw here would take out the log call site it wraps.
+    expect(redactQueryString('/api/x?')).toBe('/api/x');
+    expect(redactQueryString('/api/x?&&')).toBe('/api/x');
+    expect(redactQueryString('/api/x?flag')).toBe('/api/x?flag');
+    expect(redactQueryString('/api/x?a=b=SECRET')).toBe(`/api/x?a=${REDACTED_QUERY_VALUE}`);
+    expect(redactQueryString(undefined)).toBe('');
+    expect(redactQueryString(null)).toBe('');
+    expect(redactQueryString('')).toBe('');
   });
 });

@@ -224,6 +224,26 @@ pool at once. That upgrades H4a from hardening to a plausible takeover path, and
 > bound that holds regardless is the per-account attempt cap that burns the outstanding code — see
 > `recordResetFailure` in `auth.ts`.
 
+> **Resolved, 2026-09-10 (TRA-4488, LeadDev).** The remaining H4 transport item — the session token in the
+> WS upgrade query string — is fixed. The upgrade now takes a **single-use, 30s ticket** from
+> `POST /api/auth/ws-ticket` (`packages/server/src/ws-auth.ts`), stored as a keyed hash in process memory and
+> never persisted; both desktop clients fetch one per connect attempt, reconnects included.
+>
+> The audit's cheaper alternative — carry the token in `Sec-WebSocket-Protocol` — was costed and **rejected**.
+> It moves the same full-TTL session token to a different header: the leak surface shrinks, the blast radius
+> of a leak does not change at all. A 30s single-use ticket is worthless by the time anyone reads the log it
+> landed in, and that is the whole point. (It is also the riskier change to ship: a subprotocol the server
+> fails to echo back in the 101 closes the socket, i.e. a dead dashboard for every user at once.)
+>
+> `?token=` is accepted for **one deploy window** so an in-flight client is not cut off mid-session, the same
+> shape as `consumeLegacyResetToken` above. It can be shut with `WS_LEGACY_TOKEN_QUERY=off` and a zero-byte
+> redeploy, and whether anything still uses it is answered off the **Render log tape** (`TRA-4488 WS upgrade
+> authenticated by LEGACY`) — not off the since-boot counter on `/api/health/ws-auth`, which reads 0 both when
+> the door is unused and when the watchdog restarted the process a second ago.
+>
+> Query-string **values** are now redacted wherever a request URL reaches a log (`redactQueryString`,
+> `http-security.ts`), names kept, so the class does not come back through the next parameter.
+
 The 2FA fail-open at `index.ts:9189-9191` is real but is a **deliberate, commented tradeoff** ("Fail safe by
 letting them in rather than locking them out permanently") and needs an admin to have removed an email from
 a 2FA-enabled account. It should be re-decided — refuse with a recovery path — not merely patched, and it

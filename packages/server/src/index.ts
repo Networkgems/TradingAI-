@@ -22,9 +22,19 @@ import {
   buildAllowedOrigins,
   corsMiddleware,
   notFoundHandler,
+  redactQueryString,
   resolveTrustProxy,
   securityHeadersMiddleware,
 } from './http-security.js';
+// TRA-4488 — WS upgrade auth: single-use short-TTL tickets instead of a full
+// session token in the query string.
+import {
+  authenticateUpgrade,
+  issueWsTicket,
+  revokeWsTicketsFor,
+  wsAuthCounters,
+  WS_TICKET_TTL_MS,
+} from './ws-auth.js';
 import { cspReportRouter, initCspReportStore } from './csp-report-collector.js';
 import { generateEodReport, wouldClobberSettledReport } from './reports/eod-report.js';
 import { decideEodReportWrite } from './reports/eod-write-gate.js';
@@ -9714,6 +9724,36 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
   res.json({ ok: true, message: 'Password changed successfully' });
 });
 
+/**
+ * TRA-4488 — mint a single-use, 30s WebSocket upgrade ticket.
+ *
+ * The session token arrives in the `Authorization` header (`requireAuth`), where
+ * it belongs; the ticket goes out in the response BODY and the client puts it in
+ * the upgrade URL. So the only credential that ever reaches a proxy access log
+ * is one that is already burnt or expired by the time anyone reads the log.
+ *
+ * `POST` rather than `GET` because it mutates (it mints into the store), and
+ * because a `GET` is the thing a browser will helpfully prefetch or replay.
+ */
+app.post('/api/auth/ws-ticket', requireAuth, (_req, res) => {
+  const username = res.locals['authUser'] as string;
+  res.json({ ticket: issueWsTicket(username), ttlMs: WS_TICKET_TTL_MS });
+});
+
+/**
+ * TRA-4488 — WS auth counters, including whether the legacy `?token=` door is
+ * still open and how many upgrades have come through it.
+ *
+ * ⚠ `legacyTokenUpgrades` is SINCE-BOOT. Reading 0 here is not clearance to
+ * delete the compat branch — bqb1's watchdog restarts the process without any
+ * deploy record (TRA-2203/TRA-2261), so a fresh 0 and a genuinely unused door
+ * are the same number. `ws-auth.ts` emits one log line per legacy upgrade
+ * precisely so the question is answered off the Render log tape instead.
+ */
+app.get('/api/health/ws-auth', requireAuth, (_req, res) => {
+  res.json(wsAuthCounters());
+});
+
 app.get('/api/auth/me', requireAuth, (req, res) => {
   const username = res.locals['authUser'] as string;
   const user = getUser(username);
@@ -15475,8 +15515,11 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
           ? req.headers['x-forwarded-for']
           : null,
         userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null,
-        route: `${req.method} ${req.originalUrl}`,
-        referer: typeof req.headers['referer'] === 'string' ? req.headers['referer'] : null,
+        // TRA-4488 item 4 — `originalUrl` and `Referer` both carry a query
+        // string, and this record is DURABLE (it is appended to disk). Parameter
+        // names survive, values do not; see `redactQueryString`.
+        route: `${req.method} ${redactQueryString(req.originalUrl)}`,
+        referer: typeof req.headers['referer'] === 'string' ? redactQueryString(req.headers['referer']) : null,
       },
     });
     log.warn('TRA-2649 live-broker arm: settings write would have DEMOTED the pinned operator off the ratified arm — re-converged', {
@@ -15500,8 +15543,11 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
           ? req.headers['x-forwarded-for']
           : null,
         userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null,
-        route: `${req.method} ${req.originalUrl}`,
-        referer: typeof req.headers['referer'] === 'string' ? req.headers['referer'] : null,
+        // TRA-4488 item 4 — values redacted, names kept. Same reasoning as the
+        // `bodyFields: Object.keys(body)` two lines up: which parameters the
+        // caller sent is the attribution signal; their contents never were.
+        route: `${req.method} ${redactQueryString(req.originalUrl)}`,
+        referer: typeof req.headers['referer'] === 'string' ? redactQueryString(req.headers['referer']) : null,
       },
     });
   }
@@ -19022,6 +19068,11 @@ function broadcastToUser(username: string, msg: string): void {
  * connection to retry.
  */
 function closeUserSockets(username: string): number {
+  // TRA-4488 — kill the 30s window IN FRONT of the sockets too. Hanging up the
+  // open sockets leaves any ticket minted moments before the delete redeemable,
+  // and redeeming one re-enters `ensureUserContext` through the exact door
+  // TRA-2421 closed. A ticket outlives nothing once the account is gone.
+  revokeWsTicketsFor(username);
   let closed = 0;
   for (const client of wss.clients) {
     const c = client as AuthedSocket;
@@ -19042,21 +19093,27 @@ function broadcastCryptoState(ctx: UserContext): void {
 }
 
 httpServer.on('upgrade', (req, socket, head) => {
-  const url = new URL(req.url ?? '/', `http://${firstHeader(req.headers.host) ?? 'localhost'}`);
-  const token = url.searchParams.get('token') ?? '';
-  const username = verifyToken(token);
-  // TRA-2421 — same existence check as `requireAuth`. The WS is a SECOND door to
-  // `ensureUserContext` (see the `connection` handler below), so a deleted user
-  // reconnecting a socket would re-create the data directory and restart the
-  // engines just as an HTTP request would. Gating only the HTTP side would leave
-  // the resurrection path fully open through the transport the UI actually uses.
-  if (!username || !getUser(username)) {
+  // TRA-4488 — the whole decision lives in `authenticateUpgrade` (`ws-auth.ts`).
+  //
+  // It used to be inline here, reading a FULL 24h session token out of
+  // `?token=` — i.e. out of the request line, which is what every proxy access
+  // log records. It now prefers a single-use 30s `?ticket=` minted by
+  // `POST /api/auth/ws-ticket`, and accepts `?token=` for one deploy window so
+  // an in-flight client is not cut off mid-session.
+  //
+  // The TRA-2421 account-existence check (a deleted user must not reach
+  // `ensureUserContext` through the WS, which would re-create the data
+  // directory and restart the engines) moved INTO that function as the injected
+  // `userExists`, so it applies to both credentials. It is passed, not
+  // reimplemented: `getUser` is the same predicate `requireAuth` uses.
+  const decision = authenticateUpgrade(req.url, { userExists: (u) => Boolean(getUser(u)) });
+  if (!decision.ok) {
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
     socket.destroy();
     return;
   }
   wss.handleUpgrade(req, socket, head, (ws) => {
-    (ws as AuthedSocket).username = username;
+    (ws as AuthedSocket).username = decision.username;
     wss.emit('connection', ws, req);
   });
 });

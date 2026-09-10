@@ -394,3 +394,60 @@ export function corsMiddleware(allowed: Set<string>): RequestHandler {
     next();
   };
 }
+
+/**
+ * TRA-4488 item 4 — strip query-string VALUES out of anything we log.
+ *
+ * The WS ticket handshake in `ws-auth.ts` takes the session token out of the
+ * URL, which fixes the one parameter we know about. This exists so the *class*
+ * does not come back through the next one: `req.originalUrl` carries the query
+ * string, and two live log surfaces interpolate it (`recordBootArmRepair` and
+ * its paired `log.warn`, both in `index.ts`, both shipped by TRA-3809/TRA-3810
+ * specifically so a settings write is attributable — so they are not going
+ * away).
+ *
+ * Parameter NAMES survive, every VALUE becomes `[redacted]`. That keeps the
+ * thing those two call sites actually need — which parameters a caller sent,
+ * the same reasoning as their `bodyFields: Object.keys(body)` — while making it
+ * impossible for a value to reach a log by being newly added and forgotten.
+ *
+ * Deliberately NOT a denylist of sensitive names (`token`, `ticket`, `code`, …)
+ * and deliberately not an allowlist of benign ones. Both are the same object:
+ * a list someone has to remember to extend, whose failure mode is a silent leak
+ * of exactly the parameter nobody thought about. A redact-everything rule has no
+ * such state. Cost is that `?date=2026-09-10` is no longer readable from the
+ * log line; that value is recoverable from the route's own handler logging if
+ * anyone ever needs it, and a leaked session token is not recoverable at all.
+ *
+ * Never throws: a URL this cannot parse is truncated at the first `?`, which is
+ * the safe direction.
+ */
+export const REDACTED_QUERY_VALUE = '[redacted]';
+
+export function redactQueryString(url: string | undefined | null): string {
+  if (!url) return '';
+  const q = url.indexOf('?');
+  if (q === -1) return stripFragment(url);
+  const path = url.slice(0, q);
+  const rest = url.slice(q + 1);
+  // A fragment never reaches a server, but `redactQueryString` is also handed
+  // client-supplied strings (`Referer`), where it does.
+  const hash = rest.indexOf('#');
+  const query = hash === -1 ? rest : rest.slice(0, hash);
+  if (query === '') return path;
+  const names = query
+    .split('&')
+    .filter((pair) => pair !== '')
+    .map((pair) => {
+      const eq = pair.indexOf('=');
+      // A bare `?flag` has no value to redact, so it is left intact — there is
+      // nothing in it but the name we were going to keep anyway.
+      return eq === -1 ? pair : `${pair.slice(0, eq)}=${REDACTED_QUERY_VALUE}`;
+    });
+  return names.length === 0 ? path : `${path}?${names.join('&')}`;
+}
+
+function stripFragment(url: string): string {
+  const hash = url.indexOf('#');
+  return hash === -1 ? url : url.slice(0, hash);
+}

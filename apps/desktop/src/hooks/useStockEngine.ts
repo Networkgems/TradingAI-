@@ -9,6 +9,8 @@ import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import { SERVER_URL, HTTP_URL } from '../server-url';
 import { logger } from '../lib/logger';
 import { createReconnectController } from '../lib/backoff';
+// TRA-4488 — the session token no longer rides in the upgrade URL.
+import { buildSocketUrl, fetchWsTicket, WsTicketError } from '../lib/ws-ticket';
 import { pickOptionsDailyLimit } from '../lib/settings';
 import type { AppState } from '../types/app';
 
@@ -78,8 +80,31 @@ export function useStockEngine(
     // TRA-419 — exponential reconnect backoff (was a flat 3s timer that
     // hammered the server during an outage). reset() on a healthy open.
     const reconnect = createReconnectController();
-    function connect() {
-      const ws = new WebSocket(`${SERVER_URL}?token=${token}`);
+    // TRA-4488 — `cancelled` guards the await below. Without it an unmount that
+    // races an in-flight ticket fetch opens a socket nobody owns and nobody
+    // closes, and the effect's cleanup has already run.
+    let cancelled = false;
+    // TRA-4488 — EVERY attempt mints its own ticket, reconnects included. The
+    // ticket is single-use, so a retry loop that replayed one would be refused
+    // forever: the dashboard would not degrade, it would never come back.
+    // Fetching inside `connect` rather than once in the effect is what makes
+    // that structurally impossible.
+    async function connect() {
+      if (cancelled) return;
+      let ticket: string;
+      try {
+        ticket = await fetchWsTicket(token);
+      } catch (err) {
+        if (cancelled) return;
+        // A 401 means the session itself is gone; no amount of backoff recovers
+        // it, and retrying would spin until the user gave up on a dead page.
+        if (err instanceof WsTicketError && err.status === 401) { onLogout(); return; }
+        logger.warn('stock-ws', 'ws-ticket fetch failed; will retry', err);
+        reconnectTimer.current = setTimeout(() => { void connect(); }, reconnect.nextDelay());
+        return;
+      }
+      if (cancelled) return;
+      const ws = new WebSocket(buildSocketUrl(SERVER_URL, ticket));
       wsRef.current = ws;
 
       ws.onopen = () => { setConnected(true); reconnect.reset(); };
@@ -89,7 +114,7 @@ export function useStockEngine(
           onLogout();
           return;
         }
-        reconnectTimer.current = setTimeout(connect, reconnect.nextDelay());
+        reconnectTimer.current = setTimeout(() => { void connect(); }, reconnect.nextDelay());
       };
       ws.onerror = () => ws.close();
       ws.onmessage = (e) => {
@@ -103,8 +128,9 @@ export function useStockEngine(
       };
     }
 
-    connect();
+    void connect();
     return () => {
+      cancelled = true;
       wsRef.current?.close();
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
     };

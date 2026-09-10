@@ -10,6 +10,8 @@ import { ErrorBoundary } from './ErrorBoundary.tsx';
 import { SERVER_URL, HTTP_URL } from './server-url';
 import { logger } from './lib/logger';
 import { createReconnectController } from './lib/backoff';
+// TRA-4488 — the session token no longer rides in the upgrade URL.
+import { buildSocketUrl, fetchWsTicket, WsTicketError } from './lib/ws-ticket';
 import type { Theme } from './components/ThemeToggle';
 import { CryptoDashboardHeader } from './components/dashboard/CryptoDashboardHeader';
 import { HaltBanner } from './components/dashboard/HaltBanner';
@@ -52,14 +54,31 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
     // TRA-419 — exponential reconnect backoff (was a flat 3s timer that
     // hammered the server during an outage). reset() on a healthy open.
     const reconnect = createReconnectController();
-    function connect() {
-      const ws = new WebSocket(`${SERVER_URL}?token=${token}`);
+    // TRA-4488 — see `lib/ws-ticket.ts`. The ticket is single-use, so it is
+    // minted inside `connect` and therefore re-minted on every reconnect; a
+    // replayed ticket would be refused forever, which is a dead dashboard rather
+    // than a slow one. `cancelled` covers an unmount racing the ticket fetch.
+    let cancelled = false;
+    async function connect() {
+      if (cancelled) return;
+      let ticket: string;
+      try {
+        ticket = await fetchWsTicket(token);
+      } catch (err) {
+        if (cancelled) return;
+        if (err instanceof WsTicketError && err.status === 401) { onLogout(); return; }
+        logger.warn('crypto-ws', 'ws-ticket fetch failed; will retry', err);
+        reconnectTimer.current = setTimeout(() => { void connect(); }, reconnect.nextDelay());
+        return;
+      }
+      if (cancelled) return;
+      const ws = new WebSocket(buildSocketUrl(SERVER_URL, ticket));
       wsRef.current = ws;
       ws.onopen = () => { setConnected(true); reconnect.reset(); };
       ws.onclose = (e) => {
         setConnected(false);
         if (e.code === 1008) { onLogout(); return; }
-        reconnectTimer.current = setTimeout(connect, reconnect.nextDelay());
+        reconnectTimer.current = setTimeout(() => { void connect(); }, reconnect.nextDelay());
       };
       ws.onerror = () => ws.close();
       ws.onmessage = (e) => {
@@ -70,8 +89,9 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
         } catch (err) { logger.warn('crypto-ws', 'dropped malformed WebSocket message', err); }
       };
     }
-    connect();
+    void connect();
     return () => {
+      cancelled = true;
       wsRef.current?.close();
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
     };
