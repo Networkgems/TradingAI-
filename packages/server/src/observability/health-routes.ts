@@ -253,6 +253,7 @@ import {
   OPTION_SPREAD_CEILING_ENFORCE_FLAG,
   classifySpreadCeilingAccount, // TRA-2355 — the SINGLE partition rule, shared with the gate ledger
   STOP_DISTANCE_FRACTION_OF_MARK, // TRA-2590 — premium R → gate R is 1/this
+  SPREAD_COST_ACCEPTANCE_N, // TRA-4291 — shared probe acceptance bar
 } from '../option-spread-cost.js';
 import type {
   SpreadCostSample,
@@ -2381,6 +2382,56 @@ export interface OptionJournalStructureExitCell {
    * different stop rules and NO single divisor describes it.
    */
   stopRPerPremiumRObserved: { n: number; values: number[] };
+  /**
+   * TRA-4291 — the MODELED net-of-cross companion to `avgR`, with its own
+   * provenance. `avgR` stays gross and byte-identical; this is the join that
+   * stops a demo cell paying no spread from reading `scratch` (the TRA-4230
+   * −17.76R block read +0.016 gross for months).
+   */
+  modeledCross: OptionJournalModeledCross;
+}
+
+/**
+ * TRA-4291 — modeled net-of-cross beside the gross `avgR`, per cell.
+ *
+ * Demo rows book NO spread cost (`demoSlippagePct: 0`, `demoFeePerContract: 0`),
+ * so their `realizedR` is GROSS of the bid/ask cross; this object charges each
+ * DEMO close the structure's MEASURED mean cross
+ * (`option-spread-cost.byStructure[].avgSpreadCrossRPremiumBasis`, already in
+ * the journal's premium R — no 4× conversion is applied or needed) and restates
+ * the cell mean. It is a MODEL, not a booked cost: the field names say so, and
+ * nothing here touches `realizedR` / `avgR` / `realizedPnlUsd`.
+ *
+ * LIVE rows already pay the cross in their booked fills, so they are NEVER
+ * charged again — they contribute their `realizedR` unchanged to both nets
+ * (`liveClosedUncharged` counts them). One cross (entry only) is the
+ * conservative floor; two crosses (entry + exit) is the realistic round trip.
+ *
+ * ⚠ TRA-2319 — `null` is NOT a pass. Both `avgRNetOfModeledCross*` fields are
+ * `number | null`, and `null <= x` is `true` in JavaScript: gate on
+ * `!== null` before comparing, never on a bare `<=`. When they are null,
+ * `reason` says why (no probe row for the structure, or probe `n` below
+ * `acceptanceN`) — a missing measurement is stated, never fabricated as 0.
+ */
+export interface OptionJournalModeledCross {
+  /** `avgR` − 1 modeled cross per DEMO close (entry only — the conservative floor). */
+  avgRNetOfModeledCross1x: number | null;
+  /** `avgR` − 2 modeled crosses per DEMO close (entry + exit — the realistic round trip). */
+  avgRNetOfModeledCross2x: number | null;
+  /** The cross charged per demo close, in PREMIUM R — `option-spread-cost.byStructure[].avgSpreadCrossRPremiumBasis` verbatim. */
+  modeledCrossRPremiumBasis: number | null;
+  /** Same unit as `avgR` and `realizedR` — no `gateRPerPremiumR` conversion applied. */
+  basis: 'premium';
+  /** Measured fills behind the cross — `option-spread-cost.byStructure[].n`. `null` = no probe row. */
+  probeN: number | null;
+  /** The probe acceptance bar; `probeN` below it ⇒ nulls with `reason`, never 0. */
+  acceptanceN: number;
+  /** DEMO closes in this cell, each charged (their realizedR is gross of spread). */
+  demoClosedCharged: number;
+  /** LIVE closes in this cell, NOT charged (their realizedR already books the cost). */
+  liveClosedUncharged: number;
+  /** Non-null exactly when the `avgRNetOfModeledCross*` fields are null: why nothing was modeled. */
+  reason: string | null;
 }
 
 /** TRA-2590 — the cross-tab plus its own residual check. */
@@ -2398,6 +2449,8 @@ export interface OptionJournalStructureExitCrossTab {
   histogramMismatchCells: string[];
   rBasis: 'premium';
   note: string;
+  /** TRA-4291 — how to read `cells[].modeledCross`. Additive; `note` above is byte-unchanged. */
+  modeledCrossNote: string;
 }
 
 /** Bucket edges in premium R. `null` = unbounded. Ascending, contiguous, total. */
@@ -2410,6 +2463,124 @@ const R_TAIL_BUCKET_EDGES: ReadonlyArray<{ label: string; fromR: number | null; 
 
 const LEFT_TAIL_SAMPLE_CAP = 12;
 
+/** TRA-4291 — one structure's measured cross + probe n, keyed for the cell join. */
+interface ModeledCrossProbe {
+  crossRPremiumBasis: number;
+  probeN: number;
+}
+type ModeledCrossByStructure = ReadonlyMap<string, ModeledCrossProbe>;
+
+/**
+ * TRA-4291 — fold the demo journal's fill-time quotes into the per-structure
+ * modeled-cross inputs, via the SAME `summarizeSpreadCost` fold
+ * `/api/health/option-spread-cost` publishes — same sample admission (demo rows
+ * carrying `entryBid`/`entryAsk`/`entryMarkUsd`, unusable quotes dropped, never
+ * zero-filled), so `crossRPremiumBasis` and `probeN` here are that route's
+ * `byStructure[].avgSpreadCrossRPremiumBasis` and `.n` verbatim and a reader
+ * can cross-check without a unit conversion.
+ *
+ * Fed the FULL journal (this helper pins `mode === 'demo'` itself), NOT the
+ * report's cohort-filtered rows — deliberately. The cross is a property of the
+ * structure's market, not of the graded cohort, and letting a narrow
+ * `?sinceTs=` window shrink the probe below `acceptanceN` would null exactly
+ * the cells the window exists to grade.
+ */
+function modeledCrossByStructure(rows: OptionTradeJournalRecord[]): ModeledCrossByStructure {
+  const samples: SpreadCostSample[] = [];
+  for (const r of rows) {
+    if (r.mode !== 'demo') continue;
+    if (
+      typeof r.entryBid !== 'number'
+      || typeof r.entryAsk !== 'number'
+      || typeof r.entryMarkUsd !== 'number'
+    ) {
+      continue;
+    }
+    samples.push({
+      structure: r.structure,
+      quote: { bid: r.entryBid, ask: r.entryAsk, mark: r.entryMarkUsd },
+    });
+  }
+  return new Map(
+    summarizeSpreadCost(samples).map((s) => [
+      s.structure,
+      { crossRPremiumBasis: s.avgSpreadCrossRPremiumBasis, probeN: s.n },
+    ]),
+  );
+}
+
+/**
+ * TRA-4291 — the per-cell join. Pure arithmetic over numbers the cell fold
+ * already has: `netKx = avgR − k · cross · demoClosed / closed` — i.e. each
+ * DEMO close is charged `k` crosses and each LIVE close is charged nothing
+ * (its booked `realizedR` already paid the real one; charging it again would
+ * double-bill exactly the rows whose cost is not modeled). Uses the same
+ * `?? 0` missing-R convention as `avgR` so the two columns stay comparable.
+ */
+function modeledCrossForCell(
+  structure: string,
+  list: OptionTradeJournalRecord[],
+  avgR: number | null,
+  probe: ModeledCrossProbe | undefined,
+): OptionJournalModeledCross {
+  const demoClosedCharged = list.filter((r) => r.mode === 'demo').length;
+  const liveClosedUncharged = list.length - demoClosedCharged;
+  const base = {
+    basis: 'premium' as const,
+    acceptanceN: SPREAD_COST_ACCEPTANCE_N,
+    demoClosedCharged,
+    liveClosedUncharged,
+  };
+  if (probe === undefined) {
+    return {
+      ...base,
+      avgRNetOfModeledCross1x: null,
+      avgRNetOfModeledCross2x: null,
+      modeledCrossRPremiumBasis: null,
+      probeN: null,
+      reason:
+        `no spread-cost probe row for structure '${structure}' — no demo fill retaining a `
+        + 'fill-time quote has measured its cross, so there is nothing to charge. null, '
+        + 'never 0: an unmeasured cost is not a zero cost (TRA-2319).',
+    };
+  }
+  if (probe.probeN < SPREAD_COST_ACCEPTANCE_N) {
+    return {
+      ...base,
+      avgRNetOfModeledCross1x: null,
+      avgRNetOfModeledCross2x: null,
+      modeledCrossRPremiumBasis: probe.crossRPremiumBasis,
+      probeN: probe.probeN,
+      reason:
+        `spread-cost probe n=${probe.probeN} for '${structure}' is below acceptanceN=`
+        + `${SPREAD_COST_ACCEPTANCE_N} — too few measured fills to trust the mean cross as a `
+        + 'grading input, so no net is modeled. null, never 0 (TRA-2319).',
+    };
+  }
+  if (avgR === null) {
+    // Unreachable in practice — a cell exists only because rows folded into it,
+    // and `rollupResolvedForCell` returns null avgR only at closed === 0 — but
+    // stated rather than coerced: a cell with no gross mean has no net mean.
+    return {
+      ...base,
+      avgRNetOfModeledCross1x: null,
+      avgRNetOfModeledCross2x: null,
+      modeledCrossRPremiumBasis: probe.crossRPremiumBasis,
+      probeN: probe.probeN,
+      reason: 'cell has no gross avgR (0 closed rows), so there is no mean to restate.',
+    };
+  }
+  const chargePerCross = (probe.crossRPremiumBasis * demoClosedCharged) / list.length;
+  return {
+    ...base,
+    avgRNetOfModeledCross1x: avgR - chargePerCross,
+    avgRNetOfModeledCross2x: avgR - 2 * chargePerCross,
+    modeledCrossRPremiumBasis: probe.crossRPremiumBasis,
+    probeN: probe.probeN,
+    reason: null,
+  };
+}
+
 /**
  * TRA-2590 — fold RESOLVED rows into the (structure × exitReason) cross-tab.
  *
@@ -2420,6 +2591,7 @@ const LEFT_TAIL_SAMPLE_CAP = 12;
  */
 function crossTabStructureExit(
   rows: OptionTradeJournalRecord[],
+  crossModel: ModeledCrossByStructure,
 ): OptionJournalStructureExitCrossTab {
   const closedRows = rows.filter((r) => r.outcome !== 'OPEN');
   // The two key parts are carried BESIDE the rows, never parsed back out of a
@@ -2453,10 +2625,14 @@ function crossTabStructureExit(
       }));
       const bucketed = rHistogram.reduce((a, b) => a + b.count, 0);
       const ascending = [...finiteR].sort((a, b) => a - b);
+      const rollup = rollupResolvedForCell(list);
       return {
         structure,
         exitReason,
-        ...rollupResolvedForCell(list),
+        ...rollup,
+        // TRA-4291 — the modeled net-of-cross companion to the gross avgR just
+        // spread in. Additive: every pre-existing field is byte-identical.
+        modeledCross: modeledCrossForCell(structure, list, rollup.avgR, crossModel.get(structure)),
         rHistogram,
         // Derived from the SAME finite set the buckets are, so the headline
         // counts and the histogram can never disagree.
@@ -2509,6 +2685,27 @@ function crossTabStructureExit(
       + 'closesBelowMinus050R / closesBelowMinus100R are STRICT (< edge), so a close landing ON '
       + '-0.50R is NOT a violation of TRA-2202\'s "zero closes below -0.50R". minR >= -0.50 '
       + 'settles the criterion for this cell with no float-epsilon question at all.',
+    modeledCrossNote:
+      'TRA-4291 — cells[].modeledCross puts a MODELED net-of-cross avgR beside the gross one, '
+      + 'because 3524/3555 journal rows are demo and demo realizedR books NO spread '
+      + '(demoSlippagePct 0, demoFeePerContract 0) — a cell can read scratch while being a '
+      + 'repeated unbooked payment of the bid/ask (TRA-4230: gross +0.016 avgR, -17.76R once '
+      + 'one mean cross is charged). Each DEMO close is charged the structure\'s MEASURED mean '
+      + 'cross, /api/health/option-spread-cost byStructure[].avgSpreadCrossRPremiumBasis — '
+      + 'already premium R, same unit as avgR, NO gateRPerPremiumR conversion — over the '
+      + 'CUMULATIVE demo probe pool (deliberately not scoped by this response\'s cohort '
+      + 'window: the cross is a property of the structure\'s market, and a narrow window '
+      + 'shrinking the probe under acceptanceN would null exactly the cells the window '
+      + 'grades; probeN and modeledCrossRPremiumBasis on the cell are that route\'s n and '
+      + 'cross verbatim). LIVE closes are NEVER charged — their booked realizedR already '
+      + 'paid the real cross (liveClosedUncharged counts them). 1x = entry cross only, the '
+      + 'conservative floor; 2x = entry + exit, the realistic round trip — both are emitted, '
+      + 'neither is silently picked. netKx = avgR - k*cross*demoClosedCharged/closed, same '
+      + '?? 0 missing-R convention as avgR so the columns stay comparable. It is a MODEL, '
+      + 'not a booked cost: realizedR/avgR/realizedPnlUsd are untouched and stay gross. '
+      + '⚠ TRA-2319 — null is NOT a pass: no probe row or probeN < acceptanceN emits null '
+      + 'with a reason, never 0, and null <= x is true in JavaScript — gate on !== null '
+      + 'before any comparison.',
   };
 }
 
@@ -2559,8 +2756,15 @@ function accountClassRowCounts(rows: OptionTradeJournalRecord[]): {
   };
 }
 
-/** TRA-2193 — the same fold, run separately over each account class. */
-function partitionByAccountClass(rows: OptionTradeJournalRecord[]): {
+/** TRA-2193 — the same fold, run separately over each account class.
+ *  TRA-4291 — `crossModel` is the per-structure modeled-cross input for the
+ *  cells' `modeledCross` join, computed ONCE by the caller over the FULL demo
+ *  journal (see {@link modeledCrossByStructure} for why it is not
+ *  cohort-scoped) and shared by all three class folds. */
+function partitionByAccountClass(
+  rows: OptionTradeJournalRecord[],
+  crossModel: ModeledCrossByStructure,
+): {
   byAccountClass: {
     fixture: ReturnType<typeof summarizeOptionTradeJournal> & {
       byStructureExit: OptionJournalStructureExitCrossTab;
@@ -2648,11 +2852,11 @@ function partitionByAccountClass(rows: OptionTradeJournalRecord[]): {
       // population the route's own note says to grade. Folding it once over the
       // pool and slicing later is what produced the marginals problem in the
       // first place.
-      fixture: { ...summarizeOptionTradeJournal(p.fixture), byStructureExit: crossTabStructureExit(p.fixture) },
-      desk: { ...summarizeOptionTradeJournal(p.desk), byStructureExit: crossTabStructureExit(p.desk) },
+      fixture: { ...summarizeOptionTradeJournal(p.fixture), byStructureExit: crossTabStructureExit(p.fixture, crossModel) },
+      desk: { ...summarizeOptionTradeJournal(p.desk), byStructureExit: crossTabStructureExit(p.desk, crossModel) },
       unattributed: {
         ...summarizeOptionTradeJournal(p.unattributed),
-        byStructureExit: crossTabStructureExit(p.unattributed),
+        byStructureExit: crossTabStructureExit(p.unattributed, crossModel),
       },
     },
     accountClassCountsSumToRows:
@@ -3035,7 +3239,14 @@ export function buildOptionJournalReport(
     shrinkageEnabled: isLearnedShrinkageEnabled(),
     summary: {
       ...summarizeOptionTradeJournal(summaryRows),
-      ...partitionByAccountClass(summaryRows as OptionTradeJournalRecord[]),
+      // TRA-4291 — the modeled-cross inputs are folded from the FULL journal
+      // passed in (`rows`, mode-pinned to demo inside the helper), not the
+      // cohort-filtered `summaryRows`, so the per-cell probe matches
+      // /api/health/option-spread-cost's cumulative byStructure verbatim.
+      ...partitionByAccountClass(
+        summaryRows as OptionTradeJournalRecord[],
+        modeledCrossByStructure(rows as OptionTradeJournalRecord[]),
+      ),
       // TRA-3381 — the mode partition folds the SAME sinceTs-filtered set as the
       // summary and the class partition; three folds over two populations in one
       // 200 is the TRA-2082 shape.
@@ -6445,7 +6656,10 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     const byStructure = summarizeSpreadCost(samples, { safetyMarginR: config.safetyMarginR });
     const rowsWithQuote = samples.length;
     const rowsTotal = rows.length;
-    const ACCEPTANCE_N = 50;
+    // TRA-4291 — shared with the option-journal modeled net-of-cross join, so
+    // the two surfaces cannot disagree on where the bar sits. Same value (50)
+    // this route has always emitted.
+    const ACCEPTANCE_N = SPREAD_COST_ACCEPTANCE_N;
     const shortfall = byStructure.filter((s) => s.n < ACCEPTANCE_N).map((s) => s.structure);
 
     res.json({

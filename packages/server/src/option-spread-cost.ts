@@ -535,6 +535,16 @@ export interface SpreadCostSummaryOptions {
 }
 
 /**
+ * TRA-1656's acceptance bar on a structure's probe `n` — the count of measured
+ * fills below which the mean cross is not trusted as a grading input. Hoisted
+ * (TRA-4291) so the two consumers — `/api/health/option-spread-cost`'s
+ * `retention.acceptanceN` and the modeled net-of-cross join on
+ * `/api/health/option-journal`'s `byStructureExit` cells — cannot drift on
+ * where the bar sits.
+ */
+export const SPREAD_COST_ACCEPTANCE_N = 50;
+
+/**
  * Fold a set of measurable fills into the per-structure measured spread-cost
  * rollup. Samples whose quote is unusable are dropped (never zero-filled), so
  * `n` is always the count of genuinely MEASURED fills — the quantity the

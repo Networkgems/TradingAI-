@@ -5521,6 +5521,168 @@ describe('TRA-2590 option-journal structure x exitReason cross-tab', () => {
 });
 
 // ---------------------------------------------------------------------------
+// TRA-4291 — the modeled net-of-cross avgR beside the gross one.
+//
+// Demo realizedR books NO spread (demoSlippagePct 0, demoFeePerContract 0), so
+// a cell can read 92.5% scratch while being a repeated unbooked payment of the
+// bid/ask — TRA-4230's single_leg_rv x time_stop block read gross +0.016 avgR
+// for months while being -17.76R once one mean cross is charged. These tests
+// pin the join: each DEMO close is charged the structure's measured mean cross
+// (already premium basis), live closes are never charged twice, and a missing
+// or under-powered probe yields null WITH a reason — never a fabricated 0.
+// ---------------------------------------------------------------------------
+
+describe('TRA-4291 modeled net-of-cross avgR on byStructureExit cells', () => {
+  function qrow(
+    over: Partial<OptionTradeJournalRecord> & { id: string },
+  ): OptionTradeJournalRecord {
+    return {
+      openTs: NOW - 3_600_000,
+      symbol: 'JACK',
+      structure: 'single_leg_rv',
+      mode: 'demo',
+      ivRank: null,
+      trend: 'up',
+      sentiment: null,
+      entryDelta: 0.45,
+      entryDte: 30,
+      atRiskUsd: 200,
+      agentConviction: null,
+      outcome: 'SCRATCH',
+      closeTs: NOW,
+      realizedPnlUsd: 2,
+      realizedR: 0.01,
+      exitReason: 'time_stop',
+      holdDays: 1,
+      account: 'admin',
+      // bid 0.95 / ask 1.05 / mark 1.00 => spreadCrossRPremiumBasis = 0.10,
+      // the journal's own premium unit — no 4x conversion anywhere in the join.
+      entryBid: 0.95,
+      entryAsk: 1.05,
+      entryMarkUsd: 1.0,
+      ...over,
+    } as OptionTradeJournalRecord;
+  }
+
+  function deskCell(rows: OptionTradeJournalRecord[], structure: string, exitReason: string, sinceTs?: number) {
+    const tab = buildOptionJournalReport(rows, NOW, true, undefined, sinceTs).summary.byAccountClass
+      .desk.byStructureExit;
+    return {
+      tab,
+      cell: tab.cells.find((c) => c.structure === structure && c.exitReason === exitReason),
+    };
+  }
+
+  it('★ the TRA-4230 shape: a positive gross avgR reads NEGATIVE once the measured cross is charged, and gross is untouched', () => {
+    // 50 quoted demo closes => probeN 50 (exactly acceptanceN, which passes:
+    // the bar is `< acceptanceN`), cross 0.10 premium, gross avgR +0.01.
+    const rows = Array.from({ length: 50 }, (_, i) => qrow({ id: `a${i}` }));
+    const { cell } = deskCell(rows, 'single_leg_rv', 'time_stop');
+    const mc = cell!.modeledCross;
+
+    // The gross column is byte-identical to what it always was.
+    expect(cell!.avgR).toBeCloseTo(0.01, 12);
+    // One cross (entry only — the conservative floor): +0.01 - 0.10 < 0.
+    expect(mc.avgRNetOfModeledCross1x).toBeCloseTo(0.01 - 0.1, 12);
+    expect(mc.avgRNetOfModeledCross1x!).toBeLessThan(0);
+    // Two crosses (entry + exit — the realistic round trip), emitted BESIDE the
+    // floor rather than silently picked.
+    expect(mc.avgRNetOfModeledCross2x).toBeCloseTo(0.01 - 0.2, 12);
+    // Provenance is on the cell — re-derivable without a second endpoint.
+    expect(mc.modeledCrossRPremiumBasis).toBeCloseTo(0.1, 12);
+    expect(mc.basis).toBe('premium');
+    expect(mc.probeN).toBe(50);
+    expect(mc.acceptanceN).toBe(50);
+    expect(mc.demoClosedCharged).toBe(50);
+    expect(mc.liveClosedUncharged).toBe(0);
+    expect(mc.reason).toBeNull();
+  });
+
+  it('a probe below acceptanceN yields NULL with a reason — never a fabricated 0 (TRA-2319)', () => {
+    const rows = Array.from({ length: 10 }, (_, i) => qrow({ id: `b${i}` }));
+    const { cell } = deskCell(rows, 'single_leg_rv', 'time_stop');
+    const mc = cell!.modeledCross;
+    expect(mc.avgRNetOfModeledCross1x).toBeNull();
+    expect(mc.avgRNetOfModeledCross2x).toBeNull();
+    // NOT zero — `null <= x` is true in JS, so a consumer must gate on !== null.
+    expect(mc.avgRNetOfModeledCross1x).not.toBe(0);
+    // The shortfall is stated, with the measured-but-untrusted cross beside it.
+    expect(mc.probeN).toBe(10);
+    expect(mc.reason).toContain('acceptanceN');
+    expect(mc.modeledCrossRPremiumBasis).toBeCloseTo(0.1, 12);
+  });
+
+  it('a structure with NO probe row yields NULL with a reason, not 0', () => {
+    // No row retains a fill-time quote => summarizeSpreadCost has no bucket.
+    const rows = Array.from({ length: 3 }, (_, i) =>
+      qrow({ id: `c${i}`, entryBid: undefined, entryAsk: undefined, entryMarkUsd: undefined }),
+    );
+    const { cell } = deskCell(rows, 'single_leg_rv', 'time_stop');
+    const mc = cell!.modeledCross;
+    expect(mc.avgRNetOfModeledCross1x).toBeNull();
+    expect(mc.avgRNetOfModeledCross2x).toBeNull();
+    expect(mc.probeN).toBeNull();
+    expect(mc.modeledCrossRPremiumBasis).toBeNull();
+    expect(mc.reason).toContain('no spread-cost probe row');
+  });
+
+  it('LIVE closes are never charged — their booked realizedR already paid the real cross', () => {
+    // 50 demo + 50 live in ONE cell: only the demo half is charged, so the
+    // per-close charge halves: net1x = 0.01 - 0.10 * 50/100 = -0.04.
+    const rows = [
+      ...Array.from({ length: 50 }, (_, i) => qrow({ id: `d${i}` })),
+      ...Array.from({ length: 50 }, (_, i) => qrow({ id: `l${i}`, mode: 'live' })),
+    ];
+    const { cell } = deskCell(rows, 'single_leg_rv', 'time_stop');
+    const mc = cell!.modeledCross;
+    expect(mc.demoClosedCharged).toBe(50);
+    expect(mc.liveClosedUncharged).toBe(50);
+    expect(mc.avgRNetOfModeledCross1x).toBeCloseTo(0.01 - 0.1 * (50 / 100), 12);
+    expect(mc.avgRNetOfModeledCross2x).toBeCloseTo(0.01 - 0.2 * (50 / 100), 12);
+
+    // An ALL-live cell is charged nothing: modeled net == gross, stated, not null.
+    const slLive = [
+      ...Array.from({ length: 50 }, (_, i) => qrow({ id: `p${i}`, exitReason: 'sl' })),
+      ...Array.from({ length: 3 }, (_, i) => qrow({ id: `q${i}`, mode: 'live' })),
+    ];
+    const allLive = deskCell(slLive, 'single_leg_rv', 'time_stop').cell!.modeledCross;
+    expect(allLive.demoClosedCharged).toBe(0);
+    expect(allLive.liveClosedUncharged).toBe(3);
+    expect(allLive.avgRNetOfModeledCross1x).toBeCloseTo(0.01, 12);
+    expect(allLive.avgRNetOfModeledCross2x).toBeCloseTo(0.01, 12);
+    expect(allLive.reason).toBeNull();
+  });
+
+  it('the probe pool is the FULL demo journal, not the cohort window — a narrow ?sinceTs cannot null the cell it grades', () => {
+    const old = Array.from({ length: 50 }, (_, i) =>
+      qrow({ id: `o${i}`, openTs: NOW - 10 * 86_400_000 }),
+    );
+    const recent = qrow({
+      id: 'r0',
+      openTs: NOW - 1_000,
+      entryBid: undefined,
+      entryAsk: undefined,
+      entryMarkUsd: undefined,
+    });
+    const { cell } = deskCell([...old, recent], 'single_leg_rv', 'time_stop', NOW - 2_000);
+    // The window folded ONE row into the cell…
+    expect(cell!.closed).toBe(1);
+    // …but the cross model still stands on the cumulative 50-fill probe.
+    expect(cell!.modeledCross.probeN).toBe(50);
+    expect(cell!.modeledCross.avgRNetOfModeledCross1x).toBeCloseTo(0.01 - 0.1, 12);
+  });
+
+  it('the container documents the join and the null-is-not-a-pass trap, additively', () => {
+    const { tab } = deskCell([qrow({ id: 'n0' })], 'single_leg_rv', 'time_stop');
+    expect(tab.modeledCrossNote).toContain('MODELED');
+    expect(tab.modeledCrossNote).toContain('TRA-2319');
+    expect(tab.modeledCrossNote).toContain('avgSpreadCrossRPremiumBasis');
+    // The pre-existing note is byte-untouched — the new doc lives beside it.
+    expect(tab.note).not.toContain('TRA-4291');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // TRA-3011 — the durability note's third state.
 //
 // From 2026-07-30T23:40Z to 2026-08-04T~21:20Z every write to /data on bqb1
