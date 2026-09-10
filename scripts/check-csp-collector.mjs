@@ -153,11 +153,28 @@ if (missing.length) {
 say(`wired       : report-uri + report-to + Reporting-Endpoints present`);
 
 // The positive control for the SIBLING risk: this checker greening must never be
-// read as "the promotion happened". If the enforced slot has grown past
-// frame-ancestors, someone promoted without TRA-2321, and that is the finding.
-if (enforced && enforced.trim() !== "frame-ancestors 'none'") {
-  say(`WARNING: enforced CSP is no longer just frame-ancestors — it is: ${enforced}`);
-  say('WARNING: if TRA-2321 has not been signed off, that is an accidental promotion.');
+// read as "the promotion happened". TRA-4429 promoted deliberately, so there are now
+// exactly TWO legitimate enforced shapes; anything else is the finding.
+//   - `frame-ancestors 'none'` alone: pre-4429 build, or CSP_ENFORCED_POLICY=frame-ancestors
+//     (the kill switch) has been pulled.
+//   - the promoted policy: default-src + the explicit `'wasm-unsafe-eval'` carve-out,
+//     and NEVER a bare `'unsafe-eval'` token (which would enable eval()).
+const enforcedTrim = enforced.trim();
+const scriptSrcTokens = (enforcedTrim.split(';').map(d => d.trim()).find(d => d.startsWith('script-src ')) ?? '').split(/\s+/);
+if (!enforcedTrim) {
+  say('WARNING: no enforced CSP at all — the clickjacking fix (TRA-2298) is gone.');
+} else if (enforcedTrim === "frame-ancestors 'none'") {
+  say("enforced    : frame-ancestors only (pre-TRA-4429 build, or the CSP_ENFORCED_POLICY kill switch is pulled)");
+} else if (
+  enforcedTrim.includes("default-src 'self'") &&
+  enforcedTrim.includes("frame-ancestors 'none'") &&
+  scriptSrcTokens.includes("'wasm-unsafe-eval'") &&
+  !scriptSrcTokens.includes("'unsafe-eval'")
+) {
+  say('enforced    : TRA-4429 promoted policy');
+} else {
+  say(`WARNING: enforced CSP matches neither sanctioned shape — it is: ${enforced}`);
+  say('WARNING: that is an unreviewed widening/narrowing; compare with TRA-4429 before trusting this box.');
 }
 
 // ── Leg 3: is the window gradable, and what does it say? ─────────────────────

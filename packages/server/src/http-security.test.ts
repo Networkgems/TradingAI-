@@ -3,6 +3,10 @@ import {
   buildAllowedOrigins,
   resolveAllowedOrigin,
   securityHeaders,
+  securityHeadersMiddleware,
+  enforcedCsp,
+  resolveCspEnforcedMode,
+  MINIMAL_ENFORCED_CSP,
   reportOnlyCsp,
   reportingEndpointsHeader,
   toOrigin,
@@ -158,22 +162,84 @@ describe('securityHeaders', () => {
     expect(h['X-Content-Type-Options']).toBe('nosniff');
   });
 
-  it('keeps the ENFORCED policy to frame-ancestors only', () => {
-    // Guards against someone promoting the report-only policy into the enforced
-    // slot without a session of clean reports: `default-src 'self'` enforced
-    // today would be a live SPA outage, and this is the cheapest place to catch
-    // that. Promotion is a deliberate edit to this assertion.
-    const csp = securityHeaders({ secure: true, host: 'h' })['Content-Security-Policy'];
-    expect(csp).toBe("frame-ancestors 'none'");
-    expect(csp).not.toContain('default-src');
+  it('pins the ENFORCED policy to the exact TRA-4429 promoted string', () => {
+    // TRA-4429 promoted the TRA-2321 candidate, so this pin moved — it was NOT
+    // deleted. It is still exact equality on purpose: the next widening (a new
+    // source, `'unsafe-eval'`, a dropped directive) must be a deliberate edit to
+    // this string, never a silent one.
+    const csp = securityHeaders({ secure: true, host: 'tradingai-bqb1.onrender.com' })['Content-Security-Policy'];
+    expect(csp).toBe(
+      "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; " +
+        "form-action 'self'; script-src 'self' 'wasm-unsafe-eval'; " +
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; " +
+        "worker-src 'self' blob:; manifest-src 'self'; " +
+        'connect-src \'self\' wss://tradingai-bqb1.onrender.com ws://tradingai-bqb1.onrender.com',
+    );
   });
 
-  it('ships the candidate policy Report-Only', () => {
+  it('never grants eval() — the wasm carve-out is NOT unsafe-eval', () => {
+    // `'wasm-unsafe-eval'` contains the substring `unsafe-eval`, so a toContain
+    // check would pass on the dangerous token too. Tokenise and compare exactly.
+    const csp = securityHeaders({ secure: true, host: 'h' })['Content-Security-Policy'] ?? '';
+    const scriptSrc = csp.split(';').map(d => d.trim()).find(d => d.startsWith('script-src ')) ?? '';
+    const tokens = scriptSrc.split(/\s+/);
+    expect(tokens).toContain("'wasm-unsafe-eval'");
+    expect(tokens).not.toContain("'unsafe-eval'");
+    expect(tokens).not.toContain("'unsafe-inline'");
+  });
+
+  it('ships the TIGHTER candidate Report-Only — no wasm carve-out there', () => {
+    // Promotion must not blind the instrument: Report-Only keeps measuring whether
+    // the wasm-eval dependency ever disappears, so the carve-out can be retired.
     const h = securityHeaders({ secure: true, host: 'tradingai-bqb1.onrender.com' });
     const ro = h['Content-Security-Policy-Report-Only'] ?? '';
     expect(ro).toContain("default-src 'self'");
     expect(ro).toContain("object-src 'none'");
     expect(ro).toContain("worker-src 'self' blob:"); // vite-plugin-pwa service worker
+    expect(ro).toContain("script-src 'self';");
+    expect(ro).not.toContain('wasm-unsafe-eval');
+    expect(ro).not.toBe(h['Content-Security-Policy']);
+  });
+});
+
+describe('TRA-4429 — CSP_ENFORCED_POLICY kill switch', () => {
+  it('defaults to the promoted policy when unset', () => {
+    expect(resolveCspEnforcedMode({})).toEqual({ mode: 'full', unrecognised: null });
+  });
+
+  it('drops to frame-ancestors only when pulled, and clickjacking stays enforced', () => {
+    expect(resolveCspEnforcedMode({ CSP_ENFORCED_POLICY: ' Frame-Ancestors ' }).mode).toBe('frame-ancestors');
+    const h = securityHeaders({ secure: true, host: 'h', cspMode: 'frame-ancestors' });
+    expect(h['Content-Security-Policy']).toBe(MINIMAL_ENFORCED_CSP);
+    expect(MINIMAL_ENFORCED_CSP).toBe("frame-ancestors 'none'");
+    // The instrument is untouched by the switch.
+    expect(h['Content-Security-Policy-Report-Only']).toBe(reportOnlyCsp('h'));
+  });
+
+  it('resolves a typo to the promoted policy and reports it, never to the weaker one', () => {
+    expect(resolveCspEnforcedMode({ CSP_ENFORCED_POLICY: 'frame-ancestor' })).toEqual({
+      mode: 'full',
+      unrecognised: 'frame-ancestor',
+    });
+  });
+
+  it('the middleware honours the switch on the wire, including the writeHead reassert', async () => {
+    // Positive/negative pair through the EXACT handler the server mounts.
+    const run = (env: NodeJS.ProcessEnv) => {
+      const headers: Record<string, string> = {};
+      const res = {
+        headersSent: false,
+        setHeader: (k: string, v: string) => { headers[k] = v; },
+        writeHead: () => undefined,
+      };
+      securityHeadersMiddleware(env)({ secure: true, headers: { host: 'h' } } as never, res as never, () => undefined);
+      // Simulate finalhandler clobbering the header, then the status line going out.
+      res.setHeader('Content-Security-Policy', "default-src 'none'");
+      (res.writeHead as () => void)();
+      return headers['Content-Security-Policy'];
+    };
+    expect(run({})).toBe(enforcedCsp('h'));
+    expect(run({ CSP_ENFORCED_POLICY: 'frame-ancestors' })).toBe("frame-ancestors 'none'");
   });
 });
 
@@ -191,11 +257,12 @@ describe('TRA-2344 — reporting wired to Report-Only, and ONLY Report-Only', ()
     const enforced = h['Content-Security-Policy'] ?? '';
     const ro = h['Content-Security-Policy-Report-Only'] ?? '';
 
-    // Detects: reporting directives leaking into the enforced policy.
-    expect(enforced).toBe("frame-ancestors 'none'");
+    // Detects: reporting directives leaking into the enforced policy. (TRA-4429
+    // moved the enforced slot to the promoted policy; it still carries NO
+    // reporting — the instrument lives one slot over, on the tighter candidate.)
+    expect(enforced).toBe(enforcedCsp('tradingai-bqb1.onrender.com'));
     expect(enforced).not.toContain('report-uri');
     expect(enforced).not.toContain('report-to');
-    expect(enforced).not.toContain('default-src');
 
     // Contains what it detects: the directives DO exist, one slot over. Without
     // these three lines the block above is satisfied by an empty change.

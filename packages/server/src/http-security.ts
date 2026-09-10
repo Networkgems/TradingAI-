@@ -160,15 +160,90 @@ export interface SecurityHeaderOptions {
   secure: boolean;
   /** `req.headers.host`, used to name this origin's WebSocket in the CSP. */
   host?: string | undefined;
+  /** TRA-4429 kill switch, resolved from env once by the middleware. Default `full`. */
+  cspMode?: CspEnforcedMode;
 }
 
 /**
- * The enforced Content-Security-Policy. Deliberately ONLY `frame-ancestors`:
- * that is the clickjacking fix TRA-2298 calls the sharpest edge, and it cannot
- * break a page that is never framed (nothing in this repo embeds the app —
- * grepped, zero `<iframe>`). Everything else ships Report-Only first.
+ * The pre-TRA-4429 enforced policy, and what the kill switch below falls back to.
+ * `frame-ancestors` is the clickjacking fix TRA-2298 calls the sharpest edge, and it
+ * cannot break a page that is never framed (nothing in this repo embeds the app —
+ * grepped, zero `<iframe>`). It is present in BOTH enforced shapes, so pulling the
+ * kill switch never reopens the clickjacking exposure.
  */
-const ENFORCED_CSP = "frame-ancestors 'none'";
+export const MINIMAL_ENFORCED_CSP = "frame-ancestors 'none'";
+
+/**
+ * TRA-4429 — kill switch for the promoted policy. A panel the enforced CSP breaks
+ * mid-session on a real-money box must be a RESTART, not a rebuild-and-deploy under
+ * pressure, so the shape is chosen from env:
+ *
+ *   CSP_ENFORCED_POLICY unset / `full`  → `enforcedCsp()` (the promoted policy)
+ *   CSP_ENFORCED_POLICY=frame-ancestors → MINIMAL_ENFORCED_CSP only (pre-4429)
+ *
+ * An unrecognised value resolves to `full` and is reported by the caller: a typo in
+ * a hardening switch must not silently weaken the header. The Report-Only header is
+ * unaffected by this switch in both shapes.
+ */
+export type CspEnforcedMode = 'full' | 'frame-ancestors';
+
+export function resolveCspEnforcedMode(env: NodeJS.ProcessEnv = process.env): {
+  mode: CspEnforcedMode;
+  unrecognised: string | null;
+} {
+  const raw = (env['CSP_ENFORCED_POLICY'] ?? '').trim().toLowerCase();
+  if (raw === '' || raw === 'full') return { mode: 'full', unrecognised: null };
+  if (raw === 'frame-ancestors') return { mode: 'frame-ancestors', unrecognised: null };
+  return { mode: 'full', unrecognised: raw };
+}
+
+/** `connect-src` for a document served by `host`. Shared by both policies. */
+function connectSrc(host: string | undefined): string {
+  // A document served by this origin opens its dashboard socket back to the
+  // same host. CSP3 says `'self'` should cover ws/wss on the same origin, but
+  // that has been unevenly implemented, so name it explicitly when we know it.
+  const socket = host ? ` wss://${host} ws://${host}` : '';
+  return `connect-src 'self'${socket}`;
+}
+
+/**
+ * TRA-4429 — the ENFORCED policy, promoted from the TRA-2321 candidate after the
+ * TRA-2344 collector read 24 days with violations on ONE bucket only
+ * (`script-src` / `wasm-eval`) and zero on the other ten directives.
+ *
+ * `script-src` is named explicitly, and it has to be: omitting it while enforcing
+ * `default-src 'self'` does not leave scripts unenforced, it falls back to
+ * `default-src` (CSP L3 fetch-directive fallback) — bit-for-bit the policy that
+ * produced the wasm-eval reports. `'wasm-unsafe-eval'` permits
+ * `WebAssembly.compile`/`instantiate` and NOTHING else: it does not enable `eval()`
+ * or `new Function()` (that is `'unsafe-eval'`, which this policy does not grant).
+ * The shipped client bundle makes no WebAssembly call (TRA-4429 grep of the live
+ * bytes), so the carve-out is retirable once the Report-Only tape shows the
+ * wasm-eval bucket has stopped arriving.
+ *
+ * `'unsafe-inline'` on style-src is PERMANENT BY DESIGN, not an oversight: React
+ * inline `style={{...}}` props and the chart components emit inline styles
+ * (TRA-2321 item 2). `worker-src` covers the vite-plugin-pwa service worker.
+ *
+ * No `report-uri`/`report-to` here on purpose: the instrument stays on the
+ * Report-Only header, which carries the TIGHTER candidate (no wasm carve-out).
+ */
+export function enforcedCsp(host?: string): string {
+  return [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    "script-src 'self' 'wasm-unsafe-eval'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "font-src 'self' data:",
+    "worker-src 'self' blob:",
+    "manifest-src 'self'",
+    connectSrc(host),
+  ].join('; ');
+}
 
 // ── TRA-2344 — where violation reports go ────────────────────────────────────
 //
@@ -204,13 +279,13 @@ export function reportingEndpointsHeader(host: string | undefined, secure: boole
 }
 
 /**
- * The candidate full policy, shipped Report-Only so a violation is a console
- * entry, never a broken panel. Promote to enforced on a separate ticket once a
- * session's worth of reports is clean.
- *
- * `'unsafe-inline'` on style-src is expected to be permanent: React inline
- * `style={{...}}` props and the chart components emit inline styles. `worker-src`
- * covers the vite-plugin-pwa service worker.
+ * The TIGHTER candidate, shipped Report-Only so a violation is a console entry,
+ * never a broken panel. TRA-4429 promoted this policy to enforced WITH a
+ * `'wasm-unsafe-eval'` carve-out on script-src (see `enforcedCsp`); this header
+ * deliberately keeps `script-src 'self'` WITHOUT it, so the collector keeps
+ * measuring whether the wasm-eval dependency ever disappears and the carve-out can
+ * be retired. A Report-Only header identical to the enforced one measures nothing —
+ * do not "sync" the two.
  *
  * TRA-2344 appends `report-uri` + `report-to` — to THIS header only. Both ship
  * because they are not interchangeable: `report-uri` is deprecated but is what
@@ -220,10 +295,6 @@ export function reportingEndpointsHeader(host: string | undefined, secure: boole
  * no violations — which is the reading error TRA-2321 must not make.
  */
 export function reportOnlyCsp(host?: string): string {
-  // A document served by this origin opens its dashboard socket back to the
-  // same host. CSP3 says `'self'` should cover ws/wss on the same origin, but
-  // that has been unevenly implemented, so name it explicitly when we know it.
-  const socket = host ? ` wss://${host} ws://${host}` : '';
   return [
     "default-src 'self'",
     "base-uri 'self'",
@@ -236,7 +307,7 @@ export function reportOnlyCsp(host?: string): string {
     "font-src 'self' data:",
     "worker-src 'self' blob:",
     "manifest-src 'self'",
-    `connect-src 'self'${socket}`,
+    connectSrc(host),
     // Relative URL on purpose: `report-uri` resolves against the document, this
     // endpoint is same-origin, and naming an absolute host here would break the
     // moment the app is served from a hostname this code did not predict.
@@ -260,12 +331,11 @@ export function securityHeaders(opts: SecurityHeaderOptions): Record<string, str
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'strict-origin-when-cross-origin',
-    // TRA-2344 did NOT touch this line, and the control in the test suite exists
-    // to prove it: the enforced slot is still exactly `frame-ancestors 'none'`,
-    // with no `report-uri`/`report-to` and no `default-src`. Promotion is TRA-2321's
-    // deliberate edit, gated on a clean session of the reports the line below now
-    // actually collects.
-    'Content-Security-Policy': ENFORCED_CSP,
+    // TRA-4429 — the promoted policy, pinned to its exact string in the test suite
+    // so the next widening is a deliberate edit. `CSP_ENFORCED_POLICY=frame-ancestors`
+    // (restart, no rebuild) drops it back to the pre-promotion clickjacking-only slot.
+    'Content-Security-Policy':
+      opts.cspMode === 'frame-ancestors' ? MINIMAL_ENFORCED_CSP : enforcedCsp(opts.host),
     'Content-Security-Policy-Report-Only': reportOnlyCsp(opts.host),
   };
   // TRA-2344 — `report-to` is inert without this header; the group name in the
@@ -285,14 +355,28 @@ export function securityHeaders(opts: SecurityHeaderOptions): Record<string, str
 // the wiring would keep passing after the wiring in `index.ts` drifted, which
 // is the failure mode that makes a green suite worse than no suite.
 
-/** Stamps the security headers on every response, including static and error paths. */
-export function securityHeadersMiddleware(): RequestHandler {
+/**
+ * Stamps the security headers on every response, including static and error paths.
+ *
+ * TRA-4429: the CSP kill switch is read from `env` ONCE, here, so a flip takes
+ * effect on restart and every response of one process carries the same policy.
+ * An unrecognised value is announced on stderr at mount (this module has no
+ * runtime imports, so no logger) and resolves to the promoted policy.
+ */
+export function securityHeadersMiddleware(env: NodeJS.ProcessEnv = process.env): RequestHandler {
+  const { mode: cspMode, unrecognised } = resolveCspEnforcedMode(env);
+  if (unrecognised !== null) {
+    console.warn(
+      `[http-security] CSP_ENFORCED_POLICY=${JSON.stringify(unrecognised)} is not "full" or ` +
+        '"frame-ancestors"; enforcing the FULL promoted policy (TRA-4429).',
+    );
+  }
   return (req, res, next) => {
     // `req.secure` is only truthful because `app.set('trust proxy', true)` is
     // set (TRA-404) — behind Render's proxy the TLS terminates upstream and the
     // signal arrives as `X-Forwarded-Proto`. Without trust proxy this would be
     // false on prod and HSTS would never ship.
-    const headers = securityHeaders({ secure: req.secure, host: req.headers.host });
+    const headers = securityHeaders({ secure: req.secure, host: req.headers.host, cspMode });
     for (const [name, value] of Object.entries(headers)) res.setHeader(name, value);
 
     // TRA-2320 — A HEADER SET IN MIDDLEWARE IS NOT FINAL. Two of Express's own
@@ -322,7 +406,7 @@ export function securityHeadersMiddleware(): RequestHandler {
     res.writeHead = function reassertCsp(this: typeof res, ...args: unknown[]) {
       try {
         if (!res.headersSent) {
-          res.setHeader('Content-Security-Policy', headers['Content-Security-Policy'] ?? ENFORCED_CSP);
+          res.setHeader('Content-Security-Policy', headers['Content-Security-Policy'] ?? MINIMAL_ENFORCED_CSP);
         }
       } catch {
         // A hardening header must never be the reason a response fails to send.

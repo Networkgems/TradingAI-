@@ -8,6 +8,7 @@ import { tmpdir } from 'os';
 import {
   buildAllowedOrigins,
   corsMiddleware,
+  enforcedCsp,
   notFoundHandler,
   securityHeadersMiddleware,
   PAGES_ORIGIN,
@@ -204,7 +205,7 @@ describe('TRA-2320 — enforced CSP survives every response class', () => {
     it(`keeps frame-ancestors on: ${c.name}`, async () => {
       const res = await fetch(`${base}${c.path}`, { method: c.method ?? 'GET' });
       expect(res.status).toBe(c.status);
-      expect(res.headers.get('content-security-policy')).toBe("frame-ancestors 'none'");
+      expect(res.headers.get('content-security-policy')).toBe(enforcedCsp(new URL(base).host));
       // The headers finalhandler does NOT touch must still be there too, so a
       // regression that dropped the whole middleware can't hide behind this.
       expect(res.headers.get('x-frame-options')).toBe('DENY');
@@ -222,7 +223,7 @@ describe('TRA-2320 — enforced CSP survives every response class', () => {
     const res = await fetch(`${base}/assets`, { redirect: 'manual' });
     expect(res.status).toBe(301);
     expect(res.headers.get('location')).toBe('/assets/');
-    expect(res.headers.get('content-security-policy')).toBe("frame-ancestors 'none'");
+    expect(res.headers.get('content-security-policy')).toBe(enforcedCsp(new URL(base).host));
   });
 
   it('answers an unknown /api path with JSON, not finalhandler HTML', async () => {
