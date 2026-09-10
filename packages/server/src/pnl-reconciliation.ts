@@ -975,11 +975,13 @@ export interface PnlReconcileDay {
   stockLegProbeRowUsd: number | null;
   /**
    * TRA-4506 AC1 — Σ non-capital broker events (`fee`) over this row's span,
-   * signed as posted. Stamped by the writer on rows written after this ticket;
-   * supplied at read time on older rows ONLY when the row's `netCashFlowUsd`
-   * provably excludes it (equals the typed record's capital-only flow) — a row
+   * signed as posted. Read off the typed cash record whenever the row's
+   * `netCashFlowUsd` provably excludes fees (equals the record's capital-only
+   * flow), net of whatever the writer already stamped — so a fee posted after
+   * the 21:00 ET tick is still booked. Otherwise the writer's own stamp: a row
    * whose flow was written off a v1 record already carries the fee, and
-   * subtracting it again would book it twice. `null` = not measured.
+   * subtracting it again would book it twice. `null` = not measured — which is
+   * every row while the book's record is still `v1-aggregate` (TRA-3595).
    */
   stockLegProbeBrokerFeeUsd: number | null;
   /**
@@ -3941,23 +3943,28 @@ export function reconcilePnl(
       const rowNetCashFlowUsd = finiteOrNull(s.netCashFlowUsd);
       const rowOpenOptionMarkDeltaUsd = finiteOrNull(s.openOptionMarkDeltaUsd);
       const ops = probeReadOperandsByDate?.get(s.date) ?? null;
-      // AC1. A row the post-TRA-4506 writer shaped CARRIES the key (even as
-      // `null`) and its probe already nets the fee; the reader adds nothing. An
-      // older row gets the typed record's figure only when its own stored flow
-      // equals the capital-only flow for the span — i.e. provably excludes the
-      // fee. A flow written off a v1 record includes it, and a second
-      // subtraction would book the fee twice.
-      const brokerFeeStampedByWriter = s.stockLegProbeBrokerFeeUsd !== undefined;
-      const readTimeBrokerFeeUsd =
-        !brokerFeeStampedByWriter && ops !== null
-          && ops.brokerFeeUsd !== null && ops.capitalFlowUsd !== null
+      // AC1. The typed record is the fee's ledger; the row is only what the
+      // writer SAW at 21:00 ET. Wherever the row's stored flow provably excludes
+      // fees (equals the record's capital-only flow for the span), the record's
+      // fee total is the operand and the reader subtracts only what the writer
+      // did NOT already net: `record − stamped`. One rule covers an older row (no
+      // key), a v1-era writer that stamped `null` (its tick saw no fee — had it,
+      // the v1 flow would carry the fee and fail the check), and a fee Tradier
+      // posts AFTER the tick: admin's 2026-09-03 $10 fee reached neither that
+      // night's flow nor any stamp (`netCashFlowUsd` 0). Trusting a stamp alone
+      // would pin every late-posted fee RED forever. A flow that does NOT match
+      // (a v1 record folded the fee in, or a late capital event) keeps the
+      // writer's own figure and subtracts nothing more — a second subtraction
+      // would book the fee twice.
+      const stampedBrokerFeeUsd = finiteOrNull(s.stockLegProbeBrokerFeeUsd);
+      const flowExcludesFees =
+        ops !== null && ops.brokerFeeUsd !== null && ops.capitalFlowUsd !== null
           && rowNetCashFlowUsd !== null
-          && Math.abs(rowNetCashFlowUsd - ops.capitalFlowUsd) < 0.005
-          ? ops.brokerFeeUsd
-          : null;
-      const stockLegProbeBrokerFeeUsd = brokerFeeStampedByWriter
-        ? finiteOrNull(s.stockLegProbeBrokerFeeUsd)
-        : readTimeBrokerFeeUsd;
+          && Math.abs(rowNetCashFlowUsd - ops.capitalFlowUsd) < 0.005;
+      const stockLegProbeBrokerFeeUsd = flowExcludesFees ? ops!.brokerFeeUsd : stampedBrokerFeeUsd;
+      const readTimeBrokerFeeUsd = flowExcludesFees
+        ? round2(ops!.brokerFeeUsd! - (stampedBrokerFeeUsd ?? 0))
+        : null;
       // AC3. Only where the writer differenced a mark — the shift restates THAT
       // operand's basis, and there is nothing to restate on a three-operand row.
       const openOptionMarkBasisShiftReason: PnlReconcileDay['openOptionMarkBasisShiftReason'] =

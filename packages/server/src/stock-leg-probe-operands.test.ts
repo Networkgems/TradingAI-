@@ -206,6 +206,46 @@ describe('TRA-4506 — the three RED dates on the route, re-read', () => {
     expect(stamped.days[1].stockLegProbeUsd).toBe(-0.12);
   });
 
+  it('books a fee posted AFTER the 21:00 ET tick, whatever the writer stamped', () => {
+    // The tick saw no fee, so the flow is 0 and the stamp is 0 (a v2 writer) or
+    // `null` (a v1-era writer). The record learned the fee the next day.
+    const ops = buildStockLegProbeReadOperands({
+      dates: ['2026-09-02', '2026-09-03'],
+      cashEvents: [{ date: '2026-09-03', type: 'fee', amount: -10 }],
+      marks: null,
+      lots: null,
+      etDate,
+    });
+    for (const stamp of [0, null]) {
+      const r = reconcilePnl([
+        liveRow('2026-09-02', {}),
+        liveRow('2026-09-03', { stockLegProbeBrokerFeeUsd: stamp, stockLegProbeUsd: -10.12 }),
+      ], new Map(), null, null, null, null, null, null, 'live', null, ops);
+      expect(r.days[1].stockLegProbeBrokerFeeUsd).toBe(-10);
+      expect(r.days[1].stockLegProbeUsd).toBe(-0.12);
+    }
+  });
+
+  it('a v1-aggregate record measures no fee on ANY row — quiet days included', () => {
+    // The live shape on 2026-09-10 (b5c76cc1): the TRA-2906 rebuild (TRA-3595)
+    // has not run, so the record cannot type a fee and every row reads `null`,
+    // never 0.
+    const ops = buildStockLegProbeReadOperands({
+      dates: ['2026-09-02', '2026-09-03', '2026-09-04'],
+      cashEvents: null,
+      marks: null,
+      lots: null,
+      etDate,
+    });
+    const r = reconcilePnl([
+      liveRow('2026-09-02', {}),
+      liveRow('2026-09-03', { stockLegProbeUsd: -10.12 }),
+      liveRow('2026-09-04', {}),
+    ], new Map(), null, null, null, null, null, null, 'live', null, ops);
+    expect(r.days.map(d => d.stockLegProbeBrokerFeeUsd)).toEqual([null, null, null]);
+    expect(r.days[1].stockLegProbeUsd).toBe(-10.12);
+  });
+
   it('admin 2026-08-26: restated to the journal lot and re-marked on it, reads −0.17', () => {
     const rows = [
       liveRow('2026-08-24', { openOptionMarkUsd: -20.5 }),
