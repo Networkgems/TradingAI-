@@ -282,8 +282,13 @@ export interface RelativeValueSignal extends TradeSignal {
  */
 export type Sma200StopBasis = 'sma200_minus_1atr' | 'min_swinglow_sma200_minus_1p5atr';
 
-/** TRA-3688 S-3 — why a resting SMA-200 signal was voided off the feed. */
-export type Sma200VoidReason = 'bar_rollover' | 'price_drift';
+/**
+ * TRA-3688 S-3 — why a resting SMA-200 signal was voided off the feed.
+ * TRA-4529 — `evicted`: pushed out of the capped display ring. Reached only
+ * when every older ring row is itself SMA-200 (non-SMA-200 rows are evicted
+ * first), so it is a capacity event, not a validity verdict.
+ */
+export type Sma200VoidReason = 'bar_rollover' | 'price_drift' | 'evicted';
 
 /**
  * TRA-3688 S-3 — durable record of a voided SMA-200 signal. Voided signals are

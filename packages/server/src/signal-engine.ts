@@ -14,7 +14,7 @@ import {
 } from './live-broker-position-drift.js';
 import { roundToCent } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Sma200SignalVoidRecord, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Sma200SignalVoidRecord, Sma200VoidReason, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-3390 (impl child of TRA-2628) — the entry-path currency refusal. See
 // `quoteCurrencyEntryVerdict` below for where it is consulted.
@@ -87,7 +87,7 @@ import { EvalYielder, TickPacer } from './cooperative-yield.js';
 import { TickExitWorkMeter, type TickExitWorkTerms } from './tick-exit-work.js';
 import { TickExitRegionMeter, classifyExitInterval, type TickExitRegionRthTerms } from './tick-exit-region.js';
 import { trySma200ScanSlot, releaseSma200ScanSlot, fetchSma200CandlesShared } from './sma200-scan-admission.js';
-import { resolveSma200PullbackMaxDistAtr, sma200VoidVerdict, sma200SweepVerdict, sma200SweepStarved, type Sma200SweepVerdict } from './sma200-validity.js';
+import { resolveSma200PullbackMaxDistAtr, sma200VoidVerdict, sma200SweepVerdict, sma200SweepStarved, signalRingEvictionIndex, isSma200SignalType, type Sma200SweepVerdict } from './sma200-validity.js';
 import { getLatestReviewBlock } from './research-store.js';
 import { earningsInDaysSync } from './earnings-store.js';
 import {
@@ -7292,36 +7292,73 @@ export class SignalEngine {
     let voided = 0;
     this.recentSignals = this.recentSignals.filter(sig => {
       if (sig.symbol !== symbol) return true;
-      if (sig.type !== 'sma200_pullback' && sig.type !== 'sma200_reclaim') return true;
+      if (!isSma200SignalType(sig.type)) return true;
       const s = sig as Sma200Signal;
       const reason = sma200VoidVerdict(s, ctx);
       if (reason === null) return true;
-      this.sma200SignalVoids.push({
-        signalId: s.id,
-        symbol: s.symbol,
-        kind: s.type,
-        voidReason: reason,
-        barTimestamp: s.barTimestamp,
-        entryPrice: s.entryPrice,
-        ...(reason === 'price_drift' ? { lastPrice: ctx.lastPrice } : {}),
-        ...(Number.isFinite(s.atr14) ? { atr14: s.atr14 } : {}),
-        voidedAt: Date.now(),
-      });
-      log.info('sma200 signal voided', {
-        component: 'sma200-scan', issue: 'TRA-3688',
-        sym: s.symbol, kind: s.type, voidReason: reason,
-        barTimestamp: s.barTimestamp,
-        ...(reason === 'price_drift'
-          ? { entryPrice: s.entryPrice, lastPrice: ctx.lastPrice, atr14: s.atr14 }
-          : { latestBarTs: ctx.latestBarTs }),
-      });
+      this.recordSma200Void(s, reason, ctx);
       voided++;
       return false;
+    });
+    return voided;
+  }
+
+  /**
+   * TRA-3688 S-3 / TRA-4529 — the ONE place an SMA-200 row's removal is
+   * recorded and logged. Every exit off the display feed (S-3a, S-3b, ring
+   * eviction) goes through here so {@link sma200SignalVoids} sees all of them.
+   */
+  private recordSma200Void(
+    s: Sma200Signal,
+    reason: Sma200VoidReason,
+    ctx: { latestBarTs?: number; lastPrice?: number } = {},
+  ): void {
+    this.sma200SignalVoids.push({
+      signalId: s.id,
+      symbol: s.symbol,
+      kind: s.type,
+      voidReason: reason,
+      barTimestamp: s.barTimestamp,
+      entryPrice: s.entryPrice,
+      ...(reason === 'price_drift' ? { lastPrice: ctx.lastPrice } : {}),
+      ...(Number.isFinite(s.atr14) ? { atr14: s.atr14 } : {}),
+      voidedAt: Date.now(),
+    });
+    log.info('sma200 signal voided', {
+      component: 'sma200-scan', issue: reason === 'evicted' ? 'TRA-4529' : 'TRA-3688',
+      sym: s.symbol, kind: s.type, voidReason: reason,
+      barTimestamp: s.barTimestamp,
+      ...(reason === 'price_drift'
+        ? { entryPrice: s.entryPrice, lastPrice: ctx.lastPrice, atr14: s.atr14 }
+        : reason === 'bar_rollover'
+          ? { latestBarTs: ctx.latestBarTs }
+          : { ringCap: MAX_SIGNALS }),
     });
     if (this.sma200SignalVoids.length > SignalEngine.SMA200_VOID_MAX) {
       this.sma200SignalVoids.splice(0, this.sma200SignalVoids.length - SignalEngine.SMA200_VOID_MAX);
     }
-    return voided;
+  }
+
+  /**
+   * TRA-4529 — publish a row onto the display feed (newest first) and alert.
+   *
+   * Replaces 25 inline copies of `unshift; if (length > MAX_SIGNALS) pop()`.
+   * That `pop()` shared one 50-slot ring between 5-day SMA-200 rows and the
+   * intraday stream, so the OTM refusal flood evicted SMA-200 rows minutes after
+   * the open with no void record and no log line (AEHR/DOCN, 2026-09-10). Over
+   * cap, the oldest NON-SMA-200 row goes first ({@link signalRingEvictionIndex});
+   * an SMA-200 row is evicted only when every older row is SMA-200, and is then
+   * RECORDED as `voidReason: 'evicted'`. Every feed push must go through here.
+   */
+  private pushRecentSignal(signal: TradeSignal | Sma200Signal): void {
+    this.recentSignals.unshift(signal);
+    this.emitSignalAlert(signal);
+    while (this.recentSignals.length > MAX_SIGNALS) {
+      const idx = signalRingEvictionIndex(this.recentSignals);
+      if (idx < 0) break;
+      const [evicted] = this.recentSignals.splice(idx, 1);
+      if (isSma200SignalType(evicted.type)) this.recordSma200Void(evicted as Sma200Signal, 'evicted');
+    }
   }
 
   /**
@@ -7514,8 +7551,7 @@ export class SignalEngine {
               // TRA-3688 S-3a — the daily bar this signal is valid FOR.
               validForBarTimestamp: latestBarTs,
             };
-            this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-            if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+            this.pushRecentSignal(signal);
             this.sma200LastFired.set(key, latestBarTs);
             fired++;
             // TRA-819 — the display signal above is the deliverable for now.
@@ -11752,8 +11788,7 @@ export class SignalEngine {
         const surfaceLiveSkip = (reason: string): void => {
           signal.mode = 'live';
           signal.liveSkipReason = reason;
-          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.pushRecentSignal(signal);
           this.dailySignals.push({
             id: signal.id,
             symbol: signal.symbol,
@@ -12091,8 +12126,7 @@ export class SignalEngine {
         // TRA-231 — stamp the active mode so the Signals panel scopes the
         // entry per-mode. RV runs in both demo and live (TRA-220 fix).
         signal.mode = this.mode;
-        this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-        if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+        this.pushRecentSignal(signal);
         this.dailySignals.push({
           id: signal.id,
           symbol: signal.symbol,
@@ -13144,8 +13178,7 @@ export class SignalEngine {
           // two refusals.
           signal.signalSkipReasonCode = setupDecision.skipReasonCode;
           if (this.mode === 'live') signal.liveSkipReason = setupReject;
-          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.pushRecentSignal(signal);
           this.dailySignals.push({
             id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
           });
@@ -13210,8 +13243,7 @@ export class SignalEngine {
           // the untouched 60-minute brake on its own.
           signal.signalSkipReasonCode = OTM_ENTRY_WINDOW_CLOSED_CODE;
           if (this.mode === 'live') signal.liveSkipReason = otmWindowReject;
-          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.pushRecentSignal(signal);
           this.dailySignals.push({
             id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
           });
@@ -13248,8 +13280,7 @@ export class SignalEngine {
           signal.signalSkipReason = otmFloorPick.reason;
           signal.signalSkipReasonCode = otmFloorPick.code;
           if (this.mode === 'live') signal.liveSkipReason = otmFloorPick.reason;
-          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.pushRecentSignal(signal);
           this.dailySignals.push({
             id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
           });
@@ -13286,8 +13317,7 @@ export class SignalEngine {
         if (otmUniverseReject) {
           signal.mode = 'live';
           signal.liveSkipReason = otmUniverseReject;
-          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.pushRecentSignal(signal);
           this.dailySignals.push({
             id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
           });
@@ -13311,8 +13341,7 @@ export class SignalEngine {
         if (otmAssetClassReject) {
           signal.mode = 'live';
           signal.liveSkipReason = otmAssetClassReject;
-          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.pushRecentSignal(signal);
           this.dailySignals.push({
             id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
           });
@@ -13368,8 +13397,7 @@ export class SignalEngine {
         if (otmLiveCeilingReject) {
           signal.mode = 'live';
           signal.liveSkipReason = otmLiveCeilingReject;
-          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.pushRecentSignal(signal);
           this.dailySignals.push({
             id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
           });
@@ -13417,8 +13445,7 @@ export class SignalEngine {
         if (otmLiveFloorReject) {
           signal.mode = 'live';
           signal.liveSkipReason = otmLiveFloorReject;
-          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.pushRecentSignal(signal);
           this.dailySignals.push({
             id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
           });
@@ -13473,8 +13500,7 @@ export class SignalEngine {
         const otmDeltaCeiling = this.entryDeltaCeilingRejectReason('single_leg_otm', cheap.delta);
         if (otmDeltaCeiling) {
           signal.signalSkipReason = otmDeltaCeiling;
-          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.pushRecentSignal(signal);
           this.dailySignals.push({
             id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
           });
@@ -13503,8 +13529,7 @@ export class SignalEngine {
           const surfaceOtmLiveSkip = (reason: string): void => {
             signal.mode = 'live';
             signal.liveSkipReason = reason;
-            this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-            if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+            this.pushRecentSignal(signal);
             this.dailySignals.push({
               id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
             });
@@ -14100,8 +14125,7 @@ export class SignalEngine {
           scanRun.opened();
           this.emitOptionFillAlert(openedLive);
           signal.mode = 'live';
-          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.pushRecentSignal(signal);
           this.dailySignals.push({
             id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
           });
@@ -14125,8 +14149,7 @@ export class SignalEngine {
         const otmChurnCap = this.churnOpenCapVerdict(signal.symbol);
         if (otmChurnCap.blocked) {
           signal.signalSkipReason = `churn brake: ${signal.symbol} hit same-session open cap (${otmChurnCap.count}/${otmChurnCap.cap})`;
-          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.pushRecentSignal(signal);
           this.dailySignals.push({
             id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
           });
@@ -14184,8 +14207,7 @@ export class SignalEngine {
 
         this.emitOptionFillAlert(opened);
         signal.mode = this.mode;
-        this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-        if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+        this.pushRecentSignal(signal);
         this.dailySignals.push({
           id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
         });
@@ -15478,9 +15500,7 @@ export class SignalEngine {
         const surfaceLiveSkip = (reason: string): void => {
           signal.mode = 'live';
           signal.liveSkipReason = reason;
-          this.recentSignals.unshift(signal);
-          this.emitSignalAlert(signal);
-          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.pushRecentSignal(signal);
           this.dailySignals.push({
             id: signal.id,
             symbol: signal.symbol,
@@ -15577,9 +15597,7 @@ export class SignalEngine {
         scanRun.opened();
         this.emitOptionFillAlert(opened);
         signal.mode = this.mode;
-        this.recentSignals.unshift(signal);
-        this.emitSignalAlert(signal);
-        if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+        this.pushRecentSignal(signal);
         this.dailySignals.push({
           id: signal.id,
           symbol: signal.symbol,
@@ -16243,9 +16261,7 @@ export class SignalEngine {
 
     this.emitOptionFillAlert(opened);
     signal.mode = this.mode;
-    this.recentSignals.unshift(signal);
-    this.emitSignalAlert(signal);
-    if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+    this.pushRecentSignal(signal);
     this.dailySignals.push({ id: signal.id, symbol: signal.symbol, type: 'relative_value', firedAt: signal.timestamp });
     log.info('iv-rv mispriced option opened (TRA-1203)', {
       symbol: sym,
@@ -18398,8 +18414,7 @@ export class SignalEngine {
         side: signal.side, price, stop: signal.stopLoss,
         takeProfit: signal.takeProfit, reason: equityBracket.reason,
       });
-      this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-      if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+      this.pushRecentSignal(signal);
       recordEquityEntryRejected(funnelMode, funnelEngineId, 'invalid_bracket');
       return null;
     }
@@ -18422,8 +18437,7 @@ export class SignalEngine {
     ).length;
     if (equityTradesOpenedToday >= this.equityDailyTradesLimit) {
       signal.liveSkipReason = `daily equity limit reached (${equityTradesOpenedToday}/${this.equityDailyTradesLimit})`;
-      this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-      if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+      this.pushRecentSignal(signal);
       recordEquityEntryRejected(funnelMode, funnelEngineId, 'daily_trades_limit');
       return null;
     }
@@ -18436,8 +18450,7 @@ export class SignalEngine {
     const churnCap = this.churnOpenCapVerdict(signal.symbol);
     if (churnCap.blocked) {
       signal.signalSkipReason = `churn brake: ${signal.symbol} hit same-session open cap (${churnCap.count}/${churnCap.cap})`;
-      this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-      if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+      this.pushRecentSignal(signal);
       recordEquityEntryRejected(funnelMode, funnelEngineId, 'churn_brake');
       return null;
     }
@@ -18449,8 +18462,7 @@ export class SignalEngine {
     // the board arms CORRELATED_EXPOSURE_CAP_ENABLED, so prod is unchanged.
     const correlatedCapScale = this.applyEquityCorrelatedCap(signal, price);
     if (correlatedCapScale === null) {
-      this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-      if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+      this.pushRecentSignal(signal);
       recordEquityEntryRejected(funnelMode, funnelEngineId, 'correlated_exposure_cap');
       return null;
     }
@@ -18466,16 +18478,14 @@ export class SignalEngine {
     if (this.mode === 'live') {
       if (!this.tradierLiveEquityClient) {
         signal.liveSkipReason = 'Tradier equity client not configured';
-        this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-        if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+        this.pushRecentSignal(signal);
         recordEquityEntryRejected(funnelMode, funnelEngineId, 'live_client_missing');
         return null;
       }
       const placement = await this.placeTradierEquityBracket(signal, price, correlatedCapScale);
       if (!placement.ok) {
         signal.liveSkipReason = placement.reason;
-        this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-        if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+        this.pushRecentSignal(signal);
         recordEquityEntryRejected(funnelMode, funnelEngineId, 'live_order_rejected');
         return null;
       }
@@ -18486,8 +18496,7 @@ export class SignalEngine {
       this.refreshTradierBalance().catch(() => {});
     }
 
-    this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-    if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+    this.pushRecentSignal(signal);
 
     // Auto-open equity paper position. Stock options for the same equity
     // signal are NOT auto-opened anymore (TRA-191): the only enabled

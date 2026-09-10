@@ -50,7 +50,7 @@ export const SMA200_DRIFT_VOID_ATR = 0.5;
 export function sma200VoidVerdict(
   sig: Pick<Sma200Signal, 'entryPrice' | 'atr14' | 'barTimestamp'>,
   ctx: { latestBarTs?: number; lastPrice?: number },
-): Sma200VoidReason | null {
+): Exclude<Sma200VoidReason, 'evicted'> | null {
   if (
     ctx.latestBarTs !== undefined
     && typeof sig.barTimestamp === 'number'
@@ -122,4 +122,33 @@ export function sma200SweepVerdict(c: Sma200SweepCensus): Sma200SweepVerdict {
 /** Total symbols the sweep failed to score, by any cause. */
 export function sma200SweepStarved(c: Sma200SweepCensus): number {
   return c.starvedBreakerOpen + c.starvedShortHistory + c.fetchFailed;
+}
+
+/** True for the two SMA-200 display kinds (`sma200_pullback` / `sma200_reclaim`). */
+export function isSma200SignalType(type: string): type is Sma200Signal['type'] {
+  return type === 'sma200_pullback' || type === 'sma200_reclaim';
+}
+
+/**
+ * TRA-4529 — pick the row to evict from an over-cap display ring (NEWEST
+ * FIRST, i.e. index 0 is the row just pushed).
+ *
+ * The ring is shared by 5-day SMA-200 rows and the intraday stream (OTM
+ * refusals run to thousands per session), so a plain `pop()` evicted the
+ * SMA-200 rows minutes after the open with no void record — a third exit path
+ * outside the S-3 "removed AND recorded" contract. SMA-200 rows are bounded on
+ * their own (universe × 2 kinds, 5-bar debounce, S-3 voiding), so they take no
+ * ring pressure: evict the OLDEST non-SMA-200 row instead.
+ *
+ * Index 0 is never chosen while any older row is evictable, so the newest row
+ * is always served. Falls back to the oldest row (necessarily SMA-200) only
+ * when every older row is SMA-200 — the caller must RECORD that eviction.
+ * Returns -1 for a ring of fewer than 2 rows (nothing evictable but the new one).
+ */
+export function signalRingEvictionIndex(ring: ReadonlyArray<{ type: string }>): number {
+  if (ring.length < 2) return -1;
+  for (let i = ring.length - 1; i >= 1; i--) {
+    if (!isSma200SignalType(ring[i].type)) return i;
+  }
+  return ring.length - 1;
 }

@@ -401,7 +401,8 @@ describe('TRA-3942 — the gate is WIRED into the OTM open, first and in both bo
     // twin only when the book is live.
     expect(block).toMatch(/signal\.signalSkipReason = otmWindowReject;/);
     expect(block).toMatch(/if \(this\.mode === 'live'\) signal\.liveSkipReason = otmWindowReject;/);
-    expect(block).toMatch(/this\.recentSignals\.unshift\(signal\); this\.emitSignalAlert\(signal\);/);
+    // TRA-4529 — the feed write (unshift + alert + cap) is one helper now.
+    expect(block).toMatch(/this\.pushRecentSignal\(signal\);/);
   });
 });
 

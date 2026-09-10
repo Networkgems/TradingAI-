@@ -270,7 +270,8 @@ describe('TRA-4422 — the gate is WIRED into the OTM open, in the load-bearing 
     expect(block).toMatch(/if \(setupDecision\.blocked\) \{/);
     expect(block).toMatch(/signal\.signalSkipReason = /);
     expect(block).toMatch(/signal\.signalSkipReasonCode = /);
-    expect(block).toMatch(/this\.recentSignals\.unshift\(signal\); this\.emitSignalAlert\(signal\);/);
+    // TRA-4529 — the feed write (unshift + alert + cap) is one helper now.
+    expect(block).toMatch(/this\.pushRecentSignal\(signal\);/);
     expect(block).toMatch(/scanRun\.reject\(/);
     expect(block).toMatch(/\n\s+continue;/);
   });

@@ -351,7 +351,8 @@ describe('TRA-3953 — the predicate is WIRED into the OTM dedup', () => {
     const call = ENGINE_SRC.indexOf('const otmWindowReject = this.otmEntryWindowRejectReason(');
     const block = ENGINE_SRC.slice(call, ENGINE_SRC.indexOf('\n        }\n', call));
     const stamp = block.indexOf('signal.signalSkipReasonCode =');
-    const unshift = block.indexOf('this.recentSignals.unshift(signal)');
+    // TRA-4529 — the ring write goes through the one helper.
+    const unshift = block.indexOf('this.pushRecentSignal(signal)');
     expect(stamp).toBeGreaterThan(-1);
     expect(unshift).toBeGreaterThan(stamp);
   });
