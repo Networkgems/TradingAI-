@@ -8,6 +8,7 @@ import type {
   ExportMarket,
   ExportMarketCoverage,
   ExportMoneyRestatement,
+  ExportScope,
   ExportTradeRow,
 } from './export.js';
 import { applyMoneyRestatement, formatHoldDuration, premiumRBasisLabel } from './export.js';
@@ -287,6 +288,50 @@ export function asciiHeaderJson(value: unknown): string {
   return JSON.stringify(value).replace(/[^\x20-\x7E]/g, ch =>
     `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`,
   );
+}
+
+/**
+ * TRA-4358 — the scope statement the route attaches to every export.
+ *
+ * Measured on live bqb1 2026-09-09: `/api/health/option-journal`
+ * `summary.byMode.live.total` read 32 while `modes=live` on this route served
+ * 27, and the delta was filed as the export DROPPING the five newest live rows.
+ * It was not — the five belonged to the OTHER live book, and the export is
+ * book-scoped by design (`journalRowsForBook`, TRA-2421; serving another
+ * account's trades would be the leak that scoping exists to prevent). What was
+ * genuinely missing is any statement of that rule on the wire: two documents,
+ * one firm-wide and one per-book, read as the same population with rows lost.
+ * The prose is deliberately generic — it names the RULE, never another book.
+ */
+export function exportScopeFor(username: string): ExportScope {
+  return {
+    book: username,
+    note:
+      'This export serves ONE book: the authenticated user\'s. Every candidate row is '
+      + 'scoped to that book before any filter runs (`journalRowsForBook`, TRA-2421). The '
+      + 'option-trade journal and the surfaces built on it (e.g. /api/health/option-journal '
+      + '`summary.byMode`) are FIRM-WIDE and pool every book trading a mode, so a mode-level '
+      + 'count there can legitimately exceed this document\'s row count without any row '
+      + 'having been dropped. Compare the two only after scoping the firm-wide side to this '
+      + 'book (TRA-4358).',
+  };
+}
+
+/**
+ * TRA-4358 — the same statement on the `X-Export-Scope` header, so the CSV form
+ * — the route's DEFAULT format and the artifact a human saves — carries it too.
+ * Same rules as {@link coverageHeaderValue}: through {@link asciiHeaderJson},
+ * never a bare `JSON.stringify` (`setHeader` rejects non-latin1), and the prose
+ * `note` is dropped in favour of a pointer, because a header is for the
+ * machine-readable fact and a multi-hundred-byte prose blob on every CSV
+ * response has no reader.
+ */
+export function scopeHeaderValue(scope: ExportScope): string {
+  const { note: _note, ...fact } = scope;
+  return asciiHeaderJson({
+    ...fact,
+    noteIn: 'summary.scope.note of the JSON export (TRA-4358)',
+  });
 }
 
 export interface RangeRefusal {

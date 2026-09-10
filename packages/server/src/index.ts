@@ -907,7 +907,13 @@ import {
   collectJournalMoneyRestatements,
   collectJournalPremiumBases,
   coverageHeaderValue,
+  // TRA-4358 — the per-book scope statement, in the JSON summary and on the
+  // CSV `X-Export-Scope` header, so a firm-wide count (e.g.
+  // /api/health/option-journal byMode) exceeding this document's row count is
+  // explicable from the payloads instead of reading as dropped rows.
+  exportScopeFor,
   resolveExportCoverage,
+  scopeHeaderValue,
   selectJournalExportRows,
 } from './export-history.js';
 // TRA-3874 — the strict filter parse that stops `/api/trades/export` from
@@ -10403,6 +10409,10 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
     const markets = marketsParsed.values;
     const modes = modesParsed.values;
     const filtersRequested = describeRequestedFilters(query);
+    // TRA-4358 — computed ONCE; the JSON summary and the CSV header are both
+    // rendered from this object, for the same reason `filtersRequested` is
+    // (a provenance statement that can disagree with itself is worse than none).
+    const scope = exportScopeFor(username);
     const filters: ExportFilters = {
       markets,
       modes,
@@ -10523,6 +10533,11 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
       ...summary,
       coverage,
       filtersRequested,
+      // TRA-4358 — which book this document speaks for. The journal fold above
+      // is book-scoped (`journalRowsForBook`); the health surfaces over the
+      // same journal are firm-wide. With no scope statement on the wire, that
+      // difference was filed as this route dropping the 5 newest live rows.
+      scope,
     };
 
     const stamp = new Date().toISOString().slice(0, 10);
@@ -10554,6 +10569,11 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
       // a provenance line that can disagree with the filter it describes is
       // worse than no provenance line.
       res.setHeader('X-Export-Filters-Requested', filtersRequestedHeaderValue(filtersRequested));
+      // TRA-4358 — and WHICH BOOK the document speaks for, rendered from the
+      // same `exportScopeFor` object the JSON summary carries, so the two forms
+      // cannot disagree. Through `scopeHeaderValue` → `asciiHeaderJson`, never
+      // a bare `JSON.stringify` (`setHeader` rejects non-latin1).
+      res.setHeader('X-Export-Scope', scopeHeaderValue(scope));
       res.send(toCsv(rows));
     }
   } catch (err) {

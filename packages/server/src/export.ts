@@ -675,6 +675,25 @@ export interface ExportFiltersRequested {
   to: boolean;
 }
 
+/**
+ * TRA-4358 — the BOOK this document speaks for.
+ *
+ * The export is a PER-BOOK surface: every candidate row — in-memory book
+ * positions and journal rows alike — is scoped to the authenticated user before
+ * anything else runs (`journalRowsForBook`, TRA-2421). The journal itself and
+ * the health surfaces built on it (`/api/health/option-journal`
+ * `summary.byMode`) are FIRM-WIDE and pool every book trading a mode. Nothing
+ * on the wire said so, and the difference was mis-read as the export dropping
+ * rows: 32 firm-wide live option rows vs 27 served here, where the other 5
+ * belonged to a second live book. This block states the scope in the document
+ * itself, so a cross-surface count delta is explicable from the payloads alone.
+ */
+export interface ExportScope {
+  /** The authenticated book whose rows — and only whose rows — this export serves. */
+  book: string;
+  note: string;
+}
+
 /** TRA-3860 — row-provenance census, so a mixed export is legible. */
 export interface ExportSourceCounts {
   /** Rows from the live in-memory book (full premiums). */
@@ -732,6 +751,12 @@ export interface ExportSummary {
    * as `coverage`: the pure `summarize()` never sees the query string.
    */
   filtersRequested?: ExportFiltersRequested;
+  /**
+   * TRA-4358 — which book this document speaks for. Optional on the TYPE for
+   * the same reason as `coverage`: the pure `summarize()` never sees the
+   * authenticated user; the HTTP route attaches it unconditionally.
+   */
+  scope?: ExportScope;
 }
 
 export interface ExportDocument {
