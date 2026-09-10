@@ -18,6 +18,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   freezeState,
   embargoState,
@@ -52,6 +53,16 @@ import {
   DEPLOY_LEAD_MIN,
   FREEZE_OPEN_MIN,
   FREEZE_CLOSE_MIN,
+  CADENCE_CEILINGS,
+  activeCadenceCeiling,
+  cadenceWindow,
+  cadenceState,
+  cadenceBlocks,
+  cadenceRowCounts,
+  countCommitAdvances,
+  cadenceOverrideNamesTicket,
+  renderCadenceRefusal,
+  renderCadenceLine,
 } from './render-redeploy.mjs';
 
 const at = iso => new Date(iso);
@@ -1049,7 +1060,265 @@ const rbMissing = ['FORWARD', 'NOOP', 'REFUSE_ROLLBACK', 'REFUSE_DIVERGED', 'REF
 const noteProduced = new Set(NOTE_CASES.map(([t, s]) => noteVerdict(t, s)));
 const noteMissing = ['NOTED', 'QUIET'].filter(v => !noteProduced.has(v));
 
+// ── The CADENCE CEILING (TRA-4535) — exit 10 ─────────────────────────────────
+// The freeze's one-train-per-day ceiling was prose, and the 09-09 window carried nine commit
+// advances past every gate in the file. Three kinds of arm, strongest first:
+//   1. REPLAY — Render's REAL deploy history for bqb1 (copied verbatim from
+//      GET /v1/services/srv-d7mb7rr7uimc73ev0chg/deploys at 2026-09-10T22:25Z, full shas and ids,
+//      nothing retyped), graded against the SHIPPED CADENCE_CEILINGS row. Each deploy is re-run at
+//      its own createdAt against the history that existed before it.
+//   2. PAIRS — every REFUSE next to a PROCEED that differs by one variable.
+//   3. CALL SITE — the shipped bytes of main(), spawned against the read-only stub. A predicate
+//      suite stays green if main() stops calling the gate (TRA-2262: verify the EDGE).
+const REAL_BQB1_DEPLOYS = [
+  ['2026-09-08T12:53:49Z', 'dep-dag0anf40ujc73d92rb0', '668126eed049e07d0c7af60dfc643b1c550b969d', 'deactivated'],
+  ['2026-09-08T20:04:29Z', 'dep-dag6kj8u01pc7395uu20', 'cb9d594f6883ec61efe42147456c2dd9bb509cc3', 'deactivated'],
+  ['2026-09-08T20:11:12Z', 'dep-dag6no142hec73eg4u5g', '9dbdd3aba177831df3b6e7665731fc70fe3543b9', 'deactivated'],
+  ['2026-09-08T20:20:06Z', 'dep-dag6rtlg1s2s73bahcqg', 'c7b452c0fc9259dc232cdf752f9d0f9810500a8a', 'deactivated'],
+  ['2026-09-08T20:47:05Z', 'dep-dag78iajnfac73dmla0g', 'c7b452c0fc9259dc232cdf752f9d0f9810500a8a', 'deactivated'],
+  ['2026-09-09T02:06:02Z', 'dep-dagbu2m7bikc73a7c2l0', 'f359c983e1ed5f373b92cba745f5e366ccbc76a5', 'deactivated'],
+  ['2026-09-09T02:35:23Z', 'dep-dagcbqp5efls73ac5d40', 'a187fc147ef3723c4f342d6cc00fb483e494f613', 'deactivated'],
+  ['2026-09-09T04:18:29Z', 'dep-dagds515efls73a51n4g', 'a187fc147ef3723c4f342d6cc00fb483e494f613', 'deactivated'],
+  ['2026-09-09T21:05:23Z', 'dep-dagsk4uk1f9s73dp9sig', '8e51be03261c2a71fa1d1e8f322fccb59c8440f6', 'deactivated'],
+  ['2026-09-09T23:16:05Z', 'dep-daguhd9t0dsc73fs9lu0', '21b1510653cde2b73e162e13691b9ee9fb9ab604', 'deactivated'],
+  ['2026-09-09T23:51:12Z', 'dep-dagv1s142hec73e2b7t0', '3955593ee596f4fd3f10b63ba282ed1af4d96634', 'deactivated'],
+  ['2026-09-10T00:02:44Z', 'dep-dagv795bedkc738ctgj0', 'eacd13642ffac65e1dd88cc1315fe34d19aa8810', 'deactivated'],
+  ['2026-09-10T01:20:10Z', 'dep-dah0bih42hec73e7mpcg', 'aa12bbcf8a9d31fc3f0355d941133b1761598785', 'deactivated'],
+  ['2026-09-10T02:09:17Z', 'dep-dah12jdbedkc738l1b10', 'e4a1c67b9d2cee60290748864fe9cfaf247e1de6', 'deactivated'],
+  ['2026-09-10T02:15:01Z', 'dep-dah159bl550s73d4shbg', 'eb8a1738a5d56c7f03a1d161456f30e56e0ae539', 'deactivated'],
+  ['2026-09-10T06:11:17Z', 'dep-dah4k1e1egvs73cinqgg', '35feb9f786d8c1ea6720b7994ce55139ac754c5c', 'deactivated'],
+  ['2026-09-10T10:56:52Z', 'dep-dah8pt5bedkc739kfvu0', 'c54f1e73596769b8ab87b5ce062c649c8c999eb5', 'deactivated'],
+  ['2026-09-10T20:11:42Z', 'dep-dahgtvmq1p3s73dh1us0', 'b5c76cc1c492a688434b6e1729b144d156a07e17', 'deactivated'],
+  ['2026-09-10T20:16:19Z', 'dep-dahh04uk1f9s73f8pea0', 'b5c76cc1c492a688434b6e1729b144d156a07e17', 'deactivated'],
+  ['2026-09-10T21:09:38Z', 'dep-dahhp4e1egvs7382c3tg', 'b5c76cc1c492a688434b6e1729b144d156a07e17', 'deactivated'],
+  ['2026-09-10T22:07:34Z', 'dep-dahik9m1egvs73863o1g', '05be2d1604d431ab6c0e45555daa0a955522e886', 'live'],
+];
+// Render's list shape: `{deploy, cursor}`.
+const renderEntry = ([createdAt, id, commit, status]) => ({ deploy: { id, commit: { id: commit }, status, createdAt }, cursor: id });
+const cdVerdicts = [];
+let cadenceArms = 0;
+const cdCheck = (label, got, expected, why) => {
+  cadenceArms += 1;
+  cdVerdicts.push(got);
+  if (got === expected) {
+    pass += 1;
+    console.log(`  ok   cadence  ${label.padEnd(28)} ${String(got).padEnd(9)} ${why}`);
+  } else {
+    failures.push({ iso: `cadence ${label}`, expected, got, why });
+    console.log(`  FAIL cadence  ${label.padEnd(28)} expected ${expected}, got ${got}  — ${why}`);
+  }
+};
+
+// Arm 1 — REPLAY. `live` is what was serving when the deploy was created: the last counting
+// deploy before it. `exhausted: false` because the fixture is a slice, which forces the gate to
+// find its baseline INSIDE the rows rather than assume the service began with them.
+const replayAt = i => {
+  const [createdAt, , commit] = REAL_BQB1_DEPLOYS[i];
+  const prior = REAL_BQB1_DEPLOYS.slice(0, i);
+  const serving = [...prior].reverse().find(r => cadenceRowCounts({ status: r[3] }));
+  return cadenceState(at(createdAt), {
+    history: { rows: prior.map(renderEntry), exhausted: false },
+    target: { sha: commit, source: '--commit' },
+    live: { sha: serving[2] },
+  });
+};
+// [index, expected, why]. The 09-09 block is TRA-4535's own 9-row table, in order.
+const REPLAY = [
+  [1, 'CLEAR', '09-08 20:04 cb9d594f — the 09-08 window\'s ONE train'],
+  [2, 'SPENT', '09-08 20:11 9dbdd3ab — advance #2'],
+  [3, 'SPENT', '09-08 20:20 c7b452c0 — advance #3'],
+  [4, 'SAME_SHA', '09-08 20:47 c7b452c0 again — re-deploy of the serving sha, not a train'],
+  [5, 'SPENT', '09-09 02:06 f359c983 — advance #4'],
+  [6, 'SPENT', '09-09 02:35 a187fc14 — the TRA-4420 `--help` accident, advance #5'],
+  [7, 'SAME_SHA', '09-09 04:18 a187fc14 again — the TRA-4412 env-apply'],
+  [8, 'CLEAR', 'TRA-4535 row 1 · 09-09 21:05 8e51be03 — the window\'s one legal train PROCEEDS'],
+  [9, 'SPENT', 'TRA-4535 row 2 · 09-09 23:16 21b15106'],
+  [10, 'SPENT', 'TRA-4535 row 3 · 09-09 23:51 3955593e'],
+  [11, 'SPENT', 'TRA-4535 row 4 · 09-10 00:02 eacd1364'],
+  [12, 'SPENT', 'TRA-4535 row 5 · 09-10 01:20 aa12bbcf'],
+  [13, 'SPENT', 'TRA-4535 row 6 · 09-10 02:09 e4a1c67b'],
+  [14, 'SPENT', 'TRA-4535 row 7 · 09-10 02:15 eb8a1738 — zero packages/ bytes is STILL a commit advance'],
+  [15, 'SPENT', 'TRA-4535 row 8 · 09-10 06:11 35feb9f7'],
+  [16, 'SPENT', 'TRA-4535 row 9 · 09-10 10:56 c54f1e73'],
+  [17, 'CLEAR', '09-10 20:11 b5c76cc1 — the 09-10 window\'s one train'],
+  [18, 'SAME_SHA', '09-10 20:16 b5c76cc1 — TRA-4520 env-apply, must PROCEED'],
+  [19, 'SAME_SHA', '09-10 21:09 b5c76cc1 — TRA-4473 env-apply, must PROCEED'],
+  [20, 'SPENT', '09-10 22:07 05be2d16 — the advance that beat the stopgap embargo by 34s'],
+];
+console.log('');
+console.log('cadence : arm 1 — REPLAY of bqb1\'s real Render history against the shipped ceiling row:');
+for (const [i, expected, why] of REPLAY) {
+  const st = replayAt(i);
+  cdCheck(`replay ${REAL_BQB1_DEPLOYS[i][1].slice(0, 12)}`, st.verdict, expected, why);
+  if (cadenceBlocks(st.verdict) !== (expected === 'SPENT' || expected === 'BLIND')) {
+    failures.push({ iso: 'cadence replay', expected: 'blocks agrees with verdict', got: st.verdict, why });
+  }
+}
+// And the whole-window COUNTS, which is the number the TRA-4384 daily row reports.
+const allRealRows = { rows: REAL_BQB1_DEPLOYS.map(renderEntry), exhausted: false };
+for (const [openIso, expected, why] of [
+  ['2026-09-08T20:00:00Z', 5, 'the 09-08 window: 5 advances (CTO day-2 correction)'],
+  ['2026-09-09T20:00:00Z', 9, 'the 09-09 window: 9 advances (TRA-4535 table)'],
+  ['2026-09-10T20:00:00Z', 2, 'the 09-10 window by 22:08Z: 2 advances, not the 1 the day-3 row assumed'],
+]) {
+  const open = Date.parse(openIso);
+  const c = countCommitAdvances(allRealRows, open, open + 24 * 3600 * 1000);
+  cdCheck(`count ${openIso.slice(0, 10)}`, c.advances?.length ?? `BLIND(${c.blind})`, expected, why);
+}
+
+// Arm 2 — PAIRS, on constructed histories. Full-length hex shas, because sameCommitSha
+// requires hex and a 7-vs-40 comparison is the normal case the gate must get right.
+const [SA, SB, SC] = ['a', 'b', 'c'].map(ch => ch.repeat(40));
+const dep = (createdAt, commit, status = 'deactivated', id = `dep-${createdAt}`) => renderEntry([createdAt, id, commit, status]);
+const H = (rows, exhausted = false) => ({ rows, exhausted });
+const BASE = dep('2026-09-15T10:00:00Z', SA); // Tue, inside the row, before that night's window
+const cd = (iso, history, targetSha, live, table) =>
+  cadenceState(at(iso), { history, target: { sha: targetSha, source: '--commit' }, live }, table).verdict;
+const LIVE = sha => ({ sha });
+const NO_LIVE = { sha: null, error: 'GET /api/health/version timed out' };
+const PAIRS = [
+  // the night's first train, and one row later
+  ['empty window', cd('2026-09-15T20:30:00Z', H([BASE]), SB, LIVE(SA)), 'CLEAR', 'no advance yet tonight — the one train PROCEEDS'],
+  ['one advance in', cd('2026-09-15T20:30:00Z', H([BASE, dep('2026-09-15T20:10:00Z', SB)]), SC, LIVE(SB)), 'SPENT', '…one advance later, a second one is REFUSED'],
+  // same-SHA env-apply
+  ['same-SHA env-apply', cd('2026-09-15T20:30:00Z', H([BASE, dep('2026-09-15T20:10:00Z', SB)]), SB, LIVE(SB)), 'SAME_SHA', 'spent window, target IS live: not a train, PROCEEDS'],
+  ['7-char pin of live', cd('2026-09-15T20:30:00Z', H([BASE, dep('2026-09-15T20:10:00Z', SB)]), SB.slice(0, 7), LIVE(SB)), 'SAME_SHA', '--commit is verbatim: a 7-char pin of the live sha is the same build'],
+  ['7-char pin, other sha', cd('2026-09-15T20:30:00Z', H([BASE, dep('2026-09-15T20:10:00Z', SB)]), SC.slice(0, 7), LIVE(SB)), 'SPENT', '…and a 7-char pin of anything else is a train'],
+  // BLIND, each paired with the readable history that proceeds
+  ['history unreadable', cd('2026-09-15T20:30:00Z', { rows: null, error: 'GET /deploys → 503' }, SB, LIVE(SA)), 'BLIND', 'unreadable is REFUSE, never "no advances" (pair: empty window)'],
+  ['no baseline in reach', cd('2026-09-15T20:30:00Z', H([]), SB, LIVE(SA)), 'BLIND', 'history does not reach back past 20:00Z — cannot say what the first deploy advanced FROM'],
+  ['whole history, empty', cd('2026-09-15T20:30:00Z', H([], true), SB, LIVE(SA)), 'CLEAR', 'the SAME empty read, proven to be the whole history: a new service'],
+  ['whole history, 1 row', cd('2026-09-15T20:30:00Z', H([dep('2026-09-15T20:10:00Z', SB)], true), SC, LIVE(SB)), 'SPENT', 'the service\'s first deploy ever is an advance'],
+  ['live unreadable, spent', cd('2026-09-15T20:30:00Z', H([BASE, dep('2026-09-15T20:10:00Z', SB)]), SB, NO_LIVE), 'BLIND', 'spent + live unread: the same-SHA exemption is unprovable (pair: same-SHA env-apply)'],
+  ['live unreadable, empty', cd('2026-09-15T20:30:00Z', H([BASE]), SB, NO_LIVE), 'CLEAR', 'an EMPTY window needs no exemption, so no live read'],
+  ['undated row', cd('2026-09-15T20:30:00Z', H([BASE, dep(null, SB, 'deactivated', 'dep-undated')]), SC, LIVE(SA)), 'BLIND', 'a row with no createdAt cannot be placed in or out of the window'],
+  // what counts
+  ['build_failed', cd('2026-09-15T20:30:00Z', H([BASE, dep('2026-09-15T20:10:00Z', SB, 'build_failed')]), SC, LIVE(SA)), 'CLEAR', 'a failed build never changed what served (pair: one advance in)'],
+  ['canceled', cd('2026-09-15T20:30:00Z', H([BASE, dep('2026-09-15T20:10:00Z', SB, 'canceled')]), SC, LIVE(SA)), 'CLEAR', 'nor did a canceled one'],
+  ['update_failed', cd('2026-09-15T20:30:00Z', H([BASE, dep('2026-09-15T20:10:00Z', SB, 'update_failed')]), SC, LIVE(SA)), 'CLEAR', 'nor a failed update'],
+  ['pre_deploy_failed', cd('2026-09-15T20:30:00Z', H([BASE, dep('2026-09-15T20:10:00Z', SB, 'pre_deploy_failed')]), SC, LIVE(SA)), 'CLEAR', 'nor a failed pre-deploy'],
+  ['failed keeps baseline', cd('2026-09-15T20:30:00Z', H([BASE, dep('2026-09-15T20:10:00Z', SB, 'build_failed'), dep('2026-09-15T20:20:00Z', SA)]), SC, LIVE(SA)), 'CLEAR', 'fail → redeploy of the serving sha: the failure must not move the baseline'],
+  ['in flight', cd('2026-09-15T20:27:00Z', H([BASE, dep('2026-09-15T20:25:00Z', SB, 'build_in_progress')]), SC, LIVE(SA)), 'SPENT', 'an advance somebody started 2 min ago IS tonight\'s train'],
+  ['unknown status', cd('2026-09-15T20:30:00Z', H([BASE, dep('2026-09-15T20:10:00Z', SB, 'some_new_render_status')]), SC, LIVE(SB)), 'SPENT', 'an unrecognised status is COUNTED, never waved through'],
+  ['no commit on row', cd('2026-09-15T20:30:00Z', H([BASE, dep('2026-09-15T20:10:00Z', null)]), SC, LIVE(SA)), 'SPENT', '"cannot tell whether it moved" is counted as moved'],
+  // the window boundary is half-open, at 20:00Z
+  ['19:59:59 is yesterday', cd('2026-09-15T20:00:00Z', H([BASE, dep('2026-09-15T19:59:59Z', SB)]), SC, LIVE(SB)), 'CLEAR', 'an advance at 19:59:59Z belongs to the PREVIOUS window'],
+  ['20:00:00 is tonight', cd('2026-09-15T20:00:01Z', H([BASE, dep('2026-09-15T20:00:00Z', SB)]), SC, LIVE(SB)), 'SPENT', 'an advance at 20:00:00Z sharp is INSIDE tonight\'s window'],
+  ['1ms before the roll', cd('2026-09-15T19:59:59.999Z', H([dep('2026-09-14T19:00:00Z', SA), dep('2026-09-14T20:00:00Z', SB)]), SC, LIVE(SB)), 'SPENT', '19:59:59.999Z is still the 09-14 window, which is spent'],
+  ['at the roll', cd('2026-09-15T20:00:00Z', H([dep('2026-09-14T19:00:00Z', SA), dep('2026-09-14T20:00:00Z', SB)]), SC, LIVE(SB)), 'CLEAR', '…and 1ms later the window has rolled: [from, to)'],
+  // the dated row
+  ['row: last instant', cd('2026-09-19T03:59:59Z', H([dep('2026-09-18T10:00:00Z', SA), dep('2026-09-18T20:30:00Z', SB)]), SC, LIVE(SB)), 'SPENT', '09-19T03:59:59Z — the last instant the ceiling binds'],
+  ['row: spent', cd('2026-09-19T04:00:00Z', H([dep('2026-09-18T10:00:00Z', SA), dep('2026-09-18T20:30:00Z', SB)]), SC, LIVE(SB)), 'INERT', '09-19T04:00:00Z — the row is spent, the gate is inert: no standing rule'],
+  ['row: before it began', cd('2026-09-08T18:49:59Z', H([dep('2026-09-08T12:53:49Z', SA), dep('2026-09-08T18:00:00Z', SB)]), SC, LIVE(SB)), 'INERT', '09-08T18:49:59Z — before the ruling, the gate is inert'],
+  ['advance before row', cd('2026-09-08T18:55:00Z', H([dep('2026-09-08T12:53:49Z', SA), dep('2026-09-08T18:49:59Z', SB)]), SC, LIVE(SB)), 'CLEAR', 'an advance 1s before the ceiling existed is not a breach of it'],
+  ['advance at row start', cd('2026-09-08T18:55:00Z', H([dep('2026-09-08T12:53:49Z', SA), dep('2026-09-08T18:50:00Z', SB)]), SC, LIVE(SB)), 'SPENT', '…and one AT 18:50:00Z is counted'],
+  ['no row (not the soak host)', cd('2026-09-15T20:30:00Z', H([BASE, dep('2026-09-15T20:10:00Z', SB)]), SC, LIVE(SB), []), 'INERT', 'main() passes an EMPTY table off the soak host: never gated'],
+  // the two places the 24h window differs from TRA-4535's [20:00Z, 13:25Z) — both were holes
+  ['weekend afternoon', cd('2026-09-12T15:00:00Z', H([dep('2026-09-11T10:00:00Z', SA), dep('2026-09-12T14:00:00Z', SB)]), SC, LIVE(SB)), 'SPENT', 'Sat 15:00Z after a Sat 14:00Z advance — no RTH freeze at weekends, so a 13:25Z close would count nothing'],
+  ['weekend, prior window', cd('2026-09-12T15:00:00Z', H([dep('2026-09-11T10:00:00Z', SA), dep('2026-09-11T19:00:00Z', SB)]), SC, LIVE(SB)), 'CLEAR', '…while Fri 19:00Z belongs to Thursday\'s window'],
+  ['RTH override', cd('2026-09-11T15:00:00Z', H([dep('2026-09-10T10:00:00Z', SA), dep('2026-09-10T21:00:00Z', SB)]), SC, LIVE(SB)), 'SPENT', 'Fri 15:00Z under --force-rth-override: still the Thu window, which is spent'],
+  ['RTH override, next night', cd('2026-09-11T20:00:00Z', H([dep('2026-09-10T10:00:00Z', SA), dep('2026-09-10T21:00:00Z', SB)]), SC, LIVE(SB)), 'CLEAR', 'Fri 20:00Z — the next window, one train available'],
+];
+console.log('cadence : arm 2 — one-variable pairs:');
+for (const [label, got, expected, why] of PAIRS) cdCheck(label, got, expected, why);
+for (const [iso, startIso] of [
+  ['2026-09-15T20:00:00Z', '2026-09-15T20:00:00.000Z'],
+  ['2026-09-15T19:59:59.999Z', '2026-09-14T20:00:00.000Z'],
+  ['2026-09-16T00:30:00Z', '2026-09-15T20:00:00.000Z'],
+]) {
+  cdCheck(`window(${iso.slice(5, 19)})`, cadenceWindow(at(iso)).start.toISOString(), startIso, 'the window opens at the most recent 20:00Z, for 24h');
+}
+for (const [reason, expected] of [
+  ['TRA-4512 P0: the exit path is down', true],
+  ['tra-4512 lowercase', true],
+  ['P0 hotfix, trust me', false],
+  ['TRA- no number', false],
+]) {
+  cdCheck(`override "${reason.slice(0, 16)}"`, cadenceOverrideNamesTicket(reason), expected, 'the override must name a ticket');
+}
+{
+  // The refusal must NAME what spent the window — deploy ids, not a count the operator has to go
+  // and re-derive — and the proceed line must say when THIS deploy is the train.
+  const spent = cadenceState(at('2026-09-10T22:07:34Z'), {
+    history: { rows: REAL_BQB1_DEPLOYS.slice(0, 20).map(renderEntry), exhausted: false },
+    target: { sha: REAL_BQB1_DEPLOYS[20][2], source: '--commit' },
+    live: { sha: REAL_BQB1_DEPLOYS[19][2] },
+  });
+  const text = renderCadenceRefusal(spent);
+  const need = ['advance #2', 'dep-dahgtvmq1p3s73dh1us0', 'c54f1e73 → b5c76cc1', '2 same-SHA', '--override-cadence', '2026-09-11T20:00Z'];
+  const missingText = need.filter(s => !text.includes(s));
+  cdCheck('refusal names the trains', missingText.length ? `missing ${missingText.join(' | ')}` : 'ok', 'ok', 'the refusal lists every advance that spent the window, and when the next one opens');
+  const line = renderCadenceLine(replayAt(17));
+  cdCheck('proceed line: a train', line.includes('THIS DEPLOY IS A TRAIN') ? 'ok' : line, 'ok', 'a green run says it is spending the window');
+}
+
+// Arm 3 — the CALL SITE. The shipped bytes, spawned under the read-only stub (every POST
+// throws). Aimed at bqb1 because the gate is scoped to it. Live = HEAD, which exists in every
+// checkout, shallow or not; a refusal target of all-zeros needs --allow-rollback to get past
+// Gate 4 (BLIND on an unknown object), and that override is not what is under test.
+// Deterministic across the clock: the arms that must reach exit 0 also pass the embargo and
+// RTH overrides, which are inert unless those gates are live, so a pretest at 15:00Z and one at
+// 22:00Z grade the same thing.
+{
+  const SCRIPT = fileURLToPath(new URL('./render-redeploy.mjs', import.meta.url));
+  const STUB = new URL('./lib/tra2387-render-api-stub.mjs', import.meta.url).href;
+  const HEAD = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: fileURLToPath(new URL('..', import.meta.url)), encoding: 'utf8' }).stdout.trim();
+  const ZERO = '0'.repeat(40);
+  const BQB1_SVC = { id: 'srv-d7mb7rr7uimc73ev0chg', name: 'TradingAI-', slug: 'tradingai-bqb1', branch: 'main' };
+  const ENV_OK = [{ key: 'PORT', value: '4000' }, { key: 'AUTH_SECRET', value: 'a-real-secret-value' }];
+  const win = cadenceWindow(new Date());
+  const baseRow = renderEntry([new Date(win.start.getTime() - 3600e3).toISOString(), 'dep-e2e-base', SA, 'deactivated']);
+  const advRow = renderEntry([win.start.toISOString(), 'dep-e2e-advance', HEAD, 'live']);
+  const QUIET = ['--force-embargo-override=TRA-4535 e2e control, POSTs nothing', '--force-rth-override=TRA-4535 e2e control, POSTs nothing'];
+  const PAST4 = '--allow-rollback=TRA-4535 e2e control, POSTs nothing';
+  const live = activeCadenceCeiling(new Date());
+  const arms = live
+    ? [
+        { why: 'spent window + an advancing target ⇒ exit 10, naming the advance', deploys: [advRow, baseRow], args: [`--commit=${ZERO}`, '--dry-run', PAST4], code: 10, errHas: ['REFUSED: this deploy would be commit advance #2', 'dep-e2e-advance', '--override-cadence'] },
+        { why: '…the same run with ONE fewer history row PROCEEDS as the window\'s train', deploys: [baseRow], args: [`--commit=${ZERO}`, '--dry-run', PAST4, ...QUIET], code: 0, outHas: ['cadence : 0/1', 'THIS DEPLOY IS A TRAIN', 'would POST'] },
+        { why: 'spent window + the LIVE sha (env-apply) PROCEEDS', deploys: [advRow, baseRow], args: [`--commit=${HEAD}`, '--dry-run', ...QUIET], code: 0, outHas: ['cadence : 1/1', 'SAME build as live: not a train', 'would POST'] },
+        { why: '…the same env-apply with the history UNREADABLE ⇒ exit 10 BLIND', deploys: null, deploysStatus: 503, args: [`--commit=${HEAD}`, '--dry-run', ...QUIET], code: 10, errHas: ['BLIND and fails closed', '503'] },
+        { why: '--override-cadence="TRA-#### why" PROCEEDS and is echoed', deploys: [advRow, baseRow], args: [`--commit=${ZERO}`, '--dry-run', PAST4, ...QUIET, '--override-cadence=TRA-4535 e2e control, not a real deploy'], code: 0, errHas: ['OVERRIDING the TRA-4384 CADENCE CEILING', 'TRA-4535 e2e control, not a real deploy'], outHas: ['OVERRIDDEN (--override-cadence)'] },
+        { why: '--override-cadence with no ticket ⇒ exit 2', deploys: [advRow, baseRow], args: [`--commit=${ZERO}`, '--dry-run', PAST4, '--override-cadence=because I said so'], code: 2, errHas: ['must NAME the ticket'] },
+      ]
+    : [
+        // After the ceiling row is spent the gate is inert BY DESIGN, and this suite must say so
+        // rather than go red in everyone's pretest the morning after the freeze.
+        { why: 'no ceiling row covers today: the gate is INERT and says so', deploys: [advRow, baseRow], args: [`--commit=${ZERO}`, '--dry-run', PAST4, ...QUIET], code: 0, outHas: ['gate inert'] },
+      ];
+  console.log(`cadence : arm 3 — the shipped main(), stubbed Render, window ${win.start.toISOString()} (${live ? 'ceiling ACTIVE' : 'no ceiling row today — inert arm only'}):`);
+  for (const a of arms) {
+    const r = spawnSync(process.execPath, ['--import', STUB, SCRIPT, ...a.args], {
+      encoding: 'utf8',
+      timeout: 90000,
+      env: {
+        ...process.env,
+        RENDER_API_KEY: 'stub-key-not-a-real-credential',
+        RENDER_SERVICE_ID: BQB1_SVC.id,
+        TRA2387_STUB: JSON.stringify({
+          service: BQB1_SVC,
+          envVars: ENV_OK,
+          health: { commit: HEAD, commitSource: 'git', startedAt: '2026-09-10T00:00:00.000Z' },
+          deploys: a.deploys,
+          ...(a.deploysStatus ? { deploysStatus: a.deploysStatus } : {}),
+        }),
+      },
+    });
+    const out = r.stdout ?? '';
+    const err = r.stderr ?? '';
+    const problems = [];
+    if (r.status !== a.code) problems.push(`exit ${r.status}, expected ${a.code}`);
+    for (const s of a.outHas ?? []) if (!out.includes(s)) problems.push(`stdout missing "${s}"`);
+    for (const s of a.errHas ?? []) if (!err.includes(s)) problems.push(`stderr missing "${s}"`);
+    if (/refusing to serve a POST/.test(err)) problems.push('REACHED THE DEPLOY POST — the stub had to stop it');
+    cdCheck(`e2e exit ${a.code}`, problems.length ? problems.join('; ') : 'ok', 'ok', a.why);
+    if (problems.length && err) console.log(`         stderr[0..2]: ${err.split('\n').slice(0, 3).join(' | ')}`);
+  }
+}
+const cdMissing = ['INERT', 'CLEAR', 'SAME_SHA', 'SPENT', 'BLIND'].filter(v => !cdVerdicts.includes(v));
+
 const TOTAL =
+  cadenceArms + // TRA-4535: replay + pairs + renderers + the spawned call site
   CASES.length +
   HOLD_CASES.length +
   WARN_CASES.length +
@@ -1082,6 +1351,7 @@ const allMissing = [
   ...stMissing.map(v => `staleness:${v}`),
   ...blMissing.map(v => `baseline:${v}`),
   ...pdMissing.map(v => `pin-drift:${v}`),
+  ...cdMissing.map(v => `cadence:${v}`),
 ];
 
 console.log('');
@@ -1090,7 +1360,10 @@ console.log(`embargos: ${EMBARGOES.length} row(s) — ${EMBARGOES.map(e => `${e.
 console.log(
   `holds   : ${COMMIT_HOLDS.length} row(s) — ${COMMIT_HOLDS.map(h => `${h.commit.slice(0, 7)}→${h.until} (${h.ticket})`).join(', ')}`,
 );
-console.log(`dholds  : ${DEPLOY_HOLD_FILE} — ${readDeployHolds().holds.map(h => h.ticket).join(', ') || 'none'} (TRA-4261)`);
+console.log(
+  `ceilings: ${CADENCE_CEILINGS.length} row(s) — ${CADENCE_CEILINGS.map(c => `${c.from}→${c.to} max ${c.max} (${c.ticket.split(' ')[0]})`).join(', ')} (TRA-4535)`,
+);
+console.log(`dholds  :${DEPLOY_HOLD_FILE} — ${readDeployHolds().holds.map(h => h.ticket).join(', ') || 'none'} (TRA-4261)`);
 console.log(`cases   : ${pass}/${TOTAL} pass`);
 console.log(
   `verdicts: reached ${[...new Set([...produced, ...holdProduced, ...warnProduced, ...rbProduced, ...noteProduced, ...carryProduced, ...dhProduced])].sort().join(', ')}`,
@@ -1108,6 +1381,9 @@ if (failures.length) {
 console.log(
   `baseline: emits[] window graded ${[...blProduced].sort().join('/')} · live-pin drift ${[...pdProduced].sort().join('/')} (TRA-4268)`,
 );
-console.log('[tra2325] PASS — freeze, embargo, commit-hold, rollback, stale-pin and deploy-hold all discriminate,');
+console.log(
+  `cadence : ${cadenceArms} arm(s) — verdicts ${[...new Set(cdVerdicts.filter(v => typeof v === 'string' && /^[A-Z_]+$/.test(v)))].sort().join('/')} (TRA-4535)`,
+);
+console.log('[tra2325] PASS — freeze, embargo, commit-hold, rollback, stale-pin, deploy-hold and cadence all discriminate,');
 console.log('[tra2325] and every verdict is reachable.');
 process.exit(0);

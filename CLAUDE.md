@@ -163,6 +163,15 @@ env-var list exits `7`, never `0` — and unlike the first three it is not scope
 `docs/runbook.md` §"Four gates". The overrides are not interchangeable: a reason that justifies
 deploying inside RTH is not a reason to boot a process that throws.
 
+**Exit `10`: the cadence ceiling (TRA-4535).** While a `CADENCE_CEILINGS` row is active (the first
+one runs `2026-09-08T18:50Z → 2026-09-19T04:00Z`, TRA-4384, max 1), the script counts **commit
+advances** on bqb1 from Render's own deploy history over `[D 20:00Z, D+1 20:00Z)`. Once the window
+holds its quota it refuses any further deploy whose target is not the live build. A same-SHA
+env-apply always proceeds, and failed/canceled deploys are not counted. If the history is
+unreadable the gate reads BLIND and still exits `10`. Override with
+`--override-cadence="TRA-#### why"`, which must name a ticket. The window runs a full 24h rather than
+closing at 13:25Z so that an RTH-override deploy or a weekend afternoon deploy is still counted.
+
 ⚠️ It gates **deploys**. It cannot see an **env/settings write**, nor the memory watchdog's own pm2
 self-restart, which writes no deploy record at all (TRA-2203/TRA-2261). **A green run of the script
 is not evidence the host is safe to touch.**

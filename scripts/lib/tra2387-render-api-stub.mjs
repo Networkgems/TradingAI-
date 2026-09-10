@@ -13,6 +13,10 @@
 // Config comes in as JSON on TRA2387_STUB:
 //   { service: {id, name, branch}, envVars: [{key, value}] | null, envVarsStatus?: number }
 // envVars: null + envVarsStatus → the env-var read fails, i.e. the BLIND arm.
+// TRA-4535 adds two OPTIONAL keys, for the cadence gate's call-site arms:
+//   deploys: [{deploy, cursor}] | null, deploysStatus?: number — GET /services/{id}/deploys
+//   health:  {commit, startedAt, …}                                 — GET …/api/health/version
+// When a key is absent its route throws "unstubbed" as it always has, so no existing arm changes shape.
 //
 // It refuses to serve a deploy POST at all, so a stubbed run cannot become a real one even
 // if --dry-run were dropped from the command.
@@ -37,6 +41,13 @@ globalThis.fetch = async (url, init) => {
     }
     return json(cfg.envVars.map(v => ({ envVar: v, cursor: null })));
   }
+  if (/\/services\/[^/]+\/deploys/.test(u) && ('deploys' in cfg || 'deploysStatus' in cfg)) {
+    if (!Array.isArray(cfg.deploys)) {
+      return new Response('stubbed deploy-list read failure', { status: cfg.deploysStatus ?? 500 });
+    }
+    return json(cfg.deploys);
+  }
+  if (/\/api\/health\/version/.test(u) && cfg.health) return json(cfg.health);
   if (/\/services\/[^/]+$/.test(u)) return json(service);
 
   throw new Error(`[tra2387-stub] unstubbed request: ${method} ${u}`);

@@ -195,6 +195,24 @@ const E2E = [
     stderrLacks: ['REFUSED (usage)'],
   },
   {
+    // TRA-4535. A misspelt override would be SILENTLY IGNORED without the guard, and an operator
+    // who believed they had overridden the cadence gate would read exit 10 as a malfunction. The
+    // guard must refuse it and name the real flag.
+    why: '--overide-cadence (one r) is REFUSED 2 and suggests --override-cadence',
+    args: [`--commit=${NO_SUCH_SHA}`, '--overide-cadence=TRA-4535 P0'],
+    code: 2,
+    class: 'refuse',
+    stderrHas: ['REFUSED (usage)', 'Did you mean `--override-cadence`?'],
+  },
+  {
+    why: '--override-cadence is a KNOWN flag: the guard admits it (the cadence gate owns its reason check)',
+    args: [`--commit=${NO_SUCH_SHA}`, '--dry-run', '--override-cadence=TRA-4535 control arm, not a real deploy'],
+    service: OTHER,
+    code: 0,
+    class: 'proceed',
+    stderrLacks: ['REFUSED (usage)'],
+  },
+  {
     why: 'the full documented invocation with a reasoned override PROCEEDS through the guard',
     args: [
       `--commit=${NO_SUCH_SHA}`,
@@ -313,6 +331,11 @@ const CASES = [
   [['--commit=abc', '--force-rth-override'], [], 'bare override flag — the GATE owns that refusal'],
   [['--commit=abc', '--force-rth-override=why'], [], 'override with a reason'],
   [['--commit=abc', '--override-hold=TRA-1 why'], [], 'reason containing a space'],
+  // TRA-4535: the seventh override. Known to the guard, admitted bare (its gate owns the
+  // "must name a ticket" refusal), and a near-miss is still refused with a suggestion.
+  [['--commit=abc', '--override-cadence=TRA-4535 P0'], [], 'the cadence override with a ticket'],
+  [['--commit=abc', '--override-cadence'], [], 'the cadence override BARE — exit 10\'s own gate owns that refusal'],
+  [['--commit=abc', '--overide-cadence=TRA-4535 P0'], ['unknown'], 'the cadence override misspelt — must NOT be ignored'],
   [['--commmit=abc'], ['no-target', 'unknown'], "the two-m typo — THE incident's expensive sibling"],
   [['--comit=abc'], ['no-target', 'unknown'], 'the dropped-m typo'],
   [['--commit', 'abc'], ['missing-value', 'no-target', 'positional'], 'the space form'],

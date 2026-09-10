@@ -105,6 +105,11 @@
 //                       condition this script can itself measure (a clock, a sha, a secret),
 //                       so a bare reason is enough; this one guards a DECISION somebody else
 //                       is holding, and naming it is the cheapest proof the hold was read.
+//   --override-cadence="<TRA-####> reason"  deploy one more COMMIT ADVANCE into a window whose
+//                       cadence ceiling is already spent, or whose history cannot be read.
+//                       This is the seventh override. Like --override-hold it must name a
+//                       ticket, because a second train needs an owner who will answer for it.
+//                       TRA-4535.
 //   --dry-run           print the gate decision and the intended call, POST nothing.
 //   --help, -h          print usage and exit 0 WITHOUT deploying. Added by TRA-4420: on
 //                       2026-09-09 this flag was unrecognised, therefore ignored, and the
@@ -127,6 +132,10 @@
 //      before any byte reaches Render — TRA-4261. A hold missing either stamp is BLIND:
 //      `enumeratedTip` (the list's HEAD, TRA-4262) and `enumeratedFromLivePin` (the list's
 //      BASELINE — the sha THE BOX IS RUNNING, sha first then provenance, TRA-4268).
+//  10  REFUSED — a CADENCE_CEILINGS row is active, this post-close window already holds its
+//      quota of COMMIT ADVANCES (counted off Render's deploy history), and this deploy would
+//      add one more. Also exit 10 when that history cannot be read (BLIND). A same-SHA
+//      redeploy is never refused. Override: --override-cadence="<TRA-####> reason". TRA-4535.
 
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -480,6 +489,245 @@ export const EMBARGOES = [
 //
 // This row is spent at 21:00Z on 2026-07-27. Grades are published from the reads above, so if you
 // need a deploy that evening, take it after 21:00Z rather than overriding.
+
+// ── The CADENCE CEILING (TRA-4535, off TRA-4384) — exit 10 ────────────────────
+// Every other gate here answers a question about ONE deploy: is it the right hour, the right
+// commit, will it boot, does it go backwards. None of them can COUNT. So a ceiling on how many
+// deploys a night may carry could only be written as prose, and prose did not hold. Board
+// ruling A (TRA-4383, card c4dd383c) caps bqb1 at ONE deploy train per day through Fri
+// 2026-09-18. The closed window 2026-09-09T20:00Z → 09-10T13:30Z carried NINE commit advances,
+// by at least three operators, the freeze's own enforcer among them, and every one passed every
+// gate in this file, because no gate could see the ceiling. A freeze that reads "in force"
+// identically whether it holds or not is the silent-green class.
+//
+// The stopgap was a dated EMBARGOES row per night. It works, but somebody has to write it by
+// hand every night, which is the "one day at a time" defect the notes above already name. It
+// also LOST A RACE on its first night: the 09-10 row was committed at 22:07:00Z, and that
+// window's second advance (dep-dahik9m1, b5c76cc1 → 05be2d16) was created at 22:07:34Z from a
+// checkout that did not hold it. A ceiling row covers the whole freeze, so every checkout from
+// the day it lands carries it, and the count comes from Render, not from whoever last wrote a row.
+//
+// WHAT IS COUNTED. A COMMIT ADVANCE is a deploy whose commit differs from the commit of the
+// counting deploy before it, in creation order. Failed and canceled deploys never changed what
+// served, so they are skipped: they neither count nor move the baseline. A same-SHA redeploy (the
+// env-apply path, --commit=<sha already serving>) is not a train. It is never counted, and it is
+// never refused. A deploy still IN FLIGHT does count: an advance somebody else created two minutes
+// ago is this window's train whether or not it has booted yet.
+//
+// THE WINDOW is [D 20:00Z, D+1 20:00Z): a 24h day anchored at the close. TRA-4535 first
+// specified [D 20:00Z, D+1 13:25Z), the post-close deploy slot. On a weekday the two count the same
+// deploys, because the RTH freeze already refuses everything in 13:25–20:00Z. They differ in two
+// places, and in the spec's shape both are holes:
+//   · a deploy made INSIDE RTH with --force-rth-override falls in no post-close window, so it
+//     would be a second train for free. The CTO's own stopgap row ran 20:00Z → 20:00Z for this
+//     reason: "an RTH override alone cannot spend a second train today";
+//   · the RTH freeze does not run at weekends, so Sat/Sun 13:25–20:00Z would be counted by
+//     nothing, and the ceiling row spans the 09-12/13 weekend.
+// Half-open at 20:00Z: a deploy created at 19:59:59Z belongs to the previous window.
+//
+// FAILS CLOSED, like every other gate here. A deploy history that cannot be read, or that cannot
+// be shown to reach back past the window's start (the first advance needs a baseline to be an
+// advance FROM), is BLIND ⇒ REFUSE. A spent window with an unreadable live commit is also BLIND,
+// because the same-SHA exemption cannot then be shown. An EMPTY window proceeds without either,
+// since there is nothing to be exempted from.
+//
+// DATED, and inert outside a row. The ceiling is a board ruling with an end date, not a standing
+// rule, and a gate that outlived the ruling would be a rule nobody ratified. A row is half-open
+// [from, to) like EMBARGOES, and advances created before the row's `from` are not counted.
+// Leave spent rows in place as a record.
+export const CADENCE_WINDOW_OPEN_MIN = FREEZE_CLOSE_MIN; // 20:00Z — the window rolls at the close
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+export const CADENCE_CEILINGS = [
+  {
+    from: '2026-09-08T18:50:00Z',
+    to: '2026-09-19T04:00:00Z',
+    ticket: 'TRA-4384 (TRA-4383 board ruling A, card c4dd383c: ONE deploy train per day to 2026-09-18)',
+    max: 1,
+    why:
+      'The feature freeze caps bqb1 at ONE deploy train per day, and prose did not hold it: 5 commit ' +
+      'advances in the 09-08 window, 9 in the 09-09 window, and 2 by 22:08Z in the 09-10 window ' +
+      '(the second one 34s after that night\'s stopgap embargo was committed). NOTHING IS LOST BY ' +
+      'WAITING: every commit on main rides the next window\'s train in one boot, and ' +
+      'check:deploy-train-window grades a deploy order by ANCESTRY.',
+  },
+];
+
+// Render deploy statuses that never changed what the host served. Everything else counts, and
+// that includes a status this list has never seen: an unrecognised status is counted, never
+// waved through, so a new Render verb over-counts rather than opening the gate.
+export const CADENCE_NON_COUNTING_STATUSES = new Set(['build_failed', 'update_failed', 'pre_deploy_failed', 'canceled']);
+
+// The window `now` falls in: the most recent 20:00Z at or before `now`, for 24h.
+export function cadenceWindow(now) {
+  const t = now.getTime();
+  let start = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) + CADENCE_WINDOW_OPEN_MIN * 60000;
+  if (start > t) start -= DAY_MS;
+  return { start: new Date(start), end: new Date(start + DAY_MS) };
+}
+
+export function activeCadenceCeiling(now, table = CADENCE_CEILINGS) {
+  const t = now.getTime();
+  return table.find(c => t >= Date.parse(c.from) && t < Date.parse(c.to)) ?? null;
+}
+
+// Where counting starts: the window's start, or the row's `from` if the row began inside the
+// window. An advance from before the ceiling existed is not a breach of it.
+export function cadenceLowerBound(now, ceiling) {
+  return Math.max(cadenceWindow(now).start.getTime(), Date.parse(ceiling.from));
+}
+
+// One deploy-list row, as Render returns it (`{deploy, cursor}`) or already unwrapped.
+function cadenceRow(entry) {
+  const d = entry?.deploy ?? entry;
+  return {
+    id: typeof d?.id === 'string' ? d.id : '(no id)',
+    commit: typeof d?.commit?.id === 'string' ? d.commit.id : null,
+    status: typeof d?.status === 'string' ? d.status : '(no status)',
+    createdAt: d?.createdAt ?? null,
+    t: Date.parse(d?.createdAt),
+  };
+}
+
+export function cadenceRowCounts(row) {
+  return !CADENCE_NON_COUNTING_STATUSES.has(row.status);
+}
+
+// Pure. `history` = { rows: [Render deploy entries], exhausted: boolean }, where `exhausted` says
+// the rows are the service's WHOLE history, so that "no deploy before the window" is a fact about
+// the service and not about pagination. Counts over [lower, upper).
+//   → { advances, sameSha, skipped, baseline } | { blind: why }
+export function countCommitAdvances(history, lower, upper) {
+  const rows = (history?.rows ?? []).map(cadenceRow);
+  const undated = rows.find(r => !Number.isFinite(r.t));
+  if (undated) return { blind: `deploy ${undated.id} carries no readable createdAt, so it cannot be placed in or out of the window` };
+  rows.sort((a, b) => a.t - b.t);
+
+  const before = rows.filter(r => r.t < lower && cadenceRowCounts(r));
+  let baseline;
+  if (before.length) baseline = before[before.length - 1].commit;
+  else if (history?.exhausted) baseline = null; // the service's first deploy ever is an advance
+  else {
+    return {
+      blind:
+        `the deploy history read does not reach back past ${new Date(lower).toISOString()}, so the window's ` +
+        'first deploy has nothing to be an advance FROM',
+    };
+  }
+
+  const advances = [];
+  const sameSha = [];
+  const skipped = [];
+  let prev = baseline;
+  for (const r of rows) {
+    if (r.t < lower || r.t >= upper) continue;
+    if (!cadenceRowCounts(r)) {
+      skipped.push(r);
+      continue;
+    }
+    // A row with no commit is COUNTED: "cannot tell whether it moved" is not "it did not move".
+    if (r.commit && prev && sameCommitSha(r.commit, prev)) sameSha.push(r);
+    else advances.push({ ...r, from: prev });
+    prev = r.commit;
+  }
+  return { advances, sameSha, skipped, baseline };
+}
+
+// The predicate main() evaluates. Pure: `history` from fetchDeployHistory, `target` from
+// resolveTarget, `live` from fetchLiveCommit, all injected.
+//   INERT     no ceiling row covers `now`                           ⇒ proceed
+//   CLEAR     the window holds fewer advances than the ceiling       ⇒ proceed
+//   SAME_SHA  the window is spent, but the target IS the live build  ⇒ proceed (not a train)
+//   SPENT     the window is spent and this deploy would advance      ⇒ REFUSE
+//   BLIND     the count or the same-SHA exemption cannot be shown    ⇒ REFUSE
+export function cadenceState(now, { history, target, live }, table = CADENCE_CEILINGS) {
+  const ceiling = activeCadenceCeiling(now, table);
+  const window = cadenceWindow(now);
+  const base = { ceiling, window, target, live, advances: [], sameSha: [], skipped: [], why: null };
+  if (!ceiling) return { ...base, verdict: 'INERT' };
+  if (!history || history.error || !Array.isArray(history.rows)) {
+    return { ...base, verdict: 'BLIND', why: history?.error ?? 'the deploy history was not read' };
+  }
+  const c = countCommitAdvances(history, cadenceLowerBound(now, ceiling), window.end.getTime());
+  if (c.blind) return { ...base, verdict: 'BLIND', why: c.blind };
+  const at = { ...base, advances: c.advances, sameSha: c.sameSha, skipped: c.skipped };
+  if (c.advances.length < ceiling.max) return { ...at, verdict: 'CLEAR' };
+  if (!target?.sha) return { ...at, verdict: 'BLIND', why: target?.error ?? 'the target commit could not be resolved' };
+  if (!live?.sha) {
+    return {
+      ...at,
+      verdict: 'BLIND',
+      why: `${live?.error ?? 'the live commit could not be read'}, so whether this deploy is a same-SHA redeploy (not a train) cannot be shown`,
+    };
+  }
+  // Prefix equality, not `===`: --commit is passed through verbatim, so a 7-char pin against the
+  // 40-char live sha is the NORMAL case (the stalePinNote lesson, TRA-3625).
+  if (sameCommitSha(target.sha, live.sha)) return { ...at, verdict: 'SAME_SHA' };
+  return { ...at, verdict: 'SPENT' };
+}
+
+export function cadenceBlocks(verdict) {
+  return verdict === 'SPENT' || verdict === 'BLIND';
+}
+
+// The override must name A ticket, not necessarily the ceiling's own. What it is proving is
+// that the second train has an owner who will answer for it, and the owner's ticket is the one
+// that says why it could not wait.
+export function cadenceOverrideNamesTicket(reason) {
+  return /\bTRA-\d+\b/i.test(String(reason ?? ''));
+}
+
+const cadenceAt = r => (Number.isFinite(r.t) ? new Date(r.t).toISOString() : '(undated)');
+const cadenceWin = w => `[${w.start.toISOString().replace(':00.000Z', 'Z')}, ${w.end.toISOString().replace(':00.000Z', 'Z')})`;
+
+function cadenceAdvanceLines(state) {
+  const lines = state.advances.map(
+    a => `    · ${cadenceAt(a)}  ${a.id}  ${a.from ? a.from.slice(0, 8) : '(none)'} → ${a.commit ? a.commit.slice(0, 8) : '(no commit)'}  [${a.status}]`,
+  );
+  lines.push(
+    `    (+ ${state.sameSha.length} same-SHA redeploy(s) and ${state.skipped.length} failed/canceled deploy(s) in the window — not counted)`,
+  );
+  return lines;
+}
+
+export function renderCadenceRefusal(state) {
+  const c = state.ceiling;
+  const head =
+    state.verdict === 'SPENT'
+      ? `[render-redeploy] REFUSED: this deploy would be commit advance #${state.advances.length + 1} in a window whose ceiling is ${c.max} — TRA-4535.`
+      : `[render-redeploy] REFUSED: the cadence ceiling cannot be checked, so this gate is BLIND and fails closed — TRA-4535.`;
+  return [
+    head,
+    `  ceiling : at most ${c.max} commit advance(s) per window, ${c.from} → ${c.to} — ${c.ticket}`,
+    `  window  : ${cadenceWin(state.window)}`,
+    ...(state.why ? [`  blind   : ${state.why}`] : []),
+    `  counted : ${state.advances.length} advance(s)${state.advances.length ? ':' : ''}`,
+    ...(state.advances.length || state.sameSha.length || state.skipped.length ? cadenceAdvanceLines(state) : []),
+    `  live    : ${state.live?.sha ? short(state.live.sha) : '(unreadable)'}`,
+    `  target  : ${state.target?.sha ? short(state.target.sha) : '(unresolved)'}  [${state.target?.source ?? '?'}]`,
+    `  ${c.why}`,
+    `  The next window opens ${state.window.end.toISOString().replace(':00.000Z', 'Z')}. A same-SHA env-apply is not a train and is not`,
+    `  refused: --commit=<the sha ALREADY SERVING>. If a second train genuinely cannot wait, re-run with`,
+    `  --override-cadence="TRA-#### why this cannot wait" (it must name a ticket, and it is echoed on the record).`,
+    `  NOTE: ${ENV_WRITE_CAVEAT_SHORT}`,
+  ].join('\n');
+}
+
+// The one-line summary on a run that proceeds. Never silent: a green run must say how much of
+// the night it spent, or "the gate passed" reads the same at 0 advances and at 1.
+export function renderCadenceLine(state, { isSoakHost = true, overridden = false } = {}) {
+  if (!isSoakHost) return '(not the soak host — cadence gate N/A)';
+  if (state.verdict === 'INERT') return 'no CADENCE_CEILINGS row covers this instant — gate inert';
+  const n = `${state.advances.length}/${state.ceiling.max} advance(s) in ${cadenceWin(state.window)} (${state.ceiling.ticket.split(' ')[0]})`;
+  if (state.verdict === 'SAME_SHA') return `${n} — SPENT, but the target is the SAME build as live: not a train`;
+  if (state.verdict === 'CLEAR') {
+    const advance = state.live?.sha && state.target?.sha ? !sameCommitSha(state.target.sha, state.live.sha) : null;
+    return `${n} — ${
+      advance === null ? 'whether this deploy advances is unknown (live unread)' : advance ? 'THIS DEPLOY IS A TRAIN and spends the window' : 'this deploy is a same-SHA redeploy, not a train'
+    }`;
+  }
+  return `${n} — ${state.verdict}${overridden ? ', OVERRIDDEN (--override-cadence)' : ''}`;
+}
 
 // ── Held commits ──────────────────────────────────────────────────────────────
 // The two gates above answer "may I deploy NOW?". Neither can answer "may I deploy THIS?" —
@@ -1642,6 +1890,8 @@ const ROLLBACK_OVERRIDE_REASON = valOf('--allow-rollback');
 const HAS_ROLLBACK_OVERRIDE = argv.some(a => a === '--allow-rollback' || a.startsWith('--allow-rollback='));
 const HOLD_OVERRIDE_REASON = valOf('--override-hold');
 const HAS_HOLD_OVERRIDE = argv.some(a => a === '--override-hold' || a.startsWith('--override-hold='));
+const CADENCE_OVERRIDE_REASON = valOf('--override-cadence');
+const HAS_CADENCE_OVERRIDE = argv.some(a => a === '--override-cadence' || a.startsWith('--override-cadence='));
 const WANTS_TIP = has('--tip');
 
 function fail(code, msg) {
@@ -1742,6 +1992,12 @@ export const KNOWN_ARGS = [
     value: 'reason',
     arg: '"<TRA-####> reason"',
     help: 'deploy past an open hold in ops/deploy-hold.json anyway (exit 9). Must NAME the hold.',
+  },
+  {
+    flag: '--override-cadence',
+    value: 'reason',
+    arg: '"<TRA-####> reason"',
+    help: 'deploy one more commit advance into a window whose CADENCE CEILING is spent or unreadable (exit 10). Must name a ticket.',
   },
 ];
 
@@ -1945,6 +2201,7 @@ export function renderUsage() {
     '  7  REFUSED — the live AUTH_SECRET is unusable, or cannot be READ (BLIND)',
     '  8  REFUSED — the deploy would ROLL THE HOST BACK, or cannot be proven not to',
     '  9  REFUSED — an open hold in ops/deploy-hold.json covers this service (or it is BLIND)',
+    ' 10  REFUSED — this window\'s CADENCE CEILING is spent by earlier commit advances (or is BLIND)',
     '',
     'THIS PRINTS AND EXITS. It deploys nothing. Before TRA-4420 it deployed the branch tip.',
   ].join('\n');
@@ -2078,6 +2335,52 @@ async function fetchLiveCommit() {
     };
   }
   return { sha: (rev.stdout ?? '').trim(), reported: commit, startedAt: body?.startedAt ?? null };
+}
+
+// The cadence gate's history (TRA-4535). Deliberately NOT `api()`, for the reason given at
+// fetchEnvVarProbe: an unreadable deploy list is this gate going BLIND under exit 10, not a
+// usage error under exit 2. Pages newest-first until it holds a COUNTING deploy created before
+// `lowerMs` (the baseline the window's first advance is measured from), or the history ends.
+// It stops there, so a normal night costs one request. Anything short of that returns
+// `exhausted: false`, and countCommitAdvances turns a missing baseline into BLIND.
+const DEPLOY_HISTORY_PAGE = 100;
+const DEPLOY_HISTORY_MAX_PAGES = 10;
+
+async function fetchDeployHistory(serviceId, lowerMs) {
+  const rows = [];
+  let cursor;
+  for (let page = 0; page < DEPLOY_HISTORY_MAX_PAGES; page += 1) {
+    const q = new URLSearchParams({ limit: String(DEPLOY_HISTORY_PAGE) });
+    if (cursor) q.set('cursor', cursor);
+    const path = `/services/${serviceId}/deploys?${q}`;
+    let r;
+    try {
+      r = await fetch(`${API}${path}`, { headers: { Authorization: `Bearer ${API_KEY}`, Accept: 'application/json' } });
+    } catch (e) {
+      return { rows: null, error: `GET ${path} threw: ${e?.message ?? String(e)}` };
+    }
+    if (!r.ok) {
+      const body = await r.text().catch(() => '');
+      return { rows: null, error: `GET ${path} → ${r.status} ${r.statusText} ${body}`.trim() };
+    }
+    let json;
+    try {
+      json = await r.json();
+    } catch (e) {
+      return { rows: null, error: `GET ${path} returned unparseable JSON: ${e?.message ?? String(e)}` };
+    }
+    if (!Array.isArray(json)) return { rows: null, error: `GET ${path} returned ${typeof json}, expected an array` };
+    rows.push(...json);
+    if (json.length < DEPLOY_HISTORY_PAGE) return { rows, exhausted: true };
+    const baselineInHand = json.some(e => {
+      const d = e?.deploy ?? e;
+      return Date.parse(d?.createdAt) < lowerMs && !CADENCE_NON_COUNTING_STATUSES.has(d?.status);
+    });
+    if (baselineInHand) return { rows, exhausted: false };
+    cursor = json[json.length - 1]?.cursor;
+    if (!cursor) return { rows, exhausted: false };
+  }
+  return { rows, exhausted: false };
 }
 
 async function resolveService() {
@@ -2477,6 +2780,45 @@ async function main() {
     );
   }
 
+  // ── The CADENCE CEILING (TRA-4535) — exit 10 ────────────────────────────────
+  // After Gate 4, because it needs the live commit Gate 4 already read: the same-SHA exemption
+  // IS "target equals live". AHEAD of the embargo and the RTH freeze on purpose. On a night when
+  // a stopgap embargo row and a spent ceiling cover the same deploy, the count names the trains
+  // that spent the window, where the embargo refusal only names a row. And a deploy made under
+  // --force-rth-override must still meet it: that was the free second train in the spec's shape
+  // of the window (see the block at CADENCE_CEILINGS).
+  // Only the soak host, and only inside a ceiling row. Outside one it costs no request at all.
+  const cadenceCeiling = isSoakHost ? activeCadenceCeiling(now) : null;
+  const cadenceHistory = cadenceCeiling ? await fetchDeployHistory(service.id, cadenceLowerBound(now, cadenceCeiling)) : null;
+  const cadence = cadenceState(now, { history: cadenceHistory, target, live }, isSoakHost ? CADENCE_CEILINGS : []);
+
+  if (cadenceBlocks(cadence.verdict) && !HAS_CADENCE_OVERRIDE) {
+    console.error(renderCadenceRefusal(cadence));
+    process.exit(10);
+  }
+
+  if (cadenceBlocks(cadence.verdict) && HAS_CADENCE_OVERRIDE) {
+    if (!CADENCE_OVERRIDE_REASON || !CADENCE_OVERRIDE_REASON.trim()) {
+      fail(2, '--override-cadence requires a non-empty reason, e.g. --override-cadence="TRA-4512 P0: the exit path is down".');
+    }
+    if (!cadenceOverrideNamesTicket(CADENCE_OVERRIDE_REASON)) {
+      fail(
+        2,
+        `--override-cadence must NAME the ticket this extra train is for (a TRA-#### token). ` +
+          `Got: "${CADENCE_OVERRIDE_REASON}".`,
+      );
+    }
+    console.error(
+      `[render-redeploy] ⚠ OVERRIDING the ${cadence.ceiling.ticket.split(' ')[0]} CADENCE CEILING at ${new Date().toISOString()} — TRA-4535.\n` +
+        `  override: --override-cadence="${CADENCE_OVERRIDE_REASON}"\n` +
+        `  verdict : ${cadence.verdict}${cadence.why ? ` — ${cadence.why}` : ''}\n` +
+        `  window  : ${renderCadenceLine(cadence, { overridden: true })}\n` +
+        (cadence.advances.length ? `${cadenceAdvanceLines(cadence).join('\n')}\n` : '') +
+        `  This is commit advance #${cadence.advances.length + 1} in the window. Tell the freeze owner on ` +
+        `${cadence.ceiling.ticket.split(' ')[0]} BEFORE the box boots, not after.`,
+    );
+  }
+
   if (isSoakHost && embargo && !HAS_EMBARGO_OVERRIDE) {
     console.error(
       `[render-redeploy] REFUSED: ${service.name} (${service.id}) is under a DATED EMBARGO ` +
@@ -2580,6 +2922,10 @@ async function main() {
     const note = stalePinNote(target, resolveTarget(service.branch ?? 'main', undefined).sha);
     if (note) console.log(note);
   }
+  // TRA-4535: printed on every run, so a green run still says how much of tonight it spends.
+  console.log(
+    `cadence : ${renderCadenceLine(cadence, { isSoakHost, overridden: HAS_CADENCE_OVERRIDE && cadenceBlocks(cadence.verdict) })}`,
+  );
   console.log(
     `holds   : ${
       holdCheck.active.length === 0
