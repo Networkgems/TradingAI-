@@ -154,6 +154,63 @@ export const OTM_EVALUATION_VERDICT_STATUSES = [
 ] as const;
 export type OtmEvaluationVerdictStatus = (typeof OTM_EVALUATION_VERDICT_STATUSES)[number];
 
+/** Bound on the persisted re-cut log. */
+export const OTM_EVALUATION_RECUT_HISTORY_MAX = 20;
+
+/**
+ * A re-cut RULED by the verdict owner but not necessarily executed.
+ *
+ * The record could always be re-cut in prose and never in state: the only
+ * writers were the tick's one-shot stamp and a shell script on the host's data
+ * dir, so a ruling that moved the cut had nowhere to land — the same shape as
+ * the `verdict_insufficient_population` terminal (fd917f86) that the record
+ * named for four days before anything could write it. These declarations carry
+ * the ruling onto the wire with `satisfied` COMPUTED off the persisted cut, so
+ * an unexecuted ruling cannot read as a done one.
+ */
+export interface OtmEvaluationRuledRecut {
+  /** The ruling's own reference — comment id + author + instant. */
+  rulingRef: string;
+  ruledAt: string;
+  /** Why the population splits here (the TRA-2677 hazard being avoided). */
+  reason: string;
+  /** ms epoch the sample must restart at. */
+  candidateStartedAt: number;
+  candidateBuild: OtmEvaluationBuildPin;
+  /** Where the pin above was reported (a deploy order's commit is a lower bound; this is the wire read). */
+  pinSource: string;
+}
+
+/**
+ * QuantTrader comment `a9753fda` on TRA-3945 (2026-08-25T20:39:31Z): TRA-4006
+ * lowered `PROFIT_LOCK_ARM_R` 1.0 → 0.75 and `PROFIT_LOCK_GIVEBACK_R` 1.0 →
+ * 0.40, which ALTERS REALISED OUTCOMES ⇒ closes generated before it are a
+ * different population (TRA-2677). "Until then the window is not counting. No
+ * close entered before that timestamp is admissible."
+ *
+ * The pin was reported the same night under TRA-4006 AC6 (LeadDev comment
+ * `eb048f86`, read off `/api/health/options-live` at 04:34:33Z and again at
+ * 04:35Z). The re-cut itself was never executed — measured 2026-09-09, the
+ * record still held `startedAt 2026-08-23T01:40:43.225Z` / `startBuild
+ * f041ebf3`, so 5 of the counted 9 closes entered BEFORE the fix.
+ */
+export const OTM_EVALUATION_RULED_RECUTS: readonly OtmEvaluationRuledRecut[] = [
+  {
+    rulingRef: 'TRA-3945 comment a9753fda (QuantTrader, verdictOwner, 2026-08-25T20:39:31.423Z)',
+    ruledAt: '2026-08-25T20:39:31.423Z',
+    reason:
+      'TRA-4006 changed the profit-lock exit floor (PROFIT_LOCK_ARM_R 1.0->0.75, PROFIT_LOCK_GIVEBACK_R 1.0->0.40). The arm under test IS an exit ruleset, so closes generated under the old constants are a different population (TRA-2677). Ruled: the window restarts at TRA-4006\'s deploy commit and its startedAt; no close whose ENTRY predates that instant is admissible.',
+    candidateStartedAt: Date.UTC(2026, 7, 26, 4, 33, 57, 910),
+    candidateBuild: {
+      commit: '85c788e5cdc91ef75345c943bbcdccb8e809db14',
+      commitShort: '85c788e5cdc9',
+      pid: 75,
+      startedAt: '2026-08-26T04:33:57.910Z',
+    },
+    pinSource: 'TRA-4006 AC6 (LeadDev comment eb048f86) - /api/health/options-live read 2026-08-26T04:34:33Z, re-read 04:35Z',
+  },
+];
+
 export type OtmEvaluationWindowStatus =
   | 'armed'
   | 'counting'
@@ -314,12 +371,32 @@ export interface OtmEvaluationVerdict {
   atN?: number | null;
 }
 
+/**
+ * One executed re-cut. The PRIOR cut is kept so the wire can still show which
+ * population every earlier filing was computed over — a re-cut that silently
+ * overwrote `startedAt` would make every prior comment unreproducible.
+ */
+export interface OtmEvaluationRecutEntry {
+  at: number;
+  by: string;
+  /** Must carry the ruling's ticket reference. */
+  note: string;
+  priorStartedAt: number;
+  priorStartBuild: OtmEvaluationBuildPin | null;
+  /** Counted n immediately BEFORE the re-cut, read off the fold in the same beat. */
+  priorN: number | null;
+  startedAt: number;
+  startBuild: OtmEvaluationBuildPin | null;
+}
+
 /** The persisted part. Everything else is derived on read. */
 export interface OtmEvaluationWindowState {
   version: 1;
   windowId: string;
   startedAt: number | null;
   startBuild: OtmEvaluationBuildPin | null;
+  /** TRA-3945 re-cut log; `[]` on a record that has never been re-cut. */
+  recutHistory?: OtmEvaluationRecutEntry[];
   buildDrift: OtmEvaluationPauseSpan[];
   buildDriftTotal: number;
   extension: { allowed: 1; closes: number; used: boolean; usedAt: number | null };
@@ -338,6 +415,7 @@ export function emptyOtmEvaluationWindowState(): OtmEvaluationWindowState {
     windowId: OTM_EVALUATION_WINDOW_ID,
     startedAt: null,
     startBuild: null,
+    recutHistory: [],
     buildDrift: [],
     buildDriftTotal: 0,
     extension: { allowed: 1, closes: OTM_EVALUATION_EXTENSION_CLOSES, used: false, usedAt: null },
@@ -911,6 +989,109 @@ export function applyOtmEvaluationVerdict(
   return { ...state, verdict: { status: verdict.status, note: verdict.note, by: verdict.by, atN, at: now } };
 }
 
+// ── Re-cut (a ruled restart of the sample) ──────────────────────────────────
+
+export interface OtmEvaluationRecutPreview extends OtmEvaluationStats {
+  candidateStartedAt: string;
+  /** Counted n under the cut CURRENTLY persisted, read in the same beat. */
+  currentN: number;
+  /** currentN − n. Never negative: a forward cut can only remove rows. */
+  droppedByRecut: number;
+  /** Of the rows the current cut counts, how many entered before the candidate. */
+  countedEntriesPredatingCandidate: number;
+}
+
+/**
+ * What the sample WOULD read under a candidate cut — computed, never stored.
+ *
+ * The verdict owner cannot answer "does the interim direction survive the
+ * correct population?" from outside the box: no route publishes per-row
+ * `realizedR` for live rows (they are redacted on `/api/health/option-journal`
+ * and `/api/trades/export` is book-scoped to the caller), so the question can
+ * only be answered by the process that holds the journal. Publishing the
+ * preview is what makes the ruling gradeable before it is executed.
+ */
+export function previewOtmEvaluationRecut(
+  records: ReadonlyArray<CloseRow>,
+  state: OtmEvaluationWindowState,
+  candidateStartedAt: number,
+  now: number,
+): OtmEvaluationRecutPreview {
+  const current = selectOtmEvaluationCountedCloses(records, state, now).counted;
+  const probe: OtmEvaluationWindowState = { ...state, startedAt: candidateStartedAt };
+  const counted = selectOtmEvaluationCountedCloses(records, probe, now).counted;
+  const stats = otmEvaluationStats(counted.map((r) => ({
+    realizedR: r.realizedR as number,
+    realizedPnlUsd: r.realizedPnlUsd ?? 0,
+  })));
+  return {
+    candidateStartedAt: new Date(candidateStartedAt).toISOString(),
+    ...stats,
+    currentN: current.length,
+    droppedByRecut: Math.max(0, current.length - stats.n),
+    countedEntriesPredatingCandidate: current.filter((r) => r.openTs < candidateStartedAt).length,
+  };
+}
+
+/**
+ * Hand-run only (the re-cut route or the offline script — never the tick).
+ *
+ * FORWARD ONLY, and that is the whole safety argument: a cut may only move
+ * later, so the admitted set can only SHRINK — `n` is a lower bound on the old
+ * `n` and `seR` an upper bound, so a re-cut can only make the pre-registered
+ * bar HARDER to clear. A backward cut would ADMIT rows the record had already
+ * published as refused, which is a re-cut in the permissive direction dressed
+ * as a correction; it is refused rather than trusted to judgement.
+ *
+ * `baseline` and `populationCell` are deliberately NOT recomputed: the baseline
+ * is frozen by the verdict owner's ruling ("baseline NEVER recomputed") and the
+ * cell is the ruling's cell, not a function of the cut. `extension.used` and
+ * the inconclusive terminal DO reset, because both are properties of a full
+ * sample and the sample is what just restarted.
+ */
+export function applyOtmEvaluationRecut(
+  state: OtmEvaluationWindowState,
+  recut: { startedAt: number; build?: OtmEvaluationBuildPin | null; by: string; note: string; priorN?: number | null },
+  now: number,
+): OtmEvaluationWindowState {
+  if (!/TRA-\d+/.test(recut.note)) {
+    throw new Error('TRA-3945: a re-cut note must carry the ruling\'s ticket reference (TRA-nnnn)');
+  }
+  if (!Number.isFinite(recut.startedAt)) throw new Error('TRA-3945: re-cut startedAt must be a finite epoch ms');
+  if (state.startedAt === null) {
+    throw new Error('TRA-3945: cannot re-cut a window that never opened - it stamps itself on the liveness predicate');
+  }
+  if (state.verdict) {
+    throw new Error(`TRA-3945: cannot re-cut a graded window (${state.verdict.status} by ${state.verdict.by} at ${new Date(state.verdict.at).toISOString()})`);
+  }
+  if (recut.startedAt <= state.startedAt) {
+    throw new Error(`TRA-3945: a re-cut is FORWARD only - ${new Date(recut.startedAt).toISOString()} is not after the current cut ${new Date(state.startedAt).toISOString()}. A backward cut would ADMIT rows the record already published as refused.`);
+  }
+  if (recut.startedAt > now) {
+    throw new Error(`TRA-3945: re-cut ${new Date(recut.startedAt).toISOString()} is in the future (now ${new Date(now).toISOString()})`);
+  }
+  const entry: OtmEvaluationRecutEntry = {
+    at: now,
+    by: recut.by,
+    note: recut.note,
+    priorStartedAt: state.startedAt,
+    priorStartBuild: state.startBuild,
+    priorN: typeof recut.priorN === 'number' && Number.isFinite(recut.priorN) ? recut.priorN : null,
+    startedAt: recut.startedAt,
+    startBuild: recut.build ?? null,
+  };
+  const history = [...(state.recutHistory ?? []), entry];
+  if (history.length > OTM_EVALUATION_RECUT_HISTORY_MAX) history.splice(0, history.length - OTM_EVALUATION_RECUT_HISTORY_MAX);
+  return {
+    ...state,
+    startedAt: recut.startedAt,
+    startBuild: recut.build ?? state.startBuild,
+    recutHistory: history,
+    terminalAt: null,
+    extension: { allowed: 1, closes: OTM_EVALUATION_EXTENSION_CLOSES, used: false, usedAt: null },
+  };
+}
+
 // ── The published record ────────────────────────────────────────────────────
 
 export function buildOtmEvaluationWindowRecord(
@@ -929,6 +1110,9 @@ export function buildOtmEvaluationWindowRecord(
    * `null` = unreadable, which the staleness check publishes as `null`
    * ("check me"), never as `false`. */
   entryAccrual: OtmEntryAccrual | null = readOtmEntryAccrual(),
+  /** The ruled-re-cut previews, computed off the journal by the caller. `null`
+   * ⇒ not computed in this beat, never "computed and empty". */
+  recutPreviews: ReadonlyArray<OtmEvaluationRecutPreview | null> | null = null,
 ) {
   const status = otmEvaluationWindowStatus(state);
   // TRA-4345 AC2 — the accused gate is `entry_window`; "still blocking" is the
@@ -1041,6 +1225,52 @@ export function buildOtmEvaluationWindowRecord(
       observedGateStillBlocking,
       /** TRUE ⇒ the accused gate has CLEARED since `observedAt` — the `observed` diagnosis is superseded; re-diagnose before routing any decision off it. */
       stale: observedGateStillBlocking === null ? null : observedGateStillBlocking === false,
+    },
+    // ── TRA-3945 re-cut ─────────────────────────────────────────────────────
+    //
+    // A ruling that RESTARTS the sample had no writer either. QuantTrader ruled
+    // one on 2026-08-25 (`a9753fda`) and reported nothing could execute it: the
+    // tick stamps `startedAt` ONCE and never re-stamps, and the only other
+    // writer was a shell script on Render's data dir. `satisfied` is computed
+    // off the persisted cut, so an unexecuted ruling reads as unexecuted rather
+    // than as prose in a thread nobody re-reads. `preview` answers the only
+    // question that matters before executing one — what the sample reads under
+    // the ruled population — and it is computed at READ time, never frozen.
+    recut: {
+      currentCut: state.startedAt === null ? null : new Date(state.startedAt).toISOString(),
+      monotone: 'FORWARD only: a cut may only move later, so the admitted set can only SHRINK (n a lower bound, seR an upper bound) and a re-cut can only make the pre-registered bar HARDER. A backward cut is refused.',
+      preserved: 'baseline and populationCell are NEVER recomputed by a re-cut (the baseline is frozen by ruling; the cell is the ruling\'s cell). extension.used and the inconclusive terminal DO reset - both are properties of a full sample, and the sample is what restarted.',
+      writer: 'POST /api/health/otm-evaluation-window/recut (admin) body {startedAt (ISO), build?, by, note with a TRA-nnnn ref}; dry-run by default, apply=true requires confirm=TRA-3945',
+      // A re-cut moves THIS record's cut and nothing else. The TRA-3974 cost
+      // accumulator's pin is write-once by design (a re-arm is refused and
+      // logged; the held pin stands), because its rows come off a ledger whose
+      // 30-day retention has already rolled past them and cannot be re-read. So
+      // after a re-cut its sample is a strict SUPERSET of the window's — say so
+      // on the wire rather than leaving a reader to notice two `startedAt`s.
+      costAccumulatorPin: postPin?.costAccumulator?.startedAt ?? null,
+      costAccumulatorPinFollowsRecut: false as const,
+      costAccumulatorPinNote: 'TRA-3974 pin is write-once and does NOT follow a re-cut. If postPinCost.startedAt is earlier than currentCut, its spreadR/costR sample is a SUPERSET of the counted sample - never cite that p50 beside this avgR without saying the two windows differ.',
+      history: (state.recutHistory ?? []).map((h) => ({
+        at: new Date(h.at).toISOString(),
+        by: h.by,
+        note: h.note,
+        priorStartedAt: new Date(h.priorStartedAt).toISOString(),
+        priorStartBuild: h.priorStartBuild,
+        priorN: h.priorN,
+        startedAt: new Date(h.startedAt).toISOString(),
+        startBuild: h.startBuild,
+      })),
+      ruled: OTM_EVALUATION_RULED_RECUTS.map((r, i) => ({
+        rulingRef: r.rulingRef,
+        ruledAt: r.ruledAt,
+        reason: r.reason,
+        candidateStartedAt: new Date(r.candidateStartedAt).toISOString(),
+        candidateBuild: r.candidateBuild,
+        pinSource: r.pinSource,
+        /** TRUE ⇒ the persisted cut is at or after the ruled one, i.e. the ruling is IN FORCE on the population. */
+        satisfied: state.startedAt === null ? null : state.startedAt >= r.candidateStartedAt,
+        preview: recutPreviews?.[i] ?? null,
+      })),
     },
     cadence: otmEvaluationCadence(state, readout.n, state.lastTickAt ?? state.startedAt ?? Number.NaN, entryAccrual),
     /** TRA-4345 — the effective entry windows the two reads above were computed against, `null` = unreadable. */
@@ -1165,8 +1395,19 @@ export async function tickOtmEvaluationWindow(args: {
   }
   const readout = foldOtmEvaluationWindow(args.records, state, now);
   const postPin = tickOtmWindowPostPinReads(state, args.records, now);
+  // Wrapped: a preview is an instrument over the record, and an instrument may
+  // never take its subject off the wire.
+  let recutPreviews: Array<OtmEvaluationRecutPreview | null> | null = null;
+  try {
+    recutPreviews = OTM_EVALUATION_RULED_RECUTS.map((r) =>
+      state.startedAt === null ? null : previewOtmEvaluationRecut(args.records, state, r.candidateStartedAt, now));
+  } catch (err) {
+    log.warn('TRA-3945 re-cut preview failed; the record still publishes', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
   return buildOtmEvaluationWindowRecord(
-    state, liveness, args.nominationBandIntersects, readout, postPin,
+    state, liveness, args.nominationBandIntersects, readout, postPin, readOtmEntryAccrual(), recutPreviews,
   );
 }
 

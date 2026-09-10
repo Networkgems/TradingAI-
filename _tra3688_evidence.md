@@ -184,3 +184,81 @@ cannot tell a starved scan from a quiet market, so no number of repeat reads can
 C1-C4 are implemented, deployed and live; AC4 (unit, both arms), AC6 and AC7 stand as graded on
 2026-09-08. AC1/AC2/AC3/AC5 stay **UNGRADED** and TRA-3693 blocks on the starve-visibility fix,
 filed as a child of this ticket. Nothing here changes a C1-C4 surface.
+
+---
+
+# 2026-09-09T23:15-23:25Z — S1 deployed; the starve is CONFIRMED LIVE and it is TOTAL
+
+Build pinned in the beat of the grade: `21b1510653cd`, pid 75, boot `2026-09-09T23:18:37.531Z`
+(deploy `dep-daguhd9t0dsc73fs9lu0`, gate green at 23:15Z, `FORWARD` from `8e51be03261c`).
+
+## The instrument's own blind branch, controlled BEFORE the deploy
+
+`scripts/tra4457-grade-census.mjs` run against the pre-S1 build `8e51be03261c` exited **3** with
+`INSTRUMENT BLIND — sma200ScanStats ABSENT`, while that build served `symbols: 751, signals: 0,
+voids: 0`. That is the exact ambiguous read this whole chain is about. A grader that scored it as
+a clean `SWEPT` would have manufactured a false discharge of AC5, so the blind arm is proven to
+fire rather than being an untested claim. Post-deploy the same field reads `null` (S1 live, no
+sweep yet) and then an object — **field presence discriminates the build**, `undefined` vs `null`
+vs populated being three different facts.
+
+## The live census
+
+First completed sweep on the admin engine, read off `/api/state`:
+
+```
+considered 751   evaluated 0   starvedBreakerOpen 751   starvedShortHistory 0
+fetchFailed 0    fired 0       voided 0                 verdict BLIND
+startedAt 1788995978868   finishedAt 1788995978869      => 1 ms for 751 symbols
+```
+
+**1 ms for 751 symbols is the signature**: no request was issued for any of them. The sweep did
+not fail to find setups, it failed to look.
+
+## Two things the ticket did not anticipate
+
+**1. The sweep is PER ENGINE, and every engine is blind.** The Render log carries 30 distinct
+`sma200 scan swept` lines in the 54 s from 23:19:50Z to 23:20:44Z, with `considered` ranging
+160/168/178/198/199/208/244/245/250/257/269/270/272/276/282/291/350/388 — separate books, each
+with its own universe and its own `lastSma200ScanAt`. **Every single one reads `evaluated: 0`,
+`starvedBreakerOpen == considered`, `durationMs` 0-4.** The starve is not one book's bad luck; the
+sma200 strategy is dark fleet-wide.
+
+**2. It is NOT an artifact of the redeploy.** The breaker was already tripping on the OLD process
+(pid 52) at 23:03:43Z and 23:05:14Z, ~15 min before this deploy existed, and the original
+diagnosis caught it at 21:45Z. The restart did not cause the starve, it only gave it a counter.
+
+## S2 sizing — the duty cycle, measured
+
+3-hour Render sweep (20:22Z-23:22Z), paginated backward to exhaustion, 167 lines / 86 distinct
+trip instants spanning 131.2 min:
+
+```
+first trip 21:08:20.794Z  (9 s after the 21:08:11Z boot)
+last  trip 23:19:29.846Z
+inter-trip gap: p50 90.23 s   p90 90.855 s   max 600.0 s
+```
+
+**The breaker's own cooldown is 90 s and the median gap between trips is 90.23 s.** It is not
+opening intermittently — it re-trips within a fraction of a second of every close, so the open
+intervals tile the window end to end at roughly a **99.7% open duty cycle**. During that time
+`isRateLimited()` short-circuits `withRetry`, so *every* daily-bar pull returns `[]` unattempted.
+
+This is precisely the number S1 was built to produce, and it reframes S2's stated risk. The worry
+was "splitting the flag may just move the 429s". The measured shape is that the QUOTE fan-out is
+generating a permanent storm (episode total 13206 symbols / 4807 calls) while the BAR path asks
+for ~751 symbols **once per 4 hours** and is currently getting 0% of them. Those two are not
+comparable loads.
+
+**S2 is still not shipped, and the reason is now specific rather than cautious.** Every byte of
+this measurement is post-close on a single evening. Yahoo's quota behaviour across an RTH session
+is unmeasured, and a per-source split ratified off post-close data could be wrong exactly when it
+matters. Next post-close beat the census will span a full session; that is the read S2 turns on.
+
+## What this settles for TRA-3693
+
+AC5 pre-registered that an empty queue is not a pass. It can now be graded rather than deferred,
+and the answer is negative: the 09-08 and 09-09 empty reads were **not** quiet markets, they were
+blind sweeps. No number of further re-grades could have discharged AC1/AC2/AC3/AC5, because the
+rows those ACs need cannot exist while `evaluated` is 0. TRA-3693 stays blocked on the feed, not
+on the instrument.
