@@ -18,12 +18,28 @@
 // pass/fail, never retired as starved. This script cannot fold the journal, so
 // `--n` is the operator's attestation of the wire's `n`; the route needs no such thing.
 //
-// Exit 0 written · 2 usage · 3 refused (no ticket ref / window never opened / already has a verdict / starved on a full sample).
+// Exit 0 written · 2 usage · 3 refused (no ticket ref / window never opened /
+// already has a verdict / starved on a full sample / a RULED RE-CUT is still
+// unexecuted, which `--ack-unexecuted-recuts` overrides on the record).
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
 const STATUSES = ['verdict_pass', 'verdict_fail', 'verdict_insufficient_population'];
 const TARGET = 30;
 const EXTENSION = 15;
+
+// TRA-3945 ordering interlock — a MIRROR of `OTM_EVALUATION_RULED_RECUTS` in
+// packages/server/src/otm-evaluation-window.ts. A standalone .mjs cannot import
+// the TS module, so this copy MUST be kept in step when a ruling is added there.
+// It drifts in the UNDER-refusing direction (a ruling added only in TS is not
+// enforced here), which is why the route is the sanctioned writer and this is
+// the fallback. Executing a re-cut never makes this fire: an executed cut moves
+// `state.startedAt` to (or past) the candidate, so the filter empties by itself.
+const RULED_RECUTS = [
+  {
+    rulingRef: 'TRA-3945 comment a9753fda (QuantTrader, verdictOwner, 2026-08-25T20:39:31.423Z)',
+    candidateStartedAt: Date.UTC(2026, 7, 26, 4, 33, 57, 910),
+  },
+];
 
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
@@ -70,7 +86,28 @@ if (status === 'verdict_insufficient_population') {
     process.exit(3);
   }
 }
-state.verdict = { status, note, by, atN, at: Date.now() };
+const unexecuted = RULED_RECUTS.filter((r) => r.candidateStartedAt > state.startedAt);
+if (unexecuted.length > 0 && args['ack-unexecuted-recuts'] !== 'true') {
+  const which = unexecuted.map((r) => `${r.rulingRef} -> cut ${new Date(r.candidateStartedAt).toISOString()}`).join('; ');
+  console.error(
+    `refused: ${unexecuted.length} ruled re-cut(s) unexecuted [${which}] while the record still holds the ${new Date(state.startedAt).toISOString()} cut.\n` +
+    'A verdict is once-only AND a graded window can never be re-cut, so this terminal would be frozen over an inadmissible population, permanently.\n' +
+    'Execute the re-cut first (POST /api/health/otm-evaluation-window/recut), or re-run with --ack-unexecuted-recuts to override; the override is recorded in the verdict.',
+  );
+  process.exit(3);
+}
+state.verdict = {
+  status,
+  note,
+  by,
+  atN,
+  at: Date.now(),
+  acknowledgedUnexecutedRecuts: unexecuted.length === 0 ? null : unexecuted.map((r) => ({
+    rulingRef: r.rulingRef,
+    candidateStartedAt: new Date(r.candidateStartedAt).toISOString(),
+    cutAtVerdict: new Date(state.startedAt).toISOString(),
+  })),
+};
 const tmp = `${file}.tmp`;
 writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
 renameSync(tmp, file);

@@ -11440,6 +11440,12 @@ app.post('/api/health/otm-evaluation-window/verdict', requireAuth, requireAdmin,
   const status = typeof body['status'] === 'string' ? body['status'] : null;
   const by = typeof body['by'] === 'string' && body['by'].trim() !== '' ? body['by'].trim() : null;
   const note = typeof body['note'] === 'string' && body['note'].trim() !== '' ? body['note'].trim() : null;
+  // TRA-3945 — the ordering interlock. A verdict is once-only AND a graded
+  // window can never be re-cut, so a terminal filed while a ruled re-cut is
+  // unexecuted is frozen over an inadmissible population with no remedy on
+  // either side. The writer refuses; this flag is the grader's explicit door
+  // through it, and it is recorded IN the verdict rather than in a thread.
+  const acknowledgeUnexecutedRecuts = body['acknowledgeUnexecutedRecuts'] === true;
   if (!status || !(OTM_EVALUATION_VERDICT_STATUSES as readonly string[]).includes(status) || !by || !note) {
     res.status(400).json({
       ok: false,
@@ -11451,7 +11457,11 @@ app.post('/api/health/otm-evaluation-window/verdict', requireAuth, requireAdmin,
     const now = Date.now();
     const prev = await loadOtmEvaluationWindowState();
     const readout = foldOtmEvaluationWindow(await listOptionTradeJournal(), prev, now);
-    const next = applyOtmEvaluationVerdict(prev, { status: status as OtmEvaluationVerdictStatus, by, note, atN: readout.n }, now);
+    const next = applyOtmEvaluationVerdict(
+      prev,
+      { status: status as OtmEvaluationVerdictStatus, by, note, atN: readout.n, acknowledgeUnexecutedRecuts },
+      now,
+    );
     const summary = {
       statusBefore: otmEvaluationWindowStatus(prev),
       n: readout.n,

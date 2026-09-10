@@ -286,7 +286,10 @@ describe('TRA-3945 extension + verdict', () => {
   it('a verdict is a hand-run carrying a ticket reference, and refuses one without', () => {
     const s = opened();
     expect(() => applyOtmEvaluationVerdict(s, { status: 'verdict_fail', note: 'dropped it', by: 'QuantTrader' }, T0)).toThrow(/TRA-nnnn/);
-    const v = applyOtmEvaluationVerdict(s, { status: 'verdict_fail', note: 'TRA-3945 verdict: avgR<=0, seR<0.1', by: 'QuantTrader' }, T0);
+    // `acknowledgeUnexecutedRecuts` because this fixture's cut (T0-H) predates the
+    // REAL ruled re-cut (2026-08-26T04:33Z), so the ordering interlock would refuse.
+    // The interlock has its own tests in tra3945-otm-window-recut.test.ts.
+    const v = applyOtmEvaluationVerdict(s, { status: 'verdict_fail', note: 'TRA-3945 verdict: avgR<=0, seR<0.1', by: 'QuantTrader', acknowledgeUnexecutedRecuts: true }, T0);
     expect(otmEvaluationWindowStatus(v)).toBe('verdict_fail');
     // a verdict freezes the state machine
     const after = stepOtmEvaluationWindow(v, evaluateOtmEvaluationLiveness({ ...ALL_TRUE, liveOtmRouting: false }), PIN, [], T0 + H);
@@ -303,7 +306,7 @@ describe('TRA-3945 extension + verdict', () => {
     // a FULL sample is graded pass/fail, never retired as starved
     expect(() => applyOtmEvaluationVerdict(s, { status: 'verdict_insufficient_population', note: 'TRA-3945', by: 'QuantTrader', atN: OTM_EVALUATION_TARGET_CLOSES }, T0)).toThrow(/never retired/);
     // the live shape: n=1 against $6.74 of admission vs a $50 floor
-    const v = applyOtmEvaluationVerdict(s, { status: 'verdict_insufficient_population', note: 'TRA-3945: sumAdmissibleEntryUsd $6.74 vs $50 contract floor', by: 'QuantTrader', atN: 1 }, T0);
+    const v = applyOtmEvaluationVerdict(s, { status: 'verdict_insufficient_population', note: 'TRA-3945: sumAdmissibleEntryUsd $6.74 vs $50 contract floor', by: 'QuantTrader', atN: 1, acknowledgeUnexecutedRecuts: true }, T0);
     expect(otmEvaluationWindowStatus(v)).toBe('verdict_insufficient_population');
     expect(v.verdict?.atN).toBe(1);
     // one verdict, ever

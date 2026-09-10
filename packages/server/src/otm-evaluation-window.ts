@@ -369,6 +369,19 @@ export interface OtmEvaluationVerdict {
   by: string;
   /** The counted `n` the verdict was written at; `null` on a legacy record. */
   atN?: number | null;
+  /**
+   * Set ONLY when the verdict was filed over an unexecuted ruled re-cut. A
+   * verdict is once-only and a graded window can never be re-cut, so filing
+   * one first makes the ruling permanently unexecutable — the grader may still
+   * do it, but the record then says, forever, which population the terminal
+   * was written over and which ruling it overrode.
+   */
+  acknowledgedUnexecutedRecuts?: ReadonlyArray<{
+    rulingRef: string;
+    candidateStartedAt: string;
+    /** The cut the verdict was actually written over. */
+    cutAtVerdict: string;
+  }> | null;
 }
 
 /**
@@ -482,6 +495,31 @@ export function otmEvaluationStats(rs: ReadonlyArray<{ realizedR: number; realiz
 
 function round6(x: number): number {
   return Math.round(x * 1e6) / 1e6;
+}
+
+/**
+ * Two-sided 95% Student-t critical values, df 1..30, then the normal limit.
+ *
+ * The pre-registered `lowerCi95` is a NORMAL interval (z = 1.96) and stays one —
+ * it is the number the `cutToZeroNominationsIf` rule was written against and
+ * re-cutting a bar mid-window is exactly what this record exists to prevent.
+ * But at the n this window actually reached, z and t are not interchangeable:
+ * at n=9 the multiplier is 2.306 (+18%), at n=4 it is 3.182 (+62%). Publishing
+ * the t interval BESIDE it, explicitly labelled as not the rule's number, is
+ * what stops a reader concluding "the whole interval is below zero" from a
+ * multiplier that assumes a sample size we do not have.
+ */
+const T_CRIT_95_TWO_SIDED: readonly number[] = [
+  12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+  2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+  2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042,
+];
+
+/** `null` below n=2, where there is no df to speak of. */
+export function tCritical95(n: number): number | null {
+  if (!Number.isFinite(n) || n < 2) return null;
+  const df = Math.floor(n) - 1;
+  return df <= T_CRIT_95_TWO_SIDED.length ? (T_CRIT_95_TWO_SIDED[df - 1] as number) : 1.96;
 }
 
 export interface OtmEvaluationExcluded {
@@ -957,13 +995,49 @@ export function stepOtmEvaluationWindow(
 }
 
 /**
+ * The ruled re-cuts this record has NOT executed — every declaration whose
+ * `candidateStartedAt` is still later than the persisted cut.
+ *
+ * This is the same predicate `recut.ruled[].satisfied` publishes, lifted out so
+ * the WRITER can key on it instead of the operator's memory of a thread.
+ */
+export function unexecutedRuledRecuts(
+  state: OtmEvaluationWindowState,
+  ruled: readonly OtmEvaluationRuledRecut[] = OTM_EVALUATION_RULED_RECUTS,
+): readonly OtmEvaluationRuledRecut[] {
+  if (state.startedAt === null) return [];
+  return ruled.filter((r) => r.candidateStartedAt > (state.startedAt as number));
+}
+
+/**
  * Hand-run only (the verdict route or the offline script — never the tick).
  * Refuses a note without a ticket reference, a window that never opened, a
  * second verdict, and a starved-population terminal on a FULL sample.
+ *
+ * ── The ORDERING interlock (TRA-3945, 2026-09-10) ────────────────────────────
+ *
+ * A verdict is `onceOnly` and `applyOtmEvaluationRecut` refuses a graded window.
+ * Those two rules compose into an ordering the record never stated: **filing the
+ * terminal first makes every ruled re-cut permanently unexecutable**, and the
+ * terminal is then frozen over a population the verdict owner's own ruling
+ * declared inadmissible. Nothing here can un-freeze it afterwards.
+ *
+ * So the writer refuses while a ruled re-cut is unexecuted, and names both doors:
+ * execute the re-cut first, or re-post with `acknowledgeUnexecutedRecuts` and
+ * have the override recorded IN the verdict. The grader keeps the decision — the
+ * writer only makes it impossible to make it by accident, which is the same
+ * asymmetry the FORWARD-only rule encodes for the re-cut itself.
  */
 export function applyOtmEvaluationVerdict(
   state: OtmEvaluationWindowState,
-  verdict: { status: OtmEvaluationVerdictStatus; note: string; by: string; atN?: number | null },
+  verdict: {
+    status: OtmEvaluationVerdictStatus;
+    note: string;
+    by: string;
+    atN?: number | null;
+    /** Explicit override: file the terminal over an unexecuted ruled re-cut. */
+    acknowledgeUnexecutedRecuts?: boolean;
+  },
   now: number,
 ): OtmEvaluationWindowState {
   if (!OTM_EVALUATION_VERDICT_STATUSES.includes(verdict.status)) {
@@ -986,7 +1060,35 @@ export function applyOtmEvaluationVerdict(
       throw new Error(`TRA-3945: verdict_insufficient_population refused at n=${atN} >= target ${target}: a full sample is graded pass/fail, never retired as starved`);
     }
   }
-  return { ...state, verdict: { status: verdict.status, note: verdict.note, by: verdict.by, atN, at: now } };
+  const unexecuted = unexecutedRuledRecuts(state);
+  const cutAtVerdict = new Date(state.startedAt).toISOString();
+  if (unexecuted.length > 0 && verdict.acknowledgeUnexecutedRecuts !== true) {
+    const which = unexecuted
+      .map((r) => `${r.rulingRef} -> cut ${new Date(r.candidateStartedAt).toISOString()}`)
+      .join('; ');
+    throw new Error(
+      `TRA-3945: verdict REFUSED - ${unexecuted.length} ruled re-cut(s) unexecuted [${which}] while the record still holds the ${cutAtVerdict} cut. ` +
+      'A verdict is once-only AND a graded window can never be re-cut, so writing this terminal now freezes it over a population the ruling says is inadmissible, permanently. ' +
+      'Either execute the re-cut first (POST /api/health/otm-evaluation-window/recut), or re-post with acknowledgeUnexecutedRecuts=true to override - the override is RECORDED in the verdict.',
+    );
+  }
+  return {
+    ...state,
+    verdict: {
+      status: verdict.status,
+      note: verdict.note,
+      by: verdict.by,
+      atN,
+      at: now,
+      acknowledgedUnexecutedRecuts: unexecuted.length === 0
+        ? null
+        : unexecuted.map((r) => ({
+          rulingRef: r.rulingRef,
+          candidateStartedAt: new Date(r.candidateStartedAt).toISOString(),
+          cutAtVerdict,
+        })),
+    },
+  };
 }
 
 // ── Re-cut (a ruled restart of the sample) ──────────────────────────────────
@@ -1197,6 +1299,22 @@ export function buildOtmEvaluationWindowRecord(
         lowerCi95: readout.n >= 2 && readout.avgR !== null && readout.seR !== null
           ? round6(readout.avgR - 1.96 * readout.seR)
           : null,
+        /** The multiplier the RULE keys on. Fixed at the pre-registration, never re-cut. */
+        lowerCi95Method: 'normal, z=1.96 - the pre-registered number; the cutToZeroNominationsIf rule keys on THIS field',
+        /**
+         * NOT the rule's number. The honest small-sample interval, published
+         * beside it so nobody reads a z-interval at single-digit n as if the
+         * sample supported it.
+         */
+        studentT: readout.n >= 2 && readout.avgR !== null && readout.seR !== null
+          ? {
+            note: 'DESCRIPTIVE ONLY - the pre-registered rule keys on lowerCi95 (z=1.96), not on these. At single-digit n the t interval is materially wider and is the one a reader should quote when characterising the sample.',
+            df: readout.n - 1,
+            tCritical: tCritical95(readout.n),
+            lower: round6(readout.avgR - (tCritical95(readout.n) as number) * readout.seR),
+            upper: round6(readout.avgR + (tCritical95(readout.n) as number) * readout.seR),
+          }
+          : null,
       },
     },
     onFail: 'REPORT ONLY - drop the arm, do not re-tune; QuantTrader files the verdict to the board',
@@ -1280,6 +1398,21 @@ export function buildOtmEvaluationWindowRecord(
       statuses: OTM_EVALUATION_VERDICT_STATUSES,
       onceOnly: true as const,
       offlineFallback: 'scripts/tra3945-otm-window-verdict.mjs against the data-dir file (the running process caches the state - a restart is needed for the wire to reflect it)',
+      // ── The ordering interlock (2026-09-10) ──────────────────────────────
+      //
+      // `onceOnly` above and `recut` below compose into a one-way door the
+      // record never stated: a verdict can never be rewritten, and a graded
+      // window can never be re-cut, so filing the terminal while a ruled
+      // re-cut is unexecuted freezes it over the population the ruling calls
+      // inadmissible - permanently, with no remedy on either side.
+      ordering: 'A ruled re-cut must be EXECUTED (or explicitly overridden) BEFORE any verdict: applyOtmEvaluationRecut refuses a graded window and a verdict is once-only, so the verdict is a one-way door over whichever cut is current when it lands.',
+      /** Non-empty ⇒ the writer refuses without `acknowledgeUnexecutedRecuts: true`. */
+      blockedByUnexecutedRecut: unexecutedRuledRecuts(state).map((r) => ({
+        rulingRef: r.rulingRef,
+        candidateStartedAt: new Date(r.candidateStartedAt).toISOString(),
+        currentCut: state.startedAt === null ? null : new Date(state.startedAt).toISOString(),
+      })),
+      override: 'body {acknowledgeUnexecutedRecuts: true} - the grader keeps the decision; the override is RECORDED in verdict.acknowledgedUnexecutedRecuts so the record says forever which population the terminal was written over',
     },
     baseline: state.baseline,
     n: readout.n,

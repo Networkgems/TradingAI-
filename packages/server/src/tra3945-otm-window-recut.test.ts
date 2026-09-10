@@ -23,6 +23,8 @@ import {
   otmEvaluationWindowStatus,
   previewOtmEvaluationRecut,
   stepOtmEvaluationWindow,
+  tCritical95,
+  unexecutedRuledRecuts,
   type OtmEvaluationBuildPin,
   type OtmEvaluationLivenessInputs,
 } from './otm-evaluation-window.js';
@@ -122,7 +124,7 @@ describe('TRA-3945 re-cut — the writer', () => {
     expect(() => applyOtmEvaluationRecut(s, { startedAt: T0 - H, by: 'QT', note: 'TRA-3945' }, T0 + 100 * H)).toThrow(/FORWARD only/);
     expect(() => applyOtmEvaluationRecut(s, { startedAt: T0 + 200 * H, by: 'QT', note: 'TRA-3945' }, T0 + 100 * H)).toThrow(/future/);
     expect(() => applyOtmEvaluationRecut(emptyOtmEvaluationWindowState(), { startedAt: CUT, by: 'QT', note: 'TRA-3945' }, T0 + 100 * H)).toThrow(/never opened/);
-    const graded = applyOtmEvaluationVerdict(s, { status: 'verdict_fail', note: 'TRA-3945 fail', by: 'QuantTrader' }, T0);
+    const graded = applyOtmEvaluationVerdict(s, { status: 'verdict_fail', note: 'TRA-3945 fail', by: 'QuantTrader', acknowledgeUnexecutedRecuts: true }, T0);
     expect(() => applyOtmEvaluationRecut(graded, { startedAt: CUT, by: 'QT', note: 'TRA-3945' }, T0 + 100 * H)).toThrow(/graded window/);
   });
 
@@ -217,5 +219,121 @@ describe('TRA-3945 re-cut — the ruled-but-unexecuted TRA-4006 restart', () => 
     // …and seR rises ABOVE the 0.10 bar, so the restated sample is not a FAIL
     // under the pre-registered rule either — it is below target and unresolved.
     expect(p.seR!).toBeGreaterThan(OTM_EVALUATION_SE_R_MAX);
+  });
+});
+
+// ── The ORDERING interlock (2026-09-10) ──────────────────────────────────────
+//
+// The verdict owner's read of 2026-09-09 (`9087cabe`) recommended filing
+// `verdict_insufficient_population` at n=9. Compose the two rules already in this
+// module and that is a ONE-WAY DOOR: a verdict is once-only, and a graded window
+// can never be re-cut, so the terminal would freeze over the very population the
+// same owner's 2026-08-25 ruling declared inadmissible — with no remedy on either
+// side. Neither rule is wrong; their COMPOSITION is what nothing stated.
+describe('TRA-3945 — a verdict is a one-way door over whichever cut is current', () => {
+  const CUT_LIVE = Date.parse('2026-08-23T01:40:43.225Z');
+  const RULED = Date.parse('2026-08-26T04:33:57.910Z');
+  const NOW = Date.parse('2026-09-10T01:00:00.000Z');
+  const liveCut = () => ({ ...opened(), startedAt: CUT_LIVE });
+
+  it('REFUSES a verdict while a ruled re-cut is unexecuted, and names both doors', () => {
+    const s = liveCut();
+    expect(unexecutedRuledRecuts(s)).toHaveLength(1);
+    let threw: Error | null = null;
+    try {
+      applyOtmEvaluationVerdict(s, { status: 'verdict_insufficient_population', note: 'TRA-3945: starved by entry_window', by: 'QuantTrader', atN: 9 }, NOW);
+    } catch (e) { threw = e as Error; }
+    expect(threw).toBeTruthy();
+    expect(threw!.message).toContain('a9753fda');
+    expect(threw!.message).toContain('2026-08-26T04:33:57.910Z'); // the cut it would skip
+    expect(threw!.message).toContain('2026-08-23T01:40:43.225Z'); // the cut it would freeze
+    expect(threw!.message).toMatch(/recut/);                       // door 1: execute it
+    expect(threw!.message).toMatch(/acknowledgeUnexecutedRecuts/); // door 2: override
+  });
+
+  it('the override stays the grader\'s to take, and the RECORD keeps it forever', () => {
+    const v = applyOtmEvaluationVerdict(
+      liveCut(),
+      { status: 'verdict_insufficient_population', note: 'TRA-3945: starved by entry_window', by: 'QuantTrader', atN: 9, acknowledgeUnexecutedRecuts: true },
+      NOW,
+    );
+    expect(otmEvaluationWindowStatus(v)).toBe('verdict_insufficient_population');
+    expect(v.verdict?.acknowledgedUnexecutedRecuts).toHaveLength(1);
+    expect(v.verdict?.acknowledgedUnexecutedRecuts?.[0]).toMatchObject({
+      candidateStartedAt: '2026-08-26T04:33:57.910Z',
+      cutAtVerdict: '2026-08-23T01:40:43.225Z',
+    });
+    // The override does NOT make the skipped ruling read as executed.
+    expect(unexecutedRuledRecuts(v)).toHaveLength(1);
+  });
+
+  it('executing the re-cut FIRST clears the refusal with no flag, and files a clean verdict', () => {
+    const cut = applyOtmEvaluationRecut(liveCut(), { startedAt: RULED, by: 'QuantTrader', note: 'TRA-3945 / TRA-4006 ruled re-cut a9753fda' }, NOW);
+    expect(unexecutedRuledRecuts(cut)).toHaveLength(0);
+    const v = applyOtmEvaluationVerdict(cut, { status: 'verdict_insufficient_population', note: 'TRA-3945: starved by entry_window', by: 'QuantTrader', atN: 4 }, NOW);
+    expect(v.verdict?.atN).toBe(4);
+    // `null`, never omitted: "nothing to acknowledge" and "acknowledged" are
+    // opposite facts about how the terminal was reached.
+    expect(v.verdict?.acknowledgedUnexecutedRecuts).toBeNull();
+  });
+
+  it('the door only swings one way: verdict-then-re-cut is IMPOSSIBLE, re-cut-then-verdict is not', () => {
+    const s = liveCut();
+    const graded = applyOtmEvaluationVerdict(s, { status: 'verdict_fail', note: 'TRA-3945', by: 'QuantTrader', acknowledgeUnexecutedRecuts: true }, NOW);
+    expect(() => applyOtmEvaluationRecut(graded, { startedAt: RULED, by: 'QuantTrader', note: 'TRA-3945 re-cut' }, NOW)).toThrow(/graded window/);
+    const other = applyOtmEvaluationRecut(s, { startedAt: RULED, by: 'QuantTrader', note: 'TRA-3945 re-cut' }, NOW);
+    expect(() => applyOtmEvaluationVerdict(other, { status: 'verdict_fail', note: 'TRA-3945', by: 'QuantTrader' }, NOW)).not.toThrow();
+  });
+
+  it('publishes the block on the wire BEFORE the grader reaches the writer, and it empties on execution', () => {
+    const s = liveCut();
+    const rec = buildOtmEvaluationWindowRecord(s, L, true, foldOtmEvaluationWindow([], s, NOW));
+    expect(rec.verdictWriter.blockedByUnexecutedRecut).toHaveLength(1);
+    expect(rec.verdictWriter.blockedByUnexecutedRecut[0]).toMatchObject({
+      candidateStartedAt: '2026-08-26T04:33:57.910Z', currentCut: '2026-08-23T01:40:43.225Z',
+    });
+    expect(rec.verdictWriter.ordering).toContain('BEFORE any verdict');
+    expect(rec.verdictWriter.override).toContain('acknowledgeUnexecutedRecuts');
+    const cut = applyOtmEvaluationRecut(s, { startedAt: RULED, by: 'QuantTrader', note: 'TRA-3945 re-cut' }, NOW);
+    const rec2 = buildOtmEvaluationWindowRecord(cut, L, true, foldOtmEvaluationWindow([], cut, NOW));
+    expect(rec2.verdictWriter.blockedByUnexecutedRecut).toEqual([]);
+  });
+});
+
+// The pre-registered rule keys on a NORMAL interval. At the n this window
+// actually reached, that multiplier is not the honest one — so the t interval is
+// published BESIDE it, labelled, rather than substituted for it. Re-cutting a
+// pre-registered bar mid-window is exactly what this record exists to prevent.
+describe('TRA-3945 — the CI multiplier is pre-registered; the small-sample one is descriptive', () => {
+  const NOW = Date.parse('2026-09-10T01:00:00.000Z');
+  const liveCut = () => ({ ...opened(), startedAt: Date.parse('2026-08-23T01:40:43.225Z') });
+
+  it('keeps lowerCi95 on z=1.96 and publishes the wider Student-t interval beside it', () => {
+    const s = liveCut();
+    const rows = Array.from({ length: 9 }, (_, i) => close(i + 1, {
+      openTs: Date.parse('2026-08-28T14:00:00.000Z') + i * H,
+      closeTs: Date.parse('2026-09-02T14:00:00.000Z') + i * H,
+    }));
+    const readout = foldOtmEvaluationWindow(rows, s, NOW);
+    expect(readout.n).toBe(9);
+    const inv = buildOtmEvaluationWindowRecord(s, L, true, readout).thresholds.invalidation;
+    expect(inv.lowerCi95).toBeCloseTo(readout.avgR! - 1.96 * readout.seR!, 6);
+    expect(inv.lowerCi95Method).toContain('z=1.96');
+    expect(inv.studentT?.df).toBe(8);
+    expect(inv.studentT?.tCritical).toBe(2.306);
+    // Strictly wider on BOTH sides — which is the whole point of publishing it.
+    expect(inv.studentT!.lower).toBeLessThan(inv.lowerCi95!);
+    expect(inv.studentT!.upper).toBeGreaterThan(readout.avgR! + 1.96 * readout.seR!);
+    expect(inv.studentT!.note).toContain('DESCRIPTIVE ONLY');
+  });
+
+  it('is null below n=2, where there is no df to speak of', () => {
+    const s = liveCut();
+    const rec = buildOtmEvaluationWindowRecord(s, L, true, foldOtmEvaluationWindow([], s, NOW));
+    expect(rec.thresholds.invalidation.studentT).toBeNull();
+    expect(tCritical95(1)).toBeNull();
+    expect(tCritical95(9)).toBe(2.306);
+    expect(tCritical95(4)).toBe(3.182);   // the re-cut sample's multiplier: z+62%
+    expect(tCritical95(400)).toBe(1.96);  // past the table, the normal limit
   });
 });
