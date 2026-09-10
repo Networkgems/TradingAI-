@@ -1,0 +1,167 @@
+{
+  "ticket": "TRA-4484",
+  "measuredAt": "2026-09-10T04:12:34.851Z",
+  "host": "https://sandbox.tradier.com/v1",
+  "account": "VA20296703",
+  "scenarios": {
+    "control_s1_breaker_disarmed": {
+      "scenario": "s1_response_lost",
+      "negativeControl": true,
+      "quantityUsed": 111,
+      "sabotage": "throw",
+      "journalInstalled": {
+        "installed": true,
+        "path": "C:\\Users\\eetienne\\AppData\\Local\\Temp\\paperclip-run-tra-4484-d3f9d314-892-7A3j9D\\tra4484-s1_response_lost-NM0E8j\\tra4476-order-intents.jsonl",
+        "rehydrated": 0,
+        "corruptLines": 0,
+        "journalAbsent": true
+      },
+      "postsThatReallyReachedTradier": 1,
+      "firstAttempt": {
+        "threw": false,
+        "value": {
+          "id": 38453773,
+          "status": "pending"
+        }
+      },
+      "secondAttempt": {
+        "threw": false,
+        "value": {
+          "id": 38453774,
+          "status": "ok",
+          "partner_id": "3a8bbee1-5184-4ffe-8a0c-294fbad1aee9"
+        }
+      },
+      "secondAttemptRefusedByHalt": false,
+      "brokerOrdersOfThisShape": [
+        {
+          "id": 38453773,
+          "status": "pending",
+          "qty": 111,
+          "tag": null
+        },
+        {
+          "id": 38453774,
+          "status": "pending",
+          "qty": 111,
+          "tag": null
+        }
+      ],
+      "brokerOrderCount": 2,
+      "health": {
+        "armed": true,
+        "latchedCount": 0,
+        "latched": [],
+        "counters": {
+          "latched": 0,
+          "resolved": 0,
+          "halts": 0,
+          "manualReleases": 0
+        },
+        "journalInstalled": true,
+        "journalPath": "C:\\Users\\eetienne\\AppData\\Local\\Temp\\paperclip-run-tra-4484-d3f9d314-892-7A3j9D\\tra4484-s1_response_lost-NM0E8j\\tra4476-order-intents.jsonl",
+        "journalWrites": 5,
+        "journalFailures": 0,
+        "openOnDisk": 0,
+        "journalAbsent": false,
+        "corruptLines": 0
+      },
+      "verdict": "FAIL",
+      "why": "expected exactly 1 broker order and a halted resubmit; got 2 order(s), refused=false"
+    },
+    "control_s3_no_journal": {
+      "scenario": "s3_process_kill",
+      "negativeControl": true,
+      "quantityUsed": 113,
+      "childExit": {
+        "status": 1,
+        "signal": null,
+        "killedMidSubmit": true,
+        "survived": false
+      },
+      "journalLinesAfterKill": 1,
+      "journalAfterKill": [
+        {
+          "intentId": "oi_mtv0hat8_aiflnk_1",
+          "status": "submitting",
+          "qty": 113
+        }
+      ],
+      "rebootRehydrated": 0,
+      "healthAfterBoot": {
+        "armed": true,
+        "latchedCount": 0,
+        "latched": [],
+        "counters": {
+          "latched": 0,
+          "resolved": 0,
+          "halts": 0,
+          "manualReleases": 0
+        },
+        "journalInstalled": false,
+        "journalPath": null,
+        "journalWrites": 0,
+        "journalFailures": 0,
+        "openOnDisk": 0,
+        "journalAbsent": true,
+        "corruptLines": 0
+      },
+      "resubmitAfterReboot": {
+        "threw": false,
+        "value": {
+          "id": 38453776,
+          "status": "ok",
+          "partner_id": "3a8bbee1-5184-4ffe-8a0c-294fbad1aee9"
+        }
+      },
+      "resubmitRefusedByHalt": false,
+      "brokerOrdersOfThisShape": [
+        {
+          "id": 38453775,
+          "status": "pending",
+          "qty": 113
+        },
+        {
+          "id": 38453776,
+          "status": "pending",
+          "qty": 113
+        }
+      ],
+      "brokerOrderCount": 2,
+      "verdict": "FAIL",
+      "why": "killed=true survived=false rehydrated=0 brokerOrders=2 refused=false"
+    }
+  },
+  "cleanup": {
+    "attempted": 4,
+    "results": [
+      {
+        "id": 38453773,
+        "deleteStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453774,
+        "deleteStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453775,
+        "deleteStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453776,
+        "deleteStatus": 200,
+        "finalStatus": "canceled"
+      }
+    ],
+    "stillWorking": []
+  },
+  "mode": "negative-controls",
+  "controlVerdict": "CONTROLS OK (both failed as required)",
+  "summary": {
+    "control_s1_breaker_disarmed": "FAIL",
+    "control_s3_no_journal": "FAIL"
+  }
+}

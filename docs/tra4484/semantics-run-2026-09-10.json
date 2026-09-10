@@ -1,0 +1,526 @@
+{
+  "ticket": "TRA-4484",
+  "measuredAt": "2026-09-10T04:04:34.003Z",
+  "host": "https://sandbox.tradier.com/v1",
+  "account": "VA20296703",
+  "dryRun": false,
+  "ordersCreated": [
+    38453637,
+    38453638,
+    38453639,
+    38453640,
+    38453641,
+    38453642,
+    38453643,
+    38453644,
+    38453645,
+    38453646,
+    38453647,
+    38453648,
+    38453649,
+    38453650,
+    38453651,
+    38453652,
+    38453653
+  ],
+  "m1_tag": {
+    "roundTrip": {
+      "parameterName": "tag",
+      "requestedVia": "POST /accounts/{id}/orders body field `tag`",
+      "readBackVia": "GET /accounts/{id}/orders?includeTags=true → orders.order[].tag",
+      "sent": [
+        "TRA4484-lat-0",
+        "TRA4484-lat-1",
+        "TRA4484-lat-2",
+        "TRA4484-lat-3",
+        "TRA4484-lat-4",
+        "TRA4484-lat-5",
+        "TRA4484-lat-6",
+        "TRA4484-lat-7"
+      ],
+      "readBack": [
+        "TRA4484-lat-0",
+        "TRA4484-lat-1",
+        "TRA4484-lat-2",
+        "TRA4484-lat-3",
+        "TRA4484-lat-4",
+        "TRA4484-lat-5",
+        "TRA4484-lat-6",
+        "TRA4484-lat-7"
+      ],
+      "allMatched": true
+    },
+    "ladder": [
+      {
+        "label": "len-8",
+        "sentLength": 8,
+        "accepted": true,
+        "httpStatus": 200,
+        "readBack": "TRA4484x",
+        "readBackLength": 8,
+        "truncated": false,
+        "errorBody": null
+      },
+      {
+        "label": "len-16",
+        "sentLength": 16,
+        "accepted": true,
+        "httpStatus": 200,
+        "readBack": "TRA4484xxxxxxxxx",
+        "readBackLength": 16,
+        "truncated": false,
+        "errorBody": null
+      },
+      {
+        "label": "len-32",
+        "sentLength": 32,
+        "accepted": true,
+        "httpStatus": 200,
+        "readBack": "TRA4484xxxxxxxxxxxxxxxxxxxxxxxxx",
+        "readBackLength": 32,
+        "truncated": false,
+        "errorBody": null
+      },
+      {
+        "label": "len-64",
+        "sentLength": 64,
+        "accepted": true,
+        "httpStatus": 200,
+        "readBack": "TRA4484xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "readBackLength": 64,
+        "truncated": false,
+        "errorBody": null
+      },
+      {
+        "label": "len-128",
+        "sentLength": 128,
+        "accepted": true,
+        "httpStatus": 200,
+        "readBack": "TRA4484xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "readBackLength": 128,
+        "truncated": false,
+        "errorBody": null
+      },
+      {
+        "label": "len-255",
+        "sentLength": 255,
+        "accepted": true,
+        "httpStatus": 200,
+        "readBack": "TRA4484xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "readBackLength": 255,
+        "truncated": false,
+        "errorBody": null
+      },
+      {
+        "label": "len-256",
+        "sentLength": 256,
+        "accepted": false,
+        "httpStatus": 400,
+        "readBack": null,
+        "readBackLength": null,
+        "truncated": false,
+        "errorBody": "Invalid parameter, tag: contains more than 255 characters."
+      },
+      {
+        "label": "len-512",
+        "sentLength": 512,
+        "accepted": false,
+        "httpStatus": 400,
+        "readBack": null,
+        "readBackLength": null,
+        "truncated": false,
+        "errorBody": "Invalid parameter, tag: contains more than 255 characters."
+      },
+      {
+        "label": "charset-hyphen",
+        "sentLength": 11,
+        "accepted": true,
+        "httpStatus": 200,
+        "readBack": "TRA4484-a-b",
+        "readBackLength": 11,
+        "truncated": false,
+        "errorBody": null
+      },
+      {
+        "label": "charset-underscore",
+        "sentLength": 11,
+        "accepted": false,
+        "httpStatus": 400,
+        "readBack": null,
+        "readBackLength": null,
+        "truncated": false,
+        "errorBody": "Invalid parameter, tag: contains invalid characters."
+      },
+      {
+        "label": "charset-dot",
+        "sentLength": 11,
+        "accepted": false,
+        "httpStatus": 400,
+        "readBack": null,
+        "readBackLength": null,
+        "truncated": false,
+        "errorBody": "Invalid parameter, tag: contains invalid characters."
+      },
+      {
+        "label": "charset-colon",
+        "sentLength": 11,
+        "accepted": false,
+        "httpStatus": 400,
+        "readBack": null,
+        "readBackLength": null,
+        "truncated": false,
+        "errorBody": "Invalid parameter, tag: contains invalid characters."
+      },
+      {
+        "label": "charset-space",
+        "sentLength": 11,
+        "accepted": false,
+        "httpStatus": 400,
+        "readBack": null,
+        "readBackLength": null,
+        "truncated": false,
+        "errorBody": "Invalid parameter, tag: contains invalid characters."
+      },
+      {
+        "label": "charset-slash",
+        "sentLength": 11,
+        "accepted": false,
+        "httpStatus": 400,
+        "readBack": null,
+        "readBackLength": null,
+        "truncated": false,
+        "errorBody": "Invalid parameter, tag: contains invalid characters."
+      },
+      {
+        "label": "charset-uuidish",
+        "sentLength": 36,
+        "accepted": true,
+        "httpStatus": 200,
+        "readBack": "3a8bbee1-5184-4ffe-8a0c-294fbad1aee9",
+        "readBackLength": 36,
+        "truncated": false,
+        "errorBody": null
+      }
+    ],
+    "lengthVerdict": {
+      "longestAcceptedIntact": 255,
+      "shortestRejected": 11,
+      "anyTruncatedRatherThanRejected": false
+    }
+  },
+  "m2_cancel": {
+    "matrix": [
+      {
+        "condition": "working order (status pending/open)",
+        "orderId": 38453653,
+        "statusBefore": "pending",
+        "deleteHttpStatus": 200,
+        "deleteBody": "{\"order\":{\"id\":38453653,\"status\":\"ok\"}}",
+        "statusAfter": "canceled"
+      },
+      {
+        "condition": "already-terminal (canceled) order, re-cancelled",
+        "orderId": 38453653,
+        "statusBefore": "canceled",
+        "deleteHttpStatus": 400,
+        "deleteBody": "order already in finalized state: canceled",
+        "statusAfter": "canceled"
+      },
+      {
+        "condition": "order id that never existed",
+        "orderId": 1,
+        "getHttpStatus": 401,
+        "getBody": "Unauthorized Account: VA20296703",
+        "deleteHttpStatus": 401,
+        "deleteBody": "Unauthorized Account: VA20296703"
+      },
+      {
+        "condition": "wrong (foreign, non-existent) account in the path",
+        "accountUsed": "VA00000000",
+        "orderId": 38453653,
+        "deleteHttpStatus": 401,
+        "deleteBody": "Unauthorized Account: VA00000000",
+        "getHttpStatus": 401,
+        "getBody": "Unauthorized Account: VA00000000"
+      },
+      {
+        "condition": "cancel of a FILLED order",
+        "result": "UNMEASURED",
+        "why": "no filled order existed on the sandbox tape at measurement time (unfillable limits by design; market closed). Re-run inside RTH with a marketable order to measure this row."
+      }
+    ]
+  },
+  "m3_latency": {
+    "n": 8,
+    "pollIntervalMs": 150,
+    "visibleAfterMs": {
+      "min": 46,
+      "p50": 48,
+      "p95": 74,
+      "max": 74,
+      "all": [
+        46,
+        46,
+        47,
+        48,
+        48,
+        49,
+        50,
+        74
+      ]
+    },
+    "brokerMinusLocalSubmitMs": {
+      "min": 66,
+      "p50": 74,
+      "max": 87,
+      "all": [
+        66,
+        70,
+        70,
+        74,
+        76,
+        79,
+        79,
+        87
+      ]
+    },
+    "submitRttMs": [
+      45,
+      46,
+      46,
+      47,
+      48,
+      48,
+      49,
+      56
+    ],
+    "neverVisible": 0,
+    "statusAtFirstSight": [
+      "pending"
+    ],
+    "samples": [
+      {
+        "httpStatus": 200,
+        "id": 38453637,
+        "startedAt": 1789013074217,
+        "returnedAt": 1789013074266,
+        "rttMs": 49,
+        "body": "{\"order\":{\"id\":38453637,\"status\":\"ok\",\"partner_id\":\"3a8bbee1-5184-4ffe-8a0c-294fbad1aee9\"}}",
+        "pollCount": 1,
+        "visibleAfterMs": 46,
+        "visibleAfterPostStartMs": 95,
+        "createDate": "2026-09-10T04:04:34.287Z",
+        "tagReadBack": "TRA4484-lat-0",
+        "statusAtFirstSight": "pending",
+        "brokerMinusLocalSubmitMs": 70
+      },
+      {
+        "httpStatus": 200,
+        "id": 38453638,
+        "startedAt": 1789013074521,
+        "returnedAt": 1789013074567,
+        "rttMs": 46,
+        "body": "{\"order\":{\"id\":38453638,\"status\":\"ok\",\"partner_id\":\"3a8bbee1-5184-4ffe-8a0c-294fbad1aee9\"}}",
+        "pollCount": 1,
+        "visibleAfterMs": 50,
+        "visibleAfterPostStartMs": 96,
+        "createDate": "2026-09-10T04:04:34.600Z",
+        "tagReadBack": "TRA4484-lat-1",
+        "statusAtFirstSight": "pending",
+        "brokerMinusLocalSubmitMs": 79
+      },
+      {
+        "httpStatus": 200,
+        "id": 38453639,
+        "startedAt": 1789013074822,
+        "returnedAt": 1789013074870,
+        "rttMs": 48,
+        "body": "{\"order\":{\"id\":38453639,\"status\":\"ok\",\"partner_id\":\"3a8bbee1-5184-4ffe-8a0c-294fbad1aee9\"}}",
+        "pollCount": 1,
+        "visibleAfterMs": 47,
+        "visibleAfterPostStartMs": 95,
+        "createDate": "2026-09-10T04:04:34.896Z",
+        "tagReadBack": "TRA4484-lat-2",
+        "statusAtFirstSight": "pending",
+        "brokerMinusLocalSubmitMs": 74
+      },
+      {
+        "httpStatus": 200,
+        "id": 38453640,
+        "startedAt": 1789013075123,
+        "returnedAt": 1789013075171,
+        "rttMs": 48,
+        "body": "{\"order\":{\"id\":38453640,\"status\":\"ok\",\"partner_id\":\"3a8bbee1-5184-4ffe-8a0c-294fbad1aee9\"}}",
+        "pollCount": 1,
+        "visibleAfterMs": 48,
+        "visibleAfterPostStartMs": 96,
+        "createDate": "2026-09-10T04:04:35.193Z",
+        "tagReadBack": "TRA4484-lat-3",
+        "statusAtFirstSight": "pending",
+        "brokerMinusLocalSubmitMs": 70
+      },
+      {
+        "httpStatus": 200,
+        "id": 38453641,
+        "startedAt": 1789013075424,
+        "returnedAt": 1789013075469,
+        "rttMs": 45,
+        "body": "{\"order\":{\"id\":38453641,\"status\":\"ok\",\"partner_id\":\"3a8bbee1-5184-4ffe-8a0c-294fbad1aee9\"}}",
+        "pollCount": 1,
+        "visibleAfterMs": 49,
+        "visibleAfterPostStartMs": 94,
+        "createDate": "2026-09-10T04:04:35.490Z",
+        "tagReadBack": "TRA4484-lat-4",
+        "statusAtFirstSight": "pending",
+        "brokerMinusLocalSubmitMs": 66
+      },
+      {
+        "httpStatus": 200,
+        "id": 38453642,
+        "startedAt": 1789013075724,
+        "returnedAt": 1789013075771,
+        "rttMs": 47,
+        "body": "{\"order\":{\"id\":38453642,\"status\":\"ok\",\"partner_id\":\"3a8bbee1-5184-4ffe-8a0c-294fbad1aee9\"}}",
+        "pollCount": 1,
+        "visibleAfterMs": 74,
+        "visibleAfterPostStartMs": 121,
+        "createDate": "2026-09-10T04:04:35.803Z",
+        "tagReadBack": "TRA4484-lat-5",
+        "statusAtFirstSight": "pending",
+        "brokerMinusLocalSubmitMs": 79
+      },
+      {
+        "httpStatus": 200,
+        "id": 38453643,
+        "startedAt": 1789013076055,
+        "returnedAt": 1789013076101,
+        "rttMs": 46,
+        "body": "{\"order\":{\"id\":38453643,\"status\":\"ok\",\"partner_id\":\"3a8bbee1-5184-4ffe-8a0c-294fbad1aee9\"}}",
+        "pollCount": 1,
+        "visibleAfterMs": 46,
+        "visibleAfterPostStartMs": 92,
+        "createDate": "2026-09-10T04:04:36.131Z",
+        "tagReadBack": "TRA4484-lat-6",
+        "statusAtFirstSight": "pending",
+        "brokerMinusLocalSubmitMs": 76
+      },
+      {
+        "httpStatus": 200,
+        "id": 38453644,
+        "startedAt": 1789013076356,
+        "returnedAt": 1789013076412,
+        "rttMs": 56,
+        "body": "{\"order\":{\"id\":38453644,\"status\":\"ok\",\"partner_id\":\"3a8bbee1-5184-4ffe-8a0c-294fbad1aee9\"}}",
+        "pollCount": 1,
+        "visibleAfterMs": 48,
+        "visibleAfterPostStartMs": 104,
+        "createDate": "2026-09-10T04:04:36.443Z",
+        "tagReadBack": "TRA4484-lat-7",
+        "statusAtFirstSight": "pending",
+        "brokerMinusLocalSubmitMs": 87
+      }
+    ]
+  },
+  "m4_reach": {
+    "httpStatus": 200,
+    "envelopeShapeBefore": "orders.order is a single OBJECT",
+    "rowCountBefore": 1,
+    "oldestCreateDate": "2026-09-10T04:02:26.395Z",
+    "newestCreateDate": "2026-09-10T04:02:26.395Z",
+    "distinctEtDays": [
+      "2026-09-10"
+    ],
+    "localEtDay": "2026-09-10"
+  },
+  "cleanup": {
+    "attempted": 17,
+    "results": [
+      {
+        "id": 38453637,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453638,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453639,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453640,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453641,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453642,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453643,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453644,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453645,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453646,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453647,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453648,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453649,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453650,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453651,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453652,
+        "deleteHttpStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453653,
+        "deleteHttpStatus": 400,
+        "finalStatus": "canceled"
+      }
+    ],
+    "stillWorking": []
+  }
+}

@@ -1,0 +1,260 @@
+{
+  "ticket": "TRA-4484",
+  "measuredAt": "2026-09-10T04:10:42.243Z",
+  "host": "https://sandbox.tradier.com/v1",
+  "account": "VA20296703",
+  "scenarios": {
+    "s1_response_lost": {
+      "scenario": "s1_response_lost",
+      "sabotage": "throw",
+      "journalInstalled": {
+        "installed": true,
+        "path": "C:\\Users\\eetienne\\AppData\\Local\\Temp\\paperclip-run-tra-4484-d3f9d314-892-7A3j9D\\tra4484-s1_response_lost-KHxwIr\\tra4476-order-intents.jsonl",
+        "rehydrated": 0,
+        "corruptLines": 0,
+        "journalAbsent": true
+      },
+      "postsThatReallyReachedTradier": 1,
+      "firstAttempt": {
+        "threw": false,
+        "value": {
+          "id": 38453739,
+          "status": "pending"
+        }
+      },
+      "secondAttempt": {
+        "threw": true,
+        "message": "Tradier submit halted: an earlier order of this shape has an unresolved outcome (intent oi_mtv0euo4_heb2hi_1, order_working). Resubmitting could duplicate live exposure.",
+        "kind": "transport",
+        "outcome": null
+      },
+      "secondAttemptRefusedByHalt": true,
+      "brokerOrdersOfThisShape": [
+        {
+          "id": 38453739,
+          "status": "pending",
+          "qty": 11,
+          "tag": null
+        }
+      ],
+      "brokerOrderCount": 1,
+      "health": {
+        "armed": true,
+        "latchedCount": 1,
+        "latched": [
+          {
+            "key": "VA20296703|equity|buy|spy|-|11",
+            "intentId": "oi_mtv0euo4_heb2hi_1",
+            "env": "sandbox",
+            "reason": "order_working",
+            "latchedAt": 1789013442575,
+            "shape": {
+              "orderClass": "equity",
+              "side": "buy",
+              "symbol": "SPY",
+              "optionSymbol": null,
+              "quantity": 11,
+              "limitPrice": 1
+            }
+          }
+        ],
+        "counters": {
+          "latched": 1,
+          "resolved": 0,
+          "halts": 1,
+          "manualReleases": 0
+        },
+        "journalInstalled": true,
+        "journalPath": "C:\\Users\\eetienne\\AppData\\Local\\Temp\\paperclip-run-tra-4484-d3f9d314-892-7A3j9D\\tra4484-s1_response_lost-KHxwIr\\tra4476-order-intents.jsonl",
+        "journalWrites": 4,
+        "journalFailures": 0,
+        "openOnDisk": 0,
+        "journalAbsent": false,
+        "corruptLines": 0
+      },
+      "verdict": "PASS",
+      "why": "exactly one economic order at the broker across two submit attempts, and the second was refused by the halt"
+    },
+    "s2_transport_5xx": {
+      "scenario": "s2_transport_5xx",
+      "sabotage": "http503",
+      "journalInstalled": {
+        "installed": true,
+        "path": "C:\\Users\\eetienne\\AppData\\Local\\Temp\\paperclip-run-tra-4484-d3f9d314-892-7A3j9D\\tra4484-s2_transport_5xx-jo9JeH\\tra4476-order-intents.jsonl",
+        "rehydrated": 0,
+        "corruptLines": 0,
+        "journalAbsent": true
+      },
+      "postsThatReallyReachedTradier": 1,
+      "firstAttempt": {
+        "threw": false,
+        "value": {
+          "id": 38453740,
+          "status": "pending"
+        }
+      },
+      "secondAttempt": {
+        "threw": true,
+        "message": "Tradier submit halted: an earlier order of this shape has an unresolved outcome (intent oi_mtv0evmt_heb2hi_2, order_working). Resubmitting could duplicate live exposure.",
+        "kind": "transport",
+        "outcome": null
+      },
+      "secondAttemptRefusedByHalt": true,
+      "brokerOrdersOfThisShape": [
+        {
+          "id": 38453740,
+          "status": "pending",
+          "qty": 12,
+          "tag": null
+        }
+      ],
+      "brokerOrderCount": 1,
+      "health": {
+        "armed": true,
+        "latchedCount": 1,
+        "latched": [
+          {
+            "key": "VA20296703|equity|buy|spy|-|12",
+            "intentId": "oi_mtv0evmt_heb2hi_2",
+            "env": "sandbox",
+            "reason": "order_working",
+            "latchedAt": 1789013443602,
+            "shape": {
+              "orderClass": "equity",
+              "side": "buy",
+              "symbol": "SPY",
+              "optionSymbol": null,
+              "quantity": 12,
+              "limitPrice": 1
+            }
+          }
+        ],
+        "counters": {
+          "latched": 1,
+          "resolved": 0,
+          "halts": 1,
+          "manualReleases": 0
+        },
+        "journalInstalled": true,
+        "journalPath": "C:\\Users\\eetienne\\AppData\\Local\\Temp\\paperclip-run-tra-4484-d3f9d314-892-7A3j9D\\tra4484-s2_transport_5xx-jo9JeH\\tra4476-order-intents.jsonl",
+        "journalWrites": 4,
+        "journalFailures": 0,
+        "openOnDisk": 0,
+        "journalAbsent": false,
+        "corruptLines": 0
+      },
+      "verdict": "PASS",
+      "why": "exactly one economic order at the broker across two submit attempts, and the second was refused by the halt"
+    },
+    "s3_process_kill": {
+      "scenario": "s3_process_kill",
+      "childExit": {
+        "status": 1,
+        "signal": null,
+        "killedMidSubmit": true,
+        "survived": false
+      },
+      "journalLinesAfterKill": 1,
+      "journalAfterKill": [
+        {
+          "intentId": "oi_mtv0ewq8_lkjdl2_1",
+          "status": "submitting",
+          "qty": 13
+        }
+      ],
+      "rebootRehydrated": 1,
+      "healthAfterBoot": {
+        "armed": true,
+        "latchedCount": 1,
+        "latched": [
+          {
+            "key": "VA20296703|equity|buy|spy|-|13",
+            "intentId": "oi_mtv0ewq8_lkjdl2_1",
+            "env": "sandbox",
+            "reason": "rehydrated_from_journal",
+            "latchedAt": 1789013445094,
+            "shape": {
+              "orderClass": "equity",
+              "side": "buy",
+              "symbol": "SPY",
+              "optionSymbol": null,
+              "quantity": 13,
+              "limitPrice": 1
+            }
+          }
+        ],
+        "counters": {
+          "latched": 1,
+          "resolved": 0,
+          "halts": 0,
+          "manualReleases": 0
+        },
+        "journalInstalled": true,
+        "journalPath": "C:\\Users\\eetienne\\AppData\\Local\\Temp\\paperclip-run-tra-4484-d3f9d314-892-7A3j9D\\tra4484-s3_process_kill-lK6Sw4\\tra4476-order-intents.jsonl",
+        "journalWrites": 0,
+        "journalFailures": 0,
+        "openOnDisk": 1,
+        "journalAbsent": false,
+        "corruptLines": 0
+      },
+      "resubmitAfterReboot": {
+        "threw": true,
+        "message": "Tradier submit halted: an earlier order of this shape has an unresolved outcome (intent oi_mtv0ewq8_lkjdl2_1, rehydrated_from_journal). Resubmitting could duplicate live exposure.",
+        "kind": "transport",
+        "outcome": null
+      },
+      "resubmitRefusedByHalt": true,
+      "brokerOrdersOfThisShape": [
+        {
+          "id": 38453741,
+          "status": "pending",
+          "qty": 13
+        }
+      ],
+      "brokerOrderCount": 1,
+      "verdict": "PASS",
+      "why": "the process died after the broker committed; a fresh boot re-latched the shape from the JSONL journal, refused the resubmit, and the broker holds exactly one order"
+    },
+    "s4_cancel_race": {
+      "scenario": "s4_cancel_race",
+      "verdict": "UNMEASURED",
+      "marketState": "closed",
+      "marketClock": {
+        "date": "2026-09-10",
+        "description": "Market is closed",
+        "state": "closed",
+        "timestamp": 1789013446,
+        "next_change": "07:00",
+        "next_state": "premarket"
+      },
+      "why": "A GENUINE cancel race needs an order that can fill while the cancel is in flight. The sandbox market is \"closed\", so every order rests unfilled and the \"cancel lost the race\" arm is unreachable. Reported UNMEASURED rather than passed — a race that cannot happen is not a race that was won."
+    }
+  },
+  "cleanup": {
+    "attempted": 3,
+    "results": [
+      {
+        "id": 38453739,
+        "deleteStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453740,
+        "deleteStatus": 200,
+        "finalStatus": "canceled"
+      },
+      {
+        "id": 38453741,
+        "deleteStatus": 200,
+        "finalStatus": "canceled"
+      }
+    ],
+    "stillWorking": []
+  },
+  "summary": {
+    "s1_response_lost": "PASS",
+    "s2_transport_5xx": "PASS",
+    "s3_process_kill": "PASS",
+    "s4_cancel_race": "UNMEASURED"
+  }
+}

@@ -80,6 +80,21 @@
  * broker-semantics change that needs sandbox confirmation before it touches a
  * money path, so this module is built to be correct WITHOUT it and to get
  * strictly sharper if one ever lands.
+ *
+ * **TRA-4484 has now done that confirmation, and it did NOT change this module.**
+ * Measured against the sandbox on 2026-09-10: `tag` round-trips verbatim under
+ * that exact parameter name, on both `GET /orders/{id}` and
+ * `GET /orders?includeTags=true`. But the broker validates it at SUBMIT time and
+ * rejects a bad one with an HTTP 400 — `[A-Za-z0-9-]{1,255}`; an underscore, a
+ * dot, a colon, a space or a slash is `Invalid parameter, tag: contains invalid
+ * characters`, and 256 characters is `contains more than 255 characters`. It is
+ * never truncated, always refused. So a tag generator that emits one bad
+ * character does not degrade the reconcile — it REJECTS A REAL ORDER on a path
+ * where `liveEquityTradingEnabled: true`. Adding it to a production body is
+ * therefore a real change with a real failure mode and is deliberately left to
+ * its own ticket (**TRA-4491**), behind a canonical-grammar generator and a
+ * sandbox soak. Details and the raw run:
+ * `docs/tra4484-tradier-sandbox-semantics.md`.
  */
 
 /** `production` vs `sandbox`. Structurally identical to `TradierEnv`; declared
@@ -287,12 +302,61 @@ export type UnresolvedReason =
 /** TRA-319's terminal set, duplicated here to keep this module import-free. */
 const TERMINAL = new Set(['filled', 'canceled', 'rejected', 'expired', 'error']);
 
+/**
+ * TRA-4484 — the match window's LOWER allowance, ms.
+ *
+ * MEASURED against the Tradier sandbox on 2026-09-10T04:0Z (8 consecutive
+ * submits, `scripts/tra4484-tradier-sandbox-semantics.mjs`): the broker's own
+ * `create_date` landed **+66ms to +87ms AFTER** our local `submitStartedAt` on
+ * 8/8 samples. Never before it. So the observed requirement for this allowance
+ * is ZERO, and everything it is carrying is a margin against LOCAL CLOCK DRIFT,
+ * not against anything the broker does.
+ *
+ * It stays large on purpose. The two failure directions are not symmetric:
+ *
+ *   too NARROW — our own order's `create_date` falls outside the window, the
+ *     reconcile reports `not_placed`, and the caller submits a SECOND order on
+ *     top of a live one. This is the duplication the whole machine exists to
+ *     prevent.
+ *   too WIDE  — more foreign rows of the same shape are admitted, which yields
+ *     `multiple_matches`, which is a HALT.
+ *
+ * A halt is recoverable by a human; a duplicate position is not. 60s buys ~700x
+ * the measured need and costs only halts, so it is kept — but it is now kept
+ * for a stated, measured reason rather than because nobody had checked.
+ */
+export const RECONCILE_LOWER_SKEW_MS = 60_000;
+
+/**
+ * TRA-4484 — the match window's UPPER allowance, ms.
+ *
+ * This one was NOT defensible at 60s and the measurement is why. The upper
+ * bound is `now`, our OWN reconcile instant, and our own order was necessarily
+ * created before it (measured: `create_date - submitStartedAt` ≤ +87ms, and the
+ * reconcile runs strictly later still). Allowing rows stamped up to a minute in
+ * the FUTURE therefore admits nothing of ours and only widens the aperture for
+ * someone else's identically-shaped order on a shared account — and adopting a
+ * foreign row is the one outcome worse than a halt, because a foreign row in a
+ * terminal state CLEARS the latch while our own order may still be working.
+ *
+ * 5s is the measured +87ms rounded up by ~57x, which covers NTP-class drift in
+ * the only direction that can hide one of our own rows here.
+ */
+export const RECONCILE_UPPER_SKEW_MS = 5_000;
+
 export interface ReconcileOptions {
   /**
    * Tolerance for broker-vs-local clock skew on the LOWER bound, ms. A broker
    * row stamped slightly before our `submitStartedAt` is still plausibly ours.
+   * Defaults to {@link RECONCILE_LOWER_SKEW_MS}.
    */
   clockSkewMs?: number;
+  /**
+   * TRA-4484 — tolerance on the UPPER bound, ms. Separate from `clockSkewMs`
+   * because the two bounds fail in opposite directions and one number cannot be
+   * right for both. Defaults to {@link RECONCILE_UPPER_SKEW_MS}.
+   */
+  upperSkewMs?: number;
   /** Reconcile instant; the window's upper bound (plus skew). Defaults to now. */
   now?: number;
 }
@@ -328,13 +392,23 @@ export function reconcileIntent(
 ): IntentReconcileVerdict {
   if (!read.ok) return { kind: 'unresolved', reason: 'orders_read_failed' };
 
-  const skew = options.clockSkewMs ?? 60_000;
+  const lowerSkew = options.clockSkewMs ?? RECONCILE_LOWER_SKEW_MS;
+  const upperSkew = options.upperSkewMs ?? RECONCILE_UPPER_SKEW_MS;
   const now = options.now ?? Date.now();
-  const lower = intent.submitStartedAt - skew;
-  const upper = now + skew;
+  const lower = intent.submitStartedAt - lowerSkew;
+  const upper = now + upperSkew;
 
   // The reach proof: at least one row the endpoint served was created at or
   // after our submit instant. Rows with an unparseable date cannot prove reach.
+  //
+  // TRA-4484 — note this comparison takes NO skew allowance, deliberately, and
+  // the measurement says leave it that way. Loosening it to
+  // `created >= submitStartedAt - skew` would make reach EASIER to prove, which
+  // makes `not_placed` easier to reach, which licenses a resubmit — the
+  // dangerous direction. Measured margin on the sandbox is +66ms to +87ms
+  // (8/8 samples, 2026-09-10), so our own row proves reach comfortably; if the
+  // local clock ever drifts far enough ahead to break that, the verdict degrades
+  // to `orders_window_unproven`, which is a halt. Failing to a halt is correct.
   let windowProven = false;
   const byId = new Map<number, ReconcilableOrderRow[]>();
   let ambiguousTimestamp = false;

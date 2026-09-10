@@ -638,11 +638,39 @@ export class TradierOrderClient {
    * ⚠ TRA-4476 — **this method cannot tell you the order is gone.** It reports
    * whether the DELETE was *accepted*, and it swallows 404 and 422 as success.
    *
-   * 404/422 are exactly the statuses Tradier returns when the order terminated
-   * between our last poll and this call — but "terminated" includes **`filled`**.
-   * Treating them as a successful cancel is how a partially- or fully-filled
-   * order gets replaced by a fresh full-quantity order and the aggregate
-   * exposure ends up above what was requested.
+   * 404/422 were believed to be the statuses Tradier returns when the order
+   * terminated between our last poll and this call — and "terminated" includes
+   * **`filled`**. Treating them as a successful cancel is how a partially- or
+   * fully-filled order gets replaced by a fresh full-quantity order and the
+   * aggregate exposure ends up above what was requested.
+   *
+   * ⚠ **TRA-4484 measured the sandbox on 2026-09-10 and Tradier returns NEITHER
+   * of those codes.** The observed matrix (`scripts/tra4484-tradier-sandbox-semantics.mjs`,
+   * raw run in `docs/tra4484-tradier-sandbox-semantics.md`):
+   *
+   *   working order          → **200** `{"order":{"id":N,"status":"ok"}}`
+   *   already-terminal order → **400** `order already in finalized state: canceled`
+   *   order id that is not ours (incl. one that never existed)
+   *                          → **401** `Unauthorized Account: {accountId}`
+   *   wrong account in path  → **401** `Unauthorized Account: {thatAccount}`
+   *
+   * Two consequences, both of which make this method WORSE than its docblock
+   * suggested rather than better:
+   *
+   *  1. The `!== 422 && !== 404` swallow never fires against this broker, so
+   *     `cancelOrder` **THROWS** on a routine already-terminal cancel. Callers
+   *     that treat a throw as "cleanup failed" are reading a no-op as an error.
+   *  2. 401 does not distinguish "no such order" from "credentials are wrong".
+   *     A cancel aimed at a mistyped id and a cancel with a dead token are the
+   *     same status and the same body.
+   *
+   * The `filled` row of that matrix is still **UNMEASURED** — producing a fill
+   * needs an open market, and the measurement ran with the market shut. Do not
+   * assume it mirrors the `canceled` row.
+   *
+   * None of this weakens {@link cancelOrderConfirmed}, which is why it exists:
+   * it treats every one of these codes as an acknowledgement only and takes its
+   * verdict from the status poll.
    *
    * Kept as-is for the callers that genuinely only want best-effort cleanup and
    * do not branch on the result. **Anything that replaces, re-prices or resizes

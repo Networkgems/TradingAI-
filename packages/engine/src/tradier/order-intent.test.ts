@@ -27,6 +27,8 @@ import {
   intentBreakerKey,
   newIntentId,
   reconcileIntent,
+  RECONCILE_LOWER_SKEW_MS,
+  RECONCILE_UPPER_SKEW_MS,
   rehydrateBreakerFromJournal,
   setOrderIntentJournal,
   summarizeUnknownIntents,
@@ -653,5 +655,110 @@ describe('TRA-4476 cancelOrderConfirmed', () => {
     const client = new TradierOrderClient('tok', 'A1');
     await expect(client.cancelOrder(5)).resolves.toBeUndefined();
     expect(fetchMock.mock.calls.length).toBe(1);
+  });
+});
+
+/**
+ * TRA-4484 — the window constants, now that they are MEASURED rather than
+ * assumed. Before this ticket nothing in this file touched either bound, so the
+ * 60s default was a number no test could have noticed changing.
+ *
+ * The sandbox measurement these encode (2026-09-10, 8/8 samples,
+ * `scripts/tra4484-tradier-sandbox-semantics.mjs`): the broker's `create_date`
+ * lands +66ms..+87ms AFTER our local `submitStartedAt`, never before it.
+ *
+ * Each assertion below is paired with the input one millisecond on the other
+ * side of the bound, because "row admitted" and "row rejected" are the only two
+ * behaviours a bound has and a test that only ever sees one of them is not
+ * testing a bound.
+ */
+describe('TRA-4484 reconcile window — bounds are asymmetric and measured', () => {
+  const T0 = 1_700_000_000_000;
+  function intent(over: Partial<OrderIntent> = {}): OrderIntent {
+    return {
+      intentId: newIntentId(T0),
+      accountId: 'A1',
+      env: 'sandbox',
+      submitStartedAt: T0,
+      shape: {
+        orderClass: 'equity', side: 'buy', symbol: 'AAPL',
+        optionSymbol: null, quantity: 10, limitPrice: null,
+      },
+      status: 'unknown',
+      updatedAt: T0,
+      ...over,
+    };
+  }
+  function rowAt(createdMs: number, over: Partial<ReconcilableOrderRow> = {}): ReconcilableOrderRow {
+    return {
+      id: 1, status: 'open', orderClass: 'equity', side: 'buy', symbol: 'AAPL',
+      optionSymbol: null, quantity: 10, execQuantity: null,
+      createDate: new Date(createdMs).toISOString(), ...over,
+    };
+  }
+  /** A row that post-dates the submit, so `windowProven` is never the reason. */
+  const reachProof = rowAt(T0 + 100, { id: 4242, symbol: 'TSLA' });
+
+  it('the two bounds are DIFFERENT numbers — one constant cannot be right for both', () => {
+    expect(RECONCILE_LOWER_SKEW_MS).toBe(60_000);
+    expect(RECONCILE_UPPER_SKEW_MS).toBe(5_000);
+    expect(RECONCILE_UPPER_SKEW_MS).toBeLessThan(RECONCILE_LOWER_SKEW_MS);
+  });
+
+  it('a row inside the LOWER allowance is ours — the measured margin is +66ms, this is 60s', () => {
+    const v = reconcileIntent(
+      intent(),
+      { ok: true, orders: [rowAt(T0 - RECONCILE_LOWER_SKEW_MS + 1), reachProof] },
+      { now: T0 + 2000 },
+    );
+    expect(v.kind).toBe('placed');
+  });
+
+  it('NEGATIVE CONTROL — one millisecond outside the LOWER allowance and it is not ours', () => {
+    const v = reconcileIntent(
+      intent(),
+      { ok: true, orders: [rowAt(T0 - RECONCILE_LOWER_SKEW_MS - 1), reachProof] },
+      { now: T0 + 2000 },
+    );
+    expect(v).toEqual({ kind: 'not_placed' });
+  });
+
+  it('a row inside the UPPER allowance is still ours', () => {
+    const now = T0 + 2000;
+    const v = reconcileIntent(
+      intent(),
+      { ok: true, orders: [rowAt(now + RECONCILE_UPPER_SKEW_MS - 1), reachProof] },
+      { now },
+    );
+    expect(v.kind).toBe('placed');
+  });
+
+  it('NEGATIVE CONTROL — a row past the UPPER allowance is refused, and 60s would have ADMITTED it', () => {
+    const now = T0 + 2000;
+    const farFuture = rowAt(now + RECONCILE_UPPER_SKEW_MS + 1);
+    expect(reconcileIntent(intent(), { ok: true, orders: [farFuture, reachProof] }, { now }))
+      .toEqual({ kind: 'not_placed' });
+    // The discriminator: the OLD symmetric 60s bound admits this exact row. If
+    // this half ever stops passing, the tightening has been silently undone.
+    expect(
+      reconcileIntent(intent(), { ok: true, orders: [farFuture, reachProof] }, { now, upperSkewMs: 60_000 }).kind,
+    ).toBe('placed');
+  });
+
+  it('the reach proof takes NO skew allowance — loosening it would license a resubmit', () => {
+    // The ONLY row pre-dates our submit by 1ms. It is inside the lower match
+    // allowance, so it matches; but a row that does not post-date the submit
+    // cannot prove the endpoint covers our instant.
+    const only = rowAt(T0 - 1, { symbol: 'TSLA', id: 77 });
+    const v = reconcileIntent(intent(), { ok: true, orders: [only] }, { now: T0 + 2000 });
+    expect(v).toEqual({ kind: 'unresolved', reason: 'orders_window_unproven' });
+    // ...and the same list with that row moved to +0ms DOES prove reach. The
+    // boundary is `>=`, measured as comfortably satisfied at +66ms.
+    const v2 = reconcileIntent(
+      intent(),
+      { ok: true, orders: [rowAt(T0, { symbol: 'TSLA', id: 77 })] },
+      { now: T0 + 2000 },
+    );
+    expect(v2).toEqual({ kind: 'not_placed' });
   });
 });
