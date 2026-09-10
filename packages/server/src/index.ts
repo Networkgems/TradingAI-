@@ -489,12 +489,12 @@ import {
   runAnalystPostmarketTick,
 } from './analyst-scheduler.js';
 import {
-  computeOptionsAlerts,
   scanTargetStop,
   diffChain,
   toAlertEvents,
   type OptionsAlert,
 } from './reports/options-alert-engine.js';
+import { buildOptionsAlertsBody, dashboardBookViewFor } from './options-alerts-book.js';
 import {
   aggregateCashFlowByDate,
   aggregateRealizedOptionsPnl,
@@ -8047,27 +8047,10 @@ app.get('/api/options/alerts', requireAuth, async (_req, res) => {
   const ctx = await userCtx(res);
   try {
     const days = await loadChainDays(CHAIN_RECORD_OUT_DIR);
-    const openOptions = ctx.engine.getState().options.openOptions ?? [];
-    if (days.length < 2) {
-      const positionAlerts = scanTargetStop(openOptions);
-      res.json({
-        issue: 'TRA-845',
-        chainDates: days.map((d) => d.date),
-        symbolsDiffed: [],
-        counts: { new_expiry: 0, new_strike: 0, iv_move: 0, target_hit: positionAlerts.filter((a) => a.kind === 'target_hit').length, stop_hit: positionAlerts.filter((a) => a.kind === 'stop_hit').length },
-        alerts: positionAlerts,
-        note: 'fewer than 2 chain partitions on disk — chain-diff skipped, target/stop only',
-      });
-      return;
-    }
-    const prevDay = days[days.length - 2];
-    const todayDay = days[days.length - 1];
-    const result = computeOptionsAlerts({
-      prevBySymbol: prevDay.bySymbol,
-      todayBySymbol: todayDay.bySymbol,
-      openOptions,
-    });
-    res.json({ issue: 'TRA-845', chainDates: [prevDay.date, todayDay.date], ...result });
+    // TRA-4501 — the book the dashboard SHOWS (`viewMode`), the same one the
+    // open-options table on `/api/state` renders, not the routing book.
+    const state = dashboardEngineState(ctx);
+    res.json(buildOptionsAlertsBody(days, state.options.openOptions ?? [], state.bookView));
   } catch (err) {
     log.error('options-alerts probe failed', {
       reason: err instanceof Error ? err.message : String(err),
@@ -15436,11 +15419,7 @@ const LIVE_BROKER_ARM_FIELDS: ReadonlyArray<keyof AccountSettings> = [
  * path costs nothing and `getState()` keeps its default argument.
  */
 function resolveDashboardBookView(username: string): 'demo' | 'live' | undefined {
-  const s = getSettings(username);
-  const v = s.viewMode;
-  if (v !== 'demo' && v !== 'live') return undefined;
-  const routing: 'demo' | 'live' = s.mode === 'live' ? 'live' : 'demo';
-  return v === routing ? undefined : v;
+  return dashboardBookViewFor(getSettings(username));
 }
 
 /** Engine state as the DASHBOARD should see it (honours `viewMode`). */

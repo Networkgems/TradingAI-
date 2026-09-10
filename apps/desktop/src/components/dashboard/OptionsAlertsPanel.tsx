@@ -75,6 +75,12 @@ export function OptionsAlertsPanel({ token }: { token: string }) {
   if (!data && !error) return null;
 
   const alerts = data?.alerts ?? [];
+  // TRA-4501 — split the collapsed count by severity. A single muted total let
+  // 3 stop hits disappear into `(1963)` behind ~1960 IV moves, and this is the
+  // only panel on the Live dashboard that shows stop breaches.
+  const actionAlerts = alerts.filter((a) => a.severity === 'action');
+  const infoCount = alerts.length - actionAlerts.length;
+  const actionClass = actionAlerts.some((a) => a.kind === 'stop_hit') ? 'red' : 'green';
 
   return (
     <div
@@ -94,8 +100,16 @@ export function OptionsAlertsPanel({ token }: { token: string }) {
         </button>
         Options Alerts
         {collapsed && alerts.length > 0 && (
-          <span className="muted" style={{ fontWeight: 600, fontSize: '0.78rem' }}>
-            ({alerts.length})
+          <span style={{ fontWeight: 600, fontSize: '0.78rem' }}>
+            (
+            {actionAlerts.length > 0 && (
+              <>
+                <span className={actionClass}>{actionAlerts.length} action</span>
+                {', '}
+              </>
+            )}
+            <span className="muted">{infoCount} info</span>
+            )
           </span>
         )}
         <span className="muted" style={{ fontWeight: 'normal', fontSize: '0.78rem' }}>

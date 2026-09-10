@@ -529,8 +529,39 @@ describe('OptionsAlertsPanel (TRA-1125)', () => {
     // Header renders once the first load resolves.
     await waitFor(() => expect(screen.getByText('Options Alerts')).toBeInTheDocument());
     // Collapsed: the count badge is visible but the alert detail row is not.
-    expect(screen.getByText('(1)')).toBeInTheDocument();
+    expect(screen.getByText('1 info')).toBeInTheDocument();
     expect(screen.queryByText(/IV \+12% vs prior chain/)).not.toBeInTheDocument();
+  });
+
+  // TRA-4501 — the collapsed header must split action from info. The live feed
+  // had 3 stop hits behind ~1960 IV moves, and the old header rendered a single
+  // muted `(1963)`. Against that render this test fails: there is no
+  // `3 action` element at all.
+  it('splits the collapsed count into action vs info, with the action count styled by severity (TRA-4501)', async () => {
+    const stop = (i: number) => ({ kind: 'stop_hit', severity: 'action', symbol: `S${i}`, message: `stop ${i}`, dedupKey: `s${i}` });
+    const iv = (i: number) => ({ kind: 'iv_move', severity: 'info', symbol: `I${i}`, message: `iv ${i}`, dedupKey: `i${i}` });
+    const mixed = JSON.stringify({
+      chainDates: ['2026-09-09', '2026-09-10'],
+      symbolsDiffed: [],
+      counts: { new_expiry: 0, new_strike: 0, iv_move: 5, target_hit: 0, stop_hit: 3 },
+      alerts: [stop(1), stop(2), stop(3), iv(1), iv(2), iv(3), iv(4), iv(5)],
+    });
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(mixed, { status: 200 }))));
+    renderWithToast(<OptionsAlertsPanel token="t" />);
+    await waitFor(() => expect(screen.getByText('Options Alerts')).toBeInTheDocument());
+    const action = screen.getByText('3 action');
+    expect(action).not.toHaveClass('muted');
+    expect(action).toHaveClass('red');
+    expect(screen.getByText('5 info')).toBeInTheDocument();
+    expect(screen.queryByText('(8)')).not.toBeInTheDocument();
+  });
+
+  it('an all-info feed shows no action count (TRA-4501 control)', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(alertsBody, { status: 200 }))));
+    renderWithToast(<OptionsAlertsPanel token="t" />);
+    await waitFor(() => expect(screen.getByText('Options Alerts')).toBeInTheDocument());
+    expect(screen.getByText('1 info')).toHaveClass('muted');
+    expect(screen.queryByText(/action/)).not.toBeInTheDocument();
   });
 
   it('reveals the alert table when the expand chevron is clicked', async () => {
