@@ -92,10 +92,16 @@ const journalRows =
   (Array.isArray(jr.body) && jr.body) ||
   null;
 const atRiskById = new Map();
+// TRA-4035 — the label on a twinned book row names the instant the twin STATES
+// (`atRiskBasis`, TRA-4028): 'fill' ⇒ 'premium-fill'; 'mark' / absent ⇒
+// 'premium-open-mark'. Expecting open-mark on every twin false-FAILs the 3
+// fill-restated twins live on 2026-09-10 (BAC `6bbc5d17` among them).
+const atRiskBasisById = new Map();
 if (journalRows) {
   for (const r of journalRows) {
     if (r && typeof r.id === 'string' && Number.isFinite(r.atRiskUsd) && r.atRiskUsd > 0) {
       atRiskById.set(r.id, r.atRiskUsd);
+      atRiskBasisById.set(r.id, r.atRiskBasis === 'fill' ? 'premium-fill' : 'premium-open-mark');
     }
   }
 }
@@ -142,8 +148,9 @@ for (const r of rows) {
   }
   if ((r.source ?? 'book') === 'book' && r.journal_id && atRiskById.has(r.journal_id)) {
     const twin = atRiskById.get(r.journal_id);
-    if (r.pnl_r_basis !== 'premium-open-mark') {
-      fails.push(`${id}: book row has journal twin atRiskUsd=${twin} but basis=${r.pnl_r_basis}`);
+    const expectLabel = atRiskBasisById.get(r.journal_id);
+    if (r.pnl_r_basis !== expectLabel) {
+      fails.push(`${id}: book row has journal twin atRiskUsd=${twin} (${expectLabel}) but basis=${r.pnl_r_basis}`);
     }
     if (Math.abs((r.premium_basis_usd ?? NaN) - twin) > 1e-6) {
       fails.push(`${id}: book row premium_basis_usd=${r.premium_basis_usd} != twin atRiskUsd=${twin}`);
