@@ -368,6 +368,14 @@ export function extractViolations(body: unknown): NormalizedViolation[] {
     pushLegacy(legacy);
     return out;
   }
+  // TRA-4429 — a SINGLE Reporting-API envelope, NOT wrapped in an array. WebKit
+  // (Safari 26.6, captured on the wire 2026-09-10) posts exactly this for
+  // `report-uri`, labelled `application/csp-report`:
+  //   {"type":"csp-violation","url":…,"body":{"effectiveDirective":…,"blockedURL":…}}
+  // No branch here matched it, so every Safari report since TRA-2344 went live was
+  // counted `droppedMalformed` — the whole browser family read as "no violations".
+  // Route it through the array path so the `type` filter still applies.
+  if (asRecord(obj['body'])) return extractViolations([obj]);
   // A bare violation object (no envelope). Some tooling and older WebKit post this.
   if ('effective-directive' in obj || 'violated-directive' in obj || 'blocked-uri' in obj) {
     pushLegacy(obj);
@@ -413,6 +421,12 @@ function bucketKey(directive: string, blockedUri: string): string {
   return `${directive}|${blockedUri}`;
 }
 
+// TRA-4429 — `retainDays` is NOT a time window. This keeps the RETAIN_DAYS most
+// recent days THAT HAD A VIOLATION, and it runs only when a new day is first
+// written. Under low traffic that is far more history than "7 days" suggests (on
+// 2026-09-09 the 08-16 bucket was 24 days old: 3 report-days, no write since
+// 09-01). So never read "no rows older than 7 days" as "pruning ran" — at this
+// traffic level it equally means nobody loaded the app.
 function pruneDays(): void {
   if (state.days.size <= RETAIN_DAYS) return;
   const sorted = [...state.days.keys()].sort();

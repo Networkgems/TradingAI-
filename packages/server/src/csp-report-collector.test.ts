@@ -103,6 +103,31 @@ describe('extractViolations — both wire formats', () => {
     expect(v).toHaveLength(0);
   });
 
+  it('accepts a SINGLE un-arrayed Reporting-API envelope — the bytes WebKit actually sends (TRA-4429)', () => {
+    // Captured verbatim off the wire from WebKit 26.6 (Safari UA) on 2026-09-10,
+    // posted to `report-uri` with `content-type: application/csp-report`. Before
+    // TRA-4429 this returned [] and the live collector counted it droppedMalformed,
+    // so every Safari report was lost and the browser family read as clean.
+    const webkit = JSON.parse(
+      '{"type":"csp-violation","url":"https://tradingai-bqb1.onrender.com/","body":{"documentURL":' +
+        '"https://tradingai-bqb1.onrender.com/","disposition":"report","referrer":"","effectiveDirective":' +
+        '"img-src","blockedURL":"https://csp-capture-tra4429.invalid:443/p.png","originalPolicy":' +
+        '"default-src \'self\'","statusCode":200,"sample":""}}',
+    );
+    const v = extractViolations(webkit);
+    expect(v).toHaveLength(1);
+    expect(v[0]).toEqual({
+      directive: 'img-src',
+      blockedUri: 'https://csp-capture-tra4429.invalid',
+      documentOrigin: 'https://tradingai-bqb1.onrender.com',
+      disposition: 'report',
+    });
+  });
+
+  it('still applies the type filter to a single un-arrayed envelope', () => {
+    expect(extractViolations({ type: 'deprecation', body: { id: 'x', message: 'y' } })).toHaveLength(0);
+  });
+
   it('accepts a bare violation object with no envelope', () => {
     const v = extractViolations({ 'violated-directive': "img-src 'self'", 'blocked-uri': 'data' });
     expect(v).toHaveLength(1);
