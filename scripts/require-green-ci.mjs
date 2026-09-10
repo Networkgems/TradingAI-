@@ -168,7 +168,10 @@ async function main() {
     }
   }
   if (doSelftest) process.exit(await selftest());
-  if (!sha || !/^[0-9a-f]{7,40}$/i.test(sha)) { console.error(`[require-green-ci] --sha=<sha> is REQUIRED and must be a hex sha (got '${sha ?? ''}')`); process.exit(USAGE); }
+  // FULL 40 hex, not an abbreviation: GitHub's `head_sha=` filter is exact-match,
+  // so a short sha returns an empty run list — a false "no runs exist" BLIND that
+  // names the wrong cause. Both workflow call sites pass full SHAs already.
+  if (!sha || !/^[0-9a-f]{40}$/i.test(sha)) { console.error(`[require-green-ci] --sha=<sha> is REQUIRED and must be the FULL 40-char hex sha (got '${sha ?? ''}'); GitHub's head_sha filter is exact-match and a short sha reads as a false no-runs BLIND`); process.exit(USAGE); }
   if (!repo) { console.error('[require-green-ci] --repo=<owner/repo> or GITHUB_REPOSITORY is required'); process.exit(USAGE); }
   const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
   if (!token) { console.error('[require-green-ci] GITHUB_TOKEN is not set — cannot read CI state — BLIND'); process.exit(BLIND); }

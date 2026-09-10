@@ -22,6 +22,14 @@ on:
   pull_request:
     branches: [main, master, develop]
 
+# The verdict job grades this very run's /jobs list over the REST API. The repo's
+# default workflow token is restricted (no `actions` scope): run #1797 had every
+# job green and still went red because that read 403'd — the gate correctly graded
+# it BLIND rather than passing on `needs` alone. This is the grant that read needs.
+permissions:
+  contents: read
+  actions: read
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 

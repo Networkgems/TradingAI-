@@ -22,6 +22,12 @@ jobs:
   require-green-ci:
     name: Require green CI at the tagged SHA
     runs-on: ubuntu-latest
+    # The repo's default workflow token has no `actions` scope, and this gate reads
+    # the CI run list + /jobs over the REST API. Without the grant it 403s and
+    # refuses every release as BLIND (fail closed, but never able to pass).
+    permissions:
+      contents: read
+      actions: read
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
