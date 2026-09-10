@@ -5,41 +5,55 @@
  * and the archive callback at 9:00 PM ET every calendar day.
  * Uses a 1-minute polling loop so no external cron dependency is needed.
  *
- * US market holidays are pre-computed for 2025–2026 and checked on each fire.
+ * The NYSE calendar it fires against is NOT defined here — see
+ * `market-calendar.ts` (TRA-4478).
  */
 
 import { logger } from './observability/index.js';
 import { etClockParts } from './et-clock.js';
+import { isSessionDateOptimistic, sessionCloseEtMinute } from './market-calendar.js';
 
 const log = logger.child({ module: 'scheduler' });
 
-// ── Holiday calendar (NYSE observed dates) ───────────────────────────────────
+// ── Holiday calendar ─────────────────────────────────────────────────────────
+//
+// TRA-4478 — this module used to OWN the calendar: `MARKET_HOLIDAYS`, a
+// hand-typed `Set` covering 2025 and 2026 only, with a bare weekday fall-
+// through for everything after. The first miss was **2027-01-01**, a Friday,
+// and it would have mis-dated every per-ET-day fold keyed off this predicate —
+// not just the session gate. Early closes were not modelled at all.
+//
+// Exchange policy now lives in `market-calendar.ts`, generated from the
+// observance rules into `data/nyse-calendar.generated.ts` and graded by
+// `pnpm check:calendar-coverage`. The scheduler is a CONSUMER.
+//
+// ⛔ The re-export below keeps the OPTIMISTIC (weekday-guess) fallback for an
+// out-of-coverage date, deliberately and unchanged. Twelve non-test server
+// modules key evidence folds and EOD writes off `isMarketDayIso` (measured
+// 2026-09-09: close-ledger, both denominator-flip-tape halves,
+// directional-exploration-allowance, eod-archive-participation,
+// giveback-arm-floor-ledger, index, live-nav-tripwire-ledger,
+// reports/desk-calendar, reports/eod-write-gate, session-coverage,
+// user-context); failing those closed on a
+// stale calendar would drop every row fleet-wide, which is the TRA-3267
+// incident shape, not a fix for it. The fallback is counted and logged
+// (`calendarFallbackCount`). Anything that OPENS RISK must consult
+// `calendarEntryGate` instead, which fails closed — see that module's header.
 
-/** Set of YYYY-MM-DD strings that are NYSE market holidays. */
-const MARKET_HOLIDAYS = new Set<string>([
-  // 2025
-  '2025-01-01', // New Year's Day
-  '2025-01-20', // MLK Day
-  '2025-02-17', // Presidents Day
-  '2025-04-18', // Good Friday
-  '2025-05-26', // Memorial Day
-  '2025-06-19', // Juneteenth
-  '2025-07-04', // Independence Day
-  '2025-09-01', // Labor Day
-  '2025-11-27', // Thanksgiving
-  '2025-12-25', // Christmas
-  // 2026
-  '2026-01-01', // New Year's Day
-  '2026-01-19', // MLK Day
-  '2026-02-16', // Presidents Day
-  '2026-04-03', // Good Friday
-  '2026-05-25', // Memorial Day
-  '2026-06-19', // Juneteenth
-  '2026-07-03', // Independence Day (observed, July 4 is Saturday)
-  '2026-09-07', // Labor Day
-  '2026-11-26', // Thanksgiving
-  '2026-12-25', // Christmas
-]);
+export {
+  calendarCoverage,
+  calendarEntryGate,
+  calendarFreshness,
+  calendarFallbackCount,
+  calendarFallbackDates,
+  earlyCloseName,
+  exchangeClosureName,
+  isEarlyClose,
+  resolveSessionDate,
+  sessionCloseEtMinute,
+  sessionOpenEtMinute,
+  MARKET_CALENDAR_VERSION,
+} from './market-calendar.js';
 
 /**
  * TRA-407 — the calendar date in ET (`YYYY-MM-DD`) for `date`. This is the
@@ -76,13 +90,16 @@ export function isMarketDay(date: Date = new Date()): boolean {
  * host's local timezone, which is wrong for a date-only value; deriving it
  * from a UTC date keeps the result timezone-independent. Used by the missed-
  * day catch-up so a backfill scan never mis-classifies a weekend/holiday.
+ *
+ * TRA-4478 — the holiday table it consults moved to `market-calendar.ts`. The
+ * date-only, UTC-midnight day-of-week derivation is unchanged; so is the
+ * behaviour on an out-of-coverage date (weekday guess), which is now counted
+ * and logged rather than silent. See the ⛔ note at the top of this file for
+ * why this predicate does NOT fail closed and what to use when you need one
+ * that does.
  */
 export function isMarketDayIso(dateIso: string): boolean {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateIso)) return false;
-  if (MARKET_HOLIDAYS.has(dateIso)) return false;
-  const [y, m, d] = dateIso.split('-').map(Number);
-  const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); // 0=Sun … 6=Sat
-  return dow !== 0 && dow !== 6;
+  return isSessionDateOptimistic(dateIso, 'equities');
 }
 
 /**
@@ -96,8 +113,8 @@ export function isMarketDayIso(dateIso: string): boolean {
  * must abstain rather than reach for the nearest report file it can find.
  *
  * The 10-day lookback covers the longest run of consecutive non-sessions the
- * `MARKET_HOLIDAYS` table can produce (a Thu/Fri holiday pair around a weekend
- * is 4; 10 leaves margin) and bounds the loop so a malformed date cannot spin.
+ * exchange calendar can produce (a Thu/Fri holiday pair around a weekend is 4;
+ * 10 leaves margin) and bounds the loop so a malformed date cannot spin.
  */
 export function previousMarketDayIso(dateIso: string, maxLookbackDays = 10): string | null {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateIso)) return null;
@@ -668,9 +685,25 @@ export class MarketScheduler {
   }
 }
 
+/**
+ * Is the NYSE regular session open right now?
+ *
+ * TRA-4478 — the close boundary is now read from the exchange calendar rather
+ * than hard-coded to 16:00, so a 13:00 ET EARLY CLOSE (the Friday after
+ * Thanksgiving, Christmas Eve, July 3) reports shut at 13:00 instead of
+ * claiming three more hours of session that do not exist. Early closes were
+ * previously not modelled anywhere.
+ *
+ * ⛔ On an out-of-coverage date `isMarketDay` takes the optimistic weekday
+ * guess and `sessionCloseEtMinute` returns `null` — so the close falls back to
+ * 16:00 rather than being guessed at. This function is a "the exchange is
+ * open" READ, not an entry gate; anything opening risk must consult
+ * `calendarEntryGate`, which refuses out-of-coverage dates outright.
+ */
 export function isMarketOpen(): boolean {
   const { hour, minute, date } = nowET();
   if (!isMarketDay(date)) return false;
   const minuteOfDay = hour * 60 + minute;
-  return minuteOfDay >= 9 * 60 + 30 && minuteOfDay < 16 * 60;
+  const close = sessionCloseEtMinute(etDateString(date), 'equities') ?? 16 * 60;
+  return minuteOfDay >= 9 * 60 + 30 && minuteOfDay < close;
 }

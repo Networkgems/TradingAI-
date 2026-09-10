@@ -342,6 +342,10 @@ import {
   type EquityEntryPassGateReason,
 } from './equity-entry-funnel.js';
 import { etDateString } from './scheduler.js';
+// TRA-4478 — the fail-closed leg of the exchange calendar. An out-of-coverage
+// ET date refuses new EQUITY/OPTIONS entries; exits are never gated by it, and
+// crypto is exempt (it has no exchange calendar to be stale).
+import { calendarFreshness } from './market-calendar.js';
 // TRA-995 (epic-C, self-regulation) — the standing risk autopilot. A pure
 // tighten-only decision module; the governor below is its mutation boundary and
 // enforces the "may only tighten autonomously" invariant a second time.
@@ -2271,7 +2275,14 @@ export type HaltKind =
   | 'daily_breaker'
   | 'book_giveback'
   | 'session_stop'
-  | 'feed_stale';
+  | 'feed_stale'
+  /**
+   * TRA-4478 — the exchange calendar makes no statement about today's ET date,
+   * so the session boundary cannot be trusted. Transient and self-clearing
+   * (it lifts the moment a bundle covering the date ships), and it is NOT
+   * operator-clearable — there is nothing to clear, only a calendar to extend.
+   */
+  | 'calendar_stale';
 
 /**
  * TRA-4388 — how long the feed must be CONTINUOUSLY stale before the first mail.
@@ -2797,7 +2808,51 @@ export class DailyRiskGovernor {
     // breaker like `halted`; it gates the equity entry path here (options gets
     // it via `isBookHalted` in `runRelativeValueScan`). Stays false unless the
     // book give-back rules are enabled (markBook is only called behind the flag).
-    return this.killSwitchEngaged || this.halted || this.sessionHalted || this.feedStaleGate;
+    // TRA-4478 — the exchange-calendar freshness gate. Same shape as the
+    // feed-stale gate: transient, self-clearing, EQUITY/OPTIONS only, and
+    // entry-side only (nothing here is consulted by an exit path). Deliberately
+    // absent from `isHaltedExcludingFeedStale` below, which is the CRYPTO leg —
+    // crypto is 24/7 and has no exchange calendar, so a stale NYSE bundle is
+    // not a reason to stop trading Coinbase.
+    return (
+      this.killSwitchEngaged ||
+      this.halted ||
+      this.sessionHalted ||
+      this.feedStaleGate ||
+      this.isCalendarStale()
+    );
+  }
+
+  /**
+   * TRA-4478 — does the exchange calendar make no statement about today's ET
+   * date?
+   *
+   * ⛔ FAILS CLOSED, and that direction is the whole point: a calendar outage
+   * must never OPEN trading. Both "the date is past the bundle's coverage" and
+   * "the date could not be read at all" return true, because a session
+   * boundary you cannot verify is a session boundary you must not size risk
+   * against — the mis-dating this guards is invisible in the output, which is
+   * why it cannot be left to a reader to notice.
+   *
+   * Reads live rather than latching: shipping a wider bundle lifts it on the
+   * next call, with no operator action and no restart.
+   */
+  private isCalendarStale(): boolean {
+    const status = this.describeCalendarFreshness().status;
+    return status === 'stale' || status === 'unreadable';
+  }
+
+  /**
+   * TRA-4478 — the calendar-freshness statement backing {@link isCalendarStale},
+   * for the health route and the halt banner. Non-null even when fresh, so a
+   * reader can tell "checked, covered" from "never checked".
+   */
+  describeCalendarFreshness(): ReturnType<typeof calendarFreshness> {
+    // ⛔ `this.now()`, never a bare `new Date()`. This class takes an injected
+    // clock precisely so its ET day boundary is testable (TRA-407), and a gate
+    // reading the ambient clock instead would be untestable AND could disagree
+    // with every other day-keyed decision made in the same tick.
+    return calendarFreshness(etDateString(this.now()));
   }
 
   /**
@@ -2826,6 +2881,10 @@ export class DailyRiskGovernor {
     if (this.sessionHalted) return this.sessionHaltReason;
     // TRA-1072 — finally the transient feed-stale gate, with its freshness detail.
     if (this.feedStaleGate) return this.feedStaleReason;
+    // TRA-4478 — last: the exchange-calendar coverage gate. Ranked below the
+    // feed gate because a stale feed is the more urgent operator signal; both
+    // are transient and neither is operator-clearable.
+    if (this.isCalendarStale()) return this.describeCalendarFreshness().statement;
     return null;
   }
 
@@ -2843,6 +2902,11 @@ export class DailyRiskGovernor {
    *     (the reported TRA-2246 bug). The banner shows a "lifts next day" note
    *     instead of a dead button.
    *   • `feed_stale`    — transient; self-clears when a fresh candle returns.
+   *   • `calendar_stale` — TRA-4478; the exchange calendar does not cover
+   *     today's ET date. Transient and self-clearing, but NOT operator-
+   *     clearable: the remedy is to ship a wider bundle, so the banner must not
+   *     offer a "Clear halt" button here either (same dead-control trap as
+   *     `book_giveback`).
    * Null when the book is not halted.
    */
   getHaltKind(): HaltKind | null {
@@ -2853,6 +2917,7 @@ export class DailyRiskGovernor {
       return this.sessionHaltReasonCode === 'session_net_negative' ? 'session_stop' : 'book_giveback';
     }
     if (this.feedStaleGate) return 'feed_stale';
+    if (this.isCalendarStale()) return 'calendar_stale';
     return null;
   }
 

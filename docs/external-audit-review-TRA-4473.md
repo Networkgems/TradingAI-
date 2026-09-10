@@ -28,7 +28,7 @@ more urgent than anything in it** (§2).
 | C2/C3 replacement not net of partial fills | **CONFIRMED** | `tradier-smart-open.ts:257` re-submits full `qty` each attempt; `:328` `// Best-effort cleanup; the next limit submission still proceeds.` |
 | C3 durability fail-open by default | **CONFIRMED, AND LIVE** | `durability.ts:184` defaults `observe`; **live box reads `"policy":"observe"`** — see §2, this is the finding |
 | C4 red CI does not block publication | **Specific instance FIXED; structure UNFIXED** | see §3 |
-| H1 calendar expires at 2026 | **CONFIRMED** | `scheduler.ts:19` `MARKET_HOLIDAYS`; zero `2027-` dates anywhere in non-test server source. First miss: **2027-01-01** |
+| H1 calendar expires at 2026 | **CONFIRMED — FIXED 2026-09-09 (TRA-4478)** | `scheduler.ts:19` `MARKET_HOLIDAYS`; zero `2027-` dates anywhere in non-test server source. First miss: **2027-01-01**. Now a generated 2025–2035 bundle behind one interface, with early closes, a fail-closed entry gate and `pnpm check:calendar-coverage` — see `docs/exchange-calendar-TRA-4478.md` |
 | H2 quote guard off by default | **CONFIRMED, AND LIVE** | `ENABLE_ORDER_QUOTE_GUARD` **absent from the bqb1 env**; live `/api/health/order-quote-guard` → `"mode":"off"` (not even shadow) |
 | H4 auth weak states | **CONFIRMED, one amplification missed** | `auth.ts:218` `Math.random`; `index.ts:9447` 6-char passwords; `index.ts:18819` WS token in query; 2FA fail-open at `index.ts:9189-9191`. Amplification in §5 |
 | H5 no validated edge | **CONFIRMED by the live grader, not just the docs** | `/api/health/live-capital-gate` → `passed:false`, "UNDERPOWERED … required n ≥ 727, observed 61", self-reports COMPOSITION-FRAGILE on two dimensions |

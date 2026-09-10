@@ -265,6 +265,19 @@ import {
   OPTION_DIRECTIONAL_QUALITY_GATE_FLAG,
 } from '../ignition-quality-gate.js';
 import { etDateString } from '../scheduler.js';
+// TRA-4478 — the exchange calendar, read from the RUNNING build (see the
+// /api/health/exchange-calendar route for why the repo check is not enough).
+import {
+  calendarCoverage,
+  calendarEntryGate,
+  calendarFallbackCount,
+  calendarFallbackDates,
+  calendarFreshness,
+  earlyCloseName,
+  exchangeClosureName,
+  resolveSessionDate,
+  sessionCloseEtMinute,
+} from '../market-calendar.js';
 import {
   isChurnLossBrakeEnabled,
   resolveSameSessionOpenCap,
@@ -4091,6 +4104,64 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
 
   app.get('/api/health/version', (_req, res) => {
     res.json(resolveBuildInfo());
+  });
+
+  /**
+   * TRA-4478 — the exchange calendar this build is running, and whether it
+   * still covers today.
+   *
+   * ⛔ WHY THIS IS A ROUTE AND NOT JUST A REPO CHECK. `pnpm
+   * check:calendar-coverage` grades the CHECKOUT; the local checkout is a fork
+   * of whatever the money host is serving, and a host eleven commits behind
+   * reports its SHA with exactly as much confidence as one at the tip. The
+   * calendar that matters is the one in the running build, so it has to be
+   * readable FROM the running build.
+   *
+   * Unauthenticated and names no balances, symbols or usernames — it publishes
+   * a version string, a date window and a day count.
+   *
+   * `fallbackDates` is the discriminator, and it must never be read as "absent
+   * ⇒ zero": it is present and `[]` on a healthy host. A non-empty list means
+   * this process has already served a session verdict it GUESSED from the day
+   * of week, and names exactly which dates — the mis-dating is otherwise
+   * invisible in every downstream fold.
+   */
+  app.get('/api/health/exchange-calendar', (_req, res) => {
+    const today = etDateString(new Date(now()));
+    const freshness = calendarFreshness(today);
+    res.json({
+      issue: 'TRA-4478',
+      etDate: today,
+      calendar: calendarCoverage(),
+      freshness,
+      /** Entry posture for each asset class, as the risk governor sees it. */
+      entry: {
+        equities: calendarEntryGate(today, 'equities'),
+        options: calendarEntryGate(today, 'options'),
+        crypto: calendarEntryGate(today, 'crypto'),
+      },
+      session: {
+        resolution: resolveSessionDate(today, 'equities'),
+        closureName: exchangeClosureName(today),
+        earlyCloseName: earlyCloseName(today),
+        /** Minutes past ET midnight; 780 on a 13:00 half day, 960 normally, null off-session. */
+        closeEtMinute: sessionCloseEtMinute(today, 'equities'),
+      },
+      fallback: {
+        distinctUncoveredDates: calendarFallbackCount(),
+        dates: calendarFallbackDates(),
+      },
+      note:
+        'The exchange calendar keys the session gate AND every per-ET-day fold (EOD, risk-day, promotion ' +
+        'evidence), so a wrong session boundary mis-dates rows rather than announcing itself. `freshness.status` ' +
+        'is four-valued: fresh | expiring (covered, cliff inside 180d) | stale (⛔ today is UNCOVERED — entries ' +
+        'are failing closed) | unreadable (⛔ could not check; never conflate with fresh). Exits are NEVER gated ' +
+        'by this — a stale calendar that trapped a position would be worse than the bug. Crypto is exempt: it ' +
+        'has no exchange calendar, so it cannot have a stale one. `fallback.dates` non-empty ⇒ this process has ' +
+        'already emitted session verdicts guessed from the day of week; treat every fold keyed on those dates ' +
+        'as unverified. Remedy for stale/expiring: raise COVERAGE_END_YEAR in scripts/gen-nyse-calendar.mjs, ' +
+        're-run it, ship.',
+    });
   });
 
   app.get('/api/health/live', deps.requireAuth, async (_req, res) => {
