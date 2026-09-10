@@ -22,6 +22,8 @@
     "check:cycles": "node scripts/check-cycles.mjs",
     "check:push-auth": "node scripts/check-git-push-auth.mjs",
     "check:deploy-drift": "node scripts/check-deploy-drift.mjs",
+    "check:env-intent": "node scripts/check-env-intent.mjs",
+    "check:env-intent:controls": "node scripts/check-env-intent-controls.mjs",
     "check:deploy-lag": "node scripts/check-deploy-lag.mjs",
     "check:deploy-lag:tape": "node scripts/check-deploy-lag.mjs --tape --days=30",
     "check:deploy-lag:controls": "node scripts/check-deploy-lag.mjs --selftest",

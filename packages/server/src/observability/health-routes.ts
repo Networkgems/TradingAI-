@@ -159,6 +159,7 @@ import {
 } from '../giveback-arm-floor-ledger.js'; // TRA-1892 / TRA-2220
 import { summarizeMarkSanity } from '../option-mark-sanity.js'; // TRA-2927
 import { evaluateDurability, type DurabilityReport } from '../durability.js'; // TRA-1681
+import { summarizeEnvIntent } from '../env-intent.js'; // TRA-4474
 import { getDiskWatermark, diskReadingAgeSec } from './disk-watermark.js'; // TRA-3011
 import { getStateDbStatus } from '../sqlite.js'; // TRA-1681
 import {
@@ -4701,6 +4702,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       disk: report.disk,
       violations: report.violations,
       unmeasured: report.unmeasured,
+      // TRA-4474 — the INTENDED value of every production env lever, beside the
+      // effective one. `policy` above is what the process resolved; for ~50 days
+      // that was `observe` on a box the record says was armed `refuse`, and this
+      // route could not disagree with itself because it published no second term.
+      // The intent is compiled in from `env-intent.ts` (the env is the thing that
+      // can vanish, so the intent must not live there). `envIntent.ok` is
+      // tri-state: `null` off-production is UNGRADED, never a pass — see
+      // `pnpm check:env-intent`, which fails closed on it.
+      envIntent: summarizeEnvIntent(process.env),
       note: durabilityNote(report),
     });
   });
