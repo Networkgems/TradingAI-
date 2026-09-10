@@ -1,6 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { SignalEngine } from './signal-engine.js';
 import * as yahooFeed from './yahoo-feed.js';
+import {
+  __resetSma200CandleMemoForTest,
+  __sma200CandleMemoSizeForTest,
+  SMA200_CANDLE_MEMO_MS,
+} from './sma200-scan-admission.js';
 
 /**
  * TRA-4457 — the census has to reach the WIRE, not just the pure grader.
@@ -19,6 +24,7 @@ const TRADING_TIME = Date.parse('2024-06-04T14:00:00Z');
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(TRADING_TIME);
+  __resetSma200CandleMemoForTest();
 });
 
 afterEach(() => {
@@ -153,5 +159,94 @@ describe('TRA-4457 — the sweep verdict is published, not re-derived', () => {
     const state = new SignalEngine().getState();
     expect('sma200SweepVerdict' in state).toBe(true);
     expect(state.sma200SweepVerdict ?? null).toBeNull();
+  });
+});
+
+/**
+ * TRA-4457 S2 — the fleet pulls each name ONCE, not once per engine.
+ *
+ * Measured 2026-09-10 off the S1 census: a fleet batch handed the sweep
+ * 18,291-29,008 symbols against a union of <= 755, and the only sighted sweeps
+ * were tripped by their own `dailyChart` pulls after ~2,400 requests. These arms
+ * grade the dedup AND the one way it could make the starve worse (memoizing the
+ * breaker's `[]`).
+ */
+describe('TRA-4457 S2 — the sweep shares daily bars across engines', () => {
+  const bars = Array.from({ length: 260 }, (_, i) => ({
+    symbol: 'X',
+    timestamp: TRADING_TIME - (260 - i) * 86_400_000,
+    open: 100, high: 100, low: 100, close: 100, volume: 1_000,
+  }));
+
+  it('a second engine sweeping the same universe issues NO requests', async () => {
+    const fetchSpy = vi.spyOn(yahooFeed, 'fetchDailyCandles').mockResolvedValue(bars as never);
+    vi.spyOn(yahooFeed, 'isYahooBreakerOpen').mockReturnValue(false);
+
+    await scan(new SignalEngine(), ['AAA', 'BBB', 'CCC']);
+    const second = new SignalEngine();
+    await scan(second, ['AAA', 'BBB', 'CCC']);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+    const stats = second.getState().sma200ScanStats;
+    expect(stats?.memoHits).toBe(3);
+    // Served-from-memo is still a real scored population, not a starve.
+    expect(stats?.evaluated).toBe(3);
+    expect(second.getState().sma200SweepVerdict).toBe('SWEPT');
+  });
+
+  it('NEVER memoizes the breaker\'s empty result — a starve must not be pinned fleet-wide', async () => {
+    // 🔴 The failure mode that would make this change strictly worse: `[]` is
+    // what `fetchDailyCandles` returns while the breaker is open WITHOUT asking.
+    const fetchSpy = vi.spyOn(yahooFeed, 'fetchDailyCandles').mockResolvedValue([]);
+    const breaker = vi.spyOn(yahooFeed, 'isYahooBreakerOpen').mockReturnValue(true);
+
+    const blind = new SignalEngine();
+    await scan(blind, ['AAA']);
+    expect(blind.getState().sma200ScanStats?.starvedBreakerOpen).toBe(1);
+    expect(__sma200CandleMemoSizeForTest()).toBe(0);
+
+    fetchSpy.mockResolvedValue(bars as never);
+    breaker.mockReturnValue(false);
+    const next = new SignalEngine();
+    await scan(next, ['AAA']);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(next.getState().sma200ScanStats?.memoHits).toBe(0);
+    expect(next.getState().sma200ScanStats?.evaluated).toBe(1);
+  });
+
+  it('a BLIND window is sighted off the memo a sighted engine filled (the fleet payoff)', async () => {
+    const fetchSpy = vi.spyOn(yahooFeed, 'fetchDailyCandles').mockResolvedValue(bars as never);
+    const breaker = vi.spyOn(yahooFeed, 'isYahooBreakerOpen').mockReturnValue(false);
+    await scan(new SignalEngine(), ['AAA', 'BBB']);
+
+    // The breaker now trips — as it did at 20:15:23Z — and every further pull
+    // would come back `[]` unasked.
+    fetchSpy.mockResolvedValue([]);
+    breaker.mockReturnValue(true);
+    const late = new SignalEngine();
+    await scan(late, ['AAA', 'BBB']);
+
+    const stats = late.getState().sma200ScanStats;
+    expect(stats?.evaluated).toBe(2);
+    expect(stats?.starvedBreakerOpen).toBe(0);
+    expect(stats?.memoHits).toBe(2);
+    expect(late.getState().sma200SweepVerdict).toBe('SWEPT');
+  });
+
+  it('expires after the TTL and holds nothing resident between batches', async () => {
+    const fetchSpy = vi.spyOn(yahooFeed, 'fetchDailyCandles').mockResolvedValue(bars as never);
+    vi.spyOn(yahooFeed, 'isYahooBreakerOpen').mockReturnValue(false);
+    await scan(new SignalEngine(), ['AAA', 'BBB']);
+    expect(__sma200CandleMemoSizeForTest()).toBe(2);
+
+    // Nothing sweeps for the next 4h, so only the prune timer can free these.
+    vi.advanceTimersByTime(SMA200_CANDLE_MEMO_MS);
+    expect(__sma200CandleMemoSizeForTest()).toBe(0);
+
+    const later = new SignalEngine();
+    await scan(later, ['AAA', 'BBB']);
+    expect(fetchSpy).toHaveBeenCalledTimes(4);
+    expect(later.getState().sma200ScanStats?.memoHits).toBe(0);
   });
 });

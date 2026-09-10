@@ -86,7 +86,7 @@ import { withPhase, timeSyncPhase } from './phase-timing.js';
 import { EvalYielder, TickPacer } from './cooperative-yield.js';
 import { TickExitWorkMeter, type TickExitWorkTerms } from './tick-exit-work.js';
 import { TickExitRegionMeter, classifyExitInterval, type TickExitRegionRthTerms } from './tick-exit-region.js';
-import { trySma200ScanSlot, releaseSma200ScanSlot } from './sma200-scan-admission.js';
+import { trySma200ScanSlot, releaseSma200ScanSlot, fetchSma200CandlesShared } from './sma200-scan-admission.js';
 import { resolveSma200PullbackMaxDistAtr, sma200VoidVerdict, sma200SweepVerdict, sma200SweepStarved, type Sma200SweepVerdict } from './sma200-validity.js';
 import { getLatestReviewBlock } from './research-store.js';
 import { earningsInDaysSync } from './earnings-store.js';
@@ -737,6 +737,12 @@ export interface Sma200ScanStats {
   fired: number;
   /** Resting signals voided by this sweep (TRA-3688 S-3). */
   voided: number;
+  /**
+   * TRA-4457 S2 — symbols served from the process-wide daily-bar memo, i.e.
+   * scored WITHOUT a request. `considered - memoHits` bounds the pulls this
+   * sweep put on Yahoo. Optional (TRA-3913): absent = a build without the memo.
+   */
+  memoHits?: number;
   /**
    * The TRA-3688 S-1 gate value in force for this sweep, or `null` when it is
    * the shipped `Infinity` default (dark). Same convention as the per-signal
@@ -7339,6 +7345,7 @@ export class SignalEngine {
       fired: stats.fired,
       voided: stats.voided,
       maxDistAtr: stats.maxDistAtr,
+      memoHits: stats.memoHits,
       durationMs: stats.finishedAt - stats.startedAt,
       // The one field a grader actually needs: did this sweep have a population
       // to find anything IN? `BLIND` means it did not, and no conclusion about
@@ -7384,6 +7391,7 @@ export class SignalEngine {
       fired: 0,
       voided: 0,
       maxDistAtr: null,
+      memoHits: 0,
     };
     // TRA-4457 — an empty universe still owes a census. It is a DIFFERENT fault
     // from a starved feed (the watchlist upstream, not the bar feed), which is
@@ -7403,7 +7411,13 @@ export class SignalEngine {
         symbols.slice(i, i + SCAN_BATCH).map(async (sym) => {
           let candles: Candle[];
           try {
-            candles = await fetchDailyCandles(sym, SMA200_DAILY_BARS);
+            // TRA-4457 S2 — shared across engines: the next engine to sweep this
+            // symbol inside the memo window scores it without a request.
+            const pulled = await fetchSma200CandlesShared(
+              sym, SMA200_DAILY_BARS, (s, n) => fetchDailyCandles(s, n),
+            );
+            candles = pulled.candles;
+            if (pulled.fromMemo) stats.memoHits = (stats.memoHits ?? 0) + 1;
           } catch (err: unknown) {
             stats.fetchFailed++;
             log.warn('sma200: daily candle fetch failed', {

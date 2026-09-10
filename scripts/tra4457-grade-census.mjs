@@ -94,9 +94,14 @@ const starved = (stats.starvedBreakerOpen || 0) + (stats.starvedShortHistory || 
 const verdict = stats.considered <= 0 ? 'NO_UNIVERSE' : stats.evaluated > 0 ? 'SWEPT' : 'BLIND';
 
 console.log('\n--- sweep census (TRA-4457 S1) ---');
-for (const k of ['startedAt', 'finishedAt', 'considered', 'evaluated', 'starvedBreakerOpen', 'starvedShortHistory', 'fetchFailed', 'fired', 'voided', 'maxDistAtr']) {
+for (const k of ['startedAt', 'finishedAt', 'considered', 'evaluated', 'starvedBreakerOpen', 'starvedShortHistory', 'fetchFailed', 'fired', 'voided', 'maxDistAtr', 'memoHits']) {
   console.log(`  ${k.padEnd(20)} ${JSON.stringify(stats[k])}`);
 }
+// TRA-4457 S2 — `memoHits` is ABSENT on builds before the shared daily-bar memo;
+// absent is "this build cannot dedup", not "0 hits". Say which.
+console.log(`  ${'networkPulls'.padEnd(20)} ${'memoHits' in stats
+  ? stats.considered - stats.memoHits + '  (considered - memoHits; upper bound, starves included)'
+  : 'UNREAD — build predates the S2 memo'}`);
 console.log(`  ${'starved(total)'.padEnd(20)} ${starved}`);
 console.log(`  ${'verdict'.padEnd(20)} ${verdict}`);
 console.log(`  ${'sweptAgo'.padEnd(20)} ${Math.round((Date.now() - stats.finishedAt) / 1000)}s`);

@@ -3,6 +3,7 @@ import type { Candle, Sma200Signal } from '@trading-app/shared';
 import { SignalEngine } from './signal-engine.js';
 import { isLiveEntryGatePassed, PASSED_LIVE_ENTRIES } from './capital-gate-manifest.js';
 import * as yahooFeed from './yahoo-feed.js';
+import { __resetSma200CandleMemoForTest } from './sma200-scan-admission.js';
 
 // Inside an ET trading window: 10:00 AM ET on a Tuesday → 14:00 UTC during EDT.
 // Picked so isStockMarketOpen() and the demo auto-trading gate are both OPEN,
@@ -66,6 +67,9 @@ function makePullbackSignal(overrides: Partial<Sma200Signal> = {}): Sma200Signal
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(TRADING_TIME);
+  // TRA-4457 S2 — the sweep's daily-bar memo is process-wide; without this a
+  // later test's spy would never be asked for bars an earlier test memoized.
+  __resetSma200CandleMemoForTest();
 });
 
 afterEach(() => {
