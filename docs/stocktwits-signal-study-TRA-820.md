@@ -1,6 +1,7 @@
 # TRA-820 — StockTwits + Options-Flow Signal Study (Step 1)
 
-**Author:** QuantTrader · **Date:** 2026-06-13 · **Status:** Step 1 design + data-readiness verdict; measurement delegated (see §6)
+**Author:** QuantTrader · **Date:** 2026-06-13 · **Graded:** 2026-09-04 (TRA-4360)
+**Status:** Step 1 GRADED — **VERDICT: INCONCLUSIVE** (sample bar met; S2 edge absent). See **§7**.
 **Parent:** [TRA-814](/TRA/issues/TRA-814) turnaround · **Gates Step 2 on:** [TRA-815](/TRA/issues/TRA-815) (fee-aware harness) + [TRA-817](/TRA/issues/TRA-817) (OOS keeper gate)
 
 > Owner ask (TRA-814): *"find the best options trade strategies using live data and StockTwits data."*
@@ -105,3 +106,96 @@ The measurement requires **application code** (a snapshot logger + an offline IC
 - **(c)** Optional: a best-effort retrospective StockTwits backfill (paginated `?max=`) for the liquid subset to seed a preliminary S1 read, clearly labelled non-gating.
 
 **TRA-820 status:** `blocked` on the child issue (data-collection + harness). Unblock owner: Developer/LeadDev. Once (a)+(b) land and ~20 trading days have accumulated, QuantTrader re-runs the harness against the §4 gate and writes the final PASS/FAIL/INCONCLUSIVE verdict here. No live options entry is wired off StockTwits in the interim (acceptance criterion).
+
+---
+
+## 7. VERDICT — first graded run against the §4 gate (TRA-4360, 2026-09-04)
+
+**VERDICT: INCONCLUSIVE.** The accrual constraint is gone — the §4 *sample* bar is met — but the
+S2 edge the study was built to detect is not there. This is a **materially different**
+INCONCLUSIVE from every prior one: those were INCONCLUSIVE-for-no-data, this is
+INCONCLUSIVE-with-the-sample-met.
+
+**Provenance.** Graded on bqb1 commit `f6d72028`, pid 52, `startedAt` 2026-09-04T16:16:52Z. Data
+mirrored this run via `scripts/pull-recorded-sentiment.mjs` + `scripts/pull-recorded-chains.mjs`.
+Report: `packages/backtest/reports/tra822-sentiment-ic.{json,md}`.
+
+### 7.1 The sample is smaller than the capture counters say
+
+⚠️ **`tradingDaysCaptured: 55` is a partition count, not a data count.** Of the 1,350 recorded
+rows, **475 are `outcome: "no_data"`** — 19 trading days (2026-06-15 → 2026-07-08, plus 07-27 →
+07-29) wrote a partition where *every* symbol came back empty. Those days are indistinguishable
+from healthy ones in `/api/health/sentiment-capture`, whose `latest` block only ever describes the
+most recent day.
+
+| Quantity | Health route says | Actually usable | §4 bar |
+|---|---|---|---|
+| Trading days | 55 | **35** | ≥ 20 ✅ |
+| Symbol-days (single-name, `taggedCount ≥ 5` ∧ `freshness ≤ 720m`) | (implied ~1,375) | **685** | ≥ 300 ✅ |
+| Chain days joined | 73 | **34** (overlap w/ signal days) | ≥ 1 ✅ |
+
+The bar is still cleared — but by **1.75×** on days and **2.3×** on symbol-days, not the ~4.6× a
+naive read of the counters gives. Signal span: **2026-07-09 → 2026-09-03**.
+
+### 7.2 Measured IC (every cell carries its denominator — Amendment 1)
+
+Bar coverage **25/25 symbols, 0 fetch failures**, so no cell below is an unmeasured zero.
+`nDays`/`nPairs` are non-zero on every cell reported.
+
+| Horizon | S1 meanIC | S1 ICIR | S1 nDays/nPairs | S2 meanIC | S2 ICIR | S2 nDays/nPairs | S2−S1 Δ |
+|---|---|---|---|---|---|---|---|
+| 1d | **−0.0622** | −0.31 | 35 / 685 | **−0.0775** | −0.29 | 33 / 381 | −0.0153 |
+| 5d | **−0.0822** | −0.36 | 31 / 606 | **+0.0000176** | +0.00005 | 29 / 325 | +0.0822 |
+| 20d | **−0.0750** | −0.34 | 16 / 314 | **−0.0725** | −0.24 | 16 / 186 | +0.0025 |
+
+Confirmed (S2) symbol-days: **381**. Buzz-only cohort: 15.
+
+### 7.3 Reading it
+
+1. **S1 is not the noise we pre-registered — it leans *contrarian*.** Sentiment alone carries a
+   consistently **negative** de-market IC on all three horizons (bullish StockTwits → subsequent
+   underperformance vs the equal-weight universe). Directionally consistent with the retail
+   sentiment-reversal literature. It is **not** the "S1 ≈ 0" §1 predicted.
+2. **S2 does not beat S1 — flow confirmation *destroys* the signal.** At 5d, conditioning on
+   options-flow agreement drives meanIC to **+0.0000176 on 325 pairs** — a measured zero, not an
+   unmeasured one. At 1d, S2 is no better than S1. The study's central hypothesis (*the edge lives
+   in the flow-confirmed subset*) is **not supported**.
+3. **Nothing is statistically decisive, and the horizons are not independent confirmations.**
+   Overlapping forward windows make the daily ICs autocorrelated, so raw ICIR overstates
+   significance:
+
+   | Cell | t (raw) | effective N | t (overlap-adjusted) |
+   |---|---|---|---|
+   | S1 1d | −1.81 | 35 | **−1.81** |
+   | S1 5d | −1.99 | 6.2 | −0.89 |
+   | S1 20d | −1.37 | 1.0 | −0.34 |
+   | S2 1d | −1.64 | 33 | −1.64 |
+
+   **No cell reaches \|t\| ≥ 2.** Only the 1d row has genuinely non-overlapping daily observations.
+4. ⚠️ **The 20d row is a different subsample from the 1d row.** Forward bars end 2026-09-04, so 20d
+   resolves only for signal days **2026-07-09 → 2026-08-07** (16 of 35). "Consistent sign across
+   horizons" is therefore substantially the same July data resampled, not three independent looks.
+5. **Bucketed returns are non-monotone** on 5d and 20d; 13 of 15 quintile CIs straddle zero.
+
+### 7.4 Pre-registration defect found while grading — flagged, NOT applied
+
+§4 reads `|mean IC| ≥ 0.03` (absolute) **and** `ICIR ≥ 0.3` (signed), and the harness implements
+that literally (`sentiment-ic-harness.ts:673`). Since `sign(ICIR) = sign(meanIC)`, a strong,
+consistent **negative** IC can never enter `passingHorizons` — so a contrarian edge can reach
+neither the PASS branch nor the "shows IC but does not beat S1" FAIL branch, and lands in
+INCONCLUSIVE **by construction**. That is exactly the regime S1 is now in.
+
+**This has deliberately NOT been re-graded under an amended gate.** Amending a pre-registered
+threshold after seeing the results is the rationalisation the pre-registration exists to prevent.
+The verdict above is the gate as written. The asymmetry is raised for board ratification and must
+be resolved **before** the next grading run, not after.
+
+### 7.5 Disposition
+
+- **No PASS ⇒ Step 2 stays locked.** No live options entry is wired off StockTwits. Unchanged.
+- **Not a FAIL either** — under the gate as codified this is INCONCLUSIVE, and the contrarian S1
+  reading is interesting enough that killing the direction now would discard a real observation.
+- **Keep collecting**, and **fix the recorder's dead days** — 19 of 54 partitions returning
+  all-`no_data` is a ~35% loss of accrual rate that the health route does not surface.
+- Re-grade when the sample roughly doubles (~70 usable days), which also lets the 20d horizon
+  cover a genuinely out-of-sample span rather than the July subsample.
