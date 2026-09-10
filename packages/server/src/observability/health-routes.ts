@@ -5297,6 +5297,21 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // must grade the SAME fleet snapshot, and two provider calls walk every
     // engine twice and could disagree on this one response.
     const concentrationBooks = deps.liveOtmConcentration?.() ?? null;
+    // TRA-3977 (2026-08-27) — the books this process is SERVING live, from the
+    // same fleet snapshot the rows above were taken from, so the registry the
+    // scoping gate reads can be graded against it on every beat. `null` when
+    // the provider is unwired: "cannot say", never "serving nothing".
+    const liveBooksServed: string[] | null =
+      aggregateExposureRows === null
+        ? null
+        : [
+            ...new Set(
+              aggregateExposureRows
+                .filter((r) => r.mode === 'live')
+                .map((r) => r.book)
+                .filter((b): b is string => typeof b === 'string' && b.length > 0),
+            ),
+          ].sort();
     res.json({
       ok: true,
       time: new Date(nowMs).toISOString(),
@@ -5342,8 +5357,25 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
        * every oracle answers exactly as it did pre-TRA-3977, and this whole
        * block is a no-op by construction. The PRESENCE of this key is the
        * deployed-bytes proof (a build without it lacks the key entirely).
+       *
+       * ⚠ READ `unregisteredLiveBooks` BEFORE `scopingReachable` (2026-08-27).
+       * `booksServedLive` is what the fleet walk says this process is serving
+       * in `mode: 'live'` RIGHT NOW; `books` is what the ledger's registry
+       * knows. On bqb1 `56804e1a` the boot hydrate wiped the registry after
+       * the engines had declared themselves, so this route served TWO live
+       * books beside `books: ["admin"]` and `scopingReachable: false` — the
+       * scoping was a no-op on the box it was written for and nothing on the
+       * wire said so. A non-empty `unregisteredLiveBooks` is that defect,
+       * named; `null` means the fleet walk is unwired and it cannot be graded.
        */
-      crossBookEpisodes: summary.crossBook,
+      crossBookEpisodes: {
+        ...summary.crossBook,
+        booksServedLive: liveBooksServed,
+        unregisteredLiveBooks:
+          liveBooksServed === null
+            ? null
+            : liveBooksServed.filter((b) => !summary.crossBook.books.includes(b)),
+      },
       otmFlag: 'ENABLE_OPTION_LIVE_OTM',
       rvFlag: 'ENABLE_OPTION_LIVE_RV_LONG',
       windowVar: 'OPTION_LIVE_TEST_UNTIL',

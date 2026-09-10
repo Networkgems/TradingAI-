@@ -30,8 +30,12 @@
 //   AC5 — the census measures the reachability instead of arguing it, and a
 //         tape nobody can read never folds to `clean`.
 import { describe, it, expect, beforeEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   clearLiveOptionsFeeSlippageLedger,
+  hydrateLiveOptionsFeeSlippageFromDisk,
   recordLiveOptionFill,
   recordReconcileTermination,
   registerLiveOptionBook,
@@ -365,6 +369,61 @@ describe('TRA-3977 AC4 — ⭐ NEGATIVE CONTROL: one book, and nothing changes',
     clearLiveOptionsFeeSlippageLedger();
     expect(bookScopingReachable()).toBe(false);
     expect(knownLiveOptionBooks()).toEqual([]);
+  });
+
+  // ── 2026-08-27: the boot hydrate was UN-WIRING the registry ─────────────
+  // Measured on bqb1 `56804e1a` pid 52: `initAllUserContexts()` declared both
+  // live books, then `hydrateLiveOptionsFeeSlippageFromDisk` called the test
+  // seam and wiped them. `books` read `["admin"]` off one termination marker
+  // beside TWO served live books, `scopingReachable: false`, every oracle
+  // fleet-wide. The "early half of the two-source read" had been empty on
+  // every boot since the fix deployed.
+  it('a re-hydrate from disk does NOT un-wire the books the engines declared', () => {
+    registerLiveOptionBook(ADMIN);
+    registerLiveOptionBook(V0NNI);
+    const dir = mkdtempSync(join(tmpdir(), 'tra3977-hydrate-'));
+    try {
+      const h = hydrateLiveOptionsFeeSlippageFromDisk(dir);
+      expect(h.records).toBe(0);
+      expect(bookScopingReachable()).toBe(true);
+      expect(knownLiveOptionBooks()).toEqual([ADMIN, V0NNI]);
+      const c = crossBookOpenEpisodeCensus();
+      expect(c.booksWired).toEqual([ADMIN, V0NNI]);
+      expect(c.booksObserved).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('…but it DOES reset the observed set, which is re-derived from the rows it keeps', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tra3977-hydrate-'));
+    try {
+      // Boot 1: one attributed fill lands and is persisted.
+      hydrateLiveOptionsFeeSlippageFromDisk(dir);
+      open(V0NNI, 1, 1.54, T0);
+      expect(crossBookOpenEpisodeCensus().booksObserved).toEqual([V0NNI]);
+      // Boot 2: nothing wired, the file is the only witness — and it is enough.
+      clearLiveOptionsFeeSlippageLedger();
+      const h = hydrateLiveOptionsFeeSlippageFromDisk(dir);
+      expect(h.records).toBe(1);
+      const c = crossBookOpenEpisodeCensus();
+      expect(c.booksWired).toEqual([]);
+      expect(c.booksObserved).toEqual([V0NNI]);
+      expect(c.books).toEqual([V0NNI]);
+      expect(c.scopingReachable).toBe(false); // one book is still not a question
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('the census publishes the two sources SEPARATELY — wired-and-unseen is not seen-and-unwired', () => {
+    registerLiveOptionBook(ADMIN);
+    open(V0NNI, 1, 1.54, T0);
+    const c = crossBookOpenEpisodeCensus();
+    expect(c.booksWired).toEqual([ADMIN]);
+    expect(c.booksObserved).toEqual([V0NNI]);
+    expect(c.books).toEqual([ADMIN, V0NNI]);
+    expect(c.scopingReachable).toBe(true);
   });
 });
 

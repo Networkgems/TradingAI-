@@ -505,8 +505,39 @@ export function liveOptionsFeeSlippageLogPath(dir: string): string {
   return join(dir, LIVE_OPTIONS_FEE_SLIPPAGE_LOG_FILENAME);
 }
 
-/** Test seam — drop every record and the configured dir. */
+/**
+ * Test seam — drop every record, the configured dir AND the book registry.
+ *
+ * ⛔ TRA-3977 (2026-08-27) — this is the TEST seam, not the hydrate's reset.
+ * The production boot runs `initAllUserContexts()` (which declares every live
+ * book via `registerLiveOptionBook`) BEFORE `hydrateLiveOptionsFeeSlippageFromDisk`,
+ * and the hydrate used to call this function — wiping `wiredBooks` and leaving
+ * the "early half of the two-source read" empty on every boot. Measured on
+ * bqb1 `56804e1a` pid 52: two live books served, `books: ["admin"]` (admin
+ * only via a hydrated termination marker), `scopingReachable: false` ⇒ every
+ * book-scoped oracle answered fleet-wide, i.e. the whole fix was a no-op on
+ * the box it was written for. The hydrate now uses {@link resetStoreRows},
+ * which leaves the wire-up declarations alone: they are a property of the
+ * PROCESS, not of the rows on disk.
+ */
 export function clearLiveOptionsFeeSlippageLedger(): void {
+  resetStoreRows();
+  // TRA-3977 — the registry is part of this store's answer too. A suite that
+  // left `admin` + `v0nni` registered from the previous case would make the
+  // NEXT case's single-book fixture refuse, which is the exact false-negative
+  // the reachability gate exists to avoid.
+  wiredBooks.clear();
+}
+
+/**
+ * Drop every row-derived fact (fills, markers, observed books, counters) but
+ * NOT the wire-up registry. This is what a re-hydrate from disk owes the
+ * process: the rows are about to be re-read from the file, the observed books
+ * are re-derived from those rows, and the books the engines DECLARED are not
+ * on the file at all — a reset that dropped them would have to wait for each
+ * book's next fill (or a termination marker) to learn what it already knew.
+ */
+function resetStoreRows(): void {
   dataDir = null;
   fills.length = 0;
   lastRecordAt = null;
@@ -520,11 +551,9 @@ export function clearLiveOptionsFeeSlippageLedger(): void {
   hydratedTerminations = 0;
   terminationAppendErrors = 0;
   lastTerminationAppendError = null;
-  // TRA-3977 — the registry is part of this store's answer too. A suite that
-  // left `admin` + `v0nni` registered from the previous case would make the
-  // NEXT case's single-book fixture refuse, which is the exact false-negative
-  // the reachability gate exists to avoid.
-  wiredBooks.clear();
+  // TRA-3977 — `observedBooks` is derived from the rows, so it resets with
+  // them; the hydrate re-populates it from every row it keeps. `wiredBooks`
+  // is deliberately NOT here (see `clearLiveOptionsFeeSlippageLedger`).
   observedBooks.clear();
 }
 
@@ -1799,7 +1828,12 @@ export function hydrateLiveOptionsFeeSlippageFromDisk(
   dir: string,
   now: number = Date.now(),
 ): LiveOptionsFeeSlippageHydration {
-  clearLiveOptionsFeeSlippageLedger();
+  // ⛔ TRA-3977 — rows only. `clearLiveOptionsFeeSlippageLedger()` here wiped
+  // the books the engines had declared at `initAllUserContexts()` (which runs
+  // BEFORE this hydrate at boot), so `bookScopingReachable()` was false on a
+  // box serving two live books and every book-scoped oracle answered
+  // fleet-wide. Measured 2026-08-27 on bqb1 `56804e1a`.
+  resetStoreRows();
   dataDir = dir;
 
   let raw = '';
@@ -3475,6 +3509,15 @@ export interface CrossBookOpenEpisodeCensus {
   scopingReachable: boolean;
   /** Every book known to this store (wired at engine boot ∪ seen in a row). */
   books: string[];
+  /**
+   * TRA-3977 (2026-08-27) — the two sources SEPARATELY, so a reader can tell
+   * "the engines declared it" from "a row happened to carry it". On bqb1
+   * `56804e1a` the boot hydrate wiped the first set and `books` read
+   * `["admin"]` off one termination marker while two live books were being
+   * served: `booksWired: []` would have named that in one read.
+   */
+  booksWired: string[];
+  booksObserved: string[];
   /** `clean` | `overlap` | `unattributed` — see the block above. */
   verdict: 'clean' | 'overlap' | 'unattributed';
   /** Distinct OCCs carrying at least one row. The denominator. */
@@ -3537,6 +3580,8 @@ export function crossBookOpenEpisodeCensus(): CrossBookOpenEpisodeCensus {
   return {
     scopingReachable: bookScopingReachable(),
     books,
+    booksWired: [...wiredBooks].sort(),
+    booksObserved: [...observedBooks].sort(),
     verdict,
     symbols: symbols.size,
     overlappingSymbols: rows.length,

@@ -4387,6 +4387,9 @@ export class SignalEngine {
     // TRA-857 — keep the snapshot fresh so setAlertUsername can rebuild the
     // operator-scoped live clients from the latest settings.
     this.lastSettings = settings;
+    // TRA-3977 — a book that just flipped to live is a book that can now
+    // append to the live fill ledger: declare it (idempotent, no-op for demo).
+    this.declareLiveOptionBook();
     // TRA-221 — re-resolve the Tradier live client whenever settings change
     // so toggling Live mode or editing the API token takes effect on the
     // next tick without requiring a server restart.
@@ -19106,6 +19109,19 @@ export class SignalEngine {
   // username is bound and route through `emitAlert`, which never throws. They
   // are safe to call inline on the trade paths (open / close / signal / halt).
 
+  /**
+   * TRA-3977 — declare this engine's book to the live fill ledger iff the book
+   * is LIVE and has an owner. Called from `setAlertUsername` (the owner arrives
+   * after construction) and from `applySettings` (the mode can flip at
+   * runtime); both are idempotent on the ledger side. Registering is what
+   * flips `bookScopingReachable()` on a process serving a second live book.
+   */
+  private declareLiveOptionBook(): void {
+    if (this.alertUsername && this.lastSettings?.mode === 'live') {
+      registerLiveOptionBook(this.alertUsername);
+    }
+  }
+
   /** TRA-563 — bind the owning user so emitted alerts resolve that user's prefs. */
   setAlertUsername(username: string): void {
     const changed = this.alertUsername !== username;
@@ -19121,7 +19137,13 @@ export class SignalEngine {
     // (unattributed) legacy tape from the first tick rather than after the first
     // fill of each. The ledger also auto-registers off any row it records, so
     // this call is the EARLY half of a two-source read, never the only one.
-    registerLiveOptionBook(username);
+    //
+    // ⚠ LIVE books only (2026-08-27). The ledger is live-only by construction,
+    // so a demo book can never have written an unattributed row and must not
+    // make the attribution question "reachable": a fleet of one live book and
+    // sixty QA demo books is ONE book to this store (AC4). A book that flips
+    // to live later is declared at that flip — see `applySettings`.
+    this.declareLiveOptionBook();
     // TRA-857 — the live Tradier order clients scope their shared `process.env`
     // cred fallback to the pinned operator (isLiveBrokerOperator). The
     // constructor runs before this binding, so for the operator those clients

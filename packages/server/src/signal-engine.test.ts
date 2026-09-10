@@ -141,6 +141,7 @@ import { TradierOptionsClient as RealTradierOptionsClient } from '@trading-app/e
 import {
   clearLiveOptionsFeeSlippageLedger,
   summarizeLiveOptionsFeeSlippage,
+  knownLiveOptionBooks, // TRA-3977
 } from './live-options-fee-slippage-ledger.js';
 import {
   setPreTradeLiquidityLedgerFileForTests,
@@ -6377,6 +6378,43 @@ describe('buildTradierLiveEquityClient — TRA-857 operator-scoped env fallback'
     });
     engine.setAlertUsername('alice');
     expect(readEquityClient(engine)).not.toBeNull();
+  });
+});
+
+// ── TRA-3977 — the engine DECLARES its book to the live fill ledger ─────────
+// Measured 2026-08-27 on bqb1 `56804e1a`: two live books served, the ledger's
+// registry read `["admin"]` (off one termination marker) and every book-scoped
+// oracle answered fleet-wide. The wire-up half of the registry is what these
+// pin: it fires for a LIVE book with an owner, not for a demo book (one live
+// book + sixty QA demo books is ONE book to the ledger — AC4), and it fires
+// again when a book flips to live at runtime.
+describe('SignalEngine — TRA-3977 live-book declaration to the fill ledger', () => {
+  beforeEach(() => {
+    clearLiveOptionsFeeSlippageLedger();
+  });
+  afterEach(() => {
+    clearLiveOptionsFeeSlippageLedger();
+  });
+
+  it('a LIVE engine declares its book when the owner is bound', () => {
+    const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'live' });
+    expect(knownLiveOptionBooks()).toEqual([]); // owner unknown at construction
+    engine.setAlertUsername('v0nni');
+    expect(knownLiveOptionBooks()).toEqual(['v0nni']);
+  });
+
+  it('a DEMO engine does NOT — a demo book cannot write the live ledger, so it is not a second book', () => {
+    const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' });
+    engine.setAlertUsername('qa_reg_0710202220');
+    expect(knownLiveOptionBooks()).toEqual([]);
+  });
+
+  it('a book that flips to live at runtime is declared at the flip', async () => {
+    const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' });
+    engine.setAlertUsername('alice');
+    expect(knownLiveOptionBooks()).toEqual([]);
+    await engine.applySettings({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'live' });
+    expect(knownLiveOptionBooks()).toEqual(['alice']);
   });
 });
 
