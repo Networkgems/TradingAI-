@@ -25,9 +25,11 @@ result is reported rather than assumed. **No production order was placed and bqb
 
 > **Shared-account note (TRA-3299).** `VA20296703` is also the sanctioned options smoke's account,
 > and `scripts/tra3299-sandbox-attribution.mjs` grades anything that is not a smoke leg as RESIDUE.
-> This run created **24 orders** on the 2026-09-10 ET day, all `class=equity` (the smoke only ever
-> places `class=option`), all now `canceled`. Ids: `38453601`, `38453637`–`38453653`, `38453672`,
-> `38453739`–`38453741`, `38453773`–`38453776`. Subtract them from any attribution run for that day.
+> This run created **26 orders** on the 2026-09-10 ET day, all `class=equity` (the smoke only ever
+> places `class=option`), all now `canceled` — verified by re-reading the tape at 04:24Z:
+> 26 rows, `statuses: ["canceled"]`, **0 non-terminal**. Ids: `38453601`, `38453637`–`38453653` (17),
+> `38453672`, `38453739`–`38453741`, `38453773`–`38453776`. Subtract them from any attribution run
+> for that day.
 
 ---
 
