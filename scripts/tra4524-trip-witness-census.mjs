@@ -129,6 +129,7 @@ function bestStaircase(series) {
   return best;
 }
 let signatureTrips = 0;
+let unreadTrips = 0;
 for (const t of trips) {
   const tMs = Date.parse(t.timestamp);
   const from = new Date(tMs - PRE_MS).toISOString();
@@ -142,12 +143,17 @@ for (const t of trips) {
   const steps = bestStaircase(preempt);
   const signature = steps >= MIN_STEPS;
   if (signature) signatureTrips += 1;
+  // ZERO sync witnesses is BLIND, not clean: every 09-08 trip reads 0 because the
+  // `yield-preempt` meter (`1fa511fd`) only went live 09-09. Grading those `no` would
+  // pad the BEFORE row with clean-looking trips nobody could see into.
+  const unread = witnesses.length === 0;
+  if (unread) unreadTrips += 1;
   const maxPre = preempt.reduce((m, x) => Math.max(m, x.ms), 0);
   const top = witnesses.slice().sort((a, b) => b.ms - a.ms)[0] ?? null;
   console.log(
     `TRIP ${t.timestamp} lagMax=${field(msgOf(t), 'lagMaxMs')} heapMB=${field(msgOf(t), 'heapUsedMB')}` +
     ` | sync witnesses ${witnesses.length}, yield-preempt ${preempt.length} (max ${maxPre}ms, ${steps} steps)` +
-    ` | largest ${top ? `${top.phase} ${top.ms}ms` : 'none'} | FIFO-signature ${signature ? 'YES' : 'no'}` +
+    ` | largest ${top ? `${top.phase} ${top.ms}ms` : 'none'} | FIFO-signature ${unread ? 'UNREAD (0 sync witnesses)' : signature ? 'YES' : 'no'}` +
     `${w.complete ? '' : ' (WITNESS PAGE CAP)'}`,
   );
   if (preempt.length > 0) console.log(`   preempt series: ${preempt.map((x) => `${x.ms}@${String(x.phase).slice(14)}`).join(' ')}`);
@@ -158,5 +164,5 @@ const exitDrain = await drain({ text: 'exceeded' }, 60);
 const exitWarns = exitDrain.lines.filter((l) => msgOf(l).includes('exit evaluation interval exceeded')).length;
 console.log(`exit evaluation interval exceeded: ${exitWarns}${exitDrain.complete ? '' : ' (PAGE CAP HIT — UNDERCOUNT)'}`);
 
-console.log(`SUMMARY trips=${trips.length} fifoSignature=${signatureTrips} exitWarns=${exitWarns}` +
+console.log(`SUMMARY trips=${trips.length} fifoSignature=${signatureTrips} unread=${unreadTrips} exitWarns=${exitWarns}` +
   `${tripsComplete && exitDrain.complete ? '' : ' (undercount)'}`);
