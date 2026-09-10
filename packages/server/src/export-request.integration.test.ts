@@ -412,6 +412,32 @@ describe('TRA-3882 — the CSV carries its own provenance, on the wire', () => {
   });
 });
 
+describe('TRA-4507 — `books=all` on the wire', () => {
+  it('THE TRAP: ?books=all is a 400 with the authenticated-book hint, not a 200 of one book', async () => {
+    const { status, body } = await get('format=json&markets=options&modes=live&books=all');
+    expect(status).toBe(400);
+    expect(body.parameter).toBe('books');
+    expect(body.detail).toContain('AUTHENTICATED');
+    expect(body.trades).toBeUndefined();
+  });
+
+  it('AC3: `book=` and `username=` still 400; the clean request still 200', async () => {
+    for (const extra of ['book=v0nni', 'book=all', 'username=admin']) {
+      const { status } = await get(`format=json&markets=options&modes=live&${extra}`);
+      expect(status, extra).toBe(400);
+    }
+    const { status, body } = await get('format=json&markets=options&modes=live');
+    expect(status).toBe(200);
+    expect(body.summary?.count).toBe(2);
+  });
+
+  it('the CSV default refuses too — a saved file cannot lose a 400', async () => {
+    const { status, headers } = await getCsv('markets=options&modes=live&books=all');
+    expect(status).toBe(400);
+    expect(headers.get('x-export-filters-requested')).toBeNull();
+  });
+});
+
 describe('TRA-3883 — the residual, re-run on the wire', () => {
   it('R1 THE TRAP: ?Mode=demo is a 400 naming `Mode`, not a 200 with 2 live rows', async () => {
     const { status, body } = await get('format=json&markets=options&Mode=demo');

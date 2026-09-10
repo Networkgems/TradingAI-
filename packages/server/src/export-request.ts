@@ -131,22 +131,25 @@ export type FilterParse<T extends string> =
  * failure shape, one field over. All four were observed silently ignored here and
  * on `/api/health/option-journal`.
  *
+ * TRA-4507 — `books=all`, the spelling TRA-4242 AC3 proposed for a fleet opt-in,
+ * was answered `200` with ONE book and the key dropped without trace (bqb1
+ * `c54f1e735967`, 27 rows, `scope.book: "admin"`). There is no fleet opt-in —
+ * the export is per-book by design (TRA-2421) — so `books` joins `book`, along
+ * with the account / user spellings of the same question.
+ *
  * Extending this list is deliberately cheap; every entry is one more request that
  * refuses instead of answering something other than what was asked.
  */
+const authenticatedBookHint = (key: string): string =>
+  `this route always exports the AUTHENTICATED book; there is no \`${key}\` selector `
+  + 'and no multi-book or fleet export. Authenticate as that user instead.';
+
 export const CONFUSABLE_EXPORT_KEYS: ReadonlyMap<string, string> = new Map([
   ['mode', "did you mean `modes` (comma-separated, e.g. `modes=demo`)?"],
   ['market', "did you mean `markets` (comma-separated, e.g. `markets=options`)?"],
-  [
-    'book',
-    'this route always exports the AUTHENTICATED book; there is no `book` selector. '
-    + 'Authenticate as that user instead.',
-  ],
-  [
-    'username',
-    'this route always exports the AUTHENTICATED book; there is no `username` selector. '
-    + 'Authenticate as that user instead.',
-  ],
+  ...['book', 'username', 'books', 'account', 'accounts', 'user', 'users'].map(
+    key => [key, authenticatedBookHint(key)] as const,
+  ),
 ]);
 
 /**
@@ -168,7 +171,7 @@ export const EXPORT_QUERY_PARAMETERS: readonly string[] = [
  *
  * Two classes, both refused with one 400:
  *
- *  1. A known-confusable key (`mode`, `market`, `book`, `username`) — a spelling
+ *  1. A known-confusable key (`mode`, `market`, `book`, `books`, …) — a spelling
  *     that maps onto a parameter that works, or onto nothing at all.
  *  2. A case-variant of a REAL parameter (`MODES`, `Markets`, `From`, `Format`).
  *     Refusing rather than honouring is the parent's verb, and it cannot serve a

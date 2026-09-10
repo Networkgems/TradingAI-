@@ -203,6 +203,27 @@ describe('TRA-3874 — confusable query KEYS', () => {
     }
   });
 
+  it('TRA-4507 THE TRAP: ?books=all — the proposed fleet opt-in — refuses, it is not a fleet export', () => {
+    // Measured on bqb1 `c54f1e735967`: 200, 27 rows, ONE book, the key dropped.
+    // The hint must say the route is per-book, not suggest a plural that works.
+    for (const spelling of ['books', 'Books', 'BOOKS']) {
+      const check = checkExportQueryKeys({ markets: 'options', modes: 'live', [spelling]: 'all' });
+      expect(check.ok, spelling).toBe(false);
+      if (check.ok) continue;
+      expect(check.refusal.parameter).toBe(spelling);
+      expect(check.refusal.detail).toContain(`\`${spelling}\``);
+      expect(check.refusal.detail).toContain('AUTHENTICATED');
+      expect(check.refusal.detail).not.toContain('did you mean');
+    }
+  });
+
+  it('TRA-4507: every book/account/user spelling carries the authenticated-book hint', () => {
+    for (const key of ['book', 'username', 'books', 'account', 'accounts', 'user', 'users']) {
+      expect(CONFUSABLE_EXPORT_KEYS.get(key), key).toContain('AUTHENTICATED');
+      expect(CONFUSABLE_EXPORT_KEYS.get(key), key).toContain(`\`${key}\``);
+    }
+  });
+
   it('a confusable key refuses even when its VALUE is empty', () => {
     // `?mode=` is still a caller who thinks they are filtering.
     expect(checkExportQueryKeys({ mode: '' }).ok).toBe(false);
@@ -226,8 +247,10 @@ describe('TRA-3874 — confusable query KEYS', () => {
     expect(checkExportQueryKeys({ modes: 'live', _cacheBust: '1' }).ok).toBe(true);
   });
 
-  it('the confusable set is exactly the four QA measured as silently ignored', () => {
-    expect([...CONFUSABLE_EXPORT_KEYS.keys()]).toEqual(['mode', 'market', 'book', 'username']);
+  it('the confusable set is the four QA measured, plus TRA-4507 `books` and its account/user kin', () => {
+    expect([...CONFUSABLE_EXPORT_KEYS.keys()]).toEqual([
+      'mode', 'market', 'book', 'username', 'books', 'account', 'accounts', 'user', 'users',
+    ]);
   });
 
   it('names EVERY offending key, not just the first', () => {
