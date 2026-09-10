@@ -538,7 +538,11 @@ import {
 // TRA-3216 (parent TRA-2760) — the LIVE OTM underlying allowlist. The scan is
 // handed the full ~614-name watchlist; this is the only universe restriction on
 // the real-money path.
-import { resolveLiveOtmUniverse, isSymbolInLiveOtmUniverse } from './otm-live-universe-flag.js';
+import {
+  resolveLiveOtmUniverse,
+  isSymbolInLiveOtmUniverse,
+  liveOtmRatifiedSetCounterfactual,
+} from './otm-live-universe-flag.js';
 // TRA-4144 — the underlying ASSET CLASS gate on the live OTM entry path: the
 // classifier + the flag-gated (default-OFF) refusal + the entry-site census.
 import {
@@ -8195,15 +8199,19 @@ export class SignalEngine {
   ): string | null {
     if (this.mode !== 'live') return null;
     const universe = resolveLiveOtmUniverse(process.env);
-    // Unrestricted ⇒ no verdict exists to record. `evaluated:0` on this axis is
-    // NOT "the gate never ran" — /api/health/live-enforce-gates publishes
-    // `arm.universe.restricted:false` alongside, which is the discriminator.
-    if (!universe.restricted) return null;
+    // Unrestricted ⇒ `isSymbolInLiveOtmUniverse` admits every name, so the
+    // return below is null exactly as it was when this branch returned early.
     const admitted = isSymbolInLiveOtmUniverse(symbol, universe);
     const reason = admitted
       ? null
       : `live OTM universe (TRA-3216): ${symbol} is not on the live underlying allowlist `
         + `[${universe.symbols.join(',')}] (source ${universe.source})`;
+    // TRA-4269 — the unrestricted admit is RECORDED too. Before this it returned
+    // early and wrote nothing, so the board was asked to rule on the allowlist
+    // with an entry-side tape of zero rows. Each such row carries the
+    // ratified-set counterfactual (both values); a restricted row carries none,
+    // because its `blocked` already is the verdict.
+    const counterfactual = universe.restricted ? null : liveOtmRatifiedSetCounterfactual(symbol);
     recordLiveEnforceDecision(
       'universe',
       symbol,
@@ -8215,6 +8223,7 @@ export class SignalEngine {
         reasonCode: admitted ? undefined : 'not_in_universe',
         book: this.alertUsername ?? null,
         nominator: nominator ?? null,
+        ratifiedSetCounterfactual: counterfactual,
       },
     );
     return reason;

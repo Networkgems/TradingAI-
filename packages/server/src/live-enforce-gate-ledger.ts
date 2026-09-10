@@ -47,6 +47,10 @@ import {
   type NetEdgeShadowSample,
 } from './option-net-edge-bar.js';
 import type { AdmissibleSelection } from './otm-admissible-strike.js';
+import {
+  OPTION_LIVE_OTM_UNIVERSE_DEFAULT,
+  type LiveOtmRatifiedSetCounterfactual,
+} from './otm-live-universe-flag.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'live-enforce-gate-ledger' });
@@ -381,6 +385,27 @@ export interface LiveEnforceRecord {
    * rather than to a synthetic bucket — "never stamped" is not a branch.
    */
   nominator?: LiveEnforceNominator;
+  /**
+   * TRA-4269 — the RATIFIED-SET COUNTERFACTUAL, on `universe` rows only.
+   *
+   * With `OPTION_LIVE_OTM_UNIVERSE=*` every name is admitted, so `blocked` is
+   * `false` on every row and cannot say which of those admits the allowlist
+   * would have refused. This field can. It is stamped on EVERY unrestricted row,
+   * `true` and `false` alike. If only the would-block rows were stamped, an
+   * in-set admit and a row from before this field would be the same bytes.
+   *
+   * Absent ⇒ the gate was RESTRICTED when the row was recorded (its `blocked`
+   * already is the verdict under the list in force), a non-`universe` gate, or
+   * a row from before TRA-4269.
+   */
+  wouldBlockUnderRatifiedSet?: boolean;
+  /**
+   * TRA-4269 — the set `wouldBlockUnderRatifiedSet` was taken against,
+   * comma-joined (`AAPL,SPY,QQQ,PLTR,TSLA`). Present iff that field is. Carried
+   * per row so a later change to `OPTION_LIVE_OTM_UNIVERSE_DEFAULT` cannot
+   * silently redefine what the retained rows measured.
+   */
+  ratifiedSet?: string;
 }
 
 /** TRA-3510 — the nominator branch + chain shape carried on an OTM verdict. */
@@ -512,6 +537,29 @@ interface GateTallies {
   costSamplesDropped: number;
   /** TRA-3483 (D2) — BLOCKED rows carrying no `reasonCode`, so `byReason`'s denominator is visible. */
   blockedUnclassified: number;
+  /**
+   * TRA-4269 — `universe` rows carrying the ratified-set counterfactual, keyed
+   * by membership + symbol ({@link ratifiedSymbolKey}). Empty on every other gate.
+   */
+  byRatifiedSymbol: Map<string, RatifiedSymbolTally>;
+  /** TRA-4269 — the same rows, counted by the set they were stamped under. */
+  byRatifiedSet: Map<string, number>;
+}
+
+/** TRA-4269 — one symbol's counterfactual rows under one membership verdict. */
+interface RatifiedSymbolTally {
+  symbol: string;
+  inRatifiedSet: boolean;
+  evaluated: number;
+}
+
+/**
+ * TRA-4269 — membership is part of the key, so a symbol whose verdict flipped
+ * with a change to the ratified set lands in two rows. Otherwise it would be one
+ * row whose `inRatifiedSet` is whichever verdict came last.
+ */
+function ratifiedSymbolKey(symbol: string, inRatifiedSet: boolean): string {
+  return `${inRatifiedSet ? 'in' : 'out'}::${symbol}`;
 }
 
 const UNATTRIBUTED_BOOK = 'unattributed';
@@ -527,6 +575,8 @@ function emptyTallies(): GateTallies {
     costRowsMissing: 0,
     costSamplesDropped: 0,
     blockedUnclassified: 0,
+    byRatifiedSymbol: new Map(),
+    byRatifiedSet: new Map(),
   };
 }
 
@@ -767,6 +817,18 @@ function apply(rec: LiveEnforceRecord): void {
     // that was never instrumented — a fake coverage hole.
     tallies.costRowsMissing += 1;
   }
+  // TRA-4269 — the ratified-set counterfactual. A row that carries none adds
+  // nothing here: a restricted or pre-field row is not an in-set admit.
+  const counterfactual = usableCounterfactual(rec.gate, rec.wouldBlockUnderRatifiedSet, rec.ratifiedSet);
+  if (counterfactual) {
+    const inRatifiedSet = !counterfactual.wouldBlockUnderRatifiedSet;
+    const key = ratifiedSymbolKey(rec.scope, inRatifiedSet);
+    const t = tallies.byRatifiedSymbol.get(key);
+    if (t) t.evaluated += 1;
+    else tallies.byRatifiedSymbol.set(key, { symbol: rec.scope, inRatifiedSet, evaluated: 1 });
+    const set = counterfactual.ratifiedSet;
+    tallies.byRatifiedSet.set(set, (tallies.byRatifiedSet.get(set) ?? 0) + 1);
+  }
   decisionsTotal += 1;
   lastDecisionAt = rec.ts;
   // TRA-3974 — LAST, and never before the tallies: an observer must not be able
@@ -815,6 +877,10 @@ export function recordLiveEnforceDecision(
     nominator?: LiveEnforceNominator | null;
     // TRA-3674 — the per-book budget's three resolved terms, admits included.
     budget?: LiveEnforceRecord['budget'] | null;
+    // TRA-4269 — the ratified-set counterfactual: `universe` only, and only
+    // while unrestricted. Null/absent on a restricted verdict and on every
+    // other gate.
+    ratifiedSetCounterfactual?: LiveOtmRatifiedSetCounterfactual | null;
   },
 ): void {
   const cost = opts?.cost;
@@ -841,6 +907,12 @@ export function recordLiveEnforceDecision(
     // denominator that tells "the budget never had to bite" apart from "the
     // budget resolved to 0 and blocked everything silently".
     ...(hydratedBudget(opts?.budget ?? undefined) ? { budget: opts!.budget! } : {}),
+    // TRA-4269 — both halves or neither. A stamp offered on any other gate is dropped.
+    ...(usableCounterfactual(
+      gate,
+      opts?.ratifiedSetCounterfactual?.wouldBlock,
+      opts?.ratifiedSetCounterfactual?.ratifiedSet,
+    ) ?? {}),
   };
   applyAndAppend(rec);
 }
@@ -939,6 +1011,24 @@ function isStrikeCount(v: number | undefined): v is number {
   return typeof v === 'number' && Number.isInteger(v) && v >= 0;
 }
 
+/**
+ * TRA-4269 — the counterfactual stamp, normalized, or `null` when it is not
+ * usable: a non-`universe` gate, a non-boolean verdict, or a missing/empty set.
+ * Shared by the write path, the hydrate path and {@link apply} for the same
+ * reason as {@link usableNominator}. A row this refuses to record must also be
+ * a row it refuses to read back or count.
+ */
+function usableCounterfactual(
+  gate: LiveEnforceGate,
+  wouldBlock: unknown,
+  ratifiedSet: unknown,
+): { wouldBlockUnderRatifiedSet: boolean; ratifiedSet: string } | null {
+  if (gate !== 'universe') return null;
+  if (typeof wouldBlock !== 'boolean') return null;
+  if (typeof ratifiedSet !== 'string' || ratifiedSet === '') return null;
+  return { wouldBlockUnderRatifiedSet: wouldBlock, ratifiedSet };
+}
+
 /** What {@link hydrateLiveEnforceGateFromDisk} recovered (for the boot log line). */
 export interface LiveEnforceGateHydration {
   days: number;
@@ -1027,6 +1117,10 @@ export function hydrateLiveEnforceGateFromDisk(dir: string, now: number = Date.n
           },
         }
         : {}),
+      // TRA-4269 — both halves or neither, and `universe` only. A row from
+      // before the field, or one with a malformed half, hydrates with no stamp
+      // and stays out of the counterfactual's denominator.
+      ...(usableCounterfactual(rec.gate, rec.wouldBlockUnderRatifiedSet, rec.ratifiedSet) ?? {}),
     };
     apply(clean);
     kept.push(JSON.stringify(clean));
@@ -1459,6 +1553,45 @@ export interface LiveEnforceGateSummary {
   costRQuantiles: CostRQuantiles | null;
   /** TRA-3483 — the counterfactual k-sweep. Non-null on `cost_bar` only. */
   netEdgeShadow: NetEdgeShadowSummary | null;
+  /**
+   * TRA-4269 — the RATIFIED-SET COUNTERFACTUAL. These five fields are ALWAYS
+   * non-null on `universe` (`0` / `[]` at n=0) and null on every other gate, so
+   * "0 would-block" can never read as "not deployed" or as a build from before
+   * the field.
+   *
+   * "Restoring the allowlist would have refused N of M entries, in these names"
+   * reads straight off the row: N = `wouldBlockUnderRatifiedSet`,
+   * M = `counterfactualEvaluated`, and the names are the `bySymbol` rows with
+   * `inRatifiedSet: false`.
+   *
+   * M is NOT `evaluated`. Rows recorded while the gate was RESTRICTED carry no
+   * counterfactual and fall outside M; `evaluated − counterfactualEvaluated` is
+   * that restricted (or pre-TRA-4269) remainder.
+   *
+   * `ratifiedSet` is the set NEW rows are stamped against
+   * (`OPTION_LIVE_OTM_UNIVERSE_DEFAULT`).
+   */
+  ratifiedSet: string[] | null;
+  /** TRA-4269 — rows carrying the counterfactual (M). */
+  counterfactualEvaluated: number | null;
+  /** TRA-4269 — of those, the rows the ratified set would have refused (N). */
+  wouldBlockUnderRatifiedSet: number | null;
+  /**
+   * TRA-4269 — counterfactual rows stamped under a set OTHER than `ratifiedSet`.
+   * `0` unless the default changed inside this fold. Nonzero ⇒ N and M mix two
+   * definitions of the set, and neither can be quoted as-is.
+   */
+  counterfactualUnderOtherSet: number | null;
+  /** TRA-4269 — every counterfactual row by symbol, would-block names included, busiest first. */
+  bySymbol: LiveEnforceRatifiedSymbolSummary[] | null;
+}
+
+/** TRA-4269 — one name's rows under the ratified-set counterfactual. */
+export interface LiveEnforceRatifiedSymbolSummary {
+  symbol: string;
+  evaluated: number;
+  /** FALSE ⇒ the ratified allowlist would have refused every one of these rows. */
+  inRatifiedSet: boolean;
 }
 
 export interface LiveEnforceDurability {
@@ -1809,6 +1942,9 @@ function foldGates(
     // deployed" cannot read the same as "deployed, no live candidates yet" —
     // the same distinction the zero gate rows exist for.
     const instrumented = gate === 'cost_bar';
+    // TRA-4269 — the ratified-set counterfactual: `0` / `[]` on `universe` at
+    // n=0 (never omitted), and null on every other gate.
+    const counterfactual = gate === 'universe' ? foldRatifiedCounterfactual(tallies) : null;
 
     out.push({
       gate,
@@ -1831,9 +1967,50 @@ function foldGates(
       netEdgeShadow: instrumented
         ? netEdgeShadow(tallies, etDay, etDays, evaluated, blocked, shadowOpts)
         : null,
+      ratifiedSet: counterfactual?.ratifiedSet ?? null,
+      counterfactualEvaluated: counterfactual?.counterfactualEvaluated ?? null,
+      wouldBlockUnderRatifiedSet: counterfactual?.wouldBlockUnderRatifiedSet ?? null,
+      counterfactualUnderOtherSet: counterfactual?.counterfactualUnderOtherSet ?? null,
+      bySymbol: counterfactual?.bySymbol ?? null,
     });
   }
   return out;
+}
+
+/** TRA-4269 — fold one gate's counterfactual tallies into the `universe` row's five fields. */
+function foldRatifiedCounterfactual(tallies: GateTallies): {
+  ratifiedSet: string[];
+  counterfactualEvaluated: number;
+  wouldBlockUnderRatifiedSet: number;
+  counterfactualUnderOtherSet: number;
+  bySymbol: LiveEnforceRatifiedSymbolSummary[];
+} {
+  let counterfactualEvaluated = 0;
+  let wouldBlockUnderRatifiedSet = 0;
+  const bySymbol: LiveEnforceRatifiedSymbolSummary[] = [];
+  for (const t of tallies.byRatifiedSymbol.values()) {
+    counterfactualEvaluated += t.evaluated;
+    if (!t.inRatifiedSet) wouldBlockUnderRatifiedSet += t.evaluated;
+    bySymbol.push({ symbol: t.symbol, evaluated: t.evaluated, inRatifiedSet: t.inRatifiedSet });
+  }
+  bySymbol.sort(
+    (a, b) =>
+      b.evaluated - a.evaluated
+      || a.symbol.localeCompare(b.symbol)
+      || Number(a.inRatifiedSet) - Number(b.inRatifiedSet),
+  );
+  const current = OPTION_LIVE_OTM_UNIVERSE_DEFAULT.join(',');
+  let counterfactualUnderOtherSet = 0;
+  for (const [set, n] of tallies.byRatifiedSet.entries()) {
+    if (set !== current) counterfactualUnderOtherSet += n;
+  }
+  return {
+    ratifiedSet: [...OPTION_LIVE_OTM_UNIVERSE_DEFAULT],
+    counterfactualEvaluated,
+    wouldBlockUnderRatifiedSet,
+    counterfactualUnderOtherSet,
+    bySymbol,
+  };
 }
 
 /** Merge one axis map into an accumulator. */
@@ -1896,6 +2073,17 @@ function accumulateAllDays(): Map<LiveEnforceGate, GateTallies> {
       into.costRowsMissing += tallies.costRowsMissing;
       into.costSamplesDropped += tallies.costSamplesDropped;
       into.blockedUnclassified += tallies.blockedUnclassified;
+      // TRA-4269 — the counterfactual travels with the day, or the retained view
+      // would publish `counterfactualEvaluated: 0` over a fold that has rows.
+      // Copied, never aliased: the per-day tallies must not grow on each read.
+      for (const [key, t] of tallies.byRatifiedSymbol.entries()) {
+        const cur = into.byRatifiedSymbol.get(key);
+        if (cur) cur.evaluated += t.evaluated;
+        else into.byRatifiedSymbol.set(key, { ...t });
+      }
+      for (const [set, n] of tallies.byRatifiedSet.entries()) {
+        into.byRatifiedSet.set(set, (into.byRatifiedSet.get(set) ?? 0) + n);
+      }
     }
   }
   return acc;

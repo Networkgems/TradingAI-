@@ -38,6 +38,12 @@
 // `live-enforce-gate-ledger.ts` under gate `universe`, keyed by symbol and
 // stamped with the BOOK, so the payload answers "which live books did this
 // actually govern" and not merely "some process has a list".
+//
+// TRA-4269 — that includes the UNRESTRICTED (`*`) admits. They used to be
+// dropped with no record, so while the universe was open the board had no
+// entry-side tape to rule on. Each is now recorded with
+// {@link liveOtmRatifiedSetCounterfactual}: whether the ratified set would have
+// refused it.
 
 /** Operator override for the live OTM underlying allowlist. Comma/space separated. */
 export const OPTION_LIVE_OTM_UNIVERSE_VAR = 'OPTION_LIVE_OTM_UNIVERSE';
@@ -132,4 +138,40 @@ export function isSymbolInLiveOtmUniverse(symbol: string | null | undefined, res
   const sym = symbol.trim().toUpperCase();
   if (sym === '') return false;
   return resolution.symbols.includes(sym);
+}
+
+/**
+ * TRA-4269 — what the board's RATIFIED set would have said about `symbol`,
+ * whatever the env currently resolves to.
+ *
+ * The call site asks this only while the universe is UNRESTRICTED. With the
+ * restriction lifted every name is admitted, so `blocked` alone cannot say
+ * which admits the allowlist would have refused. And "restoring the allowlist
+ * would have refused N of M entries, in these names" is the question the board
+ * is being asked to rule on.
+ *
+ * Read against {@link OPTION_LIVE_OTM_UNIVERSE_DEFAULT} (the compiled
+ * ratified set), never the env, and the set is returned alongside the verdict so
+ * every ledger row says which definition it was taken under. A later change to
+ * the default then shows up as rows stamped under two sets. It cannot quietly
+ * redefine the counterfactual on rows already retained.
+ */
+export interface LiveOtmRatifiedSetCounterfactual {
+  /** The ratified set this verdict was taken against, comma-joined in declared order. */
+  ratifiedSet: string;
+  /** TRUE ⇒ restoring the ratified allowlist would have refused this entry. */
+  wouldBlock: boolean;
+}
+
+export function liveOtmRatifiedSetCounterfactual(symbol: string | null | undefined): LiveOtmRatifiedSetCounterfactual {
+  const ratified: LiveOtmUniverseResolution = {
+    symbols: [...OPTION_LIVE_OTM_UNIVERSE_DEFAULT],
+    restricted: true,
+    source: 'default',
+    raw: null,
+  };
+  return {
+    ratifiedSet: OPTION_LIVE_OTM_UNIVERSE_DEFAULT.join(','),
+    wouldBlock: !isSymbolInLiveOtmUniverse(symbol, ratified),
+  };
 }

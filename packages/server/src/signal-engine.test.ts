@@ -8639,16 +8639,25 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
     expect(gateOf('universe')).toMatchObject({ evaluated: 1, blocked: 0 });
   });
 
-  it('the `*` escape hatch restores the old behaviour and records NO verdict at all', async () => {
+  it('the `*` escape hatch opens any name, and RECORDS the admit with the ratified-set counterfactual (TRA-4269)', async () => {
     process.env[OPTION_LIVE_OTM_UNIVERSE_VAR] = '*';
     const stub = liveStub();
     await runOtm(engineFor('live', stub), ['KVYO']);
 
     expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
-    // Unrestricted ⇒ there is no verdict to record. `evaluated:0` here is the ONE
-    // reading on this axis that is ambiguous on its own; the health route pairs it
-    // with arm.universe.restricted, which is the discriminator.
-    expect(gateOf('universe')).toMatchObject({ evaluated: 0, blocked: 0, blockRate: null });
+    // TRA-4269 — this read `evaluated: 0` until the unrestricted branch started
+    // recording, which left the board ruling on the allowlist with no
+    // entry-side tape. The admit is now on the record with what the ratified
+    // set would have done: KVYO is off it, so restoring the allowlist would
+    // have refused this entry.
+    expect(gateOf('universe')).toMatchObject({
+      evaluated: 1,
+      blocked: 0,
+      blockRate: 0,
+      counterfactualEvaluated: 1,
+      wouldBlockUnderRatifiedSet: 1,
+    });
+    expect(gateOf('universe').bySymbol).toEqual([{ symbol: 'KVYO', evaluated: 1, inRatifiedSet: false }]);
   });
 
   it('a malformed override does NOT re-open the universe — it falls back to the restriction', async () => {
