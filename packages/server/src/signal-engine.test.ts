@@ -175,6 +175,25 @@ import type {
   Candle,
 } from '@trading-app/shared';
 
+/**
+ * TRA-4483 — a CONFIRMED clean cancel, the shape `cancelOrderConfirmed`
+ * returns. The open-side maker walk calls this instead of `cancelOrder`
+ * because it RE-PRICES over the cancel: `cancelOrder` reports whether the
+ * DELETE was accepted (swallowing the 404/422 a FILLED order also returns),
+ * which cannot tell a cancelled order from a filled one. `filledQty: 0` is a
+ * real zero — the broker answered — so the walk may size a replacement from it.
+ */
+function stubConfirmedCancel(id: string | number) {
+  return {
+    kind: 'canceled' as const,
+    terminalStatus: 'canceled',
+    ackStatus: 200,
+    ackError: null,
+    detail: { id: Number(id), status: 'canceled', exec_quantity: 0 },
+    filledQty: 0,
+  };
+}
+
 // Inside an ET trading window: 10:20 AM ET on a Tuesday → 14:20 UTC during EDT.
 //
 // ⚠️ TRA-3942 moved this from 10:00 ET. The OTM sleeve now admits ENTRIES only
@@ -1839,6 +1858,8 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     getOptionQuote: ReturnType<typeof vi.fn>;
     buyContractsLimit: ReturnType<typeof vi.fn>;
     cancelOrder: ReturnType<typeof vi.fn>;
+    /** TRA-4483 — the walk re-prices over the cancel, so it needs the CONFIRMED one. */
+    cancelOrderConfirmed: ReturnType<typeof vi.fn>;
     waitForOrderTerminalStatus: ReturnType<typeof vi.fn>;
     sellContracts?: ReturnType<typeof vi.fn>;
   }
@@ -1885,6 +1906,7 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
       getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
       buyContractsLimit: vi.fn().mockResolvedValue({ id: 7, status: 'ok' }),
       cancelOrder: vi.fn().mockResolvedValue(undefined),
+      cancelOrderConfirmed: vi.fn(async (id: string | number) => stubConfirmedCancel(id)),
       waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
         id: 7, status: 'canceled', reason_description: 'insufficient buying power',
       })),
@@ -1978,6 +2000,7 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
       getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
       buyContractsLimit: vi.fn().mockResolvedValue({ id: 9, status: 'ok' }),
       cancelOrder: vi.fn().mockResolvedValue(undefined),
+      cancelOrderConfirmed: vi.fn(async (id: string | number) => stubConfirmedCancel(id)),
       waitForOrderTerminalStatus: vi.fn(async () => ({ id: 9, status: 'filled' })),
     };
     const engine = setupLiveEngine(stub, freshScanner());
@@ -2007,6 +2030,7 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
       getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
       buyContractsLimit: vi.fn().mockResolvedValue({ id: 11, status: 'ok' }),
       cancelOrder: vi.fn().mockResolvedValue(undefined),
+      cancelOrderConfirmed: vi.fn(async (id: string | number) => stubConfirmedCancel(id)),
       waitForOrderTerminalStatus: vi.fn(async () => ({ id: 11, status: 'filled' })),
     };
     // 0.60 delta is the makeCandidate default and sits inside the selector's
@@ -2040,6 +2064,7 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
       getOptionQuote: vi.fn(),
       buyContractsLimit: vi.fn(),
       cancelOrder: vi.fn(),
+      cancelOrderConfirmed: vi.fn(async (id: string | number) => stubConfirmedCancel(id)),
       waitForOrderTerminalStatus: vi.fn(),
     };
     const engine = setupLiveEngine(stub, freshScanner());
@@ -2082,6 +2107,7 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
       getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
       buyContractsLimit: vi.fn().mockResolvedValue({ id: 21, status: 'ok' }),
       cancelOrder: vi.fn(),
+      cancelOrderConfirmed: vi.fn(async (id: string | number) => stubConfirmedCancel(id)),
       waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
         id: 21, status: 'filled', exec_quantity: 1, avg_fill_price: 0.91,
       })),
@@ -2151,6 +2177,7 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
       getOptionQuote: vi.fn(),
       buyContractsLimit: vi.fn(),
       cancelOrder: vi.fn(),
+      cancelOrderConfirmed: vi.fn(async (id: string | number) => stubConfirmedCancel(id)),
       waitForOrderTerminalStatus: vi.fn(),
     };
     // TRA-497 — bump mark above the new $150 per-position cap floor so the
@@ -2187,6 +2214,7 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
       getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
       buyContractsLimit: vi.fn().mockRejectedValue(new Error('Tradier 401 unauthorized')),
       cancelOrder: vi.fn(),
+      cancelOrderConfirmed: vi.fn(async (id: string | number) => stubConfirmedCancel(id)),
       waitForOrderTerminalStatus: vi.fn(),
     };
     const engine = setupLiveEngine(stub, freshScanner());
@@ -2219,6 +2247,7 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
       getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
       buyContractsLimit: vi.fn().mockResolvedValue({ id: 11, status: 'ok' }),
       cancelOrder: vi.fn(),
+      cancelOrderConfirmed: vi.fn(async (id: string | number) => stubConfirmedCancel(id)),
       waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
         id: 11, status: 'filled', exec_quantity: 1, avg_fill_price: 0.91,
       })),
@@ -2261,6 +2290,7 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
       getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
       buyContractsLimit: vi.fn().mockResolvedValue({ id: 13, status: 'ok' }),
       cancelOrder: vi.fn().mockResolvedValue(undefined),
+      cancelOrderConfirmed: vi.fn(async (id: string | number) => stubConfirmedCancel(id)),
       // Always pending → walk exhausts the full schedule.
       waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
         id: 13, status: 'pending',
@@ -2282,7 +2312,99 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     expect(state.signals[0].liveSkipReason).toContain('walk to ask exhausted');
     // The walk submitted 5 LIMITs and cancelled each in turn.
     expect(stub.buyContractsLimit).toHaveBeenCalledTimes(5);
-    expect(stub.cancelOrder).toHaveBeenCalledTimes(5);
+    expect(stub.cancelOrderConfirmed).toHaveBeenCalledTimes(5);
+  });
+
+  // ─── TRA-4483 — the mirror must NOT void when contracts may be live ──────
+  //
+  // The test directly above is the CONTRAST that makes these two mean
+  // something: identical setup, identical scan, and the ONLY thing that moves
+  // is what the confirmed cancel reports. `walk_exhausted` (nothing executed)
+  // voids and frees the slot; a measured partial and an unreadable cancel keep
+  // the row, because voiding it is what leaves contracts live at the broker
+  // with no paper row for any close path to key on (TRA-4476).
+
+  function primedLiveEngine(stub: TradierLiveStub, mark?: number) {
+    const engine = setupLiveEngine(stub, mark === undefined ? freshScanner() : freshScanner(mark));
+    (engine as unknown as { liveTradierBalance: { totalEquity: number; totalCash: number; optionBuyingPower: number } | null }).liveTradierBalance = {
+      totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000,
+    };
+    return engine;
+  }
+
+  it('KEEPS the paper open when the walk ends on a measured partial fill (TRA-4483)', async () => {
+    const stub: TradierLiveStub = {
+      getAccountBalance: vi.fn().mockResolvedValue({
+        totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000,
+      }),
+      getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 13, status: 'ok' }),
+      cancelOrder: vi.fn().mockResolvedValue(undefined),
+      // The first step executed a contract before the cancel landed; the rest
+      // are clean, so the ladder runs out holding a real position.
+      cancelOrderConfirmed: vi
+        .fn()
+        .mockResolvedValueOnce({
+          kind: 'canceled',
+          terminalStatus: 'canceled',
+          ackStatus: 200,
+          ackError: null,
+          detail: { id: 13, status: 'canceled', exec_quantity: 1, avg_fill_price: 1.2 },
+          filledQty: 1,
+        })
+        .mockImplementation(async (id: string | number) => stubConfirmedCancel(id)),
+      waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
+        id: 13, status: 'pending',
+      })),
+    };
+    const engine = primedLiveEngine(stub, 0.05);
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+
+    const state = engine.getState();
+    // ⭐ 1 contract is LIVE at the broker. Under the pre-TRA-4483 walk this
+    // returned `walk_exhausted` and the row above was deleted on top of it.
+    expect(state.options.openOptions).toHaveLength(1);
+    expect(state.options.dailyOptionsCount).toBe(1);
+    expect(state.signals[0].liveSkipReason).toBeUndefined();
+    // ⭐ AC1 END TO END, through the real mirror rather than the helper's own
+    // fixtures: the sleeve asked for 30, one executed before the first cancel
+    // landed, and every replacement asked for 29. Before TRA-4483 all five
+    // submits read 30 — an aggregate of 150 against a request of 30.
+    const submitted = (stub.buyContractsLimit as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[1]);
+    expect(submitted).toEqual([30, 29, 29, 29, 29]);
+  });
+
+  it('KEEPS the paper open when the cancel could not be confirmed, and submits only once (TRA-4483)', async () => {
+    const stub: TradierLiveStub = {
+      getAccountBalance: vi.fn().mockResolvedValue({
+        totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000,
+      }),
+      getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 13, status: 'ok' }),
+      cancelOrder: vi.fn().mockResolvedValue(undefined),
+      cancelOrderConfirmed: vi.fn().mockResolvedValue({
+        kind: 'unknown',
+        reason: 'still_working',
+        ackStatus: 200,
+        ackError: null,
+        detail: null,
+        filledQty: null,
+      }),
+      waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
+        id: 13, status: 'pending',
+      })),
+    };
+    const engine = primedLiveEngine(stub);
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+
+    const state = engine.getState();
+    // The order may still be working AND may still fill, so the row stays and
+    // the exposure is left for the broker-position drift detector to name.
+    expect(state.options.openOptions).toHaveLength(1);
+    expect(state.signals[0].liveSkipReason).toBeUndefined();
+    // ⭐ ONE submit. The old walk re-priced over the unconfirmed cancel four
+    // more times, so up to five orders could have been working at once.
+    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -2318,6 +2440,8 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
     getOptionQuote: ReturnType<typeof vi.fn>;
     buyContractsLimit: ReturnType<typeof vi.fn>;
     cancelOrder: ReturnType<typeof vi.fn>;
+    /** TRA-4483 — the walk re-prices over the cancel, so it needs the CONFIRMED one. */
+    cancelOrderConfirmed: ReturnType<typeof vi.fn>;
     waitForOrderTerminalStatus: ReturnType<typeof vi.fn>;
   }
 
@@ -2351,6 +2475,7 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
       getOptionQuote: vi.fn(),
       buyContractsLimit: vi.fn(),
       cancelOrder: vi.fn(),
+      cancelOrderConfirmed: vi.fn(async (id: string | number) => stubConfirmedCancel(id)),
       waitForOrderTerminalStatus: vi.fn(),
     };
     // TRA-497 — the per-position cap floor moved from $100 to $150 on
@@ -2388,6 +2513,7 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
       getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
       buyContractsLimit: vi.fn().mockResolvedValue({ id: 31, status: 'ok' }),
       cancelOrder: vi.fn(),
+      cancelOrderConfirmed: vi.fn(async (id: string | number) => stubConfirmedCancel(id)),
       waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
         id: 31, status: 'filled', avg_fill_price: 1.01,
       })),
@@ -2421,6 +2547,7 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
       getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
       buyContractsLimit: vi.fn().mockResolvedValue({ id: 21, status: 'ok' }),
       cancelOrder: vi.fn(),
+      cancelOrderConfirmed: vi.fn(async (id: string | number) => stubConfirmedCancel(id)),
       waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
         id: 21, status: 'filled', avg_fill_price: 1.01,
       })),
@@ -2455,6 +2582,7 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
       getOptionQuote: vi.fn(),
       buyContractsLimit: vi.fn(),
       cancelOrder: vi.fn(),
+      cancelOrderConfirmed: vi.fn(async (id: string | number) => stubConfirmedCancel(id)),
       waitForOrderTerminalStatus: vi.fn(),
     };
     const engine = setupLiveEngine(stub, freshScanner(1.0));
@@ -2485,6 +2613,7 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
       getOptionQuote: vi.fn(),
       buyContractsLimit: vi.fn(),
       cancelOrder: vi.fn(),
+      cancelOrderConfirmed: vi.fn(async (id: string | number) => stubConfirmedCancel(id)),
       waitForOrderTerminalStatus: vi.fn(),
     };
     // TRA-495 / TRA-497 — the $150 ticket floor would normally let a

@@ -12723,6 +12723,68 @@ export class SignalEngine {
         symbol: opened.optionSymbol,
         result: outcome.status,
       }).catch(() => {});
+      // ⭐ TRA-4483 — THE TWO OUTCOMES THAT MUST NOT VOID.
+      //
+      // Both of these end with contracts that may be LIVE AT THE BROKER, and
+      // `tradierVoid` deletes the local position — which is precisely how
+      // TRA-4476 described the leak: "4 contracts are live at the broker with
+      // no paper row". A row that overstates the size is recoverable (the close
+      // path books partial fills since TRA-416, and TRA-3067's broker-position
+      // drift detector NAMES the mismatch); a row that does not exist is not:
+      // nothing closes it, nothing stops it, nothing reports it.
+      //
+      // ⚠ The row is deliberately left at `opened.contracts`, NOT resized to
+      // `filledQty`. Resizing an open row is an ACCOUNTING write (paper cash,
+      // `contractsRemaining`, the stop schedule's basis) and is the half of this
+      // ticket that carries product consequences — it is on the sign-off ask,
+      // not smuggled in here. Until then the drift detector is the instrument.
+      if (outcome.status === 'partial_fill' || outcome.status === 'halted') {
+        const confirmed =
+          outcome.status === 'partial_fill' ? outcome.filledQty : outcome.confirmedFilledQty;
+        // A `halted` walk's `confirmedFilledQty` is a LOWER BOUND, never the
+        // exposure. Kept apart in the log so the operator is never told a bound
+        // is a measurement.
+        log.error('smart-open ended with UNRECONCILED broker exposure — paper row KEPT', {
+          component: 'smart-open',
+          outcome: outcome.status,
+          ...(outcome.status === 'halted' ? { haltCode: outcome.haltCode } : {}),
+          reason: outcome.reason,
+          optionSymbol: opened.optionSymbol,
+          requestedContracts: outcome.requestedQty,
+          confirmedFilledContracts: confirmed,
+          confirmedIs: outcome.status === 'partial_fill' ? 'measured' : 'lower_bound',
+          positionId: opened.id,
+          orderId: outcome.orderId,
+          username: this.alertUsername ?? null,
+        });
+        if (outcome.status === 'partial_fill') {
+          // A measured fill is positive proof this account may trade options —
+          // same reason the full-fill branch clears the permission run.
+          recordBrokerFill(censusBook, censusEtDay);
+          // TRA-3964/3965 parity: real cash left the account for the slice that
+          // DID execute, and the cached balance does not know.
+          if (Number.isFinite(outcome.avgFillPrice) && outcome.filledQty > 0) {
+            this.recordUnsettledLivePremium(outcome.avgFillPrice * outcome.filledQty * 100);
+            opened.brokerEntryFill = {
+              premiumPaid: outcome.avgFillPrice,
+              contracts: outcome.filledQty,
+              at: Date.now(),
+              ...(Number.isFinite(outcome.orderId) ? { orderId: outcome.orderId } : {}),
+            };
+          }
+          // TRA-3990 — the quote the order actually crossed, same pull.
+          const entryQuote = buildEntryQuoteStamp('broker_submit', { bid: outcome.bid, ask: outcome.ask });
+          opened.entryBidAtOpen = entryQuote.entryBidAtOpen;
+          opened.entryAskAtOpen = entryQuote.entryAskAtOpen;
+          opened.entrySpreadPct = entryQuote.entrySpreadPct;
+          opened.entryQuoteSource = entryQuote.entryQuoteSource;
+          opened.entryQuoteReason = entryQuote.entryQuoteReason;
+          recordEntryQuoteStampOutcome(entryQuote);
+          recordOptionTradeEntryQuote(opened.id, entryQuote).catch(() => {});
+        }
+        this.refreshTradierBalance().catch(() => {});
+        return true;
+      }
       if (outcome.status === 'rejected') {
         const idSuffix = outcome.orderId !== undefined ? ` ${outcome.orderId}` : '';
         // TRA-3905 — the ONE branch whose class is not known statically: the

@@ -20,14 +20,33 @@ import type {
 
 type SmartOpenClient = Pick<
   TradierOptionsClient,
-  'getOptionQuote' | 'buyContractsLimit' | 'cancelOrder' | 'waitForOrderTerminalStatus'
+  // TRA-4483 — `cancelOrderConfirmed`, not `cancelOrder`. The walk re-prices
+  // over the cancel, so it needs the order's terminal state, not the DELETE's
+  // status code.
+  'getOptionQuote' | 'buyContractsLimit' | 'cancelOrderConfirmed' | 'waitForOrderTerminalStatus'
 >;
+
+/**
+ * TRA-4483 — a CONFIRMED clean cancel: terminal `canceled`, nothing executed.
+ * `filledQty: 0` is a real zero (the broker answered), which is what makes it
+ * safe to size a replacement from. `null` would be UNMEASURED and halts.
+ */
+function cleanCancel(orderId = 1) {
+  return {
+    kind: 'canceled' as const,
+    terminalStatus: 'canceled',
+    ackStatus: 200,
+    ackError: null,
+    detail: { id: orderId, status: 'canceled', exec_quantity: 0 } as TradierOrderDetail,
+    filledQty: 0,
+  };
+}
 
 function buildClient(overrides: Partial<SmartOpenClient> = {}): SmartOpenClient {
   return {
     getOptionQuote: vi.fn(async () => null),
     buyContractsLimit: vi.fn(async () => ({ id: 1, status: 'ok' } as TradierOrderResponse)),
-    cancelOrder: vi.fn(async () => undefined),
+    cancelOrderConfirmed: vi.fn(async (id: string | number) => cleanCancel(Number(id))),
     waitForOrderTerminalStatus: vi.fn(async () => null),
     ...overrides,
   };
@@ -121,7 +140,7 @@ describe('submitSmartBuyToOpen', () => {
       ask: 1.20,
     });
     expect(buySpy).toHaveBeenCalledWith('X', 2, 1.11);
-    expect((client.cancelOrder as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+    expect((client.cancelOrderConfirmed as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
   });
 
   it('walks toward the ask in 0.25 increments when the first attempt does not fill', async () => {
@@ -139,12 +158,12 @@ describe('submitSmartBuyToOpen', () => {
         ? ({ id: 201, status: 'open' } as TradierOrderDetail)
         : ({ id: 202, status: 'filled', avg_fill_price: 1.13 } as TradierOrderDetail);
     });
-    const cancelSpy = vi.fn(async () => undefined);
+    const cancelSpy = vi.fn(async (id: string | number) => cleanCancel(Number(id)));
     const client = buildClient({
       getOptionQuote: vi.fn(async () => ({ symbol: 'X', bid: 1.00, ask: 1.20 } as TradierOptionQuote)),
       buyContractsLimit: buySpy,
       waitForOrderTerminalStatus: waitSpy,
-      cancelOrder: cancelSpy,
+      cancelOrderConfirmed: cancelSpy,
     });
 
     const outcome = await submitSmartBuyToOpen(client, 'X', 3, { timeoutMs: 1, sleep: async () => {} });
@@ -154,19 +173,19 @@ describe('submitSmartBuyToOpen', () => {
     expect((outcome as { avgFillPrice: number }).avgFillPrice).toBeCloseTo(1.13, 2);
     expect(buySpy).toHaveBeenNthCalledWith(1, 'X', 3, 1.11);
     expect(buySpy).toHaveBeenNthCalledWith(2, 'X', 3, 1.13);
-    expect(cancelSpy).toHaveBeenCalledWith(201);
+    expect(cancelSpy.mock.calls[0][0]).toBe(201);
   });
 
   it('returns walk_exhausted after the final ask attempt without filling', async () => {
     // Always pending → walk should burn all 5 attempts then cancel and return.
     const buySpy = vi.fn(async () => ({ id: 999, status: 'ok' } as TradierOrderResponse));
     const waitSpy = vi.fn(async () => ({ id: 999, status: 'open' } as TradierOrderDetail));
-    const cancelSpy = vi.fn(async () => undefined);
+    const cancelSpy = vi.fn(async (id: string | number) => cleanCancel(Number(id)));
     const client = buildClient({
       getOptionQuote: vi.fn(async () => ({ symbol: 'X', bid: 1.00, ask: 1.20 } as TradierOptionQuote)),
       buyContractsLimit: buySpy,
       waitForOrderTerminalStatus: waitSpy,
-      cancelOrder: cancelSpy,
+      cancelOrderConfirmed: cancelSpy,
     });
 
     const outcome = await submitSmartBuyToOpen(client, 'X', 1, { timeoutMs: 1, sleep: async () => {} });
@@ -289,7 +308,7 @@ describe('submitSmartBuyToOpen — cross-tick config end to end', () => {
       getOptionQuote: vi.fn(async () => ({ symbol: 'X', bid: 1.0, ask: 1.2 } as TradierOptionQuote)),
       buyContractsLimit: buySpy,
       waitForOrderTerminalStatus: waitSpy,
-      cancelOrder: vi.fn(async () => undefined),
+      cancelOrderConfirmed: vi.fn(async (id: string | number) => cleanCancel(Number(id))),
     });
 
     const outcome = await submitSmartBuyToOpen(client, 'X', 1, {
@@ -313,7 +332,7 @@ describe('submitSmartBuyToOpen — cross-tick config end to end', () => {
       getOptionQuote: vi.fn(async () => ({ symbol: 'X', bid: 1.0, ask: 1.2 } as TradierOptionQuote)),
       buyContractsLimit: buySpy,
       waitForOrderTerminalStatus: vi.fn(async () => ({ id: 1, status: 'open' } as TradierOrderDetail)),
-      cancelOrder: vi.fn(async () => undefined),
+      cancelOrderConfirmed: vi.fn(async (id: string | number) => cleanCancel(Number(id))),
     });
 
     const outcome = await submitSmartBuyToOpen(client, 'X', 1, { timeoutMs: 1, sleep: async () => {} });
@@ -345,7 +364,7 @@ describe('submitSmartBuyToOpen — execution-quality telemetry wiring (TRA-2046)
       getOptionQuote: vi.fn(async () => ({ symbol: 'X', bid: 1.0, ask: 1.2 } as TradierOptionQuote)),
       buyContractsLimit: vi.fn(async () => ({ id: ++submitCount, status: 'ok' } as TradierOrderResponse)),
       waitForOrderTerminalStatus: vi.fn(async (id: number) => details.find((d) => d.id === id) ?? null),
-      cancelOrder: vi.fn(async () => undefined),
+      cancelOrderConfirmed: vi.fn(async (id: string | number) => cleanCancel(Number(id))),
     });
 
     const outcome = await submitSmartBuyToOpen(client, 'X', 2, {

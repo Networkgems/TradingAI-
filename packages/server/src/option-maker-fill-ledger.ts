@@ -42,7 +42,19 @@ export type MakerFillSide = 'open' | 'close';
  * carries fill metrics; the rest are recorded so the fill-RATE denominator is
  * every chase, not just the ones that filled.
  */
-export type MakerFillResult = 'filled' | 'walk_exhausted' | 'rejected' | 'no_quote' | 'pending';
+export type MakerFillResult =
+  | 'filled'
+  | 'walk_exhausted'
+  | 'rejected'
+  | 'no_quote'
+  | 'pending'
+  // TRA-4483 — the open-side walk's two new terminal readings. Given their own
+  // values rather than folded into a neighbour: `partial_fill` IS a fill (a
+  // position exists) and must not read as `walk_exhausted`, and `halted` is the
+  // ABSENCE of a broker verdict and must not read as either. Folding them in is
+  // how a chase that left unreconciled exposure would look like a quiet miss.
+  | 'partial_fill'
+  | 'halted';
 
 /**
  * One maker-chase attempt outcome. Optional metric fields are present only on a
