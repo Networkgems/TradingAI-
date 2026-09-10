@@ -68,6 +68,53 @@ a live session (step 14) — which is precisely what REFUSE would deny and RESTR
 a throttle failure (`index.ts:9396-9398`; 5 free, then exponential backoff), so a desk locked out
 mid-RTH is retrying into a backoff. The first drill run throttled itself at 6/10 redemptions.
 
+### 3. The exposed population on the live host is ZERO — counted, not assumed (2026-09-10)
+
+Both findings above are about *reachability*. Neither says how many accounts are actually sitting in
+the bad state today, and the ruling was being priced without that number. It is now measured, on
+`tradingai-bqb1`, read-only:
+
+```
+GET /api/auth/login  (admin) -> 200, 91-char token
+GET /api/admin/users          -> 200, 67 rows
+```
+
+| cell | count |
+| --- | --- |
+| accounts on the live host | **67** |
+| accounts with 2FA **enabled** | **0** |
+| accounts with an unusable email (`null` / `''` / no `@`) | **0** |
+| ⇒ accounts in the fail-open state (`enabled` ∧ no email) | **0** |
+
+The intersection is empty for two independent reasons, not one. **The fail-open branch at
+`index.ts:9278-9280` has never executed against live data, and cannot today.**
+
+**Why this is a measurement and not a blind instrument.** `twoFactor` is absent from 66 of the 67
+rows, and "field never rendered" would read *identically* to "nobody is enrolled" — the failure mode
+this issue's own drill was already burned by. The discriminator is that the projection is a
+**conditional spread**, not an unconditional strip (`users.ts:45-52`, byte-identical on the live SHA
+`eb8a1738` and on `main` — diffed, not assumed):
+
+```ts
+...(twoFactor ? { twoFactor: { enabled: twoFactor.enabled } } : {})
+```
+
+so the key appears whenever the record has one. The **positive control came from the live data
+itself**: exactly one row (`qa_tra2251_7b0483ee`, a QA fixture from 2026-07-25) renders
+`twoFactor: {enabled: false}`. The field demonstrably *can* appear on this route, on this build, for
+this data — so its absence elsewhere is a fact about the records, not about the serializer. Had any
+account been enrolled it would have read `enabled: true`.
+
+**Scope, stated honestly.** This is a point-in-time census of a host whose population is
+overwhelmingly QA fixtures, and 2FA can be enabled by any user at any time. It does **not** make the
+branch safe in perpetuity — it makes today's exposure zero, which is a statement about urgency, not
+about correctness. The ruling still has content: what the code should *do* when the state occurs.
+
+**And the trigger is still open in production.** TRA-4493's guard (`79938e1e`) is merged but **not
+deployed** — live is `eb8a1738`, 14 commits behind. So on the box as it runs right now,
+`PATCH /api/auth/me` still accepts a blank address. That costs nothing only because there are no
+enrolled accounts for it to downgrade.
+
 ## Why v1 was withdrawn rather than corrected by comment
 
 An accepted card ratifies **the payload**, not a later comment on the thread. v1's prompt carried
