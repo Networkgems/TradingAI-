@@ -71,6 +71,7 @@ import {
   journalRowsForBook,
   patchEodReportOptionsPnl,
   planOptionsDailyPnlRepair,
+  planOptionsDailyPnlRestatements,
   planEodReportOptionsSync,
   syncEodReportOptionsLegs,
   type OptionsDailyPnlDecision,
@@ -93,6 +94,11 @@ import {
   openOptionMarkUsdByDate,
   type OpenOptionMarkByDate,
 } from './tradier-eod-option-mark.js';
+// TRA-4506 — the stock-leg probe's broker-fee, basis-shift and trade-fee operands.
+import {
+  buildStockLegProbeReadOperands,
+  sumBrokerFeesOverSpan,
+} from './stock-leg-probe-operands.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { buildJournalCalendarCells, nonSessionCloseRetractions } from './reports/desk-calendar.js';
 import { foldDeskRows } from './test-accounts.js'; // TRA-2554 — the desk fold names itself on the wire
@@ -2952,6 +2958,28 @@ async function runOptionsDailyPnlRepair(): Promise<void> {
       // being produced in the same pass.
       const repaired = ctx.tracker.applyOptionsDailyPnlRepair(plan.deltas);
 
+      // TRA-4506 AC2 — the NAMED restatements: non-zero cells the journal later
+      // superseded, each proven against the broker and listed by date in
+      // `OPTIONS_DAILY_PNL_RESTATEMENTS`. Applied before the file pass for the
+      // same reason as the repair — the sync is driven off the persisted rows —
+      // and the sync now leaves a broker-override report's `combinedPnl` alone.
+      // Silent once applied: a restated row no longer holds `before`.
+      const restatement = planOptionsDailyPnlRestatements(
+        ctx.username,
+        ctx.tracker.getSnapshots(),
+        census,
+      );
+      const restated = ctx.tracker.applyOptionsDailyPnlRestatement(restatement.apply);
+      if (restated > 0 || restatement.refused.length > 0) {
+        log.warn('TRA-4506 named optionsDailyPnl restatement', {
+          username: ctx.username,
+          restated: restatement.apply.map(
+            r => `${r.date}:${r.before.toFixed(2)}->${r.after.toFixed(2)} (${r.ticket})`,
+          ),
+          refused: restatement.refused,
+        });
+      }
+
       // TRA-2641 — reconcile the report files across EVERY mode dir, not just
       // the one this book currently sits in. The day cell is mode-blind (that is
       // what `PnlTracker` is); the report file is mode-scoped. See
@@ -3750,6 +3778,8 @@ async function reconcileTradierLiveCalendar(
   prevDate: string;
   prevBalance: number;
   netCashFlow: number;
+  /** TRA-4506 AC1 — Σ `fee` events over the same span; `null` on a v1 record. */
+  brokerFeeUsd: number | null;
   anchorVerdict: BalanceAnchorVerdict;
 } | null> {
   if (mode === 'demo') return null;
@@ -3880,6 +3910,14 @@ async function reconcileTradierLiveCalendar(
     prev.date,
     reportDate,
   );
+  // TRA-4506 AC1 — the OTHER half of the same events: what `isCapitalMovement`
+  // keeps in P&L (a broker `fee`). Not subtracted from the cell — TRA-2906's
+  // ruling stands — but handed to the ledger-row writer as a named operand of the
+  // stock-leg probe, which otherwise reads a fee as stock motion. `null` on a v1
+  // record: its aggregate flow already carries the fee.
+  const brokerFeeUsd = cashFlowState.schema === 'v2-typed'
+    ? sumBrokerFeesOverSpan(cashFlowState.events, prev.date, reportDate)
+    : null;
   const pnl = computeBalanceDailyPnl(todayBalance, prev.balance, netCashFlow);
   if (pnl === null) return null;
 
@@ -3933,6 +3971,7 @@ async function reconcileTradierLiveCalendar(
     prevDate: prev.date,
     prevBalance: prev.balance,
     netCashFlow,
+    brokerFeeUsd,
     anchorVerdict,
   };
 }
@@ -6930,6 +6969,23 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
           tailCalendar,
           baselineDate,
         );
+        // TRA-4506 — the stock-leg probe's read-time operands (broker fee,
+        // mark basis shift, dated trade fees), from the three DURABLE per-book
+        // stores this book already has: the typed cash-event record, the EOD
+        // mark file and the journal census scoped above. Live books only — the
+        // probe is only ever stamped on a broker-shaped live row.
+        const probeReadOperandsByDate = mode === 'live'
+          ? await (async () => {
+            const cashFlow = await loadTradierCashFlow(ctx, 'production');
+            return buildStockLegProbeReadOperands({
+              dates: snapshots.map(s => s.date),
+              cashEvents: cashFlow.schema === 'v2-typed' ? cashFlow.events : null,
+              marks: await loadTradierOptionMarks(ctx, 'production'),
+              lots: bookRows,
+              etDate: (ts: number) => etDateString(new Date(ts)),
+            });
+          })()
+          : null;
         return {
           username: ctx.username,
           mode,
@@ -6975,6 +7031,8 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
             // TRA-3517 — arms the row/report `combinedPnl` agreement axis, the
             // reader that replaces `drift` where TRA-3349 suppressed it.
             eodPnlSourceByDate,
+            // TRA-4506 — the probe's read-time operands.
+            probeReadOperandsByDate,
           ),
         };
       }),

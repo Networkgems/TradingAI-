@@ -1,6 +1,11 @@
 import type { DailySnapshot } from './pnl-tracker.js';
 import { CLOSING_EQUITY_BASIS_BROKER, STOCK_LEG_PROBE_TOLERANCE_USD } from './pnl-tracker.js';
 import { isJournalAuthoritativeSource, journalRealizingEvents } from './options-daily-pnl-source.js';
+import type {
+  OptionBasisShiftNotMeasuredReason,
+  StockLegProbeReadOperands,
+  TradeFeeNotMeasuredReason,
+} from './stock-leg-probe-operands.js';
 // TRA-2888 — the permanent 07-30/07-31/08-03 gap ruling. `eod-ledger-gap.ts`
 // imports only a TYPE back from this module (`EodTailCalendar`), which erases at
 // compile time, so this is not a runtime cycle.
@@ -954,6 +959,56 @@ export interface PnlReconcileDay {
    * DIAGNOSIS: the verdict keys on the number.
    */
   stockLegProbeMarkBasis: string | null;
+  /**
+   * TRA-4506 — the WRITER's stamped probe, byte-for-byte. {@link stockLegProbeUsd}
+   * is now that number less the read-time operands below, each published beside
+   * it so the adjustment re-derives by subtraction:
+   *
+   *   stockLegProbeUsd = stockLegProbeRowUsd
+   *                      − (optionsDaily − optionsDailyPnlBeforeRestatement)  [restated rows]
+   *                      − brokerFee(read-time only)
+   *                      − openOptionMarkBasisShiftUsd − stockLegProbeTradeFeeUsd
+   *
+   * `null` exactly when the writer stamped no probe; the reader never manufactures
+   * one for an unmeasured row.
+   */
+  stockLegProbeRowUsd: number | null;
+  /**
+   * TRA-4506 AC1 — Σ non-capital broker events (`fee`) over this row's span,
+   * signed as posted. Stamped by the writer on rows written after this ticket;
+   * supplied at read time on older rows ONLY when the row's `netCashFlowUsd`
+   * provably excludes it (equals the typed record's capital-only flow) — a row
+   * whose flow was written off a v1 record already carries the fee, and
+   * subtracting it again would book it twice. `null` = not measured.
+   */
+  stockLegProbeBrokerFeeUsd: number | null;
+  /**
+   * TRA-4506 AC3 — Δ(broker cost basis − ledger lot basis) over this row's span.
+   * The mark operand differences Tradier's AVERAGE basis while `optionsDaily`
+   * realizes the ledger LOT; subtracting this re-states the mark on the lot. `0`
+   * wherever the two bases agree; non-zero where the broker averaged lots the
+   * ledger keeps apart (admin RIG 2026-08-26: −5.50). `null` = not measured —
+   * see {@link openOptionMarkBasisShiftReason}. Applied only where the row's mark
+   * delta is.
+   */
+  openOptionMarkBasisShiftUsd: number | null;
+  /** TRA-4506 AC3 — why {@link openOptionMarkBasisShiftUsd} is `null`; `null` when measured. */
+  openOptionMarkBasisShiftReason: OptionBasisShiftNotMeasuredReason | 'mark-not-differenced' | 'no-operands' | null;
+  /**
+   * TRA-4506 AC4 — −Σ broker commission on every option fill dated inside this
+   * row's span, from the journal's measured `feesUsd`. `optionsDaily` books
+   * gross, equity moves net, so each fill's fee otherwise reads as stock motion
+   * (v0nni 2026-08-25, three fills: −1.34). `null` = a fill in the span has no
+   * measured fee — see {@link stockLegProbeTradeFeeReason}.
+   */
+  stockLegProbeTradeFeeUsd: number | null;
+  /** TRA-4506 AC4 — why {@link stockLegProbeTradeFeeUsd} is `null`; `null` when measured. */
+  stockLegProbeTradeFeeReason: TradeFeeNotMeasuredReason | 'no-operands' | null;
+  /**
+   * TRA-4506 AC2 — `optionsDaily` before a named restatement
+   * (`optionsDailyPnlSource: 'journal-restated'`); `null` on every other row.
+   */
+  optionsDailyPnlBeforeRestatement: number | null;
   /**
    * TRA-3517 — the ROW's own `combinedPnl` (see {@link DailySnapshot.combinedPnl}),
    * as distinct from {@link eodCombined}, which is the REPORT FILE's.
@@ -3729,6 +3784,10 @@ export function reconcilePnl(
   // (every row reads `'override-not-computed'`), which is the safe direction —
   // omission cannot manufacture a green.
   eodPnlSourceByDate: ReadonlyMap<string, string> | null = null,
+  // TRA-4506 — the stock-leg probe's read-time operands per row date
+  // (`buildStockLegProbeReadOperands`). Optional so every existing caller keeps
+  // compiling; `null` applies nothing, and every new operand reads NOT MEASURED.
+  probeReadOperandsByDate: ReadonlyMap<string, StockLegProbeReadOperands> | null = null,
 ): PnlReconcileResult {
   const days: PnlReconcileDay[] = [...snapshots]
     .sort((a, b) => a.date.localeCompare(b.date))
@@ -3873,6 +3932,63 @@ export function reconcilePnl(
         s.optionsCreditedCumulative !== undefined && s.optionsCreditedCumulative !== null
           ? round2(s.optionsCreditedCumulative)
           : null;
+      // TRA-4506 — the probe's missing operands, each published beside the
+      // writer's own number. Every operand is subtracted ONLY from a probe the
+      // writer actually stamped: an unmeasured row stays unmeasured.
+      const finiteOrNull = (v: unknown): number | null =>
+        typeof v === 'number' && Number.isFinite(v) ? round2(v) : null;
+      const stockLegProbeRowUsd = finiteOrNull(s.stockLegProbeUsd);
+      const rowNetCashFlowUsd = finiteOrNull(s.netCashFlowUsd);
+      const rowOpenOptionMarkDeltaUsd = finiteOrNull(s.openOptionMarkDeltaUsd);
+      const ops = probeReadOperandsByDate?.get(s.date) ?? null;
+      // AC1. A row the post-TRA-4506 writer shaped CARRIES the key (even as
+      // `null`) and its probe already nets the fee; the reader adds nothing. An
+      // older row gets the typed record's figure only when its own stored flow
+      // equals the capital-only flow for the span — i.e. provably excludes the
+      // fee. A flow written off a v1 record includes it, and a second
+      // subtraction would book the fee twice.
+      const brokerFeeStampedByWriter = s.stockLegProbeBrokerFeeUsd !== undefined;
+      const readTimeBrokerFeeUsd =
+        !brokerFeeStampedByWriter && ops !== null
+          && ops.brokerFeeUsd !== null && ops.capitalFlowUsd !== null
+          && rowNetCashFlowUsd !== null
+          && Math.abs(rowNetCashFlowUsd - ops.capitalFlowUsd) < 0.005
+          ? ops.brokerFeeUsd
+          : null;
+      const stockLegProbeBrokerFeeUsd = brokerFeeStampedByWriter
+        ? finiteOrNull(s.stockLegProbeBrokerFeeUsd)
+        : readTimeBrokerFeeUsd;
+      // AC3. Only where the writer differenced a mark — the shift restates THAT
+      // operand's basis, and there is nothing to restate on a three-operand row.
+      const openOptionMarkBasisShiftReason: PnlReconcileDay['openOptionMarkBasisShiftReason'] =
+        ops === null
+          ? 'no-operands'
+          : rowOpenOptionMarkDeltaUsd === null
+            ? 'mark-not-differenced'
+            : ops.basisShiftReason;
+      const openOptionMarkBasisShiftUsd =
+        openOptionMarkBasisShiftReason === null ? ops!.basisShiftUsd : null;
+      // AC4.
+      const stockLegProbeTradeFeeReason: PnlReconcileDay['stockLegProbeTradeFeeReason'] =
+        ops === null ? 'no-operands' : ops.tradeFeeReason;
+      const stockLegProbeTradeFeeUsd =
+        stockLegProbeTradeFeeReason === null ? ops!.tradeFeeUsd : null;
+      // AC2. A NAMED restatement moved `optionsDaily` AFTER the writer stamped
+      // the probe off the old figure, so the probe is re-based onto the booked
+      // one: it subtracts `optionsDaily`, so it moves by −(after − before).
+      const optionsDailyPnlBeforeRestatement = finiteOrNull(s.optionsDailyPnlBeforeRestatement);
+      const restatementDeltaUsd = optionsDailyPnlBeforeRestatement === null
+        ? 0
+        : round2(optionsDaily - optionsDailyPnlBeforeRestatement);
+      const stockLegProbeUsd = stockLegProbeRowUsd === null
+        ? null
+        : round2(
+          stockLegProbeRowUsd
+          - restatementDeltaUsd
+          - (readTimeBrokerFeeUsd ?? 0)
+          - (openOptionMarkBasisShiftUsd ?? 0)
+          - (stockLegProbeTradeFeeUsd ?? 0),
+        );
       return {
         date: s.date,
         eodCombined,
@@ -3938,11 +4054,16 @@ export function reconcilePnl(
             : null,
         // `round2(null)` is 0, and a $0 probe is the PASSING state ("the stock
         // leg really was inert") — the one value an unmeasured probe must never
-        // be allowed to render as.
-        stockLegProbeUsd:
-          typeof s.stockLegProbeUsd === 'number' && Number.isFinite(s.stockLegProbeUsd)
-            ? round2(s.stockLegProbeUsd)
-            : null,
+        // be allowed to render as. TRA-4506 — the writer's number less the
+        // read-time operands, which ride beside it; `null` stays `null`.
+        stockLegProbeUsd,
+        stockLegProbeRowUsd,
+        stockLegProbeBrokerFeeUsd,
+        openOptionMarkBasisShiftUsd,
+        openOptionMarkBasisShiftReason,
+        stockLegProbeTradeFeeUsd,
+        stockLegProbeTradeFeeReason,
+        optionsDailyPnlBeforeRestatement: finiteOrNull(s.optionsDailyPnlBeforeRestatement),
         // TRA-3954 — the mark operands, same null discipline: a `0` here is the
         // "nothing open / nothing moved" reading and an uncaptured mark must
         // never render as it.
@@ -4301,7 +4422,14 @@ export function reconcilePnl(
       (d.netCashFlowUsd != null && Math.abs(d.netCashFlowUsd) > STOCK_LEG_PROBE_TOLERANCE_USD) ||
       // TRA-3954 — the fourth operand is checked like the other three.
       (d.openOptionMarkDeltaUsd != null
-        && Math.abs(d.openOptionMarkDeltaUsd) > STOCK_LEG_PROBE_TOLERANCE_USD)
+        && Math.abs(d.openOptionMarkDeltaUsd) > STOCK_LEG_PROBE_TOLERANCE_USD) ||
+      // TRA-4506 — and so are the operands the reader supplies.
+      (d.stockLegProbeBrokerFeeUsd != null
+        && Math.abs(d.stockLegProbeBrokerFeeUsd) > STOCK_LEG_PROBE_TOLERANCE_USD) ||
+      (d.openOptionMarkBasisShiftUsd != null
+        && Math.abs(d.openOptionMarkBasisShiftUsd) > STOCK_LEG_PROBE_TOLERANCE_USD) ||
+      (d.stockLegProbeTradeFeeUsd != null
+        && Math.abs(d.stockLegProbeTradeFeeUsd) > STOCK_LEG_PROBE_TOLERANCE_USD)
     );
   });
   const stockLegProbeOffendingDates = stockLegProbeRows

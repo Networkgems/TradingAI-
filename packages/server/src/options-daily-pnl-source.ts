@@ -41,6 +41,12 @@ export type OptionsDailyPnlSource =
   /** Rewritten from the journal by the historical repair (was a false zero). */
   | 'journal-repair'
   /**
+   * TRA-4506 — a NAMED restatement of a frozen, NON-zero cell onto the journal
+   * figure (see {@link OPTIONS_DAILY_PNL_RESTATEMENTS}). The prior value rides
+   * the row as `optionsDailyPnlBeforeRestatement`.
+   */
+  | 'journal-restated'
+  /**
    * No census was available (journal disabled, or the read failed), so the
    * legacy volatile-bucket figure was booked unchanged. NOT a silent fallback —
    * this value is what makes the degraded mode visible.
@@ -330,6 +336,97 @@ export function planOptionsDailyPnlRepair(
   };
 }
 
+/**
+ * TRA-4506 AC2 — one NAMED restatement of a frozen, non-zero day cell.
+ *
+ * `planOptionsDailyPnlRepair` deliberately leaves a non-zero cell alone even when
+ * it disagrees with the journal (TRA-2079: no silent rewrite of a number that may
+ * be right). This is the narrow exception, and it is narrow on purpose: each
+ * entry names the book, the date, the exact figure it replaces, the exact figure
+ * it books, and the ticket whose broker reconciliation proved it. A general
+ * "re-sync every superseded cell" pass was NOT built — the other superseded
+ * cells have not been reconciled against the broker, and the TRA-2886/2888
+ * refusal to restate banked rows still governs them.
+ */
+export interface OptionsDailyPnlRestatement {
+  username: string;
+  date: string;
+  /** The figure the row must still hold for the restatement to apply. */
+  before: number;
+  /** The figure it books — which the CURRENT journal census must also state. */
+  after: number;
+  ticket: string;
+}
+
+export const OPTIONS_DAILY_PNL_RESTATEMENTS: ReadonlyArray<OptionsDailyPnlRestatement> = [
+  // admin 2026-08-26 booked −15.24, which is the 2026-08-24 engine RIG lot
+  // (bought 08-21 @0.33, sold 08-24 @0.18 — already on the 08-24 row). The lot
+  // that actually closed on 08-26 is the desk re-buy (bought 08-24 @0.22, sold
+  // 08-26 @0.15, order 143384264): −7.00 gross, the journal's figure after the
+  // TRA-4082 repair of 2026-09-02, which never reached this frozen row. Gross, the
+  // convention every other live row carries. Reconciled against Tradier ***0154
+  // `/history` + `/gainloss` by CFO on TRA-4245 / TRA-4506.
+  { username: 'admin', date: '2026-08-26', before: -15.24, after: -7, ticket: 'TRA-4506' },
+];
+
+export type OptionsDailyPnlRestatementRefusal =
+  /** The manifest names a date this book has no row for. */
+  | 'row-absent'
+  /** The row was not journal-booked, so the journal is not its authority. */
+  | 'source-not-journal'
+  /** The row no longer holds `before` — someone else moved it; never overwrite that. */
+  | 'row-moved'
+  /** The current journal census does not state `after`; the proof no longer holds. */
+  | 'journal-disagrees';
+
+export interface OptionsDailyPnlRestatementPlan {
+  apply: Array<{ date: string; before: number; after: number; ticket: string }>;
+  refused: Array<{ date: string; ticket: string; reason: OptionsDailyPnlRestatementRefusal }>;
+}
+
+/**
+ * Plan the named restatements for one book. Pure — the caller persists.
+ *
+ * Applies an entry only when BOTH witnesses still hold: the row carries exactly
+ * `before` on a journal-authoritative source, AND the live journal census for
+ * that date is exactly `after`. Either failing is a named refusal, never a
+ * partial write. An entry already applied (`'journal-restated'` at `after`) is
+ * silent, which is what keeps this a no-op on every later boot.
+ */
+export function planOptionsDailyPnlRestatements(
+  username: string,
+  snapshots: ReadonlyArray<DailySnapshot>,
+  censusByDate: ReadonlyMap<string, JournalDayCloses>,
+  manifest: ReadonlyArray<OptionsDailyPnlRestatement> = OPTIONS_DAILY_PNL_RESTATEMENTS,
+): OptionsDailyPnlRestatementPlan {
+  const plan: OptionsDailyPnlRestatementPlan = { apply: [], refused: [] };
+  for (const e of manifest) {
+    if (e.username !== username) continue;
+    const s = snapshots.find(r => r.date === e.date);
+    if (!s) {
+      plan.refused.push({ date: e.date, ticket: e.ticket, reason: 'row-absent' });
+      continue;
+    }
+    const current = round2(s.optionsDailyPnl ?? 0);
+    if (s.optionsDailyPnlSource === 'journal-restated' && current === round2(e.after)) continue;
+    if (!isJournalAuthoritativeSource(s.optionsDailyPnlSource)) {
+      plan.refused.push({ date: e.date, ticket: e.ticket, reason: 'source-not-journal' });
+      continue;
+    }
+    if (current !== round2(e.before)) {
+      plan.refused.push({ date: e.date, ticket: e.ticket, reason: 'row-moved' });
+      continue;
+    }
+    const census = censusByDate.get(e.date);
+    if (!census || round2(census.realizedPnlUsd) !== round2(e.after)) {
+      plan.refused.push({ date: e.date, ticket: e.ticket, reason: 'journal-disagrees' });
+      continue;
+    }
+    plan.apply.push({ date: e.date, before: current, after: round2(e.after), ticket: e.ticket });
+  }
+  return plan;
+}
+
 /** One dated report file whose options leg must be brought onto the journal figure. */
 export interface EodReportOptionsSyncTarget {
   date: string;
@@ -402,7 +499,7 @@ export interface EodReportOptionsSyncTarget {
  * really was independent. One definition, two consumers (TRA-2641/TRA-2630).
  */
 export function isJournalAuthoritativeSource(source: string | null | undefined): boolean {
-  return source === 'journal' || source === 'journal-repair';
+  return source === 'journal' || source === 'journal-repair' || source === 'journal-restated';
 }
 
 export function planEodReportOptionsSync(
@@ -515,7 +612,17 @@ export interface PatchableEodReport {
   realizedPnl?: number;
   combinedPnl?: number;
   markdown?: string;
+  /** TRA-1192 — `'tradier-balance'` = `combinedPnl` is the broker's day delta. */
+  pnlSource?: string;
 }
+
+/**
+ * TRA-4506 — `pnlSource` of a report whose `combinedPnl` the TRA-359 override
+ * wrote from the broker balance delta. Same literal as
+ * `EOD_PNL_SOURCE_BROKER_OVERRIDE` in `pnl-reconciliation.ts`, restated here
+ * because that module value-imports from this one.
+ */
+const BROKER_OVERRIDE_PNL_SOURCE = 'tradier-balance';
 
 /**
  * Re-book a report's options leg from `value`, keeping the rendered markdown in
@@ -532,7 +639,13 @@ export interface PatchableEodReport {
  * currently reads clean.
  *
  * `combinedPnl` is recomputed as `realizedPnl + optionsPnl`, exactly as
- * `generateEodReport` computes it (eod-report.ts:788).
+ * `generateEodReport` computes it (eod-report.ts:788) — EXCEPT on a report the
+ * TRA-359 override already wrote (`pnlSource: 'tradier-balance'`). There
+ * `combinedPnl` is the BROKER's balance delta, the figure the live calendar
+ * shows, and it does not decompose into the engine legs at all; recomputing it
+ * would replace a broker-truth cell with an engine sum. Only the options leg
+ * moves on such a report (TRA-4506: the boot sync re-books a restated live row's
+ * options leg into its file on every boot).
  */
 export function patchEodReportOptionsPnl<T extends PatchableEodReport>(
   report: T,
@@ -541,6 +654,7 @@ export function patchEodReportOptionsPnl<T extends PatchableEodReport>(
   const nextOptions = round2(value);
   const prevOptions = round2(report.optionsPnl ?? 0);
   if (nextOptions === prevOptions) return report;
+  const brokerCell = report.pnlSource === BROKER_OVERRIDE_PNL_SOURCE;
   const realizedPnl = report.realizedPnl ?? 0;
   const nextCombined = round2(realizedPnl + nextOptions);
   const prevCombined = round2(report.combinedPnl ?? 0);
@@ -551,13 +665,20 @@ export function patchEodReportOptionsPnl<T extends PatchableEodReport>(
       `| Options P&L | ${pnlSign(prevOptions)} |`,
       `| Options P&L | ${pnlSign(nextOptions)} |`,
     );
-    markdown = markdown.replace(
-      `| **Combined P&L** | **${pnlSign(prevCombined)}** |`,
-      `| **Combined P&L** | **${pnlSign(nextCombined)}** |`,
-    );
+    if (!brokerCell) {
+      markdown = markdown.replace(
+        `| **Combined P&L** | **${pnlSign(prevCombined)}** |`,
+        `| **Combined P&L** | **${pnlSign(nextCombined)}** |`,
+      );
+    }
   }
 
-  return { ...report, optionsPnl: nextOptions, combinedPnl: nextCombined, ...(markdown != null ? { markdown } : {}) };
+  return {
+    ...report,
+    optionsPnl: nextOptions,
+    ...(brokerCell ? {} : { combinedPnl: nextCombined }),
+    ...(markdown != null ? { markdown } : {}),
+  };
 }
 
 function round2(n: number): number {

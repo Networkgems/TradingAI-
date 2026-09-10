@@ -426,6 +426,13 @@ export function shapeLiveRecordedRow(args: {
     prevBalance: number;
     netCashFlow: number;
     combinedPnl: number;
+    /**
+     * TRA-4506 AC1 — Σ non-capital broker events (`fee`) over the SAME span as
+     * `netCashFlow`, or `null` when the cash record is v1-aggregate (its flow
+     * already carries the fee). Optional so pre-existing callers keep compiling;
+     * absent reads as `null`.
+     */
+    brokerFeeUsd?: number | null;
   } | null;
   /**
    * TRA-3954 — EOD unrealized P&L on open option positions per session
@@ -439,6 +446,7 @@ export function shapeLiveRecordedRow(args: {
   'openingEquity' | 'openingEquityBasis' | 'closingEquity' | 'closingEquityBasis'
   | 'dailyPnl' | 'combinedPnl' | 'stockLegBasis' | 'stockLegProbeUsd' | 'netCashFlowUsd'
   | 'openOptionMarkUsd' | 'openOptionMarkDeltaUsd' | 'stockLegProbeMarkBasis'
+  | 'stockLegProbeBrokerFeeUsd'
 > {
   const { date, optionsDailyPnl, balanceByDate, override, optionMarkUsdByDate } = args;
   const round2 = (n: number): number => Math.round(n * 100) / 100;
@@ -478,11 +486,21 @@ export function shapeLiveRecordedRow(args: {
   // must never impersonate.
   const { markUsd: openOptionMarkUsd, deltaUsd: openOptionMarkDeltaUsd } =
     resolveOpenOptionMarkDelta(optionMarkUsdByDate, date, prev === null ? null : prev.date);
+  // TRA-4506 AC1 — the FEE operand. A broker `fee` is in P&L by TRA-2906's
+  // ruling, so `netCashFlowUsd` excludes it and nothing else here books it: the
+  // probe read admin's 2026-09-03 $10 fee as −10.12 of stock motion. `null` (a
+  // v1 record, whose flow already carries the fee) subtracts nothing.
+  const stockLegProbeBrokerFeeUsd =
+    override !== null && typeof override.brokerFeeUsd === 'number'
+      && Number.isFinite(override.brokerFeeUsd)
+      ? round2(override.brokerFeeUsd)
+      : null;
   const stockLegProbeUsd =
     closingEquity !== null && openingEquity !== null && netCashFlowUsd !== null
       ? round2(
         closingEquity - openingEquity - optionsDailyPnl - netCashFlowUsd
-        - (openOptionMarkDeltaUsd ?? 0),
+        - (openOptionMarkDeltaUsd ?? 0)
+        - (stockLegProbeBrokerFeeUsd ?? 0),
       )
       : null;
   const probeDisagrees =
@@ -509,6 +527,9 @@ export function shapeLiveRecordedRow(args: {
       openOptionMarkDeltaUsd === null
         ? STOCK_LEG_PROBE_MARK_NOT_MEASURED
         : STOCK_LEG_PROBE_MARK_DIFFERENCED,
+    // Always WRITTEN, `null` included: the reader keys on the key's presence to
+    // know this writer already subtracted the fee (TRA-4506).
+    stockLegProbeBrokerFeeUsd,
   };
 }
 

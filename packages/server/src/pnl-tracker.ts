@@ -98,7 +98,8 @@ export interface DailySnapshot {
    * TRA-2314 — which source booked `optionsDailyPnl` (see
    * `options-daily-pnl-source.ts`). `'journal'` = the durable option-trade
    * journal, `'journal-repair'` = rewritten from the journal by the historical
-   * repair, `'bucket-*'` = the legacy volatile in-memory bucket. Absent on rows
+   * repair, `'journal-restated'` = a named TRA-4506 restatement of a non-zero
+   * cell, `'bucket-*'` = the legacy volatile in-memory bucket. Absent on rows
    * written before this ticket, which were ALL bucket-sourced.
    *
    * This field is what gives the repair a failing state. Without it a repaired
@@ -286,6 +287,25 @@ export interface DailySnapshot {
    * probe NUMBER, never on this string.
    */
   stockLegProbeMarkBasis?: string;
+  /**
+   * TRA-4506 AC1 — the broker-FEE operand the writer subtracted from
+   * {@link DailySnapshot.stockLegProbeUsd}: Σ non-capital broker events (today
+   * exactly `fee`) over the same span as `netCashFlowUsd`, signed as posted (a $10
+   * fee is −10). `netCashFlowUsd` excludes fees by TRA-2906's ruling, so without
+   * this term a fee read as unbooked stock motion (admin 2026-09-03, −10.12).
+   * `null` = not measured (a v1-aggregate cash record, whose flow already carries
+   * the fee). ABSENT on every row written before this ticket — the reader then
+   * supplies the operand itself, and PRESENCE (even `null`) tells it not to.
+   */
+  stockLegProbeBrokerFeeUsd?: number | null;
+  /**
+   * TRA-4506 AC2 — `optionsDailyPnl` as it stood before a NAMED restatement
+   * (`optionsDailyPnlSource: 'journal-restated'`). Carried on the row so the
+   * correction is auditable from the row alone.
+   */
+  optionsDailyPnlBeforeRestatement?: number;
+  /** TRA-4506 AC2 — the ticket that authorized the restatement. */
+  optionsDailyPnlRestatedBy?: string;
   trades: number;
 }
 
@@ -869,6 +889,42 @@ export class PnlTracker {
       writeFileSync(this.snapshotsFile, JSON.stringify(this.snapshots, null, 2), 'utf-8');
     }
     return repaired;
+  }
+
+  /**
+   * TRA-4506 AC2 — apply the NAMED restatements `planOptionsDailyPnlRestatements`
+   * cleared. Sibling of {@link applyOptionsDailyPnlRepair}, for the case that one
+   * deliberately refuses: a NON-zero cell the journal later superseded. It
+   * rewrites `optionsDailyPnl` only, stamps `'journal-restated'`, and keeps the
+   * prior figure and the authorizing ticket on the row. `combinedPnl`, the
+   * equity anchors and the stamped probe are left as written — on a live row
+   * `combinedPnl` is the broker's figure, which was never wrong.
+   *
+   * Idempotent through the planner: a restated row no longer holds `before`, so
+   * the next boot plans nothing.
+   */
+  applyOptionsDailyPnlRestatement(
+    entries: ReadonlyArray<{ date: string; before: number; after: number; ticket: string }>,
+  ): number {
+    if (entries.length === 0) return 0;
+    const byDate = new Map(entries.map(e => [e.date, e]));
+    let restated = 0;
+    this.snapshots = this.snapshots.map(s => {
+      const e = byDate.get(s.date);
+      if (!e) return s;
+      restated += 1;
+      return {
+        ...s,
+        optionsDailyPnl: e.after,
+        optionsDailyPnlSource: 'journal-restated',
+        optionsDailyPnlBeforeRestatement: e.before,
+        optionsDailyPnlRestatedBy: e.ticket,
+      };
+    });
+    if (restated > 0) {
+      writeFileSync(this.snapshotsFile, JSON.stringify(this.snapshots, null, 2), 'utf-8');
+    }
+    return restated;
   }
 
   /**
