@@ -333,6 +333,27 @@ export interface ExitParams {
    * the time stop entirely for swing-held rows.
    */
   timeStopTradingDays?: number;
+  /**
+   * TRA-4500 (parent TRA-4290/TRA-4230, D1) — DTE-proportional minimum hold on
+   * the two CHURN exits, `time_stop` and `ma20_close_through`. Neither may fire
+   * on a position whose {@link ExitState.entryDte} is ≥
+   * {@link ExitParams.dteMinHoldEntryDteFloor} until
+   * `max(1, dteMinHoldFactor × entryDte)` full trading sessions have elapsed
+   * (per {@link ExitState.tradingDaysHeld}). TRA-4230 measured these two exits
+   * booking ~34-DTE options out after 33 min–2 h — 39% of desk closes, net
+   * −7.8R to −36.6R once the measured spread cross is charged. Default 0.10
+   * (34 DTE ⇒ 3.4 sessions). The gate binds ONLY the two churn exits: the
+   * premium stop / take-profit above it and the `supertrend_flip` structural
+   * exit are untouched, and the account-level stop family (`sl`, chandeliers,
+   * `profit_lock`, `trail`) never flows through this function at all.
+   */
+  dteMinHoldFactor?: number;
+  /**
+   * TRA-4500 (D1) — entry-DTE floor at which the churn-exit minimum hold
+   * engages. Positions with `entryDte` below this keep the legacy behaviour.
+   * Default 21.
+   */
+  dteMinHoldEntryDteFloor?: number;
 }
 
 export const DEFAULT_EXIT_PARAMS: ExitParams = {
@@ -346,6 +367,12 @@ export const DEFAULT_EXIT_PARAMS: ExitParams = {
   // baseline behaviour (it only activates when the caller marks the state
   // `swingHeld`; bar-driven callers are unaffected).
   timeStopTradingDays: 4,
+  // TRA-4500 (D1) — in the default set so every params object built by
+  // spreading DEFAULT_EXIT_PARAMS (the RV re-tune branches included) carries
+  // the churn-exit minimum hold. Only activates when the caller supplies
+  // `ExitState.entryDte`; state-less callers (backtests) are byte-identical.
+  dteMinHoldFactor: 0.1,
+  dteMinHoldEntryDteFloor: 21,
 };
 
 export type ExitReason =
@@ -401,6 +428,16 @@ export interface ExitState {
    * bar's through-state.
    */
   recentMa20Through?: boolean[];
+  /**
+   * TRA-4500 (D1) — calendar days to expiration AT ENTRY. Consulted only by
+   * the churn-exit minimum hold ({@link ExitParams.dteMinHoldFactor}): when
+   * present and ≥ {@link ExitParams.dteMinHoldEntryDteFloor}, `time_stop` and
+   * `ma20_close_through` are held until the position has been held
+   * `max(1, dteMinHoldFactor × entryDte)` trading sessions (per
+   * {@link ExitState.tradingDaysHeld}). Absent ⇒ the gate is inert (legacy
+   * behaviour for callers that do not track entry DTE).
+   */
+  entryDte?: number;
 }
 
 /**
@@ -437,6 +474,20 @@ export function evaluateExit(state: ExitState, params: ExitParams = DEFAULT_EXIT
         recent.length >= confirmBars &&
         recent.slice(-confirmBars).every(d => d === flippedDir)));
 
+  // TRA-4500 (D1) — DTE-proportional minimum hold on the two CHURN exits
+  // (`ma20_close_through`, `time_stop`): a ~34-DTE position must not be booked
+  // out by a 20-period intraday rule or a bar-count stall inside its first
+  // sessions (TRA-4230: 39% of desk closes, 33 min–2 h holds, net negative once
+  // the spread cross is charged). `entryDte` absent ⇒ inert (legacy callers).
+  // With `entryDte` present but `tradingDaysHeld` absent the gate HOLDS the two
+  // churn exits (conservative, matching the confirm-bars absent-history rule)
+  // rather than fire on an unmeasured hold. The premium stop / take-profit
+  // above and the `supertrend_flip` exit are DELIBERATELY outside this gate.
+  const churnMinHoldMet =
+    state.entryDte === undefined ||
+    state.entryDte < (params.dteMinHoldEntryDteFloor ?? 21) ||
+    (state.tradingDaysHeld ?? 0) >= Math.max(1, (params.dteMinHoldFactor ?? 0.1) * state.entryDte);
+
   // Structure-based exits.
   if (params.supertrendFlipExit && flipConfirmed) {
     // TRA-1480 (v2) — winner-protect P&L gate. When
@@ -464,7 +515,10 @@ export function evaluateExit(state: ExitState, params: ExitParams = DEFAULT_EXIT
         (maRecent !== undefined &&
           maRecent.length >= maConfirmBars &&
           maRecent.slice(-maConfirmBars).every(Boolean));
-      if (maConfirmed) return 'ma20_close_through';
+      // TRA-4500 (D1) — a confirmed close-through still waits out the
+      // DTE-proportional minimum hold; the row falls through to the (equally
+      // gated) time stop and, in the caller, to the untouched stop family.
+      if (maConfirmed && churnMinHoldMet) return 'ma20_close_through';
     }
   }
 
@@ -476,16 +530,23 @@ export function evaluateExit(state: ExitState, params: ExitParams = DEFAULT_EXIT
   // rejected in TRA-2946). The trading-day stop additionally requires the
   // Supertrend confirmed AGAINST the position — a stale row whose trend is
   // still with it keeps riding to the risk-side exits.
+  // TRA-4500 (D1) — both time-stop arms sit behind the churn minimum hold.
   if (state.swingHeld && params.timeStopTradingDays !== undefined) {
     if (
       params.timeStopTradingDays > 0 &&
       (state.tradingDaysHeld ?? 0) >= params.timeStopTradingDays &&
       !state.hadFollowThrough &&
-      flipConfirmed
+      flipConfirmed &&
+      churnMinHoldMet
     ) {
       return 'time_stop';
     }
-  } else if (params.timeStopBars > 0 && state.barsHeld >= params.timeStopBars && !state.hadFollowThrough) {
+  } else if (
+    params.timeStopBars > 0 &&
+    state.barsHeld >= params.timeStopBars &&
+    !state.hadFollowThrough &&
+    churnMinHoldMet
+  ) {
     return 'time_stop';
   }
 

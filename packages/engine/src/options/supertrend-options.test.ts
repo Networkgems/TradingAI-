@@ -218,6 +218,108 @@ describe('evaluateExit (parameterized exit rules)', () => {
   });
 });
 
+describe('evaluateExit — TRA-4500 DTE-proportional minimum hold on the churn exits', () => {
+  // Long call, trend still green, premium flat: only the ma20 / time-stop
+  // branches can trigger, which isolates the churn-hold behaviour.
+  const base: ExitState = {
+    side: 'buy',
+    supertrendDirection: 'green',
+    underlyingClose: 105,
+    ma20: 100,
+    entryPremium: 2,
+    currentPremium: 2,
+    barsHeld: 1,
+    hadFollowThrough: true,
+  };
+  // 34 DTE (the measured desk cohort) ⇒ minHold = max(1, 0.10 × 34) = 3.4
+  // trading sessions.
+  const dte34 = { entryDte: 34 };
+
+  it('holds a confirmed ma20 close-through inside the minimum hold (34 DTE, 0 sessions held)', () => {
+    expect(evaluateExit({ ...base, ...dte34, underlyingClose: 99, tradingDaysHeld: 0 })).toBeNull();
+  });
+  it('holds the ma20 close-through at 3 sessions held (3 < 3.4)', () => {
+    expect(evaluateExit({ ...base, ...dte34, underlyingClose: 99, tradingDaysHeld: 3 })).toBeNull();
+  });
+  it('releases the ma20 close-through once the hold has elapsed (4 ≥ 3.4)', () => {
+    expect(evaluateExit({ ...base, ...dte34, underlyingClose: 99, tradingDaysHeld: 4 })).toBe(
+      'ma20_close_through',
+    );
+  });
+  it('holds the bar-count time stop inside the minimum hold', () => {
+    expect(
+      evaluateExit({ ...base, ...dte34, barsHeld: 9, hadFollowThrough: false, tradingDaysHeld: 0 }),
+    ).toBeNull();
+  });
+  it('releases the bar-count time stop once the hold has elapsed', () => {
+    expect(
+      evaluateExit({ ...base, ...dte34, barsHeld: 9, hadFollowThrough: false, tradingDaysHeld: 4 }),
+    ).toBe('time_stop');
+  });
+  it('holds the swing-held trading-day time stop until the DTE hold elapses (60 DTE ⇒ 6 sessions)', () => {
+    // 60 DTE ⇒ minHold 6 > timeStopTradingDays 4, so at 4 sessions the swing
+    // arm's own threshold is met but the churn hold still refuses it. The
+    // confirmed flip's winner-protect gate (-20%) is kept shut by the -5%
+    // premium so only the time stop can fire (the TRA-2949 test pattern).
+    const params = {
+      ...DEFAULT_EXIT_PARAMS,
+      supertrendFlipConfirmBars: 2,
+      supertrendFlipMinLossPctToExit: -0.2,
+    };
+    const swing: ExitState = {
+      ...base,
+      entryDte: 60,
+      swingHeld: true,
+      supertrendDirection: 'red',
+      recentSupertrendDirections: ['red', 'red'],
+      currentPremium: 1.9,
+      hadFollowThrough: false,
+    };
+    expect(evaluateExit({ ...swing, tradingDaysHeld: 4 }, params)).toBeNull();
+    expect(evaluateExit({ ...swing, tradingDaysHeld: 6 }, params)).toBe('time_stop');
+  });
+  it('is inert below the 21-DTE floor (legacy behaviour)', () => {
+    expect(
+      evaluateExit({ ...base, entryDte: 20, barsHeld: 5, hadFollowThrough: false, tradingDaysHeld: 0 }),
+    ).toBe('time_stop');
+    expect(evaluateExit({ ...base, entryDte: 20, underlyingClose: 99, tradingDaysHeld: 0 })).toBe(
+      'ma20_close_through',
+    );
+  });
+  it('is inert when entryDte is absent (legacy callers)', () => {
+    expect(evaluateExit({ ...base, underlyingClose: 99, tradingDaysHeld: 0 })).toBe(
+      'ma20_close_through',
+    );
+  });
+  it('holds conservatively when entryDte ≥ floor but tradingDaysHeld is unsupplied', () => {
+    expect(evaluateExit({ ...base, ...dte34, underlyingClose: 99 })).toBeNull();
+  });
+  it('enforces the 1-full-session floor when the factor alone would allow less', () => {
+    // Custom floor 5 so an 8-DTE row engages the gate: 0.10 × 8 = 0.8 < 1 ⇒
+    // minHold clamps to 1 full session.
+    const params = { ...DEFAULT_EXIT_PARAMS, dteMinHoldEntryDteFloor: 5 };
+    expect(
+      evaluateExit({ ...base, entryDte: 8, underlyingClose: 99, tradingDaysHeld: 0 }, params),
+    ).toBeNull();
+    expect(
+      evaluateExit({ ...base, entryDte: 8, underlyingClose: 99, tradingDaysHeld: 1 }, params),
+    ).toBe('ma20_close_through');
+  });
+  it('never touches the risk-side exits: the premium stop fires on tick one of a 34-DTE row', () => {
+    expect(evaluateExit({ ...base, ...dte34, currentPremium: 1.0, tradingDaysHeld: 0 })).toBe(
+      'premium_stop',
+    );
+  });
+  it('never touches the take-profit or the supertrend flip', () => {
+    expect(evaluateExit({ ...base, ...dte34, currentPremium: 4.0, tradingDaysHeld: 0 })).toBe(
+      'premium_take_profit',
+    );
+    expect(
+      evaluateExit({ ...base, ...dte34, supertrendDirection: 'red', tradingDaysHeld: 0 }),
+    ).toBe('supertrend_flip');
+  });
+});
+
 describe('evaluateExit — TRA-1409 confirmed N-bar Supertrend flip', () => {
   // Long call; underlying above MA20 and no premium move, so ONLY the flip logic
   // can trigger an exit (isolates the confirm-bars behaviour).

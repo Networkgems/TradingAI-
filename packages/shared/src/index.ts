@@ -3652,6 +3652,20 @@ export interface OptionPosition {
    */
   engineOriginSleeve?: 'single_leg_rv' | 'single_leg_otm' | 'single_leg_directional';
   /**
+   * TRA-4500 (D2, parent TRA-4290/TRA-4230) — the journal STRUCTURE label this
+   * open stamped (`journalSetup.structureLabel ?? 'single_leg_rv'`, the exact
+   * expression `queueJournalOpen` receives), persisted on the position so the
+   * exit cascade can scope `ma20_close_through` OUT of `single_leg_rv` — a
+   * 20-period intraday close-through rule has no business closing a ~34-DTE
+   * position — without re-deriving which caller opened the row. Set by
+   * `openOptionFromRvCandidate` only (the sole producer of the two labels this
+   * discrimination is about); rows opened before this shipped fall back to
+   * `engineOriginSleeve` at the exit site and, when that is also absent, keep
+   * the pre-TRA-4500 exit set (the TRA-4500 D1 DTE-hold still binds them via
+   * `entryDte`, which needs no stamp).
+   */
+  journalStructure?: string;
+  /**
    * TRA-3943 (parent TRA-3927, board card `a29b2db8`) — the SPOT LEVEL at which
    * this row's thesis is invalidated: `underlyingEntryPrice ∓ atrMult ×
    * ATR(14, DAILY)`, stamped ONCE at entry and never moved. Below it for a call,

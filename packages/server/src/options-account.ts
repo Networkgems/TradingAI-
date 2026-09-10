@@ -8930,6 +8930,13 @@ export class PaperOptionsAccount {
       openedAt: Date.now(),
       signalId: signal.id,
       signalType: 'relative_value',
+      // TRA-4500 (D2) — persist the SAME structure label the journal open below
+      // stamps (`structureLabel ?? 'single_leg_rv'`), so the exit cascade can
+      // scope `ma20_close_through` out of `single_leg_rv` at close-decision
+      // time. Every `signalType: 'relative_value'` row is born here, so this is
+      // the one stamp site; the journal row and the exit decision can never
+      // file the row under two different sleeve names.
+      journalStructure: journalSetup?.structureLabel ?? 'single_leg_rv',
       mode,
       ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
       // TRA-3990 — see `openOptionFromCandidate`.
@@ -11034,6 +11041,28 @@ export class PaperOptionsAccount {
           // account owns both predicates, so the state is stamped here rather
           // than in the engine's per-tick state build.
           const swingHeld = (opt.mode ?? 'demo') === 'live' || this.swingHoldOptions;
+          // TRA-4500 (D2) — `ma20_close_through` is scoped OUT of
+          // `single_leg_rv` entirely: a 20-period intraday close-through rule
+          // on a ~34-DTE option is a timeframe error (TRA-4230: 25 of 29 desk
+          // ma20 firings landed in the sleeve with the worst measured spread
+          // cross). The row's own birth stamp decides; pre-stamp rows resolve
+          // via the durable `engineOriginSleeve`, and rows with neither keep
+          // the legacy exit set — the D1 DTE-hold below still binds them.
+          // `single_leg_directional` keeps its ma20 exit (not ordered off).
+          const rowStructure = opt.journalStructure ?? opt.engineOriginSleeve;
+          const baseExitParams = rvExitParams ?? DEFAULT_EXIT_PARAMS;
+          const structuralExitParams =
+            rowStructure === 'single_leg_rv'
+              ? { ...baseExitParams, ma20CloseThroughExit: false }
+              : baseExitParams;
+          // TRA-4500 (D1) — entry DTE for the engine's churn-exit minimum hold
+          // (`max(1, 0.10 × entryDte)` trading sessions before `time_stop` /
+          // `ma20_close_through` may fire on an entryDte ≥ 21 row). Derived
+          // from the row itself so it covers every open position, stamped or
+          // not. The stop family below/above this block never sees the gate.
+          const entryDte = opt.expiration
+            ? dteFromExpiration(opt.expiration, opt.openedAt)
+            : null;
           const reason = evaluateExit(
             {
               ...exitState,
@@ -11041,8 +11070,9 @@ export class PaperOptionsAccount {
               entryPremium: opt.premiumPaid,
               swingHeld,
               tradingDaysHeld: tradingDaysBetween(opt.openedAt, Date.now()),
+              ...(entryDte !== null ? { entryDte } : {}),
             },
-            rvExitParams ?? DEFAULT_EXIT_PARAMS,
+            structuralExitParams,
           );
           if (reason === 'supertrend_flip' || reason === 'ma20_close_through' || reason === 'time_stop') {
             stampOpeningRangeFire(opt, mark); // TRA-4020 (R4)
