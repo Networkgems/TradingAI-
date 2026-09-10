@@ -198,6 +198,13 @@ export interface BlockAttribution {
   /** Share of the measured lag the considered `sync` phase accounts for, or null. */
   explainedFraction: number | null;
   /**
+   * TRA-3660 (trip #14) — the `sync` record the verdict actually graded: the
+   * largest in-window one from the ring, which is NOT necessarily the trip's
+   * `slowSyncPhase` (the most recent). Null when the ring was read and held no
+   * candidate; absent when the ring was not consulted.
+   */
+  syncPhase?: SlowPhase | null;
+  /**
    * TRA-3660 (2026-08-19, second instance) — the SAMPLER's own view of the same
    * window, which does not depend on a slow sync phase existing at all.
    *
@@ -255,6 +262,13 @@ export function classifyBlockAttribution(input: {
    * "no pause in the window" (`gc: null`) from "nobody looked" (`gc` absent).
    */
   gcPauses?: readonly GcPause[];
+  /**
+   * TRA-3660 (trip #14, 2026-09-10) — the phase ring (both kinds, tagged). When
+   * given, the verdict grades the LARGEST in-window `sync` record instead of
+   * `slowSyncPhase` (the most RECENT one), and names the record it graded in
+   * `syncPhase`. Omit it and the output is byte-identical to before.
+   */
+  recentSyncPhases?: readonly SlowPhase[];
 }): BlockAttribution {
   const windowMs = Math.max(0, input.lagMaxMs) + Math.max(0, input.sampleMs) + ATTRIBUTION_SLACK_MS;
   if (input.reason !== 'block' && input.reason !== 'lag') {
@@ -280,21 +294,36 @@ export function classifyBlockAttribution(input: {
       return { verdict: 'gc-attributed', windowMs, syncPhaseAgeMs: null, explainedFraction: explainedByGc, gc: gcWindow };
     }
   }
-  const phase = input.slowSyncPhase;
+  // TRA-3660 (trip #14, 2026-09-10) — `slowSyncPhase` is the most RECENT sync
+  // record, and for yield-preempt witnesses of one block that is structurally the
+  // SMALLEST: yields resume FIFO, so the longest-waiting one records first and
+  // every shorter witness overwrites it. The live trip graded a 1123ms witness
+  // (`partial`, 0.168) while the ring held a 6104ms witness of the same block
+  // (0.912). Grade the largest in-window sync record instead. Witnesses overlap
+  // rather than sum, so the max is the conservative reading; `async` records
+  // (incl. the `#span` demotions) are never candidates.
+  const inWindow = (p: SlowPhase): boolean => input.tripAtMs - p.atMs <= windowMs;
+  let phase = input.slowSyncPhase ?? null;
+  for (const p of input.recentSyncPhases ?? []) {
+    if (p.kind !== 'sync' || !inWindow(p)) continue;
+    if (!phase || !inWindow(phase) || p.durationMs > phase.durationMs) phase = p;
+  }
+  const finish = (r: BlockAttribution): BlockAttribution =>
+    withGc(input.recentSyncPhases === undefined ? r : { ...r, syncPhase: phase });
   if (!phase) {
-    return withGc({ verdict: 'unattributed-none', windowMs, syncPhaseAgeMs: null, explainedFraction: null });
+    return finish({ verdict: 'unattributed-none', windowMs, syncPhaseAgeMs: null, explainedFraction: null });
   }
   const ageMs = input.tripAtMs - phase.atMs;
   if (!(ageMs <= windowMs)) {
-    return withGc({ verdict: 'unattributed-stale', windowMs, syncPhaseAgeMs: ageMs, explainedFraction: null });
+    return finish({ verdict: 'unattributed-stale', windowMs, syncPhaseAgeMs: ageMs, explainedFraction: null });
   }
   // Guard the denominator: a zero/negative lag cannot be a share of anything, and
   // dividing by it would publish Infinity as a confident-looking number.
   const explained = input.lagMaxMs > 0 ? phase.durationMs / input.lagMaxMs : null;
   if (explained == null || !(explained >= ATTRIBUTION_EXPLAINED_MIN)) {
-    return withGc({ verdict: 'partial', windowMs, syncPhaseAgeMs: ageMs, explainedFraction: explained });
+    return finish({ verdict: 'partial', windowMs, syncPhaseAgeMs: ageMs, explainedFraction: explained });
   }
-  return withGc({ verdict: 'attributed', windowMs, syncPhaseAgeMs: ageMs, explainedFraction: explained });
+  return finish({ verdict: 'attributed', windowMs, syncPhaseAgeMs: ageMs, explainedFraction: explained });
 }
 
 /**
@@ -1589,6 +1618,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
           lagMaxMs: sample.lagMaxMs,
           sampleMs: cfg.sampleMs,
           slowSyncPhase: tripAttribution.lastSlowSyncPhase,
+          recentSyncPhases: tripAttribution.recentSlowPhases ?? [],
           ...(tripGc?.enabled ? { gcPauses: tripGc.recent } : {}),
         });
         // TRA-3660 — attach the sampler's own view of the SAME candidate window.
@@ -1613,6 +1643,10 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
             windowMs: attribution.windowMs,
             syncPhaseAgeMs: attribution.syncPhaseAgeMs,
             explainedFraction: attribution.explainedFraction,
+            // TRA-3660 (trip #14) — the record the verdict graded (largest
+            // in-window sync), which may differ from `lastTrip.slowSyncPhase`.
+            gradedSyncPhase: attribution.syncPhase?.name ?? null,
+            gradedSyncPhaseMs: attribution.syncPhase?.durationMs ?? null,
             stdioMaxWriteMs: stdio?.maxWrite?.durationMs ?? null,
             stdioSlowWrites: stdio?.slowWrites ?? null,
             topEmitters: stdio?.topEmitters ?? null,
@@ -1682,6 +1716,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
                 lagMaxMs: sample.lagMaxMs,
                 sampleMs: cfg.sampleMs,
                 slowSyncPhase: tripAttribution.lastSlowSyncPhase,
+                recentSyncPhases: tripAttribution.recentSlowPhases ?? [],
                 gcPauses: [...(lateGc?.recent ?? []), late],
               });
               if (amended.verdict !== 'gc-attributed') return;

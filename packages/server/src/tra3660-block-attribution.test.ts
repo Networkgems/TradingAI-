@@ -115,6 +115,75 @@ describe('classifyBlockAttribution (TRA-3660 AC1)', () => {
   });
 });
 
+describe('classifyBlockAttribution grades the LARGEST in-window witness (TRA-3660 trip #14)', () => {
+  // The live 2026-09-10T16:43:42.080Z trip, verbatim off bqb1 `lastTrip` + the
+  // Render tape: ten `yield-preempt@signal.doTick.pacer` witnesses of ONE block,
+  // written in FIFO resume order — the longest-waiting yield resumes first, so
+  // each shorter witness overwrote `lastSlowSyncPhase` and the trip graded the
+  // SMALLEST (1123ms, `partial`) while the ring held a 6104ms witness of the
+  // same block.
+  const tripAtMs = 1_789_058_622_080;
+  const base = { reason: 'block' as const, tripAtMs, lagMaxMs: 6694, sampleMs: 1000 };
+  const delays = [6104, 5533, 4948, 4383, 3803, 3271, 2743, 2190, 1665, 1123];
+  const emitAgeMs = [36, 32, 29, 27, 24, 21, 19, 16, 14, 11];
+  const witnesses = delays.map((durationMs, i) => ({
+    name: 'yield-preempt@signal.doTick.pacer',
+    durationMs,
+    atMs: tripAtMs - emitAgeMs[i]!,
+    kind: 'sync' as const,
+  }));
+  const last = witnesses[witnesses.length - 1]!;
+
+  it('reproduces the live verdict when the ring is not supplied (legacy input is byte-identical)', () => {
+    const v = classifyBlockAttribution({ ...base, slowSyncPhase: last });
+    expect(v.verdict).toBe('partial');
+    expect(v.explainedFraction).toBeCloseTo(0.16776, 4);
+    expect('syncPhase' in v).toBe(false);
+  });
+
+  it('grades the 6104ms witness, not the last-written 1123ms one', () => {
+    const v = classifyBlockAttribution({ ...base, slowSyncPhase: last, recentSyncPhases: witnesses });
+    expect(v.verdict).toBe('attributed');
+    expect(v.syncPhase?.durationMs).toBe(6104);
+    expect(v.explainedFraction).toBeCloseTo(6104 / 6694, 4);
+    expect(v.syncPhaseAgeMs).toBe(36);
+  });
+
+  it('never grades an ASYNC record, however large (the #span demotion must stay out of the verdict)', () => {
+    const v = classifyBlockAttribution({
+      ...base,
+      slowSyncPhase: last,
+      recentSyncPhases: [
+        { name: 'signal.doTick.pacer#span[<start>..early-state-broadcast]', durationMs: 63_088, atMs: tripAtMs - 20, kind: 'async' },
+        { name: 'signal.doTick', durationMs: 38_413, atMs: tripAtMs - 2, kind: 'async' },
+        last,
+      ],
+    });
+    expect(v.verdict).toBe('partial');
+    expect(v.syncPhase).toBe(last);
+  });
+
+  it('does not let a larger FOSSIL sync record in the ring pose as the culprit', () => {
+    const fossil = { name: 'ledger.hydrate', durationMs: 9000, atMs: tripAtMs - 600_000, kind: 'sync' as const };
+    const v = classifyBlockAttribution({ ...base, slowSyncPhase: last, recentSyncPhases: [fossil, last] });
+    expect(v.verdict).toBe('partial');
+    expect(v.syncPhase).toBe(last);
+  });
+
+  it('grades an in-window ring record even when slowSyncPhase itself is stale', () => {
+    const stale = { name: 'ledger.hydrate', durationMs: 9000, atMs: tripAtMs - 600_000, kind: 'sync' as const };
+    const v = classifyBlockAttribution({ ...base, slowSyncPhase: stale, recentSyncPhases: [stale, witnesses[0]!] });
+    expect(v.verdict).toBe('attributed');
+    expect(v.syncPhase?.durationMs).toBe(6104);
+  });
+
+  it('publishes syncPhase: null (looked, found nothing) when the ring holds no sync record', () => {
+    const v = classifyBlockAttribution({ ...base, slowSyncPhase: null, recentSyncPhases: [] });
+    expect(v.verdict).toBe('unattributed-none');
+    expect(v.syncPhase).toBeNull();
+  });
+});
+
 describe('stdio block meter (TRA-3660 AC1)', () => {
   beforeEach(() => {
     _resetStdioBlockMeterForTests();
