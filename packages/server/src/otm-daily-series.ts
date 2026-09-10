@@ -103,6 +103,27 @@ export const OTM_DAILY_SERIES_REFRESH_MS = 30 * 60_000;
 export const OTM_DAILY_SERIES_MAX_AGE_MS = 4 * 60 * 60_000;
 
 /**
+ * How old an entry may get before a completed rotation DROPS it.
+ *
+ * ⛔ EVICTION IS BY AGE, NEVER BY "LEFT THE UNIVERSE". There is no single
+ * universe: `initAllUserContexts` builds ONE `SignalEngine` PER USER, every one
+ * of them runs this refresh over its OWN `getActiveSymbols()` (hidden symbols,
+ * dynamic symbols and open-option underlyings all differ per book), and they
+ * all share this module's one cache. The first cut pruned against the calling
+ * engine's universe, so each engine's completed rotation deleted every symbol
+ * the OTHER books were holding — measured on live tape 2026-09-10: `evicted`
+ * 218, `cachedSymbols` 25, and 49 of the last 50 seam reads `absent`.
+ *
+ * 24h is past the longest gap a symbol can legitimately go unrefreshed inside a
+ * trading week (the ~17.5h close-to-open overnight), so a symbol some book still
+ * trades is always refreshed before it could be dropped; a symbol no book holds
+ * any more ages out within a day. Between `MAX_AGE` and this, an entry reads
+ * `stale` — which is the informative state, and eviction would erase it into
+ * `absent`.
+ */
+export const OTM_DAILY_SERIES_EVICT_AGE_MS = 24 * 60 * 60_000;
+
+/**
  * The state of one read at the seam.
  *
  * ⛔ THREE VALUES, NOT A BOOLEAN. `absent` (the refresh has never landed this
@@ -160,8 +181,20 @@ export interface OtmDailySeriesCounters {
    * nominee scored `series_unreadable`: the exact "a dead feed reads like a
    * quiet market" failure this whole block exists to prevent, reintroduced one
    * layer down. So the breaker is asked BEFORE the call and counted here.
+   *
+   * ⚠️ A PRESSURE GAUGE, NOT A DISTINCT-SYMBOL COUNT. An open breaker STOPS the
+   * rotation on the refused batch (it does not skip past it), and the same batch
+   * is re-offered — and re-counted — on every tick until the breaker closes.
    */
   readonly skippedFeedBreaker: number;
+  /**
+   * Symbols a rotation did NOT fetch because the cache already held them inside
+   * {@link OTM_DAILY_SERIES_REFRESH_MS}, or another engine's fetch for them was
+   * in flight. This is what keeps N per-user engines at ONE fetch per symbol per
+   * refresh interval process-wide rather than N — without it, every book's
+   * rotation re-pulled the same universe off one shared Yahoo client.
+   */
+  readonly skippedFresh: number;
   /** Reset by any success — the discriminator between a blip and an outage. */
   readonly consecutiveFetchFailures: number;
   readonly lastOkAt: number | null;
@@ -172,7 +205,7 @@ export interface OtmDailySeriesCounters {
   readonly readsStale: number;
   readonly readsAbsent: number;
   readonly cachedSymbols: number;
-  /** Entries dropped because their symbol left the universe. */
+  /** Entries dropped for age ({@link OTM_DAILY_SERIES_EVICT_AGE_MS}). */
   readonly evicted: number;
   /** Wall clock this process started counting. Every total above is SINCE-BOOT. */
   readonly since: number;
@@ -186,6 +219,7 @@ const counters = {
   fetchEmpty: 0,
   fetchFailed: 0,
   skippedFeedBreaker: 0,
+  skippedFresh: 0,
   consecutiveFetchFailures: 0,
   lastOkAt: null as number | null,
   lastFailureAt: null as number | null,
@@ -300,18 +334,83 @@ export function noteOtmDailySeriesPass(complete: boolean): void {
 }
 
 /**
- * Drop cached entries for symbols no longer in the universe. Called at the end
- * of a COMPLETE rotation only — pruning mid-rotation against the slice rather
- * than the universe would evict everything the pass did not happen to reach.
+ * Drop cached entries older than {@link OTM_DAILY_SERIES_EVICT_AGE_MS}. Called at
+ * the end of a COMPLETE rotation. ⛔ Never takes a universe — see the constant
+ * for why a per-engine universe prune on a fleet-shared cache is the defect.
  */
-export function pruneOtmDailySeries(universe: readonly string[]): void {
-  const keep = new Set(universe);
-  for (const sym of [...cache.keys()]) {
-    if (!keep.has(sym)) {
+export function pruneOtmDailySeries(nowMs: number = Date.now()): void {
+  for (const [sym, entry] of [...cache.entries()]) {
+    if (nowMs - entry.fetchedAt > OTM_DAILY_SERIES_EVICT_AGE_MS) {
       cache.delete(sym);
       counters.evicted += 1;
     }
   }
+}
+
+/** Symbols some engine is fetching right now. Module-shared, like the cache. */
+const inFlight = new Set<string>();
+
+function needsFetch(symbol: string, nowMs: number): boolean {
+  if (inFlight.has(symbol)) return false;
+  const entry = cache.get(symbol);
+  return entry == null || nowMs - entry.fetchedAt >= OTM_DAILY_SERIES_REFRESH_MS;
+}
+
+/** The feed, injected so this module stays a leaf with no IO of its own. */
+export interface OtmDailySeriesBatchDeps {
+  readonly fetch: (symbol: string) => Promise<readonly Candle[]>;
+  /** Asked BEFORE any fetch — see {@link OtmDailySeriesCounters.skippedFeedBreaker}. */
+  readonly breakerOpen: () => boolean;
+  readonly now?: () => number;
+}
+
+/**
+ * The refresh's per-batch worker — `runBudgetedSweep`'s `run` in
+ * `refreshOtmDailySeries`. Lives here, with the feed injected, so its two
+ * failure modes are graded BEHAVIOURALLY rather than by a source regex.
+ *
+ * ⛔ AN OPEN BREAKER RETURNS `false` (STOP, cursor left ON this batch). The first
+ * cut returned `undefined`, which `runBudgetedSweep` reads as "batch done": a
+ * rotation that began under an open breaker walked the whole universe in 0 ms,
+ * fetched nothing, reported COMPLETE, and spent its 30-minute cadence slot.
+ * Measured on live tape 2026-09-10: the Yahoo breaker was open in 37 of the
+ * first 68 minutes of RTH (3,900 trips, 3,529 of them from the quote fan-out,
+ * 124 from this sink), `skippedFeedBreaker` 74,991 against `fetchOk` 1,177,
+ * and no daily fetch landed between 14:00:41Z and 15:01:31Z. Stopping instead
+ * makes the rotation resume on the first tick the breaker is closed.
+ *
+ * ⛔ FRESH AND IN-FLIGHT SYMBOLS ARE NOT RE-FETCHED. With one engine per user
+ * sharing this cache, the stop above would otherwise turn N engines' rotations
+ * into N full fetches of the same universe every refresh interval — a feed-quota
+ * regression (TRA-1996) that the open breaker was masking. The skip is what
+ * makes the stop safe to ship.
+ */
+export async function runOtmDailySeriesBatch(
+  batch: readonly string[],
+  deps: OtmDailySeriesBatchDeps,
+): Promise<boolean | void> {
+  const now = deps.now ?? Date.now;
+  const due = batch.filter((sym) => needsFetch(sym, now()));
+  if (due.length > 0 && deps.breakerOpen()) {
+    noteOtmDailySeriesBreakerSkip(due.length);
+    return false;
+  }
+  counters.skippedFresh += batch.length - due.length;
+  // Claimed synchronously, before the first await, so a second engine's batch
+  // interleaving on the event loop sees these as in flight.
+  for (const sym of due) inFlight.add(sym);
+  await Promise.all(due.map(async (sym) => {
+    try {
+      // An EMPTY answer is not a failure and does not evict the last good
+      // series: a symbol that has genuinely stopped printing should age out
+      // through staleness rather than vanish on one empty response.
+      storeOtmDailySeries(sym, await deps.fetch(sym), now());
+    } catch (err: unknown) {
+      noteOtmDailySeriesFailure(sym, err instanceof Error ? err.message : String(err), now());
+    } finally {
+      inFlight.delete(sym);
+    }
+  }));
 }
 
 /**
@@ -494,6 +593,7 @@ function noteFor(
 /** Test seam: drop the cache, the counters and the sample ring. */
 export function __resetOtmDailySeriesForTests(nowMs: number = Date.now()): void {
   cache.clear();
+  inFlight.clear();
   samples.length = 0;
   verdictsRecorded = 0;
   counters.refreshPasses = 0;
@@ -503,6 +603,7 @@ export function __resetOtmDailySeriesForTests(nowMs: number = Date.now()): void 
   counters.fetchEmpty = 0;
   counters.fetchFailed = 0;
   counters.skippedFeedBreaker = 0;
+  counters.skippedFresh = 0;
   counters.consecutiveFetchFailures = 0;
   counters.lastOkAt = null;
   counters.lastFailureAt = null;

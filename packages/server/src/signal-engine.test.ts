@@ -10711,13 +10711,67 @@ describe('TRA-4424 — the OTM setup seam reads a DAILY series, off the order pa
     vi.mocked(isYahooBreakerOpen).mockReturnValue(true);
     try {
       const engine = otmEngine();
-      await refreshDaily(engine, ['AAPL', 'MSFT']);
+      const pass = await refreshDaily(engine, ['AAPL', 'MSFT']);
       expect(vi.mocked(fetchDailyCandles)).not.toHaveBeenCalled();
       const h = otmDailySeriesHealth();
       expect(h.counters.skippedFeedBreaker).toBe(2);
       expect(h.counters.fetchEmpty).toBe(0);
       expect(h.counters.fetchFailed).toBe(0);
       expect(h.status).not.toBe('ok');
+      // ⛔ AND THE ROTATION DID NOT COMPLETE. Live tape 2026-09-10: a rotation
+      // that began under an open breaker "completed" in 0 ms having fetched
+      // nothing, and spent its 30-minute slot — no daily fetch landed for an hour.
+      expect(pass.complete).toBe(false);
+      expect(pass.stopped).toBe(true);
+    } finally {
+      vi.mocked(isYahooBreakerOpen).mockReturnValue(false);
+    }
+  });
+
+  it('⛔ the breaker closing RESUMES the rotation on the next pass — it is not deferred a cadence slot', async () => {
+    vi.mocked(fetchDailyCandles).mockResolvedValue(bars(120, DAY_MS));
+    vi.mocked(isYahooBreakerOpen).mockReturnValue(true);
+    const engine = otmEngine();
+    try {
+      await refreshDaily(engine, ['AAPL', 'MSFT']);
+    } finally {
+      vi.mocked(isYahooBreakerOpen).mockReturnValue(false);
+    }
+    const pass = await refreshDaily(engine, ['AAPL', 'MSFT']);
+    expect(pass.complete).toBe(true);
+    expect(vi.mocked(fetchDailyCandles)).toHaveBeenCalledTimes(2);
+    await runOtm(engine, ['AAPL']);
+    expect(lastVerdict()!.readState).toBe('fresh');
+  });
+
+  // ⛔ THE 09-10 THRASH. One engine per USER shares this cache; the first cut
+  // pruned it to the calling engine's universe at the end of every rotation, so
+  // each book evicted every other book's symbols (`evicted` 218,
+  // `cachedSymbols` 25, 49 of the last 50 seam reads `absent`).
+  it('⛔ one book\'s completed rotation does NOT evict another book\'s symbols', async () => {
+    vi.mocked(fetchDailyCandles).mockImplementation(async (sym: string) => bars(120, DAY_MS, sym));
+    const alice = otmEngine();
+    alice.setAlertUsername('alice');
+    const bob = otmEngine();
+    bob.setAlertUsername('bob');
+    expect((await refreshDaily(alice, ['AAPL'])).complete).toBe(true);
+    expect((await refreshDaily(bob, ['MSFT'])).complete).toBe(true);
+
+    await runOtm(alice, ['AAPL']);
+    expect(lastVerdict()!.symbol).toBe('AAPL');
+    expect(lastVerdict()!.readState).toBe('fresh');
+    expect(otmDailySeriesHealth().counters.evicted).toBe(0);
+  });
+
+  it('the rotation cursor is keyed per BOOK, not per mode', async () => {
+    vi.mocked(isYahooBreakerOpen).mockReturnValue(true);
+    try {
+      const engine = otmEngine();
+      engine.setAlertUsername('alice');
+      await refreshDaily(engine, ['AAPL', 'MSFT']); // parks the cursor
+      const keys = Object.keys(sweepCursorSnapshot()).filter((k) => k.endsWith('otm-daily-series'));
+      expect(keys).toHaveLength(1);
+      expect(keys[0]).toMatch(/:alice:otm-daily-series$/);
     } finally {
       vi.mocked(isYahooBreakerOpen).mockReturnValue(false);
     }

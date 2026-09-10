@@ -246,9 +246,7 @@ import {
 // off the order path, in `refreshOtmDailySeries`.
 import {
   readOtmDailySeries,
-  storeOtmDailySeries,
-  noteOtmDailySeriesFailure,
-  noteOtmDailySeriesBreakerSkip,
+  runOtmDailySeriesBatch,
   noteOtmDailySeriesPass,
   noteOtmDailySeriesVerdict,
   pruneOtmDailySeries,
@@ -14735,42 +14733,28 @@ export class SignalEngine {
   private async refreshOtmDailySeries(symbols: string[]): Promise<SweepPass> {
     const BATCH = 4;
     const pass = await runBudgetedSweep({
-      // Per-engine: `mode` namespaces demo from live so two engines sweeping the
-      // same watchlist do not consume each other's cursor.
-      key: `${this.mode}:otm-daily-series`,
+      // ⛔ PER ENGINE, AND AN ENGINE IS A BOOK, NOT A MODE. `initAllUserContexts`
+      // builds one engine per user and the cursor store is process-wide, so a
+      // `${mode}`-only key had every book resume at whatever symbol the LAST book
+      // parked on — in a universe that is not its own.
+      key: `${this.mode}:${this.alertUsername ?? '-'}:otm-daily-series`,
       symbols,
       batchSize: BATCH,
       budgetMs: OTM_DAILY_SERIES_BUDGET_MS,
-      run: async (batch) => {
-        // ⛔ ASK THE BREAKER FIRST, AND COUNT THE SKIP. `fetchDailyCandles` runs
-        // through `withRetry`, which short-circuits to `null` while Yahoo is
-        // rate-limited — so a tripped breaker arrives as an EMPTY RESULT, not a
-        // throw. Left to fall through it would land in `fetchEmpty`, and a
-        // mid-session trip after a healthy morning would publish `status: 'ok'`
-        // while every nominee scored `series_unreadable`. That is exactly the
-        // "a dead feed reads like a quiet market" defect this refresh's counters
-        // exist to prevent, one layer down.
-        if (isYahooBreakerOpen()) {
-          noteOtmDailySeriesBreakerSkip(batch.length);
-          return;
-        }
-        await Promise.all(batch.map(async (sym) => {
-          try {
-            const bars = await fetchDailyCandles(sym, OTM_DAILY_SERIES_BARS);
-            // An EMPTY answer is not a failure and does not evict the last good
-            // series: a symbol that has genuinely stopped printing should age
-            // out through staleness rather than vanish on one empty response.
-            storeOtmDailySeries(sym, bars);
-          } catch (err: unknown) {
-            noteOtmDailySeriesFailure(sym, err instanceof Error ? err.message : String(err));
-          }
-        }));
-      },
+      // The breaker / fresh / in-flight policy lives in the module with the feed
+      // injected, so it is graded behaviourally — see `runOtmDailySeriesBatch`.
+      // ⛔ The breaker is still asked BEFORE the call: `fetchDailyCandles` runs
+      // through `withRetry`, which returns `[]` while Yahoo is rate-limited, so an
+      // un-asked breaker would launder an outage into `fetchEmpty`.
+      run: (batch) => runOtmDailySeriesBatch(batch, {
+        fetch: (sym) => fetchDailyCandles(sym, OTM_DAILY_SERIES_BARS),
+        breakerOpen: () => isYahooBreakerOpen(),
+      }),
     });
     noteOtmDailySeriesPass(pass.complete);
-    // Evict only at the end of a COMPLETE rotation. Pruning against a mid-
-    // rotation slice would drop every symbol the pass had not yet reached.
-    if (pass.complete) pruneOtmDailySeries(symbols);
+    // Age-based, never against `symbols`: the cache is shared by every book's
+    // engine, and pruning it to THIS book's universe evicted everyone else's.
+    if (pass.complete) pruneOtmDailySeries(Date.now());
     return pass;
   }
 

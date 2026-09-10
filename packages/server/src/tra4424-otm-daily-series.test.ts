@@ -12,14 +12,19 @@ import {
   noteOtmDailySeriesPass,
   noteOtmDailySeriesVerdict,
   pruneOtmDailySeries,
+  runOtmDailySeriesBatch,
   otmDailySeriesHealth,
   __resetOtmDailySeriesForTests,
   OTM_DAILY_SERIES_BARS,
   OTM_DAILY_SERIES_BUDGET_MS,
   OTM_DAILY_SERIES_MAX_AGE_MS,
+  OTM_DAILY_SERIES_EVICT_AGE_MS,
+  OTM_DAILY_SERIES_REFRESH_MS,
   OTM_DAILY_SERIES_SAMPLE_CAP,
   OTM_DAILY_SERIES_MIN_THESIS_SPAN_MS,
+  type OtmDailySeriesBatchDeps,
 } from './otm-daily-series.js';
+import { runBudgetedSweep, type SweepCursorStore } from './tick-sweep-budget.js';
 
 /**
  * TRA-4424 (parent TRA-4421, off TRA-4422 Finding 1) — the daily-bar source for
@@ -226,14 +231,141 @@ describe('refresh counters — a dead feed must not read like a quiet market', (
     expect(h.note).toContain('SINCE-BOOT');
   });
 
-  it('pruning drops only symbols that left the universe, and counts the evictions', () => {
+  // ⛔ Pruning takes NO universe. The cache is shared by one engine per user,
+  // and pruning it to the calling engine's universe evicted every other book's
+  // symbols on each rotation (live tape 2026-09-10: `evicted` 218,
+  // `cachedSymbols` 25). Only AGE drops an entry.
+  it('pruning drops only entries past the evict age, and counts the evictions', () => {
     storeOtmDailySeries('AAPL', bars(120, DAY_MS), T0);
-    storeOtmDailySeries('GONE', bars(120, DAY_MS, 'GONE'), T0);
-    pruneOtmDailySeries(['AAPL']);
+    storeOtmDailySeries('OLD', bars(120, DAY_MS, 'OLD'), T0 - OTM_DAILY_SERIES_EVICT_AGE_MS - 1);
+    pruneOtmDailySeries(T0);
     expect(readOtmDailySeries('AAPL', T0).state).toBe('fresh');
-    expect(readOtmDailySeries('GONE', T0).state).toBe('absent');
+    expect(readOtmDailySeries('OLD', T0).state).toBe('absent');
     expect(otmDailySeriesHealth(T0).counters.evicted).toBe(1);
     expect(otmDailySeriesHealth(T0).counters.cachedSymbols).toBe(1);
+  });
+
+  it('an entry past MAX_AGE but inside the evict age is KEPT and reads `stale`, not `absent`', () => {
+    const t = T0 + OTM_DAILY_SERIES_MAX_AGE_MS + 60_000;
+    storeOtmDailySeries('AAPL', bars(120, DAY_MS), T0);
+    pruneOtmDailySeries(t);
+    expect(readOtmDailySeries('AAPL', t).state).toBe('stale');
+    expect(otmDailySeriesHealth(t).counters.evicted).toBe(0);
+    expect(OTM_DAILY_SERIES_EVICT_AGE_MS).toBeGreaterThan(OTM_DAILY_SERIES_MAX_AGE_MS);
+  });
+});
+
+// ─── THE WORKER — the two defects the live tape found on 2026-09-10 ──────────
+// Graded through the REAL `runBudgetedSweep`, because both defects live in the
+// contract between the worker and the sweep (what "batch done" means), which a
+// worker tested alone cannot see.
+describe('refresh worker — an open breaker STOPS the rotation; N books fetch each symbol ONCE', () => {
+  const U6 = ['A', 'B', 'C', 'D', 'E', 'F'];
+
+  function memCursors(): SweepCursorStore {
+    const m = new Map<string, string>();
+    return {
+      get: (k) => m.get(k) ?? null,
+      set: (k, s) => { m.set(k, s); },
+      clear: (k) => { m.delete(k); },
+    };
+  }
+
+  function feed(breakerOpen: () => boolean = () => false) {
+    const calls: string[] = [];
+    let clock = T0;
+    const deps: OtmDailySeriesBatchDeps = {
+      fetch: async (sym) => { calls.push(sym); return bars(120, DAY_MS, sym); },
+      breakerOpen,
+      now: () => clock,
+    };
+    return { calls, deps, advance: (ms: number) => { clock += ms; } };
+  }
+
+  const sweep = (key: string, symbols: string[], deps: OtmDailySeriesBatchDeps, cursors: SweepCursorStore) =>
+    runBudgetedSweep({
+      key, symbols, batchSize: 4, budgetMs: OTM_DAILY_SERIES_BUDGET_MS, cursors,
+      run: (batch) => runOtmDailySeriesBatch(batch, deps),
+    });
+
+  it('⛔ an OPEN breaker stops the rotation on the refused batch — NOT complete — and it resumes once the breaker closes', async () => {
+    let open = true;
+    const f = feed(() => open);
+    const cursors = memCursors();
+
+    const p1 = await sweep('live:alice:otm-daily-series', U6, f.deps, cursors);
+    expect(p1.complete).toBe(false); // the first cut reported TRUE here, having fetched nothing
+    expect(p1.stopped).toBe(true);
+    expect(p1.resumeAt).toBe('A');
+    expect(f.calls).toEqual([]);
+    expect(otmDailySeriesHealth(T0).counters.skippedFeedBreaker).toBe(4);
+
+    open = false;
+    const p2 = await sweep('live:alice:otm-daily-series', U6, f.deps, cursors);
+    expect(p2.complete).toBe(true);
+    expect([...f.calls].sort()).toEqual(U6);
+    for (const s of U6) expect(readOtmDailySeries(s, T0).state).toBe('fresh');
+  });
+
+  it('a breaker that trips MID-rotation keeps what landed and parks on the first refused batch', async () => {
+    let asked = 0;
+    const f = feed(() => asked++ >= 1); // closed for the first batch only
+    const p = await sweep('live:alice:otm-daily-series', U6, f.deps, memCursors());
+    expect(p.complete).toBe(false);
+    expect(p.resumeAt).toBe('E');
+    expect(f.calls).toEqual(['A', 'B', 'C', 'D']);
+    expect(otmDailySeriesHealth(T0).counters.skippedFeedBreaker).toBe(2);
+  });
+
+  it('⛔ a second book\'s rotation inside the refresh interval fetches only what the first did not', async () => {
+    const f = feed();
+    const cursors = memCursors();
+    await sweep('live:alice:otm-daily-series', ['A', 'B', 'C'], f.deps, cursors);
+    await sweep('live:bob:otm-daily-series', ['A', 'B', 'C', 'D'], f.deps, cursors);
+    expect(f.calls).toEqual(['A', 'B', 'C', 'D']); // not A,B,C,A,B,C,D
+    expect(otmDailySeriesHealth(T0).counters.skippedFresh).toBe(3);
+
+    // …and past the refresh interval the same book DOES re-fetch.
+    f.advance(OTM_DAILY_SERIES_REFRESH_MS);
+    await sweep('live:alice:otm-daily-series', ['A', 'B', 'C'], f.deps, cursors);
+    expect(f.calls).toHaveLength(7);
+  });
+
+  it('a fetch in flight on one book is not duplicated by a concurrent book', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const calls: string[] = [];
+    const deps: OtmDailySeriesBatchDeps = {
+      fetch: async (sym) => { calls.push(sym); await gate; return bars(120, DAY_MS, sym); },
+      breakerOpen: () => false,
+      now: () => T0,
+    };
+    const first = runOtmDailySeriesBatch(['AAPL'], deps);
+    await runOtmDailySeriesBatch(['AAPL'], deps);
+    release();
+    await first;
+    expect(calls).toEqual(['AAPL']);
+    expect(readOtmDailySeries('AAPL', T0).state).toBe('fresh');
+  });
+
+  it('a throwing fetch is counted and releases its in-flight claim', async () => {
+    let fail = true;
+    const calls: string[] = [];
+    const deps: OtmDailySeriesBatchDeps = {
+      fetch: async (sym) => {
+        calls.push(sym);
+        if (fail) throw new Error('yahoo 502');
+        return bars(120, DAY_MS, sym);
+      },
+      breakerOpen: () => false,
+      now: () => T0,
+    };
+    await runOtmDailySeriesBatch(['AAPL'], deps);
+    expect(otmDailySeriesHealth(T0).counters.fetchFailed).toBe(1);
+    fail = false;
+    await runOtmDailySeriesBatch(['AAPL'], deps);
+    expect(calls).toEqual(['AAPL', 'AAPL']);
+    expect(readOtmDailySeries('AAPL', T0).state).toBe('fresh');
   });
 });
 
@@ -335,15 +467,15 @@ describe('TRA-4424 — the refresh is wired OFF the order path', () => {
     expect(body).toMatch(/runBudgetedSweep\(\{/);
     expect(body).toMatch(/budgetMs: OTM_DAILY_SERIES_BUDGET_MS,/);
     expect(body).toMatch(/fetchDailyCandles\(sym, OTM_DAILY_SERIES_BARS\)/);
-    // ⛔ A per-symbol failure is CAUGHT AND COUNTED. Swallowing it is what makes
-    // a dead daily feed read as a quiet market.
-    expect(body).toMatch(/noteOtmDailySeriesFailure\(/);
     expect(body).toMatch(/noteOtmDailySeriesPass\(pass\.complete\)/);
-    // ⛔ THE BREAKER IS ASKED BEFORE THE CALL. `withRetry` short-circuits to
-    // `null` while Yahoo is rate-limited, so an un-asked breaker turns an
-    // outage into `fetchEmpty` and leaves the status green.
-    expect(body).toMatch(/if \(isYahooBreakerOpen\(\)\) \{/);
-    expect(body).toMatch(/noteOtmDailySeriesBreakerSkip\(batch\.length\)/);
+    // The batch policy (breaker asked BEFORE the call, failures COUNTED, fresh
+    // and in-flight skipped) is the module's, graded behaviourally above; the
+    // engine must hand it the REAL breaker, not a constant.
+    expect(body).toMatch(/run: \(batch\) => runOtmDailySeriesBatch\(batch, \{/);
+    expect(body).toMatch(/breakerOpen: \(\) => isYahooBreakerOpen\(\),/);
+    // ⛔ Age-based prune only — a universe argument is the 09-10 thrash.
+    expect(body).toMatch(/pruneOtmDailySeries\(Date\.now\(\)\)/);
+    expect(body).not.toMatch(/pruneOtmDailySeries\(symbols\)/);
   });
 
   // ⛔ THE ORDER-PATH CLAIM, stated as a source invariant. `runOtmScan` is a
