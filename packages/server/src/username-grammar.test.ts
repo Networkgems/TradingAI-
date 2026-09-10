@@ -648,7 +648,12 @@ describe('TRA-4475 — the WIRING (order is the fix; a grammar behind the rename
     // the `username:` field in arg 2 is the name being WRITTEN (must be the
     // validated one). Getting these backwards is a lockout in one direction and
     // this ticket's bug in the other.
-    expect(body).toMatch(/updateUser\(username,\s*\{\s*email,\s*username:\s*cleanNewUsername\s*\}\)/);
+    //
+    // TRA-4493 — arg 2's `email` field became `cleanEmail` for the same reason
+    // `username` became `cleanNewUsername`: it is a WRITTEN value and must be
+    // the validated one. Both halves of arg 2 are now guarded; arg 1 is still
+    // the raw lookup key and must stay that way.
+    expect(body).toMatch(/updateUser\(username,\s*\{\s*email:\s*cleanEmail,\s*username:\s*cleanNewUsername\s*\}\)/);
   });
 
   it('the admin RENAME limb is disabled (audit H3), and the 409 is the LAST gate', () => {
@@ -671,7 +676,7 @@ describe('TRA-4475 — the WIRING (order is the fix; a grammar behind the rename
     // half is the half that actually works.
     const body = routeBody("app.patch('/api/admin/users/:username'");
     expect(body).toMatch(/if \(cleanNewUsername !== undefined && cleanNewUsername !== username\) \{/);
-    expect(body).toMatch(/updateUser\(username,\s*\{\s*email,/);
+    expect(body).toMatch(/updateUser\(username,\s*\{\s*email:\s*cleanEmail,/);
   });
 
   it('no route re-implements the grammar inline', () => {

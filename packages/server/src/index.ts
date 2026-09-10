@@ -122,6 +122,7 @@ import { stampFirmWideDemoFoldScope } from './reports/demo-calendar-fold-provena
 // `if` at signup only, which is how both admin routes came to skip it.
 import { refuseReservedIdentityWrite } from './identity-write-guard.js';
 import { acceptUsername, normalizeUsername } from './username-grammar.js';
+import { acceptEmail, auditTwoFactorEmailIntegrity } from './email-grammar.js';
 // TRA-2421 — self-serve account deletion: the wipe surface and the identity
 // tombstone that keeps a recycled username from inheriting the previous holder's
 // shared-journal rows.
@@ -1185,6 +1186,44 @@ await checkDataDirHealth();
 await loadUsers();
 initResetTokenStore(DATA_DIR);
 initTwoFactorStore(DATA_DIR);
+
+// TRA-4493 item 2 — validation on the WRITE does not repair a row that was
+// already blanked, and every account that reached the fail-open state before the
+// guard shipped is still sitting in it, silently. This reconcile REPORTS them.
+//
+// It deliberately does not repair: what a login should DO with an enrolled
+// account that has no usable address is TRA-4489's ruling (REFUSE / RESTRICT /
+// ADMIT), and disabling someone's second factor at boot, or locking them out of
+// it, are both that decision made unilaterally by a startup path. Naming the
+// rows is what this ticket can honestly own, and it is what the ruling will need
+// to be executed against.
+//
+// The summary line is emitted UNCONDITIONALLY, zeroes included. A `degraded: 0`
+// and a reconcile that never ran must not share a rendering — absence in the log
+// tape then means "did not run", which is the fact you actually want.
+{
+  const tfAudit = auditTwoFactorEmailIntegrity(
+    getAllUsers().map((u) => ({
+      username: u.username,
+      email: u.email,
+      twoFactorEnabled: !!u.twoFactor?.enabled,
+      backupCodesRemaining: getTwoFactorStatus(u.username).backupCodesRemaining,
+    })),
+  );
+  log.info('TRA-4493: two-factor email integrity reconcile', {
+    scanned: tfAudit.scanned,
+    enrolled: tfAudit.enrolled,
+    degraded: tfAudit.degraded.length,
+  });
+  for (const row of tfAudit.degraded) {
+    log.warn('TRA-4493: 2FA enrolled account has no usable email address', {
+      username: row.username,
+      reason: row.reason,
+      backupCodesRemaining: row.backupCodesRemaining,
+      recoverableByBackupCode: row.recoverableByBackupCode,
+    });
+  }
+}
 
 // TRA-1052 (TRA-1045 R1) — open the durable hot-state SQLite store on the Render
 // disk (DATA_DIR) BEFORE any per-user context boots, so the agent-spend committed
@@ -9461,11 +9500,17 @@ app.post('/api/auth/2fa/disable', requireAuth, async (req, res) => {
 app.post('/api/auth/account/email', requireAuth, async (req, res) => {
   const username = res.locals['authUser'] as string;
   const { email } = req.body as { email?: string };
-  if (typeof email !== 'string' || !email.includes('@') || !email.trim()) {
-    res.status(400).json({ error: 'A valid email address is required' });
+  // TRA-4493 — this route already had the rule; it is now the shared one. This
+  // is the spelling the other four were measured against, so routing it through
+  // `acceptEmail` is what stops the canonical version from being the copy that
+  // drifts. No `twoFactorEnabled` limb: the 409 below means this route can only
+  // ever ADD an address, never blank one.
+  const decision = acceptEmail({ email });
+  if (!decision.ok) {
+    res.status(decision.refusal.status).json({ error: decision.refusal.message });
     return;
   }
-  const trimmed = email.trim();
+  const trimmed = decision.email;
   const current = getUser(username);
   if (current?.email) {
     res.status(409).json({ error: 'This account already has an email address. Change it in Settings.' });
@@ -9513,10 +9558,16 @@ app.post('/api/auth/signup', async (req, res) => {
     return;
   }
   const cleanUsername = decision.username;
-  if (typeof email !== 'string' || !email.includes('@')) {
-    res.status(400).json({ error: 'A valid email address is required' });
+  // TRA-4493 — was `!email.includes('@')`, one of the three spellings of this
+  // rule the codebase carried. `" @ "` passed it and stored as `"@"`. Same
+  // module as every other email write now; no `twoFactorEnabled` limb because an
+  // account being created has no second factor to disarm.
+  const emailDecision = acceptEmail({ email });
+  if (!emailDecision.ok) {
+    res.status(emailDecision.refusal.status).json({ error: emailDecision.refusal.message });
     return;
   }
+  const cleanEmail = emailDecision.email;
   if (typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH) {
     res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` });
     return;
@@ -9575,7 +9626,7 @@ app.post('/api/auth/signup', async (req, res) => {
       });
     }
   }
-  const result = await createUser(cleanUsername, email.trim(), password);
+  const result = await createUser(cleanUsername, cleanEmail, password);
   if (result.error) {
     res.status(409).json({ error: result.error });
     return;
@@ -9591,7 +9642,7 @@ app.post('/api/auth/signup', async (req, res) => {
   // TRA-2251 — welcome email, best-effort. Fire-and-forget: a mail failure (or
   // unconfigured SMTP) must never block account creation, so we do not await it
   // and swallow any rejection into the log.
-  void sendWelcomeEmail(email.trim(), cleanUsername).catch((err) => {
+  void sendWelcomeEmail(cleanEmail, cleanUsername).catch((err) => {
     log.error('auth: failed to send welcome email', {
       reason: err instanceof Error ? err.message : String(err),
     });
@@ -9866,11 +9917,32 @@ app.delete('/api/account', requireAuth, async (req, res) => {
   res.json({ ok: true, receipt: publicReceipt, journalRowsRetained });
 });
 
+// TRA-4493 — the trigger for TRA-4489's 2FA fail-open, closed here.
+//
+// This route's only check used to be `typeof email !== 'string'`. `""` passed
+// and `updateUser` wrote it through verbatim, so a 2FA-enrolled account could
+// blank its OWN address in one authenticated call — its own session, no admin —
+// and the next login then minted a full session from the password alone
+// (drill steps 05-07, `docs/tra4489-2fa-lockout-drill.md`). `"nope"` passed too,
+// which is the quieter half: 2FA stays armed and every OTP goes nowhere.
+//
+// `acceptEmail` carries BOTH halves of the fix. Format validation refuses the
+// malformed address; the `twoFactorEnabled` limb refuses a BLANK one on an
+// enrolled account with a 409 that says what it would have disarmed, rather than
+// a generic 400 about an empty string. Clearing an address on a non-2FA account
+// is an ordinary edit and stays a 400 purely because a blank address is not one.
 app.patch('/api/auth/me', requireAuth, async (req, res) => {
   const username = res.locals['authUser'] as string;
   const { email } = req.body as { email?: string };
-  if (typeof email !== 'string') { res.status(400).json({ error: 'email is required' }); return; }
-  const result = await updateUser(username, { email });
+  const decision = acceptEmail({ email, twoFactorEnabled: isTwoFactorEnabled(username) });
+  if (!decision.ok) {
+    log.warn('PATCH /api/auth/me: refused an email write', { username, code: decision.refusal.code });
+    res.status(decision.refusal.status).json({ error: decision.refusal.message });
+    return;
+  }
+  // `decision.email` — NOT the raw body value. Validated and stored must be the
+  // same string or they drift and the gap re-opens with the guard still here.
+  const result = await updateUser(username, { email: decision.email });
   if (!result.ok) { res.status(404).json({ error: result.error }); return; }
   res.json({ ok: true });
 });
@@ -9898,6 +9970,16 @@ app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
     res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` });
     return;
   }
+  // TRA-4493 — this route checked `typeof email === 'string'` and nothing more,
+  // then stored the value UNTRIMMED. `POST {email:''}` minted an account that
+  // can never receive an OTP and can never enrol in 2FA (`enableTwoFactor`
+  // refuses an address with no `@`), with no error anywhere to say so.
+  const emailDecision = acceptEmail({ email });
+  if (!emailDecision.ok) {
+    res.status(emailDecision.refusal.status).json({ error: emailDecision.refusal.message });
+    return;
+  }
+  const cleanEmail = emailDecision.email;
   // TRA-4475 — the canonical grammar, ahead of the reserve and (crucially) ahead
   // of `retireOrphanedBook` below. This route reaches the same destructive step
   // as signup with the same unvalidated string; `requireAdmin` narrows WHO can
@@ -9951,7 +10033,7 @@ app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
       return;
     }
   }
-  const result = await createUser(cleanUsername, email, password, role ?? 'user');
+  const result = await createUser(cleanUsername, cleanEmail, password, role ?? 'user');
   if (result.error) {
     res.status(409).json({ error: result.error });
     return;
@@ -10023,6 +10105,25 @@ app.patch('/api/admin/users/:username', requireAuth, requireAdmin, async (req, r
     }
     cleanNewUsername = decision.username;
   }
+  // TRA-4493 — the EMAIL limb shared the same gap: it forwarded `email` straight
+  // into `updateUser`, so `PATCH {email:''}` blanked a 2FA account's address from
+  // an admin session exactly as `PATCH /api/auth/me` did from the account's own.
+  // `requireAdmin` narrows WHO can fire it, not what it does — the same argument
+  // TRA-4475 made about this route's name limb.
+  //
+  // The limb stays OPTIONAL: `email === undefined` means "not editing the
+  // address" and must keep meaning that, or every rename-only PATCH becomes a
+  // 400. Only a PRESENT field is graded.
+  let cleanEmail: string | undefined;
+  if (email !== undefined) {
+    const decision = acceptEmail({ email, twoFactorEnabled: isTwoFactorEnabled(username) });
+    if (!decision.ok) {
+      log.warn('admin: refused an email write', { username, code: decision.refusal.code });
+      res.status(decision.refusal.status).json({ error: decision.refusal.message });
+      return;
+    }
+    cleanEmail = decision.email;
+  }
   const reserved = refuseReservedIdentityWrite({ name: cleanNewUsername, audience: 'admin' });
   if (reserved) {
     res.status(reserved.status).json({ error: reserved.message });
@@ -10057,7 +10158,7 @@ app.patch('/api/admin/users/:username', requireAuth, requireAdmin, async (req, r
     });
     return;
   }
-  const result = await updateUser(username, { email, username: cleanNewUsername });
+  const result = await updateUser(username, { email: cleanEmail, username: cleanNewUsername });
   if (!result.ok) {
     res.status(result.error === 'User not found' ? 404 : 409).json({ error: result.error });
     return;

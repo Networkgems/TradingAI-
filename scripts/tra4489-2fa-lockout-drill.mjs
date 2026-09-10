@@ -133,24 +133,69 @@ const run = async () => {
   );
 
   // ── Q1: can the account reach the fail-open state on its OWN authority? ────
+  //
+  // ⚠️ TRA-4493 CLOSED THIS ON 2026-09-10, AND THAT CHANGES WHAT THIS DRILL CAN
+  // MEASURE. On the build this drill was written against, the call below
+  // returned 200 and the whole Q2/Q3 chain ran off the back of it; that
+  // transcript is `docs/tra4489-2fa-lockout-drill.md` and it is the measurement
+  // the board card is priced on. It is NOT re-derived here and must not be
+  // deleted on the strength of a later run.
+  //
+  // `acceptEmail` now refuses a blank address on an enrolled account (409), so
+  // the ONLY API path into the fail-open state is gone. Q1's answer is therefore
+  // inverted rather than lost: the state is no longer self-service.
+  //
+  // Q2 and Q3 are about an account that is ALREADY in that state — which is
+  // still TRA-4489's live subject, because validation on the write does not
+  // repair a row blanked before the guard shipped. This drill can no longer
+  // manufacture such a row through the API, so from here it reports
+  // UNDETERMINED and exits 2. "Could not check" does not share an exit code with
+  // "checked and it is fine" — the same correction this drill already had to
+  // make to its own Q3b instrumentation. Re-measuring Q2/Q3 now means planting
+  // the row below the API (edit `users.json`, restart), which is a deliberate
+  // operator step and not something a drill should do to itself.
   say('\n--- Q1: is an administrator required to reach the state? ---');
   const blank = await call('PATCH', '/api/auth/me', { token, body: { email: '' } });
   record("PATCH /api/auth/me {email:''} using the ACCOUNT'S OWN session", blank);
   assert(
-    'Q1: a 2FA-enrolled user can blank its OWN email — no admin involved',
-    blank.status === 200,
-    `self-service, status ${blank.status}`,
+    'Q1 (post-TRA-4493): the self-service path into the fail-open state is REFUSED',
+    blank.status === 409,
+    `status ${blank.status} — was 200 on the pre-fix build; see docs/tra4489-2fa-lockout-drill.md`,
   );
 
   const status1 = await call('GET', '/api/auth/2fa/status', { token });
-  record('2FA status after the email was blanked', status1);
+  record('2FA status after the refused write', status1);
   assert(
-    'Q1: blanking the address leaves 2FA still ENABLED (the fail-open state)',
+    'Q1: 2FA is still enabled and the account still holds its codes',
     status1.json?.enabled === true,
     `enabled=${status1.json?.enabled}, codes=${status1.json?.backupCodesRemaining}`,
   );
 
+  const meNow = await call('GET', '/api/auth/me', { token });
+  if (meNow.json?.email) {
+    say(`\n     UNDETERMINED :: the account still has an address on file ` +
+        `(${JSON.stringify(meNow.json.email)}), so it is NOT in the fail-open state. ` +
+        `Q2 (does the fail-open admit?) and Q3 (is there a recovery path?) cannot be ` +
+        `measured from here — TRA-4493 removed the only API path into that state. ` +
+        `They were measured on the pre-fix build; the transcript is in ` +
+        `docs/tra4489-2fa-lockout-drill.md and is the record the ruling is priced on.`);
+    say(`\n     Re-measuring means planting the row BELOW the API — blanking the ` +
+        `address on the enrolled row in DATA_DIR/users.json and restarting the ` +
+        `server. Note that a plant-then-re-run does NOT restore Q3: the plaintext ` +
+        `backup codes are returned once at enrolment and are never re-readable, so ` +
+        `the plant has to happen mid-run, between enrolment and Q2, against a ` +
+        `server this drill can restart. That is a redesign of this instrument and ` +
+        `it belongs to TRA-4489, not to the ticket that closed the trigger.`);
+    say(`\n${'='.repeat(78)}`);
+    say('DRILL: INCOMPLETE — Q2/Q3 unreachable post-TRA-4493 (this is exit 2, not a pass).');
+    say('='.repeat(78));
+    return 2;
+  }
+
   // ── Q2: does the fail-open actually admit? ────────────────────────────────
+  //
+  // Reached only when the row WAS planted below the API (see above), which is
+  // the supported way to re-run the original measurement.
   say('\n--- Q2: does the fail-open actually admit? ---');
   const loginAfter = await call('POST', '/api/auth/login', {
     body: { username: USER, password: PASSWORD },
