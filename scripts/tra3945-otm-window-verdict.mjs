@@ -36,6 +36,7 @@ const EXTENSION = 15;
 // `state.startedAt` to (or past) the candidate, so the filter empties by itself.
 const RULED_RECUTS = [
   {
+    windowId: 'otm-joint-arm-w1',
     rulingRef: 'TRA-3945 comment a9753fda (QuantTrader, verdictOwner, 2026-08-25T20:39:31.423Z)',
     candidateStartedAt: Date.UTC(2026, 7, 26, 4, 33, 57, 910),
   },
@@ -61,7 +62,8 @@ if (!/TRA-\d+/.test(note)) {
   process.exit(3);
 }
 const state = JSON.parse(readFileSync(file, 'utf8'));
-if (state.version !== 1 || state.windowId !== 'otm-joint-arm-w1') {
+// Any window in the family: a successor (w2, w3, ...) is graded by the same writer.
+if (state.version !== 1 || !/^otm-joint-arm-w\d+$/.test(String(state.windowId))) {
   console.error('refused: not a TRA-3945 window state file');
   process.exit(3);
 }
@@ -86,7 +88,7 @@ if (status === 'verdict_insufficient_population') {
     process.exit(3);
   }
 }
-const unexecuted = RULED_RECUTS.filter((r) => r.candidateStartedAt > state.startedAt);
+const unexecuted = RULED_RECUTS.filter((r) => r.windowId === state.windowId && r.candidateStartedAt > state.startedAt);
 if (unexecuted.length > 0 && args['ack-unexecuted-recuts'] !== 'true') {
   const which = unexecuted.map((r) => `${r.rulingRef} -> cut ${new Date(r.candidateStartedAt).toISOString()}`).join('; ');
   console.error(

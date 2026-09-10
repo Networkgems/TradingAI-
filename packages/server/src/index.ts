@@ -430,6 +430,7 @@ import {
   OTM_EVALUATION_VERDICT_STATUSES,
   applyOtmEvaluationVerdict,
   applyOtmEvaluationRecut,
+  applyOtmEvaluationSuccessor,
   previewOtmEvaluationRecut,
   foldOtmEvaluationWindow,
   loadOtmEvaluationWindowState,
@@ -11979,6 +11980,71 @@ app.post('/api/health/otm-evaluation-window/recut', requireAuth, requireAdmin, a
       avgRAfter: record.avgR,
       seRAfter: record.seR,
       wire: 'GET /api/health/options-live .evaluationWindow.recut',
+    });
+  } catch (err) {
+    res.status(409).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// TRA-3945 — the SUCCESSOR writer on the wire.
+//
+// The verdict owner's standing call (TRA-4342, 2026-09-04) is to re-register a
+// fresh window at the un-hold rather than resume a sample across the regime
+// gap; the un-hold went live 2026-09-10 (TRA-4520). Nothing could register one:
+// the window id was a constant and a verdict froze it. Refused unless the
+// current window is TERMINAL, so it can never stand in for a grade. Same shape
+// as the two routes above: dry-run by default, `apply=true` requires
+// `confirm=TRA-3945`, admin only; the predecessor's final fold is read off the
+// journal in the same beat, and the successor stamps itself on the next tick.
+app.post('/api/health/otm-evaluation-window/successor', requireAuth, requireAdmin, async (req, res) => {
+  const q = req.query as Record<string, unknown>;
+  const wantsApply = q['apply'] === 'true' || q['apply'] === '1';
+  const confirmed = q['confirm'] === 'TRA-3945';
+  if (wantsApply && !confirmed) {
+    res.status(400).json({
+      ok: false,
+      error: 'apply=true requires confirm=TRA-3945',
+      detail: 'A successor retires the current window from the wire and opens a new sample. The confirmation is what keeps a mistyped flag in the dry-run branch.',
+    });
+    return;
+  }
+  const apply = wantsApply && confirmed;
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const by = typeof body['by'] === 'string' && body['by'].trim() !== '' ? body['by'].trim() : null;
+  const note = typeof body['note'] === 'string' && body['note'].trim() !== '' ? body['note'].trim() : null;
+  if (!by || !note) {
+    res.status(400).json({ ok: false, error: 'body requires {by, note containing a TRA-nnnn ref}' });
+    return;
+  }
+  try {
+    const now = Date.now();
+    const journal = await listOptionTradeJournal();
+    const prev = await loadOtmEvaluationWindowState();
+    const next = applyOtmEvaluationSuccessor(prev, journal, { by, note }, now);
+    const retired = next.predecessors?.[next.predecessors.length - 1] ?? null;
+    const summary = {
+      statusBefore: otmEvaluationWindowStatus(prev),
+      retiredWindowId: prev.windowId,
+      retiredVerdict: prev.verdict,
+      retiredFinalReadout: retired?.finalReadout ?? null,
+      newWindowId: next.windowId,
+      newStatus: otmEvaluationWindowStatus(next),
+    };
+    if (!apply) {
+      res.json({ ok: true, applied: false, wouldWrite: summary, note: 'dry run - add ?apply=true&confirm=TRA-3945 to write' });
+      return;
+    }
+    await saveOtmEvaluationWindowState(next);
+    log.warn('TRA-3945 OTM evaluation window SUCCESSOR registered by hand', { ...summary, by, note });
+    const record = await tickOtmEvaluationWindowNow();
+    res.json({
+      ok: true,
+      applied: true,
+      ...summary,
+      statusAfter: record.status,
+      startedAtAfter: record.startedAt,
+      nAfter: record.n,
+      wire: 'GET /api/health/options-live .evaluationWindow (windowId, successor.predecessors)',
     });
   } catch (err) {
     res.status(409).json({ ok: false, error: err instanceof Error ? err.message : String(err) });

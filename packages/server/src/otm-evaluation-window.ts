@@ -129,6 +129,25 @@ import {
 const log = logger.child({ module: 'otm-evaluation-window' });
 
 export const OTM_EVALUATION_WINDOW_ID = 'otm-joint-arm-w1';
+
+/**
+ * TRA-3945 successor windows. `w1` is the first registration; a SUCCESSOR
+ * (`w2`, `w3`, …) re-registers the same pre-registration over a fresh sample
+ * after its predecessor is terminal. The id is the only thing that tells two
+ * windows' filings apart, so the loader accepts the whole family, never just w1.
+ */
+const OTM_EVALUATION_WINDOW_ID_RE = /^otm-joint-arm-w(\d+)$/;
+
+export function isOtmEvaluationWindowId(id: unknown): id is string {
+  return typeof id === 'string' && OTM_EVALUATION_WINDOW_ID_RE.test(id);
+}
+
+export function nextOtmEvaluationWindowId(id: string): string {
+  const m = OTM_EVALUATION_WINDOW_ID_RE.exec(id);
+  if (!m) throw new Error(`TRA-3945: not an evaluation window id: ${id}`);
+  return `otm-joint-arm-w${Number(m[1]) + 1}`;
+}
+
 export const OTM_EVALUATION_RULE_REF = 'TRA-375';
 export const OTM_EVALUATION_TARGET_CLOSES = 30;
 export const OTM_EVALUATION_EXTENSION_CLOSES = 15;
@@ -169,6 +188,8 @@ export const OTM_EVALUATION_RECUT_HISTORY_MAX = 20;
  * an unexecuted ruling cannot read as a done one.
  */
 export interface OtmEvaluationRuledRecut {
+  /** The window the ruling was made about. A ruling never follows the sample into a successor. */
+  windowId: string;
   /** The ruling's own reference — comment id + author + instant. */
   rulingRef: string;
   ruledAt: string;
@@ -196,6 +217,7 @@ export interface OtmEvaluationRuledRecut {
  */
 export const OTM_EVALUATION_RULED_RECUTS: readonly OtmEvaluationRuledRecut[] = [
   {
+    windowId: 'otm-joint-arm-w1',
     rulingRef: 'TRA-3945 comment a9753fda (QuantTrader, verdictOwner, 2026-08-25T20:39:31.423Z)',
     ruledAt: '2026-08-25T20:39:31.423Z',
     reason:
@@ -210,6 +232,15 @@ export const OTM_EVALUATION_RULED_RECUTS: readonly OtmEvaluationRuledRecut[] = [
     pinSource: 'TRA-4006 AC6 (LeadDev comment eb048f86) - /api/health/options-live read 2026-08-26T04:34:33Z, re-read 04:35Z',
   },
 ];
+
+/**
+ * The ruled re-cuts that bind THIS window. A ruling is about the sample it was
+ * made on; applied to a successor, the w1 ruling's 08-26 candidate would read
+ * as a BACKWARD cut and its preview would re-admit w1's closes into w2.
+ */
+export function ruledRecutsFor(windowId: string): readonly OtmEvaluationRuledRecut[] {
+  return OTM_EVALUATION_RULED_RECUTS.filter((r) => r.windowId === windowId);
+}
 
 export type OtmEvaluationWindowStatus =
   | 'armed'
@@ -402,6 +433,45 @@ export interface OtmEvaluationRecutEntry {
   startBuild: OtmEvaluationBuildPin | null;
 }
 
+/**
+ * A retired window, kept verbatim inside its successor's state so every filing
+ * made against it stays reproducible after the successor takes the wire.
+ */
+export interface OtmEvaluationPredecessor {
+  windowId: string;
+  startedAt: number | null;
+  startBuild: OtmEvaluationBuildPin | null;
+  recutHistory: OtmEvaluationRecutEntry[];
+  buildDriftTotal: number;
+  extension: OtmEvaluationWindowState['extension'];
+  baseline: OtmEvaluationBaseline | null;
+  populationCell: OtmEvaluationPopulationCell | null;
+  terminalAt: number | null;
+  verdict: OtmEvaluationVerdict | null;
+  /**
+   * The fold over the predecessor's own cut, read in the SAME beat as the
+   * successor write. The fold does not stop at a verdict, so this can exceed
+   * `verdict.atN` by the closes that landed between the verdict and the
+   * successor — both are kept so the difference stays visible.
+   */
+  finalReadout: {
+    n: number;
+    avgR: number | null;
+    seR: number | null;
+    winRate: number | null;
+    netUsd: number;
+    criteria: OtmEvaluationReadout['criteria'];
+    lastCloseAt: number | null;
+  };
+  retiredAt: number;
+  retiredBy: string;
+  /** Must carry the registering ticket reference. */
+  retiredNote: string;
+}
+
+/** Bound on the persisted predecessor chain. */
+export const OTM_EVALUATION_PREDECESSORS_MAX = 10;
+
 /** The persisted part. Everything else is derived on read. */
 export interface OtmEvaluationWindowState {
   version: 1;
@@ -410,6 +480,8 @@ export interface OtmEvaluationWindowState {
   startBuild: OtmEvaluationBuildPin | null;
   /** TRA-3945 re-cut log; `[]` on a record that has never been re-cut. */
   recutHistory?: OtmEvaluationRecutEntry[];
+  /** TRA-3945 retired windows, oldest first; absent/`[]` on the first registration. */
+  predecessors?: OtmEvaluationPredecessor[];
   buildDrift: OtmEvaluationPauseSpan[];
   buildDriftTotal: number;
   extension: { allowed: 1; closes: number; used: boolean; usedAt: number | null };
@@ -1003,7 +1075,7 @@ export function stepOtmEvaluationWindow(
  */
 export function unexecutedRuledRecuts(
   state: OtmEvaluationWindowState,
-  ruled: readonly OtmEvaluationRuledRecut[] = OTM_EVALUATION_RULED_RECUTS,
+  ruled: readonly OtmEvaluationRuledRecut[] = ruledRecutsFor(state.windowId),
 ): readonly OtmEvaluationRuledRecut[] {
   if (state.startedAt === null) return [];
   return ruled.filter((r) => r.candidateStartedAt > (state.startedAt as number));
@@ -1194,6 +1266,88 @@ export function applyOtmEvaluationRecut(
   };
 }
 
+// ── Successor (re-register the pre-registration over a fresh sample) ────────
+
+/**
+ * Hand-run only (the successor route — never the tick).
+ *
+ * The verdict owner's standing call (TRA-4342, 2026-09-04) is "RE-REGISTER a
+ * fresh window at the un-hold — never resume n=9 across a regime gap", and the
+ * CFO's sequence on TRA-4376 ends the same way. Nothing could write it: the
+ * window id was a constant, the loader discarded any other id, a verdict
+ * freezes the tick, and a graded window refuses a re-cut. So once w1 is
+ * retired, every later OTM close would be graded by no pre-registered rule —
+ * the exact failure this ticket exists to prevent.
+ *
+ * The precondition is the whole safety argument: a successor is refused
+ * unless the current window is TERMINAL (a written verdict, or the code's
+ * `inconclusive_terminal`). Otherwise re-registering would be an escape hatch
+ * from a grade — a live window with a bad interim could be swapped for a
+ * fresh one instead of being graded. Retiring stays the verdict owner's act
+ * (the verdict route); this only opens the next window after it.
+ *
+ * The successor inherits the PRE-REGISTRATION only (target, bar, rule, the
+ * liveness and cell predicates — all code constants). It is born `armed` with
+ * `startedAt: null`, so the ordinary one-shot tick stamps it on its own first
+ * all-true tick, freezing its own baseline and cell: no supplied instant, no
+ * back-dating. The predecessor is kept verbatim, with its final fold read off
+ * the journal in the same beat.
+ */
+export function applyOtmEvaluationSuccessor(
+  state: OtmEvaluationWindowState,
+  records: ReadonlyArray<CloseRow>,
+  successor: { by: string; note: string },
+  now: number,
+): OtmEvaluationWindowState {
+  if (!/TRA-\d+/.test(successor.note)) {
+    throw new Error('TRA-3945: a successor note must carry the registering ticket reference (TRA-nnnn)');
+  }
+  if (state.startedAt === null) {
+    throw new Error(`TRA-3945: ${state.windowId} never opened - there is nothing to succeed`);
+  }
+  if (!state.verdict && state.terminalAt === null) {
+    throw new Error(
+      `TRA-3945: successor REFUSED - ${state.windowId} is not terminal (status ${otmEvaluationWindowStatus(state)}). ` +
+      'A successor can only follow a graded window; re-registering over a live one would replace a grade with a fresh sample. ' +
+      'File the terminal first (POST /api/health/otm-evaluation-window/verdict), then register the successor.',
+    );
+  }
+  const readout = foldOtmEvaluationWindow(records, state, now);
+  const predecessor: OtmEvaluationPredecessor = {
+    windowId: state.windowId,
+    startedAt: state.startedAt,
+    startBuild: state.startBuild,
+    recutHistory: [...(state.recutHistory ?? [])],
+    buildDriftTotal: state.buildDriftTotal,
+    extension: { ...state.extension },
+    baseline: state.baseline,
+    populationCell: state.populationCell,
+    terminalAt: state.terminalAt,
+    verdict: state.verdict,
+    finalReadout: {
+      n: readout.n,
+      avgR: readout.avgR,
+      seR: readout.seR,
+      winRate: readout.winRate,
+      netUsd: readout.netUsd,
+      criteria: readout.criteria,
+      lastCloseAt: readout.lastCloseAt,
+    },
+    retiredAt: now,
+    retiredBy: successor.by,
+    retiredNote: successor.note,
+  };
+  const predecessors = [...(state.predecessors ?? []), predecessor];
+  if (predecessors.length > OTM_EVALUATION_PREDECESSORS_MAX) {
+    predecessors.splice(0, predecessors.length - OTM_EVALUATION_PREDECESSORS_MAX);
+  }
+  return {
+    ...emptyOtmEvaluationWindowState(),
+    windowId: nextOtmEvaluationWindowId(state.windowId),
+    predecessors,
+  };
+}
+
 // ── The published record ────────────────────────────────────────────────────
 
 export function buildOtmEvaluationWindowRecord(
@@ -1378,7 +1532,7 @@ export function buildOtmEvaluationWindowRecord(
         startedAt: new Date(h.startedAt).toISOString(),
         startBuild: h.startBuild,
       })),
-      ruled: OTM_EVALUATION_RULED_RECUTS.map((r, i) => ({
+      ruled: ruledRecutsFor(state.windowId).map((r, i) => ({
         rulingRef: r.rulingRef,
         ruledAt: r.ruledAt,
         reason: r.reason,
@@ -1413,6 +1567,47 @@ export function buildOtmEvaluationWindowRecord(
         currentCut: state.startedAt === null ? null : new Date(state.startedAt).toISOString(),
       })),
       override: 'body {acknowledgeUnexecutedRecuts: true} - the grader keeps the decision; the override is RECORDED in verdict.acknowledgedUnexecutedRecuts so the record says forever which population the terminal was written over',
+    },
+    // ── TRA-3945 successor (2026-09-10) ─────────────────────────────────────
+    //
+    // The verdict owner's standing call is to RE-REGISTER a fresh window at the
+    // un-hold rather than resume a sample across the regime gap. There was no
+    // writer for that either: a verdict froze the one window for good.
+    successor: {
+      writer: 'POST /api/health/otm-evaluation-window/successor (admin) body {by, note with a TRA-nnnn ref}; dry-run by default, apply=true requires confirm=TRA-3945',
+      precondition: 'the current window must be TERMINAL (a written verdict, or inconclusive_terminal). A successor never retires a live window - that would replace a grade with a fresh sample.',
+      ordering: 'retire THEN register: (1) any ruled re-cut, (2) the verdict, (3) the successor - all three before the next entry window opens, or closes that enter in between land in the retired window (its fold does not stop at the verdict).',
+      /** TRUE ⇒ the writer would accept a successor now. */
+      available: state.startedAt !== null && (state.verdict !== null || state.terminalAt !== null),
+      nextWindowId: isOtmEvaluationWindowId(state.windowId) ? nextOtmEvaluationWindowId(state.windowId) : null,
+      inherits: 'the pre-registration only: targetCloses, the seR bar, the TRA-375 rule, the liveness and population-cell predicates. NOT n, startedAt, baseline or the frozen cell - the successor stamps its own on its first all-true tick, exactly as w1 did. Ruled re-cuts stay with the window they were ruled on.',
+      costAccumulatorFollowsSuccessor: false as const,
+      costAccumulatorNote: 'The TRA-3974 cost accumulator is one write-once pin. A successor does not re-key it, so postPinCost.windowId names the window it was armed for; while that differs from windowId its sample is a SUPERSET of this window - never cite its p50 beside this avgR.',
+      predecessors: (state.predecessors ?? []).map((p) => ({
+        windowId: p.windowId,
+        startedAt: p.startedAt === null ? null : new Date(p.startedAt).toISOString(),
+        startBuild: p.startBuild,
+        recutHistory: p.recutHistory.map((h) => ({
+          at: new Date(h.at).toISOString(),
+          by: h.by,
+          note: h.note,
+          priorStartedAt: new Date(h.priorStartedAt).toISOString(),
+          priorN: h.priorN,
+          startedAt: new Date(h.startedAt).toISOString(),
+        })),
+        buildDriftTotal: p.buildDriftTotal,
+        baseline: p.baseline,
+        populationCell: p.populationCell,
+        terminalAt: p.terminalAt === null ? null : new Date(p.terminalAt).toISOString(),
+        verdict: p.verdict,
+        finalReadout: {
+          ...p.finalReadout,
+          lastCloseAt: p.finalReadout.lastCloseAt === null ? null : new Date(p.finalReadout.lastCloseAt).toISOString(),
+        },
+        retiredAt: new Date(p.retiredAt).toISOString(),
+        retiredBy: p.retiredBy,
+        retiredNote: p.retiredNote,
+      })),
     },
     baseline: state.baseline,
     n: readout.n,
@@ -1470,7 +1665,9 @@ export async function loadOtmEvaluationWindowState(): Promise<OtmEvaluationWindo
   try {
     const raw = await fs.readFile(storeFile(), 'utf8');
     const parsed = JSON.parse(raw) as Partial<OtmEvaluationWindowState>;
-    if (parsed && parsed.version === 1 && parsed.windowId === OTM_EVALUATION_WINDOW_ID) {
+    // Any id in the family: a successor's file must survive a restart. Discarding
+    // it would start an EMPTY w1 that the next tick stamps and saves over it.
+    if (parsed && parsed.version === 1 && isOtmEvaluationWindowId(parsed.windowId)) {
       cache = { ...emptyOtmEvaluationWindowState(), ...parsed };
       return cache;
     }
@@ -1532,7 +1729,7 @@ export async function tickOtmEvaluationWindow(args: {
   // never take its subject off the wire.
   let recutPreviews: Array<OtmEvaluationRecutPreview | null> | null = null;
   try {
-    recutPreviews = OTM_EVALUATION_RULED_RECUTS.map((r) =>
+    recutPreviews = ruledRecutsFor(state.windowId).map((r) =>
       state.startedAt === null ? null : previewOtmEvaluationRecut(args.records, state, r.candidateStartedAt, now));
   } catch (err) {
     log.warn('TRA-3945 re-cut preview failed; the record still publishes', {
@@ -1566,7 +1763,13 @@ function tickOtmWindowPostPinReads(
     ensureOtmWindowCostSubscription();
     loadOtmWindowCostAccumulator(state.windowId);
     const cell = state.populationCell;
-    if (state.startedAt !== null && cell && cell.frozen) {
+    // The pin is write-once. Once it is held for a different cut (a re-cut or a
+    // successor), offering the new one is a known refusal already published on
+    // the wire (`recut.costAccumulatorPin`, `postPinCost.windowId`) - do not
+    // re-log it at error level on every 60s tick.
+    const held = peekOtmWindowCostAccumulatorState();
+    const heldElsewhere = held !== null && held.startedAt !== null && held.startedAt !== state.startedAt;
+    if (state.startedAt !== null && cell && cell.frozen && !heldElsewhere) {
       armOtmWindowCostAccumulator({
         windowId: state.windowId,
         startedAt: state.startedAt,
