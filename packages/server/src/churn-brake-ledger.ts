@@ -42,6 +42,20 @@ const log = logger.child({ module: 'churn-brake-ledger' });
 /** Which conviction-DCA leg the same-day-loss rule halted. */
 export type ChurnDcaLeg = 'equity' | 'option';
 
+/**
+ * TRA-4462 defect 1 — which BOOK an admitted open landed in.
+ *
+ * The per-name cap is CROSS-SLEEVE **and cross-asset-class**: two of its six
+ * `recordChurnOpen` chokepoints are equity entries (`routeEquitySignal`,
+ * `openSma200Pullback`) and four are option entries (RV / OTM ×2 / directional).
+ * The option trade journal is, by construction, options-only — so an equity open
+ * counts toward the cap and is INVISIBLE in the journal. Reconciling the two
+ * without this split is what produced the 2026-09-08 MSTR reading: 26 rejects
+ * (cap 6, so ≥6 counted opens) against a journal that holds ZERO MSTR rows in its
+ * entire lifetime, on any day.
+ */
+export type ChurnOpenAssetClass = 'equity' | 'option';
+
 /** A per-symbol NEW-open counter scoped to one ET session. */
 interface EtDayCount {
   etDay: string;
@@ -104,11 +118,32 @@ function pushEvent(ev: ChurnBrakeEvent): void {
  * feeds, so this surface and the enforcement counter can never drift. Resets a
  * symbol's count at the ET-day roll (same-session semantics).
  */
-export function recordChurnBrakeOpen(symbol: string, etDay: string): void {
+export function recordChurnBrakeOpen(
+  symbol: string,
+  etDay: string,
+  // TRA-4462 — which book this open landed in. Optional so the existing tests and
+  // any caller that predates the split keep compiling; an omitted class records the
+  // durable ADMITTED event under `unknown` rather than guessing a book.
+  assetClass?: ChurnOpenAssetClass,
+  now: number = Date.now(),
+): void {
   const sym = normSymbol(symbol);
   const rec = opensBySymbol.get(sym);
   const count = rec && rec.etDay === etDay ? rec.count : 0;
   opensBySymbol.set(sym, { etDay, count: count + 1 });
+  // TRA-4462 — the DURABLE twin: an open the cap ADMITTED and that actually reached
+  // a book. `opensPresented`/`opensEvaluated` are counted at the cap chokepoint,
+  // which sits BEFORE the open and whose callers all `continue` on a downstream
+  // refusal, so neither of those is a count of opens. This is.
+  recordChurnBrakeGuardEvent({
+    ts: now,
+    etDay,
+    symbol: sym,
+    guardEnabled: true,
+    blocked: false,
+    kind: 'open_admitted',
+    ...(assetClass ? { assetClass } : {}),
+  });
 }
 
 /**
@@ -246,6 +281,26 @@ const GUARD_RETENTION_DAYS = 30;
  * is a structural no-op there).
  */
 export interface ChurnBrakeGuardEvent {
+  /**
+   * TRA-4462 — which chokepoint wrote this line.
+   *
+   *   `cap_verdict`   — one candidate EVALUATED by the cap, written from
+   *                     `churnOpenCapVerdict` BEFORE the open. Feeds
+   *                     presented/evaluated/rejected.
+   *   `open_admitted` — one open that actually reached a book, written from
+   *                     `recordChurnOpen` AFTER it. Feeds `opensAdmitted`.
+   *
+   * ABSENT ⇒ `cap_verdict`. That default is load-bearing, not tidiness: the live
+   * ledger already holds tens of thousands of lines written before this field
+   * existed, and re-reading them as anything else would silently restate every
+   * retained day's denominator on the first boot after deploy.
+   */
+  kind?: 'cap_verdict' | 'open_admitted';
+  /**
+   * TRA-4462 — the book an `open_admitted` line landed in. Only meaningful on that
+   * kind; absent ⇒ unknown (a pre-split line, or a chokepoint that did not say).
+   */
+  assetClass?: ChurnOpenAssetClass;
   /** Evaluation time, ms epoch. */
   ts: number;
   /** ET calendar day (America/New_York, YYYY-MM-DD) — the key the fold rolls on. */
@@ -270,6 +325,10 @@ interface GuardDayTally {
   evaluated: number;
   rejected: number;
   rejectsBySymbol: Map<string, number>;
+  /** TRA-4462 — opens the cap ADMITTED that actually reached a book, this ET day. */
+  admitted: number;
+  admittedByAssetClass: { equity: number; option: number; unknown: number };
+  admittedBySymbol: Map<string, number>;
   firstAt: number | null;
   lastAt: number | null;
 }
@@ -317,7 +376,17 @@ export function clearChurnBrakeGuardLedger(): void {
 function guardDayTally(etDay: string): GuardDayTally {
   let t = guardByDay.get(etDay);
   if (!t) {
-    t = { presented: 0, evaluated: 0, rejected: 0, rejectsBySymbol: new Map(), firstAt: null, lastAt: null };
+    t = {
+      presented: 0,
+      evaluated: 0,
+      rejected: 0,
+      rejectsBySymbol: new Map(),
+      admitted: 0,
+      admittedByAssetClass: { equity: 0, option: 0, unknown: 0 },
+      admittedBySymbol: new Map(),
+      firstAt: null,
+      lastAt: null,
+    };
     guardByDay.set(etDay, t);
   }
   return t;
@@ -326,6 +395,19 @@ function guardDayTally(etDay: string): GuardDayTally {
 /** Apply one guard event to the per-day aggregates (shared by record + hydrate). */
 function applyGuardEvent(ev: ChurnBrakeGuardEvent): void {
   const t = guardDayTally(ev.etDay);
+  // TRA-4462 — an ADMITTED-open line is a different population from a cap verdict.
+  // Folding it into `presented` would inflate the cap's own denominator with the
+  // opens it let through, which is the reverse of the defect this fixes.
+  if (ev.kind === 'open_admitted') {
+    t.admitted += 1;
+    const cls = ev.assetClass === 'equity' || ev.assetClass === 'option' ? ev.assetClass : 'unknown';
+    t.admittedByAssetClass[cls] += 1;
+    const sym = normSymbol(ev.symbol);
+    t.admittedBySymbol.set(sym, (t.admittedBySymbol.get(sym) ?? 0) + 1);
+    if (t.firstAt === null || ev.ts < t.firstAt) t.firstAt = ev.ts;
+    if (t.lastAt === null || ev.ts > t.lastAt) t.lastAt = ev.ts;
+    return;
+  }
   t.presented += 1;
   if (ev.guardEnabled) t.evaluated += 1;
   // A halt is only meaningful as a subset of the evaluated population (the
@@ -414,6 +496,13 @@ export function hydrateChurnBrakeGuardFromDisk(
       symbol: rec.symbol,
       guardEnabled: rec.guardEnabled,
       blocked: rec.blocked === true,
+      // TRA-4462 — a line whose `kind` this build does not recognise is normalised
+      // to `cap_verdict`, matching the absent-key default. Silently dropping it
+      // would let a forward-written line shrink a retained day's denominator.
+      ...(rec.kind === 'open_admitted' ? { kind: 'open_admitted' as const } : {}),
+      ...(rec.assetClass === 'equity' || rec.assetClass === 'option'
+        ? { assetClass: rec.assetClass }
+        : {}),
       ...(Number.isFinite(rec.count) ? { count: rec.count as number } : {}),
       ...(Number.isFinite(rec.cap) ? { cap: rec.cap as number } : {}),
     };
@@ -446,11 +535,38 @@ export function hydrateChurnBrakeGuardFromDisk(
 
 export interface ChurnBrakeGuardDaySummary {
   etDay: string;
+  /**
+   * Open CANDIDATES that reached the cap chokepoint. NOT a count of opens — the
+   * chokepoint runs BEFORE the open and every caller `continue`s on a downstream
+   * refusal (cost bar, sizing, quote gate, account refusal), so the overwhelming
+   * majority of these never became a position. Compare {@link opensAdmitted}.
+   */
   opensPresented: number;
   opensEvaluated: number;
   opensRejected: number;
   /** Per-symbol rejects for this day, most-rejected first (top N). */
   rejectsBySymbol: ChurnBrakeSymbolCount[];
+  /**
+   * TRA-4462 — opens the cap ADMITTED **and that actually reached a book** on this
+   * ET day, written from the post-open `recordChurnOpen` chokepoint. This is the
+   * counter the per-name cap's own count is built from, and therefore the only one
+   * a journal reconciliation may be run against.
+   */
+  opensAdmitted: number;
+  /**
+   * The admitted split by BOOK. The option trade journal can only ever contain the
+   * `option` cell; an `equity` open counts toward the same cross-sleeve per-name cap
+   * and is structurally absent from that journal. Reconcile
+   * `opensAdmittedByAssetClass.option` against the journal — never `opensAdmitted`,
+   * and never `opensPresented`.
+   *
+   * `unknown` = a line written before the split, or by a chokepoint that did not
+   * state its book. It is a stated cell, not an omission: a silently-absent key
+   * would let a partially-migrated ledger read as a fully-attributed one.
+   */
+  opensAdmittedByAssetClass: { equity: number; option: number; unknown: number };
+  /** Per-symbol ADMITTED opens for this day, busiest first (top N). */
+  admittedBySymbol: ChurnBrakeSymbolCount[];
 }
 
 /**
@@ -480,6 +596,21 @@ export interface ChurnBrakeGuardSummary {
   opensEvaluated: number;
   /** Candidates the cap refused. */
   opensRejected: number;
+  /** TRA-4462 — opens that actually reached a book, across the retained window. */
+  opensAdmitted: number;
+  /** TRA-4462 — the admitted split by book. See {@link ChurnBrakeGuardDaySummary}. */
+  opensAdmittedByAssetClass: { equity: number; option: number; unknown: number };
+  /**
+   * TRA-4462 — the ET day from which `opensAdmitted` is a complete count (the first
+   * retained day carrying at least one `open_admitted` line), or `null` when no such
+   * line is retained at all.
+   *
+   * Every day retained from BEFORE this cut was written by a build with no admitted
+   * chokepoint, so its `opensAdmitted: 0` means UNRECORDED, not "nothing opened".
+   * Without this field those two states are byte-identical, which is the exact
+   * failure this ticket exists to remove — reintroduced by its own fix.
+   */
+  opensAdmittedSinceEtDay: string | null;
   /** Every ET day still retained, ascending. */
   etDays: string[];
   /** How many days back the ledger retains — a read gap wider than this can miss a reject. */
@@ -491,6 +622,8 @@ export interface ChurnBrakeGuardSummary {
   lastRejectedAt: number | null;
   durability: ChurnBrakeGuardDurability;
   note: string;
+  /** TRA-4462 — the journal-reconciliation rule, on the wire. See {@link RECONCILIATION_NOTE}. */
+  reconciliation: string;
 }
 
 /** Fold the guard store into the read-only health diagnostics. Pure — no IO. */
@@ -498,6 +631,9 @@ export function summarizeChurnBrakeGuard(): ChurnBrakeGuardSummary {
   let presented = 0;
   let evaluated = 0;
   let rejected = 0;
+  let admitted = 0;
+  const admittedByAssetClass = { equity: 0, option: 0, unknown: 0 };
+  let admittedSinceEtDay: string | null = null;
   let lastEvaluatedAt: number | null = null;
   let lastRejectedAt: number | null = null;
   const etDays = [...guardByDay.keys()].sort();
@@ -507,6 +643,13 @@ export function summarizeChurnBrakeGuard(): ChurnBrakeGuardSummary {
     presented += t.presented;
     evaluated += t.evaluated;
     rejected += t.rejected;
+    admitted += t.admitted;
+    admittedByAssetClass.equity += t.admittedByAssetClass.equity;
+    admittedByAssetClass.option += t.admittedByAssetClass.option;
+    admittedByAssetClass.unknown += t.admittedByAssetClass.unknown;
+    // `etDays` is sorted ascending, so the first day with an admitted line is the
+    // earliest one this counter can honestly speak for.
+    if (admittedSinceEtDay === null && t.admitted > 0) admittedSinceEtDay = etDay;
     if (t.lastAt !== null && (lastEvaluatedAt === null || t.lastAt > lastEvaluatedAt)) {
       lastEvaluatedAt = t.lastAt;
     }
@@ -521,6 +664,12 @@ export function summarizeChurnBrakeGuard(): ChurnBrakeGuardSummary {
       opensEvaluated: t.evaluated,
       opensRejected: t.rejected,
       rejectsBySymbol: [...t.rejectsBySymbol.entries()]
+        .map(([symbol, count]) => ({ symbol, count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, TOP_SYMBOLS),
+      opensAdmitted: t.admitted,
+      opensAdmittedByAssetClass: { ...t.admittedByAssetClass },
+      admittedBySymbol: [...t.admittedBySymbol.entries()]
         .map(([symbol, count]) => ({ symbol, count }))
         .sort((a, b) => b.count - a.count)
         .slice(0, TOP_SYMBOLS),
@@ -541,6 +690,9 @@ export function summarizeChurnBrakeGuard(): ChurnBrakeGuardSummary {
     opensPresented: presented,
     opensEvaluated: evaluated,
     opensRejected: rejected,
+    opensAdmitted: admitted,
+    opensAdmittedByAssetClass: admittedByAssetClass,
+    opensAdmittedSinceEtDay: admittedSinceEtDay,
     etDays,
     retentionDays: GUARD_RETENTION_DAYS,
     byEtDay,
@@ -558,5 +710,44 @@ export function summarizeChurnBrakeGuard(): ChurnBrakeGuardSummary {
       'TRA-4335 — durable per-ET-day open-cap guard counters (restart-safe, unlike the '
       + 'since-boot fields beside this block). state=dark means candidates arrived while '
       + 'ENABLE_CHURN_LOSS_BRAKE was off; live_clean means the cap ran and refused nothing.',
+    reconciliation: RECONCILIATION_NOTE,
   };
 }
+
+/**
+ * TRA-4462 defect 1 — the reconciliation rule, published ON THE WIRE.
+ *
+ * The 2026-09-08 reading that opened the ticket: `opensRejected: 26` for MSTR (cap
+ * 6, so the cap's own count had reached 6) against an option journal holding ZERO
+ * opens that ET day. Both surfaces were correct; the comparison was not. Two
+ * independent reasons, and each is sufficient on its own:
+ *
+ *  1. **Wrong denominator — the cap is CROSS-ASSET-CLASS, the journal is not.** The
+ *     count the cap compares against is `max(in-memory churnOpensToday, durable
+ *     anySleeveOpensFor)`, both fed only by `recordChurnOpen`, which fires from six
+ *     chokepoints — TWO of them EQUITY entries. The option trade journal cannot
+ *     contain an equity open. (Measured: MSTR has zero option-journal rows across
+ *     the full 3,558-row lifetime dump, on every day, not just 09-08.)
+ *
+ *  2. **`opensPresented` is not a count of opens.** It is counted at the cap
+ *     chokepoint, which runs BEFORE the open; every caller then `continue`s if the
+ *     account/cost/quote path refuses. 09-08 presented 8,460 candidates while the
+ *     journal recorded 0 option opens — presented/evaluated are an ATTEMPT
+ *     denominator, and `presented - rejected` is not "admitted".
+ *
+ * Not a cause: ET-day bucketing. Both sides key on `etDateString`, so DST and the
+ * UTC/ET boundary are common-mode and cannot produce this.
+ */
+const RECONCILIATION_NOTE =
+  'TRA-4462 — HOW TO RECONCILE THIS AGAINST THE OPTION JOURNAL. '
+  + '`opensPresented`/`opensEvaluated` count CANDIDATES at the cap chokepoint, which runs '
+  + 'BEFORE the open; callers continue on any downstream refusal, so they are an ATTEMPT '
+  + 'denominator and `opensPresented - opensRejected` is NOT the number of opens admitted. '
+  + '`opensAdmitted` is, written post-open from the same `recordChurnOpen` chokepoint the '
+  + 'per-name cap counts from. The cap is CROSS-SLEEVE AND CROSS-ASSET-CLASS (2 of its 6 '
+  + 'chokepoints are equity entries), while /api/health/option-journal is options-only — so '
+  + 'the only journal-comparable cell is `opensAdmittedByAssetClass.option`. An `equity` '
+  + 'admit counts toward the cap and is structurally absent from that journal, which is why '
+  + '2026-09-08 shows 26 MSTR rejects against a journal that holds no MSTR row on any day. '
+  + 'Before comparing any day, check `opensAdmittedSinceEtDay`: a retained day earlier than '
+  + 'that cut predates this counter and its `opensAdmitted: 0` means UNRECORDED, not zero.';

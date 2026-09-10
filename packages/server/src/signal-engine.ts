@@ -265,6 +265,7 @@ import {
   recordChurnBrakeDcaHalt,
   recordChurnBrakeGuardEvent, // TRA-4335 — the durable presented/evaluated/rejected denominator
 } from './churn-brake-ledger.js';
+import type { ChurnOpenAssetClass } from './churn-brake-ledger.js';
 import {
   isDirectionalQualityGateEnabled,
   resolveDirectionalQualityThresholds,
@@ -7783,7 +7784,7 @@ export class SignalEngine {
       if (signal.forwardTestOnly) pos.forwardTestOnly = true;
       this.positionSignalType.set(pos.id, signal.type);
       this.emitFillAlert(pos, signal.type); // TRA-563 fill alert
-      this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
+      this.recordChurnOpen(signal.symbol, 'equity'); // TRA-1408 per-name same-session churn counter
       recordEquityEntryAdmitted(funnelMode, funnelEngineId); // TRA-1768 — reached the book
       // TRA-1980 — SHADOW-first pre-trade liquidity record on the live-equity mirror.
       if (this.mode === 'live') void this.recordEquityLiquidityShadow(orderSignal, pos);
@@ -9012,7 +9013,19 @@ export class SignalEngine {
    * unconditionally (independent of the flag) so arming the brake mid-session sees
    * an honest count; the count is cheap and self-resets on the ET-day roll.
    */
-  private recordChurnOpen(symbol: string, sleeve: OpenSleeve = 'other', now = Date.now()): void {
+  private recordChurnOpen(
+    symbol: string,
+    // TRA-4462 — which BOOK this open landed in, stated by the chokepoint rather
+    // than inferred. The cap is cross-asset-class (this method is called from two
+    // equity entry paths and four option ones) while /api/health/option-journal is
+    // options-only, so without this the two surfaces cannot be reconciled at all —
+    // which is how 26 MSTR rejects on 2026-09-08 read as a contradiction against a
+    // journal that has never held an MSTR row. NOT derivable from `sleeve`, which
+    // splits `directional` vs everything-else for a different cap.
+    assetClass: ChurnOpenAssetClass,
+    sleeve: OpenSleeve = 'other',
+    now = Date.now(),
+  ): void {
     if (this.mode === 'live') return;
     const etDay = etDateString(new Date(now));
     const rec = this.churnOpensToday.get(symbol);
@@ -9021,7 +9034,10 @@ export class SignalEngine {
     // TRA-1481 — mirror into the telemetry ledger from this single chokepoint so
     // `/api/health/churn-brake`'s per-name session counters never drift from the
     // enforcement counter above.
-    recordChurnBrakeOpen(symbol, etDay);
+    // TRA-4462 — this call ALSO writes the durable `open_admitted` guard line, i.e.
+    // the only counter on that surface that is a count of opens rather than of
+    // attempts. Same single chokepoint, so it cannot drift from the cap's count.
+    recordChurnBrakeOpen(symbol, etDay, assetClass, now);
     // TRA-1486 D2 — ALSO write-through to the DURABLE per-name/ET-day ledger. The
     // in-memory `churnOpensToday` above resets on every reboot, which is exactly why
     // the per-name cap leaked on bqb1 (multiple reboots/session → count restarted at
@@ -12081,7 +12097,7 @@ export class SignalEngine {
           this.activeRiskSizingMultiplier('options_single_leg') * optionCapScale,
         );
         if (!opened) continue;
-        this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
+        this.recordChurnOpen(signal.symbol, 'option'); // TRA-1408 per-name same-session churn counter
         // TRA-1662 — shadow the maker chase this demo open did NOT route.
         this.beginShadowMakerChase('single_leg_rv', signal, opened);
 
@@ -14023,7 +14039,7 @@ export class SignalEngine {
           // that fills carries its level from its very first exit tick; a failed
           // mirror rolls the paper open back and takes the stamp with it.
           await this.stampOtmAtrInvalidation(openedLive);
-          this.recordChurnOpen(signal.symbol);
+          this.recordChurnOpen(signal.symbol, 'option');
           this.beginShadowMakerChase('single_leg_otm', signal, openedLive);
 
           // ASK-ONLY smart-open ladder: the single limit is the ask (fraction 1, no
@@ -14121,7 +14137,7 @@ export class SignalEngine {
         // carry no invalidation level would report a stop the live book has.
         await this.stampOtmAtrInvalidation(opened);
         scanRun.opened();
-        this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
+        this.recordChurnOpen(signal.symbol, 'option'); // TRA-1408 per-name same-session churn counter
         // TRA-1662 — shadow the maker chase this demo open did NOT route.
         this.beginShadowMakerChase('single_leg_otm', signal, opened);
 
@@ -15494,7 +15510,7 @@ export class SignalEngine {
         // TRA-1564 B2 — tag the sleeve `directional` so this open feeds the
         // directional-only cap read + health view (the other four chokepoints record
         // as `other` and count toward the cross-sleeve churn brake only).
-        this.recordChurnOpen(sym, 'directional', asOf);
+        this.recordChurnOpen(sym, 'option', 'directional', asOf);
 
         // TRA-1490 — DARK live-capital broker mirror. Re-assert the arm flag on
         // the broker-submit condition itself (defense-in-depth): the caller +
@@ -18456,7 +18472,7 @@ export class SignalEngine {
       this.stampRiskThrottleOnPosition(pos);
       this.positionSignalType.set(pos.id, signal.type);
       this.emitFillAlert(pos, signal.type); // TRA-563 fill alert
-      this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
+      this.recordChurnOpen(signal.symbol, 'equity'); // TRA-1408 per-name same-session churn counter
       recordEquityEntryAdmitted(funnelMode, funnelEngineId); // TRA-1768 — reached the book
       // TRA-1980 — SHADOW-first pre-trade liquidity record on the live-equity mirror.
       if (this.mode === 'live') void this.recordEquityLiquidityShadow(signal, pos);

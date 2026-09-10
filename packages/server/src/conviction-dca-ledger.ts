@@ -401,7 +401,22 @@ export interface ConvictionDcaGuardEvent {
   netEtDay: number | null;
 }
 
-/** Per-partition guard counters. `addsHalted ≤ addsEvaluated ≤ addsPresented` always. */
+/**
+ * TRA-4462 defect 2 — the rounding grain of `netEtDay`.
+ *
+ * `netEtDay` is stored as `Number((realized + unrealized).toFixed(2))`, so a net of
+ * −0.001 lands on the wire as `-0` and `-0 >= 0` is `true` in JS. Testing "was this
+ * candidate net-POSITIVE on the day?" with a bare `>= 0` would therefore classify a
+ * correctly-halted sub-cent loser as a candidate the rule should have admitted, and
+ * manufacture a `failing_closed` verdict out of arithmetic. The bar is one grain
+ * above the rounding floor.
+ */
+const NET_POSITIVE_USD = 0.005;
+
+/**
+ * Per-partition guard counters. `addsHalted ≤ addsEvaluated ≤ addsPresented` always,
+ * and `addsPassed + addsHalted === addsEvaluated`.
+ */
 export interface ConvictionDcaGuardBucket {
   /** Add candidates that reached the brake chokepoint. */
   addsPresented: number;
@@ -409,9 +424,65 @@ export interface ConvictionDcaGuardBucket {
   addsEvaluated: number;
   /** Candidates the rule refused. */
   addsHalted: number;
+  /**
+   * TRA-4462 — candidates the rule RAN ON and ADMITTED. Stated explicitly rather
+   * than left as `addsEvaluated - addsHalted`: the arithmetic is trivial, but a
+   * reader who never computes it never notices a partition where it is ZERO, which
+   * is the whole finding on the equity leg (172/172 halted since 2026-06-01).
+   */
+  addsPassed: number;
+  /**
+   * TRA-4462 — **the discriminator.** Evaluated candidates whose name was net
+   * POSITIVE on the ET day (`netEtDay >= ${NET_POSITIVE_USD}`), i.e. candidates the
+   * same-day-loss rule is REQUIRED to admit.
+   *
+   * A partition with `addsPassed: 0` reads identically whether the rule is (a)
+   * correctly refusing a run of genuine same-day losers or (b) hard-failing closed
+   * on that partition — UNLESS you know whether a candidate the rule was obliged to
+   * admit ever arrived. This is that number. `0` ⇒ the population never contained a
+   * pass candidate, so the halt count is not evidence the rule can admit. `>0`
+   * alongside `haltedAtPositiveNet > 0` ⇒ the rule refused an add it had no grounds
+   * to refuse, which is a BUG, not a statistic.
+   */
+  presentedAtPositiveNet: number;
+  /** Candidates HALTED despite `netEtDay >= ${NET_POSITIVE_USD}`. Non-zero is a finding. */
+  haltedAtPositiveNet: number;
+  /**
+   * Range of `netEtDay` across evaluated candidates (null when none carried a finite
+   * net). `netEtDayMax` is the closest this partition's population ever came to the
+   * pass boundary — the distance from 0 says how far the sample is from ever having
+   * been able to test the admit path.
+   */
+  netEtDayMin: number | null;
+  netEtDayMax: number | null;
   firstAt: number | null;
   lastAt: number | null;
 }
+
+/**
+ * TRA-4462 — what a partition's halt count is EVIDENCE OF. Derived, never stored,
+ * so it can never disagree with the counters beside it.
+ *
+ * `state` (above) answers "did the rule run?". This answers the question that
+ * actually matters on a safety brake with a 100% halt rate: "is a PASS reachable
+ * here at all, and if none was observed, is that because none was owed?"
+ */
+export type ConvictionDcaGuardPassState =
+  /** The rule never ran on this partition — nothing to say. */
+  | 'no_candidates'
+  /** At least one candidate was admitted: the admit path demonstrably works here. */
+  | 'pass_observed'
+  /**
+   * A candidate arrived net-POSITIVE on the day and was halted anyway. The rule is
+   * refusing adds it has no grounds to refuse — a wiring bug, NOT a statistic.
+   */
+  | 'failing_closed'
+  /**
+   * Zero passes, and zero candidates the rule was obliged to admit ever arrived.
+   * The halt count is therefore NOT evidence the brake works; the sample cannot
+   * distinguish a working brake from one hard-failed closed. See TRA-4462 defect 2.
+   */
+  | 'no_pass_candidate';
 
 /**
  * The named verdict a bare zero could not express. Derived, never stored — so it can
@@ -430,7 +501,18 @@ export type ConvictionDcaGuardState =
   | 'mixed';
 
 function emptyGuardBucket(): ConvictionDcaGuardBucket {
-  return { addsPresented: 0, addsEvaluated: 0, addsHalted: 0, firstAt: null, lastAt: null };
+  return {
+    addsPresented: 0,
+    addsEvaluated: 0,
+    addsHalted: 0,
+    addsPassed: 0,
+    presentedAtPositiveNet: 0,
+    haltedAtPositiveNet: 0,
+    netEtDayMin: null,
+    netEtDayMax: null,
+    firstAt: null,
+    lastAt: null,
+  };
 }
 
 function foldIntoGuardBucket(bucket: ConvictionDcaGuardBucket, ev: ConvictionDcaGuardEvent): void {
@@ -440,8 +522,43 @@ function foldIntoGuardBucket(bucket: ConvictionDcaGuardBucket, ev: ConvictionDca
   // meaningful as a subset of the evaluated population, and letting an impossible
   // combination through would break `addsHalted ≤ addsEvaluated`.
   if (ev.guardEnabled && ev.halted) bucket.addsHalted += 1;
+  // TRA-4462 — the admit side of the same population, and the net distribution that
+  // says whether a pass was ever OWED. Scoped to `guardEnabled` for the same reason
+  // `addsHalted` is: a dark candidate is not a verdict, so it must not enter either
+  // numerator or the range.
+  if (ev.guardEnabled) {
+    if (!ev.halted) bucket.addsPassed += 1;
+    if (typeof ev.netEtDay === 'number' && Number.isFinite(ev.netEtDay)) {
+      if (bucket.netEtDayMin == null || ev.netEtDay < bucket.netEtDayMin) {
+        bucket.netEtDayMin = ev.netEtDay;
+      }
+      if (bucket.netEtDayMax == null || ev.netEtDay > bucket.netEtDayMax) {
+        bucket.netEtDayMax = ev.netEtDay;
+      }
+      if (ev.netEtDay >= NET_POSITIVE_USD) {
+        bucket.presentedAtPositiveNet += 1;
+        if (ev.halted) bucket.haltedAtPositiveNet += 1;
+      }
+    }
+  }
   if (bucket.firstAt == null || ev.ts < bucket.firstAt) bucket.firstAt = ev.ts;
   if (bucket.lastAt == null || ev.ts > bucket.lastAt) bucket.lastAt = ev.ts;
+}
+
+/**
+ * TRA-4462 — derive {@link ConvictionDcaGuardPassState} for one partition. Pure.
+ *
+ * `failing_closed` is tested FIRST and independently of `addsPassed`: a partition
+ * that admits most candidates but halts one it was obliged to admit is still buggy,
+ * and ranking `pass_observed` above it would let a busy leg hide a real refusal.
+ */
+export function convictionDcaGuardPassStateOf(
+  bucket: ConvictionDcaGuardBucket,
+): ConvictionDcaGuardPassState {
+  if (bucket.addsEvaluated === 0) return 'no_candidates';
+  if (bucket.haltedAtPositiveNet > 0) return 'failing_closed';
+  if (bucket.addsPassed > 0) return 'pass_observed';
+  return 'no_pass_candidate';
 }
 
 function guardStateOf(bucket: ConvictionDcaGuardBucket): ConvictionDcaGuardState {
@@ -505,11 +622,30 @@ export function recordConvictionDcaGuardEvaluation(ev: ConvictionDcaGuardEvent):
 export interface ConvictionDcaGuardSummary extends ConvictionDcaGuardBucket {
   /** The named verdict — what the counters above MEAN. */
   state: ConvictionDcaGuardState;
+  /**
+   * TRA-4462 — whether a PASS is reachable at all, pooled. Read this beside
+   * {@link passStateByClass}: a pooled `pass_observed` carried entirely by one leg
+   * is exactly how the equity leg's zero stayed invisible for three months.
+   */
+  passState: ConvictionDcaGuardPassState;
   /** Same counts per book, and per asset-class leg. */
   byAccount: Record<string, ConvictionDcaGuardBucket>;
   byClass: Record<ConvictionDcaClassKey, ConvictionDcaGuardBucket>;
   /** Per-book named verdicts, so one dark book cannot hide behind a busy one. */
   stateByAccount: Record<string, ConvictionDcaGuardState>;
+  /**
+   * TRA-4462 — per-LEG pass-state verdicts. The equity and option legs are two
+   * different predicates over two different populations sharing one field name;
+   * pooling them is what let `addsHalted: 8572` read as evidence the brake works
+   * while one of its two legs had never once admitted an add.
+   */
+  passStateByClass: Record<ConvictionDcaClassKey, ConvictionDcaGuardPassState>;
+  /** Per-book pass-state verdicts, same rationale as {@link stateByAccount}. */
+  passStateByAccount: Record<string, ConvictionDcaGuardPassState>;
+  /** The USD bar `presentedAtPositiveNet` / `haltedAtPositiveNet` apply. */
+  netPositiveThresholdUsd: number;
+  /** What the pass-state fields mean, on the wire, for a reader who has no ticket. */
+  passStateNote: string;
   /** Distinct books with ≥1 presented candidate. */
   accountCount: number;
   retainedEventCount: number;
@@ -548,13 +684,36 @@ export function summarizeConvictionDcaGuard(
     foldIntoGuardBucket(byCls[cls], ev);
   }
   const stateByAccount: Record<string, ConvictionDcaGuardState> = {};
-  for (const [key, bucket] of Object.entries(byAcct)) stateByAccount[key] = guardStateOf(bucket);
+  const passStateByAccount: Record<string, ConvictionDcaGuardPassState> = {};
+  for (const [key, bucket] of Object.entries(byAcct)) {
+    stateByAccount[key] = guardStateOf(bucket);
+    passStateByAccount[key] = convictionDcaGuardPassStateOf(bucket);
+  }
+  const passStateByClass = {
+    equity: convictionDcaGuardPassStateOf(byCls.equity),
+    option: convictionDcaGuardPassStateOf(byCls.option),
+    unknown: convictionDcaGuardPassStateOf(byCls.unknown),
+  } satisfies Record<ConvictionDcaClassKey, ConvictionDcaGuardPassState>;
   return {
     ...pooled,
     state: guardStateOf(pooled),
+    passState: convictionDcaGuardPassStateOf(pooled),
     byAccount: byAcct,
     byClass: byCls,
     stateByAccount,
+    passStateByClass,
+    passStateByAccount,
+    netPositiveThresholdUsd: NET_POSITIVE_USD,
+    passStateNote:
+      'TRA-4462 — `state` says whether the rule RAN; `passState` says whether a PASS was '
+      + 'reachable. A partition with addsPassed:0 reads identically whether the rule is '
+      + 'correctly halting genuine same-day losers or hard-failing closed, so read '
+      + '`presentedAtPositiveNet` (evaluated candidates the rule was OBLIGED to admit, '
+      + `netEtDay >= ${NET_POSITIVE_USD}). no_pass_candidate = zero passes and zero such `
+      + 'candidates ever arrived ⇒ the halt count is NOT evidence the brake works. '
+      + 'failing_closed = one arrived and was halted anyway ⇒ a bug, not a statistic. '
+      + 'Grade per LEG (`passStateByClass`), never pooled: the equity and option legs are '
+      + 'different predicates over different populations behind one field name.',
     accountCount: Object.values(byAcct).filter((b) => b.addsPresented > 0).length,
     retainedEventCount: guardEvents.length,
     droppedEventCount: droppedGuardEvents,

@@ -2116,6 +2116,28 @@ export interface OptionJournalReport {
    */
   rowsCarryMarks?: false;
   /**
+   * TRA-4462 AC2 — **the dump's own denominator, stated on the wire.**
+   *
+   * `summary` folds the whole filtered set; `rows` is a SUBSET selected by
+   * `rowsMode`. The two are documented as different populations in this file, but
+   * nothing in the payload said so, and nothing said BY HOW MANY — so a reader who
+   * folds `rows[]` and compares it to `summary.total` gets a mismatch with no way
+   * to tell a scoping rule from a lost row. On 2026-09-09 that read as a 67-row
+   * integrity gap on a `?rows=demo` fetch (3,491 vs 3,558) and was filed as a
+   * defect; it is exactly `notDemoMode: 32` + `stillOpen: 35`, i.e. the two
+   * documented exclusions, and `?rows=all` returns 3,558 === 3,558.
+   *
+   * INVARIANT, and the reason this is emitted rather than left to arithmetic:
+   *   `rowsDumped + Σ rowsExcludedFromDump[*] === summary.total`, in EVERY mode.
+   * Each mode states its own exclusions; a cell that cannot apply reads `0`, never
+   * an omitted key — an absent key is how a partially-populated payload reads as a
+   * fully-reconciled one.
+   */
+  rowsDumped?: number;
+  rowsExcludedFromDump?: OptionJournalDumpExclusions;
+  /** TRA-4462 AC2 — how to read the two counts above. */
+  rowsDumpNote?: string;
+  /**
    * TRA-1046 (TRA-1041c L1) — freshness of the learned-weights fold. `generation`
    * bumps on each recompute (a close event or TTL lapse), so a probe can confirm
    * the weights refreshed intraday after a demo trade closed rather than only at
@@ -2845,6 +2867,64 @@ export function parseCohortTsParam(raw: unknown, param: string): CohortTsParse {
   return { ok: true, value };
 }
 
+/**
+ * TRA-4462 AC2 — why each row in the filtered set is NOT in `rows`. Every cell is
+ * always present, including the ones the active `rowsMode` cannot produce: a stated
+ * `0` and an omitted key are the same bytes to a reader that tests for the key, and
+ * the whole point here is that the payload account for the gap by itself.
+ */
+export interface OptionJournalDumpExclusions {
+  /** Dropped for `mode !== 'demo'` (live rows). Only `rowsMode: 'demo'` drops these. */
+  notDemoMode: number;
+  /** Dropped for `outcome === 'OPEN'`. Only `rowsMode: 'demo'` drops these. */
+  stillOpen: number;
+  /** Dropped for being already resolved. Only `rowsMode: 'open'` drops these. */
+  alreadyClosed: number;
+  /**
+   * The `?rows=` value was not recognised, so an EMPTY dump was served deliberately
+   * (TRA-2082) and the whole filtered set sits here. Its own cell rather than one of
+   * the scoping cells above — reporting these as mode/outcome exclusions would name
+   * a filter that never ran.
+   */
+  unrecognisedMode: number;
+}
+
+/**
+ * TRA-4462 AC2 — count the rows `rowsMode` excluded from the dump, off the SAME
+ * filtered set the summary folds. Every cell is always stated, including the ones a
+ * given mode cannot drop (they read `0`), so a reader never has to know which mode
+ * omits which key to check the invariant in {@link OptionJournalReport.rowsDumped}.
+ */
+function dumpExclusions(
+  summaryRows: readonly OptionTradeJournalRecord[],
+  rowsMode: 'demo' | 'open' | 'all' | null | undefined,
+): OptionJournalDumpExclusions {
+  const zero = { notDemoMode: 0, stillOpen: 0, alreadyClosed: 0, unrecognisedMode: 0 };
+  if (rowsMode === 'all') return zero;
+  if (rowsMode === 'demo') {
+    let notDemoMode = 0;
+    let stillOpen = 0;
+    for (const r of summaryRows) {
+      // Order matters and mirrors the dump predicate exactly: a LIVE row that is
+      // also OPEN is dropped by the mode test first, so counting it in both cells
+      // would over-explain the gap and break the sum.
+      if (r.mode !== 'demo') notDemoMode += 1;
+      else if (r.outcome === 'OPEN') stillOpen += 1;
+    }
+    return { ...zero, notDemoMode, stillOpen };
+  }
+  if (rowsMode === 'open') {
+    let alreadyClosed = 0;
+    for (const r of summaryRows) if (r.outcome !== 'OPEN') alreadyClosed += 1;
+    return { ...zero, alreadyClosed };
+  }
+  // `null` — an unrecognised `?rows=` value serves a deliberately EMPTY dump. Its
+  // own cell, not one of the scoping cells: attributing these rows to `notDemoMode`
+  // would report a filter that was never applied, and the whole point of the null
+  // mode is that NO population was selected.
+  return { ...zero, unrecognisedMode: summaryRows.length };
+}
+
 export function buildOptionJournalReport(
   rows: Parameters<typeof summarizeOptionTradeJournal>[0],
   now: number,
@@ -3023,6 +3103,23 @@ export function buildOptionJournalReport(
           // Journal rows are entry economics; they hold no live mark. Say so
           // rather than letting a consumer read a missing field as $0 unrealized.
           rowsCarryMarks: false as const,
+          // TRA-4462 AC2 — the dump's denominator, counted off the SAME `summaryRows`
+          // set the summary folds, so the invariant below is arithmetic rather than a
+          // claim. Re-deriving either side from `rows` would make them agree with
+          // themselves and prove nothing.
+          rowsDumped: dumpRows.length,
+          rowsExcludedFromDump: dumpExclusions(
+            summaryRows as OptionTradeJournalRecord[],
+            rowsMode,
+          ),
+          rowsDumpNote:
+            'TRA-4462 — `rows` is a SUBSET of the population `summary` folds, selected by '
+            + '`rowsMode`; do NOT compare rows.length against summary.total. '
+            + 'rowsDumped + the SUM of every cell in rowsExcludedFromDump === summary.total, '
+            + 'always, in every mode. rowsMode=demo drops live rows AND still-OPEN rows '
+            + '(it is the resolved-demo cohort); rowsMode=open keeps only OPEN rows, both '
+            + 'modes; rowsMode=all drops nothing. Use ?rows=all for a row-level expansion of '
+            + '`summary`.',
         }),
   };
 }
