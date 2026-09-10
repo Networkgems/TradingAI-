@@ -38,6 +38,7 @@ import {
   type OptionTradeJournalRecord,
 } from './option-trade-journal.js';
 import { rowFromJournalRecord } from './export-history.js';
+import { buildOptionJournalReport } from './observability/health-routes.js';
 import { PaperOptionsAccount, type OptionExitRiskInput } from './options-account.js';
 import { profitLockDecision } from '@trading-app/engine';
 import type { OtmMispricingSignal } from '@trading-app/shared';
@@ -377,6 +378,100 @@ describe('TRA-4246 AC3 — the cell publishes a MEASURED divisor beside the gate
     )!;
     expect(cell.stopRPerPremiumR!.n).toBe(1);
     expect(cell.stopRPerPremiumR!.missing).toBe(2);
+  });
+});
+
+// ── AC1/AC2 — the grader's READ path ─────────────────────────────────────────
+//
+// Measured 2026-09-10 on bqb1: 4 post-boot desk closes, every one carrying the
+// stop-basis divisor on `/api/health/option-journal` — and ZERO of them
+// readable, because the only route serving `pnl_r_stop_basis` is the
+// caller-book-scoped export and `profitLockFire` was served by no route at all.
+// Stamped-and-unreadable is not "a READ, not a derivation".
+
+describe('TRA-4246 AC1/AC2 — both are served on the public journal route', () => {
+  function reportCell(rows: OptionTradeJournalRecord[], exitReason: string) {
+    return buildOptionJournalReport(rows, Date.UTC(2026, 8, 10), true).summary.byAccountClass
+      .desk.byStructureExit.cells.find(
+        (c) => c.structure === 'single_leg_otm' && c.exitReason === exitReason,
+      )!;
+  }
+  const base = {
+    atRiskUsd: 114, entryDte: 35, entryDelta: 0.3, ivRank: null, trend: 'up',
+    sentiment: null, agentConviction: null,
+  } as unknown as Partial<OptionTradeJournalRecord>;
+
+  it('AC1: a stamped value, a stamped null (with its reason) and a pre-stamp close are three different counts', () => {
+    const cell = reportCell([
+      closedRow({ ...base, exitReason: 'chandelier', pnlRStopBasis: -0.5, stopBasisRPerPremiumR: 5 }),
+      closedRow({ ...base, exitReason: 'chandelier', pnlRStopBasis: null, pnlRStopBasisReason: 'stop_unarmed' }),
+      closedRow({ ...base, exitReason: 'chandelier' }),
+    ], 'chandelier');
+    expect(cell.stopBasisR).toEqual({
+      n: 1, avg: -0.5, min: -0.5, max: -0.5, nullReasons: { stop_unarmed: 1 }, unstamped: 1,
+    });
+    // A non-trail cell lists no release forensics.
+    expect(cell.releaseForensics).toEqual([]);
+  });
+
+  it('AC2: the NOK release is served with its slip as a subtraction, and an unstamped profit_lock reads as a relabel', () => {
+    const fire = {
+      at: Date.UTC(2026, 8, 9, 15, 0), levelR: 0.4333333333, levelPremium: 0.6194,
+      markAtFire: 0.62, execBidAtFire: 0.61, armed: true, peakPremiumAtFire: 0.665,
+      peakR: 0.8333333333, giveBackR: 0.4, stopBasisPremium: 0.114,
+    };
+    const cell = reportCell([
+      closedRow({
+        ...base, optionSymbol: 'NOK261002C00010500', closeTs: Date.UTC(2026, 8, 9, 15, 1),
+        profitLockFire: fire, pnlBasis: 'broker-fill', exitFillPremium: 0.57, pnlRStopBasis: 0,
+      } as Partial<OptionTradeJournalRecord>),
+      closedRow({ ...base, optionSymbol: 'RIG260925C00006000', closeTs: Date.UTC(2026, 8, 8, 15, 0) }),
+    ], 'profit_lock');
+
+    expect(cell.releaseForensicsTruncated).toBe(0);
+    const [nok, rig] = cell.releaseForensics;
+    expect(nok!.optionSymbol).toBe('NOK261002C00010500'); // newest first
+    expect(nok!.stamped).toBe(true);
+    expect(nok!.armed).toBe(true);
+    expect(nok!.peakPremiumAtFire).toBe(0.665);
+    expect(nok!.fillVsLevelPremium).toBeCloseTo(0.57 - 0.6194, 12);
+    expect(nok!.fillVsLevelR).toBeCloseTo((0.57 - 0.6194) / 0.114, 12);
+    expect(nok!.markVsLevelPremium).toBeCloseTo(0.62 - 0.6194, 12);
+    expect(nok!.pnlRStopBasis).toBe(0);
+
+    expect(rig!.stamped).toBe(false);
+    expect(rig!.armed).toBeNull();
+    expect(rig!.levelPremium).toBeNull();
+    expect(rig!.fillVsLevelPremium).toBeNull();
+  });
+
+  it('AC2: an unrestated row publishes NO fill and NO slip — the mark never stands in for a fill', () => {
+    const cell = reportCell([
+      closedRow({
+        ...base,
+        profitLockFire: {
+          at: 1, levelR: 0.4, levelPremium: 0.6, markAtFire: 0.61, execBidAtFire: null, armed: true,
+          peakPremiumAtFire: 0.66, peakR: 0.8, giveBackR: 0.4, stopBasisPremium: 0.1,
+        },
+        // A fill figure WITHOUT the broker-fill basis is not a measured fill.
+        exitFillPremium: 0.55,
+      } as Partial<OptionTradeJournalRecord>),
+    ], 'profit_lock');
+    const [row] = cell.releaseForensics;
+    expect(row!.exitFillPremium).toBeNull();
+    expect(row!.fillVsLevelPremium).toBeNull();
+    expect(row!.fillVsLevelR).toBeNull();
+    expect(row!.markVsLevelPremium).toBeCloseTo(0.01, 12);
+  });
+
+  it('AC2: the list is capped and the remainder is COUNTED, never silently dropped', async () => {
+    const { RELEASE_FORENSICS_CAP } = await import('./observability/health-routes.js');
+    const rows = Array.from({ length: RELEASE_FORENSICS_CAP + 3 }, (_, i) =>
+      closedRow({ ...base, closeTs: Date.UTC(2026, 8, 1) + i * 60_000 }));
+    const cell = reportCell(rows, 'profit_lock');
+    expect(cell.releaseForensics).toHaveLength(RELEASE_FORENSICS_CAP);
+    expect(cell.releaseForensicsTruncated).toBe(3);
+    expect(cell.releaseForensics[0]!.closeTs).toBe(Date.UTC(2026, 8, 1) + (RELEASE_FORENSICS_CAP + 2) * 60_000);
   });
 });
 

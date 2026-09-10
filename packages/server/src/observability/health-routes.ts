@@ -2384,6 +2384,38 @@ export interface OptionJournalStructureExitCell {
    */
   stopRPerPremiumRObserved: { n: number; values: number[] };
   /**
+   * TRA-4246 (AC1, the grader's read) — the cell's rows' OWN stop-basis R.
+   *
+   * The per-row value lives on the journal close row, and the only route that
+   * served it was `/api/trades/export` — which is scoped to the CALLER's book.
+   * A desk close on any other book therefore had no read path at all: measured
+   * 2026-09-10, 4 post-boot desk closes all carried the divisor on this surface
+   * while the admin export's newest row was 09-02. `n` counts finite values;
+   * `nullReasons` counts STAMPED nulls by their reason; `unstamped` counts
+   * pre-stamp closes (key absent). Forward-only — ⛔ an unstamped row is never
+   * filled in from `realizedR × divisor`.
+   */
+  stopBasisR: {
+    n: number;
+    avg: number | null;
+    min: number | null;
+    max: number | null;
+    nullReasons: Record<string, number>;
+    unstamped: number;
+  };
+  /**
+   * TRA-4246 (AC2, the grader's read) — one entry per trail-family close
+   * (`profit_lock` / `profit_floor`) or any close carrying a `profitLockFire`
+   * stamp, newest first, capped at {@link RELEASE_FORENSICS_CAP}. Before this
+   * the stamp was written to the journal and served by NO route, so
+   * level-vs-fill slip was a read only for someone holding the host's disk.
+   * `stamped: false` on a trail-family row is a RELABEL (see
+   * `OptionTradeJournalRecord.profitLockFire`), not a fire that went unrecorded.
+   */
+  releaseForensics: OptionJournalReleaseForensic[];
+  /** Trail-family rows beyond the cap — counted, never silently dropped. */
+  releaseForensicsTruncated: number;
+  /**
    * TRA-4291 — the MODELED net-of-cross companion to `avgR`, with its own
    * provenance. `avgR` stays gross and byte-identical; this is the join that
    * stops a demo cell paying no spread from reading `scratch` (the TRA-4230
@@ -2463,6 +2495,48 @@ const R_TAIL_BUCKET_EDGES: ReadonlyArray<{ label: string; fromR: number | null; 
 ];
 
 const LEFT_TAIL_SAMPLE_CAP = 12;
+
+/**
+ * TRA-4246 (AC2) — the exit reasons a give-back decision closes under: the base
+ * lock and the TRA-4020 ladder floor. Membership is by LABEL, not by stamp, so a
+ * trail-family close that carries no `profitLockFire` still lands on the list —
+ * that absence is the relabel evidence the list exists to publish.
+ */
+const TRAIL_FAMILY_EXIT_REASONS: ReadonlySet<string> = new Set(['profit_lock', 'profit_floor']);
+/** TRA-4246 (AC2) — per-cell cap on `releaseForensics`; the remainder is counted. */
+export const RELEASE_FORENSICS_CAP = 25;
+
+/**
+ * TRA-4246 (AC2) — one trail-family close's release forensics, as a READ.
+ * Every operand is the row's own stamp; nothing is re-derived from a constant.
+ * `null` = not measured on this row, never a stand-in.
+ */
+export interface OptionJournalReleaseForensic {
+  optionSymbol: string | null;
+  closeTs: number | null;
+  exitReason: string;
+  /** `false` ⇒ no `profitLockFire` on the row: a relabel, or a pre-stamp close. */
+  stamped: boolean;
+  armed: boolean | null;
+  /** The peak the rule CONSUMED (executable basis when `execBidAtFire` is non-null). */
+  peakPremiumAtFire: number | null;
+  peakR: number | null;
+  giveBackR: number | null;
+  levelR: number | null;
+  levelPremium: number | null;
+  stopBasisPremium: number | null;
+  markAtFire: number | null;
+  execBidAtFire: number | null;
+  /** Broker exit fill — TRA-2819 restated rows only. ⛔ Never the mark standing in. */
+  exitFillPremium: number | null;
+  /** `exitFillPremium − levelPremium`: the execution slip. Null unless both are measured. */
+  fillVsLevelPremium: number | null;
+  /** The same slip in stop-basis R (÷ `stopBasisPremium`). */
+  fillVsLevelR: number | null;
+  /** `markAtFire − levelPremium`: the tick-granularity half of the gap. */
+  markVsLevelPremium: number | null;
+  pnlRStopBasis: number | null;
+}
 
 /** TRA-4291 — one structure's measured cross + probe n, keyed for the cell join. */
 interface ModeledCrossProbe {
@@ -2659,6 +2733,84 @@ function crossTabStructureExit(
             seen.add(Math.round(v * 10000) / 10000);
           }
           return { n, values: [...seen].sort((a, b) => a - b) };
+        })(),
+        // TRA-4246 (AC1) — the rows' OWN stop-basis R. The export that also
+        // carries it is scoped to the caller's book, so without this a desk
+        // close on any other book is stamped and unreadable.
+        stopBasisR: (() => {
+          const values: number[] = [];
+          const nullReasons: Record<string, number> = {};
+          let unstamped = 0;
+          for (const r of list) {
+            // Key absent ⇒ a pre-stamp close; key present and null ⇒ a stamped
+            // verdict, counted under its reason. The two are different facts.
+            if (!('pnlRStopBasis' in r) || r.pnlRStopBasis === undefined) {
+              unstamped += 1;
+              continue;
+            }
+            const v = r.pnlRStopBasis;
+            if (typeof v === 'number' && Number.isFinite(v)) {
+              values.push(v);
+              continue;
+            }
+            const reason = r.pnlRStopBasisReason ?? 'unreasoned';
+            nullReasons[reason] = (nullReasons[reason] ?? 0) + 1;
+          }
+          return {
+            n: values.length,
+            avg: values.length > 0 ? values.reduce((a, v) => a + v, 0) / values.length : null,
+            min: values.length > 0 ? Math.min(...values) : null,
+            max: values.length > 0 ? Math.max(...values) : null,
+            nullReasons,
+            unstamped,
+          };
+        })(),
+        // TRA-4246 (AC2) — the give-back stamp, served. Level-vs-fill slip is a
+        // subtraction of two stamped operands, never a derivation off a constant.
+        ...(() => {
+          const num = (v: unknown): number | null =>
+            typeof v === 'number' && Number.isFinite(v) ? v : null;
+          const trail = list
+            .filter((r) => r.profitLockFire !== undefined || TRAIL_FAMILY_EXIT_REASONS.has(exitReason))
+            .sort((a, b) => (b.closeTs ?? 0) - (a.closeTs ?? 0));
+          const releaseForensics: OptionJournalReleaseForensic[] = trail
+            .slice(0, RELEASE_FORENSICS_CAP)
+            .map((r) => {
+              const f = r.profitLockFire;
+              const levelPremium = num(f?.levelPremium);
+              const stopBasisPremium = num(f?.stopBasisPremium);
+              const markAtFire = num(f?.markAtFire);
+              // Same rule as the export's `exit_price`: only a restated row has
+              // a measured fill. A mark is not a fill and is never used as one.
+              const exitFillPremium = r.pnlBasis === 'broker-fill' ? num(r.exitFillPremium) : null;
+              const fillVsLevelPremium =
+                exitFillPremium !== null && levelPremium !== null ? exitFillPremium - levelPremium : null;
+              return {
+                optionSymbol: r.optionSymbol ?? null,
+                closeTs: num(r.closeTs),
+                exitReason,
+                stamped: f !== undefined,
+                armed: typeof f?.armed === 'boolean' ? f.armed : null,
+                peakPremiumAtFire: num(f?.peakPremiumAtFire),
+                peakR: num(f?.peakR),
+                giveBackR: num(f?.giveBackR),
+                levelR: num(f?.levelR),
+                levelPremium,
+                stopBasisPremium,
+                markAtFire,
+                execBidAtFire: num(f?.execBidAtFire),
+                exitFillPremium,
+                fillVsLevelPremium,
+                fillVsLevelR:
+                  fillVsLevelPremium !== null && stopBasisPremium !== null && stopBasisPremium > 0
+                    ? fillVsLevelPremium / stopBasisPremium
+                    : null,
+                markVsLevelPremium:
+                  markAtFire !== null && levelPremium !== null ? markAtFire - levelPremium : null,
+                pnlRStopBasis: num(r.pnlRStopBasis),
+              };
+            });
+          return { releaseForensics, releaseForensicsTruncated: trail.length - releaseForensics.length };
         })(),
       };
     })
