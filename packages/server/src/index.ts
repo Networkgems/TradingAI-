@@ -110,6 +110,7 @@ import { stampFirmWideDemoFoldScope } from './reports/demo-calendar-fold-provena
 // (signup + the two admin identity-writes). The reserve rule used to be an inline
 // `if` at signup only, which is how both admin routes came to skip it.
 import { refuseReservedIdentityWrite } from './identity-write-guard.js';
+import { acceptUsername } from './username-grammar.js';
 // TRA-2421 — self-serve account deletion: the wipe surface and the identity
 // tombstone that keeps a recycled username from inheriting the previous holder's
 // shared-journal rows.
@@ -9436,10 +9437,33 @@ app.post('/api/auth/account/email', requireAuth, async (req, res) => {
 
 app.post('/api/auth/signup', async (req, res) => {
   const { username, email, password } = req.body as { username?: string; email?: string; password?: string };
-  if (typeof username !== 'string' || !username.trim()) {
-    res.status(400).json({ error: 'Username is required' });
+  // TRA-4475 — the canonical grammar, and it runs FIRST. The only rule here used
+  // to be `typeof username === 'string' && username.trim()`, so
+  // `{username:'../users/richard'}` walked past the operator-book reserve below
+  // (which is exact set membership on the lower-cased name, and therefore has no
+  // opinion about a traversal SPELLING of the very book it protects), read as a
+  // free name at `getUser`, and reached `retireOrphanedBook` — which resolved it
+  // to `DATA_DIR/users/richard` and renamed the LIVE book away, with a `cp -r` +
+  // `rm -rf` fallback. Anonymous, no credential, no trading flag.
+  //
+  // ⚠️ ORDER IS THE FIX. A grammar behind `retireOrphanedBook` is decoration: the
+  // destructive step has already run by the time the 400 is written.
+  // `username-grammar.test.ts` asserts this ordering by index, per route.
+  //
+  // `decision.username` — NOT the raw body value — is what flows downstream from
+  // here. The string that was validated has to be the string that is stored and
+  // joined, or a future difference between the two re-opens the gap.
+  const decision = acceptUsername({
+    name: username,
+    audience: 'public',
+    existingUsernames: getAllUsers().map((u) => u.username),
+  });
+  if (!decision.ok) {
+    log.warn('signup: refused a username', { code: decision.refusal.code, detail: decision.refusal.detail });
+    res.status(decision.refusal.status).json({ error: decision.refusal.message });
     return;
   }
+  const cleanUsername = decision.username;
   if (typeof email !== 'string' || !email.includes('@')) {
     res.status(400).json({ error: 'A valid email address is required' });
     return;
@@ -9460,7 +9484,7 @@ app.post('/api/auth/signup', async (req, res) => {
   // both admin identity-writes came to skip it. It is now the shared precondition;
   // `audience: 'public'` is what makes the admin carve-out unreachable from this
   // anonymous body.
-  const reserved = refuseReservedIdentityWrite({ name: username, audience: 'public' });
+  const reserved = refuseReservedIdentityWrite({ name: cleanUsername, audience: 'public' });
   if (reserved) {
     res.status(reserved.status).json({ error: reserved.message });
     return;
@@ -9476,13 +9500,13 @@ app.post('/api/auth/signup', async (req, res) => {
   //
   // This runs only when the name is genuinely free; a live collision is left to
   // `createUser` to reject, so a failed signup can never disturb a live book.
-  if (!getUser(username.trim())) {
-    const retirement = await retireOrphanedBook(username.trim());
+  if (!getUser(cleanUsername)) {
+    const retirement = await retireOrphanedBook(cleanUsername);
     if (!retirement.ok) {
       // Fail CLOSED. Creating the account anyway is exactly the reported bug:
       // the user opens onto someone else's positions.
       log.error('signup: refusing registration — could not retire an orphaned book', {
-        username: username.trim(),
+        username: cleanUsername,
         errors: retirement.errors,
       });
       res.status(503).json({ error: 'Could not prepare a clean account. Please try again shortly.' });
@@ -9490,7 +9514,7 @@ app.post('/api/auth/signup', async (req, res) => {
     }
     if (retirement.orphanFound) {
       log.warn('signup: retired an orphaned book before registering the name', {
-        username: username.trim(),
+        username: cleanUsername,
         primaryDirExisted: retirement.primaryDirExisted,
         backupGenerationsWithData: retirement.backupGenerationsWithData,
         retiredAt: retirement.retiredAt,
@@ -9502,7 +9526,7 @@ app.post('/api/auth/signup', async (req, res) => {
       });
     }
   }
-  const result = await createUser(username.trim(), email.trim(), password);
+  const result = await createUser(cleanUsername, email.trim(), password);
   if (result.error) {
     res.status(409).json({ error: result.error });
     return;
@@ -9514,16 +9538,16 @@ app.post('/api/auth/signup', async (req, res) => {
   // clears the live key and records the identity epoch, so the three channels that
   // could refill this book (the directory, the 24 backup generations, the shared
   // option journal) all resolve to empty for a name that was reused.
-  await provisionUser(username.trim());
+  await provisionUser(cleanUsername);
   // TRA-2251 — welcome email, best-effort. Fire-and-forget: a mail failure (or
   // unconfigured SMTP) must never block account creation, so we do not await it
   // and swallow any rejection into the log.
-  void sendWelcomeEmail(email.trim(), username.trim()).catch((err) => {
+  void sendWelcomeEmail(email.trim(), cleanUsername).catch((err) => {
     log.error('auth: failed to send welcome email', {
       reason: err instanceof Error ? err.message : String(err),
     });
   });
-  res.json({ token: createToken(username.trim()) });
+  res.json({ token: createToken(cleanUsername) });
 });
 
 app.post('/api/auth/forgot-password', async (req, res) => {
@@ -9744,6 +9768,20 @@ app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
     res.status(400).json({ error: 'Password must be at least 6 characters' });
     return;
   }
+  // TRA-4475 — the canonical grammar, ahead of the reserve and (crucially) ahead
+  // of `retireOrphanedBook` below. This route reaches the same destructive step
+  // as signup with the same unvalidated string; `requireAdmin` narrows WHO can
+  // fire it, not what it does. Same rule, same module, one call.
+  const decision = acceptUsername({
+    name: username,
+    audience: 'admin',
+    existingUsernames: getAllUsers().map((u) => u.username),
+  });
+  if (!decision.ok) {
+    res.status(decision.refusal.status).json({ error: decision.refusal.message });
+    return;
+  }
+  const cleanUsername = decision.username;
   // TRA-2508 — the operator-name reserve, which this route skipped entirely.
   // `POST {username:'RICHARD'}` minted a `role: 'user'` book that was served the
   // firm-wide demo fold on `/api/reports/<date>?mode=demo` while `/api/reports/desk`
@@ -9753,7 +9791,7 @@ app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
   // It runs BEFORE `retireOrphanedBook` deliberately: a refused create must not
   // have moved anyone's book aside on its way to the 409.
   const reserved = refuseReservedIdentityWrite({
-    name: username,
+    name: cleanUsername,
     audience: 'admin',
     provisionOperatorBook,
   });
@@ -9772,24 +9810,24 @@ app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
   // precisely what TRA-2406 escalated. Either way nothing is destroyed: a retired
   // book is moved to `orphaned-books/`, so a mistaken default is recoverable.
   let retiredOrphan: Awaited<ReturnType<typeof retireOrphanedBook>> | null = null;
-  if (adoptExistingBook !== true && !getUser(username)) {
-    retiredOrphan = await retireOrphanedBook(username);
+  if (adoptExistingBook !== true && !getUser(cleanUsername)) {
+    retiredOrphan = await retireOrphanedBook(cleanUsername);
     if (!retiredOrphan.ok) {
       log.error('admin: refusing to create user — could not retire an orphaned book', {
-        username,
+        username: cleanUsername,
         errors: retiredOrphan.errors,
       });
       res.status(503).json({ error: 'Could not prepare a clean account. Please try again shortly.' });
       return;
     }
   }
-  const result = await createUser(username, email, password, role ?? 'user');
+  const result = await createUser(cleanUsername, email, password, role ?? 'user');
   if (result.error) {
     res.status(409).json({ error: result.error });
     return;
   }
   // TRA-142 — admin-created users also get an isolated context.
-  await provisionUser(username);
+  await provisionUser(cleanUsername);
   res.status(201).json({
     ok: true,
     user: result.user,
@@ -9828,12 +9866,68 @@ app.patch('/api/admin/users/:username', requireAuth, requireAdmin, async (req, r
   // CREATE (TRA-142 retains the files for exactly that), not a rename of some
   // other account onto the name. A guard with no way to be waived is one fewer
   // flag for the next route to forget to forward.
-  const reserved = refuseReservedIdentityWrite({ name: newUsername, audience: 'admin' });
+  // TRA-4475 — the canonical grammar on the name being WRITTEN, ahead of the
+  // reserve and ahead of `updateUser`.
+  //
+  // The path param is the EXISTING name and is deliberately NOT validated: it is
+  // a lookup key into a case-sensitive `===` find, so a legacy name that predates
+  // this grammar must still be editable. Validating it would turn a tightened
+  // grammar into a lockout — which is the same reason the grammar is off the
+  // login path. (Measured against bqb1 2026-09-09: all 67 live usernames pass it
+  // today, so that set is currently empty; the split is what keeps it empty.)
+  //
+  // `renamingFrom` excludes the account from its own collision check, so a
+  // case-only self-rename is refused by the reserve or accepted on its merits
+  // rather than colliding with itself.
+  let cleanNewUsername: string | undefined;
+  if (newUsername !== undefined) {
+    const decision = acceptUsername({
+      name: newUsername,
+      audience: 'admin',
+      existingUsernames: getAllUsers().map((u) => u.username),
+      renamingFrom: username,
+    });
+    if (!decision.ok) {
+      res.status(decision.refusal.status).json({ error: decision.refusal.message });
+      return;
+    }
+    cleanNewUsername = decision.username;
+  }
+  const reserved = refuseReservedIdentityWrite({ name: cleanNewUsername, audience: 'admin' });
   if (reserved) {
     res.status(reserved.status).json({ error: reserved.message });
     return;
   }
-  const result = await updateUser(username, { email, username: newUsername });
+  // TRA-4475 / external audit H3 — the RENAME limb is disabled, and this 409 is
+  // deliberately the LAST gate before `updateUser` rather than the first. The
+  // grammar and the TRA-2508 reserve stay in front of it in source order, so
+  // deleting this block re-enables the rename onto a still-guarded path instead
+  // of an unguarded one.
+  //
+  // Why disabled: `updateUser` (`users.ts:186-191`) rewrites the registry STRING
+  // and nothing else. The book stays at `DATA_DIR/users/<old>/`, the
+  // `account_settings` and `agent_spend` rows stay keyed to `<old>`, the option
+  // journal's `account` stamps stay `<old>`, and the live socket and session keep
+  // the old identity. So a "successful" rename returns 200 and detaches the
+  // account from its own book, positions and basis — the same
+  // engine-holding-state-whose-files-moved condition this ticket is filed about,
+  // reached by an admin who was told it worked.
+  //
+  // The EMAIL limb is untouched: it is the half that works, and 409ing it would
+  // be an outage for an ordinary admin edit.
+  //
+  // Re-enabling this is audit H3's own work — it needs the tree move, the SQLite
+  // re-key, the journal scope and a session invalidation, transactionally.
+  if (cleanNewUsername !== undefined && cleanNewUsername !== username) {
+    res.status(409).json({
+      error:
+        'Renaming an account is disabled (audit H3): the rename rewrites the credential row only and would ' +
+        'detach the book, its settings and its journal from the account. Create the new account and migrate ' +
+        'deliberately instead.',
+    });
+    return;
+  }
+  const result = await updateUser(username, { email, username: cleanNewUsername });
   if (!result.ok) {
     res.status(result.error === 'User not found' ? 404 : 409).json({ error: result.error });
     return;

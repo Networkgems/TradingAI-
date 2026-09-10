@@ -87,6 +87,7 @@ import {
   identityRowsRemaining,
 } from './sqlite-identity.js';
 import { logger } from './observability/index.js';
+import { assertContainedUserDir, isPathSafeUsername } from './username-grammar.js';
 
 const log = logger.child({ module: 'orphaned-books' });
 
@@ -244,8 +245,17 @@ export function shapeRetiredOrphanReceipt(
   };
 }
 
+// TRA-4475 — this join WAS `join(root,'users',username)` on a raw, unvalidated
+// string, and it is step 4 of the anonymous-signup traversal: `../users/richard`
+// resolved to `DATA_DIR/users/richard` — the LIVE book — which made
+// `primaryDirExisted` true and handed the rename/`rm -rf` below a directory
+// nobody asked to retire. `assertContainedUserDir` refuses at the join, so the
+// hazard is closed by the SHAPE OF THE RESULT rather than by every caller
+// remembering to check its argument. It is deliberately narrower than the
+// signup grammar (see `username-grammar.ts`), so a legacy name that predates
+// that grammar still resolves normally here.
 function userDirIn(root: string, username: string): string {
-  return join(root, 'users', username);
+  return assertContainedUserDir(root, username);
 }
 
 /** Timestamped backup generations. Missing backup root ⇒ `[]`. */
@@ -305,6 +315,39 @@ export async function retireOrphanedBook(
 ): Promise<OrphanRetirementReceipt> {
   const dataDir = opts.dataDir ?? resolveDataDir();
   const errors: string[] = [];
+
+  // TRA-4475 — refuse a name that cannot be one path segment, BEFORE anything is
+  // probed and long before anything is moved. The routes now reject this shape at
+  // the door, so reaching here means a caller skipped the grammar; this is the
+  // backstop that keeps such a caller from being destructive rather than merely
+  // wrong. It returns a fail-CLOSED receipt (`ok: false`) instead of throwing,
+  // because every existing caller already treats `!ok` as "do not create the
+  // account" — the throw lives one layer down in `userDirIn`, where there is no
+  // receipt to return.
+  if (!isPathSafeUsername(username)) {
+    log.error('orphaned-books: refusing to retire — username is not a safe path segment', {
+      username,
+    });
+    return {
+      username,
+      orphanFound: false,
+      primaryDirExisted: false,
+      backupGenerationsWithData: 0,
+      retiredAt: null,
+      quarantinedTo: null,
+      resetTokensRevoked: 0,
+      twoFactorStateCleared: 0,
+      settingsRowFound: false,
+      settingsRowRetired: false,
+      settingsCredentialFieldsCleared: 0,
+      settingsQuarantinedTo: null,
+      identityRowsDeleted: 0,
+      identityRowsRemaining: 0,
+      errors: ['unsafe-username: not a single safe path segment (TRA-4475)'],
+      ok: false,
+    };
+  }
+
   const primaryDir = userDirIn(dataDir, username);
   const primaryDirExisted = existsSync(primaryDir);
 

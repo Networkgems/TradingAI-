@@ -185,8 +185,14 @@ describe('TRA-2508 — the WIRING (this block fails on 4df4e41)', () => {
     const body = routeBody("app.patch('/api/admin/users/:username'");
     // The path param is the EXISTING name; guarding it would refuse every edit to
     // the real `Richard`'s email. The reserved thing is the name being WRITTEN.
-    expect(body).toMatch(/refuseReservedIdentityWrite\(\{\s*name:\s*newUsername/);
-    expect(body).not.toMatch(/refuseReservedIdentityWrite\(\{\s*name:\s*username/);
+    //
+    // TRA-4475 widened the accepted spelling to `cleanNewUsername` — the same
+    // value after `acceptUsername` normalized it. The INVARIANT is unchanged and
+    // is what both lines still assert: the guard's argument derives from the
+    // request BODY's new name, never from the `:username` path param. The
+    // negative below is the load-bearing half.
+    expect(body).toMatch(/refuseReservedIdentityWrite\(\{\s*name:\s*(clean)?[Nn]ewUsername/);
+    expect(body).not.toMatch(/refuseReservedIdentityWrite\(\{\s*name:\s*(clean)?username\b/i);
     const guard = body.indexOf('refuseReservedIdentityWrite(');
     const update = body.indexOf('updateUser(');
     expect(update).toBeGreaterThan(-1);

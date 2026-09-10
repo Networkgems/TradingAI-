@@ -2,6 +2,7 @@ import { mkdir, rename, copyFile, rm, writeFile, readdir, unlink, stat } from 'f
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 
+import { assertContainedUserDir } from './username-grammar.js';
 import {
   SignalEngine,
   shouldBootArmLiveCrypto,
@@ -168,8 +169,14 @@ export function tryGetUserContext(username: string): UserContext | undefined {
   return contexts.get(username);
 }
 
+// TRA-4475 — the second place a raw username became a path. Same backstop as
+// `orphaned-books.ts:userDirIn`: refuse at the join, on the shape of the RESULT,
+// so a name that resolves outside `DATA_DIR/users/` can never name a context
+// directory. Narrower than the signup grammar on purpose — legacy names that
+// predate that grammar still resolve here, which is what keeps this off the
+// login path's blast radius.
 export function userDataDir(username: string): string {
-  return join(DATA_DIR, 'users', username);
+  return assertContainedUserDir(DATA_DIR, username);
 }
 
 /**
