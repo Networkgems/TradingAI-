@@ -86,7 +86,7 @@ import { withPhase, timeSyncPhase, SyncSliceMeter } from './phase-timing.js';
 import { TickExitWorkMeter, type TickExitWorkTerms } from './tick-exit-work.js';
 import { TickExitRegionMeter, classifyExitInterval, type TickExitRegionRthTerms } from './tick-exit-region.js';
 import { trySma200ScanSlot, releaseSma200ScanSlot } from './sma200-scan-admission.js';
-import { resolveSma200PullbackMaxDistAtr, sma200VoidVerdict, sma200SweepVerdict, sma200SweepStarved } from './sma200-validity.js';
+import { resolveSma200PullbackMaxDistAtr, sma200VoidVerdict, sma200SweepVerdict, sma200SweepStarved, type Sma200SweepVerdict } from './sma200-validity.js';
 import { getLatestReviewBlock } from './research-store.js';
 import { earningsInDaysSync } from './earnings-store.js';
 import {
@@ -766,6 +766,24 @@ export interface EngineState {
    * guarantee (TRA-3913).
    */
   sma200ScanStats?: Sma200ScanStats | null;
+  /**
+   * TRA-4457 — the sweep's own verdict on whether its empty feed means anything:
+   * `SWEPT` (honest empty), `BLIND` (starved, no conclusion permitted) or
+   * `NO_UNIVERSE` (upstream watchlist fault). `null` when no sweep has completed.
+   *
+   * Published because `sma200ScanStats` alone forces every grader to re-derive
+   * the verdict from the counters, which is the re-implementation
+   * `sma200SweepVerdict` exists to prevent — and it put the sweep's own ruler
+   * behind a Render log query, readable only by whoever could run one. Check the
+   * ruler before the measurement: a verdict that is READ cannot drift from the
+   * one the engine logged, whereas four hand-rolled re-derivations can, and the
+   * load-bearing arm (`evaluated > 0` with `fired === 0` is SWEPT, not BLIND) is
+   * exactly the one a reader keying on `fired` gets backwards.
+   *
+   * Optional for the same reason as `sma200ScanStats`: an older build genuinely
+   * does not serve it, and field presence is the deployed-bytes proof (TRA-3913).
+   */
+  sma200SweepVerdict?: Sma200SweepVerdict | null;
   /**
    * TRA-787 — SupertrendConfluence SHADOW channel. Observe-only signals the
    * supertrend engine computes off the live tape each tick. These are
@@ -7419,6 +7437,20 @@ export class SignalEngine {
       starved,
       verdict,
     });
+  }
+
+  /**
+   * TRA-4457 — the published verdict for the last sweep, or `null` if none.
+   *
+   * Deliberately ONE derivation shared by every `getState` branch (live and
+   * demo) and folded off the SAME `lastSma200ScanStats` object that is being
+   * serialized beside it. A second inlined copy could report `BLIND` next to
+   * counters saying `SWEPT` after any future edit to one site only — and a
+   * verdict that can disagree with its own denominator is worse than no verdict,
+   * because it is still read as authoritative.
+   */
+  private sma200VerdictForState(): Sma200SweepVerdict | null {
+    return this.lastSma200ScanStats ? sma200SweepVerdict(this.lastSma200ScanStats) : null;
   }
 
   private async runSma200Scan(symbols: string[]): Promise<void> {
@@ -21363,6 +21395,8 @@ export class SignalEngine {
         // TRA-4457 — the sweep census, so a reader can see the denominator that
         // makes an empty `signals` array mean something.
         sma200ScanStats: this.lastSma200ScanStats,
+        // TRA-4457 — and the verdict itself, so the ruler is read, not rebuilt.
+        sma200SweepVerdict: this.sma200VerdictForState(),
         // TRA-787 — observe-only supertrend shadow channel (never routed).
         supertrendShadowSignals: this.supertrendShadowSignals,
         // TRA-1972 — observe-only catalyst earnings/macro proximity gate decisions.
@@ -21425,6 +21459,8 @@ export class SignalEngine {
       // TRA-4457 — the sweep census, so a reader can see the denominator that
       // makes an empty `signals` array mean something.
       sma200ScanStats: this.lastSma200ScanStats,
+      // TRA-4457 — and the verdict itself, so the ruler is read, not rebuilt.
+      sma200SweepVerdict: this.sma200VerdictForState(),
       // TRA-787 — observe-only supertrend shadow channel (never routed).
       supertrendShadowSignals: this.supertrendShadowSignals,
       // TRA-1972 — observe-only catalyst earnings/macro proximity gate decisions.
