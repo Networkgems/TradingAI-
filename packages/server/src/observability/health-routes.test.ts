@@ -33,6 +33,14 @@ import {
   type ExitCadenceRollup,
 } from './health-routes.js';
 import { TEST_ACCOUNT_PREFIX_ENV } from '../test-accounts.js'; // TRA-2478
+// TRA-4510 — the profit-floor readout is graded against the engine's own
+// resolver and env view, not against retyped literals.
+import {
+  isProfitFloorTrailEnabled,
+  PROFIT_FLOOR_TRAIL_FLAG,
+  EXIT_RISK_RULES_FLAG,
+} from '../exit-risk-rules-flag.js';
+import { resolveDemoFlagEnv } from '../demo-flags.js';
 // TRA-3216 — the live OTM underlying allowlist + the enforcement-gate ledger it publishes through.
 import { OPTION_LIVE_OTM_UNIVERSE_VAR } from '../otm-live-universe-flag.js';
 import { clearLiveEnforceGateLedger, recordLiveEnforceDecision } from '../live-enforce-gate-ledger.js';
@@ -7653,5 +7661,95 @@ describe('GET /api/health/live-options-fee-slippage — fleet concentration (TRA
     // AC4 — advisory, said on the wire.
     expect(fc.entryPathBehavior).toBe('advisory_no_refusal');
     expect(fc.refuses).toBe(false);
+  });
+});
+
+// TRA-4510 (parent TRA-4293) — the TRA-4020 profit-floor ladder arm, on BOTH
+// books. The capability matrix read "demo-only" off a flag no route published;
+// these pin that each readout IS `isProfitFloorTrailEnabled` over the env view
+// signal-engine.ts uses for that book (live = process.env, demo = overlay).
+describe('TRA-4510 option-swing-exits profitFloorTrail — both books', () => {
+  type Book = { enabled: boolean; exitRiskMaster: boolean };
+  type Block = { flag: string; requiresMaster: string; live: Book; demo: Book };
+  const KEYS = [PROFIT_FLOOR_TRAIL_FLAG, EXIT_RISK_RULES_FLAG, 'DATA_DIR'];
+  const saved: Record<string, string | undefined> = {};
+  let tmp: string | null = null;
+
+  const serve = (): Block => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const handlers = routes.get('/api/health/option-swing-exits')!;
+    expect(handlers).toHaveLength(1); // unauthenticated
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    return (res.body as { profitFloorTrail: Block }).profitFloorTrail;
+  };
+  const stageOverlay = (flags: Record<string, string>): string => {
+    tmp = mkdtempSync(join(tmpdir(), 'tra4510-'));
+    writeFileSync(join(tmp, 'demo-flags.json'), JSON.stringify(flags), 'utf8');
+    process.env.DATA_DIR = tmp;
+    return tmp;
+  };
+
+  beforeEach(() => {
+    for (const k of KEYS) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+  });
+  afterEach(() => {
+    for (const k of KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    tmp = null;
+  });
+
+  it('names the flag and its master by symbol; DARK on both books with nothing set', () => {
+    const pft = serve();
+    expect(pft.flag).toBe(PROFIT_FLOOR_TRAIL_FLAG);
+    expect(pft.requiresMaster).toBe(EXIT_RISK_RULES_FLAG);
+    expect(pft.live).toEqual({ enabled: false, exitRiskMaster: false });
+    expect(pft.demo).toEqual({ enabled: false, exitRiskMaster: false });
+  });
+
+  it('live reads process.env: flag + master in the process arms the LIVE book', () => {
+    process.env[EXIT_RISK_RULES_FLAG] = '1';
+    process.env[PROFIT_FLOOR_TRAIL_FLAG] = '1';
+    const pft = serve();
+    expect(pft.live.enabled).toBe(isProfitFloorTrailEnabled(process.env));
+    expect(pft.live.enabled).toBe(true);
+    // No DATA_DIR ⇒ the engine's demo view falls back to process.env too.
+    expect(pft.demo.enabled).toBe(true);
+  });
+
+  it('demo reads the overlay: the file arms the DEMO book only, live stays dark', () => {
+    const dir = stageOverlay({ [EXIT_RISK_RULES_FLAG]: '1', [PROFIT_FLOOR_TRAIL_FLAG]: '1' });
+    // Control: the overlay really does arm the resolver on this env view — both
+    // keys are allowlisted, so this is not a vacuous `false === false`.
+    expect(isProfitFloorTrailEnabled(resolveDemoFlagEnv(dir))).toBe(true);
+    const pft = serve();
+    expect(pft.demo.enabled).toBe(isProfitFloorTrailEnabled(resolveDemoFlagEnv(dir)));
+    expect(pft.demo.enabled).toBe(true);
+    // Live containment: a demo-flags.json write can never arm the live book.
+    expect(pft.live.enabled).toBe(isProfitFloorTrailEnabled(process.env));
+    expect(pft.live.enabled).toBe(false);
+  });
+
+  it('flag without its master reads disabled, and exitRiskMaster says why', () => {
+    stageOverlay({ [PROFIT_FLOOR_TRAIL_FLAG]: '1' });
+    expect(serve().demo).toEqual({ enabled: false, exitRiskMaster: false });
+    // The overlay layers ON process.env, so a process-level master completes the
+    // demo arm — while the live book, which has no flag in process.env, stays dark.
+    process.env[EXIT_RISK_RULES_FLAG] = '1';
+    const pft = serve();
+    expect(pft.demo).toEqual({ enabled: true, exitRiskMaster: true });
+    expect(pft.live).toEqual({ enabled: false, exitRiskMaster: true });
   });
 });
