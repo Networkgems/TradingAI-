@@ -1,5 +1,12 @@
 import YahooFinance from 'yahoo-finance2';
-import { TradierStocksClient, type TradierEnv, type TradierEquityQuote } from '@trading-app/engine';
+import {
+  TradierStocksClient,
+  setTradierRateLimitObserver, // TRA-4441
+  type TradierEnv,
+  type TradierEquityQuote,
+  type TradierRateLimitReading, // TRA-4441
+  type TradierEndpointClass, // TRA-4441
+} from '@trading-app/engine';
 import type { Candle, NewsItem, CorporateAction } from '@trading-app/shared';
 import { corporateActionInSessionWindow, normalizeQuoteCurrency } from '@trading-app/shared';
 import { fetchStooqQuote } from './stooq-feed.js';
@@ -862,12 +869,27 @@ export function accountMinuteStats(
   counts: ReadonlyMap<number, number>,
   now: number,
   windowMs: number,
-): { mean: number; peak: number; minutes: number } {
+): { mean: number; peak: number; median: number; minutes: number } {
   const currentBucket = Math.floor(now / windowMs);
   const completed = [...counts.entries()].filter(([b]) => b < currentBucket).map(([, c]) => c);
-  if (completed.length === 0) return { mean: 0, peak: 0, minutes: 0 };
+  if (completed.length === 0) return { mean: 0, peak: 0, median: 0, minutes: 0 };
   const sum = completed.reduce((a, b) => a + b, 0);
-  return { mean: sum / completed.length, peak: Math.max(...completed), minutes: completed.length };
+  // TRA-4441 — the MEDIAN minute, because the mean is not robust to the one thing
+  // this series reliably contains. bqb1 restarts during RTH, pulls the whole
+  // universe's bars in the first minute (measured 2026-09-09: 819 calls) and then
+  // runs at ~200/min; that single minute drags the mean ~60% high at 5 samples and
+  // is still visible at 30. Every "sustained spend" claim read off the mean —
+  // TRA-4441's own 326.3/min headline included — inherits that bias. The median is
+  // unmoved by one extreme minute, so it answers the question actually being asked:
+  // what does a TYPICAL minute cost? Published beside the mean, never instead of
+  // it: the mean is the right input for a QUOTA question, since Tradier bills the
+  // burst too.
+  const sorted = [...completed].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  const median = sorted.length % 2 === 1
+    ? (sorted[mid] ?? 0)
+    : ((sorted[mid - 1] ?? 0) + (sorted[mid] ?? 0)) / 2;
+  return { mean: sum / completed.length, peak: Math.max(...completed), median, minutes: completed.length };
 }
 
 function recordTradierQuoteRequest(now: number): void {
@@ -1054,6 +1076,17 @@ const TRADIER_ACCOUNT_BUDGET_PER_MIN = (() => {
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 200;
 })();
 
+/** TRA-4441 — say which of the two the number above actually is. The docblock
+ * calls it a property of the upstream contract; in fact `200` was INFERRED from
+ * the minute Tradier started refusing us on 2026-08-06, and nothing in the
+ * published block admitted that. A reader grading `crossed` needs to know it is
+ * grading against a modelled denominator, not a measured one. See
+ * `getTradierUpstreamRateLimitState` for what upstream actually reports. */
+const TRADIER_ACCOUNT_BUDGET_SOURCE: 'env_override' | 'modelled_constant' = (() => {
+  const raw = Number(process.env['TRADIER_ACCOUNT_BUDGET_PER_MIN']);
+  return Number.isFinite(raw) && raw > 0 ? 'env_override' : 'modelled_constant';
+})();
+
 /** Opt-in switch for the DERIVED bar ceiling. Default OFF: the budget block is
  * observe-only, so it publishes the crossing diagnostic on every box without
  * changing a single fetch decision. Enabling it is a decision that needs the
@@ -1153,6 +1186,10 @@ export function quotaCrossingVerdict(input: {
   accountObservedPeak: number;
   accountObservedMean: number;
   accountBudget: number;
+  /** TRA-4441 — how many COMPLETED minutes the mean is an average of. Required:
+   * see `MEAN_VERDICT_MIN_MINUTES` for why a mean without its sample size cannot
+   * distinguish the two verdicts this function exists to separate. */
+  minutesObserved: number;
 }): {
   crossed: boolean;
   /** Peak demand already meets its derived allowance ⇒ the throttle can only bite. */
@@ -1163,24 +1200,168 @@ export function quotaCrossingVerdict(input: {
    * correctly-windowed limiter is the right tool for. Distinguished from
    * `budgetExhausted` because the two call for opposite remedies. */
   burstBound: boolean;
+  /** TRA-4441 — the mean is averaged over too few completed minutes to separate a
+   * sustained rate from a single burst, so the `budgetExhausted` branch is withheld.
+   * ⚠️ NOT an all-clear: `burstBound` still fires off the peak, so `crossed` still
+   * reports. This suppresses a WRONG verdict, not the finding. */
+  meanUnderSampled: boolean;
   headroomReqPerMin: number;
   peakOverBudgetReqPerMin: number;
 } {
-  const { barCeiling, accountObservedPeak, accountObservedMean, accountBudget } = input;
+  const { barCeiling, accountObservedPeak, accountObservedMean, accountBudget, minutesObserved } = input;
   // Graded against the BUDGET, never against the resolved ceiling alone: on a
   // default (inert) box the ceiling is Infinity, and a verdict read off it would
   // report `crossed:false` on every box — a gate satisfied by the absence of the
   // thing it grades.
   const ceilingUnsatisfiable = Number.isFinite(barCeiling) && accountObservedPeak >= barCeiling;
-  const budgetExhausted = accountObservedMean >= accountBudget;
+  // ⭐ TRA-4441 — A MEAN OVER ONE MINUTE IS THAT MINUTE. The docblock above says
+  // these two verdicts are separated "because the remedies are opposite", and then
+  // computed `budgetExhausted` from a mean with no sample-size condition at all.
+  // With `minutesObserved: 1` the mean IS the peak, so the burst — the case whose
+  // remedy is a limiter — is arithmetically indistinguishable from sustained
+  // overspend, the case whose remedy is a bigger plan or a smaller universe. Worse,
+  // `budgetExhausted` PREEMPTS `burstBound` in the line below, so a thin sample does
+  // not merely blur the two: it reports the expensive verdict every time.
+  //
+  // Measured on bqb1 2026-09-09 17:27-17:29Z: the process restarts, pulls the whole
+  // universe's bars in the first minute (356 calls, and 737 on the read TRA-4441 was
+  // filed from), then falls to ZERO. Sampled 3 minutes after a boot, `mins: 1`,
+  // `mean: 356` ⇒ `budgetExhausted: true` — "a genuine capacity condition, no
+  // throttle helps". It was one cold-start burst. TRA-4441's headline figures
+  // (mean 326.3 over `accountMinutesObserved: 3`) are that artefact.
+  //
+  // The floor is the smallest window in which a boot burst cannot BE the whole
+  // sample — it makes the mean a mean of several minutes instead of a restatement
+  // of one.
+  //
+  // ⚠️ IT DOES NOT MAKE THE MEAN BURST-FREE, AND MUST NOT BE READ AS IF IT DID.
+  // One 819-call boot minute is still ~50% of a 5-minute total against a ~200/min
+  // steady state, and ~12% even at the full 30-minute history. The mean stays
+  // biased HIGH for the whole window after every restart; this floor only bounds
+  // how absurdly high. Use `accountMedianReqPerMin` for the burst-robust figure —
+  // that is the one to grade a sustained-rate claim on.
+  const meanUnderSampled = minutesObserved < MEAN_VERDICT_MIN_MINUTES;
+  const budgetExhausted = !meanUnderSampled && accountObservedMean >= accountBudget;
+  // ⛔ The peak branch is deliberately NOT sample-gated. A peak is a real observed
+  // minute, not an average, so one minute is a sufficient sample for it — and
+  // suppressing it too would turn an under-sampled window into a silent all-clear,
+  // which is the failure this guard exists to avoid rather than to commit.
   const burstBound = !budgetExhausted && accountObservedPeak >= accountBudget;
   return {
     crossed: ceilingUnsatisfiable || budgetExhausted || burstBound,
     ceilingUnsatisfiable,
     budgetExhausted,
     burstBound,
+    meanUnderSampled,
     headroomReqPerMin: accountBudget - accountObservedMean,
     peakOverBudgetReqPerMin: accountObservedPeak - accountBudget,
+  };
+}
+
+/** TRA-4441 — completed minutes required before the MEAN may support the
+ *  `budgetExhausted` (capacity) verdict. See the reasoning in
+ *  {@link quotaCrossingVerdict}. */
+export const MEAN_VERDICT_MIN_MINUTES = 5;
+
+// ── TRA-4441 — the upstream-reported rate limit ───────────────────────────────
+//
+// `TRADIER_ACCOUNT_BUDGET_PER_MIN` above documents itself as "a property of the
+// UPSTREAM contract" and is then a hand-written `200`, INFERRED on 2026-08-06
+// from the minute Tradier began returning `HTTP 400: Quota Violation`. Tradier
+// states the limit outright in `X-Ratelimit-Allowed` on every response, and the
+// client always held those headers — we discarded them and re-derived a worse
+// answer. The engine client now reports each reading here (TRA-4441).
+//
+// ⛔ THIS BLOCK PUBLISHES; IT DOES NOT ADOPT. `accountBudgetReqPerMin` is still
+// the constant. Two reasons, and neither is timidity:
+//   1. The reading is PER BUCKET. If `quotes` and `timesales` report different
+//      `allowed`, they are metered separately, and there is no single "account
+//      budget" for the merged figure to be — TRA-4441's premise (the bar path
+//      exhausting the budget out from under the quote path) would be FALSE, and
+//      silently folding the two into one number would erase the evidence for
+//      that. `bucketsAgree` is the field that decides it.
+//   2. Correcting the budget moves `crossed`/`budgetExhausted`, which are the
+//      graded fields of TRA-4441 AC3. Changing the constant and the verdict in
+//      one deploy makes a moved verdict unattributable. Read the value first,
+//      correct the constant in a second commit against the observed number.
+// Deciding is a sizing call (TRA-4441 AC2) on a live real-money box, not a
+// consequence of learning to read a header.
+//
+// A reading is kept per endpoint class and never merged: the last one wins
+// within its class, because `available`/`used` describe the CURRENT window and
+// an older sample of the same bucket is strictly less true. `allowed` is the
+// stable field and the one AC1 turns on.
+const tradierRateLimitByClass = new Map<TradierEndpointClass, TradierRateLimitReading>();
+
+setTradierRateLimitObserver((reading) => {
+  tradierRateLimitByClass.set(reading.endpointClass, reading);
+});
+
+/**
+ * TRA-4441 — what Tradier itself says our limit is, per bucket, as last observed.
+ *
+ * `null` everywhere with `observedClasses: 0` means no Tradier call has completed
+ * since boot OR Tradier does not send the family on these routes. Those two are
+ * distinguishable: `sawAnyResponse` is true once any reading arrived, header-bearing
+ * or not, so an all-null block with `sawAnyResponse: true` is a genuine "upstream
+ * does not tell us", not a cold meter. Without that split an unarmed observer and a
+ * silent upstream read identically — the failure that makes a health field useless.
+ */
+export function getTradierUpstreamRateLimitState(): {
+  observedClasses: number;
+  sawAnyResponse: boolean;
+  /** Distinct non-null `allowed` values across buckets. >1 ⇒ separately metered. */
+  distinctAllowedValues: readonly number[];
+  /** All observed buckets report the SAME `allowed` ⇒ one shared meter is plausible.
+   *  `null` when fewer than two buckets have reported an `allowed` yet. */
+  bucketsAgree: boolean | null;
+  /** The shared `allowed`, only when every reporting bucket agrees. Else `null`. */
+  sharedAllowedReqPerMin: number | null;
+  byClass: Record<string, {
+    allowed: number | null;
+    used: number | null;
+    available: number | null;
+    expiryMs: number | null;
+    status: number;
+    observedAtMs: number;
+    ageMs: number;
+    /** Seconds from this reading to its window expiry. A high-water across readings
+     *  of one bucket approximates the WINDOW LENGTH, which we otherwise assume is
+     *  60s with no evidence — and every req/min figure here depends on that. */
+    secondsToExpiry: number | null;
+  }>;
+} {
+  const now = Date.now();
+  const byClass: Record<string, {
+    allowed: number | null; used: number | null; available: number | null;
+    expiryMs: number | null; status: number; observedAtMs: number; ageMs: number;
+    secondsToExpiry: number | null;
+  }> = {};
+  const allowedValues: number[] = [];
+  for (const [cls, r] of tradierRateLimitByClass) {
+    if (typeof r.allowed === 'number') allowedValues.push(r.allowed);
+    byClass[cls] = {
+      allowed: r.allowed,
+      used: r.used,
+      available: r.available,
+      expiryMs: r.expiryMs,
+      status: r.status,
+      observedAtMs: r.observedAtMs,
+      ageMs: now - r.observedAtMs,
+      secondsToExpiry: typeof r.expiryMs === 'number'
+        ? Number(((r.expiryMs - r.observedAtMs) / 1000).toFixed(1))
+        : null,
+    };
+  }
+  const distinct = [...new Set(allowedValues)].sort((a, b) => a - b);
+  const bucketsAgree = allowedValues.length >= 2 ? distinct.length === 1 : null;
+  return {
+    observedClasses: allowedValues.length,
+    sawAnyResponse: tradierRateLimitByClass.size > 0,
+    distinctAllowedValues: distinct,
+    bucketsAgree,
+    sharedAllowedReqPerMin: distinct.length === 1 ? (distinct[0] ?? null) : null,
+    byClass,
   };
 }
 
@@ -1201,6 +1382,9 @@ export function getTradierQuotaBudgetState(now: number = Date.now()): {
   /** Mean / peak account-wide req/min over recent COMPLETED minutes. */
   accountMeanReqPerMin: number;
   accountPeakReqPerMin: number;
+  /** TRA-4441 — the MEDIAN completed minute. The burst-robust figure: grade a
+   * "sustained spend" claim on this, not on the restart-biased mean. */
+  accountMedianReqPerMin: number;
   accountMinutesObserved: number;
   /** The quote path's share, a SUBSET of the account figures above — never a term
    * to be added to them. TRA-3104's headline double-counted exactly this. */
@@ -1212,12 +1396,33 @@ export function getTradierQuotaBudgetState(now: number = Date.now()): {
   ceilingUnsatisfiable: boolean;
   budgetExhausted: boolean;
   burstBound: boolean;
+  /** TRA-4441 — the mean is averaged over fewer than `MEAN_VERDICT_MIN_MINUTES`
+   * completed minutes, so `budgetExhausted` is withheld as unsupportable. Read
+   * alongside `accountMinutesObserved`. NOT an all-clear — see the verdict fn. */
+  meanUnderSampled: boolean;
+  /** TRA-4441 — completed minutes needed before the mean may carry a verdict, so a
+   * consumer can grade `accountMinutesObserved` without inheriting the constant. */
+  meanVerdictMinMinutes: number;
   /** ⚠️ The ceiling bounds only the COLD, deferrable subset — hot / deep-MTF pulls
    * and the whole quote path bypass it while still consuming quota. Published so a
    * consumer cannot read `enforcing:true` as "account spend is bounded". */
   boundsDeferrableSubsetOnly: true;
+  /** TRA-4441 — where `accountBudgetReqPerMin` came from. `env_override` = an
+   * operator set `TRADIER_ACCOUNT_BUDGET_PER_MIN`; `modelled_constant` = the
+   * hand-inferred `200` default. ⛔ Never `upstream_header` today: this block
+   * publishes the upstream reading without adopting it (see the block above the
+   * observer). A reader must not treat the budget as measured until this says so. */
+  budgetSource: 'env_override' | 'modelled_constant';
+  /** TRA-4441 — what Tradier itself reports, per rate-limit bucket. This is the
+   * AC1 evidence; `budgetAgreesWithUpstream` is the AC1 verdict. */
+  upstream: ReturnType<typeof getTradierUpstreamRateLimitState>;
+  /** TRA-4441 — does the constant match what upstream says? `null` until a
+   * shared `allowed` is observed (no reading yet, or buckets disagree — and
+   * disagreement is itself the answer: there is no single account budget). */
+  budgetAgreesWithUpstream: boolean | null;
 } {
   const quoteState = getTradierQuoteRateState(now);
+  const upstream = getTradierUpstreamRateLimitState(); // TRA-4441
   const accountState = getTradierBarPullRateState(now); // account-wide, not bars-only
   const stats = accountMinuteStats(tradierAccountMinuteCounts, now, BAR_PULL_RATE_WINDOW_MS);
   const reservation = quoteReservationReqPerMin({
@@ -1240,6 +1445,7 @@ export function getTradierQuotaBudgetState(now: number = Date.now()): {
     accountObservedPeak: stats.peak,
     accountObservedMean: stats.mean,
     accountBudget: TRADIER_ACCOUNT_BUDGET_PER_MIN,
+    minutesObserved: stats.minutes, // TRA-4441
   });
   return {
     accountBudgetReqPerMin: TRADIER_ACCOUNT_BUDGET_PER_MIN,
@@ -1251,6 +1457,7 @@ export function getTradierQuotaBudgetState(now: number = Date.now()): {
     accountThisMinute: accountState.requestsThisMinute,
     accountMeanReqPerMin: Number(stats.mean.toFixed(1)),
     accountPeakReqPerMin: stats.peak,
+    accountMedianReqPerMin: Number(stats.median.toFixed(1)), // TRA-4441
     accountMinutesObserved: stats.minutes,
     quoteSubsetThisMinute: quoteState.requestsThisMinute,
     quoteSubsetPeakPerFixedMinute: quoteState.peakPerFixedMinute,
@@ -1260,7 +1467,15 @@ export function getTradierQuotaBudgetState(now: number = Date.now()): {
     ceilingUnsatisfiable: verdict.ceilingUnsatisfiable,
     budgetExhausted: verdict.budgetExhausted,
     burstBound: verdict.burstBound,
+    meanUnderSampled: verdict.meanUnderSampled, // TRA-4441
+    meanVerdictMinMinutes: MEAN_VERDICT_MIN_MINUTES, // TRA-4441
     boundsDeferrableSubsetOnly: true,
+    // TRA-4441 — publish, do not adopt. See the block above the observer.
+    budgetSource: TRADIER_ACCOUNT_BUDGET_SOURCE,
+    upstream,
+    budgetAgreesWithUpstream: upstream.sharedAllowedReqPerMin === null
+      ? null
+      : upstream.sharedAllowedReqPerMin === TRADIER_ACCOUNT_BUDGET_PER_MIN,
   };
 }
 

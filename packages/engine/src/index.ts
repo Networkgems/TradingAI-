@@ -195,6 +195,8 @@ export {
   TRADIER_REJECTED_STATUSES,
   setTradierOrderSubmitObserver,
   getTradierOrderSubmitObserver,
+  setTradierRateLimitObserver, // TRA-4441
+  parseTradierRateLimitHeaders, // TRA-4441
 } from './tradier/index.js';
 export type {
   TradierOrderSubmitEvent,
@@ -234,6 +236,8 @@ export type {
   TradierMultilegSide,
   TradierMultilegLeg,
   TradierMultilegPricing,
+  TradierRateLimitReading, // TRA-4441
+  TradierEndpointClass, // TRA-4441
 } from './tradier/index.js';
 export { CoinbaseOrderClient } from './coinbase/index.js';
 export type {

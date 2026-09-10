@@ -1,6 +1,109 @@
 import type { Candle } from '@trading-app/shared';
 import { tradierBaseUrl, type TradierEnv } from './order-client.js';
 
+// ── TRA-4441 — read the rate limit off the wire instead of modelling it ───────
+//
+// `TRADIER_ACCOUNT_BUDGET_PER_MIN` (yahoo-feed.ts) calls itself "a property of the
+// UPSTREAM contract, not of our universe" and then hard-codes `200` — a number
+// INFERRED on 2026-08-06 from the minute at which Tradier began returning
+// `HTTP 400: Quota Violation`. Inference was never necessary: Tradier states the
+// limit explicitly in `X-Ratelimit-*` on EVERY response, and all three call sites
+// below already hold the `Response` object that carries them. We were discarding
+// the authoritative answer and re-deriving a worse one by hand.
+//
+// ⭐ THE READING IS PER RATE-LIMIT BUCKET, NOT PER ACCOUNT — which is why this is
+// recorded per endpoint class and not collapsed to one number here. If
+// `/markets/quotes` and `/markets/timesales` report DIFFERENT `Allowed`, they are
+// metered separately and the whole "one account-wide budget the bar path exhausts
+// out from under the quote path" model is false — TRA-4441's premise included. A
+// single merged number would hide exactly the disagreement that decides that.
+// Deciding is the consumer's job; this layer only reports what each bucket said.
+//
+// ⛔ OBSERVE BEFORE THE THROW. The most informative response is the REFUSAL — a
+// 400/429 carries the headers stating what we exceeded. Recording only on `ok`
+// responses would blind the meter in precisely the window it exists for.
+
+/** TRA-4441 — one Tradier `X-Ratelimit-*` reading, as reported by upstream. */
+export interface TradierRateLimitReading {
+  /** Which Tradier rate-limit bucket answered. Distinct classes may meter separately. */
+  endpointClass: TradierEndpointClass;
+  /** `X-Ratelimit-Allowed` — the plan's ceiling for this bucket. The AC1 answer. */
+  allowed: number | null;
+  /** `X-Ratelimit-Used` — consumed so far in the current window. */
+  used: number | null;
+  /** `X-Ratelimit-Available` — remaining in the current window. */
+  available: number | null;
+  /** `X-Ratelimit-Expiry` — epoch ms at which this window resets. */
+  expiryMs: number | null;
+  /** HTTP status of the response the headers rode in on. A 400/429 here is a refusal. */
+  status: number;
+  /** Local clock when read, so a consumer can age the reading and derive the window. */
+  observedAtMs: number;
+}
+
+export type TradierEndpointClass = 'quotes' | 'timesales' | 'history';
+
+type TradierRateLimitObserver = (reading: TradierRateLimitReading) => void;
+
+let rateLimitObserver: TradierRateLimitObserver | null = null;
+
+/**
+ * TRA-4441 — register the sink for upstream rate-limit readings, or `null` to
+ * unregister. Kept as an injected callback rather than module state read by the
+ * server so this package keeps no process-wide meter of its own: the engine
+ * reports, the server aggregates and publishes.
+ */
+export function setTradierRateLimitObserver(fn: TradierRateLimitObserver | null): void {
+  rateLimitObserver = fn;
+}
+
+/**
+ * Parse the `X-Ratelimit-*` family off a response's headers. Pure and exported so
+ * the header contract can be tested without a live Tradier round-trip.
+ *
+ * Every field is independently nullable: Tradier does not promise the family on
+ * every route, and a partially-present set is still worth recording. A missing
+ * header must read as "not stated" (`null`) and never as `0` — `available: 0`
+ * means "quota exhausted", which is the opposite of "we did not learn anything".
+ */
+export function parseTradierRateLimitHeaders(
+  headers: { get(name: string): string | null },
+  endpointClass: TradierEndpointClass,
+  status: number,
+  observedAtMs: number,
+): TradierRateLimitReading {
+  const num = (name: string): number | null => {
+    const raw = headers.get(name);
+    if (raw === null || raw.trim() === '') return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  };
+  return {
+    endpointClass,
+    allowed: num('x-ratelimit-allowed'),
+    used: num('x-ratelimit-used'),
+    available: num('x-ratelimit-available'),
+    expiryMs: num('x-ratelimit-expiry'),
+    status,
+    observedAtMs,
+  };
+}
+
+/** Feed one response's headers to the registered observer. Never throws: an
+ *  observability sink must not be able to fail a market-data fetch. */
+function observeRateLimit(
+  resp: { status: number; headers: { get(name: string): string | null } },
+  endpointClass: TradierEndpointClass,
+): void {
+  const observer = rateLimitObserver;
+  if (!observer) return;
+  try {
+    observer(parseTradierRateLimitHeaders(resp.headers, endpointClass, resp.status, Date.now()));
+  } catch {
+    // A broken observer must never take the quote feed down with it.
+  }
+}
+
 export interface TradierEquityQuote {
   symbol: string;
   /** Last trade price. */
@@ -228,6 +331,7 @@ export class TradierStocksClient {
     }
     const url = `${this.baseUrl}/markets/quotes?symbols=${encodeURIComponent([...wireToRequested.keys()].join(','))}`;
     const resp = await fetch(url, { headers: this.headers });
+    observeRateLimit(resp, 'quotes'); // TRA-4441 — before the throw: a refusal is the informative one.
     if (!resp.ok) {
       throw new Error(`Tradier quotes HTTP ${resp.status}: ${(await resp.text().catch(() => '')).slice(0, 200)}`);
     }
@@ -308,6 +412,7 @@ export class TradierStocksClient {
     });
     const url = `${this.baseUrl}/markets/timesales?${params}`;
     const resp = await fetch(url, { headers: this.headers });
+    observeRateLimit(resp, 'timesales'); // TRA-4441 — before the throw: a refusal is the informative one.
     if (!resp.ok) {
       throw new Error(`Tradier timesales(${symbol}) HTTP ${resp.status}: ${(await resp.text().catch(() => '')).slice(0, 200)}`);
     }
@@ -369,6 +474,7 @@ export class TradierStocksClient {
     });
     const url = `${this.baseUrl}/markets/history?${params}`;
     const resp = await fetch(url, { headers: this.headers });
+    observeRateLimit(resp, 'history'); // TRA-4441 — before the throw: a refusal is the informative one.
     if (!resp.ok) {
       throw new Error(`Tradier history(${symbol}) HTTP ${resp.status}: ${(await resp.text().catch(() => '')).slice(0, 200)}`);
     }

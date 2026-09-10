@@ -14,6 +14,8 @@ import {
   quoteReservationReqPerMin,
   resolveBarPullCeiling,
   quotaCrossingVerdict,
+  MEAN_VERDICT_MIN_MINUTES, // TRA-4441
+  getTradierUpstreamRateLimitState, // TRA-4441
   getTradierQuotaBudgetState,
   getTradierAccountSpendThisMinute,
   accountMinuteStats,
@@ -26,6 +28,7 @@ import {
   barPullThrottleGate,
   secondaryFanoutCeiling,
 } from './yahoo-feed.js';
+import { parseTradierRateLimitHeaders } from '@trading-app/engine'; // TRA-4441
 
 const Q = (price: number) => ({ price, volume: 0, change: 0, changePct: 0 });
 
@@ -492,11 +495,15 @@ describe('resolveBarPullCeiling (TRA-3104 derived budget precedence)', () => {
 // remedies are opposite. Every branch must be reachable: a verdict that can only
 // ever say "fine" is decoration, and one that collapses capacity into burst is
 // what produced this ticket's wrong headline.
+// TRA-4441 — every pre-existing case here means "the window is fully sampled";
+// the sample-size condition is exercised on purpose in its own describe below.
+const FULLY_SAMPLED = 30;
+
 describe('quotaCrossingVerdict (TRA-3104 capacity vs burst)', () => {
   it('is BURST-BOUND on the corrected 2026-08-06 world: mean 184 under a 200 plan, peak 260 over it', () => {
     // ⚠️ The account meter already INCLUDES the quote calls, so the filed
     // "184 + 16 = 200 = fully consumed" double-counted. Mean is 184 of 200.
-    const v = quotaCrossingVerdict({ barCeiling: 180, accountObservedPeak: 260, accountObservedMean: 184, accountBudget: 200 });
+    const v = quotaCrossingVerdict({ barCeiling: 180, accountObservedPeak: 260, accountObservedMean: 184, accountBudget: 200, minutesObserved: FULLY_SAMPLED });
     expect(v.burstBound).toBe(true);
     expect(v.budgetExhausted).toBe(false);       // NOT a capacity condition
     expect(v.crossed).toBe(true);
@@ -505,14 +512,14 @@ describe('quotaCrossingVerdict (TRA-3104 capacity vs burst)', () => {
   });
 
   it('is BUDGET-EXHAUSTED only when the MEAN reaches the plan — the one case no throttle fixes', () => {
-    const v = quotaCrossingVerdict({ barCeiling: 180, accountObservedPeak: 260, accountObservedMean: 205, accountBudget: 200 });
+    const v = quotaCrossingVerdict({ barCeiling: 180, accountObservedPeak: 260, accountObservedMean: 205, accountBudget: 200, minutesObserved: FULLY_SAMPLED });
     expect(v.budgetExhausted).toBe(true);
     expect(v.burstBound).toBe(false);            // mutually exclusive by construction
     expect(v.headroomReqPerMin).toBe(-5);        // negative, never clamped
   });
 
   it('is NOT crossed when both mean and peak fit under the plan (the green branch)', () => {
-    const v = quotaCrossingVerdict({ barCeiling: 180, accountObservedPeak: 150, accountObservedMean: 120, accountBudget: 200 });
+    const v = quotaCrossingVerdict({ barCeiling: 180, accountObservedPeak: 150, accountObservedMean: 120, accountBudget: 200, minutesObserved: FULLY_SAMPLED });
     expect(v.crossed).toBe(false);
     expect(v.burstBound).toBe(false);
     expect(v.budgetExhausted).toBe(false);
@@ -524,21 +531,164 @@ describe('quotaCrossingVerdict (TRA-3104 capacity vs burst)', () => {
     // A gate satisfied by the absence of the thing it grades: reading `crossed`
     // off an Infinity ceiling alone would report false on every default box.
     expect(
-      quotaCrossingVerdict({ barCeiling: Number.POSITIVE_INFINITY, accountObservedPeak: 260, accountObservedMean: 184, accountBudget: 200 }).crossed,
+      quotaCrossingVerdict({ barCeiling: Number.POSITIVE_INFINITY, accountObservedPeak: 260, accountObservedMean: 184, accountBudget: 200, minutesObserved: FULLY_SAMPLED }).crossed,
     ).toBe(true);
     expect(
-      quotaCrossingVerdict({ barCeiling: Number.POSITIVE_INFINITY, accountObservedPeak: 150, accountObservedMean: 120, accountBudget: 200 }).crossed,
+      quotaCrossingVerdict({ barCeiling: Number.POSITIVE_INFINITY, accountObservedPeak: 150, accountObservedMean: 120, accountBudget: 200, minutesObserved: FULLY_SAMPLED }).crossed,
     ).toBe(false);
   });
 
   it('flags ceilingUnsatisfiable independently of the budget verdict', () => {
     // Peak over the derived allowance but the whole account comfortably under the
     // plan: enabling the throttle would bite for no quota benefit.
-    const v = quotaCrossingVerdict({ barCeiling: 100, accountObservedPeak: 140, accountObservedMean: 90, accountBudget: 200 });
+    const v = quotaCrossingVerdict({ barCeiling: 100, accountObservedPeak: 140, accountObservedMean: 90, accountBudget: 200, minutesObserved: FULLY_SAMPLED });
     expect(v.ceilingUnsatisfiable).toBe(true);
     expect(v.budgetExhausted).toBe(false);
     expect(v.burstBound).toBe(false);
     expect(v.crossed).toBe(true);
+  });
+});
+
+// TRA-4441 — the capacity/burst split above is only meaningful if the mean is an
+// average of enough minutes to BE a mean. It was not: `budgetExhausted` had no
+// sample-size condition, and it PREEMPTS `burstBound`, so a one-minute window
+// reported the expensive verdict every time. bqb1 restarts, pulls the whole
+// universe's bars in the first minute, then idles — measured 2026-09-09 17:27-
+// 17:30Z: minute counts 356, 0, 0, 813. Sampled 3 minutes after a boot that is
+// `minutesObserved: 1, mean: 356` ⇒ "genuine capacity condition, no throttle
+// helps", off one cold-start burst. TRA-4441 was filed on that artefact.
+describe('quotaCrossingVerdict sample-size guard (TRA-4441)', () => {
+  const bqb1BootBurst = {
+    barCeiling: 195,
+    accountObservedPeak: 356,
+    accountObservedMean: 356, // a one-minute mean IS that minute
+    accountBudget: 200,
+  };
+
+  it('withholds budgetExhausted when the mean is one minute of boot burst', () => {
+    const v = quotaCrossingVerdict({ ...bqb1BootBurst, minutesObserved: 1 });
+    expect(v.meanUnderSampled).toBe(true);
+    expect(v.budgetExhausted).toBe(false); // was true, off a single sample
+  });
+
+  it('⛔ does NOT go quiet on the thin sample — the peak still reports', () => {
+    // The whole risk of a sample-size guard is that it converts "not measured"
+    // into "measured clean". `crossed` must survive: a real observed minute at
+    // 356 against a 200 plan is a finding whether or not it is sustained.
+    const v = quotaCrossingVerdict({ ...bqb1BootBurst, minutesObserved: 1 });
+    expect(v.crossed).toBe(true);
+    expect(v.burstBound).toBe(true);       // …and now names the CORRECT remedy
+    expect(v.peakOverBudgetReqPerMin).toBe(156);
+  });
+
+  it('re-enables the capacity verdict once the window is genuinely sampled', () => {
+    const thin = quotaCrossingVerdict({ ...bqb1BootBurst, minutesObserved: MEAN_VERDICT_MIN_MINUTES - 1 });
+    const full = quotaCrossingVerdict({ ...bqb1BootBurst, minutesObserved: MEAN_VERDICT_MIN_MINUTES });
+    expect(thin.budgetExhausted).toBe(false);
+    expect(full.budgetExhausted).toBe(true);   // same numbers, sufficient sample
+    expect(full.meanUnderSampled).toBe(false);
+    // …and the two verdicts stay mutually exclusive on both sides of the boundary.
+    expect(thin.burstBound).toBe(true);
+    expect(full.burstBound).toBe(false);
+  });
+
+  it('leaves a genuinely-under-budget thin window green, so the guard is not a blanket alarm', () => {
+    // The guard suppresses one verdict; it must not manufacture the other. A quiet
+    // minute under the plan reads clean at any sample size.
+    const v = quotaCrossingVerdict({
+      barCeiling: 195, accountObservedPeak: 120, accountObservedMean: 120, accountBudget: 200, minutesObserved: 1,
+    });
+    expect(v.crossed).toBe(false);
+    expect(v.burstBound).toBe(false);
+    expect(v.meanUnderSampled).toBe(true);   // still flagged as unproven…
+    expect(v.budgetExhausted).toBe(false);   // …without inventing a crossing
+  });
+
+  it('keeps ceilingUnsatisfiable live on a thin sample — it is a peak fact, not a mean fact', () => {
+    const v = quotaCrossingVerdict({
+      barCeiling: 62, accountObservedPeak: 737, accountObservedMean: 737, accountBudget: 200, minutesObserved: 1,
+    });
+    expect(v.ceilingUnsatisfiable).toBe(true);
+  });
+});
+
+// TRA-4441 — AC1. `TRADIER_ACCOUNT_BUDGET_PER_MIN = 200` calls itself a property
+// of the upstream contract but was INFERRED from the minute Tradier began
+// refusing us on 2026-08-06. Tradier states it outright in `X-Ratelimit-*`, and
+// the client held those headers all along.
+describe('parseTradierRateLimitHeaders (TRA-4441 AC1)', () => {
+  const headers = (map: Record<string, string>) => ({
+    get: (name: string) => map[name.toLowerCase()] ?? null,
+  });
+
+  it('reads the limit Tradier states, rather than inferring it from a refusal', () => {
+    const r = parseTradierRateLimitHeaders(headers({
+      'x-ratelimit-allowed': '120',
+      'x-ratelimit-used': '118',
+      'x-ratelimit-available': '2',
+      'x-ratelimit-expiry': '1789000060000',
+    }), 'quotes', 200, 1789000000000);
+    expect(r.allowed).toBe(120);
+    expect(r.available).toBe(2);
+    expect(r.endpointClass).toBe('quotes');
+  });
+
+  it('⛔ distinguishes "not stated" from zero — the difference between blind and exhausted', () => {
+    // `available: 0` means the quota is gone. A missing header means we learned
+    // nothing. Coercing the absent one to 0 would report exhaustion on a silent
+    // upstream, which is the whole reason each field is independently nullable.
+    const r = parseTradierRateLimitHeaders(headers({}), 'timesales', 200, 1);
+    expect(r.allowed).toBeNull();
+    expect(r.available).toBeNull();
+    expect(r.used).toBeNull();
+    const zero = parseTradierRateLimitHeaders(headers({ 'x-ratelimit-available': '0' }), 'timesales', 200, 1);
+    expect(zero.available).toBe(0);
+  });
+
+  it('records the REFUSAL, which is the most informative response of all', () => {
+    // Observed before the throw at every call site: a 400 Quota Violation carries
+    // the headers saying what we exceeded. Recording only 2xx responses would
+    // blind the meter in exactly the window it exists for.
+    const r = parseTradierRateLimitHeaders(headers({
+      'x-ratelimit-allowed': '120', 'x-ratelimit-available': '0',
+    }), 'quotes', 400, 1);
+    expect(r.status).toBe(400);
+    expect(r.allowed).toBe(120);
+  });
+
+  it('ignores a non-numeric header instead of propagating NaN into the budget', () => {
+    const r = parseTradierRateLimitHeaders(headers({ 'x-ratelimit-allowed': 'unlimited' }), 'history', 200, 1);
+    expect(r.allowed).toBeNull();
+  });
+});
+
+describe('getTradierQuotaBudgetState upstream block (TRA-4441 AC1)', () => {
+  it('admits the budget is MODELLED, and never claims agreement it has not observed', () => {
+    // The published block previously stated `accountBudgetReqPerMin: 200` with
+    // nothing saying where 200 came from, so a reader grading `crossed` could not
+    // tell a measured denominator from a hand-inferred one. Both AC1 fields must
+    // be present and honest on a box that has seen no reading yet.
+    const s = getTradierQuotaBudgetState(Date.now());
+    expect(s.budgetSource).toBe('modelled_constant');
+    // ⛔ `null`, not `true`. "We have not checked" must never render as "it matches".
+    if (s.upstream.sharedAllowedReqPerMin === null) {
+      expect(s.budgetAgreesWithUpstream).toBeNull();
+    } else {
+      expect(s.budgetAgreesWithUpstream).toBe(s.upstream.sharedAllowedReqPerMin === s.accountBudgetReqPerMin);
+    }
+  });
+
+  it('separates a cold meter from an upstream that simply does not state a limit', () => {
+    // Both render as all-null `allowed`. If they were indistinguishable the field
+    // would be unreadable: one means "wait", the other means "this can never be
+    // answered here". `sawAnyResponse` is the discriminator.
+    const u = getTradierUpstreamRateLimitState();
+    expect(typeof u.sawAnyResponse).toBe('boolean');
+    expect(u.observedClasses).toBe(u.distinctAllowedValues.length === 0 ? 0 : u.observedClasses);
+    // `bucketsAgree` stays null until at least two buckets have reported: a single
+    // bucket agreeing with itself is not evidence that the meters are shared, and
+    // that claim is exactly what decides whether TRA-4441's premise holds.
+    if (u.distinctAllowedValues.length < 2) expect(u.sharedAllowedReqPerMin).toBe(u.distinctAllowedValues[0] ?? null);
   });
 });
 
@@ -566,13 +716,36 @@ describe('accountMinuteStats (TRA-3104 recent-window mean/peak)', () => {
     expect(sb.peak).toBeGreaterThan(ss.peak);          // burst has the higher peak
     expect(sb.mean).toBeLessThan(ss.mean);             // …and the lower mean
     // Same budget, opposite verdicts.
-    expect(quotaCrossingVerdict({ barCeiling: 180, accountObservedPeak: sb.peak, accountObservedMean: sb.mean, accountBudget: 200 }).burstBound).toBe(true);
-    expect(quotaCrossingVerdict({ barCeiling: 180, accountObservedPeak: ss.peak, accountObservedMean: ss.mean, accountBudget: 200 }).budgetExhausted).toBe(true);
+    expect(quotaCrossingVerdict({ barCeiling: 180, accountObservedPeak: sb.peak, accountObservedMean: sb.mean, accountBudget: 200, minutesObserved: FULLY_SAMPLED }).burstBound).toBe(true);
+    expect(quotaCrossingVerdict({ barCeiling: 180, accountObservedPeak: ss.peak, accountObservedMean: ss.mean, accountBudget: 200, minutesObserved: FULLY_SAMPLED }).budgetExhausted).toBe(true);
+  });
+
+  // TRA-4441 — the mean is not robust to the one thing this series reliably
+  // contains: a whole-universe bar pull in the minute after every restart.
+  it('median survives the boot burst that drags the mean 60% high', () => {
+    // bqb1 shape measured 2026-09-09: one 819-call boot minute, then ~200/min.
+    const counts = new Map([[b(10), 819], [b(11), 202], [b(12), 198], [b(13), 205], [b(14), 196]]);
+    const s = accountMinuteStats(counts, 15 * W, W);
+    expect(s.minutes).toBe(5);
+    expect(Math.round(s.mean)).toBe(324);   // ~62% above the true steady state…
+    expect(s.median).toBe(202);             // …the median lands on it
+    expect(s.peak).toBe(819);               // and the burst is still reported
+    // The distinction is load-bearing: same window, opposite readings against a
+    // 200/min plan. Grading a SUSTAINED-spend claim on the mean would restate
+    // TRA-4441's 326.3/min headline, which was this artefact.
+    expect(s.mean).toBeGreaterThan(200);
+    expect(s.median).toBeGreaterThan(200);  // marginal here — over by 2, not by 126
+    expect(s.mean - 200).toBeGreaterThan(60 * (s.median - 200));
+  });
+
+  it('takes the mean of the two middle minutes on an even-length window', () => {
+    const s = accountMinuteStats(new Map([[b(10), 100], [b(11), 200], [b(12), 300], [b(13), 400]]), 14 * W, W);
+    expect(s.median).toBe(250);
   });
 
   it('reports zero minutes observed rather than a fabricated rate when nothing completed', () => {
     // BLIND, not "quiet" — an empty history must not read as a clean all-clear.
-    expect(accountMinuteStats(new Map(), 13 * W, W)).toEqual({ mean: 0, peak: 0, minutes: 0 });
+    expect(accountMinuteStats(new Map(), 13 * W, W)).toEqual({ mean: 0, peak: 0, median: 0, minutes: 0 });
     expect(accountMinuteStats(new Map([[b(13), 50]]), 13 * W + 1_000, W).minutes).toBe(0);
   });
 });

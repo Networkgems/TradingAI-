@@ -87,3 +87,7 @@ export type {
 } from './options-client.js';
 export { TradierStocksClient } from './stocks-client.js';
 export type { TradierEquityQuote, TradierQuotesRead } from './stocks-client.js';
+// TRA-4441 — the upstream-reported rate limit, so the account budget can be READ
+// rather than modelled from the minute Tradier started refusing us.
+export { setTradierRateLimitObserver, parseTradierRateLimitHeaders } from './stocks-client.js';
+export type { TradierRateLimitReading, TradierEndpointClass } from './stocks-client.js';
