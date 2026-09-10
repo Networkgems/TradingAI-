@@ -154,6 +154,23 @@ interface RvScanCensusRecord {
    * asked for the universe to survive the fold.
    */
   universeSum: number;
+  /**
+   * TRA-4357 AC4 — of `blindScans`, how many were blind on EACH gate. Sums to
+   * `blindScans`. `blindScans` alone is gate-agnostic by design (see
+   * {@link isBlindScan}), which means it pools a feed blackout (`scan:no_spot`
+   * at 100%) with a policy refusal (`entry_window_closed` at 100%) — two
+   * opposite readings of "the strategy never ran". This names which gate did it.
+   */
+  blindScansByGate: Record<string, number>;
+  /**
+   * TRA-4357 AC4 — the share of `rejectionsByGate` that came from blind passes,
+   * per gate. Every entry is `<=` the same gate in `rejectionsByGate`, so
+   * `rejectionsByGate - blindRejectionsByGate` is the ledger of the passes that
+   * actually exercised the strategy. Without it a day's gate sums are dominated
+   * by blind volume and bury the few passes that ruled, which was the filing's
+   * "Why this is urgent" case.
+   */
+  blindRejectionsByGate: Record<string, number>;
   /** First scan under this key during this boot, ms epoch. */
   firstAt: number;
 }
@@ -174,6 +191,10 @@ interface CensusTally {
   blindScans: number;
   /** TRA-4357 — see {@link RvScanCensusRecord.universeSum}. */
   universeSum: number;
+  /** TRA-4357 AC4 — see {@link RvScanCensusRecord.blindScansByGate}. */
+  blindScansByGate: Map<string, number>;
+  /** TRA-4357 AC4 — see {@link RvScanCensusRecord.blindRejectionsByGate}. */
+  blindRejectionsByGate: Map<string, number>;
   firstAt: number;
   lastAt: number;
   /** ms epoch of the last line appended for this tally (0 ⇒ never appended). */
@@ -280,6 +301,8 @@ function flushCensus(tally: CensusTally): void {
       rejectionsByGate: gatesToObject(tally.rejectionsByGate),
       blindScans: tally.blindScans,
       universeSum: tally.universeSum,
+      blindScansByGate: gatesToObject(tally.blindScansByGate),
+      blindRejectionsByGate: gatesToObject(tally.blindRejectionsByGate),
       firstAt: tally.firstAt,
     };
     appendFileSync(path, JSON.stringify(rec) + '\n', 'utf8');
@@ -310,11 +333,24 @@ export function isBlindScan(record: {
   candidatesPassed: number;
   rejectionsByGate: Record<string, number>;
 }): boolean {
-  if (!(record.candidatesEvaluated > 0)) return false;
-  if (record.candidatesPassed > 0) return false;
-  const gates = Object.values(record.rejectionsByGate);
-  if (gates.length !== 1) return false;
-  return gates[0] === record.candidatesEvaluated;
+  return blindGateOf(record) !== null;
+}
+
+/**
+ * TRA-4357 AC4 — the gate that took the whole of a blind pass, or null when the
+ * pass was not blind. Same predicate as {@link isBlindScan}; this one keeps the
+ * label so the census can say WHICH gate blinded the sleeve.
+ */
+export function blindGateOf(record: {
+  candidatesEvaluated: number;
+  candidatesPassed: number;
+  rejectionsByGate: Record<string, number>;
+}): string | null {
+  if (!(record.candidatesEvaluated > 0)) return null;
+  if (record.candidatesPassed > 0) return null;
+  const gates = Object.entries(record.rejectionsByGate);
+  if (gates.length !== 1) return null;
+  return gates[0]![1] === record.candidatesEvaluated ? gates[0]![0] : null;
 }
 
 /** The book a scan pass belongs to. Supplied by the caller; never inferred here. */
@@ -368,6 +404,8 @@ export function recordRvScanCensus(
       rejectionsByGate: new Map(),
       blindScans: 0,
       universeSum: 0,
+      blindScansByGate: new Map(),
+      blindRejectionsByGate: new Map(),
       firstAt: now,
       lastAt: now,
       lastFlushedAt: 0,
@@ -379,7 +417,12 @@ export function recordRvScanCensus(
   tally.candidatesPassed += record.candidatesPassed;
   tally.opensPlaced += record.opensPlaced;
   mergeGates(tally.rejectionsByGate, record.rejectionsByGate);
-  if (isBlindScan(record)) tally.blindScans += 1;
+  const blindGate = blindGateOf(record);
+  if (blindGate !== null) {
+    tally.blindScans += 1;
+    mergeGates(tally.blindScansByGate, { [blindGate]: 1 });
+    mergeGates(tally.blindRejectionsByGate, { [blindGate]: record.candidatesEvaluated });
+  }
   tally.universeSum += Number.isFinite(record.universeSize) ? record.universeSize : 0;
   tally.lastAt = now;
 
@@ -491,6 +534,10 @@ export function hydrateRvScanCensusFromDisk(
       // read quieter than it was but a quiet day can never read blind.
       blindScans: num(rec.blindScans),
       universeSum: num(rec.universeSum),
+      // TRA-4357 AC4 — same floor-to-empty as `blindScans` above: a line written
+      // before these maps existed contributes nothing, never a fabricated split.
+      blindScansByGate: gateMap(rec.blindScansByGate),
+      blindRejectionsByGate: gateMap(rec.blindRejectionsByGate),
       firstAt: Number.isFinite(rec.firstAt) ? rec.firstAt : rec.ts,
       lastAt: rec.ts,
       // Hydrated tallies belong to a PREVIOUS boot (different bootId ⇒ different
@@ -521,6 +568,8 @@ export function hydrateRvScanCensusFromDisk(
       rejectionsByGate: gatesToObject(t.rejectionsByGate),
       blindScans: t.blindScans,
       universeSum: t.universeSum,
+      blindScansByGate: gatesToObject(t.blindScansByGate),
+      blindRejectionsByGate: gatesToObject(t.blindRejectionsByGate),
       firstAt: t.firstAt,
     };
     kept.push(JSON.stringify(rec));
@@ -545,6 +594,12 @@ export function hydrateRvScanCensusFromDisk(
 
 function num(v: unknown): number {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0;
+}
+
+function gateMap(v: unknown): Map<string, number> {
+  const out = new Map<string, number>();
+  if (v && typeof v === 'object' && !Array.isArray(v)) mergeGates(out, v as Record<string, number>);
+  return out;
 }
 
 // ── Health summary ───────────────────────────────────────────────────────────
@@ -595,6 +650,27 @@ export interface RvScanCensusCell {
    * not-measured caveat as `blindScans` for pre-2026-09-08 lines.
    */
   universeSum: number;
+  /**
+   * TRA-4357 AC4 — `blindScans` split by the gate that took the whole pass.
+   * Sums to `blindScans`. Read this BEFORE reading `blindScans` as a feed
+   * failure: a pass that `entry_window_closed` took whole is blind to the
+   * strategy for a POLICY reason, and pooling it with a `scan:no_spot`
+   * blackout would attribute a closed window to the quote feed.
+   */
+  blindScansByGate: Record<string, number>;
+  /**
+   * TRA-4357 AC4 — the part of `rejectionsByGate` contributed by blind passes.
+   * `rejectionsByGate[g] - (blindRejectionsByGate[g] ?? 0)` is gate `g`'s count
+   * over the passes that ACTUALLY RULED — the strategy ledger with the blind
+   * volume taken out. That subtraction is the whole point: on 2026-09-04 a
+   * summed day read as an overwhelming `scan:no_spot` day and buried the 3
+   * cycles that exercised the strategy.
+   *
+   * ⚠️ Empty on lines written before 2026-09-10 = NOT MEASURED. Compare
+   * `sum(blindScansByGate)` to `blindScans`: less means some contributing boot
+   * predates this field, and the subtraction is not yet trustworthy.
+   */
+  blindRejectionsByGate: Record<string, number>;
   firstAt: number;
   lastAt: number;
 }
@@ -638,6 +714,8 @@ export function summarizeRvScanCensus(): RvScanCensusDay[] {
     gates: Map<string, number>;
     blindScans: number;
     universeSum: number;
+    blindScansByGate: Map<string, number>;
+    blindRejectionsByGate: Map<string, number>;
     firstAt: number;
     lastAt: number;
   }
@@ -664,6 +742,8 @@ export function summarizeRvScanCensus(): RvScanCensusDay[] {
         gates: new Map(),
         blindScans: 0,
         universeSum: 0,
+        blindScansByGate: new Map(),
+        blindRejectionsByGate: new Map(),
         firstAt: t.firstAt,
         lastAt: t.lastAt,
       };
@@ -679,6 +759,8 @@ export function summarizeRvScanCensus(): RvScanCensusDay[] {
     agg.opensPlaced += t.opensPlaced;
     mergeGates(agg.gates, gatesToObject(t.rejectionsByGate));
     agg.blindScans += t.blindScans;
+    mergeGates(agg.blindScansByGate, gatesToObject(t.blindScansByGate));
+    mergeGates(agg.blindRejectionsByGate, gatesToObject(t.blindRejectionsByGate));
     agg.universeSum += t.universeSum;
     if (t.firstAt < agg.firstAt) agg.firstAt = t.firstAt;
     if (t.lastAt > agg.lastAt) agg.lastAt = t.lastAt;
@@ -703,6 +785,8 @@ export function summarizeRvScanCensus(): RvScanCensusDay[] {
           rejectionsByGate: gatesToObject(a.gates),
           blindScans: a.blindScans,
           universeSum: a.universeSum,
+          blindScansByGate: gatesToObject(a.blindScansByGate),
+          blindRejectionsByGate: gatesToObject(a.blindRejectionsByGate),
           firstAt: a.firstAt,
           lastAt: a.lastAt,
         }))

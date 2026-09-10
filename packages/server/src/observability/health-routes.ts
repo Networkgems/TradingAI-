@@ -8024,7 +8024,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         + '⚠️ `blindScans`/`universeSum` are 0 on lines written before 2026-09-08, which '
         + 'means NOT MEASURED rather than "none" — check `etDay` before reading a zero as '
         + 'evidence. The counter is gate-AGNOSTIC on purpose: hard-coding `scan:no_spot` '
-        + 'would make it blind to the next gate that saturates.',
+        + 'would make it blind to the next gate that saturates. '
+        + 'TRA-4357 AC4: because it is gate-agnostic, `blindScans` pools a feed blackout '
+        + '(`scan:no_spot` took the whole pass) with a policy refusal (`entry_window_closed` '
+        + 'took it) — read `blindScansByGate` for which gate blinded each pass. '
+        + '`blindRejectionsByGate` is the share of `rejectionsByGate` that came from blind '
+        + 'passes; `rejectionsByGate[g] - blindRejectionsByGate[g]` is the ledger of the '
+        + 'passes that actually ruled. Both maps are empty on lines written before '
+        + '2026-09-10 (NOT MEASURED): if `sum(blindScansByGate) < blindScans` a contributing '
+        + 'boot predates them and the subtraction is incomplete.',
       censusRetentionDays: 30,
     });
   });

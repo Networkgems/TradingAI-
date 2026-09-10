@@ -24,14 +24,24 @@
  *
  * These tests fail on the pre-fix behaviour.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { mkdtempSync, rmSync, appendFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   TradierRelativeValueScannerService,
   CHAIN_CACHE_TTL_MS,
 } from './relative-value-scanner.js';
 import { partitionCachedQuotes } from './yahoo-feed.js';
-import { beginRvScan, UNATTRIBUTED_GATE } from './rv-scan-telemetry.js';
-import { isBlindScan } from './rv-scan-census-ledger.js';
+import { beginRvScan, UNATTRIBUTED_GATE, type RvScanRecord } from './rv-scan-telemetry.js';
+import {
+  isBlindScan,
+  recordRvScanCensus,
+  summarizeRvScanCensus,
+  clearRvScanCensusLedger,
+  hydrateRvScanCensusFromDisk,
+  rvScanCensusLogPath,
+} from './rv-scan-census-ledger.js';
 import type { OptionChainRow, TradierOptionsClient } from '@trading-app/engine';
 
 const NOW_BASE = Date.parse('2024-01-15T15:00:00Z');
@@ -242,6 +252,74 @@ describe('TRA-4357 AC4 — the census can tell a BLIND cycle from a strategy dec
     // ...and separated by the new counter.
     expect(blindDay.filter(isBlindScan).length).toBe(2);
     expect(decliningDay.filter(isBlindScan).length).toBe(0);
+  });
+});
+
+describe('TRA-4357 AC4 — the census names WHICH gate blinded a pass, and how much volume it was', () => {
+  const rec = (evaluated: number, gates: Record<string, number>): RvScanRecord => {
+    const run = beginRvScan('otm', evaluated, () => NOW_BASE);
+    for (let i = 0; i < evaluated; i++) run.enterSymbol();
+    for (const [g, n] of Object.entries(gates)) for (let i = 0; i < n; i++) run.reject(g);
+    return run.finish();
+  };
+  const owner = { account: 'desk', accountClass: 'desk' as const, mode: 'live' as const, etDay: '2026-09-10' };
+
+  beforeEach(() => clearRvScanCensusLedger());
+
+  it('separates a feed blackout from a closed window, and lets the strategy ledger be recovered', () => {
+    // One feed-blind pass, one window-blind pass, one pass that actually ruled.
+    recordRvScanCensus(owner, 'otm', rec(273, { 'scan:no_spot': 273 }), NOW_BASE);
+    recordRvScanCensus(owner, 'otm', rec(150, { entry_window_closed: 150 }), NOW_BASE + 1);
+    recordRvScanCensus(owner, 'otm', rec(187, {
+      no_candidates: 83, contract_floor_delta: 35, 'scan:no_expirations': 25,
+      recent_duplicate: 20, entry_window_closed: 14, 'scan:no_spot': 10,
+    }), NOW_BASE + 2);
+
+    const cell = summarizeRvScanCensus()[0]!.cells[0]!;
+    // Pre-AC4 payload: 2 blind scans and nothing saying one was a closed window.
+    expect(cell.blindScans).toBe(2);
+    expect(cell.blindScansByGate).toEqual({ 'scan:no_spot': 1, entry_window_closed: 1 });
+    expect(cell.blindRejectionsByGate).toEqual({ 'scan:no_spot': 273, entry_window_closed: 150 });
+
+    // The summed day reads as a `scan:no_spot` day...
+    expect(Object.keys(cell.rejectionsByGate)[0]).toBe('scan:no_spot');
+    // ...and the subtraction recovers the pass that ruled, exactly.
+    const ruled: Record<string, number> = {};
+    for (const [g, n] of Object.entries(cell.rejectionsByGate)) {
+      const left = n - (cell.blindRejectionsByGate[g] ?? 0);
+      if (left > 0) ruled[g] = left;
+    }
+    expect(ruled).toEqual({
+      no_candidates: 83, contract_floor_delta: 35, 'scan:no_expirations': 25,
+      recent_duplicate: 20, entry_window_closed: 14, 'scan:no_spot': 10,
+    });
+  });
+
+  it('survives the disk round-trip, and floors a pre-AC4 line to empty rather than guessing', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tra4357-ac4-'));
+    try {
+      hydrateRvScanCensusFromDisk(dir, NOW_BASE);
+      recordRvScanCensus(owner, 'otm', rec(100, { 'scan:no_spot': 100 }), NOW_BASE);
+      // A line from a boot that predates the maps: blindScans present, maps absent.
+      appendFileSync(rvScanCensusLogPath(dir), JSON.stringify({
+        kind: 'scan-census', ts: NOW_BASE, etDay: '2026-09-10', path: 'otm', account: 'desk',
+        accountClass: 'desk', mode: 'live', bootId: 'old-boot', scans: 3,
+        candidatesEvaluated: 300, candidatesPassed: 0, opensPlaced: 0,
+        rejectionsByGate: { 'scan:no_spot': 300 }, blindScans: 3, universeSum: 300, firstAt: NOW_BASE,
+      }) + '\n', 'utf8');
+
+      hydrateRvScanCensusFromDisk(dir, NOW_BASE + 1);
+      const cell = summarizeRvScanCensus()[0]!.cells[0]!;
+      expect(cell.blindScans).toBe(4);
+      expect(cell.blindScansByGate).toEqual({ 'scan:no_spot': 1 });
+      expect(cell.blindRejectionsByGate).toEqual({ 'scan:no_spot': 100 });
+      // The published tell that a contributing boot predates the maps.
+      const splitSum = Object.values(cell.blindScansByGate).reduce((a, b) => a + b, 0);
+      expect(splitSum).toBeLessThan(cell.blindScans);
+    } finally {
+      clearRvScanCensusLedger();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
