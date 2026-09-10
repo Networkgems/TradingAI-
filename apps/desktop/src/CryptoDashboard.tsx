@@ -11,7 +11,7 @@ import { SERVER_URL, HTTP_URL } from './server-url';
 import { logger } from './lib/logger';
 import { createReconnectController } from './lib/backoff';
 // TRA-4488 — the session token no longer rides in the upgrade URL.
-import { buildSocketUrl, fetchWsTicket, WsTicketError } from './lib/ws-ticket';
+import { buildLegacySocketUrl, buildSocketUrl, fetchWsTicket, WsTicketError } from './lib/ws-ticket';
 import type { Theme } from './components/ThemeToggle';
 import { CryptoDashboardHeader } from './components/dashboard/CryptoDashboardHeader';
 import { HaltBanner } from './components/dashboard/HaltBanner';
@@ -61,18 +61,23 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
     let cancelled = false;
     async function connect() {
       if (cancelled) return;
-      let ticket: string;
+      let url: string;
       try {
-        ticket = await fetchWsTicket(token);
+        url = buildSocketUrl(SERVER_URL, await fetchWsTicket(token));
       } catch (err) {
         if (cancelled) return;
         if (err instanceof WsTicketError && err.status === 401) { onLogout(); return; }
-        logger.warn('crypto-ws', 'ws-ticket fetch failed; will retry', err);
-        reconnectTimer.current = setTimeout(() => { void connect(); }, reconnect.nextDelay());
-        return;
+        // 404 = the server predates the ticket endpoint; see `buildLegacySocketUrl`.
+        if (err instanceof WsTicketError && err.status === 404) {
+          url = buildLegacySocketUrl(SERVER_URL, token);
+        } else {
+          logger.warn('crypto-ws', 'ws-ticket fetch failed; will retry', err);
+          reconnectTimer.current = setTimeout(() => { void connect(); }, reconnect.nextDelay());
+          return;
+        }
       }
       if (cancelled) return;
-      const ws = new WebSocket(buildSocketUrl(SERVER_URL, ticket));
+      const ws = new WebSocket(url);
       wsRef.current = ws;
       ws.onopen = () => { setConnected(true); reconnect.reset(); };
       ws.onclose = (e) => {

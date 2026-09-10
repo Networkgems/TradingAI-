@@ -241,6 +241,17 @@ pool at once. That upgrades H4a from hardening to a plausible takeover path, and
 > authenticated by LEGACY`) — not off the since-boot counter on `/api/health/ws-auth`, which reads 0 both when
 > the door is unused and when the watchdog restarted the process a second ago.
 >
+> ⚠ **The deploy ordering here runs the wrong way, so the compat window needed a second half.** A server-side
+> window protects an OLD client meeting a NEW server. The direction that actually occurs is the reverse:
+> `deploy-pages.yml` promotes the web client automatically once CI is green on `main` (TRA-4477), while bqb1 is
+> `autoDeploy=no` and ships on an explicit REST trigger whenever the window allows — so the new client is live
+> minutes after the merge and the new server can be hours behind. The client therefore treats a **404** from
+> `POST /api/auth/ws-ticket` (endpoint absent — distinct from a 401 dead session and from a 5xx blip) as "this
+> server predates the change" and falls back to `?token=` for that attempt only; the next reconnect takes the
+> ticket path with no action once bqb1 is deployed. Both halves die together, one release after the tape is
+> clean. Untreated this was not darkness — both dashboards fall back to 5s REST polling — but it was loss of
+> live push for every Pages user plus a retry loop against a 404, shipped deliberately for no gain.
+>
 > Query-string **values** are now redacted wherever a request URL reaches a log (`redactQueryString`,
 > `http-security.ts`), names kept, so the class does not come back through the next parameter.
 

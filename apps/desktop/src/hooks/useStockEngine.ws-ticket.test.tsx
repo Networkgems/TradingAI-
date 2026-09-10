@@ -14,6 +14,9 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { renderHook, act, waitFor } from '@testing-library/react';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
 import { useStockEngine } from './useStockEngine';
 
@@ -31,7 +34,7 @@ interface FakeSocket {
 let sockets: FakeSocket[] = [];
 let ticketSerial = 0;
 /** Ticket responses the stub will serve, in order; `null` = respond 401. */
-let ticketPlan: Array<'ok' | 'fail' | 'unauthorized'> = [];
+let ticketPlan: Array<'ok' | 'fail' | 'unauthorized' | 'absent'> = [];
 let logoutCalls = 0;
 
 function installFakeWebSocket(): void {
@@ -56,6 +59,7 @@ function installFetchStub(): void {
       expect(init?.method, 'the ticket must be minted with POST').toBe('POST');
       const plan = ticketPlan.shift() ?? 'ok';
       if (plan === 'unauthorized') return new Response('{}', { status: 401 });
+      if (plan === 'absent') return new Response('{}', { status: 404 });
       if (plan === 'fail') return new Response('{}', { status: 503 });
       ticketSerial += 1;
       return new Response(JSON.stringify({ ticket: `ticket-${ticketSerial}`, ttlMs: 30000 }), { status: 200 });
@@ -180,6 +184,49 @@ describe('TRA-4488 useStockEngine ticket handshake', () => {
     expect(ticketFetches()).toBe(1);
   });
 
+  it('falls back to ?token= when the SERVER predates the ticket endpoint (404)', async () => {
+    // The deploy ordering here is fixed and runs the wrong way: Pages promotes
+    // this client on CI green, bqb1 is deployed by hand later. Without this arm
+    // every Pages user loses live push (and spins on a 404) until the server
+    // catches up — see `buildLegacySocketUrl`.
+    ticketPlan = ['absent'];
+    render();
+
+    await waitFor(() => expect(sockets.length).toBe(1));
+    expect(sockets[0]!.url).toContain('token=session-token');
+    expect(sockets[0]!.url).not.toContain('ticket=');
+    expect(logoutCalls).toBe(0);
+  });
+
+  it('returns to the TICKET path on the next reconnect once the server has caught up', async () => {
+    // The fallback must not be sticky: one 404 must not pin the client to the
+    // legacy URL for the life of the page. Nothing caches the decision, so this
+    // holds by construction — asserted because "by construction" is how the
+    // reconnect bug in this very file would also have been described.
+    ticketPlan = ['absent', 'ok'];
+    render();
+    await waitFor(() => expect(sockets.length).toBe(1));
+    expect(sockets[0]!.url).toContain('token=session-token');
+
+    act(() => { sockets[0]!.onclose?.({ code: 1006 }); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(31_000); });
+
+    await waitFor(() => expect(sockets.length).toBe(2));
+    expect(sockets[1]!.url).toContain('ticket=ticket-1');
+    expect(sockets[1]!.url).not.toContain('session-token');
+  });
+
+  it('does NOT fall back on a 503 — only a 404 proves the endpoint is absent', async () => {
+    // A 5xx is a blip at an endpoint that exists. Falling back there would put
+    // the session token in the URL on every transient server error, i.e. reopen
+    // the defect on the most common failure in the set.
+    ticketPlan = ['fail'];
+    render();
+
+    await waitFor(() => expect(ticketFetches()).toBe(1));
+    expect(sockets.length).toBe(0);
+  });
+
   it('does not open a socket when the component unmounts while the mint is in flight', async () => {
     const { unmount } = render();
     unmount();
@@ -189,5 +236,41 @@ describe('TRA-4488 useStockEngine ticket handshake', () => {
     // An orphan socket here is owned by nobody: the cleanup has already run, so
     // it is never closed and never reconnected — a leak per mount/unmount cycle.
     expect(sockets.filter((s) => !s.closed).length).toBe(0);
+  });
+});
+
+// `CryptoDashboard.tsx` owns the SECOND socket, with the same handshake inlined
+// in a component rather than a hook — so the behavioural tests above cannot
+// reach it. Rendering that component would drag in a dozen panels and their
+// fetches to re-assert what is already covered, so the second client is graded
+// on the seam instead: it must use the same three helpers and must not form a
+// socket URL by hand. That is what drift would look like.
+describe('TRA-4488 the crypto dashboard uses the same handshake', () => {
+  const SRC = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), '..', 'CryptoDashboard.tsx'),
+    'utf-8',
+  );
+
+  it('routes through fetchWsTicket + buildSocketUrl, never a hand-built URL', () => {
+    expect(SRC).toContain('fetchWsTicket(token)');
+    expect(SRC).toContain('buildSocketUrl(SERVER_URL');
+    // The defect, asserted absent: the pre-fix line was
+    // `new WebSocket(`${SERVER_URL}?token=${token}`)`.
+    expect(SRC).not.toMatch(/\$\{SERVER_URL\}\?token=/);
+    expect(SRC).toMatch(/new WebSocket\(url\)/);
+  });
+
+  it('carries the 401 sign-out and the 404 legacy fallback arms', () => {
+    expect(SRC).toMatch(/status === 401.*onLogout\(\)/s);
+    expect(SRC).toMatch(/status === 404[\s\S]{0,120}buildLegacySocketUrl/);
+  });
+
+  it('mints inside connect() — so a reconnect re-mints, as in the hook', () => {
+    // The decisive property, expressed the only way a source check can: the
+    // mint must appear INSIDE the reconnecting function, not before it.
+    const fnStart = SRC.indexOf('async function connect()');
+    const mint = SRC.indexOf('fetchWsTicket(token)');
+    expect(fnStart).toBeGreaterThan(-1);
+    expect(mint).toBeGreaterThan(fnStart);
   });
 });

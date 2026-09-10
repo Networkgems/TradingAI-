@@ -55,3 +55,35 @@ export async function fetchWsTicket(token: string): Promise<string> {
 export function buildSocketUrl(serverUrl: string, ticket: string): string {
   return `${serverUrl}?ticket=${encodeURIComponent(ticket)}`;
 }
+
+/**
+ * TRA-4488 — the OTHER half of the compat window, and the half the server cannot
+ * provide.
+ *
+ * The server keeps `?token=` working so an OLD client meeting a NEW server is
+ * fine. Nothing protects the reverse, and the reverse is the direction that
+ * actually happens here: `deploy-pages.yml` promotes the web client
+ * automatically once CI is green on `main`, while `tradingai-bqb1` has
+ * `autoDeploy=no` and is deployed by an explicit REST trigger whenever the
+ * window allows (CLAUDE.md §"Merging does not deploy"). So the new client is
+ * live minutes after the merge and the new server may be hours behind it.
+ *
+ * Against a server that predates this change, `POST /api/auth/ws-ticket` is a
+ * 404 — unambiguously "this endpoint does not exist here", distinct from the 401
+ * of a dead session and from the 5xx/network of a blip. On exactly that status
+ * the client falls back to the old URL shape. The socket reconnects normally, so
+ * the next attempt after bqb1 is deployed takes the ticket path with no further
+ * action.
+ *
+ * Without this the dashboard does not go dark (both hooks fall back to 5s REST
+ * polling when the socket is down) but it loses live push for every Pages user
+ * until the server deploy lands, and spins a retry loop against a 404 the whole
+ * time. That is a real regression to ship deliberately for no gain.
+ *
+ * DELETE THIS WITH THE SERVER'S LEGACY BRANCH — one release after the tape
+ * (`TRA-4488 WS upgrade authenticated by LEGACY`) is clean. It is the only
+ * remaining place a session token is put in a URL.
+ */
+export function buildLegacySocketUrl(serverUrl: string, token: string): string {
+  return `${serverUrl}?token=${encodeURIComponent(token)}`;
+}
