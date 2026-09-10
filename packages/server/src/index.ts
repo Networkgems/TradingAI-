@@ -404,6 +404,8 @@ import {
   OTM_EVALUATION_WINDOW_ID,
   OTM_EVALUATION_VERDICT_STATUSES,
   applyOtmEvaluationVerdict,
+  applyOtmEvaluationRecut,
+  previewOtmEvaluationRecut,
   foldOtmEvaluationWindow,
   loadOtmEvaluationWindowState,
   otmEvaluationWindowStatus,
@@ -11465,6 +11467,95 @@ app.post('/api/health/otm-evaluation-window/verdict', requireAuth, requireAdmin,
     log.warn('TRA-3945 OTM evaluation window VERDICT written by hand', { ...summary, by });
     const record = await tickOtmEvaluationWindowNow();
     res.json({ ok: true, applied: true, ...summary, statusAfter: record.status, wire: 'GET /api/health/options-live .evaluationWindow' });
+  } catch (err) {
+    res.status(409).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// TRA-3945 — the RE-CUT writer on the wire.
+//
+// QuantTrader ruled a restart of the sample on 2026-08-25 (`a9753fda`): TRA-4006
+// changed the profit-lock exit floor, so closes entered before it belong to a
+// different population (TRA-2677). Measured 2026-09-09, fifteen days later, the
+// record still held the 08-23 cut — because nothing could write a new one. The
+// tick stamps `startedAt` exactly once and never re-stamps (by design, so the
+// window cannot drift its own goalposts), and the only other writer was a shell
+// script on Render's data dir, which the verdict owner (an agent) cannot reach.
+// Same remedy shape as the verdict route above: dry-run by default, `apply=true`
+// requires `confirm=TRA-3945`, admin only, FORWARD-only, every prior cut kept.
+//
+// The code still never decides the population: this route only carries the
+// verdict owner's ruling onto the record, and `priorN` is read off the fold in
+// the same beat rather than supplied.
+app.post('/api/health/otm-evaluation-window/recut', requireAuth, requireAdmin, async (req, res) => {
+  const q = req.query as Record<string, unknown>;
+  const wantsApply = q['apply'] === 'true' || q['apply'] === '1';
+  const confirmed = q['confirm'] === 'TRA-3945';
+  if (wantsApply && !confirmed) {
+    res.status(400).json({
+      ok: false,
+      error: 'apply=true requires confirm=TRA-3945',
+      detail: 'A re-cut restarts the pre-registered sample. The confirmation is what keeps a mistyped flag in the dry-run branch.',
+    });
+    return;
+  }
+  const apply = wantsApply && confirmed;
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const startedAtRaw = typeof body['startedAt'] === 'string' ? body['startedAt'].trim() : null;
+  const by = typeof body['by'] === 'string' && body['by'].trim() !== '' ? body['by'].trim() : null;
+  const note = typeof body['note'] === 'string' && body['note'].trim() !== '' ? body['note'].trim() : null;
+  const startedAt = startedAtRaw ? Date.parse(startedAtRaw) : Number.NaN;
+  if (!startedAtRaw || !Number.isFinite(startedAt) || !by || !note) {
+    res.status(400).json({
+      ok: false,
+      error: 'body requires {startedAt: ISO-8601 instant, by, note containing a TRA-nnnn ref}; optional build: {commit, commitShort, pid, startedAt}',
+    });
+    return;
+  }
+  const buildRaw = (body['build'] ?? null) as Record<string, unknown> | null;
+  const build = buildRaw && typeof buildRaw === 'object'
+    ? {
+      commit: typeof buildRaw['commit'] === 'string' ? buildRaw['commit'] : null,
+      commitShort: typeof buildRaw['commitShort'] === 'string'
+        ? buildRaw['commitShort']
+        : (typeof buildRaw['commit'] === 'string' ? buildRaw['commit'].slice(0, 12) : null),
+      pid: typeof buildRaw['pid'] === 'number' ? buildRaw['pid'] : process.pid,
+      startedAt: typeof buildRaw['startedAt'] === 'string' ? buildRaw['startedAt'] : new Date(startedAt).toISOString(),
+    }
+    : null;
+  try {
+    const now = Date.now();
+    const journal = await listOptionTradeJournal();
+    const prev = await loadOtmEvaluationWindowState();
+    const before = foldOtmEvaluationWindow(journal, prev, now);
+    const preview = previewOtmEvaluationRecut(journal, prev, startedAt, now);
+    const next = applyOtmEvaluationRecut(prev, { startedAt, build, by, note, priorN: before.n }, now);
+    const summary = {
+      statusBefore: otmEvaluationWindowStatus(prev),
+      priorCut: prev.startedAt === null ? null : new Date(prev.startedAt).toISOString(),
+      priorStartBuild: prev.startBuild,
+      priorN: before.n,
+      newCut: new Date(startedAt).toISOString(),
+      newStartBuild: next.startBuild,
+      preview,
+    };
+    if (!apply) {
+      res.json({ ok: true, applied: false, wouldWrite: summary, note: 'dry run - add ?apply=true&confirm=TRA-3945 to write' });
+      return;
+    }
+    await saveOtmEvaluationWindowState(next);
+    log.warn('TRA-3945 OTM evaluation window RE-CUT by hand', { ...summary, by, note });
+    const record = await tickOtmEvaluationWindowNow();
+    res.json({
+      ok: true,
+      applied: true,
+      ...summary,
+      statusAfter: record.status,
+      nAfter: record.n,
+      avgRAfter: record.avgR,
+      seRAfter: record.seR,
+      wire: 'GET /api/health/options-live .evaluationWindow.recut',
+    });
   } catch (err) {
     res.status(409).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
   }
