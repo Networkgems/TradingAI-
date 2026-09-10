@@ -420,6 +420,26 @@ export const EMBARGOES = [
       'ancestor of the live 1ff4fa7b), so that carrier has nothing left to deploy and only a grade ' +
       'to take.',
   },
+  {
+    from: '2026-09-10T20:00:00Z',
+    // Opens at the 09-10 post-close boundary and closes at the 09-11 one, so the next legal
+    // commit advance is the 09-11 post-close train. The RTH freeze already owns 13:25–20:00Z;
+    // running through it means an RTH override alone cannot spend a second train today.
+    // A STOPGAP, one night wide: the durable form is a cadence gate that counts commit
+    // advances off Render's history (TRA-4384 child). Until it lands, one row per night.
+    to: '2026-09-11T20:00:00Z',
+    ticket: 'TRA-4384 (TRA-4383 board ruling A, card c4dd383c: ONE deploy train per day to 2026-09-18)',
+    why:
+      'The feature freeze caps bqb1 at ONE deploy train per day, and prose did not hold it: the ' +
+      'closed 09-09T20:00Z -> 09-10T13:30Z window carried NINE commit-advancing deploys (8e51be03, ' +
+      '21b15106, 3955593e, eacd1364, aa12bbcf, e4a1c67b, eb8a1738, 35feb9f7, c54f1e73) by at least ' +
+      'three different operators, the CTO who enforces the freeze among them. TONIGHT\'S ONE TRAIN IS ' +
+      'SPENT: dep-dahgtvmq advanced c54f1e73 -> b5c76cc1 at 20:11Z; the 20:16Z and 21:09Z deploys were ' +
+      'same-SHA env-applies. NOTHING IS LOST BY WAITING: every commit past b5c76cc1 rides the 09-11 ' +
+      'post-close train in one boot, and check:deploy-train-window grades a deploy order by ANCESTRY. ' +
+      'A same-SHA env-apply (--commit=<sha already serving>) is not a train but still boots the box: ' +
+      'run it with --force-embargo-override="<TRA-#### why>" and it is recorded.',
+  },
 ];
 
 // ── Why the 2026-07-27 row closes at 21:00Z, not 20:20Z (TRA-2306, CTO 2026-07-26) ──
