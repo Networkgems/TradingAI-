@@ -9663,7 +9663,19 @@ app.post('/api/auth/reset-password', async (req, res) => {
     // A no-op for an account with nothing outstanding, so this stays silent
     // about whether `named` exists.
     if (named) recordResetFailure(named);
-    res.status(400).json({ error: 'Invalid or expired reset code' });
+    // A client that sent no username at all has, once the compat window has
+    // drained, no way to succeed — and "Invalid or expired reset code" would
+    // send that user round the loop requesting codes that can never work. Say
+    // what is actually wrong. The message does not depend on `code`, so it is
+    // not an oracle: an out-of-date client gets it for a right code and a wrong
+    // one alike.
+    res.status(400).json({
+      error: named
+        ? 'Invalid or expired reset code'
+        : 'This app version cannot complete a password reset — it does not send your '
+          + 'username. Update the app, or use the web app, and enter the username shown '
+          + 'in your reset email.',
+    });
     return;
   }
   for (const key of keys) recordSuccess(key);
