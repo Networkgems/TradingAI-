@@ -52,9 +52,16 @@
 //                     was given, or the store is not durable (DATA_DIR ephemeral,
 //                     so counters are since-boot and a restart silently reset them
 //                     mid-session). An empty partition is ungraded, not passed.
-//   5  DIRTY        — violations were counted. This is a SUCCESSFUL measurement and
-//                     the honest answer to TRA-2321: do not promote yet. The
-//                     offending buckets are named.
+//   5  DIRTY        — at least one violation is UNEXPLAINED against the ENFORCED
+//                     policy. This is a SUCCESSFUL measurement; the offending
+//                     buckets are named. (TRA-4531) Violations the live enforced
+//                     header explicitly permits — the Report-Only candidate is
+//                     deliberately stricter, to probe whether the wasm carve-out
+//                     can be retired — and `.invalid` positive controls do NOT
+//                     count: a tape of only those reads exit 0,
+//                     `GRADABLE (controls/allowed only)`, every bucket classified.
+
+import { enforcedShape, gradeBuckets, CLASS } from './lib/csp-bucket-grade.mjs';
 
 const args = process.argv.slice(2);
 const arg = (name, fallback) => {
@@ -159,18 +166,12 @@ say(`wired       : report-uri + report-to + Reporting-Endpoints present`);
 //     (the kill switch) has been pulled.
 //   - the promoted policy: default-src + the explicit `'wasm-unsafe-eval'` carve-out,
 //     and NEVER a bare `'unsafe-eval'` token (which would enable eval()).
-const enforcedTrim = enforced.trim();
-const scriptSrcTokens = (enforcedTrim.split(';').map(d => d.trim()).find(d => d.startsWith('script-src ')) ?? '').split(/\s+/);
-if (!enforcedTrim) {
+const shape = enforcedShape(enforced);
+if (shape === 'none') {
   say('WARNING: no enforced CSP at all — the clickjacking fix (TRA-2298) is gone.');
-} else if (enforcedTrim === "frame-ancestors 'none'") {
+} else if (shape === 'frame-ancestors-only') {
   say("enforced    : frame-ancestors only (pre-TRA-4429 build, or the CSP_ENFORCED_POLICY kill switch is pulled)");
-} else if (
-  enforcedTrim.includes("default-src 'self'") &&
-  enforcedTrim.includes("frame-ancestors 'none'") &&
-  scriptSrcTokens.includes("'wasm-unsafe-eval'") &&
-  !scriptSrcTokens.includes("'unsafe-eval'")
-) {
+} else if (shape === 'promoted') {
   say('enforced    : TRA-4429 promoted policy');
 } else {
   say(`WARNING: enforced CSP matches neither sanctioned shape — it is: ${enforced}`);
@@ -215,17 +216,23 @@ if (snap.violations === 0) {
   ]);
 }
 
-// ── Dirty: name the buckets, because "some violations" is not actionable ─────
-const buckets = Array.isArray(snap.buckets) ? snap.buckets : [];
+// ── Violations: grade every bucket against the ENFORCED policy (TRA-4531) ────
+//
+// Not against the Report-Only candidate: that header is deliberately stricter than
+// the enforced one (no wasm carve-out, TRA-4429), so it files a fresh report on
+// every wasm page load and a raw count would read DIRTY forever. Only UNEXPLAINED
+// buckets go non-zero; the judgement lives in scripts/lib/csp-bucket-grade.mjs.
+const graded = gradeBuckets({ violations: snap.violations, buckets: snap.buckets, enforced });
+const TAG = { [CLASS.ALLOWED]: 'ALLOWED    ', [CLASS.CONTROL]: 'CONTROL    ', [CLASS.UNEXPLAINED]: 'UNEXPLAINED' };
 say('');
-say('violations by (day, directive, blocked-origin):');
-for (const b of buckets.slice(0, 25)) {
-  say(`  ${String(b.count).padStart(6)}  ${b.day}  ${b.directive} <- ${b.blockedUri}`);
+say('violations by (day, directive, blocked-origin), graded against the ENFORCED policy:');
+for (const r of graded.rows.slice(0, 25)) {
+  const b = r.bucket;
+  say(`  ${TAG[r.class]} ${String(b.count).padStart(6)}  ${b.day}  ${b.directive} <- ${b.blockedUri}  (${r.reason})`);
 }
-if (buckets.length > 25) say(`  … and ${buckets.length - 25} more bucket(s)`);
+if (graded.rows.length > 25) {
+  const hidden = graded.rows.slice(25).filter(r => r.class === CLASS.UNEXPLAINED).length;
+  say(`  … and ${graded.rows.length - 25} more bucket(s), ${hidden} of them unexplained`);
+}
 
-done(5, 'DIRTY', [
-  `${snap.violations} violation(s) counted. This is a SUCCESSFUL measurement.`,
-  'TRA-2321 must NOT promote these directives until each bucket above is either',
-  'fixed or deliberately allowed in the policy.',
-]);
+done(graded.exitCode, graded.verdict, graded.lines);

@@ -285,7 +285,9 @@ export function reportingEndpointsHeader(host: string | undefined, secure: boole
  * deliberately keeps `script-src 'self'` WITHOUT it, so the collector keeps
  * measuring whether the wasm-eval dependency ever disappears and the carve-out can
  * be retired. A Report-Only header identical to the enforced one measures nothing —
- * do not "sync" the two.
+ * do not "sync" the two. Nor is there checker pressure to: `check-csp-collector.mjs`
+ * grades buckets against the ENFORCED header, so the wasm-eval reports this divergence
+ * produces read allowed-by-enforced, not DIRTY (TRA-4531, scripts/lib/csp-bucket-grade.mjs).
  *
  * TRA-2344 appends `report-uri` + `report-to` — to THIS header only. Both ship
  * because they are not interchangeable: `report-uri` is deprecated but is what
