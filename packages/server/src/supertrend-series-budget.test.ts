@@ -192,7 +192,7 @@ describe('TRA-2477 — refreshSupertrendShadowSeries is wall-clock bounded', () 
     expect(pass.total).toBe(40);
     // Per-ENGINE cursor: demo and live sweep the same watchlist and must not
     // consume each other's position.
-    expect(sweepCursorSnapshot()['demo:supertrend-series']).toBe(pass.resumeAt);
+    expect(sweepCursorSnapshot()['demo:-:supertrend-series']).toBe(pass.resumeAt);
   });
 
   it('the next pass resumes where the last one stopped and finishes the universe', async () => {
@@ -212,7 +212,7 @@ describe('TRA-2477 — refreshSupertrendShadowSeries is wall-clock bounded', () 
     let pass = second;
     while (!pass.complete) pass = await refresh(universe);
     expect(pass.resumeAt).toBeNull();
-    expect(sweepCursorSnapshot()['demo:supertrend-series']).toBeUndefined();
+    expect(sweepCursorSnapshot()['demo:-:supertrend-series']).toBeUndefined();
   });
 
   it('an empty universe is a completed rotation, not a parked one', async () => {

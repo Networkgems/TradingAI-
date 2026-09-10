@@ -7259,7 +7259,7 @@ export class SignalEngine {
       // resumed pass reach the end of the walk — `pass.complete` — holding only
       // the TAIL it happened to run after the outage, and publish that as the
       // whole-universe snapshot. Two safe pieces, one unsafe composition.
-      sweepCursors.clear(`${this.mode}:agents-advisory`);
+      sweepCursors.clear(this.sweepKey('agents-advisory'));
       this.agentsAdvisorySweep = null;
     }
 
@@ -12904,6 +12904,22 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-4519 — the {@link runBudgetedSweep} cursor key for one of this engine's
+   * doTick sinks. ⛔ AN ENGINE IS A BOOK, NOT A MODE: `initAllUserContexts` builds
+   * one engine per user (68 on bqb1, 3 of them `live` — admin and v0nni on
+   * production, Richard on sandbox — measured 2026-09-10) and the
+   * cursor store is process-wide, so the old `${mode}:${sink}` key had every book
+   * of a mode resume at whatever symbol the LAST book of that mode parked on — in a
+   * universe that is not its own. A resumed book never walked `[0..cursor)`, and a
+   * sink that rebuilds per-engine state on COMPLETION (curated social, the wheel
+   * map, the OTM daily series) rebuilt it off a suffix. Every sink goes through
+   * here so a new one cannot re-open the hole with a hand-rolled key.
+   */
+  private sweepKey(sink: string): string {
+    return `${this.mode}:${this.alertUsername ?? '-'}:${sink}`;
+  }
+
+  /**
    * TRA-1207 — scan each active-interest symbol for cheap OUT-OF-THE-MONEY
    * contracts (the original TRA-158/TRA-159 strategy the board re-enabled in
    * place of RV) and route the most-mispriced `cheap` candidate per symbol into
@@ -12989,7 +13005,7 @@ export class SignalEngine {
     // under-scanned for entries, which the plain loop only avoided by never
     // stopping.
     const pass = await runBudgetedSweep({
-      key: `${this.mode}:otm-scan`,
+      key: this.sweepKey('otm-scan'),
       symbols: activeSymbols,
       run: async (batch) => { for (const sym of batch) {
       // TRA-1231 — same iv-rv cap reservation as the RV scan above. The OTM
@@ -14517,9 +14533,8 @@ export class SignalEngine {
    */
   private async runColdBarScan(symbols: string[], pacer?: TickPacer): Promise<SweepPass> {
     return runBudgetedSweep({
-      // Per-engine: `mode` namespaces demo from live so two engines sweeping the
-      // same watchlist do not consume each other's cursor.
-      key: `${this.mode}:cold-bar-scan`,
+      // Per-BOOK, not per-mode (TRA-4519) — see `sweepKey`.
+      key: this.sweepKey('cold-bar-scan'),
       symbols,
       batchSize: COLD_BAR_BATCH,
       budgetMs: COLD_BAR_SWEEP_BUDGET_MS,
@@ -14645,9 +14660,11 @@ export class SignalEngine {
   private async refreshSupertrendShadowSeries(symbols: string[]): Promise<SweepPass> {
     const BATCH = 5;
     return runBudgetedSweep({
-      // Per-engine: `mode` namespaces demo from live so two engines sweeping the
-      // same watchlist do not consume each other's cursor.
-      key: `${this.mode}:supertrend-series`,
+      // Per-BOOK, not per-mode (TRA-4519) — see `sweepKey`. Under the shared
+      // shadow pass only the claiming engine resumes a rotation (`resumingSeries`
+      // reads its OWN `supertrendSeriesSweep`), so a peer claiming a fresh window
+      // after an abandon must start at its own head, not the dead owner's cursor.
+      key: this.sweepKey('supertrend-series'),
       symbols,
       batchSize: BATCH,
       run: async (batch) => {
@@ -14737,7 +14754,7 @@ export class SignalEngine {
       // builds one engine per user and the cursor store is process-wide, so a
       // `${mode}`-only key had every book resume at whatever symbol the LAST book
       // parked on — in a universe that is not its own.
-      key: `${this.mode}:${this.alertUsername ?? '-'}:otm-daily-series`,
+      key: this.sweepKey('otm-daily-series'),
       symbols,
       batchSize: BATCH,
       budgetMs: OTM_DAILY_SERIES_BUDGET_MS,
@@ -15865,7 +15882,7 @@ export class SignalEngine {
     const wheelScans = this.pendingWheelScans;
 
     const pass = await runBudgetedSweep({
-      key: `${this.mode}:short-premium-scan`,
+      key: this.sweepKey('short-premium-scan'),
       symbols,
       run: async (batch) => { for (const sym of batch) {
       try {
@@ -17176,7 +17193,9 @@ export class SignalEngine {
     // the tail, and `consecutiveFailures` stops a pass that is only discovering
     // the same systemic refusal 639 times. See agents-advisory-bound.ts.
     let firstFailure: string | null = null;
-    const key = `${this.mode}:agents-advisory`;
+    // Per-BOOK (TRA-4519): the half-built rotation is THIS engine's
+    // `pendingAgentRecos`, and the outage path above clears this same key.
+    const key = this.sweepKey('agents-advisory');
     // TRA-3514 (§4) — the per-pass backing census. Accumulated by `adviseOneSymbol`
     // so `advised` vs `fellBack` is counted where the fact is KNOWN, rather than
     // re-derived afterwards from the published set (which cannot see a skip or a
@@ -21687,7 +21706,7 @@ export class SignalEngine {
    *
    * ⚠️ A truncation is NOT a breaker trip and the two must not be read as the
    * same event. They are distinguishable by construction: a truncation emits
-   * `doTick sink truncated by its wall-clock budget` with `sink: <mode>:social-*`
+   * `doTick sink truncated by its wall-clock budget` with `sink: <mode>:<user>:social-*`
    * and touches no cache; a breaker trip emits `rate-limited (429); breaker open`
    * from stocktwits-feed.ts. Neither reaches the TRA-820/TRA-2519 sentiment
    * accrual at all — `sentiment-snapshot-recorder.ts` runs on its own 15:55 ET
@@ -21708,9 +21727,8 @@ export class SignalEngine {
     // not widen it.
     const symbols = this.getActiveSymbols().slice(0, SOCIAL_SYMBOL_LIMIT);
     const crowd = await runBudgetedSweep({
-      // Per-engine: `mode` namespaces demo from live so two engines do not
-      // consume each other's cursor.
-      key: `${this.mode}:social-crowd`,
+      // Per-BOOK, not per-mode (TRA-4519) — see `sweepKey`.
+      key: this.sweepKey('social-crowd'),
       symbols,
       budgetMs: SOCIAL_SWEEP_BUDGET_MS,
       run: async ([sym]) => {
@@ -21762,7 +21780,11 @@ export class SignalEngine {
   private async refreshCuratedSocialSentiment(budgetMs: number): Promise<SweepPass> {
     const accounts = getCuratedStockTwitsAccounts();
     const pass = await runBudgetedSweep({
-      key: `${this.mode}:social-curated`,
+      // TRA-4519 — the account list is identical for every book, but the rebuild
+      // on completion is of THIS engine's `pendingCuratedSocial`; a cursor shared
+      // across books completed a rotation off another book's suffix and published
+      // the thinner snapshot this sink's wholesale rebuild exists to prevent.
+      key: this.sweepKey('social-curated'),
       symbols: accounts,
       budgetMs,
       run: async ([user]) => {
@@ -21871,9 +21893,8 @@ export class SignalEngine {
   private async refreshTechnicalSnapshots(symbols: string[]): Promise<SweepPass> {
     const BATCH = 5;
     return runBudgetedSweep({
-      // Per-engine: `mode` namespaces demo from live so two engines sweeping the
-      // same watchlist do not consume each other's cursor.
-      key: `${this.mode}:mtf-refresh`,
+      // Per-BOOK, not per-mode (TRA-4519) — see `sweepKey`.
+      key: this.sweepKey('mtf-refresh'),
       symbols,
       batchSize: BATCH,
       run: async (batch) => {

@@ -231,8 +231,8 @@ describe('refreshSocialSentiment is budgeted and cursored (TRA-3019)', () => {
     expect(pass.complete).toBe(true);
     expect(pass.budgetExhausted).toBe(false);
     expect(vi.mocked(fetchStockTwitsUserStream).mock.calls.length).toBe(CURATED_9.length);
-    expect(sweepCursorSnapshot()['demo:social-crowd']).toBeUndefined();
-    expect(sweepCursorSnapshot()['demo:social-curated']).toBeUndefined();
+    expect(sweepCursorSnapshot()['demo:-:social-crowd']).toBeUndefined();
+    expect(sweepCursorSnapshot()['demo:-:social-curated']).toBeUndefined();
   });
 
   it('preserves the SOCIAL_SYMBOL_LIMIT quota control — a rotation is still at most 8 crowd fetches', async () => {
@@ -263,8 +263,8 @@ describe('refreshSocialSentiment is budgeted and cursored (TRA-3019)', () => {
 
     expect(demoSecond.startIndex).toBeGreaterThan(0);
     expect(livePass.startIndex).toBe(0);
-    expect(sweepCursorSnapshot()).toHaveProperty('live:social-curated');
-    expect(sweepCursorSnapshot()).toHaveProperty('demo:social-curated');
+    expect(sweepCursorSnapshot()).toHaveProperty('live:-:social-curated');
+    expect(sweepCursorSnapshot()).toHaveProperty('demo:-:social-curated');
   });
 });
 

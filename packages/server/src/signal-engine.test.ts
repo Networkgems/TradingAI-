@@ -1010,7 +1010,7 @@ describe('SignalEngine — relative-value scanner bridge', () => {
       expect(pass!.complete).toBe(true);
       expect(pass!.budgetExhausted).toBe(false);
       expect(pass!.processed).toEqual(symbols);
-      expect(sweepCursorSnapshot()['demo:otm-scan']).toBeUndefined();
+      expect(sweepCursorSnapshot()['demo:-:otm-scan']).toBeUndefined();
     });
   });
 

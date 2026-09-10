@@ -6,7 +6,8 @@
 // two worlds are indistinguishable from a percentile. The ticket pre-registered the
 // discriminator: "a silent pass is a NO-RUN, not a PASS, until the bound is proven to
 // have bitten". `runBudgetedSweep` emits exactly one positive witness on truncation
-// (tick-sweep-budget.ts:382), tagged `sink: <mode>:cold-bar-scan`. This reads it.
+// (tick-sweep-budget.ts:382), tagged `sink: <mode>:<user>:cold-bar-scan` (per BOOK since
+// TRA-4519; `<mode>:cold-bar-scan` before it — SINK_RE matches both). This reads it.
 //
 // ── Why the controls are not decoration ──────────────────────────────────────────
 // A `text=` query that returns zero lines is ambiguous between "the marker never

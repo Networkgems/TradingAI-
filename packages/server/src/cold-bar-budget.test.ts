@@ -26,6 +26,8 @@
 // meaningful.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 vi.mock('./yahoo-feed.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./yahoo-feed.js')>();
@@ -94,11 +96,12 @@ type ColdBarInternals = {
   candleCache: Map<string, Candle[]>;
 };
 
-function engine(mode: 'demo' | 'live' = 'demo'): {
+function engine(mode: 'demo' | 'live' = 'demo', username?: string): {
   scan: (syms: string[]) => Promise<SweepPass>;
   candleCache: Map<string, Candle[]>;
 } {
   const e = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode });
+  if (username) e.setAlertUsername(username);
   // `private` in TS only. The bound lives in this method, so drive the real
   // thing rather than a re-implementation of it.
   const inner = e as unknown as ColdBarInternals;
@@ -178,7 +181,7 @@ describe('runColdBarScan is wall-clock bounded (TRA-3441)', () => {
     expect(pass.total).toBe(40);
     // Per-ENGINE cursor: demo and live sweep the same watchlist and must not
     // consume each other's position.
-    expect(sweepCursorSnapshot()['demo:cold-bar-scan']).toBe(pass.resumeAt);
+    expect(sweepCursorSnapshot()['demo:-:cold-bar-scan']).toBe(pass.resumeAt);
   });
 
   it('one pass stays inside the graded 60s bar on the pathological tape', async () => {
@@ -203,7 +206,7 @@ describe('runColdBarScan is wall-clock bounded (TRA-3441)', () => {
     expect(pass.budgetExhausted).toBe(false);
     expect(pass.processed).toEqual(universe);
     expect(pass.resumeAt).toBeNull();
-    expect(sweepCursorSnapshot()['demo:cold-bar-scan']).toBeUndefined();
+    expect(sweepCursorSnapshot()['demo:-:cold-bar-scan']).toBeUndefined();
   });
 
   it('successive passes resume where the last stopped and cover the universe exactly once', async () => {
@@ -220,20 +223,70 @@ describe('runColdBarScan is wall-clock bounded (TRA-3441)', () => {
     expect(pass?.complete).toBe(true);
     // No gaps and no repeats — the property a symbol cursor buys over an index.
     expect(seen).toEqual(universe);
-    expect(sweepCursorSnapshot()['demo:cold-bar-scan']).toBeUndefined();
+    expect(sweepCursorSnapshot()['demo:-:cold-bar-scan']).toBeUndefined();
   });
 
   it('two engines keep separate cursors over the same watchlist', async () => {
     const universe = universeOf(40);
     await engine('demo').scan(universe);
-    const demoAt = sweepCursorSnapshot()['demo:cold-bar-scan'];
+    const demoAt = sweepCursorSnapshot()['demo:-:cold-bar-scan'];
 
     // The live engine starts its own rotation at 0 rather than inheriting demo's.
     const livePass = await engine('live').scan(universe);
 
     expect(livePass.startIndex).toBe(0);
-    expect(sweepCursorSnapshot()['demo:cold-bar-scan']).toBe(demoAt);
-    expect(sweepCursorSnapshot()['live:cold-bar-scan']).toBe(livePass.resumeAt);
+    expect(sweepCursorSnapshot()['demo:-:cold-bar-scan']).toBe(demoAt);
+    expect(sweepCursorSnapshot()['live:-:cold-bar-scan']).toBe(livePass.resumeAt);
+  });
+});
+
+// ── TRA-4519 — an engine is a BOOK, not a mode ───────────────────────────────
+// `initAllUserContexts` builds one engine per user and the cursor store is
+// process-wide. bqb1 2026-09-10: 68 engines, THREE of them `live` (admin and
+// v0nni on production, Richard on sandbox) — so a `${mode}:${sink}` key had the
+// real-money book resume at whatever symbol another live book last parked on.
+
+describe('the sweep cursor is keyed per BOOK, not per mode (TRA-4519)', () => {
+  it('two books of the SAME mode with different universes do not share a cursor', async () => {
+    const admin = engine('live', 'admin');
+    const other = engine('live', 'v0nni');
+    const adminUniverse = universeOf(40);
+
+    const first = await admin.scan(adminUniverse);
+    expect(first.resumeAt).not.toBeNull();
+
+    // The other book holds admin's parked symbol MID-list — the shape that made a
+    // shared cursor resume there and skip `[0..cursor)` of a universe not its own.
+    const otherUniverse = ['B0', 'B1', first.resumeAt!, 'B3', 'B4', 'B5', 'B6', 'B7'];
+    const otherPass = await other.scan(otherUniverse);
+    expect(otherPass.startIndex).toBe(0);
+    expect(otherPass.processed[0]).toBe('B0');
+
+    // …and the other book's pass (which completed and CLEARED its cursor) did not
+    // reset admin's rotation to 0 either.
+    const second = await admin.scan(adminUniverse);
+    expect(second.startIndex).toBe(adminUniverse.indexOf(first.resumeAt!));
+
+    const keys = Object.keys(sweepCursorSnapshot()).filter((k) => k.endsWith(':cold-bar-scan'));
+    expect(keys).toEqual(['live:admin:cold-bar-scan']);
+  });
+
+  it('no sink hand-rolls a mode-only cursor key — every one goes through `sweepKey`', () => {
+    const src = readFileSync(fileURLToPath(new URL('./signal-engine.ts', import.meta.url)), 'utf8');
+    // The one legitimate `${this.mode}:` template is `sweepKey`'s own body.
+    expect(src.match(/`\$\{this\.mode\}:/g)).toHaveLength(1);
+    const sinks = new Set([...src.matchAll(/this\.sweepKey\('([^']+)'\)/g)].map((m) => m[1]));
+    expect([...sinks].sort()).toEqual([
+      'agents-advisory',
+      'cold-bar-scan',
+      'mtf-refresh',
+      'otm-daily-series',
+      'otm-scan',
+      'short-premium-scan',
+      'social-crowd',
+      'social-curated',
+      'supertrend-series',
+    ]);
   });
 });
 

@@ -275,7 +275,11 @@ export function flushSweepCursors(): void {
 // ── The sweep ────────────────────────────────────────────────────────────────
 
 export interface BudgetedSweepOptions {
-  /** Cursor key. Namespace it per ENGINE (`${mode}:${sink}`) — the cursor is per-engine. */
+  /**
+   * Cursor key. Namespace it per ENGINE — and an engine is a BOOK, not a mode
+   * (`${mode}:${user}:${sink}`, see `SignalEngine.sweepKey`). A mode-only key is
+   * shared by every per-user engine of that mode (TRA-4519).
+   */
   key: string;
   /** The universe to walk, in a stable order. */
   symbols: readonly string[];
