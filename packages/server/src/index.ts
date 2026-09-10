@@ -466,6 +466,7 @@ import { summarizeLiveArmCensus } from './live-arm-census.js';
 // TRA-3937 — durable broker-census snapshot: hydrate on boot, persist on read.
 import { hydrateCensusFromDir, persistCensusDaySync } from './broker-submit-census.js';
 import { runLiveOptionsFeeReconcile, type FeeReconcileAccount } from './live-options-fee-reconcile.js'; // TRA-2810/TRA-2850/TRA-4295
+import { runOpenBasisRegradePass, type OpenBasisRegradeDeps } from './tra4453-open-basis-regrade.js'; // TRA-4453
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
 // TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
@@ -5457,11 +5458,25 @@ async function buildLiveFeeReconcileAccounts(): Promise<FeeReconcileAccount[]> {
 // an admin POST nobody can auth against on bqb1; this makes the back-fill self-driving.
 // 90s so boot IO settles first; .unref() so the timer can never hold the process open;
 // the pass itself never throws and makes no broker call when nothing is unmeasured.
+// TRA-4453 — what the open-basis re-grade reads and writes. It runs directly
+// behind every fee reconcile because that pass is the ONLY writer of
+// `history_import` fills: an import row minted before its fill was backfilled
+// is labelled `'mark'` against a ledger that did not yet hold it.
+const openBasisRegradeDeps: OpenBasisRegradeDeps = {
+  journalEnabled: isOptionTradeJournalEnabled,
+  listRows: () => listOptionTradeJournal(),
+  ledger: () => {
+    const s = summarizeLiveOptionsFeeSlippage();
+    return { records: s.records, usable: !s.durability.ephemeral && s.durability.appendErrors === 0 && s.n > 0 };
+  },
+  amend: recordOptionTradeOpenBasis,
+};
 setTimeout(() => {
   // TRA-3977/TRA-4295 — each roster account carries its own book, so every
   // `history_import` row is stamped with the account its history actually
   // came from; no separate book argument to fall out of sync.
-  void runLiveOptionsFeeReconcile(buildLiveFeeReconcileAccounts, Date.now());
+  void runLiveOptionsFeeReconcile(buildLiveFeeReconcileAccounts, Date.now())
+    .then(() => runOpenBasisRegradePass(openBasisRegradeDeps));
 }, 90_000).unref();
 
 // TRA-3547 — everything the zombie-open sweep touches, in one place. Injected
@@ -19710,6 +19725,11 @@ scheduler.start({
     // and internally best-effort — it cannot throw into this tick.
     // TRA-3977/TRA-4295 — same roster resolution as the boot kick above.
     await runLiveOptionsFeeReconcile(buildLiveFeeReconcileAccounts, Date.now());
+    // TRA-4453 — re-grade `atRiskBasis: 'mark'` import rows against the ledger
+    // the reconcile above may just have backfilled. Promotes a LABEL only when
+    // the ledger's fill equals the row's figure; a disagreeing fill is surfaced,
+    // never applied. Refuses inside RTH. Never throws.
+    await runOpenBasisRegradePass(openBasisRegradeDeps);
     // TRA-3547 — resolve live journal rows the broker tape says are NOT open:
     // back-fill the CLOSE for a real round trip, retract a row that never
     // filled, refuse anything ambiguous. Runs AFTER the fee reconcile above so a

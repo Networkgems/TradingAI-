@@ -99,6 +99,7 @@ import {
 } from '../live-options-fee-slippage-ledger.js';
 import { getLiveOptionsFeeReconcileState } from '../live-options-fee-reconcile.js'; // TRA-2810
 import { getZombieOpenSweepState } from '../zombie-open-journal-sweep.js'; // TRA-3547
+import { getOpenBasisRegradeState } from '../tra4453-open-basis-regrade.js'; // TRA-4453
 import { getCloseBasisSweepState } from '../tra3730-close-basis-sweep.js'; // TRA-3730
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
 import { summarizeTermStructureShadow } from '../term-structure-shadow.js'; // TRA-4413 item 4
@@ -7255,6 +7256,12 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // `refused: unknown_row` is a finding. Per-row, `rows[].atRiskBasis`
       // says which instrument priced every import row minted since this cut.
       openBasisAmends: getOptionTradeOpenBasisAmends(),
+      // TRA-4453 — the self-driving re-grade of `atRiskBasis: 'mark'` import
+      // rows against the ledger AFTER each `history_import` backfill. Read
+      // `lastRows[].verdict`: `promote` is applied as a LABEL-only amend (see
+      // `openBasisAmends.recent[].labelOnly`), `disagree` is a finding left for
+      // a witness, `ticks: 0` means the pass never ran.
+      openBasisRegrade: getOpenBasisRegradeState(),
       // TRA-3547 — the zombie alarm, unauthenticated like the rest of this
       // route. A live `OPEN` row the broker tape says is NOT open sat silently
       // for 10 days because nothing published the contradiction; `summary` alone

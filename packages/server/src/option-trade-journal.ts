@@ -1449,6 +1449,13 @@ export interface OptionTradeOpenBasisAmendRecord {
   applied: boolean;
   /** Why the fold refused; `null` when applied. */
   refusal: 'unknown_row' | 'unchanged' | 'malformed' | null;
+  /**
+   * TRA-4453 — TRUE when only the LABEL moved (`atRiskBasis`/`atRiskProvenance`)
+   * and the figure already on the row was kept: `atRiskUsdAfter === atRiskUsdBefore`
+   * and `realizedRAfter === realizedRBefore` by construction. False on a figure
+   * move and on every refusal.
+   */
+  labelOnly: boolean;
   reason: string | null;
   issue: string | null;
   provenance: string | null;
@@ -1812,14 +1819,17 @@ function foldLine(
       realizedRBefore: rec && Number.isFinite(rec.realizedR) ? (rec.realizedR as number) : null,
     };
     const refuse = (refusal: OptionTradeOpenBasisAmendRecord['refusal']): void => {
-      pushOpenBasisAmend(openBasisSink, { ...base, applied: false, refusal, atRiskUsdAfter: null, realizedRAfter: null });
+      pushOpenBasisAmend(openBasisSink, { ...base, applied: false, refusal, labelOnly: false, atRiskUsdAfter: null, realizedRAfter: null });
     };
     const malformed = typeof atRiskUsd !== 'number' || !Number.isFinite(atRiskUsd) || !(atRiskUsd > 0)
       || (line.atRiskBasis !== 'fill' && line.atRiskBasis !== 'mark')
       || typeof line.provenance !== 'string' || line.provenance === '';
     if (malformed) { refuse('malformed'); return; }
     if (!rec) { refuse('unknown_row'); return; }
-    if (Math.abs(rec.atRiskUsd - atRiskUsd) <= 1e-6) { refuse('unchanged'); return; }
+    // TRA-4453 — "unchanged" is the figure AND the label. An absent label reads
+    // as `'mark'`, the same way the export reads it (TRA-4035).
+    const sameFigure = Math.abs(rec.atRiskUsd - atRiskUsd) <= 1e-6;
+    if (sameFigure && (rec.atRiskBasis ?? 'mark') === line.atRiskBasis) { refuse('unchanged'); return; }
     const prior: OptionTradeSupersededOpenBasis = {
       atRiskUsd: rec.atRiskUsd,
       atRiskBasis: rec.atRiskBasis ?? null,
@@ -1830,11 +1840,29 @@ function foldLine(
       reason: base.reason ?? '',
       issue: base.issue ?? '',
     };
+    if (sameFigure) {
+      // TRA-4453 — LABEL-ONLY: the figure was right and the row under-claimed
+      // it (a `'mark'` over what the ledger now attributes as the lot's fill).
+      // Nothing numeric moves — not `atRiskUsd`, not `realizedR`, not the
+      // outcome. Re-deriving R here could shift it by a rounding path, and a
+      // label promotion that moves a number is exactly what it must not do.
+      pushOpenBasisAmend(openBasisSink, {
+        ...base, applied: true, refusal: null, labelOnly: true,
+        atRiskUsdAfter: rec.atRiskUsd, realizedRAfter: base.realizedRBefore,
+      });
+      map.set(line.id, {
+        ...rec,
+        atRiskBasis: line.atRiskBasis,
+        atRiskProvenance: line.provenance,
+        supersededOpenBasis: [...(rec.supersededOpenBasis ?? []), prior],
+      });
+      return;
+    }
     const closed = rec.outcome !== 'OPEN' && Number.isFinite(rec.realizedPnlUsd);
     const realizedR = closed
       ? Math.round(((rec.realizedPnlUsd as number) / atRiskUsd) * 10_000) / 10_000
       : null;
-    pushOpenBasisAmend(openBasisSink, { ...base, applied: true, refusal: null, atRiskUsdAfter: atRiskUsd, realizedRAfter: realizedR });
+    pushOpenBasisAmend(openBasisSink, { ...base, applied: true, refusal: null, labelOnly: false, atRiskUsdAfter: atRiskUsd, realizedRAfter: realizedR });
     map.set(line.id, {
       ...rec,
       atRiskUsd,
