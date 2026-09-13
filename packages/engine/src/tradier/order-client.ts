@@ -1107,13 +1107,39 @@ export class TradierOrderClient {
       status: 'submitting',
       updatedAt: now(),
     };
+    // TRA-4602 — the pre-submit record must be DURABLE before a live POST.
+    //
+    // This used to be `try { journal.record(intent) } catch {}`: a journal that
+    // could not write was treated as acceptable because it "degrades to the
+    // pre-TRA-4476 behaviour". That reasoning is wrong on Production. The
+    // journal is what a restart re-latches open/unknown orders from, so a failed
+    // append produces exactly the state the whole mechanism exists to prevent —
+    // a real broker order with no durable record, whose deduplication halt
+    // evaporates on the next boot. ENOSPC on the data disk is not a hypothetical
+    // on a single-disk host that also writes snapshots and JSONL evidence.
+    //
+    // Fail CLOSED on Production only. Sandbox risks no capital and keeps the
+    // in-memory journal, which never claims durability. Exits are unaffected:
+    // this is the OPEN path.
+    let durable: boolean;
     try {
-      journal.record(intent);
+      durable = journal.recordDurable ? journal.recordDurable(intent) : (journal.record(intent), false);
     } catch {
-      // The journal must never turn a healthy order into a failure. A journal
-      // that is failing degrades us to the pre-TRA-4476 behaviour, which is the
-      // status quo, not a new hazard — and the server-side journal counts its
-      // own write failures on its own side.
+      // A journal must never throw, but if one does we treat it as non-durable
+      // rather than letting it become the outage.
+      durable = false;
+    }
+    if (!durable && this.env === 'production') {
+      // Nothing was POSTed, so there is no broker ambiguity to latch — this is
+      // a clean refusal, not an unknown. The server-side durability health
+      // surface reports the journal's own failure counter.
+      const error = new TradierOrderError(
+        'order-intent journal could not durably record the pre-submit intent; refusing to place a live order that a restart could not reconstruct',
+        'transport',
+        undefined,
+        { outcome: 'not_placed', intentId: intent.intentId },
+      );
+      return { kind: 'not_placed', error, intent };
     }
 
     // ── 3. the bounded POST ────────────────────────────────────────────────

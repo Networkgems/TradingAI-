@@ -470,6 +470,24 @@ export function reconcileIntent(
 export interface OrderIntentJournal {
   /** Called BEFORE the POST leaves. */
   record(intent: OrderIntent): void;
+  /**
+   * TRA-4602 — the DURABLE write receipt. Same append as `record`, but it
+   * reports whether the bytes actually landed.
+   *
+   * `record` cannot answer this: it returns `void` and must never throw, so a
+   * full disk (ENOSPC), a read-only mount (EACCES) or a clobbered path (EISDIR)
+   * produced a live broker order with NO durable pre-submit record — the
+   * deduplication halt that protects against a double-submit across a restart
+   * lives in that file, so the one moment the journal is needed most was the one
+   * moment it was allowed to be absent.
+   *
+   * A journal that cannot prove durability MUST return false rather than throw.
+   * Callers decide what to do with that: on Tradier PRODUCTION the submit path
+   * refuses to POST, on sandbox it proceeds. Optional so third-party/in-memory
+   * implementations stay source-compatible; an absent method is treated as
+   * "durability unknown".
+   */
+  recordDurable?(intent: OrderIntent): boolean;
   /** Called once the outcome is known, including a later reconcile. */
   update(intent: OrderIntent): void;
   /** Intents left `unknown` — the set a restart must re-latch from. */
@@ -481,6 +499,16 @@ export class InMemoryOrderIntentJournal implements OrderIntentJournal {
 
   record(intent: OrderIntent): void {
     this.intents.set(intent.intentId, { ...intent });
+  }
+
+  /**
+   * An in-memory map cannot survive a restart, so it never claims durability.
+   * It is the sandbox/test journal; the production refusal in `order-client`
+   * is scoped to Tradier Production, where the file journal is installed.
+   */
+  recordDurable(intent: OrderIntent): boolean {
+    this.record(intent);
+    return false;
   }
 
   update(intent: OrderIntent): void {

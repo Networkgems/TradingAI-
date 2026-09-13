@@ -83,10 +83,11 @@ export class FileOrderIntentJournal implements OrderIntentJournal {
 
   constructor(private readonly filePath: string) {}
 
-  private append(intent: OrderIntent): void {
+  private append(intent: OrderIntent): boolean {
     try {
       appendFileSync(this.filePath, `${JSON.stringify(intent)}\n`, 'utf8');
       this.writes += 1;
+      return true;
     } catch (err) {
       this.failures += 1;
       // Log at most the first few — a disk that is full will produce one of
@@ -97,11 +98,22 @@ export class FileOrderIntentJournal implements OrderIntentJournal {
           reason: err instanceof Error ? err.message : String(err),
         });
       }
+      return false;
     }
   }
 
   record(intent: OrderIntent): void {
     this.append(intent);
+  }
+
+  /**
+   * TRA-4602 — the durable write receipt. `false` means the bytes did NOT land,
+   * so no restart can reconstruct this order and the caller must decide whether
+   * the submit may proceed. Never throws: the submit path wants a verdict, not
+   * an exception.
+   */
+  recordDurable(intent: OrderIntent): boolean {
+    return this.append(intent);
   }
 
   update(intent: OrderIntent): void {
