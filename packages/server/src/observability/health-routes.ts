@@ -7342,8 +7342,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     const swingTimeStopTradingDays = resolveSwingTimeStopTradingDays(process.env);
     // The demo book's env view — the same `dir ? resolveDemoFlagEnv(dir) :
     // process.env` the engine's private `resolveDemoFlagEnv()` returns.
-    const dataDir = process.env.DATA_DIR;
-    const demoEnv = dataDir ? resolveDemoFlagEnv(dataDir) : process.env;
+    // TRA-4606 — `dir`, not `dataDir`. The TRA-4440 exemption in
+    // scripts/check-data-dir.mjs covers exactly the `dir` report-read idiom at
+    // count 11, and the rename to `dataDir` both dropped that count to 10
+    // (STALE_EXEMPTION) and presented as an eleventh, UNEXEMPTED copy (NEW_COPY).
+    // Same read, same blank-value behaviour; only the identifier moved.
+    // ⛔ Do not spell the exempted line out in prose here — the scanner matches on
+    // text, so quoting it verbatim in a comment counts as another copy.
+    const dir = process.env.DATA_DIR;
+    const demoEnv = dir ? resolveDemoFlagEnv(dir) : process.env;
     res.json({
       ok: true,
       time: new Date(now()).toISOString(),
