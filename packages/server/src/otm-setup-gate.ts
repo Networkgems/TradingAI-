@@ -1,6 +1,6 @@
 import {
   evaluateSetupTaxonomy,
-  SETUP_TAXONOMY_REGISTRY,
+  SETUP_DEFINITIONS,
   type SetupTaxonomyDefinition,
   type SetupTaxonomyInput,
   type SetupTaxonomyReasonCode,
@@ -217,11 +217,14 @@ export interface ResolvedSetupTaxonomySetups {
 /**
  * The per-setup enable list. ABSENT ⇒ NOTHING ENABLED, which is the conservative
  * direction and the one TRA-4421 §11 default 4 asks for: a setup arriving in
- * {@link SETUP_TAXONOMY_REGISTRY} does not arm itself by existing.
+ * a setup does not arm itself by existing.
  */
 export function resolveSetupTaxonomySetups(
   env: NodeJS.ProcessEnv = process.env,
-  registry: readonly SetupTaxonomyDefinition[] = SETUP_TAXONOMY_REGISTRY,
+  // TRA-4423 — defaults to the IMPLEMENTED A-E rather than the empty registry.
+  // This is the arming seam and the only place that changes: the env list still
+  // decides which of them run, and an absent list still enables nothing.
+  registry: readonly SetupTaxonomyDefinition[] = SETUP_DEFINITIONS,
 ): ResolvedSetupTaxonomySetups {
   const raw = env[OTM_SETUP_TAXONOMY_SETUPS_ENV];
   const ids = (raw ?? '')
@@ -284,7 +287,7 @@ export interface OtmSetupGateDecision {
 export function evaluateOtmSetupGate(
   input: SetupTaxonomyInput,
   env: NodeJS.ProcessEnv = process.env,
-  registry: readonly SetupTaxonomyDefinition[] = SETUP_TAXONOMY_REGISTRY,
+  registry: readonly SetupTaxonomyDefinition[] = SETUP_DEFINITIONS,
 ): OtmSetupGateDecision {
   const { mode } = resolveSetupTaxonomyMode(env);
   const { enabled } = resolveSetupTaxonomySetups(env, registry);
@@ -321,7 +324,7 @@ export interface SetupTaxonomyHealth {
 
 export function setupTaxonomyHealth(
   env: NodeJS.ProcessEnv = process.env,
-  registry: readonly SetupTaxonomyDefinition[] = SETUP_TAXONOMY_REGISTRY,
+  registry: readonly SetupTaxonomyDefinition[] = SETUP_DEFINITIONS,
 ): SetupTaxonomyHealth {
   const m = resolveSetupTaxonomyMode(env);
   const s = resolveSetupTaxonomySetups(env, registry);

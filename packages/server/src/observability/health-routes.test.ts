@@ -6611,10 +6611,16 @@ describe('GET /api/health/otm-sleeve-mandate — setupTaxonomy (TRA-4422)', () =
     expect(t.status).not.toBe('unmeasured'); // it DID run
     expect(t.note).toMatch(/REFUSES NOTHING/);
     expect(t.note).toMatch(/property of the mode/);
-    // The empty registry has to be stated, or `no_setup_matched` reads as a
-    // real negative when nothing was ever scored.
-    expect(t.setupsRegistered).toEqual([]);
-    expect(t.note).toMatch(/registry is EMPTY/);
+    // TRA-4423 — A-E are implemented and therefore REGISTERED. This used to
+    // assert `[]` plus a "registry is EMPTY" note; that was a characterization
+    // of the unfinished taxonomy, not a requirement.
+    //
+    // The distinction the arm exists to protect is unchanged and is now carried
+    // by the list itself: an EMPTY `setupsRegistered` means `no_setup_matched`
+    // is UNMEASURED, a NON-EMPTY one means it is a real negative. Registration
+    // still does not arm anything — `OTM_SETUP_TAXONOMY_SETUPS` does.
+    expect(t.setupsRegistered).toEqual(['A', 'B', 'C', 'D', 'E']);
+    expect(t.note).toMatch(/READ `setupsRegistered` BEFORE/);
   });
 
   // ⛔ THE LIVE MODE, NOT THE COMPILED DEFAULT. Two false greens on this sleeve
@@ -6644,12 +6650,15 @@ describe('GET /api/health/otm-sleeve-mandate — setupTaxonomy (TRA-4422)', () =
   });
 
   it('reports a setup id that matches nothing rather than dropping it', () => {
+    // TRA-4423 — 'E' is a REAL setup now, so the unknown-id arm needs an id that
+    // genuinely matches nothing. Pairing a real id with a bogus one is the
+    // stronger shape anyway: it proves the split, not just the rejection.
     process.env[OTM_SETUP_TAXONOMY_SETUPS_ENV] = 'E,not_a_setup';
     const t = taxonomy();
-    expect(t.setupsEnabled).toEqual([]); // registry is empty — nothing can arm
+    expect(t.setupsEnabled).toEqual(['E']);
     // "I enabled setup E" over a typo'd id is otherwise indistinguishable from
     // "setup E is enabled and never confirms".
-    expect(t.setupsUnknown).toEqual(['E', 'not_a_setup']);
+    expect(t.setupsUnknown).toEqual(['not_a_setup']);
   });
 
   it('joins the ledger on the SAME gate key the recorder writes', () => {

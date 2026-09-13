@@ -201,7 +201,24 @@ export interface InstallResult {
  */
 export function installOrderIntentJournal(dataDir: string | null): InstallResult {
   if (dataDir === null) {
-    log.warn('order-intent journal NOT installed — no data dir; unknown-outcome halts will not survive a restart');
+    // TRA-4602 — this is now a LOUD boot fact, not a warning buried in the log.
+    //
+    // Since TRA-4602 the submit path refuses a Tradier PRODUCTION order whose
+    // pre-submit intent could not be durably recorded, and with no data dir the
+    // in-memory journal is what stays installed — it never claims durability.
+    // The consequence is therefore: NO DATA DIR ⇒ NO LIVE ENTRIES. That is the
+    // correct direction (no durable audit trail, no real orders) but it is a
+    // whole trading sleeve going quiet, and discovering it from an empty fill
+    // tape at the open is the wrong way to find out.
+    //
+    // Exits are unaffected — the refusal is scoped to the OPEN path — so this
+    // degrades to "cannot enter, can still get flat", never to "trapped".
+    log.error(
+      'order-intent journal NOT installed — no data dir. LIVE PRODUCTION ENTRIES WILL BE REFUSED ' +
+        '(TRA-4602: no durable pre-submit record). Exits and sandbox are unaffected. ' +
+        'Set DATA_DIR to restore live entry.',
+      { consequence: 'live_production_entries_refused', exitsAffected: false },
+    );
     return { installed: false, path: null, rehydrated: 0, corruptLines: 0, journalAbsent: true };
   }
   const filePath = orderIntentLogPath(dataDir);

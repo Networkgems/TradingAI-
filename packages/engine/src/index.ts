@@ -256,8 +256,8 @@ export type {
   MarketOrderParams as CoinbaseMarketOrderParams,
   LimitOrderParams as CoinbaseLimitOrderParams,
 } from './coinbase/index.js';
-export { rsi, rsiDivergence, macd, macdCross, bollinger, bollingerZone, VwapTracker, detectPattern, isBullishPattern, isBearishPattern, adx, choppinessIndex, efficiencyRatio, ema, emaCross, emaSeries, maSlope, atr, atrPct, supertrend, supertrendLatest, SUPERTREND_DEFAULT_PERIOD, SUPERTREND_DEFAULT_FACTOR, donchian, ichimoku, tkCross, composeTechnicalSnapshot, composeTimeframeSignal, resampleCandles, mtfBiasOf, MTF_CHOP_ADX, MTF_TF_WEIGHTS, TF_BUCKET_MS } from './indicators/index.js';
-export type { MacdResult, BollingerState, VwapState, CandlePattern, AdxResult, DonchianChannel, IchimokuState, TimeframeCandles, SupertrendBar, SupertrendDirection, SupertrendOptions } from './indicators/index.js';
+export { rsi, rsiDivergence, macd, macdCross, bollinger, bollingerZone, VwapTracker, anchoredVwap, anchorIndexAtRecentGap, anchorIndexAtExtreme, avwapReclaim, detectPattern, isBullishPattern, isBearishPattern, adx, choppinessIndex, efficiencyRatio, ema, emaCross, emaSeries, maSlope, atr, atrPct, supertrend, supertrendLatest, SUPERTREND_DEFAULT_PERIOD, SUPERTREND_DEFAULT_FACTOR, donchian, ichimoku, tkCross, composeTechnicalSnapshot, composeTimeframeSignal, resampleCandles, mtfBiasOf, MTF_CHOP_ADX, MTF_TF_WEIGHTS, TF_BUCKET_MS } from './indicators/index.js';
+export type { MacdResult, BollingerState, VwapState, AnchoredVwapState, AvwapReclaimResult, AvwapReclaimSide, CandlePattern, AdxResult, DonchianChannel, IchimokuState, TimeframeCandles, SupertrendBar, SupertrendDirection, SupertrendOptions } from './indicators/index.js';
 // TRA-920 — swing-based S/R zones + reversal-confluence checklist (TRA-921 wires
 // these into the OBSERVE-ONLY reversal shadow ledger).
 export { findSwings, supportResistance, reversalChecklist } from './indicators/index.js';
@@ -639,15 +639,20 @@ export type {
   VolumeBreakoutOptions,
   VolumeBreakoutResult,
 } from './options/swing-entries.js';
-// TRA-4422 (parent TRA-4421) — the setup-taxonomy instrument. Ships with an
-// EMPTY registry: the gate above it admits everything and only the reason-code
-// histogram is live. See the module header for why that is a deliverable.
+// TRA-4422 (parent TRA-4421) — the setup-taxonomy instrument.
+//
+// TRA-4423 — `SETUP_TAXONOMY_REGISTRY` is STILL the empty array. A-E live in
+// `setup-definitions.js` and reach the gate through the server seam's registry
+// parameter, which keeps the module graph acyclic (definitions import the types
+// and nothing points back) and keeps LANDING a setup separate from ARMING one.
+// Arming is still the env list `OTM_SETUP_TAXONOMY_SETUPS`, absent ⇒ nothing on.
 export {
   evaluateSetupTaxonomy,
   SETUP_TAXONOMY_REGISTRY,
   SETUP_TAXONOMY_REASON_CODES,
   SETUP_TAXONOMY_MIN_BARS,
 } from './options/setup-taxonomy.js';
+export { SETUP_DEFINITIONS, setupDefinitionsById } from './options/setup-definitions.js';
 export type {
   SetupTaxonomySide,
   SetupTaxonomyReasonCode,
