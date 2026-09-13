@@ -77,6 +77,30 @@ export type SmartSellOutcome =
       submittedOrders: number;
     }
   | { status: 'pending'; orderId: number; limitPrice: number; submittedOrders: number }
+  | {
+      /**
+       * TRA-4603 — the walk stopped because the broker's state is not KNOWABLE,
+       * not because it is bad. A close order may still be WORKING at the broker;
+       * no replacement was submitted and none may be until an operator or the
+       * reconciler establishes terminal state.
+       *
+       * This is the close-side twin of smart-open's `halted`, and the asymmetry
+       * matters: an unconfirmed cancel on the OPEN side risks a doubled entry,
+       * whereas on the CLOSE side it risks selling contracts we do not own. On a
+       * cash, option-level-2 account that is not a bigger position — it is a
+       * broker rejection or a naked short the account is not permitted to hold.
+       *
+       * `confirmedFilledQty` is a LOWER BOUND, never a measurement. Do not size
+       * anything from it; reconcile against the broker.
+       */
+      status: 'halted';
+      orderId: number;
+      haltCode: 'cancel_unknown' | 'cancel_threw' | 'exec_qty_unmeasured';
+      reason: string;
+      confirmedFilledQty: number | null;
+      lastLimitPrice: number;
+      submittedOrders: number;
+    }
   | { status: 'no_quote'; reason: string; submittedOrders: number };
 
 /**
@@ -186,7 +210,7 @@ export interface SmartSellOptions {
  * working once they walk away from the screen).
  */
 export async function submitSmartSellToClose(
-  client: Pick<TradierOptionsClient, 'getOptionQuote' | 'sellContractsLimit' | 'cancelOrder' | 'waitForOrderTerminalStatus'>,
+  client: Pick<TradierOptionsClient, 'getOptionQuote' | 'sellContractsLimit' | 'cancelOrder' | 'cancelOrderConfirmed' | 'waitForOrderTerminalStatus'>,
   optionSymbol: string,
   qty: number,
   options: SmartSellOptions = {},
@@ -299,27 +323,142 @@ export async function submitSmartSellToClose(
     // attempts. Cancel failures are swallowed — Tradier sometimes reports
     // 422 when the order already terminated between our last poll and the
     // cancel call; either way, we proceed to the next attempt or return.
+    // ⭐ TRA-4603 — STILL WORKING, and the walk is about to RE-PRICE this order.
+    //
+    // THE DEFECT THIS CLOSES. This block used `cancelOrder`, whose contract is
+    // "the DELETE was acknowledged" — and it swallowed 404/422, which are
+    // exactly the statuses a FILLED order returns. A thrown cancel was logged
+    // and the walk proceeded anyway ("Best-effort cleanup; the next limit
+    // submission still proceeds"), so a live close limit and its replacement
+    // could both be working, and both could fill. smart-open was fixed for the
+    // same shape in TRA-4483; the close side and its pending fill-chaser were
+    // left on the legacy API.
+    //
+    // The verdict now comes from the order's own TERMINAL STATE, never from the
+    // DELETE's status code. An unconfirmed cancel HALTS the walk rather than
+    // re-pricing over an order that may still be live.
     if (attempt < maxAttempts - 1) {
       const cancelStart = clock();
+      let cancelOutcome;
       try {
-        await client.cancelOrder(order.id);
-        // TRA-2046 — cancel->ack latency, recorded only on a successful ack.
-        recordCancelReplaceLatency({
-          engine: 'options',
-          side: 'close',
-          kind: 'cancel',
-          latencyMs: Math.max(0, clock() - cancelStart),
-        });
+        cancelOutcome = await client.cancelOrderConfirmed(order.id, { sleep });
       } catch (err) {
-        // Best-effort cleanup; the next limit submission still proceeds.
-        // TRA-406 — was a bare `catch {}`. Cancel failures are expected when
-        // the order already terminated, but on a broker path they must not be
-        // invisible: a repeated cancel failure can mean a stale live limit.
-        closeLog.warn('cancelOrder failed during smart-close walk', {
+        // A confirm that RAISED may still have served its DELETE. Unknown, and
+        // an unknown must never be re-priced over.
+        closeLog.error('cancelOrderConfirmed threw during smart-close walk — HALTING', {
           orderId: order.id,
           attempt,
           reason: err instanceof Error ? err.message : String(err),
         });
+        return {
+          status: 'halted',
+          orderId: order.id,
+          haltCode: 'cancel_threw',
+          reason: `cancel confirmation threw: ${err instanceof Error ? err.message : String(err)}`,
+          confirmedFilledQty: null,
+          lastLimitPrice: limitPrice,
+          submittedOrders,
+        };
+      }
+
+      if (cancelOutcome.kind === 'unknown') {
+        closeLog.error('smart-close cancel unconfirmed — HALTING rather than re-pricing', {
+          orderId: order.id,
+          attempt,
+          reason: cancelOutcome.reason,
+          ackStatus: cancelOutcome.ackStatus,
+          ackError: cancelOutcome.ackError,
+        });
+        return {
+          status: 'halted',
+          orderId: order.id,
+          haltCode: 'cancel_unknown',
+          reason: `cancel not confirmed (${cancelOutcome.reason}) — walk halted rather than re-pricing over a live close order`,
+          confirmedFilledQty: null,
+          lastLimitPrice: limitPrice,
+          submittedOrders,
+        };
+      }
+
+      // The cancel LOST THE RACE: the close already executed in full. There is
+      // nothing left to close and a replacement would sell contracts we no
+      // longer hold. Report it as the fill it is.
+      if (cancelOutcome.kind === 'filled') {
+        const avg = cancelOutcome.detail?.avg_fill_price;
+        if (typeof avg === 'number' && Number.isFinite(avg)) {
+          return {
+            status: 'filled',
+            orderId: order.id,
+            avgFillPrice: avg,
+            limitPrice: limitPrice,
+            mid: limitPath.kind === 'mid' ? (limitPath.bid + limitPath.ask) / 2 : null,
+            submittedOrders,
+          };
+        }
+        // Terminal `filled` but no usable average — a real fill we cannot price.
+        // Halting is the honest outcome; the reconciler owns it from here.
+        closeLog.error('smart-close cancel raced a FILL with no avg_fill_price — HALTING', {
+          orderId: order.id,
+          attempt,
+        });
+        return {
+          status: 'halted',
+          orderId: order.id,
+          haltCode: 'exec_qty_unmeasured',
+          reason: 'close filled during cancel but the broker reported no avg_fill_price',
+          confirmedFilledQty: cancelOutcome.filledQty,
+          lastLimitPrice: limitPrice,
+          submittedOrders,
+        };
+      }
+
+      // TRA-2046 — cancel->ack latency, recorded only on a CONFIRMED terminal
+      // outcome (an unknown is not an ack, so it must not enter the rollup).
+      recordCancelReplaceLatency({
+        engine: 'options',
+        side: 'close',
+        kind: 'cancel',
+        latencyMs: Math.max(0, clock() - cancelStart),
+      });
+
+      // Terminal and unfilled-or-partial. A partial close means the NEXT
+      // submission must be net of what already executed; an UNMEASURED
+      // quantity (`null`, never 0 — TRA-1707) cannot be sized from at all.
+      if (cancelOutcome.filledQty === null) {
+        closeLog.error('smart-close cancel confirmed terminal but exec quantity UNMEASURED — HALTING', {
+          orderId: order.id,
+          attempt,
+          terminalStatus: cancelOutcome.terminalStatus,
+        });
+        return {
+          status: 'halted',
+          orderId: order.id,
+          haltCode: 'exec_qty_unmeasured',
+          reason: 'cancel confirmed terminal but the broker did not report an executed quantity',
+          confirmedFilledQty: null,
+          lastLimitPrice: limitPrice,
+          submittedOrders,
+        };
+      }
+      if (cancelOutcome.filledQty > 0) {
+        // A partial close executed. Re-pricing the ORIGINAL quantity here would
+        // submit for more than remains. The walk does not currently carry a
+        // per-attempt remaining-quantity, so the safe action is to stop and let
+        // the reconciler pick up the residual position.
+        closeLog.warn('smart-close cancel confirmed a PARTIAL fill — halting walk, residual is the reconciler\'s', {
+          orderId: order.id,
+          attempt,
+          filledQty: cancelOutcome.filledQty,
+        });
+        return {
+          status: 'halted',
+          orderId: order.id,
+          haltCode: 'exec_qty_unmeasured',
+          reason: `close partially filled (${cancelOutcome.filledQty}) during cancel — walk halted rather than re-pricing the full quantity`,
+          confirmedFilledQty: cancelOutcome.filledQty,
+          lastLimitPrice: limitPrice,
+          submittedOrders,
+        };
       }
     }
   }

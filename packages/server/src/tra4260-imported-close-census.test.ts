@@ -94,6 +94,20 @@ function stubClient(opts: StubOpts) {
         return { id: 1_000 + submits, status: 'open' } as never;
       },
       cancelOrder: async () => undefined as never,
+      // TRA-4603 — the walk confirms cancels via terminal state. This stub
+      // models a CONFIRMED, fully-unfilled cancel so the walk keeps walking,
+      // which is the behaviour these census arms were written against; without
+      // it the walk (correctly) halts on `cancel_threw` and the census arms stop
+      // describing the reprice path at all.
+      cancelOrderConfirmed: async (id: number) =>
+        ({
+          kind: 'canceled',
+          terminalStatus: 'canceled',
+          ackStatus: 200,
+          ackError: null,
+          detail: { id, status: 'canceled' },
+          filledQty: 0,
+        }) as never,
       waitForOrderTerminalStatus: async (id: number) => {
         const status = statuses[id - 1_001] ?? null;
         if (status === null) return null as never;

@@ -17153,6 +17153,32 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
       });
       return;
     }
+    if (outcome.status === 'halted') {
+      // TRA-4603 — the walk stopped because the broker's state is not KNOWABLE.
+      // A close order may still be WORKING at the broker, so the pending order
+      // id is still stamped (the operator needs to know where to look), but this
+      // is NOT a clean pending: no replacement was submitted and none may be
+      // until terminal state is established. 409, not 202 — the caller must not
+      // read this as "the close is progressing normally".
+      log.error('tradier-import sell_to_close HALTED — broker state unknown', {
+        optionSymbol,
+        qty: contracts,
+        env: imported.env,
+        order: outcome.orderId,
+        haltCode: outcome.haltCode,
+        reason: outcome.reason,
+        confirmedFilledQty: outcome.confirmedFilledQty,
+      });
+      ctx.engine.setPendingCloseOrderId(id, outcome.orderId);
+      broadcastEngineState(ctx);
+      res.status(409).json({
+        error: `Close halted — broker state unknown: ${outcome.reason}`,
+        status: 'halted',
+        haltCode: outcome.haltCode,
+        orderId: outcome.orderId,
+      });
+      return;
+    }
     // outcome.status === 'pending'
     log.info('tradier-import sell_to_close pending', {
       optionSymbol,
