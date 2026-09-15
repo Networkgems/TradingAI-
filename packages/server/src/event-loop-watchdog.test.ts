@@ -48,6 +48,20 @@ describe('resolveConfig', () => {
     expect(c).toEqual(DEFAULT_WATCHDOG);
   });
 
+  it('TRA-4560 — the default heap trip sits BELOW the measured V8 OOM point on bqb1', () => {
+    // bqb1 heap_size_limit = 1811939328 B; the three exit-134 deaths read heapUsed 1601-1605 MB.
+    const limit = 1_811_939_328;
+    const lowestMeasuredDeath = 1_601e6;
+    expect(DEFAULT_WATCHDOG.heapPct * limit).toBeLessThan(lowestMeasuredDeath);
+    // 10 samples at the 09-15 priorLiveness reading (1601 MB, 16s before the abort) trip it.
+    const c = cfg({ rssMaxBytes: 0 });
+    const s = freshState();
+    const atDeath = sample({ heapUsedBytes: lowestMeasuredDeath, heapLimitBytes: limit, heapPct: lowestMeasuredDeath / limit });
+    let d: TripDecision = { trip: false };
+    for (let i = 0; i < c.breachSamples; i++) d = evaluateSample(atDeath, s, c);
+    expect(d).toMatchObject({ trip: true, reason: 'heap' });
+  });
+
   it('honours explicit disable spellings', () => {
     expect(resolveConfig({ WATCHDOG_ENABLED: 'false' }).enabled).toBe(false);
     expect(resolveConfig({ WATCHDOG_ENABLED: '0' }).enabled).toBe(false);

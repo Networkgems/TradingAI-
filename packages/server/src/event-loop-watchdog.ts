@@ -751,7 +751,17 @@ export const DEFAULT_WATCHDOG: WatchdogConfig = {
   enabled: true,
   restartEnabled: true,
   sampleMs: 1_000,
-  heapPct: 0.92,
+  // TRA-4560 — 0.85, not 0.92. `heapPct` is graded against `heap_size_limit`,
+  // which is the old-space cap PLUS the young-generation reservation
+  // (bqb1: --max-old-space-size=1536 + 3 x --max-semi-space-size=64 = 1728 MiB
+  // = the 1812 "MB" /api/health/watchdog prints). V8 aborts when OLD space is
+  // full, i.e. well short of that limit: all three bqb1 exit-134 OOMs died at
+  // heapUsed ~1601-1605 MB = 0.883-0.886 (09-09T14:14Z, 09-10T16:16Z,
+  // 09-15T19:21Z). 0.92 (1667 MB) was therefore UNREACHABLE — the heap trip
+  // could never fire, and every heap death was a SIGABRT with no drain and no
+  // lastTrip. 0.85 (1540 MB) sits ~60 MB under the measured death point; a
+  // fresh boot's RTH heap peaks at ~50% (TRA-4158), so it only fires terminal.
+  heapPct: 0.85,
   lagMs: 2_000,
   breachSamples: 10,
   // 4s: a single loop block this long has already blown Render's 5s health
