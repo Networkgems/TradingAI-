@@ -328,6 +328,102 @@ describe('AC2 — `no_quote` is a PRE-SUBMIT abort: counted in its own field, an
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// TRA-4561 — `halted` (TRA-4603) left no census event at all
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('TRA-4561 — a HALTED smart-close walk is counted, once, outside `closeAttempts`', () => {
+  /** A real walk whose first cancel cannot be confirmed → `halted/cancel_unknown`. */
+  const haltedWalk = () => {
+    const stub = stubClient({ statuses: [null, null] });
+    (stub.client as { cancelOrderConfirmed: unknown }).cancelOrderConfirmed = async () => ({
+      kind: 'unknown',
+      reason: 'order still open after cancel',
+      ackStatus: 422,
+      ackError: null,
+    });
+    return stub;
+  };
+
+  it('the real helper emits `submitted` then `halted`, and the census counts it in `closeHalted`', async () => {
+    const stub = haltedWalk();
+    const outcome = await submitSmartSellToClose(stub.client, OCC, 1);
+    expect(outcome).toMatchObject({ status: 'halted', haltCode: 'cancel_unknown', submittedOrders: 1 });
+    // The walk did not re-price over the unconfirmed order.
+    expect(stub.submits()).toBe(1);
+
+    const events = foldIntoCensus(outcome);
+    // Pre-TRA-4561 this was `['submitted']` — byte-identical to a clean pending.
+    expect(events).toEqual(['submitted', 'halted']);
+
+    const r = row();
+    expect(r.closeHalted).toBe(1);
+    expect(r.closeSubmitted).toBe(1);
+    // ONE order reached the broker: the halt must not double it in the denominator.
+    expect(r.closeAttempts).toBe(1);
+    // …and it is not a broker verdict: the sweep owns the terminal event.
+    expect(r.closeRejected).toBe(0);
+    expect(r.closeFilled).toBe(0);
+    expect(r.closeExpired).toBe(0);
+    expect(r.closeVerdict).toBe('degraded');
+    expect(summarizeBrokerSubmitCensus(DAY, [BOOK]).rollup.closeHalted).toBe(1);
+  });
+
+  it('control — a clean pending walk emits no `halted`, so the field discriminates', async () => {
+    foldIntoCensus(await submitSmartSellToClose(stubClient({ statuses: [null, null] }).client, OCC, 1));
+    expect(row().closeHalted).toBe(0);
+  });
+
+  it('every `SmartSellOutcome.status` maps to a terminal event or is a named no-event status', async () => {
+    // `pending` is the ONLY status that legitimately emits nothing after its
+    // submits. Any other status producing a bare `submitted × n` is a suppression.
+    const outcomes: SmartSellOutcome[] = [
+      await submitSmartSellToClose(stubClient({ statuses: ['filled'] }).client, OCC, 1),
+      await submitSmartSellToClose(stubClient({ statuses: ['rejected'] }).client, OCC, 1),
+      await submitSmartSellToClose(stubClient({ submitThrows: tradier500() }).client, OCC, 1),
+      await submitSmartSellToClose(stubClient({ quote: { symbol: OCC, bid: 0, ask: 0, last: 0 } }).client, OCC, 1),
+      await submitSmartSellToClose(haltedWalk().client, OCC, 1),
+    ];
+    expect(outcomes.map(o => o.status).sort()).toEqual(['filled', 'halted', 'no_quote', 'rejected', 'rejected']);
+    for (const o of outcomes) {
+      const tail = smartSellCloseCensusEvents(o).slice(o.submittedOrders);
+      expect(tail, o.status).toHaveLength(1);
+      expect(tail[0], o.status).not.toBe('submitted');
+    }
+  });
+
+  it('a pre-TRA-4561 snapshot cell (no `closeHalted` key) reads back as 0, never NaN', () => {
+    const src = readFileSync(new URL('./broker-submit-census.ts', import.meta.url), 'utf-8');
+    expect(src).toMatch(/closeHalted: Number\(cell\['closeHalted'\] \?\? 0\)/);
+  });
+});
+
+describe('TRA-4561 — the partial-fill remainder resubmit handles `halted` BEFORE its failure branch', () => {
+  const engineSrc = readFileSync(new URL('./signal-engine.ts', import.meta.url), 'utf-8');
+
+  /** From the remainder submit to the reconciler's next outcome arm — bounded both sides. */
+  const remainderBlock = (): string => {
+    const start = engineSrc.indexOf("{ maxAttempts: 1 },");
+    expect(start, 'remainder resubmit no longer found').toBeGreaterThan(0);
+    const end = engineSrc.indexOf("} else if (outcome.status === 'rejected') {", start);
+    expect(end, 'remainder block end anchor not found').toBeGreaterThan(start);
+    return engineSrc.slice(start, end);
+  };
+
+  it('`halted` has its own arm, which re-stamps the pending order id and does not fall into the failure `else`', () => {
+    const block = remainderBlock();
+    const haltedArm = block.indexOf("} else if (resub.status === 'halted') {");
+    const failureElse = block.indexOf('// rejected / no_quote');
+    expect(haltedArm).toBeGreaterThan(-1);
+    expect(failureElse).toBeGreaterThan(haltedArm);
+    // Slice BETWEEN the anchors: the arm itself must stamp the order id.
+    const arm = block.slice(haltedArm, failureElse);
+    expect(arm).toMatch(/acct\.setPendingCloseOrderId\(row\.optionId, resub\.orderId\)/);
+    expect(arm).toMatch(/stillPending \+= 1/);
+    expect(arm).not.toMatch(/cleared \+= 1/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // The false-degraded direction: a pending close that fills 30s later
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -472,6 +568,7 @@ describe('AC5 — the close leg stays COUNT-ONLY on /api/health/options-live (TR
       'closeTransportFaults',
       'closeSubmitThrows',
       'closeNoQuoteAborts',
+      'closeHalted',
       'closeAttempts',
     ] as const) {
       expect(typeof r[k], k).toBe('number');

@@ -300,6 +300,22 @@ export const UNATTRIBUTED_BOOK = '(unattributed)';
  * census that reads `idle` over that is the defect, not the fix. So the same
  * sentence TRA-4223 wrote about throws — "still an exit this book tried and
  * failed to place" — governs here, and yields `degraded`.
+ *
+ * ## TRA-4561 — `halted`, the walk that stopped on UNKNOWABLE broker state
+ *
+ * TRA-4603 gave `submitSmartSellToClose` a `halted` outcome: a cancel could not
+ * be confirmed (or confirmed an unmeasured / partial fill), so the walk refused
+ * to re-price over an order that may still be working. Before TRA-4561 the fold
+ * emitted no event for it at all — a suppression with no counter.
+ *
+ *   • **counted**, in its own field ({@link BookDayCell.closeHalted});
+ *   • **NOT inside {@link BrokerSubmitCensusRow.closeAttempts}** — every halt
+ *     path returns after at least one accepted order, whose `submitted` event is
+ *     already in the denominator. Adding the halt would count one order twice;
+ *   • **NOT a terminal broker verdict.** The halted order id is stamped as
+ *     `pendingCloseOrderId`, so `reconcilePendingCloses` records its real
+ *     `filled` / `rejected` / `expired` later. `closeHalted` counts OUR walk
+ *     stopping, on an axis orthogonal to those, so it cannot double-count them.
  */
 export type BrokerCloseEvent =
   | 'submitted'
@@ -308,7 +324,8 @@ export type BrokerCloseEvent =
   | 'expired'
   | 'transport_fault'
   | 'submit_throw'
-  | 'no_quote_abort';
+  | 'no_quote_abort'
+  | 'halted';
 
 interface BookDayCell {
   /** Orders handed to the broker. Never incremented by a pre-submit abort. */
@@ -345,6 +362,8 @@ interface BookDayCell {
   closeSubmitThrows: number;
   /** TRA-4260 — closes we refused to price. Nothing reached Tradier. */
   closeNoQuoteAborts: number;
+  /** TRA-4561 — smart-close walks halted on unknowable broker state. Not an attempt. */
+  closeHalted: number;
 }
 
 /** etDay -> book -> cell. */
@@ -377,6 +396,7 @@ function emptyCell(): BookDayCell {
     closeTransportFaults: 0,
     closeSubmitThrows: 0,
     closeNoQuoteAborts: 0,
+    closeHalted: 0,
   };
 }
 
@@ -532,6 +552,9 @@ export function recordBrokerCloseEvent(book: string, etDay: string, event: Broke
     case 'no_quote_abort':
       cell.closeNoQuoteAborts += 1;
       break;
+    case 'halted':
+      cell.closeHalted += 1;
+      break;
   }
   persistCensusDayIfArmed(etDay);
 }
@@ -664,6 +687,12 @@ export interface BrokerSubmitCensusRow {
    */
   closeNoQuoteAborts: number;
   /**
+   * TRA-4561 — smart-close walks that HALTED on unknowable broker state
+   * (TRA-4603). Deliberately outside {@link closeAttempts}: the halted order's
+   * own `submitted` is already there. See {@link BrokerCloseEvent}.
+   */
+  closeHalted: number;
+  /**
    * Every close order this book TRIED to place: reached + threw + refused to
    * price (TRA-4260). This is the denominator that makes `idle` mean "did
    * nothing" again — it is non-zero for a book whose only broker activity was N
@@ -748,6 +777,8 @@ export interface BrokerSubmitCensusReport {
      * from one book holding one untradeable OCC. Count only (TRA-2163).
      */
     closeNoQuoteAborts: number;
+    /** TRA-4561 — smart-close walks halted on unknowable broker state, fleet-wide. */
+    closeHalted: number;
     /** Books that tried to close and filled none. The unprotected-capital count. */
     closeDegradedBookCount: number;
   };
@@ -832,6 +863,7 @@ function gradeRow(book: string, etDay: string, cell: BookDayCell | undefined): B
     closeTransportFaults,
     closeSubmitThrows,
     closeNoQuoteAborts,
+    closeHalted: cell?.closeHalted ?? 0,
     closeAttempts,
     entryVerdict,
     closeVerdict,
@@ -876,6 +908,7 @@ export function summarizeBrokerSubmitCensus(
       closeTransportFaults: rows.reduce((a, r) => a + r.closeTransportFaults, 0),
       closeTransportBookCount: rows.filter(r => r.closeTransportFaults > 0).length,
       closeNoQuoteAborts: rows.reduce((a, r) => a + r.closeNoQuoteAborts, 0),
+      closeHalted: rows.reduce((a, r) => a + r.closeHalted, 0),
       closeDegradedBookCount: rows.filter(r => r.closeVerdict === 'degraded').length,
     },
     retainedEtDays: [...store.keys()].sort(),
@@ -972,6 +1005,8 @@ function deserializeDay(raw: Record<string, unknown>): Map<string, BookDayCell> 
       // and reading it back as `NaN` would poison `closeAttempts` and every
       // sum downstream, rendering as `null` through JSON.
       closeNoQuoteAborts: Number(cell['closeNoQuoteAborts'] ?? 0),
+      // TRA-4561 — same `?? 0` migration for pre-TRA-4561 snapshots.
+      closeHalted: Number(cell['closeHalted'] ?? 0),
     });
   }
   return day;

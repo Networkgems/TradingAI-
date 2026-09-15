@@ -139,6 +139,10 @@ function failureKindForThrow(err: unknown): Exclude<SmartSellFailureKind, 'broke
  *     `rejected`: `submitted` means "the broker saw it and did not fill it", and
  *     a throw did not clear that bar.
  *   • `no_quote` → `submitted` × n (usually 0), then `no_quote_abort`.
+ *   • `halted`   → `submitted` × n, then `halted` (TRA-4561). Not a broker
+ *     verdict: the halted order id is stamped pending and the sweep records its
+ *     real terminal event later, exactly as for `pending`. `halted` counts the
+ *     walk stopping, which before TRA-4561 left no trace in the census at all.
  *
  * `expired` is not reachable from here: `submitSmartSellToClose` folds every
  * `TRADIER_REJECTED_STATUSES` member — expired included — into `rejected`
@@ -157,6 +161,9 @@ export function smartSellCloseCensusEvents(outcome: SmartSellOutcome): BrokerClo
     case 'no_quote':
       events.push('no_quote_abort');
       break;
+    case 'halted':
+      events.push('halted');
+      break;
     case 'rejected':
       events.push(
         outcome.failure === 'broker_rejected'
@@ -166,6 +173,12 @@ export function smartSellCloseCensusEvents(outcome: SmartSellOutcome): BrokerClo
             : 'submit_throw',
       );
       break;
+    default: {
+      // TRA-4561 — a new outcome status must fail the BUILD here, not fall
+      // through silently the way `halted` did.
+      const unhandled: never = outcome;
+      return unhandled;
+    }
   }
   return events;
 }

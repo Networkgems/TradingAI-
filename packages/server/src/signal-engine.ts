@@ -20448,6 +20448,27 @@ export class SignalEngine {
                       avgFillPrice: resub.avgFillPrice,
                     });
                   }
+                } else if (resub.status === 'halted') {
+                  // TRA-4561 — NOT a failure. Broker state is unknowable and the
+                  // remainder order may still be WORKING, so falling into the
+                  // failure branch below (marker cleared, row re-renders Close)
+                  // invites a manual retry that sells contracts we may no longer
+                  // hold. Stamp the order id like the imported-close route does
+                  // on `halted`, so this reconciler resolves its terminal state.
+                  // Unreachable while `maxAttempts: 1` (the walk only cancels
+                  // between attempts) — handled explicitly so it stays safe if
+                  // that value changes.
+                  acct.setPendingCloseOrderId(row.optionId, resub.orderId);
+                  stillPending += 1;
+                  log.error('sell_to_close remainder re-order HALTED — broker state unknown, left pending', {
+                    component: 'tradier-reconcile',
+                    optionSymbol: row.optionSymbol,
+                    env,
+                    remainder,
+                    order: resub.orderId,
+                    haltCode: resub.haltCode,
+                    reason: resub.reason,
+                  });
                 } else {
                   // rejected / no_quote — `bookPartialClose` already cleared
                   // the pending marker, so the row re-renders Close with the
