@@ -339,12 +339,29 @@ describe('TRA-1436 promotion gate — environment-aware (Tradier Sandbox exempt)
     }
   });
 
-  it('flag OFF (default) preserves the legacy crypto-only trigger — Production options NOT gated', async () => {
-    // With the flag off, an options-only live switch (crypto OFF) is allowed even
-    // to Production, because the legacy gate only fires on live crypto. This is
-    // the behaviour-preserving default until the board arms the change.
+  it('TRA-4601: Production options are gated even with the env-aware flag OFF', async () => {
+    // WAS: "flag OFF (default) preserves the legacy crypto-only trigger —
+    // Production options NOT gated", asserting `allowed === true`.
+    //
+    // That was a characterization of the defect, not a requirement. The flag
+    // defaults OFF and is declared in neither the production intent manifest nor
+    // render.yaml, so the shipped configuration never checked a Production
+    // options route against the RV/OTM promotion records. The axis is now graded
+    // unconditionally; the flag no longer speaks for it.
     delete process.env[FLAG];
     const gate = await svc.evaluateLiveTransitionGate(ENV_USER, liveOptions('production'));
+    expect(gate.allowed).toBe(false);
+    expect(gate.blocked.map((b) => b.strategyId).sort()).toEqual(
+      ['single_leg_otm', 'single_leg_rv'],
+    );
+  });
+
+  it('TRA-4601: Sandbox options stay ungated with the flag OFF — zero capital is exempt', async () => {
+    // The negative control. If the row above went red for a reason OTHER than
+    // the production axis, this one would go red too — sandbox risks no real
+    // money and IS the paper environment the gate demands.
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveTransitionGate(ENV_USER, liveOptions('sandbox'));
     expect(gate.allowed).toBe(true);
   });
 });
@@ -548,9 +565,12 @@ describe('TRA-2343 promotion gate — the roster delta is gated, not just the ax
     }
   });
 
-  it('the options axis is still ungated while the env-aware flag is OFF', async () => {
-    // The roster comparison must not arm the options axis behind the flag's
-    // back — with the flag off, an options → production switch stays allowed.
+  it('TRA-4601: the options axis is gated on escalation even with the flag OFF', async () => {
+    // WAS: "the options axis is still ungated while the env-aware flag is OFF",
+    // asserting `allowed === true`. Sandbox → Production IS an escalation of
+    // real-capital intent and is exactly what the gate exists to stop; the
+    // TRA-1590 de-escalation exemption still lets the reverse move through (see
+    // the sandbox control below).
     delete process.env[FLAG];
     const previous = {
       mode: 'live',
@@ -559,6 +579,21 @@ describe('TRA-2343 promotion gate — the roster delta is gated, not just the ax
       liveTradierEnvOptions: 'sandbox',
     } as AccountSettings;
     const updated = { ...previous, liveTradierEnvOptions: 'production' } as AccountSettings;
+    const gate = await svc.evaluateLiveTransitionGate(ENV_USER, updated, previous);
+    expect(gate.allowed).toBe(false);
+  });
+
+  it('TRA-4601: de-escalation Production → Sandbox is still always allowed', async () => {
+    // The direction that must never block, or an operator cannot wind down a
+    // gate-failing live path.
+    delete process.env[FLAG];
+    const previous = {
+      mode: 'live',
+      cryptoAutoTradingEnabledLive: false,
+      activeStrategyPreset: 'crypto_core',
+      liveTradierEnvOptions: 'production',
+    } as AccountSettings;
+    const updated = { ...previous, liveTradierEnvOptions: 'sandbox' } as AccountSettings;
     const gate = await svc.evaluateLiveTransitionGate(ENV_USER, updated, previous);
     expect(gate.allowed).toBe(true);
   });

@@ -124,6 +124,17 @@ describe('TradierOrderClient', () => {
   });
 
   it('targets production base URL when env=production', async () => {
+    // TRA-4602 — Production refuses to POST unless the pre-submit intent was
+    // recorded DURABLY, and the default in-memory journal never claims
+    // durability. This arm is about URL routing, so install a journal that does.
+    // (The real server installs FileOrderIntentJournal at boot via
+    // installOrderIntentJournal(DATA_DIR).)
+    setOrderIntentJournal({
+      record: () => {},
+      recordDurable: () => true,
+      update: () => {},
+      openUnknowns: () => [],
+    });
     fetchMock.mockResolvedValueOnce(jsonResponse({ order: { id: 1, status: 'ok' } }));
     const client = new TradierOrderClient('tok', 'A1', 'production');
     await client.submitBracketOrder({

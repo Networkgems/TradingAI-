@@ -1,6 +1,10 @@
 export { rsi, rsiDivergence } from './rsi.js';
 export { VwapTracker } from './vwap.js';
 export type { VwapState } from './vwap.js';
+// TRA-4605 — anchored VWAP. Distinct from session VWAP above: never resets,
+// pinned to one event bar, answers "is everyone since that event underwater".
+export { anchoredVwap, anchorIndexAtRecentGap, anchorIndexAtExtreme, avwapReclaim } from './anchored-vwap.js';
+export type { AnchoredVwapState, AvwapReclaimResult, AvwapReclaimSide } from './anchored-vwap.js';
 export { detectPattern, detectMultiBarPattern, isBullishPattern, isBearishPattern } from './patterns.js';
 export type { CandlePattern, MultiBarPatternOptions } from './patterns.js';
 export { macd, macdCross } from './macd.js';

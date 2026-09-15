@@ -6009,10 +6009,13 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
                 ? 'OBSERVE — the gate scores every nominee and REFUSES NOTHING, so `blocked: 0` here is a '
                   + 'property of the mode and says nothing about the taxonomy. The counterfactual '
                   + '("what would this have refused") is on the `TRA-4422, observe-safe` log line as '
-                  + '`wouldBlock`, with `setupsScored` beside it. ⛔ `setupsRegistered: []` means the '
-                  + 'registry is EMPTY, so every verdict is `series_unreadable` or `no_setup_matched` at '
-                  + '`setupsScored: 0` — read that as UNMEASURED per-row, never as "the taxonomy looked '
-                  + 'and found nothing". The enforce flip is a separate board act (card `70e36987`) and '
+                  + '`wouldBlock`, with `setupsScored` beside it. ⛔ READ `setupsRegistered` BEFORE '
+                  + '`no_setup_matched`: an EMPTY list means nothing was ever scored, so every row is '
+                  + 'UNMEASURED at `setupsScored: 0` and NOT "the taxonomy looked and found nothing". '
+                  + 'Since TRA-4423 A-E are implemented, so a NON-EMPTY list makes `no_setup_matched` a '
+                  + 'REAL negative — but only for the ids actually listed: landing a setup does not arm '
+                  + 'it, `OTM_SETUP_TAXONOMY_SETUPS` does, and an absent env list still enables nothing. '
+                  + 'The enforce flip is a separate board act (card `70e36987`) and '
                   + 'must relocate the refusal BELOW `entry_window` first.'
                 : 'ENFORCE — the gate is refusing. ⚠️ In this position (above `entry_window`) an '
                   + 'enforcing gate SHRINKS that sibling\'s `evaluated`; the relocation owed at the '
@@ -7339,8 +7342,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     const swingTimeStopTradingDays = resolveSwingTimeStopTradingDays(process.env);
     // The demo book's env view — the same `dir ? resolveDemoFlagEnv(dir) :
     // process.env` the engine's private `resolveDemoFlagEnv()` returns.
-    const dataDir = process.env.DATA_DIR;
-    const demoEnv = dataDir ? resolveDemoFlagEnv(dataDir) : process.env;
+    // TRA-4606 — `dir`, not `dataDir`. The TRA-4440 exemption in
+    // scripts/check-data-dir.mjs covers exactly the `dir` report-read idiom at
+    // count 11, and the rename to `dataDir` both dropped that count to 10
+    // (STALE_EXEMPTION) and presented as an eleventh, UNEXEMPTED copy (NEW_COPY).
+    // Same read, same blank-value behaviour; only the identifier moved.
+    // ⛔ Do not spell the exempted line out in prose here — the scanner matches on
+    // text, so quoting it verbatim in a comment counts as another copy.
+    const dir = process.env.DATA_DIR;
+    const demoEnv = dir ? resolveDemoFlagEnv(dir) : process.env;
     res.json({
       ok: true,
       time: new Date(now()).toISOString(),

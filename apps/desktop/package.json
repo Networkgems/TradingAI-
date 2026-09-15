@@ -15,7 +15,6 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.3.0",
-    "@tauri-apps/plugin-shell": "^2.2.0",
     "@trading-app/shared": "workspace:*",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"

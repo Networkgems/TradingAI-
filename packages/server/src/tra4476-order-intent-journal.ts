@@ -83,10 +83,11 @@ export class FileOrderIntentJournal implements OrderIntentJournal {
 
   constructor(private readonly filePath: string) {}
 
-  private append(intent: OrderIntent): void {
+  private append(intent: OrderIntent): boolean {
     try {
       appendFileSync(this.filePath, `${JSON.stringify(intent)}\n`, 'utf8');
       this.writes += 1;
+      return true;
     } catch (err) {
       this.failures += 1;
       // Log at most the first few — a disk that is full will produce one of
@@ -97,11 +98,22 @@ export class FileOrderIntentJournal implements OrderIntentJournal {
           reason: err instanceof Error ? err.message : String(err),
         });
       }
+      return false;
     }
   }
 
   record(intent: OrderIntent): void {
     this.append(intent);
+  }
+
+  /**
+   * TRA-4602 — the durable write receipt. `false` means the bytes did NOT land,
+   * so no restart can reconstruct this order and the caller must decide whether
+   * the submit may proceed. Never throws: the submit path wants a verdict, not
+   * an exception.
+   */
+  recordDurable(intent: OrderIntent): boolean {
+    return this.append(intent);
   }
 
   update(intent: OrderIntent): void {
@@ -189,7 +201,24 @@ export interface InstallResult {
  */
 export function installOrderIntentJournal(dataDir: string | null): InstallResult {
   if (dataDir === null) {
-    log.warn('order-intent journal NOT installed — no data dir; unknown-outcome halts will not survive a restart');
+    // TRA-4602 — this is now a LOUD boot fact, not a warning buried in the log.
+    //
+    // Since TRA-4602 the submit path refuses a Tradier PRODUCTION order whose
+    // pre-submit intent could not be durably recorded, and with no data dir the
+    // in-memory journal is what stays installed — it never claims durability.
+    // The consequence is therefore: NO DATA DIR ⇒ NO LIVE ENTRIES. That is the
+    // correct direction (no durable audit trail, no real orders) but it is a
+    // whole trading sleeve going quiet, and discovering it from an empty fill
+    // tape at the open is the wrong way to find out.
+    //
+    // Exits are unaffected — the refusal is scoped to the OPEN path — so this
+    // degrades to "cannot enter, can still get flat", never to "trapped".
+    log.error(
+      'order-intent journal NOT installed — no data dir. LIVE PRODUCTION ENTRIES WILL BE REFUSED ' +
+        '(TRA-4602: no durable pre-submit record). Exits and sandbox are unaffected. ' +
+        'Set DATA_DIR to restore live entry.',
+      { consequence: 'live_production_entries_refused', exitsAffected: false },
+    );
     return { installed: false, path: null, rehydrated: 0, corruptLines: 0, journalAbsent: true };
   }
   const filePath = orderIntentLogPath(dataDir);

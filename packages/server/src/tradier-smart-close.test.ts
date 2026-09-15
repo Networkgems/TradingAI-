@@ -19,7 +19,7 @@ import type { TradierOptionQuote, TradierOptionsClient, TradierOrderDetail, Trad
 
 type SmartCloseClient = Pick<
   TradierOptionsClient,
-  'getOptionQuote' | 'sellContractsLimit' | 'cancelOrder' | 'waitForOrderTerminalStatus'
+  'getOptionQuote' | 'sellContractsLimit' | 'cancelOrder' | 'cancelOrderConfirmed' | 'waitForOrderTerminalStatus'
 >;
 
 function buildClient(overrides: Partial<SmartCloseClient> = {}): SmartCloseClient {
@@ -27,6 +27,18 @@ function buildClient(overrides: Partial<SmartCloseClient> = {}): SmartCloseClien
     getOptionQuote: vi.fn(async () => null),
     sellContractsLimit: vi.fn(async () => ({ id: 1, status: 'ok' } as TradierOrderResponse)),
     cancelOrder: vi.fn(async () => undefined),
+    // TRA-4603 — the walk now confirms cancels via terminal state. The default
+    // is a CONFIRMED, fully-unfilled cancel: the pre-existing reprice tests
+    // describe a walk that keeps walking, which is exactly what filledQty 0
+    // authorises. Tests that want a halt override this.
+    cancelOrderConfirmed: vi.fn(async () => ({
+      kind: 'canceled',
+      terminalStatus: 'canceled',
+      ackStatus: 200,
+      ackError: null,
+      detail: { id: 1, status: 'canceled' } as TradierOrderDetail,
+      filledQty: 0,
+    })) as unknown as SmartCloseClient['cancelOrderConfirmed'],
     waitForOrderTerminalStatus: vi.fn(async () => null),
     ...overrides,
   };
@@ -272,12 +284,22 @@ describe('submitSmartSellToClose', () => {
     });
     sellSpy.mockResolvedValueOnce({ id: 200, status: 'ok' } as TradierOrderResponse);
     sellSpy.mockResolvedValueOnce({ id: 201, status: 'ok' } as TradierOrderResponse);
-    const cancelSpy = vi.fn(async () => undefined);
+    // TRA-4603 — the walk confirms cancels via terminal state now, so the spy
+    // that proves "the stale limit was pulled before re-pricing" is on
+    // `cancelOrderConfirmed`, not the legacy ack-only `cancelOrder`.
+    const cancelSpy = vi.fn(async () => ({
+      kind: 'canceled',
+      terminalStatus: 'canceled',
+      ackStatus: 200,
+      ackError: null,
+      detail: { id: 200, status: 'canceled' } as TradierOrderDetail,
+      filledQty: 0,
+    })) as unknown as SmartCloseClient['cancelOrderConfirmed'];
     const client = buildClient({
       getOptionQuote: vi.fn(async () => ({ symbol: 'X', bid: 0.05, ask: 0.17 } as TradierOptionQuote)),
       sellContractsLimit: sellSpy,
       waitForOrderTerminalStatus: waitSpy,
-      cancelOrder: cancelSpy,
+      cancelOrderConfirmed: cancelSpy,
     });
 
     const outcome = await submitSmartSellToClose(client, 'X', 3, { maxAttempts: 2 });
@@ -286,8 +308,9 @@ describe('submitSmartSellToClose', () => {
     expect((outcome as { avgFillPrice: number }).avgFillPrice).toBeCloseTo(0.08, 2);
     expect(sellSpy).toHaveBeenNthCalledWith(1, 'X', 3, 0.11);
     expect(sellSpy).toHaveBeenNthCalledWith(2, 'X', 3, 0.08);
-    // First pending order must be cancelled before the walk submits the next limit.
-    expect(cancelSpy).toHaveBeenCalledWith(200);
+    // First pending order must be cancelled — and CONFIRMED terminal — before
+    // the walk submits the next limit.
+    expect(cancelSpy).toHaveBeenCalledWith(200, expect.anything());
   });
 
   it('returns rejected with the Tradier reason when the broker terminates the order', async () => {
@@ -652,5 +675,129 @@ describe('repricePendingCloseOrder', () => {
 
     expect(outcome.status).toBe('error');
     expect((outcome as { reason: string }).reason).toContain('401');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-4603 — the close walk must not re-price over a cancel it never confirmed.
+//
+// smart-open was fixed for this shape in TRA-4483; smart-close and its pending
+// fill-chaser were left on `cancelOrder`, whose contract is "the DELETE was
+// acknowledged" and which swallowed 404/422 — exactly the statuses a FILLED
+// order returns. Each arm below is paired with the PROCEED case it differs from
+// by one variable, because a suite that only asserts refusals stays green on a
+// walk that has jammed shut.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('TRA-4603 smart-close confirmed cancel/reprice', () => {
+  function walkClient(cancelOutcome: unknown) {
+    const sellSpy = vi.fn();
+    sellSpy.mockResolvedValueOnce({ id: 300, status: 'ok' } as TradierOrderResponse);
+    sellSpy.mockResolvedValueOnce({ id: 301, status: 'ok' } as TradierOrderResponse);
+    const client = buildClient({
+      getOptionQuote: vi.fn(async () => ({ symbol: 'X', bid: 0.05, ask: 0.17 } as TradierOptionQuote)),
+      sellContractsLimit: sellSpy,
+      // Never terminal → the walk always reaches the cancel/reprice branch.
+      waitForOrderTerminalStatus: vi.fn(async () => null),
+      cancelOrderConfirmed: vi.fn(async () => cancelOutcome) as unknown as SmartCloseClient['cancelOrderConfirmed'],
+    });
+    return { client, sellSpy };
+  }
+
+  const CONFIRMED_UNFILLED = {
+    kind: 'canceled',
+    terminalStatus: 'canceled',
+    ackStatus: 200,
+    ackError: null,
+    detail: { id: 300, status: 'canceled' } as TradierOrderDetail,
+    filledQty: 0,
+  };
+
+  it('PROCEEDS when the cancel is confirmed terminal and unfilled (the control)', async () => {
+    // The negative control. If this ever goes red, the arms below are passing
+    // because the walk refuses everything, not because they discriminate.
+    const { client, sellSpy } = walkClient(CONFIRMED_UNFILLED);
+    const outcome = await submitSmartSellToClose(client, 'X', 3, { maxAttempts: 2 });
+    expect(outcome.status).toBe('pending');
+    expect(sellSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('HALTS instead of re-pricing when the cancel is unconfirmed (still_working)', async () => {
+    // ⛔ THE DEFECT. The order may still be LIVE at the broker; a replacement
+    // could leave two working close limits that both fill.
+    const { client, sellSpy } = walkClient({
+      kind: 'unknown',
+      reason: 'still_working',
+      ackStatus: 200,
+      ackError: null,
+      detail: null,
+      filledQty: null,
+    });
+    const outcome = await submitSmartSellToClose(client, 'X', 3, { maxAttempts: 2 });
+    expect(outcome.status).toBe('halted');
+    expect((outcome as { haltCode: string }).haltCode).toBe('cancel_unknown');
+    expect(sellSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('HALTS when the status could not be read at all (status_unreadable)', async () => {
+    const { client, sellSpy } = walkClient({
+      kind: 'unknown',
+      reason: 'status_unreadable',
+      ackStatus: null,
+      ackError: 'boom',
+      detail: null,
+      filledQty: null,
+    });
+    const outcome = await submitSmartSellToClose(client, 'X', 3, { maxAttempts: 2 });
+    expect(outcome.status).toBe('halted');
+    expect(sellSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('HALTS when the cancel confirmation THREW — a DELETE that raised may still have been served', async () => {
+    const sellSpy = vi.fn();
+    sellSpy.mockResolvedValueOnce({ id: 300, status: 'ok' } as TradierOrderResponse);
+    const client = buildClient({
+      getOptionQuote: vi.fn(async () => ({ symbol: 'X', bid: 0.05, ask: 0.17 } as TradierOptionQuote)),
+      sellContractsLimit: sellSpy,
+      waitForOrderTerminalStatus: vi.fn(async () => null),
+      cancelOrderConfirmed: vi.fn(async () => {
+        throw new Error('socket hang up');
+      }) as unknown as SmartCloseClient['cancelOrderConfirmed'],
+    });
+    const outcome = await submitSmartSellToClose(client, 'X', 3, { maxAttempts: 2 });
+    expect(outcome.status).toBe('halted');
+    expect((outcome as { haltCode: string }).haltCode).toBe('cancel_threw');
+    expect(sellSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports FILLED when the cancel lost the race — replacing here would sell contracts we no longer hold', async () => {
+    // 404/422 on the DELETE is what a filled order returns, and the legacy
+    // `cancelOrder` swallowed exactly that.
+    const { client, sellSpy } = walkClient({
+      kind: 'filled',
+      ackStatus: 422,
+      ackError: null,
+      detail: { id: 300, status: 'filled', avg_fill_price: 0.11 } as TradierOrderDetail,
+      filledQty: 3,
+    });
+    const outcome = await submitSmartSellToClose(client, 'X', 3, { maxAttempts: 2 });
+    expect(outcome.status).toBe('filled');
+    expect((outcome as { avgFillPrice: number }).avgFillPrice).toBeCloseTo(0.11, 2);
+    expect(sellSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('HALTS on a PARTIAL fill rather than re-pricing the full quantity', async () => {
+    const { client, sellSpy } = walkClient({ ...CONFIRMED_UNFILLED, filledQty: 1 });
+    const outcome = await submitSmartSellToClose(client, 'X', 3, { maxAttempts: 2 });
+    expect(outcome.status).toBe('halted');
+    expect((outcome as { confirmedFilledQty: number }).confirmedFilledQty).toBe(1);
+    expect(sellSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('HALTS when the executed quantity is UNMEASURED — null is not zero (TRA-1707)', async () => {
+    const { client, sellSpy } = walkClient({ ...CONFIRMED_UNFILLED, filledQty: null });
+    const outcome = await submitSmartSellToClose(client, 'X', 3, { maxAttempts: 2 });
+    expect(outcome.status).toBe('halted');
+    expect((outcome as { haltCode: string }).haltCode).toBe('exec_qty_unmeasured');
+    expect(sellSpy).toHaveBeenCalledTimes(1);
   });
 });

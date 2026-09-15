@@ -307,10 +307,30 @@ function guardedRosterByAxis(
   envAware: boolean,
   axes: { crypto: boolean; optionsProduction: boolean } = realCapitalIntentAxes(s),
 ): { crypto: string[]; optionsProduction: string[] } {
+  // TRA-4601 — the options-production axis is now graded UNCONDITIONALLY.
+  //
+  // THE DEFECT THIS CLOSES. The axis used to be gated on `envAware`
+  // (PROMOTION_GATE_ENV_AWARE), which defaults OFF, is absent from the
+  // production intent manifest, and is not declared in render.yaml. With the
+  // shipped default, routing options to Tradier PRODUCTION was never checked
+  // against the named RV/OTM promotion records — the gate was decorative on the
+  // one axis that spends real money.
+  //
+  // It is ALSO the load-bearing half once crypto is removed. The legacy trigger
+  // is crypto-only: with `axes.crypto` permanently false, a default-OFF
+  // `envAware` leaves `guardedRosterByAxis` returning two empty arrays, i.e. a
+  // gate that cannot fire on anything. Deleting crypto while this stayed
+  // flag-gated would have silently disarmed promotion entirely.
+  //
+  // Sandbox remains exempt (see `realCapitalIntentAxes` — the axis is only true
+  // for Tradier Production), so zero-capital paper is not blocked, and the
+  // TRA-1590 de-escalation exemption upstream still lets an operator always
+  // move TOWARD safety. `envAware` is retained only for the crypto axis it
+  // originally described and is no longer consulted here.
+  void envAware;
   return {
     crypto: axes.crypto ? [...resolveStrategyPreset(s.activeStrategyPreset).enabledStrategies] : [],
-    optionsProduction:
-      envAware && axes.optionsProduction ? [...OPTIONS_PRODUCTION_STRATEGIES] : [],
+    optionsProduction: axes.optionsProduction ? [...OPTIONS_PRODUCTION_STRATEGIES] : [],
   };
 }
 

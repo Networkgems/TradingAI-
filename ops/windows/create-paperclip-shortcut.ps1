@@ -17,7 +17,7 @@
     The shortcut file name (without extension). Defaults to "Run Paperclip".
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File scripts\create-paperclip-shortcut.ps1
+    powershell -ExecutionPolicy Bypass -File ops\windows\create-paperclip-shortcut.ps1
 #>
 [CmdletBinding()]
 param(
