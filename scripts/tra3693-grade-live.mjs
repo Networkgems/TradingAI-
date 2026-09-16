@@ -43,3 +43,15 @@ const voids = state.sma200SignalVoids || [];
 console.log(`AC5 voids recorded: ${voids.length}`);
 for (const v of voids.slice(-10)) console.log('  void:', JSON.stringify(v));
 if (rows.length === 0) console.log('AC5 note: queue EMPTY at grade time — empty is NOT a pass by itself');
+
+// TRA-4457 census — the AC5 discriminator. An empty queue on a BLIND sweep is a NO-RUN, not a pass;
+// only `evaluated > 0` lets the emptiness be read as "market genuinely quiet". The spec owner
+// withdrew AC5's "declare empty and re-grade" fallback on 2026-09-10 for exactly this reason.
+console.log('CENSUS sma200SweepVerdict:', JSON.stringify(state.sma200SweepVerdict));
+console.log('CENSUS sma200ScanStats:', JSON.stringify(state.sma200ScanStats));
+
+// S-3a per-row staleness: a row is stale once a newer daily bar exists for its symbol. The engine
+// records that as a void; at grade time the queue must hold no row whose own validity stamp has
+// been outrun.
+const staleRows = rows.filter(r => r.validForBarTimestamp != null && r.validForBarTimestamp !== r.barTimestamp);
+console.log(`AC5 S-3a violations in served queue: ${staleRows.length}${staleRows.length ? ' -> ' + staleRows.map(r => r.symbol).join(',') : ''}`);

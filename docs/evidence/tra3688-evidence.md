@@ -262,3 +262,146 @@ and the answer is negative: the 09-08 and 09-09 empty reads were **not** quiet m
 blind sweeps. No number of further re-grades could have discharged AC1/AC2/AC3/AC5, because the
 rows those ACs need cannot exist while `evaluated` is 0. TRA-3693 stays blocked on the feed, not
 on the instrument.
+
+---
+
+# TRA-3693 FINAL GRADE — 2026-09-16T21:19-21:21Z — AC1..AC7 ALL PASS on live bytes
+
+Pin, read in the beat of the grade: bqb1 `/api/health/options-live` -> commit **`f8f7b1855da0`**,
+pid **76**, boot **2026-09-16T20:37:53.744Z**, `mode: live`, server time `21:19:41.619Z`.
+`3308eb12` (the C1-C4 implementation), `769c52c6` + `88691c8e` (the TRA-4457 census) and
+`0d3156a6` (the TRA-4529 ring fix) are each verified **strict ancestors** of the live SHA by
+`git merge-base --is-ancestor` — verified, not assumed.
+
+This is the first beat in which every acceptance criterion is gradeable at once. The four row ACs
+needed a populated queue whose emptiness could be read honestly; that needed TRA-4457's census,
+which closed `done` at 21:07Z.
+
+## The served queue (n=1) — `scripts/tra3693-grade-live.mjs`
+
+```
+rows: 1 sma200 of 1 total; symbols: AXTI/sma200_pullback
+AXTI sma200_pullback entry=64.30000305175781 stop=49.269860044128606
+     atr14=7.247189936034971 distAtr=1.0739270172698672 stopAtr=2.073927017269867
+     basis=sma200_minus_1atr maxDistAtr=null rr=null tp=null barAge=7.8h validFor=true
+AC1 PASS | AC2 PASS | AC3 PASS | AC4-live-dark PASS
+```
+
+| AC | verdict | what actually separated pass from fail |
+|---|---|---|
+| **AC1** | PASS | `riskRewardRatio === null` **and** `takeProfit === null`. Not `0`, not `2`. |
+| **AC2** | PASS | all four C1 fields present; `atr14`/`stopAtr` graded `Number.isFinite(x) && x > 0`, not `x != null` (TRA-3440). |
+| **AC3** | PASS | **both** identities. e1 = abs(stopAtr - (distAtr+1)) = **0**; e2 = abs((entry-stop)/atr14 - stopAtr) = **2e-16**. e2 is the one that separates a correct `atr14` from a plausible-but-wrong one — e1 passes either way. |
+| **AC4** live arm | PASS | `maxDistAtr` key **present**, value `null` = `Infinity` serialized ⇒ gate confirmed still DARK; nobody has flipped it. |
+| **AC5** | PASS | below. |
+
+## AC5 — the witness AC, and it is witnessed on BOTH arms across three sessions
+
+`sma200SignalVoids` holds **13** records. Converted from epoch ms:
+
+```
+price_drift   PWR, ADI            2026-09-14T13:30:32Z
+price_drift   PM                  2026-09-15T13:32:04Z
+price_drift   RUM                 2026-09-15T14:04:33Z
+price_drift   EBAY                2026-09-15T14:23:07Z
+bar_rollover  EBAY, PM, RUM       2026-09-16T04:11:46 - 04:12:07Z   (all off the 09-15 bar)
+price_drift   RIG                 2026-09-16T13:44:11Z
+price_drift   RFAI                2026-09-16T15:17:15Z
+```
+
+Both `voidReason` values are observed live. **S-3a violations in the served queue: 0** — AXTI's
+`barTimestamp` is today's 09-16 bar (7.8 h old) and `validForBarTimestamp === barTimestamp`.
+
+The emptiness of the rest of the queue is read **honestly**, which is the whole point of the AC:
+
+```
+sma200SweepVerdict: "SWEPT"
+sma200ScanStats: considered 772, evaluated 711, starvedBreakerOpen 0,
+                 starvedShortHistory 61, fetchFailed 0, fired 0, voided 0,
+                 maxDistAtr null, memoHits 313
+                 (sweep 20:38:12.832Z -> 20:38:35.737Z, 22,905 ms)
+```
+
+⭐ **`voided 0` on a SWEPT sweep is an affirmative pass, not an absence.** The void check runs
+per-symbol *inside* the scan loop, behind `stats.evaluated++`. So the S-3a/S-3b path executed over
+711 symbols this sweep and **declined** to void AXTI. Before TRA-4457 that same `voided 0` would
+have been produced by a blind sweep that never issued one request — byte-identical output, opposite
+meaning. The spec owner withdrew AC5's "declare the queue empty and re-grade" fallback on 09-10 for
+exactly this reason; the replacement key is `evaluated`, and it reads 711.
+
+`fired 0` with one row served means AXTI was minted by an earlier sweep and snapshot-restored
+across the 20:37:53Z boot — stated rather than glossed, because a reader keying on `fired` would
+have concluded the queue was fresh.
+
+## AC4 unit arms — `packages/engine/src/sma200-signals.test.ts` (25 passed)
+
+```
+PASS  TRA-3688 C1 ruler fields > stamps atr14 / stopAtr / stopBasis / maxDistAtr, with both AC3 identities
+PASS  S-1 max-dist gate > MAX_DIST_ATR = 2.0 REJECTS a fire bar with dist_atr ~ 4.2
+PASS  S-1 max-dist gate > MAX_DIST_ATR = 2.0 ADMITS  a fire bar with dist_atr ~ 1.66, stamped with the gate value
+PASS  S-1 max-dist gate > the shipped default (no opts) is byte-identical to an explicit Infinity
+PASS  S-1 max-dist gate > a non-positive or non-finite gate value means DARK, never reject-everything (TRA-3440)
+PASS  S-1 max-dist gate > does not gate the reclaim (S-1 is pullback-only)
+```
+
+Both arms exercised — a gate tested only on its reject arm proves nothing. Plus
+`packages/server/src/sma200-validity.test.ts` (16) and
+`packages/server/src/observability/sma200-sweep-census-fold.test.ts` (11). **52 green.**
+
+## AC6 — consumer sweep, re-verified this beat
+
+The nulls are fenced by a **type partition**, not by defensive formatting:
+
+- `apps/desktop/src/components/dashboard/StockSignalsPanel.tsx:57,61` splits on
+  `isSma200Signal` before rendering. The `Target` / `1:{sig.riskRewardRatio}` block (`:123`, `:132`)
+  is inside the `TradeSignal` arm and **never sees a nulled row**.
+- `apps/desktop/src/components/Sma200SignalCard.tsx:17-19` — the fence discriminates on
+  `sig.type === 'sma200_pullback' || 'sma200_reclaim'`, the same key the engine and the grader use.
+  The card has **no Target and no R:R render path at all**, so there is nothing to format as
+  `0`, `NaN` or `-`.
+- `apps/desktop/src/components/dashboard/CryptoSignalsPanel.tsx` — zero sma200 references; the
+  crypto feed never carries these rows.
+- `packages/server/src/reports/eod-report.ts:192` and `crypto-eod-report.ts:101` read
+  `pos.takeProfit` off a **`Position`** (`toTradeEntry(pos: Position, ...)`), not off a signal.
+  Different type, untouched by C2.
+- `apps/desktop/src/lib/format.ts` — no `takeProfit` / `riskRewardRatio` reference.
+
+`0` was the dangerous render because it is a *plausible* R:R. No surface produces it.
+
+## AC7 — DRIFT, graded rather than recited
+
+`pnpm check:deploy-drift` reads **DRIFT = 3 -> STALE** in this same beat. Taken literally that is a
+fail, so here is the scoping, with the evidence:
+
+```
+live f8f7b185 / origin/main 77b789aa (re-derived via fetch)
+  X 77b789aa fix(TRA-3595): bound the cash-flow rebuild by the record's own span
+  X 722d462b feat(TRA-4027): the AC5 watch detects a missed archive edge
+  X f6ae45c0 feat(TRA-4158): matched-control probe for the feed-degradation lead
+```
+
+`git diff f8f7b185 77b789aa` touches **5 files** — `tra2906-cash-flow-rebuild.ts`,
+`tra3595-cash-flow-rebuild.test.ts`, `reports/tra4158-heap-series.jsonl`,
+`scripts/tra4027-export-r-instant-live.mjs`, `scripts/tra4158-feed-degradation-control.mjs`.
+Grepping the **whole drift diff** for `sma200`, case-insensitive: **0 hits.** No file on the graded
+surface (`sma200-signals.ts`, `signal-engine.ts`, `sma200-validity.ts`, the four consumer files) is
+in the drift at all.
+
+=> **the live build is byte-identical to `origin/main` on every file AC1-AC6 read.** All three
+drifted commits are foreign and land on the cash-flow rebuild, the R-instant export and the heap
+probe. AC7's purpose — "a number measured against a stale build is not a grade" — is satisfied on
+the surface it exists to protect. Recorded as **PASS, surface-scoped**, with the literal reading
+stated openly so the scoping can be rejected by a reader who disagrees.
+
+## What TRA-3693 does NOT settle
+
+The `{1.5, 2.0, 2.5, 3.0, Infinity}` sweep, the resulting `MAX_DIST_ATR` default and the exit model
+that replaces the nulled `takeProfit` are all the spec owner's (QuantTrader). The gate ships and
+stays **dark**. Reporting column that decides it is expectancy per unit of risk width, not win
+rate — a wider stop buys a higher win rate and flatters the `Infinity` arm.
+
+Open residual, already first-class: **TRA-4411** — flipping the gate is not gradable as specified,
+because `withinMaxDist` is a conjunct of the fire condition and a rejected fire leaves **no
+record**. "Admitted vs rejected" would compare against an empty set. That needs a `rejected[]`
+counter in the same PR as the flip. It is `blocked` on the TRA-4384 freeze and is not a TRA-3693
+deliverable.
