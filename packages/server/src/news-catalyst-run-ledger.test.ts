@@ -7,6 +7,8 @@ import {
   summarizeCatalystRuns,
   listCatalystRuns,
   isCatalystRunDegraded,
+  catalystQuoteCoverage,
+  CATALYST_MIN_QUOTE_COVERAGE,
   setNewsCatalystRunLedgerFileForTests,
 } from './news-catalyst-run-ledger.js';
 
@@ -227,10 +229,42 @@ describe('news-catalyst run ledger — isCatalystRunDegraded', () => {
     ).toBe(false);
   });
 
-  it('does NOT flag a PARTIAL quote outage', () => {
-    // Degraded coverage is not a dead feed — same distinction TRA-2064 drew for
-    // `queriesAttempted < universe`. One usable quote means the screen ran.
-    expect(isCatalystRunDegraded({ ...base, quotesOk: 1 })).toBe(false);
+  it('DOES flag a partial quote outage below the coverage floor (TRA-4598)', () => {
+    // This assertion is INVERTED from TRA-4585, deliberately. The old
+    // all-or-nothing arm (`quotesOk === 0`) let the canonical incident's own
+    // shape through: 2026-08-31 wrote 19 rows, 14 unpriced and 5 priced, so
+    // `quotesOk === 0` was FALSE and the day was flagged only because the news
+    // sweep separately died. A 74% quote outage under a HEALTHY news sweep
+    // entered the forward-test cohort as a legitimate low-catalyst session.
+    expect(isCatalystRunDegraded({ ...base, quotesAttempted: 19, quotesOk: 5 })).toBe(true);
+    expect(isCatalystRunDegraded({ ...base, quotesOk: 1 })).toBe(true);
+  });
+
+  it('does NOT flag a shallow partial — a few names missing is not an outage', () => {
+    // The floor has to cut BOTH ways: a rule that flags everything shrinks the
+    // forward-test window instead of correcting it. Banked history's worst
+    // clean session is 17/19 = 0.895 (2026-09-11) and there is no observation
+    // anywhere between that and 0.263, so this side of the gap must stay
+    // eligible.
+    expect(isCatalystRunDegraded({ ...base, quotesOk: 11 })).toBe(false); // 0.917
+    expect(isCatalystRunDegraded({ ...base, quotesAttempted: 19, quotesOk: 17 })).toBe(false);
+  });
+
+  it('treats the floor as strict — exactly at the floor is NOT degraded', () => {
+    // Pins the comparison direction. `< floor`, not `<= floor`: the boundary
+    // belongs to the eligible side, so a rule change is never silently smuggled
+    // in by an equality.
+    expect(isCatalystRunDegraded({ ...base, quotesAttempted: 12, quotesOk: 6 })).toBe(false);
+    expect(isCatalystRunDegraded({ ...base, quotesAttempted: 12, quotesOk: 5 })).toBe(true);
+  });
+
+  it('exposes coverage as null — never 0/0 — for both NOT MEASURED cases', () => {
+    // The two invariants TRA-4598 must not regress. A ratio that manufactured a
+    // verdict here would either retro-contaminate banked history (first case)
+    // or reclassify every quiet news day as an outage (second).
+    expect(catalystQuoteCoverage({ quotesAttempted: null, quotesOk: null })).toBeNull();
+    expect(catalystQuoteCoverage({ quotesAttempted: 0, quotesOk: 0 })).toBeNull();
+    expect(catalystQuoteCoverage({ quotesAttempted: 19, quotesOk: 5 })).toBeCloseTo(0.2632, 4);
   });
 
   it('does NOT flag a legacy row whose counters were never written', () => {
@@ -337,11 +371,111 @@ describe('news-catalyst run ledger — session partition', () => {
     let s = await summarizeCatalystRuns();
     expect(s.lastRunQuotesAttempted).toBe(12);
     expect(s.lastRunQuotesOk).toBe(3);
-    expect(s.lastRunDegraded).toBe(false); // partial, not dead
+    expect(s.lastRunQuoteCoverage).toBeCloseTo(0.25, 4);
+    // TRA-4598 — was `false` ("partial, not dead") under TRA-4585's
+    // all-or-nothing arm. 3/12 = 0.25 is below the floor and this is now the
+    // whole point of the predicate.
+    expect(s.lastRunDegraded).toBe(true);
 
     await run(25, 13, { quotesAttempted: null, quotesOk: null });
     s = await summarizeCatalystRuns();
     expect(s.lastRunQuotesAttempted).toBeNull();
     expect(s.lastRunQuotesOk).toBeNull();
+    expect(s.lastRunQuoteCoverage).toBeNull();
+  });
+});
+
+describe('news-catalyst run ledger — per-session quote coverage (TRA-4598)', () => {
+  const run = (
+    day: number,
+    hour: number,
+    over: Partial<Parameters<typeof recordCatalystRun>[0]> = {},
+  ) =>
+    recordCatalystRun({
+      at: Date.UTC(2026, 7, day, hour, 0),
+      outcome: 'picks_built',
+      headlineCount: 40,
+      candidateCount: 12,
+      chosenCount: 3,
+      queriesAttempted: 25,
+      queriesSucceeded: 25,
+      quotesAttempted: 12,
+      quotesOk: 12,
+      ...over,
+    });
+
+  it('publishes the floor alongside the ratios so the payload grades itself', async () => {
+    await run(24, 13);
+    const s = await summarizeCatalystRuns();
+    expect(s.quoteCoverageFloor).toBe(CATALYST_MIN_QUOTE_COVERAGE);
+  });
+
+  it('makes the PARTIAL outage legible without reading per-row drop reasons', async () => {
+    // TRA-4222's acceptance sentence. The 2026-08-31 shape: 19 candidates, 5
+    // priced. Every other field on this payload reads as an ordinary
+    // low-catalyst session.
+    await run(31, 13, { quotesAttempted: 19, quotesOk: 5, chosenCount: 0 });
+    const s = await summarizeCatalystRuns();
+    const day = s.quoteCoverageBySession.find((c) => c.session === '2026-08-31');
+    expect(day?.quoteCoverage).toBeCloseTo(0.2632, 4);
+    expect(day?.belowFloor).toBe(true);
+    expect(s.degradedSessions).toEqual(['2026-08-31']);
+  });
+
+  it('reports the WORST run in a session, not a sum across it', async () => {
+    // Summing dilutes exactly the case worth catching, and the dilution is not
+    // hypothetical: the shadow ledger dedupes one row per symbol per session,
+    // first write wins, so the dead 13:00 run below OWNS the day's rows and the
+    // five healthy ones cannot overwrite them. Summed this is 95/114 = 0.83 and
+    // reads clean.
+    await run(24, 13, { quotesAttempted: 19, quotesOk: 0 });
+    for (const hour of [14, 15, 16, 17, 18]) await run(24, hour, { quotesAttempted: 19, quotesOk: 19 });
+
+    const s = await summarizeCatalystRuns();
+    const day = s.quoteCoverageBySession.find((c) => c.session === '2026-08-24');
+    expect(day?.quotesAttempted).toBe(19);
+    expect(day?.quotesOk).toBe(0);
+    expect(day?.quoteCoverage).toBe(0);
+    expect(day?.belowFloor).toBe(true);
+    // Consistent with the partition, which flags a session if ANY run degraded.
+    expect(s.sessionsDegraded).toBe(1);
+  });
+
+  it('reads an unmeasured session as null, never as a 0/0 verdict', async () => {
+    // The banked-history invariant. A pre-TRA-4585 row has no `quotes*` key, so
+    // the session has no coverage — and `belowFloor: null` keeps "clean" and
+    // "never looked" as different observations.
+    await run(24, 13, { quotesAttempted: null, quotesOk: null });
+    const s = await summarizeCatalystRuns();
+    const day = s.quoteCoverageBySession.find((c) => c.session === '2026-08-24');
+    expect(day?.quoteCoverage).toBeNull();
+    expect(day?.belowFloor).toBeNull();
+    expect(day?.quotesAttempted).toBeNull();
+    expect(s.sessionsDegraded).toBe(0);
+    expect(s.sessionsQuoteMeasured).toBe(0);
+  });
+
+  it('counts a quiet news day as MEASURED even though it has no ratio', async () => {
+    // `quotesAttempted: 0` — nothing mapped, nothing to price. The writer DID
+    // look, so it belongs in `sessionsQuoteMeasured`; there is simply no ratio
+    // to divide. Keying that count off the coverage map instead would
+    // under-report the telemetry and make a quiet day look like a legacy row.
+    await run(24, 13, { outcome: 'no_mapped_candidates', quotesAttempted: 0, quotesOk: 0 });
+    const s = await summarizeCatalystRuns();
+    expect(s.sessionsQuoteMeasured).toBe(1);
+    const day = s.quoteCoverageBySession.find((c) => c.session === '2026-08-24');
+    expect(day?.quoteCoverage).toBeNull();
+    expect(day?.belowFloor).toBeNull();
+    expect(s.sessionsDegraded).toBe(0);
+    expect(s.sessionsEligible).toBe(1);
+  });
+
+  it('covers every session in the partition, one entry each', async () => {
+    await run(24, 13);
+    await run(24, 14);
+    await run(25, 13, { quotesAttempted: 19, quotesOk: 5 });
+    const s = await summarizeCatalystRuns();
+    expect(s.quoteCoverageBySession.map((c) => c.session)).toEqual(['2026-08-24', '2026-08-25']);
+    expect(s.quoteCoverageBySession).toHaveLength(s.sessionsTotal);
   });
 });
