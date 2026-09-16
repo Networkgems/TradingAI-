@@ -384,3 +384,82 @@ test('a TIE on one axis attributes the row to the FIRST sample that attained it'
   assert.equal(s.peakAxesAgree, true, 'and the row IS one moment: 58.5% of $313 is $183');
   assert.equal(s.maxContractUsd, 183);
 });
+
+// ── The FLAT-session split (fifth softness axis) ──────────────────────────────
+// ⚠ THE CONTROL HERE IS THE THIRD TEST, and it is why the other two are not
+// enough. A fold that computed `perSessionHolding` as an ALIAS of `perSession`
+// passes every quantile assertion on a tape whose sessions all held positions,
+// and passes the census assertions too. Only a tape that MIXES flat and held
+// sessions can tell the two folds apart, and that mixed tape is the live one.
+
+test('a FLAT session is a real observation: in the denominator, and named as flat', () => {
+  const f = foldTape([
+    sample({ session: '2026-09-09', slot: 'mid', at: '2026-09-09T17:04:00.000Z',
+      status: 'empty', fleetAtRiskUsd: 0, distinctContracts: 0,
+      maxContract: null, maxUnderlying: null }),
+  ]);
+  assert.equal(f.census.sessionsObserved, 1, 'a flat fleet is an observation, not a refusal');
+  assert.equal(f.census.samplesGraded, 1);
+  assert.equal(f.census.sessionsFlat, 1);
+  assert.equal(f.census.sessionsHoldingPositions, 0);
+  assert.equal(f.sessions[0].holdsPositions, false);
+  // The 0 is real and stays in the row -- it must not be rendered as n/a.
+  assert.equal(f.sessions[0].maxContractShare, 0);
+  assert.equal(f.perSession.maxContract.quantiles.p50, 0);
+  const md = renderReport(f);
+  assert.match(md, /FLAT/, 'the reader must see WHY the row is 0, not infer it from `empty`');
+  assert.match(md, /no conditional row to compare/,
+    'a tape with no held session carries no reading of concentration at all');
+});
+
+test('one `measured` sample makes the whole session non-flat', () => {
+  // The 08-24 shape: flat at the open, a fill inside the window. A session
+  // graded flat because its FIRST sample was empty would drop a real reading
+  // out of the conditional population.
+  const f = foldTape([
+    sample({ session: '2026-09-01', slot: 'open', at: '2026-09-01T13:35:00.000Z',
+      status: 'empty', fleetAtRiskUsd: 0, distinctContracts: 0,
+      maxContract: null, maxUnderlying: null }),
+    sample({ session: '2026-09-01', slot: 'mid', at: '2026-09-01T16:37:00.000Z' }),
+  ]);
+  assert.equal(f.census.sessionsFlat, 0);
+  assert.equal(f.census.sessionsHoldingPositions, 1);
+  assert.equal(f.sessions[0].holdsPositions, true);
+  assert.doesNotMatch(renderReport(f), /session\(s\) were FLAT/,
+    'no flat session => the dilution sentence must NOT be narrated');
+});
+
+test('CONTROL — the HELD-POSITIONS rows are NOT an alias of the pooled rows', () => {
+  // Two flat sessions and two held ones. Pooled p50 is dragged to 0 by the
+  // flats; conditional p50 is the midpoint of the two real peaks. A fold that
+  // aliased the two would report the SAME p50 twice.
+  const flat = s => sample({ session: s, slot: 'mid', at: `${s}T16:30:00.000Z`,
+    status: 'empty', fleetAtRiskUsd: 0, distinctContracts: 0,
+    maxContract: null, maxUnderlying: null });
+  const held = (s, share, usd) => sample({ session: s, slot: 'mid', at: `${s}T16:30:00.000Z`,
+    fleetAtRiskUsd: usd / share,
+    maxContract: { key: 'AAA261002C00010000', atRiskUsd: usd, contracts: 1, books: ['admin'], bookCount: 1, shareOfFleetAtRisk: share },
+    maxUnderlying: { key: 'AAA', atRiskUsd: usd, contracts: 1, books: ['admin'], bookCount: 1, shareOfFleetAtRisk: share } });
+  const f = foldTape([
+    flat('2026-09-09'), flat('2026-09-10'),
+    held('2026-08-26', 0.3, 100), held('2026-09-01', 0.6, 200),
+  ]);
+  assert.equal(f.census.sessionsObserved, 4);
+  assert.equal(f.census.sessionsFlat, 2);
+  assert.equal(f.census.sessionsHoldingPositions, 2);
+  // Pooled: [0, 0, 0.3, 0.6] -> p50 = 0.15. Conditional: [0.3, 0.6] -> 0.45.
+  assert.equal(f.perSession.maxContract.n, 4);
+  assert.equal(f.perSession.maxContract.quantiles.p50, 0.15);
+  assert.equal(f.perSessionHolding.maxContract.n, 2);
+  assert.ok(Math.abs(f.perSessionHolding.maxContract.quantiles.p50 - 0.45) < 1e-9);
+  assert.notEqual(f.perSessionHolding.maxContract.quantiles.p50,
+    f.perSession.maxContract.quantiles.p50, 'conditional rows must not alias pooled rows');
+  // Same on the dollar axis -- the axis a ceiling is actually set in.
+  assert.equal(f.perSession.maxContractUsd.quantiles.p50, 50);
+  assert.equal(f.perSessionHolding.maxContractUsd.quantiles.p50, 150);
+  const md = renderReport(f);
+  assert.match(md, /HELD-POSITIONS sessions only/);
+  assert.match(md, /2 of 4 observed session\(s\) were FLAT/);
+  // The flats are STILL in the pooled rows -- the fix must not delete them.
+  assert.match(md, /per SESSION peak\D+\| 4 \|/);
+});

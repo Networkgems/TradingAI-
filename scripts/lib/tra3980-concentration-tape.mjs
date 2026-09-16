@@ -240,6 +240,11 @@ export function foldTape(lines) {
         maxContractShareAt: null, maxContractUsdAt: null,
         maxUnderlyingShareAt: null, maxUnderlyingUsdAt: null,
         distinctContracts: null, statuses: new Set(), pins: new Set(),
+        // ⛔ ANY `measured` sample makes the session non-flat. NOT "every
+        // sample": the 08-24 event opened INSIDE one window, so a session whose
+        // first sample is `empty` and whose second is `measured` held positions
+        // that day and must not be counted as a flat zero.
+        holdsPositions: false,
       });
     }
     const g = sessions.get(key);
@@ -248,6 +253,7 @@ export function foldTape(lines) {
     if (s.concentrationIsLowerBound === true) g.lowerBound += 1;
     if (isAfterSessionOpen(s)) g.afterOpen += 1;
     g.statuses.add(s.status);
+    if (s.status === 'measured') g.holdsPositions = true;
     if (s.pin?.commit) g.pins.add(`${s.pin.commit}/${s.pin.pid}`);
     const c = shareOf(s, 'contract');
     const u = shareOf(s, 'underlying');
@@ -284,6 +290,25 @@ export function foldTape(lines) {
   const sampleUsd = pick => graded.map(s => dollarsOf(s, pick)).filter(v => v !== null);
   const hardUsd = pick => hard.map(s => dollarsOf(s, pick)).filter(v => v !== null);
   const sessionUsd = pick => sessionList
+    .map(g => (pick === 'contract' ? g.maxContractUsd : g.maxUnderlyingUsd))
+    .filter(v => v !== null);
+
+  // ⚠ A FIFTH SOFTNESS, AND IT PULLS THE OTHER WAY. The four above make a
+  // reading PERMISSIVE (a share is understated, a peak is a floor). This one
+  // makes the DISTRIBUTION look calmer than the mechanism is: a session every
+  // one of whose samples is `empty` held nothing, contributes a legitimate 0 to
+  // every quantile (ticket rule 4 — a flat fleet IS an observation and stays in
+  // the denominator), and in a tape where entry flow is starved those zeroes can
+  // OWN the low half of the distribution. "p50 concentration is 0%" then
+  // describes how often the engine opened anything, not how concentrated it
+  // gets when it does. Both readings are wanted and neither may replace the
+  // other, so the flat sessions stay in every row above and the conditional
+  // distribution is published BESIDE them, never instead of them.
+  const holdingList = sessionList.filter(g => g.holdsPositions);
+  const holdingShares = pick => holdingList
+    .map(g => (pick === 'contract' ? g.maxContractShare : g.maxUnderlyingShare))
+    .filter(v => v !== null);
+  const holdingUsd = pick => holdingList
     .map(g => (pick === 'contract' ? g.maxContractUsd : g.maxUnderlyingUsd))
     .filter(v => v !== null);
 
@@ -324,6 +349,12 @@ export function foldTape(lines) {
       samplesAfterOpen: graded.filter(s => isAfterSessionOpen(s)).length,
       sessionsPreOpenOnly: sessionList.filter(g => g.afterOpen === 0).length,
       sessionsCovered: sessionList.filter(g => g.afterOpen > 0).length,
+      // ⚠ A FIFTH AXIS — see the comment on `holdingList`. Flat sessions are IN
+      // every denominator here; this split only says how much of the
+      // distribution is "the engine opened nothing" rather than "the engine
+      // opened something diversified".
+      sessionsFlat: sessionList.filter(g => !g.holdsPositions).length,
+      sessionsHoldingPositions: holdingList.length,
     },
     perSample: {
       maxContract: distribution(sampleShares('contract')),
@@ -342,6 +373,14 @@ export function foldTape(lines) {
       maxContractUsd: distribution(sessionUsd('contract')),
       maxUnderlyingUsd: distribution(sessionUsd('underlying')),
     },
+    // BESIDE `perSession`, never instead of it: the same session peaks with the
+    // flat sessions withheld. n here is `census.sessionsHoldingPositions`.
+    perSessionHolding: {
+      maxContract: distribution(holdingShares('contract')),
+      maxUnderlying: distribution(holdingShares('underlying')),
+      maxContractUsd: distribution(holdingUsd('contract')),
+      maxUnderlyingUsd: distribution(holdingUsd('underlying')),
+    },
     sessions: sessionList.map(g => ({
       session: g.session,
       slots: Array.from(g.slots).sort(),
@@ -350,6 +389,7 @@ export function foldTape(lines) {
       samplesAfterOpen: g.afterOpen,
       // The session peak is soft if nothing looked after the bell rang.
       peakIsSessionLowerBound: g.afterOpen === 0,
+      holdsPositions: g.holdsPositions,
       statuses: Array.from(g.statuses).sort(),
       pins: Array.from(g.pins).sort(),
       maxContractShare: g.maxContractShare,
@@ -442,6 +482,12 @@ export function renderReport(fold, opts = {}) {
   L.push(qLine('`maxUnderlying` share — per sample, HARD only', fold.perSample.maxUnderlyingHardOnly));
   L.push(qLine('`maxContract` share — per SESSION peak', fold.perSession.maxContract));
   L.push(qLine('`maxUnderlying` share — per SESSION peak', fold.perSession.maxUnderlying));
+  if (c.sessionsFlat > 0 && c.sessionsHoldingPositions > 0) {
+    L.push(qLine('`maxContract` share — per SESSION peak, HELD-POSITIONS sessions only',
+      fold.perSessionHolding.maxContract));
+    L.push(qLine('`maxUnderlying` share — per SESSION peak, HELD-POSITIONS sessions only',
+      fold.perSessionHolding.maxUnderlying));
+  }
   L.push('');
   // AC2 amendment (CEO, TRA-3703 `6245c427`): the DOLLAR axis beside the share
   // axis, same samples, same census. A share ceiling's dollar bite is
@@ -459,6 +505,30 @@ export function renderReport(fold, opts = {}) {
   L.push(qLine('`maxUnderlying.atRiskUsd` — per sample, HARD only', fold.perSample.maxUnderlyingUsdHardOnly, usd));
   L.push(qLine('`maxContract.atRiskUsd` — per SESSION peak', fold.perSession.maxContractUsd, usd));
   L.push(qLine('`maxUnderlying.atRiskUsd` — per SESSION peak', fold.perSession.maxUnderlyingUsd, usd));
+  if (c.sessionsFlat > 0 && c.sessionsHoldingPositions > 0) {
+    L.push(qLine('`maxContract.atRiskUsd` — per SESSION peak, HELD-POSITIONS sessions only',
+      fold.perSessionHolding.maxContractUsd, usd));
+    L.push(qLine('`maxUnderlying.atRiskUsd` — per SESSION peak, HELD-POSITIONS sessions only',
+      fold.perSessionHolding.maxUnderlyingUsd, usd));
+  }
+  // ⚠ Emitted ONLY when the tape actually mixes flat and held sessions. A
+  // sentence narrated unconditionally would tell a reader of an all-held tape
+  // that its quantiles were diluted by zeroes that are not there — the same
+  // inversion the soft-census sentence had to be guarded against.
+  if (c.sessionsFlat > 0) {
+    L.push('');
+    L.push(`⚠ **${c.sessionsFlat} of ${c.sessionsObserved} observed session(s) were FLAT** — every `
+      + 'sample `empty`, the fleet held nothing. Those sessions contribute a real `0%`/`$0` to '
+      + 'every per-SESSION row above and belong there (a flat fleet is an observation, not a '
+      + 'refusal). But they measure HOW OFTEN THE ENGINE OPENED ANYTHING, not how concentrated it '
+      + 'gets when it does, and they own the low half of the distribution: the per-session p0–p50 '
+      + `here is a statement about entry flow. ${c.sessionsHoldingPositions > 0
+        ? 'The HELD-POSITIONS rows are the same peaks with the flat sessions withheld — that is '
+          + 'the population a ceiling would actually bind. Read BOTH: the full rows say how often '
+          + 'the hazard is reachable, the held rows say how big it gets.'
+        : 'NO session in this tape held a position, so there is no conditional row to compare '
+          + 'against and the tape carries no reading of concentration at all.'}`);
+  }
   L.push('');
   L.push(`#### Multi-book contracts — the hazard (${fold.multiBook.sessions} of `
     + `${c.sessionsObserved} sessions)`);
@@ -490,7 +560,11 @@ export function renderReport(fold, opts = {}) {
     // a reader recovers a fleet size by dividing peak-$ by peak-share and gets
     // a number no probe ever saw.
     const split = s.peakAxesAgree === false ? ' †' : '';
-    L.push(`| ${s.session} | ${s.slots.join(',') || '-'} | ${s.samples} | `
+    // `FLAT` names why a 0.0%/$0 row is 0 — a reader must not have to infer it
+    // from the statuses column that the zero is an empty fleet rather than a
+    // diversified one.
+    const flat = s.holdsPositions ? '' : ' FLAT';
+    L.push(`| ${s.session}${flat} | ${s.slots.join(',') || '-'} | ${s.samples} | `
       + `${s.samplesAfterOpen}${s.peakIsSessionLowerBound ? ' ⚠' : ''} | `
       + `${s.lowerBoundSamples} | ${s.statuses.join(',')} | `
       + `${s.distinctContracts ?? 'n/a'} | ${pct(s.maxContractShare)}${soft}${split} | `

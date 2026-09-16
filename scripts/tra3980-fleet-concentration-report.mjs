@@ -76,6 +76,24 @@ if (c.sessionsObserved > 0 && c.sessionsPreOpenOnly > 0) {
 } else if (c.sessionsObserved > 0) {
   verdict.push(`✅ All ${c.sessionsObserved} observed session(s) were sampled at or after the open.`);
 }
+// ⭐ A FIFTH, AND THE ONLY ONE THAT BIASES THE DISTRIBUTION *DOWN*. The four
+// above all make a reading look SAFER than it is by understating a share or a
+// peak. This one is about the population: flat sessions are legitimately in the
+// denominator, but they answer "did the engine open anything" and a board
+// reading the pooled p50 will hear "concentration is typically nil" when what
+// the tape says is "the engine typically opened nothing". State the split and
+// the conditional n, so the strength claim below is scoped to the sessions that
+// could have exhibited concentration at all.
+if (c.sessionsFlat > 0) {
+  verdict.push(`⚠ **${c.sessionsFlat}/${c.sessionsObserved} observed session(s) were FLAT** `
+    + '(every sample `empty` — the fleet held nothing). They are correctly IN the denominator, '
+    + `but only **${c.sessionsHoldingPositions}** session(s) held a position and could exhibit `
+    + 'concentration at all. The pooled per-session p0–p50 is therefore a reading of ENTRY FLOW, '
+    + 'not of concentration; the HELD-POSITIONS rows are the population a ceiling would bind.');
+} else if (c.sessionsObserved > 0) {
+  verdict.push(`✅ All ${c.sessionsObserved} observed session(s) held at least one position — no `
+    + 'flat session dilutes the per-session rows.');
+}
 if (fold.multiBook.sessions > 0) {
   verdict.push(`🔴 **The hazard reproduced in ${fold.multiBook.sessions} of `
     + `${c.sessionsObserved} observed session(s)** — one contract held by more than one `
@@ -102,6 +120,18 @@ console.log(renderReport(fold, {
         + (c.sessionsPreOpenOnly > 0
           ? ` ⚠ Qualified: ${c.sessionsPreOpenOnly} of those sessions were sampled only pre-open `
             + '(see the coverage line above), so the per-SESSION rows are floors for those days.'
+          : '')
+        // ⛔ AC1's floor counts SESSIONS, and a flat session is a valid one — so
+        // the floor can be met on a tape carrying very few readings OF
+        // CONCENTRATION. Say the conditional n on the same line as the strength
+        // claim; a qualification further up the report is one a board member
+        // quoting this sentence will not carry with them.
+        + (c.sessionsFlat > 0
+          ? ` ⚠ Qualified on n: AC1's floor counts sessions and ${c.sessionsFlat} of the `
+            + `${c.sessionsObserved} were FLAT, so the calibration population is `
+            + `**${c.sessionsHoldingPositions} session(s)**, not ${c.sessionsObserved}. The tape `
+            + 'establishes that concentration is REACHABLE at the observed levels; it is thin '
+            + 'evidence for where in that range a value belongs.'
           : '')
       : '**The observation is NOT yet strong enough to carry a ceiling decision.** '
         + 'No value is proposed and none should be inferred from the rows above.',
