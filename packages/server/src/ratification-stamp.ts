@@ -22,13 +22,23 @@
 //     is precisely a comparison nobody performs, so the ROUTE computes it and
 //     publishes the VERDICT. The echoed values sit beside it as evidence, not as
 //     the deliverable.
-//   • THE TRI-STATE IS LOAD-BEARING. `matchesLive` is `true | false |
-//     'unstamped'`. An absent stamp is UNKNOWN, never `true` — a stamp that
-//     defaults to OK reproduces the original defect one layer up, which is the
-//     entire failure mode of the field it is fixing.
+//   • THE TRI-STATE IS LOAD-BEARING. `matchesLive` is `true | false | null`. An
+//     absent stamp is UNKNOWN, never `true` — a stamp that defaults to OK
+//     reproduces the original defect one layer up, which is the entire failure
+//     mode of the field it is fixing.
+//   • THE UNKNOWN STATE IS `null`, AND ITS FALSINESS IS THE POINT (TRA-4619,
+//     ruling B on TRA-4606). It used to render as the string `'unstamped'`, which
+//     is NON-EMPTY and therefore TRUTHY: a reader writing the obvious
+//     `if (stamp.matchesLive) { /* authorized */ }` PASSED on an unstamped bar,
+//     and `if (!stamp.matchesLive) { /* alarm */ }` silently SKIPPED it. The
+//     `note` said "This is NOT a pass" in English while the field said the
+//     opposite in JavaScript. `null` is falsy, so both sloppy idioms now fail
+//     safe; `=== true` / `=== false` readers are unaffected. The self-describing
+//     token moved to `reason: 'unstamped'`, which is where a human-readable state
+//     name belongs — a verdict field should not carry one.
 //   • EVERY UNCERTAIN BRANCH LANDS ON NOT-`true`. A stamp that is set but does
-//     not parse reads `false`, not `unstamped` and never `true`: the operator set
-//     a value and believes something is in force, so the loud state is correct.
+//     not parse reads `false`, not `null` and never `true`: the operator set a
+//     value and believes something is in force, so the loud state is correct.
 //     (Same discrimination as `env_invalid` vs `default` in
 //     `otm-live-universe-flag.ts` — both yield a verdict, only one means "nobody
 //     tried".)
@@ -88,20 +98,30 @@ export const OPTION_COST_GATE_SAFETY_MARGIN_R_RATIFIED_VAR = 'OPTION_COST_GATE_S
 export const OPTION_COST_GATE_SAFETY_MARGIN_R_RATIFIED_BY_VAR = 'OPTION_COST_GATE_SAFETY_MARGIN_R_RATIFIED_BY';
 
 /**
- * The published verdict. `'unstamped'` is a THIRD state, not a falsy `false` and
- * emphatically not `true`: the var is absent, so authorization is UNKNOWN.
+ * The published verdict. `null` is a THIRD state — UNKNOWN, because the var is
+ * absent — and is emphatically not `true`. It is DELIBERATELY FALSY (TRA-4619):
+ * ⛔ do NOT widen this union back to include `'unstamped'` or any other string.
+ * A non-empty string is truthy, so `if (matchesLive)` would authorize on an
+ * unstamped bar. The state's NAME lives on {@link RatificationReason}; this field
+ * carries only the verdict. Narrowing is also what makes `tsc` (TS2367) find
+ * every reader still comparing against the old string literal.
  */
-export type RatificationVerdict = boolean | 'unstamped';
+export type RatificationVerdict = boolean | null;
 
 /** Why {@link RatificationVerdict} reads the way it does — a mismatch and a malformed stamp are both `false`. */
 export type RatificationReason =
-  /** Var absent or blank ⇒ `matchesLive: 'unstamped'`. */
-  | 'absent'
+  /**
+   * Var absent or blank ⇒ `matchesLive: null`. This token is the ONLY
+   * self-describing name for the UNKNOWN state now that the verdict is `null`
+   * (TRA-4619, restoring TRA-4258 constraint 1): `'absent'` standing alone did
+   * not say absent *what*.
+   */
+  | 'unstamped'
   /** Stamp parsed and equals the live value. */
   | 'match'
   /** Stamp parsed and differs from the live value. */
   | 'mismatch'
-  /** Var is SET but unparseable — never `unstamped` (somebody tried) and never `true`. */
+  /** Var is SET but unparseable — never `null`/unstamped (somebody tried) and never `true`. */
   | 'unparseable';
 
 export interface RatificationStamp {
@@ -113,7 +133,12 @@ export interface RatificationStamp {
   raw: string | null;
   /** Free-text provenance (interaction id / issue key), or null when unset. */
   ratifiedBy: string | null;
-  /** ⭐ THE FIELD TO READ. `true` | `false` | `'unstamped'`. An unset stamp is NEVER `true`. */
+  /**
+   * ⭐ THE FIELD TO READ. `true` | `false` | `null`. An unset stamp is `null` —
+   * UNKNOWN — and NEVER `true`. `null` is falsy on purpose (TRA-4619), so
+   * `if (matchesLive)` fails closed on an unstamped bar; read {@link reason} for
+   * WHICH not-`true` state you are in.
+   */
   matchesLive: RatificationVerdict;
   /** The discriminator behind a `false`: a real mismatch and an unparseable stamp are different operator problems. */
   reason: RatificationReason;
@@ -198,8 +223,8 @@ export function resolveLiveOtmUniverseRatification(
   if (raw === null) {
     return {
       ...base,
-      matchesLive: 'unstamped',
-      reason: 'absent',
+      matchesLive: null,
+      reason: 'unstamped',
       ratifiedSymbols: null,
       ratifiedRestricted: null,
       onlyLive: [],
@@ -246,7 +271,7 @@ export function resolveLiveOtmUniverseRatification(
       onlyRatified: [],
       note:
         `UNPARSEABLE STAMP: ${OPTION_LIVE_OTM_UNIVERSE_RATIFIED_VAR}=${JSON.stringify(raw)} parses to zero symbols. ` +
-        `Reported as NOT MATCHING (never 'unstamped', never true) — the var is SET, so an operator believes a ` +
+        `Reported as NOT MATCHING (never null/unstamped, never true) — the var is SET, so an operator believes a ` +
         `ratification is published, and the live universe [${liveSymbols.join(',')}] is ungraded.`,
     };
   }
@@ -350,8 +375,8 @@ export function resolveNumericRatification(
   if (raw === null) {
     return {
       ...base,
-      matchesLive: 'unstamped',
-      reason: 'absent',
+      matchesLive: null,
+      reason: 'unstamped',
       ratifiedValue: null,
       note:
         `UNSTAMPED — ${varName} is not set, so whether the resolved ${label} of ${liveValue} is board-ratified is ` +
@@ -368,7 +393,7 @@ export function resolveNumericRatification(
       ratifiedValue: null,
       note:
         `UNPARSEABLE STAMP: ${varName}=${JSON.stringify(raw)} is not a finite number. Reported as NOT MATCHING ` +
-        `(never 'unstamped', never true) — the var is SET, so the live ${label} of ${liveValue} is ungraded.`,
+        `(never null/unstamped, never true) — the var is SET, so the live ${label} of ${liveValue} is ungraded.`,
     };
   }
 
@@ -394,13 +419,15 @@ export function resolveNumericRatification(
 
 /**
  * Fold several stamps into one field a reader can check without walking the
- * payload. Same tri-state, and the fold is FAIL-LOUD: any `false` ⇒ `false`;
- * otherwise any `'unstamped'` ⇒ `'unstamped'`; `true` only when EVERY stamp
- * matched. An empty input is `'unstamped'` — "nothing to check" is not a pass.
+ * payload. Same tri-state, and the fold is FAIL-LOUD with PRECEDENCE UNCHANGED by
+ * TRA-4619: any `false` ⇒ `false`; otherwise any `null` ⇒ `null`; `true` only
+ * when EVERY stamp matched. A real mismatch therefore still OUTRANKS an unknown.
+ * An empty input is `null` — "nothing to check" is not a pass, and being falsy it
+ * cannot be mistaken for one.
  */
 export function foldRatificationVerdicts(verdicts: readonly RatificationVerdict[]): RatificationVerdict {
-  if (verdicts.length === 0) return 'unstamped';
+  if (verdicts.length === 0) return null;
   if (verdicts.some((v) => v === false)) return false;
-  if (verdicts.some((v) => v === 'unstamped')) return 'unstamped';
+  if (verdicts.some((v) => v === null)) return null;
   return true;
 }
