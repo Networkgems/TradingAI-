@@ -774,14 +774,100 @@ export function readOtmEntryAccrual(): OtmEntryAccrual | null {
   }
 }
 
+// ── TRA-4610 — can the population still be REACHED? ─────────────────────────
+//
+// The entry-gate clause above answers "can an order be placed inside the
+// session". That is ONE case of the general predicate, not the predicate.
+//
+// A window is equally starved when the cell it is pinned to is no longer
+// NOMINATED. `populationCell` is frozen at the stamp — floor band ∩ armed
+// selector band AT THAT INSTANT — and both of those are live env knobs that
+// have moved since. Measured on prod `f8f7b1855da0` 2026-09-16: the cell was
+// frozen at [0.50, 0.55) on 2026-08-23 while the armed
+// `ENABLE_OTM_ADMISSIBLE_STRIKE_SELECT` band read [0.25, 0.40) — disjoint by
+// 0.095 — and of 640 candidates evaluated that etDay, `cost_bar.byCell` put
+// 365 in 0.30–0.40 and 275 in 0.20–0.30 and **zero** in the window's own cell.
+// Meanwhile `entry_window` had re-opened (blockRate 1.00 → 0.62), so the
+// TRA-4345 clause released and the record advertised `canAccrue: true` with
+// `projectedSessionsToTarget: 42` — a runway it cannot walk. An `n` that cannot
+// arrive is the most expensive thing this record can tell a reader to wait for.
+//
+// Computed at read time off the LIVE armed band and never stored: the frozen
+// cell is the window's pre-registration and must not move, but whether that
+// cell is still reachable is a property of today's wire.
+
+export interface OtmPopulationReach {
+  /** TRUE ⇒ the frozen cell can still be nominated. FALSE ⇒ the bands are disjoint. `null` ⇒ unreadable. */
+  reachable: boolean | null;
+  /** The cell's EFFECTIVE half-open membership interval, tolerance included — the same one `entryDeltaInCell` admits on. */
+  cellBand: [number, number] | null;
+  /** The live armed nominator band ([min, max)); `null` when unreadable or before the cell is stamped. */
+  armedSelectorBand: [number, number] | null;
+  /** Machine-greppable cause, `null` when `reachable` is true. */
+  reason: string | null;
+  method: string;
+}
+
+const OTM_POPULATION_REACH_METHOD =
+  'the cell\'s OWN membership interval [deltaAbsMin - tolerance, deltaAbsMax + tolerance) against the LIVE armed selector band [min, max); two half-open intervals intersect iff lo < selectorMax AND selectorMin < hi. Read at record-build time off the live band - the FROZEN cell never moves. NOT the same predicate as `nominationBandIntersects`, which compares the LIVE floor band to the LIVE selector band and says nothing about the frozen cell. Non-binding before a cell is stamped (there is no cell to starve); an unreadable band reads `null` and the cadence fails CLOSED on it, never open.';
+
+/**
+ * TRA-4610 — is the FROZEN population cell still inside the LIVE armed
+ * nominator band? Pure, so the test can build either side.
+ *
+ * Uses the tolerance-widened interval deliberately: a close is COUNTED iff
+ * {@link entryDeltaInCell} admits it, so reachability has to be asked on the
+ * same interval the fold admits on, or the two disagree at the edge.
+ */
+export function assessOtmPopulationReach(
+  cell: Pick<OtmEvaluationPopulationCell, 'deltaAbsMin' | 'deltaAbsMax' | 'tolerance'> | null,
+  armedSelectorBand: readonly [number, number] | null | undefined,
+): OtmPopulationReach {
+  const method = OTM_POPULATION_REACH_METHOD;
+  // No cell stamped yet ⇒ this clause cannot bind. A fresh successor window
+  // must never read `canAccrue: false` for want of a cell it has not cut.
+  if (cell === null) {
+    return { reachable: true, cellBand: null, armedSelectorBand: null, reason: null, method };
+  }
+  const lo = cell.deltaAbsMin - cell.tolerance;
+  const hi = cell.deltaAbsMax + cell.tolerance;
+  const cellBand: [number, number] = [round6(lo), round6(hi)];
+  const sb = armedSelectorBand;
+  if (!sb || !Number.isFinite(sb[0]) || !Number.isFinite(sb[1])) {
+    return { reachable: null, cellBand, armedSelectorBand: null, reason: 'armed_selector_band_unreadable', method };
+  }
+  const reachable = lo < sb[1] && sb[0] < hi;
+  return {
+    reachable,
+    cellBand,
+    armedSelectorBand: [sb[0], sb[1]],
+    reason: reachable ? null : 'population_cell_outside_armed_selector_band',
+    method,
+  };
+}
+
 export interface OtmEvaluationCadence {
   asOf: string;
   /** ET weekdays whose 16:00 ET close is at or before `asOf`, since the stamp. */
   rthSessionsElapsed: number;
   closesPerSession: number | null;
-  /** TRA-4345 — FALSE ⇒ the entry gate is structurally shut and the forward rate is 0, whatever `closesPerSession` says. */
+  /**
+   * FALSE ⇒ the forward close rate is structurally 0, whatever `closesPerSession` says.
+   *
+   * TRA-4345 introduced this on the entry-gate clause alone. TRA-4610 made it
+   * the CONJUNCTION of every accrual clause: the entry gate opening is
+   * necessary, not sufficient — the cell also has to be reachable by the armed
+   * nominator. See {@link blockers}.
+   */
   canAccrue: boolean;
+  /** The FIRST blocking clause, entry gate first. `null` when `canAccrue` is true. */
   cannotAccrueReason: string | null;
+  /**
+   * TRA-4610 — EVERY blocking clause, so one starving gate can never hide
+   * behind another (TRA-3926: two gates on one row must agree, and a single
+   * reason string cannot say that they do not). Empty ⇒ accruing.
+   */
+  blockers: string[];
   /** `null` when the rate is zero OR when `canAccrue` is false — at that pace the window NEVER reaches target; never `0`. */
   projectedSessionsToTarget: number | null;
   method: string;
@@ -801,6 +887,13 @@ export function otmEvaluationCadence(
   asOf: number,
   /** TRA-4345 — read-time entry-gate accrual; `null` = unreadable ⇒ fail closed (no ETA). */
   accrual: OtmEntryAccrual | null = readOtmEntryAccrual(),
+  /**
+   * TRA-4610 — read-time cell reachability. `null` = clause NOT EVALUATED this
+   * beat (non-binding, back-compat for callers predating TRA-4610), which is a
+   * different thing from `reach.reachable === null` = evaluated and UNREADABLE,
+   * which fails CLOSED.
+   */
+  reach: OtmPopulationReach | null = null,
 ): OtmEvaluationCadence | null {
   if (state.startedAt === null || !Number.isFinite(asOf) || asOf < state.startedAt) return null;
   const startDay = etDay(state.startedAt);
@@ -827,18 +920,34 @@ export function otmEvaluationCadence(
   // entry gate cannot open inside the session the remaining closes cannot be
   // produced, so the projection is `null` ("never at this pace"), not a number.
   // A reached target (`remaining === 0`) still reads 0 — nothing left to accrue.
-  const canAccrue = accrual !== null && accrual.canAccrue;
+  // TRA-4610 — the CONJUNCTION of every accrual clause. Precedence in
+  // `cannotAccrueReason` keeps the entry gate first so TRA-4345's reason string
+  // is unchanged where that clause is the one biting; `blockers` carries the
+  // rest, because a reader deciding whether to wait needs to know that fixing
+  // the named gate would not start the population moving.
+  const entryBlocker = accrual === null
+    ? 'entry_window_state_unreadable'
+    : accrual.canAccrue ? null : (accrual.cannotAccrueReason ?? 'entry_window_never_intersects_rth');
+  // `reach === null` = not evaluated ⇒ non-binding. `reachable !== true`
+  // (false OR unreadable) ⇒ blocking: an unreadable nominator band must never
+  // buy the record a runway it cannot demonstrate.
+  const reachBlocker = reach === null || reach.reachable === true
+    ? null
+    : (reach.reason ?? 'population_cell_outside_armed_selector_band');
+  const blockers = [entryBlocker, reachBlocker].filter((b): b is string => b !== null);
+  const canAccrue = blockers.length === 0;
   return {
     asOf: new Date(asOf).toISOString(),
     rthSessionsElapsed: sessions,
     closesPerSession: rate === null ? null : round6(rate),
     canAccrue,
-    cannotAccrueReason: accrual === null ? 'entry_window_state_unreadable' : accrual.cannotAccrueReason,
+    cannotAccrueReason: blockers[0] ?? null,
+    blockers,
     projectedSessionsToTarget:
       remaining === 0 ? 0
         : !canAccrue ? null
           : rate !== null && rate > 0 ? Math.ceil(remaining / rate) : null,
-    method: 'an ET weekday counts once its 16:00 ET close is at or before asOf; the stamp day only if the window opened before that close; holidays NOT subtracted (biases the projection HIGH, the conservative direction); projectedSessionsToTarget = ceil((target - n) / closesPerSession), null on a zero rate AND null when canAccrue is false (TRA-4345: the entry gate cannot open inside the session, so the forward rate is 0 whatever the average says)',
+    method: 'an ET weekday counts once its 16:00 ET close is at or before asOf; the stamp day only if the window opened before that close; holidays NOT subtracted (biases the projection HIGH, the conservative direction); projectedSessionsToTarget = ceil((target - n) / closesPerSession), null on a zero rate AND null when canAccrue is false. canAccrue is the CONJUNCTION of every accrual clause (TRA-4610), not the entry gate alone: (1) TRA-4345 - a configured entry window must intersect the 09:30-16:00 ET session, and (2) TRA-4610 - the frozen populationCell must still intersect the LIVE armed nominator band, or no candidate is ever nominated into the cell the window counts. Clause 1 opening does NOT imply accrual; see `blockers` for every clause that is shut and `populationReach` for clause 2\'s two bands.',
   };
 }
 
@@ -1369,13 +1478,34 @@ export function buildOtmEvaluationWindowRecord(
   /** The ruled-re-cut previews, computed off the journal by the caller. `null`
    * ⇒ not computed in this beat, never "computed and empty". */
   recutPreviews: ReadonlyArray<OtmEvaluationRecutPreview | null> | null = null,
+  /**
+   * TRA-4610 — the LIVE armed nominator band (`ENABLE_OTM_ADMISSIBLE_STRIKE_SELECT`).
+   * `undefined` ⇒ the reach clause is not evaluated this beat (non-binding, so
+   * every pre-TRA-4610 caller keeps its behaviour); `null` ⇒ evaluated and
+   * UNREADABLE, which fails closed.
+   */
+  armedSelectorBand?: readonly [number, number] | null,
 ) {
   const status = otmEvaluationWindowStatus(state);
+  // TRA-4610 — the SECOND accrual clause. Computed off the live band in this
+  // beat against the frozen cell; never stored, never allowed to move the cell.
+  const populationReach = armedSelectorBand === undefined
+    ? null
+    : assessOtmPopulationReach(state.populationCell, armedSelectorBand);
   // TRA-4345 AC2 — the accused gate is `entry_window`; "still blocking" is the
   // structural predicate (no configured window intersects RTH), computed off
   // live state in this beat, never stored.
   const observedGateStillBlocking: boolean | null =
     entryAccrual === null ? null : entryAccrual.canAccrue === false;
+  // Hoisted (TRA-4610) so `insufficientPopulation` can name the clause that is
+  // starving the window RIGHT NOW without recomputing the fold. Deliberately
+  // NOT folded into `observedGateStillBlocking` above: that field is scoped to
+  // the ACCUSED gate (`entry_window`), which has genuinely cleared, and
+  // widening it would erase the honest "your diagnosis is stale" signal the
+  // record is currently emitting correctly.
+  const cadence = otmEvaluationCadence(
+    state, readout.n, state.lastTickAt ?? state.startedAt ?? Number.NaN, entryAccrual, populationReach,
+  );
   return {
     issue: 'TRA-3945',
     windowId: state.windowId,
@@ -1399,6 +1529,22 @@ export function buildOtmEvaluationWindowRecord(
       reEvaluatedEveryTick: true as const,
     },
     nominationBandIntersects,
+    /**
+     * TRA-4610 — say WHICH two bands that boolean compares, on the record.
+     *
+     * It is a LIVE-floor ∩ LIVE-selector read (`otmContractFloorBandIntersects`
+     * over `resolveAdmissibleBand`), and both of those bands move. It has never
+     * been a statement about the frozen `populationCell` sitting beside it, and
+     * on 2026-09-16 it read `true` (live floor [0.25, 0.40] ∩ live selector
+     * [0.25, 0.40]) while the frozen cell [0.50, 0.55) was unreachable — the
+     * two are about different band PAIRS, both true, and the unlabelled field
+     * invited exactly the wrong reading. `populationReach` is the one that
+     * answers "can this window's cell still be nominated".
+     */
+    nominationBandIntersectsMethod:
+      'LIVE floor band (TRA-3944 OTM_CONTRACT_FLOOR_DELTA_MIN/MAX) intersected with the LIVE armed selector band (TRA-3401 ENABLE_OTM_ADMISSIBLE_STRIKE_SELECT), both read THIS beat. NOT a statement about the frozen populationCell, whose own bands were captured at frozenAt and may be disjoint from today\'s - for that read populationReach.reachable.',
+    /** TRA-4610 — is the FROZEN cell still inside the LIVE armed band? `null` ⇒ clause not evaluated this beat. */
+    populationReach,
     startedAt: state.startedAt === null ? null : new Date(state.startedAt).toISOString(),
     startBuild: state.startBuild,
     buildDrift: state.buildDrift.map((s) => ({
@@ -1497,6 +1643,15 @@ export function buildOtmEvaluationWindowRecord(
       observedGateStillBlocking,
       /** TRUE ⇒ the accused gate has CLEARED since `observedAt` — the `observed` diagnosis is superseded; re-diagnose before routing any decision off it. */
       stale: observedGateStillBlocking === null ? null : observedGateStillBlocking === false,
+      /**
+       * TRA-4610 — the clauses starving the population in THIS beat, whatever
+       * the hand-written `observed` note above accuses. `rule` requires that
+       * note to name the gate that starved the population; when `stale` is true
+       * the accused gate is no longer it, and this is where the writer reads
+       * what to name instead. Empty ⇒ nothing structural is blocking accrual
+       * and a `verdict_insufficient_population` would need a different reason.
+       */
+      currentBlockers: cadence?.blockers ?? null,
     },
     // ── TRA-3945 re-cut ─────────────────────────────────────────────────────
     //
@@ -1544,7 +1699,7 @@ export function buildOtmEvaluationWindowRecord(
         preview: recutPreviews?.[i] ?? null,
       })),
     },
-    cadence: otmEvaluationCadence(state, readout.n, state.lastTickAt ?? state.startedAt ?? Number.NaN, entryAccrual),
+    cadence,
     /** TRA-4345 — the effective entry windows the two reads above were computed against, `null` = unreadable. */
     entryAccrual,
     verdictWriter: {
@@ -1736,8 +1891,17 @@ export async function tickOtmEvaluationWindow(args: {
       reason: err instanceof Error ? err.message : String(err),
     });
   }
+  // TRA-4610 — the live armed nominator band travels on the SAME inputs the
+  // liveness predicate and the cell stamp already read, so the reach clause can
+  // never be computed against a band the rest of the record did not see.
+  // `null` (present but unreadable) fails closed; the key is always supplied so
+  // the clause is always evaluated on this path.
+  const sb = args.inputs.otmContractFloor?.selectorBand;
+  const armedSelectorBand: readonly [number, number] | null =
+    sb && Number.isFinite(sb[0]) && Number.isFinite(sb[1]) ? [sb[0], sb[1]] : null;
   return buildOtmEvaluationWindowRecord(
     state, liveness, args.nominationBandIntersects, readout, postPin, readOtmEntryAccrual(), recutPreviews,
+    armedSelectorBand,
   );
 }
 
