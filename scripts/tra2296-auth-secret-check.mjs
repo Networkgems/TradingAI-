@@ -79,11 +79,46 @@ async function api(path) {
 // than the hazard's is not a guard — it is a green light with the failure still
 // live behind it (TRA-2315). Grade with `trim()`, and if auth.ts ever changes how
 // it normalises the value, change this line in the same commit.
-const varsRes = await api(`/services/${SRV}/env-vars?limit=100`);
+//
+// ⛔ AND THE READ MUST BE `'value' in row`, NEVER `row.value ?? ''` (TRA-2403/TRA-2613).
+// This is the same decision `authSecretGateState` already made in render-redeploy.mjs —
+// ported here, not re-derived, because the two scripts must not disagree about what an
+// unreadable value means. An absent field is a fact about the payload you asked for, never
+// about the world: collapsing "the API did not return the value" into "the value is the
+// empty string" manufactures a confident `present but EMPTY` FAIL out of a read failure.
+// Both refuse, so the safety is identical — but only one of them is TRUE, and the operator
+// acts on the message. Unreadable ⇒ BLIND (exit 3), the code line 83 already uses.
+const ENV_VAR_PAGE = 100;
+const varsRes = await api(`/services/${SRV}/env-vars?limit=${ENV_VAR_PAGE}`);
 if (varsRes.__err) finish(3, `BLIND — cannot read env vars: ${varsRes.__err}`);
+if (!Array.isArray(varsRes)) {
+  finish(3, `BLIND — the env-var list came back as ${varsRes === null ? 'null' : typeof varsRes}, not an array, so AUTH_SECRET's value was NOT READ.`);
+}
 const rows = varsRes.map((x) => x.envVar || x);
-const authVar = rows.find((v) => v.key === 'AUTH_SECRET');
-const auth = classifyAuthSecret(authVar ? (authVar.value ?? '') : null);
+const authVar = rows.find((v) => v && v.key === 'AUTH_SECRET') ?? null;
+
+if (!authVar && rows.length >= ENV_VAR_PAGE) {
+  // A CAPPED ENUMERATION CANNOT PROVE AN ABSENCE. This route is a limit-capped list and
+  // this script does not follow its cursor, so a full page means we cannot prove we reached
+  // the end — "AUTH_SECRET is not in the rows I managed to read" is then a fact about the
+  // pagination, not about the service. Same disease as the missing-`value` case, one row over.
+  finish(
+    3,
+    `BLIND — the env-var list came back FULL (${rows.length} rows at limit=${ENV_VAR_PAGE}) and this check does not ` +
+      "follow the cursor, so AUTH_SECRET's absence from them is a fact about the pagination, not about the service.",
+  );
+}
+if (authVar && !('value' in authVar)) {
+  finish(3, 'BLIND — the AUTH_SECRET row carries no `value` key at all, so its value was NOT READ. This is not the same as the value being empty.');
+}
+if (authVar && typeof authVar.value !== 'string') {
+  finish(
+    3,
+    `BLIND — the AUTH_SECRET row's value is ${authVar.value === null ? 'null' : typeof authVar.value}, not a string, ` +
+      'so it was NOT READ as one — the server predicate is defined over strings, so this cannot be graded.',
+  );
+}
+const auth = classifyAuthSecret(authVar ? authVar.value : null);
 
 say(`env AUTH_SECRET : ${auth.detail}${auth.shape === 'SET' ? '' : `  [${auth.shape}]`}`);
 if (!auth.usable) {

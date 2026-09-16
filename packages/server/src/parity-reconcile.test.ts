@@ -334,6 +334,37 @@ describe('summarizeParityReconcile', () => {
     expect(hs.p90).toBeCloseTo(500, 2);
   });
 
+  // TRA-3497 / TRA-2591 ask 3 — A1, the pre-registered acceptance. Asserted as EXACT values
+  // against a synthetic fixture, deliberately NOT against the live corpus (it grows daily, so
+  // today's numbers are not reproducible tomorrow) and deliberately NOT as
+  // `expect(max).toBeGreaterThan(p90)` — `max >= p90` holds for EVERY sample by the definition
+  // of a percentile, so that assertion is unfailable by construction and cannot tell a correct
+  // `max` from `percentile(sorted, 0.95)`.
+  //
+  // `legHalfSpreadBps` is SIGNED (positive = adverse, negative = favourable), so a lone
+  // `Math.max` sees only the adverse tail. The fixture is chosen so |min| = 1000 is 2x
+  // max = 500: a max-only implementation fails this outright rather than passing weakly.
+  it('publishes SIGNED min AND max beside mean/median/p90 — the favourable tail is not invisible', () => {
+    // requestedPx = 1.0 on every leg, so bps = signedCost x 1e4 and the arithmetic is readable.
+    const s = summarizeParityReconcile(
+      [
+        record('covered_call', [
+          leg('buy', 1.0, 1.05), //  buy  fill ABOVE  request → +500 adverse
+          leg('buy', 1.0, 0.9), //   buy  fill BELOW  request → −1000 favourable  ← the tail max cannot see
+          leg('sell', 1.0, 0.99), //  sell fill BELOW  request → +100 adverse
+          leg('sell', 1.0, 1.02), //  sell fill ABOVE  request → −200 favourable
+        ]),
+      ],
+      NOW,
+    );
+    const hs = s.strategies.covered_call.cumulative.halfSpreadBps;
+    // Sorted signed sample: [-1000, -200, 100, 500].
+    // median: rank 1.5 ⇒ −200 + 300×0.5.   p90: rank 2.7 ⇒ 100 + 400×0.7.
+    // Asserted as a WHOLE object so a regression in any single moment is caught, and so an
+    // accidentally-dropped key fails here rather than silently reading `undefined` downstream.
+    expect(hs).toEqual({ mean: -150, median: -50, p90: 380, min: -1000, max: 500 });
+  });
+
   it('buckets etDay separately from cumulative', () => {
     const recs = [
       record('long_call', [leg('buy', 1.0, 1.05), leg('sell', 2.0, 1.9)], { etDay: ET_DAY }),           // today, gap 15
@@ -585,7 +616,13 @@ describe('TRA-2370 — a PRESENT-but-impossible price is nonPhysical, never fold
     expect(s.parityGapUsd.mean).toBeNull();
     expect(s.parityGapUsd.median).toBeNull();
     expect(s.parityGapUsd.p90).toBeNull();
+    expect(s.parityGapUsd.min).toBeNull();
+    expect(s.parityGapUsd.max).toBeNull();
     expect(s.halfSpreadBps.mean).toBeNull();
+    // TRA-3497 A2 — the tails obey the same null discipline. A `0` here would read as "a leg
+    // filled exactly at request", which is a claim about an execution that never happened.
+    expect(s.halfSpreadBps.min).toBeNull();
+    expect(s.halfSpreadBps.max).toBeNull();
   });
 
   it('the ∓10_000 bps leg a 0-fill scores no longer reaches halfSpreadBps', () => {

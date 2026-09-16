@@ -1839,8 +1839,9 @@ export function authSecretGateState(probe, { keyRequired = false } = {}) {
   // you asked for, never about the world: collapsing "the API did not return the value" into
   // "the value is the empty string" manufactures a confident UNUSABLE out of a read failure.
   // Both refuse, so the safety is identical — but only one of them is TRUE, and the operator
-  // acts on the message. (Residual noted on TRA-2387: tra2296-auth-secret-check.mjs still
-  // does the `?? ''` collapse at its check 1.)
+  // acts on the message. (The TRA-2387 residual is CLOSED: tra2296-auth-secret-check.mjs
+  // check 1 carries this same decision as of TRA-2613 — graded by `pnpm check:auth-secret-check1`.
+  // If you change what BLIND means here, change it there in the same commit.)
   if (!('value' in row)) {
     return blind('the AUTH_SECRET row carries no `value` key at all, so its value was not read');
   }

@@ -312,7 +312,21 @@ export interface ParityBucket {
    * next bad fill even if the `nonPhysical` guard does not recognise its shape.
    * Percentiles are over PER-ROUND-TRIP gaps; `null` at `n === 0` — never a fabricated 0.
    */
-  parityGapUsd: { sum: number; mean: number | null; median: number | null; p90: number | null };
+  /**
+   * Signed USD gap per round-trip. `min`/`max` are the SIGNED extremes for the same reason
+   * as `halfSpreadBps` below — a one-tailed summary of a two-tailed signed sample cannot see
+   * a favourable excursion (TRA-3497, the "optional, same function, same argument" half of
+   * TRA-2591 ask 3). The durable daily series projects only `.sum` here (see
+   * `appendParitySnapshotForDay`), so this is not a persisted-shape change.
+   */
+  parityGapUsd: {
+    sum: number;
+    mean: number | null;
+    median: number | null;
+    p90: number | null;
+    min: number | null;
+    max: number | null;
+  };
   /**
    * TRA-2279 D1 — `parityGapUsd.sum / |demoMarkPnlUsd|` as a **RATIO**, not a percent:
    * `0.15` means 15%, `17` would mean 1700%. (The old `gapPct` carried this exact value
@@ -326,7 +340,29 @@ export interface ParityBucket {
     | 'computed'
     | 'no_computable_round_trips'
     | 'denominator_below_materiality_floor';
-  halfSpreadBps: { mean: number | null; median: number | null; p90: number | null };
+  /**
+   * Per-leg half-spread in basis points, SIGNED: positive = adverse fill, negative =
+   * favourable (see the sign construction in `classifyRoundTripParity`). Every statistic
+   * here is computed over those signed values.
+   *
+   * ⛔ BOTH TAILS ARE PUBLISHED, AND `max` ALONE WOULD NOT HAVE BEEN ENOUGH (TRA-2591 ask 3,
+   * scoped on TRA-3497). Because the sample is signed, a lone `Math.max` reports only the
+   * ADVERSE tail and is structurally blind to a favourable excursion of any size. Measured on
+   * the live corpus 2026-08-13 (50 records / 92 computable legs): `covered_call`'s signed max
+   * is 36.90 against its own p90 of 35.01 — 1.05x, i.e. it reads as a bucket with no outlier
+   * at all — while its signed MIN is −210.66, which is the single leg TRA-2591, TRA-2370 and
+   * TRA-2292 were all opened over. A max-only patch closes the ticket and leaves that leg
+   * invisible in the published summary. Do not "simplify" this back to one tail.
+   *
+   * `null` at n === 0 — never a fabricated 0, same 3-valued discipline as the fields above.
+   */
+  halfSpreadBps: {
+    mean: number | null;
+    median: number | null;
+    p90: number | null;
+    min: number | null;
+    max: number | null;
+  };
 }
 
 export interface ParityStrategyEntry {
@@ -432,6 +468,8 @@ function foldBucket(recs: readonly SandboxStrategyRecord[]): ParityBucket {
       mean: n > 0 ? round2(gapSum / n) : null,
       median: round2OrNull(percentile(sortedGaps, 0.5)),
       p90: round2OrNull(percentile(sortedGaps, 0.9)),
+      min: sortedGaps.length > 0 ? round2(sortedGaps[0]) : null,
+      max: sortedGaps.length > 0 ? round2(sortedGaps[sortedGaps.length - 1]) : null,
     },
     gapToDemoMarkRatio: ratioStatus === 'computed' ? round4(gapSum / denom) : null,
     gapToDemoMarkRatioStatus: ratioStatus,
@@ -439,6 +477,11 @@ function foldBucket(recs: readonly SandboxStrategyRecord[]): ParityBucket {
       mean: round2OrNull(hsMean),
       median: round2OrNull(percentile(sorted, 0.5)),
       p90: round2OrNull(percentile(sorted, 0.9)),
+      // Off `sorted`, which is the SIGNED sample in ascending order — so these are the true
+      // signed extremes, not |bps| extremes. `sorted[0]` / `sorted[len-1]` rather than
+      // Math.min/max so a future change to the sample cannot silently desync the two.
+      min: sorted.length > 0 ? round2(sorted[0]) : null,
+      max: sorted.length > 0 ? round2(sorted[sorted.length - 1]) : null,
     },
   };
 }
