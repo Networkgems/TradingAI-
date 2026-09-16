@@ -222,7 +222,29 @@ export const MODELED_H_CALIBRATION = {
   /** Entry-timestamp window of the 140 rows, inclusive. */
   windowUtc: { from: '2026-07-15T13:33:16.188Z', to: '2026-07-21T15:53:13.040Z' },
   n: 140,
-  byStructure: { single_leg_rv: 124, single_leg_otm: 16 },
+  /**
+   * TRA-3697 — the calibration split PER STRUCTURE: row count **and** that structure's own
+   * mean `h`. This is the record {@link MARKETABLE_MTM_H_BY_STRUCTURE} is derived from, which
+   * is why the two numbers live together here rather than as a second table someone has to
+   * keep in step. A structure absent from this object is UNCALIBRATED — see
+   * {@link resolveMarketableMtmH}; it is NOT a structure whose `h` happens to be the pooled
+   * default.
+   *
+   * `hMean` is the **existing TRA-3459 fit** (window {@link MODELED_H_CALIBRATION.windowUtc}),
+   * transcribed from the same measurement that produced `h.mean` — not a refit, and
+   * emphatically not derived from the 07-21→08-13 forward window, which is what GRADES these
+   * numbers. Grading a fit on its own training set is exactly what
+   * `marketable-mtm-demo-journal-basis.ts` refuses as `IN_SAMPLE_COHORT`.
+   *
+   * Self-consistency is a test, not a promise: the n-weighted mean of `hMean` reproduces
+   * `h.mean` — `(0.1428·124 + 0.0752·16) / 140 = 0.13507` vs the published 0.1351. That
+   * identity is asserted in the suite so a future recalibration cannot move one without the
+   * other.
+   */
+  byStructure: {
+    single_leg_rv: { n: 124, hMean: 0.1428 },
+    single_leg_otm: { n: 16, hMean: 0.0752 },
+  },
   /**
    * **The statistic `0.134` IS.** Named on the wire because the whole TRA-2602 defect was a
    * `median` graded against it. Anything comparing to `modeledH` must be a mean.
@@ -254,6 +276,132 @@ export const MODELED_H_CALIBRATION = {
   tickQuantizedRows: 140,
   distinctWidthTicks: 47,
 } as const;
+
+/**
+ * TRA-3697 — **`h` is a per-structure lookup, not a fleet-wide constant.**
+ *
+ * `MARKETABLE_MTM_DEFAULT_H = 0.134` reads as a property of the fleet and is not one. It is
+ * `single_leg_rv`'s own `h` at 88.6% weight (124 of 140 calibration rows), applied to a live
+ * book that today holds NO rv at all. On the forward `desk` cells the pooled constant FAILS
+ * `single_leg_otm` at 217% of the ±{@link MARKETABLE_MTM_DEFAULT_TOL} band while passing
+ * `single_leg_rv` at exactly 100% of it; the per-structure constants below pass BOTH, at 70%
+ * and 21% of band, **out-of-sample on data already banked**.
+ *
+ * DERIVED from {@link MODELED_H_CALIBRATION}, never transcribed beside it — a recalibration
+ * that moves `byStructure[s].hMean` moves this table in the same commit, by construction.
+ */
+export const MARKETABLE_MTM_H_BY_STRUCTURE: Readonly<Record<string, number>> = Object.freeze(
+  Object.fromEntries(
+    Object.entries(MODELED_H_CALIBRATION.byStructure).map(([structure, fit]) => [structure, fit.hMean]),
+  ),
+);
+
+/** Why a structure has no modeled `h`. One code today; a union so a second reason cannot be a boolean. */
+export type MarketableMtmHRefusalCode = 'UNCALIBRATED_STRUCTURE';
+
+/**
+ * The outcome of asking for a structure's `h`. A discriminated union **on purpose**: the
+ * uncalibrated case carries `h: null`, so a caller that ignores `ok` gets a type error or a
+ * `null`, never a plausible-looking 0.134 belonging to a different structure.
+ */
+export type MarketableMtmHResolution =
+  | {
+    ok: true;
+    structure: string;
+    /** THIS structure's calibrated mean `h`. */
+    h: number;
+    /** Calibration rows behind it. A floor check, not a precision claim. */
+    n: number;
+    refusal: null;
+  }
+  | {
+    ok: false;
+    structure: string;
+    /** **Never a number.** An uncalibrated structure has no modeled half-spread. */
+    h: null;
+    n: 0;
+    refusal: { code: MarketableMtmHRefusalCode; reason: string };
+  };
+
+/**
+ * TRA-3697 §2 — resolve a structure's modeled half-spread fraction, or **REFUSE**.
+ *
+ * ⛔ **There is deliberately no fallback to {@link MARKETABLE_MTM_DEFAULT_H}.** A silent
+ * fallback re-creates the exact defect this exists to remove: `single_leg_directional` (forward
+ * mean 0.036) would keep receiving rv's 0.1428 — a 3.7× over-charge — and would read
+ * IDENTICALLY to a properly calibrated structure at every call site. That is the
+ * no-failing-state shape, not a conservative default. This mirrors the refusal posture in
+ * `marketable-mtm-demo-journal-basis.ts`: *"a refusal returns NO moments and NO cells — not
+ * zeroed ones — so there is nothing for a caller to grade."*
+ *
+ * A caller with no structure in hand keeps using the pooled scalar; a caller WITH one must
+ * handle the refusal.
+ */
+export function resolveMarketableMtmH(structure: string): MarketableMtmHResolution {
+  const fit = (MODELED_H_CALIBRATION.byStructure as Record<string, { n: number; hMean: number } | undefined>)[structure];
+  if (fit == null) {
+    return {
+      ok: false,
+      structure,
+      h: null,
+      n: 0,
+      refusal: {
+        code: 'UNCALIBRATED_STRUCTURE',
+        reason:
+          `Structure '${structure}' has no entry in MODELED_H_CALIBRATION.byStructure `
+          + `(calibrated: ${Object.keys(MODELED_H_CALIBRATION.byStructure).join(', ')}; window `
+          + `${MODELED_H_CALIBRATION.windowUtc.from}..${MODELED_H_CALIBRATION.windowUtc.to}). `
+          + `REFUSED — no modeled h is emitted. It is NOT charged the pooled default `
+          + `${MARKETABLE_MTM_DEFAULT_H}, which is single_leg_rv's fit at 88.6% weight and would `
+          + 'read identically to a real calibration. Calibrate the structure, then re-read.',
+      },
+    };
+  }
+  return { ok: true, structure, h: fit.hMean, n: fit.n, refusal: null };
+}
+
+/**
+ * The subset of `structures` that {@link resolveMarketableMtmH} refuses, sorted. Named rather
+ * than counted: "no structure was flagged" and "no structure could be checked" must not read
+ * alike — the same rule `structuresBelowQuotedMinN` already follows.
+ */
+export function marketableMtmUncalibratedStructures(structures: readonly string[]): string[] {
+  return [...new Set(structures)].filter((s) => !resolveMarketableMtmH(s).ok).sort();
+}
+
+/**
+ * TRA-3697 §2 — **an uncalibrated structure is a non-OK verdict, never a silent omission.**
+ *
+ * Applied at the health route rather than inside `foldMarketableMtmForwardValidation` on
+ * purpose: the fold's population is the SANDBOX round-trip journal, whose `structure` is a
+ * strategy name (`long_call`, `csp`, …), while {@link MODELED_H_CALIBRATION} is keyed on the
+ * DEMO option-journal's structures (`single_leg_rv`, `single_leg_otm`). Those are two
+ * namespaces, and resolving one against the other would call every sandbox structure
+ * uncalibrated — a red gate that says nothing. The structures this table can speak about are
+ * the ones on `demoJournalBasis`, so the route reads the census from there and folds it in
+ * here, where it is a pure, testable function instead of a branch inside a handler.
+ *
+ * A `PASS` is REVOKED to `REVIEW` — the calibration is a DATA precondition, so "not yet" is
+ * the honest code. `NOT_GRADEABLE` KEEPS its code, for the same reason
+ * {@link marketableMtmQuotedPooledVerdict} keeps it: a terminal question does not become a
+ * waiting one because a second, lesser problem was also found.
+ */
+export function marketableMtmVerdictWithUncalibrated(
+  base: MarketableMtmVerdict,
+  uncalibrated: readonly string[],
+): MarketableMtmVerdict {
+  if (uncalibrated.length === 0) return base;
+  const bit =
+    `UNCALIBRATED h: ${[...uncalibrated].sort().join(', ')} — no entry in `
+    + `MODELED_H_CALIBRATION.byStructure (calibrated: `
+    + `${Object.keys(MARKETABLE_MTM_H_BY_STRUCTURE).join(', ')}). Those rows are charged the `
+    + `pooled h=${MARKETABLE_MTM_DEFAULT_H}, which is single_leg_rv's fit at 88.6% weight and `
+    + 'NOT theirs. Calibrate the structure before reading this verdict as OK';
+  if (base.code === 'NOT_GRADEABLE') {
+    return { ...base, reason: `${base.reason} ALSO: ${bit}` };
+  }
+  return { code: 'REVIEW', basis: base.basis, reason: base.code === 'REVIEW' ? `${base.reason}; ${bit}` : bit };
+}
 
 /**
  * TRA-3459 — the factor at which a REGIME divergence between the validation and calibration

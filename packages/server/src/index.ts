@@ -1013,6 +1013,7 @@ import {
 import {
   foldMarketableMtmForwardValidation,
   resolveMarketableMtmGateThresholds,
+  marketableMtmVerdictWithUncalibrated,
   MARKETABLE_MTM_SCOPE,
 } from './marketable-mtm-forward-validation.js';
 // TRA-3502 — the live per-tick mark-path quote-coverage counter. See the route.
@@ -19084,8 +19085,19 @@ app.get('/api/health/marketable-mtm-forward-validation', async (req, res) => {
       includeSamples: boolParam(req.query.samples),
     },
   );
+  // TRA-3697 — an uncalibrated structure must be NAMED here, beside `structuresBelowMinN` /
+  // `structuresBelowQuotedMinN`, and must cost the verdicts their OK. The census comes from
+  // `demoJournalBasis` because that is the population keyed in the same structure namespace as
+  // MODELED_H_CALIBRATION; `result.perStructure` is sandbox STRATEGY names and is a different
+  // namespace entirely (see `marketableMtmVerdictWithUncalibrated`).
+  const structuresUncalibratedH = demoJournalBasis.structuresUncalibratedH;
   res.status(200).json({
     ...result,
+    structuresUncalibratedH,
+    hByStructure: demoJournalBasis.hByStructure,
+    verdict: marketableMtmVerdictWithUncalibrated(result.verdict, structuresUncalibratedH),
+    actualVerdict: marketableMtmVerdictWithUncalibrated(result.actualVerdict, structuresUncalibratedH),
+    quotedVerdict: marketableMtmVerdictWithUncalibrated(result.quotedVerdict, structuresUncalibratedH),
     demoJournalBasis,
     fillRealismNote: FILL_REALISM_NOTE,
     scope: MARKETABLE_MTM_SCOPE,

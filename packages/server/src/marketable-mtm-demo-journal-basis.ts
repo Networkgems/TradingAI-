@@ -61,8 +61,11 @@
 import {
   MODELED_H_CALIBRATION,
   MARKETABLE_MTM_DEFAULT_H,
+  MARKETABLE_MTM_H_BY_STRUCTURE,
+  marketableMtmUncalibratedStructures,
   quotedTailUnderCharged,
   quotedTailUnderChargeRatio,
+  resolveMarketableMtmH,
 } from './marketable-mtm-forward-validation.js';
 import { halfSpreadFracFromQuoteForSide, type MarketableSide } from './marketable-open-mtm.js';
 
@@ -153,6 +156,36 @@ export interface MarketableMtmDemoCell {
   quotedTailUnderChargeRatio: number | null;
   /** Signed mean error in h-space (`mean(quotedH) − modeledH`). Negative ⇒ `h` OVER-charges. */
   meanHError: number;
+  /**
+   * TRA-3697 — THIS structure's **own** calibrated `h`, or `null`.
+   *
+   * `null` is one of two statements, and `hRefusal.code` says which:
+   *
+   * - `UNCALIBRATED_STRUCTURE` — this structure has no fit in
+   *   {@link MODELED_H_CALIBRATION}.byStructure and therefore has **no modeled half-spread at
+   *   all**. It is emphatically NOT {@link MARKETABLE_MTM_DEFAULT_H}: that scalar is
+   *   `single_leg_rv`'s fit at 88.6% weight, and handing it to `single_leg_directional`
+   *   (forward desk mean 0.036) is a 3.7× over-charge that reads identically to a real
+   *   calibration at every call site. Naming it is the entire point.
+   * - `POOLED_MARGINAL` — this cell aggregates over the structure axis (`structure === '*'`),
+   *   so there is no single structure to resolve. A marginal is not uncalibrated; conflating
+   *   the two would put `'*'` in `structuresUncalibratedH` on a perfectly calibrated book.
+   *
+   * ⚠️ `meanHError` and `modeledCrossUsdOnQuoted` on this cell are still computed at the
+   * `modeledH` scalar the fold was called with — unchanged by TRA-3697, which is a spec change
+   * to `h`'s SHAPE and not to any measured or published value. When `calibratedH` is non-null
+   * and differs from `modeledH`, those two fields are charging this structure at another
+   * structure's rate, and this field is how a reader can tell.
+   */
+  calibratedH: number | null;
+  /** Non-null ⇒ `calibratedH` is `null`, with the reason. See {@link MarketableMtmDemoCellHRefusal}. */
+  hRefusal: MarketableMtmDemoCellHRefusal | null;
+}
+
+/** Why a cell has no `calibratedH`. Two codes because "no fit" and "no single structure" differ. */
+export interface MarketableMtmDemoCellHRefusal {
+  code: 'UNCALIBRATED_STRUCTURE' | 'POOLED_MARGINAL';
+  reason: string;
 }
 
 export interface MarketableMtmDemoRefusal {
@@ -194,6 +227,19 @@ export interface MarketableMtmDemoJournalBasis {
   pooled: MarketableMtmDemoCell | null;
   /** structure × accountClass, plus the `'*'` marginals on each axis. `n`-descending. */
   cells: MarketableMtmDemoCell[];
+  /**
+   * TRA-3697 — structures PRESENT in this population that have no calibrated `h`, named and
+   * sorted. `'*'` is never here; a marginal is not an uncalibrated structure.
+   *
+   * Named rather than counted, and published even when empty, for the reason
+   * `structuresBelowQuotedMinN` already is: "no structure was flagged" and "no structure could
+   * be checked" must not read alike. A non-empty list is a **non-OK** condition — those rows
+   * are being charged `single_leg_rv`'s half-spread under another structure's name — and
+   * `/api/health/marketable-mtm-forward-validation` downgrades its verdicts accordingly.
+   */
+  structuresUncalibratedH: string[];
+  /** TRA-3697 — the per-structure `h` table in force, derived from {@link MODELED_H_CALIBRATION}. */
+  hByStructure: Readonly<Record<string, number>>;
   /** Rides the payload: this is an ENTRY quote and the haircut is applied at EXIT. */
   seamCaveat: string;
   /** Rides the payload: this module emits no retune target, by construction. */
@@ -323,10 +369,22 @@ function cell(
   const quotedCrossUsd = moments(rows.map((r) => r.quotedCrossUsd));
   const modeledCrossUsdOnQuoted = moments(rows.map((r) => r.modeledCrossUsd));
   const tailInput = { modeledCrossUsdOnQuoted, quotedCrossUsd };
+  // TRA-3697 — RESOLVED, never defaulted. `'*'` is the structure-axis marginal and has no
+  // single structure to resolve; everything else either has its own fit or is refused.
+  const hRes = structure === '*' ? null : resolveMarketableMtmH(structure);
   return {
     structure,
     accountClass,
     n: rows.length,
+    calibratedH: hRes?.ok === true ? hRes.h : null,
+    hRefusal: hRes == null
+      ? {
+        code: 'POOLED_MARGINAL' as const,
+        reason:
+          'This cell aggregates over the structure axis, so no per-structure h applies. '
+          + 'NOT an uncalibrated structure — read the per-structure cells for that.',
+      }
+      : hRes.refusal,
     quotedH,
     quotedCrossUsd,
     modeledCrossUsdOnQuoted,
@@ -366,6 +424,11 @@ export function foldMarketableMtmDemoJournalBasis(
     },
     seamCaveat: MARKETABLE_MTM_DEMO_SEAM_CAVEAT,
     retuneNote: MARKETABLE_MTM_DEMO_RETUNE_NOTE,
+    hByStructure: MARKETABLE_MTM_H_BY_STRUCTURE,
+    // A refusal returns NO cells, so it has censused NO structures. `[]` here means "not
+    // measured", exactly as `pooled: null` beside it does — the refusal is what a reader must
+    // check first, and it is on the same object.
+    structuresUncalibratedH: [] as string[],
   };
 
   // ── Refusal 1: the requested cohort itself overlaps the training window ──────
@@ -493,6 +556,10 @@ export function foldMarketableMtmDemoJournalBasis(
     drops,
     pooled: cell('*', '*', samples, h),
     cells,
+    // TRA-3697 — censused off the RETAINED structures, not off the cells, so a structure that
+    // is present but produced no populated account-class cell still counts. `'*'` is excluded
+    // by construction: it is not in `samples[].structure`.
+    structuresUncalibratedH: marketableMtmUncalibratedStructures(structures),
     ...(opts.includeSamples === true ? { samples: samples.slice(0, 50) } : {}),
   };
 }
