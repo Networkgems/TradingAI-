@@ -659,6 +659,9 @@ describe('TRA-3943 AC2 — the posture endpoint', () => {
       atrInvalidation: 0,
       pdtHeld: 0,
       byMarkSource: { quote: 0, last: 0, delta_backstop: 0, unknown: 1 },
+      // TRA-4623 — same additive-split discipline: no two-sided quote on the
+      // firing pass ⇒ the concession leg is underivable, counted as such.
+      byConcessionBindingLeg: { bid: 0, abs: 0, frac: 0, unquoted: 1 },
     });
     // `rows: 0` after the close — which is exactly why the cumulative twin has
     // to exist: the live row count says nothing about whether the rule fired.

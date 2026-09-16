@@ -59,6 +59,25 @@
 // exist). The readable answer is /api/health/option-expectancy-table, which
 // publishes n / lowerCI95 / admits per cell — never re-derive it by symbol.
 //
+// ── TRA-4623 (QuantTrader ruling on TRA-4621) — the R BASIS convention ───────
+//
+// `single_leg_otm` expectancy and R-multiples are computed off the REALIZED
+// BROKER-FILL basis — live closes only, `markSource: quote`, points of
+// broker-fill basis — never off the trigger level. The −35% day-one stop is a
+// TRIGGER (a firing condition), not a realized-loss budget: a limit order
+// bounds its price only conditional on filling, and the exit escalates until
+// it fills, so grading the sleeve at the trigger level understates every
+// realized loss by the concession actually paid (TRA-4534 item 3, ratified as
+// the standing sleeve convention on TRA-4621).
+//
+// ⛔ Explicitly NOT the cap basis. `atRiskUsd` / `openPremiumAtRiskUsd` stay
+// FULL PREMIUM (`rowOpenPremiumAtRisk` in options-account.ts): a long option's
+// max loss is 100% of premium and the fleet cap must keep folding it that way.
+// A cap hold is never implemented by rewriting a risk basis — the fold is
+// conservative HIGH, the stop is LOW, and an "expectancy-informed" at-risk
+// figure would quietly widen admission on exactly the books the cap exists to
+// bound (the TRA-3703 ruling's arithmetic).
+//
 // PURE — no env, no I/O, no clock (the caller passes `nowMs`). The rolling window
 // and the journal read live in `option-tape-expectancy-cache.ts`.
 

@@ -861,6 +861,87 @@ export function liveSellLimit(
 }
 
 /**
+ * TRA-4623 (QuantTrader ruling on TRA-4621) — WHICH LEG of the first-attempt
+ * pricing set the concession below mid:
+ *
+ *   • `'bid'`  — the bid (or the TRA-2811 donation floor) was the price; the
+ *     TRA-3418 cap was INERT and the cost of the exit is the half-spread the
+ *     book was showing. The tight-book world.
+ *   • `'abs'`  — the cap engaged and its flat {@link MIN_LIVE_SELL_CONCESSION_ABS}
+ *     leg was the concession (`mid ≤ $1.00`). The cheap-contract-on-a-widened-
+ *     book world, where $0.05 of concession is a large fraction of premium.
+ *   • `'frac'` — the cap engaged and its proportional
+ *     {@link MAX_LIVE_SELL_CONCESSION_FRAC_OF_MID} leg was the concession
+ *     (`mid > $1.00`). Scale-invariant: 5% of mid whatever the premium.
+ *
+ * The ruling's point: a fire COUNT cannot separate the first two worlds, and
+ * the whole budget-vs-trigger argument turns on which one is modal. Publish the
+ * leg, not just the number.
+ */
+export type LiveSellConcessionBindingLeg = 'bid' | 'abs' | 'frac';
+
+/** TRA-4623 — the first-attempt concession of a live `sell_to_close`, derived. */
+export interface LiveSellFirstAttemptConcession {
+  concessionBindingLeg: LiveSellConcessionBindingLeg;
+  /** `mid − first-attempt limit`, per share — what attempt 0 concedes below mid. */
+  concessionUsd: number;
+  /** The mid the concession is measured against (cent-rounded). */
+  midUsd: number;
+  /** `(ask − bid) / 2` — what sitting on the bid would have conceded. */
+  halfSpreadUsd: number;
+}
+
+/**
+ * TRA-4623 — derive the first-attempt concession and its binding leg from the
+ * SAME pricing walk the live exit runs ({@link liveSellLimitDetailed}, bid
+ * level), so this observability read can never disagree with the order path.
+ *
+ * `null` on a null / single-sided / unusable quote: with no two-sided book
+ * there is no mid to measure a concession against, and the caller must say
+ * "underivable" rather than publish a leg it invented.
+ */
+export function liveSellFirstAttemptConcession(
+  quote: TradierOptionQuote | null,
+): LiveSellFirstAttemptConcession | null {
+  const path = derivePricingPath(quote);
+  if (path.kind !== 'mid') return null;
+  const detailed = liveSellLimitDetailed(quote, 'bid');
+  if (detailed === null || detailed.mid === null) return null;
+  return {
+    // When the cap engaged, which of its two max() arms won is pure arithmetic
+    // on the mid; strict `>` so the $1.00 tie reads `'abs'` (the flat-nickel
+    // world is the one the ruling watches).
+    concessionBindingLeg: detailed.capped
+      ? (detailed.mid * MAX_LIVE_SELL_CONCESSION_FRAC_OF_MID > MIN_LIVE_SELL_CONCESSION_ABS
+        ? 'frac'
+        : 'abs')
+      : 'bid',
+    concessionUsd: roundToCent(Math.max(0, detailed.mid - detailed.limit)),
+    midUsd: detailed.mid,
+    halfSpreadUsd: roundToCent((path.ask - path.bid) / 2),
+  };
+}
+
+/**
+ * TRA-4623 — the WORST-case realized loss the escalation path can hand back on
+ * a premium-leg stop fire, as a fraction of entry premium:
+ *
+ *   `1 − markFloorRatio × (1 − MAX_LIVE_SELL_LIMIT_DISCOUNT_VS_MID)`
+ *
+ * i.e. the stop fires with the mark at the floor (65% of entry at the default
+ * −35%) and the escalation walk ends at the TRA-2811 donation floor (mid −
+ * 40%). 0.61 at the defaults. A pure derivation from constants that already
+ * exist — published so the wire carries the BAND, not just the trigger level
+ * (the TRA-4621 ruling: the −35% is a trigger; this is what the trigger can
+ * realize, stated instead of implied).
+ */
+export function otmStopEscalationBoundPct(markFloorRatio: number): number {
+  return Math.round(
+    (1 - markFloorRatio * (1 - MAX_LIVE_SELL_LIMIT_DISCOUNT_VS_MID)) * 10000,
+  ) / 10000;
+}
+
+/**
  * TRA-352 — compute the limit price for the n-th attempt along the configured
  * pricing path. Mid path walks from the midpoint toward the bid in quarter
  * steps so attempt 0 = mid, attempt 1 = bid + 0.75 × (ask − bid), and so on.

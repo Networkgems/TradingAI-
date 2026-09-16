@@ -169,6 +169,10 @@ import {
 // TRA-4225 — the ONE reject-text classifier (TRA-4226). Leaf module: it imports
 // `node:fs`/`node:path` and nothing of ours, so this import is acyclic.
 import { classifyBrokerRejectText } from './broker-submit-census.js';
+// TRA-4623 — the derived realized band of the OTM day-one stop, from the same
+// pricing walk the live exit runs. No cycle: tradier-smart-close does not
+// import this module.
+import { liveSellFirstAttemptConcession, otmStopEscalationBoundPct } from './tradier-smart-close.js';
 export type {
   AdoptedLotView,
   LiveLotAdoptionReport,
@@ -3328,6 +3332,45 @@ export interface OtmDayOneStopMarkSourceCounts {
   unknown: number;
 }
 
+/**
+ * TRA-4623 (QuantTrader ruling on TRA-4621) — the SAME fires, split by which
+ * leg of the first-attempt exit pricing SET the concession
+ * ({@link LiveSellConcessionBindingLeg}): `bid` = the cap was inert and the
+ * cost is the half-spread; `abs` = the flat $0.05 was the price (cap engaged
+ * on a widened cheap book); `frac` = 5%·mid (cap engaged, mid > $1).
+ *
+ * A count of fires cannot tell `bid` from `abs`, and the ruling's whole
+ * budget-vs-trigger question turns on which is modal — its invalidation
+ * trigger is `abs` on > 60% of fires. `unquoted` carries fires evaluated with
+ * no two-sided quote in hand (e.g. a `delta_backstop` fire), so the vector
+ * sums to `premiumPct + atrInvalidation` like {@link OtmDayOneStopMarkSourceCounts}.
+ */
+export interface OtmDayOneStopConcessionLegCounts {
+  bid: number;
+  abs: number;
+  frac: number;
+  unquoted: number;
+}
+
+/**
+ * TRA-4623 — the derived realized band of the most recent fire, latched
+ * since-boot. Observability only; nothing reads it back into a decision.
+ *
+ * `firstAttemptPct` is the ruling's formula
+ * `premiumStopPct + min(halfSpread, max($0.05, 5%·mid)) / premiumBasis`,
+ * evaluated on the quote served at the firing tick — the realized loss the
+ * FIRST exit attempt asks for, as a fraction of entry premium. `null` when the
+ * fire had no two-sided quote or no fill-grade premium basis to denominate in
+ * (TRA-3981 — a restated basis must not anchor a published number).
+ */
+export interface OtmDayOneStopLastFireBand {
+  firstAttemptPct: number | null;
+  concessionBindingLeg: 'bid' | 'abs' | 'frac' | 'unquoted';
+  trigger: OtmDayOneStopTrigger;
+  /** ISO of the firing tick. */
+  at: string;
+}
+
 export interface DayOneStopPosture {
   /**
    * The FLEET basis, folded from {@link stopBasisBySleeve} (TRA-3943).
@@ -3418,7 +3461,29 @@ export interface DayOneStopPosture {
        * field said it. Countable here without the journal.
        */
       byMarkSource: OtmDayOneStopMarkSourceCounts;
+      /**
+       * TRA-4623 — the same fires, split by the CONCESSION BINDING LEG of the
+       * first-attempt exit pricing. OPTIONAL: a summary served by an older
+       * build genuinely lacks it, and the fold must read absence as zero, not
+       * as coverage.
+       */
+      byConcessionBindingLeg?: OtmDayOneStopConcessionLegCounts;
     };
+    /**
+     * TRA-4623 — the escalation-path worst case as a fraction of entry
+     * premium, `1 − markFloorRatio × (1 − MAX_LIVE_SELL_LIMIT_DISCOUNT_VS_MID)`
+     * = 0.61 at the defaults ({@link otmStopEscalationBoundPct}). Derived from
+     * constants that already exist; published beside `markFloorRatio` so the
+     * wire carries the realized BAND, not just the trigger level. OPTIONAL —
+     * absent on a summary served by an older build.
+     */
+    escalationBoundPct?: number;
+    /**
+     * TRA-4623 — the derived band of the most recent fire, since-boot
+     * ({@link OtmDayOneStopLastFireBand}). `null` = no fire since boot.
+     * OPTIONAL — absent on a summary served by an older build.
+     */
+    lastFire?: OtmDayOneStopLastFireBand | null;
   } | null;
   /**
    * TRA-3985 — WHAT WAS COUNTED, as a literal on the wire rather than as a
@@ -3510,7 +3575,16 @@ export interface DayOneStopPostureContext {
     pdtHeld: number;
     /** TRA-4055 — see {@link OtmDayOneStopMarkSourceCounts}. */
     byMarkSource: OtmDayOneStopMarkSourceCounts;
+    /** TRA-4623 — optional so a hand-built / older-build caller stays valid. */
+    byConcessionBindingLeg?: OtmDayOneStopConcessionLegCounts;
+    /** TRA-4623 — see {@link OtmDayOneStopLastFireBand}. */
+    lastFire?: OtmDayOneStopLastFireBand | null;
   };
+}
+
+/** TRA-4623 — the all-zero split, for the "no counters attached" reading. */
+function zeroConcessionLegCounts(): OtmDayOneStopConcessionLegCounts {
+  return { bid: 0, abs: 0, frac: 0, unquoted: 0 };
 }
 
 /** TRA-4055 — the all-zero split, for the "no counters attached" reading. */
@@ -3604,8 +3678,21 @@ export function summarizeDayOneStopPosture(
         atrLegRows,
         atrLegInertRows,
         atrLegPopulationRows: atrLegRows + atrLegInertRows,
-        fires: ctx.otmDayOneStopCounters
-          ?? { premiumPct: 0, atrInvalidation: 0, pdtHeld: 0, byMarkSource: zeroMarkSourceCounts() },
+        fires: {
+          premiumPct: ctx.otmDayOneStopCounters?.premiumPct ?? 0,
+          atrInvalidation: ctx.otmDayOneStopCounters?.atrInvalidation ?? 0,
+          pdtHeld: ctx.otmDayOneStopCounters?.pdtHeld ?? 0,
+          byMarkSource: ctx.otmDayOneStopCounters?.byMarkSource ?? zeroMarkSourceCounts(),
+          // TRA-4623 — a caller that attached counters without the split (an
+          // older build's shape, or a fixture) publishes zeros honestly: the
+          // leg totals beside them say whether zeros mean "no fires" or "a
+          // build that did not count legs" (books + build id are on the route).
+          byConcessionBindingLeg:
+            ctx.otmDayOneStopCounters?.byConcessionBindingLeg ?? zeroConcessionLegCounts(),
+        },
+        // TRA-4623 — pure derivation from the rule already being published.
+        escalationBoundPct: otmStopEscalationBoundPct(ctx.otmDayOneStop.rule.markFloorRatio),
+        lastFire: ctx.otmDayOneStopCounters?.lastFire ?? null,
       },
     population: 'live_held_rows_opened_today',
     populationDayKey: nowKey,
@@ -3676,7 +3763,12 @@ export function mergeDayOneStopPosture(
     // bucket, so the identity above would not hold for that fleet — which is the
     // honest reading, not a hidden one, because `books` is on the wire beside it.
     byMarkSource: zeroMarkSourceCounts(),
+    // TRA-4623 — same fold discipline as byMarkSource, same older-build caveat.
+    byConcessionBindingLeg: zeroConcessionLegCounts(),
   };
+  // TRA-4623 — the fleet's most RECENT fire wins; a summary without the field
+  // (older build) contributes nothing rather than nulling a sibling's record.
+  let lastFire: OtmDayOneStopLastFireBand | null = null;
   for (const s of summaries) {
     books += s.books;
     rows += s.rows;
@@ -3703,6 +3795,14 @@ export function mergeDayOneStopPosture(
       fires.byMarkSource.last += bms.last ?? 0;
       fires.byMarkSource.delta_backstop += bms.delta_backstop ?? 0;
       fires.byMarkSource.unknown += bms.unknown ?? 0;
+      // TRA-4623 — `?? zero` for the same older-build reason as byMarkSource.
+      const bcl = s.otmDayOneStop.fires.byConcessionBindingLeg ?? zeroConcessionLegCounts();
+      fires.byConcessionBindingLeg.bid += bcl.bid ?? 0;
+      fires.byConcessionBindingLeg.abs += bcl.abs ?? 0;
+      fires.byConcessionBindingLeg.frac += bcl.frac ?? 0;
+      fires.byConcessionBindingLeg.unquoted += bcl.unquoted ?? 0;
+      const lf = s.otmDayOneStop.lastFire ?? null;
+      if (lf !== null && (lastFire === null || lf.at > lastFire.at)) lastFire = lf;
       if (otmDayOneStop === null) otmDayOneStop = s.otmDayOneStop;
     }
     if (s.releasesAt !== null && (earliest === null || s.releasesAt < earliest)) {
@@ -3730,6 +3830,10 @@ export function mergeDayOneStopPosture(
         atrLegInertRows,
         atrLegPopulationRows: atrLegRows + atrLegInertRows,
         fires,
+        // TRA-4623 — the latest fire across the fold, not the first book's.
+        // `escalationBoundPct` rides the spread: it is a process-level
+        // derivation of the rule, identical across this process's books.
+        lastFire,
       },
     population: 'live_held_rows_opened_today',
     // An EMPTY fold (or one over pre-TRA-4280 summaries) still publishes the
@@ -5612,7 +5716,16 @@ export interface RowOpenPremiumAtRisk {
   unbookedSuppressedUsd: number;
   /** TRA-3958 — a live operator basis pin prices this row. */
   pinned: boolean;
-  /** `basisUsd + unbookedUsd` — the row's exact contribution to `usd`. */
+  /**
+   * `basisUsd + unbookedUsd` — the row's exact contribution to `usd`.
+   *
+   * TRA-4623 (TRA-4621 ruling) — this is FULL PREMIUM by convention, and it
+   * stays that way. The −35% OTM day-one stop is a TRIGGER, not a realized
+   * bound, so no stop level may discount this figure: a long option's max loss
+   * is 100% of premium and the fleet cap folds it as such. Expectancy grades
+   * off the realized broker-fill basis instead (`option-tape-expectancy.ts`);
+   * a cap hold is never implemented by rewriting a risk basis.
+   */
   atRiskUsd: number;
 }
 
@@ -6391,6 +6504,20 @@ export class PaperOptionsAccount {
     delta_backstop: 0,
     unknown: 0,
   };
+  /**
+   * TRA-4623 — the SAME fires, split by which leg of the first-attempt exit
+   * pricing set the concession ({@link OtmDayOneStopConcessionLegCounts}).
+   * Since-boot, per book. Sums to `premium_pct + atr_invalidation` like the
+   * mark-source split; `unquoted` is the no-two-sided-quote bucket.
+   */
+  private otmDayOneStopFiresByConcessionLeg: OtmDayOneStopConcessionLegCounts = {
+    bid: 0,
+    abs: 0,
+    frac: 0,
+    unquoted: 0,
+  };
+  /** TRA-4623 — the most recent fire's derived band ({@link OtmDayOneStopLastFireBand}). */
+  private otmDayOneStopLastFire: OtmDayOneStopLastFireBand | null = null;
   /**
    * TRA-3943 — OTM intraday stops this process could NOT fire on day one because
    * the account had no day-trade capacity (one per row per ET day).
@@ -10748,6 +10875,12 @@ export class PaperOptionsAccount {
       // AFTER the window.
       const otmDayOneStop = options.otmDayOneStop;
       let otmStopTrigger: OtmDayOneStopTrigger | null = null;
+      // TRA-4623 — the derived realized band of a fire, computed HERE where the
+      // rule, the verdict's fill-grade basis and the served quote are all in
+      // scope, and booked at the fire site below with the other counters.
+      let otmStopFireBand: Pick<
+        OtmDayOneStopLastFireBand, 'firstAttemptPct' | 'concessionBindingLeg'
+      > | null = null;
       if (otmDayOneStop !== undefined && !opt.legs && !inOpeningRange && isOtmSleeveRow(opt)) {
         const verdict = otmDayOneStopVerdict(
           otmDayOneStopSubject(opt),
@@ -10779,6 +10912,34 @@ export class PaperOptionsAccount {
           } else {
             otmStopTrigger = verdict.trigger;
             delete opt.otmStopHeldForPdt;
+            // TRA-4623 — which pricing leg will set the first exit attempt's
+            // concession, off the SAME quote this pass served (`quoteAtFire`),
+            // and the ruling's first-attempt formula
+            // `premiumStopPct + min(halfSpread, max($0.05, 5%·mid)) / basis`.
+            // The basis is the fired leg's own fill-grade anchor
+            // (`markFloor / markFloorRatio`); a fire with no such anchor (an
+            // ATR-leg fire on a restated-basis row) publishes `null` rather
+            // than denominating in a number nobody paid (TRA-3981).
+            // `liveQuoteFor` already proved the pair two-sided; the wrap only
+            // satisfies the quote type's required `symbol`.
+            const concession = liveSellFirstAttemptConcession(
+              quoteAtFire === null
+                ? null
+                : { symbol: opt.optionSymbol ?? '', bid: quoteAtFire.bid, ask: quoteAtFire.ask },
+            );
+            const basisUsd =
+              verdict.markFloor !== null && otmDayOneStop.rule.markFloorRatio > 0
+                ? verdict.markFloor / otmDayOneStop.rule.markFloorRatio
+                : null;
+            otmStopFireBand = {
+              concessionBindingLeg: concession === null ? 'unquoted' : concession.concessionBindingLeg,
+              firstAttemptPct:
+                concession !== null && basisUsd !== null && basisUsd > 0
+                  ? Math.round(
+                    (otmDayOneStop.rule.premiumStopPct + concession.concessionUsd / basisUsd) * 10000,
+                  ) / 10000
+                  : null,
+            };
           }
         } else {
           delete opt.otmStopHeldForPdt;
@@ -11478,6 +11639,18 @@ export class PaperOptionsAccount {
         // provenance goes to `unknown` rather than nowhere: the split has to sum
         // to the leg totals or it is a coverage claim it cannot support.
         this.otmDayOneStopFiresByMarkSource[markProvenance.markSource ?? 'unknown'] += 1;
+        // TRA-4623 — the same fire, binned by the concession's binding leg, and
+        // the latched last-fire band. `unquoted` (not a silent drop) when the
+        // pass served no two-sided quote, so this split also sums to the leg
+        // totals. Observability only — nothing reads it back into a decision.
+        const fireBand = otmStopFireBand
+          ?? { firstAttemptPct: null, concessionBindingLeg: 'unquoted' as const };
+        this.otmDayOneStopFiresByConcessionLeg[fireBand.concessionBindingLeg] += 1;
+        this.otmDayOneStopLastFire = {
+          ...fireBand,
+          trigger: otmStopTrigger,
+          at: new Date().toISOString(),
+        };
         accountLog.warn('OTM intraday stop FIRED', {
           issue: 'TRA-3943',
           optionSymbol: opt.optionSymbol,
@@ -11495,6 +11668,10 @@ export class PaperOptionsAccount {
           markSource: markProvenance.markSource,
           staleMarkTicks: markProvenance.staleMarkTicks,
           quoteAtFire: markProvenance.quoteAtFire,
+          // TRA-4623 — the derived realized band of this fire, on the log line
+          // the incident reader already opens.
+          concessionBindingLeg: fireBand.concessionBindingLeg,
+          firstAttemptPct: fireBand.firstAttemptPct,
         });
       }
 
@@ -13104,6 +13281,8 @@ export class PaperOptionsAccount {
     atrInvalidation: number;
     pdtHeld: number;
     byMarkSource: OtmDayOneStopMarkSourceCounts;
+    byConcessionBindingLeg: OtmDayOneStopConcessionLegCounts;
+    lastFire: OtmDayOneStopLastFireBand | null;
   } {
     return {
       premiumPct: this.otmDayOneStopFires.premium_pct,
@@ -13112,6 +13291,9 @@ export class PaperOptionsAccount {
       // TRA-4055 — copied, not aliased: this leaves the class on a health route
       // and a caller holding the live object could watch it move mid-render.
       byMarkSource: { ...this.otmDayOneStopFiresByMarkSource },
+      // TRA-4623 — same copy discipline as byMarkSource.
+      byConcessionBindingLeg: { ...this.otmDayOneStopFiresByConcessionLeg },
+      lastFire: this.otmDayOneStopLastFire === null ? null : { ...this.otmDayOneStopLastFire },
     };
   }
 
