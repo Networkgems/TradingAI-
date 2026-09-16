@@ -24,6 +24,41 @@ interface AlertsResponse {
   counts: Record<AlertKind, number>;
   alerts: OptionsAlert[];
   note?: string;
+  // TRA-4599 (residual of TRA-4593 AC3) — the book the SERVER scanned, echoed
+  // off `dashboardBookViewFor`. This is the same call `/api/state` resolves the
+  // open-options table through, which is the entire basis of the TRA-4593 YES
+  // ruling: the panel and the table beside it cannot disagree. We render the
+  // server's own label rather than re-deriving the book from settings, because
+  // a client-side derivation is exactly the second source of truth that could
+  // drift and make the label lie about agreement it is supposed to prove.
+  bookView?: 'demo' | 'live';
+}
+
+/**
+ * TRA-4599 — the deliberate `undefined` decision (acceptance 2).
+ *
+ * `bookView` is `dashboardBookViewFor`'s return, which is populated ONLY while a
+ * `viewMode` override is set AND differs from routing. So `undefined` does not
+ * mean "demo" and does not mean "live" — it means "this view follows routing",
+ * and this panel has no second source for what routing is (the issue forbids a
+ * second fetch and forbids deriving it from settings). Printing "live" there
+ * would be a GUESS, and a book label that is sometimes a guess is worse than no
+ * book label: an operator cannot tell which frames to trust.
+ *
+ * So `undefined` renders NOTHING. That is not a hole — the TRA-3910 header chip
+ * already states routing on every frame, and it is the no-override case where
+ * routing and view are the same book, i.e. the case where there is nothing for
+ * this label to disambiguate. The label appears precisely when the panel is
+ * scanning a book that is NOT the routing book, which is the only time the
+ * question "which book is this?" has a non-obvious answer.
+ *
+ * Also narrows defensively: an unexpected value off the wire renders nothing
+ * rather than being printed raw.
+ */
+function bookLabelFor(bookView: unknown): 'DEMO' | 'LIVE' | null {
+  if (bookView === 'demo') return 'DEMO';
+  if (bookView === 'live') return 'LIVE';
+  return null;
 }
 
 const KIND_LABEL: Record<AlertKind, string> = {
@@ -81,6 +116,8 @@ export function OptionsAlertsPanel({ token }: { token: string }) {
   const actionAlerts = alerts.filter((a) => a.severity === 'action');
   const infoCount = alerts.length - actionAlerts.length;
   const actionClass = actionAlerts.some((a) => a.kind === 'stop_hit') ? 'red' : 'green';
+  // TRA-4599 — see `bookLabelFor`. Null on the common (no-override) path.
+  const bookLabel = bookLabelFor(data?.bookView);
 
   return (
     <div
@@ -116,6 +153,26 @@ export function OptionsAlertsPanel({ token }: { token: string }) {
           chain-diff · target/stop · IV-move
           {data?.chainDates?.length === 2 ? ` · ${data.chainDates[0]} → ${data.chainDates[1]}` : ''}
         </span>
+        {/* TRA-4599 — the book the SERVER scanned, in the server's own words.
+            Scoped to "target/stop" on purpose: those are the only rows with a
+            book. The chain-diff rows (new_expiry / new_strike / iv_move) come
+            off chain partitions on disk and are book-agnostic, so a bare "LIVE
+            book" here would overclaim what the label covers. */}
+        {bookLabel && (
+          <span
+            data-testid="options-alerts-book-view"
+            className={bookLabel === 'LIVE' ? 'red' : 'muted'}
+            style={{ fontWeight: 600, fontSize: '0.75rem', letterSpacing: '0.03em' }}
+            title={
+              `The server scanned target/stop hits on the ${bookLabel} book — echoed from this route's own`
+              + ` bookView field, which resolves through the same call the open-options table uses.`
+              + ` It is populated only while a view override is in force, so this label appearing means`
+              + ` the book shown is NOT the routing book.`
+            }
+          >
+            target/stop on the {bookLabel} book
+          </span>
+        )}
         <button
           className="btn-secondary"
           style={{ marginLeft: 'auto', padding: '0.2rem 0.6rem', fontSize: '0.75rem' }}
