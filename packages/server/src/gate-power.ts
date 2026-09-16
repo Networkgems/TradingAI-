@@ -75,7 +75,7 @@ export const TARGET_EFFECT_R = 0.03;
  * ⚠️ Be honest about what 2.0 buys: n = (2σ/δ)² puts δ at TWO standard errors, which is
  * ~95% confidence against a ZERO effect but only ~50% POWER at the effect δ itself (at
  * true effect δ, the estimate lands below the 2-SE line half the time). True 80% power
- * at δ needs z ≈ 2.81 (= 1.96 + 0.84). That is a PARAMETER CHANGE on this constant, not
+ * at δ needs z ≈ 2.80 (= 1.96 + 0.84). That is a PARAMETER CHANGE on this constant, not
  * a redesign — ratified as such by the TRA-2346 sign-off (Q3).
  */
 export const POWER_CONFIDENCE_SIGMA = 2.0;

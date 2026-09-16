@@ -8384,8 +8384,8 @@ app.get('/api/health/live-capital-gate', async (_req, res) => {
       // `confidenceSigma = 2.0` puts δ at TWO standard errors (n_req = (2σ/δ)²). That is
       // ~95% confidence against a ZERO effect but only **~50% power at δ itself**, and
       // `powered: true` MUST NOT be read as "80% powered" — true 80% power at δ would need
-      // z ≈ 2.81 (= 1.96 + 0.84), i.e. ~1.97× the sample on every branch (measured: c=0.03
-      // 138→272, c=0.20 1112→2194, c=0.30 1905→3761).
+      // z ≈ 2.80 (= 1.96 + 0.84), i.e. ~1.96× the sample on every branch (measured: c=0.03
+      // 138→270, c=0.20 1112→2178, c=0.30 1905→3734).
       //
       // What z = 2.0 DOES buy, and why it was kept: the gate's expectancy rule is a
       // POINT-ESTIMATE comparison (`expectancyNetR > minExpectancyR`, live-capital-gate.ts)
@@ -8397,7 +8397,7 @@ app.get('/api/health/live-capital-gate', async (_req, res) => {
       // ⛔ THIS PRE-REGISTRATION VOIDS ITSELF IF THE DECISION RULE CHANGES. If
       // `positive_expectancy` is ever amended to require the mean to clear the bar by an
       // SE margin (an actual significance test), z = 2.0 becomes genuinely ~50%-powered,
-      // the reasoning above no longer holds, and z must be re-derived (2.81 for 80%).
+      // the reasoning above no longer holds, and z must be re-derived (2.80 for 80%).
       // Whoever makes that change re-opens TRA-3611. Ratified as a PARAMETER change, not a
       // redesign (TRA-2346 Q3) — the door is open, it is just not walked through today.
       power: gate.power,

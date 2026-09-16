@@ -447,7 +447,7 @@ Four things are **closed decisions**, not open design space:
    fragmented population. Fixture (f) in `gate-power.test.ts` fails if it is dropped.
 
 `z = 2.0` puts δ at two standard errors: ~95% confidence against a *zero* effect, but only
-**~50% power at δ itself**. True 80% power needs `z ≈ 2.81`. That is a **parameter change
+**~50% power at δ itself**. True 80% power needs `z ≈ 2.80`. That is a **parameter change
 on a named constant**, not a redesign — but it is QuantTrader's to make.
 
 `GET /api/health/live-capital-gate` publishes the whole verdict under `power`, including
