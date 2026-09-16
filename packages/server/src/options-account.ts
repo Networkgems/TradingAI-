@@ -205,6 +205,7 @@ import {
   listOptionTradeJournal,
   // TRA-2895 — the dated partial-exit row; see `queueJournalPartial`.
   recordOptionTradePartialClose,
+  recordOptionTradeConvictionAdd,
   getOptionTradeJournalRecord,
   // TRA-2937 — the import-journalling path: the contract-keyed lookup that lets
   // a re-imported engine row be REBOUND onto its original OPEN instead of
@@ -7398,6 +7399,17 @@ export class PaperOptionsAccount {
           exitReason,
           holdDays,
           brokerOrderId,
+          // TRA-4609 — the size the position SETTLED, stamped here because this
+          // is the last place `position.contracts` is in hand: once the close
+          // row is written the position leaves the book and the size is
+          // unrecoverable. Independent of the entry-side `contracts` column,
+          // which the mint wrote and `amend_open_lots` grows — a row where the
+          // two disagree with no `convictionAdds` is a row something resized
+          // without telling the journal. Forward-only; ⛔ nothing backfills a
+          // closed row's size.
+          ...(Number.isFinite(position.contracts) && position.contracts > 0
+            ? { contractsAtClose: position.contracts }
+            : {}),
           // TRA-4246 (AC1) — ALWAYS written, `null` included: the null is the
           // verdict "this row had no armed stop", and the reason beside it is
           // what stops that reading as "we forgot to stamp". Forward-only —
@@ -9418,7 +9430,55 @@ export class PaperOptionsAccount {
     // The protective loss bound (`stopLossPremium`) is intentionally left as-is.
     this.cash -= cost;
     this.openOptions.set(optionId, opt);
+    // TRA-4609 — tell the JOURNAL. Until this call the add moved the book and
+    // the conviction-DCA ledger and nothing else, so the trade journal's OPEN
+    // row kept mint-time `contracts` and mint-time `atRiskUsd` — and
+    // `realizedR = realizedPnlUsd / atRiskUsd` then divided an all-lots P&L by
+    // minted-lots capital. Measured live 2026-09-16 (pin `f8f7b1855da0`): 8 of
+    // 12 closed rows carried an add, every one overstating premium R, 2x on
+    // seven of them — adverse in the direction that matters, since the book read
+    // best exactly where the engine had committed the most capital.
+    //
+    // Queued (not awaited) onto `journalWrites` for the same reason every other
+    // journal write here is: the journal is observe-only and must never reach a
+    // capital path. The book mutation above is already committed; a journal
+    // failure below is logged and loses a column, never a fill.
+    this.queueJournalConvictionAdd(opt, addContracts, cost);
     return opt;
+  }
+
+  /**
+   * TRA-4609 — queue the OPEN-row amendment for a conviction-DCA add. No-op
+   * (returns synchronously) when the journal flag is off, exactly like
+   * {@link queueJournalOpen}.
+   *
+   * `journalIdFor` resolves the row the same way {@link queueJournalClose} does,
+   * so an add to a position the reconcile ADOPTED onto a sibling's row amends
+   * the row the close will divide by — not a row nothing will ever read.
+   */
+  private queueJournalConvictionAdd(
+    position: OptionPosition,
+    addedContracts: number,
+    addedPremiumUsd: number,
+  ): void {
+    if (!isOptionTradeJournalEnabled()) return;
+    const contracts = position.contracts;
+    this.journalWrites = this.journalWrites
+      .then(async () => {
+        await recordOptionTradeConvictionAdd(
+          this.journalIdFor(position),
+          { addedContracts, addedPremiumUsd, contracts },
+          { reason: 'conviction_dca_add', issue: 'TRA-4609' },
+        );
+      })
+      .catch((err) => {
+        accountLog.warn('option trade journal conviction-DCA add emit failed', {
+          issue: 'TRA-4609',
+          id: position.id,
+          optionSymbol: position.optionSymbol,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      });
   }
 
   /**

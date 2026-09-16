@@ -236,7 +236,15 @@ describe('the row and the journal open line carry the PRE-order reading (TRA-399
     await rm(tmpFile, { force: true });
   });
 
-  const settle = () => new Promise<void>((r) => setTimeout(r, 10));
+  // TRA-4609 — this used to be `setTimeout(…, 10)`, a WALL-CLOCK race against
+  // the async `journalWrites` chain rather than a wait on it. It passed for as
+  // long as the suite was light enough for a queued append to land inside 10 ms;
+  // adding ONE more file to the run (`tra4609-…`) put this file under enough
+  // contention that it did not, and the assertion below read the row as absent —
+  // reproducibly, and only when that file was present. `flushOptionTradeJournal`
+  // awaits the chain itself, which is what the rest of the suite uses and what
+  // the method exists for, so the read-after-write is now deterministic.
+  const settle = (acct: PaperOptionsAccount) => acct.flushOptionTradeJournal();
 
   it('stamped `openPremiumAtRiskUsd` equals the at-risk BEFORE the order, not after; journal row is the same object', async () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
@@ -267,7 +275,7 @@ describe('the row and the journal open line carry the PRE-order reading (TRA-399
     expect(second!.admission!.openPremiumAtRiskUsd).not.toBe(post);
 
     // Journal: same object on the `open` line, absent on the unstamped row (AC5).
-    await settle();
+    await settle(acct);
     const rows = await listOptionTradeJournal();
     const byId = new Map(rows.map((r) => [r.id, r]));
     expect(byId.get(second!.id)?.admission).toEqual(stamp);

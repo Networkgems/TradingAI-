@@ -193,6 +193,55 @@ export interface OptionTradeJournalOpen {
   atRiskBasis?: 'fill' | 'mark';
   /** TRA-4028 — the source, named: `ledger_fill:142603649`, `operator_pin:TRA-3958`, `mark:remainder_excess`. */
   atRiskProvenance?: string;
+  /**
+   * TRA-4609 — the conviction-DCA scale-ins (TRA-964) folded onto this row, and
+   * the MINT figures they moved off.
+   *
+   * ── What this fixes ───────────────────────────────────────────────────────
+   *
+   * `PaperOptionsAccount.addToOptionPosition` bumps the BOOK's `contracts` and
+   * blends `premiumPaid`. Before this field nothing told the journal, so the row
+   * kept mint-time `contracts` and with it mint-time `atRiskUsd`, and
+   * `realizedR = realizedPnlUsd / atRiskUsd` then divided a P&L covering ALL
+   * lots by capital covering only the MINTED ones. Measured live 2026-09-16 on
+   * pin `f8f7b1855da0`: 8 of 12 closed demo/desk rows carried an add and every
+   * one overstated premium R by `totalContracts / mintContracts` — 2x on seven
+   * of them. The identity `atRiskUsd == contracts · 100 · entryMarkUsd` held on
+   * 12/12 THROUGHOUT, because all three quantities derive from the same frozen
+   * `contracts`: internally consistent and externally wrong together, which is
+   * why it must never be cited as a control on this.
+   *
+   * ── The convention this row now publishes ─────────────────────────────────
+   *
+   * `atRiskUsd` is CAPITAL ACTUALLY COMMITTED — mint premium plus every add's
+   * premium — so R is measured against what the trade risked, not against what
+   * the first lot risked. The alternative (freeze R on the minted basis and
+   * label it) was rejected: `atRiskUsd` is documented as premium at risk, and
+   * after an add more premium genuinely is at risk. The choice is PUBLISHED
+   * here rather than left to silence — silence is what made this a defect, and
+   * `mintContracts`/`mintAtRiskUsd` keep the pre-add reading reconstructible
+   * from the row alone.
+   *
+   * ⛔ Forward-only. ABSENT means "no add was ever folded onto this row", which
+   * on a row written before this field existed is indistinguishable from "an add
+   * landed and was dropped". Nothing backfills a closed row, and the only other
+   * surface that knows — `/api/health/conviction-dca` — is a bounded ring, so a
+   * join against it is not durable evidence. Treat absence on a pre-TRA-4609 row
+   * as UNKNOWN.
+   */
+  convictionAdds?: OptionTradeJournalConvictionAdds;
+  /**
+   * TRA-4609 — `OptionPosition.contracts` as the CLOSE path read it, stamped by
+   * {@link OptionTradeJournalClose.contractsAtClose}.
+   *
+   * The independent witness for the same defect. `contracts` above is an ENTRY
+   * column (the mint's fill, amended by `convictionAdds`); this is the size the
+   * position actually carried when it settled, which is what `realizedPnlUsd`
+   * and `pnlRStopBasis` were computed over. A row where the two DISAGREE and
+   * `convictionAdds` is absent is a row some other path resized without telling
+   * the journal. ⛔ Forward-only; absent on every pre-stamp close.
+   */
+  contractsAtClose?: number;
   /** Agent conviction [0,1] when an LLM advisory approved it; null otherwise. */
   agentConviction?: number | null;
   /**
@@ -441,6 +490,14 @@ export interface OptionTradeJournalClose {
   exitReason: string;
   /** Calendar days held (open→close). */
   holdDays: number;
+  /**
+   * TRA-4609 — `OptionPosition.contracts` as THIS close read it: the size the
+   * position actually settled, after any conviction-DCA add. See
+   * {@link OptionTradeJournalRecord.contractsAtClose} for why it is stamped
+   * separately from the entry-side `contracts`. Optional so a close booked
+   * without a finite size folds back absent rather than as a synthetic 0.
+   */
+  contractsAtClose?: number;
   /**
    * TRA-1600 (deliverable D) — MEASURED exit-side slippage in USD for this
    * position: signed `(mark − fillPremium) × contracts × 100`, i.e. positive when
@@ -892,6 +949,34 @@ export interface OptionTradeRefusedCloseSupersede {
   issue: string;
 }
 
+/**
+ * TRA-4609 — the conviction-DCA (TRA-964) scale-in history folded onto ONE row.
+ * See {@link OptionTradeJournalRecord.convictionAdds}.
+ *
+ * The `mint…` fields are restated here rather than left implicit because the
+ * live columns move under every add: after the fold `contracts` and `atRiskUsd`
+ * describe the POSITION, and only this object still describes the MINT. A
+ * reader wanting the old (frozen-basis) reading computes
+ * `realizedPnlUsd / mintAtRiskUsd` without needing the DCA ledger.
+ */
+export interface OptionTradeJournalConvictionAdds {
+  /** How many separate adds were folded. Never 0 — the field is absent instead. */
+  adds: number;
+  /**
+   * `contracts` as the MINT wrote it. `null` when the mint stamped none
+   * (the field is optional on the open), which is a readable "unknown", never 0.
+   */
+  mintContracts: number | null;
+  /** `atRiskUsd` as the MINT wrote it, before the first add moved it. */
+  mintAtRiskUsd: number;
+  /** Lots added across every fold. */
+  addedContracts: number;
+  /** Premium committed across every fold, USD — exactly what `atRiskUsd` grew by. */
+  addedPremiumUsd: number;
+  firstAddTs: number;
+  lastAddTs: number;
+}
+
 /** TRA-4028 — one entry basis this row USED to carry. See {@link OptionTradeJournalRecord.supersededOpenBasis}. */
 export interface OptionTradeSupersededOpenBasis {
   atRiskUsd: number;
@@ -1137,6 +1222,42 @@ type AmendOpenBasisLine = {
   /** The ticket authorising the writer (`TRA-4028` for the admin route). */
   issue: string;
 };
+// TRA-4609 — GROW an OPEN row by a conviction-DCA (TRA-964) scale-in.
+//
+// The fifth correction kind, and the only one written by the ENGINE rather than
+// by an operator or a repair pass. `amend_open_basis` says "the basis we wrote
+// was the wrong figure for the lots we had"; this one says "we bought MORE
+// lots", which is a different fact and must not be spelled as the other: the
+// basis amend takes an ABSOLUTE `atRiskUsd` from its caller, and an engine that
+// posted one would be racing the fold for the row's current figure.
+//
+// So the line is INCREMENTAL on capital (`addedPremiumUsd`, applied to whatever
+// the row holds at fold time) and ABSOLUTE on size (`contracts`, the book's
+// post-add total — the book, not arithmetic on the row, is the authority for
+// how many lots exist). That split also makes a replay exact: the file is folded
+// once, in order, from the mint.
+//
+// Refused (and WITNESSED) on a malformed figure, an unknown id, and a row that
+// is no longer OPEN. The last is the load-bearing one: an add to a settled row
+// would move the denominator UNDER a published R, and unlike `amend_open_basis`
+// — which corrects a figure that was always wrong — there is no reading on which
+// a position acquires lots after it closes. That is a writer defect, and it is
+// recorded rather than swallowed.
+type AmendOpenLotsLine = {
+  kind: 'amend_open_lots';
+  id: string;
+  ts: number;
+  /** Lots added by THIS fill (> 0). */
+  addedContracts: number;
+  /** Premium committed by THIS fill, USD (> 0) — what `atRiskUsd` grows by. */
+  addedPremiumUsd: number;
+  /** The BOOK's post-add total contracts (> 0). Authoritative for `contracts`. */
+  contracts: number;
+  /** Why — free text naming the writer, e.g. `conviction_dca_add`. */
+  reason: string;
+  /** The ticket authorising the writer (`TRA-4609` for the engine path). */
+  issue: string;
+};
 type JournalLine =
   | OpenLine
   | CloseLine
@@ -1148,7 +1269,8 @@ type JournalLine =
   | AverageDownShadowLine
   | AmendEntryQuoteLine
   | SupersedeCloseLine
-  | AmendOpenBasisLine;
+  | AmendOpenBasisLine
+  | AmendOpenLotsLine;
 
 /**
  * TRA-4004 — two closes of ONE position closer together than this are the SAME
@@ -1509,6 +1631,85 @@ export function getOptionTradeOpenBasisAmends(): {
   };
 }
 
+/**
+ * TRA-4609 — one conviction-DCA scale-in the fold SAW, applied or refused.
+ *
+ * Same argument as {@link OptionTradeOpenBasisAmendRecord}: the row can testify
+ * to the adds that LANDED (`convictionAdds`, `supersededOpenBasis[]`), and only
+ * a ledger can testify to the ones the fold turned away. A refused add is the
+ * interesting record here — the row's `atRiskUsd` did NOT grow, so the R it
+ * publishes is the frozen-basis figure this ticket exists to stop, and nothing
+ * on the row says so.
+ */
+export interface OptionTradeConvictionAddRecord {
+  id: string;
+  ts: number | null;
+  applied: boolean;
+  /** Why the fold refused; `null` when applied. */
+  refusal: 'unknown_row' | 'already_closed' | 'malformed' | null;
+  reason: string | null;
+  issue: string | null;
+  mode: 'demo' | 'live' | null;
+  symbol: string | null;
+  optionSymbol: string | null;
+  /** Lots/premium the line asked for; echoed on refusals too, so the loss is quantified. */
+  addedContracts: number | null;
+  addedPremiumUsd: number | null;
+  /** Read off the row BEFORE the fold; `null` when the row is unknown. */
+  contractsBefore: number | null;
+  atRiskUsdBefore: number | null;
+  /** On the row AFTER the fold; `null` when refused. */
+  contractsAfter: number | null;
+  atRiskUsdAfter: number | null;
+}
+
+/** TRA-4609 — cents. USD figures on a row are money, not floats to accumulate drift in. */
+function round2(v: number): number {
+  return Math.round(v * 100) / 100;
+}
+
+/** Same cap as {@link OPEN_BASIS_AMEND_LEDGER_CAP} — a witness, not a second journal. */
+const CONVICTION_ADD_LEDGER_CAP = 500;
+let convictionAddLedger: OptionTradeConvictionAddRecord[] = [];
+let convictionAddDropped = 0;
+
+function pushConvictionAdd(
+  sink: OptionTradeConvictionAddRecord[],
+  rec: OptionTradeConvictionAddRecord,
+): void {
+  sink.push(rec);
+  while (sink.length > CONVICTION_ADD_LEDGER_CAP) {
+    sink.shift();
+    convictionAddDropped += 1;
+  }
+}
+
+/**
+ * TRA-4609 — conviction-DCA adds observed by the last load plus every one
+ * written since. Served by `/api/health/option-journal` as `convictionAdds`.
+ *
+ * ⚠️ `refused > 0` is a FINDING, not noise: every refusal is a row whose
+ * `atRiskUsd` still covers only its minted lots while its `realizedPnlUsd`
+ * covers all of them.
+ */
+export function getOptionTradeConvictionAdds(): {
+  total: number;
+  dropped: number;
+  applied: number;
+  refused: number;
+  live: number;
+  recent: OptionTradeConvictionAddRecord[];
+} {
+  return {
+    total: convictionAddLedger.length,
+    dropped: convictionAddDropped,
+    applied: convictionAddLedger.filter((s) => s.applied).length,
+    refused: convictionAddLedger.filter((s) => !s.applied).length,
+    live: convictionAddLedger.filter((s) => s.mode === 'live').length,
+    recent: convictionAddLedger.map((s) => ({ ...s })),
+  };
+}
+
 function defaultStoreFile(): string {
   const root = resolveDataDir();
   return join(root, 'option-trade-journal.jsonl');
@@ -1530,6 +1731,9 @@ export function setOptionTradeJournalFileForTests(path: string | null): void {
   // TRA-4028 — and the entry-basis witnesses.
   openBasisAmendLedger = [];
   openBasisAmendDropped = 0;
+  // TRA-4609 — and the conviction-DCA add witnesses.
+  convictionAddLedger = [];
+  convictionAddDropped = 0;
 }
 function storeFile(): string {
   return storeFileOverride ?? defaultStoreFile();
@@ -1608,6 +1812,8 @@ function foldLine(
   supersedeSink: OptionTradeCloseSupersedeRecord[] = closeSupersedeLedger,
   // TRA-4028 — and once more for the entry-basis witness.
   openBasisSink: OptionTradeOpenBasisAmendRecord[] = openBasisAmendLedger,
+  // TRA-4609 — and once more for the conviction-DCA add witness.
+  convictionAddSink: OptionTradeConvictionAddRecord[] = convictionAddLedger,
 ): void {
   if (line.kind === 'open') {
     if (!map.has(line.rec.id)) map.set(line.rec.id, { ...line.rec, outcome: 'OPEN' });
@@ -1873,6 +2079,97 @@ function foldLine(
     });
     return;
   }
+  if (line.kind === 'amend_open_lots') {
+    // TRA-4609 — GROW an OPEN row by a conviction-DCA scale-in. See
+    // {@link AmendOpenLotsLine} for why capital is incremental and size is not.
+    //
+    // `atRiskUsd` moves to mint premium + every add's premium, so the eventual
+    // close divides its all-lots P&L by all-lots capital. `contracts` moves to
+    // the book's post-add total. The MINT figures are preserved on
+    // `convictionAdds` and the whole pre-add basis on `supersededOpenBasis[]`,
+    // so the frozen-basis reading stays reconstructible from the row alone —
+    // this changes which number the row PUBLISHES, never which numbers it KNOWS.
+    //
+    // ⚠️ `entryMarkUsd` is deliberately NOT touched: it is the scanner's mid at
+    // the MINT and an add did not happen at it. That means the pre-TRA-4609
+    // identity `atRiskUsd == contracts · 100 · entryMarkUsd` now FAILS on an
+    // added row — correctly. It was never a control on this defect (all three
+    // sides derived from the same frozen `contracts`); it is now a DETECTOR of
+    // one, and `convictionAdds` is what says the failure was intentional.
+    const rec = map.get(line.id);
+    const ts = typeof line.ts === 'number' && Number.isFinite(line.ts) ? line.ts : null;
+    const finitePositive = (v: unknown): v is number =>
+      typeof v === 'number' && Number.isFinite(v) && v > 0;
+    const base = {
+      id: line.id,
+      ts,
+      reason: typeof line.reason === 'string' ? line.reason : null,
+      issue: typeof line.issue === 'string' ? line.issue : null,
+      mode: rec?.mode ?? null,
+      symbol: rec?.symbol ?? null,
+      optionSymbol: rec?.optionSymbol ?? null,
+      addedContracts: typeof line.addedContracts === 'number' && Number.isFinite(line.addedContracts)
+        ? line.addedContracts
+        : null,
+      addedPremiumUsd: typeof line.addedPremiumUsd === 'number' && Number.isFinite(line.addedPremiumUsd)
+        ? line.addedPremiumUsd
+        : null,
+      contractsBefore: rec && Number.isFinite(rec.contracts as number) ? (rec.contracts as number) : null,
+      atRiskUsdBefore: rec && Number.isFinite(rec.atRiskUsd) ? rec.atRiskUsd : null,
+    };
+    const refuse = (refusal: OptionTradeConvictionAddRecord['refusal']): void => {
+      pushConvictionAdd(convictionAddSink, {
+        ...base, applied: false, refusal, contractsAfter: null, atRiskUsdAfter: null,
+      });
+    };
+    if (
+      !finitePositive(line.addedContracts)
+      || !finitePositive(line.addedPremiumUsd)
+      || !finitePositive(line.contracts)
+      || typeof line.issue !== 'string' || line.issue === ''
+    ) { refuse('malformed'); return; }
+    if (!rec) { refuse('unknown_row'); return; }
+    if (rec.outcome !== 'OPEN') { refuse('already_closed'); return; }
+    const atRiskUsd = round2(rec.atRiskUsd + line.addedPremiumUsd);
+    const prior: OptionTradeSupersededOpenBasis = {
+      atRiskUsd: rec.atRiskUsd,
+      atRiskBasis: rec.atRiskBasis ?? null,
+      atRiskProvenance: rec.atRiskProvenance ?? null,
+      // The row is OPEN by the guard above, so it has no R to restate — the
+      // same `null` the TRA-4028 fold writes for an OPEN row.
+      realizedR: null,
+      outcome: 'OPEN',
+      supersededAt: ts ?? 0,
+      reason: base.reason ?? '',
+      issue: base.issue ?? '',
+    };
+    const priorAdds = rec.convictionAdds;
+    const convictionAdds: OptionTradeJournalConvictionAdds = {
+      adds: (priorAdds?.adds ?? 0) + 1,
+      // Latched at the FIRST add and never re-read: after that fold `rec` no
+      // longer holds the mint figures, so a later add re-deriving them would
+      // silently adopt the previous add's totals as "the mint".
+      mintContracts: priorAdds
+        ? priorAdds.mintContracts
+        : (Number.isFinite(rec.contracts as number) ? (rec.contracts as number) : null),
+      mintAtRiskUsd: priorAdds ? priorAdds.mintAtRiskUsd : rec.atRiskUsd,
+      addedContracts: (priorAdds?.addedContracts ?? 0) + line.addedContracts,
+      addedPremiumUsd: round2((priorAdds?.addedPremiumUsd ?? 0) + line.addedPremiumUsd),
+      firstAddTs: priorAdds?.firstAddTs ?? (ts ?? 0),
+      lastAddTs: ts ?? 0,
+    };
+    pushConvictionAdd(convictionAddSink, {
+      ...base, applied: true, refusal: null, contractsAfter: line.contracts, atRiskUsdAfter: atRiskUsd,
+    });
+    map.set(line.id, {
+      ...rec,
+      contracts: line.contracts,
+      atRiskUsd,
+      convictionAdds,
+      supersededOpenBasis: [...(rec.supersededOpenBasis ?? []), prior],
+    });
+    return;
+  }
   if (line.kind === 'supersede_close') {
     // TRA-4004 — replace the close on a CLOSED row with a DIFFERENT close.
     //
@@ -2040,9 +2337,13 @@ function foldLine(
       // the basis of a close that was never this position's, and `kept` would
       // otherwise carry it onto a close it did not price.
       entryBasisPremium: _entryBasis,
+      // TRA-4609 — and the replaced close's SIZE, for exactly the same reason:
+      // `contractsAtClose` says how many lots THAT close settled, and a close
+      // that was never this position's cannot testify about this one's size.
+      contractsAtClose: _contractsAtClose,
       ...kept
     } = rec;
-    void _pnlBasis; void _feesUsd; void _entryFillPremium; void _exitFillPremium; void _before; void _exitSlippage; void _entryBasis;
+    void _pnlBasis; void _feesUsd; void _entryFillPremium; void _exitFillPremium; void _before; void _exitSlippage; void _entryBasis; void _contractsAtClose;
     map.set(line.id, {
       ...kept,
       outcome: c.outcome,
@@ -2057,6 +2358,11 @@ function foldLine(
       // absent (never the replaced close's).
       ...(typeof c.entryBasisPremium === 'number' && Number.isFinite(c.entryBasisPremium) && c.entryBasisPremium > 0
         ? { entryBasisPremium: c.entryBasisPremium }
+        : {}),
+      // TRA-4609 — likewise: the superseding close names its own size, or the
+      // field is absent (never the replaced close's).
+      ...(typeof c.contractsAtClose === 'number' && Number.isFinite(c.contractsAtClose) && c.contractsAtClose > 0
+        ? { contractsAtClose: c.contractsAtClose }
         : {}),
       supersededCloses: [...(rec.supersededCloses ?? []), prior],
     });
@@ -2146,6 +2452,14 @@ function foldLine(
       && Number.isFinite(line.close.stopBasisRPerPremiumR)
       ? { stopBasisRPerPremiumR: line.close.stopBasisRPerPremiumR }
       : {}),
+    // TRA-4609 — the size the position SETTLED, beside the entry-side
+    // `contracts`. Absent stays absent: a pre-stamp close has no size witness,
+    // and ⛔ a reconstructed one is a fabricated column.
+    ...(typeof line.close.contractsAtClose === 'number'
+      && Number.isFinite(line.close.contractsAtClose)
+      && line.close.contractsAtClose > 0
+      ? { contractsAtClose: line.close.contractsAtClose }
+      : {}),
   });
 }
 
@@ -2164,6 +2478,8 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
   const supersedeSink: OptionTradeCloseSupersedeRecord[] = [];
   // TRA-4028 — and the entry-basis witness.
   const openBasisSink: OptionTradeOpenBasisAmendRecord[] = [];
+  // TRA-4609 — and the conviction-DCA add witness.
+  const convictionAddSink: OptionTradeConvictionAddRecord[] = [];
   if (existsSync(path)) {
     try {
       const raw = await readFile(path, 'utf-8');
@@ -2171,7 +2487,7 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
         const trimmed = rawLine.trim();
         if (!trimmed) continue;
         try {
-          foldLine(map, JSON.parse(trimmed) as JournalLine, voidSink, amendSink, supersedeSink, openBasisSink);
+          foldLine(map, JSON.parse(trimmed) as JournalLine, voidSink, amendSink, supersedeSink, openBasisSink, convictionAddSink);
         } catch {
           // Skip a single corrupt line rather than losing the whole journal — but
           // COUNT it, so a dropped row cannot pass for a clean load.
@@ -2195,6 +2511,7 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
   closeBasisAmendLedger = amendSink;
   closeSupersedeLedger = supersedeSink;
   openBasisAmendLedger = openBasisSink;
+  convictionAddLedger = convictionAddSink;
 
   // TRA-1681 — do NOT cache a book we could not read.
   //
@@ -2720,6 +3037,83 @@ export async function recordOptionTradeOpenBasis(
     atRiskBasis: basis.atRiskBasis,
     realizedRBefore: witness.realizedRBefore,
     realizedRAfter: witness.realizedRAfter,
+  });
+  return { applied: true, refusal: null };
+}
+
+/**
+ * TRA-4609 — fold a conviction-DCA (TRA-964) scale-in onto the OPEN row.
+ *
+ * Called by `PaperOptionsAccount.addToOptionPosition` after the BOOK mutation
+ * commits, so the journal can only ever learn about lots the book actually
+ * bought. `addedPremiumUsd` is the cash the add consumed
+ * (`addContracts × addDebitPerContract`) and `contracts` is the book's post-add
+ * total — the same two numbers the caller already has in hand; nothing here
+ * re-derives them from the row, which is what keeps this safe to run behind the
+ * `journalWrites` chain.
+ *
+ * Folds first, appends only if the fold APPLIED, so the file never carries a
+ * line a replay would refuse. Does NOT notify close listeners: no money was
+ * realized, and the learner re-reads the journal (TRA-1046), which now serves
+ * the committed-capital basis.
+ *
+ * ⚠️ A refusal is a FINDING, not a fallback. The book has grown and the row has
+ * not, which is the frozen-basis state this ticket exists to end — so it is
+ * WARNED and witnessed on {@link getOptionTradeConvictionAdds}, never returned
+ * as a quiet `false`. It must not be retried into the file: a refused line
+ * re-refuses on every cold load.
+ */
+export async function recordOptionTradeConvictionAdd(
+  id: string,
+  add: { addedContracts: number; addedPremiumUsd: number; contracts: number },
+  meta: { reason: string; issue: string },
+  // Test seam — pin the witness clock. Defaults to wall time.
+  ts: number = Date.now(),
+): Promise<{ applied: boolean; refusal: OptionTradeConvictionAddRecord['refusal'] }> {
+  if (!isOptionTradeJournalEnabled()) return { applied: false, refusal: null };
+  const map = await ensureLoaded();
+  const existing = map.get(id);
+  const line: AmendOpenLotsLine = {
+    kind: 'amend_open_lots',
+    id,
+    ts,
+    addedContracts: add.addedContracts,
+    addedPremiumUsd: add.addedPremiumUsd,
+    contracts: add.contracts,
+    reason: meta.reason,
+    issue: meta.issue,
+  };
+  const before = convictionAddLedger.length;
+  foldLine(map, line);
+  const witness = convictionAddLedger[convictionAddLedger.length - 1];
+  const applied = convictionAddLedger.length > before && witness !== undefined && witness.id === id && witness.applied;
+  if (!applied) {
+    log.warn('option trade journal conviction-DCA add REFUSED; the row keeps its MINTED basis', {
+      issue: meta.issue,
+      id,
+      reason: meta.reason,
+      refusal: witness?.refusal ?? null,
+      optionSymbol: existing?.optionSymbol ?? null,
+      mode: existing?.mode ?? null,
+      outcome: existing?.outcome ?? null,
+      rowAtRiskUsd: existing?.atRiskUsd ?? null,
+      rowContracts: existing?.contracts ?? null,
+      addedContracts: add.addedContracts,
+      addedPremiumUsd: add.addedPremiumUsd,
+    });
+    return { applied: false, refusal: witness?.refusal ?? null };
+  }
+  await appendLine(line);
+  log.info('option trade journal ENTRY BASIS GREW on a conviction-DCA add', {
+    issue: meta.issue,
+    id,
+    reason: meta.reason,
+    optionSymbol: existing?.optionSymbol ?? null,
+    mode: existing?.mode ?? null,
+    contractsBefore: witness.contractsBefore,
+    contractsAfter: witness.contractsAfter,
+    atRiskUsdBefore: witness.atRiskUsdBefore,
+    atRiskUsdAfter: witness.atRiskUsdAfter,
   });
   return { applied: true, refusal: null };
 }

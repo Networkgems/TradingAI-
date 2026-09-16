@@ -320,6 +320,7 @@ import {
   getOptionTradeCloseBasisAmends, // TRA-2819 — the acceptance witness for the broker-basis restatement
   getOptionTradeCloseSupersedes, // TRA-4004 — the acceptance witness for a real close landing on an already-closed row
   getOptionTradeOpenBasisAmends, // TRA-4028 — the acceptance witness for an entry-basis restatement (blend → own fill)
+  getOptionTradeConvictionAdds, // TRA-4609 — the acceptance witness for a conviction-DCA add growing an OPEN row's basis
   GATE_R_BASIS_STRUCTURES, // TRA-2590 — which structures have a valid premium→gate R conversion
   type OptionTradeJournalSummary,
   type OptionTradeJournalIntegrity,
@@ -7907,6 +7908,19 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // `refused: unknown_row` is a finding. Per-row, `rows[].atRiskBasis`
       // says which instrument priced every import row minted since this cut.
       openBasisAmends: getOptionTradeOpenBasisAmends(),
+      // TRA-4609 — the fifth correction witness, and the only ENGINE-written
+      // one: a conviction-DCA (TRA-964) scale-in GREW an OPEN row's
+      // `contracts`/`atRiskUsd` so its eventual R divides an all-lots P&L by
+      // all-lots capital. Before this the add moved the book and nothing else,
+      // and premium R came out overstated by `totalContracts / mintContracts`
+      // (measured 8/12 closed rows, 2x on seven, pin `f8f7b1855da0`).
+      //
+      // ⚠️ Read `refused`: every refusal is a row still publishing the frozen
+      // minted basis, and the row itself cannot say so. Per-row, the durable
+      // statement is `rows[].convictionAdds` (absent = no add was folded) and
+      // `rows[].contractsAtClose`. ⛔ Neither is backfilled, so absence on a
+      // row closed before this cut is UNKNOWN, not "never added".
+      convictionAdds: getOptionTradeConvictionAdds(),
       // TRA-4453 — the self-driving re-grade of `atRiskBasis: 'mark'` import
       // rows against the ledger AFTER each `history_import` backfill. Read
       // `lastRows[].verdict`: `promote` is applied as a LABEL-only amend (see
