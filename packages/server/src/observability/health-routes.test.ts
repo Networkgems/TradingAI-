@@ -7214,7 +7214,7 @@ describe('GET /api/health/live-enforce-gates — arm.universe.ratification (TRA-
 
   type Stamp = {
     var: string; byVar: string | null; raw: string | null; ratifiedBy: string | null;
-    matchesLive: boolean | 'unstamped'; reason: string; note: string;
+    matchesLive: boolean | null; reason: string; note: string;
     ratifiedSymbols: string[] | null; ratifiedRestricted: boolean | null;
     onlyLive: string[]; onlyRatified: string[];
   };
@@ -7268,20 +7268,31 @@ describe('GET /api/health/live-enforce-gates — arm.universe.ratification (TRA-
   });
 
   // ── Acceptance 3 — an unset stamp is UNKNOWN, never a pass ────────────────
-  it("reads 'unstamped' when the var is unset — NOT true, even on the shipped default", () => {
+  it('reads NULL when the var is unset — NOT true, and FALSY, even on the shipped default', () => {
     const { universe, note } = serveGates();
     expect(universe.symbols).toEqual(['AAPL', 'SPY', 'QQQ', 'PLTR', 'TSLA']); // the default
-    expect(universe.ratification.matchesLive).toBe('unstamped');
+    expect(universe.ratification.matchesLive).toBeNull();
     expect(universe.ratification.matchesLive).not.toBe(true);
-    expect(universe.ratification.reason).toBe('absent');
+    // ⭐ TRA-4619 — THE defect this flip exists for, and it is NOT implied by the
+    // value assertion above. The old `'unstamped'` satisfied `toBe('unstamped')`
+    // and `not.toBe(true)` while being TRUTHY, so a reader writing the obvious
+    // `if (r.matchesLive) { /* authorized */ }` passed on an unstamped universe.
+    // Assert the TRUTHINESS, because that is what callers actually branch on.
+    expect(Boolean(universe.ratification.matchesLive)).toBe(false);
+    expect(universe.ratification.matchesLive ? 'AUTHORIZED' : 'NOT-AUTHORIZED').toBe('NOT-AUTHORIZED');
+    // The state NAME moved here when the verdict became `null` (TRA-4258 c1).
+    expect(universe.ratification.reason).toBe('unstamped');
     expect(universe.ratification.raw).toBeNull();
     expect(universe.ratification.ratifiedSymbols).toBeNull();
     expect(note).toMatch(/RATIFICATION UNSTAMPED/);
   });
 
-  it('a BLANK stamp is unstamped, not an empty ratified set', () => {
+  it('a BLANK stamp is null/unstamped, not an empty ratified set', () => {
     process.env[RATIFIED_VAR] = '   ';
-    expect(serveGates().universe.ratification.matchesLive).toBe('unstamped');
+    const { universe } = serveGates();
+    expect(universe.ratification.matchesLive).toBeNull();
+    expect(Boolean(universe.ratification.matchesLive)).toBe(false);
+    expect(universe.ratification.reason).toBe('unstamped');
   });
 
   // ── The trap the ticket names: a stamp that defaults to OK ────────────────
@@ -7358,7 +7369,7 @@ describe('GET /api/health/live-enforce-gates — arm.costBar.ratification (TRA-4
 
   type NumStamp = {
     var: string; byVar: string | null; raw: string | null; ratifiedBy: string | null;
-    matchesLive: boolean | 'unstamped'; reason: string; note: string;
+    matchesLive: boolean | null; reason: string; note: string;
     ratifiedValue: number | null; liveValue: number;
   };
   type CostBarBlock = {
@@ -7430,15 +7441,20 @@ describe('GET /api/health/live-enforce-gates — arm.costBar.ratification (TRA-4
   });
 
   // ── AC3 — an unset stamp is UNKNOWN, and UNKNOWN is not OK ────────────────
-  it("reads 'unstamped' when unset — explicitly NEITHER true NOR false", () => {
+  it('reads NULL when unset — explicitly NEITHER true NOR false, and FALSY', () => {
     process.env[MARGIN_VAR] = '0.10'; // the ratified value: a "compare to the
     // default and pass" implementation would report a spurious `true` here.
     const { costBar, note } = serveGates();
     expect(costBar.bar.safetyMarginR).toBe(0.1);
-    expect(costBar.ratification.matchesLive).toBe('unstamped');
+    expect(costBar.ratification.matchesLive).toBeNull();
     expect(costBar.ratification.matchesLive).not.toBe(true);
     expect(costBar.ratification.matchesLive).not.toBe(false);
-    expect(costBar.ratification.reason).toBe('absent');
+    // ⭐ TRA-4619 — the truthiness IS the contract. `'unstamped'` passed every
+    // assertion above and still authorized under `if (r.matchesLive)`; this is
+    // the line that fails if the UNKNOWN state is ever given a truthy value.
+    expect(Boolean(costBar.ratification.matchesLive)).toBe(false);
+    expect(costBar.ratification.matchesLive ? 'AUTHORIZED' : 'NOT-AUTHORIZED').toBe('NOT-AUTHORIZED');
+    expect(costBar.ratification.reason).toBe('unstamped');
     expect(costBar.ratification.raw).toBeNull();
     expect(costBar.ratification.ratifiedValue).toBeNull();
     expect(costBar.ratification.ratifiedBy).toBeNull();
@@ -7446,10 +7462,12 @@ describe('GET /api/health/live-enforce-gates — arm.costBar.ratification (TRA-4
     expect(note).toMatch(/cost-bar safety margin: RATIFICATION UNSTAMPED|RATIFICATION UNSTAMPED \(OPTION_COST_GATE_SAFETY_MARGIN_R_RATIFIED/);
   });
 
-  it('a BLANK stamp is unstamped, not a zero ratified value', () => {
+  it('a BLANK stamp is null/unstamped, not a zero ratified value', () => {
     process.env[RATIFIED_VAR] = '   ';
     const { costBar } = serveGates();
-    expect(costBar.ratification.matchesLive).toBe('unstamped');
+    expect(costBar.ratification.matchesLive).toBeNull();
+    expect(Boolean(costBar.ratification.matchesLive)).toBe(false);
+    expect(costBar.ratification.reason).toBe('unstamped');
     expect(costBar.ratification.ratifiedValue).toBeNull();
   });
 
@@ -7505,7 +7523,7 @@ describe('GET /api/health/live-enforce-gates — arm.costBar.ratification (TRA-4
     // The verdicts genuinely differ — otherwise the assertion above is vacuous.
     expect(stampedMismatch.ratification.matchesLive).toBe(false);
     expect(stampedMatch.ratification.matchesLive).toBe(true);
-    expect(unstamped.ratification.matchesLive).toBe('unstamped');
+    expect(unstamped.ratification.matchesLive).toBeNull();
   });
 });
 
@@ -7528,11 +7546,11 @@ describe('GET /api/health/live-options-fee-slippage — capRatification (TRA-369
     }
   });
 
-  type CapStamp = { matchesLive: boolean | 'unstamped'; reason: string; ratifiedValue: number | null; liveValue: number; note: string };
+  type CapStamp = { matchesLive: boolean | null; reason: string; ratifiedValue: number | null; liveValue: number; note: string };
   type CapsBody = {
     notionalCapUsd: number; aggregateCapUsd: number;
     capRatification: { notionalCap: CapStamp; aggregateCap: CapStamp };
-    ratificationMatchesLive: boolean | 'unstamped';
+    ratificationMatchesLive: boolean | null;
   };
   function serveCaps(): CapsBody {
     const { app, routes } = fakeApp();
@@ -7547,11 +7565,20 @@ describe('GET /api/health/live-options-fee-slippage — capRatification (TRA-369
     return res.body as CapsBody;
   }
 
-  it("is 'unstamped' out of the box — an unset stamp never reads as a pass", () => {
+  it('is NULL out of the box — an unset stamp never reads as a pass, and is FALSY', () => {
     const body = serveCaps();
-    expect(body.capRatification.notionalCap.matchesLive).toBe('unstamped');
-    expect(body.capRatification.aggregateCap.matchesLive).toBe('unstamped');
-    expect(body.ratificationMatchesLive).toBe('unstamped');
+    expect(body.capRatification.notionalCap.matchesLive).toBeNull();
+    expect(body.capRatification.aggregateCap.matchesLive).toBeNull();
+    expect(body.ratificationMatchesLive).toBeNull();
+    // ⭐ TRA-4619 — the FOLD's truthiness, which is what a reader checking one
+    // field instead of walking the payload actually branches on. Under the old
+    // `'unstamped'` this whole route published a TRUTHY "everything is fine".
+    expect(Boolean(body.ratificationMatchesLive)).toBe(false);
+    expect(Boolean(body.capRatification.notionalCap.matchesLive)).toBe(false);
+    expect(Boolean(body.capRatification.aggregateCap.matchesLive)).toBe(false);
+    expect(body.ratificationMatchesLive ? 'AUTHORIZED' : 'NOT-AUTHORIZED').toBe('NOT-AUTHORIZED');
+    expect(body.capRatification.notionalCap.reason).toBe('unstamped');
+    expect(body.capRatification.aggregateCap.reason).toBe('unstamped');
   });
 
   it('reads TRUE when both stamps equal the RESOLVED caps', () => {
@@ -7575,15 +7602,33 @@ describe('GET /api/health/live-options-fee-slippage — capRatification (TRA-369
     expect(body.capRatification.aggregateCap.note).toMatch(/LOOSER than the authorization/);
   });
 
-  it('the fold is FAIL-LOUD: one false beats one unstamped', () => {
+  it('the fold is FAIL-LOUD: one false beats one null/unstamped', () => {
     process.env.OPTION_LIVE_TEST_AGGREGATE_CAP_USD_RATIFIED = '250'; // false
-    // notionalCap stays unset => 'unstamped'
+    // notionalCap stays unset => null
     const body = serveCaps();
-    expect(body.capRatification.notionalCap.matchesLive).toBe('unstamped');
+    expect(body.capRatification.notionalCap.matchesLive).toBeNull();
+    // PRECEDENCE UNCHANGED BY TRA-4619: a real mismatch still OUTRANKS an
+    // unknown. `false`, not `null` — this is the assertion that catches a fold
+    // "simplified" into returning the first non-`true` it sees.
     expect(body.ratificationMatchesLive).toBe(false);
   });
 
-  it('a non-numeric stamp reads FALSE, not unstamped', () => {
+  it('the fold reads NULL — not true — when one stamp is unknown and none mismatch', () => {
+    // TRA-4619: `[true, null] => null`. The partial-stamp case, which is the one
+    // an operator lands in halfway through ratifying, and it must not read as a
+    // pass. Asserted on the SHIPPED route so it covers the wiring, not just the
+    // pure fold.
+    const live = serveCaps();
+    process.env.OPTION_LIVE_TEST_NOTIONAL_CAP_USD_RATIFIED = String(live.notionalCapUsd); // true
+    // aggregateCap deliberately left unset => null
+    const body = serveCaps();
+    expect(body.capRatification.notionalCap.matchesLive).toBe(true);
+    expect(body.capRatification.aggregateCap.matchesLive).toBeNull();
+    expect(body.ratificationMatchesLive).toBeNull();
+    expect(Boolean(body.ratificationMatchesLive)).toBe(false);
+  });
+
+  it('a non-numeric stamp reads FALSE, not null/unstamped', () => {
     process.env.OPTION_LIVE_TEST_NOTIONAL_CAP_USD_RATIFIED = 'yes';
     const s = serveCaps().capRatification.notionalCap;
     expect(s.matchesLive).toBe(false);
