@@ -1673,6 +1673,158 @@ export function summarizeSma200ForwardTestFills(
   };
 }
 
+// ── TRA-4457 sma200 sweep census (fleet fold) ────────────────────────────────
+
+/**
+ * TRA-4457 — the fleet answer to "does an empty sma200 signal feed mean a quiet
+ * market, or a scan that could not look?".
+ *
+ * `21b15106` put the census on `EngineState.sma200ScanStats` and the grade on
+ * `EngineState.sma200SweepVerdict`, and that was as far as it got: the only
+ * health route that is handed an `EngineState` (`/options-pipeline`) projects
+ * it down to a fixed whitelist, so neither field reaches any unauthenticated
+ * surface. Measured against live bqb1 on 2026-09-16 (`f3ce18b6`, pid 77): 65
+ * engines served, **0** exposing either key. That is this ticket's own defect
+ * one layer out — a grader that is correct and published by nobody — so the
+ * fold lives here, on the sma200 route, where the monitor already reads.
+ *
+ * ⚠️ WHOLE FLEET, BOTH MODES. `runSma200Scan` is driven from `doTick` behind an
+ * interval + the process-wide scan slot, with no mode predicate, so a
+ * `.filter(mode === 'demo')` here would silently drop engines that really do
+ * sweep — the TRA-2650 / TRA-3445 lesson, in the caller where no unit test can
+ * see it. The per-mode split is published instead so a reader narrows it
+ * themselves.
+ */
+export interface Sma200SweepCensusReport {
+  /** Engines folded (whole fleet, both modes). */
+  engines: number;
+  /** …of which `mode === 'live'`. The rest are demo. */
+  liveEngines: number;
+  /**
+   * Engines that have completed at least one sweep since boot, i.e. carry a
+   * non-null census. This is the DENOMINATOR of every verdict below.
+   */
+  graded: number;
+  /**
+   * Engines whose census is still `null` — no sweep has finished on them yet
+   * (a fresh boot; the interval is minutes). Explicitly NOT folded into
+   * `BLIND`: "has not looked yet" and "looked and saw nothing" are different
+   * facts, and collapsing them re-creates the defect this ticket is about.
+   */
+  neverSwept: number;
+  /**
+   * Engines served by a build that does not carry the census at all (neither
+   * key present on the state object). Non-zero ⇒ `21b15106` is not live here
+   * and NO reading below is evidence about the feed. ABSENT ≠ AGREE.
+   */
+  unpublished: number;
+  /** Per-verdict engine counts over the `graded` denominator. */
+  byVerdict: { SWEPT: number; BLIND: number; NO_UNIVERSE: number };
+  /**
+   * The fleet fold.
+   *
+   * - `NO_SWEEP_YET`  — nothing graded yet. Not a reading.
+   * - `NO_UNIVERSE`   — every graded engine was handed zero symbols (upstream
+   *                     watchlist fault, not a starved feed).
+   * - `BLIND`         — at least one engine graded and NONE scored a symbol.
+   *                     An empty feed here says nothing about the market.
+   * - `PARTIAL_BLIND` — some engines scored, some could not look. The feed is
+   *                     a lower bound, never a "quiet day".
+   * - `SWEPT`         — at least one engine scored and none went blind. Only
+   *                     here may an empty feed be reported as "no setup fired".
+   */
+  verdict: 'NO_SWEEP_YET' | 'NO_UNIVERSE' | 'BLIND' | 'PARTIAL_BLIND' | 'SWEPT';
+  /** Σ over graded engines' most-recent sweeps. Counters only, no symbols. */
+  totals: {
+    considered: number;
+    evaluated: number;
+    starvedBreakerOpen: number;
+    starvedShortHistory: number;
+    fetchFailed: number;
+    fired: number;
+    voided: number;
+  };
+  /** ISO time the most-recent sweep in the fleet finished, or null. */
+  newestSweepAt: string | null;
+  /** Age of `newestSweepAt` in ms at read time — a stale census is not a live one. */
+  newestSweepAgeMs: number | null;
+}
+
+/**
+ * Fold the fleet's sweep censuses. Pure (clock injected) so the five verdict
+ * arms are unit-gradeable without a server.
+ *
+ * The load-bearing arm is the one that looks like nothing: a fleet that scored
+ * symbols and fired zero reads `SWEPT`. Folding on `fired` instead of
+ * `evaluated` would collapse quiet and starved into one verdict — the exact
+ * defect TRA-4457 was filed for, one layer above where `sma200SweepVerdict`
+ * already refuses it.
+ */
+export function summarizeSma200Sweeps(
+  engines: Array<{ state: EngineState; mode: string }>,
+  now: number,
+): Sma200SweepCensusReport {
+  const byVerdict = { SWEPT: 0, BLIND: 0, NO_UNIVERSE: 0 };
+  const totals = {
+    considered: 0, evaluated: 0, starvedBreakerOpen: 0,
+    starvedShortHistory: 0, fetchFailed: 0, fired: 0, voided: 0,
+  };
+  let graded = 0;
+  let neverSwept = 0;
+  let unpublished = 0;
+  let liveEngines = 0;
+  let newestFinishedAt: number | null = null;
+
+  for (const { state, mode } of engines) {
+    if (mode === 'live') liveEngines++;
+    // A build without the census carries NEITHER key. A build WITH it carries
+    // both, holding `null` until the first sweep lands. Keying on the key's
+    // presence (not its value) is what keeps "old build" out of "quiet fleet".
+    if (!('sma200ScanStats' in state) && !('sma200SweepVerdict' in state)) {
+      unpublished++;
+      continue;
+    }
+    const stats = state.sma200ScanStats ?? null;
+    const verdict = state.sma200SweepVerdict ?? null;
+    if (stats === null || verdict === null) {
+      neverSwept++;
+      continue;
+    }
+    graded++;
+    byVerdict[verdict]++;
+    totals.considered += stats.considered;
+    totals.evaluated += stats.evaluated;
+    totals.starvedBreakerOpen += stats.starvedBreakerOpen;
+    totals.starvedShortHistory += stats.starvedShortHistory;
+    totals.fetchFailed += stats.fetchFailed;
+    totals.fired += stats.fired;
+    totals.voided += stats.voided;
+    if (newestFinishedAt === null || stats.finishedAt > newestFinishedAt) {
+      newestFinishedAt = stats.finishedAt;
+    }
+  }
+
+  let verdict: Sma200SweepCensusReport['verdict'];
+  if (graded === 0) verdict = 'NO_SWEEP_YET';
+  else if (byVerdict.NO_UNIVERSE === graded) verdict = 'NO_UNIVERSE';
+  else if (byVerdict.SWEPT > 0 && byVerdict.BLIND > 0) verdict = 'PARTIAL_BLIND';
+  else if (byVerdict.SWEPT > 0) verdict = 'SWEPT';
+  else verdict = 'BLIND';
+
+  return {
+    engines: engines.length,
+    liveEngines,
+    graded,
+    neverSwept,
+    unpublished,
+    byVerdict,
+    verdict,
+    totals,
+    newestSweepAt: newestFinishedAt === null ? null : new Date(newestFinishedAt).toISOString(),
+    newestSweepAgeMs: newestFinishedAt === null ? null : now - newestFinishedAt,
+  };
+}
+
 // ── TRA-895 options-signal pipeline probe ─────────────────────────────────────
 
 /**
@@ -7440,7 +7592,13 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // landed", so the monitor could never close on first fill. Sourced from the
     // demo fleet's paper books (forwardTestOnly marker = this path's unique
     // fingerprint); demo-money only, no secrets, no live capital.
-    const fills = summarizeSma200ForwardTestFills(demoModeBooks(deps.fleetBooks?.() ?? []));
+    const fleet = deps.fleetBooks?.() ?? [];
+    const fills = summarizeSma200ForwardTestFills(demoModeBooks(fleet));
+    // TRA-4457 — the sweep census, WHOLE FLEET (see `summarizeSma200Sweeps`).
+    // `fills` above is demo-only because a forward-test fill is demo-only by
+    // construction; a SWEEP is not, so the two folds take different populations
+    // off the same `fleet` read deliberately.
+    const sweep = summarizeSma200Sweeps(fleet, now());
     res.json({
       ok: true,
       time: new Date(now()).toISOString(),
@@ -7456,6 +7614,14 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       closedCount: fills.closedCount,
       lastFillAt: fills.lastFillAt,
       realizedPnl: fills.realizedPnl,
+      /**
+       * TRA-4457 — read `sweep.verdict` BEFORE reading `fillCount: 0` or an
+       * empty signal feed as a quiet market. `BLIND` / `PARTIAL_BLIND` /
+       * `NO_SWEEP_YET` mean the scan could not look, and a zero under any of
+       * them is not evidence about the market. `unpublished > 0` means this
+       * build predates the census and nothing here is a reading at all.
+       */
+      sweep,
       note: enabled
         ? 'ARMED: sma200_pullback opens demo-only forward-test (forwardTestOnly) paper fills; live stays hard-gated.'
         : 'DISARMED: sma200_pullback stays display-only in demo. Set ENABLE_SMA200_DEMO_FORWARD_TEST=true (render.yaml env or DATA_DIR/demo-flags.json) to arm.',
