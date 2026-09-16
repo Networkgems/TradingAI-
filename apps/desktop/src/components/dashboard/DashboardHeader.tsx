@@ -3,7 +3,7 @@
 // auto-trading toggle (with its in-flight lock), and the theme + profile
 // controls. The auto-trading POST lives here because nothing else needs it.
 import { useState } from 'react';
-import type { AccountState, OptionsAccountState } from '@trading-app/shared';
+import type { AccountState, OptionsAccountState, HiddenBookExposure } from '@trading-app/shared';
 import { HTTP_URL } from '../../server-url';
 import { logger } from '../../lib/logger';
 import { useToast } from '../../lib/toast.tsx';
@@ -17,6 +17,9 @@ import { KillSwitchButton } from './KillSwitchButton';
 import { TradingAgentsButton } from './TradingAgentsButton';
 import { AgentGatingButton } from './AgentGatingButton';
 import { VersionChip } from './VersionChip';
+// TRA-4502 — the exposure clause the TRA-3910 chip appends. Same module as the
+// banner so the chip and the escalation cannot describe the payload differently.
+import { hiddenBookChipSuffix, hiddenBookStopLine } from './HiddenBookBanner';
 import type { ProfileModal } from './ProfileModals';
 
 export function DashboardHeader({
@@ -35,6 +38,7 @@ export function DashboardHeader({
   accountMode,
   engineMode,
   liveBrokerArmPinned,
+  hiddenBookExposure,
   onAccountModeChange,
   theme,
   onToggleTheme,
@@ -67,6 +71,14 @@ export function DashboardHeader({
   engineMode?: 'demo' | 'live';
   /** TRA-3910 — whether the TRA-2649 arm governs this user's `mode`. */
   liveBrokerArmPinned?: boolean;
+  /**
+   * TRA-4502 (parent TRA-4284) — what is in the book this dashboard is NOT
+   * showing, off `/api/state`. The TRA-3910 chip below states the ROUTING fact;
+   * this is the EXPOSURE fact it could not state, and it rides the same chip so
+   * a count is on screen every frame — not only when something is wrong.
+   * Absent ⇒ no override is set and nothing is hidden.
+   */
+  hiddenBookExposure?: HiddenBookExposure | null;
   onAccountModeChange: (mode: 'demo' | 'live') => void;
   theme: Theme;
   onToggleTheme: () => void;
@@ -80,6 +92,11 @@ export function DashboardHeader({
   // TRA-3910 — routing mode; equals the shown book unless a view override is set.
   const routingMode: 'demo' | 'live' = engineMode ?? accountMode;
   const viewingOtherBook = routingMode !== accountMode;
+  // TRA-4502 — the exposure clause the chip appends. `null` on a pre-TRA-4502
+  // server (the field is simply absent), which renders the chip exactly as
+  // TRA-3910 left it rather than asserting an empty book.
+  const hiddenChipSuffix = hiddenBookChipSuffix(hiddenBookExposure);
+  const hiddenStopLine = hiddenBookExposure ? hiddenBookStopLine(hiddenBookExposure) : null;
 
   async function toggleAutoTrading() {
     setTradingToggling(true);
@@ -126,9 +143,23 @@ export function DashboardHeader({
           <span
             className="book-view-banner"
             data-testid="book-view-banner"
-            title={`The dashboard is showing the ${accountMode.toUpperCase()} book. The engine is still routing orders to the ${routingMode.toUpperCase()} account — nothing was disarmed.`}
+            title={
+              `The dashboard is showing the ${accountMode.toUpperCase()} book. The engine is still routing orders to the ${routingMode.toUpperCase()} account — nothing was disarmed.`
+              // TRA-4502 — the census detail rides the tooltip so the quiet
+              // readings (a held stop with a known release, an exit working at
+              // the broker) are reachable without waiting for a banner.
+              + (hiddenStopLine === null ? '' : ` ${hiddenStopLine}`)
+            }
           >
             Viewing {accountMode.toUpperCase()} book · engine is {routingMode.toUpperCase()}
+            {/* TRA-4502 — ...and this is what is IN the book you are not
+                looking at. Rendered every frame, breach or no breach: "0 open
+                LIVE rows" on a quiet day is what makes "3 breached" legible on
+                a bad one. A breach also escalates to `HiddenBookBanner`; this
+                clause is the standing disclosure, not the alarm. */}
+            {hiddenChipSuffix !== null && (
+              <span data-testid="book-view-exposure"> · {hiddenChipSuffix}</span>
+            )}
           </span>
         )}
       </div>

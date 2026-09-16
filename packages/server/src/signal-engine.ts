@@ -12,9 +12,12 @@ import {
   darkBrokerPositionDriftReport,
   type LiveBrokerPositionDriftReport,
 } from './live-broker-position-drift.js';
+// TRA-4502 (parent TRA-4284) — the wire fold for the book a `viewMode` override
+// is HIDING. Pure; see the module doc for why it invents no new census.
+import { foldHiddenBookExposure } from './hidden-book-exposure.js';
 import { roundToCent } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Sma200SignalVoidRecord, Sma200VoidReason, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Sma200SignalVoidRecord, Sma200VoidReason, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason, HiddenBookExposure } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-3390 (impl child of TRA-2628) — the entry-path currency refusal. See
 // `quoteCurrencyEntryVerdict` below for where it is consulted.
@@ -823,6 +826,19 @@ export interface EngineState {
    */
   bookView?: 'demo' | 'live';
   engineMode?: 'demo' | 'live';
+  /**
+   * TRA-4502 (parent TRA-4284) — exposure in the book this frame is NOT
+   * rendering. Present **only** while `bookView !== engineMode`, i.e. exactly
+   * when a `viewMode` override is hiding a book; absent on every default frame,
+   * which is every frame for every user who has not set one.
+   *
+   * `bookView` / `engineMode` above say which book is on screen and that is a
+   * statement about ROUTING. This is the statement about EXPOSURE that was
+   * missing: how many open rows are in the other book, how much premium, and —
+   * when the other book is the LIVE one — the TRA-3822/TRA-3839 stop census
+   * over them. Absence of the field means "no override", never "nothing there".
+   */
+  hiddenBookExposure?: HiddenBookExposure;
   account: AccountState;
   closedPositions: ReturnType<PaperAccount['checkExits']>;
   options: OptionsAccountState;
@@ -10292,6 +10308,66 @@ export class SignalEngine {
       this.getLiveStopActionabilityRows(at),
       this.getLiveExitPassStatus(at),
     );
+  }
+
+  /**
+   * TRA-4502 (parent TRA-4284) — exposure in the book a `viewMode` override is
+   * HIDING, for the dashboard frame that is rendering the other one.
+   *
+   * The hidden book is always `this.mode`: an override only exists when the
+   * rendered `bookView` differs from the routing mode, so the book not on
+   * screen is the book the engine routes to. Returns `null` when `shownBook`
+   * IS the routing book — no override, nothing hidden, and the field stays off
+   * the frame entirely rather than shipping a row of zeroes to every user.
+   *
+   * ⚠️ Never throws. This is called from `getState()`, which builds every
+   * dashboard frame and every WS broadcast: an exception here would white-screen
+   * the dashboard to report that a stop might not fire, which is strictly worse
+   * than the defect. A census that throws is published as `stops: null` with
+   * `stopsUnavailableReason` naming the failure — BLIND, which the banner
+   * escalates on, and which is not the same as clean.
+   */
+  getHiddenBookExposure(shownBook: 'demo' | 'live', now?: number): HiddenBookExposure | null {
+    const hiddenBook = this.mode;
+    if (hiddenBook === shownBook) return null;
+    const premium = this.optionsAccount.openPremiumAtRiskForMode(hiddenBook);
+    // The census is `mode: 'live'`-scoped by construction (TRA-3822). On a demo
+    // hidden book it is ABSENT WITH A REASON, never a clean zero — a `0` there
+    // would read as "we looked at the money book and it is fine".
+    if (hiddenBook !== 'live') {
+      return foldHiddenBookExposure({
+        hiddenBook,
+        shownBook,
+        premium,
+        absence: { kind: 'hidden_book_is_demo' },
+      });
+    }
+    try {
+      const q = this.getLiveStopActionability(now);
+      return foldHiddenBookExposure({
+        hiddenBook,
+        shownBook,
+        premium,
+        stops: {
+          breached: q.breached,
+          actionable: q.actionable,
+          inFlight: q.inFlight,
+          inert: q.inert,
+          unacted: q.unacted,
+          indefinite: q.indefinite,
+          byReason: q.byReason,
+          releasesAt: q.releasesAt,
+          exitPass: { reaches: q.exitPass.reaches, blockedBy: q.exitPass.blockedBy },
+        },
+      });
+    } catch (err) {
+      return foldHiddenBookExposure({
+        hiddenBook,
+        shownBook,
+        premium,
+        absence: { kind: 'blind', reason: err instanceof Error ? err.message : String(err) },
+      });
+    }
   }
 
   /**
@@ -21363,6 +21439,26 @@ export class SignalEngine {
    */
   getState(view?: 'demo' | 'live'): EngineState {
     const bookView: 'demo' | 'live' = view ?? this.mode;
+    // TRA-4502 (parent TRA-4284) — when this frame renders a book the engine is
+    // NOT routing to, say what is in the other one. Costs nothing on the default
+    // path: `getHiddenBookExposure` returns null the moment the two agree, which
+    // is every frame for every user with no `viewMode` override set.
+    //
+    // The outer guard is for the premium fold, which is the one read here that
+    // is NOT already inside that method's own try. Nothing in `getState` may
+    // throw — a dashboard that white-screens tells the operator strictly less
+    // than the silent demo book this ticket is fixing. An exception is logged
+    // and the field omitted; every other failure publishes a REASON instead.
+    let hiddenBookExposure: HiddenBookExposure | undefined;
+    try {
+      hiddenBookExposure = this.getHiddenBookExposure(bookView) ?? undefined;
+    } catch (err) {
+      log.error('TRA-4502 hidden-book exposure fold failed — frame shipped without it', {
+        bookView,
+        engineMode: this.mode,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
     const symbols = Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol));
     // TRA-844 — spot resolver for the portfolio Greeks rollup. The options
     // account holds positions but not live underlying prices, so we hand it a
@@ -21463,6 +21559,10 @@ export class SignalEngine {
         catalystGateShadowDecisions: this.catalystGateShadowDecisions,
         bookView,
         engineMode: this.mode,
+        // TRA-4502 — spread conditionally: the key is ABSENT on a default frame
+        // (no override), never present-and-empty. A consumer reading `undefined`
+        // is reading "nothing is hidden", which is what that frame means.
+        ...(hiddenBookExposure ? { hiddenBookExposure } : {}),
         account: liveAccount,
         closedPositions: [],
         options: {
@@ -21527,6 +21627,10 @@ export class SignalEngine {
       catalystGateShadowDecisions: this.catalystGateShadowDecisions,
       bookView,
       engineMode: this.mode,
+      // TRA-4502 — THE branch the parent defect renders through: a live-armed
+      // operator with `viewMode: "demo"` gets this frame, with the live book's
+      // open rows / premium / stop census attached.
+      ...(hiddenBookExposure ? { hiddenBookExposure } : {}),
       account: demoAccountWithBreakdown,
       closedPositions: this.allClosedPositions.filter(p => isMode(p.mode)).slice(-20),
       options: {

@@ -4585,6 +4585,117 @@ export interface OptionsAccountState {
 }
 
 /**
+ * TRA-4502 (parent TRA-4284) — the STOP census over the book the dashboard is
+ * NOT rendering. Field-for-field a redacted copy of the server's
+ * `LiveStopActionabilityQualified` (TRA-3822 + TRA-3839), which is the walk the
+ * exit pass itself is graded by; counts and reason LABELS only, never an OCC
+ * symbol, so this rides the same `/api/state` frame the panels do.
+ *
+ * ⚠️ Live-book only. The census is `mode: 'live'`-scoped by construction, so on
+ * a DEMO hidden book it is not a clean `0` — it is {@link HiddenBookExposure.stops}
+ * `= null` with a reason. A zero here would read as "measured, nothing wrong".
+ */
+export interface HiddenBookStopExposure {
+  /** Open rows through an armed stop. `breached === actionable + inFlight + inert`. */
+  breached: number;
+  /** The subset a running exit pass WOULD act on this tick. */
+  actionable: number;
+  /** The subset already carrying a staged/working broker exit. */
+  inFlight: number;
+  /** Breached rows a `continue` in `checkExits` refuses. 0 is the healthy read. */
+  inert: number;
+  /**
+   * TRA-3839's composite — breached rows NOTHING will act on, whether a row
+   * gate refused them or no exit pass reaches the book at all. **This is the
+   * number the banner escalates on when `breached` alone would under-report.**
+   */
+  unacted: number;
+  /** Inert rows whose suppression has no known expiry — they need a human. */
+  indefinite: number;
+  /**
+   * `inert` split by the FIRST refusing gate, count-descending. Reason LABELS
+   * as data (the authoritative union lives with the walk, server-side): a count
+   * cannot tell an operator which gate to go clear.
+   */
+  inertReasons: readonly { reason: string; count: number }[];
+  /** ISO of the earliest instant an inert row is released; null ⇒ none / indefinite. */
+  releasesAt: string | null;
+  /** null ⇒ a pass reaches these rows; else the first blocker in the cadence walk. */
+  exitPassBlockedBy: string | null;
+}
+
+/**
+ * TRA-4502 (parent TRA-4284) — what the operator is NOT looking at.
+ *
+ * Present on an `/api/state` frame **only** while a `viewMode` override is in
+ * force (`bookView !== engineMode`), and it describes the OTHER book — the one
+ * the engine routes to. TRA-3910 already says which book is on screen; that is
+ * a true statement about ROUTING and it is not a statement about EXPOSURE. On
+ * 2026-09-01 the live-armed operator account carried `viewMode: "demo"`, so
+ * every panel rendered the empty paper book while three real-money rows sat
+ * breached and inert in the book that was not being shown, and nothing on the
+ * screen said so.
+ *
+ * Disclosure is the whole control: the override is a legitimate feature and is
+ * deliberately NOT removed or expired (see `docs/view-override-persistence-TRA-4502.md`),
+ * so it is paid for by being self-announcing on every frame.
+ */
+export interface HiddenBookExposure {
+  /** The book NOT on screen. Always the engine's ROUTING book while an override is set. */
+  book: 'demo' | 'live';
+  /** The book on screen — carried so a consumer never has to re-derive the pair. */
+  shownBook: 'demo' | 'live';
+  /** Open option rows in the hidden book, priced and unpriced together. */
+  openOptionRows: number;
+  /** Σ `premiumPaid × contractsRemaining × 100` over the hidden book's open rows, USD. */
+  openPremiumUsd: number;
+  /**
+   * Open rows whose premium was unusable and so contributed $0. Non-zero ⇒
+   * `openPremiumUsd` is known to UNDERSTATE; published rather than folded away.
+   */
+  unpricedRows: number;
+  /** The stop census, or null — read {@link stopsUnavailableReason} before believing an absence. */
+  stops: HiddenBookStopExposure | null;
+  /**
+   * Why {@link stops} is null. `'hidden_book_is_demo'` ⇒ nothing to census (no
+   * real money in a paper book); anything else is the census having THROWN,
+   * i.e. the instrument is blind. null ⇔ `stops` is present.
+   */
+  stopsUnavailableReason: string | null;
+}
+
+/**
+ * TRA-4502 — does a hidden book warrant a BANNER rather than the header chip?
+ *
+ * Lives in `shared` so the server that folds the payload and the dashboard that
+ * renders it cannot disagree about what counts as an escalation — one rule, one
+ * copy. (The parent defect is already one of "two surfaces, one fact"; a second
+ * hand-written threshold on the client would be the same shape again.)
+ *
+ * The parent's acceptance 2 names `breached > 0`. Three further readings are
+ * folded in here because each is a hidden-book state an operator must not miss:
+ *
+ *   • `unacted > 0` — a breached row NOTHING will act on, including because no
+ *     exit pass reaches the book at all (TRA-3839's `noExitPass` cause).
+ *     `breached > 0` subsumes it today; it is named so a later narrowing of
+ *     `breached` cannot silently drop the escalation.
+ *   • the census is ABSENT on a LIVE hidden book holding rows — we cannot say
+ *     the money book is fine, and "we don't know" about real money is a banner,
+ *     not silence.
+ *   • dollars hidden under a census that reports nothing wrong: deliberately
+ *     NOT a banner. A quiet live book behind an override is the chip's job;
+ *     escalating it would make the banner permanent for this operator and
+ *     therefore invisible on the day it means something.
+ */
+export function hiddenBookNeedsBanner(exposure: HiddenBookExposure | null | undefined): boolean {
+  if (!exposure || exposure.book !== 'live') return false;
+  // Absent census on the live book — but only once there is something to be
+  // blind ABOUT. A flat hidden book with no census is not an exposure.
+  if (exposure.stops === null) return exposure.openOptionRows > 0;
+  return exposure.stops.breached > 0 || exposure.stops.unacted > 0;
+}
+
+/**
  * TRA-2043 — HONESTY CAVEAT (survivorship bias): this list is
  * SURVIVORSHIP-SELECTED. It is the equity universe as of 2026-07-18 (today's
  * names) applied uniformly across ALL historical backtest windows — delisted,

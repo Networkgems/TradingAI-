@@ -1,5 +1,5 @@
 // TRA-419 — App-level interfaces extracted from App.tsx.
-import type { TradeSignal, Sma200Signal, AccountState, Position, OptionsAccountState, EngineMarketReviewState, AgentRecommendation } from '@trading-app/shared';
+import type { TradeSignal, Sma200Signal, AccountState, Position, OptionsAccountState, EngineMarketReviewState, AgentRecommendation, HiddenBookExposure } from '@trading-app/shared';
 
 export interface SymbolState {
   symbol: string;
@@ -82,4 +82,9 @@ export interface AppState {
   // gate-consumption flag is off (or no review exists yet); optional so a
   // server running a pre-TRA-389 build still type-checks against this state.
   marketReview?: EngineMarketReviewState;
+  // TRA-4502 (parent TRA-4284) — exposure in the book this frame is NOT
+  // rendering. Present ONLY while a `viewMode` override is in force, so
+  // `undefined` means "nothing is hidden" and never "nothing is there". Drives
+  // the header chip's row count and the `HiddenBookBanner` escalation.
+  hiddenBookExposure?: HiddenBookExposure;
 }

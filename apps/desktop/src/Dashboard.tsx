@@ -29,6 +29,7 @@ import { OtmMispricingPanel } from './components/dashboard/OtmMispricingPanel';
 import { NewsPanel } from './components/dashboard/NewsPanel';
 import { LiveCredentialsBanner } from './components/dashboard/LiveCredentialsBanner';
 import { HaltBanner } from './components/dashboard/HaltBanner';
+import { HiddenBookBanner } from './components/dashboard/HiddenBookBanner';
 import { HealthPanel } from './components/dashboard/HealthPanel';
 import { DashboardTour } from './components/onboarding/CoachMarkTour';
 import { useStockEngine } from './hooks/useStockEngine';
@@ -99,6 +100,7 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
         accountMode={accountMode}
         engineMode={engineMode}
         liveBrokerArmPinned={liveBrokerArmPinned}
+        hiddenBookExposure={state?.hiddenBookExposure ?? null}
         onAccountModeChange={setAccountMode}
         theme={theme}
         onToggleTheme={onToggleTheme}
@@ -147,6 +149,13 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
           });
         }}
       />
+
+      {/* TRA-4502 (parent TRA-4284) — a `viewMode` override is hiding a book
+          with breached real-money rows in it. Banner-level, beside the two
+          above, because every PANEL on this screen is rendering the other book
+          and none of them can say so. Renders nothing unless the hidden book is
+          the LIVE one and something in it needs an operator. */}
+      <HiddenBookBanner exposure={state?.hiddenBookExposure ?? null} />
 
       {/* TRA-690 — grouped nav: the core trading workflow (Watchlist → Signals →
           Positions → Options → AI Ideas) stays flat; reference/utility surfaces
