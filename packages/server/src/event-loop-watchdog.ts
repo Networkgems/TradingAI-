@@ -387,8 +387,24 @@ export interface SamplerAttribution {
   /**
    * The heaviest phase and its share of `lagSumMs`, or null when the window is
    * empty. Null share when `lagSumMs` is 0 — a share of nothing is not 100%.
+   *
+   * TRA-4595 — `causalSupport` states, IN WORDS, what `straddleSamples` already
+   * encoded as a number, because a bare `0` next to a `share: 0.97` has now been
+   * read as a culprit twice (the `gc-pause-meter` header, and TRA-4595's own
+   * filing, which put `signal.doTick.news-refresh` at "96.8% of the trip" off a
+   * `top` whose `straddleSamples` was 0). `coincident` means NOT ONE sample in
+   * the window had this phase already running when its block began: the phase is
+   * what ran NEXT, and the share is a coincidence, not an attribution. Reading a
+   * `coincident` top as the blocker points a fix at innocent code.
    */
-  top: { name: string; lagSumMs: number; share: number | null; straddleSamples: number } | null;
+  top: {
+    name: string;
+    lagSumMs: number;
+    share: number | null;
+    straddleSamples: number;
+    /** `straddling` ⇒ ≥1 straddling sample (causal read supported); else `coincident`. */
+    causalSupport: 'straddling' | 'coincident';
+  } | null;
 }
 
 /** Sentinel for samples that fired with no phase in flight. */
@@ -454,6 +470,9 @@ export function summarizeLagLedger(input: {
           lagSumMs: head.lagSumMs,
           share: lagSumMs > 0 ? head.lagSumMs / lagSumMs : null,
           straddleSamples: head.straddleSamples,
+          // TRA-4595 — the share and its causal support travel together or the
+          // share gets quoted alone. See SamplerAttribution.top.
+          causalSupport: head.straddleSamples > 0 ? 'straddling' : 'coincident',
         }
       : null,
   };
@@ -1669,6 +1688,9 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
             samplerTopPhase: attribution.sampler?.top?.name ?? null,
             samplerTopShare: attribution.sampler?.top?.share ?? null,
             samplerTopStraddleSamples: attribution.sampler?.top?.straddleSamples ?? null,
+            // TRA-4595 — a `coincident` top is NOT a culprit. Named on the line so
+            // a tape reader cannot quote `samplerTopShare` without it.
+            samplerTopCausalSupport: attribution.sampler?.top?.causalSupport ?? null,
             samplerSamples: attribution.sampler?.samples ?? null,
             // TRA-3660 (fourth instance) — what the collector was doing. A null
             // `gcInWindowMs` with `gcMeter: true` is a REAL negative: the meter

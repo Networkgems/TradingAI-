@@ -6213,6 +6213,20 @@ export class SignalEngine {
     const tickPacer = new TickPacer('signal.doTick.pacer');
     if (Date.now() - this.lastNewsRefresh > NEWS_REFRESH_MS) {
       // TRA-2203 — named sink: whole-universe news fan-out on the 5-min cadence.
+      //
+      // TRA-4595 — SETTLED: this phase DOES yield internally, so TRA-4524's gate
+      // has boundaries to act on and there is nothing here to bound. The fan-out
+      // (`yahoo-feed.ts` `fetchStocksNews`) awaits at every batch —
+      // `await Promise.all(slice.map(withRetry(yf.search…)))` per batch of 3,
+      // `await sleep(200)` between batches, and one awaited fallback search — and
+      // `withRetry` itself awaits `withTimeout` plus 1s/2s backoff sleeps. Its own
+      // synchronous work is `collect()` over ≤5 items/symbol and a ≤40-element
+      // sort. `withPhase` records it `kind: 'async'` for exactly this reason: the
+      // duration is awaited I/O, never a block.
+      //
+      // The 2026-09-10T16:50:32Z trip that named this phase at share 0.9679 rode
+      // `straddleSamples: 0` — not one sample had it already running when the
+      // block began, i.e. it is what ran NEXT. See `tra4595-news-refresh-yield.test.ts`.
       const news = await withPhase('signal.doTick.news-refresh', () =>
         fetchStocksNews(this.getActiveSymbols()));
       // TRA-534 — attach deterministic lexicon-v1 sentiment to each article on
