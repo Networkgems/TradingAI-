@@ -337,6 +337,35 @@ export function reconcileAgainstStored(
   return { ok: mismatches.length === 0, mismatches };
 }
 
+/**
+ * Clamp a broker history to the inclusive date span a stored record actually
+ * covers.
+ *
+ * Measured on live bqb1 2026-09-16 (TRA-3595): the admin record begins
+ * `2026-05-07`, but the fetch window is `2025-01-01 → today`, and the broker
+ * reports a +$300 deposit on `2026-05-01` — six days before the record starts.
+ * `reconcileAgainstStored` compares the UNION of both date sets, so that event
+ * scored as a mismatch and the book REFUSED.
+ *
+ * Refusing was necessary, not merely defensible. The apply path writes the
+ * fetched events verbatim, so a lenient control would have written a v2 record
+ * containing a deposit the v1 record never held — changing the book's cash
+ * basis on top of the classification. TRA-2906 authorises the classification
+ * change and nothing else, and **that invariant requires the event set to be
+ * bounded by the record's own span.** Fetching wider than the record is the
+ * defect; the union comparison is what caught it.
+ *
+ * This does NOT soften the guard. Inside the span both directions still bite: a
+ * truncated fetch still reads `stored > 0, rebuilt 0` and still REFUSES. It only
+ * stops the run from grading — and writing — history the record never claimed.
+ */
+export function clampEventsToStoredSpan(
+  events: readonly TradierCashEvent[],
+  span: { first: string; last: string },
+): TradierCashEvent[] {
+  return events.filter((e) => e.date >= span.first && e.date <= span.last);
+}
+
 // ── Per-book outcome ─────────────────────────────────────────────────────────
 
 export type BookOutcome =
@@ -386,6 +415,15 @@ export interface BookResult {
   mismatches: ReproductionMismatch[] | null;
   movedDates: MovedDate[] | null;
   totalPnlShiftUsd: number | null;
+  /**
+   * The record's own inclusive date span, which bounds both the reconciliation
+   * and the write (see `clampEventsToStoredSpan`). Published so the health route
+   * shows WHICH history was graded — a run scoped to the wrong span and a run
+   * scoped to the right one otherwise read identically.
+   */
+  storedSpan: { first: string; last: string } | null;
+  /** How many of the fetched events survived the span clamp. */
+  eventsInSpan: number | null;
 }
 
 export interface RebuildRunResult {
@@ -541,6 +579,8 @@ async function processBook(
     mismatches: null,
     movedDates: null,
     totalPnlShiftUsd: null,
+    storedSpan: null,
+    eventsInSpan: null,
   } satisfies Omit<BookResult, 'outcome' | 'detail'>;
 
   // On an `apply` the book list is an allowlist, not a filter over a default.
@@ -563,13 +603,33 @@ async function processBook(
   const { netByDate: stored } = classifyRecordFile(book.path);
   const storedDates = Object.keys(stored).sort();
 
+  // A v1 record carrying NO dates has no span, and therefore nothing that could
+  // bound the clamp below. It must never reach it: an empty span filters every
+  // event away, both sides of the control reconcile as `{}` vs `{}`, the guard
+  // PASSES, and an `apply` writes an empty v2 record over the only copy. That is
+  // the failure this whole module exists to prevent, arriving through the fix
+  // for the previous one. USAGE, explicitly, before the clamp is ever built.
+  if (storedDates.length === 0) {
+    return {
+      ...blank,
+      outcome: 'USAGE',
+      detail: 'the v1 record carries zero dates, so it has no span to bound the rebuild. '
+        + 'An unbounded or empty-span run cannot be graded and must not write. Nothing read '
+        + 'from the broker, nothing written.',
+    };
+  }
+  const storedSpan = { first: storedDates[0]!, last: storedDates[storedDates.length - 1]! };
+
   const fetchResult = await opts.fetchOnce();
   if (!fetchResult.ok) {
     // BLIND, never REFUSED. "We could not reach the broker" must not be reported
     // as "the broker disagrees with our record".
-    return { ...blank, outcome: 'BLIND', detail: `broker history fetch failed: ${fetchResult.detail}` };
+    return { ...blank, storedSpan, outcome: 'BLIND', detail: `broker history fetch failed: ${fetchResult.detail}` };
   }
-  const events = fetchResult.events;
+  // Bound the history to what this record actually claims. Everything downstream
+  // — the control, the measured shift, and the bytes an `apply` writes — reads
+  // this clamped set, so the classification stays the only variable.
+  const events = clampEventsToStoredSpan(fetchResult.events, storedSpan);
 
   // ── THE GUARD ──────────────────────────────────────────────────────────────
   const rebuiltOld = netByDateUnderOldRule(events);
@@ -578,7 +638,9 @@ async function processBook(
     return {
       ...blank,
       outcome: 'REFUSED',
-      fetchedEventCount: events.length,
+      storedSpan,
+      fetchedEventCount: fetchResult.events.length,
+      eventsInSpan: events.length,
       reproductionOk: false,
       mismatches: verdict.mismatches,
       detail: `the fetched history does NOT reproduce the ${storedDates.length} stored totals `
@@ -602,7 +664,9 @@ async function processBook(
 
   const measured = {
     ...blank,
-    fetchedEventCount: events.length,
+    storedSpan,
+    fetchedEventCount: fetchResult.events.length,
+    eventsInSpan: events.length,
     feeEvents,
     reproductionOk: true,
     mismatches: [],
@@ -614,9 +678,11 @@ async function processBook(
     return {
       ...measured,
       outcome: 'CLEAN',
-      detail: `DRY RUN — control passed on all ${storedDates.length} stored dates; the `
-        + `classification change is the only variable. ${movedDates.length} date(s) move, for a `
-        + `reported-P&L shift of ${totalPnlShiftUsd.toFixed(2)}. Nothing written.`,
+      detail: `DRY RUN — control passed on all ${storedDates.length} stored dates over `
+        + `${storedSpan.first}..${storedSpan.last} (${events.length} of `
+        + `${fetchResult.events.length} fetched events are in span); the classification change is `
+        + `the only variable. ${movedDates.length} date(s) move, for a reported-P&L shift of `
+        + `${totalPnlShiftUsd.toFixed(2)}. Nothing written.`,
     };
   }
 

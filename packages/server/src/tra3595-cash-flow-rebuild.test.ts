@@ -11,6 +11,7 @@ import {
   reconcileAgainstStored,
   netByDateUnderOldRule,
   worstOutcome,
+  clampEventsToStoredSpan,
   buildHostCashEventFetcher,
   type FetchCashEventsResult,
 } from './tra2906-cash-flow-rebuild.js';
@@ -417,5 +418,137 @@ describe('TRA-3595 apply', () => {
       fetchCashEvents: okFetch(),
     });
     expect(result.verdict).toBe('BLIND');
+  });
+});
+
+// ── 8. The span clamp — the live 2026-09-16 refusal, and its two directions ──
+//
+// Measured on bqb1: the admin record starts 2026-05-07, the fetch window starts
+// 2025-01-01, and the broker reports +$300 on 2026-05-01. The union comparison
+// scored that as a mismatch and the book REFUSED.
+//
+// The refusal was CORRECT — `apply` writes the fetched events verbatim, so a
+// lenient control would have written a deposit the v1 record never held. The fix
+// is therefore not to relax the comparison but to bound the EVENT SET, so the
+// classification stays the only variable. These controls pin both halves: the
+// incident now passes, AND every in-span disagreement still refuses.
+
+/** The live shape: a deposit strictly BEFORE the record's first stored date. */
+const EVENTS_WITH_PRE_SPAN_DEPOSIT: TradierCashEvent[] = [
+  { date: '2026-05-01', type: 'ach', amount: 300, transactionId: 'pre1' },
+  ...EVENTS,
+];
+
+describe('TRA-3595 the rebuild is bounded by the record`s own span', () => {
+  it('clamps inclusively at both ends', () => {
+    const span = { first: '2026-07-01', last: '2026-08-03' };
+    expect(clampEventsToStoredSpan(EVENTS_WITH_PRE_SPAN_DEPOSIT, span).map(e => e.transactionId))
+      .toEqual(['a1', 'a2', 'f1', 'f2']); // 'pre1' before, 'd1' (08-10) after
+  });
+
+  // THE INCIDENT. Before the clamp this book REFUSED on live bqb1.
+  it('a deposit BEFORE the first stored date no longer refuses the book', async () => {
+    seedBook('admin', STORED_V1);
+    const result = await runCashFlowRebuild({
+      dataDir: root,
+      env: 'production',
+      intent: parseRebuildIntent('dry-run'),
+      fetchCashEvents: okFetch(EVENTS_WITH_PRE_SPAN_DEPOSIT),
+    });
+
+    expect(result.verdict).toBe('CLEAN');
+    const book = result.books[0]!;
+    expect(book.mismatches).toEqual([]);
+    expect(book.storedSpan).toEqual({ first: '2026-07-01', last: '2026-08-10' });
+    // Both counts are published, and they DIFFER — that difference is the whole
+    // discriminator between a run scoped to the record and one scoped wider.
+    expect(book.fetchedEventCount).toBe(6);
+    expect(book.eventsInSpan).toBe(5);
+    // The shift is still attributable to the fees alone, unchanged by the clamp.
+    expect(book.movedDates?.map(m => m.date)).toEqual(['2026-07-07', '2026-08-03']);
+    expect(book.totalPnlShiftUsd).toBe(-20);
+  });
+
+  // THE MUTATION, direction 1: the SAME unexpected $300, moved INSIDE the span.
+  // If this passed, the clamp would be suppressing real disagreements.
+  it('the same surprise deposit INSIDE the span still REFUSES', async () => {
+    seedBook('admin', STORED_V1);
+    const result = await runCashFlowRebuild({
+      dataDir: root,
+      env: 'production',
+      intent: parseRebuildIntent('apply:admin'),
+      fetchCashEvents: okFetch([
+        { date: '2026-07-20', type: 'ach', amount: 300, transactionId: 'pre1' },
+        ...EVENTS,
+      ]),
+    });
+    expect(result.verdict).toBe('REFUSED');
+    expect(result.books[0]!.applied).toBe(false);
+    expect(result.books[0]!.mismatches?.map(m => m.date)).toEqual(['2026-07-20']);
+  });
+
+  // THE MUTATION, direction 2: the deposit-deleting direction, at the span EDGE.
+  // The clamp is derived from the STORED dates, so dropping the broker event for
+  // the first stored date must not shrink the span out from under the control.
+  it('a fetch missing the FIRST stored date still REFUSES, not silently rescoped', async () => {
+    seedBook('admin', STORED_V1);
+    const before = readFileSync(bookPath('admin'), 'utf-8');
+    const result = await runCashFlowRebuild({
+      dataDir: root,
+      env: 'production',
+      intent: parseRebuildIntent('apply:admin'),
+      fetchCashEvents: okFetch(EVENTS.filter(e => e.date !== '2026-07-01')),
+    });
+    expect(result.verdict).toBe('REFUSED');
+    expect(result.books[0]!.storedSpan).toEqual({ first: '2026-07-01', last: '2026-08-10' });
+    expect(result.books[0]!.mismatches?.map(m => m.date)).toEqual(['2026-07-01']);
+    expect(readFileSync(bookPath('admin'), 'utf-8')).toBe(before);
+  });
+
+  // An `apply` must write the CLAMPED set. This is the reason the clamp exists:
+  // the pre-span deposit is not a classification change, and writing it would
+  // move the book's cash basis under cover of TRA-2906.
+  it('apply writes only the in-span events — the pre-span deposit never lands', async () => {
+    seedBook('admin', STORED_V1);
+    const result = await runCashFlowRebuild({
+      dataDir: root,
+      env: 'production',
+      intent: parseRebuildIntent('apply:admin'),
+      fetchCashEvents: okFetch(EVENTS_WITH_PRE_SPAN_DEPOSIT),
+      now: new Date('2026-09-17T20:30:00Z'),
+    });
+
+    expect(result.verdict).toBe('CLEAN');
+    expect(result.books[0]!.applied).toBe(true);
+    const written = JSON.parse(readFileSync(bookPath('admin'), 'utf-8')) as {
+      events: TradierCashEvent[];
+    };
+    expect(written.events.map(e => e.transactionId)).toEqual(['a1', 'a2', 'f1', 'f2', 'd1']);
+    expect(written.events.some(e => e.transactionId === 'pre1')).toBe(false);
+    // And the v1 backup still holds the original, untouched.
+    const backup = JSON.parse(
+      readFileSync(`${bookPath('admin')}.v1-backup-2026-09-17`, 'utf-8'),
+    ) as typeof STORED_V1;
+    expect(backup.netByDate).toEqual(STORED_V1.netByDate);
+  });
+
+  // The fix's own failure mode. An empty span filters EVERY event away, so both
+  // sides of the control reconcile as {} vs {} — the guard PASSES and an apply
+  // writes an empty record over the only copy of the deposits. It must be
+  // refused before the clamp is ever built.
+  it('a v1 record with ZERO dates reads USAGE and never writes an empty record', async () => {
+    seedBook('admin', { netByDate: {}, seenIds: [] });
+    const before = readFileSync(bookPath('admin'), 'utf-8');
+    const result = await runCashFlowRebuild({
+      dataDir: root,
+      env: 'production',
+      intent: parseRebuildIntent('apply:admin'),
+      fetchCashEvents: okFetch(),
+    });
+    expect(result.verdict).toBe('USAGE');
+    expect(result.verdict).not.toBe('CLEAN');
+    expect(result.books[0]!.applied).toBe(false);
+    expect(result.books[0]!.storedSpan).toBeNull();
+    expect(readFileSync(bookPath('admin'), 'utf-8')).toBe(before);
   });
 });
