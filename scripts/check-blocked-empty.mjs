@@ -1413,19 +1413,33 @@ export function renderReport(result) {
       const rep = f.repair || null;
       if (rep && rep.eligible) {
         const back = (result.roster.get(rep.assigneeAgentId) || {}).name || rep.assigneeAgentId;
+        // TRA-4574 — ONE PREDICATE, TWO READERS, and they used to DISAGREE.
+        // `deriveRepair` hardcodes `todo`; the drain overrides it to `done` for the
+        // suppressing-leaf class (`drain-blocked-empty.mjs`, the positive test ordered
+        // BEFORE `deriveRepair`). This emitter consumed `rep.status` raw, so on those
+        // rows it printed `{"status":"todo"}` — and then the SUPPRESSING LEAF block a
+        // few lines below called that exact write "actively harmful". An operator
+        // obeying this routine's own "RUN THEM AS PRINTED" mandate switched the
+        // routine off. Measured 2026-09-16: 11 of 30 findings carried the marker.
+        // The emitter now mirrors the drain's ordering, so there is one disposition.
+        const repStatus = suppressesOwnRoutine(f) ? 'done' : rep.status;
         L.push('     repair KNOWN (stranded_assigned_issue) — ONE step, and one step only:');
-        L.push(`       RESTORE-PATCH 1/1  PATCH /api/issues/${f.id} {"status":"${rep.status}"}`);
+        L.push(`       RESTORE-PATCH 1/1  PATCH /api/issues/${f.id} {"status":"${repStatus}"}`);
         L.push(`       ${rep.why}`);
         L.push(
-          `       \`${rep.status}\`, never \`done\` and never the read \`${rep.restoredFrom}\`: todo is queue-visible AND ` +
-            'still counts as an unresolved blocker upstream, while in_progress is what the reconciler mints strands FROM.',
+          repStatus === 'done'
+            ? '       `done`, NOT the generic `todo`: this row is a SUPPRESSING LEAF (see the block below) and `todo` ' +
+              'there keeps its own routine off. This is the drain\'s disposition for the class, printed here so the ' +
+              'command and the block below cannot disagree.'
+            : `       \`${repStatus}\`, never \`done\` and never the read \`${rep.restoredFrom}\`: todo is queue-visible AND ` +
+              'still counts as an unresolved blocker upstream, while in_progress is what the reconciler mints strands FROM.',
         );
         L.push(
           '       Do NOT re-send the WRITE-ONLY blocker key: there is no open anchor, and an empty write-key list ' +
             'reproduces the born-blocked state.',
         );
         L.push(
-          `       VERIFY by re-read on \`activeRecoveryAction == null\`, NOT on \`status === "${rep.status}"\`. The strand ` +
+          `       VERIFY by re-read on \`activeRecoveryAction == null\`, NOT on \`status === "${repStatus}"\`. The strand ` +
             'IS the recovery action; on a row a run picks up at once the status reads back `in_progress` and that is ' +
             'still a clean drain (TRA-4041, TRA-3758).',
         );
@@ -2793,6 +2807,43 @@ async function selftest() {
   console.log(
     `${rejects ? 'ok  ' : 'FAIL'}  TRA-4041 NEGATIVE — the whitelist REFUSES a re-introduced assignee PATCH, and refuses a \`n/2\` step counter\n` +
       '        (the step that returned 409 Issue run ownership conflict 6/6 on 2026-08-26)',
+  );
+
+  // TRA-4574 — THE TWO READERS MUST AGREE. `deriveRepair` hardcodes `todo` and the
+  // drain overrides it to `done` for the suppressing-leaf class. Until this control
+  // existed the REPORT consumed `rep.status` raw, so on exactly those rows it printed
+  // `{"status":"todo"}` and then, four lines lower, called that write "actively
+  // harmful". The whole selftest was green through it (44/44) because nothing rendered
+  // an ELIGIBLE row that was ALSO a suppressing leaf — the two halves were only ever
+  // exercised apart. Measured live 2026-09-16: 11 of 30 findings carried both.
+  const supRepair = await (async () => {
+    const row = recoveryStrand('s1', 'TRA-8640', 'agent-cto', { returnOwner: 'agent-qt' });
+    row.item.originKind = 'routine_execution';
+    row.item.blocks = []; // KNOWN-empty: gates nothing. Absent would be UNKNOWN, a different arm.
+    const r = await sweep(transportFor(fakeBoard([row])), { now: NOW_STALE });
+    const out = renderReport(r).join('\n');
+    const f = r.findings[0];
+    const cmd = out.split('\n').filter((l) => /RESTORE-PATCH/.test(l));
+    return {
+      ok:
+        suppressesOwnRoutine(f) === true &&
+        f.repair.eligible === true &&
+        // the shared predicate still reports the GENERIC target; only the emitter overrides
+        f.repair.status === 'todo' &&
+        cmd.length === 1 &&
+        /PATCH \/api\/issues\/s1 \{"status":"done"\}/.test(cmd[0]) &&
+        !/\{"status":"todo"\}/.test(out) &&
+        /SUPPRESSING LEAF/.test(out) &&
+        // and the prose must not still be arguing for the opposite write
+        !/`todo`, never `done`/.test(out),
+      detail: cmd[0] ? cmd[0].trim() : 'NO RESTORE-PATCH EMITTED',
+    };
+  })();
+  if (!supRepair.ok) failed += 1;
+  console.log(
+    `${supRepair.ok ? 'ok  ' : 'FAIL'}  TRA-4574 — an ELIGIBLE row that is ALSO a SUPPRESSING LEAF prints \`done\`, not the generic \`todo\`\n` +
+      `        ${supRepair.detail}\n` +
+      '        (the emitter mirrors the drain; a `todo` here switches the row\'s own routine OFF — 11/30 live rows on 2026-09-16)',
   );
 
   const miss = await naiveMissControl();
