@@ -1989,6 +1989,73 @@ export interface ImportProvenanceFleetSummary extends ImportProvenanceCensus {
    * measurement, and the two are byte-identical in every other field.
    */
   blind: boolean;
+  /**
+   * TRA-4594 — the DURABLE denominator: live imported rows open in the book
+   * RIGHT NOW, folded from persisted row state rather than from a since-boot
+   * counter. `null` = NOT MEASURED (no caller supplied a book).
+   *
+   * Every counter above it is process-local and dies at restart; this one is
+   * rebuilt from the snapshot on the way back up, so it is the only field here
+   * a multi-day gate may key on.
+   */
+  liveImportedRows: number | null;
+  /**
+   * TRA-4594 — WHICH zero `blind` is standing on. `null` when not blind.
+   *
+   * `no_imported_rows`  — the book holds no adopted live rows. Genuinely
+   *                       unmeasured because there is nothing to measure.
+   * `witness_lost_at_restart` — adopted live rows ARE open in the book and the
+   *                       since-boot census cannot see them. The import branch
+   *                       DID run; the counter was zeroed by a reboot. Grade
+   *                       the rows directly, do not re-arm waiting on `adopted`.
+   * `unmeasured`        — no caller supplied a book, so the two above cannot
+   *                       be told apart. Never treat as `no_imported_rows`.
+   */
+  blindReason: 'no_imported_rows' | 'witness_lost_at_restart' | 'unmeasured' | null;
+}
+
+/**
+ * TRA-4594 — count live open rows that ARRIVED THROUGH THE IMPORT PATH, from
+ * durable row state.
+ *
+ * ── Why this exists ─────────────────────────────────────────────────────────
+ * `importProvenanceCensus` is a private in-memory field zero-initialised at
+ * construction, and it is incremented at exactly ONE site: the mint branch of
+ * `reconcileTradierPositions`, immediately before `openOptions.set(...)`. But
+ * `importSnapshot` repopulates `openOptions` at boot, so after a restart the
+ * very same contract takes the `existing` branch on every subsequent reconcile
+ * and the mint site is unreachable for it — permanently. This is the identical
+ * structural trap TRA-3078 documents in that same loop for the journal binding,
+ * in its own words: "bqb1 reboots several times a day, so 'the fix worked' and
+ * 'the fix is gone' were separated by hours."
+ *
+ * The consequence is a FALSE NEGATIVE with the same byte signature as the false
+ * positive TRA-3553 was filed against. `{adopted: 0, blind: true}` is published
+ * both when the import path never ran AND when it ran, adopted a real
+ * real-money contract, and was forgotten at the next deploy — while that
+ * contract is still open in the book. A gate that waits for `adopted > 0` over
+ * a multi-day window therefore never goes green no matter what the import path
+ * does, because the window spans reboots.
+ *
+ * Counts only, never OCC symbols: this feeds the no-auth
+ * `/api/health/options-live` and TRA-2163 is the standing reason not to widen
+ * what that route says about the real-money book.
+ */
+export function countLiveImportedRows(positions: Iterable<OptionPosition>): number {
+  let rows = 0;
+  for (const opt of positions) {
+    if ((opt.mode ?? 'demo') !== 'live') continue;
+    if (opt.closedAt !== undefined) continue;
+    // `importedFromTradier` is the durable bookkeeping claim and is deliberately
+    // NEVER cleared, including by the engine-origin re-type in
+    // `restoreImportProvenance` (which rewrites `signalType`/`signalId` but
+    // leaves this flag true). So it survives the re-type, and keying on
+    // `signalType === 'tradier_import'` here would UNDERCOUNT by exactly the
+    // engine-origin rows — the cohort ask 3 cares about most.
+    if (opt.importedFromTradier !== true) continue;
+    rows += 1;
+  }
+  return rows;
 }
 
 const EMPTY_IMPORT_PROVENANCE_CENSUS: ImportProvenanceCensus = {
@@ -2021,9 +2088,26 @@ const EMPTY_IMPORT_PROVENANCE_CENSUS: ImportProvenanceCensus = {
  *
  * Empty input is `blind: true`, not a thrown error: a fleet with no books is
  * exactly the unmeasured state the flag names.
+ *
+ * ── TRA-4594: `blind` is TRUE-BUT-INCOMPLETE on its own ─────────────────────
+ * Everything folded here is process-local and dies at restart (see
+ * {@link countLiveImportedRows}). `blind` remains a correct statement about the
+ * SINCE-BOOT census, so it is unchanged — but on its own it cannot say whether
+ * the import branch never ran or ran and was forgotten by a reboot, and those
+ * demand opposite actions. `liveImportedRows` is the durable denominator that
+ * separates them and `blindReason` publishes the answer as a word, for the same
+ * reason `blind` itself is a word and not left to the reader to re-derive.
  */
 export function foldImportProvenanceCensuses(
   censuses: Iterable<ImportProvenanceCensus>,
+  /**
+   * TRA-4594 — durable count of live imported rows open across the fleet.
+   * Defaults to `null` = NOT MEASURED, matching `summarizeLiveUnmanagedRisk`'s
+   * `uncoveredBrokerContracts`. It must never default to `0`: that is the value
+   * that would let an unmeasured fleet publish `no_imported_rows`, which is the
+   * false all-clear this argument exists to close.
+   */
+  liveImportedRows: number | null = null,
 ): ImportProvenanceFleetSummary {
   const total: ImportProvenanceCensus = { ...EMPTY_IMPORT_PROVENANCE_CENSUS };
   for (const one of censuses) {
@@ -2035,7 +2119,19 @@ export function foldImportProvenanceCensuses(
     total.underlyingUnknown += one.underlyingUnknown;
     total.entryDeltaRestored += one.entryDeltaRestored;
   }
-  return { ...total, blind: total.adopted === 0 };
+  const blind = total.adopted === 0;
+  return {
+    ...total,
+    blind,
+    liveImportedRows,
+    blindReason: !blind
+      ? null
+      : liveImportedRows === null
+        ? 'unmeasured'
+        : liveImportedRows > 0
+          ? 'witness_lost_at_restart'
+          : 'no_imported_rows',
+  };
 }
 
 /**
@@ -15152,6 +15248,15 @@ export class PaperOptionsAccount {
    */
   importProvenanceSummary(): ImportProvenanceCensus {
     return { ...this.importProvenanceCensus };
+  }
+
+  /**
+   * TRA-4594 — the durable companion to {@link importProvenanceSummary}: how
+   * many live imported rows this book holds RIGHT NOW, read off persisted row
+   * state so it survives the restart that zeroes the census above.
+   */
+  liveImportedRowCount(): number {
+    return countLiveImportedRows(this.openOptions.values());
   }
 
   /**

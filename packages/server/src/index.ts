@@ -12477,8 +12477,19 @@ app.get('/api/health/options-live', async (_req, res) => {
       // Counts only — no OCC symbols, no per-row detail. This route is no-auth
       // and TRA-2163 is the standing reason not to widen what it says about the
       // real-money book.
+      //
+      // ⚠️ TRA-4594 — `blind: true` ALONE IS AMBIGUOUS. Read `blindReason`.
+      // Every counter here is since-boot and dies at restart, and the increment
+      // site is the MINT branch of the reconcile only; `importSnapshot` reloads
+      // `openOptions`, so after a reboot an already-adopted contract takes the
+      // `existing` branch forever and the census never sees it again. So
+      // `{adopted: 0, blind: true}` is ALSO what a fleet publishes while holding
+      // a real adopted real-money row that a deploy train forgot.
+      // `liveImportedRows` is the durable denominator that tells those apart:
+      // `witness_lost_at_restart` means GO GRADE THE ROWS, not "keep waiting".
       importProvenance: foldImportProvenanceCensuses(
         getAllUserContexts().map(c => c.engine.getImportProvenanceCensus()),
+        getAllUserContexts().reduce((n, c) => n + c.engine.getLiveImportedRowCount(), 0),
       ),
       // TRA-3822 — the counter `liveUnmanagedRisk` above is STRUCTURALLY UNABLE
       // to contain: is a live stop that is already THROUGH going to be acted on?

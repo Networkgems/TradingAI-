@@ -10220,10 +10220,23 @@ export class SignalEngine {
    * both buckets was adopted twice, and that is two adoptions).
    */
   getImportProvenanceCensus(): ImportProvenanceCensus {
-    const { blind: _blind, ...total } = foldImportProvenanceCensuses(
-      this.allOptionsAccounts().map(a => a.importProvenanceSummary()),
-    );
+    const { blind: _blind, liveImportedRows: _rows, blindReason: _reason, ...total } =
+      foldImportProvenanceCensuses(
+        this.allOptionsAccounts().map(a => a.importProvenanceSummary()),
+      );
     return total;
+  }
+
+  /**
+   * TRA-4594 — durable live-imported-row count for this book, summed over the
+   * same account set the census above folds. Unlike that census this is a LEVEL
+   * read from persisted rows, not a since-boot counter, so `allOptionsAccounts`
+   * really can double-count a contract held in two accounts — but the only
+   * consumer asks "is this fleet holding any adopted live inventory at all",
+   * and both an over- and an exact count answer that identically.
+   */
+  getLiveImportedRowCount(): number {
+    return this.allOptionsAccounts().reduce((n, a) => n + a.liveImportedRowCount(), 0);
   }
 
   getLiveStopActionabilityRows(now?: number): LiveStopActionabilitySummary {

@@ -176,6 +176,14 @@ describe('TRA-3553 — `blind` separates "never measured" from "measured clean"'
       underlyingUnknown: 66,
       entryDeltaRestored: 77,
       blind: false,
+      // TRA-4594 — the durable denominator and the reason word. This `toEqual`
+      // is deliberately exhaustive (it is the mutation check that a field was
+      // not dropped or aliased), so a new field belongs HERE rather than being
+      // absorbed by relaxing the matcher. No caller supplied a book, so the
+      // denominator is NOT MEASURED; `blindReason` is null because the census
+      // is not blind at all in this case.
+      liveImportedRows: null,
+      blindReason: null,
     });
   });
 });
