@@ -5881,6 +5881,19 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   //     `insufficient_evidence` no matter how good its mean looks.
   //  4. `cells[].lowerCI95` against `cells[].barR` — the decision rule is the
   //     LOWER BOUND, not the mean (Ruling 2.4).
+  //  5. TRA-4578 — `cells[].provenance` BEFORE you trust step 4. `lowerCI95` is
+  //     byte-identical whether the cell is desk real-money closes or demo rows
+  //     booked at mid, and demo rows cannot pay the cost the bar prices
+  //     (`demoSlippagePct: 0`; demo realized R is gross of spread). Read
+  //     `provenance.byMode` / `.byAccountClass` — `unattributed` is NOT desk, it
+  //     is a row written before TRA-1475 added `account` — and
+  //     `provenance.fromTs`/`toTs`, which separate populations a single cell can
+  //     span. Then read `cells[].lowerCI95_netOfModelledCross` and
+  //     `netOfModelledCross.wouldAdmit`: the same cell with its own measured
+  //     round-trip cost charged to its demo rows. Those are COMPANIONS — `admits`
+  //     is still decided by `lowerCI95` alone and TRA-4578 changed no verdict. A
+  //     null companion means no measured cost for that cell, NOT a zero cost;
+  //     `netOfModelledCross.unavailableReason` says which case.
   //
   // Observe-only, secrets-free (structure / bucket / counts / R-multiples only),
   // unauthenticated for parity with /option-journal and /live-enforce-gates.
@@ -6551,6 +6564,24 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
                 lowerCI95: c.lowerCI95,
                 barR: c.barR,
                 admits: c.admits,
+                /**
+                 * TRA-4578 — WHO is in this cell. `admits` above is decided by
+                 * `lowerCI95` alone, and `lowerCI95` reads identically whether the
+                 * cell is desk real-money closes or demo rows booked at mid
+                 * (`demoSlippagePct: 0` — demo realized R is gross of spread). This
+                 * block is the discriminator; it decides nothing.
+                 */
+                provenance: c.provenance,
+                /**
+                 * TRA-4578 — the same cell with its own measured round-trip cost
+                 * charged to its demo rows. BESIDE the governing number, never
+                 * instead of it: `admits` is unchanged, `netOfModelledCross.
+                 * wouldAdmit` is the counterfactual. Null ⇒ no measured cost for
+                 * this cell (`unavailableReason` says which case) — never zero.
+                 */
+                meanR_gate_netOfModelledCross: c.meanR_gate_netOfModelledCross,
+                lowerCI95_netOfModelledCross: c.lowerCI95_netOfModelledCross,
+                netOfModelledCross: c.netOfModelledCross,
               })),
           },
         },

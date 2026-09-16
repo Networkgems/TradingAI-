@@ -71,6 +71,21 @@ export function isModelFacingModeRow(row: Pick<OptionTradeJournalRecord, 'mode'>
   return row.mode === MODEL_FACING_JOURNAL_MODE;
 }
 
+/**
+ * TRA-4578 — the row-level form of the ACCOUNT-CLASS axis, exported so a
+ * per-cell census cannot drift from the table-level one.
+ *
+ * `unattributed` = a KEPT row with no `account` stamp, i.e. written before
+ * TRA-1475 added the field. It is **not** desk — `/api/health/option-journal`'s
+ * own `accountClassNote` says so, under an instruction to grade on
+ * `byAccountClass.desk`. {@link applyModelFacingBasis} classifies with exactly
+ * this predicate, so `desk + unattributed === rows.length` by construction at
+ * every granularity that uses it.
+ */
+export function isUnattributedRow(row: Pick<OptionTradeJournalRecord, 'account'>): boolean {
+  return !row.account;
+}
+
 /** Rows on the model-facing basis, plus the census that explains them. */
 export interface ModelFacingJournal {
   /** The rows to fold. QA/test books removed; unattributed rows kept. */
@@ -97,7 +112,7 @@ export function applyModelFacingBasis(
   // "Unattributed" is the same falsy-`account` test `excludeTestAccountRows`
   // uses to decide to KEEP a row, so desk + unattributed always sums to
   // `kept.length` and desk + unattributed + fixtureExcluded to `rows.length`.
-  const unattributed = kept.filter((r) => !r.account).length;
+  const unattributed = kept.filter(isUnattributedRow).length;
   return {
     rows: kept,
     basis: MODEL_FACING_JOURNAL_BASIS,

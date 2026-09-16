@@ -40,6 +40,8 @@ import {
   buildTapeExpectancyTable,
   type TapeExpectancyTable,
 } from './option-tape-expectancy.js';
+import { summarizeLiveEnforceGate } from './live-enforce-gate-ledger.js';
+import { etDateString } from './scheduler.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'option-tape-expectancy-cache' });
@@ -78,12 +80,84 @@ export interface TapeExpectancyBasisCensus {
   fixtureExcluded: number;
   /** Kept rows by journal `mode`, e.g. `{ demo: 1067, live: 6 }`. */
   byMode: Record<string, number>;
+  /**
+   * TRA-4578 — the source the per-cell `netOfModelledCross` charge was read off,
+   * or `null` when the fold ran uncharged. `null` here means EVERY cell's
+   * companion is null with `unavailableReason: 'no per-cell cross-cost source…'`;
+   * it does not mean the cost is zero.
+   */
+  crossCostSource: string | null;
+  /**
+   * Cells the source could price. `0` with a non-null {@link crossCostSource} is
+   * a real state — the ledger is live but has no usable quote sample yet — and it
+   * is distinguishable from "no source at all", which is the whole point of
+   * carrying both fields.
+   */
+  crossCostCells: number;
 }
 
 export interface CachedTapeExpectancy {
   table: TapeExpectancyTable;
   census: TapeExpectancyBasisCensus;
   freshness: TapeExpectancyFreshness;
+}
+
+/**
+ * TRA-4578 item 2 — the per-cell modelled cross cost, and where it came from.
+ *
+ * QuantTrader's open question was whether the companion should read the
+ * live-enforce ledger at render time or whether that couples two surfaces. The
+ * answer taken here: couple them, but **at this seam and nowhere else**. The pure
+ * fold keeps no ledger edge (it is what the trade pass decides on), and the
+ * coupling is one injectable function, so it is visible, testable, and cannot
+ * reach the admission path.
+ *
+ * It cannot be done at render time either: charging a subset of the rows moves
+ * the SE as well as the mean, and the SE is not recoverable from a served cell's
+ * summary statistics. The charge has to be applied where the values still exist.
+ */
+export interface TapeCrossCostSource {
+  /** `cellKey` -> measured round-trip `costR`, in gate R. */
+  byCell: ReadonlyMap<string, number>;
+  /** Greppable literal echoed onto every charged cell. */
+  source: string;
+}
+
+/**
+ * The literal naming the ledger surface the default charge is read off.
+ * Exported so a grader can grep for it rather than infer it.
+ */
+export const TAPE_CROSS_COST_SOURCE =
+  'live-enforce-gate-ledger: retained.byGate[cost_bar].byCell[].costRQuantiles.p50';
+
+/**
+ * Default cross-cost provider — the RETAINED (durable, all-days) cost_bar fold,
+ * per cell, at its median.
+ *
+ * `retained` rather than the requested-day view on purpose: a cell's expectancy
+ * is folded over a 365-day window, so pricing it off a single ET day's quotes
+ * (which is often zero rows, and on a holiday is always zero rows) would make the
+ * companion blink in and out for reasons that have nothing to do with the cell.
+ *
+ * Returns `null` on any failure. Null ⇒ the companion is null on every cell with
+ * a stated reason ⇒ never a zero charge.
+ */
+function defaultCrossCostSource(nowMs: number): TapeCrossCostSource | null {
+  try {
+    const summary = summarizeLiveEnforceGate(etDateString(new Date(nowMs)));
+    const costBar = summary.retained.byGate.find((g) => g.gate === 'cost_bar');
+    if (!costBar) return null;
+    const byCell = new Map<string, number>();
+    for (const c of costBar.byCell) {
+      const p50 = c.costRQuantiles?.p50;
+      // A cell with no usable sample publishes `p50: null`. Skipping it leaves the
+      // key ABSENT, which the fold reports as "not measured" — never as 0.
+      if (typeof p50 === 'number' && Number.isFinite(p50)) byCell.set(c.cell, p50);
+    }
+    return { byCell, source: TAPE_CROSS_COST_SOURCE };
+  } catch {
+    return null;
+  }
 }
 
 export interface TapeExpectancyCacheOpts {
@@ -93,6 +167,12 @@ export interface TapeExpectancyCacheOpts {
   /** Load ALL journal rows (pre-basis). Injected in tests. */
   load?: () => Promise<OptionTradeJournalRecord[]>;
   env?: NodeJS.ProcessEnv;
+  /**
+   * TRA-4578 item 2 — the per-cell cross charge. Injected in tests; defaults to
+   * {@link defaultCrossCostSource}. Return `null` to publish an uncharged table,
+   * which is a stated-null companion, never a zero one.
+   */
+  crossCost?: (nowMs: number) => TapeCrossCostSource | null;
 }
 
 /**
@@ -113,6 +193,7 @@ export class TapeExpectancyCache {
   private readonly windowDays: number | null;
   private readonly load: () => Promise<OptionTradeJournalRecord[]>;
   private readonly env: NodeJS.ProcessEnv;
+  private readonly crossCost: (nowMs: number) => TapeCrossCostSource | null;
 
   constructor(opts: TapeExpectancyCacheOpts = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_TAPE_EXPECTANCY_TTL_MS;
@@ -122,6 +203,7 @@ export class TapeExpectancyCache {
     // NOT `loadModelFacingJournalRows()`.
     this.load = opts.load ?? (() => listOptionTradeJournal({}));
     this.env = opts.env ?? process.env;
+    this.crossCost = opts.crossCost ?? defaultCrossCostSource;
   }
 
   /** Mark the fold stale so the next read refolds. Wired to the journal close event. */
@@ -178,10 +260,23 @@ export class TapeExpectancyCache {
         for (const r of rows) {
           byMode[r.mode] = (byMode[r.mode] ?? 0) + 1;
         }
+        // TRA-4578 — read the charge BEFORE the fold, never inside it, and treat
+        // a throw as "no charge" rather than as a failed refold: the companion is
+        // observability and must not be able to dark the table the gate decides on.
+        let cross: TapeCrossCostSource | null = null;
+        try {
+          cross = this.crossCost(t);
+        } catch (err) {
+          log.warn('tape-expectancy cross-cost source failed; publishing an uncharged companion', {
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
         this.table = buildTapeExpectancyTable(rows, {
           windowDays: this.windowDays,
           nowMs: t,
           config: resolveCostGateConfig(this.env),
+          modelledCrossRByCell: cross?.byCell ?? null,
+          modelledCrossRSource: cross?.source ?? null,
         });
         this.census = {
           basis: MODEL_FACING_JOURNAL_BASIS,
@@ -189,6 +284,8 @@ export class TapeExpectancyCache {
           unattributed: counts.unattributed,
           fixtureExcluded: counts.fixtureExcluded,
           byMode,
+          crossCostSource: cross?.source ?? null,
+          crossCostCells: cross?.byCell.size ?? 0,
         };
         this.computedAt = t;
         this.generation += 1;

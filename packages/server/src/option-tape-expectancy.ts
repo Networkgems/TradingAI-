@@ -77,6 +77,9 @@ import {
 // DE-AUTHORIZATION predicate only; the module holds no bar and no env, so the
 // admission decision cannot acquire one through this edge.
 import { mandateBandFor, OTM_SLEEVE_MANDATE_ISSUE } from './otm-sleeve-mandate.js';
+// TRA-4578 — the ACCOUNT-CLASS predicate, imported rather than re-written, so the
+// per-cell census cannot drift from the table-level one in `applyModelFacingBasis`.
+import { isUnattributedRow } from './model-facing-journal.js';
 
 /**
  * Ruling 2.5 — a cell needs this many closed rows before its expectancy may
@@ -171,6 +174,91 @@ export function tapeExpectancyCellKey(structure: string, bucket: string): string
   return `${canonicalTapeStructure(structure)}::${bucket}`;
 }
 
+/**
+ * TRA-4578 — the per-cell PROVENANCE block, and the reason it exists.
+ *
+ * `lowerCI95` is the edge side of the live `single_leg_otm` cost-bar admission,
+ * so a cell whose `admits` flips is a cell that opens real-money positions. Until
+ * this block shipped, **a cell reading `lowerCI95: 0.3617` was byte-identical
+ * whether it was 110 desk real-money closes or 84 July demo rows booked at mid.**
+ * Provenance existed only at TABLE level (`basis.desk` / `basis.unattributed` /
+ * `basis.byMode` on the cache's census), which cannot be attributed down to the
+ * cell a candidate was actually decided under — TRA-4520 and TRA-4569 both had to
+ * reconstruct `single_leg_otm::0.50-0.55` by hand off
+ * `/api/health/option-journal?rows=all` to find that its positive mean was
+ * carried entirely by pre-08-20 demo rows, 53 of them `unattributed`, while the
+ * 23 desk rows the band actually produced returned mean −0.835 R_gate / −$497.
+ *
+ * ⚠ This block DECIDES NOTHING. `admits`, `barR` and the basis predicate are
+ * unchanged by TRA-4578 — the defect was that the choice was invisible at the row
+ * a verdict cites, not that the choice was wrong. The `desk+unattributed` basis
+ * is deliberate (see `option-tape-expectancy-cache.ts`'s header: it avoids
+ * `loadModelFacingJournalRows()` precisely so the handful of live rows survive).
+ */
+export interface TapeExpectancyCellProvenance {
+  /**
+   * Rows in THIS cell by journal `mode`, e.g. `{ demo: 93, live: 17 }`. Keys are
+   * only present when non-zero — read a missing key as "no rows of that mode",
+   * which is exactly what `n − (sum of present keys) === 0` asserts.
+   */
+  byMode: Record<string, number>;
+  /**
+   * Rows in THIS cell by account class, on the fold's own basis.
+   * `desk + unattributed === n` by construction (both derived from
+   * {@link isUnattributedRow}, the same predicate `applyModelFacingBasis` uses).
+   * `unattributed` is NOT desk: it is a row written before TRA-1475 added
+   * `account`.
+   */
+  byAccountClass: { desk: number; unattributed: number };
+  /**
+   * Oldest / newest `closeTs` among THIS cell's rows; null when no row in it
+   * carried a finite `closeTs`. The table-level `fromTs`/`toTs` span every cell
+   * at once and so cannot separate two populations inside one cell — these can
+   * (item 3 of the ask: the 08-20 provenance change is visible here).
+   */
+  fromTs: number | null;
+  toTs: number | null;
+}
+
+/**
+ * TRA-4578 item 2 — the NET-OF-MODELLED-CROSS companion's own provenance.
+ *
+ * Demo rows cannot pay the cost the bar prices: `/api/health/option-spread-cost`
+ * → `demoCostModel` reads `demoSlippagePct: 0`, `demoFeePerContract: 0`, and the
+ * route's own note says "demo realized R is gross of spread". Live rows already
+ * paid a real spread and real fees, so charging them again would double-count.
+ * The companion therefore deducts the cell's own measured round-trip `costR` from
+ * **demo rows only** — exactly one deduction, which is correct because
+ * `netEdgeCostBreakdown` already builds `costR` as `ask − bid` plus round-trip
+ * fees.
+ *
+ * ⛔ FAIL-NULL, never fail-zero. When no measured `costR` exists for the cell the
+ * whole companion is `null` and {@link unavailableReason} says which of the two
+ * ignorance cases it is. An absent cost charged as `0` would make the companion
+ * byte-identical to the gross number — i.e. it would reproduce the exact defect
+ * this ticket exists to close.
+ */
+export interface TapeExpectancyCrossCharge {
+  /** Per-row round-trip charge applied to demo rows, in gate R. Null ⇒ not charged. */
+  costR_gate: number | null;
+  /** A LITERAL naming where the charge came from, greppable; null when uncharged. */
+  source: string | null;
+  /** Demo rows — the ones charged. */
+  rowsCharged: number;
+  /** Live rows — already net of real spread and fees, so NOT charged. */
+  rowsUncharged: number;
+  sdR_gate: number | null;
+  seR_gate: number | null;
+  /**
+   * ⚠ READ-ONLY, and it is not a decision. `admits` beside it is what the live
+   * gate does; this is what it WOULD do if the modelled cross were charged.
+   * Null whenever {@link costR_gate} is null.
+   */
+  wouldAdmit: boolean | null;
+  /** Why the companion is null; null when the companion is populated. */
+  unavailableReason: string | null;
+}
+
 /** One `structure × |delta| bucket` cell of the tape. */
 export interface TapeExpectancyCell {
   /** Canonical structure (see {@link canonicalTapeStructure}). */
@@ -194,6 +282,19 @@ export interface TapeExpectancyCell {
   barR: number;
   /** Ruling 2.4 + 2.5: `n >= 30 && lowerCI95 >= barR`. */
   admits: boolean;
+  /** TRA-4578 — who is in this cell. Decides nothing; see the interface doc. */
+  provenance: TapeExpectancyCellProvenance;
+  /**
+   * TRA-4578 item 2 — `meanR_gate` with the cell's measured round-trip cost
+   * charged to its demo rows. **Published BESIDE `meanR_gate`, never instead of
+   * it** — the deciding value is unchanged by this ticket. Null when no measured
+   * cost exists for the cell (see `netOfModelledCross.unavailableReason`).
+   */
+  meanR_gate_netOfModelledCross: number | null;
+  /** TRA-4578 item 2 — the companion of `lowerCI95`. Decides nothing. */
+  lowerCI95_netOfModelledCross: number | null;
+  /** TRA-4578 item 2 — the charge, its source, and why it is null when it is. */
+  netOfModelledCross: TapeExpectancyCrossCharge;
 }
 
 /** Provenance for the fold — what went in, what was dropped, and on what basis. */
@@ -231,6 +332,56 @@ export interface BuildTapeExpectancyOpts {
   /** Cost-gate config the `admits` / `barR` columns are computed against. */
   config?: CostGateConfig;
   minCellN?: number;
+  /**
+   * TRA-4578 item 2 — measured round-trip cross cost per cell, in gate R, keyed
+   * by `cellKey`. INJECTED: this module has no ledger edge and must keep none
+   * (it is the pure fold the gate decides on), so the coupling to the
+   * live-enforce ledger lives one layer up in `option-tape-expectancy-cache.ts`
+   * where it is visible and testable.
+   *
+   * Absent map, or absent key ⇒ the companion is NULL for that cell. Never 0.
+   */
+  modelledCrossRByCell?: ReadonlyMap<string, number> | null;
+  /**
+   * A literal naming where {@link modelledCrossRByCell} came from, echoed onto
+   * every charged cell. Required in spirit whenever the map is supplied — a
+   * charge whose origin is unstated is the same class of unlabelled number this
+   * ticket exists to end.
+   */
+  modelledCrossRSource?: string | null;
+}
+
+/** A cell's accumulator: the gate-R values plus who produced each one. */
+interface CellAccumulator {
+  structure: string;
+  bucket: string;
+  values: number[];
+  /**
+   * Parallel to {@link values}: true when the row's realized R is GROSS of the
+   * cross (i.e. `mode: 'demo'`), and so is the one the companion charges.
+   */
+  grossOfCross: boolean[];
+  byMode: Record<string, number>;
+  desk: number;
+  unattributed: number;
+  fromTs: number | null;
+  toTs: number | null;
+}
+
+/** Mean / sample-SD / SE / lower 95% bound over one value list. Shared by both columns. */
+function cellStats(values: readonly number[]): {
+  mean: number;
+  sd: number | null;
+  se: number | null;
+  lowerCI95: number | null;
+} {
+  const n = values.length;
+  const mean = values.reduce((a, v) => a + v, 0) / n;
+  // Sample SD (n−1): the unbiased dispersion estimate a CI on the mean needs.
+  // Undefined at n=1 — which declines anyway, well under minCellN.
+  const sd = n > 1 ? Math.sqrt(values.reduce((a, v) => a + (v - mean) ** 2, 0) / (n - 1)) : null;
+  const se = sd !== null ? sd / Math.sqrt(n) : null;
+  return { mean, sd, se, lowerCI95: se !== null ? mean - TAPE_EXPECTANCY_Z95 * se : null };
 }
 
 /**
@@ -253,6 +404,10 @@ export function buildTapeExpectancyTable(
   const minCellN = opts.minCellN ?? TAPE_EXPECTANCY_MIN_CELL_N;
   const windowDays = opts.windowDays ?? null;
   const computedAt = opts.nowMs ?? 0;
+  // TRA-4578 item 2 — `null` and `undefined` are both "no source"; kept as a
+  // nullish check so an explicitly-passed `null` reads the same as omission.
+  const crossByCell = opts.modelledCrossRByCell ?? null;
+  const crossSource = opts.modelledCrossRSource ?? null;
   const cutoff =
     windowDays !== null && Number.isFinite(windowDays) && windowDays > 0
       ? computedAt - windowDays * 24 * 60 * 60 * 1000
@@ -266,8 +421,8 @@ export function buildTapeExpectancyTable(
   let fromTs: number | null = null;
   let toTs: number | null = null;
 
-  /** cellKey -> gate-basis realized R values. */
-  const cells = new Map<string, { structure: string; bucket: string; values: number[] }>();
+  /** cellKey -> gate-basis realized R values, plus TRA-4578's per-cell provenance. */
+  const cells = new Map<string, CellAccumulator>();
 
   for (const r of rows) {
     if (r.outcome === 'OPEN' || typeof r.realizedR !== 'number' || !Number.isFinite(r.realizedR)) {
@@ -296,30 +451,69 @@ export function buildTapeExpectancyTable(
     const key = tapeExpectancyCellKey(structure, bucket);
     let cell = cells.get(key);
     if (!cell) {
-      cell = { structure, bucket, values: [] };
+      cell = {
+        structure,
+        bucket,
+        values: [],
+        grossOfCross: [],
+        byMode: {},
+        desk: 0,
+        unattributed: 0,
+        fromTs: null,
+        toTs: null,
+      };
       cells.set(key, cell);
     }
     cell.values.push(r.realizedR * GATE_R_PER_PREMIUM_R);
+    // TRA-4578 — census the row that actually LANDED in the cell. It is counted
+    // here, after all four drop predicates and the window cutoff, and not in the
+    // cache beside the table-level census, precisely because only this loop knows
+    // which rows survived: a census re-derived upstream would have to re-implement
+    // the bucket, structure-alias, gate-basis and window logic and could drift
+    // from it silently — the same-reading-instrument failure this ticket is about.
+    cell.grossOfCross.push(r.mode === 'demo');
+    cell.byMode[r.mode] = (cell.byMode[r.mode] ?? 0) + 1;
+    if (isUnattributedRow(r)) cell.unattributed += 1;
+    else cell.desk += 1;
     rowsUsed += 1;
     if (closeTs !== null) {
       fromTs = fromTs === null ? closeTs : Math.min(fromTs, closeTs);
       toTs = toTs === null ? closeTs : Math.max(toTs, closeTs);
+      cell.fromTs = cell.fromTs === null ? closeTs : Math.min(cell.fromTs, closeTs);
+      cell.toTs = cell.toTs === null ? closeTs : Math.max(cell.toTs, closeTs);
     }
   }
 
   const bucketOrder = tapeExpectancyBucketOrder();
   const out: TapeExpectancyCell[] = [...cells.entries()]
-    .map(([cellKey, { structure, bucket, values }]) => {
+    .map(([cellKey, acc]) => {
+      const { structure, bucket, values, grossOfCross } = acc;
       const n = values.length;
-      const mean = values.reduce((a, v) => a + v, 0) / n;
-      // Sample SD (n−1): the unbiased dispersion estimate a CI on the mean needs.
-      // Undefined at n=1 — which declines anyway, well under minCellN.
-      const sd =
-        n > 1 ? Math.sqrt(values.reduce((a, v) => a + (v - mean) ** 2, 0) / (n - 1)) : null;
-      const se = sd !== null ? sd / Math.sqrt(n) : null;
-      const lowerCI95 = se !== null ? mean - TAPE_EXPECTANCY_Z95 * se : null;
+      const { mean, sd, se, lowerCI95 } = cellStats(values);
       const barR = admissionBarR(structure, config);
       const band = TAPE_EXPECTANCY_BANDS.find((b) => b.label === bucket)!;
+
+      // ── TRA-4578 item 2 — the net-of-modelled-cross companion ──────────────
+      // Fail-NULL: `costR` is read from the injected map and must be a finite
+      // number. An absent map and an absent key are DIFFERENT ignorance cases and
+      // say so; neither is charged as 0, because a 0 charge renders the companion
+      // byte-identical to the gross column it exists to discriminate against.
+      const rowsCharged = grossOfCross.reduce((a, g) => a + (g ? 1 : 0), 0);
+      const supplied = crossByCell?.get(cellKey);
+      const costR = typeof supplied === 'number' && Number.isFinite(supplied) ? supplied : null;
+      const unavailableReason =
+        costR !== null
+          ? null
+          : crossByCell == null
+            ? 'no per-cell cross-cost source was supplied to this fold'
+            : `no measured round-trip costR for ${cellKey} in ${crossSource ?? 'the supplied source'} — NOT charged as zero`;
+      // The deduction is per-ROW, not applied to the mean, because it lands on a
+      // SUBSET: it shifts the demo rows relative to the live ones and therefore
+      // moves the dispersion too. `mean − costR·(charged/n)` would get the mean
+      // right and the SE — which is the half that decides — wrong.
+      const netValues = costR === null ? null : values.map((v, i) => (grossOfCross[i] ? v - costR : v));
+      const net = netValues === null ? null : cellStats(netValues);
+
       return {
         structure,
         bucket,
@@ -333,6 +527,25 @@ export function buildTapeExpectancyTable(
         lowerCI95,
         barR,
         admits: n >= minCellN && lowerCI95 !== null && lowerCI95 >= barR,
+        provenance: {
+          byMode: { ...acc.byMode },
+          byAccountClass: { desk: acc.desk, unattributed: acc.unattributed },
+          fromTs: acc.fromTs,
+          toTs: acc.toTs,
+        },
+        meanR_gate_netOfModelledCross: net?.mean ?? null,
+        lowerCI95_netOfModelledCross: net?.lowerCI95 ?? null,
+        netOfModelledCross: {
+          costR_gate: costR,
+          source: costR === null ? null : (crossSource ?? null),
+          rowsCharged,
+          rowsUncharged: n - rowsCharged,
+          sdR_gate: net?.sd ?? null,
+          seR_gate: net?.se ?? null,
+          wouldAdmit:
+            net === null ? null : n >= minCellN && net.lowerCI95 !== null && net.lowerCI95 >= barR,
+          unavailableReason,
+        },
       };
     })
     .sort(
