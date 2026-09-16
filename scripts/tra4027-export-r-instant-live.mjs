@@ -24,6 +24,10 @@
 //
 //   --out      write the pinned snapshot (build + every options row) for the
 //              other side of the edge to compare against.
+//   --since    ET day (YYYY-MM-DD) of the previous read. Reports every ET day
+//              at or after it that carried option orders, so a LOW-cadence
+//              monitor still learns that a close crossed the archive
+//              unobserved. Defaults to the `--compare` snapshot's own readAt.
 //   --compare  the BEFORE snapshot. Every row present in both (joined on
 //              `journal_id`) must publish the SAME `pnl_r` and the same
 //              `premium_basis_usd`, whichever emitter served it. Rows with
@@ -69,10 +73,12 @@ if (login.status !== 200 || !login.body?.token) {
 const H = { authorization: `Bearer ${login.body.token}` };
 
 const readAt = new Date().toISOString();
-const [live, exp, jr] = await Promise.all([
+const [live, exp, jr, cap, state] = await Promise.all([
   j(`${BASE}/api/health/options-live`, { headers: H }),
   j(`${BASE}/api/trades/export?format=json&markets=options`, { headers: H }),
   j(`${BASE}/api/health/option-journal?rows=all`, { headers: H }),
+  j(`${BASE}/api/health/order-provenance-capture`, { headers: H }),
+  j(`${BASE}/api/state`, { headers: H }),
 ]);
 if (live.status !== 200 || exp.status !== 200) {
   console.error('route unreadable — BLIND', { live: live.status, export: exp.status, body: exp.body });
@@ -105,6 +111,68 @@ if (journalRows) {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// FLOW CENSUS (added 2026-09-16, monitor fire #7).
+//
+// AC5's BOOK half can only be graded on a day the book actually holds a closed
+// options row, and the book drops it at the 21:00 ET archive — so the
+// pre-archive read has to happen ON the close day. Between 2026-09-03 and
+// 2026-09-16 the fleet placed ZERO option orders on all 14 ET sessions, so 7
+// monitor fires have now read the same book-empty population, and the one real
+// opportunity (the 09-02 closes) was missed because the monitor was armed for
+// 09-04.
+//
+// The fix is not a faster monitor, it is a DETECTOR that a low-cadence monitor
+// cannot fool: `/api/health/order-provenance-capture` keeps a per-ET-day
+// option-order count — 27 day rows on 2026-09-16, reaching back to 08-21, and
+// the count includes `sell_to_close`. Whether a close happened is therefore
+// readable LONG after the archive destroyed the export row it produced. So:
+//   * detection of a missed edge is lossless at any cadence WELL INSIDE that
+//     retention (which is bounded and must be re-read, not assumed — it is
+//     published as `flow.retentionDays`), and only as complete as each day's
+//     `attestation`: a `partial` day covered one account, so a close in the
+//     other book can still be invisible. The attestation travels with every
+//     reported day for exactly that reason;
+//   * only the GRADE of that specific row is perishable.
+// `--since=YYYY-MM-DD` (ET) makes the script say, out loud, which ET days since
+// the last read carried option orders. An `openOptions > 0` reading is the
+// forward signal: a close can land the next session, so the cadence tightens to
+// daily. Both are echoed into `--out` so the next read can chain off them.
+const etDayOf = (iso) =>
+  new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(iso));
+
+const captureDays = Array.isArray(cap.body?.brokerOrderCapture?.days) ? cap.body.brokerOrderCapture.days : null;
+const openOptionsNow = Array.isArray(state.body?.options?.openOptions) ? state.body.options.openOptions.length : null;
+// `--since` wins; otherwise the BEFORE snapshot's own `readAt` supplies it, so
+// a `--compare` run reports the flow over exactly the interval it spans.
+let sinceEtDay = typeof args.since === 'string' ? args.since : null;
+if (!sinceEtDay && typeof args.compare === 'string') {
+  try {
+    const prior = JSON.parse(readFileSync(args.compare, 'utf8'));
+    if (prior?.readAt) sinceEtDay = etDayOf(prior.readAt);
+  } catch { /* the compare read below reports the real error */ }
+}
+const flow = {
+  captureReadable: !!captureDays,
+  captureEtDay: cap.body?.etDay ?? null,
+  retentionDays: captureDays ? captureDays.length : 0,
+  openOptionsNow,
+  since: sinceEtDay,
+  daysWithOptionOrders: captureDays
+    ? captureDays
+        .filter((d) => (sinceEtDay ? d.etDay >= sinceEtDay : true) && (d.optionOrders ?? 0) > 0)
+        .map((d) => ({ etDay: d.etDay, optionOrders: d.optionOrders, attestation: d.attestation }))
+    : [],
+  flatSessions: captureDays ? (() => { let n = 0; for (let i = captureDays.length - 1; i >= 0; i -= 1) { if ((captureDays[i].optionOrders ?? 0) > 0) break; n += 1; } return n; })() : null,
+};
+// A day with orders that we did NOT read pre-archive is a missed grading
+// opportunity — loud, because it is the only thing that can silently cost AC5 a
+// row, and it is exactly what happened on 09-02.
+flow.missedEdgeRisk = !!(sinceEtDay && flow.daysWithOptionOrders.length);
+flow.cadence = openOptionsNow ? 'daily (a position is open — a close can land next session)'
+  : flow.missedEdgeRisk ? 'daily (orders landed since the last read)'
+  : 'low (book flat and no orders; the capture still records any close for later detection)';
 
 const fails = [];
 const notes = [];
@@ -199,11 +267,19 @@ if (typeof args.compare === 'string') {
 }
 
 const verdict = fails.length ? 'FAIL' : 'PASS';
-const out = { readAt, pin, summary: { count: summary.count, sources: summary.sources, supersededRowCount: summary.supersededRowCount }, census, journalTwins: atRiskById.size, journalRouteReadable: !!journalRows, fails, journalResiduals, notes, compare, rows };
+const out = { readAt, pin, summary: { count: summary.count, sources: summary.sources, supersededRowCount: summary.supersededRowCount }, census, flow, journalTwins: atRiskById.size, journalRouteReadable: !!journalRows, fails, journalResiduals, notes, compare, rows };
 if (typeof args.out === 'string') writeFileSync(args.out, JSON.stringify(out, null, 2));
 
 console.log(`[tra4027] ${verdict} readAt=${readAt} pin=${pin.commit} pid=${pin.pid} startedAt=${pin.startedAt}`);
 console.log(`[tra4027] options rows=${rows.length} census=${JSON.stringify(census)} journalTwins=${atRiskById.size} journalRoute=${journalRows ? 'ok' : 'unreadable (twin check skipped)'}`);
+console.log(`[tra4027] flow openOptionsNow=${flow.openOptionsNow} flatSessions=${flow.flatSessions} captureEtDay=${flow.captureEtDay} retention=${flow.retentionDays}d since=${flow.since ?? 'n/a'} daysWithOptionOrders=${JSON.stringify(flow.daysWithOptionOrders)}`);
+console.log(`[tra4027] cadence: ${flow.cadence}`);
+if (flow.missedEdgeRisk) {
+  // Not a FAIL of the export — a FAIL of the WATCH. Those rows' book-served
+  // instant is gone (archived), and only the capture remembers they existed.
+  console.log(`  MISSED-EDGE-RISK: option orders landed on ${flow.daysWithOptionOrders.map((d) => d.etDay).join(', ')} since the last read; any close on those days crossed the archive UNGRADED on the book side.`);
+}
+if (!flow.captureReadable) console.log('  note: order-provenance-capture unreadable — flow census degraded, cadence cannot be lowered on this read.');
 for (const r of rows.filter((x) => (x.source ?? 'book') === 'book')) {
   console.log(`  book  ${r.symbol} lot=${r.lot_id} jid=${r.journal_id} net=${r.net_pnl_usd} pnl_r=${r.pnl_r} basis=${r.pnl_r_basis} premium_basis_usd=${r.premium_basis_usd} entry=${r.entry_price} exit=${r.exit_time}`);
 }
