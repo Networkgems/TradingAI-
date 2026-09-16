@@ -11170,6 +11170,16 @@ app.get('/api/health/news-catalyst-signals', async (_req, res) => {
       // feed is degraded. Without it, `queriesAttempted` has no scale.
       catalystUniverseSize: catalystUniverse().length,
       chosenCount: chosen,
+      // TRA-4585 (parent TRA-4222) — `promotionReady` is DELIBERATELY UNCHANGED.
+      // The parent's complaint is that it is biased downward, because `chosen`
+      // accrues over calendar sessions while outage days sit in the denominator
+      // — and `sessionsTotal`/`sessionsDegraded`/`sessionsEligible` (spread in
+      // from `...runs` above) are now beside it so a reader can see the bias
+      // rather than infer it. Re-cutting the predicate itself moves a LIVE
+      // promotion gate and is CFO's call, not this ticket's; it is raised on
+      // TRA-4585 as a separate question. Read `promotionReady` as "≥100 chosen
+      // name-days on the calendar denominator", and `sessionsEligible` as the
+      // denominator it should arguably be measured against.
       promotionReady: chosen >= 100,
       signals,
       // TRA-1632 — D2 lean gradeability surface.

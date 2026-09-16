@@ -43,16 +43,54 @@ export function isNewsCatalystEnabled(env: NodeJS.ProcessEnv = process.env): boo
   return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
 }
 
-/** Why a scored candidate was not injected into the watchlist. */
+/**
+ * Why a scored candidate was not injected into the watchlist.
+ *
+ * TRA-4585 (parent TRA-4222) — `no_quote` and `below_min_price` are DIFFERENT
+ * diagnoses and must never share a token. `below_min_price` is a measurement:
+ * we priced the name and it is under the floor. `no_quote` is the ABSENCE of a
+ * measurement: the metrics feed answered with null / NaN / 0, so the name was
+ * dropped without ever being screened. Folding the two together is what let the
+ * 2026-08-31 price-feed outage enter the forward-test cohort as an ordinary
+ * 0-catalyst session — that day rejected SPY, DIA, TSLA, NFLX, AVGO, ORCL, CRM,
+ * ADBE, MSTR, COIN, QCOM, AMD, INTC and PYPL as `below_min_price` (14 drops,
+ * against 1 across the 25 prior sessions) while the run ledger read
+ * `fetch_degraded / queriesSucceeded: 0`. A reader had to already know that SPY
+ * is not a penny stock to spot it.
+ *
+ * The token is `no_quote` and NOT a new third vocabulary: `premarket-watchlist.ts`
+ * `filterByPriceFloor` already splits its `dropped[]` exactly this way, with the
+ * identical predicate (`price == null || !Number.isFinite(price) || price <= 0`).
+ * Both surfaces now mean the same thing by the same word — see
+ * {@link hasUsableQuote}, which is the single shared predicate.
+ */
 export type CatalystDropReason =
   | 'stale' // newest headline older than the freshness gate
   | 'neutral_tilt' // sentiment tilt neutral (no directional catalyst)
   | 'earnings_demote' // earnings within one session — manual look only
-  | 'below_min_price' // under WATCHLIST_MIN_PRICE
+  | 'below_min_price' // priced, and under WATCHLIST_MIN_PRICE
+  | 'no_quote' // TRA-4585 — NOT priced at all (null/NaN/≤0); never screened
   | 'below_liquidity' // avg $-vol under the directional floor
   | 'hidden' // on the user hidden list
   | 'not_tradable' // not a tradable US equity
   | 'below_cap'; // ranked outside the top-8 cap
+
+/**
+ * TRA-4585 — the single predicate for "this quote is a MEASUREMENT, not an
+ * absence". Lives here, next to the drop-reason vocabulary, because the whole
+ * point of the `no_quote` / `below_min_price` split is that both surfaces that
+ * emit those tokens agree on where the boundary is.
+ *
+ * All three clauses are load-bearing and the 2026-08-31 feed proved it: it
+ * returned nulls AND zeros. A bare `price == null` check passes the zeros
+ * straight through to the `< minPrice` comparison, where `0 < 5` is true — so
+ * half the outage reproduces as `below_min_price` and the bug survives the fix.
+ * `!Number.isFinite` additionally catches `NaN`, for which BOTH `< minPrice`
+ * and `>= minPrice` are false.
+ */
+export function hasUsableQuote(price: number | null | undefined): price is number {
+  return price != null && Number.isFinite(price) && price > 0;
+}
 
 /** What the caller hands the ledger for one capture. */
 export interface CatalystObservationInput {
@@ -77,6 +115,25 @@ export interface CatalystObservationInput {
   dropReason: CatalystDropReason | null;
   /** Advisory tags (e.g. `EARNINGS_IV_CRUSH_RISK`). */
   tags: string[];
+  /**
+   * TRA-4585 — was the run that WROTE this row degraded (news feed dead, or no
+   * candidate got a usable quote)? See `isCatalystRunDegraded`.
+   *
+   * ⚠️ TRI-STATE, and the third state is the important one. Every row written
+   * from this commit on carries an explicit `true` or `false`. A row with the
+   * key ABSENT predates the field and is **UNKNOWN** — never read it as `false`.
+   * (`news-catalyst-run-ledger.ts` makes the same distinction for
+   * `queriesAttempted` and states why; this follows that precedent. The reader
+   * that must not collapse it is {@link CatalystShadowRecord.degradedRun}'s
+   * `?? null` unwrap, not a `?:`.)
+   *
+   * Why it is stamped per-ROW rather than derived at read time: the shadow
+   * ledger dedupes one row per symbol per ET session, FIRST WRITE WINS. So a
+   * degraded early run permanently owns that session's rows even if a later
+   * healthy run that day would have priced the same names. The provenance has
+   * to travel with the row it poisoned.
+   */
+  degradedRun?: boolean;
 }
 
 /** One persisted news-catalyst shadow observation. */

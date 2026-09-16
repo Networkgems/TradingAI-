@@ -76,8 +76,60 @@ export interface CatalystRunRecord {
    */
   queriesAttempted: number | null;
   queriesSucceeded: number | null;
+  /**
+   * TRA-4585 — PRICE-feed health on this run: candidates we tried to price, and
+   * candidates that came back with a usable quote (`hasUsableQuote`). `null`
+   * when the run never reached the enrichment step, or when it predates these
+   * fields. Same `null`-means-not-measured discipline as the pair above.
+   *
+   * These are a SEPARATE feed from `queries*`. `queriesAttempted/Succeeded`
+   * measure the Yahoo *news* sweep; these measure the daily-candle pull behind
+   * `fetchCatalystMetrics`. The 2026-08-31 defect is only fully visible with
+   * both: a run can score candidates off perfectly healthy news and then drop
+   * every one of them because the quote feed answered null. Without this pair
+   * that run writes `picks_built / chosenCount: 0` — indistinguishable from a
+   * real day on which nothing scored well enough.
+   */
+  quotesAttempted: number | null;
+  quotesOk: number | null;
   /** Error message on the failure outcomes. */
   reason?: string;
+}
+
+/**
+ * TRA-4585 — did this run measure its inputs, or did it only look like it did?
+ *
+ * THE predicate. The row stamp (`CatalystShadowRecord.degradedRun`) and the
+ * session partition below both call this, so a row can never disagree with the
+ * session it belongs to.
+ *
+ * Degraded ⇔ any of:
+ *   1. a terminal outcome that by definition measured nothing
+ *      (`fetch_degraded`, `fetch_failed`, `source_failed`);
+ *   2. the news sweep issued queries and NONE answered;
+ *   3. the price feed was asked for quotes and NONE were usable.
+ *
+ * (3) is the arm that catches 2026-08-31 in the general case. (1) and (2)
+ * overlap on that specific day — it recorded `fetch_degraded` — but they are
+ * not the same rule: `fetch_degraded` is only raised when the *news* sweep dies
+ * before enrichment, and a dead quote feed under live news never reaches it.
+ *
+ * ⚠️ `null` is NOT degraded. A pre-TRA-4585 run has `quotesAttempted: null`,
+ * which means "not measured", and treating an absent measurement as a positive
+ * finding would retro-contaminate the 25 clean sessions QuantTrader has already
+ * banked. Each clause therefore requires its counter to be a real number > 0.
+ */
+export function isCatalystRunDegraded(
+  r: Pick<
+    CatalystRunRecord,
+    'outcome' | 'queriesAttempted' | 'queriesSucceeded' | 'quotesAttempted' | 'quotesOk'
+  >,
+): boolean {
+  if (r.outcome === 'fetch_degraded' || r.outcome === 'fetch_failed' || r.outcome === 'source_failed')
+    return true;
+  if (r.queriesAttempted != null && r.queriesAttempted > 0 && r.queriesSucceeded === 0) return true;
+  if (r.quotesAttempted != null && r.quotesAttempted > 0 && r.quotesOk === 0) return true;
+  return false;
 }
 
 function defaultStoreFile(): string {
@@ -194,6 +246,15 @@ export interface CatalystRunSummary {
   /** TRA-2064 — feed health on the last run; see {@link CatalystRunRecord}. */
   lastRunQueriesAttempted: number | null;
   lastRunQueriesSucceeded: number | null;
+  /** TRA-4585 — price-feed health on the last run; see {@link CatalystRunRecord}. */
+  lastRunQuotesAttempted: number | null;
+  lastRunQuotesOk: number | null;
+  /**
+   * TRA-4585 — {@link isCatalystRunDegraded} over the last run. `null` ↔ there
+   * is no last run (the writer has never run on this disk), which is a third
+   * state and not a `false`.
+   */
+  lastRunDegraded: boolean | null;
   lastRunReason: string | null;
   /** Cumulative invocations across ALL boots (durable — survives a restart). */
   runCount: number;
@@ -201,6 +262,36 @@ export interface CatalystRunSummary {
   runCountSinceBoot: number;
   /** Distinct ET sessions in which the writer ran at least once. */
   sessionsWithRun: number;
+  /**
+   * TRA-4585 — the forward-test DENOMINATOR, as a three-field partition.
+   *
+   * `sessionsDegraded + sessionsEligible === sessionsTotal`, always, and a test
+   * pins it (the shape `live-nav-tripwire-ledger.ts` uses for
+   * `sessionsTrip + sessionsDegradedOnly + sessionsClean`). A partition that is
+   * checkable is the point: the reader does not have to trust that the two
+   * buckets were derived from the same set.
+   *
+   * `sessionsTotal` is the same set as {@link sessionsWithRun} — distinct ET
+   * days with ≥1 run — re-exposed under the name that makes the partition read
+   * as one. It is not a second measurement and must never diverge.
+   *
+   * A session is DEGRADED if **any** run in it was degraded, not if all were.
+   * That looks harsh until you remember the shadow ledger dedupes one row per
+   * symbol per session, first write wins: one degraded run early in the day
+   * owns that session's rows outright, and a later healthy run cannot overwrite
+   * them. The strict rule is the one that matches what is actually on disk.
+   */
+  sessionsTotal: number;
+  sessionsDegraded: number;
+  sessionsEligible: number;
+  /**
+   * The ET day keys behind `sessionsDegraded`, ascending. Bounded by the
+   * degraded subset (rare by construction), and it is what lets a reader
+   * reconcile this fold against a hand-kept exclusion list — QuantTrader's
+   * banked `26 total | 1 contaminated | 25 eligible` should show up here as
+   * exactly `['2026-08-31']` once the field has history behind it.
+   */
+  degradedSessions: string[];
   /** Tail of the run history, most recent last. */
   recentRuns: CatalystRunRecord[];
 }
@@ -216,6 +307,14 @@ export interface CatalystRunSummary {
 export async function summarizeCatalystRuns(tail = 20): Promise<CatalystRunSummary> {
   const rows = await ensureLoaded();
   const last = rows.length > 0 ? rows[rows.length - 1] : null;
+
+  // TRA-4585 — fold the SAME `rows` into the session partition. No new
+  // persistence: `session`, `outcome` and both health pairs are already durable
+  // per run, so this is arithmetic over what the ledger has always stored.
+  const allSessions = new Set(rows.map((r) => r.session));
+  const degraded = new Set(rows.filter((r) => isCatalystRunDegraded(r)).map((r) => r.session));
+  const degradedSessions = [...degraded].sort();
+
   return {
     lastRunAt: last?.at ?? null,
     lastRunSession: last?.session ?? null,
@@ -227,10 +326,21 @@ export async function summarizeCatalystRuns(tail = 20): Promise<CatalystRunSumma
     // such key, and an absent measurement is `null`, never `0`.
     lastRunQueriesAttempted: last?.queriesAttempted ?? null,
     lastRunQueriesSucceeded: last?.queriesSucceeded ?? null,
+    // Same `?? null` for the same reason — a run written before TRA-4585 has no
+    // such key, and "not measured" is `null`, never `0`.
+    lastRunQuotesAttempted: last?.quotesAttempted ?? null,
+    lastRunQuotesOk: last?.quotesOk ?? null,
+    lastRunDegraded: last ? isCatalystRunDegraded(last) : null,
     lastRunReason: last?.reason ?? null,
     runCount: rows.length,
     runCountSinceBoot: runsSinceBoot,
-    sessionsWithRun: new Set(rows.map((r) => r.session)).size,
+    sessionsWithRun: allSessions.size,
+    sessionsTotal: allSessions.size,
+    sessionsDegraded: degraded.size,
+    // Subtraction, not a second filter — this is what makes the partition an
+    // identity rather than a coincidence two predicates have to keep agreeing on.
+    sessionsEligible: allSessions.size - degraded.size,
+    degradedSessions,
     recentRuns: rows.slice(-tail),
   };
 }

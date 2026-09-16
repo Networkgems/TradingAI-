@@ -28,10 +28,11 @@ import {
 import { fetchDailyCandles, type MarketNewsResult } from './yahoo-feed.js';
 import {
   recordCatalystObservation,
+  hasUsableQuote,
   type CatalystDropReason,
   type CatalystObservationInput,
 } from './news-catalyst-ledger.js';
-import { recordCatalystRun } from './news-catalyst-run-ledger.js';
+import { recordCatalystRun, isCatalystRunDegraded } from './news-catalyst-run-ledger.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'news-catalyst-source' });
@@ -168,7 +169,14 @@ export function scoreAndSelect(
     let dropReason: CatalystDropReason | null = null;
     if (!tradable(c.symbol)) dropReason = 'not_tradable';
     else if (hidden.has(c.symbol.toUpperCase())) dropReason = 'hidden';
-    else if (c.price == null || c.price < minPrice) dropReason = 'below_min_price';
+    // TRA-4585 — the missing quote is checked FIRST and separately. This used to
+    // read `c.price == null || c.price < minPrice → 'below_min_price'`, which
+    // filed a market-data outage under the price screen. Order matters as much
+    // as the split: `hasUsableQuote` has to answer before any comparison against
+    // `minPrice`, or a `0` price reaches `0 < minPrice` and is reported as a
+    // cheap stock. See `hasUsableQuote` for why null/NaN/≤0 are all one class.
+    else if (!hasUsableQuote(c.price)) dropReason = 'no_quote';
+    else if (c.price < minPrice) dropReason = 'below_min_price';
     else if (c.avgDollarVol == null || c.avgDollarVol < minVol) dropReason = 'below_liquidity';
     else if (!score.fresh) dropReason = 'stale';
     else if (c.tilt === 'neutral') dropReason = 'neutral_tilt';
@@ -253,7 +261,11 @@ export async function fetchCatalystMetrics(symbol: string): Promise<CatalystMetr
   };
 }
 
-function toLedgerRow(s: ScoredCandidate, asof: number): CatalystObservationInput {
+function toLedgerRow(
+  s: ScoredCandidate,
+  asof: number,
+  degradedRun: boolean,
+): CatalystObservationInput {
   return {
     symbol: s.symbol,
     asof,
@@ -268,6 +280,11 @@ function toLedgerRow(s: ScoredCandidate, asof: number): CatalystObservationInput
     chosen: s.chosen,
     dropReason: s.dropReason,
     tags: s.score.tags,
+    // TRA-4585 — written EXPLICITLY on every row, `true` or `false`. Omitting
+    // it on the healthy path would make "clean row" and "row written before
+    // this field existed" the same observation, which is the identical
+    // false-equivalence this ticket exists to remove one layer up.
+    degradedRun,
   };
 }
 
@@ -296,6 +313,11 @@ export async function buildNewsCatalystPicks(deps: CatalystSourceDeps): Promise<
       chosenCount: null,
       queriesAttempted: null,
       queriesSucceeded: null,
+      // TRA-4585 — `null`, not `0`: the run died at the news fetch and never
+      // reached enrichment, so no quote was ever requested. A `0` here would
+      // claim we asked for quotes and got none, which is a different diagnosis.
+      quotesAttempted: null,
+      quotesOk: null,
       reason,
     });
     return [];
@@ -320,6 +342,9 @@ export async function buildNewsCatalystPicks(deps: CatalystSourceDeps): Promise<
       chosenCount: null,
       queriesAttempted: feed.queriesAttempted,
       queriesSucceeded: 0,
+      // Returned before enrichment — no quote requested. See above.
+      quotesAttempted: null,
+      quotesOk: null,
       reason: 'all market-news queries failed',
     });
     return [];
@@ -336,6 +361,11 @@ export async function buildNewsCatalystPicks(deps: CatalystSourceDeps): Promise<
       chosenCount: 0,
       queriesAttempted: feed.queriesAttempted,
       queriesSucceeded: feed.queriesSucceeded,
+      // Zero candidates mapped, so zero names to price. `0`/`0` is MEASURED
+      // here — and `isCatalystRunDegraded` requires `quotesAttempted > 0`, so a
+      // genuinely quiet news day is correctly NOT degraded by the quote arm.
+      quotesAttempted: 0,
+      quotesOk: 0,
     });
     return [];
   }
@@ -362,10 +392,26 @@ export async function buildNewsCatalystPicks(deps: CatalystSourceDeps): Promise<
 
   const { chosen, scored } = scoreAndSelect(enriched, { hidden: deps.hidden });
 
-  // Persist every scored candidate to the shadow ledger (deduped per session).
+  // TRA-4585 — price-feed health for THIS run, measured over the names we
+  // actually asked about. `fetchMetrics` swallows its own failures into
+  // `price: null` (above, and again inside `fetchCatalystMetrics`), so a dead
+  // quote feed raises no error anywhere on this path; counting the usable
+  // answers is the only place it becomes visible.
+  const quotesAttempted = enriched.length;
+  const quotesOk = enriched.filter((c) => hasUsableQuote(c.price)).length;
+  const degradedRun = isCatalystRunDegraded({
+    outcome: 'picks_built',
+    queriesAttempted: feed.queriesAttempted,
+    queriesSucceeded: feed.queriesSucceeded,
+    quotesAttempted,
+    quotesOk,
+  });
+
+  // Persist every scored candidate to the shadow ledger (deduped per session),
+  // each stamped with whether the run that wrote it had measured inputs.
   for (const s of scored) {
     try {
-      await recordCatalystObservation(toLedgerRow(s, deps.now));
+      await recordCatalystObservation(toLedgerRow(s, deps.now, degradedRun));
     } catch (err) {
       log.warn('news-catalyst ledger append failed', {
         symbol: s.symbol,
@@ -383,11 +429,30 @@ export async function buildNewsCatalystPicks(deps: CatalystSourceDeps): Promise<
     chosenCount: picks.length,
     queriesAttempted: feed.queriesAttempted,
     queriesSucceeded: feed.queriesSucceeded,
+    quotesAttempted,
+    quotesOk,
+    ...(degradedRun
+      ? { reason: `price feed degraded: ${quotesOk}/${quotesAttempted} candidates priced` }
+      : {}),
   });
+  if (degradedRun) {
+    // TRA-4585 — loud, because this is the run shape that used to be silent: a
+    // healthy news sweep, a full candidate list, and every name dropped for
+    // want of a quote. It exits `picks_built / chosenCount: 0`, which reads as
+    // an ordinary uneventful session unless something says otherwise.
+    log.warn('news-catalyst: run wrote rows with DEGRADED inputs', {
+      quotesAttempted,
+      quotesOk,
+      queriesAttempted: feed.queriesAttempted,
+      queriesSucceeded: feed.queriesSucceeded,
+      candidates: scored.length,
+    });
+  }
   log.info('news-catalyst picks built', {
     headlines: news.length,
     candidates: scored.length,
     chosen: picks.length,
+    degradedRun,
     ...(picks.length ? { symbols: picks.join(', ') } : {}),
   });
   return picks;

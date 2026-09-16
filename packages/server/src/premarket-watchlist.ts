@@ -50,7 +50,7 @@ import {
 import { scanStocksMarket, type ScanResult } from './market-scanner.js';
 import { fetchQuotes, fetchMarketNews } from './yahoo-feed.js';
 import { addStocksSymbol, getStocksWatchlistData } from './watchlist-store.js';
-import { isNewsCatalystEnabled } from './news-catalyst-ledger.js';
+import { isNewsCatalystEnabled, hasUsableQuote } from './news-catalyst-ledger.js';
 import {
   buildNewsCatalystPicks,
   catalystUniverse,
@@ -340,7 +340,11 @@ export async function filterByPriceFloor(
   const dropped: Array<{ symbol: string; price: number | null; reason: 'below_min_price' | 'no_quote' }> = [];
   for (const r of newcomers) {
     const price = priceBySymbol.get(r.symbol);
-    if (price == null || !Number.isFinite(price) || price <= 0) {
+    // TRA-4585 — this inlined `price == null || !Number.isFinite(price) ||
+    // price <= 0`. Same predicate, now the SHARED one: the catalyst path adopted
+    // this surface's `no_quote` / `below_min_price` vocabulary, and two copies of
+    // a boundary definition are two things that can drift apart.
+    if (!hasUsableQuote(price)) {
       // No usable quote — drop conservatively. Without a price we can't
       // prove the symbol clears the floor, and TRA-508 showed unfiltered
       // micro-caps are exactly the cohort the floor is meant to gate out.
@@ -412,6 +416,11 @@ export async function generateSmartWatchlist(ctx: UserContext): Promise<string[]
         chosenCount: null,
         queriesAttempted: null,
         queriesSucceeded: null,
+        // TRA-4585 — the build threw; nothing about either feed was measured
+        // from out here, so both quote counters are `null` (not measured),
+        // never `0` (asked and got nothing).
+        quotesAttempted: null,
+        quotesOk: null,
         reason,
       });
     }
