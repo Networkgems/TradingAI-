@@ -18484,6 +18484,27 @@ export class SignalEngine {
       recordEquityEntryRejected(funnelMode, funnelEngineId, 'non_usd_quote_currency');
       return null;
     }
+    // TRA-4442 — the capital-gate manifest, at THIS chokepoint too. TRA-1540's
+    // paper-only ratification rested on the TRA-817 manifest being empty, but
+    // the manifest was only ever consulted in openSma200Pullback and the tsmom
+    // router — never here, the chokepoint that carries ORB / BB-fade / Ichimoku
+    // into a real Tradier OTOCO in live mode. Until a strategy clears the OOS
+    // keeper gate, the live branch below must be unreachable for it, regardless
+    // of what stocksAutoTradingEnabledLive reads. Scoped to live mode on
+    // purpose: the demo paper book is the forward-test measurement population
+    // and closing it is a posture change the TRA-4442 ruling did not order.
+    // Ordered after the currency refusal, matching openSma200Pullback, so a
+    // foreign row still names non_usd_quote_currency (TRA-3390 AC4).
+    if (this.mode === 'live' && !isLiveEntryGatePassed(signal.type)) {
+      signal.liveSkipReason =
+        `display-only: ${signal.type} is not registered in the TRA-817 capital-gate manifest (no out-of-sample pass)`;
+      log.warn('live equity entry suppressed: strategy not registered in capital-gate manifest', {
+        component: 'equity-scan', issue: 'TRA-4442', via: source, sym,
+        signalType: signal.type,
+      });
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'capital_gate_manifest');
+      return null;
+    }
     // TRA-952 — swing universe gate (backstop for the agent-gating path; the
     // deterministic scan already skips off-universe symbols before evaluation).
     // Block equity entries on names outside the curated liquid universe (thin
