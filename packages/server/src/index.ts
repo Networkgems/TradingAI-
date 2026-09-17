@@ -623,9 +623,13 @@ import {
   initIvRankStore,
   recordDailyIv,
   ivRankSync,
+  ivPercentileSync,
   atmIvFromRows,
   seedFromArchive,
 } from './iv-rank-store.js';
+// TRA-4644 — availability accounting for the `ivPercentile` sibling field on
+// the OTM/RV nomination read surface (published on the decomposition probe).
+import { ivPercentileCoverageHealth } from './iv-percentile-coverage.js';
 // TRA-2206 (TRA-1965) — chain-archive IV-rank reconstruction + the (default-OFF)
 // store seed that makes the TRA-2005 expectancy shadow gradeable on a fresh cohort.
 import {
@@ -5582,10 +5586,10 @@ async function runChainRecord(): Promise<boolean> {
   return true;
 }
 
-// TRA-1049 — post-pass that stamps `spot` + `ivRank` onto each per-symbol file
-// of the given date partition. Idempotent: re-reads the file the recorder just
-// wrote, adds the two fields, rewrites. Pure best-effort — any error per symbol
-// is logged and skipped.
+// TRA-1049 — post-pass that stamps `spot` + `ivRank` (+ `ivPercentile`,
+// TRA-4644) onto each per-symbol file of the given date partition. Idempotent:
+// re-reads the file the recorder just wrote, adds the fields, rewrites. Pure
+// best-effort — any error per symbol is logged and skipped.
 async function enrichChainPartition(date: string): Promise<void> {
   const dir = join(CHAIN_RECORD_OUT_DIR, date);
   // TRA-2417 — via `listChainSnapshotFiles`, so a compacted (`.json.gz`)
@@ -5601,6 +5605,7 @@ async function enrichChainPartition(date: string): Promise<void> {
     try {
       const snap = (await readChainSnapshotFile(path)) as import('@trading-app/backtest').OptionChainSnapshotFile & {
         ivRank?: number | null;
+        ivPercentile?: number | null;
       };
       if (!snap || !Array.isArray(snap.rows) || typeof snap.symbol !== 'string') continue;
       // Idempotent: a file already carrying `ivRank` was enriched on a prior
@@ -5617,8 +5622,18 @@ async function enrichChainPartition(date: string): Promise<void> {
         await recordDailyIv(snap.symbol, atmIv, asOf);
       }
       const ivRank = atmIv != null ? ivRankSync(snap.symbol, atmIv, asOf) : null;
+      // TRA-4644 — the IV-PERCENTILE sibling, stamped in the same pass off the
+      // same store/window. NEW enrichments only: the `ivRank !== undefined`
+      // idempotence guard above deliberately leaves older rank-only files
+      // percentile-less rather than backfilling them now — `windowFor` has no
+      // upper bound at `asOf`, so recomputing an old partition against today's
+      // deepened store would fold in sessions recorded AFTER that partition's
+      // capture instant (look-ahead), which is strictly worse than an honest
+      // absence.
+      const ivPercentile = atmIv != null ? ivPercentileSync(snap.symbol, atmIv, asOf) : null;
       snap.spot = spot ?? null;
       snap.ivRank = ivRank;
+      snap.ivPercentile = ivPercentile;
       // TRA-2417 — writes back in the form the path names; a `.json.gz` stays gzipped.
       await writeChainSnapshotFile(path, snap);
       stamped += 1;
@@ -7960,6 +7975,11 @@ app.get('/api/health/options-ideas-decomposition', async (_req, res) => {
         expectancyNetR: report.totals.expectancyNetR,
         popCalibrationGap: report.totals.popCalibrationGap,
       },
+      // TRA-4644 — availability of the `ivPercentile` field on the OTM/RV
+      // nomination surface: the covered / insufficient-history / uncovered /
+      // no-atm-iv split, since boot, so "how often is the percentile actually
+      // a number" is answerable without a code read.
+      ivPercentileCoverage: ivPercentileCoverageHealth(),
       ...report.decomposition,
     });
   } catch (err) {

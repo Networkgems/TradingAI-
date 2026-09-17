@@ -25,7 +25,17 @@ import {
 import type { OptionChainSnapshotFile } from './options-chain-recorder.js';
 import { earningsInDaysSync } from './earnings-store.js';
 import { daysToNextFOMCSync, eventsNearDateSync } from './macro-store.js';
-import { ivRankSync, recordDailyIv, atmIvFromRows } from './iv-rank-store.js';
+import {
+  ivRankSync,
+  ivPercentileSync,
+  ivSampleDepthSync,
+  recordDailyIv,
+  atmIvFromRows,
+} from './iv-rank-store.js';
+import {
+  classifyIvPercentileCoverage,
+  recordIvPercentileCoverage,
+} from './iv-percentile-coverage.js';
 import {
   buildOptionsIdeasFeed,
   noDayTradingBlock,
@@ -307,8 +317,21 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
     // 'Other'/unmapped → null so the ranker treats the name as its own bucket
     // rather than clustering every unmapped ticker into one "Other" sector.
     const sector = sectorOf(symbol);
+    const ivRank = atmIv != null ? ivRankSync(symbol, atmIv, now) : null;
+    // TRA-4644 — the IV PERCENTILE sibling (TRA-2028's `ivPercentileSync`):
+    // same loaded store, same trailing window, same mid-mark ATM-IV series,
+    // one extra call against data already in memory. Honest null below
+    // MIN_IV_SAMPLES. The coverage counter makes the covered / uncovered /
+    // insufficient-history split readable on the decomposition health route.
+    const ivPercentile = atmIv != null ? ivPercentileSync(symbol, atmIv, now) : null;
+    recordIvPercentileCoverage(
+      symbol,
+      classifyIvPercentileCoverage(atmIv, ivPercentile, ivSampleDepthSync(symbol, now)),
+      { ivRank, ivPercentile, nowMs: now },
+    );
     return {
-      ivRank: atmIv != null ? ivRankSync(symbol, atmIv, now) : null,
+      ivRank,
+      ivPercentile,
       nextEarningsInDays: earningsInDaysSync(symbol, now),
       daysToFOMC: fomc,
       macroEventsNearby: macroNearby,

@@ -510,6 +510,43 @@ describe('buildOptionsIdeasFeed', () => {
     expect(feed.availability).toEqual({ state: 'ok', code: 'ok', scope: 'none' });
   });
 
+  // TRA-4644 — IV PERCENTILE is published beside IV RANK on the idea card, as
+  // its own field, and its presence is independent of the rank's (a flat
+  // trailing window nulls the rank while the percentile still holds).
+  it('publishes ivPercentile beside ivRank, each independently present (TRA-4644)', () => {
+    const { feed } = buildOptionsIdeasFeed({
+      research,
+      input: { ...input, symbols: [{ ...sym, ivPercentile: 83 }] },
+      rowsBySymbol,
+      guardrail: DAY_TRADING_GUARDRAIL,
+      generatedAt: GEN,
+    });
+    expect(feed.ideas[0]!.ivRank).toBe(64);
+    expect(feed.ideas[0]!.ivPercentile).toBe(83);
+
+    // Honest absence: a null percentile is OMITTED, never coerced to 0.
+    const { feed: bare } = buildOptionsIdeasFeed({
+      research,
+      input: { ...input, symbols: [{ ...sym, ivPercentile: null }] },
+      rowsBySymbol,
+      guardrail: DAY_TRADING_GUARDRAIL,
+      generatedAt: GEN,
+    });
+    expect(bare.ideas[0]!.ivRank).toBe(64);
+    expect('ivPercentile' in bare.ideas[0]!).toBe(false);
+
+    // The flat-window direction: rank null, percentile still published.
+    const { feed: flat } = buildOptionsIdeasFeed({
+      research,
+      input: { ...input, symbols: [{ ...sym, ivRank: null, ivPercentile: 50 }] },
+      rowsBySymbol,
+      guardrail: DAY_TRADING_GUARDRAIL,
+      generatedAt: GEN,
+    });
+    expect('ivRank' in flat.ideas[0]!).toBe(false);
+    expect(flat.ideas[0]!.ivPercentile).toBe(50);
+  });
+
   // TRA-3122 — the OTHER arm of the discriminator, and the one that makes it
   // worth anything: a research pass that RAN and liked nothing still reports
   // `ok`. Without this, "availability != ok" would just be a synonym for

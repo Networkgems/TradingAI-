@@ -57,8 +57,20 @@ const SEED_TARGET_DTE = 35;
  * absent → `null`, and the pass is told it's unknown (no fabricated edge).
  */
 export interface SymbolEventContext {
-  /** IV-rank 0–100 (current IV's percentile in its trailing 52w range). */
+  /**
+   * IV RANK 0–100: `(IV − min) / (max − min)` over the trailing 52w window.
+   * NOT the percentile — the old wording here said "percentile", which is the
+   * exact conflation TRA-4644 exists to keep out of this surface.
+   */
   ivRank?: number | null;
+  /**
+   * TRA-4644 — IV PERCENTILE 0–100: the fraction of trailing sessions whose IV
+   * closed strictly BELOW today's (`ivPercentileSync`). Same store, same window
+   * and same mid-mark ATM-IV series as `ivRank`; honest `null` below
+   * MIN_IV_SAMPLES, never 0. A separate field on purpose — the two statistics
+   * must never share a name or a config-dependent meaning.
+   */
+  ivPercentile?: number | null;
   /** Days to next scheduled earnings (C1). */
   nextEarningsInDays?: number | null;
   /** Days to the next FOMC decision (C2). */
@@ -281,6 +293,11 @@ export function fuseOptionsResearchSymbol(
     symbol: snapshot.symbol.toUpperCase(),
     spot,
     ivRank: ctx.ivRank ?? null,
+    // TRA-4644 — the percentile rides beside the rank down the whole fused
+    // path. Read-only carrier: the research pass's prompt payload and batch
+    // key are explicit projections that do NOT include it (deliberate — the
+    // model must not see a field nothing is allowed to gate on yet).
+    ivPercentile: ctx.ivPercentile ?? null,
     nextEarningsInDays: ctx.nextEarningsInDays ?? null,
     daysToFOMC: ctx.daysToFOMC ?? null,
     macroEventsNearby: ctx.macroEventsNearby ?? [],

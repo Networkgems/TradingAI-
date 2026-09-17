@@ -206,6 +206,17 @@ export interface OptionsResearchSymbol {
    * NOT claim an IV edge it can't see (honest framing, TRA-595 §5).
    */
   ivRank: number | null;
+  /**
+   * TRA-4644 — IV PERCENTILE 0–100 (fraction of trailing sessions whose IV
+   * closed strictly below today's), the distinct sibling statistic to `ivRank`
+   * off the SAME store and window. READ-ONLY CARRIER for the published feed:
+   * deliberately excluded from both the user-prompt payload (`buildUserPrompt`'s
+   * explicit projection — the model must not see a field nothing may gate on;
+   * ranking/gating on it is a TRA-3392 §6 pre-registration) and the batch cache
+   * key (`optionsResearchBatchKey` — a value the model never sees must not bust
+   * the cache). Optional so pre-TRA-4644 fixtures stay valid; absent ≡ null.
+   */
+  ivPercentile?: number | null;
   /** Days to next scheduled earnings (C1), or `null` if uncovered/none ahead. */
   nextEarningsInDays: number | null;
   /** Days to the next FOMC decision (C2), or `null` if unknown. */

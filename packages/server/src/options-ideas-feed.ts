@@ -62,7 +62,17 @@ export interface OptionsIdeaView {
   maxProfitUsd: number;
   netUsd: number;
   breakevens: number[];
+  /** IV RANK 0–100 (`(IV−min)/(max−min)`, trailing 52w). NOT the percentile. */
   ivRank?: number;
+  /**
+   * TRA-4644 — IV PERCENTILE 0–100 (fraction of trailing sessions with IV
+   * strictly below today's), off the SAME store/window as `ivRank`. Two
+   * separately-named nullable fields on purpose — never one field whose
+   * meaning depends on config. Absent when the store can't support it
+   * (honest null upstream, below MIN_IV_SAMPLES). Display/read only;
+   * nothing gates on it.
+   */
+  ivPercentile?: number;
   dte: number;
   events: IdeaEvent[];
   /**
@@ -1068,6 +1078,10 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
       netUsd: sizedNetUsd,
       breakevens: structure.breakevens,
       ...(sym.ivRank != null ? { ivRank: sym.ivRank } : {}),
+      // TRA-4644 — the percentile sibling, published beside the rank wherever
+      // the rank already reaches the read surface. Independent presence: a
+      // flat trailing window nulls the rank while the percentile still holds.
+      ...(sym.ivPercentile != null ? { ivPercentile: sym.ivPercentile } : {}),
       // TRA-1368 — DTE + horizon derived from the executed leg expiration (the
       // single source of truth for the time axis), not the model's intended DTE.
       dte: legDte,

@@ -74,6 +74,8 @@ function calmChainSnapshot(): OptionChainSnapshotFile {
 const context: Record<string, SymbolEventContext> = {
   AAPL: {
     ivRank: 68,
+    // TRA-4644 — the percentile sibling rides the same context lane.
+    ivPercentile: 84,
     nextEarningsInDays: 20,
     daysToFOMC: 9,
     macroEventsNearby: ['CPI in 2d'],
@@ -99,6 +101,8 @@ describe('fuseOptionsResearchSymbol (recorded chain snapshot)', () => {
     }
     // Event/IV lanes are fused through.
     expect(fused!.ivRank).toBe(68);
+    // TRA-4644 — the percentile is carried beside the rank, as its own field.
+    expect(fused!.ivPercentile).toBe(84);
     expect(fused!.nextEarningsInDays).toBe(20);
     expect(fused!.daysToFOMC).toBe(9);
     expect(fused!.macroEventsNearby).toEqual(['CPI in 2d']);
@@ -108,6 +112,8 @@ describe('fuseOptionsResearchSymbol (recorded chain snapshot)', () => {
     const fused = fuseOptionsResearchSymbol(loadSnapshot(), { now: ASOF });
     expect(fused).not.toBeNull();
     expect(fused!.ivRank).toBeNull();
+    // TRA-4644 — honest null, never 0, when no context supplies a percentile.
+    expect(fused!.ivPercentile).toBeNull();
     expect(fused!.newsSentiment).toBeNull();
     expect(fused!.macroEventsNearby).toEqual([]);
   });
