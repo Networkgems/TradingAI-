@@ -219,7 +219,26 @@ export interface LiveEnforceRecord {
   etDay: string;
   /** Which gate ruled. */
   gate: LiveEnforceGate;
-  /** For `cost_bar`, the structure (single_leg_rv / single_leg_otm / directional); for `spread` and `universe`, the underlying symbol. */
+  /**
+   * For `cost_bar`, the structure (single_leg_rv / single_leg_otm / directional);
+   * for `spread` and `universe`, the underlying symbol.
+   *
+   * TRA-4631 — on `cost_bar` this IS the call-site stamp. The structure literal
+   * is passed by the caller and each caller passes a distinct one, so the
+   * mapping is 1:1 with the source sites in `signal-engine.ts`:
+   *   • `single_leg_otm`  — `runOtmScan` → `costAwareGateReject('single_leg_otm', …)`.
+   *     THE LIVE ENTRY SITE: the only caller that traverses `entry_window`
+   *     (`otmEntryWindowRejectReason` is consulted nowhere else).
+   *   • `single_leg_rv`   — `runRelativeValueScan` → `costAwareGateReject('single_leg_rv', …)`.
+   *     Bypasses `entry_window` entirely — this is the caller whose 425 rows on
+   *     2026-09-09/09-10 (days `entry_window` blocked 100%) made the pooled
+   *     per-day counter unreadable as an entry-site denominator.
+   *   • `directional`     — the directional sleeve's `costAwareGateReject('directional', …)`.
+   * The field has been REQUIRED since the ledger's birth (the hydrate drops a
+   * scope-less row), so every retained row is attributable; the TRA-4631 defect
+   * was that the per-day roll did not PUBLISH this axis — see
+   * {@link LiveEnforceGateDaySummary.byScope}.
+   */
   scope: string;
   /** TRUE ⇒ the order was BLOCKED (rejected). FALSE ⇒ evaluated and allowed to proceed. */
   blocked: boolean;
@@ -563,6 +582,21 @@ function ratifiedSymbolKey(symbol: string, inRatifiedSet: boolean): string {
 }
 
 const UNATTRIBUTED_BOOK = 'unattributed';
+
+/**
+ * TRA-4631 — the three `cost_bar` call sites, named by the `scope` each one
+ * stamps (see {@link LiveEnforceRecord.scope} for the file+symbol mapping).
+ * `single_leg_otm` is the LIVE ENTRY SITE — the only caller that traverses
+ * `entry_window`. The per-day `byScope` roll seeds every one of these at 0 so
+ * an entry-site zero is a readable value, not an absence; a NEW call site that
+ * ships without being added here still publishes its own row (the fold takes
+ * the union), it just is not seeded on its silent days.
+ */
+export const COST_BAR_CALL_SITE_SCOPES: readonly string[] = [
+  'single_leg_otm',
+  'single_leg_rv',
+  'directional',
+];
 
 function emptyTallies(): GateTallies {
   return {
@@ -1481,14 +1515,40 @@ export interface LiveEnforceGateDaySummary {
   /** blocked / evaluated; **`null` when the gate ruled on nothing that day** — never 0. */
   blockRate: number | null;
   /**
-   * ⚠️ There is deliberately NO per-day `byScope`. It is the one axis here with
-   * UNBOUNDED cardinality — on `spread` and `universe` the scope key is the
-   * underlying symbol, and the live retained fold read 2026-09-01 carries **178**
-   * of them on `universe` alone. Crossed with 30 retained days and 12 gates that
-   * is a ~250 KB payload for a split whose per-day shape nothing asks for; the
-   * three axes below are bounded (7 cells, 6 selections, a fixed reason
-   * vocabulary). The pooled `byScope` on the gate is unchanged.
+   * TRA-4631 — the per-day CALL-SITE split, on **`cost_bar` only**; `null` on
+   * every other gate.
+   *
+   * On `cost_bar` the scope key is the calling sleeve's structure — bounded
+   * (3 known call sites, see {@link COST_BAR_CALL_SITE_SCOPES}) and 1:1 with
+   * the source site that evaluated the candidate — so publishing it per day is
+   * cheap and it is the axis that makes the ENTRY-SITE DENOMINATOR readable:
+   * `runRelativeValueScan`'s rows bypass `entry_window`, and pooling them with
+   * the OTM entry site's rows is how TRA-4622's "4002 of 4002" headline
+   * overcounted a 3577-row population by 425. The three known call-site scopes
+   * are ALWAYS present (seeded at 0), so "the entry site admitted nothing to
+   * this gate today" is a readable `evaluated: 0` on the `single_leg_otm` row,
+   * never an absence a reader has to notice — that zero is exactly the
+   * discriminating state (2026-09-09/09-10) the pooled counter rendered
+   * invisible.
+   *
+   * ⚠️ It stays `null` on every OTHER gate for the original reason: on
+   * `spread` and `universe` the scope key is the underlying symbol — UNBOUNDED
+   * cardinality (178 on `universe` alone, read 2026-09-01), and crossed with 30
+   * retained days that is a ~250 KB payload for a split nothing asks for. The
+   * pooled `byScope` on the gate is unchanged.
    */
+  byScope: LiveEnforceScopeSummary[] | null;
+  /**
+   * TRA-4631 (AC3) — rows this day whose scope is missing from `byScope`'s
+   * rows. Non-null exactly where `byScope` is. `scope` is a REQUIRED field
+   * (the write path demands it and the hydrate drops a row without one), so
+   * there is no unstamped pre-fix population and this reads `0/0` by
+   * construction — published anyway so "nothing was silently pooled" is a
+   * value a grader can read rather than a property they must prove from the
+   * code, and so a future fold defect surfaces as a nonzero here instead of as
+   * silent undercounting.
+   */
+  scopeUnstamped: LiveEnforceUnstampedTally | null;
   /** Per-tape-cell split for the day, admits included. **The AC2/AC3 axis.** */
   byCell: LiveEnforceDayCellSummary[];
   /** Per-nominator-branch split for the day, admits included. */
@@ -1745,7 +1805,11 @@ function netEdgeShadow(
  * caller drives this off `etDays`, so the roll's length is the fold's length on
  * every gate and a silent day is readable instead of inferable.
  */
-function foldGateDay(etDay: string, tallies: GateTallies | undefined): LiveEnforceGateDaySummary {
+function foldGateDay(
+  gate: LiveEnforceGate,
+  etDay: string,
+  tallies: GateTallies | undefined,
+): LiveEnforceGateDaySummary {
   const t = tallies ?? emptyTallies();
 
   // The day's totals are summed from `byScope`, which every record bumps exactly
@@ -1760,6 +1824,42 @@ function foldGateDay(etDay: string, tallies: GateTallies | undefined): LiveEnfor
   for (const s of t.byScope.values()) {
     evaluated += s.evaluated;
     blocked += s.blocked;
+  }
+
+  // TRA-4631 — the per-day call-site split, `cost_bar` only (bounded scope
+  // cardinality: the scope is the calling sleeve's structure). The known call
+  // sites are seeded at 0 FIRST so the entry site's silent day publishes an
+  // explicit `evaluated: 0` row; scopes actually recorded (known or not) then
+  // overwrite / extend the seed, so an unforeseen caller still shows up.
+  let byScope: LiveEnforceScopeSummary[] | null = null;
+  let scopeUnstamped: LiveEnforceUnstampedTally | null = null;
+  if (gate === 'cost_bar') {
+    const rows = new Map<string, LiveEnforceScopeSummary>();
+    for (const scope of COST_BAR_CALL_SITE_SCOPES) {
+      rows.set(scope, { scope, evaluated: 0, blocked: 0, blockRate: null });
+    }
+    let scopeEvaluated = 0;
+    let scopeBlocked = 0;
+    for (const [scope, s] of t.byScope.entries()) {
+      scopeEvaluated += s.evaluated;
+      scopeBlocked += s.blocked;
+      rows.set(scope, {
+        scope,
+        evaluated: s.evaluated,
+        blocked: s.blocked,
+        blockRate: s.evaluated > 0 ? round(s.blocked / s.evaluated) : null,
+      });
+    }
+    byScope = [...rows.values()].sort(
+      (a, b) => b.evaluated - a.evaluated || a.scope.localeCompare(b.scope),
+    );
+    // Identity by construction (the day totals above are summed from the SAME
+    // `byScope` map), so this is 0/0 unless the fold itself regresses — see the
+    // interface doc for why it is published anyway (AC3).
+    scopeUnstamped = {
+      evaluated: Math.max(0, evaluated - scopeEvaluated),
+      blocked: Math.max(0, blocked - scopeBlocked),
+    };
   }
 
   let cellEvaluated = 0;
@@ -1811,6 +1911,8 @@ function foldGateDay(etDay: string, tallies: GateTallies | undefined): LiveEnfor
     evaluated,
     blocked,
     blockRate: evaluated > 0 ? round(blocked / evaluated) : null,
+    byScope,
+    scopeUnstamped,
     byCell,
     bySelection,
     byReason,
@@ -1954,7 +2056,7 @@ function foldGates(
       // TRA-4154 — driven off `etDays`, not off the keys `perDay` happens to hold
       // for this gate: a day on which this gate recorded nothing must publish a
       // zero row, not vanish. `etDays` is ascending on both callers.
-      byEtDay: etDays.map((d) => foldGateDay(d, perDay.get(d)?.get(gate))),
+      byEtDay: etDays.map((d) => foldGateDay(gate, d, perDay.get(d)?.get(gate))),
       byScope,
       byReason,
       blockedUnclassified: tallies.blockedUnclassified,

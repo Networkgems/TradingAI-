@@ -690,9 +690,12 @@ describe('live-enforce-gate-ledger', () => {
       const quiet = cb.byEtDay.find((d) => d.etDay === DARK_DAY)!;
       expect(quiet).toMatchObject({ evaluated: 0, blocked: 0, blockRate: null });
       expect(quiet.byCell).toEqual([]);
-      // The pooled `byScope` is untouched by this change; the day row carries no
-      // scope split on purpose (unbounded symbol cardinality — 178 on `universe`).
-      expect(quiet).not.toHaveProperty('byScope');
+      // The pooled `byScope` is untouched by this change. TRA-4631 later added
+      // a per-day scope split on cost_bar ONLY (bounded call-site cardinality);
+      // on this silent day it is all seeded zeros, and the entry site's zero is
+      // an explicit row, not an absence.
+      expect(quiet.byScope!.every((s) => s.evaluated === 0)).toBe(true);
+      expect(quiet.byScope!.find((s) => s.scope === 'single_leg_otm')!.blockRate).toBeNull();
       expect(cb.byScope.length).toBeGreaterThan(0);
       // Every gate gets a row on every retained day, not just the busy ones.
       for (const g of summarizeLiveEnforceGate(DARK_DAY).retained.byGate) {
@@ -759,6 +762,77 @@ describe('live-enforce-gate-ledger', () => {
         expect(g.byEtDay[0]!.etDay).toBe(DARK_DAY);
         expect(g.byEtDay[0]!.evaluated).toBe(g.evaluated);
       }
+    });
+  });
+
+  // TRA-4631 — the per-day CALL-SITE split on `cost_bar`. The defect: on
+  // 2026-09-09/09-10 `entry_window` blocked 100% (the entry site admitted
+  // nothing) yet the pooled per-day cost_bar counter read 268/157, because
+  // `runRelativeValueScan`'s rows (scope `single_leg_rv`, which never traverses
+  // `entry_window`) were indistinguishable from the entry site's in the day
+  // roll. These tests pin the discriminating read.
+  describe('per-day call-site scope split on cost_bar (TRA-4631)', () => {
+    const RV_ONLY_DAY = '2026-07-21';
+
+    function costBarDay(day: string) {
+      return summarizeLiveEnforceGate(day).byGate
+        .find((g) => g.gate === 'cost_bar')!.byEtDay[0]!;
+    }
+
+    it('AC2 shape: an RV-only day publishes the entry site as an EXPLICIT zero row, not an absence', () => {
+      recordLiveEnforceDecision('cost_bar', 'single_leg_rv', true, RV_ONLY_DAY, 'over bar', 1_001);
+      recordLiveEnforceDecision('cost_bar', 'single_leg_rv', true, RV_ONLY_DAY, 'over bar', 1_002);
+      const day = costBarDay(RV_ONLY_DAY);
+      expect(day.evaluated).toBe(2);
+      const otm = day.byScope!.find((s) => s.scope === 'single_leg_otm')!;
+      expect(otm).toEqual({ scope: 'single_leg_otm', evaluated: 0, blocked: 0, blockRate: null });
+      const rv = day.byScope!.find((s) => s.scope === 'single_leg_rv')!;
+      expect(rv).toEqual({ scope: 'single_leg_rv', evaluated: 2, blocked: 2, blockRate: 1 });
+      // All three known call sites are seeded even when silent.
+      expect(day.byScope!.map((s) => s.scope).sort()).toEqual(
+        ['directional', 'single_leg_otm', 'single_leg_rv'],
+      );
+      // AC3 — the unstamped bucket exists and reads 0 (scope is a required field).
+      expect(day.scopeUnstamped).toEqual({ evaluated: 0, blocked: 0 });
+    });
+
+    it('a mixed day splits by caller and Σ byScope equals the day totals, unknown scopes included', () => {
+      recordLiveEnforceDecision('cost_bar', 'single_leg_otm', false, RV_ONLY_DAY, undefined, 1_001);
+      recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, RV_ONLY_DAY, 'over bar', 1_002);
+      recordLiveEnforceDecision('cost_bar', 'single_leg_rv', true, RV_ONLY_DAY, 'over bar', 1_003);
+      // A caller this build does not know about still publishes its own row.
+      recordLiveEnforceDecision('cost_bar', 'future_sleeve', true, RV_ONLY_DAY, 'over bar', 1_004);
+      const day = costBarDay(RV_ONLY_DAY);
+      expect(day.byScope!.find((s) => s.scope === 'future_sleeve'))
+        .toEqual({ scope: 'future_sleeve', evaluated: 1, blocked: 1, blockRate: 1 });
+      expect(day.byScope!.reduce((a, s) => a + s.evaluated, 0)).toBe(day.evaluated);
+      expect(day.byScope!.reduce((a, s) => a + s.blocked, 0)).toBe(day.blocked);
+      expect(day.scopeUnstamped).toEqual({ evaluated: 0, blocked: 0 });
+    });
+
+    it('stays null on every other gate (unbounded symbol cardinality), and on the retained roll it is per-day', () => {
+      recordLiveEnforceDecision('spread', 'AAPL', true, RV_ONLY_DAY, 'SPREAD_TOO_WIDE', 1_001);
+      recordLiveEnforceDecision('cost_bar', 'single_leg_rv', true, RV_ONLY_DAY, 'over bar', 1_002);
+      const s = summarizeLiveEnforceGate(RV_ONLY_DAY);
+      const spreadDay = s.byGate.find((g) => g.gate === 'spread')!.byEtDay[0]!;
+      expect(spreadDay.byScope).toBeNull();
+      expect(spreadDay.scopeUnstamped).toBeNull();
+      const retainedCb = s.retained.byGate.find((g) => g.gate === 'cost_bar')!;
+      const retainedDay = retainedCb.byEtDay.find((d) => d.etDay === RV_ONLY_DAY)!;
+      expect(retainedDay.byScope!.find((x) => x.scope === 'single_leg_rv')!.evaluated).toBe(1);
+      expect(retainedDay.byScope!.find((x) => x.scope === 'single_leg_otm')!.evaluated).toBe(0);
+    });
+
+    it('survives the hydrate: pre-fix persisted rows are attributable (scope was always required)', () => {
+      hydrateLiveEnforceGateFromDisk(dir, 1_000);
+      recordLiveEnforceDecision('cost_bar', 'single_leg_rv', true, RV_ONLY_DAY, 'over bar', 1_001);
+      recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, RV_ONLY_DAY, 'over bar', 1_002);
+      hydrateLiveEnforceGateFromDisk(dir, 1_500);
+      const day = summarizeLiveEnforceGate(RV_ONLY_DAY).retained.byGate
+        .find((g) => g.gate === 'cost_bar')!.byEtDay.find((d) => d.etDay === RV_ONLY_DAY)!;
+      expect(day.byScope!.find((x) => x.scope === 'single_leg_rv')!.blocked).toBe(1);
+      expect(day.byScope!.find((x) => x.scope === 'single_leg_otm')!.blocked).toBe(1);
+      expect(day.scopeUnstamped).toEqual({ evaluated: 0, blocked: 0 });
     });
   });
 });
