@@ -18,7 +18,6 @@ import {
   BbFadeStrategy,
   MomentumStrategy,
   BreakoutVolStrategy,
-  MeanReversionCryptoStrategy,
   IchimokuStrategy,
   ScalpingStrategy,
   SwingStrategy,
@@ -29,7 +28,6 @@ import {
   advanceExtreme,
   momentumTrailStop,
   breakoutTrailStop,
-  meanReversionRsiAltExitTriggered,
   timeStopBarsFor,
   momentumTrailPeriodFor,
   breakoutTrailOptionsFor,
@@ -76,12 +74,6 @@ import { admitsUnderPortfolioCap, defaultSectorOf } from './runner.js';
 const DEFAULT_LOOKAHEAD_BARS = 24;
 const MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1_000;
 
-/**
- * TRA-211: mean-reversion sizes at 0.75% of equity, smaller than the 1%
- * default momentum / breakout share. Mirrors runner.ts.
- */
-const DEFAULT_MEAN_REVERSION_RISK_PCT = 0.0075;
-
 /** Per-symbol strategy + cost + risk opts shared across the portfolio basket. */
 export interface PortfolioBacktestConfig {
   /** Symbols ticked together against the shared portfolio. */
@@ -98,8 +90,6 @@ export interface PortfolioBacktestConfig {
   ichimokuOpts?: BacktestConfig['ichimokuOpts'];
   momentumOpts?: BacktestConfig['momentumOpts'];
   breakoutVolOpts?: BacktestConfig['breakoutVolOpts'];
-  meanReversionOpts?: BacktestConfig['meanReversionOpts'];
-  meanReversionRiskPct?: number;
   regimeOpts?: BacktestConfig['regimeOpts'];
   orbOpts?: BacktestConfig['orbOpts'];
   scalpingOpts?: BacktestConfig['scalpingOpts'];
@@ -247,7 +237,6 @@ class StrategyBundle {
   private readonly swing: SwingStrategy;
   private readonly momentum: MomentumStrategy;
   private readonly breakoutVol: BreakoutVolStrategy;
-  private readonly meanReversion: MeanReversionCryptoStrategy;
   private readonly strategyType: BacktestConfig['strategyType'];
 
   constructor(config: PortfolioBacktestConfig) {
@@ -274,10 +263,6 @@ class StrategyBundle {
       ...config.breakoutVolOpts,
       regimeOptions: config.breakoutVolOpts?.regimeOptions ?? config.regimeOpts,
     });
-    this.meanReversion = new MeanReversionCryptoStrategy({
-      ...config.meanReversionOpts,
-      regimeOptions: config.meanReversionOpts?.regimeOptions ?? config.regimeOpts,
-    });
   }
 
   /** Evaluate the enabled strategies on the window ending at the latest bar. */
@@ -295,7 +280,6 @@ class StrategyBundle {
     }
     if (t === 'momentum' || t === 'combined') push(this.momentum.evaluate(symbol, window));
     if (t === 'breakout_vol' || t === 'combined') push(this.breakoutVol.evaluate(symbol, window));
-    if (t === 'mean_reversion' || t === 'combined') push(this.meanReversion.evaluate(symbol, window));
     if (t === 'ichimoku' || t === 'combined') push(this.ichimoku.evaluate(symbol, window));
     if (t === 'scalping' || t === 'combined') push(this.scalping.evaluate(symbol, window));
     if (t === 'swing' || t === 'combined') push(this.swing.evaluate(symbol, window));
@@ -385,8 +369,8 @@ export class PortfolioBacktestRunner {
 
     // ── Per-symbol state. Each symbol keeps its own strategy stack and
     // RiskManager (sharing the one `account` by reference so equity is
-    // common), but a per-symbol `fractionalQuantity` so a mixed crypto/equity
-    // basket sizes each leg correctly.
+    // common), but a per-symbol `fractionalQuantity` so a mixed fractional/
+    // whole-unit basket sizes each leg correctly.
     const stateBySymbol = new Map<string, SymbolState>();
     for (const symbol of symbols) {
       const raw = candlesBySymbol[symbol] ?? [];
@@ -394,7 +378,7 @@ export class PortfolioBacktestRunner {
         .filter(c => c.timestamp >= warmupStart && c.timestamp <= config.endDate)
         .sort((a, b) => a.timestamp - b.timestamp);
       const fractionalQuantity = config.fractionalQuantity
-        ?? (defaultSectorOf(symbol) === 'crypto');
+        ?? (defaultSectorOf(symbol) === 'usd_pair');
       const fill = config.costModel
         ? config.costModel.resolve(symbol)
         : {
@@ -418,7 +402,7 @@ export class PortfolioBacktestRunner {
     }
 
     // ── Merged timeline: the sorted union of every symbol's bar timestamps.
-    // Symbols on an aligned grid (e.g. Coinbase 4H) share each tick; a symbol
+    // Symbols on an aligned grid (e.g. a shared 4H grid) share each tick; a symbol
     // missing a timestamp simply does not advance on that tick.
     const tsSet = new Set<number>();
     for (const s of stateBySymbol.values()) {
@@ -503,10 +487,7 @@ export class PortfolioBacktestRunner {
           continue;
         }
 
-        // TRA-211 per-strategy risk override for mean reversion.
-        let riskPct = signal.type === 'mean_reversion'
-          ? (config.meanReversionRiskPct ?? DEFAULT_MEAN_REVERSION_RISK_PCT)
-          : undefined;
+        let riskPct: number | undefined;
 
         // TRA-430 vol-/Kelly-scaled per-trade risk (TRA-428 §3). σ_sym is the
         // trailing realised vol of fully-closed strategy-timeframe closes —
@@ -632,22 +613,6 @@ export class PortfolioBacktestRunner {
         const hitsTarget = pos.side === 'buy'
           ? latest.high >= pos.takeProfit
           : latest.low <= pos.takeProfit;
-
-        if (
-          ls
-          && pos.signalType === 'mean_reversion'
-          && !hitsStop
-          && !hitsTarget
-          && meanReversionRsiAltExitTriggered(
-            pos,
-            window,
-            config.meanReversionOpts?.rsiPeriod ?? 14,
-            ls,
-          )
-        ) {
-          exitsThisBar.push({ pos, rawExit: latest.close, reason: 'rsi_alt_exit', ambiguous: false });
-          continue;
-        }
 
         if (hitsStop || hitsTarget) {
           const ambiguous = hitsStop && hitsTarget;

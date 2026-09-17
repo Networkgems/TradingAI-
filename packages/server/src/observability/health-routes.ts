@@ -111,20 +111,6 @@ import {
 } from '../rv-scan-telemetry.js'; // TRA-2193 / TRA-2245
 import { summarizeShortPremiumScans } from '../short-premium-scanner.js';
 import { buildWheelPromotionGateSummary } from '../wheel-promotion-gate-store.js'; // TRA-2028
-import { isPerpFundingCarryEnabled } from '../perp-funding-carry-flag.js';
-import { summarizeFundingCarryScans } from '../perp-funding-carry-scanner.js';
-import { isCryptoRegimeEnabled } from '../crypto-regime-flag.js';
-import { summarizeCryptoRegimeScans } from '../crypto-regime-scanner.js';
-import {
-  isRegimeTsmomEnabled,
-  isRegimeTsmomDemoRouteEnabled,
-  REGIME_TSMOM_OBSERVE_KILLED,
-  REGIME_TSMOM_OBSERVE_KILLED_REASON,
-} from '../crypto-regime-tsmom-flag.js';
-import { summarizeRegimeTsmomScans } from '../crypto-regime-tsmom-scanner.js';
-import { summarizeRegimeTsmomDemoRoute } from '../crypto-regime-tsmom-demo-route.js';
-import { isCryptoIgnitionEnabled, resolveIgnitionWatchlist } from '../crypto-ignition-flag.js';
-import { summarizeIgnitionScans } from '../crypto-ignition-scanner.js';
 import {
   summarizeConvictionDca,
   summarizeConvictionDcaGuard,
@@ -4934,108 +4920,6 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       enabled: ivFilterEnabled,
       liveCapitalReachable: false,
       ...buildWheelPromotionGateSummary({ now: now(), ivFilterEnabled }),
-    });
-  });
-
-  // TRA-1216 — unauthenticated, secrets-free perp funding-carry readout. The
-  // scan is a process-global, OBSERVE-ONLY pass (no balances/PII — just perp
-  // product ids, funding rates, and net-APR) so this is unauthenticated (parity
-  // with /iv-rv). `enabled` mirrors ENABLE_PERP_FUNDING_CARRY_OBSERVE so the
-  // board can see at a glance whether the scanner + funding-history accrual are
-  // armed; when off the store is empty so the surface is a fail-closed
-  // `enabled:false` with `scans:[]` rather than a 404. Always read-only: NO order
-  // is ever placed off these candidates — the short-perp leg carries a
-  // liquidation note but is never sized.
-  app.get('/api/health/perp-funding-carry', (_req, res) => {
-    res.json({
-      ok: true,
-      time: new Date(now()).toISOString(),
-      build: resolveBuildInfo(),
-      enabled: isPerpFundingCarryEnabled(),
-      ...summarizeFundingCarryScans(now()),
-    });
-  });
-
-  // TRA-1220 — unauthenticated, secrets-free crypto regime-overlay readout
-  // (parity with /perp-funding-carry). The scan is a process-global, OBSERVE-ONLY
-  // pass carrying no balances/PII — just symbols, regime labels, confidence, and
-  // the ADX/CHOP/ER values. `enabled` mirrors ENABLE_CRYPTO_REGIME_OVERLAY so the
-  // board can see at a glance whether the classifier is armed; when off the store
-  // is empty so the surface is a fail-closed `enabled:false` with `scans:[]`
-  // rather than a 404. Always read-only: NO order is ever placed off these labels.
-  app.get('/api/health/crypto-regime', (_req, res) => {
-    res.json({
-      ok: true,
-      time: new Date(now()).toISOString(),
-      build: resolveBuildInfo(),
-      enabled: isCryptoRegimeEnabled(),
-      ...summarizeCryptoRegimeScans(now()),
-    });
-  });
-
-  // TRA-1221 — unauthenticated, secrets-free regime-gated TSMOM readout (parity
-  // with /crypto-regime). Process-global, OBSERVE-ONLY: carries no balances/PII —
-  // just symbols, would-be actions, regime@bar, r_L, and rolling would-be turnover
-  // + net-of-taker expectancy R. `enabled` mirrors ENABLE_CRYPTO_REGIME_TSMOM so
-  // the board sees at a glance whether the scanner is armed; when off the store is
-  // empty ⇒ fail-closed `enabled:false` with `scans:[]`. Always read-only: NO order
-  // is placed off these signals — the short_observe leg is never sized.
-  app.get('/api/health/crypto-regime-tsmom', (_req, res) => {
-    // TRA-1317 — the DEMO paper-route block. `enabled` mirrors the standalone,
-    // demo-scoped CRYPTO_REGIME_TSMOM_DEMO_ROUTE_ENABLED resolved through the SAME
-    // demo-flags overlay the engine consults (process.env layered with the DATA_DIR
-    // demo-flags.json, file wins) so it reflects the EFFECTIVE switch. The route book
-    // has no live path (liveCapitalReachable:false) — arming it can never touch real
-    // capital. openPositions/fillCount/realizedR are the forward evidence the future
-    // live-promotion decision reads; all rebuilt from the snapshot under DATA_DIR on boot.
-    const dir = process.env.DATA_DIR;
-    const routeEnv = dir ? resolveDemoFlagEnv(dir) : process.env;
-    const demo = summarizeRegimeTsmomDemoRoute();
-    res.json({
-      ok: true,
-      time: new Date(now()).toISOString(),
-      build: resolveBuildInfo(),
-      enabled: isRegimeTsmomEnabled(),
-      // TRA-1734 — an explicit retire marker. A killed strategy MUST NOT read
-      // identically to one that was simply never switched on: a future reader
-      // hitting a silent `enabled:false` cannot tell "retired after a NO-GO at
-      // n=18" from "flag never set", and that ambiguity is how a dead strategy
-      // gets revived by accident. `killed:true` + `killedReason` name the verdict.
-      killed: REGIME_TSMOM_OBSERVE_KILLED,
-      killedReason: REGIME_TSMOM_OBSERVE_KILLED ? REGIME_TSMOM_OBSERVE_KILLED_REASON : null,
-      ...summarizeRegimeTsmomScans(now()),
-      demoRoute: {
-        enabled: isRegimeTsmomDemoRouteEnabled(routeEnv),
-        demoOnly: true,
-        liveCapitalReachable: false,
-        openPositions: demo.openPositions,
-        fillCount: demo.fillCount,
-        closeCount: demo.closeCount,
-        lastFillAt: demo.lastFillAt,
-        realizedR: demo.realizedR,
-        realizedPnl: demo.realizedPnl,
-        recent: demo.recent,
-      },
-    });
-  });
-
-  // TRA-1271 — unauthenticated, secrets-free crypto ignition readout (parity with
-  // /crypto-regime-tsmom). Process-global, OBSERVE-ONLY, ZERO capital: carries no
-  // balances/PII — just watchlist size, open/resolved forward-record counts, per-arm
-  // net-of-fee expectancy R (maker vs taker), hit%, and the ★ would-a-limit-fill
-  // rate that confirms-or-kills the maker-fill edge. `enabled` mirrors
-  // ENABLE_CRYPTO_IGNITION_SCANNER so the board sees at a glance whether capture is
-  // armed; when off the store is empty ⇒ fail-closed `enabled:false`. Always
-  // read-only: NO order is ever placed off these signals (graduation is a separate,
-  // board-visible decision — taker-cost CI must clear 0 first).
-  app.get('/api/health/crypto-ignition', (_req, res) => {
-    const enabled = isCryptoIgnitionEnabled();
-    res.json({
-      ok: true,
-      time: new Date(now()).toISOString(),
-      build: resolveBuildInfo(),
-      enabled,
-      ...summarizeIgnitionScans(now(), enabled ? resolveIgnitionWatchlist().length : 0),
     });
   });
 

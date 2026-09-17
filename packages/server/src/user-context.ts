@@ -5,13 +5,10 @@ import { join, dirname } from 'path';
 import { assertContainedUserDir } from './username-grammar.js';
 import {
   SignalEngine,
-  shouldBootArmLiveCrypto,
-  shouldBootDisarmLiveCrypto,
   shouldBootArmLiveEquity,
   applyLiveBrokerArm,
 } from './signal-engine.js';
 import type { LiveBrokerArmField } from './signal-engine.js';
-import { CryptoSignalEngine } from './crypto-engine.js';
 import { PnlTracker } from './pnl-tracker.js';
 import { isMarketDayIso } from './scheduler.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
@@ -23,15 +20,12 @@ import {
 import type { AccountSettings } from '@trading-app/shared';
 import {
   initWatchlistStore,
-  getCryptoWatchlistData,
   getStocksWatchlistData,
   clearWatchlistCache,
 } from './watchlist-store.js';
 import {
   loadStocksTradeSnapshot,
-  loadCryptoTradeSnapshot,
   saveStocksTradeSnapshot,
-  saveCryptoTradeSnapshot,
   // TRA-2629 — the single seam `PaperAccountSnapshot` crosses on the way to and
   // from disk. Both directions must go through these or a field added to the
   // in-memory snapshot silently stops persisting.
@@ -71,7 +65,7 @@ const log = logger.child({ module: 'user-context' });
 // TRA-142 — per-user account isolation.
 //
 // Every user (admin and any non-admin signups) gets their own SignalEngine,
-// CryptoSignalEngine, PnlTracker pair, and persistence timers. State is rooted
+// PnlTracker, and persistence timers. State is rooted
 // at DATA_DIR/users/<username>/ so settings, watchlist, trades, and equity
 // history never collide across users.
 //
@@ -83,9 +77,9 @@ const DATA_DIR = resolveDataDir();
 const PERSIST_DEBOUNCE_MS = 1000;
 
 // TRA-1084 — boot-herd mitigation. Each per-user engine creates its OWN
-// SignalEngine + CryptoSignalEngine, and each `.start()` fires an immediate
+// SignalEngine, and each `.start()` fires an immediate
 // full-universe tick. With N demo books that is N engines sweeping the SAME
-// watchlist + N crypto feeds (~495 symbols, Coinbase timeouts) ALIGNED at
+// watchlist ALIGNED at
 // `server_available`, saturating the single libuv loop for >5s so `/api/health`
 // can't answer inside Render's 5s budget → Render kills the box mid-warmup →
 // restart-loop (the bqb1 502 root cause, TRA-1082 forensics). Staggering the
@@ -98,8 +92,6 @@ const ENGINE_BOOT_STAGGER_MS = Math.max(0, Number(process.env.ENGINE_BOOT_STAGGE
 export interface EngineStartStagger {
   /** Delay before the stocks SignalEngine fires its first tick. */
   engineDelayMs?: number;
-  /** Delay before the CryptoSignalEngine fires its first tick. */
-  cryptoDelayMs?: number;
 }
 
 export interface UserContext {
@@ -108,16 +100,10 @@ export interface UserContext {
   dataDir: string;
   /** EOD reports for this user (stocks). */
   reportsDir: string;
-  /** EOD reports for this user (crypto). */
-  cryptoReportsDir: string;
   engine: SignalEngine;
-  cryptoEngine: CryptoSignalEngine;
   tracker: PnlTracker;
-  cryptoTracker: PnlTracker;
   /** Pending debounce timer for stocks trade-history persistence. */
   stocksPersistTimer: ReturnType<typeof setTimeout> | null;
-  /** Pending debounce timer for crypto trade-history persistence. */
-  cryptoPersistTimer: ReturnType<typeof setTimeout> | null;
 }
 
 const contexts = new Map<string, UserContext>();
@@ -194,7 +180,6 @@ export async function ensureUserContext(
   const ctx = await createUserContext(username);
   // TRA-1084 — stagger the boot tick so N per-user engines don't sweep at once.
   ctx.engine.start({ initialDelayMs: stagger?.engineDelayMs });
-  ctx.cryptoEngine.start({ initialDelayMs: stagger?.cryptoDelayMs });
   return ctx;
 }
 
@@ -203,10 +188,9 @@ export async function ensureUserContext(
  * once. Idempotent: a marker file at DATA_DIR/.tra-142-migrated guards against
  * re-running. Files migrated:
  *   - account-settings.json, watchlist.json
- *   - trades-stocks.json, trades-crypto.json
+ *   - trades-stocks.json
  *   - equity-state.json, daily-snapshots.json
- *   - crypto/equity-state.json, crypto/daily-snapshots.json
- *   - reports/, crypto-reports/
+ *   - reports/
  * Global files (users.json, admin-reset-applied.json, reset tokens, backups)
  * stay at the data-dir root.
  */
@@ -216,17 +200,13 @@ export async function runFirstBootMigration(adminUsername = 'admin'): Promise<vo
 
   const adminDir = userDataDir(adminUsername);
   if (!existsSync(adminDir)) await mkdir(adminDir, { recursive: true });
-  await mkdir(join(adminDir, 'crypto'), { recursive: true });
 
   const fileMoves: Array<[string, string]> = [
     [join(DATA_DIR, 'account-settings.json'), join(adminDir, 'account-settings.json')],
     [join(DATA_DIR, 'watchlist.json'), join(adminDir, 'watchlist.json')],
     [join(DATA_DIR, 'trades-stocks.json'), join(adminDir, 'trades-stocks.json')],
-    [join(DATA_DIR, 'trades-crypto.json'), join(adminDir, 'trades-crypto.json')],
     [join(DATA_DIR, 'equity-state.json'), join(adminDir, 'equity-state.json')],
     [join(DATA_DIR, 'daily-snapshots.json'), join(adminDir, 'daily-snapshots.json')],
-    [join(DATA_DIR, 'crypto', 'equity-state.json'), join(adminDir, 'crypto', 'equity-state.json')],
-    [join(DATA_DIR, 'crypto', 'daily-snapshots.json'), join(adminDir, 'crypto', 'daily-snapshots.json')],
   ];
 
   let migratedAny = false;
@@ -254,7 +234,6 @@ export async function runFirstBootMigration(adminUsername = 'admin'): Promise<vo
   // Move legacy reports directories into the admin namespace.
   for (const [legacy, target] of [
     [join(DATA_DIR, 'reports'), join(adminDir, 'reports')],
-    [join(DATA_DIR, 'crypto-reports'), join(adminDir, 'crypto-reports')],
   ] as const) {
     if (!existsSync(legacy) || existsSync(target)) continue;
     try {
@@ -347,9 +326,7 @@ export async function runTra237OptionsReset(): Promise<void> {
  * that feeds CalendarTab + PnlTracker.getCumulativeStats:
  *
  *   - `<userDir>/reports/*.{json,md}`           (stocks Calendar tab)
- *   - `<userDir>/crypto-reports/*.{json,md}`    (crypto Calendar tab)
  *   - `<userDir>/daily-snapshots.json`          (weekly/monthly/yearly P&L)
- *   - `<userDir>/crypto/daily-snapshots.json`   (crypto cumulative P&L)
  *
  * Today's calendar is shared across demo / live / sandbox views; per-account
  * scoping moves to TRA-244, so a single wipe per user covers every dashboard
@@ -388,10 +365,8 @@ export async function runTra241CalendarReset(): Promise<void> {
     if (!existsSync(dir)) continue;
     try {
       fileCount += await clearReportsDir(join(dir, 'reports'));
-      fileCount += await clearReportsDir(join(dir, 'crypto-reports'));
       for (const snapPath of [
         join(dir, 'daily-snapshots.json'),
-        join(dir, 'crypto', 'daily-snapshots.json'),
       ]) {
         if (!existsSync(snapPath)) continue;
         try {
@@ -508,23 +483,20 @@ export async function runTra3064SidecarReclaim(): Promise<void> {
 
 /**
  * TRA-301 — full demo fresh-start across every user. The board is rolling out
- * a new generation of stock and crypto strategies, so every user's persisted
+ * a new generation of strategies, so every user's persisted
  * demo P&L, trade history, and calendar history must be wiped before the
  * engines boot.
  *
  * Wider than TRA-241: that migration only touched daily-snapshots and the
  * (now legacy) unscoped `reports/` files. TRA-301 also clears
- *   - `equity-state.json` (stocks + crypto), so PnlTracker reseeds from the
+ *   - `equity-state.json`, so PnlTracker reseeds from the
  *     configured demoEquity instead of carrying yesterday's equity baseline,
- *   - `trades-{stocks,crypto}.json`, so engines start with no open/closed
+ *   - `trades-stocks.json`, so engines start with no open/closed
  *     positions or recent signals,
- *   - `reports/` and `crypto-reports/` recursively, covering the TRA-244
+ *   - `reports/` recursively, covering the TRA-244
  *     per-mode subfolders (`{demo,live,sandbox}/`) as well as legacy files.
  *
- * Crypto's live broker mirror is sourced from Coinbase on each sync, so the
- * `liveClosedPositions` array dropped here repopulates from the broker API
- * — wiping it carries no canonical-data loss. Idempotent via marker
- * `.tra-301-demo-fresh-start`.
+ * Idempotent via marker `.tra-301-demo-fresh-start`.
  */
 async function clearReportsTree(dir: string): Promise<number> {
   if (!existsSync(dir)) return 0;
@@ -558,153 +530,6 @@ async function clearReportsTree(dir: string): Promise<number> {
   return removed;
 }
 
-/**
- * TRA-330 — one-shot crypto-only equity reset. The demo crypto account drifted
- * into the billions in prod (cash $2.52B, sized cost $3.44B on a $25k-capped
- * account) because the short cash-flow path mis-tracked sells. The runtime
- * invariant in `crypto-account.ts` will catch any future drift, but the
- * already-corrupt persisted snapshots need to be cleared once so the engines
- * don't import the bad state on the next boot.
- *
- * Narrower than TRA-301: only crypto state (`crypto/equity-state.json`,
- * `crypto/daily-snapshots.json`, `trades-crypto.json`, `crypto-reports/`).
- * Stocks state is untouched. Idempotent via marker `.tra-330-crypto-reset`.
- */
-export async function runTra330CryptoEquityReset(): Promise<void> {
-  const markerFile = join(DATA_DIR, '.tra-330-crypto-reset');
-  if (existsSync(markerFile)) return;
-
-  let userCount = 0;
-  let fileCount = 0;
-
-  for (const u of getAllUsers()) {
-    const dir = userDataDir(u.username);
-    if (!existsSync(dir)) continue;
-    try {
-      for (const filePath of [
-        join(dir, 'crypto', 'equity-state.json'),
-        join(dir, 'crypto', 'daily-snapshots.json'),
-        join(dir, 'trades-crypto.json'),
-      ]) {
-        if (!existsSync(filePath)) continue;
-        try {
-          await unlink(filePath);
-          fileCount += 1;
-        } catch (err: unknown) {
-          log.warn('migration TRA-330: could not remove file', { migration: 'TRA-330', path: filePath, reason: err instanceof Error ? err.message : String(err) });
-        }
-      }
-      fileCount += await clearReportsTree(join(dir, 'crypto-reports'));
-      userCount += 1;
-    } catch (err: unknown) {
-      log.warn('migration TRA-330: reset failed for user', { migration: 'TRA-330', username: u.username, reason: err instanceof Error ? err.message : String(err) });
-    }
-  }
-
-  await writeFile(markerFile, new Date().toISOString(), 'utf-8');
-  log.info('migration TRA-330: complete — wiped crypto-state files.', { migration: 'TRA-330', fileCount, userCount });
-}
-
-/**
- * TRA-338 — surgical one-shot cleanup for the MEGA-USD phantom position
- * documented in TRA-337. Yahoo's `MEGA-USD` ticker resolves to a different
- * (delisted-2022) token and returned a frozen $4.05 quote that opened a paper
- * position whose true Coinbase price is around $0.12. Rather than realising
- * the bogus ~97% loss into trade history, we expunge the open position and
- * refund the recorded `entryPrice * quantity` to the paper cash balance, so
- * the next snapshot reflects a clean book.
- *
- * Behaviour:
- *  - Scans every user's `trades-crypto.json` for OPEN positions with
- *    `symbol === 'MEGA-USD'`. Closed positions are left alone (closing the
- *    record after the fact would only obscure the audit trail).
- *  - Per-user: refunds `entryPrice * quantity` to `account.cash` (the
- *    persisted USD balance), drops the position from `openPositions`, and
- *    writes the snapshot back atomically. `account.equity` is intentionally
- *    NOT recomputed here — the engine's next tick reconciles equity from
- *    cash + open-position MTM, so a one-shot adjustment of cash is enough
- *    and we avoid double-counting if another path also touches equity on
- *    boot.
- *  - Skips users with no open MEGA-USD entry, with a missing snapshot, or
- *    with a snapshot the JSON parser couldn't read.
- *  - Idempotent via marker file `.tra-338-mega-usd-cleanup`.
- *
- * Runs BEFORE `initAllUserContexts` so engines load the cleaned snapshot.
- * Sequenced AFTER `runTra330CryptoEquityReset` (which may wipe
- * `trades-crypto.json` outright) so a one-time stale-snapshot reset can't
- * undo this cleanup mid-flight.
- */
-export async function runTra338MegaUsdCleanup(): Promise<void> {
-  const markerFile = join(DATA_DIR, '.tra-338-mega-usd-cleanup');
-  if (existsSync(markerFile)) return;
-
-  const { readFile } = await import('fs/promises');
-  let usersTouched = 0;
-  let positionsRemoved = 0;
-  let cashRefunded = 0;
-
-  for (const u of getAllUsers()) {
-    const file = join(userDataDir(u.username), 'trades-crypto.json');
-    if (!existsSync(file)) continue;
-    let snap: import('./trade-store.js').CryptoTradeSnapshot | null = null;
-    try {
-      const raw = await readFile(file, 'utf-8');
-      if (!raw.trim()) continue;
-      snap = JSON.parse(raw) as import('./trade-store.js').CryptoTradeSnapshot;
-    } catch (err: unknown) {
-      log.warn('migration TRA-338: could not parse snapshot', { migration: 'TRA-338', path: file, reason: err instanceof Error ? err.message : String(err) });
-      continue;
-    }
-    if (!snap || !Array.isArray(snap.openPositions)) continue;
-
-    const ghosts = snap.openPositions.filter(p => p.symbol === 'MEGA-USD');
-    if (ghosts.length === 0) continue;
-
-    let userRefund = 0;
-    for (const p of ghosts) {
-      const refund = (p.entryPrice ?? 0) * (p.quantity ?? 0);
-      if (Number.isFinite(refund) && refund > 0) {
-        userRefund += refund;
-      }
-      log.info('migration TRA-338: expunging phantom MEGA-USD position', {
-        migration: 'TRA-338',
-        username: u.username,
-        positionId: p.id,
-        quantity: p.quantity,
-        entryPrice: p.entryPrice,
-        refund,
-      });
-    }
-
-    const nextOpen = snap.openPositions.filter(p => p.symbol !== 'MEGA-USD');
-    const nextCash = (snap.account?.cash ?? 0) + userRefund;
-    const nextSnap: import('./trade-store.js').CryptoTradeSnapshot = {
-      ...snap,
-      savedAt: new Date().toISOString(),
-      openPositions: nextOpen,
-      account: {
-        ...snap.account,
-        cash: nextCash,
-      },
-    };
-    try {
-      await saveCryptoTradeSnapshot(u.username, nextSnap);
-      usersTouched += 1;
-      positionsRemoved += ghosts.length;
-      cashRefunded += userRefund;
-    } catch (err: unknown) {
-      log.warn('migration TRA-338: persist failed', { migration: 'TRA-338', username: u.username, reason: err instanceof Error ? err.message : String(err) });
-    }
-  }
-
-  await writeFile(markerFile, new Date().toISOString(), 'utf-8');
-  log.info('migration TRA-338: complete — removed phantom MEGA-USD positions.', {
-    migration: 'TRA-338',
-    positionsRemoved,
-    usersTouched,
-    cashRefunded,
-  });
-}
 
 export async function runTra301DemoFreshStart(): Promise<void> {
   const markerFile = join(DATA_DIR, '.tra-301-demo-fresh-start');
@@ -720,10 +545,7 @@ export async function runTra301DemoFreshStart(): Promise<void> {
       for (const filePath of [
         join(dir, 'daily-snapshots.json'),
         join(dir, 'equity-state.json'),
-        join(dir, 'crypto', 'daily-snapshots.json'),
-        join(dir, 'crypto', 'equity-state.json'),
         join(dir, 'trades-stocks.json'),
-        join(dir, 'trades-crypto.json'),
       ]) {
         if (!existsSync(filePath)) continue;
         try {
@@ -734,7 +556,6 @@ export async function runTra301DemoFreshStart(): Promise<void> {
         }
       }
       fileCount += await clearReportsTree(join(dir, 'reports'));
-      fileCount += await clearReportsTree(join(dir, 'crypto-reports'));
       userCount += 1;
     } catch (err: unknown) {
       log.warn('migration TRA-301: reset failed for user', { migration: 'TRA-301', username: u.username, reason: err instanceof Error ? err.message : String(err) });
@@ -748,16 +569,14 @@ export async function runTra301DemoFreshStart(): Promise<void> {
 // ─────────────────────────────────────────────────────────────────────────────
 // TRA-244 — per-account calendar buckets.
 //
-// The Calendar tab used to share a single `<userDir>/reports/` and
-// `<userDir>/crypto-reports/` regardless of which account the user was viewing
+// The Calendar tab used to share a single `<userDir>/reports/`
+// regardless of which account the user was viewing
 // (demo, live, sandbox). Users explicitly asked for per-mode history so the
 // calendar shows only the rows that belong to the active account. Reports now
-// live under `reports/{demo,live,sandbox}/...` (stocks) and
-// `crypto-reports/{demo,live}/...` (crypto).
+// live under `reports/{demo,live,sandbox}/...`.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export type StockModeKey = 'demo' | 'live' | 'sandbox';
-export type CryptoModeKey = 'demo' | 'live';
 
 /**
  * Resolve the active stocks mode for a user from saved settings. In demo mode
@@ -770,23 +589,14 @@ export function stockModeKey(settings: AccountSettings): StockModeKey {
   return settings.liveTradierEnvOptions === 'production' ? 'live' : 'sandbox';
 }
 
-/** Crypto only has demo (paper) vs live (Coinbase). */
-export function cryptoModeKey(settings: AccountSettings): CryptoModeKey {
-  return settings.mode === 'live' ? 'live' : 'demo';
-}
-
 export function stockReportsDirFor(ctx: UserContext, mode: StockModeKey): string {
   return join(ctx.reportsDir, mode);
-}
-
-export function cryptoReportsDirFor(ctx: UserContext, mode: CryptoModeKey): string {
-  return join(ctx.cryptoReportsDir, mode);
 }
 
 /**
  * One-shot per-user move of pre-TRA-244 calendar files into the `demo/`
  * subfolder. Demo was the only account the calendar ever wrote to under the
- * old layout, so legacy `reports/*.json|*.md` and `crypto-reports/*.json|*.md`
+ * old layout, so legacy `reports/*.json|*.md`
  * files (including `latest.json` / `latest.md`) all belong in the demo bucket.
  *
  * Idempotent: a marker file `<userDir>/.tra-244-reports-migrated` short-
@@ -834,8 +644,6 @@ async function migrateLegacyReports(reportsRoot: string, markerFile: string): Pr
 async function createUserContext(username: string): Promise<UserContext> {
   const dataDir = userDataDir(username);
   if (!existsSync(dataDir)) await mkdir(dataDir, { recursive: true });
-  const cryptoDir = join(dataDir, 'crypto');
-  if (!existsSync(cryptoDir)) await mkdir(cryptoDir, { recursive: true });
 
   const settings = await loadSettings(username);
 
@@ -923,59 +731,6 @@ async function createUserContext(username: string): Promise<UserContext> {
     }
   }
 
-  // TRA-1340 — persistent live-crypto DCA boot-arm (scoped, default-OFF,
-  // board-ratified: issue-thread interaction 4caaa410 answered YES to overriding
-  // TRA-314 and enabling live Coinbase crypto auto-trading; the TRA-532 promotion
-  // gate is satisfied). Mirrors the TRA-713 equity boot-arm above: because
-  // `cryptoAutoTradingEnabledLive` is a persisted per-account setting that only an
-  // admin-authenticated settings PUT / crypto-start POST can flip — neither
-  // reachable on a redeploy-only deployment — persist the approved flag at boot for
-  // the single pinned operator so a plain `git push` activates it. Runs AFTER the
-  // equity boot-arm so `settings.mode` is already `live` for the operator. Gated on
-  // Live mode + resolvable Coinbase creds (`shouldBootArmLiveCrypto`), so it arms
-  // nothing fleet-wide and never arms with no broker attached. Per-trade risk gates
-  // (10% notional cap, EMA-200 trend gate, catastrophe stop, $1 Coinbase
-  // min-notional, funding) still apply — an unfunded sleeve places no order. No-op
-  // for every non-operator user.
-  if (settings.cryptoAutoTradingEnabledLive !== true && shouldBootArmLiveCrypto(settings, username)) {
-    settings.cryptoAutoTradingEnabledLive = true;
-    try {
-      await saveSettings(username, settings);
-      log.info('TRA-1340 boot-arm: enabled live crypto auto-trading at boot for operator', {
-        username,
-        mode: settings.mode,
-      });
-    } catch (err: unknown) {
-      log.warn('TRA-1340 boot-arm: failed to persist live crypto flag (engine still arms live in-memory)', {
-        username,
-        reason: err instanceof Error ? err.message : String(err),
-      });
-    }
-  } else if (shouldBootDisarmLiveCrypto(settings, username)) {
-    // TRA-2351 — the arm above short-circuits on `!== true`, so an arm that is
-    // ALREADY set never reaches `shouldBootArmLiveCrypto` and never meets the
-    // TRA-2342 `LIVE_CRYPTO_BOOT_ARM` interlock. The interlock stopped a boot
-    // from CREATING the arm; it did not stop a boot from INHERITING one — and
-    // an inherited arm is exactly what the TRA-2351 crypto-start bypass (and a
-    // pre-interlock DATA_DIR restore) leaves behind, on the same operator that
-    // `TRADIER_ENV=production` force-writes to `mode:'live'` one block above.
-    // With the board's carrier absent, the operator boots DISARMED however the
-    // flag got there. See `shouldBootDisarmLiveCrypto` for the exact scope.
-    settings.cryptoAutoTradingEnabledLive = false;
-    try {
-      await saveSettings(username, settings);
-      log.warn('TRA-2351 boot-disarm: cleared an INHERITED live-crypto arm — LIVE_CRYPTO_BOOT_ARM is not set', {
-        username,
-        mode: settings.mode,
-      });
-    } catch (err: unknown) {
-      log.warn('TRA-2351 boot-disarm: failed to persist the cleared live crypto flag (engine still boots disarmed in-memory)', {
-        username,
-        reason: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
   const tracker = new PnlTracker(
     dataDir,
     settings.mode === 'live' ? 0 : (settings.demoEquityStocks ?? settings.demoEquity),
@@ -983,13 +738,8 @@ async function createUserContext(username: string): Promise<UserContext> {
     // calendar. Without this, a boot on a weekend/holiday followed by another
     // boot before the next 21:00 ET close re-anchored `openingEquity` off the
     // stale trade-path cache and the next row booked phantom stock P&L
-    // (41 of 64 demo books, session 2026-08-24). The crypto tracker is NOT
-    // given the calendar: that book trades and closes seven days a week.
+    // (41 of 64 demo books, session 2026-08-24).
     { isMarketDay: isMarketDayIso },
-  );
-  const cryptoTracker = new PnlTracker(
-    cryptoDir,
-    settings.mode === 'live' ? 0 : (settings.demoEquityCrypto ?? settings.demoEquity),
   );
 
   const engine = new SignalEngine(settings, tracker, sharedRvScanner);
@@ -1008,12 +758,6 @@ async function createUserContext(username: string): Promise<UserContext> {
   // user's row. Awaited and never fatal — the store reports how it failed, and the EOD census
   // grades that failure as BLIND rather than publishing a clean-looking empty exclusion list.
   await engine.hydrateMoveSuspectSession(dataDir);
-  const cryptoEngine = new CryptoSignalEngine(cryptoTracker, settings);
-  // TRA-857 — bind the owning user on the crypto engine too so its live-broker
-  // builder scopes the shared COINBASE_* env-cred fallback to the pinned
-  // operator. Without this, any new user flipping crypto to Live inherits the
-  // operator's Coinbase account (the TRA-856 multi-tenant data leak).
-  cryptoEngine.setOwnerUsername(username);
 
   // Restore trade history (TRA-140)
   try {
@@ -1147,43 +891,8 @@ async function createUserContext(username: string): Promise<UserContext> {
     log.warn('Failed to restore stocks history', { username, reason: err instanceof Error ? err.message : String(err) });
   }
 
-  try {
-    const cryptoSnap = await loadCryptoTradeSnapshot(username);
-    if (cryptoSnap) {
-      cryptoEngine.importTradeSnapshot({
-        // TRA-242 — prefer the split lists; fall back to the pre-TRA-242
-        // merged `closedPositions` (treated as demo, since live history is
-        // broker-owned and was effectively unavailable before this fix).
-        closedPositions: cryptoSnap.closedPositions ?? [],
-        demoClosedPositions: cryptoSnap.demoClosedPositions,
-        liveClosedPositions: cryptoSnap.liveClosedPositions,
-        recentSignals: cryptoSnap.recentSignals ?? [],
-        account: {
-          cash: cryptoSnap.account.cash,
-          equity: cryptoSnap.account.equity,
-          initialEquity: cryptoSnap.account.initialEquity,
-          openingEquityToday: cryptoSnap.account.openingEquityToday,
-          openPositions: cryptoSnap.openPositions ?? [],
-        },
-      });
-      const demoCount = cryptoSnap.demoClosedPositions?.length ?? cryptoSnap.closedPositions?.length ?? 0;
-      const liveCount = cryptoSnap.liveClosedPositions?.length ?? 0;
-      log.info('Restored crypto trade history', {
-        username,
-        open: cryptoSnap.openPositions?.length ?? 0,
-        demoClosed: demoCount,
-        liveClosed: liveCount,
-      });
-    }
-  } catch (err: unknown) {
-    log.warn('Failed to restore crypto history', { username, reason: err instanceof Error ? err.message : String(err) });
-  }
-
   // Restore watchlist into engines
   await initWatchlistStore(username);
-  const savedCrypto = getCryptoWatchlistData(username);
-  for (const sym of savedCrypto.hidden) cryptoEngine.removeSymbol(sym);
-  for (const sym of savedCrypto.added) cryptoEngine.addSymbol(sym);
   const savedStocks = getStocksWatchlistData(username);
   for (const sym of savedStocks.hidden) engine.removeSymbol(sym);
   for (const sym of savedStocks.added) engine.addSymbol(sym);
@@ -1191,25 +900,17 @@ async function createUserContext(username: string): Promise<UserContext> {
   // Restore auto-trading state — TRA-229 split per dashboard × per mode.
   engine.setAutoTrading(settings.stocksAutoTradingEnabledDemo ?? true, 'demo');
   engine.setAutoTrading(settings.stocksAutoTradingEnabledLive ?? true, 'live');
-  cryptoEngine.setAutoTrading(settings.cryptoAutoTradingEnabledDemo ?? true, 'demo');
-  // TRA-575 — absent ↔ OFF for live crypto (matches the gate's strict `=== true`).
-  cryptoEngine.setAutoTrading(settings.cryptoAutoTradingEnabledLive ?? false, 'live');
 
   const ctx: UserContext = {
     username,
     dataDir,
     reportsDir: join(dataDir, 'reports'),
-    cryptoReportsDir: join(dataDir, 'crypto-reports'),
     engine,
-    cryptoEngine,
     tracker,
-    cryptoTracker,
     stocksPersistTimer: null,
-    cryptoPersistTimer: null,
   };
 
   if (!existsSync(ctx.reportsDir)) await mkdir(ctx.reportsDir, { recursive: true });
-  if (!existsSync(ctx.cryptoReportsDir)) await mkdir(ctx.cryptoReportsDir, { recursive: true });
 
   // TRA-244 — migrate legacy top-level report files into the demo/ subfolder
   // before the per-mode dirs are seeded. Idempotent via a per-user marker.
@@ -1217,13 +918,11 @@ async function createUserContext(username: string): Promise<UserContext> {
   if (!existsSync(reportsMarker)) {
     try {
       const stockMoved = await migrateLegacyReports(ctx.reportsDir, reportsMarker);
-      const cryptoMoved = await migrateLegacyReports(ctx.cryptoReportsDir, reportsMarker);
-      if (stockMoved + cryptoMoved > 0) {
+      if (stockMoved > 0) {
         log.info('migration TRA-244: moved report files into demo/', {
           migration: 'TRA-244',
           username,
           stockMoved,
-          cryptoMoved,
         });
       }
     } catch (err: unknown) {
@@ -1233,10 +932,6 @@ async function createUserContext(username: string): Promise<UserContext> {
   // Pre-create the per-mode subfolders so writers/readers don't need to mkdir.
   for (const mode of ['demo', 'live', 'sandbox'] as const) {
     const dir = join(ctx.reportsDir, mode);
-    if (!existsSync(dir)) await mkdir(dir, { recursive: true });
-  }
-  for (const mode of ['demo', 'live'] as const) {
-    const dir = join(ctx.cryptoReportsDir, mode);
     if (!existsSync(dir)) await mkdir(dir, { recursive: true });
   }
 
@@ -1250,16 +945,11 @@ async function createUserContext(username: string): Promise<UserContext> {
     recordPersistTick(ctx.username, 'stocks');
     scheduleStocksPersist(ctx);
   });
-  cryptoEngine.onTick(() => {
-    recordPersistTick(ctx.username, 'crypto');
-    scheduleCryptoPersist(ctx);
-  });
 
   contexts.set(username, ctx);
 
   // Initial persist so a fresh user has a snapshot on disk before any trades.
   await persistStocksNow(ctx);
-  await persistCryptoNow(ctx);
 
   return ctx;
 }
@@ -1279,7 +969,6 @@ export async function initUserContext(
   // (it used to leak a second interval + boot tick). For a pre-existing context
   // it ensures the engines are ticking.
   ctx.engine.start({ initialDelayMs: stagger?.engineDelayMs });
-  ctx.cryptoEngine.start({ initialDelayMs: stagger?.cryptoDelayMs });
   return ctx;
 }
 
@@ -1288,9 +977,7 @@ export function destroyUserContext(username: string): void {
   const ctx = contexts.get(username);
   if (!ctx) return;
   if (ctx.stocksPersistTimer) clearTimeout(ctx.stocksPersistTimer);
-  if (ctx.cryptoPersistTimer) clearTimeout(ctx.cryptoPersistTimer);
   ctx.engine.stop();
-  ctx.cryptoEngine.stop();
   contexts.delete(username);
   clearSettingsCache(username);
   clearWatchlistCache(username);
@@ -1305,14 +992,6 @@ function scheduleStocksPersist(ctx: UserContext): void {
   ctx.stocksPersistTimer = setTimeout(() => {
     ctx.stocksPersistTimer = null;
     void persistStocksNow(ctx);
-  }, PERSIST_DEBOUNCE_MS);
-}
-
-function scheduleCryptoPersist(ctx: UserContext): void {
-  if (ctx.cryptoPersistTimer) return;
-  ctx.cryptoPersistTimer = setTimeout(() => {
-    ctx.cryptoPersistTimer = null;
-    void persistCryptoNow(ctx);
   }, PERSIST_DEBOUNCE_MS);
 }
 
@@ -1367,46 +1046,12 @@ export async function persistStocksNow(ctx: UserContext): Promise<void> {
   }
 }
 
-export async function persistCryptoNow(ctx: UserContext): Promise<void> {
-  try {
-    const snap = ctx.cryptoEngine.exportTradeSnapshot();
-    await saveCryptoTradeSnapshot(ctx.username, {
-      version: 1,
-      savedAt: new Date().toISOString(),
-      openPositions: snap.account.openPositions,
-      // TRA-242 — keep the legacy `closedPositions` field populated with
-      // the demo list so old readers see the same view they always have,
-      // and persist the split lists alongside it for the new UI separation.
-      closedPositions: snap.demoClosedPositions,
-      demoClosedPositions: snap.demoClosedPositions,
-      liveClosedPositions: snap.liveClosedPositions,
-      recentSignals: snap.recentSignals,
-      account: {
-        cash: snap.account.cash,
-        equity: snap.account.equity,
-        initialEquity: snap.account.initialEquity,
-        openingEquityToday: snap.account.openingEquityToday,
-      },
-    });
-    // TRA-3407 — see `persistStocksNow`. Same seam, same ordering constraint.
-    recordPersistSuccess(ctx.username, 'crypto');
-  } catch (err: unknown) {
-    // TRA-3407 — the crypto writer has the identical swallow-shape and is graded
-    // as its own axis. A fold to one fleet scalar would hide a single-book writer
-    // failure (the TRA-2903 / `enock` shape), which is why this is per context.
-    recordPersistFailure(ctx.username, 'crypto', err);
-    log.warn('crypto persist failed', { username: ctx.username, reason: err instanceof Error ? err.message : String(err) });
-  }
-}
-
 /** Bootstrap contexts for every existing user in users.json. */
 export async function initAllUserContexts(): Promise<void> {
   const users = getAllUsers();
-  // TRA-1084 — assign each user an incremental boot-tick delay so the N engine
-  // pairs don't all sweep the full universe simultaneously at `server_available`.
-  // The crypto engine is offset half a step from the same user's stock engine so
-  // a single user's two heavy first ticks (full watchlist + ~495-symbol feed)
-  // also don't land together. `await initUserContext` only blocks on the
+  // TRA-1084 — assign each user an incremental boot-tick delay so the N
+  // engines don't all sweep the full universe simultaneously at
+  // `server_available`. `await initUserContext` only blocks on the
   // synchronous context build (restore + persist); the boot tick itself is
   // deferred by the stagger, so the loop still finishes provisioning every
   // context promptly and the spread is applied to the *ticks*, not the loop.
@@ -1415,7 +1060,6 @@ export async function initAllUserContexts(): Promise<void> {
     const stagger: EngineStartStagger = ENGINE_BOOT_STAGGER_MS > 0
       ? {
         engineDelayMs: idx * ENGINE_BOOT_STAGGER_MS,
-        cryptoDelayMs: idx * ENGINE_BOOT_STAGGER_MS + Math.floor(ENGINE_BOOT_STAGGER_MS / 2),
       }
       : {};
     try {

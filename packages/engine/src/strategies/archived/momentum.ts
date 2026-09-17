@@ -1,7 +1,7 @@
 /*
  * DORMANT / ARCHIVED — TRA-816 (TRA-814 workstream B cleanup).
  * OOS-failed roster: 0 of 10 keeper-gate pools passed after costs (TRA-306, TRA-523).
- * NOT wired into the live or demo crypto router — no selectable strategy preset
+ * NOT wired into any live or demo router — no selectable strategy preset
  * enables it (packages/shared STRATEGY_PRESETS is DCA-only; live = no_trade).
  * Kept here for research history; still reachable via the @trading-app/engine
  * public API only for the backtest harnesses. Do NOT re-wire into a live/demo
@@ -83,14 +83,14 @@ export interface MomentumOptions {
   volumeSmaPeriod?: number;
   /**
    * Lot-size for ATR-based sizing. Forwarded to `RiskManager.sizeFromAtr`;
-   * crypto callers typically use 1e-6 (Coinbase BTC) so a $500 risk budget
-   * over a $1k stop sizes to 0.5 BTC instead of being floored to 0.
+   * fractional-unit callers typically use 1e-6 so a $500 risk budget
+   * over a $1k stop sizes to 0.5 units instead of being floored to 0.
    */
   lotSize?: number;
   /**
    * TRA-261 — per-side parameter overrides. Long-side fields stay byte-
    * identical to the TRA-200 spec values; short-side fields layer on top of
-   * the resolved options ONLY when emitting a short. Used by the crypto
+   * the resolved options ONLY when emitting a short. Used by the
    * perp shorts spec (TRA-255 §4) so short entries pull tighter stops, a
    * faster trailing cadence, and a volume-confirmation bump without
    * conditional drift in the long path. Omit either field to keep that
@@ -284,7 +284,7 @@ const CASCADE_LEG_DEFAULTS: ResolvedCascadeLeg = {
   recentHighAnchorRatio: 0.97,
 };
 
-/** Tolerance window (ms) around a 4H bar interval — covers Coinbase exchange
+/** Tolerance window (ms) around a 4H bar interval — covers exchange feed
  * jitter (typically <1s) and the very rare clock-skew artifacts. Wider than
  * needed but still tight enough to reject 1H bars (3.6e6) and 1D bars (8.64e7).
  */

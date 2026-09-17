@@ -370,7 +370,7 @@ function overnightRows(sec: BriefOvernightSection): string[] {
   return out;
 }
 
-/** Format one open position row: "ETH-USD CRYPTO · long 2 @ 3,140 · P&L +$84.20". */
+/** Format one open position row: "NVDA STOCKS · long 2 @ 3,140 · P&L +$84.20". */
 function fmtPosition(p: BriefPosition): string {
   const head = `${p.symbol} ${p.market.toUpperCase()}`;
   const det = p.detail ? ` ${p.detail}` : '';

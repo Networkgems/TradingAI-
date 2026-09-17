@@ -8,7 +8,7 @@ import { rsi } from './indicators/rsi.js';
  * alternate exit).
  *
  * The B5–B8 entry-signal classes (`MomentumStrategy`,
- * `MeanReversionCryptoStrategy`, `BreakoutVolStrategy`) deliberately stay
+ * `BreakoutVolStrategy`) deliberately stay
  * stateless — they only emit entries. Per-position bar-by-bar lifecycle
  * (TRA-197 spec §3–§5) lives here so it can be unit-tested in isolation and
  * driven by the `BacktestRunner` (and, eventually, the live position manager)
@@ -22,8 +22,8 @@ import { rsi } from './indicators/rsi.js';
 
 /**
  * Per-strategy time-stop caps from TRA-197 spec §3 (mean reversion) and §4
- * (breakout). TRA-261 / TRA-255 §4 — re-keyed by `(signalType, side)` so the
- * crypto perp shorts spec can layer in tighter time-stop caps for Momentum
+ * (breakout). TRA-261 / TRA-255 §4 — re-keyed by `(signalType, side)` so a
+ * shorts spec can layer in tighter time-stop caps for Momentum
  * and Breakout shorts without disturbing the long path. Momentum-long has no
  * time stop (trends ride to a structural exit); the missing entry there is
  * intentional and `timeStopBarsFor('momentum', 'buy')` returns null.

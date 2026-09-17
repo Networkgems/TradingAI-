@@ -19,18 +19,10 @@
  * ## Ordered failover
  * When the primary feed is stale/down, the per-asset feed modules fail over
  * across providers in a fixed, documented order. The canonical orders live in
- * the `*_FAILOVER_ORDER` constants below; the cascade implementations in
- * `crypto-feed.ts` and `yahoo-feed.ts` follow them.
+ * the `*_FAILOVER_ORDER` constants below; the cascade implementation in
+ * `yahoo-feed.ts` follows them.
  */
 import type { Candle } from '@trading-app/shared';
-
-/**
- * Crypto quote/candle failover order. Coinbase Exchange is primary because the
- * live crypto broker routes to the same venue, so quote ↔ execution prices
- * stay aligned; Yahoo backstops symbols Coinbase does not list; CoinMarketCap
- * is the final fallback. Implemented by `crypto-feed.ts` `fetchCryptoQuotes`.
- */
-export const CRYPTO_FEED_FAILOVER_ORDER = ['coinbase', 'yahoo', 'cmc'] as const;
 
 /**
  * Equity quote failover order. Tradier is primary (same venue as the live

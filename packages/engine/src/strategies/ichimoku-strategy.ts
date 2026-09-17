@@ -60,7 +60,7 @@ export interface IchimokuOptions {
    * can sweep it.
    */
   kumoThicknessFloor?: number;
-  /** Set false for 24/7 markets like crypto (default: true). */
+  /** Set false for 24/7 markets (default: true). */
   enforceTimeFilter?: boolean;
   /**
    * TRA-183: when true the breakout bar arms a pending retest instead of
@@ -79,7 +79,7 @@ export interface IchimokuOptions {
   /**
    * TRA-183: bars to wait for the pullback before discarding the pending.
    * Default 16 — same anchor used by the reversal retest after the round-2
-   * crypto sweep, on a similar 1h crypto timeframe.
+   * research sweep, on a similar 1h timeframe.
    */
   retestExpiryBars?: number;
   /**
@@ -139,7 +139,7 @@ export class IchimokuStrategy {
     const latest = candles[candles.length - 1];
 
     // Time filter: only trade during high-volume windows (equity only;
-    // disabled for 24/7 crypto datasets via enforceTimeFilter=false).
+    // disabled for 24/7 datasets via enforceTimeFilter=false).
     if (this.enforceTimeFilter && !isValidTradingWindow(latest.timestamp)) return null;
 
     // First, see whether an already-armed pending retest fires on this bar.

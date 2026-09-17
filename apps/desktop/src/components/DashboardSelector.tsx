@@ -1,9 +1,9 @@
 // TRA-419 — DashboardSelector component extracted from App.tsx.
 import { ThemeToggle } from './ThemeToggle';
-import { CandlestickIcon, BitcoinIcon } from './Icons';
+import { CandlestickIcon } from './Icons';
 import type { Theme } from './ThemeToggle';
 
-export function DashboardSelector({ onSelect, onLogout, theme, onToggleTheme, cryptoEnabled = true }: { onSelect: (mode: 'stocks' | 'crypto') => void; onLogout: () => void; theme: Theme; onToggleTheme: () => void; cryptoEnabled?: boolean }) {
+export function DashboardSelector({ onSelect, onLogout, theme, onToggleTheme }: { onSelect: (mode: 'stocks') => void; onLogout: () => void; theme: Theme; onToggleTheme: () => void }) {
   return (
     <div className="selector-screen">
       <div className="selector-topbar">
@@ -20,14 +20,6 @@ export function DashboardSelector({ onSelect, onLogout, theme, onToggleTheme, cr
           <div className="selector-card-title">Stocks Trading</div>
           <div className="selector-card-desc">Trade US equities &amp; options with ORB, Ichimoku, Bollinger-Band Fade, and more</div>
         </button>
-        {/* TRA-1580 — crypto tile hidden for the options/stock-only launch. */}
-        {cryptoEnabled && (
-          <button className="selector-card crypto" onClick={() => onSelect('crypto')}>
-            <div className="selector-card-icon"><BitcoinIcon /></div>
-            <div className="selector-card-title">Crypto Trading</div>
-            <div className="selector-card-desc">Trade crypto 24/7 with live data and algorithmic strategies</div>
-          </button>
-        )}
       </div>
     </div>
   );

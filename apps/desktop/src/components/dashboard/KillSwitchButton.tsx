@@ -2,10 +2,10 @@
 // deterministic risk layer ("the AI proposes, the math disposes") shipped its
 // backend on `main` (cad22de) with only a `POST /api/trading/kill-switch`
 // route; until now the only way to engage the master halt was curl. This button
-// lives in both the Stocks and Crypto dashboard headers and toggles that single
-// global switch — there is no separate per-engine endpoint, the one route halts
-// new entries across BOTH engines and persists via `globalKillSwitchEngaged` in
-// account settings so the halt survives a restart.
+// lives in the Stocks dashboard header and toggles that single global switch —
+// there is no separate per-engine endpoint, the one route halts new entries
+// and persists via `globalKillSwitchEngaged` in account settings so the halt
+// survives a restart.
 //
 // Engaging is gated behind a confirm dialog (it halts all new entries across
 // both engines, so it must be hard to fat-finger) and prompts for an optional
@@ -25,9 +25,7 @@ export function KillSwitchButton({
 }: {
   token: string;
   engaged: boolean;
-  /** Notifies the parent of the new engaged state after a successful toggle
-   *  (the Crypto dashboard uses this to drive its halt banner, which has no
-   *  live `tradingHalted` field to read from). */
+  /** Notifies the parent of the new engaged state after a successful toggle. */
   onToggled?: (engaged: boolean) => void;
 }) {
   const [busy, setBusy] = useState(false);
@@ -44,8 +42,8 @@ export function KillSwitchButton({
     if (next) {
       const ok = window.confirm(
         'Engage the GLOBAL KILL SWITCH?\n\n' +
-        'This immediately halts ALL new entries across both the stock and ' +
-        'crypto engines until you release it. Open positions are NOT closed. ' +
+        'This immediately halts ALL new entries until you release it. ' +
+        'Open positions are NOT closed. ' +
         'The halt persists across server restarts.',
       );
       if (!ok) return;

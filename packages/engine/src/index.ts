@@ -31,8 +31,6 @@ export type {
   ResolvedBtcMomentumDivergence,
   BtcMomentumDivergenceEvalArgs,
 } from './strategies/btc-momentum-divergence.js';
-export { MeanReversionCryptoStrategy } from './strategies/archived/mean-reversion-crypto.js';
-export type { MeanReversionCryptoOptions } from './strategies/archived/mean-reversion-crypto.js';
 export { BreakoutVolStrategy } from './strategies/archived/breakout-vol.js';
 export type { BreakoutVolOptions } from './strategies/archived/breakout-vol.js';
 export { IchimokuStrategy } from './strategies/ichimoku-strategy.js';
@@ -41,8 +39,6 @@ export { ScalpingStrategy } from './strategies/archived/scalping-strategy.js';
 export type { ScalpingOptions } from './strategies/archived/scalping-strategy.js';
 export { SwingStrategy } from './strategies/archived/swing-strategy.js';
 export type { SwingOptions } from './strategies/archived/swing-strategy.js';
-export { CryptoDcaStrategy } from './strategies/crypto-dca.js';
-export type { DcaOptions } from './strategies/crypto-dca.js';
 export {
   SupertrendConfluenceStrategy,
   evaluateSupertrendConfluence,
@@ -151,8 +147,6 @@ export type {
 } from './scale-out-ladder.js';
 export { AlpacaFeed } from './feed/index.js';
 export type { AlpacaFeedEvents } from './feed/index.js';
-export { CoinbaseFeed } from './feed/index.js';
-export type { CoinbaseFeedEvents, CoinbaseFeedOptions } from './feed/index.js';
 export { AlpacaOrderClient } from './alpaca/index.js';
 export type { BracketOrderParams, AlpacaOrderResponse } from './alpaca/index.js';
 export { AlpacaOptionsClient } from './alpaca/index.js';
@@ -239,23 +233,6 @@ export type {
   TradierRateLimitReading, // TRA-4441
   TradierEndpointClass, // TRA-4441
 } from './tradier/index.js';
-export { CoinbaseOrderClient } from './coinbase/index.js';
-export type {
-  CoinbaseOrderClientOptions,
-  CoinbaseAccountBalance,
-  CoinbaseOrderSuccessResponse,
-  CoinbaseOrderDetails,
-  CoinbaseProductInfo,
-  CoinbaseListedProduct,
-  CoinbaseFuturesPosition,
-  CoinbaseFundingRate,
-  CoinbasePerpMetrics,
-  CoinbaseProductBook,
-  CoinbaseMarginType,
-  CoinbasePositionSide,
-  MarketOrderParams as CoinbaseMarketOrderParams,
-  LimitOrderParams as CoinbaseLimitOrderParams,
-} from './coinbase/index.js';
 export { rsi, rsiDivergence, macd, macdCross, bollinger, bollingerZone, VwapTracker, anchoredVwap, anchorIndexAtRecentGap, anchorIndexAtExtreme, avwapReclaim, detectPattern, isBullishPattern, isBearishPattern, adx, choppinessIndex, efficiencyRatio, ema, emaCross, emaSeries, maSlope, atr, atrPct, supertrend, supertrendLatest, SUPERTREND_DEFAULT_PERIOD, SUPERTREND_DEFAULT_FACTOR, donchian, ichimoku, tkCross, composeTechnicalSnapshot, composeTimeframeSignal, resampleCandles, mtfBiasOf, MTF_CHOP_ADX, MTF_TF_WEIGHTS, TF_BUCKET_MS } from './indicators/index.js';
 export type { MacdResult, BollingerState, VwapState, AnchoredVwapState, AvwapReclaimResult, AvwapReclaimSide, CandlePattern, AdxResult, DonchianChannel, IchimokuState, TimeframeCandles, SupertrendBar, SupertrendDirection, SupertrendOptions } from './indicators/index.js';
 // TRA-920 — swing-based S/R zones + reversal-confluence checklist (TRA-921 wires
@@ -336,22 +313,6 @@ export type {
   CanaryPromotionBlocker,
   CanaryPromotionVerdict,
 } from './live-canary.js';
-// TRA-1220 (parent TRA-1218) — crypto ADX/CHOP/ER regime classifier. DISTINCT
-// from `classifyRegime` above; the shared substrate rec #2 (regime-gated TSMOM)
-// imports.
-export { classifyCryptoRegime, CRYPTO_REGIME_DEFAULTS } from './crypto-regime-classifier.js';
-export type {
-  CryptoRegimeConfig,
-  CryptoRegimeReading,
-  CryptoRegimeLabel,
-} from './crypto-regime-classifier.js';
-export { StrategyRouter, DEFAULT_ROUTER_PRIORITY } from './router.js';
-export type {
-  StrategyRouterOptions,
-  RouterEvaluation,
-  RouterPriority,
-  RouterUniverse,
-} from './router.js';
 export {
   TIME_STOP_BARS,
   MOMENTUM_TRAIL_PERIOD_BY_SIDE,
@@ -688,17 +649,5 @@ export type {
   MacroImportance,
   MacroWindowOptions,
 } from './macro/index.js';
-export {
-  cryptoTieredCostModel,
-  flatCostModel,
-  cryptoTierOf,
-  CRYPTO_TIER_FILLS,
-  DEFAULT_CRYPTO_TIERS,
-} from './cost/index.js';
-export type {
-  FillCost,
-  CostModel,
-  CryptoSpreadTier,
-  CryptoTierEntry,
-  CryptoTieredCostModelOptions,
-} from './cost/index.js';
+export { flatCostModel } from './cost/index.js';
+export type { FillCost, CostModel } from './cost/index.js';

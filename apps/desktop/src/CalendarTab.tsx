@@ -597,7 +597,7 @@ function isoDate(year: number, month: number, day: number): string {
 }
 
 // TRA-2246 — Week view helpers. Weeks start on Monday to line up with the month
-// grid's Mon–Fri (stocks) / Mon–Sun (crypto) columns.
+// grid's Mon–Fri columns.
 function addDays(d: Date, n: number): Date {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
 }
@@ -609,11 +609,9 @@ function startOfWeekMonday(d: Date): Date {
 
 // Build an array of weeks for the given month. Each week is an N-element array
 // of day numbers or null for out-of-month / padding.
-// TRA-286 — crypto trades 24/7 and stock P&L can post on weekends (settlement,
-// adjustments), so the crypto calendar includes Saturday and Sunday columns.
 // TRA-369 — the stocks market is closed on Sat/Sun, so the stocks calendar
 // renders Mon–Fri only and skips weekend rows. `cols` controls the layout:
-// 7 → Mon–Sun (crypto), 5 → Mon–Fri (stocks).
+// 7 → Mon–Sun, 5 → Mon–Fri (stocks).
 function buildMonthWeeks(year: number, month: number, cols: 5 | 7): (number | null)[][] {
   const weeks: (number | null)[][] = [];
   const lastDayNum = new Date(year, month + 1, 0).getDate();
@@ -776,7 +774,7 @@ function MonthSummary({ year, month, reports, view }: {
 // ── Week view ────────────────────────────────────────────────────────────────
 //
 // TRA-2246 — a single-week P&L strip sitting between the Month and Year filters.
-// Renders the Mon–Fri (stocks) / Mon–Sun (crypto) days of the week starting at
+// Renders the Mon–Fri days of the week starting at
 // `weekStart` as one row of the same cells the Month grid uses, plus a week
 // summary. Reads from the same fully-loaded `reports` map (all available dates),
 // so a week that straddles a month boundary renders correctly.
@@ -1389,20 +1387,18 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
 // ── Main CalendarTab export ──────────────────────────────────────────────────
 
 export type CalendarMode = 'demo' | 'live' | 'sandbox';
-export type CalendarMarket = 'stocks' | 'crypto';
+export type CalendarMarket = 'stocks';
 
 export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode, market = 'stocks', isAdmin = false }: {
   token: string;
   httpUrl: string;
   reportsPath?: string;
   // TRA-244 — picks which per-account bucket the calendar reads from. Stocks
-  // can be demo/live/sandbox; crypto is demo/live. Omitting falls back to the
-  // server's default (active settings) for legacy callers.
+  // can be demo/live/sandbox. Omitting falls back to the server's default
+  // (active settings) for legacy callers.
   mode?: CalendarMode;
   // TRA-369 — stocks markets are closed Sat/Sun, so the stocks calendar drops
-  // weekend rows entirely; crypto stays 24/7. Defaults to 'stocks' (the
-  // legacy/equity callers) to make the behaviour change opt-out for callers
-  // that don't pass `market`.
+  // weekend rows entirely. Defaults to 'stocks' (the only market).
   market?: CalendarMarket;
   // TRA-1604 — the firm-wide Desk calendar is admin-only. Non-admin accounts
   // never see the Desk toggle and are pinned to their own account book; the
@@ -1475,7 +1471,6 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
 
   // TRA-244 — flipping accounts must clear the cached month state so a brief
   // render of the previous bucket's rows can't leak through.
-  // TRA-369 — also reset when toggling stocks ↔ crypto.
   // TRA-1413 — also reset when toggling My Account ↔ Desk.
   useEffect(() => {
     setReports({});
@@ -1496,10 +1491,8 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
         // TRA-369 — drop weekend-dated rows on the stocks calendar. The U.S.
         // equity market is closed Sat/Sun, so any saved report with a weekend
         // date is stale/imported noise we shouldn't surface in totals or
-        // monthly stats. Crypto keeps every day.
-        const filteredDates = marketEff === 'stocks'
-          ? dates.filter(d => !isWeekendIso(d))
-          : dates;
+        // monthly stats.
+        const filteredDates = dates.filter(d => !isWeekendIso(d));
 
         const results = await Promise.all(
           filteredDates.map(d =>
@@ -1512,7 +1505,7 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
         const map: Record<string, EodReport> = {};
         for (const rep of results) {
           if (!rep) continue;
-          if (marketEff === 'stocks' && isWeekendIso(rep.date)) continue;
+          if (isWeekendIso(rep.date)) continue;
           map[rep.date] = rep;
         }
         setReports(map);
@@ -1558,9 +1551,9 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
     if (month === 11) { setYear(y => y + 1); setMonth(0); } else setMonth(m => m + 1);
   }
 
-  // TRA-2246 — the week label spans the row's first→last visible day (Mon–Fri for
-  // stocks, Mon–Sun for crypto), collapsing the year when both ends share it.
-  const weekEnd   = addDays(weekStart, (marketEff === 'stocks' ? 5 : 7) - 1);
+  // TRA-2246 — the week label spans the row's first→last visible day (Mon–Fri),
+  // collapsing the year when both ends share it.
+  const weekEnd   = addDays(weekStart, 4);
   const weekLabel = weekStart.getFullYear() === weekEnd.getFullYear()
     ? `${MONTH_SHORT[weekStart.getMonth()]} ${weekStart.getDate()} – ${MONTH_SHORT[weekEnd.getMonth()]} ${weekEnd.getDate()}, ${weekEnd.getFullYear()}`
     : `${MONTH_SHORT[weekStart.getMonth()]} ${weekStart.getDate()}, ${weekStart.getFullYear()} – ${MONTH_SHORT[weekEnd.getMonth()]} ${weekEnd.getDate()}, ${weekEnd.getFullYear()}`;
@@ -1752,7 +1745,7 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
             month={month}
             reports={reports}
             onSelectDate={setSelectedDate}
-            cols={marketEff === 'stocks' ? 5 : 7}
+            cols={5}
             view={pnlViewEff}
           />
           <MonthSummary year={year} month={month} reports={reports} view={pnlViewEff} />
@@ -1792,7 +1785,7 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
         <>
           <WeekView
             weekStart={weekStart}
-            cols={marketEff === 'stocks' ? 5 : 7}
+            cols={5}
             reports={reports}
             onSelectDate={setSelectedDate}
             view={pnlViewEff}

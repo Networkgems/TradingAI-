@@ -1,6 +1,6 @@
 /**
  * Equity backtesting script (TRA-169) — runs all 6 strategies on SPY / QQQ /
- * AAPL with realistic fill modeling. Mirrors `backtest-crypto.ts` so the two
+ * AAPL with realistic fill modeling.
  * outputs can be compared side-by-side.
  *
  * Data: 1-minute bars from Twelve Data, last 30 days. The free tier caps a

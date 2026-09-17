@@ -487,9 +487,6 @@ import type { BrokerCloseEvent, BrokerRejectClass } from './broker-submit-census
 import { isLiveEntryGatePassed } from './capital-gate-manifest.js';
 import { isSma200DemoForwardTestEnabled } from './sma200-forward-test-flag.js';
 import { resolveDemoFlagEnv } from './demo-flags.js';
-// TRA-2336 — the positive carrier the live-crypto boot-arm must clear. Compiled
-// default OFF, so no equity-side arming step can chain into a real-money crypto arm.
-import { isLiveCryptoBootArmEnabled } from './live-crypto-boot-arm-flag.js';
 // TRA-2233 — marketable(bid) open-position valuation, DARK behind
 // ENABLE_MARKETABLE_OPEN_MTM. Demo-scoped downstream (account guards on
 // mode==='demo'), so wiring it into both accounts can never change a live number.
@@ -9217,37 +9214,6 @@ export class SignalEngine {
       sum += o.pnl ?? 0;
     }
     return sum;
-  }
-
-  /**
-   * TRA-821 (TRA-817 workstream C) — capital gate for the `tsmom_majors` crypto
-   * candidate. This is the SANCTIONED live-entry chokepoint: any future crypto
-   * router that would open a real `tsmom_majors` position (demo OR live) must go
-   * through here, exactly like {@link openSma200Pullback} gates the equity path.
-   *
-   * It opens NOTHING until `tsmom_majors` is registered in the TRA-817 capital-
-   * gate manifest as having cleared the keeper gate — which is QuantTrader's call
-   * after grading the committed TRA-821 report, not something this code flips.
-   * Returns `true` only when the gate is open AND a position was opened; otherwise
-   * it stamps `liveSkipReason` and returns `false`, leaving the signal display-only.
-   *
-   * No live crypto scan calls this yet (crypto is research/display-only during the
-   * TRA-814 turnaround); the method exists so the gate is enforced the moment a
-   * live entry path is wired post-PASS, with no risk of a pre-validation open.
-   */
-  private maybeOpenTsmomMajorsEntry(signal: TradeSignal): boolean {
-    // Gate first, before any sizing or order placement — the same discipline as
-    // the sma200 path. `tsmom_majors` is intentionally absent from
-    // PASSED_LIVE_ENTRIES, so this short-circuits to display-only.
-    if (!isLiveEntryGatePassed('tsmom_majors')) {
-      signal.liveSkipReason =
-        'display-only: tsmom_majors is not registered in the TRA-817 capital-gate manifest (awaiting OOS keeper-gate PASS)';
-      return false;
-    }
-    // (Reached only once the quant registers a PASS.) A live crypto entry path
-    // would size + place the order here; until then this remains unreachable by
-    // construction and the candidate cannot open a real position.
-    return false;
   }
 
   /**
@@ -19379,13 +19345,13 @@ export class SignalEngine {
   }
 
   /** Emit an exit (position-closed) alert for a closed equity position. */
-  private emitExitAlert(pos: Position, market: 'stocks' | 'crypto' = 'stocks'): void {
+  private emitExitAlert(pos: Position): void {
     if (!this.alertUsername) return;
     emitAlert({
       kind: 'exit',
       username: this.alertUsername,
       symbol: pos.symbol,
-      market,
+      market: 'stocks',
       mode: this.alertMode(),
       exitReason: pos.exitReason,
       pnl: pos.pnl,
@@ -23571,113 +23537,6 @@ export function applyLiveBrokerArm(
   settings.liveTradierEnvOptions = 'production';
   settings.liveTradeEquitiesTradier = true;
   return drift;
-}
-
-/**
- * TRA-1340 — decide whether the production crypto engine should boot with LIVE
- * Coinbase auto-trading armed for the pinned operator, so a plain redeploy
- * activates the board-approved live crypto DCA arm WITHOUT an ADMIN_PASSWORD API
- * flip. This mirrors {@link shouldBootArmLiveEquity} (TRA-713): the board answered
- * YES on issue-thread interaction 4caaa410 (override TRA-314) to enable live
- * Coinbase crypto auto-trading, and the TRA-532 promotion gate is satisfied — but
- * `cryptoAutoTradingEnabledLive` is a persisted per-account setting that only the
- * admin-authenticated PUT /api/account/settings or POST /api/crypto/trading/start
- * can flip, and neither is reachable by an agent on a redeploy-only deployment.
- *
- * REAL-money and deliberately SINGLE-USER scoped — every condition must hold:
- *   • TRA-2336 — `LIVE_CRYPTO_BOOT_ARM` is positively set. The other three
- *     conditions are NOT independent on bqb1: the pin is permanent, the operator
- *     carries per-user Coinbase creds, and `mode` is force-persisted to `'live'`
- *     by the equity boot-arm running immediately above this one in
- *     `createUserContext` whenever `TRADIER_ENV==='production'`. Without a carrier
- *     of its own, the ratified go-live arming step (set `TRADIER_ENV=production`)
- *     silently armed live crypto too — against the board's "Options+Stock, crypto
- *     OFF" ratification (TRA-1575) and TRA-314. Deliberately NOT
- *     `CRYPTO_ENGINE_ENABLED`: that flag means "the crypto data sweep ticks"
- *     (TRA-1580) and must not double as a real-money switch.
- *   • `LIVE_EQUITY_BOOT_USER` names THIS user (operator pin, default "admin" per
- *     render.yaml / TRA-716). A fleet-wide arm would let any user resolve the
- *     shared `COINBASE_*` env creds and trade the operator's Coinbase account
- *     (the TRA-856 multi-tenant leak class).
- *   • the account is in Live mode — live crypto auto-trading is meaningful only in
- *     `mode: 'live'` (mirrors promotion-service's live-crypto predicate). On bqb1
- *     the TRA-713 equity boot-arm forces the operator to Live first, so this holds
- *     at boot.
- *   • resolvable Coinbase creds — per-user crypto creds, or the shared `COINBASE_*`
- *     env fallback scoped to the operator — mirroring
- *     `crypto-engine.buildLiveBroker`, so we never arm live crypto with no broker
- *     attached.
- *
- * Ongoing per-trade risk gates (10%-of-equity notional cap, EMA-200 trend gate,
- * catastrophe stop, Coinbase $1 min-notional, funding) still apply, so an unfunded
- * sleeve places no order even when this arms. `env` is injectable for tests.
- */
-export function shouldBootArmLiveCrypto(
-  settings: AccountSettings,
-  username: string,
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
-  // TRA-2336 — checked FIRST and independently of every account-derived field, so
-  // no amount of persisted state (or a boot-arm that writes it) can reach the arm.
-  if (!isLiveCryptoBootArmEnabled(env)) return false;
-  if (!isLiveBrokerOperator(username, env)) return false;
-  if ((settings.mode ?? 'demo') !== 'live') return false;
-  const apiKey = (
-    settings.liveApiKeyCrypto?.trim()
-    || settings.liveApiKey?.trim()
-    || (env['COINBASE_API_KEY'] ?? '')
-    || ''
-  ).trim();
-  const apiSecret = (
-    settings.liveApiSecretCrypto?.trim()
-    || settings.liveApiSecret?.trim()
-    || (env['COINBASE_API_SECRET'] ?? '')
-    || ''
-  ).trim();
-  return apiKey.length > 0 && apiSecret.length > 0;
-}
-
-/**
- * TRA-2351 — must this boot CLEAR an INHERITED live-crypto arm?
- *
- * `shouldBootArmLiveCrypto` above is checked as
- * `settings.cryptoAutoTradingEnabledLive !== true && shouldBootArmLiveCrypto(...)`,
- * and a flag that is ALREADY `true` short-circuits on the first conjunct — so the
- * TRA-2342 `LIVE_CRYPTO_BOOT_ARM` interlock is never evaluated at all. That
- * interlock stops a boot from CREATING the arm; it did not stop a boot from
- * INHERITING one. Any writer that lands `cryptoAutoTradingEnabledLive: true`
- * without the board's carrier — a settings PUT, the TRA-2351 crypto-start bypass,
- * a DATA_DIR restore predating the interlock — therefore survived every
- * subsequent boot untouched, and `TRADIER_ENV=production` (the ratified go-live
- * arming step) then force-writes `mode:'live'` around it.
- *
- * So the interlock is re-derived to govern the arm's PRESENCE, not just its
- * creation: `LIVE_CRYPTO_BOOT_ARM` is the single carrier for "this box may run
- * real-money crypto", and without it the pinned operator boots DISARMED however
- * the flag got there. Deliberately narrow — it fires ONLY when the carrier itself
- * is absent, and only for the pinned operator on a Live-mode account (the
- * real-money box). It never touches a non-operator account.
- *
- * Note the condition set is NOT the negation of `shouldBootArmLiveCrypto`'s: that
- * one checks resolvable Coinbase creds so it never arms with no broker attached,
- * while this one answers "may this box run real-money crypto AT ALL", and the
- * carrier is the whole of that answer. Leaving an arm in place through a cred-less
- * boot would just re-arm silently the moment creds resolved again.
- *
- * Consequence worth stating plainly: with the carrier absent, arming live crypto
- * through the API on the pinned operator no longer survives a redeploy. That is
- * the control working — TRA-2336's finding was that the flag must be the carrier
- * — not a bug. Set `LIVE_CRYPTO_BOOT_ARM=1` to make the arm durable again.
- */
-export function shouldBootDisarmLiveCrypto(
-  settings: AccountSettings,
-  username: string,
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
-  if (settings.cryptoAutoTradingEnabledLive !== true) return false;
-  if (isLiveCryptoBootArmEnabled(env)) return false;
-  if (!isLiveBrokerOperator(username, env)) return false;
-  return (settings.mode ?? 'demo') === 'live';
 }
 
 function buildTradierLiveEquityClient(

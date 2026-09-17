@@ -27,10 +27,10 @@ export interface RiskManagerOptions {
   /**
    * TRA-186: when true, returned quantities are not floored to whole units —
    * essential for high-priced fractional assets (a $100k account at 1% risk
-   * has a $500 budget; a $80k BTC with a 2% stop floors a 0.31 BTC sized
-   * position to 0 and the BacktestRunner skips the trade entirely while
+   * has a $500 budget; a high-priced asset with a 2% stop floors a 0.31-unit
+   * sized position to 0 and the BacktestRunner skips the trade entirely while
    * still logging the signal). Quantities are rounded down to 8 decimal
-   * places (Coinbase's BTC precision) to keep float noise out of PnL math.
+   * places to keep float noise out of PnL math.
    * Default false preserves equity-share semantics for stock callers.
    */
   fractionalQuantity?: boolean;
@@ -122,7 +122,7 @@ export class RiskManager {
     const stopDistance = Math.abs(entryPrice - stopPrice);
     if (stopDistance === 0) return 0;
     const truncate = (n: number): number => this.fractionalQuantity
-      // Round down to 8 dp — Coinbase's BTC precision; keeps float noise
+      // Round down to 8 dp; keeps float noise
       // (1e-15 scraps) out of qty × price PnL math without shaving real size.
       ? Math.floor(n * 1e8) / 1e8
       : Math.floor(n);

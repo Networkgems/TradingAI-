@@ -31,7 +31,7 @@ import { logger, type Logger } from '../observability/index.js';
 
 // ── Event model ──────────────────────────────────────────────────────────────
 
-export type AlertMarket = 'stocks' | 'crypto' | 'options';
+export type AlertMarket = 'stocks' | 'options';
 
 interface AlertEventBase {
   /** `kind` doubles as the routing class (see {@link AlertEventClass}). */
@@ -299,7 +299,7 @@ export interface RoutineAlertEvent extends AlertEventBase {
 export interface ReportDaySummary {
   /** ET calendar date, `YYYY-MM-DD`. */
   date: string;
-  /** Day-only realized P&L across stocks + options + crypto. */
+  /** Day-only realized P&L across stocks + options. */
   pnl: number;
   /** Closed trades booked that day. */
   trades: number;

@@ -14,12 +14,12 @@ export interface OrbOptions {
   maxSpreadPct?: number;
   /** Volume spike multiplier: breakout candle must have volume > N × range average (default: 1.5). */
   volumeSpikeMultiplier?: number;
-  /** Custom time filter. Defaults to ET stock windows. Pass isValidCryptoTradingWindow for crypto. */
+  /** Custom time filter. Defaults to ET stock windows. */
   timeFilter?: (timestampMs: number) => boolean;
   /**
    * Custom session-anchor finder. Returns the UTC ms timestamp that opens the
    * session containing `latest`. Defaults to "first candle at or after 9:30 AM ET"
-   * (US equity session). For 24/7 crypto markets, pass a callback that returns
+   * (US equity session). For 24/7 markets, pass a callback that returns
    * the start of the UTC day, e.g.
    *   `(latest) => Math.floor(latest.timestamp / 86_400_000) * 86_400_000`.
    */
@@ -30,7 +30,7 @@ export interface OrbOptions {
  * Opening Range Breakout strategy — improved with:
  *   1. ADX regime filter: skip when ADX < 20 (no trend → breakout likely to fail)
  *   2. Volume spike confluence: breakout candle must have volume > 1.5× range average
- *   3. Time filter: only fires in valid trading windows (ET for stocks; session-gated UTC for crypto)
+ *   3. Time filter: only fires in valid trading windows (ET for stocks; custom session windows otherwise)
  */
 export class OrbStrategy {
   private readonly rangeMinutes: number;
@@ -63,7 +63,7 @@ export class OrbStrategy {
     if (!this.timeFilter(latest.timestamp)) return null;
 
     // Locate the session-opening timestamp. For ET equities (default), find
-    // the first candle at or after 9:30 AM ET. For 24/7 crypto markets, callers
+    // the first candle at or after 9:30 AM ET. For 24/7 markets, callers
     // inject `sessionAnchorTimestampOf` to anchor on UTC day boundaries
     // (00:00 UTC) or any other custom session schedule.
     let openTime: number;

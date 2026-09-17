@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { Candle, TradeSignal } from '@trading-app/shared';
-import { cryptoTieredCostModel, flatCostModel, cryptoTierOf, CRYPTO_TIER_FILLS } from '@trading-app/engine';
+import { flatCostModel } from '@trading-app/engine';
 import { admitsUnderPortfolioCap, defaultSectorOf, reachedOneR, BacktestRunner } from './runner.js';
 import type { BacktestConfig } from './types.js';
 
@@ -30,9 +30,9 @@ function mkCandle(over: Partial<Candle> = {}): Candle {
 }
 
 describe('defaultSectorOf', () => {
-  it('routes *-USD tickers into the crypto bucket', () => {
-    expect(defaultSectorOf('BTC-USD')).toBe('crypto');
-    expect(defaultSectorOf('eth-usd')).toBe('crypto');
+  it('routes *-USD tickers into their own bucket', () => {
+    expect(defaultSectorOf('BTC-USD')).toBe('usd_pair');
+    expect(defaultSectorOf('eth-usd')).toBe('usd_pair');
   });
   it('treats everything else as equity', () => {
     expect(defaultSectorOf('AAPL')).toBe('equity');
@@ -70,7 +70,7 @@ describe('admitsUnderPortfolioCap', () => {
       { maxOpenPositions: 5, maxSectorExposure: 2 },
     );
     expect(result?.reason).toBe('max_sector');
-    expect(result?.sector).toBe('crypto');
+    expect(result?.sector).toBe('usd_pair');
   });
 
   it('lets uncorrelated sector positions in even when other sectors are full', () => {
@@ -171,35 +171,6 @@ describe('BacktestRunner cost model + ambiguous fills (TRA-169)', () => {
     if (flatOnly.totalTrades > 0 || tieredOverride.totalTrades > 0) {
       expect(tieredOverride.totalPnl).toBeLessThan(flatOnly.totalPnl);
     }
-  });
-
-  it('cryptoTieredCostModel charges majors less than small-caps', () => {
-    const model = cryptoTieredCostModel();
-    const major = model.resolve('BTC-USD');
-    const small = model.resolve('ADA-USD');
-    expect(major.commissionBps + major.slippageBps).toBeLessThan(
-      small.commissionBps + small.slippageBps,
-    );
-  });
-
-  it('cryptoTieredCostModel falls back to small-cap costs for unknown symbols', () => {
-    const model = cryptoTieredCostModel();
-    expect(model.resolve('UNKNOWN-USD')).toEqual(CRYPTO_TIER_FILLS.small);
-  });
-
-  it('cryptoTierOf reports the bucket for a known major', () => {
-    expect(cryptoTierOf('BTC-USD')).toBe('major');
-    expect(cryptoTierOf('LINK-USD')).toBe('mid');
-    expect(cryptoTierOf('ADA-USD')).toBe('small');
-  });
-
-  it('cryptoTieredCostModel options merge custom tier overrides on top of defaults', () => {
-    const model = cryptoTieredCostModel({
-      tiers: new Map([['DOGE-USD', 'mid']]),
-      fills: { mid: { commissionBps: 99, slippageBps: 1 } },
-    });
-    expect(model.resolve('DOGE-USD')).toEqual({ commissionBps: 99, slippageBps: 1 });
-    expect(model.resolve('BTC-USD')).toEqual(CRYPTO_TIER_FILLS.major);
   });
 
   it('reduces PnL when commissionBps and slippageBps are set vs the zero-cost baseline', async () => {
@@ -692,36 +663,6 @@ describe('BacktestRunner TRA-211 lifecycle wiring', () => {
     expect(result.trades.some(t => t.exitReason === 'target')).toBe(true);
   });
 
-  it('mean-reversion sizing scales with meanReversionRiskPct (0.75% by default)', async () => {
-    // Hand-rolled tiny harness: open one mean_reversion signal manually via
-    // the same admit/size path the runner uses, comparing default-pct vs an
-    // override. Easier than building a full backtest fixture that fires
-    // mean reversion deterministically.
-    //
-    // We compare two BacktestRunner runs on the same synthetic series:
-    // baseline at 0.75% should size strictly smaller than an override of 1%.
-    // Because mean reversion only fires on `range` regime tape, we use the
-    // ranging-with-spikes generator from run-tra206 — but to keep this test
-    // self-contained we just assert the API reaches the runner: a
-    // mean_reversion config with explicit 0.01 override produces ≥ the
-    // total notional of one with 0.0075 (or zero trades, which is fine).
-    const baseConfig: BacktestConfig = {
-      symbol: 'TEST',
-      startDate: 0,
-      endDate: Number.MAX_SAFE_INTEGER,
-      initialEquity: 100_000,
-      strategyType: 'mean_reversion',
-    };
-    // Empty candles → 0 trades, just verifying both code paths run without
-    // throwing (the per-strategy risk override is opt-in plumbing).
-    const r1 = await new BacktestRunner().run(baseConfig, []);
-    const r2 = await new BacktestRunner().run(
-      { ...baseConfig, meanReversionRiskPct: 0.01 },
-      [],
-    );
-    expect(r1.totalTrades).toBe(0);
-    expect(r2.totalTrades).toBe(0);
-  });
 });
 
 // ── TRA-420 §4: next-bar-open fill ────────────────────────────────────────────

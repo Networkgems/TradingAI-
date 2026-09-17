@@ -1,7 +1,7 @@
 /*
  * DORMANT / ARCHIVED — TRA-816 (TRA-814 workstream B cleanup).
  * OOS-failed roster: 0 of 10 keeper-gate pools passed after costs (TRA-306, TRA-523).
- * NOT wired into the live or demo crypto router — no selectable strategy preset
+ * NOT wired into any live or demo router — no selectable strategy preset
  * enables it (packages/shared STRATEGY_PRESETS is DCA-only; live = no_trade).
  * Kept here for research history; still reachable via the @trading-app/engine
  * public API only for the backtest harnesses. Do NOT re-wire into a live/demo
@@ -25,7 +25,7 @@ export interface ReversalOptions {
   /** RSI oversold threshold (default: 30). */
   rsiOversold?: number;
   lookback?: number;
-  /** Set false for 24/7 markets like crypto (default: true). */
+  /** Set false for 24/7 markets (default: true). */
   enforceTimeFilter?: boolean;
   /** ATR lookback period (default: 14). */
   atrPeriod?: number;
@@ -61,7 +61,7 @@ export interface ReversalOptions {
   retestEntry?: boolean;
   /**
    * TRA-179: maximum bars to wait for a retest before discarding a pending
-   * signal. Default 16 — tuned on the round-2 crypto sample to give the
+   * signal. Default 16 — tuned on the round-2 research sample to give the
    * pullback enough time to print without dragging the entry into a regime
    * change.
    */
@@ -177,7 +177,7 @@ export class ReversalStrategy {
 
     const latest = candles[candles.length - 1];
 
-    // Time filter: avoid midday chop and after-hours noise (equity only; disabled for crypto)
+    // Time filter: avoid midday chop and after-hours noise (equity only; disable for 24/7 datasets)
     if (this.enforceTimeFilter && !isValidTradingWindow(latest.timestamp)) return null;
 
     // First, see whether an already-armed pending retest fires on this bar.
@@ -203,7 +203,7 @@ export class ReversalStrategy {
 
     // Volume climax: current volume > volumeMultiplier × average of lookback
     // window. TRA-170 lowered the default from 1.5× → 1.3× because the previous
-    // threshold blocked most genuine reversals on 1h crypto bars (where volume
+    // threshold blocked most genuine reversals on 1h bars (where volume
     // spikes are smaller than on equity 1-min bars). The multiplier is exposed
     // (TRA-177) so walk-forward can sweep it.
     const window = candles.slice(-this.lookback - 1, -1);

@@ -35,21 +35,14 @@ const refreshSpy = vi.fn();
 function fakeCtx(opts: {
   username?: string;
   stocksSignals?: unknown[];
-  cryptoSignals?: unknown[];
   stocksPositions?: unknown[];
-  cryptoPositions?: unknown[];
   openOptions?: unknown[];
   stocksNews?: unknown[];
-  cryptoNews?: unknown[];
 }): UserContext {
   const stocksState = {
     signals: opts.stocksSignals ?? [],
     account: { openPositions: opts.stocksPositions ?? [] },
     options: { openOptions: opts.openOptions ?? [] },
-  };
-  const cryptoState = {
-    signals: opts.cryptoSignals ?? [],
-    account: { openPositions: opts.cryptoPositions ?? [] },
   };
   return {
     username: opts.username ?? 'alice',
@@ -60,10 +53,6 @@ function fakeCtx(opts: {
       // than asserted by inspection.
       addSymbol: addSymbolSpy,
       refresh: refreshSpy,
-    },
-    cryptoEngine: {
-      getState: () => cryptoState,
-      getNews: () => opts.cryptoNews ?? [],
     },
   } as unknown as UserContext;
 }
@@ -80,17 +69,16 @@ describe('buildBriefForUser', () => {
     const ctx = fakeCtx({
       stocksSignals: [
         { symbol: 'AAPL', type: 'orb_long', side: 'buy', entryPrice: 150, stopLoss: 147, takeProfit: 156, timestamp: 2 },
-      ],
-      cryptoSignals: [
-        { symbol: 'BTC-USD', type: 'momentum', side: 'buy', entryPrice: 65000, stopLoss: 64000, takeProfit: 67000, timestamp: 5 },
+        { symbol: 'TSLA', type: 'bb_fade', side: 'buy', entryPrice: 180, stopLoss: 176, takeProfit: 190, timestamp: 5 },
       ],
       stocksPositions: [{ symbol: 'MSFT', side: 'buy', quantity: 10, entryPrice: 400 }],
-      cryptoPositions: [{ symbol: 'ETH-USD', side: 'buy', quantity: 2, entryPrice: 3140, productType: 'perp' }],
       openOptions: [
         { symbol: 'NVDA', optionType: 'call', strike: 900, expiration: '2026-06-19', contracts: 3, contractsRemaining: 3, premiumPaid: 10, currentPremium: 12 },
       ],
-      stocksNews: [{ title: 'Apple ships', source: 'WSJ', publishedAt: '2026-05-17T05:00:00Z' }],
-      cryptoNews: [{ title: 'BTC rallies', source: 'CoinDesk', publishedAt: '2026-05-17T06:00:00Z' }],
+      stocksNews: [
+        { title: 'Apple ships', source: 'WSJ', publishedAt: '2026-05-17T05:00:00Z' },
+        { title: 'Chips rally', source: 'WSJ', publishedAt: '2026-05-17T06:00:00Z' },
+      ],
     });
 
     const e = buildBriefForUser(ctx, MACRO, '2026-05-17', TS);
@@ -100,18 +88,17 @@ describe('buildBriefForUser', () => {
     expect(e.date).toBe('2026-05-17');
     expect(e.macro.regime).toBe('yellow');
 
-    // Setups sorted newest-first (BTC ts=5 before AAPL ts=2).
-    expect(e.setups.map((s) => s.symbol)).toEqual(['BTC-USD', 'AAPL']);
+    // Setups sorted newest-first (TSLA ts=5 before AAPL ts=2).
+    expect(e.setups.map((s) => s.symbol)).toEqual(['TSLA', 'AAPL']);
 
-    // Positions: stocks, crypto (perp tagged), options (with estimated P&L).
-    expect(e.positions.map((p) => p.market)).toEqual(['stocks', 'crypto', 'options']);
-    expect(e.positions[1]?.detail).toBe('perp');
-    const opt = e.positions[2]!;
+    // Positions: stocks, then options (with estimated P&L).
+    expect(e.positions.map((p) => p.market)).toEqual(['stocks', 'options']);
+    const opt = e.positions[1]!;
     expect(opt.detail).toBe('call 900 2026-06-19');
     expect(opt.pnl).toBeCloseTo((12 - 10) * 3 * 100); // +$600
 
-    // News merged + recency-sorted (crypto 06:00 before stocks 05:00).
-    expect(e.news.map((n) => n.title)).toEqual(['BTC rallies', 'Apple ships']);
+    // News recency-sorted (06:00 before 05:00).
+    expect(e.news.map((n) => n.title)).toEqual(['Chips rally', 'Apple ships']);
   });
 
   it('dedupes news by title and caps the list', () => {

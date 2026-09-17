@@ -13,12 +13,10 @@ interface Props {
  * Copy is shipped from the Marketing Copy Deck (TRA-752 §2 base; CEO/CFO signed
  * off) — see /TRA/issues/TRA-752#document-marketing-copy-deck. The TRA-1522
  * honesty pass (grounded in the CTO's TRA-1479 demo→live audit) re-aligned the
- * live-trading claims: equities trade live on a locked roster, while crypto
- * runs demo evaluation only (LIVE_STRATEGY_PRESET="") — the copy no longer
- * implies live real-money crypto or markets gate-failed crypto strategies as
- * live. Every claim maps to a `working` audit row or carries the audit caveat;
- * no invented performance/return numbers appear anywhere. The Section 5 risk
- * disclaimer is rendered in full in the footer and condensed under the hero CTA.
+ * live-trading claims: equities trade live on a locked roster. Every claim maps
+ * to a `working` audit row or carries the audit caveat; no invented
+ * performance/return numbers appear anywhere. The Section 5 risk disclaimer is
+ * rendered in full in the footer and condensed under the hero CTA.
  *
  * Visual direction: TRA-765 Visual / UI Spec (single-column rhythm, F-pattern
  * hierarchy, single high-contrast primary CTA, secondary actions as text
@@ -49,7 +47,7 @@ export default function LandingPage({ onStart, onFeatures, onSignIn }: Props) {
               Disciplined trading, on autopilot.
             </h1>
             <p className="lp-subhead">
-              TradeAI scans crypto and equities for rules-based setups, sizes
+              TradeAI scans equities for rules-based setups, sizes
               every position to protect your capital, and signals the exact
               moment it enters or exits — so you don't have to stare at charts.
             </p>
@@ -63,7 +61,7 @@ export default function LandingPage({ onStart, onFeatures, onSignIn }: Props) {
             </div>
             <p className="lp-cta-note">Starts in demo mode. Real-money trading is opt-in.</p>
             <p className="lp-cta-fineprint">
-              Trading involves substantial risk of loss. Not financial advice. Equities &amp; options start in demo. Crypto runs in demo evaluation today — live crypto trading is not currently enabled.
+              Trading involves substantial risk of loss. Not financial advice. Equities &amp; options start in demo.
             </p>
           </div>
           <DashboardMock />
@@ -88,8 +86,8 @@ export default function LandingPage({ onStart, onFeatures, onSignIn }: Props) {
               <p className="lp-card-lead">Setups found for you, around the clock.</p>
               <p className="lp-card-b">
                 Named, tested strategies scan a curated 25-symbol stock
-                watchlist and a crypto list every 30 seconds, and trade a
-                locked equity roster live.
+                watchlist every 30 seconds, and trade a locked equity
+                roster live.
               </p>
             </article>
             <article className="lp-card">
@@ -113,14 +111,13 @@ export default function LandingPage({ onStart, onFeatures, onSignIn }: Props) {
               'Bollinger-Band Fade',
               'Ichimoku Cloud Breakout',
               'SMA-200 Trend Pullback',
-              'Crypto DCA (demo)',
             ].map((name) => (
               <span key={name} className="lp-chip">{name}</span>
             ))}
           </div>
           <p className="lp-chips-caption">
-            Rules-based strategies across equities and crypto — trading live on
-            equities, in demo evaluation on crypto.
+            Rules-based strategies across equities and options — trading live
+            on a locked equity roster.
           </p>
         </section>
 
@@ -199,14 +196,12 @@ export function RiskDisclaimer() {
       <h2 id="lp-risk-h" className="lp-risk-h">Risk disclosure</h2>
       <p className="lp-risk-body">
         TradeAI is automated trading software, not financial advice. Trading
-        equities, options, and crypto involves substantial risk, including the
+        equities and options involves substantial risk, including the
         possible loss of your entire investment. Automated strategies can and do
         lose money; past or simulated performance does not guarantee future
         results. Equities and options start in demo mode — real-money trading is
-        opt-in and requires your own production broker credentials. Crypto
-        currently runs in demo evaluation only; live crypto trading is not
-        currently enabled, and if it is enabled it is real-money with no paper
-        sandbox. You are solely responsible for your trading decisions. No representation is made that any account will
+        opt-in and requires your own production broker credentials.
+        You are solely responsible for your trading decisions. No representation is made that any account will
         or is likely to achieve profits.
       </p>
     </section>

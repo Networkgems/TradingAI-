@@ -1,12 +1,12 @@
 import { Candle, Position } from '@trading-app/shared';
-import type { BreakoutVolOptions, CellExpectancy, CorrelationCapConfig, CostModel, IchimokuOptions, MeanReversionCryptoOptions, MomentumOptions, OrbOptions, RegimeDetectorOptions, ScalpingOptions, SwingOptions, TsmomMajorsParams, VolKellySizerConfig } from '@trading-app/engine';
+import type { BreakoutVolOptions, CellExpectancy, CorrelationCapConfig, CostModel, IchimokuOptions, MomentumOptions, OrbOptions, RegimeDetectorOptions, ScalpingOptions, SwingOptions, VolKellySizerConfig } from '@trading-app/engine';
 
 export interface BacktestReversalOpts {
   rsiPeriod?: number;
   rsiOverbought?: number;
   rsiOversold?: number;
   lookback?: number;
-  /** Pass-through to the engine strategy; set false for 24/7 crypto datasets. */
+  /** Pass-through to the engine strategy; set false for 24/7 datasets. */
   enforceTimeFilter?: boolean;
   /** TRA-171: ATR-based stop multiplier; 0 forces the fixed-pct / structural stop path. */
   atrStopMultiplier?: number;
@@ -52,16 +52,15 @@ export interface BacktestMacdBollingerOpts {
  *
  * `maxOpenPositions` caps the total number of simultaneously open positions
  * across every strategy. `maxSectorExposure` caps how many of those open
- * positions may share the same sector bucket — e.g. all `*-USD` crypto symbols
- * roll up into a single "crypto" bucket so the engine can't pile five highly
- * correlated coins on the same directional bet.
+ * positions may share the same sector bucket, so the engine can't pile
+ * several highly correlated names on the same directional bet.
  */
 export interface PortfolioOpts {
   maxOpenPositions?: number;
   maxSectorExposure?: number;
   /**
-   * Optional symbol → sector resolver. Defaults to a heuristic that maps any
-   * `*-USD` ticker to `crypto` and everything else to `equity`.
+   * Optional symbol → sector resolver. Defaults to a heuristic that buckets
+   * `*-USD` tickers separately from everything else (`equity`).
    */
   sectorOf?: (symbol: string) => string;
 }
@@ -78,7 +77,7 @@ export interface PortfolioOpts {
  * `config` overrides any of the five spec §5 keys; omitted keys take the
  * recommended defaults so the cap is tunable without a code change.
  *
- * `dailyCandlesBySymbol` supplies the real Coinbase daily history used to
+ * `dailyCandlesBySymbol` supplies the real daily history used to
  * estimate correlations. When omitted, the insufficient-history fallback
  * applies — which, for a single-symbol backtest, correctly collapses every
  * open position into one cluster (a symbol is ρ=1.0 with itself).
@@ -147,9 +146,7 @@ export interface BacktestConfig {
     | 'macd_bollinger'
     | 'scalping'
     | 'swing'
-    | 'breakout_vol'
-    | 'mean_reversion'
-    | 'tsmom_majors';
+    | 'breakout_vol';
   reversalOpts?: BacktestReversalOpts;
   macdBollingerOpts?: BacktestMacdBollingerOpts;
   ichimokuOpts?: BacktestIchimokuOpts;
@@ -157,34 +154,15 @@ export interface BacktestConfig {
   momentumOpts?: MomentumOptions;
   /** TRA-207: pass-through to BreakoutVolStrategy. */
   breakoutVolOpts?: BreakoutVolOptions;
-  /** TRA-206: pass-through to MeanReversionCryptoStrategy. */
-  meanReversionOpts?: MeanReversionCryptoOptions;
-  /**
-   * TRA-821 — the four frozen `tsmom_majors` params (lookbackDays, entryBandPct,
-   * exitBandPct, volTargetAnnualPct). Only consulted when
-   * `strategyType === 'tsmom_majors'`. The runner force-enables the VolKellySizer
-   * for that strategy and derives the sizer's vol anchor from `volTargetAnnualPct`
-   * (see runner), so no separate `volKellySizerOpts` is required for tsmom.
-   */
-  tsmomOpts?: TsmomMajorsParams;
-  /**
-   * TRA-211: per-strategy risk-budget override for mean-reversion entries —
-   * spec §3 sizes mean reversion at 0.75% of equity (vs. the 1% default that
-   * momentum/breakout share). Defaults to 0.0075 when omitted; set explicitly
-   * to override (e.g. 0.01 to flatten back to the global default).
-   */
-  meanReversionRiskPct?: number;
   /**
    * TRA-205: regime-detector knobs forwarded to the detector that gates
    * momentum (and any future regime-aware strategy). Omit to use defaults.
    */
   regimeOpts?: RegimeDetectorOptions;
   /**
-   * Pass-through to OrbStrategy. Use this to inject `timeFilter:
-   * isValidCryptoTradingWindow` and a `sessionAnchorTimestampOf` callback for
-   * crypto datasets — without it the default ET equity session anchor blocks
-   * every crypto bar (verified empirically: 0 trades on 6,483 bars of
-   * BTC/ETH/SOL 1h data).
+   * Pass-through to OrbStrategy. Use this to inject a custom `timeFilter` and
+   * `sessionAnchorTimestampOf` callback for 24/7 datasets — without it the
+   * default ET equity session anchor blocks every bar outside the US session.
    */
   orbOpts?: OrbOptions;
   scalpingOpts?: ScalpingOptions;
@@ -193,22 +171,19 @@ export interface BacktestConfig {
   /**
    * TRA-423 — portfolio correlation / concentration cap. Omit (or set
    * `enabled: false`) to leave behaviour unchanged; set `enabled: true` to
-   * have the runner enforce the TRA-411 §6 admission rule. QuantTrader drives
-   * the spec §8 validation by toggling this on the {BTC-USD, SOL-USD}
-   * `macd_bollinger` book.
+   * have the runner enforce the TRA-411 §6 admission rule.
    */
   correlationCapOpts?: CorrelationCapOpts;
   /**
    * TRA-430 — volatility-/Kelly-scaled per-trade risk sizing (TRA-428 spec).
-   * Omit (or `enabled: false`) to leave sizing unchanged. The §6 three-arm
-   * validation toggles this on the {BTC-USD, SOL-USD} `macd_bollinger` book.
+   * Omit (or `enabled: false`) to leave sizing unchanged.
    */
   volKellySizerOpts?: VolKellySizerOpts;
   signalEdgeOpts?: SignalEdgeOpts;
   /**
    * Per-fill commission charged on entry and exit, in basis points of notional
-   * (1 bp = 0.01% = 0.0001). Defaults to 0 for backwards compat. Pass 40 for
-   * Coinbase taker fees, ~5 bps for low-cost equity brokers, etc. Ignored
+   * (1 bp = 0.01% = 0.0001). Defaults to 0 for backwards compat. Pass
+   * ~5 bps for low-cost equity brokers, more for high-fee venues. Ignored
    * when {@link costModel} is also provided.
    */
   commissionBps?: number;
@@ -223,17 +198,17 @@ export interface BacktestConfig {
    * TRA-185: spread-aware cost model. When set, overrides
    * {@link commissionBps}/{@link slippageBps} — the runner resolves
    * `costModel.resolve(symbol)` once per backtest and uses the per-fill cost
-   * it returns for every fill. Use `cryptoTieredCostModel()` from
-   * `@trading-app/engine` for the default crypto tier table. Existing flat-cost
+   * it returns for every fill. Use `flatCostModel()` from
+   * `@trading-app/engine` to adapt a flat per-fill cost. Existing flat-cost
    * callers can leave this unset and behavior is unchanged.
    */
   costModel?: CostModel;
   /**
    * TRA-186: opt into fractional-quantity sizing. Defaults to true for `*-USD`
-   * symbols (crypto) and false otherwise — without it, RiskManager.sizeFromStop
+   * symbols and false otherwise — without it, RiskManager.sizeFromStop
    * floors to whole units, which silently zeros out high-priced fractional
-   * assets like BTC: at $80k spot with a 2% stop on a $100k account, the risk
-   * budget sizes to 0.31 BTC and the integer floor reports 0. Set explicitly
+   * assets: at $80k spot with a 2% stop on a $100k account, the risk
+   * budget sizes to 0.31 units and the integer floor reports 0. Set explicitly
    * to override the heuristic.
    */
   fractionalQuantity?: boolean;

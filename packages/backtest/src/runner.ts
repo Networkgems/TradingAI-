@@ -12,11 +12,6 @@ import {
   BbFadeStrategy,
   MomentumStrategy,
   BreakoutVolStrategy,
-  MeanReversionCryptoStrategy,
-  TsmomMajorsStrategy,
-  resolveTsmomMajorsParams,
-  tsmomExitToFlat,
-  TSMOM_BARS_PER_YEAR,
   IchimokuStrategy,
   ScalpingStrategy,
   SwingStrategy,
@@ -27,7 +22,6 @@ import {
   advanceExtreme,
   momentumTrailStop,
   breakoutTrailStop,
-  meanReversionRsiAltExitTriggered,
   timeStopBarsFor,
   momentumTrailPeriodFor,
   breakoutTrailOptionsFor,
@@ -38,13 +32,6 @@ const DEFAULT_MAX_OPEN = 3;
 const DEFAULT_MAX_SECTOR = 3;
 const DEFAULT_LOOKAHEAD_BARS = 24;
 const MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1_000;
-
-/**
- * TRA-211: spec §3 mean-reversion sizes at 0.75% of equity, smaller than the
- * 1% default that momentum / breakout share. Falls back to the global default
- * if `meanReversionRiskPct` is not provided on the config.
- */
-const DEFAULT_MEAN_REVERSION_RISK_PCT = 0.0075;
 
 /**
  * TRA-203: normalize the {@link BacktestConfig.feeBps} field into per-fill
@@ -104,12 +91,12 @@ function tradeR(
 }
 
 /**
- * Default sector resolver — `*-USD` tickers fall into the `crypto` bucket so
- * five highly correlated coins can't all open simultaneously and call
+ * Default sector resolver — `*-USD` tickers fall into their own bucket so
+ * several highly correlated names can't all open simultaneously and call
  * themselves "diversified". Everything else is treated as `equity`.
  */
 export function defaultSectorOf(symbol: string): string {
-  return /-USD$/i.test(symbol) ? 'crypto' : 'equity';
+  return /-USD$/i.test(symbol) ? 'usd_pair' : 'equity';
 }
 
 /**
@@ -168,11 +155,11 @@ export class BacktestRunner {
       dailyPnl: 0,
     };
 
-    // TRA-186: crypto symbols default to fractional-quantity sizing — without
-    // it BTC trades silently never size at typical 1% risk budgets because
-    // sizeFromStop floors a 0.31-BTC budget to 0.
+    // TRA-186: `*-USD` symbols default to fractional-quantity sizing — without
+    // it high-priced fractional assets silently never size at typical 1% risk
+    // budgets because sizeFromStop floors a 0.31-unit budget to 0.
     const fractionalQuantity = config.fractionalQuantity
-      ?? (defaultSectorOf(config.symbol) === 'crypto');
+      ?? (defaultSectorOf(config.symbol) === 'usd_pair');
     const risk = new RiskManager(account, { fractionalQuantity });
     const positions = new PositionManager();
     const orb = new OrbStrategy(config.orbOpts);
@@ -204,21 +191,6 @@ export class BacktestRunner {
       ...config.breakoutVolOpts,
       regimeOptions: config.breakoutVolOpts?.regimeOptions ?? config.regimeOpts,
     });
-    // TRA-206: mean-reversion is regime-gated to `range` only. Same wiring
-    // shape as breakoutVol — pass `regimeOpts` through so the strategy's
-    // self-classification uses the same hysteresis/threshold config as the
-    // rest of the runner. The router (TRA-208) will eventually drive a shared
-    // detector; until then this keeps configuration consistent.
-    const meanReversion = new MeanReversionCryptoStrategy({
-      ...config.meanReversionOpts,
-      regimeOptions: config.meanReversionOpts?.regimeOptions ?? config.regimeOpts,
-    });
-    // TRA-821 — time-series-momentum on the crypto majors. Long-or-flat, band
-    // exit; sizing is the VolKellySizer's job (wired below). Stateless wrapper.
-    const tsmomParams = resolveTsmomMajorsParams(config.tsmomOpts);
-    const tsmom = new TsmomMajorsStrategy(config.tsmomOpts);
-    const isTsmom = config.strategyType === 'tsmom_majors';
-
     // TRA-169 / TRA-185 / TRA-203: per-fill cost model. Commission charged on
     // entry+exit notional, slippage applied adversely to fill prices. The
     // resolution order is `costModel` > `feeBps` (with maker/taker split if
@@ -328,30 +300,9 @@ export class BacktestRunner {
     // flag defaults false → the sizer ships dark. `resolveVolKellySizerConfig`
     // asserts `riskPctFloor >= minTradeRiskPct` against the resolved cluster
     // cap floor (§5 floor coherence).
-    // TRA-821 — the sizer is intrinsic to `tsmom_majors` ("enabled for THIS
-    // strategy only"), so force it on and derive its config from the frozen 4
-    // params: `volTargetAnnualPct` is the annual vol anchor, risk is the 1%
-    // base clamped to [0.5%, 1.75%], and daily crypto bars annualise on √365.
-    // An explicit `volKellySizerOpts.config` (e.g. a sweep) still overrides.
-    // Omitting `expectancyByCell` leaves the Kelly cap inactive (vol-only) —
-    // the only honest choice in a backtest, since feeding OOS expectancy back
-    // into the same OOS trades would be look-ahead; live trading supplies the
-    // validated OOS net expectancy per the spec.
-    const tsmomVolKellyConfig = isTsmom
-      ? {
-          baseRiskPct: 0.01,
-          riskPctFloor: 0.005,
-          riskPctCeil: 0.0175,
-          volRefAnnual: tsmomParams.volTargetAnnualPct / 100,
-          barsPerYear: TSMOM_BARS_PER_YEAR,
-          volWindowBars: 30,
-        }
-      : undefined;
-    const volKellyEnabled = config.volKellySizerOpts?.enabled === true || isTsmom;
+    const volKellyEnabled = config.volKellySizerOpts?.enabled === true;
     const volKellyConfig = resolveVolKellySizerConfig(
-      isTsmom
-        ? { ...tsmomVolKellyConfig, ...(config.volKellySizerOpts?.config ?? {}) }
-        : config.volKellySizerOpts?.config,
+      config.volKellySizerOpts?.config,
       corrCapConfig.minTradeRiskPct,
     );
     const volKellyExpectancy = config.volKellySizerOpts?.expectancyByCell ?? {};
@@ -391,13 +342,7 @@ export class BacktestRunner {
           continue;
         }
 
-        // TRA-211 spec §3: mean reversion sizes at 0.75% of equity (vs. the
-        // 1% default that momentum/breakout share). The override applies only
-        // to `mean_reversion` signals — other types use whatever
-        // `RiskManager` defaults to.
-        let riskPct = signal.type === 'mean_reversion'
-          ? (config.meanReversionRiskPct ?? DEFAULT_MEAN_REVERSION_RISK_PCT)
-          : undefined;
+        let riskPct: number | undefined;
 
         // TRA-430 — vol-/Kelly-scaled per-trade risk (TRA-428 spec §3). When
         // enabled, the effective risk fraction replaces the flat budget for
@@ -557,24 +502,6 @@ export class BacktestRunner {
       for (const pos of positions.getOpen()) {
         const ls = positions.getLifecycle(pos.id);
 
-        // TRA-821 — tsmom_majors is long-or-flat with a band exit, NOT a bracket
-        // strategy. Its on-signal stop is a sizing-only 1R unit (one daily
-        // vol-target σ) that would fire near-daily on crypto if armed, so we skip
-        // the hard stop / take-profit / time-stop entirely and exit only when the
-        // trailing L-day return crosses below -exitBandPct. Exit at this bar's
-        // close, mirroring the mean_reversion RSI alt-exit convention.
-        if (pos.signalType === 'tsmom_majors') {
-          if (tsmomExitToFlat(window, tsmomParams)) {
-            exitsThisBar.push({
-              pos,
-              rawExit: latest.close,
-              reason: 'tsmom_band_exit',
-              ambiguous: false,
-            });
-          }
-          continue;
-        }
-
         const hitsStop = pos.side === 'buy'
           ? latest.low <= pos.stopLoss
           : latest.high >= pos.stopLoss;
@@ -582,32 +509,7 @@ export class BacktestRunner {
           ? latest.high >= pos.takeProfit
           : latest.low <= pos.takeProfit;
 
-        // 1) Mean-reversion alt exit (RSI re-cross 50). Spec §3 says it
-        //    competes with the BB-middle target — first to fire wins. We
-        //    prefer the alt exit when it's the only thing firing AND it has
-        //    triggered; if a hard stop also hits this bar, the stop wins.
-        if (
-          ls
-          && pos.signalType === 'mean_reversion'
-          && !hitsStop
-          && !hitsTarget
-          && meanReversionRsiAltExitTriggered(
-            pos,
-            window,
-            config.meanReversionOpts?.rsiPeriod ?? 14,
-            ls,
-          )
-        ) {
-          exitsThisBar.push({
-            pos,
-            rawExit: latest.close,
-            reason: 'rsi_alt_exit',
-            ambiguous: false,
-          });
-          continue;
-        }
-
-        // 2) Hard stop / take-profit bracket. Same OHLC ambiguity handling
+        // 1) Hard stop / take-profit bracket. Same OHLC ambiguity handling
         //    as before, plus exit-reason classification: a stop hit after a
         //    trailing ratchet records as `trailing` instead of `stop`.
         if (hitsStop || hitsTarget) {
@@ -628,9 +530,9 @@ export class BacktestRunner {
           continue;
         }
 
-        // 3) Time stop. Per spec §3/§4 the position closes "at market" once
+        // 2) Time stop. Per spec §3/§4 the position closes "at market" once
         //    the bar cap is reached; we use the bar's close. Only fires when
-        //    neither the bracket nor the alt-exit closed the trade. TRA-261 —
+        //    the bracket did not close the trade. TRA-261 —
         //    pass `pos.side` so Momentum-shorts get the §4.1 20-bar cap and
         //    Breakout-shorts get the §4.2 10-bar cap (vs. 15 long).
         const cap = timeStopBarsFor(pos.signalType, pos.side);
@@ -738,16 +640,6 @@ export class BacktestRunner {
       if (config.strategyType === 'breakout_vol' || config.strategyType === 'combined') {
         const b = breakoutVol.evaluate(config.symbol, window);
         if (b) signals.push(b);
-      }
-      if (config.strategyType === 'mean_reversion' || config.strategyType === 'combined') {
-        const m = meanReversion.evaluate(config.symbol, window);
-        if (m) signals.push(m);
-      }
-      // TRA-821 — standalone crypto candidate; not part of the legacy `combined`
-      // equity bundle. The runner's `alreadyOpen` guard keeps it long-or-flat.
-      if (config.strategyType === 'tsmom_majors') {
-        const s = tsmom.evaluate(config.symbol, window);
-        if (s) signals.push(s);
       }
       if (config.strategyType === 'ichimoku' || config.strategyType === 'combined') {
         const s = ichimoku.evaluate(config.symbol, window);

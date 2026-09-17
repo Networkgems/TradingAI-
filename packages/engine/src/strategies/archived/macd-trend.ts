@@ -1,7 +1,7 @@
 /*
  * DORMANT / ARCHIVED — TRA-816 (TRA-814 workstream B cleanup).
  * OOS-failed roster: 0 of 10 keeper-gate pools passed after costs (TRA-306, TRA-523).
- * NOT wired into the live or demo crypto router — no selectable strategy preset
+ * NOT wired into any live or demo router — no selectable strategy preset
  * enables it (packages/shared STRATEGY_PRESETS is DCA-only; live = no_trade).
  * Kept here for research history; still reachable via the @trading-app/engine
  * public API only for the backtest harnesses. Do NOT re-wire into a live/demo
@@ -26,7 +26,7 @@ export interface MacdTrendOptions {
   /**
    * Volume multiplier to confirm signal (default: 1.2× average).
    *
-   * TRA-170 follow-up: lowered from 1.5× → 1.2× after the real-Coinbase
+   * TRA-170 follow-up: lowered from 1.5× → 1.2× after the real-data
    * acceptance run showed the cross+ADX+volume intersection capped frequency
    * at 0–12 trades/asset/90d. 1.2× still rejects flat-volume drift while
    * letting genuine continuation breakouts through.
@@ -34,7 +34,7 @@ export interface MacdTrendOptions {
   volumeMultiplier?: number;
   /** Bars to average for volume baseline (default: 20) */
   volumeLookback?: number;
-  /** Set false for 24/7 markets like crypto (default: true). */
+  /** Set false for 24/7 markets (default: true). */
   enforceTimeFilter?: boolean;
   /** ATR lookback period (default: 14). */
   atrPeriod?: number;

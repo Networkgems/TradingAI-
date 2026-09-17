@@ -3,8 +3,7 @@
 // stock engine) is impossible to miss. On the Stocks dashboard `halted` /
 // `reason` come straight from the live `tradingHalted` / `haltReason` fields in
 // `/api/state`, where the kill-switch reason already takes precedence over the
-// daily circuit-breakers (see DailyRiskGovernor.getHaltReason). The Crypto
-// dashboard drives it from the kill-switch engaged state, its only halt source.
+// daily circuit-breakers (see DailyRiskGovernor.getHaltReason).
 //
 // TRA-895 — when the halt is from the daily circuit-breaker (not the kill
 // switch), show a "Clear halt" button so an operator can resume without waiting

@@ -40,9 +40,9 @@ interface PromotionStatusResponse {
 
 const POLL_MS = 30_000;
 
-// Strategy ids are crypto-strategy preset ids / strategy names; humanise the
-// common shapes (`bb_fade_sol_doge` → "Bb fade sol doge") without a lookup
-// table so a newly-registered strategy still reads cleanly.
+// Strategy ids are preset ids / strategy names; humanise the common shapes
+// (`bb_fade_sol_doge` → "Bb fade sol doge") without a lookup table so a
+// newly-registered strategy still reads cleanly.
 function prettyStrategyId(id: string): string {
   const spaced = id.replace(/[_-]+/g, ' ').trim();
   return spaced.charAt(0).toUpperCase() + spaced.slice(1);

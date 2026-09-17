@@ -566,7 +566,7 @@ export function correlatedExposureDecision(
  * A position/candidate reduced to the fields the correlated-exposure cap groups
  * on: its correlated keys at each grain plus its per-trade dollar risk. The
  * caller resolves the keys (for an option, the `underlying` is the underlier's
- * ticker; `assetClass` is e.g. `'equity'` / `'crypto'`; `sector` is optional —
+ * ticker; `assetClass` is e.g. `'equity'` / `'options'`; `sector` is optional —
  * omit it and the sector grain is simply not evaluated for that name).
  */
 export interface ExposurePositionRisk {

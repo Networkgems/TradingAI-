@@ -1957,8 +1957,8 @@ tr:hover td { background: var(--bg-hover); }
 }
 
 /* Month grid */
-/* TRA-369 — the stocks calendar drops Sat/Sun columns (5-wide grid); crypto
-   keeps the full 7-wide week. `--cal-cols` is set inline by <MonthGrid>. */
+/* TRA-369 — the stocks calendar drops Sat/Sun columns (5-wide grid).
+   `--cal-cols` is set inline by <MonthGrid>. */
 .cal-grid {
   display: flex;
   flex-direction: column;
@@ -2646,7 +2646,6 @@ tr:hover td { background: var(--bg-hover); }
 }
 
 .selector-card.stocks:hover { border-color: var(--green); }
-.selector-card.crypto:hover { border-color: var(--orange); }
 
 .selector-card-icon { display: flex; align-items: center; justify-content: center; }
 .selector-card-title { font-size: 1rem; font-weight: 700; letter-spacing: 0.04em; }
@@ -2687,7 +2686,6 @@ tr:hover td { background: var(--bg-hover); }
 }
 
 .mode-badge.stocks { background: var(--green-soft); color: var(--green); }
-.mode-badge.crypto { background: var(--orange-soft); color: var(--orange); }
 
 .account-mode-badge {
   font-size: 0.62rem;
@@ -2756,10 +2754,6 @@ tr:hover td { background: var(--bg-hover); }
    may clear the pin at any time, and this is the control they reach for when
    they are trying to get OUT of a live arm. The `title` carries the reason. */
 .account-mode-option[data-clamped='true'] { text-decoration: line-through; opacity: 0.55; }
-
-/* ── Crypto dashboard: orange accent ─────────────────────────────────────────── */
-
-.header-left h1 .mode-badge.crypto ~ * { color: var(--orange); }
 
 /* ── News card ───────────────────────────────────────────────────────────────── */
 
@@ -4280,34 +4274,6 @@ tr:hover td { background: var(--bg-hover); }
   line-height: 1.55;
   color: var(--lp-muted);
   max-width: 48rem;
-}
-
-/* Crypto demo-evaluation block (TRA-2038 / TRA-2037 §D). Deliberately
- * SUBORDINATE to the live-strategy table above it: derived from .lp-ft-note,
- * no accent color and no badge, so it can never read as a live capability.
- * The "not live" status is carried by the words in the heading, never by color
- * alone. Both text colors clear WCAG AA on --lp-surface-2 — measured
- * soft 11.7:1, muted 7.5:1 (AA body text needs 4.5:1). */
-.lp-ft-demo {
-  margin-top: 1.5rem;
-  max-width: 48rem;
-  padding: 0.9rem 1.1rem;
-  border-left: 3px solid var(--lp-border);
-  border-radius: 0 6px 6px 0;
-  background: var(--lp-surface-2);
-}
-.lp-ft-demo-h {
-  margin: 0 0 0.4rem;
-  font-size: 0.95rem;
-  font-weight: 700;
-  letter-spacing: 0;
-  color: var(--lp-soft);
-}
-.lp-ft-demo-body {
-  margin: 0;
-  font-size: 0.85rem;
-  line-height: 1.55;
-  color: var(--lp-muted);
 }
 
 /* ── Responsive ────────────────────────────────────────────────────────── */

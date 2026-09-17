@@ -19,7 +19,6 @@ let loadSettings: AccountSettingsModule['loadSettings'];
 let saveSettings: AccountSettingsModule['saveSettings'];
 let clearSettingsCache: AccountSettingsModule['clearSettingsCache'];
 let migrateLegacyLiveCredentials: AccountSettingsModule['migrateLegacyLiveCredentials'];
-let migrateLegacyCryptoLiveDefault: AccountSettingsModule['migrateLegacyCryptoLiveDefault'];
 // TRA-349 — also bound through the same dynamic import so the helpers we test
 // belong to the same module instance whose DATA_DIR was captured against
 // TMP_ROOT. A static `import { ... } from './account-settings.js'` at the top
@@ -36,7 +35,6 @@ beforeAll(async () => {
   saveSettings = mod.saveSettings;
   clearSettingsCache = mod.clearSettingsCache;
   migrateLegacyLiveCredentials = mod.migrateLegacyLiveCredentials;
-  migrateLegacyCryptoLiveDefault = mod.migrateLegacyCryptoLiveDefault;
   clampScopedRatio = mod.clampScopedRatio;
   clampScopedRisk = mod.clampScopedRisk;
   mergeScopedRiskSettings = mod.mergeScopedRiskSettings;
@@ -61,29 +59,24 @@ function writeUserSettingsFile(partial: Partial<AccountSettings>): string {
 }
 
 describe('migrateLegacyLiveCredentials (TRA-165)', () => {
-  it('routes a Coinbase-flavored legacy install into the crypto-scoped fields', () => {
+  it('routes a legacy install into the stocks-scoped fields regardless of brokerage flavour (coinbase arm retired, TRA-4629)', () => {
     const before: AccountSettings = {
       ...DEFAULT_ACCOUNT_SETTINGS,
       liveBrokerageType: 'coinbase',
       liveApiKey: 'coinbase-key',
       liveApiSecret: 'coinbase-secret',
       liveAccountId: '',
-      liveApiKeyCrypto: '',
-      liveApiSecretCrypto: '',
       liveApiKeyStocks: '',
       liveAccountIdStocks: '',
     };
     const { settings, migrated } = migrateLegacyLiveCredentials(before);
     expect(migrated).toBe(true);
-    expect(settings.liveApiKeyCrypto).toBe('coinbase-key');
-    expect(settings.liveApiSecretCrypto).toBe('coinbase-secret');
-    // Legacy fields cleared so the form's `scoped ?? legacy` chain cannot leak
-    // into the Stocks tab anymore.
+    expect(settings.liveApiKeyStocks).toBe('coinbase-key');
+    expect(settings.liveAccountIdStocks).toBe('');
+    // Legacy fields cleared so the form's `scoped ?? legacy` chain cannot leak.
     expect(settings.liveApiKey).toBe('');
     expect(settings.liveApiSecret).toBe('');
     expect(settings.liveAccountId).toBe('');
-    expect(settings.liveApiKeyStocks ?? '').toBe('');
-    expect(settings.liveAccountIdStocks ?? '').toBe('');
   });
 
   it('routes a Webull-flavored legacy install into the stocks-scoped fields', () => {
@@ -110,18 +103,17 @@ describe('migrateLegacyLiveCredentials (TRA-165)', () => {
   it('does not overwrite a scoped value the user has already saved', () => {
     const before: AccountSettings = {
       ...DEFAULT_ACCOUNT_SETTINGS,
-      liveBrokerageType: 'coinbase',
-      liveApiKey: 'old-coinbase-key',
-      liveApiSecret: 'old-coinbase-secret',
-      liveApiKeyCrypto: 'new-coinbase-key',
-      liveApiSecretCrypto: 'new-coinbase-secret',
+      liveApiKey: 'old-key',
+      liveAccountId: 'OLD-1',
+      liveApiKeyStocks: 'new-key',
+      liveAccountIdStocks: 'NEW-1',
     };
     const { settings, migrated } = migrateLegacyLiveCredentials(before);
     expect(migrated).toBe(true);
-    expect(settings.liveApiKeyCrypto).toBe('new-coinbase-key');
-    expect(settings.liveApiSecretCrypto).toBe('new-coinbase-secret');
+    expect(settings.liveApiKeyStocks).toBe('new-key');
+    expect(settings.liveAccountIdStocks).toBe('NEW-1');
     expect(settings.liveApiKey).toBe('');
-    expect(settings.liveApiSecret).toBe('');
+    expect(settings.liveAccountId).toBe('');
   });
 
   it('is a no-op when there are no legacy values', () => {
@@ -130,7 +122,7 @@ describe('migrateLegacyLiveCredentials (TRA-165)', () => {
       liveApiKey: '',
       liveApiSecret: '',
       liveAccountId: '',
-      liveApiKeyCrypto: 'already-scoped',
+      liveApiKeyStocks: 'already-scoped',
     };
     const { settings, migrated } = migrateLegacyLiveCredentials(before);
     expect(migrated).toBe(false);
@@ -149,137 +141,20 @@ describe('loadSettings persistence (TRA-165)', () => {
     clearSettingsCache(USER);
 
     const first = await loadSettings(USER);
-    expect(first.liveApiKeyCrypto).toBe('coinbase-key');
-    expect(first.liveApiSecretCrypto).toBe('coinbase-secret');
+    // The coinbase arm retired with the crypto engine (TRA-4629): every legacy
+    // credential now routes to the stocks-scoped fields.
+    expect(first.liveApiKeyStocks).toBe('coinbase-key');
     expect(first.liveApiKey).toBe('');
-    // Stocks tab fallback chain `scoped ?? legacy` now resolves to '', not the
-    // Coinbase key — this is the original TRA-165 reporter's symptom.
-    expect((first.liveApiKeyStocks ?? '') || (first.liveApiKey ?? '')).toBe('');
 
     const onDisk = JSON.parse(readFileSync(file, 'utf-8')) as AccountSettings;
     expect(onDisk.liveApiKey).toBe('');
     expect(onDisk.liveApiSecret).toBe('');
-    expect(onDisk.liveApiKeyCrypto).toBe('coinbase-key');
+    expect(onDisk.liveApiKeyStocks).toBe('coinbase-key');
 
     clearSettingsCache(USER);
     const second = await loadSettings(USER);
     expect(second.liveApiKey).toBe('');
-    expect(second.liveApiKeyCrypto).toBe('coinbase-key');
-  });
-});
-
-describe('migrateLegacyCryptoLiveDefault (TRA-587)', () => {
-  it('flips a legacy persisted cryptoAutoTradingEnabledLive: true to false and stamps the marker', () => {
-    const before: AccountSettings = {
-      ...DEFAULT_ACCOUNT_SETTINGS,
-      cryptoAutoTradingEnabledLive: true,
-    };
-    // markerPresentOnDisk = false → legacy file written before the marker existed.
-    const { settings, migrated } = migrateLegacyCryptoLiveDefault(before, false);
-    expect(migrated).toBe(true);
-    expect(settings.cryptoAutoTradingEnabledLive).toBe(false);
-    expect(settings.cryptoLiveDefaultMigratedTra587).toBe(true);
-  });
-
-  it('still stamps the marker (one-shot) even when crypto-live was already false', () => {
-    const before: AccountSettings = {
-      ...DEFAULT_ACCOUNT_SETTINGS,
-      cryptoAutoTradingEnabledLive: false,
-    };
-    const { settings, migrated } = migrateLegacyCryptoLiveDefault(before, false);
-    expect(migrated).toBe(true);
-    expect(settings.cryptoAutoTradingEnabledLive).toBe(false);
-    expect(settings.cryptoLiveDefaultMigratedTra587).toBe(true);
-  });
-
-  it('is a no-op once the marker is present — never re-flips a deliberate opt-in', () => {
-    const before: AccountSettings = {
-      ...DEFAULT_ACCOUNT_SETTINGS,
-      cryptoAutoTradingEnabledLive: true,
-      cryptoLiveDefaultMigratedTra587: true,
-    };
-    const { settings, migrated } = migrateLegacyCryptoLiveDefault(before, true);
-    expect(migrated).toBe(false);
-    expect(settings.cryptoAutoTradingEnabledLive).toBe(true);
-    expect(settings).toBe(before);
-  });
-});
-
-describe('loadSettings crypto-live default migration (TRA-587)', () => {
-  it('disables live crypto for a legacy file with the old true default and persists it', async () => {
-    // A pre-TRA-575 file: crypto-live ON, no migration marker. This is the
-    // TRA-587 reporter's state — switching to live trips the crypto gate.
-    const file = writeUserSettingsFile({
-      mode: 'demo',
-      cryptoAutoTradingEnabledLive: true,
-    });
-    clearSettingsCache(USER);
-
-    const first = await loadSettings(USER);
-    expect(first.cryptoAutoTradingEnabledLive).toBe(false);
-    expect(first.cryptoLiveDefaultMigratedTra587).toBe(true);
-
-    const onDisk = JSON.parse(readFileSync(file, 'utf-8')) as AccountSettings;
-    expect(onDisk.cryptoAutoTradingEnabledLive).toBe(false);
-    expect(onDisk.cryptoLiveDefaultMigratedTra587).toBe(true);
-
-    // Next read is already clean — the migration does not run twice.
-    clearSettingsCache(USER);
-    const second = await loadSettings(USER);
-    expect(second.cryptoAutoTradingEnabledLive).toBe(false);
-  });
-
-  it('preserves a deliberate live-crypto opt-in once the marker is on disk', async () => {
-    // Post-migration the user re-enabled live crypto (marker already present).
-    // A subsequent load must NOT flip it back off.
-    writeUserSettingsFile({
-      mode: 'live',
-      cryptoAutoTradingEnabledLive: true,
-      cryptoLiveDefaultMigratedTra587: true,
-    });
-    clearSettingsCache(USER);
-    const reloaded = await loadSettings(USER);
-    expect(reloaded.cryptoAutoTradingEnabledLive).toBe(true);
-  });
-});
-
-describe('liveTradeRoutingCrypto / liveMaxLeverageCrypto round-trip (TRA-249-E)', () => {
-  it('persists hybrid routing + leverage cap and re-reads them on next load', async () => {
-    const stored: AccountSettings = {
-      ...DEFAULT_ACCOUNT_SETTINGS,
-      liveTradeRoutingCrypto: 'hybrid',
-      liveMaxLeverageCrypto: 3,
-    };
-    await saveSettings(USER, stored);
-    clearSettingsCache(USER);
-    const reloaded = await loadSettings(USER);
-    expect(reloaded.liveTradeRoutingCrypto).toBe('hybrid');
-    expect(reloaded.liveMaxLeverageCrypto).toBe(3);
-  });
-
-  it('round-trips perp_only and spot_only without dropping the value', async () => {
-    for (const routing of ['perp_only', 'spot_only'] as const) {
-      const stored: AccountSettings = {
-        ...DEFAULT_ACCOUNT_SETTINGS,
-        liveTradeRoutingCrypto: routing,
-        liveMaxLeverageCrypto: 1,
-      };
-      await saveSettings(USER, stored);
-      clearSettingsCache(USER);
-      const reloaded = await loadSettings(USER);
-      expect(reloaded.liveTradeRoutingCrypto).toBe(routing);
-    }
-  });
-
-  it('falls back to hybrid + 1× when the saved file pre-dates TRA-249-E', async () => {
-    // Pre-E payload — neither field present on disk. The DEFAULT_ACCOUNT_SETTINGS
-    // merge in `loadSettings` should inject the defaults so `useSettings` reads
-    // sane values without forcing a server-side migration.
-    writeUserSettingsFile({ mode: 'live' });
-    clearSettingsCache(USER);
-    const reloaded = await loadSettings(USER);
-    expect(reloaded.liveTradeRoutingCrypto).toBe('hybrid');
-    expect(reloaded.liveMaxLeverageCrypto).toBe(1);
+    expect(second.liveApiKeyStocks).toBe('coinbase-key');
   });
 });
 
@@ -337,23 +212,19 @@ describe('clampScopedRatio / clampScopedRisk bounds (TRA-346 / TRA-349)', () => 
 });
 
 describe('mergeScopedRiskSettings — bucket isolation (TRA-346 / TRA-349)', () => {
-  it('saving only managedAccountRatioDemoCrypto leaves the other 7 scoped fields undefined', () => {
+  it('saving only managedAccountRatioDemoStocks leaves the other 3 scoped fields undefined', () => {
     // Models a fresh user with no saved scoped buckets. The PUT body sets
-    // exactly one bucket; the helper must not pin the other seven to a
+    // exactly one bucket; the helper must not pin the other three to a
     // default — that would silently disable the legacy fallback chain for
     // every other (mode × market) combo.
     const merged = mergeScopedRiskSettings(
       { ...DEFAULT_ACCOUNT_SETTINGS },
-      { managedAccountRatioDemoCrypto: 0.7 },
+      { managedAccountRatioDemoStocks: 0.7 },
     );
-    expect(merged.managedAccountRatioDemoCrypto).toBe(0.7);
-    expect(merged.managedAccountRatioDemoStocks).toBeUndefined();
+    expect(merged.managedAccountRatioDemoStocks).toBe(0.7);
     expect(merged.managedAccountRatioLiveStocks).toBeUndefined();
-    expect(merged.managedAccountRatioLiveCrypto).toBeUndefined();
     expect(merged.riskPerTradeDemoStocks).toBeUndefined();
     expect(merged.riskPerTradeLiveStocks).toBeUndefined();
-    expect(merged.riskPerTradeDemoCrypto).toBeUndefined();
-    expect(merged.riskPerTradeLiveCrypto).toBeUndefined();
   });
 
   it('does not touch the legacy managedAccountRatio / riskPerTrade fields', () => {
@@ -363,7 +234,7 @@ describe('mergeScopedRiskSettings — bucket isolation (TRA-346 / TRA-349)', () 
     // accidentally start emitting them.
     const merged = mergeScopedRiskSettings(
       { ...DEFAULT_ACCOUNT_SETTINGS, managedAccountRatio: 0.5, riskPerTrade: 0.01 },
-      { managedAccountRatioDemoCrypto: 0.7 },
+      { managedAccountRatioDemoStocks: 0.7 },
     );
     expect(merged).not.toHaveProperty('managedAccountRatio');
     expect(merged).not.toHaveProperty('riskPerTrade');
@@ -377,45 +248,36 @@ describe('mergeScopedRiskSettings — bucket isolation (TRA-346 / TRA-349)', () 
       {
         managedAccountRatioDemoStocks: 5,
         managedAccountRatioLiveStocks: 5,
-        managedAccountRatioDemoCrypto: 5,
-        managedAccountRatioLiveCrypto: 5,
         riskPerTradeDemoStocks: 5,
         riskPerTradeLiveStocks: 5,
-        riskPerTradeDemoCrypto: 5,
-        riskPerTradeLiveCrypto: 5,
       },
     );
     expect(merged.managedAccountRatioDemoStocks).toBe(1);
     expect(merged.managedAccountRatioLiveStocks).toBe(1);
-    expect(merged.managedAccountRatioDemoCrypto).toBe(1);
-    expect(merged.managedAccountRatioLiveCrypto).toBe(1);
     expect(merged.riskPerTradeDemoStocks).toBe(0.5);
     expect(merged.riskPerTradeLiveStocks).toBe(0.5);
-    expect(merged.riskPerTradeDemoCrypto).toBe(0.5);
-    expect(merged.riskPerTradeLiveCrypto).toBe(0.5);
   });
 
   it('preserves saved buckets that the body omits — partial saves are non-destructive', () => {
-    // User has a previously saved live-crypto override; the next save touches
-    // demo-stocks only. Live-crypto must still round-trip its saved value so
+    // User has a previously saved live-stocks override; the next save touches
+    // demo-stocks only. Live-stocks must still round-trip its saved value so
     // the legacy fallback chain keeps reporting the right size at order time.
     const merged = mergeScopedRiskSettings(
       {
         ...DEFAULT_ACCOUNT_SETTINGS,
-        managedAccountRatioLiveCrypto: 0.9,
-        riskPerTradeLiveCrypto: 0.04,
+        managedAccountRatioLiveStocks: 0.9,
+        riskPerTradeLiveStocks: 0.04,
       },
       { managedAccountRatioDemoStocks: 0.2 },
     );
     expect(merged.managedAccountRatioDemoStocks).toBe(0.2);
-    expect(merged.managedAccountRatioLiveCrypto).toBe(0.9);
-    expect(merged.riskPerTradeLiveCrypto).toBe(0.04);
+    expect(merged.managedAccountRatioLiveStocks).toBe(0.9);
+    expect(merged.riskPerTradeLiveStocks).toBe(0.04);
     // Buckets that have neither a body value nor a saved value stay undefined.
-    expect(merged.managedAccountRatioLiveStocks).toBeUndefined();
     expect(merged.riskPerTradeDemoStocks).toBeUndefined();
   });
 
-  it('round-trips a save that scopes all four crypto+stocks ratio buckets at once', () => {
+  it('round-trips a save that scopes all four stocks buckets at once', () => {
     // End-to-end shape of a power user who's filled in every scoped field —
     // verifies each bucket lands on the bucket the resolver will read,
     // independently clamped.
@@ -424,23 +286,15 @@ describe('mergeScopedRiskSettings — bucket isolation (TRA-346 / TRA-349)', () 
       {
         managedAccountRatioDemoStocks: 0.10,
         managedAccountRatioLiveStocks: 0.20,
-        managedAccountRatioDemoCrypto: 0.30,
-        managedAccountRatioLiveCrypto: 0.40,
         riskPerTradeDemoStocks: 0.001,
         riskPerTradeLiveStocks: 0.002,
-        riskPerTradeDemoCrypto: 0.005,
-        riskPerTradeLiveCrypto: 0.01,
       },
     );
     expect(merged).toEqual({
       managedAccountRatioDemoStocks: 0.10,
       managedAccountRatioLiveStocks: 0.20,
-      managedAccountRatioDemoCrypto: 0.30,
-      managedAccountRatioLiveCrypto: 0.40,
       riskPerTradeDemoStocks: 0.001,
       riskPerTradeLiveStocks: 0.002,
-      riskPerTradeDemoCrypto: 0.005,
-      riskPerTradeLiveCrypto: 0.01,
     });
   });
 });

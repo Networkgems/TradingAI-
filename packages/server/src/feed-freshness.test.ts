@@ -1,16 +1,14 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { Candle, CryptoSymbolState } from '@trading-app/shared';
+import { describe, it, expect } from 'vitest';
+import type { Candle } from '@trading-app/shared';
 
 import {
   evaluateFeedFreshness,
   latestCandleTimestamp,
   MAX_QUOTE_AGE_MS,
   MAX_CANDLE_AGE_MS,
-  CRYPTO_FEED_FAILOVER_ORDER,
   EQUITY_QUOTE_FAILOVER_ORDER,
   EQUITY_CANDLE_FAILOVER_ORDER,
 } from './feed-freshness.js';
-import { CryptoSignalEngine } from './crypto-engine.js';
 
 // TRA-418 — data-feed freshness gating + ordered failover (TRA-408 review §5).
 //
@@ -96,10 +94,6 @@ describe('evaluateFeedFreshness — freshness gate decision (TRA-418)', () => {
 });
 
 describe('feed failover order constants (TRA-418)', () => {
-  it('crypto fails over coinbase → yahoo → cmc', () => {
-    expect(CRYPTO_FEED_FAILOVER_ORDER).toEqual(['coinbase', 'yahoo', 'cmc']);
-  });
-
   it('equity quotes fail over tradier → yahoo → yahooChart → stooq', () => {
     expect(EQUITY_QUOTE_FAILOVER_ORDER).toEqual(['tradier', 'yahoo', 'yahooChart', 'stooq']);
   });
@@ -107,69 +101,5 @@ describe('feed failover order constants (TRA-418)', () => {
   it('equity candles fail over tradier → yahoo → twelvedata (no stooq — EOD only)', () => {
     expect(EQUITY_CANDLE_FAILOVER_ORDER).toEqual(['tradier', 'yahoo', 'twelvedata']);
     expect(EQUITY_CANDLE_FAILOVER_ORDER).not.toContain('stooq');
-  });
-});
-
-// ── Engine-level gate wiring ─────────────────────────────────────────────────
-// Acceptance: "Symbols whose feed is stale beyond the threshold do not produce
-// signals." `markStaleSymbols` is the private gate the demo + live tick loops
-// call before strategy evaluation; we exercise it directly via a typed cast.
-interface CryptoEngineGateInternals {
-  symbolState: Map<string, CryptoSymbolState>;
-  candleCache: Map<string, Candle[]>;
-  markStaleSymbols: (symbols: readonly string[]) => Set<string>;
-}
-
-describe('CryptoSignalEngine.markStaleSymbols — engine freshness gate (TRA-418)', () => {
-  beforeEach(() => {
-    vi.spyOn(console, 'log').mockImplementation(() => {});
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
-  });
-
-  function freshCandles(now: number): Candle[] {
-    return [candle(now - 180_000), candle(now - 120_000), candle(now - 60_000)];
-  }
-
-  it('excludes a symbol whose quote has gone stale and marks quoteStatus=stale', () => {
-    const engine = new CryptoSignalEngine() as unknown as CryptoEngineGateInternals;
-    const now = Date.now();
-    // FRESH-USD: quote + candles current → still evaluated.
-    engine.symbolState.set('FRESH-USD', {
-      symbol: 'FRESH-USD', price: 1, volume: 0, change: 0, changePct: 0,
-      lastUpdated: now - 10_000, quoteStatus: 'ok',
-    });
-    engine.candleCache.set('FRESH-USD', freshCandles(now));
-    // STALE-USD: quote last updated well past the threshold (feed down).
-    engine.symbolState.set('STALE-USD', {
-      symbol: 'STALE-USD', price: 2, volume: 0, change: 0, changePct: 0,
-      lastUpdated: now - (MAX_QUOTE_AGE_MS + 120_000), quoteStatus: 'ok',
-    });
-    engine.candleCache.set('STALE-USD', freshCandles(now));
-
-    const stale = engine.markStaleSymbols(['FRESH-USD', 'STALE-USD']);
-
-    expect(stale.has('STALE-USD')).toBe(true);
-    expect(stale.has('FRESH-USD')).toBe(false);
-    // The stale symbol is marked so the watchlist UI surfaces the degraded feed.
-    expect(engine.symbolState.get('STALE-USD')?.quoteStatus).toBe('stale');
-    expect(engine.symbolState.get('FRESH-USD')?.quoteStatus).toBe('ok');
-    // Last known price is preserved under the stale badge — no Loading… reset.
-    expect(engine.symbolState.get('STALE-USD')?.price).toBe(2);
-  });
-
-  it('excludes a symbol whose candle cache has gone stale even when the quote is fresh', () => {
-    const engine = new CryptoSignalEngine() as unknown as CryptoEngineGateInternals;
-    const now = Date.now();
-    engine.symbolState.set('BTC-USD', {
-      symbol: 'BTC-USD', price: 50_000, volume: 0, change: 0, changePct: 0,
-      lastUpdated: now - 5_000, quoteStatus: 'ok',
-    });
-    // Candle feed died: the latest bar is far past the candle threshold.
-    engine.candleCache.set('BTC-USD', [candle(now - (MAX_CANDLE_AGE_MS + 600_000))]);
-
-    const stale = engine.markStaleSymbols(['BTC-USD']);
-
-    expect(stale.has('BTC-USD')).toBe(true);
-    expect(engine.symbolState.get('BTC-USD')?.quoteStatus).toBe('stale');
   });
 });

@@ -11,7 +11,7 @@ export interface SymbolState {
   // TRA-2610 — FRESHNESS / AVAILABILITY ONLY. `'suspect'` was removed from this
   // union; plausibility is `moveSuspect` below. One field could not hold both facts
   // — `'unavailable'` overwrote `'suspect'` and a fabricated move reached #1.
-  // TRA-418 — `'stale'` was already emitted by the crypto path and was missing from
+  // TRA-418 — `'stale'` was already emitted elsewhere and was missing from
   // this copy of the union; added while I was here.
   quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' | 'stale';
   // TRA-2610 — the price is live but the published session move is not believable

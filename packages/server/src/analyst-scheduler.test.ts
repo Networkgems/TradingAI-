@@ -6,16 +6,6 @@ import {
   DEFAULT_ANALYST_TUNABLES,
   PRODUCTION_OPTION_STRUCTURES,
 } from './analyst-scheduler.js';
-import { RV_CRYPTO_MAJORS_BASE_CONFIG } from './backtest-executor.js';
-
-function numberAtPath(cfg: Record<string, unknown>, path: string): number | null {
-  let node: unknown = cfg;
-  for (const seg of path.split('.')) {
-    if (node == null || typeof node !== 'object') return null;
-    node = (node as Record<string, unknown>)[seg];
-  }
-  return typeof node === 'number' && Number.isFinite(node) ? node : null;
-}
 
 describe('analyst-scheduler flag gate', () => {
   it('pre-market tick no-ops with the flag OFF and builds NO deps (zero cost)', async () => {
@@ -42,17 +32,14 @@ describe('analyst-scheduler flag gate', () => {
 
   // TRA-1006 — vocabulary-drift guard (requested at QuantTrader sign-off). Catches
   // a tunable keyed to a setup-type that production never emits (which would
-  // silently degrade that setup to the R3 no-op), and a path that doesn't resolve
-  // in the base config (which the pipeline would reject at apply time).
-  it('every default tunable key is a real production structure and resolves to a finite config leaf', () => {
+  // silently degrade that setup to the R3 no-op). The path-resolution half of
+  // this guard retired with the RV crypto-majors base config (TRA-4629): the
+  // pipeline now runs on EMPTY_BASE_CONFIG, so no path can resolve by design.
+  it('every default tunable key is a real production structure', () => {
     expect(DEFAULT_ANALYST_TUNABLES.length).toBeGreaterThan(0);
     const vocab = new Set<string>(PRODUCTION_OPTION_STRUCTURES);
     for (const t of DEFAULT_ANALYST_TUNABLES) {
       expect(vocab.has(t.key), `tunable key "${t.key}" not in production structure vocabulary`).toBe(true);
-      expect(
-        numberAtPath(RV_CRYPTO_MAJORS_BASE_CONFIG as Record<string, unknown>, t.path),
-        `tunable path "${t.path}" does not resolve to a finite number`,
-      ).not.toBeNull();
     }
   });
 

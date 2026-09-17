@@ -9,42 +9,29 @@
 import type { AccountSettings, LiveCredentialField } from '@trading-app/shared';
 import { findMissingLiveCredentials } from '@trading-app/shared';
 
-const FIELD_LABELS: Record<LiveCredentialField, string> = {
+// TRA-4629 — the shared LiveCredentialField union still carries the retired
+// Coinbase fields until their backend removal lands; this map deliberately
+// labels only the Tradier fields, and the filter below drops anything else so
+// a retired field can never surface here.
+const FIELD_LABELS: Partial<Record<LiveCredentialField, string>> = {
   liveApiKeyOptionsProduction: 'Tradier production API token',
   liveAccountIdOptionsProduction: 'Tradier production account ID',
   liveApiKeyOptionsSandbox: 'Tradier sandbox API token',
   liveAccountIdOptionsSandbox: 'Tradier sandbox account ID',
-  liveApiKeyCrypto: 'Coinbase API key',
-  liveApiSecretCrypto: 'Coinbase API secret',
 };
-
-// TRA-798 — the Coinbase (crypto) credential fields. Used to scope the banner
-// to its host dashboard so the crypto "missing API key" warning shows on the
-// Crypto dashboard and the Tradier/options warning shows on the Stocks
-// dashboard, instead of every page surfacing every market's missing creds.
-const CRYPTO_FIELDS: readonly LiveCredentialField[] = [
-  'liveApiKeyCrypto',
-  'liveApiSecretCrypto',
-];
 
 interface Props {
   settings: AccountSettings | null;
   onOpenSettings: (focusField: LiveCredentialField) => void;
-  // TRA-798 — restrict the banner to one market's credentials. 'crypto' shows
-  // only Coinbase fields; 'stocks' shows everything else (Tradier). Omit to
-  // show all missing creds (legacy behaviour).
-  market?: 'stocks' | 'crypto';
+  // TRA-798 — restrict the banner to one market's credentials. Since
+  // TRA-4629, 'stocks' (Tradier) is the only market.
+  market?: 'stocks';
 }
 
-export function LiveCredentialsBanner({ settings, onOpenSettings, market }: Props) {
+export function LiveCredentialsBanner({ settings, onOpenSettings }: Props) {
   if (!settings || settings.mode !== 'live') return null;
-  const allMissing = findMissingLiveCredentials(settings);
-  const missing =
-    market === 'crypto'
-      ? allMissing.filter(f => CRYPTO_FIELDS.includes(f))
-      : market === 'stocks'
-        ? allMissing.filter(f => !CRYPTO_FIELDS.includes(f))
-        : allMissing;
+  const missing = findMissingLiveCredentials(settings)
+    .filter(f => FIELD_LABELS[f] !== undefined);
   if (missing.length === 0) return null;
   const firstMissing = missing[0]!;
   return (

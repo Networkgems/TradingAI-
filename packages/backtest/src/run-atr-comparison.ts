@@ -3,11 +3,11 @@
  *
  * Runs each strategy twice (once with the ATR-adaptive stop/target enabled,
  * once forced onto the legacy fixed-pct or structural path) over a synthetic
- * equity scenario and a synthetic crypto scenario, and prints which variant
+ * equity scenario and a synthetic 24/7 scenario, and prints which variant
  * wins per asset class.
  *
  *   Equity scenario: ranging+trending mixed 1-min SPY candles.
- *   Crypto scenario: 90-day rolling 1h BTC-USD with 4 regime segments.
+ *   24/7 scenario: 90-day rolling 1h synthetic `*-USD` tape with 4 regime segments.
  *
  * Run with:
  *   pnpm --filter @trading-app/backtest exec tsx src/run-atr-comparison.ts
@@ -78,9 +78,9 @@ const ASSETS: AssetClass[] = [
     candles: mixedRegimeCandles(800, 'SPY', 450, 13),
   },
   {
-    label: 'Crypto (BTC-USD synthetic, 1h)',
-    symbol: 'BTC-USD',
-    candles: syntheticCryptoSeries(90, 'BTC-USD', 30_000, 60, 31),
+    label: '24/7 (SYN-USD synthetic, 1h)',
+    symbol: 'SYN-USD',
+    candles: syntheticCryptoSeries(90, 'SYN-USD', 30_000, 60, 31),
   },
 ];
 
@@ -99,7 +99,7 @@ function pad(s: string, n: number): string {
 async function runOne(asset: AssetClass, variant: Variant, strategy: BacktestConfig['strategyType']): Promise<BacktestResult> {
   const start = asset.candles[0].timestamp;
   const end = asset.candles[asset.candles.length - 1].timestamp;
-  const isCrypto = /-USD$/i.test(asset.symbol);
+  const is247 = /-USD$/i.test(asset.symbol);
   return runner.run(
     {
       symbol: asset.symbol,
@@ -107,8 +107,8 @@ async function runOne(asset: AssetClass, variant: Variant, strategy: BacktestCon
       endDate: end,
       initialEquity: INITIAL_EQUITY,
       strategyType: strategy,
-      reversalOpts: { ...variant.reversal, enforceTimeFilter: !isCrypto },
-      macdBollingerOpts: { ...variant.macd, enforceTimeFilter: !isCrypto },
+      reversalOpts: { ...variant.reversal, enforceTimeFilter: !is247 },
+      macdBollingerOpts: { ...variant.macd, enforceTimeFilter: !is247 },
       scalpingOpts: { ...variant.scalping, enforceTimeFilter: false },
       swingOpts: variant.swing,
     },

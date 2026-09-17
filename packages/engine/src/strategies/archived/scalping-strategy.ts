@@ -1,14 +1,14 @@
 /*
  * DORMANT / ARCHIVED — TRA-816 (TRA-814 workstream B cleanup).
  * OOS-failed roster: 0 of 10 keeper-gate pools passed after costs (TRA-306, TRA-523).
- * NOT wired into the live or demo crypto router — no selectable strategy preset
+ * NOT wired into any live or demo router — no selectable strategy preset
  * enables it (packages/shared STRATEGY_PRESETS is DCA-only; live = no_trade).
  * Kept here for research history; still reachable via the @trading-app/engine
  * public API only for the backtest harnesses. Do NOT re-wire into a live/demo
  * path until it clears the TRA-814 §4-C OOS keeper gate. See /TRA/issues/TRA-816.
  */
 
-import { Candle, TradeSignal, Side, isValidCryptoTradingWindow } from '@trading-app/shared';
+import { Candle, TradeSignal, Side, isValidTradingWindow } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
 import { emaCross } from '../../indicators/ema.js';
 import { rsi } from '../../indicators/rsi.js';
@@ -40,7 +40,7 @@ export interface ScalpingOptions {
   stopPct?: number;
   /** Risk-reward ratio for take-profit (default: 2) */
   rrRatio?: number;
-  /** Set false for 24/7 crypto markets (default: false) */
+  /** Set true to gate entries to the standard equity trading windows (default: false) */
   enforceTimeFilter?: boolean;
   /**
    * ATR lookback period (default: 14). Used for both the ATR-based stop and
@@ -116,7 +116,7 @@ export class ScalpingStrategy {
     if (candles.length < minBars) return null;
 
     const latest = candles[candles.length - 1];
-    if (this.enforceTimeFilter && !isValidCryptoTradingWindow(latest.timestamp)) return null;
+    if (this.enforceTimeFilter && !isValidTradingWindow(latest.timestamp)) return null;
 
     const closes = candles.map(c => c.close);
 

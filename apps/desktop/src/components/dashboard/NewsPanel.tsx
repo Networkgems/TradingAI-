@@ -1,6 +1,5 @@
-// TRA-422 — the News tab body, extracted from Dashboard.tsx / CryptoDashboard.tsx
-// (both rendered the same NewsCard list). The two dashboards differ only in the
-// "loading" copy, so that is a prop.
+// TRA-422 — the News tab body, extracted from Dashboard.tsx (a NewsCard list).
+// The "loading" copy is a prop.
 import type { NewsItem } from '@trading-app/shared';
 import { NewsCard } from '../NewsCard';
 

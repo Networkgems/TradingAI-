@@ -23,7 +23,7 @@
  *                     today's. Restored from the snapshot across restarts
  *                     (`signal-engine.ts` `recentSignals`), so a redeploy does
  *                     not even reset it.
- *   4. Positions    — the open book: stocks + crypto spot/perp positions plus
+ *   4. Positions    — the open book: stock positions plus
  *                     open option legs.
  *   5. Overnight news — the headlines cached on each engine's last news refresh.
  *                     TRA-4303 measured this: `doTick` runs off-hours (only the
@@ -422,15 +422,14 @@ function toSetup(s: {
   };
 }
 
-/** Map an equity/crypto spot/perp position onto a brief position row. */
-function toPosition(p: Position, market: 'stocks' | 'crypto'): BriefPosition {
+/** Map an equity position onto a brief position row. */
+function toPosition(p: Position, market: 'stocks'): BriefPosition {
   return {
     symbol: p.symbol,
     market,
     side: p.side,
     quantity: p.quantity,
     entryPrice: p.entryPrice,
-    ...(p.productType === 'perp' ? { detail: 'perp' } : {}),
   };
 }
 
@@ -490,25 +489,23 @@ export function buildBriefForUser(
   overnight?: BriefOvernightSection,
 ): BriefingAlertEvent {
   const stocks = ctx.engine.getState();
-  const crypto = ctx.cryptoEngine.getState();
 
   // TRA-4303 — the PRIOR session's signals, not today's. `recentSignals` grows
   // only when a bar evaluates and no bar evaluates overnight; the renderer
   // labels it honestly. The overnight read is `overnight`, threaded below.
-  const setups = [...stocks.signals, ...crypto.signals]
+  const setups = [...stocks.signals]
     .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0))
     .slice(0, MAX_SETUPS)
     .map(toSetup);
 
-  // Positions — stocks + crypto spot/perp + open option legs.
+  // Positions — stocks + open option legs.
   const positions: BriefPosition[] = [
     ...stocks.account.openPositions.map((p) => toPosition(p, 'stocks')),
-    ...crypto.account.openPositions.map((p) => toPosition(p, 'crypto')),
     ...stocks.options.openOptions.map(toOptionPosition),
   ].slice(0, MAX_POSITIONS);
 
   // News — cached on each engine's last refresh; no fresh network fetch.
-  const news = toHeadlines([...ctx.engine.getNews(), ...ctx.cryptoEngine.getNews()]);
+  const news = toHeadlines([...ctx.engine.getNews()]);
 
   return {
     kind: 'briefing',

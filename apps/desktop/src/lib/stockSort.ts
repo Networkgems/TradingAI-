@@ -8,9 +8,8 @@ import type { SymbolState } from '../types/app';
 import { isQuoteMoveUnreliable } from './format';
 import { closeRejectLatch } from './optionRowState';
 
-// TRA-339 — Stock-dashboard sort keys mirror the Crypto set, minus the
-// perp-only leverage / liquidation columns (Stocks have no perps), and
-// add Open / Closed Options tables.
+// TRA-339 — Stock-dashboard sort keys, including the Open / Closed Options
+// tables.
 export type StockWatchSortKey =
   | 'symbol' | 'price' | 'change' | 'changePct' | 'volume' | 'updated';
 export type StockOpenPosSortKey =

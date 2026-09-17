@@ -97,7 +97,7 @@ function ProposalsCard({ p }: { p: ProposalsScorecard }) {
   if (!p.available) {
     return (
       <div className="health-panel">
-        <div className="health-panel-head">Proposals · equity/crypto (OOS A/B)</div>
+        <div className="health-panel-head">Proposals · equity (OOS A/B)</div>
         <div className="health-panel-body">
           <p className="muted" style={{ fontSize: '0.85em' }}>{p.source}</p>
         </div>
@@ -109,7 +109,7 @@ function ProposalsCard({ p }: { p: ProposalsScorecard }) {
     : p.edgeVsBaseline.avgRDelta > 0 ? 'ok' : 'bad';
   return (
     <div className="health-panel">
-      <div className="health-panel-head">Proposals · equity/crypto (OOS A/B)</div>
+      <div className="health-panel-head">Proposals · equity (OOS A/B)</div>
       <div className="health-panel-body">
         <Row label="Sample (routable trades)" value={<SampleBadge s={p.sample} />} />
         <Row label="Agent win-rate" value={pct(p.agent.winRate)} />

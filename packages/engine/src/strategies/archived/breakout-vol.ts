@@ -1,7 +1,7 @@
 /*
  * DORMANT / ARCHIVED — TRA-816 (TRA-814 workstream B cleanup).
  * OOS-failed roster: 0 of 10 keeper-gate pools passed after costs (TRA-306, TRA-523).
- * NOT wired into the live or demo crypto router — no selectable strategy preset
+ * NOT wired into any live or demo router — no selectable strategy preset
  * enables it (packages/shared STRATEGY_PRESETS is DCA-only; live = no_trade).
  * Kept here for research history; still reachable via the @trading-app/engine
  * public API only for the backtest harnesses. Do NOT re-wire into a live/demo
@@ -45,7 +45,7 @@ export interface BreakoutVolOptions {
   /**
    * TRA-261 — per-side parameter overrides. Long-side fields stay byte-
    * identical to the TRA-207 spec values; short-side fields layer on top of
-   * the resolved options ONLY when emitting a short. Used by the crypto
+   * the resolved options ONLY when emitting a short. Used by the
    * perp shorts spec (TRA-255 §4) so short entries pull a tighter stop ATR
    * multiplier and a volume-confirmation bump without conditional drift in
    * the long path. Omit either field to keep that direction's values at the
@@ -88,8 +88,8 @@ export interface BreakoutVolOptions {
  *   - Take-profit = `atrTpMultiplier × ATR(atrPeriod)`.
  *   - Trailing (BE after +2·ATR, then 2·ATR trail) and the 15-bar time stop
  *     from spec §4 are runner / position-manager responsibilities — see the
- *     same split-of-concerns used by `MomentumStrategy` and
- *     `MeanReversionCryptoStrategy`. `evaluate()` only emits the entry.
+ *     same split-of-concerns used by `MomentumStrategy`.
+ *     `evaluate()` only emits the entry.
  */
 interface ResolvedBreakoutOptions {
   consolidationBars: number;

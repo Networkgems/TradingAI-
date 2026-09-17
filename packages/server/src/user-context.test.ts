@@ -14,13 +14,9 @@ type UsersModule = typeof import('./users.js');
 
 let saveStocksTradeSnapshot: TradeStoreModule['saveStocksTradeSnapshot'];
 let loadStocksTradeSnapshot: TradeStoreModule['loadStocksTradeSnapshot'];
-let saveCryptoTradeSnapshot: TradeStoreModule['saveCryptoTradeSnapshot'];
-let loadCryptoTradeSnapshot: TradeStoreModule['loadCryptoTradeSnapshot'];
 let runTra237OptionsReset: UserContextModule['runTra237OptionsReset'];
 let runTra301DemoFreshStart: UserContextModule['runTra301DemoFreshStart'];
-let runTra338MegaUsdCleanup: UserContextModule['runTra338MegaUsdCleanup'];
 let stockModeKey: UserContextModule['stockModeKey'];
-let cryptoModeKey: UserContextModule['cryptoModeKey'];
 
 beforeAll(async () => {
   // Seed a users.json so getAllUsers() returns the test user. users.ts reads a
@@ -35,14 +31,10 @@ beforeAll(async () => {
   const tradeStore = await import('./trade-store.js');
   saveStocksTradeSnapshot = tradeStore.saveStocksTradeSnapshot;
   loadStocksTradeSnapshot = tradeStore.loadStocksTradeSnapshot;
-  saveCryptoTradeSnapshot = tradeStore.saveCryptoTradeSnapshot;
-  loadCryptoTradeSnapshot = tradeStore.loadCryptoTradeSnapshot;
   const userCtx = await import('./user-context.js');
   runTra237OptionsReset = userCtx.runTra237OptionsReset;
   runTra301DemoFreshStart = userCtx.runTra301DemoFreshStart;
-  runTra338MegaUsdCleanup = userCtx.runTra338MegaUsdCleanup;
   stockModeKey = userCtx.stockModeKey;
-  cryptoModeKey = userCtx.cryptoModeKey;
   // Populate the in-memory users cache from the seeded users.json.
   const users = (await import('./users.js')) as UsersModule;
   await users.loadUsers();
@@ -178,7 +170,7 @@ describe('runTra237OptionsReset — one-shot options bucket cleanup', () => {
 // Tradier env. `mode === 'live'` flips to sandbox/live based on
 // `liveTradierEnvOptions` so demo / sandbox / production each keep their own
 // calendar history.
-describe('stockModeKey / cryptoModeKey — TRA-244 per-account calendar buckets', () => {
+describe('stockModeKey — TRA-244 per-account calendar buckets', () => {
   type Settings = Parameters<typeof stockModeKey>[0];
   function settings(overrides: Partial<Settings> = {}): Settings {
     return { mode: 'demo', ...overrides } as Settings;
@@ -189,7 +181,6 @@ describe('stockModeKey / cryptoModeKey — TRA-244 per-account calendar buckets'
       .toBe('demo');
     expect(stockModeKey(settings({ mode: 'demo', liveTradierEnvOptions: 'sandbox' })))
       .toBe('demo');
-    expect(cryptoModeKey(settings({ mode: 'demo' }))).toBe('demo');
   });
 
   it('live + production Tradier env returns "live"', () => {
@@ -206,10 +197,6 @@ describe('stockModeKey / cryptoModeKey — TRA-244 per-account calendar buckets'
     expect(stockModeKey(settings({ mode: 'live' }))).toBe('sandbox');
   });
 
-  it('cryptoModeKey is binary: live → live, anything else → demo', () => {
-    expect(cryptoModeKey(settings({ mode: 'live' }))).toBe('live');
-    expect(cryptoModeKey(settings({ mode: 'demo' }))).toBe('demo');
-  });
 });
 
 describe('runTra301DemoFreshStart — full demo fresh-start wipe', () => {
@@ -218,31 +205,24 @@ describe('runTra301DemoFreshStart — full demo fresh-start wipe', () => {
     reportSubdirFiles: string[];
   } {
     const userDir = join(TMP_ROOT, 'users', 'alice');
-    const cryptoDir = join(userDir, 'crypto');
-    mkdirSync(cryptoDir, { recursive: true });
+    mkdirSync(userDir, { recursive: true });
     const files = [
       join(userDir, 'daily-snapshots.json'),
       join(userDir, 'equity-state.json'),
       join(userDir, 'trades-stocks.json'),
-      join(userDir, 'trades-crypto.json'),
-      join(cryptoDir, 'daily-snapshots.json'),
-      join(cryptoDir, 'equity-state.json'),
     ];
     for (const f of files) writeFileSync(f, '{}', 'utf-8');
     // Drop both legacy unscoped files and TRA-244 per-mode subdir files so
     // the recursive cleanup is exercised end-to-end.
     const reportsDemo = join(userDir, 'reports', 'demo');
     const reportsLive = join(userDir, 'reports', 'live');
-    const cryptoReportsDemo = join(userDir, 'crypto-reports', 'demo');
     mkdirSync(reportsDemo, { recursive: true });
     mkdirSync(reportsLive, { recursive: true });
-    mkdirSync(cryptoReportsDemo, { recursive: true });
     const reportSubdirFiles = [
       join(userDir, 'reports', 'legacy.json'),
       join(reportsDemo, '2026-04-30.json'),
       join(reportsDemo, '2026-04-30.md'),
       join(reportsLive, '2026-04-30.json'),
-      join(cryptoReportsDemo, '2026-05-01.json'),
     ];
     for (const f of reportSubdirFiles) writeFileSync(f, 'placeholder', 'utf-8');
     // A non-{json,md} file must be left alone — the cleanup is conservative
@@ -290,91 +270,3 @@ describe('runTra301DemoFreshStart — full demo fresh-start wipe', () => {
   });
 });
 
-describe('runTra338MegaUsdCleanup — phantom MEGA-USD position cleanup', () => {
-  function makeCryptoSnapWithGhost() {
-    return {
-      version: 1 as const,
-      savedAt: '',
-      openPositions: [
-        // The phantom: Yahoo's frozen $4.04945 quote × 26.1 ≈ $105.71 cost
-        // basis from TRA-337. Refund to cash on cleanup.
-        {
-          id: 'mega-1',
-          symbol: 'MEGA-USD',
-          side: 'buy' as const,
-          signalType: 'bb_fade' as const,
-          entryPrice: 4.04945,
-          quantity: 26.1,
-          stopLoss: 3.5,
-          takeProfit: 5,
-          openedAt: 1700000000000,
-        },
-        // Unrelated open position — must survive the cleanup untouched.
-        {
-          id: 'btc-1',
-          symbol: 'BTC-USD',
-          side: 'buy' as const,
-          signalType: 'macd_trend' as const,
-          entryPrice: 60_000,
-          quantity: 0.05,
-          stopLoss: 59_000,
-          takeProfit: 62_000,
-          openedAt: 1700000000000,
-        },
-      ],
-      closedPositions: [],
-      recentSignals: [],
-      account: {
-        cash: 18_000,
-        equity: 25_000,
-        initialEquity: 25_000,
-        openingEquityToday: 25_000,
-      },
-    };
-  }
-
-  it('expunges open MEGA-USD positions and refunds cost basis to cash', async () => {
-    await saveCryptoTradeSnapshot('alice', makeCryptoSnapWithGhost());
-
-    await runTra338MegaUsdCleanup();
-
-    const after = await loadCryptoTradeSnapshot('alice');
-    expect(after).not.toBeNull();
-    // Phantom is gone, the unrelated BTC-USD position survives.
-    expect(after!.openPositions.find(p => p.symbol === 'MEGA-USD')).toBeUndefined();
-    expect(after!.openPositions.find(p => p.symbol === 'BTC-USD')).toBeDefined();
-    // Cash refunded by entryPrice × quantity (4.04945 × 26.1 ≈ 105.6907).
-    expect(after!.account.cash).toBeCloseTo(18_000 + 4.04945 * 26.1, 4);
-    // Equity not touched — engine reconciles equity from cash + MTM on next tick.
-    expect(after!.account.equity).toBe(25_000);
-    expect(existsSync(join(TMP_ROOT, '.tra-338-mega-usd-cleanup'))).toBe(true);
-  });
-
-  it('is idempotent — second run is a no-op once the marker exists', async () => {
-    await saveCryptoTradeSnapshot('alice', makeCryptoSnapWithGhost());
-    await runTra338MegaUsdCleanup();
-    // Re-introduce a phantom and confirm a second run does not touch it.
-    await saveCryptoTradeSnapshot('alice', makeCryptoSnapWithGhost());
-    await runTra338MegaUsdCleanup();
-    const after = await loadCryptoTradeSnapshot('alice');
-    expect(after!.openPositions.find(p => p.symbol === 'MEGA-USD')).toBeDefined();
-  });
-
-  it('handles users without a crypto snapshot gracefully (no throw, marker still written)', async () => {
-    expect(existsSync(join(TMP_ROOT, '.tra-338-mega-usd-cleanup'))).toBe(false);
-    await runTra338MegaUsdCleanup();
-    expect(existsSync(join(TMP_ROOT, '.tra-338-mega-usd-cleanup'))).toBe(true);
-  });
-
-  it('does nothing when the snapshot has no MEGA-USD position', async () => {
-    const clean = makeCryptoSnapWithGhost();
-    clean.openPositions = clean.openPositions.filter(p => p.symbol !== 'MEGA-USD');
-    await saveCryptoTradeSnapshot('alice', clean);
-
-    await runTra338MegaUsdCleanup();
-
-    const after = await loadCryptoTradeSnapshot('alice');
-    expect(after!.account.cash).toBe(18_000);
-    expect(after!.openPositions).toHaveLength(1);
-  });
-});

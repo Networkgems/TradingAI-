@@ -74,7 +74,7 @@ export function AccountModeSwitcher({
    */
   liveBrokerArmPinned?: boolean;
   onChange: (mode: AccountMode) => void;
-  market: 'stocks' | 'crypto';
+  market: 'stocks';
   token: string;
 }) {
   const [busy, setBusy] = useState(false);
@@ -133,7 +133,7 @@ export function AccountModeSwitcher({
       const alreadyAcknowledged = localStorage.getItem(ackKey) === 'true';
       if (!alreadyAcknowledged) {
         const ok = window.confirm(
-          `Switch ${market === 'crypto' ? 'Crypto' : 'Stocks'} dashboard to LIVE account?\n\n` +
+          'Switch Stocks dashboard to LIVE account?\n\n' +
           'Live mode places real orders against your configured brokerage. ' +
           'Make sure your live credentials are set up in Settings.',
         );

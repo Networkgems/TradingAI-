@@ -14,15 +14,11 @@ import type {
   AccountSettings,
   BrokerageType,
   LiveTradierMarkets,
-  StrategyPreset,
-  StrategyPresetId,
   TradierEnv,
 } from '@trading-app/shared';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
-  DEFAULT_STRATEGY_PRESET_ID,
   HARD_MAX_RISK_PER_TRADE,
-  STRATEGY_PRESETS,
   managedAccountRatioField,
   resolveLiveTradeEquitiesTradier,
   resolveManagedAccountRatio,
@@ -31,25 +27,10 @@ import {
 } from '@trading-app/shared';
 import { MIN_PASSWORD_LENGTH } from './password-policy';
 
-type Market = 'crypto' | 'stocks';
+type Market = 'stocks';
 
-// Live credentials are stored per-market (TRA-165) so a Coinbase key entered
-// on the Crypto dashboard never appears on the Stock dashboard. Read-time
-// helpers fall back to the legacy un-suffixed fields for users that saved
-// before this split — new writes go straight to the scoped fields.
-// TRA-457 — `readLiveBrokerageType` / `readLiveTradeMode` were removed with the
-// crypto Brokerage selector and the Trading Mode radio: both controls were dead
-// (single-option dropdown; no engine/server reader for the `liveTradeMode*`
-// fields).
-function readLiveApiKey(s: AccountSettings, m: Market): string {
-  const scoped = m === 'crypto' ? s.liveApiKeyCrypto : s.liveApiKeyStocks;
-  return scoped ?? s.liveApiKey ?? '';
-}
-function readLiveApiSecretCrypto(s: AccountSettings): string {
-  return s.liveApiSecretCrypto ?? s.liveApiSecret ?? '';
-}
 // TRA-221 — Tradier (Options) live credentials. Stored on a dedicated set of
-// fields so options auto-trading is independent from the crypto flow.
+// fields.
 function readLiveBrokerageTypeOptions(s: AccountSettings): BrokerageType {
   return s.liveBrokerageTypeOptions ?? 'tradier';
 }
@@ -95,10 +76,6 @@ function PasswordInput({
   disabled,
   required,
   minLength,
-  // TRA-222 — set for the Coinbase CDP private key field so newlines survive
-  // the paste. Single-line inputs strip newlines, breaking PEM parsing.
-  multiline,
-  rows,
   // TRA-506 — set on cred inputs so the dashboard's missing-creds banner can
   // querySelector → focus the right input on modal open.
   dataCredField,
@@ -116,8 +93,6 @@ function PasswordInput({
   disabled?: boolean;
   required?: boolean;
   minLength?: number;
-  multiline?: boolean;
-  rows?: number;
   dataCredField?: string;
   id?: string;
 }) {
@@ -138,69 +113,33 @@ function PasswordInput({
   const antiAutofillProps = suppressAutofill
     ? { readOnly: autofillGuard, onFocus: () => setAutofillGuard(false) }
     : {};
-  // `-webkit-text-security: disc` is the only way to mask a textarea in
-  // Chromium/Electron. Falls back to plain text on browsers that don't
-  // support it, which is acceptable on a local desktop app.
-  const maskedTextareaStyle: React.CSSProperties = show
-    ? {}
-    : { WebkitTextSecurity: 'disc' } as React.CSSProperties;
   return (
     <div
       style={{
         position: 'relative',
         display: 'flex',
-        alignItems: multiline ? 'flex-start' : 'center',
+        alignItems: 'center',
       }}
     >
-      {multiline ? (
-        <textarea
-          value={value}
-          onChange={e => onChange(e.target.value)}
-          autoComplete={effectiveAutoComplete}
-          {...antiAutofillProps}
-          placeholder={placeholder}
-          disabled={disabled}
-          required={required}
-          minLength={minLength}
-          rows={rows ?? 6}
-          spellCheck={false}
-          data-cred-field={dataCredField}
-          // TRA-778 — stop Chromium / 1Password / LastPass from autofilling the
-          // app login (admin) username + password into broker credential fields.
-          data-1p-ignore
-          data-lpignore="true"
-          data-form-type="other"
-          style={{
-            paddingRight: '2.5rem',
-            width: '100%',
-            boxSizing: 'border-box',
-            fontFamily: 'monospace',
-            fontSize: '0.85rem',
-            resize: 'vertical',
-            ...maskedTextareaStyle,
-          }}
-        />
-      ) : (
-        <input
-          id={id}
-          type={show ? 'text' : 'password'}
-          value={value}
-          onChange={e => onChange(e.target.value)}
-          autoComplete={effectiveAutoComplete}
-          {...antiAutofillProps}
-          placeholder={placeholder}
-          disabled={disabled}
-          required={required}
-          minLength={minLength}
-          data-cred-field={dataCredField}
-          // TRA-778 — stop Chromium / 1Password / LastPass from autofilling the
-          // app login (admin) username + password into broker credential fields.
-          data-1p-ignore
-          data-lpignore="true"
-          data-form-type="other"
-          style={{ paddingRight: '2.5rem', width: '100%', boxSizing: 'border-box' }}
-        />
-      )}
+      <input
+        id={id}
+        type={show ? 'text' : 'password'}
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        autoComplete={effectiveAutoComplete}
+        {...antiAutofillProps}
+        placeholder={placeholder}
+        disabled={disabled}
+        required={required}
+        minLength={minLength}
+        data-cred-field={dataCredField}
+        // TRA-778 — stop Chromium / 1Password / LastPass from autofilling the
+        // app login (admin) username + password into broker credential fields.
+        data-1p-ignore
+        data-lpignore="true"
+        data-form-type="other"
+        style={{ paddingRight: '2.5rem', width: '100%', boxSizing: 'border-box' }}
+      />
       <button
         type="button"
         onClick={() => setShow(s => !s)}
@@ -239,7 +178,7 @@ function PasswordInput({
 interface Props {
   token: string;
   httpUrl: string;
-  context?: 'crypto' | 'stocks';
+  context?: 'stocks';
   onModeChange?: (mode: 'demo' | 'live') => void;
   // TRA-327 — fired after a successful PUT /api/account/settings so the
   // hosting dashboard can refetch /api/account/settings and refresh any
@@ -1145,184 +1084,6 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
   );
 }
 
-/**
- * TRA-325 — strategy preset selector. Renders each preset from
- * `STRATEGY_PRESETS` as a radio card, expanded to show enabled strategies
- * and the symbol-filter (or "all watchlist symbols" when null). The active
- * id lives on `AccountSettings.activeStrategyPreset` so it saves on the
- * existing form submit alongside the other account settings.
- *
- * TRA-697 — the OOS-failed legacy roster (`legacy_5`, `bb_fade_sol_doge`,
- * `tra405_validated`) was retired after QuantTrader's TRA-695 NO-GO and the
- * TRA-693 board decision. The library now holds exactly two live-relevant
- * presets — `no_trade` (engine paused, the recommended posture) and
- * `crypto_core` (the go-forward DCA-only BTC/SOL forward-paper roster) — so the
- * picker shows both directly with no "Advanced" overflow.
- */
-// TRA-521 / TRA-523 / TRA-697 — QuantTrader's fee-aware R&D (and the later
-// TRA-695 re-validation) returned a NO-GO on the legacy roster: bb_fade and the
-// other timing strategies are OOS-negative net of fees and fail Stage 1 of the
-// Live-Trading Promotion Gate (TRA-532). Those presets are now retired. Until a
-// strategy clears the gate, the recommended posture is to keep the engine
-// paused (`no_trade`); `crypto_core` runs DCA as a demo/paper forward leg.
-// Repoint this id once a strategy clears the promotion gate.
-const RECOMMENDED_PRESET_ID: StrategyPresetId = 'no_trade';
-// Presets surfaced in the primary list. With the legacy roster retired
-// (TRA-697) the library is just these two, so there is no Advanced overflow.
-// TRA-694 / TRA-698: `crypto_core` is the DCA-only BTC/SOL forward-paper roster.
-const PRIMARY_PRESET_IDS: readonly StrategyPresetId[] = ['crypto_core', 'no_trade'];
-
-function StrategyPresetCard({
-  preset,
-  active,
-  onChange,
-}: {
-  preset: StrategyPreset;
-  active: StrategyPresetId;
-  onChange: (id: StrategyPresetId) => void;
-}) {
-  const isActive = preset.id === active;
-  return (
-    <label
-      className={`mode-card ${isActive ? 'active' : ''}`}
-      style={{ alignItems: 'flex-start' }}
-    >
-      <input
-        type="radio"
-        name="activeStrategyPreset"
-        value={preset.id}
-        checked={isActive}
-        onChange={() => onChange(preset.id)}
-      />
-      <div className="mode-card-inner" style={{ width: '100%' }}>
-        <span className="mode-card-title">
-          {preset.displayName}
-          {preset.id === RECOMMENDED_PRESET_ID && (
-            <span
-              style={{
-                marginLeft: '0.5rem',
-                fontSize: '0.7rem',
-                fontWeight: 600,
-                textTransform: 'uppercase',
-                letterSpacing: '0.04em',
-                color: 'var(--green, #3fb950)',
-              }}
-            >
-              Recommended
-            </span>
-          )}
-        </span>
-        <span className="mode-card-desc" style={{ marginBottom: '0.5rem' }}>
-          {preset.description}
-        </span>
-        <div style={{ fontSize: '0.85rem', color: 'var(--muted, #8b949e)', display: 'grid', gap: '0.25rem' }}>
-          <div>
-            <strong>Strategies:</strong>{' '}
-            {preset.enabledStrategies.length > 0
-              ? preset.enabledStrategies.join(', ')
-              : 'none (engine idle)'}
-          </div>
-          <div>
-            <strong>Symbols:</strong>{' '}
-            {preset.symbolFilter === null
-              ? (preset.strategyUniverse
-                  ? 'crypto watchlist, narrowed per strategy below'
-                  : 'entire crypto watchlist')
-              : preset.symbolFilter.join(', ')}
-          </div>
-          {preset.strategyUniverse && (
-            <div>
-              <strong>Per-strategy universe:</strong>{' '}
-              {Object.entries(preset.strategyUniverse)
-                .map(([strat, syms]) => `${strat} → ${(syms ?? []).join(', ') || 'none'}`)
-                .join('; ')}
-            </div>
-          )}
-        </div>
-      </div>
-    </label>
-  );
-}
-
-function StrategyPresetSection({
-  active,
-  onChange,
-}: {
-  active: StrategyPresetId;
-  onChange: (id: StrategyPresetId) => void;
-}) {
-  const primaryPresets = PRIMARY_PRESET_IDS.map(id => STRATEGY_PRESETS[id]);
-  const advancedPresets = Object.values(STRATEGY_PRESETS).filter(
-    p => !PRIMARY_PRESET_IDS.includes(p.id),
-  );
-  // Auto-open the Advanced list when the saved selection lives in it, so the
-  // active radio is always visible (and the user can tell what's persisted).
-  const activeIsAdvanced = advancedPresets.some(p => p.id === active);
-  const [showAdvanced, setShowAdvanced] = useState(activeIsAdvanced);
-  return (
-    <section className="settings-section">
-      <h2 className="settings-section-title">Crypto Strategy Preset</h2>
-      <p className="settings-hint">
-        Choose which crypto strategies fire and on which symbols. Switching takes effect
-        on the next engine tick (no restart required).
-      </p>
-      <p className="settings-hint" style={{ marginTop: '0.5rem' }}>
-        Why is the engine paused by default? QuantTrader's fee-aware backtests (TRA-523,
-        re-validated in TRA-695) re-ran every legacy roster net of Coinbase taker fees and
-        found <strong>none</strong> profitable out-of-sample, so the OOS-failed legacy
-        strategies were retired (TRA-697). Until a strategy clears the Live-Trading Promotion
-        Gate, <strong>No-trade</strong> is the recommended setting; <strong>Crypto Core</strong>{' '}
-        runs DCA on BTC/SOL as a demo/paper forward leg to gather forward evidence.
-      </p>
-      <div className="strategy-preset-list" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', marginTop: '0.75rem' }}>
-        {primaryPresets.map(preset => (
-          <StrategyPresetCard key={preset.id} preset={preset} active={active} onChange={onChange} />
-        ))}
-      </div>
-
-      {advancedPresets.length > 0 && (
-        <div style={{ marginTop: '0.75rem' }}>
-          <button
-            type="button"
-            className="btn-secondary btn-sm"
-            aria-expanded={showAdvanced}
-            onClick={() => setShowAdvanced(v => !v)}
-          >
-            {showAdvanced ? 'Hide advanced presets' : 'Advanced / show all presets'}
-          </button>
-          {showAdvanced && (
-            <>
-              <p className="settings-hint" style={{ marginTop: '0.5rem' }}>
-                These legacy and experimental presets are kept for reference and live tests.
-                They are higher-turnover and not recommended — taker fees make them
-                unprofitable in practice.
-              </p>
-              <div
-                className="strategy-preset-list"
-                style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', marginTop: '0.5rem' }}
-              >
-                {advancedPresets.map(preset => (
-                  <StrategyPresetCard key={preset.id} preset={preset} active={active} onChange={onChange} />
-                ))}
-              </div>
-            </>
-          )}
-        </div>
-      )}
-
-      <p className="settings-hint" style={{ marginTop: '0.75rem' }}>
-        Note: this selection applies to the <strong>Live</strong> engine only. The Demo
-        engine runs a fixed preset (<code>DEMO_STRATEGY_PRESET</code>, default{' '}
-        <code>crypto_core</code> since TRA-698) so the demo dashboard stays actively trading
-        on paper for evaluation. On the server the <code>LIVE_STRATEGY_PRESET</code> environment
-        variable (when set) overrides this selection for the live engine — ops use it to
-        pin a preset for live tests; drop the env var to release control back to this
-        per-user setting.
-      </p>
-    </section>
-  );
-}
-
 export default function SettingsPage({ token, httpUrl, context, onModeChange, onSettingsSaved, onLogout, focusCredField }: Props) {
   const [settings, setSettings] = useState<AccountSettings>(DEFAULT_ACCOUNT_SETTINGS);
   const [loading, setLoading] = useState(true);
@@ -1372,12 +1133,6 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
   >(null);
   const [resetPending, setResetPending] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
-  const [coinbaseTestStatus, setCoinbaseTestStatus] = useState<'idle' | 'testing'>('idle');
-  const [coinbaseTestResult, setCoinbaseTestResult] = useState<
-    | null
-    | { ok: true; authScheme: 'hmac' | 'cdp'; accountCount: number; currencies: string[] }
-    | { ok: false; authScheme?: 'hmac' | 'cdp'; error: string }
-  >(null);
   // TRA-506 — per-env test state so each block ("Sandbox", "Production")
   // surfaces its own status and result independent of the saved
   // `liveTradierEnvOptions`. A user can confirm Production buying power
@@ -1397,23 +1152,6 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
   const [tradierTestResultSandbox, setTradierTestResultSandbox] = useState<TradierTestResult>(null);
   const [tradierTestStatusProduction, setTradierTestStatusProduction] = useState<'idle' | 'testing'>('idle');
   const [tradierTestResultProduction, setTradierTestResultProduction] = useState<TradierTestResult>(null);
-  // TRA-222 — one-shot $1 BTC-USD market BUY to verify the live order path
-  // before flipping auto-trading on. The server caps quoteSize at $5.
-  const [coinbaseOrderStatus, setCoinbaseOrderStatus] = useState<'idle' | 'placing'>('idle');
-  const [coinbaseOrderResult, setCoinbaseOrderResult] = useState<
-    | null
-    | {
-        ok: true;
-        authScheme?: 'hmac' | 'cdp';
-        orderId: string;
-        productId: string;
-        quoteSize: number;
-        status: string;
-        fillPrice?: number;
-        fillSize?: number;
-      }
-    | { ok: false; authScheme?: 'hmac' | 'cdp'; error: string }
-  >(null);
 
   // TRA-397 — bumped to re-run the initial fetch when the user retries after
   // a transient load failure.
@@ -1616,48 +1354,6 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
     }
   }
 
-  async function handleTestCoinbase() {
-    setCoinbaseTestStatus('testing');
-    setCoinbaseTestResult(null);
-    try {
-      const r = await fetch(`${httpUrl}/api/crypto/coinbase/test-connection`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const data = await r.json();
-      setCoinbaseTestResult(data);
-    } catch (err) {
-      setCoinbaseTestResult({ ok: false, error: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setCoinbaseTestStatus('idle');
-    }
-  }
-
-  async function handlePlaceCoinbaseTestOrder() {
-    if (!window.confirm(
-      'Place a real $1 USD market buy of BTC-USD against your live Coinbase account?\n\n'
-      + 'This is intended as a one-shot smoke test to confirm orders clear before enabling auto-trading. '
-      + 'The BTC will sit in your Coinbase wallet — manage it in the Coinbase app.',
-    )) {
-      return;
-    }
-    setCoinbaseOrderStatus('placing');
-    setCoinbaseOrderResult(null);
-    try {
-      const r = await fetch(`${httpUrl}/api/crypto/coinbase/place-test-order`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ productId: 'BTC-USD', quoteSize: 1 }),
-      });
-      const data = await r.json();
-      setCoinbaseOrderResult(data);
-    } catch (err) {
-      setCoinbaseOrderResult({ ok: false, error: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setCoinbaseOrderStatus('idle');
-    }
-  }
-
   // TRA-506 — env-pinned probe. The server reads `env` from the body and
   // tests the saved pair for that env regardless of the currently selected
   // `liveTradierEnvOptions`, so the user can verify Production while their
@@ -1685,9 +1381,8 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
   async function handleResetDemo() {
     setResetPending(true);
     try {
-      // Scope the reset to the dashboard the user is viewing (TRA-192) so
-      // resetting Stocks does not wipe Crypto and vice versa. The global
-      // settings page (context undefined) still resets both engines.
+      // Scope the reset to the dashboard the user is viewing (TRA-192). The
+      // global settings page (context undefined) resets every engine.
       await fetch(`${httpUrl}/api/account/reset-demo`, {
         method: 'POST',
         headers: {
@@ -1804,26 +1499,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                 </div>
               )}
 
-              {(!context || context === 'crypto') && (
-                <div className="settings-field">
-                  <label htmlFor="set-demoEquityCrypto">{context === 'crypto' ? 'Starting Equity ($)' : 'Crypto Starting Equity ($)'}</label>
-                  <input
-                    id="set-demoEquityCrypto"
-                    type="number"
-                    min={1000}
-                    max={10000000}
-                    step={1000}
-                    value={settings.demoEquityCrypto ?? settings.demoEquity}
-                    onChange={e => set('demoEquityCrypto', Number(e.target.value))}
-                  />
-                  <span className="field-hint">Virtual starting balance for crypto (default: $25,000)</span>
-                </div>
-              )}
-
-              {/* TRA-232 — Daily trade limits are stocks/options only today.
-                  The crypto engine doesn't enforce a per-day cap, so on the
-                  Crypto dashboard we hide both rows to stop showing irrelevant
-                  stock settings on a crypto page. */}
+              {/* TRA-232 — Daily trade limits apply to stocks/options. */}
               {(!context || context === 'stocks') && (
                 <div className="settings-field">
                   <label htmlFor="set-dailyTradesLimit">Stock Daily Trades Limit</label>
@@ -1855,10 +1531,9 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
               )}
 
               {/* TRA-346 — Managed Account Ratio + Risk Per Trade are stored
-                  per (mode × dashboard) so the Crypto and Stocks dashboards
-                  no longer share a slot, and Demo edits don't bleed into
-                  Live. The standalone settings page (no `context`) writes to
-                  the Stocks bucket by default to preserve the historical
+                  per (mode × dashboard) so Demo edits don't bleed into Live.
+                  The standalone settings page (no `context`) writes to the
+                  Stocks bucket by default to preserve the historical
                   behaviour where these inputs surfaced once globally. */}
               {(() => {
                 const market: Market = context ?? 'stocks';
@@ -1867,9 +1542,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                 const riskKey = riskPerTradeField(market, mode);
                 const ratio = resolveManagedAccountRatio(settings, market, mode);
                 const risk = resolveRiskPerTrade(settings, market, mode);
-                const labelSuffix = context === 'crypto'
-                  ? ' (Demo Crypto)'
-                  : context === 'stocks' ? ' (Demo Stocks)' : '';
+                const labelSuffix = context === 'stocks' ? ' (Demo Stocks)' : '';
                 return (
                   <>
                     <div className="settings-field">
@@ -1887,7 +1560,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                       />
                       <span className="field-hint">
                         Portion of equity auto-traded (default: 50%). Only affects
-                        {context === 'crypto' ? ' demo crypto' : context === 'stocks' ? ' demo stocks/options' : ' demo'}.
+                        {context === 'stocks' ? ' demo stocks/options' : ' demo'}.
                       </span>
                     </div>
                     <div className="settings-field">
@@ -1906,7 +1579,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                       />
                       <span className="field-hint">
                         Max equity risked per trade (default: 1%). Only affects
-                        {context === 'crypto' ? ' demo crypto' : context === 'stocks' ? ' demo stocks/options' : ' demo'}.
+                        {context === 'stocks' ? ' demo stocks/options' : ' demo'}.
                         {' '}<strong>Hard cap: {(HARD_MAX_RISK_PER_TRADE * 100).toFixed(0)}%</strong> — the
                         deterministic risk layer (TRA-526) clamps any larger value at trade time.
                       </span>
@@ -1963,27 +1636,17 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                 type="button"
                 className="btn-secondary"
                 onClick={() => setSettings(s => {
-                  // TRA-346 — only revert the demo bucket for the dashboard the
-                  // user is on; the Live bucket and the *other* dashboard's
-                  // values stay untouched. With no context we revert both demo
-                  // buckets to keep parity with the pre-346 global page.
-                  const market: Market | undefined = context;
+                  // TRA-346 — only revert the demo bucket; the Live bucket
+                  // stays untouched.
                   const next: AccountSettings = {
                     ...s,
                     demoEquity: DEFAULT_ACCOUNT_SETTINGS.demoEquity,
                     demoEquityStocks: DEFAULT_ACCOUNT_SETTINGS.demoEquityStocks,
-                    demoEquityCrypto: DEFAULT_ACCOUNT_SETTINGS.demoEquityCrypto,
                     dailyTradesLimit: DEFAULT_ACCOUNT_SETTINGS.dailyTradesLimit,
                     optionsDailyTradesLimit: DEFAULT_ACCOUNT_SETTINGS.optionsDailyTradesLimit,
                   };
-                  if (!market || market === 'stocks') {
-                    next.managedAccountRatioDemoStocks = DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
-                    next.riskPerTradeDemoStocks = DEFAULT_ACCOUNT_SETTINGS.riskPerTrade;
-                  }
-                  if (!market || market === 'crypto') {
-                    next.managedAccountRatioDemoCrypto = DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
-                    next.riskPerTradeDemoCrypto = DEFAULT_ACCOUNT_SETTINGS.riskPerTrade;
-                  }
+                  next.managedAccountRatioDemoStocks = DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
+                  next.riskPerTradeDemoStocks = DEFAULT_ACCOUNT_SETTINGS.riskPerTrade;
                   return next;
                 })}
               >
@@ -1995,8 +1658,6 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
 
         {/* ── Live settings ─────────────────────────────────────────────── */}
         {/*
-          Live crypto credentials are stored per-market (TRA-165) so a Coinbase
-          key on the Crypto dashboard never bleeds into the Stocks dashboard.
           The Webull credential UI was removed in TRA-225; the Stocks dashboard
           now exposes only the Tradier (Options) live-trading credentials.
         */}
@@ -2008,15 +1669,12 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                 they were only editable in Demo, which left users unable to
                 tell whether Live trading honored Managed Account Ratio,
                 Risk Per Trade, or the daily trade limits (it does — the
-                same engine code path drives sizing for stocks, options,
-                and crypto). Daily trade limits are stocks/options only,
-                so they're hidden under the Crypto context. */}
+                same engine code path drives sizing for stocks and options). */}
             <div className="live-brokerage-block">
               <h3 className="settings-subheading">Live Trading Risk</h3>
               <div className="settings-grid">
-                {/* TRA-346 — scoped to (live × context) so Crypto and Stocks
-                    track separate live values, and saving here never alters
-                    the Demo bucket. */}
+                {/* TRA-346 — scoped to (live × context) so saving here never
+                    alters the Demo bucket. */}
                 {(() => {
                   const market: Market = context ?? 'stocks';
                   const mode: AccountMode = 'live';
@@ -2024,9 +1682,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                   const riskKey = riskPerTradeField(market, mode);
                   const ratio = resolveManagedAccountRatio(settings, market, mode);
                   const risk = resolveRiskPerTrade(settings, market, mode);
-                  const liveBrokerLabel = context === 'crypto'
-                    ? 'live Coinbase'
-                    : context === 'stocks' ? 'live Tradier (options)' : 'live brokerage';
+                  const liveBrokerLabel = context === 'stocks' ? 'live Tradier (options)' : 'live brokerage';
                   return (
                     <>
                       <div className="settings-field">
@@ -2074,41 +1730,6 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                     </>
                   );
                 })()}
-                {/* TRA-341 — operator override for the §6 single-symbol short
-                    cap on the live perp router (default 15% of strategy equity).
-                    Crypto-only; the cross-strategy (20%) and total-book (30%)
-                    ceilings still apply downstream. Blank = spec default. The
-                    server also reads `LIVE_SINGLE_SYMBOL_SHORT_CAP` as a
-                    process-wide fallback when this knob is unset, so an
-                    operator can move the floor without per-user saves. */}
-                {(!context || context === 'crypto') && (
-                  <div className="settings-field">
-                    <label htmlFor="set-liveSingleSymbolShortCap">Single-Symbol Short Cap (%)</label>
-                    <input
-                      id="set-liveSingleSymbolShortCap"
-                      type="number"
-                      min={0}
-                      max={100}
-                      step={1}
-                      value={
-                        settings.liveSingleSymbolShortCap === undefined
-                          ? ''
-                          : Math.round(settings.liveSingleSymbolShortCap * 100)
-                      }
-                      onChange={e => {
-                        const raw = e.target.value;
-                        if (raw === '') {
-                          set('liveSingleSymbolShortCap', undefined);
-                        } else {
-                          set('liveSingleSymbolShortCap', Number(raw) / 100);
-                        }
-                      }}
-                    />
-                    <span className="field-hint">
-                      Live perp shorts only. Max single-symbol notional per strategy as % of strategy equity (default: 15%). Blank → spec default. Cross-strategy (20%) and total-book (30%) ceilings still apply.
-                    </span>
-                  </div>
-                )}
                 {/* TRA-327 — Live limits bind to dailyTradesLimitLive /
                     optionsDailyTradesLimitLive so editing the Demo cap on
                     another visit never drags the Live cap with it. Falls back
@@ -2144,128 +1765,6 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                 )}
               </div>
             </div>
-
-            {(!context || context === 'crypto') && (
-              <div className="live-brokerage-block">
-                {!context && <h3 className="settings-subheading">Crypto (Coinbase)</h3>}
-
-                <div className="settings-grid">
-                  {/* TRA-457 — Brokerage selector removed: Coinbase is the only
-                      crypto broker, and the crypto engine deliberately never
-                      gates on `liveBrokerageTypeCrypto`, so the single-option
-                      dropdown was redundant clutter. */}
-                  <div className="settings-field">
-                    <label>API Key</label>
-                    <PasswordInput
-                      value={readLiveApiKey(settings, 'crypto')}
-                      onChange={v => set('liveApiKeyCrypto', v)}
-                      placeholder={'organizations/{org-id}/apiKeys/{key-id}'}
-                      autoComplete="off"
-                      dataCredField="liveApiKeyCrypto"
-                    />
-                    <p className="field-hint">
-                      Paste the full <strong>API key name</strong> Coinbase shows when you create a CDP key
-                      (looks like <code>organizations/.../apiKeys/...</code>). Legacy HMAC API keys also work.
-                    </p>
-                  </div>
-
-                  <div className="settings-field">
-                    <label>API Secret</label>
-                    <PasswordInput
-                      value={readLiveApiSecretCrypto(settings)}
-                      onChange={v => set('liveApiSecretCrypto', v)}
-                      placeholder={'-----BEGIN EC PRIVATE KEY-----\n...\n-----END EC PRIVATE KEY-----'}
-                      autoComplete="off"
-                      multiline
-                      rows={6}
-                      dataCredField="liveApiSecretCrypto"
-                    />
-                    <p className="field-hint">
-                      For CDP keys, paste the entire private key — including the
-                      <code> -----BEGIN </code> and <code> -----END </code> lines and all the
-                      lines in between. The full JSON file Coinbase gives you on download
-                      also works. For legacy HMAC keys, paste the shared secret on a single line.
-                    </p>
-                  </div>
-                </div>
-
-                {/* TRA-457 — "Trading Mode" radio (AI-in-brokerage vs
-                    transfer-to-platform) removed: it was dead. Nothing in
-                    packages/server or packages/engine reads `liveTradeMode*`,
-                    and the transfer-to-platform flow was never built — the
-                    crypto engine always trades directly in Coinbase. */}
-
-                {/* TRA-249-E — Live trading routing (spot / hybrid / perp-only). */}
-                <div className="settings-field" style={{ marginTop: '1.25rem' }}>
-                  <label>Live trading mode</label>
-                  <div className="radio-group">
-                    <label className="radio-option">
-                      <input
-                        type="radio"
-                        name="liveTradeRouting-crypto"
-                        value="spot_only"
-                        checked={(settings.liveTradeRoutingCrypto ?? 'hybrid') === 'spot_only'}
-                        onChange={() => set('liveTradeRoutingCrypto', 'spot_only')}
-                      />
-                      <div>
-                        <strong>Spot only</strong>
-                        <p className="field-hint">Only spot Coinbase orders. SELL signals on long-only spot accounts are skipped.</p>
-                      </div>
-                    </label>
-                    <label className="radio-option">
-                      <input
-                        type="radio"
-                        name="liveTradeRouting-crypto"
-                        value="hybrid"
-                        checked={(settings.liveTradeRoutingCrypto ?? 'hybrid') === 'hybrid'}
-                        onChange={() => set('liveTradeRoutingCrypto', 'hybrid')}
-                      />
-                      <div>
-                        <strong>Hybrid (recommended)</strong>
-                        <p className="field-hint">BUY → spot, SELL → perp short when the symbol has a Coinbase INTX listing, else skipped.</p>
-                      </div>
-                    </label>
-                    <label className="radio-option">
-                      <input
-                        type="radio"
-                        name="liveTradeRouting-crypto"
-                        value="perp_only"
-                        checked={(settings.liveTradeRoutingCrypto ?? 'hybrid') === 'perp_only'}
-                        onChange={() => set('liveTradeRoutingCrypto', 'perp_only')}
-                      />
-                      <div>
-                        <strong>Perp only</strong>
-                        <p className="field-hint">Both legs route to Coinbase INTX perpetual futures.</p>
-                      </div>
-                    </label>
-                  </div>
-                </div>
-
-                {/* TRA-457 — "Max leverage" knob hidden (not deleted). It
-                    round-trips to `AccountSettings.liveMaxLeverageCrypto` and
-                    the server clamps it to [1,5], but the live engine pins
-                    leverage at 1× (PERP_SHORT_LEVERAGE) and never reads the
-                    field, so the control has no effect today. Hidden rather
-                    than removed so a future leverage ramp can re-surface it
-                    without a settings migration — restore the block below:
-
-                <div className="settings-field" style={{ marginTop: '1.25rem' }}>
-                  <label>Max leverage</label>
-                  <input
-                    type="number"
-                    min={1}
-                    max={5}
-                    step={1}
-                    value={settings.liveMaxLeverageCrypto ?? 1}
-                    onChange={e => set('liveMaxLeverageCrypto', Math.max(1, Math.min(5, Math.round(Number(e.target.value)))))}
-                  />
-                  <span className="field-hint">
-                    Leverage ceiling for crypto perp positions (1-5). Phase-1 the engine pins leverage at 1x.
-                  </span>
-                </div>
-                */}
-              </div>
-            )}
 
             {/* TRA-221 — Options live trading via Tradier. Rendered in the
                 admin (no-context) and stocks-dashboard views, since options
@@ -2557,99 +2056,10 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
               </div>
             )}
 
-            {context === 'crypto' && (
-              <div className="settings-field" style={{ marginTop: '1rem' }}>
-                <button
-                  type="button"
-                  className="btn-secondary"
-                  onClick={handleTestCoinbase}
-                  disabled={coinbaseTestStatus === 'testing'}
-                >
-                  {coinbaseTestStatus === 'testing' ? 'Testing…' : 'Test Coinbase Connection'}
-                </button>
-                <p className="field-hint">
-                  Reads your account balances from Coinbase to verify the saved credentials. No orders are placed.
-                  Save the form first if you just edited the API key or secret.
-                </p>
-                {coinbaseTestResult && (
-                  coinbaseTestResult.ok ? (
-                    <div className="save-success" style={{ marginTop: '0.5rem' }}>
-                      ✓ Connected (auth={coinbaseTestResult.authScheme}). Coinbase returned {coinbaseTestResult.accountCount} account
-                      {coinbaseTestResult.accountCount === 1 ? '' : 's'}
-                      {coinbaseTestResult.currencies.length > 0 && (
-                        <> across {coinbaseTestResult.currencies.slice(0, 6).join(', ')}{coinbaseTestResult.currencies.length > 6 ? `, +${coinbaseTestResult.currencies.length - 6} more` : ''}</>
-                      )}
-                      .
-                    </div>
-                  ) : (
-                    <div className="save-error" style={{ marginTop: '0.5rem' }}>
-                      ✗ {coinbaseTestResult.authScheme ? `auth=${coinbaseTestResult.authScheme} — ` : ''}{coinbaseTestResult.error}
-                    </div>
-                  )
-                )}
-              </div>
-            )}
-
-            {/* TRA-222 — one-shot $1 test order. Only shown in Live mode so a
-                misclick in demo can't burn real money on a user who hasn't
-                explicitly switched over yet. */}
-            {context === 'crypto' && settings.mode === 'live' && (
-              <div className="settings-field" style={{ marginTop: '1rem' }}>
-                <button
-                  type="button"
-                  className="btn-secondary"
-                  onClick={handlePlaceCoinbaseTestOrder}
-                  disabled={coinbaseOrderStatus === 'placing'}
-                >
-                  {coinbaseOrderStatus === 'placing' ? 'Placing $1 order…' : 'Place $1 BTC-USD test order'}
-                </button>
-                <p className="field-hint">
-                  Places a real $1 USD market buy of BTC against your live Coinbase account so you can confirm
-                  the order path works end-to-end before enabling auto-trading. The BTC stays in your Coinbase
-                  wallet until you sell it (manage in the Coinbase app).
-                </p>
-                {coinbaseOrderResult && (
-                  coinbaseOrderResult.ok ? (
-                    <div className="save-success" style={{ marginTop: '0.5rem' }}>
-                      ✓ Placed order {coinbaseOrderResult.orderId} ({coinbaseOrderResult.productId},
-                      ${coinbaseOrderResult.quoteSize}, status={coinbaseOrderResult.status})
-                      {coinbaseOrderResult.fillPrice != null && coinbaseOrderResult.fillSize != null && (
-                        <> — filled {coinbaseOrderResult.fillSize} @ ${coinbaseOrderResult.fillPrice.toFixed(2)}</>
-                      )}
-                      .
-                    </div>
-                  ) : (
-                    <div className="save-error" style={{ marginTop: '0.5rem' }}>
-                      ✗ {coinbaseOrderResult.authScheme ? `auth=${coinbaseOrderResult.authScheme} — ` : ''}{coinbaseOrderResult.error}
-                    </div>
-                  )
-                )}
-              </div>
-            )}
-
             <div className="live-notice">
-              {context === 'crypto' ? (
-                <>
-                  <strong>Live Coinbase trading is enabled.</strong> Once you save valid API credentials and switch the account to <em>Live</em>, the engine routes new signals to Coinbase using market orders. Make sure the API key has trade permissions on your Coinbase Advanced Trade account.
-                </>
-              ) : (
-                <>
-                  <strong>Live Tradier trading is enabled.</strong> Once you save a valid Tradier API token and Account ID and switch the account to <em>Live</em>, the engine routes signals based on the <em>Trade</em> selector above. <em>Options only</em> (default, TRA-220) sends the relative-value scanner to Tradier as <code>buy_to_open</code> market orders. <em>Positions (equity)</em> and <em>Both</em> activate stock-share routing — BB-fade / ORB / Ichimoku entries fire as Tradier OTOCO bracket orders when the &quot;Tradier Live trades equities&quot; toggle is also on (TRA-335).
-                </>
-              )}
+              <strong>Live Tradier trading is enabled.</strong> Once you save a valid Tradier API token and Account ID and switch the account to <em>Live</em>, the engine routes signals based on the <em>Trade</em> selector above. <em>Options only</em> (default, TRA-220) sends the relative-value scanner to Tradier as <code>buy_to_open</code> market orders. <em>Positions (equity)</em> and <em>Both</em> activate stock-share routing — BB-fade / ORB / Ichimoku entries fire as Tradier OTOCO bracket orders when the &quot;Tradier Live trades equities&quot; toggle is also on (TRA-335).
             </div>
           </section>
-        )}
-
-        {/* TRA-325 — Crypto strategy preset selector. Visible in admin (no-
-            context) and crypto-dashboard views since the preset only affects
-            CryptoSignalEngine today; hidden on the Stocks dashboard to avoid
-            implying it gates equity trading. */}
-        {(!context || context === 'crypto') && (
-          <StrategyPresetSection
-            active={settings.activeStrategyPreset ?? DEFAULT_STRATEGY_PRESET_ID}
-            onChange={id => set('activeStrategyPreset', id)}
-          />
         )}
 
         {/* ── Save + Reset row ──────────────────────────────────────────── */}
@@ -2731,7 +2141,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
         </div>
       </form>
 
-      {/* ── Profile / Change Password / Notifications / User Management (hidden in crypto/stocks context) */}
+      {/* ── Profile / Change Password / Notifications / User Management (hidden in stocks context) */}
       {!context && <ProfileSection token={token} httpUrl={httpUrl} />}
       {!context && <ChangePasswordSection token={token} httpUrl={httpUrl} />}
       {/* TRA-1505 — email two-factor login enrollment (account-global). */}
@@ -2743,7 +2153,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
       {isAdmin && <UserManagementSection token={token} httpUrl={httpUrl} />}
       {/* TRA-2421 — danger zone LAST: irreversible, and nothing below it should
           compete for the click. Account-global, so it is hidden in the per-market
-          crypto/stocks contexts like the other account sections. */}
+          stocks context like the other account sections. */}
       {!context && <DeleteAccountSection token={token} httpUrl={httpUrl} onLogout={onLogout} />}
     </div>
   );

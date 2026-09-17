@@ -14,8 +14,8 @@ const exitEvent: ExitAlertEvent = {
   kind: 'exit',
   username: 'alice',
   timestamp: TS,
-  symbol: 'ETH-USD',
-  market: 'crypto',
+  symbol: 'AAPL',
+  market: 'stocks',
   mode: 'live',
   exitReason: 'take-profit',
   pnl: 84.2,
@@ -69,7 +69,7 @@ describe('EmailChannelAdapter', () => {
     const arg = sendMail.mock.calls[0]![0];
     expect(arg.to).toBe('login@x.com');
     expect(arg.subject).toContain('Position Exited');
-    expect(arg.html).toContain('ETH-USD');
+    expect(arg.html).toContain('AAPL');
     expect(arg.text).toContain('P&L: +$84.20');
   });
 

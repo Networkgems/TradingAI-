@@ -24,7 +24,7 @@ import { logError } from '../lib/logger';
 
 export type ExportRange = 'all' | 'year' | 'custom';
 export type ExportMode = 'demo' | 'live';
-export type ExportMarket = 'stocks' | 'crypto' | 'options';
+export type ExportMarket = 'stocks' | 'options';
 export type ExportFormat = 'csv' | 'json';
 
 const MODE_OPTIONS: { key: ExportMode; label: string }[] = [
@@ -34,7 +34,6 @@ const MODE_OPTIONS: { key: ExportMode; label: string }[] = [
 
 const MARKET_OPTIONS: { key: ExportMarket; label: string }[] = [
   { key: 'stocks', label: 'Stocks' },
-  { key: 'crypto', label: 'Crypto' },
   { key: 'options', label: 'Options' },
 ];
 
@@ -62,7 +61,6 @@ export function ExportTradesModal({ token, httpUrl, onClose }: {
   const [modes, setModes] = useState<Record<ExportMode, boolean>>({ demo: true, live: true });
   const [markets, setMarkets] = useState<Record<ExportMarket, boolean>>({
     stocks: true,
-    crypto: true,
     options: true,
   });
   const [format, setFormat] = useState<ExportFormat>('csv');

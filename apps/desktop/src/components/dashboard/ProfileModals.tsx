@@ -1,6 +1,6 @@
 // TRA-422 — the three profile-menu modals (Settings, Change Password, User
-// Management) extracted from Dashboard.tsx / CryptoDashboard.tsx, which carried
-// byte-identical copies. Behaviour is unchanged: backdrop click closes, the
+// Management) extracted from Dashboard.tsx. Behaviour is unchanged: backdrop
+// click closes, the
 // inner card stops propagation, and User Management is gated on `isAdmin`.
 import type { LiveCredentialField } from '@trading-app/shared';
 import SettingsPage, { ChangePasswordSection, UserManagementSection } from '../../SettingsPage.tsx';
@@ -23,7 +23,7 @@ export function ProfileModals({
   onClose: () => void;
   token: string;
   httpUrl: string;
-  context: 'crypto' | 'stocks';
+  context: 'stocks';
   isAdmin: boolean;
   onModeChange: (mode: 'demo' | 'live') => void;
   onSettingsSaved: (settings: import('@trading-app/shared').AccountSettings) => void;

@@ -18,12 +18,12 @@ export interface BbFadeOptions {
   /**
    * RSI long-entry threshold (default: 35).
    *
-   * TRA-170 follow-up: raised from 30 → 35 after the real-Coinbase acceptance
-   * run showed RSI<30 fires on only ~5% of 1h crypto bars; <35 catches roughly
+   * TRA-170 follow-up: raised from 30 → 35 after the real-data acceptance
+   * run showed RSI<30 fires on only ~5% of 1h bars; <35 catches roughly
    * 13% and still rejects shallow pullbacks that aren't oversold.
    */
   rsiOversold?: number;
-  /** Set false for 24/7 markets like crypto (default: true). */
+  /** Set false for 24/7 markets (default: true). */
   enforceTimeFilter?: boolean;
   /** ATR lookback period (default: 14). */
   atrPeriod?: number;

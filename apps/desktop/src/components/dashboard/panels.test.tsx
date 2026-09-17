@@ -1,5 +1,5 @@
 // TRA-422 — component tests for the dashboard panels extracted from the
-// Dashboard.tsx / CryptoDashboard.tsx decomposition. Each panel is rendered in
+// Dashboard.tsx decomposition. Each panel is rendered in
 // isolation; panels that call useToast are wrapped in <ToastProvider>. fetch is
 // stubbed so the watchlist/close mutations never hit the network.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -7,7 +7,7 @@ import { render, screen, act, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactElement } from 'react';
 import type {
-  Position, TradeSignal, AccountState, NewsItem, CryptoSymbolState, AccountSettings, OptionPosition,
+  Position, TradeSignal, AccountState, NewsItem, AccountSettings, OptionPosition,
 } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import { ToastProvider } from '../../lib/toast.tsx';
@@ -18,9 +18,6 @@ import { StockSignalsPanel } from './StockSignalsPanel';
 import { StockPositionsPanel } from './StockPositionsPanel';
 import { StockOptionsPanel } from './StockOptionsPanel';
 import { OptionsAlertsPanel } from './OptionsAlertsPanel';
-import { CryptoWatchlistPanel } from './CryptoWatchlistPanel';
-import { CryptoSignalsPanel } from './CryptoSignalsPanel';
-import { CryptoPositionsPanel } from './CryptoPositionsPanel';
 import { DashboardHeader } from './DashboardHeader';
 import { DashboardFooter } from './DashboardFooter';
 import { AccountSummaryCard } from './AccountSummaryCard';
@@ -40,11 +37,6 @@ function renderWithToast(ui: ReactElement) {
 
 const symbol = (over: Partial<SymbolState> = {}): SymbolState => ({
   symbol: 'NVDA', price: 100, volume: 2_000_000, change: 1.5, changePct: 1.5,
-  lastUpdated: Date.now(), quoteStatus: 'ok', ...over,
-});
-
-const cryptoSymbol = (over: Partial<CryptoSymbolState> = {}): CryptoSymbolState => ({
-  symbol: 'ETH-USD', price: 3000, volume: 5_000_000, change: 12, changePct: 0.4,
   lastUpdated: Date.now(), quoteStatus: 'ok', ...over,
 });
 
@@ -573,55 +565,6 @@ describe('OptionsAlertsPanel (TRA-1125)', () => {
   });
 });
 
-describe('CryptoWatchlistPanel (TRA-422)', () => {
-  it('rejects a symbol that is not in XXX-USD form', async () => {
-    renderWithToast(<CryptoWatchlistPanel token="t" symbols={[]} />);
-    await userEvent.type(screen.getByPlaceholderText('Add symbol (e.g. ETH-USD)'), 'ETH');
-    await userEvent.click(screen.getByRole('button', { name: 'Add' }));
-    expect(screen.getByText(/XXX-USD/)).toBeInTheDocument();
-    expect(fetch).not.toHaveBeenCalled();
-  });
-});
-
-describe('CryptoSignalsPanel (TRA-422)', () => {
-  it('renders a signal card', () => {
-    renderWithToast(
-      <CryptoSignalsPanel token="t" signals={[signal({ symbol: 'ETH-USD' })]} symbols={[cryptoSymbol()]} />,
-    );
-    expect(screen.getByText('ETH-USD')).toBeInTheDocument();
-    expect(screen.getByText('BUY')).toBeInTheDocument();
-  });
-});
-
-describe('CryptoPositionsPanel (TRA-422)', () => {
-  it('shows the empty state when there are no positions', () => {
-    renderWithToast(
-      <CryptoPositionsPanel token="t" openPositions={[]} closedPositions={[]} symbols={[]} liveSkips={[]} />,
-    );
-    expect(screen.getByText(/No open positions/)).toBeInTheDocument();
-  });
-
-  it('renders Leverage / Liquidation columns only when a perp is open', () => {
-    const { rerender } = renderWithToast(
-      <CryptoPositionsPanel
-        token="t" openPositions={[position({ symbol: 'ETH-USD' })]} closedPositions={[]}
-        symbols={[cryptoSymbol()]} liveSkips={[]}
-      />,
-    );
-    expect(screen.queryByText('Leverage')).not.toBeInTheDocument();
-    rerender(
-      <ToastProvider>
-        <CryptoPositionsPanel
-          token="t"
-          openPositions={[position({ symbol: 'ETH-USD', productType: 'perp', leverage: 3, liquidationPrice: 80 })]}
-          closedPositions={[]} symbols={[cryptoSymbol()]} liveSkips={[]}
-        />
-      </ToastProvider>,
-    );
-    expect(screen.getByText('Leverage')).toBeInTheDocument();
-    expect(screen.getByText('Liquidation')).toBeInTheDocument();
-  });
-});
 
 describe('DashboardHeader (TRA-422)', () => {
   it('renders the account stat group', () => {
@@ -806,8 +749,6 @@ describe('LiveCredentialsBanner (TRA-506)', () => {
       liveTradierEnvOptions: 'production',
       liveApiKeyOptionsProduction: 'prod-token',
       liveAccountIdOptionsProduction: 'VA123',
-      liveApiKeyCrypto: 'cb-key',
-      liveApiSecretCrypto: 'cb-secret',
     };
   }
 
@@ -822,8 +763,6 @@ describe('LiveCredentialsBanner (TRA-506)', () => {
       mode: 'demo',
       liveApiKeyOptionsProduction: '',
       liveAccountIdOptionsProduction: '',
-      liveApiKeyCrypto: '',
-      liveApiSecretCrypto: '',
     };
     const { container } = render(<LiveCredentialsBanner settings={demoBlank} onOpenSettings={() => {}} />);
     expect(container).toBeEmptyDOMElement();
@@ -853,57 +792,17 @@ describe('LiveCredentialsBanner (TRA-506)', () => {
     expect(onOpenSettings).toHaveBeenCalledWith('liveApiKeyOptionsProduction');
   });
 
-  it('renders a warning when live + Coinbase creds are blank', () => {
-    const broken: AccountSettings = {
-      ...liveFullCreds(),
-      liveApiKeyCrypto: '',
-      liveApiSecretCrypto: '',
-    };
-    render(<LiveCredentialsBanner settings={broken} onOpenSettings={() => {}} />);
-    expect(screen.getByTestId('live-credentials-banner')).toBeInTheDocument();
-    expect(screen.getByText(/Coinbase API key/)).toBeInTheDocument();
-    expect(screen.getByText(/Coinbase API secret/)).toBeInTheDocument();
-  });
-
-  // TRA-798 — the banner is rendered on both dashboards; `market` scopes it so
-  // the crypto warning lives on the Crypto dashboard and the Tradier warning on
-  // the Stocks dashboard, instead of every page surfacing every market's creds.
-  it('market="crypto" surfaces only Coinbase fields, ignoring blank Tradier creds', () => {
+  // TRA-4629 — the retired Coinbase credential fields still exist on the shared
+  // union until the backend removal lands; the banner must never surface them.
+  it('never surfaces the retired Coinbase fields, even when the validator reports them missing', () => {
     const broken: AccountSettings = {
       ...liveFullCreds(),
       liveApiKeyOptionsProduction: '',
       liveAccountIdOptionsProduction: '',
-      liveApiKeyCrypto: '',
-      liveApiSecretCrypto: '',
-    };
-    render(<LiveCredentialsBanner settings={broken} market="crypto" onOpenSettings={() => {}} />);
-    expect(screen.getByText(/Coinbase API key/)).toBeInTheDocument();
-    expect(screen.queryByText(/Tradier production API token/)).not.toBeInTheDocument();
-  });
-
-  it('market="stocks" surfaces only Tradier fields, ignoring blank Coinbase creds', () => {
-    const broken: AccountSettings = {
-      ...liveFullCreds(),
-      liveApiKeyOptionsProduction: '',
-      liveAccountIdOptionsProduction: '',
-      liveApiKeyCrypto: '',
-      liveApiSecretCrypto: '',
     };
     render(<LiveCredentialsBanner settings={broken} market="stocks" onOpenSettings={() => {}} />);
     expect(screen.getByText(/Tradier production API token/)).toBeInTheDocument();
-    expect(screen.queryByText(/Coinbase API key/)).not.toBeInTheDocument();
-  });
-
-  it('market="crypto" renders nothing when only Tradier creds are blank', () => {
-    const broken: AccountSettings = {
-      ...liveFullCreds(),
-      liveApiKeyOptionsProduction: '',
-      liveAccountIdOptionsProduction: '',
-    };
-    const { container } = render(
-      <LiveCredentialsBanner settings={broken} market="crypto" onOpenSettings={() => {}} />,
-    );
-    expect(container).toBeEmptyDOMElement();
+    expect(screen.queryByText(/Coinbase/)).not.toBeInTheDocument();
   });
 });
 

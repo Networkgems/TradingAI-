@@ -99,7 +99,6 @@ import {
   buildStockLegProbeReadOperands,
   sumBrokerFeesOverSpan,
 } from './stock-leg-probe-operands.js';
-import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { buildJournalCalendarCells, nonSessionCloseRetractions } from './reports/desk-calendar.js';
 import { foldDeskRows } from './test-accounts.js'; // TRA-2554 — the desk fold names itself on the wire
 // TRA-3100 — the live-calendar backfill's write decision (which cells it is
@@ -207,13 +206,6 @@ import { runZombieOpenSweep } from './zombie-open-journal-sweep.js';
 import { foldModelFacingEodJournal } from './model-facing-journal.js';
 // TRA-1046 (TRA-1041c L2) — synchronous on-demand hypothesis backtest behind
 // POST /api/backtest, reusing the audited apply→backtest→G0-grade pipeline.
-import {
-  runOnDemandBacktest,
-  validateBacktestRequest,
-  OnDemandBacktestBadRequest,
-  type OnDemandBacktestRequest,
-} from './backtest-on-demand.js';
-import { makeBacktestExecutor, RV_CRYPTO_MAJORS_BASE_CONFIG } from './backtest-executor.js';
 // TRA-1000 — external-intel source-quality scorer: per-source advisory weights
 // folded from the attribution log × hypothesis-queue gate outcomes.
 import { isExternalIntelEnabled } from './external-intel.js';
@@ -244,82 +236,6 @@ import {
   recordSeededEnvKey,
   DEMO_FLAG_ALLOWLIST,
 } from './demo-flags.js';
-// TRA-1216 — observe-only perp funding-carry scanner + forward funding-history
-// accrual. Flag-checked before any fetch so ENABLE_PERP_FUNDING_CARRY_OBSERVE
-// off ⇒ zero cost/IO. Read-only: no order/entry/sizing path.
-import {
-  isPerpFundingCarryEnabled,
-  resolvePerpCarryConfig,
-  resolvePerpCarryWatchlist,
-} from './perp-funding-carry-flag.js';
-import {
-  scanFundingCarry,
-  recordFundingCarryScan,
-  type FundingObservation,
-} from './perp-funding-carry-scanner.js';
-import { appendFundingHistory, type FundingHistoryEntry } from './perp-funding-history.js';
-// TRA-1220 — observe-only crypto regime-filter overlay (ADX/CHOP/ER classifier).
-// Flag-checked before any 4H candle fetch so ENABLE_CRYPTO_REGIME_OVERLAY off ⇒
-// zero cost/IO. Read-only: emits regime labels only, no order/entry/sizing path.
-import {
-  isCryptoRegimeEnabled,
-  resolveCryptoRegimeConfig,
-  resolveCryptoRegimeWatchlist,
-} from './crypto-regime-flag.js';
-import {
-  observeCryptoRegime,
-  summarizeCryptoRegimeScans,
-  buildCryptoRegimeEodSection,
-} from './crypto-regime-scanner.js';
-// TRA-1221 — observe-only regime-gated TSMOM crypto scanner (widen bands + bear
-// short/flat gate over the TRA-1220 regime label). Flag-checked before any 4H
-// fetch so ENABLE_CRYPTO_REGIME_TSMOM off ⇒ zero cost/IO. Read-only: emits would-
-// be long/exit/short-observe SIGNALS + forward net-of-fee evidence, no order path.
-import {
-  isRegimeTsmomEnabled,
-  isRegimeTsmomDemoRouteEnabled,
-  resolveRegimeTsmomConfig,
-  resolveRegimeTsmomWatchlist,
-} from './crypto-regime-tsmom-flag.js';
-import {
-  observeRegimeTsmom,
-  summarizeRegimeTsmomScans,
-  buildRegimeTsmomEodSection,
-  persistRegimeTsmomPass,
-  hydrateRegimeTsmomFromDisk,
-  type RegimeTsmomState,
-} from './crypto-regime-tsmom-scanner.js';
-// TRA-1317 — DEMO paper routing for the regime-gated TSMOM scanner (board
-// interaction 7042a614 = demo). Standalone, demo-scoped: an isolated CryptoPaperAccount
-// route book with NO live path, so arming can never touch real capital. Routes on
-// enter_long/exit_long transitions, persists a restart-safe JSONL + snapshot, and
-// surfaces its open longs to the crypto dashboard for the "movement" the board wants.
-import {
-  routeRegimeTsmomResults,
-  hydrateRegimeTsmomDemoRouteFromDisk,
-  summarizeRegimeTsmomDemoRoute,
-} from './crypto-regime-tsmom-demo-route.js';
-// TRA-2411 — that route book is a PROCESS-GLOBAL singleton with no user key. Both
-// of its per-user surfaces (the dashboard position injection below, and the EOD
-// report rollup line) go through this scope so the firm's paper book is not served
-// to every account as its own.
-import {
-  demoRoutePositionsFor,
-  mayViewFirmWideDemoRouteBook,
-} from './crypto-demo-route-scope.js';
-// TRA-1271 — observe-only crypto ignition scanner (strict RVOL>=6 Donchian
-// breakout + squeeze + EMA50 trend, bull-only). Flag-checked before any 4H fetch so
-// ENABLE_CRYPTO_IGNITION_SCANNER off => zero cost/IO. Read-only, ZERO capital:
-// emits would-be forward records + the would-a-limit-fill instrument only, no order path.
-import {
-  isCryptoIgnitionEnabled,
-  resolveIgnitionConfig,
-  resolveIgnitionWatchlist,
-} from './crypto-ignition-flag.js';
-import {
-  observeIgnition,
-  hydrateIgnitionFromDisk,
-} from './crypto-ignition-scanner.js';
 import { hydrateConvictionDcaFromDisk } from './conviction-dca-ledger.js';
 import {
   hydrateOptionsIdeasExpectancyFromDisk,
@@ -477,8 +393,6 @@ import { summarizeLiveArmCensus } from './live-arm-census.js';
 import { hydrateCensusFromDir, persistCensusDaySync } from './broker-submit-census.js';
 import { runLiveOptionsFeeReconcile, type FeeReconcileAccount } from './live-options-fee-reconcile.js'; // TRA-2810/TRA-2850/TRA-4295
 import { runOpenBasisRegradePass, type OpenBasisRegradeDeps } from './tra4453-open-basis-regrade.js'; // TRA-4453
-import { fetchCrypto4hBars } from './crypto-feed.js';
-import type { CryptoSignalEngine } from './crypto-engine.js';
 // TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
 // before any deps are built (zero cost while ENABLE_ANALYST_AGENT is off) and are
 // hooked onto the existing onPremarket / onArchive market-scheduler ticks.
@@ -586,15 +500,12 @@ import {
 import { LLM_KILL_ENV_VAR, isAgentMarketHoursGateDisabled } from './trading-agents-advisory.js';
 import {
   initWatchlistStore,
-  getCryptoWatchlistData,
   getStocksWatchlistData,
-  addCryptoSymbol,
-  removeCryptoSymbol,
   addStocksSymbol,
   removeStocksSymbol,
   seedReviewLeaders,
 } from './watchlist-store.js';
-import { scanStocksMarket, scanCryptoMarket } from './market-scanner.js';
+import { scanStocksMarket } from './market-scanner.js';
 import { runPremarketForAllUsers } from './premarket-watchlist.js';
 import {
   runMorningBriefForAllUsers,
@@ -876,8 +787,9 @@ import {
   checkErrorSpike,
   runAlertingSelfTest,
 } from './observability/index.js';
-// TRA-1684 — from the module, not the barrel: the barrel re-export dragged the crypto
-// route graph behind every logger import and manufactured the TRA-1674 cycle.
+// TRA-1684 — from the module, not the barrel: the barrel re-export previously
+// dragged a heavy route graph behind every logger import and manufactured the
+// TRA-1674 cycle.
 import { registerLiveHealthRoutes, runStaleStateCheck, projectFleetBooks, rollUpExitCadence } from './observability/health-routes.js';
 // TRA-2840 — durable RTH open/close snapshots of the exit-cadence rollup.
 import {
@@ -891,9 +803,7 @@ import {
   rotateBackups,
   checkDataDirHealth,
   loadStocksTradeSnapshot,
-  loadCryptoTradeSnapshot,
   type StocksTradeSnapshot,
-  type CryptoTradeSnapshot,
   // TRA-3407 — resolve the snapshot paths through the writer's own helper so the
   // write-axis instrument stats the file that is actually written.
   snapshotFilePathFor,
@@ -911,9 +821,6 @@ import {
   type PersistAxis,
   type PersistRowInput,
 } from './snapshot-persist-health.js';
-// TRA-3432 — the crypto axis of the TRA-3407 verdict is only interpretable
-// alongside the master kill switch that decides whether its engine ticks at all.
-import { isCryptoEngineEnabled, CRYPTO_ENGINE_FLAG } from './crypto-engine-flag.js';
 import {
   buildExport,
   toCsv,
@@ -973,7 +880,6 @@ import {
   SHORT_SQUEEZE_FORWARD_SESSIONS,
 } from './short-squeeze-forward-resolver.js';
 import {
-  CoinbaseOrderClient,
   tradierBaseUrl,
   TradierOptionsClient,
   DEFAULT_SHORT_SQUEEZE_THRESHOLDS,
@@ -1035,8 +941,6 @@ import {
   runTra1472StaleCellCleanup,
   runTra3064SidecarReclaim,
   runTra301DemoFreshStart,
-  runTra330CryptoEquityReset,
-  runTra338MegaUsdCleanup,
   initAllUserContexts,
   initUserContext,
   ensureUserContext,
@@ -1045,14 +949,10 @@ import {
   tryGetUserContext,
   getLiveBrokerBootArmOutcome,
   persistStocksNow,
-  persistCryptoNow,
   setRvScanner,
   stockModeKey,
-  cryptoModeKey,
   stockReportsDirFor,
-  cryptoReportsDirFor,
   type StockModeKey,
-  type CryptoModeKey,
   type UserContext,
 } from './user-context.js';
 // TRA-3879 — the cross-engine fleet-capital read (`Σ E_i`) behind
@@ -1062,8 +962,6 @@ import { setAssetClassWatchlistProvider } from './underlying-asset-class.js';
 import {
   resolveTradierOptionsCreds,
   isLiveTradierOptionsEnabled,
-  STRATEGY_PRESETS,
-  DEFAULT_STRATEGY_PRESET_ID,
   WATCHLIST,
   aliasWatchlistSymbol,
   aggregateStockTwitsSentiment,
@@ -1077,7 +975,6 @@ import {
   type ResearchReport,
   type EodReport,
   type EodMover,
-  type StrategyPresetId,
   type Position,
   type OptionPosition,
   ALERT_CHANNELS,
@@ -1122,13 +1019,11 @@ import {
   ensureStrategyRegistered,
   PromotionValidationError,
 } from './promotion-store.js';
-import { seedDcaAccumulationBacktest } from './promotion-dca-seed.js';
 import {
   buildPromotionStatus,
   buildPublicPromotionProbe,
   snapshotPaperMetrics,
   evaluateLiveTransitionGate,
-  evaluateLiveCryptoStartGate,
 } from './promotion-service.js';
 import { resolveDataDir } from './data-dir.js';
 // TRA-3595 — the host execution path for the TRA-2906 v1→v2 cash-flow rebuild.
@@ -1298,18 +1193,6 @@ await ensureStrategyRegistered('supertrend_confluence').catch(err =>
   }),
 );
 
-// TRA-1579 — seed the crypto-DCA Stage-1 accumulation-backtest verdict (TRA-1465
-// accumulate leg) so `dca` carries a REAL pass/fail Stage-1 on the go-live gate
-// instead of `missing` (parent TRA-1575). Idempotent + non-clobbering: a later
-// admin registration via `POST /api/promotion/accumulation-backtest` wins. Flips
-// no live flag — Stage-3 board sign-off still gates the live transition, and the
-// seeded verdict is FAIL on the current OOS data.
-await seedDcaAccumulationBacktest().catch(err =>
-  log.warn('TRA-1579 seedDcaAccumulationBacktest failed', {
-    reason: err instanceof Error ? err.message : String(err),
-  }),
-);
-
 // TRA-191 — server-side relative-value scanner. The only options strategy
 // active for stock options in this iteration; OTM mispricing and per-equity
 // ATM auto-open are disabled. Wired into user-context BEFORE any contexts
@@ -1437,23 +1320,11 @@ await runTra1472StaleCellCleanup();
 // to a build that still does. Only removes a `.md` with a `.json` beside it.
 await runTra3064SidecarReclaim();
 // TRA-301 — full demo fresh-start: with the new strategy generation rolling
-// out for both Stocks and Crypto, the board asked to wipe every user's
+// out, the board asked to wipe every user's
 // persisted demo P&L, equity baselines, trade history, and calendar reports
 // so the dashboards open clean on the new strategies. Runs before context
 // bootstrap so engines load empty. Idempotent via marker file.
 await runTra301DemoFreshStart();
-// TRA-330 — one-shot crypto equity reset: prod demo crypto accounts drifted
-// into the billions because of a short cash-flow accounting bug. The bug
-// itself is fixed in crypto-account.ts; this migration clears the persisted
-// snapshots that already loaded the bad state. Crypto-only, idempotent.
-await runTra330CryptoEquityReset();
-// TRA-338 — surgical removal of the phantom MEGA-USD paper position opened
-// off Yahoo's frozen $4.05 ghost ticker (root cause in TRA-337). Refunds the
-// recorded cost basis to cash and drops the position before the engine boots
-// off the cleaned snapshot. Runs after TRA-330 so the equity reset (which
-// may itself wipe trades-crypto.json) doesn't undo the cleanup mid-flight.
-// Idempotent via marker file.
-await runTra338MegaUsdCleanup();
 await initAllUserContexts();
 
 // TRA-227 — drop a placeholder QuantTrader research report so the Stocks
@@ -2114,8 +1985,8 @@ async function generateAndSaveReport(
   // TRA-1981 (parent TRA-1967 item 2) — fold the realized-vs-modeled execution-quality
   // KPI (per asset class) into the EOD markdown so the board sees execution decay next
   // to the day's P&L. Options come from the durable fee/slippage ledger; equity from
-  // this book's open + closed positions carrying the TRA-536 entry-slippage stamp;
-  // crypto from the paired crypto book. Pure read of already-persisted data (no new
+  // this book's open + closed positions carrying the TRA-536 entry-slippage stamp.
+  // Pure read of already-persisted data (no new
   // writes). Best-effort — a fold failure logs and leaves the section absent, never
   // blocking the report.
   try {
@@ -2123,14 +1994,7 @@ async function generateAndSaveReport(
       ...finalSnapshot.state.account.openPositions,
       ...finalSnapshot.allClosedPositions,
     ];
-    let cryptoPositions: Position[] = [];
-    try {
-      const cs = ctx.cryptoEngine.getState();
-      cryptoPositions = [...cs.account.openPositions, ...cs.closedPositions];
-    } catch {
-      // Crypto book unavailable this tick — the equity + (durable) options legs still fold.
-    }
-    finalSnapshot.executionQuality = buildExecutionQualityKpi({ equityPositions, cryptoPositions });
+    finalSnapshot.executionQuality = buildExecutionQualityKpi({ equityPositions });
   } catch (err) {
     log.warn('execution-quality EOD fold failed', {
       username: ctx.username,
@@ -4577,372 +4441,16 @@ async function runLiveRealizedCalendarBackfill(): Promise<void> {
   }
 }
 
-
-async function generateAndSaveCryptoReport(ctx: UserContext): Promise<void> {
-  // TRA-244 — same per-mode bucketing as the stocks generator above; crypto
-  // only has demo vs live (no sandbox) since Coinbase has no paper sandbox.
-  // TRA-245 — pass the mode into getReportSnapshot so the Live folder gets
-  // Live (Coinbase) data and the Demo folder gets Demo paper-account data;
-  // pre-fix the snapshot was always Demo even when written under live/.
-  const mode = cryptoModeKey(getSettings(ctx.username));
-  const snapshot = ctx.cryptoEngine.getReportSnapshot(mode);
-  const baseReport = generateCryptoEodReport(snapshot);
-  // TRA-1220 — append the observe-only "Crypto Regime Overlay" section, folding
-  // the forward regime labels captured this session (empty/disabled fallback when
-  // the overlay flag is off). Read-only: no orders, no fetch here.
-  const regimeSection = buildCryptoRegimeEodSection(
-    isCryptoRegimeEnabled(),
-    summarizeCryptoRegimeScans(),
-  );
-  // TRA-1221 — append the observe-only "Crypto Regime-Gated TSMOM" section, folding
-  // the forward would-be signals + net-of-taker round-trip evidence captured this
-  // session (empty/disabled fallback when the scanner flag is off). Read-only.
-  const regimeTsmomSection = buildRegimeTsmomEodSection(
-    isRegimeTsmomEnabled(),
-    summarizeRegimeTsmomScans(),
-  );
-  // TRA-1317 — append a one-line DEMO-route rollup under the observe-only section:
-  // whether paper routing is armed + the accrued open/fill/realized-R evidence. Kept
-  // out of buildRegimeTsmomEodSection (scanner module) to avoid a scanner→route
-  // import cycle. Read-only: folds the route ledger, places no order.
-  //
-  // TRA-2411 — the SECOND per-user reader of that process-global book, and the
-  // reason this fix is not just the dashboard provider: these are the FIRM's
-  // counters (open/fills/closed/realized-R across every routed symbol), and this
-  // report is written per user under their own reports directory. Same operator
-  // scope as the dashboard injection; an ordinary account's crypto EOD report
-  // simply omits the line rather than reporting the firm's ledger as its own.
-  const showDemoRoute = mayViewFirmWideDemoRouteBook(ctx.username, getUser(ctx.username)?.role);
-  const demoRoute = summarizeRegimeTsmomDemoRoute();
-  const demoRouteEnabled = isRegimeTsmomDemoRouteEnabled(demoFlagEnv());
-  const regimeTsmomDemoRouteLine = !showDemoRoute
-    ? ''
-    : demoRouteEnabled
-    ? `\n_DEMO paper routing **armed** — open ${demoRoute.openPositions} · fills ${demoRoute.fillCount} · closed ${demoRoute.closeCount} · realized ${demoRoute.realizedR}R (paper, zero real capital)._`
-    : `\n_DEMO paper routing disarmed (CRYPTO_REGIME_TSMOM_DEMO_ROUTE_ENABLED off)._`;
-  const report = {
-    ...baseReport,
-    markdown: `${baseReport.markdown}\n${regimeSection}\n${regimeTsmomSection}${regimeTsmomDemoRouteLine}\n`,
-  };
-  const targetDir = cryptoReportsDirFor(ctx, mode);
-  const datePath = join(targetDir, `${report.date}.json`);
-  const latestJsonPath = join(targetDir, 'latest.json');
-
-  // TRA-3064 — the `<date>.md` / `latest.md` sidecars are gone. `report.markdown`
-  // is a field on the object serialized into the JSON beside them, so they were
-  // the same bytes on a second inode, and no read path ever opened them.
-  await Promise.all([
-    writeFile(datePath, JSON.stringify(report, null, 2), 'utf-8'),
-    writeFile(latestJsonPath, JSON.stringify(report, null, 2), 'utf-8'),
-  ]);
-
-  // TRA-193 — persist the day's equity snapshot so the crypto P&L calendar and
-  // cumulative stats see this row, mirroring the stocks flow above.
-  // TRA-245 — only write to cryptoTracker in demo mode. The tracker is shared
-  // across both crypto modes, and saveSnapshot rebases the demo dashboard's
-  // openingEquity to the snapshot's closingEquity. Writing a live-equity row
-  // here would corrupt that baseline (e.g. a $0 live equity from missing
-  // Coinbase creds would make the demo dashboard report a phantom -$25k
-  // dailyPnl after a restart). Live equity history lives in the per-mode
-  // crypto-reports/live/ files and longer-term in Coinbase's account history.
-  if (mode === 'demo') {
-    const closingEquity = snapshot.accountState.totalEquity;
-    const openingEquity = ctx.cryptoTracker.getOpeningEquity();
-    ctx.cryptoTracker.saveSnapshot({
-      date: report.date,
-      openingEquity,
-      closingEquity,
-      dailyPnl: closingEquity - openingEquity,
-      optionsPnl: 0,
-      optionsDailyPnl: 0, // TRA-1633 — crypto book has no options leg
-      combinedPnl: closingEquity - openingEquity,
-      trades: snapshot.allClosedPositions.length,
-    });
-  }
-
-  log.info('crypto EOD report saved', { username: ctx.username, datePath });
-
-  const msg = JSON.stringify({ type: 'crypto_eod_report', payload: report });
-  broadcastToUser(ctx.username, msg);
-}
-
 // TRA-244 — Single 9 PM ET close-out for every user. Order is load-bearing:
 //   1. Generate today's EOD reports + persist the equity snapshot for the
 //      Calendar. We do this BEFORE resetting dailyPnl so the report's combined
-//      P&L still reflects the day. Stocks only on market days; crypto every
-//      day (24/7).
-//   2. Reset the in-memory `dailyPnl` baseline on both engines so the next
+//      P&L still reflects the day. Stocks only on market days.
+//   2. Reset the in-memory `dailyPnl` baseline on the engine so the next
 //      tick broadcasts a fresh 0 for the new trading day. The persisted
 //      tracker.openingEquity is realigned in lock-step.
 //   3. Archive the rolling "Recent Closed" lists so the Positions/Options
 //      tabs start the next session blank.
 //   4. Persist + broadcast so connected clients see the reset immediately.
-// TRA-249-D — top-of-hour fan-out: every active user's crypto engine gets
-// one funding-accrual pass per ET hour. Demo and uninitialised-broker
-// engines short-circuit inside `tickFundingHourly`, so this is essentially
-// free unless the user is running live perps. Failures per-user are
-// isolated so one user's outage can't starve the rest of the fleet.
-async function runHourlyFundingForAllUsers(): Promise<void> {
-  for (const ctx of getAllUserContexts()) {
-    try {
-      await ctx.cryptoEngine.tickFundingHourly();
-    } catch (err) {
-      log.error('funding hourly tick failed', {
-        username: ctx.username,
-        reason: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-}
-
-// TRA-1216 — observe-only perp funding-carry pass, fired off the SAME hourly hook
-// as the funding accrual above. When ENABLE_PERP_FUNDING_CARRY_OBSERVE is OFF this
-// returns before any work ⇒ zero cost/IO. When ON it fetches funding + mark price
-// for EVERY watchlist perp (regardless of open positions), records the ranked
-// observe-only carry candidates into the in-memory store backing
-// `GET /api/health/perp-funding-carry`, and appends the observations to the
-// forward funding-history JSONL under DATA_DIR (the sole persisted artifact — it
-// unblocks a future carry backtest). Read-only throughout: NO order/entry/sizing.
-//
-// The fetch is done ONCE per hour off any live Coinbase client in the fleet
-// (funding is venue-global, not per-user). Demo/keyless fleets have no live
-// client ⇒ no fetch, no writes. Coinbase INTX funds hourly ⇒ intervalHours = 1;
-// the scanner annualizes off that per-observation interval, not a hardcoded 8h.
-async function runHourlyPerpFundingCarry(): Promise<void> {
-  if (!isPerpFundingCarryEnabled()) return; // flag OFF ⇒ zero cost/IO
-  const watchlist = resolvePerpCarryWatchlist();
-  if (watchlist.length === 0) return;
-
-  let client: ReturnType<CryptoSignalEngine['getPerpFundingClient']> = null;
-  for (const ctx of getAllUserContexts()) {
-    client = ctx.cryptoEngine.getPerpFundingClient();
-    if (client) break;
-  }
-  if (!client) return; // no live client (demo/keyless) ⇒ no fetch, no writes
-
-  let rates: Map<string, { rate: number }>;
-  let prices: Map<string, number>;
-  try {
-    [rates, prices] = await Promise.all([
-      client.getFundingRates(watchlist),
-      client.getProductPrices(watchlist).catch(() => new Map<string, number>()),
-    ]);
-  } catch (err) {
-    log.warn('perp funding-carry fetch failed (TRA-1216)', {
-      reason: err instanceof Error ? err.message : String(err),
-    });
-    return;
-  }
-
-  const asOf = Date.now();
-  const observations: FundingObservation[] = watchlist.map((productId) => {
-    const fr = rates.get(productId);
-    const mark = prices.get(productId);
-    return {
-      productId,
-      fundingRate: fr && Number.isFinite(fr.rate) ? fr.rate : null,
-      intervalHours: 1, // Coinbase INTX funding cadence
-      markPrice: mark != null && Number.isFinite(mark) ? mark : null,
-      ts: asOf,
-    };
-  });
-
-  const candidates = scanFundingCarry(observations, resolvePerpCarryConfig(), asOf);
-  recordFundingCarryScan(candidates, asOf);
-
-  const history: FundingHistoryEntry[] = observations
-    .filter((o): o is FundingObservation & { fundingRate: number } => o.fundingRate != null)
-    .map((o) => ({
-      ts: o.ts ?? asOf,
-      productId: o.productId,
-      fundingRate: o.fundingRate,
-      intervalHours: o.intervalHours,
-      markPrice: o.markPrice ?? null,
-    }));
-  const rows = appendFundingHistory(DATA_DIR, history);
-
-  log.info('perp funding-carry observe pass (TRA-1216)', {
-    watchlist: watchlist.length,
-    eligible: candidates.filter((c) => c.eligible).length,
-    missing: candidates.filter((c) => c.reason === 'funding_data_missing').length,
-    historyRows: rows,
-  });
-}
-
-// TRA-1220 — per-symbol dedupe so we re-classify at most once per newly-closed 4H
-// bar (spec §6): keyed on the ISO of the last CLOSED bar we last classified.
-const lastCryptoRegimeBarBySymbol = new Map<string, string>();
-
-// TRA-1220 — observe-only crypto regime-overlay pass, fired off the SAME hourly
-// hook as the funding-carry pass above. The core logic lives in the scanner
-// module's dependency-injected `observeCryptoRegime` (so the zero-IO-when-off
-// invariant is unit-testable). When ENABLE_CRYPTO_REGIME_OVERLAY is OFF it returns
-// before ANY fetch ⇒ provably zero cost/IO. When ON it pulls CLOSED 4H bars for
-// each watchlist major (keyless public Coinbase candles — the perp-shorts 4H cache
-// only covers 5 of the 12 majors, so a shared reuse isn't possible; this mirrors
-// funding-carry's own hourly fetch), drops the forming bar (invariant #3 — no
-// lookahead), classifies via the pure engine substrate, and records the ranked
-// labels into the store backing GET /api/health/crypto-regime. Read-only: NO
-// order/entry/sizing path. 4H bars roll every 4h so the hourly cadence + the
-// lastBarTime dedupe re-classify a symbol at most once per new bar.
-async function runHourlyCryptoRegime(): Promise<void> {
-  if (!isCryptoRegimeEnabled()) return; // fast-path: skip resolving deps when off
-  const result = await observeCryptoRegime({
-    enabled: true,
-    watchlist: resolveCryptoRegimeWatchlist(),
-    cfg: resolveCryptoRegimeConfig(),
-    fetch4h: (symbol) => fetchCrypto4hBars(symbol, 260),
-    lastBarBySymbol: lastCryptoRegimeBarBySymbol,
-    onError: (symbol, err) =>
-      log.warn('crypto regime 4H fetch failed (TRA-1220)', {
-        symbol,
-        reason: err instanceof Error ? err.message : String(err),
-      }),
-  });
-  if (result.recorded > 0) {
-    log.info('crypto regime observe pass (TRA-1220)', {
-      fetched: result.fetched,
-      classified: result.recorded,
-      trend: result.readings.filter(
-        (r) => r.regime === 'trend_up' || r.regime === 'trend_down',
-      ).length,
-      chop: result.readings.filter((r) => r.regime === 'chop').length,
-    });
-  }
-}
-
-// TRA-1221 — carried state for the regime-gated TSMOM scanner (TSMOM is stateful:
-// a would-be position persists between passes so entries/exits + turnover count
-// correctly). Both maps are process-global and mutated in place by the observe
-// routine; they stay empty while ENABLE_CRYPTO_REGIME_TSMOM is off (no pass runs).
-const lastRegimeTsmomBarBySymbol = new Map<string, string>();
-const regimeTsmomStateBySymbol = new Map<string, RegimeTsmomState>();
-
-// TRA-1264 — hydrate the accrual on boot so a restart/redeploy inside the multi-
-// week n≥20 window doesn't reset the completed-round-trip count to 0. Rebuilds the
-// in-memory round-trip store from the persisted JSONL, restores the turnover
-// anchor/total, and re-seeds the carried per-symbol state + last-bar dedupe maps.
-// Best-effort (a missing/corrupt file yields an empty hydration). Runs even when
-// the flag is off — reading two small files at boot is cheap and keeps the accrual
-// intact if the flag is later toggled on.
-{
-  const h = hydrateRegimeTsmomFromDisk(DATA_DIR);
-  for (const [k, v] of h.stateBySymbol) regimeTsmomStateBySymbol.set(k, v);
-  for (const [k, v] of h.lastBarBySymbol) lastRegimeTsmomBarBySymbol.set(k, v);
-  if (h.totalRoundTrips > 0 || h.stateBySymbol.size > 0) {
-    log.info('crypto regime-tsmom accrual hydrated (TRA-1264)', {
-      roundTripsLoaded: h.roundTripsLoaded,
-      totalRoundTrips: h.totalRoundTrips,
-      carriedSymbols: h.stateBySymbol.size,
-    });
-  }
-}
-
-// TRA-1317 — hydrate the DEMO paper-route book on boot so an open routed long and
-// the realized-R accrual survive the ~daily Render demo (`tradingai-bqb1`) reboot.
-// Restores the isolated CryptoPaperAccount route book + counters from the state
-// snapshot under DATA_DIR (the JSONL is the append-only audit). Runs even when the
-// route flag is off — reading one small file at boot is cheap and keeps the ledger
-// intact if the flag is later armed. NO live path is touched (the route book has none).
-{
-  const h = hydrateRegimeTsmomDemoRouteFromDisk(DATA_DIR);
-  if (h.fillCount > 0 || h.openPositions > 0) {
-    log.info('crypto regime-tsmom demo-route hydrated (TRA-1317)', {
-      openPositions: h.openPositions,
-      fillCount: h.fillCount,
-      closeCount: h.closeCount,
-      realizedR: h.realizedR,
-    });
-  }
-}
-
-// TRA-1221 — observe-only regime-gated TSMOM pass, fired off the SAME hourly hook
-// as the funding-carry and regime-overlay passes above. When ENABLE_CRYPTO_REGIME_TSMOM
-// is OFF it returns before ANY fetch ⇒ provably zero cost/IO. When ON it pulls
-// CLOSED 4H bars for each watchlist major, drops the forming bar (invariant #3 —
-// no lookahead), classifies the regime AND computes r_L off the SAME closed series
-// (no double fetch / time-skew), runs the pure regime gate (§3), and records the
-// would-be signals + completed round trips into the store backing
-// GET /api/health/crypto-regime-tsmom. Read-only: NO order/entry/sizing path — the
-// short_observe leg is never sized (invariant #4). 4H bars roll every 4h so the
-// hourly cadence + the lastBarTime dedupe scan a symbol at most once per new bar.
-async function runHourlyCryptoRegimeTsmom(): Promise<void> {
-  if (!isRegimeTsmomEnabled()) return; // fast-path: skip resolving deps when off
-  const result = await observeRegimeTsmom({
-    enabled: true,
-    watchlist: resolveRegimeTsmomWatchlist(),
-    regimeCfg: resolveCryptoRegimeConfig(),
-    cfg: resolveRegimeTsmomConfig(),
-    fetch4h: (symbol) => fetchCrypto4hBars(symbol, 260),
-    lastBarBySymbol: lastRegimeTsmomBarBySymbol,
-    stateBySymbol: regimeTsmomStateBySymbol,
-    onError: (symbol, err) =>
-      log.warn('crypto regime-tsmom 4H fetch failed (TRA-1221)', {
-        symbol,
-        reason: err instanceof Error ? err.message : String(err),
-      }),
-  });
-  // TRA-1264 — persist the pass so the completed-round-trip accrual and any
-  // in-flight would-be position survive a restart/redeploy. Best-effort inside
-  // the scanner module (an I/O failure never breaks the observe pass). Runs only
-  // when a scan actually happened (a new closed bar advanced) so an idle pass
-  // doesn't rewrite the snapshot needlessly.
-  if (result.scanned > 0) {
-    persistRegimeTsmomPass(
-      DATA_DIR,
-      result.results,
-      regimeTsmomStateBySymbol,
-      lastRegimeTsmomBarBySymbol,
-    );
-    const signals = result.results.filter(
-      (r) => r.action === 'enter_long' || r.action === 'short_observe',
-    ).length;
-    const exits = result.results.filter((r) => r.action === 'exit_long' || r.roundTrip).length;
-    if (signals > 0 || exits > 0) {
-      log.info('crypto regime-tsmom observe pass (TRA-1221)', {
-        fetched: result.fetched,
-        scanned: result.scanned,
-        newSignals: signals,
-        roundTrips: result.results.filter((r) => r.roundTrip).length,
-      });
-    }
-
-    // TRA-1317 — DEMO paper routing. When the standalone, demo-scoped route flag
-    // is armed (resolved through the SAME demo-flags overlay the engine consults,
-    // so a non-admin operator can arm it via DATA_DIR/demo-flags.json), route this
-    // pass's enter_long/exit_long transitions into the isolated CryptoPaperAccount
-    // route book. Structurally DEMO-only: that book has no live path, so this can
-    // never touch real capital regardless of the host. Off by default ⇒ no-op.
-    if (isRegimeTsmomDemoRouteEnabled(demoFlagEnv())) {
-      const routed = routeRegimeTsmomResults(result.results, resolveRegimeTsmomConfig());
-      if (routed.opened > 0 || routed.closed > 0) {
-        log.info('crypto regime-tsmom demo-route fills (TRA-1317)', {
-          opened: routed.opened,
-          closed: routed.closed,
-        });
-      }
-    }
-  }
-}
-
-// TRA-1271 — hydrate the ignition forward-capture accrual on boot so a
-// restart/redeploy inside the multi-week taker-CI window doesn't reset the
-// resolved-record count to 0. Rebuilds the in-memory resolved list from the JSONL
-// close-lines, restores the turnover anchor/totals, and re-seeds the open fires +
-// dedupe maps. Best-effort (a missing/corrupt file yields an empty hydration).
-// Runs even when the flag is off — reading two small files at boot is cheap and
-// keeps the accrual intact if the flag is later toggled on.
-{
-  const h = hydrateIgnitionFromDisk(DATA_DIR);
-  if (h.totalResolved > 0 || h.openRecords > 0) {
-    log.info('crypto ignition accrual hydrated (TRA-1271)', {
-      resolvedLoaded: h.resolvedLoaded,
-      totalResolved: h.totalResolved,
-      openRecords: h.openRecords,
-    });
-  }
-}
-
 // TRA-1278 — hydrate the conviction-DCA add ledger on boot and remember DATA_DIR
 // for subsequent appends, so the TRA-971 forward-evidence gate's addCount/breachCount
 // survive the ~daily demo-host restart instead of resetting to a structural 0.
@@ -5700,42 +5208,6 @@ void initTapeExpectancyCache().catch((err: unknown) => {
   }
 }
 
-// TRA-1271 — observe-only crypto ignition pass, fired off the SAME hourly hook as
-// the funding-carry / regime-overlay / regime-TSMOM passes above. When
-// ENABLE_CRYPTO_IGNITION_SCANNER is OFF it returns before ANY fetch => provably
-// zero cost/IO. When ON it pulls CLOSED 4H bars for each watchlist name, drops the
-// forming bar (no lookahead), classifies the regime off the SAME closed series,
-// resolves any open fire forward (pessimistic TP/stop/timeout), then evaluates a
-// fresh fire on the last bar, recording the would-be forward records + the
-// would-a-limit-fill flag into the store backing GET /api/health/crypto-ignition
-// and persisting them to the JSONL/snapshot under DATA_DIR. Read-only, ZERO
-// capital: NO order/entry/sizing path (invariant #1). 4H bars roll every 4h so the
-// hourly cadence + the lastBarTime dedupe scan a symbol at most once per new bar.
-async function runHourlyCryptoIgnition(): Promise<void> {
-  if (!isCryptoIgnitionEnabled()) return; // fast-path: skip resolving deps when off
-  const result = await observeIgnition({
-    enabled: true,
-    watchlist: resolveIgnitionWatchlist(),
-    regimeCfg: resolveCryptoRegimeConfig(),
-    cfg: resolveIgnitionConfig(),
-    fetch4h: (symbol) => fetchCrypto4hBars(symbol, 260),
-    dataDir: DATA_DIR,
-    onError: (symbol, err) =>
-      log.warn('crypto ignition 4H fetch failed (TRA-1271)', {
-        symbol,
-        reason: err instanceof Error ? err.message : String(err),
-      }),
-  });
-  if (result.opened.length > 0 || result.resolved.length > 0) {
-    log.info('crypto ignition observe pass (TRA-1271)', {
-      fetched: result.fetched,
-      scanned: result.scanned,
-      opened: result.opened.length,
-      resolved: result.resolved.length,
-    });
-  }
-}
-
 async function runDailyCloseForAllUsers(): Promise<void> {
   const stocksMarketDay = isMarketDay();
   // TRA-388 — heal any calendar gap from a missed 21:00 ET archive tick
@@ -5802,44 +5274,30 @@ async function runDailyCloseForAllUsers(): Promise<void> {
           });
         }
       } else {
-        // Not a miss: the hook fires every calendar day for crypto, but no stock EOD
+        // Not a miss: the hook fires every calendar day, but no stock EOD
         // row is expected on a weekend/holiday. Recorded explicitly so it is excluded
         // from the participation denominator rather than buried in it.
         outcome = 'skipped_not_market_day';
       }
-      // 1b. Crypto EOD — every calendar day (24/7 market).
-      try {
-        await generateAndSaveCryptoReport(ctx);
-      } catch (err) {
-        log.error('crypto EOD report failed', {
-          username: ctx.username,
-          reason: err instanceof Error ? err.message : String(err),
-        });
-      }
 
       // 2. Reset dashboard daily-P&L baselines for the new trading day.
       ctx.engine.resetDailyPnl();
-      ctx.cryptoEngine.resetDailyPnl();
 
       // 2b. TRA-1053 (TRA-1045 R3) — release per-day in-memory ledgers so they
       // do not accumulate across trading days. Runs AFTER step 1 (the EOD report
-      // reads dailySignals). Stocks-only: CryptoSignalEngine has no dailySignals
-      // / conviction-DCA maps.
+      // reads dailySignals).
       ctx.engine.clearDailySessionState();
 
       // 3. Archive closed trades.
       const stocks = ctx.engine.archiveClosedTrades();
-      const crypto = ctx.cryptoEngine.archiveClosedTrades();
 
       // 4. Persist + broadcast.
-      await Promise.all([persistStocksNow(ctx), persistCryptoNow(ctx)]);
+      await persistStocksNow(ctx);
       broadcastEngineState(ctx);
-      broadcastCryptoState(ctx);
       log.info('archive: reset dailyPnl and archived closed trades', {
         username: ctx.username,
         closedPositions: stocks.positions,
         closedOptions: stocks.options,
-        closedCryptoPositions: crypto,
       });
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
@@ -5872,7 +5330,7 @@ async function runDailyCloseForAllUsers(): Promise<void> {
  * TRA-2252 — fire the scheduled P&L + trade-summary report for every user whose
  * cadence closes today. Runs from the 21:00 ET archive hook AFTER
  * `runDailyCloseForAllUsers` has booked today's snapshot into each user's
- * `tracker` / `cryptoTracker`, so "today" is in the window. The per-user cadence
+ * `tracker`, so "today" is in the window. The per-user cadence
  * decision + empty-period skip + boundary detection all live in the pure
  * `scheduled-report.ts`; here we only gather each user's combined snapshots +
  * resolved prefs and hand them off. Emit is fire-and-forget through the
@@ -5882,9 +5340,7 @@ function runScheduledReportsForAllUsers(now: Date = new Date()): void {
   const users = (): ReportUser[] =>
     getAllUserContexts().map((ctx) => ({
       username: ctx.username,
-      // Combine both books' booked daily ledgers; the aggregator merges rows
-      // that share a date across the two trackers.
-      snapshots: [...ctx.tracker.getSnapshots(), ...ctx.cryptoTracker.getSnapshots()],
+      snapshots: [...ctx.tracker.getSnapshots()],
       prefs: resolveAlertPreferences(getSettings(ctx.username)),
     }));
   try {
@@ -5913,7 +5369,7 @@ function runScheduledReportsForAllUsers(now: Date = new Date()): void {
 // RV scanners both need.
 //
 // Production creds come from the server env (TRADIER_API_TOKEN). A missing
-// token logs a warning and no-ops rather than throwing — equity/crypto
+// token logs a warning and no-ops rather than throwing — equity
 // trading is unaffected. Per-symbol errors are isolated inside
 // `recordOptionChains` and logged, never fatal.
 const CHAIN_RECORD_OUT_DIR = process.env['CHAINS_OUT_DIR'] ?? join(DATA_DIR, 'option-chains');
@@ -6837,23 +6293,6 @@ app.get('/api/health/tra2906-cash-flow-rebuild', (_req, res) => {
     armedMode: parseRebuildIntent(process.env[TRA2906_REBUILD_ENV_VAR]).mode,
     inventoryNow: inventoryCashFlowRecords(DATA_DIR, 'production'),
     bootRun,
-  });
-});
-
-// TRA-1304 — tokenless acceptance probe for the item-5 live DCA canary
-// (QuantTrader comment 4436ec31). Enumerates every engine's redacted canary
-// readout (booleans / counts / ids / aggregate notional only — no keys, prices,
-// or order specifics) so the canary ARM state and the four PASS criteria can be
-// verified against the live deployment without shipping Coinbase credentials
-// into an agent env. Unauthenticated by design, matching the other health
-// probes. Canary off / demo-only ⇒ canaryArmed:false and empty PASS evidence.
-app.get('/api/health/crypto-dca-canary', (_req, res) => {
-  res.json({
-    time: new Date().toISOString(),
-    engines: getAllUserContexts().map(ctx => ({
-      username: ctx.username,
-      ...ctx.cryptoEngine.getCryptoDcaCanaryAcceptance(),
-    })),
   });
 });
 
@@ -8760,7 +8199,7 @@ app.get('/api/health/snapshot-persist', async (_req, res) => {
   const rows: PersistRowInput[] = [];
   const outcomeByKey = new Map(outcomes.map(o => [`${o.axis}:${o.username}`, o]));
   for (const ctx of contexts) {
-    for (const axis of ['stocks', 'crypto'] as PersistAxis[]) {
+    for (const axis of ['stocks'] as PersistAxis[]) {
       const rec = outcomeByKey.get(`${axis}:${ctx.username}`) ?? null;
       // THE INDEPENDENT READ. `stat()` here, at request time, on the path the
       // writer resolves. Not `rec.lastSuccessAt`, which the persist path writes
@@ -8779,15 +8218,7 @@ app.get('/api/health/snapshot-persist', async (_req, res) => {
         consecutiveFailures: rec?.consecutiveFailures ?? 0,
         fileMtimeMs,
         lastSuccessAt: rec?.lastSuccessAt ?? null,
-        // TRA-3432 — label an IDLE crypto row with WHY it is quiet. The crypto
-        // engine is master-killed by default (TRA-1580), so `start()` never arms
-        // the 60s interval, `doTick` never runs, and the `onTick` handler that
-        // carries BOTH `recordPersistTick` and `scheduleCryptoPersist` is never
-        // invoked. Without this label, 64 crypto rows reading IDLE/`no-tick-observed`
-        // are indistinguishable from 64 books whose writers just died — and a
-        // reader would be entitled to mistake the column for coverage.
-        // Reason-only; see `engineEnabled` in snapshot-persist-health.ts.
-        engineEnabled: axis === 'crypto' ? isCryptoEngineEnabled() : true,
+        engineEnabled: true,
       });
     }
   }
@@ -8806,25 +8237,6 @@ app.get('/api/health/snapshot-persist', async (_req, res) => {
     // visible rather than being read as a clean one (the TRA-2630 lesson).
     contextCount: contexts.length,
     rowCount: rows.length,
-    // TRA-3432 — WHY the crypto column reads the way it does, published as a
-    // boolean a probe can branch on rather than as prose in a ticket.
-    //
-    // When this is `false`, every crypto row is IDLE `engine-disabled` and the
-    // crypto axis is STRUCTURALLY UNGRADEABLE on this host: `start()` never arms
-    // the tick interval, so the hook carrying `scheduleCryptoPersist` never runs
-    // and each `trades-crypto.json` stays at whatever the boot-time
-    // `persistCryptoNow` wrote. That is the CORRECT grade for a parked engine —
-    // a dark book cannot lose state it is not changing — but the crypto IDLE
-    // column must NOT be read as coverage of the crypto writer. It has never
-    // been exercised past boot.
-    cryptoAxis: {
-      engineFlag: CRYPTO_ENGINE_FLAG,
-      engineEnabled: isCryptoEngineEnabled(),
-      gradeable: isCryptoEngineEnabled(),
-      note: isCryptoEngineEnabled()
-        ? 'crypto engine is ticking; crypto rows are graded like stocks rows'
-        : `crypto engine is dark (${CRYPTO_ENGINE_FLAG} off, TRA-1580) — crypto rows grade IDLE/engine-disabled and are NOT coverage of the crypto writer (TRA-3432)`,
-    },
     policy: {
       stalenessTicks: STALENESS_TICKS,
       livenessTicks: LIVENESS_TICKS,
@@ -10604,24 +10016,6 @@ function collectClosedOptions(snap: StocksTradeSnapshot | null): OptionPosition[
 }
 
 /**
- * Collect crypto closed positions, preferring the TRA-242 mode-split lists
- * (stamping mode so legacy rows without it land in the right bucket) and
- * falling back to the merged list. De-duped by id.
- */
-function collectClosedCrypto(snap: CryptoTradeSnapshot | null): Position[] {
-  if (!snap) return [];
-  const byId = new Map<string, Position>();
-  const hasSplit = snap.demoClosedPositions || snap.liveClosedPositions;
-  if (hasSplit) {
-    for (const p of snap.demoClosedPositions ?? []) byId.set(p.id, { ...p, mode: p.mode ?? 'demo' });
-    for (const p of snap.liveClosedPositions ?? []) byId.set(p.id, { ...p, mode: p.mode ?? 'live' });
-  } else {
-    for (const p of snap.closedPositions ?? []) byId.set(p.id, p);
-  }
-  return Array.from(byId.values());
-}
-
-/**
  * TRA-3860 — process start, the CONSERVATIVE coverage floor used by
  * `/api/trades/export` when a book has no observed archive boundary yet.
  *
@@ -10701,10 +10095,7 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
       to: toParsed.value,
     };
 
-    const [stocksSnap, cryptoSnap] = await Promise.all([
-      loadStocksTradeSnapshot(username),
-      loadCryptoTradeSnapshot(username),
-    ]);
+    const stocksSnap = await loadStocksTradeSnapshot(username);
 
     // TRA-3860 — the durable per-close ledger that lets an ARCHIVED option day
     // stay readable. Best-effort: the journal is default-OFF and its file may be
@@ -10795,7 +10186,6 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
     const { rows, summary } = buildExport(
       {
         stocksClosed: stocksSnap?.closedPositions ?? [],
-        cryptoClosed: collectClosedCrypto(cryptoSnap),
         optionsClosed,
         preMappedRows: journalExportRows,
         optionMoneyRestatements,
@@ -10870,14 +10260,9 @@ app.get('/api/state', requireAuth, async (_req, res) => {
   res.json(dashboardEngineState(ctx));
 });
 
-app.get('/api/crypto/state', requireAuth, async (_req, res) => {
-  const ctx = await userCtx(res);
-  res.json(ctx.cryptoEngine.getState());
-});
-
 // TRA-1303 — Position Advisor readout: per held DEMO-book symbol, the next DCA
 // add (size + trigger price) and the current sell plan (SL / TP / trailing).
-// Read-only — it re-runs the SHIPPED engine cores (conviction-dca / crypto-dca /
+// Read-only — it re-runs the SHIPPED engine cores (conviction-dca /
 // the exit engines) against the demo book and never places or mutates an order.
 // This is the smallest surface that lets a user actually SEE the guidance the
 // parent TRA-1302 asks for. Live positions are never surfaced.
@@ -10885,7 +10270,6 @@ app.get('/api/advisor/positions', requireAuth, async (_req, res) => {
   const ctx = await userCtx(res);
   const rows = [
     ...ctx.engine.getPositionAdvisor(),
-    ...ctx.cryptoEngine.getPositionAdvisor(),
   ];
   const countIn = (book: string) => rows.filter(r => r.book === book).length;
   const readout: PositionAdvisorReadout = {
@@ -10893,16 +10277,11 @@ app.get('/api/advisor/positions', requireAuth, async (_req, res) => {
     mode: 'demo',
     rows,
     notes: [
-      `${countIn('equity')} equity, ${countIn('options')} options, ${countIn('crypto')} crypto held position(s)`,
+      `${countIn('equity')} equity, ${countIn('options')} options held position(s)`,
       "Read-only advisory (demo book, no live orders). DCA sizes/triggers and sell plans are the engine's own outputs.",
     ],
   };
   res.json(readout);
-});
-
-app.get('/api/crypto/news', requireAuth, async (_req, res) => {
-  const ctx = await userCtx(res);
-  res.json(ctx.cryptoEngine.getNews());
 });
 
 app.get('/api/news', requireAuth, async (_req, res) => {
@@ -11516,12 +10895,12 @@ app.get('/api/health/execution-quality', (_req, res) => {
 // TRA-1981 (parent TRA-1967 item 2) — realized-vs-modeled EXECUTION-QUALITY KPI per
 // asset class. The pre-trade liquidity gate above MODELS a cost per fill; this probe
 // measures the REALIZED cost against it — options fills vs mid (durable fee/slippage
-// ledger), equity/crypto against the TRA-536 per-fill bps budget stamped at open — so
+// ledger), equity against the TRA-536 per-fill bps budget stamped at open — so
 // execution decay is visible per asset class before it eats the edge. The decay ratio
 // (Σ|realized| ÷ Σ|modeled|) is the OOS check that justifies arming the liquidity-gate
 // veto: > 1× means realized cost runs hotter than the model. Pure read of already-
 // persisted data (no new writes, no behavior change); unmeasured legs are `null`,
-// never `0` (TRA-1707). The options leg is durable; the equity/crypto legs are
+// never `0` (TRA-1707). The options leg is durable; the equity leg is
 // session-scoped live open positions (folded across all user books).
 //
 // ⚠️ PATH — `-kpi`, NOT the bare `/api/health/execution-quality` above (TRA-3051).
@@ -11539,28 +10918,22 @@ app.get('/api/health/execution-quality', (_req, res) => {
 app.get('/api/health/execution-quality-kpi', (_req, res) => {
   try {
     const equityPositions: Position[] = [];
-    const cryptoPositions: Position[] = [];
     for (const ctx of getAllUserContexts()) {
       try {
         equityPositions.push(...ctx.engine.getState().account.openPositions);
       } catch {
         // Skip a context whose engine can't render state this tick — the others still fold.
       }
-      try {
-        cryptoPositions.push(...ctx.cryptoEngine.getState().account.openPositions);
-      } catch {
-        // Same guard for the crypto book.
-      }
     }
-    const kpi = buildExecutionQualityKpi({ equityPositions, cryptoPositions });
+    const kpi = buildExecutionQualityKpi({ equityPositions });
     res.json({
       issue: 'TRA-1981',
       model:
         'realized vs modeled cost per fill — options: fill-vs-mid signed into cost vs modeled half-spread (|ask−mid|); '
-        + 'equity/crypto: TRA-536 entry drift (|fill−intended|×qty) vs the per-fill bps budget the trade was charged',
+        + 'equity: TRA-536 entry drift (|fill−intended|×qty) vs the per-fill bps budget the trade was charged',
       decayRatio: 'Σ|realized| ÷ Σ|modeled|; > 1× ⇒ realized execution cost is running hotter than the model',
       durabilityNote:
-        'options leg is durable (fee/slippage ledger, survives restart); equity/crypto legs are session-scoped '
+        'options leg is durable (fee/slippage ledger, survives restart); the equity leg is session-scoped '
         + 'live open positions. Unmeasured legs are null, never 0 (TRA-1707).',
       kpi,
     });
@@ -11709,38 +11082,6 @@ app.get('/api/health/learned-weights-history', async (req, res) => {
   }
 });
 
-// TRA-1046 (TRA-1041c L2) — on-demand hypothesis backtest. Validates a single
-// param-change hypothesis SYNCHRONOUSLY through the same apply→backtest→G0-grade
-// pipeline the analyst's EOD reflect routine uses, returning the graded result in
-// one round-trip so a param can be checked without overnight latency. Read-only:
-// it never enqueues a ratification item or touches demo/live config — the only
-// path that lands a change stays the board-ratified queue, and live promotion is
-// gated on TRA-382. Auth-gated because a backtest is non-trivial compute.
-const onDemandBacktestExecutor = makeBacktestExecutor();
-app.post('/api/backtest', requireAuth, async (req, res) => {
-  const problem = validateBacktestRequest(req.body);
-  if (problem) {
-    res.status(400).json({ error: problem });
-    return;
-  }
-  try {
-    const result = await runOnDemandBacktest(req.body as OnDemandBacktestRequest, {
-      baseConfig: RV_CRYPTO_MAJORS_BASE_CONFIG,
-      runBacktest: onDemandBacktestExecutor,
-    });
-    res.json({ issue: 'TRA-1046', ...result });
-  } catch (err) {
-    if (err instanceof OnDemandBacktestBadRequest) {
-      res.status(400).json({ error: err.message });
-      return;
-    }
-    log.error('on-demand backtest failed', {
-      reason: err instanceof Error ? err.message : String(err),
-    });
-    res.status(500).json({ error: 'Failed to run backtest' });
-  }
-});
-
 app.get('/api/research/reports/:id', requireAuth, async (req, res) => {
   const id = (req.params as Record<string, string>)['id'];
   const report = await getResearchReport(id);
@@ -11798,50 +11139,6 @@ app.get('/api/health/market-review', async (_req, res) => {
   }
 });
 
-// TRA-1340 — PUBLIC, tokenless read-only probe confirming whether the pinned
-// operator's LIVE Coinbase crypto auto-trading flag is armed. Same non-sensitive
-// class as the other open `/api/health/*` probes: booleans only (presence, never
-// key values or balances), so the board/desk and the TRA-1304 canary monitor can
-// confirm the board-approved `cryptoAutoTradingEnabledLive` flip took effect on
-// bqb1 WITHOUT admin creds (login + pre-minted token both 401 on Render's separate
-// user store). `liveCryptoActive` mirrors promotion-service's live-crypto
-// predicate (`mode === 'live' && cryptoAutoTradingEnabledLive === true`). Reports
-// the operator resolved from `LIVE_EQUITY_BOOT_USER` (default "admin", TRA-716).
-app.get('/api/health/crypto-live', async (_req, res) => {
-  try {
-    const operator = resolveLiveBrokerOperator();
-    const settings = await loadSettings(operator);
-    const mode = settings.mode === 'live' ? 'live' : 'demo';
-    const liveCryptoAutoTradingEnabled = settings.cryptoAutoTradingEnabledLive === true;
-    const brokerConfigured =
-      (settings.liveApiKeyCrypto?.trim()
-        || settings.liveApiKey?.trim()
-        || process.env['COINBASE_API_KEY']
-        || '').trim().length > 0
-      && (settings.liveApiSecretCrypto?.trim()
-        || settings.liveApiSecret?.trim()
-        || process.env['COINBASE_API_SECRET']
-        || '').trim().length > 0;
-    res.json({
-      ok: true,
-      issue: 'TRA-1340',
-      time: new Date().toISOString(),
-      build: resolveBuildInfo(),
-      operator,
-      mode,
-      liveCryptoActive: mode === 'live' && liveCryptoAutoTradingEnabled,
-      liveCryptoAutoTradingEnabled,
-      liveCryptoBrokerConfigured: brokerConfigured,
-      bootArmPinConfigured: (process.env['LIVE_EQUITY_BOOT_USER'] ?? '').trim().length > 0,
-    });
-  } catch (err) {
-    log.error('crypto-live health probe failed', {
-      reason: err instanceof Error ? err.message : String(err),
-    });
-    res.status(500).json({ ok: false, error: 'Failed to read crypto-live status' });
-  }
-});
-
 // TRA-1581 — UNAUTHENTICATED, secrets-free readout confirming the live OPTIONS
 // Tradier plumbing for the pinned operator: whether the resolved options broker
 // env is `production` and whether a live options order client would actually
@@ -11849,8 +11146,8 @@ app.get('/api/health/crypto-live', async (_req, res) => {
 // fallback). This exists because `/api/health/live` names credentials and is
 // therefore auth-gated — and admin login + a pre-minted token both 401 against
 // bqb1's separate Render user store, so the board/desk cannot confirm the
-// Monday attended-canary plumbing prereq from there. Mirrors the TRA-1340
-// `/api/health/crypto-live` probe's contract: booleans + env label + a masked
+// Monday attended-canary plumbing prereq from there. Contract:
+// booleans + env label + a masked
 // account-id tail ONLY — never a token, secret, or full account id. The
 // options client `buildTradierLiveClient` uses `resolveTradierOptionsCreds(...)
 // .env` + the operator-scoped env fallback, so this replicates that exact
@@ -15042,11 +14339,6 @@ function resolveStockReportMode(req: express.Request, username: string): StockMo
   return stockModeKey(getSettings(username));
 }
 
-function resolveCryptoReportMode(req: express.Request, username: string): CryptoModeKey {
-  const q = (req.query['mode'] as string | undefined)?.trim();
-  if (q === 'demo' || q === 'live') return q;
-  return cryptoModeKey(getSettings(username));
-}
 
 // TRA-2631 (board ruling A, TRA-3020 card `09bee410`) — FILTER AND STAMP every
 // stock EOD report on its way OUT.
@@ -15464,71 +14756,6 @@ app.post('/api/reports/backfill-realized', requireAuth, async (req, res) => {
   }
 });
 
-// ── Crypto Reports ────────────────────────────────────────────────────────────
-
-app.get('/api/crypto/reports/latest', requireAuth, async (req, res) => {
-  const ctx = await userCtx(res);
-  const mode = resolveCryptoReportMode(req, ctx.username);
-  const latestPath = join(cryptoReportsDirFor(ctx, mode), 'latest.json');
-  if (!existsSync(latestPath)) {
-    res.status(404).json({ error: 'No crypto report generated yet' });
-    return;
-  }
-  try {
-    const raw = await readFile(latestPath, 'utf-8');
-    res.json(JSON.parse(raw));
-  } catch {
-    res.status(500).json({ error: 'Failed to read crypto report' });
-  }
-});
-
-app.get('/api/crypto/reports', requireAuth, async (req, res) => {
-  const ctx = await userCtx(res);
-  const mode = resolveCryptoReportMode(req, ctx.username);
-  try {
-    const files = await readdir(cryptoReportsDirFor(ctx, mode));
-    const dates = files
-      .filter(f => /^\d{4}-\d{2}-\d{2}\.json$/.test(f))
-      .map(f => f.replace('.json', ''))
-      .sort()
-      .reverse();
-    res.json({ dates });
-  } catch {
-    res.json({ dates: [] });
-  }
-});
-
-app.get('/api/crypto/reports/:date', requireAuth, async (req, res) => {
-  const ctx = await userCtx(res);
-  const { date } = req.params as Record<string, string>;
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
-    return;
-  }
-  const mode = resolveCryptoReportMode(req, ctx.username);
-  const filePath = join(cryptoReportsDirFor(ctx, mode), `${date}.json`);
-  if (!existsSync(filePath)) {
-    res.status(404).json({ error: `No crypto report for ${date}` });
-    return;
-  }
-  try {
-    const raw = await readFile(filePath, 'utf-8');
-    res.json(JSON.parse(raw));
-  } catch {
-    res.status(500).json({ error: 'Failed to read crypto report' });
-  }
-});
-
-app.post('/api/crypto/reports/generate', requireAuth, async (_req, res) => {
-  try {
-    const ctx = await userCtx(res);
-    await generateAndSaveCryptoReport(ctx);
-    res.json({ ok: true, message: 'Crypto EOD report generated successfully' });
-  } catch (err) {
-    res.status(500).json({ error: String(err) });
-  }
-});
-
 app.get('/api/snapshots', requireAuth, async (_req, res) => {
   const ctx = await userCtx(res);
   res.json(ctx.tracker.getSnapshots());
@@ -15714,7 +14941,6 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
     ...body,
     demoEquity: clampEquity(body.demoEquity ?? current.demoEquity),
     demoEquityStocks: clampEquity(body.demoEquityStocks ?? current.demoEquityStocks ?? current.demoEquity),
-    demoEquityCrypto: clampEquity(body.demoEquityCrypto ?? current.demoEquityCrypto ?? current.demoEquity),
     dailyTradesLimit: Math.max(1, Math.min(100, Number(body.dailyTradesLimit ?? current.dailyTradesLimit))),
     optionsDailyTradesLimit: Math.max(1, Math.min(100, Number(body.optionsDailyTradesLimit ?? current.optionsDailyTradesLimit))),
     // TRA-327 — clamp the live-only counterparts independently so a Demo edit
@@ -15751,31 +14977,12 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
     // TRA-349 regression tests can lock the contract without spinning up the
     // route.
     ...mergeScopedRiskSettings(current, body),
-    // TRA-249-E — clamp the operator-facing leverage cap to [1, 5] integer.
-    // The live engine still hard-caps at 1× (PERP_SHORT_LEVERAGE) so a
-    // misconfigured value can't bypass the §6 caps; clamping here keeps the
-    // stored payload sane regardless of what the UI sends.
-    liveMaxLeverageCrypto: Math.max(
-      1,
-      Math.min(5, Math.round(Number(body.liveMaxLeverageCrypto ?? current.liveMaxLeverageCrypto ?? 1))),
-    ),
-    // TRA-325 — clamp to a known preset id so a malformed request can't park
-    // the engine on an unknown preset (which would degrade-fall to no_trade
-    // anyway via resolveStrategyPreset since TRA-697, but persisting a junk id would
-    // surface as a confusing UI selection on next load).
-    activeStrategyPreset: ((): StrategyPresetId => {
-      const requested = body.activeStrategyPreset ?? current.activeStrategyPreset;
-      if (requested && requested in STRATEGY_PRESETS) return requested as StrategyPresetId;
-      return DEFAULT_STRATEGY_PRESET_ID;
-    })(),
   };
   // TRA-515 — the TRA-506 guardrail used to 422-reject this PUT whenever any
   // required live cred was blank. But the PUT is atomic: rejecting it
   // discarded the user's *valid* Tradier production keys the moment an
-  // unrelated market was unconfigured — e.g. a Tradier-only stocks+options
-  // user in live mode who never set up Coinbase. `findMissingLiveCredentials`
-  // demands the Coinbase pair in live mode (default `liveBrokerageTypeCrypto`
-  // is 'coinbase'), so their save 422'd, the Tradier keys never reached disk,
+  // unrelated market was unconfigured, so their save 422'd, the Tradier keys
+  // never reached disk,
   // and GET /api/account/settings kept returning empty
   // `liveApiKeyOptionsProduction` / `liveAccountIdOptionsProduction` — live
   // Tradier trading could never start.
@@ -15785,7 +14992,7 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
   // settings via `findMissingLiveCredentials` — it never depended on this
   // 422. And the engine builds a null broker client for any market whose
   // creds are blank (`buildTradierLiveClient` / `buildTradierLiveEquityClient`
-  // / crypto `buildLiveBroker` all return null), so persisting a partially
+  // both return null), so persisting a partially
   // configured snapshot can never place orders on an unconfigured market.
   //
   // So: persist unconditionally and surface the missing set as a
@@ -15879,16 +15086,16 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
     ...validateProductionTradierKeys(updated).missing,
   ]));
   // TRA-532 — Live-Trading Promotion Gate. Before persisting a settings change
-  // whose *result* runs live crypto auto-trading, every strategy the active
-  // preset would trade live must be fully promoted
+  // whose *result* newly places real capital, every strategy the save newly
+  // exposes must be fully promoted
   // (backtest=pass AND paper=pass AND signoff=present). An unpromoted strategy
   // blocks the save with the exact failing gate so the UI can surface it. The
   // gate only fires on results that turn/keep live ON — turning live OFF or
   // editing settings in Demo is never blocked (see evaluateLiveTransitionGate).
   try {
     // TRA-1590 — pass the pre-PUT snapshot so the gate exempts de-escalations
-    // (holding/reducing real-capital intent). Without it an operator whose live
-    // crypto path already fails the gate could not even route options back to
+    // (holding/reducing real-capital intent). Without it an operator whose
+    // live path already fails the gate could not even route options back to
     // sandbox, deadlocking every move toward safety.
     const gate = await evaluateLiveTransitionGate(username, updated, current);
     if (!gate.allowed) {
@@ -15945,11 +15152,6 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
   // would show $0 equity for up to 30s until the next tick.
   await ctx.engine.applySettings(updated);
   broadcastEngineState(ctx);
-  // Await the crypto engine: switching into live mode does an initial Coinbase
-  // balance fetch, and the broadcast that follows must reflect that equity
-  // instead of a transient $0 the user sees until the next 60s tick (TRA-224).
-  await ctx.cryptoEngine.applySettings(updated);
-  broadcastCryptoState(ctx);
   res.json({ ok: true, settings: updated, missingLiveCredentials });
 });
 
@@ -16202,7 +15404,7 @@ app.post('/api/notifications/report/test', requireAuth, async (req, res) => {
     }
 
     const ctx = await userCtx(res);
-    const snapshots = [...ctx.tracker.getSnapshots(), ...ctx.cryptoTracker.getSnapshots()];
+    const snapshots = [...ctx.tracker.getSnapshots()];
     const periodStart = periodStartFor(cadence, asOfDate);
     const snapshotsInWindow = snapshots.filter(
       s => s.date >= periodStart && s.date <= asOfDate,
@@ -16736,29 +15938,21 @@ app.post('/api/notifications/discord/interactions', async (req, res) => {
   }
 });
 
-// Per-market scope (TRA-192): Stockdashboard and Cryptodashboard each have
-// their own "Reset Demo Account" button, and resetting one must not wipe the
-// other. The optional `market` body field selects which engine to reset.
-// Omitting it preserves the legacy "reset both" behavior used by the global
-// settings page where no market context is active.
+// Per-market scope (TRA-192): the optional `market` body field selects which
+// engine to reset. Omitting it preserves the legacy "reset all" behavior used
+// by the global settings page where no market context is active. (`crypto` was
+// retired with the crypto engine, TRA-4629.)
 app.post('/api/account/reset-demo', requireAuth, async (req, res) => {
   const username = res.locals['authUser'] as string;
   const ctx = await userCtx(res);
   const settings = getSettings(username);
   const market = (req.body as { market?: string } | undefined)?.market;
-  if (market !== undefined && market !== 'stocks' && market !== 'crypto') {
-    res.status(400).json({ error: "market must be 'stocks', 'crypto', or omitted" });
+  if (market !== undefined && market !== 'stocks') {
+    res.status(400).json({ error: "market must be 'stocks' or omitted" });
     return;
   }
-  if (market === undefined || market === 'stocks') {
-    ctx.engine.forceReset(settings);
-    broadcastEngineState(ctx);
-  }
-  if (market === undefined || market === 'crypto') {
-    const cryptoEquity = settings.demoEquityCrypto ?? settings.demoEquity;
-    ctx.cryptoEngine.forceReset(cryptoEquity);
-    broadcastCryptoState(ctx);
-  }
+  ctx.engine.forceReset(settings);
+  broadcastEngineState(ctx);
   res.json({ ok: true, market: market ?? 'both' });
 });
 
@@ -16911,7 +16105,7 @@ app.post('/api/trading/stop', requireAuth, async (req, res) => {
 
 // TRA-526 — global kill switch (deterministic risk-layer master override).
 // Engages/releases the manual master halt across BOTH the equities/options
-// engine (via DailyRiskGovernor) and the crypto engine, and persists the state
+// engine (via DailyRiskGovernor), and persists the state
 // to settings so the halt survives a server restart. While engaged, every
 // new-entry path is blocked regardless of the per-mode auto-trading flags or
 // daily circuit-breakers — "the AI proposes, the math disposes."
@@ -16925,7 +16119,6 @@ app.post('/api/trading/kill-switch', requireAuth, async (req, res) => {
 
   if (engaged) ctx.engine.engageKillSwitch(reason);
   else ctx.engine.releaseKillSwitch();
-  ctx.cryptoEngine.setKillSwitch(engaged);
 
   const updated: AccountSettings = {
     ...settings,
@@ -16934,7 +16127,6 @@ app.post('/api/trading/kill-switch', requireAuth, async (req, res) => {
   };
   await saveSettings(username, updated);
   broadcastEngineState(ctx);
-  broadcastCryptoState(ctx);
   res.json({
     ok: true,
     killSwitchEngaged: ctx.engine.isKillSwitchEngaged(),
@@ -17960,158 +17152,6 @@ app.post('/api/tradier/equity-positions/sync', requireAuth, async (_req, res) =>
 });
 
 /**
- * Smoke-test Coinbase live credentials without placing any orders.
- *
- * Pulls the user's saved API key/secret (env-var fallback identical to
- * crypto-engine.buildLiveBroker), instantiates a CoinbaseOrderClient, then
- * issues a single authenticated GET against /api/v3/brokerage/accounts.
- *
- * The response always returns 200 with an `ok` flag; the UI only needs to
- * inspect the body. `authScheme` lets the user confirm a PEM secret was
- * recognised as CDP rather than silently treated as HMAC.
- */
-app.post('/api/crypto/coinbase/test-connection', requireAuth, async (_req, res) => {
-  const username = res.locals['authUser'] as string;
-  const settings = getSettings(username);
-  // Same precedence as crypto-engine.buildLiveBroker: per-market crypto
-  // credentials (TRA-165) → legacy un-suffixed fields → env vars.
-  const apiKey = (
-    settings.liveApiKeyCrypto?.trim()
-    || settings.liveApiKey?.trim()
-    || process.env['COINBASE_API_KEY']
-    || ''
-  ).trim();
-  const apiSecret = (
-    settings.liveApiSecretCrypto?.trim()
-    || settings.liveApiSecret?.trim()
-    || process.env['COINBASE_API_SECRET']
-    || ''
-  ).trim();
-  if (!apiKey || !apiSecret) {
-    res.json({ ok: false, error: 'Coinbase API key and secret are not configured. Save them in Settings before testing.' });
-    return;
-  }
-  let client: CoinbaseOrderClient;
-  try {
-    client = new CoinbaseOrderClient({ apiKey, apiSecret });
-  } catch (err: unknown) {
-    res.json({ ok: false, error: err instanceof Error ? err.message : String(err) });
-    return;
-  }
-  const authScheme = client.getAuthScheme();
-  try {
-    const accounts = await client.listAccounts();
-    const currencies = Array.from(new Set(accounts.map(a => a.currency))).sort();
-    res.json({ ok: true, authScheme, accountCount: accounts.length, currencies });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    res.json({ ok: false, authScheme, error: message });
-  }
-});
-
-/**
- * Place a deliberately tiny market BUY against Coinbase Advanced Trade so the
- * user can verify their funded live account end-to-end (TRA-222) before
- * flipping auto-trading on. Reuses the same credential precedence as
- * /test-connection. The order is NOT registered with the engine — it's a
- * one-shot smoke test, the resulting crypto sits in the user's Coinbase
- * wallet exactly like a manual buy.
- *
- * Hard caps: $5 USD max quote size and BUY only. We refuse to do this in demo
- * mode so a misclick can't waste real money on a user who hasn't switched
- * over yet.
- */
-app.post('/api/crypto/coinbase/place-test-order', requireAuth, async (req, res) => {
-  const username = res.locals['authUser'] as string;
-  const settings = getSettings(username);
-  if (settings.mode !== 'live') {
-    res.json({ ok: false, error: 'Account is in demo mode. Switch to Live before placing a test order.' });
-    return;
-  }
-  const body = (req.body ?? {}) as { productId?: string; quoteSize?: number };
-  const productId = (body.productId ?? 'BTC-USD').trim().toUpperCase();
-  if (!/^[A-Z0-9]{2,10}-USD[CT]?$/.test(productId)) {
-    res.json({ ok: false, error: `Invalid productId "${productId}". Expected e.g. BTC-USD.` });
-    return;
-  }
-  const quoteSize = Number(body.quoteSize ?? 1);
-  if (!Number.isFinite(quoteSize) || quoteSize <= 0) {
-    res.json({ ok: false, error: 'quoteSize must be a positive number (USD).' });
-    return;
-  }
-  if (quoteSize > 5) {
-    res.json({ ok: false, error: 'Test order capped at $5 USD. Reduce quoteSize.' });
-    return;
-  }
-  const apiKey = (
-    settings.liveApiKeyCrypto?.trim()
-    || settings.liveApiKey?.trim()
-    || process.env['COINBASE_API_KEY']
-    || ''
-  ).trim();
-  const apiSecret = (
-    settings.liveApiSecretCrypto?.trim()
-    || settings.liveApiSecret?.trim()
-    || process.env['COINBASE_API_SECRET']
-    || ''
-  ).trim();
-  if (!apiKey || !apiSecret) {
-    res.json({ ok: false, error: 'Coinbase API key and secret are not configured. Save them in Settings before testing.' });
-    return;
-  }
-  let client: CoinbaseOrderClient;
-  try {
-    client = new CoinbaseOrderClient({ apiKey, apiSecret });
-  } catch (err: unknown) {
-    res.json({ ok: false, error: err instanceof Error ? err.message : String(err) });
-    return;
-  }
-  const authScheme = client.getAuthScheme();
-  let orderId: string;
-  try {
-    const placed = await client.placeMarketOrder({ productId, side: 'buy', quoteSize });
-    orderId = placed.order_id;
-  } catch (err: unknown) {
-    res.json({ ok: false, authScheme, error: err instanceof Error ? err.message : String(err) });
-    return;
-  }
-  // Best-effort fill reconciliation — same backoff schedule as
-  // CryptoLiveAccount.awaitFill so a typical fill returns rich detail without
-  // dragging the request out indefinitely.
-  const delays = [200, 400, 800, 1500, 2000];
-  let fillPrice: number | undefined;
-  let fillSize: number | undefined;
-  let status = 'unknown';
-  for (const d of delays) {
-    await new Promise(r => setTimeout(r, d));
-    try {
-      const order = await client.getOrder(orderId);
-      status = (order.status ?? 'unknown').toUpperCase();
-      if (status === 'FILLED') {
-        const p = parseFloat(order.average_filled_price);
-        const s = parseFloat(order.filled_size);
-        if (Number.isFinite(p) && p > 0) fillPrice = p;
-        if (Number.isFinite(s) && s > 0) fillSize = s;
-        break;
-      }
-      if (status === 'CANCELLED' || status === 'EXPIRED' || status === 'FAILED') break;
-    } catch {
-      // Order was already accepted by Coinbase — keep polling.
-    }
-  }
-  res.json({
-    ok: true,
-    authScheme,
-    orderId,
-    productId,
-    quoteSize,
-    status,
-    fillPrice,
-    fillSize,
-  });
-});
-
-/**
  * Smoke-test Tradier live credentials without placing any orders (TRA-221).
  *
  * Reads the user's saved options API token, account ID, and environment from
@@ -18262,139 +17302,7 @@ app.post('/api/options/tradier/test-connection', requireAuth, async (req, res) =
   }
 });
 
-app.post('/api/crypto/trading/start', requireAuth, async (req, res) => {
-  const username = res.locals['authUser'] as string;
-  const ctx = await userCtx(res);
-  const settings = getSettings(username);
-  const mode = resolveTradingMode(req.body, settings.mode);
-  const updated: AccountSettings = {
-    ...settings,
-    ...(mode === 'live'
-      ? { cryptoAutoTradingEnabledLive: true }
-      : { cryptoAutoTradingEnabledDemo: true }),
-  };
-  // TRA-575 — enabling LIVE crypto auto-trading is the real trigger for the
-  // TRA-532 promotion gate. Now that `cryptoAutoTradingEnabledLive` defaults OFF,
-  // this endpoint (not the global mode flip) is the path a user takes to turn it
-  // on — so it must enforce the same gate as PUT /api/account/settings, otherwise
-  // it would be an ungated bypass. Demo starts are never gated; only a result that
-  // runs live crypto auto-trading. Fail CLOSED if the gate can't be evaluated.
-  //
-  // TRA-2351 — gate through `evaluateLiveCryptoStartGate`, NOT by handing
-  // `updated` to the general gate. `mode` here comes from the REQUEST BODY, so
-  // `updated.mode` is still the PERSISTED mode — passing that snapshot asked the
-  // gate to authorize a LIVE start against a snapshot that read `demo`, which it
-  // correctly graded as "no real-capital axis active" and allowed. The route then
-  // persisted a durable live-crypto arm that was never graded. The named entry
-  // point declares the action, so the mismatch is not expressible here.
-  if (mode === 'live') {
-    try {
-      const gate = await evaluateLiveCryptoStartGate(username, settings);
-      if (!gate.allowed) {
-        log.warn('TRA-575 refused live crypto start — promotion gate', {
-          username,
-          blocked: gate.blocked.map(b => b.strategyId),
-        });
-        res.status(422).json({
-          ok: false,
-          code: 'promotion_gate_blocked',
-          error:
-            'Live crypto auto-trading is blocked by the promotion gate: '
-            + gate.blocked.map(b => `${b.strategyId} — ${b.reasons.join(' | ')}`).join(' ;; '),
-          blocked: gate.blocked,
-        });
-        return;
-      }
-    } catch (err: unknown) {
-      log.error('TRA-575 crypto-start promotion gate evaluation failed', {
-        username,
-        reason: err instanceof Error ? err.message : String(err),
-      });
-      res.status(500).json({
-        ok: false,
-        code: 'promotion_gate_error',
-        error: 'Could not verify the live-trading promotion gate. Live crypto start refused; please retry.',
-      });
-      return;
-    }
-  }
-  ctx.cryptoEngine.setAutoTrading(true, mode);
-  await saveSettings(username, updated);
-  broadcastCryptoState(ctx);
-  res.json({ ok: true, mode, autoTradingEnabled: true });
-});
-
-app.post('/api/crypto/trading/stop', requireAuth, async (req, res) => {
-  const username = res.locals['authUser'] as string;
-  const ctx = await userCtx(res);
-  const settings = getSettings(username);
-  const mode = resolveTradingMode(req.body, settings.mode);
-  ctx.cryptoEngine.setAutoTrading(false, mode);
-  const updated: AccountSettings = {
-    ...settings,
-    ...(mode === 'live'
-      ? { cryptoAutoTradingEnabledLive: false }
-      : { cryptoAutoTradingEnabledDemo: false }),
-  };
-  await saveSettings(username, updated);
-  broadcastCryptoState(ctx);
-  res.json({ ok: true, mode, autoTradingEnabled: false });
-});
-
 // ── Watchlist management ──────────────────────────────────────────────────────
-
-app.get('/api/watchlist/crypto', requireAuth, async (_req, res) => {
-  const username = res.locals['authUser'] as string;
-  await initWatchlistStore(username);
-  res.json(getCryptoWatchlistData(username));
-});
-
-app.post('/api/watchlist/crypto', requireAuth, async (req, res) => {
-  const username = res.locals['authUser'] as string;
-  const ctx = await userCtx(res);
-  const { symbol } = req.body as { symbol?: string };
-  if (typeof symbol !== 'string' || !symbol.trim()) {
-    res.status(400).json({ error: 'symbol is required' });
-    return;
-  }
-  const sym = symbol.trim().toUpperCase();
-  if (!/^[A-Z]{2,10}-USD$/.test(sym)) {
-    res.status(400).json({ error: 'Invalid symbol format. Expected XXX-USD (e.g. ETH-USD)' });
-    return;
-  }
-  await addCryptoSymbol(username, sym);
-  ctx.cryptoEngine.addSymbol(sym);
-  ctx.cryptoEngine.refresh();
-  res.json({ ok: true, symbol: sym });
-});
-
-app.delete('/api/watchlist/crypto/:symbol', requireAuth, async (req, res) => {
-  const username = res.locals['authUser'] as string;
-  const ctx = await userCtx(res);
-  const raw = req.params['symbol'];
-  const sym = (Array.isArray(raw) ? raw[0] : raw ?? '').toUpperCase();
-  if (!sym) { res.status(400).json({ error: 'symbol is required' }); return; }
-  await removeCryptoSymbol(username, sym);
-  ctx.cryptoEngine.removeSymbol(sym);
-  broadcastCryptoState(ctx);
-  res.json({ ok: true });
-});
-
-app.post('/api/watchlist/crypto/scan', requireAuth, async (_req, res) => {
-  const username = res.locals['authUser'] as string;
-  const ctx = await userCtx(res);
-  try {
-    const results = await scanCryptoMarket();
-    for (const r of results) {
-      await addCryptoSymbol(username, r.symbol);
-      ctx.cryptoEngine.addSymbol(r.symbol);
-    }
-    ctx.cryptoEngine.refresh();
-    res.json({ ok: true, added: results.map(r => r.symbol) });
-  } catch (err) {
-    res.status(500).json({ error: String(err) });
-  }
-});
 
 app.get('/api/watchlist/stocks', requireAuth, async (_req, res) => {
   const username = res.locals['authUser'] as string;
@@ -18449,50 +17357,12 @@ app.post('/api/watchlist/stocks/scan', requireAuth, async (_req, res) => {
   }
 });
 
-// TRA-230: clear the displayed crypto signal list without resetting positions or equity.
-app.post('/api/crypto/signals/reset', requireAuth, async (_req, res) => {
-  const ctx = await userCtx(res);
-  ctx.cryptoEngine.clearSignals();
-  broadcastCryptoState(ctx);
-  res.json({ ok: true });
-});
-
-app.post('/api/crypto/positions/:id/close', requireAuth, async (req, res) => {
-  const ctx = await userCtx(res);
-  const { id } = req.params as Record<string, string>;
-  const state = ctx.cryptoEngine.getState();
-  const pos = state.account.openPositions.find(p => p.id === id);
-  if (!pos) {
-    res.status(404).json({ error: 'Position not found' });
-    return;
-  }
-  const sym = state.symbols.find(s => s.symbol === pos.symbol);
-  const price = sym?.price ?? pos.entryPrice;
-  // TRA-320 — await the broker close so a Coinbase reject (auth,
-  // INSUFFICIENT_FUND, product not tradable) surfaces back to the dashboard
-  // instead of being swallowed by a fire-and-forget. On failure the position
-  // stays open in the broker mirror and the dashboard's next state tick will
-  // continue to show it; we just need to tell the user *why* the close did
-  // not go through.
-  try {
-    await ctx.cryptoEngine.manualClosePosition(id, price);
-  } catch (err: unknown) {
-    const reason = err instanceof Error ? err.message : String(err);
-    log.warn('crypto-engine manualClose live failed', { reason });
-    broadcastCryptoState(ctx);
-    res.status(502).json({ error: 'Coinbase rejected close', reason });
-    return;
-  }
-  broadcastCryptoState(ctx);
-  res.json({ ok: true });
-});
-
 // ── Data-source health check ─────────────────────────────────────────────────
 
-// TRA-708 — `/api/health/quotes` was a self-inflicted production DoS. It runs
-// eight network probes (incl. the Coinbase Exchange leg that Render's egress IP
-// is blocked from, which hangs to its full timeout, plus the heavy minute-bar
-// and daily-bar candle cascades). Each call could tie the work up for 30-60s,
+// TRA-708 — `/api/health/quotes` was a self-inflicted production DoS. It ran
+// several network probes (incl. provider legs that Render's egress IP
+// is blocked from, which hang to their full timeout, plus the heavy minute-bar
+// candle cascade). Each call could tie the work up for 30-60s,
 // and nothing de-duplicated concurrent calls. Under RTH sampling (TRA-707) the
 // heavy builds piled up on the single web process, which then flapped 502s on
 // EVERY route and got restarted — the ~14:00Z 2026-06-08 "service outage". Fix:
@@ -18508,8 +17378,8 @@ const QUOTES_HEALTH_BUILD_TIMEOUT_MS = 9_000;
 let quotesHealthCache: { ts: number; payload: Record<string, unknown> } | null = null;
 let quotesHealthInFlight: Promise<Record<string, unknown>> | null = null;
 
-// TRA-708 — hard per-probe timeout. Without it the build's slowest legs (the
-// IP-blocked Coinbase Exchange host, the minute-bar/daily-bar candle cascades)
+// TRA-708 — hard per-probe timeout. Without it the build's slowest legs
+// (IP-blocked provider hosts, the minute-bar candle cascade)
 // keep the single in-flight build running for 30-60s; even one such build is
 // enough to briefly load the web process and 502 other routes. Capping each
 // probe means the whole (parallel) build settles in a few seconds. The losing
@@ -18538,8 +17408,8 @@ app.get('/api/health/quotes', async (_req, res) => {
   if (quotesHealthCache && now - quotesHealthCache.ts < QUOTES_HEALTH_TTL_MS) {
     const p = quotesHealthCache.payload;
     // TRA-783 — a diagnostics endpoint that produced a payload returns HTTP 200;
-    // per-component health (ok/stocksOk/cryptoOk) lives in the body. A crypto-egress
-    // timeout (Coinbase IP-blocked on Render) must not page stock-only monitors.
+    // per-component health (ok/stocksOk) lives in the body. A single provider's
+    // egress timeout must not page stock-only monitors.
     res.status(200).json({ ...p, cached: true });
     return;
   }
@@ -19196,15 +18066,6 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
     getFeedDegradationState,
     getUnservableSymbolsState,
   } = await import('./yahoo-feed.js');
-  const {
-    testCoinMarketCap,
-    testCoinbase,
-    testCoinbaseAdvancedTrade,
-    testCoinGecko,
-    isCoinbaseBreakerOpen,
-    getCoinbaseBarPullRateState,
-    fetchCryptoDailyBars,
-  } = await import('./crypto-feed.js');
   // TRA-3805 — counters for the per-symbol log suppressions. Imported here rather
   // than re-exported through yahoo-feed because `stooqNonOk` is not yahoo-feed's
   // family, and routing it through there would make the emitter and the counter
@@ -19214,25 +18075,19 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
 
   // TRA-708 — run every probe in PARALLEL, each under `runQuotesProbe`'s hard
   // timeout, so the whole build settles in a few seconds instead of the sum of
-  // eight serial network calls. Probe semantics are unchanged:
-  //   • tradier / twelveData / coinMarketCap keep their "skipped" fallback when
+  // serial network calls. Probe semantics are unchanged:
+  //   • tradier / twelveData keep their "skipped" fallback when
   //     unconfigured (null result);
-  //   • coinbase (TRA-331 Exchange) + coinbaseAdvancedTrade (TRA-705 the real
-  //     Render-resolvable primary) + yahooFinance are probed as-is;
-  //   • chartFallback (TRA-191 minute-bar path) and cryptoDailyBars (TRA-705
-  //     daily OHLC candle cascade) preserve their full diagnostic shapes.
+  //   • yahooFinance is probed as-is;
+  //   • chartFallback (TRA-191 minute-bar path) preserves its full diagnostic shape.
   const [
-    tradier, coinbase, coinbaseAdvancedTrade, coinGecko, yahooFinance, yahooChartQuote, twelveData,
-    coinMarketCap, chartFallback, cryptoDailyBars,
+    tradier, yahooFinance, yahooChartQuote, twelveData,
+    chartFallback,
   ] = await Promise.all([
     runQuotesProbe(async () => (await testTradier()) ?? { skipped: 'TRADIER_*_API_TOKEN not set' }),
-    runQuotesProbe(() => testCoinbase()),
-    runQuotesProbe(() => testCoinbaseAdvancedTrade()),
-    runQuotesProbe(() => testCoinGecko()),
     runQuotesProbe(() => testYahooFinance()),
     runQuotesProbe(() => testYahooChartQuote()),
     runQuotesProbe(async () => (await testTwelveData()) ?? { skipped: 'TWELVE_DATA_API_KEY not set' }),
-    runQuotesProbe(async () => (await testCoinMarketCap()) ?? { skipped: 'CMC_API_KEY not set' }),
     runQuotesProbe(async () => {
       const probe = await fetchMinuteBarsWithSource('AAPL', 60);
       return {
@@ -19245,25 +18100,12 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
         twelveDataDiag: probe.twelveDataDiag ?? null,
       };
     }),
-    runQuotesProbe(async () => {
-      const dailyBars = await fetchCryptoDailyBars('BTC-USD', 60);
-      return {
-        symbol: 'BTC-USD',
-        bars: dailyBars.length,
-        lastClose: dailyBars.at(-1)?.close ?? null,
-      };
-    }),
   ]);
   results['tradier'] = tradier;
-  results['coinbase'] = coinbase;
-  results['coinbaseAdvancedTrade'] = coinbaseAdvancedTrade;
-  results['coinGecko'] = coinGecko;
   results['yahooFinance'] = yahooFinance;
   results['yahooChartQuote'] = yahooChartQuote;
   results['twelveData'] = twelveData;
-  results['coinMarketCap'] = coinMarketCap;
   results['chartFallback'] = chartFallback;
-  results['cryptoDailyBars'] = cryptoDailyBars;
 
   // Daily request counters per provider. Resets at UTC midnight.
   try { results['fallbackRequestsToday'] = getFallbackRequestCounts(); }
@@ -19298,16 +18140,6 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   try { results['tradierQuotaBudget'] = getTradierQuotaBudgetState(); }
   catch (err) { results['tradierQuotaBudget'] = { error: err instanceof Error ? err.message : String(err) }; }
 
-  // TRA-1059 — rolling Coinbase request rate (req/min, 60s window) per host. The
-  // crypto candle cascade (cold-start daily warmer + steady-state tick loop) hits
-  // the Exchange host first and falls back to keyless Advanced Trade, so the load
-  // spans both pacers; `requestsLastMin` is the combined total that must stay
-  // under the ~200/min per-IP ceiling. Companion to the coarse `coinbaseBreakerOpen`
-  // bool below — makes the cold-start-prefetch soak's criterion-2 directly
-  // measurable instead of Render-log-only.
-  try { results['coinbaseBarPullRate'] = getCoinbaseBarPullRateState(); }
-  catch (err) { results['coinbaseBarPullRate'] = { error: err instanceof Error ? err.message : String(err) }; }
-
   // TRA-439 — Twelve Data quota guard: how much of the daily budget is spent
   // and whether the credit/rate-limit breaker is open. Lets QA confirm a
   // single provider can no longer blow its free-tier cap.
@@ -19318,17 +18150,6 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
     const v = results[key];
     return v && typeof v === 'object' && !('error' in (v as object)) && !('skipped' in (v as object));
   };
-  // TRA-705 — a `cryptoDailyBars` result with bars > 0 means the OHLC candle
-  // pipeline is operational: the engine can evaluate strategies and generate
-  // signals. Quote probes (`coinbase`, `coinbaseAdvancedTrade`, `yahooFinance`,
-  // `coinMarketCap`) are for watchlist display; the strategy layer runs on
-  // candles, not spot quotes. So `cryptoOk` is true if either the spot-quote
-  // path OR the candle path is live. On Render the AT candle endpoint
-  // (`market/products/{id}/candles`) resolves while the AT quote endpoint
-  // (`market/products`) does not — this gate ensures the gauge reports the
-  // truth (engine can trade) rather than a false outage (quote endpoint down).
-  const dailyBarsResult = results['cryptoDailyBars'] as { bars?: number } | undefined;
-  const dailyBarsOk = typeof dailyBarsResult?.bars === 'number' && dailyBarsResult.bars > 0;
   // TRA-1035 — `yahooChartQuote` is the keyless chart-endpoint quote path. It
   // counts toward `stocksOk` because the equity engine prices the universe
   // through the same `fetchQuote`/`fetchQuotes` cascade (tradier → yahoo quote →
@@ -19336,16 +18157,7 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   // the chart path still serves live prices, so the gauge must report stocks as
   // up rather than a false outage.
   const stocksOk = ok('tradier') || ok('yahooFinance') || ok('yahooChartQuote');
-  // TRA-331 / TRA-705 — Coinbase is primary for crypto; YF/CMC are fallbacks
-  // only. `coinbaseAdvancedTrade` (keyless `api.coinbase.com`) is the engine's
-  // real primary and the one source that resolves from the Render egress IP, so
-  // it must count toward `cryptoOk` — otherwise the gauge reports a crypto
-  // outage while the engine is happily pricing the universe through it.
-  const cryptoOk =
-    dailyBarsOk ||
-    ok('coinbaseAdvancedTrade') || ok('coinbase') || ok('coinGecko') ||
-    ok('yahooFinance') || ok('coinMarketCap');
-  const allOk = stocksOk && cryptoOk;
+  const allOk = stocksOk;
   // TRA-572 diagnostic: report which boot-time env vars the process sees (boolean
   // presence only — no secret values). Lets ops confirm whether Render is actually
   // injecting the credentials before each new process starts.
@@ -19361,11 +18173,9 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   return {
     ok: allOk,
     stocksOk,
-    cryptoOk,
     tradierConfigured: isTradierStocksConfigured(),
     tradierBreakerOpen: isTradierBreakerOpen(),
     yahooBreakerOpen: isYahooBreakerOpen(),
-    coinbaseBreakerOpen: isCoinbaseBreakerOpen(),
     // TRA-1940 — degraded-feed detail: which provider, why, quota/breaker expiry,
     // and the per-tick secondary-fetch wall-time budget currently enforced.
     feedDegradation: getFeedDegradationState(),
@@ -19448,10 +18258,6 @@ function broadcastEngineState(ctx: UserContext): void {
   broadcastToUser(ctx.username, JSON.stringify({ type: 'state', payload: dashboardEngineState(ctx) }));
 }
 
-function broadcastCryptoState(ctx: UserContext): void {
-  broadcastToUser(ctx.username, JSON.stringify({ type: 'crypto_state', payload: ctx.cryptoEngine.getState() }));
-}
-
 httpServer.on('upgrade', (req, socket, head) => {
   // TRA-4488 — the whole decision lives in `authenticateUpgrade` (`ws-auth.ts`).
   //
@@ -19485,7 +18291,6 @@ wss.on('connection', async (ws) => {
   const ctx = await ensureUserContext(username);
 
   ws.send(JSON.stringify({ type: 'state', payload: dashboardEngineState(ctx) }));
-  ws.send(JSON.stringify({ type: 'crypto_state', payload: ctx.cryptoEngine.getState() }));
 
   // TRA-244 — read latest.json from the active stocks bucket so the WS
   // handshake matches whatever the Calendar tab is showing for this account.
@@ -19514,21 +18319,6 @@ wss.on('connection', async (ws) => {
 // engine internals.
 function attachBroadcastHandlers(ctx: UserContext): void {
   const equityAudit = new TradeAuditTracker(ctx.username, 'equity');
-  const cryptoAudit = new TradeAuditTracker(ctx.username, 'crypto');
-  // TRA-1317 — surface the process-global regime-gated TSMOM demo-route book's open
-  // paper longs on this engine's Demo dashboard view. Consulted only in buildState's
-  // demo branch, so a live-mode context never renders them (real capital untouched).
-  //
-  // TRA-2411 — ...but SCOPED to the operator books. The route book is a module-level
-  // singleton with no user key, and binding it bare here handed the firm's paper
-  // positions to EVERY demo account as their own — the TRA-2407 fold leak on the
-  // crypto surface. The predicate is re-evaluated inside the closure on every
-  // getState() rather than decided once at attach time, so a role change cannot leave
-  // a demoted context still reading the book. A denied caller gets [], i.e. this
-  // engine's own book untouched.
-  ctx.cryptoEngine.setExternalDemoPositionsProvider(() =>
-    demoRoutePositionsFor(ctx.username, getUser(ctx.username)?.role),
-  );
   ctx.engine.onTick((state) => {
     try { equityAudit.observe(state as unknown as Parameters<typeof equityAudit.observe>[0]); } catch { /* audit must never break broadcast */ }
     // TRA-3910 — the audit above observes the ROUTING-mode state the engine
@@ -19536,10 +18326,6 @@ function attachBroadcastHandlers(ctx: UserContext): void {
     // when an override is actually set, so the default path ships `state` as-is.
     const view = resolveDashboardBookView(ctx.username);
     broadcastToUser(ctx.username, JSON.stringify({ type: 'state', payload: view ? ctx.engine.getState(view) : state }));
-  });
-  ctx.cryptoEngine.onTick((state) => {
-    try { cryptoAudit.observe(state as unknown as Parameters<typeof cryptoAudit.observe>[0]); } catch { /* audit must never break broadcast */ }
-    broadcastToUser(ctx.username, JSON.stringify({ type: 'crypto_state', payload: state }));
   });
 }
 
@@ -19814,7 +18600,7 @@ const externalIntelSchedule = startExternalIntelSchedule();
 // gate, no live-capital path). When on, each tick drives the existing brain
 // unattended on every DEMO-mode book: it enables demo auto-trading and forces a
 // decision cycle (analysts→trader→risk + strategy selector across
-// stocks/options/crypto), with the TRA-995 autopilot kept in-loop as the guard.
+// stocks/options), with the TRA-995 autopilot kept in-loop as the guard.
 // A halted book is skipped, so an autopilot halt demonstrably stops the loop.
 //
 // The driver below only ever touches the *demo* book (`setAutoTrading(true,
@@ -19823,28 +18609,15 @@ const externalIntelSchedule = startExternalIntelSchedule();
 function makeDemoBookEngine(ctx: UserContext): DemoBookEngine {
   return {
     username: ctx.username,
-    isHalted: () =>
-      ctx.engine.getState().tradingHalted || ctx.cryptoEngine.isKillSwitchEngaged(),
-    // TRA-1072 — the crypto leg ignores the equity feed-stale gate (an equity
-    // feed gap must not freeze crypto); it still honours the crypto kill switch
-    // and the equity latched breakers (loss-streak / drawdown / equity kill).
-    isCryptoHalted: () =>
-      ctx.engine.isHaltedExcludingFeedStale() || ctx.cryptoEngine.isKillSwitchEngaged(),
-    haltReason: () =>
-      ctx.engine.getState().haltReason ??
-      (ctx.cryptoEngine.isKillSwitchEngaged() ? 'Crypto kill switch engaged' : null),
+    isHalted: () => ctx.engine.getState().tradingHalted,
+    haltReason: () => ctx.engine.getState().haltReason ?? null,
     riskThrottle: () => ctx.engine.getRiskThrottle(),
     regime: () => ctx.engine.getState().marketReview.regime,
     recentAutopilotActions: () => ctx.engine.getAutopilotActions(),
     openStocks: () => ctx.engine.getState().account.openPositions.length,
-    openCrypto: () => ctx.cryptoEngine.getReportSnapshot('demo').accountState.openPositions.length,
     driveStocks: () => {
       ctx.engine.setAutoTrading(true, 'demo');
       ctx.engine.refresh();
-    },
-    driveCrypto: () => {
-      ctx.cryptoEngine.setAutoTrading(true, 'demo');
-      ctx.cryptoEngine.refresh();
     },
   };
 }
@@ -19867,7 +18640,7 @@ scheduler.start({
   // appears AFTER the dashboard's dailyPnl reset (the previous 4:05 PM hooks
   // ran before the reset, leaving the row visible at 4:05 but the dashboard
   // still showing the stale total until 9). Stocks generation is gated on
-  // market days inside the callback; crypto fires every day (24/7).
+  // market days inside the callback.
   //
   // TRA-386 — the post-market regime review runs on the same hook, after the
   // daily close so the EOD reports are already on disk.
@@ -19931,10 +18704,6 @@ scheduler.start({
       }),
     );
   },
-  // TRA-249-D — hourly funding accrual on open Coinbase INTX perps. Fires
-  // at minute=0 every ET hour; per-user trackers no-op when no perps are
-  // open or the user is in demo mode. TRA-1216 — the same tick also drives the
-  // observe-only perp funding-carry pass (flag-gated ⇒ zero cost/IO when off).
   onHourly: async () => {
     // TRA-2279 D2 — re-fold the parity-reconcile daily point on every ET hour boundary.
     // This is the DURABLE post-close read the series was missing: routine `d8ec9395`'s
@@ -19946,24 +18715,13 @@ scheduler.start({
     // single 16:05 ET minute `onMarketClose` would have given.
     //
     // Runs FIRST, and synchronously, on purpose: every other callee here is awaited, so
-    // placing it later would let one unrelated crypto/funding rejection starve the day's
+    // placing it later would let one unrelated rejection starve the day's
     // post-close fold — the exact silent-gap failure this fix exists to close. Cost is a
     // pure fold over the already-in-memory sandbox journal (no broker call, no order path,
     // no flag read) and it is best-effort internally, so it cannot throw into this tick.
     // Idempotent by construction (last-write-wins per ET day). Observe-only under the
     // TRA-1897 hold — gates/arms/graduates nothing.
     appendParitySnapshotForDay(getSandboxStrategyRecords());
-    await runHourlyFundingForAllUsers();
-    await runHourlyPerpFundingCarry();
-    // TRA-1220 — observe-only crypto regime-overlay classification (flag-gated ⇒
-    // zero cost/IO when off). Read-only: emits labels only, no order path.
-    await runHourlyCryptoRegime();
-    // TRA-1221 — observe-only regime-gated TSMOM scan over the same regime label
-    // (flag-gated ⇒ zero cost/IO when off). Read-only: would-be signals only.
-    await runHourlyCryptoRegimeTsmom();
-    // TRA-1271 — observe-only crypto ignition scan (flag-gated ⇒ zero cost/IO when
-    // off). Read-only, ZERO capital: would-be forward records + fill instrument only.
-    await runHourlyCryptoIgnition();
     // TRA-2810 — join Tradier account-history commission onto any live fee/slippage
     // ledger row still fees:null. Self-quenching (zero IO once nothing is unmeasured)
     // and internally best-effort — it cannot throw into this tick.
@@ -20012,8 +18770,7 @@ scheduler.start({
   },
   // TRA-368 — 9:00 AM ET pre-market routine. Replays prior session's EOD
   // review + a fresh pre-market scan into each user's smart watchlist so
-  // the SignalEngine starts the new session with curated symbols. Stocks
-  // only — crypto's 24/7 market has no pre-market boundary.
+  // the SignalEngine starts the new session with curated symbols.
   //
   // TRA-386 — the pre-market regime review runs first so its GREEN/YELLOW/RED
   // gates are persisted before the watchlist builder (and any engine reader)
@@ -20281,7 +19038,7 @@ const eventLoopWatchdog: WatchdogHandle | null = startEventLoopWatchdog();
 // 1812 MB at the 2026-08-27T13:26:17Z trip, and FLAT overnight afterwards).
 //
 // The census walks each per-user object's own container fields reflectively —
-// one `SignalEngine` + one `CryptoSignalEngine` + two `PnlTracker`s per user,
+// one `SignalEngine` + one `PnlTracker` per user,
 // against 67 users, so every per-engine container carries a x67 multiplier and
 // a hand-written suspect list would only ever find a retainer someone already
 // suspected. Shallow (`.size`/`.length`, O(1) per field) on the sampled path;
@@ -20290,9 +19047,7 @@ const heapCensusSampler: HeapCensusSamplerHandle | null = startHeapCensusSampler
   subjects: () =>
     getAllUserContexts().flatMap((ctx): CensusSubject[] => [
       { klass: 'signalEngine', target: ctx.engine },
-      { klass: 'cryptoEngine', target: ctx.cryptoEngine },
       { klass: 'pnlTracker', target: ctx.tracker },
-      { klass: 'cryptoPnlTracker', target: ctx.cryptoTracker },
     ]),
 });
 
@@ -20329,14 +19084,12 @@ async function gracefulShutdown(signal: string): Promise<void> {
   // tick (if any) keeps running and is drained next.
   for (const ctx of all) {
     ctx.engine.stop();
-    ctx.cryptoEngine.stop();
     if (ctx.stocksPersistTimer) clearTimeout(ctx.stocksPersistTimer);
-    if (ctx.cryptoPersistTimer) clearTimeout(ctx.cryptoPersistTimer);
   }
   // TRA-407 (C5) — finish the current tick so we exit on a tick boundary, not
   // mid-tick. Bounded by SHUTDOWN_DRAIN_TIMEOUT_MS so a wedged tick can't hold
   // the process past the redeploy grace window.
-  const drainAll = Promise.all(all.flatMap(ctx => [ctx.engine.drain(), ctx.cryptoEngine.drain()]));
+  const drainAll = Promise.all(all.map(ctx => ctx.engine.drain()));
   let drainTimer: ReturnType<typeof setTimeout> | undefined;
   await Promise.race([
     drainAll.then(() => undefined),
@@ -20364,7 +19117,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
   }
   // Flush every user's pending trade-history writes synchronously before exit.
   try {
-    await Promise.all(all.flatMap(ctx => [persistStocksNow(ctx), persistCryptoNow(ctx)]));
+    await Promise.all(all.map(ctx => persistStocksNow(ctx)));
   } catch (err: unknown) {
     log.warn('shutdown persist failed', {
       reason: err instanceof Error ? err.message : String(err),

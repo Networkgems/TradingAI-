@@ -4,7 +4,7 @@ import { isMoveSuspect, formatQuoteLevel, type QuoteMoveRow } from '@trading-app
 
 // TRA-318 follow-up: defend against null/undefined/NaN/non-finite numeric
 // fields arriving from the API (e.g. `Number.POSITIVE_INFINITY` reconciled
-// from a Coinbase wallet holding gets serialized to `null` over the wire).
+// from a broker holding gets serialized to `null` over the wire).
 // Without this guard the formatters threw and crashed the Positions tab to
 // a white screen.
 export function fmt(n: number | null | undefined, decimals = 2) {
@@ -98,8 +98,7 @@ export function quoteStatusLabel(s: QuoteRow, moveUnreliable: boolean = isQuoteM
   };
   // TRA-2379/TRA-2610 — the published session move is not believable. Name that
   // first, so nobody reads a fabricated move as merely a delayed feed. The caller
-  // may pass the verdict explicitly (the crypto panel does — its reading is
-  // flag-only; see `isCryptoMoveUnreliable`) so the badge and the label can never
+  // may pass the verdict explicitly so the badge and the label can never
   // disagree with each other on the same row.
   if (moveUnreliable) return `Change % unreliable — bad prev close (${freshness()})`;
   return freshness();
@@ -134,23 +133,6 @@ type QuoteRow = { lastUpdated: number; quoteStatus?: QuoteStatus } & QuoteMoveRo
  */
 export function isQuoteMoveUnreliable(s: QuoteMoveRow): boolean {
   return isMoveSuspect(s);
-}
-
-/**
- * TRA-2610 — the CRYPTO reading of the same question, and it is deliberately
- * FLAG-ONLY: it reads `moveSuspect` and does NOT execute the ratio rule.
- *
- * Not an oversight and not laziness. TRA-2379 ruled the rule out for crypto with a
- * reason that still holds (see the top-movers comment in `crypto-eod-report.ts`): a
- * crypto row's `changePct` is a provider-supplied 24h figure with no implied prev
- * close for the ratio test to recover, and a genuine +100% session in a thin coin is
- * a real move, not a corporate-action artefact — there are no corporate actions here.
- * Executing the rule on this path would manufacture false positives while fixing
- * nothing. Nothing stamps `moveSuspect` on a crypto row today; if a crypto
- * plausibility rule is ever written, this is the reader that picks it up for free.
- */
-export function isCryptoMoveUnreliable(s: { moveSuspect?: boolean }): boolean {
-  return s.moveSuspect === true;
 }
 
 export function formatTime(ts: number) {
@@ -214,7 +196,6 @@ export function signalLabel(type: string) {
     case 'tradier_import': return 'Tradier Import';
     case 'sma200_pullback': return 'Pullback → 200';
     case 'sma200_reclaim': return '200-SMA Reclaim';
-    case 'tsmom_majors': return 'TS Momentum'; // TRA-821 — crypto time-series momentum (display-only pre-gate)
     default: return type;
   }
 }

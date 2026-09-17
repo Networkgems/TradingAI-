@@ -1,19 +1,17 @@
 /**
  * Automated optimization harness with overfitting guards (TRA-540, implements
- * the TRA-531 QuantTrader spec). One config-driven CLI entry drives the whole
+ * the TRA-531 QuantTrader spec). One config-driven entry drives the whole
  * pipeline:
  *
  *   partition → sweep → walk-forward → guard battery → holdout → report
  *
- * Run:
- *   pnpm --filter @trading-app/backtest exec tsx src/run-optimization.ts \
- *       --strategy=reversal [--symbol=BTC-USD] [--maxTrials=64] [--seed=42]
- *
  * It replaces the hand-written `run-traNNN-sweep.ts` scripts with a reusable
  * harness: the strategy, parameter grid, window sizes and `maxTrials` are
  * declarative config (see {@link STRATEGY_SPECS}); the math primitives
- * (`walkForward`, `BacktestRunner`, `cryptoTieredCostModel`, `loadOrFetch4hBars`,
+ * (`walkForward`, `BacktestRunner`, `flatCostModel`,
  * `blockBootstrapEquityCurves`, and the new `overfitting-stats`) are reused.
+ * (TRA-4629 removed the retired CLI entry that fetched the old 4H exchange
+ * caches; callers now invoke {@link runOptimization} with their own candles.)
  *
  * Outputs (anchored to the package root): `optimization-report.json`,
  * `optimization-report.md`, `optimization-windows.csv`, and a machine-readable
@@ -28,7 +26,6 @@ import { writeFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BacktestRunner } from './runner.js';
-import { loadOrFetch4hBars } from './fetch-tra266-data.js';
 import { buildWindows, walkForward } from './walk-forward.js';
 import { blockBootstrapEquityCurves } from './bootstrap.js';
 import { partitionData, type DataPartition } from './data-partition.js';
@@ -39,16 +36,18 @@ import {
   type DeflatedSharpeResult,
   type PboResult,
 } from './overfitting-stats.js';
-import { cryptoTieredCostModel, type CostModel } from '@trading-app/engine';
+import { flatCostModel, type CostModel } from '@trading-app/engine';
 import type { Candle } from '@trading-app/shared';
 import type { BacktestConfig, BacktestResult } from './types.js';
 
 const INITIAL_EQUITY = 25_000;
-// Real Coinbase 4H bars — 6 bars per 24h day (TRA-420 §1).
+// 4H bars — 6 bars per 24h day (TRA-420 §1).
 const BARS_PER_DAY = 6;
 // Warmup must cover the slowest indicator (200-bar EMA / 90-bar ATR-median).
 const WARMUP_BARS = 250;
-const DATA_START_MS = Date.UTC(2023, 4, 1); // 2023-05-01, the on-disk 4H cache start.
+// Default per-fill cost assumption (was the tiered table's top tier before
+// TRA-4629 removed the tiered model): 4 bps commission + 2 bps slippage.
+const DEFAULT_FILL_COST = { commissionBps: 4, slippageBps: 2 };
 // Min trades per train window below which Sharpe is noise (spec §6).
 const MIN_TRADES_PER_WINDOW = 20;
 // Min OOS trade sample below which a guard cannot honestly certify. A handful
@@ -198,7 +197,7 @@ function baseConfig(symbol: string, strategyType: BacktestConfig['strategyType']
     endDate: 0,
     initialEquity: INITIAL_EQUITY,
     strategyType,
-    costModel: cryptoTieredCostModel(),
+    costModel: flatCostModel(DEFAULT_FILL_COST),
     portfolioOpts: { maxOpenPositions: 3, maxSectorExposure: 3 },
   };
 }
@@ -488,7 +487,7 @@ export async function runOptimization(
   const holdoutStressed = await runner.run(
     {
       ...blessedConfig,
-      costModel: scaledCostModel(cryptoTieredCostModel(), G6_COST_MULTIPLIER),
+      costModel: scaledCostModel(flatCostModel(DEFAULT_FILL_COST), G6_COST_MULTIPLIER),
       warmupStartDate: hWarmStart, startDate: hEvalStart, endDate: hEnd,
     },
     holdoutBars,
@@ -646,46 +645,6 @@ function writeReports(report: OptimizationReport): void {
   console.log(`\nWrote optimization-report.json / .md and optimization-windows.csv to ${root}`);
 }
 
-// ── CLI ──────────────────────────────────────────────────────────────────────
-
-function parseArgs(argv: string[]): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const a of argv) {
-    const m = /^--([^=]+)=(.*)$/.exec(a);
-    if (m) out[m[1]] = m[2];
-  }
-  return out;
-}
-
-async function main() {
-  const args = parseArgs(process.argv.slice(2));
-  const strategyName = args.strategy ?? 'reversal';
-  const symbol = args.symbol ?? 'BTC-USD';
-  const seed = args.seed ? Number(args.seed) : 42;
-
-  const spec = STRATEGY_SPECS[strategyName];
-  if (!spec) {
-    throw new Error(`Unknown strategy "${strategyName}". Known: ${Object.keys(STRATEGY_SPECS).join(', ')}`);
-  }
-  if (args.maxTrials) spec.maxTrials = Number(args.maxTrials);
-
-  console.log(`[run-optimization] strategy=${strategyName} symbol=${symbol} seed=${seed}`);
-  const candles = await loadOrFetch4hBars(symbol, DATA_START_MS, Date.now());
-  const span = candles.length
-    ? (candles[candles.length - 1].timestamp - candles[0].timestamp) / (365.25 * 864e5)
-    : 0;
-  console.log(`Loaded ${candles.length} real Coinbase 4H bars (${span.toFixed(2)}y).`);
-
-  const report = await runOptimization(spec, candles, { symbol, seed });
-
-  console.log(`\n── Guard battery ──`);
-  for (const g of report.guards) {
-    console.log(`  ${g.id} ${g.name}: ${g.pass ? 'PASS' : 'FAIL'} — ${g.detail}`);
-  }
-  console.log(`\nVERDICT: ${report.verdict.pass ? 'PASS ✅' : 'FAIL ❌'} (blessed: ${report.blessed.label})`);
-
-  writeReports(report);
-}
-
-const invoked = process.argv[1] && /[\\/]run-optimization\.(ts|js)$/.test(process.argv[1]);
-if (invoked) main().catch((err) => { console.error(err); process.exit(1); });
+// (The former CLI entry, which fetched the retired 4H exchange caches, was
+// removed in TRA-4629. Drive the pipeline via `runOptimization(spec, candles,
+// opts)` and `writeReports(report)` from a caller that supplies its own data.)

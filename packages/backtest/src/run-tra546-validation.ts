@@ -1,5 +1,5 @@
 // TRA-546 (TRA-529 P3) — driver for the agent validation harness. Replays the
-// P1 stub graph over a synthetic multi-regime crypto series under an as-of
+// P1 stub graph over a synthetic multi-regime 24/7 series under an as-of
 // clock, persists every recommendation, and writes the four metric reports
 // (ledger, scoring, calibration, net-of-cost edge) to disk + a console summary.
 //

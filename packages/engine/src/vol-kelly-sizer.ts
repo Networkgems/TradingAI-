@@ -59,7 +59,7 @@ export interface VolKellySizerConfig {
   volWindowBars: number;
   /** §3.2 — bars per year used to annualise realised vol (4H → 2190). */
   barsPerYear: number;
-  /** §3.2 — `σ_ref` volatility anchor (annualised), default mid-band crypto vol. */
+  /** §3.2 — `σ_ref` volatility anchor (annualised). */
   volRefAnnual: number;
   /** §3.3 — lower clamp on `volScalar`. */
   volScalarFloor: number;

@@ -48,9 +48,8 @@ describe('ExportTradesModal', () => {
     // account — both modes checked
     expect(screen.getByLabelText('Demo')).toBeChecked();
     expect(screen.getByLabelText('Live')).toBeChecked();
-    // market — all three checked
+    // market — both checked
     expect(screen.getByLabelText('Stocks')).toBeChecked();
-    expect(screen.getByLabelText('Crypto')).toBeChecked();
     expect(screen.getByLabelText('Options')).toBeChecked();
     // format — CSV default
     expect(screen.getByLabelText('CSV')).toBeChecked();
@@ -63,10 +62,10 @@ describe('ExportTradesModal', () => {
     const { createObjectURL, clickSpy } = stubDownloadPlumbing();
     render(<ExportTradesModal token="tok" httpUrl="http://x" onClose={() => undefined} />);
 
-    // Narrow to: This year · Live only · stocks+options · JSON.
+    // Narrow to: This year · Live only · stocks only · JSON.
     await user.click(screen.getByLabelText('This year'));
     await user.click(screen.getByLabelText('Demo')); // uncheck demo
-    await user.click(screen.getByLabelText('Crypto')); // uncheck crypto
+    await user.click(screen.getByLabelText('Options')); // uncheck options
     await user.click(screen.getByLabelText('JSON'));
 
     await user.click(screen.getByRole('button', { name: 'Download' }));
@@ -77,7 +76,7 @@ describe('ExportTradesModal', () => {
     const qs = new URLSearchParams(url.split('?')[1]);
     expect(qs.get('format')).toBe('json');
     expect(qs.get('modes')).toBe('live');
-    expect(qs.get('markets')).toBe('stocks,options');
+    expect(qs.get('markets')).toBe('stocks');
     const y = new Date().getFullYear();
     expect(qs.get('from')).toBe(`${y}-01-01`);
     expect(qs.get('to')).toBe(`${y}-12-31`);

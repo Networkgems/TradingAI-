@@ -56,7 +56,7 @@ const cache: Map<string, AccountSettings> = new Map();
 // per-market field based on `liveBrokerageType`, then clear them so the leak
 // is impossible.
 // TRA-229 — pre-split installs stored a single auto-trading flag per market
-// (`stocksAutoTradingEnabled`, `cryptoAutoTradingEnabled`) that applied to both
+// (`stocksAutoTradingEnabled`) that applied to both
 // demo and live. After the per-mode split each market has independent demo/live
 // flags. Copy the legacy value into BOTH new fields once so users keep their
 // previous on/off state, then clear the legacy field.
@@ -65,22 +65,13 @@ export function migrateLegacyAutoTradingFlags(input: AccountSettings): {
   migrated: boolean;
 } {
   const hasLegacyStocks = typeof input.stocksAutoTradingEnabled === 'boolean';
-  const hasLegacyCrypto = typeof input.cryptoAutoTradingEnabled === 'boolean';
-  if (!hasLegacyStocks && !hasLegacyCrypto) return { settings: input, migrated: false };
+  if (!hasLegacyStocks) return { settings: input, migrated: false };
 
   const next: AccountSettings = { ...input };
-  if (hasLegacyStocks) {
-    const v = input.stocksAutoTradingEnabled ?? true;
-    if (typeof next.stocksAutoTradingEnabledDemo !== 'boolean') next.stocksAutoTradingEnabledDemo = v;
-    if (typeof next.stocksAutoTradingEnabledLive !== 'boolean') next.stocksAutoTradingEnabledLive = v;
-    delete next.stocksAutoTradingEnabled;
-  }
-  if (hasLegacyCrypto) {
-    const v = input.cryptoAutoTradingEnabled ?? true;
-    if (typeof next.cryptoAutoTradingEnabledDemo !== 'boolean') next.cryptoAutoTradingEnabledDemo = v;
-    if (typeof next.cryptoAutoTradingEnabledLive !== 'boolean') next.cryptoAutoTradingEnabledLive = v;
-    delete next.cryptoAutoTradingEnabled;
-  }
+  const v = input.stocksAutoTradingEnabled ?? true;
+  if (typeof next.stocksAutoTradingEnabledDemo !== 'boolean') next.stocksAutoTradingEnabledDemo = v;
+  if (typeof next.stocksAutoTradingEnabledLive !== 'boolean') next.stocksAutoTradingEnabledLive = v;
+  delete next.stocksAutoTradingEnabled;
   return { settings: next, migrated: true };
 }
 
@@ -95,52 +86,16 @@ export function migrateLegacyLiveCredentials(input: AccountSettings): {
   if (!hasLegacy) return { settings: input, migrated: false };
 
   const next: AccountSettings = { ...input };
-  // `liveBrokerageType` defaults to 'webull' in DEFAULT_ACCOUNT_SETTINGS, which
+  // `liveBrokerageType` defaulted to 'webull' in DEFAULT_ACCOUNT_SETTINGS, which
   // matches what the original single-market form would have shown when the
-  // field was unset, so an undefined value routes to stocks.
-  const brokerage = input.liveBrokerageType ?? 'webull';
-  if (brokerage === 'coinbase') {
-    if (!next.liveApiKeyCrypto) next.liveApiKeyCrypto = input.liveApiKey ?? '';
-    if (!next.liveApiSecretCrypto) next.liveApiSecretCrypto = input.liveApiSecret ?? '';
-  } else {
-    if (!next.liveApiKeyStocks) next.liveApiKeyStocks = input.liveApiKey ?? '';
-    if (!next.liveAccountIdStocks) next.liveAccountIdStocks = input.liveAccountId ?? '';
-  }
+  // field was unset, so legacy values route to stocks. (The coinbase arm was
+  // removed with the crypto engine, TRA-4629.)
+  if (!next.liveApiKeyStocks) next.liveApiKeyStocks = input.liveApiKey ?? '';
+  if (!next.liveAccountIdStocks) next.liveAccountIdStocks = input.liveAccountId ?? '';
 
   next.liveApiKey = '';
   next.liveApiSecret = '';
   next.liveAccountId = '';
-  return { settings: next, migrated: true };
-}
-
-// TRA-587 — pre-TRA-575 installs persisted `cryptoAutoTradingEnabledLive: true`
-// (the old DEFAULT_ACCOUNT_SETTINGS value). TRA-575 flipped that default to
-// `false` so a live-switch no longer trips the TRA-532 crypto promotion gate for
-// stocks-only users — but it never migrated EXISTING saved files, whose persisted
-// `true` still overrides the new default on load (loadSettings merges
-// `{ ...DEFAULT_ACCOUNT_SETTINGS, ...JSON.parse(raw) }`). Those legacy accounts
-// therefore keep getting "Could not switch to live — promotion gate" (TRA-587).
-//
-// Flip the stale `true` to `false` exactly ONCE per account, completing TRA-575's
-// "live crypto is strictly opt-in" intent for existing accounts. A user who truly
-// wants live crypto re-enables it via POST /api/crypto/trading/start (mode=live),
-// which sets the flag back on AND enforces the same gate — so nobody is stranded
-// and the gate is not weakened. The `cryptoLiveDefaultMigratedTra587` marker
-// (born `true` in DEFAULT_ACCOUNT_SETTINGS for new accounts, absent on legacy
-// files) guarantees we only flip on the first load of a pre-marker file and never
-// re-flip a deliberate post-migration opt-in. `markerPresentOnDisk` must be read
-// from the RAW parsed JSON, not the defaults-merged object — the merge would
-// otherwise inject the default `true` marker and mask every legacy file.
-export function migrateLegacyCryptoLiveDefault(
-  input: AccountSettings,
-  markerPresentOnDisk: boolean,
-): {
-  settings: AccountSettings;
-  migrated: boolean;
-} {
-  if (markerPresentOnDisk) return { settings: input, migrated: false };
-  const next: AccountSettings = { ...input, cryptoLiveDefaultMigratedTra587: true };
-  if (input.cryptoAutoTradingEnabledLive === true) next.cryptoAutoTradingEnabledLive = false;
   return { settings: next, migrated: true };
 }
 
@@ -214,11 +169,7 @@ async function readMigratedJsonFile(username: string): Promise<AccountSettings |
   const merged = { ...DEFAULT_ACCOUNT_SETTINGS, ...parsed } as AccountSettings;
   const credsResult = migrateLegacyLiveCredentials(merged);
   const flagsResult = migrateLegacyAutoTradingFlags(credsResult.settings);
-  const cryptoLiveResult = migrateLegacyCryptoLiveDefault(
-    flagsResult.settings,
-    parsed.cryptoLiveDefaultMigratedTra587 === true,
-  );
-  return cryptoLiveResult.settings;
+  return flagsResult.settings;
 }
 
 /** Legacy JSON read path (used only when SQLite is unavailable). Unchanged behaviour. */
@@ -235,24 +186,13 @@ async function loadSettingsFromJsonFile(username: string): Promise<AccountSettin
     const merged = { ...DEFAULT_ACCOUNT_SETTINGS, ...parsed } as AccountSettings;
     const credsResult = migrateLegacyLiveCredentials(merged);
     const flagsResult = migrateLegacyAutoTradingFlags(credsResult.settings);
-    // TRA-587 — detect the legacy crypto-live default from the RAW parse: the
-    // defaults-merged `merged` always carries the marker, so the marker presence
-    // check must read `parsed`, not `merged` (see migrateLegacyCryptoLiveDefault).
-    const cryptoLiveResult = migrateLegacyCryptoLiveDefault(
-      flagsResult.settings,
-      parsed.cryptoLiveDefaultMigratedTra587 === true,
-    );
-    const settings = cryptoLiveResult.settings;
-    const migrated = credsResult.migrated || flagsResult.migrated || cryptoLiveResult.migrated;
+    const settings = flagsResult.settings;
+    const migrated = credsResult.migrated || flagsResult.migrated;
     if (migrated) {
       try {
         await persistMigrated(username, settings);
         if (credsResult.migrated) log.info('TRA-165 migration: cleared legacy live creds', { username });
         if (flagsResult.migrated) log.info('TRA-229 migration: split auto-trading flags by mode', { username });
-        if (cryptoLiveResult.migrated)
-          log.info('TRA-587 migration: defaulted legacy live-crypto auto-trading OFF (strictly opt-in)', {
-            username,
-          });
       } catch (err: unknown) {
         log.warn('migration: failed to persist migrated settings', {
           username,
@@ -292,8 +232,6 @@ export function getSettings(username: string): AccountSettings {
 const CREDENTIAL_FIELDS: ReadonlyArray<keyof AccountSettings> = [
   'liveApiKeyStocks',
   'liveAccountIdStocks',
-  'liveApiKeyCrypto',
-  'liveApiSecretCrypto',
   'liveApiKeyOptionsSandbox',
   'liveAccountIdOptionsSandbox',
   'liveApiKeyOptionsProduction',
@@ -406,7 +344,7 @@ export function clearSettingsCache(username: string): void {
  * itself, so a new credential field added to the shared type fails the suite
  * rather than silently escaping retirement.
  */
-export const PERSISTED_CREDENTIAL_FIELDS: ReadonlyArray<keyof AccountSettings> = [
+export const PERSISTED_CREDENTIAL_FIELDS: ReadonlyArray<string> = [
   // legacy, pre-market-split (TRA-165)
   'liveApiKey',
   'liveApiSecret',
@@ -414,7 +352,9 @@ export const PERSISTED_CREDENTIAL_FIELDS: ReadonlyArray<keyof AccountSettings> =
   // stocks — NOT in LiveCredentialField, and the pair that leaked
   'liveApiKeyStocks',
   'liveAccountIdStocks',
-  // crypto
+  // crypto — RETIRED fields (TRA-4629 removed the crypto engine; nothing reads
+  // these anymore), kept here BY NAME because old persisted blobs still carry
+  // plaintext Coinbase creds and a retiring account must still be scrubbed.
   'liveApiKeyCrypto',
   'liveApiSecretCrypto',
   // options, pre-env-split
@@ -443,9 +383,9 @@ export function redactPersistedCredentials(input: Partial<AccountSettings>): {
   const settings: Partial<AccountSettings> = { ...input };
   const cleared: string[] = [];
   for (const field of PERSISTED_CREDENTIAL_FIELDS) {
-    const raw = settings[field];
-    if (typeof raw === 'string' && raw.trim() !== '') cleared.push(String(field));
-    if (raw !== undefined) (settings as Record<string, unknown>)[String(field)] = '';
+    const raw = (settings as Record<string, unknown>)[field];
+    if (typeof raw === 'string' && raw.trim() !== '') cleared.push(field);
+    if (raw !== undefined) (settings as Record<string, unknown>)[field] = '';
   }
   return { settings, cleared };
 }
@@ -564,14 +504,13 @@ export function clampScopedRisk(incoming?: number, saved?: number): number | und
 }
 
 /**
- * TRA-346 — return a partial AccountSettings holding only the eight scoped
+ * TRA-346 — return a partial AccountSettings holding only the scoped
  * Managed Account Ratio + Risk Per Trade fields, each clamped against the
  * matching bucket from `body` (request) falling back to `current` (saved).
  *
- * Extracted so the unit tests can lock in the four-bucket isolation contract
+ * Extracted so the unit tests can lock in the per-bucket isolation contract
  * without spinning up the full Express route. Each bucket is clamped
- * independently — touching `managedAccountRatioDemoCrypto` must NOT pin the
- * other seven scoped fields to anything, otherwise the resolver's legacy
+ * independently, otherwise the resolver's legacy
  * fallback breaks for users who saved before TRA-346.
  */
 export function mergeScopedRiskSettings(
@@ -581,21 +520,13 @@ export function mergeScopedRiskSettings(
   AccountSettings,
   | 'managedAccountRatioDemoStocks'
   | 'managedAccountRatioLiveStocks'
-  | 'managedAccountRatioDemoCrypto'
-  | 'managedAccountRatioLiveCrypto'
   | 'riskPerTradeDemoStocks'
   | 'riskPerTradeLiveStocks'
-  | 'riskPerTradeDemoCrypto'
-  | 'riskPerTradeLiveCrypto'
 > {
   return {
     managedAccountRatioDemoStocks: clampScopedRatio(body.managedAccountRatioDemoStocks, current.managedAccountRatioDemoStocks),
     managedAccountRatioLiveStocks: clampScopedRatio(body.managedAccountRatioLiveStocks, current.managedAccountRatioLiveStocks),
-    managedAccountRatioDemoCrypto: clampScopedRatio(body.managedAccountRatioDemoCrypto, current.managedAccountRatioDemoCrypto),
-    managedAccountRatioLiveCrypto: clampScopedRatio(body.managedAccountRatioLiveCrypto, current.managedAccountRatioLiveCrypto),
     riskPerTradeDemoStocks: clampScopedRisk(body.riskPerTradeDemoStocks, current.riskPerTradeDemoStocks),
     riskPerTradeLiveStocks: clampScopedRisk(body.riskPerTradeLiveStocks, current.riskPerTradeLiveStocks),
-    riskPerTradeDemoCrypto: clampScopedRisk(body.riskPerTradeDemoCrypto, current.riskPerTradeDemoCrypto),
-    riskPerTradeLiveCrypto: clampScopedRisk(body.riskPerTradeLiveCrypto, current.riskPerTradeLiveCrypto),
   };
 }

@@ -2,15 +2,15 @@
 //
 // Parent: TRA-990. The owner wants the in-app brain to self-run and self-adjust
 // on the DEMO book continuously, with nobody on the team driving it daily. The
-// brain already exists — per-user `SignalEngine` (stocks/options) + crypto
-// engine each tick on their own 30s timers, and the TRA-995 risk autopilot
+// brain already exists — the per-user `SignalEngine` (stocks/options) ticks
+// on its own 30s timer, and the TRA-995 risk autopilot
 // already runs inside the daily governor. This module is the standing CONDUCTOR
 // that makes the demo book drive itself unattended:
 //
 //   • a fast intraday cadence (per-minute by default, NOT sub-minute HFT — that
 //     was analysed NO-GO for this stack on TRA-960/963),
 //   • that, each tick, enables demo auto-trading and drives one decision cycle
-//     across stocks/options/crypto on every DEMO-mode book,
+//     across stocks/options on every DEMO-mode book,
 //   • with the TRA-995 autopilot kept in-loop as the guard: a halted book is
 //     skipped (no new entries forced), so an autopilot halt demonstrably stops
 //     the loop,
@@ -72,16 +72,15 @@ export function resolveAutonomousLoopIntervalMs(
 export interface DemoLoopGates {
   /**
    * True when the US equity market is open. Stocks/options decisioning only
-   * fires in-session; crypto is 24/7 and drives every tick.
+   * fires in-session.
    */
   stocksMarketOpen: boolean;
 }
 
 /**
  * The read-only + drive seam for ONE demo book. The index.ts adapter implements
- * this over a real `UserContext` (stocks `SignalEngine` + crypto engine); tests
- * inject a fake. The loop only ever calls `driveStocks` / `driveCrypto` on a
- * book it has NOT found halted, which is what makes "autopilot halt stops the
+ * this over a real `UserContext` (stocks `SignalEngine`); tests inject a fake.
+ * The loop only ever calls `driveStocks` on a book it has NOT found halted, which is what makes "autopilot halt stops the
  * loop" hold and be unit-testable.
  */
 export interface DemoBookEngine {
@@ -92,14 +91,6 @@ export interface DemoBookEngine {
    * feed_stale). This is the book-wide "halted" flag surfaced for health/EOD.
    */
   isHalted(): boolean;
-  /**
-   * TRA-1072 — the CRYPTO-leg halt state: the book's halt EXCLUDING the equity
-   * feed-stale gate (plus the crypto kill switch). An equity-feed staleness must
-   * NOT freeze crypto, which runs on the independent Coinbase feed with its own
-   * freshness gate. Genuine latched breakers (loss-streak / drawdown / kill
-   * switch) still halt both legs.
-   */
-  isCryptoHalted(): boolean;
   /** Human-readable halt reason, surfaced when halted. */
   haltReason(): string | null;
   /** Tighten-only risk multiplier in (0, 1]; 1 ⇒ full size. */
@@ -110,12 +101,8 @@ export interface DemoBookEngine {
   recentAutopilotActions(): AutopilotAction[];
   /** Open stock/option position count after the cycle (visibility). */
   openStocks(): number;
-  /** Open crypto position count after the cycle (visibility). */
-  openCrypto(): number;
   /** Enable demo auto-trading + drive one stocks/options decision cycle. */
   driveStocks(): void | Promise<void>;
-  /** Enable demo auto-trading + drive one crypto decision cycle. */
-  driveCrypto(): void | Promise<void>;
 }
 
 /** Per-book decision summary the loop records for health + EOD. */
@@ -123,8 +110,6 @@ export interface DemoBookDecision {
   username: string;
   /** True if a stocks/options decision cycle was driven this tick. */
   droveStocks: boolean;
-  /** True if a crypto decision cycle was driven this tick. */
-  droveCrypto: boolean;
   /** Autopilot/kill halt state — when true the book was skipped (no entries). */
   halted: boolean;
   haltReason: string | null;
@@ -133,7 +118,6 @@ export interface DemoBookDecision {
   /** Newest autopilot actions surfaced this tick. */
   autopilotActions: AutopilotAction[];
   openStocks: number;
-  openCrypto: number;
   /** Active regime if known. */
   regime: string | null;
 }
@@ -165,8 +149,8 @@ export interface AutonomousDemoLoopDeps {
 /**
  * Run ONE autonomous-demo tick. The flag is checked FIRST, before any books are
  * enumerated, so a tick with `ENABLE_AUTONOMOUS_DEMO_LOOP` off does zero IO and
- * never touches an engine. With the flag on it drives crypto on every book and
- * stocks/options only in-session, SKIPPING any book the autopilot has halted, and
+ * never touches an engine. With the flag on it drives stocks/options only
+ * in-session, SKIPPING any book the autopilot has halted, and
  * records the outcome for the health + EOD surfaces.
  */
 export async function runAutonomousDemoTick(
@@ -199,28 +183,9 @@ export async function runAutonomousDemoTick(
   let booksDriven = 0;
 
   for (const book of books) {
-    // TRA-1072 — the two legs are gated SEPARATELY. `isHalted()` carries the
-    // equity/options halt (latched breakers + kill + the transient equity
-    // feed-stale gate); `isCryptoHalted()` excludes the equity feed-stale gate so
-    // an equity-feed staleness does NOT freeze crypto (which runs on its own
-    // Coinbase feed gate). A genuine latched breaker still halts both legs.
     const halted = book.isHalted();
-    const cryptoHalted = book.isCryptoHalted();
     let droveStocks = false;
-    let droveCrypto = false;
 
-    // Crypto trades 24/7 and is gated by its OWN halt state only.
-    if (!cryptoHalted) {
-      try {
-        await book.driveCrypto();
-        droveCrypto = true;
-      } catch (err) {
-        log.error('autonomous demo book crypto drive failed', {
-          username: book.username,
-          reason: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
     // Stocks/options only when the equity market is open AND the equity leg is
     // not halted (a halted book forces NO new equity entries).
     if (!halted && stocksMarketOpen) {
@@ -234,18 +199,16 @@ export async function runAutonomousDemoTick(
         });
       }
     }
-    if (droveStocks || droveCrypto) booksDriven += 1;
+    if (droveStocks) booksDriven += 1;
 
     decisions.push({
       username: book.username,
       droveStocks,
-      droveCrypto,
       halted,
       haltReason: halted ? book.haltReason() : null,
       riskThrottle: book.riskThrottle(),
       autopilotActions: book.recentAutopilotActions(),
       openStocks: book.openStocks(),
-      openCrypto: book.openCrypto(),
       regime: book.regime(),
     });
   }

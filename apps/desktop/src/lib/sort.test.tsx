@@ -1,5 +1,5 @@
 // TRA-339 — regression coverage for the generic per-table sort primitives that
-// power the sortable column headers in the Crypto + Stock dashboards. The
+// power the sortable column headers in the Stock dashboard. The
 // feature shipped in d27c0cf and survived the TRA-419 decomposition, but the
 // core comparator / sortRows / useTableSort toggle had no tests. These lock in
 // the behaviour the dashboard tables rely on: alphabetic-both-ways on strings,

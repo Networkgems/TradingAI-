@@ -4,7 +4,7 @@
 // pre-trade gate (MTF + volume + R:R>=1.5, ATR stop)". This is the ONE distilled
 // improvement from the TRA-1456 strategy-card study (readout eda8bf72): fold the
 // recurring tactical-chart pattern into a single reusable gate that EVERY trade
-// candidate (options RV/exec-selector, equity directional, crypto DCA/TSMOM) must
+// candidate (options RV/exec-selector, equity directional) must
 // clear before order routing.
 //
 // This module is PURE and side-effect free: it takes the entry basis, direction,

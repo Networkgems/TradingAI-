@@ -19,7 +19,7 @@ import { getStocksWatchlistData, seedReviewLeaders } from './watchlist-store.js'
 import { fetchDailyCandles } from './yahoo-feed.js';
 import { generateMarketReview } from './market-review.js';
 import { loadModelFacingJournalRows } from './model-facing-journal.js';
-import { makeBacktestExecutor, RV_CRYPTO_MAJORS_BASE_CONFIG } from './backtest-executor.js';
+import { makeBacktestExecutor, EMPTY_BASE_CONFIG } from './backtest-executor.js';
 import {
   isAnalystAgentEnabled,
   analystEtDate,
@@ -184,10 +184,12 @@ export async function buildPostmarketDeps(
     regime,
     rows,
     plan,
-    baseConfig: RV_CRYPTO_MAJORS_BASE_CONFIG,
+    // TRA-4629 — no sleeve is registered (the RV crypto-majors sleeve went with
+    // the crypto engine); the executor refuses, so no hypothesis can clear G0.
+    baseConfig: EMPTY_BASE_CONFIG,
     tunables: DEFAULT_ANALYST_TUNABLES,
     pipeline: {
-      baseConfig: RV_CRYPTO_MAJORS_BASE_CONFIG,
+      baseConfig: EMPTY_BASE_CONFIG,
       runBacktest: makeBacktestExecutor(),
     },
   };

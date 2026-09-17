@@ -81,7 +81,7 @@ vi.mock('./trade-store.js', async (importOriginal) => {
   };
 });
 
-const { persistStocksNow, persistCryptoNow } = await import('./user-context.js');
+const { persistStocksNow } = await import('./user-context.js');
 const {
   gradePersistRow,
   foldPersistVerdict,
@@ -200,27 +200,6 @@ describe('TRA-3407 negative control — the write throws, the verdict must flip'
     expect(red.staleRows[0]?.reason).toBe('persist-failing');
     // And the denominator moved with it, so this is not a red over an empty set.
     expect(red.gradedRowCount).toBe(1);
-  });
-
-  it('NEGATIVE CONTROL (crypto): the second writer has its own axis and its own flip', async () => {
-    const ctx = ctxFor('admin');
-    recordPersistTick('admin', 'crypto', new Date(NOW - 1_000));
-    await persistCryptoNow(ctx);
-    expect(getPersistOutcome('admin', 'crypto')?.consecutiveFailures).toBe(0);
-
-    failure.crypto = enospc('/data/users/admin/trades-crypto.json');
-    await persistCryptoNow(ctx);
-
-    const rec = getPersistOutcome('admin', 'crypto')!;
-    expect(rec.consecutiveFailures).toBe(1);
-    const graded = gradePersistRow(
-      liveRow({ axis: 'crypto', consecutiveFailures: rec.consecutiveFailures }),
-      NOW,
-    );
-    expect(graded.verdict).toBe('STALE');
-    // Crypto ticks at 60s, so its budget is twice the stock one. A shared
-    // constant would hold the slower writer to the faster writer's clock.
-    expect(graded.budgetSec).toBe((AXIS_TICK_MS.crypto * STALENESS_TICKS) / 1000);
   });
 
   it('a streak accumulates and only a SUCCESS clears it — five days is one unbroken run', async () => {
@@ -534,19 +513,6 @@ describe('TRA-3432 engine-disabled is a LABEL, not an operand', () => {
     expect(gradePersistRow({ ...row, engineEnabled: true }, NOW).reason).toBe('no-tick-observed');
   });
 
-  it('the flag is read from the ENV the engine itself consults, and is OFF by default', async () => {
-    // Grading the crypto column off a hand-written boolean would let the route
-    // and the engine disagree about whether crypto is dark. Same function, same
-    // env key, so they cannot.
-    const { isCryptoEngineEnabled, CRYPTO_ENGINE_FLAG } = await import('./crypto-engine-flag.js');
-    expect(CRYPTO_ENGINE_FLAG).toBe('CRYPTO_ENGINE_ENABLED');
-    // Compiled default = OFF (TRA-1580), which is why bqb1 reads 64/64 IDLE with
-    // no such key set in Render's env at all.
-    expect(isCryptoEngineEnabled({})).toBe(false);
-    expect(isCryptoEngineEnabled({ CRYPTO_ENGINE_ENABLED: '1' })).toBe(true);
-    expect(isCryptoEngineEnabled({ CRYPTO_ENGINE_ENABLED: 'true' })).toBe(true);
-    expect(isCryptoEngineEnabled({ CRYPTO_ENGINE_ENABLED: '0' })).toBe(false);
-  });
 });
 
 afterEach(() => {

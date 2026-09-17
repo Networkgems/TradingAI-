@@ -2,8 +2,8 @@
 // TRA-372 — contract detail row rendered under the entry/stop/target/RR block
 // on option signals (currently relative_value; future option SignalTypes fall
 // through the same render path as long as `strike`/`expiration` are present).
-// Returns null for non-option signals so the crypto signal feed renders byte
-// identical to before.
+// Returns null for non-option signals so those feeds render byte identical
+// to before.
 import type { TradeSignal, OptionType } from '@trading-app/shared';
 import { formatExpirationFull, daysToExpiration } from '../lib/format';
 

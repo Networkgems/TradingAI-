@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { scaleOutLadderDecision } from './scale-out-ladder.js';
-import {
-  SCALE_OUT_TAKER_FEE_EQUITY,
-  SCALE_OUT_TAKER_FEE_CRYPTO,
-} from '@trading-app/shared';
+import { SCALE_OUT_TAKER_FEE_EQUITY } from '@trading-app/shared';
+
+/** A materially higher per-side taker fee (63 bps) used to exercise the feeRate override. */
+const HIGH_TAKER_FEE = 0.0063;
 
 describe('scaleOutLadderDecision — TRA-1300 scale-out (take-profit) ladder', () => {
   const base = { side: 'buy' as const, avgEntry: 100, baseQty: 1000 };
@@ -30,12 +30,12 @@ describe('scaleOutLadderDecision — TRA-1300 scale-out (take-profit) ladder', (
     expect(d.cumulativeSoldPctBase).toBeCloseTo(0.1, 10);
   });
 
-  it('applies the crypto taker fee when supplied', () => {
-    const d = scaleOutLadderDecision({ ...base, currentPrice: 125, feeRate: SCALE_OUT_TAKER_FEE_CRYPTO });
+  it('applies a custom taker fee when supplied', () => {
+    const d = scaleOutLadderDecision({ ...base, currentPrice: 125, feeRate: HIGH_TAKER_FEE });
     const t = d.triggered[0]!;
-    expect(d.feeRate).toBe(SCALE_OUT_TAKER_FEE_CRYPTO);
-    expect(t.feeCost).toBeCloseTo(12_500 * SCALE_OUT_TAKER_FEE_CRYPTO, 10);
-    // crypto fee (63bps) is materially larger than equity (5bps)
+    expect(d.feeRate).toBe(HIGH_TAKER_FEE);
+    expect(t.feeCost).toBeCloseTo(12_500 * HIGH_TAKER_FEE, 10);
+    // the override fee (63bps) is materially larger than equity (5bps)
     expect(t.feeCost).toBeGreaterThan(12_500 * SCALE_OUT_TAKER_FEE_EQUITY);
   });
 

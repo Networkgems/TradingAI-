@@ -168,7 +168,7 @@ function StepDemoVsLive() {
         </div>
         <div className="onboarding-mode-card">
           <h4>Live</h4>
-          <p>Real broker, real money. Connect Tradier / Coinbase.</p>
+          <p>Real broker, real money. Connect Tradier.</p>
         </div>
       </div>
       <p className="onboarding-note">

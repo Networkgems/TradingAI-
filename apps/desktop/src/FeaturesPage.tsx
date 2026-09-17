@@ -100,8 +100,7 @@ export default function FeaturesPage({ onStart, onHome, onSignIn }: Props) {
           <h2 id="fp-a" className="lp-section-h">Trading strategies (live)</h2>
           <p className="lp-section-intro">
             Five rules-based strategies run across US equities and stock options.
-            Each one defines its own entries, exits, and risk. Crypto runs a
-            separate demo-evaluation track — see below.
+            Each one defines its own entries, exits, and risk.
           </p>
           <div className="lp-feature-table" role="table" aria-label="Trading strategies that run live">
             <div className="lp-ft-head" role="row">
@@ -121,16 +120,6 @@ export default function FeaturesPage({ onStart, onHome, onSignIn }: Props) {
             Note on SMA-200: only the pullback variant trades live; the "reclaim"
             signal is informational only.
           </p>
-          <div className="lp-ft-demo">
-            <h3 className="lp-ft-demo-h">Crypto (demo evaluation — not live)</h3>
-            <p className="lp-ft-demo-body">
-              On crypto, TradeAI currently runs a dollar-cost-averaging (DCA)
-              accumulation approach in demo evaluation only — live crypto
-              trading is not currently enabled. Other crypto approaches we have
-              researched (mean-reversion, perpetual shorts) are research-stage
-              and are not running in the product.
-            </p>
-          </div>
         </section>
 
         {/* ── Section B — Risk, sizing & auto-trading ────────────────────── */}
@@ -176,11 +165,6 @@ export default function FeaturesPage({ onStart, onHome, onSignIn }: Props) {
               orders — paper sandbox by default.
             </li>
             <li>
-              <strong>Crypto via Coinbase.</strong> Runs in demo evaluation
-              today — live crypto trading is not currently enabled; if enabled
-              it is real-money with no paper sandbox.
-            </li>
-            <li>
               <strong>Live entry &amp; exit signals.</strong> The engine tells
               you when it's getting in and when it's cashing out, and executes
               automatically. Signals are delivered on the dashboard — no
@@ -200,9 +184,9 @@ export default function FeaturesPage({ onStart, onHome, onSignIn }: Props) {
           <h2 id="fp-d" className="lp-section-h">Platform</h2>
           <ul className="lp-feature-list">
             <li>
-              <strong>Real-time dashboard.</strong> Separate stocks and crypto
-              dashboards — watchlist, signals, positions, options, news, and
-              calendar — updating live.
+              <strong>Real-time dashboard.</strong> A stocks dashboard —
+              watchlist, signals, positions, options, news, and calendar —
+              updating live.
             </li>
             <li>
               <strong>Daily P&amp;L reports &amp; calendar.</strong> End-of-day
@@ -263,11 +247,6 @@ function FeaturesRiskDisclaimer() {
           <strong>Paper-first:</strong> equities &amp; options default to a paper
           sandbox; real-money trading requires your own production broker
           credentials.
-        </li>
-        <li className="lp-risk-item">
-          <strong>Crypto runs in demo evaluation only today</strong>; live crypto
-          trading is not currently enabled (and would be real-money, with no
-          paper sandbox).
         </li>
         <li className="lp-risk-item">
           <strong>Auto-trading is opt-in</strong> and bounded by the daily risk

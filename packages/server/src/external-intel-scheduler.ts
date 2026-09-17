@@ -32,7 +32,7 @@ import {
 } from './external-intel-sources.js';
 import {
   makeBacktestExecutor,
-  RV_CRYPTO_MAJORS_BASE_CONFIG,
+  EMPTY_BASE_CONFIG,
 } from './backtest-executor.js';
 
 const log = logger.child({ module: 'external-intel-scheduler' });
@@ -102,7 +102,8 @@ export function buildExternalIntelDeps(
     sources,
     extractor: makeLlmIntelExtractor(llm),
     pipeline: {
-      baseConfig: RV_CRYPTO_MAJORS_BASE_CONFIG,
+      // TRA-4629 — no registered sleeve; the executor refuses (fail-closed).
+      baseConfig: EMPTY_BASE_CONFIG,
       runBacktest: makeBacktestExecutor(),
     },
   };

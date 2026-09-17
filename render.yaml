@@ -198,22 +198,8 @@ services:
       # RSS is the driver (falsifiable). Ships via the git-push autoDeploy lever.
       - key: MALLOC_ARENA_MAX
         value: "2"
-      # TRA-1565 — native-RSS relief for the residual TRA-1463 crash-loop. The
-      # MALLOC_ARENA_MAX=2 cap above bounds the arena COUNT but not fragmentation
-      # WITHIN the arenas, and did not hold the 2026-07-10 RTH soak (21 non-deploy
-      # restarts on crypto.doTick). This flag arms two pure-code levers the
-      # allocator tuning can't reach: (1) `refresh()` coalesces request-triggered
-      # full-sweeps into a single debounced tick (removes the watchlist-edit / scan
-      # amplifier of the concurrent-fetch arena churn), and (2) the daily-candle
-      # fan-out batch narrows from 5→2 concurrent fetches (lowers the peak
-      # simultaneous arena-grab footprint, so the RSS high-water mark settles
-      # lower). Behaviour is identical except for refresh debounce + fetch pacing —
-      # no pacer/rate/order/capital change. The CODE self-arms whenever `RENDER` is
-      # set (dodging the TRA-1289/TRA-1481 blueprint env-sync gap), so this entry
-      # is the explicit off-switch / rollback record: set to "0" + redeploy to
-      # revert to the legacy fire-immediately + batch-5 behaviour.
-      - key: CRYPTO_TICK_RSS_RELIEF
-        value: "1"
+      # TRA-4629 — the TRA-1565 CRYPTO_TICK_RSS_RELIEF flag was retired here:
+      # the crypto engine it paced was deleted, so the flag had no reader left.
       - key: DATA_DIR
         value: /data
       - key: APP_URL

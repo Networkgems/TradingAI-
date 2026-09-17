@@ -142,11 +142,13 @@ export function rangingCandles(
 }
 
 /**
- * Generates a multi-day synthetic crypto dataset for walk-forward and
- * Monte Carlo runs (TRA-172).
+ * Generates a multi-day synthetic 24/7 dataset for walk-forward and
+ * Monte Carlo runs (TRA-172). (The `Crypto` in the name is legacy — the
+ * generator is a generic round-the-clock series and the name is kept only
+ * because it is part of the package's public API.)
  *
- * Crypto trades 24/7 so we space candles by `barIntervalMinutes` (default 60 →
- * hourly bars) without skipping nights/weekends, and stitch together rotating
+ * A 24/7 tape spaces candles by `barIntervalMinutes` (default 60 →
+ * hourly bars) without skipping nights/weekends, and stitches together rotating
  * regime segments so the dataset contains both trending and ranging stretches.
  * The result is large enough (90 days × 24 bars ≈ 2,160 bars by default) for a
  * 60/30 train/test rolling window split to produce multiple folds.

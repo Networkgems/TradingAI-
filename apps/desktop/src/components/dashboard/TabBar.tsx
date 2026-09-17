@@ -1,5 +1,5 @@
 // TRA-690 — grouped tab navigation. As features piled up, the flat tab bar
-// sprawled to 8 (stocks) / 6 (crypto) buttons. This keeps the core trading
+// sprawled to 8 buttons. This keeps the core trading
 // workflow visible and collapses the secondary/reference surfaces into a single
 // "More ▾" dropdown so the bar stays clean and scannable. The dropdown reuses
 // the ProfileMenu portal pattern (transparent backdrop + fixed-position menu,

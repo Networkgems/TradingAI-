@@ -383,12 +383,12 @@ describe('Rule 5 — correlated-exposure cap (TRA-1295)', () => {
     const d = correlatedExposureDecision({
       candidateRisk: 1_000,
       managedEquity: EQ,
-      buckets: [{ level: 'assetClass', key: 'crypto', openRisk: 6_900 }],
+      buckets: [{ level: 'assetClass', key: 'options', openRisk: 6_900 }],
     });
     expect(d.admitted).toBe(false);
     expect(d.scale).toBe(0);
     expect(d.reason).toBe('below_min_trade_risk');
-    expect(d.bindingBucket).toEqual({ level: 'assetClass', key: 'crypto' });
+    expect(d.bindingBucket).toEqual({ level: 'assetClass', key: 'options' });
   });
 
   it('rejects when a group is already at/over the cap (no negative headroom)', () => {
@@ -440,7 +440,7 @@ describe('Rule 5 — correlated-exposure cap (TRA-1295)', () => {
       { underlying: 'AAPL', sector: 'tech', assetClass: 'equity', risk: 400 }, // same underlying
       { underlying: 'MSFT', sector: 'tech', assetClass: 'equity', risk: 600 }, // same sector, diff underlying
       { underlying: 'XOM', sector: 'energy', assetClass: 'equity', risk: 800 }, // same asset-class only
-      { underlying: 'BTC-USD', sector: undefined, assetClass: 'crypto', risk: 999 }, // shares nothing
+      { underlying: 'GLD', sector: undefined, assetClass: 'commodity', risk: 999 }, // shares nothing
     ];
 
     it('sums OPEN risk per grain the candidate shares, excluding its own risk', () => {
@@ -452,7 +452,7 @@ describe('Rule 5 — correlated-exposure cap (TRA-1295)', () => {
     });
 
     it('skips a grain the candidate has no key for (missing sector), never a catch-all', () => {
-      const noSector: ExposurePositionRisk = { underlying: 'BTC-USD', assetClass: 'crypto', risk: 500 };
+      const noSector: ExposurePositionRisk = { underlying: 'GLD', assetClass: 'commodity', risk: 500 };
       const buckets = buildExposureBuckets(noSector, open);
       expect(buckets.map((b) => b.level)).toEqual(['underlying', 'assetClass']);
     });

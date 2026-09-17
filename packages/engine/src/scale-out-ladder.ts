@@ -40,7 +40,7 @@ export interface ScaleOutLadderParams {
   baseQty: number;
   /**
    * Per-side TAKER fee rate applied to each trim's gross proceeds. Defaults to the
-   * equity rate; the caller passes the crypto rate for crypto names.
+   * equity rate; the caller passes a higher rate for higher-fee venues.
    */
   feeRate?: number;
   /**

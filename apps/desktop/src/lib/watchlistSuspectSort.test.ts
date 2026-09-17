@@ -9,12 +9,10 @@
 // Asserting on the SORTED OUTPUT rather than on the resolver's return value: the
 // resolver returning null is the implementation, "it isn't first" is the promise.
 import { describe, expect, it } from 'vitest';
-import type { CryptoSymbolState } from '@trading-app/shared';
 import type { SymbolState } from '../types/app';
 import { sortRows } from './sort';
 import { getStockWatchSortValue } from './stockSort';
-import { getCryptoWatchSortValue } from './cryptoSort';
-import { isQuoteMoveUnreliable, isCryptoMoveUnreliable, quoteStatusLabel } from './format';
+import { isQuoteMoveUnreliable, quoteStatusLabel } from './format';
 
 function sym(over: Partial<SymbolState> = {}): SymbolState {
   return { symbol: 'AAPL', price: 110, volume: 0, change: 0, changePct: 0, lastUpdated: 5_000, ...over };
@@ -60,17 +58,6 @@ describe('TRA-2379 stock watchlist CHANGE % sort', () => {
     const clean = [AAPL, JEM, GSUN];
     const out = sortRows(clean, { key: 'changePct', dir: 'desc' }, getStockWatchSortValue);
     expect(out.map(r => r.symbol)).toEqual(['JEM', 'AAPL', 'GSUN']);
-  });
-});
-
-describe('TRA-2379 crypto watchlist CHANGE % sort (same shared code)', () => {
-  const c = (over: Partial<CryptoSymbolState>): CryptoSymbolState =>
-    ({ symbol: 'BTC-USD', price: 1, volume: 0, change: 0, changePct: 0, lastUpdated: 5_000, ...over }) as CryptoSymbolState;
-
-  it('parks a suspect row at the bottom', () => {
-    const rows = [c({ symbol: 'A', changePct: 5 }), c({ symbol: 'B', changePct: 9999, moveSuspect: true })];
-    const out = sortRows(rows, { key: 'changePct', dir: 'desc' }, getCryptoWatchSortValue);
-    expect(out[0].symbol).toBe('A');
   });
 });
 
@@ -140,15 +127,4 @@ describe('TRA-2610 a failed fetch cannot un-flag a fabricated move', () => {
     expect(quoteStatusLabel(stale)).toBe('Quote unavailable');
   });
 
-  it('the CRYPTO reader is flag-only, by design', () => {
-    // A crypto 24h % has no implied prev close and no corporate actions, so a genuine
-    // +9,999% memecoin session is a real move. Executing the ratio rule there would
-    // manufacture false positives — see isCryptoMoveUnreliable.
-    const memecoin = { price: 0.004, change: 0.0039, changePct: 9_999 };
-    expect(isCryptoMoveUnreliable(memecoin)).toBe(false);
-    expect(isCryptoMoveUnreliable({ ...memecoin, moveSuspect: true })).toBe(true);
-    // …and the stock reader, on the same numbers, DOES fire. Both directions asserted
-    // so this documents an intentional asymmetry rather than an untested branch.
-    expect(isQuoteMoveUnreliable(memecoin)).toBe(true);
-  });
 });

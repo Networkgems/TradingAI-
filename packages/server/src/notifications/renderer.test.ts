@@ -20,8 +20,8 @@ describe('renderAlert', () => {
       kind: 'exit',
       username: 'alice',
       timestamp: TS,
-      symbol: 'ETH-USD',
-      market: 'crypto',
+      symbol: 'AAPL',
+      market: 'stocks',
       mode: 'live',
       exitReason: 'take-profit @ 3,142.50',
       pnl: 84.2,
@@ -30,11 +30,11 @@ describe('renderAlert', () => {
     };
     const r = renderAlert(e);
     expect(r.title).toBe('🟢 TradingAI — Position Exited');
-    expect(r.text).toContain('ETH-USD  ·  LIVE  ·  mean-reversion');
+    expect(r.text).toContain('AAPL  ·  LIVE  ·  mean-reversion');
     expect(r.text).toContain('Exit: take-profit @ 3,142.50');
     expect(r.text).toContain('P&L: +$84.20 (+1.32R)');
     expect(r.text).toContain('2026-05-17 14:32 ET');
-    expect(r.subject).toBe('TradingAI — Position Exited: ETH-USD LIVE');
+    expect(r.subject).toBe('TradingAI — Position Exited: AAPL LIVE');
   });
 
   it('uses a red marker and signed loss for a losing exit', () => {
@@ -77,8 +77,8 @@ describe('renderAlert', () => {
       kind: 'signal',
       username: 'alice',
       timestamp: TS,
-      symbol: 'BTC-USD',
-      market: 'crypto',
+      symbol: 'AAPL',
+      market: 'stocks',
       signalType: 'orb',
       side: 'long',
       entryPrice: 65000,
@@ -87,7 +87,7 @@ describe('renderAlert', () => {
     };
     const r = renderAlert(e);
     expect(r.title).toBe('🔔 TradingAI — New Trade Signal');
-    expect(r.text).toContain('BTC-USD  ·  orb');
+    expect(r.text).toContain('AAPL  ·  orb');
     expect(r.text).toContain('entry 65,000');
     expect(r.text).toContain('SL 64,000');
     expect(r.text).toContain('TP 67,000');
@@ -144,7 +144,7 @@ describe('renderAlert', () => {
         { symbol: 'AAPL', signalType: 'orb_long', side: 'buy', entryPrice: 150, stopLoss: 147, takeProfit: 156 },
       ],
       positions: [
-        { symbol: 'ETH-USD', market: 'crypto', side: 'long', quantity: 2, entryPrice: 3140, pnl: 84.2 },
+        { symbol: 'AAPL', market: 'stocks', side: 'long', quantity: 2, entryPrice: 150.25, pnl: 84.2 },
       ],
       news: [{ title: 'Fed holds rates steady', source: 'Reuters' }],
     };
@@ -158,7 +158,7 @@ describe('renderAlert', () => {
     // Setups
     expect(r.text).toContain('AAPL · orb_long · buy · entry 150 · SL 147 · TP 156');
     // Positions
-    expect(r.text).toContain('ETH-USD CRYPTO · long 2 @ 3,140 · P&L +$84.20');
+    expect(r.text).toContain('AAPL STOCKS · long 2 @ 150.25 · P&L +$84.20');
     // News
     expect(r.text).toContain('Fed holds rates steady (Reuters)');
     expect(r.text).toContain('2026-05-17 14:32 ET');

@@ -14,9 +14,6 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { renderHook, act, waitFor } from '@testing-library/react';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
 
 import { useStockEngine } from './useStockEngine';
 
@@ -236,41 +233,5 @@ describe('TRA-4488 useStockEngine ticket handshake', () => {
     // An orphan socket here is owned by nobody: the cleanup has already run, so
     // it is never closed and never reconnected — a leak per mount/unmount cycle.
     expect(sockets.filter((s) => !s.closed).length).toBe(0);
-  });
-});
-
-// `CryptoDashboard.tsx` owns the SECOND socket, with the same handshake inlined
-// in a component rather than a hook — so the behavioural tests above cannot
-// reach it. Rendering that component would drag in a dozen panels and their
-// fetches to re-assert what is already covered, so the second client is graded
-// on the seam instead: it must use the same three helpers and must not form a
-// socket URL by hand. That is what drift would look like.
-describe('TRA-4488 the crypto dashboard uses the same handshake', () => {
-  const SRC = readFileSync(
-    join(dirname(fileURLToPath(import.meta.url)), '..', 'CryptoDashboard.tsx'),
-    'utf-8',
-  );
-
-  it('routes through fetchWsTicket + buildSocketUrl, never a hand-built URL', () => {
-    expect(SRC).toContain('fetchWsTicket(token)');
-    expect(SRC).toContain('buildSocketUrl(SERVER_URL');
-    // The defect, asserted absent: the pre-fix line was
-    // `new WebSocket(`${SERVER_URL}?token=${token}`)`.
-    expect(SRC).not.toMatch(/\$\{SERVER_URL\}\?token=/);
-    expect(SRC).toMatch(/new WebSocket\(url\)/);
-  });
-
-  it('carries the 401 sign-out and the 404 legacy fallback arms', () => {
-    expect(SRC).toMatch(/status === 401.*onLogout\(\)/s);
-    expect(SRC).toMatch(/status === 404[\s\S]{0,120}buildLegacySocketUrl/);
-  });
-
-  it('mints inside connect() — so a reconnect re-mints, as in the hook', () => {
-    // The decisive property, expressed the only way a source check can: the
-    // mint must appear INSIDE the reconnecting function, not before it.
-    const fnStart = SRC.indexOf('async function connect()');
-    const mint = SRC.indexOf('fetchWsTicket(token)');
-    expect(fnStart).toBeGreaterThan(-1);
-    expect(mint).toBeGreaterThan(fnStart);
   });
 });

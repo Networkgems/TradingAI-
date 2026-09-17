@@ -1,40 +1,7 @@
-import { existsSync, readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import type { Candle } from '@trading-app/shared';
-import { cryptoTieredCostModel } from '@trading-app/engine';
 import { PortfolioBacktestRunner } from './portfolio-runner.js';
 import type { PortfolioBacktestConfig } from './portfolio-runner.js';
-import { cachePathFor4h } from './fetch-tra266-data.js';
-
-/** Resample 4H bars to daily UTC closes — the §3 correlation source. */
-function toDailyCandles(bars: Candle[]): Candle[] {
-  const byDay = new Map<number, Candle[]>();
-  for (const b of bars) {
-    const day = Math.floor(b.timestamp / 864e5) * 864e5;
-    const group = byDay.get(day);
-    if (group) group.push(b);
-    else byDay.set(day, [b]);
-  }
-  return [...byDay.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .map(([day, group]) => ({
-      symbol: group[0].symbol,
-      timestamp: day,
-      open: group[0].open,
-      high: Math.max(...group.map(g => g.high)),
-      low: Math.min(...group.map(g => g.low)),
-      close: group[group.length - 1].close,
-      volume: group.reduce((s, g) => s + g.volume, 0),
-    }));
-}
-
-/** Load a cached 4H Coinbase series from disk; returns null when absent. */
-function loadCached4h(symbol: string): Candle[] | null {
-  const path = cachePathFor4h(symbol);
-  if (!existsSync(path)) return null;
-  const cache = JSON.parse(readFileSync(path, 'utf-8')) as { candles: Candle[] };
-  return cache.candles;
-}
 
 // ── TRA-429: synthetic deterministic check — no disk dependency ───────────────
 
@@ -189,62 +156,6 @@ describe('PortfolioBacktestRunner — shared portfolio state', () => {
       (on.correlationCap?.rejected ?? 0) + (on.correlationCap?.scaledDown ?? 0);
     expect(capActivity).toBeGreaterThan(0);
     // Binding the cap can only remove or shrink entries, never add them.
-    expect(on.totalTrades).toBeLessThanOrEqual(off.totalTrades);
-  });
-});
-
-// ── TRA-429: regression on the real {BTC-USD, SOL-USD} macd_bollinger book ─────
-
-describe('PortfolioBacktestRunner — BTC-USD + SOL-USD cross-symbol cap (TRA-429)', () => {
-  const btc = loadCached4h('BTC-USD');
-  const sol = loadCached4h('SOL-USD');
-  const haveData = btc !== null && sol !== null;
-  const maybe = haveData ? it : it.skip;
-
-  maybe('binds the cross-symbol cluster cap on historical 4H data', async () => {
-    const candlesBySymbol = { 'BTC-USD': btc!, 'SOL-USD': sol! };
-    const daily = {
-      'BTC-USD': toDailyCandles(btc!),
-      'SOL-USD': toDailyCandles(sol!),
-    };
-    // Restrict to the genuinely-OOS window the TRA-423 §8 validation used.
-    const OOS_START = Date.UTC(2025, 0, 1);
-    const OOS_END = Date.now();
-    const base: PortfolioBacktestConfig = {
-      symbols: ['BTC-USD', 'SOL-USD'],
-      startDate: OOS_START,
-      endDate: OOS_END,
-      initialEquity: 25_000,
-      strategyType: 'macd_bollinger',
-      macdBollingerOpts: { enforceTimeFilter: false },
-      costModel: cryptoTieredCostModel(),
-      // Wide legacy caps so the correlation cluster cap is the binding gate.
-      portfolioOpts: { maxOpenPositions: 10, maxSectorExposure: 10 },
-    };
-
-    const off = await new PortfolioBacktestRunner().run(base, candlesBySymbol);
-    const on = await new PortfolioBacktestRunner().run(
-      {
-        ...base,
-        correlationCapOpts: { enabled: true, dailyCandlesBySymbol: daily },
-      },
-      candlesBySymbol,
-    );
-
-    // The runner shares one book — trades land on both BTC and SOL.
-    expect(off.bySymbol['BTC-USD'].totalTrades).toBeGreaterThan(0);
-    expect(off.bySymbol['SOL-USD'].totalTrades).toBeGreaterThan(0);
-
-    // BTC-USD and SOL-USD are highly correlated ⇒ one cluster. With
-    // macd_bollinger fanning to two sub-strategies per symbol, the shared
-    // book exceeds the default maxPositionsPerCluster ⇒ the cross-symbol
-    // cluster cap binds. This is the coverage TRA-423 §8 could not reach.
-    expect(on.correlationCap?.enabled).toBe(true);
-    const capActivity =
-      (on.correlationCap?.rejected ?? 0) + (on.correlationCap?.scaledDown ?? 0);
-    expect(capActivity).toBeGreaterThan(0);
-
-    // Enforcing the cap can only drop / shrink entries.
     expect(on.totalTrades).toBeLessThanOrEqual(off.totalTrades);
   });
 });
