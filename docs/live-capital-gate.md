@@ -477,6 +477,47 @@ out-of-sample proof the map generalizes, nor proof of gross edge (TRA-1965). Qua
 signs off on the fit — ideally against a holdout / forward slice — before any default
 flip, and the flip also arms the ideas-ranking / entry-gate / idea-view consumers.
 
+## The debit-sleeve retirement and the per-idea journal probe (TRA-4646)
+
+TRA-1964/TRA-1965 commissioned a premium-**INCOME** product; the graded book
+nonetheless accrued a 31% premium-**buying** sleeve (`long_call`,
+`bull_call_spread`, `bear_put_spread`) that the 2026-09-17 roll-up measured as both
+the entire negative signal (perfect credit/debit sign separation across all 5
+structures) and the variance that forced `power.nRequired` to 727 (σ debit 0.617 vs
+credit 0.275; credit-only ≈ 337).
+
+**`ENABLE_OPTIONS_DEBIT_SLEEVE_RETIREMENT`** (default OFF) retires that sleeve:
+
+- **surfacing** — the research prompt gains a credit-only-mandate addendum, the
+  deterministic guardrail drops premium-buying ideas into `rejected`, and the feed
+  drops them defense-in-depth (`options-debit-retirement.ts` in `@trading-app/agents`
+  is the single source for the flag and the credit-class set);
+- **scoring** — every gate/decomposition/accumulation/roll-up read re-scores the book
+  CREDIT-ONLY by excluding debit entries as `off_mandate_debit` at scoring time.
+  **Forward scoring only**: journal rows are never deleted or amended — the resolved
+  debit rows are the evidence the retirement rests on and stay readable (excluded,
+  with that reason) everywhere.
+
+`/api/health/live-capital-gate` publishes `debitRetirement` — before (all
+structures) vs after (credit-only) `nRequired` / `sigmaUsed` / feasibility verdict /
+`ceilingSources` — computed on **every** read regardless of flag state, so the
+post-arm numbers are gradeable before arming and the pre-arm numbers stay visible
+after. `sleeveExpectancy` carries credit-only / debit-only `expectancyNetR` **in R**
+with n, sd, se per sleeve (the power module's `c` is a different unit; do not grade
+one against the other).
+
+**`GET /api/health/options-ideas-journal`** (unauth, secrets-free like its
+siblings) is the per-idea read: one row per journaled idea with
+`ideaId / structure / premiumDirection / resolvedAt / pnlR / pnlNetR / costsUsd /
+maxLossUsd / statedPop / outcome`, paginated from the **start** of a stable ordering
+with an offset-independent `total` (`?status=`, `?offset=`, `?limit=`).
+
+The generator side of the same roll-up (TRA-4646 AC4): `modelStructure` now widens
+verticals and condor wings to the **first listed width whose max-loss clears the
+TRA-1991 cost ceiling** instead of hard-coding one strike step and letting the
+surface-time filter discard the penny-wide result after generation (43.8% of the
+journaled book was being generated-then-discarded as `cost_uneconomic`).
+
 ## Disposition when the gate passes
 
 A pass does **not** ship live trading. It unlocks a single next step: **Lead Dev

@@ -13,6 +13,7 @@ import {
   runOptionsResearch,
   createAnthropicLlmClientFromEnv,
   describeAnthropicCredFromEnv,
+  isDebitSleeveRetirementEnabled,
   type OptionsResearchCache,
   type OptionsResearchResult,
   type DayTradingGuardrail,
@@ -423,6 +424,9 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
     generatedAt: now,
     // TRA-1121 — pre-flight enterability against the user's paper book equity.
     ...(typeof opts.accountEquityUsd === 'number' ? { accountEquityUsd: opts.accountEquityUsd } : {}),
+    // TRA-4646 — credit-only mandate: defense in depth behind the research
+    // guardrail's own drop (a cached slate can predate the flag flip).
+    retireDebitStructures: isDebitSleeveRetirementEnabled(),
   });
   entryIntents.clear();
   for (const [id, intent] of intents) entryIntents.set(id, intent);

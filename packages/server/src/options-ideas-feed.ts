@@ -20,7 +20,12 @@ import type {
   OptionsResearchSymbol,
   OptionsScannerCandidate,
 } from '@trading-app/agents';
-import { isCoveredStrategy, classifyHorizon, DEFAULT_DIVERSIFICATION } from '@trading-app/agents';
+import {
+  isCoveredStrategy,
+  classifyHorizon,
+  DEFAULT_DIVERSIFICATION,
+  isCreditClassStrategy,
+} from '@trading-app/agents';
 
 /**
  * The long-premium / spread families the ideas feed models and displays. The
@@ -413,6 +418,47 @@ const CONTRACT = 100;
 const r2 = (v: number): number => Math.round(v * 100) / 100;
 
 /**
+ * TRA-4646 (AC4) — how many listed strikes a spread may widen through looking for
+ * an ECONOMIC width. Bounded so an irregular chain can't send the search far from
+ * the anchor thesis; six rungs covers a $0.50-increment chain out to $3 of width,
+ * well past where any 2–4-leg structure clears the cost ceiling.
+ */
+export const MAX_ECONOMIC_WIDTH_RUNGS = 6;
+
+/**
+ * TRA-4646 (AC4) — pick the FIRST candidate structure (nearest-width first) whose
+ * cost-efficiency ratio clears `COST_EFFICIENCY_MAX`; fall back to the nearest
+ * priced candidate when none does (the TRA-1991 surface-time filter then drops it
+ * exactly as before, so this can only ever ADD economically-viable structures).
+ *
+ * WHY. The modeler used to hard-code a ONE-strike-step width for every vertical
+ * and condor wing. On fine-increment chains that manufactures penny-wide
+ * structures whose defined risk (~$13–70) barely exceeds the FIXED retail
+ * round-trip cost (F1: ~$10.60 for a 2-leg vertical, ~$21.20 for a condor), so
+ * TRA-1991's surface-time gate discarded them AFTER generation — 43.8% of the
+ * journaled book measured on bqb1 2026-09-17, every one a wasted slate slot. The
+ * generator, not the gate, was the defect: this makes the cost test bind at
+ * STRUCTURE-SELECTION time, choosing the tightest width whose max-loss can pay
+ * for its own round trip. First-clearing (not widest) deliberately: widening a
+ * credit spread strictly lowers credit/width, so stopping at the first economic
+ * rung concedes the least against the TRA-2208 floor.
+ */
+function firstEconomicStructure(
+  candidates: readonly number[],
+  build: (candidate: number) => ModeledStructure | null,
+): ModeledStructure | null {
+  let nearest: ModeledStructure | null = null;
+  for (const candidate of candidates.slice(0, MAX_ECONOMIC_WIDTH_RUNGS)) {
+    const s = build(candidate);
+    if (s == null) continue;
+    nearest ??= s;
+    const ratio = costEfficiencyRatio(s.legs.length, s.maxLossUsd);
+    if (ratio != null && ratio <= COST_EFFICIENCY_MAX) return s;
+  }
+  return nearest;
+}
+
+/**
  * Model a defined-risk structure for one idea from the anchor contract + the
  * live chain. Prices each leg off real chain marks where available; when a leg
  * can't be priced (thin chain), falls back to the engine's `maxLossUsdFallback`
@@ -435,12 +481,10 @@ export function modelStructure(
   const putStrikes = strikesFor(rows, 'put', exp);
   const step = strikeStep(anchor.optionType === 'put' ? putStrikes : callStrikes, spot);
 
-  // Credit-class strategies carry a + net; debit-class a − net.
-  const isCredit =
-    strategy === 'bull_put_spread' ||
-    strategy === 'bear_call_spread' ||
-    strategy === 'iron_condor' ||
-    strategy === 'iron_butterfly';
+  // Credit-class strategies carry a + net; debit-class a − net. TRA-4646 — the
+  // classification is the shared mandate set, so the modeler, the feed drop and
+  // the research guardrail can never disagree about which sleeve a structure is.
+  const isCredit = isCreditClassStrategy(strategy);
 
   const fallback = (legs: IdeaLeg[], breakevens: number[]): ModeledStructure => {
     const maxLoss = Math.max(1, Math.round(maxLossUsdFallback));
@@ -503,22 +547,33 @@ export function modelStructure(
         nearestNonItmStrike(strikes, ot, spot, notItmTarget) ??
         nearestStrike(strikes, notItmTarget) ??
         anchor.strike;
-      const kShort = ot === 'call' ? kLong + step : kLong - step;
       const longMid = midAt(rows, ot, exp, kLong);
-      const shortMid = midAt(rows, ot, exp, kShort);
-      const width = Math.abs(kShort - kLong);
-      const legs = [leg('buy', ot, kLong), leg('sell', ot, kShort)];
-      if (longMid == null || shortMid == null) return fallback(legs, [kLong]);
-      const debit = Math.max(0.01, longMid - shortMid);
-      const be = ot === 'call' ? kLong + debit : kLong - debit;
-      return {
-        legs,
-        breakevens: [r2(be)],
-        maxLossUsd: r2(debit * CONTRACT),
-        maxProfitUsd: r2(Math.max(0, width - debit) * CONTRACT),
-        netUsd: r2(-debit * CONTRACT),
-        priced: true,
-      };
+      const arithmeticShort = ot === 'call' ? kLong + step : kLong - step;
+      const fallbackLegs = [leg('buy', ot, kLong), leg('sell', ot, arithmeticShort)];
+      if (longMid == null) return fallback(fallbackLegs, [kLong]);
+      // TRA-4646 (AC4) — walk the SHORT leg outward through the listed strikes,
+      // nearest first, until the debit (= the max loss) is large enough to clear
+      // the TRA-1991 cost ceiling; see `firstEconomicStructure`.
+      const shortCandidates =
+        ot === 'call'
+          ? strikes.filter((s) => s > kLong).sort((a, b) => a - b)
+          : strikes.filter((s) => s < kLong).sort((a, b) => b - a);
+      const chosen = firstEconomicStructure(shortCandidates, (kShort) => {
+        const shortMid = midAt(rows, ot, exp, kShort);
+        if (shortMid == null) return null;
+        const width = Math.abs(kShort - kLong);
+        const debit = Math.max(0.01, longMid - shortMid);
+        const be = ot === 'call' ? kLong + debit : kLong - debit;
+        return {
+          legs: [leg('buy', ot, kLong), leg('sell', ot, kShort)],
+          breakevens: [r2(be)],
+          maxLossUsd: r2(debit * CONTRACT),
+          maxProfitUsd: r2(Math.max(0, width - debit) * CONTRACT),
+          netUsd: r2(-debit * CONTRACT),
+          priced: true,
+        };
+      });
+      return chosen ?? fallback(fallbackLegs, [kLong]);
     }
     case 'bull_put_spread':
     case 'bear_call_spread': {
@@ -539,22 +594,35 @@ export function modelStructure(
         nearestNonItmStrike(strikes, ot, spot, otmTarget) ??
         nearestStrike(strikes, otmTarget) ??
         anchor.strike;
-      const kLong = ot === 'put' ? kShort - step : kShort + step;
       const shortMid = midAt(rows, ot, exp, kShort);
-      const longMid = midAt(rows, ot, exp, kLong);
-      const width = Math.abs(kShort - kLong);
-      const legs = [leg('sell', ot, kShort), leg('buy', ot, kLong)];
-      if (shortMid == null || longMid == null) return fallback(legs, [kShort]);
-      const credit = Math.max(0.01, shortMid - longMid);
-      const be = ot === 'put' ? kShort - credit : kShort + credit;
-      return {
-        legs,
-        breakevens: [r2(be)],
-        maxLossUsd: r2(Math.max(0, width - credit) * CONTRACT),
-        maxProfitUsd: r2(credit * CONTRACT),
-        netUsd: r2(credit * CONTRACT),
-        priced: true,
-      };
+      const arithmeticLong = ot === 'put' ? kShort - step : kShort + step;
+      const fallbackLegs = [leg('sell', ot, kShort), leg('buy', ot, arithmeticLong)];
+      if (shortMid == null) return fallback(fallbackLegs, [kShort]);
+      // TRA-4646 (AC4) — walk the LONG wing outward through the listed strikes,
+      // nearest first, until the width-minus-credit (= the max loss) is large
+      // enough to clear the TRA-1991 cost ceiling; see `firstEconomicStructure`.
+      // First-clearing width, never wider: widening strictly lowers credit/width,
+      // so this concedes the least against the TRA-2208 floor.
+      const longCandidates =
+        ot === 'put'
+          ? strikes.filter((s) => s < kShort).sort((a, b) => b - a)
+          : strikes.filter((s) => s > kShort).sort((a, b) => a - b);
+      const chosen = firstEconomicStructure(longCandidates, (kLong) => {
+        const longMid = midAt(rows, ot, exp, kLong);
+        if (longMid == null) return null;
+        const width = Math.abs(kShort - kLong);
+        const credit = Math.max(0.01, shortMid - longMid);
+        const be = ot === 'put' ? kShort - credit : kShort + credit;
+        return {
+          legs: [leg('sell', ot, kShort), leg('buy', ot, kLong)],
+          breakevens: [r2(be)],
+          maxLossUsd: r2(Math.max(0, width - credit) * CONTRACT),
+          maxProfitUsd: r2(credit * CONTRACT),
+          netUsd: r2(credit * CONTRACT),
+          priced: true,
+        };
+      });
+      return chosen ?? fallback(fallbackLegs, [kShort]);
     }
     case 'iron_condor':
     case 'iron_butterfly': {
@@ -570,31 +638,51 @@ export function modelStructure(
       // increment that differs from the median `step` doesn't push the wing onto
       // an unlisted strike — which would null out `midAt` and silently drop the
       // whole condor to the 1:1 fallback sketch.
-      const kPutLong = nearestStrike(putStrikes, kPutShort - step) ?? kPutShort - step;
-      const kCallLong = nearestStrike(callStrikes, kCallShort + step) ?? kCallShort + step;
-      const legs = [
-        leg('sell', 'put', kPutShort),
-        leg('buy', 'put', kPutLong),
-        leg('sell', 'call', kCallShort),
-        leg('buy', 'call', kCallLong),
-      ];
       const ps = midAt(rows, 'put', exp, kPutShort);
-      const pl = midAt(rows, 'put', exp, kPutLong);
       const cs = midAt(rows, 'call', exp, kCallShort);
-      const cl = midAt(rows, 'call', exp, kCallLong);
-      if (ps == null || pl == null || cs == null || cl == null) {
-        return fallback(legs, [kPutShort, kCallShort]);
+      // TRA-4646 (AC4) — the wings walk outward in lock-step through the LISTED
+      // strikes strictly beyond each short, nearest first, until the condor's
+      // max loss clears the TRA-1991 cost ceiling (4 legs ⇒ ~2× a vertical's
+      // fixed cost, so a one-step wing is the most cost-starved structure the
+      // modeler produced); see `firstEconomicStructure`.
+      const putWings = putStrikes.filter((s) => s < kPutShort).sort((a, b) => b - a);
+      const callWings = callStrikes.filter((s) => s > kCallShort).sort((a, b) => a - b);
+      const fallbackLegs = [
+        leg('sell', 'put', kPutShort),
+        leg('buy', 'put', putWings[0] ?? kPutShort - step),
+        leg('sell', 'call', kCallShort),
+        leg('buy', 'call', callWings[0] ?? kCallShort + step),
+      ];
+      if (ps == null || cs == null || putWings.length === 0 || callWings.length === 0) {
+        return fallback(fallbackLegs, [kPutShort, kCallShort]);
       }
-      const credit = Math.max(0.01, ps - pl + cs - cl);
-      const width = Math.max(kCallLong - kCallShort, kPutShort - kPutLong);
-      return {
-        legs,
-        breakevens: [r2(kPutShort - credit), r2(kCallShort + credit)],
-        maxLossUsd: r2(Math.max(0, width - credit) * CONTRACT),
-        maxProfitUsd: r2(credit * CONTRACT),
-        netUsd: r2(credit * CONTRACT),
-        priced: true,
-      };
+      const rungs = Math.min(putWings.length, callWings.length);
+      const chosen = firstEconomicStructure(
+        Array.from({ length: rungs }, (_, i) => i),
+        (i) => {
+          const kPutLong = putWings[i]!;
+          const kCallLong = callWings[i]!;
+          const pl = midAt(rows, 'put', exp, kPutLong);
+          const cl = midAt(rows, 'call', exp, kCallLong);
+          if (pl == null || cl == null) return null;
+          const credit = Math.max(0.01, ps - pl + cs - cl);
+          const width = Math.max(kCallLong - kCallShort, kPutShort - kPutLong);
+          return {
+            legs: [
+              leg('sell', 'put', kPutShort),
+              leg('buy', 'put', kPutLong),
+              leg('sell', 'call', kCallShort),
+              leg('buy', 'call', kCallLong),
+            ],
+            breakevens: [r2(kPutShort - credit), r2(kCallShort + credit)],
+            maxLossUsd: r2(Math.max(0, width - credit) * CONTRACT),
+            maxProfitUsd: r2(credit * CONTRACT),
+            netUsd: r2(credit * CONTRACT),
+            priced: true,
+          };
+        },
+      );
+      return chosen ?? fallback(fallbackLegs, [kPutShort, kCallShort]);
     }
     case 'call_calendar':
     case 'put_calendar': {
@@ -844,6 +932,16 @@ export interface BuildFeedArgs {
    * The TRA-1348 $500 absolute floor + 5%-equity clamp apply on top via the gate.
    */
   maxLossPctCap?: number;
+  /**
+   * TRA-4646 — credit-only mandate (debit-sleeve retirement). When true, any
+   * non-credit-class idea (long_call / long_put / bull_call_spread /
+   * bear_put_spread / call_calendar / put_calendar) is dropped from the feed:
+   * defense in depth behind the research guardrail's own drop, so a cached or
+   * legacy slate can't surface a premium-buying card while the flag is armed.
+   * The caller resolves `ENABLE_OPTIONS_DEBIT_SLEEVE_RETIREMENT`; this stays a
+   * pure argument so the feed builder remains env-free and unit-testable.
+   */
+  retireDebitStructures?: boolean;
 }
 
 export interface BuiltFeed {
@@ -945,6 +1043,12 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
     // rather than model/display a sleeve-managed short leg. Also narrows
     // idea.strategy to EmittableStrategy for the structure/display maps below.
     if (isCoveredStrategy(idea.strategy)) continue;
+
+    // TRA-4646 — credit-only mandate: with the debit-sleeve retirement armed, a
+    // premium-BUYING structure never renders and can't be entered (no idea, no
+    // intent). The research guardrail already drops these; this is the same
+    // defense-in-depth position the TRA-1322 covered-strategy gate holds above.
+    if (args.retireDebitStructures && !isCreditClassStrategy(idea.strategy)) continue;
 
     const structure = modelStructure(idea.strategy, anchor, sym.spot, rows, idea.maxLossUsd);
 

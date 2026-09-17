@@ -725,7 +725,18 @@ import {
   buildAccumulationMonitor,
   renderWeeklyRollupMarkdown,
   defaultChainsDir,
+  type IdeaOutcome,
 } from './options-forward-test.js';
+// TRA-4646 — the debit-sleeve retirement (AC3), the per-idea journal readout
+// (AC1) and the per-sleeve R-unit expectancy (AC2).
+import {
+  applyDebitRetirement,
+  buildDebitRetirementComparison,
+  buildIdeaJournalReadout,
+  buildSleeveExpectancy,
+  type JournalStatusFilter,
+} from './options-ideas-journal-readout.js';
+import { isDebitSleeveRetirementEnabled } from '@trading-app/agents';
 import { evaluateLiveCapitalGate, resolveLiveCapitalGateCriteria } from './live-capital-gate.js';
 import { isPopCalibrationEnabled, resolvePopCalibrationConfig } from './options-pop-calibration.js';
 import {
@@ -5685,12 +5696,29 @@ void backfillChainEnrichment().then(() => runChainCompaction('boot'));
 // hop — the exact creds gap that kept the old routine from posting). Idempotent
 // per week via the `weekly_review-options-ideas-<asOfDate>` id; the scheduler
 // fires this once per ET Monday. Read-only: wires no capital.
+/**
+ * TRA-4646 — ONE scoring basis for every AI-Options-Ideas readout. With
+ * `ENABLE_OPTIONS_DEBIT_SLEEVE_RETIREMENT` armed, `scored` excludes debit-entry
+ * rows as `off_mandate_debit` (forward scoring only — the journal is untouched)
+ * and every gate/decomposition/accumulation/roll-up read consumes THAT array, so
+ * the routes can never disagree about which book is being graded. `all` keeps the
+ * un-retired valuation for the evidence reads (sleeve expectancy, the before
+ * snapshot) that must stay able to see the retired sleeve.
+ */
+async function loadScoredIdeaOutcomes(
+  entries: Awaited<ReturnType<typeof listJournalEntries>>,
+): Promise<{ all: IdeaOutcome[]; scored: IdeaOutcome[]; debitRetired: boolean }> {
+  const all = await forwardTestIdeas(entries);
+  const debitRetired = isDebitSleeveRetirementEnabled();
+  return { all, scored: debitRetired ? applyDebitRetirement(all) : all, debitRetired };
+}
+
 async function runWeeklyOptionsRollup(): Promise<void> {
   const [entries, days] = await Promise.all([
     listJournalEntries(),
     loadChainDays(CHAIN_RECORD_OUT_DIR),
   ]);
-  const outcomes = await forwardTestIdeas(entries);
+  const { scored: outcomes } = await loadScoredIdeaOutcomes(entries);
   const report = buildForwardTestReport(outcomes, { chainsDir: defaultChainsDir() });
   const gateCriteria = resolveLiveCapitalGateCriteria();
   const gate = evaluateLiveCapitalGate(report, gateCriteria, {
@@ -7786,7 +7814,7 @@ app.get('/api/health/agents-advisory', (req, res) => {
 app.get('/api/options/forward-test/report', requireAuth, async (_req, res) => {
   try {
     const entries = await listJournalEntries();
-    const outcomes = await forwardTestIdeas(entries);
+    const { scored: outcomes } = await loadScoredIdeaOutcomes(entries);
     const report = buildForwardTestReport(outcomes, { chainsDir: defaultChainsDir() });
     res.json(report);
   } catch (err) {
@@ -7807,7 +7835,10 @@ app.get('/api/options/forward-test/report', requireAuth, async (_req, res) => {
 app.get('/api/health/live-capital-gate', async (_req, res) => {
   try {
     const entries = await listJournalEntries();
-    const outcomes = await forwardTestIdeas(entries);
+    // TRA-4646 — the gate grades the SCORED basis (credit-only when the
+    // debit-sleeve retirement is armed); `all` feeds the flag-independent
+    // evidence blocks below.
+    const { all: outcomesAll, scored: outcomes, debitRetired } = await loadScoredIdeaOutcomes(entries);
     const report = buildForwardTestReport(outcomes, { chainsDir: defaultChainsDir() });
     // TRA-1600 (B) — apply the cost-aware raised expectancy bar when the
     // cost-aware gate flag is on; defaults to the shipped LIVE_CAPITAL_GATE
@@ -7915,6 +7946,20 @@ app.get('/api/health/live-capital-gate', async (_req, res) => {
       // Whoever makes that change re-opens TRA-3611. Ratified as a PARAMETER change, not a
       // redesign (TRA-2346 Q3) — the door is open, it is just not walked through today.
       power: gate.power,
+      // TRA-4646 (AC3) — the debit-sleeve retirement comparison: before (all
+      // structures) vs after (credit-only) nRequired / sigmaUsed / feasibility
+      // verdict / ceilingSources, computed on EVERY read regardless of the flag so
+      // the expected post-arm numbers are gradeable before arming (TRA-2680) and
+      // the pre-arm numbers stay visible after. `scoringBasis` names which basis
+      // every figure ABOVE this block is scored on.
+      debitRetirement: buildDebitRetirementComparison(outcomesAll, gateCriteria, debitRetired, {
+        chainsDir: defaultChainsDir(),
+      }),
+      // TRA-4646 (AC2) — credit-only / debit-only expectancyNetR in the R UNIT
+      // with n, sd, se per sleeve. Computed over the UN-retired outcomes: the
+      // retired debit rows are the evidence for the retirement and must stay
+      // readable here in both flag states.
+      sleeveExpectancy: buildSleeveExpectancy(outcomesAll),
       evidence: {
         surfaced: report.totals.surfaced,
         resolved: report.totals.resolved,
@@ -7959,7 +8004,7 @@ app.get('/api/health/live-capital-gate', async (_req, res) => {
 app.get('/api/health/options-ideas-decomposition', async (_req, res) => {
   try {
     const entries = await listJournalEntries();
-    const outcomes = await forwardTestIdeas(entries);
+    const { scored: outcomes } = await loadScoredIdeaOutcomes(entries);
     const report = buildForwardTestReport(outcomes, { chainsDir: defaultChainsDir() });
     res.json({
       ok: true,
@@ -7987,6 +8032,62 @@ app.get('/api/health/options-ideas-decomposition', async (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to build the options-ideas decomposition.' });
+  }
+});
+
+// TRA-4646 (AC1/AC2) — the PER-IDEA journal readout, on the same unauth,
+// secrets-free basis as the sibling /api/health/* probes (QuantTrader has no auth
+// on bqb1; the journal is the GLOBAL engine-validation artifact — paper 1-lot
+// terms, no user data, no per-user P&L, no idea prose). Until this route existed
+// no per-idea read was reachable at all (/api/options/ideas/journal,
+// /api/options/idea-journal, /api/options/ideas/resolved all 404'd), so the
+// 2026-09-17 sleeve finding had to be derived from the power module's centered
+// statistic `c` — a different UNIT from expectancyNetR. `sleeveExpectancy` is the
+// R-unit read that closes that gap (AC2).
+//
+// Query params: `status` = all | resolved (default) | open | awaiting_data |
+// no_data; `offset` / `limit` paginate from the FIRST row of the stable journal
+// ordering with an offset-independent `total` — see the payload note for the
+// TRA-4607 contract this deliberately rules out.
+app.get('/api/health/options-ideas-journal', async (req, res) => {
+  try {
+    const entries = await listJournalEntries();
+    const { all, scored, debitRetired } = await loadScoredIdeaOutcomes(entries);
+    const rawStatus = String(req.query['status'] ?? 'resolved');
+    const allowedStatuses: readonly JournalStatusFilter[] = [
+      'all',
+      'resolved',
+      'open',
+      'awaiting_data',
+      'no_data',
+    ];
+    const statusFilter: JournalStatusFilter = allowedStatuses.includes(
+      rawStatus as JournalStatusFilter,
+    )
+      ? (rawStatus as JournalStatusFilter)
+      : 'resolved';
+    // Rows come from the SCORED basis so `excludeReason: "off_mandate_debit"`
+    // is visible per row while the retirement is armed; the sleeve stats come
+    // from the un-retired valuation (the retired sleeve must stay measurable).
+    const readout = buildIdeaJournalReadout(scored, {
+      status: statusFilter,
+      offset: Number(req.query['offset']),
+      limit: Number(req.query['limit']),
+    });
+    res.json({
+      ok: true,
+      issue: 'TRA-4646',
+      time: new Date().toISOString(),
+      build: resolveBuildInfo(),
+      debitRetirementEnabled: debitRetired,
+      ...readout,
+      sleeveExpectancy: buildSleeveExpectancy(all),
+    });
+  } catch (err) {
+    log.error('options-ideas-journal probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to build the options-ideas journal readout.' });
   }
 });
 
@@ -8077,7 +8178,7 @@ app.get('/api/health/options-ideas-credit-width', (_req, res) => {
 app.get('/api/health/pop-calibration', async (_req, res) => {
   try {
     const entries = await listJournalEntries();
-    const outcomes = await forwardTestIdeas(entries);
+    const { scored: outcomes } = await loadScoredIdeaOutcomes(entries);
     const report = buildForwardTestReport(outcomes, {
       chainsDir: defaultChainsDir(),
       popCalibration: resolvePopCalibrationConfig(),
@@ -8132,7 +8233,7 @@ app.get('/api/health/pop-calibration', async (_req, res) => {
 app.get('/api/health/engine-scorecard', async (_req, res) => {
   try {
     const entries = await listJournalEntries();
-    const outcomes = await forwardTestIdeas(entries);
+    const { scored: outcomes } = await loadScoredIdeaOutcomes(entries);
     const ideasReport = buildForwardTestReport(outcomes, { chainsDir: defaultChainsDir() });
     const aiIdeas = buildAiIdeasScorecard(ideasReport);
     const proposals = await loadProposalsScorecard();
@@ -8708,7 +8809,7 @@ app.get('/api/health/options-accumulation', async (_req, res) => {
       loadChainDays(CHAIN_RECORD_OUT_DIR),
       listJournalEntries(),
     ]);
-    const outcomes = await forwardTestIdeas(entries);
+    const { scored: outcomes } = await loadScoredIdeaOutcomes(entries);
     const report = buildForwardTestReport(outcomes, { chainsDir: defaultChainsDir() });
     const gate = resolveLiveCapitalGateCriteria();
     // Journal entries are ascending by surface time (see listJournalEntries).

@@ -145,3 +145,14 @@ export {
   type CreditWidthFloorShadow,
   type CreditWidthFloorShadowEntry,
 } from './options-idea-credit-width-floor.js';
+// TRA-4646 (child of TRA-1965) — the credit-only mandate / debit-sleeve retirement
+// flag. Exported through the barrel so the server's feed drop, scoring-time
+// exclusion and structure modeler read the SAME strategy classification and flag
+// state as the research pass — one source of truth, no drift.
+export {
+  DEBIT_SLEEVE_RETIREMENT_VAR,
+  CREDIT_CLASS_STRATEGIES,
+  isCreditClassStrategy,
+  isDebitSleeveRetirementEnabled,
+  debitRetirementPromptAddendum,
+} from './options-debit-retirement.js';

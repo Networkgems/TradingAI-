@@ -120,7 +120,17 @@ export type ExcludeReason =
    * surface-time filter (`options-ideas-feed`) now stops NEW such ideas from being
    * journaled; this reclassifies pre-existing journaled history at scoring time.
    */
-  | 'cost_uneconomic';
+  | 'cost_uneconomic'
+  /**
+   * TRA-4646 — the entry paid a net DEBIT (bought premium), which is the opposite
+   * trade to the premium-INCOME product TRA-1964/TRA-1965 commissioned. Applied at
+   * SCORING time only, and only while `ENABLE_OPTIONS_DEBIT_SLEEVE_RETIREMENT` is
+   * armed (`applyDebitRetirement`, options-ideas-journal-readout.ts): the gate is
+   * re-scored credit-only, while the journal rows themselves are never deleted or
+   * amended — the 19 resolved debit rows are the evidence the retirement decision
+   * rests on, and they stay readable (excluded, with this reason) on every route.
+   */
+  | 'off_mandate_debit';
 
 export interface IdeaOutcome {
   key: string;
@@ -1056,7 +1066,7 @@ export interface BookCeilingAxes {
  * is a per-row measurement, not a taxonomy that can fall out of date. A zero or
  * non-finite entry is `unknown` — never silently folded into either sleeve.
  */
-function premiumDirection(o: IdeaOutcome): string {
+export function premiumDirection(o: IdeaOutcome): string {
   if (!Number.isFinite(o.entryNetUsd) || o.entryNetUsd === 0) return 'unknown';
   return o.entryNetUsd > 0 ? 'credit' : 'debit';
 }

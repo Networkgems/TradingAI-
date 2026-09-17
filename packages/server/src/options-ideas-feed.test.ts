@@ -218,6 +218,54 @@ describe('modelStructure', () => {
     expect(s.maxLossUsd).toBeCloseTo(550, 4);
     expect(s.breakevens).toEqual([420.5, 439.5]); // [425 - 4.5, 435 + 4.5]
   });
+
+  // TRA-4646 (AC4) — economic width selection. The modeler used to hard-code a
+  // 1-strike-step width; on a fine-increment chain that manufactures a structure
+  // whose defined risk can't pay its own fixed round-trip cost, which TRA-1991
+  // then throws away AFTER generation (43.8% of the bqb1 journal). The width now
+  // widens to the FIRST rung that clears the cost ceiling.
+  it('widens a credit vertical to the first economic width instead of a penny-wide one (TRA-4646 AC4)', () => {
+    const fineRows: OptionChainRow[] = [
+      putRow(418, 3.05, 3.15), // mid 3.10
+      putRow(419, 3.55, 3.65), // mid 3.60
+      putRow(420, 4.15, 4.25), // mid 4.20
+    ];
+    const s = modelStructure('bull_put_spread', candidate({ strike: 420, optionType: 'put' }), 421, fineRows, 999);
+    // 1-wide: credit 0.60 → $40 max loss → cost $10.60 = 26.5% of risk (uneconomic).
+    // 2-wide: credit 1.10 → $90 max loss → 11.8% ≤ 15% → chosen.
+    expect(s.legs).toEqual([
+      { action: 'sell', optionType: 'put', strike: 420, expiration: EXP },
+      { action: 'buy', optionType: 'put', strike: 418, expiration: EXP },
+    ]);
+    expect(s.maxLossUsd).toBeCloseTo(90, 4);
+    expect(s.maxProfitUsd).toBeCloseTo(110, 4);
+    expect(s.netUsd).toBeCloseTo(110, 4);
+    expect(s.breakevens).toEqual([418.9]); // 420 - 1.10
+    expect(s.priced).toBe(true);
+  });
+
+  it('widens a debit vertical until the debit itself can pay the round trip (TRA-4646 AC4)', () => {
+    const fineCalls: OptionChainRow[] = [
+      callRow(197, 5.95, 6.05), // mid 6.00
+      callRow(198, 5.4, 5.5), // mid 5.45
+      callRow(199, 4.9, 5.0), // mid 4.95
+    ];
+    const s = modelStructure('bull_call_spread', candidate({ strike: 197, optionType: 'call' }), 196.9, fineCalls, 999);
+    // 1-wide: debit 0.55 → $55 → 19.3% of risk; 2-wide: debit 1.05 → $105 → 10.1% ✓
+    expect(s.legs).toEqual([
+      { action: 'buy', optionType: 'call', strike: 197, expiration: EXP },
+      { action: 'sell', optionType: 'call', strike: 199, expiration: EXP },
+    ]);
+    expect(s.maxLossUsd).toBeCloseTo(105, 4);
+    expect(s.priced).toBe(true);
+  });
+
+  it('keeps the nearest width when NO listed width clears the ceiling (the feed filter then drops it)', () => {
+    const pennyOnly: OptionChainRow[] = [putRow(419, 3.55, 3.65), putRow(420, 4.15, 4.25)];
+    const s = modelStructure('bull_put_spread', candidate({ strike: 420, optionType: 'put' }), 421, pennyOnly, 999);
+    expect(s.legs[1]!.strike).toBe(419);
+    expect(s.maxLossUsd).toBeCloseTo(40, 4); // still uneconomic — surfacing gate drops it
+  });
 });
 
 describe('ideaPopPlacementCoherent (TRA-1360)', () => {
@@ -823,6 +871,74 @@ describe('buildOptionsIdeasFeed', () => {
     });
     expect(feed.ideas).toHaveLength(1);
     expect(feed.ideas[0]!.maxLossUsd).toBeCloseTo(380, 4);
+  });
+
+  // TRA-4646 (AC4) — the throughput reclaim, end to end: the same penny-wide
+  // anchor that the TRA-1991 filter used to throw away now SURFACES, because the
+  // modeler widens to the first economic width before the filter ever looks.
+  it('reclaims a would-be cost_uneconomic drop by surfacing the economic width (TRA-4646 AC4)', () => {
+    const pennySym: OptionsResearchSymbol = {
+      ...sym,
+      spot: 421,
+      candidates: [candidate({ strike: 420, optionType: 'put', mispricingPct: -0.25 })],
+    };
+    const pennyInput: OptionsResearchInput = { asOf: input.asOf, symbols: [pennySym] };
+    // Same shape as the TRA-1991 drop fixture above, plus ONE deeper listed strike.
+    const fineRows = new Map<string, OptionChainRow[]>([
+      ['MSFT', [putRow(418, 3.05, 3.15), putRow(419, 3.55, 3.65), putRow(420, 4.15, 4.25)]],
+    ]);
+    const { feed, intents } = buildOptionsIdeasFeed({
+      research,
+      input: pennyInput,
+      rowsBySymbol: fineRows,
+      guardrail: DAY_TRADING_GUARDRAIL,
+      generatedAt: 1,
+    });
+    expect(feed.ideas).toHaveLength(1);
+    expect(feed.ideas[0]!.maxLossUsd).toBeCloseTo(90, 4); // 2-wide, economic
+    expect(intents.size).toBe(1);
+  });
+
+  // TRA-4646 (AC3) — the credit-only mandate at the feed layer.
+  describe('debit-sleeve retirement (TRA-4646 AC3)', () => {
+    const twoSleeves: OptionsResearchResult = {
+      ...research,
+      ideas: [
+        research.ideas[0]!, // bull_put_spread (credit), rank 1
+        { ...research.ideas[0]!, strategy: 'bull_call_spread', pop: 0.62, rank: 2 },
+      ],
+    };
+    const bothRows = new Map<string, OptionChainRow[]>([
+      ['MSFT', [putRow(415, 2.9, 3.1), putRow(420, 4.1, 4.3), callRow(435, 4.9, 5.1), callRow(440, 2.9, 3.1)]],
+    ]);
+
+    it('drops premium-buying structures when armed — no idea, no intent', () => {
+      const { feed, intents } = buildOptionsIdeasFeed({
+        research: twoSleeves,
+        input,
+        rowsBySymbol: bothRows,
+        guardrail: DAY_TRADING_GUARDRAIL,
+        generatedAt: GEN,
+        retireDebitStructures: true,
+      });
+      expect(feed.ideas).toHaveLength(1);
+      expect(feed.ideas[0]!.strategy).toBe(STRATEGY_DISPLAY.bull_put_spread);
+      expect(intents.size).toBe(1);
+    });
+
+    it('is inert when the flag is off — both sleeves surface exactly as before', () => {
+      const { feed } = buildOptionsIdeasFeed({
+        research: twoSleeves,
+        input,
+        rowsBySymbol: bothRows,
+        guardrail: DAY_TRADING_GUARDRAIL,
+        generatedAt: GEN,
+      });
+      expect(feed.ideas.map((i) => i.strategy).sort()).toEqual([
+        STRATEGY_DISPLAY.bull_call_spread,
+        STRATEGY_DISPLAY.bull_put_spread,
+      ]);
+    });
   });
 
   it('drops ideas whose symbol has no anchor candidate', () => {

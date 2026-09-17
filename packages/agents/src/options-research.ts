@@ -31,6 +31,11 @@ import {
   type CreditWidthFloorConfig,
   type CreditWidthFloorShadow,
 } from './options-idea-credit-width-floor.js';
+import {
+  debitRetirementPromptAddendum,
+  isCreditClassStrategy,
+  isDebitSleeveRetirementEnabled,
+} from './options-debit-retirement.js';
 
 /**
  * The capped-loss strategies. Anything outside this allowlist (naked/short single
@@ -650,9 +655,16 @@ export function creditWidthFloorPromptAddendum(config: CreditWidthFloorConfig): 
   ].join('\n');
 }
 
-/** The system prompt for one pass: the constant, plus the flag-gated TRA-2208 addendum. */
-function buildSystemPrompt(floor: CreditWidthFloorConfig | null): string {
-  return floor == null ? SYSTEM_PROMPT : `${SYSTEM_PROMPT}\n\n${creditWidthFloorPromptAddendum(floor)}`;
+/**
+ * The system prompt for one pass: the constant, plus the flag-gated TRA-2208 floor
+ * addendum, plus the flag-gated TRA-4646 credit-only-mandate addendum. Both are
+ * addenda (never edits) so the all-flags-off prompt is byte-for-byte the old one.
+ */
+function buildSystemPrompt(floor: CreditWidthFloorConfig | null, retireDebit: boolean): string {
+  const parts = [SYSTEM_PROMPT];
+  if (floor != null) parts.push(creditWidthFloorPromptAddendum(floor));
+  if (retireDebit) parts.push(debitRetirementPromptAddendum());
+  return parts.join('\n\n');
 }
 
 function buildUserPrompt(
@@ -817,6 +829,7 @@ function enforceGuardrail(
   maxIdeas: number,
   policy: DiversificationPolicy,
   floor: CreditWidthFloorConfig | null,
+  retireDebit: boolean,
 ): { ideas: OptionsIdea[]; rejected: RejectedIdea[] } {
   const symByTicker = new Map<string, OptionsResearchSymbol>();
   for (const s of input.symbols) symByTicker.set(s.symbol.toUpperCase(), s);
@@ -839,6 +852,16 @@ function enforceGuardrail(
     // into the (paper-only) ideas → paper-enter path.
     else if (guardrail.definedRiskOnly && isCoveredStrategy(r.strategy)) {
       reasons.push(`strategy "${r.strategy}" is sleeve-managed, not an LLM idea`);
+    }
+    // TRA-4646 — credit-only mandate: with the debit-sleeve retirement armed, any
+    // non-credit-class (premium-BUYING) idea is dropped deterministically, recorded
+    // here for audit rather than silently thinned. The prompt addendum states the
+    // mandate so the model spends its slots on credit structures instead.
+    if (retireDebit && !isCreditClassStrategy(r.strategy)) {
+      reasons.push(
+        `strategy "${r.strategy}" buys premium — off-mandate under the credit-only mandate ` +
+          `(TRA-4646 debit-sleeve retirement); use bull_put_spread / bear_call_spread / iron_condor / iron_butterfly`,
+      );
     }
     // TRA-1974 — event-IV "sell the crush": a net-long-vega debit single-leg
     // (long_call / long_put) held across a scheduled catalyst inside its expiry,
@@ -999,22 +1022,29 @@ export async function runOptionsResearch(
   // = the prompt, the cache key, the guardrail and the emitted idea shape are all
   // exactly what they were before this issue.
   const floor = resolveCreditWidthFloorConfig();
+  // TRA-4646 — resolve the credit-only mandate once per pass. False = flag off =
+  // the prompt, the cache key, the guardrail and the slate are all unchanged.
+  const retireDebit = isDebitSleeveRetirementEnabled();
 
   // The floor changes the PROMPT, so it must change the cache key too — otherwise a
   // slate researched under the old prompt would be re-served to a flag-on caller and
   // the floor would appear to have removed nothing. Suffix-only, so the flag-off key
-  // is byte-for-byte the old one.
-  const key =
-    floor == null
-      ? optionsResearchBatchKey(input)
-      : `${optionsResearchBatchKey(input)}|cwfloor${floor.minCreditWidth}:${floor.shortDeltaMin}-${floor.shortDeltaMax}`;
+  // is byte-for-byte the old one. TRA-4646 — same reasoning for the credit-only
+  // mandate suffix.
+  const key = [
+    optionsResearchBatchKey(input),
+    ...(floor == null
+      ? []
+      : [`cwfloor${floor.minCreditWidth}:${floor.shortDeltaMin}-${floor.shortDeltaMax}`]),
+    ...(retireDebit ? ['creditonly'] : []),
+  ].join('|');
   const cached = deps.cache?.get(key);
   if (cached) {
     return { ...cached, cached: true };
   }
 
   const messages: LlmMessage[] = [
-    { role: 'system', content: buildSystemPrompt(floor) },
+    { role: 'system', content: buildSystemPrompt(floor, retireDebit) },
     { role: 'user', content: buildUserPrompt(input, guardrail, maxIdeas, diversification) },
   ];
 
@@ -1032,6 +1062,7 @@ export async function runOptionsResearch(
     maxIdeas,
     diversification,
     floor,
+    retireDebit,
   );
 
   const result: OptionsResearchResult = {
