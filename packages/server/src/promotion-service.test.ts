@@ -743,16 +743,14 @@ describe('TRA-2348 promotion gate — the graded unit is (strategy, UNIVERSE)', 
     // Set up CANARY_USER with Stage-1 evidence and sign-off that only covers BTC-USD
     await store.registerAccumulationBacktestVerdict({
       strategyId: 'dca',
-      metrics: passingDcaBacktest(),
+      metrics: passingAccumBacktestMetrics(),
       reportId: 'canary-backtest',
       registeredBy: CANARY_USER,
       evidenceUniverse: ['BTC-USD'], // evidence only covered BTC
     });
-    await tradeStore.saveStocksTradeSnapshot(CANARY_USER, {
-      version: 1,
-      acpDcaPaperAccrual: { soakDays: 90, totalFills: 45 },
-      closedPositions: [],
-    });
+    // No paper ledger is seeded for CANARY_USER: dca paper metrics read the
+    // CRYPTO snapshot, and recordSignoff accepts paperMetrics null — the case
+    // under test is the G-coverage refusal, which is independent of Stage 2.
     await store.recordSignoff({
       strategyId: 'dca',
       reviewer: 'QuantTrader',
@@ -774,6 +772,19 @@ describe('TRA-2348 promotion gate — the graded unit is (strategy, UNIVERSE)', 
     // AC2 — assert the new error message for ratified-but-not-covered case
     expect(gate.blocked[0]?.reasons.join(' ')).toMatch(/IS on the board-ratified live-crypto list/);
     expect(gate.blocked[0]?.reasons.join(' ')).toMatch(/Stage-1 evidence does not cover/);
+
+    // The store is GLOBAL per strategyId and the gate reads the LATEST decision,
+    // so the narrow {BTC-USD} grant appended above would otherwise leak into
+    // every later test in this file. Restore alice's majors grant (recorded in
+    // the end-to-end block) as the latest decision.
+    await store.recordSignoff({
+      strategyId: 'dca',
+      reviewer: 'QuantTrader',
+      backtestMetrics: null,
+      paperMetrics: await svc.snapshotPaperMetrics(USER, 'dca'),
+      evidenceUniverse: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
+      grantedUniverse: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
+    });
   });
 
   it('THE ESCAPE HATCH — widening the preset while turning live crypto OFF in the same save is ALLOWED', async () => {

@@ -11,7 +11,7 @@ import type {
   PromotionThresholds,
   PromotionTradeSample,
 } from '@trading-app/shared';
-import { DEFAULT_PROMOTION_THRESHOLDS, computePaperGateMetrics, promotionStrategyClass } from '@trading-app/shared';
+import { DEFAULT_PROMOTION_THRESHOLDS, computePaperGateMetrics, isSymbolUniverseSubset, promotionStrategyClass } from '@trading-app/shared';
 import type { BacktestResult, OptimizationVerdict } from '@trading-app/backtest';
 import { logger } from './observability/index.js';
 import { resolveDataDir } from './data-dir.js';
@@ -477,28 +477,6 @@ export function mergeThresholds(
 }
 
 /**
- * TRA-2392 — check if granted is a subset of evidence (G ⊆ E). Null (unbounded)
- * is never a subset of a bounded set, and a bounded set is never a subset of null
- * (unbounded). Two unbounded sets are equal (both null).
- */
-function isUniverseSubset(
-  granted: readonly string[] | null | undefined,
-  evidence: readonly string[] | null | undefined,
-): boolean {
-  // If either is undefined, cannot validate subset relationship
-  if (granted === undefined || evidence === undefined) return false;
-  // null (unbounded) granted is not a subset of bounded evidence
-  if (granted === null && evidence !== null) return false;
-  // Bounded granted is not a subset of null (unbounded) evidence - wait, actually it is!
-  // Any bounded set is a subset of unbounded
-  if (granted !== null && evidence === null) return true;
-  // Both null (unbounded) - equal, so subset holds
-  if (granted === null && evidence === null) return true;
-  // Both bounded arrays - check every symbol in granted is in evidence
-  return granted.every((sym) => evidence.includes(sym));
-}
-
-/**
  * Record a Stage-3 sign-off (`promotion_decision`). `paperMetrics` /
  * `backtestMetrics` are the snapshots the reviewer saw at decision time, passed
  * in by the service layer (which recomputed them from data). When
@@ -533,9 +511,11 @@ export async function recordSignoff(args: {
     ? args.grantedUniverse
     : args.evidenceUniverse;
 
-  // Validate G ⊆ E before append
+  // Validate G ⊆ E before append. The subset semantics live in ONE place
+  // (shared `isSymbolUniverseSubset`, null read as ⊤) — a second hand-written
+  // copy here is the drift the TRA-4633 positive control cannot reach (TRA-4643).
   if (args.evidenceUniverse !== undefined && grantedUniverse !== undefined) {
-    if (!isUniverseSubset(grantedUniverse, args.evidenceUniverse)) {
+    if (!isSymbolUniverseSubset(grantedUniverse, args.evidenceUniverse)) {
       const describeUniverse = (u: readonly string[] | null | undefined): string =>
         u === undefined ? 'undefined' : u === null ? 'unbounded' : `[${u.join(', ')}]`;
       throw new PromotionValidationError(
