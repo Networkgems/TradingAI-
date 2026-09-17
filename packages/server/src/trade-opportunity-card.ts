@@ -16,10 +16,11 @@
 //    'proposal_only'; there is no order field, no broker hook, no execution
 //    callback. The TRA-4651 lifecycle state machine is the only intended
 //    consumer that can advance one, and it starts at Detected.
-//  - `confidence` is `null` by construction. A confidence number must be
-//    calibrated (TRA-4652: historical expectancy after fees/slippage, costs
-//    charged inside the fold per TRA-4578) or it must not be shown. This module
-//    reserves the slot and NEVER populates it.
+//  - `confidence` is populated ONLY from a validated TRA-4652 calibration cell
+//    (historical expectancy after fees/slippage, costs charged inside the fold
+//    per TRA-4578, ≥30 instances, out-of-sample validated). No calibration in
+//    the build context, or a setup that fails any of those gates, leaves the
+//    slot `null` — this module never invents a number.
 //  - FAIL CLOSED per field: a field that cannot be populated from measured
 //    inputs reports `incomplete` with the named missing inputs. It is never
 //    silently defaulted, and `card.complete` is true only when all 8 verify.
@@ -51,6 +52,11 @@ import {
   type NetEdgeCostBreakdown,
 } from './option-net-edge-bar.js';
 import { sizeFromStopViaRiskManager } from './account-sizing.js';
+import {
+  confidenceFor,
+  type SetupCalibrationIndex,
+  type SetupConfidence,
+} from './setup-calibration.js';
 
 // ── Field plumbing ──────────────────────────────────────────────────────────
 
@@ -401,8 +407,13 @@ export interface TradeOpportunityCard {
   generatedAt: number;
   /** Cards propose. They never execute. See TRA-4651 for the state machine. */
   disposition: 'proposal_only';
-  /** RESERVED for TRA-4652 calibrated expectancy. Never populated here. */
-  confidence: null;
+  /**
+   * TRA-4652 calibrated expectancy verdict. Non-null ONLY when the build
+   * context carried a calibration index whose cell for this setup cleared the
+   * ≥30-instance floor and out-of-sample validation (existence implies
+   * validation — `SetupConfidence` has no unvalidated variant). Otherwise null.
+   */
+  confidence: SetupConfidence | null;
   complete: boolean;
   /** Names of the fields that failed to verify (empty iff complete). */
   incompleteFields: string[];
@@ -438,6 +449,13 @@ export interface CardBuildContext {
   underlyingFeesPerShare?: number;
   /** Optional chain liquidity for option contracts. */
   optionLiquidity?: { openInterest?: number; volume?: number; marketPhase?: 'pre' | 'rth' | 'post' };
+  /**
+   * TRA-4652 calibration index (from `calibrateSetups`). Absent ⇒ every card's
+   * `confidence` is null — the pre-TRA-4652 behavior, unchanged.
+   */
+  calibration?: SetupCalibrationIndex;
+  /** Current market regime label, for regime-conditioned confidence lookup. */
+  currentRegime?: string | null;
 }
 
 // ── The builder ─────────────────────────────────────────────────────────────
@@ -862,7 +880,9 @@ export function buildTradeOpportunityCard(
     mode: str(s.mode) ?? null,
     generatedAt: ctx.now,
     disposition: 'proposal_only',
-    confidence: null,
+    confidence: ctx.calibration
+      ? confidenceFor(ctx.calibration, signal.type, ctx.currentRegime ?? null).confidence
+      : null,
     complete: incompleteFields.length === 0,
     incompleteFields,
     fields,
