@@ -151,10 +151,13 @@ describe('SignalEngine — TRA-796 agent gating mode', () => {
     priv(engine).latestAgentRecommendations = [reco];
     await priv(engine).routeAgentApprovals(new Map([['AAPL', 100]]));
 
-    // With no Tradier equity client wired in this unit test, the order path
-    // itself declines — but with the gating-disabled reason, proving the live
-    // gate opened the path through to the deterministic risk/broker step.
+    // The order path itself declines downstream of the gating block — since
+    // TRA-4442, the first refusing step past the gate is the TRA-817
+    // capital-gate manifest consult (this unit strategy has no out-of-sample
+    // pass), which fires before the Tradier-client check. Either way the
+    // reason is NOT the gating one, proving the live gate opened the path
+    // through to the deterministic risk/broker steps.
     expect(reco.proposedSignal?.liveSkipReason).not.toMatch(/live routing disabled/i);
-    expect(reco.proposedSignal?.liveSkipReason).toMatch(/Tradier equity client not configured/i);
+    expect(reco.proposedSignal?.liveSkipReason).toMatch(/TRA-817 capital-gate manifest/i);
   });
 });

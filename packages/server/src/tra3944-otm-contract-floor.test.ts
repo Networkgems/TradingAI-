@@ -302,9 +302,16 @@ describe('TRA-3944 AC4 — source-level: arm / row size / 2-row cap untouched; o
     const block = ENGINE_SRC.slice(pick, ENGINE_SRC.indexOf('\n        }\n', pick));
     expect(block).toContain('signal.signalSkipReasonCode = otmFloorPick.code;');
     expect(block).toContain('scanRun.reject(otmFloorPick.code);');
+    // The reject call must sit AFTER the chain survey and BEFORE the selector
+    // consult. Located by ordered indexOf rather than a brace-bounded slice:
+    // TRA-4642 legitimately inserted its demoter block (its own `}` included)
+    // between the survey and the refusal, which made any "up to the next
+    // `}` at this indent" window end early and miss the line it was proving.
     const chain = ENGINE_SRC.indexOf('const otmFloorChain = applyOtmContractFloor(result.candidates, otmFloor);');
-    const chainBlock = ENGINE_SRC.slice(chain, ENGINE_SRC.indexOf('\n        }\n', chain));
-    expect(chainBlock).toContain('scanRun.reject(otmFloorChain.refusalCode);');
+    const chainReject = ENGINE_SRC.indexOf('scanRun.reject(otmFloorChain.refusalCode);', chain);
+    const selectorConsult = ENGINE_SRC.indexOf('selectAdmissibleOtmCandidate(otmFloorChain.admissible', chain);
+    expect(chainReject).toBeGreaterThan(chain);
+    expect(selectorConsult).toBeGreaterThan(chainReject);
   });
 
   it('both open sites carry the per-entry cap; the live count is capped AFTER the canary sizing, not instead of it', () => {
