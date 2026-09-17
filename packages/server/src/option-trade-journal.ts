@@ -7,6 +7,10 @@ import { logger } from './observability/index.js';
 import { STOP_DISTANCE_FRACTION_OF_MARK } from './option-spread-cost.js';
 import type { RiskThrottleSizingPath, RiskThrottleSizingScope } from './risk-throttle-sizing.js';
 import { resolveDataDir } from './data-dir.js';
+// TRA-4674 — crossed (ask→bid) re-pricing. Pure, read-time-only; that module
+// imports nothing back from this one at runtime, so no cycle.
+import { foldCrossedCells, foldSpreadCells } from './option-crossed-pnl.js';
+import type { CrossedFoldCells, SpreadFoldCells } from './option-crossed-pnl.js';
 
 // TRA-990 (Learning A) — the option-trade JOURNAL: a durable, observe-only
 // setup -> outcome ledger for option positions (calls/puts, spreads and
@@ -3389,6 +3393,13 @@ export interface OptionTradeJournalStructureStat {
   realizedPnlUsd: number;
   winRate: number | null;
   avgR: number | null;
+  /**
+   * TRA-4674 — the structure's rows re-priced at the cross (pay the ask,
+   * sell the bid), beside the booked columns above. `crossedPnlUsd` and
+   * `bookedPnlUsdPriced` are a matched pair over the same `priced` subset,
+   * so the drag is a subtraction, never a cross-population comparison.
+   */
+  crossed: CrossedFoldCells;
 }
 
 /**
@@ -3789,6 +3800,23 @@ export interface OptionTradeJournalSummary {
    * recalibrated against.
    */
   slippage: OptionTradeJournalSlippageStat;
+  /**
+   * TRA-4674 — the closed book re-priced at the CROSS (long premium: pay the
+   * ask at entry, sell the bid at exit; mirrored for short premium), beside
+   * the booked `realizedPnlUsd` above, which stays mark-based and unchanged.
+   * On the desk rows of 09-09..09-17 the spread drag was 52% of the mean
+   * absolute booked P&L and flipped the book's sign — a flat booked column
+   * and a bleeding one are indistinguishable without this cell. Rows missing
+   * either quote are `null`-priced and excluded from BOTH sides of the
+   * matched comparison (see {@link CrossedFoldCells}).
+   */
+  crossed: CrossedFoldCells;
+  /**
+   * TRA-4674 — entry- and exit-side spread distributions over the closed
+   * rows, so an entry-side spread bar (QT's ranked improvement #1) is
+   * gradeable from `summary` without a row dump. Fractions, not percent.
+   */
+  spreads: SpreadFoldCells;
 }
 
 /**
@@ -3851,7 +3879,15 @@ export function summarizeOptionTradeJournal(
       const wins = list.filter((r) => r.outcome === 'WIN').length;
       const pnl = list.reduce((acc, r) => acc + (r.realizedPnlUsd ?? 0), 0);
       const r = c > 0 ? list.reduce((acc, x) => acc + (x.realizedR ?? 0), 0) / c : null;
-      return { structure, closed: c, realizedPnlUsd: pnl, winRate: c > 0 ? wins / c : null, avgR: r };
+      return {
+        structure,
+        closed: c,
+        realizedPnlUsd: pnl,
+        winRate: c > 0 ? wins / c : null,
+        avgR: r,
+        // TRA-4674 — the same rows at the cross, beside the booked columns.
+        crossed: foldCrossedCells(list),
+      };
     })
     .sort((a, b) => b.closed - a.closed || Math.abs(b.realizedPnlUsd) - Math.abs(a.realizedPnlUsd));
 
@@ -4056,5 +4092,9 @@ export function summarizeOptionTradeJournal(
     byDte,
     byDelta,
     slippage,
+    // TRA-4674 — the crossed (ask→bid) matched comparison and the spread
+    // distributions, over the same closed set as the booked headline.
+    crossed: foldCrossedCells(closedRows),
+    spreads: foldSpreadCells(closedRows),
   };
 }
