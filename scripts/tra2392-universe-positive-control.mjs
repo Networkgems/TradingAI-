@@ -21,6 +21,8 @@ import { readFileSync, writeFileSync } from 'fs';
 
 const SHARED_SRC = 'packages/shared/src/symbol-universe.ts';
 const SHARED_DIST = 'packages/shared/dist/symbol-universe.js';
+const SERVICE_SRC = 'packages/server/src/promotion-service.ts';
+const SERVICE_DIST = 'packages/server/dist/promotion-service.js';
 
 function exec(cmd) {
   try {
@@ -33,6 +35,11 @@ function exec(cmd) {
 function rebuildShared() {
   console.log('Rebuilding @trading-app/shared with --force...');
   execSync('npx tsc -b packages/shared --force', { stdio: 'inherit' });
+}
+
+function rebuildServer() {
+  console.log('Rebuilding @trading-app/server with --force...');
+  execSync('npx tsc -b packages/server --force', { stdio: 'inherit' });
 }
 
 function assertMarkerInDist(marker) {
@@ -107,7 +114,7 @@ if (result.passed && !result.failed) {
 }
 console.log('✓ Perturbation 2 correctly FAILED\n');
 
-// Restore and final pass
+// Restore and re-test
 writeFileSync(SHARED_SRC, original);
 rebuildShared();
 result = runTests();
@@ -115,7 +122,46 @@ if (!result.passed) {
   console.error('FAIL: Tests failed after restore. The control broke something.');
   process.exit(1);
 }
+console.log('✓ Perturbations 1-2 detected, restore PASS\n');
 
-console.log('✓ All perturbations detected, restore PASS');
+// Perturbation 3: Disable the grantedUniverse conjunct in promotion-service.ts
+console.log('4. Perturbation 3: disable G conjunct (always allow ratified widenings)...');
+const serviceOriginal = readFileSync(SERVICE_SRC, 'utf-8');
+// Change "if (isRatified && isCoveredByG)" to "if (isRatified)" so G is ignored
+const perturbed3 = serviceOriginal.replace(
+  'if (isRatified && isCoveredByG) {',
+  'if (isRatified) { // PERTURBED3 - G conjunct disabled'
+);
+writeFileSync(SERVICE_SRC, perturbed3);
+rebuildServer();
+// Check the marker reached dist
+const serviceDist = readFileSync(SERVICE_DIST, 'utf-8');
+if (!serviceDist.includes('PERTURBED3')) {
+  console.error(`BLIND: marker "PERTURBED3" not found in ${SERVICE_DIST}`);
+  console.error('The perturbation did not reach dist. Tests are grading the old code.');
+  writeFileSync(SERVICE_SRC, serviceOriginal);
+  process.exit(2);
+}
+console.log('✓ Marker "PERTURBED3" found in dist');
+
+// Run the full promotion-service.test suite (not just promotion-universe.test)
+const serviceResult = exec('npm test -- promotion-service.test');
+if (serviceResult.includes('passed') && !serviceResult.includes('failed')) {
+  console.error('BLIND: Tests passed with G conjunct disabled. They do not grade the real gate.');
+  writeFileSync(SERVICE_SRC, serviceOriginal);
+  process.exit(2);
+}
+console.log('✓ Perturbation 3 correctly FAILED\n');
+
+// Final restore and pass
+writeFileSync(SERVICE_SRC, serviceOriginal);
+rebuildServer();
+const finalResult = exec('npm test -- promotion-service.test');
+if (!finalResult.includes('passed')) {
+  console.error('FAIL: Tests failed after final restore. The control broke something.');
+  process.exit(1);
+}
+
+console.log('✓ All perturbations detected, all restores PASS');
 console.log('\n=== CONTROL PASS ===');
 process.exit(0);

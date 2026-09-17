@@ -72,6 +72,14 @@ export interface RegisteredBacktest {
    * {@link registerOptimizationVerdict} class guards).
    */
   accumulationBacktest?: AccumulationBacktestGateMetrics;
+  /**
+   * TRA-2392 (ruling 1B) — the symbol universe that the Stage-1 evidence
+   * actually covered. Derived from the backtest run's symbol set. Null
+   * represents an unbounded universe (grows with the catalog), but null is
+   * refused at the API boundary — no backtest can measure a catalog that grows
+   * on its own. Absent E refuses ALL sign-offs (fail-closed on legacy records).
+   */
+  evidenceUniverse?: readonly string[] | null;
 }
 
 /**
@@ -253,8 +261,15 @@ export async function registerBacktestReport(args: {
   report: BacktestResult;
   reportId: string;
   registeredBy: string;
+  evidenceUniverse?: readonly string[] | null;
 }): Promise<StrategyPromotionRecord> {
   if (!args.strategyId) throw new PromotionValidationError('strategyId is required');
+  // TRA-2392 — refuse null/TOP as an evidence universe at the API boundary.
+  if (args.evidenceUniverse === null) {
+    throw new PromotionValidationError(
+      'evidenceUniverse cannot be null (unbounded) — no backtest can measure a catalog that grows on its own',
+    );
+  }
   // TRA-1465 — a close-based backtest report can never clear an accumulate
   // Stage 1 (the six-guard timing battery is meaningless on hold-mode DCA).
   if (promotionStrategyClass(args.strategyId) === 'accumulate') {
@@ -271,6 +286,7 @@ export async function registerBacktestReport(args: {
     reportId: args.reportId || 'unspecified',
     registeredAt: new Date().toISOString(),
     registeredBy: args.registeredBy,
+    ...(args.evidenceUniverse !== undefined ? { evidenceUniverse: args.evidenceUniverse } : {}),
   };
   store.strategies[args.strategyId] = rec;
   await persist();
@@ -294,8 +310,15 @@ export async function registerOptimizationVerdict(args: {
   verdict: OptimizationVerdict;
   reportId: string;
   registeredBy: string;
+  evidenceUniverse?: readonly string[] | null;
 }): Promise<StrategyPromotionRecord> {
   if (!args.strategyId) throw new PromotionValidationError('strategyId is required');
+  // TRA-2392 — refuse null/TOP as an evidence universe at the API boundary.
+  if (args.evidenceUniverse === null) {
+    throw new PromotionValidationError(
+      'evidenceUniverse cannot be null (unbounded) — no backtest can measure a catalog that grows on its own',
+    );
+  }
   // TRA-1465 — the TRA-540 six-guard timing verdict can never clear an
   // accumulate Stage 1 (DCA has no per-trade timing edge to certify).
   if (promotionStrategyClass(args.strategyId) === 'accumulate') {
@@ -329,6 +352,7 @@ export async function registerOptimizationVerdict(args: {
     registeredBy: args.registeredBy,
     verdict: { pass: v.pass, guards: v.guards },
     blessedParams: v.blessedParams,
+    ...(args.evidenceUniverse !== undefined ? { evidenceUniverse: args.evidenceUniverse } : {}),
   };
   store.strategies[args.strategyId] = rec;
   await persist();
@@ -372,8 +396,15 @@ export async function registerAccumulationBacktestVerdict(args: {
   metrics: AccumulationBacktestGateMetrics;
   reportId: string;
   registeredBy: string;
+  evidenceUniverse?: readonly string[] | null;
 }): Promise<StrategyPromotionRecord> {
   if (!args.strategyId) throw new PromotionValidationError('strategyId is required');
+  // TRA-2392 — refuse null/TOP as an evidence universe at the API boundary.
+  if (args.evidenceUniverse === null) {
+    throw new PromotionValidationError(
+      'evidenceUniverse cannot be null (unbounded) — no backtest can measure a catalog that grows on its own',
+    );
+  }
   if (promotionStrategyClass(args.strategyId) !== 'accumulate') {
     throw new PromotionValidationError(
       `strategy "${args.strategyId}" is close-based — its Stage-1 leg is a six-guard timing verdict `
@@ -410,6 +441,7 @@ export async function registerAccumulationBacktestVerdict(args: {
     registeredAt: new Date().toISOString(),
     registeredBy: args.registeredBy,
     accumulationBacktest: metrics,
+    ...(args.evidenceUniverse !== undefined ? { evidenceUniverse: args.evidenceUniverse } : {}),
   };
   store.strategies[args.strategyId] = rec;
   await persist();
@@ -445,11 +477,35 @@ export function mergeThresholds(
 }
 
 /**
+ * TRA-2392 — check if granted is a subset of evidence (G ⊆ E). Null (unbounded)
+ * is never a subset of a bounded set, and a bounded set is never a subset of null
+ * (unbounded). Two unbounded sets are equal (both null).
+ */
+function isUniverseSubset(
+  granted: readonly string[] | null | undefined,
+  evidence: readonly string[] | null | undefined,
+): boolean {
+  // If either is undefined, cannot validate subset relationship
+  if (granted === undefined || evidence === undefined) return false;
+  // null (unbounded) granted is not a subset of bounded evidence
+  if (granted === null && evidence !== null) return false;
+  // Bounded granted is not a subset of null (unbounded) evidence - wait, actually it is!
+  // Any bounded set is a subset of unbounded
+  if (granted !== null && evidence === null) return true;
+  // Both null (unbounded) - equal, so subset holds
+  if (granted === null && evidence === null) return true;
+  // Both bounded arrays - check every symbol in granted is in evidence
+  return granted.every((sym) => evidence.includes(sym));
+}
+
+/**
  * Record a Stage-3 sign-off (`promotion_decision`). `paperMetrics` /
  * `backtestMetrics` are the snapshots the reviewer saw at decision time, passed
  * in by the service layer (which recomputed them from data). When
  * `thresholdOverrides` is present a `rationale` is mandatory (TRA-527: defaults
- * may only be loosened with a written rationale).
+ * may only be loosened with a written rationale). TRA-2392 — accepts
+ * `grantedUniverse` from the reviewer, defaulting to `evidenceUniverse` when
+ * omitted; refuses G ⊄ E before the append.
  */
 export async function recordSignoff(args: {
   strategyId: string;
@@ -458,12 +514,36 @@ export async function recordSignoff(args: {
   paperMetrics: PaperGateMetrics | null;
   thresholdOverrides?: Partial<PromotionThresholds>;
   rationale?: string;
+  evidenceUniverse?: readonly string[] | null;
+  grantedUniverse?: readonly string[] | null;
 }): Promise<PromotionDecision> {
   if (!args.strategyId) throw new PromotionValidationError('strategyId is required');
   if (!args.reviewer) throw new PromotionValidationError('reviewer is required');
   if (args.thresholdOverrides && !args.rationale?.trim()) {
     throw new PromotionValidationError('rationale is required when threshold overrides are applied');
   }
+  // TRA-2392 — refuse null/TOP as an evidence universe
+  if (args.evidenceUniverse === null) {
+    throw new PromotionValidationError(
+      'evidenceUniverse cannot be null (unbounded) — no backtest can measure a catalog that grows on its own',
+    );
+  }
+  // Default grantedUniverse to evidenceUniverse when reviewer omits it
+  const grantedUniverse = args.grantedUniverse !== undefined
+    ? args.grantedUniverse
+    : args.evidenceUniverse;
+
+  // Validate G ⊆ E before append
+  if (args.evidenceUniverse !== undefined && grantedUniverse !== undefined) {
+    if (!isUniverseSubset(grantedUniverse, args.evidenceUniverse)) {
+      const describeUniverse = (u: readonly string[] | null | undefined): string =>
+        u === undefined ? 'undefined' : u === null ? 'unbounded' : `[${u.join(', ')}]`;
+      throw new PromotionValidationError(
+        `grantedUniverse ${describeUniverse(grantedUniverse)} is not a subset of evidenceUniverse ${describeUniverse(args.evidenceUniverse)} — cannot grant more than the evidence covered`,
+      );
+    }
+  }
+
   const store = await ensureLoaded();
   const rec = store.strategies[args.strategyId] ?? blankRecord(args.strategyId);
   const decision: PromotionDecision = {
@@ -475,6 +555,8 @@ export async function recordSignoff(args: {
     paperMetrics: args.paperMetrics,
     ...(args.thresholdOverrides ? { thresholdOverrides: args.thresholdOverrides } : {}),
     ...(args.rationale ? { rationale: args.rationale } : {}),
+    ...(args.evidenceUniverse !== undefined ? { evidenceUniverse: args.evidenceUniverse } : {}),
+    ...(grantedUniverse !== undefined ? { grantedUniverse } : {}),
   };
   rec.decisions.push(decision);
   if (args.thresholdOverrides) rec.thresholdOverrides = mergeThresholds(

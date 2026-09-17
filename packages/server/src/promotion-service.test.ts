@@ -180,6 +180,8 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
       reviewer: 'QuantTrader',
       backtestMetrics: store.deriveBacktestGateMetrics(passingReport()),
       paperMetrics: await svc.snapshotPaperMetrics(USER, 'dca'),
+      evidenceUniverse: ['BTC-USD', 'ETH-USD', 'SOL-USD'], // majors universe
+      grantedUniverse: ['BTC-USD', 'ETH-USD', 'SOL-USD'], // grant the full majors
     });
     const status = await svc.buildPromotionStatus(USER, 'dca');
     expect(status.canGoLive).toBe(true);
@@ -731,18 +733,47 @@ describe('TRA-2348 promotion gate — the graded unit is (strategy, UNIVERSE)', 
     expect(gate.blocked).toHaveLength(0);
   });
 
-  it('THE RATIFIED STEP-UP — canary BTC → majors is a widening but is ALLOWED', async () => {
-    // TRA-1304 adjudicated the canary INSIDE the existing majors sign-off:
-    // "on canary PASS the step-up is env-only, no code change and no re-gate".
-    // The rule must not re-gate the one widening the board already granted.
+  it('THE RATIFIED STEP-UP — canary BTC → majors WIDENING is REFUSED when G is too narrow (TRA-3467)', async () => {
+    // TRA-2392/TRA-3467 — under the new conjunct rule (ratified AND covered by G),
+    // a widening from canary to majors is REFUSED when the granted universe only
+    // covers BTC-USD. The preset is ratified, but G doesn't cover the wider universe.
+    // This test uses a SECOND user with a narrow grant to isolate this scenario.
+    const CANARY_USER = 'canary-user';
+
+    // Set up CANARY_USER with Stage-1 evidence and sign-off that only covers BTC-USD
+    await store.registerAccumulationBacktestVerdict({
+      strategyId: 'dca',
+      metrics: passingDcaBacktest(),
+      reportId: 'canary-backtest',
+      registeredBy: CANARY_USER,
+      evidenceUniverse: ['BTC-USD'], // evidence only covered BTC
+    });
+    await tradeStore.saveStocksTradeSnapshot(CANARY_USER, {
+      version: 1,
+      acpDcaPaperAccrual: { soakDays: 90, totalFills: 45 },
+      closedPositions: [],
+    });
+    await store.recordSignoff({
+      strategyId: 'dca',
+      reviewer: 'QuantTrader',
+      backtestMetrics: null,
+      paperMetrics: await svc.snapshotPaperMetrics(CANARY_USER, 'dca'),
+      evidenceUniverse: ['BTC-USD'], // evidence only covered BTC
+      grantedUniverse: ['BTC-USD'], // grant only BTC, not the full majors
+    });
+
     delete process.env[FLAG];
     const gate = await svc.evaluateLiveTransitionGate(
-      USER,
+      CANARY_USER,
       cryptoLiveOn('crypto_core_live_majors'),
       cryptoLiveOn('crypto_core_live_canary_btc'),
     );
-    expect(gate.allowed).toBe(true);
-    expect(gate.blocked).toHaveLength(0);
+    expect(gate.allowed).toBe(false);
+    expect(gate.blocked).toHaveLength(1);
+    expect(gate.blocked[0]?.strategyId).toBe('dca');
+    // AC2 — assert the new error message for ratified-but-not-covered case
+    expect(gate.blocked[0]?.reasons.join(' ')).toMatch(/IS on the board-ratified live-crypto list/);
+    expect(gate.blocked[0]?.reasons.join(' ')).toMatch(/Stage-1 evidence does not cover/);
   });
 
   it('THE ESCAPE HATCH — widening the preset while turning live crypto OFF in the same save is ALLOWED', async () => {

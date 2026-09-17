@@ -14870,6 +14870,7 @@ app.post('/api/promotion/backtest', requireAuth, requireAdmin, async (req, res) 
       report: body.report as Parameters<typeof registerBacktestReport>[0]['report'],
       reportId: typeof body.reportId === 'string' ? body.reportId : 'unspecified',
       registeredBy: username,
+      evidenceUniverse: Array.isArray(body.evidenceUniverse) ? body.evidenceUniverse : undefined,
     });
     res.status(201).json(rec);
   } catch (err) {
@@ -14906,6 +14907,7 @@ app.post('/api/promotion/optimization', requireAuth, requireAdmin, async (req, r
       verdict: body.verdict as Parameters<typeof registerOptimizationVerdict>[0]['verdict'],
       reportId: typeof body.reportId === 'string' ? body.reportId : 'unspecified',
       registeredBy: username,
+      evidenceUniverse: Array.isArray(body.evidenceUniverse) ? body.evidenceUniverse : undefined,
     });
     res.status(201).json(rec);
   } catch (err) {
@@ -14947,6 +14949,7 @@ app.post('/api/promotion/accumulation-backtest', requireAuth, requireAdmin, asyn
       metrics: body.metrics as Parameters<typeof registerAccumulationBacktestVerdict>[0]['metrics'],
       reportId: typeof body.reportId === 'string' ? body.reportId : 'unspecified',
       registeredBy: username,
+      evidenceUniverse: Array.isArray(body.evidenceUniverse) ? body.evidenceUniverse : undefined,
     });
     res.status(201).json(rec);
   } catch (err) {
@@ -15004,6 +15007,8 @@ app.post('/api/promotion/signoff', requireAuth, requireAdmin, async (req, res) =
       paperMetrics,
       thresholdOverrides: overrides,
       rationale: typeof body.rationale === 'string' ? body.rationale : undefined,
+      evidenceUniverse: Array.isArray(body.evidenceUniverse) ? body.evidenceUniverse : undefined,
+      grantedUniverse: Array.isArray(body.grantedUniverse) ? body.grantedUniverse : undefined,
     });
     res.status(201).json({ ok: true, decision, status: await buildPromotionStatus(username, body.strategyId) });
   } catch (err) {

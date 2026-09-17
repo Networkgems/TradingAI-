@@ -368,9 +368,9 @@ function guardedRosterByAxis(
  *     never gated.
  *   • an unrelated edit that holds the same preset — ⊤ ⊆ ⊤ / list ⊆ itself, so no
  *     widening, never gated. The TRA-1590 hold-exposure exemption survives.
- *   • canary → majors — a widening, but `crypto_core_live_majors` IS ratified, so
- *     it is allowed. That is the TRA-1304 step-up ("on canary PASS the step-up is
- *     env-only, no code change and no re-gate"), preserved deliberately.
+ *   • canary → majors — a widening; allowed only when BOTH ratified AND covered by
+ *     the granted universe G (TRA-2392). Board ratification alone is not sufficient;
+ *     the Stage-1 evidence must cover the wider universe.
  *   • crypto axis OFF in the result — no live universe at all, nothing to widen.
  *
  * With no `previous` snapshot (the crypto-start path) the previous universe is
@@ -420,34 +420,52 @@ async function widenedBeyondRatifiedUniverse(
       continue;
     }
 
-    if (isRatified && !isCoveredByG) {
-      // TRA-3467 — allowed by board ratification, NOT by Stage-1 evidence.
-      // This is the canary->majors step-up case: ratified but not covered by G.
-      log.warn('crypto universe widening allowed by board ratification, NOT by Stage-1 evidence', {
-        strategyId,
-        nextPreset: nextPreset.id,
-        nextUniverse: nextUniverse === null ? 'unbounded' : nextUniverse.join(','),
-        grantedUniverse: grantedUniverse === null ? 'unbounded' : grantedUniverse?.join(',') ?? 'absent',
-      });
-    }
-
     const describe = (u: readonly string[] | null): string =>
       u === null
         ? 'the FULL Coinbase-tradable USD universe (≈395 pairs, unbounded — it grows with the catalog)'
         : u.length === 0
           ? 'nothing'
           : u.join(', ');
-    blocks.set(
-      strategyId,
-      `TRA-2348 — this save WIDENS the live symbol universe for '${strategyId}' from `
-        + `${describe(prevUniverse)} to ${describe(nextUniverse)} by selecting preset `
-        + `'${nextPreset.id}', which is not on the board-ratified live-crypto list `
-        + `(${LIVE_RATIFIED_CRYPTO_PRESETS.join(', ')}). A promotion sign-off is granted for a `
-        + 'UNIVERSE, not just a strategy id: QuantTrader\'s live-money sign-off is CONDITIONAL GO '
-        + 'on the OOS-validated majors and NO-GO on the full catalog (TRA-1304), so a majors or '
-        + 'canary sign-off does not carry over to a wider one. Narrowing back to a ratified preset '
-        + 'is never blocked, and turning live crypto OFF in this same save always succeeds.',
-    );
+
+    // AC2 — split the error message for !isRatified vs isRatified && !isCoveredByG
+    if (isRatified && !isCoveredByG) {
+      // TRA-3467 — REFUSED: preset is board-ratified but the widening is not covered by the granted universe
+      // AC3 — fix witness wording: this is a REFUSAL, not "allowed"
+      log.warn('crypto universe widening REFUSED: preset is board-ratified but Stage-1 evidence does not cover the widening', {
+        strategyId,
+        nextPreset: nextPreset.id,
+        nextUniverse: nextUniverse === null ? 'unbounded' : nextUniverse.join(','),
+        grantedUniverse: grantedUniverse === null ? 'unbounded' : grantedUniverse?.join(',') ?? 'absent',
+      });
+      const gDesc = grantedUniverse === null
+        ? 'unbounded'
+        : grantedUniverse === undefined
+          ? 'no granted universe on record'
+          : grantedUniverse.join(', ');
+      blocks.set(
+        strategyId,
+        `TRA-2392 — this save WIDENS the live symbol universe for '${strategyId}' from `
+          + `${describe(prevUniverse)} to ${describe(nextUniverse)} by selecting preset `
+          + `'${nextPreset.id}', which IS on the board-ratified live-crypto list `
+          + `(${LIVE_RATIFIED_CRYPTO_PRESETS.join(', ')}), but the Stage-1 evidence does not cover `
+          + `this universe. The granted universe on record is: ${gDesc}. A promotion sign-off is `
+          + 'granted for a UNIVERSE, not just a strategy id, so the widening requires additional '
+          + 'Stage-1 evidence covering the wider universe.',
+      );
+    } else {
+      // Not ratified at all
+      blocks.set(
+        strategyId,
+        `TRA-2348 — this save WIDENS the live symbol universe for '${strategyId}' from `
+          + `${describe(prevUniverse)} to ${describe(nextUniverse)} by selecting preset `
+          + `'${nextPreset.id}', which is not on the board-ratified live-crypto list `
+          + `(${LIVE_RATIFIED_CRYPTO_PRESETS.join(', ')}). A promotion sign-off is granted for a `
+          + 'UNIVERSE, not just a strategy id: QuantTrader\'s live-money sign-off is CONDITIONAL GO '
+          + 'on the OOS-validated majors and NO-GO on the full catalog (TRA-1304), so a majors or '
+          + 'canary sign-off does not carry over to a wider one. Narrowing back to a ratified preset '
+          + 'is never blocked, and turning live crypto OFF in this same save always succeeds.',
+      );
+    }
   }
   return blocks;
 }
