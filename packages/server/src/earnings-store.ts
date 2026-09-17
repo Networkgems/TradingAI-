@@ -122,6 +122,56 @@ export function earningsInDaysSync(symbol: string, asOf: number = Date.now()): n
   return daysFromRecord(cache.get(symbol.trim().toUpperCase()), asOf);
 }
 
+/**
+ * TRA-4642 (parent TRA-4413 item 1) — the readability-aware read. The plain
+ * `earningsInDaysSync` collapses FOUR worlds into one `null`: store never
+ * loaded, store loaded-but-never-refreshed (no FINNHUB token / refresh never
+ * ran), symbol genuinely without an upcoming event, and a stored date that has
+ * already passed. A consumer that must not launder a calendar outage into a
+ * clean "no earnings" pass (the TRA-4424 trap) needs the split.
+ *
+ * States:
+ *  - `unloaded`    — `initEarningsStore` has not run; the cache is dark.
+ *  - `unpopulated` — loaded but EMPTY. Read as an outage, not as "no name in
+ *    the universe has earnings": with a real symbol universe and the client's
+ *    fetch horizon, an empty store means the refresh never succeeded (token
+ *    missing, boot refresh failed). The conservative direction is unreadable.
+ *  - `uncovered`   — store has data; THIS symbol has no usable upcoming date
+ *    (absent, or the stored date passed and awaits the next refresh's prune).
+ *    This is the store's own "no earnings scheduled" semantics — identical to
+ *    what `earningsInDaysSync` hands the news-catalyst scorer today.
+ *  - `covered`     — an upcoming date exists; `days` is non-null.
+ *
+ * `days` is EXACTLY `earningsInDaysSync(symbol, asOf)` in every state, so a
+ * consumer routing this into `computeCatalystScore` consults the demoter on
+ * the same input the news-catalyst path would have.
+ */
+export type EarningsCalendarReadState = 'unloaded' | 'unpopulated' | 'covered' | 'uncovered';
+
+export interface EarningsCalendarRead {
+  state: EarningsCalendarReadState;
+  /** Days to next earnings; non-null iff `state === 'covered'`. */
+  days: number | null;
+  /** Symbols currently holding an upcoming date (0 when unloaded/unpopulated). */
+  coveredSymbols: number;
+}
+
+export function earningsCalendarReadSync(
+  symbol: string,
+  asOf: number = Date.now(),
+): EarningsCalendarRead {
+  if (!cache) return { state: 'unloaded', days: null, coveredSymbols: 0 };
+  if (cache.size === 0) return { state: 'unpopulated', days: null, coveredSymbols: 0 };
+  const days = daysFromRecord(cache.get(symbol.trim().toUpperCase()), asOf);
+  if (days === null) return { state: 'uncovered', days: null, coveredSymbols: cache.size };
+  return { state: 'covered', days, coveredSymbols: cache.size };
+}
+
+/** Store-level status for health surfaces (no per-symbol argument needed). */
+export function earningsStoreStatusSync(): { loaded: boolean; coveredSymbols: number } {
+  return { loaded: cache !== null, coveredSymbols: cache?.size ?? 0 };
+}
+
 function daysFromRecord(rec: EarningsRecord | undefined, asOf: number): number | null {
   if (!rec) return null;
   const d = daysUntil(rec.date, asOf);

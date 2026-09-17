@@ -207,6 +207,10 @@ import { otmDailySeriesHealth } from '../otm-daily-series.js';
 // TRA-4639 (parent TRA-4413 item A) — the underlying-confirmation shadow's
 // LIVE read (same explicit-env rule as `setupTaxonomyHealth` above).
 import { otmUnderlyingConfirmHealth } from '../otm-underlying-confirm.js';
+// TRA-4642 (parent TRA-4413 item 1) — the EARNINGS_IV_CRUSH_RISK demoter
+// shadow's LIVE read, plus the earnings-store status behind its codes.
+import { otmIvCrushDemoterHealth } from '../otm-iv-crush-demoter.js';
+import { earningsStoreStatusSync } from '../earnings-store.js';
 import { SETUP_TAXONOMY_REASON_CODES } from '@trading-app/engine';
 import {
   ENTRY_DELTA_CEILING_GATE,
@@ -6115,6 +6119,19 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
        * refuses nothing in any mode. Flag default OFF.
        */
       underlyingConfirm: otmUnderlyingConfirmHealth(liveEnv),
+      /**
+       * TRA-4642 (parent TRA-4413 item 1) — the news-catalyst
+       * EARNINGS_IV_CRUSH_RISK demoter, CONSULTED (not re-implemented) on the
+       * OTM CHAIN population — beside the contract floor, BEFORE the selector
+       * ranks. `books.*.evaluated` tracks the contract-floor chain-survey
+       * population call-for-call by construction (⚠️ SINCE-BOOT; the census
+       * cross-check identity is in the module header). Observe-only: refuses
+       * nothing in any mode; no enforce arm exists in the module. Flag
+       * default OFF. `ivcrush_calendar_unreadable` is the earnings FEED's
+       * defect and is never pooled with `ivcrush_no_earnings_scheduled` —
+       * the `calendar` sub-block here says which world produced a spike.
+       */
+      ivCrushDemoter: otmIvCrushDemoterHealth(earningsStoreStatusSync(), liveEnv),
       /**
        * TRA-4424 (parent TRA-4421, off TRA-4422 Finding 1) — THE DAILY-BAR
        * SOURCE feeding the seam above.

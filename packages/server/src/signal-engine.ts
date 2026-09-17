@@ -92,7 +92,7 @@ import { TickExitRegionMeter, classifyExitInterval, type TickExitRegionRthTerms 
 import { trySma200ScanSlot, releaseSma200ScanSlot, fetchSma200CandlesShared } from './sma200-scan-admission.js';
 import { resolveSma200PullbackMaxDistAtr, sma200VoidVerdict, sma200SweepVerdict, sma200SweepStarved, signalRingEvictionIndex, isSma200SignalType, type Sma200SweepVerdict } from './sma200-validity.js';
 import { getLatestReviewBlock } from './research-store.js';
-import { earningsInDaysSync } from './earnings-store.js';
+import { earningsInDaysSync, earningsCalendarReadSync } from './earnings-store.js';
 import {
   evaluateCatalystGate,
   resolveCatalystGateConfig,
@@ -260,6 +260,18 @@ import {
   isOtmUnderlyingConfirmShadowEnabled,
   recordOtmUnderlyingConfirm,
 } from './otm-underlying-confirm.js';
+// TRA-4642 (parent TRA-4413 item 1) — CONSULT the existing news-catalyst
+// EARNINGS_IV_CRUSH_RISK demoter on the OTM chain population, BEFORE the
+// selector ranks. Flag-gated (ENABLE_OTM_IV_CRUSH_DEMOTER_SHADOW, default
+// OFF), observe-only: it never refuses, so this import changes no capital
+// behaviour. The calendar read is `earningsCalendarReadSync` — same store,
+// same semantics as the `earningsInDaysSync` the news-catalyst path feeds
+// the demoter, plus the readability split the reason codes need.
+import {
+  evaluateOtmIvCrushDemoter,
+  isOtmIvCrushDemoterShadowEnabled,
+  recordOtmIvCrushDemoter,
+} from './otm-iv-crush-demoter.js';
 // TRA-4424 (parent TRA-4421, off TRA-4422 Finding 1) — THE DAILY-BAR SOURCE for
 // that seam. The taxonomy's setups are multi-day theses and the only series
 // previously reachable there was ~6.15 trading days of 5-minute bars, which
@@ -13110,6 +13122,35 @@ export class SignalEngine {
         const otmFloor = this.otmContractFloor();
         const otmFloorChain = applyOtmContractFloor(result.candidates, otmFloor);
         this.recordOtmContractFloorChainVerdict(sym, otmFloorChain);
+        // TRA-4642 (parent TRA-4413 item 1) — the EARNINGS_IV_CRUSH_RISK
+        // demoter consult, HERE and nowhere else: chain level, beside the
+        // contract floor and ABOVE both the floor's refusal `continue` and the
+        // selector, so (a) it is literally BEFORE ranking — demotion is a
+        // property of the UNDERLYING, and an enforce arm would remove the name
+        // before the ranker spends a nominee on it (the TRA-3401 shape); and
+        // (b) `evaluated` tracks the contract-floor chain-survey population
+        // call-for-call BY CONSTRUCTION — no second denominator minted. The
+        // demote decision is `computeCatalystScore`'s own (routed, not
+        // re-implemented) on the same `earningsInDaysSync` read the
+        // news-catalyst path feeds it. SHADOW: records, never refuses, in any
+        // mode. Flag default OFF; when dark this block is one boolean read.
+        if (isOtmIvCrushDemoterShadowEnabled()) {
+          const ivCrush = evaluateOtmIvCrushDemoter(sym, earningsCalendarReadSync(sym));
+          const ivCrushBook = this.mode === 'live' ? 'live' : 'demo';
+          const logWorthy = recordOtmIvCrushDemoter(ivCrushBook, ivCrush);
+          if (ivCrushBook === 'live' && logWorthy) {
+            // Only `ivcrush_demoted` / `ivcrush_calendar_unreadable`, braked
+            // hourly per symbol in the module — the counters carry the rest.
+            log.info('OTM IV-crush demoter shadow verdict (TRA-4642, observe-only)', {
+              sym,
+              code: ivCrush.code,
+              demoted: ivCrush.demoted,
+              earningsInDays: ivCrush.earningsInDays,
+              calendarState: ivCrush.calendarState,
+              tags: ivCrush.tags,
+            });
+          }
+        }
         if (otmFloorChain.refusalCode !== null) {
           log.info('OTM setup refused by contract floor (TRA-3944)', {
             sym,
