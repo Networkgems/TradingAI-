@@ -250,6 +250,16 @@ import {
   SETUP_TAXONOMY_DEFAULT_REFUSAL_CODE,
   type OtmSetupGateDecision,
 } from './otm-setup-gate.js';
+// TRA-4639 (parent TRA-4413 item A) — SHADOW evaluation of the two TRA-1028
+// underlying-confirmation archetypes (EMA pullback, volume breakout) on the
+// SAME nominee population the setup taxonomy scores. Flag-gated
+// (ENABLE_OTM_UNDERLYING_CONFIRM_SHADOW, default OFF), observe-only: it never
+// refuses, so this import changes no capital behaviour.
+import {
+  evaluateOtmUnderlyingConfirm,
+  isOtmUnderlyingConfirmShadowEnabled,
+  recordOtmUnderlyingConfirm,
+} from './otm-underlying-confirm.js';
 // TRA-4424 (parent TRA-4421, off TRA-4422 Finding 1) — THE DAILY-BAR SOURCE for
 // that seam. The taxonomy's setups are multi-day theses and the only series
 // previously reachable there was ~6.15 trading days of 5-minute bars, which
@@ -8374,6 +8384,37 @@ export class SignalEngine {
       reasonCode: decision.verdict.reasonCode,
       confirmed: decision.verdict.confirmed,
     });
+    // TRA-4639 (parent TRA-4413 item A) — the underlying-confirmation SHADOW,
+    // HERE and nowhere else, so its `evaluated` denominator is the
+    // `setup_confirmation` nominee population call-for-call BY CONSTRUCTION
+    // (the issue's "don't mint a second denominator" requirement). Same daily
+    // bars, same nominee, same placement above `entry_window` — which is safe
+    // only because this records and never refuses. BOTH books are counted
+    // (keyed apart in the module): demo is the cheap wiring check, live is the
+    // population the measurement is about. Flag default OFF; when dark this
+    // whole block is one boolean read on the sweep path.
+    if (isOtmUnderlyingConfirmShadowEnabled()) {
+      const confirm = evaluateOtmUnderlyingConfirm(
+        sym,
+        nomineeSide,
+        daily.bars,
+        daily.state === 'fresh',
+      );
+      const confirmBook = this.mode === 'live' ? 'live' : 'demo';
+      recordOtmUnderlyingConfirm(confirmBook, confirm);
+      if (confirmBook === 'live') {
+        log.info('OTM underlying-confirm shadow verdict (TRA-4639, observe-only)', {
+          sym,
+          side: nomineeSide,
+          emaCode: confirm.ema.code,
+          vbCode: confirm.volume.code,
+          emaConfirmed: confirm.ema.confirmed,
+          volumeConfirmed: confirm.volume.confirmed,
+          bars: confirm.bars,
+          dailyReadState: daily.state,
+        });
+      }
+    }
     if (this.mode === 'live') {
       recordLiveEnforceDecision(
         'setup_confirmation',

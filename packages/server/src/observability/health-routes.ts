@@ -204,6 +204,9 @@ import {
 // seam above reads. Its counters are what keep "the daily feed is dead" from
 // publishing the same histogram as "the market was quiet".
 import { otmDailySeriesHealth } from '../otm-daily-series.js';
+// TRA-4639 (parent TRA-4413 item A) — the underlying-confirmation shadow's
+// LIVE read (same explicit-env rule as `setupTaxonomyHealth` above).
+import { otmUnderlyingConfirmHealth } from '../otm-underlying-confirm.js';
 import { SETUP_TAXONOMY_REASON_CODES } from '@trading-app/engine';
 import {
   ENTRY_DELTA_CEILING_GATE,
@@ -6101,6 +6104,17 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
                   + 'enforce flip has not happened if you are reading this.',
         };
       })(),
+      /**
+       * TRA-4639 (parent TRA-4413 item A) — the underlying-confirmation SHADOW.
+       * The two TRA-1028 archetypes (EMA pullback, volume-confirmed breakout)
+       * scored on the SAME nominee population as `setupTaxonomy` above — the
+       * call site is inside the same seam, so `books.live.evaluated` tracks
+       * `setup_confirmation.evaluated` call-for-call over this process's own
+       * rows (⚠️ these counters are SINCE-BOOT and the ledger is disk-hydrated;
+       * compare only when `crossCheck.comparable` above is true). Observe-only:
+       * refuses nothing in any mode. Flag default OFF.
+       */
+      underlyingConfirm: otmUnderlyingConfirmHealth(liveEnv),
       /**
        * TRA-4424 (parent TRA-4421, off TRA-4422 Finding 1) — THE DAILY-BAR
        * SOURCE feeding the seam above.
