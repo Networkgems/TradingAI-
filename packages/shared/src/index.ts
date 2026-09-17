@@ -1054,17 +1054,57 @@ export function isSymbolUniverseSubset(
  * OOS-validated liquid majors and NO-GO on `crypto_core`'s ≈395-pair universe.
  * With a universe-blind promotion record, a majors sign-off would grandfather a
  * 395-pair roster the moment the preset is swapped — the roster delta is empty
- * ({dca} → {dca}), so nothing else in the gate can see it.
+ * ({dca} → {dca}), so nothing else in the promotion machinery can see it.
  *
- * Until the promotion record itself carries the universe it was granted for
- * (the durable fix; see the TRA-2348 thread), this list IS the record. Adding an
- * id here is a real-money authorization and requires the same sign-off TRA-1304
- * carried — it is intentionally a code change, not an env var, so it lands with
- * a diff, a reviewer, and a commit message.
+ * THE PERMANENT RULE (TRA-2386 ruling Q2, carried here by TRA-2393/TRA-2609).
+ * `crypto_core`'s exclusion is a THEOREM of the evidence model, not a policy
+ * choice that a future board could revisit. Its `symbolFilter: null` is the ⊤
+ * universe — sourced at runtime from the live Coinbase product catalog,
+ * unbounded, and growing as the catalog grows. A ratification of ⊤ can never be
+ * discharged by any validation: the evidence universe E is finite by
+ * construction, and ⊤ ⊄ E for every finite E — the set contains listings that
+ * do not exist yet and therefore cannot have been tested. So ⊤ is unreachable
+ * as a grant, PERMANENTLY.
+ *
+ * WHAT IS *NOT* PERMANENT — the majors pin. QuantTrader's TRA-1304 sign-off
+ * (comment `26f71bb9`) contemplates expansion verbatim: "First live window: no
+ * cap increases, majors only, for >= 30 days of live fills, then a fresh
+ * sign-off before any expansion (wider universe or higher per-name cap)."
+ *
+ * HOW THE TWO RECONCILE. An expansion is legitimate; re-pointing at
+ * `crypto_core` is not. Any wider live universe lands as a NEW, FINITE,
+ * ENUMERATED preset (e.g. `crypto_core_live_majors_plus`) with its own OOS
+ * coverage and its own fresh sign-off — never by widening an existing preset's
+ * `symbolFilter` to `null`.
+ *
+ * ELIGIBILITY RULE for this list, stated outright: every entry must resolve to
+ * a finite, enumerated universe for every strategy it enables.
+ * `symbolFilter: null` is categorically ineligible. `ratified-universe.test.ts`
+ * asserts both the categorical rule and the resolved-universe property — they
+ * are genuinely different rules; the comment there says why.
+ *
+ * STATUS OF THIS RECORD. This constant is the interim record of a decision the
+ * promotion store cannot yet hold (the durable fix — a promotion record that
+ * carries the universe it was granted for — is tracked on the TRA-2348 thread).
+ * As measured on 2026-07-26 the `dca` promotion record held ZERO
+ * `promotion_decision` rows, so this list is the ONLY machine-readable trace of
+ * TRA-1304's CONDITIONAL GO anywhere in the system. Adding an id here is a
+ * real-money authorization and requires the same sign-off TRA-1304 carried —
+ * it is intentionally a code change, not an env var, so it lands with a diff,
+ * a reviewer, and a commit message.
+ *
+ * ⚠ NO RUNTIME READER as of `9a2ccba2` (TRA-4629, 2026-09-17): the crypto
+ * engine and the promotion-gate axis that consumed this list
+ * (`widenedBeyondRatifiedUniverse` in promotion-service.ts) were deleted. This
+ * is a PRESERVED AUTHORIZATION RECORD awaiting the crypto engine's return, NOT
+ * an active control — nothing enforces it at runtime today. Do not read
+ * membership here as enforcement; until a gate consumes it again, the only
+ * guard is `ratified-universe.test.ts`, which fails an ineligible entry at the
+ * diff instead of at a live order.
  *
  * NOT a list of "safe presets" in general: `no_trade` is absent because it needs
- * no authorization (it trades nothing) and is reached only by paths this gate
- * already treats as de-escalations.
+ * no authorization (it trades nothing), and a move onto it is a narrowing —
+ * a de-escalation needing no grant.
  */
 export const LIVE_RATIFIED_CRYPTO_PRESETS: readonly StrategyPresetId[] = [
   'crypto_core_live_majors', // TRA-1304 CONDITIONAL GO — BTC-USD / ETH-USD / SOL-USD
