@@ -207,6 +207,61 @@ describe('TRA-2392 — symbol universe promotion gates', () => {
         expect(reasons).toMatch(/IS on the board-ratified live-crypto list/);
         expect(reasons).toMatch(/Stage-1 evidence does not cover/);
       });
+
+      // TRA-4648 — the measured probe, inverted. Pre-fix, recordSignoff gated
+      // G ⊆ E only on the SAME-CALL evidenceUniverse: omitting the key appended
+      // an arbitrary grant unchecked, and evaluateLiveTransitionGate then read
+      // allowed=true off it (canary→majors approved on BTC-only evidence).
+      // Order note: the refusal appends NOTHING and the defaults case below
+      // appends G={BTC-USD} — the same latest-G case 2 left — so the file's
+      // decision walk (no-record → {BTC-USD} → majors) is unchanged.
+      it('TRA-4648: grant with E OMITTED is validated against the Stage-1 record E and REFUSED', async () => {
+        // Stage 1 re-registers carrying the evidence universe a real DCA run
+        // stamps (the beforeAll registration predates the universe fields).
+        await store.registerAccumulationBacktestVerdict({
+          strategyId: 'dca',
+          metrics: passingAccumBacktestMetrics(),
+          reportId: 'TRA-4648-record-E',
+          registeredBy: 'qt',
+          evidenceUniverse: ['BTC-USD'],
+        });
+        const probe = async () =>
+          store.recordSignoff({
+            strategyId: 'dca',
+            reviewer: 'QuantTrader',
+            backtestMetrics: null,
+            paperMetrics: await svc.snapshotPaperMetrics(USER, 'dca'),
+            grantedUniverse: ['BTC-USD', 'ETH-USD', 'SOL-USD'], // E omitted
+          });
+        // AC2 rides on the class: POST /api/promotion/signoff maps
+        // PromotionValidationError → 400, so the route surfaces this as a 4xx.
+        await expect(probe()).rejects.toThrow(store.PromotionValidationError);
+        // …and the message names BOTH universes (the record-E, not "undefined").
+        await expect(probe()).rejects.toThrow(
+          /grantedUniverse \[BTC-USD, ETH-USD, SOL-USD\] is not a subset of evidenceUniverse \[BTC-USD\]/,
+        );
+        // Step 3 of the probe is unreachable: the unchecked grant never landed,
+        // so the REAL gate still refuses the widening (latest G is case 2's).
+        const gate = await svc.evaluateLiveTransitionGate(
+          USER,
+          cryptoLiveOn('crypto_core_live_majors'),
+          cryptoLiveOn('crypto_core_live_canary_btc'),
+        );
+        expect(gate.allowed).toBe(false);
+        expect(gate.blocked.map(b => b.strategyId)).toEqual(['dca']);
+      });
+
+      it('TRA-4648: sign-off with BOTH universes omitted defaults G to the record E, not undefined', async () => {
+        const d = await store.recordSignoff({
+          strategyId: 'dca',
+          reviewer: 'QuantTrader',
+          backtestMetrics: null,
+          paperMetrics: await svc.snapshotPaperMetrics(USER, 'dca'),
+        });
+        // The decision records the EFFECTIVE universes it was validated under.
+        expect(d.evidenceUniverse).toEqual(['BTC-USD']);
+        expect(d.grantedUniverse).toEqual(['BTC-USD']);
+      });
     });
 
     describe('MUST STILL PASS (regression guards — TRA-1590 deadlock)', () => {

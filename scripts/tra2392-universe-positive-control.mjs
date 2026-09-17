@@ -23,13 +23,23 @@ const SHARED_SRC = 'packages/shared/src/symbol-universe.ts';
 const SHARED_DIST = 'packages/shared/dist/symbol-universe.js';
 const SERVICE_SRC = 'packages/server/src/promotion-service.ts';
 const SERVICE_DIST = 'packages/server/dist/promotion-service.js';
+const STORE_SRC = 'packages/server/src/promotion-store.ts';
+const STORE_DIST = 'packages/server/dist/promotion-store.js';
 
-function exec(cmd) {
+function exec(cmd, opts = {}) {
   try {
-    return execSync(cmd, { encoding: 'utf-8', stdio: 'pipe' });
+    return execSync(cmd, { encoding: 'utf-8', stdio: 'pipe', ...opts });
   } catch (e) {
     return e.stdout;
   }
+}
+
+// TRA-4648 — grade via vitest in packages/server directly, NOT the root
+// `npm test`: the root pretest chain runs repo-wide selftests that can be (and
+// on 2026-09-17 are, TRA-3744/calendar-coverage) red on code this control never
+// touches, which fails the baseline and makes the control ungradeable.
+function runPromotionTests(file) {
+  return exec(`npx vitest run ${file}`, { cwd: 'packages/server' });
 }
 
 function rebuildShared() {
@@ -53,7 +63,7 @@ function assertMarkerInDist(marker) {
 }
 
 function runTests() {
-  const out = exec('npm test -- promotion-universe.test');
+  const out = runPromotionTests('promotion-universe.test');
   return {
     passed: out.includes('passed'),
     failed: out.includes('failed'),
@@ -145,7 +155,7 @@ if (!serviceDist.includes('PERTURBED3')) {
 console.log('✓ Marker "PERTURBED3" found in dist');
 
 // Run the full promotion-service.test suite (not just promotion-universe.test)
-const serviceResult = exec('npm test -- promotion-service.test');
+const serviceResult = runPromotionTests('promotion-service.test');
 if (serviceResult.includes('passed') && !serviceResult.includes('failed')) {
   console.error('BLIND: Tests passed with G conjunct disabled. They do not grade the real gate.');
   writeFileSync(SERVICE_SRC, serviceOriginal);
@@ -153,10 +163,53 @@ if (serviceResult.includes('passed') && !serviceResult.includes('failed')) {
 }
 console.log('✓ Perturbation 3 correctly FAILED\n');
 
-// Final restore and pass
+// Restore service before perturbing the store
 writeFileSync(SERVICE_SRC, serviceOriginal);
 rebuildServer();
-const finalResult = exec('npm test -- promotion-service.test');
+
+// Perturbation 4 (TRA-4648): remove the record-E fallback in recordSignoff, so
+// G ⊆ E is once again gated only on the SAME-CALL evidenceUniverse — the exact
+// defect TRA-4648 measured (omit E ⇒ arbitrary grant accepted ⇒ canary→majors
+// allowed on BTC-only evidence). The AC1 test must go red: with the fallback
+// gone, an omitted-E grant hits the fail-closed refusal (a DIFFERENT message
+// than the subset refusal the test asserts) and the omitted-both default lands
+// G=undefined instead of the record E.
+console.log('5. Perturbation 4: record-E fallback removed (same-call E only)...');
+const storeOriginal = readFileSync(STORE_SRC, 'utf-8');
+const FALLBACK_LINE =
+  'const evidenceUniverse = args.evidenceUniverse ?? rec.backtest?.evidenceUniverse ?? undefined;';
+if (!storeOriginal.includes(FALLBACK_LINE)) {
+  console.error('BLIND: the record-E fallback line was not found in promotion-store.ts.');
+  console.error('The control no longer matches the code — fix the control, not the tests.');
+  process.exit(2);
+}
+const perturbed4 = storeOriginal.replace(
+  FALLBACK_LINE,
+  'const evidenceUniverse = args.evidenceUniverse ?? undefined; // PERTURBED4 - record-E fallback removed'
+);
+writeFileSync(STORE_SRC, perturbed4);
+rebuildServer();
+const storeDist = readFileSync(STORE_DIST, 'utf-8');
+if (!storeDist.includes('PERTURBED4')) {
+  console.error(`BLIND: marker "PERTURBED4" not found in ${STORE_DIST}`);
+  console.error('The perturbation did not reach dist. Tests are grading the old code.');
+  writeFileSync(STORE_SRC, storeOriginal);
+  process.exit(2);
+}
+console.log('✓ Marker "PERTURBED4" found in dist');
+
+result = runTests();
+if (result.passed && !result.failed) {
+  console.error('BLIND: Tests passed with the record-E fallback removed. They do not discriminate.');
+  writeFileSync(STORE_SRC, storeOriginal);
+  process.exit(2);
+}
+console.log('✓ Perturbation 4 correctly FAILED\n');
+
+// Final restore and pass
+writeFileSync(STORE_SRC, storeOriginal);
+rebuildServer();
+const finalResult = runPromotionTests('promotion-service.test');
 if (!finalResult.includes('passed')) {
   console.error('FAIL: Tests failed after final restore. The control broke something.');
   process.exit(1);
