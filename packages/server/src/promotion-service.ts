@@ -377,12 +377,12 @@ function guardedRosterByAxis(
  * EMPTY, so any live universe reads as a widening and must be ratified — the same
  * fail-closed posture the rest of the gate takes on that path.
  */
-function widenedBeyondRatifiedUniverse(
+async function widenedBeyondRatifiedUniverse(
   updated: AccountSettings,
   previous: AccountSettings | undefined,
   next: { crypto: boolean },
   prev: { crypto: boolean },
-): Map<string, string> {
+): Promise<Map<string, string>> {
   const blocks = new Map<string, string>();
   if (!next.crypto) return blocks;
 
@@ -400,7 +400,36 @@ function widenedBeyondRatifiedUniverse(
       ? resolveStrategySymbolUniverse(prevPreset, strategyId as CryptoStrategyType)
       : [];
     if (isSymbolUniverseSubset(nextUniverse, prevUniverse)) continue;
-    if (LIVE_RATIFIED_CRYPTO_PRESETS.includes(nextPreset.id)) continue;
+
+    // TRA-2392 — A widening is allowed only when BOTH ratified AND covered by
+    // the granted universe G. Check both conditions:
+    const isRatified = LIVE_RATIFIED_CRYPTO_PRESETS.includes(nextPreset.id);
+
+    // Look up the granted universe from the promotion decision
+    const record = await getStrategyRecord(strategyId);
+    const latestDecision = record?.decisions?.[record.decisions.length - 1];
+    const grantedUniverse = latestDecision?.grantedUniverse;
+
+    // Absent G is UNSATISFIED (fail-closed), not vacuously true
+    const isCoveredByG = grantedUniverse !== undefined
+      ? isSymbolUniverseSubset(nextUniverse, grantedUniverse)
+      : false;
+
+    if (isRatified && isCoveredByG) {
+      // Allowed by both conditions
+      continue;
+    }
+
+    if (isRatified && !isCoveredByG) {
+      // TRA-3467 — allowed by board ratification, NOT by Stage-1 evidence.
+      // This is the canary->majors step-up case: ratified but not covered by G.
+      log.warn('crypto universe widening allowed by board ratification, NOT by Stage-1 evidence', {
+        strategyId,
+        nextPreset: nextPreset.id,
+        nextUniverse: nextUniverse === null ? 'unbounded' : nextUniverse.join(','),
+        grantedUniverse: grantedUniverse === null ? 'unbounded' : grantedUniverse?.join(',') ?? 'absent',
+      });
+    }
 
     const describe = (u: readonly string[] | null): string =>
       u === null
@@ -595,7 +624,7 @@ export async function evaluateLiveTransitionGate(
   // BEFORE the `strategies.length === 0` early return on purpose: the defect it
   // closes produces an EMPTY roster delta by construction ({dca} → {dca}), so a
   // check placed after that return could never fire.
-  const universeBlocks = widenedBeyondRatifiedUniverse(updated, previous, next, prev);
+  const universeBlocks = await widenedBeyondRatifiedUniverse(updated, previous, next, prev);
 
   const blocked: Array<{ strategyId: string; reasons: string[] }> = emptyRosterAxes.map(e => ({
     strategyId: `(${e.axis})`,
