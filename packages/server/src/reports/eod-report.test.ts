@@ -612,6 +612,22 @@ describe('generateEodReport — TRA-594 calendar aggregation', () => {
     expect(onUtc16.realizedPnl).toBe(0);
   });
 
+  // TRA-4674 — a bull_put is multi-leg, so the crossed re-pricing declines it:
+  // null sums (never 0) with the row named in the census.
+  const noCrossedCells = () => ({
+    priced: 0,
+    unpriced: 1,
+    unpricedReasons: { structure_not_crossable: 1 as number },
+    crossedPnlUsd: null,
+    bookedPnlUsdPriced: null,
+    spreadDragUsd: null,
+    avgCrossedR: null,
+    crossedRSampled: 0,
+    win: 0,
+    loss: 0,
+    flat: 0,
+  });
+
   /** One closed bull_put winner — the minimum that renders the journal section. */
   const journalSummaryFixture = (): OptionTradeJournalSummary => ({
     total: 2,
@@ -624,7 +640,7 @@ describe('generateEodReport — TRA-594 calendar aggregation', () => {
     realizedPnlUsd: 320,
     avgR: 1,
     byStructure: [
-      { structure: 'bull_put', closed: 1, realizedPnlUsd: 320, winRate: 1, avgR: 1 },
+      { structure: 'bull_put', closed: 1, realizedPnlUsd: 320, winRate: 1, avgR: 1, crossed: noCrossedCells() },
     ],
     byArchetype: [],
     byExitReason: [],
@@ -640,6 +656,11 @@ describe('generateEodReport — TRA-594 calendar aggregation', () => {
       avgExitSlippageR: null,
       avgRoundTripCostR: null,
       totalSlippageUsd: 0,
+    },
+    crossed: noCrossedCells(),
+    spreads: {
+      entry: { sampled: 0, mean: null, median: null, min: null, max: null },
+      exit: { sampled: 0, mean: null, median: null, min: null, max: null },
     },
   });
 

@@ -326,6 +326,9 @@ import {
   type OptionTradeJournalRecord,
   type OptionTradeJournalExitReasonStat,
 } from '../option-trade-journal.js';
+// TRA-4674 — per-row crossed (ask→bid) re-pricing for the `?rows=` dump. Pure,
+// read-time-only, computed from quotes the row already carries.
+import { priceCrossedRow, type CrossedRowPricing } from '../option-crossed-pnl.js';
 // TRA-3715 — the accountClass × structure × entryArchetype grading surface, its
 // strategy-vs-harness exit table, and the ET-session close window. See
 // `option-journal-sleeve-cells.ts` for why none of that could be read off the
@@ -2055,7 +2058,7 @@ export function summarizeOptionsPipeline(
 export type OptionJournalDumpRow = OptionTradeJournalRecord & {
   accountClass: SpreadCeilingAccountClass;
   closeEtDay: string | null;
-};
+} & CrossedRowPricing; // TRA-4674 — crossedPnlUsd / crossedR / crossedUnpriced, null-not-0
 
 export interface OptionJournalReport {
   ok: true;
@@ -3536,6 +3539,9 @@ export function buildOptionJournalReport(
     ...r,
     accountClass: classifySpreadCeilingAccount(r.account),
     closeEtDay: rowCloseEtDay(r),
+    // TRA-4674 — the row at the cross (pay the ask, sell the bid), beside its
+    // booked realizedPnlUsd. `null` + a named reason when unpriceable — never 0.
+    ...priceCrossedRow(r),
   }));
   return {
     ok: true,
