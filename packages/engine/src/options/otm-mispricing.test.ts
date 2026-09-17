@@ -344,3 +344,96 @@ describe('TRA-2917 — PAVA monotone repair of the theo surface', () => {
     }
   });
 });
+
+describe('TRA-4628 — admission tap records admitted AND refused candidates', () => {
+  const tapChain = (chain: OptionChainRow[], opts: Parameters<typeof findMispricedOtmContracts>[2] = {}) => {
+    const decisions: import('./otm-mispricing.js').OtmAdmissionDecision[] = [];
+    const result = findMispricedOtmContracts(chain, SPOT, {
+      now: NOW,
+      ...opts,
+      onAdmission: (d) => decisions.push(d),
+    });
+    return { decisions, result };
+  };
+
+  it('emits one admitted decision per returned candidate, bindingReason none', () => {
+    const chain = [liquidRow(110, 'call', 0.3), liquidRow(105, 'call', 0), liquidRow(90, 'put', 0)];
+    const { decisions, result } = tapChain(chain);
+    const admitted = decisions.filter((d) => d.admitted);
+    expect(admitted).toHaveLength(result.length);
+    expect(admitted.every((d) => d.bindingReason === 'none')).toBe(true);
+    expect(admitted.every((d) => typeof d.absDelta === 'number')).toBe(true);
+  });
+
+  it('emits a min_mark refusal that still carries both sweep axes (mark AND spreadPct)', () => {
+    const cheap = liquidRow(115, 'call', 0, { bid: 0.02, ask: 0.04 }); // mark 0.03 < 0.05 floor
+    const { decisions, result } = tapChain([cheap]);
+    expect(result).toHaveLength(0);
+    expect(decisions).toHaveLength(1);
+    const d = decisions[0];
+    expect(d.admitted).toBe(false);
+    expect(d.bindingReason).toBe('min_mark');
+    expect(d.mark).toBeCloseTo(0.03, 10);
+    expect(d.spreadPct).toBeCloseTo(0.02 / 0.03, 10);
+    expect(d.absDelta).toBeUndefined(); // refused before the greeks stage
+  });
+
+  it('records the FIRST binding gate: cheap-and-wide reads min_mark, never max_spread_pct', () => {
+    const cheapAndWide = liquidRow(115, 'call', 0, { bid: 0.01, ask: 0.04 }); // mark 0.025, spread 120%
+    const { decisions } = tapChain([cheapAndWide]);
+    expect(decisions[0].bindingReason).toBe('min_mark');
+  });
+
+  it('emits max_spread_pct and min_open_interest refusals', () => {
+    const wide = liquidRow(110, 'call', 0, { bid: 1.0, ask: 1.5 }); // spread 40%
+    const thin = liquidRow(112, 'call', 0, { openInterest: 5 });
+    const { decisions } = tapChain([wide, thin]);
+    const byOcc = new Map(decisions.map((d) => [d.occSymbol, d]));
+    expect(byOcc.get(wide.optionSymbol)!.bindingReason).toBe('max_spread_pct');
+    expect(byOcc.get(thin.optionSymbol)!.bindingReason).toBe('min_open_interest');
+  });
+
+  it('emits min_abs_delta with the measured absDelta when the floor binds', () => {
+    const farOtm = liquidRow(140, 'call', 0);
+    const { decisions, result } = tapChain([farOtm], { minAbsDelta: 0.4 });
+    expect(result).toHaveLength(0);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0].bindingReason).toBe('min_abs_delta');
+    expect(decisions[0].absDelta).toBeGreaterThan(0);
+    expect(decisions[0].absDelta!).toBeLessThan(0.4);
+  });
+
+  it('emits no_iv when neither smvVol nor a smoothable neighbour midIv exists', () => {
+    const noIv = liquidRow(110, 'call', 0, { smvVol: undefined, midIv: undefined });
+    const { decisions } = tapChain([noIv]);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0].bindingReason).toBe('no_iv');
+  });
+
+  it('does NOT emit for structurally-out-of-population rows (ITM, no usable quote)', () => {
+    const itm = liquidRow(90, 'call', 0);
+    const noQuote = liquidRow(110, 'call', 0, { bid: 0, ask: 0 });
+    const { decisions } = tapChain([itm, noQuote]);
+    expect(decisions).toHaveLength(0);
+  });
+
+  it('is behaviour-neutral: identical candidates with and without the tap', () => {
+    const chain = [
+      liquidRow(110, 'call', 0.3),
+      liquidRow(105, 'call', 0),
+      liquidRow(115, 'call', 0, { bid: 0.02, ask: 0.04 }),
+      liquidRow(112, 'call', 0, { openInterest: 5 }),
+      liquidRow(90, 'put', -0.25),
+    ];
+    const without = findMispricedOtmContracts(chain, SPOT, { now: NOW });
+    const { result: withTap } = tapChain(chain);
+    expect(withTap).toEqual(without);
+  });
+
+  it('uses the same (bid+ask)/2 mid convention as the returned candidate (TRA-1656 axis match)', () => {
+    const chain = [liquidRow(110, 'call', 0.3)];
+    const { decisions, result } = tapChain(chain);
+    expect(decisions[0].mark).toBe(result[0].mark);
+    expect(decisions[0].spreadPct).toBe(result[0].spreadPct);
+  });
+});

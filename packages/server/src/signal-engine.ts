@@ -210,6 +210,14 @@ import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarl
 import { buildRvExitParams } from './rv-exit-params.js';
 // TRA-3401 — nominate an OTM strike inside the band the cost bar can admit.
 import { selectAdmissibleOtmCandidate, isOtmAdmissibleStrikeEnabled, resolveAdmissibleBand } from './otm-admissible-strike.js';
+// TRA-4628 — observe-only candidate-admission tape (admitted AND refused, with
+// the first binding gate) so the TRA-4623 pre-registered minMark rule gets the
+// denominator it names instead of the journal's survivorship population.
+import {
+  beginOtmAdmissionPass,
+  recordOtmAdmissionOrdered,
+  recordOtmAdmissionRanked,
+} from './otm-admission-tape.js';
 // TRA-3942 — WHEN the OTM sleeve may open. Entry-side only; nothing on any exit
 // path imports this module and that is load-bearing (see its header).
 import {
@@ -13029,12 +13037,28 @@ export class SignalEngine {
       // against symbols the next pass will walk again.
       scanRun.enterSymbol();
       try {
-        const result = await this.rvScanner!.scanOtm(sym, otmScanOpts, dtePrefs);
+        // TRA-4628 — observe-only admission tape. `beginOtmAdmissionPass` is a
+        // pass-level throttle (null = untaped pass, scan proceeds byte-identical);
+        // the engine tap only OBSERVES the gate verdicts the scanner already
+        // computes — no selection parameter and no admission behaviour changes.
+        const admissionPass = beginOtmAdmissionPass({
+          symbol: sym,
+          book: this.alertUsername,
+          mode: this.mode,
+        });
+        const result = await this.rvScanner!.scanOtm(
+          sym,
+          admissionPass ? { ...otmScanOpts, onAdmission: admissionPass.onAdmission } : otmScanOpts,
+          dtePrefs,
+        );
         // A usable chain came back, so the market-data leg is healthy as of now.
         // This is what lets `dataSource.lastFetchOkAt` separate a dead feed from
         // a quiet tape on the OTM axis specifically.
         if (result.reason === 'ok') {
           scanRun.fetchOk();
+          // TRA-4628 — commit only on 'ok': an abandoned pass (breaker/no chain)
+          // writes nothing and does not consume the throttle slot.
+          admissionPass?.commit();
           // TRA-4413 item 4 — same flag-gated term-structure SHADOW capture as
           // the RV loop. Wired HERE too because this is the path that actually
           // runs in prod (RV_ENGINE_ENABLED default-off retires the RV loop);
@@ -13168,6 +13192,12 @@ export class SignalEngine {
           }
           continue;
         }
+        // TRA-4628 — the nominee link, NEVER throttled (one row per pick): this
+        // is what lets the admission-vs-ranker split be measured directly.
+        recordOtmAdmissionRanked(
+          { symbol: sym, book: this.alertUsername, mode: this.mode },
+          cheap.optionSymbol,
+        );
         // TRA-3510 — the nominator branch, stamped on EVERY live gate verdict
         // below rather than only logged. The `log.info` under it reaches an
         // operator tailing Render; it reaches no endpoint, so until now no fold
@@ -14226,6 +14256,12 @@ export class SignalEngine {
           // would report opens the book does not hold (the directional path's
           // TRA-2193 rule, and it matters more here: this is the real-money site).
           scanRun.opened();
+          // TRA-4628 — the ordered link, at the FINAL point only (same TRA-2193
+          // rule): a rolled-back open must not read as ordered on the tape.
+          recordOtmAdmissionOrdered(
+            { symbol: sym, book: this.alertUsername, mode: this.mode },
+            cheap.optionSymbol,
+          );
           this.emitOptionFillAlert(openedLive);
           signal.mode = 'live';
           this.pushRecentSignal(signal);
@@ -14304,6 +14340,12 @@ export class SignalEngine {
         // carry no invalidation level would report a stop the live book has.
         await this.stampOtmAtrInvalidation(opened);
         scanRun.opened();
+        // TRA-4628 — the ordered link on the demo/paper book (classes are split
+        // by accountClass on the tape, never pooled).
+        recordOtmAdmissionOrdered(
+          { symbol: sym, book: this.alertUsername, mode: this.mode },
+          cheap.optionSymbol,
+        );
         this.recordChurnOpen(signal.symbol, 'option'); // TRA-1408 per-name same-session churn counter
         // TRA-1662 — shadow the maker chase this demo open did NOT route.
         this.beginShadowMakerChase('single_leg_otm', signal, opened);

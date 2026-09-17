@@ -142,6 +142,9 @@ import { summarizeCostAwareGate } from '../cost-aware-gate-ledger.js';
 // quiet" and "never armed" can never render identically.
 import { summarizeExplorationAllowance } from '../directional-exploration-allowance.js';
 import { summarizeLiveEnforceGate } from '../live-enforce-gate-ledger.js'; // TRA-2048
+// TRA-4628 — the OTM candidate-admission tape (admitted AND refused scanner
+// candidates), the real denominator for the TRA-4623 pre-registered minMark rule.
+import { readOtmAdmissionTapeRows, summarizeOtmAdmissionTape } from '../otm-admission-tape.js';
 import { gradeCanaryCeilingHealth } from '../canary-ceiling.js'; // TRA-3836
 // TRA-3979 — fleet concentration. ADVISORY: no order site consults it.
 import { gradeFleetConcentration, type FleetConcentrationBookRow } from '../fleet-concentration.js';
@@ -6966,6 +6969,63 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       }
     });
   }
+
+  // TRA-4628 (parent TRA-4621, ruling TRA-4623) — the OTM candidate-ADMISSION
+  // tape: admitted AND refused `single_leg_otm` scanner candidates with the
+  // FIRST binding gate (`min_mark` / `max_spread_pct` / `min_open_interest` /
+  // `min_abs_delta` / …/ `none`), split by accountClass (classes NEVER pooled —
+  // TRA-3715/TRA-3682/TRA-3709). This is the denominator the pre-registered
+  // minMark rule actually names; the journal population downstream of the
+  // ranker + capital gate is a survivorship statistic (the TRA-4623 ruling).
+  //
+  // `mark`/`spreadPct` on every row use the scanner's (bid+ask)/2 mid — the
+  // TRA-1656 entry-stamp convention — so the tape's axes match the journal's.
+  //
+  // Query: `?day=YYYY-MM-DD&class=desk&rows=5000` streams raw rows (capped);
+  // omit `rows` for the summary alone. Row fields are OPTIONAL on the read
+  // side: a row written by an older build genuinely lacks newer fields.
+  //
+  // Observe-only: the trading path never reads this tape, and serving it never
+  // routes an order or moves a parameter.
+  app.get('/api/health/otm-admission-tape', async (req, res) => {
+    const nowMs = now();
+    try {
+      const summary = summarizeOtmAdmissionTape();
+      const wantRows = typeof req.query.rows === 'string' && req.query.rows !== '';
+      let rows: Awaited<ReturnType<typeof readOtmAdmissionTapeRows>> | undefined;
+      if (wantRows) {
+        const limitRaw = Number(req.query.rows);
+        rows = await readOtmAdmissionTapeRows({
+          ...(typeof req.query.day === 'string' && req.query.day !== '' ? { etDay: req.query.day } : {}),
+          ...(typeof req.query.class === 'string' && req.query.class !== ''
+            ? { accountClass: req.query.class }
+            : {}),
+          ...(Number.isFinite(limitRaw) && limitRaw > 0 ? { limit: Math.floor(limitRaw) } : {}),
+        });
+      }
+      res.json({
+        ok: true,
+        issue: 'TRA-4628',
+        time: new Date(nowMs).toISOString(),
+        build: resolveBuildInfo(),
+        etDay: etDateString(new Date(nowMs)),
+        ...summary,
+        ...(rows !== undefined ? { rows: rows.rows, rowsTruncated: rows.truncated } : {}),
+        note: `${summary.deskSessionsWithAdmissions}/20 desk-class ET sessions with >=1 ADMITTED candidate toward the TRA-4623 AC4 re-run bar. bindingReason = FIRST binding gate in engine evaluation order ('none' = admitted). Sampling is pass-level and independent of mark/spreadPct by construction (see policy). An evidence archive has no backfill: the tape starts at the deploy that armed it. durability.appendErrors > 0 means rows were counted in memory that never reached disk — treat the on-disk export as an undercount, not the counters as an overcount.`,
+      });
+    } catch (err: unknown) {
+      // An instrument may not take the box down, and it may not report a read
+      // failure as an absence of findings either.
+      res.status(200).json({
+        ok: false,
+        issue: 'TRA-4628',
+        time: new Date(nowMs).toISOString(),
+        verdict: null,
+        blindReason: err instanceof Error ? err.message : String(err),
+        note: 'BLIND — the admission-tape summary could not be read. This is NOT a clean bill of health.',
+      });
+    }
+  });
 
   // TRA-1656 (TRA-1602B) — unauthenticated, secrets-free MEASURED option spread
   // cross, in R units. This probe was built to CHECK the cost-aware bar's spread

@@ -71,6 +71,66 @@ export interface OtmMispricingCandidate {
   delta: number;
 }
 
+/**
+ * TRA-4628 — which gate refused a candidate, or `none` when it was admitted.
+ *
+ * Convention: this is the **first binding gate in evaluation order** (the order
+ * of the `continue` statements in `findMispricedOtmContracts`), not the full
+ * set — a cheap AND wide contract records `min_mark`, never `max_spread_pct`.
+ * Evaluation order: min_mark → max_spread_pct → min_open_interest → expired →
+ * no_iv → non_positive_theo → min_abs_delta.
+ *
+ * The last three non-parameter reasons (`expired` / `no_iv` /
+ * `non_positive_theo`) are recorded so the tape stays an exact account of the
+ * decision path; the TRA-4623 pre-registered rule only sweeps the four
+ * parameter gates.
+ */
+export type OtmAdmissionRefusalReason =
+  | 'min_mark'
+  | 'max_spread_pct'
+  | 'min_open_interest'
+  | 'expired'
+  | 'no_iv'
+  | 'non_positive_theo'
+  | 'min_abs_delta'
+  | 'none';
+
+/**
+ * TRA-4628 — one admission decision, admitted or refused, emitted per OTM
+ * contract with a valid two-sided quote (bid > 0, ask > 0, ask ≥ bid). Rows
+ * that are not OTM or have no usable quote are structurally outside the
+ * candidate population the TRA-4623 `minMark × maxSpreadPct` sweep names, and
+ * are NOT emitted — they cannot enter the denominator at any parameter value.
+ *
+ * `mark` and `spreadPct` use the scanner's own `(bid+ask)/2` mid convention —
+ * the same convention as the TRA-1656 entry stamp — and are present on every
+ * record, including ones refused before the corresponding gate ran, so the
+ * sweep can re-grade any (minMark, maxSpreadPct) cell off refused rows too.
+ */
+export interface OtmAdmissionDecision {
+  occSymbol: string;
+  underlying: string;
+  right: OptionType;
+  strike: number;
+  expiry: string; // YYYY-MM-DD
+  bid: number;
+  ask: number;
+  /** (bid+ask)/2 — same convention as the TRA-1656 entry stamp. */
+  mark: number;
+  /** (ask−bid)/mark, computed on the mid above. */
+  spreadPct: number;
+  openInterest: number;
+  /**
+   * |Black-Scholes delta|. Only computable after the IV/theo stage, so it is
+   * absent on rows refused earlier; NaN (unpriceable) is passed through as-is
+   * and fails the `min_abs_delta` gate when a floor is set.
+   */
+  absDelta?: number;
+  admitted: boolean;
+  /** First binding gate in evaluation order; `none` iff `admitted`. */
+  bindingReason: OtmAdmissionRefusalReason;
+}
+
 export interface OtmScannerOptions {
   /** Annualized risk-free rate used by the BS model (default 0.045). */
   riskFreeRate?: number;
@@ -124,9 +184,17 @@ export interface OtmScannerOptions {
   minAbsDelta?: number;
   /** Override of `Date.now()` — test seam. */
   now?: number;
+  /**
+   * TRA-4628 — observability tap. When provided, called once per OTM contract
+   * with a valid two-sided quote, admitted or refused, with the first binding
+   * gate. Pure observation: it runs on the values the scanner already
+   * computes, changes no gate, no ordering and no returned candidate, and the
+   * scanner never awaits or catches it — callers own buffering and errors.
+   */
+  onAdmission?: (decision: OtmAdmissionDecision) => void;
 }
 
-const DEFAULTS: Required<Omit<OtmScannerOptions, 'now'>> = {
+const DEFAULTS: Required<Omit<OtmScannerOptions, 'now' | 'onAdmission'>> = {
   riskFreeRate: 0.045,
   dividendYield: 0,
   maxSpreadPct: 0.2,
@@ -187,6 +255,7 @@ export function findMispricedOtmContracts(
 
   const opts = { ...DEFAULTS, ...options };
   const now = options.now ?? Date.now();
+  const onAdmission = options.onAdmission;
 
   // Pre-sort same-type rows by strike — needed for IV smoothing fallback.
   const sortedByType = new Map<string, OptionChainRow[]>();
@@ -215,17 +284,53 @@ export function findMispricedOtmContracts(
     const ask = row.ask ?? 0;
     if (bid <= 0 || ask <= 0 || ask < bid) continue;
 
+    // TRA-4628 — admission tap. `mark`/`spreadPct` are computed up front (both
+    // are pure, and mark > 0 is guaranteed by the quote gate above) so every
+    // emitted decision carries both sweep axes, including rows refused at the
+    // very first gate. Gate ORDER and gate PREDICATES below are unchanged.
     const mark = (bid + ask) / 2;
-    if (mark < opts.minMark) continue;
-
     const spreadPct = (ask - bid) / mark;
-    if (spreadPct > opts.maxSpreadPct) continue;
-
     const openInterest = row.openInterest ?? 0;
-    if (openInterest < opts.minOpenInterest) continue;
+    const emit = onAdmission
+      ? (bindingReason: OtmAdmissionRefusalReason, absDelta?: number): void => {
+          onAdmission({
+            occSymbol: row.optionSymbol,
+            underlying: row.underlying,
+            right: row.optionType,
+            strike: row.strike,
+            expiry: row.expiration,
+            bid,
+            ask,
+            mark,
+            spreadPct,
+            openInterest,
+            ...(absDelta === undefined ? {} : { absDelta }),
+            admitted: bindingReason === 'none',
+            bindingReason,
+          });
+        }
+      : undefined;
+
+    if (mark < opts.minMark) {
+      emit?.('min_mark');
+      continue;
+    }
+
+    if (spreadPct > opts.maxSpreadPct) {
+      emit?.('max_spread_pct');
+      continue;
+    }
+
+    if (openInterest < opts.minOpenInterest) {
+      emit?.('min_open_interest');
+      continue;
+    }
 
     const dte = daysToExpiration(row.expiration, now);
-    if (dte <= 0) continue;
+    if (dte <= 0) {
+      emit?.('expired');
+      continue;
+    }
 
     // Theo IV: smvVol > smoothed neighbour midIv > skip.
     let ivUsed = row.smvVol && row.smvVol > 0 ? row.smvVol : null;
@@ -234,7 +339,10 @@ export function findMispricedOtmContracts(
       const idx = bucket.indexOf(row);
       ivUsed = smoothedIv(bucket, idx, opts.ivSmoothingWindow);
     }
-    if (ivUsed == null) continue;
+    if (ivUsed == null) {
+      emit?.('no_iv');
+      continue;
+    }
 
     const theo = blackScholesPrice({
       spot: underlyingPrice,
@@ -245,7 +353,10 @@ export function findMispricedOtmContracts(
       optionType: row.optionType,
       dividendYield: opts.dividendYield,
     });
-    if (theo <= 0) continue;
+    if (theo <= 0) {
+      emit?.('non_positive_theo');
+      continue;
+    }
 
     const delta = blackScholesDelta({
       spot: underlyingPrice,
@@ -261,7 +372,12 @@ export function findMispricedOtmContracts(
     // the caller's floor. Off by default (minAbsDelta 0). A missing/NaN delta is
     // treated as failing the floor when one is set (don't admit an un-scored
     // contract past a hard risk gate).
-    if (opts.minAbsDelta > 0 && !(Math.abs(delta) >= opts.minAbsDelta)) continue;
+    if (opts.minAbsDelta > 0 && !(Math.abs(delta) >= opts.minAbsDelta)) {
+      emit?.('min_abs_delta', Math.abs(delta));
+      continue;
+    }
+
+    emit?.('none', Math.abs(delta));
 
     const mispricingPct = (mark - theo) / theo;
 

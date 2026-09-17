@@ -535,6 +535,8 @@ export type {
   OtmMispricingCandidate,
   OtmScannerOptions,
   Mispricing,
+  OtmAdmissionDecision,
+  OtmAdmissionRefusalReason,
 } from './options/otm-mispricing.js';
 export {
   findIvRvMispricings,

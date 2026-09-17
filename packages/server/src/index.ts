@@ -338,6 +338,9 @@ import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 import { hydrateEntrySiteCensusFromDisk } from './entry-site-census-ledger.js';
 import { gradeSinceBootSessionCoverage } from './session-coverage.js';
 import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
+// TRA-4628 — the OTM candidate-admission tape (admitted AND refused scanner
+// candidates), hydrated at boot so a post-close read spans the whole session.
+import { hydrateOtmAdmissionTapeFromDisk } from './otm-admission-tape.js';
 // TRA-3434 — boot warm for the TRA-3391 tape-expectancy fold the live cost bar
 // admits on. Without it the first candidates after every process start decline
 // blind under a reason code that reads exactly like a measured verdict.
@@ -5162,6 +5165,20 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
   const h = hydrateCostAwareGateFromDisk(DATA_DIR);
   if (h.records > 0) {
     log.info('cost-aware fire-bar ledger hydrated (TRA-1602)', {
+      records: h.records,
+      days: h.days,
+    });
+  }
+}
+
+// TRA-4628 — rebuild the OTM candidate-admission tape aggregates and remember
+// DATA_DIR for appends. Same durability rationale as the ledgers above: the
+// TRA-4623 rule needs >=20 RTH desk sessions, which no since-boot counter can
+// span. Compacted to a 60-day window / 64MB (whole-oldest-day pruning) on boot.
+{
+  const h = hydrateOtmAdmissionTapeFromDisk(DATA_DIR);
+  if (h.records > 0) {
+    log.info('otm admission tape hydrated (TRA-4628)', {
       records: h.records,
       days: h.days,
     });
