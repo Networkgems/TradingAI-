@@ -358,6 +358,7 @@ import {
 import { hydrateOptionsBreakerLedgerFromDisk, summarizeOptionsBreakerLedger } from './options-breaker-ledger.js'; // TRA-3218
 import { hydrateMarkSanityFromDisk } from './option-mark-sanity.js'; // TRA-2945
 import { hydrateLiveEnforceGateFromDisk } from './live-enforce-gate-ledger.js';
+import { registerHardControlRoutes } from './hard-controls-routes.js'; // TRA-4655
 // TRA-2930 — durable per-book EOD archive-participation record.
 import {
   hydrateEodArchiveParticipationFromDisk,
@@ -16847,6 +16848,13 @@ app.post('/api/trading/stop', requireAuth, async (req, res) => {
   broadcastEngineState(ctx);
   res.json({ ok: true, mode, autoTradingEnabled: false });
 });
+
+// TRA-4655 — Week-1 hard operating controls: fleet-wide kill switch, $500 daily
+// loss lockout, $300/trade cap, 3-position cap, 5s stale-quote breaker,
+// idempotency, force-close-all. Registers /api/controls/hard* and hydrates the
+// durable latches. The admit() choke point is what the TRA-4657 paper-trading
+// order path MUST call; TRA-4650 extends/verifies on this interface.
+registerHardControlRoutes(app, { requireAuth, requireAdmin });
 
 // TRA-526 — global kill switch (deterministic risk-layer master override).
 // Engages/releases the manual master halt across BOTH the equities/options
