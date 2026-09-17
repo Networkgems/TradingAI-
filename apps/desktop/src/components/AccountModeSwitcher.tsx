@@ -106,10 +106,18 @@ export function AccountModeSwitcher({
       }
       setClampedTo(null);
       onChange(applied.bookView);
+      // TRA-4641 — when the shown book diverges from the routing, name the
+      // supported de-escalation here too. TRA-3910 rerouted the pinned press
+      // away from the settings write, which also rerouted it away from the
+      // clamp toast — the only place the lever was ever named — so the exact
+      // operator this control exists for (one trying to stand a live arm
+      // down) was left with "nothing was disarmed" and no way out.
       toast.success(
         `Viewing the ${applied.bookView === 'live' ? 'Live' : 'Demo'} book`
         + (applied.bookView !== applied.mode
-          ? ` — the engine is still routing to the ${applied.mode.toUpperCase()} account; nothing was disarmed.`
+          ? ` — the engine is still routing to the ${applied.mode.toUpperCase()} account; nothing was `
+            + 'disarmed. This toggle cannot stand the pinned arm down: the supported de-escalation is '
+            + 'clearing the LIVE_EQUITY_BOOT_USER service env var and redeploying.'
           : '.'),
       );
     } catch (err) {
@@ -226,7 +234,8 @@ export function AccountModeSwitcher({
   const routing: AccountMode = engineMode ?? mode;
   const clampNote = (side: AccountMode) =>
     liveBrokerArmPinned
-      ? ` — VIEW only: the engine keeps routing to the ${routing.toUpperCase()} account (pinned live-broker arm)`
+      ? ` — VIEW only: the engine keeps routing to the ${routing.toUpperCase()} account (pinned live-broker arm;`
+        + ' stand-down is clearing LIVE_EQUITY_BOOT_USER on the service and redeploying, not this toggle)'
       : clampedTo !== null && clampedTo !== side
       ? ` — the server refused this switch and held the account on ${clampedTo === 'live' ? 'LIVE' : 'DEMO'};`
         + ' clear LIVE_EQUITY_BOOT_USER on the service to de-escalate'

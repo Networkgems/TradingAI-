@@ -133,6 +133,50 @@ describe('AccountModeSwitcher', () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
+  it('TRA-4641 — the pinned view-only path names the supported de-escalation lever', async () => {
+    // TRA-3910 reroutes the pinned press to `PUT /api/account/view-mode`, which
+    // also rerouted it away from the clamp toast — previously the only place
+    // the way out of the live arm was named. The operator this control exists
+    // for (one trying to stand a live arm down) must still be told the lever.
+    const fetchMock = vi.fn((_url: string, _init?: RequestInit) =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ bookView: 'demo', mode: 'live' }),
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const onChange = vi.fn();
+    render(
+      <ToastProvider>
+        <AccountModeSwitcher
+          mode="live"
+          liveBrokerArmPinned={true}
+          onChange={onChange}
+          market="stocks"
+          token="tok"
+        />
+        <ToastViewport />
+      </ToastProvider>,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Demo' }));
+
+    // The pinned press must never touch the settings write path — that is the
+    // nine-event ledger class this retires.
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(String(fetchMock.mock.calls[0]![0])).toMatch(/\/api\/account\/view-mode$/);
+
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith('demo'));
+    // Honest about what did NOT happen, and names the lever that works.
+    const toastText = await screen.findByText(/nothing was disarmed/i);
+    expect(toastText).toHaveTextContent(/LIVE_EQUITY_BOOT_USER/);
+    expect(toastText).toHaveTextContent(/cannot stand the pinned arm down/i);
+    // The at-rest title carries the lever too, before any click outcome.
+    expect(screen.getByRole('button', { name: 'Demo' }).getAttribute('title'))
+      .toMatch(/LIVE_EQUITY_BOOT_USER/);
+  });
+
   it('still surfaces the promotion gate reason on a 422 (TRA-575 unchanged)', async () => {
     vi.stubGlobal(
       'fetch',
