@@ -1408,6 +1408,15 @@ export interface OptionTradeCloseBasisAmendRecord {
   ts: number | null;
   /** Did the fold actually restate a row, or was it refused (unknown / still OPEN)? */
   applied: boolean;
+  /** TRA-4673 — why the fold refused; `null` when applied. */
+  refusal: 'non_finite' | 'unknown_row' | 'row_open' | 'r_mismatch' | null;
+  /**
+   * TRA-4673 — on `r_mismatch` only: the R the line claimed, and
+   * `realizedPnlUsd / atRiskUsd` off the row's own basis. `null` otherwise —
+   * the two numbers are only interesting when they disagree.
+   */
+  realizedRClaimed: number | null;
+  realizedRDerived: number | null;
   mode: 'demo' | 'live' | null;
   symbol: string | null;
   optionSymbol: string | null;
@@ -1418,6 +1427,15 @@ export interface OptionTradeCloseBasisAmendRecord {
   deltaUsd: number | null;
   feesUsd: number | null;
 }
+
+/**
+ * TRA-4673 — how far a line's `realizedR` may sit from its own
+ * `realizedPnlUsd / atRiskUsd` before the fold refuses it. Wide enough for a
+ * writer that rounds R to 4 decimals (max error 5e-5 — the convention the
+ * admin backfill route and `amend_open_basis` both use), three orders of
+ * magnitude under the ±0.1 scratch band that gives R its meaning.
+ */
+const CLOSE_BASIS_R_RECONCILE_EPS = 1e-4;
 
 /** Same rationale and cap as {@link VOID_LEDGER_CAP} — a witness, not a second journal. */
 const CLOSE_BASIS_AMEND_LEDGER_CAP = 500;
@@ -1944,11 +1962,18 @@ function foldLine(
     // position as settled and the silence is the expensive part.
     const rec = map.get(line.id);
     const basis = line.basis;
-    if (!rec || rec.outcome === 'OPEN' || !Number.isFinite(basis?.realizedPnlUsd)) {
+    const refuse = (
+      refusal: NonNullable<OptionTradeCloseBasisAmendRecord['refusal']>,
+      realizedRClaimed: number | null = null,
+      realizedRDerived: number | null = null,
+    ): void => {
       pushCloseBasisAmend(amendSink, {
         id: line.id,
         ts: typeof line.ts === 'number' && Number.isFinite(line.ts) ? line.ts : null,
         applied: false,
+        refusal,
+        realizedRClaimed,
+        realizedRDerived,
         mode: rec?.mode ?? null,
         symbol: rec?.symbol ?? null,
         optionSymbol: rec?.optionSymbol ?? null,
@@ -1957,7 +1982,26 @@ function foldLine(
         deltaUsd: null,
         feesUsd: null,
       });
+    };
+    if (!Number.isFinite(basis?.realizedPnlUsd) || !Number.isFinite(basis?.realizedR)) {
+      refuse('non_finite');
       return;
+    }
+    if (!rec) { refuse('unknown_row'); return; }
+    if (rec.outcome === 'OPEN') { refuse('row_open'); return; }
+    // TRA-4673 — the R on the line must be the R its own money implies. The sole
+    // production writer recomputes `realizedPnlUsd / atRiskUsd` in the same step
+    // that moves the money, so this is inert for it; what it refuses is a SECOND
+    // writer that carried a stale or mis-derived R, which would land a row whose
+    // dollars and R disagree — the exact artefact TRA-4610 Defect 3 suspected.
+    // Only checkable when the row carries a usable denominator; legacy rows
+    // without one get the finiteness assert alone.
+    if (Number.isFinite(rec.atRiskUsd) && rec.atRiskUsd > 0) {
+      const derived = basis.realizedPnlUsd / rec.atRiskUsd;
+      if (Math.abs(basis.realizedR - derived) > CLOSE_BASIS_R_RECONCILE_EPS) {
+        refuse('r_mismatch', basis.realizedR, derived);
+        return;
+      }
     }
     // Read the pre-state off the record BEFORE overwriting it — after the
     // `map.set` there is nothing left that remembers what the engine said.
@@ -1966,6 +2010,9 @@ function foldLine(
       id: line.id,
       ts: typeof line.ts === 'number' && Number.isFinite(line.ts) ? line.ts : null,
       applied: true,
+      refusal: null,
+      realizedRClaimed: null,
+      realizedRDerived: null,
       mode: rec.mode,
       symbol: rec.symbol,
       optionSymbol: rec.optionSymbol ?? null,
@@ -2945,6 +2992,13 @@ export async function recordOptionTradeVoid(
  * still OPEN, or the basis is not finite. The OPEN guard is the important one:
  * stamping a realized figure on an unsettled position would publish it as a
  * completed trade while the contracts are still at the broker.
+ *
+ * TRA-4673 — `realizedR` is now asserted finite and reconciled against
+ * `realizedPnlUsd / atRiskUsd` by the fold (see the `amend_close_basis`
+ * branch), and the line is appended ONLY if the fold applied it, so the file
+ * never carries a line a replay would refuse. Observably inert for the sole
+ * production writer, which recomputes R in the same step that moves the money
+ * (verified on TRA-4610, comment `0d6833c0` Defect 3: all rows reconcile).
  */
 export async function recordOptionTradeCloseBasis(
   id: string,
@@ -2953,13 +3007,33 @@ export async function recordOptionTradeCloseBasis(
   ts: number = Date.now(),
 ): Promise<boolean> {
   if (!isOptionTradeJournalEnabled()) return false;
-  if (!Number.isFinite(basis?.realizedPnlUsd) || !Number.isFinite(basis?.feesUsd)) return false;
+  if (!Number.isFinite(basis?.realizedPnlUsd) || !Number.isFinite(basis?.feesUsd)
+    || !Number.isFinite(basis?.realizedR)) return false;
   const map = await ensureLoaded();
   const existing = map.get(id);
   if (!existing || existing.outcome === 'OPEN') return false;
   const before = existing.realizedPnlUsd;
   const line: AmendCloseBasisLine = { kind: 'amend_close_basis', id, ts, basis };
+  // The fold pushes exactly one witness per amend line; `dropped` moves instead
+  // of `length` once the ledger is at cap, so watch both.
+  const ledgerLenBefore = closeBasisAmendLedger.length;
+  const droppedBefore = closeBasisAmendDropped;
   foldLine(map, line);
+  const witness = closeBasisAmendLedger[closeBasisAmendLedger.length - 1];
+  const applied = (closeBasisAmendLedger.length > ledgerLenBefore || closeBasisAmendDropped > droppedBefore)
+    && witness !== undefined && witness.id === id && witness.applied;
+  if (!applied) {
+    log.warn('option trade journal close-basis restatement REFUSED', {
+      issue: 'TRA-4673',
+      id,
+      refusal: witness?.refusal ?? null,
+      realizedRClaimed: witness?.realizedRClaimed ?? null,
+      realizedRDerived: witness?.realizedRDerived ?? null,
+      attemptedPnlUsd: basis.realizedPnlUsd,
+      atRiskUsd: existing.atRiskUsd ?? null,
+    });
+    return false;
+  }
   await appendLine(line);
   log.info('option trade journal close basis RESTATED to broker fills', {
     issue: 'TRA-2819',

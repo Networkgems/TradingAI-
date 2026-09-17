@@ -184,7 +184,9 @@ describe('TRA-2819 amend_close_basis', () => {
     // shrink the recorded size of the defect.
     await openAndClose();
     await recordOptionTradeCloseBasis('pos-2819', BROKER);
-    await recordOptionTradeCloseBasis('pos-2819', { ...BROKER, realizedPnlUsd: 695.5 });
+    // TRA-4673 — the second amend carries the R its own money implies
+    // (695.5 / 398, 4dp); a stale 1.7465 would now be refused as `r_mismatch`.
+    await recordOptionTradeCloseBasis('pos-2819', { ...BROKER, realizedPnlUsd: 695.5, realizedR: 1.7475 });
     setOptionTradeJournalFileForTests(tmpFile);
     const row = (await listOptionTradeJournal()).find((r) => r.id === 'pos-2819')!;
     expect(row.realizedPnlUsd).toBe(695.5);
