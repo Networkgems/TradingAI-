@@ -11,7 +11,7 @@ import type {
   PromotionThresholds,
   PromotionTradeSample,
 } from '@trading-app/shared';
-import { DEFAULT_PROMOTION_THRESHOLDS, computePaperGateMetrics, promotionStrategyClass } from '@trading-app/shared';
+import { DEFAULT_PROMOTION_THRESHOLDS, computePaperGateMetrics, isSymbolUniverseSubset, promotionStrategyClass } from '@trading-app/shared';
 import type { BacktestResult, OptimizationVerdict } from '@trading-app/backtest';
 import { logger } from './observability/index.js';
 import { resolveDataDir } from './data-dir.js';
@@ -72,6 +72,14 @@ export interface RegisteredBacktest {
    * {@link registerOptimizationVerdict} class guards).
    */
   accumulationBacktest?: AccumulationBacktestGateMetrics;
+  /**
+   * TRA-2392 (ruling 1B) — the symbol universe that the Stage-1 evidence
+   * actually covered. Derived from the backtest run's symbol set. Null
+   * represents an unbounded universe (grows with the catalog), but null is
+   * refused at the API boundary — no backtest can measure a catalog that grows
+   * on its own. Absent E refuses ALL sign-offs (fail-closed on legacy records).
+   */
+  evidenceUniverse?: readonly string[] | null;
 }
 
 /**
@@ -253,8 +261,15 @@ export async function registerBacktestReport(args: {
   report: BacktestResult;
   reportId: string;
   registeredBy: string;
+  evidenceUniverse?: readonly string[] | null;
 }): Promise<StrategyPromotionRecord> {
   if (!args.strategyId) throw new PromotionValidationError('strategyId is required');
+  // TRA-2392 — refuse null/TOP as an evidence universe at the API boundary.
+  if (args.evidenceUniverse === null) {
+    throw new PromotionValidationError(
+      'evidenceUniverse cannot be null (unbounded) — no backtest can measure a catalog that grows on its own',
+    );
+  }
   // TRA-1465 — a close-based backtest report can never clear an accumulate
   // Stage 1 (the six-guard timing battery is meaningless on hold-mode DCA).
   if (promotionStrategyClass(args.strategyId) === 'accumulate') {
@@ -271,6 +286,7 @@ export async function registerBacktestReport(args: {
     reportId: args.reportId || 'unspecified',
     registeredAt: new Date().toISOString(),
     registeredBy: args.registeredBy,
+    ...(args.evidenceUniverse !== undefined ? { evidenceUniverse: args.evidenceUniverse } : {}),
   };
   store.strategies[args.strategyId] = rec;
   await persist();
@@ -294,8 +310,15 @@ export async function registerOptimizationVerdict(args: {
   verdict: OptimizationVerdict;
   reportId: string;
   registeredBy: string;
+  evidenceUniverse?: readonly string[] | null;
 }): Promise<StrategyPromotionRecord> {
   if (!args.strategyId) throw new PromotionValidationError('strategyId is required');
+  // TRA-2392 — refuse null/TOP as an evidence universe at the API boundary.
+  if (args.evidenceUniverse === null) {
+    throw new PromotionValidationError(
+      'evidenceUniverse cannot be null (unbounded) — no backtest can measure a catalog that grows on its own',
+    );
+  }
   // TRA-1465 — the TRA-540 six-guard timing verdict can never clear an
   // accumulate Stage 1 (DCA has no per-trade timing edge to certify).
   if (promotionStrategyClass(args.strategyId) === 'accumulate') {
@@ -329,6 +352,7 @@ export async function registerOptimizationVerdict(args: {
     registeredBy: args.registeredBy,
     verdict: { pass: v.pass, guards: v.guards },
     blessedParams: v.blessedParams,
+    ...(args.evidenceUniverse !== undefined ? { evidenceUniverse: args.evidenceUniverse } : {}),
   };
   store.strategies[args.strategyId] = rec;
   await persist();
@@ -372,8 +396,15 @@ export async function registerAccumulationBacktestVerdict(args: {
   metrics: AccumulationBacktestGateMetrics;
   reportId: string;
   registeredBy: string;
+  evidenceUniverse?: readonly string[] | null;
 }): Promise<StrategyPromotionRecord> {
   if (!args.strategyId) throw new PromotionValidationError('strategyId is required');
+  // TRA-2392 — refuse null/TOP as an evidence universe at the API boundary.
+  if (args.evidenceUniverse === null) {
+    throw new PromotionValidationError(
+      'evidenceUniverse cannot be null (unbounded) — no backtest can measure a catalog that grows on its own',
+    );
+  }
   if (promotionStrategyClass(args.strategyId) !== 'accumulate') {
     throw new PromotionValidationError(
       `strategy "${args.strategyId}" is close-based — its Stage-1 leg is a six-guard timing verdict `
@@ -410,6 +441,7 @@ export async function registerAccumulationBacktestVerdict(args: {
     registeredAt: new Date().toISOString(),
     registeredBy: args.registeredBy,
     accumulationBacktest: metrics,
+    ...(args.evidenceUniverse !== undefined ? { evidenceUniverse: args.evidenceUniverse } : {}),
   };
   store.strategies[args.strategyId] = rec;
   await persist();
@@ -449,7 +481,16 @@ export function mergeThresholds(
  * `backtestMetrics` are the snapshots the reviewer saw at decision time, passed
  * in by the service layer (which recomputed them from data). When
  * `thresholdOverrides` is present a `rationale` is mandatory (TRA-527: defaults
- * may only be loosened with a written rationale).
+ * may only be loosened with a written rationale). TRA-2392 — accepts
+ * `grantedUniverse` from the reviewer, defaulting to the record's
+ * `evidenceUniverse` when omitted; refuses G ⊄ E before the append.
+ * TRA-4690 — E has exactly ONE writer, the Stage-1 registration: a call that
+ * supplies `evidenceUniverse` is refused outright (TRA-4648 closed the
+ * omitted-E bypass with a record fallback; the supplied-E key was the same
+ * bypass's other half — a reviewer-supplied wide E overrode the Stage-1
+ * record and canary→majors was granted on BTC-only evidence). An explicit G
+ * with no E on the record is refused outright (fail-closed, the posture the
+ * rest of this gate takes).
  */
 export async function recordSignoff(args: {
   strategyId: string;
@@ -458,14 +499,68 @@ export async function recordSignoff(args: {
   paperMetrics: PaperGateMetrics | null;
   thresholdOverrides?: Partial<PromotionThresholds>;
   rationale?: string;
+  /**
+   * TRA-4690 — REFUSED whenever present (any value, null included). The key
+   * stays on the signature so a caller that passes it gets a loud
+   * `PromotionValidationError` instead of a silent drop; E is read from the
+   * Stage-1 record only.
+   */
+  evidenceUniverse?: readonly string[] | null;
+  grantedUniverse?: readonly string[] | null;
 }): Promise<PromotionDecision> {
   if (!args.strategyId) throw new PromotionValidationError('strategyId is required');
   if (!args.reviewer) throw new PromotionValidationError('reviewer is required');
   if (args.thresholdOverrides && !args.rationale?.trim()) {
     throw new PromotionValidationError('rationale is required when threshold overrides are applied');
   }
+  // TRA-4690 — E has exactly ONE writer: the Stage-1 registration. A sign-off
+  // that supplies `evidenceUniverse` (any value, null included, even one that
+  // matches the record) is refused outright — accepting it would keep a second
+  // writer alive, and the measured defect was precisely a reviewer-supplied
+  // wide E winning over the Stage-1 record (canary→majors granted on BTC-only
+  // evidence). The reviewer's only universe lever is `grantedUniverse`.
+  if (args.evidenceUniverse !== undefined) {
+    throw new PromotionValidationError(
+      'evidenceUniverse is not accepted on a sign-off — the evidence universe is written by the '
+        + 'Stage-1 registration only; the reviewer narrows the grant via grantedUniverse (G ⊆ record E)',
+    );
+  }
+  // TRA-4648 — the record is loaded BEFORE the G ⊆ E validation: E comes from
+  // the record registered at Stage 1, never from this call (measured bypass:
+  // canary→majors grant accepted on BTC-only Stage-1 evidence). Nothing is
+  // written until `persist()` below, so loading early cannot leak a blank
+  // record on a refusal.
   const store = await ensureLoaded();
   const rec = store.strategies[args.strategyId] ?? blankRecord(args.strategyId);
+  const evidenceUniverse = rec.backtest?.evidenceUniverse ?? undefined;
+  // Default grantedUniverse to the effective evidence when the reviewer omits
+  // it, so an omitted G lands on the Stage-1 universe rather than `undefined`.
+  const grantedUniverse = args.grantedUniverse !== undefined
+    ? args.grantedUniverse
+    : evidenceUniverse;
+
+  const describeUniverse = (u: readonly string[] | null | undefined): string =>
+    u === undefined ? 'undefined' : u === null ? 'unbounded' : `[${u.join(', ')}]`;
+
+  // Fail-closed: an explicit grant with no evidence registered at Stage 1 has
+  // nothing to be validated against.
+  if (grantedUniverse !== undefined && evidenceUniverse === undefined) {
+    throw new PromotionValidationError(
+      `grantedUniverse ${describeUniverse(grantedUniverse)} cannot be granted: no evidenceUniverse registered at Stage 1 — cannot grant more than the evidence covered`,
+    );
+  }
+
+  // Validate G ⊆ E before append. The subset semantics live in ONE place
+  // (shared `isSymbolUniverseSubset`, null read as ⊤) — a second hand-written
+  // copy here is the drift the TRA-4633 positive control cannot reach (TRA-4643).
+  if (evidenceUniverse !== undefined && grantedUniverse !== undefined) {
+    if (!isSymbolUniverseSubset(grantedUniverse, evidenceUniverse)) {
+      throw new PromotionValidationError(
+        `grantedUniverse ${describeUniverse(grantedUniverse)} is not a subset of evidenceUniverse ${describeUniverse(evidenceUniverse)} — cannot grant more than the evidence covered`,
+      );
+    }
+  }
+
   const decision: PromotionDecision = {
     id: randomUUID(),
     strategyId: args.strategyId,
@@ -475,6 +570,11 @@ export async function recordSignoff(args: {
     paperMetrics: args.paperMetrics,
     ...(args.thresholdOverrides ? { thresholdOverrides: args.thresholdOverrides } : {}),
     ...(args.rationale ? { rationale: args.rationale } : {}),
+    // TRA-4690 — the Stage-1 record's E is what the grant was validated
+    // against, so that is what the audit records (a call can no longer carry
+    // its own E, so the trail cannot claim evidence Stage 1 never produced).
+    ...(evidenceUniverse !== undefined ? { evidenceUniverse } : {}),
+    ...(grantedUniverse !== undefined ? { grantedUniverse } : {}),
   };
   rec.decisions.push(decision);
   if (args.thresholdOverrides) rec.thresholdOverrides = mergeThresholds(

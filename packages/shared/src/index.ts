@@ -4,6 +4,9 @@
 // computation from data, per-stage evaluation, overall verdict, audit record).
 export * from './promotion-gate.js';
 
+// TRA-2392 — Symbol universe utilities (subset checks, universe derivation).
+export * from './symbol-universe.js';
+
 // TRA-2036 — shadow-expectancy promotion guard (pure core): blocks promotion on
 // non-positive net shadow E[R], with a correlation-adjusted effective sample
 // size and a day/episode block-bootstrap CI. Flag-gated, observe-only first.
@@ -1020,27 +1023,6 @@ export function resolveStrategySymbolUniverse(
   return wide.filter(s => perStrategy.includes(s));
 }
 
-/**
- * TRA-2348 — is universe `a` contained in universe `b`, with `null` read as ⊤?
- *
- * The three edge cases are the whole point, so they are spelled out rather than
- * left to a clever one-liner:
- *   • `b === null` (⊤ container) — everything is a subset. A save moving from
- *     the full catalog to a pinned list is a NARROWING and must never be gated
- *     (TRA-1590 de-escalation).
- *   • `a === null`, `b` a list — ⊤ is NOT contained in any finite list. This is
- *     the widening TRA-2348 exists to catch (canary BTC → `crypto_core`).
- *   • both `null` — ⊤ ⊆ ⊤ is TRUE, so an unrelated edit that HOLDS an
- *     already-unbounded live universe is not mistaken for a widening.
- */
-export function isSymbolUniverseSubset(
-  a: readonly string[] | null,
-  b: readonly string[] | null,
-): boolean {
-  if (b === null) return true;
-  if (a === null) return false;
-  return a.every(s => b.includes(s));
-}
 
 /**
  * TRA-2348 — the preset ids the board has ratified for REAL-MONEY crypto, and

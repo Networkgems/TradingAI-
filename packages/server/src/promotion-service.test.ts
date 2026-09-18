@@ -75,6 +75,15 @@ beforeAll(async () => {
   svc = await import('./promotion-service.js');
   store = await import('./promotion-store.js');
   tradeStore = await import('./trade-store.js');
+
+  // Pin the promotion store to THIS file's DATA_DIR. vitest's threads pool
+  // shares process.env across worker threads, and the store re-resolves
+  // DATA_DIR lazily on every persist/load — so promotion-universe.test.ts's
+  // module-eval DATA_DIR write can silently redirect this file's store
+  // mid-suite when the two files share an invocation, interleaving both
+  // files' `dca` records in one store file (measured: 11 cross-shaped
+  // failures on the TRA-4690 walk, unreproducible file-by-file).
+  store.__resetPromotionStoreForTests(join(DATA_DIR, 'promotion-gate.json'));
 });
 
 // TRA-4629 — the crypto engine (and with it the live-crypto promotion axis and

@@ -972,4 +972,19 @@ export interface PromotionDecision {
   thresholdOverrides?: Partial<PromotionThresholds>;
   /** Written justification — mandatory when `thresholdOverrides` is present. */
   rationale?: string;
+  /**
+   * TRA-2392 (ruling 1B) — the symbol universe that the Stage-1/Stage-2 evidence
+   * actually covered. Derived from the backtest/paper run's symbol set. Null
+   * represents an unbounded universe (grows with the catalog), but null is
+   * refused at the API boundary — no backtest can measure a catalog that grows
+   * on its own. Absent E refuses ALL sign-offs (fail-closed on legacy records).
+   */
+  evidenceUniverse?: readonly string[] | null;
+  /**
+   * TRA-2392 (ruling 1B) — the reviewer-narrowed universe granted for live
+   * trading. Must be ⊆ evidenceUniverse. Defaults to evidenceUniverse if
+   * omitted. A widening (next ⊄ prev) is allowed only when BOTH ratified AND
+   * covered by grantedUniverse.
+   */
+  grantedUniverse?: readonly string[] | null;
 }

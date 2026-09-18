@@ -14286,6 +14286,32 @@ app.get('/api/promotion/status', requireAuth, async (_req, res, next) => {
   }
 });
 
+// TRA-4643 (TRA-4633 AC1) — parse an optional universe field off a promotion
+// request body. An explicit `null` is an UNBOUNDED-universe claim and must be
+// refused loudly at the boundary: the store's PromotionValidationError for a
+// null evidence universe was unreachable while these routes coerced any
+// non-array (null included) to `undefined`, so a caller who POSTed an unbounded
+// grant was silently told 201-accepted. Only a genuinely absent key reads as
+// "not supplied"; a present-but-malformed value is a 400, never a coercion.
+function parsePromotionUniverseField(
+  body: unknown,
+  key: 'evidenceUniverse' | 'grantedUniverse',
+): { ok: true; value: string[] | undefined } | { ok: false; error: string } {
+  if (typeof body !== 'object' || body === null || !(key in body)) return { ok: true, value: undefined };
+  const v = (body as Record<string, unknown>)[key];
+  if (v === undefined) return { ok: true, value: undefined };
+  if (v === null) {
+    return {
+      ok: false,
+      error: `${key} cannot be null (unbounded) — omit the key entirely, or send the explicit symbol list the evidence covered`,
+    };
+  }
+  if (!Array.isArray(v) || !v.every((s): s is string => typeof s === 'string')) {
+    return { ok: false, error: `${key} must be an array of symbol strings` };
+  }
+  return { ok: true, value: v };
+}
+
 // Stage 1 — register a backtest report for a strategy. Admin-only. The body
 // carries the FULL computed `BacktestResult`; the server picks the gate metrics
 // off it (deriveBacktestGateMetrics) so the registered numbers always reflect a
@@ -14302,11 +14328,17 @@ app.post('/api/promotion/backtest', requireAuth, requireAdmin, async (req, res) 
       res.status(400).json({ error: 'report (a computed BacktestResult) is required' });
       return;
     }
+    const evidenceUniverse = parsePromotionUniverseField(req.body, 'evidenceUniverse');
+    if (!evidenceUniverse.ok) {
+      res.status(400).json({ error: evidenceUniverse.error });
+      return;
+    }
     const rec = await registerBacktestReport({
       strategyId: body.strategyId,
       report: body.report as Parameters<typeof registerBacktestReport>[0]['report'],
       reportId: typeof body.reportId === 'string' ? body.reportId : 'unspecified',
       registeredBy: username,
+      evidenceUniverse: evidenceUniverse.value,
     });
     res.status(201).json(rec);
   } catch (err) {
@@ -14338,11 +14370,17 @@ app.post('/api/promotion/optimization', requireAuth, requireAdmin, async (req, r
       res.status(400).json({ error: 'verdict (the TRA-540 optimization verdict block) is required' });
       return;
     }
+    const evidenceUniverse = parsePromotionUniverseField(req.body, 'evidenceUniverse');
+    if (!evidenceUniverse.ok) {
+      res.status(400).json({ error: evidenceUniverse.error });
+      return;
+    }
     const rec = await registerOptimizationVerdict({
       strategyId: body.strategyId,
       verdict: body.verdict as Parameters<typeof registerOptimizationVerdict>[0]['verdict'],
       reportId: typeof body.reportId === 'string' ? body.reportId : 'unspecified',
       registeredBy: username,
+      evidenceUniverse: evidenceUniverse.value,
     });
     res.status(201).json(rec);
   } catch (err) {
@@ -14379,11 +14417,17 @@ app.post('/api/promotion/accumulation-backtest', requireAuth, requireAdmin, asyn
       res.status(400).json({ error: 'metrics (the TRA-695 accumulation-backtest metrics block) is required' });
       return;
     }
+    const evidenceUniverse = parsePromotionUniverseField(req.body, 'evidenceUniverse');
+    if (!evidenceUniverse.ok) {
+      res.status(400).json({ error: evidenceUniverse.error });
+      return;
+    }
     const rec = await registerAccumulationBacktestVerdict({
       strategyId: body.strategyId,
       metrics: body.metrics as Parameters<typeof registerAccumulationBacktestVerdict>[0]['metrics'],
       reportId: typeof body.reportId === 'string' ? body.reportId : 'unspecified',
       registeredBy: username,
+      evidenceUniverse: evidenceUniverse.value,
     });
     res.status(201).json(rec);
   } catch (err) {
@@ -14433,6 +14477,28 @@ app.post('/api/promotion/signoff', requireAuth, requireAdmin, async (req, res) =
       });
       return;
     }
+    // TRA-4690 — this route does not read `evidenceUniverse` at all: E has
+    // exactly one writer, the Stage-1 registration (TRA-2392 ruling 1B — E is
+    // derived by the harness, G is narrowed by the reviewer; the sign-off IS
+    // the reviewer). A body that carries the key is refused loudly, naming it,
+    // so no caller can believe a supplied E was honoured.
+    if (req.body && typeof req.body === 'object' && 'evidenceUniverse' in (req.body as Record<string, unknown>)) {
+      res.status(400).json({
+        error:
+          'evidenceUniverse is not accepted on sign-off — the evidence universe is registered at Stage 1 '
+          + 'by the harness; supply grantedUniverse (⊆ the registered evidence) to narrow the grant',
+      });
+      return;
+    }
+    // TRA-4643 — an explicit null G is refused here, not coerced. A null G
+    // coerced to `undefined` would silently default the grant to E —
+    // converting "grant unbounded" into "grant exactly E" behind the
+    // reviewer's back.
+    const grantedUniverse = parsePromotionUniverseField(req.body, 'grantedUniverse');
+    if (!grantedUniverse.ok) {
+      res.status(400).json({ error: grantedUniverse.error });
+      return;
+    }
     const paperMetrics = await snapshotPaperMetrics(username, body.strategyId);
     const decision = await recordSignoff({
       strategyId: body.strategyId,
@@ -14441,6 +14507,7 @@ app.post('/api/promotion/signoff', requireAuth, requireAdmin, async (req, res) =
       paperMetrics,
       thresholdOverrides: overrides,
       rationale: typeof body.rationale === 'string' ? body.rationale : undefined,
+      grantedUniverse: grantedUniverse.value,
     });
     res.status(201).json({ ok: true, decision, status: await buildPromotionStatus(username, body.strategyId) });
   } catch (err) {
