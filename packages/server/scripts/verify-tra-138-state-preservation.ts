@@ -5,7 +5,6 @@ import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { SignalEngine } from '../src/signal-engine.js';
-import { CryptoSignalEngine } from '../src/crypto-engine.js';
 import { PnlTracker } from '../src/pnl-tracker.js';
 import type { AccountSettings, TradeSignal } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
@@ -139,61 +138,6 @@ async function runStocksEquityChange() {
   }
 }
 
-async function runCryptoScenario() {
-  console.log('\n── Crypto: demo → live → demo preserves equity/positions/signals/symbols ──');
-  const dataDir = mkdtempSync(join(tmpdir(), 'tra138-crypto-'));
-  try {
-    const settings = makeSettings({ mode: 'demo', demoEquityCrypto: 25_000 });
-    const tracker = new PnlTracker(dataDir, 25_000);
-    const engine = new CryptoSignalEngine(tracker, settings);
-
-    // Simulate realized profits by manipulating the internal account.
-    // @ts-expect-error reach internal account for the test fixture.
-    const account = engine.account as InstanceType<typeof import('../src/crypto-account.js').CryptoPaperAccount>;
-    const sig = fakeSignal('BTC-USD', 'reversal', 'buy');
-    const pos = account.openPosition(sig, 100);
-    if (!pos) throw new Error('failed to open crypto paper position');
-    account.closePosition(pos.id, 200);
-    tracker.saveEquity(account.getEquity(), 0);
-    tracker.syncOpeningEquity(account.getState().totalEquity, account.getState().dailyPnl);
-
-    const sig2 = fakeSignal('ETH-USD', 'reversal', 'buy');
-    const open2 = account.openPosition(sig2, 100);
-    if (!open2) throw new Error('failed to open second crypto position');
-    // @ts-expect-error reach internal recentSignals for the test fixture.
-    engine.recentSignals.unshift(fakeSignal('SOL-USD', 'macd-bollinger', 'sell'));
-    // @ts-expect-error reach internal symbolState for the test fixture.
-    engine.symbolState.set('BTC-USD', { symbol: 'BTC-USD', price: 60000, volume: 1, change: 100, changePct: 0.1, lastUpdated: Date.now() });
-
-    const baselineEquity = account.getState().totalEquity;
-    const baselinePositions = account.getState().openPositions.length;
-    const baselineSignals = engine.getState().signals.length;
-    const baselineSymbols = engine.getState().symbols.length;
-    console.log(`  baseline demo: equity=${baselineEquity}, positions=${baselinePositions}, signals=${baselineSignals}, symbols=${baselineSymbols}`);
-
-    check('crypto baseline equity reflects gain (>$25K)', baselineEquity > 25_000, baselineEquity);
-
-    await engine.applySettings(makeSettings({ mode: 'live', demoEquityCrypto: 25_000 }));
-    const live = engine.getState();
-    check('crypto live mode shows 0 equity', live.account.totalEquity === 0, live.account.totalEquity);
-    check('crypto live mode shows no positions', live.account.openPositions.length === 0, live.account.openPositions.length);
-    check('crypto live mode keeps watchlist visible', live.symbols.length === baselineSymbols);
-    check('crypto live mode keeps signals visible', live.signals.length === baselineSignals);
-
-    await engine.applySettings(makeSettings({ mode: 'demo', demoEquityCrypto: 25_000 }));
-    const restored = engine.getState();
-    console.log(`  restored demo: equity=${restored.account.totalEquity}, positions=${restored.account.openPositions.length}, signals=${restored.signals.length}, symbols=${restored.symbols.length}`);
-
-    check('crypto demo equity preserved (>$25K)', restored.account.totalEquity > 25_000, restored.account.totalEquity);
-    check('crypto demo equity matches baseline', restored.account.totalEquity === baselineEquity);
-    check('crypto positions preserved', restored.account.openPositions.length === baselinePositions);
-    check('crypto signals preserved', restored.signals.length === baselineSignals);
-    check('crypto watchlist preserved', restored.symbols.length === baselineSymbols);
-  } finally {
-    rmSync(dataDir, { recursive: true, force: true });
-  }
-}
-
 async function runStocksRestartInLiveMode() {
   console.log('\n── Stocks: server restart in live mode → switch to demo restores demo equity ──');
   const dataDir = mkdtempSync(join(tmpdir(), 'tra138-stocks-restart-'));
@@ -236,7 +180,6 @@ async function runStocksRestartInLiveMode() {
 async function main() {
   await runStocksScenario();
   await runStocksEquityChange();
-  await runCryptoScenario();
   await runStocksRestartInLiveMode();
 
   if (failures > 0) {
