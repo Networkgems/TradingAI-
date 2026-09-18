@@ -39,6 +39,7 @@ import { accountDeletedAt } from './deleted-accounts.js';
 import type { OptionsBucketSnapshot } from './trade-store.js';
 import type { TradierEnv } from '@trading-app/shared';
 import { getAllUsers } from './users.js';
+import { noteEngineBornForHardControls } from './hard-controls-bridge.js'; // TRA-4650
 import { scrubStaleOptionsPnlCells } from './reports/stale-cell-cleanup.js';
 import {
   bookReportRoots,
@@ -743,6 +744,11 @@ async function createUserContext(username: string): Promise<UserContext> {
   );
 
   const engine = new SignalEngine(settings, tracker, sharedRvScanner);
+  // TRA-4650 — an engine born while the persisted fleet hard-kill latch is
+  // engaged (or hard-controls state is unreadable) starts halted; the bridge
+  // observer only fires on transitions and cannot reach a context that did
+  // not exist yet.
+  noteEngineBornForHardControls(engine);
   // TRA-563 — bind the owning user so engine alert hooks (fill/exit/signal/
   // risk-halt) resolve this user's notification preferences.
   engine.setAlertUsername(username);

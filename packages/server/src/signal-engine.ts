@@ -339,6 +339,7 @@ import {
 } from './option-spread-cost.js';
 import { recordLiveEnforceDecision, type LiveEnforceNominator } from './live-enforce-gate-ledger.js';
 import { resolveCanaryCeiling, gradeCanaryCeiling } from './canary-ceiling.js';
+import { admitOrderThroughHardControls } from './hard-controls.js'; // TRA-4650 (choke point: TRA-4655)
 import { recordGiveBackState, getBookSessionPeak, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
 import { recordOptionsBreakerState, getOptionsBreakerRestoreState } from './options-breaker-ledger.js'; // TRA-3218
 import { recordMarkObservation, classifyMarkJump, MAX_MARK_JUMP_X } from './option-mark-sanity.js'; // TRA-2927
@@ -12552,6 +12553,40 @@ export class SignalEngine {
       return false;
     }
 
+    // TRA-4650 — the TRA-4655 hard-controls choke point, bound at THE live
+    // buy_to_open seam (same placement rationale as the canary ceiling above:
+    // every live option open passes here). Runs all seven checks — fleet kill
+    // switch, $500 day-loss lockout, $300 notional cap, 3-position cap, 5s
+    // stale-quote breaker, idempotency — fail closed on any unreadable input.
+    // AFTER the canary record so the canary census denominator keeps counting
+    // while a kill/lockout is engaged; BEFORE the BP pre-checks and the broker
+    // submit, so a refusal never reaches Tradier. `openedAt` is the instant
+    // the paper open priced this row, i.e. the freshest instant its pricing
+    // inputs are known to derive from — a mirror delayed past 5s (awaited
+    // vetoes, slow ticks) is refused as stale rather than priced off an old
+    // quote. An ALLOW consumes the idempotency key; that is safe here because
+    // a voided open deletes the position and any retry arrives as a NEW row id.
+    const hardVerdict = admitOrderThroughHardControls({
+      kind: 'open',
+      notionalUsd: notionalCost,
+      // Fleet-wide count: live option rows (excluding this row — it is already
+      // in the book pre-mirror, see the TRA-3872 note above) + the equity
+      // book's open positions, which in live mode are the Tradier mirrors.
+      openPositionCount: canaryAtRisk.rows + this.account.getState().openPositions.length,
+      quoteAsOfMs: opened.openedAt,
+      idempotencyKey: `live-option-open:${opened.id}`,
+    });
+    if (!hardVerdict.allowed) {
+      log.warn('live option open REFUSED by hard controls (TRA-4650/TRA-4655)', {
+        optionSymbol: opened.optionSymbol,
+        notionalCost,
+        reasonCode: hardVerdict.reasonCode,
+        username: this.alertUsername ?? null,
+      });
+      tradierVoid(`hard controls REFUSED (${hardVerdict.reasonCode}): ${hardVerdict.reason}`, 'policy');
+      return false;
+    }
+
     // Pre-check: bail before submitting an order we know will be rejected.
     // `optionBuyingPower` is `null` for cash accounts on a raw payload — fall
     // through to the post-submit reconciliation in that case rather than blocking.
@@ -19510,6 +19545,55 @@ export class SignalEngine {
     this.riskGovernor.releaseKillSwitch();
   }
 
+  /**
+   * TRA-4650 — control 7's engine leg: flatten every ENGINE-OPENED live option
+   * row through the existing manual-close seam (census, journal, pending-exit
+   * reconciliation all included, because it IS `submitManualOptionClose`).
+   * A sell limit of $0.01 is the "at market, now" implementation — it crosses
+   * to the bid without needing a quote, which is the point: a force-close is
+   * usually ordered DURING a feed problem. Skipped on purpose, each named in
+   * the result rather than silently: rows already carrying a `pendingExit`
+   * (an exit is in flight; re-staging is refused by the account anyway) and
+   * imported rows (they close via the TRA-4260 smart-sell path, which this
+   * seam structurally cannot drive). LIVE EQUITY mirrors are left to their
+   * resting Tradier OTOCO exit legs, the same board directive the TRA-1267
+   * book-halt flatten follows. Errors are collected, never thrown — one dead
+   * row must not stop the rest of the book from flattening.
+   */
+  async forceFlattenLiveOptionsForHardControls(): Promise<{ closed: number; errors: string[] }> {
+    let closed = 0;
+    const errors: string[] = [];
+    for (const env of ['sandbox', 'production'] as const) {
+      const acct = this.optionsAccounts[env];
+      for (const opt of [...acct.getStateForMode('live').openOptions]) {
+        const label = opt.optionSymbol ?? opt.id;
+        if (opt.pendingExit) {
+          errors.push(`${label}: skipped — exit already in flight (pendingExit)`);
+          continue;
+        }
+        if (opt.importedFromTradier) {
+          errors.push(`${label}: skipped — imported row, closes via the smart-sell path`);
+          continue;
+        }
+        if (!(opt.contractsRemaining > 0)) {
+          errors.push(`${label}: skipped — non-positive contractsRemaining (${String(opt.contractsRemaining)})`);
+          continue;
+        }
+        try {
+          const r = await this.submitManualOptionClose(opt.id, opt.contractsRemaining, 0.01, 'day');
+          if (r.status === 'filled' || r.status === 'pending' || r.status === 'reconciled') {
+            closed++;
+          } else {
+            errors.push(`${label}: ${r.status}${'reason' in r && r.reason ? ` — ${r.reason}` : ''}`);
+          }
+        } catch (err) {
+          errors.push(`${label}: threw — ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
+    return { closed, errors };
+  }
+
   /** TRA-895 — operator reset of the daily circuit-breaker without touching the kill switch. */
   resetDailyCircuitBreaker(): void {
     this.riskGovernor.resetDailyCircuitBreaker();
@@ -22801,6 +22885,39 @@ export class SignalEngine {
       return {
         ok: false,
         reason: `Tradier sizing yielded qty=0 (cash=${balance.totalCash.toFixed(2)} stockBP=${balance.stockBuyingPower ?? 'null'})`,
+      };
+    }
+    // TRA-4650 — the TRA-4655 hard-controls choke point, bound at THE live
+    // equity submit seam (both equity entry callers inherit it, same as the
+    // TRA-726 market-hours gate above). Placed after sizing because the
+    // notional needs the resolved qty; before the split planner and the broker
+    // submit so a refusal never reaches Tradier. `signal.timestamp` is the
+    // signal's fire instant — the freshest instant `currentPrice`'s pricing
+    // inputs are known to derive from — so a submit delayed >5s past the fire
+    // is refused as stale (control 5) rather than priced off an old tick. The
+    // consumed idempotency key is keyed on the signal id: one broker submit
+    // attempt per fired signal, ever (control 3); a retry fires a new signal.
+    const hardVerdict = admitOrderThroughHardControls({
+      kind: 'open',
+      notionalUsd: qty * currentPrice,
+      // Fleet-wide count: the equity book's open positions (live-mode = the
+      // Tradier mirrors) + open live option rows.
+      openPositionCount:
+        this.account.getState().openPositions.length +
+        this.optionsAccount.openPremiumAtRiskForMode('live').rows,
+      quoteAsOfMs: signal.timestamp,
+      idempotencyKey: `live-equity-open:${signal.id}`,
+    });
+    if (!hardVerdict.allowed) {
+      log.warn('live equity bracket REFUSED by hard controls (TRA-4650/TRA-4655)', {
+        symbol: signal.symbol,
+        qty,
+        notionalUsd: qty * currentPrice,
+        reasonCode: hardVerdict.reasonCode,
+      });
+      return {
+        ok: false,
+        reason: `hard controls REFUSED (${hardVerdict.reasonCode}): ${hardVerdict.reason}`,
       };
     }
     // TRA-2050 — TWAP/participation order splitting for larger equity orders,

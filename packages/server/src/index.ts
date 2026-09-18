@@ -278,6 +278,7 @@ import { hydrateOptionsBreakerLedgerFromDisk, summarizeOptionsBreakerLedger } fr
 import { hydrateMarkSanityFromDisk } from './option-mark-sanity.js'; // TRA-2945
 import { hydrateLiveEnforceGateFromDisk } from './live-enforce-gate-ledger.js';
 import { registerHardControlRoutes } from './hard-controls-routes.js'; // TRA-4655
+import { bindHardControlsToEngines } from './hard-controls-bridge.js'; // TRA-4650
 // TRA-2930 — durable per-book EOD archive-participation record.
 import {
   hydrateEodArchiveParticipationFromDisk,
@@ -16231,6 +16232,13 @@ app.post('/api/trading/stop', requireAuth, async (req, res) => {
 // durable latches. The admit() choke point is what the TRA-4657 paper-trading
 // order path MUST call; TRA-4650 extends/verifies on this interface.
 registerHardControlRoutes(app, { requireAuth, requireAdmin });
+// TRA-4650 — fan the fleet latch out to every engine's TRA-526 kill switch and
+// register the live-option force-close handler (control 7's engine leg). The
+// LIVE order seams are additionally bound to admit() inside the engine itself;
+// this bridge is what halts the demo/paper entry paths too.
+bindHardControlsToEngines(() =>
+  getAllUserContexts().map((c) => ({ username: c.username, engine: c.engine })),
+);
 
 // TRA-526 — global kill switch (deterministic risk-layer master override).
 // Engages/releases the manual master halt across BOTH the equities/options

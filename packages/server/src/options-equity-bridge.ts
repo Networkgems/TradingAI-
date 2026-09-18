@@ -1,6 +1,7 @@
 import type { AccountMode } from '@trading-app/shared';
 import type { PaperAccount } from './paper-account.js';
 import type { PaperOptionsAccount } from './options-account.js';
+import { recordHardControlsPnl } from './hard-controls.js';
 
 /**
  * TRA-2323 — the bridge between the options ledger and the equity book.
@@ -56,6 +57,25 @@ export function bindOptionsPnlToEquityBook(
   equityBook: PaperAccount,
 ): void {
   optionsAccount.setRealizedPnlSink((mode: AccountMode, delta: number) => {
+    // TRA-4650 — control 2's feed (the TRA-4655 $500 daily-loss lockout).
+    // This sink is already the one seam every realized-P&L accrual in
+    // `PaperOptionsAccount` reaches (see the TRA-2885 note above), so the
+    // lockout is fed HERE rather than at any of the four accrual call sites.
+    // Live P&L still never touches the paper sizing book (the refusal below
+    // stands); it now also latches the fleet-wide lockout. A NON-FINITE delta
+    // deliberately flows through — `recordHardControlsPnl` latches the day
+    // unreadable on it, which refuses all opens (fail closed). Best-effort
+    // wrap: a hard-controls persistence throw must never reach the booking
+    // path that offered the delta.
+    if (mode === 'live') {
+      try {
+        recordHardControlsPnl(delta);
+      } catch {
+        // recordHardControlsPnl persists fail-soft itself; this guard is for
+        // anything unexpected above that. The booking path must not die here.
+      }
+      return;
+    }
     if (mode !== 'demo') return;
     equityBook.creditRealizedOptionsPnl(delta);
   });

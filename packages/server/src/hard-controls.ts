@@ -109,6 +109,19 @@ interface HardControlsState extends HardControlsPersisted {
 
 export type ForceCloseHandler = () => Promise<{ closed: number; errors: string[] }>;
 
+/**
+ * TRA-4650 — fired on every kill-switch transition (engage AND release; a
+ * force-close-all fires it too, via its internal engage). Lets the fleet
+ * bridge push the latch into each engine's own TRA-526 kill switch without
+ * this module importing any engine. Observers are best-effort: one throwing
+ * must never stop the latch itself, nor the other observers.
+ */
+export type HardControlsKillObserver = (ev: {
+  engaged: boolean;
+  by: string | null;
+  reason: string | null;
+}) => void;
+
 export interface ForceCloseHandlerResult {
   name: string;
   ok: boolean;
@@ -130,6 +143,28 @@ function freshState(nowMs: number): HardControlsState {
 let state: HardControlsState = freshState(Date.now());
 let dataDirOverride: string | null = null;
 const forceCloseHandlers = new Map<string, ForceCloseHandler>();
+const killObservers = new Set<HardControlsKillObserver>();
+
+/** TRA-4650 — subscribe to kill-switch transitions. See {@link HardControlsKillObserver}. */
+export function registerHardControlsKillObserver(observer: HardControlsKillObserver): void {
+  killObservers.add(observer);
+}
+
+function notifyKillObservers(): void {
+  const ev = {
+    engaged: state.killSwitch.engaged,
+    by: state.killSwitch.by,
+    reason: state.killSwitch.reason,
+  };
+  for (const observer of killObservers) {
+    try {
+      observer(ev);
+    } catch {
+      // Best-effort by contract: the latch is already persisted; a broken
+      // observer must not block the remaining observers or the caller.
+    }
+  }
+}
 
 function stateFilePath(): string {
   return join(dataDirOverride ?? resolveDataDir(), HARD_CONTROLS_STATE_FILENAME);
@@ -210,6 +245,7 @@ function pruneIdempotency(nowMs: number): void {
 export function engageHardKillSwitch(by: string, reason: string, nowMs: number = Date.now()): void {
   state.killSwitch = { engaged: true, by, atMs: nowMs, reason: reason || null };
   persist();
+  notifyKillObservers();
 }
 
 /**
@@ -221,6 +257,7 @@ export function releaseHardKillSwitch(): void {
   state.killSwitch = { engaged: false, by: null, atMs: null, reason: null };
   state.forceClose = { engaged: false, by: null, atMs: null };
   persist();
+  notifyKillObservers();
 }
 
 /**
@@ -453,4 +490,5 @@ export function __resetHardControlsForTest(opts?: { dataDir?: string; nowMs?: nu
   dataDirOverride = opts?.dataDir ?? null;
   state = freshState(opts?.nowMs ?? Date.now());
   forceCloseHandlers.clear();
+  killObservers.clear();
 }
