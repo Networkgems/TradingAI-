@@ -467,6 +467,34 @@ tr:hover td { background: var(--bg-hover); }
 /* TRA-372 — inline percent on the Target/Stop chips: lighter weight + smaller font so it reads as a qualifier and doesn't fight the dollar number for attention. */
 .sig-stat-pct { font-size: 0.7rem; font-weight: 500; opacity: 0.8; }
 
+/* TRA-4654 — "Why This Trade?" decision panel, expanded under a signal card. */
+.wtt-toggle { margin-top: 0.55rem; }
+.wtt-panel { margin-top: 0.6rem; padding: 0.6rem; border: 1px solid var(--border); border-radius: 6px; display: flex; flex-direction: column; gap: 0.6rem; }
+.wtt-panel.wtt-loading, .wtt-panel.wtt-error { color: var(--muted); font-size: 0.8rem; }
+.wtt-header { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.wtt-regime { font-size: 0.7rem; color: var(--muted); }
+.wtt-confidence { font-size: 0.7rem; font-weight: 600; }
+.wtt-confidence.none { color: var(--muted); font-weight: 400; }
+.wtt-section-header { display: flex; align-items: baseline; gap: 0.5rem; margin-bottom: 0.25rem; }
+.wtt-section-title { font-size: 0.65rem; text-transform: uppercase; color: var(--muted); letter-spacing: 0.04em; }
+.wtt-incomplete-badge { font-size: 0.65rem; color: var(--red); }
+.wtt-empty { font-size: 0.75rem; color: var(--muted); }
+.wtt-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.5rem; }
+.wtt-checklist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.2rem; }
+.wtt-checklist li { display: flex; gap: 0.4rem; font-size: 0.75rem; align-items: baseline; }
+.wtt-checklist li.pass .wtt-check-mark { color: var(--green); }
+.wtt-checklist li.fail .wtt-check-mark { color: var(--red); }
+.wtt-check-name { font-weight: 600; }
+.wtt-check-desc { color: var(--muted); }
+.wtt-stale-warning, .wtt-liq-reasons, .wtt-correlation-note { grid-column: 1 / -1; font-size: 0.7rem; color: var(--muted); }
+.wtt-stale-warning { color: var(--red); font-weight: 600; }
+.wtt-history-summary { font-size: 0.75rem; }
+.wtt-history-rows { list-style: none; margin: 0.3rem 0 0; padding: 0; display: flex; flex-direction: column; gap: 0.15rem; }
+.wtt-history-rows li { display: flex; gap: 0.75rem; font-size: 0.72rem; }
+.wtt-history-rows .green { color: var(--green); }
+.wtt-history-rows .red { color: var(--red); }
+.wtt-actions { display: flex; gap: 0.5rem; }
+
 /* TRA-372 — option contract row rendered under the entry/stop/target/RR block
    on option signals. Matches the call/put colour treatment used in the Open
    Options table so the user can recognise the contract side at a glance. */

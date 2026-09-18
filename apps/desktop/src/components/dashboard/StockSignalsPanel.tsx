@@ -8,7 +8,9 @@ import { fmtSignedIntPct, fmtQuoteLevel, formatTime, signalLabel } from '../../l
 import { RegimeBanner } from '../RegimeBanner';
 import { SignalOptionRow } from '../SignalOptionRow';
 import { Sma200SignalCard, isSma200Signal } from '../Sma200SignalCard';
+import { WhyThisTradePanel } from './WhyThisTradePanel';
 import type { SymbolState } from '../../types/app';
+import { useState } from 'react';
 
 export function StockSignalsPanel({
   token,
@@ -28,6 +30,9 @@ export function StockSignalsPanel({
   marketOpen?: boolean;
 }) {
   const toast = useToast();
+  // TRA-4654 — which signal's "Why This Trade?" panel is expanded. One at a
+  // time: the panel is dense, and the payload is fetched on expand only.
+  const [whyOpenFor, setWhyOpenFor] = useState<string | null>(null);
 
   // TRA-1350 — scan-status line. `0 signals` on a closed market is EXPECTED
   // (the intraday strategies only fire in-session), so the tab needs to show
@@ -133,6 +138,18 @@ export function StockSignalsPanel({
                     </div>
                   </div>
                   <SignalOptionRow sig={sig} />
+                  {/* TRA-4654 — expandable decision panel: what is the trade,
+                      why is it valid, what breaks it, how much can I lose.
+                      Server-assembled (GET /api/cards/:id/panel); fetched on
+                      expand, rendered in one synchronous pass. */}
+                  <button
+                    className="btn-secondary btn-sm wtt-toggle"
+                    onClick={() => setWhyOpenFor(whyOpenFor === sig.id ? null : sig.id)}
+                    title="Full decision panel: trigger checklist, invalidation, sizing, portfolio impact, history"
+                  >
+                    {whyOpenFor === sig.id ? 'Hide details' : 'Why this trade?'}
+                  </button>
+                  {whyOpenFor === sig.id && <WhyThisTradePanel token={token} signalId={sig.id} />}
                 </div>
                 );
               })}
