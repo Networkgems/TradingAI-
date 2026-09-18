@@ -79,7 +79,13 @@ import { resetSweepCursors, sweepCursorSnapshot, type SweepPass } from './tick-s
 import { summarizeRvScanPath, __resetRvScanTelemetry } from './rv-scan-telemetry.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+// TRA-4692 — the TRA-4650 equity-seam admit runs every live bracket through the
+// hard-controls choke point, whose kill/day-loss/idempotency state is module-
+// global AND disk-persisted (48h retention). The bracket fixtures pin a fresh
+// sandbox per test so they grade the seam, not residue from earlier tests or
+// earlier RUNS of this suite.
+import { __resetHardControlsForTest } from './hard-controls.js';
 import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, liveEquityDcaAddEnvAllowed, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, resolveLiveBrokerArmDrift, applyLiveBrokerArm, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval, shouldRunDecoupledQuoteRefresh, shouldRunDecoupledExitPass, decoupledExitPassDecision, emptyDecoupledExitSkips, DECOUPLED_EXIT_SKIP_REASONS, bucketExitInterval, emptyExitIntervalHistogram, EXIT_INTERVAL_BUCKETS, classifyExitInterval } from './signal-engine.js';
 import { isStockMarketOpen } from '@trading-app/shared'; // TRA-2257
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
@@ -3214,25 +3220,42 @@ describe('SignalEngine — TRA-335 live equity bracket placement', () => {
     return engine;
   }
 
+  // TRA-4692 — a fresh hard-controls sandbox per test: the choke point's
+  // idempotency ledger is consume-on-admit and disk-persisted, so without the
+  // pin a fixture's static signal id would be refused as `duplicate_order` by
+  // the ledger a PREVIOUS run of this suite left in the real DATA_DIR.
+  beforeEach(() => {
+    __resetHardControlsForTest({ dataDir: mkdtempSync(join(tmpdir(), 'se-hard-controls-')) });
+  });
+
+  // TRA-4692 — a bracket fixture sized UNDER the $300 per-trade hard cap the
+  // TRA-4650 equity-seam admit now enforces: $12,500 managed × 1% risk / $5
+  // stop distance ⇒ qty 25, and at a $10 entry the notional is $250. The old
+  // $100-entry fixtures sized to $2,500 and were refused (`max_order_notional`).
+  // The controls are board policy — the fixtures are what changed.
+  function underCap(overrides: Partial<TradeSignal> = {}): TradeSignal {
+    return bbSignal({ entryPrice: 10, stopLoss: 5, takeProfit: 20, ...overrides });
+  }
+
   it('placeTradierEquityBracket submits an OTOCO with the sized qty + entry/TP/SL legs and returns ok on a non-rejected Tradier response', async () => {
     const stub: TradierEquityStub = {
       submitBracketOrder: vi.fn().mockResolvedValue({ id: 42, status: 'ok' }),
       waitForOrderTerminalStatus: vi.fn(async (_id: number, _o?: WaitOpts) => ({
-        id: 42, status: 'filled', exec_quantity: 25, avg_fill_price: 100,
+        id: 42, status: 'filled', exec_quantity: 25, avg_fill_price: 10,
       })),
     };
     const engine = setupLiveEquityEngine(stub);
 
     const result = await (engine as unknown as {
       placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; orderId?: number | string; reason?: string }>
-    }).placeTradierEquityBracket(bbSignal(), 100);
+    }).placeTradierEquityBracket(underCap({ id: 'sig-e1' }), 10);
 
     expect(result.ok).toBe(true);
     expect(result.orderId).toBe(42);
     expect(stub.submitBracketOrder).toHaveBeenCalledTimes(1);
     expect(stub.submitBracketOrder).toHaveBeenCalledWith({
       symbol: 'AAPL', qty: 25, side: 'buy',
-      limitPrice: 100, takeProfitPrice: 110, stopLossPrice: 95,
+      limitPrice: 10, takeProfitPrice: 20, stopLossPrice: 5,
     });
   });
 
@@ -3285,7 +3308,7 @@ describe('SignalEngine — TRA-335 live equity bracket placement', () => {
 
     const result = await (engine as unknown as {
       placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; reason?: string }>
-    }).placeTradierEquityBracket(bbSignal({ side: 'buy' }), 100);
+    }).placeTradierEquityBracket(underCap({ id: 'sig-e2', side: 'buy' }), 10);
 
     expect(result.ok).toBe(true);
     expect(stub.submitBracketOrder).toHaveBeenCalledTimes(1);
@@ -3305,7 +3328,7 @@ describe('SignalEngine — TRA-335 live equity bracket placement', () => {
 
     const result = await (engine as unknown as {
       placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; reason?: string }>
-    }).placeTradierEquityBracket(bbSignal({ side: 'sell' }), 100);
+    }).placeTradierEquityBracket(underCap({ id: 'sig-e3', side: 'sell' }), 10);
 
     expect(result.ok).toBe(true);
     expect(stub.submitBracketOrder).toHaveBeenCalledTimes(1);
@@ -3325,7 +3348,7 @@ describe('SignalEngine — TRA-335 live equity bracket placement', () => {
 
     const result = await (engine as unknown as {
       placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; orderId?: number; reason?: string }>
-    }).placeTradierEquityBracket(bbSignal(), 100);
+    }).placeTradierEquityBracket(underCap({ id: 'sig-e4' }), 10);
 
     expect(result.ok).toBe(false);
     expect(result.reason).toContain('canceled');
@@ -3341,11 +3364,55 @@ describe('SignalEngine — TRA-335 live equity bracket placement', () => {
 
     const result = await (engine as unknown as {
       placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; reason?: string }>
-    }).placeTradierEquityBracket(bbSignal(), 100);
+    }).placeTradierEquityBracket(underCap({ id: 'sig-e5' }), 10);
 
     expect(result.ok).toBe(false);
     expect(result.reason).toContain('Tradier 401 unauthorized');
     expect(stub.waitForOrderTerminalStatus).not.toHaveBeenCalled();
+  });
+
+  // TRA-4692 — the refusal path the old fixtures exercised by accident, now
+  // asserted on purpose: this is the discriminator that fails if the TRA-4650
+  // admit call is ever unwired from the equity seam. The default bbSignal
+  // fixture sizes to qty 25 × $100 = $2,500, well over the $300 hard cap.
+  it('hard controls REFUSE an oversized bracket (max_order_notional) before the broker is reached (TRA-4650)', async () => {
+    const stub: TradierEquityStub = {
+      submitBracketOrder: vi.fn(),
+      waitForOrderTerminalStatus: vi.fn(),
+    };
+    const engine = setupLiveEquityEngine(stub);
+
+    const result = await (engine as unknown as {
+      placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; reason?: string }>
+    }).placeTradierEquityBracket(bbSignal({ id: 'sig-oversized' }), 100);
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain('hard controls REFUSED (max_order_notional)');
+    // The refusal never reaches Tradier.
+    expect(stub.submitBracketOrder).not.toHaveBeenCalled();
+  });
+
+  // TRA-4692 — control 3 at this seam: one broker submit attempt per fired
+  // signal, ever. The admit CONSUMES `live-equity-open:<signal.id>`, so a
+  // second bracket for the same signal id is refused as a duplicate.
+  it('hard controls REFUSE a second bracket for the same signal id (duplicate_order) — the broker is hit exactly once (TRA-4650)', async () => {
+    const stub: TradierEquityStub = {
+      submitBracketOrder: vi.fn().mockResolvedValue({ id: 42, status: 'ok' }),
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 42, status: 'filled' })),
+    };
+    const engine = setupLiveEquityEngine(stub);
+    const sig = underCap({ id: 'sig-dup' });
+    const place = (engine as unknown as {
+      placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; reason?: string }>
+    }).placeTradierEquityBracket.bind(engine);
+
+    const first = await place(sig, 10);
+    expect(first.ok).toBe(true);
+
+    const second = await place(sig, 10);
+    expect(second.ok).toBe(false);
+    expect(second.reason).toContain('hard controls REFUSED (duplicate_order)');
+    expect(stub.submitBracketOrder).toHaveBeenCalledTimes(1);
   });
 
   it('returns ok:false when the cached Tradier balance is missing (engine refuses to size against an unknown balance)', async () => {
@@ -5404,6 +5471,10 @@ describe('SignalEngine — TRA-495 live stocks + options coexistence', () => {
     process.env[RV_ENGINE_FLAG] = '1'; // TRA-4385 — the arm now also requires a live producer
     process.env[OPTION_LIVE_RV_LONG_FLAG] = '1';
     process.env[OPTION_LIVE_TEST_UNTIL_VAR] = FAR_FUTURE_TEST_UNTIL; // TRA-1929 window open
+    // TRA-4692 — fresh hard-controls sandbox: both legs of this coexistence
+    // check now pass the TRA-4650 choke point (option seam + equity seam), and
+    // its idempotency ledger is disk-persisted across runs.
+    __resetHardControlsForTest({ dataDir: mkdtempSync(join(tmpdir(), 'se-hard-controls-')) });
   });
   afterEach(() => {
     delete process.env[RV_ENGINE_FLAG];
@@ -5470,7 +5541,7 @@ describe('SignalEngine — TRA-495 live stocks + options coexistence', () => {
     const equityStub: EquityTradierStub = {
       submitBracketOrder: vi.fn().mockResolvedValue({ id: 42, status: 'ok' }),
       waitForOrderTerminalStatus: vi.fn(async (_id: number, _o?: WaitOpts) => ({
-        id: 42, status: 'filled', exec_quantity: 25, avg_fill_price: 100,
+        id: 42, status: 'filled', exec_quantity: 25, avg_fill_price: 10,
       })),
     };
 
@@ -5491,20 +5562,22 @@ describe('SignalEngine — TRA-495 live stocks + options coexistence', () => {
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
 
     // ── 2) Equity leg: BB-fade signal places an OTOCO bracket. ────────────
+    // TRA-4692 — sized under the $300 per-trade hard cap (TRA-4650): qty 25
+    // at a $10 entry is $250 notional; the old $100 entry sized to $2,500.
     const sig: TradeSignal = {
       id: 'sig-stock-1',
       symbol: 'AAPL',
       type: 'bb_fade',
       side: 'buy',
-      entryPrice: 100,
-      stopLoss: 95,
-      takeProfit: 110,
+      entryPrice: 10,
+      stopLoss: 5,
+      takeProfit: 20,
       riskRewardRatio: 2,
       timestamp: Date.now(),
     };
     const placement = await (engine as unknown as {
       placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; orderId?: number | string; reason?: string }>;
-    }).placeTradierEquityBracket(sig, 100);
+    }).placeTradierEquityBracket(sig, 10);
     expect(placement.ok).toBe(true);
     expect(equityStub.submitBracketOrder).toHaveBeenCalledTimes(1);
 
@@ -5513,7 +5586,7 @@ describe('SignalEngine — TRA-495 live stocks + options coexistence', () => {
     // bracket placement.
     (engine as unknown as {
       openLiveEquityMirror: (s: TradeSignal, p: number, oid: number | string) => { id: string } | null;
-    }).openLiveEquityMirror(sig, 100, placement.orderId!);
+    }).openLiveEquityMirror(sig, 10, placement.orderId!);
 
     // ── 3) Both routes succeeded WITHOUT one silently nulling the other. ──
     expect(optionsStub.buyContractsLimit).toHaveBeenCalledTimes(1);
@@ -5541,7 +5614,7 @@ describe('SignalEngine — TRA-495 live stocks + options coexistence', () => {
     const equityStub: EquityTradierStub = {
       submitBracketOrder: vi.fn().mockResolvedValue({ id: 42, status: 'ok' }),
       waitForOrderTerminalStatus: vi.fn(async () => ({
-        id: 42, status: 'filled', exec_quantity: 25, avg_fill_price: 100,
+        id: 42, status: 'filled', exec_quantity: 25, avg_fill_price: 10,
       })),
     };
     const engine = buildEngine(freshScanner(1.0));
@@ -5553,16 +5626,20 @@ describe('SignalEngine — TRA-495 live stocks + options coexistence', () => {
     };
 
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+    // TRA-4692 — under the $300 hard cap ($10 × qty 25 = $250), fresh signal id.
     const sig: TradeSignal = {
-      id: 'sig-2', symbol: 'AAPL', type: 'bb_fade', side: 'buy',
-      entryPrice: 100, stopLoss: 95, takeProfit: 110, riskRewardRatio: 2, timestamp: Date.now(),
+      id: 'sig-stock-2', symbol: 'AAPL', type: 'bb_fade', side: 'buy',
+      entryPrice: 10, stopLoss: 5, takeProfit: 20, riskRewardRatio: 2, timestamp: Date.now(),
     };
     const placement = await (engine as unknown as {
       placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; orderId?: number | string }>;
-    }).placeTradierEquityBracket(sig, 100);
+    }).placeTradierEquityBracket(sig, 10);
+    // The bracket must genuinely place — a refused placement with the mirror
+    // opened anyway would keep this test green while the live path is dark.
+    expect(placement.ok).toBe(true);
     (engine as unknown as {
       openLiveEquityMirror: (s: TradeSignal, p: number, oid: number | string) => { id: string } | null;
-    }).openLiveEquityMirror(sig, 100, placement.orderId!);
+    }).openLiveEquityMirror(sig, 10, placement.orderId!);
 
     const live = engine.getState();
     expect(live.options.openOptions.length).toBeGreaterThan(0);
