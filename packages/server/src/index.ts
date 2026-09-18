@@ -664,7 +664,7 @@ import {
   PCR_PROMOTION_MIN_Z_SESSIONS,
 } from './pcr-shadow-ledger.js';
 import { initOiShadowLedger, listOiShadowSignals, isOiShadowEnabled, usableSignalCount as usableOiSignalCount } from './oi-shadow-ledger.js';
-import { initNewsCatalystLedger, listNewsCatalystSignals, isNewsCatalystEnabled, chosenSignalCount } from './news-catalyst-ledger.js';
+import { initNewsCatalystLedger, listNewsCatalystSignals, isNewsCatalystEnabled, chosenSignalCount, rowContaminatedSessions } from './news-catalyst-ledger.js';
 import { initNewsCatalystRunLedger, summarizeCatalystRuns } from './news-catalyst-run-ledger.js';
 import { catalystUniverse, catalystSweepGateSnapshot } from './news-catalyst-source.js';
 import { initNewsCatalystLeanLedger, listCatalystLeans, leanBreakdown } from './news-catalyst-lean-ledger.js';
@@ -10752,6 +10752,13 @@ app.get('/api/health/news-catalyst-signals', async (_req, res) => {
       // restart). `attempts` is vendor sweeps this session; `servedFromCache`
       // is the per-account callers that used to each be a sweep.
       sweepGate: catalystSweepGateSnapshot(),
+      // TRA-4682 (CFO addendum) — row basis, beside the run-basis
+      // `sessionsNoHealthyRun`: sessions whose rows carry a quote failure even
+      // though the sweep itself succeeded. Different failure; read both.
+      ...(() => {
+        const s = rowContaminatedSessions(signals, new Set(catalystUniverse()));
+        return { sessionsRowContaminated: s.length, rowContaminatedSessions: s };
+      })(),
       chosenCount: chosen,
       // TRA-4585 (parent TRA-4222) — `promotionReady` is DELIBERATELY UNCHANGED.
       // The parent's complaint is that it is biased downward, because `chosen`

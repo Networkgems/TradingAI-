@@ -255,3 +255,33 @@ export async function listNewsCatalystSignals(): Promise<CatalystShadowRecord[]>
 export function chosenSignalCount(records: readonly CatalystShadowRecord[]): number {
   return records.filter((r) => r.chosen).length;
 }
+
+/**
+ * TRA-4682 (CFO addendum) — the ROW-basis contamination count, the complement
+ * of the run ledger's `sessionsNoHealthyRun`. That one counts sessions where
+ * the news sweep never succeeded; it is blind to sessions where the sweep
+ * succeeded but the QUOTES were bad (08-31, 09-01, 09-17, 09-18). A session is
+ * row-contaminated when any of its rows:
+ *  - carries `degradedRun: true` (absent = unknown, NOT false, and not counted);
+ *  - was dropped `no_quote`; or
+ *  - was dropped `below_min_price` on a name in `largeCaps` — the curated
+ *    catalyst universe, none of which legitimately trades under the floor. Pre-
+ *    TRA-4585 rows filed null/zero quotes under that token (see
+ *    {@link hasUsableQuote}), so this clause is what catches 08-31 / 09-01.
+ */
+export function rowContaminatedSessions(
+  records: readonly CatalystShadowRecord[],
+  largeCaps: ReadonlySet<string>,
+): string[] {
+  const out = new Set<string>();
+  for (const r of records) {
+    if (
+      r.degradedRun === true ||
+      r.dropReason === 'no_quote' ||
+      (r.dropReason === 'below_min_price' && largeCaps.has(r.symbol.toUpperCase()))
+    ) {
+      out.add(r.session);
+    }
+  }
+  return [...out].sort();
+}
