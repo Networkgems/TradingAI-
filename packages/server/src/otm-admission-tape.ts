@@ -21,24 +21,28 @@
 // This surface would otherwise write every scanned contract on every sweep pass.
 // Volume is bounded by three rules, every one of them INDEPENDENT of `mark` and
 // `spreadPct` (a quote-correlated sample would destroy the exact retention ratio
-// being measured):
-//   1. PASS THROTTLE — at most one recorded pass per (symbol × book) per
-//      `PASS_THROTTLE_MS` (wall-clock only). Unrecorded passes still scan and
-//      trade exactly as before; they are simply not written.
+// being measured) AND — since policy v2 — independent of time-of-day:
+//   1. SLOT SAMPLER — the ET day is cut into 30-minute slots. A (book × symbol)
+//      pass is recorded iff it is the first `ok` pass of that pair inside the
+//      slot AND `fnv1a(book|symbol|etDay|slot) % SAMPLE_MOD[class] === 0`. The
+//      selection is decided BEFORE the scan from identity and the clock alone —
+//      never from a quote, never from scan order. Unselected passes still scan
+//      and trade exactly as before; they are simply not written.
 //   2. WHOLE-PASS DROPS ONLY — a pass whose decision count exceeds
 //      `MAX_ROWS_PER_PASS` is dropped IN FULL and counted
 //      (`oversizedPassesDropped`), never truncated: truncation by chain position
 //      correlates with strike and therefore with mark.
-//   3. PER-CLASS DAILY BUDGET — once a (accountClass × ET day) cell holds
-//      `MAX_ROWS_PER_CLASS_PER_DAY` candidate rows, further passes for that cell
-//      are dropped whole and counted (`budgetPassesDropped`). Per class, so a
-//      chatty fixture book can never starve the desk evidence.
-// `ranked` / `ordered` link rows are NEVER throttled (they are one row per
-// nominee / per final open — negligible volume) and are written even when the
-// candidate pass they belong to was not recorded; the join key is
-// (occSymbol × etDay × accountClass), so the admission-vs-ranker split is
-// measured directly rather than inferred.
-//
+//   3. PER-SLOT BUDGET — a (accountClass × ET day × slot) cell holds at most
+//      `MAX_ROWS_PER_SLOT[class]` candidate rows; further passes in that cell are
+//      dropped whole and counted (`slotBudgetPassesDropped`). The budget is per
+//      SLOT, never per day, so exhausting it can only thin one half-hour.
+// ⚠ Policy v1 (f39e939b, live 2026-09-17..18) had a 2h per-pair throttle and a
+// first-come 6000-row DAILY budget. On its first session (2026-09-18) the desk
+// budget was exhausted by 10:17 ET and the fixture budget within one minute of
+// the open, so the whole day's tape was the opening 47 minutes — the widest-
+// spread half-hour, and entirely outside `OTM_ENTRY_WINDOWS_ET`. Time-of-day
+// correlates with spread, so v1 rows are NOT a quote-independent sample; they
+// carry no `samplingPolicy` field and are excluded from the AC4 session count.
 // ── CLASSES ARE NEVER POOLED ─────────────────────────────────────────────────
 // Every row carries `accountClass` (TRA-2355 classifier, frozen at DECISION
 // time — TRA-3715/TRA-3682/TRA-3709). The desk table is the evidence; fixture is
@@ -65,6 +69,7 @@ import { createInterface } from 'readline';
 import type { OtmAdmissionDecision, OtmAdmissionRefusalReason } from '@trading-app/engine';
 import { logger } from './observability/index.js';
 import { etDateString } from './scheduler.js';
+import { etClockParts } from './et-clock.js';
 import {
   classifySpreadCeilingAccount,
   type SpreadCeilingAccountClass,
@@ -74,17 +79,25 @@ const log = logger.child({ module: 'otm-admission-tape' });
 
 export const OTM_ADMISSION_TAPE_FILENAME = 'otm-admission-tape.jsonl';
 
+/** Rows written by this build carry this; v1 rows (no field) are open-biased. */
+export const OTM_ADMISSION_SAMPLING_POLICY = 2;
+/** ET slot width for the sampler (rule 1) and the budget (rule 3). */
+const SLOT_MINUTES = 30;
 /**
- * At most one recorded pass per (symbol × book) per this many ms. ~3–4 recorded
- * passes per symbol per RTH session — the rule's denominator is a per-session
- * candidate count, and pass-over-pass chain snapshots are highly redundant, so
- * sparser passes bound the file without touching the mark/spread distribution.
+ * Rule-1 modulus per class. Sized off the 2026-09-18 desk tape (192 symbols,
+ * ~31 decisions per pass, one universe cycle ≈ 45 min ⇒ ~53k rows/day
+ * unsampled): 12 ⇒ ~4.5k desk rows/day ≈ 1.5 MB, so the byte cap holds well
+ * over the ≥20 desk sessions AC4 needs. Non-desk classes are retention-shape
+ * only and scan far faster (fixture: 113 passes in the first minute), so they
+ * are sampled harder.
  */
-const PASS_THROTTLE_MS = 2 * 60 * 60 * 1000;
+const SAMPLE_MOD: Record<string, number> = { desk: 12 };
+const SAMPLE_MOD_OTHER = 48;
+/** Rule-3 per (class × ET day × slot) row budget — a backstop, ~3x desk's expected slot volume. */
+const MAX_ROWS_PER_SLOT: Record<string, number> = { desk: 1000 };
+const MAX_ROWS_PER_SLOT_OTHER = 200;
 /** A pass bigger than this is dropped WHOLE (rule 2 above), never truncated. */
 const MAX_ROWS_PER_PASS = 400;
-/** Per (accountClass × ET day) candidate-row budget (rule 3 above). */
-const MAX_ROWS_PER_CLASS_PER_DAY = 6000;
 /** Keep this many ms on disk — comfortably over the ≥20 RTH desk sessions AC4 needs. */
 const RETAIN_MS = 60 * 24 * 60 * 60 * 1000;
 /** After time compaction, prune whole OLDEST ET days until the file fits this. */
@@ -129,6 +142,12 @@ export interface OtmAdmissionTapeCandidateRow {
    * carries regardless of where it was refused.
    */
   bindingReason: OtmAdmissionRefusalReason;
+  /**
+   * Sampling policy that selected this row. ABSENT on v1 rows (the open-biased
+   * first-come daily budget — see the policy header); `2` = the slot sampler.
+   * A readout MUST filter to `samplingPolicy >= 2`.
+   */
+  samplingPolicy?: number;
 }
 
 /** A nominee (`ranked`) or a final open (`ordered`) — the survivorship links. */
@@ -147,27 +166,38 @@ export type OtmAdmissionTapeRow = OtmAdmissionTapeCandidateRow | OtmAdmissionTap
 interface ClassDayTally {
   candidateRows: number;
   admitted: number;
+  /** Admitted rows selected by policy >= 2 — the only ones AC4 counts. */
+  admittedSampled: number;
+  /** Candidate rows with no `samplingPolicy` (v1, open-biased). */
+  legacyRows: number;
   byBindingReason: Record<string, number>;
   passesRecorded: number;
   ranked: number;
   ordered: number;
+  firstTs: number;
   lastTs: number;
+  /** Candidate rows per ET 30-minute slot — rule-3 budget AND time coverage. */
+  rowsBySlot: Map<number, number>;
+  /** `${underlying}|${ts}` of the last candidate row — rows of a pass are contiguous. */
+  lastPassKey: string;
 }
 
-// ── Module state (bounded: aggregates + throttle map, never raw rows) ────────
+// ── Module state (bounded: aggregates + per-pair slot map, never raw rows) ───
 let dataDir: string | null = null;
 /** etDay → accountClass → tally. */
 const byDay = new Map<string, Map<string, ClassDayTally>>();
-/** `${book}|${symbol}` → last COMMITTED pass ts (throttle rule 1). */
-const lastPassAt = new Map<string, number>();
+/** `${book}|${symbol}` → `${etDay}|${slot}` of the pair's last COMMITTED pass (rule 1). */
+const lastSlotByPair = new Map<string, string>();
 let oversizedPassesDropped = 0;
-let budgetPassesDropped = 0;
-let throttledPasses = 0;
+let slotBudgetPassesDropped = 0;
+let unsampledPasses = 0;
 let emptyPasses = 0;
 let appendErrors = 0;
 let lastAppendError: string | null = null;
 let hydratedDays = 0;
 let hydratedRecords = 0;
+/** Approximate on-disk bytes: hydrated size plus every append since boot. */
+let fileBytes = 0;
 
 export function otmAdmissionTapePath(dir: string): string {
   return join(dir, OTM_ADMISSION_TAPE_FILENAME);
@@ -177,15 +207,58 @@ export function otmAdmissionTapePath(dir: string): string {
 export function clearOtmAdmissionTape(): void {
   dataDir = null;
   byDay.clear();
-  lastPassAt.clear();
+  lastSlotByPair.clear();
   oversizedPassesDropped = 0;
-  budgetPassesDropped = 0;
-  throttledPasses = 0;
+  slotBudgetPassesDropped = 0;
+  unsampledPasses = 0;
   emptyPasses = 0;
   appendErrors = 0;
   lastAppendError = null;
   hydratedDays = 0;
   hydratedRecords = 0;
+  fileBytes = 0;
+}
+
+/** ET 30-minute slot index (0–47) of an instant. */
+export function otmAdmissionSlot(ms: number): number {
+  const { hour, minute } = etClockParts(new Date(ms));
+  return Math.floor((hour * 60 + minute) / SLOT_MINUTES);
+}
+
+// Hydrate memo: every row of a pass shares one ts, so this almost always hits.
+let slotMemoTs = Number.NaN;
+let slotMemo = 0;
+function slotOf(ms: number): number {
+  if (ms !== slotMemoTs) {
+    slotMemoTs = ms;
+    slotMemo = otmAdmissionSlot(ms);
+  }
+  return slotMemo;
+}
+
+/** 32-bit FNV-1a — a stable, quote-blind hash for the rule-1 sampler. */
+function fnv1a(input: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h;
+}
+
+/**
+ * Rule 1, pure: is this (book × symbol) pair selected in this ET slot?
+ * Depends on identity and the clock ONLY — never on a quote, never on scan order.
+ */
+export function otmAdmissionSlotSelected(
+  book: string,
+  symbol: string,
+  etDay: string,
+  slot: number,
+  accountClass: string,
+): boolean {
+  const mod = SAMPLE_MOD[accountClass] ?? SAMPLE_MOD_OTHER;
+  return fnv1a(`${book}|${symbol}|${etDay}|${slot}`) % mod === 0;
 }
 
 function tallyFor(etDay: string, accountClass: string): ClassDayTally {
@@ -196,7 +269,20 @@ function tallyFor(etDay: string, accountClass: string): ClassDayTally {
   }
   let t = classes.get(accountClass);
   if (!t) {
-    t = { candidateRows: 0, admitted: 0, byBindingReason: {}, passesRecorded: 0, ranked: 0, ordered: 0, lastTs: 0 };
+    t = {
+      candidateRows: 0,
+      admitted: 0,
+      admittedSampled: 0,
+      legacyRows: 0,
+      byBindingReason: {},
+      passesRecorded: 0,
+      ranked: 0,
+      ordered: 0,
+      firstTs: 0,
+      lastTs: 0,
+      rowsBySlot: new Map(),
+      lastPassKey: '',
+    };
     classes.set(accountClass, t);
   }
   return t;
@@ -206,13 +292,27 @@ function applyRow(row: OtmAdmissionTapeRow): void {
   const t = tallyFor(row.etDay, row.accountClass);
   if (row.kind === 'candidate') {
     t.candidateRows += 1;
-    if (row.admitted) t.admitted += 1;
+    const sampled = typeof row.samplingPolicy === 'number' && row.samplingPolicy >= 2;
+    if (!sampled) t.legacyRows += 1;
+    if (row.admitted) {
+      t.admitted += 1;
+      if (sampled) t.admittedSampled += 1;
+    }
     t.byBindingReason[row.bindingReason] = (t.byBindingReason[row.bindingReason] ?? 0) + 1;
+    const slot = slotOf(row.ts);
+    t.rowsBySlot.set(slot, (t.rowsBySlot.get(slot) ?? 0) + 1);
+    // Rebuilt on hydrate too (v1 read 0 after every reboot).
+    const passKey = `${row.underlying}|${row.ts}`;
+    if (passKey !== t.lastPassKey) {
+      t.lastPassKey = passKey;
+      t.passesRecorded += 1;
+    }
   } else if (row.kind === 'ranked') {
     t.ranked += 1;
   } else {
     t.ordered += 1;
   }
+  if (t.firstTs === 0 || row.ts < t.firstTs) t.firstTs = row.ts;
   if (row.ts > t.lastTs) t.lastTs = row.ts;
 }
 
@@ -225,7 +325,9 @@ function appendLines(lines: string[]): void {
     // exists / unwritable — the append below surfaces the error
   }
   try {
-    appendFileSync(path, lines.join('\n') + '\n', 'utf8');
+    const chunk = lines.join('\n') + '\n';
+    appendFileSync(path, chunk, 'utf8');
+    fileBytes += chunk.length;
   } catch (err) {
     appendErrors += 1;
     lastAppendError = err instanceof Error ? err.message : String(err);
@@ -248,27 +350,32 @@ export interface OtmAdmissionPassRecorder {
   onAdmission: (decision: OtmAdmissionDecision) => void;
   /**
    * Call ONLY after the scan returned `reason: 'ok'` — commits the collected
-   * rows (or counts a whole-pass drop) and consumes the throttle slot. A pass
+   * rows (or counts a whole-pass drop) and consumes the pair's ET slot. A pass
    * abandoned without commit (breaker, no chain, fetch error) costs nothing.
    */
   commit: () => void;
 }
 
 /**
- * Begin a recorded scan pass, or return `null` when the (symbol × book) slot is
- * inside the pass throttle — the caller then scans exactly as before, untaped.
+ * Begin a recorded scan pass, or return `null` when rule 1 does not select this
+ * (symbol × book) pass — the caller then scans exactly as before, untaped.
  * Nothing here reads or alters any selection parameter (observe-only).
  */
 export function beginOtmAdmissionPass(ctx: OtmAdmissionPassContext): OtmAdmissionPassRecorder | null {
   const now = ctx.now ?? Date.now();
-  const key = `${ctx.book ?? ''}|${ctx.symbol}`;
-  const last = lastPassAt.get(key);
-  if (last !== undefined && now - last < PASS_THROTTLE_MS) {
-    throttledPasses += 1;
-    return null;
-  }
+  const book = ctx.book ?? '';
+  const key = `${book}|${ctx.symbol}`;
   const accountClass = classifySpreadCeilingAccount(ctx.book ?? undefined);
   const etDay = etDateString(new Date(now));
+  const slot = otmAdmissionSlot(now);
+  const slotKey = `${etDay}|${slot}`;
+  if (
+    lastSlotByPair.get(key) === slotKey
+    || !otmAdmissionSlotSelected(book, ctx.symbol, etDay, slot, accountClass)
+  ) {
+    unsampledPasses += 1;
+    return null;
+  }
   const decisions: OtmAdmissionDecision[] = [];
   return {
     onAdmission: (d) => {
@@ -278,7 +385,7 @@ export function beginOtmAdmissionPass(ctx: OtmAdmissionPassContext): OtmAdmissio
       if (decisions.length <= MAX_ROWS_PER_PASS) decisions.push(d);
     },
     commit: () => {
-      lastPassAt.set(key, now);
+      lastSlotByPair.set(key, slotKey);
       if (decisions.length === 0) {
         emptyPasses += 1;
         return;
@@ -288,8 +395,9 @@ export function beginOtmAdmissionPass(ctx: OtmAdmissionPassContext): OtmAdmissio
         return;
       }
       const t = tallyFor(etDay, accountClass);
-      if (t.candidateRows + decisions.length > MAX_ROWS_PER_CLASS_PER_DAY) {
-        budgetPassesDropped += 1;
+      const slotBudget = MAX_ROWS_PER_SLOT[accountClass] ?? MAX_ROWS_PER_SLOT_OTHER;
+      if ((t.rowsBySlot.get(slot) ?? 0) + decisions.length > slotBudget) {
+        slotBudgetPassesDropped += 1;
         return;
       }
       const lines: string[] = [];
@@ -313,11 +421,11 @@ export function beginOtmAdmissionPass(ctx: OtmAdmissionPassContext): OtmAdmissio
           ...(typeof d.absDelta === 'number' && Number.isFinite(d.absDelta) ? { absDelta: d.absDelta } : {}),
           admitted: d.admitted,
           bindingReason: d.bindingReason,
+          samplingPolicy: OTM_ADMISSION_SAMPLING_POLICY,
         };
         applyRow(row);
         lines.push(JSON.stringify(row));
       }
-      t.passesRecorded += 1;
       appendLines(lines);
     },
   };
@@ -459,6 +567,7 @@ export function hydrateOtmAdmissionTapeFromDisk(dir: string, now: number = Date.
 
   hydratedDays = byDay.size;
   hydratedRecords = records;
+  fileBytes = totalBytes;
   return { days: byDay.size, records };
 }
 
@@ -473,13 +582,25 @@ export interface OtmAdmissionTapeClassDaySummary {
   passesRecorded: number;
   ranked: number;
   ordered: number;
+  /** Admitted rows selected by sampling policy >= 2 (what AC4 counts). OPTIONAL: older builds lack it. */
+  admittedSampled?: number;
+  /** Candidate rows with no `samplingPolicy` — v1, open-biased; exclude from any readout. */
+  legacyRows?: number;
+  /** Candidate rows per ET 30-minute slot, `HH:MM` slot start → rows. The time-coverage check. */
+  rowsBySlotEt?: Record<string, number>;
+  firstTs?: number;
   lastTs: number;
 }
 
 export interface OtmAdmissionTapeClassSummary {
   accountClass: string;
-  /** Distinct ET days holding ≥1 ADMITTED candidate row — the AC4 session unit. */
+  /**
+   * Distinct ET days holding ≥1 ADMITTED candidate row selected by sampling
+   * policy >= 2 — the AC4 session unit. v1 (open-biased) days never count.
+   */
   sessionsWithAdmissions: number;
+  /** Days whose admitted rows are ALL v1 — shown, never counted. */
+  legacySessions?: number;
   candidateRows: number;
   admitted: number;
   ranked: number;
@@ -493,18 +614,22 @@ export interface OtmAdmissionTapeSummary {
   /** The AC4 gate readout: desk-class ET days holding ≥1 admitted candidate row. */
   deskSessionsWithAdmissions: number;
   policy: {
-    passThrottleMs: number;
+    samplingPolicy: number;
+    slotMinutes: number;
+    sampleModDesk: number;
+    sampleModOther: number;
     maxRowsPerPass: number;
-    maxRowsPerClassPerDay: number;
+    maxRowsPerSlotDesk: number;
+    maxRowsPerSlotOther: number;
     retainDays: number;
     maxFileBytes: number;
     /** The independence statement, published so a grader need not read source. */
     sampling: string;
   };
   counters: {
-    throttledPasses: number;
+    unsampledPasses: number;
     oversizedPassesDropped: number;
-    budgetPassesDropped: number;
+    slotBudgetPassesDropped: number;
     emptyPasses: number;
   };
   durability: {
@@ -513,7 +638,14 @@ export interface OtmAdmissionTapeSummary {
     lastAppendError: string | null;
     hydratedDays: number;
     hydratedRecords: number;
+    /** Approximate file size — pruning whole oldest days starts at `policy.maxFileBytes`. */
+    fileBytes: number;
   };
+}
+
+function slotLabel(slot: number): string {
+  const m = slot * SLOT_MINUTES;
+  return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
 }
 
 export function summarizeOtmAdmissionTape(): OtmAdmissionTapeSummary {
@@ -525,6 +657,7 @@ export function summarizeOtmAdmissionTape(): OtmAdmissionTapeSummary {
         c = {
           accountClass,
           sessionsWithAdmissions: 0,
+          legacySessions: 0,
           candidateRows: 0,
           admitted: 0,
           ranked: 0,
@@ -537,15 +670,24 @@ export function summarizeOtmAdmissionTape(): OtmAdmissionTapeSummary {
       c.admitted += t.admitted;
       c.ranked += t.ranked;
       c.ordered += t.ordered;
-      if (t.admitted > 0) c.sessionsWithAdmissions += 1;
+      if (t.admittedSampled > 0) c.sessionsWithAdmissions += 1;
+      else if (t.admitted > 0) c.legacySessions = (c.legacySessions ?? 0) + 1;
+      const rowsBySlotEt: Record<string, number> = {};
+      for (const slot of [...t.rowsBySlot.keys()].sort((a, b) => a - b)) {
+        rowsBySlotEt[slotLabel(slot)] = t.rowsBySlot.get(slot)!;
+      }
       c.days.push({
         etDay,
         candidateRows: t.candidateRows,
         admitted: t.admitted,
+        admittedSampled: t.admittedSampled,
+        legacyRows: t.legacyRows,
         byBindingReason: { ...t.byBindingReason },
         passesRecorded: t.passesRecorded,
         ranked: t.ranked,
         ordered: t.ordered,
+        rowsBySlotEt,
+        firstTs: t.firstTs,
         lastTs: t.lastTs,
       });
     }
@@ -556,18 +698,22 @@ export function summarizeOtmAdmissionTape(): OtmAdmissionTapeSummary {
     byClass,
     deskSessionsWithAdmissions: classes.get('desk')?.sessionsWithAdmissions ?? 0,
     policy: {
-      passThrottleMs: PASS_THROTTLE_MS,
+      samplingPolicy: OTM_ADMISSION_SAMPLING_POLICY,
+      slotMinutes: SLOT_MINUTES,
+      sampleModDesk: SAMPLE_MOD.desk,
+      sampleModOther: SAMPLE_MOD_OTHER,
       maxRowsPerPass: MAX_ROWS_PER_PASS,
-      maxRowsPerClassPerDay: MAX_ROWS_PER_CLASS_PER_DAY,
+      maxRowsPerSlotDesk: MAX_ROWS_PER_SLOT.desk,
+      maxRowsPerSlotOther: MAX_ROWS_PER_SLOT_OTHER,
       retainDays: Math.round(RETAIN_MS / (24 * 60 * 60 * 1000)),
       maxFileBytes: MAX_FILE_BYTES,
       sampling:
-        'Pass-level throttle (wall-clock per symbol×book), whole-pass drops only, per-class daily budget — every rule independent of mark and spreadPct by construction.',
+        'v2 slot sampler: first ok pass per (book×symbol) per ET 30-min slot, selected by fnv1a(book|symbol|etDay|slot) % sampleMod — decided from identity and clock before the scan, independent of mark, spreadPct, scan order and time-of-day. Whole-pass drops only; per-(class×day×slot) row budget, never a daily first-come one. Rows without samplingPolicy are v1 (open-biased) and excluded from sessionsWithAdmissions.',
     },
     counters: {
-      throttledPasses,
+      unsampledPasses,
       oversizedPassesDropped,
-      budgetPassesDropped,
+      slotBudgetPassesDropped,
       emptyPasses,
     },
     durability: {
@@ -576,6 +722,7 @@ export function summarizeOtmAdmissionTape(): OtmAdmissionTapeSummary {
       lastAppendError,
       hydratedDays,
       hydratedRecords,
+      fileBytes,
     },
   };
 }

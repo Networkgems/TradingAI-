@@ -6933,7 +6933,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         etDay: etDateString(new Date(nowMs)),
         ...summary,
         ...(rows !== undefined ? { rows: rows.rows, rowsTruncated: rows.truncated } : {}),
-        note: `${summary.deskSessionsWithAdmissions}/20 desk-class ET sessions with >=1 ADMITTED candidate toward the TRA-4623 AC4 re-run bar. bindingReason = FIRST binding gate in engine evaluation order ('none' = admitted). Sampling is pass-level and independent of mark/spreadPct by construction (see policy). An evidence archive has no backfill: the tape starts at the deploy that armed it. durability.appendErrors > 0 means rows were counted in memory that never reached disk — treat the on-disk export as an undercount, not the counters as an overcount.`,
+        note: `${summary.deskSessionsWithAdmissions}/20 desk-class ET sessions with >=1 ADMITTED candidate toward the TRA-4623 AC4 re-run bar. bindingReason = FIRST binding gate in engine evaluation order ('none' = admitted). Only sampling-policy-v2 days count; v1 rows (no samplingPolicy, 2026-09-17..18) exhausted a first-come daily budget in the opening minutes and are open-biased (legacySessions/legacyRows) - exclude them from any readout. v2 sampling is pass-level and independent of mark, spreadPct and time-of-day by construction (see policy); days[].rowsBySlotEt is the time-coverage check. An evidence archive has no backfill: the tape starts at the deploy that armed it. durability.appendErrors > 0 means rows were counted in memory that never reached disk — treat the on-disk export as an undercount, not the counters as an overcount.`,
       });
     } catch (err: unknown) {
       // An instrument may not take the box down, and it may not report a read
