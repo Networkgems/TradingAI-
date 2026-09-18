@@ -551,3 +551,116 @@ describe('scanTermStructure (TRA-4413 item 4)', () => {
     expect(second.reason).toBe('breaker_open');
   });
 });
+
+// TRA-4664 — `/api/options/otm-mispricing` read `no_expirations` / `no_chain`
+// episodically in RTH with `breakerOpen: false`. Root cause: the client's
+// collapsed `getExpirations`/`getChainSnapshot` turn a Tradier 429 into `[]`,
+// which the scanner reported as a domain outcome AND CACHED (6h for
+// expirations). These tests drive the status-preserving `fetch*` path.
+class CheckedFakeClient extends FakeClient {
+  fetchExpirations = vi.fn<(s: string) => Promise<
+    { ok: true; httpStatus: number; value: string[] } | { ok: false; httpStatus: number }
+  >>();
+  fetchChainSnapshot = vi.fn<(s: string, e: string) => Promise<
+    { ok: true; httpStatus: number; value: OptionChainRow[] } | { ok: false; httpStatus: number }
+  >>();
+}
+
+describe('Tradier HTTP refusals are not listings (TRA-4664)', () => {
+  const okExp = { ok: true as const, httpStatus: 200, value: [EXP] };
+  const okChain = { ok: true as const, httpStatus: 200, value: [row(100, 'call', 0.3)] };
+
+  it('a 429 on expirations is fetch_error + breaker, and is NOT cached as an empty listing', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, advance } = makeService({ client });
+    client.fetchExpirations.mockResolvedValueOnce({ ok: false, httpStatus: 429 }).mockResolvedValue(okExp);
+    client.fetchChainSnapshot.mockResolvedValue(okChain);
+
+    const first = await svc.scanOtm('SPY');
+    expect(first.reason).toBe('fetch_error');
+    expect(first.errorMessage).toMatch(/HTTP 429/);
+    const diag = svc.diagnostics();
+    expect(diag.breakerOpen).toBe(true);
+    expect(diag.upstreamRefusals).toEqual({ byStatus: { '429': 1 }, lastAtMs: NOW_BASE, lastStatus: 429 });
+    // Nothing cached: pre-fix this entry was `[]` for SIX HOURS.
+    expect(diag.expirationsCacheSize).toBe(0);
+
+    // Past the 90s rate-limit cooldown the SAME symbol recovers — only possible
+    // because the refusal was never written to the expirations cache.
+    advance(91_000);
+    const second = await svc.scanOtm('SPY');
+    expect(second.reason).toBe('ok');
+    expect(client.fetchExpirations).toHaveBeenCalledTimes(2);
+    // The collapsed readers are never consulted when the checked ones exist.
+    expect(client.getExpirations).not.toHaveBeenCalled();
+    expect(client.getChainSnapshot).not.toHaveBeenCalled();
+  });
+
+  it('a 5xx on the chain is fetch_error + breaker and is not cached as no_chain', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, advance } = makeService({ client });
+    client.fetchExpirations.mockResolvedValue(okExp);
+    client.fetchChainSnapshot.mockResolvedValueOnce({ ok: false, httpStatus: 502 }).mockResolvedValue(okChain);
+
+    const first = await svc.scanOtm('SPY');
+    expect(first.reason).toBe('fetch_error');
+    expect(svc.diagnostics().breakerOpen).toBe(true);
+    expect(svc.diagnostics().cacheSize).toBe(0);
+    advance(5 * 60_000 + 1);
+    expect((await svc.scanOtm('SPY')).reason).toBe('ok');
+  });
+
+  it('a non-429 4xx refuses THIS request only — the breaker stays closed for every other symbol', async () => {
+    const client = new CheckedFakeClient();
+    const { svc } = makeService({ client });
+    client.fetchExpirations.mockImplementation(async (s) =>
+      s === 'BAD!' ? { ok: false, httpStatus: 400 } : okExp);
+    client.fetchChainSnapshot.mockResolvedValue(okChain);
+
+    expect((await svc.scanOtm('BAD!')).reason).toBe('fetch_error');
+    expect(svc.diagnostics().breakerOpen).toBe(false);
+    expect((await svc.scanOtm('SPY')).reason).toBe('ok');
+  });
+
+  it('a genuine 200 empty listing is still no_expirations (the domain outcome is preserved)', async () => {
+    const client = new CheckedFakeClient();
+    const { svc } = makeService({ client });
+    client.fetchExpirations.mockResolvedValue({ ok: true, httpStatus: 200, value: [] });
+    const r = await svc.scanOtm('NOPT');
+    expect(r.reason).toBe('no_expirations');
+    expect(svc.diagnostics().breakerOpen).toBe(false);
+    expect(svc.diagnostics().upstreamRefusals?.byStatus).toEqual({});
+  });
+
+  it('counts hits, misses and LIVE capacity evictions — a thrashing cache is distinguishable from a full healthy one', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, advance } = makeService({ client });
+    client.fetchExpirations.mockResolvedValue(okExp);
+    client.fetchChainSnapshot.mockResolvedValue(okChain);
+    const cap = svc.diagnostics().chainCacheMaxEntries;
+
+    // Healthy: `cap` symbols, each read twice inside the TTL. Full, zero evictions.
+    for (let i = 0; i < cap; i++) await svc.getSelectorChain(`S${i}`);
+    for (let i = 0; i < cap; i++) await svc.getSelectorChain(`S${i}`);
+    let d = svc.diagnostics();
+    expect(d.cacheSize).toBe(cap);
+    expect(d.chainCache).toEqual({ hits: cap, misses: cap, capacityEvictions: 0 });
+
+    // Thrash: one more than the cap, round-robin. Every read evicts the entry
+    // the NEXT read wants — hits stay flat, live evictions climb.
+    for (let round = 0; round < 2; round++) {
+      for (let i = 0; i <= cap; i++) await svc.getSelectorChain(`T${i}`);
+    }
+    d = svc.diagnostics();
+    expect(d.cacheSize).toBe(cap); // reads identically to the healthy case…
+    expect(d.chainCache!.hits).toBe(cap); // …but not one extra hit
+    expect(d.chainCache!.capacityEvictions).toBeGreaterThan(cap);
+
+    // TTL expiry is not a capacity eviction.
+    const before = svc.diagnostics().chainCache!.capacityEvictions;
+    advance(61_000);
+    await svc.getSelectorChain('FRESH');
+    expect(svc.diagnostics().chainCache!.capacityEvictions).toBe(before);
+    expect(svc.diagnostics().cacheSize).toBe(1);
+  });
+});

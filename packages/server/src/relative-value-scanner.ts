@@ -62,6 +62,10 @@ const MAX_EXPIRATIONS_CACHE_ENTRIES = 64;
 // errors). The 429 branch is forward-compatible scaffolding; wiring 429
 // into the throw path belongs in a follow-up. The immediate win is the
 // 1h→5min shrink for transient blips.
+// TRA-4664 — that follow-up. The scanner now reads expirations/chains through
+// the status-preserving `fetch*` variants (TRA-4059) and raises a refusal as
+// `TradierHttpRefusalError`, so 429 reaches the backoff branch and 5xx the
+// upstream-error branch. A non-429 4xx is request-specific and does NOT trip.
 const RATE_LIMIT_429_COOLDOWN_MS = 90_000;
 const UPSTREAM_ERROR_COOLDOWN_MS = 5 * 60_000;
 const BACKOFF_429_WINDOW_MS = 5 * 60_000;
@@ -215,6 +219,45 @@ export interface RelativeValueScannerDiagnostics {
   /** TRA-943 — hard caps the retained working set is bounded to (live entries). */
   chainCacheMaxEntries: number;
   expirationsCacheMaxEntries: number;
+  /**
+   * TRA-4664 — the counters that decide whether `chainCacheMaxEntries` is
+   * undersized. `cacheSize == max` alone cannot: a full cache of entries that
+   * are re-read inside their TTL is healthy, and a full cache that evicts every
+   * entry before its second read is a pass-through that multiplies upstream
+   * spend. `capacityEvictions` counts only entries evicted while still LIVE
+   * (TTL expiry is not counted) — that number, against `hits`, is the verdict.
+   * Optional on the interface only so test doubles need not carry it; the
+   * Tradier service always emits it. Process-lifetime counts, reset on boot.
+   */
+  chainCache?: CacheCounters;
+  expirationsCache?: CacheCounters;
+  /**
+   * TRA-4664 — Tradier HTTP refusals (429/5xx/401) seen by this scanner, keyed
+   * by HTTP status. Before TRA-4664 the client collapsed these into `[]`, which
+   * the scanner reported as `no_expirations`/`no_chain` and CACHED (6h for
+   * expirations). Absent key ≠ zero: an older build omits the whole object.
+   */
+  upstreamRefusals?: { byStatus: Record<string, number>; lastAtMs: number | null; lastStatus: number | null };
+}
+
+export interface CacheCounters {
+  hits: number;
+  misses: number;
+  /** Entries evicted by the size cap while still inside their TTL. */
+  capacityEvictions: number;
+}
+
+/**
+ * TRA-4664 — a Tradier HTTP refusal, raised by the scanner so the refusal takes
+ * the THROW path (breaker, `fetch_error`, never cached) instead of being read as
+ * an empty listing. The message carries the status, so `is429Error` matches a
+ * rate-limit refusal and the TRA-417 429 backoff finally engages.
+ */
+export class TradierHttpRefusalError extends Error {
+  constructor(readonly endpoint: 'expirations' | 'chain', readonly httpStatus: number, detail: string) {
+    super(`Tradier ${endpoint} HTTP ${httpStatus} (${detail})`);
+    this.name = 'TradierHttpRefusalError';
+  }
 }
 
 /**
@@ -451,6 +494,12 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
   private breakerState: BreakerState | null = null;
   private last429AtMs: number | null = null;
   private consecutive429 = 0;
+  // TRA-4664 — see `RelativeValueScannerDiagnostics.chainCache`/`upstreamRefusals`.
+  private readonly chainCounters: CacheCounters = { hits: 0, misses: 0, capacityEvictions: 0 };
+  private readonly expirationsCounters: CacheCounters = { hits: 0, misses: 0, capacityEvictions: 0 };
+  private readonly refusalsByStatus: Record<string, number> = {};
+  private lastRefusalAtMs: number | null = null;
+  private lastRefusalStatus: number | null = null;
 
   constructor(config: RelativeValueScannerConfig) {
     this.fetchSpot = config.fetchSpot;
@@ -484,6 +533,13 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       expirationsCacheSize: this.expirationsCache.size,
       chainCacheMaxEntries: MAX_CHAIN_CACHE_ENTRIES,
       expirationsCacheMaxEntries: MAX_EXPIRATIONS_CACHE_ENTRIES,
+      chainCache: { ...this.chainCounters },
+      expirationsCache: { ...this.expirationsCounters },
+      upstreamRefusals: {
+        byStatus: { ...this.refusalsByStatus },
+        lastAtMs: this.lastRefusalAtMs,
+        lastStatus: this.lastRefusalStatus,
+      },
     };
   }
 
@@ -864,6 +920,15 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
   private tripBreaker(label: string, err: unknown): void {
     const now = this.now();
     const msg = err instanceof Error ? err.message : String(err);
+    // TRA-4664 — a non-429 4xx is a refusal of THIS request (bad symbol/params),
+    // not an upstream outage: it must not black out every other symbol's scan.
+    if (
+      err instanceof TradierHttpRefusalError &&
+      err.httpStatus >= 400 && err.httpStatus < 500 && err.httpStatus !== 429
+    ) {
+      log.warn('upstream request refused (breaker not tripped)', { label, reason: msg });
+      return;
+    }
     if (is429Error(err)) {
       if (this.last429AtMs != null && now - this.last429AtMs <= BACKOFF_429_WINDOW_MS) {
         this.consecutive429 += 1;
@@ -922,6 +987,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     value: T,
     ttlMs: number,
     maxEntries: number,
+    counters?: CacheCounters,
   ): void {
     const now = this.now();
     cache.delete(key);
@@ -933,7 +999,19 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       const oldest = cache.keys().next().value as K | undefined;
       if (oldest === undefined) break;
       cache.delete(oldest);
+      // Every entry still here survived the TTL sweep above, so this one was
+      // evicted LIVE — the cap, not the clock, threw it away (TRA-4664).
+      if (counters) counters.capacityEvictions += 1;
     }
+  }
+
+  /** TRA-4664 — record a Tradier HTTP refusal and raise it on the throw path. */
+  private refuse(endpoint: 'expirations' | 'chain', httpStatus: number, detail: string): never {
+    const key = String(httpStatus);
+    this.refusalsByStatus[key] = (this.refusalsByStatus[key] ?? 0) + 1;
+    this.lastRefusalAtMs = this.now();
+    this.lastRefusalStatus = httpStatus;
+    throw new TradierHttpRefusalError(endpoint, httpStatus, detail);
   }
 
   private async pickExpiration(symbol: string, dtePrefs: DtePrefs = {}): Promise<string | null> {
@@ -968,9 +1046,23 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     const cached = this.expirationsCache.get(symbol);
     let expirations: string[];
     if (cached && this.now() - cached.at < EXPIRATIONS_CACHE_TTL_MS) {
+      this.expirationsCounters.hits += 1;
       expirations = cached.value;
     } else {
-      expirations = await this.client!.getExpirations(symbol);
+      this.expirationsCounters.misses += 1;
+      // TRA-4664 — the status-preserving read. `getExpirations` collapses a 429
+      // into `[]`, which this method used to cache for SIX HOURS and report as
+      // `no_expirations` — a quota blip poisoning the symbol until the size cap
+      // happened to evict it. A refusal now throws: never cached, and the
+      // caller's catch trips the breaker and reports `fetch_error`.
+      const client = this.client!;
+      if (typeof client.fetchExpirations === 'function') {
+        const r = await client.fetchExpirations(symbol);
+        if (!r.ok) this.refuse('expirations', r.httpStatus, symbol);
+        expirations = r.value;
+      } else {
+        expirations = await client.getExpirations(symbol);
+      }
       this.noteUpstreamSuccess();
       this.putBounded(
         this.expirationsCache,
@@ -978,6 +1070,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
         expirations,
         EXPIRATIONS_CACHE_TTL_MS,
         MAX_EXPIRATIONS_CACHE_ENTRIES,
+        this.expirationsCounters,
       );
     }
     if (expirations.length === 0) return null;
@@ -1021,11 +1114,25 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     const key: ChainKey = `${symbol}|${expiration}`;
     const cached = this.chainCache.get(key);
     if (cached && this.now() - cached.at < CHAIN_CACHE_TTL_MS) {
+      this.chainCounters.hits += 1;
       return cached.value;
     }
-    const rows = await this.client!.getChainSnapshot(symbol, expiration);
+    this.chainCounters.misses += 1;
+    // TRA-4664 — same as `resolveWindowedExpirations`: a refusal was `[]`,
+    // cached for the chain TTL and reported as `no_chain`. Now it throws.
+    const client = this.client!;
+    let rows: OptionChainRow[];
+    if (typeof client.fetchChainSnapshot === 'function') {
+      const r = await client.fetchChainSnapshot(symbol, expiration);
+      if (!r.ok) this.refuse('chain', r.httpStatus, `${symbol},${expiration}`);
+      rows = r.value;
+    } else {
+      rows = await client.getChainSnapshot(symbol, expiration);
+    }
     this.noteUpstreamSuccess();
-    this.putBounded(this.chainCache, key, rows, CHAIN_CACHE_TTL_MS, MAX_CHAIN_CACHE_ENTRIES);
+    this.putBounded(
+      this.chainCache, key, rows, CHAIN_CACHE_TTL_MS, MAX_CHAIN_CACHE_ENTRIES, this.chainCounters,
+    );
     return rows;
   }
 }
