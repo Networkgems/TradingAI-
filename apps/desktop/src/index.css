@@ -3659,6 +3659,25 @@ tr:hover td { background: var(--bg-hover); }
 .health-warn { color: var(--orange); }
 .health-bad { color: var(--red); }
 
+/* TRA-4707 — Tradier stream panel (connection + per-symbol quote age). */
+.tradier-stream { margin-top: 0.8rem; }
+.tradier-stream .muted { padding: 0.4rem 0.8rem; font-size: 0.82rem; }
+.tradier-stream-symbols {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+}
+.tradier-stream-symbols th,
+.tradier-stream-symbols td {
+  padding: 0.3rem 0.8rem;
+  text-align: left;
+  border-top: 1px solid var(--border-subtle);
+}
+.tradier-stream-symbols th { color: var(--muted); font-weight: 600; }
+.tradier-stream-symbols td:last-child,
+.tradier-stream-symbols th:last-child { text-align: right; }
+
 /* TRA-539 — always-visible running-build chip in the header. */
 .version-chip {
   display: inline-flex;

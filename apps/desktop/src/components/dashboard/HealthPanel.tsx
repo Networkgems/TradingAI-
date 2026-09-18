@@ -14,6 +14,7 @@ import { HTTP_URL } from '../../server-url';
 import { logger } from '../../lib/logger';
 import { formatUptime, type BuildInfo } from './VersionChip';
 import { EngineScorecardPanel } from './EngineScorecardPanel';
+import { TradierStreamPanel } from './TradierStreamPanel';
 
 type HealthStatus = 'green' | 'yellow' | 'red';
 
@@ -236,6 +237,11 @@ export function HealthPanel({ token }: { token: string }) {
           <Row label="Node / pid" value={`${h.build.nodeVersion} · ${h.build.pid}`} />
         </Panel>
       </div>
+
+      {/* TRA-4707 — Tradier /markets/events stream: connection state + per-symbol
+          quote age (stale above 2s). Self-fetching; reads "Disabled" while
+          ENABLE_TRADIER_STREAM is off. */}
+      <TradierStreamPanel token={token} />
 
       {/* TRA-1141 — combined accuracy scorecard: both idea engines side by side
           on out-of-sample data. Auxiliary, self-fetching, winner-free. */}

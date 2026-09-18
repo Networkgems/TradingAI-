@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import WebSocket from 'ws';
-import type { MarketTrade, MarketQuote } from '@trading-app/shared';
+import { quoteFreshness, QUOTE_STALE_AFTER_MS, type MarketTrade, type MarketQuote, type SymbolFreshness } from '@trading-app/shared';
 import { tradierBaseUrl, type TradierEnv } from '../tradier/order-client.js';
 
 /**
@@ -27,15 +27,10 @@ export interface StreamQuote extends MarketQuote {
   latencyMs: number;
 }
 
-export interface SymbolFreshness {
-  symbol: string;
-  eventTime: number;
-  receivedAt: number;
-  /** now − eventTime at the moment the snapshot was taken. */
-  ageMs: number;
-  stale: boolean;
-  latencyMs: number;
-}
+// TRA-4707 — the predicate moved to `shared` so the desktop grades staleness
+// with the same function; re-exported here so existing imports keep working.
+export { quoteFreshness };
+export type { SymbolFreshness };
 
 export interface TradierStreamStatus {
   state: StreamConnectionState;
@@ -124,23 +119,6 @@ interface SessionEnvelope {
 
 const DEFAULT_WS_URL = 'wss://ws.tradier.com/v1/markets/events';
 
-/** Pure freshness read, shared by the feed snapshot and any UI that holds a quote. */
-export function quoteFreshness(
-  q: Pick<StreamQuote, 'symbol' | 'eventTime' | 'receivedAt' | 'latencyMs'>,
-  nowMs: number,
-  staleAfterMs = 2000,
-): SymbolFreshness {
-  const ageMs = nowMs - q.eventTime;
-  return {
-    symbol: q.symbol,
-    eventTime: q.eventTime,
-    receivedAt: q.receivedAt,
-    ageMs,
-    stale: ageMs > staleAfterMs,
-    latencyMs: q.latencyMs,
-  };
-}
-
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export class TradierStreamFeed extends EventEmitter {
   private readonly opts: TradierStreamFeedOptions;
@@ -183,7 +161,7 @@ export class TradierStreamFeed extends EventEmitter {
     this.maxDelay = opts.maxReconnectDelayMs ?? 4000;
     this.heartbeatIntervalMs = opts.heartbeatIntervalMs ?? 10_000;
     this.heartbeatTimeoutMs = opts.heartbeatTimeoutMs ?? 25_000;
-    this.staleAfterMs = opts.staleAfterMs ?? 2000;
+    this.staleAfterMs = opts.staleAfterMs ?? QUOTE_STALE_AFTER_MS;
     this.latencyBudgetMs = opts.latencyBudgetMs ?? 500;
     this.delayMs = this.initialDelay;
   }

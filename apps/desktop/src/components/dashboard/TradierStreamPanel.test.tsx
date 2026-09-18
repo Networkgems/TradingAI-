@@ -1,0 +1,148 @@
+// TRA-4707 — Tradier stream panel: connection state + per-symbol quote age that
+// turns stale strictly above 2s. The body is pure (payload + two clocks), so the
+// boundary and the between-poll ageing are asserted without timers; the
+// container is exercised with a stubbed fetch for its honesty states.
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import {
+  TradierStreamBody,
+  TradierStreamPanel,
+  gradeStreamRows,
+  isStreamPayload,
+  type StreamPayload,
+} from './TradierStreamPanel';
+
+const T = 1_758_200_000_000;
+
+function connected(over: Partial<Extract<StreamPayload, { enabled: true }>> = {}): StreamPayload {
+  return {
+    enabled: true,
+    state: 'connected',
+    flag: 'ENABLE_TRADIER_STREAM',
+    flagOn: true,
+    reconnects: 0,
+    lastConnectedAt: T - 60_000,
+    lastDisconnectedAt: null,
+    lastMessageAt: T,
+    lastError: null,
+    staleAfterMs: 2000,
+    quotesReceived: 42,
+    quotesOverLatencyBudget: 0,
+    latencyBudgetMs: 500,
+    maxLatencyMs: 120,
+    subscribedSymbols: 3,
+    quotedSymbols: 2,
+    staleSymbols: 1,
+    generatedAt: T,
+    symbols: [
+      { symbol: 'AAPL', ageMs: null, stale: true, neverQuoted: true, eventTime: null, receivedAt: null, latencyMs: null },
+      { symbol: 'QQQ', ageMs: 1500, stale: false, neverQuoted: false, eventTime: T - 1500, receivedAt: T - 1400, latencyMs: 100 },
+      { symbol: 'SPY', ageMs: 200, stale: false, neverQuoted: false, eventTime: T - 200, receivedAt: T - 150, latencyMs: 50 },
+    ],
+    ...over,
+  };
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe('gradeStreamRows', () => {
+  it('uses the strict >2000ms boundary: exactly 2000ms is fresh, 2001ms is stale', () => {
+    const p = connected();
+    // Local fetch at 10_000; QQQ is 1500ms old at the server's generatedAt.
+    const at = (localNow: number) => Object.fromEntries(gradeStreamRows(p, 10_000, localNow).map((r) => [r.symbol, r]));
+    expect(at(10_500)['QQQ']).toMatchObject({ ageMs: 2000, stale: false });
+    expect(at(10_501)['QQQ']).toMatchObject({ ageMs: 2001, stale: true });
+  });
+
+  it('ages quotes between polls — a server that stops answering turns every row stale', () => {
+    const p = connected();
+    const rows = gradeStreamRows(p, 10_000, 10_000 + 60_000);
+    expect(rows.every((r) => r.stale)).toBe(true);
+  });
+
+  it('never-quoted symbols read stale with no age', () => {
+    const rows = gradeStreamRows(connected(), 0, 0);
+    expect(rows.find((r) => r.symbol === 'AAPL')).toEqual({ symbol: 'AAPL', ageMs: null, stale: true, neverQuoted: true });
+  });
+
+  it('is immune to local clock skew: ages are graded on the server clock', () => {
+    const p = connected();
+    // Local clock 5 minutes behind the server — only the elapsed time since the fetch counts.
+    const rows = gradeStreamRows(p, T - 300_000, T - 300_000);
+    expect(rows.find((r) => r.symbol === 'SPY')).toMatchObject({ ageMs: 200, stale: false });
+  });
+});
+
+describe('TradierStreamBody', () => {
+  it('renders the connection state and flags a stale row', () => {
+    render(<TradierStreamBody payload={connected()} fetchedAtLocal={0} localNow={1000} />);
+    expect(screen.getByTestId('stream-state')).toHaveTextContent('Connected');
+    // QQQ: 1500 + 1000 = 2500ms → stale; SPY: 1200ms → fresh; AAPL never quoted → stale.
+    expect(screen.getByTestId('stream-row-QQQ')).toHaveAttribute('data-stale', 'true');
+    expect(screen.getByTestId('stream-row-QQQ')).toHaveTextContent('2.5s · stale');
+    expect(screen.getByTestId('stream-row-SPY')).toHaveAttribute('data-stale', 'false');
+    expect(screen.getByTestId('stream-row-SPY')).toHaveTextContent('1.2s');
+    expect(screen.getByTestId('stream-row-AAPL')).toHaveTextContent('no quote · stale');
+    expect(screen.getByTestId('stream-stale-count')).toHaveTextContent('2 / 3');
+  });
+
+  for (const [state, label] of [
+    ['reconnecting', 'Reconnecting'],
+    ['disconnected', 'Disconnected'],
+    ['connecting', 'Connecting'],
+  ] as const) {
+    it(`renders ${state}`, () => {
+      render(<TradierStreamBody payload={connected({ state, lastError: 'socket closed 1006' })} fetchedAtLocal={0} localNow={0} />);
+      expect(screen.getByTestId('stream-state')).toHaveTextContent(label);
+      expect(screen.getByText('socket closed 1006')).toBeInTheDocument();
+    });
+  }
+
+  it('renders DISABLED with its reason and no symbol table', () => {
+    const disabled: StreamPayload = {
+      enabled: false, state: 'disabled', reason: 'flag_off', flag: 'ENABLE_TRADIER_STREAM',
+      flagOn: false, staleAfterMs: 2000, generatedAt: T,
+    };
+    render(<TradierStreamBody payload={disabled} fetchedAtLocal={0} localNow={0} />);
+    expect(screen.getByTestId('stream-state')).toHaveTextContent('Disabled');
+    expect(screen.getByTestId('stream-disabled-reason')).toHaveTextContent(/ENABLE_TRADIER_STREAM is off/);
+    expect(screen.queryByRole('table')).toBeNull();
+  });
+});
+
+describe('TradierStreamPanel (container)', () => {
+  it('fetches the stream route with the bearer token and renders it', async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(JSON.stringify(connected()), { status: 200 })));
+    vi.stubGlobal('fetch', fetchMock);
+    render(<TradierStreamPanel token="tok" />);
+    expect(await screen.findByText('Connected')).toBeInTheDocument();
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toMatch(/\/api\/market-data\/stream$/);
+    expect((init.headers as Record<string, string>)['Authorization']).toBe('Bearer tok');
+  });
+
+  it('an unrecognised payload reads as an error, never as a blank Disabled', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({ status: 'green' }), { status: 200 }))));
+    render(<TradierStreamPanel token="t" />);
+    expect(await screen.findByText(/not recognised/)).toBeInTheDocument();
+    expect(screen.queryByText('Disabled')).toBeNull();
+  });
+
+  it('surfaces an HTTP failure', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response('nope', { status: 503 }))));
+    render(<TradierStreamPanel token="t" />);
+    expect(await screen.findByText(/Could not load stream status \(HTTP 503\)/)).toBeInTheDocument();
+  });
+});
+
+describe('isStreamPayload', () => {
+  it('accepts both arms and rejects foreign shapes', () => {
+    expect(isStreamPayload(connected())).toBe(true);
+    expect(isStreamPayload({ enabled: false, state: 'disabled', reason: 'token_missing' })).toBe(true);
+    expect(isStreamPayload({ enabled: false, state: 'disabled', reason: 'bogus' })).toBe(false);
+    expect(isStreamPayload({ enabled: true, state: 'green', generatedAt: 1, symbols: [] })).toBe(false);
+    expect(isStreamPayload(null)).toBe(false);
+  });
+});

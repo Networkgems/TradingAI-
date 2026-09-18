@@ -280,6 +280,7 @@ import { hydrateLiveEnforceGateFromDisk } from './live-enforce-gate-ledger.js';
 import { registerHardControlRoutes } from './hard-controls-routes.js'; // TRA-4655
 import { bindHardControlsToEngines } from './hard-controls-bridge.js'; // TRA-4650
 import { registerPaperTradingRoutes } from './paper-trading-routes.js'; // TRA-4657
+import { createTradierStreamService, registerTradierStreamRoutes } from './tradier-stream-status.js'; // TRA-4707
 import { registerDecisionAuditRoutes } from './decision-audit-routes.js'; // TRA-4658
 import { auditIntervention, queryDecisionAudit } from './decision-audit-log.js'; // TRA-4658 / TRA-4653
 import { buildPostTradeReviews } from './post-trade-review.js'; // TRA-4653
@@ -16413,6 +16414,17 @@ bindHardControlsToEngines(() =>
 // via ENABLE_PAPER_TRADING; the tees live at the engine's alert emitters.
 registerPaperTradingRoutes(app, { requireAuth });
 
+// TRA-4707 — Tradier `/markets/events` stream (TRA-4656 engine module), DEFAULT
+// OFF behind ENABLE_TRADIER_STREAM. Data feed only — no order path. Subscribes
+// the fleet union of the books' active symbols (read once at boot; contexts are
+// initialised above). GET /api/market-data/stream reads `disabled` + reason
+// whenever the feed is not running.
+const tradierStream = createTradierStreamService({
+  resolveSymbols: () => getAllUserContexts().flatMap((ctx) => ctx.engine.getActiveSymbols()),
+});
+tradierStream.start();
+registerTradierStreamRoutes(app, { requireAuth, service: tradierStream });
+
 // TRA-4658 — decision audit log: query + CSV export + coverage counters.
 // The write tees live at the choke point / engine seams; this surface only reads.
 registerDecisionAuditRoutes(app, { requireAuth });
@@ -19411,6 +19423,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
   autonomousDemoSchedule.stop();
   eventLoopWatchdog?.stop();
   heapCensusSampler?.stop();
+  tradierStream.stop();
   const all = getAllUserContexts();
   // Clear each engine's tick timer first so no new tick starts; the in-flight
   // tick (if any) keeps running and is drained next.

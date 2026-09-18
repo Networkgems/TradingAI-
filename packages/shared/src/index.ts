@@ -7,6 +7,9 @@ export * from './promotion-gate.js';
 // TRA-2392 — Symbol universe utilities (subset checks, universe derivation).
 export * from './symbol-universe.js';
 
+// TRA-4707 — streamed-quote staleness: ONE predicate for the engine feed and the desktop UI.
+export * from './quote-freshness.js';
+
 // TRA-2036 — shadow-expectancy promotion guard (pure core): blocks promotion on
 // non-positive net shadow E[R], with a correlation-adjusted effective sample
 // size and a day/episode block-bootstrap CI. Flag-gated, observe-only first.
