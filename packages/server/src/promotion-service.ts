@@ -75,7 +75,21 @@ function toSample(p: Position): PromotionTradeSample {
  */
 export async function collectPaperTrades(username: string, strategyId: string): Promise<Position[]> {
   const isDemo = (p: Position): boolean => p.mode === 'demo' || p.mode === undefined;
-  const matches = (p: Position): boolean => p.signalType === strategyId && isDemo(p) && p.closedAt !== undefined;
+  return collectClosedStrategyPositions(username, strategyId, isDemo);
+}
+
+/**
+ * TRA-4661 — the ledger union behind {@link collectPaperTrades}, with the mode
+ * filter lifted out so the post-promotion divergence monitor reads the SAME
+ * sources (stocks `closedPositions` ∪ durable `supertrendPaperClosed`, de-duped
+ * by id) rather than a second hand-rolled copy of them.
+ */
+export async function collectClosedStrategyPositions(
+  username: string,
+  strategyId: string,
+  keep: (p: Position) => boolean,
+): Promise<Position[]> {
+  const matches = (p: Position): boolean => p.signalType === strategyId && keep(p) && p.closedAt !== undefined;
 
   // De-dupe by position id across the (possibly overlapping) source lists.
   const byId = new Map<string, Position>();
@@ -176,6 +190,45 @@ export async function buildPublicPromotionProbe(strategyId: string): Promise<Pro
   const signoff = rec && rec.decisions.length > 0 ? 'present' : 'absent';
 
   return evaluatePromotion({ strategyId, strategyClass, backtest, backtestVerdict, accumulationBacktest, paper, accumulation: null, signoff, thresholds });
+}
+
+/**
+ * TRA-4661 — the FORWARD population for the post-promotion divergence monitor:
+ * every closed trade of `strategyId`, across every user and BOTH books (demo +
+ * live — a promoted strategy keeps accruing in both), that was OPENED at or
+ * after `sinceMs` (the active sign-off). Opened-after, not closed-after, so the
+ * forward sample is disjoint by construction from the Stage-2 sample that
+ * admitted the strategy. Trades with no `openedAt` cannot be placed on either
+ * side of the sign-off and are counted out, not guessed in. The PCS shadow
+ * ledger is unioned exactly as the admission gate unions it.
+ */
+export async function collectForwardTradeSamples(
+  strategyId: string,
+  sinceMs: number,
+): Promise<{ samples: PromotionTradeSample[]; byMode: { demo: number; live: number; shadow: number }; undated: number }> {
+  const byMode = { demo: 0, live: 0, shadow: 0 };
+  let undated = 0;
+  const samples: PromotionTradeSample[] = [];
+  const after = (openedAt: number | undefined): boolean => {
+    if (typeof openedAt !== 'number' || !Number.isFinite(openedAt)) {
+      undated += 1;
+      return false;
+    }
+    return openedAt >= sinceMs;
+  };
+  for (const u of getAllUsers()) {
+    for (const p of await collectClosedStrategyPositions(u.username, strategyId, () => true)) {
+      if (!after(p.openedAt)) continue;
+      byMode[p.mode === 'live' ? 'live' : 'demo'] += 1;
+      samples.push(toSample(p));
+    }
+  }
+  for (const s of await collectPcsShadowPaperSamples(strategyId)) {
+    if (!after(s.openedAt)) continue;
+    byMode.shadow += 1;
+    samples.push(s);
+  }
+  return { samples, byMode, undated };
 }
 
 /** Most recent paper metrics for a strategy, used when persisting a sign-off snapshot. */

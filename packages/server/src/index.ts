@@ -1047,7 +1047,15 @@ import {
   buildPublicPromotionProbe,
   snapshotPaperMetrics,
   evaluateLiveTransitionGate,
+  collectForwardTradeSamples,
 } from './promotion-service.js';
+// TRA-4661 — standing post-promotion backtest-vs-forward divergence monitor (shadow).
+import {
+  isPromotionDivergenceMonitorShadowEnabled,
+  promotionDivergenceHealth,
+  runPromotionDivergencePass,
+  PROMOTION_DIVERGENCE_RECOMPUTE_MS,
+} from './promotion-divergence-monitor.js';
 import { resolveDataDir } from './data-dir.js';
 // TRA-3595 — the host execution path for the TRA-2906 v1→v2 cash-flow rebuild.
 // Inert unless `TRA2906_CASH_FLOW_REBUILD` is set; see that module's header for
@@ -14332,6 +14340,14 @@ app.post('/api/market-review/run', requireAuth, requireAdmin, async (req, res) =
 // These routes surface the per-stage status with metrics computed from data,
 // register a Stage-1 backtest report, and record the Stage-3 sign-off audit.
 
+// TRA-4661 — PUBLIC read of the standing post-promotion divergence monitor.
+// Same non-sensitive class as the promotion-gate probe below: per signed-off
+// strategy, the reason codes, the forward gate metrics, and the basis the
+// comparison ran against. SHADOW: nothing it reports disables anything.
+app.get('/api/health/promotion-divergence', (_req, res) => {
+  res.json({ ok: true, time: new Date().toISOString(), ...promotionDivergenceHealth(demoFlagEnv()) });
+});
+
 // TRA-803 — PUBLIC, tokenless read-only probe for a strategy's promotion-gate
 // summary, extending the TRA-799 shadow-ledger pattern to the Stage-2 paper
 // gate. Unauthenticated by design and the same non-sensitive class as the other
@@ -18851,6 +18867,38 @@ const otmEvaluationWindowTimer = setInterval(() => {
   });
 }, OTM_EVALUATION_TICK_MS);
 otmEvaluationWindowTimer.unref?.();
+
+// TRA-4661 — hourly recomputation of the post-promotion divergence monitor.
+// The flag is read per tick so arming/disarming via demo-flags needs no
+// restart. A pass logs only verdict TRANSITIONS per strategy.
+function tickPromotionDivergence(): void {
+  if (!isPromotionDivergenceMonitorShadowEnabled(demoFlagEnv())) return;
+  void runPromotionDivergencePass({
+    listRecords: listStrategyRecords,
+    getThresholds: getEffectiveThresholds,
+    collectForward: collectForwardTradeSamples,
+  })
+    .then(({ changed }) => {
+      for (const r of changed) {
+        logger.info('TRA-4661 promotion divergence verdict changed', {
+          strategyId: r.strategyId,
+          reasonCodes: r.reasonCodes,
+          decisionId: r.decisionId,
+          forwardTradeCount: r.forward?.tradeCount ?? 0,
+          minPopulation: r.minPopulation,
+        });
+      }
+    })
+    .catch((err) => {
+      logger.warn('TRA-4661 promotion divergence pass failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    });
+}
+// First pass shortly after boot so an armed monitor is observable without
+// waiting an hour; then hourly.
+setTimeout(tickPromotionDivergence, 2 * 60_000).unref?.();
+setInterval(tickPromotionDivergence, PROMOTION_DIVERGENCE_RECOMPUTE_MS).unref?.();
 
 // ── Static frontend (production web) ────────────────────────────────────────
 const DIST_DIR = join(__dirname, '..', '..', '..', 'apps', 'desktop', 'dist');

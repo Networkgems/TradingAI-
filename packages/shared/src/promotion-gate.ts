@@ -715,21 +715,56 @@ export function evaluatePaperGate(
     failed.push(`paper trade count ${fmt(paper.tradeCount)} < ${t.minTradeCount}`);
   if (!(paper.expectancy > t.minExpectancy))
     failed.push(`paper expectancy ${fmt(paper.expectancy)} not > ${t.minExpectancy}`);
-  if (backtest && backtest.expectancy > 0) {
-    const floor = t.minExpectancyVsBacktestRatio * backtest.expectancy;
-    if (!(paper.expectancy >= floor))
-      failed.push(
-        `paper expectancy ${fmt(paper.expectancy)} < ${fmt(t.minExpectancyVsBacktestRatio)}× backtest (${fmt(floor)}) — overfit signal`,
-      );
-  }
+  const divergence = compareToBacktestBasis(paper, backtest, thresholds);
+  if (divergence.expectancy?.diverged)
+    failed.push(
+      `paper expectancy ${fmt(paper.expectancy)} < ${fmt(t.minExpectancyVsBacktestRatio)}× backtest (${fmt(divergence.expectancy.floor)}) — overfit signal`,
+    );
   if (paper.sharpe === null)
     failed.push(
       'paper Sharpe unverified — too few valid-R trades or too short a span to annualize (need ≥2 trades over ≥~5 trading days)',
     );
   else if (!(paper.sharpe >= t.minSharpe)) failed.push(`paper Sharpe ${fmt(paper.sharpe)} < ${t.minSharpe}`);
-  if (paper.slippageRatio !== null && !(paper.slippageRatio <= t.maxSlippageRatio))
-    failed.push(`realized slippage ${fmt(paper.slippageRatio)}× modeled > ${t.maxSlippageRatio}×`);
+  if (divergence.slippage?.diverged)
+    failed.push(`realized slippage ${fmt(divergence.slippage.ratio)}× modeled > ${t.maxSlippageRatio}×`);
   return { state: failed.length === 0 ? 'pass' : 'fail', failedChecks: failed };
+}
+
+/**
+ * TRA-4661 — the two backtest-vs-forward comparisons, extracted from
+ * {@link evaluatePaperGate} so the Stage-2 admission gate and the standing
+ * post-promotion divergence monitor share ONE copy of the arithmetic and the
+ * ratified `minExpectancyVsBacktestRatio` / `maxSlippageRatio` thresholds.
+ *
+ * An arm is `null` when it is not comparable, never `diverged: false`:
+ *   • expectancy — the basis is absent or its expectancy is ≤ 0 (no ratio floor
+ *     can be formed against a non-positive basis);
+ *   • slippage — `paper.slippageRatio` is null (no trade carried both realized
+ *     and modeled slippage). Advisory in the admission gate, as before.
+ * Population sufficiency is the CALLER's question — this compares whatever it
+ * is handed.
+ */
+export interface BacktestDivergenceComparison {
+  expectancy: { diverged: boolean; floor: number; forward: number; basis: number } | null;
+  slippage: { diverged: boolean; ratio: number; cap: number } | null;
+}
+
+export function compareToBacktestBasis(
+  paper: Pick<PaperGateMetrics, 'expectancy' | 'slippageRatio'>,
+  backtest: Pick<BacktestGateMetrics, 'expectancy'> | null,
+  thresholds: PromotionThresholds = DEFAULT_PROMOTION_THRESHOLDS,
+): BacktestDivergenceComparison {
+  const t = thresholds.paper;
+  let expectancy: BacktestDivergenceComparison['expectancy'] = null;
+  if (backtest && backtest.expectancy > 0) {
+    const floor = t.minExpectancyVsBacktestRatio * backtest.expectancy;
+    expectancy = { diverged: !(paper.expectancy >= floor), floor, forward: paper.expectancy, basis: backtest.expectancy };
+  }
+  const slippage =
+    paper.slippageRatio !== null
+      ? { diverged: !(paper.slippageRatio <= t.maxSlippageRatio), ratio: paper.slippageRatio, cap: t.maxSlippageRatio }
+      : null;
+  return { expectancy, slippage };
 }
 
 /**
