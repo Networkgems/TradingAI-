@@ -281,7 +281,8 @@ import { registerHardControlRoutes } from './hard-controls-routes.js'; // TRA-46
 import { bindHardControlsToEngines } from './hard-controls-bridge.js'; // TRA-4650
 import { registerPaperTradingRoutes } from './paper-trading-routes.js'; // TRA-4657
 import { registerDecisionAuditRoutes } from './decision-audit-routes.js'; // TRA-4658
-import { auditIntervention } from './decision-audit-log.js'; // TRA-4658
+import { auditIntervention, queryDecisionAudit } from './decision-audit-log.js'; // TRA-4658 / TRA-4653
+import { buildPostTradeReviews } from './post-trade-review.js'; // TRA-4653
 // TRA-2930 — durable per-book EOD archive-participation record.
 import {
   hydrateEodArchiveParticipationFromDisk,
@@ -10420,6 +10421,56 @@ app.get('/api/cards/:signalId/panel', requireAuth, async (req, res) => {
     return;
   }
   res.json(panel);
+});
+
+// TRA-4653 — Post-Trade Intelligence: one review record per journal trade,
+// paper and live alike. Pure read-time JOIN of surfaces other issues shipped:
+// the option trade journal (fills, MAE TRA-3946, MFE TRA-4020, crossed
+// re-pricing TRA-4674), the decision audit log (TRA-4658 — the positionId↔
+// signalId bridge and the rule-violation trail) and the card ring (TRA-4649 —
+// the thesis and the cost estimate the fill is graded against). A review is
+// built for EVERY row; joins that could not be made are counted by name in
+// `summary.joins.missingByReason`, never dropped. `calibrationRecords` is the
+// TRA-4652 feed, keyed by setup with per-row cost provenance. Read-only.
+app.get('/api/trade-reviews', requireAuth, async (req, res, next) => {
+  try {
+    const q = req.query as Record<string, string | undefined>;
+    const mode = q['mode'] === 'live' || q['mode'] === 'demo' ? q['mode'] : undefined;
+    const parsedLimit = q['limit'] !== undefined ? Number.parseInt(q['limit'], 10) : NaN;
+    const limit = Number.isInteger(parsedLimit) && parsedLimit > 0
+      ? Math.min(parsedLimit, 2_000)
+      : 500;
+    const rows = await listOptionTradeJournal(mode !== undefined ? { mode } : {});
+    const slice = rows.slice(-limit); // listOptionTradeJournal sorts openTs asc
+    // Audit window: from the earliest surviving row's open day through today.
+    // Files that predate the TRA-4658 go-live simply do not exist — the join
+    // then reads `no_audit_fill_event`, counted, never invented.
+    const fromDay = slice.length > 0 ? etDateKey(slice[0]!.openTs) : etDateKey(Date.now());
+    const audit = queryDecisionAudit({ fromDay, toDay: etDateKey(Date.now()) });
+    const ctx = await userCtx(res);
+    const { cards } = ctx.engine.getRecentCards();
+    const ring = new Map(cards.map(c => [c.signalId, c]));
+    const batch = buildPostTradeReviews(slice, {
+      auditEvents: audit.events,
+      cardForSignal: id => ring.get(id) ?? null,
+    });
+    res.json({
+      asOf: new Date().toISOString(),
+      mode: mode ?? 'all',
+      journalRowsTotal: rows.length,
+      journalRowsReviewed: slice.length,
+      auditWindow: {
+        fromDay: audit.fromDay,
+        toDay: audit.toDay,
+        events: audit.events.length,
+        corruptLines: audit.corruptLines,
+        truncated: audit.truncated,
+      },
+      ...batch,
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // TRA-1303 — Position Advisor readout: per held DEMO-book symbol, the next DCA
