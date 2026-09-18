@@ -782,7 +782,7 @@ describe('throttle CHOKEPOINT identity on the journal open row (TRA-2375)', () =
     riskThrottleSizingPath: 'options_single_leg',
   });
 
-  // The partition the TRA-2331 grade runs (scripts/tra2331-throttle-grade.mjs
+  // The partition the TRA-2331 grade ran (scripts/tra2331-throttle-grade.mjs, deleted TRA-4679;
   // `eligibility()`), restated here against rows the REAL writer produced. Stated
   // as a two-step presence test on purpose — that is the property under test.
   const stamps = (r: OptionTradeJournalRecord): boolean =>
