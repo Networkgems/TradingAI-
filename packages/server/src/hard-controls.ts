@@ -36,6 +36,12 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { join } from 'path';
 import { resolveDataDir, isEphemeralDataDir } from './data-dir.js';
 import { etDateKey } from './et-clock.js';
+import {
+  auditIntervention,
+  auditOrderAdmit,
+  auditStateChange,
+  __resetDecisionAuditForTest,
+} from './decision-audit-log.js';
 
 /** Daily realized-loss lockout, USD. Board number ("$500 → auto-disable"). */
 export const HARD_DAILY_LOSS_LIMIT_USD = 500;
@@ -230,8 +236,18 @@ export function hydrateHardControlsFromDisk(nowMs: number = Date.now()): void {
 function rollDayIfNeeded(nowMs: number): void {
   const today = etDateKey(nowMs);
   if (state.dayLoss.etDay !== today) {
+    const wasLatched = state.dayLoss.lockedOut || state.dayLoss.unreadable;
+    const priorDay = state.dayLoss.etDay;
     state.dayLoss = { etDay: today, realizedPnlUsd: 0, lockedOut: false, lockedAtMs: null, unreadable: false };
     persist();
+    // TRA-4658 — a roll that RE-ARMS trading is a state change worth a row;
+    // a roll off a quiet day is not.
+    if (wasLatched) {
+      auditStateChange({
+        action: 'daily_loss_lockout_cleared', outcome: 'rearmed', atMs: nowMs,
+        reason: `ET day rolled ${priorDay} → ${today}; day-loss latch cleared`,
+      });
+    }
   }
 }
 
@@ -246,6 +262,10 @@ export function engageHardKillSwitch(by: string, reason: string, nowMs: number =
   state.killSwitch = { engaged: true, by, atMs: nowMs, reason: reason || null };
   persist();
   notifyKillObservers();
+  // TRA-4658 — every manual intervention lands in the decision audit log.
+  auditIntervention({
+    action: 'hard_kill_switch_engaged', actor: by, reason: reason || null, atMs: nowMs,
+  });
 }
 
 /**
@@ -253,11 +273,15 @@ export function engageHardKillSwitch(by: string, reason: string, nowMs: number =
  * operator statement that trading may resume, and leaving a hidden second
  * latch behind is how "released but still refusing" tickets get filed.
  */
-export function releaseHardKillSwitch(): void {
+export function releaseHardKillSwitch(by?: string): void {
   state.killSwitch = { engaged: false, by: null, atMs: null, reason: null };
   state.forceClose = { engaged: false, by: null, atMs: null };
   persist();
   notifyKillObservers();
+  auditIntervention({
+    action: 'hard_kill_switch_released', actor: by ?? null,
+    reason: 'kill switch + force-close latch released; trading may resume',
+  });
 }
 
 /**
@@ -294,6 +318,12 @@ export async function requestForceCloseAll(
       results.push({ name, ok: false, closed: 0, errors: [err instanceof Error ? err.message : String(err)] });
     }
   }
+  // TRA-4658 — the flatten order AND what every handler did, one audit row.
+  auditIntervention({
+    action: 'force_close_all', actor: by, reason, atMs: nowMs,
+    outcome: results.every((r) => r.ok) ? 'executed' : 'partial',
+    detail: { handlers: results },
+  });
   return { handlers: results };
 }
 
@@ -306,14 +336,27 @@ export async function requestForceCloseAll(
 export function recordHardControlsPnl(deltaUsd: number, nowMs: number = Date.now()): void {
   rollDayIfNeeded(nowMs);
   if (!Number.isFinite(deltaUsd)) {
+    const wasUnreadable = state.dayLoss.unreadable;
     state.dayLoss.unreadable = true;
     persist();
+    // TRA-4658 — the fail-closed latch is a state change; log the transition.
+    if (!wasUnreadable) {
+      auditStateChange({
+        action: 'day_pnl_unreadable_latched', outcome: 'halted', atMs: nowMs,
+        reason: `a fill's P&L on ${state.dayLoss.etDay} was non-finite; day total unprovable — opens refused for the day`,
+      });
+    }
     return;
   }
   state.dayLoss.realizedPnlUsd += deltaUsd;
   if (state.dayLoss.realizedPnlUsd <= -HARD_DAILY_LOSS_LIMIT_USD && !state.dayLoss.lockedOut) {
     state.dayLoss.lockedOut = true;
     state.dayLoss.lockedAtMs = nowMs;
+    auditStateChange({
+      action: 'daily_loss_lockout_latched', outcome: 'halted', atMs: nowMs,
+      reason: `realized $${state.dayLoss.realizedPnlUsd.toFixed(2)} on ${state.dayLoss.etDay} breached the −$${HARD_DAILY_LOSS_LIMIT_USD} limit; auto-disabled until the ET day rolls`,
+      detail: { realizedPnlUsd: state.dayLoss.realizedPnlUsd, limitUsd: HARD_DAILY_LOSS_LIMIT_USD },
+    });
   }
   persist();
 }
@@ -339,6 +382,18 @@ function refuse(reasonCode: HardControlReasonCode, reason: string): HardControlV
 export function admitOrderThroughHardControls(
   intent: HardControlIntent,
   nowMs: number = Date.now(),
+): HardControlVerdict {
+  const verdict = evaluateAdmitOrder(intent, nowMs);
+  // TRA-4658 — EVERY choke-point verdict, allowed or refused, lands in the
+  // decision audit log. Inside the choke point on purpose: an order path
+  // cannot reach a broker without also reaching this line.
+  auditOrderAdmit(intent, verdict, nowMs);
+  return verdict;
+}
+
+function evaluateAdmitOrder(
+  intent: HardControlIntent,
+  nowMs: number,
 ): HardControlVerdict {
   // (0) fail-closed on unreadable persisted state — never grade off bytes we
   // could not read; a wiped latch and a clean slate must not look alike.
@@ -491,4 +546,10 @@ export function __resetHardControlsForTest(opts?: { dataDir?: string; nowMs?: nu
   state = freshState(opts?.nowMs ?? Date.now());
   forceCloseHandlers.clear();
   killObservers.clear();
+  // TRA-4658 — the audit tees fire from inside this module, so pin their dir
+  // to the same sandbox; otherwise a hard-controls test writes audit rows
+  // into the real DATA_DIR.
+  __resetDecisionAuditForTest({
+    dir: opts?.dataDir ? join(opts.dataDir, 'decision-audit') : null,
+  });
 }

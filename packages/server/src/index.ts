@@ -280,6 +280,8 @@ import { hydrateLiveEnforceGateFromDisk } from './live-enforce-gate-ledger.js';
 import { registerHardControlRoutes } from './hard-controls-routes.js'; // TRA-4655
 import { bindHardControlsToEngines } from './hard-controls-bridge.js'; // TRA-4650
 import { registerPaperTradingRoutes } from './paper-trading-routes.js'; // TRA-4657
+import { registerDecisionAuditRoutes } from './decision-audit-routes.js'; // TRA-4658
+import { auditIntervention } from './decision-audit-log.js'; // TRA-4658
 // TRA-2930 — durable per-book EOD archive-participation record.
 import {
   hydrateEodArchiveParticipationFromDisk,
@@ -16313,6 +16315,10 @@ bindHardControlsToEngines(() =>
 // via ENABLE_PAPER_TRADING; the tees live at the engine's alert emitters.
 registerPaperTradingRoutes(app, { requireAuth });
 
+// TRA-4658 — decision audit log: query + CSV export + coverage counters.
+// The write tees live at the choke point / engine seams; this surface only reads.
+registerDecisionAuditRoutes(app, { requireAuth });
+
 // TRA-526 — global kill switch (deterministic risk-layer master override).
 // Engages/releases the manual master halt across BOTH the equities/options
 // engine (via DailyRiskGovernor), and persists the state
@@ -16329,6 +16335,12 @@ app.post('/api/trading/kill-switch', requireAuth, async (req, res) => {
 
   if (engaged) ctx.engine.engageKillSwitch(reason);
   else ctx.engine.releaseKillSwitch();
+
+  // TRA-4658 — engine-scoped kill switch flips are manual interventions.
+  auditIntervention({
+    action: engaged ? 'kill_switch_engaged' : 'kill_switch_released',
+    actor: username, reason: reason ?? null,
+  });
 
   const updated: AccountSettings = {
     ...settings,
@@ -16349,6 +16361,9 @@ app.post('/api/trading/kill-switch', requireAuth, async (req, res) => {
 // the ET midnight day-roll. Does NOT touch the kill switch. Demo-safe: no settings are mutated.
 app.post('/api/trading/reset-halt', requireAuth, async (_req, res) => {
   const ctx = await userCtx(res);
+  // TRA-4658 — operator identity on the reset; the governor logs the state
+  // change itself (only when a halt was actually cleared).
+  auditIntervention({ action: 'reset_halt', actor: String(res.locals['authUser'] ?? 'unknown') });
   ctx.engine.resetDailyCircuitBreaker();
   broadcastEngineState(ctx);
   res.json({ ok: true, tradingHalted: false });
@@ -16470,6 +16485,12 @@ app.post('/api/positions/:id/close', requireAuth, async (req, res) => {
   }
   const sym = state.symbols.find(s => s.symbol === pos.symbol);
   const price = sym?.price ?? pos.entryPrice;
+  // TRA-4658 — a manual close is an intervention; the resulting exit row is
+  // booked separately at the engine's exit emitter.
+  auditIntervention({
+    action: 'manual_position_close', actor: String(res.locals['authUser'] ?? 'unknown'),
+    symbol: pos.symbol, positionId: id, detail: { requestedPrice: price },
+  });
   ctx.engine.manualClosePosition(id, price);
   broadcastEngineState(ctx);
   res.json({ ok: true });
@@ -16479,6 +16500,9 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
   const username = res.locals['authUser'] as string;
   const ctx = await userCtx(res);
   const { id } = req.params as Record<string, string>;
+  // TRA-4658 — a manual option close is an intervention; the resulting exit
+  // row is booked separately at the engine's exit emitter when it fills.
+  auditIntervention({ action: 'manual_option_close', actor: username, positionId: id });
 
   // TRA-323 / TRA-348 / TRA-352 — close path. There are three sub-paths,
   // each routed by the position's origin:

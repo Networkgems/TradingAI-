@@ -43,7 +43,8 @@ export function registerHardControlRoutes(app: Express, deps: HardControlRouteDe
 
   /** Release — admin only. Also clears the force-close latch (documented). */
   app.post('/api/controls/hard/kill/release', deps.requireAuth, deps.requireAdmin, (_req, res) => {
-    releaseHardKillSwitch();
+    // TRA-4658 — pass the operator identity through to the audit row.
+    releaseHardKillSwitch(String(res.locals['authUser'] ?? 'unknown'));
     res.json({ ok: true, state: getHardControlsState() });
   });
 

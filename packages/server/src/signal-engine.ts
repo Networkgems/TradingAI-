@@ -349,6 +349,18 @@ import {
   recordPaperOptionOpen,
   recordPaperSignal,
 } from './paper-trading.js';
+// TRA-4658 — decision-audit tees at the same seams, ALWAYS ON (no arming
+// flag): signals at the feed sink, fills/exits at the alert emitters, halt
+// transitions at the risk governor. The recorders swallow their own throws.
+import {
+  auditEquityExit,
+  auditEquityFill,
+  auditIntervention,
+  auditOptionExit,
+  auditOptionFill,
+  auditSignalFired,
+  auditStateChange,
+} from './decision-audit-log.js';
 import { recordGiveBackState, getBookSessionPeak, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
 import { recordOptionsBreakerState, getOptionsBreakerRestoreState } from './options-breaker-ledger.js'; // TRA-3218
 import { recordMarkObservation, classifyMarkJump, MAX_MARK_JUMP_X } from './option-mark-sanity.js'; // TRA-2927
@@ -2382,6 +2394,13 @@ export class DailyRiskGovernor {
   private resetIfNewDay(): void {
     const today = etDateString(this.now());
     if (today !== this.currentDay) {
+      // TRA-4658 — a roll that RE-ARMS entries is a state change; log it.
+      if (this.halted) {
+        auditStateChange({
+          action: 'daily_breaker_cleared', outcome: 'rearmed',
+          reason: `ET day rolled to ${today}; daily breaker cleared (was: ${this.haltReason ?? 'no reason recorded'})`,
+        });
+      }
       this.consecutiveLosses = 0;
       this.dailyPnl = 0;
       this.halted = false;
@@ -2445,6 +2464,13 @@ export class DailyRiskGovernor {
   /** TRA-895 — operator reset of the daily circuit-breaker (consecutive-loss / drawdown halt).
    *  Does NOT touch the kill switch — that requires a separate releaseKillSwitch() call. */
   resetDailyCircuitBreaker(): void {
+    // TRA-4658 — log the clear only when a halt was actually in force.
+    if (this.halted) {
+      auditStateChange({
+        action: 'daily_breaker_cleared', outcome: 'rearmed',
+        reason: `operator reset (was: ${this.haltReason ?? 'no reason recorded'})`,
+      });
+    }
     this.consecutiveLosses = 0;
     this.dailyPnl = 0;
     this.halted = false;
@@ -2477,6 +2503,16 @@ export class DailyRiskGovernor {
     if (!this.halted && this.dailyPnl < 0 && drawdownPct >= DAILY_DRAWDOWN_HALT_PCT) {
       this.halted = true;
       this.haltReason = `Daily drawdown −${(drawdownPct * 100).toFixed(1)}% exceeded ${DAILY_DRAWDOWN_HALT_PCT * 100}% limit`;
+    }
+
+    // TRA-4658 — the halt latch is a strategy state change; log the
+    // transition itself, not the notification (which needs a listener).
+    if (!wasHalted && this.halted) {
+      auditStateChange({
+        action: 'daily_breaker_halted', outcome: 'halted',
+        reason: this.haltReason,
+        detail: { consecutiveLosses: this.consecutiveLosses, dailyPnl: this.dailyPnl },
+      });
     }
 
     // TRA-563 — fire the risk_halt alert on the false→true transition only.
@@ -2849,6 +2885,7 @@ export class DailyRiskGovernor {
     if (decision.halt && !this.halted) {
       this.halted = true;
       this.haltReason = decision.haltReason ?? 'Risk autopilot halted new entries';
+      auditStateChange({ action: 'daily_breaker_halted', outcome: 'halted', reason: this.haltReason }); // TRA-4658
     }
 
     // TRA-1072 — the TRANSIENT feed-stale gate: ASSIGN it every tick (set AND
@@ -7422,6 +7459,7 @@ export class SignalEngine {
     // trade. This is THE feed sink, so logging here is exhaustive by the same
     // argument the doc above makes; before the ring so eviction can't un-log.
     recordPaperSignal(signal, this.mode);
+    auditSignalFired(signal, this.mode); // TRA-4658 — same exhaustiveness argument
     this.recentSignals.unshift(signal);
     this.emitSignalAlert(signal);
     while (this.recentSignals.length > MAX_SIGNALS) {
@@ -19446,6 +19484,7 @@ export class SignalEngine {
     // confirmed equity open. Above the alert guard: recording must not depend
     // on whether this book has an alert username.
     recordPaperEquityOpen(pos, this.mode);
+    auditEquityFill(pos, this.mode); // TRA-4658
     if (!this.alertUsername) return;
     emitAlert({
       kind: 'fill',
@@ -19467,6 +19506,7 @@ export class SignalEngine {
     // TRA-3990 entry quote) + choke-point admit, for every confirmed option
     // open across all sleeves. Above the alert guard on purpose.
     recordPaperOptionOpen(opt, this.mode);
+    auditOptionFill(opt, this.mode); // TRA-4658
     if (!this.alertUsername) return;
     emitAlert({
       kind: 'fill',
@@ -19487,6 +19527,7 @@ export class SignalEngine {
     // TRA-4657 — paper ledger: theoretical exit fill for every strategy-driven
     // equity close. Above the alert guard on purpose.
     recordPaperEquityClose(pos, this.mode);
+    auditEquityExit(pos, this.mode); // TRA-4658
     if (!this.alertUsername) return;
     emitAlert({
       kind: 'exit',
@@ -19506,6 +19547,7 @@ export class SignalEngine {
     // row `currentPremium` IS the demo exit fill — TRA-2890) for every
     // strategy-driven option close. Above the alert guard on purpose.
     recordPaperOptionClose(opt, this.mode);
+    auditOptionExit(opt, this.mode); // TRA-4658
     if (!this.alertUsername) return;
     emitAlert({
       kind: 'exit',
