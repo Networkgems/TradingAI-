@@ -482,12 +482,15 @@ export function mergeThresholds(
  * in by the service layer (which recomputed them from data). When
  * `thresholdOverrides` is present a `rationale` is mandatory (TRA-527: defaults
  * may only be loosened with a written rationale). TRA-2392 — accepts
- * `grantedUniverse` from the reviewer, defaulting to `evidenceUniverse` when
- * omitted; refuses G ⊄ E before the append. TRA-4648 — when the call omits
- * `evidenceUniverse`, E falls back to the one registered at Stage 1
- * (`rec.backtest.evidenceUniverse`), so omitting the key is not a bypass of
- * the subset check; an explicit G with no E on the call AND none on the record
- * is refused outright (fail-closed, the posture the rest of this gate takes).
+ * `grantedUniverse` from the reviewer, defaulting to the record's
+ * `evidenceUniverse` when omitted; refuses G ⊄ E before the append.
+ * TRA-4690 — E has exactly ONE writer, the Stage-1 registration: a call that
+ * supplies `evidenceUniverse` is refused outright (TRA-4648 closed the
+ * omitted-E bypass with a record fallback; the supplied-E key was the same
+ * bypass's other half — a reviewer-supplied wide E overrode the Stage-1
+ * record and canary→majors was granted on BTC-only evidence). An explicit G
+ * with no E on the record is refused outright (fail-closed, the posture the
+ * rest of this gate takes).
  */
 export async function recordSignoff(args: {
   strategyId: string;
@@ -496,6 +499,12 @@ export async function recordSignoff(args: {
   paperMetrics: PaperGateMetrics | null;
   thresholdOverrides?: Partial<PromotionThresholds>;
   rationale?: string;
+  /**
+   * TRA-4690 — REFUSED whenever present (any value, null included). The key
+   * stays on the signature so a caller that passes it gets a loud
+   * `PromotionValidationError` instead of a silent drop; E is read from the
+   * Stage-1 record only.
+   */
   evidenceUniverse?: readonly string[] | null;
   grantedUniverse?: readonly string[] | null;
 }): Promise<PromotionDecision> {
@@ -504,20 +513,26 @@ export async function recordSignoff(args: {
   if (args.thresholdOverrides && !args.rationale?.trim()) {
     throw new PromotionValidationError('rationale is required when threshold overrides are applied');
   }
-  // TRA-2392 — refuse null/TOP as an evidence universe
-  if (args.evidenceUniverse === null) {
+  // TRA-4690 — E has exactly ONE writer: the Stage-1 registration. A sign-off
+  // that supplies `evidenceUniverse` (any value, null included, even one that
+  // matches the record) is refused outright — accepting it would keep a second
+  // writer alive, and the measured defect was precisely a reviewer-supplied
+  // wide E winning over the Stage-1 record (canary→majors granted on BTC-only
+  // evidence). The reviewer's only universe lever is `grantedUniverse`.
+  if (args.evidenceUniverse !== undefined) {
     throw new PromotionValidationError(
-      'evidenceUniverse cannot be null (unbounded) — no backtest can measure a catalog that grows on its own',
+      'evidenceUniverse is not accepted on a sign-off — the evidence universe is written by the '
+        + 'Stage-1 registration only; the reviewer narrows the grant via grantedUniverse (G ⊆ record E)',
     );
   }
-  // TRA-4648 — the record is loaded BEFORE the G ⊆ E validation: an omitted
-  // call-E must fall back to the E registered at Stage 1, or omitting the key
-  // is a silent bypass of the subset check (measured: canary→majors grant
-  // accepted on BTC-only Stage-1 evidence). Nothing is written until
-  // `persist()` below, so loading early cannot leak a blank record on a refusal.
+  // TRA-4648 — the record is loaded BEFORE the G ⊆ E validation: E comes from
+  // the record registered at Stage 1, never from this call (measured bypass:
+  // canary→majors grant accepted on BTC-only Stage-1 evidence). Nothing is
+  // written until `persist()` below, so loading early cannot leak a blank
+  // record on a refusal.
   const store = await ensureLoaded();
   const rec = store.strategies[args.strategyId] ?? blankRecord(args.strategyId);
-  const evidenceUniverse = args.evidenceUniverse ?? rec.backtest?.evidenceUniverse ?? undefined;
+  const evidenceUniverse = rec.backtest?.evidenceUniverse ?? undefined;
   // Default grantedUniverse to the effective evidence when the reviewer omits
   // it, so an omitted G lands on the Stage-1 universe rather than `undefined`.
   const grantedUniverse = args.grantedUniverse !== undefined
@@ -527,11 +542,11 @@ export async function recordSignoff(args: {
   const describeUniverse = (u: readonly string[] | null | undefined): string =>
     u === undefined ? 'undefined' : u === null ? 'unbounded' : `[${u.join(', ')}]`;
 
-  // Fail-closed: an explicit grant with no evidence anywhere (neither on this
-  // call nor registered at Stage 1) has nothing to be validated against.
+  // Fail-closed: an explicit grant with no evidence registered at Stage 1 has
+  // nothing to be validated against.
   if (grantedUniverse !== undefined && evidenceUniverse === undefined) {
     throw new PromotionValidationError(
-      `grantedUniverse ${describeUniverse(grantedUniverse)} cannot be granted: no evidenceUniverse on this call and none registered at Stage 1 — cannot grant more than the evidence covered`,
+      `grantedUniverse ${describeUniverse(grantedUniverse)} cannot be granted: no evidenceUniverse registered at Stage 1 — cannot grant more than the evidence covered`,
     );
   }
 
@@ -555,8 +570,9 @@ export async function recordSignoff(args: {
     paperMetrics: args.paperMetrics,
     ...(args.thresholdOverrides ? { thresholdOverrides: args.thresholdOverrides } : {}),
     ...(args.rationale ? { rationale: args.rationale } : {}),
-    // TRA-4648 — the EFFECTIVE E (call value, else the Stage-1 record's) is
-    // what the grant was validated against, so that is what the audit records.
+    // TRA-4690 — the Stage-1 record's E is what the grant was validated
+    // against, so that is what the audit records (a call can no longer carry
+    // its own E, so the trail cannot claim evidence Stage 1 never produced).
     ...(evidenceUniverse !== undefined ? { evidenceUniverse } : {}),
     ...(grantedUniverse !== undefined ? { grantedUniverse } : {}),
   };

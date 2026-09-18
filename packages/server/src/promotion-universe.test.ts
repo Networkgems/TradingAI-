@@ -111,6 +111,15 @@ beforeAll(async () => {
   store = await import('./promotion-store.js');
   tradeStore = await import('./trade-store.js');
 
+  // Pin the promotion store to THIS file's DATA_DIR. vitest's threads pool
+  // shares process.env across worker threads, and the store re-resolves
+  // DATA_DIR lazily on every persist/load — so a concurrently-collected test
+  // file's module-eval DATA_DIR write can silently redirect this file's store
+  // mid-suite, interleaving both files' `dca` records in one store file (the
+  // TRA-4690 walk registers/reads the record throughout, which widened the
+  // window until the two promotion suites flaked when run in one invocation).
+  store.__resetPromotionStoreForTests(join(DATA_DIR, 'promotion-gate.json'));
+
   // Fully promote `dca` for USER on Stages 1+2 (Stage 3 sign-offs are appended
   // inside the cases below, because WHICH grant is latest is what each case is
   // about). Seeding mirrors promotion-service.test.ts: a closed paper ledger
@@ -189,12 +198,20 @@ describe('TRA-2392 — symbol universe promotion gates', () => {
 
       it('case 2: canary→majors with G={BTC-USD} (too narrow) is REFUSED', async () => {
         // The universe a real DCA Stage-1 registration would carry today.
+        // TRA-4690 — E is written by the Stage-1 registration ONLY; the
+        // sign-off may not carry it (recordSignoff refuses the key outright).
+        await store.registerAccumulationBacktestVerdict({
+          strategyId: 'dca',
+          metrics: passingAccumBacktestMetrics(),
+          reportId: 'TRA-2392-universe-btc-evidence',
+          registeredBy: 'qt',
+          evidenceUniverse: ['BTC-USD'],
+        });
         await store.recordSignoff({
           strategyId: 'dca',
           reviewer: 'QuantTrader',
           backtestMetrics: null,
           paperMetrics: await svc.snapshotPaperMetrics(USER, 'dca'),
-          evidenceUniverse: ['BTC-USD'],
           grantedUniverse: ['BTC-USD'],
         });
         const gate = await svc.evaluateLiveTransitionGate(
@@ -217,7 +234,8 @@ describe('TRA-2392 — symbol universe promotion gates', () => {
       // decision walk (no-record → {BTC-USD} → majors) is unchanged.
       it('TRA-4648: grant with E OMITTED is validated against the Stage-1 record E and REFUSED', async () => {
         // Stage 1 re-registers carrying the evidence universe a real DCA run
-        // stamps (the beforeAll registration predates the universe fields).
+        // stamps (case 2 already stamped this E; re-registered here so this
+        // case stays self-describing about the record it validates against).
         await store.registerAccumulationBacktestVerdict({
           strategyId: 'dca',
           metrics: passingAccumBacktestMetrics(),
@@ -261,6 +279,44 @@ describe('TRA-2392 — symbol universe promotion gates', () => {
         // The decision records the EFFECTIVE universes it was validated under.
         expect(d.evidenceUniverse).toEqual(['BTC-USD']);
         expect(d.grantedUniverse).toEqual(['BTC-USD']);
+      });
+
+      // TRA-4690 — the SUPPLIED-E mirror of the TRA-4648 omitted-E bypass. The
+      // measured probe: record E={BTC-USD}, reviewer supplies E=G=majors on
+      // the sign-off itself → pre-fix, the call-E won over the Stage-1 record
+      // (`args.evidenceUniverse ?? rec...`), the grant was accepted, the real
+      // gate flipped canary→majors to allowed=true, and the audit trail
+      // claimed evidence Stage 1 never produced. Refusal appends nothing, so
+      // the file's decision walk is unchanged.
+      it('TRA-4690: sign-off that SUPPLIES a wider E is REFUSED — the call cannot override the Stage-1 record', async () => {
+        const probe = async () =>
+          store.recordSignoff({
+            strategyId: 'dca',
+            reviewer: 'QuantTrader',
+            backtestMetrics: null,
+            paperMetrics: await svc.snapshotPaperMetrics(USER, 'dca'),
+            evidenceUniverse: ['BTC-USD', 'ETH-USD', 'SOL-USD'], // wider than the record E
+            grantedUniverse: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
+          });
+        await expect(probe()).rejects.toThrow(store.PromotionValidationError);
+        // …and the refusal NAMES the key, so a caller cannot believe it was honoured.
+        await expect(probe()).rejects.toThrow(
+          /evidenceUniverse is not accepted on a sign-off — the evidence universe is written by the Stage-1 registration only/,
+        );
+        // The unchecked grant never landed: the REAL gate still refuses the
+        // widening (latest G is the {BTC-USD} default appended above).
+        const gate = await svc.evaluateLiveTransitionGate(
+          USER,
+          cryptoLiveOn('crypto_core_live_majors'),
+          cryptoLiveOn('crypto_core_live_canary_btc'),
+        );
+        expect(gate.allowed).toBe(false);
+        expect(gate.blocked.map(b => b.strategyId)).toEqual(['dca']);
+        // The audit trail cannot claim evidence Stage 1 never produced: the
+        // latest decision's E equals the record E, not the supplied one.
+        const rec = await store.getStrategyRecord('dca');
+        expect(rec?.backtest?.evidenceUniverse).toEqual(['BTC-USD']);
+        expect(rec?.decisions.at(-1)?.evidenceUniverse).toEqual(['BTC-USD']);
       });
     });
 
@@ -323,14 +379,21 @@ describe('TRA-2392 — symbol universe promotion gates', () => {
     });
 
     it('TRA-3473 AC2: ratified AND covered by G → allowed', async () => {
-      // The happy path: append a majors grant (latest decision wins), then the
-      // exact save case 2 refused is approved.
+      // The happy path: majors are reached the only legitimate way (TRA-4690) —
+      // Stage 1 RE-REGISTERS with the majors evidence, then the reviewer grants
+      // G = majors (latest decision wins). The sign-off itself carries no E.
+      await store.registerAccumulationBacktestVerdict({
+        strategyId: 'dca',
+        metrics: passingAccumBacktestMetrics(),
+        reportId: 'TRA-2392-universe-majors-evidence',
+        registeredBy: 'qt',
+        evidenceUniverse: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
+      });
       await store.recordSignoff({
         strategyId: 'dca',
         reviewer: 'QuantTrader',
         backtestMetrics: null,
         paperMetrics: await svc.snapshotPaperMetrics(USER, 'dca'),
-        evidenceUniverse: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
         grantedUniverse: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
       });
       const gate = await svc.evaluateLiveTransitionGate(

@@ -176,10 +176,12 @@ rebuildServer();
 // G=undefined instead of the record E.
 console.log('5. Perturbation 4: record-E fallback removed (same-call E only)...');
 const storeOriginal = readFileSync(STORE_SRC, 'utf-8');
+// TRA-4690 — post-fix, E is read from the record ONLY; this is the line both
+// store perturbations anchor on.
 const FALLBACK_LINE =
-  'const evidenceUniverse = args.evidenceUniverse ?? rec.backtest?.evidenceUniverse ?? undefined;';
+  'const evidenceUniverse = rec.backtest?.evidenceUniverse ?? undefined;';
 if (!storeOriginal.includes(FALLBACK_LINE)) {
-  console.error('BLIND: the record-E fallback line was not found in promotion-store.ts.');
+  console.error('BLIND: the record-E line was not found in promotion-store.ts.');
   console.error('The control no longer matches the code — fix the control, not the tests.');
   process.exit(2);
 }
@@ -205,6 +207,49 @@ if (result.passed && !result.failed) {
   process.exit(2);
 }
 console.log('✓ Perturbation 4 correctly FAILED\n');
+
+// Restore store before perturbation 5
+writeFileSync(STORE_SRC, storeOriginal);
+rebuildServer();
+
+// Perturbation 5 (TRA-4690): restore call-E precedence over the record — the
+// exact measured defect. Two coupled replacements: (a) disable the supplied-E
+// refusal guard, (b) make `args.evidenceUniverse` win over the Stage-1 record
+// again (`args.evidenceUniverse ?? rec...`). The TRA-4690 test must go red:
+// the wide-E sign-off is ACCEPTED instead of refused, the real gate reads
+// canary→majors allowed=true off the wide grant, and the latest decision's E
+// records evidence Stage 1 never produced.
+console.log('6. Perturbation 5: call-E precedence restored (supplied E overrides the record)...');
+const GUARD_LINE = 'if (args.evidenceUniverse !== undefined) {';
+if (!storeOriginal.includes(GUARD_LINE)) {
+  console.error('BLIND: the supplied-E refusal guard was not found in promotion-store.ts.');
+  console.error('The control no longer matches the code — fix the control, not the tests.');
+  process.exit(2);
+}
+const perturbed5 = storeOriginal
+  .replace(GUARD_LINE, 'if (false) { // PERTURBED5 - supplied-E refusal disabled')
+  .replace(
+    FALLBACK_LINE,
+    'const evidenceUniverse = args.evidenceUniverse ?? rec.backtest?.evidenceUniverse ?? undefined; // PERTURBED5 - call-E precedence restored'
+  );
+writeFileSync(STORE_SRC, perturbed5);
+rebuildServer();
+const storeDist5 = readFileSync(STORE_DIST, 'utf-8');
+if (!storeDist5.includes('PERTURBED5')) {
+  console.error(`BLIND: marker "PERTURBED5" not found in ${STORE_DIST}`);
+  console.error('The perturbation did not reach dist. Tests are grading the old code.');
+  writeFileSync(STORE_SRC, storeOriginal);
+  process.exit(2);
+}
+console.log('✓ Marker "PERTURBED5" found in dist');
+
+result = runTests();
+if (result.passed && !result.failed) {
+  console.error('BLIND: Tests passed with call-E precedence restored. They do not discriminate.');
+  writeFileSync(STORE_SRC, storeOriginal);
+  process.exit(2);
+}
+console.log('✓ Perturbation 5 correctly FAILED\n');
 
 // Final restore and pass
 writeFileSync(STORE_SRC, storeOriginal);

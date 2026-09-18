@@ -15040,15 +15040,23 @@ app.post('/api/promotion/signoff', requireAuth, requireAdmin, async (req, res) =
       });
       return;
     }
-    // TRA-4643 — an explicit null in EITHER universe field is refused here, not
-    // coerced. A null G coerced to `undefined` would silently default the grant
-    // to E — converting "grant unbounded" into "grant exactly E" behind the
-    // reviewer's back — and a null E never reached the store's own refusal.
-    const evidenceUniverse = parsePromotionUniverseField(req.body, 'evidenceUniverse');
-    if (!evidenceUniverse.ok) {
-      res.status(400).json({ error: evidenceUniverse.error });
+    // TRA-4690 — this route does not read `evidenceUniverse` at all: E has
+    // exactly one writer, the Stage-1 registration (TRA-2392 ruling 1B — E is
+    // derived by the harness, G is narrowed by the reviewer; the sign-off IS
+    // the reviewer). A body that carries the key is refused loudly, naming it,
+    // so no caller can believe a supplied E was honoured.
+    if (req.body && typeof req.body === 'object' && 'evidenceUniverse' in (req.body as Record<string, unknown>)) {
+      res.status(400).json({
+        error:
+          'evidenceUniverse is not accepted on sign-off — the evidence universe is registered at Stage 1 '
+          + 'by the harness; supply grantedUniverse (⊆ the registered evidence) to narrow the grant',
+      });
       return;
     }
+    // TRA-4643 — an explicit null G is refused here, not coerced. A null G
+    // coerced to `undefined` would silently default the grant to E —
+    // converting "grant unbounded" into "grant exactly E" behind the
+    // reviewer's back.
     const grantedUniverse = parsePromotionUniverseField(req.body, 'grantedUniverse');
     if (!grantedUniverse.ok) {
       res.status(400).json({ error: grantedUniverse.error });
@@ -15062,7 +15070,6 @@ app.post('/api/promotion/signoff', requireAuth, requireAdmin, async (req, res) =
       paperMetrics,
       thresholdOverrides: overrides,
       rationale: typeof body.rationale === 'string' ? body.rationale : undefined,
-      evidenceUniverse: evidenceUniverse.value,
       grantedUniverse: grantedUniverse.value,
     });
     res.status(201).json({ ok: true, decision, status: await buildPromotionStatus(username, body.strategyId) });

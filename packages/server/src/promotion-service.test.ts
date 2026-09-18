@@ -124,6 +124,15 @@ beforeAll(async () => {
   tradeStore = await import('./trade-store.js');
   shared = await import('@trading-app/shared');
 
+  // Pin the promotion store to THIS file's DATA_DIR. vitest's threads pool
+  // shares process.env across worker threads, and the store re-resolves
+  // DATA_DIR lazily on every persist/load — so promotion-universe.test.ts's
+  // module-eval DATA_DIR write can silently redirect this file's store
+  // mid-suite when the two files share an invocation, interleaving both
+  // files' `dca` records in one store file (measured: 11 cross-shaped
+  // failures on the TRA-4690 walk, unreproducible file-by-file).
+  store.__resetPromotionStoreForTests(join(DATA_DIR, 'promotion-gate.json'));
+
   // Seed 60 monitored dca paper trades (50 winners +1.5R, 10 losers -0.5R) — kept
   // so snapshotPaperMetrics still reflects a real ledger — PLUS the OPEN, held
   // accumulation the Stage-2 accumulate leg actually gates on (TRA-1461).
@@ -156,6 +165,10 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
       metrics: passingAccumBacktestMetrics(),
       reportId: 'TRA-695',
       registeredBy: 'qt',
+      // TRA-4690 — E is stamped at Stage-1 registration ONLY (recordSignoff
+      // refuses the key). The majors sign-off two tests down validates its
+      // grant against THIS evidence universe.
+      evidenceUniverse: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
     });
     const status = await svc.buildPromotionStatus(USER, 'dca');
     expect(status.backtest.state).toBe('pass');
@@ -180,7 +193,8 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
       reviewer: 'QuantTrader',
       backtestMetrics: store.deriveBacktestGateMetrics(passingReport()),
       paperMetrics: await svc.snapshotPaperMetrics(USER, 'dca'),
-      evidenceUniverse: ['BTC-USD', 'ETH-USD', 'SOL-USD'], // majors universe
+      // TRA-4690 — no E on the sign-off; the grant validates against the
+      // majors evidence the Stage-1 registration above stamped.
       grantedUniverse: ['BTC-USD', 'ETH-USD', 'SOL-USD'], // grant the full majors
     });
     const status = await svc.buildPromotionStatus(USER, 'dca');
@@ -756,7 +770,8 @@ describe('TRA-2348 promotion gate — the graded unit is (strategy, UNIVERSE)', 
       reviewer: 'QuantTrader',
       backtestMetrics: null,
       paperMetrics: await svc.snapshotPaperMetrics(CANARY_USER, 'dca'),
-      evidenceUniverse: ['BTC-USD'], // evidence only covered BTC
+      // TRA-4690 — no E on the sign-off; the grant validates against the
+      // BTC-only evidence the registration above stamped on the record.
       grantedUniverse: ['BTC-USD'], // grant only BTC, not the full majors
     });
 
@@ -776,13 +791,21 @@ describe('TRA-2348 promotion gate — the graded unit is (strategy, UNIVERSE)', 
     // The store is GLOBAL per strategyId and the gate reads the LATEST decision,
     // so the narrow {BTC-USD} grant appended above would otherwise leak into
     // every later test in this file. Restore alice's majors grant (recorded in
-    // the end-to-end block) as the latest decision.
+    // the end-to-end block) as the latest decision. TRA-4690 — the registration
+    // above also narrowed the RECORD E to {BTC-USD}, and a sign-off may not
+    // carry its own E, so the majors evidence is re-registered at Stage 1 first.
+    await store.registerAccumulationBacktestVerdict({
+      strategyId: 'dca',
+      metrics: passingAccumBacktestMetrics(),
+      reportId: 'restore-majors-evidence',
+      registeredBy: 'qt',
+      evidenceUniverse: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
+    });
     await store.recordSignoff({
       strategyId: 'dca',
       reviewer: 'QuantTrader',
       backtestMetrics: null,
       paperMetrics: await svc.snapshotPaperMetrics(USER, 'dca'),
-      evidenceUniverse: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
       grantedUniverse: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
     });
   });
