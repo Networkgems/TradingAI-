@@ -666,7 +666,7 @@ import {
 import { initOiShadowLedger, listOiShadowSignals, isOiShadowEnabled, usableSignalCount as usableOiSignalCount } from './oi-shadow-ledger.js';
 import { initNewsCatalystLedger, listNewsCatalystSignals, isNewsCatalystEnabled, chosenSignalCount } from './news-catalyst-ledger.js';
 import { initNewsCatalystRunLedger, summarizeCatalystRuns } from './news-catalyst-run-ledger.js';
-import { catalystUniverse } from './news-catalyst-source.js';
+import { catalystUniverse, catalystSweepGateSnapshot } from './news-catalyst-source.js';
 import { initNewsCatalystLeanLedger, listCatalystLeans, leanBreakdown } from './news-catalyst-lean-ledger.js';
 import { initPcsShadowLedger, listPcsShadowSignals, isPcsShadowEnabled, settledSignalCount, PCS_SHADOW_STRATEGY_ID } from './pcs-shadow-ledger.js';
 import {
@@ -10735,6 +10735,10 @@ app.get('/api/health/news-catalyst-signals', async (_req, res) => {
       // this ⇒ the sweep hit its wall-clock bound; succeeded < attempted ⇒ the
       // feed is degraded. Without it, `queriesAttempted` has no scale.
       catalystUniverseSize: catalystUniverse().length,
+      // TRA-4682 — the once-per-session sweep gate, process-local (resets on
+      // restart). `attempts` is vendor sweeps this session; `servedFromCache`
+      // is the per-account callers that used to each be a sweep.
+      sweepGate: catalystSweepGateSnapshot(),
       chosenCount: chosen,
       // TRA-4585 (parent TRA-4222) — `promotionReady` is DELIBERATELY UNCHANGED.
       // The parent's complaint is that it is biased downward, because `chosen`

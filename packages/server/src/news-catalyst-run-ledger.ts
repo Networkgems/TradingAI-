@@ -363,10 +363,19 @@ export interface CatalystRunSummary {
    * as one. It is not a second measurement and must never diverge.
    *
    * A session is DEGRADED if **any** run in it was degraded, not if all were.
-   * That looks harsh until you remember the shadow ledger dedupes one row per
-   * symbol per session, first write wins: one degraded run early in the day
-   * owns that session's rows outright, and a later healthy run cannot overwrite
-   * them. The strict rule is the one that matches what is actually on disk.
+   *
+   * ⚠️ READ THIS AS "SOME RUN FAILED", NOT AS "THE SESSION'S DATA IS BAD"
+   * (TRA-4680/TRA-4682). This field used to be justified by "first write wins:
+   * one degraded run early in the day owns that session's rows". That holds
+   * for exactly one shape — a quote-degraded `picks_built` run, which DOES
+   * write rows — and it does not hold for the shape that actually dominates:
+   * `fetch_degraded` / `fetch_failed` / `source_failed` return before
+   * `scoreAndSelect` and write NO rows, so they cannot own anything. 2026-09-17
+   * is the counterexample on disk: a healthy run wrote 22 rows at 13:00:07Z and
+   * 20 `fetch_degraded` retries followed from 13:02:23Z, flagging a session
+   * whose rows are all clean. That retry storm put this figure at 34/43 (79%).
+   * Kept for continuity; the number to act on is
+   * {@link sessionsNoHealthyRun}.
    */
   sessionsTotal: number;
   sessionsDegraded: number;
@@ -379,6 +388,21 @@ export interface CatalystRunSummary {
    * exactly `['2026-08-31']` once the field has history behind it.
    */
   degradedSessions: string[];
+  /**
+   * TRA-4682 — sessions in which NO run was healthy (every run in the session
+   * is {@link isCatalystRunDegraded}). This is the data-loss count: a session
+   * with at least one healthy run got a real sweep, whatever failed around it.
+   * `sessionsNoHealthyRun <= sessionsDegraded`, always.
+   */
+  sessionsNoHealthyRun: number;
+  /** The ET day keys behind `sessionsNoHealthyRun`, ascending. */
+  noHealthyRunSessions: string[];
+  /**
+   * TRA-4682 — per-session run counts over the FULL ledger (not the
+   * `recentRuns` tail), ascending by session. This is what makes a re-invocation
+   * storm visible: a healthy session should read `runs: 1`.
+   */
+  runsBySession: CatalystSessionRunCount[];
   /**
    * TRA-4598 — the floor {@link isCatalystRunDegraded} applies, published so a
    * reader can grade `quoteCoverageBySession` without reading the source.
@@ -416,6 +440,19 @@ export interface CatalystRunSummary {
   recentRuns: CatalystRunRecord[];
 }
 
+/** TRA-4682 — one session's run histogram. */
+export interface CatalystSessionRunCount {
+  session: string;
+  runs: number;
+  healthyRuns: number;
+  degradedRuns: number;
+  /** ms-epoch of the session's first and last run. */
+  firstAt: number;
+  lastAt: number;
+  /** ms-epoch of the session's first healthy run; `null` ⇔ none. */
+  firstHealthyAt: number | null;
+}
+
 /** TRA-4598 — one session's worst measured quote coverage. */
 export interface CatalystSessionQuoteCoverage {
   session: string;
@@ -450,6 +487,28 @@ export async function summarizeCatalystRuns(tail = 20): Promise<CatalystRunSumma
   const allSessions = new Set(rows.map((r) => r.session));
   const degraded = new Set(rows.filter((r) => isCatalystRunDegraded(r)).map((r) => r.session));
   const degradedSessions = [...degraded].sort();
+
+  // TRA-4682 — per-session histogram over every row. `rows` is ascending by
+  // `at`, so first/last/firstHealthy fall out of one pass.
+  const bySession = new Map<string, CatalystSessionRunCount>();
+  for (const r of rows) {
+    const healthy = !isCatalystRunDegraded(r);
+    let s = bySession.get(r.session);
+    if (!s) {
+      s = { session: r.session, runs: 0, healthyRuns: 0, degradedRuns: 0, firstAt: r.at, lastAt: r.at, firstHealthyAt: null };
+      bySession.set(r.session, s);
+    }
+    s.runs += 1;
+    s.lastAt = r.at;
+    if (healthy) {
+      s.healthyRuns += 1;
+      if (s.firstHealthyAt == null) s.firstHealthyAt = r.at;
+    } else {
+      s.degradedRuns += 1;
+    }
+  }
+  const runsBySession = [...bySession.values()].sort((a, b) => a.session.localeCompare(b.session));
+  const noHealthyRunSessions = runsBySession.filter((s) => s.healthyRuns === 0).map((s) => s.session);
 
   // TRA-4598 — worst MEASURED coverage per session. A run whose coverage is
   // `null` contributes nothing: it cannot win the `<` comparison, so a session
@@ -504,6 +563,9 @@ export async function summarizeCatalystRuns(tail = 20): Promise<CatalystRunSumma
     // identity rather than a coincidence two predicates have to keep agreeing on.
     sessionsEligible: allSessions.size - degraded.size,
     degradedSessions,
+    sessionsNoHealthyRun: noHealthyRunSessions.length,
+    noHealthyRunSessions,
+    runsBySession,
     quoteCoverageFloor: CATALYST_MIN_QUOTE_COVERAGE,
     // Keyed on `quotesAttempted != null` — "the writer looked" — NOT on
     // `worstBySession`, which excludes the measured-but-nothing-to-price case

@@ -52,7 +52,7 @@ import { fetchQuotes, fetchMarketNews } from './yahoo-feed.js';
 import { addStocksSymbol, getStocksWatchlistData } from './watchlist-store.js';
 import { isNewsCatalystEnabled, hasUsableQuote } from './news-catalyst-ledger.js';
 import {
-  buildNewsCatalystPicks,
+  sessionCatalystPicks,
   catalystUniverse,
   fetchCatalystMetrics,
 } from './news-catalyst-source.js';
@@ -389,7 +389,10 @@ export async function generateSmartWatchlist(ctx: UserContext): Promise<string[]
       const hidden = new Set(
         getStocksWatchlistData(ctx.username).hidden.map(s => s.toUpperCase()),
       );
-      newsCatalyst = await buildNewsCatalystPicks({
+      // TRA-4682 — gated to ONE vendor sweep per session. This function runs
+      // once PER USER CONTEXT; calling the ungated builder here was the
+      // ~59 runs/session storm behind TRA-4680.
+      newsCatalyst = await sessionCatalystPicks({
         // TRA-2064 — sweep the catalyst universe by ENTITY. Yahoo's search
         // returns news only for a resolvable ticker/company; the free-text topic
         // queries this used to rely on came back empty every session. The

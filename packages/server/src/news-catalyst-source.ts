@@ -33,6 +33,7 @@ import {
   type CatalystObservationInput,
 } from './news-catalyst-ledger.js';
 import { recordCatalystRun, isCatalystRunDegraded } from './news-catalyst-run-ledger.js';
+import { etDateKey } from './options-chain-recorder.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'news-catalyst-source' });
@@ -294,8 +295,26 @@ function toLedgerRow(
  * every scored candidate to the shadow ledger. Returns the chosen symbols
  * (UPPERCASE) for injection into the smart watchlist. Never throws — a feed
  * failure logs and yields an empty pick list so the watchlist build continues.
+ *
+ * UNGATED — every call is a full vendor sweep and a run-ledger row. The
+ * premarket path must go through {@link sessionCatalystPicks} instead (TRA-4682).
  */
 export async function buildNewsCatalystPicks(deps: CatalystSourceDeps): Promise<string[]> {
+  return (await runCatalystSweep(deps)).picks;
+}
+
+/**
+ * One sweep's result. `pool` is the enriched candidate list of a HEALTHY run —
+ * the thing a later caller in the same session can re-select from without
+ * touching the vendor — and `null` on every run that must not be reused
+ * (degraded, failed, or the feed never answered).
+ */
+interface CatalystSweepResult {
+  picks: string[];
+  pool: CatalystCandidate[] | null;
+}
+
+async function runCatalystSweep(deps: CatalystSourceDeps): Promise<CatalystSweepResult> {
   let feed: MarketNewsResult;
   try {
     feed = await deps.fetchNews();
@@ -320,7 +339,7 @@ export async function buildNewsCatalystPicks(deps: CatalystSourceDeps): Promise<
       quotesOk: null,
       reason,
     });
-    return [];
+    return { picks: [], pool: null };
   }
 
   const news = feed.items;
@@ -347,7 +366,7 @@ export async function buildNewsCatalystPicks(deps: CatalystSourceDeps): Promise<
       quotesOk: null,
       reason: 'all market-news queries failed',
     });
-    return [];
+    return { picks: [], pool: null };
   }
 
   const base = mapNewsToCandidates(news, deps.now);
@@ -367,7 +386,9 @@ export async function buildNewsCatalystPicks(deps: CatalystSourceDeps): Promise<
       quotesAttempted: 0,
       quotesOk: 0,
     });
-    return [];
+    // A measured quiet day IS healthy — the empty pool is a real answer, and a
+    // re-sweep would only spend vendor quota to learn the same thing.
+    return { picks: [], pool: [] };
   }
 
   // Enrich each candidate with market metrics + earnings (bounded fan-out —
@@ -455,5 +476,132 @@ export async function buildNewsCatalystPicks(deps: CatalystSourceDeps): Promise<
     degradedRun,
     ...(picks.length ? { symbols: picks.join(', ') } : {}),
   });
+  return { picks, pool: degradedRun ? null : enriched };
+}
+
+// ── TRA-4682: one vendor sweep per session, not one per account ──────────────
+//
+// The premarket hook builds the smart watchlist PER USER CONTEXT
+// (`runPremarketForAllUsers` → `generateSmartWatchlist(ctx)`), and before this
+// gate every one of those called `buildNewsCatalystPicks` — a full 25-query
+// Yahoo news sweep plus a run-ledger row — once per account. That is the
+// measured `runCount` 2521 over 43 sessions = 58.6 runs/session (TRA-4680).
+//
+// The news sweep is user-independent: the only per-user input is `hidden`, and
+// that only filters selection. So the first healthy sweep of a session is
+// cached as its enriched candidate pool and every later caller re-selects from
+// it in memory — no vendor call and no run row. A failed sweep is retried at
+// most {@link CATALYST_SWEEP_MAX_ATTEMPTS} times per session, no sooner than
+// {@link CATALYST_SWEEP_RETRY_BACKOFF_MS} apart; callers in between get `[]`.
+//
+// Why the backoff is longer than 90s: the failure shape on 2026-09-17 was 20
+// `fetch_degraded` rows at a uniform 1.7s — which is NOT vendor latency. It is
+// `withRetry` short-circuiting all 25 queries on an OPEN 429 breaker
+// (`yahoo-feed.ts` `isRateLimited`, 90s cooldown), leaving only the 9 batches x
+// 200ms `BATCH_PAUSE_MS`. Retrying inside the cooldown cannot succeed and only
+// writes another degraded row, so the backoff must clear it.
+//
+// Process-local on purpose: a restart loses the cache, which costs at most one
+// extra sweep, and the durable run ledger still records every sweep that ran.
+
+/** Vendor sweeps allowed per ET session, successful or not. */
+export const CATALYST_SWEEP_MAX_ATTEMPTS = 3;
+/** Minimum gap between failed sweep attempts — clears the 90s Yahoo 429 breaker. */
+export const CATALYST_SWEEP_RETRY_BACKOFF_MS = 2 * 60_000;
+
+interface SessionSweepState {
+  session: string;
+  attempts: number;
+  lastAttemptAt: number;
+  /** Enriched pool from the session's healthy sweep; `null` until one lands. */
+  pool: CatalystCandidate[] | null;
+  /** Callers answered without a vendor sweep (cache hit or backoff/cap skip). */
+  servedFromCache: number;
+  skipped: number;
+  inFlight: Promise<void> | null;
+}
+
+let sweepState: SessionSweepState | null = null;
+
+/** Test seam — forget the per-session sweep gate. */
+export function resetCatalystSweepGateForTests(): void {
+  sweepState = null;
+}
+
+/** Probe view of the gate, for `/api/health/news-catalyst-signals`. */
+export interface CatalystSweepGateSnapshot {
+  session: string | null;
+  attempts: number;
+  maxAttempts: number;
+  retryBackoffMs: number;
+  healthy: boolean;
+  servedFromCache: number;
+  skipped: number;
+}
+
+export function catalystSweepGateSnapshot(): CatalystSweepGateSnapshot {
+  return {
+    session: sweepState?.session ?? null,
+    attempts: sweepState?.attempts ?? 0,
+    maxAttempts: CATALYST_SWEEP_MAX_ATTEMPTS,
+    retryBackoffMs: CATALYST_SWEEP_RETRY_BACKOFF_MS,
+    healthy: sweepState?.pool != null,
+    servedFromCache: sweepState?.servedFromCache ?? 0,
+    skipped: sweepState?.skipped ?? 0,
+  };
+}
+
+function selectFromPool(pool: readonly CatalystCandidate[], hidden?: ReadonlySet<string>): string[] {
+  if (pool.length === 0) return [];
+  return scoreAndSelect(pool, { hidden }).chosen.map((s) => s.symbol.toUpperCase());
+}
+
+/**
+ * The premarket entry point: {@link buildNewsCatalystPicks} behind a
+ * once-per-session gate. See the block comment above. Never throws.
+ */
+export async function sessionCatalystPicks(deps: CatalystSourceDeps): Promise<string[]> {
+  const session = etDateKey(deps.now);
+  if (!sweepState || sweepState.session !== session) {
+    sweepState = {
+      session,
+      attempts: 0,
+      lastAttemptAt: 0,
+      pool: null,
+      servedFromCache: 0,
+      skipped: 0,
+      inFlight: null,
+    };
+  }
+  const state = sweepState;
+  // Single-flight: a concurrent caller waits for the running sweep, then reads
+  // its outcome like any later caller.
+  if (state.inFlight) await state.inFlight;
+
+  if (state.pool) {
+    state.servedFromCache += 1;
+    return selectFromPool(state.pool, deps.hidden);
+  }
+  if (
+    state.attempts >= CATALYST_SWEEP_MAX_ATTEMPTS ||
+    (state.attempts > 0 && deps.now - state.lastAttemptAt < CATALYST_SWEEP_RETRY_BACKOFF_MS)
+  ) {
+    state.skipped += 1;
+    return [];
+  }
+
+  state.attempts += 1;
+  state.lastAttemptAt = deps.now;
+  let picks: string[] = [];
+  const run = runCatalystSweep(deps).then((r) => {
+    picks = r.picks;
+    if (r.pool) state.pool = r.pool;
+  });
+  state.inFlight = run.catch(() => undefined);
+  try {
+    await run;
+  } finally {
+    state.inFlight = null;
+  }
   return picks;
 }
