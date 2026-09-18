@@ -137,7 +137,7 @@ import {
   PCS_ENTRY_DTE_BAND,
 } from './pcs-shadow-ledger.js';
 import { selectWeeklyPcs } from '@trading-app/engine';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalArmed, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd, liveOptionTestAggregateHeadroomSignedUsd, resolveLiveOptionTestFleetRiskFraction, resolveLiveOptionTestBookAggregateCapUsd, sumLiveOtmFleetCapitalUsd, resolveEffectiveFleetRiskFraction, resolveLiveOtmSizingBasisUsd, sumLiveOtmFleetAtRiskUsd, resolveLiveOtmAdmissibleEntryUsd, fitsLiveOtmReachableBound, foldUnsettledLivePremiumUsd, resolveSettledAvailableCashUsd, isLivePremiumUnsettled } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isSwingSignalScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalArmed, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd, liveOptionTestAggregateHeadroomSignedUsd, resolveLiveOptionTestFleetRiskFraction, resolveLiveOptionTestBookAggregateCapUsd, sumLiveOtmFleetCapitalUsd, resolveEffectiveFleetRiskFraction, resolveLiveOtmSizingBasisUsd, sumLiveOtmFleetAtRiskUsd, resolveLiveOtmAdmissibleEntryUsd, fitsLiveOtmReachableBound, foldUnsettledLivePremiumUsd, resolveSettledAvailableCashUsd, isLivePremiumUnsettled } from './option-exec-flag.js';
 import type { LiveOtmAdmissibleBoundBy } from './option-exec-flag.js';
 // TRA-3997 (parent TRA-3703) — freeze the order site's admission reading onto
 // the row it is about to open. See the OTM bounded-test site below.
@@ -185,6 +185,12 @@ import {
   type AdvisoryShortlist,
 } from './agents-advisory-bound.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan, type ShortPremiumScanResult } from './short-premium-scanner.js';
+// TRA-4570 — Swing signal scanners (post-earnings IV crush, momentum breakout IV lag, panic reversal)
+import { scanPostEarningsIvCrush, type PostEarningsIvCrushConfig, type PostEarningsIvCrushScanInput } from './post-earnings-iv-crush-scanner.js';
+import { scanMomentumBreakoutIvLag, type MomentumBreakoutIvLagConfig, type MomentumBreakoutScanInput } from './momentum-breakout-iv-lag-scanner.js';
+import { scanPanicReversal, type PanicReversalConfig, type PanicReversalScanInput } from './panic-reversal-scanner.js';
+// TRA-4626 — Swing signal fusion engine (composite scoring + ranking)
+import { scanAndRankSwingSignals, type SwingSignalCandidate, type FusionScanInput } from './swing-signal-fusion.js';
 import {
   DEFAULT_WHEEL_GUARDS,
   isWheelUniverseSymbol,
@@ -885,6 +891,14 @@ export interface EngineState {
    * partial `EngineState` fixtures stay valid; the live builders always set it.
    */
   catalystGateShadowDecisions?: CatalystGateDecision[];
+  /**
+   * TRA-4570 — Swing signal candidates from the fusion engine. Observe-only until
+   * graduation gates pass. Each candidate includes composite score (0-100) and
+   * breakdown across 8 dimensions: technical, momentum, mean reversion, relative
+   * strength, IV/RV, IV skew, OTM mispricing, liquidity. Latest pass only, top 20 by score.
+   * Empty unless `ENABLE_SWING_SIGNAL_SCANNER` is on.
+   */
+  swingSignals?: SwingSignalCandidate[];
   /**
    * TRA-3910 — which BOOK this state renders (`bookView`) vs which book the
    * engine ROUTES to (`engineMode`). Equal unless the user set a `viewMode`
@@ -3573,6 +3587,8 @@ export class SignalEngine {
   private lastIvRvScanAt = 0;
   /** TRA-1292 — last observe-only short-premium scanner pass (reuses {@link RV_SCAN_INTERVAL_MS}). */
   private lastShortPremiumScanAt = 0;
+  /** TRA-4570 — last observe-only swing signal scanner pass (reuses {@link RV_SCAN_INTERVAL_MS}). */
+  private lastSwingSignalScanAt = 0;
   /**
    * TRA-1156 — per-symbol trailing daily closes, stashed from the SAME
    * `fetchDailyCandles` pull {@link refreshTechnicalSnapshot} already makes, so
@@ -3604,6 +3620,12 @@ export class SignalEngine {
    * Observe-only: appended by {@link evaluateCatalystGateShadow}; never routes.
    */
   private catalystGateShadowDecisions: CatalystGateDecision[] = [];
+  /**
+   * TRA-4626 — latest swing signal candidates from the fusion engine, surfaced
+   * on EngineState.swingSignals. Observe-only until graduation gates pass.
+   * Latest pass only, top 20 by score.
+   */
+  private swingSignals: SwingSignalCandidate[] = [];
   /** TRA-451 — last SMA-200 daily-bar scan timestamp (gates the 4h cadence). */
   private lastSma200ScanAt = 0;
   /**
@@ -7198,6 +7220,27 @@ export class SignalEngine {
         } catch (err: unknown) {
           this.shortPremiumSweep = null;
           log.warn('short-premium scan pass threw', {
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }
+
+    // TRA-4570 — observe-only swing signal scan (post-earnings IV crush, momentum
+    // breakout IV lag, panic reversal). Same demo-first, flag-gated, market-hours
+    // cadence as IV-RV and short-premium scans.
+    if (
+      this.mode === 'demo'
+      && isStockMarketOpen()
+      && isSwingSignalScannerEnabled()
+      && !!this.rvScanner
+    ) {
+      if (Date.now() - this.lastSwingSignalScanAt >= RV_SCAN_INTERVAL_MS) {
+        this.lastSwingSignalScanAt = Date.now();
+        try {
+          await withPhase('signal.doTick.swing-signal-scan', () => this.evaluateSwingSignalScan(activeSymbols));
+        } catch (err: unknown) {
+          log.warn('swing signal scan pass threw', {
             reason: err instanceof Error ? err.message : String(err),
           });
         }
@@ -16336,6 +16379,103 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-4626 — Swing signal scanner evaluation pass using the fusion engine.
+   * Evaluates post-earnings IV crush, momentum breakout IV lag, and panic reversal
+   * scanners for each active symbol, then ranks candidates via composite scoring.
+   *
+   * Runs on the same option chain snapshot + daily candles the IV-RV and short-premium
+   * passes already fetch, so the scan rides the existing cache without extra Tradier calls.
+   *
+   * For each symbol:
+   * - Fetches option chain via rvScanner (warm cache)
+   * - Backfills daily candles if needed (Yahoo → Tradier fallback)
+   * - Evaluates all 3 swing scanners via fusion engine
+   * - Stores ranked candidates (composite score ≥60/100) to `this.swingSignals`
+   * - Broadcasts to connected clients via getState()
+   *
+   * SHADOW-first: observe-only until TRA-4570 graduation gates pass.
+   */
+  private async evaluateSwingSignalScan(symbols: string[]): Promise<void> {
+    if (!isSwingSignalScannerEnabled() || this.mode !== 'demo' || !this.rvScanner) return;
+
+    const asOf = Date.now();
+    const dtePrefs = { min: 25, max: 60, target: 45 }; // Swing DTE range
+    const candidates: SwingSignalCandidate[] = [];
+
+    for (const sym of symbols) {
+      try {
+        // Ride the same warm selector chain IV-RV/short-premium already fetched
+        const snap = await this.rvScanner.getSelectorChain(sym, dtePrefs);
+        if (!snap || !(snap.spot > 0) || snap.rows.length === 0) continue;
+
+        // Backfill daily candles (same pattern as evaluateIvRvScan)
+        let dailyCloses = this.dailyCloseCache.get(sym) ?? [];
+        if (dailyCloses.length === 0) {
+          let bars = await fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
+          if (bars.length === 0) {
+            bars = await fetchTradierDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
+          }
+          if (bars.length > 0) {
+            dailyCloses = bars.map((b) => b.close);
+            this.dailyCloseCache.set(sym, dailyCloses);
+          }
+        }
+
+        // Get 5m candles for momentum/reversal analysis
+        const candles = this.candleCache.get(sym) ?? [];
+        if (candles.length < 15) continue; // Insufficient data
+
+        // Get IV metrics
+        const atmIv = atmIvFromRows(snap.rows, snap.spot);
+        const ivRank = atmIv != null ? ivRankSync(sym, atmIv, asOf) : null;
+        const ivPercentile = atmIv != null ? ivPercentileSync(sym, atmIv, asOf) : null;
+        if (ivPercentile === null) continue; // IV metrics required
+
+        // Calculate average volume and ATR (needed by scanners)
+        const avgVolume = candles.length > 20
+          ? candles.slice(-20).reduce((sum, c) => sum + c.volume, 0) / 20
+          : candles[candles.length - 1]?.volume ?? 0;
+        const atrValue = atr(candles, 14);
+
+        // Build fusion scan input
+        const fusionInput: FusionScanInput = {
+          symbol: sym,
+          candles,
+          optionChain: snap.rows,
+          ivPercentile,
+          currentPrice: snap.spot,
+          avgVolume,
+          ...(ivRank !== null ? { ivRank } : {}),
+          ...(atrValue !== null ? { atr: atrValue } : {}),
+          // TODO: Wire earnings date from earnings store
+          // earningsDate: earningsInDaysSync(sym, asOf)?.date,
+        };
+
+        // Run fusion engine: evaluates all 3 scanners + ranks by composite score
+        const symbolCandidates = await scanAndRankSwingSignals(fusionInput);
+        if (symbolCandidates.length > 0) {
+          candidates.push(...symbolCandidates);
+          log.info('swing signal candidates detected', {
+            symbol: sym,
+            count: symbolCandidates.length,
+            topScore: symbolCandidates[0]?.score ?? 0,
+          });
+        }
+
+      } catch (err: unknown) {
+        log.warn('swing signal scan eval threw', {
+          symbol: sym,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Each pass REPLACES the list with its own top 20 by composite score. Appending
+    // across passes let the same symbol re-detected every pass crowd out the rest.
+    this.swingSignals = candidates.sort((a, b) => b.score - a.score).slice(0, 20);
+  }
+
+  /**
    * TRA-1977 — the wheel state machine driven once per short-premium pass, on the
    * DEMO paper book, behind the `ENABLE_OPTION_WHEEL_ROUTING` sub-flag. Ties the
    * TRA-1966/1976 primitives into a put→stock→call→flat cycle:
@@ -22038,6 +22178,8 @@ export class SignalEngine {
         supertrendShadowSignals: this.supertrendShadowSignals,
         // TRA-1972 — observe-only catalyst earnings/macro proximity gate decisions.
         catalystGateShadowDecisions: this.catalystGateShadowDecisions,
+        // TRA-4626 — observe-only swing signal candidates (fusion engine).
+        swingSignals: this.swingSignals,
         bookView,
         engineMode: this.mode,
         // TRA-4502 — spread conditionally: the key is ABSENT on a default frame
@@ -22106,6 +22248,8 @@ export class SignalEngine {
       supertrendShadowSignals: this.supertrendShadowSignals,
       // TRA-1972 — observe-only catalyst earnings/macro proximity gate decisions.
       catalystGateShadowDecisions: this.catalystGateShadowDecisions,
+      // TRA-4626 — observe-only swing signal candidates (fusion engine).
+      swingSignals: this.swingSignals,
       bookView,
       engineMode: this.mode,
       // TRA-4502 — THE branch the parent defect renders through: a live-armed

@@ -21,6 +21,7 @@ import { ProfileModals } from './components/dashboard/ProfileModals';
 import type { ProfileModal } from './components/dashboard/ProfileModals';
 import { StockWatchlistPanel } from './components/dashboard/StockWatchlistPanel';
 import { StockSignalsPanel } from './components/dashboard/StockSignalsPanel';
+import { SwingSignalsPanel } from './components/dashboard/SwingSignalsPanel';
 import { PendingProposalsPanel } from './components/dashboard/PendingProposalsPanel';
 import { StockPositionsPanel } from './components/dashboard/StockPositionsPanel';
 import { StockOptionsPanel } from './components/dashboard/StockOptionsPanel';
@@ -38,7 +39,8 @@ import { useStockEngine } from './hooks/useStockEngine';
 // TRA-161 — 'otm' is the read-only Mispriced OTM scanner surface. It lives
 // under "More" rather than the primary bar: the primary row is the trading
 // workflow, and this is a research/diagnostic read with no action on it.
-type StockTab = 'watchlist' | 'signals' | 'proposals' | 'positions' | 'options' | 'ideas' | 'otm' | 'news' | 'calendar' | 'health';
+// TRA-4626 — 'swing' is the swing signal fusion engine panel (ranked candidates).
+type StockTab = 'watchlist' | 'signals' | 'swing' | 'proposals' | 'positions' | 'options' | 'ideas' | 'otm' | 'news' | 'calendar' | 'health';
 
 export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme }: { token: string; onLogout: () => void; onGoHome: () => void; onActivity?: () => void; theme: Theme; onToggleTheme: () => void }) {
   const [tab, setTab] = useState<StockTab>('watchlist');
@@ -72,6 +74,7 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
 
   const account = state?.account;
   const signals = state?.signals ?? [];
+  const swingSignals = state?.swingSignals ?? [];
   const symbols = state?.symbols ?? [];
   const openPositions = account?.openPositions ?? [];
   // TRA-238 — closed trades stay visible in the Positions/Options tabs until
@@ -173,6 +176,8 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
           // TRA-569 — Signals/Positions coach-mark anchors point at their tabs.
           { id: 'watchlist', label: `Watchlist (${symbols.length})` },
           { id: 'signals', label: `Signals (${signals.length})`, dataTour: 'signals' },
+          // TRA-4626 — Swing signal fusion engine candidates (ranked 0-100).
+          { id: 'swing', label: `Swing (${swingSignals.length})`, title: 'Ranked swing trade options signals with composite scoring — observe-only' },
           { id: 'proposals', label: 'Proposals' },
           { id: 'positions', label: `Positions (${openPositions.length})`, dataTour: 'positions' },
           { id: 'options', label: `Options (${openOptions.length})` },
@@ -207,6 +212,10 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
 
         {state && tab === 'signals' && (
           <StockSignalsPanel token={token} signals={signals} symbols={symbols} marketReview={state.marketReview} lastScanAt={state.lastScanAt} marketOpen={state.marketOpen} />
+        )}
+
+        {state && tab === 'swing' && (
+          <SwingSignalsPanel token={token} swingSignals={swingSignals} lastScanAt={state.lastScanAt} marketOpen={state.marketOpen} />
         )}
 
         {state && tab === 'proposals' && (

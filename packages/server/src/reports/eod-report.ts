@@ -97,6 +97,10 @@ function strategyLabel(t: SignalType): EodTradeEntry['strategy'] {
     case 'dca': return 'DCA';                 // TRA-693 — DCA accumulation
     case 'otm_mispricing': return 'OTM';
     case 'relative_value': return 'RV';
+    // TRA-4570 — swing options signals
+    case 'post_earnings_iv_crush': return 'Earnings IV';
+    case 'momentum_breakout_iv_lag': return 'Momentum IV';
+    case 'panic_reversal': return 'Panic Rev';
     // TRA-323 — imported Tradier positions don't trade through the local
     // engine, so they never reach the EOD trade exporter. Map to a label
     // for completeness (and to keep the switch exhaustive); this label is
