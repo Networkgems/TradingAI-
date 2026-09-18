@@ -292,17 +292,26 @@ let verdictsRecorded = 0;
  * TRA-4422's split was built to make impossible.
  */
 export function readOtmDailySeries(symbol: string, nowMs: number = Date.now()): OtmDailySeriesRead {
+  const read = peekOtmDailySeries(symbol, nowMs);
+  if (read.state === 'absent') counters.readsAbsent += 1;
+  else if (read.state === 'stale') counters.readsStale += 1;
+  else counters.readsFresh += 1;
+  return read;
+}
+
+/**
+ * TRA-4706 — the same read, same readability policy, WITHOUT moving the seam's
+ * `reads*` counters. For consumers other than the OTM taxonomy seam (the
+ * observe-only swing scanner): those counters are the denominator of the
+ * TRA-4424 coverage grade, and a second reader folding into them would grade
+ * the swing pass's universe as the sleeve's. Such a consumer counts its own
+ * unreadable reads.
+ */
+export function peekOtmDailySeries(symbol: string, nowMs: number = Date.now()): OtmDailySeriesRead {
   const entry = cache.get(symbol);
-  if (!entry) {
-    counters.readsAbsent += 1;
-    return { bars: [], state: 'absent', ageMs: null };
-  }
+  if (!entry) return { bars: [], state: 'absent', ageMs: null };
   const ageMs = nowMs - entry.fetchedAt;
-  if (ageMs > OTM_DAILY_SERIES_MAX_AGE_MS) {
-    counters.readsStale += 1;
-    return { bars: [], state: 'stale', ageMs };
-  }
-  counters.readsFresh += 1;
+  if (ageMs > OTM_DAILY_SERIES_MAX_AGE_MS) return { bars: [], state: 'stale', ageMs };
   return { bars: entry.bars, state: 'fresh', ageMs };
 }
 

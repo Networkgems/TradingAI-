@@ -11,6 +11,7 @@ import {
   initEarningsStore,
   makeEarningsClientFromEnv,
   __resetEarningsStoreForTests,
+  recentEarningsDateSync,
 } from './earnings-store.js';
 
 let tmpRoot: string;
@@ -102,5 +103,49 @@ describe('earnings-store', () => {
     expect(makeEarningsClientFromEnv()).toBeInstanceOf(EarningsCalendarClient);
     if (prev === undefined) delete process.env['FINNHUB_API_TOKEN'];
     else process.env['FINNHUB_API_TOKEN'] = prev;
+  });
+});
+
+// TRA-4706 — the post-earnings swing scanner needs the report that JUST happened,
+// which the refresh used to overwrite/delete the morning after.
+describe('recentEarningsDateSync (TRA-4706)', () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('keeps the passed date across the refresh that replaces it, and across a reload from disk', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.UTC(2026, 8, 10, 13, 0));
+    await refreshEarningsCalendar(stubClient([{ symbol: 'AAPL', date: '2026-09-15' }]), ['AAPL', 'MSFT']);
+    expect(recentEarningsDateSync('AAPL')).toEqual({ state: 'none' }); // still upcoming
+
+    // Between the report and the next refresh the upcoming record itself is the source.
+    vi.setSystemTime(Date.UTC(2026, 8, 15, 21, 0));
+    expect(recentEarningsDateSync('AAPL')).toEqual({ state: 'recent', date: '2026-09-15' });
+
+    // The next morning's refresh swaps in next quarter's date — the passed one must survive.
+    vi.setSystemTime(Date.UTC(2026, 8, 16, 13, 0));
+    await refreshEarningsCalendar(stubClient([{ symbol: 'AAPL', date: '2026-12-15' }]), ['AAPL', 'MSFT']);
+    expect(earningsInDaysSync('AAPL')).toBe(90);
+    expect(recentEarningsDateSync('AAPL')).toEqual({ state: 'recent', date: '2026-09-15' });
+
+    // …and survives a process restart.
+    __resetEarningsStoreForTests(join(tmpRoot, 'earnings-calendar.json'));
+    await initEarningsStore();
+    expect(recentEarningsDateSync('AAPL')).toEqual({ state: 'recent', date: '2026-09-15' });
+    expect(recentEarningsDateSync('MSFT')).toEqual({ state: 'none' });
+  });
+
+  it('a symbol whose provider window goes EMPTY after the report still keeps its passed date', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.UTC(2026, 8, 10, 13, 0));
+    await refreshEarningsCalendar(stubClient([{ symbol: 'AAPL', date: '2026-09-15' }]), ['AAPL']);
+    vi.setSystemTime(Date.UTC(2026, 8, 16, 13, 0));
+    await refreshEarningsCalendar(stubClient([]), ['AAPL']);
+    expect(recentEarningsDateSync('AAPL')).toEqual({ state: 'recent', date: '2026-09-15' });
+  });
+
+  it('a dark store reads UNREADABLE, never "none"', async () => {
+    expect(recentEarningsDateSync('AAPL')).toEqual({ state: 'unreadable' }); // not loaded
+    await initEarningsStore();
+    expect(recentEarningsDateSync('AAPL')).toEqual({ state: 'unreadable' }); // loaded, never refreshed
   });
 });

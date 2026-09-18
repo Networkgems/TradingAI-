@@ -1016,6 +1016,25 @@ export function isOptionShortPremiumScannerEnabled(env: NodeJS.ProcessEnv = proc
 }
 
 // --------------------------------------------------------------------------
+// TRA-4570/4626 (landed by TRA-4705) — observe-only SWING signal scanner
+// (post-earnings IV crush, momentum breakout IV lag, panic reversal, ranked by
+// the fusion engine) surfaced on `EngineState.swingSignals` / the Swing tab.
+//
+// OFF by default ⇒ zero cost/IO. The pass walks the selector chain per symbol
+// sequentially — the same shape that made the short-premium scan the Σ-leader
+// of the tick tape (TRA-2262) — so it must not run on bqb1 until someone arms
+// it deliberately. When ON it NEVER routes: no order is placed off these
+// candidates. Demo-only (the pass hard-gates on `mode === 'demo'`).
+// --------------------------------------------------------------------------
+
+export const SWING_SIGNAL_SCANNER_FLAG = 'ENABLE_SWING_SIGNAL_SCANNER';
+
+/** True iff the observe-only swing signal scanner flag is on. */
+export function isSwingSignalScannerEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[SWING_SIGNAL_SCANNER_FLAG]);
+}
+
+// --------------------------------------------------------------------------
 // TRA-1977 (parent TRA-1976, rides TRA-1292's scanner) — route the short-premium
 // scanner into the WHEEL paper primitive under a SHADOW/paper sub-flag.
 //

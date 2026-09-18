@@ -44,15 +44,32 @@ interface StoreFile {
   updatedAt: number;
   /** Keyed by UPPER-CASE symbol. */
   symbols: Record<string, EarningsRecord>;
+  /**
+   * TRA-4706 — the most recent PAST earnings date per symbol (`YYYY-MM-DD`).
+   * Optional so a pre-TRA-4706 file still loads.
+   */
+  previous?: Record<string, string>;
 }
 
 let cache: Map<string, EarningsRecord> | null = null;
+/**
+ * TRA-4706 — `symbol → most recent past earnings date`. Kept APART from `cache`
+ * so every existing reader (the `unpopulated` / `covered` split, `coveredSymbols`)
+ * keeps meaning "upcoming dates" exactly as before.
+ *
+ * ⛔ Why it exists: the refresh used to overwrite or delete a record the moment
+ * its date passed, so the one date the post-earnings swing scanner needs — the
+ * report that just happened — was thrown away by the 9 AM ET refresh that
+ * follows it. The refresh now moves it here instead.
+ */
+let previous: Map<string, string> = new Map();
 
 async function ensureLoaded(): Promise<Map<string, EarningsRecord>> {
   if (cache) return cache;
   const path = storeFile();
   if (!existsSync(path)) {
     cache = new Map();
+    previous = new Map();
     return cache;
   }
   try {
@@ -69,12 +86,20 @@ async function ensureLoaded(): Promise<Map<string, EarningsRecord>> {
         }
       }
     }
+    const prev = new Map<string, string>();
+    if (parsed.previous && typeof parsed.previous === 'object') {
+      for (const [sym, date] of Object.entries(parsed.previous)) {
+        if (typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date)) prev.set(sym.toUpperCase(), date);
+      }
+    }
     cache = map;
+    previous = prev;
   } catch (err) {
     log.error('failed to read earnings store, starting empty', {
       reason: err instanceof Error ? err.message : String(err),
     });
     cache = new Map();
+    previous = new Map();
   }
   return cache;
 }
@@ -88,6 +113,7 @@ async function persist(): Promise<void> {
     version: 1,
     updatedAt: Date.now(),
     symbols: Object.fromEntries(cache),
+    previous: Object.fromEntries(previous),
   };
   await writeFile(path, JSON.stringify(payload, null, 2), 'utf-8');
 }
@@ -181,6 +207,35 @@ function daysFromRecord(rec: EarningsRecord | undefined, asOf: number): number |
   return d;
 }
 
+/**
+ * TRA-4706 — the most recent earnings date on or before `asOf`'s day, for the
+ * post-earnings swing scanner.
+ *
+ * Three states, not a nullable date, for the same reason as
+ * {@link earningsCalendarReadSync}: a dark calendar must not read as "no recent
+ * earnings". `unreadable` = store not loaded, or loaded with nothing in it
+ * (the refresh never succeeded). `none` = the store is live and holds no past
+ * date for this symbol within its memory.
+ *
+ * Sources, newest wins: the upcoming record once its date has arrived (between
+ * the report and the next refresh it is still sitting there), then the
+ * `previous` date the refresh moved aside.
+ */
+export type RecentEarningsRead =
+  | { state: 'recent'; date: string }
+  | { state: 'none' }
+  | { state: 'unreadable' };
+
+export function recentEarningsDateSync(symbol: string, asOf: number = Date.now()): RecentEarningsRead {
+  if (!cache || (cache.size === 0 && previous.size === 0)) return { state: 'unreadable' };
+  const sym = symbol.trim().toUpperCase();
+  const candidates = [cache.get(sym)?.date, previous.get(sym)].filter(
+    (d): d is string => typeof d === 'string' && (daysUntil(d, asOf) ?? 1) <= 0,
+  );
+  if (candidates.length === 0) return { state: 'none' };
+  return { state: 'recent', date: candidates.sort().at(-1)! };
+}
+
 /** Raw next-earnings date (`YYYY-MM-DD`) for `symbol`, or `null` if uncovered. */
 export async function getNextEarningsDate(symbol: string): Promise<string | null> {
   const map = await ensureLoaded();
@@ -213,6 +268,13 @@ export async function refreshEarningsCalendar(
   let uncovered = 0;
   for (const sym of upper) {
     const date = fetched.get(sym);
+    // TRA-4706 — a held date that has arrived is about to be replaced or
+    // dropped; keep it as the symbol's most recent report first.
+    const held = map.get(sym)?.date;
+    if (held && (daysUntil(held, now) ?? 1) <= 0 && held !== date) {
+      const prior = previous.get(sym);
+      if (!prior || held > prior) previous.set(sym, held);
+    }
     if (date) {
       map.set(sym, { date, fetchedAt: now });
       covered++;
@@ -242,5 +304,6 @@ export function makeEarningsClientFromEnv(): EarningsCalendarClient | null {
 /** Test-only: reset the in-memory cache and (optionally) override the on-disk path. */
 export function __resetEarningsStoreForTests(overridePath?: string | null): void {
   cache = null;
+  previous = new Map();
   storeFileOverride = overridePath ?? null;
 }

@@ -1,5 +1,5 @@
 // TRA-419 — App-level interfaces extracted from App.tsx.
-import type { TradeSignal, Sma200Signal, AccountState, Position, OptionsAccountState, EngineMarketReviewState, AgentRecommendation, HiddenBookExposure } from '@trading-app/shared';
+import type { TradeSignal, Sma200Signal, AccountState, Position, OptionsAccountState, EngineMarketReviewState, AgentRecommendation, HiddenBookExposure, SwingSignalCandidate, SwingScanSummary } from '@trading-app/shared';
 
 export interface SymbolState {
   symbol: string;
@@ -87,4 +87,8 @@ export interface AppState {
   // `undefined` means "nothing is hidden" and never "nothing is there". Drives
   // the header chip's row count and the `HiddenBookBanner` escalation.
   hiddenBookExposure?: HiddenBookExposure;
+  // TRA-4626/4706 — observe-only swing candidates + the pass's per-cause read
+  // summary. Absent on a pre-TRA-4626 server; `null` summary = never ran.
+  swingSignals?: SwingSignalCandidate[];
+  swingScanSummary?: SwingScanSummary | null;
 }
