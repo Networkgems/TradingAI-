@@ -195,6 +195,29 @@ export interface OtmDailySeriesCounters {
    * rotation re-pulled the same universe off one shared Yahoo client.
    */
   readonly skippedFresh: number;
+  /**
+   * TRA-4424 (09-18) — of {@link fetchOk}, the fetches served by the FALLBACK feed
+   * (Tradier `/markets/history`) because the Yahoo breaker was open. A SUBSET of
+   * `fetchOk`, not an addend.
+   *
+   * ⛔ WHY IT EXISTS. Graded live 2026-09-18 14:34Z (bqb1 `0dc2baea`): the span leg
+   * held (172 d) and the 09-10 fixes were serving (`evicted` 0, `skippedFresh`
+   * 503), yet `readsFresh` 3 against `readsAbsent` 142 — `skippedFeedBreaker`
+   * 30,172 against `fetchOk` 41 since the 21:31Z boot. Yahoo 429s ~permanently on
+   * Render's shared egress (TRA-1230), so a Yahoo-only daily source is a source
+   * that serves ~2% of the seam. The counters said so honestly; the cache was
+   * still empty. Every other daily-bar consumer on this box already falls back to
+   * Tradier for exactly this reason (`dailyCloseCache`, market-review).
+   */
+  readonly fetchOkFallback: number;
+  /**
+   * Fallback fetches that came back EMPTY. `fetchTradierDailyCandles` swallows
+   * every error to `[]` (it trips its own breaker on 429/5xx, and only warns on
+   * anything else — a 401 included), so an empty here is NOT a quiet answer the
+   * way a Yahoo empty is. Counted apart and graded `degraded`, so a dead fallback
+   * cannot hide inside `fetchEmpty`.
+   */
+  readonly fetchEmptyFallback: number;
   /** Reset by any success — the discriminator between a blip and an outage. */
   readonly consecutiveFetchFailures: number;
   readonly lastOkAt: number | null;
@@ -220,6 +243,8 @@ const counters = {
   fetchFailed: 0,
   skippedFeedBreaker: 0,
   skippedFresh: 0,
+  fetchOkFallback: 0,
+  fetchEmptyFallback: 0,
   consecutiveFetchFailures: 0,
   lastOkAt: null as number | null,
   lastFailureAt: null as number | null,
@@ -361,6 +386,16 @@ export interface OtmDailySeriesBatchDeps {
   readonly fetch: (symbol: string) => Promise<readonly Candle[]>;
   /** Asked BEFORE any fetch — see {@link OtmDailySeriesCounters.skippedFeedBreaker}. */
   readonly breakerOpen: () => boolean;
+  /**
+   * TRA-4424 (09-18) — the feed used while the primary's breaker is open. Its
+   * `available` is asked BEFORE the call for the same reason `breakerOpen` is: a
+   * blocked or unconfigured fallback answers `[]`, never a throw. See
+   * {@link OtmDailySeriesCounters.fetchOkFallback}.
+   */
+  readonly fallback?: {
+    readonly fetch: (symbol: string) => Promise<readonly Candle[]>;
+    readonly available: () => boolean;
+  };
   readonly now?: () => number;
 }
 
@@ -391,10 +426,18 @@ export async function runOtmDailySeriesBatch(
 ): Promise<boolean | void> {
   const now = deps.now ?? Date.now;
   const due = batch.filter((sym) => needsFetch(sym, now()));
+  let viaFallback = false;
   if (due.length > 0 && deps.breakerOpen()) {
-    noteOtmDailySeriesBreakerSkip(due.length);
-    return false;
+    // ⛔ A SKIP ONLY WHEN NO FEED CAN SERVE. With the primary's breaker open the
+    // fallback carries the batch; only when it is ALSO blocked/unconfigured does
+    // the rotation park — same `false`, same reason as below.
+    if (!deps.fallback || !deps.fallback.available()) {
+      noteOtmDailySeriesBreakerSkip(due.length);
+      return false;
+    }
+    viaFallback = true;
   }
+  const fetchOne = viaFallback && deps.fallback ? deps.fallback.fetch : deps.fetch;
   counters.skippedFresh += batch.length - due.length;
   // Claimed synchronously, before the first await, so a second engine's batch
   // interleaving on the event loop sees these as in flight.
@@ -404,7 +447,12 @@ export async function runOtmDailySeriesBatch(
       // An EMPTY answer is not a failure and does not evict the last good
       // series: a symbol that has genuinely stopped printing should age out
       // through staleness rather than vanish on one empty response.
-      storeOtmDailySeries(sym, await deps.fetch(sym), now());
+      const got = await fetchOne(sym);
+      if (viaFallback) {
+        if (got.length > 0) counters.fetchOkFallback += 1;
+        else counters.fetchEmptyFallback += 1;
+      }
+      storeOtmDailySeries(sym, got, now());
     } catch (err: unknown) {
       noteOtmDailySeriesFailure(sym, err instanceof Error ? err.message : String(err), now());
     } finally {
@@ -510,6 +558,7 @@ export function otmDailySeriesHealth(nowMs: number = Date.now()): OtmDailySeries
       : snapshot.fetchOk === 0
         ? 'failing'
         : snapshot.fetchFailed > 0 || snapshot.skippedFeedBreaker > 0
+            || snapshot.fetchEmptyFallback > 0
           ? 'degraded'
           : 'ok';
 
@@ -571,7 +620,9 @@ function noteFor(
     case 'degraded':
       return `DEGRADED — ${c.fetchOk} fetches succeeded, ${c.fetchFailed} failed `
         + `(${c.consecutiveFetchFailures} consecutive; last: ${c.lastFailureReason ?? 'n/a'}) and `
-        + `${c.skippedFeedBreaker} were SKIPPED with the feed breaker open. `
+        + `${c.skippedFeedBreaker} were SKIPPED with the Yahoo breaker open AND no fallback available; `
+        + `${c.fetchOkFallback} were served by the Tradier fallback and ${c.fetchEmptyFallback} of its `
+        + 'answers came back empty (it swallows errors to `[]`, so an empty there is a suspected failure). '
         + 'Symbols whose fetch is failing age out through staleness at '
         + `${Math.round(OTM_DAILY_SERIES_MAX_AGE_MS / 60_000)} min and then read `
         + '`series_unreadable`, so a partial outage shows up as a rising `readsStale` rather '
@@ -604,6 +655,8 @@ export function __resetOtmDailySeriesForTests(nowMs: number = Date.now()): void 
   counters.fetchFailed = 0;
   counters.skippedFeedBreaker = 0;
   counters.skippedFresh = 0;
+  counters.fetchOkFallback = 0;
+  counters.fetchEmptyFallback = 0;
   counters.consecutiveFetchFailures = 0;
   counters.lastOkAt = null;
   counters.lastFailureAt = null;

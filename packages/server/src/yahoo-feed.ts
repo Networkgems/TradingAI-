@@ -2294,6 +2294,15 @@ export async function fetchTradierDailyCandles(symbol: string, count = 30): Prom
   }
 }
 
+/**
+ * TRA-4424 — whether {@link fetchTradierDailyCandles} can serve at all right now
+ * (client configured, bar breaker closed). Asked BEFORE the call by callers that
+ * must tell "blocked" from "answered empty": the fetch itself returns `[]` for both.
+ */
+export function isTradierDailyAvailable(): boolean {
+  return tradierStocksClient != null && !isTradierBlocked();
+}
+
 export interface TradierCandleDiag {
   reason: 'no_credentials' | 'breaker_open' | 'http_error' | 'no_data' | 'fetch_error' | 'ok';
   httpStatus?: number;

@@ -465,7 +465,7 @@ const NON_CHOKEPOINT_THROTTLE_STAMP = {
   riskThrottleSizingPath: null,
 } as const;
 import type { Regime } from '@trading-app/engine';
-import { fetchMinuteBars, fetchMinuteBarsWithSource, fetchDailyCandles, fetchTradierDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient, getTradierStocksFeedClient, knownSplitForSession } from './yahoo-feed.js';
+import { fetchMinuteBars, fetchMinuteBarsWithSource, fetchDailyCandles, fetchTradierDailyCandles, isTradierDailyAvailable, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient, getTradierStocksFeedClient, knownSplitForSession } from './yahoo-feed.js';
 import { prioritizeQuoteUniverse } from './quote-priority.js';
 
 /**
@@ -15038,6 +15038,13 @@ export class SignalEngine {
       run: (batch) => runOtmDailySeriesBatch(batch, {
         fetch: (sym) => fetchDailyCandles(sym, OTM_DAILY_SERIES_BARS),
         breakerOpen: () => isYahooBreakerOpen(),
+        // TRA-4424 (09-18) — Yahoo 429s ~permanently on Render (TRA-1230): measured
+        // live, a Yahoo-only refresh left 142 of 145 seam reads `absent`. Tradier
+        // daily history carries the batch while the Yahoo breaker is open.
+        fallback: {
+          fetch: (sym) => fetchTradierDailyCandles(sym, OTM_DAILY_SERIES_BARS),
+          available: () => isTradierDailyAvailable(),
+        },
       }),
     });
     noteOtmDailySeriesPass(pass.complete);

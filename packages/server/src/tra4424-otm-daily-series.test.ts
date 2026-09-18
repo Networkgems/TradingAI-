@@ -348,6 +348,68 @@ describe('refresh worker — an open breaker STOPS the rotation; N books fetch e
     expect(readOtmDailySeries('AAPL', T0).state).toBe('fresh');
   });
 
+  // ─── TRA-4424 (09-18): THE TRADIER FALLBACK ───────────────────────────────
+  // Graded live 09-18 14:34Z: 142 of 145 seam reads `absent`, `skippedFeedBreaker`
+  // 30,172 vs `fetchOk` 41 — the Yahoo breaker is open ~all session on Render.
+  function withFallback(yahooOpen: () => boolean, tradierUp: () => boolean, tradierBars = 120) {
+    const yahoo: string[] = [];
+    const tradier: string[] = [];
+    const deps: OtmDailySeriesBatchDeps = {
+      fetch: async (sym) => { yahoo.push(sym); return bars(120, DAY_MS, sym); },
+      breakerOpen: yahooOpen,
+      fallback: {
+        fetch: async (sym) => { tradier.push(sym); return bars(tradierBars, DAY_MS, sym); },
+        available: tradierUp,
+      },
+      now: () => T0,
+    };
+    return { yahoo, tradier, deps };
+  }
+
+  it('⛔ Yahoo breaker OPEN + Tradier up ⇒ the rotation COMPLETES off Tradier; nothing is skipped', async () => {
+    const f = withFallback(() => true, () => true);
+    const p = await sweep('live:alice:otm-daily-series', U6, f.deps, memCursors());
+    expect(p.complete).toBe(true);
+    expect(f.yahoo).toEqual([]);
+    expect([...f.tradier].sort()).toEqual(U6);
+    const c = otmDailySeriesHealth(T0).counters;
+    expect(c.skippedFeedBreaker).toBe(0);
+    expect(c.fetchOk).toBe(6);
+    expect(c.fetchOkFallback).toBe(6);
+    for (const sym of U6) expect(readOtmDailySeries(sym, T0).state).toBe('fresh');
+    noteOtmDailySeriesPass(p.complete); // the engine's half; without it status is `unmeasured`
+    expect(otmDailySeriesHealth(T0).status).toBe('ok');
+  });
+
+  it('Yahoo breaker CLOSED ⇒ Yahoo serves and the fallback is never touched', async () => {
+    const f = withFallback(() => false, () => true);
+    await sweep('live:alice:otm-daily-series', U6, f.deps, memCursors());
+    expect(f.tradier).toEqual([]);
+    expect(otmDailySeriesHealth(T0).counters.fetchOkFallback).toBe(0);
+  });
+
+  it('⛔ BOTH blocked ⇒ the old stop: parked, not complete, counted as a skip', async () => {
+    const f = withFallback(() => true, () => false);
+    const p = await sweep('live:alice:otm-daily-series', U6, f.deps, memCursors());
+    expect(p.complete).toBe(false);
+    expect(p.resumeAt).toBe('A');
+    expect(f.yahoo).toEqual([]);
+    expect(f.tradier).toEqual([]);
+    expect(otmDailySeriesHealth(T0).counters.skippedFeedBreaker).toBe(4);
+  });
+
+  it('⛔ a fallback that answers EMPTY (it swallows errors to []) reads DEGRADED, not ok', async () => {
+    const f = withFallback(() => true, () => true, 0);
+    await sweep('live:alice:otm-daily-series', ['A'], f.deps, memCursors());
+    // One real success elsewhere, so the status is not merely `failing`.
+    await runOtmDailySeriesBatch(['B'], withFallback(() => false, () => true).deps);
+    noteOtmDailySeriesPass(true);
+    const h = otmDailySeriesHealth(T0);
+    expect(h.counters.fetchEmptyFallback).toBe(1);
+    expect(h.status).toBe('degraded');
+    expect(readOtmDailySeries('A', T0).state).toBe('absent');
+  });
+
   it('a throwing fetch is counted and releases its in-flight claim', async () => {
     let fail = true;
     const calls: string[] = [];
@@ -473,6 +535,9 @@ describe('TRA-4424 — the refresh is wired OFF the order path', () => {
     // engine must hand it the REAL breaker, not a constant.
     expect(body).toMatch(/run: \(batch\) => runOtmDailySeriesBatch\(batch, \{/);
     expect(body).toMatch(/breakerOpen: \(\) => isYahooBreakerOpen\(\),/);
+    // TRA-4424 (09-18) — the fallback is the REAL Tradier feed and its REAL probe.
+    expect(body).toMatch(/fetch: \(sym\) => fetchTradierDailyCandles\(sym, OTM_DAILY_SERIES_BARS\),/);
+    expect(body).toMatch(/available: \(\) => isTradierDailyAvailable\(\),/);
     // ⛔ Age-based prune only — a universe argument is the 09-10 thrash.
     expect(body).toMatch(/pruneOtmDailySeries\(Date\.now\(\)\)/);
     expect(body).not.toMatch(/pruneOtmDailySeries\(symbols\)/);

@@ -31,6 +31,7 @@ vi.mock('./yahoo-feed.js', () => ({
   toIsoTime: vi.fn((t: Date | number | string | undefined | null) =>
     new Date(t ?? 0).toISOString()),
   isYahooBreakerOpen: vi.fn(() => false),
+  isTradierDailyAvailable: vi.fn(() => false),
   tripYahooBreakerFromExternal: vi.fn(),
   setActiveInterestSymbols: vi.fn(),
   setTradierStocksFeedClient: vi.fn(),
