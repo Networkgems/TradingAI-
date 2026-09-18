@@ -100,6 +100,7 @@ import {
 } from '../live-options-fee-slippage-ledger.js';
 import { getLiveOptionsFeeReconcileState } from '../live-options-fee-reconcile.js'; // TRA-2810
 import { getZombieOpenSweepState } from '../zombie-open-journal-sweep.js'; // TRA-3547
+import { getExpiredDemoOrphanSweepState } from '../expired-demo-orphan-sweep.js'; // TRA-4711
 import { getOpenBasisRegradeState } from '../tra4453-open-basis-regrade.js'; // TRA-4453
 import { getCloseBasisSweepState } from '../tra3730-close-basis-sweep.js'; // TRA-3730
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
@@ -7927,6 +7928,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // ticked, or the journal flag is off), `0` = checked and clean. Those are
       // different facts and this shape refuses to collapse them.
       zombieSweep: getZombieOpenSweepState(),
+      expiredDemoOrphanSweep: getExpiredDemoOrphanSweepState(),
       // TRA-3730 — the SELF-DRIVING half of the close-basis restatement, and the
       // only thing that separates "the journal agrees with the broker" from "the
       // pass that would have checked never ran". `closeBasisAmends` above is a

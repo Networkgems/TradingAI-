@@ -201,6 +201,7 @@ import { planStaleOpenRepair, RECONSTRUCTED_EXIT_REASON } from './tra3485-stale-
 // admin writes are unreachable on bqb1, so left as a route alone it would never
 // run against the rows it was written for (the TRA-1954 -> TRA-2810 lesson).
 import { runZombieOpenSweep } from './zombie-open-journal-sweep.js';
+import { runExpiredDemoOrphanSweep } from './expired-demo-orphan-sweep.js'; // TRA-4711
 // TRA-2214 — the EOD journal blocks fold HERE, not inline, so this module holds
 // no bare fold that could be fed a differently-sourced (pooled) row list.
 import { foldModelFacingEodJournal } from './model-facing-journal.js';
@@ -5106,6 +5107,22 @@ const zombieOpenSweepDeps = {
 setTimeout(() => {
   void runZombieOpenSweep(zombieOpenSweepDeps);
 }, 120_000).unref();
+
+// TRA-4711 — the DEMO twin of the sweep above. A paper position lost across a
+// restart (journal OPEN already on disk, book snapshot not yet) leaves its row
+// OPEN forever; once the contract has expired and no booted book holds it, the
+// row is retracted through the same void fold. Reads every user context, so it
+// runs well after boot has built them.
+const expiredDemoOrphanSweepDeps = {
+  journalEnabled: () => isOptionTradeJournalEnabled(),
+  listDemoJournalRows: () => listOptionTradeJournal({ mode: 'demo' }),
+  listBookOpenPositions: () => getAllUserContexts().map((ctx) => ctx.engine.openOptionPositionIds()),
+  recordVoid: (id: string, reason: string, book: string | null) =>
+    recordOptionTradeVoid(id, reason, Date.now(), { book, reasonCode: 'expired_orphan' }),
+};
+setTimeout(() => {
+  void runExpiredDemoOrphanSweep(expiredDemoOrphanSweepDeps);
+}, 180_000).unref();
 
 // TRA-3730 — everything the close-basis sweep touches, in one place, injected
 // for the same reasons TRA-3547's deps are: the pass must be testable without
@@ -19083,6 +19100,9 @@ scheduler.start({
     // fill ledger, no broker call), self-quenching, and internally best-effort —
     // it cannot throw into this tick.
     await runZombieOpenSweep(zombieOpenSweepDeps);
+    // TRA-4711 — demo rows whose contract expired while no book held them. Pure
+    // local IO, never throws.
+    await runExpiredDemoOrphanSweep(expiredDemoOrphanSweepDeps);
     // TRA-3730 — restate the MONEY on closed live rows the fee reconcile has
     // since measured: broker entry fill, broker exit fill, NET of measured
     // commission. Runs LAST of the three on purpose — it consumes what both

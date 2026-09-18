@@ -12774,6 +12774,14 @@ export class PaperOptionsAccount {
   }
 
   /**
+   * TRA-4711 — the id pair of every open position (all modes), for the
+   * expired-demo-orphan sweep's "does any book still hold this row" test.
+   */
+  listOpenPositionIds(): Array<{ id: string; journalId?: string }> {
+    return Array.from(this.openOptions.values(), (o) => ({ id: o.id, journalId: o.journalId }));
+  }
+
+  /**
    * TRA-2819 — clear staged exits that never reached the broker, so a row
    * cannot rest forever in a state every automated path declines to touch.
    *

@@ -4859,6 +4859,13 @@ export class SignalEngine {
     return out;
   }
 
+  /** TRA-4711 — every open option position this engine holds, both Tradier envs. */
+  openOptionPositionIds(): Array<{ id: string; journalId?: string }> {
+    return (Object.keys(this.optionsAccounts) as TradierEnv[]).flatMap((env) =>
+      this.optionsAccounts[env].listOpenPositionIds(),
+    );
+  }
+
   refresh(): void {
     this.tick().catch((err: unknown) => {
       log.error('refresh tick error', { reason: err instanceof Error ? err.message : String(err) });
