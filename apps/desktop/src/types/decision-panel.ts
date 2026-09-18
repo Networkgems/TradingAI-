@@ -136,6 +136,31 @@ export interface PanelConfidence {
   expectancyNetR: number;
 }
 
+/**
+ * TRA-4719 — "reasons NOT to enter", display only. `not_evaluated` is NOT
+ * clear: render its `detail` verbatim, never collapse an unmeasured row away.
+ */
+export interface ReasonSourceRow {
+  source: 'iv_crush' | 'ema_pullback' | 'volume_breakout' | 'promotion_divergence' | 'gap_ranked';
+  state: 'clear' | 'flagged' | 'not_evaluated';
+  codes: string[];
+  notEvaluatedBecause:
+    | 'section_flag_off'
+    | 'source_flag_off'
+    | 'input_missing'
+    | 'not_applicable'
+    | 'no_detector'
+    | null;
+  detail: string;
+}
+
+export interface PanelReasonsNotToEnter {
+  enabled: boolean;
+  sources: ReasonSourceRow[];
+  counts: { clear: number; flagged: number; notEvaluated: number };
+  note: string;
+}
+
 export interface DecisionPanelPayload {
   schemaVersion: 1;
   signalId: string;
@@ -148,6 +173,8 @@ export interface DecisionPanelPayload {
   contract: PanelSection<PanelContract>;
   portfolio: PanelSection<PanelPortfolioImpact>;
   similarTrades: PanelSection<PanelSimilarTrades>;
+  /** Optional on the wire so a pre-TRA-4719 server still parses. */
+  reasonsNotToEnter?: PanelReasonsNotToEnter;
   confidence: PanelConfidence | null;
   actions: PanelActions;
   complete: boolean;

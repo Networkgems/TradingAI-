@@ -57,6 +57,11 @@ import {
   type SetupCalibrationIndex,
   type SetupConfidence,
 } from './setup-calibration.js';
+import {
+  buildReasonsNotToEnter,
+  type ReasonsNotToEnter,
+  type ReasonsNotToEnterInputs,
+} from './card-reasons-not-to-enter.js';
 
 // ── Field plumbing ──────────────────────────────────────────────────────────
 
@@ -427,6 +432,14 @@ export interface TradeOpportunityCard {
     sizing: CardField<PositionSizing>;
     whyNow: CardField<WhyNowContext>;
   };
+  /**
+   * TRA-4719 — negative evidence at entry, DISPLAY ONLY: outside `fields`, so
+   * it never enters `complete`/`incompleteFields` and never touches
+   * `confidence`. The builder always sets it; optional only so cards built
+   * elsewhere (fixtures, pre-TRA-4719 rows) still typecheck — a consumer reads
+   * an absent section as all `not_evaluated`, never as clear.
+   */
+  reasonsNotToEnter?: ReasonsNotToEnter;
 }
 
 // ── Build context ───────────────────────────────────────────────────────────
@@ -456,6 +469,11 @@ export interface CardBuildContext {
   calibration?: SetupCalibrationIndex;
   /** Current market regime label, for regime-conditioned confidence lookup. */
   currentRegime?: string | null;
+  /**
+   * TRA-4719 — engine-owned reads for the "reasons NOT to enter" section.
+   * Absent (or `enabled: false`) ⇒ every source reads `not_evaluated`.
+   */
+  reasonsNotToEnter?: ReasonsNotToEnterInputs;
 }
 
 // ── The builder ─────────────────────────────────────────────────────────────
@@ -886,6 +904,16 @@ export function buildTradeOpportunityCard(
     complete: incompleteFields.length === 0,
     incompleteFields,
     fields,
+    reasonsNotToEnter: buildReasonsNotToEnter(
+      {
+        symbol: signal.symbol,
+        signalType: signal.type,
+        instrument: opt ? 'option' : 'underlying',
+        family: spec?.family ?? null,
+        optionType: opt?.optionType ?? null,
+      },
+      ctx.reasonsNotToEnter,
+    ),
   };
 }
 

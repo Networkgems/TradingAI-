@@ -275,6 +275,15 @@ export async function runPromotionDivergencePass(
   }
 }
 
+/**
+ * TRA-4719 — the last completed pass's rows for the card's "reasons NOT to
+ * enter" section, READ and never recomputed. Null ⇔ no pass has completed since
+ * boot (nothing measured — not clean).
+ */
+export function lastPromotionDivergenceRows(): readonly PromotionDivergencePassRow[] | null {
+  return lastPassAt === null ? null : lastRows;
+}
+
 export interface PromotionDivergenceHealth {
   readonly issue: 'TRA-4661';
   readonly flag: string;

@@ -293,6 +293,19 @@ import {
   OTM_DAILY_SERIES_BUDGET_MS,
   OTM_DAILY_SERIES_REFRESH_MS,
 } from './otm-daily-series.js';
+// TRA-4719 (parent TRA-4413 item 3) — "reasons NOT to enter" on the card:
+// the shadow verdicts above, CONSULTED at the card sink (never recorded into
+// their counters). Display only; sub-flag ENABLE_CARD_REASONS_NOT_TO_ENTER.
+import {
+  isCardReasonsNotToEnterEnabled,
+  summarizeReasonsNotToEnter,
+  type ReasonsNotToEnterInputs,
+  type ReasonsNotToEnterTally,
+} from './card-reasons-not-to-enter.js';
+import {
+  isPromotionDivergenceMonitorShadowEnabled,
+  lastPromotionDivergenceRows,
+} from './promotion-divergence-monitor.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
 import { sessionEdgeBlackoutVerdict } from './session-edge-blackout-flag.js';
@@ -7598,6 +7611,7 @@ export class SignalEngine {
             }
           : {}),
         ...(quote ? { underlyingQuote: quote } : {}),
+        reasonsNotToEnter: this.reasonsNotToEnterInputs(signal.symbol),
       });
       this.recentCards.unshift(card);
       if (this.recentCards.length > MAX_SIGNALS) this.recentCards.length = MAX_SIGNALS;
@@ -7617,11 +7631,52 @@ export class SignalEngine {
     cards: TradeOpportunityCard[];
     summary: CardBatchSummary;
     buildFailures: number;
+    reasonsNotToEnter: ReasonsNotToEnterTally & { enabled: boolean };
   } {
     return {
       cards: [...this.recentCards],
       summary: summarizeCards(this.recentCards),
       buildFailures: this.cardBuildFailures,
+      // TRA-4719 — the published counter: ring cards by source × state, with
+      // the not_evaluated cause split out. Folded off the SAME ring as
+      // `summary`; `enabled` is the sub-flag now (cards carry their own).
+      reasonsNotToEnter: {
+        enabled: isCardReasonsNotToEnterEnabled(this.reasonsFlagEnv()),
+        ...summarizeReasonsNotToEnter(this.recentCards.map((c) => c.reasonsNotToEnter)),
+      },
+    };
+  }
+
+  private reasonsFlagEnv(): NodeJS.ProcessEnv {
+    return this.mode === 'live' ? process.env : this.resolveDemoFlagEnv();
+  }
+
+  /**
+   * TRA-4719 — the engine-owned reads behind the card's "reasons NOT to enter"
+   * section. Each source is read with the SAME flag env and the SAME input its
+   * own shadow seam uses (IV-crush / underlying-confirm: `process.env`, the
+   * earnings calendar read, the daily series; promotion divergence: the demo-
+   * flag env the index tick gates on, and the monitor's last pass). Reads are
+   * side-effect free — `peekOtmDailySeries`, not `readOtmDailySeries`, so the
+   * card sink never lands in the daily-series read counters, and nothing is
+   * recorded into any shadow module's denominator. Sub-flag off ⇒ nothing is
+   * read at all.
+   */
+  private reasonsNotToEnterInputs(symbol: string): ReasonsNotToEnterInputs {
+    if (!isCardReasonsNotToEnterEnabled(this.reasonsFlagEnv())) return { enabled: false };
+    const ivCrushOn = isOtmIvCrushDemoterShadowEnabled();
+    const confirmOn = isOtmUnderlyingConfirmShadowEnabled();
+    const daily = confirmOn ? peekOtmDailySeries(symbol) : null;
+    const promotionOn = isPromotionDivergenceMonitorShadowEnabled(this.resolveDemoFlagEnv());
+    return {
+      enabled: true,
+      ivCrush: { enabled: ivCrushOn, calendar: ivCrushOn ? earningsCalendarReadSync(symbol) : null },
+      underlying: {
+        enabled: confirmOn,
+        series: daily?.bars ?? [],
+        readable: daily?.state === 'fresh',
+      },
+      promotion: { enabled: promotionOn, rows: promotionOn ? lastPromotionDivergenceRows() : null },
     };
   }
 

@@ -29,6 +29,7 @@ import type {
   SetupFamily,
 } from './trade-opportunity-card.js';
 import type { SetupConfidence } from './setup-calibration.js';
+import { buildReasonsNotToEnter, type ReasonsNotToEnter } from './card-reasons-not-to-enter.js';
 
 // (Route: GET /api/cards/:signalId/panel in index.ts; engine assembly in
 // SignalEngine.getDecisionPanel.)
@@ -249,6 +250,12 @@ export interface DecisionPanelView {
   contract: PanelSection<PanelContract>;
   portfolio: PanelSection<PanelPortfolioImpact>;
   similarTrades: PanelSection<PanelSimilarTrades>;
+  /**
+   * TRA-4719 — "reasons NOT to enter", passed through from the card. DISPLAY
+   * ONLY: not a PanelSection, not in `incompleteSections`, never moves
+   * `complete` or the actions. A card without one reads all `not_evaluated`.
+   */
+  reasonsNotToEnter: ReasonsNotToEnter;
   /** TRA-4652 verdict, passed through from the card. Calibrated or absent. */
   confidence: SetupConfidence | null;
   actions: PanelActions;
@@ -531,6 +538,18 @@ export function buildDecisionPanel(
     assemblyMs: 0,
     header: buildHeader(card, ctx),
     ...sections,
+    reasonsNotToEnter:
+      card.reasonsNotToEnter
+      ?? buildReasonsNotToEnter(
+        {
+          symbol: card.symbol,
+          signalType: card.signalType,
+          instrument: card.fields.setup.data?.instrument ?? null,
+          family: card.fields.setup.data?.family ?? null,
+          optionType: card.fields.contract.data?.optionType ?? null,
+        },
+        undefined,
+      ),
     confidence: card.confidence,
     actions: buildActions(card),
     complete: incompleteSections.length === 0 && card.complete,
