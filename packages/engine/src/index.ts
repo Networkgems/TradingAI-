@@ -153,6 +153,15 @@ export { AlpacaOptionsClient } from './alpaca/index.js';
 export type { AlpacaOptionsContract, AlpacaOptionOrderResponse } from './alpaca/index.js';
 export { TradierFeed } from './feed/index.js';
 export type { TradierFeedEvents } from './feed/index.js';
+export { TradierStreamFeed, quoteFreshness } from './feed/index.js';
+export type {
+  TradierStreamFeedEvents,
+  TradierStreamFeedOptions,
+  TradierStreamStatus,
+  StreamConnectionState,
+  StreamQuote,
+  SymbolFreshness,
+} from './feed/index.js';
 export {
   TradierOrderClient,
   TradierOrderError, // TRA-4218 — carries the HTTP status so a 5xx is not read as a refusal
