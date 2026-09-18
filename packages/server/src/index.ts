@@ -279,6 +279,7 @@ import { hydrateMarkSanityFromDisk } from './option-mark-sanity.js'; // TRA-2945
 import { hydrateLiveEnforceGateFromDisk } from './live-enforce-gate-ledger.js';
 import { registerHardControlRoutes } from './hard-controls-routes.js'; // TRA-4655
 import { bindHardControlsToEngines } from './hard-controls-bridge.js'; // TRA-4650
+import { registerPaperTradingRoutes } from './paper-trading-routes.js'; // TRA-4657
 // TRA-2930 — durable per-book EOD archive-participation record.
 import {
   hydrateEodArchiveParticipationFromDisk,
@@ -16306,6 +16307,11 @@ registerHardControlRoutes(app, { requireAuth, requireAdmin });
 bindHardControlsToEngines(() =>
   getAllUserContexts().map((c) => ({ username: c.username, engine: c.engine })),
 );
+// TRA-4657 — paper trading with live data: hydrates the theoretical-fill
+// ledger, registers the `paper-book` force-close handler, and serves
+// /api/paper-trading* (state · daily summary · per-day rows). Recording arms
+// via ENABLE_PAPER_TRADING; the tees live at the engine's alert emitters.
+registerPaperTradingRoutes(app, { requireAuth });
 
 // TRA-526 — global kill switch (deterministic risk-layer master override).
 // Engages/releases the manual master halt across BOTH the equities/options

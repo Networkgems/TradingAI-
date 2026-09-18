@@ -340,6 +340,15 @@ import {
 import { recordLiveEnforceDecision, type LiveEnforceNominator } from './live-enforce-gate-ledger.js';
 import { resolveCanaryCeiling, gradeCanaryCeiling } from './canary-ceiling.js';
 import { admitOrderThroughHardControls } from './hard-controls.js'; // TRA-4650 (choke point: TRA-4655)
+// TRA-4657 — paper-trading tees at the alert-emitter seams (observe-only; the
+// recorders swallow their own throws and are inert while the flag is off).
+import {
+  recordPaperEquityClose,
+  recordPaperEquityOpen,
+  recordPaperOptionClose,
+  recordPaperOptionOpen,
+  recordPaperSignal,
+} from './paper-trading.js';
 import { recordGiveBackState, getBookSessionPeak, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
 import { recordOptionsBreakerState, getOptionsBreakerRestoreState } from './options-breaker-ledger.js'; // TRA-3218
 import { recordMarkObservation, classifyMarkJump, MAX_MARK_JUMP_X } from './option-mark-sanity.js'; // TRA-2927
@@ -7409,6 +7418,10 @@ export class SignalEngine {
    * RECORDED as `voidReason: 'evicted'`. Every feed push must go through here.
    */
   private pushRecentSignal(signal: TradeSignal | Sma200Signal): void {
+    // TRA-4657 — paper ledger: every fired signal, with trigger + proposed
+    // trade. This is THE feed sink, so logging here is exhaustive by the same
+    // argument the doc above makes; before the ring so eviction can't un-log.
+    recordPaperSignal(signal, this.mode);
     this.recentSignals.unshift(signal);
     this.emitSignalAlert(signal);
     while (this.recentSignals.length > MAX_SIGNALS) {
@@ -19429,6 +19442,10 @@ export class SignalEngine {
 
   /** Emit a fill (position-opened) alert. `pos` is the freshly opened position. */
   private emitFillAlert(pos: Position, strategy?: SignalType | string): void {
+    // TRA-4657 — paper ledger: theoretical fill + choke-point admit for every
+    // confirmed equity open. Above the alert guard: recording must not depend
+    // on whether this book has an alert username.
+    recordPaperEquityOpen(pos, this.mode);
     if (!this.alertUsername) return;
     emitAlert({
       kind: 'fill',
@@ -19446,6 +19463,10 @@ export class SignalEngine {
 
   /** Emit an options fill alert (RV option open). */
   private emitOptionFillAlert(opt: OptionPosition): void {
+    // TRA-4657 — paper ledger: theoretical at-the-touch fill (row's own
+    // TRA-3990 entry quote) + choke-point admit, for every confirmed option
+    // open across all sleeves. Above the alert guard on purpose.
+    recordPaperOptionOpen(opt, this.mode);
     if (!this.alertUsername) return;
     emitAlert({
       kind: 'fill',
@@ -19463,6 +19484,9 @@ export class SignalEngine {
 
   /** Emit an exit (position-closed) alert for a closed equity position. */
   private emitExitAlert(pos: Position): void {
+    // TRA-4657 — paper ledger: theoretical exit fill for every strategy-driven
+    // equity close. Above the alert guard on purpose.
+    recordPaperEquityClose(pos, this.mode);
     if (!this.alertUsername) return;
     emitAlert({
       kind: 'exit',
@@ -19478,6 +19502,10 @@ export class SignalEngine {
 
   /** Emit an exit alert for a closed option position. */
   private emitOptionExitAlert(opt: OptionPosition): void {
+    // TRA-4657 — paper ledger: theoretical at-the-touch exit fill (on a closed
+    // row `currentPremium` IS the demo exit fill — TRA-2890) for every
+    // strategy-driven option close. Above the alert guard on purpose.
+    recordPaperOptionClose(opt, this.mode);
     if (!this.alertUsername) return;
     emitAlert({
       kind: 'exit',
