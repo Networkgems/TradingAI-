@@ -77,6 +77,10 @@ function strategyLabel(t: SignalType): StrategyLabel {
     case 'orb_breakout': return 'ORB';
     case 'otm_mispricing': return 'OTM';
     case 'relative_value': return 'RV';
+    // TRA-4570 — swing options signals (stocks-options only, never reach crypto EOD)
+    case 'post_earnings_iv_crush': return 'Earnings IV';
+    case 'momentum_breakout_iv_lag': return 'Momentum IV';
+    case 'panic_reversal': return 'Panic Rev';
     // TRA-323 — imported Tradier positions are stocks-options only and
     // never reach the crypto EOD exporter. Mapped here only to keep the
     // switch exhaustive for the shared `SignalType` enum.

@@ -67,6 +67,9 @@ export type SignalType =
   | 'dca'          // TRA-693: dollar-cost-averaging accumulation — long-only, trend-gated, cadence-paced
   | 'otm_mispricing'
   | 'relative_value' // TRA-191: options chain relative-value scanner (IV skew + monotonic + no-arb)
+  | 'post_earnings_iv_crush' // TRA-4570: post-earnings IV collapse + directional continuation swing (OTM options)
+  | 'momentum_breakout_iv_lag' // TRA-4570: price breaks out but IV hasn't repriced — OTM options before vol catches up
+  | 'panic_reversal' // TRA-4570: big selloff → reversal confirmation → cheap OTM calls (elevated put skew + price recovery)
   | 'sma200_pullback' // TRA-451: pullback-to-200 bounce (continuation long), daily bars
   | 'sma200_reclaim'  // TRA-451: 200-SMA reclaim reversal (trend-change swing), daily bars
   | 'supertrend_confluence' // TRA-728: Supertrend + MA-stack + MACD + RSI confluence (options, router-gated off in Phase 1)
@@ -273,6 +276,133 @@ export interface RelativeValueSignal extends TradeSignal {
    */
   bid?: number;
   ask?: number;
+}
+
+/**
+ * TRA-4570 — post-earnings IV crush + continuation signal.
+ * Swing entry after earnings event where IV collapses and price holds gap/trend.
+ * Targets OTM options that are now reasonably priced post-IV-crush.
+ */
+export interface PostEarningsIvCrushSignal extends TradeSignal {
+  type: 'post_earnings_iv_crush';
+  side: 'buy' | 'sell';
+  optionSymbol: string;
+  optionType: OptionType;
+  strike: number;
+  expiration: string;
+  /** Per-share mark (entry premium). */
+  mark: number;
+  /** Days since last earnings. */
+  daysSinceEarnings: number;
+  /** IV percentile current vs 30-day lookback. */
+  ivPercentile: number;
+  /** Gap % from earnings event. */
+  gapPercent: number;
+  /** Sign-adjusted delta. */
+  delta: number;
+  /** Trend direction post-earnings. */
+  trendDirection: 'bullish' | 'bearish';
+  /** Relative strength vs sector. */
+  relativeStrength?: number;
+  bid?: number;
+  ask?: number;
+}
+
+/**
+ * TRA-4570 — momentum breakout + IV lag signal.
+ * Price breaks out but option IV hasn't repriced yet.
+ * Entry on 0.25–0.40 delta OTM calls/puts before vol catches up.
+ */
+export interface MomentumBreakoutIvLagSignal extends TradeSignal {
+  type: 'momentum_breakout_iv_lag';
+  side: 'buy' | 'sell';
+  optionSymbol: string;
+  optionType: OptionType;
+  strike: number;
+  expiration: string;
+  /** Per-share mark (entry premium). */
+  mark: number;
+  /** Breakout price level. */
+  breakoutLevel: number;
+  /** IV percentile (should be low for bullish, moderate for bearish). */
+  ivPercentile: number;
+  /** Volume confirmation (current vs average). */
+  volumeRatio: number;
+  /** Momentum score (0-100). */
+  momentumScore: number;
+  /** Sign-adjusted delta. */
+  delta: number;
+  /** Relative strength vs sector. */
+  relativeStrength: number;
+  bid?: number;
+  ask?: number;
+}
+
+/**
+ * TRA-4570 — panic reversal signal (big selloff → stabilization → reversal).
+ * Targets cheap OTM calls after panic selling when:
+ * - Put skew is elevated (downside options expensive)
+ * - Price has stabilized and shows reversal confirmation
+ * - OTM calls remain relatively cheap
+ */
+export interface PanicReversalSignal extends TradeSignal {
+  type: 'panic_reversal';
+  side: 'buy';
+  optionSymbol: string;
+  optionType: 'call'; // Always calls for panic reversal
+  strike: number;
+  expiration: string;
+  /** Per-share mark (entry premium). */
+  mark: number;
+  /** Recent decline % (e.g., -9% over 2 days). */
+  recentDeclinePct: number;
+  /** IV rank (should be elevated). */
+  ivRank: number;
+  /** Put/call skew ratio. */
+  putCallSkew: number;
+  /** Distance to support level. */
+  supportDistance: number;
+  /** Reversal confirmation score (0-100). */
+  reversalScore: number;
+  /** Sign-adjusted delta. */
+  delta: number;
+  /** RSI value (should be recovering from oversold). */
+  rsi: number;
+  bid?: number;
+  ask?: number;
+}
+
+/**
+ * TRA-4626 — Swing signal fusion engine score breakdown. Each dimension
+ * scores 0-100; weighted composite determines final ranking.
+ */
+export interface SignalScoreBreakdown {
+  /** Technical score (0-100): price action, volume, momentum */
+  technical: number;
+  /** Momentum score (0-100): trend strength, velocity */
+  momentum: number;
+  /** Mean reversion score (0-100): oversold/overbought, reversal signals */
+  meanReversion: number;
+  /** Relative strength (0-100): vs sector/index */
+  relativeStrength: number;
+  /** IV/RV score (0-100): implied vs realized volatility spread */
+  ivRv: number;
+  /** IV skew score (0-100): put/call skew analysis */
+  ivSkew: number;
+  /** OTM mispricing score (0-100): option cheapness */
+  otmMispricing: number;
+  /** Liquidity score (0-100): bid/ask spread, volume */
+  liquidity: number;
+}
+
+/**
+ * TRA-4626 — Swing signal candidate with composite score + breakdown.
+ * Surfaced on EngineState.swingSignals for dashboard display.
+ */
+export interface SwingSignalCandidate {
+  signal: PostEarningsIvCrushSignal | MomentumBreakoutIvLagSignal | PanicReversalSignal;
+  score: number;
+  breakdown: SignalScoreBreakdown;
 }
 
 /**
@@ -5518,6 +5648,9 @@ export interface EodTradeEntry {
     | 'DCA'          // TRA-693 — dollar-cost-averaging accumulation
     | 'OTM'
     | 'RV'           // TRA-191 — relative-value scanner
+    | 'Earnings IV'  // TRA-4570 — post-earnings IV crush swing options
+    | 'Momentum IV'  // TRA-4570 — momentum breakout IV lag swing options
+    | 'Panic Rev'    // TRA-4570 — panic reversal swing options
     | 'Tradier'      // TRA-323 — imported from Tradier (never actually written to disk: imports don't trade through the EOD exporter)
     | 'Options'      // TRA-365 follow-up — option closes that arrived without a more specific signal mapping
     | 'SMA-200'      // TRA-451 — SMA-200 pullback/reclaim signals (display-only; never opens a position, so never reaches the EOD exporter)

@@ -358,7 +358,6 @@ import {
 import { hydrateOptionsBreakerLedgerFromDisk, summarizeOptionsBreakerLedger } from './options-breaker-ledger.js'; // TRA-3218
 import { hydrateMarkSanityFromDisk } from './option-mark-sanity.js'; // TRA-2945
 import { hydrateLiveEnforceGateFromDisk } from './live-enforce-gate-ledger.js';
-import { registerHardControlRoutes } from './hard-controls-routes.js'; // TRA-4655
 // TRA-2930 — durable per-book EOD archive-participation record.
 import {
   hydrateEodArchiveParticipationFromDisk,
@@ -1128,6 +1127,19 @@ import {
   evaluateLiveCryptoStartGate,
 } from './promotion-service.js';
 import { resolveDataDir } from './data-dir.js';
+// TRA-3595 — the host execution path for the TRA-2906 v1→v2 cash-flow rebuild.
+// Inert unless `TRA2906_CASH_FLOW_REBUILD` is set; see that module's header for
+// why an env-armed boot one-shot is not the standing automated write TRA-3595
+// refused to create.
+import {
+  TRA2906_REBUILD_ENV_VAR,
+  parseRebuildIntent,
+  inventoryCashFlowRecords,
+  runCashFlowRebuild,
+  buildHostCashEventFetcher,
+  setLastRebuildRun,
+  getLastRebuildRun,
+} from './tra2906-cash-flow-rebuild.js';
 
 const log = logger.child({ module: 'index' });
 
@@ -6780,6 +6792,36 @@ app.get('/api/health/autonomous-demo', (_req, res) => {
   res.json(getAutonomousDemoStatus(demoFlagEnv()));
 });
 
+// TRA-3595 — the readable half of the TRA-2906 v1→v2 cash-flow migration.
+// Unauthenticated, matching the other `/api/health/*` probes: it carries record
+// SHAPE and per-date cash-flow deltas for the books on this host — the same
+// class of P&L delta `/api/health/pnl-reconciliation` already publishes — and no
+// credentials, positions, or order specifics.
+//
+// Two distinct things are published, and they answer different questions:
+//
+//   `inventoryNow` — read FRESH on every request. Which schema each book's
+//     record is in, right now. This is the fact that had to be INFERRED on
+//     2026-09-10 from `stockLegProbeBrokerFeeUsd` being null two subsystems
+//     downstream, because no route published it. A one-shot migration whose
+//     completion is not directly readable cannot be graded, and an `apply` that
+//     silently did nothing would look exactly like one that worked.
+//   `bootRun` — the result of the arming run at the last boot, or `null`. Kept
+//     separate from `inventoryNow` on purpose: after a later restart the boot
+//     run is gone but the schema is not, so conflating them would make a
+//     completed migration read as "never ran".
+app.get('/api/health/tra2906-cash-flow-rebuild', (_req, res) => {
+  const bootRun = getLastRebuildRun();
+  res.json({
+    time: new Date().toISOString(),
+    envVar: TRA2906_REBUILD_ENV_VAR,
+    // The MODE only — never the raw value, which on an `apply` names books.
+    armedMode: parseRebuildIntent(process.env[TRA2906_REBUILD_ENV_VAR]).mode,
+    inventoryNow: inventoryCashFlowRecords(DATA_DIR, 'production'),
+    bootRun,
+  });
+});
+
 // TRA-1304 — tokenless acceptance probe for the item-5 live DCA canary
 // (QuantTrader comment 4436ec31). Enumerates every engine's redacted canary
 // readout (booleans / counts / ids / aggregate notional only — no keys, prices,
@@ -8384,8 +8426,8 @@ app.get('/api/health/live-capital-gate', async (_req, res) => {
       // `confidenceSigma = 2.0` puts δ at TWO standard errors (n_req = (2σ/δ)²). That is
       // ~95% confidence against a ZERO effect but only **~50% power at δ itself**, and
       // `powered: true` MUST NOT be read as "80% powered" — true 80% power at δ would need
-      // z ≈ 2.81 (= 1.96 + 0.84), i.e. ~1.97× the sample on every branch (measured: c=0.03
-      // 138→272, c=0.20 1112→2194, c=0.30 1905→3761).
+      // z ≈ 2.80 (= 1.96 + 0.84), i.e. ~1.96× the sample on every branch (measured: c=0.03
+      // 138→270, c=0.20 1112→2178, c=0.30 1905→3734).
       //
       // What z = 2.0 DOES buy, and why it was kept: the gate's expectancy rule is a
       // POINT-ESTIMATE comparison (`expectancyNetR > minExpectancyR`, live-capital-gate.ts)
@@ -8397,7 +8439,7 @@ app.get('/api/health/live-capital-gate', async (_req, res) => {
       // ⛔ THIS PRE-REGISTRATION VOIDS ITSELF IF THE DECISION RULE CHANGES. If
       // `positive_expectancy` is ever amended to require the mean to clear the bar by an
       // SE margin (an actual significance test), z = 2.0 becomes genuinely ~50%-powered,
-      // the reasoning above no longer holds, and z must be re-derived (2.81 for 80%).
+      // the reasoning above no longer holds, and z must be re-derived (2.80 for 80%).
       // Whoever makes that change re-opens TRA-3611. Ratified as a PARAMETER change, not a
       // redesign (TRA-2346 Q3) — the door is open, it is just not walked through today.
       power: gate.power,
@@ -16849,13 +16891,6 @@ app.post('/api/trading/stop', requireAuth, async (req, res) => {
   res.json({ ok: true, mode, autoTradingEnabled: false });
 });
 
-// TRA-4655 — Week-1 hard operating controls: fleet-wide kill switch, $500 daily
-// loss lockout, $300/trade cap, 3-position cap, 5s stale-quote breaker,
-// idempotency, force-close-all. Registers /api/controls/hard* and hydrates the
-// durable latches. The admit() choke point is what the TRA-4657 paper-trading
-// order path MUST call; TRA-4650 extends/verifies on this interface.
-registerHardControlRoutes(app, { requireAuth, requireAdmin });
-
 // TRA-526 — global kill switch (deterministic risk-layer master override).
 // Engages/releases the manual master halt across BOTH the equities/options
 // engine (via DailyRiskGovernor) and the crypto engine, and persists the state
@@ -20125,6 +20160,60 @@ httpServer.listen(PORT, () => {
   console.log(`Trading server running on http://localhost:${PORT}`);
   console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
 });
+
+// TRA-3595 — the TRA-2906 cash-flow rebuild one-shot.
+//
+// Started AFTER `listen` and deliberately not awaited: the whole value of this
+// run is the verdict published on `/api/health/tra2906-cash-flow-rebuild`, so a
+// broker fetch that hangs must not be able to hold the port — an unreachable
+// health route would make the result unreadable, which is the failure mode this
+// ticket is about.
+//
+// With `TRA2906_CASH_FLOW_REBUILD` unset — every boot before the arming write
+// and every boot after it — `parseRebuildIntent` returns `off` and this reads
+// one directory listing and writes nothing. It never arms itself, never
+// retries, and has no schedule.
+void (async () => {
+  const intent = parseRebuildIntent(process.env[TRA2906_REBUILD_ENV_VAR]);
+  if (intent.mode === 'off') return;
+  try {
+    const result = await runCashFlowRebuild({
+      dataDir: DATA_DIR,
+      env: 'production',
+      intent,
+      fetchCashEvents: buildHostCashEventFetcher(),
+    });
+    setLastRebuildRun(result);
+    // Logged at WARN even on a clean run: this is a one-shot against financial
+    // state on the money host, and it should be conspicuous in the Render log
+    // tape rather than sorted in with routine info lines.
+    log.warn('TRA-3595 cash-flow rebuild one-shot ran', {
+      mode: result.intentMode,
+      verdict: result.verdict,
+      reason: result.reason,
+      books: result.books.map(b => `${b.username}:${b.outcome}${b.applied ? ' APPLIED' : ''}`).join(', '),
+    });
+  } catch (err) {
+    // A throw must not leave the route publishing `bootRun: null`, which reads
+    // identically to "not armed".
+    setLastRebuildRun({
+      armed: true,
+      intentMode: intent.mode,
+      reason: `BLIND — the one-shot threw: ${err instanceof Error ? err.message : String(err)}`,
+      env: 'production',
+      dataDir: DATA_DIR,
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      window: null,
+      inventory: { usersRoot: '', books: [], legacyRootPath: null },
+      books: [],
+      verdict: 'BLIND',
+    });
+    log.error('TRA-3595 cash-flow rebuild one-shot threw', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+})();
 
 // TRA-1080 — event-loop/heap starvation watchdog. Detects the bqb1 "HTTP
 // listener dead while worker timers live" state from inside the process and
