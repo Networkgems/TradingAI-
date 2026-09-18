@@ -370,6 +370,15 @@ import {
   type CardBatchSummary,
   type TradeOpportunityCard,
 } from './trade-opportunity-card.js';
+// TRA-4654 — "Why This Trade?" decision panel: read-only assembly of one card
+// plus engine-owned context (regime, books, closed-trade history). See
+// decision-panel.ts for the fail-closed section discipline.
+import {
+  buildDecisionPanel,
+  type DecisionPanelView,
+  type PanelHistoryInput,
+  type PanelPositionInput,
+} from './decision-panel.js';
 import { recordGiveBackState, getBookSessionPeak, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
 import { recordOptionsBreakerState, getOptionsBreakerRestoreState } from './options-breaker-ledger.js'; // TRA-3218
 import { recordMarkObservation, classifyMarkJump, MAX_MARK_JUMP_X } from './option-mark-sanity.js'; // TRA-2927
@@ -7557,6 +7566,77 @@ export class SignalEngine {
       summary: summarizeCards(this.recentCards),
       buildFailures: this.cardBuildFailures,
     };
+  }
+
+  /**
+   * TRA-4654 — assemble the "Why This Trade?" decision panel for one carded
+   * signal. Read-only over engine state the same way the card sink is: regime
+   * from the market-review cache (TRA-389), concentration over BOTH books'
+   * open positions, history over both books' closed rows. Unknowns stay
+   * unknowns — an option row without `entryDelta` is COUNTED as delta-unknown,
+   * a close that never booked `pnl` poisons the cohort total (see
+   * decision-panel.ts). Null ⇔ no card in the ring for that id (evicted or
+   * never emitted); the route turns that into a 404, not an empty panel.
+   */
+  getDecisionPanel(signalId: string): DecisionPanelView | null {
+    const card = this.recentCards.find(c => c.signalId === signalId);
+    if (!card) return null;
+    const review = this.buildMarketReviewState();
+    const equityState = this.account.getState();
+    const optionsState = this.optionsAccount.getState();
+    const positions: PanelPositionInput[] = [
+      ...equityState.openPositions.map((p): PanelPositionInput => ({
+        symbol: p.symbol,
+        kind: 'equity',
+        signalType: p.signalType ?? null,
+        quantity: p.quantity,
+        notionalUsd: p.quantity * p.entryPrice,
+        deltaShares: p.side === 'sell' ? -p.quantity : p.quantity,
+      })),
+      ...optionsState.openOptions.map((o): PanelPositionInput => ({
+        symbol: o.symbol,
+        kind: 'option',
+        signalType: o.signalType ?? null,
+        quantity: o.contractsRemaining,
+        notionalUsd: o.currentPremium * 100 * o.contractsRemaining,
+        // entryDelta is |delta| at entry (TRA-384); sign restored from the
+        // option type. Absent ⇒ unknown, never zero.
+        deltaShares:
+          typeof o.entryDelta === 'number'
+            ? (o.optionType === 'put' ? -1 : 1) * o.entryDelta * 100 * o.contractsRemaining
+            : null,
+      })),
+    ];
+    const history: PanelHistoryInput[] = [
+      ...this.allClosedPositions.map((p): PanelHistoryInput => ({
+        symbol: p.symbol,
+        signalType: p.signalType ?? null,
+        closedAt: p.closedAt ?? null,
+        pnlUsd: typeof p.pnl === 'number' ? p.pnl : null,
+        source: 'equity_book',
+      })),
+      ...optionsState.closedOptions.map((o): PanelHistoryInput => ({
+        symbol: o.symbol,
+        signalType: o.signalType ?? null,
+        closedAt: o.closedAt ?? null,
+        pnlUsd: typeof o.pnl === 'number' ? o.pnl : null,
+        source: 'options_book',
+      })),
+    ];
+    const managedEquity = this.account.managedEquity();
+    const quote = this.symbolState.get(card.symbol);
+    return buildDecisionPanel(card, {
+      now: Date.now(),
+      regime: {
+        enabled: review.enabled,
+        label: review.regime,
+        asOf: review.reviewDate,
+      },
+      ...(managedEquity > 0 ? { totalEquityUsd: managedEquity } : {}),
+      positions,
+      history,
+      quoteAsOf: quote?.lastUpdated ?? null,
+    });
   }
 
   /**

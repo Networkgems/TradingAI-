@@ -10399,6 +10399,29 @@ app.get('/api/cards', requireAuth, async (_req, res) => {
   res.json({ asOf: new Date().toISOString(), ...ctx.engine.getRecentCards() });
 });
 
+// TRA-4654 — "Why This Trade?" decision panel for one carded signal. The
+// server precomputes EVERYTHING (regime, trigger checklist, risk levels,
+// liquidity grade, portfolio concentration, similar-trade history) so the
+// client render is one synchronous pass over this payload — that is how the
+// <100ms render acceptance is met, not by a fast fetch. Read-only like
+// /api/cards: the panel's action entries are intents for the TRA-4651
+// lifecycle; there is deliberately NO order path here. 404 ⇔ no card in the
+// ring for that id (evicted or never emitted) — distinct from an empty panel.
+app.get('/api/cards/:signalId/panel', requireAuth, async (req, res) => {
+  const signalId = (req.params as Record<string, string>)['signalId'] ?? '';
+  if (!signalId) {
+    res.status(400).json({ error: 'signalId required' });
+    return;
+  }
+  const ctx = await userCtx(res);
+  const panel = ctx.engine.getDecisionPanel(signalId);
+  if (!panel) {
+    res.status(404).json({ error: 'no card for signalId (evicted or never emitted)' });
+    return;
+  }
+  res.json(panel);
+});
+
 // TRA-1303 — Position Advisor readout: per held DEMO-book symbol, the next DCA
 // add (size + trigger price) and the current sell plan (SL / TP / trailing).
 // Read-only — it re-runs the SHIPPED engine cores (conviction-dca /

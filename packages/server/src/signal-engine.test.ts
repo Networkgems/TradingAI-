@@ -10864,3 +10864,81 @@ describe('TRA-4649 — trade opportunity cards ride the signal feed sink', () =>
     expect(engine.getState().signals).toHaveLength(0);
   });
 });
+
+// ── TRA-4654 — "Why This Trade?" decision panel off the card ring ────────────
+//
+// The assembler's own behavior (section verdicts, concentration math,
+// unknown-never-zero, the <100ms budget) is covered in decision-panel.test.ts.
+// These tests cover the WIRING: `getDecisionPanel` finds the card by signalId,
+// feeds it ENGINE-OWNED context (books, managed equity, regime cache, L1
+// timestamp), and distinguishes "no such card" (null → the route's 404) from
+// an assembled-but-incomplete panel.
+describe('TRA-4654 — decision panel assembles off the card ring with engine-owned context', () => {
+  function pushInto(engine: SignalEngine, signal: unknown): void {
+    (engine as unknown as { pushRecentSignal: (s: unknown) => void }).pushRecentSignal(signal);
+  }
+
+  function seededEngine(): SignalEngine {
+    const engine = new SignalEngine();
+    (engine as unknown as { symbolState: Map<string, unknown> }).symbolState.set('MSFT', {
+      symbol: 'MSFT',
+      price: 100,
+      volume: 1_000,
+      change: 0,
+      changePct: 0,
+      lastUpdated: 1_726_000_000_000,
+      bid: 99.98,
+      ask: 100.02,
+    });
+    pushInto(engine, {
+      id: 'tra4654-eq-1',
+      symbol: 'MSFT',
+      type: 'momentum',
+      side: 'buy',
+      entryPrice: 100,
+      stopLoss: 95,
+      takeProfit: 115,
+      riskRewardRatio: 3,
+      timestamp: Date.now() - 60_000,
+      mode: 'demo',
+    });
+    return engine;
+  }
+
+  it('a carded signal panels COMPLETE off engine context: books read, equity read, quote stamped', () => {
+    const engine = seededEngine();
+    const panel = engine.getDecisionPanel('tra4654-eq-1');
+    expect(panel).not.toBeNull();
+    expect(panel!.signalId).toBe('tra4654-eq-1');
+    expect(panel!.header.disposition).toBe('proposal_only');
+    // Fresh engine: no market review consumed → the regime banner says so
+    // honestly instead of carrying a stale label.
+    expect(panel!.header.regimeEnabled).toBe(false);
+    expect(panel!.header.regime).toBeNull();
+    // All six sections assemble: the books are EMPTY but PRESENT (a wired
+    // empty book is a verified zero, not a missing input).
+    expect(panel!.incompleteSections).toEqual([]);
+    expect(panel!.complete).toBe(true);
+    expect(panel!.portfolio.data).toMatchObject({
+      openPositionCount: 0,
+      sameSymbolCount: 0,
+      sameSetupCount: 0,
+      deltaUnknownCount: 0,
+    });
+    expect(panel!.portfolio.data!.correlation.status).toBe('not_computed');
+    expect(panel!.similarTrades.data).toMatchObject({ n: 0, wins: 0, losses: 0 });
+    // Quote timestamp is the L1 row's own lastUpdated, not "now".
+    expect(panel!.freshness.data!.quoteAsOf).toBe(1_726_000_000_000);
+    // Proposal-only action posture survives the wiring.
+    expect(panel!.actions.paperTrade.enabled).toBe(true);
+    expect(panel!.actions.autoExecute.enabled).toBe(false);
+  });
+
+  it('an unknown / evicted signalId is null — the route 404s instead of serving an empty panel', () => {
+    const engine = seededEngine();
+    expect(engine.getDecisionPanel('never-emitted')).toBeNull();
+    engine.clearSignals();
+    // After a feed clear the card is gone WITH its panel — no stale proposal survives.
+    expect(engine.getDecisionPanel('tra4654-eq-1')).toBeNull();
+  });
+});
