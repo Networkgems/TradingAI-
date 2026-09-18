@@ -62,6 +62,7 @@ import {
   type ReasonsNotToEnter,
   type ReasonsNotToEnterInputs,
 } from './card-reasons-not-to-enter.js';
+import type { RelativeStrengthReading } from './otm-relative-strength.js';
 
 // ── Field plumbing ──────────────────────────────────────────────────────────
 
@@ -440,6 +441,15 @@ export interface TradeOpportunityCard {
    * an absent section as all `not_evaluated`, never as clear.
    */
   reasonsNotToEnter?: ReasonsNotToEnter;
+  /**
+   * TRA-4720 — relative strength vs SPY / QQQ / sector ETF (raw spreads per
+   * pre-registered lookback + reason codes), OBSERVE ONLY: outside `fields`, so
+   * it never moves `complete`/`incompleteFields`/`confidence`. Present only
+   * under `ENABLE_OTM_RELATIVE_STRENGTH_SHADOW`; absent ⇒ not measured (NOT
+   * neutral). Distinct from the `relativeStrength:` line in `fields.whyNow` evidence, which echoes the
+   * signal's own value (the momentum scanner's `?? 50` placeholder included).
+   */
+  relativeStrength?: RelativeStrengthReading;
 }
 
 // ── Build context ───────────────────────────────────────────────────────────
@@ -474,6 +484,8 @@ export interface CardBuildContext {
    * Absent (or `enabled: false`) ⇒ every source reads `not_evaluated`.
    */
   reasonsNotToEnter?: ReasonsNotToEnterInputs;
+  /** TRA-4720 — the engine's RS reading; absent (flag OFF) ⇒ no key on the card. */
+  relativeStrength?: RelativeStrengthReading;
 }
 
 // ── The builder ─────────────────────────────────────────────────────────────
@@ -914,6 +926,7 @@ export function buildTradeOpportunityCard(
       },
       ctx.reasonsNotToEnter,
     ),
+    ...(ctx.relativeStrength ? { relativeStrength: ctx.relativeStrength } : {}),
   };
 }
 

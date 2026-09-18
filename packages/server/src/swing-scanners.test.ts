@@ -407,3 +407,62 @@ describe('runSwingSignalPass — what the engine feeds the scanners', () => {
     expect(summary).toMatchObject({ dailySeriesUnreadable: 1, chainUnreadable: 1, ivUnreadable: 1, symbolsScored: 1 });
   });
 });
+
+// ── TRA-4720: relative strength reaches the scanners ONLY under its flag ─────
+
+/** Strip the per-signal `randomUUID` so two runs of the same input compare byte-for-byte. */
+function stable<T>(v: T): unknown {
+  return JSON.parse(JSON.stringify(v, (k, x) => (k === 'id' ? '<id>' : x)));
+}
+
+describe('TRA-4720 — flag OFF: both scanners receive `undefined`, never a placeholder 50', () => {
+  const momentumDeps = (over: Partial<SwingPassDeps> = {}) => {
+    const bars = breakoutBars();
+    const spot = bars[bars.length - 1].close;
+    return passDeps(bars, { getChain: async () => ({ spot, rows: chain(spot) }), ivPercentile: () => 30, ...over });
+  };
+  const earningsDeps = (over: Partial<SwingPassDeps> = {}) => {
+    const bars = earningsBars(8, 1);
+    const spot = bars[bars.length - 1].close;
+    return passDeps(bars, {
+      getChain: async () => ({ spot, rows: chain(spot, { baseIv: 0.28 }) }),
+      ivPercentile: () => 20,
+      ivRank: () => 10,
+      recentEarnings: () => ({ state: 'recent', date: barDay(bars[bars.length - 4]) }),
+      ...over,
+    });
+  };
+
+  it('momentum: no RS dep (flag OFF) ⇒ the gate is skipped and the signal still fires', async () => {
+    const off = await runSwingSignalPass(['X'], momentumDeps());
+    expect(off.summary.emittedByType.momentum_breakout_iv_lag).toBe(1);
+    // …which PROVES the input was undefined: a supplied 50 is refused by the >=80 gate
+    const fifty = await runSwingSignalPass(['X'], momentumDeps({ relativeStrength: () => 50 }));
+    expect(fifty.summary.emittedByType.momentum_breakout_iv_lag).toBe(0);
+    // the fusion breakdown still reads it as unmeasured, not 50
+    const mom = off.candidates.find((c) => c.signal.type === 'momentum_breakout_iv_lag');
+    expect(mom?.breakdown.relativeStrength).toBeNull();
+  });
+
+  it('post-earnings: no RS dep (flag OFF) ⇒ the continuation check is skipped and the signal still fires', async () => {
+    const off = await runSwingSignalPass(['X'], earningsDeps());
+    expect(off.summary.emittedByType.post_earnings_iv_crush).toBe(1);
+    const fifty = await runSwingSignalPass(['X'], earningsDeps({ relativeStrength: () => 50 }));
+    expect(fifty.summary.emittedByType.post_earnings_iv_crush).toBe(0); // 50 < 70 continuation floor
+  });
+
+  it('byte-identity: no dep ≡ a dep that answers `undefined` (unmeasured under the flag), on both scanners', async () => {
+    for (const mk of [momentumDeps, earningsDeps]) {
+      const off = await runSwingSignalPass(['X'], mk());
+      const unmeasured = await runSwingSignalPass(['X'], mk({ relativeStrength: () => undefined }));
+      expect(stable(unmeasured)).toEqual(stable(off));
+    }
+  });
+
+  it('flag ON with a measured value: it reaches the scanner gate and the breakdown', async () => {
+    const on = await runSwingSignalPass(['X'], momentumDeps({ relativeStrength: () => 92 }));
+    expect(on.summary.emittedByType.momentum_breakout_iv_lag).toBe(1);
+    const mom = on.candidates.find((c) => c.signal.type === 'momentum_breakout_iv_lag');
+    expect(mom?.breakdown.relativeStrength).toBe(92);
+  });
+});

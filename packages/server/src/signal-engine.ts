@@ -264,6 +264,19 @@ import {
   isOtmUnderlyingConfirmShadowEnabled,
   recordOtmUnderlyingConfirm,
 } from './otm-underlying-confirm.js';
+// TRA-4720 (parent TRA-4413 item 5) — relative strength vs SPY / QQQ / sector
+// ETF, SHADOW-first. Flag-gated (ENABLE_OTM_RELATIVE_STRENGTH_SHADOW, default
+// OFF): measured at the nominee seam, stamped on the card, and supplied to the
+// two swing scanners that already consume `relativeStrength`. Gates nothing.
+import {
+  computeRelativeStrength,
+  isOtmRelativeStrengthShadowEnabled,
+  recordOtmRelativeStrength,
+  recordScannerRelativeStrength,
+  scannerRelativeStrength,
+  withRelativeStrengthBenchmarks,
+  type RsSeriesRead,
+} from './otm-relative-strength.js';
 // TRA-4642 (parent TRA-4413 item 1) — CONSULT the existing news-catalyst
 // EARNINGS_IV_CRUSH_RISK demoter on the OTM chain population, BEFORE the
 // selector ranks. Flag-gated (ENABLE_OTM_IV_CRUSH_DEMOTER_SHADOW, default
@@ -664,6 +677,17 @@ import { dispatchAlert } from './observability/alerts.js';
 
 const balanceLog = logger.child({ module: 'signal-engine' });
 const log = logger.child({ module: 'signal-engine' });
+
+/**
+ * TRA-4720 — a side-effect-free daily-series read for relative strength (the
+ * name on the card sink / swing pass, and every benchmark leg). `peek`, never
+ * `read`: the OTM seam's `reads*` counters are the TRA-4424 coverage
+ * denominator and must not absorb benchmark or card reads.
+ */
+function peekRsSeries(symbol: string, nowMs: number = Date.now()): RsSeriesRead {
+  const d = peekOtmDailySeries(symbol, nowMs);
+  return { bars: d.bars, readable: d.state === 'fresh' };
+}
 // TRA-2689 — min spacing between denominator-flip candidate INFO lines. The ring
 // holds up to 2,000 rows a session and the flushed tape is the artifact; the log
 // line exists only so a live operator can see the recorder is alive and whether
@@ -7046,7 +7070,10 @@ export class SignalEngine {
         try {
           this.otmDailySeriesSweep = await withPhase(
             'signal.doTick.otm-daily-series',
-            () => this.refreshOtmDailySeries(activeSymbols),
+            // TRA-4720 — flag ON appends the RS benchmarks (SPY/QQQ/sector
+            // ETFs) so their daily series are cached; flag OFF passes the SAME
+            // array, so the refresh universe is unchanged.
+            () => this.refreshOtmDailySeries(withRelativeStrengthBenchmarks(activeSymbols)),
           );
         } catch (err: unknown) {
           // The cursor already advanced past the failing batch inside the sweep;
@@ -7612,6 +7639,10 @@ export class SignalEngine {
           : {}),
         ...(quote ? { underlyingQuote: quote } : {}),
         reasonsNotToEnter: this.reasonsNotToEnterInputs(signal.symbol),
+        // TRA-4720 — observe-only RS reading; flag OFF ⇒ key absent, card unchanged.
+        ...(isOtmRelativeStrengthShadowEnabled()
+          ? { relativeStrength: computeRelativeStrength(signal.symbol, peekRsSeries) }
+          : {}),
       });
       this.recentCards.unshift(card);
       if (this.recentCards.length > MAX_SIGNALS) this.recentCards.length = MAX_SIGNALS;
@@ -8770,6 +8801,34 @@ export class SignalEngine {
           volumeConfirmed: confirm.volume.confirmed,
           bars: confirm.bars,
           dailyReadState: daily.state,
+        });
+      }
+    }
+    // TRA-4720 (parent TRA-4413 item 5) — relative strength on the SAME nominee
+    // population, same placement rule as TRA-4639: records, never refuses.
+    // The name's series is the `daily` read above (already counted once); the
+    // benchmarks are PEEKED so they do not inflate the seam's read counters.
+    if (isOtmRelativeStrengthShadowEnabled()) {
+      const rs = computeRelativeStrength(sym, (s) => (
+        s === sym.toUpperCase()
+          ? { bars: daily.bars, readable: daily.state === 'fresh' }
+          : peekRsSeries(s)
+      ));
+      const rsBook = this.mode === 'live' ? 'live' : 'demo';
+      recordOtmRelativeStrength(rsBook, rs);
+      if (rsBook === 'live') {
+        log.info('OTM relative-strength shadow reading (TRA-4720, observe-only)', {
+          sym,
+          side: nomineeSide,
+          percentile: rs.percentile,
+          percentileCode: rs.percentileCode,
+          spy: rs.legs.spy.spreads,
+          spyCode: rs.legs.spy.code,
+          qqq: rs.legs.qqq.spreads,
+          qqqCode: rs.legs.qqq.code,
+          sectorEtf: rs.legs.sector.benchmark,
+          sector: rs.legs.sector.spreads,
+          sectorCode: rs.legs.sector.code,
         });
       }
     }
@@ -16480,6 +16539,18 @@ export class SignalEngine {
       ivRank: (sym, iv) => ivRankSync(sym, iv, asOf),
       ivPercentile: (sym, iv) => ivPercentileSync(sym, iv, asOf),
       recentEarnings: (sym) => recentEarningsDateSync(sym, asOf),
+      // TRA-4720 — supplied ONLY under the flag. Absent ⇒ the scanners get no
+      // `relativeStrength` key (byte-identical to pre-TRA-4720); present, an
+      // unmeasured name still yields `undefined`, never a placeholder 50.
+      ...(isOtmRelativeStrengthShadowEnabled()
+        ? {
+            relativeStrength: (sym: string) => {
+              const rs = computeRelativeStrength(sym, (s) => peekRsSeries(s, asOf));
+              recordScannerRelativeStrength(rs);
+              return scannerRelativeStrength(rs);
+            },
+          }
+        : {}),
       asOf,
       onSymbolError: (sym, err) => log.warn('swing signal scan eval threw', {
         symbol: sym,

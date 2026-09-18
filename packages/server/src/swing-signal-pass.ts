@@ -42,6 +42,14 @@ export interface SwingPassDeps {
   fusion?: FusionEngineConfig;
   /** Per-symbol failure hook (logging); a throw never aborts the pass. */
   onSymbolError?(symbol: string, err: unknown): void;
+  /**
+   * TRA-4720 — the measured relative-strength percentile for a symbol, or
+   * `undefined` when unmeasured (never a placeholder 50). The engine supplies
+   * this dep ONLY under `ENABLE_OTM_RELATIVE_STRENGTH_SHADOW`; absent, the
+   * scanners receive no `relativeStrength` key at all — byte-identical to
+   * pre-TRA-4720.
+   */
+  relativeStrength?(symbol: string): number | undefined;
 }
 
 export interface SwingPassResult {
@@ -102,6 +110,7 @@ export async function runSwingSignalPass(
       const priorVol = series.slice(-21, -1);
       const avgVolume = priorVol.reduce((s, c) => s + c.volume, 0) / priorVol.length;
       const atrValue = atr(series, 14);
+      const relativeStrength = deps.relativeStrength?.(sym);
 
       const { emitted, ranked } = scanAndRankSwingSignals({
         symbol: sym,
@@ -114,6 +123,7 @@ export async function runSwingSignalPass(
         ...(ivRank !== null ? { ivRank } : {}),
         ...(atrValue !== null ? { atr: atrValue } : {}),
         ...(earnings.state === 'recent' ? { earningsDate: earnings.date } : {}),
+        ...(relativeStrength !== undefined ? { relativeStrength } : {}),
       }, deps.fusion);
       summary.symbolsScored += 1;
       for (const s of emitted) summary.emittedByType[s.type] += 1;
