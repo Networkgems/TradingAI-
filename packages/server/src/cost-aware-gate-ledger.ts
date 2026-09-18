@@ -130,6 +130,83 @@ interface CostGateDecisionRecord {
    * that differs names it as a cause and bounds the blast radius to a count.
    */
   classifierHash?: string;
+  /**
+   * TRA-4439 D1 — `cost_bar` ADMITS only: set when the admit was GRANTED BY A BYPASS
+   * (today only the TRA-4378 exploration allowance) rather than earned by clearing the
+   * bar. Absent ⇒ an ordinary bar verdict — and on every line written before TRA-4439,
+   * where a bypass admit is therefore indistinguishable from a merit one (see
+   * {@link CostAwareGateStructureSummary.admittedByBypass}).
+   */
+  bypass?: CostBarBypass;
+  /**
+   * TRA-4439 D2 — `cost_bar` records only: the estimator had no usable output
+   * (`tapeEdgeR` is NaN whenever the cell is `insufficient_evidence`), so `grossR`
+   * on this line is a 0 FILL, not a score. Absent on pre-TRA-4439 lines, whose fills
+   * cannot be told from genuine zeros.
+   */
+  grossRUnmeasurable?: true;
+}
+
+/** TRA-4439 D1 — the named bypasses that can write a cost-bar ADMIT without the bar clearing it. */
+export type CostBarBypass = 'exploration_allowance';
+
+/**
+ * TRA-4439 D5 — the COST-BAR counters for ONE account class within a structure.
+ * Same partition rule as the spread-ceiling split below it (TRA-2355): the pooled
+ * cost-bar fields mix ~64 QA fixture books with the desk — on the RV row 93% fixture
+ * over 09-11..09-18 — so a pooled mean is not a desk measurement.
+ */
+interface CostBarClassTally {
+  admitted: number;
+  admittedByBypass: number;
+  rejected: number;
+  grossRUnmeasurable: number;
+  /** Rejects that carried a real score (fills excluded), their sum and the largest. */
+  rejectedMeasured: number;
+  rejectedMeasuredGrossRSum: number;
+  maxRejectedGrossR: number | null;
+}
+
+function newCostBarClassTally(): CostBarClassTally {
+  return {
+    admitted: 0,
+    admittedByBypass: 0,
+    rejected: 0,
+    grossRUnmeasurable: 0,
+    rejectedMeasured: 0,
+    rejectedMeasuredGrossRSum: 0,
+    maxRejectedGrossR: null,
+  };
+}
+
+/** Fold one cost-bar record into a (pooled or per-class) cost-bar tally. */
+function applyCostBar(c: CostBarClassTally, rec: CostGateDecisionRecord): void {
+  const fill = rec.grossRUnmeasurable === true;
+  if (fill) c.grossRUnmeasurable += 1;
+  if (rec.admit) {
+    c.admitted += 1;
+    if (rec.bypass) c.admittedByBypass += 1;
+    return;
+  }
+  c.rejected += 1;
+  if (fill) return;
+  c.rejectedMeasured += 1;
+  c.rejectedMeasuredGrossRSum += rec.grossR;
+  c.maxRejectedGrossR = c.maxRejectedGrossR === null ? rec.grossR : Math.max(c.maxRejectedGrossR, rec.grossR);
+}
+
+/** Sum one cost-bar tally into another (N days fold like one; max is a null-safe MAX). */
+function mergeCostBar(into: CostBarClassTally, t: CostBarClassTally): void {
+  into.admitted += t.admitted;
+  into.admittedByBypass += t.admittedByBypass;
+  into.rejected += t.rejected;
+  into.grossRUnmeasurable += t.grossRUnmeasurable;
+  into.rejectedMeasured += t.rejectedMeasured;
+  into.rejectedMeasuredGrossRSum += t.rejectedMeasuredGrossRSum;
+  if (t.maxRejectedGrossR !== null) {
+    into.maxRejectedGrossR =
+      into.maxRejectedGrossR === null ? t.maxRejectedGrossR : Math.max(into.maxRejectedGrossR, t.maxRejectedGrossR);
+  }
 }
 
 /**
@@ -161,6 +238,16 @@ interface StructureTally {
   rejected: number;
   admittedGrossRSum: number;
   rejectedGrossRSum: number;
+  /**
+   * TRA-4439 — the bypass / fill / measured-reject counters for the POOLED cost bar,
+   * in the same shape as a class slice. Its `admitted`/`rejected` duplicate the two
+   * fields above by construction (both written in {@link apply}'s cost-bar branch).
+   */
+  costBar: CostBarClassTally;
+  /** TRA-4439 D1 — gross-R sum of the MERIT admits only (bypass admits excluded). */
+  admittedOnMeritGrossRSum: number;
+  /** TRA-4439 D5 — the cost-bar counters partitioned by owning account class. */
+  costBarByAccountClass: Map<SpreadCeilingAccountClass, CostBarClassTally>;
   /**
    * Most recent effective bar seen for this structure (the config is env-tunable).
    * `null` until a COST-BAR decision lands: a ceiling record carries `barR: 0` and has no
@@ -231,6 +318,9 @@ function newTally(): StructureTally {
     rejected: 0,
     admittedGrossRSum: 0,
     rejectedGrossRSum: 0,
+    costBar: newCostBarClassTally(),
+    admittedOnMeritGrossRSum: 0,
+    costBarByAccountClass: new Map(),
     lastBarR: null,
     deltaCeilingRejected: 0,
     deltaCeilingAbsDeltaSum: 0,
@@ -375,13 +465,26 @@ function apply(rec: CostGateDecisionRecord): void {
     // touch the cost bar's admitted/rejected (that gate did not rule on it here).
     tally.deltaCeilingObserved += 1;
     tally.deltaCeilingObservedAbsDeltaSum += Number.isFinite(rec.absDelta) ? (rec.absDelta as number) : 0;
-  } else if (rec.admit) {
-    tally.admitted += 1;
-    tally.admittedGrossRSum += rec.grossR;
-    tally.lastBarR = rec.barR;
   } else {
-    tally.rejected += 1;
-    tally.rejectedGrossRSum += rec.grossR;
+    // A cost-bar verdict. TRA-4439 — the pooled fields and the class partition are
+    // written in the SAME branch off the SAME record (the TRA-2355 rule), so the
+    // partition cannot fall out of step with the total it partitions.
+    const klass = recAccountClass(rec);
+    let c = tally.costBarByAccountClass.get(klass);
+    if (!c) {
+      c = newCostBarClassTally();
+      tally.costBarByAccountClass.set(klass, c);
+    }
+    applyCostBar(tally.costBar, rec);
+    applyCostBar(c, rec);
+    if (rec.admit) {
+      tally.admitted += 1;
+      tally.admittedGrossRSum += rec.grossR;
+      if (!rec.bypass) tally.admittedOnMeritGrossRSum += rec.grossR;
+    } else {
+      tally.rejected += 1;
+      tally.rejectedGrossRSum += rec.grossR;
+    }
     tally.lastBarR = rec.barR;
   }
   decisionsTotal += 1;
@@ -395,6 +498,13 @@ function apply(rec: CostGateDecisionRecord): void {
  * (unit tests / CLI without boot) the in-memory counts still update; only the file
  * write is skipped. A non-finite `grossR` (unusable estimator inputs) is recorded as
  * a reject with grossR 0 so the sums stay finite — the gate rejects it anyway.
+ *
+ * TRA-4439 — that 0 FILL is now MARKED (`grossRUnmeasurable`), counted, and kept out
+ * of the measured mean/max: `tapeEdgeR` is NaN on every `insufficient_evidence` cell,
+ * so an uncounted fill silently blended "no score" into the rejected-gross-R mean.
+ * `opts` carries the owning book's CLASS (D5 — frozen at decision time like the
+ * spread records; absent ⇒ `unattributed`, never `desk`) and the BYPASS that
+ * granted an admit the bar did not (D1).
  */
 export function recordCostAwareGateDecision(
   structure: string,
@@ -403,6 +513,7 @@ export function recordCostAwareGateDecision(
   barR: number,
   etDay: string,
   now: number = Date.now(),
+  opts: { accountClass?: SpreadCeilingAccountClass; bypass?: CostBarBypass } = {},
 ): void {
   const rec: CostGateDecisionRecord = {
     ts: now,
@@ -412,6 +523,9 @@ export function recordCostAwareGateDecision(
     grossR: Number.isFinite(grossR) ? grossR : 0,
     barR: Number.isFinite(barR) ? barR : 0,
     gate: 'cost_bar',
+    ...(Number.isFinite(grossR) ? {} : { grossRUnmeasurable: true as const }),
+    ...(opts.accountClass ? { accountClass: opts.accountClass } : {}),
+    ...(admit && opts.bypass ? { bypass: opts.bypass } : {}),
   };
   applyAndAppend(rec);
 }
@@ -617,6 +731,7 @@ export function hydrateCostAwareGateFromDisk(dir: string, now: number = Date.now
       : 'cost_bar';
     const isSpread = gate === 'spread_ceiling' || gate === 'spread_ceiling_admitted';
     const isDelta = gate === 'delta_ceiling' || gate === 'delta_ceiling_observed';
+    const isCostBar = gate === 'cost_bar';
     const clean: CostGateDecisionRecord = {
       ts: rec.ts,
       etDay: rec.etDay,
@@ -640,6 +755,15 @@ export function hydrateCostAwareGateFromDisk(dir: string, now: number = Date.now
       // into `unattributed` on the first reboot, and the desk partition would read `0`
       // for a week of sessions the desk actually traded.
       ...(isSpread ? { accountClass: recAccountClass(rec) } : {}),
+      // TRA-4439 — the cost-bar class, bypass tag and fill marker survive the rewrite
+      // for the TRA-1703 reason: a field dropped here is ERASED FROM DISK. A class is
+      // kept only when present (absent hydrates as `unattributed` and is never
+      // back-filled); a pre-TRA-4439 line never gains a bypass tag.
+      ...(isCostBar && rec.accountClass !== undefined ? { accountClass: recAccountClass(rec) } : {}),
+      ...(isCostBar && rec.admit && rec.bypass === 'exploration_allowance' ? { bypass: rec.bypass } : {}),
+      ...(isCostBar && (rec.grossRUnmeasurable === true || !Number.isFinite(rec.grossR))
+        ? { grossRUnmeasurable: true as const }
+        : {}),
       // TRA-2948 — the classifier stamp must ALSO survive the rewrite, for the same
       // reason: compaction erased fields stay erased. Dropping it would re-mark every
       // retained decision UNSTAMPED on the first reboot, and the provenance read would
@@ -695,8 +819,47 @@ export interface CostAwareGateStructureSummary {
   admitRate: number | null;
   /** Mean modeled gross R of the candidates that CLEARED the bar (null when none). */
   avgAdmittedGrossR: number | null;
-  /** Mean modeled gross R of the candidates the bar REFUSED (null when none). */
+  /**
+   * Mean modeled gross R of the candidates the bar REFUSED (null when none).
+   * ⚠️ INCLUDES the `grossRUnmeasurable` 0 FILLS (kept byte-compatible, TRA-2079) —
+   * grade `avgRejectedGrossRMeasured` instead.
+   */
   avgRejectedGrossR: number | null;
+  /**
+   * TRA-4439 D1 — of `admitted`, how many a named BYPASS granted (the TRA-4378
+   * exploration allowance) rather than the bar. ⚠️ A LOWER bound on a window reaching
+   * before TRA-4439: older bypass admits carry no tag and count as merit — which is why
+   * `avgAdmittedOnMeritGrossR` ships beside it as the cross-check.
+   */
+  admittedByBypass: number;
+  /** TRA-4439 D1 — `admitted - admittedByBypass`: what the bar itself cleared. */
+  admittedOnMerit: number;
+  /** TRA-4439 D1 — mean gross R of the merit admits (null when none). A real bar admit sits ≥ `barR`. */
+  avgAdmittedOnMeritGrossR: number | null;
+  /**
+   * TRA-4439 D2 — cost-bar decisions whose `grossR` is a 0 FILL for an unusable
+   * estimator output (every `insufficient_evidence` cell). Emitted at 0. Pre-TRA-4439
+   * lines are marked on hydrate only if their raw `grossR` was non-finite, so on a
+   * window reaching before the fix this is a LOWER bound.
+   */
+  grossRUnmeasurable: number;
+  /** TRA-4439 D2 — mean gross R of the rejects that HAD a score (fills excluded; null when none). */
+  avgRejectedGrossRMeasured: number | null;
+  /** TRA-4439 D2 — the LARGEST measured rejected gross R (null when none): the right-tail field. */
+  maxRejectedGrossR: number | null;
+  /**
+   * TRA-4439 D3 — the ET days on which this structure's COST BAR ruled on ≥ 1
+   * candidate. `retained.etDays` is the RETENTION window, not the sample span: a
+   * structure that decided on one session inside a six-day window has ONE day here.
+   */
+  costBarDecisionEtDays: string[];
+  /**
+   * TRA-4439 D5 — the cost-bar counters split by owning book. ALL THREE classes are
+   * emitted even at zero (an absent cell reads like a passing one). `unattributed` is
+   * every line written before TRA-4439; it is NOT desk. Read `desk` before believing
+   * any pooled cost-bar field.
+   */
+  costBarByAccountClass: Record<SpreadCeilingAccountClass, CostAwareGateCostBarClassSummary>;
   /**
    * Effective bar last applied to this structure — **`null` until a cost-bar decision lands**.
    *
@@ -772,6 +935,19 @@ export interface CostAwareGateStructureSummary {
    *   `desk.maxAdmittedSpreadPct > ceiling` ⇒ falsification, on the desk book.
    */
   spreadCeilingByAccountClass: Record<SpreadCeilingAccountClass, CostAwareGateAccountClassSummary>;
+}
+
+/** TRA-4439 D5 — one account class's slice of a structure's COST-BAR counters. */
+export interface CostAwareGateCostBarClassSummary {
+  accountClass: SpreadCeilingAccountClass;
+  admitted: number;
+  admittedByBypass: number;
+  rejected: number;
+  /** 0 fills among this class's decisions — excluded from the mean and max below. */
+  grossRUnmeasurable: number;
+  /** Mean gross R of this class's MEASURED rejects (null when none). */
+  avgRejectedGrossR: number | null;
+  maxRejectedGrossR: number | null;
 }
 
 /**
@@ -930,6 +1106,12 @@ export interface CostAwareGateSummary {
    */
   spreadCeilingAccountClassNote: string;
   /**
+   * TRA-4439 D4 — why this ledger's cost-bar `rejected` is SMALLER than the
+   * `/api/health/rv-scan` census's `rejectionsByGate.cost_aware_bar` for the same
+   * path and window, stated in the payload so the gap is not re-filed as a lost write.
+   */
+  costBarCensusReconciliationNote: string;
+  /**
    * TRA-2948 — WHICH CLASSIFIER each retained spread decision froze its class under,
    * versus the one in effect now. THE separator for the standing trap this ledger and
    * `/api/health/option-spread-cost` share: they are published as independent
@@ -1046,6 +1228,16 @@ function mergeTally(into: StructureTally, t: StructureTally): void {
   into.rejected += t.rejected;
   into.admittedGrossRSum += t.admittedGrossRSum;
   into.rejectedGrossRSum += t.rejectedGrossRSum;
+  mergeCostBar(into.costBar, t.costBar);
+  into.admittedOnMeritGrossRSum += t.admittedOnMeritGrossRSum;
+  for (const [klass, ct] of t.costBarByAccountClass.entries()) {
+    let acc = into.costBarByAccountClass.get(klass);
+    if (!acc) {
+      acc = newCostBarClassTally();
+      into.costBarByAccountClass.set(klass, acc);
+    }
+    mergeCostBar(acc, ct);
+  }
   into.deltaCeilingRejected += t.deltaCeilingRejected;
   into.deltaCeilingAbsDeltaSum += t.deltaCeilingAbsDeltaSum;
   into.deltaCeilingObserved += t.deltaCeilingObserved;
@@ -1118,8 +1310,35 @@ function foldAccountClasses(
   return out;
 }
 
-/** Fold a structure->tally map into the per-structure health rows, busiest first. */
-function foldStructures(acc: Map<string, StructureTally>): {
+/** TRA-4439 D5 — the full three-class cost-bar grid, zeros included (never sparse). */
+function foldCostBarAccountClasses(
+  t: StructureTally,
+): Record<SpreadCeilingAccountClass, CostAwareGateCostBarClassSummary> {
+  const out = {} as Record<SpreadCeilingAccountClass, CostAwareGateCostBarClassSummary>;
+  for (const accountClass of SPREAD_CEILING_ACCOUNT_CLASSES) {
+    const c = t.costBarByAccountClass.get(accountClass) ?? newCostBarClassTally();
+    out[accountClass] = {
+      accountClass,
+      admitted: c.admitted,
+      admittedByBypass: c.admittedByBypass,
+      rejected: c.rejected,
+      grossRUnmeasurable: c.grossRUnmeasurable,
+      avgRejectedGrossR: c.rejectedMeasured > 0 ? round(c.rejectedMeasuredGrossRSum / c.rejectedMeasured) : null,
+      maxRejectedGrossR: c.maxRejectedGrossR === null ? null : round(c.maxRejectedGrossR),
+    };
+  }
+  return out;
+}
+
+/**
+ * Fold a structure->tally map into the per-structure health rows, busiest first.
+ * `decisionDays` (TRA-4439 D3) names, per structure, the ET days its cost bar ruled
+ * on anything; the one-day view passes its own day for every structure that decided.
+ */
+function foldStructures(
+  acc: Map<string, StructureTally>,
+  decisionDays: (structure: string, t: StructureTally) => string[],
+): {
   byStructure: CostAwareGateStructureSummary[];
   admittedTotal: number;
   rejectedTotal: number;
@@ -1151,6 +1370,20 @@ function foldStructures(acc: Map<string, StructureTally>): {
       admitRate: decisions > 0 ? round(t.admitted / decisions) : null,
       avgAdmittedGrossR: t.admitted > 0 ? round(t.admittedGrossRSum / t.admitted) : null,
       avgRejectedGrossR: t.rejected > 0 ? round(t.rejectedGrossRSum / t.rejected) : null,
+      admittedByBypass: t.costBar.admittedByBypass,
+      admittedOnMerit: t.admitted - t.costBar.admittedByBypass,
+      avgAdmittedOnMeritGrossR:
+        t.admitted - t.costBar.admittedByBypass > 0
+          ? round(t.admittedOnMeritGrossRSum / (t.admitted - t.costBar.admittedByBypass))
+          : null,
+      grossRUnmeasurable: t.costBar.grossRUnmeasurable,
+      avgRejectedGrossRMeasured:
+        t.costBar.rejectedMeasured > 0
+          ? round(t.costBar.rejectedMeasuredGrossRSum / t.costBar.rejectedMeasured)
+          : null,
+      maxRejectedGrossR: t.costBar.maxRejectedGrossR === null ? null : round(t.costBar.maxRejectedGrossR),
+      costBarDecisionEtDays: decisionDays(structure, t),
+      costBarByAccountClass: foldCostBarAccountClasses(t),
       barR: t.lastBarR === null ? null : round(t.lastBarR),
       deltaCeilingRejected: t.deltaCeilingRejected,
       avgDeltaCeilingAbsDelta:
@@ -1195,8 +1428,10 @@ function foldStructures(acc: Map<string, StructureTally>): {
 /** TRA-1703 — fold EVERY retained ET day. See {@link CostAwareGateRetainedSummary}. */
 function summarizeRetained(): CostAwareGateRetainedSummary {
   const acc = new Map<string, StructureTally>();
-  for (const day of byDay.values()) {
+  const days = new Map<string, string[]>();
+  for (const [etDay, day] of [...byDay.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
     for (const [structure, t] of day.entries()) {
+      if (t.admitted + t.rejected > 0) days.set(structure, [...(days.get(structure) ?? []), etDay]);
       let into = acc.get(structure);
       if (!into) {
         into = newTally();
@@ -1208,7 +1443,7 @@ function summarizeRetained(): CostAwareGateRetainedSummary {
   return {
     etDays: [...byDay.keys()].sort(),
     retentionDays: RETAIN_MS / (24 * 60 * 60 * 1000),
-    ...foldStructures(acc),
+    ...foldStructures(acc, (structure) => days.get(structure) ?? []),
   };
 }
 
@@ -1229,7 +1464,7 @@ export function summarizeCostAwareGate(
   const day = byDay.get(etDay);
   return {
     decisionsRecorded: decisionsTotal,
-    ...foldStructures(day ?? new Map()),
+    ...foldStructures(day ?? new Map(), (_s, t) => (t.admitted + t.rejected > 0 ? [etDay] : [])),
     retained: summarizeRetained(),
     classifierProvenance: summarizeClassifierProvenance(env),
     spreadCeilingStructureKeys: {
@@ -1240,6 +1475,16 @@ export function summarizeCostAwareGate(
       demo_directional: `${DIRECTIONAL_STRUCTURE_LABEL} — NOT the \`directional\` row, which carries only the cost bar and the delta ceiling and will always show spreadCeilingEvaluated 0 (TRA-2295).`,
       otm: 'single_leg_otm — gated in the OTM scanner chain filter, not by this counter; spreadCeilingEvaluated 0 there is expected.',
     },
+    costBarCensusReconciliationNote:
+      'TRA-4439 D4. This ledger records DEMO cost-bar verdicts only (the demo branch of costAwareGateReject). '
+      + 'LIVE-mode verdicts of the same bar go to /api/health/live-enforce-gates instead, while the '
+      + '/api/health/rv-scan census counts `cost_aware_bar` rejects in BOTH modes (its cells carry `mode`). '
+      + 'Reconcile against census cells with mode === "demo" only, over the same ET days. Measured on bqb1 '
+      + '0dc2baea, 2026-09-18, rv_scan over 09-11..09-18: census 3,502 = demo 3,302 + live 200; this ledger\'s '
+      + 'single_leg_rv rejected = 3,304. The 198 gap is the live cells; the +2 residual (ledger > census) is the '
+      + 'census\'s documented 5-minute flush lower bound. Two smaller skews: this ledger drops records older than '
+      + '7x24h by TIMESTAMP at boot, so its OLDEST retained ET day can be partial while the 30-day census holds it '
+      + 'whole; and the census under-counts any day on which a boot died before flushing.',
     spreadCeilingAccountClassNote:
       'TRA-2355. The pooled `spreadCeiling*` fields on each byStructure[] row are NOT A DESK VERDICT: this ledger is module-global while SignalEngine is constructed per username, so ~51 QA fixture books (qa*/ctoverify*/monitor_qa) tally into the same counters as the desk (admin/Richard). GRADE `byStructure[].spreadCeilingByAccountClass.desk` — a non-zero pooled `spreadCeilingEvaluated` can be 100% fixture, and the fixture fleet is a CURRENTLY-FIRING writer of the directional cohort (64 of 151 pre-fix rows), not an empirical zero that expires. `desk.spreadCeilingEvaluated === 0` is NO READING AT ALL, not a pass — the desk fires zero directional entries on roughly 2 sessions in 5. `unattributed` is records written before TRA-2355 (and any hydrated line carrying no class); it is NOT desk, and folding it into desk would re-pool exactly the retained history a multi-day grade leans on hardest. All three classes are emitted even at 0, because an absent cell reads like a passing one. Classification is frozen at DECISION time via classifySpreadCeilingAccount(), the same predicate /api/health/option-spread-cost applies to a row\'s stored `account`, so the two routes cannot drift on the partition RULE — but (TRA-2948) they CAN drift on the rule\'s INPUTS: that route re-applies the predicate at READ time, so a pattern-set edit restates its history while this side keeps what the gate saw. `classifierProvenance` is the separator — read its divergenceDiscriminator before interpreting a mismatch. Cross-check: this desk cell should track ceilingCompliance.byAccountClass.desk[single_leg_directional].gated on that route.',
     durability: {

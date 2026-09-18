@@ -140,9 +140,50 @@ export type RvScanAdmissibilityStatus =
 
 /** The subset of the cost-aware ledger the admissibility fold needs. */
 export interface RvScanAdmissibilityLedgerRead {
-  /** Every ET day retained by the ledger, ascending. The window the fold covers. */
+  /** Every ET day retained by the ledger, ascending. The RETENTION window — not a sample span. */
   etDays: readonly string[];
-  byStructure: ReadonlyArray<{ structure: string; admitted: number; rejected: number }>;
+  byStructure: ReadonlyArray<RvScanAdmissibilityLedgerRow>;
+}
+
+/**
+ * One cost-aware ledger row. The TRA-4439 fields are OPTIONAL so an older ledger
+ * shape still type-checks — and every one of them fails CLOSED when absent: a row
+ * that cannot say how many of its admits were a bypass cannot serve as a control.
+ */
+export interface RvScanAdmissibilityLedgerRow {
+  structure: string;
+  admitted: number;
+  rejected: number;
+  /** TRA-4439 D1 — admits a named bypass granted (TRA-4378 allowance), not the bar. */
+  admittedByBypass?: number;
+  /** TRA-4439 D1 — mean gross R of the NON-bypass admits. A bar clearance sits ≥ `barR`. */
+  avgAdmittedOnMeritGrossR?: number | null;
+  barR?: number | null;
+  /** TRA-4439 D3 — ET days on which this structure's cost bar ruled on ≥ 1 candidate. */
+  costBarDecisionEtDays?: readonly string[];
+}
+
+/**
+ * TRA-4439 D1 — how many admits on this row the BAR itself cleared, or `null` when
+ * that cannot be established. The positive control used to be `admitted > 0`, and
+ * the TRA-4378 exploration allowance writes its force-admits into that same counter:
+ * on 2026-09-18 `directional` "cleared 12 on the SAME read" with a mean admitted
+ * gross R of −0.6157 against a 0.385 bar — every one a bypass. Two discriminators,
+ * BOTH required, because each covers the other's blind spot:
+ *   • `admitted - admittedByBypass` — the tag. Blind to bypass admits recorded before
+ *     the tag existed (they count as merit), so on its own it is a lower bound.
+ *   • `avgAdmittedOnMeritGrossR >= barR` — arithmetic. Every bar clearance has
+ *     `grossR >= barR`, so a merit mean below the bar proves an untagged bypass is in
+ *     the population. (It can also fail a genuine control if the bar moved inside the
+ *     window — the safe direction: that reads `unmeasured`, never a false accusation.)
+ */
+export function admittedOnMerit(row: RvScanAdmissibilityLedgerRow): number | null {
+  if (typeof row.admittedByBypass !== 'number') return null;
+  const merit = row.admitted - row.admittedByBypass;
+  if (merit <= 0) return merit === 0 ? 0 : null;
+  const avg = row.avgAdmittedOnMeritGrossR;
+  if (typeof avg !== 'number' || typeof row.barR !== 'number') return null;
+  return avg >= row.barR ? merit : null;
 }
 
 export interface RvScanAdmissibility {
@@ -164,6 +205,14 @@ export interface RvScanAdmissibility {
    * to `unmeasured` rather than being reported as a stronger claim than we hold.
    */
   positiveControl: { structure: string; admitted: number; rejected: number } | null;
+  /**
+   * TRA-4439 D3 — the ET days on which THIS structure's cost bar actually ruled,
+   * `null` when unmeasured or when the ledger cannot say. `windowEtDays` is the
+   * retention window; this is the sample span, and it is what `reason` quotes.
+   */
+  decisionEtDays: readonly string[] | null;
+  /** TRA-4439 D1 — of `admitted`, those granted by a bypass (null when the ledger cannot say). */
+  admittedByBypass: number | null;
   /** Why this status, in words, so the payload does not need the source to read. */
   reason: string;
 }
@@ -187,6 +236,8 @@ export function classifyRvScanAdmissibility(
     admitRate: null,
     windowEtDays: null,
     positiveControl: null,
+    decisionEtDays: null,
+    admittedByBypass: null,
   } as const;
 
   if (costBarStructure === null) {
@@ -217,20 +268,39 @@ export function classifyRvScanAdmissibility(
 
   const ruledOn = row.admitted + row.rejected;
   const window = ledger.etDays;
+  // TRA-4439 D3 — the sample span is the days THIS structure decided on, not the
+  // retention window. On 2026-09-09 "across 5 retained ET day(s)" described a
+  // `single_leg_rv` sample that was one session. When the ledger cannot say, the
+  // reason names the window AS a window rather than implying it is the span.
+  const decisionEtDays = Array.isArray(row.costBarDecisionEtDays) ? row.costBarDecisionEtDays : null;
+  const span = decisionEtDays !== null
+    ? `on ${decisionEtDays.length} ET day(s) with decisions (of ${window.length} retained)`
+    : `within a ${window.length}-ET-day retention window (days with decisions not reported)`;
+  const bypass = typeof row.admittedByBypass === 'number' ? row.admittedByBypass : null;
   const measured = {
     costBarStructure,
     admitted: row.admitted,
     rejected: row.rejected,
     admitRate: ruledOn > 0 ? row.admitted / ruledOn : null,
     windowEtDays: window,
+    decisionEtDays,
+    admittedByBypass: bypass,
   };
 
   if (row.admitted > 0) {
+    // Candidates DO reach an open, so `admitting` stands either way — but the words
+    // must not credit the bar with admits a bypass granted (TRA-4439 D1).
+    const merit = admittedOnMerit(row);
+    const how = merit === null
+      ? 'cleared or bypass-admitted (the ledger cannot separate them on this read)'
+      : bypass !== null && bypass > 0
+        ? `admitted (${merit} cleared the bar, ${bypass} via the exploration-allowance bypass)`
+        : 'cleared';
     return {
       ...measured,
       status: 'admitting',
       positiveControl: null,
-      reason: `bar cleared ${row.admitted} of ${ruledOn} candidates across ${window.length} retained ET day(s)`,
+      reason: `bar ${how} ${row.admitted} of ${ruledOn} candidates ${span}`,
     };
   }
   if (ruledOn === 0) {
@@ -238,27 +308,31 @@ export function classifyRvScanAdmissibility(
       ...measured,
       status: 'not_reached',
       positiveControl: null,
-      reason: `cost-aware bar ruled on 0 candidates for \`${costBarStructure}\` across ${window.length} retained ET day(s) — the starve is UPSTREAM of the bar; this says nothing about admissibility`,
+      reason: `cost-aware bar ruled on 0 candidates for \`${costBarStructure}\` within a ${window.length}-ET-day retention window — the starve is UPSTREAM of the bar; this says nothing about admissibility`,
     };
   }
 
-  // admitted === 0 && rejected > 0. Only claim it with a live control on the same read.
+  // admitted === 0 && rejected > 0. Only claim it with a live control on the same
+  // read — and (TRA-4439 D1) a control the BAR admitted, not a bypass. A row whose
+  // merit count cannot be established is not a control.
   const control = ledger.byStructure
-    .filter((s) => s.structure !== costBarStructure && s.admitted > 0)
-    .sort((a, b) => b.admitted - a.admitted)[0] ?? null;
+    .filter((s) => s.structure !== costBarStructure)
+    .map((s) => ({ s, merit: admittedOnMerit(s) }))
+    .filter((c): c is { s: RvScanAdmissibilityLedgerRow; merit: number } => c.merit !== null && c.merit > 0)
+    .sort((a, b) => b.merit - a.merit)[0] ?? null;
   if (!control) {
     return {
       ...measured,
       status: 'unmeasured',
       positiveControl: null,
-      reason: `\`${costBarStructure}\` cleared 0 of ${ruledOn}, but NO sibling structure in this ledger read admitted anything either — a wiped/stalled ledger cannot be excluded, so this is not yet a measurement`,
+      reason: `\`${costBarStructure}\` cleared 0 of ${ruledOn} ${span}, but NO sibling structure in this ledger read shows an admit the BAR cleared (bypass admits and rows that cannot separate the two do not count) — a wiped/stalled ledger or a bar nothing can clear cannot be excluded, so this is not yet a measurement`,
     };
   }
   return {
     ...measured,
     status: 'admitting_nothing',
-    positiveControl: { structure: control.structure, admitted: control.admitted, rejected: control.rejected },
-    reason: `cost-aware bar cleared 0 of ${ruledOn} \`${costBarStructure}\` candidates across ${window.length} retained ET day(s), while \`${control.structure}\` cleared ${control.admitted} on the SAME read — the admissible set is empty by measurement, not by absence of candidates`,
+    positiveControl: { structure: control.s.structure, admitted: control.merit, rejected: control.s.rejected },
+    reason: `cost-aware bar cleared 0 of ${ruledOn} \`${costBarStructure}\` candidates ${span}, while the bar cleared ${control.merit} \`${control.s.structure}\` candidate(s) on MERIT on the SAME read (bypass admits excluded) — the admissible set is empty by measurement, not by absence of candidates`,
   };
 }
 

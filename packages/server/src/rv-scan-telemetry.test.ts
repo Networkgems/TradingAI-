@@ -368,8 +368,16 @@ const LIVE_LEDGER: RvScanAdmissibilityLedgerRead = {
   byStructure: [
     // What the sleeve JOURNALS. Carries the spread ceiling, NEVER the cost bar.
     { structure: 'single_leg_directional', admitted: 0, rejected: 0 },
-    // The positive control: same route, same fold, same window, non-zero.
-    { structure: 'single_leg_otm', admitted: 11_972, rejected: 25_059 },
+    // The positive control: same route, same fold, same window, non-zero — and
+    // (TRA-4439) provably the BAR's admits: none tagged bypass, merit mean ≥ bar.
+    {
+      structure: 'single_leg_otm',
+      admitted: 11_972,
+      rejected: 25_059,
+      admittedByBypass: 0,
+      avgAdmittedOnMeritGrossR: 1.1,
+      barR: 0.485,
+    },
     // What the ENGINE keys the bar off. This is the row that testifies.
     { structure: 'directional', admitted: 0, rejected: 17_727 },
   ],

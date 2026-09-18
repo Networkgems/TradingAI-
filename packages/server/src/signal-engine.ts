@@ -8103,6 +8103,9 @@ export class SignalEngine {
           tapeEdgeR(tape),
           verdict.requiredEdgeR,
           etDateString(new Date()),
+          Date.now(),
+          // TRA-4439 D5 — the owning book's class, frozen at decision time.
+          { accountClass: classifySpreadCeilingAccount(this.alertUsername) },
         );
         return verdict.admit ? null : verdict.reason;
       }
@@ -8134,6 +8137,14 @@ export class SignalEngine {
             tapeEdgeR(tape),
             tape.barR,
             etDateString(new Date()),
+            Date.now(),
+            // TRA-4439 D1 — TAGGED as a bypass. Untagged, this admit wrote into the
+            // same `admitted` counter a bar clearance does, and the rv-scan
+            // admissibility fold cited it as proof "the bar can admit".
+            {
+              accountClass: classifySpreadCeilingAccount(this.alertUsername),
+              bypass: 'exploration_allowance',
+            },
           );
           return null;
         }
@@ -8148,6 +8159,8 @@ export class SignalEngine {
         tapeEdgeR(tape),
         tape.barR,
         etDateString(new Date()),
+        Date.now(),
+        { accountClass: classifySpreadCeilingAccount(this.alertUsername) }, // TRA-4439 D5
       );
       return tape.admit ? null : tape.reason;
     }
