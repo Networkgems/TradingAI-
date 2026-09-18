@@ -899,12 +899,12 @@ export interface CardBatchSummary {
   missingByField: Record<string, number>;
 }
 
-/** Build a card for EVERY signal (total by construction) and fold the tally. */
-export function buildCards(
-  signals: readonly TradeSignal[],
-  ctx: CardBuildContext,
-): { cards: TradeOpportunityCard[]; summary: CardBatchSummary } {
-  const cards = signals.map((sig) => buildTradeOpportunityCard(sig, ctx));
+/**
+ * Fold a card population into the acceptance tally. Exported (TRA-4649 wiring)
+ * so a caller retaining already-built cards — the signal engine's card ring —
+ * reads the SAME fold the batch builder reports, not a re-implementation.
+ */
+export function summarizeCards(cards: readonly TradeOpportunityCard[]): CardBatchSummary {
   const missingByField: Record<string, number> = {};
   for (const card of cards) {
     for (const f of card.incompleteFields) {
@@ -912,8 +912,14 @@ export function buildCards(
     }
   }
   const complete = cards.filter((c) => c.complete).length;
-  return {
-    cards,
-    summary: { total: cards.length, complete, incomplete: cards.length - complete, missingByField },
-  };
+  return { total: cards.length, complete, incomplete: cards.length - complete, missingByField };
+}
+
+/** Build a card for EVERY signal (total by construction) and fold the tally. */
+export function buildCards(
+  signals: readonly TradeSignal[],
+  ctx: CardBuildContext,
+): { cards: TradeOpportunityCard[]; summary: CardBatchSummary } {
+  const cards = signals.map((sig) => buildTradeOpportunityCard(sig, ctx));
+  return { cards, summary: summarizeCards(cards) };
 }

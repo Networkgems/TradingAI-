@@ -10721,3 +10721,145 @@ describe('TRA-4424 — the OTM setup seam reads a DAILY series, off the order pa
     }
   });
 });
+
+// ── TRA-4649 — trade-opportunity-card wiring at the feed sink ────────────────
+//
+// The builder's own behavior (all 8 fields, fail-closed inputs, shipped cost /
+// sizing arithmetic) is covered in trade-opportunity-card.test.ts. These tests
+// cover the WIRING: every TradeSignal published through the engine's one feed
+// sink produces a card readable (with the acceptance fold) off
+// `getRecentCards`, SMA-200 display rows do not, and a broken/unregistered
+// signal surfaces as a loud fold row — never a missing card, never a throw out
+// of the sink.
+describe('TRA-4649 — trade opportunity cards ride the signal feed sink', () => {
+  function pushInto(engine: SignalEngine, signal: unknown): void {
+    (engine as unknown as { pushRecentSignal: (s: unknown) => void }).pushRecentSignal(signal);
+  }
+
+  function freshEquitySignal(overrides: Partial<TradeSignal> = {}): TradeSignal {
+    return {
+      id: 'tra4649-eq-1',
+      symbol: 'MSFT',
+      type: 'momentum',
+      side: 'buy',
+      entryPrice: 100,
+      stopLoss: 95,
+      takeProfit: 115,
+      riskRewardRatio: 3,
+      timestamp: Date.now() - 60_000,
+      mode: 'demo',
+      ...overrides,
+    } as TradeSignal;
+  }
+
+  it('an OTM scan publish also builds a card: linked by signalId, proposal-only, confidence null', async () => {
+    const scanner = new StubScanner();
+    scanner.scanOtm.mockResolvedValue({
+      symbol: 'AAPL',
+      spot: 195,
+      expiration: '2024-07-05',
+      candidates: [makeOtmCandidate()],
+      reason: 'ok',
+    });
+    const engine = new SignalEngine(undefined, undefined, scanner);
+    await (engine as unknown as { runOtmScan: (s: string[]) => Promise<void> }).runOtmScan(['AAPL']);
+
+    const signals = engine.getState().signals;
+    expect(signals).toHaveLength(1);
+    const { cards, summary, buildFailures } = engine.getRecentCards();
+    expect(buildFailures).toBe(0);
+    expect(cards).toHaveLength(1);
+    expect(summary.total).toBe(1);
+    expect(cards[0].signalId).toBe(signals[0].id);
+    expect(cards[0].disposition).toBe('proposal_only');
+    // otm_mispricing is a registered setup, and the candidate carries a
+    // two-sided option quote — both halves survive the trip through the sink.
+    expect(cards[0].fields.setup.status).toBe('verified');
+    expect(cards[0].fields.contract.status).toBe('verified');
+    // No calibration index is wired at the sink (the TRA-4652 ≥30 floor is
+    // unfillable on today's data by design) — null, never an invented number.
+    expect(cards[0].confidence).toBeNull();
+  });
+
+  it('an equity signal cards COMPLETE off engine-owned context (account sizing + seeded L1 quote)', () => {
+    const engine = new SignalEngine();
+    (engine as unknown as { symbolState: Map<string, unknown> }).symbolState.set('MSFT', {
+      symbol: 'MSFT',
+      price: 100,
+      volume: 1_000,
+      change: 0,
+      changePct: 0,
+      lastUpdated: Date.now(),
+      bid: 99.98,
+      ask: 100.02,
+    });
+    pushInto(engine, freshEquitySignal());
+
+    const { cards, summary, buildFailures } = engine.getRecentCards();
+    expect(buildFailures).toBe(0);
+    expect(cards).toHaveLength(1);
+    expect(cards[0].complete).toBe(true);
+    expect(cards[0].incompleteFields).toEqual([]);
+    expect(summary).toEqual({ total: 1, complete: 1, incomplete: 0, missingByField: {} });
+    // The sizing basis is the account's own numbers, not literals: the card's
+    // share count must equal what the account itself would size for this stop.
+    const acct = (engine as unknown as { account: PaperAccount }).account;
+    expect(cards[0].fields.sizing.data?.quantity).toBe(acct.sizeFromStop(100, 95));
+  });
+
+  it('without an L1 book the contract/costs fields fail closed — a missing feed is not a wide book', () => {
+    const engine = new SignalEngine();
+    pushInto(engine, freshEquitySignal({ id: 'tra4649-eq-noquote' }));
+
+    const { cards, summary } = engine.getRecentCards();
+    expect(cards).toHaveLength(1);
+    expect(cards[0].complete).toBe(false);
+    expect(cards[0].fields.contract.status).toBe('incomplete');
+    expect(cards[0].fields.costs.status).toBe('incomplete');
+    expect(summary.missingByField['contract']).toBe(1);
+    expect(summary.missingByField['costs']).toBe(1);
+  });
+
+  it('SMA-200 display rows are published but never carded — the fold denominator is TradeSignals only', () => {
+    const engine = new SignalEngine();
+    pushInto(engine, {
+      id: 'tra4649-sma-1',
+      symbol: 'AAPL',
+      type: 'sma200_pullback',
+      side: 'buy',
+      entryPrice: 100,
+      stopLoss: 95,
+      takeProfit: null,
+      riskRewardRatio: null,
+      timestamp: Date.now(),
+      mode: 'demo',
+    });
+
+    expect(engine.getState().signals).toHaveLength(1);
+    const { cards, summary, buildFailures } = engine.getRecentCards();
+    expect(buildFailures).toBe(0);
+    expect(cards).toHaveLength(0);
+    expect(summary.total).toBe(0);
+  });
+
+  it('an unregistered signal type still cards, loud in the fold — never a missing card, never a sink throw', () => {
+    const engine = new SignalEngine();
+    pushInto(engine, freshEquitySignal({ id: 'tra4649-unreg', type: 'never_heard_of_it' as TradeSignal['type'] }));
+
+    expect(engine.getState().signals).toHaveLength(1); // the publish itself survived
+    const { cards, summary, buildFailures } = engine.getRecentCards();
+    expect(buildFailures).toBe(0); // fail-closed is a field verdict, not a throw
+    expect(cards).toHaveLength(1);
+    expect(cards[0].complete).toBe(false);
+    expect(summary.missingByField['setup']).toBe(1);
+  });
+
+  it('clearSignals clears the card ring with the feed — no stale proposals outlive a cleared feed', () => {
+    const engine = new SignalEngine();
+    pushInto(engine, freshEquitySignal());
+    expect(engine.getRecentCards().summary.total).toBe(1);
+    engine.clearSignals();
+    expect(engine.getRecentCards().summary.total).toBe(0);
+    expect(engine.getState().signals).toHaveLength(0);
+  });
+});

@@ -361,6 +361,15 @@ import {
   auditSignalFired,
   auditStateChange,
 } from './decision-audit-log.js';
+// TRA-4649 — Trade Opportunity Card tee at the same feed sink: every published
+// TradeSignal is folded into an 8-field proposal card (fail-closed per field,
+// see trade-opportunity-card.ts). Proposals only — no order path reads a card.
+import {
+  buildTradeOpportunityCard,
+  summarizeCards,
+  type CardBatchSummary,
+  type TradeOpportunityCard,
+} from './trade-opportunity-card.js';
 import { recordGiveBackState, getBookSessionPeak, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
 import { recordOptionsBreakerState, getOptionsBreakerRestoreState } from './options-breaker-ledger.js'; // TRA-3218
 import { recordMarkObservation, classifyMarkJump, MAX_MARK_JUMP_X } from './option-mark-sanity.js'; // TRA-2927
@@ -3222,6 +3231,16 @@ export class SignalEngine {
   // display feed is the explicit union.
   private recentSignals: (TradeSignal | Sma200Signal)[] = [];
   /**
+   * TRA-4649 — one proposal card per published TradeSignal (newest first),
+   * same cap as the display ring. SMA-200 rows carry no exit model (TRA-3688)
+   * and are not proposals, so they are never carded — the acceptance fold's
+   * denominator is TradeSignals only. `cardBuildFailures` counts builder throws
+   * swallowed at the sink: the fold cannot read a card that was never built, so
+   * the suppression ships its own counter (surfaced by {@link getRecentCards}).
+   */
+  private recentCards: TradeOpportunityCard[] = [];
+  private cardBuildFailures = 0;
+  /**
    * TRA-3688 S-3 — voided SMA-200 signals, newest last, capped. A voided
    * signal is REMOVED from `recentSignals` and RECORDED here so the void rate
    * is measurable — a silent drop is what made the original filing
@@ -4638,6 +4657,7 @@ export class SignalEngine {
     });
     this.allClosedPositions = [];
     this.recentSignals = [];
+    this.recentCards = []; // TRA-4649 — the card ring mirrors the signal ring
     this.dailySignals = [];
     this.positionSignalType.clear();
     // TRA-451 — clear the SMA-200 debounce ledger so signals can re-emit
@@ -4669,6 +4689,7 @@ export class SignalEngine {
    */
   clearSignals(): void {
     this.recentSignals = [];
+    this.recentCards = []; // TRA-4649 — a cleared feed must not leave stale proposals readable
     // TRA-451 — also clear the SMA-200 debounce ledger; otherwise a cleared
     // daily signal would stay debounced for 5 bars and never re-appear.
     this.sma200LastFired.clear();
@@ -7460,6 +7481,10 @@ export class SignalEngine {
     // argument the doc above makes; before the ring so eviction can't un-log.
     recordPaperSignal(signal, this.mode);
     auditSignalFired(signal, this.mode); // TRA-4658 — same exhaustiveness argument
+    // TRA-4649 — card the signal at the same sink, for the same exhaustiveness
+    // reason: every published TradeSignal gets a proposal card, or a counted
+    // build failure. SMA-200 rows are display-only (TRA-3688), never proposals.
+    if (!isSma200SignalType(signal.type)) this.recordOpportunityCard(signal as TradeSignal);
     this.recentSignals.unshift(signal);
     this.emitSignalAlert(signal);
     while (this.recentSignals.length > MAX_SIGNALS) {
@@ -7468,6 +7493,70 @@ export class SignalEngine {
       const [evicted] = this.recentSignals.splice(idx, 1);
       if (isSma200SignalType(evicted.type)) this.recordSma200Void(evicted as Sma200Signal, 'evicted');
     }
+  }
+
+  /**
+   * TRA-4649 — build + retain the proposal card for a published signal.
+   *
+   * The builder itself is pure and FAIL-CLOSED: an input it cannot verify
+   * yields an `incomplete` field with the missing input named, never a throw.
+   * The catch is a last-resort guard because this runs inside the display feed
+   * sink — a card bug must not un-publish a signal — and every swallow is
+   * counted, never silent.
+   *
+   * Sizing context uses the SAME numbers `account.sizeFromStop` sizes with
+   * (managedEquity × riskPerTrade, TRA-2034), so the card's sizing field agrees
+   * with the open path's own arithmetic; the underlying quote is the
+   * symbol-state L1 book when the feed carried one (TRA-1980) — a missing feed
+   * is not a wide book, so absent L1 leaves contract/costs fail-closed instead
+   * of fabricating a spread. No calibration index is wired here yet: every
+   * card's `confidence` stays null until charged desk rows can clear the
+   * TRA-4652 ≥30-instance floor, which today's data cannot fill by design.
+   */
+  private recordOpportunityCard(signal: TradeSignal): void {
+    try {
+      const managedEquity = this.account.managedEquity();
+      const state = this.symbolState.get(signal.symbol);
+      const quote =
+        state && typeof state.bid === 'number' && typeof state.ask === 'number'
+          ? { bid: state.bid, ask: state.ask }
+          : undefined;
+      const card = buildTradeOpportunityCard(signal, {
+        now: Date.now(),
+        ...(managedEquity > 0
+          ? {
+              sizing: {
+                managedEquity,
+                riskPerTrade: this.account.maxRiskPerTrade() / managedEquity,
+              },
+            }
+          : {}),
+        ...(quote ? { underlyingQuote: quote } : {}),
+      });
+      this.recentCards.unshift(card);
+      if (this.recentCards.length > MAX_SIGNALS) this.recentCards.length = MAX_SIGNALS;
+    } catch {
+      this.cardBuildFailures += 1;
+    }
+  }
+
+  /**
+   * TRA-4649 — read surface for the card ring: cards newest-first plus the
+   * acceptance fold over exactly this population. `summary.missingByField` is
+   * the instrument the issue's acceptance is graded on — a nonzero row names
+   * the input the emitted population is missing. `buildFailures` is the
+   * counter for cards the sink could not build at all.
+   */
+  getRecentCards(): {
+    cards: TradeOpportunityCard[];
+    summary: CardBatchSummary;
+    buildFailures: number;
+  } {
+    return {
+      cards: [...this.recentCards],
+      summary: summarizeCards(this.recentCards),
+      buildFailures: this.cardBuildFailures,
+    };
   }
 
   /**

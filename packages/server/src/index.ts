@@ -10386,6 +10386,19 @@ app.get('/api/state', requireAuth, async (_req, res) => {
   res.json(dashboardEngineState(ctx));
 });
 
+// TRA-4649 — Trade Opportunity Card read surface. One proposal card per
+// published TradeSignal, built fail-closed at the engine's feed sink (same ring
+// cap as the display feed). `summary.missingByField` is the acceptance fold —
+// a nonzero row names the input the emitted population is missing — and
+// `buildFailures` counts cards the sink could not build at all, so a quiet
+// card list is distinguishable from a broken builder. Read-only: cards are
+// `disposition: 'proposal_only'`; there is deliberately NO order path here
+// (the TRA-4651 lifecycle is the only intended consumer that can advance one).
+app.get('/api/cards', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
+  res.json({ asOf: new Date().toISOString(), ...ctx.engine.getRecentCards() });
+});
+
 // TRA-1303 — Position Advisor readout: per held DEMO-book symbol, the next DCA
 // add (size + trigger price) and the current sell plan (SL / TP / trailing).
 // Read-only — it re-runs the SHIPPED engine cores (conviction-dca /
