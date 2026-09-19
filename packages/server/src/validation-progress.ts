@@ -1,5 +1,7 @@
 import {
-  liveOptionFillRecords,
+  liveOptionEvidenceCoverage,
+  liveOptionPromotionEvidenceRecords,
+  type LiveOptionEvidenceCoverage,
   type LiveOptionFillRecord,
 } from './live-options-fee-slippage-ledger.js';
 import {
@@ -78,6 +80,14 @@ export interface SleeveProgress {
 export interface ValidationProgressReport {
   /** Ledger rows seen, before any exclusion. */
   fillsSeen: number;
+  /**
+   * TRA-4727 — WHICH tape was graded and how far back it reaches. The sample is
+   * the cumulative archive ∪ window, not the 30-day calibration window; read
+   * `earliestFillTs` before reading a small `observedN` as a quiet sleeve —
+   * fills compacted away before the archive existed are NOT on it.
+   * `null` when the caller passed its own `records` (a fixture).
+   */
+  coverage: LiveOptionEvidenceCoverage | null;
   /** Round-trips the harness could price. */
   roundTrips: number;
   excluded: ValidationProgressExclusions;
@@ -144,12 +154,15 @@ function noteFor(v: ValidationVerdict, n: number): string {
  * Grade the production sleeves against the live ledger.
  *
  * Pure with respect to its input: pass `records` to test against a fixture. The
- * default reads the process-wide ledger.
+ * default reads the process-wide CUMULATIVE tape (TRA-4727: archive ∪ window —
+ * the 30-day window alone manufactured `noMatchingOpen` and shrank on every boot).
  */
 export function computeValidationProgress(
-  records: readonly LiveOptionFillRecord[] = liveOptionFillRecords(),
+  records?: readonly LiveOptionFillRecord[],
   opts: { minDetectableEffectPct?: number; minProfitFactor?: number } = {},
 ): ValidationProgressReport {
+  const coverage = records === undefined ? liveOptionEvidenceCoverage() : null;
+  if (records === undefined) records = liveOptionPromotionEvidenceRecords();
   const graded = new Set<string>(OPTIONS_PRODUCTION_STRATEGIES);
   const excluded: ValidationProgressExclusions = {
     unattributed: 0,
@@ -214,6 +227,7 @@ export function computeValidationProgress(
 
   return {
     fillsSeen: records.length,
+    coverage,
     roundTrips: roundTrips.length,
     excluded,
     sleeves,

@@ -58,6 +58,29 @@ export const LIVE_OPTION_RECONCILE_TERMINATION_LOG_FILENAME =
  */
 const RETAIN_MS = 30 * 24 * 60 * 60 * 1000;
 
+/**
+ * TRA-4727 — where a fill goes when it ages out of {@link RETAIN_MS}, instead of
+ * being deleted. Append-only and NEVER compacted or rewritten.
+ *
+ * ── Why ─────────────────────────────────────────────────────────────────────
+ * The 30-day window was sized for the fee/slippage CALIBRATION readout. TRA-4607
+ * then pointed promotion evidence (`/api/health/validation-progress`) at the same
+ * store, and every boot silently shrank it: bqb1's same-SHA env apply at
+ * 2026-09-19T17:21Z compacted the pre-08-20 fills away, `fillsSeen` fell 41 → 31,
+ * and a close whose OPEN had aged out read `noMatchingOpen` — an exclusion
+ * MANUFACTURED BY RETENTION. `requiredN = 30` round-trips could only ever be
+ * reached if all 30 landed inside one 30-day window.
+ *
+ * So the window keeps bounding what the calibration readout and the episode
+ * oracles see (unchanged), and the aged rows move here. Promotion evidence reads
+ * {@link liveOptionPromotionEvidenceRecords} = archive ∪ window.
+ *
+ * ⛔ The archive append happens BEFORE the main file is compacted, and a failed
+ * append SKIPS the compaction — so the worst a crash or an unwritable disk can do
+ * is leave a row in both places (de-duplicated on read), never in neither.
+ */
+export const LIVE_OPTIONS_FILL_ARCHIVE_FILENAME = 'live-options-fill-archive.jsonl';
+
 // ════════════════════════════════════════════════════════════════════════════
 // ⭐ TRA-3977 — THIS STORE IS FLEET-WIDE AND THE NUMBER IT HANDS THE EXIT PATH
 // IS SPENT PER BOOK.
@@ -418,6 +441,10 @@ let lastRecordAt: number | null = null;
 let hydratedRecords = 0;
 let appendErrors = 0;
 let lastAppendError: string | null = null;
+/** TRA-4727 — fills that aged out of the window, oldest-first. Never pruned. */
+const archivedFills: LiveOptionFillRecord[] = [];
+let archiveErrors = 0;
+let lastArchiveError: string | null = null;
 
 // ── TRA-3977 — the book registry ─────────────────────────────────────────────
 //
@@ -483,6 +510,71 @@ export function liveOptionFillRecords(): LiveOptionFillRecord[] {
   return fills.map((f) => ({ ...f })).sort((a, b) => a.ts - b.ts);
 }
 
+/** TRA-4727 — identity of a fill across the window and the archive. */
+function fillKey(f: LiveOptionFillRecord): string {
+  return [f.ts, f.book ?? '', f.optionSymbol, f.side, f.contracts, f.orderId ?? '', f.origin].join('|');
+}
+
+/**
+ * TRA-4727 — the CUMULATIVE tape: every fill that aged out of the window (the
+ * archive) plus the retained window, de-duplicated, oldest-first, as copies.
+ * This is what promotion evidence grades; the 30-day window is a calibration
+ * bound and must not be one for the sample. A row present in both (a boot that
+ * archived it but could not compact the main file) is taken from the WINDOW,
+ * which is the copy the fee back-fill keeps current.
+ */
+export function liveOptionPromotionEvidenceRecords(): LiveOptionFillRecord[] {
+  const byKey = new Map<string, LiveOptionFillRecord>();
+  for (const f of archivedFills) byKey.set(fillKey(f), f);
+  for (const f of fills) byKey.set(fillKey(f), f);
+  return [...byKey.values()].map((f) => ({ ...f })).sort((a, b) => a.ts - b.ts);
+}
+
+/**
+ * TRA-4727 AC3 — how much history the evidence tape actually covers, so a
+ * truncated window is visible on the wire rather than read as a quiet sleeve.
+ */
+export interface LiveOptionEvidenceCoverage {
+  /** The calibration window's bound, in days. Does NOT bound the evidence tape. */
+  retentionDays: number;
+  /** Rows in the window / in the archive (overlap de-duplicated in `evidenceFills`). */
+  windowFills: number;
+  archivedFills: number;
+  evidenceFills: number;
+  /** Oldest fill ts on the evidence tape; `null` when empty. */
+  earliestFillTs: number | null;
+  /** Oldest fill ts inside the window only. */
+  earliestWindowFillTs: number | null;
+  /** Archive appends that failed (the row stayed in the main file instead). */
+  archiveErrors: number;
+  lastArchiveError: string | null;
+  /** Whether the directory holding both files survives a redeploy (TRA-1681). */
+  ephemeral: boolean;
+  dataDir: string | null;
+}
+
+export function liveOptionEvidenceCoverage(): LiveOptionEvidenceCoverage {
+  const evidence = liveOptionPromotionEvidenceRecords();
+  const minTs = (xs: readonly LiveOptionFillRecord[]): number | null =>
+    xs.length === 0 ? null : xs.reduce((m, f) => (f.ts < m ? f.ts : m), Infinity);
+  return {
+    retentionDays: RETAIN_MS / (24 * 60 * 60 * 1000),
+    windowFills: fills.length,
+    archivedFills: archivedFills.length,
+    evidenceFills: evidence.length,
+    earliestFillTs: minTs(evidence),
+    earliestWindowFillTs: minTs(fills),
+    archiveErrors,
+    lastArchiveError,
+    ephemeral: isEphemeralDataDir(dataDir),
+    dataDir,
+  };
+}
+
+export function liveOptionsFillArchivePath(dir: string): string {
+  return join(dir, LIVE_OPTIONS_FILL_ARCHIVE_FILENAME);
+}
+
 /**
  * TRA-3977 — is the book-attribution question REACHABLE in this process?
  *
@@ -544,6 +636,9 @@ function resetStoreRows(): void {
   hydratedRecords = 0;
   appendErrors = 0;
   lastAppendError = null;
+  archivedFills.length = 0;
+  archiveErrors = 0;
+  lastArchiveError = null;
   // TRA-3976 — the terminal markers are part of this ledger's answer, so the
   // test seam has to drop them too. Leaving them behind would make a suite's
   // "empty ledger" fixture silently carry the previous case's refusals.
@@ -1817,10 +1912,78 @@ function isSide(v: unknown): v is LiveFillSide {
 }
 
 /**
+ * Parse + validate + re-derive one on-disk JSONL line. `null` for a blank,
+ * torn or invalid line (skipped rather than aborting the hydrate). Shared by
+ * the main file and the TRA-4727 archive so both hydrate to the same shape.
+ */
+function parseFillLine(line: string): { clean: LiveOptionFillRecord; migrated: boolean } | null {
+  const trimmed = line.trim();
+  if (trimmed === '') return null;
+  let rec: LiveOptionFillRecord;
+  try {
+    rec = JSON.parse(trimmed) as LiveOptionFillRecord;
+  } catch {
+    return null; // skip a torn/partial line rather than abort the hydrate
+  }
+  if (rec === null || typeof rec !== 'object') return null;
+  if (typeof rec.ts !== 'number' || !Number.isFinite(rec.ts)) return null;
+  if (typeof rec.etDay !== 'string' || rec.etDay === '') return null;
+  if (!isSleeve(rec.sleeve) || !isSide(rec.side)) return null;
+  if (typeof rec.optionSymbol !== 'string' || rec.optionSymbol === '') return null;
+  // TRA-2850 — repair the pre-2850 poison: the commission join back-filled
+  // `fees: 0` from a broker field that is 0 on EVERY production history row,
+  // converting honest-null ("unmeasured") into a confident $0 ("measured, and
+  // it was free"). Those rows carry no `feeSource`. Reset them to null so
+  // `feesMeasured` stops counting fees nobody measured; the gainloss-derived
+  // reconcile re-measures them with real numbers. A `fees: 0` WITH a source
+  // is a genuine measured zero and is kept.
+  const sourced = isFeeSource(rec.feeSource);
+  const fees = rec.fees === 0 && !sourced ? null : rec.fees;
+  // Re-derive through toRecord so the disk copy and a live record are byte-identical
+  // in shape and the slippage invariants hold even if an old line was hand-edited.
+  const clean = toRecord({
+    ts: rec.ts,
+    etDay: rec.etDay,
+    sleeve: rec.sleeve,
+    // ⛔ TRA-3977 — a line written before this field existed hydrates
+    // UNATTRIBUTED and stays that way. There is no back-fill here, and there
+    // must not be: the only book we could name is the one whose process is
+    // reading the file, which is exactly the permissive default AC3 refuses.
+    book: rec.book,
+    optionSymbol: rec.optionSymbol,
+    side: rec.side,
+    contracts: typeof rec.contracts === 'number' && Number.isFinite(rec.contracts) ? rec.contracts : 0,
+    submittedLimit: rec.submittedLimit,
+    askAtSubmit: rec.askAtSubmit,
+    midAtSubmit: rec.midAtSubmit,
+    filledPrice: rec.filledPrice,
+    fees,
+    feeSource: sourced ? rec.feeSource : null,
+    orderId: rec.orderId,
+    origin: rec.origin,
+    // TRA-4143 — pass an explicit stamp through; an absent one re-derives
+    // from origin inside toRecord (which is what retrofits pre-cut lines).
+    tsSynthetic: rec.tsSynthetic,
+    // TRA-3997 — pass the pair through untouched. A line with neither key
+    // resolves to `null` + `unstamped` inside `toRecord`; there is NO
+    // back-fill here and there must not be (AC5).
+    admission: rec.admission,
+    admissionReason: rec.admissionReason,
+    // TRA-3926 — pass the close grant through untouched; a line with no key
+    // hydrates `null` (UNSTAMPED) and there is no back-fill.
+    exitGrant: rec.exitGrant,
+  });
+  return { clean, migrated: fees === null && rec.fees === 0 };
+}
+
+/**
  * Rebuild the in-memory records from disk on boot and remember `dir` for subsequent
  * appends. Idempotent: CLEARS first, so it is safe to call exactly once at startup
  * before any live pass. Only records within {@link RETAIN_MS} of `now` are kept, and
- * the file is COMPACTED to exactly those lines (bounding growth). Best-effort: a
+ * the file is COMPACTED to exactly those lines (bounding growth). TRA-4727 — the
+ * rows compacted out are first APPENDED to the never-pruned archive
+ * ({@link LIVE_OPTIONS_FILL_ARCHIVE_FILENAME}), which is also re-read here; they
+ * leave the calibration window, never the promotion evidence. Best-effort: a
  * missing/corrupt file yields an empty hydration; a torn trailing line is skipped
  * rather than throwing.
  */
@@ -1843,66 +2006,37 @@ export function hydrateLiveOptionsFeeSlippageFromDisk(
     raw = '';
   }
 
+  // TRA-4727 — the archive first: it is append-only, so it is only ever READ here.
+  let archiveRaw = '';
+  try {
+    archiveRaw = readFileSync(liveOptionsFillArchivePath(dir), 'utf8');
+  } catch {
+    archiveRaw = '';
+  }
+  const archivedKeys = new Set<string>();
+  for (const line of archiveRaw.split('\n')) {
+    const parsed = parseFillLine(line);
+    if (parsed === null) continue;
+    archivedFills.push(parsed.clean);
+    archivedKeys.add(fillKey(parsed.clean));
+  }
+
   const cutoff = now - RETAIN_MS;
   const kept: string[] = [];
+  const aged: LiveOptionFillRecord[] = [];
   let migrated = 0; // TRA-2850 — `fees: 0` rows with no feeSource reset to null
   for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed === '') continue;
-    let rec: LiveOptionFillRecord;
-    try {
-      rec = JSON.parse(trimmed) as LiveOptionFillRecord;
-    } catch {
-      continue; // skip a torn/partial line rather than abort the hydrate
+    const parsed = parseFillLine(line);
+    if (parsed === null) continue;
+    const { clean } = parsed;
+    if (parsed.migrated) migrated += 1;
+    if (clean.ts < cutoff) {
+      // ⛔ TRA-4727 — aged out of the CALIBRATION window, NOT out of the
+      // evidence. It leaves `fills` (the oracles keep their 30-day view) and
+      // moves to the archive below; it used to be deleted right here.
+      aged.push(clean);
+      continue;
     }
-    if (typeof rec.ts !== 'number' || !Number.isFinite(rec.ts) || rec.ts < cutoff) continue;
-    if (typeof rec.etDay !== 'string' || rec.etDay === '') continue;
-    if (!isSleeve(rec.sleeve) || !isSide(rec.side)) continue;
-    if (typeof rec.optionSymbol !== 'string' || rec.optionSymbol === '') continue;
-    // TRA-2850 — repair the pre-2850 poison: the commission join back-filled
-    // `fees: 0` from a broker field that is 0 on EVERY production history row,
-    // converting honest-null ("unmeasured") into a confident $0 ("measured, and
-    // it was free"). Those rows carry no `feeSource`. Reset them to null so
-    // `feesMeasured` stops counting fees nobody measured; the gainloss-derived
-    // reconcile re-measures them with real numbers. A `fees: 0` WITH a source
-    // is a genuine measured zero and is kept.
-    const sourced = isFeeSource(rec.feeSource);
-    const fees = rec.fees === 0 && !sourced ? null : rec.fees;
-    if (fees === null && rec.fees === 0) migrated += 1;
-    // Re-derive through toRecord so the disk copy and a live record are byte-identical
-    // in shape and the slippage invariants hold even if an old line was hand-edited.
-    const clean = toRecord({
-      ts: rec.ts,
-      etDay: rec.etDay,
-      sleeve: rec.sleeve,
-      // ⛔ TRA-3977 — a line written before this field existed hydrates
-      // UNATTRIBUTED and stays that way. There is no back-fill here, and there
-      // must not be: the only book we could name is the one whose process is
-      // reading the file, which is exactly the permissive default AC3 refuses.
-      book: rec.book,
-      optionSymbol: rec.optionSymbol,
-      side: rec.side,
-      contracts: typeof rec.contracts === 'number' && Number.isFinite(rec.contracts) ? rec.contracts : 0,
-      submittedLimit: rec.submittedLimit,
-      askAtSubmit: rec.askAtSubmit,
-      midAtSubmit: rec.midAtSubmit,
-      filledPrice: rec.filledPrice,
-      fees,
-      feeSource: sourced ? rec.feeSource : null,
-      orderId: rec.orderId,
-      origin: rec.origin,
-      // TRA-4143 — pass an explicit stamp through; an absent one re-derives
-      // from origin inside toRecord (which is what retrofits pre-cut lines).
-      tsSynthetic: rec.tsSynthetic,
-      // TRA-3997 — pass the pair through untouched. A line with neither key
-      // resolves to `null` + `unstamped` inside `toRecord`; there is NO
-      // back-fill here and there must not be (AC5).
-      admission: rec.admission,
-      admissionReason: rec.admissionReason,
-      // TRA-3926 — pass the close grant through untouched; a line with no key
-      // hydrates `null` (UNSTAMPED) and there is no back-fill.
-      exitGrant: rec.exitGrant,
-    });
     fills.push(clean);
     // TRA-3977 — a hydrated row is a witness too: a file carrying two books'
     // fills makes the attribution question reachable from the first tick, before
@@ -1912,13 +2046,40 @@ export function hydrateLiveOptionsFeeSlippageFromDisk(
     if (clean.ts > (lastRecordAt ?? 0)) lastRecordAt = clean.ts;
   }
 
+  // TRA-4727 — archive the aged rows BEFORE compacting them out of the main
+  // file. A row already archived (a previous boot archived it and then failed
+  // to compact) is not appended twice. If the append fails the compaction is
+  // skipped, so the row stays on disk in the main file and is retried next boot.
+  let archiveOk = true;
+  const toArchive = aged.filter((f) => !archivedKeys.has(fillKey(f)));
+  if (toArchive.length > 0) {
+    const archivePath = liveOptionsFillArchivePath(dir);
+    try {
+      mkdirSync(dirname(archivePath), { recursive: true });
+      appendFileSync(archivePath, toArchive.map((f) => JSON.stringify(f)).join('\n') + '\n', 'utf8');
+    } catch (err) {
+      archiveOk = false;
+      archiveErrors += 1;
+      lastArchiveError = err instanceof Error ? err.message : String(err);
+      log.warn('live-options fill archive append failed — main file NOT compacted', {
+        reason: lastArchiveError,
+      });
+    }
+  }
+  for (const f of aged) {
+    if (archivedKeys.has(fillKey(f))) continue;
+    archivedKeys.add(fillKey(f));
+    archivedFills.push(f);
+  }
+  archivedFills.sort((a, b) => a.ts - b.ts);
+
   // Compact: rewrite the file to the retained lines only (best-effort). Skipped when
   // there is nothing to drop AND nothing was migrated, to avoid a needless rewrite on
   // every clean boot. A TRA-2850 poison repair (fees:0 → null) changes content without
   // changing the count, so it forces the rewrite too — otherwise the poison would sit
   // on disk and be re-migrated every boot.
   const nonEmptyLines = raw.split('\n').filter((l) => l.trim() !== '').length;
-  if (kept.length < nonEmptyLines || migrated > 0) {
+  if (archiveOk && (kept.length < nonEmptyLines || migrated > 0)) {
     const path = liveOptionsFeeSlippageLogPath(dir);
     try {
       mkdirSync(dirname(path), { recursive: true });
