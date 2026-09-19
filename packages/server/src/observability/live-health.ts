@@ -13,7 +13,7 @@
 // without a running engine. The route handler and the background monitor both
 // build their input from the same place and read the same verdict.
 
-import type { AccountMode, TradierEnv } from '@trading-app/shared';
+import type { AccountMode, LiveCredentialField, TradierEnv } from '@trading-app/shared';
 import { MAX_QUOTE_AGE_MS } from '../feed-freshness.js';
 import type { LiveStopActionabilitySummary } from '../options-account.js';
 import type { AutopilotAction } from '../risk-autopilot.js';
@@ -53,8 +53,12 @@ export interface LiveHealthSymbol {
 export interface LiveHealthInput {
   mode: AccountMode;
   tradierEnv: TradierEnv;
-  /** Output of `findMissingLiveCredentials(settings)` — empty ⇒ broker auth OK. */
-  missingCredentials: string[];
+  /**
+   * Output of `findMissingLiveCredentials(settings)` — empty ⇒ broker auth OK.
+   * TRA-4732 — typed to the union, not `string[]`, so a retired field (the
+   * Coinbase pair, TRA-4729) cannot come back as a fixture or a caller value.
+   */
+  missingCredentials: LiveCredentialField[];
   autoTradingEnabled: boolean;
   tradingHalted: boolean;
   haltReason: string | null;

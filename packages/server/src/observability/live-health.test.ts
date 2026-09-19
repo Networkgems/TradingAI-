@@ -1,6 +1,7 @@
 // TRA-528 — live-health summarizer tests.
 
 import { describe, it, expect } from 'vitest';
+import { DEFAULT_ACCOUNT_SETTINGS, findMissingLiveCredentials, type AccountSettings } from '@trading-app/shared';
 import {
   summarizeFeed,
   summarizeLiveHealth,
@@ -72,7 +73,7 @@ describe('summarizeLiveHealth', () => {
   });
 
   it('is RED when live mode is missing broker credentials', () => {
-    const s = summarizeLiveHealth(input({ missingCredentials: ['liveApiKeyCrypto'] }));
+    const s = summarizeLiveHealth(input({ missingCredentials: ['liveApiKeyOptionsProduction'] }));
     expect(s.status).toBe('red');
     expect(s.broker.authOk).toBe(false);
     expect(s.issues[0]).toMatch(/credentials missing/);
@@ -80,7 +81,7 @@ describe('summarizeLiveHealth', () => {
 
   it('does NOT flag missing creds in demo mode', () => {
     const s = summarizeLiveHealth(
-      input({ mode: 'demo', missingCredentials: ['liveApiKeyCrypto'] }),
+      input({ mode: 'demo', missingCredentials: ['liveApiKeyOptionsProduction'] }),
     );
     // demo + missing-live-creds is not an incident
     expect(s.status).toBe('green');
@@ -123,11 +124,49 @@ describe('summarizeLiveHealth', () => {
 
   it('RED outranks YELLOW when multiple problems coexist', () => {
     const s = summarizeLiveHealth(
-      input({ missingCredentials: ['liveApiKeyCrypto'], tradingHalted: true }),
+      input({ missingCredentials: ['liveApiKeyOptionsProduction'], tradingHalted: true }),
     );
     expect(s.status).toBe('red');
     // both issues are reported
     expect(s.issues.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+// TRA-4732 — the credential verdict end to end, from a Settings snapshot through
+// the real `findMissingLiveCredentials` (the route's own input) into the
+// summarizer. Before TRA-4729 the default `liveBrokerageTypeCrypto: 'coinbase'`
+// made a blank Coinbase pair read RED on every Tradier-only live account.
+describe('summarizeLiveHealth — credentials from a live Settings snapshot (TRA-4732)', () => {
+  const tradierProduction: AccountSettings = {
+    ...DEFAULT_ACCOUNT_SETTINGS,
+    mode: 'live',
+    liveTradierEnvOptions: 'production',
+    liveApiKeyOptionsProduction: 'tradier-prod-key',
+    liveAccountIdOptionsProduction: 'VA0000001',
+  };
+
+  function fromSettings(s: AccountSettings) {
+    return summarizeLiveHealth(input({ missingCredentials: findMissingLiveCredentials(s) }));
+  }
+
+  it('full Tradier creds + BLANK Coinbase fields ⇒ authOk (a legacy blob still carrying the retired brokerage type)', () => {
+    const legacyBlob = {
+      ...tradierProduction,
+      liveBrokerageTypeCrypto: 'coinbase',
+      liveApiKeyCrypto: '',
+      liveApiSecretCrypto: '',
+    } as AccountSettings;
+    const s = fromSettings(legacyBlob);
+    expect(s.broker.missingCredentials).toEqual([]);
+    expect(s.broker.authOk).toBe(true);
+    expect(s.status).toBe('green');
+  });
+
+  it('control: the SAME snapshot with the Tradier production key blanked ⇒ RED, naming the Tradier field', () => {
+    const s = fromSettings({ ...tradierProduction, liveApiKeyOptionsProduction: '' });
+    expect(s.broker.missingCredentials).toEqual(['liveApiKeyOptionsProduction']);
+    expect(s.broker.authOk).toBe(false);
+    expect(s.status).toBe('red');
   });
 });
 
