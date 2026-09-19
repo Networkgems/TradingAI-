@@ -217,7 +217,10 @@ const BASELINE = {
       // through the same `dir ? resolveDemoFlagEnv(dir) : process.env` idiom as the
       // ten above it. Same class, same blank-value behaviour (blank ⇒ process.env,
       // never a root named ' '). Hand-edited here, which is the ratchet working.
-      { text: 'const dir = process.env.DATA_DIR;', count: 11, reason: R.REPORT },
+      // TRA-4726 — 11 → 10: TRA-4629 (`9a2ccba2`) deleted the crypto engine and with it
+      // the regime-TSMOM demo readout, which carried one of these reads. A removal, not
+      // a new unguarded copy; `copies` stays 0.
+      { text: 'const dir = process.env.DATA_DIR;', count: 10, reason: R.REPORT },
       { text: 'const dataDir = process.env.DATA_DIR ?? null;', count: 1, reason: R.REPORT },
       { text: 'const sebDir = process.env.DATA_DIR;', count: 1, reason: R.REPORT },
       {

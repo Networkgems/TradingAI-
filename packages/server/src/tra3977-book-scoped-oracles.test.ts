@@ -403,8 +403,11 @@ describe('TRA-3977 AC4 — ⭐ NEGATIVE CONTROL: one book, and nothing changes',
       open(V0NNI, 1, 1.54, T0);
       expect(crossBookOpenEpisodeCensus().booksObserved).toEqual([V0NNI]);
       // Boot 2: nothing wired, the file is the only witness — and it is enough.
+      // `now` is pinned beside T0: the hydrate drops rows older than its 30-day
+      // retention, so a wall-clock `now` expired this fixture on 2026-09-19 13:35:30Z
+      // and read as "0 rows survive a restart" (TRA-4726).
       clearLiveOptionsFeeSlippageLedger();
-      const h = hydrateLiveOptionsFeeSlippageFromDisk(dir);
+      const h = hydrateLiveOptionsFeeSlippageFromDisk(dir, T0 + 60_000);
       expect(h.records).toBe(1);
       const c = crossBookOpenEpisodeCensus();
       expect(c.booksWired).toEqual([]);

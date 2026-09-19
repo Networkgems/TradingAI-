@@ -576,7 +576,7 @@ export async function runOptimization(
 
 // ── Report writers (spec §8) ──────────────────────────────────────────────────
 
-function writeReports(report: OptimizationReport): void {
+export function writeReports(report: OptimizationReport): void {
   const here = dirname(fileURLToPath(import.meta.url));
   const root = resolve(here, '..');
 

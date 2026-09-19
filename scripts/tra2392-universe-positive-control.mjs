@@ -21,8 +21,6 @@ import { readFileSync, writeFileSync } from 'fs';
 
 const SHARED_SRC = 'packages/shared/src/symbol-universe.ts';
 const SHARED_DIST = 'packages/shared/dist/symbol-universe.js';
-const SERVICE_SRC = 'packages/server/src/promotion-service.ts';
-const SERVICE_DIST = 'packages/server/dist/promotion-service.js';
 const STORE_SRC = 'packages/server/src/promotion-store.ts';
 const STORE_DIST = 'packages/server/dist/promotion-store.js';
 
