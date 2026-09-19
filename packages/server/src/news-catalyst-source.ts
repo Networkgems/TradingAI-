@@ -223,6 +223,22 @@ export interface CatalystSourceDeps {
   hidden?: ReadonlySet<string>;
 }
 
+/**
+ * TRA-4901 — which checkpoint of the trading day a sweep belongs to.
+ *
+ * The morning brief (8:30 ET) and the pre-market watchlist build (9:00 ET)
+ * both read overnight/premarket headlines and correctly share ONE vendor
+ * sweep per day (TRA-4682) — headlines from 4pm-yesterday through the open
+ * do not go stale in that 30-minute gap. Afternoon setups are a different
+ * question: a name that caught a lunchtime headline needs a FRESH sweep, and
+ * before this the once-per-session cache silently served the 9am pool all
+ * afternoon — "midday news" never actually re-hit the vendor.
+ *
+ * Each window gets its own cache entry and its own attempt budget, so a
+ * midday sweep can never crowd out (or be crowded out by) the premarket one.
+ */
+export type CatalystSweepWindow = 'premarket' | 'midday';
+
 function zScore(value: number, history: readonly number[]): number {
   const sample = history.filter((v) => Number.isFinite(v));
   if (sample.length < 2) return 0;
@@ -503,14 +519,23 @@ async function runCatalystSweep(deps: CatalystSourceDeps): Promise<CatalystSweep
 //
 // Process-local on purpose: a restart loses the cache, which costs at most one
 // extra sweep, and the durable run ledger still records every sweep that ran.
+//
+// TRA-4901 — the cache key used to be the bare ET session (`etDateKey`), so
+// EVERY caller for the rest of the day — including one built specifically to
+// re-hit the vendor for fresh midday headlines — served from the 9am pool.
+// The key is now `${session}:${window}` ({@link CatalystSweepWindow}) so the
+// premarket sweep and a midday refresh each get their own budget and their
+// own cache slot; the midday window still cannot exceed
+// {@link CATALYST_SWEEP_MAX_ATTEMPTS} of its own vendor sweeps, it just no
+// longer inherits the premarket window's exhausted one (or vice versa).
 
-/** Vendor sweeps allowed per ET session, successful or not. */
+/** Vendor sweeps allowed per ET session PER WINDOW, successful or not. */
 export const CATALYST_SWEEP_MAX_ATTEMPTS = 3;
 /** Minimum gap between failed sweep attempts — clears the 90s Yahoo 429 breaker. */
 export const CATALYST_SWEEP_RETRY_BACKOFF_MS = 2 * 60_000;
 
 interface SessionSweepState {
-  session: string;
+  key: string;
   attempts: number;
   lastAttemptAt: number;
   /** Enriched pool from the session's healthy sweep; `null` until one lands. */
@@ -521,16 +546,17 @@ interface SessionSweepState {
   inFlight: Promise<void> | null;
 }
 
-let sweepState: SessionSweepState | null = null;
+const sweepStates = new Map<string, SessionSweepState>();
 
-/** Test seam — forget the per-session sweep gate. */
+/** Test seam — forget every per-session/window sweep gate. */
 export function resetCatalystSweepGateForTests(): void {
-  sweepState = null;
+  sweepStates.clear();
 }
 
-/** Probe view of the gate, for `/api/health/news-catalyst-signals`. */
+/** Probe view of the gate, for `/api/health/news-catalyst-signals`. Defaults to `premarket`. */
 export interface CatalystSweepGateSnapshot {
   session: string | null;
+  window: CatalystSweepWindow;
   attempts: number;
   maxAttempts: number;
   retryBackoffMs: number;
@@ -539,15 +565,21 @@ export interface CatalystSweepGateSnapshot {
   skipped: number;
 }
 
-export function catalystSweepGateSnapshot(): CatalystSweepGateSnapshot {
+export function catalystSweepGateSnapshot(
+  window: CatalystSweepWindow = 'premarket',
+): CatalystSweepGateSnapshot {
+  // Best-effort session label: any live key sharing this window (there is at
+  // most one per window at a time — a new ET day replaces it).
+  const state = [...sweepStates.values()].find((s) => s.key.endsWith(`:${window}`)) ?? null;
   return {
-    session: sweepState?.session ?? null,
-    attempts: sweepState?.attempts ?? 0,
+    session: state ? state.key.slice(0, state.key.length - window.length - 1) : null,
+    window,
+    attempts: state?.attempts ?? 0,
     maxAttempts: CATALYST_SWEEP_MAX_ATTEMPTS,
     retryBackoffMs: CATALYST_SWEEP_RETRY_BACKOFF_MS,
-    healthy: sweepState?.pool != null,
-    servedFromCache: sweepState?.servedFromCache ?? 0,
-    skipped: sweepState?.skipped ?? 0,
+    healthy: state?.pool != null,
+    servedFromCache: state?.servedFromCache ?? 0,
+    skipped: state?.skipped ?? 0,
   };
 }
 
@@ -557,14 +589,24 @@ function selectFromPool(pool: readonly CatalystCandidate[], hidden?: ReadonlySet
 }
 
 /**
- * The premarket entry point: {@link buildNewsCatalystPicks} behind a
- * once-per-session gate. See the block comment above. Never throws.
+ * The premarket/midday entry point: {@link buildNewsCatalystPicks} behind a
+ * once-per-session-per-window gate. See the block comment above. Never throws.
+ *
+ * `window` defaults to `'premarket'` for back-compat with every existing
+ * caller (the 9am watchlist build); pass `'midday'` from the afternoon
+ * refresh hook so it gets an independent cache slot and attempt budget
+ * instead of silently reading the morning's stale pool.
  */
-export async function sessionCatalystPicks(deps: CatalystSourceDeps): Promise<string[]> {
+export async function sessionCatalystPicks(
+  deps: CatalystSourceDeps,
+  window: CatalystSweepWindow = 'premarket',
+): Promise<string[]> {
   const session = etDateKey(deps.now);
-  if (!sweepState || sweepState.session !== session) {
-    sweepState = {
-      session,
+  const key = `${session}:${window}`;
+  let state = sweepStates.get(key);
+  if (!state) {
+    state = {
+      key,
       attempts: 0,
       lastAttemptAt: 0,
       pool: null,
@@ -572,8 +614,8 @@ export async function sessionCatalystPicks(deps: CatalystSourceDeps): Promise<st
       skipped: 0,
       inFlight: null,
     };
+    sweepStates.set(key, state);
   }
-  const state = sweepState;
   // Single-flight: a concurrent caller waits for the running sweep, then reads
   // its outcome like any later caller.
   if (state.inFlight) await state.inFlight;
@@ -595,7 +637,7 @@ export async function sessionCatalystPicks(deps: CatalystSourceDeps): Promise<st
   let picks: string[] = [];
   const run = runCatalystSweep(deps).then((r) => {
     picks = r.picks;
-    if (r.pool) state.pool = r.pool;
+    if (r.pool) state!.pool = r.pool;
   });
   state.inFlight = run.catch(() => undefined);
   try {

@@ -502,3 +502,85 @@ export async function runPremarketForAllUsers(): Promise<void> {
     }
   }
 }
+
+/**
+ * TRA-4901 — midday news-catalyst refresh (~12:00 ET), wired to the
+ * scheduler's `onMiddayNews` hook.
+ *
+ * This is deliberately NOT a second `generateSmartWatchlist` run: that
+ * function's other input, `scanStocksMarket()`'s day-gainers/losers screener,
+ * is a pre-market read (`suspectMover`/`isMoveSuspect` gate it against a
+ * PRIOR close), and re-running it midday would score intraday moves against
+ * the wrong baseline. The only thing genuinely stale by lunchtime is the
+ * NEWS side — `sessionCatalystPicks` cached the 9am headline sweep for the
+ * rest of the day (TRA-4682), so a name whose catalyst hit at noon was
+ * invisible to the watchlist until tomorrow's premarket build.
+ *
+ * Calling `sessionCatalystPicks(..., 'midday')` forces a fresh vendor sweep
+ * (its own cache slot + attempt budget — see the TRA-4901 note in
+ * news-catalyst-source.ts) and adds anything new straight into each user's
+ * watchlist via the same `addStocksSymbol` + `engine.addSymbol` path
+ * `generateSmartWatchlist` uses, so the newcomer is live for the afternoon
+ * session without waiting for a restart.
+ */
+export async function runMiddayNewsRefreshForAllUsers(): Promise<void> {
+  if (!isNewsCatalystEnabled()) return;
+
+  let picks: string[] = [];
+  try {
+    picks = await sessionCatalystPicks(
+      {
+        fetchNews: () => fetchMarketNews(catalystUniverse()),
+        fetchMetrics: fetchCatalystMetrics,
+        earningsInDays: earningsInDaysSync,
+        now: Date.now(),
+      },
+      'midday',
+    );
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    log.warn('midday news-catalyst sweep failed', { reason });
+    await recordCatalystRun({
+      at: Date.now(),
+      outcome: 'source_failed',
+      headlineCount: null,
+      candidateCount: null,
+      chosenCount: null,
+      queriesAttempted: null,
+      queriesSucceeded: null,
+      quotesAttempted: null,
+      quotesOk: null,
+      reason,
+    });
+    return;
+  }
+
+  if (picks.length === 0) return;
+
+  const baseSet = new Set((WATCHLIST as readonly string[]).map((s) => s.toUpperCase()));
+  for (const ctx of getAllUserContexts()) {
+    try {
+      const hidden = new Set(getStocksWatchlistData(ctx.username).hidden.map((s) => s.toUpperCase()));
+      const existing = new Set(getStocksWatchlistData(ctx.username).all.map((s) => s.toUpperCase()));
+      const newcomers = picks.filter(
+        (sym) => !baseSet.has(sym) && !hidden.has(sym) && !existing.has(sym),
+      );
+      for (const sym of newcomers) {
+        await addStocksSymbol(ctx.username, sym);
+        ctx.engine.addSymbol(sym);
+      }
+      if (newcomers.length > 0) {
+        ctx.engine.refresh();
+        log.info('midday news-catalyst symbols added', {
+          username: ctx.username,
+          symbols: newcomers.join(', '),
+        });
+      }
+    } catch (err) {
+      log.error('midday news-catalyst refresh failed for user', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}

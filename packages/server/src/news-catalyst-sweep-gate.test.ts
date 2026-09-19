@@ -172,6 +172,50 @@ describe('sessionCatalystPicks — one vendor sweep per session (TRA-4682)', () 
   });
 });
 
+// TRA-4901 — a midday sweep must not be masked by (or exhaust) the premarket
+// window's cache/budget, and vice versa. Before this fix `sessionCatalystPicks`
+// cached on the bare ET session, so a second call anywhere later in the day
+// (any window) always served the 9am pool with ZERO vendor calls — "midday
+// news" never actually re-hit the vendor.
+describe('sessionCatalystPicks — per-window cache (TRA-4901)', () => {
+  it("a midday call forces a FRESH sweep instead of reusing the premarket window's pool", async () => {
+    const premarket = makeDeps({ healthy: true, at: NOW });
+    await sessionCatalystPicks(premarket.deps, 'premarket');
+    expect(premarket.calls.news).toBe(1);
+
+    // Same ET session, ~3 hours later — the midday slot. Under the old bare
+    // session key this would be `servedFromCache` with zero vendor calls.
+    const midday = makeDeps({ healthy: true, at: NOW + 3 * 3_600_000 });
+    const picks = await sessionCatalystPicks(midday.deps, 'midday');
+    expect(midday.calls.news).toBe(1);
+    expect(picks.length).toBeGreaterThan(0);
+  });
+
+  it('premarket and midday windows have independent attempt budgets', async () => {
+    // Exhaust the premarket window's budget on a dead feed.
+    for (let i = 0; i < CATALYST_SWEEP_MAX_ATTEMPTS; i++) {
+      const { deps } = makeDeps({ healthy: false, at: NOW + i * CATALYST_SWEEP_RETRY_BACKOFF_MS });
+      await sessionCatalystPicks(deps, 'premarket');
+    }
+    expect(catalystSweepGateSnapshot('premarket')).toMatchObject({ attempts: CATALYST_SWEEP_MAX_ATTEMPTS });
+
+    // The midday window, on the SAME ET day, still gets its own first attempt.
+    const midday = makeDeps({ healthy: true, at: NOW + 4 * 3_600_000 });
+    const picks = await sessionCatalystPicks(midday.deps, 'midday');
+    expect(midday.calls.news).toBe(1);
+    expect(picks.length).toBeGreaterThan(0);
+    expect(catalystSweepGateSnapshot('midday')).toMatchObject({ attempts: 1, healthy: true });
+  });
+
+  it("omitting the window argument defaults to 'premarket' (back-compat)", async () => {
+    const { deps, calls } = makeDeps({ healthy: true, at: NOW });
+    await sessionCatalystPicks(deps);
+    expect(calls.news).toBe(1);
+    expect(catalystSweepGateSnapshot('premarket')).toMatchObject({ attempts: 1, healthy: true });
+    expect(catalystSweepGateSnapshot('midday')).toMatchObject({ attempts: 0, healthy: false });
+  });
+});
+
 describe('row-basis degraded metric (TRA-4682)', () => {
   const run = (at: number, healthy: boolean) =>
     recordCatalystRun({
