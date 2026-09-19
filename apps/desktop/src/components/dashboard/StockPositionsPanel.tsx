@@ -25,6 +25,7 @@ export function StockPositionsPanel({
   symbols,
   accountMode,
   tradierEnv,
+  showAccountSummary = true,
 }: {
   token: string;
   account: AccountState | undefined;
@@ -33,6 +34,8 @@ export function StockPositionsPanel({
   symbols: SymbolState[];
   accountMode: 'demo' | 'live';
   tradierEnv: 'sandbox' | 'production';
+  /** TRA-4729 — the Overview renders the account card once, above; it passes `false`. */
+  showAccountSummary?: boolean;
 }) {
   const openPosSort = useTableSort<StockOpenPosSortKey>('opened', 'desc');
   const closedPosSort = useTableSort<StockClosedPosSortKey>('closed', 'desc');
@@ -64,7 +67,7 @@ export function StockPositionsPanel({
     <div className="positions-panel">
       {/* TRA-725 — Tradier-parity account summary card at the top of the
           holdings view. Live-only balance fields degrade to "—" in demo. */}
-      <AccountSummaryCard account={account} accountMode={accountMode} />
+      {showAccountSummary && <AccountSummaryCard account={account} accountMode={accountMode} />}
       {/* TRA-503 — pull open equity positions from Tradier into TradeAI so the
           Positions table catches out-of-band opens before the cadence sweep. */}
       {showTradierSync && (

@@ -39,7 +39,7 @@ export const TOUR_STOPS: readonly TourStop[] = [
   {
     id: 'signals',
     title: 'Signals & watchlist',
-    body: 'The engine’s latest entry signals and the symbols it tracks. Switch tabs to explore each.',
+    body: 'The engine’s latest entry signals, the symbols it tracks, and every other panel beyond the five on the Overview live under Diagnostics.',
   },
   {
     id: 'auto-trading',
@@ -49,7 +49,7 @@ export const TOUR_STOPS: readonly TourStop[] = [
   {
     id: 'calendar',
     title: 'Reports & calendar',
-    body: 'Your daily P&L, closed-trade history, and exportable reports live on the Calendar tab.',
+    body: 'Your daily P&L, closed-trade history, and exportable reports live under Diagnostics → Calendar.',
   },
 ] as const;
 

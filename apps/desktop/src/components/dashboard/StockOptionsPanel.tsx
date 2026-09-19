@@ -24,6 +24,7 @@ export function StockOptionsPanel({
   openOptions,
   closedOptions,
   optionsDailyLimit,
+  showAccountSummary = true,
 }: {
   token: string;
   tradierEnv: 'sandbox' | 'production';
@@ -33,6 +34,8 @@ export function StockOptionsPanel({
   openOptions: OptionPosition[];
   closedOptions: OptionPosition[];
   optionsDailyLimit: number;
+  /** TRA-4729 — the Overview renders the account card once, above; it passes `false`. */
+  showAccountSummary?: boolean;
 }) {
   const openOptSort = useTableSort<OptionOpenSortKey>('opened', 'desc');
   const closedOptSort = useTableSort<OptionClosedSortKey>('closed', 'desc');
@@ -257,7 +260,7 @@ export function StockOptionsPanel({
         </>
       )}
 
-      <AccountSummaryCard account={account} accountMode={accountMode} />
+      {showAccountSummary && <AccountSummaryCard account={account} accountMode={accountMode} />}
       {/* TRA-844 — portfolio Greeks + theta-$ bleed + allocation-by-name/sector
           over the open options book. Renders nothing when the book is empty. */}
       <PortfolioGreeksPanel greeks={optionsState?.portfolioGreeks} />

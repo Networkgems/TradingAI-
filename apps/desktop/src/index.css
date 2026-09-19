@@ -4334,3 +4334,165 @@ tr:hover td { background: var(--bg-hover); }
   .lp-ft-2col .lp-ft-row { grid-template-columns: 1fr; gap: 0.3rem; }
   .lp-ft-markets { color: var(--lp-eyebrow); font-size: 0.8rem; }
 }
+
+/* ── TRA-4729 (design TRA-4733) — Overview: the five primary panels ─────── */
+.dashboard-primary {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+.dashboard-primary__top-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1rem;
+  align-items: start;
+}
+.dashboard-primary__card,
+.dashboard-primary__full-width {
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  min-width: 0;
+}
+.dashboard-primary__card h3,
+.dashboard-primary__full-width > h3 {
+  margin: 0 0 0.6rem;
+  font-size: 0.95rem;
+}
+/* The card already supplies the frame; drop the nested one. */
+.dashboard-primary__card .account-summary-card {
+  border: none;
+  padding: 0;
+  margin-bottom: 0.6rem;
+}
+.dashboard-primary__risk {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+  gap: 0.5rem 1rem;
+  margin: 0;
+}
+.dashboard-primary__risk dt {
+  font-size: 0.62rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.dashboard-primary__risk dd { margin: 0; font-weight: 600; }
+.dashboard-primary__risk dd.red { color: var(--red); }
+@media (max-width: 1023px) {
+  .dashboard-primary__top-row { grid-template-columns: 1fr; }
+}
+
+/* ── Validation Progress panel ──────────────────────────────────────────── */
+.validation-progress-panel__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.6rem;
+}
+.validation-progress-panel__head h3 { margin: 0; font-size: 0.95rem; }
+.validation-progress-panel__window {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.validation-progress-panel__warn { color: var(--orange); font-size: 0.85rem; }
+.validation-progress-panel__summary {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.5rem;
+  margin: 0 0 0.5rem;
+}
+.validation-progress-panel__summary dt,
+.validation-progress-panel__exclusions dt {
+  font-size: 0.62rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.validation-progress-panel__summary dd,
+.validation-progress-panel__exclusions dd { margin: 0; font-weight: 600; }
+.validation-progress-panel__note { font-size: 0.8rem; }
+.sleeve-progress-card {
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  margin-bottom: 0.5rem;
+}
+.sleeve-progress-card__head {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.sleeve-progress-card__badge {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.05rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+.sleeve-progress-card__badge--pass { color: var(--green); border-color: var(--green); }
+.sleeve-progress-card__badge--blocked { color: var(--red); border-color: var(--red); }
+.sleeve-progress-card__badge--pending { color: var(--orange); border-color: var(--orange); }
+.sleeve-progress-card__badge--unmeasured { color: var(--muted); }
+.sleeve-progress-card__note { font-size: 0.8rem; margin: 0.35rem 0; }
+.sleeve-progress-card__fees { display: flex; gap: 0.75rem; flex-wrap: wrap; font-size: 0.72rem; }
+.validation-progress-panel__exclusions dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 0.4rem;
+  margin: 0.4rem 0 0;
+}
+.validation-progress-panel__foot {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.6rem;
+  font-size: 0.72rem;
+}
+
+/* ── Diagnostics view: sidebar + one sub-panel ─────────────────────────── */
+.diagnostics-layout {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+}
+.diagnostics-sidebar {
+  width: 160px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  padding-right: 0.5rem;
+}
+.diagnostics-sidebar__select { display: none; width: 100%; }
+.diagnostics-sidebar__section { margin-bottom: 0.75rem; }
+.diagnostics-sidebar__heading {
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0 0.5rem 0.25rem;
+}
+.diagnostics-sidebar__item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  padding: 0.35rem 0.5rem;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.diagnostics-sidebar__item:hover { background: var(--bg-hover); }
+.diagnostics-sidebar__item.active { background: var(--bg-hover); color: var(--blue); font-weight: 600; }
+.diagnostics-content { flex: 1; min-width: 0; }
+@media (max-width: 767px) {
+  .diagnostics-layout { flex-direction: column; }
+  .diagnostics-sidebar { width: 100%; border-right: none; padding-right: 0; }
+  .diagnostics-sidebar__select { display: block; }
+  .diagnostics-sidebar__section { display: none; }
+}

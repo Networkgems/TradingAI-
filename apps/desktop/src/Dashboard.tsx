@@ -5,6 +5,7 @@
 // pieces together. Behaviour (toast feedback, focus-trapped close drawer, sort
 // hooks, backoff/validation libs from TRA-419) carries through unchanged.
 import { useEffect, useState } from 'react';
+import type { ReactNode } from 'react';
 import type { LiveCredentialField } from '@trading-app/shared';
 import { HTTP_URL } from './server-url';
 import {
@@ -32,18 +33,36 @@ import { LiveCredentialsBanner } from './components/dashboard/LiveCredentialsBan
 import { HaltBanner } from './components/dashboard/HaltBanner';
 import { HiddenBookBanner } from './components/dashboard/HiddenBookBanner';
 import { HealthPanel } from './components/dashboard/HealthPanel';
+import { PromotionGatePanel } from './components/dashboard/PromotionGatePanel';
+import { ValidationProgressPanel } from './components/dashboard/ValidationProgressPanel';
+import { DiagnosticsView } from './components/dashboard/DiagnosticsView';
+import type { DiagnosticsItem } from './components/dashboard/DiagnosticsView';
+import { AccountSummaryCard } from './components/dashboard/AccountSummaryCard';
 import { DashboardTour } from './components/onboarding/CoachMarkTour';
 import { useStockEngine } from './hooks/useStockEngine';
 
-// TRA-600 — 'ideas' is the new "AI Options Ideas" surface (Phase 3 of TRA-595).
-// TRA-161 — 'otm' is the read-only Mispriced OTM scanner surface. It lives
-// under "More" rather than the primary bar: the primary row is the trading
-// workflow, and this is a research/diagnostic read with no action on it.
-// TRA-4626 — 'swing' is the swing signal fusion engine panel (ranked candidates).
-type StockTab = 'watchlist' | 'signals' | 'swing' | 'proposals' | 'positions' | 'options' | 'ideas' | 'otm' | 'news' | 'calendar' | 'health';
+// TRA-4729 (design TRA-4733) — two top-level views. `overview` is the primary
+// screen and holds exactly five panels: Account/Risk, Proposals, Open
+// Positions, OTM Mispricing, Validation Progress. Every other surface — the
+// old flat tabs (Watchlist, Signals, Swing, AI Ideas, Calendar, News, Health,
+// …) — moved behind `diagnostics`. Moved, not deleted: each is still one click
+// away in the Diagnostics sidebar, rendered by the same component as before.
+type StockView = 'overview' | 'diagnostics';
+// TRA-600 'ideas' · TRA-161 'otm' · TRA-4626 'swing' · TRA-539 'health' ·
+// TRA-1158 'calendar' — the pre-TRA-4729 tab ids, now Diagnostics sub-panels.
+type DiagnosticsTab =
+  | 'health' | 'validation' | 'promotion'
+  | 'watchlist' | 'signals' | 'swing' | 'positions'
+  | 'ideas' | 'otm'
+  | 'calendar' | 'news';
 
 export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme }: { token: string; onLogout: () => void; onGoHome: () => void; onActivity?: () => void; theme: Theme; onToggleTheme: () => void }) {
-  const [tab, setTab] = useState<StockTab>('watchlist');
+  const [view, setView] = useState<StockView>('overview');
+  // Spec §6 Q1 — Health is the default Diagnostics sub-panel.
+  const [diagTab, setDiagTab] = useState<DiagnosticsTab>('health');
+  // `useStockEngine` refreshes settings whenever this key changes, exactly as
+  // it did on every old tab switch.
+  const tab = view === 'overview' ? 'overview' : diagTab;
   const [profileModal, setProfileModal] = useState<ProfileModal | null>(null);
   // TRA-506 — the banner deep-links into Settings with a specific input
   // focused. Tracked here so the modal can read it on open and clear it
@@ -84,6 +103,58 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
   const openOptions = optionsState?.openOptions ?? [];
   const closedOptions = optionsState?.closedOptions ?? [];
   const autoTradingEnabled = state?.autoTradingEnabled ?? true;
+  const killSwitchEngaged = accountSettings?.globalKillSwitchEngaged ?? false;
+
+  // Engine-snapshot panels show the same "connecting" state the old tabs did
+  // until the first WebSocket frame lands; the self-fetching ones (Health,
+  // Validation, Promotion, AI Ideas, OTM, News, Calendar) render without it.
+  const needsState = (node: () => ReactNode) => () => state ? node() : (
+    <div className="loading">
+      <div className="spinner" />
+      <p>Connecting to trading engine…</p>
+    </div>
+  );
+
+  const diagnosticsItems: DiagnosticsItem<DiagnosticsTab>[] = [
+    // TRA-539 — reads its own /api/health/live, independent of the engine feed,
+    // so the surface that diagnoses a dead session works when the feed is dead.
+    { id: 'health', section: 'Core', label: 'Health', render: () => <HealthPanel token={token} /> },
+    { id: 'validation', section: 'Core', label: 'Validation Progress', render: () => <ValidationProgressPanel token={token} /> },
+    { id: 'promotion', section: 'Core', label: 'Promotion Gate', render: () => <PromotionGatePanel token={token} /> },
+    { id: 'watchlist', section: 'Market & signals', label: `Watchlist (${symbols.length})`, render: needsState(() => <StockWatchlistPanel token={token} symbols={symbols} />) },
+    { id: 'signals', section: 'Market & signals', label: `Signals (${signals.length})`, render: needsState(() => state && <StockSignalsPanel token={token} signals={signals} symbols={symbols} marketReview={state.marketReview} lastScanAt={state.lastScanAt} marketOpen={state.marketOpen} />) },
+    // TRA-4626 — swing signal fusion engine candidates (ranked 0-100).
+    { id: 'swing', section: 'Market & signals', label: `Swing (${swingSignals.length})`, title: 'Ranked swing trade options signals with composite scoring — observe-only', render: needsState(() => state && <SwingSignalsPanel swingSignals={swingSignals} summary={state.swingScanSummary} />) },
+    { id: 'positions', section: 'Market & signals', label: `Equity positions (${openPositions.length})`, render: needsState(() => (
+      <StockPositionsPanel
+        token={token}
+        account={account}
+        openPositions={openPositions}
+        closedPositions={closedPositions}
+        symbols={symbols}
+        accountMode={accountMode}
+        tradierEnv={tradierEnv}
+      />
+    )) },
+    // TRA-600 — event-aware "AI Options Ideas" (Phase 3 of TRA-595).
+    { id: 'ideas', section: 'Options', label: 'AI Ideas', title: 'Ranked, defined-risk options ideas with earnings/Fed event context — paper entry only', render: () => <AiOptionsIdeasPanel token={token} /> },
+    // TRA-161 — read-only OTM scan; also on the Overview.
+    { id: 'otm', section: 'Options', label: 'Mispriced OTM', title: 'Out-of-the-money contracts whose mark diverges most from Black-Scholes theo — research only, no order entry', render: () => <OtmMispricingPanel token={token} symbols={symbols} /> },
+    { id: 'calendar', section: 'Reports & feeds', label: 'Calendar', dataTour: 'calendar', title: 'Daily P&L calendar and per-day EOD reports', render: () => (
+      <CalendarTab
+        token={token}
+        httpUrl={HTTP_URL}
+        // TRA-1604 — gate the firm-wide Desk calendar to admin accounts.
+        isAdmin={isAdmin}
+        mode={
+          accountMode === 'demo'
+            ? 'demo'
+            : tradierEnv === 'production' ? 'live' : 'sandbox'
+        }
+      />
+    ) },
+    { id: 'news', section: 'Reports & feeds', label: `News (${news.length})`, render: () => <NewsPanel news={news} loadingText="Loading market news…" /> },
+  ];
 
   return (
     <div className="app">
@@ -97,7 +168,7 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
         connected={connected}
         lastTick={state?.lastTick}
         autoTradingEnabled={autoTradingEnabled}
-        killSwitchEngaged={accountSettings?.globalKillSwitchEngaged ?? false}
+        killSwitchEngaged={killSwitchEngaged}
         tradingAgentsEnabled={state?.tradingAgentsEnabled ?? accountSettings?.tradingAgentsEnabled ?? false}
         tradingAgentsGatingEnabled={state?.tradingAgentsGatingEnabled ?? accountSettings?.tradingAgentsGatingEnabled ?? false}
         accountMode={accountMode}
@@ -160,133 +231,113 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
           the LIVE one and something in it needs an operator. */}
       <HiddenBookBanner exposure={state?.hiddenBookExposure ?? null} />
 
-      {/* TRA-690 — grouped nav: the core trading workflow (Watchlist → Signals →
-          Positions → Options → AI Ideas) stays flat; reference/utility surfaces
-          (News, Health) collapse into a "More ▾" dropdown so the bar stays clean
-          as features are added.
-          TRA-1158 — Calendar promoted out of "More" to a primary tab so the P&L
-          history is one click away and easy to scan. Its coach-mark anchor
-          (TRA-569 design §3.3) now rides on the Calendar tab itself; `moreTour`
-          falls back to the More trigger for any tour stop still inside it. */}
+      {/* TRA-4729 — two views. The old flat bar (TRA-690 grouping, TRA-1158
+          Calendar promotion) is now the Diagnostics sidebar below.
+          Coach-mark anchors (TRA-569): `signals` rides on the Diagnostics tab,
+          which is where Signals now lives; `positions` on the Overview's
+          positions section; `calendar` on its sidebar item. */}
       <TabBar
-        active={tab}
-        onSelect={setTab}
-        moreTour="news"
+        active={view}
+        onSelect={setView}
         primary={[
-          // TRA-569 — Signals/Positions coach-mark anchors point at their tabs.
-          { id: 'watchlist', label: `Watchlist (${symbols.length})` },
-          { id: 'signals', label: `Signals (${signals.length})`, dataTour: 'signals' },
-          // TRA-4626 — Swing signal fusion engine candidates (ranked 0-100).
-          { id: 'swing', label: `Swing (${swingSignals.length})`, title: 'Ranked swing trade options signals with composite scoring — observe-only' },
-          { id: 'proposals', label: 'Proposals' },
-          { id: 'positions', label: `Positions (${openPositions.length})`, dataTour: 'positions' },
-          { id: 'options', label: `Options (${openOptions.length})` },
-          // TRA-600 — event-aware "AI Options Ideas" surface (Phase 3 of TRA-595).
-          { id: 'ideas', label: 'AI Ideas', title: 'Ranked, defined-risk options ideas with earnings/Fed event context — paper entry only' },
-          // TRA-1158 — Calendar surfaced as a top-level tab (was under "More").
-          { id: 'calendar', label: 'Calendar', dataTour: 'calendar', title: 'Daily P&L calendar and per-day EOD reports' },
-        ]}
-        more={[
-          // TRA-161 — read-only OTM mispricing scan (no order entry; TRA-159).
-          { id: 'otm', label: 'Mispriced OTM', title: 'Out-of-the-money contracts whose mark diverges most from Black-Scholes theo — research only, no order entry' },
-          { id: 'news', label: `News (${news.length})` },
-          // TRA-539 — live reliability dashboard (TRA-528 /api/health/live).
-          { id: 'health', label: 'Health' },
+          { id: 'overview', label: 'Overview', title: 'Account & risk, proposals, open positions, OTM mispricing, validation progress' },
+          { id: 'diagnostics', label: 'Diagnostics', dataTour: 'signals', title: 'Watchlist, signals, swing, AI ideas, calendar, news, health and every other panel' },
         ]}
       />
 
       <main className="content">
-       {/* TRA-398 — per-tab error boundary. `key={tab}` remounts it on tab
-           switch so a render crash in one tab cannot white-screen the app. */}
-       <ErrorBoundary key={tab} label={`stocks:${tab}`} variant="panel">
-        {!state && (
+       {/* TRA-398 — per-view error boundary. `key={view}` remounts it on switch
+           so a render crash in one view cannot white-screen the app. The
+           Diagnostics view adds its own per-panel boundary inside. */}
+       <ErrorBoundary key={view} label={`stocks:${view}`} variant="panel">
+        {view === 'overview' && !state && (
           <div className="loading">
             <div className="spinner" />
             <p>Connecting to trading engine…</p>
           </div>
         )}
 
-        {state && tab === 'watchlist' && (
-          <StockWatchlistPanel token={token} symbols={symbols} />
+        {view === 'overview' && state && (
+          <div className="dashboard-primary">
+            <div className="dashboard-primary__top-row">
+              {/* 1 — Account / Risk. Equity breakdown plus the caps and the
+                  kill-switch STATE. The kill-switch BUTTON stays in the header
+                  (always visible): a second instance here would keep its own
+                  local state and could disagree with the first. */}
+              <section className="dashboard-primary__card" aria-label="Account and risk">
+                <h3>Account / Risk</h3>
+                <AccountSummaryCard account={account} accountMode={accountMode} />
+                <dl className="dashboard-primary__risk">
+                  <div>
+                    <dt>Options today</dt>
+                    <dd className={optionsState && optionsState.dailyOptionsCount >= optionsDailyLimit ? 'red' : ''}>
+                      {optionsState ? `${optionsState.dailyOptionsCount}/${optionsDailyLimit}` : '—'}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Kill switch</dt>
+                    <dd className={killSwitchEngaged ? 'red' : ''}>{killSwitchEngaged ? 'ENGAGED' : 'Off'}</dd>
+                  </div>
+                  <div>
+                    <dt>Trading</dt>
+                    <dd className={state.tradingHalted ? 'red' : ''}>{state.tradingHalted ? 'HALTED' : 'Running'}</dd>
+                  </div>
+                </dl>
+              </section>
+
+              {/* 2 — Proposals (approve / reject). */}
+              <section className="dashboard-primary__card" aria-label="Proposals">
+                <PendingProposalsPanel token={token} accountMode={accountMode} />
+              </section>
+
+              {/* 5 — Validation Progress (spec §1.2 puts it in the top row). */}
+              <section className="dashboard-primary__card" aria-label="Validation progress">
+                <ValidationProgressPanel token={token} />
+              </section>
+            </div>
+
+            {/* 3 — Open positions. The live sleeve is options, so the options
+                book always shows; the equity table joins it whenever the equity
+                book has anything open. Both stay available in full under
+                Diagnostics. */}
+            <section className="dashboard-primary__full-width" aria-label="Open positions">
+              <h3 data-tour="positions">Open Positions</h3>
+              <StockOptionsPanel
+                token={token}
+                tradierEnv={tradierEnv}
+                accountMode={accountMode}
+                account={account}
+                optionsState={optionsState}
+                openOptions={openOptions}
+                closedOptions={closedOptions}
+                optionsDailyLimit={optionsDailyLimit}
+                showAccountSummary={false}
+              />
+              {openPositions.length > 0 && (
+                <StockPositionsPanel
+                  token={token}
+                  account={account}
+                  openPositions={openPositions}
+                  closedPositions={closedPositions}
+                  symbols={symbols}
+                  accountMode={accountMode}
+                  tradierEnv={tradierEnv}
+                  showAccountSummary={false}
+                />
+              )}
+            </section>
+
+            {/* 4 — OTM Mispricing. Setup verdicts ("Why this trade?",
+                TRA-4719 reasons-not-to-enter) render on each proposal/signal
+                card, so they sit beside the proposal they judge. */}
+            <section className="dashboard-primary__full-width" aria-label="OTM mispricing">
+              <OtmMispricingPanel token={token} symbols={symbols} />
+            </section>
+          </div>
         )}
 
-        {state && tab === 'signals' && (
-          <StockSignalsPanel token={token} signals={signals} symbols={symbols} marketReview={state.marketReview} lastScanAt={state.lastScanAt} marketOpen={state.marketOpen} />
-        )}
-
-        {state && tab === 'swing' && (
-          <SwingSignalsPanel swingSignals={swingSignals} summary={state.swingScanSummary} />
-        )}
-
-        {state && tab === 'proposals' && (
-          <PendingProposalsPanel token={token} accountMode={accountMode} />
-        )}
-
-        {state && tab === 'positions' && (
-          <StockPositionsPanel
-            token={token}
-            account={account}
-            openPositions={openPositions}
-            closedPositions={closedPositions}
-            symbols={symbols}
-            accountMode={accountMode}
-            tradierEnv={tradierEnv}
-          />
-        )}
-
-        {state && tab === 'options' && (
-          <StockOptionsPanel
-            token={token}
-            tradierEnv={tradierEnv}
-            accountMode={accountMode}
-            account={account}
-            optionsState={optionsState}
-            openOptions={openOptions}
-            closedOptions={closedOptions}
-            optionsDailyLimit={optionsDailyLimit}
-          />
-        )}
-
-        {/* TRA-600 — the AI Options Ideas tab reads its own /api/options/ideas
-            feed (lands with C4) and falls back to a clearly-labelled preview
-            until then, so it renders without waiting for the engine snapshot. */}
-        {tab === 'ideas' && (
-          <AiOptionsIdeasPanel token={token} />
-        )}
-
-        {/* TRA-161 — reads its own /api/options/otm-mispricing scan and the
-            /api/health/options-mispricing diagnostics, so (like Health) it
-            renders without waiting for the engine snapshot. `symbols` only
-            seeds the selector; an empty watchlist still allows a manual scan. */}
-        {tab === 'otm' && (
-          <OtmMispricingPanel token={token} symbols={symbols} />
-        )}
-
-        {tab === 'news' && (
-          <NewsPanel news={news} loadingText="Loading market news…" />
-        )}
-
-        {tab === 'calendar' && (
-          <CalendarTab
-            token={token}
-            httpUrl={HTTP_URL}
-            // TRA-1604 — gate the firm-wide Desk calendar to admin accounts.
-            isAdmin={isAdmin}
-            mode={
-              accountMode === 'demo'
-                ? 'demo'
-                : tradierEnv === 'production' ? 'live' : 'sandbox'
-            }
-          />
-        )}
-
-        {/* TRA-539 — the Health tab reads its own `/api/health/live` endpoint
-            and is independent of the WebSocket engine snapshot, so it renders
-            without waiting for `state` (the surface that diagnoses a dead Live
-            session must work even when the engine feed is the thing that's
-            broken). */}
-        {tab === 'health' && (
-          <HealthPanel token={token} />
+        {view === 'diagnostics' && (
+          <DiagnosticsView items={diagnosticsItems} active={diagTab} onSelect={setDiagTab} />
         )}
        </ErrorBoundary>
       </main>
