@@ -5171,6 +5171,28 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // hour ago and has since been pruned no longer reads identically to one that was
   // never full. Booleans and ages only — the byte and inode figures stay behind
   // admin auth on `/api/health/storage/detail` (TRA-2599) and this route is open.
+  /**
+   * TRA-4607 — progress toward the net-of-fee forward-validation bar, measured
+   * off the LIVE fee/slippage ledger rather than read from a stale report.
+   *
+   * Read-only. No order path, no balances, no PII — round-trip counts, σ, and
+   * the required-N those imply.
+   *
+   * ⛔ `unmeasured: true` is NOT a failing grade. It means no graded sleeve has a
+   * priced round-trip yet, which is a different fact from "the sleeves lost
+   * money", and `excluded` says where the rows went.
+   */
+  app.get('/api/health/validation-progress', (_req, res) => {
+    const report = computeValidationProgress();
+    res.json({
+      ok: true,
+      issue: 'TRA-4607',
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      ...report,
+    });
+  });
+
   app.get('/api/health/durability', (_req, res) => {
     const dataDir = process.env.DATA_DIR ?? null;
     const etDay = etDateString(new Date(now()));
