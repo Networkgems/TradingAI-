@@ -90,6 +90,12 @@ export interface ValidationProgressReport {
   coverage: LiveOptionEvidenceCoverage | null;
   /** Round-trips the harness could price. */
   roundTrips: number;
+  /**
+   * TRA-4730 — of `roundTrips`, those paired to a pre-TRA-3977 UNATTRIBUTED
+   * open by symbol alone (see `RoundTrip.openBookInferred`). An inference, so
+   * it is counted, never folded silently into the cohort.
+   */
+  roundTripsWithInferredOpenBook: number;
   excluded: ValidationProgressExclusions;
   sleeves: SleeveProgress[];
   /**
@@ -229,6 +235,7 @@ export function computeValidationProgress(
     fillsSeen: records.length,
     coverage,
     roundTrips: roundTrips.length,
+    roundTripsWithInferredOpenBook: roundTrips.filter((t) => t.openBookInferred).length,
     excluded,
     sleeves,
     unmeasured,

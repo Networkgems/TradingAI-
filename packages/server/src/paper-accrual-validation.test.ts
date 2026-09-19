@@ -33,7 +33,7 @@ function fill(over: Partial<HarnessFill> = {}): HarnessFill {
 }
 
 describe('pairFillsIntoRoundTrips', () => {
-  it('prices a clean round-trip net of BOTH cost layers', () => {
+  it('prices a clean round-trip: net = fill-to-fill − fees; the spread is ATTRIBUTED, not deducted again', () => {
     const { roundTrips, unpaired } = pairFillsIntoRoundTrips([
       fill({ ts: 1, side: 'buy_to_open', filledPrice: 1.0, midAtSubmit: 0.98, fees: 1.3 }),
       fill({ ts: 2, side: 'sell_to_close', filledPrice: 1.5, midAtSubmit: 1.52, fees: 1.3 }),
@@ -41,25 +41,70 @@ describe('pairFillsIntoRoundTrips', () => {
     expect(unpaired).toHaveLength(0);
     expect(roundTrips).toHaveLength(1);
     const t = roundTrips[0]!;
-    // gross = (1.50 − 1.00) × 100 = 50
+    // gross = (1.50 − 1.00) × 100 = 50 — on FILL prices, so the 4¢ crossed is already in it
     expect(t.grossPnl).toBeCloseTo(50, 6);
     expect(t.fees).toBeCloseTo(2.6, 6);
-    // slippage = |1.00−0.98|×100 + |1.50−1.52|×100 = 2 + 2 = 4
+    // slippage = (1.00−0.98)×100 + (1.52−1.50)×100 = 2 + 2 = 4
     expect(t.slippageCost).toBeCloseTo(4, 6);
-    expect(t.netPnl).toBeCloseTo(50 - 2.6 - 4, 6);
-    expect(t.netReturnPct).toBeCloseTo(43.4 / 100, 6);
+    // TRA-4730: NOT 50 − 2.6 − 4. That charged the 4¢ a second time.
+    expect(t.netPnl).toBeCloseTo(50 - 2.6, 6);
+    expect(t.netReturnPct).toBeCloseTo(47.4 / 100, 6);
+    // The identity the attribution must satisfy: mid-to-mid − crossing − fees = net.
+    expect((1.52 - 0.98) * 100 - t.slippageCost - t.fees).toBeCloseTo(t.netPnl, 6);
   });
 
-  it('THE POINT: costs can flip a gross winner into a net loser', () => {
-    // A 3¢ gross gain on a contract with a 10¢ spread is a loss. This is the
-    // entire reason the gate is "net of fee" and not "profitable".
+  it('THE POINT: the crossing can flip a mid-to-mid winner into a cash loser', () => {
+    // The mid rose 3¢, but 5¢ was paid to get in and 5¢ to get out. The fills
+    // carry that: gross is −7, and nothing needs subtracting on top of it.
     const { roundTrips } = pairFillsIntoRoundTrips([
       fill({ ts: 1, side: 'buy_to_open', filledPrice: 1.05, midAtSubmit: 1.0, fees: 1.3 }),
-      fill({ ts: 2, side: 'sell_to_close', filledPrice: 1.08, midAtSubmit: 1.13, fees: 1.3 }),
+      fill({ ts: 2, side: 'sell_to_close', filledPrice: 0.98, midAtSubmit: 1.03, fees: 1.3 }),
     ]);
     const t = roundTrips[0]!;
-    expect(t.grossPnl).toBeGreaterThan(0);
-    expect(t.netPnl).toBeLessThan(0);
+    expect(t.slippageCost).toBeCloseTo(10, 6);
+    expect(t.grossPnl).toBeCloseTo(-7, 6);
+    expect(t.netPnl).toBeCloseTo(-7 - 2.6, 6);
+  });
+
+  it('price improvement is SIGNED negative, never charged as a cost (TRA-4730, RIG exit 0.18 vs 0.16 mid)', () => {
+    const { roundTrips } = pairFillsIntoRoundTrips([
+      fill({ ts: 1, side: 'buy_to_open', filledPrice: 0.33, midAtSubmit: 0.33, fees: 0.11 }),
+      fill({ ts: 2, side: 'sell_to_close', filledPrice: 0.18, midAtSubmit: 0.16, fees: 0.13 }),
+    ]);
+    const t = roundTrips[0]!;
+    expect(t.slippageCost).toBeCloseTo(-2, 6);
+    // Tradier `gainloss` for this lot: −15.24.
+    expect(t.netPnl).toBeCloseTo(-15.24, 6);
+  });
+
+  it('a stamped close pairs to an UNATTRIBUTED open of its symbol, flagged (TRA-4730)', () => {
+    const { roundTrips, unpaired } = pairFillsIntoRoundTrips([
+      fill({ ts: 1, side: 'buy_to_open', book: null, filledPrice: 0.71 }),
+      fill({ ts: 2, side: 'sell_to_close', book: 'v0nni', filledPrice: 0.75 }),
+    ]);
+    expect(unpaired).toHaveLength(0);
+    expect(roundTrips).toHaveLength(1);
+    expect(roundTrips[0]!.openBookInferred).toBe(true);
+    expect(roundTrips[0]!.book).toBe('v0nni');
+  });
+
+  it('prefers the close\'s OWN book before any unattributed open, and never crosses two named books', () => {
+    const own = pairFillsIntoRoundTrips([
+      fill({ ts: 1, side: 'buy_to_open', book: null, filledPrice: 0.5 }),
+      fill({ ts: 2, side: 'buy_to_open', book: 'admin', filledPrice: 0.9 }),
+      fill({ ts: 3, side: 'sell_to_close', book: 'admin', filledPrice: 1.0 }),
+    ]);
+    expect(own.roundTrips).toHaveLength(1);
+    expect(own.roundTrips[0]!.openPrice).toBe(0.9);
+    expect(own.roundTrips[0]!.openBookInferred).toBe(false);
+    expect(own.unpaired.map((u) => u.reason)).toEqual(['still_open']);
+
+    const crossed = pairFillsIntoRoundTrips([
+      fill({ ts: 1, side: 'buy_to_open', book: 'admin' }),
+      fill({ ts: 2, side: 'sell_to_close', book: 'v0nni', filledPrice: 1.5 }),
+    ]);
+    expect(crossed.roundTrips).toHaveLength(0);
+    expect(crossed.unpaired.map((u) => u.reason).sort()).toEqual(['no_matching_open', 'still_open']);
   });
 
   it('refuses to price a fill with an UNREPORTED fee — null is not zero (TRA-1707)', () => {
@@ -142,6 +187,7 @@ describe('computeCohortStats', () => {
       slippageCost: 0,
       netPnl: r * 100,
       netReturnPct: r,
+      openBookInferred: false,
     }));
   }
 
@@ -223,6 +269,7 @@ describe('gradeSleeve', () => {
         slippageCost: 0,
         netPnl: r * 100,
         netReturnPct: r,
+        openBookInferred: false,
       };
     });
   }

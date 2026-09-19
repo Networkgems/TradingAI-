@@ -33,6 +33,10 @@
  *  2. IMPLICIT — the spread actually crossed, measured as fill vs. the MID at
  *     submit. This is the cost most cost models omit, and on a wide-spread
  *     option it routinely exceeds commission by an order of magnitude.
+ *     ⛔ It is ALREADY INSIDE the P&L, because the P&L is built from the fill
+ *     prices. It is published as an ATTRIBUTION (`slippageCost`) and never
+ *     deducted a second time (TRA-4730: deducting it charged the OTM sleeve's
+ *     $79.50 of crossing twice and served −$18.86/trade against −$5.61 cash).
  *  3. COMPOUNDING — returns are chained multiplicatively, not summed. A simple
  *     mean of per-trade percentages overstates a series containing losses.
  *  4. RECONCILIATION — every round-trip is built from two REAL ledger rows.
@@ -98,18 +102,32 @@ export interface RoundTrip {
   contracts: number;
   openPrice: number;
   closePrice: number;
-  /** (close − open) × 100 × contracts. Before any cost. */
+  /**
+   * (close − open) × 100 × contracts, on FILL prices. Before fees — but AFTER
+   * the spread: a fill price already includes whatever was paid to cross.
+   */
   grossPnl: number;
   /** Explicit costs: commission + per-contract + regulatory, both legs. */
   fees: number;
   /**
-   * Implicit cost: |fill − mid| × 100 × contracts, summed across both legs.
+   * Implicit cost, SIGNED, as an ATTRIBUTION of `grossPnl` — entry
+   * (fill − mid) + exit (mid − fill), × 100 × contracts. Positive = crossing
+   * paid; a leg filled better than mid (price improvement) is negative.
    * Reported separately from `fees` because they have different remedies —
    * commission is negotiated, spread is a routing and liquidity decision.
+   *
+   * ⛔ NOT deducted from `netPnl` (TRA-4730). It is already inside `grossPnl`;
+   * the identity is (exitMid − entryMid) × 100 × q − slippageCost − fees = netPnl.
    */
   slippageCost: number;
-  /** grossPnl − fees − slippageCost. The number the gate actually grades. */
+  /** grossPnl − fees. Cash P&L; the number the gate actually grades. */
   netPnl: number;
+  /**
+   * TRA-4730 — TRUE when the close carried a book but its open was a pre-TRA-3977
+   * UNATTRIBUTED (`book: null`) row, and the pair was made on the symbol alone.
+   * Counted rather than hidden: it is an inference, not a ledger fact.
+   */
+  openBookInferred: boolean;
   /** netPnl as a fraction of capital at risk (open premium × 100 × contracts). */
   netReturnPct: number;
 }
@@ -138,6 +156,9 @@ export interface PairingResult {
  *
  * Partial closes are supported: a close consumes from the front of the open
  * queue and leaves any remainder queued.
+ *
+ * A stamped close its own book cannot satisfy falls back to UNATTRIBUTED
+ * (`book: null`) opens of the same symbol, flagged `openBookInferred` (TRA-4730).
  *
  * ⚠ A fill missing `filledPrice`, `fees`, or `midAtSubmit` is NOT priced and NOT
  * counted. `null` is UNMEASURED, never zero (TRA-1707): treating an unreported
@@ -178,56 +199,72 @@ export function pairFillsIntoRoundTrips(fills: readonly HarnessFill[]): PairingR
 
     // sell_to_close — consume FIFO from the open queue.
     let toClose = fill.contracts;
-    const q = openQueues.get(key) ?? [];
-    while (toClose > 0 && q.length > 0) {
-      const lot = q[0]!;
-      const matched = Math.min(lot.remaining, toClose);
+    const consume = (q: { fill: HarnessFill; remaining: number }[], openBookInferred: boolean) => {
+      while (toClose > 0 && q.length > 0) {
+        const lot = q[0]!;
+        const matched = Math.min(lot.remaining, toClose);
 
-      const openPrice = lot.fill.filledPrice!;
-      const closePrice = fill.filledPrice!;
-      const grossPnl = (closePrice - openPrice) * CONTRACT_MULTIPLIER * matched;
+        const openPrice = lot.fill.filledPrice!;
+        const closePrice = fill.filledPrice!;
+        // Fill-to-fill: the spread paid on both legs is already in here.
+        const grossPnl = (closePrice - openPrice) * CONTRACT_MULTIPLIER * matched;
 
-      // Fees are per-FILL; apportion by the fraction of each leg consumed.
-      const openFeeShare = (lot.fill.fees! * matched) / lot.fill.contracts;
-      const closeFeeShare = (fill.fees! * matched) / fill.contracts;
+        // Fees are per-FILL; apportion by the fraction of each leg consumed.
+        const openFeeShare = (lot.fill.fees! * matched) / lot.fill.contracts;
+        const closeFeeShare = (fill.fees! * matched) / fill.contracts;
 
-      // Implicit cost: distance from mid, both legs, always a COST (abs) —
-      // a fill better than mid is price improvement, not negative friction we
-      // get to book as profit twice.
-      const openSlip =
-        Math.abs(openPrice - lot.fill.midAtSubmit!) * CONTRACT_MULTIPLIER * matched;
-      const closeSlip = Math.abs(closePrice - fill.midAtSubmit!) * CONTRACT_MULTIPLIER * matched;
+        // Implicit cost, SIGNED, as an attribution of grossPnl — entry pays
+        // fill − mid, exit pays mid − fill. A fill better than mid is price
+        // improvement and reads negative. ⛔ Never deducted again (TRA-4730):
+        // the old `grossPnl − fees − |fill − mid|` charged the spread twice and
+        // turned RIG's 2¢ exit improvement into a $2 cost.
+        const openSlip = (openPrice - lot.fill.midAtSubmit!) * CONTRACT_MULTIPLIER * matched;
+        const closeSlip = (fill.midAtSubmit! - closePrice) * CONTRACT_MULTIPLIER * matched;
 
-      const fees = openFeeShare + closeFeeShare;
-      const slippageCost = openSlip + closeSlip;
-      const netPnl = grossPnl - fees - slippageCost;
-      const capitalAtRisk = openPrice * CONTRACT_MULTIPLIER * matched;
+        const fees = openFeeShare + closeFeeShare;
+        const slippageCost = openSlip + closeSlip;
+        const netPnl = grossPnl - fees;
+        const capitalAtRisk = openPrice * CONTRACT_MULTIPLIER * matched;
 
-      roundTrips.push({
-        sleeve: lot.fill.sleeve,
-        book: lot.fill.book,
-        optionSymbol: lot.fill.optionSymbol,
-        // A pair is only 'live' if BOTH legs were. A paper leg anywhere makes
-        // the round-trip paper evidence.
-        source: lot.fill.source === 'live' && fill.source === 'live' ? 'live' : 'paper',
-        openTs: lot.fill.ts,
-        closeTs: fill.ts,
-        daysHeld: Math.max(0, (fill.ts - lot.fill.ts) / 86_400_000),
-        contracts: matched,
-        openPrice,
-        closePrice,
-        grossPnl,
-        fees,
-        slippageCost,
-        netPnl,
-        netReturnPct: capitalAtRisk > 0 ? netPnl / capitalAtRisk : 0,
-      });
+        roundTrips.push({
+          sleeve: lot.fill.sleeve,
+          book: lot.fill.book ?? fill.book,
+          optionSymbol: lot.fill.optionSymbol,
+          // A pair is only 'live' if BOTH legs were. A paper leg anywhere makes
+          // the round-trip paper evidence.
+          source: lot.fill.source === 'live' && fill.source === 'live' ? 'live' : 'paper',
+          openTs: lot.fill.ts,
+          closeTs: fill.ts,
+          daysHeld: Math.max(0, (fill.ts - lot.fill.ts) / 86_400_000),
+          contracts: matched,
+          openPrice,
+          closePrice,
+          grossPnl,
+          fees,
+          slippageCost,
+          netPnl,
+          netReturnPct: capitalAtRisk > 0 ? netPnl / capitalAtRisk : 0,
+          openBookInferred,
+        });
 
-      lot.remaining -= matched;
-      toClose -= matched;
-      if (lot.remaining <= 0) q.shift();
+        lot.remaining -= matched;
+        toClose -= matched;
+        if (lot.remaining <= 0) q.shift();
+      }
+    };
+    consume(openQueues.get(key) ?? [], false);
+
+    // TRA-4730 — the book stamp (TRA-3977) landed 08-27, so a position opened
+    // before it and closed after it has a `book: null` open and a stamped
+    // close. Keyed strictly they never meet: the close reads `no_matching_open`
+    // and the open `still_open` forever (BULL, ETHA, NVTS13 on the live
+    // ledger). `null` is UNKNOWN, not a distinct book, so a stamped close that
+    // its own book cannot satisfy may consume an unattributed open of the same
+    // symbol — FIFO, and flagged `openBookInferred`. Never the reverse, and
+    // never one named book's open for another named book's close.
+    if (toClose > 0 && fill.book !== null) {
+      consume(openQueues.get(`\u0000${fill.optionSymbol}`) ?? [], true);
     }
-    openQueues.set(key, q);
 
     if (toClose > 0) {
       // Closed more than we ever opened — an imported position, or a gap in the
