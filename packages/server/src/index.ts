@@ -7982,6 +7982,10 @@ app.get('/api/health/live-capital-gate', async (_req, res) => {
       // Whoever makes that change re-opens TRA-3611. Ratified as a PARAMETER change, not a
       // redesign (TRA-2346 Q3) — the door is open, it is just not walked through today.
       power: gate.power,
+      // TRA-4735 (CFO ruling TRA-4734) — the working behind `positive_expectancy`,
+      // readable in every state: mean, iid + three CR1 cluster-robust SEs, SE_eff,
+      // the 2σ bounds, the bar, and which rule decided it.
+      expectancyInterval: gate.expectancyInterval,
       // TRA-4646 (AC3) — the debit-sleeve retirement comparison: before (all
       // structures) vs after (credit-only) nRequired / sigmaUsed / feasibility
       // verdict / ceilingSources, computed on EVERY read regardless of the flag so

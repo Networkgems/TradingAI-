@@ -14,6 +14,9 @@ import {
   TARGET_EFFECT_R,
   type GatePowerResult,
 } from './gate-power.js';
+// TRA-4735 (CFO ruling TRA-4734) — the one-sided 2σ interval that lets
+// `positive_expectancy` grade FAIL below power when the interval excludes the bar.
+import { buildExpectancyInterval, type ExpectancyInterval } from './gate-expectancy-interval.js';
 
 // TRA-601 (TRA-595 C6) — the AI-Options-Ideas LIVE-CAPITAL GATE.
 //
@@ -121,6 +124,10 @@ export function resolveLiveCapitalGateCriteria(
  * It attaches to BOTH `sample_size` and `positive_expectancy`, pre-empting `FAIL` AND
  * `PASS` (a mean clearing the bar on an unpowered sample is a coin flip, not evidence).
  * Precedence: `INFEASIBLE` > `UNDERPOWERED` > `FAIL`/`PASS`. `pass: false` always.
+ *
+ * TRA-4735 — on `positive_expectancy` only, a FAIL whose 2σ upper bound (cluster-robust
+ * SE_eff) sits below the bar is ANSWERED and outranks UNDERPOWERED:
+ * `INFEASIBLE` > interval-`FAIL` > `UNDERPOWERED` > `FAIL`/`PASS`.
  */
 export type GateCriterionStatus = 'PASS' | 'FAIL' | 'INFEASIBLE' | 'UNDERPOWERED';
 
@@ -185,6 +192,12 @@ export interface LiveCapitalGateResult {
    * `/api/health/live-capital-gate` as `power`.
    */
   power: GatePowerResult;
+  /**
+   * TRA-4735 — the working behind `positive_expectancy`: mean, the iid + three CR1
+   * cluster-robust SEs, SE_eff (their max), the 2σ bounds, the bar, and `decidedBy`.
+   * Published in EVERY state as `expectancyInterval` on the gate route.
+   */
+  expectancyInterval: ExpectancyInterval;
   /** One-line plain-English disposition. */
   summary: string;
   /** Standing reminder that a pass is permission-to-propose, not auto-wiring. */
@@ -311,15 +324,44 @@ export function evaluateLiveCapitalGate(
   // TRA-3368 — precedence `INFEASIBLE` > `UNDERPOWERED` > `FAIL`/`PASS`: when the bar is
   // unreachable, accruing the required sample resolves nothing, so INFEASIBLE (whose
   // headline says exactly that) must win over a status whose remedy is "accrue more".
-  // Below it, UNDERPOWERED pre-empts BOTH plain verdicts — a FAIL here would assert the
-  // book underperformed a bar it could have cleared, and a PASS would promote on a
-  // coin flip; neither is a fact this sample can carry.
+  // Below it, UNDERPOWERED pre-empts PASS — a PASS would promote on a coin flip.
+  //
+  // TRA-4735 (CFO ruling TRA-4734) — but it no longer pre-empts FAIL unconditionally.
+  // `n_req` is a design-stage sample size, not a stopping rule: when the whole 2σ
+  // interval (SE_eff = max of iid + three CR1 cluster-robust SEs) already sits below
+  // the bar, the one-sided question is answered and more sample would only narrow an
+  // interval that excludes the bar. FAIL there additionally requires the hard floors
+  // (n ≥ minResolvedIdeas, weeks ≥ minWeeksWithResolved). ASYMMETRIC by design — the
+  // interval can only ever produce FAIL; PASS still needs `powered` ∧ measured pass.
+  // An uncomputable SE_eff never FAILs (fail-closed toward "no verdict").
+  const interval = buildExpectancyInterval(t.expectancySe, criteria.minExpectancyR);
+  const intervalFail =
+    interval.upperBelowBar &&
+    t.resolved >= criteria.minResolvedIdeas &&
+    t.weeksWithResolved >= criteria.minWeeksWithResolved;
   const expectancyStatus: GateCriterionStatus =
     barUnreachable || sleeveBlocking
       ? 'INFEASIBLE'
-      : !power.powered
-        ? 'UNDERPOWERED'
-        : plain(expectancyMeasuredPass);
+      : intervalFail
+        ? 'FAIL'
+        : !power.powered
+          ? 'UNDERPOWERED'
+          : plain(expectancyMeasuredPass);
+  const expectancyInterval: ExpectancyInterval = {
+    ...interval,
+    decidedBy:
+      expectancyStatus === 'INFEASIBLE' || expectancyStatus === 'UNDERPOWERED'
+        ? null
+        : intervalFail
+          ? 'upper_bound_below_bar'
+          : 'powered',
+  };
+  const fmtR = (v: number | null): string =>
+    v == null ? 'n/a' : `${v >= 0 ? '+' : ''}${v.toFixed(4)}R`;
+  const intervalFailNote =
+    expectancyInterval.decidedBy === 'upper_bound_below_bar'
+      ? `⛔ FAIL (TRA-4735) — the ${POWER_CONFIDENCE_SIGMA}σ upper bound on cost-net expectancy is ${fmtR(interval.upper2Sigma)} (mean ${fmtR(interval.mean)} + ${POWER_CONFIDENCE_SIGMA}×SE_eff ${interval.seEff?.toFixed(4)}R, the max of iid ${interval.seIid?.toFixed(4)} / CR1 resolved-week ${interval.seClusterResolvedWeek?.toFixed(4)} (G=${interval.clusters.resolvedWeek}) / CR1 surfaced-week ${interval.seClusterSurfacedWeek?.toFixed(4)} (G=${interval.clusters.surfacedWeek}) / CR1 ticker ${interval.seClusterTicker?.toFixed(4)} (G=${interval.clusters.ticker})), BELOW the ${criteria.minExpectancyR}R bar, on n=${t.resolved} over ${t.weeksWithResolved} weeks. More sample would only narrow an interval that already excludes the bar — this is a fact about the BOOK, not a shortfall of evidence.`
+      : null;
 
   /**
    * The clause the headline prints for an INFEASIBLE criterion.
@@ -389,7 +431,10 @@ export function evaluateLiveCapitalGate(
       // TRA-3368 — `power.powered` is the SAME move again: a new conjunct, monotone
       // non-increasing, pre-empting PASS because a mean clearing the bar on an
       // unpowered sample is a coin flip, not evidence.
-      pass: !barUnreachable && !sleeveBlocking && power.powered && expectancyMeasuredPass,
+      // TRA-4735 — `expectancyStatus` is PASS exactly on
+      // `!barUnreachable ∧ !sleeveBlocking ∧ powered ∧ measured pass` (the interval rule
+      // only ever adds FAIL), so this is the same conjunction, stated once.
+      pass: expectancyStatus === 'PASS',
       status: expectancyStatus,
       barR: criteria.minExpectancyR,
       // ⚠️ Still the BOOK ceiling — the number the book verdict was derived from. On a
@@ -419,6 +464,7 @@ export function evaluateLiveCapitalGate(
         // opposite ways, and a note saying "more sample is the only remedy" beside a
         // headline saying "more sample cannot resolve it" would be self-contradicting.
         expectancyStatus === 'UNDERPOWERED' ? underpoweredNote : null,
+        intervalFailNote,
         feasibility.reason,
         sleeveFeasibility.note == null ? null : `⚠️ ${sleeveFeasibility.note}`,
       ]
@@ -469,7 +515,12 @@ export function evaluateLiveCapitalGate(
     ? 'PASS — forward-test track record clears every documented criterion; live-capital wiring may now be PROPOSED (not auto-enabled).'
     : infeasible.length > 0
       ? `INFEASIBLE — live capital stays gated, and ${infeasible.length === 1 ? 'one criterion CANNOT BE TESTED' : `${infeasible.length} criteria CANNOT BE TESTED`} against this book: ${infeasible.map(infeasibleClause).join('; ')}. This is NOT a shortfall of evidence and MORE SAMPLE CANNOT RESOLVE IT — re-derive the bar or change the instrument.${failed.filter((n) => !infeasible.some((c) => c.name === n)).length > 0 ? ` Also unmet: ${failed.filter((n) => !infeasible.some((c) => c.name === n)).join(', ')}.` : ''}`
-      : underpowered.length > 0
+      : intervalFailNote != null
+        ? // TRA-4735 — the expectancy question is ANSWERED, so the headline must not say
+          // "MORE SAMPLE IS THE ONLY REMEDY". `sample_size` may still read UNDERPOWERED;
+          // that is a statement about resolving ±δ, not about this verdict.
+          `FAIL — live capital stays gated: positive_expectancy's ${POWER_CONFIDENCE_SIGMA}σ upper bound ${fmtR(expectancyInterval.upper2Sigma)} (mean ${fmtR(expectancyInterval.mean)}, SE_eff ${expectancyInterval.seEff?.toFixed(4)}R = max of iid and three cluster-robust SEs) is BELOW the ${criteria.minExpectancyR}R bar. More sample would only narrow an interval that already excludes the bar.${underpowered.length > 0 ? ` (${underpowered.map((c) => c.name).join(', ')} still read UNDERPOWERED — the sample cannot resolve ±${TARGET_EFFECT_R}R, which does not reopen a bar the interval already excludes.)` : ''}${failed.filter((n) => n !== 'positive_expectancy' && !underpowered.some((c) => c.name === n)).length > 0 ? ` Also unmet: ${failed.filter((n) => n !== 'positive_expectancy' && !underpowered.some((c) => c.name === n)).join(', ')}.` : ''}`
+        : underpowered.length > 0
         ? `UNDERPOWERED — live capital stays gated: at δ = ${TARGET_EFFECT_R}R and ${POWER_CONFIDENCE_SIGMA}σ the graded sample cannot resolve the expectancy bar (required n ≥ ${power.nRequired ?? 'uncomputable — σ degenerate'}, observed ${power.nObserved}; forced by ${power.forcedBy.join(', ')}). A PASS or FAIL from this sample would be a coin flip. This IS a shortfall of evidence and MORE SAMPLE IS THE ONLY REMEDY — the bar and the instrument stay as written.${failed.filter((n) => !underpowered.some((c) => c.name === n)).length > 0 ? ` Also unmet: ${failed.filter((n) => !underpowered.some((c) => c.name === n)).join(', ')}.` : ''}`
         : `HOLD — live capital stays gated. Unmet: ${failed.join(', ')}.`;
 
@@ -497,6 +548,7 @@ export function evaluateLiveCapitalGate(
     feasibility,
     sleeveFeasibility,
     power,
+    expectancyInterval,
     summary,
     note:
       'A passing gate is permission to PROPOSE live wiring to the board — it enables no orders. Live ' +

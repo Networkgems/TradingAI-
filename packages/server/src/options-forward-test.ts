@@ -47,6 +47,11 @@ import {
   type GatePowerInputs,
   type SleevePowerObservation,
 } from './gate-power.js';
+// TRA-4735 — the cluster-robust SE estimators behind the one-sided expectancy FAIL.
+import {
+  computeExpectancySeEstimates,
+  type ExpectancySeEstimates,
+} from './gate-expectancy-interval.js';
 // TRA-2208 — the floor + its governed families, imported (not restated) so the
 // counterfactual this probe reports is measured against the exact bar the emission
 // gate enforces. See `CellCreditWidthFloor`.
@@ -597,6 +602,13 @@ export interface ForwardTestReport {
      * two axes as `ceilingAxes` — never a re-derived population.
      */
     powerInputs: GatePowerInputs;
+    /**
+     * TRA-4735 — iid + three CR1 cluster-robust SEs (resolved ISO week, surfaced week,
+     * ticker) of the cost-net mean, over the SAME graded array. Optional so legacy /
+     * hand-built reports still type-check; absent reads as uncomputable, which can
+     * never grade `positive_expectancy` FAIL (fail-closed toward no verdict).
+     */
+    expectancySe?: ExpectancySeEstimates;
     wins: number;
     losses: number;
     scratches: number;
@@ -1203,6 +1215,15 @@ export function buildForwardTestReport(
       ceilingAxes,
       // TRA-3368 — power observations over the SAME graded set, on the SAME axes.
       powerInputs: computePowerInputs(resolved),
+      // TRA-4735 — same graded array, same `pnlNetR ?? 0` fold as expectancyNetR.
+      expectancySe: computeExpectancySeEstimates(
+        resolved.map((o) => ({
+          x: o.pnlNetR ?? 0,
+          resolvedWeek: o.valuedAt ? isoWeek(o.valuedAt) : 'unknown',
+          surfacedWeek: o.surfacedWeek,
+          ticker: o.ticker,
+        })),
+      ),
       wins: wins.length,
       losses: losses.length,
       scratches: scratches.length,
