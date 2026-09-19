@@ -576,7 +576,13 @@ export async function runOptimization(
 
 // ── Report writers (spec §8) ──────────────────────────────────────────────────
 
-function writeReports(report: OptimizationReport): void {
+// TRA-4722 — exported, not renamed. TRA-4629 removed the CLI entry that called
+// this, orphaning it, and the note at the foot of this file directs callers to
+// `runOptimization(...)` + `writeReports(report)`. `runOptimization` is already
+// exported; this is its documented companion, so the honest fix is to finish
+// making it public rather than to underscore-prefix a function the docs tell
+// people to call.
+export function writeReports(report: OptimizationReport): void {
   const here = dirname(fileURLToPath(import.meta.url));
   const root = resolve(here, '..');
 

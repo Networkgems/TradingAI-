@@ -244,11 +244,19 @@ describe('TRA-3595 dry run', () => {
     // `2026-08-10` (dividend — deliberately NOT reclassified by TRA-2906) must
     // not move; if they did, the change under test would not be the fee rule.
     expect(book.movedDates?.map(m => m.date)).toEqual(['2026-07-07', '2026-08-03']);
-    const jul7 = book.movedDates?.find(m => m.date === '2026-07-07')!;
+    // TRA-4722 — bind the array once and assert it is present, rather than
+    // `book.movedDates?.find(...)!`. That idiom pairs an optional chain with a
+    // non-null assertion, which lints (no-non-null-asserted-optional-chain) and
+    // is genuinely unsafe: when `movedDates` is undefined the chain yields
+    // undefined and the `!` asserts it away, so the four expects below would
+    // throw a TypeError instead of failing on the value they exist to check.
+    const moved = book.movedDates;
+    expect(moved).toBeDefined();
+    const jul7 = moved!.find(m => m.date === '2026-07-07')!;
     expect(jul7.before).toBe(290);
     expect(jul7.after).toBe(300);   // the fee stops being subtracted from flow…
     expect(jul7.pnlShift).toBe(-10); // …so reported P&L drops by exactly the fee
-    const aug3 = book.movedDates?.find(m => m.date === '2026-08-03')!;
+    const aug3 = moved!.find(m => m.date === '2026-08-03')!;
     expect(aug3.before).toBe(-10);
     expect(aug3.after).toBe(0);     // a fee-only day leaves netByDate entirely
     expect(aug3.pnlShift).toBe(-10);

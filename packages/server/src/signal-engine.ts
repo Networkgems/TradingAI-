@@ -386,7 +386,6 @@ import {
 import {
   auditEquityExit,
   auditEquityFill,
-  auditIntervention,
   auditOptionExit,
   auditOptionFill,
   auditSignalFired,

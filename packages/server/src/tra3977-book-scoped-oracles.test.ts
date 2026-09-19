@@ -55,6 +55,21 @@ const ADMIN = 'admin';
 const V0NNI = 'v0nni';
 const T0 = Date.parse('2026-08-20T13:35:30Z');
 
+// TRA-4722 — the hydrate arms pin the clock.
+//
+// `hydrateLiveOptionsFeeSlippageFromDisk` drops any row older than RETAIN_MS
+// (30 days) against its `now` argument, which defaults to `Date.now()`. T0 is a
+// fixed 2026-08-20, so these arms were a TIME BOMB: they passed for thirty days
+// and began failing on 2026-09-19, when T0 aged out of the window and the row
+// under test was retained by the writer but discarded by the reader. The
+// failure looked like a persistence regression and was a stale fixture.
+//
+// Passing an explicit `now` makes the arm deterministic — it grades the
+// retention RULE rather than the wall clock — and the `now` used is one hour
+// after T0, so the row is unambiguously inside the window.
+const HYDRATE_NOW = T0 + 3_600_000;
+
+
 function open(
   book: string | null,
   contracts: number,
@@ -383,7 +398,7 @@ describe('TRA-3977 AC4 — ⭐ NEGATIVE CONTROL: one book, and nothing changes',
     registerLiveOptionBook(V0NNI);
     const dir = mkdtempSync(join(tmpdir(), 'tra3977-hydrate-'));
     try {
-      const h = hydrateLiveOptionsFeeSlippageFromDisk(dir);
+      const h = hydrateLiveOptionsFeeSlippageFromDisk(dir, HYDRATE_NOW);
       expect(h.records).toBe(0);
       expect(bookScopingReachable()).toBe(true);
       expect(knownLiveOptionBooks()).toEqual([ADMIN, V0NNI]);
@@ -399,12 +414,12 @@ describe('TRA-3977 AC4 — ⭐ NEGATIVE CONTROL: one book, and nothing changes',
     const dir = mkdtempSync(join(tmpdir(), 'tra3977-hydrate-'));
     try {
       // Boot 1: one attributed fill lands and is persisted.
-      hydrateLiveOptionsFeeSlippageFromDisk(dir);
+      hydrateLiveOptionsFeeSlippageFromDisk(dir, HYDRATE_NOW);
       open(V0NNI, 1, 1.54, T0);
       expect(crossBookOpenEpisodeCensus().booksObserved).toEqual([V0NNI]);
       // Boot 2: nothing wired, the file is the only witness — and it is enough.
       clearLiveOptionsFeeSlippageLedger();
-      const h = hydrateLiveOptionsFeeSlippageFromDisk(dir);
+      const h = hydrateLiveOptionsFeeSlippageFromDisk(dir, HYDRATE_NOW);
       expect(h.records).toBe(1);
       const c = crossBookOpenEpisodeCensus();
       expect(c.booksWired).toEqual([]);
