@@ -5,6 +5,9 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { OptionTradeJournalRecord } from './option-trade-journal.js';
 import {
+  DTE_BOUND_MARGIN_DAYS,
+  dteBoundExpiryDate,
+  EXPIRED_DEMO_ORPHAN_DTE_BOUND_REASON,
   EXPIRED_DEMO_ORPHAN_REASON,
   occExpiryDate,
   planExpiredDemoOrphans,
@@ -164,5 +167,85 @@ describe('runExpiredDemoOrphanSweep', () => {
     const s = await runExpiredDemoOrphanSweep(d);
     expect(s.lastOutcome).toBe('error');
     expect(s.lastError).toBe('disk');
+  });
+});
+
+// TRA-4721 — 28 demo rows from 2026-06-25..07-10 carry no OCC and no account.
+// Their own openTs + entryDte bounds the expiry; past bound + margin and held by
+// no book ⇒ voided under a distinct reason. Anything the bound cannot prove
+// stays `unparseable`.
+describe('TRA-4721 DTE bound for rows with no OCC', () => {
+  const legacy = (overrides: Partial<OptionTradeJournalRecord>) =>
+    row({ optionSymbol: undefined, account: undefined, ...overrides });
+
+  it('bounds expiry at ET open date + entryDte + margin', () => {
+    // 2026-06-25T13:35Z is 09:35 ET on 06-25; +52d = 08-16; +7d margin = 08-23.
+    expect(DTE_BOUND_MARGIN_DAYS).toBe(7);
+    expect(dteBoundExpiryDate(legacy({ openTs: Date.parse('2026-06-25T13:35:00Z'), entryDte: 52 }))).toBe('2026-08-23');
+    // 02:00Z is still the PREVIOUS ET day — the bound anchors on the ET date.
+    expect(dteBoundExpiryDate(legacy({ openTs: Date.parse('2026-07-11T02:00:00Z'), entryDte: 0 }))).toBe('2026-07-17');
+    // A fractional DTE rounds UP (the conservative direction).
+    expect(dteBoundExpiryDate(legacy({ openTs: Date.parse('2026-07-10T13:50:00Z'), entryDte: 21.2 }))).toBe('2026-08-08');
+  });
+
+  it('refuses to bound an import, a multi-expiry structure, or a missing/negative field', () => {
+    const base = { openTs: Date.parse('2026-06-25T13:35:00Z'), entryDte: 30 };
+    expect(dteBoundExpiryDate(legacy({ ...base, structure: 'tradier_import' }))).toBeNull();
+    expect(dteBoundExpiryDate(legacy({ ...base, structure: 'put_calendar' }))).toBeNull();
+    expect(dteBoundExpiryDate(legacy({ ...base, structure: 'diagonal_call' }))).toBeNull();
+    expect(dteBoundExpiryDate(legacy({ ...base, entryDte: -1 }))).toBeNull();
+    expect(dteBoundExpiryDate(legacy({ ...base, entryDte: Number.NaN }))).toBeNull();
+    expect(dteBoundExpiryDate(legacy({ ...base, entryDte: undefined as unknown as number }))).toBeNull();
+    expect(dteBoundExpiryDate(legacy({ ...base, openTs: 0 }))).toBeNull();
+  });
+
+  it('partitions the 2026-09-19 bqb1 residual: past-bound rows void, the rest stay unparseable', () => {
+    const plan = planExpiredDemoOrphans(
+      [
+        legacy({ id: 'rv', structure: 'single_leg_rv', openTs: Date.parse('2026-06-25T13:35:00Z'), entryDte: 52 }),
+        legacy({ id: 'ic', structure: 'iron_condor', openTs: Date.parse('2026-07-10T13:50:00Z'), entryDte: 22 }),
+        legacy({ id: 'held-ic', structure: 'iron_condor', openTs: Date.parse('2026-07-10T13:50:00Z'), entryDte: 22 }),
+        // Opened 09-01 at 10 DTE: bound = 09-18, which is today — not yet proven dead.
+        legacy({ id: 'edge', openTs: Date.parse('2026-09-01T14:00:00Z'), entryDte: 10 }),
+        legacy({ id: 'imp', structure: 'tradier_import', openTs: Date.parse('2026-06-25T13:35:00Z'), entryDte: 5 }),
+        row({ id: 'gis', optionSymbol: 'GIS260821P00037500' }),
+      ],
+      new Set(['held-ic']),
+      '2026-09-18',
+    );
+    expect(plan).toMatchObject({
+      demoOpenRows: 6,
+      orphans: 3,
+      dteBoundOrphans: 2,
+      heldExpired: 1,
+      live: 0,
+      unparseable: 2,
+    });
+    expect(plan.rows.map((r) => [r.id, r.treatment, r.expiry])).toEqual([
+      ['rv', 'void_dte_bound', '2026-08-23'],
+      ['ic', 'void_dte_bound', '2026-08-08'],
+      ['held-ic', 'held_expired', '2026-08-08'],
+      ['gis', 'void', '2026-08-21'],
+    ]);
+  });
+
+  it('voids a past-bound row under its own reason and never touches a held one', async () => {
+    const d = deps(
+      [
+        legacy({ id: 'rv', openTs: Date.parse('2026-06-25T13:35:00Z'), entryDte: 52 }),
+        legacy({ id: 'held-rv', openTs: Date.parse('2026-06-25T13:35:00Z'), entryDte: 52 }),
+        row({ id: 'gis' }),
+      ],
+      [[{ id: 'p', journalId: 'held-rv' }]],
+    );
+    const s = await runExpiredDemoOrphanSweep(d);
+    expect(d.voids).toEqual([
+      { id: 'rv', reason: EXPIRED_DEMO_ORPHAN_DTE_BOUND_REASON, book: null },
+      { id: 'gis', reason: EXPIRED_DEMO_ORPHAN_REASON, book: 'admin' },
+    ]);
+    expect(EXPIRED_DEMO_ORPHAN_DTE_BOUND_REASON).not.toBe(EXPIRED_DEMO_ORPHAN_REASON);
+    expect(s.lastOutcome).toBe('repaired');
+    expect(s.counts).toMatchObject({ orphans: 2, dteBoundOrphans: 1, heldExpired: 1, unparseable: 0 });
+    expect(s.lastRows.find((r) => r.id === 'rv')?.reason).toMatch(/no OCC; openTs \+ entryDte \+ 7d = 2026-08-23/);
   });
 });

@@ -201,7 +201,7 @@ import { planStaleOpenRepair, RECONSTRUCTED_EXIT_REASON } from './tra3485-stale-
 // admin writes are unreachable on bqb1, so left as a route alone it would never
 // run against the rows it was written for (the TRA-1954 -> TRA-2810 lesson).
 import { runZombieOpenSweep } from './zombie-open-journal-sweep.js';
-import { runExpiredDemoOrphanSweep } from './expired-demo-orphan-sweep.js'; // TRA-4711
+import { EXPIRED_DEMO_ORPHAN_DTE_BOUND_REASON, runExpiredDemoOrphanSweep } from './expired-demo-orphan-sweep.js'; // TRA-4711, TRA-4721
 // TRA-2214 — the EOD journal blocks fold HERE, not inline, so this module holds
 // no bare fold that could be fed a differently-sourced (pooled) row list.
 import { foldModelFacingEodJournal } from './model-facing-journal.js';
@@ -5126,7 +5126,11 @@ const expiredDemoOrphanSweepDeps = {
   listDemoJournalRows: () => listOptionTradeJournal({ mode: 'demo' }),
   listBookOpenPositions: () => getAllUserContexts().map((ctx) => ctx.engine.openOptionPositionIds()),
   recordVoid: (id: string, reason: string, book: string | null) =>
-    recordOptionTradeVoid(id, reason, Date.now(), { book, reasonCode: 'expired_orphan' }),
+    recordOptionTradeVoid(id, reason, Date.now(), {
+      book,
+      // TRA-4721 — a no-OCC row proven dead by openTs + entryDte carries its own code.
+      reasonCode: reason === EXPIRED_DEMO_ORPHAN_DTE_BOUND_REASON ? 'expired_orphan_dte_bound' : 'expired_orphan',
+    }),
 };
 setTimeout(() => {
   void runExpiredDemoOrphanSweep(expiredDemoOrphanSweepDeps);
