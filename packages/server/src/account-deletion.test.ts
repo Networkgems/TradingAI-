@@ -104,9 +104,7 @@ describe('TRA-2421 — the wipe surface', () => {
 
     // ...and then the very next read puts it all back.
     const stocks = await tradeStore.loadStocksTradeSnapshot(user);
-    const crypto = await tradeStore.loadCryptoTradeSnapshot(user);
     expect(markerOf(stocks)).toBe('naive-book');
-    expect(markerOf(crypto)).toBe('naive-book');
     // Not just returned — WRITTEN BACK to disk, so the directory is live again.
     expect(existsSync(join(userDir(user), 'trades-stocks.json'))).toBe(true);
   });
@@ -145,7 +143,6 @@ describe('TRA-2421 — the wipe surface', () => {
     for (const g of gens) expect(existsSync(g)).toBe(true);
 
     expect(await tradeStore.loadStocksTradeSnapshot(user)).toBeNull();
-    expect(await tradeStore.loadCryptoTradeSnapshot(user)).toBeNull();
   });
 
   it('leaves every other account untouched', async () => {
@@ -212,7 +209,6 @@ describe('TRA-2421 — the tombstone restore guard', () => {
     // A generation the purge did not reach, stamped BEFORE the delete.
     plantBackup(user, T0 - 30 * 60_000, 'guard');
     expect(await tradeStore.loadStocksTradeSnapshot(user)).toBeNull();
-    expect(await tradeStore.loadCryptoTradeSnapshot(user)).toBeNull();
     // Refused, not consumed — the guard must not write the book back to disk.
     expect(existsSync(join(userDir(user), 'trades-stocks.json'))).toBe(false);
   });

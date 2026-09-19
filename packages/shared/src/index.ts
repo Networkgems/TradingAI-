@@ -1296,20 +1296,6 @@ export type AccountMode = 'demo' | 'live';
 export type BrokerageType = 'webull' | 'coinbase' | 'tradier';
 export type LiveTradeMode = 'ai_in_brokerage' | 'transfer_to_platform';
 /**
- * TRA-249-C / TRA-249-E — how the live crypto account routes strategy signals.
- *   - `'hybrid'`    (default) sends SELL signals to Coinbase INTX perpetuals
- *     when a perp is listed for the spot symbol AND the strategy universe gate
- *     passes; falls back to the spot-only skip otherwise. BUY signals always
- *     route to spot.
- *   - `'spot_only'` forces every SELL through the spot-only skip path even
- *     when perps would otherwise route — the safety hatch for users that
- *     haven't enabled INTX or want to keep live trading directional-long.
- *   - `'perp_only'` (TRA-249-E) routes both legs through the INTX perp
- *     catalog. Surfaced in the Settings UI; the engine treats unknown values
- *     as `'hybrid'` until the routing fork explicitly handles `'perp_only'`.
- */
-export type LiveTradeRoutingCrypto = 'hybrid' | 'spot_only' | 'perp_only';
-/**
  * Tradier exposes two parallel API hosts (TRA-221). `sandbox` is the paper
  * environment with simulated fills and free real-time options data; `production`
  * is the live brokerage where orders execute against real money. Stored on
@@ -1568,7 +1554,6 @@ export interface AccountSettings {
   // Demo mode settings
   demoEquity: number;
   demoEquityStocks: number;
-  demoEquityCrypto: number;
   dailyTradesLimit: number;
   /**
    * Max options trades per day — applies across ATM, OTM, and RV scanners
@@ -1623,22 +1608,8 @@ export interface AccountSettings {
   // new writes always land on the per-mode fields below.
   stocksAutoTradingEnabledDemo: boolean;
   stocksAutoTradingEnabledLive: boolean;
-  cryptoAutoTradingEnabledDemo: boolean;
-  cryptoAutoTradingEnabledLive: boolean;
   /** @deprecated TRA-229 — superseded by stocksAutoTradingEnabled{Demo,Live}. */
   stocksAutoTradingEnabled?: boolean;
-  /** @deprecated TRA-229 — superseded by cryptoAutoTradingEnabled{Demo,Live}. */
-  cryptoAutoTradingEnabled?: boolean;
-  /**
-   * TRA-587 — one-shot marker that the server's legacy `cryptoAutoTradingEnabledLive`
-   * default migration has already run for this account. Pre-TRA-575 installs persisted
-   * `cryptoAutoTradingEnabledLive: true` (the old default), which keeps overriding the
-   * new `false` default on load and re-arms the crypto promotion gate on every
-   * live-switch. The server flips that stale `true` to `false` ONCE and stamps this
-   * marker so a user who later deliberately re-enables live crypto is never re-flipped.
-   * Absent on legacy files (triggers the migration); `true` on every new/migrated file.
-   */
-  cryptoLiveDefaultMigratedTra587?: boolean;
   // Live mode settings — legacy un-suffixed fields. Kept as a read-time
   // fallback so existing saved settings still surface in the UI; new writes
   // land on the per-market fields below so Coinbase (crypto) and Webull
@@ -1653,47 +1624,11 @@ export interface AccountSettings {
    */
   liveApiSecret?: string;
   liveAccountId?: string;
-  // Live mode settings — Crypto (Coinbase). API Secret holds the HMAC secret
-  // or full PEM private key; Coinbase has no concept of an Account ID here.
-  liveBrokerageTypeCrypto?: BrokerageType;
-  liveTradeModeCrypto?: LiveTradeMode;
+  // TRA-4629 — RETIRED Coinbase pair. The crypto engine is gone and nothing reads
+  // these; they stay declared only because old persisted blobs still carry them
+  // and account retirement must scrub them (`PERSISTED_CREDENTIAL_FIELDS`).
   liveApiKeyCrypto?: string;
   liveApiSecretCrypto?: string;
-  /**
-   * TRA-249-C — routing fork for crypto strategy signals. `'hybrid'` (default)
-   * routes SELL shorts to a listed Coinbase perp when the strategy universe
-   * gate passes; `'spot_only'` forces the spot-only skip even when a perp
-   * exists; `'perp_only'` (TRA-249-E) routes both legs through the INTX perp
-   * catalog. Optional so saved settings pre-TRA-249 still type-check; absent
-   * ↔ `'hybrid'` per {@link DEFAULT_ACCOUNT_SETTINGS}.
-   */
-  liveTradeRoutingCrypto?: LiveTradeRoutingCrypto;
-  /**
-   * TRA-249-E — operator-facing leverage cap for crypto perp positions
-   * (1 → 5, integer). Phase-1 the live engine hard-caps leverage at 1×, but
-   * surfacing the field now means raising the cap later doesn't require a
-   * settings migration. The value the engine actually applies is
-   * `min(liveMaxLeverageCrypto, ENGINE_HARD_CAP)`.
-   */
-  liveMaxLeverageCrypto?: number;
-  /**
-   * TRA-341 — operator-tunable override for the §6 single-symbol short cap on
-   * the LIVE crypto preset, expressed as a fraction of strategy equity (0–1).
-   * Default 0.15 (PERP_SHORT_SINGLE_SYMBOL_CAP in @trading-app/engine) per spec; the
-   * Live test board ($180 managed) saturates that cap below MIN_NOTIONAL_USD
-   * on most pairs and every short signal trips `SKIP_SINGLE_SYMBOL_CAP` before
-   * the order ever reaches Coinbase. Raising this knob loosens the per-strategy
-   * single-symbol budget without touching the cross-strategy (20%) or total
-   * (30%) ceilings, which still enforce whole-book risk.
-   *
-   * Engine-side resolver (`resolveSingleSymbolShortCap`) clamps the value to
-   * (0, 1] and falls back to the spec default for unset / non-finite / ≤ 0
-   * inputs, so a fat-finger save can't accidentally disable the gate.
-   *
-   * Optional for back-compat with snapshots persisted before TRA-341 — absent
-   * ↔ spec default.
-   */
-  liveSingleSymbolShortCap?: number;
   // Live mode settings — Stocks (Webull). Webull uses Account ID for routing
   // and (today) does not require a separate API secret.
   liveBrokerageTypeStocks?: BrokerageType;
@@ -1926,7 +1861,6 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   mode: 'demo',
   demoEquity: 25_000,
   demoEquityStocks: 25_000,
-  demoEquityCrypto: 25_000,
   dailyTradesLimit: 10,
   optionsDailyTradesLimit: 10,
   dailyTradesLimitLive: 10,
@@ -1935,33 +1869,11 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   riskPerTrade: 0.01,
   stocksAutoTradingEnabledDemo: true,
   stocksAutoTradingEnabledLive: true,
-  cryptoAutoTradingEnabledDemo: true,
-  // TRA-575 — defaults to FALSE. Live crypto auto-trading places real capital on
-  // the strategy roster and is the trigger for the TRA-532 promotion gate
-  // (`liveCryptoOn` = mode==='live' && cryptoAutoTradingEnabledLive===true). With
-  // the old `true` default, ANY account flipping the single global `mode` to live
-  // — including a stocks-only Tradier user with zero crypto intent — tripped the
-  // crypto promotion gate and got a 422. Defaulting OFF makes live crypto strictly
-  // opt-in: a fresh account can go live on stocks, while live crypto stays gated
-  // until the user explicitly enables it (which re-arms the gate). Never auto-trade
-  // real crypto capital by default.
-  cryptoAutoTradingEnabledLive: false,
-  // TRA-587 — new accounts are born already-migrated so the legacy crypto-live
-  // default migration never touches them; only files written before this field
-  // existed (no marker) get the one-shot true→false flip. See the server-side
-  // `migrateLegacyCryptoLiveDefault`.
-  cryptoLiveDefaultMigratedTra587: true,
   liveBrokerageType: 'webull',
   liveTradeMode: 'ai_in_brokerage',
   liveApiKey: '',
   liveApiSecret: '',
   liveAccountId: '',
-  liveBrokerageTypeCrypto: 'coinbase',
-  liveTradeModeCrypto: 'ai_in_brokerage',
-  liveApiKeyCrypto: '',
-  liveApiSecretCrypto: '',
-  liveTradeRoutingCrypto: 'hybrid',
-  liveMaxLeverageCrypto: 1,
   // TRA-499 — board directive on TRA-494: stock signals should also be
   // Tradier production. The live equity entry path in `signal-engine.ts`
   // already routes through Tradier OTOCO when `liveTradeEquitiesTradier`
@@ -2184,9 +2096,7 @@ export type LiveCredentialField =
   | 'liveApiKeyOptionsProduction'
   | 'liveAccountIdOptionsProduction'
   | 'liveApiKeyOptionsSandbox'
-  | 'liveAccountIdOptionsSandbox'
-  | 'liveApiKeyCrypto'
-  | 'liveApiSecretCrypto';
+  | 'liveAccountIdOptionsSandbox';
 
 export interface LiveCredentialsCheck {
   ok: boolean;
@@ -2207,11 +2117,13 @@ function isBlankCred(v: string | undefined): boolean {
  *   - Tradier pair (per `liveTradierEnvOptions`) is required when
  *     `liveTradeEquitiesTradier && liveBrokerageTypeStocks === 'tradier'`
  *     (stocks) OR `liveTradierMarkets in ('options','both')` (options).
- *   - Coinbase pair is required when `liveBrokerageTypeCrypto === 'coinbase'`.
  *
  * Defaults match `DEFAULT_ACCOUNT_SETTINGS` so a fresh user with no overrides
- * still triggers the check: stocks (Tradier), options (both), crypto
- * (Coinbase) are all on out of the box.
+ * still triggers the check: stocks (Tradier) and options (both) are on out of
+ * the box. TRA-4729 — the Coinbase pair is no longer required: the crypto
+ * engine was removed (TRA-4629), so every Tradier-only live user was being
+ * reported (warning list, live-health, banner) as missing credentials nothing
+ * reads.
  */
 export function findMissingLiveCredentials(s: AccountSettings): LiveCredentialField[] {
   const missing = new Set<LiveCredentialField>();
@@ -2229,10 +2141,6 @@ export function findMissingLiveCredentials(s: AccountSettings): LiveCredentialFi
       if (isBlankCred(sandboxKey)) missing.add('liveApiKeyOptionsSandbox');
       if (isBlankCred(sandboxAcct)) missing.add('liveAccountIdOptionsSandbox');
     }
-  }
-  if ((s.liveBrokerageTypeCrypto ?? 'coinbase') === 'coinbase') {
-    if (isBlankCred(s.liveApiKeyCrypto)) missing.add('liveApiKeyCrypto');
-    if (isBlankCred(s.liveApiSecretCrypto)) missing.add('liveApiSecretCrypto');
   }
   return Array.from(missing);
 }
@@ -4953,9 +4861,7 @@ export const EQUITIES_WATCHLIST = WATCHLIST;
  * redeploy — see {@link resolveEquitySwingUniverse}.
  *
  * Deliberately a SUBSET of {@link WATCHLIST}: the thinnest single-stock names
- * are dropped; deep-book mega-caps and broad-market ETFs stay. `*-USD` crypto
- * majors are handled by {@link CRYPTO_WATCHLIST} on the crypto engine and are
- * always swing-eligible (see {@link isLiquidSwingSymbol}).
+ * are dropped; deep-book mega-caps and broad-market ETFs stay.
  */
 export const EQUITY_SWING_UNIVERSE: readonly string[] = [
   // Mega-cap tech / deep single-stock books
@@ -5059,32 +4965,6 @@ const STOCK_TICKER_ALIASES: Readonly<Record<string, string>> = {
 export function aliasWatchlistSymbol(symbol: string): string {
   return STOCK_TICKER_ALIASES[symbol.toUpperCase()] ?? symbol;
 }
-
-// TRA-521 — Coinbase-only watchlist. The board's directive is explicit:
-// "Only get quotes from Coinbase watchlist, don't add other coins. Clear the
-// unavailable quotes if they are not tradeable on Coinbase." This supersedes
-// the TRA-445 rationale that kept Yahoo-backstopped, non-Coinbase assets in
-// the list. Six symbols Coinbase does not list — BNB-USD, TRX-USD, THETA-USD,
-// VET-USD, RUNE-USD, EGLD-USD (Binance/Cosmos-only assets that only ever
-// resolved via the Yahoo/CMC fallback and 404/400 on both Coinbase hosts) —
-// are removed so the dashboard shows only tradeable Coinbase products and no
-// permanently-"unavailable" rows. The engine's Coinbase-strict entry gate
-// (TRA-338) already refused to trade them; this stops quoting them too.
-//
-// TRA-445 token migrations are unchanged: MATIC→POL and FTM→S (the old
-// Coinbase products are delisted, the list tracks the new tickers, and legacy
-// positions resolve via `aliasCryptoSymbol`). TRA-344 RNDR→RENDER likewise.
-export const CRYPTO_WATCHLIST: readonly string[] = [
-  'BTC-USD',   'ETH-USD',   'SOL-USD',   'ADA-USD',   'DOT-USD',
-  'AVAX-USD',  'LINK-USD',  'POL-USD',   'XRP-USD',   'LTC-USD',
-  'BCH-USD',   'ATOM-USD',  'DOGE-USD',  'SHIB-USD',  'NEAR-USD',
-  'S-USD',     'SAND-USD',  'MANA-USD',  'AXS-USD',   'UNI-USD',
-  'AAVE-USD',  'MKR-USD',   'CRV-USD',   'ALGO-USD',  'XLM-USD',
-  'ETC-USD',   'FIL-USD',   'HBAR-USD',  'ICP-USD',   'FLOW-USD',
-  'GRT-USD',   'ARB-USD',   'OP-USD',    'APT-USD',   'SUI-USD',
-  'INJ-USD',   'RENDER-USD','IMX-USD',   'LDO-USD',   'SNX-USD',
-  'APE-USD',   'COMP-USD',  'CHZ-USD',   'ZEC-USD',
-] as const;
 
 /**
  * Map known stale crypto tickers to their renamed equivalents at read time so
@@ -5566,125 +5446,6 @@ export interface EngineMarketReviewState {
   gatedStrategies: GatedStrategyNote[];
 }
 
-export interface CryptoSymbolState {
-  symbol: string;
-  price: number;
-  volume: number;
-  change: number;
-  changePct: number;
-  lastUpdated: number;
-  /**
-   * Why this symbol's quote is missing/stale. The watchlist UI uses this to render
-   * a useful state ("Quote unavailable — provider rate-limited") instead of a
-   * permanent "Loading…" spinner when upstream providers are down.
-   *
-   * TRA-418 — `'stale'` marks a symbol whose quote or backing candles aged past
-   * the freshness threshold (feed down). A stale symbol is excluded from
-   * strategy evaluation so a dead feed can never produce a new entry signal.
-   *
-   * TRA-2610 — this field is about FRESHNESS / AVAILABILITY ONLY. `'suspect'` used
-   * to live in this union (TRA-2379) and that was the defect: one field carrying two
-   * orthogonal facts, so a failed fetch stamping `'unavailable'` erased the
-   * plausibility verdict. Plausibility now lives on `moveSuspect` below. Do not
-   * re-add a plausibility member here.
-   */
-  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' | 'stale';
-  /**
-   * TRA-2610 — true when this row's published session move is not believable (an
-   * unadjusted prev close across a corporate action). INDEPENDENT of `quoteStatus`:
-   * a row can be unavailable AND fabricated, which is the case that shipped a
-   * +110.66% FGMC at #1 in two consecutive EOD reports.
-   *
-   * `change` / `changePct` are still published RAW alongside it — TRA-2379 decision
-   * 1 is flag, never clamp. Consumers must call `isMoveSuspect()` rather than
-   * reading this field directly, so the rule is executed even on a row no producer
-   * stamped. NOTE: nothing on the crypto path sets this today, deliberately — see
-   * the top-movers comment in `crypto-eod-report.ts`.
-   *
-   * TRA-3243 — this field is the INSTANTANEOUS verdict and it is NOT monotonic
-   * within a session: it is re-derived every tick, so it clears the moment the
-   * numerator mean-reverts under the bar even though the denominator under
-   * suspicion is unchanged.
-   *
-   * ⚠️ The session-scoped companion fields (`moveSuspectSession` /
-   * `moveSuspectSessionDay` / `moveSuspectPrevClose`) are DELIBERATELY NOT declared
-   * here. They exist on the equity `SymbolState` in `signal-engine.ts`, whose
-   * `applyQuotes` is the only producer that runs the state machine. Declaring them
-   * on a shape nothing maintains would let a reader treat an always-`undefined`
-   * field as an always-clean verdict — the same "one field, two facts" mistake
-   * TRA-2610 unwound. `isMoveSuspect()` degrades correctly on a crypto row: with no
-   * session fact present it falls through to `isMoveSuspectNow()`, i.e. exactly
-   * today's behaviour.
-   */
-  moveSuspect?: boolean;
-}
-
-export interface CryptoEngineState {
-  symbols: CryptoSymbolState[];
-  signals: TradeSignal[];
-  account: AccountState;
-  closedPositions: Position[];
-  news: NewsItem[];
-  lastTick: number;
-  autoTradingEnabled: boolean;
-  /** Always true — crypto trades 24/7 */
-  marketOpen: true;
-  /**
-   * TRA-249-B — recent live-broker skip events (most recent 50, newest last).
-   * Aggregate channel separate from per-`signal.liveSkipReason`: that one
-   * stamps the originating signal so the Signals panel can render an inline
-   * "not opened" tag, but a Coinbase outage / repeated cash-cap miss leaves
-   * no trace once those signals roll off the recent list. The aggregate
-   * preserves a structured timeline (symbol, side, reason, at) that survives
-   * signal turnover and gives operators a single place to diagnose silent
-   * skips. Populated only on the live branch — undefined on demo, where the
-   * paper account never skips for liquidity reasons.
-   *
-   * Rendered by `SkippedSignalsPanel` (mounted from `CryptoPositionsPanel`),
-   * alongside the existing per-signal `liveSkipReason` inline tag on the
-   * Signals panel. (TRA-249-E landed that surface; a stale TODO here said
-   * otherwise until TRA-4473's audit caught it.)
-   */
-  liveSkips?: LiveSkip[];
-  /**
-   * TRA-345 — the strategy preset the engine is currently gating signal
-   * emission on. Surfaced in engine state so the active config can be
-   * verified from `/api/crypto/state` without Render dashboard or server-log
-   * access. `id` is the resolved preset; `envValue` is the raw
-   * `LIVE_STRATEGY_PRESET` process-env string (empty when unset) so a typo
-   * that falls back to `no_trade` (TRA-697) is directly visible to operators.
-   */
-  activePreset: {
-    id: StrategyPresetId;
-    envValue: string;
-    enabledStrategies: readonly CryptoStrategyType[];
-    symbolFilter: readonly string[] | null;
-    /**
-     * TRA-421 — the resolved preset's per-strategy universe whitelist
-     * ({@link StrategyPreset.strategyUniverse}), surfaced so operators can
-     * confirm the validated-symbol gate is live without log access. Omitted
-     * when the preset declares no per-strategy universe.
-     */
-    strategyUniverse?: Readonly<Partial<Record<CryptoStrategyType, readonly string[]>>>;
-  };
-}
-
-/**
- * TRA-249-B — structured live-broker skip event. Recorded each time
- * `CryptoLiveAccount.openPosition` declines to submit an order (qty too
- * small, managed equity too small, cost > cash, spot-only SELL, etc.) so
- * the dashboard can surface a timeline of why signals didn't translate to
- * fills. This is the aggregate counterpart to `TradeSignal.liveSkipReason`,
- * which annotates the originating signal in place. Pre-perp (TRA-249-C)
- * the spot-only SELL branch is the entire SELL path; once C lands it
- * becomes the fallback for symbols not in the perp catalog.
- */
-export interface LiveSkip {
-  symbol: string;
-  side: Side;
-  reason: string;
-  at: number;
-}
 
 export interface MarketBar {
   symbol: string;

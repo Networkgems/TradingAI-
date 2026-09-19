@@ -4,7 +4,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import type { OptionPosition, Position } from '@trading-app/shared';
 import { PnlTracker } from './pnl-tracker.js';
-import type { StocksTradeSnapshot, CryptoTradeSnapshot } from './trade-store.js';
+import type { StocksTradeSnapshot } from './trade-store.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TRA-522 — restart of the PM2 `trading-server` silently swapped the entire demo
@@ -34,16 +34,12 @@ type TradeStoreModule = typeof import('./trade-store.js');
 let resolveDataDir: TradeStoreModule['resolveDataDir'];
 let loadStocksTradeSnapshot: TradeStoreModule['loadStocksTradeSnapshot'];
 let saveStocksTradeSnapshot: TradeStoreModule['saveStocksTradeSnapshot'];
-let loadCryptoTradeSnapshot: TradeStoreModule['loadCryptoTradeSnapshot'];
-let saveCryptoTradeSnapshot: TradeStoreModule['saveCryptoTradeSnapshot'];
 
 beforeAll(async () => {
   const mod = await import('./trade-store.js');
   resolveDataDir = mod.resolveDataDir;
   loadStocksTradeSnapshot = mod.loadStocksTradeSnapshot;
   saveStocksTradeSnapshot = mod.saveStocksTradeSnapshot;
-  loadCryptoTradeSnapshot = mod.loadCryptoTradeSnapshot;
-  saveCryptoTradeSnapshot = mod.saveCryptoTradeSnapshot;
 });
 
 beforeEach(() => {
@@ -133,48 +129,6 @@ function makeStocksSnapshot(): StocksTradeSnapshot {
   };
 }
 
-function makeCryptoSnapshot(): CryptoTradeSnapshot {
-  const open: Position = {
-    id: 'c-btc',
-    symbol: 'BTC-USD',
-    side: 'buy',
-    signalType: 'bb_fade',
-    entryPrice: 60000,
-    quantity: 0.01,
-    stopLoss: 59000,
-    takeProfit: 62000,
-    openedAt: 1717100000000,
-  };
-  const closed: Position = {
-    id: 'c-sol',
-    symbol: 'SOL-USD',
-    side: 'buy',
-    signalType: 'bb_fade',
-    entryPrice: 150,
-    quantity: 2,
-    stopLoss: 145,
-    takeProfit: 160,
-    openedAt: 1716900000000,
-    closedAt: 1717000000000,
-    exitPrice: 158,
-    pnl: 16,
-  };
-  return {
-    version: 1,
-    savedAt: '',
-    openPositions: [open],
-    closedPositions: [closed],
-    demoClosedPositions: [closed],
-    recentSignals: [],
-    account: {
-      cash: 22000,
-      equity: 25000,
-      initialEquity: 25000,
-      openingEquityToday: 25000,
-    },
-  };
-}
-
 describe('TRA-522 — resolveDataDir is launch-cwd independent and env-pinned', () => {
   it('returns the DATA_DIR env value verbatim when set', () => {
     expect(resolveDataDir({ DATA_DIR: '/srv/tradingai/data' }, '/anything/dist')).toBe(
@@ -232,15 +186,12 @@ describe('TRA-522 — restart preserves the full account book under a constant D
     expect(t2.getSavedOptionsPnl()).toBe(12.5);
   });
 
-  it('preserves equity, open positions, options and closed history (stocks + crypto)', async () => {
+  it('preserves equity, open positions, options and closed history ', async () => {
     const stocks = makeStocksSnapshot();
-    const crypto = makeCryptoSnapshot();
     await saveStocksTradeSnapshot(USER, stocks);
-    await saveCryptoTradeSnapshot(USER, crypto);
 
     // Simulated restart: reload from the same DATA_DIR.
     const loadedStocks = await loadStocksTradeSnapshot(USER);
-    const loadedCrypto = await loadCryptoTradeSnapshot(USER);
 
     expect(loadedStocks).not.toBeNull();
     expect(loadedStocks!.account).toEqual(stocks.account);
@@ -248,11 +199,6 @@ describe('TRA-522 — restart preserves the full account book under a constant D
     expect(loadedStocks!.closedPositions).toEqual(stocks.closedPositions);
     expect(loadedStocks!.options.openOptions).toEqual(stocks.options.openOptions);
     expect(loadedStocks!.options.optionsPnl).toBe(stocks.options.optionsPnl);
-
-    expect(loadedCrypto).not.toBeNull();
-    expect(loadedCrypto!.account).toEqual(crypto.account);
-    expect(loadedCrypto!.openPositions).toEqual(crypto.openPositions);
-    expect(loadedCrypto!.demoClosedPositions).toEqual(crypto.demoClosedPositions);
   });
 
   it('demonstrates the swap: a restart against a DIFFERENT dataDir does NOT see the book', () => {

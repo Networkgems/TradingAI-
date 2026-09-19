@@ -792,9 +792,9 @@ describe('LiveCredentialsBanner (TRA-506)', () => {
     expect(onOpenSettings).toHaveBeenCalledWith('liveApiKeyOptionsProduction');
   });
 
-  // TRA-4629 — the retired Coinbase credential fields still exist on the shared
-  // union until the backend removal lands; the banner must never surface them.
-  it('never surfaces the retired Coinbase fields, even when the validator reports them missing', () => {
+  // TRA-4629/TRA-4729 — the retired Coinbase credential fields are no longer
+  // validated at all; the banner must never surface them.
+  it('never surfaces the retired Coinbase fields', () => {
     const broken: AccountSettings = {
       ...liveFullCreds(),
       liveApiKeyOptionsProduction: '',

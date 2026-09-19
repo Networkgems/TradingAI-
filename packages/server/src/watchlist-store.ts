@@ -1,7 +1,7 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
-import { WATCHLIST, CRYPTO_WATCHLIST, isCryptoSymbolBlocked, type ReviewBlock } from '@trading-app/shared';
+import { WATCHLIST, type ReviewBlock } from '@trading-app/shared';
 import { resolveDataDir } from './data-dir.js';
 
 const DATA_DIR = resolveDataDir();
@@ -9,13 +9,16 @@ const DATA_DIR = resolveDataDir();
 // TRA-142 — watchlists are now per-user. Each user has their own
 // DATA_DIR/users/<username>/watchlist.json. The legacy global watchlist file
 // is migrated into the admin namespace by runFirstBootMigration.
+//
+// TRA-4729 — stocks only. The crypto half (and CRYPTO_WATCHLIST) went with the
+// crypto engine (TRA-4629); a legacy `crypto` key in an old file is ignored on
+// load and dropped on the next write.
 
 // TRA-950 — hard cap on how many leaders a single review may seed into the
 // watchlist, so a runaway review block can never blow past the size/risk caps.
 export const MAX_REVIEW_LEADERS = 15;
 
 interface WatchlistData {
-  crypto: { added: string[]; hidden: string[] };
   stocks: {
     added: string[];
     hidden: string[];
@@ -32,7 +35,6 @@ interface WatchlistData {
 
 function emptyData(): WatchlistData {
   return {
-    crypto: { added: [], hidden: [] },
     stocks: { added: [], hidden: [], reviewSourced: [], invalidationLevels: {} },
   };
 }
@@ -54,7 +56,6 @@ export async function initWatchlistStore(username: string): Promise<void> {
     const raw = await readFile(file, 'utf-8');
     const parsed = JSON.parse(raw) as Partial<WatchlistData>;
     cache.set(username, {
-      crypto: { added: parsed.crypto?.added ?? [], hidden: parsed.crypto?.hidden ?? [] },
       stocks: {
         added: parsed.stocks?.added ?? [],
         hidden: parsed.stocks?.hidden ?? [],
@@ -84,44 +85,12 @@ async function persist(username: string): Promise<void> {
   await writeFile(watchlistFile(username), JSON.stringify(data, null, 2), 'utf-8');
 }
 
-export function getCryptoWatchlistData(username: string): { all: string[]; added: string[]; hidden: string[] } {
-  const { added, hidden } = getCache(username).crypto;
-  const hiddenSet = new Set(hidden);
-  // TRA-283: filter denylisted symbols out of every view so blocked tickers
-  // can't surface even if they were persisted before the denylist landed.
-  const base = (CRYPTO_WATCHLIST as readonly string[]).filter(s => !hiddenSet.has(s) && !isCryptoSymbolBlocked(s));
-  const addedNotInBase = added.filter(s => !base.includes(s) && !isCryptoSymbolBlocked(s));
-  return { all: [...base, ...addedNotInBase], added, hidden };
-}
-
 export function getStocksWatchlistData(username: string): { all: string[]; added: string[]; hidden: string[] } {
   const { added, hidden } = getCache(username).stocks;
   const hiddenSet = new Set(hidden);
   const base = (WATCHLIST as readonly string[]).filter(s => !hiddenSet.has(s));
   const addedNotInBase = added.filter(s => !base.includes(s));
   return { all: [...base, ...addedNotInBase], added, hidden };
-}
-
-export async function addCryptoSymbol(username: string, symbol: string): Promise<void> {
-  // TRA-283: silently ignore denylisted symbols so an old client / scanner
-  // suggestion can't re-introduce a banned ticker.
-  if (isCryptoSymbolBlocked(symbol)) return;
-  const d = getCache(username);
-  d.crypto.hidden = d.crypto.hidden.filter(s => s !== symbol);
-  if (!(CRYPTO_WATCHLIST as readonly string[]).includes(symbol) && !d.crypto.added.includes(symbol)) {
-    d.crypto.added.push(symbol);
-  }
-  await persist(username);
-}
-
-export async function removeCryptoSymbol(username: string, symbol: string): Promise<void> {
-  const d = getCache(username);
-  if ((CRYPTO_WATCHLIST as readonly string[]).includes(symbol)) {
-    if (!d.crypto.hidden.includes(symbol)) d.crypto.hidden.push(symbol);
-  } else {
-    d.crypto.added = d.crypto.added.filter(s => s !== symbol);
-  }
-  await persist(username);
 }
 
 export async function addStocksSymbol(username: string, symbol: string): Promise<void> {

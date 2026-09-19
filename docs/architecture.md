@@ -36,9 +36,9 @@ Tauri window or as a plain web page; both talk to the same server.
                 │
        ┌────────▼─────────────────────────────────┐
        │ Brokers / data feeds                      │
-       │ Tradier (equities + options) · Coinbase   │
-       │ (crypto spot + perps) · Alpaca · Yahoo    │
-       │ Finance · CoinMarketCap · Twelve Data     │
+       │ Tradier (equities + options) · Alpaca     │
+       │ Yahoo Finance · Twelve Data               │
+       │ (crypto retired, TRA-4629)                │
        └───────────────────────────────────────────┘
 ```
 
@@ -62,8 +62,8 @@ This is the part most worth understanding before changing the server.
 ### Per-user context
 
 Every authenticated user gets a `UserContext` (`packages/server/src/user-context.ts`)
-containing their own equity engine, crypto engine, data directory, watchlists
-and settings. Contexts are created on signup / admin-create and rebuilt lazily
+containing their own equity engine, data directory, watchlist and settings.
+(The per-user crypto engine was removed in TRA-4629.) Contexts are created on signup / admin-create and rebuilt lazily
 on first auth. Two users never share engine state.
 
 ### The request → state-push cycle
@@ -72,9 +72,9 @@ on first auth. Two users never share engine state.
    `POST /api/trading/start` or `POST /api/positions/:id/close`. Auth is a
    bearer token (`Authorization: Bearer <token>`) verified by `requireAuth`.
 2. **The handler mutates the user's engine.** It looks up the caller's
-   `UserContext`, runs the action against `ctx.engine` / `ctx.cryptoEngine`.
+   `UserContext`, runs the action against `ctx.engine`.
 3. **The handler broadcasts new state.** Almost every mutating handler ends with
-   `broadcastEngineState(ctx)` / `broadcastCryptoState(ctx)`. The REST response
+   `broadcastEngineState(ctx)`. The REST response
    itself is usually a thin ack (`{ ok: true }`); the *real* result arrives over
    the WebSocket as a fresh state snapshot.
 4. **The engine also ticks on its own.** Independently of any request, each
@@ -99,9 +99,8 @@ or the UI will look stale until the next tick.
   | `type` | `payload` |
   |---|---|
   | `state` | Full equity-engine state snapshot. |
-  | `crypto_state` | Full crypto-engine state snapshot. |
   | `eod_report` | The latest end-of-day report (sent on connect and at archive time). |
-- On connect the server immediately sends one `state`, one `crypto_state` and
+- On connect the server immediately sends one `state` and
   (if present) one `eod_report` so the client renders without waiting for a
   tick. The protocol is currently server-push only; clients do not send
   messages.

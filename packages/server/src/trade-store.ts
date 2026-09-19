@@ -105,10 +105,6 @@ function stocksTradesFile(username: string): string {
   return join(userDir(username), 'trades-stocks.json');
 }
 
-function cryptoTradesFile(username: string): string {
-  return join(userDir(username), 'trades-crypto.json');
-}
-
 /**
  * TRA-3407 — the paths the write axis stats. Exported so
  * `/api/health/snapshot-persist` reads the SAME file `saveStocksTradeSnapshot`
@@ -120,8 +116,8 @@ function cryptoTradesFile(username: string): string {
  * from a read independent of the in-process outcome counter, or a dead writer
  * confirms its own freshness.
  */
-export function snapshotFilePathFor(username: string, axis: 'stocks' | 'crypto'): string {
-  return axis === 'stocks' ? stocksTradesFile(username) : cryptoTradesFile(username);
+export function snapshotFilePathFor(username: string, _axis: 'stocks'): string {
+  return stocksTradesFile(username);
 }
 
 /**
@@ -248,37 +244,6 @@ export interface StocksTradeSnapshot {
    * (absent ⇒ the ledger starts empty and re-accrues forward).
    */
   supertrendPaperClosed?: Position[];
-}
-
-export interface CryptoTradeSnapshot {
-  version: 1;
-  savedAt: string;
-  openPositions: Position[];
-  /**
-   * Pre-TRA-242 merged closed list. Always equal to `demoClosedPositions`
-   * on fresh saves so older callers / pre-split backups round-trip safely.
-   * New code should consume the split lists below.
-   */
-  closedPositions: Position[];
-  /**
-   * TRA-242 — Demo (paper) closed positions only. Persisted separately
-   * from the live broker history so the Live dashboard never surfaces
-   * Demo trades.
-   */
-  demoClosedPositions?: Position[];
-  /**
-   * TRA-242 — Live closed positions mirrored from the Coinbase broker
-   * view. Optional because pre-TRA-242 snapshots don't have it; the engine
-   * treats absence as "no live history yet".
-   */
-  liveClosedPositions?: Position[];
-  recentSignals: TradeSignal[];
-  account: {
-    cash: number;
-    equity: number;
-    initialEquity: number;
-    openingEquityToday: number;
-  };
 }
 
 async function ensureDir(dir: string): Promise<void> {
@@ -528,19 +493,8 @@ export async function loadStocksTradeSnapshot(username: string): Promise<StocksT
   return tryRestoreFromBackup<StocksTradeSnapshot>(file, username, 'trades-stocks.json');
 }
 
-export async function loadCryptoTradeSnapshot(username: string): Promise<CryptoTradeSnapshot | null> {
-  const file = cryptoTradesFile(username);
-  const primary = await readJsonOrNull<CryptoTradeSnapshot>(file);
-  if (primary) return primary;
-  return tryRestoreFromBackup<CryptoTradeSnapshot>(file, username, 'trades-crypto.json');
-}
-
 export async function saveStocksTradeSnapshot(username: string, snap: StocksTradeSnapshot): Promise<void> {
   await atomicWriteJson(stocksTradesFile(username), { ...snap, savedAt: new Date().toISOString() });
-}
-
-export async function saveCryptoTradeSnapshot(username: string, snap: CryptoTradeSnapshot): Promise<void> {
-  await atomicWriteJson(cryptoTradesFile(username), { ...snap, savedAt: new Date().toISOString() });
 }
 
 /** TRA-2817 — recursive file count under `dir`. Directories are not counted. */
@@ -690,6 +644,8 @@ export async function rotateBackups(): Promise<void> {
   if (existsSync(usersRoot)) {
     const userFiles = [
       'trades-stocks.json',
+      // TRA-4729 — nothing writes this since TRA-4629, but pre-removal books still
+      // carry one; keep mirroring it so a restore never loses the legacy file.
       'trades-crypto.json',
       'account-settings.json',
       'watchlist.json',

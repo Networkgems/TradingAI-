@@ -307,7 +307,7 @@ describe('mergeScopedRiskSettings — bucket isolation (TRA-346 / TRA-349)', () 
 // whole bundle.
 describe('validateLiveCredentials (TRA-506)', () => {
   // Build a settings snapshot that's fully credentialed for stocks +
-  // options + crypto so each test can blank exactly one cred and verify
+  // options so each test can blank exactly one cred and verify
   // the reject path is wired to that one field.
   function liveFullCreds(): AccountSettings {
     return {
@@ -316,8 +316,6 @@ describe('validateLiveCredentials (TRA-506)', () => {
       liveTradierEnvOptions: 'production',
       liveApiKeyOptionsProduction: 'prod-token',
       liveAccountIdOptionsProduction: 'VA123',
-      liveApiKeyCrypto: 'cb-key',
-      liveApiSecretCrypto: 'cb-secret',
     };
   }
 
@@ -374,18 +372,14 @@ describe('validateLiveCredentials (TRA-506)', () => {
     );
   });
 
-  it('rejects when Coinbase API key is blank (mode=live, brokerage=coinbase)', () => {
-    const s = { ...liveFullCreds(), liveApiKeyCrypto: '' };
-    const result = validateLiveCredentials(s);
-    expect(result.ok).toBe(false);
-    expect(result.missing).toContain('liveApiKeyCrypto');
-  });
-
-  it('rejects when Coinbase API secret is blank (mode=live, brokerage=coinbase)', () => {
-    const s = { ...liveFullCreds(), liveApiSecretCrypto: '' };
-    const result = validateLiveCredentials(s);
-    expect(result.ok).toBe(false);
-    expect(result.missing).toContain('liveApiSecretCrypto');
+  it('TRA-4729: a blank retired Coinbase pair is NOT missing — nothing reads it since TRA-4629', () => {
+    // Pre-TRA-4729 this was two reject tests. The crypto engine is gone, so
+    // demanding its credentials only produced a permanent false "missing" on
+    // every Tradier-only live account. Pin that a blank pair is now clean...
+    const s = { ...liveFullCreds(), liveApiKeyCrypto: '', liveApiSecretCrypto: '' };
+    expect(validateLiveCredentials(s)).toEqual({ ok: true, missing: [] });
+    // ...and that the check still has teeth on the pair that IS read.
+    expect(validateLiveCredentials({ ...s, liveApiKeyOptionsProduction: '' }).ok).toBe(false);
   });
 
   it('whitespace-only credentials count as missing (defense against fat-finger saves)', () => {
@@ -546,11 +540,11 @@ describe('Tradier production keys persist for a Tradier-only live user (TRA-515)
     expect(loaded.liveAccountIdOptionsProduction).toBe('VA123');
   });
 
-  it('the Tradier keys are not what the guardrail flags — only the unconfigured Coinbase pair is', () => {
+  it('a fully-configured Tradier-only live user reports NOTHING missing', () => {
     // The route folds both validators into a single non-blocking
     // `missingLiveCredentials` list. The Tradier production pair is filled,
-    // so it must NOT appear; the missing set is purely the Coinbase creds the
-    // banner nags about — and it no longer blocks the save.
+    // so it must NOT appear. Until TRA-4729 the list still carried the retired
+    // Coinbase pair; with the crypto engine gone it must now be empty.
     const s = tradierOnlyLive();
     const missing = Array.from(new Set([
       ...validateLiveCredentials(s).missing,
@@ -558,8 +552,6 @@ describe('Tradier production keys persist for a Tradier-only live user (TRA-515)
     ]));
     expect(missing).not.toContain('liveApiKeyOptionsProduction');
     expect(missing).not.toContain('liveAccountIdOptionsProduction');
-    expect(missing).toEqual(
-      expect.arrayContaining(['liveApiKeyCrypto', 'liveApiSecretCrypto']),
-    );
+    expect(missing).toEqual([]);
   });
 });

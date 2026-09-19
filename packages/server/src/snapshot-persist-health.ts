@@ -4,7 +4,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * WHY THIS EXISTS, AND WHY `/api/health/storage` DOES NOT ALREADY COVER IT
  * ─────────────────────────────────────────────────────────────────────────────
- * `persistStocksNow` / `persistCryptoNow` swallow every write failure into a
+ * `persistStocksNow` swallows every write failure into a
  * `log.warn`. ENOSPC, EIO, EACCES, an unmounted volume — all of them land in
  * that one catch and nowhere else. There is no counter, no health field, no
  * gate.
@@ -64,25 +64,27 @@
  * A dead writer on a LIVE box grades STALE. That is the whole deliverable.
  */
 
-/** The two snapshot writers this axis grades. */
-export type PersistAxis = 'stocks' | 'crypto';
+/**
+ * The snapshot writer this axis grades. TRA-4729 — was `'stocks' | 'crypto'`; the
+ * crypto writer went with the crypto engine (TRA-4629) and the route has graded
+ * stocks only since.
+ */
+export type PersistAxis = 'stocks';
 
 /**
  * Nominal tick period per axis, in ms. `SignalEngine.start` arms a 30s tick
- * (`signal-engine.ts`), `CryptoSignalEngine.start` a 60s one (`crypto-engine.ts`).
- * Every tick schedules a persist unconditionally (`scheduleStocksPersist` /
- * `scheduleCryptoPersist`), so on a healthy writer the file's mtime advances
+ * (`signal-engine.ts`).
+ * Every tick schedules a persist unconditionally (`scheduleStocksPersist`), so on a healthy writer the file's mtime advances
  * once per tick — which is what makes mtime age a valid staleness measure rather
  * than a proxy for "did anything change".
  */
 export const AXIS_TICK_MS: Readonly<Record<PersistAxis, number>> = {
   stocks: 30_000,
-  crypto: 60_000,
 };
 
 /**
  * How many tick intervals of silence make a LIVE writer STALE. 10 ticks is
- * 5 minutes on stocks / 10 on crypto — long enough that a single slow write or
+ * 5 minutes on stocks — long enough that a single slow write or
  * a GC pause cannot trip it, short enough that the five-day ENOSPC incident
  * would have been red within minutes of the first failed write.
  */
@@ -152,8 +154,8 @@ export interface PersistRowInput {
   lastSuccessAt?: string | null;
   /**
    * TRA-3432 — is the engine that drives this axis switched ON at all?
-   * `false` ⇔ a master kill (crypto's TRA-1580 `CRYPTO_ENGINE_ENABLED`, off by
-   * compiled default) means `start()` never arms the tick interval, so the tick
+   * `false` ⇔ a master kill (historically crypto's TRA-1580 `CRYPTO_ENGINE_ENABLED`,
+   * retired with that engine in TRA-4629) means `start()` never arms the tick interval, so the tick
    * hook — and therefore the persist scheduler wired to it — can never fire.
    *
    * This is a LABEL, NOT AN OPERAND. It only refines the reason on a row that
@@ -395,7 +397,7 @@ export function getPersistOutcome(username: string, axis: PersistAxis): PersistO
 
 /** Drop a context's rows on delete-user, so a deleted book cannot grade forever. */
 export function forgetPersistOutcomes(username: string): void {
-  for (const axis of ['stocks', 'crypto'] as const) outcomes.delete(key(username, axis));
+  for (const axis of ['stocks'] as const) outcomes.delete(key(username, axis));
 }
 
 /** Test-only reset. The registry is process-global by design. */

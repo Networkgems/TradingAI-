@@ -107,7 +107,6 @@ describe('TRA-2410 — the recycled-username adoption hazard', () => {
 
     // ...and the very first read of the "new" account hands over the old positions.
     expect(markerOf(await tradeStore.loadStocksTradeSnapshot(user))).toBe('predecessor');
-    expect(markerOf(await tradeStore.loadCryptoTradeSnapshot(user))).toBe('predecessor');
     // Not merely returned — WRITTEN BACK, so the directory is live again.
     expect(existsSync(join(userDir(user), 'trades-stocks.json'))).toBe(true);
     rmSync(userDir(user), { recursive: true, force: true });
@@ -130,10 +129,9 @@ describe('TRA-2410 — the recycled-username adoption hazard', () => {
     expect(receipt.errors).toEqual([]);
     expect(receipt.ok).toBe(true);
 
-    // The new account's book: empty from BOTH stores, and the refused restore must
-    // not have written anything back to the live key.
+    // The new account's book: empty, and the refused restore must not have
+    // written anything back to the live key.
     expect(await tradeStore.loadStocksTradeSnapshot(user)).toBeNull();
-    expect(await tradeStore.loadCryptoTradeSnapshot(user)).toBeNull();
     expect(existsSync(join(userDir(user), 'trades-stocks.json'))).toBe(false);
   });
 

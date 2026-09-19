@@ -33,7 +33,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * WHAT IS STUBBED, AND WHAT IS NOT
  * ─────────────────────────────────────────────────────────────────────────────
- * Only `saveStocksTradeSnapshot` / `saveCryptoTradeSnapshot` are swapped, and
+ * Only `saveStocksTradeSnapshot` is swapped, and
  * only so the ENOSPC can be injected at the syscall seam instead of by filling a
  * real volume. Everything downstream of the throw — the catch, the counter, the
  * grader, the fold — is production code. The on-disk half of the axis is tested
@@ -48,7 +48,7 @@ import { join } from 'path';
 import type { PersistRowInput } from './snapshot-persist-health.js';
 
 // The injection point for the ENOSPC. Read by the `./trade-store.js` mock below.
-const failure: { stocks: Error | null; crypto: Error | null } = { stocks: null, crypto: null };
+const failure: { stocks: Error | null } = { stocks: null };
 
 /**
  * ENOSPC-shaped, matching what `/data` actually threw from 2026-07-30T23:40:19Z
@@ -75,9 +75,6 @@ vi.mock('./trade-store.js', async (importOriginal) => {
     saveStocksTradeSnapshot: vi.fn(async () => {
       if (failure.stocks) throw failure.stocks;
     }),
-    saveCryptoTradeSnapshot: vi.fn(async () => {
-      if (failure.crypto) throw failure.crypto;
-    }),
   };
 });
 
@@ -97,8 +94,8 @@ const { snapshotFilePathFor } = await import('./trade-store.js');
 type Ctx = Parameters<typeof persistStocksNow>[0];
 
 /**
- * The minimum of `UserContext` that `persistStocksNow` / `persistCryptoNow`
- * actually touch: the username and the engine's exported snapshot. Cast rather
+ * The minimum of `UserContext` that `persistStocksNow`
+ * actually touches: the username and the engine's exported snapshot. Cast rather
  * than built, because standing up two real engines would make this test about
  * engine construction instead of about the persist seam.
  */
@@ -129,7 +126,6 @@ function ctxFor(username: string): Ctx {
   return {
     username,
     engine: { exportTradeSnapshot: () => snap },
-    cryptoEngine: { exportTradeSnapshot: () => snap },
   } as unknown as Ctx;
 }
 
@@ -151,7 +147,6 @@ function liveRow(over: Partial<PersistRowInput> = {}): PersistRowInput {
 
 beforeEach(() => {
   failure.stocks = null;
-  failure.crypto = null;
   __resetPersistOutcomesForTest();
 });
 
@@ -320,7 +315,6 @@ describe('TRA-3407 operand independence', () => {
     // a file nobody writes would grade NOT_MEASURED forever and read like a quiet
     // box.
     expect(snapshotFilePathFor('admin', 'stocks')).toMatch(/admin[\\/]trades-stocks\.json$/);
-    expect(snapshotFilePathFor('admin', 'crypto')).toMatch(/admin[\\/]trades-crypto\.json$/);
   });
 });
 
@@ -413,10 +407,14 @@ describe('TRA-3407 tri-state, fail closed', () => {
 //
 // The whole risk of adding a label to a grader is that the label starts DECIDING.
 // These tests pin that it cannot.
+//
+// TRA-4729 — the crypto axis went with the crypto engine (TRA-4629). The
+// properties below are axis-agnostic (they pin the grader, not a writer), so
+// they now run on the one remaining axis, unchanged.
 describe('TRA-3432 engine-disabled is a LABEL, not an operand', () => {
   it('refines the reason on an already-IDLE row without moving the verdict', () => {
     const base = liveRow({
-      axis: 'crypto',
+      axis: 'stocks',
       lastTickAt: null,
       fileMtimeMs: NOW - 86_400_000,
     });
@@ -445,7 +443,7 @@ describe('TRA-3432 engine-disabled is a LABEL, not an operand', () => {
     // precisely the defect class this whole instrument exists to catch.
     const failingButFlaggedOff = gradePersistRow(
       liveRow({
-        axis: 'crypto',
+        axis: 'stocks',
         lastTickAt: new Date(NOW - 1_000).toISOString(), // LIVE — ticking right now
         consecutiveFailures: 4,
         engineEnabled: false,
@@ -459,7 +457,7 @@ describe('TRA-3432 engine-disabled is a LABEL, not an operand', () => {
     // Same, via the on-disk operand rather than the counter.
     const staleFileFlaggedOff = gradePersistRow(
       liveRow({
-        axis: 'crypto',
+        axis: 'stocks',
         lastTickAt: new Date(NOW - 1_000).toISOString(),
         fileMtimeMs: NOW - 86_400_000,
         engineEnabled: false,
@@ -471,7 +469,7 @@ describe('TRA-3432 engine-disabled is a LABEL, not an operand', () => {
 
     // And it cannot manufacture a GREEN either.
     const healthyFlaggedOff = gradePersistRow(
-      liveRow({ axis: 'crypto', engineEnabled: false }),
+      liveRow({ axis: 'stocks', engineEnabled: false }),
       NOW,
     );
     expect(healthyFlaggedOff.verdict).toBe('CURRENT');
@@ -480,15 +478,15 @@ describe('TRA-3432 engine-disabled is a LABEL, not an operand', () => {
   it('an engine-disabled row is still excluded from the denominator, never STALE', () => {
     // The property TRA-3407's negative control pins, restated for the labelled
     // row: loosening the qualifier so a dark box grades STALE is the failure mode
-    // the qualifier exists to prevent. 64 dark crypto books must not turn the
+    // the qualifier exists to prevent. 64 dark books must not turn the
     // fleet verdict red.
     const dark = Array.from({ length: 64 }, (_, i) =>
       gradePersistRow(
         liveRow({
           username: `book${i}`,
-          axis: 'crypto',
+          axis: 'stocks',
           lastTickAt: null,
-          fileMtimeMs: NOW - 86_400_000, // WAY past the 600s crypto budget
+          fileMtimeMs: NOW - 86_400_000, // WAY past the 300s stocks budget
           engineEnabled: false,
         }),
         NOW,
@@ -506,7 +504,7 @@ describe('TRA-3432 engine-disabled is a LABEL, not an operand', () => {
   });
 
   it('omitting the label is treated as ENABLED — a forgetful caller loses legibility, not safety', () => {
-    const row = liveRow({ axis: 'crypto', lastTickAt: null });
+    const row = liveRow({ axis: 'stocks', lastTickAt: null });
     expect(row.engineEnabled).toBeUndefined();
     expect(gradePersistRow(row, NOW).reason).toBe('no-tick-observed');
     // `true` and omitted must agree.

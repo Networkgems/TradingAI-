@@ -232,7 +232,7 @@ function selftest() {
       gradedRowCount: 4,
       currentRowCount: 3,
       notMeasuredRowCount: 1,
-      notMeasuredRows: [{ username: 'admin', axis: 'crypto', reason: 'file-unreadable' }],
+      notMeasuredRows: [{ username: 'admin', axis: 'stocks', reason: 'file-unreadable' }],
     }).code,
     EXIT_NOT_MEASURED,
   );

@@ -9,11 +9,11 @@
 import type { AccountSettings, LiveCredentialField } from '@trading-app/shared';
 import { findMissingLiveCredentials } from '@trading-app/shared';
 
-// TRA-4629 — the shared LiveCredentialField union still carries the retired
-// Coinbase fields until their backend removal lands; this map deliberately
-// labels only the Tradier fields, and the filter below drops anything else so
-// a retired field can never surface here.
-const FIELD_LABELS: Partial<Record<LiveCredentialField, string>> = {
+// TRA-4729 — the retired Coinbase fields are gone from LiveCredentialField
+// (TRA-4629 left them there pending this backend removal), so the map is now
+// total: a new credential field fails to compile until it is labelled. The
+// filter below stays as a belt-and-braces guard against an unlabelled value.
+const FIELD_LABELS: Record<LiveCredentialField, string> = {
   liveApiKeyOptionsProduction: 'Tradier production API token',
   liveAccountIdOptionsProduction: 'Tradier production account ID',
   liveApiKeyOptionsSandbox: 'Tradier sandbox API token',
