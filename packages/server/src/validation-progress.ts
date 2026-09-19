@@ -58,7 +58,6 @@ export interface ValidationProgressExclusions {
   /** Rows the harness refused to price, by reason. */
   unpriced: number;
   unreportedFees: number;
-  unmeasuredMid: number;
   /** Opens with no matching close yet — a position, not a discard. */
   stillOpen: number;
   /** Closes with no matching open in the ledger. */
@@ -96,6 +95,13 @@ export interface ValidationProgressReport {
    * it is counted, never folded silently into the cohort.
    */
   roundTripsWithInferredOpenBook: number;
+  /**
+   * TRA-4736 — of `roundTrips`, those with no mid on a leg. PRICED and in the
+   * cohort (net P&L never reads the mid); only their `slippageCost` is
+   * UNMEASURED. Not an exclusion: until TRA-4736 they were one
+   * (`excluded.unmeasuredMid`), and the two it dropped were both losers.
+   */
+  roundTripsWithoutMid: number;
   excluded: ValidationProgressExclusions;
   sleeves: SleeveProgress[];
   /**
@@ -175,7 +181,6 @@ export function computeValidationProgress(
     otherSleeve: 0,
     unpriced: 0,
     unreportedFees: 0,
-    unmeasuredMid: 0,
     stillOpen: 0,
     noMatchingOpen: 0,
   };
@@ -198,7 +203,6 @@ export function computeValidationProgress(
     switch (u.reason) {
       case 'unpriced_fill': excluded.unpriced += 1; break;
       case 'unreported_fees': excluded.unreportedFees += 1; break;
-      case 'unmeasured_mid': excluded.unmeasuredMid += 1; break;
       case 'still_open': excluded.stillOpen += 1; break;
       case 'no_matching_open': excluded.noMatchingOpen += 1; break;
     }
@@ -236,6 +240,7 @@ export function computeValidationProgress(
     coverage,
     roundTrips: roundTrips.length,
     roundTripsWithInferredOpenBook: roundTrips.filter((t) => t.openBookInferred).length,
+    roundTripsWithoutMid: roundTrips.filter((t) => t.slippageCost === null).length,
     excluded,
     sleeves,
     unmeasured,

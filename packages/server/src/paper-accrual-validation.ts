@@ -82,7 +82,11 @@ export interface HarnessFill {
   contracts: number;
   /** Broker-reported fill. `null` = UNMEASURED; the fill cannot be priced. */
   filledPrice: number | null;
-  /** Mid at submit, for the implicit-cost leg. `null` on a single-sided quote. */
+  /**
+   * Mid at submit, for the implicit-cost leg. `null` on a single-sided quote.
+   * Attribution-only (TRA-4736): a null mid leaves the trip PRICED and its
+   * `slippageCost` UNMEASURED — it never takes a cash round-trip out.
+   */
   midAtSubmit: number | null;
   /** Broker-reported total fees for this fill. `null` = UNREPORTED, never zero. */
   fees: number | null;
@@ -118,8 +122,11 @@ export interface RoundTrip {
    *
    * ⛔ NOT deducted from `netPnl` (TRA-4730). It is already inside `grossPnl`;
    * the identity is (exitMid − entryMid) × 100 × q − slippageCost − fees = netPnl.
+   *
+   * `null` = UNMEASURED (TRA-4736): a leg's mid was missing. Never 0 — a zero
+   * would read as "filled at mid" and understate the crossing.
    */
-  slippageCost: number;
+  slippageCost: number | null;
   /** grossPnl − fees. Cash P&L; the number the gate actually grades. */
   netPnl: number;
   /**
@@ -139,8 +146,7 @@ export interface UnpairedFill {
     | 'no_matching_open'
     | 'still_open'
     | 'unpriced_fill'
-    | 'unreported_fees'
-    | 'unmeasured_mid';
+    | 'unreported_fees';
 }
 
 export interface PairingResult {
@@ -160,10 +166,16 @@ export interface PairingResult {
  * A stamped close its own book cannot satisfy falls back to UNATTRIBUTED
  * (`book: null`) opens of the same symbol, flagged `openBookInferred` (TRA-4730).
  *
- * ⚠ A fill missing `filledPrice`, `fees`, or `midAtSubmit` is NOT priced and NOT
- * counted. `null` is UNMEASURED, never zero (TRA-1707): treating an unreported
- * fee as zero fee biases every downstream statistic in the flattering direction,
- * which is precisely the failure mode a net-of-fee gate exists to catch.
+ * ⚠ A fill missing `filledPrice` or `fees` is NOT priced and NOT counted. `null`
+ * is UNMEASURED, never zero (TRA-1707): treating an unreported fee as zero fee
+ * biases every downstream statistic in the flattering direction, which is
+ * precisely the failure mode a net-of-fee gate exists to catch.
+ *
+ * A missing `midAtSubmit` is NOT a reason to refuse (TRA-4736). `netPnl` never
+ * reads the mid; only the `slippageCost` attribution does, so that field alone
+ * goes `null`. Refusing the whole trip dropped SOFI (−33.24) and KO (−68.24) off
+ * the live OTM ledger — both losers, so the refusal FLATTERED the cohort (n=9,
+ * −87.81 against the true n=11, −189.29): layer 4's failure mode by another door.
  */
 export function pairFillsIntoRoundTrips(fills: readonly HarnessFill[]): PairingResult {
   const roundTrips: RoundTrip[] = [];
@@ -172,13 +184,14 @@ export function pairFillsIntoRoundTrips(fills: readonly HarnessFill[]): PairingR
   const unmeasured = (f: HarnessFill): UnpairedFill['reason'] | null => {
     if (f.filledPrice === null || !Number.isFinite(f.filledPrice)) return 'unpriced_fill';
     if (f.fees === null || !Number.isFinite(f.fees)) return 'unreported_fees';
-    if (f.midAtSubmit === null || !Number.isFinite(f.midAtSubmit)) return 'unmeasured_mid';
     return null;
   };
 
   // Queue of still-open lots, keyed by the position's identity.
   const openQueues = new Map<string, { fill: HarnessFill; remaining: number }[]>();
   const keyOf = (f: HarnessFill) => `${f.book ?? ''}\u0000${f.optionSymbol}`;
+  const midOf = (f: HarnessFill): number | null =>
+    f.midAtSubmit !== null && Number.isFinite(f.midAtSubmit) ? f.midAtSubmit : null;
 
   const ordered = [...fills].sort((a, b) => a.ts - b.ts);
 
@@ -218,11 +231,16 @@ export function pairFillsIntoRoundTrips(fills: readonly HarnessFill[]): PairingR
         // improvement and reads negative. ⛔ Never deducted again (TRA-4730):
         // the old `grossPnl − fees − |fill − mid|` charged the spread twice and
         // turned RIG's 2¢ exit improvement into a $2 cost.
-        const openSlip = (openPrice - lot.fill.midAtSubmit!) * CONTRACT_MULTIPLIER * matched;
-        const closeSlip = (fill.midAtSubmit! - closePrice) * CONTRACT_MULTIPLIER * matched;
+        // Either mid missing ⇒ the attribution is UNMEASURED, never 0 (TRA-4736).
+        const openMid = midOf(lot.fill);
+        const closeMid = midOf(fill);
+        const slippageCost =
+          openMid === null || closeMid === null
+            ? null
+            : (openPrice - openMid) * CONTRACT_MULTIPLIER * matched
+              + (closeMid - closePrice) * CONTRACT_MULTIPLIER * matched;
 
         const fees = openFeeShare + closeFeeShare;
-        const slippageCost = openSlip + closeSlip;
         const netPnl = grossPnl - fees;
         const capitalAtRisk = openPrice * CONTRACT_MULTIPLIER * matched;
 
@@ -295,7 +313,14 @@ export interface CohortStats {
   grossLoss: number;
   totalNetPnl: number;
   totalFees: number;
+  /** Sum of the MEASURED `slippageCost`s only — read it beside `slippageUnattributed`. */
   totalSlippage: number;
+  /**
+   * TRA-4736 — trips in the cohort whose `slippageCost` is `null` (a leg had no
+   * mid). They count toward n and net P&L, and are absent from `totalSlippage`,
+   * which therefore understates the crossing by an unknown amount.
+   */
+  slippageUnattributed: number;
   /** Mean and SD of per-trade NET RETURN — the inputs to the power calc. */
   meanNetReturnPct: number;
   stdDevNetReturnPct: number;
@@ -325,6 +350,7 @@ export function computeCohortStats(trips: readonly RoundTrip[]): CohortStats {
     totalNetPnl: 0,
     totalFees: 0,
     totalSlippage: 0,
+    slippageUnattributed: 0,
     meanNetReturnPct: 0,
     stdDevNetReturnPct: 0,
     compoundedReturnPct: 0,
@@ -374,7 +400,8 @@ export function computeCohortStats(trips: readonly RoundTrip[]): CohortStats {
     grossLoss,
     totalNetPnl,
     totalFees: trips.reduce((s, t) => s + t.fees, 0),
-    totalSlippage: trips.reduce((s, t) => s + t.slippageCost, 0),
+    totalSlippage: trips.reduce((s, t) => s + (t.slippageCost ?? 0), 0),
+    slippageUnattributed: trips.filter((t) => t.slippageCost === null).length,
     meanNetReturnPct: mean,
     stdDevNetReturnPct: Math.sqrt(variance),
     compoundedReturnPct: compounded - 1,

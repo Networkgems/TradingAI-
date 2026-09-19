@@ -236,7 +236,9 @@ describe('TRA-4730 — the live OTM ledger, priced once', () => {
   });
 
   it('the 6 strictly-keyed round-trips net −33.63 cash, 2 winners (XLF +0.30, TTD +3.30)', () => {
-    const strict = pair().roundTrips.filter((t) => !t.openBookInferred);
+    // The set bqb1 served: strictly keyed AND mid-measured (SOFI and KO joined
+    // the cohort only at TRA-4736).
+    const strict = pair().roundTrips.filter((t) => !t.openBookInferred && t.slippageCost !== null);
     expect(strict).toHaveLength(6);
     const s = computeCohortStats(strict);
     expect(s.totalNetPnl).toBeCloseTo(-33.63, 6);
@@ -260,29 +262,56 @@ describe('TRA-4730 — the live OTM ledger, priced once', () => {
     expect(doubleCharged).toBeCloseTo(-113.13, 6);
   });
 
-  it('every trip satisfies mid-to-mid − signed crossing − fees = net', () => {
+  it('every mid-measured trip satisfies mid-to-mid − signed crossing − fees = net', () => {
     const { roundTrips } = pair();
-    expect(roundTrips.length).toBeGreaterThan(0);
-    for (const t of roundTrips) {
+    const measured = roundTrips.filter((t) => t.slippageCost !== null);
+    expect(measured).toHaveLength(9);
+    for (const t of measured) {
       const { open, close } = legsOf(t.openTs, t.closeTs);
-      expect((close.midAtSubmit! - open.midAtSubmit!) * 100 - t.slippageCost - t.fees).toBeCloseTo(t.netPnl, 9);
+      expect((close.midAtSubmit! - open.midAtSubmit!) * 100 - t.slippageCost! - t.fees).toBeCloseTo(t.netPnl, 9);
     }
   });
 
-  it('recovers BULL, ETHA and NVTS13 across the 08-27 book stamp: n 6 → 9, counted', () => {
-    expect(report.roundTrips).toBe(9);
+  it('recovers BULL, ETHA and NVTS13 across the 08-27 book stamp, and SOFI and KO despite no mid: n 6 → 11, counted', () => {
+    expect(report.roundTrips).toBe(11);
     expect(report.roundTripsWithInferredOpenBook).toBe(3);
+    expect(report.roundTripsWithoutMid).toBe(2);
     expect(report.excluded.noMatchingOpen).toBe(0);
-    // NOK never closed; the SOFI and KO closes have no mid, so their opens sit
-    // queued behind them as still_open.
-    expect(report.excluded.unmeasuredMid).toBe(2);
-    expect(report.excluded.stillOpen).toBe(3);
-    expect(otm.observedN).toBe(9);
-    expect(otm.stats.totalNetPnl).toBeCloseTo(-87.81, 6);
-    expect(otm.stats.winRate).toBeCloseTo(3 / 9, 9);
-    // Before TRA-4730 this cohort served n=6, σ 0.1930, requiredN 30, PF 0.
-    expect(otm.stats.stdDevNetReturnPct).toBeCloseTo(0.2013, 4);
-    expect(otm.power.requiredN).toBe(32);
-    expect(otm.stats.profitFactor).toBeCloseTo(0.0729, 4);
+    expect(report.excluded).not.toHaveProperty('unmeasuredMid');
+    // Only NOK is left: it never closed.
+    expect(report.excluded.stillOpen).toBe(1);
+    expect(otm.observedN).toBe(11);
+    expect(otm.stats.totalNetPnl).toBeCloseTo(-189.29, 6);
+    expect(otm.stats.winRate).toBeCloseTo(3 / 11, 9);
+    expect(otm.stats.slippageUnattributed).toBe(2);
+    // Before TRA-4736 (n=9): σ 0.2013, requiredN 32, PF 0.0729, expectancy −9.76.
+    expect(otm.stats.stdDevNetReturnPct).toBeCloseTo(0.1982, 4);
+    expect(otm.power.requiredN).toBe(31);
+    expect(otm.stats.profitFactor).toBeCloseTo(0.0352, 4);
+    expect(otm.stats.expectancy).toBeCloseTo(-189.29 / 11, 6);
+    // Crossing over the 9 mid-measured trips only; the other 2 are counted, not zeroed.
+    expect(otm.stats.totalSlippage).toBeCloseTo(103, 6);
+
+    const noMid = pair().roundTrips.filter((t) => t.slippageCost === null);
+    expect(noMid.map((t) => [t.optionSymbol, +t.netPnl.toFixed(2)])).toEqual([
+      ['SOFI260925C00019000', -33.24],
+      ['KO261002C00090000', -68.24],
+    ]);
+  });
+
+  it('NEGATIVE CONTROL: refusing the null-mid fills (the pre-TRA-4736 rule) reproduces n=9, −87.81', () => {
+    // Drop exactly what the old `unmeasured_mid` check refused, then grade with
+    // the shipped code. If the fixture or the pricing drifted, this moves off the
+    // figures TRA-4730 recorded.
+    const refused = computeValidationProgress(LIVE_OTM_LEDGER_20260919.filter((r) => r.midAtSubmit !== null));
+    const v = refused.sleeves.find((s) => s.sleeve === 'single_leg_otm')!.verdict;
+    expect(v.observedN).toBe(9);
+    expect(v.stats.totalNetPnl).toBeCloseTo(-87.81, 6);
+    expect(v.stats.winRate).toBeCloseTo(3 / 9, 9);
+    expect(v.stats.stdDevNetReturnPct).toBeCloseTo(0.2013, 4);
+    expect(v.power.requiredN).toBe(32);
+    expect(v.stats.profitFactor).toBeCloseTo(0.0729, 4);
+    // …and the two refused trips are exactly the gap: both losers, −101.48.
+    expect(otm.stats.totalNetPnl - v.stats.totalNetPnl).toBeCloseTo(-33.24 - 68.24, 6);
   });
 });

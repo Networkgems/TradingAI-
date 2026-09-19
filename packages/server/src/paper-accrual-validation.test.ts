@@ -50,7 +50,7 @@ describe('pairFillsIntoRoundTrips', () => {
     expect(t.netPnl).toBeCloseTo(50 - 2.6, 6);
     expect(t.netReturnPct).toBeCloseTo(47.4 / 100, 6);
     // The identity the attribution must satisfy: mid-to-mid − crossing − fees = net.
-    expect((1.52 - 0.98) * 100 - t.slippageCost - t.fees).toBeCloseTo(t.netPnl, 6);
+    expect((1.52 - 0.98) * 100 - t.slippageCost! - t.fees).toBeCloseTo(t.netPnl, 6);
   });
 
   it('THE POINT: the crossing can flip a mid-to-mid winner into a cash loser', () => {
@@ -127,11 +127,38 @@ describe('pairFillsIntoRoundTrips', () => {
     expect(unpaired).toHaveLength(0);
   });
 
-  it('refuses an unpriced fill and an unmeasured mid', () => {
+  it('refuses an unpriced fill', () => {
     const a = pairFillsIntoRoundTrips([fill({ filledPrice: null })]);
     expect(a.unpaired[0]!.reason).toBe('unpriced_fill');
-    const b = pairFillsIntoRoundTrips([fill({ midAtSubmit: null })]);
-    expect(b.unpaired[0]!.reason).toBe('unmeasured_mid');
+  });
+
+  it('PRICES a trip with a null mid on either leg; only the attribution goes UNMEASURED (TRA-4736)', () => {
+    // SOFI on the live OTM ledger: 1.23 → 0.90, no mid on the close.
+    for (const [openMid, closeMid] of [[1.205, null], [null, 0.91], [null, null]] as const) {
+      const { roundTrips, unpaired } = pairFillsIntoRoundTrips([
+        fill({ ts: 1, side: 'buy_to_open', filledPrice: 1.23, midAtSubmit: openMid, fees: 0.11 }),
+        fill({ ts: 2, side: 'sell_to_close', filledPrice: 0.9, midAtSubmit: closeMid, fees: 0.13 }),
+      ]);
+      expect(unpaired).toHaveLength(0);
+      expect(roundTrips).toHaveLength(1);
+      expect(roundTrips[0]!.netPnl).toBeCloseTo(-33.24, 6);
+      // null, NEVER 0 — a zero would read as "filled at mid".
+      expect(roundTrips[0]!.slippageCost).toBeNull();
+    }
+  });
+
+  it('totalSlippage sums the MEASURED trips only and counts the rest beside it', () => {
+    const { roundTrips } = pairFillsIntoRoundTrips([
+      fill({ ts: 1, side: 'buy_to_open', filledPrice: 1.0, midAtSubmit: 0.98, fees: 0 }),
+      fill({ ts: 2, side: 'sell_to_close', filledPrice: 1.5, midAtSubmit: 1.52, fees: 0 }),
+      fill({ ts: 3, side: 'buy_to_open', filledPrice: 1.0, midAtSubmit: 0.9, fees: 0 }),
+      fill({ ts: 4, side: 'sell_to_close', filledPrice: 0.5, midAtSubmit: null, fees: 0 }),
+    ]);
+    const s = computeCohortStats(roundTrips);
+    expect(s.n).toBe(2);
+    expect(s.totalNetPnl).toBeCloseTo(0, 6);
+    expect(s.totalSlippage).toBeCloseTo(4, 6);
+    expect(s.slippageUnattributed).toBe(1);
   });
 
   it('reports a still-open position instead of discarding it', () => {
