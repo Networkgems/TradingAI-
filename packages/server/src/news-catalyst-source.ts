@@ -548,9 +548,34 @@ interface SessionSweepState {
 
 const sweepStates = new Map<string, SessionSweepState>();
 
+/**
+ * Retire every other key for this window, so the map holds AT MOST ONE state
+ * per window — the invariant the old single-slot `sweepState` gave for free and
+ * that {@link catalystSweepGateSnapshot} reads. Without this the map is
+ * append-only for the life of the process: an unbounded leak on a long-lived
+ * pm2 box, and a health probe frozen on day 1. An evicted state is still held
+ * by any caller mid-await, so dropping it here cannot strand an in-flight
+ * sweep — it only stops a PAST session from being consulted again, which is
+ * exactly what the pre-TRA-4901 code did when `sweepState.session !== session`.
+ */
+function retireStaleWindowKeys(liveKey: string, window: CatalystSweepWindow): void {
+  for (const k of [...sweepStates.keys()]) {
+    if (k !== liveKey && k.endsWith(`:${window}`)) sweepStates.delete(k);
+  }
+}
+
 /** Test seam — forget every per-session/window sweep gate. */
 export function resetCatalystSweepGateForTests(): void {
   sweepStates.clear();
+}
+
+/**
+ * Test seam — how many session/window states are resident. The at-most-one-per-
+ * window invariant is otherwise unobservable from outside, and an append-only
+ * map is both a leak and the cause of the frozen probe (TRA-4737).
+ */
+export function catalystSweepStateCountForTests(): number {
+  return sweepStates.size;
 }
 
 /** Probe view of the gate, for `/api/health/news-catalyst-signals`. Defaults to `premarket`. */
@@ -568,9 +593,17 @@ export interface CatalystSweepGateSnapshot {
 export function catalystSweepGateSnapshot(
   window: CatalystSweepWindow = 'premarket',
 ): CatalystSweepGateSnapshot {
-  // Best-effort session label: any live key sharing this window (there is at
-  // most one per window at a time — a new ET day replaces it).
-  const state = [...sweepStates.values()].find((s) => s.key.endsWith(`:${window}`)) ?? null;
+  // The live key for this window. `retireStaleWindowKeys` keeps at most one
+  // per window, so this loop normally sees exactly one candidate; it takes the
+  // LAST match rather than the first so that even if that eviction ever
+  // regressed, the probe would report the newest session instead of silently
+  // freezing on the oldest one the process ever saw. (TRA-4737: `Map` iterates
+  // in insertion order, so a `.find()` here reported day 1 forever and a dead
+  // feed read `healthy: true` from the second ET day onward.)
+  let state: SessionSweepState | null = null;
+  for (const s of sweepStates.values()) {
+    if (s.key.endsWith(`:${window}`)) state = s;
+  }
   return {
     session: state ? state.key.slice(0, state.key.length - window.length - 1) : null,
     window,
@@ -615,6 +648,7 @@ export async function sessionCatalystPicks(
       inFlight: null,
     };
     sweepStates.set(key, state);
+    retireStaleWindowKeys(key, window);
   }
   // Single-flight: a concurrent caller waits for the running sweep, then reads
   // its outcome like any later caller.
