@@ -644,6 +644,10 @@ import {
   netEdgeFormPredicate,
   tapeExpectancyFlatPredicate,
 } from './live-enforce-gate-predicate.js';
+// TRA-4753 — the NUMERATOR's provenance. Same contract as the predicate builders
+// above: built from the verdict and the table it was decided against, never from
+// a second read of the cache.
+import { tapeExpectancyGrossProvenance } from './live-enforce-gate-gross-provenance.js';
 // TRA-3216 (parent TRA-2760) — the LIVE OTM underlying allowlist. The scan is
 // handed the full ~614-name watchlist; this is the only universe restriction on
 // the real-money path.
@@ -8417,9 +8421,16 @@ export class SignalEngine {
       // `insufficient_evidence`: the tape holds 471 live-universe rows and ALL of
       // them are |Δ| < 0.20, so the band the gate admits has literally never been
       // measured on the names real money may trade.
+      // TRA-4753 — the table is peeked ONCE and held, because the numerator
+      // stamp below must describe the fold THIS verdict was made against. The
+      // cache re-folds on a 60s TTL and on every option close, so a second
+      // `peekTapeExpectancyTable()` can hand back a different estimator and the
+      // stamp would then name a generation the gate never used — the same class
+      // of defect as re-reading today's table at fold time, one layer down.
+      const tapeTable = peekTapeExpectancyTable();
       const tape = tapeExpectancyVerdict(
         { structure, delta: inputs.delta },
-        peekTapeExpectancyTable(),
+        tapeTable,
         resolveCostGateConfig(process.env),
       );
       // TRA-3272 — NET-EDGE form on the LIVE branch. Process-env only (same
@@ -8456,6 +8467,13 @@ export class SignalEngine {
           }
           : null,
         grossR,
+        // TRA-4753 — WHERE that `grossR` came from: the producing site, the
+        // estimator fold's identity, the cell's tape window AS OF THIS DECISION,
+        // its `n` and its demo/live split. Built from `tapeTable` (the object the
+        // verdict above was computed from) plus the verdict itself, so it can
+        // never describe an estimator the gate did not consult. On BOTH record
+        // sites: the numerator is the same cell constant in either form.
+        grossRProvenance: tapeExpectancyGrossProvenance(tapeTable, tape),
         // TRA-3510 — travels with the cost block so BOTH the flat and net-edge
         // record sites carry it; the deployed form is the flat one, and it is the
         // branch TRA-3481's k-decision will actually be read off.

@@ -48,6 +48,13 @@ import {
 } from './option-net-edge-bar.js';
 import { impliedBarR } from './live-enforce-gate-predicate.js';
 import type { ImpliedBarR, LiveEnforceGatePredicate } from './live-enforce-gate-predicate.js';
+// TRA-4753 — the NUMERATOR's provenance: the counterpart of `impliedBarR`, which
+// recovered the denominator.
+import { foldGrossRProvenance } from './live-enforce-gate-gross-provenance.js';
+import type {
+  GrossRProvenance,
+  GrossRProvenanceFold,
+} from './live-enforce-gate-gross-provenance.js';
 import type { AdmissibleSelection } from './otm-admissible-strike.js';
 import {
   OPTION_LIVE_OTM_UNIVERSE_DEFAULT,
@@ -345,6 +352,26 @@ export interface LiveEnforceRecord {
    */
   grossR?: number;
   /**
+   * TRA-4753 — WHERE {@link grossR} came from, stamped at the decision.
+   *
+   * `grossR` alone cannot answer the question the CFO held a board decision
+   * open for. On 2026-09-20 three enforcing cells published a `grossR`
+   * distribution with ZERO dispersion whose constants equalled
+   * `arm.costBar.edge.otmCells[].lowerCI95` exactly — which is consistent with
+   * "the gate reads the estimator cell" AND with "something else happens to
+   * agree", and the payload could not separate them. This field does: it names
+   * the producing site, the estimator fold (`estimatorGeneration`), the cell's
+   * tape window AS OF THAT DECISION, its `n` and its demo/live split.
+   *
+   * Shared BY REFERENCE across rows of one `(cell, generation)` — it holds
+   * nothing decision-specific, because the per-row half (how stale the tape was
+   * at that instant) is `ts`, already on this record.
+   *
+   * Absent ⇒ a non-`cost_bar` gate or a row predating this field, published as
+   * `grossRProvenance.rowsUnstamped`.
+   */
+  grossRProvenance?: GrossRProvenance;
+  /**
    * TRA-4745 — the UNDERLYING this verdict ruled on.
    *
    * NOT redundant with {@link scope}: on `cost_bar` the scope key is the
@@ -564,6 +591,15 @@ interface CostSample extends NetEdgeShadowSample {
   reasonCode: string | null;
   /** TRA-4745 — the realised comparison. Null on pre-field rows. */
   predicate: LiveEnforceGatePredicate | null;
+  /** TRA-4753 — where the numerator came from. Null on pre-field rows. */
+  grossRProvenance: GrossRProvenance | null;
+  /**
+   * TRA-4753 — the decision instant. `etDay` cannot date a tape: the whole point
+   * of the numerator stamp is `decidedAt − tapeToTs`, and a day-resolution clock
+   * would round a seven-week staleness to the nearest day AND make two folds
+   * inside one session indistinguishable.
+   */
+  ts: number;
 }
 
 /**
@@ -952,6 +988,11 @@ function apply(rec: LiveEnforceRecord): void {
             ? rec.reasonCode
             : null,
         predicate: usablePredicate(rec.predicate) ? rec.predicate! : null,
+        // TRA-4753 — the numerator stamp and the decision instant it is dated
+        // against. Independently nullable like the three above: a pre-deploy row
+        // carries a cost and no provenance.
+        grossRProvenance: usableGrossRProvenance(rec.grossRProvenance) ? rec.grossRProvenance! : null,
+        ts: rec.ts,
       });
     } else {
       tallies.costSamplesDropped += 1;
@@ -1030,6 +1071,9 @@ export function recordLiveEnforceDecision(
     // and hydrates as a COUNTED miss rather than a synthetic value.
     symbol?: string | null;
     predicate?: LiveEnforceGatePredicate | null;
+    // TRA-4753 — where the numerator came from. `cost_bar` only today; optional
+    // on the same terms as the two above.
+    grossRProvenance?: GrossRProvenance | null;
     // TRA-3510 — which TRA-3401 branch nominated this candidate. Null/absent on
     // every non-OTM call site, which is the honest reading: those rows were not
     // produced by the OTM nominator at all.
@@ -1065,6 +1109,10 @@ export function recordLiveEnforceDecision(
     // MISSING stamp, never the empty-string key.
     ...(typeof opts?.symbol === 'string' && opts.symbol !== '' ? { symbol: opts.symbol } : {}),
     ...(usablePredicate(opts?.predicate ?? undefined) ? { predicate: opts!.predicate! } : {}),
+    // TRA-4753 — the numerator stamp.
+    ...(usableGrossRProvenance(opts?.grossRProvenance ?? undefined)
+      ? { grossRProvenance: opts!.grossRProvenance! }
+      : {}),
     ...(usableNominator(opts?.nominator) ? { nominator: opts!.nominator! } : {}),
     // TRA-3674 — stamped on BOTH verdicts. The admits are what supply the
     // denominator that tells "the budget never had to bite" apart from "the
@@ -1163,6 +1211,45 @@ function usablePredicate(p: LiveEnforceRecord['predicate']): boolean {
       && typeof p.rhs === 'number' && Number.isFinite(p.rhs);
   }
   return p.lhs === null && p.rhs === null && typeof p.shortCircuit === 'string';
+}
+
+/** The numerator-source kinds this ledger will publish. A row naming anything
+ *  else hydrates as UNSTAMPED rather than minting a key nobody documented. */
+const GROSS_R_SOURCE_KINDS: readonly string[] = [
+  'tape_cell_lower_ci95',
+  'tape_cell_unmeasured',
+  'no_cell',
+  'mandate_deauthorized',
+  'unfolded_tape',
+  'per_candidate_model',
+];
+
+/**
+ * TRA-4753 — is a numerator-provenance stamp usable?
+ *
+ * Same write-path/hydrate-path sharing as {@link usablePredicate}. Two
+ * invariants are ENFORCED rather than trusted:
+ *
+ *   • `source` must be a NON-EMPTY string. The ticket's acceptance is "the
+ *     published `grossRSource` is a concrete named source, not `null` /
+ *     `unstamped`", so a blank one must fail to record — otherwise the field
+ *     that certifies the stamp would itself be the thing that reads empty.
+ *   • `kind: 'tape_cell_lower_ci95'` demands a finite `grossR`. That kind MEANS
+ *     "the comparison ran against this number"; carrying it with a null value
+ *     would assert a comparison that had no left side, which is the TRA-4745
+ *     defect re-opened on the numerator axis.
+ */
+function usableGrossRProvenance(p: LiveEnforceRecord['grossRProvenance']): boolean {
+  if (!p || typeof p !== 'object') return false;
+  if (typeof p.source !== 'string' || p.source === '') return false;
+  if (typeof p.kind !== 'string' || !GROSS_R_SOURCE_KINDS.includes(p.kind)) return false;
+  if (typeof p.perCandidate !== 'boolean') return false;
+  if (typeof p.n !== 'number' || !Number.isFinite(p.n)) return false;
+  if (!p.byMode || typeof p.byMode !== 'object') return false;
+  if (p.kind === 'tape_cell_lower_ci95') {
+    return typeof p.grossR === 'number' && Number.isFinite(p.grossR);
+  }
+  return p.grossR === null || p.grossR === undefined || Number.isFinite(p.grossR);
 }
 
 /**
@@ -1284,6 +1371,15 @@ export function hydrateLiveEnforceGateFromDisk(dir: string, now: number = Date.n
       // fold rather than a hole nobody can see.
       ...(typeof rec.symbol === 'string' && rec.symbol !== '' ? { symbol: rec.symbol } : {}),
       ...(usablePredicate(rec.predicate) ? { predicate: rec.predicate! } : {}),
+      // TRA-4753 — same contract: every row on disk today predates the numerator
+      // stamp and hydrates WITHOUT it, which is what makes
+      // `grossRProvenance.rowsUnstamped` the honest coverage denominator rather
+      // than a hole a reader cannot see. ⚠️ Hydrated stamps are NOT interned —
+      // each JSONL line rebuilds its own object — so a retained fold holds one
+      // per row. That is bounded by the same retention the rest of the fold is.
+      ...(usableGrossRProvenance(rec.grossRProvenance)
+        ? { grossRProvenance: rec.grossRProvenance! }
+        : {}),
       // TRA-3674 — a row written before the budget terms existed hydrates
       // WITHOUT them (a missing stamp), never with a synthetic zero budget,
       // which would read as "this book was allowed nothing".
@@ -1426,6 +1522,25 @@ export interface LiveEnforceCellSummary {
    * here constrained the bar.
    */
   barRImplied: ImpliedBarR | null;
+  /**
+   * ⭐ TRA-4753 — the NUMERATOR's provenance, and the direct counterpart of
+   * `barRImplied` above (which recovers the DENOMINATOR). WHERE this cell's
+   * `grossR` came from, WHICH estimator fold produced it, how many decisions each
+   * fold was replayed across, and how stale the TAPE behind it was AT THOSE
+   * DECISIONS.
+   *
+   * **Read `constantAcrossRows` FIRST.** `true` says every stamped decision in
+   * this cell was compared against ONE per-cell number — so `blocked ===
+   * evaluated` is the EXPECTED shape of a bound sitting under the bar, and the
+   * refusal COUNT carries no more evidence than its first row does. Then read
+   * `generations[].tapeAgeMsAtLastDecision`, which is the age of the TAPE:
+   * `arm.costBar.edge.freshness.ageMs` times the RECOMPUTE and reads identically
+   * whether the tape is an hour or seven weeks old.
+   *
+   * Null ⇒ this cell produced no cost samples at all. `rowsUnstamped` inside it
+   * is the coverage denominator — every row written before this deploy.
+   */
+  grossRProvenance: GrossRProvenanceFold | null;
   /**
    * TRA-4745 — one sampled BLOCKED row per ET day in this cell, carrying the
    * exact comparison the gate evaluated. Empty on a cell with no blocks, and on
@@ -2009,6 +2124,17 @@ export interface LiveEnforceGateSummary {
   rowsShortCircuited: number | null;
   predicateUnstamped: number | null;
   /**
+   * ⭐ TRA-4753 — the NUMERATOR's provenance over the WHOLE gate: which estimator
+   * folds decided, how many rows each was replayed across, and the tape age
+   * behind them at decision time. Non-null on `cost_bar` only.
+   *
+   * The per-CELL block (`byCell[].grossRProvenance`) is the one to read for a
+   * verdict; this one answers "is the whole gate running off one stale fold?" in
+   * a single field. `sources` is the acceptance surface: a concrete named
+   * producing site per row, never `null` / `unstamped`.
+   */
+  grossRProvenance: GrossRProvenanceFold | null;
+  /**
    * TRA-4745 — the per-UNDERLYING fold for `cost_bar`, busiest first. Non-null on
    * `cost_bar` only (`[]` at n=0, never omitted).
    *
@@ -2248,6 +2374,20 @@ function predicateSamples(samples: CostSample[]): LiveEnforcePredicateSample[] {
     });
   }
   return [...perDay.values()].sort((a, b) => a.etDay.localeCompare(b.etDay));
+}
+
+/**
+ * TRA-4753 — the numerator-provenance fold over a sample list.
+ *
+ * Adapter only: the fold itself is pure and lives in
+ * `live-enforce-gate-gross-provenance.ts`. `decidedAt` is the sample's own `ts`,
+ * which is what dates the tape — using `etDay` would round a seven-week
+ * staleness to a day and hide two folds inside one session.
+ */
+function grossRProvenanceFold(samples: CostSample[]): GrossRProvenanceFold | null {
+  return foldGrossRProvenance(
+    samples.map((s) => ({ provenance: s.grossRProvenance, decidedAt: s.ts })),
+  );
 }
 
 /** TRA-4745 — compared / short-circuited split over a sample list. */
@@ -2617,6 +2757,13 @@ function foldGates(
         // beside a 30-day distribution cannot say. Cross-read it against the
         // per-day `byEtDay[].byCell[].barRImplied` to find WHICH day moved.
         barRImplied: impliedBarR(cellSamples, shadowOpts.flatFormBarR ?? null),
+        // TRA-4753 — the other side of the same comparison. `barRImplied` above
+        // RECOVERS the denominator from rows already held; this one STAMPS the
+        // numerator at the decision, because the numerator cannot be recovered:
+        // re-reading today's estimator gives a value that is constant across
+        // every day by construction and so can neither confirm nor refute the
+        // "one verdict replayed" reading.
+        grossRProvenance: grossRProvenanceFold(cellSamples),
         predicateSamples: predicateSamples(cellSamples),
         predicateUnstamped: coverage.predicateUnstamped,
         rowsCompared: coverage.rowsCompared,
@@ -2717,6 +2864,10 @@ function foldGates(
       // at `n: 0` rather than omitted, so "not deployed" and "deployed, no rows
       // yet" stay distinguishable.
       grossRQuantiles: instrumented ? grossRQuantiles(tallies.costSamples) : null,
+      // TRA-4753 — the gate-wide numerator provenance, same `cost_bar`-only
+      // contract. `rowsStamped: 0, rowsUnstamped: N` is the correct reading on
+      // every fold until a post-deploy RTH nomination lands.
+      grossRProvenance: instrumented ? grossRProvenanceFold(tallies.costSamples) : null,
       rowsCompared: instrumented ? gatePredicateCoverage.rowsCompared : null,
       rowsShortCircuited: instrumented ? gatePredicateCoverage.rowsShortCircuited : null,
       predicateUnstamped: instrumented ? gatePredicateCoverage.predicateUnstamped : null,
