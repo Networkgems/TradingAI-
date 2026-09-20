@@ -247,7 +247,8 @@ export type SchedulerDedupeKey =
   | 'lastPremarketDate'
   | 'lastMorningBriefDate'
   | 'lastChainRecordDate'
-  | 'lastWeeklyRollupDate';
+  | 'lastWeeklyRollupDate'
+  | 'lastMiddayNewsDate';
 
 /**
  * TRA-4417 — every key this store carries is an ET date (`YYYY-MM-DD`) produced
@@ -335,6 +336,16 @@ export interface ScheduleCallbacks {
    */
   onChainRecord?: EodTriggerCallback;
   /**
+   * TRA-4901 — fires at OR AFTER 12:00 PM ET (through 12:30 PM ET), once per
+   * ET trading day. Forces a FRESH news-catalyst vendor sweep tagged
+   * `'midday'` (its own cache slot in `news-catalyst-source.ts`, independent
+   * of the 9am premarket sweep's cache/budget) so a headline that hits over
+   * lunch is available to the afternoon session instead of being masked by
+   * the once-per-session cache until tomorrow's premarket build. Deduped per
+   * ET date with the same catch-up-window pattern as the other hooks.
+   */
+  onMiddayNews?: EodTriggerCallback;
+  /**
    * TRA-1971 — fires once per week on MONDAY at OR AFTER 7:00 AM ET (through
    * noon), after the prior trading week's chains + Friday settlements have
    * accumulated on the durable disk. Publishes the AI-Options-Ideas forward-test
@@ -421,6 +432,8 @@ export class MarketScheduler {
   private lastChainRecordDate = '';
   /** TRA-1971 — last ET Monday date the weekly options roll-up fired. Dedupes per ISO week. */
   private lastWeeklyRollupDate = '';
+  /** TRA-4901 — last ET date the midday news-catalyst refresh hook fired. Dedupes within the day. */
+  private lastMiddayNewsDate = '';
   /**
    * TRA-1404 / TRA-4417 — persists the per-ET-day dedup keys so a restart INSIDE a
    * hook's catch-up window can't re-fire a hook that already ran today.
@@ -504,6 +517,7 @@ export class MarketScheduler {
       this.lastMorningBriefDate = take('lastMorningBriefDate');
       this.lastChainRecordDate = take('lastChainRecordDate');
       this.lastWeeklyRollupDate = take('lastWeeklyRollupDate');
+      this.lastMiddayNewsDate = take('lastMiddayNewsDate');
       // Logged even when empty: "restored nothing" and "never looked" are different
       // facts, and the second one is what TRA-4417 spent a live incident learning to
       // tell apart. An empty object here means a fresh disk, not a disabled store.
@@ -599,6 +613,23 @@ export class MarketScheduler {
         }
       }
 
+      // TRA-4901 — midday news-catalyst refresh. Fire at OR AFTER 12:00 ET
+      // through 12:30 ET (a 30-min catch-up window, matching the other
+      // once-per-day hooks) so a restart across noon still catches the day.
+      // Gated on market days; deduped per ET date. The window is placed after
+      // lunch's opening chop and well clear of the 9:00 premarket build and
+      // the 3:55 chain-record hook, so its own sweep budget (see
+      // `CatalystSweepWindow` in news-catalyst-source.ts) never contends with
+      // either.
+      if (hour === 12 && minute < 30) {
+        if (cfg.onMiddayNews && isMarketDay(date) && this.lastMiddayNewsDate !== todayKey) {
+          this.lastMiddayNewsDate = todayKey;
+          this.markFired('lastMiddayNewsDate', todayKey);
+          log.info('midday news-catalyst trigger fired', { date: todayKey, etHour: hour, etMinute: minute });
+          runScheduled('midday-news', cfg.onMiddayNews);
+        }
+      }
+
       // TRA-1971 — weekly options-ideas roll-up. Monday 07:00–11:59 ET window,
       // deduped per ET Monday date (unique per ISO week). The at-or-after window
       // heals a server that was asleep across 07:00; publishing bookkeeping is
@@ -667,7 +698,7 @@ export class MarketScheduler {
       }
     }, 60_000);
 
-    log.info('EOD scheduler started (8:30 AM ET morning brief, 9:00 AM ET pre-market, 3:55 PM ET chain recorder, 4:05 PM ET reports, 9:00 PM ET archive)');
+    log.info('EOD scheduler started (8:30 AM ET morning brief, 9:00 AM ET pre-market, 12:00 PM ET midday news refresh, 3:55 PM ET chain recorder, 4:05 PM ET reports, 9:00 PM ET archive)');
   }
 
   stop(): void {

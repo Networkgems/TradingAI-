@@ -7,6 +7,7 @@ import {
   sessionCatalystPicks,
   resetCatalystSweepGateForTests,
   catalystSweepGateSnapshot,
+  catalystSweepStateCountForTests,
   CATALYST_SWEEP_MAX_ATTEMPTS,
   CATALYST_SWEEP_RETRY_BACKOFF_MS,
   type CatalystMetrics,
@@ -169,6 +170,124 @@ describe('sessionCatalystPicks — one vendor sweep per session (TRA-4682)', () 
     const [pa, pb] = await Promise.all([sessionCatalystPicks(a.deps), sessionCatalystPicks(b.deps)]);
     expect(a.calls.news + b.calls.news).toBe(1);
     expect(pb).toEqual(pa);
+  });
+});
+
+// TRA-4901 — a midday sweep must not be masked by (or exhaust) the premarket
+// window's cache/budget, and vice versa. Before this fix `sessionCatalystPicks`
+// cached on the bare ET session, so a second call anywhere later in the day
+// (any window) always served the 9am pool with ZERO vendor calls — "midday
+// news" never actually re-hit the vendor.
+describe('sessionCatalystPicks — per-window cache (TRA-4901)', () => {
+  it("a midday call forces a FRESH sweep instead of reusing the premarket window's pool", async () => {
+    const premarket = makeDeps({ healthy: true, at: NOW });
+    await sessionCatalystPicks(premarket.deps, 'premarket');
+    expect(premarket.calls.news).toBe(1);
+
+    // Same ET session, ~3 hours later — the midday slot. Under the old bare
+    // session key this would be `servedFromCache` with zero vendor calls.
+    const midday = makeDeps({ healthy: true, at: NOW + 3 * 3_600_000 });
+    const picks = await sessionCatalystPicks(midday.deps, 'midday');
+    expect(midday.calls.news).toBe(1);
+    expect(picks.length).toBeGreaterThan(0);
+  });
+
+  it('premarket and midday windows have independent attempt budgets', async () => {
+    // Exhaust the premarket window's budget on a dead feed.
+    for (let i = 0; i < CATALYST_SWEEP_MAX_ATTEMPTS; i++) {
+      const { deps } = makeDeps({ healthy: false, at: NOW + i * CATALYST_SWEEP_RETRY_BACKOFF_MS });
+      await sessionCatalystPicks(deps, 'premarket');
+    }
+    expect(catalystSweepGateSnapshot('premarket')).toMatchObject({ attempts: CATALYST_SWEEP_MAX_ATTEMPTS });
+
+    // The midday window, on the SAME ET day, still gets its own first attempt.
+    const midday = makeDeps({ healthy: true, at: NOW + 4 * 3_600_000 });
+    const picks = await sessionCatalystPicks(midday.deps, 'midday');
+    expect(midday.calls.news).toBe(1);
+    expect(picks.length).toBeGreaterThan(0);
+    expect(catalystSweepGateSnapshot('midday')).toMatchObject({ attempts: 1, healthy: true });
+  });
+
+  it("omitting the window argument defaults to 'premarket' (back-compat)", async () => {
+    const { deps, calls } = makeDeps({ healthy: true, at: NOW });
+    await sessionCatalystPicks(deps);
+    expect(calls.news).toBe(1);
+    expect(catalystSweepGateSnapshot('premarket')).toMatchObject({ attempts: 1, healthy: true });
+    expect(catalystSweepGateSnapshot('midday')).toMatchObject({ attempts: 0, healthy: false });
+  });
+});
+
+// TRA-4737 — the ET-DAY BOUNDARY, which is where a per-session cache's bugs
+// live and which every test above structurally cannot reach: they reset the
+// gate between cases and never leave 2026-09-17.
+//
+// Widening the single `sweepState` slot into a keyed `Map` moved the probe from
+// "the current state" to "whatever `.find()` hits first", and a `Map` iterates
+// in INSERTION order with nothing ever deleting. From the second ET day onward
+// `/api/health/news-catalyst-signals` therefore reported day 1 forever — a
+// completely dead news feed read `healthy: true`. The functional path was fine
+// (`.get(key)` misses on a new day and sweeps for real), so only the detector
+// was broken, which is exactly the class of bug that reads identically in pass
+// and fail. Run WITHOUT `retireStaleWindowKeys` and the first expectation below
+// reads `{session:'2026-09-17', attempts:1, healthy:true, skipped:0}`.
+describe('the probe survives an ET-day boundary (TRA-4737)', () => {
+  const DAY = 24 * 3_600_000;
+
+  it('day 2 with the feed DEAD reports day 2 and healthy:false — not day 1 and healthy:true', async () => {
+    // Day 1: one healthy premarket sweep. The probe reads day 1, as it should.
+    await sessionCatalystPicks(makeDeps({ healthy: true, at: NOW }).deps, 'premarket');
+    expect(catalystSweepGateSnapshot('premarket')).toMatchObject({
+      session: '2026-09-17',
+      attempts: 1,
+      healthy: true,
+    });
+
+    // Day 2: the vendor is dead and the whole attempt budget burns, then two
+    // more callers are refused by the cap.
+    for (let i = 0; i < CATALYST_SWEEP_MAX_ATTEMPTS; i++) {
+      const { deps } = makeDeps({
+        healthy: false,
+        at: NOW + DAY + i * CATALYST_SWEEP_RETRY_BACKOFF_MS,
+      });
+      await sessionCatalystPicks(deps, 'premarket');
+    }
+    for (let i = 0; i < 2; i++) {
+      const { deps } = makeDeps({ healthy: false, at: NOW + DAY + 6 * CATALYST_SWEEP_RETRY_BACKOFF_MS });
+      await sessionCatalystPicks(deps, 'premarket');
+    }
+
+    expect(catalystSweepGateSnapshot('premarket')).toMatchObject({
+      session: '2026-09-18',
+      attempts: CATALYST_SWEEP_MAX_ATTEMPTS,
+      healthy: false,
+      skipped: 2,
+    });
+  });
+
+  it('the midday window crosses the boundary too, independently of premarket', async () => {
+    await sessionCatalystPicks(makeDeps({ healthy: true, at: NOW + 3 * 3_600_000 }).deps, 'midday');
+    const { deps } = makeDeps({ healthy: false, at: NOW + DAY + 3 * 3_600_000 });
+    await sessionCatalystPicks(deps, 'midday');
+    expect(catalystSweepGateSnapshot('midday')).toMatchObject({
+      session: '2026-09-18',
+      attempts: 1,
+      healthy: false,
+    });
+  });
+
+  it('retires the prior day: at most one resident state per window, not one per day forever', async () => {
+    for (let d = 0; d < 5; d++) {
+      await sessionCatalystPicks(makeDeps({ healthy: true, at: NOW + d * DAY }).deps, 'premarket');
+      await sessionCatalystPicks(
+        makeDeps({ healthy: true, at: NOW + d * DAY + 3 * 3_600_000 }).deps,
+        'midday',
+      );
+    }
+    // Two windows resident, not ten. Unbounded growth here is a leak on a
+    // long-lived pm2 box as well as the cause of the frozen probe above.
+    expect(catalystSweepStateCountForTests()).toBe(2);
+    expect(catalystSweepGateSnapshot('premarket')).toMatchObject({ session: '2026-09-21' });
+    expect(catalystSweepGateSnapshot('midday')).toMatchObject({ session: '2026-09-21' });
   });
 });
 

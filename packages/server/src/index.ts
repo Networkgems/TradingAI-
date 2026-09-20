@@ -514,7 +514,7 @@ import {
   seedReviewLeaders,
 } from './watchlist-store.js';
 import { scanStocksMarket } from './market-scanner.js';
-import { runPremarketForAllUsers } from './premarket-watchlist.js';
+import { runPremarketForAllUsers, runMiddayNewsRefreshForAllUsers } from './premarket-watchlist.js';
 import {
   runMorningBriefForAllUsers,
   buildBriefForUser,
@@ -19247,6 +19247,20 @@ scheduler.start({
     // zero cost while ENABLE_ANALYST_AGENT is off (flag checked before any deps).
     await runAnalystPremarketTick(Date.now()).catch(err =>
       log.error('analyst pre-market tick failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  },
+  // TRA-4901 — ~12:00 PM ET midday news-catalyst refresh. Forces a fresh
+  // vendor sweep (own cache slot/budget, independent of the 9am premarket
+  // sweep) so a lunchtime headline is live in the watchlist for the
+  // afternoon session instead of waiting on tomorrow's premarket build. See
+  // `runMiddayNewsRefreshForAllUsers` for why this does NOT re-run the full
+  // `generateSmartWatchlist` (its other input, the gainers/losers screener,
+  // is a pre-market-only read).
+  onMiddayNews: async () => {
+    await runMiddayNewsRefreshForAllUsers().catch(err =>
+      log.error('midday news-catalyst refresh failed', {
         reason: err instanceof Error ? err.message : String(err),
       }),
     );
