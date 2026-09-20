@@ -2667,6 +2667,72 @@ export interface OptionProfitLockFire {
    */
   stopBasisPremium: number;
 }
+
+/**
+ * TRA-4759 — the take-profit-early rule's own record at the tick it chose to
+ * exit, mirroring `OptionProfitLockFire` field-for-field in intent: stamped at
+ * the FIRST firing tick, first-fire-only, folded onto the journal close row,
+ * ⛔ never backfilled. Before this the call site computed a full
+ * `takeProfitEarlyDecision` and kept only `shouldExit` — the rule fires on the
+ * live book (TAKE_PROFIT_EARLY_LIVE_ENABLED, boot 2026-09-20T13:47:23.779Z)
+ * and recorded nothing a grader can read, which lands 100% of its rows in
+ * TRA-4758's ungradeable class U2.
+ *
+ * Beyond the decision's own operands it captures, AT THE SAME TICK, the levels
+ * the fire pre-empted — the close destroys them, and the parent watch's
+ * primary observable ("did TP-early release at a worse level than the
+ * displaced family would have") cannot be answered without them.
+ */
+export interface OptionTakeProfitEarlyFire {
+  /** ms epoch of the tick the capture rule chose to exit. */
+  at: number;
+  /** `TakeProfitEarlyDecision.availableProfit` — entry→TP1 span, price terms. */
+  availableProfit: number;
+  /** `TakeProfitEarlyDecision.currentProfit` — open profit at the fire, price terms. */
+  currentProfit: number;
+  /** `TakeProfitEarlyDecision.capturedFrac` — currentProfit / availableProfit. */
+  capturedFrac: number;
+  /** The capture threshold in force (`TAKE_PROFIT_EARLY_CAPTURE_PCT` unless overridden). */
+  captureFrac: number;
+  /** The MID the tick served (`mark`) — the price the rule read and exits at. */
+  markAtFire: number;
+  /** The executable bid this tick served, `null` on an unquoted tick. */
+  execBidAtFire: number | null;
+  /** The rule's max-profit reference — the TP1 target the capture fraction is measured against. */
+  tp1Premium: number;
+  /** The mid high-water mark at the fire. */
+  peakPremium: number;
+  /** The executable high-water mark (TRA-4285), `null` if no usable quote ever served. */
+  peakPremiumExec: number | null;
+  /** The hard stop armed at the fire (`0` = the unarmed sentinel). */
+  stopLossPremium: number;
+  /** The premium trail level the fire pre-empted. */
+  trailingStopPremiumAtFire: number;
+  trailingActiveAtFire: boolean;
+  /**
+   * The co-resident give-back rule, evaluated PURELY at this same tick (the
+   * TRA-4020 R4 pattern: a displaced decision is counted, not vanished). This
+   * is the level the displaced family held at the instant TP-early pre-empted
+   * it. `stopBasisPremium` is `ProfitLockDecision.R`; `exitLevelR` is
+   * `floor.exitLevelR ?? peakR − giveBackR` — the same expression the
+   * `profitLockFire` stamp uses.
+   */
+  profitLock: {
+    armed: boolean;
+    peakR: number;
+    giveBackR: number;
+    exitLevelR: number;
+    levelPremium: number;
+    stopBasisPremium: number;
+    /** The peak the co-resident decision CONSUMED (executable basis on a quoted tick). */
+    peakPremiumConsumed: number;
+    shouldExit: boolean;
+  };
+  /** The mark's provenance, already in scope at the fire (TRA-4055 vocabulary). */
+  markSource: OptionMarkProvenance['markSource'];
+  staleMarkTicks: number | null;
+}
+
 /**
  * TRA-4030 (R4, the PDT column) — see `OptionPosition.profitFloorHeldForPdt`.
  * The per-row, restart-durable twin of `OptionOpeningRangeSuppression`: how
@@ -3501,6 +3567,13 @@ export interface OptionPosition {
    * fire on this build. ⛔ Never backfilled.
    */
   profitLockFire?: OptionProfitLockFire;
+  /**
+   * TRA-4759 — the take-profit-early rule's record at its firing tick, stamped
+   * beside `profitLockFire` (first fire only, same rationale) and folded onto
+   * the journal close row. Absent ↔ no take-profit-early fire on this build.
+   * ⛔ Never backfilled.
+   */
+  takeProfitEarlyFire?: OptionTakeProfitEarlyFire;
   trailingActive: boolean;    // true once price is up 20% and trailing mode engaged
   trailingStopPremium: number; // current trailing stop level (peak * (1 - 0.12))
   underlyingEntryPrice: number;

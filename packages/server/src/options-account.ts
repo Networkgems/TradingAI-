@@ -224,6 +224,9 @@ import {
   // TRA-3946 — the durable MAE + average-down shadow lines.
   recordOptionTradeMae,
   recordOptionTradeAverageDownShadow,
+  // TRA-4759 (AC4) — the take-profit-early shadow continuation's terminal record.
+  recordOptionTradeTakeProfitEarlyShadow,
+  type OptionTradeJournalTakeProfitEarlyShadow,
   type JournalTrend,
   type OptionTradeJournalOpen,
   type SentimentIcBand,
@@ -5938,6 +5941,45 @@ export function foldOpenPremiumAtRisk(
   };
 }
 
+/**
+ * TRA-4759 item 2 — restart-durable state of one take-profit-early shadow
+ * continuation: a LIVE row closed by `take_profit_early` whose displaced
+ * trail/lock family is kept ratcheting, read-only, on the same mark feed the
+ * live stops read, until the family's own natural exit would have fired. The
+ * terminal record lands on the journal row as `takeProfitEarlyShadow`. Rides
+ * `exportSnapshot` so a deploy mid-continuation does not orphan the
+ * counterfactual. Zero order-path involvement by construction: nothing here is
+ * read by any staging, submit, or broker code.
+ */
+export interface OptionTakeProfitEarlyShadowState {
+  /** Journal row the terminal record settles onto. */
+  journalId: string;
+  optionSymbol: string;
+  symbol: string;
+  optionType: OptionPosition['optionType'];
+  signalType: OptionPosition['signalType'];
+  premiumPaid: number;
+  stopLossPremium: number;
+  entryDelta: number | null;
+  underlyingEntryPrice: number;
+  /** `YYYY-MM-DD`, the continuation's hard horizon; null when the row carried none. */
+  expiration: string | null;
+  /** Ratchet state, seeded from the position at the close and advanced per tick. */
+  peakPremium: number;
+  peakPremiumExec: number | null;
+  trailingActive: boolean;
+  trailingStopPremium: number;
+  /** The trail schedule the row was on (same selection `checkExits` makes). */
+  trailActivatePct: number;
+  trailOffsetPct: number;
+  /** The TP-early close's own exit premium — the expiry fallback level. */
+  closedExitPremium: number;
+  startedAt: number;
+  ticksObserved: number;
+  staleMarkTicks: number;
+  lastMark: number | null;
+}
+
 export class PaperOptionsAccount {
   private initialEquity: number;
   private managedAccountRatio: number;
@@ -6563,6 +6605,15 @@ export class PaperOptionsAccount {
    * exactly today's shipped behaviour.
    */
   private optionQuotes = new Map<string, { bid: number; ask: number }>();
+  /**
+   * TRA-4759 item 2 — live take-profit-early shadow continuations, keyed by
+   * journal row id. Advanced by `advanceTakeProfitEarlyShadows` inside the
+   * same `checkExits` pass the live stops run in (⚠ TRA-3730: a spy loop the
+   * real fold never runs reads `clean` with its write path never exercised —
+   * the shadow must be driven by the real tick), settled onto the journal row
+   * when the displaced family's own exit would have fired.
+   */
+  private tpEarlyShadows = new Map<string, OptionTakeProfitEarlyShadowState>();
   /**
    * TRA-4055 — this tick's per-OCC mark PROVENANCE (`quote` | `last`), refreshed
    * wholesale by {@link refreshOptionMarkSources}. A symbol absent from this map
@@ -7596,6 +7647,18 @@ export class PaperOptionsAccount {
           ...(position.profitLockFire !== undefined
             ? { profitLockFire: { ...position.profitLockFire } }
             : {}),
+          // TRA-4759 (AC1) — the take-profit-early decision at its firing
+          // tick, beside the lock's stamp. Absent stays absent: only a
+          // take-profit-early fire writes one, and ⛔ a reconstructed record
+          // is a fabricated column.
+          ...(position.takeProfitEarlyFire !== undefined
+            ? {
+                takeProfitEarlyFire: {
+                  ...position.takeProfitEarlyFire,
+                  profitLock: { ...position.takeProfitEarlyFire.profitLock },
+                },
+              }
+            : {}),
           ...(pdtHeld !== undefined
             ? {
                 profitFloorHeldForPdt: {
@@ -7704,6 +7767,9 @@ export class PaperOptionsAccount {
               holdDays: Math.max(0, (closeTs - own.openTs) / MS_PER_DAY),
             };
             const wrote = await recordOptionTradeClose(id, ownClose);
+            // TRA-4759 item 2 — a live TP-early close arms the shadow
+            // continuation on whichever row the close actually settled onto.
+            if (exitReason === 'take_profit_early') this.registerTakeProfitEarlyShadow(position, id);
             accountLog.warn('detached lot close written to its own journal row', {
               issue: 'TRA-4082',
               id,
@@ -7739,6 +7805,11 @@ export class PaperOptionsAccount {
           return;
         }
         await recordOptionTradeClose(journalId, close);
+        // TRA-4759 item 2 — a live `take_profit_early` close arms the shadow
+        // continuation for this row. Registered here, after the close write
+        // and with the task-resolved journalId, so the terminal record can
+        // only ever land on the row the close itself landed on.
+        if (exitReason === 'take_profit_early') this.registerTakeProfitEarlyShadow(position, journalId);
       })
       // TRA-3078 — nothing to unbind. The binding lives on the position, which
       // has already left `openOptions` for `closedOptions` by the time this
@@ -7751,6 +7822,212 @@ export class PaperOptionsAccount {
           reason: err instanceof Error ? err.message : String(err),
         });
       });
+  }
+
+  // ── TRA-4759 item 2 — the take-profit-early shadow continuation ───────────
+
+  /**
+   * Seed a shadow for a LIVE row the take-profit-early rule just closed. The
+   * ratchet state is copied off the position at the close, so the continuation
+   * picks up exactly where the live path stopped. Single-leg engine rows only
+   * (the rule itself is gated `!opt.legs`); demo rows are excluded because the
+   * counterfactual question is about the real-money displacement.
+   */
+  private registerTakeProfitEarlyShadow(position: OptionPosition, journalId: string): void {
+    if ((position.mode ?? 'demo') !== 'live') return;
+    if (!position.optionSymbol) return;
+    if (position.legs && position.legs.length > 1) return;
+    if (this.tpEarlyShadows.has(journalId)) return;
+    // The trail schedule the row was on — the same selection `checkExits`
+    // makes at the top of its per-position pass.
+    let trailActivatePct: number;
+    let trailOffsetPct: number;
+    if (position.importedFromTradier === true || position.signalType === 'relative_value') {
+      trailActivatePct = this.rvRiskParams.trailActivatePct;
+      trailOffsetPct = this.rvRiskParams.trailOffsetPct;
+    } else if (position.signalType === 'otm_mispricing') {
+      trailActivatePct = this.otmRiskParams.trailActivatePct;
+      trailOffsetPct = this.otmRiskParams.trailOffsetPct;
+    } else {
+      trailActivatePct = OPTIONS_TRAIL_ACTIVATE_PCT;
+      trailOffsetPct = OPTIONS_TRAIL_OFFSET_PCT;
+    }
+    this.tpEarlyShadows.set(journalId, {
+      journalId,
+      optionSymbol: position.optionSymbol,
+      symbol: position.symbol,
+      optionType: position.optionType,
+      signalType: position.signalType,
+      premiumPaid: position.premiumPaid,
+      stopLossPremium: position.stopLossPremium,
+      entryDelta:
+        typeof position.entryDelta === 'number' && Number.isFinite(position.entryDelta)
+          ? position.entryDelta
+          : null,
+      underlyingEntryPrice: position.underlyingEntryPrice,
+      expiration:
+        typeof position.expiration === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(position.expiration)
+          ? position.expiration
+          : null,
+      peakPremium: position.peakPremium,
+      peakPremiumExec:
+        typeof position.peakPremiumExec === 'number' && Number.isFinite(position.peakPremiumExec)
+          ? position.peakPremiumExec
+          : null,
+      trailingActive: position.trailingActive,
+      trailingStopPremium: position.trailingStopPremium,
+      trailActivatePct,
+      trailOffsetPct,
+      closedExitPremium:
+        Number.isFinite(position.currentPremium) && position.currentPremium > 0
+          ? position.currentPremium
+          : position.premiumPaid,
+      startedAt: Date.now(),
+      ticksObserved: 0,
+      staleMarkTicks: 0,
+      lastMark: null,
+    });
+    accountLog.info('take-profit-early shadow continuation ARMED (TRA-4759)', {
+      journalId,
+      optionSymbol: position.optionSymbol,
+      peakPremium: position.peakPremium,
+      trailingActive: position.trailingActive,
+      trailingStopPremium: position.trailingStopPremium,
+      expiration: position.expiration ?? null,
+    });
+  }
+
+  /**
+   * Advance every armed shadow one tick, on the SAME maps this `checkExits`
+   * pass handed the live stops. Mark resolution mirrors the live loop's three
+   * branches (served mark → OTM/RV stale-tolerance delta backstop → the same
+   * fail-closed dark-tick skip); the ratchet mirrors the mid + executable
+   * ratchets (TRA-4285); and the displaced family's own exits are read in the
+   * live cascade's order — give-back lock, premium trail, hard stop — with the
+   * contract's ET expiration day as the hard horizon. Read-only: the ONLY
+   * write it ever makes is the journal's terminal shadow record.
+   *
+   * The lock is evaluated with the same env-resolved schedule the live branch
+   * uses; the TRA-4020 floor ladder is deliberately omitted (this path cannot
+   * know whether the ladder was armed for a given tick — same conservative
+   * under-fire posture as the `book_halt_flat` relabel).
+   */
+  private advanceTakeProfitEarlyShadows(
+    underlyingPrices: Map<string, number>,
+    optionMarks?: Map<string, number>,
+  ): void {
+    if (this.tpEarlyShadows.size === 0) return;
+    const now = Date.now();
+    for (const [journalId, sh] of [...this.tpEarlyShadows]) {
+      if (sh.expiration !== null && etDateKey(now) > sh.expiration) {
+        // Past the contract's own expiration day the displaced family could
+        // not have held on. Settle at the last observed level; if the shadow
+        // never saw a mark, the close's own exit premium is the only honest
+        // stand-in and `ticksObserved: 0` says exactly that.
+        this.settleTakeProfitEarlyShadow(journalId, sh, 'expiry', sh.lastMark ?? sh.closedExitPremium, now);
+        continue;
+      }
+      const liveMark = optionMarks?.get(sh.optionSymbol);
+      let mark: number | null = null;
+      if (typeof liveMark === 'number' && liveMark > 0) {
+        mark = liveMark;
+        sh.staleMarkTicks = 0;
+      } else {
+        sh.staleMarkTicks += 1;
+        const waitsForBackstop =
+          sh.signalType === 'otm_mispricing' || sh.signalType === 'relative_value';
+        if (!waitsForBackstop || sh.staleMarkTicks >= STALE_MARK_BACKSTOP_TICKS) {
+          const spot = underlyingPrices.get(sh.symbol);
+          // TRA-2893 — same fail-closed anchor guard as the live loop: with no
+          // real entry spot there is no honest extrapolation, so skip the tick.
+          if (spot != null && Number.isFinite(sh.underlyingEntryPrice) && sh.underlyingEntryPrice > 0) {
+            const deltaMag =
+              sh.entryDelta !== null && sh.entryDelta !== 0 ? Math.abs(sh.entryDelta) : ATM_DELTA;
+            const move = (spot - sh.underlyingEntryPrice) * deltaMag * (sh.optionType === 'call' ? 1 : -1);
+            mark = Math.max(0.01, sh.premiumPaid + move);
+          }
+        }
+      }
+      if (mark === null) continue;
+      sh.ticksObserved += 1;
+      sh.lastMark = mark;
+      if (mark > sh.peakPremium) sh.peakPremium = mark;
+      const q = this.optionQuotes.get(sh.optionSymbol);
+      const usableQuote =
+        q != null && Number.isFinite(q.bid) && Number.isFinite(q.ask)
+          && q.bid > 0 && q.ask > 0 && q.ask >= q.bid
+          ? q
+          : null;
+      if (usableQuote !== null && !(sh.peakPremiumExec !== null && sh.peakPremiumExec >= usableQuote.bid)) {
+        sh.peakPremiumExec = usableQuote.bid;
+      }
+      if (!sh.trailingActive && mark >= sh.premiumPaid * (1 + sh.trailActivatePct)) {
+        sh.trailingActive = true;
+      }
+      if (sh.trailingActive) {
+        sh.trailingStopPremium = sh.peakPremium * (1 - sh.trailOffsetPct);
+      }
+      const execBid = usableQuote !== null ? usableQuote.bid : null;
+      const lock = profitLockDecision({
+        side: 'buy',
+        entry: sh.premiumPaid,
+        initialStop: sh.stopLossPremium,
+        peakPrice: execBid !== null ? (sh.peakPremiumExec ?? execBid) : sh.peakPremium,
+        currentPrice: execBid ?? mark,
+        armR: this.otmProfitSchedule.armR,
+        giveBackR: this.otmProfitSchedule.giveBackR,
+        tightenPeakR: this.otmProfitSchedule.tightenPeakR,
+        tightenGiveBackR: this.otmProfitSchedule.tightenGiveBackR,
+      });
+      if (lock.shouldExit) {
+        this.settleTakeProfitEarlyShadow(journalId, sh, 'profit_lock', mark, now);
+        continue;
+      }
+      if (sh.trailingActive && sh.trailingStopPremium > 0 && mark <= sh.trailingStopPremium) {
+        this.settleTakeProfitEarlyShadow(journalId, sh, 'trail', mark, now);
+        continue;
+      }
+      if (isArmedThreshold(sh.stopLossPremium) && mark <= sh.stopLossPremium) {
+        this.settleTakeProfitEarlyShadow(journalId, sh, 'sl', mark, now);
+      }
+    }
+  }
+
+  /** Retire a shadow and queue its terminal record onto the journal row. */
+  private settleTakeProfitEarlyShadow(
+    journalId: string,
+    sh: OptionTakeProfitEarlyShadowState,
+    exitReason: OptionTradeJournalTakeProfitEarlyShadow['exitReason'],
+    displacedLevelContinued: number,
+    at: number,
+  ): void {
+    this.tpEarlyShadows.delete(journalId);
+    const shadow: OptionTradeJournalTakeProfitEarlyShadow = {
+      exitReason,
+      at,
+      displacedLevelContinued,
+      continuedPeakPremium: sh.peakPremium,
+      continuedPeakPremiumExec: sh.peakPremiumExec,
+      ticksObserved: sh.ticksObserved,
+    };
+    this.journalWrites = this.journalWrites
+      .then(() => recordOptionTradeTakeProfitEarlyShadow(journalId, shadow))
+      .catch((err) => {
+        accountLog.warn('take-profit-early shadow journal emit failed (TRA-4759)', {
+          id: journalId,
+          exitReason,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    accountLog.info('take-profit-early shadow continuation SETTLED (TRA-4759)', {
+      journalId,
+      optionSymbol: sh.optionSymbol,
+      exitReason,
+      displacedLevelContinued,
+      closedExitPremium: sh.closedExitPremium,
+      continuedPeakPremium: sh.peakPremium,
+      ticksObserved: sh.ticksObserved,
+    });
   }
 
   reset(config: OptionsAccountConfig = {}): void {
@@ -11734,6 +12011,79 @@ export class PaperOptionsAccount {
             exitPremium = mark;
             exitKind = 'trail';
             exitJournalReason = 'take_profit_early';
+            // TRA-4759 item 1 — the rule fires on real money (live flag armed
+            // 2026-09-20T13:47:23.779Z) and this call used to keep only
+            // `shouldExit`, discarding every operand a grader needs. Stamp the
+            // decision at the FIRST firing tick, first-fire-only (a re-staged
+            // unfilled leg keeps the original decision's record, same
+            // semantics as `profitLockFire`), plus the levels this fire
+            // PRE-EMPTS — the close destroys them, and TRA-4758's primary
+            // observable is unreadable without them. The co-resident give-back
+            // rule is evaluated PURELY, exactly as TRA-4020 R4 evaluates the
+            // lock inside the opening-range window, so the displaced level is
+            // counted rather than vanishing. Same operands and same executable
+            // basis as the live lock branch below (TRA-4285).
+            if (opt.takeProfitEarlyFire === undefined) {
+              const execBid =
+                quoteAtFire !== null && quoteAtFire.bid > 0 ? quoteAtFire.bid : null;
+              const lock = profitLockDecision({
+                side: 'buy',
+                entry: opt.premiumPaid,
+                initialStop: opt.stopLossPremium,
+                peakPrice: execBid !== null ? (opt.peakPremiumExec ?? execBid) : opt.peakPremium,
+                currentPrice: execBid ?? mark,
+                armR: this.otmProfitSchedule.armR,
+                giveBackR: this.otmProfitSchedule.giveBackR,
+                tightenPeakR: this.otmProfitSchedule.tightenPeakR,
+                tightenGiveBackR: this.otmProfitSchedule.tightenGiveBackR,
+                ...(profitFloorLadder !== undefined ? { floorLadder: profitFloorLadder } : {}),
+              });
+              const exitLevelR = lock.floor?.exitLevelR ?? lock.peakR - lock.giveBackR;
+              opt.takeProfitEarlyFire = {
+                at: Date.now(),
+                availableProfit: tp.availableProfit,
+                currentProfit: tp.currentProfit,
+                capturedFrac: tp.capturedFrac,
+                captureFrac: tp.captureFrac,
+                markAtFire: mark,
+                execBidAtFire: execBid,
+                tp1Premium: opt.tp1Premium,
+                peakPremium: opt.peakPremium,
+                peakPremiumExec:
+                  typeof opt.peakPremiumExec === 'number' && Number.isFinite(opt.peakPremiumExec)
+                    ? opt.peakPremiumExec
+                    : null,
+                stopLossPremium: opt.stopLossPremium,
+                trailingStopPremiumAtFire: opt.trailingStopPremium,
+                trailingActiveAtFire: opt.trailingActive,
+                profitLock: {
+                  armed: lock.armed,
+                  peakR: lock.peakR,
+                  giveBackR: lock.giveBackR,
+                  exitLevelR,
+                  levelPremium: opt.premiumPaid + exitLevelR * lock.R,
+                  stopBasisPremium: lock.R,
+                  peakPremiumConsumed:
+                    execBid !== null ? (opt.peakPremiumExec ?? execBid) : opt.peakPremium,
+                  shouldExit: lock.shouldExit,
+                },
+                markSource: markProvenance.markSource,
+                staleMarkTicks: markProvenance.staleMarkTicks,
+              };
+              accountLog.info('take-profit-early fired', {
+                issue: 'TRA-4759',
+                optionSymbol: opt.optionSymbol,
+                mode: opt.mode ?? 'demo',
+                mark,
+                capturedFrac: tp.capturedFrac,
+                captureFrac: tp.captureFrac,
+                tp1Premium: opt.tp1Premium,
+                displacedLockLevelPremium: opt.takeProfitEarlyFire.profitLock.levelPremium,
+                displacedLockArmed: lock.armed,
+                trailingStopPremium: opt.trailingStopPremium,
+                markSource: markProvenance.markSource,
+              });
+            }
           }
         }
 
@@ -12178,6 +12528,16 @@ export class PaperOptionsAccount {
         this.queueJournalClose(opt, exitJournalReason ?? exitKind);
         closed.push({ ...opt });
       }
+    }
+
+    // TRA-4759 item 2 — advance the take-profit-early shadow continuations on
+    // the SAME maps this pass handed the live stops. Shadows are live-only, so
+    // a demo-scoped pass leaves them to the live engine's own tick (advancing
+    // them off a pass whose maps were fanned for the other book would read a
+    // different feed than the one the live stops read, which is the TRA-3730
+    // spy-loop defect this placement exists to avoid).
+    if (mode === undefined || mode === 'live') {
+      this.advanceTakeProfitEarlyShadows(underlyingPrices, optionMarks);
     }
 
     return closed;
@@ -16683,6 +17043,12 @@ export class PaperOptionsAccount {
      * written against them). Optional so legacy snapshots without it still import.
      */
     assignedShares?: AssignedShareLot[];
+    /**
+     * TRA-4759 item 2 — in-flight take-profit-early shadow continuations, so a
+     * deploy mid-continuation does not orphan the counterfactual. Optional so
+     * legacy snapshots without it still import.
+     */
+    tpEarlyShadows?: OptionTakeProfitEarlyShadowState[];
   } {
     return {
       openOptions: Array.from(this.openOptions.values()),
@@ -16698,6 +17064,7 @@ export class PaperOptionsAccount {
       equity: this.equity,
       tradierEnv: this.tradierEnv,
       assignedShares: Array.from(this.assignedShares.values()).map((l) => ({ ...l })),
+      tpEarlyShadows: Array.from(this.tpEarlyShadows.values()).map((s) => ({ ...s })),
     };
   }
 
@@ -16732,6 +17099,8 @@ export class PaperOptionsAccount {
     equity: number;
     /** TRA-1976 — assigned-share inventory; older snapshots don't carry it. */
     assignedShares?: AssignedShareLot[];
+    /** TRA-4759 — in-flight TP-early shadow continuations; older snapshots don't carry it. */
+    tpEarlyShadows?: OptionTakeProfitEarlyShadowState[];
   }): void {
     this.openOptions.clear();
     // TRA-2957 — re-establish the in-memory sentinels at the durable boundary.
@@ -16870,6 +17239,15 @@ export class PaperOptionsAccount {
     // TRA-1976 — restore assigned-share inventory (empty for legacy snapshots).
     this.assignedShares.clear();
     for (const l of snap.assignedShares ?? []) this.assignedShares.set(l.id, { ...l });
+    // TRA-4759 item 2 — restore in-flight shadow continuations. Malformed or
+    // legacy-absent entries are dropped rather than half-restored: a shadow
+    // with no journal id or basis has nowhere to settle and nothing to ratchet.
+    this.tpEarlyShadows.clear();
+    for (const s of snap.tpEarlyShadows ?? []) {
+      if (!s || typeof s.journalId !== 'string' || s.journalId === '') continue;
+      if (typeof s.optionSymbol !== 'string' || !Number.isFinite(s.premiumPaid)) continue;
+      this.tpEarlyShadows.set(s.journalId, { ...s });
+    }
     if (snap.optionsPnlByMode) {
       this.optionsPnlByMode = {
         demo: snap.optionsPnlByMode.demo ?? 0,

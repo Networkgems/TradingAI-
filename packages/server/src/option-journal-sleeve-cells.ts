@@ -118,8 +118,12 @@ export const OPTION_EXIT_REASON_TABLE: readonly OptionExitReasonRule[] = [
     reason: 'take_profit_early',
     owner: 'harness',
     why:
-      'An out-of-band early take-profit driven by the harness/operator, not by the sleeve\'s '
-      + 'own target logic. TRA-3709 window: 34 rows at avgR +0.4655.',
+      'SPLIT BY ROW (TRA-4759): `strategy` for a `mode: \'live\'` row with closeTs >= '
+      + '1789912043779 (2026-09-20T13:47:23.779Z, the instant TAKE_PROFIT_EARLY_LIVE_ENABLED '
+      + 'armed on bqb1 and the ENGINE started choosing this exit on real money); `harness` '
+      + 'otherwise — the demo/QA capture path and every pre-arm row, including TRA-3709\'s 34 '
+      + 'rows at avgR +0.4655, whose baseline a blanket flip would corrupt. The `owner` on this '
+      + 'table row is the PRE-ARM base rule; `classifyOptionExitOwnerForRow` applies the split.',
   },
   {
     reason: 'reconstructed-TRA-3472',
@@ -168,6 +172,41 @@ export function classifyOptionExitOwner(exitReason: string | null | undefined): 
   const trimmed = exitReason.trim();
   if (trimmed.length === 0) return 'unknown';
   return EXIT_OWNER_BY_REASON.get(trimmed) ?? 'unknown';
+}
+
+/**
+ * TRA-4759 item 4 — the instant `TAKE_PROFIT_EARLY_LIVE_ENABLED` armed on bqb1
+ * (boot 2026-09-20T13:47:23.779Z, commit `e2b542538dbc`). From this instant a
+ * live `take_profit_early` close is the ENGINE's own choice, not a harness
+ * hand-close, and a grader following this surface's own instruction ("grade a
+ * sleeve on `strategyExits`") must be able to see it.
+ */
+export const TAKE_PROFIT_EARLY_LIVE_STRATEGY_SINCE_TS = 1789912043779;
+
+/**
+ * TRA-4759 item 4 — the ROW-conditional owner. `take_profit_early` was a
+ * harness/QA close path while the flag was demo-only, and from
+ * {@link TAKE_PROFIT_EARLY_LIVE_STRATEGY_SINCE_TS} it is the live engine's own
+ * exit — so ownership is a function of the row, not of the label alone:
+ * `strategy` for a `mode: 'live'` row closed at or after the arm instant,
+ * the reason-table's owner (`harness`) otherwise. ⛔ Deliberately NOT a
+ * blanket table flip: that would relabel TRA-3709's 34 pre-arm harness rows
+ * (avgR +0.4655) and corrupt the exact baseline TRA-4758's pre-registration
+ * freezes. Every other reason delegates to {@link classifyOptionExitOwner}.
+ */
+export function classifyOptionExitOwnerForRow(
+  row: Pick<OptionTradeJournalRecord, 'exitReason' | 'mode' | 'closeTs'>,
+): OptionExitOwner {
+  const reason = typeof row.exitReason === 'string' ? row.exitReason.trim() : '';
+  if (
+    reason === 'take_profit_early'
+    && row.mode === 'live'
+    && typeof row.closeTs === 'number'
+    && row.closeTs >= TAKE_PROFIT_EARLY_LIVE_STRATEGY_SINCE_TS
+  ) {
+    return 'strategy';
+  }
+  return classifyOptionExitOwner(row.exitReason);
 }
 
 /**
@@ -259,7 +298,12 @@ export interface OptionSleeveStopBasisDivisor {
   unanimous: boolean;
 }
 
-/** Per-exit-reason attribution inside one cell — how the slices were built. */
+/**
+ * Per-exit-reason attribution inside one cell — how the slices were built.
+ * TRA-4759 — keyed by (reason, ROW-owner): a reason whose ownership is
+ * row-conditional (`take_profit_early`, split at the live-arm instant) appears
+ * once per owner, so `owner` is true of every row the entry counts.
+ */
 export interface OptionSleeveExitReasonStat {
   exitReason: string;
   owner: OptionExitOwner;
@@ -579,19 +623,31 @@ export function foldOptionSleeveCells(rows: OptionTradeJournalRecord[]): OptionS
       const closedList = list.filter((r) => r.outcome !== 'OPEN');
       const byOwner = new Map<OptionExitOwner, OptionTradeJournalRecord[]>();
       for (const owner of OPTION_EXIT_OWNERS) byOwner.set(owner, []);
-      for (const r of closedList) byOwner.get(classifyOptionExitOwner(r.exitReason))!.push(r);
+      // TRA-4759 item 4 — ROW-conditional: a live post-arm `take_profit_early`
+      // is the engine's own exit and lands in `strategyExits`; every other row
+      // of that reason stays `harness`. See `classifyOptionExitOwnerForRow`.
+      for (const r of closedList) byOwner.get(classifyOptionExitOwnerForRow(r))!.push(r);
 
-      const byReasonMap = new Map<string, OptionTradeJournalRecord[]>();
+      // TRA-4759 — keyed by (reason, ROW-owner), carried beside the rows, so a
+      // reason whose ownership is row-conditional appears once PER OWNER and
+      // each stat row's `owner` is true of every row it counts. Every
+      // unconditional reason folds exactly as before (one entry, same owner).
+      const byReasonMap = new Map<
+        string,
+        { exitReason: string; owner: OptionExitOwner; rows: OptionTradeJournalRecord[] }
+      >();
       for (const r of closedList) {
         const reason = r.exitReason ?? 'unknown';
-        const l = byReasonMap.get(reason) ?? [];
-        l.push(r);
-        byReasonMap.set(reason, l);
+        const owner = classifyOptionExitOwnerForRow(r);
+        const key = JSON.stringify([reason, owner]);
+        const cellRows = byReasonMap.get(key) ?? { exitReason: reason, owner, rows: [] };
+        cellRows.rows.push(r);
+        byReasonMap.set(key, cellRows);
       }
-      const byExitReason: OptionSleeveExitReasonStat[] = [...byReasonMap.entries()]
-        .map(([exitReason, l]) => ({
+      const byExitReason: OptionSleeveExitReasonStat[] = [...byReasonMap.values()]
+        .map(({ exitReason, owner, rows: l }) => ({
           exitReason,
-          owner: classifyOptionExitOwner(exitReason),
+          owner,
           closed: l.length,
           avgR: l.length > 0 ? l.reduce((a, r) => a + (r.realizedR ?? 0), 0) / l.length : null,
           realizedPnlUsd: l.reduce((a, r) => a + (r.realizedPnlUsd ?? 0), 0),
@@ -651,10 +707,15 @@ export function foldOptionSleeveCells(rows: OptionTradeJournalRecord[]): OptionS
     note:
       'TRA-3715. One cell per accountClass x structure x entryArchetype, emitted for ALL THREE '
       + 'classes even at n=0 (an absent cell reads like a passing one). GRADE A SLEEVE ON '
-      + '`strategyExits`, NOT on `all`: `manual` and `take_profit_early` are harness/QA close '
-      + 'paths and on TRA-3709\'s window they carried the ENTIRE positive baseline of both '
+      + '`strategyExits`, NOT on `all`: `manual` is a harness/QA close path, and on TRA-3709\'s '
+      + 'window it and pre-arm `take_profit_early` carried the ENTIRE positive baseline of both '
       + 'sleeves (strip them and single_leg_directional goes +0.1193 -> -0.0453, single_leg_otm '
-      + '+0.2098 -> -0.0459). `exitOwnerTable` is the classification rule itself; a reason it '
+      + '+0.2098 -> -0.0459). TRA-4759: `take_profit_early` ownership is ROW-conditional — '
+      + '`strategy` for a mode=live row with closeTs >= 1789912043779 (2026-09-20T13:47:23.779Z, '
+      + 'the TAKE_PROFIT_EARLY_LIVE_ENABLED arm instant, from which the ENGINE chooses this exit '
+      + 'on real money), `harness` otherwise — so live post-arm rows are IN `strategyExits` and '
+      + 'the pre-arm harness baseline is untouched; that reason can appear once per owner in '
+      + '`byExitReason`. `exitOwnerTable` is the classification rule itself; a reason it '
       + 'does not list lands in `unknownExits` and is named in `unclassifiedExitReasons`, never '
       + 'absorbed into strategy. Any slice with n < ' + SLEEVE_CELL_MIN_N + ' is labelled '
       + 'UNDERPOWERED and its avgR must not be read as a verdict. R is PREMIUM R '

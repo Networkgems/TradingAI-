@@ -2,7 +2,7 @@ import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { deriveEntrySpreadPct } from '@trading-app/shared';
-import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason, OptionAdmissionStamp, OptionMarkProvenance, OptionPeakStampBasis, OptionProfitLockFire } from '@trading-app/shared';
+import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason, OptionAdmissionStamp, OptionMarkProvenance, OptionPeakStampBasis, OptionProfitLockFire, OptionTakeProfitEarlyFire } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { STOP_DISTANCE_FRACTION_OF_MARK } from './option-spread-cost.js';
 import type { RiskThrottleSizingPath, RiskThrottleSizingScope } from './risk-throttle-sizing.js';
@@ -609,6 +609,15 @@ export interface OptionTradeJournalClose {
    */
   profitLockFire?: OptionProfitLockFire;
   /**
+   * TRA-4759 (AC1) — the take-profit-early rule's own decision at the firing
+   * tick, beside the lock's stamp: the capture operands the call site used to
+   * discard, plus the levels the fire pre-empted (trail, hard stop, and the
+   * co-resident give-back decision evaluated purely). Absent on every
+   * non-take-profit-early close and on rows closed before this shipped.
+   * ⛔ Never backfilled.
+   */
+  takeProfitEarlyFire?: OptionTakeProfitEarlyFire;
+  /**
    * TRA-4246 (AC1) — THE ROW'S OWN STOP-BASIS R, and the divisor it was
    * computed with, captured at the close write.
    *
@@ -688,6 +697,30 @@ export interface OptionTradeJournalOpeningRangeSuppression {
   lastSuppressedAt: number;
   premiumAtSuppression: number;
   premiumAtFire: number | null;
+}
+
+/**
+ * TRA-4759 (AC4) — the take-profit-early shadow continuation's terminal
+ * record. After a live `take_profit_early` close the account keeps ratcheting
+ * the row's peak / trail on the SAME mark feed the live stops read and
+ * re-runs the give-back decision each tick, until the displaced family's own
+ * natural exit would have fired. This is that exit: the level it released at,
+ * which rule it was, and when. `displacedLevelContinued` minus the close's
+ * own exit premium is the parent watch's primary observable.
+ */
+export interface OptionTradeJournalTakeProfitEarlyShadow {
+  /** The counterfactual exit that ended the continuation. */
+  exitReason: 'profit_lock' | 'trail' | 'sl' | 'expiry';
+  /** ms epoch of the tick the counterfactual exit would have fired. */
+  at: number;
+  /** The premium the displaced family would have released at. */
+  displacedLevelContinued: number;
+  /** Mid-basis peak reached over the CONTINUED path (close → counterfactual exit). */
+  continuedPeakPremium: number;
+  /** Executable-basis peak over the continued path; null if no usable quote served. */
+  continuedPeakPremiumExec: number | null;
+  /** Ticks the shadow observed between the close and the counterfactual exit. */
+  ticksObserved: number;
 }
 
 /** TRA-4030 (R4) — see {@link OptionTradeJournalClose.profitFloorHeldForPdt}. */
@@ -783,6 +816,23 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
    * decision. Read the absence, do not fill it.
    */
   profitLockFire?: OptionProfitLockFire;
+  /**
+   * TRA-4759 (AC1) — the take-profit-early decision at its firing tick, folded
+   * from the CLOSE row. Same absence semantics as `profitLockFire`: a
+   * `take_profit_early` row with NO stamp on a post-stamp build is a RELABEL
+   * or a close path that never ran the decision — read the absence, do not
+   * fill it.
+   */
+  takeProfitEarlyFire?: OptionTakeProfitEarlyFire;
+  /**
+   * TRA-4759 (AC4) — the shadow continuation's terminal record: where the
+   * DISPLACED trail/lock family would have released had the take-profit-early
+   * close not pre-empted it. Written by
+   * {@link recordOptionTradeTakeProfitEarlyShadow} AFTER the close (the whole
+   * point — the counterfactual resolves on later ticks), one per row.
+   * Read-only shadow: no order path is involved in producing it.
+   */
+  takeProfitEarlyShadow?: OptionTradeJournalTakeProfitEarlyShadow;
   /**
    * TRA-4246 (AC1) — the row's own stop-basis R, its null-reason and its
    * divisor, folded from the CLOSE row. Forward-only; ⛔ never backfilled.
@@ -1146,6 +1196,8 @@ type MaeLine = { kind: 'mae'; id: string; mae: OptionTradeJournalMae };
 // TRA-3946 — one average-down shadow verdict. Deduped on (id, reason) at fold
 // time, so a replay of the same line twice is one verdict.
 type AverageDownShadowLine = { kind: 'average_down_shadow'; id: string; shadow: OptionTradeJournalAverageDownShadow };
+/** TRA-4759 (AC4) — appended AFTER the close, when the counterfactual resolves. */
+type TakeProfitEarlyShadowLine = { kind: 'tp_early_shadow'; id: string; shadow: OptionTradeJournalTakeProfitEarlyShadow };
 // TRA-3990 — supersede the OPEN row's entry-quote stamp with the quote the
 // broker order actually crossed. Same shape and same reason as
 // `amend_entry_slippage`: the live open paths write the row BEFORE the broker
@@ -1271,6 +1323,7 @@ type JournalLine =
   | AmendCloseBasisLine
   | MaeLine
   | AverageDownShadowLine
+  | TakeProfitEarlyShadowLine
   | AmendEntryQuoteLine
   | SupersedeCloseLine
   | AmendOpenBasisLine
@@ -1906,6 +1959,19 @@ function foldLine(
     map.set(line.id, { ...rec, averageDownShadow: [...prior, { ...s }] });
     return;
   }
+  if (line.kind === 'tp_early_shadow') {
+    // TRA-4759 (AC4) — one terminal shadow record per row, first write wins
+    // (the continuation resolves exactly once; a replayed line is a no-op).
+    // Unknown id ⇒ dropped, never resurrects a row.
+    const rec = map.get(line.id);
+    if (!rec) return;
+    const s = line.shadow;
+    if (!s || typeof s.exitReason !== 'string' || !Number.isFinite(s.at)
+      || !Number.isFinite(s.displacedLevelContinued)) return;
+    if (rec.takeProfitEarlyShadow !== undefined) return;
+    map.set(line.id, { ...rec, takeProfitEarlyShadow: { ...s } });
+    return;
+  }
   if (line.kind === 'void') {
     // TRA-3472 — retract an OPEN row whose order never filled. Guarded on
     // `outcome === 'OPEN'`: a void arriving after a close would otherwise
@@ -2483,6 +2549,17 @@ function foldLine(
     // the mark it read; absent stays absent. Copied for the same aliasing reason.
     ...(line.close.profitLockFire !== undefined
       ? { profitLockFire: { ...line.close.profitLockFire } }
+      : {}),
+    // TRA-4759 (AC1) — the take-profit-early decision at its firing tick,
+    // beside the lock's; absent stays absent. Copied (nested `profitLock`
+    // included) for the same aliasing reason.
+    ...(line.close.takeProfitEarlyFire !== undefined
+      ? {
+          takeProfitEarlyFire: {
+            ...line.close.takeProfitEarlyFire,
+            profitLock: { ...line.close.takeProfitEarlyFire.profitLock },
+          },
+        }
       : {}),
     // TRA-4246 (AC1) — the row's own stop-basis R and the divisor it used.
     // `pnlRStopBasis` is folded when the KEY is present, `null` included: a
@@ -3244,6 +3321,42 @@ export async function recordOptionTradeAverageDownShadow(
     tier: shadow.tier,
     dte: shadow.dte,
     addUsd: shadow.addUsd,
+  });
+  return true;
+}
+
+/**
+ * TRA-4759 (AC4) — persist the take-profit-early shadow continuation's
+ * terminal record. Unlike the MAE / average-down writers this REQUIRES a
+ * CLOSED row (the continuation only exists after the close destroyed the live
+ * path) whose close is `take_profit_early` — the counterfactual is defined
+ * against that displacement and against nothing else. One record per row:
+ * a second call is a no-op returning false.
+ */
+export async function recordOptionTradeTakeProfitEarlyShadow(
+  id: string,
+  shadow: OptionTradeJournalTakeProfitEarlyShadow,
+): Promise<boolean> {
+  if (!isOptionTradeJournalEnabled()) return false;
+  if (!shadow || typeof shadow.exitReason !== 'string' || !Number.isFinite(shadow.at)
+    || !Number.isFinite(shadow.displacedLevelContinued)) return false;
+  const map = await ensureLoaded();
+  const existing = map.get(id);
+  if (!existing || existing.outcome === 'OPEN') return false;
+  if (existing.exitReason !== 'take_profit_early') return false;
+  if (existing.takeProfitEarlyShadow !== undefined) return false;
+  const line: TakeProfitEarlyShadowLine = { kind: 'tp_early_shadow', id, shadow };
+  foldLine(map, line);
+  await appendLine(line);
+  log.info('take-profit-early shadow continuation resolved (TRA-4759)', {
+    id,
+    symbol: existing.symbol,
+    optionSymbol: existing.optionSymbol,
+    mode: existing.mode,
+    exitReason: shadow.exitReason,
+    displacedLevelContinued: shadow.displacedLevelContinued,
+    at: shadow.at,
+    ticksObserved: shadow.ticksObserved,
   });
   return true;
 }

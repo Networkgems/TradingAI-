@@ -2665,8 +2665,18 @@ const LEFT_TAIL_SAMPLE_CAP = 12;
  * lock and the TRA-4020 ladder floor. Membership is by LABEL, not by stamp, so a
  * trail-family close that carries no `profitLockFire` still lands on the list —
  * that absence is the relabel evidence the list exists to publish.
+ *
+ * TRA-4759 item 3 — `take_profit_early` joined the family when the live flag
+ * armed (2026-09-20T13:47:23.779Z): the engine now chooses this exit on real
+ * money, and it releases at a level exactly like the lock does. Its rows carry
+ * a `takeProfitEarlyFire` stamp on post-TRA-4759 builds; a pre-stamp close
+ * lands with `stamped: false`, which is the correct and intended reading.
  */
-const TRAIL_FAMILY_EXIT_REASONS: ReadonlySet<string> = new Set(['profit_lock', 'profit_floor']);
+const TRAIL_FAMILY_EXIT_REASONS: ReadonlySet<string> = new Set([
+  'profit_lock',
+  'profit_floor',
+  'take_profit_early',
+]);
 /** TRA-4246 (AC2) — per-cell cap on `releaseForensics`; the remainder is counted. */
 export const RELEASE_FORENSICS_CAP = 25;
 
@@ -2679,7 +2689,11 @@ export interface OptionJournalReleaseForensic {
   optionSymbol: string | null;
   closeTs: number | null;
   exitReason: string;
-  /** `false` ⇒ no `profitLockFire` on the row: a relabel, or a pre-stamp close. */
+  /**
+   * `false` ⇒ no fire stamp on the row (`profitLockFire`, or TRA-4759's
+   * `takeProfitEarlyFire` for a `take_profit_early` close): a relabel, or a
+   * pre-stamp close.
+   */
   stamped: boolean;
   armed: boolean | null;
   /** The peak the rule CONSUMED (executable basis when `execBidAtFire` is non-null). */
@@ -2935,11 +2949,76 @@ function crossTabStructureExit(
           const num = (v: unknown): number | null =>
             typeof v === 'number' && Number.isFinite(v) ? v : null;
           const trail = list
-            .filter((r) => r.profitLockFire !== undefined || TRAIL_FAMILY_EXIT_REASONS.has(exitReason))
+            .filter((r) =>
+              r.profitLockFire !== undefined
+              || r.takeProfitEarlyFire !== undefined
+              || TRAIL_FAMILY_EXIT_REASONS.has(exitReason))
             .sort((a, b) => (b.closeTs ?? 0) - (a.closeTs ?? 0));
           const releaseForensics: OptionJournalReleaseForensic[] = trail
             .slice(0, RELEASE_FORENSICS_CAP)
             .map((r) => {
+              // TRA-4759 item 3 — a `take_profit_early` close is stamped by its
+              // OWN record. Its release level is the capture level the rule
+              // fired at (`entry + captureFrac × availableProfit`, both off the
+              // stamp — entry recovered as `tp1Premium − availableProfit`), so
+              // level-vs-fill slip reads the same way it does for the lock. The
+              // displaced family's level rides the row's `takeProfitEarlyFire.
+              // profitLock` and the AC4 shadow record, not this list. When a
+              // row somehow carries both stamps, the one matching the cell's
+              // own exitReason wins.
+              const tpf = r.takeProfitEarlyFire;
+              const useTpf =
+                tpf !== undefined
+                && (exitReason === 'take_profit_early' || r.profitLockFire === undefined);
+              if (useTpf && tpf !== undefined) {
+                const availableProfit = num(tpf.availableProfit);
+                const captureFrac = num(tpf.captureFrac);
+                const tp1 = num(tpf.tp1Premium);
+                const entry =
+                  tp1 !== null && availableProfit !== null ? tp1 - availableProfit : null;
+                const levelPremium =
+                  entry !== null && captureFrac !== null && availableProfit !== null
+                    ? entry + captureFrac * availableProfit
+                    : null;
+                const stopBasisPremium = num(tpf.profitLock?.stopBasisPremium);
+                const markAtFire = num(tpf.markAtFire);
+                const exitFillPremium =
+                  r.pnlBasis === 'broker-fill' ? num(r.exitFillPremium) : null;
+                const fillVsLevelPremium =
+                  exitFillPremium !== null && levelPremium !== null
+                    ? exitFillPremium - levelPremium
+                    : null;
+                return {
+                  optionSymbol: r.optionSymbol ?? null,
+                  closeTs: num(r.closeTs),
+                  exitReason,
+                  stamped: true,
+                  // A level trigger that fired IS armed by construction; the
+                  // relabel discrimination stays `stamped: false`.
+                  armed: true,
+                  peakPremiumAtFire: num(tpf.profitLock?.peakPremiumConsumed),
+                  peakR: num(tpf.profitLock?.peakR),
+                  giveBackR: num(tpf.profitLock?.giveBackR),
+                  levelR:
+                    levelPremium !== null && entry !== null
+                      && stopBasisPremium !== null && stopBasisPremium > 0
+                      ? (levelPremium - entry) / stopBasisPremium
+                      : null,
+                  levelPremium,
+                  stopBasisPremium,
+                  markAtFire,
+                  execBidAtFire: num(tpf.execBidAtFire),
+                  exitFillPremium,
+                  fillVsLevelPremium,
+                  fillVsLevelR:
+                    fillVsLevelPremium !== null && stopBasisPremium !== null && stopBasisPremium > 0
+                      ? fillVsLevelPremium / stopBasisPremium
+                      : null,
+                  markVsLevelPremium:
+                    markAtFire !== null && levelPremium !== null ? markAtFire - levelPremium : null,
+                  pnlRStopBasis: num(r.pnlRStopBasis),
+                };
+              }
               const f = r.profitLockFire;
               const levelPremium = num(f?.levelPremium);
               const stopBasisPremium = num(f?.stopBasisPremium);
