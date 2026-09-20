@@ -2386,7 +2386,14 @@ function predicateSamples(samples: CostSample[]): LiveEnforcePredicateSample[] {
  */
 function grossRProvenanceFold(samples: CostSample[]): GrossRProvenanceFold | null {
   return foldGrossRProvenance(
-    samples.map((s) => ({ provenance: s.grossRProvenance, decidedAt: s.ts })),
+    samples.map((s) => ({
+      provenance: s.grossRProvenance,
+      decidedAt: s.ts,
+      // TRA-4753 — the RECORDED value and its day, which is what makes
+      // `recovered` answerable on rows that predate the stamp entirely.
+      grossR: s.grossR,
+      etDay: s.etDay,
+    })),
   );
 }
 

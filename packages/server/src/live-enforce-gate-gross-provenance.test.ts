@@ -101,6 +101,20 @@ function tableOf(opts: {
   });
 }
 
+/**
+ * One row as the fold takes it. `grossR` defaults to the stamp's own value, so a
+ * stamped row and its recorded number agree unless a case deliberately splits
+ * them — which is the real shape: both are written by the same call site.
+ */
+function foldRow(
+  provenance: GrossRProvenance | null,
+  decidedAt: number,
+  etDay = '2026-09-20',
+  grossR: number | null = provenance?.grossR ?? null,
+) {
+  return { provenance, decidedAt, etDay, grossR };
+}
+
 beforeEach(() => {
   resetGrossRProvenanceMemoForTests();
 });
@@ -234,7 +248,7 @@ describe('TRA-4753 §2 — the stamp is the estimator AS APPLIED', () => {
 
     // 2627 refusals, as measured live on `single_leg_otm::0.30-0.40`.
     const fold = foldGrossRProvenance(
-      Array.from({ length: 2627 }, (_, i) => ({ provenance: stamp, decidedAt: DECIDED_AT + i })),
+      Array.from({ length: 2627 }, (_, i) => foldRow(stamp, DECIDED_AT + i)),
     )!;
     expect(fold.rowsStamped).toBe(2627);
     expect(fold.rowsUnstamped).toBe(0);
@@ -265,8 +279,8 @@ describe('TRA-4753 §2 — the stamp is the estimator AS APPLIED', () => {
       tapeExpectancyVerdict({ structure: OTM, delta: DELTA_A }, gen2, DEFAULT_COST_GATE_CONFIG),
     );
     const fold = foldGrossRProvenance([
-      ...Array.from({ length: 5 }, () => ({ provenance: s1, decidedAt: DECIDED_AT - 86_000_000 })),
-      ...Array.from({ length: 3 }, () => ({ provenance: s2, decidedAt: DECIDED_AT })),
+      ...Array.from({ length: 5 }, () => foldRow(s1, DECIDED_AT - 86_000_000, '2026-09-19')),
+      ...Array.from({ length: 3 }, () => foldRow(s2, DECIDED_AT, '2026-09-20')),
     ])!;
     expect(fold.distinctGenerations).toBe(2);
     expect(fold.distinctGrossRValues).toBe(2);
@@ -281,7 +295,7 @@ describe('TRA-4753 §2 — the stamp is the estimator AS APPLIED', () => {
     // them would publish a clean one-generation answer over a handful of rows
     // and read as a census.
     const fold = foldGrossRProvenance(
-      Array.from({ length: 9558 }, () => ({ provenance: null, decidedAt: DECIDED_AT })),
+      Array.from({ length: 9558 }, () => foldRow(null, DECIDED_AT)),
     )!;
     expect(fold.rowsStamped).toBe(0);
     expect(fold.rowsUnstamped).toBe(9558);
@@ -304,7 +318,7 @@ describe('TRA-4753 §3 — tape age is measured from the TAPE, not the recompute
       table,
       tapeExpectancyVerdict({ structure: OTM, delta: DELTA_A }, table, DEFAULT_COST_GATE_CONFIG),
     );
-    const fold = foldGrossRProvenance([{ provenance: stamp, decidedAt: DECIDED_AT }])!;
+    const fold = foldGrossRProvenance([foldRow(stamp, DECIDED_AT)])!;
     const g = fold.generations[0]!;
 
     // The RECOMPUTE is 30s old…
@@ -323,8 +337,8 @@ describe('TRA-4753 §3 — tape age is measured from the TAPE, not the recompute
       tapeExpectancyVerdict({ structure: OTM, delta: DELTA_A }, table, DEFAULT_COST_GATE_CONFIG),
     );
     const fold = foldGrossRProvenance([
-      { provenance: stamp, decidedAt: DECIDED_AT },
-      { provenance: stamp, decidedAt: DECIDED_AT + 3 * 3_600_000 },
+      foldRow(stamp, DECIDED_AT),
+      foldRow(stamp, DECIDED_AT + 3 * 3_600_000),
     ])!;
     const g = fold.generations[0]!;
     expect(g.rows).toBe(2);
@@ -348,7 +362,7 @@ describe('TRA-4753 §3 — tape age is measured from the TAPE, not the recompute
       tapeToTs: null,
       windowDays: null,
     };
-    const fold = foldGrossRProvenance([{ provenance: stamp, decidedAt: DECIDED_AT }])!;
+    const fold = foldGrossRProvenance([foldRow(stamp, DECIDED_AT)])!;
     expect(fold.generations[0]!.tapeAgeMsAtLastDecision).toBeNull();
     expect(fold.tapeAgeMsMaxAtDecision).toBeNull();
     expect(fold.tapeToTsMax).toBeNull();
@@ -356,6 +370,82 @@ describe('TRA-4753 §3 — tape age is measured from the TAPE, not the recompute
 
   it('an empty row list folds to null, never to a zeroed shape', () => {
     expect(foldGrossRProvenance([])).toBeNull();
+  });
+});
+
+// ── §3b — the RECOVERY: answerable on rows that predate the stamp ────────────
+//
+// The stamp can only describe rows written after its own deploy. `recovered`
+// reads the `grossR` the ledger has held per row since TRA-3483, so the replay
+// question is answered on the whole retained census on boot. These cases mirror
+// the live 2026-09-20 fold exactly, including its own negative control.
+
+describe('TRA-4753 §3b — the replay, recovered from rows already held', () => {
+  const DAYS = ['2026-09-11', '2026-09-14', '2026-09-15', '2026-09-16', '2026-09-17', '2026-09-18'];
+
+  it('ONE value across six sessions reads as a REPLAY, with no stamp at all', () => {
+    // The live `single_leg_otm::0.30-0.40` shape: 2627 refusals, one bound.
+    const rows = DAYS.flatMap((d, i) =>
+      Array.from({ length: 400 }, () => foldRow(null, DECIDED_AT + i * 86_400_000, d, -0.215375)));
+    const fold = foldGrossRProvenance(rows)!;
+
+    expect(fold.rowsStamped).toBe(0); // no stamp — this is the point
+    expect(fold.recovered.rows).toBe(2400);
+    expect(fold.recovered.distinctValues).toBe(1);
+    expect(fold.recovered.etDaysSpanned).toBe(6);
+    expect(fold.recovered.heldConstantAcrossDays).toBe(true);
+    expect(fold.recovered.values[0]!.grossR).toBe(-0.215375);
+    expect(fold.recovered.values[0]!.etDays).toEqual(DAYS);
+  });
+
+  it('NEGATIVE CONTROL — the cell whose bound MOVED reads false on the same field', () => {
+    // The live `single_leg_otm::0.50-0.55`: seven distinct bounds over eight
+    // days, five of them inside 2026-08-21 alone. This is what proves the
+    // recorded values were written AT THE DECISION rather than back-filled from
+    // the current estimator — a back-fill is constant by construction, so it
+    // could not produce this row and the one above from the same code.
+    const moved = [0.604101, 0.635, 0.658764, 0.505147, 0.493214, 0.456215, 0.428045];
+    const fold = foldGrossRProvenance(
+      moved.map((v, i) => foldRow(null, DECIDED_AT + i * 86_400_000, DAYS[i % DAYS.length]!, v)),
+    )!;
+    expect(fold.recovered.distinctValues).toBe(7);
+    expect(fold.recovered.heldConstantAcrossDays).toBe(false);
+  });
+
+  it('one value on ONE day is NOT a cross-session replay', () => {
+    // A single session cannot distinguish "the bound held for weeks" from "the
+    // gate only ran once". Claiming a replay off it would overstate the finding.
+    const fold = foldGrossRProvenance(
+      Array.from({ length: 700 }, () => foldRow(null, DECIDED_AT, '2026-08-26', 0.456215)),
+    )!;
+    expect(fold.recovered.distinctValues).toBe(1);
+    expect(fold.recovered.etDaysSpanned).toBe(1);
+    expect(fold.recovered.heldConstantAcrossDays).toBe(false);
+  });
+
+  it('keys on the RAW double — two bounds 1e-12 apart are TWO values', () => {
+    // Rounding here would manufacture a replay that did not happen: a bound that
+    // re-resolved by a last bit is a bound that re-resolved.
+    const fold = foldGrossRProvenance([
+      foldRow(null, DECIDED_AT, '2026-09-11', -0.215375),
+      foldRow(null, DECIDED_AT, '2026-09-14', -0.215375 + 1e-12),
+    ])!;
+    expect(fold.recovered.distinctValues).toBe(2);
+    expect(fold.recovered.heldConstantAcrossDays).toBe(false);
+  });
+
+  it('rows with NO recorded grossR are counted, not folded into a value', () => {
+    const fold = foldGrossRProvenance([
+      foldRow(null, DECIDED_AT, '2026-09-11', -0.215375),
+      foldRow(null, DECIDED_AT, '2026-09-14', -0.215375),
+      foldRow(null, DECIDED_AT, '2026-09-15', null),
+    ])!;
+    expect(fold.recovered.rows).toBe(2);
+    expect(fold.recovered.rowsMissing).toBe(1);
+    expect(fold.recovered.heldConstantAcrossDays).toBe(true);
+    // The missing row still spans its day: `etDaysSpanned` is the group's, not
+    // the value's, so a coverage hole cannot shrink the window it is measured in.
+    expect(fold.recovered.etDaysSpanned).toBe(3);
   });
 });
 

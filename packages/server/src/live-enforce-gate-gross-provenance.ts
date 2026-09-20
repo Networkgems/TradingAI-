@@ -255,6 +255,59 @@ export interface GrossRProvenanceRow {
   provenance: GrossRProvenance | null;
   /** ms-epoch the decision was made — the only per-row input, and it dates the tape. */
   decidedAt: number;
+  /**
+   * The value RECORDED on the row at its own decision (TRA-3483). Present on
+   * every row since long before the stamp, which is what makes {@link
+   * GrossRRecovered} answerable today.
+   */
+  grossR: number | null;
+  /** The row's ET day — the axis the replay is measured ACROSS. */
+  etDay: string;
+}
+
+/**
+ * ⭐ TRA-4753 — THE REPLAY, RECOVERED FROM ROWS THE LEDGER ALREADY HOLDS.
+ *
+ * The stamp above is the right instrument and it is EMPTY on every row written
+ * before its own deploy — 9558 of 9558 on the fold it shipped onto, exactly as
+ * `predicate` was for TRA-4745. The first stamped row cannot arrive before the
+ * next RTH nomination, so on its own this ticket's question would stay open for
+ * a session at best and a month at worst.
+ *
+ * It is answerable NOW because `grossR` itself has been recorded per row since
+ * TRA-3483. Pool a cell over its own days and count the DISTINCT recorded
+ * doubles: one value across several sessions is one cell-level verdict replayed,
+ * and it does not depend on matching anything against today's estimator.
+ *
+ * ⚠️ This is EVIDENCE, not an assertion, and it carries its own control. A
+ * distribution BACK-FILLED from the current estimator would be constant across
+ * every cell and every day BY CONSTRUCTION — so the fact that one cell on this
+ * same surface, folded by this same code, MOVES while others hold still is what
+ * proves the values were written at the decision. Read a `heldConstantAcrossDays:
+ * true` next to a sibling cell reading `false` before believing either.
+ */
+export interface GrossRRecovered {
+  /** Rows carrying a recorded `grossR`. */
+  rows: number;
+  /** Rows carrying none — an unknown edge, which fails closed and constrains nothing. */
+  rowsMissing: number;
+  /** Distinct recorded doubles over the POOLED group. */
+  distinctValues: number;
+  /** ET days the group spans. */
+  etDaysSpanned: number;
+  /**
+   * ⭐ `true` ⇒ ONE recorded value, over 2+ rows, across 2+ ET days. The gate
+   * compared every one of those candidates against the same number on every one
+   * of those sessions: the refusal COUNT is a replay count, not N findings.
+   *
+   * `false` with `distinctValues > 1` is the live NEGATIVE CONTROL — that cell's
+   * bound re-resolved, which only a tape that is still growing can do.
+   */
+  heldConstantAcrossDays: boolean;
+  /** Each recorded value with its row count and the days it decided on. Capped. */
+  values: { grossR: number; rows: number; etDays: string[] }[];
+  /** Values dropped by the cap. > 0 ⇒ `values` is a head, not the set. */
+  valuesTruncated: number;
 }
 
 /**
@@ -331,9 +384,67 @@ export interface GrossRProvenanceFold {
   tapeAgeMsMaxAtDecision: number | null;
   /** Newest `closeTs` any stamped row's cell had behind it. */
   tapeToTsMax: number | null;
+  /**
+   * ⭐ THE FIELD TO READ WHILE `rowsStamped` IS 0. Recovered from `grossR` as
+   * already recorded on every row since TRA-3483, so it answers the replay
+   * question on the whole retained census today instead of next session.
+   *
+   * ⚠️ To close the loop, join `generations[].tapeToTs` — or, while nothing is
+   * stamped, `arm.costBar.edge.cellsByStructure[].cells[].tapeWindow` under this
+   * cell's OWN key (`cellKey` is exactly `structure::bucket`) — onto
+   * `heldConstantAcrossDays`. A bound that held still for weeks over a tape that
+   * has not grown for weeks is the self-sealing loop; a bound that held still
+   * over a tape still accruing is an ordinary quiet cell.
+   */
+  recovered: GrossRRecovered;
 }
 
 const MAX_GENERATIONS = 12;
+const MAX_RECOVERED_VALUES = 8;
+/** Days listed per recovered value. The COUNT is `etDaysSpanned`, never this length. */
+const MAX_RECOVERED_DAYS_PER_VALUE = 12;
+
+/**
+ * The replay, recovered. PURE. Keyed on the RAW recorded double — no rounding,
+ * no epsilon: two decisions that faced bounds 1e-12 apart faced different
+ * numbers, and collapsing them would manufacture a replay that did not happen.
+ */
+function recoverGrossR(rows: readonly GrossRProvenanceRow[]): GrossRRecovered {
+  const byValue = new Map<number, { grossR: number; rows: number; days: Set<string> }>();
+  const allDays = new Set<string>();
+  let present = 0;
+  let missing = 0;
+  for (const row of rows) {
+    allDays.add(row.etDay);
+    if (row.grossR === null || !Number.isFinite(row.grossR)) {
+      missing += 1;
+      continue;
+    }
+    present += 1;
+    const v = byValue.get(row.grossR);
+    if (v) {
+      v.rows += 1;
+      v.days.add(row.etDay);
+    } else {
+      byValue.set(row.grossR, { grossR: row.grossR, rows: 1, days: new Set([row.etDay]) });
+    }
+  }
+  const ordered = [...byValue.values()].sort((a, b) => b.rows - a.rows || a.grossR - b.grossR);
+  const single = ordered.length === 1 ? ordered[0]! : null;
+  return {
+    rows: present,
+    rowsMissing: missing,
+    distinctValues: ordered.length,
+    etDaysSpanned: allDays.size,
+    heldConstantAcrossDays: single !== null && single.rows >= 2 && single.days.size >= 2,
+    values: ordered.slice(0, MAX_RECOVERED_VALUES).map((v) => ({
+      grossR: v.grossR,
+      rows: v.rows,
+      etDays: [...v.days].sort().slice(0, MAX_RECOVERED_DAYS_PER_VALUE),
+    })),
+    valuesTruncated: Math.max(0, ordered.length - MAX_RECOVERED_VALUES),
+  };
+}
 
 function isoOrNull(ms: number | null): string | null {
   return ms === null || !Number.isFinite(ms) ? null : new Date(ms).toISOString();
@@ -405,6 +516,10 @@ export function foldGrossRProvenance(rows: readonly GrossRProvenanceRow[]): Gros
     }
   }
 
+  // Recovered from the RECORDED values, so it is populated on every row —
+  // stamped or not. This is the half that answers the ticket today.
+  const recovered = recoverGrossR(rows);
+
   if (rowsStamped === 0) {
     return {
       rowsStamped: 0,
@@ -418,6 +533,7 @@ export function foldGrossRProvenance(rows: readonly GrossRProvenanceRow[]): Gros
       generationsTruncated: 0,
       tapeAgeMsMaxAtDecision: null,
       tapeToTsMax: null,
+      recovered,
     };
   }
 
@@ -446,5 +562,6 @@ export function foldGrossRProvenance(rows: readonly GrossRProvenanceRow[]): Gros
     generationsTruncated: Math.max(0, all.length - MAX_GENERATIONS),
     tapeAgeMsMaxAtDecision: tapeAgeMax,
     tapeToTsMax,
+    recovered,
   };
 }
