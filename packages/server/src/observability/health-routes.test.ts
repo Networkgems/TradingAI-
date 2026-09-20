@@ -7691,6 +7691,37 @@ describe('GET /api/health/live-enforce-gates — arm.costBar.barsByStructure (TR
     expect(dir.scopeLabels).toContain('directional');
   });
 
+  // ── REGRESSION, caught on the first live read after deploy (2026-09-20) ───
+  // `scope` is NOT one axis across this ledger: `cost_bar` scopes by STRUCTURE,
+  // `universe` scopes by SYMBOL. The first cut folded every gate's scopes in and
+  // published several hundred per-ticker "bars" — each the conservative
+  // `isEquityStructure`-false fallback rendered as if AAPL were a sleeve.
+  it('reads ONLY the cost_bar gate: a universe SYMBOL scope never becomes a published bar', () => {
+    recordLiveEnforceDecision('universe', 'AAPL', true, etDay, 'not in universe', NOW);
+    recordLiveEnforceDecision('universe', 'ABBV', false, etDay, undefined, NOW);
+    recordLiveEnforceDecision('spread', 'KVYO', true, etDay, 'too wide', NOW);
+    recordLiveEnforceDecision('cost_bar', 'single_leg_rv', true, etDay, 'gross below bar', NOW);
+    const { barsByStructure, edge } = serveCostBar();
+    expect(barsByStructure.map((b) => b.structure)).toEqual(['single_leg_otm', 'single_leg_rv']);
+    expect(edge.cellsByStructure.map((c) => c.structure))
+      .toEqual(['single_leg_otm', 'single_leg_rv']);
+    // The decisions really are in the ledger — otherwise this is vacuous.
+    const body = (() => {
+      const { app, routes } = fakeApp();
+      registerLiveHealthRoutes(app, {
+        requireAuth: (() => undefined) as never,
+        userCtx: async () => ctx('admin', engineState()),
+        getSettings: () => settings(),
+        now: () => NOW,
+      });
+      const res = fakeRes();
+      routes.get('/api/health/live-enforce-gates')![0]!({}, res);
+      return res.body as { byGate: Array<{ gate: string; byScope: Array<{ scope: string }> }> };
+    })();
+    const universeScopes = body.byGate.find((g) => g.gate === 'universe')!.byScope.map((s) => s.scope);
+    expect(universeScopes).toEqual(expect.arrayContaining(['AAPL', 'ABBV']));
+  });
+
   it('always carries an entry for the structure `bar` publishes, at zero observations', () => {
     const { bar, barsByStructure } = serveCostBar();
     expect(barsByStructure[0]!.structure).toBe('single_leg_otm');

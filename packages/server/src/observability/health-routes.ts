@@ -175,6 +175,7 @@ import { DECLINE_REASON_TAXONOMY, TAPE_EXPECTANCY_MIN_CELL_N } from '../option-t
 import {
   resolveGatedStructureBars,
   COST_BAR_PUBLISHED_STRUCTURE,
+  COST_BAR_GATE,
 } from '../live-enforce-gate-bars.js';
 import {
   isOtmAdmissibleStrikeEnabled,
@@ -6454,7 +6455,16 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // TRA-4622's reader, the TRA-4258 ratification grade and every saved probe
     // still read what they read before.
     const tapeCells = tapeExpectancyCache().peek()?.cells ?? [];
-    const ledgerScopes = summary.retained.byGate.flatMap((g) => g.byScope.map((s) => s.scope));
+    // ⚠️ `cost_bar` ONLY. `scope` is NOT one axis across this ledger: `cost_bar`
+    // scopes by STRUCTURE, `universe` scopes by SYMBOL. Folding every gate's
+    // scopes in published a "bar" for AAL, AAPL, ABBV … — several hundred rows
+    // of the conservative "an unrecognised structure gets the options bar"
+    // fallback rendered as if a ticker were a sleeve. Caught on the first live
+    // read after deploy; the gate that APPLIES this bar is the only one whose
+    // scopes can name a structure it charges.
+    const ledgerScopes = [...summary.byGate, ...summary.retained.byGate]
+      .filter((g) => g.gate === COST_BAR_GATE)
+      .flatMap((g) => (g.byScope ?? []).map((s) => s.scope));
     const barsByStructure = resolveGatedStructureBars({
       scopeLabels: ledgerScopes,
       cellStructures: tapeCells.map((c) => c.structure),

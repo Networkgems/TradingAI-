@@ -54,6 +54,19 @@ import { canonicalTapeStructure } from './option-tape-expectancy.js';
  */
 export const COST_BAR_PUBLISHED_STRUCTURE = 'single_leg_otm';
 
+/**
+ * The gate that APPLIES this bar, and therefore the ONLY ledger gate whose
+ * `byScope[].scope` can name a structure it charges.
+ *
+ * ⚠️ `scope` is not one axis across the live-enforce ledger. `cost_bar` scopes
+ * by STRUCTURE (`single_leg_otm`, `single_leg_rv`); `universe` scopes by
+ * SYMBOL (`AAPL`, `ABBV`, …). The first cut of this module was handed every
+ * gate's scopes and published several hundred per-ticker "bars" — each one the
+ * conservative `isEquityStructure`-false fallback rendered as if a ticker were
+ * a sleeve. Caught on the first live read after deploy, 2026-09-20.
+ */
+export const COST_BAR_GATE = 'cost_bar';
+
 /** Where a structure was OBSERVED — i.e. why it is on this list at all. */
 export type GatedStructureSource =
   /** It is the structure `arm.costBar.bar` has always published. Always present. */
