@@ -695,8 +695,96 @@ export function summarizeShadowRecovery(events: readonly ShadowChaseEvent[]): Sh
  *
  * A sleeve whose measured `avgRecoveryPctAllAttempts` lands below its entry here
  * does not cover its own spread and cannot be promoted on maker routing.
+ *
+ * ⚠️ `directional` carries the 30.8% figure as a CARRIED-FORWARD PRIOR, not as a
+ * re-derived result. TRA-1662's 2026-08-13 re-scope established that the n=1,110
+ * closes labelled `single_leg_rv` were never the rv-long cohort: until TRA-2245,
+ * `openOptionFromRvCandidate` hardcoded `single_leg_rv` for every caller, and
+ * `RV_ENGINE_ENABLED` has been a compile-time `false` since 2026-06-30 — so those
+ * rows are the mislabelled near-ATM DIRECTIONAL sleeve, and 30.8% is already a
+ * directional number wearing an RV name. It is entered here so the live primary
+ * cell is GRADED rather than silently dropped; the re-derivation under a clean
+ * `directional` label is still owed. See `breakevenBasis` on the health payload.
+ *
+ * `single_leg_rv` is retained ONLY so a zero-attempt cell reports `attempts: 0`
+ * loudly instead of vanishing. It is NOT a go-forward population selector.
  */
 export const BREAKEVEN_MAKER_RECOVERY: Readonly<Record<string, number>> = {
   single_leg_rv: 0.308,
+  directional: 0.308,
   single_leg_otm: 0.736,
 };
+
+/**
+ * Provenance for each entry above, published beside the verdict so a reader can
+ * never mistake a carried prior for a re-derived measurement.
+ */
+export const BREAKEVEN_BASIS: Readonly<Record<string, 'measured' | 'carried_prior'>> = {
+  single_leg_rv: 'measured',
+  directional: 'carried_prior',
+  single_leg_otm: 'measured',
+};
+
+/** Why a sleeve does or does not carry a verdict. Never collapse these to a boolean. */
+export type RecoveryVerdictState = 'graded' | 'ungraded_no_breakeven' | 'no_measurement';
+
+export interface RecoveryVerdict {
+  structure: string;
+  state: RecoveryVerdictState;
+  attempts: number;
+  breakevenRecoveryPct: number | null;
+  breakevenBasis: 'measured' | 'carried_prior' | null;
+  measuredRecoveryPctAllAttempts: number | null;
+  coversItsOwnSpread: boolean | null;
+}
+
+/**
+ * Pair each sleeve's measured recovery against the breakeven it must clear. Pure.
+ *
+ * ⚠️ The population is the UNION of (sleeves with attempts) and (sleeves with a
+ * breakeven entry) — never the intersection. Intersecting is how this probe
+ * shipped its one real defect: `BREAKEVEN_MAKER_RECOVERY` keyed the DEAD
+ * `single_leg_rv` sleeve and carried no `directional` entry, so the live primary
+ * cell (n=353) was silently FILTERED OUT while the reader saw a one-row table
+ * that looked complete. An ungraded cell and a graded-and-passing cell must never
+ * render identically — and TRA-1662 legislates the mirror case in as many words:
+ * "a structure cell that comes back empty is not a recovery rate of zero — it is
+ * no measurement", so `attempts: 0` is reported LOUDLY rather than dropped.
+ *
+ * `coversItsOwnSpread` is a verdict ONLY in the `graded` state. It is `null`
+ * everywhere else, so "we did not measure" can never be read as "it passed".
+ */
+export function buildRecoveryVerdicts(
+  stats: readonly ShadowStructureStat[],
+): RecoveryVerdict[] {
+  const openStats = stats.filter((s) => s.side === 'open');
+  const structures = [
+    ...new Set([...openStats.map((s) => s.structure), ...Object.keys(BREAKEVEN_MAKER_RECOVERY)]),
+  ].sort();
+
+  return structures.map((structure) => {
+    const s = openStats.find((x) => x.structure === structure);
+    const breakeven = BREAKEVEN_MAKER_RECOVERY[structure];
+    const attempts = s?.attempts ?? 0;
+    const measured = s?.avgRecoveryPctAllAttempts ?? null;
+
+    const state: RecoveryVerdictState =
+      attempts === 0
+        ? 'no_measurement'
+        : breakeven === undefined
+          ? 'ungraded_no_breakeven'
+          : 'graded';
+
+    return {
+      structure,
+      state,
+      attempts,
+      breakevenRecoveryPct: breakeven ?? null,
+      breakevenBasis: BREAKEVEN_BASIS[structure] ?? null,
+      // ★ tail-aware expectancy — NOT the fills-only mean.
+      measuredRecoveryPctAllAttempts: measured,
+      coversItsOwnSpread:
+        state === 'graded' && measured !== null ? measured >= (breakeven as number) : null,
+    };
+  });
+}

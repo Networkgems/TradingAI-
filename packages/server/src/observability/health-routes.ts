@@ -353,7 +353,7 @@ import {
   listShadowChases,
   summarizeShadowRecovery,
   isOptionMakerShadowEnabled,
-  BREAKEVEN_MAKER_RECOVERY,
+  buildRecoveryVerdicts,
 } from '../option-maker-shadow.js';
 import { resolveMakerWalkConfig } from '../option-maker-config.js';
 import { isLearnedShrinkageEnabled } from '../learned-shrinkage-flag.js';
@@ -8021,21 +8021,10 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     const ladder = resolveMakerWalkConfig();
 
     // Grade each sleeve against the recovery it must clear to cover its own
-    // MEASURED taker cross (TRA-1656). `null` until the sleeve has attempts.
-    const verdicts = stats
-      .filter((s) => s.side === 'open' && BREAKEVEN_MAKER_RECOVERY[s.structure] !== undefined)
-      .map((s) => {
-        const breakeven = BREAKEVEN_MAKER_RECOVERY[s.structure] as number;
-        const measured = s.avgRecoveryPctAllAttempts;
-        return {
-          structure: s.structure,
-          attempts: s.attempts,
-          breakevenRecoveryPct: breakeven,
-          // ★ tail-aware expectancy — NOT the fills-only mean.
-          measuredRecoveryPctAllAttempts: measured,
-          coversItsOwnSpread: measured === null ? null : measured >= breakeven,
-        };
-      });
+    // MEASURED taker cross (TRA-1656). Union-not-intersection, and every
+    // failure-to-grade mode is named rather than filtered away — see
+    // `buildRecoveryVerdicts`, which owns the rule and carries the control.
+    const verdicts = buildRecoveryVerdicts(stats);
 
     res.json({
       ok: true,

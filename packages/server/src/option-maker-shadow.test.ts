@@ -8,6 +8,7 @@ import {
   advanceShadowChase,
   activeRung,
   summarizeShadowRecovery,
+  buildRecoveryVerdicts,
   BREAKEVEN_MAKER_RECOVERY,
   type ShadowChaseEvent,
 } from './option-maker-shadow.js';
@@ -298,5 +299,82 @@ describe('rollup — survivorship honesty', () => {
     expect(stat!.p50RecoveryPct).toBeCloseTo(0.5, 10);
     expect(stat!.p10RecoveryPct!).toBeLessThan(stat!.p50RecoveryPct!);
     expect(stat!.p90RecoveryPct!).toBeGreaterThan(stat!.p50RecoveryPct!);
+  });
+
+  describe('verdict assembly — an ungraded cell must not read as a graded one', () => {
+    // The defect this suite exists to kill, measured on bqb1 build 50671745 on
+    // 2026-09-20: `verdicts` was built by INTERSECTING the measured structures
+    // with the breakeven table. The table keyed the dead `single_leg_rv` sleeve
+    // and carried no `directional` entry, so the live primary cell (n=353) was
+    // dropped and the payload showed a one-row table that looked complete.
+
+    it('grades the live primary cell `directional` instead of silently dropping it', () => {
+      const verdicts = buildRecoveryVerdicts(
+        summarizeShadowRecovery([
+          ev({ structure: 'directional', side: 'open', recoveryPct: -0.1156 }),
+        ]),
+      );
+      const d = verdicts.find((v) => v.structure === 'directional');
+      expect(d).toBeDefined();
+      expect(d!.state).toBe('graded');
+      expect(d!.attempts).toBe(1);
+      expect(d!.coversItsOwnSpread).toBe(false);
+      // …and it is honest that the bar is a carried prior, not a re-derivation.
+      expect(d!.breakevenBasis).toBe('carried_prior');
+    });
+
+    it('reports a breakeven sleeve with NO attempts as `no_measurement`, never as 0% or absent', () => {
+      // TRA-1662, in as many words: "a structure cell that comes back empty is
+      // not a recovery rate of zero — it is no measurement."
+      const verdicts = buildRecoveryVerdicts(
+        summarizeShadowRecovery([ev({ structure: 'single_leg_otm', side: 'open' })]),
+      );
+      const rv = verdicts.find((v) => v.structure === 'single_leg_rv');
+      expect(rv).toBeDefined();
+      expect(rv!.state).toBe('no_measurement');
+      expect(rv!.attempts).toBe(0);
+      // The load-bearing assertion: no verdict, and crucially NOT `false`/`true`.
+      expect(rv!.coversItsOwnSpread).toBeNull();
+      expect(rv!.measuredRecoveryPctAllAttempts).toBeNull();
+    });
+
+    it('surfaces a measured sleeve with no breakeven entry as `ungraded_no_breakeven`', () => {
+      // A new sleeve must never go invisible just because nobody added its bar.
+      const verdicts = buildRecoveryVerdicts(
+        summarizeShadowRecovery([ev({ structure: 'vertical_spread', side: 'open' })]),
+      );
+      const v = verdicts.find((x) => x.structure === 'vertical_spread');
+      expect(v).toBeDefined();
+      expect(v!.state).toBe('ungraded_no_breakeven');
+      expect(v!.attempts).toBe(1);
+      expect(v!.breakevenRecoveryPct).toBeNull();
+      expect(v!.coversItsOwnSpread).toBeNull();
+    });
+
+    it('only ever passes a sleeve that genuinely clears its bar', () => {
+      // Positive control: without this, every assertion above is satisfied by a
+      // function that hardcodes `coversItsOwnSpread: false`.
+      const pass = buildRecoveryVerdicts(
+        summarizeShadowRecovery([
+          ev({ structure: 'single_leg_otm', side: 'open', recoveryPct: 0.9 }),
+        ]),
+      ).find((v) => v.structure === 'single_leg_otm');
+      expect(pass!.state).toBe('graded');
+      expect(pass!.coversItsOwnSpread).toBe(true);
+
+      const fail = buildRecoveryVerdicts(
+        summarizeShadowRecovery([
+          ev({ structure: 'single_leg_otm', side: 'open', recoveryPct: 0.7 }),
+        ]),
+      ).find((v) => v.structure === 'single_leg_otm');
+      expect(fail!.coversItsOwnSpread).toBe(false);
+    });
+
+    it('ignores close-side rows — the breakeven bars are open-side cross', () => {
+      const verdicts = buildRecoveryVerdicts(
+        summarizeShadowRecovery([ev({ structure: 'directional', side: 'close' })]),
+      );
+      expect(verdicts.find((v) => v.structure === 'directional')!.state).toBe('no_measurement');
+    });
   });
 });
