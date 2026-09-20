@@ -75,6 +75,7 @@ import { SCALEOUT_LADDER_FLAG } from '../scaleout-ladder-flag.js';
 import {
   clearScaleoutLadderLedger,
   runScaleoutLadderObservePass,
+  hydrateScaleoutLadderFromDisk,
 } from '../scaleout-ladder-ledger.js';
 import { clearEntryGreeksLedger, recordEntryGreeksVerdict } from '../entry-greeks-ledger.js';
 import {
@@ -3367,6 +3368,14 @@ describe('GET /api/health/scaleout-ladder — TRA-1729 observe-pass readout', ()
       observeStatus: string;
       firstRungUp: number;
       blind: boolean;
+      // TRA-4757 — the durable accumulator, on the wire.
+      observedNonBlindArmedAt: number | null;
+      observedNonBlindPassCount: number | null;
+      firstObservedNonBlindAt: number | null;
+      lastObservedNonBlindAt: number | null;
+      observedEtDaysSeen: number | null;
+      lastObservedEtDay: string | null;
+      observeDurabilityNote: string;
     };
   }
 
@@ -3409,6 +3418,64 @@ describe('GET /api/health/scaleout-ladder — TRA-1729 observe-pass readout', ()
     expect(body.observeStatus).toBe('never_ran');
     expect(body.observedPositionCount).toBeNull(); // no reading ≠ read an empty book
     expect(body.blind).toBe(false); // a flag that is OFF is not an alarm
+  });
+
+  // TRA-4757 — the DURABLE fields have to be on the WIRE, for the same spread reason
+  // the block comment above gives: TRA-1318 polls this route once per trading day and
+  // never calls summarizeScaleoutLadder(). A ledger-level test cannot see a route that
+  // drops the keys.
+  it('SERVES the durable non-blind accumulator, and it OUTLIVES the blind pass', () => {
+    const t = 1_700_000_000_000;
+    // ARM it against a DATA_DIR, the way boot does. Without this the accumulator is
+    // deliberately unarmed and serves nulls (see the next test) — bqb1 has DATA_DIR
+    // set, which is exactly what makes the ~56-day-old high-water durable there.
+    const tmp = mkdtempSync(join(tmpdir(), 'tra4757-route-'));
+    try {
+      hydrateScaleoutLadderFromDisk(tmp, t - 1_000);
+      runScaleoutLadderObservePass(
+        [{ id: 'p1', symbol: 'AAPL', side: 'buy', entryPrice: 100, quantity: 100 }],
+        new Map([['AAPL', 103]]),
+        t,
+      );
+      runScaleoutLadderObservePass([], new Map(), t + 450);
+      const body = ladderBody();
+
+      // The TRA-1729 instant cell has already forgotten it — this is the false NO-GO.
+      expect(body.observedPositionCount).toBe(0);
+      expect(body.observeStatus).toBe('blind');
+      // The accumulator has not.
+      expect(body.observedNonBlindArmedAt).toBe(t - 1_000);
+      expect(body.observedNonBlindPassCount).toBe(1);
+      expect(body.firstObservedNonBlindAt).toBe(t);
+      expect(body.lastObservedNonBlindAt).toBe(t);
+      expect(body.observedEtDaysSeen).toBe(1);
+      // 1700000000000 = 2023-11-14T22:13:20Z = 17:13 ET on 2023-11-14. The UTC and ET
+      // days happen to agree here; the ET fold itself is graded in the ledger suite.
+      expect(body.lastObservedEtDay).toBe('2023-11-14');
+      expect(typeof body.observeDurabilityNote).toBe('string');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+      clearScaleoutLadderLedger();
+    }
+  });
+
+  it('UNARMED serves null on every accumulator field — never a 0, and never since-boot', () => {
+    // No DATA_DIR hydrate here, so the accumulator is not armed. It counts in memory
+    // all the same — and publishes NOTHING, on purpose. Trap 3 of TRA-4757: a
+    // since-boot counter is worse than the known-blind instrument, because on a fresh
+    // boot it reads 0 identically to a durable counter over a genuinely dead book. A
+    // `0` here would be that bug; `null` says honestly "no durable measurement".
+    runScaleoutLadderObservePass([], new Map(), 1_700_000_000_000);
+    const body = ladderBody();
+    expect(body.observedNonBlindArmedAt).toBeNull();
+    expect(body.observedNonBlindPassCount).toBeNull();
+    expect(body.firstObservedNonBlindAt).toBeNull();
+    expect(body.lastObservedNonBlindAt).toBeNull();
+    expect(body.observedEtDaysSeen).toBeNull();
+    expect(body.lastObservedEtDay).toBeNull();
+    // …and the since-boot fields still report the blind pass, so this is not "no data".
+    expect(body.observePassCount).toBe(1);
+    expect(body.observeStatus).toBe('blind');
   });
 });
 

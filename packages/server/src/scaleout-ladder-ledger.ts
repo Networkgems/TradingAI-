@@ -33,6 +33,7 @@ import {
   SCALE_OUT_TAKER_FEE_EQUITY,
   SCALE_OUT_TAKER_FEE_CRYPTO,
   SCALE_OUT_LADDER_RUNGS,
+  getEasternUtcOffset,
 } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { timeSyncPhase } from './phase-timing.js';
@@ -41,11 +42,14 @@ const log = logger.child({ module: 'scaleout-ladder-ledger' });
 
 export const SCALEOUT_LADDER_LOG_FILENAME = 'scaleout-ladder-trims.jsonl';
 
-// TRA-1729 — the observe-pass high-water snapshot. A SEPARATE, single-line file (not
-// the append-only trim log): the high-water is a MONOTONE SCALAR, so it is rewritten
-// in place on each advance and the file can never grow. Rewrite-on-advance (rather
-// than one line per pass) is what keeps a ~1/min observe pass from growing an
-// unbounded JSONL that the boot hydrate would then have to read end-to-end.
+// TRA-1729/TRA-4757 — the observe-pass snapshot. A SEPARATE, single-line file (not
+// the append-only trim log): everything in it is a MONOTONE SCALAR, so it is rewritten
+// in place and the file can never grow. Rewrite-on-change (rather than one line per
+// pass) is what keeps a ~2.2/sec observe pass from growing an unbounded JSONL that the
+// boot hydrate would then have to read end-to-end. It now carries two blocks — the
+// TRA-1729 high-water at the top level and the TRA-4757 non-blind accumulator under
+// `nonBlind` (see {@link ScaleoutObserveSnapshot} for why that nesting is the
+// back-compatible shape).
 export const SCALEOUT_LADDER_OBSERVE_FILENAME = 'scaleout-ladder-observe.json';
 
 /** The first (lowest) ladder rung — the threshold `maxGainPctObserved` is measured against. */
@@ -137,6 +141,66 @@ let lastPassObservedCount: number | null = null;
 let lastPassMaxGainPct: number | null = null;
 let maxGainObserved: ScaleoutHighWater | null = null;
 
+// ── TRA-4757 — the DURABLE non-blind observation accumulator ─────────────────
+//
+// TRA-1729 left one hole open, and TRA-4757 measured it on the live build: every
+// field above that could witness a non-empty book is either LAST-PASS-ONLY or
+// BLIND-INCLUSIVE, so a position that opened and closed between two reads leaves
+// no trace at all.
+//   • `observedPositionCount` is the LAST pass only — back to 0 one pass after the
+//     book empties (~0.45s on bqb1, measured at ~2.2 passes/sec).
+//   • `observePassCount` increments on a BLIND pass too (3275 → 3277 over ~0.6s
+//     against an empty book), so it cannot separate "ran and saw a book" from
+//     "ran and saw nothing".
+//   • `maxGainPctObserved` is a HIGH-WATER: it advances only on a new maximum, so
+//     a whole position peaking below the standing high-water (0.15268 today) moves
+//     nothing.
+// A reader sampling once per day therefore sees an INSTANT CELL, and a zero from a
+// genuinely dead book is byte-identical to a zero from a book that was full between
+// samples. TRA-1318's bear branch ("five consecutive zeros ⇒ NO-GO") was about to be
+// computed on top of exactly that ambiguity.
+//
+// These five fields are the ACCUMULATOR that closes it: monotone, incremented on the
+// observe pass (never on a trim — `trimCount` is the retired gate), and persisted in
+// the same proven-durable store as the high-water. One read per day then becomes a
+// strict SUPERSET of everything since the previous read.
+//
+// ── `null` is NOT `0`, and the discriminator is DURABLE ───────────────────────
+// A counter that reads `0` because it has never existed and a counter that reads `0`
+// because it has honestly counted nothing are the same pass/fail-identical bug one
+// level up. `nonBlindArmedAt` is what splits them: it is stamped ONCE, into the
+// durable snapshot, the first time a DATA_DIR-backed hydrate finds no accumulator
+// block. So:
+//   • armed (`nonBlindArmedAt != null`) ⇒ the counts are MEASUREMENTS and `0` means
+//     "this store has watched since <armedAt> and never once saw a position";
+//   • not armed ⇒ every count reports `null` — a pre-TRA-4757 store, or no DATA_DIR.
+// Never `?? 0` any of them at a call site; that re-collapses the two readings.
+
+let nonBlindArmedAt: number | null = null;
+let nonBlindPassCount = 0;
+let firstNonBlindAt: number | null = null;
+let lastNonBlindAt: number | null = null;
+let nonBlindEtDaysSeen = 0;
+let lastNonBlindEtDay: string | null = null;
+
+/**
+ * Throttle for the durable snapshot rewrite. The observe pass runs ~2.2×/sec, so a
+ * write per non-blind pass would be ~51k single-line rewrites across one RTH session
+ * — pointless IO for a counter nobody reads more than daily.
+ *
+ * The throttle is SAFE ONLY BECAUSE THE SIGNAL-CARRYING TRANSITIONS BYPASS IT. The
+ * first non-blind pass ever, and every ET day rollover, flush IMMEDIATELY (see
+ * {@link recordScaleoutObservePass}); only `observedNonBlindPassCount` and
+ * `lastObservedNonBlindAt` can lag, and only by ≤ this interval, and only downward.
+ * So the durable count is a LOWER BOUND that can never manufacture a false sighting
+ * — and the 0 → ≥1 edge, which is the one TRA-1318 hangs on, is never lost to a
+ * reboot.
+ */
+const OBSERVE_SNAPSHOT_FLUSH_MS = 60_000;
+
+/** Since-boot: when the durable snapshot was last actually written (throttle state). */
+let lastSnapshotFlushAt: number | null = null;
+
 export function scaleoutLadderLogPath(dir: string): string {
   return join(dir, SCALEOUT_LADDER_LOG_FILENAME);
 }
@@ -161,6 +225,26 @@ export function clearScaleoutLadderLedger(): void {
   lastPassObservedCount = null;
   lastPassMaxGainPct = null;
   maxGainObserved = null;
+  nonBlindArmedAt = null;
+  nonBlindPassCount = 0;
+  firstNonBlindAt = null;
+  lastNonBlindAt = null;
+  nonBlindEtDaysSeen = 0;
+  lastNonBlindEtDay = null;
+  lastSnapshotFlushAt = null;
+}
+
+/**
+ * ET calendar day (`YYYY-MM-DD`) of a ms-epoch instant, DST-aware via the shared
+ * Eastern offset. ET and NOT UTC deliberately: the trading day is ET, and a UTC fold
+ * splits the 13:30–20:00Z session across two day keys on any late session.
+ *
+ * Offset arithmetic rather than `new Intl.DateTimeFormat(...)` per call — this sits on
+ * a ~2.2/sec pass, and constructing a formatter there is measurable waste. Same helper
+ * shape as `learned-weights-history.ts:etDay`.
+ */
+function etDayOf(utcMs: number): string {
+  return new Date(utcMs + getEasternUtcOffset(utcMs) * 3_600_000).toISOString().slice(0, 10);
 }
 
 /** The default per-side taker fee rate for an asset class (equity vs crypto). */
@@ -237,13 +321,67 @@ export interface ScaleoutObservePass {
 }
 
 /**
- * Rewrite the durable high-water snapshot (best-effort, single line). Called only when
- * the high-water ADVANCES, which is monotone and therefore rare — the file never grows.
- * A write failure logs and is swallowed: this is a readout, and it must never be able
- * to break the observe pass it instruments.
+ * TRA-4757 — the durable non-blind accumulator block, as it sits on disk inside the
+ * observe snapshot. Persisted ONLY once `armedAt` is stamped, so a `passCount: 0` read
+ * back off disk is always a real measurement over `[armedAt, now]`, never an absence.
  */
-function persistScaleoutHighWater(): void {
-  if (dataDir == null || maxGainObserved == null) return;
+export interface ScaleoutNonBlindSnapshot {
+  /** ms epoch the accumulator was first armed against this DATA_DIR. */
+  armedAt: number;
+  /** All-time passes with `observed.length >= 1`. Lower bound — see the throttle note. */
+  passCount: number;
+  /** ms epoch of the first non-blind pass ever. Flushed immediately; exact. */
+  firstAt: number | null;
+  /** ms epoch of the most recent non-blind pass. Lags by ≤ the flush throttle. */
+  lastAt: number | null;
+  /** Distinct ET calendar days with ≥1 non-blind pass. Flushed on rollover; exact. */
+  etDaysSeen: number;
+  /** Most recent such ET day, `YYYY-MM-DD`. */
+  lastEtDay: string | null;
+}
+
+/**
+ * The on-disk shape of `scaleout-ladder-observe.json`.
+ *
+ * ⚠️ The TRA-1729 high-water fields stay at the TOP LEVEL, exactly where they were, and
+ * the TRA-4757 accumulator hangs off a nested `nonBlind` key. That is deliberate and it
+ * is what makes the format compatible in BOTH directions against the live bqb1 store
+ * (whose `GEMI` high-water is stamped 2026-07-26 and has survived ~56 days of boots):
+ *   • an OLD build reading a NEW file still shape-checks the four top-level fields and
+ *     hydrates the high-water — the extra key is ignored, so a rollback loses nothing;
+ *   • a NEW build reading an OLD file finds no `nonBlind` block and arms one, rather
+ *     than reading a missing counter as `0`.
+ */
+interface ScaleoutObserveSnapshot extends Partial<ScaleoutHighWater> {
+  nonBlind?: ScaleoutNonBlindSnapshot;
+}
+
+/**
+ * Rewrite the durable observe snapshot (best-effort, single line). The file is a
+ * MONOTONE SCALAR SET rewritten in place, never appended to, so it cannot grow.
+ *
+ * A write failure logs and is swallowed: this is a readout, and it must never be able
+ * to break the observe pass it instruments. Callers own the throttle — this always
+ * writes when called.
+ */
+function persistScaleoutObserveSnapshot(now: number): void {
+  if (dataDir == null) return;
+  const snapshot: ScaleoutObserveSnapshot = {};
+  // Spread the high-water at the top level (back-compat) only when we have one; an
+  // absent high-water must stay ABSENT rather than land as four nulls that an older
+  // build's shape check would reject.
+  if (maxGainObserved != null) Object.assign(snapshot, maxGainObserved);
+  if (nonBlindArmedAt != null) {
+    snapshot.nonBlind = {
+      armedAt: nonBlindArmedAt,
+      passCount: nonBlindPassCount,
+      firstAt: firstNonBlindAt,
+      lastAt: lastNonBlindAt,
+      etDaysSeen: nonBlindEtDaysSeen,
+      lastEtDay: lastNonBlindEtDay,
+    };
+  }
+  if (maxGainObserved == null && snapshot.nonBlind == null) return; // nothing to say yet
   const path = scaleoutLadderObservePath(dataDir);
   try {
     mkdirSync(dirname(path), { recursive: true });
@@ -251,9 +389,10 @@ function persistScaleoutHighWater(): void {
     // exists / unwritable — the write below surfaces the error
   }
   try {
-    writeFileSync(path, JSON.stringify(maxGainObserved) + '\n', 'utf8');
+    writeFileSync(path, JSON.stringify(snapshot) + '\n', 'utf8');
+    lastSnapshotFlushAt = now;
   } catch (err) {
-    log.warn('scaleout-ladder observe high-water write failed', {
+    log.warn('scaleout-ladder observe snapshot write failed', {
       reason: err instanceof Error ? err.message : String(err),
     });
   }
@@ -269,6 +408,10 @@ function persistScaleoutHighWater(): void {
  * counters and, when the pass saw a NEW best favorable excursion, advances the durable
  * high-water. A pass that observed nothing sets `maxGainPctLastPass` to `null`, NOT to
  * `0` — an empty pass did not observe a 0% gain, it observed no gain at all.
+ *
+ * TRA-4757: a pass with `observed.length >= 1` ALSO advances the durable non-blind
+ * accumulator. That is the only field family on this route that a position which opens
+ * and closes between two reads cannot slip past — see the accumulator comment above.
  */
 export function recordScaleoutObservePass(
   pass: ScaleoutObservePass,
@@ -286,15 +429,54 @@ export function recordScaleoutObservePass(
   }
   lastPassMaxGainPct = best == null ? null : best.gainPct;
 
-  if (best != null && (maxGainObserved == null || best.gainPct > maxGainObserved.gainPct)) {
+  const advancedHighWater =
+    best != null && (maxGainObserved == null || best.gainPct > maxGainObserved.gainPct);
+  if (advancedHighWater && best != null) {
     maxGainObserved = {
       gainPct: best.gainPct,
       symbol: best.symbol,
       positionId: best.positionId,
       ts: now,
     };
-    persistScaleoutHighWater();
   }
+
+  // ── TRA-4757 accumulator ───────────────────────────────────────────────────
+  // Keyed on `observed.length`, NOT on `best != null`: a position whose gainPct is
+  // non-finite is still a position the pass WATCHED, and the question this counter
+  // answers is "was the book ever non-empty", not "was it ever priced sanely".
+  let mustFlush = advancedHighWater;
+  if (pass.observed.length >= 1) {
+    nonBlindPassCount += 1;
+    lastNonBlindAt = now;
+    if (firstNonBlindAt == null) {
+      firstNonBlindAt = now;
+      mustFlush = true; // the 0 → ≥1 edge: the one transition a reboot must never eat
+    }
+    const day = etDayOf(now);
+    if (day !== lastNonBlindEtDay) {
+      lastNonBlindEtDay = day;
+      nonBlindEtDaysSeen += 1;
+      mustFlush = true; // day rollover — also exact, also never throttled away
+    }
+    // ⛔ These two `mustFlush = true` are REDUNDANT FOR THE FIRST PASS and neither is
+    // dead code. The first non-blind pass ever always changes the ET day too (from
+    // `null`), so each branch covers the other there — mutating away either one alone
+    // leaves the whole suite green; only removing BOTH goes red. Keep both: they
+    // diverge on every LATER day rollover, and TRA-4757 explicitly offers the ET day
+    // fields up as droppable, at which point the edge flush is the only guard left.
+  }
+
+  if (mustFlush) {
+    persistScaleoutObserveSnapshot(now);
+  } else if (pass.observed.length >= 1) {
+    // Ordinary non-blind pass: rewrite at most once per OBSERVE_SNAPSHOT_FLUSH_MS.
+    if (lastSnapshotFlushAt == null || now - lastSnapshotFlushAt >= OBSERVE_SNAPSHOT_FLUSH_MS) {
+      persistScaleoutObserveSnapshot(now);
+    }
+  }
+  // A BLIND pass writes nothing at all — there is no state for it to change, and a
+  // rewrite per empty tick would be ~190k pointless writes a day on the dead book this
+  // instrument exists to detect.
 }
 
 /** The open-position shape the observe pass needs (structurally the PaperAccount position). */
@@ -441,36 +623,79 @@ export interface ScaleoutLadderHydration {
   lastTrimAt: number | null;
   /** TRA-1729 — the durable observe high-water recovered from disk (null = none yet). */
   maxGainPctObserved: number | null;
+  /** TRA-4757 — durable non-blind pass count recovered from disk. `null` = not armed. */
+  observedNonBlindPassCount: number | null;
 }
 
 /**
- * TRA-1729 — restore the durable observe-pass high-water. Best-effort and shape-checked:
- * a missing/corrupt/non-numeric snapshot leaves the high-water `null` (honestly "never
- * measured") rather than throwing or, worse, laundering a garbage row into a 0.
+ * TRA-1729/TRA-4757 — restore the durable observe snapshot. Best-effort and
+ * shape-checked per BLOCK: a missing/corrupt/non-numeric high-water leaves the
+ * high-water `null` (honestly "never measured") rather than throwing or, worse,
+ * laundering a garbage row into a 0 — and the same, independently, for the non-blind
+ * accumulator. The two blocks are validated separately on purpose: a build that
+ * rolled back and rewrote the legacy-only shape must not take the high-water down
+ * with the missing accumulator, and a corrupt accumulator must not discard a
+ * ~56-day-old high-water.
  */
-function hydrateScaleoutHighWater(dir: string): void {
+function hydrateScaleoutObserveSnapshot(dir: string): void {
   let raw = '';
   try {
     raw = readFileSync(scaleoutLadderObservePath(dir), 'utf8').trim();
   } catch {
-    return; // no snapshot yet — high-water stays null
+    return; // no snapshot yet — high-water and accumulator stay null
   }
   if (raw === '') return;
+  let rec: ScaleoutObserveSnapshot;
   try {
-    const rec = JSON.parse(raw) as ScaleoutHighWater;
-    if (
-      typeof rec.gainPct === 'number' &&
-      Number.isFinite(rec.gainPct) &&
-      typeof rec.symbol === 'string' &&
-      typeof rec.positionId === 'string' &&
-      typeof rec.ts === 'number'
-    ) {
-      maxGainObserved = rec;
-    } else {
+    rec = JSON.parse(raw) as ScaleoutObserveSnapshot;
+  } catch {
+    log.warn('scaleout-ladder observe snapshot unparseable — ignored');
+    return;
+  }
+
+  if (
+    typeof rec.gainPct === 'number' &&
+    Number.isFinite(rec.gainPct) &&
+    typeof rec.symbol === 'string' &&
+    typeof rec.positionId === 'string' &&
+    typeof rec.ts === 'number'
+  ) {
+    maxGainObserved = {
+      gainPct: rec.gainPct,
+      symbol: rec.symbol,
+      positionId: rec.positionId,
+      ts: rec.ts,
+    };
+  } else {
+    // Not necessarily a defect: once the accumulator exists, a snapshot may legitimately
+    // carry ONLY the `nonBlind` block (armed, high-water never measured). Only warn when
+    // there is a partial high-water to complain about.
+    if (rec.gainPct !== undefined || rec.symbol !== undefined || rec.positionId !== undefined) {
       log.warn('scaleout-ladder observe high-water snapshot malformed — ignored');
     }
-  } catch {
-    log.warn('scaleout-ladder observe high-water snapshot unparseable — ignored');
+  }
+
+  const nb = rec.nonBlind;
+  if (nb == null) return; // pre-TRA-4757 store — the caller arms it
+  if (
+    typeof nb.armedAt === 'number' &&
+    Number.isFinite(nb.armedAt) &&
+    typeof nb.passCount === 'number' &&
+    Number.isFinite(nb.passCount) &&
+    typeof nb.etDaysSeen === 'number' &&
+    Number.isFinite(nb.etDaysSeen)
+  ) {
+    nonBlindArmedAt = nb.armedAt;
+    nonBlindPassCount = nb.passCount;
+    nonBlindEtDaysSeen = nb.etDaysSeen;
+    firstNonBlindAt = typeof nb.firstAt === 'number' && Number.isFinite(nb.firstAt) ? nb.firstAt : null;
+    lastNonBlindAt = typeof nb.lastAt === 'number' && Number.isFinite(nb.lastAt) ? nb.lastAt : null;
+    lastNonBlindEtDay = typeof nb.lastEtDay === 'string' && nb.lastEtDay !== '' ? nb.lastEtDay : null;
+  } else {
+    // Leave it UNARMED. A malformed accumulator must read `null` (= "no durable
+    // measurement"), never 0 — the caller then re-arms with a fresh `armedAt`, which
+    // truthfully says the counted window starts now.
+    log.warn('scaleout-ladder observe non-blind accumulator malformed — ignored');
   }
 }
 
@@ -482,7 +707,10 @@ function hydrateScaleoutHighWater(dir: string): void {
  * needed. Best-effort: a missing/corrupt file yields an empty hydration (torn
  * trailing lines are skipped) rather than throwing.
  */
-export function hydrateScaleoutLadderFromDisk(dir: string): ScaleoutLadderHydration {
+export function hydrateScaleoutLadderFromDisk(
+  dir: string,
+  now: number = Date.now(),
+): ScaleoutLadderHydration {
   clearScaleoutLadderLedger();
   dataDir = dir;
 
@@ -490,7 +718,18 @@ export function hydrateScaleoutLadderFromDisk(dir: string): ScaleoutLadderHydrat
   // of the boot-hydrate candidates for the residual ~71s event-loop block; wrap it
   // so a stall here is NAMED in the watchdog trip breadcrumb (`slowPhase`).
   return timeSyncPhase('hydrate.scaleoutLadder', () => {
-    hydrateScaleoutHighWater(dir);
+    hydrateScaleoutObserveSnapshot(dir);
+
+    // TRA-4757 — ARM the non-blind accumulator if this store has never carried one.
+    // This is the ONE write that makes a later `observedNonBlindPassCount: 0` readable
+    // as a measurement instead of an absence, so it happens at boot (once, on a
+    // pre-TRA-4757 or corrupt store) rather than waiting for a non-blind pass that may
+    // never come — the dead-book case is exactly the case this instrument is for, and
+    // arming lazily would leave it reporting `null` forever in precisely that state.
+    if (nonBlindArmedAt == null) {
+      nonBlindArmedAt = now;
+      persistScaleoutObserveSnapshot(now);
+    }
 
     let raw = '';
     try {
@@ -522,6 +761,7 @@ export function hydrateScaleoutLadderFromDisk(dir: string): ScaleoutLadderHydrat
       firstTrimAt,
       lastTrimAt,
       maxGainPctObserved: maxGainObserved?.gainPct ?? null,
+      observedNonBlindPassCount: nonBlindArmedAt == null ? null : nonBlindPassCount,
     };
   });
 }
@@ -572,6 +812,28 @@ export interface ScaleoutLadderSummary {
   observeStatus: ScaleoutObserveStatus;
   /** The lowest rung (0.25 = +25%), so a reader can size maxGainPctObserved against it. */
   firstRungUp: number;
+
+  // ── TRA-4757 DURABLE non-blind accumulator (survives restart via DATA_DIR) ───
+  // Every field here is `null` when the accumulator is NOT ARMED (pre-TRA-4757 store,
+  // corrupt block, or no DATA_DIR). Armed, a `0` is a MEASUREMENT over
+  // [observedNonBlindArmedAt, now]. ⛔ Never `?? 0` these.
+  /** ms epoch the accumulator was armed against this store — the start of the window
+   *  a `0` count covers. A count without this is uninterpretable. */
+  observedNonBlindArmedAt: number | null;
+  /** All-time passes that saw ≥1 position. The field TRA-1318 samples: it is an
+   *  ACCUMULATOR, so one read per day is a strict superset of the previous read.
+   *  LOWER BOUND — up to `OBSERVE_SNAPSHOT_FLUSH_MS` of ticks can be lost to a hard
+   *  reboot, but never the 0 → ≥1 edge, which flushes immediately. */
+  observedNonBlindPassCount: number | null;
+  /** ms epoch of the first non-blind pass EVER. Exact (never throttled). */
+  firstObservedNonBlindAt: number | null;
+  /** ms epoch of the most recent non-blind pass. Lags by ≤ the flush throttle. */
+  lastObservedNonBlindAt: number | null;
+  /** Distinct ET calendar days with ≥1 non-blind pass. ET, not UTC: a UTC fold splits
+   *  the 13:30–20:00Z session. Exact (day rollovers flush immediately). */
+  observedEtDaysSeen: number | null;
+  /** Most recent ET day with a non-blind pass, `YYYY-MM-DD`. */
+  lastObservedEtDay: string | null;
 }
 
 /**
@@ -608,5 +870,14 @@ export function summarizeScaleoutLadder(): ScaleoutLadderSummary {
     observePassCount,
     observeStatus,
     firstRungUp: FIRST_RUNG_UP,
+
+    // Gated on `nonBlindArmedAt` as ONE unit — reporting a count while the arming
+    // stamp is null would be the exact "0 that might mean never" this closes.
+    observedNonBlindArmedAt: nonBlindArmedAt,
+    observedNonBlindPassCount: nonBlindArmedAt == null ? null : nonBlindPassCount,
+    firstObservedNonBlindAt: nonBlindArmedAt == null ? null : firstNonBlindAt,
+    lastObservedNonBlindAt: nonBlindArmedAt == null ? null : lastNonBlindAt,
+    observedEtDaysSeen: nonBlindArmedAt == null ? null : nonBlindEtDaysSeen,
+    lastObservedEtDay: nonBlindArmedAt == null ? null : lastNonBlindEtDay,
   };
 }

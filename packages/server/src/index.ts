@@ -4563,6 +4563,16 @@ async function runLiveRealizedCalendarBackfill(): Promise<void> {
       lastTrimAt: h.lastTrimAt,
     });
   }
+  // TRA-4757 — log the DURABLE observe accumulators unconditionally, i.e. NOT under the
+  // `trimCount > 0` guard above. `trimCount` is 0 on bqb1 and is the retired gate; if
+  // this line were gated on it, the one boot-time breadcrumb proving the accumulator
+  // actually survived the restart would be silent in exactly the state the instrument
+  // exists for. `observedNonBlindPassCount: null` here means the store had no
+  // accumulator and one was just armed.
+  log.info('scale-out ladder observe accumulators hydrated (TRA-4757)', {
+    observedNonBlindPassCount: h.observedNonBlindPassCount,
+    maxGainPctObserved: h.maxGainPctObserved,
+  });
 }
 
 // TRA-1486 D2 (parent TRA-1476) — hydrate the DURABLE per-name/ET-day directional
