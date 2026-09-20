@@ -159,6 +159,7 @@ import {
   resolveCostGateConfig,
   admissionBarR,
   describeCostGateBar, // TRA-3216 — the CONSTANT half of "why did the bar block"
+  isEquityStructure, // TRA-4749 — the ONLY predicate `admissionBarR` branches on
   OPTION_COST_AWARE_GATE_FLAG,
   OPTION_COST_GATE_SAFETY_MARGIN_R_VAR, // TRA-4258 — named in the ratification clause
 } from '../option-cost-gate.js';
@@ -169,6 +170,12 @@ import { describeNetEdgeBar } from '../option-net-edge-bar.js';
 // decision is readable off deployed state instead of re-derived by hand.
 import { tapeExpectancyCache } from '../option-tape-expectancy-cache.js';
 import { DECLINE_REASON_TAXONOMY, TAPE_EXPECTANCY_MIN_CELL_N } from '../option-tape-expectancy.js';
+// TRA-4749 (parent TRA-4622 §4) — the bar for EVERY structure the gate is
+// observed to charge, not just the one `bar` was hard-coded to.
+import {
+  resolveGatedStructureBars,
+  COST_BAR_PUBLISHED_STRUCTURE,
+} from '../live-enforce-gate-bars.js';
 import {
   isOtmAdmissibleStrikeEnabled,
   resolveAdmissibleBand,
@@ -6388,7 +6395,8 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // TRA-3216 — the bar's COMPOSITION, published once. It is identical on every
     // blocked row, so it cannot live in the per-decision `byReason` fold; without
     // it, `byReason`'s shortfall buckets have no scale to be read against.
-    const otmBar = describeCostGateBar('single_leg_otm', resolveCostGateConfig(liveEnv));
+    const costConfig = resolveCostGateConfig(liveEnv);
+    const otmBar = describeCostGateBar(COST_BAR_PUBLISHED_STRUCTURE, costConfig);
     // TRA-4258 — the AUTHORIZATION behind that bar, which every field on `bar` is
     // silent about. Graded on the RESOLVED `safetyMarginR` (what the live order
     // site actually adds), never on the raw env string: a malformed
@@ -6432,6 +6440,88 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // of the grade and never an input to the recovery.
       flatFormBarR: otmBar.barR,
     });
+    // ── TRA-4749 (parent TRA-4622 §4) — EVERY bar and EVERY edge cell ─────────
+    // `bar` and `edge.otmCells` above are both scoped to `single_leg_otm` by a
+    // literal, and nothing said so. The retained ledger simultaneously recorded
+    // `single_leg_rv` at 633 evaluated / 633 blocked against a bar published
+    // nowhere, so a reader could not tell a legitimate refusal (the RV cell's
+    // edge bound is NEGATIVE) from an OTM-shaped cost charged to a cheaper
+    // sleeve. Both surfaces below are derived from LIVE RECORDED STATE — the
+    // ledger's own scopes and the fold's own cells — because a hard-coded sleeve
+    // roster is exactly what hid RV in the first place.
+    //
+    // ⛔ ADDITIVE. `bar` and `edge.otmCells` are untouched and byte-identical:
+    // TRA-4622's reader, the TRA-4258 ratification grade and every saved probe
+    // still read what they read before.
+    const tapeCells = tapeExpectancyCache().peek()?.cells ?? [];
+    const ledgerScopes = summary.retained.byGate.flatMap((g) => g.byScope.map((s) => s.scope));
+    const barsByStructure = resolveGatedStructureBars({
+      scopeLabels: ledgerScopes,
+      cellStructures: tapeCells.map((c) => c.structure),
+      config: costConfig,
+    });
+    /**
+     * The `edge.otmCells` projection, lifted verbatim so the per-structure cells
+     * below cannot drift from the OTM ones they are supposed to match (AC2 is
+     * "the same shape", and two hand-maintained mappers are how that stops being
+     * true). `otmCells` is rendered through this same function.
+     */
+    const projectEdgeCell = (c: (typeof tapeCells)[number]) => ({
+      bucket: c.bucket,
+      n: c.n,
+      meanR_gate: c.meanR_gate,
+      seR_gate: c.seR_gate,
+      lowerCI95: c.lowerCI95,
+      barR: c.barR,
+      admits: c.admits,
+      /**
+       * TRA-4578 — WHO is in this cell. `admits` above is decided by
+       * `lowerCI95` alone, and `lowerCI95` reads identically whether the
+       * cell is desk real-money closes or demo rows booked at mid
+       * (`demoSlippagePct: 0` — demo realized R is gross of spread). This
+       * block is the discriminator; it decides nothing.
+       */
+      provenance: c.provenance,
+      /**
+       * TRA-4578 — the same cell with its own measured round-trip cost
+       * charged to its demo rows. BESIDE the governing number, never
+       * instead of it: `admits` is unchanged, `netOfModelledCross.
+       * wouldAdmit` is the counterfactual. Null ⇒ no measured cost for
+       * this cell (`unavailableReason` says which case) — never zero.
+       */
+      meanR_gate_netOfModelledCross: c.meanR_gate_netOfModelledCross,
+      lowerCI95_netOfModelledCross: c.lowerCI95_netOfModelledCross,
+      netOfModelledCross: c.netOfModelledCross,
+    });
+    const cellsByStructure = barsByStructure.map((b) => {
+      const cells = tapeCells.filter((c) => c.structure === b.structure);
+      return {
+        structure: b.structure,
+        /** The bar these cells' `lowerCI95` is compared against. Same number as `barsByStructure[].barR`. */
+        barR: b.barR,
+        /**
+         * TRUE ⇒ at least one cell here clears the bar. FALSE with cells
+         * present is a sleeve that is measured and refused; FALSE with
+         * `cells: []` is a sleeve that is UNMEASURED — every candidate
+         * declines `insufficient_evidence` and no bar was ever weighed. The
+         * two want different responses and read identically off a block rate.
+         */
+        anyCellAdmits: cells.some((c) => c.admits),
+        /**
+         * ⭐ The discriminator TRA-4622 could not make. `optionsMinGrossR` is a
+         * HARD FLOOR under every options bar, so a cell whose `lowerCI95` sits
+         * below it is refused under EVERY reachable cost config — zero
+         * commission, zero spread cross, zero safety margin included. TRUE here
+         * means no cost retune can admit this cell and the refusal is an EDGE
+         * fact, not a cost fact. Null for equity structures, which have no floor.
+         */
+        allCellsBelowFloorFloor: isEquityStructure(b.structure)
+          ? null
+          : cells.length > 0
+            && cells.every((c) => c.lowerCI95 === null || c.lowerCI95 < costConfig.optionsMinGrossR),
+        cells: cells.map(projectEdgeCell),
+      };
+    });
     // TRA-4748 (parent TRA-4746) — the session-coverage verdict rendered into the
     // `note` as well as into `retained.sessionCoverage`. Same reason the universe
     // ratification is in the prose: `retained.etDays` is what a reader actually
@@ -6472,6 +6562,30 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
            * the single most common way a "retune" ships and changes nothing.
            */
           bar: otmBar,
+          /**
+           * ⭐ TRA-4749 — the bar for EVERY structure this gate is OBSERVED to
+           * charge, `bar` above included. `bar` is `single_leg_otm` by a
+           * hard-coded literal and always was; the retained ledger was
+           * simultaneously recording `single_leg_rv` at a 100% block rate
+           * against a bar that appeared on no surface.
+           *
+           * READ `barIdenticalToOtm` FIRST. `admissionBarR` branches on exactly
+           * one predicate — `isEquityStructure` — so every options sleeve
+           * (`single_leg_otm`, `single_leg_rv`, `single_leg_directional`, and
+           * anything unrecognised) is charged `optionsCost` and gets the SAME
+           * number. RV is not charged "a bar like OTM's"; it is charged OTM's,
+           * because there is only one. `costInputs` names which of the two
+           * input sets fed the entry, and `sources`/`scopeLabels` say where the
+           * structure was observed, so nothing here is a hypothetical sleeve.
+           *
+           * ⚠️ That blend is DELIBERATE, not a defect discovered here:
+           * `makerAdjustedSpreadCrossR` is one knob across every options sleeve
+           * and TRA-1661 set it to the OTM (worse) measurement on purpose, which
+           * `DEFAULT_COST_GATE_CONFIG`'s docstring records as overcharging RV by
+           * ~0.075R. What was broken is that it was UNREADABLE here. Retuning it
+           * is a nomination decision and is NOT this surface's to make.
+           */
+          barsByStructure,
           /**
            * TRA-4258 — the AUTHORIZATION behind `bar.safetyMarginR`, mirroring
            * `arm.universe.ratification` (TRA-3694). Every other field on `bar`
@@ -6519,35 +6633,31 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
             issue: 'TRA-3391',
             minCellN: TAPE_EXPECTANCY_MIN_CELL_N,
             freshness: tapeExpectancyCache().freshness(),
-            otmCells: (tapeExpectancyCache().peek()?.cells ?? [])
-              .filter((c) => c.structure === 'single_leg_otm')
-              .map((c) => ({
-                bucket: c.bucket,
-                n: c.n,
-                meanR_gate: c.meanR_gate,
-                seR_gate: c.seR_gate,
-                lowerCI95: c.lowerCI95,
-                barR: c.barR,
-                admits: c.admits,
-                /**
-                 * TRA-4578 — WHO is in this cell. `admits` above is decided by
-                 * `lowerCI95` alone, and `lowerCI95` reads identically whether the
-                 * cell is desk real-money closes or demo rows booked at mid
-                 * (`demoSlippagePct: 0` — demo realized R is gross of spread). This
-                 * block is the discriminator; it decides nothing.
-                 */
-                provenance: c.provenance,
-                /**
-                 * TRA-4578 — the same cell with its own measured round-trip cost
-                 * charged to its demo rows. BESIDE the governing number, never
-                 * instead of it: `admits` is unchanged, `netOfModelledCross.
-                 * wouldAdmit` is the counterfactual. Null ⇒ no measured cost for
-                 * this cell (`unavailableReason` says which case) — never zero.
-                 */
-                meanR_gate_netOfModelledCross: c.meanR_gate_netOfModelledCross,
-                lowerCI95_netOfModelledCross: c.lowerCI95_netOfModelledCross,
-                netOfModelledCross: c.netOfModelledCross,
-              })),
+            otmCells: tapeCells
+              .filter((c) => c.structure === COST_BAR_PUBLISHED_STRUCTURE)
+              .map(projectEdgeCell),
+            /**
+             * ⭐ TRA-4749 — the SAME cells for every structure `barsByStructure`
+             * covers, `single_leg_otm` included. `otmCells` above is retained
+             * byte-identical (it is rendered through this block's own projector,
+             * so the two can never drift) because TRA-4622's reader and every
+             * saved probe address it by name; this is the unscoped view beside
+             * it, not a replacement.
+             *
+             * An entry with `cells: []` is a sleeve the fold has NEVER measured:
+             * its candidates decline `insufficient_evidence` and no bar was
+             * weighed, which reads identically to "the bar refused it" off a
+             * block rate alone.
+             *
+             * ⭐ `allCellsBelowFloorFloor` is the question TRA-4622 opened and
+             * could not close: TRUE means every cell of that sleeve sits below
+             * `optionsMinGrossR`, the HARD FLOOR under every options bar, and is
+             * therefore refused under every reachable cost config — including
+             * commission, spread cross and safety margin all set to ZERO. A TRUE
+             * there says the refusal is an EDGE fact and no cost retune reaches
+             * it.
+             */
+            cellsByStructure,
           },
         },
         /**

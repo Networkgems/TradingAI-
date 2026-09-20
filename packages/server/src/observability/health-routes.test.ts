@@ -7580,6 +7580,125 @@ describe('GET /api/health/live-enforce-gates — arm.costBar.ratification (TRA-4
   });
 });
 
+// ─── TRA-4749 (parent TRA-4622 §4) — the bar for EVERY charged structure ─────
+// `arm.costBar.bar` was `describeCostGateBar('single_leg_otm', …)` by a literal
+// and `edge.otmCells` a `.filter(c => c.structure === 'single_leg_otm')`, while
+// the retained ledger recorded `single_leg_rv` at 633 evaluated / 633 blocked
+// against a bar on no surface. As with TRA-4258 above, every case reads the
+// SHIPPED route handler's JSON body: the deliverable is the field ON THE ROUTE.
+describe('GET /api/health/live-enforce-gates — arm.costBar.barsByStructure (TRA-4749)', () => {
+  type StructureBar = {
+    structure: string;
+    barR: number;
+    costModelR: number;
+    safetyMarginR: number;
+    minGrossR: number;
+    barPinnedByFloor: boolean;
+    dominantTerm: string;
+    sources: string[];
+    scopeLabels: string[];
+    costInputs: string;
+    barIdenticalToOtm: boolean;
+  };
+  type EdgeCell = { bucket: string; n: number; lowerCI95: number | null; barR: number; admits: boolean };
+  type CostBar = {
+    bar: Record<string, unknown>;
+    barsByStructure: StructureBar[];
+    edge: {
+      otmCells: EdgeCell[];
+      cellsByStructure: Array<{
+        structure: string;
+        barR: number;
+        anyCellAdmits: boolean;
+        allCellsBelowFloorFloor: boolean | null;
+        cells: EdgeCell[];
+      }>;
+    };
+  };
+
+  beforeEach(() => { clearLiveEnforceGateLedger(); });
+  afterEach(() => { clearLiveEnforceGateLedger(); });
+
+  function serveCostBar(): CostBar {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => undefined) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const res = fakeRes();
+    routes.get('/api/health/live-enforce-gates')![0]!({}, res);
+    return (res.body as { arm: { costBar: CostBar } }).arm.costBar;
+  }
+
+  const etDay = etDateString(new Date(NOW));
+
+  // ── AC1 — the finding: an RV refusal with no published bar ────────────────
+  it('publishes single_leg_rv the moment the ledger records ONE cost_bar refusal under it', () => {
+    expect(serveCostBar().barsByStructure.map((b) => b.structure)).not.toContain('single_leg_rv');
+    recordLiveEnforceDecision('cost_bar', 'single_leg_rv', true, etDay, 'gross below bar', NOW);
+    const rv = serveCostBar().barsByStructure.find((b) => b.structure === 'single_leg_rv');
+    expect(rv, 'the bar that refused the RV row must be on the surface').toBeDefined();
+    expect(rv!.sources).toContain('ledger_scope');
+  });
+
+  // ── AC3 — the answer: it is the OTM bar, because there is only one ────────
+  it('single_leg_rv is charged the OTM bar — barIdenticalToOtm, same composition', () => {
+    recordLiveEnforceDecision('cost_bar', 'single_leg_rv', true, etDay, 'gross below bar', NOW);
+    const costBar = serveCostBar();
+    const rv = costBar.barsByStructure.find((b) => b.structure === 'single_leg_rv')!;
+    expect(rv.barIdenticalToOtm).toBe(true);
+    expect(rv.costInputs).toBe('options');
+    expect(rv.barR).toBe((costBar.bar as { barR: number }).barR);
+    expect(rv.costModelR).toBe((costBar.bar as { costModelR: number }).costModelR);
+    expect(rv.dominantTerm).toBe((costBar.bar as { dominantTerm: string }).dominantTerm);
+  });
+
+  // ── AC2 — the RV edge cells, in the otmCells shape, via the SAME projector ─
+  it('cellsByStructure covers every published structure and its OTM entry IS edge.otmCells', () => {
+    recordLiveEnforceDecision('cost_bar', 'single_leg_rv', true, etDay, 'gross below bar', NOW);
+    const { barsByStructure, edge } = serveCostBar();
+    expect(edge.cellsByStructure.map((c) => c.structure))
+      .toEqual(barsByStructure.map((b) => b.structure));
+    const otm = edge.cellsByStructure.find((c) => c.structure === 'single_leg_otm')!;
+    // Rendered through one projector, so the two can never drift apart.
+    expect(JSON.stringify(otm.cells)).toBe(JSON.stringify(edge.otmCells));
+    for (const entry of edge.cellsByStructure) {
+      expect(entry.barR).toBe(barsByStructure.find((b) => b.structure === entry.structure)!.barR);
+      expect(entry.anyCellAdmits).toBe(entry.cells.some((c) => c.admits));
+      for (const cell of entry.cells) {
+        // AC2's named fields, on every structure, not just OTM.
+        for (const k of ['bucket', 'n', 'meanR_gate', 'seR_gate', 'lowerCI95', 'barR', 'admits']) {
+          expect(cell, `${entry.structure}::${cell.bucket} must carry ${k}`).toHaveProperty(k);
+        }
+      }
+    }
+  });
+
+  // ── AC4 — additive: nothing a prior reader addressed by name moved ────────
+  it('is ADDITIVE: `bar` and `edge.otmCells` are byte-identical with and without an RV scope', () => {
+    const before = serveCostBar();
+    recordLiveEnforceDecision('cost_bar', 'single_leg_rv', true, etDay, 'gross below bar', NOW);
+    recordLiveEnforceDecision('cost_bar', 'directional', true, etDay, 'gross below bar', NOW);
+    const after = serveCostBar();
+    expect(JSON.stringify(after.bar)).toBe(JSON.stringify(before.bar));
+    expect(JSON.stringify(after.edge.otmCells)).toBe(JSON.stringify(before.edge.otmCells));
+    // …and the new surface genuinely moved, or the assertion above is vacuous.
+    expect(after.barsByStructure.length).toBeGreaterThan(before.barsByStructure.length);
+    // `directional` folds onto the canonical cell key the gate bars.
+    const dir = after.barsByStructure.find((b) => b.structure === 'single_leg_directional')!;
+    expect(dir.scopeLabels).toContain('directional');
+  });
+
+  it('always carries an entry for the structure `bar` publishes, at zero observations', () => {
+    const { bar, barsByStructure } = serveCostBar();
+    expect(barsByStructure[0]!.structure).toBe('single_leg_otm');
+    expect(barsByStructure[0]!.barR).toBe((bar as { barR: number }).barR);
+    expect(barsByStructure[0]!.barIdenticalToOtm).toBe(true);
+  });
+});
+
 // TRA-3694 — the same stamp on the resolved caps. A cap value reads identically
 // whether the board authorised it or not, which is the identical defect.
 describe('GET /api/health/live-options-fee-slippage — capRatification (TRA-3694)', () => {
