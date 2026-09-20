@@ -5837,10 +5837,44 @@ describe('GET /api/health/live-enforce-gates (TRA-3216)', () => {
       byGate: GateRow[];
       // TRA-4154 — the multi-day fold, which is where the per-day roll matters:
       // the day view self-clears at ET midnight.
-      retained: { etDays: string[]; retentionDays: number; byGate: GateRow[] };
+      retained: {
+        etDays: string[];
+        retentionDays: number;
+        byGate: GateRow[];
+        // TRA-4748 — `etDays` read against the NYSE calendar, so an ABSENT day
+        // separates "no session" from "the recorder was dead".
+        sessionCoverage: {
+          calendarVersion: string;
+          missingSessions: string[];
+          zeroEvaluatedSessions: string[];
+          lastSessionEtDay: string | null;
+          sessionsSinceLastDecision: number | null;
+        };
+      };
       note: string;
     };
   }
+
+  // TRA-4748 (parent TRA-4746) — AC1 on the ROUTE. The fold's own cases live in
+  // `live-enforce-gate-session-coverage.test.ts`; what this pins is that the
+  // block reaches the wire at all, with every field, on a payload with nothing
+  // recorded. `NOW` sits outside the 2015-2035 calendar bundle, so this is also
+  // the uncovered-date path: it must publish `null`, never a hole.
+  it('retained.sessionCoverage reaches the wire with all five fields', () => {
+    const c = serve().retained.sessionCoverage;
+    expect(Object.keys(c).sort()).toEqual([
+      'calendarVersion',
+      'lastSessionEtDay',
+      'missingSessions',
+      'sessionsSinceLastDecision',
+      'zeroEvaluatedSessions',
+    ]);
+    expect(c.calendarVersion).toBe('nyse-2015-2035');
+    expect(c.missingSessions).toEqual([]);
+    expect(c.zeroEvaluatedSessions).toEqual([]);
+    expect(c.lastSessionEtDay).toBeNull();
+    expect(c.sessionsSinceLastDecision).toBeNull();
+  });
 
   it('publishes the RESOLVED allowlist, not the raw env var', () => {
     const body = serve();

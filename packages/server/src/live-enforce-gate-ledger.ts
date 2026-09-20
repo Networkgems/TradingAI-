@@ -53,6 +53,13 @@ import {
   type LiveOtmRatifiedSetCounterfactual,
 } from './otm-live-universe-flag.js';
 import { logger } from './observability/index.js';
+// TRA-4748 — the derived session-coverage block. Lives in its own module so the
+// calendar comparison (and its one-directional rule) is unit-testable as a pure
+// function, without stuffing the ledger store to construct each case.
+import {
+  foldSessionCoverage,
+  type LiveEnforceSessionCoverage,
+} from './live-enforce-gate-session-coverage.js';
 
 const log = logger.child({ module: 'live-enforce-gate-ledger' });
 
@@ -1989,6 +1996,14 @@ export interface LiveEnforceSummary {
     etDays: string[];
     retentionDays: number;
     byGate: LiveEnforceGateSummary[];
+    /**
+     * TRA-4748 — `etDays` read against the NYSE calendar. `etDays` alone cannot
+     * say whether an ABSENT day was a weekend/holiday or a dead recorder, and
+     * those two have different remedies; `sessionCoverage.missingSessions`
+     * non-empty is the alarm. See {@link LiveEnforceSessionCoverage} — the
+     * comparison is ONE-DIRECTIONAL on purpose.
+     */
+    sessionCoverage: LiveEnforceSessionCoverage;
   };
   durability: LiveEnforceDurability;
   lastDecisionAt: number | null;
@@ -2679,6 +2694,9 @@ export function summarizeLiveEnforceGate(
 ): LiveEnforceSummary {
   const day = byDay.get(etDay) ?? new Map<LiveEnforceGate, GateTallies>();
   const retainedDays = [...byDay.keys()].sort();
+  // TRA-4154 — `byDay` is the store hydrated from `/data` on boot, so the roll
+  // is durable on exactly the same terms as the pooled totals beside it.
+  const retainedByGate = foldGates(accumulateAllDays(), null, retainedDays, shadowOpts, byDay);
   return {
     decisionsRecorded: decisionsTotal,
     // TRA-4154 — the day view's roll is the requested day alone, whether or not
@@ -2688,9 +2706,12 @@ export function summarizeLiveEnforceGate(
     retained: {
       etDays: retainedDays,
       retentionDays: RETAIN_MS / (24 * 60 * 60 * 1000),
-      // TRA-4154 — `byDay` is the store hydrated from `/data` on boot, so the roll
-      // is durable on exactly the same terms as the pooled totals beside it.
-      byGate: foldGates(accumulateAllDays(), null, retainedDays, shadowOpts, byDay),
+      byGate: retainedByGate,
+      // TRA-4748 — folded from the two lines above plus the shipped NYSE bundle.
+      // `etDay` is the caller's ET "today"; the fold deliberately expects days
+      // only up to the session STRICTLY BEFORE it, so a session still in
+      // progress is never reported missing.
+      sessionCoverage: foldSessionCoverage(retainedDays, retainedByGate, etDay),
     },
     durability: {
       dataDir,
