@@ -691,6 +691,38 @@ export interface ExportFiltersRequested {
 export interface ExportScope {
   /** The authenticated book whose rows — and only whose rows — this export serves. */
   book: string;
+  /**
+   * TRA-4747 — DISTINCT option closes this book's slice of the durable
+   * option-trade journal holds, **before any filter runs**.
+   *
+   * The discriminator that makes a zero-row export legible. `summary.count: 0`
+   * alone cannot tell "this book closed nothing in your window" from "you are
+   * reading the wrong book": on live bqb1 2026-09-20 a `markets=options&
+   * from=2026-09-08` read served `0` while `/api/health/option-journal` showed
+   * 15 closes in the same window — because those 15 belonged to `enock` and the
+   * caller was `admin`, whose own journal slice stops on 2026-09-02. The prose
+   * {@link note} already stated that rule in the abstract; nothing on the wire
+   * let a reader CHECK it, so the scoped zero was filed as an 18-day staleness
+   * defect.
+   *
+   * Deliberately journal-only and deliberately pre-filter, so it is directly
+   * comparable to `/api/health/option-journal` `summary` — the firm-wide surface
+   * this number exists to be diffed against. It is NOT the row count this
+   * document would serve unfiltered: the book may still hold un-archived closes
+   * the journal has no record of, and the served count subtracts nothing here.
+   *
+   * Counted by CLOSE (`closeIdentityKey`), not by row, for the same reason
+   * {@link ExportSummary.count} is — TRA-3930's duplicate records of one close
+   * are one close.
+   */
+  bookOptionJournalCloses: number;
+  /**
+   * TRA-4747 — the newest close in that same slice, ISO, or `null` when the
+   * slice is empty. This is the field that dates a quiet book: a reader whose
+   * window starts after it knows the emptiness is real for THIS book without a
+   * second request.
+   */
+  bookLatestOptionJournalCloseIso: string | null;
   note: string;
 }
 

@@ -233,7 +233,12 @@ export function resolveExportCoverage(input: CoverageInput): ExportCoverage {
       + 'crypto are bounded by the 21:00 ET archive (TRA-219), which clears the in-memory '
       + 'closed-trade buckets. Options extend further back wherever the durable '
       + 'option-trade journal was already recording this book: that floor is the earliest '
-      + 'event the journal holds for it, and the journal writes a close only for a position '
+      + 'OPEN the journal holds for it, NOT its earliest close, so a served exit may '
+      + 'legitimately predate `options.sinceIso` (TRA-4747) — anchoring on the earliest '
+      + 'close would refuse a range that starts hours before the rows it contains. It is a '
+      + 'floor on what can be ATTESTED, never a claim that every close above it is served; '
+      + 'across several requested modes it is the MAX of the per-mode floors. The journal '
+      + 'writes a close only for a position '
       + 'whose open it recorded — so a position opened BEFORE that point, and closed after, '
       + 'has no journal row and its exit is not recoverable here. An empty result is only an '
       + 'answer INSIDE these bounds: a `from` earlier than a requested market\'s floor is '
@@ -302,10 +307,45 @@ export function asciiHeaderJson(value: unknown): string {
  * genuinely missing is any statement of that rule on the wire: two documents,
  * one firm-wide and one per-book, read as the same population with rows lost.
  * The prose is deliberately generic — it names the RULE, never another book.
+ *
+ * ── TRA-4747 — why the prose alone was not enough ────────────────────────────
+ *
+ * TRA-4358 shipped the rule; this ticket is the SAME defect filed a second time,
+ * against the same route, by a different reader. On live bqb1 2026-09-20,
+ * `markets=options&from=2026-09-08&to=2026-09-20` served `count: 0` while
+ * `/api/health/option-journal` showed 15 closes inside that exact window. Those
+ * 15 are `enock`'s; the caller was `admin`, whose own journal slice ends on
+ * 2026-09-02. The zero was correct and the note above was already on the wire —
+ * but the note reads IDENTICALLY on a 106-row export and an empty one, so it
+ * could not be used to tell a scoped zero from a stale route, and the report was
+ * escalated as an 18-day staleness defect against a live grading surface.
+ *
+ * So the scope block now carries this book's OWN census beside the rule: the
+ * reader who sees a firm-wide 15 and a served 0 can now settle it from the same
+ * response. `rows` MUST already be book-scoped by `journalRowsForBook` — this
+ * function does not re-implement that filter (see {@link journalFloorForMode}),
+ * and a census folded over the firm-wide journal would publish the very number
+ * the scoping exists to keep out of a per-user document.
  */
-export function exportScopeFor(username: string): ExportScope {
+export function exportScopeFor(
+  username: string,
+  rows: readonly OptionTradeJournalRecord[] = [],
+): ExportScope {
+  // The export's OWN closed-row predicate (`groupJournalCloses`), not a
+  // re-spelling of it: a census that counts a different population than the
+  // route serves is a second number to reconcile rather than an answer.
+  const closes = new Set<string>();
+  let latest: number | null = null;
+  for (const r of rows) {
+    if (r.outcome === 'OPEN') continue;
+    if (!isFiniteNumber(r.closeTs)) continue;
+    closes.add(closeIdentityKey(r) ?? `row:${r.id}`);
+    if (latest === null || r.closeTs > latest) latest = r.closeTs;
+  }
   return {
     book: username,
+    bookOptionJournalCloses: closes.size,
+    bookLatestOptionJournalCloseIso: latest === null ? null : iso(latest),
     note:
       'This export serves ONE book: the authenticated user\'s. Every candidate row is '
       + 'scoped to that book before any filter runs (`journalRowsForBook`, TRA-2421). The '
@@ -313,7 +353,11 @@ export function exportScopeFor(username: string): ExportScope {
       + '`summary.byMode`) are FIRM-WIDE and pool every book trading a mode, so a mode-level '
       + 'count there can legitimately exceed this document\'s row count without any row '
       + 'having been dropped. Compare the two only after scoping the firm-wide side to this '
-      + 'book (TRA-4358).',
+      + 'book (TRA-4358). `bookOptionJournalCloses` / `bookLatestOptionJournalCloseIso` are '
+      + 'that scoping already done, pre-filter: if a firm-wide surface shows closes inside '
+      + 'your window and `count` is 0, check them before reporting this route as stale — a '
+      + 'window that starts after `bookLatestOptionJournalCloseIso` is empty for THIS book '
+      + 'no matter what the fleet did (TRA-4747).',
   };
 }
 

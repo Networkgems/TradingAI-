@@ -10259,10 +10259,6 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
     const markets = marketsParsed.values;
     const modes = modesParsed.values;
     const filtersRequested = describeRequestedFilters(query);
-    // TRA-4358 — computed ONCE; the JSON summary and the CSV header are both
-    // rendered from this object, for the same reason `filtersRequested` is
-    // (a provenance statement that can disagree with itself is worse than none).
-    const scope = exportScopeFor(username);
     const filters: ExportFilters = {
       markets,
       modes,
@@ -10295,6 +10291,20 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
         reason: err instanceof Error ? err.message : String(err),
       });
     }
+
+    // TRA-4358 — computed ONCE; the JSON summary and the CSV header are both
+    // rendered from this object, for the same reason `filtersRequested` is
+    // (a provenance statement that can disagree with itself is worse than none).
+    //
+    // TRA-4747 — built AFTER the journal load, because it now folds this book's
+    // own close census beside the scoping rule. Fed the identical
+    // `bookJournalRows` the coverage floor and the served rows are derived from:
+    // a census over a wider population than the route serves would publish rows
+    // this document cannot produce, and a narrower one would understate the book
+    // exactly where a reader is trying to rule out under-service. A journal that
+    // failed to load leaves this `0`/`null`, which is the same honest "no journal
+    // coverage" the `catch` above degrades everything else to.
+    const scope = exportScopeFor(username, bookJournalRows);
 
     const optionsClosed = collectClosedOptions(stocksSnap);
     const coverage = resolveExportCoverage({
