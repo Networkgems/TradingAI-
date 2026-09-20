@@ -19,7 +19,7 @@ recommended option; none of them spends money.
 |---|---|---|
 | Paid market data | **A — keep the free feed, spend nothing** | Standing. The StockTwits accrual continues at $0; no vendor, no card, no approval. |
 | The curated StockTwits lane | **A — drop it** | **Shipped 2026-09-20** — see §2.3. |
-| A wider, dynamically screened universe | **A — yes, but after the cost work** | Queued behind the execution-cost work, not started. |
+| A wider, dynamically screened universe | **A — yes, but after the cost work** | Filed as **TRA-4740**, `blocked` on TRA-4622. Not started. |
 
 Two consequences worth stating plainly, because they are the parts that could be misread later:
 
@@ -28,7 +28,10 @@ Two consequences worth stating plainly, because they are the parts that could be
   issue. Nothing here re-opens on a date.
 - **"After the cost work" is a dependency, not a deferral.** The wider universe is queued behind the
   execution-cost work because widening a funnel whose candidates are already 195-of-200 starved by cost gates
-  adds noise rather than trades. It is filed with that blocker attached so it cannot be picked up out of order.
+  adds noise rather than trades. It is filed as **TRA-4740**, `blocked` on **TRA-4622** (the live OTM entry
+  site, currently 100% cost_bar-blocked at 4002 of 4002 candidates), so it cannot be picked up out of order.
+  Its entry condition is a non-zero admit rate at the live entry site — not a date, and not merely the
+  blocker being closed.
 
 ---
 
