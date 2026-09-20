@@ -54,16 +54,23 @@ function gate(
 }
 
 describe('foldSessionCoverage (TRA-4748)', () => {
-  it('publishes all five fields and names the calendar it ruled against', () => {
+  it('publishes every field and names the calendar it ruled against', () => {
     const c = foldSessionCoverage(['2026-09-17', '2026-09-18'], [gate('entry_window', {
       '2026-09-17': 4,
       '2026-09-18': 7,
     })], '2026-09-20');
     expect(Object.keys(c).sort()).toEqual([
+      'absentWeekdays',
+      'cadenceEvidence',
       'calendarVersion',
+      'darkWeekdayHolidays',
+      'gateRosterBoundaries',
       'lastSessionEtDay',
       'missingSessions',
+      'recorderCadence',
       'sessionsSinceLastDecision',
+      'weekdayDaysExpected',
+      'weekdayDaysPresent',
       'zeroEvaluatedSessions',
     ]);
     expect(c.calendarVersion).toBe(MARKET_CALENDAR_VERSION);
@@ -248,5 +255,190 @@ describe('previousSessionEtDay (TRA-4748)', () => {
   it('refuses to guess for a malformed or uncovered date', () => {
     expect(previousSessionEtDay('not-a-date')).toBeNull();
     expect(previousSessionEtDay('2036-03-06')).toBeNull();
+  });
+});
+
+// ── rev2 — the MISS direction (CFO `9f20ec40`, QuantTrader `63de41b4`) ────────
+//
+// `missingSessions` keys on `resolveSessionDate === 'session'`, and a session is
+// always a weekday — so it is structurally blind to a Mon-Fri MARKET HOLIDAY on
+// which the recorder was dead. These cases pin that second alarm, and pin that
+// it stays silent whenever the payload does not itself prove the recorder runs
+// on holidays.
+describe('foldSessionCoverage rev2 — the weekday axis (TRA-4748)', () => {
+  const LIVE_ET_DAYS = [
+    '2026-08-21', '2026-08-24', '2026-08-25', '2026-08-26', '2026-08-27',
+    '2026-08-28', '2026-08-31', '2026-09-01', '2026-09-02', '2026-09-03',
+    '2026-09-04', '2026-09-07', '2026-09-08', '2026-09-09', '2026-09-10',
+    '2026-09-11', '2026-09-14', '2026-09-15', '2026-09-16', '2026-09-17',
+    '2026-09-18',
+  ];
+  const liveFold = (): ReturnType<typeof foldSessionCoverage> =>
+    foldSessionCoverage(
+      LIVE_ET_DAYS,
+      [gate('entry_window', Object.fromEntries(LIVE_ET_DAYS.map((d) => [d, 100])))],
+      '2026-09-20',
+    );
+
+  it('counts weekdays expected vs present, and the live window is 21/21', () => {
+    const c = liveFold();
+    // 2026-08-21..2026-09-18 inclusive = 21 Mon-Fri days, all present. The
+    // 8 weekend days in that span are never counted, in either number.
+    expect(c.weekdayDaysExpected).toBe(21);
+    expect(c.weekdayDaysPresent).toBe(21);
+    expect(c.absentWeekdays).toEqual([]);
+  });
+
+  it('measures the recorder as WEEKDAY-cadenced off Labor Day, which recorded', () => {
+    const c = liveFold();
+    // The live proof: 2026-09-07 is a `non_session` the ledger has rows for.
+    expect(resolveSessionDate('2026-09-07')).toBe('non_session');
+    expect(c.cadenceEvidence.nonSessionWeekdaysPresent).toEqual(['2026-09-07']);
+    expect(c.cadenceEvidence.nonSessionWeekdaysAbsent).toEqual([]);
+    expect(c.recorderCadence).toBe('weekday');
+    // ...and it is still not an alarm. One-directional rule, unchanged.
+    expect(c.missingSessions).toEqual([]);
+    expect(c.darkWeekdayHolidays).toEqual([]);
+  });
+
+  // ⭐ THE CASE rev1 COULD NOT SEE. Christmas 2026-12-25 and New Year's Day
+  // 2027-01-01 are both Fridays one week apart, so a single retained window
+  // holds a holiday that recorded AND a later holiday that did not.
+  it('raises a dark weekday HOLIDAY that missingSessions is blind to', () => {
+    const etDays = [
+      '2026-12-23', '2026-12-24', '2026-12-25', // 12-25 = Christmas, recorded
+      '2026-12-28', '2026-12-29', '2026-12-30', '2026-12-31',
+      '2027-01-04', // 2027-01-01 = New Year's Day, NOT recorded
+    ];
+    const c = foldSessionCoverage(
+      etDays,
+      [gate('entry_window', Object.fromEntries(etDays.map((d) => [d, 50])))],
+      '2027-01-05',
+    );
+    expect(resolveSessionDate('2026-12-25')).toBe('non_session');
+    expect(resolveSessionDate('2027-01-01')).toBe('non_session');
+
+    // The rev1 alarm says nothing — correctly, by its own rule. That silence is
+    // precisely the hole: every SESSION in the window is present.
+    expect(c.missingSessions).toEqual([]);
+
+    // The rev2 alarm names the day.
+    expect(c.recorderCadence).toBe('weekday');
+    expect(c.darkWeekdayHolidays).toEqual(['2027-01-01']);
+    expect(c.absentWeekdays).toEqual([{ etDay: '2027-01-01', reason: 'non_session' }]);
+    expect(c.weekdayDaysExpected).toBe(9);
+    expect(c.weekdayDaysPresent).toBe(8);
+  });
+
+  it('stays SILENT on an absent holiday when nothing proves weekday cadence', () => {
+    // Same window, but Christmas did not record either — so the payload carries
+    // no evidence the recorder ignores the calendar, and the honest reading of
+    // both absences is "it is calendar-aware". This is the guard that keeps the
+    // rejected pure-weekday arithmetic from creeping back in.
+    const etDays = [
+      '2026-12-23', '2026-12-24',
+      '2026-12-28', '2026-12-29', '2026-12-30', '2026-12-31',
+      '2027-01-04',
+    ];
+    const c = foldSessionCoverage(
+      etDays,
+      [gate('entry_window', Object.fromEntries(etDays.map((d) => [d, 50])))],
+      '2027-01-05',
+    );
+    expect(c.recorderCadence).toBe('session');
+    expect(c.cadenceEvidence.nonSessionWeekdaysAbsent).toEqual(['2026-12-25', '2027-01-01']);
+    expect(c.darkWeekdayHolidays).toEqual([]);
+    // Both still SHOW UP, annotated — absent-and-explained, not absent-and-mute.
+    expect(c.absentWeekdays).toEqual([
+      { etDay: '2026-12-25', reason: 'non_session' },
+      { etDay: '2027-01-01', reason: 'non_session' },
+    ]);
+    expect(c.missingSessions).toEqual([]);
+  });
+
+  it('does not call a holiday dark when it PRECEDES the cadence evidence', () => {
+    // Christmas absent, then a LATER holiday records. Ordering matters: a
+    // recorder moving TOWARDS weekday cadence is not a fault.
+    const etDays = [
+      '2026-12-23', '2026-12-24',
+      '2026-12-28', '2026-12-29', '2026-12-30', '2026-12-31',
+      '2027-01-01', // New Year's Day — RECORDED
+      '2027-01-04',
+    ];
+    const c = foldSessionCoverage(
+      etDays,
+      [gate('entry_window', Object.fromEntries(etDays.map((d) => [d, 50])))],
+      '2027-01-05',
+    );
+    expect(c.recorderCadence).toBe('weekday');
+    expect(c.cadenceEvidence.nonSessionWeekdaysAbsent).toEqual(['2026-12-25']);
+    expect(c.cadenceEvidence.nonSessionWeekdaysPresent).toEqual(['2027-01-01']);
+    // 12-25 is BEFORE the evidence, so it is annotated and not alarmed.
+    expect(c.darkWeekdayHolidays).toEqual([]);
+  });
+
+  it('a genuine missing SESSION appears in both lists, tagged no_records', () => {
+    // The rev1 alarm and the rev2 list must never disagree about a session hole.
+    const etDays = ['2026-09-16', '2026-09-18'];
+    const c = foldSessionCoverage(
+      etDays,
+      [gate('entry_window', { '2026-09-16': 9, '2026-09-18': 9 })],
+      '2026-09-20',
+    );
+    expect(c.missingSessions).toEqual(['2026-09-17']);
+    expect(c.absentWeekdays).toEqual([{ etDay: '2026-09-17', reason: 'no_records' }]);
+    // The subset invariant, stated as an invariant rather than a coincidence.
+    const noRecords = c.absentWeekdays.filter((a) => a.reason === 'no_records').map((a) => a.etDay);
+    expect(noRecords).toEqual(c.missingSessions);
+  });
+
+  it('flags every day whose recording-gate roster differs from its predecessor', () => {
+    // QuantTrader's 2026-08-21: `contract_floor` and `entry_window` evaluate 0
+    // while `cost_bar` evaluates 1,562, because that day predates the wiring of
+    // the upstream gates. A site-dark test keyed on the largest-denominator gate
+    // calls it an outage; it is a schema change.
+    const etDays = ['2026-08-21', '2026-08-24', '2026-08-25'];
+    const c = foldSessionCoverage(
+      etDays,
+      [
+        gate('cost_bar', { '2026-08-21': 1562, '2026-08-24': 1000, '2026-08-25': 1000 }),
+        gate('contract_floor', { '2026-08-21': 0, '2026-08-24': 3037, '2026-08-25': 3029 }),
+        gate('entry_window', { '2026-08-21': 0, '2026-08-24': 700, '2026-08-25': 700 }),
+      ],
+      '2026-08-26',
+    );
+    expect(c.gateRosterBoundaries).toEqual([
+      {
+        etDay: '2026-08-24',
+        added: ['contract_floor', 'entry_window'],
+        removed: [],
+        maxEvaluatedGate: 'contract_floor',
+      },
+    ]);
+    // 08-21 itself is never a boundary: there is no predecessor to differ from.
+    expect(c.gateRosterBoundaries.map((b) => b.etDay)).not.toContain('2026-08-21');
+  });
+
+  it('reports no boundary when the roster is stable, whatever the volumes do', () => {
+    const etDays = ['2026-09-16', '2026-09-17', '2026-09-18'];
+    const c = foldSessionCoverage(
+      etDays,
+      [gate('contract_floor', { '2026-09-16': 2283, '2026-09-17': 2983, '2026-09-18': 2140 })],
+      '2026-09-20',
+    );
+    expect(c.gateRosterBoundaries).toEqual([]);
+  });
+
+  it('claims nothing at all on an empty ledger', () => {
+    // No retained day ⇒ no window to claim a hole inside. Must not page on a
+    // cold boot, on EITHER axis.
+    const c = foldSessionCoverage([], [], '2026-09-20');
+    expect(c.missingSessions).toEqual([]);
+    expect(c.darkWeekdayHolidays).toEqual([]);
+    expect(c.absentWeekdays).toEqual([]);
+    expect(c.gateRosterBoundaries).toEqual([]);
+    expect(c.recorderCadence).toBe('indeterminate');
+    expect(c.weekdayDaysExpected).toBe(0);
+    expect(c.weekdayDaysPresent).toBe(0);
   });
 });

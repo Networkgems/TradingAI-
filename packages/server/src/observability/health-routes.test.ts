@@ -44,6 +44,9 @@ import { resolveDemoFlagEnv } from '../demo-flags.js';
 // TRA-3216 — the live OTM underlying allowlist + the enforcement-gate ledger it publishes through.
 import { OPTION_LIVE_OTM_UNIVERSE_VAR } from '../otm-live-universe-flag.js';
 import { clearLiveEnforceGateLedger, recordLiveEnforceDecision } from '../live-enforce-gate-ledger.js';
+// TRA-4748 — the real published shape, so the route assertion below cannot drift
+// against a hand-copied mirror of it.
+import type { LiveEnforceSessionCoverage } from '../live-enforce-gate-session-coverage.js';
 // TRA-4422 — the setup-taxonomy readout. Imported as SYMBOLS rather than
 // retyped as literals: a test that grades a local copy of a string against
 // another local copy agrees with itself and proves nothing about the route.
@@ -5843,13 +5846,14 @@ describe('GET /api/health/live-enforce-gates (TRA-3216)', () => {
         byGate: GateRow[];
         // TRA-4748 — `etDays` read against the NYSE calendar, so an ABSENT day
         // separates "no session" from "the recorder was dead".
-        sessionCoverage: {
-          calendarVersion: string;
-          missingSessions: string[];
-          zeroEvaluatedSessions: string[];
-          lastSessionEtDay: string | null;
-          sessionsSinceLastDecision: number | null;
-        };
+        //
+        // ⚠️ The REAL type, deliberately, not a structural mirror of it. This
+        // was hand-copied at birth and the rev2 fields immediately drifted it
+        // out of date — `tsc -b` caught that at the pre-push gate while vitest
+        // (which does not typecheck) passed. Importing it means the key-set
+        // assertion below can only ever be wrong about the ROUTE, never about
+        // the test's own private idea of the shape.
+        sessionCoverage: LiveEnforceSessionCoverage;
       };
       note: string;
     };
@@ -5860,13 +5864,20 @@ describe('GET /api/health/live-enforce-gates (TRA-3216)', () => {
   // block reaches the wire at all, with every field, on a payload with nothing
   // recorded. `NOW` sits outside the 2015-2035 calendar bundle, so this is also
   // the uncovered-date path: it must publish `null`, never a hole.
-  it('retained.sessionCoverage reaches the wire with all five fields', () => {
+  it('retained.sessionCoverage reaches the wire with every field', () => {
     const c = serve().retained.sessionCoverage;
     expect(Object.keys(c).sort()).toEqual([
+      'absentWeekdays',
+      'cadenceEvidence',
       'calendarVersion',
+      'darkWeekdayHolidays',
+      'gateRosterBoundaries',
       'lastSessionEtDay',
       'missingSessions',
+      'recorderCadence',
       'sessionsSinceLastDecision',
+      'weekdayDaysExpected',
+      'weekdayDaysPresent',
       'zeroEvaluatedSessions',
     ]);
     expect(c.calendarVersion).toBe('nyse-2015-2035');
@@ -5874,6 +5885,14 @@ describe('GET /api/health/live-enforce-gates (TRA-3216)', () => {
     expect(c.zeroEvaluatedSessions).toEqual([]);
     expect(c.lastSessionEtDay).toBeNull();
     expect(c.sessionsSinceLastDecision).toBeNull();
+    // TRA-4748 rev2 — the weekday axis must be as silent as the session axis on
+    // an uncovered date with nothing recorded. A cold boot pages on neither.
+    expect(c.darkWeekdayHolidays).toEqual([]);
+    expect(c.absentWeekdays).toEqual([]);
+    expect(c.gateRosterBoundaries).toEqual([]);
+    expect(c.recorderCadence).toBe('indeterminate');
+    expect(c.weekdayDaysExpected).toBe(0);
+    expect(c.weekdayDaysPresent).toBe(0);
   });
 
   it('publishes the RESOLVED allowlist, not the raw env var', () => {

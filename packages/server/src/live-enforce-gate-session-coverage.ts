@@ -31,6 +31,26 @@
 // happen to append rows here. It is right by coincidence and breaks the first
 // time one does not.
 //
+// ── rev2 — the MISS direction (CFO `9f20ec40`, QuantTrader `63de41b4`) ───────
+// The one-directional rule above is correct and unchanged, but on its own it
+// leaves a hole in the other direction, and review caught it: a session is
+// always a weekday, so `missingSessions` exempts EVERY market holiday — a
+// Thanksgiving on which the recorder was genuinely dead reads byte-identically
+// to a healthy one. That is not hypothetical here, because the recorder's
+// cadence is WEEKDAY-driven (09-07 above is the proof), so a weekday holiday is
+// exactly as much a working day for it as a Tuesday.
+//
+// The fix is to enumerate on the WEEKDAY set (which strictly contains the
+// session set, so it loses nothing) and let the calendar ANNOTATE each absence
+// rather than gate the alarm. `darkWeekdayHolidays` is the resulting second
+// alarm. It is not the rejected weekday arithmetic re-proposed: it fires only
+// while `recorderCadence` — MEASURED off this payload, from whether a
+// non-session weekday actually carried rows — says `weekday`, so the "right by
+// coincidence" objection is tested every fold instead of being assumed away.
+// `gateRosterBoundaries` answers the separate 2026-08-21 finding: the gate
+// roster is not fixed across the window (7 changes in 21 days, measured), so
+// "gate X evaluated 0" is not a stable predicate over it.
+//
 // ⚠️ STRICTLY DERIVED, STRICTLY READ-ONLY. Every field below is folded from the
 // `etDays` / `byGate` the summary already carries plus the shipped NYSE bundle.
 // Nothing on the admission path reads any of it and no gate behaviour changes.
@@ -135,6 +155,132 @@ export interface LiveEnforceSessionCoverage {
    * `zeroEvaluatedSessions`, or `etDays` is empty.
    */
   sessionsSinceLastDecision: number | null;
+
+  // ── rev2 (TRA-4748, CFO comment `9f20ec40` + QuantTrader comment `63de41b4`) ──
+  // Everything below answers the MISS direction. `missingSessions` above keys on
+  // `resolveSessionDate === 'session'`, and a session is always a weekday — so it
+  // is structurally blind to a Mon-Fri **market holiday** on which the recorder
+  // was genuinely dead. The recorder's cadence is weekday-driven, not
+  // session-driven (Labor Day 2026-09-07 wrote 2,025 decisions), so that day is
+  // exactly as real as a dead Tuesday and nothing above would say a word.
+
+  /**
+   * Mon-Fri ET days in the scanned window, and how many of them the ledger has a
+   * row for. QuantTrader's ask: the two numbers that turn "is the ledger
+   * continuous?" from a hand-diff into a subtraction. Equal ⇒ every weekday in
+   * the window recorded something.
+   */
+  weekdayDaysExpected: number;
+  /** @see weekdayDaysExpected */
+  weekdayDaysPresent: number;
+  /**
+   * Every Mon-Fri ET day in the scanned window the ledger has NO row for, each
+   * carrying WHY the calendar thinks it is absent. Ascending.
+   *
+   * - `no_records` — the calendar calls it a `session`. **Red.** This is exactly
+   *   {@link missingSessions}, republished here with its reason so one list
+   *   answers the whole question; the two are kept in sync by construction and a
+   *   test pins `missingSessions ⊆ absentWeekdays`.
+   * - `non_session` — a market holiday (or an `uncovered` date outside the
+   *   bundle). Silent on its own; promoted to {@link darkWeekdayHolidays} only
+   *   when the measured cadence says the recorder should have run anyway.
+   *
+   * ⚠️ QuantTrader asked for a third value, `pre_wiring`. It is deliberately NOT
+   * here: no ABSENT day in the measured window is pre-wiring — absences are
+   * weekends. The real 2026-08-21 finding is about a day that is PRESENT with a
+   * different gate roster, so it is answered by {@link gateRosterBoundaries}
+   * instead, where it can carry which gates actually moved.
+   */
+  absentWeekdays: LiveEnforceAbsentWeekday[];
+  /**
+   * Which clock the RECORDER runs on, **measured off this payload** rather than
+   * assumed. This is the field that lets the holiday alarm below exist without
+   * hard-coding either answer.
+   *
+   * - `weekday` — at least one non-session weekday is PRESENT with rows, i.e.
+   *   the recorder demonstrably ignores the exchange calendar (live: 2026-09-07).
+   * - `session` — non-session weekdays appear in the window and are all absent,
+   *   i.e. the recorder honours the calendar.
+   * - `indeterminate` — the window contains no non-session weekday at all, so
+   *   there is no evidence either way. Most 30-day windows land here; between
+   *   US market holidays that is the normal reading, not a fault.
+   *
+   * ⚠️ This is evidence ABOUT the recorder, not a verdict on it. It is derived
+   * from at most a handful of days a year and must not be cited as a claim that
+   * the pipeline is calendar-aware.
+   */
+  recorderCadence: 'weekday' | 'session' | 'indeterminate';
+  /** The non-session weekdays the {@link recorderCadence} call was made on. */
+  cadenceEvidence: {
+    /** Non-session weekdays the ledger HAS rows for, ascending. */
+    nonSessionWeekdaysPresent: string[];
+    /** Non-session weekdays the ledger has NO rows for, ascending. */
+    nonSessionWeekdaysAbsent: string[];
+  };
+  /**
+   * **THE SECOND ALARM.** Market holidays that fall on a weekday, have no rows,
+   * and land AFTER the most recent holiday that DID record — i.e. days the
+   * recorder's own measured cadence says it should have run on and did not.
+   *
+   * This is the hole the shipped rev1 could not see. `missingSessions` exempts
+   * every `non_session` day, so a dead Thanksgiving reads byte-identically to a
+   * healthy one; the weekday set strictly contains the session set, so keying the
+   * enumeration on Mon-Fri and letting the calendar ANNOTATE (rather than gate)
+   * loses nothing and covers that case.
+   *
+   * ⛔ This does NOT reinstate the rejected "pure weekday arithmetic". That was
+   * rejected for being right by coincidence — because holidays *happen* to append
+   * rows here. This field MEASURES that coincidence ({@link recorderCadence}) and
+   * goes silent the moment it stops holding, so the objection is answered rather
+   * than overridden. The one-directional rule is untouched: present-but-not-
+   * expected is still never red.
+   *
+   * ⚠️ Known residual, deliberate. If the recorder is CORRECTLY taught to honour
+   * the calendar, the first holiday after that change raises one advisory row
+   * here, and goes quiet for good once the last recording holiday ages out of the
+   * retained window. A behaviour change in the recorder's cadence is worth one
+   * line to a reader, and this instrument blocks no order — see the module header.
+   */
+  darkWeekdayHolidays: string[];
+  /**
+   * Days on which the set of gates that recorded ANYTHING differs from the
+   * previous retained day. **Read this before quoting any cross-day trend off
+   * this funnel** — a gate's `evaluated` is not comparable across one of these.
+   *
+   * QuantTrader found the 2026-08-21 case: `contract_floor` and `entry_window`
+   * both evaluate 0 there while `cost_bar` evaluates 1,562, because that day
+   * predates the wiring of the upstream gates. A site-dark test keyed on the
+   * largest-denominator gate calls that an outage; it is a schema change.
+   *
+   * ⚠️ Measured on live bytes 2026-09-20 this fires **7 times in 21 days**, not
+   * once — the roster churns far more than the single boundary that prompted it.
+   * Two consumers (TRA-4742 §2 and the TRA-4622 `cost_bar` ruling) quoted
+   * cross-day trends over exactly this window.
+   *
+   * ⚠️ A boundary is NOT a defect claim. A genuinely low-volume gate that saw no
+   * candidate for a day flips the set without any wiring change (`canary_ceiling`
+   * evaluated 5 on 2026-08-21). The field asserts NON-COMPARABILITY and publishes
+   * `added`/`removed` so the reader judges which kind it is.
+   */
+  gateRosterBoundaries: LiveEnforceGateRosterBoundary[];
+}
+
+/** One absent Mon-Fri day and the calendar's reason for it. */
+export interface LiveEnforceAbsentWeekday {
+  etDay: string;
+  /** `no_records` is red; `non_session` is a holiday/closure. */
+  reason: 'no_records' | 'non_session';
+}
+
+/** A day whose recording-gate roster differs from the previous retained day. */
+export interface LiveEnforceGateRosterBoundary {
+  etDay: string;
+  /** Gates that recorded on this day and not the previous one, sorted. */
+  added: LiveEnforceGate[];
+  /** Gates that recorded on the previous day and not this one, sorted. */
+  removed: LiveEnforceGate[];
+  /** The gate carrying this day's largest `evaluated`, or `null` if none did. */
+  maxEvaluatedGate: LiveEnforceGate | null;
 }
 
 /** `YYYY-MM-DD` + n days, UTC-anchored so it is timezone-independent. */
@@ -146,6 +292,17 @@ function addDays(dateIso: string, n: number): string {
 }
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Is `YYYY-MM-DD` a Mon-Fri? UTC-anchored: an ET day string names a calendar
+ * date, not an instant, so reading its weekday in UTC is exact and cannot drift
+ * across a DST boundary the way `new Date(s)` in local time would.
+ */
+function isWeekday(dateIso: string): boolean {
+  const [y, m, d] = dateIso.split('-').map(Number);
+  const dow = new Date(Date.UTC(y!, m! - 1, d!)).getUTCDay();
+  return dow >= 1 && dow <= 5;
+}
 
 /**
  * The most recent `session` strictly before `todayEtDay`. `null` when the
@@ -196,19 +353,87 @@ export function foldSessionCoverage(
   const zeroEvaluatedSessions = [...etDays].filter((d) => decisionsByDay.get(d) === 0).sort();
 
   // ── expected-but-absent ────────────────────────────────────────────────────
+  // ONE walk over the scanned window produces both the session-keyed alarm
+  // (rev1) and the weekday-keyed annotation layer (rev2), so the two can never
+  // disagree about which days they looked at.
   const missingSessions: string[] = [];
+  const absentWeekdays: LiveEnforceAbsentWeekday[] = [];
+  let weekdayDaysExpected = 0;
+  let weekdayDaysPresent = 0;
+  const nonSessionWeekdaysPresent: string[] = [];
+  const nonSessionWeekdaysAbsent: string[] = [];
   if (etDays.length > 0 && lastSessionEtDay !== null) {
     const earliestRetained = [...etDays].sort()[0]!;
     const clamp = addDays(lastSessionEtDay, -MAX_SCAN_DAYS);
     const from = earliestRetained < clamp ? clamp : earliestRetained;
     for (let d = from; d <= lastSessionEtDay; d = addDays(d, 1)) {
-      if (present.has(d)) continue;
-      // ⛔ `=== 'session'` and nothing else. `non_session` (weekend or closure)
-      // and `uncovered` (outside the bundle) are both SILENT here — an absent
-      // day the calendar has no opinion about is not evidence of anything.
+      // ⛔ `=== 'session'` and nothing else on the ALARM. `non_session` (weekend
+      // or closure) and `uncovered` (outside the bundle) are both SILENT there —
+      // an absent day the calendar has no opinion about is not evidence of
+      // anything. The weekday axis below records them without alarming.
       const r: SessionResolution = resolveSessionDate(d);
-      if (r === 'session') missingSessions.push(d);
+      const here = present.has(d);
+      if (isWeekday(d)) {
+        weekdayDaysExpected++;
+        if (here) weekdayDaysPresent++;
+        if (r !== 'session') (here ? nonSessionWeekdaysPresent : nonSessionWeekdaysAbsent).push(d);
+        if (!here) absentWeekdays.push({ etDay: d, reason: r === 'session' ? 'no_records' : 'non_session' });
+      }
+      if (!here && r === 'session') missingSessions.push(d);
     }
+  }
+
+  // ── which clock is the RECORDER on? ────────────────────────────────────────
+  // Measured, never assumed. Presence of rows on a non-session weekday is the
+  // only positive evidence available, so it wins: absence alone is what the
+  // holiday alarm is trying to interpret and cannot also be its own premise.
+  const recorderCadence: LiveEnforceSessionCoverage['recorderCadence'] =
+    nonSessionWeekdaysPresent.length > 0
+      ? 'weekday'
+      : nonSessionWeekdaysAbsent.length > 0
+        ? 'session'
+        : 'indeterminate';
+  // A dark holiday must post-date the evidence that the recorder runs on
+  // holidays at all; an absent one BEFORE that evidence is the recorder changing
+  // TOWARDS weekday cadence, which is not a fault.
+  const lastRecordingHoliday = nonSessionWeekdaysPresent[nonSessionWeekdaysPresent.length - 1];
+  const darkWeekdayHolidays =
+    recorderCadence === 'weekday'
+      ? nonSessionWeekdaysAbsent.filter((d) => d > lastRecordingHoliday!)
+      : [];
+
+  // ── gate-roster boundaries ────────────────────────────────────────────────
+  // Which gates recorded at all, per day. The identity of that set — not any
+  // gate's count — is what makes two days comparable, and it is NOT fixed across
+  // the retained window (measured: 7 changes in 21 days on live bytes).
+  const gateRosterBoundaries: LiveEnforceGateRosterBoundary[] = [];
+  const orderedDays = [...etDays].sort();
+  let priorRoster: string[] | null = null;
+  for (const d of orderedDays) {
+    const recording: LiveEnforceGate[] = [];
+    let maxEvaluatedGate: LiveEnforceGate | null = null;
+    let maxEvaluated = 0;
+    for (const g of byGate) {
+      const row = g.byEtDay.find((r) => r.etDay === d);
+      if (!row || row.evaluated <= 0) continue;
+      recording.push(g.gate);
+      if (row.evaluated > maxEvaluated) {
+        maxEvaluated = row.evaluated;
+        maxEvaluatedGate = g.gate;
+      }
+    }
+    recording.sort();
+    if (priorRoster !== null && recording.join(',') !== priorRoster.join(',')) {
+      const prev = new Set(priorRoster);
+      const now = new Set<string>(recording);
+      gateRosterBoundaries.push({
+        etDay: d,
+        added: recording.filter((g) => !prev.has(g)),
+        removed: (priorRoster as LiveEnforceGate[]).filter((g) => !now.has(g)),
+        maxEvaluatedGate,
+      });
+    }
+    priorRoster = recording;
   }
 
   // ── sessions elapsed since the last day that decided anything ─────────────
@@ -233,5 +458,12 @@ export function foldSessionCoverage(
     zeroEvaluatedSessions,
     lastSessionEtDay,
     sessionsSinceLastDecision,
+    weekdayDaysExpected,
+    weekdayDaysPresent,
+    absentWeekdays,
+    recorderCadence,
+    cadenceEvidence: { nonSessionWeekdaysPresent, nonSessionWeekdaysAbsent },
+    darkWeekdayHolidays,
+    gateRosterBoundaries,
   };
 }
