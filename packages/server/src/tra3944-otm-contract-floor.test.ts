@@ -286,7 +286,9 @@ describe('TRA-3944 AC4 — source-level: arm / row size / 2-row cap untouched; o
     const window = ENGINE_SRC.indexOf('const otmWindowReject = this.otmEntryWindowRejectReason(nominator);');
     const pick = ENGINE_SRC.indexOf('const otmFloorPick = this.otmContractFloorPickRejectReason(');
     const universe = ENGINE_SRC.indexOf('const otmUniverseReject = this.liveOtmUniverseRejectReason(sym, nominator);');
-    const costBar = ENGINE_SRC.indexOf("const otmCostReject = this.costAwareGateReject('single_leg_otm', {");
+    // TRA-4745 added the positional `sym` argument; the ordering this test
+    // guards is unchanged.
+    const costBar = ENGINE_SRC.indexOf("const otmCostReject = this.costAwareGateReject('single_leg_otm', sym, {");
     for (const i of [chain, selector, window, pick, universe, costBar]) expect(i).toBeGreaterThan(-1);
     expect(chain).toBeLessThan(selector);
     expect(selector).toBeLessThan(window);

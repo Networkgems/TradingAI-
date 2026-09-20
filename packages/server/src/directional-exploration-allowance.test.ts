@@ -366,6 +366,8 @@ type GateInternals = {
   setAlertUsername(username: string): void;
   costAwareGateReject(
     structure: string,
+    // TRA-4745 — the UNDERLYING, positional and required on the real method.
+    symbol: string,
     inputs: { mark: number; delta: number },
   ): string | null;
 };
@@ -394,7 +396,7 @@ describe('TRA-4378 gate integration (costAwareGateReject demo branch)', () => {
 
   it('ARMED: a bar-rejected DESK directional candidate is ADMITTED, recorded on the directional row, with a one-shot grant', () => {
     const e = demoEngine('admin');
-    const verdict = e.costAwareGateReject('directional', { mark: 1.0, delta: 0.5 });
+    const verdict = e.costAwareGateReject('directional', 'SPY', { mark: 1.0, delta: 0.5 });
     expect(verdict).toBeNull(); // admitted under the allowance
     expect(takeExplorationGrant()).not.toBeNull();
     // Control 1's read: the admit lands on the `directional` ledger row.
@@ -409,7 +411,7 @@ describe('TRA-4378 gate integration (costAwareGateReject demo branch)', () => {
 
   it('TRA-4418 (AC1/AC3): a FIXTURE-book engine is refused fixture_book through the real gate — reject stands, no token, no row', () => {
     const e = demoEngine('qa_reg_4418');
-    const verdict = e.costAwareGateReject('directional', { mark: 1.0, delta: 0.5 });
+    const verdict = e.costAwareGateReject('directional', 'SPY', { mark: 1.0, delta: 0.5 });
     expect(typeof verdict).toBe('string'); // the flat bar's reject stands
     expect(takeExplorationGrant()).toBeNull(); // AC3: nothing a commit could spend
     const s = summarizeExplorationAllowance(process.env, etDateString(new Date()));
@@ -420,7 +422,7 @@ describe('TRA-4378 gate integration (costAwareGateReject demo branch)', () => {
 
   it('TRA-4418 (AC1): an engine with NO bound book refuses unattributed_book — unbound is not desk', () => {
     const e = demoEngine();
-    expect(typeof e.costAwareGateReject('directional', { mark: 1.0, delta: 0.5 })).toBe('string');
+    expect(typeof e.costAwareGateReject('directional', 'SPY', { mark: 1.0, delta: 0.5 })).toBe('string');
     expect(takeExplorationGrant()).toBeNull();
     const s = summarizeExplorationAllowance(process.env, etDateString(new Date()));
     expect(s.refusalsSinceBoot.unattributed_book).toBe(1);
@@ -429,7 +431,7 @@ describe('TRA-4378 gate integration (costAwareGateReject demo branch)', () => {
   it('NEGATIVE CONTROL (AC1): allowance flag off ⇒ the same DESK candidate is rejected and no grant exists', () => {
     delete process.env[DIRECTIONAL_EXPLORATION_FLAG];
     const e = demoEngine('admin');
-    const verdict = e.costAwareGateReject('directional', { mark: 1.0, delta: 0.5 });
+    const verdict = e.costAwareGateReject('directional', 'SPY', { mark: 1.0, delta: 0.5 });
     expect(typeof verdict).toBe('string'); // the flat bar's reject stands
     expect(takeExplorationGrant()).toBeNull();
     const s = summarizeCostAwareGate(etDateString(new Date())) as unknown as {
@@ -444,7 +446,7 @@ describe('TRA-4378 gate integration (costAwareGateReject demo branch)', () => {
   it('SCOPE (AC4): the allowance never fires for the OTHER structures the bar governs', () => {
     const e = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' }) as unknown as GateInternals;
     for (const structure of ['single_leg_rv', 'single_leg_otm']) {
-      const verdict = e.costAwareGateReject(structure, { mark: 1.0, delta: 0.5 });
+      const verdict = e.costAwareGateReject(structure, 'SPY', { mark: 1.0, delta: 0.5 });
       expect(typeof verdict).toBe('string'); // still rejected — no bypass outside directional
       expect(takeExplorationGrant()).toBeNull();
     }
@@ -454,7 +456,7 @@ describe('TRA-4378 gate integration (costAwareGateReject demo branch)', () => {
     const e = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'live' }) as unknown as GateInternals;
     // Live enforce flag is unset ⇒ the live branch is inert; and even the
     // enforcing live path has no allowance call — assert no grant is minted.
-    const verdict = e.costAwareGateReject('directional', { mark: 1.0, delta: 0.5 });
+    const verdict = e.costAwareGateReject('directional', 'SPY', { mark: 1.0, delta: 0.5 });
     expect(verdict).toBeNull(); // inert live gate, NOT an exploration admit:
     expect(takeExplorationGrant()).toBeNull(); // …no token exists,
     expect(summarizeExplorationAllowance(process.env, ARM_DAY).rowsUsed).toBe(0); // …no row spent.

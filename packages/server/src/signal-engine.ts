@@ -636,6 +636,13 @@ import {
   // `k` (a ratio whose numerator nothing published) becomes identifiable.
   netEdgeCostBreakdown,
 } from './option-net-edge-bar.js';
+// TRA-4745 — the REALISED predicate builders. Built from the verdict object each
+// form already returned, never re-derived from the candidate here: a call site
+// that recomputes the comparison can publish one the gate did not run.
+import {
+  netEdgeFormPredicate,
+  tapeExpectancyFlatPredicate,
+} from './live-enforce-gate-predicate.js';
 // TRA-3216 (parent TRA-2760) — the LIVE OTM underlying allowlist. The scan is
 // handed the full ~614-name watchlist; this is the only universe restriction on
 // the real-money path.
@@ -8277,6 +8284,14 @@ export class SignalEngine {
    */
   private costAwareGateReject(
     structure: string,
+    // TRA-4745 — the UNDERLYING. `cost_bar`'s ledger `scope` key is the
+    // STRUCTURE, so before this argument a cost outcome could not be joined to a
+    // symbol at all (`byGate[cost_bar].bySymbol` read `null` while
+    // `byGate[universe].bySymbol` carried 372 names). Required and positional,
+    // not an optional in the trailing bag: it is available at all three call
+    // sites, and an optional one would let a future site silently re-open the
+    // hole while still compiling.
+    symbol: string,
     inputs: CostGateCandidateInputs,
     // TRA-3272 — the candidate's OWN quote at decision time, consumed only by the
     // net-edge bar form. Optional so the three pre-existing call sites compile
@@ -8444,6 +8459,8 @@ export class SignalEngine {
         // record sites carry it; the deployed form is the flat one, and it is the
         // branch TRA-3481's k-decision will actually be read off.
         nominator: nominator ?? null,
+        // TRA-4745 — the underlying, on both record sites for the same reason.
+        symbol,
       };
       if (isNetEdgeGovernedStructure(structure, netEdgeConfig)) {
         const verdict = netEdgeBarVerdict(
@@ -8463,6 +8480,11 @@ export class SignalEngine {
             // TRA-3391 — the cell the edge came from, even when the net-edge form
             // is what declined: otherwise arming it erases the evidence axis.
             cell: tape.cellKey ?? undefined,
+            // TRA-4745 — the REALISED comparison this form just ran, built from
+            // the verdict itself rather than re-derived here: a call site that
+            // recomputes the predicate can describe a comparison the gate did
+            // not make, which is the whole defect being fixed.
+            predicate: netEdgeFormPredicate(verdict, grossR, netEdgeConfig),
             ...costOpts,
           },
         );
@@ -8486,6 +8508,14 @@ export class SignalEngine {
           reasonCode: tape.reasonCode ?? undefined,
           book: this.alertUsername ?? null,
           cell: tape.cellKey ?? undefined,
+          // TRA-4745 — the REALISED comparison: `grossR >= barR`, both sides'
+          // numbers, and whether the branch reached the inequality at all. This
+          // is the DEPLOYED form, so this is the stamp every live `cost_bar` row
+          // on bqb1 carries. `byReason`'s `shortfall_*` buckets are `barR −
+          // grossR`; `costR` beside it is a recorder this form never consults,
+          // and publishing the bar next to only the cost is what let the
+          // TRA-4741 reading survive.
+          predicate: tapeExpectancyFlatPredicate(tape),
           // TRA-3483 — the FLAT form is what is deployed, so this is the branch
           // that actually produces the recorded tape TRA-3481 will read. The
           // cost side is recorded here even though nothing in this branch
@@ -12273,7 +12303,7 @@ export class SignalEngine {
         // costAwareGateReject); ingredients are the candidate mark + delta and
         // the just-derived take-profit / stop (2:1 R:R on the mark·1.5 / mark·0.75
         // bracket). No-op unless the board arms ENABLE_OPTION_COST_AWARE_GATE.
-        const rvCostReject = this.costAwareGateReject('single_leg_rv', {
+        const rvCostReject = this.costAwareGateReject('single_leg_rv', sym, {
           mark: cheap.mark,
           delta: cheap.delta,
           stopPrice: stopLoss,
@@ -14090,7 +14120,7 @@ export class SignalEngine {
         // life of the live arm and is why the `continue` below was not recognised as
         // the thing pinning every gate ordered after it. Anything added downstream
         // of this line sees ~0.7% of live nominees.
-        const otmCostReject = this.costAwareGateReject('single_leg_otm', {
+        const otmCostReject = this.costAwareGateReject('single_leg_otm', sym, {
           mark: cheap.mark,
           delta: cheap.delta,
           stopPrice: stopLoss,
@@ -16042,7 +16072,7 @@ export class SignalEngine {
         // path carries no fixed target/stop (exits are trailed/managed at close),
         // so rewardR falls back to the signal's riskRewardRatio (2.0) exactly as
         // QuantTrader specced (TRA-1603 decision #2).
-        const dirCostReject = this.costAwareGateReject('directional', {
+        const dirCostReject = this.costAwareGateReject('directional', sym, {
           mark: best.mark,
           delta: signal.delta,
           // TRA-3391 — no stop on this path (exits are trailed/managed at close),

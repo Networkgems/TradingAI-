@@ -46,6 +46,7 @@ import {
   netEdgeShadowAdmits,
   type NetEdgeShadowSample,
 } from './option-net-edge-bar.js';
+import type { LiveEnforceGatePredicate } from './live-enforce-gate-predicate.js';
 import type { AdmissibleSelection } from './otm-admissible-strike.js';
 import {
   OPTION_LIVE_OTM_UNIVERSE_DEFAULT,
@@ -311,6 +312,42 @@ export interface LiveEnforceRecord {
    */
   grossR?: number;
   /**
+   * TRA-4745 — the UNDERLYING this verdict ruled on.
+   *
+   * NOT redundant with {@link scope}: on `cost_bar` the scope key is the
+   * STRUCTURE (`single_leg_otm` / `single_leg_rv` / `directional`), so before
+   * this field a `cost_bar` outcome could not be joined to a symbol at ALL —
+   * `byGate[cost_bar].bySymbol` read `null` while `byGate[universe].bySymbol`
+   * carried 372 names, and the "is the live universe simply illiquid?"
+   * hypothesis could only be refuted indirectly. On `spread`/`universe` the
+   * scope key IS the symbol and this field duplicates it, which is harmless and
+   * keeps one axis rather than two.
+   *
+   * Absent ⇒ the call site did not stamp it or the row predates this field. That
+   * is published as `costRowsMissingSymbol`, never as an absent symbol row —
+   * every row hydrated from before this deploy lacks it, so an empty
+   * `costBySymbol` must not read as "no candidates".
+   */
+  symbol?: string;
+  /**
+   * TRA-4745 — the REALISED COMPARISON: left side, operator, right side, outcome,
+   * exactly as the gate evaluated it. Recorded on EVERY `cost_bar` verdict,
+   * admits included.
+   *
+   * ⭐ THE FIELD TO GRADE on this gate. `byReason` publishes `shortfall_lt_0.10`
+   * / `shortfall_0.25_0.50` / `shortfall_gte_0.50` **without saying shortfall of
+   * WHAT against WHAT**, and the payload's only other numbers were the bar and
+   * the `costR` distribution — so the obvious reading (costR vs barR) is wrong,
+   * unstated, and was corroborated by one cell out of four. The shortfall is
+   * `barR − grossR`; `costR` is a recorder that the deployed flat form never
+   * consults. Read `compared` first: `false` ⇒ the row refused on a precondition
+   * and no inequality ran at all.
+   *
+   * Absent ⇒ a non-`cost_bar` gate or a row predating this field, published as
+   * `predicateUnstamped`.
+   */
+  predicate?: LiveEnforceGatePredicate;
+  /**
    * TRA-3674 — for `aggregate_cap`, the THREE TERMS the per-book budget
    * `B_i = min(φ · availableCash, A)` was resolved from, recorded on EVERY
    * verdict including admits.
@@ -486,6 +523,14 @@ interface CostSample extends NetEdgeShadowSample {
   blocked: boolean;
   /** The cell this verdict was decided under, for the per-cell quantile fold. */
   cell: string | null;
+  /** TRA-4745 — the ET day, so the per-cell predicate sample can be one PER DAY after pooling. */
+  etDay: string;
+  /** TRA-4745 — the underlying, for the `costBySymbol` join. Null on pre-field rows. */
+  symbol: string | null;
+  /** TRA-4745 — the block classification, carried onto the predicate sample. Null on admits. */
+  reasonCode: string | null;
+  /** TRA-4745 — the realised comparison. Null on pre-field rows. */
+  predicate: LiveEnforceGatePredicate | null;
 }
 
 /**
@@ -554,6 +599,18 @@ interface GateTallies {
   costRowsMissing: number;
   /** Samples discarded by {@link MAX_COST_SAMPLES_PER_GATE_DAY}. */
   costSamplesDropped: number;
+  /**
+   * TRA-4745 — the UNDERLYING axis, admits included. Bumped only by rows that
+   * carry a `symbol`, so a pre-field row contributes no key rather than a
+   * synthetic one — the same contract `byCell` and `bySelection` hold.
+   */
+  byUnderlying: Map<string, GateScopeTally>;
+  /**
+   * TRA-4745 — rows of this gate/day carrying NO `symbol`. The denominator that
+   * stops an empty `costBySymbol` (every hydrated pre-deploy row) from reading
+   * as "this gate saw no candidates".
+   */
+  symbolRowsMissing: number;
   /** TRA-3483 (D2) — BLOCKED rows carrying no `reasonCode`, so `byReason`'s denominator is visible. */
   blockedUnclassified: number;
   /**
@@ -608,6 +665,8 @@ function emptyTallies(): GateTallies {
     costSamples: [],
     costRowsMissing: 0,
     costSamplesDropped: 0,
+    byUnderlying: new Map(),
+    symbolRowsMissing: 0,
     blockedUnclassified: 0,
     byRatifiedSymbol: new Map(),
     byRatifiedSet: new Map(),
@@ -841,6 +900,16 @@ function apply(rec: LiveEnforceRecord): void {
         grossR: typeof rec.grossR === 'number' && Number.isFinite(rec.grossR) ? rec.grossR : null,
         blocked: rec.blocked,
         cell: typeof rec.cell === 'string' && rec.cell !== '' ? rec.cell : null,
+        // TRA-4745 — the three stamps the `grossR` / predicate / symbol axes are
+        // folded off. Each is independently nullable: a row can carry a cost and
+        // no symbol (pre-deploy), or a predicate and no cost (unusable quote).
+        etDay: rec.etDay,
+        symbol: typeof rec.symbol === 'string' && rec.symbol !== '' ? rec.symbol : null,
+        reasonCode:
+          rec.blocked && typeof rec.reasonCode === 'string' && rec.reasonCode !== ''
+            ? rec.reasonCode
+            : null,
+        predicate: usablePredicate(rec.predicate) ? rec.predicate! : null,
       });
     } else {
       tallies.costSamplesDropped += 1;
@@ -850,6 +919,15 @@ function apply(rec: LiveEnforceRecord): void {
     // counting them here would publish `rowsMissingCostR === evaluated` on a gate
     // that was never instrumented — a fake coverage hole.
     tallies.costRowsMissing += 1;
+  }
+  // TRA-4745 — the underlying axis, admits INCLUDED and INDEPENDENT of the cost
+  // sample: a row whose quote was unusable still has a symbol, and excluding it
+  // would make `costBySymbol`'s denominator the cost coverage rather than the
+  // gate's own population.
+  if (typeof rec.symbol === 'string' && rec.symbol !== '') {
+    bump(tallies.byUnderlying, rec.symbol, rec.blocked);
+  } else if (rec.gate === 'cost_bar') {
+    tallies.symbolRowsMissing += 1;
   }
   // TRA-4269 — the ratified-set counterfactual. A row that carries none adds
   // nothing here: a restricted or pre-field row is not an in-set admit.
@@ -905,6 +983,11 @@ export function recordLiveEnforceDecision(
     // unknown-edge case, and each has to stay distinguishable from the other.
     cost?: LiveEnforceRecord['cost'] | null;
     grossR?: number | null;
+    // TRA-4745 — the underlying, and the realised comparison. Both `cost_bar`
+    // stamps today; both optional so every other call site compiles unchanged
+    // and hydrates as a COUNTED miss rather than a synthetic value.
+    symbol?: string | null;
+    predicate?: LiveEnforceGatePredicate | null;
     // TRA-3510 — which TRA-3401 branch nominated this candidate. Null/absent on
     // every non-OTM call site, which is the honest reading: those rows were not
     // produced by the OTM nominator at all.
@@ -936,6 +1019,10 @@ export function recordLiveEnforceDecision(
     ...(typeof opts?.cell === 'string' && opts.cell !== '' ? { cell: opts.cell } : {}),
     ...(costUsable ? { cost: cost! } : {}),
     ...(typeof opts?.grossR === 'number' && Number.isFinite(opts.grossR) ? { grossR: opts.grossR } : {}),
+    // TRA-4745 — the symbol and the realised comparison. A blank symbol is a
+    // MISSING stamp, never the empty-string key.
+    ...(typeof opts?.symbol === 'string' && opts.symbol !== '' ? { symbol: opts.symbol } : {}),
+    ...(usablePredicate(opts?.predicate ?? undefined) ? { predicate: opts!.predicate! } : {}),
     ...(usableNominator(opts?.nominator) ? { nominator: opts!.nominator! } : {}),
     // TRA-3674 — stamped on BOTH verdicts. The admits are what supply the
     // denominator that tells "the budget never had to bite" apart from "the
@@ -1007,6 +1094,33 @@ function hydratedCost(cost: LiveEnforceRecord['cost']): boolean {
     && Number.isFinite(cost.feeR)
     && Number.isFinite(cost.costFracOfPremium)
   );
+}
+
+/**
+ * TRA-4745 — is a realised-predicate block usable?
+ *
+ * Shared by the write path and the hydrate path deliberately, same as
+ * {@link hydratedCost}: a block this refuses to record must also be one it
+ * refuses to read back, or the retained fold would publish a shape the live fold
+ * cannot produce.
+ *
+ * ⛔ The `compared`/`lhs`/`rhs` INVARIANT is enforced here rather than trusted:
+ * `compared === true` demands two finite sides, and `compared === false` demands
+ * two nulls. A half-populated block is exactly the surface this ticket exists to
+ * delete — a reader would infer a comparison from a number that decided nothing.
+ * `form` is checked against the known set because it becomes a published key.
+ */
+function usablePredicate(p: LiveEnforceRecord['predicate']): boolean {
+  if (!p || typeof p !== 'object') return false;
+  if (p.form !== 'tape_expectancy_flat' && p.form !== 'net_edge') return false;
+  if (typeof p.compared !== 'boolean' || typeof p.admit !== 'boolean') return false;
+  if (p.op !== '>=' && p.op !== '<=') return false;
+  if (typeof p.lhsLabel !== 'string' || typeof p.rhsLabel !== 'string') return false;
+  if (p.compared) {
+    return typeof p.lhs === 'number' && Number.isFinite(p.lhs)
+      && typeof p.rhs === 'number' && Number.isFinite(p.rhs);
+  }
+  return p.lhs === null && p.rhs === null && typeof p.shortCircuit === 'string';
 }
 
 /**
@@ -1122,6 +1236,12 @@ export function hydrateLiveEnforceGateFromDisk(dir: string, now: number = Date.n
       // them and hydrates as a MISSING sample (counted), never as a zero.
       ...(hydratedCost(rec.cost) ? { cost: rec.cost! } : {}),
       ...(typeof rec.grossR === 'number' && Number.isFinite(rec.grossR) ? { grossR: rec.grossR } : {}),
+      // TRA-4745 — every row on disk today predates both fields and hydrates
+      // WITHOUT them, which is what makes `costRowsMissingSymbol` /
+      // `predicateUnstamped` the honest coverage denominator on the retained
+      // fold rather than a hole nobody can see.
+      ...(typeof rec.symbol === 'string' && rec.symbol !== '' ? { symbol: rec.symbol } : {}),
+      ...(usablePredicate(rec.predicate) ? { predicate: rec.predicate! } : {}),
       // TRA-3674 — a row written before the budget terms existed hydrates
       // WITHOUT them (a missing stamp), never with a synthetic zero budget,
       // which would read as "this book was allowed nothing".
@@ -1235,8 +1355,41 @@ export interface LiveEnforceCellSummary {
    * it can discriminate anything: every row in a cell shares the same
    * `modeledGrossR` (the cell lower bound), so the cell-level cost spread IS the
    * within-cell decision boundary a `k` would move. Null on cells with no sample.
+   *
+   * ⚠️ TRA-4745 — this is a RECORDER. The DEPLOYED flat form compares
+   * `grossRQuantiles` against `barR` and never looks at this block. Inferring a
+   * block rate from this distribution and the published bar is exactly what
+   * produced a +98.0pp miss on `single_leg_rv::0.55-1.00`.
    */
   costRQuantiles: CostRQuantiles | null;
+  /**
+   * TRA-4745 — the `grossR` distribution WITHIN this cell: the LEFT SIDE of the
+   * deployed comparison, and therefore the only one of the two blocks here that
+   * can explain this cell's own `blockRate`. Null on cells with no sample.
+   */
+  grossRQuantiles: GrossRQuantiles | null;
+  /**
+   * TRA-4745 — one sampled BLOCKED row per ET day in this cell, carrying the
+   * exact comparison the gate evaluated. Empty on a cell with no blocks, and on
+   * a cell whose rows all predate the stamp (see `predicateUnstamped`).
+   */
+  predicateSamples: LiveEnforcePredicateSample[];
+  /**
+   * TRA-4745 — this cell's cost samples carrying NO realised predicate. The
+   * coverage denominator for `predicateSamples`: every row written before this
+   * deploy is here, so an empty sample list is a coverage hole, not a quiet cell.
+   */
+  predicateUnstamped: number;
+  /**
+   * TRA-4745 — of this cell's stamped rows, how many the gate actually COMPARED
+   * vs short-circuited on a precondition. ⭐ THE PAIR TO GRADE: a cell at
+   * `blocked === evaluated` with `rowsCompared === 0` was refused by
+   * `insufficient_evidence` / `band_deauthorized` / `gross_unknown` and is
+   * NEITHER a cost problem NOR an edge collapse — no bar move and no `k` can
+   * reach it, so no re-tune of this gate is the remedy.
+   */
+  rowsCompared: number;
+  rowsShortCircuited: number;
 }
 
 /**
@@ -1358,6 +1511,127 @@ export interface CostRQuantiles extends QuantileBlock {
   rowsMissingCostR: number;
   /** Samples dropped by the retention cap; > 0 ⇒ these quantiles are over a truncated head. */
   samplesDropped: number;
+}
+
+/**
+ * TRA-4745 — the per-decision `grossR` distribution: the LEFT SIDE of the
+ * DEPLOYED flat form's comparison, `admit ⟺ grossR ≥ barR`.
+ *
+ * ## Why this had to ship beside `costRQuantiles`
+ *
+ * Until now the payload published the bar (`arm.costBar.bar.barR`) and the
+ * `costR` distribution — the bar and the ONE quantity the flat form never
+ * compares it to. The obvious reading (blocked share ≈ share of `costR` above
+ * the bar) held on `single_leg_otm::0.50-0.55` to −1.7pp and failed by **+39.1**,
+ * **+56.1** and **+98.0pp** on the other three live cells, with
+ * `single_leg_rv::0.55-1.00` refusing 633 of 633 at a median `costR` 57% BELOW
+ * the bar (TRA-4741, comment `47a32c11`). This block is the side that actually
+ * decides, so the prediction becomes checkable instead of misleading.
+ *
+ * ## How to read it, per cell
+ *
+ * Every row inside a cell shares the SAME `grossR` — it is the cell's lower 95%
+ * CI bound, a property of the cell and not of the candidate. So within one cell
+ * on one day this block is DEGENERATE (`min === max`) and the flat predicate is
+ * constant: block rate 0% or 100%, never in between. A pooled multi-day cell
+ * spreads only because the tape re-folds between days. **A 100.0% cell is the
+ * expected shape of a cell whose bound sits under the bar, not evidence of a
+ * mis-attributed non-cost refusal.**
+ *
+ * ⚠️ `n` here counts rows that carried a FINITE edge. A row whose cell was
+ * unmeasured carries `grossR: null` and is in `rowsMissingGrossR` — and those
+ * rows are `insufficient_evidence` blocks, which never reached any comparison at
+ * all. Read `rowsMissingGrossR` against `predicate.compared` before calling a
+ * block rate an edge collapse.
+ */
+export interface GrossRQuantiles extends QuantileBlock {
+  /**
+   * Rows in this fold whose edge was UNKNOWN at decision time (unmeasured /
+   * underpowered cell, unusable delta, or written before TRA-3483).
+   * `n + rowsMissingGrossR` is the fold's cost-sample count.
+   */
+  rowsMissingGrossR: number;
+  /**
+   * The bar those rows were compared against, as recorded per row. Published as
+   * a distribution rather than a scalar because `barR` is resolved from env at
+   * decision time and a retune mid-fold would otherwise be invisible — and
+   * because reading the CURRENT `arm.costBar.bar.barR` against a 30-day fold is
+   * the same class of mistake this whole block exists to stop. Null when no row
+   * in the fold carried a realised predicate (every pre-deploy row).
+   */
+  barR: QuantileBlock | null;
+  /**
+   * `barR − grossR` over the rows that were actually COMPARED — EXACTLY the
+   * quantity `byReason`'s `shortfall_lt_0.10` / `shortfall_0.25_0.50` /
+   * `shortfall_gte_0.50` buckets. Published so "shortfall of what against what"
+   * is answered on the payload instead of in the source. Null when no row in the
+   * fold was compared.
+   */
+  shortfallR: QuantileBlock | null;
+}
+
+/**
+ * TRA-4745 — one sampled row's REALISED predicate: the exact comparison the gate
+ * performed, with both sides' numbers and the outcome.
+ *
+ * One BLOCKED row per cell per ET day, which is what the witness asked for — the
+ * per-cell distribution blocks are the fold, this is the traceable instance.
+ */
+export interface LiveEnforcePredicateSample {
+  etDay: string;
+  /** The comparison, rendered — e.g. `grossR 0.1645 >= barR 0.3850 ⇒ BLOCK`. */
+  statement: string;
+  form: string;
+  /** FALSE ⇒ the gate refused on a precondition; `lhs`/`rhs` are null and NO inequality ran. */
+  compared: boolean;
+  lhsLabel: string;
+  lhs: number | null;
+  op: string;
+  rhsLabel: string;
+  rhs: number | null;
+  /** `rhs − lhs` on a `>=` comparison — the `byReason` shortfall. Null otherwise. */
+  shortfallR: number | null;
+  /** The precondition that fired when `compared === false`; null otherwise. */
+  shortCircuit: string | null;
+  reasonCode: string | null;
+  /**
+   * The same row's recorded `costR`. ⚠️ A RECORDER — the flat form does not
+   * consult it. It is published here precisely so a reader can SEE it sitting
+   * outside the comparison instead of assuming it is inside one.
+   */
+  costR: number | null;
+  symbol: string | null;
+}
+
+/**
+ * TRA-4745 — one underlying's contribution to `cost_bar`.
+ *
+ * ⚠️ **This is NOT `bySymbol`, and `cost_bar.bySymbol` stays `null` by design.**
+ * That key is the TRA-4269 RATIFIED-SET COUNTERFACTUAL and its rows carry
+ * `inRatifiedSet`, a fact only the `universe` gate computes; populating it on
+ * `cost_bar` would mean two different questions under one name, which is the
+ * class of defect this ticket is fixing rather than propagating. The join the
+ * witness needed — cost outcomes against symbols — is here.
+ *
+ * ⛔ Read `costRowsMissingSymbol` FIRST. `cost_bar` rows carried no symbol at all
+ * before this ticket (the gate's `scope` key is the STRUCTURE), so every row
+ * hydrated from a pre-deploy JSONL line is in that counter and contributes no
+ * row here. An empty or short `costBySymbol` over a 30-day retained fold means
+ * COVERAGE, not a quiet universe.
+ */
+export interface LiveEnforceCostSymbolSummary {
+  symbol: string;
+  evaluated: number;
+  blocked: number;
+  blockRate: number | null;
+  /** The symbol's `costR` distribution. Null when no row of its carried a usable cost. */
+  costR: QuantileBlock | null;
+  /** The symbol's `grossR` distribution — the side that decides. Null when none carried an edge. */
+  grossR: QuantileBlock | null;
+  /** This symbol's rows whose edge was unknown (unmeasured cell) — they never reached a comparison. */
+  rowsMissingGrossR: number;
+  /** Rows of this symbol the gate actually COMPARED, of those carrying a predicate stamp. */
+  rowsCompared: number;
 }
 
 /** TRA-3483 — one counterfactual `k` on the recorded row set. Decides nothing. */
@@ -1611,6 +1885,44 @@ export interface LiveEnforceGateSummary {
    * distinguishable); null on every gate that records no cost.
    */
   costRQuantiles: CostRQuantiles | null;
+  /**
+   * TRA-4745 — the `grossR` distribution over this fold, with the realised
+   * `barR` and `shortfallR` beside it. Non-null on `cost_bar` on the same terms
+   * as `costRQuantiles`.
+   *
+   * ⭐ THE BLOCK TO GRADE on this gate, and the discriminator the witness asked
+   * for: `grossR` healthy while the band still blocks ⇒ a non-cost refusal is
+   * being stamped `cost_bar` (remedy in the gate's attribution); `grossR` under
+   * the bar ⇒ the edge estimator is what collapsed (remedy in the signal team).
+   * If `rowsCompared` is 0 against a nonzero `blocked`, it is NEITHER: those rows
+   * refused on a precondition and no inequality ran.
+   */
+  grossRQuantiles: GrossRQuantiles | null;
+  /**
+   * TRA-4745 — of the rows carrying a realised predicate, how many the gate
+   * COMPARED vs short-circuited, and how many carry no stamp at all.
+   * `rowsCompared + rowsShortCircuited + predicateUnstamped` is the gate's cost
+   * sample count. Non-null on `cost_bar` only.
+   */
+  rowsCompared: number | null;
+  rowsShortCircuited: number | null;
+  predicateUnstamped: number | null;
+  /**
+   * TRA-4745 — the per-UNDERLYING fold for `cost_bar`, busiest first. Non-null on
+   * `cost_bar` only (`[]` at n=0, never omitted).
+   *
+   * ⛔ NOT `bySymbol` — see {@link LiveEnforceCostSymbolSummary}. That key is the
+   * TRA-4269 ratified-set counterfactual and stays `null` here on purpose.
+   */
+  costBySymbol: LiveEnforceCostSymbolSummary[] | null;
+  /**
+   * TRA-4745 — `cost_bar` rows carrying NO underlying stamp. READ THIS FIRST:
+   * `cost_bar` never recorded a symbol before this ticket (its `scope` key is the
+   * STRUCTURE), so on the first retained folds after this deploy essentially the
+   * whole 30-day population sits here and `costBySymbol` is short. That is
+   * COVERAGE, not a quiet universe.
+   */
+  costRowsMissingSymbol: number | null;
   /** TRA-3483 — the counterfactual k-sweep. Non-null on `cost_bar` only. */
   netEdgeShadow: NetEdgeShadowSummary | null;
   /**
@@ -1741,6 +2053,109 @@ function costRQuantiles(samples: CostSample[], rowsMissingCostR: number, samples
     rowsMissingCostR,
     samplesDropped,
   };
+}
+
+// ── TRA-4745 — the side that actually decides, and the comparison it ran ──────
+
+/**
+ * Fold a sample list into the published `grossR` distribution.
+ *
+ * `grossR: null` rows are EXCLUDED from the quantiles and COUNTED in
+ * `rowsMissingGrossR` — the same contract `costRQuantiles` holds for a missing
+ * cost. An unknown edge is not a zero edge; it is an unmeasured cell, and those
+ * rows never reached a comparison at all.
+ *
+ * `barR` and `shortfallR` come off the realised predicate rather than from the
+ * current config, so a fold that spans a bar retune publishes the spread instead
+ * of one number that was true for part of it.
+ */
+function grossRQuantiles(samples: CostSample[]): GrossRQuantiles {
+  const gross: number[] = [];
+  let rowsMissingGrossR = 0;
+  const bars: number[] = [];
+  const shortfalls: number[] = [];
+  for (const s of samples) {
+    if (s.grossR === null || !Number.isFinite(s.grossR)) rowsMissingGrossR += 1;
+    else gross.push(s.grossR);
+    const p = s.predicate;
+    if (p && p.compared && p.lhs !== null && p.rhs !== null) {
+      bars.push(p.rhs);
+      // `rhs − lhs` only on the `>=` (flat) form: on the net-edge form the sides
+      // are costR and k·grossR, whose difference is NOT the `byReason` shortfall.
+      if (p.op === '>=') shortfalls.push(p.rhs - p.lhs);
+    }
+  }
+  return {
+    ...quantileBlock(gross),
+    rowsMissingGrossR,
+    barR: bars.length > 0 ? quantileBlock(bars) : null,
+    shortfallR: shortfalls.length > 0 ? quantileBlock(shortfalls) : null,
+  };
+}
+
+/** Render a realised comparison the way a reader would write it by hand. */
+function predicateStatement(s: CostSample, p: LiveEnforceGatePredicate): string {
+  const outcome = s.blocked ? 'BLOCK' : 'ADMIT';
+  if (!p.compared) {
+    return `NO COMPARISON — short-circuited on \`${p.shortCircuit ?? 'unknown'}\` ⇒ ${outcome}`;
+  }
+  return `${p.lhsLabel.split(' —')[0]} ${p.lhs!.toFixed(4)} ${p.op} ${p.rhsLabel.split(' —')[0]} ${p.rhs!.toFixed(4)} ⇒ ${outcome}`;
+}
+
+/**
+ * TRA-4745 — ONE sampled BLOCKED row per ET day out of `samples`, each rendered
+ * with the comparison the gate actually ran.
+ *
+ * Blocked rows only: an admit's predicate is not what anyone is trying to
+ * explain, and mixing them would let a day be represented by the one candidate
+ * that got through. The FIRST blocked row of each day is taken (samples are
+ * appended in decision order), so the choice is deterministic and re-reading the
+ * route twice on the same fold returns the same rows.
+ */
+function predicateSamples(samples: CostSample[]): LiveEnforcePredicateSample[] {
+  const perDay = new Map<string, LiveEnforcePredicateSample>();
+  for (const s of samples) {
+    if (!s.blocked || s.predicate === null) continue;
+    if (perDay.has(s.etDay)) continue;
+    const p = s.predicate;
+    perDay.set(s.etDay, {
+      etDay: s.etDay,
+      statement: predicateStatement(s, p),
+      form: p.form,
+      compared: p.compared,
+      lhsLabel: p.lhsLabel,
+      lhs: p.lhs === null ? null : round(p.lhs, 6),
+      op: p.op,
+      rhsLabel: p.rhsLabel,
+      rhs: p.rhs === null ? null : round(p.rhs, 6),
+      shortfallR:
+        p.compared && p.op === '>=' && p.lhs !== null && p.rhs !== null
+          ? round(p.rhs - p.lhs, 6)
+          : null,
+      shortCircuit: p.shortCircuit,
+      reasonCode: s.reasonCode,
+      costR: Number.isFinite(s.costR) ? round(s.costR, 6) : null,
+      symbol: s.symbol,
+    });
+  }
+  return [...perDay.values()].sort((a, b) => a.etDay.localeCompare(b.etDay));
+}
+
+/** TRA-4745 — compared / short-circuited split over a sample list. */
+function predicateCoverage(samples: CostSample[]): {
+  rowsCompared: number;
+  rowsShortCircuited: number;
+  predicateUnstamped: number;
+} {
+  let rowsCompared = 0;
+  let rowsShortCircuited = 0;
+  let predicateUnstamped = 0;
+  for (const s of samples) {
+    if (s.predicate === null) predicateUnstamped += 1;
+    else if (s.predicate.compared) rowsCompared += 1;
+    else rowsShortCircuited += 1;
+  }
+  return { rowsCompared, rowsShortCircuited, predicateUnstamped };
 }
 
 /** Options for the counterfactual sweep — resolved config, never literals. */
@@ -1997,6 +2412,8 @@ function foldGates(
     const byCell: LiveEnforceCellSummary[] = [];
     for (const [cell, t] of tallies.byCell.entries()) {
       const cellSamples = samplesByCell.get(cell) ?? [];
+      // TRA-4745 — the predicate coverage split for this cell.
+      const coverage = predicateCoverage(cellSamples);
       byCell.push({
         cell,
         evaluated: t.evaluated,
@@ -2009,9 +2426,47 @@ function foldGates(
           cellSamples.length > 0
             ? costRQuantiles(cellSamples, Math.max(0, t.evaluated - cellSamples.length), 0)
             : null,
+        // TRA-4745 — the side that decides, sampled on the SAME rows as the cost
+        // block so the two are paired and a reader can hold them against each
+        // other row-for-row.
+        grossRQuantiles: cellSamples.length > 0 ? grossRQuantiles(cellSamples) : null,
+        predicateSamples: predicateSamples(cellSamples),
+        predicateUnstamped: coverage.predicateUnstamped,
+        rowsCompared: coverage.rowsCompared,
+        rowsShortCircuited: coverage.rowsShortCircuited,
       });
     }
     byCell.sort((a, b) => b.evaluated - a.evaluated || a.cell.localeCompare(b.cell));
+
+    // TRA-4745 — the UNDERLYING axis. Counts come from `byUnderlying` (bumped on
+    // every stamped row, admits included) while the distributions come from the
+    // cost samples, so a symbol whose quotes were unusable still publishes its
+    // evaluated/blocked instead of vanishing from the join.
+    const samplesBySymbol = new Map<string, CostSample[]>();
+    for (const s of tallies.costSamples) {
+      if (s.symbol === null) continue;
+      const list = samplesBySymbol.get(s.symbol);
+      if (list) list.push(s);
+      else samplesBySymbol.set(s.symbol, [s]);
+    }
+    const costBySymbol: LiveEnforceCostSymbolSummary[] = [];
+    for (const [symbol, t] of tallies.byUnderlying.entries()) {
+      const symSamples = samplesBySymbol.get(symbol) ?? [];
+      const gross = symSamples.length > 0 ? grossRQuantiles(symSamples) : null;
+      costBySymbol.push({
+        symbol,
+        evaluated: t.evaluated,
+        blocked: t.blocked,
+        blockRate: t.evaluated > 0 ? round(t.blocked / t.evaluated) : null,
+        costR: symSamples.length > 0 ? quantileBlock(symSamples.map((s) => s.costR)) : null,
+        grossR: gross === null ? null : { n: gross.n, p10: gross.p10, p25: gross.p25, p50: gross.p50, p75: gross.p75, p90: gross.p90, min: gross.min, max: gross.max, mean: gross.mean },
+        rowsMissingGrossR: gross?.rowsMissingGrossR ?? 0,
+        rowsCompared: predicateCoverage(symSamples).rowsCompared,
+      });
+    }
+    costBySymbol.sort(
+      (a, b) => b.evaluated - a.evaluated || a.symbol.localeCompare(b.symbol),
+    );
 
     // TRA-3510 — the nominator axis. Means are derived HERE from the retained
     // sums over `rowsWithChainShape`, never from `evaluated`: a fold that spans
@@ -2044,6 +2499,9 @@ function foldGates(
     // deployed" cannot read the same as "deployed, no live candidates yet" —
     // the same distinction the zero gate rows exist for.
     const instrumented = gate === 'cost_bar';
+    // TRA-4745 — the gate-wide predicate coverage split, over the same sample
+    // list the quantiles are folded from.
+    const gatePredicateCoverage = predicateCoverage(tallies.costSamples);
     // TRA-4269 — the ratified-set counterfactual: `0` / `[]` on `universe` at
     // n=0 (never omitted), and null on every other gate.
     const counterfactual = gate === 'universe' ? foldRatifiedCounterfactual(tallies) : null;
@@ -2066,6 +2524,15 @@ function foldGates(
       costRQuantiles: instrumented
         ? costRQuantiles(tallies.costSamples, tallies.costRowsMissing, tallies.costSamplesDropped)
         : null,
+      // TRA-4745 — same `cost_bar`-only contract as `costRQuantiles`: published
+      // at `n: 0` rather than omitted, so "not deployed" and "deployed, no rows
+      // yet" stay distinguishable.
+      grossRQuantiles: instrumented ? grossRQuantiles(tallies.costSamples) : null,
+      rowsCompared: instrumented ? gatePredicateCoverage.rowsCompared : null,
+      rowsShortCircuited: instrumented ? gatePredicateCoverage.rowsShortCircuited : null,
+      predicateUnstamped: instrumented ? gatePredicateCoverage.predicateUnstamped : null,
+      costBySymbol: instrumented ? costBySymbol : null,
+      costRowsMissingSymbol: instrumented ? tallies.symbolRowsMissing : null,
       netEdgeShadow: instrumented
         ? netEdgeShadow(tallies, etDay, etDays, evaluated, blocked, shadowOpts)
         : null,
@@ -2174,6 +2641,12 @@ function accumulateAllDays(): Map<LiveEnforceGate, GateTallies> {
       }
       into.costRowsMissing += tallies.costRowsMissing;
       into.costSamplesDropped += tallies.costSamplesDropped;
+      // TRA-4745 — the underlying axis and its two coverage denominators travel
+      // with the day, or the retained fold would publish an empty
+      // `costBySymbol` alongside `costRowsMissingSymbol: 0` — a hole that reads
+      // as a complete zero, which is the failure this ticket is about.
+      mergeAxis(into.byUnderlying, tallies.byUnderlying);
+      into.symbolRowsMissing += tallies.symbolRowsMissing;
       into.blockedUnclassified += tallies.blockedUnclassified;
       // TRA-4269 — the counterfactual travels with the day, or the retained view
       // would publish `counterfactualEvaluated: 0` over a fold that has rows.
