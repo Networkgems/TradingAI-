@@ -545,8 +545,35 @@ const CONTROLS = [
   },
 ];
 
-async function selftest() {
+// Arg-guard controls (TRA-4760). ARM cases must PASS the guard: a guard that
+// rejects everything would also "pass" a reject-only suite while breaking the
+// routine's own invocation.
+const ARG_CONTROLS = [
+  { name: 'ARM — no flags (the routine\'s own invocation) is accepted', argv: [], expectErr: false },
+  { name: 'ARM — every real flag together is accepted', argv: ['--owner=abc', '--grace-hours=48', '--json'], expectErr: false },
+  { name: 'ARM — --selftest is accepted', argv: ['--selftest'], expectErr: false },
+  { name: 'the incident — --controls silently ran a LIVE sweep => now USAGE', argv: ['--controls'], expectErr: true, errIncludes: '--selftest' },
+  { name: '--owner <id> space form must not silently drop the scope', argv: ['--owner', 'abc'], expectErr: true, errIncludes: 'never a space' },
+  { name: '--grace-hours 48 space form must not silently revert to 24h', argv: ['--grace-hours', '48'], expectErr: true, errIncludes: 'never a space' },
+  { name: 'misspelled --ownr=<id> must not widen to company-wide', argv: ['--ownr=abc'], expectErr: true, errIncludes: 'ownr' },
+  { name: 'positional argument is rejected, not ignored', argv: ['abc'], expectErr: true, errIncludes: 'positional' },
+];
+
+function argSelftest() {
   let failed = 0;
+  for (const c of ARG_CONTROLS) {
+    const err = guardArgs(c.argv);
+    const ok = c.expectErr
+      ? Boolean(err) && (!c.errIncludes || err.includes(c.errIncludes))
+      : err === null;
+    if (!ok) failed += 1;
+    console.log(`${ok ? 'PASS' : 'FAIL'}  ${c.name}\n      got ${err === null ? 'accepted' : JSON.stringify(err)}`);
+  }
+  return failed;
+}
+
+async function selftest() {
+  let failed = argSelftest();
   for (const c of CONTROLS) {
     const transport =
       c.rows === null
@@ -568,7 +595,8 @@ async function selftest() {
         (leaked.length ? `\n      render must NOT contain: ${leaked.map((s) => JSON.stringify(s)).join(', ')}` : ''),
     );
   }
-  console.log(`\n${CONTROLS.length - failed}/${CONTROLS.length} controls pass`);
+  const total = CONTROLS.length + ARG_CONTROLS.length;
+  console.log(`\n${total - failed}/${total} controls pass`);
   return failed === 0 ? 0 : VERDICT_EXIT.STALLED;
 }
 
@@ -579,7 +607,67 @@ function argOf(name, dflt = null) {
   return hit ? hit.slice(name.length + 3) : dflt;
 }
 
+/*
+ * ARG GUARD (TRA-4760). Every flag above is matched POSITIVELY, so before this
+ * guard existed anything unrecognised was silently dropped and the run proceeded
+ * as an ordinary sweep. That is the TRA-4420 shape, and in a script whose exit
+ * code IS a company-wide verdict it fails in the expensive direction:
+ *   - `--controls` (the name the routine body uses in prose; the real flag is
+ *     `--selftest`) ran a LIVE company sweep whose output an operator reads as
+ *     controls. Measured on this script 2026-09-20 during TRA-4760's own fire.
+ *   - `--ownr=<id>` / `--owner <id>` silently drop the scope, widening a
+ *     one-owner check to company-wide — which is how a sweep pages the wrong
+ *     people for rows they do not own.
+ *   - `--grace-hours 48` (space form) silently reverts to the 24h default,
+ *     re-aging every in-grace row into a page.
+ * Unknown token => exit 2 USAGE naming the offender. Values attach with `=`.
+ */
+const KNOWN_BOOL = new Set(['--selftest', '--json', '--help']);
+const KNOWN_VALUE = new Set(['grace-hours', 'owner']);
+
+export function guardArgs(argv) {
+  for (const a of argv) {
+    if (KNOWN_BOOL.has(a)) continue;
+    if (!a.startsWith('--')) {
+      return `positional argument ${JSON.stringify(a)} is not understood; values attach with "=" (e.g. --owner=<id>)`;
+    }
+    const eq = a.indexOf('=');
+    if (eq === -1) {
+      const bare = a.slice(2);
+      if (KNOWN_VALUE.has(bare)) {
+        return `--${bare} takes a value and it attaches with "=" (--${bare}=<value>), never a space`;
+      }
+      return `unrecognised flag ${JSON.stringify(a)}${a === '--controls' ? ' — the controls flag is --selftest (pnpm check:stalled-reviews:controls)' : ''}`;
+    }
+    const name = a.slice(2, eq);
+    if (!KNOWN_VALUE.has(name)) return `unrecognised flag "--${name}"`;
+  }
+  return null;
+}
+
+const USAGE_TEXT = [
+  'USAGE: node scripts/check-stalled-reviews.mjs [--owner=<agentId>] [--grace-hours=<n>] [--json]',
+  '       node scripts/check-stalled-reviews.mjs --selftest     # controls (pnpm check:stalled-reviews:controls)',
+  '',
+  'Exit: 0 CLEAN · 1 STALLED · 2 USAGE · 3 BLIND · 4 GRACE · 5 CLUSTER',
+  'Precedence: BLIND > STALLED > CLUSTER > GRACE > CLEAN',
+].join('\n');
+
 async function main() {
+  const argErr = guardArgs(process.argv.slice(2));
+  if (argErr) {
+    console.error(`USAGE: ${argErr}`);
+    console.error(USAGE_TEXT);
+    return VERDICT_EXIT.USAGE;
+  }
+  // --help exits 2 (USAGE), NOT 0. In this script 0 means CLEAN — a measured
+  // company-wide verdict — so handing 0 to a caller that only reads the exit
+  // code would record a clean sweep that never ran.
+  if (process.argv.includes('--help')) {
+    console.error(USAGE_TEXT);
+    return VERDICT_EXIT.USAGE;
+  }
+
   if (process.argv.includes('--selftest')) return selftest();
 
   const graceHours = Number(argOf('grace-hours', String(DEFAULT_GRACE_HOURS)));
