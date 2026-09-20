@@ -22523,6 +22523,15 @@ export class SignalEngine {
    * still wholesale — it just happens on rotation COMPLETION rather than at the
    * end of every call, because a partial rebuild publishes a thinner snapshot
    * without any error surfacing. See {@link pendingCuratedSocial}.
+   *
+   * TRA-4739 — the lane is RETIRED: `getCuratedStockTwitsAccounts()` returns []
+   * by default, so this is a per-tick no-op that costs nothing and the curated
+   * cache stays empty (0.202% of the persisted message population, nothing since
+   * 2026-08-18 — see that function for the measurement). It is a no-op safely,
+   * not incidentally: `runBudgetedSweep` maps a zero-length universe to
+   * `complete: true`, so the `crowd.complete && curated.complete` pairing above
+   * still tracks the crowd lane alone rather than pinning the social sweep to the
+   * 5-minute throttle forever. Setting `CURATED_STOCKTWITS_ACCOUNTS` restores it.
    */
   private async refreshCuratedSocialSentiment(budgetMs: number): Promise<SweepPass> {
     const accounts = getCuratedStockTwitsAccounts();

@@ -552,6 +552,7 @@ import { recordOptionChains, etDateKey } from './options-chain-recorder.js';
 import { recordSentimentSnapshot } from './sentiment-snapshot-recorder.js';
 import {
   fetchStockTwitsStream,
+  describeCuratedLane,
   describeStockTwitsEgress,
   fetchStockTwitsUserStream,
   getCuratedStockTwitsAccounts,
@@ -5931,6 +5932,13 @@ async function runSentimentSnapshot(): Promise<void> {
   // SignalEngine.refreshCuratedSocialSentiment: pull each curated user stream,
   // map messages onto every symbol they mention. Best-effort — a fully throttled
   // pull just yields an empty curated map (crowd-only reads still record).
+  //
+  // TRA-4739 — retired by board decision, so the account list is empty and this
+  // loop does nothing. Left in place (rather than deleted) because the env
+  // override still resurrects the lane, and because `curatedLane` below is what
+  // distinguishes "polled nobody" from "polled nine and got nothing" — those two
+  // produce an identical `curatedCount: 0` in every recorded row.
+  const curatedLane = describeCuratedLane();
   const curatedCollected: StockTwitsMessage[] = [];
   for (const user of getCuratedStockTwitsAccounts()) {
     try {
@@ -5949,12 +5957,18 @@ async function runSentimentSnapshot(): Promise<void> {
     symbols: symbols.length,
     universeSource: rawUniverse ? 'SENTIMENT_WATCHLIST' : 'WATCHLIST',
     curatedSymbols: curatedBySymbol.size,
+    // Never let a bare 0 above stand in for "the lane is off on purpose".
+    curatedLane: curatedLane.status,
+    curatedAccounts: curatedLane.accounts,
     outDir: SENTIMENT_RECORD_OUT_DIR,
   });
 
   const result = await recordSentimentSnapshot({
     symbols,
     outDir: SENTIMENT_RECORD_OUT_DIR,
+    // TRA-4739 — persist the lane's status into `_meta.json` so the TRA-820
+    // re-grade can partition the series on the retirement instead of inferring it.
+    curatedLane,
     fetchSentiment: async (symbol) => {
       const crowd = await fetchStockTwitsStream(symbol);
       // Null = rate-limited / cold: no read for this symbol-day. An empty array

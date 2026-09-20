@@ -168,6 +168,18 @@ export interface SentimentSnapshotRecorderOptions {
   describeUnavailable?: (symbol: string) => string | undefined;
   /** TRA-2519 — bounded half-open retry. Omitted → single pass, as before. */
   retry?: SentimentRetryPolicy;
+  /**
+   * TRA-4739 — provenance for the curated (followed-account) lane, stamped into
+   * `_meta.json` verbatim. The curated lane was retired on 2026-09-20, and a
+   * row's `curatedCount: 0` cannot tell you which side of that you are on: it
+   * reads the same whether nine accounts were polled and contributed nothing
+   * (the 20 dry days before) or nobody was polled at all (every day after). The
+   * study that consumes this series has to partition on the change, so the
+   * change is written down rather than left to be inferred from the dates.
+   * Omitted → the key is absent from meta, which itself dates the partition to
+   * before this field shipped.
+   */
+  curatedLane?: { status: string; accounts: number };
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
@@ -375,6 +387,9 @@ export async function recordSentimentSnapshot(
     sweptRecorded: sweptRows.filter((s) => s.outcome === 'recorded').length,
     preservedFromPrior,
     reasons: countBy(symbols.filter((s) => s.outcome !== 'recorded').map((s) => s.reason ?? 'unspecified')),
+    // TRA-4739 — which side of the curated-lane retirement this partition is on.
+    // Absent when the caller did not say, which is itself the pre-2026-09-20 read.
+    ...(options.curatedLane ? { curatedLane: options.curatedLane } : {}),
     perSymbol: symbols.map((s) => ({ symbol: s.symbol, outcome: s.outcome })),
   };
   await writeFile(join(outDir, '_meta.json'), JSON.stringify(meta, null, 2), 'utf-8');

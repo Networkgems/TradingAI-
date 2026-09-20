@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   fetchStockTwitsStream,
   fetchStockTwitsUserStream,
+  describeCuratedLane,
   getCuratedStockTwitsAccounts,
   DEFAULT_CURATED_STOCKTWITS_ACCOUNTS,
   isStockTwitsBreakerOpen,
@@ -345,9 +346,21 @@ describe('rate-limit breaker cooldown bounds (TRA-2519)', () => {
   });
 });
 
-describe('getCuratedStockTwitsAccounts (TRA-603)', () => {
-  it('defaults to the seeded curated list', () => {
-    expect(getCuratedStockTwitsAccounts({})).toEqual([...DEFAULT_CURATED_STOCKTWITS_ACCOUNTS]);
+describe('getCuratedStockTwitsAccounts (TRA-603, retired TRA-4739)', () => {
+  // TRA-4739 — the lane is retired by board decision. The assertion that matters
+  // is that NOTHING is polled by default: the whole point of the decision is the
+  // nine HTTP fetches per sweep going away, so a default that still named even
+  // one account would be a silent no-change. Asserting `[]` rather than
+  // `not.toEqual(DEFAULT_...)` is deliberate — the latter would also pass on a
+  // list that was merely reordered or trimmed to eight.
+  it('defaults to EMPTY — the curated lane is retired, nobody is polled', () => {
+    expect(getCuratedStockTwitsAccounts({})).toEqual([]);
+  });
+
+  it('still exports the seed list for documentation / resurrection', () => {
+    // Retiring the lane must not delete the record of what it used to poll.
+    expect(DEFAULT_CURATED_STOCKTWITS_ACCOUNTS.length).toBe(9);
+    expect(DEFAULT_CURATED_STOCKTWITS_ACCOUNTS).toContain('howardlindzon');
   });
 
   it('parses a comma-separated env override, trimming blanks', () => {
@@ -355,9 +368,30 @@ describe('getCuratedStockTwitsAccounts (TRA-603)', () => {
     expect(getCuratedStockTwitsAccounts(env)).toEqual(['alpha', 'beta', 'gamma']);
   });
 
-  it('falls back to the default when the env is blank', () => {
+  it('a blank env is retired, not a fallback to the old nine', () => {
     const env = { CURATED_STOCKTWITS_ACCOUNTS: '   ' } as NodeJS.ProcessEnv;
-    expect(getCuratedStockTwitsAccounts(env)).toEqual([...DEFAULT_CURATED_STOCKTWITS_ACCOUNTS]);
+    expect(getCuratedStockTwitsAccounts(env)).toEqual([]);
+  });
+});
+
+describe('describeCuratedLane (TRA-4739)', () => {
+  // The discriminator this exists for: `curatedCount: 0` in a recorded row reads
+  // identically whether nine accounts were polled and said nothing attributable
+  // (the 20 dry days before the retirement) or nobody was polled at all (every
+  // day after it). Without a status value beside the count, a re-grade spanning
+  // 2026-09-20 cannot tell which population it is looking at.
+  it('reports `retired` with zero accounts by default', () => {
+    expect(describeCuratedLane({})).toEqual({ status: 'retired', accounts: 0 });
+  });
+
+  it('reports `enabled_by_env` and the count when resurrected', () => {
+    const env = { CURATED_STOCKTWITS_ACCOUNTS: 'alpha,beta' } as NodeJS.ProcessEnv;
+    expect(describeCuratedLane(env)).toEqual({ status: 'enabled_by_env', accounts: 2 });
+  });
+
+  it('distinguishes the two states — they must not share a value', () => {
+    const on = describeCuratedLane({ CURATED_STOCKTWITS_ACCOUNTS: 'alpha' } as NodeJS.ProcessEnv);
+    expect(on.status).not.toBe(describeCuratedLane({}).status);
   });
 });
 

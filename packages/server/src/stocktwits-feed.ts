@@ -452,9 +452,14 @@ async function fetchStreamMessages(
 }
 
 /**
- * TRA-603 — curated high-signal StockTwits accounts whose user streams are
+ * TRA-603 — curated high-signal StockTwits accounts whose user streams were
  * ingested as a higher-weight lane. Seeded from the `clipse2` Following list on
  * the TRA-602 screenshots (analysts + official feeds).
+ *
+ * TRA-4739 — RETIRED. This list is no longer the default; it is kept as the
+ * documented seed for anyone who resurrects the lane via
+ * `CURATED_STOCKTWITS_ACCOUNTS`. See {@link getCuratedStockTwitsAccounts} for
+ * the measurement that retired it.
  */
 export const DEFAULT_CURATED_STOCKTWITS_ACCOUNTS: readonly string[] = [
   'ivanhoff',
@@ -470,8 +475,30 @@ export const DEFAULT_CURATED_STOCKTWITS_ACCOUNTS: readonly string[] = [
 
 /**
  * TRA-603 — resolve the curated account list. Overridable via the
- * `CURATED_STOCKTWITS_ACCOUNTS` env (comma-separated usernames); falls back to
- * {@link DEFAULT_CURATED_STOCKTWITS_ACCOUNTS}.
+ * `CURATED_STOCKTWITS_ACCOUNTS` env (comma-separated usernames).
+ *
+ * TRA-4739 — the default is now EMPTY: the curated lane is retired by board
+ * decision (card `35590c81`, 2026-09-20). What it actually delivered, measured
+ * over the whole persisted series (`packages/backtest/data/sentiment-snapshots`,
+ * 2026-06-15 → 2026-09-03, 875 recorded symbol-days):
+ *
+ *   - **55 curated messages total — 0.202%** of the 27,180-message population.
+ *   - Present on **15 of 35** recorded days, never more than **2** on any one
+ *     symbol-day, and **none at all since 2026-08-18**.
+ *   - The crowd lane saturates its own 30-message-per-symbol cap (every dry day
+ *     lands on exactly 25 × 30 = 750), so curated messages are strictly
+ *     additive — dropping them cannot displace a crowd read.
+ *
+ * Nine account fetches per sweep bought that 0.2%, against a shared rate-limit
+ * breaker those same fetches help trip. Note this is NOT "zero by construction":
+ * the lane worked, intermittently, and its yield was simply too small to pay for
+ * itself. Setting the env resurrects it (see
+ * {@link DEFAULT_CURATED_STOCKTWITS_ACCOUNTS} for the seed list).
+ *
+ * An empty list is a no-op at both call sites by construction, not by accident:
+ * `runBudgetedSweep` short-circuits a zero-length universe to
+ * `complete: true`, so the paired social sweep's completion still tracks the
+ * crowd lane alone, and the recorder's curated map is simply empty.
  */
 export function getCuratedStockTwitsAccounts(
   env: NodeJS.ProcessEnv = process.env,
@@ -480,7 +507,24 @@ export function getCuratedStockTwitsAccounts(
   if (typeof raw === 'string' && raw.trim().length > 0) {
     return raw.split(',').map(s => s.trim()).filter(Boolean);
   }
-  return [...DEFAULT_CURATED_STOCKTWITS_ACCOUNTS];
+  return [];
+}
+
+/**
+ * TRA-4739 — why the curated lane is empty, as a value rather than an inference.
+ *
+ * `curatedCount: 0` on a snapshot row has meant two different things across the
+ * retirement date — "nine accounts were polled and none of them said anything
+ * attributable" before it, "nobody was polled" after it — and those read
+ * identically in the data. Anything that logs or persists a curated count is
+ * expected to carry this beside it so a later re-grade can partition the series
+ * instead of guessing where the composition changed.
+ */
+export function describeCuratedLane(
+  env: NodeJS.ProcessEnv = process.env,
+): { status: 'retired' | 'enabled_by_env'; accounts: number } {
+  const accounts = getCuratedStockTwitsAccounts(env).length;
+  return { status: accounts === 0 ? 'retired' : 'enabled_by_env', accounts };
 }
 
 /**

@@ -10,6 +10,28 @@ before any purchase. All measurements of our own system were taken this run agai
 
 ---
 
+## 0a. Board decision — settled 2026-09-20
+
+Card `35590c81` on TRA-4739, resolved by the board **2026-09-20T00:00:48Z**. All three answers took the
+recommended option; none of them spends money.
+
+| Question | Answer | Status |
+|---|---|---|
+| Paid market data | **A — keep the free feed, spend nothing** | Standing. The StockTwits accrual continues at $0; no vendor, no card, no approval. |
+| The curated StockTwits lane | **A — drop it** | **Shipped 2026-09-20** — see §2.3. |
+| A wider, dynamically screened universe | **A — yes, but after the cost work** | Queued behind the execution-cost work, not started. |
+
+Two consequences worth stating plainly, because they are the parts that could be misread later:
+
+- **"Keep the free feed" is not "revisit this in November."** The re-grade condition is a *sample-size*
+  condition (~70 usable days, ≈ late November at the measured rate), and it is owned by TRA-820, not by this
+  issue. Nothing here re-opens on a date.
+- **"After the cost work" is a dependency, not a deferral.** The wider universe is queued behind the
+  execution-cost work because widening a funnel whose candidates are already 195-of-200 starved by cost gates
+  adds noise rather than trades. It is filed with that blocker attached so it cannot be picked up out of order.
+
+---
+
 ## 0. Answer first
 
 | Ask | Verdict |
@@ -102,8 +124,24 @@ decision today.
 
 ### 2.3 One cheap defect found while measuring
 
-`curatedCount` is **0 in every snapshot**. It is not a broken fetch — all nine curated accounts return 200.
-Sampling each account's last 30 messages from a clean IP this run:
+> **Correction (2026-09-20).** The first version of this section said `curatedCount` is "0 in every
+> snapshot." That is **wrong**, and it was wrong in the way this repo keeps getting caught by: I read the
+> recent partitions, found 0, and generalised. Re-measured **per partition over the whole series**
+> (2026-06-15 → 2026-09-03, 875 recorded symbol-days, 27,180 messages):
+>
+> - **55 curated messages, not 0** — but that is **0.202%** of the message population.
+> - Present on **15 of 35** recorded days, never more than **2** on a single symbol-day.
+> - **None at all since 2026-08-18**, which is what the recent-partition read mistook for "always 0".
+>
+> So the lane was not dead-by-construction; it worked intermittently and its yield was simply far too small
+> to pay for nine fetches per sweep against a shared rate-limit breaker. **The recommendation below does not
+> change** — it is now supported by a weaker-but-true premise instead of a stronger false one. The crowd lane
+> saturates its own 30-messages-per-symbol cap (every dry day lands on exactly 25 × 30 = 750), so curated
+> messages were strictly additive and dropping them displaces no crowd read.
+
+`curatedCount` is **near-zero in every snapshot, and exactly 0 since 2026-08-18** (see the correction above).
+It is not a broken fetch — all nine curated accounts return 200. Sampling each account's last 30 messages
+from a clean IP this run:
 
 | Account | messages | carrying a Bullish/Bearish tag |
 |---|---|---|
@@ -112,9 +150,24 @@ Sampling each account's last 30 messages from a clean IP this run:
 | howardlindzon, ivanhoff, Jonathan_Morgan, StocktwitsNews, StocktwitsEarnings, Stocktwits, Cryptotwits | 30 each | **0** |
 
 **16 tagged messages out of 270 (5.9%), from 2 of 9 accounts.** The aggregator only scores *tagged*
-messages, so the curated lane is structurally near-empty by construction — it is not adding a "smart money"
-overlay to anything. Either drop it, or count untagged curated messages as a separate buzz term. That is a
+messages, and a tagged message must also carry a symbol entity to be attributable — the intersection of
+those two conditions is what holds the lane down to 0.202%. It is not adding a "smart money" overlay to
+anything. Either drop it, or count untagged curated messages as a separate buzz term. That is a
 study-design call for QuantTrader (one-line change either way), not a platform bug.
+
+**RESOLVED 2026-09-20 — the lane is dropped** (board card `35590c81`, option A). Shipped in
+`getCuratedStockTwitsAccounts()`, which now returns `[]` by default; `CURATED_STOCKTWITS_ACCOUNTS`
+resurrects it and `DEFAULT_CURATED_STOCKTWITS_ACCOUNTS` is retained as the documented seed list. Nine
+account fetches per sweep are gone from both call sites (the engine's paired social sweep and the daily
+snapshot recorder).
+
+One thing the drop had to not do: make itself invisible. `curatedCount: 0` on a recorded row now means two
+different things either side of 2026-09-20 — "nine accounts were polled and contributed nothing
+attributable" (the 20 dry days before) versus "nobody was polled" (every day after) — and those are
+identical in the data. So `_meta.json` now carries `curatedLane: {status, accounts}` and the recorder logs
+it, letting the eventual TRA-820 re-grade partition the series on the retirement rather than infer where the
+composition changed. `describeCuratedLane()` is the single source of that value, and a test asserts the two
+states cannot share one.
 
 ---
 
@@ -221,8 +274,9 @@ authorised envelope**, independent of whether they are good ideas. The $750 Data
 1. **Keep the free StockTwits feed running and change nothing about it.** $0, accruing ~23 usable
    symbol-days/day, re-grade condition (~70 usable days) lands ≈ late November 2026. **← default; needs no
    decision.**
-2. **Decide the curated lane** (QuantTrader, one line): drop it, or score untagged curated messages as buzz.
-   It contributes 0 today and has since we shipped it.
+2. ~~**Decide the curated lane** (QuantTrader, one line): drop it, or score untagged curated messages as
+   buzz.~~ **DONE 2026-09-20 — dropped** (board card `35590c81`, option A). It contributed 0.202% of the
+   message population and nothing at all after 2026-08-18; see §2.3.
 3. **Resolve the TRA-820 §7.4 gate asymmetry before the re-grade, not after.** The gate as written cannot
    pass a contrarian signal, and S1 is contrarian on all three horizons. This is a board ratification, and
    it must land before the next grading run or the re-grade is pre-decided.
