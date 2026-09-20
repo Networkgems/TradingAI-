@@ -46,7 +46,8 @@ import {
   netEdgeShadowAdmits,
   type NetEdgeShadowSample,
 } from './option-net-edge-bar.js';
-import type { LiveEnforceGatePredicate } from './live-enforce-gate-predicate.js';
+import { impliedBarR } from './live-enforce-gate-predicate.js';
+import type { ImpliedBarR, LiveEnforceGatePredicate } from './live-enforce-gate-predicate.js';
 import type { AdmissibleSelection } from './otm-admissible-strike.js';
 import {
   OPTION_LIVE_OTM_UNIVERSE_DEFAULT,
@@ -1376,6 +1377,22 @@ export interface LiveEnforceCellSummary {
    */
   grossRQuantiles: GrossRQuantiles | null;
   /**
+   * TRA-4745 (2026-09-20 follow-up) — the bar these rows were ACTUALLY measured
+   * against, recovered by inverting `reasonCode` over the recorded `grossR`.
+   *
+   * This exists because the per-row `predicate` stamp, which is the right
+   * instrument, can only describe rows written AFTER the deploy that added it —
+   * 0 of 9558 on the very fold it shipped onto, and no stamped row can arrive
+   * before the next RTH nomination. This recovers the same fact from rows the
+   * ledger has held since TRA-3483, so the fold answers it on boot instead of in
+   * a month.
+   *
+   * Read `consistent` FIRST; on a pooled multi-day fold `false` is a RESULT —
+   * the bar moved while these rows accumulated — not a defect. Null when no row
+   * here constrained the bar.
+   */
+  barRImplied: ImpliedBarR | null;
+  /**
    * TRA-4745 — one sampled BLOCKED row per ET day in this cell, carrying the
    * exact comparison the gate evaluated. Empty on a cell with no blocks, and on
    * a cell whose rows all predate the stamp (see `predicateUnstamped`).
@@ -1713,6 +1730,49 @@ export interface LiveEnforceDayCellSummary {
   blocked: number;
   /** blocked / evaluated; `null` when the cell decided nothing THAT DAY (never 0). */
   blockRate: number | null;
+  /**
+   * TRA-4745 (2026-09-20 follow-up) — the cell's recorded `grossR` ON THIS DAY.
+   *
+   * This is the axis that separates "the quantiles were RECORDED per row" from
+   * "the quantiles were BACK-FILLED from the current estimator", which the
+   * witness asked for as a `grossRSource` enum. An enum would have been an
+   * assertion; this is the evidence. A back-fill is constant across every day by
+   * construction, so `distinct: 1` on every day AND the same value on every day
+   * is the back-fill signature, while a value that MOVES day to day can only
+   * have been written at the decision. Null when no row that day carried one.
+   */
+  grossR: LiveEnforceDayCellGrossR | null;
+  /**
+   * TRA-4745 (2026-09-20 follow-up) — the bar this day's rows were ACTUALLY
+   * measured against, recovered by inverting `reasonCode` over the recorded
+   * `grossR`. Read `consistent` first: `false` means the bar moved INSIDE the
+   * day. Null when no row in the group constrained the bar at all.
+   */
+  barRImplied: ImpliedBarR | null;
+}
+
+/**
+ * TRA-4745 (2026-09-20 follow-up) — one day's `grossR` for one cell. Lean by
+ * design, like every other per-day row: the pooled `byCell[].grossRQuantiles`
+ * carries the full distribution, and what the day row has to answer is narrower
+ * — did this cell's bound HOLD STILL while the day ran, and at what level.
+ */
+export interface LiveEnforceDayCellGrossR {
+  /** Rows that carried a `grossR`. */
+  n: number;
+  min: number;
+  max: number;
+  mean: number;
+  /**
+   * Distinct recorded values. `1` ⇒ the cell's bound did not re-fold that day,
+   * so the flat predicate WAS constant and the day's block rate must be 0% or
+   * 100% on the bar alone. `> 1` ⇒ one side moved mid-session, which is the only
+   * way a single cell-day lands strictly between (measured: 2026-08-28,
+   * `single_leg_otm::0.50-0.55`, 168/387).
+   */
+  distinct: number;
+  /** Rows in this cell-day whose edge was never recorded. COVERAGE, not zero. */
+  rowsMissing: number;
 }
 
 /** TRA-4154 — the per-ET-day NOMINATOR-BRANCH row. Lean for the same reason: the
@@ -2179,6 +2239,18 @@ export interface NetEdgeShadowOptions {
   ks?: readonly number[];
   /** The k-independent absolute ceiling the sweep replays. Defaults to the shipped config. */
   absCostFracCeiling?: number;
+  /**
+   * TRA-4745 (2026-09-20 follow-up) — the flat form's bar AS RESOLVED RIGHT NOW
+   * (`admissionBarR('single_leg_otm', resolveCostGateConfig(liveEnv))`), for the
+   * bar-recovery grade only. It is passed rather than resolved in here for the
+   * same reason `absCostFracCeiling` is: this module must not read env, and a
+   * grade computed against a bar nobody could arm is worse than no grade.
+   *
+   * ⚠️ It is the CURRENT bar and the fold spans 30 days. Nothing here treats it
+   * as the bar those rows faced — establishing whether it WAS is the entire job
+   * of {@link impliedBarR}, and this field is only ever the thing being graded.
+   */
+  flatFormBarR?: number;
 }
 
 /**
@@ -2235,10 +2307,53 @@ function netEdgeShadow(
  * caller drives this off `etDays`, so the roll's length is the fold's length on
  * every gate and a silent day is readable instead of inferable.
  */
+/**
+ * TRA-4745 (follow-up) — fold one cell-day's samples into the lean edge row.
+ *
+ * `distinct` is counted on the RAW recorded doubles, not on a rounded display
+ * value: rounding first would collapse two genuinely different bounds into one
+ * and publish `distinct: 1` — the back-fill signature — for a cell whose
+ * estimator moved. The published min/max/mean are rounded; the count is not.
+ */
+function dayCellGrossR(samples: CostSample[], rowsWithNoSample: number): LiveEnforceDayCellGrossR | null {
+  const values: number[] = [];
+  let rowsMissing = rowsWithNoSample;
+  for (const s of samples) {
+    if (s.grossR === null || !Number.isFinite(s.grossR)) rowsMissing += 1;
+    else values.push(s.grossR);
+  }
+  if (values.length === 0) return null;
+  let min = values[0]!;
+  let max = values[0]!;
+  let sum = 0;
+  const seen = new Set<number>();
+  for (const v of values) {
+    if (v < min) min = v;
+    if (v > max) max = v;
+    sum += v;
+    seen.add(v);
+  }
+  return {
+    n: values.length,
+    // 6dp to match `grossRQuantiles`: at 4dp two bounds 1e-5 apart print
+    // identically and a reader comparing days sees a constant that is not there.
+    min: round(min, 6),
+    max: round(max, 6),
+    mean: round(sum / values.length, 6),
+    distinct: seen.size,
+    rowsMissing,
+  };
+}
+
 function foldGateDay(
   gate: LiveEnforceGate,
   etDay: string,
   tallies: GateTallies | undefined,
+  // TRA-4745 (follow-up) — the bar the route publishes TODAY, passed in so the
+  // recovered interval can be graded against it here rather than leaving the
+  // reader to join a scalar onto a 30-day fold. Null when the caller has no
+  // resolved bar; the recovery still runs, it just reports no verdict.
+  flatFormBarR: number | null = null,
 ): LiveEnforceGateDaySummary {
   const t = tallies ?? emptyTallies();
 
@@ -2292,17 +2407,33 @@ function foldGateDay(
     };
   }
 
+  // TRA-4745 (follow-up) — bucket THIS DAY's cost samples by cell once, so the
+  // per-day edge fold and the bar recovery below are both O(rows), not O(cells ×
+  // rows). These are the day's OWN samples: `foldGateDay` is handed the unpooled
+  // `GateTallies` for `etDay`, which is what makes the day axis able to say
+  // something the pooled fold structurally cannot.
+  const daySamplesByCell = new Map<string, CostSample[]>();
+  for (const s of t.costSamples) {
+    if (s.cell === null) continue;
+    const list = daySamplesByCell.get(s.cell);
+    if (list) list.push(s);
+    else daySamplesByCell.set(s.cell, [s]);
+  }
+
   let cellEvaluated = 0;
   let cellBlocked = 0;
   const byCell: LiveEnforceDayCellSummary[] = [];
   for (const [cell, c] of t.byCell.entries()) {
     cellEvaluated += c.evaluated;
     cellBlocked += c.blocked;
+    const cellDaySamples = daySamplesByCell.get(cell) ?? [];
     byCell.push({
       cell,
       evaluated: c.evaluated,
       blocked: c.blocked,
       blockRate: c.evaluated > 0 ? round(c.blocked / c.evaluated) : null,
+      grossR: dayCellGrossR(cellDaySamples, Math.max(0, c.evaluated - cellDaySamples.length)),
+      barRImplied: impliedBarR(cellDaySamples, flatFormBarR),
     });
   }
   byCell.sort((a, b) => b.evaluated - a.evaluated || a.cell.localeCompare(b.cell));
@@ -2445,6 +2576,13 @@ function foldGates(
         // block so the two are paired and a reader can hold them against each
         // other row-for-row.
         grossRQuantiles: cellSamples.length > 0 ? grossRQuantiles(cellSamples) : null,
+        // TRA-4745 (follow-up) — the bar recovered over the WHOLE fold for this
+        // cell. On a pooled multi-day fold `consistent: false` is the EXPECTED
+        // and INFORMATIVE outcome when the bar moved: it says these rows did not
+        // all face one bar, which is exactly what a single published scalar
+        // beside a 30-day distribution cannot say. Cross-read it against the
+        // per-day `byEtDay[].byCell[].barRImplied` to find WHICH day moved.
+        barRImplied: impliedBarR(cellSamples, shadowOpts.flatFormBarR ?? null),
         predicateSamples: predicateSamples(cellSamples),
         predicateUnstamped: coverage.predicateUnstamped,
         rowsCompared: coverage.rowsCompared,
@@ -2529,7 +2667,9 @@ function foldGates(
       // TRA-4154 — driven off `etDays`, not off the keys `perDay` happens to hold
       // for this gate: a day on which this gate recorded nothing must publish a
       // zero row, not vanish. `etDays` is ascending on both callers.
-      byEtDay: etDays.map((d) => foldGateDay(gate, d, perDay.get(d)?.get(gate))),
+      byEtDay: etDays.map((d) =>
+        foldGateDay(gate, d, perDay.get(d)?.get(gate), shadowOpts.flatFormBarR ?? null),
+      ),
       byScope,
       byReason,
       blockedUnclassified: tallies.blockedUnclassified,

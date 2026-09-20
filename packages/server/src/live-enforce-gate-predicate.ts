@@ -25,11 +25,22 @@
 //
 // Two further facts this module makes readable, both invisible before it:
 //
-//   • Every row inside a cell shares the SAME `grossR` (the cell's lower CI
-//     bound). So within one cell on one day the flat predicate is CONSTANT: the
-//     block rate is 0% or 100%, never in between. A 100.0% cell is therefore the
-//     EXPECTED shape of a cell whose bound sits under the bar — not evidence of a
-//     mis-attributed non-cost refusal.
+//   • Every row inside a cell shares the SAME `grossR` AT ONE INSTANT (it is the
+//     cell's lower CI bound, a property of the CELL, not of the candidate). So a
+//     100.0% cell is the EXPECTED shape of a cell whose bound sits under the bar
+//     — not evidence of a mis-attributed non-cost refusal.
+//     ⚠️ That does NOT make a cell's DAILY block rate 0% or 100%. An earlier
+//     revision of this comment said it did, and QuantTrader refuted it on the
+//     live retained fold (2026-09-20): `single_leg_otm::0.50-0.55` pools to
+//     39.12% (1627/4159). BOTH sides of the comparison re-resolve while a day is
+//     running — the tape table re-folds, and `barR` comes from
+//     `admissionBarR(structure, resolveCostGateConfig(process.env))`, which a
+//     redeploy can move under the fold. Measured on that cell's own `byEtDay`
+//     roll: 08-21/24/25 were 0%, 08-26 and 08-27 were 100%, **08-28 split
+//     168/387 = 43.4%**, and 08-31/09-01 returned to 0%. The pooled 39.12% is a
+//     TIME AVERAGE of six per-day verdicts plus one mid-session flip; it is not
+//     a per-candidate spread, and reading it as one is the same class of mistake
+//     as reading `costR` against the bar. Read `byEtDay[].byCell[]`.
 //   • Three of the flat form's branches refuse BEFORE reaching any comparison
 //     (`gross_unknown`, `band_deauthorized`, `insufficient_evidence`). Those rows
 //     are stamped `cost_bar` and land in `byReason`, but no bar and no cost was
@@ -41,6 +52,7 @@
 // PURE. No env, no I/O, no state. It describes a decision that has already been
 // made; it can never change one.
 
+import { COST_GATE_SHORTFALL_BUCKETS_R } from './option-cost-gate.js';
 import type { NetEdgeBarVerdict } from './option-net-edge-bar.js';
 import type { TapeExpectancyVerdict } from './option-tape-expectancy.js';
 
@@ -197,4 +209,175 @@ export function netEdgeFormPredicate(
     admit: verdict.admit,
     shortCircuit: compared ? null : (code ?? 'no_comparison'),
   };
+}
+
+// ── TRA-4745 (2026-09-20 follow-up) — THE BAR AS APPLIED, RECOVERED FROM ROWS
+//    THE LEDGER ALREADY HOLDS ─────────────────────────────────────────────────
+//
+// `predicate` (above) stamps the realised comparison at the decision site, which
+// is the right instrument — but it can only ever describe rows written AFTER the
+// deploy that added it. On the 30-day retained fold that is 0 of 9558 rows, and
+// the first stamped row cannot arrive before the next RTH nomination. So the one
+// question this ticket exists to answer — *was the published `barR` the bar that
+// actually blocked these rows?* — is unanswerable from the stamp for a month.
+//
+// It is answerable TODAY, from rows recorded since TRA-3483, because `reasonCode`
+// already carries a BOUNDED FUNCTION of the bar. The flat form buckets its blocks
+// by `shortfall = barR − grossR` into half-open intervals, and `grossR` is
+// recorded beside it on the same row. Inverting one row therefore bounds the bar:
+//
+//     reasonCode `shortfall_0.25_0.50`  ∧  grossR −0.051  ⇒  barR ∈ [0.199, 0.449)
+//
+// Intersecting those intervals over a (day × cell) group gives a hard two-sided
+// bound on the bar AS APPLIED, over the whole retained census, with no new stamp.
+// ADMITS bound it from the other side for free: `admit ⟺ grossR ≥ barR` means
+// every admitted row proves `barR ≤ grossR`.
+//
+// ⚠️ Read `consistent` FIRST. An EMPTY intersection is a RESULT, not a bug: it
+// says no single bar can explain that group's own rows, i.e. the bar MOVED while
+// the group was accumulating. That is the finding, and nothing else on the
+// payload can produce it — `arm.costBar.bar.barR` publishes today's scalar beside
+// a 30-day fold, which is precisely the join this ticket was filed about.
+//
+// ⚠️ `rowsUnusable` is not noise. The three pre-comparison branches
+// ({@link TAPE_EXPECTANCY_PRE_COMPARISON_REASON_CODES}) refuse before any
+// inequality runs, so they constrain the bar NOT AT ALL — folding them in would
+// manufacture a bound from rows that never met a bar. A group at
+// `rowsUsable: 0` bounds nothing and publishes `null`, never a default.
+
+/** One already-recorded decision, as the inversion needs to see it. */
+export interface ImpliedBarRRow {
+  /** The cell's lower 95% CI bound as recorded AT THE DECISION (`tapeEdgeR`). */
+  grossR: number | null;
+  blocked: boolean;
+  reasonCode: string | null;
+}
+
+/**
+ * A two-sided bound on `barR` as applied, recovered from a group of rows.
+ *
+ * Bounds are reported INCLUSIVE on both ends. The underlying shortfall buckets
+ * are half-open, so `upperBound` overstates by at most one ULP at a bucket edge;
+ * that slack is deliberate and is always in the direction that makes the interval
+ * WIDER, so an `excludesPublishedBarR: true` is never an artefact of it.
+ */
+export interface ImpliedBarR {
+  /** `barR >= lowerBound`. Null when no row constrained it from below. */
+  lowerBound: number | null;
+  /** `barR <= upperBound`. Null when no row constrained it from above. */
+  upperBound: number | null;
+  /** Blocked rows whose `reasonCode` inverted to an interval. */
+  rowsBlockedUsed: number;
+  /** Admitted rows, each proving `barR <= grossR`. */
+  rowsAdmittedUsed: number;
+  /**
+   * Rows that constrain nothing: no recorded `grossR`, or a blocked row on a
+   * pre-comparison branch, or an unrecognised `reasonCode`. COVERAGE, not zero.
+   */
+  rowsUnusable: number;
+  /**
+   * `lowerBound <= upperBound`. FALSE ⇒ the group's own rows cannot all have
+   * faced one bar ⇒ the bar MOVED inside the group. Read this before the bounds.
+   */
+  consistent: boolean;
+  /** The bar this route publishes today, echoed so the reader performs no join. */
+  publishedBarR: number | null;
+  /**
+   * `true` ⇒ the published bar lies OUTSIDE the recovered interval: the rows in
+   * this group were NOT decided against the bar the payload advertises. `null`
+   * when there is no published bar to grade, or when `consistent` is false (an
+   * empty interval excludes everything and would read as a false positive).
+   */
+  excludesPublishedBarR: boolean | null;
+}
+
+/** Bucket edges, derived from the SAME constant the classifier buckets with, so a
+ *  retune of the vocabulary cannot leave this inversion decoding a stale label. */
+function shortfallInterval(reasonCode: string): readonly [number, number] | null {
+  const edges = COST_GATE_SHORTFALL_BUCKETS_R;
+  if (edges.length < 3) return null;
+  const [near, mid, far] = edges as unknown as [number, number, number];
+  if (reasonCode === `shortfall_lt_${near.toFixed(2)}`) return [0, near];
+  if (reasonCode === `shortfall_${near.toFixed(2)}_${mid.toFixed(2)}`) return [near, mid];
+  if (reasonCode === `shortfall_${mid.toFixed(2)}_${far.toFixed(2)}`) return [mid, far];
+  if (reasonCode === `shortfall_gte_${far.toFixed(2)}`) return [far, Number.POSITIVE_INFINITY];
+  return null;
+}
+
+/**
+ * Recover the bar that a group of already-recorded flat-form decisions was
+ * actually measured against. PURE; reads nothing but the rows handed to it.
+ */
+export function impliedBarR(
+  rows: readonly ImpliedBarRRow[],
+  publishedBarR: number | null = null,
+): ImpliedBarR | null {
+  let lower: number | null = null;
+  let upper: number | null = null;
+  let rowsBlockedUsed = 0;
+  let rowsAdmittedUsed = 0;
+  let rowsUnusable = 0;
+
+  for (const row of rows) {
+    const gross = finite(row.grossR);
+    if (gross === null) {
+      rowsUnusable += 1;
+      continue;
+    }
+    if (!row.blocked) {
+      // `admit ⟺ grossR >= barR` ⇒ this row proves `barR <= grossR`.
+      rowsAdmittedUsed += 1;
+      upper = upper === null ? gross : Math.min(upper, gross);
+      continue;
+    }
+    const code = row.reasonCode;
+    if (code === null || TAPE_EXPECTANCY_PRE_COMPARISON_REASON_CODES.includes(code)) {
+      rowsUnusable += 1;
+      continue;
+    }
+    if (code === 'gross_negative') {
+      // The mean-negative override fires INSTEAD of a shortfall bucket, so it
+      // carries no width — all it proves is that the block branch was reached.
+      rowsBlockedUsed += 1;
+      lower = lower === null ? gross : Math.max(lower, gross);
+      continue;
+    }
+    const interval = shortfallInterval(code);
+    if (interval === null) {
+      rowsUnusable += 1;
+      continue;
+    }
+    rowsBlockedUsed += 1;
+    const lo = gross + interval[0];
+    lower = lower === null ? lo : Math.max(lower, lo);
+    if (Number.isFinite(interval[1])) {
+      const hi = gross + interval[1];
+      upper = upper === null ? hi : Math.min(upper, hi);
+    }
+  }
+
+  if (rowsBlockedUsed === 0 && rowsAdmittedUsed === 0) return null;
+
+  const EPS = 1e-9;
+  const consistent = lower === null || upper === null || lower <= upper + EPS;
+  const bar = finite(publishedBarR);
+  const excludes =
+    bar === null || !consistent
+      ? null
+      : (lower !== null && bar < lower - EPS) || (upper !== null && bar > upper + EPS);
+
+  return {
+    lowerBound: lower === null ? null : round6(lower),
+    upperBound: upper === null ? null : round6(upper),
+    rowsBlockedUsed,
+    rowsAdmittedUsed,
+    rowsUnusable,
+    consistent,
+    publishedBarR: bar,
+    excludesPublishedBarR: excludes,
+  };
+}
+
+function round6(n: number): number {
+  return Math.round(n * 1e6) / 1e6;
 }
