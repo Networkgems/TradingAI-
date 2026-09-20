@@ -218,7 +218,32 @@ export type LiveEnforceGate =
    * that happens to fail closed, and folding it into the ordinary refusal hides
    * a broken box inside a bucket that is supposed to be large.
    */
-  | 'setup_confirmation';
+  | 'setup_confirmation'
+  /**
+   * TRA-4752 (parent TRA-4750) — the SLEEVE STAND-DOWN roster, evaluated at the
+   * single audited live `buy_to_open` seam. The first gate on this roster that is
+   * a property of WHICH BOOK OF STRATEGY the order belongs to, rather than of the
+   * contract, the chain, the clock, the name, the book or the fleet.
+   *
+   * Its own gate for the reason every neighbour here is its own gate: ONLY A GATE
+   * CARRIES AN `evaluated` DENOMINATOR. And this one needs one more than most,
+   * because the state it exists to prevent has never been observed — a stood-down
+   * sleeve reaching live capital. The measurement that produced this gate
+   * (TRA-4752) was 30 days of `evaluated: 0` on every axis for `directional`,
+   * which had two byte-identical causes: the sleeve never ran live (it did not),
+   * and the sleeve ran live past no gate at all. A refusal with no denominator
+   * would re-create precisely that ambiguity one layer up.
+   *
+   * `scope` is the sleeve label. Recorded on BOTH verdicts — the admits are what
+   * separate "the roster is enforcing and nothing tried it" from "the roster is
+   * not wired in".
+   *
+   * `reasonCode` is `sleeve_stood_down` (named on the roster) or
+   * `sleeve_unattributable` (the open carried no readable sleeve, so it cannot be
+   * proven to be OFF the roster — fail closed; "could not tell" must never share
+   * an outcome with "checked and it is fine").
+   */
+  | 'sleeve_stand_down';
 
 /** One durable ARMED-LIVE enforcement decision — a write-through of the verdict. */
 export interface LiveEnforceRecord {
@@ -830,6 +855,15 @@ const GATES: LiveEnforceGate[] = [
   // `byReasonCode` histogram underneath says it is running on real inputs.
   // ⛔ `evaluated: 0` on this row is UNMEASURED, never a pass.
   'setup_confirmation',
+  // TRA-4752 (parent TRA-4750) — the SLEEVE STAND-DOWN roster. Listed for the
+  // deployed-bytes reason every row above is listed for, and here it is the
+  // WHOLE instrument: on a healthy box this gate's only possible rows are the
+  // admits of sleeves that are NOT stood down, so a build that shipped the
+  // refusal and a build that did not both render `blocked: 0`. The key's
+  // presence at `evaluated: 0` is what says the control shipped; nothing else
+  // on the payload can say it. ⛔ An ABSENT `sleeve_stand_down` row is the
+  // pre-TRA-4752 build, never a clean one.
+  'sleeve_stand_down',
 ];
 
 /**

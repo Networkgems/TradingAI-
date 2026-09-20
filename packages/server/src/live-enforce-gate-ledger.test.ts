@@ -87,6 +87,12 @@ describe('live-enforce-gate-ledger', () => {
       // backwards. The row's presence here at `evaluated: 0` is what says the
       // control shipped at all.
       'setup_confirmation',
+      // TRA-4752 (parent TRA-4750) — `sleeve_stand_down` joins. It leans on the
+      // deployed-bytes reason harder still: on a healthy box the ONLY rows it
+      // can produce are the admits of sleeves nobody stood down, so a build that
+      // shipped the refusal and a build that did not both render `blocked: 0`.
+      // This roster entry is the only thing that can tell them apart.
+      'sleeve_stand_down',
       'spread',
       // TRA-4144 — `underlying_asset_class` joins: the second NAME-axis gate,
       // and the only one keyed on what the name IS rather than whether it is

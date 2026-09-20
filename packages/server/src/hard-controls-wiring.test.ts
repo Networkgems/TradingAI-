@@ -155,15 +155,24 @@ describe('TRA-4650 — choke point bound at the live-options open seam', () => {
   it('an admitted open reaches the broker; the SAME row id re-admitted is a duplicate', async () => {
     const { engine, skips } = optionsSeamEngine();
     const opened = fakeOpened();
-    const first = await priv(engine).mirrorLiveOptionOpen(opened, (r) => skips.push(r));
+    // TRA-4752 — the sleeve is now load-bearing at this seam, one gate BELOW the
+    // hard controls: an open carrying no readable sleeve fails closed
+    // (`sleeve_unattributable`) and never reaches the submit, which would make
+    // this test's `toHaveBeenCalledTimes(1)` fail for a reason that has nothing
+    // to do with the choke point it grades. `single_leg_otm` is deliberately off
+    // the stand-down roster, so it admits — see `sleeve-stand-down.ts`. Every
+    // production caller of this seam passes a sleeve; this fixture did not.
+    const SLEEVE = { sleeve: 'single_leg_otm' as const };
+    const first = await priv(engine).mirrorLiveOptionOpen(opened, (r) => skips.push(r), SLEEVE);
     // The sentinel broker mock throws, so the seam voids the open — but it was
     // REACHED, which is what "admitted" means at this layer.
     expect(first).toBe(false);
     expect(submitSmartBuyToOpen).toHaveBeenCalledTimes(1);
     expect(skips.join(' ')).not.toContain('hard controls REFUSED');
+    expect(skips.join(' ')).not.toContain('sleeve stand-down REFUSED');
 
     skips.length = 0;
-    const second = await priv(engine).mirrorLiveOptionOpen({ ...opened }, (r) => skips.push(r));
+    const second = await priv(engine).mirrorLiveOptionOpen({ ...opened }, (r) => skips.push(r), SLEEVE);
     expect(second).toBe(false);
     expect(skips.join(' ')).toContain('duplicate_order');
     expect(submitSmartBuyToOpen).toHaveBeenCalledTimes(1);

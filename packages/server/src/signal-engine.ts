@@ -370,6 +370,7 @@ import {
 } from './option-spread-cost.js';
 import { recordLiveEnforceDecision, type LiveEnforceNominator } from './live-enforce-gate-ledger.js';
 import { resolveCanaryCeiling, gradeCanaryCeiling } from './canary-ceiling.js';
+import { gradeSleeveStandDown } from './sleeve-stand-down.js'; // TRA-4752
 import { admitOrderThroughHardControls } from './hard-controls.js'; // TRA-4650 (choke point: TRA-4655)
 // TRA-4657 — paper-trading tees at the alert-emitter seams (observe-only; the
 // recorders swallow their own throws and are inert while the flag is off).
@@ -13017,6 +13018,54 @@ export class SignalEngine {
         username: this.alertUsername ?? null,
       });
       tradierVoid(`hard controls REFUSED (${hardVerdict.reasonCode}): ${hardVerdict.reason}`, 'policy');
+      return false;
+    }
+
+    // TRA-4752 (parent TRA-4750) — THE SLEEVE STAND-DOWN, bound at the same
+    // single live `buy_to_open` seam as the canary ceiling and the hard
+    // controls, and for the same reason: every live option open passes here,
+    // whatever sleeve produced it.
+    //
+    // WHY IT IS HERE AND NOT HIGHER. TRA-4750 stood both option sleeves down,
+    // and TRA-4752 measured what was actually holding that ruling up: for
+    // `directional` it is `ENABLE_OPTION_LIVE_DIRECTIONAL` being unset — ONE
+    // environment variable, whose `OPTION_LIVE_TEST_UNTIL` conjunct is open
+    // until 2026-12-31 — checked at the TOP of `evaluateDemoDirectional`,
+    // which is upstream of every counter on this file. That is why
+    // `/api/health/live-enforce-gates` shows `directional: evaluated 0` on all
+    // 21 retained days: an honest zero produced by a gate that leaves no trace,
+    // which reads identically to no coverage at all. The remedy has to be a
+    // refusal the sleeve cannot route around, with its own denominator.
+    //
+    // ORDERED AFTER the canary record and the hard-controls call so neither
+    // loses its denominator and the TRA-4658 decision audit log still sees
+    // every order intent, and BEFORE the BP pre-checks and the broker submit so
+    // a refusal never reaches Tradier. Recorded on BOTH verdicts.
+    //
+    // ⚠️ OPENS ONLY — this seam does not carry closes, so standing a sleeve down
+    // can never strand a position that is already open.
+    const standDown = gradeSleeveStandDown(opts?.sleeve);
+    recordLiveEnforceDecision(
+      'sleeve_stand_down',
+      standDown.scope,
+      !standDown.allowed,
+      etDateString(new Date()),
+      standDown.reason,
+      Date.now(),
+      {
+        reasonCode: standDown.reasonCode,
+        book: this.alertUsername ?? null,
+      },
+    );
+    if (!standDown.allowed) {
+      log.warn('live option open REFUSED by sleeve stand-down (TRA-4752/TRA-4750)', {
+        optionSymbol: opened.optionSymbol,
+        sleeve: standDown.scope,
+        reasonCode: standDown.reasonCode,
+        ruling: standDown.ruling ?? null,
+        username: this.alertUsername ?? null,
+      });
+      tradierVoid(standDown.reason!, 'policy');
       return false;
     }
 

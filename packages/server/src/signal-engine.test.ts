@@ -7334,14 +7334,32 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
     expect(stub.waitForOrderTerminalStatus).not.toHaveBeenCalled();
   });
 
-  it('live + flag ON (armed) — opens a live directional long AND mirrors a real buy_to_open', async () => {
+  // ⚠️ TRA-4752 (parent TRA-4750) — THIS TEST USED TO ASSERT THE OPPOSITE, and
+  // that is the whole point of it now.
+  //
+  // Until 2026-09-20 it read "opens a live directional long AND mirrors a real
+  // buy_to_open", and it PASSED — which made it the executable statement of the
+  // hazard TRA-4752 was raised to measure. `/api/health/live-enforce-gates`
+  // showed `directional: evaluated 0` on all 21 retained ET days, and that zero
+  // had two byte-identical causes: the sleeve never ran live (it did not — the
+  // TRA-3080 arm census reads `live_arm_off` 21/21), or it ran live past no gate
+  // at all. This test proved the second was reachable: flip one environment
+  // variable and a real `buy_to_open` lands, having crossed 4 of the 14 live
+  // gates. TRA-4750 had already ruled `directional` may not carry live capital.
+  //
+  // So the arm is still what this test exercises — it must still REACH the order
+  // seam, or the assertion below would pass for the wrong reason (turned away
+  // upstream, as it is in production today). The `sleeve_stand_down` block is
+  // what proves it got there.
+  it('live + flag ON (armed) — REACHES the order seam and is refused there by the sleeve stand-down (TRA-4752)', async () => {
     process.env[OPTION_LIVE_DIRECTIONAL_FLAG] = '1';
     // TRA-4288 — the arm is flag AND OPTION_LIVE_TEST_UNTIL window; open it.
     process.env[OPTION_LIVE_TEST_UNTIL_VAR] = FAR_FUTURE_TEST_UNTIL;
     const stub: DirLiveStub = {
       getAccountBalance: vi.fn().mockResolvedValue({ totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000 }),
       // Tight quote around the ATM call mark (~0.9 — see chainRows/TRA-3872) so
-      // the smart-open walk fills inside the <=$100 canary ceiling.
+      // the smart-open walk would fill inside the <=$100 canary ceiling. Kept
+      // deliberately: the stand-down must be what refuses, not the ceiling.
       getOptionQuote: vi.fn().mockResolvedValue({ symbol: 'UPPC100', bid: 0.86, ask: 0.94 }),
       buyContractsLimit: vi.fn().mockResolvedValue({ id: 55, status: 'ok' }),
       cancelOrder: vi.fn(),
@@ -7350,17 +7368,29 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
     const svc = scannerFor({ UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainRows('UPP', 100, 0.45, 0.9) } });
     const engine = liveDirEngine(svc, stub);
     seedTrend(engine, 'UPP', sawUp(480));
+    // The ledger is module-global and this suite's other live tests feed it, so
+    // the exact counts below are only meaningful from a cleared start.
+    clearLiveEnforceGateLedger();
 
     await run(engine, ['UPP']);
 
-    // The built live path both opened a live-book position and placed a REAL order.
-    const open = engine.getState().options.openOptions;
-    expect(open).toHaveLength(1);
-    expect(open[0].optionType).toBe('call');
-    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+    // ⭐ No live position, and no order ever reached Tradier.
+    expect(engine.getState().options.openOptions).toHaveLength(0);
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+
+    // ⭐ THE DISCRIMINATOR. A `buyContractsLimit` that was never called reads
+    // identically for "refused AT the seam" and "never got near the seam", and
+    // the second is the pre-fix production state. The gate row says which: it is
+    // recorded INSIDE `mirrorLiveOptionOpen`, so its presence is proof the pass
+    // ran the whole funnel and was stopped at the money.
+    const gates = summarizeLiveEnforceGate('1970-01-01').retained.byGate;
+    const standDown = gates.find((g) => g.gate === 'sleeve_stand_down');
+    expect(standDown).toMatchObject({ evaluated: 1, blocked: 1 });
+    expect(standDown!.byScope?.find((s) => s.scope === 'single_leg_directional'))
+      .toMatchObject({ evaluated: 1, blocked: 1 });
   });
 
-  it('live + flag ON but broker rejects — voids the open and surfaces a live skip-reason (no phantom fill)', async () => {
+  it('live + flag ON — the stand-down refusal is SURFACED as a live skip-reason, not a silent quiet (TRA-4752)', async () => {
     process.env[OPTION_LIVE_DIRECTIONAL_FLAG] = '1';
     // TRA-4288 — the arm is flag AND OPTION_LIVE_TEST_UNTIL window; open it.
     process.env[OPTION_LIVE_TEST_UNTIL_VAR] = FAR_FUTURE_TEST_UNTIL;
@@ -7380,15 +7410,22 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
     await run(engine, ['UPP']);
 
     const state = engine.getState();
-    // The mirror submitted, Tradier canceled → the paper open is rolled back.
-    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+    // TRA-4752 — the sleeve stand-down now refuses AHEAD of the submit, so the
+    // broker never sees this order and the cancel branch is unreachable from the
+    // directional path. The seam-level broker-reject rollback it used to grade is
+    // still covered on the OTM/RV path (`tra3486-unbacked-live-open.test.ts`,
+    // `hard-controls-wiring.test.ts`).
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
     expect(state.options.openOptions).toHaveLength(0);
     expect(state.options.dailyOptionsCount).toBe(0);
-    // The suppressed signal is surfaced with a live skip reason, not silently dropped.
+    // What this test uniquely still grades: the refusal is SURFACED, not silently
+    // dropped. A stand-down that made the sleeve merely go quiet would be the
+    // TRA-4752 defect again — a refusal nobody can see from outside.
     const surfaced = state.signals.find(s => s.liveSkipReason);
     expect(surfaced).toBeDefined();
     expect(surfaced!.mode).toBe('live');
-    expect(surfaced!.liveSkipReason).toMatch(/rejected|insufficient/i);
+    expect(surfaced!.liveSkipReason).toMatch(/TRA-4752/);
+    expect(surfaced!.liveSkipReason).toMatch(/TRA-4750/);
   });
 
   it('live + flag ON but OPTION_LIVE_TEST_UNTIL unset — the arm stays closed at the ORDER SITE (TRA-4288): no open, no broker call', async () => {
@@ -8291,7 +8328,15 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
     // because a gate that only appears once it blocks cannot be graded on a
     // quiet day. Same discipline: named row, exact total.
     expect(retained.find((g) => g.gate === 'setup_confirmation')).toMatchObject({ evaluated: 1, blocked: 0 });
-    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(9);
+    // TRA-4752 — and a TENTH: the SLEEVE STAND-DOWN records at the open seam.
+    // `single_leg_otm` is deliberately off that roster (see `sleeve-stand-down.ts`
+    // — its live arm is ON, and nine of the gates above sit UPSTREAM of the seam
+    // on this path), so this is an ADMIT. ⭐ This row is also what keeps that
+    // gate's denominator non-zero: the sleeves it REFUSES produce no traffic, so
+    // without an admitting sleeve "enforcing and nothing tried it" and "not
+    // wired in" would be the same JSON.
+    expect(retained.find((g) => g.gate === 'sleeve_stand_down')).toMatchObject({ evaluated: 1, blocked: 0 });
+    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(10);
   });
 
   // ─── TRA-3942 — the ORDERING claim, graded BEHAVIOURALLY ────────────────────
