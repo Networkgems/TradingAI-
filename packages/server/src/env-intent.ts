@@ -68,9 +68,9 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
   },
   {
     key: 'ENABLE_OPTION_LIVE_OTM',
-    intended: 'on',
+    intended: 'off',
     provenance:
-      'TRA-2877 standing arm ("keep Live Production trading going with the OTM Mispricing"); raw flag only — the window (OPTION_LIVE_TEST_UNTIL) is ops-renewed and graded at /api/health/live-options-fee-slippage',
+      'TRA-4750 item 3 (2026-09-20): `single_leg_otm` STAND DOWN — SUPERSEDES the TRA-2877 standing arm, which is what this row read until 2026-09-22. Executed on bqb1 by TRA-4785 (env -> false + pinned same-window deploy). RE-ARMING NEEDS BOARD SIGN-OFF (TRA-4750 item 5): standing down is the risk-reducing direction and needed none; resuming is not. Do NOT "resolve" a mismatch here by flipping this row back — an `on` reading IS the event to escalate.',
     resolve: (env) => (isOptionLiveOtmEnabled(env) ? 'on' : 'off'),
   },
   {
