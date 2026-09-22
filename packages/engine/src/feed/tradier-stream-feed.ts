@@ -32,6 +32,27 @@ export interface StreamQuote extends MarketQuote {
 export { quoteFreshness };
 export type { SymbolFreshness };
 
+/**
+ * TRA-4782 — a halted book and a 40-second backlog are byte-identical here.
+ *
+ * `eventTime = max(biddate, askdate)`, so a ticker that stopped trading in May
+ * produces a `latencyMs` of 125 **days** off the connect-time snapshot
+ * (measured: FLYYQ, `eventTime` 2026-05-21; ANY/ATAI/APGE the same shape).
+ * Folded into `maxLatencyMs` / `quotesOverLatencyBudget` that is
+ * indistinguishable from extreme feed latency, and it is what put
+ * `quotesOverLatencyBudget` at 79.2% while the real p50 was ~40s.
+ *
+ * Rows beyond this bound are therefore **segregated, not clamped**: excluded
+ * from the latency statistics and counted in their own cell, where they stay
+ * legible. 10 minutes sits far above any plausible transport backlog (the
+ * incident itself was 46s) and far below a halted book's staleness, so the two
+ * populations cannot mix.
+ */
+export const DEFAULT_LATENCY_SANITY_BOUND_MS = 600_000;
+
+/** Ring size for the p50/p95 sample. ~1085 quotes/sec live, so this is a trailing ~5s. */
+export const DEFAULT_LATENCY_SAMPLE_CAPACITY = 5000;
+
 export interface TradierStreamStatus {
   state: StreamConnectionState;
   /** Monotone count of reconnect attempts since start(). */
@@ -42,11 +63,35 @@ export interface TradierStreamStatus {
   lastMessageAt: number | null;
   lastError: string | null;
   staleAfterMs: number;
-  /** Quotes whose latency exceeded `latencyBudgetMs`, of `quotesReceived`. */
+  /** Every quote frame accepted — graded or segregated. */
   quotesReceived: number;
+  /**
+   * Rows whose `latencyMs` entered the statistics below. This is the denominator
+   * for `quotesOverLatencyBudget` — **not** `quotesReceived`.
+   *
+   * Invariant: `quotesReceived === quotesLatencyGraded + quotesWithStaleEventTime
+   * + quotesWithFutureEventTime`. A suppressed row is always countable.
+   */
+  quotesLatencyGraded: number;
+  /** Segregated: exchange stamp older than `latencySanityBoundMs` — a halted/delisted book, not latency. */
+  quotesWithStaleEventTime: number;
+  /** Segregated the other way: stamp AHEAD of receipt by more than the bound — bad vendor data or gross skew. */
+  quotesWithFutureEventTime: number;
+  /** Quotes over `latencyBudgetMs`, of `quotesLatencyGraded`. */
   quotesOverLatencyBudget: number;
   latencyBudgetMs: number;
+  latencySanityBoundMs: number;
+  /** Over graded rows only. `null` = nothing graded yet — never 0. */
   maxLatencyMs: number | null;
+  /**
+   * Percentiles over the trailing `latencySampleSize` graded rows — a moving
+   * window, NOT a since-boot fold. `null` when the sample is empty; a `0` here
+   * is a real measurement, so never read these through `?? 0`.
+   */
+  latencyP50Ms: number | null;
+  latencyP95Ms: number | null;
+  latencySampleSize: number;
+  latencySampleCapacity: number;
   symbols: SymbolFreshness[];
 }
 
@@ -91,6 +136,14 @@ export interface TradierStreamFeedOptions {
   staleAfterMs?: number;
   /** Latency above this is counted as over budget. Default 500ms. */
   latencyBudgetMs?: number;
+  /**
+   * TRA-4782 — |latencyMs| beyond this is a broken exchange stamp, not latency.
+   * Such rows are segregated into their own counter and excluded from the
+   * latency statistics. Default {@link DEFAULT_LATENCY_SANITY_BOUND_MS}.
+   */
+  latencySanityBoundMs?: number;
+  /** Trailing sample size for latencyP50Ms/latencyP95Ms. Default {@link DEFAULT_LATENCY_SAMPLE_CAPACITY}. */
+  latencySampleCapacity?: number;
 }
 
 interface RawQuoteFrame {
@@ -131,6 +184,8 @@ export class TradierStreamFeed extends EventEmitter {
   private readonly heartbeatTimeoutMs: number;
   private readonly staleAfterMs: number;
   private readonly latencyBudgetMs: number;
+  private readonly latencySanityBoundMs: number;
+  private readonly latencySampleCapacity: number;
 
   private ws: WebSocket | null = null;
   private state: StreamConnectionState = 'disconnected';
@@ -147,8 +202,14 @@ export class TradierStreamFeed extends EventEmitter {
   private lastMessageAt: number | null = null;
   private lastError: string | null = null;
   private quotesReceived = 0;
+  private quotesLatencyGraded = 0;
+  private quotesStaleEventTime = 0;
+  private quotesFutureEventTime = 0;
   private quotesOverBudget = 0;
   private maxLatencyMs: number | null = null;
+  /** Fixed-size ring of graded latencies; `latencySampleCount` caps at the capacity. */
+  private latencySample: number[] = [];
+  private latencySampleNext = 0;
   private readonly lastQuote = new Map<string, StreamQuote>();
 
   constructor(opts: TradierStreamFeedOptions) {
@@ -163,6 +224,8 @@ export class TradierStreamFeed extends EventEmitter {
     this.heartbeatTimeoutMs = opts.heartbeatTimeoutMs ?? 25_000;
     this.staleAfterMs = opts.staleAfterMs ?? QUOTE_STALE_AFTER_MS;
     this.latencyBudgetMs = opts.latencyBudgetMs ?? 500;
+    this.latencySanityBoundMs = opts.latencySanityBoundMs ?? DEFAULT_LATENCY_SANITY_BOUND_MS;
+    this.latencySampleCapacity = Math.max(1, opts.latencySampleCapacity ?? DEFAULT_LATENCY_SAMPLE_CAPACITY);
     this.delayMs = this.initialDelay;
   }
 
@@ -207,11 +270,31 @@ export class TradierStreamFeed extends EventEmitter {
       lastError: this.lastError,
       staleAfterMs: this.staleAfterMs,
       quotesReceived: this.quotesReceived,
+      quotesLatencyGraded: this.quotesLatencyGraded,
+      quotesWithStaleEventTime: this.quotesStaleEventTime,
+      quotesWithFutureEventTime: this.quotesFutureEventTime,
       quotesOverLatencyBudget: this.quotesOverBudget,
       latencyBudgetMs: this.latencyBudgetMs,
+      latencySanityBoundMs: this.latencySanityBoundMs,
       maxLatencyMs: this.maxLatencyMs,
+      latencyP50Ms: this.latencyPercentile(0.5),
+      latencyP95Ms: this.latencyPercentile(0.95),
+      latencySampleSize: this.latencySample.length,
+      latencySampleCapacity: this.latencySampleCapacity,
       symbols: [...this.lastQuote.values()].map((q) => quoteFreshness(q, now, this.staleAfterMs)),
     };
+  }
+
+  /**
+   * Nearest-rank percentile over the trailing sample. `null` on an empty sample
+   * — an unmeasured percentile must not read as `0`, which is a plausible value.
+   */
+  private latencyPercentile(p: number): number | null {
+    const n = this.latencySample.length;
+    if (n === 0) return null;
+    const sorted = [...this.latencySample].sort((a, b) => a - b);
+    const idx = Math.min(n - 1, Math.max(0, Math.ceil(p * n) - 1));
+    return sorted[idx];
   }
 
   private async connect(): Promise<void> {
@@ -329,10 +412,30 @@ export class TradierStreamFeed extends EventEmitter {
       latencyMs,
     };
     this.quotesReceived++;
-    if (latencyMs > this.latencyBudgetMs) this.quotesOverBudget++;
-    if (this.maxLatencyMs == null || latencyMs > this.maxLatencyMs) this.maxLatencyMs = latencyMs;
+    // TRA-4782 — segregate a broken exchange stamp from real latency. The row is
+    // still emitted and still lands in `lastQuote`; it is only kept out of the
+    // statistics, and it is counted where a reader can see it.
+    if (latencyMs > this.latencySanityBoundMs) {
+      this.quotesStaleEventTime++;
+    } else if (latencyMs < -this.latencySanityBoundMs) {
+      this.quotesFutureEventTime++;
+    } else {
+      this.quotesLatencyGraded++;
+      if (latencyMs > this.latencyBudgetMs) this.quotesOverBudget++;
+      if (this.maxLatencyMs == null || latencyMs > this.maxLatencyMs) this.maxLatencyMs = latencyMs;
+      this.recordLatencySample(latencyMs);
+    }
     this.lastQuote.set(f.symbol, quote);
     this.emit('quote', quote);
+  }
+
+  private recordLatencySample(latencyMs: number): void {
+    if (this.latencySample.length < this.latencySampleCapacity) {
+      this.latencySample.push(latencyMs);
+      return;
+    }
+    this.latencySample[this.latencySampleNext] = latencyMs;
+    this.latencySampleNext = (this.latencySampleNext + 1) % this.latencySampleCapacity;
   }
 
   private handleTrade(f: RawTradeFrame): void {

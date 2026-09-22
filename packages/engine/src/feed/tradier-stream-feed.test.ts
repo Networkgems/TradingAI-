@@ -135,8 +135,78 @@ describe('TradierStreamFeed', () => {
     ws.pushText(`{"type":"quote","symbol":"SPY","bid":1,"ask":2,"askdate":"${clock - 900}"}`);
     const s = feed.getStatus();
     expect(s.quotesReceived).toBe(2);
+    expect(s.quotesLatencyGraded).toBe(2);
     expect(s.quotesOverLatencyBudget).toBe(1);
     expect(s.maxLatencyMs).toBe(900);
+    feed.stop();
+  });
+
+  // TRA-4782 — the defect: `eventTime = max(biddate, askdate)`, so a halted book
+  // reads as 125 days of "latency" and is byte-identical to a broken feed.
+  it('segregates a halted book from feed latency instead of clamping it', async () => {
+    const feed = makeFeed();
+    feed.start();
+    await settle();
+    const ws = FakeWebSocket.instances[0];
+    ws.pushOpen();
+
+    // Two live rows either side of the 500ms budget …
+    ws.pushText(`{"type":"quote","symbol":"SPY","bid":1,"ask":2,"askdate":"${clock - 100}"}`);
+    ws.pushText(`{"type":"quote","symbol":"QQQ","bid":1,"ask":2,"askdate":"${clock - 900}"}`);
+    // … and the FLYYQ shape: an exchange stamp four months old.
+    ws.pushText(`{"type":"quote","symbol":"FLYYQ","bid":1,"ask":2,"askdate":"${clock - 125 * 86_400_000}"}`);
+    // … and the same defect pointing the other way: a stamp from the future.
+    ws.pushText(`{"type":"quote","symbol":"BADTS","bid":1,"ask":2,"askdate":"${clock + 3_600_000}"}`);
+
+    const s = feed.getStatus();
+    expect(s.quotesReceived).toBe(4);
+    expect(s.quotesWithStaleEventTime).toBe(1);
+    expect(s.quotesWithFutureEventTime).toBe(1);
+    expect(s.quotesLatencyGraded).toBe(2);
+    // The invariant: a suppressed row is never silently dropped.
+    expect(s.quotesLatencyGraded + s.quotesWithStaleEventTime + s.quotesWithFutureEventTime).toBe(s.quotesReceived);
+    // maxLatencyMs is the WHOLE point — pre-fix this read 10800000000.
+    expect(s.maxLatencyMs).toBe(900);
+    expect(s.quotesOverLatencyBudget).toBe(1);
+    // The segregated rows still carry their true per-row latency for a reader.
+    const flyyq = s.symbols.find((r) => r.symbol === 'FLYYQ');
+    expect(flyyq?.latencyMs).toBe(125 * 86_400_000);
+    expect(s.latencySanityBoundMs).toBe(600_000);
+    feed.stop();
+  });
+
+  it('publishes p50/p95 over the graded rows, and null — never 0 — before any land', async () => {
+    const feed = makeFeed({ latencySampleCapacity: 4 });
+    feed.start();
+    await settle();
+    const ws = FakeWebSocket.instances[0];
+    ws.pushOpen();
+
+    // An unmeasured percentile must be null: 0ms latency is a plausible value.
+    const empty = feed.getStatus();
+    expect(empty.latencyP50Ms).toBeNull();
+    expect(empty.latencyP95Ms).toBeNull();
+    expect(empty.latencySampleSize).toBe(0);
+    expect(empty.latencySampleCapacity).toBe(4);
+
+    for (const lat of [10, 20, 30, 40]) {
+      ws.pushText(`{"type":"quote","symbol":"S${lat}","bid":1,"ask":2,"askdate":"${clock - lat}"}`);
+    }
+    // nearest-rank: p50 of [10,20,30,40] = index ceil(.5*4)-1 = 1 → 20; p95 = index 3 → 40.
+    expect(feed.getStatus()).toMatchObject({ latencyP50Ms: 20, latencyP95Ms: 40, latencySampleSize: 4 });
+
+    // The sample is a TRAILING window, not a since-boot fold: the ring wraps.
+    for (const lat of [1000, 1100, 1200, 1300]) {
+      ws.pushText(`{"type":"quote","symbol":"T${lat}","bid":1,"ask":2,"askdate":"${clock - lat}"}`);
+    }
+    const s = feed.getStatus();
+    expect(s.latencySampleSize).toBe(4);
+    expect(s.latencyP50Ms).toBe(1100);
+    // maxLatencyMs, by contrast, is a since-boot high-water mark and does NOT decay.
+    expect(s.maxLatencyMs).toBe(1300);
+    // A halted book must not enter the sample either.
+    ws.pushText(`{"type":"quote","symbol":"FLYYQ","bid":1,"ask":2,"askdate":"${clock - 125 * 86_400_000}"}`);
+    expect(feed.getStatus().latencyP95Ms).toBe(1300);
     feed.stop();
   });
 

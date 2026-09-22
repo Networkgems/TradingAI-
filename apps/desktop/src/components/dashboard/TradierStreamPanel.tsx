@@ -25,6 +25,12 @@ export interface StreamSymbolRow {
   eventTime: number | null;
   receivedAt: number | null;
   latencyMs: number | null;
+  /**
+   * TRA-4782. THREE-VALUED on purpose: `undefined` = a server that predates this
+   * field, `false` = measured and the stamp is sane, `true` = a halted/delisted
+   * book. Never collapse the first two — "not published" is not "fine".
+   */
+  staleEventTime?: boolean;
 }
 
 // Mirror of the server `TradierStreamPayload` (packages/server/src/tradier-stream-status.ts).
@@ -37,6 +43,9 @@ export type StreamPayload =
       flagOn: boolean;
       staleAfterMs: number;
       generatedAt: number;
+      symbolLimit?: number | null;
+      symbolLimitRaw?: string | null;
+      symbolLimitError?: string | null;
     }
   | {
       enabled: true;
@@ -58,6 +67,23 @@ export type StreamPayload =
       staleSymbols: number;
       generatedAt: number;
       symbols: StreamSymbolRow[];
+      // TRA-4782. All optional, and all three-valued when read: `undefined` = the
+      // server predates the field, `null` = published but unmeasured, number = a
+      // measurement. `?? 0` on any of these re-creates the bug this closes.
+      quotesLatencyGraded?: number;
+      quotesWithStaleEventTime?: number;
+      quotesWithFutureEventTime?: number;
+      latencySanityBoundMs?: number;
+      latencyP50Ms?: number | null;
+      latencyP95Ms?: number | null;
+      latencySampleSize?: number;
+      latencySampleCapacity?: number;
+      symbolsBeforeLimit?: number;
+      symbolLimit?: number | null;
+      symbolLimitRaw?: string | null;
+      symbolLimitError?: string | null;
+      symbolsFromLadder?: number;
+      symbolsOffLadder?: number;
     };
 
 const POLL_MS = 1000;
@@ -103,6 +129,21 @@ export interface StreamRowView {
   ageMs: number | null;
   stale: boolean;
   neverQuoted: boolean;
+  /** TRA-4782 — see {@link StreamSymbolRow.staleEventTime}; `undefined` means the server did not say. */
+  staleEventTime?: boolean;
+}
+
+/**
+ * TRA-4782 — render a latency cell without collapsing its three states.
+ *
+ * `undefined` is a server that never published the field; `null` is a server
+ * that published it and had nothing to measure. Those are different facts, and
+ * the whole ticket is about two different facts landing in one cell.
+ */
+export function formatLatencyCell(v: number | null | undefined): string {
+  if (v === undefined) return 'not published';
+  if (v === null) return 'no sample';
+  return `${v}ms`;
 }
 
 /**
@@ -114,14 +155,14 @@ export function gradeStreamRows(payload: StreamPayload, fetchedAtLocal: number, 
   const serverNow = payload.generatedAt + Math.max(0, localNow - fetchedAtLocal);
   return payload.symbols.map((row) => {
     if (row.neverQuoted || row.eventTime == null) {
-      return { symbol: row.symbol, ageMs: null, stale: true, neverQuoted: true };
+      return { symbol: row.symbol, ageMs: null, stale: true, neverQuoted: true, staleEventTime: row.staleEventTime };
     }
     const f = quoteFreshness(
       { symbol: row.symbol, eventTime: row.eventTime, receivedAt: row.receivedAt ?? row.eventTime, latencyMs: row.latencyMs ?? 0 },
       serverNow,
       payload.staleAfterMs ?? QUOTE_STALE_AFTER_MS,
     );
-    return { symbol: row.symbol, ageMs: f.ageMs, stale: f.stale, neverQuoted: false };
+    return { symbol: row.symbol, ageMs: f.ageMs, stale: f.stale, neverQuoted: false, staleEventTime: row.staleEventTime };
   });
 }
 
@@ -174,13 +215,50 @@ export function TradierStreamBody({
             <div className="health-row">
               <span className="health-row-label">Quotes (over {payload.latencyBudgetMs}ms latency)</span>
               <span className={`health-row-value${payload.quotesOverLatencyBudget > 0 ? ' health-warn' : ''}`}>
-                {payload.quotesReceived} ({payload.quotesOverLatencyBudget})
+                {payload.quotesReceived} ({payload.quotesOverLatencyBudget}
+                {payload.quotesLatencyGraded === undefined ? '' : ` of ${payload.quotesLatencyGraded} graded`})
+              </span>
+            </div>
+            {/* TRA-4782 — p50/p95 are the AC's instrument. `maxLatencyMs` is a
+                since-boot high-water mark and is NOT one: a single halted book
+                pinned it at 125 days while the real p50 was ~40s. */}
+            <div className="health-row">
+              <span className="health-row-label">Latency p50 / p95</span>
+              <span className="health-row-value" data-testid="stream-latency-percentiles">
+                {formatLatencyCell(payload.latencyP50Ms)} / {formatLatencyCell(payload.latencyP95Ms)}
+                {payload.latencySampleSize === undefined ? '' : ` (n=${payload.latencySampleSize})`}
               </span>
             </div>
             <div className="health-row">
-              <span className="health-row-label">Max latency</span>
-              <span className="health-row-value">{payload.maxLatencyMs == null ? '—' : `${payload.maxLatencyMs}ms`}</span>
+              <span className="health-row-label">Max latency (since boot)</span>
+              <span className="health-row-value">{formatLatencyCell(payload.maxLatencyMs)}</span>
             </div>
+            {payload.quotesWithStaleEventTime !== undefined && (
+              <div className="health-row">
+                <span className="health-row-label">Excluded — broken exchange stamp</span>
+                <span className="health-row-value" data-testid="stream-stale-eventtime">
+                  {payload.quotesWithStaleEventTime} stale
+                  {payload.quotesWithFutureEventTime === undefined ? '' : ` · ${payload.quotesWithFutureEventTime} future`}
+                </span>
+              </div>
+            )}
+            {payload.symbolsBeforeLimit !== undefined && (
+              <div className="health-row">
+                <span className="health-row-label">Subscribed / fleet union</span>
+                <span className="health-row-value" data-testid="stream-symbol-limit">
+                  {payload.subscribedSymbols} / {payload.symbolsBeforeLimit}
+                  {payload.symbolLimit == null ? ' (no cap)' : ` (cap ${payload.symbolLimit})`}
+                </span>
+              </div>
+            )}
+            {payload.symbolLimitError && (
+              <div className="health-row">
+                <span className="health-row-label">Symbol cap</span>
+                <span className="health-row-value health-bad" data-testid="stream-symbol-limit-error">
+                  {payload.symbolLimitError}
+                </span>
+              </div>
+            )}
             <div className="health-row">
               <span className="health-row-label">Stale (&gt;{payload.staleAfterMs / 1000}s)</span>
               <span className={`health-row-value${staleNow > 0 ? ' health-warn' : ' health-ok'}`} data-testid="stream-stale-count">
@@ -202,11 +280,18 @@ export function TradierStreamBody({
               </thead>
               <tbody>
                 {rows.map((r) => (
-                  <tr key={r.symbol} data-testid={`stream-row-${r.symbol}`} data-stale={r.stale ? 'true' : 'false'}>
+                  <tr
+                    key={r.symbol}
+                    data-testid={`stream-row-${r.symbol}`}
+                    data-stale={r.stale ? 'true' : 'false'}
+                    data-stale-eventtime={r.staleEventTime === undefined ? 'unknown' : String(r.staleEventTime)}
+                  >
                     <td>{r.symbol}</td>
                     <td className={r.stale ? 'health-bad' : 'health-ok'}>
                       {formatQuoteAge(r.ageMs)}
                       {r.stale ? ' · stale' : ''}
+                      {/* Not "the feed is 125 days late" — this book stopped trading. */}
+                      {r.staleEventTime === true ? ' · halted book (excluded from latency)' : ''}
                     </td>
                   </tr>
                 ))}

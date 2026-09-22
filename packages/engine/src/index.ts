@@ -153,7 +153,13 @@ export { AlpacaOptionsClient } from './alpaca/index.js';
 export type { AlpacaOptionsContract, AlpacaOptionOrderResponse } from './alpaca/index.js';
 export { TradierFeed } from './feed/index.js';
 export type { TradierFeedEvents } from './feed/index.js';
-export { TradierStreamFeed, quoteFreshness } from './feed/index.js';
+export {
+  TradierStreamFeed,
+  quoteFreshness,
+  // TRA-4782 — the bound that segregates a halted book from real feed latency.
+  DEFAULT_LATENCY_SANITY_BOUND_MS,
+  DEFAULT_LATENCY_SAMPLE_CAPACITY,
+} from './feed/index.js';
 export type {
   TradierStreamFeedEvents,
   TradierStreamFeedOptions,
