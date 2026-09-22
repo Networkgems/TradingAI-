@@ -1,4 +1,4 @@
-// TRA-4652 (parent TRA-4645) — Setup Scoring & Confidence Calibration.
+// TRA-4779 (parent TRA-4645) — Setup Scoring & Confidence Calibration.
 //
 // Ranks setups by HISTORICAL EXPECTANCY AFTER FEES/SLIPPAGE, not by indicator
 // agreement, and produces the calibrated confidence verdict the TRA-4649 card
@@ -41,7 +41,7 @@
 //  - Statistics conventions match the shipped tape-expectancy fold
 //    (option-tape-expectancy.ts): sample SD (n−1), SE = sd/√n (null at n<2),
 //    lowerCI95 = mean − 1.96·SE, and `calibrated ⟺ n ≥ 30` — the acceptance
-//    floor stated on TRA-4652 verbatim.
+//    floor stated on TRA-4779 verbatim.
 //
 // This module DECIDES NOTHING about capital. It measures, ranks and labels;
 // admission stays with the cost bar and the TRA-4651 lifecycle gates.
@@ -503,8 +503,21 @@ export interface SetupConfidence {
   validated: true;
 }
 
+/**
+ * TRA-4788 — which gate the lookup landed on. This is what `confidence: null`
+ * cannot say by itself: 'no_instances' (the index holds no history for this
+ * setup), 'below_floor' (rows exist, the instance floor was tested and
+ * missed), 'oos_failed' (floor cleared, out-of-sample validation did not).
+ * The state where no index was ever built cannot be expressed here — this
+ * function requires an index to run — so the card layer stamps that one
+ * 'not_run' without calling in.
+ */
+export type CalibrationOutcome = 'no_instances' | 'below_floor' | 'oos_failed' | 'calibrated';
+
 export interface ConfidenceLookup {
   confidence: SetupConfidence | null;
+  /** TRA-4788 — the gate verdict; `confidence` is non-null iff 'calibrated'. */
+  status: CalibrationOutcome;
   /** Why null, when null — one line per failed gate. */
   reasons: string[];
 }
@@ -550,7 +563,11 @@ export function confidenceFor(
 ): ConfidenceLookup {
   const setup = index.setups[setupKey];
   if (!setup) {
-    return { confidence: null, reasons: [`no historical instances for setup '${setupKey}'`] };
+    return {
+      confidence: null,
+      status: 'no_instances',
+      reasons: [`no historical instances for setup '${setupKey}'`],
+    };
   }
   const reasons: string[] = [];
   if (currentRegime !== null) {
@@ -565,10 +582,13 @@ export function confidenceFor(
       );
     } else {
       const verdict = cellVerdict(setupKey, 'regime', currentRegime, rc.cell);
-      if (verdict) return { confidence: verdict, reasons };
+      if (verdict) return { confidence: verdict, status: 'calibrated', reasons };
     }
   }
   if (!setup.confidenceEligible) {
+    // Floor first: an uncalibrated pooled cell means the floor itself was
+    // missed; OOS is only the verdict when the floor was actually cleared.
+    const status: CalibrationOutcome = !setup.pooled.calibrated ? 'below_floor' : 'oos_failed';
     if (!setup.pooled.calibrated) {
       reasons.push(`pooled n ${setup.pooled.n} < instance floor — not calibrated`);
     }
@@ -576,14 +596,17 @@ export function confidenceFor(
     if (setup.oos.attempted && !setup.oos.validated && setup.oos.reasons.length === 0) {
       reasons.push('out-of-sample validation failed');
     }
-    return { confidence: null, reasons };
+    return { confidence: null, status, reasons };
   }
   const verdict = cellVerdict(setupKey, 'pooled', null, setup.pooled);
   if (!verdict) {
+    // A calibrated cell with null statistics should be unreachable; grade it
+    // as the floor gate (the cell could not produce a validated number) and
+    // let the reason line carry the exact cause.
     reasons.push('pooled cell statistics unavailable');
-    return { confidence: null, reasons };
+    return { confidence: null, status: 'below_floor', reasons };
   }
-  return { confidence: verdict, reasons };
+  return { confidence: verdict, status: 'calibrated', reasons };
 }
 
 // ── Ranking ─────────────────────────────────────────────────────────────────

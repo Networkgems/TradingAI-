@@ -137,7 +137,7 @@ export interface PanelActions {
   autoExecute: PanelActionEntry;
 }
 
-/** TRA-4652 calibrated verdict — present only when validated; never invented. */
+/** TRA-4779 calibrated verdict — present only when validated; never invented. */
 export interface PanelConfidence {
   displayWinRatePct: number;
   n: number;
@@ -186,6 +186,15 @@ export interface DecisionPanelPayload {
   /** Optional on the wire so a pre-TRA-4719 server still parses. */
   reasonsNotToEnter?: PanelReasonsNotToEnter;
   confidence: PanelConfidence | null;
+  /**
+   * TRA-4788 — WHY `confidence` is what it is. 'not_run' = calibration has
+   * never run on this build (no index in the build context) — a different
+   * claim from 'below_floor', where rows were folded and the floor was tested
+   * and missed. Absent ⇒ the server build predates the stamp: say "unknown",
+   * never assert a branch.
+   */
+  calibrationStatus?: 'not_run' | 'no_instances' | 'below_floor' | 'oos_failed' | 'calibrated';
+  calibrationReasons?: string[];
   actions: PanelActions;
   complete: boolean;
   incompleteSections: string[];

@@ -1144,6 +1144,38 @@ export type EngineEventHandler = (state: EngineState) => void;
 
 const MAX_SIGNALS = 50;
 
+/**
+ * TRA-4788 — every card-eligible signal family, as a RUNTIME list. The
+ * `satisfies` clause pins it to the `SignalType` union minus the two SMA-200
+ * display kinds (never carded, TRA-3688), so adding a family to the union
+ * without adding it here is a compile error and vice versa. The counters
+ * payload emits every family here even at 0 — an absent key reads like a
+ * quiet family, and a family that has never fired must say `0`, not vanish.
+ */
+const CARDED_SIGNAL_TYPE_SET = {
+  orb_breakout: true,
+  reversal: true,
+  macd_cross: true,
+  macd_trend: true,
+  bb_fade: true,
+  momentum: true,
+  mean_reversion: true,
+  breakout_vol: true,
+  ichimoku: true,
+  scalping: true,
+  swing_trade: true,
+  dca: true,
+  otm_mispricing: true,
+  relative_value: true,
+  post_earnings_iv_crush: true,
+  momentum_breakout_iv_lag: true,
+  panic_reversal: true,
+  supertrend_confluence: true,
+  tsmom_majors: true,
+  tradier_import: true,
+} satisfies Record<Exclude<SignalType, 'sma200_pullback' | 'sma200_reclaim'>, true>;
+const CARDED_SIGNAL_TYPES = Object.keys(CARDED_SIGNAL_TYPE_SET) as readonly string[];
+
 // TRA-1082 / TRA-1905 / TRA-1942 / TRA-4524 — EvalYielder (per-symbol loops) and
 // TickPacer (tick-wide) live in ./cooperative-yield.ts, with their rationale and the
 // process-wide yield gate both of them share.
@@ -3316,6 +3348,22 @@ export class SignalEngine {
    */
   private recentCards: TradeOpportunityCard[] = [];
   private cardBuildFailures = 0;
+  /**
+   * TRA-4788 (AC0, from TRA-4779) — cumulative per-family card counters,
+   * OUTSIDE the ring. The ring caps at MAX_SIGNALS and is newest-first, so on
+   * a saturated day it cannot answer "what is the setup mix": 50/50
+   * otm_mispricing is indistinguishable from "OTM overwrote the ring in 15
+   * minutes" (both measured live 2026-09-22). Incremented at the point a card
+   * is ATTEMPTED — never derived by folding the ring, which would reproduce
+   * the exact cap this exists to escape. `attempted` counts every TradeSignal
+   * reaching the card sink; `built` counts cards that made the ring — a family
+   * whose builder always throws still shows up, with attempted > built.
+   * Since-boot like {@link cardBuildFailures} (survives forceReset /
+   * clearSignals, dies with the process); the payload labels the window.
+   */
+  private cardTypeCounts: Map<string, { attempted: number; built: number }> = new Map();
+  /** Wall-clock the counters started at (engine construction ≈ process boot). */
+  private readonly cardCountsSince = Date.now();
   /**
    * TRA-3688 S-3 — voided SMA-200 signals, newest last, capped. A voided
    * signal is REMOVED from `recentSignals` and RECORDED here so the void rate
@@ -7628,9 +7676,10 @@ export class SignalEngine {
    * is not a wide book, so absent L1 leaves contract/costs fail-closed instead
    * of fabricating a spread. No calibration index is wired here yet: every
    * card's `confidence` stays null until charged desk rows can clear the
-   * TRA-4652 ≥30-instance floor, which today's data cannot fill by design.
+   * TRA-4779 ≥30-instance floor, which today's data cannot fill by design.
    */
   private recordOpportunityCard(signal: TradeSignal): void {
+    this.bumpCardTypeCount(signal.type, 'attempted');
     try {
       const managedEquity = this.account.managedEquity();
       const state = this.symbolState.get(signal.symbol);
@@ -7657,9 +7706,16 @@ export class SignalEngine {
       });
       this.recentCards.unshift(card);
       if (this.recentCards.length > MAX_SIGNALS) this.recentCards.length = MAX_SIGNALS;
+      this.bumpCardTypeCount(signal.type, 'built');
     } catch {
       this.cardBuildFailures += 1;
     }
+  }
+
+  private bumpCardTypeCount(type: string, cell: 'attempted' | 'built'): void {
+    const row = this.cardTypeCounts.get(type) ?? { attempted: 0, built: 0 };
+    row[cell] += 1;
+    this.cardTypeCounts.set(type, row);
   }
 
   /**
@@ -7675,18 +7731,38 @@ export class SignalEngine {
    * `buildFailures` counts cards the sink could not build at all.
    *
    * ⚠️ The ring holds MAX_SIGNALS entries, so `total` saturating at that value
-   * is a ring bound, not a census of the session.
+   * is a ring bound, not a census of the session. The census that escapes the
+   * cap is `signalTypeCounts` (TRA-4788): per-family {attempted, built},
+   * cumulative since `countsSince`, every known family present even at 0. On a
+   * saturated ring it will disagree with the ring tally — that disagreement is
+   * the point, not a defect.
    */
   getRecentCards(): {
     cards: TradeOpportunityCard[];
     summary: CardBatchSummary;
     buildFailures: number;
+    signalTypeCounts: Record<string, { attempted: number; built: number }>;
+    countsSinceBoot: true;
+    countsSince: string;
     reasonsNotToEnter: ReasonsNotToEnterTally & { enabled: boolean };
   } {
+    // TRA-4788 — every known family at 0 first, then the measured rows on top.
+    // A key can exceed the known set (an unregistered signal type still counts
+    // its attempts); it can never be silently missing.
+    const signalTypeCounts: Record<string, { attempted: number; built: number }> = {};
+    for (const t of CARDED_SIGNAL_TYPES) signalTypeCounts[t] = { attempted: 0, built: 0 };
+    for (const [t, row] of this.cardTypeCounts) signalTypeCounts[t] = { ...row };
     return {
       cards: [...this.recentCards],
       summary: summarizeCards(this.recentCards),
       buildFailures: this.cardBuildFailures,
+      // TRA-4788 — per-family counters OUTSIDE the ring (see cardTypeCounts).
+      // Window labelled honestly: since-boot, zeroed by every deploy/restart —
+      // a freshly-zeroed counter reads identically to a quiet market, so the
+      // reader gets the epoch beside the numbers, never left to assume.
+      signalTypeCounts,
+      countsSinceBoot: true,
+      countsSince: new Date(this.cardCountsSince).toISOString(),
       // TRA-4719 — the published counter: ring cards by source × state, with
       // the not_evaluated cause split out. Folded off the SAME ring as
       // `summary`; `enabled` is the sub-flag now (cards carry their own).

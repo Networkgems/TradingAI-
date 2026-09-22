@@ -62,6 +62,27 @@ function Stat({ label, value, tone }: { label: string; value: string; tone?: 'gr
   );
 }
 
+/**
+ * TRA-4788 — the tooltip is worded off the server's `calibrationStatus`, never
+ * a hardcoded claim: "floor not cleared" was false on every build where
+ * calibration had never run at all. The reasons array carries the server's own
+ * one-line audit for the branch taken.
+ */
+function noConfidenceTitle(panel: DecisionPanelPayload): string {
+  const why =
+    panel.calibrationStatus === 'not_run'
+      ? 'calibration has never run on this build'
+      : panel.calibrationStatus === 'no_instances'
+        ? 'no historical instances for this setup'
+        : panel.calibrationStatus === 'below_floor'
+          ? 'instance floor not cleared'
+          : panel.calibrationStatus === 'oos_failed'
+            ? 'out-of-sample validation failed'
+            : 'calibration status unknown (server build predates the TRA-4788 stamp)';
+  const reasons = panel.calibrationReasons?.length ? ` — ${panel.calibrationReasons.join('; ')}` : '';
+  return `No calibrated expectancy for this setup: ${why}${reasons}. A number would be invented (TRA-4779).`;
+}
+
 export function DecisionPanelBody({ panel }: { panel: DecisionPanelPayload }) {
   const { header, checklist, freshness, risk, contract, portfolio, similarTrades, actions } = panel;
   return (
@@ -81,7 +102,7 @@ export function DecisionPanelBody({ panel }: { panel: DecisionPanelPayload }) {
             {panel.confidence.displayWinRatePct}% confidence
           </span>
         ) : (
-          <span className="wtt-confidence none" title="No calibrated expectancy for this setup yet (TRA-4652 floor not cleared) — a number would be invented">
+          <span className="wtt-confidence none" title={noConfidenceTitle(panel)}>
             confidence: not calibrated
           </span>
         )}

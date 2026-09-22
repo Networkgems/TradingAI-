@@ -10822,7 +10822,7 @@ describe('TRA-4649 — trade opportunity cards ride the signal feed sink', () =>
     // two-sided option quote — both halves survive the trip through the sink.
     expect(cards[0].fields.setup.status).toBe('verified');
     expect(cards[0].fields.contract.status).toBe('verified');
-    // No calibration index is wired at the sink (the TRA-4652 ≥30 floor is
+    // No calibration index is wired at the sink (the TRA-4779 ≥30 floor is
     // unfillable on today's data by design) — null, never an invented number.
     expect(cards[0].confidence).toBeNull();
   });
@@ -10918,6 +10918,53 @@ describe('TRA-4649 — trade opportunity cards ride the signal feed sink', () =>
     engine.clearSignals();
     expect(engine.getRecentCards().summary.total).toBe(0);
     expect(engine.getState().signals).toHaveLength(0);
+  });
+
+  // ── TRA-4788 (AC0, from TRA-4779) — the per-family census OUTSIDE the ring.
+  // The ring caps at 50 newest-first, so a saturated day cannot state the
+  // setup mix; these counters increment at the attempt, never by folding the
+  // ring, and their discriminator is DISAGREEING with the ring tally.
+
+  it('TRA-4788 — signalTypeCounts escapes the ring cap: 60 pushes read 60 while the ring holds 50', () => {
+    const engine = new SignalEngine();
+    for (let i = 0; i < 60; i++) {
+      pushInto(engine, freshEquitySignal({ id: `tra4788-mom-${i}` }));
+    }
+    const { cards, signalTypeCounts, countsSinceBoot, countsSince } = engine.getRecentCards();
+    expect(cards).toHaveLength(50); // the ring bound…
+    expect(signalTypeCounts['momentum']).toEqual({ attempted: 60, built: 60 }); // …escaped
+    // A counter derived from the ring could only ever equal the ring tally —
+    // this inequality is the whole point of the instrument.
+    expect(signalTypeCounts['momentum'].attempted).toBeGreaterThan(cards.length);
+    expect(countsSinceBoot).toBe(true);
+    expect(new Date(countsSince).getTime()).not.toBeNaN();
+  });
+
+  it('TRA-4788 — every known family reads 0, never absent; SMA-200 display kinds carry no row', () => {
+    const { signalTypeCounts } = new SignalEngine().getRecentCards();
+    for (const family of ['otm_mispricing', 'ichimoku', 'relative_value', 'momentum', 'tsmom_majors']) {
+      expect(signalTypeCounts[family]).toEqual({ attempted: 0, built: 0 });
+    }
+    expect(signalTypeCounts['sma200_pullback']).toBeUndefined();
+    expect(signalTypeCounts['sma200_reclaim']).toBeUndefined();
+  });
+
+  it('TRA-4788 — an unregistered family still counts under its own key', () => {
+    const engine = new SignalEngine();
+    pushInto(engine, freshEquitySignal({ id: 'tra4788-unreg', type: 'never_heard_of_it' as TradeSignal['type'] }));
+    expect(engine.getRecentCards().signalTypeCounts['never_heard_of_it']).toEqual({
+      attempted: 1,
+      built: 1,
+    });
+  });
+
+  it('TRA-4788 — counters survive clearSignals: since-boot, not ring-derived', () => {
+    const engine = new SignalEngine();
+    pushInto(engine, freshEquitySignal({ id: 'tra4788-clear-1' }));
+    engine.clearSignals();
+    const { summary, signalTypeCounts } = engine.getRecentCards();
+    expect(summary.total).toBe(0); // the ring is gone…
+    expect(signalTypeCounts['momentum']).toEqual({ attempted: 1, built: 1 }); // …the census is not
   });
 });
 

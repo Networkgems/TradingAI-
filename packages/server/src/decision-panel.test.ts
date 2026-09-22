@@ -292,6 +292,19 @@ describe('buildDecisionPanel — actions are intents, never orders', () => {
     expect(panel.actions.autoExecute.reason).toContain('TRA-4651');
   });
 
+  it('TRA-4788 — a not_run card never claims a floor was tested; status + reasons ride the panel', () => {
+    // No calibration in the context — the live state (TRA-4779): nothing was
+    // folded, so the old fixed string "floor not cleared" asserted a
+    // measurement that never happened.
+    const card = buildTradeOpportunityCard(otmSignal(), CARD_CTX);
+    expect(card.calibrationStatus).toBe('not_run');
+    const panel = buildDecisionPanel(card, FULL_PANEL_CTX);
+    expect(panel.actions.autoExecute.reason).toContain('calibration has never run');
+    expect(panel.actions.autoExecute.reason).not.toContain('floor');
+    expect(panel.calibrationStatus).toBe('not_run');
+    expect(panel.calibrationReasons).toEqual(card.calibrationReasons);
+  });
+
   it('an incomplete card disables Paper Trade and names the unverified fields', () => {
     // No sizing context ⇒ the card's sizing field fails closed.
     const card = buildTradeOpportunityCard(equitySignal(), { now: NOW, underlyingQuote: { bid: 99.98, ask: 100.02 } });

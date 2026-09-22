@@ -1,4 +1,4 @@
-// TRA-4652 — Setup Scoring & Confidence Calibration.
+// TRA-4779 — Setup Scoring & Confidence Calibration.
 //
 // Every control here discriminates: for each fail-closed rule there is a test
 // whose PASS depends on the rule and whose mutant (zero-fill a missing cost,
@@ -16,7 +16,7 @@ import {
   DEFAULT_SETUP_CALIBRATION_CONFIG,
   type SetupOutcomeRecord,
 } from './setup-calibration.js';
-import { buildTradeOpportunityCard } from './trade-opportunity-card.js';
+import { buildTradeOpportunityCard, CALIBRATION_NOT_RUN_REASON } from './trade-opportunity-card.js';
 import type { OtmMispricingSignal } from '@trading-app/shared';
 
 const T0 = Date.parse('2026-06-01T14:00:00Z');
@@ -286,7 +286,7 @@ describe('empty and unknown inputs', () => {
   });
 });
 
-describe('card wiring — the reserved confidence slot (TRA-4649 → TRA-4652)', () => {
+describe('card wiring — the reserved confidence slot (TRA-4649 → TRA-4779)', () => {
   const NOW = Date.parse('2026-09-17T15:00:00Z');
   function otmSignal(): OtmMispricingSignal {
     return {
@@ -318,7 +318,7 @@ describe('card wiring — the reserved confidence slot (TRA-4649 → TRA-4652)',
     optionLiquidity: { openInterest: 500, volume: 120, marketPhase: 'rth' as const },
   };
 
-  it('no calibration in the context ⇒ confidence null (pre-TRA-4652 behavior unchanged)', () => {
+  it('no calibration in the context ⇒ confidence null (pre-TRA-4779 behavior unchanged)', () => {
     expect(buildTradeOpportunityCard(otmSignal(), ctxBase).confidence).toBeNull();
   });
 
@@ -349,6 +349,54 @@ describe('card wiring — the reserved confidence slot (TRA-4649 → TRA-4652)',
     });
     expect(card.confidence!.basis).toBe('regime');
     expect(card.confidence!.winRate).toBeCloseTo(0.75, 10);
+  });
+
+  // ── TRA-4788 — calibrationStatus: 'never ran' and 'floor not cleared' are
+  // different facts and must never collapse into the same bare null. On the
+  // live build (no index has ever been constructed) the truthful value is
+  // 'not_run'; a build that read 'below_floor' there would be asserting a
+  // measurement that never happened.
+
+  it("TRA-4788 — absent index ⇒ 'not_run' with the fixed non-empty reason: no rows folded, no floor tested", () => {
+    const card = buildTradeOpportunityCard(otmSignal(), ctxBase);
+    expect(card.confidence).toBeNull();
+    expect(card.calibrationStatus).toBe('not_run');
+    expect(card.calibrationReasons).toEqual([CALIBRATION_NOT_RUN_REASON]);
+  });
+
+  it("TRA-4788 — present-but-short index ⇒ 'below_floor'; confidence stays null, never 0 or a prior", () => {
+    const thin = calibrateSetups(stablePattern(10, { setupKey: 'otm_mispricing' }));
+    const card = buildTradeOpportunityCard(otmSignal(), { ...ctxBase, calibration: thin });
+    expect(card.confidence).toBeNull();
+    expect(card.calibrationStatus).toBe('below_floor');
+    expect(card.calibrationReasons!.join(' ')).toContain('instance floor');
+  });
+
+  it("TRA-4788 — an index with no rows for THIS setup ⇒ 'no_instances'", () => {
+    const otherSetupOnly = calibrateSetups(stablePattern(45)); // orb_breakout rows only
+    const card = buildTradeOpportunityCard(otmSignal(), { ...ctxBase, calibration: otherSetupOnly });
+    expect(card.confidence).toBeNull();
+    expect(card.calibrationStatus).toBe('no_instances');
+    expect(card.calibrationReasons!.join(' ')).toContain('no historical instances');
+  });
+
+  it("TRA-4788 — floor cleared but the held-out tail collapsed ⇒ 'oos_failed', not 'below_floor'", () => {
+    const rows = Array.from({ length: 40 }, (_, i) =>
+      outcome(i, i < 28, { setupKey: 'otm_mispricing' }),
+    );
+    const card = buildTradeOpportunityCard(otmSignal(), {
+      ...ctxBase,
+      calibration: calibrateSetups(rows),
+    });
+    expect(card.confidence).toBeNull();
+    expect(card.calibrationStatus).toBe('oos_failed');
+  });
+
+  it("TRA-4788 — a validated cell ⇒ 'calibrated' with the verdict attached", () => {
+    const validated = calibrateSetups(stablePattern(45, { setupKey: 'otm_mispricing' }));
+    const card = buildTradeOpportunityCard(otmSignal(), { ...ctxBase, calibration: validated });
+    expect(card.calibrationStatus).toBe('calibrated');
+    expect(card.confidence).not.toBeNull();
   });
 });
 

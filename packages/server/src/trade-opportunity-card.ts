@@ -16,7 +16,7 @@
 //    'proposal_only'; there is no order field, no broker hook, no execution
 //    callback. The TRA-4651 lifecycle state machine is the only intended
 //    consumer that can advance one, and it starts at Detected.
-//  - `confidence` is populated ONLY from a validated TRA-4652 calibration cell
+//  - `confidence` is populated ONLY from a validated TRA-4779 calibration cell
 //    (historical expectancy after fees/slippage, costs charged inside the fold
 //    per TRA-4578, ≥30 instances, out-of-sample validated). No calibration in
 //    the build context, or a setup that fails any of those gates, leaves the
@@ -54,6 +54,7 @@ import {
 import { sizeFromStopViaRiskManager } from './account-sizing.js';
 import {
   confidenceFor,
+  type CalibrationOutcome,
   type SetupCalibrationIndex,
   type SetupConfidence,
 } from './setup-calibration.js';
@@ -439,6 +440,20 @@ export interface WhyNowContext {
   evidence: string[];
 }
 
+/**
+ * TRA-4788 — the card-level calibration verdict. 'not_run' is the one state
+ * `confidenceFor` cannot express (it requires an index to run at all); the
+ * other four are its gate outcomes, passed through untouched.
+ */
+export type CalibrationStatus = 'not_run' | CalibrationOutcome;
+
+/**
+ * TRA-4788 — the fixed reason a card carries when the build context held no
+ * calibration index. Exported so tests pin the exact wire bytes.
+ */
+export const CALIBRATION_NOT_RUN_REASON =
+  'no calibration index in build context — calibrateSetups has no caller';
+
 export interface TradeOpportunityCard {
   schemaVersion: 1;
   signalId: string;
@@ -449,12 +464,30 @@ export interface TradeOpportunityCard {
   /** Cards propose. They never execute. See TRA-4651 for the state machine. */
   disposition: 'proposal_only';
   /**
-   * TRA-4652 calibrated expectancy verdict. Non-null ONLY when the build
+   * TRA-4779 calibrated expectancy verdict. Non-null ONLY when the build
    * context carried a calibration index whose cell for this setup cleared the
    * ≥30-instance floor and out-of-sample validation (existence implies
    * validation — `SetupConfidence` has no unvalidated variant). Otherwise null.
    */
   confidence: SetupConfidence | null;
+  /**
+   * TRA-4788 — disambiguates `confidence: null`, which by itself cannot say
+   * whether a floor was tested and missed or nothing was ever measured.
+   * Three-valued contract on the wire: field ABSENT ⇒ the card predates this
+   * change · 'not_run' ⇒ no calibration index in the build context, nothing
+   * was folded and no floor was tested (the live state today — TRA-4779:
+   * `calibrateSetups` has no caller) · any other value ⇒ `confidenceFor` ran
+   * and this is the gate it landed on. `confidence` stays null in every
+   * branch except 'calibrated' — never 0, never a prior, never a shrunk
+   * estimate.
+   */
+  calibrationStatus?: CalibrationStatus;
+  /**
+   * TRA-4788 — why `confidence` is what it is: `confidenceFor(...).reasons`
+   * verbatim when an index existed, a fixed one-line explanation when none
+   * did. Non-empty whenever `calibrationStatus` is not 'calibrated'.
+   */
+  calibrationReasons?: string[];
   /** True iff all 8 fields `verified` — i.e. both lists below are empty. */
   complete: boolean;
   /** Fields whose inputs were MISSING — the builder could not populate them. */
@@ -516,8 +549,8 @@ export interface CardBuildContext {
   /** Optional chain liquidity for option contracts. */
   optionLiquidity?: { openInterest?: number; volume?: number; marketPhase?: 'pre' | 'rth' | 'post' };
   /**
-   * TRA-4652 calibration index (from `calibrateSetups`). Absent ⇒ every card's
-   * `confidence` is null — the pre-TRA-4652 behavior, unchanged.
+   * TRA-4779 calibration index (from `calibrateSetups`). Absent ⇒ every card's
+   * `confidence` is null — the pre-TRA-4779 behavior, unchanged.
    */
   calibration?: SetupCalibrationIndex;
   /** Current market regime label, for regime-conditioned confidence lookup. */
@@ -977,6 +1010,14 @@ export function buildTradeOpportunityCard(
   const fieldNames = Object.keys(fields) as (keyof typeof fields)[];
   const incompleteFields = fieldNames.filter((k) => fields[k].status === 'incomplete');
   const refusedFields = fieldNames.filter((k) => fields[k].status === 'refused');
+  // TRA-4788 — one lookup, kept whole: the verdict, the gate it landed on and
+  // its reasons travel together. An absent index is 'not_run' — nothing was
+  // folded and no floor was tested — which is a different claim from a floor
+  // that was tested and missed ('below_floor'); the two must never collapse
+  // into a bare null. `.reasons` used to be discarded here (TRA-4779).
+  const calibration = ctx.calibration
+    ? confidenceFor(ctx.calibration, signal.type, ctx.currentRegime ?? null)
+    : null;
   return {
     schemaVersion: 1,
     signalId: signal.id,
@@ -985,9 +1026,9 @@ export function buildTradeOpportunityCard(
     mode: str(s.mode) ?? null,
     generatedAt: ctx.now,
     disposition: 'proposal_only',
-    confidence: ctx.calibration
-      ? confidenceFor(ctx.calibration, signal.type, ctx.currentRegime ?? null).confidence
-      : null,
+    confidence: calibration ? calibration.confidence : null,
+    calibrationStatus: calibration ? calibration.status : 'not_run',
+    calibrationReasons: calibration ? calibration.reasons : [CALIBRATION_NOT_RUN_REASON],
     complete: incompleteFields.length === 0 && refusedFields.length === 0,
     incompleteFields,
     refusedFields,

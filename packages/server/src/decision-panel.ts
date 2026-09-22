@@ -19,11 +19,12 @@
  *     structurally disabled in this surface — there is no order path here and
  *     none may be added (board directive on TRA-4645, 2026-09-17).
  *   - `confidence` is passed through from the card untouched: calibrated
- *     (TRA-4652) or absent. This module never invents a probability.
+ *     (TRA-4779) or absent. This module never invents a probability.
  */
 
 import type {
   TradeOpportunityCard,
+  CalibrationStatus,
   EntryCriterion,
   ContractSelection,
   SetupFamily,
@@ -286,8 +287,15 @@ export interface DecisionPanelView {
    * `complete` or the actions. A card without one reads all `not_evaluated`.
    */
   reasonsNotToEnter: ReasonsNotToEnter;
-  /** TRA-4652 verdict, passed through from the card. Calibrated or absent. */
+  /** TRA-4779 verdict, passed through from the card. Calibrated or absent. */
   confidence: SetupConfidence | null;
+  /**
+   * TRA-4788 — the card's calibration gate verdict + reasons, passed through
+   * untouched so the UI can say WHY `confidence` is null without inventing a
+   * claim. Absent only when the card itself predates the stamp.
+   */
+  calibrationStatus?: CalibrationStatus;
+  calibrationReasons?: string[];
   actions: PanelActions;
   /** All six sections verified AND the underlying card is complete. */
   complete: boolean;
@@ -550,9 +558,34 @@ function buildSimilarTrades(
   return verified(data);
 }
 
+/**
+ * TRA-4788 — the no-confidence line is worded off the card's own
+ * `calibrationStatus`, never hardcoded. The previous fixed string claimed
+ * "floor not cleared" on every null, but on a build with no calibration index
+ * no rows were folded and no floor was tested — asserting the wrong branch is
+ * exactly the ambiguity the status field exists to kill.
+ */
+function noConfidenceReason(card: TradeOpportunityCard): string {
+  switch (card.calibrationStatus) {
+    case undefined:
+      return 'no calibrated confidence (card predates the TRA-4788 calibration status stamp)';
+    case 'not_run':
+      return 'no calibrated confidence — calibration has never run (no index in the build context; TRA-4779)';
+    case 'no_instances':
+      return 'no calibrated confidence — no historical instances for this setup (TRA-4779)';
+    case 'below_floor':
+      return 'no calibrated confidence — instance floor not cleared (TRA-4779)';
+    case 'oos_failed':
+      return 'no calibrated confidence — out-of-sample validation failed (TRA-4779)';
+    case 'calibrated':
+      // Contradiction: the stamp says a verdict exists but none is attached.
+      return 'no calibrated confidence — status reads calibrated with no verdict attached (defect, report on TRA-4788)';
+  }
+}
+
 function buildActions(card: TradeOpportunityCard): PanelActions {
   const autoReasons: string[] = [];
-  if (card.confidence === null) autoReasons.push('no calibrated confidence (TRA-4652 floor not cleared)');
+  if (card.confidence === null) autoReasons.push(noConfidenceReason(card));
   autoReasons.push(
     'no execution path from a panel — TRA-4651 lifecycle advances proposals, TRA-4655 controls gate execution',
   );
@@ -613,6 +646,8 @@ export function buildDecisionPanel(
         undefined,
       ),
     confidence: card.confidence,
+    ...(card.calibrationStatus !== undefined ? { calibrationStatus: card.calibrationStatus } : {}),
+    ...(card.calibrationReasons !== undefined ? { calibrationReasons: [...card.calibrationReasons] } : {}),
     actions: buildActions(card),
     complete: incompleteSections.length === 0 && card.complete,
     incompleteSections: [...incompleteSections],

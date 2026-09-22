@@ -9,7 +9,7 @@
 // holds the honest exit. What did NOT exist is the JOIN: one record per
 // trade that answers "what did we believe at entry, what happened on the
 // path, what did it actually cost, and which rules bent" — keyed by
-// position id / card id so it can feed the TRA-4652 calibration fold.
+// position id / card id so it can feed the TRA-4779 calibration fold.
 //
 // Posture (house rules):
 //   • Pure assembly. This module places no orders, mutates no ledger, and
@@ -123,7 +123,7 @@ export interface PostTradeReview {
   optionSymbol: string | null;
   structure: string;
   entryArchetype: string | null;
-  /** Setup identity for the TRA-4652 fold — audit fill `strategy`, else card. */
+  /** Setup identity for the TRA-4779 fold — audit fill `strategy`, else card. */
   setupKey: string | null;
   setupKeySource: 'audit' | 'card' | null;
   status: 'open' | 'closed';
@@ -422,7 +422,7 @@ export function buildPostTradeReview(
   };
 }
 
-// ── TRA-4652 feed: review → SetupOutcomeRecord ─────────────────────────────
+// ── TRA-4779 feed: review → SetupOutcomeRecord ─────────────────────────────
 
 export interface CalibrationFeedResult {
   record: SetupOutcomeRecord | null;
@@ -555,7 +555,7 @@ export function summarizePostTradeReviews(
 export interface PostTradeReviewBatch {
   reviews: PostTradeReview[];
   summary: PostTradeReviewSummary;
-  /** The closed-and-keyed rows, ready for `calibrateSetups` (TRA-4652). */
+  /** The closed-and-keyed rows, ready for `calibrateSetups` (TRA-4779). */
   calibrationRecords: SetupOutcomeRecord[];
 }
 

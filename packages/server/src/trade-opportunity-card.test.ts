@@ -148,7 +148,7 @@ describe('buildTradeOpportunityCard — complete cards', () => {
     expect(liq.openInterest).toBe(500);
   });
 
-  it('every card is a proposal: disposition fixed, confidence null (reserved for TRA-4652)', () => {
+  it('every card is a proposal: disposition fixed, confidence null (reserved for TRA-4779)', () => {
     for (const sig of [equitySignal(), otmSignal()]) {
       const card = buildTradeOpportunityCard(sig, FULL_CTX);
       expect(card.disposition).toBe('proposal_only');

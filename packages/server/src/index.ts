@@ -10499,7 +10499,7 @@ app.get('/api/cards/:signalId/panel', requireAuth, async (req, res) => {
 // the thesis and the cost estimate the fill is graded against). A review is
 // built for EVERY row; joins that could not be made are counted by name in
 // `summary.joins.missingByReason`, never dropped. `calibrationRecords` is the
-// TRA-4652 feed, keyed by setup with per-row cost provenance. Read-only.
+// TRA-4779 feed, keyed by setup with per-row cost provenance. Read-only.
 app.get('/api/trade-reviews', requireAuth, async (req, res, next) => {
   try {
     const q = req.query as Record<string, string | undefined>;

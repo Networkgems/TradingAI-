@@ -308,7 +308,7 @@ describe('rule violations', () => {
   });
 });
 
-// ── The TRA-4652 feed ──────────────────────────────────────────────────────
+// ── The TRA-4779 feed ──────────────────────────────────────────────────────
 
 describe('toSetupOutcomeRecord', () => {
   it('a closed, fully-measured trade emits a SAMPLED-cost record', () => {
