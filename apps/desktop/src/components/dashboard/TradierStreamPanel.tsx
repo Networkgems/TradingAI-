@@ -27,8 +27,10 @@ export interface StreamSymbolRow {
   latencyMs: number | null;
   /**
    * TRA-4782. THREE-VALUED on purpose: `undefined` = a server that predates this
-   * field, `false` = measured and the stamp is sane, `true` = a halted/delisted
-   * book. Never collapse the first two — "not published" is not "fine".
+   * field, `false` = measured and the exchange stamp is sane, `true` = the stamp
+   * is beyond the feed's sanity bound (a halted/delisted book, or a snapshot row
+   * stamped long before receipt). Never collapse the first two — "not published"
+   * is not "fine".
    */
   staleEventTime?: boolean;
 }
@@ -290,8 +292,8 @@ export function TradierStreamBody({
                     <td className={r.stale ? 'health-bad' : 'health-ok'}>
                       {formatQuoteAge(r.ageMs)}
                       {r.stale ? ' · stale' : ''}
-                      {/* Not "the feed is 125 days late" — this book stopped trading. */}
-                      {r.staleEventTime === true ? ' · halted book (excluded from latency)' : ''}
+                      {/* Not "the feed is 126 days late" — this row's exchange stamp is broken. */}
+                      {r.staleEventTime === true ? ' · stale stamp (excluded from latency)' : ''}
                     </td>
                   </tr>
                 ))}

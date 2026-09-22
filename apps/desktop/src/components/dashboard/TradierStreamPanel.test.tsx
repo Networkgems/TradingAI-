@@ -139,7 +139,7 @@ describe('TradierStreamPanel (container)', () => {
 });
 
 // TRA-4782 — the panel must not let "the server never published it" and "the
-// server measured nothing" share a cell, and must not let a halted book read as
+// server measured nothing" share a cell, and must not let a broken stamp read as
 // feed latency.
 describe('TRA-4782 latency split + symbol cap in the panel', () => {
   it('formatLatencyCell keeps all three states apart — absent ≠ unmeasured ≠ 0ms', () => {
@@ -189,10 +189,10 @@ describe('TRA-4782 latency split + symbol cap in the panel', () => {
     expect(screen.getByTestId('stream-latency-percentiles')).toHaveTextContent('35600ms / 49000ms (n=5000)');
     expect(screen.getByTestId('stream-stale-eventtime')).toHaveTextContent('6 stale · 0 future');
     expect(screen.getByTestId('stream-symbol-limit')).toHaveTextContent('25 / 822 (cap 25)');
-    // A halted book is labelled as one — it is NOT the feed running 125 days late.
+    // The broken stamp is labelled as one — it is NOT the feed running 126 days late.
     expect(screen.getByTestId('stream-row-FLYYQ')).toHaveAttribute('data-stale-eventtime', 'true');
-    expect(screen.getByTestId('stream-row-FLYYQ')).toHaveTextContent(/halted book/);
-    expect(screen.getByTestId('stream-row-SPY')).not.toHaveTextContent(/halted book/);
+    expect(screen.getByTestId('stream-row-FLYYQ')).toHaveTextContent(/stale stamp/);
+    expect(screen.getByTestId('stream-row-SPY')).not.toHaveTextContent(/stale stamp/);
   });
 
   it('an uncapped current server says so rather than leaving the cap unstated', () => {

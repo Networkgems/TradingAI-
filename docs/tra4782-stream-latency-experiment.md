@@ -98,7 +98,40 @@ The same rule covers the cap: an unset `TRADIER_STREAM_SYMBOL_LIMIT` and a *garb
 `symbolLimit: null`. Only `symbolLimitError` tells them apart, and it is non-null exactly when a
 present value was refused.
 
+### What the sanity bound is, and what it is not
+
+600000ms is calibrated against the RTH p95 of 49–55s — roughly 10x headroom. It is a **broken /
+extreme exchange stamp** discriminator, not a halted-ticker oracle. Measured on the live uncapped
+payload at 21:47Z on 2026-09-22 (post-close), 118 of 790 quoted rows exceeded it: **4 by more than a
+day** (FLYYQ 126.0d, APGE 19.6d, ATAI 11.6d, ANY 5.6d — the ticket's four), 31 between an hour and a
+day, and 83 between 10 min and an hour. Post-close the boundary population is expected to swell:
+quoting stops, and the newest frame a thin name got may be a snapshot stamped long before receipt.
+
+So the counter is not decoration — it is the check on its own bound. **If `quotesWithStaleEventTime`
+is large during RTH, the bound is doing more than segregating dead books and the verdict must be
+re-read, not published.**
+
 ## Operating the experiment
+
+⛔ **Grade inside RTH only.** `scripts/tra4782-grade-stream-latency.mjs` refuses outside
+13:30–20:00Z Mon–Fri, and below 50 gradeable rows, because a post-close read produces a p50 off a
+handful of frames that **reads identically to an RTH grade**. The script's own first live run, at
+21:47Z, printed `p50=918ms` off `n=63` — a number that would have read as "the cap nearly fixed it".
+Outside the window the verdict is `BLIND` (exit 3), never `PASS` and never `FAIL`; `--allow-outside-rth`
+prints the numbers and leaves the verdict `BLIND`.
+
+```bash
+node scripts/tra4782-grade-stream-latency.mjs --samples=4 --gap=30
+#   0 PASS · 1 FAIL (a RESULT) · 2 usage · 3 BLIND
+```
+
+It reports **two** p50s, and they answer different questions. `PER-SYMBOL` is the median over each
+subscribed symbol's latest quote — the 2026-09-22 control's own method, and therefore the one the
+before/after comparison must be made on. `FEED SAMPLE` is the server's `latencyP50Ms` over the
+trailing quote *frames*, so it is frame-weighted: a hot mega-cap counts many times and a thin name
+once. Quoting one where you mean the other is how a 786-symbol median and a 5000-frame median end up
+in the same sentence.
+
 
 ```bash
 # 1. the code must be live BEFORE 13:30Z on the grading day
