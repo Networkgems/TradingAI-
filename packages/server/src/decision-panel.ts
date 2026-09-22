@@ -134,20 +134,50 @@ export interface PanelFreshness {
   quoteAsOf: number | null;
 }
 
+/**
+ * Which card field a blank risk cell came from, and the card's own words for
+ * why. TRA-4654: a gap is NAMED per cell, never inferred from a null.
+ */
+export interface PanelRiskGap {
+  field: 'entryTrigger' | 'invalidation' | 'targets' | 'sizing';
+  /**
+   * TRA-4649's split, carried through: `unbuildable` = the input was not there
+   * (a data failure); `refused` = it WAS built and says do-not-enter (a policy
+   * answer, e.g. "risk budget $41.66 buys 0 contracts"). A refused field's
+   * cells still populate — with zeros that are the real answer — which is
+   * exactly why the section must not read `verified` on the strength of them.
+   */
+  kind: 'unbuildable' | 'refused';
+  /** The card field's own `missing[]`, verbatim. Empty ⇒ no reason recorded. */
+  reasons: string[];
+}
+
+/**
+ * ⚠️ Every cell is nullable ON PURPOSE (TRA-4654, 2026-09-22). This section
+ * used to be all-or-nothing — one absent upstream field nulled the WHOLE
+ * `data`, so a live OTM card whose entry/stop/target/R:R were all computed
+ * rendered a blank "how much can I lose" box because `sizing` alone refused
+ * ("risk budget $41.66 buys 0 contracts at $75.63 risk/contract"). A known
+ * number withheld because a DIFFERENT number is unknown is a worse answer than
+ * the number. Cells populate independently; `gaps` names the blanks; the
+ * section STATUS is unchanged, so the completeness gate does not move.
+ */
 export interface PanelRisk {
-  entry: number;
-  stop: number;
+  entry: number | null;
+  stop: number | null;
   takeProfit: number | null;
   exitRule: string | null;
   rewardRisk: number | null;
-  quantity: number;
-  unit: 'contracts' | 'shares';
+  quantity: number | null;
+  unit: 'contracts' | 'shares' | null;
   /** Loss at the protective stop — the "how much can I lose" headline. */
-  maxLossAtStopUsd: number;
+  maxLossAtStopUsd: number | null;
   /** Options: full-premium loss if the position gaps through the stop. */
   maxLossHardUsd: number | null;
   costR: number | null;
-  holdingPeriod: { minDays: number; maxDays: number | null };
+  holdingPeriod: { minDays: number; maxDays: number | null } | null;
+  /** Empty ⇔ every cell above is populated. Named blanks, never silent ones. */
+  gaps: PanelRiskGap[];
 }
 
 /**
@@ -320,32 +350,64 @@ function buildRisk(card: TradeOpportunityCard): PanelSection<PanelRisk> {
   const targets = card.fields.targets;
   const sizing = card.fields.sizing;
   const costs = card.fields.costs;
-  const missing: string[] = [];
-  if (!trigger.data) missing.push('entryTrigger');
-  if (!invalidation.data) missing.push('invalidation');
-  if (!targets.data) missing.push('targets');
-  if (!sizing.data) missing.push('sizing');
-  if (missing.length > 0) return incomplete<PanelRisk>(null, missing);
-  const data: PanelRisk = {
-    entry: trigger.data!.limitPrice,
-    stop: invalidation.data!.hardStop,
-    takeProfit: targets.data!.takeProfit,
-    exitRule: targets.data!.exitRule,
-    rewardRisk: targets.data!.rewardRiskRecomputed,
-    quantity: sizing.data!.quantity,
-    unit: sizing.data!.unit,
-    maxLossAtStopUsd: sizing.data!.maxLossAtStop,
-    maxLossHardUsd: sizing.data!.maxLossHard,
-    costR: costs.data?.costR ?? null,
-    holdingPeriod: {
-      minDays: targets.data!.holdingPeriod.minDays,
-      maxDays: targets.data!.holdingPeriod.maxDays,
-    },
+  const unbuildable: string[] = [];
+  const refusedNotes: string[] = [];
+  const gaps: PanelRiskGap[] = [];
+  const inspect = (
+    field: PanelRiskGap['field'],
+    f: { data: unknown; status: string; missing: string[] },
+  ) => {
+    if (!f.data) {
+      unbuildable.push(field);
+      gaps.push({ field, kind: 'unbuildable', reasons: [...f.missing] });
+      return;
+    }
+    if (f.status === 'refused') {
+      refusedNotes.push(
+        `${field} refused: ${f.missing.join('; ') || 'no reason recorded'}`,
+      );
+      gaps.push({ field, kind: 'refused', reasons: [...f.missing] });
+    }
   };
+  inspect('entryTrigger', trigger);
+  inspect('invalidation', invalidation);
+  inspect('targets', targets);
+  inspect('sizing', sizing);
+  // Cells populate INDEPENDENTLY: an absent `sizing` must not erase a computed
+  // entry/stop/target. `gaps` carries the card's own reason for each blank.
+  const data: PanelRisk = {
+    entry: trigger.data?.limitPrice ?? null,
+    stop: invalidation.data?.hardStop ?? null,
+    takeProfit: targets.data?.takeProfit ?? null,
+    exitRule: targets.data?.exitRule ?? null,
+    rewardRisk: targets.data?.rewardRiskRecomputed ?? null,
+    quantity: sizing.data?.quantity ?? null,
+    unit: sizing.data?.unit ?? null,
+    maxLossAtStopUsd: sizing.data?.maxLossAtStop ?? null,
+    maxLossHardUsd: sizing.data?.maxLossHard ?? null,
+    costR: costs.data?.costR ?? null,
+    holdingPeriod: targets.data
+      ? {
+          minDays: targets.data.holdingPeriod.minDays,
+          maxDays: targets.data.holdingPeriod.maxDays,
+        }
+      : null,
+    gaps,
+  };
+  // ⛔ STATUS IS NOT RELAXED by the partial fill. An absent upstream field still
+  // reads `incomplete` with the field named, exactly as before, so `complete`,
+  // `incompleteSections` and the action gates are unmoved. Data failures are
+  // listed ahead of policy refusals.
+  if (unbuildable.length > 0) return incomplete(data, [...unbuildable, ...refusedNotes]);
   const upstreamIncomplete = [trigger, invalidation, targets, sizing]
     .filter(f => f.status === 'incomplete')
     .flatMap(f => f.missing);
-  return upstreamIncomplete.length === 0 ? verified(data) : incomplete(data, upstreamIncomplete);
+  // A `refused` upstream (TRA-4649 `ce011cbf`) carries data — quantity 0, max
+  // loss $0 — and those zeros would otherwise verify the section. They are the
+  // refusal, not a clean read, so they keep the section `incomplete` and named.
+  return upstreamIncomplete.length === 0 && refusedNotes.length === 0
+    ? verified(data)
+    : incomplete(data, [...upstreamIncomplete, ...refusedNotes]);
 }
 
 function gradeLiquidity(selection: ContractSelection): PanelLiquidity {

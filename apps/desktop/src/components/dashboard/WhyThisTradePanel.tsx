@@ -23,6 +23,9 @@ import type {
   PanelSection,
 } from '../../types/decision-panel';
 
+/** A cell the server could not build. Paired with a named reason below it. */
+const NOT_BUILT = 'not built';
+
 /** Render a section's fail-closed state: named missing inputs, never blanks. */
 function SectionShell({
   title,
@@ -124,22 +127,48 @@ export function DecisionPanelBody({ panel }: { panel: DecisionPanelPayload }) {
       {/* What breaks it? How much can I lose? */}
       <SectionShell title="Risk" section={risk}>
         {risk.data && (
-          <div className="wtt-grid">
-            <Stat label="Entry" value={fmt(risk.data.entry)} />
-            <Stat label="Stop" value={fmt(risk.data.stop)} tone="red" />
-            <Stat
-              label="Target"
-              value={risk.data.takeProfit !== null ? fmt(risk.data.takeProfit) : (risk.data.exitRule ?? 'rule exit')}
-              tone="green"
-            />
-            <Stat label="R:R" value={risk.data.rewardRisk !== null ? `1:${fmt(risk.data.rewardRisk, 1)}` : '—'} />
-            <Stat label="Size" value={`${risk.data.quantity} ${risk.data.unit}`} />
-            <Stat label="Max loss at stop" value={`$${fmt(risk.data.maxLossAtStopUsd)}`} tone="red" />
-            {risk.data.maxLossHardUsd !== null && (
-              <Stat label="Max loss (gap through stop)" value={`$${fmt(risk.data.maxLossHardUsd)}`} tone="red" />
+          <>
+            <div className="wtt-grid">
+              <Stat label="Entry" value={risk.data.entry !== null ? fmt(risk.data.entry) : NOT_BUILT} />
+              <Stat label="Stop" value={risk.data.stop !== null ? fmt(risk.data.stop) : NOT_BUILT} tone="red" />
+              <Stat
+                label="Target"
+                value={
+                  risk.data.takeProfit !== null
+                    ? fmt(risk.data.takeProfit)
+                    : (risk.data.exitRule ?? NOT_BUILT)
+                }
+                tone="green"
+              />
+              <Stat label="R:R" value={risk.data.rewardRisk !== null ? `1:${fmt(risk.data.rewardRisk, 1)}` : NOT_BUILT} />
+              <Stat
+                label="Size"
+                value={risk.data.quantity !== null ? `${risk.data.quantity} ${risk.data.unit ?? ''}`.trim() : NOT_BUILT}
+              />
+              <Stat
+                label="Max loss at stop"
+                value={risk.data.maxLossAtStopUsd !== null ? `$${fmt(risk.data.maxLossAtStopUsd)}` : NOT_BUILT}
+                tone="red"
+              />
+              {risk.data.maxLossHardUsd !== null && (
+                <Stat label="Max loss (gap through stop)" value={`$${fmt(risk.data.maxLossHardUsd)}`} tone="red" />
+              )}
+              {risk.data.costR !== null && <Stat label="Round-trip cost" value={`${fmt(risk.data.costR)}R`} />}
+            </div>
+            {/* A blank cell above is explained here in the card's own words —
+                never left as a bare dash (TRA-4654). */}
+            {risk.data.gaps && risk.data.gaps.length > 0 && (
+              <ul className="wtt-gaps" data-testid="wtt-risk-gaps">
+                {risk.data.gaps.map(g => (
+                  <li key={g.field} className={g.kind}>
+                    <span className="wtt-gap-field">{g.field}</span>
+                    {g.kind === 'refused' ? ' refused: ' : ' not built: '}
+                    {g.reasons.length > 0 ? g.reasons.join('; ') : 'no reason recorded'}
+                  </li>
+                ))}
+              </ul>
             )}
-            {risk.data.costR !== null && <Stat label="Round-trip cost" value={`${fmt(risk.data.costR)}R`} />}
-          </div>
+          </>
         )}
       </SectionShell>
 

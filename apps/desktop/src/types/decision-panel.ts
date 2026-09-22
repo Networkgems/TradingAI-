@@ -49,18 +49,28 @@ export interface PanelFreshness {
   quoteAsOf: number | null;
 }
 
+export interface PanelRiskGap {
+  field: 'entryTrigger' | 'invalidation' | 'targets' | 'sizing';
+  /** `unbuildable` = input absent; `refused` = built, and it says do-not-enter. */
+  kind: 'unbuildable' | 'refused';
+  reasons: string[];
+}
+
+/** Cells populate independently — see the server's PanelRisk note (TRA-4654). */
 export interface PanelRisk {
-  entry: number;
-  stop: number;
+  entry: number | null;
+  stop: number | null;
   takeProfit: number | null;
   exitRule: string | null;
   rewardRisk: number | null;
-  quantity: number;
-  unit: 'contracts' | 'shares';
-  maxLossAtStopUsd: number;
+  quantity: number | null;
+  unit: 'contracts' | 'shares' | null;
+  maxLossAtStopUsd: number | null;
   maxLossHardUsd: number | null;
   costR: number | null;
-  holdingPeriod: { minDays: number; maxDays: number | null };
+  holdingPeriod: { minDays: number; maxDays: number | null } | null;
+  /** Optional on the wire so a pre-TRA-4654-partial server still parses. */
+  gaps?: PanelRiskGap[];
 }
 
 export interface PanelLiquidity {

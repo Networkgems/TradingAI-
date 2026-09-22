@@ -61,6 +61,7 @@ function fullPayload(over: Partial<DecisionPanelPayload> = {}): DecisionPanelPay
         maxLossHardUsd: 1_250,
         costR: 0.21,
         holdingPeriod: { minDays: 1, maxDays: 35 },
+        gaps: [],
       },
       missing: [],
     },
@@ -186,6 +187,59 @@ describe('DecisionPanelBody — one synchronous pass over the server payload', (
     payload.portfolio.data!.deltaUnknownCount = 2;
     render(<DecisionPanelBody panel={payload} />);
     expect(screen.getByText('unknown (2 positions without delta)')).toBeTruthy();
+  });
+
+  // TRA-4654 (2026-09-22): the risk box used to render nothing at all when a
+  // single upstream field was absent. The known numbers must survive, and each
+  // blank must carry the server's reason for being blank.
+  it('a refused sizing still shows entry/stop/target and explains the blank cells in the card\'s words', () => {
+    const payload = fullPayload();
+    payload.risk = {
+      status: 'incomplete',
+      data: {
+        ...payload.risk.data!,
+        quantity: 0,
+        maxLossAtStopUsd: 0,
+        maxLossHardUsd: null,
+        gaps: [
+          {
+            field: 'sizing',
+            kind: 'refused',
+            reasons: ['risk budget $41.66 buys 0 contracts at $75.63 risk/contract'],
+          },
+        ],
+      },
+      missing: ['sizing refused: risk budget $41.66 buys 0 contracts at $75.63 risk/contract'],
+    };
+    render(<DecisionPanelBody panel={payload} />);
+    // The numbers that ARE known are still on screen.
+    expect(screen.getByText('0.50')).toBeTruthy();
+    expect(screen.getByText('0.30')).toBeTruthy();
+    // And the blank is explained, not left as a dash.
+    expect(screen.getByTestId('wtt-risk-gaps').textContent).toContain('buys 0 contracts');
+    expect(screen.getByTestId('wtt-risk-gaps').textContent).toContain('refused');
+  });
+
+  it('an unbuildable cell reads "not built" — never a fabricated number, never an empty box', () => {
+    const payload = fullPayload();
+    payload.risk = {
+      status: 'incomplete',
+      data: {
+        ...payload.risk.data!,
+        stop: null,
+        rewardRisk: null,
+        quantity: null,
+        unit: null,
+        maxLossAtStopUsd: null,
+        maxLossHardUsd: null,
+        gaps: [{ field: 'invalidation', kind: 'unbuildable', reasons: ['stopLoss missing/non-finite'] }],
+      },
+      missing: ['invalidation'],
+    };
+    render(<DecisionPanelBody panel={payload} />);
+    expect(screen.getByText('0.50')).toBeTruthy(); // entry survives
+    expect(screen.getAllByText('not built').length).toBeGreaterThanOrEqual(3);
+    expect(screen.getByTestId('wtt-risk-gaps').textContent).toContain('stopLoss missing/non-finite');
   });
 
   it('renders a fully-populated panel in <100ms (acceptance budget)', () => {

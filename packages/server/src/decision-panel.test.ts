@@ -306,6 +306,91 @@ describe('buildDecisionPanel — actions are intents, never orders', () => {
   });
 });
 
+// TRA-4654 (2026-09-22) — the risk section used to be ALL-OR-NOTHING: one
+// absent upstream card field nulled the whole `data`, so the live 09-22 bqb1
+// panel rendered a BLANK "how much can I lose" box for a card whose entry,
+// stop, target, R:R, cost and holding period were every one of them computed.
+// The blanks now populate per cell, each gap named in the card's own words —
+// without relaxing the section status, which is what the gate reads.
+describe('buildDecisionPanel — risk section fills cell by cell', () => {
+  /** The live 09-22 shape: budget too small for one contract ⇒ sizing REFUSED. */
+  const tinyBudget: CardBuildContext = {
+    ...CARD_CTX,
+    sizing: { managedEquity: 1_000, riskPerTrade: 0.01 },
+  };
+
+  it('a refused sizing still publishes entry/stop/target/R:R — the known numbers are not withheld', () => {
+    const card = buildTradeOpportunityCard(otmSignal(), tinyBudget);
+    expect(card.fields.sizing.status).toBe('refused');
+    const panel = buildDecisionPanel(card, FULL_PANEL_CTX);
+    expect(panel.risk.data).not.toBeNull();
+    expect(panel.risk.data).toMatchObject({
+      entry: 0.5,
+      stop: 0.3,
+      takeProfit: 1.0,
+      quantity: 0,
+      unit: 'contracts',
+      costR: card.fields.costs.data!.costR,
+    });
+    expect(panel.risk.data!.rewardRisk).toBeCloseTo(2.5, 10);
+    expect(panel.risk.data!.holdingPeriod).not.toBeNull();
+  });
+
+  it('a refused sizing is NOT a verified read: the zeros are the refusal, and the section says so', () => {
+    const card = buildTradeOpportunityCard(otmSignal(), tinyBudget);
+    const panel = buildDecisionPanel(card, FULL_PANEL_CTX);
+    // quantity 0 / max loss $0 are arithmetically true and would otherwise
+    // verify the section. They must not.
+    expect(panel.risk.data!.maxLossAtStopUsd).toBe(0);
+    expect(panel.risk.status).toBe('incomplete');
+    expect(panel.incompleteSections).toContain('risk');
+    expect(panel.risk.missing.join(' ')).toContain('sizing refused');
+    expect(panel.risk.data!.gaps).toEqual([
+      { field: 'sizing', kind: 'refused', reasons: card.fields.sizing.missing },
+    ]);
+    // The reason is the card's own sentence, not a paraphrase.
+    expect(panel.risk.data!.gaps[0].reasons.join(' ')).toContain('buys 0 contracts');
+    // Gate unmoved.
+    expect(panel.complete).toBe(false);
+    expect(panel.actions.paperTrade.enabled).toBe(false);
+  });
+
+  it('an unbuildable field blanks ONLY its own cells, and is labelled unbuildable, not refused', () => {
+    // No stop ⇒ invalidation and sizing have no data at all; the entry does.
+    const card = buildTradeOpportunityCard(otmSignal({ stopLoss: Number.NaN }), CARD_CTX);
+    expect(card.fields.invalidation.data).toBeNull();
+    expect(card.fields.sizing.data).toBeNull();
+    const panel = buildDecisionPanel(card, FULL_PANEL_CTX);
+    expect(panel.risk.data).not.toBeNull();
+    expect(panel.risk.data!.entry).toBe(0.5);
+    expect(panel.risk.data!.stop).toBeNull();
+    expect(panel.risk.data!.quantity).toBeNull();
+    expect(panel.risk.data!.unit).toBeNull();
+    expect(panel.risk.data!.maxLossAtStopUsd).toBeNull();
+    // Targets go too — R:R is not derivable without the stop — but the entry
+    // survives, which is the whole point.
+    expect(panel.risk.data!.gaps.map(g => [g.field, g.kind])).toEqual([
+      ['invalidation', 'unbuildable'],
+      ['targets', 'unbuildable'],
+      ['sizing', 'unbuildable'],
+    ]);
+    // Data failures are named ahead of any policy refusal.
+    expect(panel.risk.missing.slice(0, 3)).toEqual(['invalidation', 'targets', 'sizing']);
+    expect(panel.risk.status).toBe('incomplete');
+    expect(panel.complete).toBe(false);
+  });
+
+  it('control: a fully verified card reports NO gaps and no null cells', () => {
+    const card = buildTradeOpportunityCard(otmSignal(), CARD_CTX);
+    const panel = buildDecisionPanel(card, FULL_PANEL_CTX);
+    expect(panel.risk.status).toBe('verified');
+    expect(panel.risk.data!.gaps).toEqual([]);
+    for (const k of ['entry', 'stop', 'quantity', 'unit', 'maxLossAtStopUsd'] as const) {
+      expect(panel.risk.data![k]).not.toBeNull();
+    }
+  });
+});
+
 describe('buildDecisionPanel — assembly budget', () => {
   it('assembles in <100ms against an oversized book (500 positions, 5000 history rows)', () => {
     const card = buildTradeOpportunityCard(otmSignal(), CARD_CTX);
