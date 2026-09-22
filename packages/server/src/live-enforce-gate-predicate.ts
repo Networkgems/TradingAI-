@@ -128,6 +128,53 @@ function finite(n: number | null | undefined): number | null {
 }
 
 /**
+ * TRA-4745 — RE-EVALUATE the published inequality from the published numbers.
+ *
+ * Returns whether `lhs op rhs` HOLDS, or null when nothing was compared.
+ *
+ * ⚠️ This is deliberately derived from the three PUBLISHED fields rather than
+ * read off `admit`. That is the whole point: it lets a reader ask whether the
+ * comparison the payload SHOWS is the one that produced the outcome the payload
+ * RECORDS. See {@link predicateOutcomeConsistent}.
+ */
+export function predicateHolds(p: LiveEnforceGatePredicate): boolean | null {
+  if (!p.compared || p.lhs === null || p.rhs === null) return null;
+  return p.op === '>=' ? p.lhs >= p.rhs : p.lhs <= p.rhs;
+}
+
+/**
+ * ⭐ TRA-4745 — does the published comparison EXPLAIN the RECORDED outcome?
+ *
+ * `blockedOnTheRow` is the LEDGER's own outcome for that row ("what the deployed
+ * form actually did"), NOT the predicate's `admit`. Comparing against `admit`
+ * would only ask whether one verdict object is internally coherent; comparing
+ * against the recorded block is what tests whether the comparison on display is
+ * the thing that refused the candidate.
+ *
+ * The flat form admits exactly when its inequality holds, so on a compared row
+ * `holds === !blocked` is an INVARIANT. A row where it fails was refused (or let
+ * through) by something other than the comparison the payload displays — which
+ * is reading **(A)**, "a non-cost refusal is being stamped `cost_bar`", caught
+ * per row rather than inferred from an aggregate block rate.
+ *
+ * Null when no comparison ran (`compared: false`): a short-circuited row has no
+ * inequality to be consistent OR inconsistent with, and scoring it either way
+ * would manufacture a verdict about the precise rows this axis cannot see.
+ *
+ * ⛔ A `false` here is NOT "the gate is broken". It is "the displayed predicate
+ * is not the operative one", and the remedy is in the gate's attribution, not in
+ * the bar. Grade it against `rowsCompared` — 0 of 0 consistent is silence, not
+ * health.
+ */
+export function predicateOutcomeConsistent(
+  p: LiveEnforceGatePredicate,
+  blockedOnTheRow: boolean,
+): boolean | null {
+  const holds = predicateHolds(p);
+  return holds === null ? null : holds === !blockedOnTheRow;
+}
+
+/**
  * The realised predicate behind one {@link TapeExpectancyVerdict} — the DEPLOYED
  * flat form, and therefore the one every live `cost_bar` row on bqb1 was decided
  * by today.

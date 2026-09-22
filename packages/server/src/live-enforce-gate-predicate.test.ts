@@ -18,6 +18,8 @@ import {
   NET_EDGE_PRE_COMPARISON_REASON_CODES,
   TAPE_EXPECTANCY_PRE_COMPARISON_REASON_CODES,
   netEdgeFormPredicate,
+  predicateHolds,
+  predicateOutcomeConsistent,
   tapeExpectancyFlatPredicate,
 } from './live-enforce-gate-predicate.js';
 import {
@@ -218,5 +220,101 @@ describe('TRA-4745 — the net-edge form publishes the comparison IT ran', () =>
     expect(p.rhs).toBe(NET_EDGE.absCostFracCeiling);
     expect(p.lhsLabel).toContain('costFracOfPremium');
     expect(p.admit).toBe(false);
+  });
+});
+
+// ── The truth value, and the (A) test it makes possible ─────────────────────
+//
+// The live route rendered `grossR -0.2154 >= barR 0.3850 ⇒ BLOCK` — an
+// inequality and an outcome, with no statement of whether the inequality HELD.
+// Read at a glance that is an assertion followed by a refusal, which is exactly
+// reading (A) ("a non-cost refusal is being stamped `cost_bar`") — the mis-read
+// this ticket exists to kill, reproduced one layer down inside its own fix.
+
+describe('TRA-4745 — the predicate re-evaluates, and says whether it explains its own outcome', () => {
+  /** A blocked row, real verdict: lower bound 0.04 against a 0.385 bar. */
+  function blockedPredicate() {
+    return tapeExpectancyFlatPredicate(
+      tapeExpectancyVerdict(
+        { structure: OTM, delta: AUTHORIZED_DELTA },
+        tableOf(AUTHORIZED_DELTA, 0.01),
+        DEFAULT_COST_GATE_CONFIG,
+      ),
+    );
+  }
+
+  it('`holds` is FALSE on the live-shaped blocked row — the number the statement was missing', () => {
+    const p = blockedPredicate();
+    expect(p.compared).toBe(true);
+    expect(p.lhs!).toBeLessThan(p.rhs!);
+    // The whole point: `>=` between those two numbers does NOT hold, and now the
+    // payload says so rather than leaving the reader to do the arithmetic.
+    expect(predicateHolds(p)).toBe(false);
+  });
+
+  it('`holds` is TRUE on an admitted row, and derives from the NUMBERS, not from `admit`', () => {
+    const p = tapeExpectancyFlatPredicate(
+      tapeExpectancyVerdict(
+        { structure: OTM, delta: AUTHORIZED_DELTA },
+        tableOf(AUTHORIZED_DELTA, 5),
+        DEFAULT_COST_GATE_CONFIG,
+      ),
+    );
+    expect(predicateHolds(p)).toBe(true);
+    // Independence from `admit` is the property that gives the consistency test
+    // its teeth: flip the recorded verdict and the re-evaluation does NOT follow.
+    expect(predicateHolds({ ...p, admit: false })).toBe(true);
+  });
+
+  it('a short-circuited row has NO truth value — null, never a default', () => {
+    const p = tapeExpectancyFlatPredicate(
+      tapeExpectancyVerdict({ structure: OTM, delta: AUTHORIZED_DELTA }, null, DEFAULT_COST_GATE_CONFIG),
+    );
+    expect(p.compared).toBe(false);
+    expect(predicateHolds(p)).toBeNull();
+    // ⛔ And it is consistent with NOTHING — scoring it either way would invent a
+    // verdict about precisely the rows this axis cannot see.
+    expect(predicateOutcomeConsistent(p, true)).toBeNull();
+    expect(predicateOutcomeConsistent(p, false)).toBeNull();
+  });
+
+  it('the invariant holds on a real blocked row: FALSE predicate ⇒ blocked', () => {
+    expect(predicateOutcomeConsistent(blockedPredicate(), true)).toBe(true);
+  });
+
+  it('⭐ reading (A) is CAUGHT: a false predicate on an ADMITTED row is inconsistent', () => {
+    // The gate refused nothing here, yet the comparison on display says it
+    // should have — i.e. something other than this comparison decided the row.
+    expect(predicateOutcomeConsistent(blockedPredicate(), false)).toBe(false);
+  });
+
+  it('⭐ and the other direction: a HOLDING predicate on a BLOCKED row is inconsistent', () => {
+    // This is the live shape reading (A) predicts — a candidate whose cost
+    // comparison passes, refused anyway and stamped `cost_bar`.
+    const p = tapeExpectancyFlatPredicate(
+      tapeExpectancyVerdict(
+        { structure: OTM, delta: AUTHORIZED_DELTA },
+        tableOf(AUTHORIZED_DELTA, 5),
+        DEFAULT_COST_GATE_CONFIG,
+      ),
+    );
+    expect(predicateHolds(p)).toBe(true);
+    expect(predicateOutcomeConsistent(p, true)).toBe(false);
+  });
+
+  it('the `<=` form is evaluated as `<=`, not as the `>=` the flat form uses', () => {
+    // A hard-coded `>=` would silently invert every net-edge row's truth value.
+    const p = netEdgeFormPredicate(
+      netEdgeBarVerdict(
+        { mark: 0.5, bid: 0.1, ask: 0.9, riskPerShare: 1, modeledGrossR: 5 },
+        NET_EDGE,
+      ),
+      5,
+      NET_EDGE,
+    );
+    expect(p.op).toBe('<=');
+    expect(p.lhs!).toBeGreaterThan(p.rhs!);
+    expect(predicateHolds(p)).toBe(false);
+    expect(predicateOutcomeConsistent(p, true)).toBe(true);
   });
 });

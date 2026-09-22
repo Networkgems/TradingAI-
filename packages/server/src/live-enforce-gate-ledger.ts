@@ -46,7 +46,11 @@ import {
   netEdgeShadowAdmits,
   type NetEdgeShadowSample,
 } from './option-net-edge-bar.js';
-import { impliedBarR } from './live-enforce-gate-predicate.js';
+import {
+  impliedBarR,
+  predicateHolds,
+  predicateOutcomeConsistent,
+} from './live-enforce-gate-predicate.js';
 import type { ImpliedBarR, LiveEnforceGatePredicate } from './live-enforce-gate-predicate.js';
 // TRA-4753 — the NUMERATOR's provenance: the counterpart of `impliedBarR`, which
 // recovered the denominator.
@@ -1563,6 +1567,15 @@ export interface LiveEnforceCellSummary {
    */
   rowsCompared: number;
   rowsShortCircuited: number;
+  /**
+   * ⭐ TRA-4745 — of this cell's `rowsCompared`, how many the displayed
+   * comparison does NOT explain (`holds !== !blocked`). The (A)/(B)
+   * discriminator as a CENSUS rather than a sample: `predicateSamples` can
+   * witness an inconsistency but never bound it. `0` against a nonzero
+   * `rowsCompared` is a real all-clear for this cell; `0` against
+   * `rowsCompared: 0` is silence.
+   */
+  rowsPredicateInconsistent: number;
 }
 
 /**
@@ -1752,7 +1765,15 @@ export interface GrossRQuantiles extends QuantileBlock {
  */
 export interface LiveEnforcePredicateSample {
   etDay: string;
-  /** The comparison, rendered — e.g. `grossR 0.1645 >= barR 0.3850 ⇒ BLOCK`. */
+  /**
+   * The comparison, rendered WITH its truth value — e.g.
+   * `grossR -0.2154 >= barR 0.3850 → FALSE ⇒ BLOCK`.
+   *
+   * The `→ TRUE`/`→ FALSE` is load-bearing: without it the line reads as an
+   * assertion that held followed by a refusal, which is indistinguishable at a
+   * glance from reading (A). An inconsistent row additionally carries a loud
+   * `⚠️ INCONSISTENT` tail — see {@link outcomeConsistent}.
+   */
   statement: string;
   form: string;
   /** FALSE ⇒ the gate refused on a precondition; `lhs`/`rhs` are null and NO inequality ran. */
@@ -1764,6 +1785,18 @@ export interface LiveEnforcePredicateSample {
   rhs: number | null;
   /** `rhs − lhs` on a `>=` comparison — the `byReason` shortfall. Null otherwise. */
   shortfallR: number | null;
+  /**
+   * Does `lhs op rhs` HOLD, re-evaluated from the three published numbers?
+   * Null ⇔ `compared === false`.
+   */
+  holds: boolean | null;
+  /**
+   * ⭐ `holds === !blocked` — does the displayed comparison EXPLAIN the recorded
+   * outcome? `false` is reading (A) caught on a single row: this candidate was
+   * refused by something other than the comparison shown. Null ⇔ no comparison
+   * ran. Grade against `rowsCompared`, never alone.
+   */
+  outcomeConsistent: boolean | null;
   /** The precondition that fired when `compared === false`; null otherwise. */
   shortCircuit: string | null;
   reasonCode: string | null;
@@ -2124,6 +2157,16 @@ export interface LiveEnforceGateSummary {
   rowsShortCircuited: number | null;
   predicateUnstamped: number | null;
   /**
+   * ⭐ TRA-4745 — gate-wide count of compared rows whose displayed comparison
+   * does not explain their own recorded outcome. This is the (A) test over the
+   * WHOLE stamped census. Non-null on `cost_bar` only.
+   *
+   * Read it as a FRACTION of `rowsCompared`. Nonzero ⇒ a non-cost refusal is
+   * being stamped `cost_bar` and the remedy is in the gate's attribution, not
+   * the bar and not the edge estimator.
+   */
+  rowsPredicateInconsistent: number | null;
+  /**
    * ⭐ TRA-4753 — the NUMERATOR's provenance over the WHOLE gate: which estimator
    * folds decided, how many rows each was replayed across, and the tape age
    * behind them at decision time. Non-null on `cost_bar` only.
@@ -2334,7 +2377,18 @@ function predicateStatement(s: CostSample, p: LiveEnforceGatePredicate): string 
   if (!p.compared) {
     return `NO COMPARISON — short-circuited on \`${p.shortCircuit ?? 'unknown'}\` ⇒ ${outcome}`;
   }
-  return `${p.lhsLabel.split(' —')[0]} ${p.lhs!.toFixed(4)} ${p.op} ${p.rhsLabel.split(' —')[0]} ${p.rhs!.toFixed(4)} ⇒ ${outcome}`;
+  // TRA-4745 follow-up — render the inequality's TRUTH VALUE, not just the
+  // inequality and the outcome. `grossR -0.2154 >= barR 0.3850 ⇒ BLOCK` reads as
+  // an assertion that HELD followed by a refusal, i.e. it looks like reading (A)
+  // to anyone scanning it — which is the exact mis-reading this ticket exists to
+  // kill, reproduced one layer down in my own field. The `→ FALSE` is what makes
+  // the line self-consistent.
+  const holds = predicateHolds(p);
+  const truth = holds === null ? 'UNKNOWN' : holds ? 'TRUE' : 'FALSE';
+  const consistent = predicateOutcomeConsistent(p, s.blocked);
+  // Loud, and on the ROW: an inconsistent row is reading (A) caught in the act.
+  const flag = consistent === false ? '  ⚠️ INCONSISTENT — the displayed comparison did NOT decide this row' : '';
+  return `${p.lhsLabel.split(' —')[0]} ${p.lhs!.toFixed(4)} ${p.op} ${p.rhsLabel.split(' —')[0]} ${p.rhs!.toFixed(4)} → ${truth} ⇒ ${outcome}${flag}`;
 }
 
 /**
@@ -2367,6 +2421,8 @@ function predicateSamples(samples: CostSample[]): LiveEnforcePredicateSample[] {
         p.compared && p.op === '>=' && p.lhs !== null && p.rhs !== null
           ? round(p.rhs - p.lhs, 6)
           : null,
+      holds: predicateHolds(p),
+      outcomeConsistent: predicateOutcomeConsistent(p, s.blocked),
       shortCircuit: p.shortCircuit,
       reasonCode: s.reasonCode,
       costR: Number.isFinite(s.costR) ? round(s.costR, 6) : null,
@@ -2397,21 +2453,37 @@ function grossRProvenanceFold(samples: CostSample[]): GrossRProvenanceFold | nul
   );
 }
 
-/** TRA-4745 — compared / short-circuited split over a sample list. */
+/**
+ * TRA-4745 — compared / short-circuited split over a sample list, plus the
+ * CENSUS of rows whose displayed comparison does not explain their own outcome.
+ *
+ * `rowsPredicateInconsistent` is the (A)/(B) discriminator promoted from a
+ * sample to a count: `predicateSamples` shows one row per cell per day, which
+ * can only ever witness an inconsistency, never bound it. This counter is over
+ * EVERY compared row in the fold, so `0` is a real all-clear on the stamped
+ * population and any nonzero is a live attribution defect with a denominator
+ * (`rowsCompared`) attached.
+ */
 function predicateCoverage(samples: CostSample[]): {
   rowsCompared: number;
   rowsShortCircuited: number;
   predicateUnstamped: number;
+  rowsPredicateInconsistent: number;
 } {
   let rowsCompared = 0;
   let rowsShortCircuited = 0;
   let predicateUnstamped = 0;
+  let rowsPredicateInconsistent = 0;
   for (const s of samples) {
     if (s.predicate === null) predicateUnstamped += 1;
-    else if (s.predicate.compared) rowsCompared += 1;
-    else rowsShortCircuited += 1;
+    else if (s.predicate.compared) {
+      rowsCompared += 1;
+      if (predicateOutcomeConsistent(s.predicate, s.blocked) === false) {
+        rowsPredicateInconsistent += 1;
+      }
+    } else rowsShortCircuited += 1;
   }
-  return { rowsCompared, rowsShortCircuited, predicateUnstamped };
+  return { rowsCompared, rowsShortCircuited, predicateUnstamped, rowsPredicateInconsistent };
 }
 
 /** Options for the counterfactual sweep — resolved config, never literals. */
@@ -2775,6 +2847,7 @@ function foldGates(
         predicateUnstamped: coverage.predicateUnstamped,
         rowsCompared: coverage.rowsCompared,
         rowsShortCircuited: coverage.rowsShortCircuited,
+        rowsPredicateInconsistent: coverage.rowsPredicateInconsistent,
       });
     }
     byCell.sort((a, b) => b.evaluated - a.evaluated || a.cell.localeCompare(b.cell));
@@ -2878,6 +2951,9 @@ function foldGates(
       rowsCompared: instrumented ? gatePredicateCoverage.rowsCompared : null,
       rowsShortCircuited: instrumented ? gatePredicateCoverage.rowsShortCircuited : null,
       predicateUnstamped: instrumented ? gatePredicateCoverage.predicateUnstamped : null,
+      rowsPredicateInconsistent: instrumented
+        ? gatePredicateCoverage.rowsPredicateInconsistent
+        : null,
       costBySymbol: instrumented ? costBySymbol : null,
       costRowsMissingSymbol: instrumented ? tallies.symbolRowsMissing : null,
       netEdgeShadow: instrumented

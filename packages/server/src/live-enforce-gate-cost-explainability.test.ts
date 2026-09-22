@@ -83,6 +83,58 @@ function comparedRow(opts: {
   );
 }
 
+/**
+ * ⭐ READING (A), synthesised: the row is REFUSED and stamped `cost_bar`, but the
+ * comparison it publishes HOLDS (`grossR >= barR`). Something other than the
+ * displayed predicate decided it.
+ *
+ * This shape cannot be produced by `comparedRow`, which derives `blocked` from
+ * the same inequality it publishes and so is consistent by construction — which
+ * is exactly why the consistency axis needs its own fixture rather than being
+ * asserted against rows that can never violate it.
+ */
+function misattributedRow(opts: {
+  day?: string;
+  cell: string;
+  structure: string;
+  grossR: number;
+  costR: number;
+  ts: number;
+}) {
+  recordLiveEnforceDecision(
+    'cost_bar',
+    opts.structure,
+    true,
+    opts.day ?? DAY,
+    'refused for a reason the published predicate does not state',
+    opts.ts,
+    {
+      reasonCode: 'shortfall_gte_0.50',
+      cell: opts.cell,
+      symbol: 'RIG',
+      grossR: opts.grossR,
+      cost: {
+        costR: opts.costR,
+        spreadR: opts.costR * 0.82,
+        feeR: opts.costR * 0.18,
+        costFracOfPremium: 0.1,
+      },
+      predicate: {
+        form: 'tape_expectancy_flat',
+        compared: true,
+        lhsLabel: LHS_LABEL,
+        lhs: opts.grossR,
+        op: '>=',
+        rhsLabel: RHS_LABEL,
+        rhs: BAR,
+        // The verdict says ADMIT and the ledger recorded a BLOCK.
+        admit: true,
+        shortCircuit: null,
+      },
+    },
+  );
+}
+
 /** A row the gate SHORT-CIRCUITED: the cell was never measured, so no inequality ran. */
 function shortCircuitRow(opts: {
   day?: string;
@@ -325,11 +377,103 @@ describe('TRA-4745 — cost_bar explains its own block rate', () => {
     expect(cb.costBySymbol).toEqual([]);
     expect(cb.costRowsMissingSymbol).toBe(0);
     expect(cb.rowsCompared).toBe(0);
+    expect(cb.rowsPredicateInconsistent).toBe(0);
     for (const g of s.byGate.filter((x) => x.gate !== 'cost_bar')) {
       expect(g.grossRQuantiles).toBeNull();
       expect(g.costBySymbol).toBeNull();
       expect(g.costRowsMissingSymbol).toBeNull();
       expect(g.rowsCompared).toBeNull();
+      expect(g.rowsPredicateInconsistent).toBeNull();
     }
+  });
+
+  // ── The statement says whether the comparison HELD, and (A) is counted ─────
+  //
+  // The live route rendered `grossR -0.2154 >= barR 0.3850 ⇒ BLOCK`: an
+  // inequality, then a refusal, with nothing saying the inequality was FALSE.
+  // Scanned quickly that reads as reading (A) — the exact mis-read this ticket
+  // exists to kill, reproduced inside its own fix.
+
+  it('a blocked row renders its comparison as FALSE, not as a bare assertion', () => {
+    comparedRow({ cell: RV_CELL, structure: 'single_leg_rv', grossR: 0.05, costR: 0.16, ts: 1_001 });
+    const sample = costBar().byCell.find((c) => c.cell === RV_CELL)!.predicateSamples[0]!;
+    expect(sample.holds).toBe(false);
+    expect(sample.outcomeConsistent).toBe(true);
+    expect(sample.statement).toContain('→ FALSE ⇒ BLOCK');
+    // …and it must NOT be flagged: a false predicate on a blocked row is the
+    // gate working exactly as published.
+    expect(sample.statement).not.toContain('INCONSISTENT');
+  });
+
+  it('an admitted row renders TRUE — the truth value tracks the NUMBERS', () => {
+    comparedRow({ cell: RV_CELL, structure: 'single_leg_rv', grossR: BAR + 0.1, costR: 0.16, ts: 1_001 });
+    // Admits produce no `predicateSamples` (blocked rows only, by design), so
+    // the assertion is on the census pair instead.
+    const cell = costBar().byCell.find((c) => c.cell === RV_CELL)!;
+    expect(cell.blocked).toBe(0);
+    expect(cell.rowsCompared).toBe(1);
+    expect(cell.rowsPredicateInconsistent).toBe(0);
+  });
+
+  it('⭐ READING A — a HOLDING predicate on a BLOCKED row is counted AND flagged', () => {
+    misattributedRow({ cell: RV_CELL, structure: 'single_leg_rv', grossR: BAR + 0.2, costR: 0.16, ts: 1_001 });
+    const cb = costBar();
+    const cell = cb.byCell.find((c) => c.cell === RV_CELL)!;
+
+    // The row IS a block, and it IS a comparison — so neither existing axis
+    // would have noticed anything.
+    expect(cell.blockRate).toBe(1);
+    expect(cell.rowsCompared).toBe(1);
+    expect(cell.rowsShortCircuited).toBe(0);
+
+    // ⭐ …and this is the axis that does.
+    expect(cell.rowsPredicateInconsistent).toBe(1);
+    expect(cb.rowsPredicateInconsistent).toBe(1);
+    const sample = cell.predicateSamples[0]!;
+    expect(sample.holds).toBe(true);
+    expect(sample.outcomeConsistent).toBe(false);
+    expect(sample.statement).toContain('→ TRUE ⇒ BLOCK');
+    expect(sample.statement).toContain('INCONSISTENT');
+  });
+
+  it('the inconsistency count is a CENSUS, not a sample — it sees rows no sample shows', () => {
+    // Ten misattributed rows on ONE day. `predicateSamples` shows exactly one of
+    // them (one blocked row per cell per day), so a reader grading off the
+    // sample alone could never bound the defect. The counter can.
+    for (let i = 0; i < 10; i += 1) {
+      misattributedRow({
+        cell: RV_CELL, structure: 'single_leg_rv', grossR: BAR + 0.2, costR: 0.16, ts: 1_001 + i,
+      });
+    }
+    // …plus two rows that are entirely in order, so the count is not just
+    // "every compared row".
+    comparedRow({ cell: OTM_CELL, structure: 'single_leg_otm', grossR: 0.05, costR: 0.2, ts: 2_001 });
+    comparedRow({ cell: OTM_CELL, structure: 'single_leg_otm', grossR: 0.05, costR: 0.2, ts: 2_002 });
+
+    const cb = costBar();
+    expect(cb.rowsCompared).toBe(12);
+    expect(cb.rowsPredicateInconsistent).toBe(10);
+    expect(cb.byCell.find((c) => c.cell === RV_CELL)!.rowsPredicateInconsistent).toBe(10);
+    // The clean cell stays clean — the axis localises the defect.
+    expect(cb.byCell.find((c) => c.cell === OTM_CELL)!.rowsPredicateInconsistent).toBe(0);
+    // And the sample surface really does only show one of the ten.
+    expect(cb.byCell.find((c) => c.cell === RV_CELL)!.predicateSamples).toHaveLength(1);
+  });
+
+  it('a SHORT-CIRCUITED row is neither consistent nor inconsistent — it is not counted', () => {
+    // The largest live bucket. Scoring it either way would manufacture a verdict
+    // about precisely the rows that ran no comparison at all.
+    for (let i = 0; i < 5; i += 1) {
+      shortCircuitRow({ cell: RV_CELL, structure: 'single_leg_rv', costR: 0.2, ts: 1_001 + i });
+    }
+    const cb = costBar();
+    expect(cb.rowsShortCircuited).toBe(5);
+    expect(cb.rowsCompared).toBe(0);
+    // ⛔ Zero here is SILENCE, not an all-clear — read it against `rowsCompared`.
+    expect(cb.rowsPredicateInconsistent).toBe(0);
+    const sample = cb.byCell.find((c) => c.cell === RV_CELL)!.predicateSamples[0]!;
+    expect(sample.holds).toBeNull();
+    expect(sample.outcomeConsistent).toBeNull();
+    expect(sample.statement).toContain('NO COMPARISON');
   });
 });
