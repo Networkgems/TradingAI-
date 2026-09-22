@@ -184,6 +184,15 @@ describe('TRA-3553 — `blind` separates "never measured" from "measured clean"'
       // is not blind at all in this case.
       liveImportedRows: null,
       blindReason: null,
+      // TRA-4594 (2026-09-22) — the ENV-SCOPED denominator and its word, added
+      // for the mirror defect: `blind: false` is reachable on a SANDBOX
+      // adoption, because the reconcile stamps `mode: 'live'` on every Tradier
+      // import regardless of env. Note this row is the proof that `blind: false`
+      // and "real money was measured" are independent — the census here is not
+      // blind and `productionWitness` still refuses, because no book was
+      // supplied. `unmeasured`, never `gradeable`, is the default.
+      liveProductionImportedRows: null,
+      productionWitness: 'unmeasured',
     });
   });
 });

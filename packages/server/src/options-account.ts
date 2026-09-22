@@ -2018,8 +2018,59 @@ export interface ImportProvenanceFleetSummary extends ImportProvenanceCensus {
    *                       the rows directly, do not re-arm waiting on `adopted`.
    * `unmeasured`        — no caller supplied a book, so the two above cannot
    *                       be told apart. Never treat as `no_imported_rows`.
+   * `sandbox_rows_only` — live imported rows ARE open, and NONE of them came
+   *                       from the production broker. Nothing was forgotten;
+   *                       there is no real-money adoption to grade. See
+   *                       {@link ImportProvenanceFleetSummary.productionWitness}.
    */
-  blindReason: 'no_imported_rows' | 'witness_lost_at_restart' | 'unmeasured' | null;
+  blindReason:
+    | 'no_imported_rows'
+    | 'witness_lost_at_restart'
+    | 'unmeasured'
+    | 'sandbox_rows_only'
+    | null;
+  /**
+   * TRA-4594 — the ENV-SCOPED durable denominator: of `liveImportedRows`, how
+   * many carry `tradierEnv: 'production'`. `null` = NOT MEASURED.
+   *
+   * ── Why `liveImportedRows` alone is not enough ───────────────────────────────
+   * The reconcile call site passes the mode `'live'` as a LITERAL (index.ts,
+   * `reconcileTradierPositions(env, positions, 'live')`), deliberately: option
+   * (a), deriving the mode from the env, was rejected because it would relocate
+   * every sandbox import into the demo book. The consequence, recorded in that
+   * same comment and graded by `tra3112-tradier-client-scope.test.ts`, is that
+   * **a SANDBOX import lands `mode: 'live'`** and is distinguishable only by the
+   * row's own `tradierEnv`.
+   *
+   * So a sandbox adoption sets `adopted > 0` (the mint increments
+   * unconditionally) AND `liveImportedRows > 0` (that count keys on `mode`
+   * alone). Both of TRA-4594's original discriminators flip together, and the
+   * vector reads as a real-money measurement having touched no real-money
+   * inventory — the exact mirror of the vacuous zero TRA-3553 was filed against,
+   * now as a false NON-blind.
+   *
+   * A row with `tradierEnv` ABSENT is NOT counted here. That field is stamped
+   * conditionally (`...(this.tradierEnv ? {tradierEnv} : {})`) and its own
+   * declaration reads "absent ↔ legacy sandbox bucket", so absent is the
+   * NON-production bucket by the convention that already governs it. Reading it
+   * as production would restore the defect through the legacy path.
+   */
+  liveProductionImportedRows: number | null;
+  /**
+   * TRA-4594 — the word a grader reads INSTEAD of re-deriving the inference,
+   * for the same reason `blind` is a word: the failure direction is a silent
+   * all-clear over an unmeasured real-money book. Always present, including
+   * when `blind` is false.
+   *
+   * `gradeable`    — at least one live imported row carries
+   *                  `tradierEnv: 'production'`. Real broker inventory has gone
+   *                  through the reconcile and the asks may be graded on it.
+   * `no_production_rows` — live imported rows may or may not exist, but none is
+   *                  a production row. **A non-blind vector in this state is
+   *                  NOT evidence about real money.**
+   * `unmeasured`   — no caller supplied a book. Never treat as either above.
+   */
+  productionWitness: 'gradeable' | 'no_production_rows' | 'unmeasured';
 }
 
 /**
@@ -2050,7 +2101,38 @@ export interface ImportProvenanceFleetSummary extends ImportProvenanceCensus {
  * what that route says about the real-money book.
  */
 export function countLiveImportedRows(positions: Iterable<OptionPosition>): number {
-  let rows = 0;
+  return countLiveImportedRowsByEnv(positions).total;
+}
+
+/**
+ * TRA-4594 — the same cohort as {@link countLiveImportedRows}, SPLIT BY the
+ * row's own `tradierEnv`.
+ *
+ * ── Why the split is load-bearing ───────────────────────────────────────────
+ * `mode` does not answer "is this real money". The reconcile call site passes
+ * `'live'` as a literal for every Tradier import regardless of env — a decision
+ * taken deliberately (deriving mode from env would have moved sandbox imports
+ * into the demo book) and graded by `tra3112-tradier-client-scope.test.ts`,
+ * which asserts a sandbox import lands `mode: 'live'` with `tradierEnv:
+ * 'sandbox'`. So `mode === 'live'` is satisfied by sandbox bytes, and the row's
+ * `tradierEnv` is the only field that separates them.
+ *
+ * `envUnknown` is its own bucket and is NOT folded into production: the stamp is
+ * conditional at every open site, and `tradierEnv`'s declaration defines absent
+ * as the "legacy sandbox bucket". Counting it as production would reopen the
+ * defect through the legacy path; counting it as sandbox would assert a
+ * provenance the row never made. It is named instead.
+ */
+export function countLiveImportedRowsByEnv(positions: Iterable<OptionPosition>): {
+  total: number;
+  production: number;
+  sandbox: number;
+  envUnknown: number;
+} {
+  let total = 0;
+  let production = 0;
+  let sandbox = 0;
+  let envUnknown = 0;
   for (const opt of positions) {
     if ((opt.mode ?? 'demo') !== 'live') continue;
     if (opt.closedAt !== undefined) continue;
@@ -2061,9 +2143,12 @@ export function countLiveImportedRows(positions: Iterable<OptionPosition>): numb
     // `signalType === 'tradier_import'` here would UNDERCOUNT by exactly the
     // engine-origin rows — the cohort ask 3 cares about most.
     if (opt.importedFromTradier !== true) continue;
-    rows += 1;
+    total += 1;
+    if (opt.tradierEnv === 'production') production += 1;
+    else if (opt.tradierEnv === undefined) envUnknown += 1;
+    else sandbox += 1;
   }
-  return rows;
+  return { total, production, sandbox, envUnknown };
 }
 
 const EMPTY_IMPORT_PROVENANCE_CENSUS: ImportProvenanceCensus = {
@@ -2116,6 +2201,14 @@ export function foldImportProvenanceCensuses(
    * false all-clear this argument exists to close.
    */
   liveImportedRows: number | null = null,
+  /**
+   * TRA-4594 — durable count of live imported rows that came from the
+   * PRODUCTION broker. Same `null`-means-unmeasured contract as the argument
+   * above, and for the same reason: `0` here would let an unmeasured fleet
+   * publish `no_production_rows`, which is a verdict about real money that
+   * nobody measured.
+   */
+  liveProductionImportedRows: number | null = null,
 ): ImportProvenanceFleetSummary {
   const total: ImportProvenanceCensus = { ...EMPTY_IMPORT_PROVENANCE_CENSUS };
   for (const one of censuses) {
@@ -2132,13 +2225,39 @@ export function foldImportProvenanceCensuses(
     ...total,
     blind,
     liveImportedRows,
+    liveProductionImportedRows,
+    // TRA-4594 — the env-scoped verdict, and it is deliberately derived from the
+    // PRODUCTION count alone. `liveImportedRows > 0` is NOT a fallback here: a
+    // fleet holding only sandbox imported rows must read `no_production_rows`,
+    // because that is precisely the state whose non-blind vector would otherwise
+    // be quoted as a real-money grade.
+    productionWitness:
+      liveProductionImportedRows === null
+        ? 'unmeasured'
+        : liveProductionImportedRows > 0
+          ? 'gradeable'
+          : 'no_production_rows',
     blindReason: !blind
       ? null
       : liveImportedRows === null
         ? 'unmeasured'
-        : liveImportedRows > 0
-          ? 'witness_lost_at_restart'
-          : 'no_imported_rows',
+        : liveImportedRows === 0
+          ? 'no_imported_rows'
+          : // Rows exist, so the census forgot something. `sandbox_rows_only`
+            // refines that ONLY when the production count was actually
+            // supplied and came back 0 — then nothing worth grading was lost.
+            //
+            // When it was NOT supplied this stays `witness_lost_at_restart`
+            // rather than degrading to `unmeasured`. That caller measured rows
+            // and "go grade the rows" is a true and actionable statement about
+            // them; replacing it with `unmeasured` would delete a truthful
+            // surface to satisfy a question this field was never asking. The
+            // env question is answered by `productionWitness`, which is always
+            // present and reads `unmeasured` here — so no caller is left
+            // inferring real money from a field that did not measure it.
+            liveProductionImportedRows !== null && liveProductionImportedRows === 0
+            ? 'sandbox_rows_only'
+            : 'witness_lost_at_restart',
   };
 }
 
@@ -15867,6 +15986,16 @@ export class PaperOptionsAccount {
    */
   liveImportedRowCount(): number {
     return countLiveImportedRows(this.openOptions.values());
+  }
+
+  /**
+   * TRA-4594 — the same level read as {@link liveImportedRowCount}, split by the
+   * row's own `tradierEnv`. `mode: 'live'` is satisfied by a SANDBOX import (see
+   * {@link countLiveImportedRowsByEnv}), so this is the only one of the two a
+   * real-money verdict may key on.
+   */
+  liveImportedRowCountByEnv(): ReturnType<typeof countLiveImportedRowsByEnv> {
+    return countLiveImportedRowsByEnv(this.openOptions.values());
   }
 
   /**

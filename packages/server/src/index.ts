@@ -12137,9 +12137,24 @@ app.get('/api/health/options-live', async (_req, res) => {
       // a real adopted real-money row that a deploy train forgot.
       // `liveImportedRows` is the durable denominator that tells those apart:
       // `witness_lost_at_restart` means GO GRADE THE ROWS, not "keep waiting".
+      //
+      // ⚠️ TRA-4594 — AND `blind: false` IS NOT "REAL MONEY WAS MEASURED".
+      // The reconcile below passes the mode `'live'` as a LITERAL for every
+      // Tradier import, sandbox included (that choice is argued at the call
+      // site and graded by `tra3112-tradier-client-scope.test.ts`). So a
+      // SANDBOX adoption increments `adopted` and `liveImportedRows` together
+      // and produces a non-blind vector over zero real-money inventory —
+      // the mirror of the vacuous zero, and reachable right now: this fleet
+      // carries a `runtimeMode: 'live'` book on a sandbox client
+      // (`brokerPositionDrift.sandboxLiveContexts`). Read `productionWitness`:
+      // only `gradeable` licenses a real-money verdict.
       importProvenance: foldImportProvenanceCensuses(
         getAllUserContexts().map(c => c.engine.getImportProvenanceCensus()),
         getAllUserContexts().reduce((n, c) => n + c.engine.getLiveImportedRowCount(), 0),
+        getAllUserContexts().reduce(
+          (n, c) => n + c.engine.getLiveProductionImportedRowCount(),
+          0,
+        ),
       ),
       // TRA-3822 — the counter `liveUnmanagedRisk` above is STRUCTURALLY UNABLE
       // to contain: is a live stop that is already THROUGH going to be acted on?

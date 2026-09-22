@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   PaperOptionsAccount,
   countLiveImportedRows,
+  countLiveImportedRowsByEnv,
   foldImportProvenanceCensuses,
   type ImportProvenanceCensus,
 } from './options-account.js';
@@ -206,5 +207,167 @@ describe('TRA-4594 — countLiveImportedRows counts the right cohort', () => {
     expect(countLiveImportedRows([row('A')] as never)).toBe(1);
     expect(countLiveImportedRows([row('A'), row('B')] as never)).toBe(2);
     expect(countLiveImportedRows([row('A'), row('B'), row('C')] as never)).toBe(3);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-4594 (2026-09-22) — THE MIRROR DEFECT, found while grading this row's own
+// Definition of Done against the live fleet.
+//
+// DoD 1 as filed reads: "`importProvenance.blind` reads `false` on bqb1 -- i.e.
+// at least one real live adoption has gone through the reconcile." The `i.e.` is
+// the bug. `blind` is `adopted === 0`, the mint increments `adopted`
+// UNCONDITIONALLY, and the reconcile call site passes the mode `'live'` as a
+// literal for every Tradier import — sandbox included. That is deliberate and
+// argued in place (deriving mode from env would relocate sandbox imports into
+// the demo book) and `tra3112-tradier-client-scope.test.ts` grades it: a sandbox
+// import lands `mode: 'live'` with `tradierEnv: 'sandbox'`.
+//
+// `countLiveImportedRows` keys on `mode` alone. So BOTH discriminators this
+// ticket shipped — `blind: false` and `liveImportedRows > 0` — move together on
+// a SANDBOX adoption, over zero real-money inventory. The row filed to stop a
+// vacuous zero being graded green specified an AC that a sandbox row satisfies.
+//
+// Reachable on the live fleet, not hypothetical. Measured on bqb1
+// 2026-09-22T20:13Z, build `9472ced3`: `serviceTradierEnv: "sandbox"`,
+// `brokerPositionDrift.sandboxLiveContexts: 1`, and that context (`Richard`)
+// reads `runtimeMode: "live"`, `clientPresent: true`, `optionsRouted: true`.
+// One adoption in that book flips the fleet vector non-blind.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('TRA-4594 — `blind: false` is not "real money was measured"', () => {
+  const zero: ImportProvenanceCensus = {
+    adopted: 0,
+    engineOrigin: 0,
+    foreign: 0,
+    unresolved: 0,
+    underlyingBackfilled: 0,
+    underlyingUnknown: 0,
+    entryDeltaRestored: 0,
+  };
+
+  it('REPRODUCES THE FALSE NON-BLIND: a sandbox adoption satisfies both of DoD 1\'s discriminators', () => {
+    const sandboxAcct = new PaperOptionsAccount({
+      initialEquity: 25_000,
+      tradierEnv: 'sandbox',
+      resolveUnderlyingEntrySpot: () => 331.69,
+    });
+    // The mode literal the real call site passes, for sandbox bytes.
+    sandboxAcct.reconcileTradierPositions([buildTslaImport()], 'live');
+
+    const row = sandboxAcct.getState().openOptions[0]!;
+    expect(row.mode).toBe('live'); // ...on a SANDBOX client
+    expect(row.tradierEnv).toBe('sandbox');
+
+    // Both fields TRA-4594 shipped as the gate flip together:
+    const census = sandboxAcct.importProvenanceSummary();
+    expect(census.adopted).toBe(1);
+    expect(sandboxAcct.liveImportedRowCount()).toBe(1);
+
+    const fold = foldImportProvenanceCensuses(
+      [census],
+      sandboxAcct.liveImportedRowCount(),
+      sandboxAcct.liveImportedRowCountByEnv().production,
+    );
+    expect(fold.blind).toBe(false); // ← DoD 1 satisfied...
+    expect(fold.liveImportedRows).toBe(1); // ← ...and its durable companion too
+
+    // ...and the new field is what refuses the grade. THIS is the assertion a
+    // real-money verdict must key on.
+    expect(fold.liveProductionImportedRows).toBe(0);
+    expect(fold.productionWitness).toBe('no_production_rows');
+    expect(fold.productionWitness).not.toBe('gradeable');
+  });
+
+  it('a PRODUCTION adoption is gradeable, so the guard is not simply always-refuse', () => {
+    recordEngineOpen(OCC, 'single_leg_otm');
+    const acct = liveAccount({ resolveUnderlyingEntrySpot: () => 331.69 });
+    acct.reconcileTradierPositions([buildTslaImport()], 'live');
+
+    const byEnv = acct.liveImportedRowCountByEnv();
+    expect(byEnv).toMatchObject({ total: 1, production: 1, sandbox: 0, envUnknown: 0 });
+
+    const fold = foldImportProvenanceCensuses(
+      [acct.importProvenanceSummary()],
+      byEnv.total,
+      byEnv.production,
+    );
+    expect(fold).toMatchObject({
+      blind: false,
+      liveProductionImportedRows: 1,
+      productionWitness: 'gradeable',
+    });
+  });
+
+  it('an unmeasured production count is NEVER gradeable, and never `no_production_rows` either', () => {
+    // Same convention as `liveImportedRows` above: absent evidence is NOT
+    // MEASURED, not an all-clear and not a refusal-with-a-reason. A `0` default
+    // would let a caller holding no book publish a real-money verdict.
+    const fold = foldImportProvenanceCensuses([zero], 0);
+    expect(fold.liveProductionImportedRows).toBeNull();
+    expect(fold.productionWitness).toBe('unmeasured');
+    expect(fold.productionWitness).not.toBe('gradeable');
+    expect(fold.productionWitness).not.toBe('no_production_rows');
+  });
+
+  it('`sandbox_rows_only` separates the third zero, and does NOT delete `witness_lost_at_restart`', () => {
+    // Rows open, none of them production ⇒ nothing worth grading was forgotten.
+    expect(foldImportProvenanceCensuses([zero], 2, 0)).toMatchObject({
+      blind: true,
+      liveImportedRows: 2,
+      blindReason: 'sandbox_rows_only',
+      productionWitness: 'no_production_rows',
+    });
+
+    // A production row IS the one the census forgot ⇒ unchanged: grade the rows.
+    expect(foldImportProvenanceCensuses([zero], 2, 2)).toMatchObject({
+      blindReason: 'witness_lost_at_restart',
+      productionWitness: 'gradeable',
+    });
+
+    // The env count NOT supplied ⇒ the rows were still measured, so the true and
+    // actionable reading survives for the legacy 2-arg caller. The env question
+    // is answered by `productionWitness`, not by degrading this field.
+    expect(foldImportProvenanceCensuses([zero], 2)).toMatchObject({
+      blindReason: 'witness_lost_at_restart',
+      productionWitness: 'unmeasured',
+    });
+  });
+
+  it('an ABSENT `tradierEnv` is not production: the legacy bucket must not reopen the defect', () => {
+    // `tradierEnv` is stamped conditionally at every open site and its own
+    // declaration defines absent as "legacy sandbox bucket". Folding absent into
+    // `production` would restore the false non-blind through the legacy path;
+    // calling it `sandbox` would assert a provenance the row never made.
+    const open = { optionSymbol: OCC, mode: 'live', importedFromTradier: true };
+    expect(countLiveImportedRowsByEnv([open] as never)).toMatchObject({
+      total: 1,
+      production: 0,
+      sandbox: 0,
+      envUnknown: 1,
+    });
+    expect(countLiveImportedRowsByEnv([{ ...open, tradierEnv: 'production' }] as never))
+      .toMatchObject({ total: 1, production: 1, sandbox: 0, envUnknown: 0 });
+    expect(countLiveImportedRowsByEnv([{ ...open, tradierEnv: 'sandbox' }] as never))
+      .toMatchObject({ total: 1, production: 0, sandbox: 1, envUnknown: 0 });
+  });
+
+  it('MUTATION CHECK: the production count tracks its input, and the total still agrees', () => {
+    const prod = (occ: string) => ({
+      optionSymbol: occ,
+      mode: 'live',
+      importedFromTradier: true,
+      tradierEnv: 'production',
+    });
+    const sbx = (occ: string) => ({ ...prod(occ), tradierEnv: 'sandbox' });
+
+    expect(countLiveImportedRowsByEnv([] as never).production).toBe(0);
+    expect(countLiveImportedRowsByEnv([prod('A')] as never).production).toBe(1);
+    expect(countLiveImportedRowsByEnv([prod('A'), prod('B')] as never).production).toBe(2);
+
+    const mixed = countLiveImportedRowsByEnv([prod('A'), sbx('B'), sbx('C')] as never);
+    expect(mixed).toMatchObject({ total: 3, production: 1, sandbox: 2, envUnknown: 0 });
+    // The split is a partition of the old total, so the shipped field is intact.
+    expect(mixed.production + mixed.sandbox + mixed.envUnknown).toBe(mixed.total);
+    expect(countLiveImportedRows([prod('A'), sbx('B'), sbx('C')] as never)).toBe(mixed.total);
   });
 });

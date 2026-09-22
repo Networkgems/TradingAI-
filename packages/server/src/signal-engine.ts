@@ -10722,10 +10722,16 @@ export class SignalEngine {
    * both buckets was adopted twice, and that is two adoptions).
    */
   getImportProvenanceCensus(): ImportProvenanceCensus {
-    const { blind: _blind, liveImportedRows: _rows, blindReason: _reason, ...total } =
-      foldImportProvenanceCensuses(
-        this.allOptionsAccounts().map(a => a.importProvenanceSummary()),
-      );
+    const {
+      blind: _blind,
+      liveImportedRows: _rows,
+      liveProductionImportedRows: _prodRows,
+      productionWitness: _witness,
+      blindReason: _reason,
+      ...total
+    } = foldImportProvenanceCensuses(
+      this.allOptionsAccounts().map(a => a.importProvenanceSummary()),
+    );
     return total;
   }
 
@@ -10739,6 +10745,20 @@ export class SignalEngine {
    */
   getLiveImportedRowCount(): number {
     return this.allOptionsAccounts().reduce((n, a) => n + a.liveImportedRowCount(), 0);
+  }
+
+  /**
+   * TRA-4594 — the ENV-SCOPED durable count for this book. `mode: 'live'` alone
+   * does not mean real money: the reconcile stamps `'live'` on a sandbox import
+   * too, so a sandbox adoption moves `adopted` AND `getLiveImportedRowCount`
+   * together and the resulting non-blind vector would read as a real-money
+   * measurement. Only `production` here may back a real-money verdict.
+   */
+  getLiveProductionImportedRowCount(): number {
+    return this.allOptionsAccounts().reduce(
+      (n, a) => n + a.liveImportedRowCountByEnv().production,
+      0,
+    );
   }
 
   getLiveStopActionabilityRows(now?: number): LiveStopActionabilitySummary {
