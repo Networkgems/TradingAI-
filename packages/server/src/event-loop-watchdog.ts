@@ -1409,6 +1409,9 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
       heapUsedMB: lastTrip.heapUsedMB,
       lagMaxMs: lastTrip.lagMaxMs,
       detail: lastTrip.detail,
+      // TRA-4158: the breadcrumb survives deploys, so every later boot re-announces
+      // the same trip; atMs is the trip's identity, which lets a log reader dedupe.
+      atMs: lastTrip.atMs,
     });
   }
 

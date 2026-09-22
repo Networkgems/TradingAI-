@@ -484,16 +484,39 @@ async function fetchBootClassifications(serviceId, key, ownerId, sinceIso) {
       const at = Date.parse(msg.ts ?? line.timestamp);
       if (!Number.isFinite(at)) continue;
       if (SELF_RESTART_RE.test(msg.msg ?? '')) {
-        rows.push({ at, iso: msg.ts, mode: 'self-restart', reason: msg.reason ?? null, uptimeSecAtTrip: msg.uptimeSecAtTrip ?? null, rssMB: msg.rssMB ?? null });
+        rows.push({ at, iso: msg.ts, mode: 'self-restart', reason: msg.reason ?? null, uptimeSecAtTrip: msg.uptimeSecAtTrip ?? null, rssMB: msg.rssMB ?? null, heapUsedMB: msg.heapUsedMB ?? null, lagMaxMs: msg.lagMaxMs ?? null, tripAtMs: msg.atMs ?? null });
       } else if (EXTERNAL_KILL_RE.test(msg.msg ?? '')) {
-        rows.push({ at, iso: msg.ts, mode: 'external-kill', reason: null, uptimeSecAtTrip: msg.lastAliveUptimeSec ?? null, rssMB: msg.lastAliveRssMB ?? null });
+        rows.push({ at, iso: msg.ts, mode: 'external-kill', reason: null, uptimeSecAtTrip: msg.lastAliveUptimeSec ?? null, rssMB: msg.lastAliveRssMB ?? null, heapUsedMB: null, lagMaxMs: null, tripAtMs: null });
       }
     }
   }
   return rows.sort((a, b) => a.at - b.at);
 }
 
-function reportDeaths(rows, sinceIso) {
+/**
+ * TRA-4158 (2026-09-22): the self-restart boot line is emitted from the PERSISTED
+ * `lastTrip` breadcrumb, which survives deploys — so every deploy boot after a trip
+ * re-announces the SAME death. Measured 09-19: 5 of 10 "deaths" were re-reads of one
+ * 133s/1830MB record. Dedupe on the trip's own identity: `atMs` when the line carries
+ * it (emitter includes it from this commit's deploy onward), else the record tuple —
+ * two distinct trips sharing reason+uptimeSec+rss+heap+lagMax is not a real collision.
+ * Keep the EARLIEST announcement; report the rest as re-announcements, not deaths.
+ */
+function dedupeAnnouncements(rows) {
+  const seen = new Map();
+  let reAnnouncements = 0;
+  for (const r of rows.slice().sort((a, b) => a.at - b.at)) {
+    const key = r.tripAtMs !== null && r.tripAtMs !== undefined
+      ? `atMs:${r.tripAtMs}`
+      : `${r.mode}|${r.reason}|${r.uptimeSecAtTrip}|${r.rssMB}|${r.heapUsedMB}|${r.lagMaxMs}`;
+    if (seen.has(key)) reAnnouncements += 1;
+    else seen.set(key, r);
+  }
+  return { rows: [...seen.values()], reAnnouncements };
+}
+
+function reportDeaths(rawRows, sinceIso) {
+  const { rows, reAnnouncements } = dedupeAnnouncements(rawRows);
   const selfRestarts = rows.filter(r => r.mode === 'self-restart');
   const externalKills = rows.filter(r => r.mode === 'external-kill');
   const paired = [];
@@ -518,6 +541,7 @@ function reportDeaths(rows, sinceIso) {
   console.log(`  distinct deaths ....................... ${deaths}`);
   console.log(`    watchdog self-restart ............... ${selfRestarts.length}`);
   console.log(`    external kill (unexplained) ......... ${orphans.length}`);
+  console.log(`  re-announcements dropped .............. ${reAnnouncements} (deploy boots re-reading the persisted lastTrip)`);
   const reasons = {};
   for (const r of selfRestarts) reasons[r.reason ?? 'null'] = (reasons[r.reason ?? 'null'] ?? 0) + 1;
   console.log(`  watchdog trip reason breakdown ........ ${JSON.stringify(reasons)}`);
