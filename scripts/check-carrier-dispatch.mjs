@@ -171,6 +171,81 @@ const CONCENTRATION_SHARE = Number(argOf('concentration-share', 0.8));
 const SYSTEMIC_MIN_FINDINGS = Number(argOf('systemic-min-findings', 3));
 const SYSTEMIC_MIN_ASSIGNEES = Number(argOf('systemic-min-assignees', 3));
 
+/* ------------------------------------------------------------------ *
+ * COHORT ARM (TRA-3535) — the roster-wide population
+ * ------------------------------------------------------------------ */
+
+/**
+ * ⭐ WHY A SECOND ARM AT ALL (TRA-3535, board ruling on TRA-3532 item 6).
+ *
+ * The routine arm above grades carriers-by-routine and reports QUEUE STARVATION
+ * — a claim about an AGENT'S WHOLE QUEUE. But the evidence for that claim lives
+ * in the MANUAL slice, which a routine-rooted population structurally cannot
+ * reach: on 2026-08-13, 17 of LeadDev's 22 starved rows were manually created,
+ * i.e. 77% of the cohort the banner is about. Those 17 were counted BY HAND
+ * twice (TRA-3529, then TRA-3532). A load-bearing number with no instrument
+ * gets re-hand-counted every time the question is asked.
+ *
+ * So this arm changes the POPULATION, not the predicate: every issue created in
+ * the window, partitioned by (assigneeAgentId, originKind). The discriminator is
+ * unchanged and deliberately so — `startedAt`, with executionLockedAt /
+ * checkoutRunId / executionRunId as corroboration. Run `status` and
+ * zero-comments both fail toward CLEAN and are not used here either.
+ *
+ * ⛔⛔ THIS IS A LIVE INSTRUMENT AND IT CANNOT BE RUN BACKWARDS. The starved
+ * population HEALS: re-measured 2026-09-22, the very cohort that read 68% at
+ * 2026-08-13T10:00Z now reads 10%, because 15 of LeadDev's starved rows (13 of
+ * them manual) were picked up AFTER the read. The rows did not turn out to have
+ * been fine — they were dispatched late, and `startedAt` records only THAT it
+ * happened, never that it was late. So a retrospective query over an old window
+ * systematically under-reports, and the 08-13 hand-count is NOT reproducible by
+ * pointing this check at 08-13. Grade the window that is open NOW; use
+ * `--cohort-since` only to inspect, never to re-litigate a past verdict.
+ */
+
+/**
+ * 72h, not the 24h the routine arm uses for recency.
+ *
+ * A 24h window ending at a quiet hour is EMPTY — measured 2026-09-22T19:26Z, all
+ * 12 issues created that day were <4 min old and inside grace, so a 24h cohort
+ * graded 0 rows and the only honest verdict was BLIND. A default that reads
+ * BLIND on an ordinary quiet afternoon is a default that gets muted. 72h holds a
+ * population (n=34 at the same instant) and still reads LIVE: a queue starving
+ * at 68% is not hidden by widening to three days.
+ */
+const COHORT_WINDOW_MS = Number(argOf('cohort-window-hours', 72)) * 3600 * 1000;
+const COHORT_SINCE = argOf('cohort-since', null);
+const ISSUE_PAGE = Number(argOf('issue-page', 200));
+const ISSUE_PAGE_CAP = Number(argOf('issue-page-cap', 60));
+
+/**
+ * ⛔ A RATE OVER A HANDFUL OF ROWS IS NOT A RATE. Measured live at 72h on
+ * 2026-09-22, CFO reads 25% off 1 starved row out of 4 — arithmetically the
+ * worst rate on the board and evidentially nothing. Without a floor on n, the
+ * concentration test fires on whoever happened to be assigned two issues.
+ */
+const COHORT_MIN_ASSIGNEE_N = Number(argOf('cohort-min-assignee-n', 8));
+
+/**
+ * ⛔⛔ CALIBRATED ON THE MEASURED SPREAD, NOT ON ZERO (TRA-3535 correction 2).
+ *
+ * TRA-3532 carried "every other assignee sits at ~0%". That is false: CTO's
+ * manual never-start rate in the same cohort was 18% (3/17), not 7%. A threshold
+ * calibrated against ~0 fires on an ordinary busy queue the following week — the
+ * detector convicts the next agent who has a slow day, gets argued with once,
+ * and is muted.
+ *
+ * The measured 08-13 spread is LeadDev 67% (22/33) against a pooled rest of
+ * 10.5% (4/38) — a 6.4x separation, not a step off zero. Both conditions are
+ * required, and each one alone is wrong:
+ *   · FLOOR alone convicts a whole board having a bad week.
+ *   · MULTIPLE alone convicts 12% against a rest that happens to sit at 4%.
+ * Against the live 2026-09-22 board (top open-starved rate 8.3%) both are
+ * comfortably silent; against 08-13 both fire with margin.
+ */
+const COHORT_RATE_FLOOR = Number(argOf('cohort-rate-floor', 0.35));
+const COHORT_RATE_MULTIPLE = Number(argOf('cohort-rate-multiple', 2.5));
+
 export const VERDICT_EXIT = { CLEAN: 0, FINDINGS: 1, SYSTEMIC: 2, BLIND: 3 };
 
 /** Terminal issue statuses — reached, but NOT necessarily by being worked. */
@@ -600,6 +675,490 @@ export function renderReport(r, names = {}) {
   return out;
 }
 
+/* ================================================================== *
+ * COHORT ARM — issues-by-origin across the whole roster (TRA-3535)
+ * ================================================================== */
+
+/**
+ * ⛔ The four fields are NOT redundant and the OR is deliberate.
+ *
+ * `startedAt` is the discriminator; the other three are corroboration, and the
+ * predicate is "none of the four is set". Reading `startedAt` alone would brand
+ * a row never-dispatched when the platform holds an execution lock on it — which
+ * is a row being worked RIGHT NOW. Fail toward CLEAN on an individual row and
+ * toward paging on the population is the wrong way round; the population floor
+ * is enforced separately, below.
+ */
+export const DISPATCH_FIELDS = ['startedAt', 'executionLockedAt', 'checkoutRunId', 'executionRunId'];
+
+export const COHORT_FINDING_STATES = new Set([
+  'ISSUE_UNDISPATCHED_OPEN',
+  'ISSUE_UNDISPATCHED_SWEPT',
+  'ISSUE_UNDISPATCHED_CANCELLED',
+]);
+
+/**
+ * ⛔⛔ ONLY THE OPEN ONES COUNT TOWARD THE HEADLINE (TRA-3535 correction 1).
+ *
+ * never-checked-out is NOT never-handled. 6 of the 25 never-dispatched rows in
+ * the 08-13 cohort were already CLOSED — TRA-3493/3511/3513 graded by replay,
+ * TRA-3521/3520 `done`, TRA-3528 a cancelled probe. Folding those into the
+ * headline over-reports by ~24% and would have made LeadDev's live figure 21
+ * rather than the true never-dispatched-AND-still-open 17.
+ *
+ * This is the same partition the routine arm already makes with
+ * CARRIER_SWEPT_UNWORKED / CARRIER_CANCELLED_UNWORKED; the manual slice needed
+ * it for the same reason. They stay REPORTED — an order discharged out of band
+ * is still an order nobody was woken on — and stay OUT of the rate.
+ */
+export const COHORT_SYSTEMIC_STATES = new Set(['ISSUE_UNDISPATCHED_OPEN']);
+
+/**
+ * Classify one issue on the dispatch axis.
+ *
+ * @param {object} issue a row as the issues LIST route serves it. ⛔ Verified
+ *   2026-09-22 to carry `startedAt` / `originKind` / `executionLockedAt` /
+ *   `checkoutRunId` / `executionRunId` with values IDENTICAL to the single-issue
+ *   GET — unlike `lastRun.linkedIssue`, which drops `startedAt` entirely (trap 1
+ *   on the routine arm). ⛔ That is true of the FULL row only: `?view=compact`
+ *   nulls fields the full GET has, so this arm must never request it.
+ */
+export function classifyIssueDispatch(issue, { graceMs = GRACE_MS, nowMs } = {}) {
+  if (!issue || typeof issue !== 'object') {
+    return { state: 'BLIND', detail: 'issue row could not be read at all' };
+  }
+  // Trap 1, one level out. The KEY, not the value — an absent key means the
+  // route did not serve the relation, which is not "never dispatched".
+  for (const f of DISPATCH_FIELDS) {
+    if (!(f in issue)) {
+      return {
+        state: 'BLIND',
+        detail:
+          `issue row carries no \`${f}\` KEY — the route did not serve the relation. An absent key is ` +
+          'not a null. (`?view=compact` and `lastRun.linkedIssue` both drop fields exactly this way.)',
+      };
+    }
+  }
+  if (!('originKind' in issue)) {
+    return {
+      state: 'BLIND',
+      detail: 'issue row carries no `originKind` KEY — this arm partitions BY origin and cannot grade it',
+    };
+  }
+
+  const createdMs = Date.parse(issue.createdAt || '');
+  // Undated is aged INFINITELY OLD — it pages rather than hiding behind grace.
+  const ageMs = Number.isFinite(createdMs) ? nowMs - createdMs : Infinity;
+  const dispatched = DISPATCH_FIELDS.find((f) => issue[f]);
+
+  if (dispatched) {
+    return {
+      state: 'ISSUE_DISPATCHED',
+      detail: `dispatched — ${dispatched}=${issue[dispatched]}`,
+      ageMs,
+      via: dispatched,
+    };
+  }
+
+  if (ageMs <= graceMs) {
+    return {
+      state: 'ISSUE_PENDING',
+      detail: `created ${Math.round(ageMs / 60000)} min ago — inside the ${Math.round(graceMs / 60000)} min grace window`,
+      ageMs,
+    };
+  }
+
+  if (issue.status === 'cancelled') {
+    return {
+      state: 'ISSUE_UNDISPATCHED_CANCELLED',
+      detail:
+        'CANCELLED without ever being dispatched — a deliberate retirement. Reported, but held OUT of the ' +
+        'rate: it is not a starved queue and it is already dispositioned.',
+      ageMs,
+    };
+  }
+  if (TERMINAL_ISSUE_STATUSES.has(issue.status)) {
+    return {
+      state: 'ISSUE_UNDISPATCHED_SWEPT',
+      detail:
+        `reached \`${issue.status}\` without ever being dispatched — discharged out of band, not worked. ` +
+        'Reported, but held OUT of the rate: never-checked-out is NOT never-handled.',
+      ageMs,
+    };
+  }
+  return {
+    state: 'ISSUE_UNDISPATCHED_OPEN',
+    detail:
+      `still \`${issue.status}\` ${(ageMs / 3600000).toFixed(1)}h after creation and NEVER DISPATCHED ` +
+      '(startedAt / executionLockedAt / checkoutRunId / executionRunId all null) — a live order nobody ' +
+      'has been woken on.',
+    ageMs,
+  };
+}
+
+/**
+ * Grade every issue created in the window, partitioned by (assignee, origin).
+ */
+export async function sweepCohort(transport, opts = {}) {
+  const graceMs = opts.graceMs ?? GRACE_MS;
+  const nowMs = opts.nowMs ?? Date.now();
+  const windowMs = opts.cohortWindowMs ?? COHORT_WINDOW_MS;
+  const pageSize = opts.issuePage ?? ISSUE_PAGE;
+  const pageCap = opts.issuePageCap ?? ISSUE_PAGE_CAP;
+  const sinceIso = opts.cohortSince ?? COHORT_SINCE;
+  const sinceMs = sinceIso ? Date.parse(sinceIso) : nowMs - windowMs;
+
+  if (!Number.isFinite(sinceMs)) {
+    return { arm: 'COHORT', verdict: 'BLIND', blind: `--cohort-since is not a parseable date: ${sinceIso}` };
+  }
+
+  // ⛔⛔ THE LIST ROUTE HAS NO createdAfter FILTER and its ordering is NOT
+  // createdAt — measured 2026-09-22, offset 0 starts at TRA-3926 and offset 200
+  // at TRA-1662. So there is NO early exit: pages cannot be stopped at the first
+  // row older than the window without silently dropping members. Enumerate the
+  // whole board and filter in memory.
+  const all = [];
+  let pages = 0;
+  let truncated = false;
+  for (;;) {
+    if (pages >= pageCap) {
+      truncated = true;
+      break;
+    }
+    let batch;
+    try {
+      batch = await transport.getIssues({ limit: pageSize, offset: pages * pageSize });
+    } catch (err) {
+      return {
+        arm: 'COHORT',
+        verdict: 'BLIND',
+        blind: `issue enumeration failed at offset ${pages * pageSize} — ${err?.message || err}`,
+      };
+    }
+    if (!Array.isArray(batch)) {
+      return {
+        arm: 'COHORT',
+        verdict: 'BLIND',
+        blind: `issues route did not return an array at offset ${pages * pageSize} — the population is unreadable`,
+      };
+    }
+    pages += 1;
+    all.push(...batch);
+    if (batch.length < pageSize) break;
+  }
+
+  // ⛔ Truncation is BLIND, never a partial pass. A capped enumeration cannot
+  // tell "nobody is starved" from "the starved rows are on the page we skipped".
+  if (truncated) {
+    return {
+      arm: 'COHORT',
+      verdict: 'BLIND',
+      blind:
+        `issue enumeration hit the ${pageCap}-page cap (${all.length} rows) without exhausting the route — ` +
+        'the population is incomplete and an incomplete population cannot clear anybody. Raise --issue-page-cap.',
+      cohortSize: all.length,
+    };
+  }
+
+  // A duplicate id across pages means the underlying ordering shifted mid-walk.
+  const seenIds = new Set();
+  let dupes = 0;
+  for (const r of all) {
+    if (!r || !r.id) continue;
+    if (seenIds.has(r.id)) dupes += 1;
+    seenIds.add(r.id);
+  }
+
+  const inWindow = all.filter((r) => {
+    const t = Date.parse(r?.createdAt || '');
+    return Number.isFinite(t) && t >= sinceMs;
+  });
+
+  const rows = [];
+  const blindRows = [];
+  const tally = {};
+  for (const issue of inWindow) {
+    const c = classifyIssueDispatch(issue, { graceMs, nowMs });
+    tally[c.state] = (tally[c.state] || 0) + 1;
+    if (c.state === 'BLIND') {
+      blindRows.push({ id: issue?.id, identifier: issue?.identifier, reason: c.detail });
+      continue;
+    }
+    rows.push({
+      id: issue.id,
+      identifier: issue.identifier || issue.id,
+      title: issue.title || '',
+      status: issue.status || null,
+      priority: issue.priority || null,
+      assigneeAgentId: issue.assigneeAgentId || null,
+      originKind: issue.originKind || 'unknown',
+      createdAt: issue.createdAt || null,
+      state: c.state,
+      detail: c.detail,
+      ageMs: Number.isFinite(c.ageMs) ? c.ageMs : null,
+    });
+  }
+
+  if (blindRows.length > 0) {
+    return {
+      arm: 'COHORT',
+      verdict: 'BLIND',
+      blind: `${blindRows.length} issue row(s) could not be classified on the dispatch axis`,
+      blindRows,
+      cohortSize: all.length,
+      inWindow: inWindow.length,
+    };
+  }
+
+  // ⛔ GRADED excludes rows inside grace: a dispatch in flight is not a graded
+  // row, and counting it as a healthy denominator DILUTES the rate toward CLEAN.
+  const graded = rows.filter((r) => r.state !== 'ISSUE_PENDING');
+  const pending = rows.length - graded.length;
+
+  // Trap 6, inherited. Zero graded rows is BLIND, never CLEAN.
+  if (graded.length === 0) {
+    return {
+      arm: 'COHORT',
+      verdict: 'BLIND',
+      blind:
+        `0 gradeable issues were created in the ${(windowMs / 3600000).toFixed(0)}h window ` +
+        `(${rows.length} in window, ${pending} still inside the ${Math.round(graceMs / 60000)} min grace). ` +
+        '"nobody is starved" and "nobody was looked at" are the same reading.',
+      cohortSize: all.length,
+      inWindow: inWindow.length,
+      pending,
+      tally,
+    };
+  }
+
+  const findings = graded.filter((r) => COHORT_FINDING_STATES.has(r.state));
+  const starvedOpen = graded.filter((r) => COHORT_SYSTEMIC_STATES.has(r.state));
+
+  // (assignee, origin) — the partition the ruling asked for, reported in full so
+  // the "and every other assignee sits at ~0%" half of the claim is MEASURED.
+  const cells = new Map();
+  for (const r of graded) {
+    const k = `${r.assigneeAgentId || 'UNASSIGNED'}\u0000${r.originKind}`;
+    const cell = cells.get(k) || { assigneeAgentId: r.assigneeAgentId || 'UNASSIGNED', originKind: r.originKind, n: 0, starvedOpen: 0, swept: 0, cancelled: 0 };
+    cell.n += 1;
+    if (r.state === 'ISSUE_UNDISPATCHED_OPEN') cell.starvedOpen += 1;
+    if (r.state === 'ISSUE_UNDISPATCHED_SWEPT') cell.swept += 1;
+    if (r.state === 'ISSUE_UNDISPATCHED_CANCELLED') cell.cancelled += 1;
+    cells.set(k, cell);
+  }
+
+  // The systemic test folds ORIGINS TOGETHER per assignee. That is the whole
+  // point of the ruling: the claim is about a QUEUE, and a queue does not care
+  // which door an issue came through.
+  const byAssignee = new Map();
+  for (const r of graded) {
+    const k = r.assigneeAgentId || 'UNASSIGNED';
+    const a = byAssignee.get(k) || { assigneeAgentId: k, n: 0, starvedOpen: 0 };
+    a.n += 1;
+    if (r.state === 'ISSUE_UNDISPATCHED_OPEN') a.starvedOpen += 1;
+    byAssignee.set(k, a);
+  }
+  const roster = [...byAssignee.values()].map((a) => ({ ...a, rate: a.n ? a.starvedOpen / a.n : 0 }));
+
+  // ⛔ UNASSIGNED IS NOT AN AGENT AND MUST NOT BE THE SUBJECT. An unassigned row
+  // is never-dispatched BY CONSTRUCTION — there is no queue for it to starve in.
+  // Measured 2026-09-22 it sits at 100% (1/1) and would win every concentration
+  // test forever. Reported as its own class; excluded from the roster maths.
+  const eligible = roster
+    .filter((a) => a.assigneeAgentId !== 'UNASSIGNED' && a.n >= COHORT_MIN_ASSIGNEE_N)
+    .sort((a, b) => b.rate - a.rate || b.starvedOpen - a.starvedOpen);
+  const unassigned = roster.find((a) => a.assigneeAgentId === 'UNASSIGNED') || null;
+  const underpowered = roster.filter((a) => a.assigneeAgentId !== 'UNASSIGNED' && a.n < COHORT_MIN_ASSIGNEE_N);
+
+  const top = eligible[0] || null;
+  // Pooled rest — rows, not a mean of rates. A mean of per-agent rates lets an
+  // agent with 2 rows swing the baseline as hard as one with 200.
+  const restN = eligible.slice(1).reduce((s, a) => s + a.n, 0);
+  const restStarved = eligible.slice(1).reduce((s, a) => s + a.starvedOpen, 0);
+  const restRate = restN ? restStarved / restN : 0;
+
+  const spreadMeasured = eligible.length >= 2;
+  const queueCondition = Boolean(
+    top &&
+      spreadMeasured &&
+      top.starvedOpen >= SYSTEMIC_MIN_FINDINGS &&
+      top.rate >= COHORT_RATE_FLOOR &&
+      top.rate >= COHORT_RATE_MULTIPLE * restRate,
+  );
+  // DISPATCHER is the remaining subject only when the floor is cleared BROADLY —
+  // no one queue explains it. Tested second, and only if QUEUE did not fire.
+  const broad = eligible.filter((a) => a.rate >= COHORT_RATE_FLOOR && a.starvedOpen >= SYSTEMIC_MIN_FINDINGS);
+  const dispatcherCondition = !queueCondition && broad.length >= SYSTEMIC_MIN_ASSIGNEES;
+
+  return {
+    arm: 'COHORT',
+    verdict:
+      findings.length === 0 ? 'CLEAN' : queueCondition || dispatcherCondition ? 'SYSTEMIC' : 'FINDINGS',
+    blind: null,
+    subject: queueCondition ? 'QUEUE' : dispatcherCondition ? 'DISPATCHER' : null,
+    sinceIso: new Date(sinceMs).toISOString(),
+    windowMs,
+    graceMs,
+    retrospective: Boolean(sinceIso),
+    cohortSize: all.length,
+    duplicateIds: dupes,
+    inWindow: inWindow.length,
+    graded: graded.length,
+    pending,
+    tally,
+    findings,
+    starvedOpenCount: starvedOpen.length,
+    sweptCount: graded.filter((r) => r.state === 'ISSUE_UNDISPATCHED_SWEPT').length,
+    cancelledCount: graded.filter((r) => r.state === 'ISSUE_UNDISPATCHED_CANCELLED').length,
+    cells: [...cells.values()].sort((a, b) => b.starvedOpen - a.starvedOpen || b.n - a.n),
+    roster: roster.sort((a, b) => b.rate - a.rate),
+    eligible,
+    underpowered,
+    unassigned,
+    top,
+    topRate: top ? top.rate : 0,
+    restRate,
+    restN,
+    restStarved,
+    spreadMeasured,
+    rateFloor: COHORT_RATE_FLOOR,
+    rateMultiple: COHORT_RATE_MULTIPLE,
+    minAssigneeN: COHORT_MIN_ASSIGNEE_N,
+  };
+}
+
+export function renderCohortReport(r, names = {}) {
+  const out = [];
+  const nm = (id) =>
+    id && id !== 'UNASSIGNED' ? names[String(id).slice(0, 8)] || String(id).slice(0, 8) : 'UNASSIGNED';
+  const pct = (v) => `${(v * 100).toFixed(1)}%`;
+
+  out.push(`TRA-3535 roster-wide issue dispatch (ALL ORIGINS) — verdict ${r.verdict}`);
+  if (r.verdict === 'BLIND') {
+    out.push('');
+    out.push(`  BLIND — ${r.blind}`);
+    for (const b of r.blindRows || []) out.push(`    ${b.identifier || b.id} — ${b.reason}`);
+    out.push('  A BLIND run is NOT a pass. Do not read it as "no queue is starved".');
+    return out;
+  }
+
+  out.push(
+    `  window: issues created since ${r.sinceIso} (${(r.windowMs / 3600000).toFixed(0)}h) · ` +
+      `board read: ${r.cohortSize} rows · in window: ${r.inWindow} · GRADED: ${r.graded} ` +
+      `(${r.pending} inside the ${Math.round(r.graceMs / 60000)} min grace, excluded from the denominator)`,
+  );
+  if (r.duplicateIds) out.push(`  ⚠ ${r.duplicateIds} duplicate id(s) across pages — the list ordering shifted mid-walk.`);
+  out.push(`  states: ${Object.entries(r.tally).map(([k, v]) => `${k}=${v}`).join(' ')}`);
+
+  out.push('');
+  out.push('  (assignee x originKind) — starvedOpen is the HEADLINE class; swept/cxl are reported, not rated:');
+  out.push(`    ${'assignee'.padEnd(13)}${'originKind'.padEnd(26)}${'n'.padStart(4)}${'starvedOpen'.padStart(13)}${'rate'.padStart(8)}${'swept'.padStart(7)}${'cxl'.padStart(5)}`);
+  for (const c of r.cells) {
+    out.push(
+      `    ${nm(c.assigneeAgentId).padEnd(13)}${String(c.originKind).padEnd(26)}${String(c.n).padStart(4)}` +
+        `${String(c.starvedOpen).padStart(13)}${pct(c.n ? c.starvedOpen / c.n : 0).padStart(8)}` +
+        `${String(c.swept).padStart(7)}${String(c.cancelled).padStart(5)}`,
+    );
+  }
+
+  out.push('');
+  out.push(`  per-assignee (origins folded — a queue does not care which door an issue came through):`);
+  for (const a of r.roster) {
+    const tag =
+      a.assigneeAgentId === 'UNASSIGNED'
+        ? '  <- NOT AN AGENT: undispatched by construction, excluded from the maths'
+        : a.n < r.minAssigneeN
+          ? `  <- n<${r.minAssigneeN}, underpowered: reported, not eligible to be the subject`
+          : '';
+    out.push(`    ${nm(a.assigneeAgentId).padEnd(13)} n=${String(a.n).padStart(4)}  starvedOpen=${String(a.starvedOpen).padStart(3)}  rate=${pct(a.rate).padStart(7)}${tag}`);
+  }
+
+  if (r.verdict === 'SYSTEMIC' && r.subject === 'QUEUE') {
+    out.push('');
+    out.push(
+      `  QUEUE STARVATION — ${nm(r.top.assigneeAgentId)} holds ${r.top.starvedOpen} never-dispatched OPEN ` +
+        `issues of ${r.top.n} created in the window (${pct(r.topRate)}) against a pooled rest of ` +
+        `${r.restStarved}/${r.restN} (${pct(r.restRate)}) — a ${(r.restRate ? r.topRate / r.restRate : Infinity).toFixed(1)}x separation.`,
+    );
+    out.push(
+      `  ⭐ MEASURED ACROSS ALL ORIGINS, so the "every other assignee sits near zero" half of the claim is ` +
+        'now a measurement and not an assertion — read the per-assignee table above, which is the evidence.',
+    );
+    out.push(
+      `  SUBJECT: THAT AGENT'S QUEUE. The findings concentrate on one assignee ACROSS ORIGINS — manual and ` +
+        'routine-spawned alike — so an origin-specific fault is ruled out by the partition, and the ' +
+        'dispatcher is NOT the remaining subject. ⛔ Route it to that owner and the board ' +
+        '(capacity / re-home / re-assign), NOT to the platform. ⛔ Do not file a ticket per starved issue.',
+    );
+  } else if (r.verdict === 'SYSTEMIC' && r.subject === 'DISPATCHER') {
+    out.push('');
+    out.push(
+      `  DISPATCH-WIDE — ${r.eligible.filter((a) => a.rate >= r.rateFloor).length} distinct assignees are above the ` +
+        `${pct(r.rateFloor)} floor with no single owner explaining it. The DISPATCHER is the remaining subject.`,
+    );
+    out.push('  ⛔ Confirm the spread is not simply several busy queues at once before routing it.');
+  } else if (r.findings.length > 0) {
+    out.push('');
+    out.push(
+      `  ${r.findings.length} never-dispatched row(s) — ${r.starvedOpenCount} OPEN (the headline class), ` +
+        `${r.sweptCount} swept closed, ${r.cancelledCount} cancelled. NOT systemic: ` +
+        (r.top
+          ? `top eligible queue is ${nm(r.top.assigneeAgentId)} at ${pct(r.topRate)} ` +
+            `(floor ${pct(r.rateFloor)}, needs >=${r.rateMultiple}x the pooled rest of ${pct(r.restRate)}, ` +
+            `and >=${SYSTEMIC_MIN_FINDINGS} starved rows; it has ${r.top.starvedOpen}).`
+          : `no assignee cleared the n>=${r.minAssigneeN} floor, so no queue is eligible to be the subject.`),
+    );
+  } else {
+    out.push('');
+    out.push(`  CLEAN — all ${r.graded} graded issues across every origin were dispatched to an agent.`);
+  }
+
+  if (r.sweptCount > 0 || r.cancelledCount > 0) {
+    out.push('');
+    out.push(
+      `  ⛔ ${r.sweptCount + r.cancelledCount} never-dispatched row(s) are CLOSED (${r.sweptCount} swept / ` +
+        `${r.cancelledCount} cancelled) and are PARTITIONED OUT of the rate above. never-checked-out is NOT ` +
+        'never-handled — folding them in over-reported the 08-13 headline by ~24% (21 vs the true 17).',
+    );
+  }
+
+  if (r.underpowered.length > 0) {
+    out.push('');
+    out.push(
+      `  ⛔ ${r.underpowered.length} assignee(s) held fewer than ${r.minAssigneeN} rows and cannot be the ` +
+        'subject: a rate over a handful of rows is not a rate. Their rows are still in the denominator of ' +
+        'the pooled rest; they just cannot be convicted by it.',
+    );
+  }
+  if (r.unassigned) {
+    out.push(
+      `  ⛔ ${r.unassigned.starvedOpen} of ${r.unassigned.n} UNASSIGNED row(s) are undispatched — by ` +
+        'construction, not by starvation. There is no queue for an unassigned issue to starve in.',
+    );
+  }
+  if (!r.spreadMeasured) {
+    out.push('');
+    out.push(
+      `  ⛔ Fewer than 2 eligible assignees — the cross-assignee SPREAD is unmeasured, so the concentration ` +
+        'test is suppressed. A "concentration" over one queue is not a concentration.',
+    );
+  }
+
+  out.push('');
+  out.push(
+    `  ⛔⛔ THIS ARM CANNOT BE RUN BACKWARDS. The starved population HEALS: the 08-13 cohort that read 68% ` +
+      'live now re-reads 10%, because 15 of those rows were dispatched AFTER the read and `startedAt` ' +
+      'records only THAT it happened, never that it was late. Grade the window that is open NOW.',
+  );
+  if (r.retrospective) {
+    out.push(
+      '  ⚠ --cohort-since was supplied: this is a RETROSPECTIVE read and it UNDER-REPORTS by construction. ' +
+        'Inspect with it; never re-litigate a past verdict with it.',
+    );
+  }
+  return out;
+}
+
 /* ------------------------------------------------------------------ *
  * Controls
  * ------------------------------------------------------------------ */
@@ -937,6 +1496,305 @@ const CASES = [
   },
 ];
 
+/* ------------------------------------------------------------------ *
+ * COHORT ARM controls — BOTH DIRECTIONS on every invocation.
+ *
+ * ⭐ The ruling's `Control` clause is the reason these are paired: "a
+ * concentration detector that has only ever been shown firing cannot
+ * distinguish a starved queue from a busy one." So every firing control here has
+ * a NEAR-MISS twin built from the SAME generator, differing only in the variable
+ * under test — and the calibration twin (`known-good` below) is built from the
+ * REAL MEASURED SPREAD of 2026-08-13, not from zero.
+ * ------------------------------------------------------------------ */
+
+/** An issue row as the issues LIST route serves it (full row, never compact). */
+function cohortIssue(id, over = {}) {
+  return {
+    id,
+    identifier: String(id).toUpperCase(),
+    title: `issue ${id}`,
+    status: 'todo',
+    priority: 'medium',
+    assigneeAgentId: 'agent-a',
+    originKind: 'manual',
+    createdAt: new Date(NOW - 6 * H).toISOString(),
+    startedAt: new Date(NOW - 5 * H).toISOString(),
+    executionLockedAt: null,
+    checkoutRunId: null,
+    executionRunId: null,
+    ...over,
+  };
+}
+
+/**
+ * Build `n` rows for one (assignee, origin) cell, `starved` of them never
+ * dispatched. Both the firing and the silent control come out of this one
+ * generator, so the only thing that differs between them is the RATE.
+ */
+function cell(assignee, originKind, n, starved, over = {}) {
+  const rows = [];
+  for (let i = 0; i < n; i += 1) {
+    const bad = i < starved;
+    rows.push(
+      cohortIssue(`${assignee}-${originKind}-${i}`, {
+        assigneeAgentId: assignee,
+        originKind,
+        ...(bad ? { startedAt: null, executionLockedAt: null, checkoutRunId: null, executionRunId: null } : {}),
+        ...over,
+      }),
+    );
+  }
+  return rows;
+}
+
+function cohortTransport(rows, { pageSize = 200, fail = null } = {}) {
+  return {
+    getIssues: async ({ limit, offset }) => {
+      if (fail) throw fail;
+      const size = Math.min(limit, pageSize);
+      return rows.slice(offset, offset + size);
+    },
+  };
+}
+
+/**
+ * THE MEASURED 2026-08-13 SPREAD, reconstructed from the TRA-3532 ruling's own
+ * table with correction 2 applied (CTO is 18%, NOT ~0%).
+ *   LeadDev  manual 25 / 17 starved · routine 8 / 5 starved  => 22/33 = 67%
+ *   CTO      manual 17 /  3 starved · routine 3 / 0          =>  3/20 = 15%
+ *   others   all origins 18 / 1                              =>  1/18 =  6%
+ */
+const SPREAD_0813 = [
+  ...cell('leaddev', 'manual', 25, 17),
+  ...cell('leaddev', 'routine_execution', 8, 5),
+  ...cell('cto', 'manual', 17, 3),
+  ...cell('cto', 'routine_execution', 3, 0),
+  ...cell('cfo', 'manual', 10, 1),
+  ...cell('quant', 'manual', 8, 0),
+];
+
+const COHORT_CASES = [
+  {
+    name: 'KNOWN-BAD (the 08-13 cohort, all origins) => SYSTEMIC/QUEUE, and the MANUAL slice is IN it',
+    rows: SPREAD_0813,
+    expect: (r) => {
+      assert(r.verdict === 'SYSTEMIC', `expected SYSTEMIC, got ${r.verdict} (${r.blind || ''})`);
+      assert(r.subject === 'QUEUE', `expected QUEUE, got ${r.subject}`);
+      assert(r.top.assigneeAgentId === 'leaddev', `top=${r.top.assigneeAgentId}`);
+      assert(r.top.starvedOpen === 22, `expected 22 starved-open, got ${r.top.starvedOpen}`);
+      // ⭐ THE WHOLE POINT OF TRA-3535: the manual slice is instrumented, so the
+      // 17 rows that were hand-counted twice are now MEASURED.
+      const man = r.cells.find((c) => c.assigneeAgentId === 'leaddev' && c.originKind === 'manual');
+      assert(man && man.starvedOpen === 17, `manual cell must carry the 17 hand-counted rows, got ${man && man.starvedOpen}`);
+      const rep = renderCohortReport(r).join('\n');
+      assert(/QUEUE STARVATION/.test(rep), rep);
+      assert(/NOT to the platform/.test(rep), 'must keep routing it away from the dispatcher');
+      assert(/Do not file a ticket per starved issue/.test(rep), 'must keep the no-ticket-per-row rule');
+    },
+  },
+  {
+    name:
+      'KNOWN-GOOD (a BUSY board at the measured live spread, top 8.3%) => must stay SILENT — ' +
+      'the control the ruling asked for: a busy queue is not a starved one',
+    rows: [
+      ...cell('leaddev', 'manual', 30, 2),
+      ...cell('leaddev', 'routine_execution', 12, 1),
+      ...cell('cto', 'manual', 24, 2),
+      ...cell('cfo', 'manual', 12, 1),
+      ...cell('quant', 'manual', 10, 0),
+    ],
+    expect: (r) => {
+      assert(r.verdict === 'FINDINGS', `a busy board must NOT be SYSTEMIC, got ${r.verdict}`);
+      assert(r.subject === null, `subject must be null, got ${r.subject}`);
+      assert(r.starvedOpenCount === 6, `expected 6 starved-open, got ${r.starvedOpenCount}`);
+    },
+  },
+  {
+    name:
+      '⛔⛔ CALIBRATION (TRA-3535 correction 2) — CTO alone at the REAL 18%, not the asserted ~0%, ' +
+      'must NOT fire. A threshold calibrated on zero convicts this board next week.',
+    rows: [
+      ...cell('cto', 'manual', 17, 3),
+      ...cell('leaddev', 'manual', 20, 0),
+      ...cell('cfo', 'manual', 10, 0),
+    ],
+    expect: (r) => {
+      assert(r.verdict !== 'SYSTEMIC', `18% must not be systemic, got ${r.verdict}/${r.subject}`);
+      assert(Math.abs(r.top.rate - 3 / 17) < 1e-9, `top rate should be 3/17, got ${r.top.rate}`);
+      assert(r.top.rate < r.rateFloor, `3/17=${r.top.rate} must sit BELOW the ${r.rateFloor} floor`);
+    },
+  },
+  {
+    name:
+      '⛔ CALIBRATION, other side — a HIGH rate over a small pooled rest must still clear the MULTIPLE, ' +
+      'not just the floor (floor alone convicts a board having a bad week)',
+    rows: [
+      ...cell('leaddev', 'manual', 20, 8), // 40% — clears the floor
+      ...cell('cto', 'manual', 20, 7), // 35% — the rest is just as bad
+      ...cell('cfo', 'manual', 20, 7),
+    ],
+    expect: (r) => {
+      assert(r.top.rate >= r.rateFloor, 'top must clear the floor for this control to mean anything');
+      assert(r.verdict === 'SYSTEMIC', `expected SYSTEMIC, got ${r.verdict}`);
+      // Nobody is concentrated — the board as a whole is starving, so the
+      // subject must flip to DISPATCHER rather than convict the top queue.
+      assert(r.subject === 'DISPATCHER', `expected DISPATCHER (no concentration), got ${r.subject}`);
+    },
+  },
+  {
+    name:
+      '⛔⛔ CORRECTION 1 — closed-without-dispatch is PARTITIONED OUT of the headline ' +
+      '(never-checked-out is not never-handled)',
+    rows: [
+      ...cell('leaddev', 'manual', 8, 8, { status: 'done' }),
+      ...cell('leaddev', 'routine_execution', 4, 4, { status: 'cancelled' }),
+      ...cell('cto', 'manual', 20, 0),
+      ...cell('cfo', 'manual', 10, 0),
+    ],
+    expect: (r) => {
+      assert(r.starvedOpenCount === 0, `headline must be 0, got ${r.starvedOpenCount}`);
+      assert(r.sweptCount === 8, `expected 8 swept, got ${r.sweptCount}`);
+      assert(r.cancelledCount === 4, `expected 4 cancelled, got ${r.cancelledCount}`);
+      assert(r.verdict === 'FINDINGS', `must still REPORT them, got ${r.verdict}`);
+      assert(r.verdict !== 'SYSTEMIC', 'closed rows must never drive the systemic test');
+      assert(r.top.rate === 0, `leaddev rate must be 0 on the headline class, got ${r.top.rate}`);
+      const rep = renderCohortReport(r).join('\n');
+      assert(/PARTITIONED OUT/.test(rep), rep);
+    },
+  },
+  {
+    name: '⛔ TRAP 1 at cohort level — a row missing the `startedAt` KEY is BLIND, never "never dispatched"',
+    rows: (() => {
+      const rows = [...cell('cto', 'manual', 10, 0)];
+      const bad = { ...cohortIssue('compact-row') };
+      delete bad.startedAt; // exactly what ?view=compact does
+      rows.push(bad);
+      return rows;
+    })(),
+    expect: (r) => {
+      assert(r.verdict === 'BLIND', `expected BLIND, got ${r.verdict}`);
+      assert(/startedAt/.test(r.blindRows[0].reason), r.blindRows[0].reason);
+    },
+  },
+  {
+    name: '⛔ an absent `originKind` KEY is BLIND — this arm partitions BY origin',
+    rows: (() => {
+      const rows = [...cell('cto', 'manual', 10, 0)];
+      const bad = { ...cohortIssue('no-origin') };
+      delete bad.originKind;
+      rows.push(bad);
+      return rows;
+    })(),
+    expect: (r) => {
+      assert(r.verdict === 'BLIND', `expected BLIND, got ${r.verdict}`);
+      assert(/originKind/.test(r.blindRows[0].reason), r.blindRows[0].reason);
+    },
+  },
+  {
+    name:
+      '⛔ a row inside GRACE is a dispatch in flight — excluded from the denominator, ' +
+      'NOT counted as a healthy row (counting it dilutes the rate toward CLEAN)',
+    rows: [
+      ...cell('leaddev', 'manual', 10, 10, { createdAt: new Date(NOW - 10 * 60000).toISOString() }),
+      ...cell('cto', 'manual', 10, 0),
+    ],
+    expect: (r) => {
+      assert(r.pending === 10, `expected 10 pending, got ${r.pending}`);
+      assert(r.graded === 10, `graded must exclude the in-flight rows, got ${r.graded}`);
+      assert(r.verdict === 'CLEAN', `expected CLEAN, got ${r.verdict}`);
+      assert(r.roster.every((a) => a.assigneeAgentId !== 'leaddev'), 'in-flight rows must not enter the roster');
+    },
+  },
+  {
+    name: '⛔ TRAP 6 — zero gradeable rows in the window is BLIND, never CLEAN (the live 24h reading)',
+    // ⛔ ORDERING: `starved` must be 6, not 0. A row created 5 min ago that IS
+    // dispatched is a GRADED row, not a pending one — the grace window only
+    // applies to a row with nothing set, because grace exists to excuse a
+    // dispatch still in flight, not to un-read one that already landed. A
+    // fixture of dispatched-inside-grace rows reads CLEAN, correctly.
+    rows: cell('cto', 'manual', 6, 6, { createdAt: new Date(NOW - 5 * 60000).toISOString() }),
+    expect: (r) => {
+      assert(r.verdict === 'BLIND', `expected BLIND, got ${r.verdict}`);
+      assert(/same reading/.test(r.blind), r.blind);
+    },
+  },
+  {
+    name: '⛔ UNASSIGNED sits at 100% BY CONSTRUCTION and must never become the subject',
+    rows: [
+      ...cell('cto', 'manual', 20, 0),
+      ...cell('cfo', 'manual', 10, 0),
+      ...cohortIssueBatch(6),
+    ],
+    expect: (r) => {
+      assert(r.unassigned && r.unassigned.starvedOpen === 6, JSON.stringify(r.unassigned));
+      assert(r.verdict !== 'SYSTEMIC', `UNASSIGNED must not drive SYSTEMIC, got ${r.verdict}`);
+      assert(r.top.assigneeAgentId !== 'UNASSIGNED', `top must not be UNASSIGNED, got ${r.top.assigneeAgentId}`);
+      const rep = renderCohortReport(r).join('\n');
+      assert(/NOT AN AGENT/.test(rep), rep);
+    },
+  },
+  {
+    name: '⛔ an UNDERPOWERED queue (the live CFO 1-of-4 = 25%) cannot be convicted by a rate',
+    rows: [
+      ...cell('cfo', 'manual', 4, 1),
+      ...cell('cto', 'manual', 20, 1),
+      ...cell('leaddev', 'manual', 20, 0),
+    ],
+    expect: (r) => {
+      assert(r.verdict !== 'SYSTEMIC', `n=4 must not be convicted, got ${r.verdict}`);
+      assert(r.underpowered.some((a) => a.assigneeAgentId === 'cfo'), JSON.stringify(r.underpowered));
+      assert(r.top.assigneeAgentId !== 'cfo', `cfo must not be eligible, got ${r.top.assigneeAgentId}`);
+    },
+  },
+  {
+    name: '⛔ a TRUNCATED enumeration is BLIND — an incomplete population cannot clear anybody',
+    rows: cell('cto', 'manual', 60, 0),
+    opts: { issuePage: 10, issuePageCap: 2 },
+    expect: (r) => {
+      assert(r.verdict === 'BLIND', `expected BLIND, got ${r.verdict}`);
+      assert(/page cap/.test(r.blind), r.blind);
+    },
+  },
+  {
+    name: '⛔ a failed enumeration is BLIND, not CLEAN',
+    rows: [],
+    transportOpts: { fail: new Error('HTTP 503') },
+    expect: (r) => {
+      assert(r.verdict === 'BLIND', `expected BLIND, got ${r.verdict}`);
+      assert(/503/.test(r.blind), r.blind);
+    },
+  },
+  {
+    name:
+      '⛔ fewer than 2 eligible assignees => the SPREAD is unmeasured and concentration is SUPPRESSED ' +
+      '(a "concentration" over one queue is not a concentration)',
+    rows: cell('leaddev', 'manual', 20, 15),
+    expect: (r) => {
+      assert(r.spreadMeasured === false, 'spread must read unmeasured');
+      assert(r.verdict !== 'SYSTEMIC', `must not convict on a single-queue board, got ${r.verdict}`);
+      const rep = renderCohortReport(r).join('\n');
+      assert(/SPREAD is unmeasured/.test(rep), rep);
+    },
+  },
+];
+
+/** `n` unassigned rows, never dispatched — undispatched by construction. */
+function cohortIssueBatch(n) {
+  const rows = [];
+  for (let i = 0; i < n; i += 1) {
+    rows.push(
+      cohortIssue(`unassigned-${i}`, {
+        assigneeAgentId: null,
+        startedAt: null,
+        executionLockedAt: null,
+        checkoutRunId: null,
+        executionRunId: null,
+      }),
+    );
+  }
+  return rows;
+}
+
 async function selftest() {
   let pass = 0;
   const seen = new Set();
@@ -950,6 +1808,41 @@ async function selftest() {
     } catch (err) {
       console.log(`FAIL  ${c.name}\n        ${err.message}`);
     }
+  }
+
+  console.log('');
+  console.log('-- COHORT ARM (TRA-3535) — roster-wide, all origins --');
+  const cohortSeen = new Set();
+  for (const c of COHORT_CASES) {
+    try {
+      const r = await sweepCohort(cohortTransport(c.rows, c.transportOpts || {}), {
+        nowMs: NOW,
+        cohortWindowMs: 72 * H,
+        ...(c.opts || {}),
+      });
+      cohortSeen.add(r.verdict);
+      c.expect(r);
+      console.log(`ok    ${c.name}`);
+      pass += 1;
+    } catch (err) {
+      console.log(`FAIL  ${c.name}\n        ${err.message}`);
+    }
+  }
+
+  // ⭐ THE PAIRING IS ITSELF A CONTROL. If the cohort arm ever reaches only one
+  // of SYSTEMIC / CLEAN-or-FINDINGS, it has not been shown to DISCRIMINATE — it
+  // has only been shown firing, which is the exact failure the ruling named.
+  try {
+    assert(cohortSeen.has('SYSTEMIC'), 'no cohort control ever reached SYSTEMIC — the detector is unproven firing');
+    assert(
+      cohortSeen.has('CLEAN') || cohortSeen.has('FINDINGS'),
+      'no cohort control ever stayed SILENT — a detector shown only firing cannot tell a starved queue from a busy one',
+    );
+    assert(cohortSeen.has('BLIND'), 'no cohort control ever reached BLIND — the unreadable population is ungraded');
+    console.log('ok    GLOBAL — the cohort arm was proven in BOTH directions (fires AND stays silent)');
+    pass += 1;
+  } catch (err) {
+    console.log(`FAIL  GLOBAL both-directions control\n        ${err.message}`);
   }
 
   // GLOBAL — this script must never write. A detector that can mutate the board
@@ -967,11 +1860,14 @@ async function selftest() {
     console.log(`FAIL  GLOBAL read-only control\n        ${err.message}`);
   }
 
-  const total = CASES.length + 1;
+  const total = CASES.length + COHORT_CASES.length + 2;
   console.log('');
-  console.log(`${pass}/${total} controls pass; verdicts reachable: ${[...seen].sort().join(', ')}`);
+  console.log(`${pass}/${total} controls pass`);
+  console.log(`  routine arm verdicts reachable: ${[...seen].sort().join(', ')}`);
+  console.log(`  cohort  arm verdicts reachable: ${[...cohortSeen].sort().join(', ')}`);
   for (const v of ['CLEAN', 'FINDINGS', 'SYSTEMIC', 'BLIND']) {
-    if (!seen.has(v)) console.log(`WARN  verdict ${v} was never reached by any control`);
+    if (!seen.has(v)) console.log(`WARN  routine-arm verdict ${v} was never reached by any control`);
+    if (!cohortSeen.has(v)) console.log(`WARN  cohort-arm verdict ${v} was never reached by any control`);
   }
   return pass === total ? 0 : 1;
 }
@@ -1006,6 +1902,13 @@ function liveTransport() {
     // ⛔ TRAP 1 — the SINGLE-ISSUE route, never `lastRun.linkedIssue`. That
     // embedded object serves six keys and `startedAt` is not among them.
     getIssue: async (id) => get(`${BASE}/api/issues/${id}`),
+    // ⛔⛔ THE FULL ROW, NEVER `?view=compact`. Verified 2026-09-22 against the
+    // single-issue GET on TRA-3535: the full list row's `startedAt`,
+    // `originKind`, `executionLockedAt`, `checkoutRunId` and `executionRunId`
+    // are IDENTICAL to the single GET, so this arm needs no fan-out. `compact`
+    // nulls fields the full GET has, which would brand the whole board starved.
+    getIssues: async ({ limit, offset }) =>
+      unwrap(await get(`${BASE}/api/companies/${CO}/issues?limit=${limit}&offset=${offset}`), 'issues'),
   };
 }
 
@@ -1013,7 +1916,18 @@ async function main() {
   if (argv.includes('--selftest')) return selftest();
 
   const transport = liveTransport();
-  const result = await sweep(transport, { routineLimit: ROUTINE_LIMIT });
+  // routine | cohort | both. Default `both`: the routine arm reports QUEUE
+  // STARVATION, and after TRA-3535 the evidence for that claim lives in the
+  // cohort arm. Running one without the other is how the number got
+  // hand-counted twice.
+  const arm = String(argOf('arm', 'both'));
+  const runRoutine = arm === 'both' || arm === 'routine';
+  const runCohort = arm === 'both' || arm === 'cohort';
+
+  const result = runRoutine
+    ? await sweep(transport, { routineLimit: ROUTINE_LIMIT })
+    : { verdict: 'CLEAN', findings: [], graded: 0, skipped: true };
+  const cohort = runCohort ? await sweepCohort(transport) : null;
 
   let names = {};
   try {
@@ -1052,15 +1966,29 @@ async function main() {
           historyUnread: result.historyUnread,
           findings: result.findings,
           blindRows: result.blindRows,
+          cohort,
         },
         null,
         2,
       ),
     );
   } else {
-    for (const l of renderReport(result, names)) console.log(l);
+    if (runRoutine) for (const l of renderReport(result, names)) console.log(l);
+    if (runCohort) {
+      if (runRoutine) console.log('');
+      for (const l of renderCohortReport(cohort, names)) console.log(l);
+    }
   }
-  return VERDICT_EXIT[result.verdict] ?? 3;
+
+  // ⛔ THE WORST ARM WINS, and BLIND outranks everything including a zero count.
+  // Folding two arms into one exit code by taking the better of them would let a
+  // CLEAN routine slice launder a starved manual slice — which is the exact
+  // blind spot TRA-3535 exists to close.
+  const codes = [];
+  if (runRoutine) codes.push(VERDICT_EXIT[result.verdict] ?? 3);
+  if (runCohort) codes.push(VERDICT_EXIT[cohort.verdict] ?? 3);
+  if (codes.includes(VERDICT_EXIT.BLIND)) return VERDICT_EXIT.BLIND;
+  return Math.max(...codes, 0);
 }
 
 main()
