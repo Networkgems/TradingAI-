@@ -541,3 +541,139 @@ describe('TRA-4246 AC4 — a supersede that changes the headline reason is NAMED
       .toHaveLength(0);
   });
 });
+
+// ── AC6 (CFO) — the TRA-450 breaker accrual on the close row ────────────────
+//
+// WHY THIS IS NOT A ONE-LINE STAMP. The breaker's own counter is CONSECUTIVE,
+// so every path that books a close deletes it FIRST — `finalizePendingExit` on
+// the fill, `stageManualPendingExit` on a user re-stage, `closeBrokerFlatPosition`
+// on the reconcile close. A journal stamp read off `position.closeRejectCount`
+// at the write would therefore have published `0` on every row ever closed:
+// a column that is vacuous by construction and reads exactly like a clean book.
+// So the accrual is carried by a LIFETIME counter that nothing resets, and the
+// threshold fact travels separately as `closeRejectBreakerTripped`.
+//
+// The reader this is for: a latched row is never handed to `profitLockDecision`
+// (`checkExits` stops re-staging at the threshold), so a `profit_lock` label on
+// one is a RELABEL — the same conflation AC4 fixes for supersedes.
+
+const MAX_CONSECUTIVE_CLOSE_REJECTS = 3;
+const REFUSAL_REASON = 'broker rejected: 400 invalid limit';
+
+describe('TRA-4246 AC6 — the close row publishes the breaker accrual the fill destroys', () => {
+  let tmpFile: string;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(TRADING_TIME);
+    tmpFile = join(tmpdir(), `tra4246-ac6-${process.pid}-${Math.random().toString(36).slice(2)}.jsonl`);
+    process.env['ENABLE_OPTION_TRADE_JOURNAL'] = '1';
+    setOptionTradeJournalFileForTests(tmpFile);
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    delete process.env['ENABLE_OPTION_TRADE_JOURNAL'];
+    setOptionTradeJournalFileForTests(null);
+    await rm(tmpFile, { force: true });
+  });
+
+  function openOne() {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      holdLiveOptionsOvernightForPdt: false,
+    });
+    const pos = acct.openOptionFromCandidate(buildSignal(), 'live', 50_000, undefined, JOURNAL_SETUP);
+    expect(pos).not.toBeNull();
+    return { acct, id: pos!.id, sym: pos!.optionSymbol! };
+  }
+
+  /** The real staging path, refused by the broker. No test-only mutation. */
+  function stageThenRefuse(acct: PaperOptionsAccount, sym: string, id: string): boolean {
+    // 0.7 is through the 1.024 stop, so `checkExits` stages the close.
+    const staged = acct.checkExits(new Map(), new Map([[sym, 0.7]]), undefined, { waitAndHold: true });
+    if (staged.length === 0) return false;
+    return acct.clearPendingExit(id, REFUSAL_REASON);
+  }
+
+  it('a LATCHED row closes carrying its accrual and its trip flag — the consecutive counter is already gone', async () => {
+    const { acct, id, sym } = openOne();
+    for (let i = 0; i < MAX_CONSECUTIVE_CLOSE_REJECTS; i += 1) {
+      expect(stageThenRefuse(acct, sym, id)).toBe(true);
+    }
+    const live = acct.getState().openOptions[0]!;
+    expect(live.closeRejectCount).toBe(MAX_CONSECUTIVE_CLOSE_REJECTS);
+    expect(live.closeRejectLifetimeCount).toBe(MAX_CONSECUTIVE_CLOSE_REJECTS);
+    expect(live.closeRejectBreakerEverTripped).toBe(true);
+
+    vi.setSystemTime(TRADING_TIME + 5 * MIN);
+    expect(acct.closeOption(id, 1.408, 'manual')).not.toBeNull();
+    await acct.flushOptionTradeJournal();
+
+    const rec = (await listOptionTradeJournal())[0]!;
+    // THE POINT: 3, not 0. A stamp taken off the breaker's own counter would
+    // have read 0 here, because booking this close deleted it.
+    expect(rec.closeRejectCount).toBe(MAX_CONSECUTIVE_CLOSE_REJECTS);
+    expect(rec.closeRejectBreakerTripped).toBe(true);
+    expect(rowFromJournalRecord(rec).close_reject_count).toBe(MAX_CONSECUTIVE_CLOSE_REJECTS);
+    expect(rowFromJournalRecord(rec).close_reject_breaker_tripped).toBe(true);
+  });
+
+  it('a clean row stamps 0/false — absent must never be read as clean', async () => {
+    const { acct, id } = openOne();
+    vi.setSystemTime(TRADING_TIME + 1 * MIN);
+    expect(acct.closeOption(id, 1.408, 'manual')).not.toBeNull();
+    await acct.flushOptionTradeJournal();
+
+    const rec = (await listOptionTradeJournal())[0]!;
+    expect(rec.closeRejectCount).toBe(0);
+    expect(rec.closeRejectBreakerTripped).toBe(false);
+  });
+
+  it('the count is a LIFETIME total and the trip flag is the separate fact — 3 rejects that never latched', async () => {
+    // A manual re-stage clears the CONSECUTIVE counter (TRA-450: a deliberate
+    // user retry gets a clean slate), so three rejects spread across re-stages
+    // never reach the threshold. The lifetime total still says three.
+    const { acct, id } = openOne();
+    for (let i = 0; i < 3; i += 1) {
+      expect(acct.stageManualPendingExit(id, 1, 1.0)).not.toBeNull();
+      expect(acct.clearPendingExit(id, REFUSAL_REASON)).toBe(true);
+      // Cleared on the NEXT re-stage; what matters is it never reaches 3.
+      expect(acct.getState().openOptions[0]!.closeRejectCount).toBe(1);
+    }
+    vi.setSystemTime(TRADING_TIME + 5 * MIN);
+    expect(acct.closeOption(id, 1.408, 'manual')).not.toBeNull();
+    await acct.flushOptionTradeJournal();
+
+    const rec = (await listOptionTradeJournal())[0]!;
+    expect(rec.closeRejectCount).toBe(3);
+    // ⛔ NOT true. Three isolated rejects are not a latch, and a reader asking
+    // "was this row latched" must not get its answer from the count.
+    expect(rec.closeRejectBreakerTripped).toBe(false);
+  });
+
+  it('the public journal route serves it per row AND per cell, and a pre-stamp close reads null — never 0', () => {
+    const report = buildOptionJournalReport(
+      [
+        closedRow({ exitReason: 'profit_lock', closeRejectCount: 4, closeRejectBreakerTripped: true }),
+        closedRow({ exitReason: 'profit_lock', closeRejectCount: 0, closeRejectBreakerTripped: false }),
+        closedRow({ exitReason: 'profit_lock' }), // pre-stamp
+      ],
+      Date.UTC(2026, 8, 10),
+      true,
+    ).summary.byAccountClass.desk!.byStructureExit;
+    const cell = report.cells.find((c) => c.exitReason === 'profit_lock')!;
+
+    // Per cell: 3 closed rows, 2 of them graded, 1 latched. The pre-stamp row is
+    // NOT counted clean — it is not counted at all.
+    expect(cell.closed).toBe(3);
+    expect(cell.closeRejectBreaker).toEqual({ stamped: 2, withRejects: 1, breakerTripped: 1 });
+
+    // Per row, on the forensics list the give-back verdict is read off.
+    const byTripped = cell.releaseForensics.map((f) => f.closeRejectBreakerTripped);
+    expect(byTripped).toContain(true);
+    expect(byTripped).toContain(false);
+    expect(byTripped).toContain(null); // pre-stamp, never `false`
+  });
+});

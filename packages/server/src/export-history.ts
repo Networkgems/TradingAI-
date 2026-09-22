@@ -582,6 +582,16 @@ export function rowFromJournalRecord(r: OptionTradeJournalRecord): ExportTradeRo
     // from a stamped null, which is why the reason lives on the journal record
     // and a grader reading the census must window on close date.
     pnl_r_stop_basis: isFiniteNumber(r.pnlRStopBasis) ? r.pnlRStopBasis : null,
+    // TRA-4246 (AC6) — the TRA-450 breaker's accrual on this row. `null` (not
+    // `0`) on a pre-stamp close: the two are different facts and only one of
+    // them licenses "this row took no rejects". `close_reject_breaker_tripped`
+    // is the one to read for "was this row LATCHED" — the count is a lifetime
+    // total and a non-consecutive 3 never tripped anything. A latched row is
+    // never handed to `profitLockDecision`, so a `profit_lock` exit_reason
+    // beside `true` here is a relabel, not a give-back release.
+    close_reject_count: isFiniteNumber(r.closeRejectCount) ? r.closeRejectCount : null,
+    close_reject_breaker_tripped:
+      typeof r.closeRejectBreakerTripped === 'boolean' ? r.closeRejectBreakerTripped : null,
     // TRA-4027 — and the premium it divides by is the one captured at the OPEN
     // MARK (`atRiskUsd`, frozen at open by TRA-991), which is why the label
     // names the instant and not merely the unit. `premium_basis_usd` is that

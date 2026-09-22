@@ -7719,6 +7719,14 @@ export class PaperOptionsAccount {
           ...(stopBasis.stopBasisRPerPremiumR !== undefined
             ? { stopBasisRPerPremiumR: stopBasis.stopBasisRPerPremiumR }
             : {}),
+          // TRA-4246 (AC6, CFO) — the TRA-450 breaker's accrual on this row,
+          // ALWAYS written (`0`/`false` included) so absence means "closed by a
+          // pre-stamp build" and never "we did not look". Read off the LIFETIME
+          // fields, never off `position.closeRejectCount`: the consecutive
+          // counter is deleted by the fill that books this very close, so a
+          // stamp taken from it would publish 0 on every row in the book.
+          closeRejectCount: position.closeRejectLifetimeCount ?? 0,
+          closeRejectBreakerTripped: position.closeRejectBreakerEverTripped === true,
           // TRA-4031 — the basis this close was PRICED against: `premiumPaid`
           // as it stands NOW, i.e. after `restateEngineOpenedBasis` (mirror
           // reconcile) or an operator pin moved it off the open mark. The OPEN
@@ -13172,6 +13180,13 @@ export class PaperOptionsAccount {
     }
     if (options.countRejection !== false) {
       opt.closeRejectCount = (opt.closeRejectCount ?? 0) + 1;
+      // TRA-4246 (AC6) — and the LIFETIME total, in lockstep. The counter above
+      // is consecutive and every close path deletes it before the journal row
+      // is written, so this is the only accrual that survives to the close row.
+      // ⛔ Nothing resets it: a fill, a manual re-stage and a reconcile close
+      // all end the streak, and none of them un-rejects an order the broker
+      // already refused.
+      opt.closeRejectLifetimeCount = (opt.closeRejectLifetimeCount ?? 0) + 1;
       // TRA-4218 — stamp the counter's PROVENANCE, not just its value. Reaching
       // this line at all means the transport branch above declined this failure,
       // so every increment under this build is a broker that looked and refused.
@@ -13194,6 +13209,13 @@ export class PaperOptionsAccount {
         // `broker_refusal`, which is the exact conflation this ticket is about.
         const causeClass = classifyExitBreakerCause(reason ?? opt.exitErrorReason);
         stampExitBreakerTrip(opt, 'close_reject', opt.closeRejectCount, causeClass);
+        // TRA-4246 (AC6) — and the DURABLE fact that it tripped at all. The
+        // stamp above is the live latch record and is deleted wherever the
+        // counters are; this survives to the journal close row, where it is the
+        // discriminator between a give-back release and a latch artifact: a
+        // latched row is never handed to `profitLockDecision`, so a
+        // `profit_lock` label on one is a relabel.
+        opt.closeRejectBreakerEverTripped = true;
         // TRA-4266 — HALF-OPEN bookkeeping. Reaching this line at or above the
         // threshold is one of exactly two events:
         //   • the CROSSING (`=== MAX`) — the trip. No probe has been spent;

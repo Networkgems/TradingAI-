@@ -681,6 +681,30 @@ export interface OptionTradeJournalClose {
    */
   stopBasisPremium?: number;
   stopBasisRPerPremiumR?: number;
+  /**
+   * TRA-4246 (AC6, CFO) — the TRA-450 close-reject accrual this row carried,
+   * and whether the breaker ever tripped on it.
+   *
+   * WHY IT IS ON THE CLOSE ROW. A latched row is never handed to
+   * `profitLockDecision`, so a `profit_lock` label on one is a LATCH ARTIFACT —
+   * the row was relabelled, not released by the give-back rule. Without this
+   * column a reader folding `byExitReason` cannot tell that apart from a real
+   * release, which is the same conflation AC4 fixes for supersedes.
+   *
+   * ⚠️ `closeRejectCount` here is the position's LIFETIME accrual
+   * (`closeRejectLifetimeCount`), NOT the consecutive `closeRejectCount` the
+   * breaker gates on. It has to be: every path that books a close deletes the
+   * consecutive counter first, so a stamp read off it would be `0` on every row
+   * ever written. A lifetime `3` may be one trip of three or three isolated
+   * rejects — `closeRejectBreakerTripped` is the separate fact about the
+   * threshold and is the one to read for "was this row latched".
+   *
+   * ⚠️ FORWARD-ONLY. Both keys are written on every close from this build,
+   * `0`/`false` included, so ABSENT means a pre-stamp close and ⛔ neither is
+   * backfilled.
+   */
+  closeRejectCount?: number;
+  closeRejectBreakerTripped?: boolean;
 }
 
 /** TRA-4246 (AC1) — see {@link OptionTradeJournalClose.pnlRStopBasisReason}. */
@@ -842,6 +866,14 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
   pnlRStopBasisReason?: OptionStopBasisNullReason;
   stopBasisPremium?: number;
   stopBasisRPerPremiumR?: number;
+  /**
+   * TRA-4246 (AC6) — the TRA-450 close-reject accrual and the ever-tripped
+   * flag, folded from the CLOSE row. Forward-only; ⛔ never backfilled. See
+   * {@link OptionTradeJournalClose.closeRejectCount} for why this is the
+   * LIFETIME total and not the breaker's consecutive counter.
+   */
+  closeRejectCount?: number;
+  closeRejectBreakerTripped?: boolean;
   /**
    * TRA-2895 — partial exits realized before the full close, in append order.
    *
@@ -2579,6 +2611,17 @@ function foldLine(
     ...(typeof line.close.stopBasisRPerPremiumR === 'number'
       && Number.isFinite(line.close.stopBasisRPerPremiumR)
       ? { stopBasisRPerPremiumR: line.close.stopBasisRPerPremiumR }
+      : {}),
+    // TRA-4246 (AC6) — the breaker accrual, folded on the KEY rather than on
+    // truthiness: `0` and `false` are the stamped verdict "this row took no
+    // rejects", and folding them away would make a graded row indistinguishable
+    // from a pre-stamp one — the exact absence/zero conflation AC1 avoids.
+    ...(typeof line.close.closeRejectCount === 'number'
+      && Number.isFinite(line.close.closeRejectCount)
+      ? { closeRejectCount: line.close.closeRejectCount }
+      : {}),
+    ...(typeof line.close.closeRejectBreakerTripped === 'boolean'
+      ? { closeRejectBreakerTripped: line.close.closeRejectBreakerTripped }
       : {}),
     // TRA-4609 — the size the position SETTLED, beside the entry-side
     // `contracts`. Absent stays absent: a pre-stamp close has no size witness,

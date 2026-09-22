@@ -321,6 +321,23 @@ export interface ExportTradeRow {
    */
   pnl_r_stop_basis?: number | null;
   /**
+   * TRA-4246 (AC6) — the TRA-450 close-reject accrual on this row, and whether
+   * the breaker ever latched it. JSON-only, deliberately: the §2.3 CSV header
+   * is positional and these are forensics for the give-back read, not a
+   * P&L column.
+   *
+   * `null` — never `0`/`false` — on a pre-stamp close from the option journal.
+   * ABSENT on every mapper that has no journal row to read (equity, crypto, the
+   * book-position and restatement mappers): "not applicable here" and "this row
+   * took no rejects" must not render alike. The count is a LIFETIME
+   * total (the breaker's own counter is consecutive and is deleted by the fill
+   * that books the close), so read `close_reject_breaker_tripped` for "was this
+   * row latched": a latched row never reaches `profitLockDecision`, so a
+   * `profit_lock` `exit_reason` beside it is a relabel.
+   */
+  close_reject_count?: number | null;
+  close_reject_breaker_tripped?: boolean | null;
+  /**
    * TRA-3990 — `(ask − bid) / mid` at entry, from the SAME snapshot the fill
    * price came from (see `OptionPosition.entrySpreadPct`). Last CSV column.
    * `null` on a pre-stamp row, an unmeasured quote, and every non-option row;

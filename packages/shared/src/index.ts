@@ -4287,6 +4287,45 @@ export interface OptionPosition {
    */
   closeRejectCount?: number;
   /**
+   * TRA-4246 (AC6) — the LIFETIME close-reject accrual on this row: bumped in
+   * lockstep with {@link closeRejectCount} and ⛔ never cleared by anything.
+   *
+   * It exists because {@link closeRejectCount} cannot answer the question the
+   * journal needs answered. That counter is CONSECUTIVE by design, so every
+   * path that ends a row deletes it BEFORE the close row is written —
+   * `finalizePendingExit` clears it on the fill that books the close
+   * (options-account.ts, the `TRA-450 — a fill is a successful close` branch),
+   * `stageManualPendingExit` clears it on a user re-stage, and
+   * `closeBrokerFlatPosition` clears it on the reconcile close. A journal
+   * stamp reading the live counter at the write would therefore publish `0` on
+   * every row in the book, including the rows that spent the session latched:
+   * a column that is vacuous by construction and reads exactly like a clean
+   * one.
+   *
+   * ⚠️ It is a LIFETIME TOTAL, not a streak: three accruals here can be one
+   * trip of three, or three isolated rejects that never tripped anything.
+   * {@link closeRejectBreakerEverTripped} is the separate fact about the
+   * threshold, and the two must not be substituted for each other.
+   *
+   * ⚠️ FORWARD-ONLY. A row opened before this shipped carries no total, and ⛔
+   * nothing backfills one — the rejects it took are not recoverable from the
+   * archived row.
+   */
+  closeRejectLifetimeCount?: number;
+  /**
+   * TRA-4246 (AC6) — `true` once the TRA-450 close-reject breaker has tripped
+   * on this row, EVER. Never cleared, for the same reason as
+   * {@link closeRejectLifetimeCount}: {@link exitBreakerTrip} is the live latch
+   * record and is deleted on the fill, the re-stage and the reconcile close, so
+   * it is always absent by the time the journal row is written.
+   *
+   * This is the discriminator the give-back forensics need. A row that tripped
+   * the breaker is never handed to `profitLockDecision` at all, so a
+   * `profit_lock` label on it is a latch artifact — a relabel — and not a
+   * give-back release. Absent ⇔ the row never tripped, or predates the stamp.
+   */
+  closeRejectBreakerEverTripped?: boolean;
+  /**
    * TRA-4218 — set to `true` alongside every increment of
    * {@link closeRejectCount} made by a build that routes transport faults away
    * from that counter. It exists for exactly one reader: the one-shot

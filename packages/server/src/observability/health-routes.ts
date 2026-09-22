@@ -2580,6 +2580,19 @@ export interface OptionJournalStructureExitCell {
   /** Trail-family rows beyond the cap — counted, never silently dropped. */
   releaseForensicsTruncated: number;
   /**
+   * TRA-4246 (AC6, CFO) — the cell's TRA-450 breaker exposure, so the latch
+   * artifact is a cell-level read and not one that only shows up on the capped
+   * `releaseForensics` list.
+   *
+   * `stamped` counts rows carrying the AC6 keys at all (forward-only: a
+   * pre-stamp close is in `closed` and not here, and ⛔ is never assumed
+   * clean). `withRejects` counts rows whose LIFETIME accrual is > 0.
+   * `breakerTripped` counts rows the breaker latched — on a trail-family cell
+   * those rows' `profit_lock` labels were not written by `profitLockDecision`,
+   * which never sees a latched row.
+   */
+  closeRejectBreaker: { stamped: number; withRejects: number; breakerTripped: number };
+  /**
    * TRA-4291 — the MODELED net-of-cross companion to `avgR`, with its own
    * provenance. `avgR` stays gross and byte-identical; this is the join that
    * stops a demo cell paying no spread from reading `scratch` (the TRA-4230
@@ -2714,6 +2727,17 @@ export interface OptionJournalReleaseForensic {
   /** `markAtFire − levelPremium`: the tick-granularity half of the gap. */
   markVsLevelPremium: number | null;
   pnlRStopBasis: number | null;
+  /**
+   * TRA-4246 (AC6) — the row's LIFETIME close-reject accrual, and whether the
+   * TRA-450 breaker ever tripped on it. `null` ⇒ a pre-stamp close, never `0`.
+   *
+   * `closeRejectBreakerTripped: true` on a trail-family row is the LATCH
+   * ARTIFACT reading: a latched row is never handed to `profitLockDecision`, so
+   * its `profit_lock` label was written by something else. Read it before
+   * folding this row's slip into a give-back verdict.
+   */
+  closeRejectCount: number | null;
+  closeRejectBreakerTripped: boolean | null;
 }
 
 /** TRA-4291 — one structure's measured cross + probe n, keyed for the cell join. */
@@ -3017,6 +3041,13 @@ function crossTabStructureExit(
                   markVsLevelPremium:
                     markAtFire !== null && levelPremium !== null ? markAtFire - levelPremium : null,
                   pnlRStopBasis: num(r.pnlRStopBasis),
+                  // TRA-4246 (AC6) — key-present, so a pre-stamp close reads
+                  // `null` and a clean row reads `0`/`false`.
+                  closeRejectCount: num(r.closeRejectCount),
+                  closeRejectBreakerTripped:
+                    typeof r.closeRejectBreakerTripped === 'boolean'
+                      ? r.closeRejectBreakerTripped
+                      : null,
                 };
               }
               const f = r.profitLockFire;
@@ -3051,9 +3082,33 @@ function crossTabStructureExit(
                 markVsLevelPremium:
                   markAtFire !== null && levelPremium !== null ? markAtFire - levelPremium : null,
                 pnlRStopBasis: num(r.pnlRStopBasis),
+                // TRA-4246 (AC6) — see the type. `true` here says the row was
+                // latched, which means `profitLockDecision` never ran on it and
+                // the label above is a relabel rather than a release.
+                closeRejectCount: num(r.closeRejectCount),
+                closeRejectBreakerTripped:
+                  typeof r.closeRejectBreakerTripped === 'boolean'
+                    ? r.closeRejectBreakerTripped
+                    : null,
               };
             });
           return { releaseForensics, releaseForensicsTruncated: trail.length - releaseForensics.length };
+        })(),
+        // TRA-4246 (AC6) — the breaker fold over EVERY row in the cell, not
+        // just the ones that fit under the forensics cap.
+        closeRejectBreaker: (() => {
+          let stamped = 0;
+          let withRejects = 0;
+          let breakerTripped = 0;
+          for (const r of list) {
+            const c = r.closeRejectCount;
+            const t = r.closeRejectBreakerTripped;
+            if (typeof c !== 'number' || !Number.isFinite(c)) continue;
+            stamped += 1;
+            if (c > 0) withRejects += 1;
+            if (t === true) breakerTripped += 1;
+          }
+          return { stamped, withRejects, breakerTripped };
         })(),
       };
     })
