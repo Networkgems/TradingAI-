@@ -47,8 +47,43 @@ import {
   DEFAULT_MARKETABLE_HALF_SPREAD_FRAC,
 } from './marketable-open-mtm.js';
 import { DEFAULT_COST_MODEL } from './options-cost-model.js';
+import {
+  engineBasisRestatementDataDir,
+  readEngineBasisRestatements,
+} from './engine-basis-restatement-log.js';
 
 const log = logger.child({ module: 'paper-trading' });
+
+/**
+ * TRA-4781 — how many times the engine restated THIS row's entry basis.
+ *
+ * Three-valued on purpose, and the whole point of the ticket. A row the
+ * restatement never reached (`quantity_mismatch` / `multi_leg` /
+ * `covered_write`) and a row it reached at zero delta BOTH show
+ * `basisDeltaUsd: 0.00` — the delta alone cannot separate them, and publishing
+ * a bare `0` for both is the indistinguishable-payload shape this whole ticket
+ * is about.
+ *
+ *   • `null`  — the durable census is UNREADABLE (DATA_DIR unset, file absent,
+ *     or open failed). NOT zero. A consumer must never `?? 0` this.
+ *   • `0`     — census readable and it holds nothing for this id: the
+ *     restatement genuinely never landed, so the engine's basis is still the
+ *     open mark and `basisDeltaUsd` of 0.00 is structural, not measured.
+ *   • `n >= 1` — it landed n times; a `basisDeltaUsd` of 0.00 is then a real
+ *     measurement that happens to be zero.
+ *
+ * Fails to `null` in every doubt: asserting "never restated" off a census we
+ * could not read is the expensive direction.
+ */
+function countBasisRestatements(positionId: string): number | null {
+  try {
+    const read = readEngineBasisRestatements(engineBasisRestatementDataDir());
+    if (!read.logPresent || read.readError !== null) return null;
+    return read.records.filter((r) => r.positionId === positionId).length;
+  } catch {
+    return null;
+  }
+}
 
 export const PAPER_TRADING_FLAG = 'ENABLE_PAPER_TRADING';
 
@@ -206,6 +241,48 @@ export interface PaperCloseRow {
   demoPnlUsd: number | null;
   /** Theoretical P&L off the PAPER fills, net of spread + commissions. */
   paperPnlUsd: number | null;
+  /**
+   * TRA-4781 — THE TWO LEGS ABOVE DO NOT SHARE AN ENTRY BASIS, and until these
+   * fields existed nothing on the payload said so.
+   *
+   * `demoPnlUsd` is the engine's, struck against `premiumPaid` AFTER
+   * `restateEngineOpenedBasis` (TRA-3965) moved it to broker truth on a later
+   * reconcile — measured 23.1s (SOFI) and 72.3s (BAC) after the open, and never
+   * at all on a `quantity_mismatch` / `multi_leg` / `covered_write` row.
+   * `paperPnlUsd` is struck against the tee's own entry fill, derived from the
+   * mid at the decision instant, which is NEVER restated. So the natural read
+   * of the summary route — `demo − theoretical = cost of trading` — silently
+   * absorbs a third term that is not a cost at all: on the four TRA-4657 pairs
+   * of 2026-09-22 it was $13.80, larger than every commission combined, 29% of
+   * the gap, and it went BOTH ways (GME +17.22, TLT −8.93).
+   *
+   * The bridge these fields close, exact to the cent on that fixture:
+   *
+   *     demoPnlUsd − paperPnlUsd = spread + commissions + basisDeltaUsd
+   *
+   * Additive by design (TRA-4781 §2): the paper open is NOT re-stamped when the
+   * restatement lands, because a paper row recording what was knowable at
+   * DECISION time is the more valuable audit property. The divergence is made
+   * readable instead of made to disappear.
+   */
+  /** The basis the TEE used: the open-time mid. `null` ⇒ no matched open. */
+  entryBasisAtOpen: number | null;
+  /** The basis the ENGINE's `demoPnlUsd` used: `premiumPaid` as of the close. */
+  entryBasisRestated: number | null;
+  /**
+   * `(entryBasisAtOpen − entryBasisRestated) × qty × multiplier` — the term to
+   * SUBTRACT from `demoPnlUsd − paperPnlUsd` to recover the true cost of
+   * trading. Sign is oriented to the bridge above; `null` when either basis is
+   * unknown. ⛔ A `0.00` here is meaningless without `basisRestatementCount`.
+   */
+  basisDeltaUsd: number | null;
+  /**
+   * Three-valued: `null` = census UNREADABLE · `0` = restatement never landed
+   * (so a zero delta is structural) · `n ≥ 1` = it landed (so a zero delta is
+   * measured). ⛔ Never `?? 0` this — that re-merges the two readings the
+   * field exists to split.
+   */
+  basisRestatementCount: number | null;
   /** FALSE ⇒ no admitted paper open existed for this id (refused/pre-arm). */
   matchedOpen: boolean;
   /** TRUE on force-closes priced off the entry mid — mark unknown, P&L excluded. */
@@ -227,6 +304,14 @@ interface PaperBookEntry {
   qty: number;
   multiplier: number;
   fillPerShare: number;
+  /**
+   * TRA-4781 — the open-time MID (`premiumPaid` as the decision seam saw it),
+   * kept beside the theoretical fill because the close needs the basis the tee
+   * was anchored to in order to name its divergence from the engine's.
+   * Recovered from the persisted open row, so rows already on disk fold with
+   * it and no migration is needed.
+   */
+  midPerShare: number;
   commissionUsd: number;
   openedAtMs: number;
 }
@@ -290,6 +375,7 @@ function foldRowIntoBook(row: PaperLedgerRow): void {
       qty: row.qty,
       multiplier: row.multiplier,
       fillPerShare: row.fill.fillPerShare,
+      midPerShare: row.midPerShare,
       commissionUsd: row.commissionUsd,
       openedAtMs: row.atMs,
     });
@@ -514,6 +600,15 @@ export interface PaperOptionCloseLike {
   pnl?: number;
   exitReason?: string;
   entrySpreadPct?: number | null;
+  /**
+   * TRA-4781 — the entry basis `pnl` above was struck against, i.e. the
+   * engine's `premiumPaid` as it stands NOW (after any
+   * `restateEngineOpenedBasis`). `OptionPosition` already carries this, so the
+   * call site needs no change — widening the structural type is the whole
+   * wiring. Optional because the force-close and equity paths have no engine
+   * basis to report, and inventing one would be worse than a null.
+   */
+  premiumPaid?: number;
 }
 
 export function recordPaperOptionClose(opt: PaperOptionCloseLike, mode: string): { recorded: boolean } {
@@ -533,6 +628,17 @@ export function recordPaperOptionClose(opt: PaperOptionCloseLike, mode: string):
     const paperPnlUsd = entry
       ? (fill.fillPerShare - entry.fillPerShare) * entry.qty * entry.multiplier - entry.commissionUsd - commissionUsd
       : null;
+    // TRA-4781 — name the basis split rather than let it hide in the gap
+    // between the two P&L legs. `entryBasisAtOpen` is what the tee anchored to
+    // at the decision instant; `entryBasisRestated` is what the engine's `pnl`
+    // was struck against by the time this close ran.
+    const entryBasisAtOpen = entry && Number.isFinite(entry.midPerShare) ? entry.midPerShare : null;
+    const entryBasisRestated =
+      typeof opt.premiumPaid === 'number' && Number.isFinite(opt.premiumPaid) ? opt.premiumPaid : null;
+    const basisDeltaUsd =
+      entry && entryBasisAtOpen !== null && entryBasisRestated !== null
+        ? (entryBasisAtOpen - entryBasisRestated) * entry.qty * entry.multiplier
+        : null;
     const row: PaperCloseRow = {
       kind: 'close',
       instrument: 'option',
@@ -550,6 +656,10 @@ export function recordPaperOptionClose(opt: PaperOptionCloseLike, mode: string):
       commissionUsd,
       demoPnlUsd: typeof opt.pnl === 'number' && Number.isFinite(opt.pnl) ? opt.pnl : null,
       paperPnlUsd,
+      entryBasisAtOpen,
+      entryBasisRestated,
+      basisDeltaUsd,
+      basisRestatementCount: countBasisRestatements(opt.id),
       matchedOpen: !!entry,
     };
     foldRowIntoBook(row);
@@ -604,6 +714,14 @@ export function recordPaperEquityClose(pos: PaperEquityCloseLike, mode: string):
       commissionUsd: 0,
       demoPnlUsd: typeof pos.pnl === 'number' && Number.isFinite(pos.pnl) ? pos.pnl : null,
       paperPnlUsd,
+      // TRA-4781 — `restateEngineOpenedBasis` is an OPTIONS mechanism; there is
+      // no equity restatement and therefore no census to read. The tee's own
+      // basis is still reported, but the other three stay null rather than
+      // publish a `0` that would read as a measured agreement we never made.
+      entryBasisAtOpen: entry && Number.isFinite(entry.midPerShare) ? entry.midPerShare : null,
+      entryBasisRestated: null,
+      basisDeltaUsd: null,
+      basisRestatementCount: null,
       matchedOpen: !!entry,
     };
     foldRowIntoBook(row);
@@ -655,6 +773,12 @@ export async function forceCloseAllPaperPositions(nowMs: number = Date.now()): P
       commissionUsd: 0,
       demoPnlUsd: null,
       paperPnlUsd: null,
+      // TRA-4781 — a force-close publishes no P&L at all (`markStale`), so
+      // there is no gap between two legs to decompose. All four stay null.
+      entryBasisAtOpen: Number.isFinite(entry.midPerShare) ? entry.midPerShare : null,
+      entryBasisRestated: null,
+      basisDeltaUsd: null,
+      basisRestatementCount: null,
       matchedOpen: true,
       markStale: true,
     };
@@ -695,6 +819,26 @@ export interface PaperDailySummary {
   /** Total logged slippage assumption (open + close legs), USD. */
   slippageAssumedUsd: number;
   commissionAssumedUsd: number;
+  /**
+   * TRA-4781 — the third term in `demo − theoretical`, folded over the option
+   * closes that carry a readable basis pair. WITHOUT this the summary's two
+   * P&L totals differ by spread + commissions + an unnamed basis drift, and
+   * the obvious subtraction overstates the cost of trading (by 29% on the
+   * 2026-09-22 fixture). Subtract it to recover the real cost:
+   *
+   *     demoRealizedPnlUsd − theoreticalRealizedPnlUsd
+   *       = slippageAssumedUsd + commissionAssumedUsd + basisDeltaUsd
+   */
+  basisDeltaUsd: number;
+  /**
+   * Option closes NOT in the fold above, split three ways so a quiet day and a
+   * broken census never render as the same number:
+   *   • `unreadable` — the restatement census could not be read
+   *   • `unstamped`  — row predates TRA-4781 (no basis fields on it at all)
+   *   • `neverRestated` — census readable, zero records: the delta is
+   *     structurally zero, NOT a measured agreement
+   */
+  basisCloses: { inFold: number; unreadable: number; unstamped: number; neverRestated: number };
   /** Closes that had no admitted paper open to settle against. */
   unmatchedCloses: number;
   openPositionsNow: number;
@@ -714,6 +858,8 @@ export function buildPaperDailySummary(etDay?: string, env: NodeJS.ProcessEnv = 
     demoRealizedPnlUsd: 0,
     slippageAssumedUsd: 0,
     commissionAssumedUsd: 0,
+    basisDeltaUsd: 0,
+    basisCloses: { inFold: 0, unreadable: 0, unstamped: 0, neverRestated: 0 },
     unmatchedCloses: 0,
     openPositionsNow: book.size,
   };
@@ -740,6 +886,23 @@ export function buildPaperDailySummary(etDay?: string, env: NodeJS.ProcessEnv = 
       if (typeof row.demoPnlUsd === 'number') summary.demoRealizedPnlUsd += row.demoPnlUsd;
       summary.slippageAssumedUsd += row.fill.slippagePerShare * row.qty * row.multiplier;
       summary.commissionAssumedUsd += row.commissionUsd;
+      // TRA-4781 — fold the basis term, and bucket every option close that
+      // cannot contribute to it. `undefined` here is a row written before this
+      // shipped; `null` is a census we could not read. Folding either as 0
+      // would put the two readings back in one cell.
+      if (row.instrument === 'option') {
+        if (!('basisDeltaUsd' in row)) {
+          summary.basisCloses.unstamped += 1;
+        } else if (row.basisRestatementCount === null) {
+          summary.basisCloses.unreadable += 1;
+        } else if (typeof row.basisDeltaUsd === 'number' && Number.isFinite(row.basisDeltaUsd)) {
+          summary.basisDeltaUsd += row.basisDeltaUsd;
+          summary.basisCloses.inFold += 1;
+          if (row.basisRestatementCount === 0) summary.basisCloses.neverRestated += 1;
+        } else {
+          summary.basisCloses.unreadable += 1;
+        }
+      }
     }
   }
   return summary;

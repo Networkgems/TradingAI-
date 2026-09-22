@@ -18,6 +18,10 @@ import {
   requestForceCloseAll,
 } from './hard-controls.js';
 import {
+  appendEngineBasisRestatement,
+  configureEngineBasisRestatementLog,
+} from './engine-basis-restatement-log.js';
+import {
   buildPaperDailySummary,
   forceCloseAllPaperPositions,
   getPaperLedgerRowsForDay,
@@ -304,5 +308,142 @@ describe('flag + persistence + zero-live-orders', () => {
     }
     // And no HTTP client of any kind to smuggle one in.
     expect(src).not.toMatch(/\bfetch\s*\(|axios|https?\.request/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TRA-4781 — the two P&L legs do not share an entry basis, and the payload
+// must SAY so. The defect these cover is not a wrong number: it is that a
+// shared-basis payload and a split-basis payload were byte-indistinguishable.
+// ---------------------------------------------------------------------------
+
+describe('TRA-4781 — the basis split is readable on the row', () => {
+  function restatement(positionId: string, before: number, after: number, contracts = 2) {
+    return {
+      ts: NOW,
+      positionId,
+      optionSymbol: 'ABC260918C00100000',
+      contracts,
+      premiumPaidBefore: before,
+      premiumPaidAfter: after,
+      ratio: after / before,
+      brokerCostBasisUsd: after * contracts * 100,
+      tp1PremiumBefore: before * 1.5,
+      tp1PremiumAfter: after * 1.5,
+      stopLossPremiumBefore: before * 0.5,
+      stopLossPremiumAfter: after * 0.5,
+      trailingStopPremiumBefore: 0,
+      trailingStopPremiumAfter: 0,
+      trailingActive: false,
+      tp1RatioBefore: 1.5,
+      tp1RatioAfter: 1.5,
+      stopRatioBefore: 0.5,
+      stopRatioAfter: 0.5,
+    };
+  }
+
+  function closeRows(): PaperCloseRow[] {
+    return getPaperLedgerRowsForDay(ET_DAY).filter((r): r is PaperCloseRow => r.kind === 'close');
+  }
+
+  it('THE BRIDGE: demo − theoretical = spread + commissions + basisDeltaUsd, to the cent', () => {
+    configureEngineBasisRestatementLog(dir);
+    const open = optOpen({ id: 'bridge-1', contracts: 2, premiumPaid: 1.0, entryBidAtOpen: 0.9, entryAskAtOpen: 1.1 });
+    recordPaperOptionOpen(open, 'paper', NOW);
+    // The reconcile moves the engine's basis to broker truth 23s later; the
+    // tee is NEVER told, which is the whole defect.
+    appendEngineBasisRestatement(dir, restatement('bridge-1', 1.0, 0.95));
+    recordPaperOptionClose({
+      id: 'bridge-1', symbol: 'ABC', optionSymbol: 'ABC260918C00100000', contracts: 2,
+      currentPremium: 1.5, entrySpreadPct: 0.2, closedAt: NOW,
+      premiumPaid: 0.95,             // restated — what `pnl` below was struck against
+      pnl: (1.5 - 0.95) * 2 * 100,   // 110.00, the engine's own demo number
+    }, 'paper');
+
+    const row = closeRows()[0]!;
+    expect(row.entryBasisAtOpen).toBeCloseTo(1.0, 10);
+    expect(row.entryBasisRestated).toBeCloseTo(0.95, 10);
+    expect(row.basisDeltaUsd).toBeCloseTo(10.0, 10);
+    expect(row.basisRestatementCount).toBe(1);
+
+    // The legs themselves are UNCHANGED — this ticket makes the split legible,
+    // it does not restate the tee (TRA-4781 §2: additive, never mutating).
+    expect(row.demoPnlUsd).toBeCloseTo(110.0, 10);
+    expect(row.paperPnlUsd).toBeCloseTo(47.4, 10);
+
+    const s = buildPaperDailySummary(ET_DAY);
+    const gap = s.demoRealizedPnlUsd - s.theoreticalRealizedPnlUsd;
+    expect(gap).toBeCloseTo(62.6, 10);
+    // Residual $0.0000 — the same control the live 2026-09-22 fixture ran.
+    expect(gap - (s.slippageAssumedUsd + s.commissionAssumedUsd + s.basisDeltaUsd)).toBeCloseTo(0, 10);
+    expect(s.basisDeltaUsd).toBeCloseTo(10.0, 10);
+    expect(s.basisCloses).toEqual({ inFold: 1, unreadable: 0, unstamped: 0, neverRestated: 0 });
+  });
+
+  it('⛔ THE DISCRIMINATOR: never-restated and restated-at-zero-delta are NOT the same row', () => {
+    configureEngineBasisRestatementLog(dir);
+    // A: the restatement landed and happened to move nothing.
+    recordPaperOptionOpen(optOpen({ id: 'zero-delta', contracts: 1, premiumPaid: 1.0 }), 'paper', NOW);
+    appendEngineBasisRestatement(dir, restatement('zero-delta', 1.0, 1.0, 1));
+    recordPaperOptionClose({
+      id: 'zero-delta', symbol: 'ABC', contracts: 1, currentPremium: 1.2,
+      entrySpreadPct: 0.2, closedAt: NOW, premiumPaid: 1.0, pnl: 20,
+    }, 'paper');
+
+    // B: a `quantity_mismatch` row the restatement never reached at all.
+    recordPaperOptionOpen(optOpen({ id: 'never', contracts: 1, premiumPaid: 1.0 }), 'paper', NOW);
+    recordPaperOptionClose({
+      id: 'never', symbol: 'ABC', contracts: 1, currentPremium: 1.2,
+      entrySpreadPct: 0.2, closedAt: NOW, premiumPaid: 1.0, pnl: 20,
+    }, 'paper');
+
+    const [a, b] = closeRows();
+    // Identical on every pre-TRA-4781 field — this is what made them the same row.
+    expect(a!.basisDeltaUsd).toBeCloseTo(0, 10);
+    expect(b!.basisDeltaUsd).toBeCloseTo(0, 10);
+    expect(a!.demoPnlUsd).toBe(b!.demoPnlUsd);
+    expect(a!.paperPnlUsd).toBe(b!.paperPnlUsd);
+    // ...and separated only by the census.
+    expect(a!.basisRestatementCount).toBe(1);
+    expect(b!.basisRestatementCount).toBe(0);
+    expect(a!.basisRestatementCount).not.toBe(b!.basisRestatementCount);
+
+    const s = buildPaperDailySummary(ET_DAY);
+    expect(s.basisCloses).toEqual({ inFold: 2, unreadable: 0, unstamped: 0, neverRestated: 1 });
+  });
+
+  it('an UNREADABLE census is null, never 0 — it must not read as "never restated"', () => {
+    configureEngineBasisRestatementLog(join(dir, 'no-such-dir'));
+    recordPaperOptionOpen(optOpen({ id: 'blind', contracts: 1, premiumPaid: 1.0 }), 'paper', NOW);
+    recordPaperOptionClose({
+      id: 'blind', symbol: 'ABC', contracts: 1, currentPremium: 1.2,
+      entrySpreadPct: 0.2, closedAt: NOW, premiumPaid: 1.0, pnl: 20,
+    }, 'paper');
+
+    const row = closeRows()[0]!;
+    expect(row.basisRestatementCount).toBeNull();
+    expect(row.basisRestatementCount).not.toBe(0);
+    // An unreadable row is NOT folded into the basis total as a zero.
+    const s = buildPaperDailySummary(ET_DAY);
+    expect(s.basisCloses).toEqual({ inFold: 0, unreadable: 1, unstamped: 0, neverRestated: 0 });
+    expect(s.basisDeltaUsd).toBe(0);
+  });
+
+  it('a row written BEFORE this shipped buckets as `unstamped`, not as a zero delta', () => {
+    const file = join(dir, 'legacy.jsonl');
+    // A pre-TRA-4781 close row: no basis fields on it at all.
+    writeFileSync(file, `${JSON.stringify({
+      kind: 'close', instrument: 'option', atMs: NOW, etDay: ET_DAY, mode: 'paper',
+      positionId: 'legacy-1', symbol: 'ABC', occ: null, exitReason: 'tp', qty: 1, multiplier: 100,
+      midPerShare: 1.2, fill: { fillPerShare: 1.08, slippagePerShare: 0.12, spreadSource: 'modeled_entry_spread', halfSpreadFrac: 0.1, aggression: 1 },
+      commissionUsd: 0.65, demoPnlUsd: 20, paperPnlUsd: 18, matchedOpen: true,
+    })}\n`, 'utf-8');
+    setPaperTradingLedgerFileForTests(file);
+
+    const s = buildPaperDailySummary(ET_DAY);
+    expect(s.basisCloses).toEqual({ inFold: 0, unreadable: 0, unstamped: 1, neverRestated: 0 });
+    expect(s.basisDeltaUsd).toBe(0);
+    // The legacy row's own P&L still counts — only its basis term is unknown.
+    expect(s.demoRealizedPnlUsd).toBe(20);
   });
 });
