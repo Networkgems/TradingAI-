@@ -249,6 +249,29 @@ const blinds = Array.isArray(census.blindCloses) ? census.blindCloses : [];
 const publishedExcess = new Map(findings.map(f => [f.optionSymbol, f.excessContracts]));
 const publishedImportOnly = new Set(blinds.filter(b => b.reason === 'import_only').map(b => b.optionSymbol));
 const publishedNoOpen = new Set(blinds.filter(b => b.reason === 'no_open_record').map(b => b.optionSymbol));
+// ⛔ TRA-3926 (2026-09-22) — A SYMBOL-KEYED SET CANNOT REPRESENT ONE SYMBOL
+// WHOSE CLOSES LAND IN TWO BUCKETS, and the horizon manufactures exactly that.
+// The route classifies each close CHRONOLOGICALLY; the fold above is a lifetime
+// per-OCC total. While every blind symbol held one close the two agreed by
+// accident. On 2026-09-22 RIG260925C00006000 held both — close 143048620
+// (14:35:55Z) served `no_open_record` because the desk's import lands at
+// 17:00Z AFTER it, and close 143384264 served `import_only` — so the served
+// no-open set was {RIG,BAC} while the lifetime fold derived {BAC} and G6b
+// FAILED A ROUTE THAT WAS RIGHT. Neither `importBuy > 0 ⇒ some close is
+// import_only` nor `#import_only <= importBuy` is sound (an import may postdate
+// every close, as RIG's does for its first; and `import_only` is a
+// classification, not a consumption — two closes may share one import). The one
+// exact discriminator is the import's own TIMESTAMP against the close's, which
+// is read off the tape here and is NOT the detector's balance walk.
+const earliestImportOpen = new Map();
+for (const f of records) {
+  if (f?.side !== 'buy_to_open' || f.origin !== 'history_import') continue;
+  const s = f.optionSymbol, t = f.ts;
+  if (typeof s !== 'string' || !Number.isFinite(t)) continue;
+  if (!earliestImportOpen.has(s) || t < earliestImportOpen.get(s)) earliestImportOpen.set(s, t);
+}
+const derivedBlindReason = b =>
+  (earliestImportOpen.get(b.optionSymbol) ?? Infinity) <= b.ts ? 'import_only' : 'no_open_record';
 
 // TRA-3926 (2026-08-26) — the fold cannot see a GRANT (a grant is a fact about
 // the row, not about the tape's arithmetic), so the derived "uncovered" total
@@ -292,12 +315,17 @@ check('G4  every finding rests on a POSITIVE statement (engineOpensSeenContracts
 check('G5  every finding is self-consistent (excess === sold − engineOpen)',
   findings.every(f => f.excessContracts === f.soldContracts - f.engineOpenContracts),
   findings.map(f => `${f.optionSymbol} ${f.soldContracts}-${f.engineOpenContracts}=${f.excessContracts}`).join(' | ') || 'no findings');
-check('G6  the import-only BLIND set agrees exactly (the false-accusation guard)',
-  setEq(publishedImportOnly, new Set(derivedImportOnly.keys())),
-  `served [${[...publishedImportOnly].join(' ')}] vs derived [${[...derivedImportOnly.keys()].join(' ')}]`);
-check('G6b the no-open-record BLIND set agrees exactly (the aged-out-open guard)',
-  setEq(publishedNoOpen, new Set(derivedNoOpen.keys())),
-  `served [${[...publishedNoOpen].join(' ')}] vs derived [${[...derivedNoOpen.keys()].join(' ')}]`);
+// G6 stays SYMBOL-keyed and exact: it is the false-accusation guard, and the
+// question it asks ("did the route decline to judge a symbol the order-free
+// fold says carries no positive engine claim?") is a lifetime question.
+check('G6  the BLIND symbol set agrees exactly (the false-accusation guard)',
+  setEq(new Set(blinds.map(b => b.optionSymbol)),
+    new Set([...derivedImportOnly.keys(), ...derivedNoOpen.keys()])),
+  `served [${[...new Set(blinds.map(b => b.optionSymbol))].join(' ')}] vs derived [${[...new Set([...derivedImportOnly.keys(), ...derivedNoOpen.keys()])].join(' ')}]`);
+// G6b is PER CLOSE, because that is the granularity the route decides at.
+check('G6b every blind close carries the reason the tape\'s own import TIMESTAMPS imply (the aged-out-open guard)',
+  blinds.every(b => b.reason === 'unusable_quantity' || b.reason === derivedBlindReason(b)),
+  blinds.map(b => `${b.optionSymbol}@${new Date(b.ts).toISOString()}:${b.reason}${b.reason === 'unusable_quantity' || b.reason === derivedBlindReason(b) ? '' : ` != derived ${derivedBlindReason(b)}`}`).join(' ') || 'no blinds');
 check('G7  the census closes over its own population (judged + blind === engineCloses)',
   census.judgedCloses + blinds.length === census.engineCloses,
   `${census.judgedCloses} + ${blinds.length} === ${census.engineCloses}`);
@@ -332,7 +360,12 @@ const recordByOrder = new Map(records.filter(r => r.orderId != null).map(r => [r
 // the durable carrier is the repo's PRE_STAMP_CLOSE_GRANT_ANCHORS table and
 // the expected source is `anchor` (2026-09-03).
 const KNOWN_GRANTED = [
-  { symbol: 'RIG260925C00006000', orderId: 143384264, sold: 1, ours: 0, basis: 'exhausted', grant: 'desk_add', source: 'anchor' },
+  // served GRANTED at 2026-09-15T18:5xZ (28/28) and blind `import_only` by
+  // 2026-09-22T19:2xZ ⇒ the ENGINE open's ts ∈ [08-16T18:5xZ, 08-23T19:2xZ].
+  // Its DESK import (08-24T17:00:00Z) is still in tape and is why this one
+  // degrades to `import_only` rather than `no_open_record`; it crosses ~09-23.
+  { symbol: 'RIG260925C00006000', orderId: 143384264, sold: 1, ours: 0, basis: 'exhausted', grant: 'desk_add', source: 'anchor',
+    opensAgedOutObserved: '2026-09-22T19:2xZ' },
 ];
 // `anchor` ⇒ the record is UNSTAMPED and the grant was read off the repo's
 // PRE_STAMP_CLOSE_GRANT_ANCHORS table (2026-09-03: the closed-row surface is
@@ -390,21 +423,50 @@ const KNOWN = [
   // RETAIN_MS=30d, live-options-fee-slippage-ledger.ts:59.
   { symbol: 'QQQ260911P00545000', orderId: 140287732, sold: 5, ours: 4, basis: 'outstanding',
     opensAgedOutObserved: '2026-09-03T13:10Z' },
-  { symbol: 'BAC260925C00063000', orderId: 143160792, sold: 1, ours: 0, basis: 'exhausted' },
+  // served as the full finding at 2026-09-15T18:5xZ (28/28) and `no_open_record`
+  // blind by 2026-09-22T19:2xZ ⇒ opens ts ∈ [08-16T18:5xZ, 08-23T19:2xZ]. The
+  // bracket is a week wide because no beat ran between; it is recorded as
+  // measured, not narrowed by assumption.
+  { symbol: 'BAC260925C00063000', orderId: 143160792, sold: 1, ours: 0, basis: 'exhausted',
+    opensAgedOutObserved: '2026-09-22T19:2xZ' },
 ];
 const oldestTs = Math.min(...records.map(r => r.ts).filter(t => Number.isFinite(t)));
+// ⛔ THE DEGRADATION IS KEYED ON THE **ENGINE** OPEN, NOT ON ANY OPEN. The
+// anchor's claim is "the engine sold more than it bought"; what kills it is the
+// loss of the engine's own `buy_to_open`. RIG's desk import outlives its engine
+// open by two days, and keying on `some buy_to_open` kept the anchor asserting
+// a finding the route could no longer derive.
+const engineOpensInTape = s =>
+  records.some(r => r.optionSymbol === s && r.side === 'buy_to_open' && r.origin !== 'history_import');
+// ⛔ WHICH aged-out reason a close carries is NOT this anchor's question — G6b
+// grades that per close against the tape's import timestamps, exactly. Pinning
+// one reason here manufactures a FAIL at every later horizon step (RIG walks
+// `import_only` → `no_open_record` as its desk import ages off ~09-23, on a
+// route doing precisely the right thing). What the anchor owns is the hazard
+// the carrier exists for: the row must not SILENTLY VANISH, must keep its
+// quantity, and must never be re-served as an accusation once its witness is
+// gone. A fabricated finding and a disappearance both still red.
+const AGED_OUT_REASONS = ['import_only', 'no_open_record'];
+const gradeAgedOutAnchor = k => {
+  const closeTs = recordByOrder.get(k.orderId)?.ts;
+  const b = blinds.find(x => Number.isFinite(closeTs) ? x.ts === closeTs
+    : (x.optionSymbol === k.symbol && x.soldContracts === k.sold));
+  const accused = findings.find(x => x.orderId === k.orderId);
+  return [
+    !!b && AGED_OUT_REASONS.includes(b.reason) && b.soldContracts === k.sold && !accused,
+    b ? `blind reason ${b.reason} sold ${b.soldContracts}${accused ? ' AND ACCUSED — a finding with no witness' : ''}`
+      : 'NOT SERVED AT ALL — the close is in tape and the row vanished',
+  ];
+};
 for (const k of KNOWN) {
   const closeInTape = records.some(r => r.orderId === k.orderId);
   if (!closeInTape) {
     notes.push(`R  ${k.symbol} order ${k.orderId} has aged out of the tape (oldest record ${new Date(oldestTs).toISOString()}) — anchor NOT assertable, not a pass`);
     continue;
   }
-  const opensInTape = records.some(r => r.optionSymbol === k.symbol && r.side === 'buy_to_open');
-  if (k.opensAgedOutObserved && !opensInTape) {
-    const b = blinds.find(x => x.optionSymbol === k.symbol && x.soldContracts === k.sold);
-    check(`R  ${k.symbol} order ${k.orderId} open leg aged out (observed ${k.opensAgedOutObserved}) — served as the exact degradation (blind, no_open_record, sold ${k.sold})`,
-      !!b && b.reason === 'no_open_record',
-      b ? `blind reason ${b.reason} sold ${b.soldContracts}` : 'NOT SERVED AT ALL — the close is in tape and the row vanished');
+  if (k.opensAgedOutObserved && !engineOpensInTape(k.symbol)) {
+    check(`R  ${k.symbol} order ${k.orderId} engine open leg aged out (observed ${k.opensAgedOutObserved}) — served as the exact degradation (blind, aged-out reason, sold ${k.sold}, NOT accused)`,
+      ...gradeAgedOutAnchor(k));
     continue;
   }
   const f = findings.find(x => x.orderId === k.orderId);
@@ -422,6 +484,19 @@ for (const k of KNOWN_GRANTED) {
   }
   if (!grantedKeysPresent) {
     notes.push(`R  ${k.symbol} order ${k.orderId} — D7 keys ABSENT on this build; the granted anchor cannot be graded (it reads as a finding here)`);
+    continue;
+  }
+  // ⛔ A GRANT IS AN ANSWER TO A QUESTION THE ROUTE CAN NO LONGER ASK. The
+  // grant excuses an excess, and the excess is only derivable while the engine
+  // open that proves it is in tape. Once that ages out the close is an
+  // unanswered question — a BLIND — and that is the correct, conservative
+  // degradation, not a lost grant. This branch did not exist until 2026-09-22,
+  // so RIG's anchor red the beat its open leg crossed the horizon while the
+  // route was serving exactly what it should. The durable Rd pin below is what
+  // keeps the granted judgement itself alive past this point.
+  if (k.opensAgedOutObserved && !engineOpensInTape(k.symbol)) {
+    check(`R  ${k.symbol} order ${k.orderId} engine open leg aged out (observed ${k.opensAgedOutObserved}) — grant degrades to a BLIND, not to an accusation (sold ${k.sold})`,
+      ...gradeAgedOutAnchor(k));
     continue;
   }
   const g = granted.find(x => x.orderId === k.orderId);

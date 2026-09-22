@@ -28,6 +28,19 @@
 //                                                        (the post-restart shape of 2026-08-25 cannot read as calm)
 //   C14–C18 grant partition (2026-08-26): bytes-absent / RIG promotion / G10's two limbs / PASS reachable
 //   C19 an `anchor` grant the grader does not pin → 1 FAIL (G10; an anchor added to quiet a finding is caught)
+//   C4a/C14a the two INJECTED bases, UNMUTATED → 0 PASS (each red below is the mutation's, not the base's)
+//   C6b a symbol whose closes straddle BOTH blind buckets → 0 PASS (the 2026-09-22 false FAIL)
+//   C6c a blind served `import_only` whose import POSTDATES the close → 1 FAIL (G6b still discriminates)
+//   C6d a pinned aged-out anchor silently dropped → 1 FAIL (an anchor may degrade; it may not vanish)
+//
+// ⚠ THE CONTROLS' OWN FIXTURES EVAPORATE (2026-09-22). C5/C6/C15/C16/C17/C19
+// mutated whatever finding or grant the LIVE capture held. The 30-day horizon
+// crossed the last engine open in the population, the census went `clean` with
+// zero findings and zero grants, and C5 THREW — taking C6..C19 down with it.
+// The suite that keeps the grader honest ran 4 of 20 on the one beat it was
+// built for, and reported no failure while doing it. Controls must never take
+// their premise from the subject's current contents: `synth` and `synthGrant`
+// inject their own self-consistent episodes, each graded GREEN unmutated first.
 //
 // ⚠ C8 is the one that matters most and it is the cheapest to get wrong: with
 // the live box at `checked 0`, a grader whose PASS branch was unreachable would
@@ -151,21 +164,99 @@ run('C1  census forced to ZERO → BLIND (an unexercised bound is never a pass)'
 run('C2  `oversoldCloses` DELETED → FAIL', 1, (ol, f) => { delete f.oversoldCloses; });
 run('C3  `exitQuantityBound` DELETED → FAIL', 1, ol => { delete ol.exitQuantityBound; });
 run('C4  served `excessContracts` +1 → FAIL', 1, (ol, f) => { f.oversoldCloses.excessContracts += 1; });
+// ⛔ TRA-3926 (2026-09-22) — THE CONTROLS' OWN FIXTURES EVAPORATE WITH THE TAPE.
+// C5 and C6 mutated whatever finding / `import_only` blind the LIVE capture
+// happened to hold. On 2026-09-22 the 30-day horizon crossed the last engine
+// open in the population and the live census went `clean` with ZERO findings —
+// C5 threw `no finding to corrupt` and took C6..C13 down with it, so the suite
+// that keeps the grader honest was silently 4/13 on the beat it was needed.
+// The controls must not depend on the tape carrying a defect; they inject their
+// own self-consistent episode and mutate THAT.
+// ⚠ The injected base is graded GREEN first (C4a/C5a below). A positive control
+// that reds for a STRONGER reason than its mutation is vacuous — if the base
+// itself did not agree with the order-free fold, C5's red would prove nothing
+// about `engineOpenContracts` (TRA-3897's hook, and it applies to me here).
+const SYNTH_OVERSOLD = 'CTL260925C00001000';
+const SYNTH_IMPORT = 'CTL260925C00002000';
+const synth = (ol, f) => {
+  const base = Math.max(...f.records.map(r => r.ts).filter(Number.isFinite));
+  const push = (optionSymbol, side, contracts, origin, orderId, ts) =>
+    f.records.push({ ts, optionSymbol, side, contracts, origin, orderId, exitGrant: null });
+  // an ENGINE 2-lot closed for 3 — a coherent excess of exactly 1
+  push(SYNTH_OVERSOLD, 'buy_to_open', 2, 'fill', 900000001, base - 7200000);
+  push(SYNTH_OVERSOLD, 'sell_to_close', 3, 'fill', 900000002, base - 3600000);
+  f.oversoldCloses.findings.push({
+    optionSymbol: SYNTH_OVERSOLD, ts: base - 3600000, etDay: '2026-09-22', orderId: 900000002,
+    soldContracts: 3, engineOpenContracts: 2, engineOpensSeenContracts: 2,
+    importedOpenContracts: 0, excessContracts: 1, basis: 'outstanding',
+  });
+  f.oversoldCloses.excessContracts += 1;
+  f.oversoldCloses.judgedCloses += 1;
+  f.oversoldCloses.engineCloses += 1;
+  f.oversoldCloses.status = 'oversold';
+  // a DESK import closed by the engine — a coherent `import_only` blind
+  push(SYNTH_IMPORT, 'buy_to_open', 1, 'history_import', null, base - 7200000);
+  push(SYNTH_IMPORT, 'sell_to_close', 1, 'fill', 900000003, base - 3600000);
+  f.oversoldCloses.blindCloses.push({
+    optionSymbol: SYNTH_IMPORT, ts: base - 3600000, reason: 'import_only',
+    soldContracts: 1, importedOpenContracts: 1,
+  });
+  f.oversoldCloses.engineCloses += 1;
+  // the bound must read EXERCISED or the verdict is BLIND(3) and no mutation
+  // below can ever be told apart from it.
+  ol.exitQuantityBound = {
+    ...ol.exitQuantityBound, checked: 1, bounded: 1, refusedContracts: 1, lastRefusalReason: 'engine_partial',
+  };
+};
+run('C4a the INJECTED base alone → PASS (the mutations below red on the mutation, not on the base)', 0, synth);
 run('C5  a finding\'s engineOpenContracts → 0 → FAIL', 1, (ol, f) => {
-  if (f.oversoldCloses.findings.length === 0) throw new Error('no finding to corrupt');
-  f.oversoldCloses.findings[0].engineOpenContracts = 0;
+  synth(ol, f);
+  f.oversoldCloses.findings.find(x => x.optionSymbol === SYNTH_OVERSOLD).engineOpenContracts = 0;
 });
 run('C6  an import_only blind PROMOTED to a finding → FAIL', 1, (ol, f) => {
-  const b = f.oversoldCloses.blindCloses.find(x => x.reason === 'import_only');
-  if (!b) throw new Error('no import_only blind to promote');
+  synth(ol, f);
+  const b = f.oversoldCloses.blindCloses.find(x => x.optionSymbol === SYNTH_IMPORT);
   f.oversoldCloses.blindCloses = f.oversoldCloses.blindCloses.filter(x => x !== b);
   f.oversoldCloses.findings.push({
-    optionSymbol: b.optionSymbol, ts: b.ts, etDay: '2026-08-21', orderId: 1,
-    soldContracts: b.soldContracts, engineOpenContracts: 0,
-    importedOpenContracts: b.importedOpenContracts, excessContracts: b.soldContracts,
+    optionSymbol: b.optionSymbol, ts: b.ts, etDay: '2026-09-22', orderId: 900000003,
+    soldContracts: b.soldContracts, engineOpenContracts: 0, engineOpensSeenContracts: 0,
+    importedOpenContracts: b.importedOpenContracts, excessContracts: b.soldContracts, basis: 'exhausted',
   });
   f.oversoldCloses.excessContracts += b.soldContracts;
   f.oversoldCloses.judgedCloses += 1;
+});
+// ⛔ THE HORIZON REGRESSION ITSELF, as a control. Both are cases the pre-fix
+// grader got WRONG in opposite directions on 2026-09-22, and both must stay
+// graded: C6b is the one that red a correct route (a symbol whose closes
+// straddle two blind buckets), C6c is the one a reason-blind relaxation would
+// let through (a blind whose served reason contradicts the import's own ts).
+run('C6b a symbol with closes in BOTH blind buckets → PASS (the per-close split, not a symbol set)', 0, (ol, f) => {
+  synth(ol, f);
+  const base = Math.max(...f.records.map(r => r.ts).filter(Number.isFinite));
+  // a close BEFORE the desk import, so the same OCC holds one of each reason
+  f.records.push({ ts: base - 10800000, optionSymbol: SYNTH_IMPORT, side: 'sell_to_close', contracts: 1, origin: 'fill', orderId: 900000004, exitGrant: null });
+  f.oversoldCloses.blindCloses.push({
+    optionSymbol: SYNTH_IMPORT, ts: base - 10800000, reason: 'no_open_record', soldContracts: 1, importedOpenContracts: 0,
+  });
+  f.oversoldCloses.engineCloses += 1;
+});
+run('C6c a blind served `import_only` whose import POSTDATES the close → FAIL (G6b)', 1, (ol, f) => {
+  synth(ol, f);
+  const base = Math.max(...f.records.map(r => r.ts).filter(Number.isFinite));
+  f.records.push({ ts: base - 10800000, optionSymbol: SYNTH_IMPORT, side: 'sell_to_close', contracts: 1, origin: 'fill', orderId: 900000004, exitGrant: null });
+  f.oversoldCloses.blindCloses.push({
+    optionSymbol: SYNTH_IMPORT, ts: base - 10800000, reason: 'import_only', soldContracts: 1, importedOpenContracts: 1,
+  });
+  f.oversoldCloses.engineCloses += 1;
+});
+// ⛔ THE ANCHOR'S OWN HAZARD, now that it accepts EITHER aged-out reason: a
+// pinned close whose witness is gone must still be SERVED. Silence is the
+// failure mode the durable carrier exists for, and it must red here.
+run('C6d a pinned aged-out anchor SILENTLY DROPPED from blindCloses → FAIL (R: the row vanished)', 1, (ol, f) => {
+  synth(ol, f);
+  f.oversoldCloses.blindCloses = f.oversoldCloses.blindCloses
+    .filter(x => x.optionSymbol !== 'BAC260925C00063000');
+  f.oversoldCloses.engineCloses -= 1;
 });
 run('C7  `records[]` emptied → BLIND (a cold ledger is never a pass)', 3, (ol, f) => { f.records = []; });
 run('C8  `exitQuantityBound.checked` = 1, last refusal a FINDING → PASS (the pass branch is REACHABLE)', 0, ol => {
@@ -209,10 +300,35 @@ run('C14 `grantedCloses` DELETED → FAIL (D7 sees the partition\'s bytes ABSENT
   ol.exitQuantityBound = { ...ol.exitQuantityBound, checked: 1, bounded: 1, refusedContracts: 1, lastRefusalReason: 'engine_partial' };
   delete f.oversoldCloses.grantedCloses;
 });
-run('C15 the RIG grant PROMOTED back to a finding → FAIL (the granted anchor is accused)', 1, (ol, f) => {
+// ⛔ TRA-3926 (2026-09-22) — THE ANCHOR LIMB EVAPORATED TOO. RIG's engine open
+// crossed the horizon this beat, so the route (correctly) degraded its grant to
+// a blind and `grantedCloses` went empty — C15 threw and took C16..C19 with it.
+// `synthGrant` puts RIG's engine open back in the tape, which is the ONLY thing
+// the horizon removed, and re-partitions the census to the shape the route
+// served while that open was still derivable. It grants nothing the grader does
+// not already pin: 143384264 is in KNOWN_GRANTED and its record stays UNSTAMPED,
+// so G10's `anchor` limb is exercised for real.
+const synthGrant = (ol, f) => {
+  const base = Math.min(...f.records.map(r => r.ts).filter(Number.isFinite));
+  f.records.push({ ts: base - 3600000, optionSymbol: 'RIG260925C00006000', side: 'buy_to_open',
+    contracts: 1, origin: 'fill', orderId: 900000020, exitGrant: null });
+  const oc = f.oversoldCloses;
+  const dropped = oc.blindCloses.filter(x => x.optionSymbol === 'RIG260925C00006000');
+  oc.blindCloses = oc.blindCloses.filter(x => x.optionSymbol !== 'RIG260925C00006000');
+  oc.judgedCloses += dropped.length;
+  oc.grantedCloses.push({
+    optionSymbol: 'RIG260925C00006000', ts: Date.parse('2026-08-26T13:45:31.275Z'), etDay: '2026-08-26',
+    orderId: 143384264, soldContracts: 1, engineOpenContracts: 0, engineOpensSeenContracts: 1,
+    importedOpenContracts: 1, excessContracts: 1, basis: 'exhausted',
+    grant: 'desk_add', grantSource: 'anchor',
+  });
+  oc.grantedContracts += 1;
   ol.exitQuantityBound = { ...ol.exitQuantityBound, checked: 1, bounded: 1, refusedContracts: 1, lastRefusalReason: 'engine_partial' };
+};
+run('C14a the INJECTED grant base alone → PASS (C15 reds on the promotion, not on the base)', 0, synthGrant);
+run('C15 the RIG grant PROMOTED back to a finding → FAIL (the granted anchor is accused)', 1, (ol, f) => {
+  synthGrant(ol, f);
   const g = f.oversoldCloses.grantedCloses.find(x => x.orderId === 143384264);
-  if (!g) throw new Error('no RIG 143384264 grant in the capture to promote');
   f.oversoldCloses.grantedCloses = f.oversoldCloses.grantedCloses.filter(x => x !== g);
   f.oversoldCloses.grantedContracts -= g.excessContracts;
   // TRA-4440 — bindings renamed, keys unchanged: `...finding` still strips `grant`
@@ -221,21 +337,20 @@ run('C15 the RIG grant PROMOTED back to a finding → FAIL (the granted anchor i
   f.oversoldCloses.findings.push(finding);
   f.oversoldCloses.excessContracts += finding.excessContracts;
 });
+// C16/C17/C19 demote the INJECTED finding (900000002), not XLF 142806015 —
+// XLF's whole episode left the tape on 2026-09-19 and its finding with it.
 run('C16 a FINDING demoted to `record`-granted with NO stamp on its record → FAIL (G10: unbacked grant)', 1, (ol, f) => {
-  ol.exitQuantityBound = { ...ol.exitQuantityBound, checked: 1, bounded: 1, refusedContracts: 1, lastRefusalReason: 'engine_partial' };
-  const x = f.oversoldCloses.findings.find(z => z.orderId === 142806015);
-  if (!x) throw new Error('no XLF finding to demote');
+  synth(ol, f);
+  const x = f.oversoldCloses.findings.find(z => z.orderId === 900000002);
   f.oversoldCloses.findings = f.oversoldCloses.findings.filter(z => z !== x);
   f.oversoldCloses.excessContracts -= x.excessContracts;
   f.oversoldCloses.grantedCloses.push({ ...x, grant: 'desk_add', grantSource: 'record' });
   f.oversoldCloses.grantedContracts += x.excessContracts;
 });
 run('C17 a FINDING demoted to `closed_row`-granted while its record says `none` → FAIL (G10: a stamped record is final)', 1, (ol, f) => {
-  ol.exitQuantityBound = { ...ol.exitQuantityBound, checked: 1, bounded: 1, refusedContracts: 1, lastRefusalReason: 'engine_partial' };
-  const x = f.oversoldCloses.findings.find(z => z.orderId === 142806015);
-  if (!x) throw new Error('no XLF finding to demote');
-  const rec = f.records.find(r => r.orderId === 142806015);
-  if (!rec) throw new Error('no XLF close record');
+  synth(ol, f);
+  const x = f.oversoldCloses.findings.find(z => z.orderId === 900000002);
+  const rec = f.records.find(r => r.orderId === 900000002);
   rec.exitGrant = 'none';
   f.oversoldCloses.findings = f.oversoldCloses.findings.filter(z => z !== x);
   f.oversoldCloses.excessContracts -= x.excessContracts;
@@ -247,9 +362,8 @@ run('C17 a FINDING demoted to `closed_row`-granted while its record says `none` 
 // Without this, adding a row to the ROUTE's anchor table to quiet a finding
 // would sail through — the deleted alarm wearing the anchor's name.
 run('C19 a FINDING demoted to `anchor`-granted for an order the grader does not pin → FAIL (G10: unbacked anchor)', 1, (ol, f) => {
-  ol.exitQuantityBound = { ...ol.exitQuantityBound, checked: 1, bounded: 1, refusedContracts: 1, lastRefusalReason: 'engine_partial' };
-  const x = f.oversoldCloses.findings.find(z => z.orderId === 142806015);
-  if (!x) throw new Error('no XLF finding to demote');
+  synth(ol, f);
+  const x = f.oversoldCloses.findings.find(z => z.orderId === 900000002);
   f.oversoldCloses.findings = f.oversoldCloses.findings.filter(z => z !== x);
   f.oversoldCloses.excessContracts -= x.excessContracts;
   f.oversoldCloses.grantedCloses.push({ ...x, grant: 'desk_add', grantSource: 'anchor' });
