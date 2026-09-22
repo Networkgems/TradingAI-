@@ -535,6 +535,13 @@ export const EMBARGOES = [
 // rule, and a gate that outlived the ruling would be a rule nobody ratified. A row is half-open
 // [from, to) like EMBARGOES, and advances created before the row's `from` are not counted.
 // Leave spent rows in place as a record.
+//
+// WRITE THE ROW BEFORE THE WINDOW OPENS, never after the first train. CEO standing rule attached
+// to decision D1 on the TRA-4384 close (2026-09-22): a cap written after the fact always lags the
+// next deployer. This row's own 'why' is the argument - the 09-10 stopgap embargo lost a race by
+// 34 SECONDS to a checkout that did not hold it yet, and the 5/9/2 advances it counts are advances
+// it was powerless to refuse. A future freeze or validation window that wants a cap gets its dated
+// row committed and pushed BEFORE the window opens; there is no retroactive arm.
 export const CADENCE_WINDOW_OPEN_MIN = FREEZE_CLOSE_MIN; // 20:00Z — the window rolls at the close
 const DAY_MS = 24 * 60 * 60 * 1000;
 
