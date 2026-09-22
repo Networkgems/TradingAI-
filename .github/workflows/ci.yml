@@ -114,6 +114,25 @@ jobs:
       - name: DATA_DIR guard controls (TRA-2603)
         run: pnpm check:data-dir:controls
 
+      # TRA-4145 — the strand drain's 43 write-path controls, which until now ran only
+      # when someone typed the command by hand. The drain is SOURCE, not a deployed
+      # service (TRA-3451), so nothing else ever executes them.
+      #
+      # The defect this closes: `originSentence()` interpolated an origin routine's
+      # TITLE verbatim into the SUPPRESSING LEAF audit comment, and `gradeWriteBody()`
+      # then graded that same body ASCII-only — so one em dash in a routine name made
+      # the drain refuse its OWN generated body, and because the comment goes FIRST the
+      # row got NEITHER write and the whole fire coloured exit 2 FAILED (measured
+      # 2026-08-27: 2 of 14 rows, U+2014). Fixed in `7465ba6d` by folding at the
+      # interpolation site — the guard was correct and was NOT widened.
+      #
+      # This step is here because the FIELD test for that fix is unreachable: all three
+      # per-seat drain arms are now archived or paused, and the live cohort is VACUOUS,
+      # so no scheduled fire will ever re-exercise it. A control that only runs by hand
+      # is a control that silently stops running. `--selftest` sends nothing.
+      - name: Strand drain write-path controls (TRA-4145)
+        run: pnpm drain:strands:controls
+
       # TRA-1684 — also before build/test. A circular import only throws from SOME
       # entry points, so prod and the suite can enter the same graph through different
       # doors and only one of them crashes (TRA-1674). A green suite is not
