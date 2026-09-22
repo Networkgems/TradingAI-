@@ -195,7 +195,21 @@ import {
   OTM_SLEEVE_MANDATE_LABEL,
   OTM_SLEEVE_MANDATE_PROVENANCE,
   OTM_SLEEVE_MANDATE_STRUCTURE,
+  // TRA-4416 — the board override, the live-band containment check and the
+  // reopening-cohort disjointness proof. All PURE; the route supplies the live read.
+  assessMandateBandContainment,
+  assessMandateCohortDisjointness,
+  deltaInterval,
+  intersectDeltaIntervals,
+  mandateBoardOverridesFor,
 } from '../otm-sleeve-mandate.js';
+// TRA-4416 — the contract floor's |delta| band is the other half of the LIVE
+// admitted set, and its top edge is INCLUSIVE where the selector's is not.
+import {
+  OTM_CONTRACT_FLOOR_DELTA_MAX_VAR,
+  OTM_CONTRACT_FLOOR_DELTA_MIN_VAR,
+  resolveOtmContractFloor,
+} from '../otm-contract-floor.js';
 // TRA-4422 (parent TRA-4421) — the setup-taxonomy instrument's LIVE read.
 // ⛔ `setupTaxonomyHealth` is passed the live env explicitly; the compiled
 // default is never the answer to "what is the box doing".
@@ -231,6 +245,8 @@ import {
   OPTION_ENTRY_DELTA_CEILING_LIVE_OBSERVE_FLAG,
   OPTION_ENTRY_DELTA_CEILING_LIVE_VALUE_VAR,
   resolveEntryDeltaCeilingLive,
+  // TRA-4416 AC3 — can the armed ceiling reach the population it is armed over?
+  entryDeltaCeilingCoverage,
 } from '../option-entry-delta-ceiling-live.js';
 // TRA-3216 (parent TRA-2760) — the LIVE OTM underlying allowlist.
 import {
@@ -6003,6 +6019,49 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     const gateToday = (g: string) => summary.byGate.find((x) => x.gate === g) ?? null;
     const gateRetained = (g: string) => summary.retained.byGate.find((x) => x.gate === g) ?? null;
 
+    // ── TRA-4416 — THE LIVE ADMITTED |Δ| BAND ──────────────────────────────
+    //
+    // ⛔ EVERY TERM HERE IS A LIVE READ OFF `liveEnv`. Not a compiled default,
+    // not `OTM_CONTRACT_FLOOR_DEFAULTS`, not `OTM_ADMISSIBLE_DELTA_*_DEFAULT`.
+    // Both bands are env-overridable and BOTH ARE OVERRIDDEN ON bqb1 (the floor
+    // read `source: 'env'` on 2026-09-22), so a compiled read here would publish
+    // a coherence verdict about a box that does not exist — the identical
+    // mistake the `setupTaxonomy` block below was written to stop.
+    //
+    // The admitted set is the INTERSECTION of the two live filters, and their
+    // top edges have DIFFERENT strictness (floor `<=`, selector `<`), so the
+    // intersection is computed with the edge carried rather than assumed.
+    //
+    // The selector only constrains when it is ARMED: unarmed, the floor alone
+    // decides, and saying otherwise would publish a narrower admitted band than
+    // the box actually has — an error in the dangerous direction.
+    const liveAdmitted = (() => {
+      try {
+        const floor = resolveOtmContractFloor(liveEnv);
+        const floorBand = deltaInterval(floor.deltaMin, floor.deltaMax, true);
+        const selectorArmed = isOtmAdmissibleStrikeEnabled(liveEnv);
+        const sel = resolveAdmissibleBand(liveEnv);
+        const selectorBand = deltaInterval(sel.min, sel.max, false);
+        const band = selectorArmed ? intersectDeltaIntervals(floorBand, selectorBand) : floorBand;
+        return {
+          band,
+          floorBand,
+          selectorBand,
+          selectorArmed,
+          floorSource: floor.source,
+          floorInvalidKeys: floor.invalidKeys,
+        };
+      } catch {
+        // ⛔ Blind ⇒ `null`, which every consumer below renders as `unmeasured`.
+        // NEVER a default band: a guess here is a false coherence verdict.
+        return null;
+      }
+    })();
+    const admittedBand = liveAdmitted?.band ?? null;
+    const containment = assessMandateBandContainment(structure, admittedBand);
+    const coverage = entryDeltaCeilingCoverage(ceiling, admittedBand);
+    const cohortDisjointness = assessMandateCohortDisjointness(structure);
+
     res.json({
       ok: true,
       issue: 'TRA-3394',
@@ -6022,8 +6081,83 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         authorizedBand: {
           from: mandateFloorFor(structure),
           to: mandateCeilingFor(structure),
-          note: 'Half-open [from, to). BOUNDED ON BOTH SIDES — that is the point of the ticket.',
+          note: 'Half-open [from, to). BOUNDED ON BOTH SIDES — that is the point of the ticket. '
+            + '⛔ TRA-4416: this is the RATIFIED band, NOT what the sleeve admits. Read '
+            + '`bandCoherence` before treating it as a description of the live box.',
         },
+      },
+      /**
+       * ⛔⛔ TRA-4416 — THE RATIFIED BAND AND THE LIVE BAND DISAGREE, AND UNTIL
+       * THIS BLOCK EXISTED NOTHING SAID SO.
+       *
+       * Board card `439c4e46` answered `widen_live_anyway` on 2026-09-09,
+       * directing the live selector at |Δ| ∈ [0.25, 0.40] — a band the table
+       * above classes `insufficient_evidence` (n=216). That decision is
+       * ACCEPTED and is not re-litigated here. What was broken is that
+       * `sleeve.authorizedBand` said [0.495, 0.55) while the box traded
+       * [0.25, 0.40] and no field anywhere carried the contradiction, so
+       * every reader of this route inherited the wrong band silently.
+       *
+       * READ ORDER: `status` → `liveBandWithinAuthorized` → `boardOverrides`.
+       *
+       * ⛔ `liveBandWithinAuthorized` IS THREE-VALUED. `null` means the live
+       * band could not be read and is NOT a pass — `?? true` and `!== false`
+       * on this field are both bugs. `status: 'empty'` is its own state: an
+       * empty admitted set is vacuously a subset of anything, and folding it
+       * into `within` is how a non-intersecting band pair reads as healthy.
+       *
+       * ⛔ `status: 'outside'` WITH a board override present is the EXPECTED,
+       * ACCOUNTED-FOR state — it is the disagreement being reported, not an
+       * incident. `outside` with `boardOverrides: []` is the incident.
+       */
+      bandCoherence: {
+        issue: 'TRA-4416',
+        authorization: 'board card `439c4e46` (`widen_live_anyway`, 2026-09-09) on TRA-3392',
+        status: containment.status,
+        liveBandWithinAuthorized: containment.liveBandWithinAuthorized,
+        admittedBand: containment.admittedBand,
+        authorizedBand: containment.authorizedBand,
+        admittedBandAuthorizations: containment.admittedBandAuthorizations,
+        /** AC1(b) — the override ON RECORD, machine-readable, naming its card. */
+        boardOverrides: mandateBoardOverridesFor(structure),
+        /**
+         * How the admitted band was derived, so the verdict is checkable rather
+         * than merely stated. ⛔ The two top edges differ in strictness — floor
+         * `|Δ| <= deltaMax` (`otm-contract-floor.ts:294`), selector
+         * `|Δ| < max` (`otm-admissible-strike.ts:306`) — so a contract at
+         * exactly the shared top edge is admitted by one and refused by the
+         * other, and `upperInclusive` is what records which one won.
+         */
+        derivation: {
+          floorBand: liveAdmitted?.floorBand ?? null,
+          selectorBand: liveAdmitted?.selectorBand ?? null,
+          selectorArmed: liveAdmitted?.selectorArmed ?? null,
+          floorSource: liveAdmitted?.floorSource ?? null,
+          floorInvalidKeys: liveAdmitted?.floorInvalidKeys ?? null,
+          envVars: {
+            floorMin: OTM_CONTRACT_FLOOR_DELTA_MIN_VAR,
+            floorMax: OTM_CONTRACT_FLOOR_DELTA_MAX_VAR,
+            selectorMin: OTM_ADMISSIBLE_DELTA_MIN_VAR,
+            selectorMax: OTM_ADMISSIBLE_DELTA_MAX_VAR,
+            selectorFlag: OTM_ADMISSIBLE_STRIKE_FLAG,
+          },
+          note:
+            'LIVE READ off this process\'s env — never the compiled defaults '
+            + '(OTM_CONTRACT_FLOOR_DEFAULTS / OTM_ADMISSIBLE_DELTA_*_DEFAULT). Both bands are '
+            + 'env-overridable and both ARE overridden on bqb1, so a compiled read here would '
+            + 'describe a box that does not exist. `selectorArmed: false` means the floor alone '
+            + 'decides and the selector band is echoed for reference only.',
+        },
+        /**
+         * AC4 — TRA-4053's reopening cohort vs the new live population.
+         * ⛔ READ `bandsOverlap` BEFORE `disjointFromLivePopulation`: the bands
+         * DO overlap ([0.25,0.40] sits inside [0.20,0.45)), so band alone does
+         * NOT separate them and a cohort query keyed on the band would pool
+         * real-money fills into a demo-only acceptance test. They are disjoint
+         * only because membership requires `mode === 'demo'`.
+         */
+        reopeningCohort: cohortDisjointness,
+        reason: containment.reason,
       },
       /** (a) The ratified band table, with n / SE / lo95 per measured cell. */
       bands: OTM_SLEEVE_MANDATE_BANDS,
@@ -6037,6 +6171,28 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         mandateCeiling: ceiling.mandateCeiling,
         rawOverride: ceiling.rawOverride,
         overrideRejectedReason: ceiling.overrideRejectedReason,
+        /**
+         * ⛔⛔ TRA-4416 AC3 — READ THIS BEFORE `mode`. AN ARMED CEILING IS NOT
+         * NECESSARILY A CEILING THAT CAN BITE.
+         *
+         * This gate's only reason code is `above_mandate_ceiling` and it fires
+         * on `|Δ| >= inForce`. When the whole admitted band lies below
+         * `inForce`, NO admissible contract can reach it: the gate is armed
+         * over a population it is structurally incapable of refusing, and its
+         * `evaluated > 0, blocked = 0` read — which this route's own note calls
+         * "the expected healthy read" — is byte-identical to the read a gate
+         * genuinely guarding a quiet tail produces. A counter cannot tell them
+         * apart, because the counter is the part that looks healthy. Only this
+         * structural comparison can.
+         *
+         * ⛔ `coversAdmittedBand` IS THREE-VALUED. `false` = armed and blind.
+         * `null` = the admitted band was unreadable, which is NOT coverage.
+         * ⛔ `armedButBlind: true` means `mode: 'enforce'` MUST NOT be read as
+         * protection. That was the live state on bqb1 `08f78eb46caa`
+         * (2026-09-22T22:30Z): enforce at 0.55 over an admitted band of
+         * [0.25, 0.40) — 100% blind, and every surface read green.
+         */
+        coverage,
         flags: {
           enforce: OPTION_ENTRY_DELTA_CEILING_LIVE_FLAG,
           observe: OPTION_ENTRY_DELTA_CEILING_LIVE_OBSERVE_FLAG,
@@ -6346,6 +6502,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
             + 'verdicts and blocks nothing; the enforcing arm is a separate CTO authorization. '
             + 'Item 2 (band_deauthorized) is ACTIVE regardless of these flags — it is a decline reason on the '
             + 'admission table, not a gate, and it needs no arm.'
+          : coverage.coversAdmittedBand === false
+            ? `⛔ CEILING ${ceiling.mode.toUpperCase()} AND STRUCTURALLY BLIND (TRA-4416 AC3). `
+              + `${coverage.reason} `
+              + 'DO NOT READ THE COUNTERS BELOW AS EVIDENCE OF ANYTHING: `blocked: 0` on this gate is '
+              + 'forced by the band arithmetic, not measured against the tape, and it is byte-identical '
+              + 'to the number a gate that is genuinely guarding a quiet tail produces. The containment '
+              + 'that matters for the admitted population is upstream — `contract_floor` and `cost_bar` '
+              + 'on /api/health/live-enforce-gates — not this flag. Read `bandCoherence` for why the '
+              + 'admitted band sits where it does (board card `439c4e46`).'
           : `CEILING ${ceiling.mode.toUpperCase()} at |delta| < ${ceiling.ceiling} on ${structure}. `
             + 'Expected healthy read is `evaluated > 0, blocked = 0`: the whole 1073-row tape holds n=20 above '
             + '0.55, so this gate is designed to bite RARELY. `evaluated = 0` means no live OTM candidate '

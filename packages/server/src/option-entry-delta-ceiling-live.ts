@@ -47,9 +47,11 @@
 // PURE w.r.t. the env passed in — no I/O, no clock.
 
 import {
+  isEmptyDeltaInterval,
   mandateBandFor,
   mandateCeilingFor,
   OTM_SLEEVE_MANDATE_ISSUE,
+  type DeltaInterval,
 } from './otm-sleeve-mandate.js';
 
 /** Local, matching every other flag module in the tree (accepts 1/true/yes/on). */
@@ -221,5 +223,149 @@ export function entryDeltaCeilingLiveVerdict(
       `entry delta ceiling (live, TRA-3394): |delta| ${absDelta.toFixed(4)} >= ${resolution.ceiling} `
       + `— above the ${OTM_SLEEVE_MANDATE_ISSUE} authorized band for ${structure} `
       + `(band ${band?.label ?? 'unmandated'}: ${band?.authorization ?? 'unknown'})${suffix}`,
+  };
+}
+
+// ─── TRA-4416 AC3 — AN ARMED CEILING THAT CANNOT REACH THE POPULATION ────────
+//
+// ⛔ THE GATE IS ARMED AND STRUCTURALLY BLIND, AND `mode: 'enforce'` DOES NOT
+// SAY SO. Measured on bqb1 `08f78eb46caa` at 2026-09-22T22:30Z:
+//
+//   /api/health/otm-sleeve-mandate  ceiling.mode 'enforce', inForce 0.55
+//   /api/health/options-live        selectorBand [0.25, 0.40], source 'env'
+//
+// Every |Δ| the sleeve can admit is below 0.55, so this gate's only reason code
+// (`above_mandate_ceiling`) can never fire. `evaluated > 0, blocked = 0` — the
+// read the module header calls "the expected healthy read" — is here produced by
+// a gate that is incapable of blocking, and it is byte-identical to the read
+// produced by a gate that is genuinely guarding a quiet tail. That is the whole
+// bug class: an instrument that reads the same in pass and in fail.
+//
+// A counter cannot fix this, because the counter is the thing that looks healthy.
+// The discriminator has to be STRUCTURAL — compare the gate's threshold against
+// the band the sleeve can actually admit — and it has to be on the wire beside
+// `mode`, or the next reader takes `enforce` for protection exactly as before.
+//
+// ── Why this is a separate function and not a field on the resolution ────────
+//
+// `resolveEntryDeltaCeilingLive` is on the live entry path via
+// `entryDeltaCeilingLiveVerdict`. AC5 is "no change to what trades", and the
+// cheapest way to MEAN that is for the hot path not to change at all: this takes
+// the admitted band as an ARGUMENT, computes nothing from the env, and is called
+// only by the health route. Nothing on the order path imports it.
+
+/** Whether an armed ceiling can reach the population it is armed over. */
+export interface EntryDeltaCeilingCoverage {
+  /** The ceiling in force, echoed. `null` ⇒ no ceiling exists to reach anything. */
+  ceiling: number | null;
+  /** The |Δ| set the sleeve can actually admit. `null` ⇒ unreadable. */
+  admittedBand: DeltaInterval | null;
+  /**
+   * ⛔ THREE-VALUED. `false` = ARMED AND CANNOT BITE. `null` = unmeasured, which
+   * is NOT coverage — never `?? true`, never `!== false`.
+   */
+  coversAdmittedBand: boolean | null;
+  /**
+   * The sub-interval of the admitted band this ceiling would actually refuse,
+   * or `null` when there is none. A reader can size the gate's reach directly.
+   */
+  bitingBand: DeltaInterval | null;
+  /** ⛔ TRUE is the alarm: the flag says `enforce` and the gate cannot refuse anything. */
+  armedButBlind: boolean;
+  reason: string;
+}
+
+/**
+ * AC3 — grade an entry-delta ceiling against the band the sleeve admits.
+ *
+ * The ceiling refuses `|Δ| >= ceiling`, so it can bite iff the admitted band
+ * reaches that far: `to > ceiling`, or `to >= ceiling` when the admitted top
+ * edge is INCLUSIVE. The edge semantics are carried on the interval precisely
+ * because the two live filters disagree about it (see `DeltaInterval`).
+ */
+export function entryDeltaCeilingCoverage(
+  resolution: EntryDeltaCeilingLiveResolution,
+  admittedBand: DeltaInterval | null,
+): EntryDeltaCeilingCoverage {
+  const ceiling = resolution.ceiling;
+
+  if (ceiling === null) {
+    return {
+      ceiling: null,
+      admittedBand,
+      coversAdmittedBand: null,
+      bitingBand: null,
+      armedButBlind: false,
+      reason:
+        'NO CEILING — the structure has no ratified authorized upper edge, so it is UNCAPPED '
+        + '(the TRA-1689 rule) and there is no threshold whose reach could be graded. Not a pass.',
+    };
+  }
+
+  if (admittedBand === null || isEmptyDeltaInterval(admittedBand)) {
+    return {
+      ceiling,
+      admittedBand,
+      coversAdmittedBand: null,
+      bitingBand: null,
+      armedButBlind: false,
+      reason: admittedBand === null
+        ? 'UNMEASURED — the live admitted |delta| band could not be read, so whether this ceiling can '
+          + 'reach it is unknown. ⛔ This is NOT coverage. An unreadable band and a covered one must '
+          + 'never share a cell.'
+        : `EMPTY — the sleeve admits no |delta| at all (${admittedBand.label}), so the ceiling has no `
+          + 'population to reach. `blocked: 0` here is a property of an empty admitted set, not of the '
+          + 'gate. Neither covered nor blind — there is nothing to cover.',
+    };
+  }
+
+  const reaches = admittedBand.upperInclusive
+    ? admittedBand.to >= ceiling
+    : admittedBand.to > ceiling;
+
+  if (!reaches) {
+    const blind = resolution.mode === 'enforce' || resolution.mode === 'observe';
+    return {
+      ceiling,
+      admittedBand,
+      coversAdmittedBand: false,
+      bitingBand: null,
+      armedButBlind: resolution.mode === 'enforce',
+      reason:
+        `⛔ CANNOT BITE — the entire admitted band ${admittedBand.label} lies below the ceiling `
+        + `${ceiling}. The gate's only reason code (\`${ENTRY_DELTA_CEILING_REASON_CODE}\`) fires on `
+        + `|delta| >= ${ceiling}, and no admissible contract can reach it. `
+        + (resolution.mode === 'enforce'
+          ? `⛔ \`mode: 'enforce'\` MUST NOT BE READ AS PROTECTION HERE: this gate is ARMED AND `
+            + 'STRUCTURALLY BLIND to 100% of the population it is armed over, and its '
+            + '`evaluated > 0, blocked = 0` read is byte-identical to a gate that is genuinely '
+            + 'guarding a quiet tail. Nothing is being contained by this flag. See TRA-4416.'
+          : blind
+            ? 'The gate is in `observe`, so it would record nothing either — a shadow count of zero '
+              + 'here is a property of the band arithmetic, not of the tape.'
+            : 'The gate is `off`, so this is moot until it is armed — but arming it would change '
+              + 'nothing, which is the point.'),
+    };
+  }
+
+  const bitingFrom = Math.max(admittedBand.from, ceiling);
+  return {
+    ceiling,
+    admittedBand,
+    coversAdmittedBand: true,
+    bitingBand: {
+      from: bitingFrom,
+      to: admittedBand.to,
+      upperInclusive: admittedBand.upperInclusive,
+      label: `[${bitingFrom},${admittedBand.to}${admittedBand.upperInclusive ? ']' : ')'}`,
+    },
+    armedButBlind: false,
+    reason:
+      `COVERS — the admitted band ${admittedBand.label} reaches the ceiling ${ceiling}, so `
+      + `|delta| in [${bitingFrom}, ${admittedBand.to}${admittedBand.upperInclusive ? ']' : ')'} is `
+      + 'refusable and a `blocked` count on this gate is a real measurement. '
+      + (resolution.mode === 'enforce'
+        ? 'Armed and able to bite.'
+        : `The gate is \`${resolution.mode}\`, so it is not refusing today — that is the FLAG, not the band.`),
   };
 }

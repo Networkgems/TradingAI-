@@ -23,6 +23,13 @@ per `test-accounts.ts`), `structure = single_leg_otm`, closed only, unit **R_gat
 The authorized band is **bounded on both sides**. This is the single most important line in this
 document, and §3 is why.
 
+> ⛔ **THIS TABLE IS NOT WHAT THE LIVE SLEEVE TRADES. READ §9 BEFORE CITING IT.**
+> Board card `439c4e46` (`widen_live_anyway`, 2026-09-09) directs the live selector at
+> **|Δ| ∈ [0.25, 0.40]** — inside the `[0.20, 0.45)` row above, which this table classes
+> *insufficient evidence*. The table is the **ratified authorization**; §9 records the
+> **amendment**, what is actually enforced, and why the override is recorded rather than
+> applied. The live read is `/api/health/otm-sleeve-mandate` → `bandCoherence`. (TRA-4416)
+
 ## 2. The band the sleeve was previously authorized to hunt is the worst cell on the tape
 
 Model-facing `single_leg_otm` closes, n=1073, by entry |Δ|, in R_gate. Reproduced independently by
@@ -152,3 +159,94 @@ Checked while ruling, and clear: the live opens on names outside the allowlist (
 `SO` on 08-11 18:15Z) all **predate** the TRA-3216 allowlist arming — the universe ledger retains 6 ET
 days and holds 152 decisions, *all* stamped 2026-08-12, so the gate recorded nothing before today.
 Today it is biting: 127 of 152 blocked. This is not an open live-risk item.
+
+---
+
+## 9. AMENDMENT — board card `439c4e46`, `widen_live_anyway` (2026-09-09, recorded by TRA-4416)
+
+**The ratified band in §1 is NOT what the live sleeve trades, and has not been since 2026-09-09.**
+
+On 2026-09-09 the board answered card `439c4e46` with **`widen_live_anyway`**, with the full
+authorization table above in view, directing the live `single_leg_otm` selector to trade
+**|Δ| ∈ [0.25, 0.40]**. §1 classes that band `insufficient_evidence` (n=216). After the 09-09
+pre-open execution, **100% of admitted live contracts sat outside the ratified band.**
+
+That is an accepted, deliberate board decision made on a corrected premise, and **TRA-4416 does not
+re-litigate it.** What TRA-4416 fixes is that the authorization document and the enforcement knobs
+disagreed *silently*.
+
+### What is enforced, measured — not inferred
+
+Read off bqb1 `08f78eb46caa` at **2026-09-22T22:30Z**:
+
+| surface | field | value |
+|---|---|---|
+| `/api/health/otm-sleeve-mandate` | `sleeve.authorizedBand` | `[0.495, 0.55)` |
+| `/api/health/otm-sleeve-mandate` | `ceiling.mode` / `inForce` | **`enforce`** / `0.55` |
+| `/api/health/options-live` | `otmContractFloor.deltaBand` | `[0.25, 0.40]` (`source: 'env'`) |
+| `/api/health/options-live` | `otmContractFloor.selectorBand` | `[0.25, 0.40]`, `selectorArmed: true` |
+
+⛔ **The ceiling is ARMED AND STRUCTURALLY BLIND.** Its only reason code,
+`above_mandate_ceiling`, fires on `|Δ| >= 0.55`. Every contract the sleeve can admit tops out below
+0.40, so the gate cannot refuse one. Its `evaluated > 0, blocked = 0` read — which §3 and the route's
+own note call "the expected healthy read" — is here **produced by a gate incapable of blocking**, and
+is byte-for-byte identical to the read a gate genuinely guarding a quiet tail produces. A counter
+cannot separate them, because the counter is the part that looks healthy. Only the structural
+comparison can, and it is now published as `ceiling.coverage.coversAdmittedBand` /
+`ceiling.coverage.armedButBlind`.
+
+### The amendment is RECORDED, not APPLIED — and that is a safety property
+
+§1's table is **unchanged**. `mandateBandFor`, `mandateCeilingFor`, `mandateFloorFor` and
+`isDeAuthorizedBand` are byte-for-byte the functions they were.
+
+The override is carried beside the table (`mandateBoardOverridesFor`, surfaced as
+`bandCoherence.boardOverrides`) rather than folded into it, because **`mandateCeilingFor` is the sole
+source of the number the armed live ceiling enforces.** Amending §1 to `[0.25, 0.40]` would move that
+enforced edge from 0.55 to 0.40; the ceiling blocks on `|Δ| >= ceiling` while the contract floor
+admits its `deltaMax` *inclusively*, so a contract at exactly |Δ| = 0.40 — admitted today — would
+begin to be refused. That is a change to what trades, made by a documentation ticket. Refused.
+
+**Changing what is enforced remains a separate act with its own authorization.**
+
+### Reading the box
+
+`/api/health/otm-sleeve-mandate` now carries `bandCoherence`. Read in this order:
+
+1. `bandCoherence.status` — `within` / `outside` / `empty` / `unmeasured`.
+2. `bandCoherence.liveBandWithinAuthorized` — ⛔ **THREE-VALUED.** `null` means the live band could
+   not be read and is **not** a pass; `?? true` and `!== false` on it are both bugs.
+3. `bandCoherence.boardOverrides` — `outside` **with** an override is the expected, accounted-for
+   state. `outside` with `boardOverrides: []` is the incident.
+
+`status: 'empty'` is its own value: an empty admitted set is vacuously a subset of anything, so
+folding it into `within` is exactly how a non-intersecting band pair reads as a healthy mandate.
+
+Both bands are **live env reads**, never the compiled defaults — `OTM_CONTRACT_FLOOR_DEFAULTS` and
+`OTM_ADMISSIBLE_DELTA_*_DEFAULT` still say `[0.25,0.40]` and `[0.495,0.55)` respectively, and the box
+overrides both. The derivation is published under `bandCoherence.derivation`.
+
+⚠️ The two live filters **disagree about their top edge**, and it is one contract wide:
+`otm-contract-floor.ts:294` admits `|Δ| <= deltaMax` (closed) while `otm-admissible-strike.ts:306`
+admits `|Δ| < max` (half-open). The admitted set is their intersection, `[0.25, 0.40)`, so the
+selector's exclusive top wins. Every interval on the wire carries `upperInclusive` for this reason.
+
+### §5's reopening test is NOT open to this population
+
+Doc §5 pre-registers the only test that may reopen `[0.20, 0.45)`: **demo-only**, five live-universe
+names, n ≥ 100, PASS iff lo95 ≥ 0.485 (TRA-4053).
+
+⛔ **`[0.25, 0.40] ⊂ [0.20, 0.45)`.** A live population is now accruing *inside* the pre-registered
+band, so **any cohort query keyed on the band alone silently pools real-money fills into a demo-only
+acceptance test** — and the band would then reopen itself using the very trades the override
+permitted. The cohort is keyed on **`mode` AND `structure` AND band**, with `mode` doing the actual
+separating work, and it **fails closed**: a row whose `mode` cannot be read is excluded
+(`mode_unknown`), never admitted. `mandateReopeningCohortMembership()` is the single filter; the
+disjointness is published at `bandCoherence.reopeningCohort` and is *computed by running live rows
+through that filter*, not asserted in prose.
+
+### What did NOT change
+
+No arm-state change. No bar change. No `k` change. No band change. No universe change. **No change to
+what trades** — TRA-4416 AC5, guarded by `tra4416-mandate-band-coherence.test.ts`, which pins the
+armed ceiling's admit/block verdict at |Δ| 0.25 → 0.99 and the ratified table's own numbers.
