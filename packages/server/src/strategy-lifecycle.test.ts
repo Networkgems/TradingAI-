@@ -183,7 +183,7 @@ describe('entry conditions are fail-closed with named reasons', () => {
     const res = advance(lc, { to: 'proposed', card: incompleteCard() }, t + 1000, 'test');
     expect(res.ok).toBe(false);
     const reasons = (res as { ok: false; reasons: string[] }).reasons;
-    expect(reasons[0]).toContain('card incomplete');
+    expect(reasons[0]).toContain('card not complete');
     expect(reasons[0]).toContain('sizing');
     expect(lc.state).toBe('confirmed');
     // …and the SAME lifecycle proceeds once handed a complete build.

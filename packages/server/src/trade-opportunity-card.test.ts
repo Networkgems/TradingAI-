@@ -183,13 +183,23 @@ describe('buildTradeOpportunityCard — fail-closed negative controls', () => {
     expect(card.fields.sizing.missing[0]).toMatch(/sizing basis missing/);
   });
 
-  it('a risk budget below one contract fails closed instead of rounding up to 1', () => {
+  it('a risk budget below one contract REFUSES at quantity 0 — never rounds up to 1', () => {
     const card = buildTradeOpportunityCard(otmSignal(), {
       ...FULL_CTX,
       sizing: { managedEquity: 1_000, riskPerTrade: 0.01 }, // $10 budget vs $20/contract risk
     });
-    expect(card.fields.sizing.status).toBe('incomplete');
+    // The inputs were all present and the arithmetic ran: this is a computed
+    // "you cannot afford one", not a missing input.
+    expect(card.fields.sizing.status).toBe('refused');
     expect(card.fields.sizing.missing[0]).toMatch(/buys 0 contracts/);
+    expect(card.fields.sizing.data).not.toBeNull();
+    expect(card.fields.sizing.data!.quantity).toBe(0);
+    expect(card.fields.sizing.data!.riskBudget).toBe(10);
+    // …and it is STILL not a proposable card. Reclassifying the reason must
+    // never soften the gate.
+    expect(card.complete).toBe(false);
+    expect(card.refusedFields).toContain('sizing');
+    expect(card.incompleteFields).not.toContain('sizing');
   });
 
   it('a stale signal fails whyNow with the measured age, not a silent pass', () => {
@@ -231,6 +241,50 @@ describe('buildTradeOpportunityCard — fail-closed negative controls', () => {
     );
     expect(card.complete).toBe(false);
     expect(card.fields.entryTrigger.missing).toContain('entry criterion failed: not_suppressed');
+  });
+
+  // TRA-4649 acceptance-instrument discriminator. On 2026-09-22 all 50 live
+  // cards folded to `missingByField.entryTrigger: 50` — a number that a builder
+  // emitting NO entry triggers at all would produce identically. These two
+  // cases are the pair that number could not tell apart; they must now land in
+  // different cells.
+  it('a SUPPRESSED signal refuses the trigger with its workings attached — it is not "missing"', () => {
+    const card = buildTradeOpportunityCard(
+      equitySignal({ signalSkipReason: 'outside the admitted entry window (TRA-3942)' }),
+      FULL_CTX,
+    );
+    expect(card.fields.entryTrigger.status).toBe('refused');
+    // The spec is fully populated — this is the field DOING its job, field #2
+    // being "entry trigger specification with pass/fail criteria".
+    expect(card.fields.entryTrigger.data).not.toBeNull();
+    expect(card.fields.entryTrigger.data!.limitPrice).toBeGreaterThan(0);
+    expect(card.fields.entryTrigger.data!.criteria.length).toBeGreaterThan(0);
+    expect(card.refusedFields).toContain('entryTrigger');
+    expect(card.incompleteFields).not.toContain('entryTrigger');
+    expect(card.complete).toBe(false); // gate unchanged
+  });
+
+  it('an UNPRICEABLE trigger is missing, not refused — the two never share a cell', () => {
+    // No mark and no entry price ⇒ we never knew the trigger at all.
+    const card = buildTradeOpportunityCard(
+      otmSignal({ mark: undefined, entryPrice: undefined }),
+      FULL_CTX,
+    );
+    expect(card.fields.entryTrigger.status).toBe('incomplete');
+    expect(card.incompleteFields).toContain('entryTrigger');
+    expect(card.refusedFields).not.toContain('entryTrigger');
+  });
+
+  it('a DATA criterion failing outranks an admission one — an untrusted input is never a policy verdict', () => {
+    // Suppressed AND quote-less at once: we cannot claim to have run the policy
+    // on inputs we do not have, so this reads `incomplete`, not `refused`.
+    const card = buildTradeOpportunityCard(
+      otmSignal({ bid: undefined, ask: undefined, signalSkipReason: 'suppressed too' }),
+      FULL_CTX,
+    );
+    expect(card.fields.entryTrigger.status).toBe('incomplete');
+    expect(card.incompleteFields).toContain('entryTrigger');
+    expect(card.refusedFields).not.toContain('entryTrigger');
   });
 
   it('missing underlying quote fails contract and costs for equity signals', () => {
@@ -307,6 +361,65 @@ describe('buildCards batch + acceptance fold', () => {
       entryTrigger: 1,
       whyNow: 1,
     });
+  });
+
+  it('separates a BROKEN population from a merely not-enterable one', () => {
+    // Same card count, same `complete: 0`, same `incomplete: 3` — the two
+    // populations the old single fold rendered identically.
+    const brokenPop = buildCards(
+      [
+        otmSignal({ id: 'b1', bid: undefined, ask: undefined }),
+        otmSignal({ id: 'b2', bid: undefined, ask: undefined }),
+        otmSignal({ id: 'b3', bid: undefined, ask: undefined }),
+      ],
+      FULL_CTX,
+    ).summary;
+    const quietPop = buildCards(
+      [
+        equitySignal({ id: 'q1', signalSkipReason: 'outside entry window' }),
+        equitySignal({ id: 'q2', signalSkipReason: 'outside entry window' }),
+        equitySignal({ id: 'q3', signalSkipReason: 'outside entry window' }),
+      ],
+      FULL_CTX,
+    ).summary;
+
+    // The cells that CANNOT tell them apart — this is the bug, pinned.
+    expect(brokenPop.complete).toBe(quietPop.complete);
+    expect(brokenPop.incomplete).toBe(quietPop.incomplete);
+
+    // The cells that CAN.
+    expect(brokenPop.unbuildable).toBe(3);
+    expect(brokenPop.refusedOnly).toBe(0);
+    expect(brokenPop.missingByField.entryTrigger).toBe(3);
+    expect(brokenPop.refusedByField.entryTrigger).toBeUndefined();
+
+    expect(quietPop.unbuildable).toBe(0);
+    expect(quietPop.refusedOnly).toBe(3);
+    expect(quietPop.refusedByField.entryTrigger).toBe(3);
+    expect(quietPop.missingByField.entryTrigger).toBeUndefined();
+  });
+
+  it('complete + unbuildable + refusedOnly partitions the population exactly', () => {
+    const { cards, summary } = buildCards(
+      [
+        equitySignal(), // complete
+        otmSignal(), // complete
+        otmSignal({ id: 'u1', bid: undefined, ask: undefined }), // unbuildable
+        equitySignal({ id: 'r1', signalSkipReason: 'suppressed' }), // refused only
+        // both at once ⇒ counted as unbuildable, never double-counted
+        otmSignal({ id: 'x1', bid: undefined, ask: undefined, signalSkipReason: 'suppressed' }),
+      ],
+      FULL_CTX,
+    );
+    expect(cards).toHaveLength(5);
+    expect(summary.complete + summary.unbuildable + summary.refusedOnly).toBe(summary.total);
+    expect(summary.unbuildable).toBe(2);
+    expect(summary.refusedOnly).toBe(1);
+    expect(summary.complete).toBe(2);
+    // A card is never in both name lists.
+    for (const c of cards) {
+      for (const f of c.refusedFields) expect(c.incompleteFields).not.toContain(f);
+    }
   });
 
   it('pre-market liquidity carries the volume-is-not-a-discriminator note', () => {

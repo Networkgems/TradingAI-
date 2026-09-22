@@ -10846,7 +10846,18 @@ describe('TRA-4649 — trade opportunity cards ride the signal feed sink', () =>
     expect(cards).toHaveLength(1);
     expect(cards[0].complete).toBe(true);
     expect(cards[0].incompleteFields).toEqual([]);
-    expect(summary).toEqual({ total: 1, complete: 1, incomplete: 0, missingByField: {} });
+    expect(cards[0].refusedFields).toEqual([]);
+    // Exhaustive on purpose: a new fold cell must not reach the shipped route
+    // unnoticed — this is the surface the acceptance grade reads.
+    expect(summary).toEqual({
+      total: 1,
+      complete: 1,
+      incomplete: 0,
+      unbuildable: 0,
+      refusedOnly: 0,
+      missingByField: {},
+      refusedByField: {},
+    });
     // The sizing basis is the account's own numbers, not literals: the card's
     // share count must equal what the account itself would size for this stop.
     const acct = (engine as unknown as { account: PaperAccount }).account;

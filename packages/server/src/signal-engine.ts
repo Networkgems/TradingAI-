@@ -7664,10 +7664,18 @@ export class SignalEngine {
 
   /**
    * TRA-4649 — read surface for the card ring: cards newest-first plus the
-   * acceptance fold over exactly this population. `summary.missingByField` is
-   * the instrument the issue's acceptance is graded on — a nonzero row names
-   * the input the emitted population is missing. `buildFailures` is the
-   * counter for cards the sink could not build at all.
+   * acceptance fold over exactly this population.
+   *
+   * GRADE `summary.unbuildable`, NOT `summary.incomplete`. `incomplete` counts
+   * every card that is not enterable, which on a normal day is most of them —
+   * an entry window that is shut or a contract the sleeve cannot afford both
+   * land there, and neither is a defect. The defect cell is `unbuildable`
+   * (≥1 field whose INPUTS were missing), named per field in `missingByField`;
+   * `refusedOnly`/`refusedByField` are the healthy not-enterable population.
+   * `buildFailures` counts cards the sink could not build at all.
+   *
+   * ⚠️ The ring holds MAX_SIGNALS entries, so `total` saturating at that value
+   * is a ring bound, not a census of the session.
    */
   getRecentCards(): {
     cards: TradeOpportunityCard[];

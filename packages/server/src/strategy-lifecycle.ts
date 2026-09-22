@@ -199,8 +199,18 @@ function entryConditions(
       const missing = checkCard(lc, ev.card);
       if (missing.length > 0) return missing;
       if (!ev.card.complete) {
+        // Name the two causes separately: an unbuilt field is a defect to chase,
+        // a refused field is the card correctly declining. Both still refuse the
+        // transition — only the wording of the refusal distinguishes them.
+        const parts: string[] = [];
+        if (ev.card.incompleteFields.length > 0) {
+          parts.push(`unbuilt fields: [${ev.card.incompleteFields.join(', ')}]`);
+        }
+        if (ev.card.refusedFields.length > 0) {
+          parts.push(`fields refusing entry: [${ev.card.refusedFields.join(', ')}]`);
+        }
         missing.push(
-          `card incomplete — unverified fields: [${ev.card.incompleteFields.join(', ')}]; an incomplete card cannot be proposed (TRA-4649)`,
+          `card not complete — ${parts.join('; ')}; an incomplete card cannot be proposed (TRA-4649)`,
         );
       }
       return missing;

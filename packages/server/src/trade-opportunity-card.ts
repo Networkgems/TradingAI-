@@ -66,9 +66,21 @@ import type { RelativeStrengthReading } from './otm-relative-strength.js';
 
 // ── Field plumbing ──────────────────────────────────────────────────────────
 
-export type CardFieldStatus = 'verified' | 'incomplete';
+// A field that was COMPUTED IN FULL and whose computed answer is "do not enter"
+// is NOT the same event as a field we could not build, and TRA-4649's acceptance
+// fold must not report them in the same cell. Both leave the card not-`complete`
+// — that part is deliberate and unchanged — but `incomplete` means "the input
+// was missing" and `refused` means "the input was there, we ran the rule, and it
+// says no". Collapsing them makes the instrument unable to tell a broken builder
+// from a healthy one: on 2026-09-22 all 50 live cards read
+// `missingByField.entryTrigger: 50`, which looks exactly like a builder emitting
+// no entry triggers at all, when in fact every one of the 50 had a fully
+// populated trigger spec whose `not_suppressed` criterion correctly fired
+// (TRA-3942 entry window). A broken build and a quiet afternoon must not
+// render as the same number.
+export type CardFieldStatus = 'verified' | 'incomplete' | 'refused';
 
-/** One of the 8 card fields. `missing` is non-empty iff `incomplete`. */
+/** One of the 8 card fields. `missing` is non-empty iff not `verified`. */
 export interface CardField<T> {
   status: CardFieldStatus;
   /** Populated content; null only when the field could not be built at all. */
@@ -82,6 +94,14 @@ function verified<T>(data: T): CardField<T> {
 }
 function incomplete<T>(data: T | null, missing: string[]): CardField<T> {
   return { status: 'incomplete', data, missing };
+}
+/**
+ * Built from measured inputs; the rule that ran on them says do not enter.
+ * `data` is non-null BY CONSTRUCTION — a refusal we cannot show the workings of
+ * is an `incomplete`, not a `refused`.
+ */
+function refused<T>(data: T, reasons: string[]): CardField<T> {
+  return { status: 'refused', data, missing: reasons };
 }
 
 /** Finite-number reader for optional/loosely-typed signal extensions. */
@@ -315,9 +335,24 @@ export interface SetupIdentification {
   label: string;
 }
 
+/**
+ * Why a criterion failing means what it means.
+ *  - `data`      — the criterion is asserting an INPUT is present and sane
+ *                  (quote exists, price finite, stop on the right side). A
+ *                  failure here means we do not actually know the trigger, so
+ *                  the field is `incomplete`.
+ *  - `admission` — the inputs are all there and a POLICY rule declines entry
+ *                  (entry window, suppression). A failure here means we know
+ *                  the trigger perfectly well and the answer is no: `refused`.
+ * A `data` failure outranks an `admission` one — if we do not trust the inputs
+ * we cannot claim to have run the policy on them.
+ */
+export type EntryCriterionKind = 'data' | 'admission';
+
 export interface EntryCriterion {
   name: string;
   description: string;
+  kind: EntryCriterionKind;
   pass: boolean;
 }
 
@@ -420,9 +455,17 @@ export interface TradeOpportunityCard {
    * validation — `SetupConfidence` has no unvalidated variant). Otherwise null.
    */
   confidence: SetupConfidence | null;
+  /** True iff all 8 fields `verified` — i.e. both lists below are empty. */
   complete: boolean;
-  /** Names of the fields that failed to verify (empty iff complete). */
+  /** Fields whose inputs were MISSING — the builder could not populate them. */
   incompleteFields: string[];
+  /**
+   * Fields that were populated in full and whose own rule says do not enter.
+   * Disjoint from `incompleteFields`. A card with entries here is a WORKING
+   * card reporting a real "no", not a defective one — but it is still not
+   * `complete`, so it still cannot reach `proposed` (TRA-4651).
+   */
+  refusedFields: string[];
   fields: {
     setup: CardField<SetupIdentification>;
     entryTrigger: CardField<EntryTriggerSpec>;
@@ -566,6 +609,7 @@ export function buildTradeOpportunityCard(
   criteria.push({
     name: 'entry_price_positive',
     description: 'Entry price / premium is a finite positive number',
+    kind: 'data',
     pass: entryPrice !== undefined && entryPrice > 0,
   });
   // Long-premium semantics for option signals: the named contract (call or put)
@@ -579,6 +623,7 @@ export function buildTradeOpportunityCard(
     description: opt
       ? 'Premium stop sits below the entry mark (long-premium position)'
       : 'Stop sits on the loss side of entry for the stated side',
+    kind: 'data',
     pass: stopOnThesisSide,
   });
   if (opt) {
@@ -587,11 +632,13 @@ export function buildTradeOpportunityCard(
     criteria.push({
       name: 'two_sided_quote_present',
       description: 'Contract has a usable two-sided quote (bid ≤ ask, bid ≥ 0)',
+      kind: 'data',
       pass: quoteUsable,
     });
     criteria.push({
       name: 'mark_within_quote',
       description: 'Entry mark lies within [bid, ask] — a mark outside its own quote is stale',
+      kind: 'data',
       pass: quoteUsable && opt.bid! <= opt.mark && opt.mark <= opt.ask!,
     });
   }
@@ -600,6 +647,7 @@ export function buildTradeOpportunityCard(
     criteria.push({
       name: 'not_suppressed',
       description: `Signal was suppressed at emission: ${suppressReason}`,
+      kind: 'admission',
       pass: false,
     });
   }
@@ -608,15 +656,21 @@ export function buildTradeOpportunityCard(
     entryPrice !== undefined
       ? { side: signal.side, orderType: 'limit', limitPrice: entryPrice, criteria }
       : null;
+  // Field #2 of the spec is "entry trigger specification WITH PASS/FAIL
+  // CRITERIA" — an `admission` criterion returning `pass: false` is this field
+  // delivering its contract, not failing to. A `data` criterion returning false
+  // means we never knew the trigger in the first place, and that stays
+  // `incomplete`. Data outranks admission (see EntryCriterionKind).
+  const failedData = failedCriteria.filter((c) => c.kind === 'data');
+  const reasons = failedCriteria.map((c) => `entry criterion failed: ${c.name}`);
   const entryTrigger =
-    triggerData !== null && failedCriteria.length === 0
-      ? verified(triggerData)
-      : incomplete(
-          triggerData,
-          failedCriteria.length > 0
-            ? failedCriteria.map((c) => `entry criterion failed: ${c.name}`)
-            : ['entry price missing/non-finite'],
-        );
+    triggerData === null
+      ? incomplete<EntryTriggerSpec>(null, ['entry price missing/non-finite'])
+      : failedData.length > 0
+        ? incomplete(triggerData, reasons)
+        : failedCriteria.length === 0
+          ? verified(triggerData)
+          : refused(triggerData, reasons);
 
   // 3. Invalidation — hard stop + type-specific thesis break.
   let invalidation: CardField<InvalidationSpec>;
@@ -832,9 +886,19 @@ export function buildTradeOpportunityCard(
             maxLossHard: contracts * entryPrice * 100,
             basis: 'floor(managedEquity × riskPerTrade / (stopDistance × 100)); hard max loss is full premium',
           })
-        : incomplete<PositionSizing>(null, [
-            `risk budget $${budget.toFixed(2)} buys 0 contracts at $${(riskPerShare * 100).toFixed(2)} risk/contract`,
-          ]);
+        : refused<PositionSizing>(
+            {
+              unit: 'contracts',
+              quantity: 0,
+              riskBudget: budget,
+              maxLossAtStop: 0,
+              maxLossHard: 0,
+              basis: 'floor(managedEquity × riskPerTrade / (stopDistance × 100)) = 0 — budget below one contract',
+            },
+            [
+              `risk budget $${budget.toFixed(2)} buys 0 contracts at $${(riskPerShare * 100).toFixed(2)} risk/contract`,
+            ],
+          );
   } else {
     const qty = sizeFromStopViaRiskManager(entryPrice, stop!, {
       managedEquity: ctx.sizing.managedEquity,
@@ -851,7 +915,17 @@ export function buildTradeOpportunityCard(
             maxLossHard: null,
             basis: 'sizeFromStopViaRiskManager (TRA-2034: engine RiskManager + TRA-178 notional cap)',
           })
-        : incomplete<PositionSizing>(null, ['RiskManager sized 0 (budget below one unit or notional-capped to zero)']);
+        : refused<PositionSizing>(
+            {
+              unit: 'shares',
+              quantity: 0,
+              riskBudget: ctx.sizing.managedEquity * ctx.sizing.riskPerTrade,
+              maxLossAtStop: 0,
+              maxLossHard: null,
+              basis: 'sizeFromStopViaRiskManager (TRA-2034) returned 0 — budget below one unit or notional-capped to zero',
+            },
+            ['RiskManager sized 0 (budget below one unit or notional-capped to zero)'],
+          );
   }
 
   // 8. "Why now?" — narrative + measured evidence + freshness (fail closed on stale).
@@ -900,8 +974,9 @@ export function buildTradeOpportunityCard(
   }
 
   const fields = { setup, entryTrigger, invalidation, targets, contract, costs, sizing, whyNow };
-  const incompleteFields = (Object.keys(fields) as (keyof typeof fields)[])
-    .filter((k) => fields[k].status !== 'verified');
+  const fieldNames = Object.keys(fields) as (keyof typeof fields)[];
+  const incompleteFields = fieldNames.filter((k) => fields[k].status === 'incomplete');
+  const refusedFields = fieldNames.filter((k) => fields[k].status === 'refused');
   return {
     schemaVersion: 1,
     signalId: signal.id,
@@ -913,8 +988,9 @@ export function buildTradeOpportunityCard(
     confidence: ctx.calibration
       ? confidenceFor(ctx.calibration, signal.type, ctx.currentRegime ?? null).confidence
       : null,
-    complete: incompleteFields.length === 0,
+    complete: incompleteFields.length === 0 && refusedFields.length === 0,
     incompleteFields,
+    refusedFields,
     fields,
     reasonsNotToEnter: buildReasonsNotToEnter(
       {
@@ -935,9 +1011,23 @@ export function buildTradeOpportunityCard(
 export interface CardBatchSummary {
   total: number;
   complete: number;
+  /** Cards not `complete`, for any reason — `unbuildable + refusedOnly`. */
   incomplete: number;
-  /** Count of cards missing each field — the fold the acceptance grade reads. */
+  /**
+   * Cards with ≥1 field the builder COULD NOT POPULATE. This is the defect
+   * cell: a nonzero here means missing inputs or a coverage hole.
+   */
+  unbuildable: number;
+  /**
+   * Cards fully populated whose own rules decline entry. This is the HEALTHY
+   * not-enterable cell — a quiet afternoon, an entry window, an unaffordable
+   * contract. It is not a defect and must never be read as one.
+   */
+  refusedOnly: number;
+  /** Per-field count of cards that could not BUILD the field. */
   missingByField: Record<string, number>;
+  /** Per-field count of cards that built it and whose rule declined entry. */
+  refusedByField: Record<string, number>;
 }
 
 /**
@@ -947,13 +1037,32 @@ export interface CardBatchSummary {
  */
 export function summarizeCards(cards: readonly TradeOpportunityCard[]): CardBatchSummary {
   const missingByField: Record<string, number> = {};
+  const refusedByField: Record<string, number> = {};
   for (const card of cards) {
     for (const f of card.incompleteFields) {
       missingByField[f] = (missingByField[f] ?? 0) + 1;
     }
+    for (const f of card.refusedFields) {
+      refusedByField[f] = (refusedByField[f] ?? 0) + 1;
+    }
   }
   const complete = cards.filter((c) => c.complete).length;
-  return { total: cards.length, complete, incomplete: cards.length - complete, missingByField };
+  // Every card lands in exactly one of the three buckets; `unbuildable` wins a
+  // card that is both, because a missing input is the finding that needs acting
+  // on. complete + unbuildable + refusedOnly === total, asserted in the tests.
+  const unbuildable = cards.filter((c) => c.incompleteFields.length > 0).length;
+  const refusedOnly = cards.filter(
+    (c) => c.incompleteFields.length === 0 && c.refusedFields.length > 0,
+  ).length;
+  return {
+    total: cards.length,
+    complete,
+    incomplete: cards.length - complete,
+    unbuildable,
+    refusedOnly,
+    missingByField,
+    refusedByField,
+  };
 }
 
 /** Build a card for EVERY signal (total by construction) and fold the tally. */
