@@ -90,7 +90,7 @@ import { EvalYielder, TickPacer } from './cooperative-yield.js';
 import { TickExitWorkMeter, type TickExitWorkTerms } from './tick-exit-work.js';
 import { TickExitRegionMeter, classifyExitInterval, type TickExitRegionRthTerms } from './tick-exit-region.js';
 import { trySma200ScanSlot, releaseSma200ScanSlot, fetchSma200CandlesShared } from './sma200-scan-admission.js';
-import { resolveSma200PullbackMaxDistAtr, sma200VoidVerdict, sma200SweepVerdict, sma200SweepStarved, signalRingEvictionIndex, isSma200SignalType, type Sma200SweepVerdict } from './sma200-validity.js';
+import { resolveSma200PullbackMaxDistAtr, resolveSma200PullbackTimeCapBars, sma200PullbackExitModel, sma200VoidVerdict, sma200SweepVerdict, sma200SweepStarved, signalRingEvictionIndex, isSma200SignalType, type Sma200SweepVerdict } from './sma200-validity.js';
 import { getLatestReviewBlock } from './research-store.js';
 import { earningsInDaysSync, earningsCalendarReadSync, recentEarningsDateSync } from './earnings-store.js';
 import {
@@ -896,6 +896,14 @@ export interface Sma200ScanStats {
    * `maxDistAtr`, which JSON-serialises `Infinity` to `null`.
    */
   maxDistAtr: number | null;
+  /**
+   * TRA-4617 (TRA-3688 S-2b) — the exit-model time cap (daily bars) in force
+   * for this sweep. Answers "what cap is stamped on the next fire" on an
+   * EMPTY queue — same lesson as `maxDistAtr` above: a per-row stamp is only
+   * readable when the lottery delivers a row. Optional: absent on an older
+   * build's census, and field presence is the deployed-bytes proof (TRA-3913).
+   */
+  timeCapBars?: number;
 }
 
 export interface EngineState {
@@ -7984,6 +7992,7 @@ export class SignalEngine {
       fired: stats.fired,
       voided: stats.voided,
       maxDistAtr: stats.maxDistAtr,
+      timeCapBars: stats.timeCapBars,
       memoHits: stats.memoHits,
       durationMs: stats.finishedAt - stats.startedAt,
       // The one field a grader actually needs: did this sweep have a population
@@ -8046,6 +8055,11 @@ export class SignalEngine {
     // sweep is stamped with the same `maxDistAtr`. Default `Infinity` = dark.
     const pullbackMaxDistAtr = resolveSma200PullbackMaxDistAtr(process.env);
     stats.maxDistAtr = Number.isFinite(pullbackMaxDistAtr) ? pullbackMaxDistAtr : null;
+    // TRA-4617 (S-2b) — the exit-model time cap in force for this whole sweep,
+    // resolved once per scan for the same reason as the gate above: every
+    // pullback fired by one sweep carries the same stamp.
+    const pullbackTimeCapBars = resolveSma200PullbackTimeCapBars(process.env);
+    stats.timeCapBars = pullbackTimeCapBars;
     for (let i = 0; i < symbols.length; i += SCAN_BATCH) {
       await Promise.all(
         symbols.slice(i, i + SCAN_BATCH).map(async (sym) => {
@@ -8148,6 +8162,14 @@ export class SignalEngine {
               stopAtr: result.stopAtr,
               stopBasis: result.stopBasis,
               maxDistAtr: result.maxDistAtr,
+              // TRA-4617 (S-2b) — the ruled exit model travels WITH the record
+              // (structural stop + time cap, takeProfit null BY RULING).
+              // Pullback only: the reclaim's exit rule is explicitly UNRULED
+              // (S-4), and stamping the pullback's ruling on it would be the
+              // original defect again — a label the evidence does not back.
+              exitModel: result.kind === 'sma200_pullback'
+                ? sma200PullbackExitModel(pullbackTimeCapBars)
+                : undefined,
               // TRA-3688 S-3a — the daily bar this signal is valid FOR.
               validForBarTimestamp: latestBarTs,
             };
@@ -23283,6 +23305,22 @@ export class SignalEngine {
         dropped: legacySma200.length,
         symbols: legacySma200.map(s => s.symbol),
       });
+    }
+    // TRA-4617 (S-2b) — backfill the exit-model stamp on restored pullback
+    // rows minted by a pre-4617 build. The queue is routinely snapshot-restored
+    // across a deploy (TRA-1926), so without this the first post-deploy read
+    // serves a mixed queue and "every pullback row carries the ruled exit
+    // model" (AC1) is false for exactly as long as the restored rows live.
+    // Honest because the exit model is a ruling about the STRATEGY, not a
+    // fire-time measurement — S-2b applies to these rows already (their
+    // `takeProfit` is null under the same ruling); the stamp resolved here is
+    // the model that governs the record now.
+    for (const sig of this.recentSignals) {
+      if (sig.type !== 'sma200_pullback') continue;
+      const row = sig as Sma200Signal;
+      if (row.exitModel === undefined) {
+        row.exitModel = sma200PullbackExitModel(resolveSma200PullbackTimeCapBars(process.env));
+      }
     }
     this.sma200SignalVoids = Array.isArray(snap.sma200SignalVoids)
       ? [...snap.sma200SignalVoids]

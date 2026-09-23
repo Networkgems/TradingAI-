@@ -547,6 +547,48 @@ export interface Sma200GateRejectionRecord {
 }
 
 /**
+ * TRA-4617 (TRA-3688 S-2b) — the ruled exit model, stamped on every emitted
+ * `sma200_pullback` record so the ruling travels WITH the record instead of
+ * living only in a document. The defect that opened TRA-3688 was exactly a
+ * label that did not travel: the fabricated `takeProfit = entry + 2·risk`
+ * shipped with an in-code "display-only" comment that `GET /api/state` never
+ * served. A bare `null` takeProfit is the same hazard one layer down — a
+ * reader cannot tell "deliberately no target" from "not implemented yet", and
+ * the obvious repair is to put the 2R projection back. This object is the
+ * explicit "no target BY RULING" marker.
+ *
+ * The ruling (evidence: docs/evidence/tra3688-s2b-exit-model.md): nothing
+ * replaces the nulled target. Exit = the structural stop plus a time cap of
+ * `timeCapBars` daily bars. No profit target, no trailing stop — every fixed-R
+ * target and every trailing stop tested destroyed expectancy (no-target E[R]
+ * 0.7046 at h=80 vs 0.6312 for the best target arm; MFE p50 is 1.07R, so a
+ * target is a strict truncation of the only tail that pays).
+ *
+ * This is a PUBLISHED PROPERTY of the signal, not position management:
+ * `sma200_pullback` is display-only and routes no capital (TRA-817 manifest),
+ * so there is nothing to exit. The spec must exist before the TRA-817
+ * out-of-sample submission, because an OOS run certifies whatever rule is in
+ * the code when it runs.
+ */
+export interface Sma200ExitModel {
+  /** Discriminant: the only ruled exit model. */
+  kind: 'structural_stop_time_capped';
+  /** The stop leg — same literal rule the record's `stopBasis` names. */
+  stopBasis: Sma200StopBasis;
+  /** Exit after this many daily bars in the trade (ruled: 60). */
+  timeCapBars: number;
+  /**
+   * Literal `null`, restated INSIDE the ruled object: there is no profit
+   * target by ruling. Distinguishes "no target by ruling" (this object
+   * present) from "field not populated" (this object absent) without reading
+   * any ticket.
+   */
+  takeProfit: null;
+  /** Provenance of the ruling. */
+  ruledBy: 'TRA-3688 S-2b';
+}
+
+/**
  * TRA-451 — signal emitted by the SMA-200 trend-filter scanner. Covers the
  * pullback-to-200 bounce (`sma200_pullback`) and the 200-SMA reclaim reversal
  * (`sma200_reclaim`), both computed on daily bars. `entryPrice` is the latest
@@ -595,6 +637,16 @@ export interface Sma200Signal extends Omit<TradeSignal, 'takeProfit' | 'riskRewa
    * earns a finite number.
    */
   maxDistAtr: number;
+  /**
+   * TRA-4617 (TRA-3688 S-2b) — the ruled exit model. Present on EVERY
+   * `sma200_pullback` row served by a current build (stamped at emit,
+   * backfilled at snapshot import); absent on `sma200_reclaim`, whose exit
+   * rule is explicitly UNRULED (TRA-3688 S-4 — zero live reclaim rows to
+   * measure). Absence therefore means "exit model unruled", never "no
+   * target": the ruled no-target state is `exitModel.takeProfit === null`
+   * with the object PRESENT.
+   */
+  exitModel?: Sma200ExitModel;
   /**
    * TRA-3688 S-3a — the daily bar this signal is valid FOR (same value as
    * `barTimestamp`). The signal is void the moment a newer daily bar exists

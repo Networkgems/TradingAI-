@@ -2,7 +2,7 @@
  * TRA-3688 — SMA-200 signal validity (S-3) and the S-1 max-dist gate's env
  * resolution. Pure helpers, unit-tested apart from the engine loop.
  */
-import type { Sma200Signal, Sma200VoidReason } from '@trading-app/shared';
+import type { Sma200ExitModel, Sma200Signal, Sma200VoidReason } from '@trading-app/shared';
 
 /**
  * TRA-4411 (TRA-3688 S-1 flip) — the default max-dist gate, finite since
@@ -37,6 +37,54 @@ export function resolveSma200PullbackMaxDistAtr(env: NodeJS.ProcessEnv): number 
   const n = Number(raw);
   if (!Number.isFinite(n) || n <= 0) return Infinity;
   return n;
+}
+
+/**
+ * TRA-4617 (TRA-3688 S-2b) — the ruled time cap on a pullback trade, in daily
+ * bars. 60 is the ruling's number (evidence:
+ * docs/evidence/tra3688-s2b-exit-model.md): exit = structural stop + 60-bar
+ * time cap, no profit target, no trailing stop.
+ */
+export const SMA200_PULLBACK_TIME_CAP_BARS_DEFAULT = 60;
+
+/**
+ * TRA-4617 — resolve `SMA200_PULLBACK_TIME_CAP_BARS` from the environment.
+ *
+ * TRA-3440 parse guard: blank or garbage env means the DEFAULT (60), never
+ * `0` — `Number('')` is `0`, and a time cap of 0 would declare every signal
+ * expired at birth. An explicit positive number is honoured (floored to a
+ * whole bar; a fractional bar count is not a thing a daily-bar cap can mean).
+ *
+ * Deliberately DIFFERENT failure arm from `resolveSma200PullbackMaxDistAtr`
+ * above, which fails a garbled override DARK (`Infinity`): the max-dist gate
+ * changes which setups are admitted, so a value nobody set must not silently
+ * re-tighten admission. The time cap gates nothing — it is a published
+ * property of the ruled exit model — so its only honest fallback is the ruled
+ * number itself. There is no "dark" arm here at all: non-finite input
+ * (including an explicit `Infinity`, which would mean "no cap" — an exit
+ * model nobody ruled) resolves to the ruled 60.
+ */
+export function resolveSma200PullbackTimeCapBars(env: NodeJS.ProcessEnv): number {
+  const raw = env.SMA200_PULLBACK_TIME_CAP_BARS;
+  if (raw === undefined || raw.trim() === '') return SMA200_PULLBACK_TIME_CAP_BARS_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1) return SMA200_PULLBACK_TIME_CAP_BARS_DEFAULT;
+  return Math.floor(n);
+}
+
+/**
+ * TRA-4617 (TRA-3688 S-2b) — build the exit-model stamp for a pullback
+ * record. One constructor so the emit site and the snapshot-import backfill
+ * cannot drift apart on the literal fields.
+ */
+export function sma200PullbackExitModel(timeCapBars: number): Sma200ExitModel {
+  return {
+    kind: 'structural_stop_time_capped',
+    stopBasis: 'sma200_minus_1atr',
+    timeCapBars,
+    takeProfit: null,
+    ruledBy: 'TRA-3688 S-2b',
+  };
 }
 
 /**

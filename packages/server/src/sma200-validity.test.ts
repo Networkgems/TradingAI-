@@ -3,6 +3,9 @@ import { describe, it, expect } from 'vitest';
 import {
   resolveSma200PullbackMaxDistAtr,
   SMA200_PULLBACK_MAX_DIST_ATR_DEFAULT,
+  resolveSma200PullbackTimeCapBars,
+  SMA200_PULLBACK_TIME_CAP_BARS_DEFAULT,
+  sma200PullbackExitModel,
   sma200VoidVerdict,
   SMA200_DRIFT_VOID_ATR,
   sma200SweepVerdict,
@@ -37,6 +40,57 @@ describe('resolveSma200PullbackMaxDistAtr (TRA-3440-guarded parse, TRA-4411 fini
 
   it('AC2 — SMA200_PULLBACK_MAX_DIST_ATR=Infinity restores the old dark gate: the flip is reversible by config without a deploy', () => {
     expect(resolveSma200PullbackMaxDistAtr({ SMA200_PULLBACK_MAX_DIST_ATR: 'Infinity' })).toBe(Infinity);
+  });
+});
+
+// TRA-4617 AC4 — BOTH arms of the env parse: an explicit value is honoured,
+// and blank/garbage resolves to the ruled 60, never 0 (`Number('')` is 0, and
+// a 0-bar time cap would declare every signal expired at birth).
+describe('resolveSma200PullbackTimeCapBars (TRA-4617, TRA-3440-guarded parse)', () => {
+  it('an absent var means the ruled default, 60', () => {
+    expect(SMA200_PULLBACK_TIME_CAP_BARS_DEFAULT).toBe(60);
+    expect(resolveSma200PullbackTimeCapBars({})).toBe(60);
+  });
+
+  it('AC4 arm 1 — an explicit SMA200_PULLBACK_TIME_CAP_BARS=20 is honoured', () => {
+    expect(resolveSma200PullbackTimeCapBars({ SMA200_PULLBACK_TIME_CAP_BARS: '20' })).toBe(20);
+    expect(resolveSma200PullbackTimeCapBars({ SMA200_PULLBACK_TIME_CAP_BARS: '120' })).toBe(120);
+  });
+
+  it('AC4 arm 2 — blank / whitespace resolves to 60, never 0', () => {
+    expect(resolveSma200PullbackTimeCapBars({ SMA200_PULLBACK_TIME_CAP_BARS: '' })).toBe(60);
+    expect(resolveSma200PullbackTimeCapBars({ SMA200_PULLBACK_TIME_CAP_BARS: '   ' })).toBe(60);
+  });
+
+  it('AC4 arm 2 — garbage resolves to 60, never 0', () => {
+    expect(resolveSma200PullbackTimeCapBars({ SMA200_PULLBACK_TIME_CAP_BARS: 'abc' })).toBe(60);
+    expect(resolveSma200PullbackTimeCapBars({ SMA200_PULLBACK_TIME_CAP_BARS: 'NaN' })).toBe(60);
+  });
+
+  it('non-positive values are refused as a config: 0 and negatives resolve to 60', () => {
+    expect(resolveSma200PullbackTimeCapBars({ SMA200_PULLBACK_TIME_CAP_BARS: '0' })).toBe(60);
+    expect(resolveSma200PullbackTimeCapBars({ SMA200_PULLBACK_TIME_CAP_BARS: '-5' })).toBe(60);
+    expect(resolveSma200PullbackTimeCapBars({ SMA200_PULLBACK_TIME_CAP_BARS: '0.4' })).toBe(60);
+  });
+
+  it('there is NO dark arm — Infinity would mean "no cap", an exit model nobody ruled, so it resolves to 60', () => {
+    expect(resolveSma200PullbackTimeCapBars({ SMA200_PULLBACK_TIME_CAP_BARS: 'Infinity' })).toBe(60);
+  });
+
+  it('a fractional bar count is floored to a whole bar', () => {
+    expect(resolveSma200PullbackTimeCapBars({ SMA200_PULLBACK_TIME_CAP_BARS: '20.9' })).toBe(20);
+  });
+});
+
+describe('sma200PullbackExitModel (TRA-4617 / TRA-3688 S-2b stamp)', () => {
+  it('carries the ruled literals: structural stop + time cap, takeProfit null BY RULING, provenance named', () => {
+    expect(sma200PullbackExitModel(60)).toEqual({
+      kind: 'structural_stop_time_capped',
+      stopBasis: 'sma200_minus_1atr',
+      timeCapBars: 60,
+      takeProfit: null,
+      ruledBy: 'TRA-3688 S-2b',
+    });
   });
 });
 

@@ -333,3 +333,85 @@ describe('TRA-4411 — S-1 finite default records max-dist rejections', () => {
     expect(engine.getState().sma200GateRejections).toHaveLength(1);
   });
 });
+
+// TRA-4617 (TRA-3688 S-2b) — the ruled exit model travels WITH the record:
+// every emitted pullback row carries `exitModel` (structural stop + 60-bar
+// time cap, takeProfit null BY RULING), the census states the cap in force
+// even on an empty queue, and a snapshot-restored pre-4617 row is backfilled.
+describe('TRA-4617 — S-2b exit model is stamped on every pullback record', () => {
+  const scan = (e: SignalEngine) => (e as unknown as {
+    runSma200Scan: (symbols: string[]) => Promise<void>;
+  }).runSma200Scan(['TEST']);
+
+  const RULED_EXIT = {
+    kind: 'structural_stop_time_capped',
+    stopBasis: 'sma200_minus_1atr',
+    timeCapBars: 60,
+    takeProfit: null,
+    ruledBy: 'TRA-3688 S-2b',
+  };
+
+  afterEach(() => {
+    delete process.env.SMA200_PULLBACK_TIME_CAP_BARS;
+  });
+
+  it('an emitted pullback carries the ruled exit model, and the census stamps the cap in force', async () => {
+    // Dark max-dist gate (file-level beforeEach) so the ≈4.2-ATR fixture FIRES.
+    delete process.env.SMA200_PULLBACK_TIME_CAP_BARS; // the shipped default, 60
+    const engine = new SignalEngine();
+    vi.spyOn(yahooFeed, 'fetchDailyCandles').mockResolvedValue(pullbackSeries());
+
+    await scan(engine);
+
+    const state = engine.getState();
+    const pullback = state.signals.find(s => s.type === 'sma200_pullback') as Sma200Signal;
+    expect(pullback).toBeDefined();
+    expect(pullback.exitModel).toEqual(RULED_EXIT);
+    // AC2 regression guard — the stamp must not re-introduce a target.
+    expect(pullback.takeProfit).toBeNull();
+    expect(pullback.riskRewardRatio).toBeNull();
+    // The census states the cap in force — readable on an EMPTY queue too,
+    // the same lesson as `maxDistAtr` (a per-row stamp waits on the lottery).
+    expect(state.sma200ScanStats?.timeCapBars).toBe(60);
+  });
+
+  it('an explicit SMA200_PULLBACK_TIME_CAP_BARS=20 is honoured on the stamped row (AC4, wiring level)', async () => {
+    process.env.SMA200_PULLBACK_TIME_CAP_BARS = '20';
+    const engine = new SignalEngine();
+    vi.spyOn(yahooFeed, 'fetchDailyCandles').mockResolvedValue(pullbackSeries());
+
+    await scan(engine);
+
+    const state = engine.getState();
+    const pullback = state.signals.find(s => s.type === 'sma200_pullback') as Sma200Signal;
+    expect(pullback.exitModel?.timeCapBars).toBe(20);
+    expect(state.sma200ScanStats?.timeCapBars).toBe(20);
+  });
+
+  it('a blank env resolves the stamp to 60, never a 0-bar cap that expires every signal at birth', async () => {
+    process.env.SMA200_PULLBACK_TIME_CAP_BARS = '';
+    const engine = new SignalEngine();
+    vi.spyOn(yahooFeed, 'fetchDailyCandles').mockResolvedValue(pullbackSeries());
+
+    await scan(engine);
+
+    const pullback = engine.getState().signals.find(s => s.type === 'sma200_pullback') as Sma200Signal;
+    expect(pullback.exitModel?.timeCapBars).toBe(60);
+  });
+
+  it('snapshot import BACKFILLS the stamp on a restored pre-4617 pullback row', () => {
+    const source = new SignalEngine();
+    const base = source.exportTradeSnapshot();
+    // makePullbackSignal has no `exitModel` — exactly a row minted pre-4617
+    // (it carries the atr14 ruler, so the TRA-3688 legacy drop keeps it).
+    const restored = makePullbackSignal({ barTimestamp: 249 * DAY, mode: 'demo' });
+    expect(restored.exitModel).toBeUndefined();
+
+    const engine = new SignalEngine();
+    engine.importTradeSnapshot({ ...base, recentSignals: [restored] });
+
+    const row = engine.getState().signals.find(s => s.type === 'sma200_pullback') as Sma200Signal;
+    expect(row).toBeDefined();
+    expect(row.exitModel).toEqual(RULED_EXIT);
+  });
+});
