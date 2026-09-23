@@ -7957,30 +7957,42 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
 
   // TRA-1294 (parent TRA-1290, board confirmation `73ef18b0`) — unauthenticated,
   // secrets-free readout of whether the take-profit-early auto-close (the PROFIT-
-  // side mirror of the give-back cap) is ARMED in this running process. STANDALONE
-  // + DEMO-ONLY: decoupled from EXIT_RISK_RULES_ENABLED, and the signal-engine only
-  // attaches its capture-fraction on the `mode === 'demo'` options exit branch — so
-  // an `enabled:true` here NEVER changes the live options path (bqb1 is the single
-  // production instance). We resolve the flag through the SAME path the engine
-  // consults (process.env layered with the DATA_DIR demo-flags.json overlay, file
-  // wins) so `enabled` reflects the EFFECTIVE switch. No balances/PII — just the
-  // flag + capture threshold — parity with the other /api/health/* rule readouts.
+  // side mirror of the give-back cap) is ARMED in this running process. We resolve
+  // the demo flag through the SAME path the engine consults (process.env layered
+  // with the DATA_DIR demo-flags.json overlay, file wins) so `enabled` reflects
+  // the EFFECTIVE switch. No balances/PII — just the flags + capture threshold —
+  // parity with the other /api/health/* rule readouts.
+  //
+  // TRA-4759 — `demoOnly`/`liveCapitalReachable` were HARDCODED `true`/`false`
+  // here, which was the configuration's intent circa TRA-1294, not this process's
+  // state: from 2026-09-20T13:47:23.779Z bqb1 runs with TAKE_PROFIT_EARLY_LIVE_
+  // ENABLED=1 (TRA-2949 arm, board ruling TRA-4293) and the ENGINE chooses this
+  // exit on real money — while this route kept saying "live options path
+  // unchanged". Both fields are now COMPUTED off the same resolver the live exit
+  // branch reads (`isTakeProfitEarlyLiveEnabled(process.env)` — live never reads
+  // the demo-flags.json overlay, and the live flag alone arms the exit-risk
+  // input: signal-engine `optionExitRisk = master || takeProfitEarlyArmed`).
   app.get('/api/health/take-profit-early', (_req, res) => {
     const dir = process.env.DATA_DIR;
     const env = dir ? resolveDemoFlagEnv(dir) : process.env;
     const enabled = isTakeProfitEarlyEnabled(env);
+    const liveEnabled = isTakeProfitEarlyLiveEnabled(process.env);
     res.json({
       ok: true,
       time: new Date(now()).toISOString(),
       build: resolveBuildInfo(),
       flag: TAKE_PROFIT_EARLY_FLAG,
       enabled,
-      demoOnly: true,
-      liveCapitalReachable: false,
+      liveFlag: TAKE_PROFIT_EARLY_LIVE_FLAG,
+      liveEnabled,
+      demoOnly: !liveEnabled,
+      liveCapitalReachable: liveEnabled,
       config: { captureFrac: TAKE_PROFIT_EARLY_CAPTURE_PCT },
-      note: enabled
-        ? 'ARMED (demo-only): banks a demo option position once it captures 60% of available profit / max credit; live options path unchanged.'
-        : 'DISARMED: set TAKE_PROFIT_EARLY_ENABLED=true (render.yaml env or DATA_DIR/demo-flags.json) to arm on the demo book.',
+      note: liveEnabled
+        ? 'ARMED (LIVE + demo): the engine banks an option position once it captures 60% of available profit — INCLUDING on the live book (TAKE_PROFIT_EARLY_LIVE_ENABLED, TRA-2949/TRA-4293). Fire forensics: takeProfitEarlyFire stamp + releaseForensics + strategyExits (TRA-4759).'
+        : enabled
+          ? 'ARMED (demo-only): banks a demo option position once it captures 60% of available profit / max credit; live options path unchanged.'
+          : 'DISARMED: set TAKE_PROFIT_EARLY_ENABLED=true (render.yaml env or DATA_DIR/demo-flags.json) to arm on the demo book.',
     });
   });
 

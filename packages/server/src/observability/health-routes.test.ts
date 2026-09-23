@@ -1708,6 +1708,8 @@ describe('TRA-1301 correlated-exposure cap health route', () => {
       ok: boolean;
       flag: string;
       enabled: boolean;
+      liveFlag: string;
+      liveEnabled: boolean;
       demoOnly: boolean;
       liveCapitalReachable: boolean;
       config: { captureFrac: number };
@@ -1716,9 +1718,46 @@ describe('TRA-1301 correlated-exposure cap health route', () => {
     expect(body.flag).toBe('TAKE_PROFIT_EARLY_ENABLED');
     // DARK by default (no env flag set in the test process).
     expect(body.enabled).toBe(false);
+    expect(body.liveFlag).toBe('TAKE_PROFIT_EARLY_LIVE_ENABLED');
+    expect(body.liveEnabled).toBe(false);
     expect(body.demoOnly).toBe(true);
     expect(body.liveCapitalReachable).toBe(false);
     expect(body.config.captureFrac).toBeCloseTo(0.6, 9);
+  });
+
+  // TRA-4759 — `demoOnly`/`liveCapitalReachable` were hardcoded `true`/`false`,
+  // so the route kept reporting "live options path unchanged" while bqb1 ran
+  // with TAKE_PROFIT_EARLY_LIVE_ENABLED=1 from 2026-09-20T13:47:23.779Z and the
+  // engine chose this exit on real money. The fields must be COMPUTED off the
+  // same resolver the live exit branch reads (process.env only, never the
+  // demo-flags overlay).
+  it('reports liveCapitalReachable: true (and demoOnly: false) when the LIVE flag is armed (TRA-4759)', () => {
+    const prev = process.env.TAKE_PROFIT_EARLY_LIVE_ENABLED;
+    process.env.TAKE_PROFIT_EARLY_LIVE_ENABLED = '1';
+    try {
+      const { app, routes } = fakeApp();
+      registerLiveHealthRoutes(app, {
+        requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+        userCtx: async () => ctx('admin', engineState()),
+        getSettings: () => settings(),
+        now: () => NOW,
+      });
+      const res = fakeRes();
+      routes.get('/api/health/take-profit-early')![0]!({}, res);
+      const body = res.body as {
+        liveEnabled: boolean;
+        demoOnly: boolean;
+        liveCapitalReachable: boolean;
+        note: string;
+      };
+      expect(body.liveEnabled).toBe(true);
+      expect(body.demoOnly).toBe(false);
+      expect(body.liveCapitalReachable).toBe(true);
+      expect(body.note).toContain('LIVE');
+    } finally {
+      if (prev === undefined) delete process.env.TAKE_PROFIT_EARLY_LIVE_ENABLED;
+      else process.env.TAKE_PROFIT_EARLY_LIVE_ENABLED = prev;
+    }
   });
 });
 
