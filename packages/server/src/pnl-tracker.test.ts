@@ -560,6 +560,58 @@ describe('TRA-3043 — openingEquityBasis is a POSITIVE marker, not a restated d
   });
 });
 
+// TRA-4796 — the demo cohort's openingEquityBasis read null for WHOLE sessions
+// (65/65 on 2026-09-11 / 09-14 / 09-21) while live and sandbox were populated.
+// Root cause: `advanceDayIfNeeded` is constructor-only, so on a session day with
+// ZERO process boots the 21:00 ET archive writes today's row while
+// `state.openingDate` still names the prior session — and `stampAnchorBasis`
+// refused on the bare date inequality, a guard written for back-fill rows. The
+// row WAS computed against the live anchor (`openingEquity` is read straight off
+// `getOpeningEquity()`), so the refusal withheld a provenance it actually knew.
+// Live/sandbox rows never showed it only because `shapeLiveRecordedRow` supplies
+// their basis at the caller. The fix stamps a LATER-dated row exactly when its
+// `openingEquity` matches the live anchor; every historical refusal stands.
+describe('TRA-4796 — a no-boot session row is stamped with the anchor provenance it was computed against', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'pnl-tracker-4796-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  const basisOf = (t: PnlTracker, date: string) =>
+    t.getSnapshots().find(s => s.date === date)?.openingEquityBasis;
+
+  it('the 21:00 ET row of a day the process never booted into is stamped, not refused', () => {
+    const t = new PnlTracker(dir, 25_000);
+    // Prior session closes; `saveSnapshot` sets the anchor (25,073.05) and
+    // `openingDate` to that session. NO reboot follows, so no roll ever
+    // re-stamps `openingDate` before the next session's archive fires.
+    t.saveSnapshot(snap('2020-01-06', 25_000, 25_073.05));
+    // The next session's archive row, computed against the live anchor — the
+    // exact write that read null on 2026-09-11 / 09-14 / 09-21.
+    t.saveSnapshot(snap('2020-01-07', 25_073.05, 25_090));
+    expect(basisOf(t, '2020-01-07')).toBe('prior-session-close');
+    // Durable — the health route reads this off a file, not off memory.
+    expect(basisOf(new PnlTracker(dir, 25_000), '2020-01-07')).toBe('prior-session-close');
+  });
+
+  it('CONTROL — a later-dated row NOT computed against the live anchor stays absent', () => {
+    const t = new PnlTracker(dir, 25_000);
+    t.saveSnapshot(snap('2020-01-06', 25_000, 25_073.05));
+    // A repair writing a forward-dated row against some other anchor: the date
+    // alone no longer refuses it, so the anchor equality must.
+    t.saveSnapshot(snap('2020-01-07', 24_000, 24_100));
+    expect(basisOf(t, '2020-01-07')).toBeUndefined();
+  });
+
+  it('CONTROL — a past-dated row is still refused (the back-fill guard is intact)', () => {
+    const t = new PnlTracker(dir, 25_000);
+    t.saveSnapshot(snap('2020-01-06', 25_000, 25_073.05));
+    // Reaching into history, even with an openingEquity that happens to equal
+    // the live anchor: the stamp must not fabricate an audit trail.
+    t.saveSnapshot(snap('2020-01-03', 25_073.05, 25_100));
+    expect(basisOf(t, '2020-01-03')).toBeUndefined();
+  });
+});
+
 // TRA-3043 — THE ATTESTATION, and the live incident that forced it.
 //
 // `advanceDayIfNeeded` is constructor-only, so exactly ONE process per ET day

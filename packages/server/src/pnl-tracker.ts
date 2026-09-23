@@ -145,8 +145,13 @@ export interface DailySnapshot {
    *    for the 2026-08-06 case that forced that distinction.
    *  - `prior-session-close` — the anchor was last written by `saveSnapshot` and
    *    no day roll has re-declared it since. On a row dated AFTER the session
-   *    that set it, this means the roll for this session was performed by a
-   *    build that does not write provenance, i.e. a PRE-fix build.
+   *    that set it, this means no fixed roll re-declared the anchor for this
+   *    session — either a PRE-fix build performed the roll, or (TRA-4796) NO
+   *    roll ran at all: `advanceDayIfNeeded` is constructor-only, so a session
+   *    day with zero process boots reaches the 21:00 ET write with the anchor
+   *    still exactly as `saveSnapshot` left it. In both readings nothing
+   *    VERIFIED the anchor; in the no-boot case it nonetheless telescopes by
+   *    construction, which is why the stamp is honest rather than a pass.
    *  - `day-roll-state-equity` — the lossy branch ran: no closed session to
    *    anchor on, so the anchor came from `state.equity` (TRA-241).
    *  - `rebase` — `syncOpeningEquity` deliberately moved the anchor off the
@@ -782,12 +787,25 @@ export class PnlTracker {
    *
    * TWO refusals, both of which produce an honest ABSENT rather than a guess:
    *
-   *  1. `snapshot.date !== state.openingDate` — this row is not the session the
-   *     live anchor governs. That is an EOD BACK-FILL row (`rowSource:
+   *  1. The row is not governed by the live anchor. A row dated BEFORE
+   *     `state.openingDate` is an EOD BACK-FILL row (`rowSource:
    *     'backfill-TRA-2827'`) or a hand repair reaching into history, and the
    *     current in-memory provenance says nothing about the anchor that was in
    *     force on that past day. Attributing it would be a fabricated audit
-   *     trail, and worse than none.
+   *     trail, and worse than none. A row dated AFTER `state.openingDate` is
+   *     governed by the live anchor exactly when it was COMPUTED against it —
+   *     TRA-4796: `advanceDayIfNeeded` is constructor-only, so on a session day
+   *     with zero process boots the 21:00 ET archive writes today's row while
+   *     `openingDate` still names the prior session. That row's
+   *     `openingEquity` IS `state.openingEquity` (the writer reads
+   *     `getOpeningEquity()`), so the equality — inside the same
+   *     `ANCHOR_MATCH_EPSILON_USD` the anchor-preservation comparison uses —
+   *     is the proof the provenance travels truthfully, not by caller
+   *     identity. Before TRA-4796 this case was refused on a bare date
+   *     inequality, which silently left the WHOLE demo cohort's basis NOT
+   *     MEASURED on every no-boot session (65/65 null on 2026-09-11 / 09-14 /
+   *     09-21) and made TRA-2636 item 2 vacuously green; live/sandbox rows
+   *     were immune only because `shapeLiveRecordedRow` supplies their basis.
    *  2. The state carries no basis at all — every state file written before
    *     TRA-3039. Absent stays absent.
    *
@@ -799,7 +817,15 @@ export class PnlTracker {
     if (snapshot.openingEquityBasis !== undefined) return snapshot;
     const basis = this.state.openingEquityBasis;
     if (typeof basis !== 'string' || basis === '') return snapshot;
-    if (snapshot.date !== this.state.openingDate) return snapshot;
+    if (snapshot.date !== this.state.openingDate) {
+      const governedByLiveAnchor =
+        snapshot.date > this.state.openingDate
+        && typeof snapshot.openingEquity === 'number'
+        && Number.isFinite(snapshot.openingEquity)
+        && Number.isFinite(this.state.openingEquity)
+        && Math.abs(snapshot.openingEquity - this.state.openingEquity) <= ANCHOR_MATCH_EPSILON_USD;
+      if (!governedByLiveAnchor) return snapshot;
+    }
     // Spread, never a field-by-field rebuild: this method must stay transparent
     // to fields added to `DailySnapshot` after it was written.
     return { ...snapshot, openingEquityBasis: basis };
