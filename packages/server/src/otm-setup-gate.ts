@@ -1,6 +1,7 @@
 import {
   evaluateSetupTaxonomy,
   SETUP_DEFINITIONS,
+  SETUP_TAXONOMY_REASON_CODES,
   type SetupTaxonomyDefinition,
   type SetupTaxonomyInput,
   type SetupTaxonomyReasonCode,
@@ -336,4 +337,130 @@ export function setupTaxonomyHealth(
     setupsUnknown: s.unknownIds,
     setupsRegistered: registry.map((d) => d.setupId),
   };
+}
+
+// ─── TRA-4423 — the observe-mode counterfactual fold ─────────────────────────
+
+/**
+ * TRA-4423 (parent TRA-4421 §10 item 1) — THE `wouldBlockByReasonCode` FOLD.
+ *
+ * ⛔ WHY THIS EXISTS. In `observe` the ledger's `byReason` histogram is EMPTY BY
+ * CONSTRUCTION — `recordLiveEnforceDecision` retains `reasonCode` on BLOCKS
+ * only, and an observe gate never blocks — so `/api/health/otm-sleeve-mandate`
+ * read IDENTICALLY whether the enabled setups would have refused every nominee
+ * or none of them. The counterfactual lived only on the per-verdict
+ * `TRA-4422, observe-safe` log line, i.e. in Render's rotating logs and nowhere
+ * durable. A restriction whose observe-mode effect is invisible on every
+ * durable surface is the house recurring bug, and the enforce proposal (board
+ * card `70e36987`) is supposed to be argued FROM this histogram.
+ *
+ * SCOPE: LIVE book only. The single caller of {@link noteOtmSetupGateCounterfactual}
+ * sits inside the engine's `if (this.mode === 'live')` branch beside the ledger
+ * write, so `evaluated` here mirrors `setup_confirmation.evaluated` over rows
+ * THIS process wrote.
+ *
+ * ⛔ SINCE-BOOT AND IN-MEMORY, deliberately NOT hydrated from disk. The
+ * ledger's ET-day folds DO hydrate across a deploy, and that produced the
+ * false-accusation incident `crossCheck` exists to disarm (2026-09-09, the
+ * 21:08:11Z swap). This fold starts at zero on every boot and says when
+ * (`since`); a reader must treat `evaluated: 0` as UNMEASURED — never as
+ * "nothing would have been refused" — exactly as the route's `unmeasured`
+ * status does one level up.
+ */
+export interface OtmSetupGateCounterfactual {
+  /** Live-book nominees folded since `since`. The denominator. */
+  readonly evaluated: number;
+  /** Verdicts where a setup confirmed the nominee's own side. */
+  readonly confirmed: number;
+  /** Verdicts an ENFORCING gate would have refused (`!confirmed`). */
+  readonly wouldBlock: number;
+  /**
+   * The would-be refusals folded on their low-cardinality code. DENSE over the
+   * whole vocabulary: a `0` is "this code occurred zero times since `since`",
+   * which an ABSENT key cannot say (absent ≠ 0 — the reader cannot tell a
+   * quiet code from a code this build does not know).
+   */
+  readonly wouldBlockByReasonCode: Readonly<Record<SetupTaxonomyReasonCode, number>>;
+  /** Confirms attributed to the setup that fired. Dense over the registry. */
+  readonly confirmedBySetup: Readonly<Record<string, number>>;
+  /** Side conflicts attributed to the setup that fired on the wrong wing. */
+  readonly conflictBySetup: Readonly<Record<string, number>>;
+  /** Epoch ms this fold started counting: module load, or the last test reset. */
+  readonly since: number;
+}
+
+function zeroByReasonCode(): Record<SetupTaxonomyReasonCode, number> {
+  const out = {} as Record<SetupTaxonomyReasonCode, number>;
+  for (const code of SETUP_TAXONOMY_REASON_CODES) out[code] = 0;
+  return out;
+}
+
+let cfEvaluated = 0;
+let cfConfirmed = 0;
+let cfWouldBlock = 0;
+let cfByReasonCode = zeroByReasonCode();
+let cfConfirmedBySetup = new Map<string, number>();
+let cfConflictBySetup = new Map<string, number>();
+let cfSince = Date.now();
+
+/**
+ * Fold one live-book decision.
+ *
+ * ⛔ CALLED UNCONDITIONALLY beside the ledger write, on admits and would-be
+ * refusals alike. Counting only refusals would collapse `evaluated` into
+ * `wouldBlock` and delete the denominator — the exact defect the sibling
+ * recorder's own control ("records on BOTH verdicts") exists to forbid.
+ */
+export function noteOtmSetupGateCounterfactual(decision: OtmSetupGateDecision): void {
+  cfEvaluated += 1;
+  const v = decision.verdict;
+  if (v.confirmed) {
+    cfConfirmed += 1;
+    if (v.setupId) cfConfirmedBySetup.set(v.setupId, (cfConfirmedBySetup.get(v.setupId) ?? 0) + 1);
+    return;
+  }
+  cfWouldBlock += 1;
+  // `reasonCode` is non-null on every unconfirmed verdict by construction; the
+  // fallback keeps the fold total (evaluated === confirmed + Σ buckets) even if
+  // that invariant ever breaks, rather than silently dropping the row.
+  const code = v.reasonCode ?? SETUP_TAXONOMY_DEFAULT_REFUSAL_CODE;
+  cfByReasonCode[code] += 1;
+  if (code === 'setup_side_conflict' && v.setupId) {
+    cfConflictBySetup.set(v.setupId, (cfConflictBySetup.get(v.setupId) ?? 0) + 1);
+  }
+}
+
+/** Snapshot for the health route. Dense over vocabulary AND registry. */
+export function readOtmSetupGateCounterfactual(
+  registry: readonly SetupTaxonomyDefinition[] = SETUP_DEFINITIONS,
+): OtmSetupGateCounterfactual {
+  const confirmedBySetup: Record<string, number> = {};
+  const conflictBySetup: Record<string, number> = {};
+  for (const d of registry) {
+    confirmedBySetup[d.setupId] = cfConfirmedBySetup.get(d.setupId) ?? 0;
+    conflictBySetup[d.setupId] = cfConflictBySetup.get(d.setupId) ?? 0;
+  }
+  // A setup removed from the registry mid-process keeps its counts visible
+  // rather than silently vanishing from a fold that claims to be cumulative.
+  for (const [id, n] of cfConfirmedBySetup) if (!(id in confirmedBySetup)) confirmedBySetup[id] = n;
+  for (const [id, n] of cfConflictBySetup) if (!(id in conflictBySetup)) conflictBySetup[id] = n;
+  return {
+    evaluated: cfEvaluated,
+    confirmed: cfConfirmed,
+    wouldBlock: cfWouldBlock,
+    wouldBlockByReasonCode: { ...cfByReasonCode },
+    confirmedBySetup,
+    conflictBySetup,
+    since: cfSince,
+  };
+}
+
+export function resetOtmSetupGateCounterfactualForTest(): void {
+  cfEvaluated = 0;
+  cfConfirmed = 0;
+  cfWouldBlock = 0;
+  cfByReasonCode = zeroByReasonCode();
+  cfConfirmedBySetup = new Map();
+  cfConflictBySetup = new Map();
+  cfSince = Date.now();
 }

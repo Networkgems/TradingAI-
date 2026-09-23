@@ -223,6 +223,10 @@ import {
 // default is never the answer to "what is the box doing".
 import {
   setupTaxonomyHealth,
+  // TRA-4423 — the observe-mode counterfactual fold (would-block by reason
+  // code, live book, since boot). The ledger's own histogram cannot carry it:
+  // it retains reason codes on BLOCKS only, and observe never blocks.
+  readOtmSetupGateCounterfactual,
   SETUP_CONFIRMATION_GATE,
   SETUP_CONFIRMATION_SIBLING_GATE,
   SETUP_CONFIRMATION_EXPECT_ROWS_AFTER_OPEN_MS,
@@ -6410,6 +6414,45 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
             byReasonCode: denseByReasonCode(today?.byReason),
             blockedUnclassified: today?.blockedUnclassified ?? 0,
           },
+          /**
+           * TRA-4423 — the observe-mode counterfactual, on a DURABLE surface.
+           * `byReasonCode` above folds BLOCKS, which in observe is zero by
+           * construction — so without this block the route reads identically
+           * whether the enabled setups would refuse every open or none of
+           * them, and the enforce proposal (card `70e36987`) has nothing to be
+           * argued from except rotating logs.
+           */
+          observeCounterfactual: (() => {
+            const cf = readOtmSetupGateCounterfactual();
+            return {
+              issue: 'TRA-4423',
+              scope: 'live book only, since boot — in-memory, NOT hydrated across deploys '
+                + '(unlike the ET-day folds above), so a fresh boot legitimately reads zero '
+                + 'here beside a non-zero hydrated `today`',
+              since: new Date(cf.since).toISOString(),
+              evaluated: cf.evaluated,
+              confirmed: cf.confirmed,
+              wouldBlock: cf.wouldBlock,
+              /** null (never 0) at evaluated 0 — 0/0 is not a rate. */
+              wouldBlockRate: cf.evaluated > 0 ? cf.wouldBlock / cf.evaluated : null,
+              /** Dense over the vocabulary: a 0 is a real "never occurred since boot". */
+              wouldBlockByReasonCode: cf.wouldBlockByReasonCode,
+              /** Which setup admitted / conflicted. Dense over the registry. */
+              confirmedBySetup: cf.confirmedBySetup,
+              conflictBySetup: cf.conflictBySetup,
+              note: cf.evaluated === 0
+                ? 'UNMEASURED — zero verdicts folded since this process booted. NOT a pass and '
+                  + 'NOT a quiet market; read `crossCheck.scanWindow` above for whether the box '
+                  + 'has had in-window time to record at all.'
+                : 'What an ENFORCING gate would have refused, folded by reason code over the '
+                  + 'live book since `since`. `wouldBlockRate` near 1.0 with `setupsEnabled` '
+                  + 'non-empty means the enabled setups would refuse nearly every open this '
+                  + 'sleeve places; near 0.0 means they change little. ⛔ Grade the enforce '
+                  + 'flip on the ADMIT-SET COUNTERFACTUAL (what did the trades E would have '
+                  + 'blocked go on to do), never on a standalone breakout backtest — TRA-816 '
+                  + 'already answered that different question No.',
+            };
+          })(),
           crossCheck,
           note:
             status === 'unmeasured'
@@ -6441,8 +6484,8 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
               : health.mode === 'observe'
                 ? 'OBSERVE — the gate scores every nominee and REFUSES NOTHING, so `blocked: 0` here is a '
                   + 'property of the mode and says nothing about the taxonomy. The counterfactual '
-                  + '("what would this have refused") is on the `TRA-4422, observe-safe` log line as '
-                  + '`wouldBlock`, with `setupsScored` beside it. ⛔ READ `setupsRegistered` BEFORE '
+                  + '("what would this have refused") is `observeCounterfactual` above (TRA-4423), '
+                  + 'with the per-verdict `TRA-4422, observe-safe` log line beside it. ⛔ READ `setupsRegistered` BEFORE '
                   + '`no_setup_matched`: an EMPTY list means nothing was ever scored, so every row is '
                   + 'UNMEASURED at `setupsScored: 0` and NOT "the taxonomy looked and found nothing". '
                   + 'Since TRA-4423 A-E are implemented, so a NON-EMPTY list makes `no_setup_matched` a '

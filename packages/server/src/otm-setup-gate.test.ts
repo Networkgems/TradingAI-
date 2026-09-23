@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,6 +10,10 @@ import {
   evaluateOtmSetupGate,
   setupTaxonomyHealth,
   scanWindowOpenMsSince,
+  // TRA-4423 — the observe counterfactual fold.
+  noteOtmSetupGateCounterfactual,
+  readOtmSetupGateCounterfactual,
+  resetOtmSetupGateCounterfactualForTest,
   SETUP_CONFIRMATION_EXPECT_ROWS_AFTER_OPEN_MS,
   SETUP_CONFIRMATION_SCAN_WINDOW_MAX_LOOKBACK_MS,
   OTM_SETUP_TAXONOMY_MODE_DEFAULT,
@@ -164,6 +168,115 @@ describe('health readout', () => {
     expect(h.setupsUnknown).toEqual(['Z']);
     // Registered ≠ enabled. The deployed-bytes read is its own field.
     expect(h.setupsRegistered).toEqual(['E']);
+  });
+});
+
+// ─── TRA-4423 — the observe counterfactual fold ──────────────────────────────
+// In observe the ledger's `byReason` is empty BY CONSTRUCTION (codes are
+// retained on blocks only), so before this fold the health route read
+// identically whether the enabled setups would refuse every nominee or none.
+describe('TRA-4423 — wouldBlockByReasonCode fold', () => {
+  beforeEach(() => resetOtmSetupGateCounterfactualForTest());
+  afterEach(() => resetOtmSetupGateCounterfactualForTest());
+
+  const input = { symbol: 'AAPL', series: series(120), nomineeSide: 'call' as const };
+  const env = { OTM_SETUP_TAXONOMY_SETUPS: 'E' };
+  const never: SetupTaxonomyDefinition = {
+    setupId: 'E', label: 'never matches', minBars: 10, evaluate: () => null,
+  };
+
+  it('starts dense at zero — every vocabulary code and every registry id present', () => {
+    const cf = readOtmSetupGateCounterfactual([setupE('call')]);
+    expect(cf.evaluated).toBe(0);
+    expect(cf.confirmed).toBe(0);
+    expect(cf.wouldBlock).toBe(0);
+    // ⛔ ABSENT ≠ 0. A missing key cannot say "occurred zero times"; asserted
+    // against the shipped vocabulary symbol, not a retyped list.
+    expect(Object.keys(cf.wouldBlockByReasonCode).sort())
+      .toEqual(['awaiting_confirmation', 'confirmation_expired', 'no_setup_matched',
+        'series_unreadable', 'setup_side_conflict']);
+    expect(cf.confirmedBySetup).toEqual({ E: 0 });
+    expect(cf.conflictBySetup).toEqual({ E: 0 });
+    expect(cf.since).toBeGreaterThan(0);
+  });
+
+  it('a CONFIRM lands in confirmed + confirmedBySetup and in NO would-block bucket', () => {
+    noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(input, env, [setupE('call')]));
+    const cf = readOtmSetupGateCounterfactual([setupE('call')]);
+    expect(cf).toMatchObject({ evaluated: 1, confirmed: 1, wouldBlock: 0 });
+    expect(cf.confirmedBySetup).toEqual({ E: 1 });
+    expect(Object.values(cf.wouldBlockByReasonCode).every((n) => n === 0)).toBe(true);
+  });
+
+  it('each refusal shape lands in EXACTLY its own bucket', () => {
+    // side conflict — attributed to the setup that fired on the wrong wing
+    noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(input, env, [setupE('put')]));
+    // real negative — enabled setup ran and matched nothing
+    noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(input, env, [never]));
+    // unreadable — the gate never ran; must NOT launder into no_setup_matched
+    noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(
+      { ...input, series: [] }, env, [setupE('put')],
+    ));
+    const cf = readOtmSetupGateCounterfactual([setupE('call')]);
+    expect(cf).toMatchObject({ evaluated: 3, confirmed: 0, wouldBlock: 3 });
+    expect(cf.wouldBlockByReasonCode).toMatchObject({
+      setup_side_conflict: 1,
+      no_setup_matched: 1,
+      series_unreadable: 1,
+      awaiting_confirmation: 0,
+      confirmation_expired: 0,
+    });
+    expect(cf.conflictBySetup).toEqual({ E: 1 });
+    expect(cf.confirmedBySetup).toEqual({ E: 0 });
+  });
+
+  it('⛔ the denominator survives: evaluated === confirmed + Σ buckets, on a mixed tape', () => {
+    // Counting only refusals would collapse `evaluated` into `wouldBlock` and
+    // the fold would once again read alike in pass and fail.
+    for (const reg of [[setupE('call')], [setupE('put')], [never], [setupE('call')]]) {
+      noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(input, env, reg));
+    }
+    const cf = readOtmSetupGateCounterfactual([setupE('call')]);
+    expect(cf.evaluated).toBe(4);
+    expect(cf.confirmed).toBe(2);
+    expect(cf.wouldBlock).toBe(2);
+    const sum = Object.values(cf.wouldBlockByReasonCode).reduce((s, n) => s + n, 0);
+    expect(cf.confirmed + sum).toBe(cf.evaluated);
+  });
+
+  it('a setup id no longer in the registry keeps its counts visible', () => {
+    noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(input, env, [setupE('call')]));
+    // Read with a registry that no longer contains E: the count must not vanish
+    // from a fold that claims to be cumulative since boot.
+    const cf = readOtmSetupGateCounterfactual([]);
+    expect(cf.confirmedBySetup).toEqual({ E: 1 });
+  });
+});
+
+// The fold is only an instrument if the engine actually feeds it. Symbols, not
+// line numbers; and per the house rule the slice BETWEEN the anchors is graded,
+// because a guard inserted between them is invisible to an order-only regex.
+describe('TRA-4423 — the fold is WIRED into the live recorder branch', () => {
+  const HERE = dirname(fileURLToPath(import.meta.url));
+  const SRC = readFileSync(join(HERE, 'signal-engine.ts'), 'utf8').replace(/\r\n/g, '\n');
+
+  it('called unconditionally between the ledger write and the log line', () => {
+    const at = SRC.indexOf('private otmSetupTaxonomyDecision(');
+    const body = SRC.slice(at, SRC.indexOf('\n  }\n', at));
+    const anchor = "if (this.mode === 'live') {";
+    const live = body.slice(body.indexOf(anchor));
+    const record = live.indexOf('recordLiveEnforceDecision(');
+    const note = live.indexOf('noteOtmSetupGateCounterfactual(decision);');
+    const logLine = live.indexOf("log.info('OTM setup taxonomy verdict");
+    // ordered: ledger write → fold → log line, all inside the live branch
+    expect(record).toBeGreaterThan(-1);
+    expect(note).toBeGreaterThan(record);
+    expect(logLine).toBeGreaterThan(note);
+    // ⛔ and NOTHING conditional between the ledger write's end and the fold —
+    // a guard here would count a subset and silently skew the histogram.
+    const betweenEnd = live.slice(live.indexOf('\n      );', record), note);
+    expect(betweenEnd).not.toMatch(/\bif \(/);
+    expect(betweenEnd).not.toMatch(/\breturn\b/);
   });
 });
 

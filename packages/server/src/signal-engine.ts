@@ -251,6 +251,10 @@ import {
 // behaviour. It exists to give the first real setup a denominator.
 import {
   evaluateOtmSetupGate,
+  // TRA-4423 — the observe-mode counterfactual fold: what an enforcing gate
+  // WOULD have refused, folded by reason code on a durable surface instead of
+  // living only in rotating logs.
+  noteOtmSetupGateCounterfactual,
   SETUP_TAXONOMY_DEFAULT_REFUSAL_CODE,
   type OtmSetupGateDecision,
 } from './otm-setup-gate.js';
@@ -9016,18 +9020,23 @@ export class SignalEngine {
           // ⛔ THE REASON CODE IS STAMPED ON BOTH VERDICTS' WORTH OF
           // INFORMATION, but the ledger only retains `reasonCode` on BLOCKS
           // (see `recordLiveEnforceDecision`). In observe nothing blocks, so
-          // `byReason` is empty by construction and the histogram the enforce
-          // decision needs comes off the structured log line below plus
-          // `evaluated`. That asymmetry is the ledger's, not this gate's, and
-          // it is why the observe verdict is ALSO logged with its code.
+          // `byReason` is empty by construction. That asymmetry is the
+          // ledger's, not this gate's — the observe histogram the enforce
+          // decision needs is the TRA-4423 fold below, with the per-verdict
+          // log line beside it.
           reasonCode: decision.blocked ? (decision.reasonCode ?? undefined) : undefined,
           book: this.alertUsername ?? null,
           nominator: nominator ?? null,
         },
       );
-      // The observe-mode counterfactual, at info level with a low-cardinality
-      // code. `wouldBlock` is the field the enforce proposal is argued from:
-      // it says what this gate WOULD have refused while refusing nothing.
+      // TRA-4423 — the DURABLE-surface counterfactual. Published as
+      // `setupTaxonomy.observeCounterfactual` on /api/health/otm-sleeve-mandate;
+      // without it the route reads identically whether the enabled setups
+      // would refuse every open or none of them.
+      noteOtmSetupGateCounterfactual(decision);
+      // The same verdict per-row, at info level with a low-cardinality code.
+      // `wouldBlock` is what the fold above accumulates: it says what this
+      // gate WOULD have refused while refusing nothing.
       log.info('OTM setup taxonomy verdict (TRA-4422, observe-safe)', {
         sym,
         mode: decision.mode,

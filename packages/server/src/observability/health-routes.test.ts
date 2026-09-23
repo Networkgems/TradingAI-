@@ -56,6 +56,10 @@ import {
   SETUP_CONFIRMATION_EXPECT_ROWS_AFTER_OPEN_MS,
   OTM_SETUP_TAXONOMY_MODE_ENV,
   OTM_SETUP_TAXONOMY_SETUPS_ENV,
+  // TRA-4423 — the observe counterfactual fold behind `observeCounterfactual`.
+  evaluateOtmSetupGate,
+  noteOtmSetupGateCounterfactual,
+  resetOtmSetupGateCounterfactualForTest,
 } from '../otm-setup-gate.js';
 import { SETUP_TAXONOMY_REASON_CODES } from '@trading-app/engine';
 import type { OptionTradeJournalRecord, OptionTradeJournalOpen } from '../option-trade-journal.js';
@@ -6477,6 +6481,20 @@ describe('GET /api/health/otm-sleeve-mandate — setupTaxonomy (TRA-4422)', () =
     byReasonCode: ReasonRow[];
     blockedUnclassified: number;
     today: { evaluated: number; blocked: number; byReasonCode: ReasonRow[] };
+    // TRA-4423 — the observe counterfactual on a DURABLE surface.
+    observeCounterfactual: {
+      issue: string;
+      scope: string;
+      since: string;
+      evaluated: number;
+      confirmed: number;
+      wouldBlock: number;
+      wouldBlockRate: number | null;
+      wouldBlockByReasonCode: Record<string, number>;
+      confirmedBySetup: Record<string, number>;
+      conflictBySetup: Record<string, number>;
+      note: string;
+    };
     crossCheck: {
       sibling: string;
       siblingEvaluatedToday: number;
@@ -6524,6 +6542,59 @@ describe('GET /api/health/otm-sleeve-mandate — setupTaxonomy (TRA-4422)', () =
       blocked ? { reasonCode } : {},
     );
   }
+
+  // ── TRA-4423 — `observeCounterfactual`: the fold the enforce flip is argued
+  // from. The ledger's `byReasonCode` above folds BLOCKS, which in observe is
+  // zero BY CONSTRUCTION — without this block the route reads identically
+  // whether the enabled setups would refuse every open or none of them.
+  it('TRA-4423 — publishes observeCounterfactual DENSE over the vocabulary, UNMEASURED at zero', () => {
+    resetOtmSetupGateCounterfactualForTest();
+    const cf = taxonomy().observeCounterfactual;
+    expect(cf.evaluated).toBe(0);
+    expect(cf.wouldBlock).toBe(0);
+    // null, never 0 — 0/0 is not a rate, and a manufactured 0.0 would read as
+    // "measured: the setups refuse nothing".
+    expect(cf.wouldBlockRate).toBeNull();
+    expect(cf.note).toMatch(/UNMEASURED/);
+    // Dense over the WHOLE vocabulary, asserted against the shipped symbol —
+    // an absent key is unreadable (quiet code vs unknown code), a 0 is a fact.
+    expect(Object.keys(cf.wouldBlockByReasonCode).sort())
+      .toEqual([...SETUP_TAXONOMY_REASON_CODES].sort());
+    for (const code of SETUP_TAXONOMY_REASON_CODES) {
+      expect(cf.wouldBlockByReasonCode[code]).toBe(0);
+    }
+    // Dense over the registry too: "E confirmed zero times" is a real zero.
+    expect(cf.confirmedBySetup).toHaveProperty('E', 0);
+    expect(cf.conflictBySetup).toHaveProperty('E', 0);
+  });
+
+  it('⛔ TRA-4423 NEGATIVE CONTROL — a folded would-block moves the ROUTE field off zero', () => {
+    // If this field cannot move, the route reads identically in pass and fail
+    // and the fold is not an instrument. Fold one real side-conflict decision
+    // through the same function the engine call site uses, then read the route.
+    resetOtmSetupGateCounterfactualForTest();
+    const DAY = 24 * 60 * 60 * 1000;
+    const series = Array.from({ length: 120 }, (_, i) => ({
+      symbol: 'AAPL',
+      timestamp: 1_700_000_000_000 + i * DAY,
+      open: 100, high: 101, low: 99, close: 100.5, volume: 1_000,
+    }));
+    const decision = evaluateOtmSetupGate(
+      { symbol: 'AAPL', series, nomineeSide: 'call' },
+      { OTM_SETUP_TAXONOMY_SETUPS: 'E' },
+      [{ setupId: 'E', label: 'stub', minBars: 10, evaluate: () => ({ setupId: 'E', side: 'put' }) }],
+    );
+    expect(decision.blocked).toBe(false); // observe refuses nothing...
+    noteOtmSetupGateCounterfactual(decision);
+    const cf = taxonomy().observeCounterfactual;
+    expect(cf.evaluated).toBe(1);
+    expect(cf.wouldBlock).toBe(1); // ...and the counterfactual still shows.
+    expect(cf.wouldBlockRate).toBe(1);
+    expect(cf.wouldBlockByReasonCode['setup_side_conflict']).toBe(1);
+    expect(cf.wouldBlockByReasonCode['no_setup_matched']).toBe(0);
+    expect(cf.conflictBySetup).toHaveProperty('E', 1);
+    resetOtmSetupGateCounterfactualForTest();
+  });
 
   // ⛔ THE CENTRAL ACCEPTANCE. `evaluated: 0` is a gate that NEVER RAN, which is
   // not a gate that never bit. If those two render alike the instrument is
