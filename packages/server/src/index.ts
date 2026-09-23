@@ -6326,6 +6326,26 @@ registerLiveHealthRoutes(app, {
     }
     return held;
   },
+  // TRA-4505 — the fleet's open rows for the engine-act-on-adopted-rows census.
+  // ⚠ WHOLE FLEET, BOTH MODES, no mode filter: the census partitions on
+  // `importedFromTradier` + `tradierEnv`, never `mode` (TRA-3112 item 3 — an
+  // imported row's `mode` is stamped 'live' unconditionally, so a mode filter
+  // here would decide the denominator invisibly to every unit test). Only the
+  // four fields `engineMayActOnAdoptedRow` reads leave this module.
+  adoptedHandoverRows: () => {
+    const rows = [];
+    for (const ctx of getAllUserContexts()) {
+      for (const opt of ctx.engine.getState().options.openOptions ?? []) {
+        rows.push({
+          importedFromTradier: opt.importedFromTradier,
+          adoptionAuthority: opt.adoptionAuthority,
+          tradierEnv: opt.tradierEnv,
+          engineHandover: opt.engineHandover,
+        });
+      }
+    }
+    return rows;
+  },
 });
 
 // TRA-3879 — WIRE THE FLEET READ. `φ_eff = min(φ, A / Σ E_i)` is what makes

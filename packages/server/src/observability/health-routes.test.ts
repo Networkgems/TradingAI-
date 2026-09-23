@@ -6789,6 +6789,88 @@ describe('GET /api/health/otm-sleeve-mandate — setupTaxonomy (TRA-4422)', () =
   });
 });
 
+// ─── TRA-4505 — the engine-act-on-adopted-rows arm, on a plain GET ────────────
+// AC1: no auth, no POST, no fabricated id — the arm state is a key on the
+// fee-slippage route. The serializer's own classification arms live in
+// tra4505-adopted-arm-health.test.ts; these grade the WIRING: the key exists on
+// the payload, `armed` follows the same env read as the decision path, and an
+// unwired row provider serves null rather than an empty census.
+describe('GET /api/health/live-options-fee-slippage — engineActionOnAdoptedRows (TRA-4505)', () => {
+  const ARM_VAR = 'ENABLE_ENGINE_ACT_ON_ADOPTED_BROKER_OPTIONS';
+  let savedArm: string | undefined;
+
+  beforeEach(() => { savedArm = process.env[ARM_VAR]; delete process.env[ARM_VAR]; });
+  afterEach(() => {
+    if (savedArm === undefined) delete process.env[ARM_VAR];
+    else process.env[ARM_VAR] = savedArm;
+  });
+
+  function serveAdoptedArm(adoptedHandoverRows?: () => Array<{
+    importedFromTradier?: boolean; adoptionAuthority?: string; tradierEnv?: string;
+    engineHandover?: { grantedAt?: unknown; grantedBy?: unknown } | null;
+  }>) {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => undefined) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+      ...(adoptedHandoverRows ? { adoptedHandoverRows } : {}),
+    });
+    const res = fakeRes();
+    routes.get('/api/health/live-options-fee-slippage')![0]!({}, res);
+    return (res.body as {
+      engineActionOnAdoptedRows: {
+        envVar: string; armed: boolean; source: string; rawEnvValue: string | null;
+        compiledDefault: boolean; handoverSurface: string;
+        rows: {
+          importedRows: number; exemptRows: number; grantedRows: number;
+          adoptedRowsAwaitingHandover: number;
+        } | null;
+      };
+    }).engineActionOnAdoptedRows;
+  }
+
+  it('serves the arm on the plain GET, disarmed/compiled_default with the env unset', () => {
+    const block = serveAdoptedArm();
+    expect(block.envVar).toBe(ARM_VAR);
+    expect(block.armed).toBe(false);
+    expect(block.source).toBe('compiled_default');
+    expect(block.compiledDefault).toBe(false);
+    expect(block.handoverSurface).toBe('disarmed');
+    // No provider wired in this harness ⇒ "cannot say", never an empty census.
+    expect(block.rows).toBeNull();
+  });
+
+  it('follows the process env the decision path reads — armed/env/live on the bqb1 posture', () => {
+    process.env[ARM_VAR] = 'true';
+    const block = serveAdoptedArm();
+    expect(block.armed).toBe(true);
+    expect(block.source).toBe('env');
+    expect(block.rawEnvValue).toBe('true');
+    expect(block.handoverSurface).toBe('live');
+  });
+
+  it('serves the fleet census off the wired provider, non-zero counters included', () => {
+    process.env[ARM_VAR] = 'true';
+    const block = serveAdoptedArm(() => [
+      { importedFromTradier: true, tradierEnv: 'production', adoptionAuthority: 'foreign' },
+      {
+        importedFromTradier: true, tradierEnv: 'production', adoptionAuthority: 'foreign',
+        engineHandover: { grantedAt: '2026-09-01T14:00:00.000Z', grantedBy: 'admin' },
+      },
+      { importedFromTradier: true, tradierEnv: 'production', adoptionAuthority: 'desk_add' },
+      { importedFromTradier: false },
+    ]);
+    expect(block.rows).toEqual({
+      importedRows: 3,
+      exemptRows: 1,
+      grantedRows: 1,
+      adoptedRowsAwaitingHandover: 1,
+    });
+  });
+});
+
 // ─── TRA-3445 — the AGGREGATE live-OTM cap, on the read side ──────────────────
 // The board authorized "1 contract/name, max $150/entry, max $750 TOTAL". The
 // first two clauses were already published here; the third was neither enforced

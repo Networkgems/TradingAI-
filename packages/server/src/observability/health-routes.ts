@@ -102,6 +102,10 @@ import { getLiveOptionsFeeReconcileState } from '../live-options-fee-reconcile.j
 import { getZombieOpenSweepState } from '../zombie-open-journal-sweep.js'; // TRA-3547
 import { getExpiredDemoOrphanSweepState } from '../expired-demo-orphan-sweep.js'; // TRA-4711
 import { getOpenBasisRegradeState } from '../tra4453-open-basis-regrade.js'; // TRA-4453
+import {
+  summarizeEngineActionOnAdoptedRows, // TRA-4505
+  type AdoptedHandoverCensusRow,
+} from '../tra4505-adopted-arm-health.js';
 import { getCloseBasisSweepState } from '../tra3730-close-basis-sweep.js'; // TRA-3730
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
 import { summarizeTermStructureShadow } from '../term-structure-shadow.js'; // TRA-4413 item 4
@@ -589,6 +593,19 @@ export interface LiveHealthDeps {
    * unwired state read as healthy would be the defect it is looking for.
    */
   liveOpenOptionSymbols?: () => string[];
+  /**
+   * TRA-4505 (parent TRA-4206) — every open option row the fleet holds, narrowed
+   * to the four fields `engineMayActOnAdoptedRow` reads, backing the
+   * `engineActionOnAdoptedRows` census on
+   * `GET /api/health/live-options-fee-slippage`. Wire it to the WHOLE fleet,
+   * both modes, no filter — the census partitions on `importedFromTradier` +
+   * `tradierEnv` itself (never `mode`, TRA-3112 item 3), and a filter applied in
+   * the caller would narrow the denominator where no unit test can see it.
+   *
+   * Optional: absent ⇒ the block serves `rows: null` — "not wired", NEVER
+   * "no adopted rows".
+   */
+  adoptedHandoverRows?: () => AdoptedHandoverCensusRow[];
   /** Injectable clock for deterministic tests. Defaults to Date.now. */
   now?: () => number;
 }
@@ -5662,6 +5679,25 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         capRatification.notionalCap.matchesLive,
         capRatification.aggregateCap.matchesLive,
       ]),
+      /**
+       * TRA-4505 (parent TRA-4206, off TRA-3829) — the engine-act-on-adopted-rows
+       * master arm, finally on a plain GET. Until this key existed the only read
+       * path was an authenticated POST to a real-money write route with a
+       * fabricated id (409 = disarmed / 404 = armed), so the arm got cited from
+       * recall instead of measured (TRA-3829 §0828).
+       *
+       * `armed` resolves through the SAME `isEngineActionOnAdoptedRowsArmed()`
+       * the exit path and the hand-over route guard call, against the same env
+       * every other live-arm read on this route uses — it must agree with the
+       * 409/404 probe on the same build/pid. READ `rows` for ruling B's per-row
+       * half: `null` ⇒ the fleet provider is unwired, never "no adopted rows",
+       * and a non-zero `adoptedRowsAwaitingHandover` beside `armed: true` is the
+       * ruled posture (two keys), not a defect.
+       */
+      engineActionOnAdoptedRows: summarizeEngineActionOnAdoptedRows(
+        deps.adoptedHandoverRows?.() ?? null,
+        liveEnv,
+      ),
       // TRA-3674 — φ, the scalar that turns the fleet-absolute authorization
       // above into an enforceable PER-BOOK budget `B_i = min(φ·E_i, A)`. Same
       // publication contract as every knob on this route: the RESOLVED value
