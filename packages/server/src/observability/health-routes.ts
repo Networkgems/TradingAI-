@@ -169,7 +169,11 @@ import { describeNetEdgeBar } from '../option-net-edge-bar.js';
 // REPLACED the delta-proxy estimator, published per cell so the admission
 // decision is readable off deployed state instead of re-derived by hand.
 import { tapeExpectancyCache } from '../option-tape-expectancy-cache.js';
-import { DECLINE_REASON_TAXONOMY, TAPE_EXPECTANCY_MIN_CELL_N } from '../option-tape-expectancy.js';
+import {
+  DECLINE_REASON_TAXONOMY,
+  TAPE_EXPECTANCY_MIN_CELL_N,
+  summarizeTapeInputStaleness,
+} from '../option-tape-expectancy.js';
 // TRA-4749 (parent TRA-4622 §4) — the bar for EVERY structure the gate is
 // observed to charge, not just the one `bar` was hard-coded to.
 import {
@@ -6977,7 +6981,27 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
             estimator: 'tape_expectancy_lower_ci95',
             issue: 'TRA-3391',
             minCellN: TAPE_EXPECTANCY_MIN_CELL_N,
-            freshness: tapeExpectancyCache().freshness(),
+            /**
+             * ⭐ TRA-4783 — the cache fields here time the RECOMPUTE; the
+             * `input*` fields merged beside them time the INPUTS, and they
+             * are the discriminator. On 2026-09-22 this object read `dirty:
+             * false, ageMs 26943` — the sanctioned degradation check — while
+             * every cell below held a tape frozen 20–76 days, so the margin
+             * `(lowerCI95 − barR)` was structurally unable to move and
+             * nothing on this route said so. The fold runs over the SAME
+             * cells `otmCells` renders, on the same `edgeReadAt` clock their
+             * `tapeWindow` blocks are stamped with. `inputStale` is
+             * three-valued: `null` is NOT COMPUTABLE and must never be read
+             * as false (`?? false` reproduces the bug one layer up).
+             * Read-only — no admission path, arm or disarm consults it.
+             */
+            freshness: {
+              ...tapeExpectancyCache().freshness(),
+              ...summarizeTapeInputStaleness(
+                tapeCells.filter((c) => c.structure === COST_BAR_PUBLISHED_STRUCTURE),
+                edgeReadAt,
+              ),
+            },
             otmCells: tapeCells
               .filter((c) => c.structure === COST_BAR_PUBLISHED_STRUCTURE)
               .map(projectEdgeCell),

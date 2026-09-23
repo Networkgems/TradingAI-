@@ -850,3 +850,107 @@ export function tapeExpectancyVerdict(
     reason: `tape-expectancy gate (TRA-3391): ${detail}`,
   };
 }
+
+// ── TRA-4783 — INPUT staleness, as a first-class degradation signal ──────────
+//
+// `TapeExpectancyFreshness` (the cache's block) times the RECOMPUTE: the fold
+// re-runs on a 60s TTL and on every option close, so `dirty: false, ageMs
+// ~27000` is what a reader saw on 2026-09-22 (build 9472ced3) while every input
+// cell's tape had been frozen 20–76 days. A healthy-and-current edge
+// computation and a 76-day-stale one rendered IDENTICALLY on the one field the
+// TRA-2879 routine body says to gate on. This fold is the discriminator: it
+// aggregates the CELLS' OWN tape windows (`provenance.toTs`, the newest close
+// actually inside each cell) into fields published beside the cache ones.
+//
+// PURE — no clock (the caller passes `nowMs`, the same single read the cells'
+// `tapeWindow` blocks are stamped with), no env, no I/O. Decides nothing:
+// read-only observability, exactly like the TRA-4753 `tapeWindow` it folds.
+
+/**
+ * The staleness bar, in days. TRA-4783 asked for a bar "anywhere in roughly
+ * 7–14 days"; the frozen state's NEWEST cell read 20.0 days while a normally
+ * accruing tape refreshes its active cells in single-digit days. 10 sits
+ * mid-band: above a long weekend plus a quiet week, below every reading the
+ * defect produced. Deliberately NOT env-tunable — a knob on a degradation
+ * detector is how the detector gets quietly widened until it agrees with the
+ * state it exists to flag.
+ */
+export const TAPE_INPUT_STALE_THRESHOLD_DAYS = 10;
+
+/** TRA-4783 — the input-staleness fields merged into `arm.costBar.edge.freshness`. */
+export interface TapeInputStaleness {
+  /**
+   * Age in days (1 decimal, the same rounding as `tapeWindow.tapeAgeDays`) of
+   * the OLDEST cell window end — `nowMs − min(provenance.toTs)` over the
+   * measurable cells. Null ⇒ no cell carried a finite `toTs`: NOT COMPUTABLE,
+   * never 0.
+   */
+  inputTapeAgeDaysMax: number | null;
+  /** ISO of that oldest window end (`min(provenance.toTs)`). Null with the above. */
+  inputTapeToIsoOldest: string | null;
+  /**
+   * THREE-VALUED, deliberately (TRA-4783 item 3):
+   *   true  — at least one measurable cell's tape is older than the threshold.
+   *   false — EVERY cell was measurable and EVERY one is inside the threshold.
+   *   null  — not computable as a clean pass: no measurable cells at all, or
+   *           the measurable ones read fresh while ≥1 cell has no `toTs` — an
+   *           unmeasured cell can be arbitrarily old, so attesting `false`
+   *           there would coerce unknown → healthy, the exact bug one layer up.
+   * At the wire that makes the field three-valued-plus-absent: absent = not
+   * deployed, `null` = not computable, boolean = a real measurement. A reader
+   * must never `?? false` it.
+   */
+  inputStale: boolean | null;
+  /** The bar `inputStale` was decided against, published so a reader need not guess. */
+  inputStaleThresholdDays: number;
+  /** Cells with a finite `provenance.toTs` — the ones inside the max/oldest fold. */
+  inputCellsMeasured: number;
+  /** Cells with `toTs: null` (no row carried a finite closeTs). Counted, never coerced. */
+  inputCellsUnmeasured: number;
+}
+
+/**
+ * Fold the cells' own tape windows into the TRA-4783 staleness summary.
+ *
+ * The threshold compare runs on the RAW age; only the published number is
+ * rounded — so 10.04 days against a 10-day bar reads `{ 10.0, true }` (rounding
+ * may not un-trip the flag), and 9.96 reads `{ 10.0, false }` (the flag is the
+ * verdict; the rounded age is display).
+ */
+export function summarizeTapeInputStaleness(
+  cells: readonly Pick<TapeExpectancyCell, 'provenance'>[],
+  nowMs: number,
+  thresholdDays: number = TAPE_INPUT_STALE_THRESHOLD_DAYS,
+): TapeInputStaleness {
+  let oldestToTs: number | null = null;
+  let measured = 0;
+  let unmeasured = 0;
+  for (const c of cells) {
+    const toTs = c.provenance.toTs;
+    if (typeof toTs === 'number' && Number.isFinite(toTs)) {
+      measured += 1;
+      oldestToTs = oldestToTs === null ? toTs : Math.min(oldestToTs, toTs);
+    } else {
+      unmeasured += 1;
+    }
+  }
+  if (oldestToTs === null) {
+    return {
+      inputTapeAgeDaysMax: null,
+      inputTapeToIsoOldest: null,
+      inputStale: null,
+      inputStaleThresholdDays: thresholdDays,
+      inputCellsMeasured: measured,
+      inputCellsUnmeasured: unmeasured,
+    };
+  }
+  const rawAgeDays = (nowMs - oldestToTs) / 86_400_000;
+  return {
+    inputTapeAgeDaysMax: Math.round(rawAgeDays * 10) / 10,
+    inputTapeToIsoOldest: new Date(oldestToTs).toISOString(),
+    inputStale: rawAgeDays > thresholdDays ? true : unmeasured > 0 ? null : false,
+    inputStaleThresholdDays: thresholdDays,
+    inputCellsMeasured: measured,
+    inputCellsUnmeasured: unmeasured,
+  };
+}
