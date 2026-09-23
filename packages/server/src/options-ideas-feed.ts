@@ -214,6 +214,91 @@ export function classifyResearchFailure(reason: string): OptionsIdeasAvailabilit
   return { state: 'degraded', code, scope: 'provider' };
 }
 
+/**
+ * TRA-4434 — the last-real-attempt outcome for each vendor behind the ideas
+ * feed, derived from the availability of the most recent NON-CACHED
+ * `buildIdeasFeed` run.
+ *
+ * Why this exists: `feeds.anthropicConfigured` on the accumulation monitor is a
+ * pure env-presence check, and it read `true` through the entire 2026-08 credit
+ * outage (TRA-3122) — the flag is identical in the pass state and the fail
+ * state, so it separates nothing. These values report what the vendor actually
+ * DID last time we called it, never what our configuration intends.
+ *
+ * `never_attempted_this_boot` is the honest boot state (the witness is
+ * in-memory); `not_reached` means the last attempt degraded upstream of this
+ * vendor's call. Neither may ever be read as healthy — `ok` is the only value
+ * that means the vendor answered.
+ */
+export type AnthropicUsableOutcome =
+  | 'ok'
+  | 'credit_exhausted'
+  | 'auth_rejected'
+  | 'rate_limited'
+  | 'provider_unavailable'
+  | 'call_failed'
+  | 'not_reached'
+  | 'never_attempted_this_boot';
+
+export type TradierUsableOutcome = 'ok' | 'no_chains' | 'not_reached' | 'never_attempted_this_boot';
+
+export interface FeedsUsableWitness {
+  /** ISO instant of the last real (non-cache-hit) feed build, or null. */
+  attemptedAt: string | null;
+  /** That attempt's availability code, or null when never attempted. */
+  availabilityCode: OptionsIdeasAvailabilityCode | null;
+  anthropicUsable: AnthropicUsableOutcome;
+  tradierUsable: TradierUsableOutcome;
+}
+
+/**
+ * TRA-4434 — map one recorded attempt onto per-vendor outcomes. Pure, and the
+ * single source of truth for the mapping, so the health route and any future
+ * reader cannot disagree. The stage order mirrors `buildIdeasFeed`: LLM
+ * credential check → Tradier client check → chain pull → spend cap → research
+ * pass — so an `llm_*` failure implies the chain pull already succeeded, and a
+ * config-stage degrade means neither vendor was actually exercised.
+ */
+export function deriveFeedsUsable(
+  last: { at: number; availability: OptionsIdeasAvailability } | null,
+): FeedsUsableWitness {
+  if (!last) {
+    return {
+      attemptedAt: null,
+      availabilityCode: null,
+      anthropicUsable: 'never_attempted_this_boot',
+      tradierUsable: 'never_attempted_this_boot',
+    };
+  }
+  const code = last.availability.code;
+  const anthropicUsable: AnthropicUsableOutcome =
+    code === 'ok'
+      ? 'ok'
+      : code === 'llm_credit_exhausted'
+        ? 'credit_exhausted'
+        : code === 'llm_auth_rejected'
+          ? 'auth_rejected'
+          : code === 'llm_rate_limited'
+            ? 'rate_limited'
+            : code === 'llm_provider_unavailable'
+              ? 'provider_unavailable'
+              : code === 'llm_call_failed'
+                ? 'call_failed'
+                : 'not_reached';
+  // Chains are pulled before the spend cap and the research pass, so reaching
+  // any of those stages (or completing) proves the pull succeeded.
+  const chainsPulled =
+    code === 'ok' ||
+    code === 'spend_cap_reached' ||
+    (code.startsWith('llm_') && code !== 'llm_credential_missing');
+  const tradierUsable: TradierUsableOutcome = chainsPulled
+    ? 'ok'
+    : code === 'no_chains'
+      ? 'no_chains'
+      : 'not_reached';
+  return { attemptedAt: new Date(last.at).toISOString(), availabilityCode: code, anthropicUsable, tradierUsable };
+}
+
 export interface OptionsIdeasFeed {
   ideas: OptionsIdeaView[];
   noDayTrading: { enforced: boolean; minHoldDays: number; note: string };

@@ -592,7 +592,7 @@ import {
 // `/api/health/storage/detail` (TRA-2599 moved it off the open route).
 import { dataDirUsageCached } from './data-dir-usage.js';
 import { registerStorageHealthRoutes } from './storage-health.js'; // TRA-2599
-import { buildIdeasFeed, getEntryIntent } from './options-ideas-service.js';
+import { buildIdeasFeed, getEntryIntent, feedsUsableWitness } from './options-ideas-service.js';
 import {
   isOptionsProposalRailEnabled,
   isOptionDemoAutoConfirmEnabled,
@@ -5782,6 +5782,8 @@ async function runWeeklyOptionsRollup(): Promise<void> {
     lastJournaledDate: entries.length ? entries[entries.length - 1].surfacedDate : null,
     tradierConfigured: Boolean(process.env['TRADIER_API_TOKEN']),
     anthropicConfigured: Boolean(process.env['ANTHROPIC_API_KEY']),
+    // TRA-4434 — presence above, liveness here: the last real vendor outcome.
+    feedsUsable: feedsUsableWitness(),
   });
   const bodyMarkdown = renderWeeklyRollupMarkdown({
     monitor,
@@ -8888,6 +8890,9 @@ app.get('/api/health/options-accumulation', async (_req, res) => {
       lastJournaledDate: entries.length ? entries[entries.length - 1].surfacedDate : null,
       tradierConfigured: Boolean(process.env['TRADIER_API_TOKEN']),
       anthropicConfigured: Boolean(process.env['ANTHROPIC_API_KEY']),
+      // TRA-4434 — presence above, liveness here: the last real vendor outcome.
+      // No probe call — this reads the in-memory witness of the ideas path.
+      feedsUsable: feedsUsableWitness(),
     });
     res.json({ issue: 'TRA-1971', ok: true, ...monitor });
   } catch (err) {

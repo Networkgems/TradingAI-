@@ -2,7 +2,12 @@ import { describe, it, expect } from 'vitest';
 import type { OptionChainRow } from '@trading-app/engine';
 import type { ChainDay } from '@trading-app/backtest';
 import type { IdeaJournalEntry } from './options-idea-journal.js';
-import type { IdeaLeg } from './options-ideas-feed.js';
+import {
+  deriveFeedsUsable,
+  classifyResearchFailure,
+  AVAILABILITY_OK,
+  type IdeaLeg,
+} from './options-ideas-feed.js';
 import {
   valueIdea,
   buildForwardTestReport,
@@ -818,6 +823,96 @@ describe('evaluateJournalStaleness (TRA-3456)', () => {
     expect(s.sessionsObserved).toBe(2);
     expect(s.sessionsSinceLastEntry).toBe(1);
     expect(s.lastObservedSession).toBe('2026-08-11');
+  });
+});
+
+describe('buildAccumulationMonitor — feeds liveness (TRA-4434)', () => {
+  const GATE = { minWeeksWithResolved: 8, minResolvedIdeas: 30, minExpectancyR: 0 };
+  const baseInput = () => ({
+    report: buildForwardTestReport([], { asOf: ET_NOON('2026-09-22') }),
+    gate: GATE,
+    chainOutDir: '/data/option-chains',
+    chainDates: ['2026-09-21'],
+    journalCount: 5,
+    firstJournaledDate: '2026-09-18',
+    lastJournaledDate: '2026-09-21',
+    tradierConfigured: true,
+    anthropicConfigured: true,
+  });
+
+  it('key present + credit exhausted reads DIFFERENTLY from key present + working', () => {
+    // The TRA-3122 outage shape: `anthropicConfigured` was true in both states
+    // and separated nothing. The usable field is the discriminator.
+    const at = ET_NOON('2026-09-22');
+    const exhausted = buildAccumulationMonitor({
+      ...baseInput(),
+      feedsUsable: deriveFeedsUsable({
+        at,
+        availability: classifyResearchFailure(
+          '400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API"}}',
+        ),
+      }),
+    });
+    const working = buildAccumulationMonitor({
+      ...baseInput(),
+      feedsUsable: deriveFeedsUsable({ at, availability: AVAILABILITY_OK }),
+    });
+    // Presence is identical — the old field still cannot see the outage…
+    expect(exhausted.feeds.anthropicConfigured).toBe(true);
+    expect(working.feeds.anthropicConfigured).toBe(true);
+    // …and the liveness field is what separates the two states.
+    expect(exhausted.feeds.anthropicUsable).toBe('credit_exhausted');
+    expect(exhausted.feeds.lastIdeasAvailabilityCode).toBe('llm_credit_exhausted');
+    expect(working.feeds.anthropicUsable).toBe('ok');
+    // The LLM stage sits downstream of a successful chain pull in both cases.
+    expect(exhausted.feeds.tradierUsable).toBe('ok');
+    expect(working.feeds.tradierUsable).toBe('ok');
+  });
+
+  it('an omitted witness reads `unknown`, never healthy', () => {
+    const m = buildAccumulationMonitor(baseInput());
+    expect(m.feeds.anthropicUsable).toBe('unknown');
+    expect(m.feeds.tradierUsable).toBe('unknown');
+    expect(m.feeds.lastIdeasAttemptAt).toBeNull();
+    expect(m.feeds.lastIdeasAvailabilityCode).toBeNull();
+  });
+
+  it('a never-attempted boot reads its own named state, not ok', () => {
+    const w = deriveFeedsUsable(null);
+    expect(w.anthropicUsable).toBe('never_attempted_this_boot');
+    expect(w.tradierUsable).toBe('never_attempted_this_boot');
+    expect(w.attemptedAt).toBeNull();
+  });
+
+  it('the identical treatment covers Tradier: a dead chain pull is not a healthy feed', () => {
+    const m = buildAccumulationMonitor({
+      ...baseInput(),
+      feedsUsable: deriveFeedsUsable({
+        at: ET_NOON('2026-09-22'),
+        availability: { state: 'degraded', code: 'no_chains', scope: 'data' },
+      }),
+    });
+    expect(m.feeds.tradierConfigured).toBe(true); // presence still true…
+    expect(m.feeds.tradierUsable).toBe('no_chains'); // …outcome says otherwise
+    // The LLM call never happened — it must not be blamed or cleared.
+    expect(m.feeds.anthropicUsable).toBe('not_reached');
+  });
+
+  it('the weekly roll-up prints the last-call outcome beside "configured"', () => {
+    const m = buildAccumulationMonitor({
+      ...baseInput(),
+      feedsUsable: deriveFeedsUsable({
+        at: ET_NOON('2026-09-22'),
+        availability: classifyResearchFailure('credit balance is too low'),
+      }),
+    });
+    const md = renderWeeklyRollupMarkdown({
+      monitor: m,
+      report: buildForwardTestReport([], { asOf: ET_NOON('2026-09-22') }),
+      gatePassed: false,
+      gateSummary: 'not yet',
+    });
+    expect(md).toMatch(/Ideas pass \(Anthropic\): configured, last call \*\*credit_exhausted\*\*/);
   });
 });
 

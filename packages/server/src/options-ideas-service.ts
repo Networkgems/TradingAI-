@@ -41,9 +41,12 @@ import {
   buildOptionsIdeasFeed,
   noDayTradingBlock,
   classifyResearchFailure,
+  deriveFeedsUsable,
+  AVAILABILITY_OK,
   type OptionsIdeasAvailability,
   type OptionsIdeasFeed,
   type IdeaEntryIntent,
+  type FeedsUsableWitness,
 } from './options-ideas-feed.js';
 import {
   isOverMonthlyCap,
@@ -91,6 +94,24 @@ interface FeedCacheEntry {
   feed: OptionsIdeasFeed;
 }
 let feedCache: FeedCacheEntry | null = null;
+
+// TRA-4434 — the last REAL (non-cache-hit) feed-build attempt and how it ended.
+// This is what lets the accumulation monitor report the vendor's last observed
+// behaviour instead of our env configuration: `anthropicConfigured: true` read
+// identically through the whole TRA-3122 credit outage, because a presence
+// check cannot see a vendor refusal. In-memory on purpose — a fresh boot reads
+// `never_attempted_this_boot`, which is honest and must not be read as healthy.
+let lastRealFeedAttempt: { at: number; availability: OptionsIdeasAvailability } | null = null;
+
+/** TRA-4434 — per-vendor outcome of the last real feed build (see options-ideas-feed.ts). */
+export function feedsUsableWitness(): FeedsUsableWitness {
+  return deriveFeedsUsable(lastRealFeedAttempt);
+}
+
+/** Test seam — the witness is module state and vitest runs share the module. */
+export function resetFeedsUsableWitnessForTest(): void {
+  lastRealFeedAttempt = null;
+}
 
 function daysBetween(fromTs: number, isoDate: string): number {
   const target = Date.parse(`${isoDate}T16:00:00-04:00`);
@@ -246,6 +267,8 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
   // code=<code>`) so the Render log filter — which is a substring match, not a
   // phrase search — can alarm on it without anyone polling the route.
   const nonLive = (note: string, availability: OptionsIdeasAvailability): OptionsIdeasFeed => {
+    // TRA-4434 — every degrade path is a real attempt with a real outcome.
+    lastRealFeedAttempt = { at: now, availability };
     log.warn(`options-ideas-unavailable code=${availability.code} scope=${availability.scope}`, {
       code: availability.code,
       scope: availability.scope,
@@ -449,6 +472,12 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
   void recordSurfacedIdeas(feed.ideas, strategyById, now).catch((err) => {
     log.warn('idea journal append failed', { reason: err instanceof Error ? err.message : String(err) });
   });
+
+  // TRA-4434 — a completed research pass is the ONLY thing that may read `ok`.
+  // A batch-cache hit inside `runOptionsResearch` still proves the vendor
+  // answered this credential at some point today, but this code path only runs
+  // on a non-feed-cache build, so the witness timestamp is a real attempt.
+  lastRealFeedAttempt = { at: now, availability: AVAILABILITY_OK };
 
   feedCache = { key: cacheKey, builtAt: now, feed };
   log.info('options-ideas feed built', {

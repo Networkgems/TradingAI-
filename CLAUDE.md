@@ -1,5 +1,33 @@
 # TradingAI — repo conventions
 
+## A health field reports the outcome of the last REAL attempt, never the configuration
+
+Two separate multi-week outages were invisible because a health route reported our **intent** and
+everyone read it as the **feed's state**:
+
+- `feeds.anthropicConfigured: true` — a pure env-presence check — held through the entire
+  2026-08 Anthropic credit outage (~4.8 weeks, TRA-3122/TRA-4434). Presence cannot go false when
+  the vendor refuses to bill you, so the flag read identically in the pass state and the fail state.
+- `queriesSucceeded: 0` on the news-catalyst route counted our **own breaker suppressing the
+  request** in the same bucket as the vendor answering nothing (TRA-4805). Three triages read a
+  self-inflicted block as a vendor outage; a 5-session feed outage read as ordinary quiet days.
+
+The rule, when writing or reviewing any `/api/health/*` field:
+
+1. **Report what the dependency actually DID last time it was exercised** — an outcome enum off the
+   last real attempt (`ok` / `auth_rejected` / `credit_exhausted` / `rate_limited` / …), with the
+   attempt's timestamp beside it. A config/presence fact may also be published, but name it as one
+   (`*KeyPresent`, `*Configured`) and never let it stand in for liveness.
+2. **Attribute the failure to the right side of the wire.** "We suppressed the call" (breaker open,
+   spend cap, gate off) and "they refused/failed" (401, 429, 5xx) are different pages to different
+   people — separate codes, never one rolled-up counter.
+3. **Absent evidence reads as its own named state** (`never_attempted_this_boot` / `unknown` /
+   `NOT MEASURED`), which is an alarm, not a pass. Fabricating an attribution from silence is how
+   both incidents got misfiled.
+
+Reference implementation: `deriveFeedsUsable` in `packages/server/src/options-ideas-feed.ts` and
+`lastRunFeedFailures` on the news-catalyst route.
+
 ## Never type-check a single file with `tsc <file>`
 
 ```bash

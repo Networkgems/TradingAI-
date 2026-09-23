@@ -4,7 +4,13 @@ import type { OptionChainRow } from '@trading-app/engine';
 import { logger } from './observability/index.js';
 import { etDateKey } from './options-chain-recorder.js';
 import { isoWeek, type IdeaJournalEntry } from './options-idea-journal.js';
-import type { IdeaLeg } from './options-ideas-feed.js';
+import type {
+  IdeaLeg,
+  AnthropicUsableOutcome,
+  TradierUsableOutcome,
+  OptionsIdeasAvailabilityCode,
+  FeedsUsableWitness,
+} from './options-ideas-feed.js';
 import {
   DEFAULT_COST_MODEL,
   structureCostUsd,
@@ -1369,12 +1375,27 @@ export interface AccumulationReachability {
 /** Snapshot of AI-Options-Ideas forward-test accumulation progress. */
 export interface AccumulationMonitor {
   asOfDate: string;
-  /** Whether each accumulation feed's credential is configured (never the value). */
+  /**
+   * Feed credential/liveness block. The `*Configured` booleans are PRESENCE
+   * checks only (never the value) — TRA-4434: `anthropicConfigured` read `true`
+   * through the entire 2026-08 credit outage, so presence must never be read as
+   * liveness. The `*Usable` fields are the liveness read: the outcome of the
+   * last REAL vendor attempt, where `ok` is the only healthy value and
+   * `unknown` / `never_attempted_this_boot` are alarms, not passes.
+   */
   feeds: {
-    /** `TRADIER_API_TOKEN` present → the daily chain recorder can write. */
+    /** `TRADIER_API_TOKEN` present → the daily chain recorder can write. PRESENCE ONLY. */
     tradierConfigured: boolean;
-    /** `ANTHROPIC_API_KEY` present → the live ideas pass can surface + journal. */
+    /** `ANTHROPIC_API_KEY` present → the live ideas pass can surface + journal. PRESENCE ONLY. */
     anthropicConfigured: boolean;
+    /** TRA-4434 — last real Anthropic call outcome; `unknown` = witness not supplied. */
+    anthropicUsable: AnthropicUsableOutcome | 'unknown';
+    /** TRA-4434 — last real chain-pull outcome; `unknown` = witness not supplied. */
+    tradierUsable: TradierUsableOutcome | 'unknown';
+    /** ISO instant of the attempt the `*Usable` fields describe, or null. */
+    lastIdeasAttemptAt: string | null;
+    /** That attempt's TRA-3122 availability code, or null. */
+    lastIdeasAvailabilityCode: OptionsIdeasAvailabilityCode | null;
   };
   chains: {
     /** The durable chain-recorder output root the report read from. */
@@ -1711,6 +1732,13 @@ export function buildAccumulationMonitor(input: {
   lastJournaledDate: string | null;
   tradierConfigured: boolean;
   anthropicConfigured: boolean;
+  /**
+   * TRA-4434 — the last-real-attempt witness from the ideas service
+   * (`feedsUsableWitness()`). Optional so the builder stays pure and callable
+   * without the service module, but ABSENT MUST NOT READ AS OK: when omitted
+   * the monitor reports `unknown`, which is an alarm state, not a pass.
+   */
+  feedsUsable?: FeedsUsableWitness;
 }): AccumulationMonitor {
   const t = input.report.totals;
   const firstRecordedDate = input.chainDates[0] ?? null;
@@ -1762,6 +1790,11 @@ export function buildAccumulationMonitor(input: {
     feeds: {
       tradierConfigured: input.tradierConfigured,
       anthropicConfigured: input.anthropicConfigured,
+      // TRA-4434 — fail closed: no witness supplied reads `unknown`, never `ok`.
+      anthropicUsable: input.feedsUsable?.anthropicUsable ?? 'unknown',
+      tradierUsable: input.feedsUsable?.tradierUsable ?? 'unknown',
+      lastIdeasAttemptAt: input.feedsUsable?.attemptedAt ?? null,
+      lastIdeasAvailabilityCode: input.feedsUsable?.availabilityCode ?? null,
     },
     chains: {
       outDir: input.chainOutDir,
@@ -1897,7 +1930,9 @@ export function renderWeeklyRollupMarkdown(input: {
   lines.push(`### Feeds`);
   lines.push('');
   lines.push(`- Chain recorder (Tradier): ${m.feeds.tradierConfigured ? 'configured' : 'NOT configured'} — ${m.chains.partitionDays} partition day(s) on disk${m.chains.lastRecordedDate ? `, latest ${m.chains.lastRecordedDate}` : ''}`);
-  lines.push(`- Ideas pass (Anthropic): ${m.feeds.anthropicConfigured ? 'configured' : 'NOT configured'} — ${m.journal.ideaCount} idea(s) journaled${m.journal.lastJournaledDate ? `, latest ${m.journal.lastJournaledDate}` : ''}`);
+  // TRA-4434 — "configured" is presence only; print the last real vendor outcome
+  // beside it so a present-but-refused credential can never render as healthy.
+  lines.push(`- Ideas pass (Anthropic): ${m.feeds.anthropicConfigured ? 'configured' : 'NOT configured'}, last call **${m.feeds.anthropicUsable}**${m.feeds.lastIdeasAttemptAt ? ` at ${m.feeds.lastIdeasAttemptAt}` : ''} — ${m.journal.ideaCount} idea(s) journaled${m.journal.lastJournaledDate ? `, latest ${m.journal.lastJournaledDate}` : ''}`);
   // TRA-3456 — "configured" is a config read, not a liveness read: the credential was
   // present and valid on every one of the twenty days nothing was captured. Print the
   // tail verdict WITH its denominator so a clean reading and a never-fired one differ.

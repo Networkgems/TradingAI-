@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import type { OptionChainRow } from '@trading-app/engine';
-import { inferSpotFromRows, buildIdeasFeed } from './options-ideas-service.js';
+import {
+  inferSpotFromRows,
+  buildIdeasFeed,
+  feedsUsableWitness,
+  resetFeedsUsableWitnessForTest,
+} from './options-ideas-service.js';
 import { recordOptionsSpend, resetOptionsSpendForTests } from './options-spend-store.js';
 
 const EXP = '2026-07-17';
@@ -121,6 +126,77 @@ describe('buildIdeasFeed non-live fallbacks', () => {
       resetOptionsSpendForTests();
       clearKeys();
       restoreKeys();
+    }
+  });
+});
+
+// TRA-4434 — the health monitor's liveness read is sourced from this witness,
+// so it must track REAL attempts: boot state is a named unknown, and every
+// degrade path records which stage died so a present-but-refused credential
+// can never render as a healthy feed.
+describe('feedsUsableWitness (TRA-4434)', () => {
+  const origKey = process.env['ANTHROPIC_API_KEY'];
+  const origClaude = process.env['CLAUDE_API_KEY'];
+  function clearKeys() {
+    delete process.env['ANTHROPIC_API_KEY'];
+    delete process.env['CLAUDE_API_KEY'];
+  }
+  function restoreKeys() {
+    if (origKey != null) process.env['ANTHROPIC_API_KEY'] = origKey;
+    if (origClaude != null) process.env['CLAUDE_API_KEY'] = origClaude;
+  }
+
+  it('reads never_attempted_this_boot before any real build, and records a degrade after one', async () => {
+    resetFeedsUsableWitnessForTest();
+    expect(feedsUsableWitness()).toMatchObject({
+      attemptedAt: null,
+      availabilityCode: null,
+      anthropicUsable: 'never_attempted_this_boot',
+      tradierUsable: 'never_attempted_this_boot',
+    });
+    clearKeys();
+    try {
+      await buildIdeasFeed({ client: null, symbols: ['MSFT'], noCache: true });
+      // The credential gate fired before EITHER vendor was exercised: nothing
+      // may claim a vendor outcome that was never observed.
+      expect(feedsUsableWitness()).toMatchObject({
+        availabilityCode: 'llm_credential_missing',
+        anthropicUsable: 'not_reached',
+        tradierUsable: 'not_reached',
+      });
+      expect(feedsUsableWitness().attemptedAt).not.toBeNull();
+    } finally {
+      restoreKeys();
+      resetFeedsUsableWitnessForTest();
+    }
+  });
+
+  it('a spend-cap stop records the chain pull as ok and the LLM as not_reached', async () => {
+    resetFeedsUsableWitnessForTest();
+    clearKeys();
+    process.env['ANTHROPIC_API_KEY'] = 'sk-test-not-used';
+    resetOptionsSpendForTests();
+    const now = Date.parse('2026-06-15T12:00:00Z');
+    const chain: OptionChainRow[] = [row('call', 100, 4.9, 5.1), row('put', 100, 3.9, 4.1)];
+    const stubClient = {
+      getExpirations: async () => ['2026-07-17'],
+      getChainSnapshot: async () => chain,
+    };
+    try {
+      recordOptionsSpend(50, now);
+      await buildIdeasFeed({ client: stubClient, symbols: ['MSFT'], now, noCache: true });
+      // Chains really were pulled; the LLM was deliberately never called. Ours,
+      // not the vendor's — and not silence.
+      expect(feedsUsableWitness()).toMatchObject({
+        availabilityCode: 'spend_cap_reached',
+        anthropicUsable: 'not_reached',
+        tradierUsable: 'ok',
+      });
+    } finally {
+      resetOptionsSpendForTests();
+      clearKeys();
+      restoreKeys();
+      resetFeedsUsableWitnessForTest();
     }
   });
 });
