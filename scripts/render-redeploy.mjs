@@ -208,8 +208,12 @@ const SOAK_HOST_SLUG = BQB1.slug; //  `tradingai-bqb1` — Render `service.slug`
 //   ----------------------  -----------------------------------  ---  -------------------
 //   newCommit:<sha>         git push auto-deploy                 854  2026-07-12T20:34Z
 //   user:{...}              POST /deploys  (this script)         280  2026-08-14T05:48Z
-//   envUpdated:true         an ENV-VAR write                      22  2026-07-23T13:39Z
+//   envUpdated:true         an ENV-VAR write                      22  2026-09-21T02:08Z ⚠
 //   updatedProperty:<name>  a SETTINGS write, PATCH /services/{id} 4  2026-04-28T04:11Z
+//
+//   ⚠ LAST-occurrence re-read 2026-09-23 (TRA-4820): the env-write row's last occurrence
+//     is NO LONGER 2026-07-23T13:39Z. n=22 is left as the 08-14 measurement's own count and
+//     is NOT re-derived here; the 09-21 row is the 23rd. See VERB 1.
 //   firstBuild:true         service creation                       1  2026-04-25T12:30Z
 //
 // VERB 1 — ENV-VAR WRITE. TRA-2186 was RIGHT when it was written, and its artifact holds
@@ -220,12 +224,40 @@ const SOAK_HOST_SLUG = BQB1.slug; //  `tradingai-bqb1` — Render `service.slug`
 //   deployed at 13:23Z. So "redeploys from BRANCH TIP, despite autoDeploy:no" is measured
 //   true for that occurrence: git-push deploys had already stopped on 07-12, so the pin
 //   was in force and did not suppress it.
-//   BUT that occurrence is the LAST of the 22, and there have been ZERO since, across at
-//   least two subsequent env writes on this service:
+//   ⚠ THE "ZERO SINCE 2026-07-23" CLAIM WAS SURFACE-BLIND AND IS NOW FALSIFIED AS WRITTEN
+//   (TRA-4820, 2026-09-23). A SECOND `envUpdated:true` deploy landed on this host:
+//   dep-dao939egekts73bbv9cg, 2026-09-21T02:08:37Z, `trigger:"service_updated"`, carrying
+//   `9472ced3`. Its event trigger object is BYTE-IDENTICAL to the 07-23 row above —
+//   `envUpdated:true`, no `user`, no `updatedProperty` — and across the whole 2000-event
+//   corpus (2026-07-10 → 09-23) there is NOT ONE `updatedProperty` row, so VERB 2 is ruled
+//   out by Render's own disjoint marker. It was an ENV-VAR write, and no gate in this file
+//   ran on it.
+//   ⇒ THE CLAIM SPLITS BY SURFACE. What was measured was the SINGLE-KEY API verb, and for
+//     that verb it still holds — 0 of 3 recent writes produced any deploy:
 //     · 2026-07-24 ~15:55Z  TRADIER_ENV -> "production"  (TRA-2163 remediation)
 //     · 2026-08-14T03:53Z   PUT /env-vars/ENABLE_OPTION_LIVE_OTM -> HTTP 200 (TRA-3708);
 //       no deploy, no event of any kind — the stream goes deploy_ended 02:23:55.856Z
 //       straight to server_restarted 03:53:53.783Z.
+//     · 2026-09-19T17:05Z ENABLE_PAPER_TRADING · 17:22Z ENABLE_TRADIER_STREAM · and
+//       2026-09-20T13:50Z TAKE_PROFIT_EARLY_LIVE_ENABLED — all `PUT /env-vars/{key}`,
+//       all HTTP 200, NONE followed by a `service_updated` deploy. (The api deploy at
+//       09-19T17:19Z is the operator's OWN `--commit=` apply, not a materialised one.)
+//   ⇒ SOME OTHER SURFACE STILL SELF-DEPLOYS. The 09-21 write was made while NO agent run
+//     existed anywhere in the company — nearest run ended 09-20T22:21:00Z, next began
+//     09-21T10:15:27Z, n=0 in flight at the instant — so it did not come from the API verb
+//     our agents use. The remaining surfaces are the Render dashboard/console and the
+//     banned full-set PUT. WHICH ONE IS UNREAD and probably unreadable: the env-vars route
+//     returns `{key, value}` ONLY — no timestamp, no actor, no audit log — so which KEY was
+//     written at 02:08Z cannot be recovered either. Do not write it down as known.
+//   ⇒ SO: TREAT AN ENV WRITE MADE ANYWHERE BUT `PUT /env-vars/{key}` AS CAPABLE OF SHIPPING
+//     THE TIP, exactly as VERB 2 is treated. The zero-delta apply path below is only
+//     zero-delta because it goes through the API verb.
+//   ⛔ AND DO NOT READ THE 09-21 ROW AS "env writes now pin the serving commit". It carried
+//     `9472ced3`, which WAS already live — but `9472ced3` was ALSO the branch tip at that
+//     instant, and stayed tip from 2026-09-20T21:57:16Z to 2026-09-22T19:33:37Z (45h36m
+//     with nothing pushed to main). Tip-semantics and serving-semantics were THE SAME SHA,
+//     so the row cannot discriminate them and is fully consistent with the 07-23 branch-tip
+//     behaviour. It cost nothing because main was quiet, not because Render pinned.
 //   Service now reads `autoDeploy:"no"`, `autoDeployTrigger:"off"`. Do NOT trust this
 //   paragraph over the live reading the script prints; see envWriteAutoDeployPosture().
 //
@@ -292,10 +324,13 @@ const SOAK_HOST_SLUG = BQB1.slug; //  `tradingai-bqb1` — Render `service.slug`
 export const ENV_WRITE_CAVEAT_SHORT =
   'This gate sees DEPLOYS only. An env/settings write does not pass through it. A SETTINGS\n' +
   '  write (PATCH /services) can still redeploy from the BRANCH TIP unguarded — hold those by\n' +
-  '  hand. An ENV-VAR write has produced no deploy on this host since 2026-07-23 (TRA-3724),\n' +
-  '  so it applies NOTHING until you deploy: apply it with --commit=<sha already serving>,\n' +
-  '  which bakes the env with a zero-byte code delta. --commit IS honoured. POST /restart is\n' +
-  '  NOT an env-apply path — it replays the last deploy\'s env snapshot.';
+  '  hand. The SINGLE-KEY API env write (PUT /env-vars/{key}) has produced no deploy on this\n' +
+  '  host since 2026-07-23 (TRA-3724; 0 of 3 as recently as 2026-09-20), so it applies NOTHING\n' +
+  '  until you deploy: apply it with --commit=<sha already serving>, which bakes the env with a\n' +
+  '  zero-byte code delta. --commit IS honoured. POST /restart is NOT an env-apply path — it\n' +
+  '  replays the last deploy\'s env snapshot. But an env write on ANY OTHER SURFACE — the Render\n' +
+  '  dashboard, the banned full-set PUT — CAN still self-deploy the TIP: one did at\n' +
+  '  2026-09-21T02:08Z, gate-free (TRA-4820). Use the API verb, or you are deploying blind.';
 
 // Report the LIVE setting rather than a compiled belief. The 2026-07-23 -> 08-14 change in
 // env-write behaviour is not attributable to any code we own, so a hard-coded claim here

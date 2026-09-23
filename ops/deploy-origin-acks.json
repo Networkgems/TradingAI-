@@ -25,6 +25,16 @@
   ],
   "acks": [
     {
+      "deployId": "dep-dao939egekts73bbv9cg",
+      "commit": "9472ced3",
+      "at": "2026-09-21T02:08:37.386633Z",
+      "trigger": "service_updated",
+      "actor": null,
+      "issue": "TRA-4820",
+      "reviewedAt": "2026-09-23T11:40:00.000Z",
+      "why": "Adjudicated: it was an ENV-VAR write, not a settings write. Render's markers are disjoint and this row carries envUpdated:true with NO updatedProperty -- and there is not one updatedProperty row in the entire 2000-event corpus (2026-07-10..09-23), so VERB 2 is ruled out by Render's own labelling, not by inference from the label alone. The trigger object is byte-identical to dep-d9h1j5nlk1mc738s57qg (2026-07-23), the row ENV_WRITE_TRUTH itself cites as the canonical env-write occurrence. NOT an agent: no heartbeat run existed anywhere in the company at the instant (nearest ended 09-20T22:21:00Z, next began 09-21T10:15:27Z, n=0 in flight), and 0 of 3 recent single-key API env writes (09-19 x2, 09-20 x1) produced any deploy -- so TRA-3724's measurement holds for the API verb and the write came through another surface (dashboard, or the banned full-set PUT). WHICH surface and WHICH key are UNREAD and unreadable: GET /env-vars returns {key,value} only, with no timestamp or actor. Cost: none -- but NOT because Render pinned. 9472ced3 was the branch TIP from 09-20T21:57:16Z to 09-22T19:33:37Z (45h36m, nothing pushed to main), so tip-semantics and serving-semantics were the same SHA and this row cannot discriminate them. Had anything landed on main in those 4h11m it would have shipped unguarded. Acked because it is adjudicated, not because it is safe: no gate is available for the surface that produced it (same one-ADMIN-member hole measured on TRA-4789), so this detector remains the only control. ENV_WRITE_TRUTH and CLAUDE.md corrected in the same commit -- the falsified part was the UNQUALIFIED wording 'an env-var write does not auto-deploy', which was surface-blind."
+    },
+    {
       "deployId": "dep-daj21q7qj5pc73bvbul0",
       "commit": "b22a9999",
       "at": "2026-09-13T04:04:56.649044Z",

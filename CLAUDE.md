@@ -160,7 +160,10 @@ This is a gate in front of `main`, not in front of the host. It is **not** a dep
 
 `tradingai-bqb1` has `autoDeploy=no` / `autoDeployTrigger=off` — **on purpose** (the launch-window
 pin, TRA-1653/TRA-1665; see `docs/runbook.md` §2). The last deploy Render fired from a commit hook
-was **2026-07-12** (`c495294`). Every deploy since has been an explicit REST trigger.
+was **2026-07-12** (`c495294`). Almost every deploy since has been an explicit REST trigger — but
+**not all of them**, and the exceptions are the whole point of `pnpm check:deploy-origin` (TRA-4789):
+three dashboard-button deploys on 2026-09-13 and one env-write self-deploy on 2026-09-21 ran **no
+gate at all**. "Every deploy is a REST trigger" is a convention, not an enforcement.
 
 So the manual trigger is **the deploy path, not a fallback**:
 
@@ -204,13 +207,27 @@ closing at 13:25Z so that an RTH-override deploy or a weekend afternoon deploy i
 self-restart, which writes no deploy record at all (TRA-2203/TRA-2261). **A green run of the script
 is not evidence the host is safe to touch.**
 
-⚠️ **An env-var write on bqb1 does NOT auto-deploy and `--commit` IS honoured (TRA-3724).** The old
-claim here said the opposite and cost us a five-commit train into the real-money host (TRA-3708). To
-apply an env change with a zero-byte code delta: write the single key, then
-`node scripts/render-redeploy.mjs --commit=<sha already serving>`. `POST /restart` is **not** an
-env-apply path — it replays the last deploy's env snapshot. A **settings** write (`PATCH /services`)
-is a different verb and is still assumed to ship the branch tip. Full per-verb measurement:
-`ENV_WRITE_TRUTH` in `scripts/render-redeploy.mjs`; operator steps in `docs/runbook.md`.
+⚠️ **A SINGLE-KEY API env write (`PUT /env-vars/{key}`) on bqb1 does NOT auto-deploy, and `--commit`
+IS honoured (TRA-3724).** The old claim here said the opposite and cost us a five-commit train into
+the real-money host (TRA-3708). To apply an env change with a zero-byte code delta: write the single
+key **through the API**, then `node scripts/render-redeploy.mjs --commit=<sha already serving>`.
+`POST /restart` is **not** an env-apply path — it replays the last deploy's env snapshot.
+
+⛔ **THAT EXEMPTION IS PER-SURFACE, NOT PER-VERB, AND THE UNQUALIFIED VERSION OF IT WAS WRONG
+(TRA-4820).** On **2026-09-21T02:08:37Z** an env write self-deployed this host gate-free
+(`dep-dao939egekts73bbv9cg`, `trigger: service_updated`, `envUpdated:true`, **no actor recorded**).
+It was an env write, not a settings write — Render's markers are disjoint and there is not one
+`updatedProperty` row in the whole 2026-07-10→09-23 event corpus. It was **not** the API verb: no
+agent run existed anywhere in the company at that instant, and 0 of 3 recent API env writes produced
+any deploy. So the dashboard (or the banned full-set `PUT`) **still ships the tip, unguarded** —
+treat every surface except `PUT /env-vars/{key}` the way you treat a **settings** write
+(`PATCH /services`), which is a different verb and is likewise assumed to ship the branch tip.
+⛔ Do **not** read that row as "env writes now pin the serving commit": `9472ced3` was *both* the
+serving commit *and* the branch tip (tip from 09-20T21:57:16Z to 09-22T19:33:37Z, 45h36m with
+nothing pushed), so it cannot discriminate the two. It cost nothing because `main` was quiet.
+Which key was written is **unreadable** — `GET /env-vars` returns `{key, value}` only, no timestamp,
+no actor. Full per-verb measurement: `ENV_WRITE_TRUTH` in `scripts/render-redeploy.mjs`; operator
+steps in `docs/runbook.md`.
 
 Do not "fix" the pin by turning `autoDeploy` back on. It is what stops a mid-session merge from
 dumping bqb1's warm quote cache and resetting the go-live soak clock (TRA-1996), and lifting it is
