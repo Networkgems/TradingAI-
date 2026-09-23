@@ -351,17 +351,29 @@ function recAt(etDay: string, ts: number): SandboxStrategyRecord {
 /** ms epoch at 13:00Z (= 09:00 ET, pre-open, before the 11:00 ET fire is due). */
 const at = (y: number, m: number, d: number) => Date.UTC(y, m - 1, d, 13);
 
+/** ms epoch at 19:00Z (= 15:00 ET, AFTER the day's 14:30 ET slot — a realistic append). */
+const atClose = (y: number, m: number, d: number) => Date.UTC(y, m - 1, d, 19);
+
 describe('summarizeCallerLiveness (TRA-2481)', () => {
   it('flags the exact TRA-2481 tape dark: last append Fri 07-24, read Wed 07-29', () => {
-    const recs = [recAt('2026-07-23', at(2026, 7, 23)), recAt('2026-07-24', at(2026, 7, 24))];
+    const recs = [
+      recAt('2026-07-23', atClose(2026, 7, 23)),
+      recAt('2026-07-24', atClose(2026, 7, 24)),
+    ];
     const c = summarizeCallerLiveness(recs, at(2026, 7, 29));
     // Mon 07-27 and Tue 07-28 came and went with zero rows.
     expect(c.weekdaysSinceLastAppend).toBe(2);
+    // TRA-4810: Mon 11:00, Mon 14:30, Tue 11:00, Tue 14:30 — 4 slots, all missed.
+    expect(c.expectedSlotsSinceLastAppend).toBe(4);
+    expect(c.missedSlots).toBe(4);
     expect(c.dark).toBe(true);
     expect(c.lastAppendEtDay).toBe('2026-07-24');
     expect(c.rowsToday).toBe(0);
-    // The reason must send the reader to the CALLER's tape, not the writer's.
+    // The reason must send the reader to the CALLER's tape, not the writer's…
     expect(c.reason).toMatch(/runner routine/i);
+    // …and name BOTH counts so a reader can tell which arm tripped (TRA-4810 spec 3).
+    expect(c.reason).toMatch(/4 of 4 expected caller slot\(s\)/);
+    expect(c.reason).toMatch(/2 whole ET weekday\(s\)/);
   });
 
   it('goes dark on a journal whose writer fields are all clean — the pass≡fail case', () => {
@@ -379,16 +391,27 @@ describe('summarizeCallerLiveness (TRA-2481)', () => {
   });
 
   it('does not count the weekend: Fri append read on Monday is not skipped', () => {
-    const c = summarizeCallerLiveness([recAt('2026-07-24', at(2026, 7, 24))], at(2026, 7, 27));
+    const c = summarizeCallerLiveness(
+      [recAt('2026-07-24', atClose(2026, 7, 24))],
+      at(2026, 7, 27),
+    );
     expect(c.weekdaysSinceLastAppend).toBe(0);
+    // Monday 09:00 ET: neither of Monday's slots is due yet, and Friday's already fired.
+    expect(c.expectedSlotsSinceLastAppend).toBe(0);
+    expect(c.missedSlots).toBe(0);
     expect(c.dark).toBe(false);
   });
 
   it('reports a single skipped weekday without tripping dark (holiday-shaped)', () => {
-    // Fri append read on Tuesday ⇒ Monday alone was skipped. Indistinguishable from a
-    // market holiday, so it is COUNTED but not called dark.
-    const c = summarizeCallerLiveness([recAt('2026-07-24', at(2026, 7, 24))], at(2026, 7, 28));
+    // Fri append read on Tuesday pre-open ⇒ Monday alone was skipped. Indistinguishable
+    // from a market holiday, so it is COUNTED but not called dark — a holiday costs
+    // exactly 1 weekday = 2 slots, and both thresholds sit just above that (TRA-4810).
+    const c = summarizeCallerLiveness(
+      [recAt('2026-07-24', atClose(2026, 7, 24))],
+      at(2026, 7, 28),
+    );
     expect(c.weekdaysSinceLastAppend).toBe(1);
+    expect(c.missedSlots).toBe(2);
     expect(c.dark).toBe(false);
   });
 
@@ -409,5 +432,107 @@ describe('summarizeCallerLiveness (TRA-2481)', () => {
     expect(c.dark).toBe(true);
     expect(c.lastAppendTs).toBeNull();
     expect(c.reason).toMatch(/EMPTY/);
+  });
+});
+
+// ── caller liveness slot grid (TRA-4810, TRA-4809 ask 1) ─────────────────────
+//
+// The measured defect: on Mon 2026-09-21 the scheduler dropped BOTH of routine
+// `d8ec9395`'s slots with zero run-history rows, Tue 09-22's replay burst stranded
+// without executing, and at Tue 21:29 ET — 4 consecutive missed slots — the route still
+// read `caller.dark: false`, because `weekdaysSinceLastAppend` counts whole ET weekdays
+// strictly between days and could not have tripped before Wed 00:00 ET no matter what
+// happened Monday. A dropped slot and a quiet day rendered identically (TRA-4141 shape).
+// The slot-grid arm makes `dark` trip at the 3rd consecutive missed slot instead.
+
+describe('summarizeCallerLiveness slot grid (TRA-4810)', () => {
+  // The measured tape: last append Fri 2026-09-18 after the 14:30 ET slot (Sep = EDT,
+  // so 11:00 ET = 15:00Z and 14:30 ET = 18:30Z).
+  const lastAppend = [recAt('2026-09-18', Date.UTC(2026, 8, 18, 18, 35))]; // Fri 14:35 ET
+
+  it('replays the 09-21/09-22 tape: dark from Tue 11:00 ET (3rd missed slot), not Wed 00:00 ET', () => {
+    // Tue 09-22 10:59 ET — only Monday's 2 slots have passed: holiday-shaped, NOT dark.
+    const before = summarizeCallerLiveness(lastAppend, Date.UTC(2026, 8, 22, 14, 59));
+    expect(before.missedSlots).toBe(2);
+    expect(before.dark).toBe(false);
+
+    // Tue 09-22 11:01 ET (15:01Z) — the 3rd consecutive slot has now passed unanswered.
+    const after = summarizeCallerLiveness(lastAppend, Date.UTC(2026, 8, 22, 15, 1));
+    expect(after.expectedSlotsSinceLastAppend).toBe(3);
+    expect(after.missedSlots).toBe(3);
+    expect(after.dark).toBe(true);
+    // The OLD arm alone would still be blind here (1 whole weekday < 2): the slot arm is
+    // what tripped, and the reason must say so.
+    expect(after.weekdaysSinceLastAppend).toBe(1);
+    expect(after.reason).toMatch(/tripped arm\(s\): missedSlots\./);
+    expect(after.reason).toMatch(/3 of 3 expected caller slot\(s\)/);
+
+    // The measured read that motivated this ticket: Tue 21:29 ET (2026-09-23T01:29Z),
+    // 4 missed slots — previously `dark: false`, now dark.
+    const measured = summarizeCallerLiveness(lastAppend, Date.UTC(2026, 8, 23, 1, 29));
+    expect(measured.missedSlots).toBe(4);
+    expect(measured.dark).toBe(true);
+  });
+
+  it('tolerates a single-holiday Monday: exactly 2 missed slots is not dark', () => {
+    // Tue 10:00 ET after a Monday holiday: Monday's 2 slots passed with no rows because
+    // the market was closed — the grid ignores the holiday calendar on purpose, and the
+    // >=3 threshold is what absorbs it.
+    const c = summarizeCallerLiveness(lastAppend, Date.UTC(2026, 8, 22, 14, 0));
+    expect(c.expectedSlotsSinceLastAppend).toBe(2);
+    expect(c.missedSlots).toBe(2);
+    expect(c.weekdaysSinceLastAppend).toBe(1);
+    expect(c.dark).toBe(false);
+  });
+
+  it('negative control: a must-be-dark state reads dark — and mutating it clears it', () => {
+    // Wed 09-23 10:00 ET, still nothing since Fri: 4 missed slots AND 2 whole skipped
+    // weekdays — BOTH arms must trip.
+    const wed = Date.UTC(2026, 8, 23, 14, 0);
+    const control = summarizeCallerLiveness(lastAppend, wed);
+    expect(control.missedSlots).toBe(4);
+    expect(control.weekdaysSinceLastAppend).toBe(2);
+    expect(control.dark).toBe(true);
+    expect(control.reason).toMatch(/tripped arm\(s\): missedSlots \+ weekdaysSinceLastAppend\./);
+
+    // MUTATE the control (repo convention): add the one append that answers Tuesday's
+    // 14:30 slot and the identical read must flip to not-dark. If this leg fails, the
+    // control above was vacuous — a detector stuck at `dark: true` would pass it.
+    const mutated = summarizeCallerLiveness(
+      [...lastAppend, recAt('2026-09-22', Date.UTC(2026, 8, 22, 18, 35))], // Tue 14:35 ET
+      wed,
+    );
+    expect(mutated.missedSlots).toBe(0);
+    expect(mutated.weekdaysSinceLastAppend).toBe(0);
+    expect(mutated.dark).toBe(false);
+  });
+
+  it('anchors the slot count to the append TIME, not its day: a pre-slot append leaves that day\'s slots expected', () => {
+    // Append Mon 09:00 ET (before either slot), read Tue 09:00 ET: both of Monday's
+    // slots came due after the append and were never answered.
+    const c = summarizeCallerLiveness(
+      [recAt('2026-09-21', Date.UTC(2026, 8, 21, 13, 0))],
+      Date.UTC(2026, 8, 22, 13, 0),
+    );
+    expect(c.expectedSlotsSinceLastAppend).toBe(2);
+    expect(c.weekdaysSinceLastAppend).toBe(0);
+    expect(c.dark).toBe(false);
+  });
+
+  it('is DST-safe: the grid holds 11:00 ET across the November fall-back (EST = 16:00Z)', () => {
+    // Fri 2026-11-06 is EST (fall-back was Sun 11-01): 11:00 ET = 16:00Z, 14:30 ET = 19:30Z.
+    // Last append Thu 11-05 after the close; read Fri 16:01Z — exactly one slot passed.
+    const c = summarizeCallerLiveness(
+      [recAt('2026-11-05', Date.UTC(2026, 10, 5, 20, 0))], // Thu 15:00 ET (EST)
+      Date.UTC(2026, 10, 6, 16, 1),
+    );
+    expect(c.expectedSlotsSinceLastAppend).toBe(1);
+    // …and one minute EARLIER the slot has not fired yet: a fixed −4 offset would
+    // already count it.
+    const before = summarizeCallerLiveness(
+      [recAt('2026-11-05', Date.UTC(2026, 10, 5, 20, 0))],
+      Date.UTC(2026, 10, 6, 15, 59),
+    );
+    expect(before.expectedSlotsSinceLastAppend).toBe(0);
   });
 });

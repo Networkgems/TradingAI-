@@ -422,13 +422,31 @@ export interface SandboxStrategyCallerLiveness {
    */
   weekdaysSinceLastAppend: number;
   /**
-   * True ⇔ `weekdaysSinceLastAppend >= CALLER_DARK_WEEKDAYS`, or the journal is empty.
+   * TRA-4810 — grid slots ({@link CALLER_SLOT_GRID_ET}: Mon–Fri 11:00 + 14:30 ET) that
+   * came due strictly after the last append and strictly before `nowMs`. Unlike the
+   * whole-weekday count, this moves the moment a slot passes without a write, so an
+   * intra-day slot drop is visible the same afternoon instead of at midnight two days on.
+   */
+  expectedSlotsSinceLastAppend: number;
+  /**
+   * Expected slots with zero appends. On this fold it always equals
+   * `expectedSlotsSinceLastAppend` — the anchor is the NEWEST record, so by construction
+   * no append landed in any slot after it. Both are published so the wire shape survives
+   * a future per-slot append match.
+   */
+  missedSlots: number;
+  /**
+   * True ⇔ `missedSlots >= CALLER_DARK_MISSED_SLOTS` (TRA-4810 — trips the same
+   * afternoon a 3rd consecutive slot is dropped), OR
+   * `weekdaysSinceLastAppend >= CALLER_DARK_WEEKDAYS` (the original TRA-2481 arm — kept
+   * as the fail-closed backstop should the hardcoded grid ever drift from the routine's
+   * real cadence), OR the journal is empty.
    *
    * Fails CLOSED (empty ⇒ dark) — an absent caller and an absent disk both mean nobody is
-   * writing, and neither should read as healthy. The threshold is 2 rather than 1 because
-   * exactly one skipped weekday is also what a market holiday looks like from here, and a
-   * holiday is a legitimate zero-row day. Read `weekdaysSinceLastAppend` directly if you
-   * need to act on the ambiguous 1-day case.
+   * writing, and neither should read as healthy. Both thresholds tolerate exactly one
+   * market holiday (a holiday costs 1 weekday = 2 slots, and the grid deliberately does
+   * NOT model the US holiday calendar — the >=3 slot threshold is what absorbs it). Read
+   * the counts directly if you need to act on the ambiguous holiday-shaped case.
    */
   dark: boolean;
   /** Human-readable statement of what was measured — always populated. */
@@ -437,6 +455,31 @@ export interface SandboxStrategyCallerLiveness {
 
 /** Skipped ET weekdays at which {@link SandboxStrategyCallerLiveness.dark} trips. */
 export const CALLER_DARK_WEEKDAYS = 2;
+
+/**
+ * TRA-4810 (TRA-4809 ask 1) — missed grid slots at which `dark` trips. 3, not 1: one
+ * skipped weekday is what a market holiday looks like from here, and a holiday costs
+ * exactly 2 slots, so >=3 preserves the single-holiday tolerance while still tripping at
+ * the 3rd consecutive dropped slot (Tue 11:00 ET after a dropped Monday) instead of
+ * Wed 00:00 ET — the measured 2026-09-21/22 tape (4 slots dropped, `dark: false` at
+ * Tue 21:29 ET) is the incident this closes.
+ */
+export const CALLER_DARK_MISSED_SLOTS = 3;
+
+/**
+ * The caller's expected slot grid: ET wall-clock fire times, Mon–Fri.
+ *
+ * ⚠️ COUPLING — this mirrors Paperclip routine `d8ec9395`'s two triggers (11:00 and
+ * 14:30 America/New_York, Mon–Fri). The server cannot read Paperclip trigger config, so
+ * the mirror is deliberate and manual: if the routine's cadence ever changes, update this
+ * grid in the same change. If the grid drifts unnoticed, the whole-weekday arm above is
+ * the backstop. US market holidays are deliberately NOT modelled here — that is exactly
+ * what the {@link CALLER_DARK_MISSED_SLOTS} >= 3 tolerance absorbs.
+ */
+const CALLER_SLOT_GRID_ET: ReadonlyArray<{ hour: number; minute: number }> = [
+  { hour: 11, minute: 0 },
+  { hour: 14, minute: 30 },
+];
 
 /** ET calendar day (YYYY-MM-DD) of a ms epoch. */
 function toEtDay(ms: number): string {
@@ -468,6 +511,67 @@ function weekdaysBetween(fromEtDay: string, toEtDay_: string): number {
 }
 
 /**
+ * ms epoch of an ET wall-clock time on a `YYYY-MM-DD` ET day key. DST-safe without a
+ * hardcoded transition table: try both ET offsets (EDT −4 / EST −5) and keep the
+ * candidate that RENDERS back to the requested wall clock in America/New_York. The grid
+ * times (11:00 / 14:30) can never land inside the 02:00 local transition hour, so
+ * exactly one candidate matches on every real day.
+ */
+function etWallClockMs(etDay: string, hour: number, minute: number): number | null {
+  const m = etDay.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  for (const offsetHours of [4, 5]) {
+    const candidate = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), hour + offsetHours, minute);
+    const parts: Record<string, string> = {};
+    for (const p of new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      hour12: false,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).formatToParts(new Date(candidate))) {
+      parts[p.type] = p.value;
+    }
+    if (
+      `${parts.year}-${parts.month}-${parts.day}` === etDay &&
+      Number(parts.hour) % 24 === hour && // some ICU builds render midnight as "24"
+      Number(parts.minute) === minute
+    ) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+/**
+ * TRA-4810 — count {@link CALLER_SLOT_GRID_ET} slots strictly after `lastAppendMs` and
+ * strictly before `nowMs`. "Strictly after the last append" excludes the slot the last
+ * append itself answered (its fire lands minutes after its slot time); "strictly before
+ * now" means a slot only counts once its instant has actually passed. Bounded the same
+ * way as {@link weekdaysBetween} so a corrupt timestamp can never spin.
+ */
+function gridSlotsBetween(lastAppendMs: number, nowMs: number): number {
+  if (!(nowMs > lastAppendMs)) return 0;
+  const startAnchor = dayAnchorMs(toEtDay(lastAppendMs));
+  const endAnchor = dayAnchorMs(toEtDay(nowMs));
+  if (startAnchor == null || endAnchor == null) return 0;
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  let count = 0;
+  for (let t = startAnchor, guard = 0; t <= endAnchor && guard < 400; t += DAY_MS, guard += 1) {
+    const dow = new Date(t).getUTCDay(); // midday-UTC anchor shares the ET day's weekday
+    if (dow === 0 || dow === 6) continue;
+    const day = toEtDay(t);
+    for (const slot of CALLER_SLOT_GRID_ET) {
+      const slotMs = etWallClockMs(day, slot.hour, slot.minute);
+      if (slotMs != null && slotMs > lastAppendMs && slotMs < nowMs) count += 1;
+    }
+  }
+  return count;
+}
+
+/**
  * Fold caller liveness out of the durable series. Pure — `nowMs` is injected so the
  * dark/not-dark contract can be pinned by tests without a clock.
  */
@@ -482,6 +586,8 @@ export function summarizeCallerLiveness(
       lastAppendEtDay: null,
       rowsToday: 0,
       weekdaysSinceLastAppend: 0,
+      expectedSlotsSinceLastAppend: 0,
+      missedSlots: 0,
       dark: true,
       reason:
         'Journal is EMPTY — no round-trip has ever been recorded (or the durable series did '
@@ -496,20 +602,36 @@ export function summarizeCallerLiveness(
   }
   const lastAppendEtDay = last.etDay || toEtDay(last.ts);
   const weekdaysSinceLastAppend = weekdaysBetween(lastAppendEtDay, todayEtDay);
-  const dark = weekdaysSinceLastAppend >= CALLER_DARK_WEEKDAYS;
+  const expectedSlotsSinceLastAppend = gridSlotsBetween(last.ts, nowMs);
+  // `last` is the newest record, so no append can have answered any slot after it:
+  // missed ≡ expected here. See the interface doc for why both are still published.
+  const missedSlots = expectedSlotsSinceLastAppend;
+  const slotArmTripped = missedSlots >= CALLER_DARK_MISSED_SLOTS;
+  const weekdayArmTripped = weekdaysSinceLastAppend >= CALLER_DARK_WEEKDAYS;
+  const dark = slotArmTripped || weekdayArmTripped;
+  // The reason names BOTH counts so a reader can tell which arm tripped (TRA-4810 spec 3).
+  const counts =
+    `${missedSlots} of ${expectedSlotsSinceLastAppend} expected caller slot(s) missed `
+    + `(grid Mon–Fri 11:00+14:30 ET, dark at >=${CALLER_DARK_MISSED_SLOTS}) and `
+    + `${weekdaysSinceLastAppend} whole ET weekday(s) skipped (dark at >=${CALLER_DARK_WEEKDAYS})`;
   return {
     lastAppendTs: last.ts,
     lastAppendEtDay,
     rowsToday,
     weekdaysSinceLastAppend,
+    expectedSlotsSinceLastAppend,
+    missedSlots,
     dark,
     reason: dark
-      ? `No append since ${lastAppendEtDay} — ${weekdaysSinceLastAppend} ET weekday(s) have `
-        + 'passed with zero rows. This journal has no internal scheduler, so that means the '
+      ? `No append since ${lastAppendEtDay} — ${counts}; tripped arm(s): `
+        + `${[slotArmTripped ? 'missedSlots' : null, weekdayArmTripped ? 'weekdaysSinceLastAppend' : null]
+          .filter((a) => a != null)
+          .join(' + ')}. `
+        + 'This journal has no internal scheduler, so that means the '
         + 'CALLER stopped, not the writer: read the runner routine\'s run history '
         + '(recentRuns + per-trigger lastResult), NOT appendErrors/lastOk — those are '
         + 'computed over the requests that arrived and stay clean at zero requests.'
-      : `Last append ${lastAppendEtDay}; ${weekdaysSinceLastAppend} skipped ET weekday(s), `
+      : `Last append ${lastAppendEtDay}; ${counts}, `
         + `${rowsToday} row(s) so far today (${todayEtDay}).`,
   };
 }
