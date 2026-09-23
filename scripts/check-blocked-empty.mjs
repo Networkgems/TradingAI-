@@ -915,6 +915,49 @@ export function suppressesOwnRoutine(f) {
   return f.originKind === 'routine_execution' && f.blocksKnown === true && f.blocksIdentifiers.length === 0;
 }
 
+/**
+ * Discharge evidence for a `done` restore (TRA-4817, CFO ask 2026-09-23).
+ *
+ * A suppressing-leaf `done` is warranted by the CLASS (a per-fire spawn that
+ * gates nothing must not rest non-terminal) — but WHAT the close records
+ * depends on whether the fire's work actually discharged. TRA-4804 is the live
+ * case: the fire's owner published the verdict at 22:47:56Z, the cascade
+ * re-parked the leaf at 22:48:22Z — 26 seconds later — so only the terminal
+ * status PATCH was lost with the run, and `done` buried nothing. The old print
+ * asserted "already terminal" off nothing; the payload's `previousStatus`
+ * (`in_progress`, `completedAt: null`) contradicted it. This function reads
+ * the thread so the report can CITE the evidence instead of asserting it.
+ *
+ * Pure, and deliberately modest: it names the newest non-system comment and
+ * where it sits relative to the recovery park. Whether that comment IS the
+ * fire's published verdict is the assignee's judgement — the report hands them
+ * the pointer, it does not grade verdict-ness.
+ */
+export function deriveDischargeEvidence({ comments, commentsError, recovery }) {
+  if (commentsError) return { state: 'UNREAD', detail: commentsError };
+  if (!Array.isArray(comments)) return { state: 'UNREAD', detail: 'the comment route returned a non-array' };
+  const newest = comments
+    .filter((c) => c && !c.deletedAt && !isSystemAuthored(c))
+    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))[0];
+  if (!newest) return { state: 'NONE' };
+  const parkAt = recovery && recovery.createdAt ? Date.parse(recovery.createdAt) : NaN;
+  const at = newest.createdAt ? Date.parse(newest.createdAt) : NaN;
+  let beforePark = null;
+  let gapText = null;
+  if (Number.isFinite(parkAt) && Number.isFinite(at)) {
+    beforePark = at <= parkAt;
+    const gapS = Math.round(Math.abs(parkAt - at) / 1000);
+    gapText = gapS < 120 ? `${gapS}s` : `${Math.round(gapS / 60)}min`;
+  }
+  return {
+    state: 'FOUND',
+    at: newest.createdAt || '?',
+    authorAgentId: newest.authorAgentId || null,
+    beforePark,
+    gapText,
+  };
+}
+
 export function deriveRepair(f) {
   const no = (why) => ({ eligible: false, status: null, assigneeAgentId: null, restoredFrom: null, why });
 
@@ -952,8 +995,11 @@ export function deriveRepair(f) {
     assigneeAgentId: f.recoveryReturnOwnerAgentId,
     restoredFrom: rt.target,
     why:
-      `previousStatus was \`${rt.target}\` and returnOwnerAgentId is named in the payload — both READ. This is the ` +
-      'same two-step the CTO and CEO ran by hand 31 times on 2026-08-12 with zero judgement calls.',
+      `ELIGIBILITY was read off the payload: \`evidence.previousStatus\` = \`${rt.target}\` and returnOwnerAgentId ` +
+      'are both present. The read is a PRECONDITION, not the write — the printed status is DERIVED: `todo` for a ' +
+      'dead run (writing back the read `in_progress` re-mints the strand the repair is clearing), `done` only for ' +
+      'a suppressing leaf. Never describe the printed target as "read off previousStatus": measured 2026-09-23 it ' +
+      'matched the payload 0/4, by design (TRA-4817).',
   };
 }
 
@@ -1042,6 +1088,9 @@ export function classifyIssue(item, roster, { graph = null, now = null } = {}) {
     // demoting target rather than asserting there is no card.
     pendingInteractions: null,
     restoreTarget: null,
+    // Filled in by sweep() for suppressing leaves only — the `done` restore must
+    // cite its discharge evidence, never assert it (TRA-4817). null = not scanned.
+    discharge: null,
     assigneeAgentId,
     assigneeUserId: item.assigneeUserId || null,
     assigneeName: agent ? agent.name : null,
@@ -1174,7 +1223,11 @@ export async function sweep({ getIssuesPage, getIssue, listAgents, getComments, 
     hits.map(async (entry) => {
       let comments = null;
       let commentsError = null;
-      if (entry.item.activeRecoveryAction) {
+      // A suppressing leaf gets its thread read EVEN under a live recovery
+      // action: its restore prints `done`, and a `done` must cite discharge
+      // evidence from the thread, never assert it off the payload (TRA-4817).
+      const settledWithoutRead = entry.item.activeRecoveryAction && !suppressesOwnRoutine(entry.graded);
+      if (settledWithoutRead) {
         // settled without a read
       } else if (typeof getComments !== 'function') {
         commentsError = 'no comment transport was supplied — the recovery marker could not be checked';
@@ -1194,6 +1247,13 @@ export async function sweep({ getIssuesPage, getIssue, listAgents, getComments, 
         recoveryOwnerAgentId: c.recoveryOwnerAgentId || null,
         recoveryOwnerName: c.recoveryOwnerName || null,
       });
+      if (suppressesOwnRoutine(entry.graded)) {
+        entry.graded.discharge = deriveDischargeEvidence({
+          comments,
+          commentsError,
+          recovery: entry.item.activeRecoveryAction || null,
+        });
+      }
     }),
   );
 
@@ -1426,14 +1486,44 @@ export function renderReport(result) {
         L.push('     repair KNOWN (stranded_assigned_issue) — ONE step, and one step only:');
         L.push(`       RESTORE-PATCH 1/1  PATCH /api/issues/${f.id} {"status":"${repStatus}"}`);
         L.push(`       ${rep.why}`);
-        L.push(
-          repStatus === 'done'
-            ? '       `done`, NOT the generic `todo`: this row is a SUPPRESSING LEAF (see the block below) and `todo` ' +
+        if (repStatus === 'done') {
+          L.push(
+            '       `done`, NOT the generic `todo`: this row is a SUPPRESSING LEAF (see the block below) and `todo` ' +
               'there keeps its own routine off. This is the drain\'s disposition for the class, printed here so the ' +
-              'command and the block below cannot disagree.'
-            : `       \`${repStatus}\`, never \`done\` and never the read \`${rep.restoredFrom}\`: todo is queue-visible AND ` +
+              'command and the block below cannot disagree.',
+          );
+          // TRA-4817 — a `done` restore CITES its discharge evidence; it never
+          // asserts "already terminal" off a payload whose previousStatus says
+          // the opposite (measured: `in_progress` + completedAt null on the row
+          // whose work HAD in fact discharged, 26s before the park).
+          const d = f.discharge || { state: 'UNREAD', detail: 'discharge scan did not run on this row' };
+          if (d.state === 'FOUND') {
+            const who = (result.roster.get(d.authorAgentId) || {}).name || d.authorAgentId || 'a user';
+            L.push(
+              `       discharge evidence IN-THREAD: newest non-system comment by ${who} @ ${d.at}` +
+                (d.beforePark === true
+                  ? ` — ${d.gapText} BEFORE the recovery park`
+                  : d.beforePark === false
+                    ? ' — AFTER the recovery park'
+                    : '') +
+                '. Read it before landing the PATCH: if it is the fire\'s published verdict, only the terminal ' +
+                'status write was lost with the run and this `done` buries nothing.',
+            );
+          } else {
+            L.push(
+              `       ⚠ NO discharge evidence found in-thread (${
+                d.state === 'UNREAD' ? `thread UNREAD: ${d.detail}` : 'no non-system comment exists at all'
+              }) — this \`done\` rests on the CLASS RULE alone, not on any claim the work finished. If the fire's ` +
+                'read never happened, the closing comment must record NOT RUN, so the `done` does not impersonate ' +
+                'a completed read (TRA-4817).',
+            );
+          }
+        } else {
+          L.push(
+            `       \`${repStatus}\`, never \`done\` and never the read \`${rep.restoredFrom}\`: todo is queue-visible AND ` +
               'still counts as an unresolved blocker upstream, while in_progress is what the reconciler mints strands FROM.',
-        );
+          );
+        }
         L.push(
           '       Do NOT re-send the WRITE-ONLY blocker key: there is no open anchor, and an empty write-key list ' +
             'reproduces the born-blocked state.',
@@ -1609,12 +1699,15 @@ export function renderReport(result) {
   // its ABSENCE on every board that emits no repair, so a mention here would
   // green four negative controls by accident.
   L.push(
-    `ONE cohort is exempt (TRA-3451): ${repairable.length} row(s) above carry a two-step restore pair. They are ` +
+    `ONE cohort is exempt (TRA-3451): ${repairable.length} row(s) above carry a restore command. They are ` +
       '`stranded_assigned_issue`',
   );
-  L.push('rows whose restore target and return owner were both READ off the recovery payload');
-  L.push('(`evidence.previousStatus` + `returnOwnerAgentId`), with the interaction route confirming');
-  L.push('ZERO pending cards. Nothing there is inferred, so there is nothing to get wrong. Every');
+  L.push('rows whose ELIGIBILITY was read off the recovery payload (`evidence.previousStatus`');
+  L.push('present + `returnOwnerAgentId` named), with the interaction route confirming ZERO');
+  L.push('pending cards. The printed TARGET is DERIVED, not read: `todo` for a dead run,');
+  L.push('`done` only for a suppressing leaf, with its discharge evidence cited beside it.');
+  L.push('(TRA-4817: the old text claimed the target was read off `previousStatus`; measured');
+  L.push('2026-09-23 it matched 0/4, because matching it would re-mint the strand.) Every');
   L.push('other row keeps the rule above and prints the reason it kept it.');
   return L;
 }
@@ -2835,7 +2928,14 @@ async function selftest() {
         !/\{"status":"todo"\}/.test(out) &&
         /SUPPRESSING LEAF/.test(out) &&
         // and the prose must not still be arguing for the opposite write
-        !/`todo`, never `done`/.test(out),
+        !/`todo`, never `done`/.test(out) &&
+        // TRA-4817 — an EMPTY thread means the `done` must SAY it rests on the
+        // class rule alone, and must not assert the work finished.
+        f.discharge && f.discharge.state === 'NONE' &&
+        /NO discharge evidence found in-thread/.test(out) &&
+        /rests on the CLASS RULE alone/.test(out) &&
+        // and the report must never claim the target was read off the payload
+        !/restore target and return owner were both READ/.test(out),
       detail: cmd[0] ? cmd[0].trim() : 'NO RESTORE-PATCH EMITTED',
     };
   })();
@@ -2844,6 +2944,51 @@ async function selftest() {
     `${supRepair.ok ? 'ok  ' : 'FAIL'}  TRA-4574 — an ELIGIBLE row that is ALSO a SUPPRESSING LEAF prints \`done\`, not the generic \`todo\`\n` +
       `        ${supRepair.detail}\n` +
       '        (the emitter mirrors the drain; a `todo` here switches the row\'s own routine OFF — 11/30 live rows on 2026-09-16)',
+  );
+
+  // TRA-4817 — the TRA-4804 shape, replayed as a fixture. The payload says
+  // `previousStatus: in_progress` (NOT terminal), yet the fire's owner published
+  // a verdict in-thread 30s before the recovery park. The `done` print must CITE
+  // that comment (author + timestamp + where it sits relative to the park), and
+  // must not assert "already terminal" — the claim the payload contradicts and
+  // the CFO measured false 4/4 on 2026-09-23.
+  const supDischarge = await (async () => {
+    const row = recoveryStrand('s1', 'TRA-8641', 'agent-cto', { returnOwner: 'agent-qt' });
+    row.item.originKind = 'routine_execution';
+    row.item.blocks = [];
+    const r = await sweep(
+      transportFor(fakeBoard([row]), {
+        comments: {
+          s1: [
+            // the platform's own recovery notice — system-authored, must NOT count
+            { id: 'c2', authorType: 'system', createdAt: '2026-08-12T11:39:01.000Z', body: 'terminal run recovery moved this issue' },
+            { id: 'c1', authorAgentId: 'agent-qt', createdAt: '2026-08-12T11:38:30.000Z', body: 'postmarket verdict: NO-TRADE, book flat, queue 0 pending' },
+          ],
+        },
+      }),
+      { now: NOW_STALE },
+    );
+    const out = renderReport(r).join('\n');
+    const f = r.findings[0];
+    const d = f.discharge || {};
+    return {
+      ok:
+        d.state === 'FOUND' &&
+        d.authorAgentId === 'agent-qt' &&
+        d.beforePark === true &&
+        d.gapText === '30s' &&
+        /discharge evidence IN-THREAD: newest non-system comment by QuantTrader @ 2026-08-12T11:38:30\.000Z — 30s BEFORE the recovery park/.test(out) &&
+        // the system recovery notice, though NEWER, was not promoted to evidence
+        !/11:39:01/.test(out) &&
+        !/NO discharge evidence/.test(out) &&
+        !/already terminal/.test(out),
+      detail: `state=${d.state} author=${d.authorAgentId} beforePark=${d.beforePark} gap=${d.gapText}`,
+    };
+  })();
+  if (!supDischarge.ok) failed += 1;
+  console.log(
+    `${supDischarge.ok ? 'ok  ' : 'FAIL'}  TRA-4817 — a \`done\` restore CITES its in-thread discharge evidence (the TRA-4804 26s shape), and a system recovery notice never counts as one\n` +
+      `        ${supDischarge.detail}`,
   );
 
   const miss = await naiveMissControl();

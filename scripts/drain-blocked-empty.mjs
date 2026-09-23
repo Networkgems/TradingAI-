@@ -254,7 +254,8 @@ export function classifyDisposition(f) {
         'gates nothing. Its routine treats a NON-TERMINAL leaf as still running (skip_if_active drops the next ' +
         'fire, coalesce_if_active merges into it), so the generic `todo` restore would leave the routine OFF while ' +
         'nextRunAt keeps advancing and every census reads it ARMED. Resting disposition for this class is `done` ' +
-        '(TRA-4041 / TRA-4063). There is no unrun work to destroy: the fire is over, the spawn is its record.',
+        '(TRA-4041 / TRA-4063). Terminal rest is the CLASS rule; whether the fire\'s read actually discharged is ' +
+        'cited from the thread, never asserted off the payload (TRA-4817).',
     };
   }
 
@@ -375,7 +376,7 @@ export function gradeWriteBody(step, body, { klass = null } = {}) {
     if (body.status === 'done') {
       return bad(
         'would write `done` on a DURABLE_STRAND, which DESTROYS unrun work. The restore is `todo` and only `todo`. ' +
-          '`done` is reachable ONLY for a SUPPRESSING_LEAF (TRA-4063), where there is no unrun work to destroy.',
+          '`done` is reachable ONLY for a SUPPRESSING_LEAF (TRA-4063), where terminal rest is the class rule.',
       );
     }
     if (body.status !== 'todo') {
@@ -497,6 +498,45 @@ export function originSentence(f, origin) {
 }
 
 /**
+ * The discharge sentence for a suppressing-leaf `done` (TRA-4817).
+ *
+ * A `done` on this class is warranted by the CLASS, but what the close RECORDS
+ * depends on whether the fire's work discharged -- and that is read from the
+ * thread by sweep() (`f.discharge`), never asserted off the payload. TRA-4804:
+ * the payload said `previousStatus: in_progress` / `completedAt: null` while
+ * the fire's owner had published the verdict 26s before the recovery park;
+ * "already terminal" was a false claim, the thread held the true one. The
+ * fixtures (and any caller outside sweep) may hand an `f` with no `discharge`
+ * key at all -- that degrades to the not-scanned arm, never a throw.
+ */
+export function dischargeSentence(f, fold = (x) => x) {
+  const d = f.discharge || null;
+  if (d && d.state === 'FOUND') {
+    return (
+      `Discharge evidence IN-THREAD: newest non-system comment by \`${fold(String(d.authorAgentId || 'a user'))}\` ` +
+      `at ${fold(String(d.at))}` +
+      (d.beforePark === true
+        ? ` (${fold(String(d.gapText))} BEFORE the recovery park)`
+        : d.beforePark === false
+          ? ' (AFTER the recovery park)'
+          : '') +
+      '. If that comment is the fire\'s published verdict, only the terminal status write was lost with the run ' +
+      'and this `done` buries nothing. Cited, not asserted: the payload\'s own previousStatus is non-terminal and ' +
+      'proves nothing either way (TRA-4817).'
+    );
+  }
+  const why = !d
+    ? 'the discharge scan did not run on this row'
+    : d.state === 'UNREAD'
+      ? `thread UNREAD: ${fold(String(d.detail || 'no detail'))}`
+      : 'no non-system comment exists in the thread';
+  return (
+    `NO discharge evidence to cite (${why}) -- this \`done\` rests on the CLASS RULE alone, NOT on any claim the ` +
+    'work finished. If the fire\'s read never happened, this close records NOT RUN, not a completed read (TRA-4817).'
+  );
+}
+
+/**
  * The audit comment. ASCII only, and written BEFORE the row leaves our boundary.
  *
  * TRA-4145 — platform-sourced field values (`recoveryKind`, `originKind`,
@@ -523,8 +563,8 @@ export function drainComment(f, runId, disp = null, origin = null) {
       `Repair applied -- ONE write (TRA-4041):\n` +
       `- PATCH status -> \`done\`. THIS IS THE \`done\` BRANCH, taken deliberately and taken only for this class. ` +
       `The generic restore for this cohort is \`todo\`, and \`todo\` here would be the defect: it is non-terminal, ` +
-      `so the origin routine would keep treating this finished fire as live and would never run again. There is no ` +
-      `unrun work to destroy -- the fire is over and this spawn is its record.\n` +
+      `so the origin routine would keep treating this fire as live and would never run again.\n` +
+      `- ${dischargeSentence(f, fold)}\n` +
       `- \`blockedByIssueIds\` deliberately NOT re-sent.\n` +
       `- assigneeAgentId deliberately NOT written. The recovery payload names \`${fold(rep.assigneeAgentId)}\` as the ` +
       `returnOwnerAgentId; the status write above spawns a run that takes this issue's checkout lock, so any ` +
