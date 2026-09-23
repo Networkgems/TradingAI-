@@ -114,6 +114,17 @@ jobs:
       - name: DATA_DIR guard controls (TRA-2603)
         run: pnpm check:data-dir:controls
 
+      # TRA-4474/TRA-4803 — the env-intent checker's own controls. `check:env-intent`
+      # itself cannot run here (it grades the LIVE box), so this is the only place its
+      # grading logic is exercised at all, and until TRA-4803 nothing ran it on a
+      # schedule. Hermetic: every case is a fixture and the Render arm is forced OFF.
+      # The TRA-4803 cases are the ones that matter — a STAGED re-arm (stored
+      # ENABLE_OPTION_LIVE_OTM=1 awaiting a boot) must exit 1, while an ABSENT key on
+      # an `intended:'off'` lever must stay exit 0, because a permanently red gate gets
+      # muted and a muted gate and a deleted gate end in the same place.
+      - name: env-intent checker controls (TRA-4474/TRA-4803)
+        run: pnpm check:env-intent:controls
+
       # TRA-4145 — the strand drain's 43 write-path controls, which until now ran only
       # when someone typed the command by hand. The drain is SOURCE, not a deployed
       # service (TRA-3451), so nothing else ever executes them.
