@@ -1715,7 +1715,14 @@ describe('SignalEngine — mode-scoped dashboard state (TRA-231)', () => {
     for (let i = 0; i < 600; i++) priv.dynamicSymbols.add(`TAIL${i}`);
     priv.dynamicSymbols.add('^VIX');
 
+    // TRA-4830 bounds getActiveSymbols() at 100 by default and promotes held
+    // risk past the cap — the same defect this test guards, fixed one layer
+    // up, which destroys the precondition below (SPCX/^VIX sitting naturally
+    // OUTSIDE the ceiling). Opt out so this test keeps grading
+    // getQuoteFetchOrder()'s reordering of the natural, unbounded order.
+    vi.stubEnv('TRADIER_SCAN_SYMBOL_LIMIT', 'none');
     const active = engine.getActiveSymbols();
+    vi.unstubAllEnvs();
     // The defect, restated: both the held underlying and the risk gate sit
     // outside the 200-symbol ceiling in the universe's natural order.
     expect(active.slice(0, 200)).not.toContain('SPCX');

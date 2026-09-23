@@ -247,8 +247,8 @@ const setEq = (a, b) => a.size === b.size && [...a].every(k => b.has(k));
 const findings = Array.isArray(census.findings) ? census.findings : [];
 const blinds = Array.isArray(census.blindCloses) ? census.blindCloses : [];
 const publishedExcess = new Map(findings.map(f => [f.optionSymbol, f.excessContracts]));
-const publishedImportOnly = new Set(blinds.filter(b => b.reason === 'import_only').map(b => b.optionSymbol));
-const publishedNoOpen = new Set(blinds.filter(b => b.reason === 'no_open_record').map(b => b.optionSymbol));
+const _publishedImportOnly = new Set(blinds.filter(b => b.reason === 'import_only').map(b => b.optionSymbol));
+const _publishedNoOpen = new Set(blinds.filter(b => b.reason === 'no_open_record').map(b => b.optionSymbol));
 // ⛔ TRA-3926 (2026-09-22) — A SYMBOL-KEYED SET CANNOT REPRESENT ONE SYMBOL
 // WHOSE CLOSES LAND IN TWO BUCKETS, and the horizon manufactures exactly that.
 // The route classifies each close CHRONOLOGICALLY; the fold above is a lifetime

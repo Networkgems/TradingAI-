@@ -62,7 +62,7 @@ const UNIVERSE = [
   'MSTR','NFLX','NVDA','ORCL','PLTR','PYPL','QCOM','QQQ','SHOP','SPY','TSLA','XLF','XYZ',
 ];
 
-const K_FEEDERS = 4;
+const _K_FEEDERS = 4; // documents the Bonferroni divisor in T_THRESHOLD
 const T_THRESHOLD = 2.498; // two-sided p <= .05/4
 const N_POWER = 224;
 const HORIZON = 5; // sessions
