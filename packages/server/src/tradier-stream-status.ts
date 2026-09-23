@@ -32,8 +32,28 @@ const log = logger.child({ module: 'tradier-stream' });
 
 export const TRADIER_STREAM_FLAG = 'ENABLE_TRADIER_STREAM';
 
-/** TRA-4782 — opt-in cap on the subscribe frame. Unset = today's behaviour (the full fleet union). */
+/**
+ * Cap on the subscribe frame. TRA-4782 introduced this as an opt-in experiment
+ * lever (unset = the full fleet union); TRA-4656 closed that experiment and made
+ * the bound the standing design, so unset now means {@link DEFAULT_STREAM_SYMBOL_LIMIT}.
+ * Uncapped is the explicit opt-out `none`.
+ */
 export const TRADIER_STREAM_SYMBOL_LIMIT_ENV = 'TRADIER_STREAM_SYMBOL_LIMIT';
+
+/**
+ * TRA-4656 — the default subscription bound, and why it exists.
+ *
+ * Uncapped, the 822-symbol fleet union measured p50 35.6–46.1s behind the
+ * exchange during RTH (TRA-4782's 09-22 control — our own fan-out backlog, not
+ * the vendor). At N=25 the same instrument measured p50 276–708ms. So an
+ * *uncapped* subscription is the known-bad regime, and after the experiment
+ * closed, "env row got dropped" must fail into the bounded configuration, not
+ * silently back into the 40s one.
+ */
+export const DEFAULT_STREAM_SYMBOL_LIMIT = 25;
+
+/** The documented opt-out: `TRADIER_STREAM_SYMBOL_LIMIT=none` subscribes the full fleet union. */
+export const STREAM_SYMBOL_LIMIT_OPT_OUT = 'none';
 
 /** Equity tickers only: `/markets/events` here is fed the stock/option underlyings. */
 const EQUITY_SYMBOL_RE = /^[A-Z][A-Z0-9.]{0,9}$/;
@@ -65,23 +85,37 @@ const LADDER_RANK = new Map(STREAM_LIQUIDITY_LADDER.map((s, i) => [s, i]));
 export interface StreamSymbolLimit {
   /** The cap actually applied, or `null` for "no cap" — the full fleet union. */
   limit: number | null;
-  /** Exactly what the env var held, `null` when unset. Present so `null` limit is never ambiguous. */
+  /** Exactly what the env var held, `null` when unset. Present so the limit's provenance is never ambiguous. */
   raw: string | null;
   /**
    * Why a present value was not honoured. A garbage value must NOT read the same
-   * as an unset one: both leave `limit: null`, and only this field tells them apart.
+   * as an unset one: both fall back to the default cap, and only this field tells
+   * them apart.
    */
   error: string | null;
 }
 
-/** Parse {@link TRADIER_STREAM_SYMBOL_LIMIT_ENV}. Unset ⇒ no cap; unparseable ⇒ no cap **plus an error**. */
+/**
+ * Parse {@link TRADIER_STREAM_SYMBOL_LIMIT_ENV}.
+ * Unset ⇒ {@link DEFAULT_STREAM_SYMBOL_LIMIT}; `none` ⇒ explicitly uncapped;
+ * unparseable ⇒ the default cap **plus an error** — after TRA-4782 named the
+ * uncapped regime as the 40s-latency branch, garbage must fail closed into a
+ * bounded subscription, never open into the known-bad one.
+ */
 export function resolveStreamSymbolLimit(env: NodeJS.ProcessEnv = process.env): StreamSymbolLimit {
   const rawValue = env[TRADIER_STREAM_SYMBOL_LIMIT_ENV];
-  if (rawValue == null || rawValue.trim() === '') return { limit: null, raw: rawValue ?? null, error: null };
+  if (rawValue == null || rawValue.trim() === '') {
+    return { limit: DEFAULT_STREAM_SYMBOL_LIMIT, raw: rawValue ?? null, error: null };
+  }
   const raw = rawValue.trim();
+  if (raw.toLowerCase() === STREAM_SYMBOL_LIMIT_OPT_OUT) return { limit: null, raw, error: null };
   const n = Number(raw);
   if (!Number.isInteger(n) || n < 1) {
-    return { limit: null, raw, error: `${TRADIER_STREAM_SYMBOL_LIMIT_ENV}=${JSON.stringify(raw)} is not an integer >= 1 — NO cap applied` };
+    return {
+      limit: DEFAULT_STREAM_SYMBOL_LIMIT,
+      raw,
+      error: `${TRADIER_STREAM_SYMBOL_LIMIT_ENV}=${JSON.stringify(raw)} is not an integer >= 1 or "${STREAM_SYMBOL_LIMIT_OPT_OUT}" — default cap ${DEFAULT_STREAM_SYMBOL_LIMIT} applied`,
+    };
   }
   return { limit: n, raw, error: null };
 }
@@ -183,7 +217,7 @@ export type TradierStreamPayload =
       /** TRA-4782 — the fleet union BEFORE the cap. Equal to `subscribedSymbols` when uncapped. */
       symbolsBeforeLimit: number;
       symbolLimitEnv: typeof TRADIER_STREAM_SYMBOL_LIMIT_ENV;
-      /** `null` = no cap. Read `symbolLimitError` before concluding the operator meant that. */
+      /** `null` = uncapped, reachable only via the explicit `none` opt-out (TRA-4656). */
       symbolLimit: number | null;
       symbolLimitRaw: string | null;
       symbolLimitError: string | null;

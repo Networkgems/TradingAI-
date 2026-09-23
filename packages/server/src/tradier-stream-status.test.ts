@@ -16,6 +16,7 @@ import {
   isTradierStreamEnabled,
   resolveStreamSymbolLimit,
   applyStreamSymbolLimit,
+  DEFAULT_STREAM_SYMBOL_LIMIT,
   type TradierStreamPayload,
   type TradierStreamService,
 } from './tradier-stream-status.js';
@@ -235,9 +236,19 @@ describe('TRA-4782 TRADIER_STREAM_SYMBOL_LIMIT', () => {
     'ZZZZ', 'AAPL', 'FLYYQ', 'SPY', 'NVDA', 'QQQ', 'TSLA', 'MSFT', 'ANY', 'ATAI',
   ]);
 
-  it('unset is the identity — the subscribe frame is byte-identical to the uncapped one', () => {
-    expect(resolveStreamSymbolLimit({})).toEqual({ limit: null, raw: null, error: null });
-    expect(resolveStreamSymbolLimit({ TRADIER_STREAM_SYMBOL_LIMIT: '  ' }).limit).toBeNull();
+  // TRA-4656 — the experiment closed with the uncapped regime named as the 40s
+  // branch, so the default flipped from "unset = full fleet union" to "unset =
+  // the measured bound". Uncapped is now the explicit `none` opt-out only.
+  it('unset is the DEFAULT BOUND, not the identity — dropping the env row cannot resurrect the 40s regime', () => {
+    expect(resolveStreamSymbolLimit({})).toEqual({ limit: DEFAULT_STREAM_SYMBOL_LIMIT, raw: null, error: null });
+    expect(resolveStreamSymbolLimit({ TRADIER_STREAM_SYMBOL_LIMIT: '  ' }).limit).toBe(DEFAULT_STREAM_SYMBOL_LIMIT);
+  });
+
+  it('`none` is the explicit opt-out — the subscribe frame is byte-identical to the uncapped one', () => {
+    for (const optOut of ['none', 'NONE', ' None ']) {
+      expect(resolveStreamSymbolLimit({ TRADIER_STREAM_SYMBOL_LIMIT: optOut }))
+        .toEqual({ limit: null, raw: optOut.trim(), error: null });
+    }
     const sel = applyStreamSymbolLimit(FLEET, null);
     expect(sel.selected).toEqual([...FLEET]);
     expect(sel.before).toBe(FLEET.length);
@@ -262,10 +273,12 @@ describe('TRA-4782 TRADIER_STREAM_SYMBOL_LIMIT', () => {
     expect(applyStreamSymbolLimit(FLEET, 999).selected).toEqual([...FLEET]);
   });
 
-  it('a garbage cap does NOT read like an unset one — both leave limit null, only the error tells them apart', () => {
+  it('a garbage cap fails CLOSED into the default bound, and does NOT read like an unset one — the error tells them apart', () => {
     for (const bad of ['0', '-3', 'twenty-five', '25.5', 'NaN']) {
       const r = resolveStreamSymbolLimit({ TRADIER_STREAM_SYMBOL_LIMIT: bad });
-      expect(r.limit).toBeNull();
+      // Never `null`: after TRA-4782, uncapped is the known-bad 40s regime, so a
+      // typo must not fail open into it.
+      expect(r.limit).toBe(DEFAULT_STREAM_SYMBOL_LIMIT);
       expect(r.raw).toBe(bad);
       expect(r.error).toContain(bad);
     }

@@ -27,8 +27,15 @@ The data arrives. It arrives ~40 seconds late.
 
 ## The experiment (the deliverable is a branch, not a fix)
 
-`TRADIER_STREAM_SYMBOL_LIMIT` is an **opt-in** cap on the subscribe frame. Unset is the identity:
-the fleet union (822 symbols today), in exactly the order it always had.
+`TRADIER_STREAM_SYMBOL_LIMIT` is a cap on the subscribe frame. **During the experiment** it was
+opt-in — unset was the identity: the fleet union (822 symbols today), in exactly the order it
+always had.
+
+> **Superseded 2026-09-23 (TRA-4656).** The experiment closed with the branch named (our fan-out;
+> see the result below), so the default flipped: **unset now means the default bound
+> (`DEFAULT_STREAM_SYMBOL_LIMIT`, 25)**, a garbage value fails *closed* into that bound (plus
+> `symbolLimitError`), and uncapped requires the explicit opt-out
+> `TRADIER_STREAM_SYMBOL_LIMIT=none`. Dropping the env row can no longer resurrect the 40s regime.
 
 ```
 TRADIER_STREAM_SYMBOL_LIMIT=25      # the most-liquid 25, ladder-first
@@ -44,6 +51,13 @@ Re-measure p50 at the next RTH open:
 
 Either branch is a result. The close condition is a **re-run of the TRA-4656 grade with the branch
 named** — never "tuned it and it looks better".
+
+**Result (2026-09-23, in-RTH re-grade, TRA-4656 comment `1202db97` / TRA-4782 comment `bf09619c`):
+the first branch.** At N=25 the per-symbol p50 read 276–708ms across 10 reads vs the uncapped
+control's 35,600–46,100ms — a 51–100x collapse. The backlog was our 822-symbol fan-out. A ~0.3–0.7s
+delivery-path floor remains on the session WebSocket itself (the feed already speaks
+`wss://ws.tradier.com/v1/markets/events`, so "switch to the websocket" is not an available lever),
+which is why AC #1 as written (<500ms p50) grades marginal-FAIL at N=25 while p50 <1s holds.
 
 ### How the 25 are chosen
 
@@ -94,9 +108,10 @@ Every new field is **three-valued** and must be read that way:
 ⛔ `latencyP50Ms ?? 0` turns "never deployed" into "perfect latency". The desktop panel renders these
 as `not published` / `no sample` / `<n>ms` for exactly this reason.
 
-The same rule covers the cap: an unset `TRADIER_STREAM_SYMBOL_LIMIT` and a *garbage* one both leave
-`symbolLimit: null`. Only `symbolLimitError` tells them apart, and it is non-null exactly when a
-present value was refused.
+The same rule covers the cap. Since the TRA-4656 default flip: an unset `TRADIER_STREAM_SYMBOL_LIMIT`
+and a *garbage* one both resolve to the default bound (25). Only `symbolLimitError` tells them
+apart, and it is non-null exactly when a present value was refused. `symbolLimit: null` now appears
+only under the explicit `none` opt-out.
 
 ### What the sanity bound is, and what it is not
 
