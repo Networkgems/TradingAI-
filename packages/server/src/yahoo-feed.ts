@@ -89,16 +89,62 @@ const RATE_LIMIT_COOLDOWN_MS = 90_000;
 // the 90s steady-state value, so RTH operation is unaffected.
 const BOOT_WINDOW_MS = 5 * 60_000;        // 5 min
 const BOOT_RATE_LIMIT_COOLDOWN_MS = 10 * 60_000; // 10 min
-let rateLimitedUntil = 0;
-function isRateLimited(): boolean {
-  return Date.now() < rateLimitedUntil;
+
+/**
+ * TRA-4805 — the breaker has LANES, because "Yahoo rate-limited us" is not one
+ * fact about one budget.
+ *
+ * `crumb` — every module that sets `needsCrumb: true` in yahoo-finance2 v3
+ *   (`quote`, and the daily/chart pulls behind it). These share the
+ *   `/v1/test/getcrumb` endpoint, and it is the crumb fetch — not the data
+ *   endpoint — that returns the 429 we see in prod:
+ *   `Failed to get crumb, status 429, statusText: Too Many Requests`.
+ * `search` — `yf.search()`, which does NOT request a crumb (verified in
+ *   `node_modules/yahoo-finance2/esm/src/modules/search.js`: no `needsCrumb`,
+ *   versus `quote.js:130 needsCrumb: true`). Different endpoint, different
+ *   budget, and the ONLY caller is the 25-query news sweep in
+ *   {@link fetchMarketNews}.
+ * `chart` — `yf.chart()`, also crumb-free. OPT-IN ONLY; see
+ *   {@link fetchDailyCandles} for why it is not switched on wholesale. Note
+ *   this endpoint does carry a real limit of its own — bqb1 logged
+ *   `dailyChart(META): Edge: Too Many Requests` on 2026-09-17 — so a genuine
+ *   429 here opens this lane on the usual cooldown. That is the point of a
+ *   lane: it backs off the budget that was actually spent.
+ *
+ * Why this is not a refactor for tidiness. With ONE global flag, the ~577-symbol
+ * `fetchQuotes` secondary fan-out owns the breaker: measured on bqb1 it sustains
+ * ~6.3 calls/s, so the 90s cooldown is re-tripped the instant it lapses and the
+ * breaker is open CONTINUOUSLY — the coalesced log line reports single episodes
+ * of 55,926s (09-18), 39,246s and 125,707s (09-22), i.e. 15.5h / 10.9h / 34.9h.
+ * `withRetry` short-circuits on that flag BEFORE issuing a request, so all 25
+ * news queries returned `null` without one HTTP request leaving the box, for
+ * three consecutive sessions. `queriesSucceeded: 0` did not mean "the feed is
+ * down"; it meant "we never asked" — and the free keyless search endpoint was
+ * verifiably answering the whole time (measured 2026-09-23 off-box with the
+ * identical client config: AAPL/NVDA/'Apple Inc' → 10 headlines each, ~260ms).
+ *
+ * The onset is a DUTY CYCLE, not an event, which is why nothing was deployed on
+ * 09-18 to cause it and why the earlier episodes "self-healed": on 09-17 the
+ * same log line reports episodes of 11s/22s/39s/51s, so a sweep could land in a
+ * gap (45 of 68 runs healthy). Once episodes run for hours, that probability is
+ * zero. A restart clears `rateLimitedUntil`, which is the whole of the
+ * 09-01 → 09-09 "recovery".
+ *
+ * The lane split is deliberately NOT a bypass: a 429 raised by a search call
+ * still opens the search lane on the same cooldown. It only stops the crumb
+ * budget from speaking for an endpoint that does not spend it.
+ */
+export type YahooBreakerLane = 'crumb' | 'search' | 'chart';
+const rateLimitedUntil: Record<YahooBreakerLane, number> = { crumb: 0, search: 0, chart: 0 };
+function isRateLimited(lane: YahooBreakerLane = 'crumb'): boolean {
+  return Date.now() < rateLimitedUntil[lane];
 }
-function tripBreaker(label: string, msg: string): void {
+function tripBreaker(label: string, msg: string, lane: YahooBreakerLane = 'crumb'): void {
   const cooldownMs = process.uptime() * 1000 < BOOT_WINDOW_MS
     ? BOOT_RATE_LIMIT_COOLDOWN_MS
     : RATE_LIMIT_COOLDOWN_MS;
-  rateLimitedUntil = Date.now() + cooldownMs;
-  console.warn(`[yahoo-feed] circuit breaker tripped for ${cooldownMs / 1000}s after ${label}: ${msg}`);
+  rateLimitedUntil[lane] = Date.now() + cooldownMs;
+  console.warn(`[yahoo-feed] ${lane} circuit breaker tripped for ${cooldownMs / 1000}s after ${label}: ${msg}`);
 }
 function isRateLimitError(msg: string): boolean {
   return /\b429\b|Too Many Requests|crumb/i.test(msg);
@@ -129,19 +175,49 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   });
 }
 
-async function withRetry<T>(fn: () => Promise<T>, label: string, retries = YF_RETRIES): Promise<T | null> {
-  if (isRateLimited()) {
-    return null;
+/**
+ * TRA-4805 — why a call returned nothing.
+ *
+ * `breaker_open` is the one that matters and the one a bare `null` could never
+ * express: NO REQUEST WAS ISSUED. Folding it in with `rate_limited` ("we asked
+ * and Yahoo refused") or `error` ("we asked and it broke") is what made a
+ * three-session outage read as a dead vendor for five days. The two have
+ * opposite remediations — one is ours, one is theirs.
+ */
+export type YahooFailureKind = 'breaker_open' | 'rate_limited' | 'timeout' | 'error';
+
+interface YahooCallOutcome<T> {
+  value: T | null;
+  /** `null` ⇔ the call succeeded. */
+  failure: { kind: YahooFailureKind; message: string } | null;
+}
+
+/**
+ * {@link withRetry}, but it says WHY it gave up. `withRetry` is the thin
+ * value-only wrapper over this, so every existing call site is unchanged.
+ */
+async function withRetryOutcome<T>(
+  fn: () => Promise<T>,
+  label: string,
+  retries = YF_RETRIES,
+  lane: YahooBreakerLane = 'crumb',
+): Promise<YahooCallOutcome<T>> {
+  if (isRateLimited(lane)) {
+    return { value: null, failure: { kind: 'breaker_open', message: `${lane} breaker open — no request issued` } };
   }
+  let last: { kind: YahooFailureKind; message: string } = { kind: 'error', message: 'no attempt made' };
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      return await withTimeout(fn(), YF_CALL_TIMEOUT_MS, label);
+      return { value: await withTimeout(fn(), YF_CALL_TIMEOUT_MS, label), failure: null };
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (isRateLimitError(msg)) {
-        tripBreaker(label, msg);
-        return null;
+        tripBreaker(label, msg, lane);
+        return { value: null, failure: { kind: 'rate_limited', message: msg } };
       }
+      // `withTimeout` is the only thing that emits this suffix, so the
+      // discriminator is ours and does not depend on a vendor message.
+      last = { kind: msg.endsWith(`timed out after ${YF_CALL_TIMEOUT_MS}ms`) ? 'timeout' : 'error', message: msg };
       if (attempt < retries) {
         console.warn(`[yahoo-feed] ${label} attempt ${attempt + 1} failed: ${msg} — retrying in ${(attempt + 1) * 1000}ms`);
         await sleep((attempt + 1) * 1000);
@@ -150,7 +226,11 @@ async function withRetry<T>(fn: () => Promise<T>, label: string, retries = YF_RE
       }
     }
   }
-  return null;
+  return { value: null, failure: last };
+}
+
+async function withRetry<T>(fn: () => Promise<T>, label: string, retries = YF_RETRIES): Promise<T | null> {
+  return (await withRetryOutcome(fn, label, retries)).value;
 }
 
 // ── Active-interest set (TRA-154) ─────────────────────────────────────────────
@@ -2134,18 +2214,44 @@ export const __recordChartSplitsForTests = recordChartSplits;
  * intraday-only and these index symbols are not in the Twelve Data budget set.
  *
  * Returns an empty array on any failure; callers must tolerate a cold feed.
+ *
+ * TRA-4805 — `lane` is an OPT-IN, and the default keeps every existing caller
+ * exactly where it was (`crumb`).
+ *
+ * The chart endpoint does not request a crumb either (no `needsCrumb` in
+ * `yahoo-finance2/esm/src/modules/chart.js`), so on the evidence it deserves its
+ * own lane the same way `search` does — and the catalyst enrichment, which is
+ * the OTHER half of this outage, is starved through exactly that door:
+ * 2026-09-17 closed with quote coverage 5/22 = 0.227 and 09-18 with 0/7, both
+ * below the 0.50 floor, so `isCatalystRunDegraded` can fail a run on the price
+ * feed even once the news feed is answering.
+ *
+ * It is NOT opted in wholesale, deliberately. `fetchDailyCandles` sits on the
+ * SMA-200 scan, the minute-bar fallback and the market-review trend pull, and
+ * TRA-1391 is on record that letting a Yahoo fan-out run while the breaker is
+ * open is what produced the bqb1 health-timeout restart loop. Widening the
+ * chart lane is a volume decision that wants its own measurement, not a
+ * side-effect of a news fix. The catalyst path opts in because it is bounded at
+ * 25 symbols per sweep and capped at 3 sweeps per window (TRA-4682/TRA-4901),
+ * i.e. ≤75 chart calls per session — which cannot reconstitute a storm.
  */
-export async function fetchDailyCandles(symbol: string, count = 30): Promise<Candle[]> {
+export async function fetchDailyCandles(
+  symbol: string,
+  count = 30,
+  lane: YahooBreakerLane = 'crumb',
+): Promise<Candle[]> {
   const now = new Date();
   // Pull a generous calendar window so weekends/holidays still leave `count`
   // trading sessions: ~1.6 calendar days per trading day, plus a week of slack.
   const from = new Date(now.getTime() - (count * 1.6 + 7) * 24 * 60 * 60 * 1000);
-  const result = await withRetry(
+  const result = (await withRetryOutcome(
     // TRA-3068 — `events` is the whole cost of the split calendar. Same route,
     // same round trip, one extra query-string key.
     () => yf.chart(symbol, { period1: from, period2: now, interval: '1d', events: 'div|split' }),
     `dailyChart(${symbol})`,
-  );
+    YF_RETRIES,
+    lane,
+  )).value;
   if (!result) return [];
   recordChartSplits(symbol, result);
   const candles: Candle[] = (result.quotes ?? [])
@@ -3026,6 +3132,24 @@ export async function fetchStocksNews(symbols: readonly string[]): Promise<NewsI
   return items.slice(0, RESULT_CAP);
 }
 
+/**
+ * TRA-4805 — the per-query failure census of one news sweep, by cause.
+ *
+ * Sums to `queriesAttempted - queriesSucceeded`. `breakerOpen > 0` means that
+ * many queries NEVER LEFT THE BOX, which is a statement about us, not about
+ * Yahoo — read it before concluding anything about the vendor.
+ */
+export interface MarketNewsFailures {
+  /** Short-circuited on the open search-lane breaker; no request issued. */
+  breakerOpen: number;
+  /** A request was issued and came back 429 / crumb-refused. */
+  rateLimited: number;
+  /** A request was issued and did not answer inside `YF_CALL_TIMEOUT_MS`. */
+  timeout: number;
+  /** A request was issued and failed for any other reason. */
+  error: number;
+}
+
 /** Outcome of a {@link fetchMarketNews} sweep — headlines PLUS feed health. */
 export interface MarketNewsResult {
   items: NewsItem[];
@@ -3033,6 +3157,17 @@ export interface MarketNewsResult {
   queriesAttempted: number;
   /** Queries that returned a response. `0` with `attempted > 0` ⇒ feed outage. */
   queriesSucceeded: number;
+  /**
+   * TRA-4805 — WHY the shortfall. Optional because a hand-built
+   * `MarketNewsResult` in a test predates the field, and because an absent
+   * census must read as NOT MEASURED rather than as four measured zeros.
+   */
+  failures?: MarketNewsFailures;
+  /**
+   * First distinct failure message of the sweep, verbatim, or `null` when every
+   * query answered. The rolled-up counts say how many; this says what it said.
+   */
+  firstFailureMessage?: string | null;
 }
 
 // TRA-1629 (TRA-1623A) — news pull for catalyst discovery.
@@ -3074,6 +3209,8 @@ export async function fetchMarketNews(symbols: readonly string[] = []): Promise<
   const seen = new Set<string>();
   let queriesAttempted = 0;
   let queriesSucceeded = 0;
+  const failures: MarketNewsFailures = { breakerOpen: 0, rateLimited: 0, timeout: 0, error: 0 };
+  let firstFailureMessage: string | null = null;
   const collect = (
     query: string,
     newsArr: ReadonlyArray<{
@@ -3114,19 +3251,34 @@ export async function fetchMarketNews(symbols: readonly string[] = []): Promise<
     queriesAttempted += slice.length;
     const settled = await Promise.all(
       slice.map((q) =>
-        withRetry(
+        // TRA-4805 — the `search` LANE. `yf.search` does not fetch a crumb, so
+        // it must not be silenced by the crumb lane that the 577-symbol quote
+        // fan-out keeps permanently open. See {@link YahooBreakerLane}.
+        withRetryOutcome(
           () => yf.search(q, { newsCount: PER_QUERY_NEWS, quotesCount: 0 }),
           `search(market news "${q}")`,
+          YF_RETRIES,
+          'search',
         ),
       ),
     );
     for (const [idx, r] of settled.entries()) {
-      // `withRetry` yields `null` on exhaustion. Counting only non-null keeps a
-      // feed outage separable from a genuinely quiet news day — the two used to
-      // land on the identical empty array.
-      if (!r) continue;
+      // A failed call yields `value: null` on exhaustion. Counting only non-null
+      // keeps a feed outage separable from a genuinely quiet news day — the two
+      // used to land on the identical empty array. TRA-4805 additionally keeps
+      // the four CAUSES separable, because "we never asked" and "Yahoo refused"
+      // also used to land on the identical `queriesSucceeded: 0`.
+      if (!r.value) {
+        const f = r.failure ?? { kind: 'error' as const, message: 'unclassified' };
+        if (f.kind === 'breaker_open') failures.breakerOpen += 1;
+        else if (f.kind === 'rate_limited') failures.rateLimited += 1;
+        else if (f.kind === 'timeout') failures.timeout += 1;
+        else failures.error += 1;
+        firstFailureMessage ??= `${f.kind}: ${f.message}`;
+        continue;
+      }
       queriesSucceeded += 1;
-      collect(slice[idx]!, r.news ?? []);
+      collect(slice[idx]!, r.value.news ?? []);
     }
     if (i + NEWS_BATCH < queries.length) await sleep(BATCH_PAUSE_MS);
   }
@@ -3178,7 +3330,7 @@ export async function fetchMarketNews(symbols: readonly string[] = []): Promise<
   // Callers receive a recency-ordered list, exactly as before — the interleave
   // decides MEMBERSHIP, not the emitted order.
   items.sort((a, b) => b.publishedAt.localeCompare(a.publishedAt));
-  return { items, queriesAttempted, queriesSucceeded };
+  return { items, queriesAttempted, queriesSucceeded, failures, firstFailureMessage };
 }
 
 /** Test Yahoo Finance connectivity — returns a quote or throws. */
@@ -3223,7 +3375,7 @@ export async function testTwelveData(): Promise<{ symbol: string; bars: number }
 /**
  * Whether the Yahoo rate-limit circuit breaker is currently open.
  *
- * TRA-4457 — this flag is GLOBAL to the whole Yahoo client (`rateLimitedUntil`,
+ * TRA-4457 — this flag gates the whole CRUMB lane (`rateLimitedUntil.crumb`,
  * checked at the top of every `withRetry`), so it gates the daily-BAR pull
  * `fetchDailyCandles` just as hard as the quote fan-out that usually trips it.
  * That is the opposite arrangement to the Tradier breaker above, which TRA-1996
@@ -3231,14 +3383,18 @@ export async function testTwelveData(): Promise<{ symbol: string; bars: number }
  * caller that reads an empty bar array therefore cannot tell "upstream had
  * nothing" from "we never asked" without consulting this.
  *
+ * TRA-4805 — it is no longer global to the whole client: `yf.search()` runs on
+ * its own `search` lane (see {@link YahooBreakerLane}), so this returning `true`
+ * says nothing about the news sweep. Pass the lane if you need that one.
+ *
  * ⚠️ For diagnostics it is a SAMPLE, not a proof: the breaker can open or close
  * during a caller's sweep, so a reading taken after a failed call attributes the
  * most recent state, not necessarily the state at the moment of that call. Good
  * enough to separate a starved sweep from a quiet one in aggregate; not good
  * enough to attribute any single symbol with certainty.
  */
-export function isYahooBreakerOpen(): boolean {
-  return isRateLimited();
+export function isYahooBreakerOpen(lane: YahooBreakerLane = 'crumb'): boolean {
+  return isRateLimited(lane);
 }
 
 /**
@@ -3252,7 +3408,12 @@ export function isYahooBreakerOpen(): boolean {
  * that reads as a passing suite.
  */
 export function __resetYahooBreakerForTests(): void {
-  rateLimitedUntil = 0;
+  // TRA-4805 — EVERY lane. A reset that cleared only `crumb` would leave the
+  // search lane latched across a suite, which is the exact order-dependence
+  // this seam exists to prevent, one lane over.
+  rateLimitedUntil.crumb = 0;
+  rateLimitedUntil.search = 0;
+  rateLimitedUntil.chart = 0;
 }
 
 /**
@@ -3260,9 +3421,13 @@ export function __resetYahooBreakerForTests(): void {
  * crypto feed). Yahoo's 429 is per-IP, so a 429 on crypto quotes means the
  * stocks branch is also about to get rate-limited; tripping the shared
  * breaker stops both feeds from hammering YF until the cooldown elapses.
+ *
+ * TRA-4805 — trips the CRUMB lane only, because every caller of this is a
+ * crumb-bearing quote path. Widening it to the search lane would re-create the
+ * starvation this ticket removed, through a different door.
  */
 export function tripYahooBreakerFromExternal(label: string, msg: string): void {
-  tripBreaker(label, msg);
+  tripBreaker(label, msg, 'crumb');
 }
 
 /** Whether the Tradier circuit breaker is currently open. */
@@ -3290,11 +3455,21 @@ export function getFeedDegradationState(): {
     quotePathOpen: boolean;
     barPathOpen: boolean;
   };
-  yahoo: { open: boolean; blockedUntil: string | null };
+  // TRA-4805 — `open`/`blockedUntil` keep their meaning (the CRUMB lane, which
+  // is what every pre-existing reader of this field was asking about). The
+  // search lane is reported ALONGSIDE, never folded in: it is the lane the news
+  // sweep runs on, and for 3 sessions it was blamed for a crumb-lane outage.
+  yahoo: {
+    open: boolean;
+    blockedUntil: string | null;
+    searchOpen: boolean;
+    searchBlockedUntil: string | null;
+  };
   fanoutBudgetMs: number;
 } {
   const tradierOpen = isTradierBlocked();
-  const yahooOpen = isRateLimited();
+  const yahooOpen = isRateLimited('crumb');
+  const yahooSearchOpen = isRateLimited('search');
   return {
     tradier: {
       open: tradierOpen,
@@ -3311,7 +3486,9 @@ export function getFeedDegradationState(): {
     },
     yahoo: {
       open: yahooOpen,
-      blockedUntil: yahooOpen ? new Date(rateLimitedUntil).toISOString() : null,
+      blockedUntil: yahooOpen ? new Date(rateLimitedUntil.crumb).toISOString() : null,
+      searchOpen: yahooSearchOpen,
+      searchBlockedUntil: yahooSearchOpen ? new Date(rateLimitedUntil.search).toISOString() : null,
     },
     fanoutBudgetMs: FEED_FANOUT_BUDGET_MS,
   };

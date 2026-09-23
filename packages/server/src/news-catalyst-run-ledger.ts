@@ -92,6 +92,30 @@ export interface CatalystRunRecord {
    */
   quotesAttempted: number | null;
   quotesOk: number | null;
+  /**
+   * TRA-4805 — WHY the news queries that failed, failed, split by cause.
+   *
+   * `queriesSucceeded: 0` is four different incidents wearing one number, and
+   * the 2026-09-18 → 09-22 outage is the proof: all 25 queries "failed" without
+   * a single HTTP request leaving the box, because the shared Yahoo crumb-lane
+   * breaker was latched open by the quote fan-out. On the old surface that is
+   * byte-identical to a dead vendor, which is how a 5-day outage got triaged as
+   * a scheduler gap and then as a credential/billing event.
+   *
+   * `breakerOpen > 0` ⇒ OURS (self-inflicted starvation). `rateLimited > 0` ⇒
+   * THEIRS (we asked, Yahoo refused). They have opposite remediations.
+   *
+   * `null`/absent when NOT MEASURED — a run written before this field, or a run
+   * whose feed threw before reporting. Never synthesise four zeros for it.
+   */
+  feedFailures?: {
+    breakerOpen: number;
+    rateLimited: number;
+    timeout: number;
+    error: number;
+  } | null;
+  /** TRA-4805 — first verbatim failure message of the sweep, or `null`. */
+  feedFirstFailure?: string | null;
   /** Error message on the failure outcomes. */
   reason?: string;
 }
@@ -331,6 +355,14 @@ export interface CatalystRunSummary {
   /** TRA-2064 — feed health on the last run; see {@link CatalystRunRecord}. */
   lastRunQueriesAttempted: number | null;
   lastRunQueriesSucceeded: number | null;
+  /**
+   * TRA-4805 — the per-cause census behind `lastRunQueriesSucceeded`, or `null`
+   * ⇔ NOT MEASURED. Read this BEFORE concluding anything about the vendor: a
+   * non-zero `breakerOpen` means those queries never left the box.
+   */
+  lastRunFeedFailures: CatalystRunRecord['feedFailures'];
+  /** TRA-4805 — first verbatim sweep failure message on the last run. */
+  lastRunFeedFirstFailure: string | null;
   /** TRA-4585 — price-feed health on the last run; see {@link CatalystRunRecord}. */
   lastRunQuotesAttempted: number | null;
   lastRunQuotesOk: number | null;
@@ -547,6 +579,10 @@ export async function summarizeCatalystRuns(tail = 20): Promise<CatalystRunSumma
     // such key, and an absent measurement is `null`, never `0`.
     lastRunQueriesAttempted: last?.queriesAttempted ?? null,
     lastRunQueriesSucceeded: last?.queriesSucceeded ?? null,
+    // TRA-4805 — `?? null` for the same reason again: a run predating the
+    // census has no such key, and "not measured" is `null`, never `{0,0,0,0}`.
+    lastRunFeedFailures: last?.feedFailures ?? null,
+    lastRunFeedFirstFailure: last?.feedFirstFailure ?? null,
     // Same `?? null` for the same reason — a run written before TRA-4585 has no
     // such key, and "not measured" is `null`, never `0`.
     lastRunQuotesAttempted: last?.quotesAttempted ?? null,

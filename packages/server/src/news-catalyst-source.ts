@@ -255,9 +255,17 @@ function zScore(value: number, history: readonly number[]): number {
  * completed session's read (a documented Phase-1 proxy — the memo §6 flags free-
  * news/data latency as exactly what validation measures). `avgDollarVol` and
  * `price` come from the same window. Degrades to neutral values on a thin feed.
+ *
+ * TRA-4805 — runs on the `chart` breaker lane, not the `crumb` lane that the
+ * 577-symbol quote fan-out keeps permanently open. This is the PRICE half of
+ * the same starvation: `candles.length < 2` returns `price: null`, which
+ * `hasUsableQuote` counts as an unquoted candidate, which drags the run's quote
+ * coverage under the 0.50 floor and marks it degraded — 09-17 closed at 5/22
+ * (0.227) and 09-18 at 0/7. Fixing the news sweep alone would have left
+ * `healthyRuns` pinned at 0 through a second, differently-named door.
  */
 export async function fetchCatalystMetrics(symbol: string): Promise<CatalystMetrics> {
-  const candles = await fetchDailyCandles(symbol, 22).catch(() => []);
+  const candles = await fetchDailyCandles(symbol, 22, 'chart').catch(() => []);
   if (candles.length < 2) {
     return { price: null, avgDollarVol: null, rvolZ: 0, gapPct: 0 };
   }
@@ -330,6 +338,38 @@ interface CatalystSweepResult {
   pool: CatalystCandidate[] | null;
 }
 
+/**
+ * TRA-4805 — render the sweep's failure census into the one-line `reason` that
+ * the run ledger and the health route both carry.
+ *
+ * The old constant string, `'all market-news queries failed'`, is the sentence
+ * three separate triages read and drew three different wrong conclusions from
+ * (scheduler gap, loop-cap regression, credential/billing event). It could not
+ * have distinguished them: the dominant real cause was `breaker_open`, which
+ * means no request was issued at all. Naming the dominant cause inline costs
+ * nothing and dates an episode instantly.
+ *
+ * Falls back to the old string verbatim when the census is absent, so a caller
+ * that never measured does not get a fabricated attribution.
+ */
+export function describeFeedFailure(feed: MarketNewsResult): string {
+  const f = feed.failures;
+  if (!f) return 'all market-news queries failed';
+  const parts = (
+    [
+      ['breaker_open', f.breakerOpen],
+      ['rate_limited', f.rateLimited],
+      ['timeout', f.timeout],
+      ['error', f.error],
+    ] as const
+  )
+    .filter(([, n]) => n > 0)
+    .map(([k, n]) => `${k} x${n}`);
+  if (parts.length === 0) return 'all market-news queries failed';
+  const head = `all ${feed.queriesAttempted} market-news queries failed (${parts.join(', ')})`;
+  return feed.firstFailureMessage ? `${head}: ${feed.firstFailureMessage}` : head;
+}
+
 async function runCatalystSweep(deps: CatalystSourceDeps): Promise<CatalystSweepResult> {
   let feed: MarketNewsResult;
   try {
@@ -366,8 +406,14 @@ async function runCatalystSweep(deps: CatalystSourceDeps): Promise<CatalystSweep
   // a quiet news day writes. Separate it BEFORE the mapping step so an outage
   // can never again be filed as "no catalysts today".
   if (feed.queriesAttempted > 0 && feed.queriesSucceeded === 0) {
+    // TRA-4805 — carry the CAUSE, not just the count. `reason` was a single
+    // rolled-up string ("all market-news queries failed") that is emitted
+    // identically whether we were refused by Yahoo or never asked it, and the
+    // 09-18 → 09-22 outage was the latter for 3 straight sessions.
     log.warn('news-catalyst: every market-news query failed', {
       queriesAttempted: feed.queriesAttempted,
+      failures: feed.failures ?? null,
+      firstFailure: feed.firstFailureMessage ?? null,
     });
     await recordCatalystRun({
       at: deps.now,
@@ -380,7 +426,9 @@ async function runCatalystSweep(deps: CatalystSourceDeps): Promise<CatalystSweep
       // Returned before enrichment — no quote requested. See above.
       quotesAttempted: null,
       quotesOk: null,
-      reason: 'all market-news queries failed',
+      feedFailures: feed.failures ?? null,
+      feedFirstFailure: feed.firstFailureMessage ?? null,
+      reason: describeFeedFailure(feed),
     });
     return { picks: [], pool: null };
   }
@@ -396,6 +444,10 @@ async function runCatalystSweep(deps: CatalystSourceDeps): Promise<CatalystSweep
       chosenCount: 0,
       queriesAttempted: feed.queriesAttempted,
       queriesSucceeded: feed.queriesSucceeded,
+      // TRA-4805 — carried on the HEALTHY paths too: a sweep that answered 9 of
+      // 25 is a partial outage, and the census is the only place that says so.
+      feedFailures: feed.failures ?? null,
+      feedFirstFailure: feed.firstFailureMessage ?? null,
       // Zero candidates mapped, so zero names to price. `0`/`0` is MEASURED
       // here — and `isCatalystRunDegraded` requires `quotesAttempted > 0`, so a
       // genuinely quiet news day is correctly NOT degraded by the quote arm.
@@ -466,6 +518,10 @@ async function runCatalystSweep(deps: CatalystSourceDeps): Promise<CatalystSweep
     chosenCount: picks.length,
     queriesAttempted: feed.queriesAttempted,
     queriesSucceeded: feed.queriesSucceeded,
+      // TRA-4805 — carried on the HEALTHY paths too: a sweep that answered 9 of
+      // 25 is a partial outage, and the census is the only place that says so.
+      feedFailures: feed.failures ?? null,
+      feedFirstFailure: feed.firstFailureMessage ?? null,
     quotesAttempted,
     quotesOk,
     ...(degradedRun
@@ -482,6 +538,10 @@ async function runCatalystSweep(deps: CatalystSourceDeps): Promise<CatalystSweep
       quotesOk,
       queriesAttempted: feed.queriesAttempted,
       queriesSucceeded: feed.queriesSucceeded,
+      // TRA-4805 — carried on the HEALTHY paths too: a sweep that answered 9 of
+      // 25 is a partial outage, and the census is the only place that says so.
+      feedFailures: feed.failures ?? null,
+      feedFirstFailure: feed.firstFailureMessage ?? null,
       candidates: scored.length,
     });
   }
