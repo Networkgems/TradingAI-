@@ -18648,14 +18648,39 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
     const v = results[key];
     return v && typeof v === 'object' && !('error' in (v as object)) && !('skipped' in (v as object));
   };
-  // TRA-1035 — `yahooChartQuote` is the keyless chart-endpoint quote path. It
-  // counts toward `stocksOk` because the equity engine prices the universe
-  // through the same `fetchQuote`/`fetchQuotes` cascade (tradier → yahoo quote →
-  // yahoo chart → stooq): when only the Yahoo *quote* endpoint is crumb-broken,
-  // the chart path still serves live prices, so the gauge must report stocks as
-  // up rather than a false outage.
-  const stocksOk = ok('tradier') || ok('yahooFinance') || ok('yahooChartQuote');
-  const allOk = stocksOk;
+  // TRA-4826 — the verdict is the pure `computeQuotesHealthVerdict`, and it consults
+  // BREAKER STATE and CACHE-SERVEDNESS, not just "did an AAPL probe answer". On
+  // 2026-09-23 all three providers were breaker-open in RTH (sweep starved
+  // 21356/21356, zero signals, zero cards) and this route still said `ok: true`,
+  // because the old formula — `ok(tradier) || ok(yahooFinance) || ok(yahooChartQuote)`
+  // — was satisfied by a direct tradier probe that BYPASSES the breaker the real
+  // fetch path honours. The TRA-1035 intent is preserved inside the verdict: the
+  // keyless yahoo chart-quote path still counts toward `stocksOk` (on its OWN
+  // breaker lane, per TRA-4805), so a crumb-only outage still reads stocks-up.
+  const { computeQuotesHealthVerdict } = await import('./quotes-health-verdict.js');
+  const tradierBreakerOpen = isTradierBreakerOpen();
+  const yahooBreakerOpen = isYahooBreakerOpen();
+  // Twelve Data's breaker rides inside its quota state; an `{ error }` there means
+  // the breaker is UNREADABLE, which must degrade (never read as closed).
+  const twelveDataQuotaState = results['twelveDataQuota'];
+  const twelveDataBreakerOpen: boolean | null =
+    twelveDataQuotaState && typeof twelveDataQuotaState === 'object' && !('error' in (twelveDataQuotaState as object))
+      ? (twelveDataQuotaState as { breakerOpen?: unknown }).breakerOpen === true
+      : null;
+  // The minute-bar probe is the one leg that KNOWS it can be cache-served; its
+  // `cached` flag is lifted to the top level so a cache hit is visible without
+  // digging into `results.*` (TRA-4826 acceptance #1). The three quote probes are
+  // direct upstream calls today (no cache on their path), hence `probeCached: false`
+  // — if any of them ever grows a cache, its flag must be wired here or the verdict
+  // regresses to green-off-cached-bytes.
+  const chartFallbackCached =
+    !!chartFallback && typeof chartFallback === 'object' && (chartFallback as { cached?: unknown }).cached === true;
+  const verdict = computeQuotesHealthVerdict({
+    tradier: { probeOk: !!ok('tradier'), probeCached: false, breakerOpen: tradierBreakerOpen },
+    yahooFinance: { probeOk: !!ok('yahooFinance'), probeCached: false, breakerOpen: yahooBreakerOpen },
+    yahooChartQuote: { probeOk: !!ok('yahooChartQuote'), probeCached: false, breakerOpen: isYahooBreakerOpen('chart') },
+    twelveData: { probeOk: !!ok('twelveData'), probeCached: false, breakerOpen: twelveDataBreakerOpen },
+  });
   // TRA-572 diagnostic: report which boot-time env vars the process sees (boolean
   // presence only — no secret values). Lets ops confirm whether Render is actually
   // injecting the credentials before each new process starts.
@@ -18669,11 +18694,17 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
     TRADIER_SANDBOX_ACCOUNT_ID_set: !!process.env['TRADIER_SANDBOX_ACCOUNT_ID'],
   };
   return {
-    ok: allOk,
-    stocksOk,
+    ok: verdict.ok,
+    stocksOk: verdict.stocksOk,
+    // TRA-4826 — `degraded`/`degradedProviders` name WHY `ok` is false while
+    // `stocksOk` may still be true (TRA-783: a twelveData-only breaker must not
+    // page stock-only monitors, but can no longer hide behind a green `ok`).
+    degraded: verdict.degraded,
+    degradedProviders: verdict.degradedProviders,
+    probeCached: { ...verdict.probeCached, chartFallback: chartFallbackCached },
     tradierConfigured: isTradierStocksConfigured(),
-    tradierBreakerOpen: isTradierBreakerOpen(),
-    yahooBreakerOpen: isYahooBreakerOpen(),
+    tradierBreakerOpen,
+    yahooBreakerOpen,
     // TRA-1940 — degraded-feed detail: which provider, why, quota/breaker expiry,
     // and the per-tick secondary-fetch wall-time budget currently enforced.
     feedDegradation: getFeedDegradationState(),
