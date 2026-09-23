@@ -44,8 +44,25 @@
 
 const DEFAULT_HOST = 'https://tradingai-bqb1.onrender.com';
 const AC_BUDGET_MS = 500;
-/** Below this many gradeable per-symbol rows the median is noise, not a verdict. */
+/**
+ * Below this many gradeable per-symbol rows the median is noise, not a verdict —
+ * UNLESS the subscription itself is smaller. The experiment arm is N=25 BY DESIGN
+ * (the issue prescribes it), so an absolute 50 structurally refuses the exact arm
+ * this script exists to grade: the first in-RTH capped run read BLIND at 25/25
+ * quoted, which is EXHAUSTIVE coverage of the subscribed population, not a thin
+ * read. The bar is therefore min(50, subscribed). Post-close thinness is still
+ * caught by the RTH refusal above, and an early-open capped read with only 10 of
+ * 25 quoting still refuses.
+ */
 const MIN_GRADED_ROWS = 50;
+/**
+ * The 09-22 uncapped RTH control (p50 35.6–46.1s; the low end, conservatively).
+ * The experiment's BRANCH turns on collapse vs persistence against THIS — whose
+ * backlog is it — not on the AC budget. A 708ms read is an AC FAIL and still a
+ * 50x collapse; printing "vendor-side, board decision" off it would misname the
+ * cause. The branch and the AC are different questions.
+ */
+const CONTROL_P50_MS = 35_600;
 
 function usage(msg) {
   if (msg) console.error(`[tra4782] ${msg}`);
@@ -169,17 +186,27 @@ const capped = typeof p.symbolLimit === 'number';
 const p50s = reads.map((r) => r.perSymbol.p50).filter((v) => v != null);
 if (p50s.length === 0) blind('no symbol quoted with a gradeable exchange stamp — the market may be closed');
 const worstP50 = Math.max(...p50s);
-const thinnest = Math.min(...reads.map((r) => r.perSymbol.graded));
 // A thin read is BLIND, not a verdict. Both directions matter: a thin FAIL is an
-// accusation off noise, and a thin PASS closes the ticket on nothing.
-const gradeable = rth.open && thinnest >= MIN_GRADED_ROWS;
+// accusation off noise, and a thin PASS closes the ticket on nothing. "Thin" is
+// relative to the subscribed population: a capped run's ceiling IS the cap.
+const minRowsFor = (r) => Math.min(MIN_GRADED_ROWS, r.perSymbol.subscribed);
+const thinRead = reads.find((r) => r.perSymbol.graded < minRowsFor(r));
+const gradeable = rth.open && !thinRead;
 const verdict = !gradeable ? 'BLIND' : worstP50 <= AC_BUDGET_MS ? 'PASS' : 'FAIL';
 const blindReason = gradeable ? null
   : !rth.open ? `outside RTH (${rth.label}) — forced with --allow-outside-rth`
-  : `only ${thinnest} gradeable rows in the thinnest read; ${MIN_GRADED_ROWS} required`;
+  : `a read has only ${thinRead.perSymbol.graded} gradeable rows of ${minRowsFor(thinRead)} required (subscribed=${thinRead.perSymbol.subscribed})`;
+// The branch: whose backlog was the 40s? Collapse ≥10x vs the control names our
+// fan-out; persistence at ≥half the control names the vendor; in between, say
+// "partial collapse" rather than guess a side.
+const branch = !gradeable ? null
+  : !capped ? 'uncapped-control'
+  : worstP50 <= CONTROL_P50_MS / 10 ? 'our-fanout'
+  : worstP50 >= CONTROL_P50_MS / 2 ? 'vendor-side'
+  : 'partial-collapse';
 
 if (opts.json) {
-  console.log(JSON.stringify({ verdict, blindReason, rth: rth.open, acBudgetMs: AC_BUDGET_MS, worstP50, capped, reads: reads.map((r) => ({ at: r.at, perSymbol: r.perSymbol, feed: {
+  console.log(JSON.stringify({ verdict, branch, blindReason, rth: rth.open, acBudgetMs: AC_BUDGET_MS, controlP50Ms: CONTROL_P50_MS, worstP50, capped, reads: reads.map((r) => ({ at: r.at, perSymbol: r.perSymbol, feed: {
     latencyP50Ms: r.payload.latencyP50Ms, latencyP95Ms: r.payload.latencyP95Ms, latencySampleSize: r.payload.latencySampleSize,
     quotesReceived: r.payload.quotesReceived, quotesLatencyGraded: r.payload.quotesLatencyGraded,
     quotesWithStaleEventTime: r.payload.quotesWithStaleEventTime, quotesWithFutureEventTime: r.payload.quotesWithFutureEventTime,
@@ -203,12 +230,15 @@ if (opts.json) {
   console.log(`\nVERDICT   : ${verdict} — worst per-symbol p50 across ${reads.length} read(s) = ${worstP50}ms vs the ${AC_BUDGET_MS}ms AC`);
   if (!gradeable) {
     console.log(`BRANCH    : NOT GRADED — ${blindReason}. These numbers are printed, not believed.`);
+  } else if (branch === 'uncapped-control') {
+    console.log(`BRANCH    : UNCAPPED — this read is the control arm, not the experiment. Set TRADIER_STREAM_SYMBOL_LIMIT and re-deploy.`);
   } else {
-    console.log(`BRANCH    : ${capped
-      ? (verdict === 'PASS'
-        ? 'capped AND under budget ⇒ the cause is OUR fan-out / consumer backpressure. Remedy: a bounded subscription.'
-        : 'capped AND still late ⇒ the cause is VENDOR-SIDE on /markets/events. AC #1 is not reachable on this path as configured — board decision.')
-      : 'UNCAPPED — this read is the control arm, not the experiment. Set TRADIER_STREAM_SYMBOL_LIMIT and re-deploy.'}`);
+    console.log(`BRANCH    : ${{
+      'our-fanout': `capped and p50 collapsed ${(CONTROL_P50_MS / worstP50).toFixed(0)}x vs the ${CONTROL_P50_MS}ms control ⇒ the 40s backlog was OUR 822-symbol fan-out / consumer backpressure. Remedy: a bounded subscription.`,
+      'vendor-side': `capped AND p50 still at ≥half the ${CONTROL_P50_MS}ms control ⇒ the cause is VENDOR-SIDE on /markets/events. AC #1 is not reachable on this path as configured — board decision.`,
+      'partial-collapse': `capped and p50 fell to ${worstP50}ms — under half the ${CONTROL_P50_MS}ms control but not a ≥10x collapse. PARTIAL: name it, don't guess a side.`,
+    }[branch]}`);
+    console.log(`AC #1     : ${verdict} at N=${p.symbolLimit} — worst per-symbol p50 ${worstP50}ms vs the ${AC_BUDGET_MS}ms budget. The branch and the AC are different questions; this line is the AC's.`);
   }
 }
 
