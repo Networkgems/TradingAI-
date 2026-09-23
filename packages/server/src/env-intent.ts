@@ -110,19 +110,22 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
   },
   {
     key: 'TRADIER_ENV',
-    intended: 'production',
+    intended: 'sandbox',
     provenance:
-      "TRA-2163 verified this by value as 'production' on 2026-07-23 and AGENTS.md still records it that way. " +
-      'It reads `sandbox` on bqb1 today. TRA-4801 dated the change to the only env-var write in the bracket ' +
-      "[09-18T14:33Z last 'production' reading, 09-22T19:29Z first 'sandbox' reading]: 2026-09-21T02:08:37.612656Z, " +
-      'about 20h after the TRA-4750 option-book stand-down, so it was most likely a deliberate execution of it. ' +
-      '⚠️ THIS ROW IS EXPECTED TO READ MISMATCH UNTIL SOMEONE RULES. That is deliberate and it is the whole ' +
-      'point of the manifest: the stand-down already has its own lever (ENABLE_OPTION_LIVE_OTM), whereas ' +
-      'TRADIER_ENV routes ALL Tradier credentials, not just options — a strictly broader posture change that ' +
-      "no ruling on the record covers. TRA-1655's G2 unblock condition is explicitly `TRADIER_ENV == production`. " +
-      'Do NOT "resolve" this by flipping the row to `sandbox`: that silently ratifies an unruled change, which ' +
-      'is the TRA-4442 shape. Either the board ratifies sandbox (then edit this row, citing the ruling) or the ' +
-      'env goes back to production. Same discipline as the ENABLE_OPTION_LIVE_OTM row above.',
+      "TRA-2163 verified this by value as 'production' on 2026-07-23 (the go-live routing) and AGENTS.md still " +
+      'records that restoration. It reads `sandbox` on bqb1 today. TRA-4801 dated the change to the only env-var ' +
+      "write in the bracket [09-18T14:33Z last 'production' reading, 09-22T19:29Z first 'sandbox' reading]: " +
+      '2026-09-21T02:08:37.612656Z (dep-dao939egekts73bbv9cg, envUpdated:true, NO actor on the event), about 20h ' +
+      'after the TRA-4750 option-book stand-down — most likely a deliberate execution of it, but the actor is ' +
+      'unidentified and stays under TRA-4820/TRA-4821. ' +
+      "INTENT RULED 'sandbox' BY THE CTO ON TRA-4801 (2026-09-23), per that issue's own ask 3 (the posture call " +
+      'is reserved to the CTO there): while the TRA-4750 stand-down is in force nothing armed consumes the ' +
+      'production pair, so the event this row must catch is a silent re-point to `production` — the ' +
+      'risk-INCREASING direction. The ruling ratifies the POSTURE, not the unattributed 09-21 write. ' +
+      "Re-arming needs the TRA-4750 item 5 board sign-off and flips this row AND the env var in the same change " +
+      "(which is also what satisfies TRA-1655's G2 unblock condition, `TRADIER_ENV == production`, at go-live). " +
+      "A 'production' or 'unrecognized' reading here is the event to escalate — never edit this row alone to " +
+      'clear it. Same discipline as the ENABLE_OPTION_LIVE_OTM row above.',
     // Resolve the way the CREDENTIAL ROUTER does (index.ts ~1243), because that
     // is the read with consequences:
     //   const tradierEnv = (process.env['TRADIER_ENV'] as ...) ?? 'sandbox';

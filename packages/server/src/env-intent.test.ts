@@ -8,10 +8,11 @@ import { PRODUCTION_ENV_INTENT, summarizeEnvIntent } from './env-intent.js';
 const RULED_PROD_ENV: NodeJS.ProcessEnv = {
   NODE_ENV: 'production',
   DURABILITY_POLICY: 'refuse',
-  // TRA-4801 — intent of record is `production` (TRA-2163, AGENTS.md). Note the
-  // LIVE box reads `sandbox` as of 2026-09-21, so this fixture is the ruled
-  // posture, not the current one; that divergence is the finding, not a bug here.
-  TRADIER_ENV: 'production',
+  // TRA-4801 — intent RULED `sandbox` by the CTO on that issue (2026-09-23),
+  // while the TRA-4750 option-book stand-down is in force: nothing armed
+  // consumes the production credential pair, so the event to catch inverted to
+  // a silent re-point to `production`. bqb1 stores the explicit `sandbox`.
+  TRADIER_ENV: 'sandbox',
   // ENABLE_ORDER_QUOTE_GUARD / ENABLE_OPTION_LIVE_RV_LONG / _DIRECTIONAL absent:
   // their intent is `off` and their code default is off — absence MATCHES.
   // ENABLE_OPTION_LIVE_OTM joined them on 2026-09-22: TRA-4750 stood the sleeve
@@ -85,28 +86,35 @@ describe('summarizeEnvIntent (TRA-4474)', () => {
   });
 
   // ── TRA-4801: TRADIER_ENV ────────────────────────────────────────────────
-  it('THE FLIP: TRADIER_ENV=sandbox on the money host is a named mismatch', () => {
-    const s = summarizeEnvIntent({ ...RULED_PROD_ENV, TRADIER_ENV: 'sandbox' });
+  // These assertions RAN THE OTHER WAY between d98c411d and the CTO ruling of
+  // 2026-09-23: the row shipped `intended: 'production'` (TRA-2163's verified
+  // value) as a deliberate standing mismatch until someone ruled on the 09-21
+  // flip. The ruling landed on TRA-4801: `sandbox` while the TRA-4750
+  // stand-down is in force, so the mismatch to catch inverted with it.
+  it('THE RE-POINT: TRADIER_ENV=production on the stood-down money host is a named mismatch', () => {
+    const s = summarizeEnvIntent({ ...RULED_PROD_ENV, TRADIER_ENV: 'production' });
     expect(s.ok).toBe(false);
     expect(s.mismatches).toContain('TRADIER_ENV');
     expect(s.levers.find((l) => l.key === 'TRADIER_ENV')).toMatchObject({
-      intended: 'production',
-      effective: 'sandbox',
+      intended: 'sandbox',
+      effective: 'production',
       present: true,
       matches: false,
     });
   });
 
-  it('an ABSENT TRADIER_ENV resolves sandbox like the credential router, and mismatches', () => {
+  it('an ABSENT TRADIER_ENV resolves sandbox like the credential router, and MATCHES the ruled intent', () => {
     const { TRADIER_ENV: _gone, ...noKey } = RULED_PROD_ENV;
     const s = summarizeEnvIntent(noKey);
-    expect(s.mismatches).toContain('TRADIER_ENV');
+    expect(s.mismatches).not.toContain('TRADIER_ENV');
     // index.ts: `(process.env['TRADIER_ENV'] as ...) ?? 'sandbox'` — absence
-    // silently routes SANDBOX credentials, which is the whole hazard.
+    // routes SANDBOX credentials, which is now also the ruled posture. The
+    // present:false bit keeps a wipe distinguishable from the stored label.
     expect(s.levers.find((l) => l.key === 'TRADIER_ENV')).toMatchObject({
       present: false,
       raw: null,
       effective: 'sandbox',
+      matches: true,
     });
   });
 
@@ -114,7 +122,8 @@ describe('summarizeEnvIntent (TRA-4474)', () => {
     const s = summarizeEnvIntent({ ...RULED_PROD_ENV, TRADIER_ENV: ' production ' });
     // The credential router (`=== 'production'`, no trim) hands out SANDBOX creds,
     // while /api/health/live-equity (`.trim() === 'production'`) reports production.
-    // Collapsing this into 'sandbox' would hide that disagreement.
+    // Collapsing this into 'sandbox' would hide that disagreement — and, now that
+    // `sandbox` is the ruled intent, would silently grade it GREEN.
     expect(s.levers.find((l) => l.key === 'TRADIER_ENV')?.effective).toBe('unrecognized');
     expect(s.mismatches).toContain('TRADIER_ENV');
   });
@@ -138,8 +147,8 @@ describe('summarizeEnvIntent (TRA-4474)', () => {
   it('a recognized label still publishes verbatim — redaction is not blanket suppression', () => {
     const s = summarizeEnvIntent(RULED_PROD_ENV);
     expect(s.levers.find((l) => l.key === 'TRADIER_ENV')).toMatchObject({
-      raw: 'production',
-      effective: 'production',
+      raw: 'sandbox',
+      effective: 'sandbox',
       matches: true,
     });
   });
