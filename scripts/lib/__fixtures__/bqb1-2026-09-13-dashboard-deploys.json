@@ -1,0 +1,169 @@
+{
+  "_comment": "TRA-4789 — VERBATIM GET /v1/services/srv-d7mb7rr7uimc73ev0chg/deploys and /events for tradingai-bqb1. Captured 2026-09-23T10:5xZ. deploys/events cover 2026-09-12T00:00Z..2026-09-14T00:00Z (the three dashboard-button deploys of 09-13, b22a9999) plus the 2026-09-21T02:08Z service_updated deploy. Commit messages are left intact. These are the bytes the detector must still classify as BYPASS; if it ever reads them CLEAN the instrument is broken.",
+  "capturedAt": "2026-09-23T10:51:37.983Z",
+  "serviceId": "srv-d7mb7rr7uimc73ev0chg",
+  "deploys": [
+    {
+      "deploy": {
+        "id": "dep-daj9nl1594qs73bbhcg0",
+        "commit": {
+          "id": "b22a999935889d76a794a09ad027901f6399c097",
+          "message": "feat(TRA-4535): render-redeploy refuses a second commit advance into one freeze window (exit 10)\n\nBoard ruling A (TRA-4383, card c4dd383c) caps bqb1 at ONE deploy train per day through\n2026-09-18. Nothing on the deploy path executed that ceiling, so it held only as prose: the\n09-09 window carried 9 commit advances past every gate, and on 09-10 the stopgap EMBARGOES row\nlost a race by 34s (committed 22:07:00Z; dep-dahik9m1 advanced b5c76cc1 -> 05be2d16 at 22:07:34Z\nfrom a checkout that did not hold it).\n\nThe cadence gate counts COMMIT ADVANCES off Render's own deploy history for the current window\nand refuses one more once the quota is reached, under a new exit code 10 with its own override\n(--override-cadence=\"TRA-#### why\", must name a ticket).\n\n- Counted: a deploy whose commit differs from the previous counting deploy's. Failed/canceled\n  deploys neither count nor move the baseline. In-flight deploys count. A same-SHA redeploy\n  (env-apply) is never counted and never refused.\n- Window: [D 20:00Z, D+1 20:00Z), half-open. This is deliberately wider than the ticket's\n  [20:00Z, 13:25Z). The narrower shape leaves an RTH-override deploy, and any weekend-afternoon\n  deploy, in no window at all.\n- Fails closed: an unreadable history, one that does not reach back to a baseline, or a spent\n  window with an unreadable live sha is BLIND and exits 10.\n- Dated: active only inside a CADENCE_CEILINGS row. The first is 2026-09-08T18:50Z ->\n  2026-09-19T04:00Z (TRA-4384, max 1), and the gate is inert outside it. Scoped to bqb1.\n\nControls (check:deploy-gates, 204/204):\n- a REPLAY of bqb1's real Render history for 09-08..09-10: in the TRA-4535 table row 1 PROCEEDS\n  and rows 2-9 REFUSE, and the window counts come out 5 / 9 / 2;\n- one-variable pairs: same-SHA, BLIND, the half-open boundary, row edges, failed statuses,\n  weekend and RTH-override;\n- the shipped main() spawned against the read-only stub, which gained optional deploys/health\n  keys.\nTen mutations of the gate, including deleting the call site, each turn the suite red.\ncheck:arg-guard knows --override-cadence and refuses a misspelling of it.\n\nA dry run against the live history on 2026-09-10T22:31Z: --commit=<tip> exits 10 with 2 advances\ncounted; --commit=<live 05be2d16> proceeds as SAME_SHA.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "createdAt": "2026-09-10T22:41:03Z"
+        },
+        "status": "deactivated",
+        "trigger": "manual",
+        "createdAt": "2026-09-13T12:49:24.29899Z",
+        "updatedAt": "2026-09-15T20:11:23.439209Z",
+        "startedAt": "2026-09-13T12:49:24.27585Z",
+        "finishedAt": "2026-09-13T12:52:08.293041Z"
+      },
+      "cursor": "qaO5T3C5T3lubDE1OTRxczczYmJoY2cw"
+    },
+    {
+      "deploy": {
+        "id": "dep-daj2nhbm8hqs73enqj00",
+        "commit": {
+          "id": "b22a999935889d76a794a09ad027901f6399c097",
+          "message": "feat(TRA-4535): render-redeploy refuses a second commit advance into one freeze window (exit 10)\n\nBoard ruling A (TRA-4383, card c4dd383c) caps bqb1 at ONE deploy train per day through\n2026-09-18. Nothing on the deploy path executed that ceiling, so it held only as prose: the\n09-09 window carried 9 commit advances past every gate, and on 09-10 the stopgap EMBARGOES row\nlost a race by 34s (committed 22:07:00Z; dep-dahik9m1 advanced b5c76cc1 -> 05be2d16 at 22:07:34Z\nfrom a checkout that did not hold it).\n\nThe cadence gate counts COMMIT ADVANCES off Render's own deploy history for the current window\nand refuses one more once the quota is reached, under a new exit code 10 with its own override\n(--override-cadence=\"TRA-#### why\", must name a ticket).\n\n- Counted: a deploy whose commit differs from the previous counting deploy's. Failed/canceled\n  deploys neither count nor move the baseline. In-flight deploys count. A same-SHA redeploy\n  (env-apply) is never counted and never refused.\n- Window: [D 20:00Z, D+1 20:00Z), half-open. This is deliberately wider than the ticket's\n  [20:00Z, 13:25Z). The narrower shape leaves an RTH-override deploy, and any weekend-afternoon\n  deploy, in no window at all.\n- Fails closed: an unreadable history, one that does not reach back to a baseline, or a spent\n  window with an unreadable live sha is BLIND and exits 10.\n- Dated: active only inside a CADENCE_CEILINGS row. The first is 2026-09-08T18:50Z ->\n  2026-09-19T04:00Z (TRA-4384, max 1), and the gate is inert outside it. Scoped to bqb1.\n\nControls (check:deploy-gates, 204/204):\n- a REPLAY of bqb1's real Render history for 09-08..09-10: in the TRA-4535 table row 1 PROCEEDS\n  and rows 2-9 REFUSE, and the window counts come out 5 / 9 / 2;\n- one-variable pairs: same-SHA, BLIND, the half-open boundary, row edges, failed statuses,\n  weekend and RTH-override;\n- the shipped main() spawned against the read-only stub, which gained optional deploys/health\n  keys.\nTen mutations of the gate, including deleting the call site, each turn the suite red.\ncheck:arg-guard knows --override-cadence and refuses a misspelling of it.\n\nA dry run against the live history on 2026-09-10T22:31Z: --commit=<tip> exits 10 with 2 advances\ncounted; --commit=<live 05be2d16> proceeds as SAME_SHA.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "createdAt": "2026-09-10T22:41:03Z"
+        },
+        "status": "deactivated",
+        "trigger": "manual",
+        "createdAt": "2026-09-13T04:51:17.81356Z",
+        "updatedAt": "2026-09-13T12:52:08.291959Z",
+        "startedAt": "2026-09-13T04:51:17.788176Z",
+        "finishedAt": "2026-09-13T04:54:02.383846Z"
+      },
+      "cursor": "S1d6dw5Yu9BuaGJtOGhxczczZW5xajAw"
+    },
+    {
+      "deploy": {
+        "id": "dep-daj21q7qj5pc73bvbul0",
+        "commit": {
+          "id": "b22a999935889d76a794a09ad027901f6399c097",
+          "message": "feat(TRA-4535): render-redeploy refuses a second commit advance into one freeze window (exit 10)\n\nBoard ruling A (TRA-4383, card c4dd383c) caps bqb1 at ONE deploy train per day through\n2026-09-18. Nothing on the deploy path executed that ceiling, so it held only as prose: the\n09-09 window carried 9 commit advances past every gate, and on 09-10 the stopgap EMBARGOES row\nlost a race by 34s (committed 22:07:00Z; dep-dahik9m1 advanced b5c76cc1 -> 05be2d16 at 22:07:34Z\nfrom a checkout that did not hold it).\n\nThe cadence gate counts COMMIT ADVANCES off Render's own deploy history for the current window\nand refuses one more once the quota is reached, under a new exit code 10 with its own override\n(--override-cadence=\"TRA-#### why\", must name a ticket).\n\n- Counted: a deploy whose commit differs from the previous counting deploy's. Failed/canceled\n  deploys neither count nor move the baseline. In-flight deploys count. A same-SHA redeploy\n  (env-apply) is never counted and never refused.\n- Window: [D 20:00Z, D+1 20:00Z), half-open. This is deliberately wider than the ticket's\n  [20:00Z, 13:25Z). The narrower shape leaves an RTH-override deploy, and any weekend-afternoon\n  deploy, in no window at all.\n- Fails closed: an unreadable history, one that does not reach back to a baseline, or a spent\n  window with an unreadable live sha is BLIND and exits 10.\n- Dated: active only inside a CADENCE_CEILINGS row. The first is 2026-09-08T18:50Z ->\n  2026-09-19T04:00Z (TRA-4384, max 1), and the gate is inert outside it. Scoped to bqb1.\n\nControls (check:deploy-gates, 204/204):\n- a REPLAY of bqb1's real Render history for 09-08..09-10: in the TRA-4535 table row 1 PROCEEDS\n  and rows 2-9 REFUSE, and the window counts come out 5 / 9 / 2;\n- one-variable pairs: same-SHA, BLIND, the half-open boundary, row edges, failed statuses,\n  weekend and RTH-override;\n- the shipped main() spawned against the read-only stub, which gained optional deploys/health\n  keys.\nTen mutations of the gate, including deleting the call site, each turn the suite red.\ncheck:arg-guard knows --override-cadence and refuses a misspelling of it.\n\nA dry run against the live history on 2026-09-10T22:31Z: --commit=<tip> exits 10 with 2 advances\ncounted; --commit=<live 05be2d16> proceeds as SAME_SHA.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "createdAt": "2026-09-10T22:41:03Z"
+        },
+        "status": "deactivated",
+        "trigger": "manual",
+        "createdAt": "2026-09-13T04:04:56.649044Z",
+        "updatedAt": "2026-09-13T04:54:02.382826Z",
+        "startedAt": "2026-09-13T04:04:56.622319Z",
+        "finishedAt": "2026-09-13T04:07:45.118362Z"
+      },
+      "cursor": "S1d6dw5Yu9AxcTdxajVwYzczYnZidWww"
+    },
+    {
+      "deploy": {
+        "id": "dep-dao939egekts73bbv9cg",
+        "commit": {
+          "id": "9472ced3fdc68a50f145b17e97f1924c4a6f2bef",
+          "message": "Merge PR #4 (TRA-4901/TRA-4737): midday news-catalyst refresh, with the health probe un-frozen\n\nAdds the missing fourth news checkpoint (onMiddayNews, 12:00-12:30 ET) and\nper-window cache keying so a midday sweep is a real vendor pull rather than a\nreplay of the 09:00 pool.\n\nIncludes the follow-up fix 4fcc3fce: widening the single-slot sweep cache into a\nMap left the health probe resolving its window with [...values()].find(), which\nreturns the OLDEST entry from day 2 onward -- /api/health/news-catalyst-signals\nfroze on day 1 and a dead news feed read healthy:true. Two redundant guards (key\neviction at creation; probe takes the last match), each mutation-graded on its\nown, plus three day-boundary regression cases that fail 3/3 against fee50d1e.\n\nAuthorised by board confirmation 7d5e38ad on TRA-4737 (accepted 2026-09-20T21:54:50Z).\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "createdAt": "2026-09-20T21:57:16Z"
+        },
+        "status": "deactivated",
+        "trigger": "service_updated",
+        "createdAt": "2026-09-21T02:08:37.386633Z",
+        "updatedAt": "2026-09-22T20:27:50.863477Z",
+        "startedAt": "2026-09-21T02:08:38.510871Z",
+        "finishedAt": "2026-09-21T02:09:27.222733Z"
+      },
+      "cursor": "lwy_tVNtDPgzOWVnZWt0czczYmJ2OWNn"
+    }
+  ],
+  "events": [
+    {
+      "event": {
+        "details": {
+          "deployId": "dep-daj9nl1594qs73bbhcg0",
+          "trigger": {
+            "clearCache": false,
+            "deployedByRender": false,
+            "envUpdated": false,
+            "firstBuild": false,
+            "manual": true,
+            "rollback": false,
+            "user": {
+              "email": "eetiennecg@gmail.com",
+              "id": "usr-d7macg0g4nts73ai6p5g"
+            }
+          }
+        },
+        "id": "evt-daj9nl09qbnc73fq6460",
+        "serviceId": "srv-d7mb7rr7uimc73ev0chg",
+        "timestamp": "2026-09-13T12:49:24.538255Z",
+        "type": "deploy_started"
+      },
+      "cursor": "CzAhgtITENtubDA5cWJuYzczZnE2NDYw"
+    },
+    {
+      "event": {
+        "details": {
+          "deployId": "dep-daj2nhbm8hqs73enqj00",
+          "trigger": {
+            "clearCache": false,
+            "deployedByRender": false,
+            "envUpdated": false,
+            "firstBuild": false,
+            "manual": true,
+            "rollback": false,
+            "user": {
+              "email": "eetiennecg@gmail.com",
+              "id": "usr-d7macg0g4nts73ai6p5g"
+            }
+          }
+        },
+        "id": "evt-daj2nhiq185c73akv5d0",
+        "serviceId": "srv-d7mb7rr7uimc73ev0chg",
+        "timestamp": "2026-09-13T04:51:18.039198Z",
+        "type": "deploy_started"
+      },
+      "cursor": "Wm3LMeSfaXluaGlxMTg1YzczYWt2NWQw"
+    },
+    {
+      "event": {
+        "details": {
+          "deployId": "dep-daj21q7qj5pc73bvbul0",
+          "trigger": {
+            "clearCache": false,
+            "deployedByRender": false,
+            "envUpdated": false,
+            "firstBuild": false,
+            "manual": true,
+            "rollback": false,
+            "user": {
+              "email": "eetiennecg@gmail.com",
+              "id": "usr-d7macg0g4nts73ai6p5g"
+            }
+          }
+        },
+        "id": "evt-daj21q09qbnc73fjr8bg",
+        "serviceId": "srv-d7mb7rr7uimc73ev0chg",
+        "timestamp": "2026-09-13T04:04:56.893854Z",
+        "type": "deploy_started"
+      },
+      "cursor": "Wm3LMeSfaXkxcTA5cWJuYzczZmpyOGJn"
+    },
+    {
+      "event": {
+        "details": {
+          "deployId": "dep-dao939egekts73bbv9cg",
+          "trigger": {
+            "clearCache": false,
+            "deployedByRender": false,
+            "envUpdated": true,
+            "firstBuild": false,
+            "manual": false,
+            "rollback": false
+          }
+        },
+        "id": "evt-dao939eeod7s73aulm60",
+        "serviceId": "srv-d7mb7rr7uimc73ev0chg",
+        "timestamp": "2026-09-21T02:08:37.612656Z",
+        "type": "deploy_started"
+      },
+      "cursor": "QVx6s-uBq5YzOWVlb2Q3czczYXVsbTYw"
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "_readme": [
+    "TRA-4789. Acknowledgement ledger for `pnpm check:deploy-origin` (scripts/check-deploy-origin.mjs).",
+    "",
+    "An entry clears exactly ONE deploy from the exit code. It never hides it: an acknowledged",
+    "deploy is still printed in full on every fire, tagged with the issue that settled it, and",
+    "`pnpm check:deploy-origin -- --no-acks` prints the raw truth with every ack ignored.",
+    "",
+    "Matching is by EXACT `deployId`. There is deliberately no way to ack a CLASS: an entry that",
+    "said 'manual is fine' would re-create the unenforced convention this detector replaced.",
+    "",
+    "An entry needs `deployId`, `issue`, `reviewedAt` and `why`. An entry missing any of those",
+    "does NOT apply -- the deploy alarms as an ordinary bypass and the run prints a WARNING",
+    "naming the incomplete entry. Fail closed.",
+    "",
+    "⛔ THESE ACKS ARE WEAKER THAN `scripts/boot-arm-repair-acks.json`'s, AND DELIBERATELY SO.",
+    "That ledger demands a `fixCommit` that made recurrence impossible. There is no such commit",
+    "here and there cannot be one: the hole is a permissions hole on Render's dashboard, and the",
+    "workspace's only member is its own ADMIN (measured 2026-09-23: GET /v1/owners/tea-d7macfog4nts73ai6p40/members",
+    "returns exactly one row, eetiennecg@gmail.com, role ADMIN). An ack here means 'seen, reviewed,",
+    "dispositioned on a ticket' and nothing more. Do not import the stronger ledger's semantics.",
+    "",
+    "Acking is not the remedy. Each entry should name the issue where the deploy was actually",
+    "adjudicated, so the ledger reads as a list of decisions rather than a list of dismissals."
+  ],
+  "acks": [
+    {
+      "deployId": "dep-daj21q7qj5pc73bvbul0",
+      "commit": "b22a9999",
+      "at": "2026-09-13T04:04:56.649044Z",
+      "trigger": "manual",
+      "actor": "eetiennecg@gmail.com",
+      "issue": "TRA-4384",
+      "reviewedAt": "2026-09-22T00:00:00.000Z",
+      "why": "The dashboard deploy found in the TRA-4384 freeze-sprint report §2 and the reason TRA-4789 exists. It ran none of render-redeploy.mjs's gates. Adjudicated by the CEO: it landed inside the then-active cadence ceiling and cost nothing -- luck, not a control. Acked so that the NEXT press of the button is the thing this detector reports, rather than being buried under a permanent day-one red."
+    },
+    {
+      "deployId": "dep-daj2nhbm8hqs73enqj00",
+      "commit": "b22a9999",
+      "at": "2026-09-13T04:51:17.81356Z",
+      "trigger": "manual",
+      "actor": "eetiennecg@gmail.com",
+      "issue": "TRA-4789",
+      "reviewedAt": "2026-09-23T11:00:00.000Z",
+      "why": "Second of THREE dashboard deploys on 2026-09-13, all carrying b22a9999. TRA-4384 §2 reported one; the full history read for TRA-4789 found three (04:04Z, 04:51Z, 12:49Z). Same commit, same actor, same adjudication as the first -- all three land outside the 13:25-20:00Z RTH freeze and carry a commit that was already the deploy target."
+    },
+    {
+      "deployId": "dep-daj9nl1594qs73bbhcg0",
+      "commit": "b22a9999",
+      "at": "2026-09-13T12:49:24.29899Z",
+      "trigger": "manual",
+      "actor": "eetiennecg@gmail.com",
+      "issue": "TRA-4789",
+      "reviewedAt": "2026-09-23T11:00:00.000Z",
+      "why": "Third of the three. 12:49Z is 36 minutes before the RTH freeze opens at 13:25Z -- the closest any of them came to a gate that would have refused, and the clearest statement of why an unenforced convention was not enough."
+    }
+  ]
+}

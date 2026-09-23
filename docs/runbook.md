@@ -255,6 +255,40 @@ matching an equally stale live build would otherwise *manufacture* a CURRENT ver
 of N means the window you just measured ran on the previous build, and the result will
 look completely ordinary.
 
+##### Every gate we own is INSIDE a script you can decline to run (TRA-4789)
+
+`render-redeploy.mjs` carries the deploy hold, the argument guard, the RTH freeze, the
+dated embargo, the commit hold, the live `AUTH_SECRET` check and the cadence ceiling.
+**Not one of them can see the Render dashboard's Deploy button**, and the gate set reads
+"in force" identically whether a deploy passed through it or walked around it. Three
+`trigger: manual` deploys reached bqb1 on 2026-09-13 — 04:04Z, 04:51Z and 12:49Z, all
+carrying `b22a9999` — having run no gate at all. They were harmless, which was luck.
+
+Taking the button away was measured and is **not available**: `GET /v1/owners/…/members`
+returns exactly one member and they are the workspace ADMIN, so there is no seat to
+restrict. So it is detected instead:
+
+```bash
+pnpm check:deploy-origin            # last 30 days; --days=/--since= to widen
+pnpm check:deploy-origin -- --no-acks   # raw truth, every acknowledgement ignored
+pnpm check:deploy-origin:controls
+#   0 CLEAN   every deploy in the window was created by REST
+#   1 BYPASS  a deploy arrived by a path that ran NO gate — each one named, with actor
+#   2 USAGE   unrecognised argument (values attach with `=`)
+#   3 BLIND   a leg unreadable, the two legs disagree, or an UNKNOWN trigger value
+```
+
+⛔ **A green here is narrower than "every deploy passed the gates."** `trigger: api` only
+means Render received `POST /deploys`; a raw `curl` with the key is indistinguishable
+from the script. What is asserted is: *no deploy took a path Render labels
+other-than-REST.* The report prints that sentence on every CLEAN run.
+
+Attribution comes from `deploy_started.details.trigger` on the events route, which
+**does** carry `user.email` — correcting the TRA-4384 §2 note that Render records no
+actor (true of the deploy object, false of the event). Adjudicated bypasses go in
+`ops/deploy-origin-acks.json` **by deploy id, never by class**; an acked deploy is still
+printed in full on every fire.
+
 ##### Drift on a SAFETY path is a decision, not a number (TRA-3991)
 
 Drift answers *how far behind*. It does not say whether anything behind matters. On
