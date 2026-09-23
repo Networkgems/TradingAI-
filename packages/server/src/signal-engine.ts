@@ -13405,10 +13405,17 @@ export class SignalEngine {
         if (realizedVsMidUsd !== undefined) {
           recordOptionTradeEntrySlippage(opened.id, realizedVsMidUsd).catch(() => {});
         }
+        // TRA-4814 — `mode` derived from the env this order actually routed in
+        // (`tradierLiveClient` is built off the same `liveTradierEnvOptions`
+        // selection as `this.tradierEnv`), exactly as the close-side sites
+        // already do. A sandbox chase is broker-SIMULATED — it fills at the
+        // decision mid (TRA-4809) — and a hard-coded 'live' stamp would land it
+        // on the very cohort `maker-ladder-recommendation` folds to tune the
+        // live ladder.
         recordMakerFill({
           ts: Date.now(),
           side: 'open',
-          mode: 'live',
+          mode: this.tradierEnv === 'production' ? 'live' : 'demo',
           symbol: opened.optionSymbol,
           result: 'filled',
           walk: outcome.walk,
@@ -13418,11 +13425,12 @@ export class SignalEngine {
         return true;
       }
       // TRA-1601 — record the non-fill outcomes too so the fill-RATE denominator
-      // is every live chase, not just the fills.
+      // is every live chase, not just the fills. TRA-4814 — mode derived, not
+      // hard-coded, same as the fill site above.
       recordMakerFill({
         ts: Date.now(),
         side: 'open',
-        mode: 'live',
+        mode: this.tradierEnv === 'production' ? 'live' : 'demo',
         symbol: opened.optionSymbol,
         result: outcome.status,
       }).catch(() => {});

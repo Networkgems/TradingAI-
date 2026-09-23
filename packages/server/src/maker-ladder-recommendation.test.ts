@@ -3,6 +3,7 @@ import type { MakerFillEvent } from './option-maker-fill-ledger.js';
 import { DEFAULT_MAKER_WALK_CONFIG, type MakerWalkConfig } from './option-maker-config.js';
 import {
   buildMakerLadderRecommendation,
+  describeInsufficientBasis,
   DEFAULT_MIN_LADDER_SAMPLES,
   MIN_RECOMMENDED_STEP_WAIT_MS,
 } from './maker-ladder-recommendation.js';
@@ -137,5 +138,53 @@ describe('buildMakerLadderRecommendation', () => {
     expect(rec.current.fractions).toEqual([...config.fractions]);
     expect(rec.current.stepWaitMs).toBe(config.stepWaitMs);
     expect(rec.current.maxCrossTicks).toBe(config.maxCrossTicks);
+  });
+});
+
+// TRA-4814 — the empty-basis discriminator: a bare `insufficient_data` must not
+// read identically in "no data anywhere" and "answered next door".
+describe('describeInsufficientBasis', () => {
+  const config: MakerWalkConfig = DEFAULT_MAKER_WALK_CONFIG;
+
+  it('names the stand-down and cross-references the shadow route on an EMPTY live basis', () => {
+    const rec = buildMakerLadderRecommendation([], config);
+    const ctx = describeInsufficientBasis(rec, 'live', 0);
+    expect(ctx).not.toBeNull();
+    expect(ctx!.basis).toBe('live_fills');
+    expect(ctx!.eventsInBasis).toBe(0);
+    // Empty pipe, not thin data: the stand-down and the dark-flag window are named.
+    expect(ctx!.whyInsufficient).toContain('TRA-4750');
+    expect(ctx!.whyInsufficient).toContain('ENABLE_OPTION_MAKER_TELEMETRY');
+    expect(ctx!.answeredNextDoor.route).toBe('/api/health/option-maker-recovery');
+    expect(ctx!.answeredNextDoor.note).toContain('TRA-1662');
+  });
+
+  it('distinguishes THIN data (events present, floor not cleared) from an empty pipe', () => {
+    const events = fillsAtStep(DEFAULT_MIN_LADDER_SAMPLES - 1, 0, 3_000);
+    const rec = buildMakerLadderRecommendation(events, config);
+    const ctx = describeInsufficientBasis(rec, 'live', events.length);
+    expect(ctx).not.toBeNull();
+    // Thin-data branch: reports the counts against the floor, no stand-down claim.
+    expect(ctx!.whyInsufficient).toContain(`minSamples=${rec.minSamples}`);
+    expect(ctx!.whyInsufficient).toContain(`open ${rec.open.filledWithStep}`);
+    expect(ctx!.whyInsufficient).not.toContain('TRA-4750');
+    // The shadow cross-reference is present either way.
+    expect(ctx!.answeredNextDoor.route).toBe('/api/health/option-maker-recovery');
+  });
+
+  it('stays null once either side has enough data to speak for itself', () => {
+    const events = fillsAtStep(DEFAULT_MIN_LADDER_SAMPLES, 0, 3_000);
+    const rec = buildMakerLadderRecommendation(events, config);
+    expect(rec.open.status).toBe('ok');
+    expect(describeInsufficientBasis(rec, 'live', events.length)).toBeNull();
+  });
+
+  it('gives the demo cohort its own why (flag off / no sandbox chases), not the stand-down text', () => {
+    const rec = buildMakerLadderRecommendation([], config);
+    const ctx = describeInsufficientBasis(rec, 'demo', 0);
+    expect(ctx).not.toBeNull();
+    expect(ctx!.basis).toBe('demo_fills');
+    expect(ctx!.whyInsufficient).toContain('ENABLE_OPTION_MAKER_TELEMETRY');
+    expect(ctx!.whyInsufficient).not.toContain('TRA-4750');
   });
 });

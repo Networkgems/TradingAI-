@@ -382,3 +382,68 @@ export function buildMakerLadderRecommendation(
       + 'live ladder config. Applying a recommendation is a separate governance-gated step (TRA-1967).',
   };
 }
+
+/**
+ * TRA-4814 — why `insufficient_data`, said out loud, and where the question is
+ * already answered.
+ *
+ * A bare `insufficient_data` reads identically in "no data anywhere" and
+ * "answered next door". Under the TRA-4750 option-book stand-down the live-fill
+ * basis is structurally unpopulatable — no live option orders route, so no maker
+ * chases exist to record — while the sibling `/api/health/option-maker-recovery`
+ * shadow ledger holds ~1,172 real-quote chases answering the same question
+ * adversely (all-attempts recovery −25.7% OTM / −11.5% directional, TRA-4808).
+ * That identical-in-pass-and-fail read is what let TRA-4807/4808 re-discover a
+ * question TRA-4750 had already measured.
+ */
+export interface InsufficientBasisContext {
+  /** Which cohort the fold read. The live ladder is only ever tuned off `live_fills`. */
+  basis: 'live_fills' | 'demo_fills';
+  /** Raw events in the cohort BEFORE the per-side / filled / with-step filters. */
+  eventsInBasis: number;
+  /** The discriminator a bare `insufficient_data` lacks: empty pipe vs thin data. */
+  whyInsufficient: string;
+  /** Sibling route already answering the maker question from real quotes. */
+  answeredNextDoor: { route: string; note: string };
+}
+
+/**
+ * Pure companion to {@link buildMakerLadderRecommendation}: null while either
+ * side has enough data to speak (the histogram is then its own legibility);
+ * otherwise the context that distinguishes an empty pipe from thin data, and
+ * points at the shadow route that already holds the answer. `eventsInBasis` is
+ * the raw cohort size before any filtering — 0 there means the pipe itself is
+ * empty, not merely that no fills carried a walk step.
+ */
+export function describeInsufficientBasis(
+  rec: MakerLadderRecommendation,
+  mode: 'live' | 'demo',
+  eventsInBasis: number,
+): InsufficientBasisContext | null {
+  if (rec.open.status === 'ok' || rec.close.status === 'ok') return null;
+  const basis = mode === 'live' ? 'live_fills' : 'demo_fills';
+  const whyInsufficient =
+    eventsInBasis === 0
+      ? mode === 'live'
+        ? 'The live-fill basis is structurally unpopulatable: the TRA-4750 option-book stand-down routes '
+          + 'no live option orders, so no maker chases exist to record — and the 08-21→09-01 live window '
+          + 'shipped with ENABLE_OPTION_MAKER_TELEMETRY off, so its 32 real closes were never recorded '
+          + 'either. An empty pipe, not a quiet market.'
+        : 'No demo-cohort maker chases recorded: ENABLE_OPTION_MAKER_TELEMETRY is off, or no sandbox '
+          + 'chases have run since it was armed.'
+      : `${eventsInBasis} event(s) in the ${basis} cohort, but neither side clears the `
+        + `minSamples=${rec.minSamples} fills-with-step floor `
+        + `(open ${rec.open.filledWithStep}, close ${rec.close.filledWithStep}).`;
+  return {
+    basis,
+    eventsInBasis,
+    whyInsufficient,
+    answeredNextDoor: {
+      route: '/api/health/option-maker-recovery',
+      note:
+        'The TRA-1662 shadow ledger holds ~1,172 real-quote chases answering the maker question '
+        + 'adversely (all-attempts recovery −25.7% OTM / −11.5% directional, TRA-4808). Consult it '
+        + 'before treating this empty fold as an open question.',
+    },
+  };
+}

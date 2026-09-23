@@ -711,7 +711,11 @@ import { snapshotExecutionQuality } from './execution-quality-telemetry.js';
 // TRA-1981 (parent TRA-1967 item 2) — realized-vs-modeled execution-quality KPI.
 import { buildExecutionQualityKpi } from './execution-quality-kpi.js';
 // TRA-1982 (parent TRA-1967 item 3) — data-driven maker-ladder recommendation.
-import { buildMakerLadderRecommendation } from './maker-ladder-recommendation.js';
+// TRA-4814 — plus the empty-basis discriminator so `insufficient_data` says why.
+import {
+  buildMakerLadderRecommendation,
+  describeInsufficientBasis,
+} from './maker-ladder-recommendation.js';
 import { listMakerFillEvents } from './option-maker-fill-ledger.js';
 import { resolveMakerWalkConfig } from './option-maker-config.js';
 import { computeLearnedWeights } from './learned-signal-weights.js';
@@ -11272,6 +11276,10 @@ app.get('/api/health/maker-ladder-recommendation', async (req, res) => {
         ? { minStepShare: minStepShareRaw }
         : {}),
     });
+    // TRA-4814 — a bare `insufficient_data` reads identically in "no data
+    // anywhere" and "answered next door" (the option-maker-recovery shadow
+    // ledger). When the whole fold is vacuous, say why and point there.
+    const insufficientBasis = describeInsufficientBasis(recommendation, mode, events.length);
     res.json({
       issue: 'TRA-1982',
       mode,
@@ -11282,6 +11290,7 @@ app.get('/api/health/maker-ladder-recommendation', async (req, res) => {
       recommendationOnly:
         'nothing here mutates the live ladder config; applying a recommendation is a separate governance-gated step (TRA-1967)',
       recommendation,
+      ...(insufficientBasis ? { insufficientBasis } : {}),
     });
   } catch (err) {
     log.error('maker-ladder-recommendation health probe failed', {
