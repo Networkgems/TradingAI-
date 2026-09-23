@@ -24,7 +24,47 @@ export interface PanelHeader {
   regime: string | null;
   regimeEnabled: boolean;
   regimeAsOf: string | null;
-  disposition: 'proposal_only';
+  /**
+   * TRA-4813 — derived from the TRA-4651 lifecycle machine, no longer a
+   * literal: 'proposal_only' until real evidence advances the machine past
+   * `proposed`, then the state itself; 'aborted' on a terminal machine.
+   */
+  disposition:
+    | 'proposal_only'
+    | 'paper'
+    | 'approved'
+    | 'executed'
+    | 'managed'
+    | 'reviewed'
+    | 'aborted';
+  /**
+   * TRA-4813 — machine state at panel assembly. Optional on the wire so a
+   * pre-TRA-4813 server still parses; null ⇒ no machine for this signal.
+   */
+  lifecycleState?: LifecycleState | null;
+}
+
+/** TRA-4813 — the TRA-4651 nine-state progression, mirrored for display. */
+export type LifecycleState =
+  | 'detected'
+  | 'armed'
+  | 'confirmed'
+  | 'proposed'
+  | 'paper'
+  | 'approved'
+  | 'executed'
+  | 'managed'
+  | 'reviewed';
+
+/** TRA-4813 — wire shape of POST /api/cards/:signalId/lifecycle/advance. */
+export interface LifecycleAdvanceResponse {
+  ok: boolean;
+  state: LifecycleState | null;
+  disposition: PanelHeader['disposition'] | null;
+  /** Named refusal reasons when `ok` is false — rendered verbatim. */
+  reasons: string[];
+  /** Provenance of the evidence the server assembled (or why it could not). */
+  note: string;
 }
 
 export interface PanelChecklistItem {

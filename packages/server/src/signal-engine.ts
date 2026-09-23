@@ -410,6 +410,11 @@ import {
   type PanelHistoryInput,
   type PanelPositionInput,
 } from './decision-panel.js';
+// TRA-4813 — the TRA-4651 lifecycle ring: one state machine per carded signal,
+// driven at the card sink and by the operator advance route. Proposals gain a
+// real progression path; nothing here executes (paper evidence comes from the
+// TRA-4657 ledger, approval from a named human).
+import { LifecycleRing } from './lifecycle-manager.js';
 import { recordGiveBackState, getBookSessionPeak, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
 import { recordOptionsBreakerState, getOptionsBreakerRestoreState } from './options-breaker-ledger.js'; // TRA-3218
 import { recordMarkObservation, classifyMarkJump, MAX_MARK_JUMP_X } from './option-mark-sanity.js'; // TRA-2927
@@ -3349,6 +3354,13 @@ export class SignalEngine {
   private recentCards: TradeOpportunityCard[] = [];
   private cardBuildFailures = 0;
   /**
+   * TRA-4813 — one TRA-4651 lifecycle per carded signal, same cap and same
+   * clear points as the card ring so a readable card and its machine live and
+   * die together. The machines share the ring cards by reference: an accepted
+   * transition re-stamps the SAME card object's `disposition`.
+   */
+  private readonly lifecycleRing = new LifecycleRing(MAX_SIGNALS);
+  /**
    * TRA-4788 (AC0, from TRA-4779) — cumulative per-family card counters,
    * OUTSIDE the ring. The ring caps at MAX_SIGNALS and is newest-first, so on
    * a saturated day it cannot answer "what is the setup mix": 50/50
@@ -4792,6 +4804,7 @@ export class SignalEngine {
     this.allClosedPositions = [];
     this.recentSignals = [];
     this.recentCards = []; // TRA-4649 — the card ring mirrors the signal ring
+    this.lifecycleRing.clear(); // TRA-4813 — and the machines die with their cards
     this.dailySignals = [];
     this.positionSignalType.clear();
     // TRA-451 — clear the SMA-200 debounce ledger so signals can re-emit
@@ -4824,6 +4837,7 @@ export class SignalEngine {
   clearSignals(): void {
     this.recentSignals = [];
     this.recentCards = []; // TRA-4649 — a cleared feed must not leave stale proposals readable
+    this.lifecycleRing.clear(); // TRA-4813 — stale machines are stale proposals too
     // TRA-451 — also clear the SMA-200 debounce ledger; otherwise a cleared
     // daily signal would stay debounced for 5 bars and never re-appear.
     this.sma200LastFired.clear();
@@ -7706,6 +7720,13 @@ export class SignalEngine {
       });
       this.recentCards.unshift(card);
       if (this.recentCards.length > MAX_SIGNALS) this.recentCards.length = MAX_SIGNALS;
+      // TRA-4813 — birth the TRA-4651 machine and drive it as far as THIS
+      // card's evidence supports (armed → confirmed → proposed). `engineArmed`
+      // is true by construction here: this sink only runs inside the display
+      // feed of the engine that just published the signal. Refusals (today:
+      // `proposed` refused on cost-bar-refused fields, TRA-4808) land in the
+      // machine's own audit trail — the visible outcome, not a defect.
+      this.lifecycleRing.onCardBuilt(card, { engineArmed: true, mode: this.mode }, Date.now());
       this.bumpCardTypeCount(signal.type, 'built');
     } catch {
       this.cardBuildFailures += 1;
@@ -7874,7 +7895,20 @@ export class SignalEngine {
       positions,
       history,
       quoteAsOf: quote?.lastUpdated ?? null,
+      // TRA-4813 — the machine's state drives the panel's action buttons; a
+      // missing machine reads null and the actions say so, never a silent
+      // enabled-no-op.
+      lifecycle: this.lifecycleRing.stateFor(signalId),
     });
+  }
+
+  /**
+   * TRA-4813 — the lifecycle ring, exposed for the /api/cards/:id/lifecycle
+   * routes. Read/advance surface only; the ring itself enforces that every
+   * transition carries evidence and every refusal is recorded.
+   */
+  getLifecycleRing(): LifecycleRing {
+    return this.lifecycleRing;
   }
 
   /**

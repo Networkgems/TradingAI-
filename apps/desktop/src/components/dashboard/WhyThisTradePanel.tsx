@@ -10,18 +10,35 @@
 //     error / 404 states honestly (a 404 means the card was evicted from the
 //     ring — say so; it is not an empty panel).
 //
-// Action buttons are INTENTS, wired to nothing that executes: the TRA-4651
-// lifecycle is the only path that advances a proposal, and Auto-Execute is
-// disabled by the server with its reasons rendered verbatim. No order path
-// exists in this component and none may be added (board directive, TRA-4645).
-import { useEffect, useState, type ReactNode } from 'react';
+// Action buttons carry INTENTS for the TRA-4651 lifecycle, serviced by
+// POST /api/cards/:signalId/lifecycle/advance (TRA-4813): Paper Trade advances
+// on a fill the TRA-4657 paper ledger already recorded, Require Approval
+// attaches the operator's named identity — and the machine's refusals are
+// rendered verbatim, never swallowed. Auto-Execute stays disabled by the
+// server with its reasons shown. No order path exists in this component and
+// none may be added (board directive, TRA-4645; TRA-4750/TRA-1653 hold).
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { HTTP_URL } from '../../server-url';
 import { logger } from '../../lib/logger';
 import { fmt, fmtDollar, formatTime, timeAgo, signalLabel } from '../../lib/format';
 import type {
   DecisionPanelPayload,
+  LifecycleAdvanceResponse,
   PanelSection,
 } from '../../types/decision-panel';
+
+/** An operator intent the advance route accepts. Execution is not one. */
+export type LifecycleActionIntent = 'paper' | 'require_approval';
+
+/** Outcome of the last advance attempt — rendered under the buttons. */
+export interface LifecycleActionState {
+  busy: boolean;
+  /** One-line outcome; null before any attempt. */
+  message: string | null;
+  /** The machine's named refusal reasons, verbatim. */
+  reasons: string[];
+  tone: 'ok' | 'refused' | 'error' | null;
+}
 
 /** A cell the server could not build. Paired with a named reason below it. */
 const NOT_BUILT = 'not built';
@@ -83,8 +100,22 @@ function noConfidenceTitle(panel: DecisionPanelPayload): string {
   return `No calibrated expectancy for this setup: ${why}${reasons}. A number would be invented (TRA-4779).`;
 }
 
-export function DecisionPanelBody({ panel }: { panel: DecisionPanelPayload }) {
+export function DecisionPanelBody({
+  panel,
+  onAction,
+  actionState,
+}: {
+  panel: DecisionPanelPayload;
+  /**
+   * TRA-4813 — the advance dispatch. REQUIRED: a body rendered without a
+   * dispatch would put enabled buttons on screen that do nothing on click,
+   * which is the exact defect this issue removes.
+   */
+  onAction: (intent: LifecycleActionIntent) => void;
+  actionState?: LifecycleActionState | null;
+}) {
   const { header, checklist, freshness, risk, contract, portfolio, similarTrades, actions } = panel;
+  const busy = actionState?.busy === true;
   return (
     <div className="wtt-panel" data-testid="wtt-panel">
       {/* What is the trade? */}
@@ -282,18 +313,48 @@ export function DecisionPanelBody({ panel }: { panel: DecisionPanelPayload }) {
         )}
       </SectionShell>
 
-      {/* Action intents — proposal only; nothing here executes. */}
+      {/* Action intents — serviced by POST /api/cards/:id/lifecycle/advance
+          (TRA-4813). The machine's verdict, accepted or refused, is rendered
+          below the buttons; nothing here executes. */}
       <div className="wtt-actions">
-        <button className="btn-secondary btn-sm" disabled={!actions.paperTrade.enabled} title={actions.paperTrade.reason ?? 'Propose into the paper book (lifecycle: Proposed → Paper)'}>
+        <button
+          className="btn-secondary btn-sm"
+          disabled={!actions.paperTrade.enabled || busy}
+          title={actions.paperTrade.reason ?? 'Advance on the recorded paper fill (lifecycle: Proposed → Paper, TRA-4657 ledger evidence)'}
+          onClick={() => onAction('paper')}
+        >
           Paper Trade
         </button>
-        <button className="btn-secondary btn-sm" disabled={!actions.requireApproval.enabled} title={actions.requireApproval.reason ?? 'Route to human approval (lifecycle: Proposed → Approved)'}>
+        <button
+          className="btn-secondary btn-sm"
+          disabled={!actions.requireApproval.enabled || busy}
+          title={actions.requireApproval.reason ?? 'Attach your approval (lifecycle: Paper → Approved, named approver)'}
+          onClick={() => onAction('require_approval')}
+        >
           Require Approval
         </button>
+        {/* Permanently disabled — TRA-4750 stand-down / TRA-1653 pin; no onClick, ever. */}
         <button className="btn-secondary btn-sm" disabled title={actions.autoExecute.reason ?? 'Disabled'}>
           Auto-Execute
         </button>
       </div>
+      {header.lifecycleState !== undefined && (
+        <div className="wtt-lifecycle-state" data-testid="wtt-lifecycle-state">
+          lifecycle: {header.lifecycleState ?? 'none'} · disposition: {header.disposition}
+        </div>
+      )}
+      {actionState?.message && (
+        <div className={`wtt-action-result ${actionState.tone ?? ''}`} data-testid="wtt-action-result">
+          <div>{actionState.message}</div>
+          {actionState.reasons.length > 0 && (
+            <ul className="wtt-action-reasons">
+              {actionState.reasons.map((r) => (
+                <li key={r}>{r}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -301,6 +362,11 @@ export function DecisionPanelBody({ panel }: { panel: DecisionPanelPayload }) {
 export function WhyThisTradePanel({ token, signalId }: { token: string; signalId: string }) {
   const [panel, setPanel] = useState<DecisionPanelPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [actionState, setActionState] = useState<LifecycleActionState | null>(null);
+  // Bumped after every advance attempt so the panel re-derives its actions and
+  // disposition from the machine's NEW state — accepted or refused alike (a
+  // refusal appends to the audit trail, so the surface must re-read too).
+  const [refresh, setRefresh] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -329,9 +395,54 @@ export function WhyThisTradePanel({ token, signalId }: { token: string; signalId
     return () => {
       cancelled = true;
     };
-  }, [token, signalId]);
+  }, [token, signalId, refresh]);
+
+  // TRA-4813 — the advance dispatch. Every outcome is rendered: an accepted
+  // advance names the new state, a machine refusal lists its named reasons
+  // verbatim, an HTTP failure says so. Silence after a click is the defect
+  // this issue removes, so there is no code path that swallows the result.
+  const onAction = useCallback(
+    async (intent: LifecycleActionIntent) => {
+      setActionState({ busy: true, message: null, reasons: [], tone: null });
+      try {
+        const r = await fetch(
+          `${HTTP_URL}/api/cards/${encodeURIComponent(signalId)}/lifecycle/advance`,
+          {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ intent }),
+          },
+        );
+        if (!r.ok) {
+          const body = (await r.json().catch(() => null)) as { error?: string } | null;
+          setActionState({
+            busy: false,
+            message: body?.error ?? `Advance request failed (HTTP ${r.status})`,
+            reasons: [],
+            tone: 'error',
+          });
+          return;
+        }
+        const body = (await r.json()) as LifecycleAdvanceResponse;
+        setActionState({
+          busy: false,
+          message: body.ok
+            ? `Lifecycle advanced to '${body.state}' (disposition: ${body.disposition}) — ${body.note}`
+            : `Machine refused the transition — ${body.note}`,
+          reasons: body.ok ? [] : body.reasons,
+          tone: body.ok ? 'ok' : 'refused',
+        });
+      } catch (err) {
+        logger.error('why-this-trade', 'lifecycle advance failed', err);
+        setActionState({ busy: false, message: 'Advance request failed — network error', reasons: [], tone: 'error' });
+      } finally {
+        setRefresh((n) => n + 1);
+      }
+    },
+    [token, signalId],
+  );
 
   if (error) return <div className="wtt-panel wtt-error">{error}</div>;
   if (!panel) return <div className="wtt-panel wtt-loading">Assembling panel…</div>;
-  return <DecisionPanelBody panel={panel} />;
+  return <DecisionPanelBody panel={panel} onAction={onAction} actionState={actionState} />;
 }

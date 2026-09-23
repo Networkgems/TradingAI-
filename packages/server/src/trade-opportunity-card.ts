@@ -12,10 +12,11 @@
 //   8. whyNow         — "why now?" context (evidence + freshness)
 //
 // DESIGN CONSTRAINTS (board directive on TRA-4645, 2026-09-17):
-//  - A card is a PROPOSAL OBJECT and nothing else. `disposition` is the literal
-//    'proposal_only'; there is no order field, no broker hook, no execution
-//    callback. The TRA-4651 lifecycle state machine is the only intended
-//    consumer that can advance one, and it starts at Detected.
+//  - A card is a PROPOSAL OBJECT and nothing else. `disposition` is DERIVED
+//    from the TRA-4651 lifecycle machine (TRA-4813) — 'proposal_only' for every
+//    state up to `proposed`, never a hard-coded literal; there is no order
+//    field, no broker hook, no execution callback. The lifecycle state machine
+//    is the only consumer that can advance one, and it starts at Detected.
 //  - `confidence` is populated ONLY from a validated TRA-4779 calibration cell
 //    (historical expectancy after fees/slippage, costs charged inside the fold
 //    per TRA-4578, ≥30 instances, out-of-sample validated). No calibration in
@@ -64,6 +65,10 @@ import {
   type ReasonsNotToEnterInputs,
 } from './card-reasons-not-to-enter.js';
 import type { RelativeStrengthReading } from './otm-relative-strength.js';
+// TRA-4813 — the disposition is the lifecycle's derivation, not this module's
+// literal. strategy-lifecycle imports only TYPES from here, so this runtime
+// edge does not close a cycle.
+import { dispositionFor, type CardDisposition } from './strategy-lifecycle.js';
 
 // ── Field plumbing ──────────────────────────────────────────────────────────
 
@@ -461,8 +466,13 @@ export interface TradeOpportunityCard {
   signalType: SignalType;
   mode: string | null;
   generatedAt: number;
-  /** Cards propose. They never execute. See TRA-4651 for the state machine. */
-  disposition: 'proposal_only';
+  /**
+   * Cards propose. They never execute. Derived from the TRA-4651 lifecycle
+   * machine by `dispositionFor` (TRA-4813): 'proposal_only' until the machine
+   * accepts real fill/approval evidence, then the state itself; 'aborted' on a
+   * terminal machine. The LifecycleRing re-stamps it on every transition.
+   */
+  disposition: CardDisposition;
   /**
    * TRA-4779 calibrated expectancy verdict. Non-null ONLY when the build
    * context carried a calibration index whose cell for this setup cleared the
@@ -1025,7 +1035,10 @@ export function buildTradeOpportunityCard(
     signalType: signal.type,
     mode: str(s.mode) ?? null,
     generatedAt: ctx.now,
-    disposition: 'proposal_only',
+    // TRA-4813 — derived, not a literal: at build time no machine exists yet,
+    // and dispositionFor(null) is the proposal-only reading of that fact. The
+    // LifecycleRing re-derives this stamp on every accepted transition.
+    disposition: dispositionFor(null),
     confidence: calibration ? calibration.confidence : null,
     calibrationStatus: calibration ? calibration.status : 'not_run',
     calibrationReasons: calibration ? calibration.reasons : [CALIBRATION_NOT_RUN_REASON],

@@ -281,6 +281,7 @@ import { hydrateLiveEnforceGateFromDisk } from './live-enforce-gate-ledger.js';
 import { registerHardControlRoutes } from './hard-controls-routes.js'; // TRA-4655
 import { bindHardControlsToEngines } from './hard-controls-bridge.js'; // TRA-4650
 import { registerPaperTradingRoutes } from './paper-trading-routes.js'; // TRA-4657
+import { registerLifecycleRoutes } from './lifecycle-routes.js'; // TRA-4813
 import { createTradierStreamService, registerTradierStreamRoutes } from './tradier-stream-status.js'; // TRA-4707
 import { registerDecisionAuditRoutes } from './decision-audit-routes.js'; // TRA-4658
 import { auditIntervention, queryDecisionAudit } from './decision-audit-log.js'; // TRA-4658 / TRA-4653
@@ -10460,9 +10461,11 @@ app.get('/api/state', requireAuth, async (_req, res) => {
 // cap as the display feed). `summary.missingByField` is the acceptance fold —
 // a nonzero row names the input the emitted population is missing — and
 // `buildFailures` counts cards the sink could not build at all, so a quiet
-// card list is distinguishable from a broken builder. Read-only: cards are
-// `disposition: 'proposal_only'`; there is deliberately NO order path here
-// (the TRA-4651 lifecycle is the only intended consumer that can advance one).
+// card list is distinguishable from a broken builder. Read-only: a card's
+// `disposition` is DERIVED from its TRA-4651 lifecycle (TRA-4813) and reads
+// 'proposal_only' until real evidence advances the machine; there is
+// deliberately NO order path here — advancing goes through
+// POST /api/cards/:signalId/lifecycle/advance, which itself mints nothing.
 app.get('/api/cards', requireAuth, async (_req, res) => {
   const ctx = await userCtx(res);
   res.json({ asOf: new Date().toISOString(), ...ctx.engine.getRecentCards() });
@@ -10474,7 +10477,8 @@ app.get('/api/cards', requireAuth, async (_req, res) => {
 // client render is one synchronous pass over this payload — that is how the
 // <100ms render acceptance is met, not by a fast fetch. Read-only like
 // /api/cards: the panel's action entries are intents for the TRA-4651
-// lifecycle; there is deliberately NO order path here. 404 ⇔ no card in the
+// lifecycle, serviced by POST /api/cards/:signalId/lifecycle/advance
+// (TRA-4813); there is deliberately NO order path here. 404 ⇔ no card in the
 // ring for that id (evicted or never emitted) — distinct from an empty panel.
 app.get('/api/cards/:signalId/panel', requireAuth, async (req, res) => {
   const signalId = (req.params as Record<string, string>)['signalId'] ?? '';
@@ -16503,6 +16507,16 @@ bindHardControlsToEngines(() =>
 // /api/paper-trading* (state · daily summary · per-day rows). Recording arms
 // via ENABLE_PAPER_TRADING; the tees live at the engine's alert emitters.
 registerPaperTradingRoutes(app, { requireAuth });
+// TRA-4813 — the TRA-4651 lifecycle on the wire: GET /api/lifecycles,
+// GET /api/cards/:signalId/lifecycle, POST /api/cards/:signalId/lifecycle/
+// advance. Two intents only ('paper' off an already-recorded TRA-4657 ledger
+// fill; 'require_approval' by the authenticated operator). No execution
+// authority — the route 403s anything else before a machine is touched.
+registerLifecycleRoutes(app, {
+  requireAuth,
+  ringFor: async (res) => (await userCtx(res)).engine.getLifecycleRing(),
+  actorFor: (res) => res.locals['authUser'] as string,
+});
 
 // TRA-4707 — Tradier `/markets/events` stream (TRA-4656 engine module), DEFAULT
 // OFF behind ENABLE_TRADIER_STREAM. Data feed only — no order path. Subscribes

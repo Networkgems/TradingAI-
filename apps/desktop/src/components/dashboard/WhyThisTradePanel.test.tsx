@@ -5,9 +5,14 @@
 // states (loading / 404-evicted / error) are exercised with a stubbed fetch —
 // a 404 must read as "the card aged out", never as an empty panel.
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { DecisionPanelBody, WhyThisTradePanel } from './WhyThisTradePanel';
 import type { DecisionPanelPayload } from '../../types/decision-panel';
+
+// TRA-4813 — the body REQUIRES a dispatch: an enabled button with no handler
+// is the defect the wiring removed. Tests that only assert rendering pass a
+// spy and (where the test is about the buttons) assert it fires.
+const noop = () => {};
 
 const NOW = Date.now();
 
@@ -134,7 +139,7 @@ afterEach(() => {
 
 describe('DecisionPanelBody — one synchronous pass over the server payload', () => {
   it('renders every section of a complete panel: setup, regime, checklist, risk, contract, portfolio, history, actions', () => {
-    render(<DecisionPanelBody panel={fullPayload()} />);
+    render(<DecisionPanelBody panel={fullPayload()} onAction={noop} />);
     expect(screen.getAllByText('SPY').length).toBeGreaterThan(0);
     expect(screen.getByText('Regime: risk_on')).toBeTruthy();
     expect(screen.getByText('confidence: not calibrated')).toBeTruthy();
@@ -164,7 +169,7 @@ describe('DecisionPanelBody — one synchronous pass over the server payload', (
       complete: false,
       incompleteSections: ['portfolio'],
     });
-    render(<DecisionPanelBody panel={payload} />);
+    render(<DecisionPanelBody panel={payload} onAction={noop} />);
     expect(screen.getByText('Not assembled — missing positions, totalEquityUsd')).toBeTruthy();
   });
 
@@ -176,7 +181,7 @@ describe('DecisionPanelBody — one synchronous pass over the server payload', (
         missing: [],
       },
     });
-    render(<DecisionPanelBody panel={payload} />);
+    render(<DecisionPanelBody panel={payload} onAction={noop} />);
     expect(screen.getByText(/STALE — older than this setup's 15min ceiling/)).toBeTruthy();
     expect(screen.getByText('no quote timestamp')).toBeTruthy();
   });
@@ -185,7 +190,7 @@ describe('DecisionPanelBody — one synchronous pass over the server payload', (
     const payload = fullPayload();
     payload.portfolio.data!.netDeltaSharesSameSymbol = null;
     payload.portfolio.data!.deltaUnknownCount = 2;
-    render(<DecisionPanelBody panel={payload} />);
+    render(<DecisionPanelBody panel={payload} onAction={noop} />);
     expect(screen.getByText('unknown (2 positions without delta)')).toBeTruthy();
   });
 
@@ -211,7 +216,7 @@ describe('DecisionPanelBody — one synchronous pass over the server payload', (
       },
       missing: ['sizing refused: risk budget $41.66 buys 0 contracts at $75.63 risk/contract'],
     };
-    render(<DecisionPanelBody panel={payload} />);
+    render(<DecisionPanelBody panel={payload} onAction={noop} />);
     // The numbers that ARE known are still on screen.
     expect(screen.getByText('0.50')).toBeTruthy();
     expect(screen.getByText('0.30')).toBeTruthy();
@@ -236,16 +241,55 @@ describe('DecisionPanelBody — one synchronous pass over the server payload', (
       },
       missing: ['invalidation'],
     };
-    render(<DecisionPanelBody panel={payload} />);
+    render(<DecisionPanelBody panel={payload} onAction={noop} />);
     expect(screen.getByText('0.50')).toBeTruthy(); // entry survives
     expect(screen.getAllByText('not built').length).toBeGreaterThanOrEqual(3);
     expect(screen.getByTestId('wtt-risk-gaps').textContent).toContain('stopLoss missing/non-finite');
   });
 
+  // TRA-4813 — the three board-requested buttons: two dispatch a real intent,
+  // the third can never dispatch anything.
+  it('Paper Trade and Require Approval DISPATCH their intents on click — no more enabled no-ops', () => {
+    const onAction = vi.fn();
+    render(<DecisionPanelBody panel={fullPayload()} onAction={onAction} />);
+    fireEvent.click(screen.getByText('Paper Trade'));
+    expect(onAction).toHaveBeenLastCalledWith('paper');
+    fireEvent.click(screen.getByText('Require Approval'));
+    expect(onAction).toHaveBeenLastCalledWith('require_approval');
+    expect(onAction).toHaveBeenCalledTimes(2);
+  });
+
+  it('Auto-Execute never dispatches — disabled, and clicking it calls nothing (AC4)', () => {
+    const onAction = vi.fn();
+    render(<DecisionPanelBody panel={fullPayload()} onAction={onAction} />);
+    const btn = screen.getByText('Auto-Execute') as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    fireEvent.click(btn);
+    expect(onAction).not.toHaveBeenCalled();
+  });
+
+  it('a machine refusal is rendered verbatim under the buttons — a click leaves a visible trace', () => {
+    render(
+      <DecisionPanelBody
+        panel={fullPayload()}
+        onAction={noop}
+        actionState={{
+          busy: false,
+          message: 'Machine refused the transition — no paper open recorded',
+          reasons: ['paperFill.orderId is empty'],
+          tone: 'refused',
+        }}
+      />,
+    );
+    const result = screen.getByTestId('wtt-action-result');
+    expect(result.textContent).toContain('Machine refused');
+    expect(result.textContent).toContain('paperFill.orderId is empty');
+  });
+
   it('renders a fully-populated panel in <100ms (acceptance budget)', () => {
     const payload = fullPayload();
     const t0 = performance.now();
-    render(<DecisionPanelBody panel={payload} />);
+    render(<DecisionPanelBody panel={payload} onAction={noop} />);
     const elapsed = performance.now() - t0;
     expect(screen.getByTestId('wtt-panel')).toBeTruthy();
     expect(elapsed).toBeLessThan(100);
@@ -272,5 +316,35 @@ describe('WhyThisTradePanel — container honesty states', () => {
     vi.stubGlobal('fetch', vi.fn(async () => Promise.reject(new Error('down'))));
     render(<WhyThisTradePanel token="t" signalId="sig-1" />);
     await waitFor(() => expect(screen.getByText('Could not load panel — network error')).toBeTruthy());
+  });
+
+  // TRA-4813 — clicking Paper Trade POSTs the advance intent, renders the
+  // machine's verdict, and re-fetches the panel so actions/disposition
+  // re-derive from the machine's new state.
+  it('Paper Trade posts the advance intent and renders the outcome + refreshed panel', async () => {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        calls.push({ url, ...(init !== undefined ? { init } : {}) });
+        if (url.endsWith('/lifecycle/advance')) {
+          return new Response(
+            JSON.stringify({ ok: true, state: 'paper', disposition: 'paper', reasons: [], note: 'paper fill from ledger open pos-1' }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify(fullPayload()), { status: 200 });
+      }),
+    );
+    render(<WhyThisTradePanel token="t" signalId="sig-1" />);
+    await waitFor(() => expect(screen.getByTestId('wtt-panel')).toBeTruthy());
+    fireEvent.click(screen.getByText('Paper Trade'));
+    await waitFor(() => expect(screen.getByTestId('wtt-action-result').textContent).toContain("advanced to 'paper'"));
+    const advance = calls.find((c) => c.url.endsWith('/lifecycle/advance'));
+    expect(advance).toBeDefined();
+    expect(advance!.init?.method).toBe('POST');
+    expect(JSON.parse(advance!.init?.body as string)).toEqual({ intent: 'paper' });
+    // Panel re-fetched after the attempt (initial + post-advance).
+    expect(calls.filter((c) => c.url.includes('/panel')).length).toBeGreaterThanOrEqual(2);
   });
 });

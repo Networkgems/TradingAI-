@@ -30,6 +30,9 @@ import type {
   SetupFamily,
 } from './trade-opportunity-card.js';
 import type { SetupConfidence } from './setup-calibration.js';
+// TRA-4813 — the panel's actions and disposition derive from the lifecycle
+// machine's state, never from literals. Type-only: no runtime edge.
+import type { CardDisposition, LifecycleState } from './strategy-lifecycle.js';
 import { buildReasonsNotToEnter, type ReasonsNotToEnter } from './card-reasons-not-to-enter.js';
 
 // (Route: GET /api/cards/:signalId/panel in index.ts; engine assembly in
@@ -100,6 +103,14 @@ export interface DecisionPanelContext {
   history?: readonly PanelHistoryInput[];
   /** ms epoch of the underlying quote the card's liquidity was read from. */
   quoteAsOf?: number | null;
+  /**
+   * TRA-4813 — the card's lifecycle machine state at assembly time. Drives the
+   * action buttons: `paper` is offered only from `proposed`, approval only
+   * from `paper`. Null ⇒ no machine exists for this signal (evicted, or the
+   * card predates the wiring) and every action says so; absent (undefined) is
+   * treated the same — fail closed, never an enabled no-op.
+   */
+  lifecycle?: { state: LifecycleState; terminal: boolean } | null;
 }
 
 // ── Section payload types ───────────────────────────────────────────────────
@@ -114,7 +125,10 @@ export interface PanelHeader {
   regime: string | null;
   regimeEnabled: boolean;
   regimeAsOf: string | null;
-  disposition: 'proposal_only';
+  /** TRA-4813 — the card's own derived stamp, not a panel literal. */
+  disposition: CardDisposition;
+  /** TRA-4813 — machine state at assembly; null ⇒ no machine for this signal. */
+  lifecycleState: LifecycleState | null;
 }
 
 export interface PanelChecklist {
@@ -318,7 +332,9 @@ function buildHeader(card: TradeOpportunityCard, ctx: DecisionPanelContext): Pan
     regime: ctx.regime?.enabled ? ctx.regime.label : null,
     regimeEnabled: ctx.regime?.enabled ?? false,
     regimeAsOf: ctx.regime?.enabled ? ctx.regime.asOf : null,
-    disposition: 'proposal_only',
+    // TRA-4813 — pass the card's derived stamp through; the machine wrote it.
+    disposition: card.disposition,
+    lifecycleState: ctx.lifecycle?.state ?? null,
   };
 }
 
@@ -583,20 +599,56 @@ function noConfidenceReason(card: TradeOpportunityCard): string {
   }
 }
 
-function buildActions(card: TradeOpportunityCard): PanelActions {
+/**
+ * TRA-4813 — actions derive from the lifecycle machine, never from optimism.
+ * The pre-4813 shape (`requireApproval` unconditionally enabled, wired to
+ * nothing) was the defect the issue names: an ENABLED control with no effect.
+ * Every disabled button now carries the named reason, and every enabled one
+ * has a live advance route behind it.
+ */
+function buildActions(
+  card: TradeOpportunityCard,
+  lifecycle: { state: LifecycleState; terminal: boolean } | null,
+): PanelActions {
   const autoReasons: string[] = [];
   if (card.confidence === null) autoReasons.push(noConfidenceReason(card));
   autoReasons.push(
-    'no execution path from a panel — TRA-4651 lifecycle advances proposals, TRA-4655 controls gate execution',
+    'no execution path from a panel — TRA-4651 lifecycle advances proposals, TRA-4655 controls gate execution'
+      + ' (TRA-4750 stand-down and TRA-1653/1665 deploy pin hold; TRA-4813 grants no execution authority)',
   );
+
+  const machineGate = (legalFrom: LifecycleState, action: string): PanelActionEntry | null => {
+    if (lifecycle === null) {
+      return {
+        enabled: false,
+        reason: 'no lifecycle machine for this signal (evicted from the ring, or the card predates the TRA-4813 wiring)',
+      };
+    }
+    if (lifecycle.terminal) {
+      return { enabled: false, reason: 'lifecycle is terminal (aborted) — nothing advances a dead machine' };
+    }
+    if (lifecycle.state !== legalFrom) {
+      return {
+        enabled: false,
+        reason: `lifecycle at '${lifecycle.state}' — ${action} is legal only from '${legalFrom}' (detected → armed → confirmed → proposed → paper → approved, no skips)`,
+      };
+    }
+    return null; // the machine is at the legal source state
+  };
+
+  // Card incompleteness outranks machine position for paper: it is the deeper
+  // "why", and the machine itself would refuse `proposed → paper`'s
+  // prerequisite on the same grounds.
+  const paperGate = !card.complete
+    ? {
+        enabled: false,
+        reason: `card incomplete: ${[...card.incompleteFields, ...card.refusedFields].join(', ') || 'unknown fields'}`,
+      }
+    : machineGate('proposed', 'paper routing') ?? { enabled: true, reason: null };
+
   return {
-    paperTrade: card.complete
-      ? { enabled: true, reason: null }
-      : {
-          enabled: false,
-          reason: `card incomplete: ${card.incompleteFields.join(', ') || 'unknown fields'}`,
-        },
-    requireApproval: { enabled: true, reason: null },
+    paperTrade: paperGate,
+    requireApproval: machineGate('paper', 'approval') ?? { enabled: true, reason: null },
     autoExecute: { enabled: false, reason: autoReasons.join('; ') },
   };
 }
@@ -648,7 +700,7 @@ export function buildDecisionPanel(
     confidence: card.confidence,
     ...(card.calibrationStatus !== undefined ? { calibrationStatus: card.calibrationStatus } : {}),
     ...(card.calibrationReasons !== undefined ? { calibrationReasons: [...card.calibrationReasons] } : {}),
-    actions: buildActions(card),
+    actions: buildActions(card, ctx.lifecycle ?? null),
     complete: incompleteSections.length === 0 && card.complete,
     incompleteSections: [...incompleteSections],
     cardComplete: card.complete,

@@ -281,15 +281,56 @@ describe('buildDecisionPanel — contract liquidity grade (display heuristic, ga
   });
 });
 
-describe('buildDecisionPanel — actions are intents, never orders', () => {
-  it('a complete card enables Paper Trade and Require Approval; Auto-Execute stays disabled with both gates named', () => {
+describe('buildDecisionPanel — actions derive from the lifecycle machine (TRA-4813)', () => {
+  it('a complete card at `proposed` enables Paper Trade; approval waits for a paper fill; Auto-Execute stays disabled with the gates named', () => {
     const card = buildTradeOpportunityCard(otmSignal(), CARD_CTX);
-    const panel = buildDecisionPanel(card, FULL_PANEL_CTX);
+    const panel = buildDecisionPanel(card, {
+      ...FULL_PANEL_CTX,
+      lifecycle: { state: 'proposed', terminal: false },
+    });
     expect(panel.actions.paperTrade).toEqual({ enabled: true, reason: null });
-    expect(panel.actions.requireApproval).toEqual({ enabled: true, reason: null });
+    // The pre-4813 surface enabled this unconditionally with nothing behind
+    // it. Approval is legal only from `paper` — the machine has no skips.
+    expect(panel.actions.requireApproval.enabled).toBe(false);
+    expect(panel.actions.requireApproval.reason).toContain("legal only from 'paper'");
     expect(panel.actions.autoExecute.enabled).toBe(false);
     expect(panel.actions.autoExecute.reason).toContain('no calibrated confidence');
     expect(panel.actions.autoExecute.reason).toContain('TRA-4651');
+    expect(panel.actions.autoExecute.reason).toContain('TRA-4750');
+    expect(panel.header.lifecycleState).toBe('proposed');
+  });
+
+  it('at `paper` the approval action enables and paper routing disables, each naming the machine position', () => {
+    const card = buildTradeOpportunityCard(otmSignal(), CARD_CTX);
+    const panel = buildDecisionPanel(card, {
+      ...FULL_PANEL_CTX,
+      lifecycle: { state: 'paper', terminal: false },
+    });
+    expect(panel.actions.requireApproval).toEqual({ enabled: true, reason: null });
+    expect(panel.actions.paperTrade.enabled).toBe(false);
+    expect(panel.actions.paperTrade.reason).toContain("lifecycle at 'paper'");
+  });
+
+  it('no lifecycle machine ⇒ every advance action is disabled WITH the reason named — never an enabled no-op', () => {
+    const card = buildTradeOpportunityCard(otmSignal(), CARD_CTX);
+    const panel = buildDecisionPanel(card, FULL_PANEL_CTX); // no `lifecycle` key at all
+    expect(panel.actions.paperTrade.enabled).toBe(false);
+    expect(panel.actions.paperTrade.reason).toContain('no lifecycle machine');
+    expect(panel.actions.requireApproval.enabled).toBe(false);
+    expect(panel.actions.requireApproval.reason).toContain('no lifecycle machine');
+    expect(panel.header.lifecycleState).toBeNull();
+  });
+
+  it('a terminal machine disables both advance actions naming the abort', () => {
+    const card = buildTradeOpportunityCard(otmSignal(), CARD_CTX);
+    const panel = buildDecisionPanel(card, {
+      ...FULL_PANEL_CTX,
+      lifecycle: { state: 'confirmed', terminal: true },
+    });
+    expect(panel.actions.paperTrade.enabled).toBe(false);
+    expect(panel.actions.paperTrade.reason).toContain('terminal');
+    expect(panel.actions.requireApproval.enabled).toBe(false);
+    expect(panel.actions.requireApproval.reason).toContain('terminal');
   });
 
   it('TRA-4788 — a not_run card never claims a floor was tested; status + reasons ride the panel', () => {

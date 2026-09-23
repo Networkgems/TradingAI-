@@ -47,6 +47,36 @@ export function nextState(state: LifecycleState): LifecycleState | null {
   return i + 1 < LIFECYCLE_STATES.length ? LIFECYCLE_STATES[i + 1] : null;
 }
 
+// ── Disposition (TRA-4813) ──────────────────────────────────────────────────
+//
+// A card's `disposition` is DERIVED from its lifecycle state, never a literal
+// stamped at build time. Every state up to and including `proposed` is still a
+// proposal — the machine has not accepted any fill or approval evidence — so
+// the wire value the pre-TRA-4813 consumers pinned ('proposal_only') is
+// preserved for exactly that population. Past `proposed`, the state itself is the
+// disposition. A terminal (aborted) machine reads 'aborted' regardless of the
+// state it died in.
+
+export type CardDisposition =
+  | 'proposal_only'
+  | 'paper'
+  | 'approved'
+  | 'executed'
+  | 'managed'
+  | 'reviewed'
+  | 'aborted';
+
+/** Derive a card's disposition from its machine. `null` machine ⇒ the card can only propose. */
+export function dispositionFor(
+  lc: Pick<StrategyLifecycle, 'state' | 'terminal'> | null,
+): CardDisposition {
+  if (lc === null) return 'proposal_only';
+  if (lc.terminal !== null) return 'aborted';
+  const i = STATE_INDEX[lc.state];
+  if (i <= STATE_INDEX['proposed']) return 'proposal_only';
+  return lc.state as Exclude<LifecycleState, 'detected' | 'armed' | 'confirmed' | 'proposed'>;
+}
+
 // ── Audit trail ─────────────────────────────────────────────────────────────
 
 export interface TransitionRecord {
