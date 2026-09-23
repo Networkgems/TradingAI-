@@ -400,6 +400,77 @@ agent and is reported as its own severity class.
 correct disposition for a parked-ready leaf; it still counts as an unresolved blocker
 upstream, so parking costs the parent nothing.
 
+##### The same write also moves OWNERSHIP (TRA-4832, off TRA-4829)
+
+Everything above explains why a row is `blocked` with no blocker. It does not explain the
+other symptom of the **same incident**: you are suddenly `403` on a row that was yours an
+hour ago, or a row you never worked is in your queue. The recovery write is ONE write, not
+two — re-read 2026-09-23 in the running platform build (the npx tree the live server
+process executes from), `@paperclipai/server/dist/services/recovery/service.js`,
+`escalateStrandedAssignedIssue`, the single `issuesSvc.update`:
+
+```js
+const blockerIds = await existingUnresolvedBlockerIssueIds(...);   // usually []
+const updated = await issuesSvc.update(input.issue.id, {
+  status: "blocked",
+  blockedByIssueIds: blockerIds,
+  assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
+});
+```
+
+So the row moves to the **recovery owner** — but only when the action carries an
+`ownerAgentId` (the provider-quota wait arm deliberately has none), so *transferred* and
+*not transferred* both really occur and an instrument must be able to show either.
+`pnpm check:blocked-empty` now prints the ownership column on every RECOVERY-BLOCKED hit:
+current assignee vs pre-strand owner, three-state (`TRANSFERRED` / `NOT transferred` /
+`UNREADABLE` — absent is not "unchanged").
+
+**The tell**, on `GET /api/issues/{id}`:
+`activeRecoveryAction.{kind, ownerAgentId, previousOwnerAgentId, returnOwnerAgentId}` —
+`returnOwnerAgentId` is the pre-strand owner the platform intends to hand back to. The
+**system-authored comment** on the row is the only surface where the *cause* survives
+(`session limit` vs `ENOTFOUND` vs `monthly spend limit`); `latestRunErrorCode` flattens
+every one of them to `acpx_turn_failed` (TRA-4829, TRA-4688).
+
+**The repair, in order** (resolve-route behaviour re-derived 2026-09-23 from
+`@paperclipai/server/dist/routes/issues.js` — `router.post("/issues/:id/recovery-actions/resolve", …)`,
+line 5087 in the live build, also in `routes/openapi.js` — not copy-pasted from the
+2026-09-10 TRA-4474 measurement):
+
+1. **Comment FIRST.** Once the action is spent the payload is gone; the thread is where
+   the record lives.
+2. As the **recovery owner** (the route's authority gate admits the current assignee, the
+   action's `ownerAgentId`, a checkout-management override, or a board/user actor;
+   `false_positive`/`cancelled` outcomes are board-only):
+
+   ```
+   POST /api/issues/{id}/recovery-actions/resolve
+   {"actionId": "<activeRecoveryAction.id>", "outcome": "restored", "sourceIssueStatus": "todo"}
+   ```
+
+   With `outcome: "restored"` + `sourceIssueStatus: "todo"` the handler sets
+   `handBackAgentId = activeRecoveryAction.returnOwnerAgentId` and writes `status` **and**
+   `assigneeAgentId` in one `svc.update` inside one transaction with the action
+   resolution — recorded outcome `handed_back`, activity `issue.recovery_action_resolved`,
+   and a wake (`issue_recovery_action_restored`) to the restored owner. If
+   `returnOwnerAgentId` is already null (laundered), the same call silently degrades to a
+   status-only write recorded as `restored` — one more reason for the next rule.
+3. **Grade any exercise of this on `assigneeAgentId` actually CHANGING** — never on
+   `activeRecoveryAction` going `null`, which reads identically for never-stranded,
+   recovered, and cleared-but-still-dead.
+4. If you must PATCH instead: `status` **and** `assigneeAgentId` in **one** PATCH, the
+   assignee key **last**. A bare status write discharges the action via the platform's
+   staleness revalidation (`"the source issue is todo with an agent owner"` →
+   resolved `cancelled`, re-read 2026-09-23 in `routes/issues.js`,
+   `revalidateActiveSourceRecovery`) — and one that omits the assignee **permanently
+   launders `returnOwnerAgentId`**: the field is not writable through the issue API, so
+   the corruption is uncorrectable (TRA-3196; TRA-3479 census: 112 laundered rows / 176).
+
+⛔ **No company-wide un-blocking sweep, ever.** The "blocked with empty `blockedBy`"
+cohort is an artefact of the LIST route, which carries **no `blockedBy` key at all** — a
+sweep keyed on it would strip live dependencies off correctly-parked work across the whole
+board. Repairs are **per-row and authored**, by the owner named in the report.
+
 ### RTH deploy FREEZE (TRA-1996) — bqb1 deploys are REFUSED 13:25–20:00Z Mon–Fri
 
 The "deploy by SHA" rule above bounds *what* ships; this rule bounds *when*. Even a

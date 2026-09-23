@@ -1136,6 +1136,24 @@ export function classifyIssue(item, roster, { graph = null, now = null } = {}) {
     // platform names it on the payload. `previousOwnerAgentId` is the same value
     // on every row measured so far; it is a fallback, not an inference.
     recoveryReturnOwnerAgentId: recovery ? recovery.returnOwnerAgentId || recovery.previousOwnerAgentId || null : null,
+    // TRA-4832 — the OWNERSHIP half of the same write. The recovery service's
+    // `escalateStrandedAssignedIssue` writes `status: "blocked"` AND
+    // `assigneeAgentId: recoveryAction.ownerAgentId ?? <previous assignee>` in
+    // ONE `issuesSvc.update` (re-read in the live platform build 2026-09-23),
+    // so "why is this blocked" and "why am I suddenly 403 on it" are ONE
+    // incident — and the transfer only happens when the action carries an
+    // `ownerAgentId`, so both arms genuinely occur and both must be printable.
+    recoveryActionId: recovery ? recovery.id || null : null,
+    recoveryActionOwnerAgentId: recovery ? recovery.ownerAgentId || null : null,
+    // ⛔ THREE-state. `true`/`false` only when the pre-strand owner is READABLE
+    // off the payload; an absent `returnOwnerAgentId`/`previousOwnerAgentId` is
+    // `null` = UNKNOWN — possibly laundered by a hand PATCH that omitted the
+    // assignee (TRA-3196; that field is not writable through the issue API, so
+    // the corruption is uncorrectable). Absent is not "unchanged".
+    ownershipTransferred:
+      recovery && (recovery.returnOwnerAgentId || recovery.previousOwnerAgentId)
+        ? (recovery.returnOwnerAgentId || recovery.previousOwnerAgentId) !== assigneeAgentId
+        : null,
     // Whether anyone is ALREADY being woken for this. Both are findings — the
     // shape is the defect either way — but only a row with no live wake needs a
     // fresh one, and filing against a live one is a duplicate wake on an owner
@@ -1315,6 +1333,12 @@ export async function sweep({ getIssuesPage, getIssue, listAgents, getComments, 
     itemReads: blockedRows.length,
     findings,
     unreadable,
+    // TRA-4832 — who is READING this report. The resolve-restore verb is only
+    // executable by the recovery action's own owner (or the current assignee /
+    // board — `assertRecoveryActionAuthority` in the platform's issues routes,
+    // re-read 2026-09-23), so the render prints it only when the runner IS that
+    // owner. `null` = unknown runner = never print an executable verb.
+    runnerAgentId: opts.runnerAgentId || null,
   };
 }
 
@@ -1568,6 +1592,76 @@ export function renderReport(result) {
       // getting improvised into filings (TRA-2396): the cause asserted from a
       // guess, the anchor lifted from a rollup that only ever samples descendants.
       L.push(`     cause: ${causeSentence(f, result.roster)}`);
+      // TRA-4832 — the OWNERSHIP column. The recovery write that set `blocked`
+      // is ALSO an assignee write (one `issuesSvc.update` in the platform's
+      // `escalateStrandedAssignedIssue`, re-read 2026-09-23), so every
+      // RECOVERY-BLOCKED hit names both sides. Three arms on purpose: an
+      // instrument that cannot show the NEGATIVE (not transferred) or the
+      // UNREADABLE (possibly laundered) is the failure mode this company keeps
+      // paying for.
+      if (f.cause === CAUSE.RECOVERY_BLOCKED) {
+        const nameOf = (id) => (id ? `${(result.roster.get(id) || {}).name || 'OFF-ROSTER'} <${id}>` : 'none');
+        if (f.ownershipTransferred === true) {
+          L.push(
+            `     ownership: TRANSFERRED by the recovery write — current assignee ${nameOf(f.assigneeAgentId)} vs ` +
+              `pre-strand owner ${nameOf(f.recoveryReturnOwnerAgentId)}. Status and assignee were ONE write, so ` +
+              '"why is it blocked" and "why is the old owner 403 on it" are ONE incident.',
+          );
+        } else if (f.ownershipTransferred === false) {
+          L.push(
+            `     ownership: NOT transferred — assignee ${nameOf(f.assigneeAgentId)} is still the pre-strand owner ` +
+              'named by returnOwnerAgentId. No ownership change is visible on this payload.',
+          );
+        } else {
+          L.push(
+            '     ownership: pre-strand owner UNREADABLE — no returnOwnerAgentId/previousOwnerAgentId on the payload. ' +
+              'Absent is NOT "unchanged": a hand repair that wrote status without the assignee launders the field ' +
+              'permanently (TRA-3196 — it is not writable through the issue API), and a discharged action leaves ' +
+              'no payload at all.',
+          );
+        }
+        // The hand-back verb (measured TRA-4474; handler re-read 2026-09-23:
+        // `POST /issues/:id/recovery-actions/resolve`, outcome `restored` +
+        // sourceIssueStatus `todo` writes status AND assigneeAgentId back to
+        // returnOwnerAgentId in one transaction, recorded outcome
+        // `handed_back`). It is printed ONLY when the RUNNER of this sweep is
+        // the recovery action's own owner — for anyone else it is a 403, and
+        // an unexecutable command in a report is how TRA-2383 happened.
+        if (
+          result.runnerAgentId &&
+          f.recoveryActionOwnerAgentId &&
+          result.runnerAgentId === f.recoveryActionOwnerAgentId &&
+          f.recoveryActionId &&
+          f.recoveryReturnOwnerAgentId
+        ) {
+          if (f.pendingInteractions === 0) {
+            L.push('     hand-back (YOU are the recovery owner — this verb is yours to run):');
+            L.push(`       POST /api/issues/${f.id}/recovery-actions/resolve`);
+            L.push(
+              `         {"actionId":"${f.recoveryActionId}","outcome":"restored","sourceIssueStatus":"todo"}`,
+            );
+            L.push(
+              `       Comment on the issue FIRST, then resolve. Writes assigneeAgentId back to ` +
+                `${nameOf(f.recoveryReturnOwnerAgentId)} atomically with the status (activity: ` +
+                'issue.recovery_action_resolved, outcome handed_back). Grade success on assigneeAgentId ' +
+                'CHANGING — never on activeRecoveryAction going null, which reads identically for ' +
+                'never-stranded, recovered, and cleared-but-still-dead.',
+            );
+          } else {
+            L.push(
+              `     hand-back verb withheld: pending interactions ${
+                f.pendingInteractions === null ? 'UNKNOWN (route unread)' : f.pendingInteractions
+              } — resolving to \`todo\` demotes a leaf that may hold a live card (TRA-2598). Unknown is not zero.`,
+            );
+          }
+        } else if (f.ownershipTransferred === true) {
+          L.push(
+            '     hand-back exists but is NOT yours to run: POST .../recovery-actions/resolve is scoped to the ' +
+              'recovery owner / current assignee / board. Do NOT repair with a bare status write — one that omits ' +
+              'the assignee launders returnOwnerAgentId permanently (TRA-3196; 112 of 176 rows in the TRA-3479 census).',
+          );
+        }
+      }
       const rollup =
         f.rollupUnresolvedCount === null || f.rollupUnresolvedCount === undefined
           ? 'n/a'
@@ -1900,10 +1994,12 @@ const recoveryStrand = (
     wakeOwner = 'agent-cfo',
     returnOwner = 'agent-cto',
     previousStatus = 'in_progress',
+    actionId = 'ra-fixture',
   } = {},
 ) =>
   stranded(id, ident, assignee, {
     activeRecoveryAction: {
+      id: actionId,
       kind,
       cause: kind,
       status,
@@ -2265,6 +2361,74 @@ const CASES = [
         f.repair.eligible === false &&
         /NO `returnOwnerAgentId`/.test(f.repair.why) &&
         !/RESTORE-PATCH/.test(renderReport(r).join('\n'))
+      );
+    },
+  },
+  {
+    // TRA-4832 — the ownership column, TRANSFERRED arm. The recovery write is
+    // status + assignee in ONE update, so the row lands on the RECOVERY OWNER's
+    // queue while returnOwnerAgentId still names the pre-strand owner. The
+    // runner here IS the recovery owner, so the hand-back verb prints —
+    // executable, with the real actionId — and it is a POST, not a blocker
+    // write, so the global no-repair-PATCH invariant must survive it.
+    name: 'TRA-4832 OWNERSHIP — transferred arm: both owners NAMED, and the hand-back verb prints for the recovery owner',
+    expect: 'FINDINGS',
+    opts: { now: NOW_STALE, runnerAgentId: 'agent-cfo' },
+    build: () =>
+      transportFor(
+        fakeBoard([
+          recoveryStrand('s1', 'TRA-8710', 'agent-cfo', {
+            wakeOwner: 'agent-cfo',
+            returnOwner: 'agent-cto',
+            actionId: 'ra-4832-t',
+          }),
+        ]),
+      ),
+    assert: (r) => {
+      const out = renderReport(r).join('\n');
+      const f = r.findings[0];
+      return (
+        f.ownershipTransferred === true &&
+        f.recoveryActionOwnerAgentId === 'agent-cfo' &&
+        f.recoveryReturnOwnerAgentId === 'agent-cto' &&
+        /ownership: TRANSFERRED/.test(out) &&
+        /current assignee CFO <agent-cfo>/.test(out) &&
+        /pre-strand owner CTO <agent-cto>/.test(out) &&
+        /hand-back \(YOU are the recovery owner/.test(out) &&
+        /POST \/api\/issues\/s1\/recovery-actions\/resolve/.test(out) &&
+        /\{"actionId":"ra-4832-t","outcome":"restored","sourceIssueStatus":"todo"\}/.test(out) &&
+        /assigneeAgentId CHANGING/.test(out) &&
+        // the POST is not a blocker write — the standing invariant survives it
+        assertNoRepairCommand(out)
+      );
+    },
+  },
+  {
+    // TRA-4832 — the NOT-transferred arm plus the UNREADABLE arm. An
+    // instrument that cannot show a NEGATIVE is the recurring failure mode:
+    // "transferred" must be distinguishable from "unchanged" AND from
+    // "cannot tell" (laundered returnOwnerAgentId, TRA-3196). And a runner who
+    // is NOT the recovery owner never gets an executable resolve verb.
+    name: 'TRA-4832 OWNERSHIP — not-transferred + unreadable arms: the negative prints, and a non-owner runner gets NO verb',
+    expect: 'FINDINGS',
+    opts: { now: NOW_STALE, runnerAgentId: 'agent-qt' },
+    build: () =>
+      transportFor(
+        fakeBoard([
+          recoveryStrand('s2', 'TRA-8711', 'agent-cto', { wakeOwner: 'agent-cfo', returnOwner: 'agent-cto' }),
+          recoveryStrand('s3', 'TRA-8712', 'agent-cfo', { returnOwner: null }),
+        ]),
+      ),
+    assert: (r) => {
+      const out = renderReport(r).join('\n');
+      const byIdent = Object.fromEntries(r.findings.map((f) => [f.identifier, f]));
+      return (
+        r.findings.length === 2 &&
+        byIdent['TRA-8711'].ownershipTransferred === false &&
+        byIdent['TRA-8712'].ownershipTransferred === null &&
+        /ownership: NOT transferred/.test(out) &&
+        /ownership: pre-strand owner UNREADABLE/.test(out) &&
+        !/recovery-actions\/resolve/.test(out)
       );
     },
   },
@@ -3127,7 +3291,14 @@ function liveTransport() {
 async function main() {
   if (argv.includes('--selftest')) return selftest();
 
-  const result = await sweep(liveTransport(), { limit: PAGE_LIMIT, maxPages: MAX_PAGES, concurrency: CONCURRENCY });
+  const result = await sweep(liveTransport(), {
+    limit: PAGE_LIMIT,
+    maxPages: MAX_PAGES,
+    concurrency: CONCURRENCY,
+    // TRA-4832 — who is running this sweep. Gates whether the hand-back verb is
+    // printed as executable; unset = never.
+    runnerAgentId: argOf('runner', process.env.PAPERCLIP_AGENT_ID || null),
+  });
   const lines = renderReport(result);
 
   if (argv.includes('--json')) {
