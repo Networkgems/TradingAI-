@@ -39,7 +39,7 @@ export const TOUR_STOPS: readonly TourStop[] = [
   {
     id: 'signals',
     title: 'Signals & watchlist',
-    body: 'The engine’s latest entry signals, the symbols it tracks, and every other panel beyond the five on the Overview live under Diagnostics.',
+    body: 'The engine’s latest entry signals. Watchlist, Swing and Equity positions have their own tabs beside it; operator panels live under Diagnostics.',
   },
   {
     id: 'auto-trading',
