@@ -512,6 +512,12 @@ const NON_CHOKEPOINT_THROTTLE_STAMP = {
 import type { Regime } from '@trading-app/engine';
 import { fetchMinuteBars, fetchMinuteBarsWithSource, fetchDailyCandles, fetchTradierDailyCandles, isTradierDailyAvailable, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient, getTradierStocksFeedClient, knownSplitForSession } from './yahoo-feed.js';
 import { prioritizeQuoteUniverse } from './quote-priority.js';
+import {
+  boundScanUniverse,
+  resolveScanSymbolLimit,
+  type ScanUniverseBound,
+  type ScanUniverseBoundState,
+} from './scan-universe-limit.js';
 
 /**
  * TRA-154 — how recently a signal must have fired for its symbol to count as
@@ -17656,6 +17662,29 @@ export class SignalEngine {
   }
 
   getActiveSymbols(): string[] {
+    return this.boundActiveSymbols().selected;
+  }
+
+  /**
+   * TRA-4830 — the merged universe with the polling bound applied.
+   *
+   * The merge is unchanged since TRA-931; what is new is the bound at the end.
+   * `dynamicSymbols` has no cap of its own, and by 2026-09-23 the discovery
+   * tail had grown the tracked universe to 782 symbols — ~715 req/min of
+   * per-symbol REST demand against the account's 120 req/min entitlement,
+   * which is the TRA-4826 all-breakers-open chain. Every per-symbol consumer
+   * (cold-bar scan, SMA-200 entry sweep, MTF, supertrend shadow, news) derives
+   * from this set, so bounding here is what makes the demand fit.
+   *
+   * Membership is cut by priority tier (held → signalled → risk inputs → base
+   * watchlist → discovery tail, `prioritizeQuoteUniverse`'s ordering), NEVER
+   * by array position, and held/signalled rows survive any cap. The result
+   * keeps this method's historical order — it is the dashboard render order
+   * (TRA-2643). The bound is surfaced on `/api/health/quotes` as
+   * `scanUniverseBound` so a truncated universe can never read as the TRA-2627
+   * silent-absence failure.
+   */
+  private boundActiveSymbols(): ScanUniverseBound {
     // Apply ticker aliases before deduping so persisted user watchlists with
     // delisted symbols (e.g. SQ → XYZ on 2025-01-13) get live data without
     // requiring a manual UI edit.
@@ -17681,7 +17710,46 @@ export class SignalEngine {
         seen.add(sym);
       }
     }
-    return merged;
+    const { held, signalled } = this.heldAndSignalledSymbols();
+    return boundScanUniverse(
+      {
+        universe: merged,
+        held,
+        signalled,
+        base: (WATCHLIST as readonly string[]).map(aliasWatchlistSymbol),
+      },
+      resolveScanSymbolLimit(),
+    );
+  }
+
+  /**
+   * TRA-4830 — the bound's observability read for `/api/health/quotes`:
+   * counts + limit provenance, no symbol list (782 names per engine is noise
+   * the payload does not need).
+   */
+  getScanUniverseBound(): ScanUniverseBoundState {
+    const { selected: _selected, ...counts } = this.boundActiveSymbols();
+    return { ...counts, ...resolveScanSymbolLimit() };
+  }
+
+  /**
+   * The held/signalled tiers shared by the quote-fetch ordering (TRA-2643) and
+   * the polling bound (TRA-4830) — one definition of "this symbol carries
+   * money right now", so the two consumers cannot drift apart.
+   */
+  private heldAndSignalledSymbols(): { held: string[]; signalled: string[] } {
+    // Same 30-minute window `setActiveInterestSymbols` uses for the Twelve
+    // Data budget gate — one definition of "this symbol is live right now".
+    const signalCutoff = Date.now() - ACTIVE_SIGNAL_WINDOW_MS;
+    const held = new Set<string>(this.openOptionUnderlyings());
+    for (const p of this.account.getState().openPositions) {
+      held.add(aliasWatchlistSymbol(p.symbol.toUpperCase()));
+    }
+    const signalled = new Set<string>();
+    for (const s of this.recentSignals) {
+      if (s.timestamp >= signalCutoff) signalled.add(s.symbol);
+    }
+    return { held: [...held], signalled: [...signalled] };
   }
 
   /**
@@ -17708,21 +17776,11 @@ export class SignalEngine {
    * and `quote-priority.test.ts` asserts the multiset identity.
    */
   private getQuoteFetchOrder(activeSymbols: readonly string[]): string[] {
-    // Same 30-minute window `setActiveInterestSymbols` uses below for the Twelve
-    // Data budget gate — one definition of "this symbol is live right now".
-    const signalCutoff = Date.now() - ACTIVE_SIGNAL_WINDOW_MS;
-    const held = new Set<string>(this.openOptionUnderlyings());
-    for (const p of this.account.getState().openPositions) {
-      held.add(aliasWatchlistSymbol(p.symbol.toUpperCase()));
-    }
-    const signalled = new Set<string>();
-    for (const s of this.recentSignals) {
-      if (s.timestamp >= signalCutoff) signalled.add(s.symbol);
-    }
+    const { held, signalled } = this.heldAndSignalledSymbols();
     return prioritizeQuoteUniverse({
       universe: activeSymbols,
-      held: [...held],
-      signalled: [...signalled],
+      held,
+      signalled,
       base: (WATCHLIST as readonly string[]).map(aliasWatchlistSymbol),
     });
   }

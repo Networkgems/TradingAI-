@@ -18638,6 +18638,32 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   try { results['tradierQuotaBudget'] = getTradierQuotaBudgetState(); }
   catch (err) { results['tradierQuotaBudget'] = { error: err instanceof Error ? err.message : String(err) }; }
 
+  // TRA-4830 — the polling-universe bound, the capacity half of TRA-4826. On
+  // 2026-09-23 a 782-symbol universe drove ~715 req/min of per-symbol REST
+  // demand into a 120 req/min entitlement (~6x), the Tradier breaker cycled on
+  // quota, the remainder fanned out to Yahoo until ITS breaker opened, and the
+  // SMA-200 sweep starved (21,794/21,794, `evaluated: 0`). The universe is now
+  // bounded at each engine's `getActiveSymbols()`; this block is the loud
+  // counterpart TRA-2627 demands of anything that filters symbols off the tape
+  // — a truncated universe must never read as an unexplained absence. `error`
+  // non-null means a garbage env value failed CLOSED to the default cap.
+  try {
+    const { resolveScanSymbolLimit, DEFAULT_SCAN_SYMBOL_LIMIT, TRADIER_SCAN_SYMBOL_LIMIT_ENV } =
+      await import('./scan-universe-limit.js');
+    const scanLimit = resolveScanSymbolLimit();
+    results['scanUniverseBound'] = {
+      env: TRADIER_SCAN_SYMBOL_LIMIT_ENV,
+      defaultLimit: DEFAULT_SCAN_SYMBOL_LIMIT,
+      limit: scanLimit.limit,
+      raw: scanLimit.raw,
+      error: scanLimit.error,
+      engines: getAllUserContexts().map((ctx) => ({
+        username: ctx.username,
+        ...ctx.engine.getScanUniverseBound(),
+      })),
+    };
+  } catch (err) { results['scanUniverseBound'] = { error: err instanceof Error ? err.message : String(err) }; }
+
   // TRA-439 — Twelve Data quota guard: how much of the daily budget is spent
   // and whether the credit/rate-limit breaker is open. Lets QA confirm a
   // single provider can no longer blow its free-tier cap.
