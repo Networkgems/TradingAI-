@@ -550,6 +550,12 @@ import {
 import { parseRoutine, filterLabel, formatScan } from './routines/routine-spec.js';
 import { RoutineRunner, type RoutineRendered } from './routines/routine-runner.js';
 import { recordOptionChains, etDateKey } from './options-chain-recorder.js';
+// TRA-2111 — phase-instrument the 15:55–20:00 ET capture-window hook. The
+// 2026-09-21T19:58Z 1080ms sync block surfaced only as
+// `yield-preempt@signal.doTick.equity-entry-sweep` — a witness, never a culprit —
+// because nothing in this hook family carries a phase: its sync slices are
+// invisible to attribution and the lag ledger cannot straddle-attribute them.
+import { withPhase, SyncSliceMeter } from './phase-timing.js';
 import { recordSentimentSnapshot } from './sentiment-snapshot-recorder.js';
 import {
   fetchStockTwitsStream,
@@ -5855,11 +5861,18 @@ async function runOptionsAlertPush(): Promise<void> {
   // below used to run as one synchronous macrotask (2,408 alerts × 30 user
   // contexts = 72,240 emits), a 40.6s event-loop block at 19:56:50Z that the
   // watchdog killed 3 minutes before the close, burning the TRA-2213 session.
+  // TRA-2111 — the meter names an own >=1s slice down to the symbol/user span
+  // (or demotes it to a #span if the loop turned over), and stamps yield resumes
+  // so foreign work during OUR yields reads yield-preempt@chain-hook.alert-push.
+  const meter = new SyncSliceMeter('chain-hook.alert-push');
   const chainAlerts: OptionsAlert[] = [];
   for (const [symbol, today] of [...todayDay.bySymbol.entries()].sort()) {
     const prev = prevDay.bySymbol.get(symbol);
     if (prev) chainAlerts.push(...diffChain(prev, today));
+    meter.endSlice(symbol);
+    const scheduledAtMs = Date.now();
     await yieldToEventLoop();
+    meter.onYieldResumed(scheduledAtMs, symbol);
   }
 
   let pushed = 0;
@@ -5874,7 +5887,10 @@ async function runOptionsAlertPush(): Promise<void> {
         // Let the watchdog sampler, health checks and GC interleave between
         // slices — the dispatcher's dedup/digest handling is unaffected by
         // WHEN an event is emitted, only by its dedupKey.
+        meter.endSlice(`${ctx.username}:${end}`);
+        const scheduledAtMs = Date.now();
         await yieldToEventLoop();
+        meter.onYieldResumed(scheduledAtMs, `${ctx.username}:${end}`);
       }
       pushed += events.length;
     } catch (err) {
@@ -19354,7 +19370,7 @@ scheduler.start({
     }
     if (!chainDoneToday) {
       try {
-        const captured = await runChainRecord();
+        const captured = await withPhase('chain-hook.capture', runChainRecord);
         if (captured) {
           await writeFile(CHAIN_HOOK_MARKER_PATH, todayEt, 'utf-8').catch((err) =>
             log.warn('chain-record day marker write failed', {
@@ -19368,7 +19384,7 @@ scheduler.start({
         });
       }
     }
-    await runSentimentSnapshot().catch((err) =>
+    await withPhase('chain-hook.sentiment', runSentimentSnapshot).catch((err) =>
       log.error('sentiment-recorder failed', {
         reason: err instanceof Error ? err.message : String(err),
       }),
@@ -19382,21 +19398,21 @@ scheduler.start({
     // TRA-1209 — short-squeeze observe-capture (default-OFF, observe-only).
     // Isolated so a screener/feed failure can't drop the chain/sentiment
     // captures above (or vice-versa).
-    await runShortSqueezeCapture().catch((err) =>
+    await withPhase('chain-hook.squeeze-capture', runShortSqueezeCapture).catch((err) =>
       log.error('short-squeeze capture failed', {
         reason: err instanceof Error ? err.message : String(err),
       }),
     );
     // TRA-1209 — resolve forward outcomes on prior captures (the graded label).
     // Isolated so a bar-feed failure can't drop the captures above.
-    await runShortSqueezeForwardResolve().catch((err) =>
+    await withPhase('chain-hook.squeeze-resolve', runShortSqueezeForwardResolve).catch((err) =>
       log.error('short-squeeze forward-resolve failed', {
         reason: err instanceof Error ? err.message : String(err),
       }),
     );
     // TRA-845 — diff the just-captured chain vs yesterday and push Layer-4 alerts.
     // Isolated so a push failure can't drop the capture above (or vice-versa).
-    await runOptionsAlertPush().catch((err) =>
+    await withPhase('chain-hook.alert-push', runOptionsAlertPush).catch((err) =>
       log.error('options-alert push failed', {
         reason: err instanceof Error ? err.message : String(err),
       }),
