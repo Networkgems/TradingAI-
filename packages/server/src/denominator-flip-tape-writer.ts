@@ -16,10 +16,15 @@
  * ## Budget (hard, from the ruling)
  *
  * - `tape/<date>.json`, **<=1 MB**.
- * - retention **<=30 sessions**, counting against leg 1's 64 MB aggregate.
- *   30 x 1 MB is 30 MB worst case; the expected footprint is far smaller
- *   (a saturated 2,000-row tape serializes to ~600 KB, and a typical session is
- *   expected to produce orders of magnitude fewer rows).
+ * - retention **<=30 sessions**, counting against the tape's OWN
+ *   `TAPE_LEDGER_MAX_BYTES` (16 MiB) share of leg 1's budget since TRA-4156
+ *   Phase 1 split the shared 64 MiB pool (48 MiB `closes/` / 16 MiB `tape/`).
+ *   The pathological worst case (30 saturated 1 MB tapes) exceeds that share,
+ *   and leg 1's sweep then evicts the oldest TAPE sessions — never `closes/` —
+ *   down to 16 MiB. The expected footprint is far smaller (a saturated
+ *   2,000-row tape serializes to ~600 KB, and a typical session is expected to
+ *   produce orders of magnitude fewer rows), and the split exists because the
+ *   old shared pool let this tape evict the LIVE book's closes.
  * - The feed NEVER writes.
  *
  * ## TRA-3116 — the trigger widened, the boundary did NOT

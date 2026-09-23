@@ -37,10 +37,14 @@
  *   ledger must not read like a complete one, which is why `truncated` is
  *   stamped unconditionally (a `0` you can see beats a field you have to notice
  *   is absent).
- * - **Retention {@link CLOSE_LEDGER_MAX_FILES} files per bucket AND
- *   {@link LEDGER_AGGREGATE_MAX_BYTES} aggregate across ALL buckets** — the
- *   aggregate is SHARED with leg 2's `tape/`, per the ruling. Both prune
- *   oldest-first at every write and report `prunedFiles`.
+ * - **Retention {@link CLOSE_LEDGER_MAX_FILES} files per bucket AND a
+ *   per-directory aggregate across ALL buckets** — {@link CLOSE_LEDGER_MAX_BYTES}
+ *   for every `closes/` and {@link TAPE_LEDGER_MAX_BYTES} for leg 2's `tape/`,
+ *   64 MiB combined. TRA-4156 Phase 1 split what the TRA-2654 ruling ran as one
+ *   shared pool: the shared pool pinned at 99.9% from 2026-08-21 and evicted
+ *   the LIVE book's closes to make room for tape, so each writer now has its
+ *   own ceiling and neither can evict the other. Both prune oldest-first at
+ *   every write and report `prunedFiles`.
  *
  * The per-bucket count alone is NOT a bound on bytes: at ~614 rows/session one
  * bucket at full retention is ~250 x ~90 KB ~= 22 MB, so four busy buckets
@@ -149,17 +153,27 @@ export const CLOSE_LEDGER_MAX_ROWS = 1500;
 /** Hard per-bucket retention, from the ruling. */
 export const CLOSE_LEDGER_MAX_FILES = 250;
 /**
- * Hard aggregate retention ACROSS ALL BUCKETS, from the ruling. Shared with
- * leg 2's tape — see {@link LEDGER_BUDGET_DIRS}.
+ * TRA-4156 Phase 1 — the 64 MiB pool split into per-directory budgets, 75/25.
+ * The split is conservative on purpose: the combined ceiling is unchanged, so
+ * this cannot grow the disk footprint; it only stops the two writers evicting
+ * each other's files.
  */
-export const LEDGER_AGGREGATE_MAX_BYTES = 64 * 1024 * 1024;
+export const CLOSE_LEDGER_MAX_BYTES = 48 * 1024 * 1024;
+/** Leg 2's (`denominator-flip-tape-writer.ts`) share of the split. */
+export const TAPE_LEDGER_MAX_BYTES = 16 * 1024 * 1024;
 /**
- * The sub-directories the 64 MB aggregate is denominated over. `tape` is leg
- * 2's (`denominator-flip-tape-writer.ts`), and it is in here because the ruling
- * put it in here: *"this budget also covers leg 2's tape"*. A budget that
+ * The per-directory ceilings, keyed by the sub-directory name the files live
+ * under. `tape` is leg 2's, and it is in here because the TRA-2654 ruling put
+ * the budget in here: *"this budget also covers leg 2's tape"*. A budget that
  * enumerated only its own writer's files would be a bound on the wrong
- * quantity.
+ * quantity — TRA-4156 changed the DENOMINATION (per directory instead of one
+ * shared pool), not the ownership.
  */
+export const LEDGER_BUDGET_LIMITS: Record<string, number> = {
+  closes: CLOSE_LEDGER_MAX_BYTES,
+  tape: TAPE_LEDGER_MAX_BYTES,
+};
+/** The sub-directories the budgets are denominated over. */
 export const LEDGER_BUDGET_DIRS = ['closes', 'tape'] as const;
 
 /** `YYYY-MM-DD.json`. Leads with the ISO date, so lexical order IS date order. */
@@ -240,7 +254,15 @@ export interface CloseLedgerWriteResult {
    * "looked and we are under budget" are not the same fact.
    */
   aggregateSweep: 'ran' | 'skipped_no_root' | 'skipped_already_run' | 'failed';
+  /** Combined bytes across both directories — the pre-TRA-4156 quantity. */
   aggregateBytes?: number;
+  /**
+   * TRA-4156 Phase 1 — the per-directory view, keyed like
+   * {@link LEDGER_BUDGET_LIMITS}. Reported (and logged) separately because the
+   * combined number is exactly what hid the LIVE book's eviction: 99.9% of one
+   * shared pool said nothing about WHICH writer's files were being given up.
+   */
+  aggregateByDir?: Record<string, { bytes: number; maxBytes: number; pruned: number }>;
   /** Set when the write failed. The caller logs it; the report proceeds. */
   error?: string;
   /**
@@ -323,7 +345,7 @@ export function capCloseLedgerRows(
  * NEVER THROWS. `log` is injected so this module does not reach into the
  * engine's logger, matching leg 2's writer.
  *
- * ⛔ `usersRoot` is what makes the 64 MB aggregate leg possible. Omitting it
+ * ⛔ `usersRoot` is what makes the aggregate budget leg possible. Omitting it
  * does NOT silently disable the budget — it reports `skipped_no_root`, because
  * a bound nobody can see is not a bound.
  */
@@ -426,6 +448,7 @@ export async function writeCloseLedger(args: {
       prunedForAggregate: agg.pruned,
       aggregateSweep: agg.sweep,
       ...(agg.bytes == null ? {} : { aggregateBytes: agg.bytes }),
+      ...(agg.byDir == null ? {} : { aggregateByDir: agg.byDir }),
     };
     // No silent caps. A truncated ledger, or one written while the shared
     // budget was evicting, must not read like an ordinary complete session.
@@ -454,10 +477,10 @@ export async function writeCloseLedger(args: {
  * much between two of them.
  *
  * ⚠️ STATED, because a bound you cannot see the slack in is not a bound: with
- * the memo the fleet can exceed 64 MB by at most ONE session's writes (~62
- * books x ~90 KB ~= 5.6 MB, i.e. under 9%) before the next date's first EOD
- * reclaims it. A restart clears the memo and simply re-runs an idempotent
- * prune, which is the safe direction.
+ * the memo the fleet can exceed the budgets by at most ONE session's writes
+ * (~62 books x ~90 KB ~= 5.6 MB, i.e. under 12% of the 48 MiB `closes/` cap)
+ * before the next date's first EOD reclaims it. A restart clears the memo and
+ * simply re-runs an idempotent prune, which is the safe direction.
  */
 let aggregateSweptForDate: string | null = null;
 
@@ -475,8 +498,10 @@ export function resetAggregateLedgerSweepMemo(): void {
  * would silently scope itself to the shrinking half of the problem while
  * reporting a clean run.
  */
-async function ledgerBudgetDirs(usersRoot: string): Promise<string[]> {
-  const out: string[] = [];
+async function ledgerBudgetDirs(
+  usersRoot: string,
+): Promise<Array<{ path: string; kind: (typeof LEDGER_BUDGET_DIRS)[number] }>> {
+  const out: Array<{ path: string; kind: (typeof LEDGER_BUDGET_DIRS)[number] }> = [];
   let books: Array<{ name: string; isDirectory(): boolean }>;
   try {
     books = await readdir(usersRoot, { withFileTypes: true });
@@ -495,7 +520,9 @@ async function ledgerBudgetDirs(usersRoot: string): Promise<string[]> {
       }
       for (const mode of modes) {
         if (!mode.isDirectory()) continue;
-        for (const sub of LEDGER_BUDGET_DIRS) out.push(join(rootPath, mode.name, sub));
+        for (const sub of LEDGER_BUDGET_DIRS) {
+          out.push({ path: join(rootPath, mode.name, sub), kind: sub });
+        }
       }
     }
   }
@@ -503,32 +530,50 @@ async function ledgerBudgetDirs(usersRoot: string): Promise<string[]> {
 }
 
 /**
- * Hold the SHARED 64 MB ceiling across every bucket, evicting oldest-first.
+ * Hold the PER-DIRECTORY ceilings ({@link LEDGER_BUDGET_LIMITS}) across every
+ * bucket, evicting oldest-first WITHIN each directory type.
  *
- * "Oldest" is the filename's ISO date across ALL directories, not per
- * directory: the budget is one pool, so the globally oldest session is the
- * right thing to give up. Ties break on path so the order is deterministic.
+ * TRA-4156 Phase 1. This ran as one shared 64 MiB pool from the TRA-2654
+ * ruling until 2026-09: leg 2's tape filled it, and "the globally oldest
+ * session is the right thing to give up" then meant the LIVE book's closes
+ * were evicted to make room for tape — a bound on the right total protecting
+ * the wrong files. The pool is now denominated per directory type: a `tape/`
+ * overage can only evict `tape/` files, and `closes/` likewise. Within a
+ * type, "oldest" is still the filename's ISO date across ALL books, ties
+ * breaking on path so the order is deterministic.
  *
  * NEVER THROWS.
  */
 export async function enforceAggregateLedgerBudget(args: {
   usersRoot?: string;
   date: string;
-  maxBytes?: number;
+  /**
+   * Test seam — per-directory ceiling overrides, keyed like
+   * {@link LEDGER_BUDGET_LIMITS}. Directories not named keep their defaults.
+   */
+  limits?: Partial<Record<(typeof LEDGER_BUDGET_DIRS)[number], number>>;
   /** Test seam — bypass the once-per-date memo. */
   force?: boolean;
   log?: LedgerLog;
-}): Promise<{ sweep: CloseLedgerWriteResult['aggregateSweep']; pruned: number; bytes?: number }> {
+}): Promise<{
+  sweep: CloseLedgerWriteResult['aggregateSweep'];
+  pruned: number;
+  bytes?: number;
+  byDir?: Record<string, { bytes: number; maxBytes: number; pruned: number }>;
+}> {
   const { usersRoot } = args;
   if (!usersRoot) return { sweep: 'skipped_no_root', pruned: 0 };
   if (!args.force && aggregateSweptForDate === args.date) {
     return { sweep: 'skipped_already_run', pruned: 0 };
   }
-  const maxBytes = args.maxBytes ?? LEDGER_AGGREGATE_MAX_BYTES;
   try {
-    const files: Array<{ path: string; name: string; size: number }> = [];
-    let total = 0;
-    for (const dir of await ledgerBudgetDirs(usersRoot)) {
+    const filesByKind: Record<string, Array<{ path: string; name: string; size: number }>> = {};
+    const totals: Record<string, number> = {};
+    for (const kind of LEDGER_BUDGET_DIRS) {
+      filesByKind[kind] = [];
+      totals[kind] = 0;
+    }
+    for (const { path: dir, kind } of await ledgerBudgetDirs(usersRoot)) {
       let names: string[];
       try {
         names = await readdir(dir);
@@ -547,40 +592,51 @@ export async function enforceAggregateLedgerBudget(args: {
         try {
           const st = await stat(join(dir, name));
           if (!st.isFile()) continue;
-          files.push({ path: join(dir, name), name, size: st.size });
-          total += st.size;
+          filesByKind[kind].push({ path: join(dir, name), name, size: st.size });
+          totals[kind] += st.size;
         } catch {
           // Vanished between readdir and stat (a concurrent prune). It is not
           // in the pool, so it is not in the total either.
         }
       }
     }
-    let pruned = 0;
-    if (total > maxBytes) {
-      files.sort((a, b) => (a.name === b.name ? (a.path < b.path ? -1 : 1) : a.name < b.name ? -1 : 1));
-      for (const f of files) {
-        if (total <= maxBytes) break;
-        try {
-          await unlink(f.path);
-          total -= f.size;
-          pruned += 1;
-        } catch {
-          // Cannot remove it — leave the total as-is so the loop keeps trying
-          // the next-oldest rather than spinning on one unremovable file.
+    let prunedAll = 0;
+    let bytesAll = 0;
+    const byDir: Record<string, { bytes: number; maxBytes: number; pruned: number }> = {};
+    for (const kind of LEDGER_BUDGET_DIRS) {
+      const maxBytes = args.limits?.[kind] ?? LEDGER_BUDGET_LIMITS[kind];
+      let total = totals[kind];
+      let pruned = 0;
+      if (total > maxBytes) {
+        const files = filesByKind[kind];
+        files.sort((a, b) => (a.name === b.name ? (a.path < b.path ? -1 : 1) : a.name < b.name ? -1 : 1));
+        for (const f of files) {
+          if (total <= maxBytes) break;
+          try {
+            await unlink(f.path);
+            total -= f.size;
+            pruned += 1;
+          } catch {
+            // Cannot remove it — leave the total as-is so the loop keeps trying
+            // the next-oldest rather than spinning on one unremovable file.
+          }
         }
+        args.log?.warn('TRA-4156 per-directory ledger budget exceeded — evicted oldest sessions', {
+          issue: 'TRA-4156',
+          dir: kind,
+          maxBytes,
+          bytesAfter: total,
+          prunedForAggregate: pruned,
+        });
       }
-      args.log?.warn('TRA-2688 shared ledger budget exceeded — evicted oldest sessions', {
-        issue: 'TRA-2688',
-        maxBytes,
-        bytesAfter: total,
-        prunedForAggregate: pruned,
-        dirsScanned: LEDGER_BUDGET_DIRS.join('+'),
-      });
+      byDir[kind] = { bytes: total, maxBytes, pruned };
+      prunedAll += pruned;
+      bytesAll += total;
     }
     aggregateSweptForDate = args.date;
-    return { sweep: 'ran', pruned, bytes: total };
+    return { sweep: 'ran', pruned: prunedAll, bytes: bytesAll, byDir };
   } catch (err: unknown) {
-    args.log?.warn('TRA-2688 shared ledger budget sweep failed', {
+    args.log?.warn('TRA-2688 ledger budget sweep failed', {
       reason: err instanceof Error ? err.message : String(err),
     });
     return { sweep: 'failed', pruned: 0 };

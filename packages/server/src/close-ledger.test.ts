@@ -286,25 +286,77 @@ describe('TRA-2688 state budget', () => {
     expect(names).toContain('2026-08-11.json');
   });
 
-  it('the 64 MB aggregate is SHARED with leg 2\'s tape and evicts the globally oldest', async () => {
+  it('TRA-4156 — a tape/ overage evicts ONLY tape/, even when closes/ holds the globally oldest file', async () => {
+    // The pre-split behaviour this reverses: one shared pool evicted the
+    // globally oldest file, so leg 2 filling the pool cost the LIVE book its
+    // closes. Here closes/ holds the globally OLDEST file and tape/ is the
+    // directory over ITS budget — under the old rule closes/ would pay.
     const closesA = join(root, 'users', 'a', 'reports', 'live', 'closes');
     const tapeB = join(root, 'users', 'b', 'reports', 'demo', 'tape');
     await mkdir(closesA, { recursive: true });
     await mkdir(tapeB, { recursive: true });
     const blob = 'x'.repeat(1000);
-    await writeFile(join(closesA, '2026-01-02.json'), blob, 'utf-8');
-    await writeFile(join(tapeB, '2026-01-01.json'), blob, 'utf-8');   // globally oldest
-    await writeFile(join(closesA, '2026-01-03.json'), blob, 'utf-8');
+    await writeFile(join(closesA, '2026-01-01.json'), blob, 'utf-8');   // globally oldest
+    await writeFile(join(tapeB, '2026-01-02.json'), blob, 'utf-8');
+    await writeFile(join(tapeB, '2026-01-03.json'), blob, 'utf-8');
+    await writeFile(join(tapeB, '2026-01-04.json'), blob, 'utf-8');
 
     const r = await enforceAggregateLedgerBudget({
-      usersRoot: usersRoot(), date: '2026-08-11', maxBytes: 2500, force: true,
+      usersRoot: usersRoot(), date: '2026-08-11', force: true,
+      limits: { closes: 2500, tape: 2500 },
     });
     expect(r.sweep).toBe('ran');
     expect(r.pruned).toBe(1);
-    // Leg 2's file was the oldest, and the pool does not respect writer
-    // boundaries — that is what "shared budget" means.
-    expect(await readdir(tapeB)).toEqual([]);
+    // tape/ paid its own overage, oldest-first; closes/ kept the globally
+    // oldest file because it is under ITS OWN budget.
+    expect((await readdir(tapeB)).sort()).toEqual(['2026-01-03.json', '2026-01-04.json']);
+    expect(await readdir(closesA)).toEqual(['2026-01-01.json']);
+    // …and the report says which directory paid.
+    expect(r.byDir?.tape).toEqual({ bytes: 2000, maxBytes: 2500, pruned: 1 });
+    expect(r.byDir?.closes).toEqual({ bytes: 1000, maxBytes: 2500, pruned: 0 });
+  });
+
+  it('TRA-4156 — a closes/ overage likewise cannot touch tape/, and evicts the oldest closes ACROSS books', async () => {
+    const closesA = join(root, 'users', 'a', 'reports', 'live', 'closes');
+    const closesB = join(root, 'users', 'b', 'reports', 'demo', 'closes');
+    const tapeB = join(root, 'users', 'b', 'reports', 'demo', 'tape');
+    await mkdir(closesA, { recursive: true });
+    await mkdir(closesB, { recursive: true });
+    await mkdir(tapeB, { recursive: true });
+    const blob = 'x'.repeat(1000);
+    await writeFile(join(closesB, '2026-01-01.json'), blob, 'utf-8');   // oldest closes, other book
+    await writeFile(join(closesA, '2026-01-02.json'), blob, 'utf-8');
+    await writeFile(join(closesA, '2026-01-03.json'), blob, 'utf-8');
+    await writeFile(join(tapeB, '2025-12-31.json'), blob, 'utf-8');     // globally oldest, wrong pool
+
+    const r = await enforceAggregateLedgerBudget({
+      usersRoot: usersRoot(), date: '2026-08-11', force: true,
+      limits: { closes: 2500, tape: 2500 },
+    });
+    expect(r.pruned).toBe(1);
+    // Within closes/ the oldest session goes regardless of which book wrote
+    // it; tape/'s file survives despite being globally oldest.
+    expect(await readdir(closesB)).toEqual([]);
     expect((await readdir(closesA)).sort()).toEqual(['2026-01-02.json', '2026-01-03.json']);
+    expect(await readdir(tapeB)).toEqual(['2025-12-31.json']);
+  });
+
+  it('TRA-4156 — the default ceilings are 48 MiB closes / 16 MiB tape, and the write result carries the per-dir view', async () => {
+    const dir = bucket();
+    await mkdir(dir, { recursive: true });
+    const w = await writeCloseLedger({
+      targetDir: dir, date: '2026-08-11', symbols: [sym({ symbol: 'A' })], usersRoot: usersRoot(),
+    });
+    expect(w.aggregateSweep).toBe('ran');
+    // Separate budgets, separate bytes — the AC on TRA-4503.
+    expect(w.aggregateByDir?.closes.maxBytes).toBe(48 * 1024 * 1024);
+    expect(w.aggregateByDir?.tape.maxBytes).toBe(16 * 1024 * 1024);
+    expect(w.aggregateByDir?.closes.bytes).toBeGreaterThan(0);
+    expect(w.aggregateByDir?.tape).toEqual({ bytes: 0, maxBytes: 16 * 1024 * 1024, pruned: 0 });
+    // The combined number is still reported, and it is the sum of the parts.
+    expect(w.aggregateBytes).toBe(
+      (w.aggregateByDir?.closes.bytes ?? 0) + (w.aggregateByDir?.tape.bytes ?? 0),
+    );
   });
 
   it('reports WHY the aggregate leg did nothing — a 0 that never looked is not a 0 under budget', async () => {
