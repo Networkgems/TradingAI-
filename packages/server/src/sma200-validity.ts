@@ -5,19 +5,35 @@
 import type { Sma200Signal, Sma200VoidReason } from '@trading-app/shared';
 
 /**
+ * TRA-4411 (TRA-3688 S-1 flip) — the default max-dist gate, finite since
+ * 2026-09-23. `3.0` is QuantTrader's resolved sweep output (n=2,780 pullback
+ * fires, 692 symbols / 10y, deployed `evaluateSma200` unmodified): strongest
+ * KEEP-vs-REJECT separation on the 1.5–5.0 scan (t=3.66 date-clustered at the
+ * 20-bar mark), on a 2.25–3.25 plateau, FLIP at all four horizons under the
+ * pre-registered rule. The honest claim is "raises expectancy per unit of risk
+ * width", not "removes a losing cohort" (the rejected tail is positive OOS).
+ */
+export const SMA200_PULLBACK_MAX_DIST_ATR_DEFAULT = 3.0;
+
+/**
  * TRA-3688 S-1 — resolve `SMA200_PULLBACK_MAX_DIST_ATR` from the environment.
  *
- * Ships DARK: the default is `Infinity` (zero behavior change), and the finite
- * threshold is a backtest output owned by QuantTrader's `{1.5, 2.0, 2.5, 3.0,
- * Infinity}` sweep — never asserted here.
+ * TRA-4411 — a truly ABSENT var now means the finite sweep-ratified default
+ * above. Explicit `Infinity` (or any non-finite spelling) restores the old
+ * dark gate, so the flip is reversible by config without a deploy.
  *
- * Guarded the TRA-3440 way: an absent / blank / garbage / non-positive value
- * means the DEFAULT, never `0`. `Number('')` is `0`, and a max-dist of 0 would
- * reject every pullback signal silently — a dark feed misread as a low reading.
+ * The TRA-3440 parse guard is unchanged and deliberately does NOT fall to the
+ * finite default: a blank / garbage / non-positive value is an EXPLICIT value
+ * we could not use, and it resolves DARK (`Infinity`), never `3.0` and never
+ * `0`. `Number('')` is `0`, and a max-dist of 0 would reject every pullback
+ * signal silently — a dark feed misread as a low reading. Failing a garbled
+ * override to the permissive arm keeps a config typo from silently tightening
+ * (or un-tightening) admission to a number nobody set.
  */
 export function resolveSma200PullbackMaxDistAtr(env: NodeJS.ProcessEnv): number {
   const raw = env.SMA200_PULLBACK_MAX_DIST_ATR;
-  if (raw === undefined || raw.trim() === '') return Infinity;
+  if (raw === undefined) return SMA200_PULLBACK_MAX_DIST_ATR_DEFAULT;
+  if (raw.trim() === '') return Infinity;
   const n = Number(raw);
   if (!Number.isFinite(n) || n <= 0) return Infinity;
   return n;

@@ -70,11 +70,17 @@ beforeEach(() => {
   // TRA-4457 S2 — the sweep's daily-bar memo is process-wide; without this a
   // later test's spy would never be asked for bars an earlier test memoized.
   __resetSma200CandleMemoForTest();
+  // TRA-4411 — the default gate is now finite (3.0) and this file's fixture
+  // fires at distAtr ≈ 4.2, so every capital-gate / dedupe test below pins the
+  // pre-flip DARK gate via the AC2 escape hatch. The finite default's own
+  // server-side behavior is tested in the TRA-4411 describe at the bottom.
+  process.env.SMA200_PULLBACK_MAX_DIST_ATR = 'Infinity';
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
+  delete process.env.SMA200_PULLBACK_MAX_DIST_ATR;
 });
 
 describe('TRA-819 — capital-gate manifest', () => {
@@ -245,5 +251,85 @@ describe('TRA-1926 — SMA-200 scan does not pile up duplicate cards across rest
 
     const map = (engine as unknown as { sma200LastFired: Map<string, number> }).sma200LastFired;
     expect(map.get('TEST:sma200_pullback')).toBe(249 * DAY);
+  });
+});
+
+// TRA-4411 (AC6) — under the FINITE default, a gate-rejected pullback must be
+// recorded on a durable surface: census counter + `sma200GateRejections` on
+// state + snapshot persistence. Without these the rejected cohort exists
+// nowhere and AC7's admitted-vs-rejected comparison is ungradable.
+describe('TRA-4411 — S-1 finite default records max-dist rejections', () => {
+  const scan = (e: SignalEngine) => (e as unknown as {
+    runSma200Scan: (symbols: string[]) => Promise<void>;
+  }).runSma200Scan(['TEST']);
+
+  it('default gate (env unset) REJECTS the ≈4.2-ATR fixture and records it everywhere it must', async () => {
+    delete process.env.SMA200_PULLBACK_MAX_DIST_ATR; // the shipped default, 3.0
+    const engine = new SignalEngine();
+    vi.spyOn(yahooFeed, 'fetchDailyCandles').mockResolvedValue(pullbackSeries());
+
+    await scan(engine);
+
+    const state = engine.getState();
+    // Not on the feed …
+    expect(state.signals.find(s => s.type === 'sma200_pullback')).toBeUndefined();
+    // … but on the rejection ledger, with the fields AC6 names.
+    expect(state.sma200GateRejections).toHaveLength(1);
+    const rej = state.sma200GateRejections![0];
+    expect(rej.symbol).toBe('TEST');
+    expect(rej.kind).toBe('sma200_pullback');
+    expect(rej.distAtr).toBeGreaterThan(3.0);
+    expect(rej.maxDistAtr).toBe(3.0);
+    expect(rej.barTimestamp).toBe(249 * DAY);
+    expect(Number.isFinite(rej.entryPrice) && Number.isFinite(rej.stopLoss)).toBe(true);
+    // The census carries the counter (and stamps the finite regime).
+    expect(state.sma200ScanStats?.rejectedMaxDist).toBe(1);
+    expect(state.sma200ScanStats?.maxDistAtr).toBe(3.0);
+    expect(state.sma200ScanStats?.fired).toBe(0);
+    // A rejection must NOT consume the FIRE debounce (a name rejected on bar t
+    // may fire admitted on t+1..t+4 — the admitted cohort is not a subset of
+    // the dark cohort, per the grader note on TRA-4411).
+    const fireMap = (engine as unknown as { sma200LastFired: Map<string, number> }).sma200LastFired;
+    expect(fireMap.get('TEST:sma200_pullback')).toBeUndefined();
+
+    // Re-scanning the same daily bar records no duplicate.
+    await scan(engine);
+    expect(engine.getState().sma200GateRejections).toHaveLength(1);
+  });
+
+  it('a DARK gate (explicit Infinity) records nothing — an empty ledger under Infinity is structural', async () => {
+    process.env.SMA200_PULLBACK_MAX_DIST_ATR = 'Infinity';
+    const engine = new SignalEngine();
+    vi.spyOn(yahooFeed, 'fetchDailyCandles').mockResolvedValue(pullbackSeries());
+
+    await scan(engine);
+
+    const state = engine.getState();
+    expect(state.signals.find(s => s.type === 'sma200_pullback')).toBeDefined();
+    expect(state.sma200GateRejections).toEqual([]);
+    expect(state.sma200ScanStats?.rejectedMaxDist).toBe(0);
+    expect(state.sma200ScanStats?.maxDistAtr).toBeNull();
+  });
+
+  it('the rejection ledger and its own debounce survive a snapshot round-trip', async () => {
+    delete process.env.SMA200_PULLBACK_MAX_DIST_ATR;
+    const source = new SignalEngine();
+    vi.spyOn(yahooFeed, 'fetchDailyCandles').mockResolvedValue(pullbackSeries());
+    await scan(source);
+    const snap = source.exportTradeSnapshot();
+    expect(snap.sma200GateRejections).toHaveLength(1);
+
+    const engine = new SignalEngine();
+    engine.importTradeSnapshot(snap);
+    expect(engine.getState().sma200GateRejections).toHaveLength(1);
+    const rejMap = (engine as unknown as { sma200LastRejected: Map<string, number> }).sma200LastRejected;
+    expect(rejMap.get('TEST:sma200_pullback')).toBe(249 * DAY);
+
+    // Post-restore, a boot re-scan of the SAME daily bar stays deduped even
+    // though the restart-proof check now rides the restored ledger.
+    __resetSma200CandleMemoForTest();
+    vi.spyOn(yahooFeed, 'fetchDailyCandles').mockResolvedValue(pullbackSeries());
+    await scan(engine);
+    expect(engine.getState().sma200GateRejections).toHaveLength(1);
   });
 });

@@ -517,6 +517,36 @@ export interface Sma200SignalVoidRecord {
 }
 
 /**
+ * TRA-4411 (TRA-3688 S-1 flip) — durable record of a pullback setup the
+ * max-dist gate REJECTED. Exists because after the flip every served row has
+ * `distAtr <= maxDistAtr` by construction, so without this record the rejected
+ * cohort exists nowhere — not on a row, not in the census, not in the log —
+ * and AC7's admitted-vs-rejected invalidation comparison is ungradable.
+ * Written ONLY when every other pullback fire conjunct held and the gate was
+ * the sole failure; an empty list under a dark gate is structural, never data.
+ * Surfaced on `EngineState.sma200GateRejections`, capped, snapshot-persisted.
+ */
+export interface Sma200GateRejectionRecord {
+  symbol: string;
+  /** Pullback-only: S-1 gates no other kind. */
+  kind: 'sma200_pullback';
+  /** Daily bar the rejected setup was computed on. */
+  barTimestamp: number;
+  /** The would-be entry (latest daily close). */
+  entryPrice: number;
+  /** The would-be structural stop (`sma200 − 1·ATR`), never clamped. */
+  stopLoss: number;
+  /** (close − SMA200) / ATR(14) at the reject bar — necessarily > maxDistAtr. */
+  distAtr: number;
+  /** ATR(14) ruler in force at the reject bar. */
+  atr14: number;
+  /** The gate value that rejected it (finite by construction). */
+  maxDistAtr: number;
+  /** Wall-clock (ms) the rejection was recorded. */
+  recordedAt: number;
+}
+
+/**
  * TRA-451 — signal emitted by the SMA-200 trend-filter scanner. Covers the
  * pullback-to-200 bounce (`sma200_pullback`) and the 200-SMA reclaim reversal
  * (`sma200_reclaim`), both computed on daily bars. `entryPrice` is the latest

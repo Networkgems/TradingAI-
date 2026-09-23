@@ -312,6 +312,59 @@ describe('evaluateSma200 — TRA-3688 S-1 max-dist gate (ships DARK)', () => {
   });
 });
 
+// TRA-4411 (AC6) — the gate's rejections are RETURNED, never silently dropped:
+// after the finite default, every served row has distAtr <= maxDistAtr by
+// construction, so `rejected[]` is the rejected cohort's only surface.
+describe('evaluateSma200 — TRA-4411 AC6 rejected[] cohort', () => {
+  it('cap 3.0 + dist_atr ≈ 4.2 ⇒ the row lands in rejected[] and NOT in signals[]', () => {
+    const candles = pullbackSeries();
+    const res = evaluateSma200('TEST', candles, { pullbackMaxDistAtr: 3.0 });
+    expect(res.signals.find(s => s.kind === 'sma200_pullback')).toBeUndefined();
+    const rej = res.rejected.find(s => s.kind === 'sma200_pullback');
+    expect(rej).toBeDefined();
+    expect(rej!.distAtr).toBeGreaterThan(3.0);
+    expect(rej!.maxDistAtr).toBe(3.0);
+    // The would-be row is the SAME row the fire path would have built: stop
+    // stays STRUCTURAL (reject-not-clamp) and the C1 ruler identities hold.
+    const ind = res.indicators!;
+    expect(rej!.stop).toBeCloseTo(ind.sma200 - ind.atr14);
+    expect(Math.abs(rej!.stopAtr - (rej!.distAtr + 1.0))).toBeLessThan(1e-6);
+    expect(Math.abs((rej!.entry - rej!.stop) / rej!.atr14 - rej!.stopAtr)).toBeLessThan(1e-3);
+  });
+
+  it('cap 3.0 + dist_atr ≈ 1.66 ⇒ admitted: in signals[], rejected[] empty', () => {
+    const candles = pullbackSeries({ spread: 4 });
+    const res = evaluateSma200('TEST', candles, { pullbackMaxDistAtr: 3.0 });
+    expect(res.signals.find(s => s.kind === 'sma200_pullback')).toBeDefined();
+    expect(res.rejected).toEqual([]);
+  });
+
+  it('gate dark ⇒ rejected[] is ALWAYS empty (default, explicit Infinity, and every TRA-3440 guard arm)', () => {
+    const candles = pullbackSeries();
+    for (const opts of [undefined, { pullbackMaxDistAtr: Infinity }, { pullbackMaxDistAtr: 0 }, { pullbackMaxDistAtr: -1 }, { pullbackMaxDistAtr: NaN }]) {
+      const res = evaluateSma200('TEST', candles, opts);
+      expect(res.signals.find(s => s.kind === 'sma200_pullback')).toBeDefined();
+      expect(res.rejected).toEqual([]);
+    }
+  });
+
+  it('a row failing any OTHER conjunct is NOT a gate rejection — rejected[] stays empty', () => {
+    // Slope gate fails; the max-dist gate would also reject at 0.001, but the
+    // gate was not the SOLE failure, so the cohort must not absorb the row.
+    const candles = pullbackSeries({ flattenSlope: true });
+    const res = evaluateSma200('TEST', candles, { pullbackMaxDistAtr: 0.001 });
+    expect(res.signals.find(s => s.kind === 'sma200_pullback')).toBeUndefined();
+    expect(res.rejected).toEqual([]);
+  });
+
+  it('the reclaim is never in rejected[] (S-1 gates the pullback only)', () => {
+    const { candles } = reclaimSeries();
+    const res = evaluateSma200('TEST', candles, { pullbackMaxDistAtr: 0.001 });
+    expect(res.signals.find(s => s.kind === 'sma200_reclaim')).toBeDefined();
+    expect(res.rejected).toEqual([]);
+  });
+});
+
 /**
  * Signal 3 fixture — a long basing range that sits below an (elevated) 200-SMA
  * and reclaims it on a volume surge. The base chops in an 88–98 band so the

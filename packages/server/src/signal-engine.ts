@@ -17,7 +17,7 @@ import {
 import { foldHiddenBookExposure } from './hidden-book-exposure.js';
 import { roundToCent } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Sma200SignalVoidRecord, Sma200VoidReason, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason, HiddenBookExposure } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Sma200SignalVoidRecord, Sma200VoidReason, Sma200GateRejectionRecord, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason, HiddenBookExposure } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-3390 (impl child of TRA-2628) — the entry-path currency refusal. See
 // `quoteCurrencyEntryVerdict` below for where it is consulted.
@@ -876,6 +876,15 @@ export interface Sma200ScanStats {
   /** Resting signals voided by this sweep (TRA-3688 S-3). */
   voided: number;
   /**
+   * TRA-4411 (AC6) — pullback setups this sweep REJECTED on the max-dist gate
+   * alone, recorded post-debounce (symmetric with `fired`, which also counts
+   * emissions, not raw evaluations). Structurally 0 while the gate is dark —
+   * `distAtr <= Infinity` cannot fail — so a zero here is only a zero once
+   * `maxDistAtr` below reads finite. Optional: absent on an older build's
+   * census, and field presence is the deployed-bytes proof (TRA-3913).
+   */
+  rejectedMaxDist?: number;
+  /**
    * TRA-4457 S2 — symbols served from the process-wide daily-bar memo, i.e.
    * scored WITHOUT a request. `considered - memoHits` bounds the pulls this
    * sweep put on Yahoo. Optional (TRA-3913): absent = a build without the memo.
@@ -901,6 +910,16 @@ export interface EngineState {
    * not "scanner dead". Optional so pre-TRA-3688 fixtures still type-check.
    */
   sma200SignalVoids?: Sma200SignalVoidRecord[];
+  /**
+   * TRA-4411 (AC6) — pullback setups the S-1 max-dist gate rejected, newest
+   * last, capped, snapshot-persisted. The rejected cohort's ONLY surface:
+   * after the finite default, every row in `signals` has `distAtr <=
+   * maxDistAtr` by construction, so without this list the AC7 invalidation
+   * comparison (admitted E[R] vs rejected E[R]) would grade against an empty
+   * set that means nothing. Empty under a dark gate is structural, not data.
+   * Optional so pre-TRA-4411 fixtures still type-check (TRA-3913).
+   */
+  sma200GateRejections?: Sma200GateRejectionRecord[];
   /**
    * TRA-4457 — census of the most recent `runSma200Scan` sweep, or `null` if no
    * sweep has completed in this process yet.
@@ -3403,6 +3422,13 @@ export class SignalEngine {
   private lastSma200ScanStats: Sma200ScanStats | null = null;
   private static readonly SMA200_VOID_MAX = 50;
   /**
+   * TRA-4411 (AC6) — pullback setups the S-1 max-dist gate rejected, newest
+   * last, capped, snapshot-persisted. See {@link EngineState.sma200GateRejections}
+   * for why the rejected cohort must have a durable surface at all.
+   */
+  private sma200GateRejections: Sma200GateRejectionRecord[] = [];
+  private static readonly SMA200_REJECTION_MAX = 50;
+  /**
    * TRA-787 — per-symbol 5m candle series for the SupertrendConfluence shadow
    * scan, resampled from a deeper minute-bar pull than the ORB cache. Refreshed
    * on the {@link SUPERTREND_SHADOW_REFRESH_MS} cadence by
@@ -3760,6 +3786,15 @@ export class SignalEngine {
    * (spec guardrail: one signal per symbol per type, 5-bar debounce).
    */
   private sma200LastFired: Map<string, number> = new Map();
+  /**
+   * TRA-4411 (AC6) — the REJECTION ledger's own 5-bar debounce, keyed
+   * `${symbol}:${kind}` like {@link sma200LastFired} but deliberately a
+   * SEPARATE map: a rejected fire does not set `sma200LastFired` (so a name
+   * rejected on bar t can still fire admitted on t+1..t+4), and a fire must
+   * not suppress the recording of a later rejection either. Rehydrated from
+   * the persisted rejection list at snapshot import.
+   */
+  private sma200LastRejected: Map<string, number> = new Map();
   private allClosedPositions: Position[] = [];
   /**
    * TRA-3860 — epoch ms of the last {@link archiveClosedTrades} tick observed on
@@ -4820,6 +4855,10 @@ export class SignalEngine {
     // TRA-451 — clear the SMA-200 debounce ledger so signals can re-emit
     // against the next daily scan after a full reset.
     this.sma200LastFired.clear();
+    // TRA-4411 — a full reset drops the gate-rejection ledger and its debounce
+    // with it (the evidence archive belongs to the state being reset).
+    this.sma200GateRejections = [];
+    this.sma200LastRejected.clear();
     // TRA-335 — wipe the live equity mirror too. The Tradier-side positions
     // are NOT canceled here (forceReset is local-only by design); the user
     // must close them in Tradier or re-import via reconciliation.
@@ -7990,6 +8029,7 @@ export class SignalEngine {
       fetchFailed: 0,
       fired: 0,
       voided: 0,
+      rejectedMaxDist: 0,
       maxDistAtr: null,
       memoHits: 0,
     };
@@ -8129,6 +8169,62 @@ export class SignalEngine {
               this.evaluateCatalystGateShadow(signal, signal.timestamp);
               await this.openSma200Pullback(signal);
             }
+          }
+          // TRA-4411 (AC6) — record the max-dist gate's rejections. These rows
+          // satisfied every other pullback conjunct; the gate alone kept them
+          // off the feed, and after the finite default they exist NOWHERE else.
+          // Debounced on their OWN ledger (`sma200LastRejected`) — a rejection
+          // must not consume the fire debounce (a name rejected on bar t may
+          // legitimately fire admitted on t+1..t+4) and vice versa.
+          // (`?? []` — an older engine build, or a test double, may not return
+          // the field at all; absent must read as "none", never throw.)
+          for (const result of evalResult.rejected ?? []) {
+            const key = `${sym}:${result.kind}`;
+            const latestBarDay = sma200BarDay(latestBarTs);
+            const lastRejectedBarTs = this.sma200LastRejected.get(key);
+            // Already recorded for this exact daily bar — never duplicate it.
+            if (lastRejectedBarTs === latestBarTs) continue;
+            // Restart-proof dedupe against the PERSISTED ledger (the TRA-1926
+            // shape): the in-memory map starts empty after a redeploy, but the
+            // rejection list is snapshot-restored — compare on the UTC calendar
+            // day so a drifting bar timestamp can't slip a dupe past.
+            const alreadyRecorded = this.sma200GateRejections.some(r =>
+              r.symbol === sym && r.kind === result.kind
+              && sma200BarDay(r.barTimestamp) === latestBarDay);
+            if (alreadyRecorded) {
+              this.sma200LastRejected.set(key, latestBarTs);
+              continue;
+            }
+            // 5-bar debounce, keyed separately from fires.
+            if (lastRejectedBarTs !== undefined) {
+              const lastIdx = candles.findIndex(c => c.timestamp === lastRejectedBarTs);
+              if (lastIdx >= 0 && candles.length - 1 - lastIdx < SMA200_DEBOUNCE_BARS) {
+                continue;
+              }
+            }
+            this.sma200GateRejections.push({
+              symbol: sym,
+              kind: 'sma200_pullback',
+              barTimestamp: latestBarTs,
+              entryPrice: result.entry,
+              stopLoss: result.stop,
+              distAtr: result.distAtr,
+              atr14: result.atr14,
+              maxDistAtr: result.maxDistAtr,
+              recordedAt: Date.now(),
+            });
+            if (this.sma200GateRejections.length > SignalEngine.SMA200_REJECTION_MAX) {
+              this.sma200GateRejections.splice(
+                0, this.sma200GateRejections.length - SignalEngine.SMA200_REJECTION_MAX,
+              );
+            }
+            this.sma200LastRejected.set(key, latestBarTs);
+            stats.rejectedMaxDist = (stats.rejectedMaxDist ?? 0) + 1;
+            log.info('sma200 pullback rejected by max-dist gate', {
+              component: 'sma200-scan', issue: 'TRA-4411',
+              sym, distAtr: result.distAtr, maxDistAtr: result.maxDistAtr,
+              barTimestamp: latestBarTs,
+            });
           }
         }),
       );
@@ -22565,6 +22661,8 @@ export class SignalEngine {
         signals: scopedSignals,
         // TRA-3688 S-3 — voided SMA-200 signals (the measurable removal trace).
         sma200SignalVoids: this.sma200SignalVoids,
+        // TRA-4411 (AC6) — the max-dist gate's rejected cohort (its only surface).
+        sma200GateRejections: this.sma200GateRejections,
         // TRA-4457 — the sweep census, so a reader can see the denominator that
         // makes an empty `signals` array mean something.
         sma200ScanStats: this.lastSma200ScanStats,
@@ -22636,6 +22734,8 @@ export class SignalEngine {
       signals: scopedSignals,
       // TRA-3688 S-3 — voided SMA-200 signals (the measurable removal trace).
       sma200SignalVoids: this.sma200SignalVoids,
+      // TRA-4411 (AC6) — the max-dist gate's rejected cohort (its only surface).
+      sma200GateRejections: this.sma200GateRejections,
       // TRA-4457 — the sweep census, so a reader can see the denominator that
       // makes an empty `signals` array mean something.
       sma200ScanStats: this.lastSma200ScanStats,
@@ -23040,6 +23140,13 @@ export class SignalEngine {
      * witness survives a restart. Optional: absent on pre-TRA-3688 snapshots.
      */
     sma200SignalVoids?: Sma200SignalVoidRecord[];
+    /**
+     * TRA-4411 (AC6) — persisted gate-rejection ledger, same rationale as the
+     * void ledger above: the rejected cohort must survive a restart or the
+     * AC7 comparison loses its slow-accruing denominator on every redeploy.
+     * Optional: absent on pre-TRA-4411 snapshots.
+     */
+    sma200GateRejections?: Sma200GateRejectionRecord[];
     dailySignals: DailySignalRecord[];
     positionSignalType: Array<[string, SignalType]>;
     account: ReturnType<PaperAccount['exportSnapshot']>;
@@ -23072,6 +23179,7 @@ export class SignalEngine {
       lastArchivedAt: this.lastArchivedAt,
       recentSignals: [...this.recentSignals],
       sma200SignalVoids: [...this.sma200SignalVoids],
+      sma200GateRejections: [...this.sma200GateRejections],
       dailySignals: [...this.dailySignals],
       positionSignalType: Array.from(this.positionSignalType.entries()),
       account: this.account.exportSnapshot(),
@@ -23179,6 +23287,19 @@ export class SignalEngine {
     this.sma200SignalVoids = Array.isArray(snap.sma200SignalVoids)
       ? [...snap.sma200SignalVoids]
       : [];
+    // TRA-4411 (AC6) — restore the gate-rejection ledger and rebuild its OWN
+    // debounce map (separate from `sma200LastFired` — a rejection must never
+    // consume a fire's debounce slot, nor the reverse). Same TRA-1926 shape.
+    this.sma200GateRejections = Array.isArray(snap.sma200GateRejections)
+      ? [...snap.sma200GateRejections]
+      : [];
+    this.sma200LastRejected.clear();
+    for (const r of this.sma200GateRejections) {
+      if (typeof r.barTimestamp !== 'number') continue;
+      const key = `${r.symbol}:${r.kind}`;
+      const prev = this.sma200LastRejected.get(key);
+      if (prev === undefined || r.barTimestamp > prev) this.sma200LastRejected.set(key, r.barTimestamp);
+    }
     // TRA-1926 — rebuild the SMA-200 one-per-symbol-per-bar debounce from the
     // restored feed. The map is otherwise in-memory only, so a redeploy wipes it
     // and the boot scan re-fires every daily-bar signal still on the feed (the

@@ -2,32 +2,41 @@
 import { describe, it, expect } from 'vitest';
 import {
   resolveSma200PullbackMaxDistAtr,
+  SMA200_PULLBACK_MAX_DIST_ATR_DEFAULT,
   sma200VoidVerdict,
   SMA200_DRIFT_VOID_ATR,
   sma200SweepVerdict,
   sma200SweepStarved,
 } from './sma200-validity.js';
 
-describe('resolveSma200PullbackMaxDistAtr (TRA-3440-guarded parse)', () => {
-  it('absent / blank / whitespace mean the DARK default (Infinity)', () => {
-    expect(resolveSma200PullbackMaxDistAtr({})).toBe(Infinity);
+describe('resolveSma200PullbackMaxDistAtr (TRA-3440-guarded parse, TRA-4411 finite default)', () => {
+  it('AC1 — a truly ABSENT var means the sweep-ratified finite default, 3.0', () => {
+    expect(SMA200_PULLBACK_MAX_DIST_ATR_DEFAULT).toBe(3.0);
+    expect(resolveSma200PullbackMaxDistAtr({})).toBe(3.0);
+  });
+
+  it('AC1 — blank / whitespace resolve DARK (Infinity): an explicit value we could not use never falls to 3.0', () => {
     expect(resolveSma200PullbackMaxDistAtr({ SMA200_PULLBACK_MAX_DIST_ATR: '' })).toBe(Infinity);
     expect(resolveSma200PullbackMaxDistAtr({ SMA200_PULLBACK_MAX_DIST_ATR: '   ' })).toBe(Infinity);
   });
 
-  it('garbage means the default, never 0 — Number("") is 0 and a 0 gate rejects every signal silently', () => {
+  it('AC1 — garbage means DARK, never 0 and never 3.0 — Number("") is 0 and a 0 gate rejects every signal silently', () => {
     expect(resolveSma200PullbackMaxDistAtr({ SMA200_PULLBACK_MAX_DIST_ATR: 'abc' })).toBe(Infinity);
     expect(resolveSma200PullbackMaxDistAtr({ SMA200_PULLBACK_MAX_DIST_ATR: 'NaN' })).toBe(Infinity);
   });
 
-  it('non-positive values are refused as a config, not honored as a reject-all', () => {
+  it('AC1 — non-positive values are refused as a config, not honored as a reject-all (and never 3.0)', () => {
     expect(resolveSma200PullbackMaxDistAtr({ SMA200_PULLBACK_MAX_DIST_ATR: '0' })).toBe(Infinity);
     expect(resolveSma200PullbackMaxDistAtr({ SMA200_PULLBACK_MAX_DIST_ATR: '-2' })).toBe(Infinity);
   });
 
-  it('a real threshold parses', () => {
+  it('AC2 — an explicit env var overrides in BOTH directions', () => {
     expect(resolveSma200PullbackMaxDistAtr({ SMA200_PULLBACK_MAX_DIST_ATR: '2.0' })).toBe(2.0);
-    expect(resolveSma200PullbackMaxDistAtr({ SMA200_PULLBACK_MAX_DIST_ATR: '2.5' })).toBe(2.5);
+    expect(resolveSma200PullbackMaxDistAtr({ SMA200_PULLBACK_MAX_DIST_ATR: '4.5' })).toBe(4.5);
+  });
+
+  it('AC2 — SMA200_PULLBACK_MAX_DIST_ATR=Infinity restores the old dark gate: the flip is reversible by config without a deploy', () => {
+    expect(resolveSma200PullbackMaxDistAtr({ SMA200_PULLBACK_MAX_DIST_ATR: 'Infinity' })).toBe(Infinity);
   });
 });
 

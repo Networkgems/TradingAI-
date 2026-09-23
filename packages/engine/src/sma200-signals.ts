@@ -136,6 +136,15 @@ export interface Sma200Evaluation {
   trendQuality: boolean;
   /** Signals 2 & 3 that fired on the latest bar (empty when none / filtered). */
   signals: Sma200SignalResult[];
+  /**
+   * TRA-4411 (TRA-3688 S-1 flip / AC6) — pullback rows that satisfied EVERY
+   * fire conjunct except `withinMaxDist`. The gate was the sole reason they
+   * are not in `signals`, so they are the rejected cohort AC7's invalidation
+   * comparison grades against. Empty by construction while the gate is dark
+   * (`distAtr <= Infinity` never fails). A row failing any OTHER conjunct is
+   * NOT here — that would fold ordinary non-setups into the gate's cohort.
+   */
+  rejected: Sma200SignalResult[];
   /** Set when the series could not be evaluated. */
   rejectReason?: string;
 }
@@ -198,6 +207,7 @@ export function evaluateSma200(
     liquidityOk: false,
     trendQuality: false,
     signals: [],
+    rejected: [],
   };
 
   if (candles.length < SMA200_MIN_BARS) {
@@ -244,12 +254,13 @@ export function evaluateSma200(
   // ---- Guardrail: liquidity filter --------------------------------------
   const liquidityOk = today.close >= SMA200_MIN_PRICE && avgDollarVol20 >= SMA200_MIN_AVG_DOLLAR_VOL;
 
-  const base: Sma200Evaluation = { symbol, indicators, liquidityOk, trendQuality, signals: [] };
+  const base: Sma200Evaluation = { symbol, indicators, liquidityOk, trendQuality, signals: [], rejected: [] };
   if (!liquidityOk) {
     return { ...base, rejectReason: 'below liquidity floor (price ≥ $3 and 20d avg $vol ≥ $5M)' };
   }
 
   const signals: Sma200SignalResult[] = [];
+  const rejected: Sma200SignalResult[] = [];
 
   // ---- Signal 2: Pullback-to-200 Bounce (continuation long) -------------
   // TRA-458 v2 — cleared the TRA-455 acceptance gate after two revisions vs
@@ -278,15 +289,18 @@ export function evaluateSma200(
   // premise says is the support (NBIS worked example: a 3.0-ATR clamp puts the
   // stop 34.76 ABOVE the SMA200). Dark by default (`Infinity`).
   const withinMaxDist = distAtr <= pullbackMaxDistAtr;
-  if (trendQuality && trendStrength && pullbackTouched && holdConfirmed && decisiveUpClose && withinMaxDist) {
+  if (trendQuality && trendStrength && pullbackTouched && holdConfirmed && decisiveUpClose) {
     const stop = sma200 - 1.0 * atr14;
     // TRA-520 — guard against a non-positive / above-entry stop. When daily
     // data is spiky (an outlier bar inflates ATR(14) past the SMA200 level)
     // `sma200 − ATR` can go ≤ 0, which slipped through and persisted as a
     // negative stopLoss (e.g. ASTC stopLoss=-0.215) — a long with no real
     // downside protection. A valid pullback long must have 0 < stop < entry.
+    // Applied BEFORE the gate split below: a row an invalid stop would have
+    // kept off the feed anyway is not a gate rejection (its sole-failure
+    // premise would be false), so it belongs in neither list.
     if (stop > 0 && stop < today.close) {
-      signals.push({
+      const row: Sma200SignalResult = {
         kind: 'sma200_pullback',
         symbol,
         entry: today.close,
@@ -304,7 +318,14 @@ export function evaluateSma200(
         stopAtr: (today.close - stop) / atr14,
         stopBasis: 'sma200_minus_1atr',
         maxDistAtr: pullbackMaxDistAtr,
-      });
+      };
+      // TRA-4411 (AC6) — the gate is the LAST conjunct, split out so its
+      // rejections are returned, never silently dropped: after the finite
+      // default every served row has `distAtr <= maxDistAtr` by construction,
+      // and without this branch the rejected cohort would exist nowhere.
+      // Reject-not-clamp is unchanged (the stop above stays STRUCTURAL).
+      if (withinMaxDist) signals.push(row);
+      else rejected.push(row);
     }
   }
 
@@ -369,5 +390,5 @@ export function evaluateSma200(
     });
   }
 
-  return { ...base, signals };
+  return { ...base, signals, rejected };
 }
