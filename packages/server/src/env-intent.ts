@@ -27,6 +27,7 @@
 // changes what the instrument reports, not what the process does.
 
 import { resolveDurabilityPolicy } from './durability.js';
+import { redactTradierEnvLabel } from './tradier-env-label.js';
 import { resolveOrderQuoteGuardConfig } from './order-quote-guard.js';
 import {
   isOptionLiveDirectionalEnabled,
@@ -43,6 +44,27 @@ export interface EnvLeverIntent {
   provenance: string;
   /** Resolve the effective value the SAME way the consumer does. */
   resolve: (env: NodeJS.ProcessEnv) => string;
+  /**
+   * TRA-4801 — optional publication filter for the RAW value.
+   *
+   * ⚠️ `summarizeEnvIntent` is served by `/api/health/durability`, which is an
+   * OPEN route (no auth, by design — see its handler). `raw` therefore echoes an
+   * env var's literal contents to the public internet. That is harmless for a
+   * policy word like `refuse`, and it is a **P0 credential leak** for any key
+   * that can hold a secret.
+   *
+   * `TRADIER_ENV` is exactly such a key, not hypothetically but historically:
+   * TRA-2163 was a P0 in which this very var held the 28-char production Tradier
+   * API token and a no-auth health route published it. Adding that key to this
+   * manifest without a filter would have re-opened that leak through a second
+   * route.
+   *
+   * So: any lever whose key could ever hold a secret MUST set `redact`. Return
+   * `null` for unset/empty and a fixed marker for anything unrecognized — never
+   * the raw string. `present` is still computed from the unredacted value, so
+   * redaction never costs the absent/present distinction.
+   */
+  redact?: (raw: string | undefined) => string | null;
 }
 
 /**
@@ -86,12 +108,57 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
       'TRA-1490: board authorized BUILDING the live path, explicitly did NOT arm it; arming is a separate gated approval',
     resolve: (env) => (isOptionLiveDirectionalEnabled(env) ? 'on' : 'off'),
   },
+  {
+    key: 'TRADIER_ENV',
+    intended: 'production',
+    provenance:
+      "TRA-2163 verified this by value as 'production' on 2026-07-23 and AGENTS.md still records it that way. " +
+      'It reads `sandbox` on bqb1 today. TRA-4801 dated the change to the only env-var write in the bracket ' +
+      "[09-18T14:33Z last 'production' reading, 09-22T19:29Z first 'sandbox' reading]: 2026-09-21T02:08:37.612656Z, " +
+      'about 20h after the TRA-4750 option-book stand-down, so it was most likely a deliberate execution of it. ' +
+      '⚠️ THIS ROW IS EXPECTED TO READ MISMATCH UNTIL SOMEONE RULES. That is deliberate and it is the whole ' +
+      'point of the manifest: the stand-down already has its own lever (ENABLE_OPTION_LIVE_OTM), whereas ' +
+      'TRADIER_ENV routes ALL Tradier credentials, not just options — a strictly broader posture change that ' +
+      "no ruling on the record covers. TRA-1655's G2 unblock condition is explicitly `TRADIER_ENV == production`. " +
+      'Do NOT "resolve" this by flipping the row to `sandbox`: that silently ratifies an unruled change, which ' +
+      'is the TRA-4442 shape. Either the board ratifies sandbox (then edit this row, citing the ruling) or the ' +
+      'env goes back to production. Same discipline as the ENABLE_OPTION_LIVE_OTM row above.',
+    // Resolve the way the CREDENTIAL ROUTER does (index.ts ~1243), because that
+    // is the read with consequences:
+    //   const tradierEnv = (process.env['TRADIER_ENV'] as ...) ?? 'sandbox';
+    //   ... tradierEnv === 'production' ? PROD_CREDS : SANDBOX_CREDS
+    // So it defaults to sandbox ONLY on absence (`??` does not catch ''), and it
+    // routes production on an EXACT `=== 'production'` with no trim.
+    //
+    // `unrecognized` is its own value on purpose. `/api/health/live-equity`
+    // grades this key as `(env['TRADIER_ENV'] ?? '').trim() === 'production'`
+    // — WITH a trim — so ` production ` makes that route report
+    // `tradierEnvProduction: true` while the credential router hands out SANDBOX
+    // creds. Collapsing that case into 'sandbox' would hide a real disagreement
+    // between two live readers of the same key; it mismatches either way, but an
+    // operator needs to know it is a malformed value, not a deliberate flip.
+    resolve: (env) => {
+      const raw = env['TRADIER_ENV'];
+      if (raw === undefined) return 'sandbox';
+      if (raw === 'production') return 'production';
+      if (raw === 'sandbox') return 'sandbox';
+      return 'unrecognized';
+    },
+    // MANDATORY here — see the `redact` doc above. `/api/health/durability` is open.
+    redact: (raw) => redactTradierEnvLabel(raw),
+  },
 ];
 
 export interface EnvIntentLeverReading {
   key: string;
   intended: string;
-  /** Raw env string, `null` when the key is absent. */
+  /**
+   * Raw env string, `null` when the key is absent — or when the lever declares a
+   * `redact` filter that suppresses it. This field is PUBLISHED on the open
+   * `/api/health/durability` route, so never assume it is the literal value:
+   * for a secret-capable key it is a label or a fixed marker. Use `present` to
+   * ask whether the key exists.
+   */
   raw: string | null;
   /** Whether the key exists in the env at all — `false` + a passing `effective` means the DEFAULT is doing the work. */
   present: boolean;
@@ -129,7 +196,10 @@ export function summarizeEnvIntent(env: NodeJS.ProcessEnv = process.env): EnvInt
     return {
       key: lever.key,
       intended: lever.intended,
-      raw: raw ?? null,
+      // TRA-4801 — redacted for publication when the lever declares a filter.
+      // `present` below is deliberately derived from the UNREDACTED value, so a
+      // key that exists but redacts to null still reads present:true.
+      raw: lever.redact ? lever.redact(raw) : (raw ?? null),
       present: raw !== undefined,
       effective,
       matches: applies ? effective === lever.intended : null,

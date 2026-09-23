@@ -182,6 +182,26 @@ const STORED_RESOLVERS = {
     reads: ['ENABLE_OPTION_LIVE_DIRECTIONAL'],
     resolve: (env) => (flagOn(env['ENABLE_OPTION_LIVE_DIRECTIONAL']) ? 'on' : 'off'),
   },
+  // TRA-4801 — index.ts:1243, the CREDENTIAL ROUTER, which is the read with
+  // consequences:
+  //   const tradierEnv = (process.env['TRADIER_ENV'] as ...) ?? 'sandbox';
+  //   tradierEnv === 'production' ? PROD_CREDS : SANDBOX_CREDS
+  // NOT `flagOn` and NOT trimmed: `??` defaults on ABSENCE only, and routing is
+  // an exact `=== 'production'`. This must stay byte-for-byte equivalent to the
+  // shipped resolver in env-intent.ts — the cross-check arm reads BLIND (exit 3)
+  // if this port and the shipped one ever disagree on an observed pair, which is
+  // the behaviour that makes this duplication safe rather than a second source
+  // of truth.
+  TRADIER_ENV: {
+    reads: ['TRADIER_ENV'],
+    resolve: (env) => {
+      const raw = env['TRADIER_ENV'];
+      if (raw === undefined) return 'sandbox';
+      if (raw === 'production') return 'production';
+      if (raw === 'sandbox') return 'sandbox';
+      return 'unrecognized';
+    },
+  },
 };
 
 /** Resolve one lever against the stored set, or say why it cannot be resolved. */
