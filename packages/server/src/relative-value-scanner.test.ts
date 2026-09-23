@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
+import { TradierRelativeValueScannerService, REFUSAL_4XX_COOLDOWN_MS } from './relative-value-scanner.js';
 import type { OptionChainRow, TradierOptionsClient } from '@trading-app/engine';
 
 class FakeClient {
@@ -618,6 +618,58 @@ describe('Tradier HTTP refusals are not listings (TRA-4664)', () => {
     client.fetchChainSnapshot.mockResolvedValue(okChain);
 
     expect((await svc.scanOtm('BAD!')).reason).toBe('fetch_error');
+    expect(svc.diagnostics().breakerOpen).toBe(false);
+    expect((await svc.scanOtm('SPY')).reason).toBe('ok');
+  });
+
+  it('a 400-refused key is not re-asked upstream during its cooldown, and every suppressed retry is counted (TRA-4664 second pass)', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, advance } = makeService({ client });
+    client.fetchExpirations.mockImplementation(async (s) =>
+      s === 'BAD!' ? { ok: false, httpStatus: 400 } : okExp);
+    client.fetchChainSnapshot.mockResolvedValue(okChain);
+    const upstreamCalls = () => client.fetchExpirations.mock.calls.filter(([s]) => s === 'BAD!').length;
+
+    expect((await svc.scanOtm('BAD!')).reason).toBe('fetch_error');
+    expect(upstreamCalls()).toBe(1);
+
+    // Without the cooldown, bqb1 re-fired this exact refusal every cycle —
+    // 1,079,861 HTTP 400s in 4.9h of RTH (~61 rps) on 2026-09-23. The same
+    // three retries now cost zero upstream calls and still read fetch_error,
+    // never no_expirations.
+    for (let i = 1; i <= 3; i++) {
+      advance(20_000);
+      const r = await svc.scanOtm('BAD!');
+      expect(r.reason).toBe('fetch_error');
+      expect(r.errorMessage).toMatch(/HTTP 400/);
+    }
+    expect(upstreamCalls()).toBe(1);
+    const d = svc.diagnostics();
+    expect(d.upstreamRefusals!.byStatus).toEqual({ '400': 1 }); // upstream responses only
+    expect(d.refusalCooldown).toEqual({ size: 1, suppressed: 3 });
+
+    // The cooldown is per-key: other symbols are untouched.
+    expect((await svc.scanOtm('SPY')).reason).toBe('ok');
+
+    // Past the cooldown the key is re-asked for real.
+    advance(REFUSAL_4XX_COOLDOWN_MS + 1);
+    expect((await svc.scanOtm('BAD!')).reason).toBe('fetch_error');
+    expect(upstreamCalls()).toBe(2);
+    expect(svc.diagnostics().upstreamRefusals!.byStatus).toEqual({ '400': 2 });
+  });
+
+  it('a 400 on the chain cools the symbol|expiration key only — breaker closed, other symbols scan', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, advance } = makeService({ client });
+    client.fetchExpirations.mockResolvedValue(okExp);
+    client.fetchChainSnapshot.mockImplementation(async (s) =>
+      s === 'BAD!' ? { ok: false, httpStatus: 400 } : okChain);
+
+    expect((await svc.scanOtm('BAD!')).reason).toBe('fetch_error');
+    advance(20_000);
+    expect((await svc.scanOtm('BAD!')).reason).toBe('fetch_error');
+    expect(client.fetchChainSnapshot.mock.calls.filter(([s]) => s === 'BAD!').length).toBe(1);
+    expect(svc.diagnostics().refusalCooldown!.suppressed).toBe(1);
     expect(svc.diagnostics().breakerOpen).toBe(false);
     expect((await svc.scanOtm('SPY')).reason).toBe('ok');
   });

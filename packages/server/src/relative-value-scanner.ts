@@ -43,8 +43,17 @@ const EXPIRATIONS_CACHE_TTL_MS = 6 * 60 * 60_000;
 // generous vs. the realistic active roster (~15–30 symbols × 1 in-window
 // expiration) so steady-state cache hits are unaffected; they only bite the
 // long-tail accumulation of dead entries.
-const MAX_CHAIN_CACHE_ENTRIES = 64;
-const MAX_EXPIRATIONS_CACHE_ENTRIES = 64;
+// TRA-4664 — 64 was undersized for the live workload, and the counters proved
+// it: 4.9h of RTH on 2026-09-23 read chainCache 136,465 hits / 111,493
+// capacityEvictions (evictions ≈ 82% of hits) and expirationsCache at an 81%
+// miss rate. The chain cache is keyed `symbol|expiration`, so the
+// TRADIER_SCAN_SYMBOL_LIMIT=100 universe (TRA-4830) × 2–3 in-window
+// expirations needs ~200–300 entries; the expirations cache is per-symbol so
+// 256 holds the whole capped universe for its 6h TTL. Chain entries die at
+// their 60s TTL regardless, so the heap cost of the larger cap is bounded by
+// churn, not by the cap.
+const MAX_CHAIN_CACHE_ENTRIES = 256;
+const MAX_EXPIRATIONS_CACHE_ENTRIES = 256;
 // TRA-417 — replaced the flat 1h cooldown with discriminated cooldowns.
 // Tradier's rate limit is a ~60s sliding window (60/min sandbox, 120/min
 // prod); a 1h breaker over-suppressed scanning by ~60x on any transient
@@ -70,6 +79,19 @@ const RATE_LIMIT_429_COOLDOWN_MS = 90_000;
 const UPSTREAM_ERROR_COOLDOWN_MS = 5 * 60_000;
 const BACKOFF_429_WINDOW_MS = 5 * 60_000;
 const BACKOFF_429_MAX_MS = 10 * 60_000;
+// TRA-4664 (second pass) — a non-429 4xx neither trips the breaker (correct:
+// it refuses THIS request, not the vendor) nor gets cached (correct: a refusal
+// must never read as an empty listing). But "never cached" made a persistently
+// refused key a per-cycle upstream call: on 2026-09-23 bqb1 fired 1,079,861
+// HTTP-400 expiration/chain requests in 4.9h (~61 rps) re-asking Tradier the
+// same refused questions. So a non-429 4xx now arms a PER-KEY cooldown: for
+// its duration the same key re-throws the refusal locally (still surfacing as
+// `fetch_error`, never as `no_expirations`/`no_chain`) without an upstream
+// call, and every suppressed retry is counted in diagnostics — a suppression
+// that doesn't ship a counter is invisible. 429 and 5xx are excluded: those
+// are vendor-wide states owned by the breaker/backoff, not per-key ones.
+export const REFUSAL_4XX_COOLDOWN_MS = 10 * 60_000;
+const MAX_REFUSAL_COOLDOWN_ENTRIES = 1024;
 
 function is429Error(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
@@ -238,6 +260,14 @@ export interface RelativeValueScannerDiagnostics {
    * expirations). Absent key ≠ zero: an older build omits the whole object.
    */
   upstreamRefusals?: { byStatus: Record<string, number>; lastAtMs: number | null; lastStatus: number | null };
+  /**
+   * TRA-4664 (second pass) — the non-429-4xx per-key refusal cooldown.
+   * `size` = keys currently under cooldown; `suppressed` = upstream calls NOT
+   * made because the key was cooling (process-lifetime). `upstreamRefusals`
+   * counts only real upstream responses, so the true refusal pressure is
+   * `byStatus[4xx] + suppressed`.
+   */
+  refusalCooldown?: { size: number; suppressed: number };
 }
 
 export interface CacheCounters {
@@ -500,6 +530,10 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
   private readonly refusalsByStatus: Record<string, number> = {};
   private lastRefusalAtMs: number | null = null;
   private lastRefusalStatus: number | null = null;
+  // TRA-4664 (second pass) — see `RelativeValueScannerDiagnostics.refusalCooldown`.
+  // Key shapes match the caches: `expirations|SYM` and `chain|SYM|EXPIRATION`.
+  private readonly refusalCooldown = new Map<string, CacheEntry<TradierHttpRefusalError>>();
+  private suppressedRefusals = 0;
 
   constructor(config: RelativeValueScannerConfig) {
     this.fetchSpot = config.fetchSpot;
@@ -540,6 +574,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
         lastAtMs: this.lastRefusalAtMs,
         lastStatus: this.lastRefusalStatus,
       },
+      refusalCooldown: { size: this.refusalCooldown.size, suppressed: this.suppressedRefusals },
     };
   }
 
@@ -1011,7 +1046,37 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     this.refusalsByStatus[key] = (this.refusalsByStatus[key] ?? 0) + 1;
     this.lastRefusalAtMs = this.now();
     this.lastRefusalStatus = httpStatus;
-    throw new TradierHttpRefusalError(endpoint, httpStatus, detail);
+    const err = new TradierHttpRefusalError(endpoint, httpStatus, detail);
+    // TRA-4664 (second pass) — a non-429 4xx refuses this KEY, and Tradier will
+    // refuse it identically next cycle: stop asking for a cooldown period.
+    // 429/5xx stay out — the breaker/backoff owns vendor-wide states, and a
+    // per-key cooldown would outlive the vendor's recovery.
+    if (httpStatus >= 400 && httpStatus < 500 && httpStatus !== 429) {
+      this.putBounded(
+        this.refusalCooldown,
+        `${endpoint}|${detail}`,
+        err,
+        REFUSAL_4XX_COOLDOWN_MS,
+        MAX_REFUSAL_COOLDOWN_ENTRIES,
+      );
+    }
+    throw err;
+  }
+
+  /**
+   * TRA-4664 (second pass) — re-raise a still-cooling refusal without an
+   * upstream call. The re-thrown error is the original refusal, so callers see
+   * exactly what a live refusal produces (`fetch_error`, breaker untouched).
+   */
+  private throwIfCooling(endpoint: 'expirations' | 'chain', detail: string): void {
+    const entry = this.refusalCooldown.get(`${endpoint}|${detail}`);
+    if (!entry) return;
+    if (this.now() - entry.at >= REFUSAL_4XX_COOLDOWN_MS) {
+      this.refusalCooldown.delete(`${endpoint}|${detail}`);
+      return;
+    }
+    this.suppressedRefusals += 1;
+    throw entry.value;
   }
 
   private async pickExpiration(symbol: string, dtePrefs: DtePrefs = {}): Promise<string | null> {
@@ -1055,6 +1120,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       // `no_expirations` — a quota blip poisoning the symbol until the size cap
       // happened to evict it. A refusal now throws: never cached, and the
       // caller's catch trips the breaker and reports `fetch_error`.
+      this.throwIfCooling('expirations', symbol);
       const client = this.client!;
       if (typeof client.fetchExpirations === 'function') {
         const r = await client.fetchExpirations(symbol);
@@ -1120,6 +1186,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     this.chainCounters.misses += 1;
     // TRA-4664 — same as `resolveWindowedExpirations`: a refusal was `[]`,
     // cached for the chain TTL and reported as `no_chain`. Now it throws.
+    this.throwIfCooling('chain', `${symbol},${expiration}`);
     const client = this.client!;
     let rows: OptionChainRow[];
     if (typeof client.fetchChainSnapshot === 'function') {
