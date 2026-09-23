@@ -100,8 +100,16 @@ const MAX_ROWS_PER_SLOT_OTHER = 200;
 const MAX_ROWS_PER_PASS = 400;
 /** Keep this many ms on disk — comfortably over the ≥20 RTH desk sessions AC4 needs. */
 const RETAIN_MS = 60 * 24 * 60 * 60 * 1000;
-/** After time compaction, prune whole OLDEST ET days until the file fits this. */
-const MAX_FILE_BYTES = 64 * 1024 * 1024;
+/**
+ * After time compaction, prune whole OLDEST ET days until the file fits this.
+ * Sized off MEASURED v2 volume (2026-09-21/22: ~20.9k rows/day at ~308 B/row
+ * ≈ 6.4 MB per desk session — 2.7x the pre-deploy estimate): the AC4 bar needs
+ * ≥20 desk sessions of RAW rows simultaneously on disk for the TRA-4623 re-run,
+ * and `sessionsWithAdmissions` itself is rebuilt from hydrated days, so a cap
+ * that holds fewer sessions than the bar makes the bar unreachable. 192 MB
+ * holds ~30 v2 sessions; the 60-day time retention binds first.
+ */
+const MAX_FILE_BYTES = 192 * 1024 * 1024;
 /** Hard cap on rows a single health-route read may return. */
 const MAX_READ_ROWS = 20_000;
 
