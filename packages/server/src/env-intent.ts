@@ -189,7 +189,12 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
       "armed, a silent re-point to 'sandbox' routes real entries to the sandbox broker, so " +
       "'sandbox' or 'unrecognized' here is now the event to escalate — never edit this row alone to " +
       'clear it. The unattributed 09-21/09-23 env writes remain open incidents under ' +
-      'TRA-4820/TRA-4821; this ratifies the POSTURE, not those writes.',
+      'TRA-4820/TRA-4821; this ratifies the POSTURE, not those writes. TRA-4863 has since ' +
+      'key-named both of them as writes to THIS key, off the boot tape rather than off a bracket: ' +
+      'dep-dao939egekts73bbv9cg set `sandbox` (last production boot 2026-09-20T22:07:07Z, first ' +
+      'sandbox boot 2026-09-21T02:09:14Z) and dep-daq028id0e5s73aka5i0 set it back ' +
+      '(2026-09-23T16:41:55Z) — 62h32m41s boot-to-boot with the real-money boot-arm disarmed, ' +
+      'which is why TRA-4820\'s "it cost nothing" verdict is withdrawn and re-filed as TRA-4864.',
     // Resolve the way the CREDENTIAL ROUTER does (index.ts ~1243), because that
     // is the read with consequences:
     //   const tradierEnv = (process.env['TRADIER_ENV'] as ...) ?? 'sandbox';

@@ -185,11 +185,42 @@ const cases = [
   // ── TRA-4862: the declared leg's own controls ──────────────────────────────
   // Both legs above read `intended` off the wire, so a manifest edit that is
   // COMMITTED BUT NOT DEPLOYED was invisible to both. The 2026-09-23 stand-down
-  // defeated them in BOTH directions, and ARM 0 and ARM 0b are those two states
-  // byte-for-byte. (Timeline corrected 2026-09-24 off the TRA-4861 Render tape:
-  // the stand-down WAS applied to the env var and held ~15.5h, then an
-  // unattributed env write at 16:41Z reverted it. ARM 0 is the state AFTER that
-  // revert — the instant the boot-arm repaired.)
+  // defeated them, and ARM 0 / 0b / 0c are the three states of it byte-for-byte.
+  //
+  // TIMELINE — measured directly off the Render tape by TRA-4863
+  // (`scripts/tra4863-tradier-env-timeline.mjs`, which reads the `rv-scanner
+  // initialized {env}` line `index.ts` logs at module scope off
+  // `process.env['TRADIER_ENV']`, so the lever's value is on the tape at every
+  // boot). This SUPERSEDES the "held ~15.5h" reading that stood here until
+  // 2026-09-24: that span was dated from the 01:15Z persisted demotion on
+  // 09-23, which is when ineligibility was first REVEALED, not when the lever
+  // moved. The lever had already moved ~47h earlier.
+  //
+  //   09-20T22:07:07Z  last boot reading 'production'
+  //   09-21T02:08:37Z  unattributed env write dep-dao939egekts73bbv9cg → sandbox
+  //   09-21T02:09:14Z  first boot reading 'sandbox'   ─┐
+  //   09-23T11:35:26Z  f183e601 DECLARES sandbox       │ stand-down in force,
+  //   09-23T16:41:06Z  env write dep-daq028id0e5s73aka5i0 → production
+  //   09-23T16:41:55Z  boot reads 'production' again  ─┘ 62h32m41s boot-to-boot
+  //   09-23T16:42:05Z  boot-arm reconverges the operator to live+production
+  //
+  // So the declaration TRAILED the lever by ~57h26m; it did not precede it.
+  // Which leg catches which write is NOT the same for the two ends of that
+  // window, and each arm below pins one of the three states:
+  //
+  //   0c  09-21T02:09Z→09-23T11:35Z (~57h26m) — declared 'production' (the
+  //       d98c411d standing mismatch), stored 'sandbox'. The ENV-LIST arm is
+  //       the only detector; the declared leg is silent because the manifest
+  //       and the wire agree. That arm is OFF without RENDER_API_KEY.
+  //   0b  09-23T11:35Z→16:41Z (~5h06m) — declaration lands. The wire-reading
+  //       legs now invert and accuse the live stand-down.
+  //   0   09-23T16:41Z onward — the revert. The stored value returns to what
+  //       the undeployed wire expects, so the env-list arm goes QUIET and the
+  //       DECLARED leg is the only thing left that can see it.
+  //
+  // That asymmetry is the argument for the declared leg: the env-list arm
+  // covers the risk-DECREASING write, and only the declared leg covers the
+  // risk-INCREASING one.
   {
     name: 'ARM 0 (THE INCIDENT, post-revert) — declared sandbox, lever back at production, never deployed ⇒ non-zero',
     // The serving build 7f290414 predates the declaration, so the wire still
@@ -221,7 +252,7 @@ const cases = [
     wantsNot: ['IN FORCE', 'STAGED ('],
   },
   {
-    name: 'ARM 0b (THE INCIDENT, stand-down IN FORCE) — the pre-fix legs invert and accuse the stand-down itself',
+    name: 'ARM 0b (THE INCIDENT, stand-down IN FORCE, declaration landed) — the pre-fix legs invert and accuse the stand-down itself',
     // 2026-09-23 11:35Z→16:41Z: the declaration is correct AND applied; only the
     // build lags. The two wire-reading legs grade the stored 'sandbox' against
     // the SUPERSEDED wire intent 'production' and report the live stand-down as
@@ -249,6 +280,50 @@ const cases = [
       'the TRA-4862 inversion',
     ],
     wantsNot: ['which DISAGREES with the declaration', 'the TRA-4862 shape'],
+  },
+  {
+    name: 'ARM 0c (THE INCIDENT, first ~57h26m) — lever already sandbox, manifest still says production ⇒ the ENV-LIST arm is the only detector',
+    // 2026-09-21T02:09Z→09-23T11:35Z. The longest of the three states and the
+    // one the corrected timeline added. `d98c411d` had deliberately left the
+    // row at intended:'production' as a standing mismatch "until someone
+    // rules", so the manifest and the serving wire AGREE and the declared leg
+    // has nothing to say. The whole verdict rests on the env-list arm reading
+    // the stored 'sandbox' — which is exactly the arm that reads OFF when
+    // RENDER_API_KEY is absent. A runner without that key would have graded
+    // this 57h window a clean MATCH.
+    body: TRADIER_LIVE,
+    stored: { ...STORED_LIVE, TRADIER_ENV: 'sandbox' },
+    declared: [
+      { key: 'DURABILITY_POLICY', intended: 'refuse' },
+      { key: 'ENABLE_OPTION_LIVE_OTM', intended: 'off' },
+      { key: 'TRADIER_ENV', intended: 'production' },
+    ],
+    want: 1,
+    wants: ['TRADIER_ENV: STAGED (', "not the intended 'production'"],
+    // The declared leg must stay silent here: nothing is undeployed, and this
+    // state must not be confused with either of the two 09-23 ones.
+    wantsNot: ['TRADIER_ENV: DECLARED', 'the TRA-4862 shape', 'the TRA-4862 inversion'],
+  },
+  {
+    name: 'ARM 0c WITHOUT the env-list arm — the same 57h26m state grades a FALSE all-clear ⇒ exit 0',
+    // Identical to ARM 0c except no stored fixture, i.e. no RENDER_API_KEY.
+    // This is the control for the routine's own instruction that an arm-OFF run
+    // is "a half-measurement, not a pass": with the key absent, the state that
+    // held for 57 hours over the real-money option book exits 0 MATCH. A
+    // cadence that runs this checker keyless is worse than no cadence, because
+    // it manufactures a green.
+    body: TRADIER_LIVE,
+    declared: [
+      { key: 'DURABILITY_POLICY', intended: 'refuse' },
+      { key: 'ENABLE_ORDER_QUOTE_GUARD', intended: 'off' },
+      { key: 'ENABLE_OPTION_LIVE_OTM', intended: 'off' },
+      { key: 'TRADIER_ENV', intended: 'production' },
+    ],
+    want: 0,
+    // The pass must carry its own caveat, so it can never be quoted as a full
+    // grade of the lever the incident turned on.
+    wants: ['env-list arm: OFF', 'EFFECTIVE only; env-list arm OFF'],
+    wantsNot: ['EFFECTIVE and STORED'],
   },
   {
     name: 'declared, env-list arm OFF — reach is UNGRADED and must say so, never assumed applied',
