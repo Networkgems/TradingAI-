@@ -646,7 +646,14 @@ describe('Tradier HTTP refusals are not listings (TRA-4664)', () => {
     expect(upstreamCalls()).toBe(1);
     const d = svc.diagnostics();
     expect(d.upstreamRefusals!.byStatus).toEqual({ '400': 1 }); // upstream responses only
-    expect(d.refusalCooldown).toEqual({ size: 1, suppressed: 3 });
+    expect(d.refusalCooldown).toEqual({
+      size: 1,
+      suppressed: 3,
+      cooling: 1,
+      byEndpoint: { expirations: 1, chain: 0 },
+      keys: ['expirations|BAD!'],
+      keysTruncated: false,
+    });
 
     // The cooldown is per-key: other symbols are untouched.
     expect((await svc.scanOtm('SPY')).reason).toBe('ok');
@@ -672,6 +679,55 @@ describe('Tradier HTTP refusals are not listings (TRA-4664)', () => {
     expect(svc.diagnostics().refusalCooldown!.suppressed).toBe(1);
     expect(svc.diagnostics().breakerOpen).toBe(false);
     expect((await svc.scanOtm('SPY')).reason).toBe('ok');
+  });
+
+  // TRA-4664 (third pass). On 2026-09-24 the live route answered `fetch_error`
+  // in ~100ms for NVDA/AMZN/META/NFLX/AMD/IWM/COIN with zero upstream calls —
+  // the cooldown working exactly as designed, and indistinguishable on every
+  // health surface from a symbol that is simply fine. `size: 110` said how many
+  // and nothing said which. These two tests are the discriminator.
+  it('the cooldown census NAMES the cooling keys, per endpoint, with the symbol and expiration', async () => {
+    const client = new CheckedFakeClient();
+    const { svc } = makeService({ client });
+    client.fetchExpirations.mockImplementation(async (s) =>
+      s === 'NOEXP' ? { ok: false, httpStatus: 400 } : okExp);
+    client.fetchChainSnapshot.mockImplementation(async (s) =>
+      s === 'NOCHAIN' ? { ok: false, httpStatus: 400 } : okChain);
+
+    expect((await svc.scanOtm('NOEXP')).reason).toBe('fetch_error');
+    expect((await svc.scanOtm('NOCHAIN')).reason).toBe('fetch_error');
+    expect((await svc.scanOtm('SPY')).reason).toBe('ok');
+
+    const cd = svc.diagnostics().refusalCooldown!;
+    expect(cd.cooling).toBe(2);
+    expect(cd.byEndpoint).toEqual({ expirations: 1, chain: 1 });
+    expect(cd.keys).toEqual([`chain|NOCHAIN,${EXP}`, 'expirations|NOEXP']);
+    expect(cd.keysTruncated).toBe(false);
+    // A symbol that scans is never named.
+    expect(cd.keys!.some(k => k.includes('SPY'))).toBe(false);
+  });
+
+  it('an expired-but-unswept entry drops out of the census, and READING the census does not sweep it', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, advance } = makeService({ client });
+    client.fetchExpirations.mockImplementation(async (s) =>
+      s === 'BAD!' ? { ok: false, httpStatus: 400 } : okExp);
+    client.fetchChainSnapshot.mockResolvedValue(okChain);
+
+    expect((await svc.scanOtm('BAD!')).reason).toBe('fetch_error');
+    expect(svc.diagnostics().refusalCooldown!.cooling).toBe(1);
+
+    advance(REFUSAL_4XX_COOLDOWN_MS + 1);
+    const after = svc.diagnostics().refusalCooldown!;
+    // `cooling` is the honest number: the key is no longer being suppressed.
+    expect(after.cooling).toBe(0);
+    expect(after.keys).toEqual([]);
+    expect(after.byEndpoint).toEqual({ expirations: 0, chain: 0 });
+    // …and `size` still counts the un-swept map entry. The census is a READ:
+    // it must not mutate what the next read (or the next scan) sees, or the
+    // second pass's `size` grade would move underneath itself.
+    expect(after.size).toBe(1);
+    expect(svc.diagnostics().refusalCooldown!.size).toBe(1);
   });
 
   it('a genuine 200 empty listing is still no_expirations (the domain outcome is preserved)', async () => {

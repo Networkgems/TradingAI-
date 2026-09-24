@@ -92,6 +92,11 @@ const BACKOFF_429_MAX_MS = 10 * 60_000;
 // are vendor-wide states owned by the breaker/backoff, not per-key ones.
 export const REFUSAL_4XX_COOLDOWN_MS = 10 * 60_000;
 const MAX_REFUSAL_COOLDOWN_ENTRIES = 1024;
+// TRA-4664 (third pass) — how many cooling keys `diagnostics()` will NAME. The
+// live census on 2026-09-24 was 110 keys, so this reports it whole; the cap
+// only stops a pathological day from turning a health route into a page of
+// payload, and `keysTruncated` says so out loud when it bites.
+const MAX_REFUSAL_COOLDOWN_KEYS_REPORTED = 300;
 
 function is429Error(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
@@ -266,8 +271,28 @@ export interface RelativeValueScannerDiagnostics {
    * made because the key was cooling (process-lifetime). `upstreamRefusals`
    * counts only real upstream responses, so the true refusal pressure is
    * `byStatus[4xx] + suppressed`.
+   *
+   * TRA-4664 (third pass) — WHICH keys, not just how many. The cooldown works
+   * by making a permanently-refused key CHEAP, and a cheap permanent failure
+   * reads exactly like a healthy fast path: on 2026-09-24 the live route
+   * answered `fetch_error` in ~100ms for NVDA/AMZN/META/NFLX/AMD/IWM/COIN with
+   * ZERO upstream calls, and nothing on any health surface named them. The only
+   * way to find out was to probe symbol-by-symbol with an operator token. So
+   * the census ships beside the counter (the TRA-3800 rule: a suppression must
+   * ship a counter — and a counter that cannot be attributed is not one).
+   * `cooling` is the LIVE count: `size` is the raw map size and includes
+   * entries whose cooldown has expired but which nothing has swept yet, so
+   * `size >= cooling`. Keys are `expirations|SYM` / `chain|SYM,YYYY-MM-DD` —
+   * symbols and dates only, no credentials.
    */
-  refusalCooldown?: { size: number; suppressed: number };
+  refusalCooldown?: {
+    size: number;
+    suppressed: number;
+    cooling?: number;
+    byEndpoint?: { expirations: number; chain: number };
+    keys?: string[];
+    keysTruncated?: boolean;
+  };
 }
 
 export interface CacheCounters {
@@ -574,7 +599,42 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
         lastAtMs: this.lastRefusalAtMs,
         lastStatus: this.lastRefusalStatus,
       },
-      refusalCooldown: { size: this.refusalCooldown.size, suppressed: this.suppressedRefusals },
+      refusalCooldown: {
+        size: this.refusalCooldown.size,
+        suppressed: this.suppressedRefusals,
+        ...this.refusalCooldownCensus(),
+      },
+    };
+  }
+
+  /**
+   * TRA-4664 (third pass) — name the keys the cooldown is currently silencing.
+   * Read-only: it must NOT sweep the expired entries it filters out, because
+   * `size` is the number the second pass's grade was written against and a
+   * read that changes what the next read sees is not an instrument. Only keys
+   * still inside `REFUSAL_4XX_COOLDOWN_MS` are reported.
+   */
+  private refusalCooldownCensus(): {
+    cooling: number;
+    byEndpoint: { expirations: number; chain: number };
+    keys: string[];
+    keysTruncated: boolean;
+  } {
+    const now = this.now();
+    const byEndpoint = { expirations: 0, chain: 0 };
+    const keys: string[] = [];
+    for (const [key, entry] of this.refusalCooldown) {
+      if (now - entry.at >= REFUSAL_4XX_COOLDOWN_MS) continue;
+      if (key.startsWith('chain|')) byEndpoint.chain += 1;
+      else byEndpoint.expirations += 1;
+      keys.push(key);
+    }
+    keys.sort();
+    return {
+      cooling: keys.length,
+      byEndpoint,
+      keys: keys.slice(0, MAX_REFUSAL_COOLDOWN_KEYS_REPORTED),
+      keysTruncated: keys.length > MAX_REFUSAL_COOLDOWN_KEYS_REPORTED,
     };
   }
 
