@@ -649,7 +649,28 @@ async function main() {
 // controls module — a top-level await here never lets this module finish evaluating, so the
 // ESM cycle deadlocks and node exits 13 having printed NOTHING. A controls suite that dies
 // silently with a non-zero code is a controls suite nobody reads.
-if (process.argv[1]?.endsWith('check-deploy-origin.mjs')) {
+//
+// ⛔ THE ENTRY TEST IS IDENTITY FIRST, FILENAME ONLY AS A FALLBACK (TRA-4821, 2026-09-24).
+// It used to be `argv[1].endsWith('check-deploy-origin.mjs')` alone. That is a test of the
+// file's NAME, and this repo's own grading discipline renames it: the sanctioned way to grade
+// a shipped blob rather than a local fork is
+//     git show origin/main:scripts/check-deploy-origin.mjs > <scratch>/graded.mjs && node <scratch>/graded.mjs
+// Under the name-keyed guard that run evaluated the module, called NOTHING, printed NOT ONE
+// LINE and exited 0 — indistinguishable at the call site from `VERDICT = CLEAN`, on the one
+// detector standing between bqb1 and an ungated deploy. Measured, not theorised: it is how
+// this was found. The identity arm makes a renamed copy run; the `endsWith` arm is kept OR'd
+// in so the fix cannot be strictly less permissive than what shipped (a realpath that fails to
+// compare — case-folding, a junction, an odd argv[1] — must not silence the canonical call).
+const isEntrypoint = (() => {
+  const argv1 = process.argv[1];
+  if (!argv1) return false;
+  try {
+    if (fs.realpathSync(argv1) === fs.realpathSync(fileURLToPath(import.meta.url))) return true;
+  } catch { /* unreadable argv[1] — fall through to the name test */ }
+  return argv1.endsWith('check-deploy-origin.mjs');
+})();
+
+if (isEntrypoint) {
   main().catch((e) => {
     console.error(`[deploy-origin] BLIND: unhandled ${e?.stack ?? e}`);
     process.exit(EXIT.BLIND);

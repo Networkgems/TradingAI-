@@ -294,8 +294,8 @@ function extraAsserts() {
 }
 
 // ── call-site arms: the SHIPPED main(), offline ──────────────────────────────────────
-function spawnArm({ stub, args = [], env = {} }) {
-  const r = spawnSync(process.execPath, ['--import', `file://${STUB.replace(/\\/g, '/')}`, SCRIPT, ...args], {
+function spawnArm({ stub, args = [], env = {}, script = SCRIPT }) {
+  const r = spawnSync(process.execPath, ['--import', `file://${STUB.replace(/\\/g, '/')}`, script, ...args], {
     encoding: 'utf8',
     env: { ...process.env, RENDER_API_KEY: 'stub-key', TRA4789_STUB: JSON.stringify(stub), ...env },
   });
@@ -402,6 +402,55 @@ function runCallSite() {
     const r = spawnArm({ stub: {}, args: ['--help'] });
     assert.equal(r.code, EXIT.CLEAN);
     assert.match(r.out, /check-deploy-origin\.mjs/);
+  });
+
+  // ── the entry guard (TRA-4821) ──────────────────────────────────────────────────────
+  //
+  // Grading a shipped blob means writing it somewhere else under some other name. If the
+  // entry test keys on the NAME, that copy runs main() zero times and exits 0 having
+  // printed nothing — which reads exactly like CLEAN. These two arms differ in ONE
+  // variable: the entry predicate. The RENAMED-COPY arm must reach the same verdict as
+  // ARM 0 above; the partner replays the OLD name-keyed predicate over the SAME bytes and
+  // asserts it is silent, so this pair fails if the hazard it documents ever stops being
+  // real (an arm that can only pass is not a control).
+  const renamedCopy = (transform) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'deploy-origin-entry-'));
+    const dst = path.join(dir, 'graded-blob.mjs');
+    const src = fs.readFileSync(SCRIPT, 'utf8');
+    fs.writeFileSync(dst, transform ? transform(src) : src, 'utf8');
+    return { dir, dst };
+  };
+
+  check('call site — the script RENAMED (graded as a blob) STILL RUNS: exit 1 + the deploy named, never a silent 0', () => {
+    const { dir, dst } = renamedCopy();
+    const tmp = path.join(dir, 'acks-empty.json');
+    fs.writeFileSync(tmp, JSON.stringify({ acks: [] }), 'utf8');
+    try {
+      const r = spawnArm({ script: dst, stub: { deploys: [synthLive, ...fixture.deploys], events: fixture.events, health }, args: [...WIN, `--acks=${tmp}`] });
+      assert.notEqual(r.out.trim(), '', 'a detector that prints NOTHING and exits 0 is the failure this arm exists for');
+      assert.equal(r.code, EXIT.BYPASS, r.out.slice(-1200));
+      assert.ok(r.out.includes('dep-daj21q7qj5pc73bvbul0'), 'the renamed copy must reach the same report as ARM 0');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  check('call site — the OLD name-keyed predicate over the SAME bytes IS silent+0 (the hazard is real, one variable)', () => {
+    const OLD = "if (process.argv[1]?.endsWith('check-deploy-origin.mjs')) {";
+    const { dir, dst } = renamedCopy((src) => {
+      const i = src.lastIndexOf('if (isEntrypoint) {');
+      assert.notEqual(i, -1, 'the shipped entry guard must still be `if (isEntrypoint) {` — this arm rewrites it by hand');
+      return `${src.slice(0, i)}${OLD}${src.slice(i + 'if (isEntrypoint) {'.length)}`;
+    });
+    const tmp = path.join(dir, 'acks-empty.json');
+    fs.writeFileSync(tmp, JSON.stringify({ acks: [] }), 'utf8');
+    try {
+      const r = spawnArm({ script: dst, stub: { deploys: [synthLive, ...fixture.deploys], events: fixture.events, health }, args: [...WIN, `--acks=${tmp}`] });
+      assert.equal(r.code, EXIT.CLEAN, 'the old predicate exited non-zero — then it was not the defect this fix names');
+      assert.equal(r.out.trim(), '', 'the old predicate printed something — then it was not silent and this pair proves nothing');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   return out;
