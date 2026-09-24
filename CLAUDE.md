@@ -228,6 +228,15 @@ nothing pushed), so it cannot discriminate the two. It cost nothing because `mai
 Which key was written is **unreadable** — `GET /env-vars` returns `{key, value}` only, no timestamp,
 no actor. Full per-verb measurement: `ENV_WRITE_TRUTH` in `scripts/render-redeploy.mjs`; operator
 steps in `docs/runbook.md`.
+⚠ A **third** such row DID discriminate — the other way (`dep-daq028id0e5s73aka5i0`,
+2026-09-23T16:41:06Z, adjudicated on TRA-4845): it carried `7f290414`, the **serving** commit,
+while the tip was `2e6feeaa`, ≥11 commits ahead. Against 07-23 (shipped the TIP over a
+14-minute-old pin) the surface's commit choice is now measured in **both directions** — treat it
+as **unpredictable**, so the ships-the-tip assumption above stays in force as the conservative
+bound. And a serving-pin row is not harmless: that deploy landed **inside the RTH freeze**, killed
+pid 76 mid-session at 5.80h uptime, and the replacement crash-looped 3× inside RTH (the TRA-4158
+boot-burst heap trips) — the mid-session restart is the cost the `autoDeploy` pin exists to
+prevent, arriving through a surface the pin cannot see.
 
 Do not "fix" the pin by turning `autoDeploy` back on. It is what stops a mid-session merge from
 dumping bqb1's warm quote cache and resetting the go-live soak clock (TRA-1996), and lifting it is

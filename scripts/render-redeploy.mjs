@@ -258,6 +258,23 @@ const SOAK_HOST_SLUG = BQB1.slug; //  `tradingai-bqb1` — Render `service.slug`
 //     with nothing pushed to main). Tip-semantics and serving-semantics were THE SAME SHA,
 //     so the row cannot discriminate them and is fully consistent with the 07-23 branch-tip
 //     behaviour. It cost nothing because main was quiet, not because Render pinned.
+//   ⚠ A THIRD `envUpdated:true` ROW LANDED UNDER THE PIN — AND IT DISCRIMINATES, IN THE
+//     OPPOSITE DIRECTION FROM 07-23 (TRA-4845, adjudicated 2026-09-24).
+//     dep-daq028id0e5s73aka5i0, 2026-09-23T16:41:06Z, same byte-shape (envUpdated:true, no
+//     user, no updatedProperty). It carried `7f290414` — the SERVING commit, deployed by the
+//     gated 10:50:27Z api deploy — while origin/main's tip was `2e6feeaa`, ≥11 commits ahead
+//     (e08e2d05 pushed 16:10Z, 2e6feeaa 16:34Z). So: 07-23 shipped TIP over a 14-min-old pin;
+//     09-23 pinned SERVING with the tip hours ahead; 09-21 cannot discriminate. The surface's
+//     commit choice is measured in BOTH directions — treat it as UNPREDICTABLE, which keeps
+//     the capable-of-shipping-the-tip posture above in force. (Both Sept rows finished in
+//     50–65s vs ~3min for api builds, consistent with a same-image env-apply that would pin
+//     serving — a HYPOTHESIS about a Render behaviour change, not a read. Do not rely on it.)
+//     And "pins serving" is NOT "harmless": this row landed INSIDE the 13:25–20:00Z RTH
+//     freeze, killed serving pid 76 at 5.80h uptime, and the replacement crash-looped 3×
+//     inside RTH (server_failed nonZeroExit:1 at 16:48/16:51/16:59Z — the TRA-4158
+//     boot-burst heap trips). The mid-session restart is a cost all by itself; it is the
+//     exact thing the autoDeploy pin exists to prevent, arriving via a surface the pin
+//     cannot see.
 //   Service now reads `autoDeploy:"no"`, `autoDeployTrigger:"off"`. Do NOT trust this
 //   paragraph over the live reading the script prints; see envWriteAutoDeployPosture().
 //

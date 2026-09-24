@@ -63,6 +63,16 @@
       "issue": "TRA-4789",
       "reviewedAt": "2026-09-23T11:00:00.000Z",
       "why": "Third of the three. 12:49Z is 36 minutes before the RTH freeze opens at 13:25Z -- the closest any of them came to a gate that would have refused, and the clearest statement of why an unenforced convention was not enough."
+    },
+    {
+      "deployId": "dep-daq028id0e5s73aka5i0",
+      "commit": "7f290414",
+      "at": "2026-09-23T16:41:06.552115Z",
+      "trigger": "service_updated",
+      "actor": null,
+      "issue": "TRA-4845",
+      "reviewedAt": "2026-09-24T10:45:00.000Z",
+      "why": "Adjudicated: an ENV-VAR write through a non-API surface (dashboard or the banned full-set PUT) -- envUpdated:true, no user, no updatedProperty; still zero updatedProperty rows in the corpus, so VERB 2 stays ruled out by Render's own labelling. NOT the API verb (TRA-3724 holds: 0/3 single-key writes deploy) and NOT attributable to an agent: exactly ONE heartbeat run was in flight company-wide at 16:41:06Z (CTO run 2eed1080, 16:37:45->16:46:21Z, the TRA-2111 fold ratification), a read-and-disposition run whose comment landed at 16:41:03Z -- 3 seconds before deploy_started -- with health-route reads only and no Render write in its trail; and even a single-key API write from it would not have materialised a deploy. WHICH key: unreadable (GET /env-vars has no timestamp/actor). UNLIKE the 09-21 row this one DISCRIMINATES tip vs serving, and it PINNED SERVING: it carried 7f290414 (serving since the gated 10:50:27Z api deploy dep-dapqtsrbc2fs73bo467g) while origin/main's tip was 2e6feeaa, >=11 commits ahead (e08e2d05 pushed 16:10Z, 2e6feeaa 16:34Z). That is the OPPOSITE direction from the 07-23 occurrence, which shipped the TIP over the operator's 13:23Z pin -- the surface's commit choice is now measured in BOTH directions (tip-ship n=1 Jul, serving-pin n=1 Sep, indeterminate n=1) and must be treated as UNPREDICTABLE; the treat-as-capable-of-shipping-the-tip posture stands. Both Sept rows built in 50-65s vs ~3min for api deploys, consistent with a same-image env-apply -- recorded as hypothesis, not a read. COST WAS REAL, unlike 09-21: first bypass row to land INSIDE the 13:25-20:00Z RTH freeze; it killed serving pid 76 at 5.80h uptime mid-RTH and the replacement crash-looped three times inside RTH (server_failed nonZeroExit:1 at 16:48:11 / 16:51:26 / 16:59:16Z -- the TRA-4158 boot-burst heap trips, spender #12 on that tape). Acked because adjudicated, not safe: no gate exists for this surface (the RTH freeze included), so this detector remains the only control. ENV_WRITE_TRUTH and CLAUDE.md updated with the discriminating measurement in the same commit."
     }
   ]
 }
