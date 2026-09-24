@@ -28,7 +28,10 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { grade, classifyTrigger, loadAcks, ackFor, parseArgs, EXIT } from '../check-deploy-origin.mjs';
+import {
+  grade, classifyTrigger, loadAcks, ackFor, parseArgs, EXIT,
+  resolveAckLedger, probeGit, parseLedgerText, LEDGER_REL, ACK_REF,
+} from '../check-deploy-origin.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '..', '..');
@@ -288,6 +291,164 @@ function extraAsserts() {
     assert.match(parseArgs(['--days', '30']).usage ?? '', /needs its value attached/);
     assert.match(parseArgs(['--commmit=abc']).usage ?? '', /unrecognised/);
     assert.match(parseArgs(['-x']).usage ?? '', /unrecognised/);
+    assert.equal(parseArgs(['--acks-from=worktree']).usage, undefined);
+    assert.match(parseArgs(['--acks-from', 'worktree']).usage ?? '', /needs its value attached/);
+  });
+
+  // ── the ledger resolver, at the table level (TRA-4868) ──────────────────────────────
+  // git is STUBBED here so every failure mode is reachable without manufacturing one. The
+  // real-git arms live in runCallSite(); neither replaces the other — this half proves the
+  // predicate, that half proves main() hands it the right file.
+  const BLOB_MAIN = 'd99028df000000000000000000000000000abcd1';
+  const MAIN_LEDGER = JSON.stringify({
+    acks: [
+      { deployId: 'dep-m', issue: 'TRA-4845', reviewedAt: '2026-09-24T00:00:00Z', why: 'adjudicated' },
+    ],
+  });
+  const WORKTREE_LEDGER = JSON.stringify({
+    acks: [
+      { deployId: 'dep-m', issue: 'TRA-4845', reviewedAt: '2026-09-24T00:00:00Z', why: 'adjudicated' },
+      { deployId: 'dep-UNCOMMITTED', issue: 'TRA-9999', reviewedAt: '2026-09-24T00:00:00Z', why: 'only in my checkout' },
+    ],
+  });
+  const gitMap = (over = {}) => ({
+    'rev-parse --show-toplevel': '/repo\n',
+    'rev-parse HEAD': '9582420af8eb7518f56546667390fadd960bfdc7\n',
+    'rev-parse --abbrev-ref HEAD': 'main\n',
+    'fetch --quiet origin main': '',
+    'rev-parse origin/main': '0ba141c882be07be6bc3fed1070390ac13a1908b\n',
+    'rev-list --count HEAD..origin/main': '172\n',
+    [`rev-parse origin/main:${LEDGER_REL}`]: `${BLOB_MAIN}\n`,
+    [`cat-file blob ${BLOB_MAIN}`]: MAIN_LEDGER,
+    [`status --porcelain -- ${LEDGER_REL}`]: ` M ${LEDGER_REL}\n`,
+    [`hash-object ${LEDGER_REL}`]: '1e3a98c8000000000000000000000000000abcd2\n',
+    ...over,
+  });
+  const fakeGit = (map) => (args) => {
+    const key = args.join(' ');
+    if (!Object.prototype.hasOwnProperty.call(map, key)) return { ok: false, status: 128, stdout: '', stderr: `no stub for \`git ${key}\`` };
+    const hit = map[key];
+    if (hit === null) return { ok: false, status: 1, stdout: '', stderr: `\`git ${key}\` refused` };
+    return { ok: true, status: 0, stdout: hit, stderr: '' };
+  };
+  const resolve = (mode, over = {}, extra = {}) =>
+    resolveAckLedger({
+      mode,
+      repo: '/repo',
+      runGit: fakeGit(gitMap(over)),
+      exists: () => true,
+      readFile: () => WORKTREE_LEDGER,
+      ...extra,
+    });
+
+  check('resolver: the DEFAULT grades origin/main\'s blob, NOT the working tree\'s copy', () => {
+    const r = resolve('origin');
+    assert.equal(r.blind, null, r.blind ?? '');
+    assert.deepEqual(r.acks.map((a) => a.deployId), ['dep-m'], 'the worktree copy carries a second ack; it must not be here');
+    assert.deepEqual(r.committedAcks.map((a) => a.deployId), ['dep-m']);
+    assert.equal(r.label, `${ACK_REF}:${LEDGER_REL}`);
+  });
+
+  check('resolver: provenance names the repo, HEAD, the behind-count, the fetch and the dirty flag', () => {
+    const line = resolve('origin').lines.join('\n');
+    assert.match(line, /HEAD 9582420a \(main\)/);
+    assert.match(line, /172 commit\(s\) behind origin\/main/);
+    assert.match(line, /fetch=ok/);
+    assert.match(line, /DIRTY vs HEAD/);
+    assert.match(line, /DIFFERS from origin\/main's and was IGNORED/);
+  });
+
+  check('resolver: a FAILED git fetch is BLIND, and the same map with a working fetch is not (one variable)', () => {
+    const bad = resolve('origin', { 'fetch --quiet origin main': null });
+    assert.match(bad.blind ?? '', /git fetch origin main.{0,40}failed/i);
+    assert.match(bad.blind ?? '', /BLIND, not a footnote/);
+    assert.equal(resolve('origin').blind, null, 'the partner must be clean, or the arm above proves nothing');
+  });
+
+  check('resolver: an unresolvable origin/main:<ledger> is BLIND, never "no acknowledgements"', () => {
+    const r = resolve('origin', { [`rev-parse origin/main:${LEDGER_REL}`]: null });
+    assert.match(r.blind ?? '', /does not resolve/);
+    assert.deepEqual(r.acks, []);
+  });
+
+  check('resolver: NOT a git checkout is BLIND in origin mode — an unreadable provenance is not a clean one', () => {
+    const r = resolve('origin', { 'rev-parse --show-toplevel': null });
+    assert.match(r.blind ?? '', /is not a git checkout/);
+  });
+
+  check('resolver: a ledger blob that does not parse is BLIND, not an empty ledger', () => {
+    const r = resolve('origin', { [`cat-file blob ${BLOB_MAIN}`]: '{not json' });
+    assert.match(r.blind ?? '', /does not parse as JSON/);
+  });
+
+  check('resolver: worktree mode marks an ack origin/main does NOT carry, and ackFor then REFUSES it', () => {
+    const r = resolve('worktree');
+    assert.equal(r.blind, null, r.blind ?? '');
+    assert.equal(r.acks.length, 2);
+    assert.equal(ackFor('dep-m', r.acks)?.invalid, undefined, 'the committed one still applies');
+    assert.match(ackFor('dep-UNCOMMITTED', r.acks)?.invalid ?? '', /exists ONLY in the graded working-tree ledger/);
+    assert.match(r.lines.join('\n'), /1 ack\(s\) present ONLY here and therefore INERT \[dep-UNCOMMITTED\]/);
+  });
+
+  check('resolver: worktree mode is BLIND when origin/main is unreadable — it could not tell committed from not', () => {
+    const r = resolve('worktree', { [`cat-file blob ${BLOB_MAIN}`]: null });
+    assert.match(r.blind ?? '', /UNCOMMITTED ack cannot be told from a committed one/);
+  });
+
+  check('resolver: --acks=<path> needs NO git at all, and is labelled an OVERRIDE', () => {
+    const tmp = path.join(os.tmpdir(), `acks-explicit-${Date.now()}.json`);
+    fs.writeFileSync(tmp, MAIN_LEDGER, 'utf8');
+    try {
+      const r = resolveAckLedger({ mode: 'path', explicitPath: tmp, repo: os.tmpdir(), runGit: fakeGit({}) });
+      assert.equal(r.blind, null, r.blind ?? '');
+      assert.deepEqual(r.acks.map((a) => a.deployId), ['dep-m']);
+      assert.match(r.lines.join('\n'), /OVERRIDE --acks=/);
+      assert.match(r.lines.join('\n'), /not a git checkout/, 'and it must SAY no cross-check was possible');
+    } finally {
+      fs.rmSync(tmp, { force: true });
+    }
+  });
+
+  check('resolver: --no-acks resolves to nothing and never touches git', () => {
+    let called = 0;
+    const r = resolveAckLedger({ mode: 'none', repo: '/repo', runGit: () => { called += 1; return { ok: false, status: 1, stdout: '', stderr: 'x' }; } });
+    assert.equal(called, 0);
+    assert.deepEqual(r.acks, []);
+    assert.equal(r.blind, null);
+  });
+
+  check('probeGit records EVERY failure it hits rather than letting a field read as a benign default', () => {
+    const p = probeGit({ repo: '/repo', runGit: fakeGit(gitMap({ 'rev-parse HEAD': null, 'rev-list --count HEAD..origin/main': null })) });
+    assert.equal(p.head, null);
+    assert.equal(p.behind, null, 'an unreadable behind-count must be null, never 0');
+    assert.equal(p.errors.length, 2);
+  });
+
+  check('parseLedgerText and loadAcks agree — one parser, so a blob and a file cannot be judged differently', () => {
+    const tmp = path.join(os.tmpdir(), `acks-agree-${Date.now()}.json`);
+    fs.writeFileSync(tmp, '{"acks": "nope"}', 'utf8');
+    try {
+      assert.match(parseLedgerText('{"acks": "nope"}', 'X').blind ?? '', /no `acks` array/);
+      assert.match(loadAcks(tmp).blind ?? '', /no `acks` array/);
+    } finally {
+      fs.rmSync(tmp, { force: true });
+    }
+  });
+
+  check('grade: committedAcks NAMES a stale alarm and can NEVER clear one', () => {
+    const wire = {
+      deploys: [liveRow(), dep({ id: 'dep-m', trigger: 'manual' })],
+      committedAcks: [{ deployId: 'dep-m', issue: 'TRA-4845', reviewedAt: '2026-09-24T00:00:00Z', why: 'adjudicated' }],
+    };
+    const g = grade(base(wire));
+    assert.equal(g.verdict, 'BYPASS', 'the COMMITTED ledger is a diagnosis, not an ack — it must not clear the exit code');
+    assert.equal(g.counts.unacked, 1);
+    assert.equal(g.counts.staleAlarms, 1);
+    assert.equal(g.rows.find((r) => r.id === 'dep-m').staleAck.issue, 'TRA-4845');
+    // one variable: with the ack actually IN the graded ledger there is nothing stale
+    const clean = grade(base({ ...wire, acks: wire.committedAcks }));
+    assert.equal(clean.verdict, 'CLEAN');
+    assert.equal(clean.counts.staleAlarms, 0);
   });
 
   return out;
@@ -320,6 +481,16 @@ function runCallSite() {
   const synthLive = { deploy: { id: 'dep-synth-live', commit: { id: LIVE }, status: 'live', trigger: 'api', createdAt: '2026-09-23T10:40:06Z' }, cursor: null };
   const health = { commit: LIVE, startedAt: '2026-09-23T10:42:33.300Z' };
   const WIN = ['--since=2026-09-01T00:00:00Z'];
+  // ⛔ TRA-4868 — the default ack ledger is now `git show origin/main:…`, so a bare run does
+  // a `git fetch` and ~8 further git calls. Every arm below that is not ABOUT the ledger
+  // therefore says `--no-acks`, which resolves to nothing and touches git zero times: the
+  // suite stays OFFLINE, hermetic and fast. It also removes a hidden dependency these arms
+  // already had — they used to read the SHIPPED ledger, so acking a deploy the fixture uses
+  // would silently have changed what they were testing.
+  const NOACKS = '--no-acks';
+  // Still needed by the one arm that asserts --acks= and --acks-from= cannot be combined.
+  const EMPTY_ACKS = path.join(os.tmpdir(), `deploy-origin-empty-acks-${process.pid}.json`);
+  fs.writeFileSync(EMPTY_ACKS, JSON.stringify({ acks: [] }), 'utf8');
 
   check('ARM 0 — the REAL 2026-09-13 bytes through the SHIPPED main() ⇒ BYPASS, all four named', () => {
     const tmp = path.join(os.tmpdir(), `acks-empty-${Date.now()}.json`);
@@ -359,36 +530,36 @@ function runCallSite() {
   });
 
   check('call site — an all-REST history ⇒ CLEAN, and the report PRINTS the "api ≠ the script ran" caveat', () => {
-    const r = spawnArm({ stub: { deploys: [synthLive], events: [], health }, args: WIN });
+    const r = spawnArm({ stub: { deploys: [synthLive], events: [], health }, args: [...WIN, NOACKS] });
     assert.equal(r.code, EXIT.CLEAN, r.out.slice(-800));
     assert.match(r.out, /does NOT prove render-redeploy\.mjs/, 'a green whose limits are only in the header is a green that gets over-read');
   });
 
   check('call site — an UNKNOWN trigger ⇒ BLIND, not CLEAN', () => {
     const odd = { deploy: { id: 'dep-odd', commit: { id: LIVE }, status: 'deactivated', trigger: 'teleported', createdAt: '2026-09-22T00:00:00Z' }, cursor: null };
-    const r = spawnArm({ stub: { deploys: [synthLive, odd], events: [], health }, args: WIN });
+    const r = spawnArm({ stub: { deploys: [synthLive, odd], events: [], health }, args: [...WIN, NOACKS] });
     assert.equal(r.code, EXIT.BLIND, r.out.slice(-800));
   });
 
   check('call site — the health route is DOWN ⇒ BLIND (the history cannot be bound)', () => {
-    const r = spawnArm({ stub: { deploys: [synthLive], events: [], health: null }, args: WIN });
+    const r = spawnArm({ stub: { deploys: [synthLive], events: [], health: null }, args: [...WIN, NOACKS] });
     assert.equal(r.code, EXIT.BLIND, r.out.slice(-800));
   });
 
   check('call site — the deploys route 503s ⇒ BLIND', () => {
-    const r = spawnArm({ stub: { deploys: null, deploysStatus: 503, events: [], health }, args: WIN });
+    const r = spawnArm({ stub: { deploys: null, deploysStatus: 503, events: [], health }, args: [...WIN, NOACKS] });
     assert.equal(r.code, EXIT.BLIND, r.out.slice(-800));
   });
 
   check('call site — the EVENTS route 503s but deploys read fine ⇒ the classification still grades', () => {
     const manual = { deploy: { id: 'dep-m', commit: { id: LIVE }, status: 'deactivated', trigger: 'manual', createdAt: '2026-09-22T00:00:00Z' }, cursor: null };
-    const r = spawnArm({ stub: { deploys: [synthLive, manual], events: null, eventsStatus: 503, health }, args: WIN });
+    const r = spawnArm({ stub: { deploys: [synthLive, manual], events: null, eventsStatus: 503, health }, args: [...WIN, NOACKS] });
     assert.equal(r.code, EXIT.BYPASS, r.out.slice(-800));
     assert.match(r.out, /attribution leg UNREAD/, 'an UNREAD arm must be printed with its reason, never silently absent');
   });
 
   check('call site — no RENDER_API_KEY ⇒ BLIND, never 0', () => {
-    const r = spawnArm({ stub: { deploys: [synthLive], events: [], health }, args: WIN, env: { RENDER_API_KEY: '' } });
+    const r = spawnArm({ stub: { deploys: [synthLive], events: [], health }, args: [...WIN, NOACKS], env: { RENDER_API_KEY: '' } });
     assert.equal(r.code, EXIT.BLIND, r.out.slice(-800));
   });
 
@@ -453,6 +624,130 @@ function runCallSite() {
     }
   });
 
+  // ── the ack LEDGER's provenance (TRA-4868) ──────────────────────────────────────────
+  //
+  // These arms are NOT stubbed at the git layer. Each one builds a REAL throwaway repo —
+  // an `upstream` with a committed ledger, a `clone` of it carrying this very script — and
+  // lets the shipped `resolveAckLedger` run real `git fetch` / `git show` against it. A
+  // table-only pass here would prove nothing: the defect was never a wrong predicate, it
+  // was WHICH FILE main() handed to the predicate. Offline throughout (origin is a path).
+  const ACK_ROW = (deployId) => ({ deployId, issue: 'TRA-4845', reviewedAt: '2026-09-24T00:00:00Z', why: 'control fixture' });
+  const F4 = ['dep-daj21q7qj5pc73bvbul0', 'dep-daj2nhbm8hqs73enqj00', 'dep-daj9nl1594qs73bbhcg0', 'dep-dao939egekts73bbv9cg'];
+
+  const gitIn = (cwd, ...args) => {
+    const r = spawnSync('git', args, { cwd, encoding: 'utf8', windowsHide: true });
+    assert.equal(r.status, 0, `git ${args.join(' ')} in ${cwd} → ${r.stderr ?? r.error?.message ?? ''}`);
+    return r.stdout ?? '';
+  };
+  const rmTree = (p) => {
+    try {
+      fs.rmSync(p, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    } catch { /* a tmp dir git left read-only objects in; the arms never depend on cleanup */ }
+  };
+
+  function ledgerRepo({ mainAcks, worktreeAcks = null }) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'deploy-origin-ledger-'));
+    const upstream = path.join(dir, 'upstream');
+    const clone = path.join(dir, 'clone');
+    fs.mkdirSync(path.join(upstream, 'ops'), { recursive: true });
+    gitIn(dir, 'init', '--quiet', upstream);
+    // Set the branch BEFORE the first commit — `--initial-branch` is too new to rely on.
+    gitIn(upstream, 'symbolic-ref', 'HEAD', 'refs/heads/main');
+    gitIn(upstream, 'config', 'user.email', 'controls@example.invalid');
+    gitIn(upstream, 'config', 'user.name', 'deploy-origin controls');
+    gitIn(upstream, 'config', 'commit.gpgsign', 'false');
+    fs.writeFileSync(path.join(upstream, LEDGER_REL), `${JSON.stringify({ acks: mainAcks }, null, 2)}\n`, 'utf8');
+    gitIn(upstream, 'add', '-A');
+    gitIn(upstream, 'commit', '--quiet', '-m', 'ledger');
+    gitIn(dir, 'clone', '--quiet', upstream, clone);
+    fs.mkdirSync(path.join(clone, 'scripts'), { recursive: true });
+    const script = path.join(clone, 'scripts', 'check-deploy-origin.mjs');
+    fs.copyFileSync(SCRIPT, script);
+    if (worktreeAcks) fs.writeFileSync(path.join(clone, LEDGER_REL), `${JSON.stringify({ acks: worktreeAcks }, null, 2)}\n`, 'utf8');
+    return { dir, upstream, clone, script };
+  }
+
+  const STUB4 = () => ({ deploys: [synthLive, ...fixture.deploys], events: fixture.events, health });
+
+  // ONE repo, graded twice. The two arms below differ by exactly one thing — which ledger
+  // main() was pointed at — so they MUST share a subject; rebuilding it per arm would let
+  // them drift apart and quietly stop being a pair.
+  const STALE = ledgerRepo({ mainAcks: F4.map(ACK_ROW), worktreeAcks: F4.slice(0, 3).map(ACK_ROW) });
+
+  check('LEDGER — a ledger MISSING an ack main carries: the DEFAULT grades origin/main ⇒ CLEAN', () => {
+    const r = spawnArm({ script: STALE.script, stub: STUB4(), args: WIN });
+    assert.equal(r.code, EXIT.CLEAN, r.out.slice(-1800));
+    assert.match(r.out, /source {2}origin\/main:ops\/deploy-origin-acks\.json {2}blob [0-9a-f]{8} {2}4 ack\(s\)/, 'the SOURCE and its blob must be printed');
+    assert.match(r.out, /repo {4}.+HEAD [0-9a-f]{8}.+commit\(s\) behind origin\/main {2}fetch=ok/, 'repo, HEAD and behind-count must be printed');
+    assert.match(r.out, /DIFFERS from origin\/main's and was IGNORED/, 'a working copy that differs must be NAMED as ignored, not silently skipped');
+  });
+
+  check('LEDGER — ONE variable: the SAME repo graded --acks-from=worktree ⇒ BYPASS, naming STALENESS as the cause', () => {
+    const r = spawnArm({ script: STALE.script, stub: STUB4(), args: [...WIN, '--acks-from=worktree'] });
+    assert.equal(r.code, EXIT.BYPASS, r.out.slice(-1800));
+    assert.ok(r.out.includes('dep-dao939egekts73bbv9cg'), 'the deploy the stale ledger lost must be named');
+    assert.match(r.out, /STALE LEDGER/, 'a settled deploy re-raised by a stale ledger must be labelled STALE, not re-adjudicated (TRA-4836)');
+    assert.match(r.out, /stale-ledger=1/, 'and the count must be on the summary line beside the others');
+    assert.match(r.out, /1 ack\(s\) origin\/main carries that this ledger LACKS \[dep-dao939egekts73bbv9cg\]/);
+  });
+
+  rmTree(STALE.dir);
+
+  check('LEDGER — ⛔ THE EXPENSIVE DIRECTION: an ack that exists ONLY in the working tree must NOT read CLEAN', () => {
+    const R = ledgerRepo({ mainAcks: F4.slice(0, 3).map(ACK_ROW), worktreeAcks: F4.map(ACK_ROW) });
+    try {
+      const w = spawnArm({ script: R.script, stub: STUB4(), args: [...WIN, '--acks-from=worktree'] });
+      assert.notEqual(w.code, EXIT.CLEAN, 'an UNCOMMITTED ack bought a green — that is exactly the defect TRA-4868 names');
+      assert.equal(w.code, EXIT.BYPASS, w.out.slice(-1800));
+      assert.match(w.out, /1 ack\(s\) present ONLY here and therefore INERT \[dep-dao939egekts73bbv9cg\]/);
+      assert.match(w.out, /exists ONLY in the graded working-tree ledger/, 'and it must say WHY that ack did not apply');
+      const d = spawnArm({ script: R.script, stub: STUB4(), args: WIN });
+      assert.equal(d.code, EXIT.BYPASS, 'the default never saw the uncommitted ack at all');
+    } finally {
+      rmTree(R.dir);
+    }
+  });
+
+  check('LEDGER — the one-variable PARTNER: the same worktree ledger, with main carrying all four ⇒ CLEAN', () => {
+    const R = ledgerRepo({ mainAcks: F4.map(ACK_ROW), worktreeAcks: F4.map(ACK_ROW) });
+    try {
+      const w = spawnArm({ script: R.script, stub: STUB4(), args: [...WIN, '--acks-from=worktree'] });
+      assert.equal(w.code, EXIT.CLEAN, w.out.slice(-1800));
+      assert.match(w.out, /0 ack\(s\) present ONLY here/, 'nothing is uncommitted here — only whether main carries it moved');
+    } finally {
+      rmTree(R.dir);
+    }
+  });
+
+  check('LEDGER — a FAILED `git fetch` reads BLIND (3), never CLEAN (one variable: origin reachable or not)', () => {
+    const R = ledgerRepo({ mainAcks: F4.map(ACK_ROW) });
+    try {
+      const ok = spawnArm({ script: R.script, stub: STUB4(), args: WIN });
+      assert.equal(ok.code, EXIT.CLEAN, ok.out.slice(-1500));
+      // THE variable. `origin/main` still resolves locally, so the fetch is the only thing
+      // that moved — a stale ref that silently grades an old ledger is the whole ticket.
+      gitIn(R.clone, 'remote', 'set-url', 'origin', path.join(R.dir, 'no-such-upstream'));
+      const gone = spawnArm({ script: R.script, stub: STUB4(), args: WIN });
+      assert.equal(gone.code, EXIT.BLIND, gone.out.slice(-1800));
+      assert.match(gone.out, /git fetch origin main.{0,40}failed/i, 'BLIND must name the fetch, not just refuse');
+      assert.match(gone.out, /PROVENANCE UNREADABLE/);
+    } finally {
+      rmTree(R.dir);
+    }
+  });
+
+  check('LEDGER — --acks-from with an unknown value is exit 2 NAMING it, never a silent fall-back', () => {
+    const r = spawnArm({ stub: { deploys: [synthLive], events: [], health }, args: [...WIN, '--acks-from=upstream'] });
+    assert.equal(r.code, EXIT.USAGE, r.out.slice(-800));
+    assert.ok(r.out.includes('--acks-from=upstream'), 'the offender must be named');
+  });
+
+  check('LEDGER — --acks= together with --acks-from= is exit 2 (two answers to "which ledger" is not an answer)', () => {
+    const r = spawnArm({ stub: { deploys: [synthLive], events: [], health }, args: [...WIN, `--acks=${EMPTY_ACKS}`, '--acks-from=origin'] });
+    assert.equal(r.code, EXIT.USAGE, r.out.slice(-800));
+  });
+
+  rmTree(EMPTY_ACKS);
   return out;
 }
 

@@ -100,6 +100,50 @@
 // the entire finding. An ack here means "seen, reviewed, dispositioned on a ticket",
 // nothing more. Do not import the stronger ledger's semantics into this weaker one.
 //
+// ── ⛔ WHICH ledger — the COMMITTED one, never the working tree (TRA-4868) ────────────
+//
+// Until 2026-09-24 the ledger was `path.join(REPO, 'ops/deploy-origin-acks.json')` — i.e.
+// whatever sat in the working tree of the checkout this happened to run from — and the
+// report said only `acks  N acknowledgement(s) loaded`. No path, no HEAD, no dirty flag.
+// The reader could not tell WHICH ledger was graded, and the verdict moved with it.
+//
+// Measured, both directions, same host and same deploy history:
+//
+//   shared agent checkout, HEAD 9582420a, 172 commits behind origin/main
+//     → bypass=5 (acked 4, unacked 1)  VERDICT = BYPASS  exit 1
+//   same run, ledger blob taken from origin/main
+//     → bypass=5 (acked 5, unacked 0)  VERDICT = CLEAN   exit 0
+//
+// The stale checkout re-raised dep-daq028id0e5s73aka5i0 — adjudicated and acked on
+// TRA-4845 fourteen hours earlier — as an unacked BYPASS. That is the CHEAP direction.
+//
+// ⛔ THE EXPENSIVE DIRECTION IS THE SAME DEFECT RUN THE OTHER WAY. An ack that exists only
+// as an UNCOMMITTED edit in somebody's working tree silences a real, un-adjudicated
+// bypass; the run reads CLEAN, exit 0, with nothing distinguishing it from a run against
+// the shipped ledger. Same class as everything else in this file: the instrument reads
+// IDENTICALLY in pass and fail. It is also the exact hazard `check:deploy-build` already
+// refuses by construction — it grades the commit in a throwaway worktree, never the dirty
+// tree, precisely because "an unstaged fix passes a broken commit".
+//
+// So, mirroring that rule:
+//
+//   • DEFAULT: the ledger is `git show origin/main:ops/deploy-origin-acks.json`, after a
+//     `git fetch`. The checkout's own copy is NOT read. A failed fetch, an unresolvable
+//     ref or an unreadable blob is BLIND (3) — never CLEAN.
+//   • `--acks-from=worktree` grades the checkout's copy, and is LOUD about it. Any ack in
+//     it that origin/main does NOT carry is INERT: it degrades to a WARNING and the row
+//     still counts, exactly like an incomplete ack. An uncommitted ack cannot buy a green.
+//   • `--acks=<path>` grades an explicit file. It is named on the command line, so it can
+//     never be mistaken for the default the way a working-tree read could.
+//   • PROVENANCE IS PRINTED ON EVERY RUN: source, blob, repo, HEAD, branch, how far behind
+//     origin/main, fetch outcome, and whether the working copy is dirty. A provenance that
+//     cannot be printed is BLIND, not a footnote.
+//   • A bypass that alarms here while origin/main's ledger DOES acknowledge it is named as
+//     STALE LEDGER, not re-raised as a new bypass. TRA-4836 lost a session to exactly that.
+//
+// ⛔ Do NOT "fix" staleness by having the routine `git pull` first. That makes the verdict
+// depend on an unmeasured side effect — the same defect with a longer fuse.
+//
 // ── Exit codes — FAILS CLOSED. Precedence BLIND > BYPASS > CLEAN ─────────────────────
 //
 //   0  CLEAN   every deploy in the window carries `trigger: api`, and every attribution
@@ -118,6 +162,8 @@
 //   node scripts/check-deploy-origin.mjs                  # last 30 days of bqb1
 //   node scripts/check-deploy-origin.mjs --days=90
 //   node scripts/check-deploy-origin.mjs --since=2026-09-01T00:00:00Z
+//   node scripts/check-deploy-origin.mjs --acks-from=worktree   # grade the CHECKOUT's ledger
+//   node scripts/check-deploy-origin.mjs --acks=<path>    # grade an explicit ledger file
 //   node scripts/check-deploy-origin.mjs --no-acks        # raw truth, acks ignored
 //   node scripts/check-deploy-origin.mjs --live=<sha>     # skip the health curl
 //   node scripts/check-deploy-origin.mjs --json
@@ -125,6 +171,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -133,7 +180,9 @@ const REPO = path.resolve(HERE, '..');
 const RENDER_API = 'https://api.render.com/v1';
 const DEFAULT_SERVICE = 'srv-d7mb7rr7uimc73ev0chg'; // tradingai-bqb1
 const DEFAULT_HOST = 'https://tradingai-bqb1.onrender.com';
-const ACKS_PATH = path.join(REPO, 'ops', 'deploy-origin-acks.json');
+export const LEDGER_REL = 'ops/deploy-origin-acks.json';
+export const ACK_REF = 'origin/main';
+export const ACK_SOURCES = new Set(['origin', 'worktree']);
 const PAGE = 100;
 const MAX_PAGES = 12; // 1200 rows; a capped page that did not reach back reads BLIND.
 
@@ -216,16 +265,245 @@ export function loadAcks(file, { readFile = fs.readFileSync, exists = fs.existsS
   } catch (e) {
     return { blind: `could not read ${file}: ${e?.message ?? e}` };
   }
+  const parsed = parseLedgerText(raw, file);
+  if (parsed.blind) return { blind: parsed.blind };
+  return { acks: parsed.acks, note: `${parsed.acks.length} acknowledgement(s) loaded` };
+}
+
+// ONE parser for BOTH shapes — a file on disk and a blob out of `git cat-file`. Two
+// parsers is two chances for the committed ledger and the working copy to be judged by
+// different rules, which is this ticket's bug one layer down.
+export function parseLedgerText(raw, whence) {
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch (e) {
-    return { blind: `${file} does not parse as JSON: ${e?.message ?? e}` };
+    return { blind: `${whence} does not parse as JSON: ${e?.message ?? e}` };
   }
   if (!parsed || !Array.isArray(parsed.acks)) {
-    return { blind: `${file} has no \`acks\` array` };
+    return { blind: `${whence} has no \`acks\` array` };
   }
-  return { acks: parsed.acks, note: `${parsed.acks.length} acknowledgement(s) loaded` };
+  return { acks: parsed.acks };
+}
+
+// ── WHICH ledger, and where it came from (TRA-4868) ──────────────────────────────────
+//
+// ⛔ ALL OF THIS LIVES IN THIS FILE ON PURPOSE. The sanctioned way to grade a SHIPPED
+// detector rather than a local fork is
+//     git show origin/main:scripts/check-deploy-origin.mjs > <scratch>/x.mjs && node <scratch>/x.mjs
+// (TRA-4821, TRA-4867). An `import './lib/…'` here would make that one-file extraction die
+// with ERR_MODULE_NOT_FOUND — it would break the very discipline this fix exists to serve.
+// One blob, node builtins only.
+
+export function makeRunGit(cwd, spawn = spawnSync) {
+  return (args) => {
+    const r = spawn('git', args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 60_000, windowsHide: true });
+    if (r?.error) return { ok: false, status: null, stdout: '', stderr: String(r.error.message ?? r.error) };
+    return { ok: r?.status === 0, status: r?.status ?? null, stdout: r?.stdout ?? '', stderr: String(r?.stderr ?? '').trim() };
+  };
+}
+
+// Everything the report must PRINT about the ledger, and everything the modes below need
+// in order to decide. Every field is independently nullable and every failure is RECORDED:
+// a probe that could not read a field must never let that field read as a benign default.
+export function probeGit({ repo, runGit, rel = LEDGER_REL, ref = ACK_REF, doFetch = true }) {
+  const p = {
+    repo, ref, rel, isRepo: false, errors: [],
+    fetched: null, head: null, branch: null, behind: null,
+    refSha: null, refBlob: null, refText: null, worktreeBlob: null, dirty: null,
+  };
+  const run = (args, { soft = false } = {}) => {
+    const r = runGit(args);
+    if (!r.ok && !soft) p.errors.push(`git ${args.join(' ')} → ${r.stderr || `exit ${r.status}`}`);
+    return r;
+  };
+
+  if (!run(['rev-parse', '--show-toplevel']).ok) return p;
+  p.isRepo = true;
+
+  const head = run(['rev-parse', 'HEAD']);
+  if (head.ok) p.head = head.stdout.trim();
+  const branch = run(['rev-parse', '--abbrev-ref', 'HEAD']);
+  if (branch.ok) p.branch = branch.stdout.trim();
+
+  // ⛔ NOT optional. A stale `origin/main` grades a stale ledger, which is this ticket one
+  // level down. A failed fetch is RECORDED and reads BLIND upstream — never CLEAN.
+  if (doFetch) p.fetched = run(['fetch', '--quiet', 'origin', 'main']).ok;
+
+  const refSha = run(['rev-parse', ref]);
+  if (refSha.ok) p.refSha = refSha.stdout.trim();
+  const behind = run(['rev-list', '--count', `HEAD..${ref}`]);
+  if (behind.ok && /^\d+$/.test(behind.stdout.trim())) p.behind = Number(behind.stdout.trim());
+  const refBlob = run(['rev-parse', `${ref}:${rel}`]);
+  if (refBlob.ok) p.refBlob = refBlob.stdout.trim();
+  if (p.refBlob) {
+    const text = run(['cat-file', 'blob', p.refBlob]);
+    if (text.ok) p.refText = text.stdout;
+  }
+
+  const status = run(['status', '--porcelain', '--', rel]);
+  if (status.ok) p.dirty = status.stdout.trim() !== '';
+  // A ledger ABSENT from the working tree is a real state — this file post-dates plenty of
+  // checkouts — not a probe failure. Soft, and reported as ABSENT rather than as an error.
+  const ho = run(['hash-object', rel], { soft: true });
+  if (ho.ok) p.worktreeBlob = ho.stdout.trim();
+
+  return p;
+}
+
+export function provenanceLine(probe, repo) {
+  if (!probe.isRepo) return `repo    ${repo} — NOT a readable git checkout, so this ledger has NO provenance`;
+  const wt = probe.worktreeBlob
+    ? `${probe.worktreeBlob.slice(0, 8)} ${probe.dirty === null ? '(dirty=UNREADABLE)' : probe.dirty ? 'DIRTY vs HEAD' : 'clean vs HEAD'}`
+    : 'ABSENT from the working tree';
+  return (
+    `repo    ${repo}  HEAD ${probe.head ? probe.head.slice(0, 8) : 'UNREADABLE'} (${probe.branch ?? '?'})  ` +
+    `${probe.behind == null ? `behind-${probe.ref}=UNREADABLE` : `${probe.behind} commit(s) behind ${probe.ref}`}  ` +
+    `fetch=${probe.fetched === null ? 'not attempted' : probe.fetched ? 'ok' : 'FAILED'}  ` +
+    `worktree-ledger ${wt}`
+  );
+}
+
+// ⛔ THE SUBJECT IS THE COMMITTED LEDGER, NEVER THE WORKING TREE (TRA-4868). Returns the
+// acks to grade, the COMMITTED acks to compare them against, the provenance lines to
+// print, and `blind` when provenance the chosen mode DEPENDS ON could not be read.
+export function resolveAckLedger({
+  mode,
+  explicitPath = null,
+  repo,
+  runGit = null,
+  rel = LEDGER_REL,
+  ref = ACK_REF,
+  readFile = fs.readFileSync,
+  exists = fs.existsSync,
+} = {}) {
+  const out = { mode, blind: null, acks: [], committedAcks: null, note: null, lines: [], label: null, probe: null };
+
+  if (mode === 'none') {
+    out.note = 'acks IGNORED (--no-acks) — this is the raw truth';
+    out.label = '(none)';
+    out.lines.push('source  --no-acks — NOTHING is acknowledged; every bypass in the window counts');
+    return out;
+  }
+
+  const git = runGit ?? makeRunGit(repo);
+  const probe = probeGit({ repo, runGit: git, rel, ref, doFetch: mode !== 'path' });
+  out.probe = probe;
+  const why = (missing) =>
+    `LEDGER PROVENANCE UNREADABLE — ${missing.join('; ')}.` +
+    (probe.errors.length ? ` git said: ${probe.errors.join(' | ')}.` : '') +
+    ' A ledger whose provenance cannot be printed is BLIND, not a footnote.';
+
+  if (mode === 'origin') {
+    const missing = [];
+    if (!probe.isRepo) missing.push(`${repo} is not a git checkout, so ${ref}:${rel} cannot be read`);
+    if (probe.fetched === false) missing.push(`\`git fetch origin main\` failed, so ${ref} may not be origin's main`);
+    if (!probe.refBlob) missing.push(`${ref}:${rel} does not resolve`);
+    else if (probe.refText == null) missing.push(`${ref}:${rel} could not be read`);
+    if (missing.length) {
+      out.blind = why(missing);
+      out.lines.push(`source  ${ref}:${rel} — UNREADABLE`);
+      out.lines.push(provenanceLine(probe, repo));
+      return out;
+    }
+    const parsed = parseLedgerText(probe.refText, `${ref}:${rel}`);
+    if (parsed.blind) {
+      out.blind = `LEDGER: ${parsed.blind}`;
+      out.lines.push(provenanceLine(probe, repo));
+      return out;
+    }
+    out.acks = parsed.acks;
+    out.committedAcks = parsed.acks;
+    out.label = `${ref}:${rel}`;
+    out.note = `${parsed.acks.length} acknowledgement(s) from ${ref}:${rel} (blob ${probe.refBlob.slice(0, 8)})`;
+    out.lines.push(
+      `source  ${ref}:${rel}  blob ${probe.refBlob.slice(0, 8)}  ${parsed.acks.length} ack(s) — ` +
+        `the SHIPPED ledger. The working tree's copy was NOT graded.`,
+    );
+    out.lines.push(provenanceLine(probe, repo));
+    if (probe.worktreeBlob && probe.worktreeBlob !== probe.refBlob) {
+      out.lines.push(
+        `note    the working tree's ${rel} DIFFERS from ${ref}'s and was IGNORED ` +
+          `(${probe.worktreeBlob.slice(0, 8)} ≠ ${probe.refBlob.slice(0, 8)}); \`--acks-from=worktree\` grades it instead`,
+      );
+    }
+    return out;
+  }
+
+  if (mode === 'worktree') {
+    const missing = [];
+    if (!probe.isRepo) missing.push(`${repo} is not a git checkout, so a working-tree ledger has no provenance at all`);
+    if (probe.fetched === false) missing.push('`git fetch origin main` failed');
+    if (probe.refText == null) missing.push(`${ref}:${rel} could not be read, so an UNCOMMITTED ack cannot be told from a committed one`);
+    if (missing.length) {
+      out.blind = why(missing);
+      out.lines.push('source  ⚠ OVERRIDE --acks-from=worktree — but its provenance is UNREADABLE');
+      out.lines.push(provenanceLine(probe, repo));
+      return out;
+    }
+    const main = parseLedgerText(probe.refText, `${ref}:${rel}`);
+    if (main.blind) {
+      out.blind = `LEDGER: ${main.blind}`;
+      out.lines.push(provenanceLine(probe, repo));
+      return out;
+    }
+    const file = path.join(repo, rel);
+    const wt = loadAcks(file, { readFile, exists });
+    if (wt.blind) {
+      out.blind = `ACKS: ${wt.blind}`;
+      out.lines.push(provenanceLine(probe, repo));
+      return out;
+    }
+    const mainIds = new Set(main.acks.map((a) => a?.deployId).filter((v) => typeof v === 'string'));
+    const wtIds = new Set(wt.acks.map((a) => a?.deployId).filter((v) => typeof v === 'string'));
+    const onlyHere = [...wtIds].filter((id) => !mainIds.has(id));
+    const missingHere = [...mainIds].filter((id) => !wtIds.has(id));
+    // ⛔ THE EXPENSIVE DIRECTION. An ack that exists only as an edit in somebody's checkout
+    // must not silence a real bypass. Marked so `ackFor` refuses it — a WARNING and a
+    // COUNTED row, exactly like an incomplete ack, and never a BLIND that would swallow the
+    // unacked count of every other row in the window behind one "could not check".
+    out.acks = wt.acks.map((a) => (a && mainIds.has(a.deployId) ? a : { ...(a ?? {}), __uncommitted: true }));
+    out.committedAcks = main.acks;
+    out.label = `${rel} (WORKING TREE)`;
+    out.note = `${wt.acks.length} acknowledgement(s) from the WORKING TREE's ${rel}; ${onlyHere.length} of them are NOT in ${ref} and do NOT apply`;
+    out.lines.push(`source  ⚠ OVERRIDE --acks-from=worktree: grading ${file}, which is NOT the shipped ledger`);
+    out.lines.push(provenanceLine(probe, repo));
+    out.lines.push(
+      `x-check vs ${ref}:${rel} (blob ${probe.refBlob ? probe.refBlob.slice(0, 8) : '?'}): ` +
+        `${onlyHere.length} ack(s) present ONLY here and therefore INERT${onlyHere.length ? ` [${onlyHere.join(', ')}]` : ''}; ` +
+        `${missingHere.length} ack(s) ${ref} carries that this ledger LACKS${missingHere.length ? ` [${missingHere.join(', ')}]` : ''}`,
+    );
+    return out;
+  }
+
+  // mode === 'path' — an EXPLICIT operator override. It is named on the command line, so it
+  // can never be mistaken for the default the way a working-tree read could. The git
+  // cross-check here is DECORATION (no fetch is run) and never moves the verdict.
+  const file = path.resolve(explicitPath ?? '');
+  const r = loadAcks(file, { readFile, exists });
+  out.label = file;
+  out.lines.push(`source  ⚠ OVERRIDE --acks=${file} — provenance is whatever you pointed this at, NOT ${ref}`);
+  if (r.blind) {
+    out.blind = `ACKS: ${r.blind}`;
+    return out;
+  }
+  out.acks = r.acks;
+  out.note = `${r.acks.length} acknowledgement(s) from ${file} (EXPLICIT --acks= override)`;
+  if (probe.isRepo) {
+    const main = probe.refText ? parseLedgerText(probe.refText, `${ref}:${rel}`) : { blind: `${ref}:${rel} is unreadable from ${repo}` };
+    if (!main.blind) out.committedAcks = main.acks;
+    out.lines.push(provenanceLine(probe, repo));
+    out.lines.push(
+      `x-check ${
+        main.blind
+          ? `NOT possible — ${main.blind}`
+          : `${ref}:${rel} carries ${main.acks.length} ack(s) — informational only; NO fetch was run, so ${ref} is only as fresh as this checkout`
+      }`,
+    );
+  } else {
+    out.lines.push(`repo    ${repo} — not a git checkout, so no cross-check against ${ref} was possible`);
+  }
+  return out;
 }
 
 // An ack applies only on EXACT deploy id and only when it is complete. A half-written ack
@@ -235,6 +513,16 @@ export function ackFor(deployId, acks) {
   const rows = Array.isArray(acks) ? acks : [];
   const hit = rows.find((a) => a && a.deployId === deployId);
   if (!hit) return null;
+  // ⛔ TRA-4868. Set by `resolveAckLedger` in worktree mode for an ack `origin/main` does
+  // NOT carry. An ack that is not committed is not an adjudication anybody else can see, so
+  // it must not buy a green. Same disposition as an incomplete ack: warn, and COUNT the row.
+  if (hit.__uncommitted) {
+    return {
+      invalid:
+        `ack for ${deployId} exists ONLY in the graded working-tree ledger — ${ACK_REF}:${LEDGER_REL} does ` +
+        'not carry it, so it does NOT apply. Adjudicate it on a ticket and COMMIT it.',
+    };
+  }
   const missing = ['issue', 'reviewedAt', 'why'].filter((k) => typeof hit[k] !== 'string' || hit[k].trim() === '');
   if (missing.length) return { invalid: `ack for ${deployId} is missing ${missing.join(', ')} — it does NOT apply` };
   return hit;
@@ -273,10 +561,18 @@ export function grade({
   historyIncompleteWhy = null,
   eventsReachedMs = null,
   preBlind = [],
+  // TRA-4868 — the acks `origin/main` carries, whatever ledger is actually being GRADED.
+  // Used only to name a stale-ledger alarm; it can never clear one.
+  committedAcks = null,
 }) {
   const blind = [...preBlind];
   const warnings = [];
   const rows = [];
+  const committedIndex = new Map(
+    (Array.isArray(committedAcks) ? committedAcks : [])
+      .filter((a) => a && typeof a.deployId === 'string')
+      .map((a) => [a.deployId, a]),
+  );
 
   const bind = bindHistory({ deploys, liveSha });
   if (!bind.ok) blind.push(`BINDING: ${bind.why}`);
@@ -319,6 +615,13 @@ export function grade({
       blind.push(`deploy ${d?.id} (${d?.createdAt}): ${cls.label} — an unknown trigger is not an \`api\` trigger`);
     }
 
+    const applied = Boolean(ack && !ack.invalid);
+    const counted = cls.kind === 'bypass' && !applied;
+    // ⛔ TRA-4868. A bypass that alarms HERE while the COMMITTED ledger acknowledges it is
+    // not a new bypass — it is the graded ledger being STALE. Say which, or the reader
+    // re-adjudicates a settled deploy: TRA-4836 did exactly that off a 172-behind checkout.
+    const committed = counted ? committedIndex.get(d?.id) ?? null : null;
+
     rows.push({
       id: d?.id ?? null,
       createdAt: d?.createdAt ?? null,
@@ -329,8 +632,9 @@ export function grade({
       label: cls.label,
       attribution: attr,
       disagreement,
-      ack: ack && !ack.invalid ? { issue: ack.issue, reviewedAt: ack.reviewedAt, why: ack.why } : null,
-      counted: cls.kind === 'bypass' && !(ack && !ack.invalid),
+      ack: applied ? { issue: ack.issue, reviewedAt: ack.reviewedAt, why: ack.why } : null,
+      staleAck: committed ? { issue: committed.issue ?? null, reviewedAt: committed.reviewedAt ?? null } : null,
+      counted,
     });
   }
 
@@ -344,6 +648,9 @@ export function grade({
     acked: rows.filter((r) => r.ack).length,
     unacked: rows.filter((r) => r.counted).length,
     attributionUnread: rows.filter((r) => r.attribution?.state === 'unread').length,
+    // TRA-4868 — unacked HERE, but acknowledged in the committed ledger. A staleness
+    // reading, not a bypass reading. Printed so the two can never be confused again.
+    staleAlarms: rows.filter((r) => r.staleAck).length,
   };
 
   const verdict = blind.length ? 'BLIND' : counts.unacked > 0 ? 'BYPASS' : 'CLEAN';
@@ -413,7 +720,7 @@ export async function fetchPaged({ route, serviceId, key, stopBeforeMs, transpor
 // and `--commit <sha>` read as "no commit given" and shipped the branch tip to the money
 // host, exit 0. Anything not on this list is exit 2 naming the offender.
 const FLAGS = new Set(['--selftest', '--json', '--no-acks', '--verbose', '--help', '-h']);
-const VALUED = new Set(['--days', '--since', '--service', '--live', '--host', '--acks']);
+const VALUED = new Set(['--days', '--since', '--service', '--live', '--host', '--acks', '--acks-from']);
 
 export function parseArgs(argv) {
   const out = { flags: new Set(), values: {} };
@@ -438,13 +745,21 @@ export function parseArgs(argv) {
 const USAGE = `check-deploy-origin.mjs — TRA-4789
 
   node scripts/check-deploy-origin.mjs [--days=30 | --since=<iso>] [--service=srv-…]
-                                       [--live=<sha>] [--host=https://…] [--acks=<path>]
+                                       [--live=<sha>] [--host=https://…]
+                                       [--acks-from=origin|worktree] [--acks=<path>]
                                        [--no-acks] [--verbose] [--json] [--selftest]
 
   0 CLEAN   every deploy in the window was created by REST
   1 BYPASS  a deploy reached the host by a path that ran no gate
   2 USAGE   unrecognised argument (values attach with \`=\`)
-  3 BLIND   a leg was unreadable, the legs disagree, or a trigger value is unknown
+  3 BLIND   a leg was unreadable, the legs disagree, a trigger value is unknown, or the
+            ack ledger's PROVENANCE could not be read
+
+THE ACK LEDGER (TRA-4868). By default it is \`git show ${ACK_REF}:${LEDGER_REL}\`, read after a
+\`git fetch\` — NOT the working tree's copy, which moves with whatever checkout you happen to
+be in. \`--acks-from=worktree\` grades the checkout's copy instead and is LOUD about it: any
+ack in it that ${ACK_REF} does not carry is INERT and cannot clear a bypass. \`--acks=<path>\`
+grades an explicit file. Provenance is printed on every run; unreadable provenance is BLIND.
 
 Needs RENDER_API_KEY. Precedence: BLIND > BYPASS > CLEAN.`;
 
@@ -462,6 +777,11 @@ function printRow(r, log) {
   }
   if (r.disagreement) log(`[deploy-origin]          ⛔ ${r.disagreement}`);
   if (r.ack) log(`[deploy-origin]          acknowledged on ${r.ack.issue} (${r.ack.reviewedAt}): ${r.ack.why}`);
+  if (r.staleAck) {
+    log(`[deploy-origin]          ⛔ STALE LEDGER: ${ACK_REF}:${LEDGER_REL} DOES acknowledge this deploy`);
+    log(`[deploy-origin]             (${r.staleAck.issue ?? 'no issue'}, reviewed ${r.staleAck.reviewedAt ?? 'unstamped'}) — the ledger graded here`);
+    log('[deploy-origin]             does NOT. This alarm is the graded ledger\'s STALENESS, not a new bypass.');
+  }
 }
 
 const CAVEAT = [
@@ -491,8 +811,27 @@ async function main() {
   const useAcks = !parsed.flags.has('--no-acks');
   const serviceId = parsed.values['--service'] ?? process.env.RENDER_SERVICE_ID ?? DEFAULT_SERVICE;
   const host = (parsed.values['--host'] ?? DEFAULT_HOST).replace(/\/+$/, '');
-  const ackFile = parsed.values['--acks'] ?? ACKS_PATH;
   const nowMs = Date.now();
+
+  // ── Which ledger (TRA-4868) ────────────────────────────────────────────────────────
+  // Matched NEGATIVELY like every other argument here: an --acks-from value we do not
+  // recognise is exit 2 naming it, never a silent fall-back to some default ledger.
+  const ackFrom = parsed.values['--acks-from'];
+  if (ackFrom !== undefined && !ACK_SOURCES.has(ackFrom)) {
+    console.error(`[deploy-origin] USAGE: --acks-from=${ackFrom} is not one of ${[...ACK_SOURCES].join('|')}`);
+    process.exit(EXIT.USAGE);
+  }
+  if (ackFrom !== undefined && parsed.values['--acks'] !== undefined) {
+    console.error('[deploy-origin] USAGE: --acks= and --acks-from= are mutually exclusive — say which ledger you mean');
+    process.exit(EXIT.USAGE);
+  }
+  const ackMode = !useAcks
+    ? 'none'
+    : parsed.values['--acks'] !== undefined
+      ? 'path'
+      : ackFrom === 'worktree'
+        ? 'worktree'
+        : 'origin';
 
   let sinceMs;
   if (parsed.values['--since']) {
@@ -525,6 +864,16 @@ async function main() {
     if (!json) console.error(`[deploy-origin] BLIND: ${why}`);
     process.exit(EXIT.BLIND);
   }
+
+  // ── The ledger, resolved and its PROVENANCE captured BEFORE anything is graded ──────
+  // ⛔ TRA-4868. This is local + git only, so it runs before the network legs: a run that
+  // cannot say WHICH ledger it graded has nothing to say about the deploys either.
+  const ledger = resolveAckLedger({
+    mode: ackMode,
+    explicitPath: parsed.values['--acks'] ?? null,
+    repo: REPO,
+  });
+  if (ledger.blind) preBlind.push(ledger.blind);
 
   // Leg 0 — what is the box actually running. This is what binds the history to it.
   let liveSha = parsed.values['--live'] ?? null;
@@ -570,25 +919,50 @@ async function main() {
     console.error(`[deploy-origin] attribution leg UNREAD: ${e instanceof Blind ? e.message : e?.message ?? e}`);
   }
 
-  const loaded = useAcks ? loadAcks(ackFile) : { acks: [], note: 'acks IGNORED (--no-acks) — this is the raw truth' };
-  if (loaded.blind) preBlind.push(`ACKS: ${loaded.blind}`);
-
   const state = grade({
     deploys,
     events,
     sinceMs,
     nowMs,
-    acks: loaded.acks ?? [],
+    acks: ledger.acks ?? [],
     useAcks,
     liveSha,
     historyComplete,
     historyIncompleteWhy,
     eventsReachedMs,
     preBlind,
+    committedAcks: ledger.committedAcks,
   });
 
   if (json) {
-    emit({ verdict: state.verdict, counts: state.counts, blind: state.blind, warnings: state.warnings, rows: state.rows, acks: loaded.note ?? null, liveSha });
+    emit({
+      verdict: state.verdict,
+      counts: state.counts,
+      blind: state.blind,
+      warnings: state.warnings,
+      rows: state.rows,
+      acks: ledger.note ?? null,
+      ledger: {
+        mode: ackMode,
+        label: ledger.label,
+        provenance: ledger.lines,
+        committedAckCount: Array.isArray(ledger.committedAcks) ? ledger.committedAcks.length : null,
+        git: ledger.probe
+          ? {
+              isRepo: ledger.probe.isRepo,
+              head: ledger.probe.head,
+              branch: ledger.probe.branch,
+              behind: ledger.probe.behind,
+              fetched: ledger.probe.fetched,
+              refBlob: ledger.probe.refBlob,
+              worktreeBlob: ledger.probe.worktreeBlob,
+              dirty: ledger.probe.dirty,
+              errors: ledger.probe.errors,
+            }
+          : null,
+      },
+      liveSha,
+    });
     process.exit(state.exitCode);
   }
 
@@ -596,7 +970,12 @@ async function main() {
   log(`[deploy-origin] service ${serviceId}  host ${host}`);
   log(`[deploy-origin] window  ${new Date(sinceMs).toISOString()} .. ${new Date(nowMs).toISOString()}`);
   log(`[deploy-origin] live    ${liveSha ? liveSha.slice(0, 8) : 'UNREAD'}${state.bind.ok ? `  (history bound via ${state.bind.newestLive})` : '  (NOT BOUND)'}`);
-  log(`[deploy-origin] acks    ${loaded.note ?? '—'}`);
+  log(`[deploy-origin] acks    ${ledger.note ?? '— UNREADABLE'}`);
+  // ⛔ Provenance is printed on EVERY run, not only when it is interesting. The defect this
+  // answers was that `acks  N acknowledgement(s) loaded` read identically whichever ledger
+  // it had loaded — from the shipped one, from a 172-behind checkout, or from an
+  // uncommitted edit. (TRA-4868.)
+  for (const l of ledger.lines) log(`[deploy-origin]         ${l}`);
   log('');
   // Default is COMPACT: every non-`api` row in full, and the REST rows as one counted
   // line. ⛔ The count is printed either way — a report that hides its denominator is how
@@ -613,7 +992,7 @@ async function main() {
   log(
     `[deploy-origin] n=${state.counts.n}  rest=${state.counts.sanctioned}  bypass=${state.counts.bypass} ` +
       `(acked ${state.counts.acked}, unacked ${state.counts.unacked})  unknown=${state.counts.unknown}  ` +
-      `attribution-unread=${state.counts.attributionUnread}`,
+      `attribution-unread=${state.counts.attributionUnread}  stale-ledger=${state.counts.staleAlarms}`,
   );
   log(`[deploy-origin] VERDICT = ${state.verdict}`);
   for (const w of state.warnings) log(`[deploy-origin] WARNING: ${w}`);
@@ -631,7 +1010,13 @@ async function main() {
     console.error('[deploy-origin] ran NONE of render-redeploy.mjs\'s gates: the deploy hold, the argument guard,');
     console.error('[deploy-origin] the RTH freeze, the dated embargo, the commit hold, the live AUTH_SECRET check,');
     console.error('[deploy-origin] and the cadence ceiling. Adjudicate each on a ticket, then record it in');
-    console.error(`[deploy-origin] ${path.relative(REPO, ackFile)} by deploy id — never by class.`);
+    console.error(`[deploy-origin] ${ACK_REF}:${LEDGER_REL} by deploy id — never by class.`);
+    if (state.counts.staleAlarms > 0) {
+      console.error('');
+      console.error(`[deploy-origin] ⛔ BUT ${state.counts.staleAlarms} of those ${state.counts.unacked} ARE already acknowledged in ${ACK_REF}:${LEDGER_REL}`);
+      console.error(`[deploy-origin] and are alarming only because the ledger graded here (${ledger.label}) is STALE.`);
+      console.error('[deploy-origin] Do NOT re-adjudicate them. Grade the committed ledger — that is the default.');
+    }
     process.exit(EXIT.BYPASS);
   }
 
