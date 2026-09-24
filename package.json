@@ -50,7 +50,7 @@
     "check:blocked-empty:controls": "node scripts/check-blocked-empty.mjs --selftest",
     "check:strands": "node scripts/check-blocked-empty.mjs",
     "check:strands:controls": "node scripts/check-blocked-empty.mjs --selftest",
-    "//check:dark-gates": "TRA-4487 (off TRA-4486 ask 3) — the gap BETWEEN check:strands and … → docs/package-script-notes.md § \"//check:dark-gates\"",
+    "//check:dark-gates": "TRA-4487 (off TRA-4486 ask 3), amended TRA-4848 (all 5 resting paths; DARK exit 1 vs STALE-PATH exit 4) — the gap BETWEEN check:strands and … → docs/package-script-notes.md § \"//check:dark-gates\"",
     "check:dark-gates": "node scripts/check-dark-gates.mjs",
     "check:dark-gates:controls": "node scripts/check-dark-gates.mjs --selftest",
     "//drain:strands": "TRA-3541 — the WRITE half of check:strands. The board ruled on 2026-08-13 that … → docs/package-script-notes.md § \"//drain:strands\"",

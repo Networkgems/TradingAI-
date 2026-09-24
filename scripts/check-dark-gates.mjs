@@ -2,7 +2,8 @@
 /**
  * TRA-4487 (off TRA-4486 ask 3) — detector for the DARK GATE: an open issue
  * that HOLDS other open work down while owning no path by which anything will
- * ever wake it.
+ * ever wake it. Amended by TRA-4848: it now grades ALL FIVE resting paths and
+ * splits the verdict DARK vs STALE-PATH.
  *
  * WHAT THE SHAPE IS, PROVEN BY TRA-3058
  * -------------------------------------
@@ -19,42 +20,49 @@
  *     routines that were this leaf's only wake path are out of scope.
  *
  * Result: TRA-3058 sat 34 days holding TRA-3052 → TRA-3057 → TRA-3110 (a live
- * security ticket) dark, with ZERO recovery actions raised. The deliverable —
- * a 30-day-retention log window — evaporated while it waited. The same sweep
- * (TRA-4486) found TRA-3553 (critical, root of three chains, one stranded
- * since 2026-07-11) and TRA-2918 in the identical shape; both were LeadDev
- * queue-position cases, not dead agents — the shape does not need a dead
- * owner, only a queue that never reaches the row.
+ * security ticket) dark, with ZERO recovery actions raised.
  *
- * THE PREDICATE (QuantTrader wording, TRA-4486, verified against the incident)
- * ---------------------------------------------------------------------------
- * Flag any OPEN (non-terminal) issue where ALL FOUR hold:
+ * THE FIVE RESTING PATHS (TRA-4848 — the founding predicate graded path 1 only)
+ * -----------------------------------------------------------------------------
+ * A row is resting SAFELY iff at least one of these is live:
  *
- *   1. it BLOCKS at least one other OPEN issue        (`blocks[]`, detail GET)
- *   2. its own `blockedBy` is empty or has no open entry       (detail GET)
- *   3. `updatedAt` is older than N days (default 7)     (list projection)
- *   4. no `executionPolicy.monitor` `nextCheckAt` in the FUTURE
- *                                                       (list projection)
- * TRA-3058 satisfied all four for 34 days.
+ *   1. `executionPolicy.monitor` with a FUTURE `nextCheckAt`   (list projection)
+ *   2. an OPEN entry in `blockedBy` (issue_blockers_resolved)      (detail GET)
+ *   3. a PENDING interaction — ⚠️ read from `/api/issues/{id}/interactions`,
+ *      NEVER off the issue GET: the issue payload OMITS the `interactions` key
+ *      entirely, so a presence-test there reads absent-key as zero (TRA-4848
+ *      ask 2). A pending card with `continuationPolicy: wake_assignee` wakes on
+ *      acceptance AND rejection; only expiry does not wake.
+ *   4. `reviewAttention.state == "covered"`                        (detail GET)
+ *   5. a non-null `activeRecoveryAction` (platform recovery owns it) (detail GET)
  *
- * Condition 1 is what separates a dark GATE from a merely idle leaf: an idle
- * leaf wastes only itself; a dark gate holds a subtree down. Condition 2 rules
- * out rows with a live `issue_blockers_resolved` wake path. Condition 4 rules
- * out rows correctly parked on a scheduled monitor — a SPENT monitor
- * (`monitorNextCheckAt` null after a fire) is NOT a wake path and does not
- * clear the row. Condition 3 is the debounce: a row someone touched this week
- * has an owner thinking about it.
+ * On 2026-09-24 the path-1-only predicate printed "NO wake path at all" against
+ * 5 rows of which at least 3 held a pending `wake_assignee` interaction with no
+ * expiry — paths 3 and 4 were live the whole time (TRA-3100: a 49-day-old
+ * `human_only` board card no agent can re-create). Same defect class as the
+ * 2026-09-04 parked-close audit that was wrong on 2 of 3 rows for the same
+ * reason (TRA-4078/TRA-4084). The printed claim is exactly the premise that
+ * licenses the un-derived close the same report forbids — so the claim is now
+ * DERIVED, never assumed from a subset of the paths.
  *
- * DELIBERATE OVERLAPS — overlap beats a gap, and both are one-way
- * ---------------------------------------------------------------
- *   - A `blocked` row with empty `blockedBy` that also blocks open work and is
- *     stale matches here AND in `check:strands`. Fine: double coverage on the
- *     loud shape, while THIS check alone covers the quiet `todo`/`backlog`/
- *     `in_review` shapes.
- *   - A stale `in_review` row whose monitor is spent matches here AND in
- *     `check:spent-monitor` — but only if it blocks open work AND
- *     `monitorScheduledBy` was ever set; a never-armed `in_review` gate is
- *     invisible to that check and visible to this one.
+ * DARK vs STALE-PATH (TRA-4848 ask 3) — the remedy differs
+ * --------------------------------------------------------
+ *   DARK        no path of any kind is live. "NO wake path at all" is TRUE.
+ *               Remedy: the row needs a wake path (finish it, arm a FUTURE
+ *               monitor, or route it).
+ *   STALE-PATH  a live path exists (pending card / covered review / recovery)
+ *               but the row is >N days untouched — e.g. its only path is a
+ *               stale, maybe-unanswerable `human_only` card. Still worth
+ *               surfacing; the remedy is ESCALATION to whoever can actually
+ *               answer (the card age and `effectiveResolverPolicy` are printed
+ *               so the reader can see who that is). ⛔ NOT a license to close,
+ *               and NOT a license to re-post the card: a replacement ask
+ *               auto-expires the prior one and EXPIRY DOES NOT WAKE — reposting
+ *               trades a live path for a silent one.
+ *
+ * Conditions kept from the founding predicate: the row must BLOCK ≥1 open
+ * issue (`blocks[]`, detail GET — an idle leaf wastes only itself; a gate
+ * holds a subtree down) and be >N days stale (`updatedAt`, default 7).
  *
  * TRAPS — each is a way to print a clean number that is wrong, each has a
  * control in `--selftest`
@@ -70,9 +78,10 @@
  *     empty company: all render as zero findings over zero rows.
  *  3. ⛔ A ROW MISSING A PREDICATE FIELD IS BLIND, NOT CLEAN. If the
  *     projection drops `updatedAt` or `monitorNextCheckAt`, or a detail GET
- *     stops carrying `blocks`/`blockedBy`, the absent key must not grade as
- *     "fresh" / "no monitor" / "blocks nothing". Absence and value must not
- *     share a verdict.
+ *     stops carrying `blocks`/`blockedBy`/`reviewAttention`/
+ *     `activeRecoveryAction` (all four are ALWAYS serialized today — absence
+ *     is a shape change, not a value), the absent key must not grade as a
+ *     value. Absence and value must not share a verdict.
  *  4. ⛔ AN UNRECOGNISED STATUS IS BLIND — on the row itself AND on a
  *     `blocks[]` entry. Guessing terminal hides gates; guessing open invents
  *     them.
@@ -80,28 +89,33 @@
  *     (TRA-4078: a loop that believed "1800 issues" hid 13 of 38 findings
  *     behind its early stop). Hitting the safety bound is BLIND, not done.
  *  6. ⛔ A FAILED DETAIL GET IS BLIND, NEVER "no edges". Fail closed: an
- *     unreadable candidate is an ungraded one, and BLIND outranks FLAGGED so
+ *     unreadable candidate is an ungraded one, and BLIND outranks DARK so
  *     one unreadable row cannot be drowned out by nine loud ones.
+ *  7. ⛔ A FAILED INTERACTIONS GET IS "A CARD EXISTS", NEVER "no card"
+ *     (TRA-4848 ask 1). The expensive direction is printing DARK — the
+ *     close-licensing claim — off a route error. The row grades STALE-PATH
+ *     with `pending interactions: UNREAD` printed, so the degradation is
+ *     visible and non-green (exit 4), and a systemic route failure cannot
+ *     manufacture a single false "no wake path at all".
  *
  * WHAT THE REMEDY IS NOT
  * ----------------------
  * This check ROUTES; it does not repair, and the finding is not "close the
  * row". A dark gate usually guards something real (TRA-3058 guarded a
- * security deliverable). The remedy is owner-shaped: re-derive whether the
- * gate condition still holds, then either finish it, arm a REAL future
- * monitor (`executionPolicy.monitor.nextCheckAt` — one-shot, so re-arm on
- * every fire), or hand it to whoever can. Closing it un-derived converts a
- * dark gate into a shape-2 silent strand on its dependents (see
- * `check:strands` header) — strictly worse.
+ * security deliverable). Closing it un-derived converts a dark gate into a
+ * shape-2 silent strand on its dependents (see `check:strands` header) —
+ * strictly worse.
  *
  * VERDICTS AND EXIT CODES
  * -----------------------
- *   0  CLEAN    — population fully read; zero dark gates.
- *   1  FLAGGED  — at least one dark gate. The incident.
- *   2  USAGE    — bad invocation.
- *   3  BLIND    — the population or a row is untrustworthy. NOT a pass.
- * BLIND > FLAGGED > CLEAN. "Could not check" and "checked and it is fine"
- * must never share an exit code.
+ *   0  CLEAN       — population fully read; zero findings of either class.
+ *   1  DARK        — ≥1 row with NO live path. The incident. Pages.
+ *   2  USAGE       — bad invocation.
+ *   3  BLIND       — the population or a row is untrustworthy. NOT a pass.
+ *   4  STALE_PATH  — no DARK row, but ≥1 row resting on a live-but-stale path.
+ *                    Escalation work, not a page — and not green.
+ * BLIND > DARK > STALE_PATH > CLEAN. "Could not check" and "checked and it is
+ * fine" must never share an exit code.
  *
  * Usage:
  *   node scripts/check-dark-gates.mjs [--json] [--stale-days=7] [--owner=<agentId>]
@@ -116,7 +130,7 @@ const MAX_PAGES = 200;
 const DEFAULT_STALE_DAYS = 7;
 const DAY_MS = 86_400_000;
 
-export const VERDICT_EXIT = { CLEAN: 0, FLAGGED: 1, USAGE: 2, BLIND: 3 };
+export const VERDICT_EXIT = { CLEAN: 0, DARK: 1, USAGE: 2, BLIND: 3, STALE_PATH: 4 };
 
 export const NON_TERMINAL = new Set(['todo', 'in_progress', 'in_review', 'blocked', 'backlog']);
 export const TERMINAL = new Set(['done', 'cancelled', 'completed', 'closed', 'archived']);
@@ -131,8 +145,8 @@ const parseTs = (v) => {
  * First pass — LIST projection only. Returns {state, detail}.
  *   TERMINAL   closed; out of population.
  *   FRESH      open but touched inside the stale window. Not a candidate.
- *   MONITORED  open with a monitor scheduled in the FUTURE — a live wake path.
- *   CANDIDATE  open, stale, no future monitor. Needs the edge GET.
+ *   MONITORED  open with a monitor scheduled in the FUTURE — resting path 1.
+ *   CANDIDATE  open, stale, no future monitor. Needs the detail-side paths.
  *   BLIND      ungradeable — trap 3/4.
  */
 export function gradeRow(row, now, staleMs) {
@@ -150,8 +164,8 @@ export function gradeRow(row, now, staleMs) {
   }
   if (TERMINAL.has(row.status)) return { state: 'TERMINAL' };
 
-  // Condition 3 — staleness. TRAP 3: an absent/unparseable `updatedAt` is
-  // BLIND, not fresh — "never touched" is the stalest a row can possibly be.
+  // Staleness. TRAP 3: an absent/unparseable `updatedAt` is BLIND, not fresh —
+  // "never touched" is the stalest a row can possibly be.
   if (!('updatedAt' in row)) {
     return { state: 'BLIND', detail: `${id}: projection carries no \`updatedAt\` key` };
   }
@@ -161,7 +175,7 @@ export function gradeRow(row, now, staleMs) {
   }
   if (now - updated < staleMs) return { state: 'FRESH' };
 
-  // Condition 4 — a monitor scheduled in the FUTURE is a live wake path.
+  // Resting path 1 — a monitor scheduled in the FUTURE is a live wake path.
   // TRAP 3 again: only the FUTURE value clears the row. A null (never armed OR
   // spent — indistinguishable here and equally dead) and a PAST value both
   // leave it a candidate. An absent key on a row that DID arm a monitor would
@@ -182,15 +196,19 @@ export function gradeRow(row, now, staleMs) {
 }
 
 /**
- * Second pass — conditions 1 and 2, from ONE detail GET per candidate.
- * Returns {state, detail, openBlocks?}:
- *   FLAGGED           blocks ≥1 open issue AND no open blocker of its own.
- *   BLOCKS_NOTHING    condition 1 fails — idle, but holding nothing down.
- *   LIVE_BLOCKER      condition 2 fails — `issue_blockers_resolved` will wake it.
- *   BLIND             unreadable row / absent edge arrays / ungradeable entry.
- * Fails closed everywhere (TRAP 6).
+ * Second pass — resting paths 2–5, from ONE detail GET plus ONE interactions
+ * GET per candidate. Returns {state, detail?, ...}:
+ *   DARK              blocks ≥1 open issue AND no path of any kind is live.
+ *   STALE_PATH        blocks ≥1 open issue, no monitor/blocker, but path 3/4/5
+ *                     is live. Carries pendingInteractions ('UNREAD' on a route
+ *                     error — TRAP 7), cards[], reviewAttentionState,
+ *                     recoveryAction, livePaths[].
+ *   BLOCKS_NOTHING    idle, but holding nothing down. Out of population.
+ *   LIVE_BLOCKER      path 2 live — `issue_blockers_resolved` will wake it.
+ *   BLIND             unreadable row / absent keys / ungradeable entry.
+ * Fails closed everywhere (TRAPs 6 and 7).
  */
-export async function resolveEdges(getIssue, row) {
+export async function resolveEdges(getIssue, getInteractions, row, now) {
   const id = row.identifier ?? row.id;
   let full;
   try {
@@ -202,7 +220,7 @@ export async function resolveEdges(getIssue, row) {
     return { state: 'BLIND', detail: `${id}: detail GET returned no object` };
   }
 
-  // Condition 1 — blocks at least one OPEN issue.
+  // Blocks at least one OPEN issue — what makes it a gate rather than a leaf.
   if (!Array.isArray(full.blocks)) {
     return { state: 'BLIND', detail: `${id}: detail GET carries no \`blocks\` array` };
   }
@@ -218,7 +236,7 @@ export async function resolveEdges(getIssue, row) {
   }
   if (openBlocks.length === 0) return { state: 'BLOCKS_NOTHING' };
 
-  // Condition 2 — no open blocker of its own. ⛔ `blockedByIssueIds` is
+  // Resting path 2 — an open blocker of its own. ⛔ `blockedByIssueIds` is
   // undefined on every GET; `blockedBy` is the served array.
   if (!Array.isArray(full.blockedBy)) {
     return { state: 'BLIND', detail: `${id}: detail GET carries no \`blockedBy\` array` };
@@ -228,7 +246,66 @@ export async function resolveEdges(getIssue, row) {
     return { state: 'LIVE_BLOCKER', detail: `${openBlockedBy.length} open blocker(s)` };
   }
 
-  return { state: 'FLAGGED', openBlocks };
+  // Resting paths 4 and 5 — both keys are ALWAYS serialized on the detail GET
+  // (state "none" / null when nothing is present), so an absent key is a shape
+  // change and BLIND (TRAP 3), never a value.
+  if (!('reviewAttention' in full)) {
+    return { state: 'BLIND', detail: `${id}: detail GET carries no \`reviewAttention\` key` };
+  }
+  if (!('activeRecoveryAction' in full)) {
+    return { state: 'BLIND', detail: `${id}: detail GET carries no \`activeRecoveryAction\` key` };
+  }
+  const reviewAttentionState = full.reviewAttention && typeof full.reviewAttention === 'object' ? full.reviewAttention.state ?? null : null;
+  const reviewCovered = reviewAttentionState === 'covered';
+  const recoveryAction = full.activeRecoveryAction ?? null;
+
+  // Resting path 3 — pending interactions, from the ROUTE (TRA-4848 ask 2: the
+  // issue payload omits the `interactions` key entirely; a presence-test there
+  // reads absent-key as zero). TRAP 7: a route error is "a card exists", never
+  // "no card" — DARK off an unread route is the close-licensing false claim.
+  let pendingInteractions;
+  let cards = [];
+  let interactionsNote = null;
+  if (typeof getInteractions !== 'function') {
+    pendingInteractions = 'UNREAD';
+    interactionsNote = 'no interactions transport supplied — fail-closed as a live card';
+  } else {
+    try {
+      const list = await getInteractions(row.id);
+      if (!Array.isArray(list)) throw new Error('interactions route did not return an array');
+      // A malformed entry fails closed in the same direction: counted pending.
+      const pending = list.filter((x) => !x || typeof x.status !== 'string' || x.status === 'pending');
+      pendingInteractions = pending.length;
+      cards = pending.map((x) => ({
+        id: x?.id ?? '<no id>',
+        kind: x?.kind ?? '<no kind>',
+        ageDays: parseTs(x?.createdAt) === null ? null : Math.floor((now - parseTs(x.createdAt)) / DAY_MS),
+        effectiveResolverPolicy: x?.effectiveResolverPolicy ?? '<unread>',
+        continuationPolicy: x?.continuationPolicy ?? '<unread>',
+      }));
+    } catch (err) {
+      pendingInteractions = 'UNREAD';
+      interactionsNote = `interactions GET failed (${err?.message ?? err}) — fail-closed as a live card`;
+    }
+  }
+  const interactionsLive = pendingInteractions === 'UNREAD' || pendingInteractions > 0;
+
+  const livePaths = [];
+  if (interactionsLive) livePaths.push('pending-interaction');
+  if (reviewCovered) livePaths.push('reviewAttention-covered');
+  if (recoveryAction) livePaths.push('activeRecoveryAction');
+
+  const base = {
+    openBlocks,
+    pendingInteractions,
+    cards,
+    interactionsNote,
+    reviewAttentionState,
+    recoveryAction: recoveryAction ? recoveryAction.kind ?? recoveryAction.type ?? 'present' : null,
+    livePaths,
+  };
+  if (livePaths.length) return { state: 'STALE_PATH', ...base };
+  return { state: 'DARK', ...base };
 }
 
 /**
@@ -293,12 +370,19 @@ export async function run(transport, { owner = null, staleDays = DEFAULT_STALE_D
     }
   } else {
     for (const row of candidates) {
-      const e = await resolveEdges(transport.getIssue, row);
+      const e = await resolveEdges(transport.getIssue, transport.getInteractions, row, now);
       if (e.state === 'BLIND') blindRows.push({ id: row.identifier ?? row.id, detail: e.detail });
-      else if (e.state === 'FLAGGED') {
+      else if (e.state === 'DARK' || e.state === 'STALE_PATH') {
         findings.push({
           ...row,
+          classification: e.state,
           openBlocks: e.openBlocks,
+          pendingInteractions: e.pendingInteractions,
+          cards: e.cards,
+          interactionsNote: e.interactionsNote,
+          reviewAttentionState: e.reviewAttentionState,
+          recoveryAction: e.recoveryAction,
+          livePaths: e.livePaths,
           staleDays: Math.floor((now - Date.parse(row.updatedAt)) / DAY_MS),
         });
       }
@@ -307,11 +391,32 @@ export async function run(transport, { owner = null, staleDays = DEFAULT_STALE_D
 
   const scoped = owner ? findings.filter((f) => f.assigneeAgentId === owner) : findings;
 
+  // BLIND > DARK > STALE_PATH > CLEAN.
   let verdict = 'CLEAN';
-  if (scoped.length) verdict = 'FLAGGED';
+  if (scoped.some((f) => f.classification === 'STALE_PATH')) verdict = 'STALE_PATH';
+  if (scoped.some((f) => f.classification === 'DARK')) verdict = 'DARK';
   if (blindRows.length) verdict = 'BLIND'; // outranks everything
 
   return { verdict, blind: null, scanned: rows.length, pages, candidates: candidates.length, findings: scoped, allFindings: findings, blindRows };
+}
+
+function renderFindingRow(f, out) {
+  const label = f.classification === 'DARK' ? 'DARK      ' : 'STALE-PATH';
+  out.push(
+    `    ${label}  ${f.identifier}  ${f.status}  stale=${f.staleDays}d  monitor=${f.monitorNextCheckAt ?? 'none'}` +
+      `\n      HOLDS DARK: ${f.openBlocks.map((b) => `${b.identifier}:${b.status}`).join(', ')}`,
+  );
+  // TRA-4848 ask 4 — printed on EVERY row, matching check:strands, so the next
+  // reader can audit the verdict without re-deriving it.
+  const pi =
+    f.pendingInteractions === 'UNREAD'
+      ? `UNREAD (${f.interactionsNote})`
+      : String(f.pendingInteractions);
+  out.push(`      pending interactions: ${pi} · reviewAttention: ${f.reviewAttentionState ?? 'unread'} · recovery: ${f.recoveryAction ?? 'none'}`);
+  for (const c of f.cards) {
+    out.push(`        card ${c.id}  ${c.kind}  age=${c.ageDays === null ? '?' : `${c.ageDays}d`}  resolver=${c.effectiveResolverPolicy}  continuation=${c.continuationPolicy}`);
+  }
+  out.push(`      ${String(f.title ?? '').slice(0, 96)}`);
 }
 
 export function render(result, { staleDays = DEFAULT_STALE_DAYS } = {}) {
@@ -328,23 +433,29 @@ export function render(result, { staleDays = DEFAULT_STALE_DAYS } = {}) {
     return out.join('\n');
   }
 
+  const darks = result.findings.filter((f) => f.classification === 'DARK');
+  const stale = result.findings.filter((f) => f.classification === 'STALE_PATH');
+  out.push(
+    result.verdict === 'DARK'
+      ? `VERDICT: DARK — ${darks.length} gate(s) with NO live resting path (all five paths derived), plus ${stale.length} STALE-PATH row(s)`
+      : `VERDICT: STALE-PATH — ${stale.length} gate(s) resting on a live path that has not moved in >${staleDays}d; zero DARK rows`,
+  );
+  out.push('remedy is OWNER-SHAPED and differs by class:');
+  out.push('  DARK       needs a wake path — re-derive the gate, then finish it, arm a FUTURE monitor, or route it.');
+  out.push('  STALE-PATH has a live path (card/review/recovery) — escalate to whoever can actually answer it.');
+  out.push('             Do NOT re-post a pending card: a replacement auto-expires the prior one and EXPIRY DOES NOT WAKE.');
+  out.push('⛔ do NOT close a gate un-derived — that mints a shape-2 silent strand on every dependent below.');
+
   const byOwner = new Map();
   for (const f of result.findings) {
     const k = f.assigneeAgentId ?? '<unassigned>';
     if (!byOwner.has(k)) byOwner.set(k, []);
     byOwner.get(k).push(f);
   }
-  out.push(`VERDICT: FLAGGED — ${result.findings.length} dark gate(s) across ${byOwner.size} owner(s)`);
-  out.push('remedy is OWNER-SHAPED: re-derive the gate, then finish it, arm a FUTURE monitor, or route it.');
-  out.push('⛔ do NOT close a gate un-derived — that mints a shape-2 silent strand on every dependent below.');
   for (const [ownerId, list] of [...byOwner.entries()].sort((a, b) => b[1].length - a[1].length)) {
     out.push(`\n  owner ${ownerId}  (${list.length})`);
     for (const f of list.sort((a, b) => String(a.identifier).localeCompare(String(b.identifier)))) {
-      out.push(
-        `    ${f.identifier}  ${f.status}  stale=${f.staleDays}d  monitor=${f.monitorNextCheckAt ?? 'none'}` +
-          `\n      HOLDS DARK: ${f.openBlocks.map((b) => `${b.identifier}:${b.status}`).join(', ')}` +
-          `\n      ${String(f.title ?? '').slice(0, 96)}`,
-      );
+      renderFindingRow(f, out);
     }
   }
   return out.join('\n');
@@ -357,7 +468,8 @@ const NOW = Date.parse('2026-09-10T12:00:00Z');
 const daysAgo = (n) => new Date(NOW - n * DAY_MS).toISOString();
 
 // The TRA-3058 replica: todo, 34 days untouched, no monitor, blocks one open
-// issue (the TRA-3057 stand-in), empty blockedBy. All four predicates hold.
+// issue (the TRA-3057 stand-in), empty blockedBy, no interaction/review/
+// recovery path. All predicates for DARK hold.
 const incidentRow = (over = {}) => ({
   id: 'i-3058',
   identifier: 'TRA-3058',
@@ -373,122 +485,224 @@ const incidentDetail = (over = {}) => ({
   identifier: 'TRA-3058',
   blocks: [{ id: 'i-3057', identifier: 'TRA-3057', status: 'blocked' }],
   blockedBy: [],
+  reviewAttention: { state: 'none', paths: [], reason: null },
+  activeRecoveryAction: null,
+  ...over,
+});
+// The TRA-3100 replica (the TRA-4848 incident): same gate shape, but a pending
+// `human_only` board card with no expiry has been live the whole time.
+const pendingCard = (over = {}) => ({
+  id: 'int-1',
+  kind: 'request_confirmation',
+  status: 'pending',
+  createdAt: daysAgo(35),
+  continuationPolicy: 'wake_assignee',
+  effectiveResolverPolicy: 'human_only',
   ...over,
 });
 
 const CASES = [
   {
-    name: 'THE INCIDENT (positive control) — all four predicates hold => FLAGGED',
+    name: 'THE TRA-3058 INCIDENT (positive control) — no path of any kind => DARK',
     rows: [incidentRow()],
     details: { 'i-3058': incidentDetail() },
-    expect: { verdict: 'FLAGGED', findings: 1 },
+    interactions: { 'i-3058': [] },
+    expect: { verdict: 'DARK', findings: 1 },
+  },
+  {
+    name: 'THE TRA-4848 INCIDENT (positive control) — pending human_only card => STALE-PATH, never "no wake path"',
+    rows: [incidentRow()],
+    details: { 'i-3058': incidentDetail() },
+    interactions: { 'i-3058': [pendingCard()] },
+    expect: { verdict: 'STALE_PATH', findings: 1 },
+  },
+  {
+    name: 'TRA-4848 ask 2 — a bogus `interactions` key on the detail GET is IGNORED; the route (1 pending) wins => STALE-PATH',
+    rows: [incidentRow()],
+    details: { 'i-3058': incidentDetail({ interactions: [] }) },
+    interactions: { 'i-3058': [pendingCard()] },
+    expect: { verdict: 'STALE_PATH', findings: 1 },
+  },
+  {
+    name: 'a RESOLVED card is not a path => DARK',
+    rows: [incidentRow()],
+    details: { 'i-3058': incidentDetail() },
+    interactions: { 'i-3058': [pendingCard({ status: 'accepted' })] },
+    expect: { verdict: 'DARK', findings: 1 },
+  },
+  {
+    name: 'reviewAttention.state == "covered" (path 4) => STALE-PATH',
+    rows: [incidentRow()],
+    details: { 'i-3058': incidentDetail({ reviewAttention: { state: 'covered', paths: [], reason: 'x' } }) },
+    interactions: { 'i-3058': [] },
+    expect: { verdict: 'STALE_PATH', findings: 1 },
+  },
+  {
+    name: 'non-null activeRecoveryAction (path 5) => STALE-PATH',
+    rows: [incidentRow()],
+    details: { 'i-3058': incidentDetail({ activeRecoveryAction: { kind: 'successful_run_missing_state' } }) },
+    interactions: { 'i-3058': [] },
+    expect: { verdict: 'STALE_PATH', findings: 1 },
+  },
+  {
+    name: 'TRAP 7 — interactions route ERRORS => "a card exists": STALE-PATH with UNREAD, never DARK',
+    rows: [incidentRow()],
+    details: { 'i-3058': incidentDetail() },
+    interactions: {}, // getInteractions throws on a missing id
+    expect: { verdict: 'STALE_PATH', findings: 1 },
+  },
+  {
+    name: 'TRAP 7 — interactions route returns a non-array => STALE-PATH with UNREAD, never DARK',
+    rows: [incidentRow()],
+    details: { 'i-3058': incidentDetail() },
+    interactions: { 'i-3058': { items: [] } },
+    expect: { verdict: 'STALE_PATH', findings: 1 },
+  },
+  {
+    name: 'DARK outranks STALE_PATH — one of each => verdict DARK, both findings kept',
+    rows: [incidentRow(), incidentRow({ id: 'i-2', identifier: 'TRA-2' })],
+    details: { 'i-3058': incidentDetail(), 'i-2': incidentDetail({ id: 'i-2', identifier: 'TRA-2' }) },
+    interactions: { 'i-3058': [], 'i-2': [pendingCard()] },
+    expect: { verdict: 'DARK', findings: 2 },
   },
   {
     name: 'negative control (acceptance) — same leaf with a FUTURE monitor => CLEAN',
     rows: [incidentRow({ monitorNextCheckAt: new Date(NOW + 2 * DAY_MS).toISOString() })],
     details: { 'i-3058': incidentDetail() },
+    interactions: { 'i-3058': [] },
     expect: { verdict: 'CLEAN', findings: 0 },
   },
   {
     name: 'negative control (acceptance) — same leaf blocking NOTHING => CLEAN',
     rows: [incidentRow()],
     details: { 'i-3058': incidentDetail({ blocks: [] }) },
+    interactions: { 'i-3058': [] },
     expect: { verdict: 'CLEAN', findings: 0 },
   },
   {
     name: 'fresh row (updatedAt inside the window) => CLEAN, no edge GET spent',
     rows: [incidentRow({ updatedAt: daysAgo(2) })],
     details: {}, // an edge GET here would throw — proving the cheap filter ran first
+    interactions: {},
     expect: { verdict: 'CLEAN', findings: 0 },
   },
   {
     name: 'a LIVE open blocker of its own => CLEAN (issue_blockers_resolved will wake it)',
     rows: [incidentRow()],
     details: { 'i-3058': incidentDetail({ blockedBy: [{ id: 'x', identifier: 'TRA-9', status: 'in_progress' }] }) },
+    interactions: { 'i-3058': [] },
     expect: { verdict: 'CLEAN', findings: 0 },
   },
   {
     name: 'blocks only CLOSED issues => CLEAN (nothing is held dark)',
     rows: [incidentRow()],
     details: { 'i-3058': incidentDetail({ blocks: [{ id: 'x', identifier: 'TRA-9', status: 'done' }] }) },
+    interactions: { 'i-3058': [] },
     expect: { verdict: 'CLEAN', findings: 0 },
   },
   {
-    name: 'blockedBy holds only CLOSED entries (the shape a close creates) => still FLAGGED',
+    name: 'blockedBy holds only CLOSED entries (the shape a close creates) => still DARK',
     rows: [incidentRow()],
     details: { 'i-3058': incidentDetail({ blockedBy: [{ id: 'x', identifier: 'TRA-9', status: 'done' }] }) },
-    expect: { verdict: 'FLAGGED', findings: 1 },
+    interactions: { 'i-3058': [] },
+    expect: { verdict: 'DARK', findings: 1 },
   },
   {
-    name: 'a SPENT monitor (null after firing) is NOT a wake path => FLAGGED',
+    name: 'a SPENT monitor (null after firing) is NOT a wake path => DARK',
     rows: [incidentRow({ monitorNextCheckAt: null, monitorScheduledBy: 'assignee', monitorAttemptCount: 3 })],
     details: { 'i-3058': incidentDetail() },
-    expect: { verdict: 'FLAGGED', findings: 1 },
+    interactions: { 'i-3058': [] },
+    expect: { verdict: 'DARK', findings: 1 },
   },
   {
-    name: 'a PAST monitorNextCheckAt is not "in the future" => FLAGGED',
+    name: 'a PAST monitorNextCheckAt is not "in the future" => DARK',
     rows: [incidentRow({ monitorNextCheckAt: daysAgo(1) })],
     details: { 'i-3058': incidentDetail() },
-    expect: { verdict: 'FLAGGED', findings: 1 },
+    interactions: { 'i-3058': [] },
+    expect: { verdict: 'DARK', findings: 1 },
   },
   {
     name: 'TERMINAL row matching everything else => CLEAN (population is OPEN issues)',
     rows: [incidentRow({ status: 'done' })],
     details: { 'i-3058': incidentDetail() },
+    interactions: { 'i-3058': [] },
     expect: { verdict: 'CLEAN', findings: 0 },
   },
   {
     name: 'TRAP 2 — zero rows scanned => BLIND, not CLEAN',
     rows: [],
     details: {},
+    interactions: {},
     expect: { verdict: 'BLIND' },
   },
   {
     name: 'TRAP 4 — unrecognised status => BLIND, never guessed',
     rows: [incidentRow({ status: 'snoozed' })],
     details: {},
+    interactions: {},
     expect: { verdict: 'BLIND' },
   },
   {
     name: 'TRAP 3 — projection dropped updatedAt => BLIND, never "fresh"',
     rows: [(() => { const r = incidentRow(); delete r.updatedAt; return r; })()],
     details: {},
+    interactions: {},
     expect: { verdict: 'BLIND' },
   },
   {
     name: 'TRAP 3 — projection dropped monitorNextCheckAt => BLIND, never "no monitor"',
     rows: [(() => { const r = incidentRow(); delete r.monitorNextCheckAt; return r; })()],
     details: {},
+    interactions: {},
     expect: { verdict: 'BLIND' },
   },
   {
     name: 'TRAP 1/3 — detail GET carries no blocks array => BLIND, never "blocks nothing"',
     rows: [incidentRow()],
     details: { 'i-3058': (() => { const d = incidentDetail(); delete d.blocks; return d; })() },
+    interactions: { 'i-3058': [] },
     expect: { verdict: 'BLIND' },
   },
   {
     name: 'TRAP 3 — detail GET carries no blockedBy array => BLIND',
     rows: [incidentRow()],
     details: { 'i-3058': (() => { const d = incidentDetail(); delete d.blockedBy; return d; })() },
+    interactions: { 'i-3058': [] },
+    expect: { verdict: 'BLIND' },
+  },
+  {
+    name: 'TRAP 3 — detail GET carries no reviewAttention key => BLIND, never "not covered"',
+    rows: [incidentRow()],
+    details: { 'i-3058': (() => { const d = incidentDetail(); delete d.reviewAttention; return d; })() },
+    interactions: { 'i-3058': [] },
+    expect: { verdict: 'BLIND' },
+  },
+  {
+    name: 'TRAP 3 — detail GET carries no activeRecoveryAction key => BLIND, never "no recovery"',
+    rows: [incidentRow()],
+    details: { 'i-3058': (() => { const d = incidentDetail(); delete d.activeRecoveryAction; return d; })() },
+    interactions: { 'i-3058': [] },
     expect: { verdict: 'BLIND' },
   },
   {
     name: 'TRAP 4 — a blocks entry with no status => BLIND',
     rows: [incidentRow()],
     details: { 'i-3058': incidentDetail({ blocks: [{ id: 'x', identifier: 'TRA-9' }] }) },
+    interactions: { 'i-3058': [] },
     expect: { verdict: 'BLIND' },
   },
   {
     name: 'TRAP 6 — detail GET fails => BLIND, never waved through',
     rows: [incidentRow()],
     details: {}, // getIssue throws on a missing id
+    interactions: { 'i-3058': [] },
     expect: { verdict: 'BLIND' },
   },
   {
-    name: 'BLIND outranks FLAGGED — one ungradeable row beats a real finding',
+    name: 'BLIND outranks DARK — one ungradeable row beats a real finding',
     rows: [incidentRow(), incidentRow({ id: 'i-2', identifier: 'TRA-2', status: 'zzz' })],
     details: { 'i-3058': incidentDetail() },
+    interactions: { 'i-3058': [] },
     expect: { verdict: 'BLIND' },
   },
   {
@@ -505,12 +719,14 @@ const CASES = [
       return rows;
     })(),
     details: { 'i-3058': incidentDetail() },
-    expect: { verdict: 'FLAGGED', findings: 1 },
+    interactions: { 'i-3058': [] },
+    expect: { verdict: 'DARK', findings: 1 },
   },
   {
     name: 'TRAP 5 — a page source that never returns a short page => BLIND, not DONE',
     rows: null, // signals the endless-page transport below
     details: {},
+    interactions: {},
     expect: { verdict: 'BLIND' },
   },
 ];
@@ -526,6 +742,10 @@ async function selftest() {
             getIssue: async (id) => {
               if (!(id in c.details)) throw new Error(`unexpected detail GET for ${id}`);
               return c.details[id];
+            },
+            getInteractions: async (id) => {
+              if (!(id in c.interactions)) throw new Error(`interactions route error for ${id}`);
+              return c.interactions[id];
             },
           };
     const res = await run(transport, { now: NOW });
@@ -577,6 +797,12 @@ async function main() {
     },
     getIssue: async (id) => {
       const r = await fetch(`${BASE}/api/issues/${id}`, auth);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    },
+    // TRA-4848 ask 2 — the ROUTE, never the issue payload (which omits the key).
+    getInteractions: async (id) => {
+      const r = await fetch(`${BASE}/api/issues/${id}/interactions`, auth);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       return r.json();
     },
