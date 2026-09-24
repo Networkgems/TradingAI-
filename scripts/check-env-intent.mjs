@@ -89,16 +89,31 @@
 // exits 0 MATCH — while the declaration the board actually made sits ungraded in
 // the repo. On a host pinned `autoDeploy=no` that lag is unbounded.
 //
-// That is not hypothetical. On 2026-09-23 `f183e601` declared `TRADIER_ENV:
-// sandbox` for the duration of the TRA-4750 stand-down of the REAL-MONEY option
-// book. It was never applied to the service env var and never deployed. The
-// serving build `7f290414` still published `intended:'production'`, the stored
-// value still WAS 'production', so both legs agreed and this script exited 0
-// with the env-list arm ON. The boot-arm — which reads the raw env var, not the
-// manifest — stayed eligible and at 16:42Z converged the operator back to
-// `mode=live` + `liveTradierEnvOptions=production`, reverting a board-ordered
-// stand-down. The only record was one `origin:boot` repair row that renders
-// identically to routine convergence. (TRA-4862, off TRA-4861.)
+// That is not hypothetical. The 2026-09-23 stand-down of the REAL-MONEY option
+// book (TRA-4750), dated from the Render tape on TRA-4861:
+//
+//   ~01:15Z  TRADIER_ENV is NOT 'production' — proven by behaviour, not by the
+//            manifest: a `mode=demo` + `liveTradierEnvOptions=sandbox` write
+//            REACHED DISK, which `applyLiveBrokerArm` only permits while
+//            `shouldBootArmLiveEquity` is false. The stand-down was IN FORCE.
+//   11:35Z   `f183e601` declares `TRADIER_ENV: sandbox` in this manifest —
+//            AFTER the fact, and never deployed. bqb1 is pinned autoDeploy=no.
+//   16:41Z   an `envUpdated:true` redeploy restores eligibility. No actor is
+//            recorded anywhere; `GET /env-vars` returns {key,value} only.
+//   16:42Z   the boot-arm — which reads the RAW env var, never the manifest —
+//            converges the operator back to `mode=live` + `production`. The
+//            only record is one `origin:boot` repair row that renders
+//            identically to routine convergence.
+//
+// So the stand-down held ~15.5h and was undone by an env write, not by a code
+// path. Both windows defeat the two wire-reading legs, in OPPOSITE directions:
+// after 16:41Z the wire intent, the stored value and the box all agree on
+// 'production' and the script exits 0 MATCH while the repo's declaration sits
+// ungraded. And during 11:35Z→16:41Z, with the stand-down IN FORCE and correctly
+// declared, those legs grade the stored 'sandbox' against the SUPERSEDED wire
+// intent 'production' and report the stand-down ITSELF as the defect — pointing
+// an operator at undoing it. Both are pinned as controls. (TRA-4862, off
+// TRA-4861; timeline corrected 2026-09-24 from the TRA-4861 log evidence.)
 //
 // So this leg grades THIS CHECKOUT's manifest — the declaration as written —
 // against both the build's intent and the STORED env value. A row whose repo
@@ -459,6 +474,13 @@ function gradeDeclared(declared, routeLevers, storedEnv) {
   const byRoute = new Map(routeLevers.map((l) => [l.key, l]));
   const seen = new Set();
   const mismatches = [];
+  // Keys where the STORED value already matches THIS CHECKOUT's declaration and
+  // only the build lags. The stored leg, which reads intent off the wire, sees
+  // the same keys as STAGED-against-the-superseded-intent and tells the operator
+  // to "fix the STORED value" — i.e. to revert the declared posture. That is the
+  // 2026-09-23 11:35Z→16:41Z inversion: it would have undone a board stand-down
+  // that was correctly applied. Collected here to re-point that remedy.
+  const appliedPendingDeploy = new Set();
 
   for (const row of declared) {
     if (typeof row?.key !== 'string' || typeof row?.intended !== 'string') {
@@ -483,11 +505,16 @@ function gradeDeclared(declared, routeLevers, storedEnv) {
     } else {
       const { effective: storedEffective, why } = resolveStored(row, storedEnv);
       if (why !== undefined) blind(`declared leg: ${why} (fail closed)`);
+      if (storedEffective === row.intended) appliedPendingDeploy.add(row.key);
       reach =
         storedEffective === row.intended
-          ? `The STORED env var already resolves '${storedEffective}', so the declaration DID reach the lever and only the build lags`
-          : `The STORED env var resolves '${storedEffective}', so the declaration NEVER REACHED THE LEVER either — ` +
-            'it stood nothing down (the TRA-4862 shape)';
+          ? `The STORED env var resolves '${storedEffective}', which AGREES with the declaration — the lever is at ` +
+            'the declared value AS OF THIS READ, and only the build lags'
+          : `The STORED env var resolves '${storedEffective}', which DISAGREES with the declaration — the lever is ` +
+            'NOT at the declared value AS OF THIS READ, so the declaration is standing nothing down right now ' +
+            '(the TRA-4862 shape). One read cannot tell NEVER APPLIED from APPLIED AND SINCE REVERTED: on ' +
+            '2026-09-23 it was the latter, in force ~15.5h and reverted by an unattributed env write. Same ' +
+            'remedy, different investigation — do not report a history this check did not measure';
     }
     mismatches.push(
       `${row.key}: DECLARED — this checkout's manifest intends '${row.intended}', the RUNNING BUILD grades against ` +
@@ -503,7 +530,7 @@ function gradeDeclared(declared, routeLevers, storedEnv) {
         'manifest without a deploy; it is still being graded against an intent nobody can now read.',
     );
   }
-  return mismatches;
+  return { mismatches, appliedPendingDeploy };
 }
 
 const { body, source } = await readDurabilityPayload();
@@ -523,8 +550,31 @@ const routeMismatches = intent.levers
   .map((l) => `${l.key}: IN FORCE — intended '${l.intended}', effective '${l.effective}' (key ${l.present ? `present, raw '${l.raw}'` : 'ABSENT — the default is deciding'})`);
 
 const arm = await gradeStoredEnv(intent.levers);
-const declaredMismatches = gradeDeclared(await readDeclaredIntent(), intent.levers, arm.storedEnv);
-const all = [...routeMismatches, ...arm.mismatches, ...declaredMismatches];
+const { mismatches: declaredMismatches, appliedPendingDeploy } = gradeDeclared(
+  await readDeclaredIntent(),
+  intent.levers,
+  arm.storedEnv,
+);
+
+// A STAGED row for a key the repo has ALREADY declared at its stored value is
+// not a staged drift — it is a correctly-applied declaration waiting on a
+// deploy. Left unqualified, its remedy ("fix the STORED value") is an
+// instruction to revert the declared posture; on 2026-09-23 that posture was a
+// board-ordered stand-down of the real-money option book. The row is annotated,
+// never suppressed: the change IS still un-baked, and hiding it would trade one
+// blind spot for another.
+const armMismatches = arm.mismatches.map((m) => {
+  const key = m.slice(0, m.indexOf(':'));
+  if (!appliedPendingDeploy.has(key) || !m.includes(': STAGED (')) return m;
+  return (
+    `${m} ⚠ BUT this checkout's manifest DECLARES that stored value: the env var matches the ` +
+    'DECLARATION and the wire intent above is the SUPERSEDED one, so the remedy is to DEPLOY the ' +
+    'declaration — NOT to "fix" the stored value, which would revert a declared posture (the ' +
+    'TRA-4862 inversion).'
+  );
+});
+
+const all = [...routeMismatches, ...armMismatches, ...declaredMismatches];
 
 console.log(`[env-intent] graded ${intent.levers.length} lever(s) from ${source}`);
 for (const l of intent.levers) {
@@ -541,6 +591,11 @@ if (all.length > 0) {
   console.error('[env-intent] A STAGED row is not in force YET. Fix the STORED value; do not wait for the');
   console.error('[env-intent] boot to prove it, and do not close it by editing the manifest to agree — for');
   console.error('[env-intent] ENABLE_OPTION_LIVE_OTM that row carries a board sign-off (TRA-4750 item 5).');
+  if (appliedPendingDeploy.size > 0) {
+    console.error('[env-intent] EXCEPT where a STAGED row is marked ⚠: there the stored value matches THIS');
+    console.error('[env-intent] CHECKOUT\'s declaration and the wire intent is superseded. Deploy the');
+    console.error('[env-intent] declaration. "Fixing" the stored value there reverts a declared posture.');
+  }
   if (declaredMismatches.length > 0) {
     console.error('[env-intent] A DECLARED row (TRA-4862) is a declaration this checkout made that the money host');
     console.error('[env-intent] is not being graded against. Declaring an intent is not applying it: the manifest');

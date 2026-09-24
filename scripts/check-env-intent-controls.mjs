@@ -184,13 +184,16 @@ const cases = [
 
   // ── TRA-4862: the declared leg's own controls ──────────────────────────────
   // Both legs above read `intended` off the wire, so a manifest edit that is
-  // COMMITTED BUT NOT DEPLOYED was invisible to both. ARM 0 below is the actual
-  // 2026-09-23 incident state, byte-for-byte; before this leg existed it exited
-  // 0 MATCH with the env-list arm ON.
+  // COMMITTED BUT NOT DEPLOYED was invisible to both. The 2026-09-23 stand-down
+  // defeated them in BOTH directions, and ARM 0 and ARM 0b are those two states
+  // byte-for-byte. (Timeline corrected 2026-09-24 off the TRA-4861 Render tape:
+  // the stand-down WAS applied to the env var and held ~15.5h, then an
+  // unattributed env write at 16:41Z reverted it. ARM 0 is the state AFTER that
+  // revert — the instant the boot-arm repaired.)
   {
-    name: 'ARM 0 (THE INCIDENT) — f183e601 declared TRADIER_ENV sandbox, never applied, never deployed ⇒ non-zero',
+    name: 'ARM 0 (THE INCIDENT, post-revert) — declared sandbox, lever back at production, never deployed ⇒ non-zero',
     // The serving build 7f290414 predates the declaration, so the wire still
-    // says 'production' and the stored value still IS 'production'. Legs 1 and 2
+    // says 'production' and the stored value is 'production' again. Legs 1 and 2
     // agree with each other and with the box. Only the repo disagrees.
     body: TRADIER_LIVE,
     stored: { ...STORED_LIVE, TRADIER_ENV: 'production' },
@@ -204,14 +207,27 @@ const cases = [
       'TRADIER_ENV: DECLARED',
       "manifest intends 'sandbox'",
       'NOT DEPLOYED',
-      'NEVER REACHED THE LEVER',
+      'which DISAGREES with the declaration',
+      'AS OF THIS READ',
       'the TRA-4862 shape',
+      // The remedy is the same either way, but the HISTORY is not measured here
+      // and must not be asserted: this state is reached both by a declaration
+      // that was never applied and by one that was applied and then reverted,
+      // and 09-23 was the second. Inventing the first from one sample is the
+      // attribution-from-silence failure the repo rule exists to stop.
+      'NEVER APPLIED from APPLIED AND SINCE REVERTED',
     ],
-    // The stand-down was never in force anywhere; it must not read as one.
+    // The stand-down is not in force AT THIS READ; it must not render as one.
     wantsNot: ['IN FORCE', 'STAGED ('],
   },
   {
-    name: 'declared but APPLIED — env already stood down, only the build lags ⇒ non-zero, and says so',
+    name: 'ARM 0b (THE INCIDENT, stand-down IN FORCE) — the pre-fix legs invert and accuse the stand-down itself',
+    // 2026-09-23 11:35Z→16:41Z: the declaration is correct AND applied; only the
+    // build lags. The two wire-reading legs grade the stored 'sandbox' against
+    // the SUPERSEDED wire intent 'production' and report the live stand-down as
+    // the defect — an operator following that reading undoes it. The declared
+    // leg must name the real fault (undeployed build) and must NOT claim the
+    // lever failed to take.
     body: TRADIER_LIVE,
     stored: { ...STORED_LIVE, TRADIER_ENV: 'sandbox' },
     declared: [
@@ -220,9 +236,19 @@ const cases = [
       { key: 'TRADIER_ENV', intended: 'sandbox' },
     ],
     want: 1,
-    wants: ['TRADIER_ENV: DECLARED', 'DID reach the lever and only the build lags'],
-    // A declaration that DID reach the lever is a different, milder failure.
-    wantsNot: ['NEVER REACHED THE LEVER'],
+    wants: [
+      'TRADIER_ENV: DECLARED',
+      'NOT DEPLOYED',
+      'which AGREES with the declaration',
+      'only the build lags',
+      // The STAGED row for the SAME key must not be left telling the operator to
+      // "fix the STORED value" — that is the instruction that undoes the
+      // stand-down. It is re-pointed at deploying the declaration.
+      'TRADIER_ENV: STAGED (',
+      'the remedy is to DEPLOY the declaration',
+      'the TRA-4862 inversion',
+    ],
+    wantsNot: ['which DISAGREES with the declaration', 'the TRA-4862 shape'],
   },
   {
     name: 'declared, env-list arm OFF — reach is UNGRADED and must say so, never assumed applied',
@@ -234,7 +260,7 @@ const cases = [
     ],
     want: 1,
     wants: ['TRADIER_ENV: DECLARED', 'NOT GRADED (env-list arm OFF)'],
-    wantsNot: ['DID reach the lever', 'NEVER REACHED THE LEVER'],
+    wantsNot: ['which AGREES with the declaration', 'which DISAGREES with the declaration'],
   },
   {
     name: 'declared — a lever ADDED to the manifest but not deployed ⇒ non-zero (nothing grades it on-box)',
