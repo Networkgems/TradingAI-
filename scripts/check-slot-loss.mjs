@@ -134,8 +134,15 @@ const DEFAULT_MAX_LATE_MIN = 6 * 60;
 const EARLY_TOLERANCE_MIN = 2;
 /** Below this, a single ragged slot is noise, not a finding. */
 const DEFAULT_MIN_LOST = 2;
-/** Page size asked of /runs. Full page + oldest-inside-window => BLIND. */
-const DEFAULT_RUN_LIMIT = 200;
+/**
+ * Page size asked of /runs. Full page + oldest-inside-window => BLIND.
+ *
+ * Set to 1000 based on a 2026-08-27 census: across all 280 routines (1197 run
+ * rows total, oldest 2026-05-02), the largest single history was 71 rows and no
+ * page came back full. Server-side retention appears unbounded as measured, so
+ * trap-3 BLIND paths only arm on truly pathological routines.
+ */
+const DEFAULT_RUN_LIMIT = 1000;
 /** Refuses to enumerate a pathological cron (e.g. `* * * * *` over 90 days). */
 const MAX_SLOTS_PER_TRIGGER = 20_000;
 
@@ -455,15 +462,40 @@ function gradeTrigger({ routine, trigger, runs, now, windowStartMs, graceMs, max
   const lostSlots = slots.filter((s) => !served.has(s));
   const suppressed = [...served.values()].filter((r) => SUPPRESSED_STATUSES.has(r.status)).length;
 
+  // Determine clamping status (TRA-4167).
+  let clampedBy = 'none';
+  let firstLostCensored = false;
+  if (lostSlots.length > 0) {
+    const firstLost = lostSlots[0];
+    const servedBeforeFirstLost = [...served.keys()].some((s) => s < firstLost);
+
+    // Birth clamp: the routine didn't exist before this window, and the first
+    // expected slot is at/near its birth.
+    if (fromMs === bornMs && bornMs > windowStartMs) {
+      clampedBy = 'birth';
+    }
+    // Window clamp: the window opened after birth, AND no slots were served
+    // before the first lost slot (i.e., we can't see the transition).
+    else if (fromMs === windowStartMs && windowStartMs > bornMs && !servedBeforeFirstLost) {
+      clampedBy = 'window';
+      firstLostCensored = true;
+    }
+    // Otherwise: observed transition (we can see slots served, then stopped).
+  }
+
   const state = lostSlots.length >= minLost ? 'SLOT_LOSS' : lostSlots.length > 0 ? 'RAGGED' : 'SERVED';
   return {
     ...base,
     state,
     windowStart: new Date(fromMs).toISOString(),
+    windowStartMs: fromMs,
+    bornMs,
     expected: slots.length,
     servedCount: served.size,
     suppressedCount: suppressed,
     lost: lostSlots.length,
+    clampedBy,
+    firstLostCensored,
     firstLostAt: lostSlots.length ? new Date(lostSlots[0]).toISOString() : null,
     lastLostAt: lostSlots.length ? new Date(lostSlots[lostSlots.length - 1]).toISOString() : null,
     lastServedAt: served.size ? new Date(Math.max(...served.keys())).toISOString() : null,
@@ -571,14 +603,27 @@ function renderReport(result, names = {}) {
 
   if (result.findings?.length) {
     out.push('');
-    out.push(`  SLOT LOSS — ${result.findings.length} trigger(s) stopped serving their cron:`);
+    out.push(`  SLOT LOSS (at --days=${result.days}) — ${result.findings.length} trigger(s) stopped serving their cron:`);
     for (const f of [...result.findings].sort((a, b) => b.lost - a.lost)) {
       out.push(
         `    ${f.routineShort}  LOST ${f.lost}/${f.expected}  ` +
           `last served ${f.lastServedAt ?? 'NEVER'}  owner ${who(f.assigneeAgentId)}`,
       );
       out.push(`        cron ${JSON.stringify(f.cronExpression)} ${f.timezone ?? '(UTC assumed)'} — ${f.routineTitle}`);
-      out.push(`        first lost ${f.firstLostAt} · last lost ${f.lastLostAt} · nextRunAt claims ${f.nextRunAt}`);
+
+      // Render firstLostAt based on clamp status (TRA-4167).
+      let firstLostLine;
+      if (f.clampedBy === 'window' && f.firstLostCensored) {
+        firstLostLine = `        first lost >= ${f.firstLostAt}  (WINDOW EDGE at --days=${result.days} -- true onset is EARLIER; widen --days)`;
+      } else if (f.clampedBy === 'birth') {
+        const bornAt = f.bornMs ? new Date(f.bornMs).toISOString() : 'unknown';
+        firstLostLine = `        first lost ${f.firstLostAt}  (SINCE BIRTH ${bornAt})`;
+      } else {
+        // Observed transition: served, then stopped.
+        const context = f.lastServedAt ? ` (observed: served through ${f.lastServedAt})` : '';
+        firstLostLine = `        first lost ${f.firstLostAt}${context}`;
+      }
+      out.push(`${firstLostLine} · last lost ${f.lastLostAt} · nextRunAt claims ${f.nextRunAt}`);
     }
   }
 
@@ -831,6 +876,64 @@ const CONTROLS = [
     expect: 'BLIND',
     note: 'population empty => BLIND',
     build: () => fakeTransport([dailyRoutine({ status: 'paused' })], {}),
+  },
+  {
+    name: 'TRA-4167 outcome CENSORED — window-clamped, no pre-loss slots served',
+    expect: 'SLOT_LOSS',
+    build: () => {
+      const r = dailyRoutine({ createdAt: '2026-06-01T00:00:00Z' });
+      r.triggers[0].createdAt = '2026-06-01T00:00:00Z';
+      // Losing every slot for 30 days; graded at --days=14.
+      return fakeTransport([r], { [r.id]: [] });
+    },
+    assert: (r) => {
+      const f = r.findings[0];
+      if (!f) return 'expected a finding';
+      if (f.clampedBy !== 'window') return `expected clampedBy='window', got ${f.clampedBy}`;
+      if (!f.firstLostCensored) return 'expected firstLostCensored=true';
+      return true;
+    },
+  },
+  {
+    name: 'TRA-4167 outcome UNCENSORED — observed onset with last served slot',
+    expect: 'SLOT_LOSS',
+    build: () => {
+      const r = dailyRoutine({ createdAt: '2026-06-01T00:00:00Z' });
+      r.triggers[0].createdAt = '2026-06-01T00:00:00Z';
+      // Served daily for 20 days, then silent for 10 days; graded at --days=14.
+      const runs = [];
+      for (let d = 10; d <= 25; d += 1) {
+        const at = Date.parse('2026-08-26T13:00:00Z') - d * DAY;
+        runs.push({ triggerId: 'tttttttt-0000-0000-0000-000000000001', status: 'completed', triggeredAt: iso(at) });
+      }
+      return fakeTransport([r], { [r.id]: runs });
+    },
+    assert: (r) => {
+      const f = r.findings[0];
+      if (!f) return 'expected a finding';
+      if (f.clampedBy !== 'none') return `expected clampedBy='none' (observed), got ${f.clampedBy}`;
+      if (f.firstLostCensored) return 'expected firstLostCensored=false for an observed onset';
+      if (!f.lastServedAt) return 'expected lastServedAt to be populated for an observed onset';
+      return true;
+    },
+  },
+  {
+    name: 'TRA-4167 outcome BIRTH-CLAMPED — born inside window, losing from first slot',
+    expect: 'SLOT_LOSS',
+    build: () => {
+      const r = dailyRoutine({ createdAt: '2026-08-24T00:00:00Z' });
+      r.triggers[0].createdAt = '2026-08-24T00:00:00Z';
+      // Born 2026-08-24, expected slots at 13:00Z on 08-24 and 08-25, never served; graded at --days=14.
+      // This gives 2 lost slots, meeting the minLost=2 threshold.
+      return fakeTransport([r], { [r.id]: [] });
+    },
+    assert: (r) => {
+      const f = r.findings[0];
+      if (!f) return 'expected a finding';
+      if (f.clampedBy !== 'birth') return `expected clampedBy='birth', got ${f.clampedBy}`;
+      if (f.firstLostCensored) return 'expected firstLostCensored=false for a birth clamp';
+      return true;
+    },
   },
 ];
 
