@@ -35,11 +35,12 @@ import { deriveEntrySpreadPct } from '@trading-app/shared';
  * fold — and so any reader holding these fields can price a row.
  */
 export interface CrossedPricingRow {
-  outcome: 'OPEN' | 'WIN' | 'LOSS' | 'SCRATCH';
+  outcome: 'OPEN' | 'WIN' | 'LOSS' | 'SCRATCH' | 'UNMEASURED'; // TRA-4857
   structure: string;
   contracts?: number;
   atRiskUsd: number;
-  realizedPnlUsd?: number;
+  /** TRA-4857: can be `null` for unpriced reconcile closes. */
+  realizedPnlUsd?: number | null;
   /** TRA-3990 stamp — broker-submit-superseded on live rows; preferred. */
   entryBidAtOpen?: number | null;
   entryAskAtOpen?: number | null;

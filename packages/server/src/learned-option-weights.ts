@@ -161,15 +161,30 @@ function statFor(
   priorRate: number | null,
   p: LearnedWeightsParams,
 ): OptionLearnedStat {
-  const resolvedRows = rows.filter((r) => r.outcome !== 'OPEN');
+  // TRA-4857 — exclude UNMEASURED (unpriced reconcile closes) alongside OPEN.
+  // A negative filter admits new members by default, so an unpriced close would
+  // silently land in the fold with its fabricated-0 R intact.
+  const resolvedRows = rows.filter((r) => r.outcome !== 'OPEN' && r.outcome !== 'UNMEASURED');
   const resolved = resolvedRows.length;
   const win = resolvedRows.filter((r) => r.outcome === 'WIN').length;
   const loss = resolvedRows.filter((r) => r.outcome === 'LOSS').length;
   const scratch = resolvedRows.filter((r) => r.outcome === 'SCRATCH').length;
   const winRate = resolved > 0 ? win / resolved : null;
+  // TRA-4857 — don't coerce null realizedR to 0. A null here is a defect (the
+  // row passed the outcome filter yet carries no R), but coercing it re-creates
+  // the fabricated-0 inside the exact mean the null was created to protect. Let
+  // it NaN the fold and surface loud, never silently flatten the mean.
   const avgR =
     resolved > 0
-      ? resolvedRows.reduce((acc, r) => acc + (r.realizedR ?? 0), 0) / resolved
+      ? resolvedRows.reduce((acc, r) => {
+          const rVal = r.realizedR;
+          if (typeof rVal !== 'number') {
+            throw new Error(
+              `learned-option-weights: resolved row ${r.id} (outcome ${r.outcome}) has non-number realizedR`,
+            );
+          }
+          return acc + rVal;
+        }, 0) / resolved
       : null;
 
   const confident = resolved >= p.minSamples;

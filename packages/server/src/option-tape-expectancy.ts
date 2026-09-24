@@ -289,6 +289,13 @@ export interface TapeExpectancyCell {
   deltaTo: number;
   /** Closed rows in the cell, on the model-facing basis. */
   n: number;
+  /**
+   * TRA-4857 — unpriced closes dropped from THIS CELL: `outcome: 'UNMEASURED'`
+   * (broker_reconcile with no fill to price against). Distinct from
+   * `rowsDroppedUnresolved` (still OPEN, or no finite realizedR on a resolved
+   * row). A cell carrying unpriced closes cannot present as fully measured.
+   */
+  droppedUnpricedCloses: number;
   /** Mean realized R in the GATE's R (`realizedR / 0.25`) — same unit as the bar. */
   meanR_gate: number;
   /** Sample SD (n−1) in gate R; null at n < 2. */
@@ -324,6 +331,13 @@ export interface TapeExpectancyTable {
   rowsUsed: number;
   /** Dropped: still open, or no finite `realizedR`. */
   rowsDroppedUnresolved: number;
+  /**
+   * TRA-4857 — dropped unpriced closes: `outcome: 'UNMEASURED'`
+   * (broker_reconcile with no fill to price against). Distinct from
+   * `rowsDroppedUnresolved` (still OPEN) and reported separately so the
+   * "closed but unpriceable" shape is visible, not conflated.
+   */
+  rowsDroppedUnpriced: number;
   /** Dropped: `|delta|` non-finite or > 1 — never folded into a real band. */
   rowsDroppedUnknownDelta: number;
   /** Dropped: structure has no valid premium→gate R conversion (credit spreads). */
@@ -385,6 +399,12 @@ interface CellAccumulator {
   unattributed: number;
   fromTs: number | null;
   toTs: number | null;
+  /**
+   * TRA-4857 — unpriced closes dropped from this cell before accumulation:
+   * `outcome: 'UNMEASURED'`. Tracked per cell so a cell carrying unpriced
+   * closes cannot present as fully measured.
+   */
+  droppedUnpriced: number;
 }
 
 /** Mean / sample-SD / SE / lower 95% bound over one value list. Shared by both columns. */
@@ -433,6 +453,7 @@ export function buildTapeExpectancyTable(
       : null;
 
   let rowsDroppedUnresolved = 0;
+  let rowsDroppedUnpriced = 0;
   let rowsDroppedUnknownDelta = 0;
   let rowsDroppedNoGateBasis = 0;
   let rowsDroppedOutOfWindow = 0;
@@ -444,6 +465,40 @@ export function buildTapeExpectancyTable(
   const cells = new Map<string, CellAccumulator>();
 
   for (const r of rows) {
+    // TRA-4857 — unpriced closes (broker_reconcile with no fill) are dropped
+    // BEFORE the generic unresolved check and counted separately, so "closed
+    // but unpriceable" is visible, not conflated with "still OPEN". Tracked per
+    // cell so a cell carrying unpriced closes cannot present as fully measured.
+    if (r.outcome === 'UNMEASURED') {
+      rowsDroppedUnpriced += 1;
+      // Track per cell: need to know which cell this row would have landed in.
+      // Compute bucket and structure, then increment the cell's unpriced counter.
+      if (GATE_R_BASIS_STRUCTURES.has(r.structure)) {
+        const bucket = tapeExpectancyBucket(r.entryDelta as number);
+        if (bucket !== null) {
+          const structure = canonicalTapeStructure(r.structure);
+          const key = tapeExpectancyCellKey(structure, bucket);
+          let cell = cells.get(key);
+          if (!cell) {
+            cell = {
+              structure,
+              bucket,
+              values: [],
+              grossOfCross: [],
+              byMode: {},
+              desk: 0,
+              unattributed: 0,
+              fromTs: null,
+              toTs: null,
+              droppedUnpriced: 0,
+            };
+            cells.set(key, cell);
+          }
+          cell.droppedUnpriced += 1;
+        }
+      }
+      continue;
+    }
     if (r.outcome === 'OPEN' || typeof r.realizedR !== 'number' || !Number.isFinite(r.realizedR)) {
       rowsDroppedUnresolved += 1;
       continue;
@@ -480,6 +535,7 @@ export function buildTapeExpectancyTable(
         unattributed: 0,
         fromTs: null,
         toTs: null,
+        droppedUnpriced: 0, // TRA-4857
       };
       cells.set(key, cell);
     }
@@ -540,6 +596,7 @@ export function buildTapeExpectancyTable(
         deltaFrom: band.from,
         deltaTo: band.to,
         n,
+        droppedUnpricedCloses: acc.droppedUnpriced, // TRA-4857
         meanR_gate: mean,
         sdR_gate: sd,
         seR_gate: se,
@@ -577,6 +634,7 @@ export function buildTapeExpectancyTable(
     rowsConsidered: rows.length,
     rowsUsed,
     rowsDroppedUnresolved,
+    rowsDroppedUnpriced, // TRA-4857
     rowsDroppedUnknownDelta,
     rowsDroppedNoGateBasis,
     rowsDroppedOutOfWindow,

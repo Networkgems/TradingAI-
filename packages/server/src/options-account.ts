@@ -7634,7 +7634,13 @@ export class PaperOptionsAccount {
   ): void {
     if (!isOptionTradeJournalEnabled()) return;
     const id = position.id;
-    const realizedPnlUsd = position.pnl ?? 0;
+    // TRA-4857 — an unpriced reconcile close (broker flat, no fill to price
+    // against) writes honest nulls, not a fabricated 0. Key on the ABSENCE OF A
+    // BROKER FILL, never on `exitReason` alone: a `broker_reconcile` that DID
+    // find a fill (row `a2f9c8cd`, `NOK261002C00010500`, brokerOrderId
+    // 144350660, realizedPnlUsd -$22.50 LOSS) must still write the truthful P&L.
+    const unpricedClose = exitReason === 'broker_reconcile' && brokerOrderId === null;
+    const realizedPnlUsd = unpricedClose ? null : (position.pnl ?? 0);
     const closeTs = position.closedAt ?? Date.now();
     this.journalWrites = this.journalWrites
       .then(async () => {
@@ -7660,7 +7666,14 @@ export class PaperOptionsAccount {
           });
           return;
         }
-        const realizedR = rec.atRiskUsd > 0 ? realizedPnlUsd / rec.atRiskUsd : 0;
+        // TRA-4857 — null when the close had no fill to price against. Paired
+        // with `outcome: 'UNMEASURED'`.
+        const realizedR =
+          realizedPnlUsd === null
+            ? null
+            : rec.atRiskUsd > 0
+              ? realizedPnlUsd / rec.atRiskUsd
+              : 0;
         const holdDays = Math.max(0, (closeTs - rec.openTs) / MS_PER_DAY);
         // TRA-4020 (R4) — MFE + the opening-range refusal record, off the
         // position. Absent stays absent (a row that never ticked has no peak
@@ -7690,7 +7703,10 @@ export class PaperOptionsAccount {
         });
         const close = {
           closeTs,
-          outcome: outcomeForR(realizedR),
+          // TRA-4857 — `UNMEASURED` when no fill to price against, paired with
+          // `realizedPnlUsd: null` / `realizedR: null`. Only `outcomeForR` when
+          // the R is actually measured.
+          outcome: realizedR === null ? 'UNMEASURED' : outcomeForR(realizedR),
           realizedPnlUsd,
           realizedR,
           exitReason,
@@ -7886,10 +7902,16 @@ export class PaperOptionsAccount {
             const own = await getOptionTradeJournalRecord(id);
             if (!own) return;
             // The row's own basis is the denominator — not the sibling's.
-            const ownR = own.atRiskUsd > 0 ? realizedPnlUsd / own.atRiskUsd : 0;
+            // TRA-4857 — null when the close had no fill to price against.
+            const ownR =
+              realizedPnlUsd === null
+                ? null
+                : own.atRiskUsd > 0
+                  ? realizedPnlUsd / own.atRiskUsd
+                  : 0;
             const ownClose = {
               ...close,
-              outcome: outcomeForR(ownR),
+              outcome: ownR === null ? 'UNMEASURED' : outcomeForR(ownR),
               realizedR: ownR,
               holdDays: Math.max(0, (closeTs - own.openTs) / MS_PER_DAY),
             };

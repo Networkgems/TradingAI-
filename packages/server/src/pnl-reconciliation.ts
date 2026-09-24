@@ -3215,7 +3215,8 @@ export function staleTailSessions(
 export function foldJournalClosesByEtDay(
   rows: ReadonlyArray<{
     closeTs?: number;
-    realizedPnlUsd?: number;
+    /** TRA-4857: can be `null` for unpriced reconcile closes. */
+    realizedPnlUsd?: number | null;
     partials?: ReadonlyArray<{ ts: number; realizedPnlUsd: number }>;
   }>,
   etDate: (ts: number) => string,

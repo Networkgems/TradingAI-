@@ -136,7 +136,7 @@ export function isUnattributedImportRow(row: { structure: string }): boolean {
 export type SentimentIcBand = 'strong' | 'weak' | 'none' | null;
 
 /** Realized verdict for a closed option trade. */
-export type OptionTradeOutcome = 'WIN' | 'LOSS' | 'SCRATCH';
+export type OptionTradeOutcome = 'WIN' | 'LOSS' | 'SCRATCH' | 'UNMEASURED';
 
 /**
  * The setup we acted on, captured at OPEN while the conditions are still live.
@@ -486,10 +486,18 @@ export interface OptionTradeJournalClose {
   /** ms-epoch the position closed. */
   closeTs: number;
   outcome: OptionTradeOutcome;
-  /** Signed realized P&L, USD. */
-  realizedPnlUsd: number;
-  /** realizedPnlUsd / atRiskUsd — the comparable R-multiple. */
-  realizedR: number;
+  /**
+   * Signed realized P&L, USD. TRA-4857: `null` when the close had no fill to
+   * price against (broker_reconcile without a broker order). The null is the
+   * honest verdict "unmeasured", not a fabricated 0.
+   */
+  realizedPnlUsd: number | null;
+  /**
+   * realizedPnlUsd / atRiskUsd — the comparable R-multiple. TRA-4857: `null`
+   * when the close had no fill to price against. Paired with
+   * `outcome: 'UNMEASURED'`.
+   */
+  realizedR: number | null;
   /** Why the book closed it (`tp1`, `stop`, `time_stop`, `expired`, …). */
   exitReason: string;
   /** Calendar days held (open→close). */
@@ -797,8 +805,10 @@ export interface OptionTradeJournalPartial {
 export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
   outcome: OptionTradeOutcome | 'OPEN';
   closeTs?: number;
-  realizedPnlUsd?: number;
-  realizedR?: number;
+  /** TRA-4857: can be `null` for unpriced reconcile closes. */
+  realizedPnlUsd?: number | null;
+  /** TRA-4857: can be `null` for unpriced reconcile closes. */
+  realizedR?: number | null;
   exitReason?: string;
   holdDays?: number;
   /** TRA-1600 (D) — measured exit-side slippage USD, folded from the CLOSE row. */
@@ -1022,7 +1032,8 @@ export interface OptionTradeRefusedCloseSupersede {
   refusedAt: number;
   closeTs: number;
   exitReason: string;
-  realizedPnlUsd: number;
+  /** TRA-4857: can be `null` for unpriced reconcile closes. */
+  realizedPnlUsd: number | null;
   brokerOrderId: string | number | null;
   /** The close the row KEPT — the one the refusal protected. */
   retainedCloseTs: number | null;
