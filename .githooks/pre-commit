@@ -1,0 +1,13 @@
+#!/bin/sh
+# TRA-4398 — refuse a commit whose index carries a revert of a landed commit.
+#
+# This checkout is SHARED between concurrent Paperclip runs (project_primary — by
+# design). On 2026-09-08 another run left 19 files staged at a pre-TRA-4241 base
+# (+163/−1582 against HEAD); `git commit -a` at that moment would have silently
+# reverted a landed fix on the real-money host's deploy branch. `git status` and
+# `git diff --cached --stat` cannot see this state — only content comparison can.
+#
+# The check refuses when a staged MODIFIED path is byte-identical to a strictly
+# older ancestor of HEAD for that path. Intentional revert: GIT_ALLOW_STAGED_REVERT=1.
+# Fails closed: "could not check" is exit 3, never a pass.
+exec node scripts/check-staged-revert.mjs --hook

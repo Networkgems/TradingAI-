@@ -23,7 +23,7 @@ import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const HOOKS_PATH = '.githooks';
-const HOOKS = ['pre-push'];
+const HOOKS = ['pre-push', 'pre-commit'];
 
 const checkOnly = process.argv.includes('--check');
 

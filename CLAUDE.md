@@ -156,6 +156,49 @@ pnpm check:deploy-build --verify-hook
 This is a gate in front of `main`, not in front of the host. It is **not** a deploy executor: the
 `autoDeploy=no` pin (TRA-1653/TRA-1665) below stands.
 
+## Concurrent runs share this checkout. The index is not yours.
+
+Paperclip allocates **one checkout per project** (`PAPERCLIP_WORKSPACE_STRATEGY=project_primary` —
+by design, not a misconfiguration; TRA-4398 AC1, measured 2026-09-24). So `git add`,
+`git commit --amend` and `git rebase` all read shared mutable state — the index, the working tree —
+that another live run can change **between two of your commands**, with no lock and no signal. On
+2026-09-08 that pushed a non-building commit to `origin/main` (`f66ab888`, repaired by `c7b452c0`):
+a concurrent run left 19 files staged at a pre-TRA-4241 base (+163/−1582 against `HEAD`), and an
+index reset landed between a verified `git add` and the `--amend` that followed, so the amend
+committed `HEAD`'s copies of 7 of the 9 files. Every individual command was correct.
+
+**The safe commit verb in this checkout is path-limited:**
+
+```bash
+git commit -m "..." -- <your paths>   # reads the WORKING TREE for those paths — safe
+```
+
+- `git commit --amend` and bare `git commit` read the **index**, which another run can reset or
+  restage under you — not safe. (During a path-limited commit git builds a private temporary index,
+  which is why that verb is immune.)
+- `git commit -a` stages **everything tracked**, so it can ship another run's staged revert of a
+  landed commit — the shape that would have silently undone TRA-4241 on the money host.
+
+**Verify by content, not by stat.** The broken `--amend` commit showed a completely healthy
+`git show --stat` — right file list, right line counts. After every commit here, assert a marker
+that exists only in your new content:
+
+```bash
+pnpm check:commit-content --rev=<sha> --expect=<marker>:<file> [--expect=...]
+#   0 PRESENT · 1 ABSENT · 2 usage · 3 BLIND;  BLIND > ABSENT > PRESENT
+```
+
+**The staged-revert shape fails loud at commit time.** `.githooks/pre-commit` (armed by the same
+`prepare` → `pnpm hooks:install` as pre-push) runs `pnpm check:staged-revert`: it refuses when a
+staged MODIFIED path is byte-identical to a strictly older ancestor of `HEAD` for that path — a
+revert of landed work you did not announce. Intentional revert: `GIT_ALLOW_STAGED_REVERT=1`.
+Fails closed (BLIND=3, the `check:deploy-build` convention). It cannot see the index-reset shape
+(that content matches `HEAD`, not an ancestor) — the path-limited verb above is the defence there.
+
+Deliberately **not** the remedy: serialising runs onto the checkout with a lock, or an unattended
+merge/push executor — both re-create what TRA-3529/TRA-3533 and the `autoDeploy` pin already ruled
+out. Detection plus a safe verb, nothing more. (TRA-4398.)
+
 ## Merging does not deploy. Deploying is a command you run.
 
 `tradingai-bqb1` has `autoDeploy=no` / `autoDeployTrigger=off` — **on purpose** (the launch-window
