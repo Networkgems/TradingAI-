@@ -13,7 +13,9 @@ import {
   clearSandboxStrategyJournal,
   sandboxStrategyLogPath,
   SIGNAL_TO_SUBMIT_BUDGET_MS,
+  legQuoteAgeMs,
   type SandboxStrategyRecord,
+  type SandboxStrategyLeg,
 } from './sandbox-strategy-journal.js';
 import type {
   SmokeContractResult,
@@ -56,6 +58,13 @@ function makeLeg(
     fill?: number | null;
     signalToSubmitMs?: number;
     filled?: boolean;
+    /**
+     * TRA-4869 — the broker's own quote stamp. Defaults to `tSignal` (age 0 — a quote
+     * snapped at the instant of decision). Pass an EARLIER ms epoch for a stale book, or
+     * `null` for a payload that carried no stamp at all. Overridable because a fixture that
+     * can only produce age 0 makes every assertion about the age vacuous.
+     */
+    quoteTimeMs?: number | null;
   } = {},
 ): SmokeLegResult {
   const bid = opts.bid ?? 1.0;
@@ -89,7 +98,7 @@ function makeLeg(
       mid,
       spread,
       spreadBps,
-      quoteTimeMs: tSignal,
+      quoteTimeMs: opts.quoteTimeMs === undefined ? tSignal : opts.quoteTimeMs,
       tSignal,
     },
     timeline: { tSignal, tSubmit, tAck, tFill },
@@ -534,5 +543,165 @@ describe('summarizeCallerLiveness slot grid (TRA-4810)', () => {
       Date.UTC(2026, 10, 6, 15, 59),
     );
     expect(before.expectedSlotsSinceLastAppend).toBe(0);
+  });
+});
+
+// ── decision-quote AGE (TRA-4869) ────────────────────────────────────────────
+//
+// The incident: on 2026-09-24 the 11:00 ET slot fired at 16:58:45Z — inside RTH, book
+// genuinely two-sided — and all four structures priced off a quote whose `quoteTimeMs`
+// was 904–907 s older than its own `tSignal`. Rows 81–84 recorded the PRICES and dropped
+// the AGE, so a row snapped against a live book and a row snapped against a quarter-hour-old
+// book were byte-identical on disk and on the health payload.
+//
+// These tests are written so that each one has a FAILING state that is not the passing
+// state: every `toBeNull()` on an age is paired with a case that measures a real number,
+// because a fold that returned `null` unconditionally would satisfy a null-only suite.
+
+describe('decision-quote age (TRA-4869)', () => {
+  beforeEach(() => {
+    hydrateSandboxStrategyJournalFromDisk(dir, NOW);
+  });
+
+  it('records the measured age: replays the 906 s in-RTH stale snap from rows 81-84', () => {
+    const stale = makeLeg('buy', { fill: 1.06, quoteTimeMs: NOW - 906_000 });
+    const rec = recordFromContractResult(
+      'long_call',
+      makeResult('call', { entry: stale }),
+      ET_DAY,
+      NOW,
+    )!;
+    expect(rec.legs[0].quoteAgeMs).toBe(906_000);
+    // …and the discriminator actually discriminates: the fresh exit leg on the SAME record
+    // measures 0. Before this field both legs serialized identically.
+    expect(rec.legs[1].quoteAgeMs).toBe(0);
+  });
+
+  it('records a MISSING broker stamp as null, never 0 — and 0 stays reachable', () => {
+    const noStamp = makeLeg('buy', { fill: 1.06, quoteTimeMs: null });
+    const rec = recordFromContractResult(
+      'long_call',
+      makeResult('call', { entry: noStamp }),
+      ET_DAY,
+      NOW,
+    )!;
+    expect(rec.legs[0].quoteAgeMs).toBeNull();
+    expect(rec.legs[0].quoteAgeMs).not.toBe(0);
+    // The pass/fail pair: an identical leg WITH a stamp at tSignal measures exactly 0, so
+    // the null above is the absence of a measurement and not the fold's only answer.
+    const stamped = recordFromContractResult(
+      'long_call',
+      makeResult('call', { entry: makeLeg('buy', { fill: 1.06 }) }),
+      ET_DAY,
+      NOW,
+    )!;
+    expect(stamped.legs[0].quoteAgeMs).toBe(0);
+  });
+
+  it('records a broker stamp AHEAD of our clock as a negative age, not a clamped 0', () => {
+    const ahead = makeLeg('buy', { fill: 1.06, quoteTimeMs: NOW + 1_500 });
+    const rec = recordFromContractResult(
+      'long_call',
+      makeResult('call', { entry: ahead }),
+      ET_DAY,
+      NOW,
+    )!;
+    // Clock skew is a finding ABOUT the timestamp; laundering it into 0 would assert the
+    // quote was current, which is exactly the claim this field exists to stop faking.
+    expect(rec.legs[0].quoteAgeMs).toBe(-1_500);
+  });
+
+  it('summary folds max + unknown across legs: the worst age wins, unknowns are COUNTED', () => {
+    // long_call: one 906 s leg + one fresh leg ⇒ max 906 000, nothing unknown.
+    recordSandboxStrategy(
+      recordFromContractResult(
+        'long_call',
+        makeResult('call', { entry: makeLeg('buy', { fill: 1.06, quoteTimeMs: NOW - 906_000 }) }),
+        ET_DAY,
+        NOW,
+      )!,
+    );
+    // long_put: one unstamped leg + one 12 s leg ⇒ max 12 000 with unknown 1. The max is
+    // NOT dragged to 0 by the unstamped leg.
+    recordSandboxStrategy(
+      recordFromContractResult(
+        'long_put',
+        makeResult('put', {
+          entry: makeLeg('buy', { fill: 1.06, quoteTimeMs: null }),
+          exit: makeLeg('sell', { fill: 1.04, quoteTimeMs: NOW - 12_000 }),
+        }),
+        ET_DAY,
+        NOW,
+      )!,
+    );
+    const s = summarizeSandboxStrategyJournal().strategies;
+    expect(s.long_call.maxQuoteAgeMs).toBe(906_000);
+    expect(s.long_call.quoteAgeMeasured).toBe(2);
+    expect(s.long_call.quoteAgeUnknown).toBe(0);
+    expect(s.long_put.maxQuoteAgeMs).toBe(12_000);
+    expect(s.long_put.quoteAgeMeasured).toBe(1);
+    expect(s.long_put.quoteAgeUnknown).toBe(1);
+  });
+
+  it('a LEGACY row (key ABSENT on disk) folds to null/unknown — no backfill, never 0', () => {
+    // A row exactly as rows 1-84 deserialize: the `quoteAgeMs` key does not exist. `null`
+    // and ABSENT are invisible to `== null`, which is why this fixture is hand-built JSONL
+    // rather than produced by the mapper.
+    const legacyLeg = {
+      side: 'buy',
+      optionSymbol: 'SPY260724C00500000',
+      submitTs: NOW,
+      fillTs: NOW + 500,
+      signalToSubmitMs: 40,
+      requestedPx: 1.05,
+      bid: 1.0,
+      ask: 1.1,
+      fillPx: 1.06,
+      slippageBps: 95.24,
+      spreadAtSubmitPct: 9.52,
+      withinSpread: true,
+    };
+    expect('quoteAgeMs' in legacyLeg).toBe(false); // the fixture's own premise
+    const legacyRow = {
+      ts: NOW - 1000,
+      etDay: ET_DAY,
+      strategy: 'long_call',
+      underlying: 'SPY',
+      ok: true,
+      realizedRoundTripUsd: -2.3,
+      legs: [legacyLeg, { ...legacyLeg, side: 'sell', fillPx: 1.04 }],
+    };
+    writeFileSync(sandboxStrategyLogPath(dir), JSON.stringify(legacyRow) + '\n', 'utf8');
+    hydrateSandboxStrategyJournalFromDisk(dir, NOW);
+
+    const s = summarizeSandboxStrategyJournal().strategies.long_call;
+    expect(s.total).toBe(1); // the row itself survived hydration — we are reading it, not dropping it
+    expect(s.maxQuoteAgeMs).toBeNull();
+    expect(s.maxQuoteAgeMs).not.toBe(0);
+    expect(s.quoteAgeMeasured).toBe(0);
+    expect(s.quoteAgeUnknown).toBe(2);
+    // MUTATION of this control: plant an explicit `quoteAgeMs: 0` on one leg and the fold
+    // reports a MEASURED 0. So the null above is produced by the absent key, not by a fold
+    // that can only answer null — and "measured 0 ms" and "never measured" are now
+    // distinguishable on this surface, which is the whole defect.
+    writeFileSync(
+      sandboxStrategyLogPath(dir),
+      JSON.stringify({ ...legacyRow, legs: [{ ...legacyLeg, quoteAgeMs: 0 }, legacyRow.legs[1]] }) + '\n',
+      'utf8',
+    );
+    hydrateSandboxStrategyJournalFromDisk(dir, NOW);
+    const mutated = summarizeSandboxStrategyJournal().strategies.long_call;
+    expect(mutated.maxQuoteAgeMs).toBe(0);
+    expect(mutated.quoteAgeMeasured).toBe(1);
+    expect(mutated.quoteAgeUnknown).toBe(1);
+  });
+
+  it('legQuoteAgeMs folds a non-finite on-disk value to unknown, not to a number', () => {
+    // A torn/hand-edited row: JSON has no NaN literal, but `null`-round-tripped Infinity and
+    // a string both arrive here as non-numbers. None of them may read as an age.
+    for (const planted of [NaN, Infinity, 'stale', undefined, null]) {
+      expect(legQuoteAgeMs({ quoteAgeMs: planted } as unknown as SandboxStrategyLeg)).toBeNull();
+    }
+    expect(legQuoteAgeMs({ quoteAgeMs: 906_000 } as unknown as SandboxStrategyLeg)).toBe(906_000);
   });
 });

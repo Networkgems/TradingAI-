@@ -102,6 +102,54 @@ export interface SandboxStrategyLeg {
   bid: number | null;
   /** Decision-quote ASK at submit time; `null` when the snap had no usable ask. TRA-2283 D2. */
   ask: number | null;
+  /**
+   * TRA-4869 — **how OLD the decision quote was when we priced off it**: `tSignal −
+   * quoteTimeMs`, in ms. `null` when the broker payload carried no usable timestamp —
+   * **never `0`**, matching this module's null discipline everywhere else (a missing
+   * broker timestamp is not a fresh quote).
+   *
+   * ── WHY THIS FIELD EXISTS ──────────────────────────────────────────────────
+   * Until this field, the journal recorded a decision quote's PRICES and dropped its
+   * AGE one line before the write. Measured 2026-09-24 (leaf TRA-4858, live SHA
+   * `d26f58b9`): the 11:00 ET slot fired at 16:58:45Z — **inside RTH, book genuinely
+   * two-sided** (spreads 29.7–61.0 bps, no null-quote row) — and all four structures'
+   * `decisionQuote.quoteTimeMs` was **904–907 s (~15.1 min) older than its own
+   * `tSignal`**, four different contracts, clustered inside 3 s. Those became rows
+   * 81–84, byte-identical on disk and on `/api/health/sandbox-strategy-journal` to rows
+   * snapped against a live book. The healthy case and the degraded case printed the same
+   * bytes.
+   *
+   * It matters because TRA-2283 D2 persists `bid`/`ask` precisely so the marketable(bid)
+   * MTM gate can measure its half-spread off the QUOTED BOOK rather than off a
+   * broker-simulated fill — the quoted book is the only falsifiable input this venue
+   * gives us. `fillRealism: "SANDBOX_SIMULATED"` warns a reader about the FILLS; nothing
+   * warned them about the QUOTES. Any per-structure floor read off `spreadAtSubmitPct`
+   * or the marketable-bid half-spread inherited an unmeasured, unbounded quote age.
+   *
+   * ⚠️ **NO THRESHOLD IS APPLIED HERE, deliberately** (TRA-4869 / same order as TRA-2045):
+   * record the number first; whoever sets the acceptance bar (graduation is QuantTrader's
+   * call) decides what age is disqualifying.
+   *
+   * ⚠️ **NOT MEASURED — what this age is an age OF.** `quoteTimeMs` is sourced from
+   * Tradier `trade_date` (`packages/engine/src/tradier/options-client.ts`). If that is
+   * the LAST-TRADE time rather than the bid/ask time, every "quote age" in this system is
+   * a last-trade age, and an illiquid contract with a perfectly live two-sided book would
+   * read arbitrarily stale. The 904–907 s cluster cannot discriminate the two: for SPY
+   * ATM weeklies a 15-min-delayed feed and a last-trade stamp coincide. Settling it needs
+   * one RTH `/markets/quotes` on a deep-OTM zero-volume contract (and a check for
+   * `bid_date`/`ask_date`, which this repo parses nowhere) — TRA-2045's question, not a
+   * reason to keep dropping the number.
+   *
+   * ⚠️ Records written before this field render `quoteAgeMs` ABSENT (not null). There is
+   * **no backfill** — the age at a past snap is not recoverable (same rule TRA-3997
+   * applied to `admission`). Read it through {@link legQuoteAgeMs}, which folds absent and
+   * null to the same `null`, never to `0`.
+   *
+   * A NEGATIVE value is recorded as measured, not clamped: it means the broker stamp ran
+   * ahead of our clock, which is itself a finding about the timestamp and must not be
+   * laundered into a "fresh quote" 0.
+   */
+  quoteAgeMs: number | null;
   /** Broker avg fill price; `null` if the leg never filled AT A USABLE PRICE (see mapLeg). */
   fillPx: number | null;
   /** `(fill − mid)/mid × 10_000`; `null` when either side is unprovable (NOT 0). */
@@ -167,6 +215,25 @@ function usableFillPrice(avgFillPrice: number | null): number | null {
     : null;
 }
 
+/**
+ * TRA-4869 — read a leg's quote age on the READ side, where three distinct on-disk shapes
+ * must all fold to "unknown":
+ *
+ * 1. the key is ABSENT — every row written before this field shipped (rows 1–84+ on bqb1);
+ * 2. the key is `null` — the writer ran but the broker payload had no usable stamp;
+ * 3. the key holds a non-finite number — a torn/hand-edited row.
+ *
+ * All three answer `null`. **Never `0`**: a `0` here would be read as "quote was current at
+ * the instant of decision", which is exactly the claim we cannot make about a row whose age
+ * was never recorded. This mirrors `quoteKeyPresence` in
+ * `marketable-mtm-forward-validation.ts`, which had to be written for the same reason after
+ * TRA-2283 D2 added `bid`/`ask`: the TYPE says `number | null`, the DISK says otherwise.
+ */
+export function legQuoteAgeMs(leg: SandboxStrategyLeg): number | null {
+  const v = (leg as Partial<SandboxStrategyLeg>).quoteAgeMs;
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
 function mapLeg(leg: SmokeLegResult): SandboxStrategyLeg {
   const { decisionQuote, timeline, metrics } = leg;
   const mid = decisionQuote.mid;
@@ -178,6 +245,12 @@ function mapLeg(leg: SmokeLegResult): SandboxStrategyLeg {
     fillMinusMid != null && mid != null && mid > 0 ? (fillMinusMid / mid) * 10_000 : null;
   const spreadAtSubmitPct =
     decisionQuote.spreadBps != null ? decisionQuote.spreadBps / 100 : null;
+  // TRA-4869 — the age is in hand HERE (both timestamps are on `decisionQuote`) and was
+  // being dropped. A null broker stamp yields a null age, never 0.
+  const quoteAgeMs =
+    decisionQuote.quoteTimeMs != null && Number.isFinite(decisionQuote.quoteTimeMs)
+      ? decisionQuote.tSignal - decisionQuote.quoteTimeMs
+      : null;
   return {
     side: leg.side,
     optionSymbol: null, // filled by the record mapper (the symbol lives on the contract, not the leg)
@@ -187,6 +260,7 @@ function mapLeg(leg: SmokeLegResult): SandboxStrategyLeg {
     requestedPx: mid,
     bid: decisionQuote.bid,
     ask: decisionQuote.ask,
+    quoteAgeMs,
     fillPx,
     slippageBps: slippageBps != null ? Math.round(slippageBps * 100) / 100 : null,
     spreadAtSubmitPct: spreadAtSubmitPct != null ? Math.round(spreadAtSubmitPct * 10000) / 10000 : null,
@@ -369,6 +443,29 @@ export interface SandboxStrategySummaryEntry {
   maxSignalToSubmitMs: number | null;
   /** Mean slippage in bps across legs that recorded a finite slippage; `null` if none. */
   meanSlippageBps: number | null;
+  /**
+   * TRA-4869 — worst (max) {@link SandboxStrategyLeg.quoteAgeMs} across every leg of this
+   * strategy's records that MEASURED one. `null` ⇔ `quoteAgeMeasured === 0`: not one leg on
+   * this strategy is age-readable.
+   *
+   * ⚠️ `null` here does **not** mean "quotes were fresh". Read it beside
+   * {@link quoteAgeUnknown} / {@link quoteAgeMeasured}: `maxQuoteAgeMs: null,
+   * quoteAgeUnknown: 84` says the age is UNKNOWN on all 84 legs, and must never be read the
+   * same as a measured `maxQuoteAgeMs: 0`, which is the affirmative claim that every quote
+   * was current. That collapse is the defect this row exists to remove, so it is not
+   * reintroduced in the fold.
+   */
+  maxQuoteAgeMs: number | null;
+  /** TRA-4869 — legs whose quote age WAS measurable (the denominator of `maxQuoteAgeMs`). */
+  quoteAgeMeasured: number;
+  /**
+   * TRA-4869 — legs carrying NO readable quote age: pre-TRA-4869 rows (key absent) plus
+   * legs whose broker payload had no usable timestamp. Published so a reader can tell
+   * "measured, and the worst was 0 ms" from "never measured", and so the pre-fix corpus
+   * stays visibly unmeasured rather than being reconstructed (no backfill — the age at a
+   * past snap is not recoverable).
+   */
+  quoteAgeUnknown: number;
   /** ms epoch of the most recent record; `null` if none. */
   lastTs: number | null;
   /** `ok` of the most recent record; `null` if none. */
@@ -663,6 +760,9 @@ export function summarizeSandboxStrategyJournal(): SandboxStrategyJournalSummary
     let maxSignalToSubmitMs: number | null = null;
     let slipSum = 0;
     let slipN = 0;
+    let maxQuoteAgeMs: number | null = null;
+    let quoteAgeMeasured = 0;
+    let quoteAgeUnknown = 0;
     for (const rec of list) {
       if (rec.ok) {
         clean += 1;
@@ -676,6 +776,14 @@ export function summarizeSandboxStrategyJournal(): SandboxStrategyJournalSummary
           slipSum += leg.slippageBps;
           slipN += 1;
         }
+        // TRA-4869 — absent/null/non-finite all count as UNKNOWN and leave the max alone.
+        const age = legQuoteAgeMs(leg);
+        if (age == null) {
+          quoteAgeUnknown += 1;
+        } else {
+          quoteAgeMeasured += 1;
+          if (maxQuoteAgeMs == null || age > maxQuoteAgeMs) maxQuoteAgeMs = age;
+        }
       }
     }
     // list follows insertion order (append + hydrate both push chronologically).
@@ -687,6 +795,9 @@ export function summarizeSandboxStrategyJournal(): SandboxStrategyJournalSummary
       acceptanceMet: cleanWithinLatencyBudget >= 1,
       maxSignalToSubmitMs,
       meanSlippageBps: slipN > 0 ? Math.round((slipSum / slipN) * 100) / 100 : null,
+      maxQuoteAgeMs,
+      quoteAgeMeasured,
+      quoteAgeUnknown,
       lastTs: last?.ts ?? null,
       lastOk: last?.ok ?? null,
     };

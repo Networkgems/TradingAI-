@@ -42,6 +42,7 @@ function leg(over: Partial<SandboxStrategyLeg>): SandboxStrategyLeg {
     requestedPx: 1,
     bid: null,
     ask: null,
+    quoteAgeMs: null, // TRA-4869 — not what this suite measures; overridable via `over`.
     fillPx: 1,
     slippageBps: null,
     spreadAtSubmitPct: null,
