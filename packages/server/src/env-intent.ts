@@ -25,6 +25,56 @@
 //
 // ⚠️ This manifest GRADES; it never ARMS. Changing an `intended` value here
 // changes what the instrument reports, not what the process does.
+//
+// ── TRA-4862 — THE INTENT IS BINDING, AND IT BINDS THE OPERATOR ──────────────
+// CTO ruling, 2026-09-24. A row here is not documentation. When this manifest
+// declares a value for a production lever, the live service env var MUST be
+// made to agree, in the same change. What the ruling does NOT do is make this
+// file arm anything — see below for why — so the obligation lands on the human
+// who edits it, and the checker's job is to refuse to go green until they have
+// discharged it.
+//
+// Editing a row is therefore TWO acts, never one:
+//   1. the edit here (the audit trail), and
+//   2. the single-key `PUT /env-vars/{key}` upsert on the service, then
+//      `render-redeploy --commit=<sha>` to ship the edit (TRA-3724).
+// Do half and you have declared a posture the box is not in.
+//
+// That is not a style note. On 2026-09-23 `f183e601` declared `TRADIER_ENV:
+// sandbox` for the duration of the TRA-4750 stand-down of the REAL-MONEY option
+// book. Act 2 never happened. `shouldBootArmLiveEquity` reads the raw env var,
+// which still said `production`, so the boot-arm stayed eligible and at 16:42Z
+// converged the operator back to `mode=live` + `liveTradierEnvOptions=
+// production` — reverting a board-ordered stand-down, with one `origin:boot`
+// repair row as the entire record. The stand-down stood nothing down.
+//
+// WHY THE FIX IS NOT "MAKE THIS FILE ARM THE LEVER". Three reasons, and the
+// third is the one that settles it:
+//   • A repo file that writes the money host's live broker routing is a
+//     standing automated write to production. That is the `autoDeploy=no` pin
+//     (TRA-1653/TRA-1665) and the TRA-3529/TRA-3533 no-unattended-executor
+//     ruling, both still in force; this would re-create both through the back
+//     door.
+//   • It would collapse the two terms into one. The whole point of TRA-4474 is
+//     that `effective` alone cannot be disagreed with. An arming manifest makes
+//     intent and effect the same fact again, and the instrument goes blind in
+//     exactly the way it was built not to.
+//   • It would not have prevented THIS event anyway. This file is COMPILED INTO
+//     THE BUILD, so an arming row could only take effect at the deploy that
+//     shipped it — and `f183e601` was never deployed. The failure was the gap
+//     between declaring and applying, and an arming manifest has that same gap.
+//
+// So the remedy is detection, and it had to be able to see a declaration THE
+// BOX HAS NEVER HEARD OF. `check:env-intent` used to take every `intended` off
+// the wire from the manifest the RUNNING BUILD published — one source of truth,
+// deliberately, but it meant a committed-but-undeployed edit was invisible to
+// every leg it had. On a host pinned `autoDeploy=no` that blind window has no
+// upper bound. Its third leg now reads THIS CHECKOUT's manifest (source and
+// compiled build, which must agree or it reads BLIND) and grades it against
+// both the build's intent and the stored env value, so "declared but not
+// deployed" and "declared but never applied" are each named, loudly, as their
+// own finding. Control ARM 0 in `check:env-intent:controls` is the 09-23 state
+// byte-for-byte; it exits 0 on the pre-fix checker and 1 now.
 
 import { resolveDurabilityPolicy } from './durability.js';
 import { redactTradierEnvLabel } from './tradier-env-label.js';

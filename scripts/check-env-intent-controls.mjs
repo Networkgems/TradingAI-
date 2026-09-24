@@ -16,6 +16,14 @@ import { join } from 'node:path';
 const CHECKER = join(import.meta.dirname, 'check-env-intent.mjs');
 const dir = mkdtempSync(join(tmpdir(), 'env-intent-controls-'));
 
+// TRA-4862 — the declared leg is ALWAYS ON and fails closed, so every control
+// below must feed it a declaration too; otherwise each one would be graded
+// against this checkout's real manifest (7 levers) and go red for a reason the
+// control is not about. Unless a case says otherwise, the declaration is
+// exactly what its route fixture publishes — i.e. "the build is current", which
+// is the state every pre-TRA-4862 control implicitly assumed.
+const declaredFromBody = (body) => (body?.envIntent?.levers ?? []).map((l) => ({ key: l.key, intended: l.intended }));
+
 const lever = (key, intended, effective, present = true, raw = undefined) => ({
   key,
   intended,
@@ -84,6 +92,12 @@ const storedList = (pairs) => Object.entries(pairs).map(([key, value]) => ({ key
 // The live stored set on bqb1, measured 2026-09-22 (93 keys; only the graded
 // ones matter — the rest cannot change any verdict).
 const STORED_LIVE = { DURABILITY_POLICY: 'refuse', ENABLE_OPTION_LIVE_OTM: 'false' };
+
+// TRA-4862 — bqb1 as the serving build `7f290414` published it on 2026-09-23,
+// the boot that reverted the stand-down: TRADIER_ENV graded, intended and
+// effective 'production', every lever matching. Nothing on this wire is wrong;
+// the declaration that disagreed with it was sitting undeployed in the repo.
+const TRADIER_LIVE = withExtraLever(GOOD, lever('TRADIER_ENV', 'production', 'production', true, 'production'));
 
 const cases = [
   { name: 'CLEAN — armed as ruled', body: GOOD, want: 0 },
@@ -167,6 +181,95 @@ const cases = [
     want: 3,
     wants: ['local resolver disagrees with the shipped one'],
   },
+
+  // ── TRA-4862: the declared leg's own controls ──────────────────────────────
+  // Both legs above read `intended` off the wire, so a manifest edit that is
+  // COMMITTED BUT NOT DEPLOYED was invisible to both. ARM 0 below is the actual
+  // 2026-09-23 incident state, byte-for-byte; before this leg existed it exited
+  // 0 MATCH with the env-list arm ON.
+  {
+    name: 'ARM 0 (THE INCIDENT) — f183e601 declared TRADIER_ENV sandbox, never applied, never deployed ⇒ non-zero',
+    // The serving build 7f290414 predates the declaration, so the wire still
+    // says 'production' and the stored value still IS 'production'. Legs 1 and 2
+    // agree with each other and with the box. Only the repo disagrees.
+    body: TRADIER_LIVE,
+    stored: { ...STORED_LIVE, TRADIER_ENV: 'production' },
+    declared: [
+      { key: 'DURABILITY_POLICY', intended: 'refuse' },
+      { key: 'ENABLE_OPTION_LIVE_OTM', intended: 'off' },
+      { key: 'TRADIER_ENV', intended: 'sandbox' },
+    ],
+    want: 1,
+    wants: [
+      'TRADIER_ENV: DECLARED',
+      "manifest intends 'sandbox'",
+      'NOT DEPLOYED',
+      'NEVER REACHED THE LEVER',
+      'the TRA-4862 shape',
+    ],
+    // The stand-down was never in force anywhere; it must not read as one.
+    wantsNot: ['IN FORCE', 'STAGED ('],
+  },
+  {
+    name: 'declared but APPLIED — env already stood down, only the build lags ⇒ non-zero, and says so',
+    body: TRADIER_LIVE,
+    stored: { ...STORED_LIVE, TRADIER_ENV: 'sandbox' },
+    declared: [
+      { key: 'DURABILITY_POLICY', intended: 'refuse' },
+      { key: 'ENABLE_OPTION_LIVE_OTM', intended: 'off' },
+      { key: 'TRADIER_ENV', intended: 'sandbox' },
+    ],
+    want: 1,
+    wants: ['TRADIER_ENV: DECLARED', 'DID reach the lever and only the build lags'],
+    // A declaration that DID reach the lever is a different, milder failure.
+    wantsNot: ['NEVER REACHED THE LEVER'],
+  },
+  {
+    name: 'declared, env-list arm OFF — reach is UNGRADED and must say so, never assumed applied',
+    body: TRADIER_LIVE,
+    declared: [
+      { key: 'DURABILITY_POLICY', intended: 'refuse' },
+      { key: 'ENABLE_OPTION_LIVE_OTM', intended: 'off' },
+      { key: 'TRADIER_ENV', intended: 'sandbox' },
+    ],
+    want: 1,
+    wants: ['TRADIER_ENV: DECLARED', 'NOT GRADED (env-list arm OFF)'],
+    wantsNot: ['DID reach the lever', 'NEVER REACHED THE LEVER'],
+  },
+  {
+    name: 'declared — a lever ADDED to the manifest but not deployed ⇒ non-zero (nothing grades it on-box)',
+    body: GOOD,
+    declared: [...declaredFromBody(GOOD), { key: 'ENABLE_OPTION_LIVE_DIRECTIONAL', intended: 'off' }],
+    want: 1,
+    wants: ['ENABLE_OPTION_LIVE_DIRECTIONAL: DECLARED', 'does not publish this lever at all'],
+  },
+  {
+    name: 'declared — a lever DROPPED from the manifest but still deployed ⇒ non-zero',
+    body: GOOD,
+    declared: declaredFromBody(GOOD).filter((r) => r.key !== 'ENABLE_ORDER_QUOTE_GUARD'),
+    want: 1,
+    wants: ['ENABLE_ORDER_QUOTE_GUARD: DECLARED', 'no longer declares it'],
+  },
+  {
+    name: 'declared leg is ON in the MATCH line — a pass must not render like the pre-TRA-4862 one',
+    body: GOOD,
+    want: 0,
+    wants: ['declared leg: ON', 'DECLARES exactly what the running build grades against'],
+  },
+  {
+    name: 'BLIND — the declaration is unreadable (fail closed; an unread declaration is not an absent one)',
+    body: GOOD,
+    declaredRaw: '{"not":"an array"}',
+    want: 3,
+    wants: ['not a non-empty array'],
+  },
+  {
+    name: 'BLIND — a declared row is not {key,intended}',
+    body: GOOD,
+    declaredRaw: '[{"key":"DURABILITY_POLICY"}]',
+    want: 3,
+    wants: ['is not {key:string,intended:string}'],
+  },
 ];
 
 let failed = 0;
@@ -179,6 +282,11 @@ for (const [i, c] of cases.entries()) {
     writeFileSync(sf, JSON.stringify(c.storedRaw ?? storedList(c.stored)));
     args.push(`--stored-fixture=${sf}`);
   }
+  // TRA-4862 — always fed: the declared leg has no off switch, so a control that
+  // omitted it would be graded against this checkout's real manifest.
+  const df = join(dir, `c${i}-declared.json`);
+  writeFileSync(df, c.declaredRaw ?? JSON.stringify(c.declared ?? declaredFromBody(c.body)));
+  args.push(`--declared-fixture=${df}`);
   const r = spawnSync(process.execPath, args, {
     encoding: 'utf8',
     // The env-list arm must never reach the REAL service from a control: a real

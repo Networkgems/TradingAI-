@@ -122,7 +122,17 @@ jobs:
       # ENABLE_OPTION_LIVE_OTM=1 awaiting a boot) must exit 1, while an ABSENT key on
       # an `intended:'off'` lever must stay exit 0, because a permanently red gate gets
       # muted and a muted gate and a deleted gate end in the same place.
-      - name: env-intent checker controls (TRA-4474/TRA-4803)
+      #
+      # TRA-4862 adds ARM 0, which is the 2026-09-23 incident byte-for-byte: `f183e601`
+      # declared `TRADIER_ENV: sandbox` for the TRA-4750 stand-down of the real-money
+      # option book, and it was neither applied to the env var nor deployed. Both of the
+      # older legs read `intended` OFF THE WIRE, from the build that predated the
+      # declaration, so they agreed with each other and with the box and the checker
+      # exited 0 MATCH with the Render arm ON. The boot-arm (which reads the raw env var,
+      # not the manifest) stayed eligible and reverted the stand-down at 16:42Z. The
+      # declared leg grades THIS CHECKOUT's manifest, so that state is now exit 1 — and
+      # ARM 0 must keep failing on the pre-fix code or this control is decorative.
+      - name: env-intent checker controls (TRA-4474/TRA-4803/TRA-4862)
         run: pnpm check:env-intent:controls
 
       # TRA-4145 — the strand drain's 43 write-path controls, which until now ran only

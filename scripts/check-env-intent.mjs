@@ -26,22 +26,26 @@
 //                  matches its manifest intent. The optional Render env-list arm
 //                  (below), when ON, also resolved every lever's STORED value to
 //                  its manifest intent.
-//   1  MISMATCH  — at least one lever disagrees with the manifest: either IN
-//                  FORCE (the route leg: effective != intended) or STAGED (the
-//                  env-list leg: the stored set resolves to something else, so
-//                  the next boot bakes in a value the manifest does not intend).
-//                  Both are named, and a STAGED row says so in as many words so
-//                  it can never be read as an in-force arm.
+//   1  MISMATCH  — at least one lever disagrees with the manifest, in any of
+//                  three ways: IN FORCE (the route leg: effective != intended),
+//                  STAGED (the env-list leg: the stored set resolves to
+//                  something else, so the next boot bakes in a value the
+//                  manifest does not intend), or DECLARED (the declared leg: THIS
+//                  CHECKOUT's manifest intends something the running build does
+//                  not even grade against). Each is named in as many words, so a
+//                  STAGED or DECLARED row can never be read as an in-force arm.
 //   2  usage     — unrecognized argument (nothing was graded).
 //   3  BLIND     — could not read a leg: route unreachable/non-200, payload has
 //                  no `envIntent` (the running build predates TRA-4474),
 //                  `applies` is not true (the box cannot prove it is the
-//                  production host the manifest is about), or — with the
-//                  env-list arm ON — a stored value that cannot be RESOLVED
-//                  (unknown lever, non-string value, or a local resolver that
-//                  disagrees with the shipped one). "Could not check" is
-//                  never "matches" — an old build reading green here would be
-//                  the exact silent state this exists to kill.
+//                  production host the manifest is about), the declared leg
+//                  could not read THIS CHECKOUT's manifest (or its source and
+//                  its build disagree), or — with the env-list arm ON — a stored
+//                  value that cannot be RESOLVED (unknown lever, non-string
+//                  value, or a local resolver that disagrees with the shipped
+//                  one). "Could not check" is never "matches" — an old build
+//                  reading green here would be the exact silent state this
+//                  exists to kill.
 //
 // ── The optional env-list arm ────────────────────────────────────────────────
 // The route proves what the PROCESS resolved at its last boot. An env write that
@@ -75,8 +79,50 @@
 //     live box. A permanently red gate gets muted, and a muted gate and a
 //     deleted gate end in the same place.
 //   • An unresolvable stored value is BLIND, never MATCH.
+//
+// ── The DECLARED leg (TRA-4862) — always on, fails closed ────────────────────
+// Both legs above take each lever's `intended` OFF THE WIRE, from the manifest
+// the RUNNING BUILD published. That was deliberate (one source of truth for the
+// intents, no second copy to drift) and it left a hole the width of the deploy
+// lag: a manifest edit that is COMMITTED BUT NOT DEPLOYED is invisible to both.
+// The checker reads the old build's intent, finds the env still matches it, and
+// exits 0 MATCH — while the declaration the board actually made sits ungraded in
+// the repo. On a host pinned `autoDeploy=no` that lag is unbounded.
+//
+// That is not hypothetical. On 2026-09-23 `f183e601` declared `TRADIER_ENV:
+// sandbox` for the duration of the TRA-4750 stand-down of the REAL-MONEY option
+// book. It was never applied to the service env var and never deployed. The
+// serving build `7f290414` still published `intended:'production'`, the stored
+// value still WAS 'production', so both legs agreed and this script exited 0
+// with the env-list arm ON. The boot-arm — which reads the raw env var, not the
+// manifest — stayed eligible and at 16:42Z converged the operator back to
+// `mode=live` + `liveTradierEnvOptions=production`, reverting a board-ordered
+// stand-down. The only record was one `origin:boot` repair row that renders
+// identically to routine convergence. (TRA-4862, off TRA-4861.)
+//
+// So this leg grades THIS CHECKOUT's manifest — the declaration as written —
+// against both the build's intent and the STORED env value. A row whose repo
+// intent the running build does not grade is a DECLARED finding, and when the
+// env-list arm is ON it also says whether the declaration ever reached the
+// lever, which is the question the incident turned on.
+//
+// It carries no copy of the intents either: it READS them, twice, from the two
+// artifacts that must agree — the TS source (`PRODUCTION_ENV_INTENT` in
+// packages/server/src/env-intent.ts, the thing a human edits and a reviewer
+// reads) and the compiled `packages/server/dist/env-intent.js`. If they
+// disagree the build is stale ⇒ BLIND, never a grade; a stale `dist` silently
+// grading a superseded declaration would rebuild this exact bug one layer down.
+//
+// ⚠️ This leg still GRADES; like the manifest itself it never ARMS. A repo file
+// that could write the money host's live broker routing is a standing automated
+// write to production, which is the `autoDeploy=no` posture (TRA-1653/TRA-1665)
+// and the TRA-3529/TRA-3533 no-unattended-executor ruling, both still in force.
+// Intent is binding ON THE OPERATOR — declare it, apply it with the single-key
+// upsert, and let this leg refuse to go green until you have.
 
 import { readFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+import { join } from 'node:path';
 
 const DEFAULT_HOST = 'https://tradingai-bqb1.onrender.com';
 // bqb1. The Render service `name` is different ("TradingAI-"), so resolve by id,
@@ -88,7 +134,7 @@ const valOf = (name) => {
   const hit = argv.find((a) => a.startsWith(`${name}=`));
   return hit ? hit.slice(name.length + 1) : undefined;
 };
-const KNOWN = ['--host', '--fixture', '--timeout-ms', '--render-service', '--stored-fixture'];
+const KNOWN = ['--host', '--fixture', '--timeout-ms', '--render-service', '--stored-fixture', '--declared-fixture'];
 for (const a of argv) {
   const name = a.includes('=') ? a.slice(0, a.indexOf('=')) : a;
   if (!KNOWN.includes(name)) {
@@ -101,6 +147,7 @@ for (const a of argv) {
 const HOST = (valOf('--host') ?? DEFAULT_HOST).replace(/\/+$/, '');
 const FIXTURE = valOf('--fixture');
 const STORED_FIXTURE = valOf('--stored-fixture');
+const DECLARED_FIXTURE = valOf('--declared-fixture');
 const TIMEOUT_MS = Number(valOf('--timeout-ms') ?? 25_000);
 const SERVICE_ID = valOf('--render-service') ?? process.env.RENDER_SERVICE_ID ?? DEFAULT_SERVICE_ID;
 
@@ -286,7 +333,7 @@ async function readStoredEnv() {
 
 async function gradeStoredEnv(levers) {
   const read = await readStoredEnv();
-  if (!read.armed) return { armed: false, mismatches: [], notes: [] };
+  if (!read.armed) return { armed: false, mismatches: [], notes: [], storedEnv: null };
   const storedEnv = Object.create(null);
   for (const r of Array.isArray(read.rows) ? read.rows : []) {
     const k = r?.envVar?.key ?? r?.key;
@@ -325,7 +372,138 @@ async function gradeStoredEnv(levers) {
         `boot need not be a deploy (TRA-2203/TRA-2261), so this is as actionable as a wipe.`,
     );
   }
-  return { armed: true, mismatches, notes };
+  return { armed: true, mismatches, notes, storedEnv };
+}
+
+// ── Leg 3 (TRA-4862): THIS CHECKOUT's declared intent ────────────────────────
+// Read, never copied — and read twice, from the two artifacts that must agree.
+
+const REPO_ROOT = join(import.meta.dirname, '..');
+const MANIFEST_TS = join(REPO_ROOT, 'packages/server/src/env-intent.ts');
+const MANIFEST_DIST = join(REPO_ROOT, 'packages/server/dist/env-intent.js');
+
+/**
+ * The `key`/`intended` pairs as WRITTEN in the TS manifest. Every row in
+ * `PRODUCTION_ENV_INTENT` opens `key: '<K>',` immediately followed by
+ * `intended: '<V>',` — the shape a reviewer reads. This parse is never trusted
+ * alone: it is cross-checked against the compiled artifact below, so a row that
+ * stops matching this shape shows up as a source/build disagreement (BLIND),
+ * not as a silently dropped lever.
+ */
+function declaredFromSource() {
+  let src;
+  try {
+    src = readFileSync(MANIFEST_TS, 'utf8');
+  } catch (e) {
+    blind(`declared leg could not read ${MANIFEST_TS}: ${e.message} (fail closed — an unread declaration is not an absent one)`);
+  }
+  const start = src.indexOf('export const PRODUCTION_ENV_INTENT');
+  if (start < 0) blind(`declared leg: ${MANIFEST_TS} has no 'export const PRODUCTION_ENV_INTENT' — the manifest moved or was renamed`);
+  const rows = [];
+  const re = /\bkey:\s*'([^']+)',\s*\n\s*intended:\s*'([^']+)',/g;
+  re.lastIndex = start;
+  for (let m = re.exec(src); m !== null; m = re.exec(src)) rows.push({ key: m[1], intended: m[2] });
+  return rows;
+}
+
+/** The same pairs as COMPILED — the values the running server would publish from this checkout. */
+async function declaredFromBuild() {
+  let mod;
+  try {
+    mod = await import(pathToFileURL(MANIFEST_DIST).href);
+  } catch (e) {
+    blind(
+      `declared leg could not import ${MANIFEST_DIST}: ${e.message} — this checkout has no compiled manifest ` +
+        'to cross-check its source against. Run `pnpm build` (never `tsc <file>`, CLAUDE.md) and re-run.',
+    );
+  }
+  const rows = mod?.PRODUCTION_ENV_INTENT;
+  if (!Array.isArray(rows) || rows.length === 0) blind(`declared leg: ${MANIFEST_DIST} exports no non-empty PRODUCTION_ENV_INTENT`);
+  return rows.map((r) => ({ key: r?.key, intended: r?.intended }));
+}
+
+/** This checkout's declaration, or BLIND. Source and build must agree exactly. */
+async function readDeclaredIntent() {
+  if (DECLARED_FIXTURE) {
+    console.log(`[env-intent] declared leg: ON (fixture ${DECLARED_FIXTURE} — NOT this checkout's manifest)`);
+    let rows;
+    try {
+      rows = JSON.parse(readFileSync(DECLARED_FIXTURE, 'utf8'));
+    } catch (e) {
+      blind(`--declared-fixture unreadable: ${e.message}`);
+    }
+    if (!Array.isArray(rows) || rows.length === 0) blind('--declared-fixture is not a non-empty array of {key,intended}');
+    return rows;
+  }
+  const [fromSrc, fromBuild] = [declaredFromSource(), await declaredFromBuild()];
+  const render = (rows) => rows.map((r) => `${r.key}=${r.intended}`).sort().join(', ');
+  if (render(fromSrc) !== render(fromBuild)) {
+    blind(
+      'declared leg: packages/server/src/env-intent.ts and packages/server/dist/env-intent.js declare DIFFERENT ' +
+        `intents — source [${render(fromSrc)}] vs build [${render(fromBuild)}]. The compiled manifest is stale ` +
+        '(run `pnpm build`), or a manifest row no longer matches the shape this leg parses. Grading a stale ' +
+        'declaration would rebuild the TRA-4862 bug one layer down, so: BLIND.',
+    );
+  }
+  console.log(`[env-intent] declared leg: ON (${fromSrc.length} lever(s) from this checkout, source == build)`);
+  return fromBuild;
+}
+
+/**
+ * The DECLARED grade. `intended` on the wire is the RUNNING BUILD's declaration;
+ * `intended` here is THIS CHECKOUT's. Where they differ, the build is grading
+ * against a superseded declaration and the thing the board actually declared is
+ * ungraded on-box — regardless of what the env holds.
+ */
+function gradeDeclared(declared, routeLevers, storedEnv) {
+  const byRoute = new Map(routeLevers.map((l) => [l.key, l]));
+  const seen = new Set();
+  const mismatches = [];
+
+  for (const row of declared) {
+    if (typeof row?.key !== 'string' || typeof row?.intended !== 'string') {
+      blind(`declared leg: a manifest row is not {key:string,intended:string} (${JSON.stringify(row)})`);
+    }
+    seen.add(row.key);
+    const onWire = byRoute.get(row.key);
+    if (onWire === undefined) {
+      mismatches.push(
+        `${row.key}: DECLARED — this checkout's manifest intends '${row.intended}', but the RUNNING BUILD does not ` +
+          'publish this lever at all, so nothing grades it on-box. The declaration is NOT DEPLOYED.',
+      );
+      continue;
+    }
+    if (onWire.intended === row.intended) continue;
+    // The declaration moved and the build has not caught up. Say what the lever
+    // actually holds where we can, because "not deployed" and "not applied" are
+    // different failures with different remedies, and the incident was both.
+    let reach;
+    if (storedEnv === null) {
+      reach = 'Whether the declaration reached the live env var is NOT GRADED (env-list arm OFF)';
+    } else {
+      const { effective: storedEffective, why } = resolveStored(row, storedEnv);
+      if (why !== undefined) blind(`declared leg: ${why} (fail closed)`);
+      reach =
+        storedEffective === row.intended
+          ? `The STORED env var already resolves '${storedEffective}', so the declaration DID reach the lever and only the build lags`
+          : `The STORED env var resolves '${storedEffective}', so the declaration NEVER REACHED THE LEVER either — ` +
+            'it stood nothing down (the TRA-4862 shape)';
+    }
+    mismatches.push(
+      `${row.key}: DECLARED — this checkout's manifest intends '${row.intended}', the RUNNING BUILD grades against ` +
+        `'${onWire.intended}' (effective '${onWire.effective}'). The declaration is NOT DEPLOYED. ${reach}.`,
+    );
+  }
+
+  for (const l of routeLevers) {
+    if (seen.has(l.key)) continue;
+    mismatches.push(
+      `${l.key}: DECLARED — the RUNNING BUILD still grades this lever (intended '${l.intended}', effective ` +
+        `'${l.effective}'), but this checkout's manifest no longer declares it. A lever was dropped from the ` +
+        'manifest without a deploy; it is still being graded against an intent nobody can now read.',
+    );
+  }
+  return mismatches;
 }
 
 const { body, source } = await readDurabilityPayload();
@@ -345,7 +523,8 @@ const routeMismatches = intent.levers
   .map((l) => `${l.key}: IN FORCE — intended '${l.intended}', effective '${l.effective}' (key ${l.present ? `present, raw '${l.raw}'` : 'ABSENT — the default is deciding'})`);
 
 const arm = await gradeStoredEnv(intent.levers);
-const all = [...routeMismatches, ...arm.mismatches];
+const declaredMismatches = gradeDeclared(await readDeclaredIntent(), intent.levers, arm.storedEnv);
+const all = [...routeMismatches, ...arm.mismatches, ...declaredMismatches];
 
 console.log(`[env-intent] graded ${intent.levers.length} lever(s) from ${source}`);
 for (const l of intent.levers) {
@@ -362,11 +541,19 @@ if (all.length > 0) {
   console.error('[env-intent] A STAGED row is not in force YET. Fix the STORED value; do not wait for the');
   console.error('[env-intent] boot to prove it, and do not close it by editing the manifest to agree — for');
   console.error('[env-intent] ENABLE_OPTION_LIVE_OTM that row carries a board sign-off (TRA-4750 item 5).');
+  if (declaredMismatches.length > 0) {
+    console.error('[env-intent] A DECLARED row (TRA-4862) is a declaration this checkout made that the money host');
+    console.error('[env-intent] is not being graded against. Declaring an intent is not applying it: the manifest');
+    console.error('[env-intent] GRADES, it never ARMS, and the boot-arm reads the raw env var. Close it by doing');
+    console.error('[env-intent] BOTH — single-key upsert of the env var, then render-redeploy --commit=<sha> to');
+    console.error('[env-intent] ship the manifest edit — never by reverting the declaration to match the box.');
+  }
   process.exit(1);
 }
 console.log(
   arm.armed
-    ? '[env-intent] MATCH — every lever at its manifest-intended value, EFFECTIVE and STORED.'
-    : '[env-intent] MATCH — every lever at its manifest-intended value (EFFECTIVE only; env-list arm OFF).',
+    ? '[env-intent] MATCH — every lever at its manifest-intended value, EFFECTIVE and STORED, and this'
+    : '[env-intent] MATCH — every lever at its manifest-intended value (EFFECTIVE only; env-list arm OFF), and this',
 );
+console.log("[env-intent]   checkout's manifest DECLARES exactly what the running build grades against.");
 process.exit(0);
