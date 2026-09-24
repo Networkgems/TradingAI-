@@ -125,12 +125,20 @@ export interface TradierEquityQuote {
   bidSize?: number;
   askSize?: number;
   /**
-   * TRA-2045 — the quote's own timestamp (ms epoch), parsed from Tradier
-   * `trade_date`. Feeds the order-time stale-quote gate, which measures the
-   * age of the quote AT THE BROKER at submit — distinct from the feed's local
-   * receive time (`symbolState.lastUpdated`). Optional: the Yahoo/Stooq
-   * fallbacks carry no broker timestamp, so a consumer must tolerate its
-   * absence (absent ⇒ "freshness unprovable for this quote").
+   * TRA-2045 — a broker timestamp (ms epoch) parsed from Tradier `trade_date`.
+   * Feeds the order-time stale-quote gate, which measures age AT THE BROKER at
+   * submit — distinct from the feed's local receive time
+   * (`symbolState.lastUpdated`). Optional: the Yahoo/Stooq fallbacks carry no
+   * broker timestamp, so a consumer must tolerate its absence (absent ⇒
+   * "freshness unprovable for this quote").
+   *
+   * ⛔ **MISNAMED: it is the LAST-TRADE time, NOT the quote time** (TRA-4870,
+   * measured 2026-09-24 in RTH). It freezes on any instrument that is not
+   * printing, however live its book. Less acute here than on the options side —
+   * a liquid equity prints continuously, so `trade_date` and `bid_date` agree
+   * to within the measurement floor — but it is the SAME defect and it bites on
+   * any thin name. The quote clock is `bid_date`/`ask_date`, unparsed here.
+   * Record: `docs/tradier-quote-clock-TRA-4870.md`.
    */
   quoteTimeMs?: number;
 }

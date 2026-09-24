@@ -21,9 +21,18 @@ export interface TradierOptionQuote {
   ask?: number;
   last?: number;
   /**
-   * TRA-2045 — quote timestamp (ms epoch) parsed from Tradier `trade_date`,
-   * when present. Feeds the order-time stale-quote gate on the smart-open path.
+   * TRA-2045 — timestamp (ms epoch) parsed from Tradier `trade_date`, when
+   * present. Feeds the order-time stale-quote gate on the smart-open path.
    * Optional: an option quote that omits the field can't be freshness-proven.
+   *
+   * ⛔ **MISNAMED: this is the LAST-TRADE time, NOT the quote time** (TRA-4870,
+   * measured 2026-09-24 in RTH). `trade_date` stamps the last print and is
+   * frozen on any contract that has not traded — measured up to 863.7 h stale
+   * on a live two-sided book whose `bid_date` was 0.9 s old. An age derived
+   * from this field is a LAST-TRADE age; on an illiquid contract it says
+   * nothing about whether the book is live. The quote clock is
+   * `bid_date`/`ask_date`, which this client does not parse yet.
+   * Record: `docs/tradier-quote-clock-TRA-4870.md`.
    */
   quoteTimeMs?: number;
 }

@@ -130,15 +130,23 @@ export interface SandboxStrategyLeg {
    * record the number first; whoever sets the acceptance bar (graduation is QuantTrader's
    * call) decides what age is disqualifying.
    *
-   * ⚠️ **NOT MEASURED — what this age is an age OF.** `quoteTimeMs` is sourced from
-   * Tradier `trade_date` (`packages/engine/src/tradier/options-client.ts`). If that is
-   * the LAST-TRADE time rather than the bid/ask time, every "quote age" in this system is
-   * a last-trade age, and an illiquid contract with a perfectly live two-sided book would
-   * read arbitrarily stale. The 904–907 s cluster cannot discriminate the two: for SPY
-   * ATM weeklies a 15-min-delayed feed and a last-trade stamp coincide. Settling it needs
-   * one RTH `/markets/quotes` on a deep-OTM zero-volume contract (and a check for
-   * `bid_date`/`ask_date`, which this repo parses nowhere) — TRA-2045's question, not a
-   * reason to keep dropping the number.
+   * ⛔ **MEASURED, AND IT IS A LAST-TRADE AGE** (TRA-4870, 2026-09-24 18:28–18:31Z, RTH,
+   * `api.tradier.com`). `quoteTimeMs` is sourced from Tradier `trade_date`
+   * (`packages/engine/src/tradier/options-client.ts`), and `trade_date` stamps the last
+   * PRINT, not the book. On zero-volume contracts it stayed bit-frozen across a 50.4 s
+   * live-RTH window while `bid_date`/`ask_date` advanced on two-sided books — one row
+   * 863.7 h stale against a book refreshed 0.9 s earlier — while the continuously-trading
+   * CONTROL moved on all three clocks. So `quoteAgeMs` here is the age of the last TRADE
+   * in the contract, and on an illiquid contract it says **nothing** about whether the
+   * quote was live. The payload does carry `bid_date`/`ask_date`; this repo parses
+   * neither. Record: `docs/tradier-quote-clock-TRA-4870.md`.
+   *
+   * ⚠️ **The 904–907 s cluster is therefore still not explained**, and the "15-min delayed
+   * feed" reading is NOT available to explain it: the sandbox HOST is ~15 min delayed
+   * (measured, 901 s), but per TRA-1937 this codebase routes all market data to
+   * `api.tradier.com`, which measured real-time (control 0.4 s). So 906 s is either a
+   * genuine last-trade gap on the journaled contract or a lag between quote capture and
+   * age computation — open on TRA-4869, and not resolvable from this file.
    *
    * ⚠️ Records written before this field render `quoteAgeMs` ABSENT (not null). There is
    * **no backfill** — the age at a past snap is not recoverable (same rule TRA-3997

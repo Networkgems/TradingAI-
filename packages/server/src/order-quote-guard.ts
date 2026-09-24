@@ -12,8 +12,26 @@
  *     midpoint-start limit toward the ask) by pricing a single marketable limit
  *     that never pays past the max-slippage cap.
  *  2. {@link evaluateQuoteFreshness} — reject/skip an order whose quote is older
- *     than `maxQuoteAgeMs`, measured from the quote's OWN broker timestamp
- *     (Tradier `trade_date`), not the feed's local receive time.
+ *     than `maxQuoteAgeMs`, measured from a broker timestamp rather than the
+ *     feed's local receive time.
+ *
+ *     ⛔ **That broker timestamp is the LAST-TRADE clock, not the quote clock,
+ *     and this gate is mis-keyed because of it (TRA-4870, measured 2026-09-24
+ *     in RTH against `api.tradier.com`).** `quoteTimeMs` comes from Tradier
+ *     `trade_date`, which stamps the last PRINT. On a zero-volume contract it
+ *     stays bit-frozen across a 50 s live-RTH window while `bid_date`/`ask_date`
+ *     advance on a two-sided book quoted 613 × 422 deep — one measured row was
+ *     863.7 h stale on a book refreshed 0.9 s earlier. Against the 5 s default
+ *     ceiling, 6 of 6 such contracts are refused on `trade_date` versus 2 of 6
+ *     on the quote clock. In enforce mode this gate would therefore refuse
+ *     exactly the illiquid deep-OTM contracts the OTM sleeve trades, and admit
+ *     only what was already liquid — fail-closed on the wrong clock.
+ *
+ *     The payload carries **`bid_date`/`ask_date`**; this repo parses neither.
+ *     ⛔ **Do NOT flip `ENABLE_ORDER_QUOTE_GUARD` to enforce until this is
+ *     re-keyed and the ceiling re-derived** — 5 s is too tight for deep OTM even
+ *     on the correct clock (a live illiquid book can go ~90 s between touches).
+ *     Record: `docs/tradier-quote-clock-TRA-4870.md`.
  *
  * ## Governance — flag-guarded, default-OFF, SHADOW-first
  * The whole guard is gated on `ENABLE_ORDER_QUOTE_GUARD` (default off). With the
