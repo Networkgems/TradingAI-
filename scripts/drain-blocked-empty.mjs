@@ -17,16 +17,21 @@
  * two drift apart on the first edit to either. One predicate, one cohort, two
  * readers.
  *
- * THE TWO WRITES, IN THIS ORDER, PER ROW
- * --------------------------------------
- *   1. POST /comments            the audit trail
- *   2. PATCH {"status": <-- CLASS-DEPENDENT}   the LAST write this row accepts
+ * THE ONE WRITE PER ROW (TRA-4043)
+ * --------------------------------
+ *   1. PATCH {"status": <-- CLASS-DEPENDENT, "comment": <the audit trail>}
  *
- * The comment goes first because it must be written while the row is still ours:
- * the moment a row leaves this actor's authorization boundary, both the status
- * PATCH and the comment come back `403 {"error":"Issue is outside this actor's
- * authorization boundary"}` (measured repeatedly; see the CFO hand-back on
- * TRA-3397).
+ * Until 2026-09-24 this was two writes — POST /comments first (while the row
+ * was still ours: once a row leaves this actor's authorization boundary, both
+ * writes 403; see the CFO hand-back on TRA-3397), then the status PATCH. Two
+ * writes per row halves the row ceiling under the per-run cross-issue write
+ * budget (THE BUDGET, below), and the ordering carried a race of its own: the
+ * comment POST can mint the run lock that 409s the status PATCH behind it.
+ * The platform PATCH accepts a `comment` string alongside `status` (verified
+ * live 2026-09-24 — the TRA-4043 assignment comment itself was delivered that
+ * way), so both land in ONE atomic write: there is no order left for a budget
+ * cut-off or a lock to truncate mid-row (Defect 2 of TRA-4043 is structurally
+ * unreachable), and a row costs exactly one unit of budget.
  *
  * ⛔ THERE IS NO THIRD WRITE (TRA-4041, MEASURED 2026-08-26). Until 2026-08-26
  * this file sent `PATCH {"assigneeAgentId": returnOwnerAgentId}` as step 3,
@@ -53,6 +58,43 @@
  * `stranded_assigned_issue:active` -> null, 6/6). The re-home to
  * `returnOwnerAgentId` is the platform's to make. This file READS that id, names
  * it in the audit comment, and does not write it.
+ *
+ * THE BUDGET (TRA-4043, MEASURED 2026-08-26)
+ * ------------------------------------------
+ * A single heartbeat run may make at most 20 cross-issue writes; attempt 21
+ * returns HTTP 429 `cross_issue_influence_cap_exceeded` (enforce mode since
+ * 2026-08-11 — two days BEFORE this drainer shipped). The 2026-08-26 CEO-arm
+ * fire measured it first: cohort 27, plan 26 drainable, 6 drained, 1 truncated
+ * mid-row, 19 never attempted — and the 19 were reported WRITE_FAILED, a
+ * fabricated finding about healthy rows that coloured the fire exit 2 FAILED
+ * and polluted the cohort the next fire read.
+ *
+ * This file is budget-aware:
+ *   - ONE write per row (the combined PATCH above), so the row ceiling is
+ *     cap minus writes the surrounding run already spent;
+ *   - a row that would exceed the budget is NOT ATTEMPTED: outcome
+ *     NOT_ATTEMPTED_BUDGET, zero network calls, EXCLUDED from the failure
+ *     count entirely;
+ *   - an actual 429 from the platform is AUTHORITATIVE (the local counter can
+ *     only see what this script spent, not what the surrounding heartbeat run
+ *     spent before it — probes and status PATCHes elsewhere in the run count
+ *     too): the rejected row and every row after it go NOT_ATTEMPTED_BUDGET.
+ *     Nothing is half-written, because the row's single write either landed
+ *     or it did not;
+ *   - the fire's verdict is DEFERRED (exit 1): a healthy fire that drained
+ *     its budget's worth and cleanly deferred the rest, per the platform's own
+ *     remedy text ("the budget resets per run"). Not a failure — and not green
+ *     either, because rows remain for the next fire.
+ * `--budget` overrides the cap (default 20); `--budget-spent` declares writes
+ * the surrounding run already made before invoking this script.
+ *
+ * A separate 403, `cross_issue_influence_run_context_required`, is TRANSIENT
+ * early-run state, not a permission verdict (TRA-4299: a byte-identical retry
+ * succeeded minutes later in the same run). It is retried once after a short
+ * delay (`--run-context-retry-ms`, default 3000); if it persists the row is
+ * RUN_CONTEXT_DEFERRED (colours REMAINDER, exit 1) — never FOREIGN, never
+ * FAILED — and after two consecutive such rows the rest of the plan is
+ * deferred without further attempts.
  *
  * THE ROW CLASS DECIDES THE STATUS (TRA-4063, MEASURED 2026-08-26)
  * ---------------------------------------------------------------
@@ -127,8 +169,15 @@
  *                 card, excluded, or FOREIGN. Someone still has to act, so this
  *                 must not be green. This is also the arm that falsifies the
  *                 `stranded_assigned_issue` kind gate (see below).
+ *   1  DEFERRED   the per-run cross-issue write budget ran out (TRA-4043).
+ *                 Every drained row is verified, every deferred row got ZERO
+ *                 writes and is still inside the detector cohort; the next
+ *                 fire continues with a fresh budget. Healthy, but not green.
  *   2  FAILED     a write threw, or a write returned 2xx and the re-read shows
  *                 it did not stick. Present-but-wrong is not repaired.
+ *                 Budget exhaustion is NEVER this (TRA-4043): a 429 cap
+ *                 rejection means the write did not happen, which is a
+ *                 different fact from a write that failed.
  *   3  BLIND      the sweep could not prove it saw the whole population. Not a
  *                 pass. Outranks everything.
  *
@@ -151,6 +200,7 @@
  *   node scripts/drain-blocked-empty.mjs --json
  *   node scripts/drain-blocked-empty.mjs --selftest       # positive + negative controls
  *   node scripts/drain-blocked-empty.mjs --apply --only=TRA-1234    # one row (control use)
+ *   node scripts/drain-blocked-empty.mjs --apply --budget=20 --budget-spent=3
  *
  * Auth: PAPERCLIP_API_URL, PAPERCLIP_API_KEY, PAPERCLIP_COMPANY_ID.
  */
@@ -171,9 +221,18 @@ export const DRAIN_EXIT = {
   VACUOUS: 0,
   DRAINED: 0,
   REMAINDER: 1,
+  // TRA-4043 — budget ran out. Shares exit 1 with REMAINDER (work remains for
+  // a next actor) but is its own verdict word: the remaining rows are healthy
+  // and owned by the NEXT fire, not by a person.
+  DEFERRED: 1,
   FAILED: 2,
   BLIND: 3,
 };
+
+// TRA-4043 — the platform's per-run cross-issue write cap, enforce mode since
+// 2026-08-11. One combined PATCH per row (comment + status in one body) costs
+// one unit; reads are free.
+export const BUDGET_DEFAULT_CAP = 20;
 
 /**
  * The carve-out, expressed as a RULE rather than as a list of identifiers.
@@ -305,9 +364,12 @@ export function classifyDisposition(f) {
  * a rejection THROWS rather than skipping the row: a body this function does
  * not recognise means the caller changed and the change was not reviewed here.
  *
- * Exactly two verbs are legal, matching the two the detector is allowed to
- * print (its SANCTIONED_VERB whitelist). Anything else — a third key, a
- * blocker-key write, a merged one-shot body — is a defect.
+ * The one sanctioned wire body is the `drain` step: a PATCH carrying exactly
+ * `status` + `comment` (TRA-4043 — one atomic cross-issue write per row). It
+ * is graded by composing the two single-purpose graders below, which survive
+ * as units so the class gate and the ASCII gate stay independently pinned.
+ * Anything else — a third key, a blocker-key write, an assignee write — is a
+ * defect.
  *
  * TRA-4063 — the sanctioned STATUS is class-dependent, so the class is an
  * argument, not an assumption. The three status branches are mutually
@@ -347,6 +409,20 @@ export function gradeWriteBody(step, body, { klass = null } = {}) {
         '2026-08-26 -- on a row the status PATCH had ALREADY repaired. It is unexecutable in either order and it ' +
         'was never load-bearing: the status write alone clears the strand. The re-home is the platform\'s.',
     );
+  }
+
+  // TRA-4043 — the combined wire body: exactly {status, comment}, graded by
+  // composing the two single-purpose graders so neither gate loosens. The
+  // blocker-key and assignee bans above already ran against the full key set.
+  if (step === 'drain') {
+    if (keys.length !== 2 || !keys.includes('status') || !keys.includes('comment')) {
+      return bad(`expected exactly {"status","comment"} (TRA-4043 one-write body), got {${keys.join(',')}}`);
+    }
+    const c = gradeWriteBody('comment', { body: body.comment }, { klass });
+    if (!c.ok) return bad(c.why);
+    const s = gradeWriteBody('status', { status: body.status }, { klass });
+    if (!s.ok) return bad(s.why);
+    return { ok: true };
   }
 
   if (step === 'status') {
@@ -570,7 +646,7 @@ export function drainComment(f, runId, disp = null, origin = null) {
       `returnOwnerAgentId; the status write above spawns a run that takes this issue's checkout lock, so any ` +
       `further PATCH returns 409 Issue run ownership conflict (6/6, measured). The re-home is the platform's.\n\n` +
       `If this classification is wrong, the recoverable direction is to reopen this row -- not to re-drain it. ` +
-      `Commented BEFORE the status write, because the status write is the last one this row accepts.\n\n` +
+      `This comment rides in the SAME PATCH as the status write (TRA-4043): one atomic cross-issue write, so a budget cut-off can never leave this row half-written.\n\n` +
       `Drained by scripts/drain-blocked-empty.mjs${runId ? ` (run ${runId})` : ''}.`
     );
   }
@@ -592,7 +668,7 @@ export function drainComment(f, runId, disp = null, origin = null) {
     `409 Issue run ownership conflict (6/6, measured). It is also unnecessary -- the status write alone clears ` +
     `the recovery action. If this row is homed on the wrong seat, that re-home is the platform's to make.\n\n` +
     `No content judgement was made on the underlying work; the strand is cleared and the ticket is queue-visible ` +
-    `again. Commented BEFORE the status write, because the status write is the last one this row accepts.\n\n` +
+    `again. This comment rides in the SAME PATCH as the status write (TRA-4043): one atomic cross-issue write, so a budget cut-off can never leave this row half-written.\n\n` +
     `Drained by scripts/drain-blocked-empty.mjs${runId ? ` (run ${runId})` : ''}.`
   );
 }
@@ -695,9 +771,34 @@ export const OUTCOME = {
   // TRA-4063 — the class could not be decided, so no status is safe. Its own
   // outcome and not WRITE_FAILED: nothing was rejected, nothing was attempted.
   UNCLASSIFIABLE: 'UNCLASSIFIABLE',
+  // TRA-4043 — the per-run cross-issue write budget was (or would have been)
+  // exhausted, so this row got ZERO writes. NOT a failure of any kind: the row
+  // is healthy, still blocked+empty, still inside the detector cohort, and the
+  // budget resets per run so the NEXT fire drains it. Folding this into
+  // WRITE_FAILED is the fabricated-finding defect this ticket was filed for.
+  NOT_ATTEMPTED_BUDGET: 'NOT_ATTEMPTED_BUDGET',
+  // TRA-4299 — 403 cross_issue_influence_run_context_required is transient
+  // early-run state, not a permission verdict. Retried once; if it persists,
+  // this outcome. Not FOREIGN (the row may well be ours) and not FAILED
+  // (nothing landed, nothing broke) — the next fire retries with context.
+  RUN_CONTEXT_DEFERRED: 'RUN_CONTEXT_DEFERRED',
 };
 
-const isBoundary403 = (err) => /\b403\b/.test(String(err?.message || err)) || /authorization boundary/i.test(String(err?.message || err));
+// TRA-4299 — checked BEFORE the boundary test, because `isBoundary403` matches
+// any "403" and this 403 is transient run state, not a permission verdict.
+const isRunContext403 = (err) => /cross_issue_influence_run_context_required/i.test(String(err?.message || err));
+
+// TRA-4043 — the per-run cross-issue write cap. Matched on the error code, with
+// the human text as fallback; a bare 429 without either is NOT assumed to be
+// the cap (a different throttle must not silently defer the cohort).
+const isBudgetCap429 = (err) => {
+  const s = String(err?.message || err);
+  return /cross_issue_influence_cap_exceeded/i.test(s) || (/\b429\b/.test(s) && /cross-issue write budget/i.test(s));
+};
+
+const isBoundary403 = (err) =>
+  !isRunContext403(err) &&
+  (/\b403\b/.test(String(err?.message || err)) || /authorization boundary/i.test(String(err?.message || err)));
 
 /**
  * TRA-4041. `409 Issue run ownership conflict` is a THIRD thing, and it must not
@@ -726,7 +827,11 @@ const isRunLock409 = (err) => {
  * untouched one, because it leaves queue-visible work homed on the wrong agent
  * with no recovery action left to name the right one.
  */
-export async function drainRow(transport, row, { apply = false, runId = null } = {}) {
+export async function drainRow(
+  transport,
+  row,
+  { apply = false, runId = null, budget = null, runContextRetryMs = 3000, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {},
+) {
   const f = row.f;
   const rep = f.repair;
   const disp = row.disp || classifyDisposition(f);
@@ -739,17 +844,23 @@ export async function drainRow(transport, row, { apply = false, runId = null } =
     return { outcome: OUTCOME.UNCLASSIFIABLE, steps, disp, why: disp.why };
   }
 
-  const send = async (step, fn, body) => {
-    const graded = gradeWriteBody(step, body, { klass: disp.klass });
-    if (!graded.ok) {
-      // Not a skip. The caller built a body this file does not sanction, which
-      // is a code defect, and continuing would write it.
-      throw new Error(`REFUSED to send an unsanctioned ${step} body -- ${graded.why}`);
-    }
-    steps.push({ step, body, sent: apply });
-    if (!apply) return null;
-    return fn();
-  };
+  // TRA-4043 — the budget gate, BEFORE any network call for this row. A row
+  // that cannot afford its single write is not attempted at all: zero writes,
+  // zero reads, a distinct outcome, and NO entry in the failure count. The
+  // dry run is exempt on purpose: it sends nothing, so it plans the whole
+  // cohort regardless of budget.
+  if (apply && budget && (budget.exhausted || budget.spent + 1 > budget.cap)) {
+    return {
+      outcome: OUTCOME.NOT_ATTEMPTED_BUDGET,
+      steps,
+      disp,
+      why:
+        `not attempted: the per-run cross-issue write budget is ` +
+        `${budget.exhausted ? 'exhausted (a live 429 said so)' : `spent (${budget.spent}/${budget.cap} attempts counted)`} ` +
+        'and this row costs 1 write. Nothing was sent -- the row is untouched, still blocked+empty, still inside ' +
+        'the detector cohort. The budget resets per run, so the next fire drains it (TRA-4043).',
+    };
+  }
 
   // Best-effort, and BEFORE the comment so the audit trail can name it. Failing
   // this read is not failing the row: the class was decided off the issue
@@ -774,39 +885,96 @@ export async function drainRow(transport, row, { apply = false, runId = null } =
     }
   }
 
-  try {
-    await send('comment', () => transport.postComment(f.id, { body: drainComment(f, runId, disp, origin) }), {
-      body: drainComment(f, runId, disp, origin),
-    });
-    // The LAST write this row will accept: it mints a live status, which spawns
-    // a run, which takes the checkout lock (TRA-4041). Nothing follows it.
-    await send('status', () => transport.patchIssue(f.id, { status: disp.status }), { status: disp.status });
-  } catch (err) {
-    if (isRunLock409(err)) {
-      return {
-        outcome: OUTCOME.RUN_LOCKED,
-        steps,
-        disp,
-        why:
-          `409 Issue run ownership conflict on the \`${steps[steps.length - 1]?.step || 'first'}\` step -- a live run ` +
-          'already holds this row\'s checkout lock, so this actor\'s run id does not match its executionRunId. The row ' +
-          'IS ours (this is not the 403 boundary and no other seat\'s arm can take it), and nothing was half-written. ' +
-          'Leave it: the next fire runs against a row whose run has ended.',
-      };
+  // TRA-4043 — ONE write: the comment rides in the same PATCH as the status,
+  // so the row either drains whole or is untouched. It still mints a live
+  // status, spawns a run and takes the checkout lock (TRA-4041), so nothing
+  // may follow it.
+  const wireBody = { status: disp.status, comment: drainComment(f, runId, disp, origin) };
+  const graded = gradeWriteBody('drain', wireBody, { klass: disp.klass });
+  if (!graded.ok) {
+    // Not a skip. The caller built a body this file does not sanction, which
+    // is a code defect, and continuing would write it.
+    throw new Error(`REFUSED to send an unsanctioned drain body -- ${graded.why}`);
+  }
+  steps.push({ step: 'drain', body: wireBody, sent: apply });
+
+  if (apply) {
+    let err = null;
+    // One bounded retry, for the TRA-4299 transient 403 only.
+    for (let attempt = 0; attempt <= 1; attempt += 1) {
+      // Attempts are counted, not just landings: whether the platform bills a
+      // refused write is unmeasured, and UNDERSTATING spend is the failure
+      // mode that manufactured 19 fabricated WRITE_FAILED rows on 2026-08-26.
+      // The live 429 below is authoritative in both directions.
+      if (budget) budget.spent += 1;
+      try {
+        await transport.patchIssue(f.id, wireBody);
+        err = null;
+        break;
+      } catch (e) {
+        err = e;
+        if (isBudgetCap429(e)) {
+          if (budget) {
+            budget.spent -= 1; // the rejected write did not land, so it did not spend
+            budget.exhausted = true;
+          }
+          return {
+            outcome: OUTCOME.NOT_ATTEMPTED_BUDGET,
+            steps,
+            disp,
+            why:
+              "the platform returned 429 cross_issue_influence_cap_exceeded on this row's single write: the " +
+              'surrounding run had already spent the cross-issue budget (a local counter cannot see writes made ' +
+              'before this script started). The write was REJECTED whole, not half-applied -- the row is untouched, ' +
+              'still inside the detector cohort, and drains on the next fire with a fresh budget (TRA-4043).',
+          };
+        }
+        if (isRunContext403(e) && attempt === 0) {
+          await sleep(runContextRetryMs);
+          continue;
+        }
+        break;
+      }
     }
-    if (isBoundary403(err)) {
-      return {
-        outcome: OUTCOME.FOREIGN,
-        steps,
-        disp,
-        why:
-          `403 outside this actor's authorization boundary on the \`${steps[steps.length - 1]?.step || 'first'}\` ` +
-          `step. This row is currently assigned to ${f.assigneeName || f.assigneeAgentId || 'nobody'} and only that ` +
-          'seat can drain it. Rank does not lift the boundary and there is no predictor for it -- this is the twin ' +
-          "arm's row, not a retry.",
-      };
+    if (err) {
+      if (isRunContext403(err)) {
+        return {
+          outcome: OUTCOME.RUN_CONTEXT_DEFERRED,
+          steps,
+          disp,
+          why:
+            '403 cross_issue_influence_run_context_required on the drain write, twice (one bounded retry after ' +
+            `${runContextRetryMs}ms). This is TRANSIENT early-run state, not a permission verdict (TRA-4299: a ` +
+            'byte-identical retry succeeded minutes later in the same run), so it is NOT reported FOREIGN and NOT a ' +
+            'write failure. Nothing landed; the next fire retries with run context established.',
+        };
+      }
+      if (isRunLock409(err)) {
+        return {
+          outcome: OUTCOME.RUN_LOCKED,
+          steps,
+          disp,
+          why:
+            '409 Issue run ownership conflict on the drain write -- a live run already holds this row\'s checkout ' +
+            'lock, so this actor\'s run id does not match its executionRunId. The row IS ours (this is not the 403 ' +
+            'boundary and no other seat\'s arm can take it), and nothing was half-written: the single combined write ' +
+            'was rejected whole. Leave it: the next fire runs against a row whose run has ended.',
+        };
+      }
+      if (isBoundary403(err)) {
+        return {
+          outcome: OUTCOME.FOREIGN,
+          steps,
+          disp,
+          why:
+            '403 outside this actor\'s authorization boundary on the drain write. This row is currently assigned ' +
+            `to ${f.assigneeName || f.assigneeAgentId || 'nobody'} and only that seat can drain it. Rank does not ` +
+            "lift the boundary and there is no predictor for it -- this is the twin arm's row, not a retry. Nothing " +
+            'was half-written: the single combined write was rejected whole.',
+        };
+      }
+      return { outcome: OUTCOME.WRITE_FAILED, steps, disp, why: String(err?.message || err) };
     }
-    return { outcome: OUTCOME.WRITE_FAILED, steps, disp, why: String(err?.message || err) };
   }
 
   if (!apply) {
@@ -922,6 +1090,10 @@ export async function drainRow(transport, row, { apply = false, runId = null } =
  */
 export function verdictFor({ blind, plan, results }) {
   if (blind) return 'BLIND';
+  // TRA-4043 — NOT_ATTEMPTED_BUDGET is deliberately absent from this filter.
+  // A budget-deferred row got zero writes against zero boundaries; folding it
+  // into the failure count is the fabricated-finding defect this exit table
+  // exists to prevent.
   const bad = results.filter((r) => r.outcome === OUTCOME.WRITE_FAILED || r.outcome === OUTCOME.NOT_VERIFIED);
   if (bad.length) return 'FAILED';
   // RUN_LOCKED joins FOREIGN here rather than FAILED (TRA-4041): nothing was
@@ -931,13 +1103,24 @@ export function verdictFor({ blind, plan, results }) {
   // could not be decided is a row nobody has drained, and the SAFE refusal is
   // only safe if it is also LOUD: a silent skip would read as a clean fire on a
   // board that still has the strand.
+  // TRA-4299 — RUN_CONTEXT_DEFERRED joins them too: transient, nothing landed,
+  // but the rows are undrained and must not read green.
   const unowned =
     plan.counts.ineligible +
     plan.counts.unclassifiable +
     results.filter(
-      (r) => r.outcome === OUTCOME.FOREIGN || r.outcome === OUTCOME.RUN_LOCKED || r.outcome === OUTCOME.UNCLASSIFIABLE,
+      (r) =>
+        r.outcome === OUTCOME.FOREIGN ||
+        r.outcome === OUTCOME.RUN_LOCKED ||
+        r.outcome === OUTCOME.UNCLASSIFIABLE ||
+        r.outcome === OUTCOME.RUN_CONTEXT_DEFERRED,
     ).length;
   if (unowned > 0) return 'REMAINDER';
+  // TRA-4043 — after FAILED and REMAINDER, so a fire that both drained and
+  // deferred reads DEFERRED (still exit 1), and a fire with real failures
+  // still reads FAILED. Deferred rows have a named owner -- the NEXT fire --
+  // which is why this outranks nothing above it.
+  if (results.some((r) => r.outcome === OUTCOME.NOT_ATTEMPTED_BUDGET)) return 'DEFERRED';
   // ⛔ The whole point of a separate verdict here. An empty cohort exercised
   // NOTHING; folding it into a success verdict is how a fleet of green logs
   // gets read back as "the drain works".
@@ -953,12 +1136,46 @@ export async function run(transport, opts = {}) {
   }
   const plan = planDrain(result, { only: opts.only || null });
 
+  // TRA-4043 — one shared budget for the whole fire. `spentBefore` is what the
+  // surrounding heartbeat run already spent (the cap is per RUN, not per
+  // script); `spent` counts this script's attempts on top of it.
+  const spentBefore = Number(opts.budgetSpent ?? 0);
+  const budget = {
+    cap: Number(opts.budgetCap ?? BUDGET_DEFAULT_CAP),
+    spentBefore,
+    spent: spentBefore,
+    exhausted: false,
+  };
+
   const results = [];
+  // TRA-4299 — two consecutive persistent run-context refusals mean the run
+  // context is simply absent; further attempts spend budget for nothing.
+  let consecutiveRunContext = 0;
   for (const row of plan.drain) {
     // Deliberately serial. These are writes against a live board; a fan-out
     // buys nothing on a cohort this size and makes a partial failure harder to
     // read back.
-    const r = await drainRow(transport, row, { apply, runId: opts.runId || null });
+    let r;
+    if (consecutiveRunContext >= 2) {
+      r = {
+        outcome: OUTCOME.RUN_CONTEXT_DEFERRED,
+        steps: [],
+        disp: row.disp,
+        why:
+          'not attempted: the two preceding rows were both refused 403 cross_issue_influence_run_context_required ' +
+          '(each retried once), so run context is absent for this run and further attempts spend budget for ' +
+          'nothing. Transient (TRA-4299); the next fire retries with context established.',
+      };
+    } else {
+      r = await drainRow(transport, row, {
+        apply,
+        runId: opts.runId || null,
+        budget,
+        runContextRetryMs: opts.runContextRetryMs ?? 3000,
+        ...(opts.sleep ? { sleep: opts.sleep } : {}),
+      });
+    }
+    consecutiveRunContext = r.outcome === OUTCOME.RUN_CONTEXT_DEFERRED ? consecutiveRunContext + 1 : 0;
     results.push({
       ...r,
       identifier: row.f.identifier || row.f.id,
@@ -978,6 +1195,7 @@ export async function run(transport, opts = {}) {
     plan,
     results,
     apply,
+    budget,
   };
 }
 
@@ -1010,7 +1228,29 @@ export function renderDrain(out) {
     `class     ${c.durableStrand} DURABLE STRAND -> todo | ${c.suppressingLeaf} SUPPRESSING LEAF -> done ` +
       `(TRA-4063: a routine_execution spawn gating nothing; todo would leave its routine OFF)`,
   );
+  // TRA-4043 — printed on EVERY fire, including the ones nowhere near the cap.
+  // The 2026-08-26 fire had no line like this, which is how a hard 6-row
+  // ceiling stayed invisible until it manufactured 20 fake write failures.
+  if (out.budget) {
+    const b = out.budget;
+    L.push(
+      `budget    per-run cross-issue cap ${b.cap} | ${b.spentBefore} declared pre-spent | 1 write/row -> ` +
+        `row ceiling ${Math.max(0, b.cap - b.spentBefore)} | ` +
+        (out.apply
+          ? `${b.spent - b.spentBefore} attempt(s) counted this fire${b.exhausted ? ' | CAP HIT (live 429)' : ''}`
+          : 'dry run, nothing spent'),
+    );
+  }
   L.push('');
+
+  if (out.verdict === 'DEFERRED') {
+    const n = out.results.filter((r) => r.outcome === OUTCOME.NOT_ATTEMPTED_BUDGET).length;
+    L.push(`DEFERRED  ${n} row(s) received ZERO writes because the per-run cross-issue write budget ran out.`);
+    L.push('          This is a HEALTHY fire, not a failure (TRA-4043): every drained row above is verified,');
+    L.push('          every deferred row is untouched and still inside the detector cohort, and the budget');
+    L.push('          resets per run -- the next fire continues where this one stopped. Deferred rows are');
+    L.push('          NOT write failures and are excluded from the failure count.');
+  }
 
   if (out.verdict === 'VACUOUS') {
     L.push('VACUOUS   NO DRAINABLE ROW EXISTED. Nothing was exercised, so this run is NOT evidence that');
@@ -1180,6 +1420,14 @@ function fakeTransport(
     // SUPPRESSING LEAF it means the leaf never went terminal and the routine is
     // still off, which must NOT read as DRAINED.
     flipTo = null,
+    // TRA-4043 — after this many writes have LANDED, every further write
+    // attempt 429s with the live cap body. Models the platform's per-run
+    // cross-issue budget, which counts the whole run, not just this script.
+    capAt = null,
+    // TRA-4299 — the first N write attempts throw the transient run-context
+    // 403, then attempts succeed. Infinity models a run that never gets
+    // context.
+    runContext403Times = 0,
   } = {},
 ) {
   // TRA-4041 — ids whose checkout lock has been taken by the run the status
@@ -1187,6 +1435,11 @@ function fakeTransport(
   const locked = new Set();
   const written = new Set();
   const writes = [];
+  // TRA-4043 / TRA-4299 — attempts vs landings. `writes` records only what
+  // LANDED; `stats.attempts` counts every try, which is what the budget and
+  // the retry controls assert on.
+  const stats = { attempts: 0 };
+  let runContextLeft = runContext403Times;
   const byId = new Map(rows.map((r) => [r.id, JSON.parse(JSON.stringify(r))]));
   const filler = Array.from({ length: total - rows.length }, (_, i) => ({
     id: `f${i}`,
@@ -1202,6 +1455,7 @@ function fakeTransport(
 
   return {
     writes,
+    stats,
     listAgents: async () => [
       { id: AGENT_SELF, name: 'CTO', role: 'cto' },
       { id: AGENT_BACK, name: 'QuantTrader', role: 'quant' },
@@ -1236,8 +1490,26 @@ function fakeTransport(
       return { ok: true };
     },
     patchIssue: async (id, body) => {
+      stats.attempts += 1;
+      // TRA-4299 — the transient early-run refusal, thrown before anything
+      // else because that is when it happens live.
+      if (runContextLeft > 0) {
+        runContextLeft -= 1;
+        throw new Error(
+          'HTTP 403 on PATCH -- {"error":"Cross-issue influence requires an established run context",' +
+            '"details":{"code":"cross_issue_influence_run_context_required"}}',
+        );
+      }
       if (on403 === 'status' && body.status) {
         throw new Error('HTTP 403 — {"error":"Issue is outside this actor\'s authorization boundary"}');
+      }
+      // TRA-4043 — the per-run cap, on LANDED writes across the whole fake.
+      if (capAt != null && writes.length >= capAt) {
+        throw new Error(
+          'HTTP 429 on PATCH -- {"error":"This run has spent its cross-issue write budget (Per-run cross-issue ' +
+            `cap of ${capAt} writes)","details":{"code":"cross_issue_influence_cap_exceeded","cap":${capAt},` +
+            `"count":${writes.length + 1},"mode":"enforce"}}`,
+        );
       }
       // TRA-4041 — model the run lock the live platform actually takes. The
       // FIRST status PATCH sets checkoutRunId; every PATCH after it on the same
@@ -1258,7 +1530,13 @@ function fakeTransport(
         // does and what the drain is verified on.
         if (!lieOnPatch && !keepRecovery) byId.get(id).activeRecoveryAction = null;
       }
-      if (!lieOnPatch) Object.assign(byId.get(id), body);
+      if (!lieOnPatch) {
+        // `comment` is a write verb on the PATCH (TRA-4043), not an issue
+        // field -- the live platform appends it to the thread, so the fake
+        // must not materialize it onto the row.
+        const { comment: _comment, ...fields } = body;
+        Object.assign(byId.get(id), fields);
+      }
       return { ok: true };
     },
   };
@@ -1266,20 +1544,23 @@ function fakeTransport(
 
 const CONTROLS = [
   {
-    name: 'POSITIVE — an eligible strand drains in TWO writes: comment, then status. There is no third write (TRA-4041)',
+    name: 'POSITIVE — an eligible strand drains in ONE combined write: PATCH {status,comment} (TRA-4043). No POST, no third key, no third write (TRA-4041)',
     build: () => fakeTransport([strandRow('s1', 'TRA-8001')]),
     apply: true,
     assert: (out, t) => {
-      const verbs = t.writes.map((w) => `${w.verb} ${JSON.stringify(w.body)}`);
+      const w = t.writes[0];
       return (
         out.verdict === 'DRAINED' &&
         out.results.length === 1 &&
         out.results[0].outcome === OUTCOME.DRAINED &&
-        t.writes.length === 2 &&
-        verbs[0].startsWith('POST') &&
-        verbs[1] === 'PATCH {"status":"todo"}' &&
+        t.writes.length === 1 &&
+        w.verb === 'PATCH' &&
+        Object.keys(w.body).sort().join(',') === 'comment,status' &&
+        w.body.status === 'todo' &&
+        typeof w.body.comment === 'string' &&
+        /TRA-3541/.test(w.body.comment) &&
         // the banned step, pinned as never sent
-        t.writes.every((w) => !('assigneeAgentId' in w.body))
+        t.writes.every((x) => !('assigneeAgentId' in x.body))
       );
     },
     detail: (out, t) => `${t.writes.length} write(s): ${t.writes.map((w) => `${w.verb} ${Object.keys(w.body).join('+')}`).join(' -> ')}`,
@@ -1298,14 +1579,15 @@ const CONTROLS = [
     detail: (out) => `verdict ${out.verdict}, 0 rows exercised`,
   },
   {
-    name: 'DRY RUN — the default sends NOTHING, and still names the two writes it would make',
+    name: 'DRY RUN — the default sends NOTHING, and still names the one combined write it would make',
     build: () => fakeTransport([strandRow('s1', 'TRA-8001')]),
     apply: false,
     assert: (out, t) =>
       t.writes.length === 0 &&
+      t.stats.attempts === 0 &&
       out.results.length === 1 &&
       out.results[0].outcome === OUTCOME.PLANNED &&
-      out.results[0].steps.map((s) => s.step).join(',') === 'comment,status' &&
+      out.results[0].steps.map((s) => s.step).join(',') === 'drain' &&
       out.results[0].steps.every((s) => s.sent === false),
     detail: (out, t) => `${t.writes.length} write(s) sent; steps planned: ${out.results[0].steps.map((s) => s.step).join(',')}`,
   },
@@ -1525,7 +1807,7 @@ const CONTROLS = [
     // whose suppressing leaf has a non-ASCII origin title plans BOTH writes
     // and refuses NOTHING. Before the fix this exact case exited WRITE_FAILED
     // ("REFUSED to send an unsanctioned comment body") without sending a byte.
-    name: 'TRA-4145 END TO END — dry run over a leaf whose origin title carries U+2014 plans comment,status with NO refusal',
+    name: 'TRA-4145 END TO END — dry run over a leaf whose origin title carries U+2014 plans the combined drain write with NO refusal',
     build: () =>
       fakeTransport(
         [strandRow('s1', 'TRA-8001', { originKind: 'routine_execution', originId: ROUTINE_ID })],
@@ -1536,9 +1818,9 @@ const CONTROLS = [
       t.writes.length === 0 &&
       out.results.length === 1 &&
       out.results[0].outcome === OUTCOME.PLANNED &&
-      out.results[0].steps.map((s) => s.step).join(',') === 'comment,status' &&
-      /ASCII-FOLDED/.test(out.results[0].steps[0].body.body) &&
-      !/—/.test(out.results[0].steps[0].body.body),
+      out.results[0].steps.map((s) => s.step).join(',') === 'drain' &&
+      /ASCII-FOLDED/.test(out.results[0].steps[0].body.comment) &&
+      !/—/.test(out.results[0].steps[0].body.comment),
     detail: (out) =>
       `outcome ${out.results[0]?.outcome}, steps ${out.results[0]?.steps.map((s) => s.step).join(',') || 'none'}: ${out.results[0]?.why || ''}`,
   },
@@ -1568,23 +1850,17 @@ const CONTROLS = [
     detail: (out) => out.plan.rows[0].why.slice(0, 90),
   },
   {
-    name: 'FOREIGN — a 403 on the status step STOPS the row; the assignee write is never attempted',
+    name: 'FOREIGN — a boundary 403 on the single combined write leaves the row with ZERO writes (atomic, TRA-4043) and reads REMAINDER, not FAILED',
     build: () => fakeTransport([strandRow('s1', 'TRA-8001')], { on403: 'status' }),
     apply: true,
     assert: (out, t) =>
       out.verdict === 'REMAINDER' &&
       out.results[0].outcome === OUTCOME.FOREIGN &&
-      // the comment landed (still ours at that point), the status 403'd, and
-      // NOTHING assignee-shaped was sent -- a half-written row is worse than none
+      // nothing landed at all -- with the combined write there is no
+      // comment-landed-then-status-403 half state left to worry about
+      t.writes.length === 0 &&
       t.writes.filter((w) => w.body.assigneeAgentId).length === 0,
     detail: (out, t) => `${t.writes.length} write(s) landed; outcome ${out.results[0].outcome}`,
-  },
-  {
-    name: 'FOREIGN — a 403 on the very first write (the comment) is reported as boundary, not as a failure',
-    build: () => fakeTransport([strandRow('s1', 'TRA-8001')], { on403: 'comment' }),
-    apply: true,
-    assert: (out, t) => out.results[0].outcome === OUTCOME.FOREIGN && t.writes.length === 0 && out.verdict === 'REMAINDER',
-    detail: (out) => out.results[0].why.slice(0, 90),
   },
   {
     name: 'THE LIE — a PATCH that returns 2xx and does not STICK is FAILED, not DRAINED (verified by value)',
@@ -1663,7 +1939,7 @@ const CONTROLS = [
     apply: true,
     // The control that a membership list could never pass. This is what stops
     // the carve-out outliving its reason.
-    assert: (out, t) => out.verdict === 'DRAINED' && out.plan.counts.excluded === 0 && t.writes.length === 2,
+    assert: (out, t) => out.verdict === 'DRAINED' && out.plan.counts.excluded === 0 && t.writes.length === 1,
     detail: (out) => `verdict ${out.verdict}, excluded ${out.plan.counts.excluded}`,
   },
   {
@@ -1699,7 +1975,7 @@ const CONTROLS = [
       out.verdict === 'REMAINDER' &&
       out.plan.counts.drain === 1 &&
       out.plan.counts.ineligible === 1 &&
-      t.writes.length === 2 &&
+      t.writes.length === 1 &&
       t.writes.every((w) => w.id === 's1'),
     detail: (out, t) => `drained ${out.plan.counts.drain}, ineligible ${out.plan.counts.ineligible}, writes ${t.writes.length}`,
   },
@@ -1717,16 +1993,22 @@ const CONTROLS = [
     apply: true,
     opts: { only: ['TRA-8002'] },
     assert: (out, t) =>
-      t.writes.length === 2 && t.writes.every((w) => w.id === 's2') && out.plan.counts.notSelected === 1,
+      t.writes.length === 1 && t.writes.every((w) => w.id === 's2') && out.plan.counts.notSelected === 1,
     detail: (out, t) => `wrote to ${[...new Set(t.writes.map((w) => w.id))].join(',')}, notSelected ${out.plan.counts.notSelected}`,
   },
   {
-    name: 'ORDER IS LOAD-BEARING — comment FIRST (while the row is still ours), status LAST (it takes the run lock)',
+    name: 'TRA-4043 ATOMIC ROW — exactly ONE step, `drain`, carrying comment AND status together: no order exists for a budget cut-off to truncate',
     build: () => fakeTransport([strandRow('s1', 'TRA-8001')]),
     apply: true,
-    assert: (out) => {
+    assert: (out, t) => {
       const steps = out.results[0].steps.map((s) => s.step);
-      return steps.length === 2 && steps[0] === 'comment' && steps[1] === 'status' && !steps.includes('assignee');
+      return (
+        steps.length === 1 &&
+        steps[0] === 'drain' &&
+        !steps.includes('assignee') &&
+        t.stats.attempts === 1 &&
+        t.writes.length === 1
+      );
     },
     detail: (out) => out.results[0].steps.map((s) => s.step).join(' -> '),
   },
@@ -1773,7 +2055,7 @@ const CONTROLS = [
     detail: () => 'a post-drain PATCH on the drained row throws 409, as the live platform does',
   },
   {
-    name: 'TRA-4041 RUN_LOCKED — a 409 on the status step is its OWN outcome: not FOREIGN (no twin arm helps), not FAILED',
+    name: 'TRA-4041 RUN_LOCKED — a 409 on the combined write is its OWN outcome: not FOREIGN (no twin arm helps), not FAILED',
     build: () => fakeTransport([strandRow('s1', 'TRA-8001')], { on409: 'status' }),
     apply: true,
     assert: (out, t) =>
@@ -1781,9 +2063,8 @@ const CONTROLS = [
       out.verdict === 'REMAINDER' &&
       DRAIN_EXIT[out.verdict] === 1 &&
       /live run already holds/.test(out.results[0].why) &&
-      // the comment landed; the status did not; nothing is half-written
-      t.writes.length === 1 &&
-      t.writes[0].verb === 'POST',
+      // the single write was rejected whole -- ZERO writes, nothing half-written
+      t.writes.length === 0,
     detail: (out) => out.results[0].why.slice(0, 100),
   },
   {
@@ -1807,15 +2088,15 @@ const CONTROLS = [
     apply: true,
     assert: (out, t) => {
       const rendered = renderDrain(out).join('\n');
-      const status = t.writes.find((w) => w.body.status);
-      const comment = t.writes.find((w) => w.verb === 'POST');
+      const w = t.writes.find((x) => x.body.status);
       return (
         out.verdict === 'DRAINED' &&
         out.results[0].outcome === OUTCOME.DRAINED &&
         out.results[0].disp.klass === ROW_CLASS.SUPPRESSING_LEAF &&
-        t.writes.length === 2 &&
-        // the write itself -- `done`, and NOT `todo`
-        JSON.stringify(status.body) === '{"status":"done"}' &&
+        t.writes.length === 1 &&
+        // the write itself -- `done`, and NOT `todo`, with the audit comment
+        // riding in the same body (TRA-4043)
+        w.body.status === 'done' &&
         out.plan.counts.suppressingLeaf === 1 &&
         out.plan.counts.durableStrand === 0 &&
         // the class is NAMED in the report, with the routine it keeps alive
@@ -1823,8 +2104,8 @@ const CONTROLS = [
         /-> done {2}\[SUPPRESSING_LEAF\]/.test(rendered) &&
         rendered.includes(ROUTINE_ID) &&
         // ...and the ledger says which branch it took
-        /`done` BRANCH, taken deliberately/.test(comment.body.body) &&
-        /concurrencyPolicy `skip_if_active`/.test(comment.body.body)
+        /`done` BRANCH, taken deliberately/.test(w.body.comment) &&
+        /concurrencyPolicy `skip_if_active`/.test(w.body.comment)
       );
     },
     detail: (out, t) =>
@@ -1840,7 +2121,7 @@ const CONTROLS = [
     assert: (out, t) =>
       out.verdict === 'DRAINED' &&
       out.results[0].disp.klass === ROW_CLASS.DURABLE_STRAND &&
-      JSON.stringify(t.writes.find((w) => w.body.status).body) === '{"status":"todo"}' &&
+      t.writes.find((w) => w.body.status).body.status === 'todo' &&
       out.plan.counts.durableStrand === 1 &&
       out.plan.counts.suppressingLeaf === 0 &&
       t.writes.every((w) => w.body.status !== 'done'),
@@ -1862,7 +2143,7 @@ const CONTROLS = [
     apply: true,
     assert: (out, t) =>
       out.results[0].disp.klass === ROW_CLASS.DURABLE_STRAND &&
-      JSON.stringify(t.writes.find((w) => w.body.status).body) === '{"status":"todo"}' &&
+      t.writes.find((w) => w.body.status).body.status === 'todo' &&
       /it GATES TRA-9001:todo/.test(out.results[0].disp.why),
     detail: (out) => out.results[0].disp.why.slice(0, 120),
   },
@@ -1942,12 +2223,12 @@ const CONTROLS = [
       ),
     apply: true,
     assert: (out, t) => {
-      const comment = t.writes.find((w) => w.verb === 'POST');
+      const w = t.writes.find((x) => x.body.status);
       return (
         out.verdict === 'DRAINED' &&
-        JSON.stringify(t.writes.find((w) => w.body.status).body) === '{"status":"done"}' &&
-        /UNREAD/.test(comment.body.body) &&
-        /HTTP 500/.test(comment.body.body)
+        w.body.status === 'done' &&
+        /UNREAD/.test(w.body.comment) &&
+        /HTTP 500/.test(w.body.comment)
       );
     },
     detail: () => 'routine unread => comment says UNREAD, the `done` write is unchanged',
@@ -1971,6 +2252,143 @@ const CONTROLS = [
       out.results[0].outcome === OUTCOME.DRAINED &&
       /status `in_progress`/.test(out.results[0].why),
     detail: (out) => out.results[0].why.slice(0, 110),
+  },
+  {
+    // TRA-4043, the wire gate for the combined body. Composed of the two
+    // existing graders, so every ban they carry must survive composition.
+    name: 'TRA-4043 DRAIN BODY GATE — the combined body is exactly {status,comment}; every existing ban survives composition',
+    unit: () => {
+      const D = { klass: ROW_CLASS.DURABLE_STRAND };
+      const good = gradeWriteBody('drain', { status: 'todo', comment: 'drained -- see TRA-3541' }, D);
+      const leafGood = gradeWriteBody('drain', { status: 'done', comment: 'leaf rest' }, { klass: ROW_CLASS.SUPPRESSING_LEAF });
+      const ascii = gradeWriteBody('drain', { status: 'todo', comment: 'drained — em dash' }, D);
+      const smuggle = gradeWriteBody('drain', { status: 'todo', comment: 'x', assigneeAgentId: 'a' }, D);
+      const blocker = gradeWriteBody('drain', { status: 'todo', comment: 'x', blockedByIssueIds: [] }, D);
+      const wrongStatus = gradeWriteBody('drain', { status: 'done', comment: 'x' }, D);
+      const noClass = gradeWriteBody('drain', { status: 'todo', comment: 'x' });
+      const missing = gradeWriteBody('drain', { status: 'todo' }, D);
+      return {
+        ok:
+          good.ok &&
+          leafGood.ok &&
+          !ascii.ok && /non-ASCII/.test(ascii.why) &&
+          !smuggle.ok && /409 Issue run ownership conflict/.test(smuggle.why) &&
+          !blocker.ok && /blocker write-key/.test(blocker.why) &&
+          !wrongStatus.ok && /DESTROYS unrun work/.test(wrongStatus.why) &&
+          !noClass.ok && /carries no row class/.test(noClass.why) &&
+          !missing.ok && /expected exactly/.test(missing.why),
+        detail:
+          'good todo+comment ok, leaf done+comment ok | refused: non-ASCII comment, smuggled assignee, ' +
+          'blocker key, done-on-durable, no class, missing comment',
+      };
+    },
+  },
+  {
+    // TRA-4043 Defect 1, the reservation. 25 drainable rows against a cap of
+    // 20: exactly 20 drain, 5 are NOT ATTEMPTED with zero network calls, and
+    // the verdict is DEFERRED -- not FAILED, and none of the 5 in the failure
+    // count. This is the 2026-08-26 fire shape, fixed.
+    name: 'TRA-4043 BUDGET RESERVATION — 25 drainable vs cap 20: 20 drained, 5 NOT_ATTEMPTED_BUDGET with ZERO writes, verdict DEFERRED exit 1',
+    build: () => fakeTransport(Array.from({ length: 25 }, (_, i) => strandRow(`s${i + 1}`, `TRA-81${String(i + 1).padStart(2, '0')}`))),
+    apply: true,
+    opts: { budgetCap: 20, budgetSpent: 0 },
+    assert: (out, t) => {
+      const drained = out.results.filter((r) => r.outcome === OUTCOME.DRAINED);
+      const deferred = out.results.filter((r) => r.outcome === OUTCOME.NOT_ATTEMPTED_BUDGET);
+      const rendered = renderDrain(out).join('\n');
+      return (
+        out.verdict === 'DEFERRED' &&
+        DRAIN_EXIT[out.verdict] === 1 &&
+        drained.length === 20 &&
+        deferred.length === 5 &&
+        t.writes.length === 20 &&
+        t.stats.attempts === 20 &&
+        // the deferred rows never even built a step, let alone sent one
+        deferred.every((r) => r.steps.length === 0) &&
+        // and none of them leaked into a failure class
+        out.results.every((r) => r.outcome !== OUTCOME.WRITE_FAILED && r.outcome !== OUTCOME.NOT_VERIFIED) &&
+        /DEFERRED/.test(rendered) &&
+        /NOT write failures/.test(rendered) &&
+        /row ceiling 20/.test(rendered)
+      );
+    },
+    detail: (out, t) => `verdict ${out.verdict}: ${t.writes.length} landed, ${out.results.filter((r) => r.outcome === OUTCOME.NOT_ATTEMPTED_BUDGET).length} deferred, ${t.stats.attempts} attempts`,
+  },
+  {
+    // TRA-4043 — the live 429 outranks the local counter: the surrounding run
+    // can have spent budget this script never saw. The rejected row and every
+    // row after it defer; the rejected row is NOT half-written (atomic write)
+    // and NOT a write failure.
+    name: 'TRA-4043 AUTHORITATIVE 429 — a live cap rejection defers the row AND the rest of the plan without further attempts; never FAILED',
+    build: () => fakeTransport(Array.from({ length: 4 }, (_, i) => strandRow(`s${i + 1}`, `TRA-820${i + 1}`)), { capAt: 2 }),
+    apply: true,
+    opts: { budgetCap: 20, budgetSpent: 0 },
+    assert: (out, t) => {
+      const outcomes = out.results.map((r) => r.outcome);
+      return (
+        out.verdict === 'DEFERRED' &&
+        outcomes.join(',') ===
+          [OUTCOME.DRAINED, OUTCOME.DRAINED, OUTCOME.NOT_ATTEMPTED_BUDGET, OUTCOME.NOT_ATTEMPTED_BUDGET].join(',') &&
+        t.writes.length === 2 &&
+        // rows 1,2 attempted and landed; row 3 attempted and 429'd; row 4 was
+        // gated locally off the authoritative signal -- no fourth attempt
+        t.stats.attempts === 3 &&
+        /live 429 said so|cross_issue_influence_cap_exceeded/.test(out.results[3].why) &&
+        /REJECTED whole/.test(out.results[2].why)
+      );
+    },
+    detail: (out, t) => `outcomes ${out.results.map((r) => r.outcome).join(',')}; ${t.stats.attempts} attempts, ${t.writes.length} landed`,
+  },
+  {
+    // TRA-4043 — the cap is per RUN, not per script. A caller that already
+    // spent 19 writes this heartbeat gets a 1-row ceiling here, not 20.
+    name: 'TRA-4043 --budget-spent — 19 pre-spent of cap 20 leaves a 1-row ceiling: 1 drained, 2 deferred',
+    build: () => fakeTransport(Array.from({ length: 3 }, (_, i) => strandRow(`s${i + 1}`, `TRA-830${i + 1}`))),
+    apply: true,
+    opts: { budgetCap: 20, budgetSpent: 19 },
+    assert: (out, t) =>
+      out.verdict === 'DEFERRED' &&
+      out.results.filter((r) => r.outcome === OUTCOME.DRAINED).length === 1 &&
+      out.results.filter((r) => r.outcome === OUTCOME.NOT_ATTEMPTED_BUDGET).length === 2 &&
+      t.writes.length === 1 &&
+      t.stats.attempts === 1 &&
+      /row ceiling 1/.test(renderDrain(out).join('\n')),
+    detail: (out, t) => `${t.writes.length} landed, ${out.results.filter((r) => r.outcome === OUTCOME.NOT_ATTEMPTED_BUDGET).length} deferred`,
+  },
+  {
+    // TRA-4299 — the transient trap. A 403 run_context_required on the first
+    // attempt is retried once and the retry lands: the row DRAINS, and is
+    // never misread as FOREIGN (which would send it to a twin arm that does
+    // not exist).
+    name: 'TRA-4299 TRANSIENT 403 — run_context_required on attempt 1 is retried and the retry drains the row; not FOREIGN',
+    build: () => fakeTransport([strandRow('s1', 'TRA-8001')], { runContext403Times: 1 }),
+    apply: true,
+    opts: { runContextRetryMs: 0 },
+    assert: (out, t) =>
+      out.verdict === 'DRAINED' &&
+      out.results[0].outcome === OUTCOME.DRAINED &&
+      t.stats.attempts === 2 &&
+      t.writes.length === 1,
+    detail: (out, t) => `outcome ${out.results[0].outcome} after ${t.stats.attempts} attempts (1 refused, 1 landed)`,
+  },
+  {
+    // TRA-4299 — and when the context never arrives: each row gets one retry,
+    // two consecutive refusals trip the breaker and the rest of the plan is
+    // deferred without spending budget on attempts that cannot land. REMAINDER,
+    // never FOREIGN, never FAILED.
+    name: 'TRA-4299 PERSISTENT 403 — run context absent all run: RUN_CONTEXT_DEFERRED rows, breaker after 2, verdict REMAINDER not FAILED/FOREIGN',
+    build: () => fakeTransport(Array.from({ length: 3 }, (_, i) => strandRow(`s${i + 1}`, `TRA-840${i + 1}`)), { runContext403Times: Infinity }),
+    apply: true,
+    opts: { runContextRetryMs: 0 },
+    assert: (out, t) =>
+      out.verdict === 'REMAINDER' &&
+      out.results.every((r) => r.outcome === OUTCOME.RUN_CONTEXT_DEFERRED) &&
+      out.results.every((r) => r.outcome !== OUTCOME.FOREIGN && r.outcome !== OUTCOME.WRITE_FAILED) &&
+      // rows 1 and 2: two attempts each; row 3: breaker, zero attempts
+      t.stats.attempts === 4 &&
+      t.writes.length === 0 &&
+      /not attempted/.test(out.results[2].why),
+    detail: (out, t) => `${t.stats.attempts} attempts across 3 rows (breaker held row 3 back), verdict ${out.verdict}`,
   },
 ];
 
@@ -2014,8 +2432,16 @@ async function selftest() {
   // Arm-reachability. A suite whose controls all exercise one branch proves one
   // branch. Every verdict and every row outcome must be REACHED by some case,
   // or the suite is smaller than it looks.
-  const wantVerdicts = ['VACUOUS', 'DRAINED', 'REMAINDER', 'FAILED', 'BLIND'];
-  const wantOutcomes = [OUTCOME.DRAINED, OUTCOME.PLANNED, OUTCOME.FOREIGN, OUTCOME.NOT_VERIFIED, OUTCOME.RUN_LOCKED];
+  const wantVerdicts = ['VACUOUS', 'DRAINED', 'REMAINDER', 'DEFERRED', 'FAILED', 'BLIND'];
+  const wantOutcomes = [
+    OUTCOME.DRAINED,
+    OUTCOME.PLANNED,
+    OUTCOME.FOREIGN,
+    OUTCOME.NOT_VERIFIED,
+    OUTCOME.RUN_LOCKED,
+    OUTCOME.NOT_ATTEMPTED_BUDGET,
+    OUTCOME.RUN_CONTEXT_DEFERRED,
+  ];
   const wantClasses = [ROW_CLASS.DURABLE_STRAND, ROW_CLASS.SUPPRESSING_LEAF, ROW_CLASS.UNCLASSIFIABLE];
   for (const [label, want, seen] of [
     ['verdict', wantVerdicts, seenVerdicts],
@@ -2114,6 +2540,12 @@ async function main() {
     limit: Number(argOf('limit', 1000)),
     maxPages: Number(argOf('max-pages', 50)),
     concurrency: Number(argOf('concurrency', 8)),
+    // TRA-4043 — the per-run cross-issue write budget. `--budget-spent` is for
+    // a caller that already made cross-issue writes in this same heartbeat run
+    // before invoking the drain (the cap is per RUN, not per script).
+    budgetCap: Number(argOf('budget', BUDGET_DEFAULT_CAP)),
+    budgetSpent: Number(argOf('budget-spent', 0)),
+    runContextRetryMs: Number(argOf('run-context-retry-ms', 3000)),
   });
 
   if (argv.includes('--json')) {
@@ -2126,6 +2558,7 @@ async function main() {
           verdict: out.verdict,
           blind: out.blind,
           counts: out.plan ? out.plan.counts : null,
+          budget: out.budget || null,
           results: out.results.map((r) => ({
             identifier: r.identifier,
             outcome: r.outcome,
