@@ -173,6 +173,9 @@ committed `HEAD`'s copies of 7 of the 9 files. Every individual command was corr
 git commit -m "..." -- <your paths>   # reads the WORKING TREE for those paths — safe
 ```
 
+- A **brand-new** file must be `git add <path>`-ed first or the pathspec errors out ("did not match
+  any file(s) known to git"). That add is safe — it writes *your* worktree content for *your* named
+  path; the path-limited commit still excludes everything anyone else staged.
 - `git commit --amend` and bare `git commit` read the **index**, which another run can reset or
   restage under you — not safe. (During a path-limited commit git builds a private temporary index,
   which is why that verb is immune.)
