@@ -57,6 +57,7 @@
 // describes decisions that have already been made and can never change one.
 
 import type { TapeExpectancyTable, TapeExpectancyVerdict } from './option-tape-expectancy.js';
+import { TAPE_INPUT_STALE_THRESHOLD_DAYS } from './option-tape-expectancy.js';
 
 /**
  * Where the compared `grossR` resolved from. Every member today is CELL-LEVEL —
@@ -344,6 +345,132 @@ export interface GrossRProvenanceGeneration {
   lastDecisionAt: number;
 }
 
+/**
+ * ⭐ TRA-4875 — THE STALENESS VERDICT, ON THE GATE DECISION ROW ITSELF.
+ *
+ * TRA-4783 gave `arm.costBar.edge.freshness` an `inputStale` boolean and **nothing
+ * consumed it**: the gate went on refusing every candidate off constants derived
+ * from a tape that stopped advancing in early August, and a gate audit read
+ * `blocked: 1799, blockRate: 1` with no annotation anywhere near it. The flag had
+ * been true since roughly mid-August; it was found by hand off a postmarket
+ * review five weeks later.
+ *
+ * Two things make this DIFFERENT from `arm.costBar.edge.freshness`, and both are
+ * the reason it exists rather than a pointer to that block:
+ *
+ *  1. **It is PER CELL and it is scoped to the cells that DECIDED something.**
+ *     The global `inputTapeAgeDaysMax` is a max over all eight fold cells, and on
+ *     2026-09-24 it read 78.1 d driven by `0.40-0.45` — a cell the armed strike
+ *     selector (band `[0.25, 0.40)`) can never nominate. The two cells that
+ *     actually refused the live entry site sat at 52.3 d and 51.1 d. A reader
+ *     acting on the global number would have been right for the wrong reason,
+ *     and a reader who checked which cell drove it would have concluded the
+ *     decision-relevant cells were fine. Neither is the truth.
+ *  2. **It is measured AT THE DECISION, not at read time.** The age here is
+ *     `decidedAt − tapeToTs` off the row's own stamp, so it describes how stale
+ *     the constant was when it refused a candidate — not how stale the estimator
+ *     looks to whoever is reading the route now.
+ *
+ * ⚠️ THREE-VALUED, on the TRA-4783 contract, and for the same reason:
+ *   `true`  — at least one stamped decision here faced a tape older than the bar.
+ *   `false` — a CLEAN pass: rows are stamped, every stamped decision was inside
+ *             the bar, and NO row is unstamped. An unstamped row's tape age is
+ *             unknown and can be arbitrarily old.
+ *   `null`  — NOT COMPUTABLE: nothing stamped, or the stamped rows read fresh
+ *             while others carry no stamp. Never read this as false; `?? false`
+ *             re-creates the coerce-unknown-to-healthy bug one layer up.
+ *
+ * ⛔ READ-ONLY, like every other field in this module. Nothing on the admission
+ * path consults it and a `true` here must NEVER admit a candidate: a stale
+ * estimator should keep refusing (TRA-4875 item 3). The defect was the silence,
+ * not the refusal.
+ */
+export interface GrossRInputFreshness {
+  /** `true | false | null` — see the three-valued contract above. NEVER `?? false` it. */
+  stale: boolean | null;
+  /** The bar the verdict was decided against, in days, published so a reader need not guess. */
+  thresholdDays: number;
+  /**
+   * ⭐ The age, in days (1 decimal), of the OLDEST tape any stamped decision in
+   * this group faced, measured at that decision's own instant. This is the number
+   * AC1 asks for. Null ⇒ nothing stamped carried a tape window.
+   */
+  tapeAgeDaysAtDecisionMax: number | null;
+  /** The age at the most recent stamped decision — "how stale is it right now, as applied". */
+  tapeAgeDaysAtLastDecision: number | null;
+  /** Newest `closeTs` behind any stamped decision here, ISO. The tape's own end. */
+  tapeToIsoNewest: string | null;
+  /** Decisions carrying a numerator stamp — the denominator the verdict is over. */
+  rowsStamped: number;
+  /** Decisions carrying none. > 0 forces `false` down to `null`; it never forces `true`. */
+  rowsUnstamped: number;
+  /** One line a human can read off a gate audit without joining anything. */
+  statement: string;
+}
+
+/**
+ * Fold the stamped decisions' own tape ages into the TRA-4875 staleness verdict.
+ * PURE — the ages are already on the rows; this only compares them to the bar.
+ *
+ * The compare runs on the RAW age and only the published number is rounded, so
+ * 10.04 days against a 10-day bar reads `{ 10.0, true }` — rounding may not
+ * un-trip the flag. Same contract as `summarizeTapeInputStaleness`.
+ */
+function foldInputFreshness(
+  generations: readonly GrossRProvenanceGeneration[],
+  rowsStamped: number,
+  rowsUnstamped: number,
+  tapeAgeMsMaxAtDecision: number | null,
+  tapeToTsMax: number | null,
+  thresholdDays: number,
+): GrossRInputFreshness {
+  const toDays = (ms: number | null): number | null =>
+    ms === null || !Number.isFinite(ms) ? null : Math.round((ms / 86_400_000) * 10) / 10;
+  // `generations` is sorted newest-fold-first; the most recent DECISION is the
+  // one to quote for "as applied right now", and it is not necessarily the one
+  // with the oldest tape.
+  let lastDecisionAt: number | null = null;
+  let lastAgeMs: number | null = null;
+  for (const g of generations) {
+    if (g.tapeAgeMsAtLastDecision === null) continue;
+    if (lastDecisionAt === null || g.lastDecisionAt > lastDecisionAt) {
+      lastDecisionAt = g.lastDecisionAt;
+      lastAgeMs = g.tapeAgeMsAtLastDecision;
+    }
+  }
+  const rawMaxDays =
+    tapeAgeMsMaxAtDecision === null || !Number.isFinite(tapeAgeMsMaxAtDecision)
+      ? null
+      : tapeAgeMsMaxAtDecision / 86_400_000;
+  const stale: boolean | null =
+    rawMaxDays === null
+      ? null
+      : rawMaxDays > thresholdDays
+        ? true
+        : rowsUnstamped > 0
+          ? null
+          : false;
+  const maxDays = toDays(tapeAgeMsMaxAtDecision);
+  const statement =
+    stale === true
+      ? `⚠️ STALE INPUTS — this group's decisions were made against a tape up to ${maxDays} d old at the decision (bar ${thresholdDays} d). These refusals are ENFORCED and the gate MUST NOT BE RELAXED on account of this; a stale estimator should keep refusing. What is wrong is the SILENCE: the refusal count is one frozen verdict replayed, so it is not evidence the market moved.`
+      : stale === false
+        ? `inputs fresh — every one of ${rowsStamped} stamped decision(s) faced a tape at most ${maxDays} d old (bar ${thresholdDays} d), and no row is unstamped.`
+        : rowsStamped === 0
+          ? `NOT COMPUTABLE — 0 of ${rowsUnstamped} decision(s) carry a numerator stamp, so no tape age is known here. This is COVERAGE, not a clean bill.`
+          : `NOT COMPUTABLE — the ${rowsStamped} stamped decision(s) read at most ${maxDays} d (inside the ${thresholdDays} d bar), but ${rowsUnstamped} row(s) carry no stamp and their tape age is unknown. Unknown is NOT fresh.`;
+  return {
+    stale,
+    thresholdDays,
+    tapeAgeDaysAtDecisionMax: maxDays,
+    tapeAgeDaysAtLastDecision: toDays(lastAgeMs),
+    tapeToIsoNewest: isoOrNull(tapeToTsMax),
+    rowsStamped,
+    rowsUnstamped,
+    statement,
+  };
+}
+
 /** The per-cell (or whole-gate) numerator provenance fold. */
 export interface GrossRProvenanceFold {
   /** Decisions carrying a numerator stamp. */
@@ -397,6 +524,13 @@ export interface GrossRProvenanceFold {
    * over a tape still accruing is an ordinary quiet cell.
    */
   recovered: GrossRRecovered;
+  /**
+   * ⭐ TRA-4875 — IS THE CONSTANT THAT DECIDED THESE ROWS STALE? Per cell, at the
+   * decision, three-valued. Read it beside `constantAcrossRows`: `true` there and
+   * `stale: true` here is one frozen verdict replayed across every refusal in the
+   * group, which is a different claim from "the gate refused N candidates".
+   */
+  inputFreshness: GrossRInputFreshness;
 }
 
 const MAX_GENERATIONS = 12;
@@ -458,7 +592,16 @@ function isoOrNull(ms: number | null): string | null {
  * alone. Two cells share a fold instant, and a group that pooled them would
  * publish a `byMode` and an `n` belonging to neither.
  */
-export function foldGrossRProvenance(rows: readonly GrossRProvenanceRow[]): GrossRProvenanceFold | null {
+export function foldGrossRProvenance(
+  rows: readonly GrossRProvenanceRow[],
+  /**
+   * TRA-4875 — the staleness bar, defaulted to the SAME constant
+   * `arm.costBar.edge.freshness.inputStale` is decided against. Injectable for
+   * tests only: two bars on one payload is how a degradation surface starts
+   * disagreeing with itself.
+   */
+  thresholdDays: number = TAPE_INPUT_STALE_THRESHOLD_DAYS,
+): GrossRProvenanceFold | null {
   if (rows.length === 0) return null;
   const groups = new Map<string, GrossRProvenanceGeneration>();
   const sources = new Map<string, { source: string; kind: GrossRSourceKind; rows: number }>();
@@ -534,6 +677,9 @@ export function foldGrossRProvenance(rows: readonly GrossRProvenanceRow[]): Gros
       tapeAgeMsMaxAtDecision: null,
       tapeToTsMax: null,
       recovered,
+      // Nothing stamped ⇒ NOT COMPUTABLE, and it says so. A group of pre-deploy
+      // rows must not render as a clean freshness pass.
+      inputFreshness: foldInputFreshness([], 0, rowsUnstamped, null, null, thresholdDays),
     };
   }
 
@@ -563,5 +709,13 @@ export function foldGrossRProvenance(rows: readonly GrossRProvenanceRow[]): Gros
     tapeAgeMsMaxAtDecision: tapeAgeMax,
     tapeToTsMax,
     recovered,
+    inputFreshness: foldInputFreshness(
+      all,
+      rowsStamped,
+      rowsUnstamped,
+      tapeAgeMax,
+      tapeToTsMax,
+      thresholdDays,
+    ),
   };
 }

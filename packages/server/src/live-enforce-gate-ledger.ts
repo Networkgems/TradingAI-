@@ -56,6 +56,7 @@ import type { ImpliedBarR, LiveEnforceGatePredicate } from './live-enforce-gate-
 // recovered the denominator.
 import { foldGrossRProvenance } from './live-enforce-gate-gross-provenance.js';
 import type {
+  GrossRInputFreshness,
   GrossRProvenance,
   GrossRProvenanceFold,
 } from './live-enforce-gate-gross-provenance.js';
@@ -1546,6 +1547,27 @@ export interface LiveEnforceCellSummary {
    */
   grossRProvenance: GrossRProvenanceFold | null;
   /**
+   * ⭐ TRA-4875 — IS THIS ROW'S OWN CONSTANT STALE? Hoisted out of
+   * `grossRProvenance.inputFreshness` (the same object, not a second
+   * computation) so a gate audit reads "refused on stale inputs" off the
+   * decision row itself, with no cross-reference to `arm.costBar.edge`.
+   *
+   * The defect this closes: `arm.costBar.edge.freshness.inputStale` has been
+   * `true` since roughly 2026-08-18 and nothing consumed it. Worse, the global
+   * flag is a max over ALL fold cells and was driven by `0.40-0.45` (78.1 d),
+   * which the armed selector cannot nominate — so it was true for the wrong
+   * reason, while the cells that actually refused the live entry site read
+   * 52.3 d and 51.1 d. This field is per cell, so that confusion cannot recur.
+   *
+   * ⚠️ `stale` is THREE-VALUED (`true | false | null`); `null` is NOT
+   * COMPUTABLE and must never be read as fresh. Null on this field (the whole
+   * block) ⇒ the cell produced no cost samples at all.
+   *
+   * ⛔ READ-ONLY. A `true` here must never admit anything — a stale estimator
+   * keeps refusing, and the refusals below are correct.
+   */
+  inputFreshness: GrossRInputFreshness | null;
+  /**
    * TRA-4745 — one sampled BLOCKED row per ET day in this cell, carrying the
    * exact comparison the gate evaluated. Empty on a cell with no blocks, and on
    * a cell whose rows all predate the stamp (see `predicateUnstamped`).
@@ -2813,6 +2835,10 @@ function foldGates(
       const cellSamples = samplesByCell.get(cell) ?? [];
       // TRA-4745 — the predicate coverage split for this cell.
       const coverage = predicateCoverage(cellSamples);
+      // TRA-4875 — folded ONCE and referenced twice (here and hoisted onto the
+      // row as `inputFreshness`). Two computations of one verdict is how the
+      // hoisted copy starts disagreeing with the nested one.
+      const cellProvenance = grossRProvenanceFold(cellSamples);
       byCell.push({
         cell,
         evaluated: t.evaluated,
@@ -2842,7 +2868,10 @@ function foldGates(
         // re-reading today's estimator gives a value that is constant across
         // every day by construction and so can neither confirm nor refute the
         // "one verdict replayed" reading.
-        grossRProvenance: grossRProvenanceFold(cellSamples),
+        grossRProvenance: cellProvenance,
+        // TRA-4875 — AC1: the staleness state of the constant that produced
+        // THIS row's refusals, on the row, no cross-reference required.
+        inputFreshness: cellProvenance?.inputFreshness ?? null,
         predicateSamples: predicateSamples(cellSamples),
         predicateUnstamped: coverage.predicateUnstamped,
         rowsCompared: coverage.rowsCompared,
