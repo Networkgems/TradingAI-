@@ -638,6 +638,24 @@ export function catalystSweepStateCountForTests(): number {
   return sweepStates.size;
 }
 
+/**
+ * Production probe of the at-most-one-per-window invariant (TRA-4777), as
+ * `session:window` keys in insertion order.
+ *
+ * This is the ONLY field that grades the eviction. {@link catalystSweepGateSnapshot}
+ * takes the LAST match precisely so that a regressed `retireStaleWindowKeys`
+ * still reports the newest session — a backstop that makes the reported
+ * `session` read correct whether or not the eviction is alive, so it cannot
+ * discriminate the two. The resident keys can: from the second ET day a
+ * process survives, a live eviction holds the count at one key per window that
+ * has run, while a dead one accumulates a key per session per window.
+ * (TRA-4737 shipped the eviction; TRA-4761 could not grade it because nothing
+ * was on the wire.)
+ */
+export function catalystSweepResidentKeys(): string[] {
+  return [...sweepStates.keys()];
+}
+
 /** Probe view of the gate, for `/api/health/news-catalyst-signals`. Defaults to `premarket`. */
 export interface CatalystSweepGateSnapshot {
   session: string | null;

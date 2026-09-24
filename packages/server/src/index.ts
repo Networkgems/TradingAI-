@@ -679,7 +679,7 @@ import {
 import { initOiShadowLedger, listOiShadowSignals, isOiShadowEnabled, usableSignalCount as usableOiSignalCount } from './oi-shadow-ledger.js';
 import { initNewsCatalystLedger, listNewsCatalystSignals, isNewsCatalystEnabled, chosenSignalCount, rowContaminatedSessions } from './news-catalyst-ledger.js';
 import { initNewsCatalystRunLedger, summarizeCatalystRuns } from './news-catalyst-run-ledger.js';
-import { catalystUniverse, catalystSweepGateSnapshot } from './news-catalyst-source.js';
+import { catalystUniverse, catalystSweepGateSnapshot, catalystSweepResidentKeys } from './news-catalyst-source.js';
 import { initNewsCatalystLeanLedger, listCatalystLeans, leanBreakdown } from './news-catalyst-lean-ledger.js';
 import { initPcsShadowLedger, listPcsShadowSignals, isPcsShadowEnabled, settledSignalCount, PCS_SHADOW_STRATEGY_ID } from './pcs-shadow-ledger.js';
 import {
@@ -10970,7 +10970,26 @@ app.get('/api/health/news-catalyst-signals', async (_req, res) => {
       // TRA-4682 — the once-per-session sweep gate, process-local (resets on
       // restart). `attempts` is vendor sweeps this session; `servedFromCache`
       // is the per-account callers that used to each be a sweep.
-      sweepGate: catalystSweepGateSnapshot(),
+      // TRA-4777 — publish BOTH windows. `catalystSweepGateSnapshot()` defaults
+      // to `premarket`, so the midday gate (the slot TRA-4901 created and
+      // TRA-4737 fixed the eviction of) had no wire representation at all: it
+      // was unreadable from outside the process.
+      sweepGate: {
+        premarket: catalystSweepGateSnapshot('premarket'),
+        midday: catalystSweepGateSnapshot('midday'),
+      },
+      // TRA-4777 — the eviction discriminator. The `session` reported above is
+      // carried by a last-match backstop that reads correct even if the
+      // eviction regressed, so it grades the backstop and not the eviction.
+      // These fields do grade the eviction: on a process that has crossed an ET
+      // midnight, expect exactly ONE key per window that has run. More than
+      // that means `retireStaleWindowKeys` is dead and the backstop is silently
+      // carrying the probe. A day-1 process cannot tell the two apart — read
+      // the boot time first and say which boot the read belongs to.
+      ...(() => {
+        const keys = catalystSweepResidentKeys();
+        return { sweepGateResidentKeys: keys.length, sweepGateResidentSessions: keys.slice(0, 8) };
+      })(),
       // TRA-4682 (CFO addendum) — row basis, beside the run-basis
       // `sessionsNoHealthyRun`: sessions whose rows carry a quote failure even
       // though the sweep itself succeeded. Different failure; read both.
