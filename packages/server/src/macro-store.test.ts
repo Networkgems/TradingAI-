@@ -93,4 +93,46 @@ describe('macro-store', () => {
     if (prev === undefined) delete process.env['FRED_API_KEY'];
     else process.env['FRED_API_KEY'] = prev;
   });
+
+  // ── TRA-4430 — the curated FOMC schedule is seeded WITHOUT a FRED key ──────
+  describe('refreshMacroCalendar(null) — fomc-only seeding (TRA-4430)', () => {
+    // Pinned so the test never depends on the wall clock: seed as of
+    // 2026-09-01; the 2026-09-16 FOMC decision must land in the store.
+    const seedAsOf = Date.parse('2026-09-01T12:00:00Z');
+
+    it('a keyless refresh seeds curated FOMC rows — daysToNextFOMCSync is non-null before 2026-09-16', async () => {
+      const res = await refreshMacroCalendar(null, { asOf: seedAsOf });
+      expect(res.mode).toBe('fomc-only');
+      expect(res.fomc).toBeGreaterThan(0);
+      expect(res.stored).toBe(res.fomc); // nothing but curated rows on a cold keyless host
+
+      // The acceptance read: a date before the 2026-09-16 decision day sees it.
+      const before = Date.parse('2026-09-09T12:00:00Z');
+      expect(daysToNextFOMCSync(before)).toBe(7); // 09-09 → 09-16
+      expect(await daysToNextFOMC(before)).toBe(7);
+    });
+
+    it('a keyless refresh preserves previously-fetched FRED rows (never blanks them)', async () => {
+      await refreshMacroCalendar(stubClient([ev('CPI', '2026-09-10'), ev('FOMC', '2026-09-16')]));
+      const res = await refreshMacroCalendar(null, { asOf: seedAsOf });
+      expect(res.mode).toBe('fomc-only');
+
+      const events = await getUpcomingMacroEvents(seedAsOf);
+      // The FRED-sourced CPI row survives; the curated FOMC rows are present.
+      expect(events.some((e) => e.type === 'CPI' && e.source === 'fred')).toBe(true);
+      expect(events.some((e) => e.type === 'FOMC' && e.date === '2026-09-16')).toBe(true);
+    });
+
+    it('the full path reports mode "full"', async () => {
+      const res = await refreshMacroCalendar(stubClient([ev('FOMC', '2026-09-16')]));
+      expect(res.mode).toBe('full');
+    });
+
+    it('fomc-only seeding survives a cache reset (persisted to disk)', async () => {
+      await refreshMacroCalendar(null, { asOf: seedAsOf });
+      __resetMacroStoreForTests(join(tmpRoot, 'economic-calendar.json'));
+      await initMacroStore();
+      expect(daysToNextFOMCSync(Date.parse('2026-09-09T12:00:00Z'))).toBe(7);
+    });
+  });
 });

@@ -65,10 +65,62 @@ export const FRED_RELEASES: ReadonlyArray<{
  * are fixed a year ahead and do not correspond to a FRED data release, so they
  * are shipped here rather than fetched. Refresh annually.
  *
+ * TRA-4430: extended back to 2021 so a walk-forward OOS window has meetings in
+ * it — past decision days are static public history and are known *ex-ante*
+ * (the schedule is published the prior year), so a point-in-time backtest may
+ * read the whole constant without lookahead. Unscheduled notation votes (e.g.
+ * 2025-08-22) are deliberately EXCLUDED: they are not on the ex-ante schedule,
+ * so treating them as suppression events would be lookahead.
+ *
  * Source: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
  */
 export const FOMC_MEETINGS: readonly string[] = [
-  // 2026 (decision day = second meeting day)
+  // 2021 (decision day = second meeting day)
+  '2021-01-27',
+  '2021-03-17',
+  '2021-04-28',
+  '2021-06-16',
+  '2021-07-28',
+  '2021-09-22',
+  '2021-11-03',
+  '2021-12-15',
+  // 2022
+  '2022-01-26',
+  '2022-03-16',
+  '2022-05-04',
+  '2022-06-15',
+  '2022-07-27',
+  '2022-09-21',
+  '2022-11-02',
+  '2022-12-14',
+  // 2023
+  '2023-02-01', // Jan 31 – Feb 1 meeting
+  '2023-03-22',
+  '2023-05-03',
+  '2023-06-14',
+  '2023-07-26',
+  '2023-09-20',
+  '2023-11-01', // Oct 31 – Nov 1 meeting
+  '2023-12-13',
+  // 2024
+  '2024-01-31',
+  '2024-03-20',
+  '2024-05-01', // Apr 30 – May 1 meeting
+  '2024-06-12',
+  '2024-07-31',
+  '2024-09-18',
+  '2024-11-07',
+  '2024-12-18',
+  // 2025
+  '2025-01-29',
+  '2025-03-19',
+  '2025-05-07',
+  '2025-06-18',
+  '2025-07-30',
+  '2025-09-17',
+  '2025-10-29',
+  '2025-12-10',
+  // 2026
   '2026-01-28',
   '2026-03-18',
   '2026-04-29',

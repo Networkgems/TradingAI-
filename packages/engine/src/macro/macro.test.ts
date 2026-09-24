@@ -5,6 +5,7 @@ import {
   nextEventOfType,
   daysToNextFOMC,
   fomcEvents,
+  FOMC_MEETINGS,
   EconomicCalendarClient,
   type MacroEvent,
 } from './macro-client.js';
@@ -94,6 +95,24 @@ describe('nextEventOfType / daysToNextFOMC', () => {
     ];
     expect(nextEventOfType(onlyPast, 'FOMC', asOf)).toBeNull();
     expect(daysToNextFOMC(onlyPast, asOf)).toBeNull();
+  });
+});
+
+describe('FOMC_MEETINGS coverage (TRA-4430)', () => {
+  it('carries 8 decision days per year for every year 2021–2026, sorted and unique', () => {
+    const byYear = new Map<string, number>();
+    for (const date of FOMC_MEETINGS) {
+      expect(date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+      const year = date.slice(0, 4);
+      byYear.set(year, (byYear.get(year) ?? 0) + 1);
+    }
+    // The Fed schedules 8 regular meetings a year; unscheduled notation votes
+    // are deliberately excluded (not ex-ante ⇒ lookahead in a backtest).
+    for (const year of ['2021', '2022', '2023', '2024', '2025', '2026']) {
+      expect(byYear.get(year)).toBe(8);
+    }
+    expect(FOMC_MEETINGS.length).toBe(48);
+    expect([...FOMC_MEETINGS]).toEqual([...new Set(FOMC_MEETINGS)].sort());
   });
 });
 

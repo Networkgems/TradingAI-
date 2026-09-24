@@ -55,6 +55,20 @@
  * NOT-YET-PAST earnings date as of that bar (`earningsInDaysAsOf`). Nothing the
  * evaluator sees at bar T depends on price/data after T.
  *
+ * ── TRA-4430: the macro / FOMC arm ───────────────────────────────────────────
+ * The D1 gate's OPTIONAL rule 2 (`macro_meanrev`) suppresses mean-reverting
+ * entries (`bb_fade` / `sma200_pullback`) when an FOMC decision or another
+ * high-impact macro print is within 1 calendar day. Two further books grade it
+ * here (`macro_meanrev_swing`, `macro_meanrev_bbfade`) with the same
+ * walk-forward geometry and the same five pre-registered metric families.
+ * Point-in-time is trivial for this arm: the FOMC schedule is published a year
+ * ahead by the Fed (curated `FOMC_MEETINGS` constant, no vendor key), so the
+ * whole constant is ex-ante knowledge at every decision bar — which is exactly
+ * why this arm is gradeable TODAY while the earnings arm waits on a Finnhub
+ * token. Coverage caveat: without `FRED_API_KEY` the CPI/NFP/PCE prints are
+ * absent, so this arm grades the FOMC COMPONENT of rule 2, a subset of the live
+ * predicate (noted in `verdict.notes`).
+ *
  * ─────────────────────────────────────────────────────────────────────────────
  * SPEND / NETWORK SAFETY — this script does NOTHING by default.
  *   • `… run-tra1968-earnings-gate.ts`            → PLAN mode: prints the config
@@ -66,16 +80,19 @@
  *   • `… run-tra1968-earnings-gate.ts --execute`  → the REAL run: Yahoo daily
  *     bars (no key) + Finnhub historical earnings (needs `FINNHUB_API_TOKEN`).
  *     Free market data; blocked on the earnings token when it is absent.
+ *   • `… run-tra1968-earnings-gate.ts --execute-macro` → the REAL macro-arm run
+ *     (TRA-4430): Yahoo daily bars + the curated FOMC constant. NO vendor
+ *     credential of any kind — runs on a bare checkout. Earnings books skipped.
  *
  * Run:
- *   pnpm --filter @trading-app/backtest exec tsx src/run-tra1968-earnings-gate.ts [--smoke|--execute]
+ *   pnpm --filter @trading-app/backtest exec tsx src/run-tra1968-earnings-gate.ts [--smoke|--execute|--execute-macro]
  */
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import YahooFinance from 'yahoo-finance2';
-import { EarningsCalendarClient, daysUntil, type EarningsEvent } from '@trading-app/engine';
+import { EarningsCalendarClient, daysUntil, FOMC_MEETINGS, type EarningsEvent } from '@trading-app/engine';
 import type { Candle } from '@trading-app/shared';
 import { walkForward } from './walk-forward.js';
 import { summarizeTrades, type TradeMetrics } from './tra731-metrics.js';
@@ -106,24 +123,40 @@ const WARMUP_BARS = 250; // clears the 200-day slow EMA the swing router keys on
 // dep. `SWING_MAX_DAYS` stays exported for the point-in-time helper tests.
 const SWING_MAX_DAYS = 10;
 const INTRADAY_MAX_DAYS = 1;
+// TRA-4430 — rule 2's proximity window (calendar days). Mirrors the hardcoded
+// `daysToFomc <= 1` / `eventsNearDate(±1)` union in `evaluateCatalystGate`.
+const MACRO_MAX_DAYS = 1;
 
 /**
- * The two books graded here. Each is run once; the gate is then applied as a
+ * The books graded here. Each is run once; the gate is then applied as a
  * point-in-time split of that book's ledger, swept across `sweepDays`. `swing`
  * proxies the live `sma200_pullback` router; `intraday_trend` (ichimoku) proxies
  * the intraday trend entries (ORB / Ichimoku) the gate also touches. NOTE: true
  * intraday opening-range (ORB) entries need intraday bars this daily harness does
  * not fetch — see `verdict.notes`; ichimoku is the daily-cadence trend proxy.
+ *
+ * `gate` selects the predicate the split reads: `earnings` = days to the next
+ * earnings event (rule 1); `macro_fomc` = absolute calendar-day distance to the
+ * nearest curated FOMC decision day (rule 2, FOMC component — TRA-4430).
  */
 interface BookSpec {
   label: string;
   strategyType: BacktestConfig['strategyType'];
   defaultThresholdDays: number;
   sweepDays: number[];
+  gate: 'earnings' | 'macro_fomc';
 }
 const BOOKS: BookSpec[] = [
-  { label: 'swing', strategyType: 'swing', defaultThresholdDays: SWING_MAX_DAYS, sweepDays: [5, 7, 10, 14] },
-  { label: 'intraday_trend', strategyType: 'ichimoku', defaultThresholdDays: INTRADAY_MAX_DAYS, sweepDays: [1, 2] },
+  { label: 'swing', strategyType: 'swing', defaultThresholdDays: SWING_MAX_DAYS, sweepDays: [5, 7, 10, 14], gate: 'earnings' },
+  { label: 'intraday_trend', strategyType: 'ichimoku', defaultThresholdDays: INTRADAY_MAX_DAYS, sweepDays: [1, 2], gate: 'earnings' },
+];
+// TRA-4430 — the macro arm: rule 2 targets the two mean-reversion entry paths
+// (`MEANREV_STRATEGIES` in catalyst-gate.ts). `swing` proxies `sma200_pullback`;
+// `bb_fade` runs the BB-fade strategy on daily bars, same daily-cadence caveat
+// as ichimoku above. Sweep ±1/±2/±3d so the 1d default sits on a plateau.
+const MACRO_BOOKS: BookSpec[] = [
+  { label: 'macro_meanrev_swing', strategyType: 'swing', defaultThresholdDays: MACRO_MAX_DAYS, sweepDays: [1, 2, 3], gate: 'macro_fomc' },
+  { label: 'macro_meanrev_bbfade', strategyType: 'bb_fade', defaultThresholdDays: MACRO_MAX_DAYS, sweepDays: [1, 2, 3], gate: 'macro_fomc' },
 ];
 
 // Sample-sufficiency floor: below ~30 gated entries per book the OOS split is
@@ -205,6 +238,43 @@ function gatedAtEntry(earningsInDays: number | null, thresholdDays: number): boo
   return earningsInDays !== null && earningsInDays <= thresholdDays;
 }
 
+// ── point-in-time FOMC proximity (TRA-4430, macro arm) ───────────────────────
+const FOMC_SORTED: readonly string[] = [...FOMC_MEETINGS].sort();
+
+/**
+ * Signed whole-calendar-day distance from `asOf`'s UTC day to `dateIso`
+ * (negative = the event is in the past). Day-boundary arithmetic, matching the
+ * live gate's `daysUntil` / `eventsNearDate` semantics — an entry at 14:30Z the
+ * day before an FOMC decision is 1 day out, not 0.4.
+ */
+function calDayDiff(dateIso: string, asOf: number): number | null {
+  const evMs = Date.parse(`${dateIso}T00:00:00Z`);
+  const dayMs = Date.parse(`${new Date(asOf).toISOString().slice(0, 10)}T00:00:00Z`);
+  if (!Number.isFinite(evMs) || !Number.isFinite(dayMs)) return null;
+  return Math.round((evMs - dayMs) / DAY_MS);
+}
+
+/**
+ * Absolute calendar-day distance to the NEAREST curated FOMC decision day
+ * (past or future), or `null` when the calendar is empty/unparseable. The live
+ * rule 2 fires (FOMC component) when `daysToFomc <= 1` (forward) OR a
+ * high-impact event is within ±1d of the entry day — for FOMC rows that union
+ * is exactly `|distance| <= 1`, so one number re-reads the gate at any sweep
+ * threshold. No lookahead: the Fed publishes the schedule the prior year, so
+ * every date here (including "yesterday's meeting") is ex-ante knowledge at
+ * the decision bar.
+ */
+function fomcAbsDaysAsOf(asOf: number, meetings: readonly string[] = FOMC_SORTED): number | null {
+  let best: number | null = null;
+  for (const date of meetings) {
+    const d = calDayDiff(date, asOf);
+    if (d === null) continue;
+    const a = Math.abs(d);
+    if (best === null || a < best) best = a;
+  }
+  return best;
+}
+
 // ── left-tail statistics (QuantTrader criteria 1/2/5) ────────────────────────
 /**
  * Linear-interpolated percentile of `xs` (p in [0,1], ascending). p10 of an R
@@ -280,6 +350,27 @@ function toGatedRecords(
   return out;
 }
 
+/**
+ * TRA-4430 — macro-arm records: `eDays` holds the ABSOLUTE calendar-day
+ * distance to the nearest FOMC decision day (see `fomcAbsDaysAsOf`), so the
+ * same `armAtThreshold` split/sweep machinery reads rule 2 unchanged.
+ */
+function toMacroRecords(
+  trades: ReadonlyArray<{ openedAt: number; pnl?: number }>,
+  tradeRs: readonly number[],
+  meetings: readonly string[] = FOMC_SORTED,
+): GatedRecord[] {
+  const out: GatedRecord[] = [];
+  for (let i = 0; i < trades.length; i++) {
+    out.push({
+      eDays: fomcAbsDaysAsOf(trades[i].openedAt, meetings),
+      r: tradeRs[i] ?? 0,
+      pnl: trades[i].pnl ?? 0,
+    });
+  }
+  return out;
+}
+
 /** Split a pooled record set into baseline / gated / removed arms at a threshold. */
 function armAtThreshold(records: readonly GatedRecord[], thresholdDays: number): ArmRs {
   const arm: ArmRs = { baseRs: [], basePnls: [], gatedRs: [], gatedPnls: [], removedRs: [], removedPnls: [] };
@@ -312,7 +403,7 @@ function splitByGate(
 }
 
 // ── verdict shape ────────────────────────────────────────────────────────────
-type RunMode = 'smoke-deterministic' | 'live';
+type RunMode = 'smoke-deterministic' | 'live' | 'live-macro-only';
 
 interface ArmSummary extends TradeMetrics {
   tailLosses: number;
@@ -356,10 +447,13 @@ interface SweepRow {
 interface BookVerdict {
   label: string;
   strategyType: string;
+  /** Which predicate this book grades: rule 1 (`earnings`) or rule 2's FOMC component (`macro_fomc`). */
+  gate: 'earnings' | 'macro_fomc';
   defaultThresholdDays: number;
   perSymbol: Array<{
     symbol: string;
     bars: number;
+    /** Rule-1 books: earnings events in the index. Macro books: FOMC decisions inside the bar range. */
     earningsEvents: number;
     baseline: ArmSummary;
     gated: ArmSummary;
@@ -414,6 +508,7 @@ interface OosVerdict {
     warmupBars: number;
     swingMaxDays: number;
     intradayMaxDays: number;
+    macroMaxDays: number;
     sampleMin: number;
     slippageBps: number;
     initialEquity: number;
@@ -447,15 +542,23 @@ async function runSymbolBook(
   });
   const agg = report.aggregate;
 
-  const records = toGatedRecords(symbol, agg.trades, agg.tradeRs, index);
+  const records =
+    book.gate === 'macro_fomc'
+      ? toMacroRecords(agg.trades, agg.tradeRs)
+      : toGatedRecords(symbol, agg.trades, agg.tradeRs, index);
   const arm = armAtThreshold(records, book.defaultThresholdDays);
   const baseline = summarizeArm(arm.baseRs, arm.basePnls);
   const gated = summarizeArm(arm.gatedRs, arm.gatedPnls);
 
+  const firstDay = new Date(candles[0].timestamp).toISOString().slice(0, 10);
+  const lastDay = new Date(candles[candles.length - 1].timestamp).toISOString().slice(0, 10);
   const perSymbol: BookVerdict['perSymbol'][number] = {
     symbol,
     bars: candles.length,
-    earningsEvents: (index.get(symbol.toUpperCase()) ?? []).length,
+    earningsEvents:
+      book.gate === 'macro_fomc'
+        ? FOMC_SORTED.filter((d) => d >= firstDay && d <= lastDay).length
+        : (index.get(symbol.toUpperCase()) ?? []).length,
     baseline,
     gated,
     removedTrades: arm.removedRs.length,
@@ -523,6 +626,7 @@ function summarizeBook(book: BookSpec, perSymbol: BookVerdict['perSymbol'], pool
   return {
     label: book.label,
     strategyType: book.strategyType,
+    gate: book.gate,
     defaultThresholdDays: book.defaultThresholdDays,
     perSymbol,
     aggregate: {
@@ -549,8 +653,8 @@ function summarizeBook(book: BookSpec, perSymbol: BookVerdict['perSymbol'], pool
 }
 
 // ── full run ─────────────────────────────────────────────────────────────────
-async function runAll(mode: RunMode): Promise<OosVerdict> {
-  // Fetch/generate bars + earnings once per symbol; reuse across both books.
+async function runAll(mode: RunMode, bookSpecs: readonly BookSpec[]): Promise<OosVerdict> {
+  // Fetch/generate bars + earnings once per symbol; reuse across all books.
   const barsBySymbol = new Map<string, Candle[]>();
   const indexBySymbol = new Map<string, EarningsIndex>();
   for (const symbol of UNIVERSE) {
@@ -562,6 +666,8 @@ async function runAll(mode: RunMode): Promise<OosVerdict> {
     } else {
       console.log(`[tra1973] ${symbol} — fetching Yahoo daily …`);
       candles = await fetchYahooDaily(symbol);
+      // `live-macro-only` (TRA-4430) needs no earnings at all — the FOMC
+      // constant is the whole calendar; the earnings index stays empty.
       events = liveEarningsBySymbol.get(symbol.toUpperCase()) ?? [];
     }
     if (candles.length < WARMUP_BARS + TRAIN_BARS + TEST_BARS) {
@@ -575,7 +681,7 @@ async function runAll(mode: RunMode): Promise<OosVerdict> {
   }
 
   const books: BookVerdict[] = [];
-  for (const book of BOOKS) {
+  for (const book of bookSpecs) {
     const perSymbol: BookVerdict['perSymbol'] = [];
     const pooled: GatedRecord[] = [];
     for (const symbol of UNIVERSE) {
@@ -597,7 +703,17 @@ async function runAll(mode: RunMode): Promise<OosVerdict> {
       'trend read is inconclusive (QuantTrader criterion 5).',
     'The gate only ever removes entries, so the gated arm is exactly the baseline ledger ' +
       'minus the point-in-time gated-out entries; the sweep re-reads the gate off each ' +
-      "entry's precomputed days-to-earnings with no re-backtest.",
+      "entry's precomputed proximity number with no re-backtest.",
+    'TRA-4430 macro books grade the FOMC COMPONENT of rule 2 only: without FRED_API_KEY ' +
+      'the CPI/NFP/PCE prints are absent from history, so the graded predicate is a ' +
+      "subset of the live `macro_meanrev` rule. FOMC decision days come from the Fed's " +
+      'published ex-ante calendar (curated FOMC_MEETINGS constant, 2021–2026) — no ' +
+      'vendor credential and no lookahead. `eDays` on macro records is the ABSOLUTE ' +
+      'calendar-day distance to the nearest decision day, whose ≤1 threshold equals the ' +
+      'live rule\'s `daysToFomc <= 1` OR `high-impact within ±1d` union for FOMC rows.',
+    'The `macro_meanrev_bbfade` book runs the bb_fade strategy on DAILY bars — the same ' +
+      'daily-cadence proxy caveat as ichimoku applies to its intraday production ' +
+      'counterpart.',
   ];
 
   return {
@@ -613,6 +729,7 @@ async function runAll(mode: RunMode): Promise<OosVerdict> {
       warmupBars: WARMUP_BARS,
       swingMaxDays: SWING_MAX_DAYS,
       intradayMaxDays: INTRADAY_MAX_DAYS,
+      macroMaxDays: MACRO_MAX_DAYS,
       sampleMin: SAMPLE_MIN,
       slippageBps: SLIPPAGE_BPS,
       initialEquity: INITIAL_EQUITY,
@@ -712,8 +829,10 @@ function renderBook(bk: BookVerdict): string {
   const suf = bk.sampleSufficiency;
   const sufMark = suf.sufficient ? '✅' : '⚠️';
 
+  const gateDesc =
+    bk.gate === 'macro_fomc' ? `FOMC ±${bk.defaultThresholdDays}d` : `earnings ≤ ${bk.defaultThresholdDays}d`;
   const lines: string[] = [
-    `#### Book: \`${bk.label}\` (${bk.strategyType}, earnings ≤ ${bk.defaultThresholdDays}d, ${bk.perSymbol.length} names)`,
+    `#### Book: \`${bk.label}\` (${bk.strategyType}, ${gateDesc}, ${bk.perSymbol.length} names)`,
     '',
     '| Metric | Baseline | Gated | Δ |',
     '| --- | ---: | ---: | ---: |',
@@ -818,45 +937,59 @@ async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const smoke = argv.includes('--smoke');
   const execute = argv.includes('--execute');
+  const executeMacro = argv.includes('--execute-macro');
 
   const fh = describeFinnhub();
   console.log(`[tra1973] ${fh.summary}`);
   console.log(
     `[tra1973] window ${new Date(WINDOW_START_MS).toISOString().slice(0, 10)} → ` +
       `${new Date(WINDOW_END_MS).toISOString().slice(0, 10)} · train=${TRAIN_BARS} test=${TEST_BARS} ` +
-      `warmup=${WARMUP_BARS} bars · swing≤${SWING_MAX_DAYS}d intraday≤${INTRADAY_MAX_DAYS}d · universe ${UNIVERSE.join(',')}`,
+      `warmup=${WARMUP_BARS} bars · swing≤${SWING_MAX_DAYS}d intraday≤${INTRADAY_MAX_DAYS}d ` +
+      `macro±${MACRO_MAX_DAYS}d · universe ${UNIVERSE.join(',')}`,
   );
 
-  if (!smoke && !execute) {
+  if (!smoke && !execute && !executeMacro) {
     console.log(
       '\n[tra1973] PLAN mode — nothing run (no spend, no network). Pass --smoke for the free ' +
-        'deterministic wiring check, or --execute for the real Yahoo+Finnhub run.',
+        'deterministic wiring check, --execute for the real Yahoo+Finnhub run, or ' +
+        '--execute-macro for the credential-free real macro/FOMC run (TRA-4430).',
     );
     return;
   }
 
   let mode: RunMode;
+  let bookSpecs: BookSpec[];
   if (execute) {
     if (!fh.reachable) {
       console.error(
-        '[tra1973] --execute requested but FINNHUB_API_TOKEN is unset. The gate cannot be ' +
-          'evaluated point-in-time without the historical earnings calendar. Aborting — this is ' +
-          'a real blocker (route to whoever provisions the Finnhub token, cf. TRA-1965).',
+        '[tra1973] --execute requested but FINNHUB_API_TOKEN is unset. The earnings gate cannot ' +
+          'be evaluated point-in-time without the historical earnings calendar. Aborting — this ' +
+          'is a real blocker (route to whoever provisions the Finnhub token, cf. TRA-1965). ' +
+          'The macro/FOMC arm needs NO credential: run --execute-macro (TRA-4430).',
       );
       process.exit(2);
       return;
     }
     await fetchHistoricalEarnings();
     mode = 'live';
+    bookSpecs = [...BOOKS, ...MACRO_BOOKS];
+  } else if (executeMacro) {
+    // TRA-4430 — the credential-free real run: Yahoo daily bars (no key) + the
+    // curated ex-ante FOMC constant. Earnings books are skipped, not blocked.
+    mode = 'live-macro-only';
+    bookSpecs = [...MACRO_BOOKS];
+    console.log('[tra1973] --execute-macro: real Yahoo bars + curated FOMC calendar, no vendor credential.');
   } else {
     mode = 'smoke-deterministic';
+    bookSpecs = [...BOOKS, ...MACRO_BOOKS];
     console.log('[tra1973] --smoke: synthetic bars + synthetic earnings, zero network.');
   }
 
-  const verdict = await runAll(mode);
+  const verdict = await runAll(mode, bookSpecs);
 
   mkdirSync(REPORT_DIR, { recursive: true });
-  const outPath = resolve(REPORT_DIR, `tra1968-earnings-gate-oos-${mode === 'live' ? 'live' : 'smoke'}.json`);
+  const suffix = mode === 'live' ? 'live' : mode === 'live-macro-only' ? 'macro-live' : 'smoke';
+  const outPath = resolve(REPORT_DIR, `tra1968-earnings-gate-oos-${suffix}.json`);
   writeFileSync(outPath, JSON.stringify(verdict, null, 2));
   console.log(`\n[tra1973] wrote ${outPath}\n`);
   console.log(renderReport(verdict));
@@ -877,6 +1010,9 @@ export {
   gatedAtEntry,
   splitByGate,
   toGatedRecords,
+  toMacroRecords,
+  calDayDiff,
+  fomcAbsDaysAsOf,
   armAtThreshold,
   percentile,
   worstDecileMean,
@@ -886,6 +1022,7 @@ export {
   renderReport,
   SWING_MAX_DAYS,
   INTRADAY_MAX_DAYS,
+  MACRO_MAX_DAYS,
   type GatedRecord,
   type OosVerdict,
   type BookVerdict,

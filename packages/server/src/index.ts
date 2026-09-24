@@ -6170,18 +6170,22 @@ async function runEarningsRefresh(): Promise<void> {
 }
 
 // TRA-597 (TRA-595 C2) — refresh the macro/Fed economic calendar (FOMC + CPI /
-// NFP / PCE). Runs on boot and on the 9 AM ET pre-market hook. Skips the FRED
-// fetch (with a warning) when FRED_API_KEY is unset, and isolates provider
+// NFP / PCE). Runs on boot and on the 9 AM ET pre-market hook. Isolates provider
 // failures so a bad/rate-limited fetch can never fault boot or a scheduled tick.
+// TRA-4430: when FRED_API_KEY is unset the FRED prints are skipped but the
+// curated key-free FOMC schedule is STILL seeded — previously the whole refresh
+// bailed, leaving `daysToNextFOMCSync()` null forever on keyless hosts and the
+// catalyst gate's macro rule structurally unable to fire.
 async function runMacroRefresh(): Promise<void> {
   const client = makeMacroClientFromEnv();
   if (!client) {
-    log.warn('macro-refresh FRED_API_KEY unset — skipping economic-calendar refresh');
-    return;
+    log.warn(
+      'macro-refresh FRED_API_KEY unset — seeding curated FOMC rows only (CPI/NFP/PCE need the key)',
+    );
   }
   try {
-    const { stored, fomc } = await refreshMacroCalendar(client);
-    log.info('macro-refresh complete', { stored, fomc });
+    const { stored, fomc, mode } = await refreshMacroCalendar(client);
+    log.info('macro-refresh complete', { mode, stored, fomc });
   } catch (err) {
     log.error('macro-refresh failed', {
       reason: err instanceof Error ? err.message : String(err),

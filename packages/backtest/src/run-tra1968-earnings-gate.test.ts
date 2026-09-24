@@ -5,12 +5,16 @@ import {
   gatedAtEntry,
   splitByGate,
   toGatedRecords,
+  toMacroRecords,
+  calDayDiff,
+  fomcAbsDaysAsOf,
   armAtThreshold,
   percentile,
   worstDecileMean,
   stopHitRate,
   summarizeArm,
   SWING_MAX_DAYS,
+  MACRO_MAX_DAYS,
 } from './run-tra1968-earnings-gate.js';
 import type { EarningsEvent } from '@trading-app/engine';
 
@@ -146,5 +150,60 @@ describe('TRA-1973 earnings-gate OOS harness — threshold sweep + tail stats', 
     expect(s.stopHitRate).toBeCloseTo(2 / 6, 3); // rounded to 4dp in summarizeArm
     expect(s.p10R).toBeLessThan(0); // left tail is negative
     expect(s.worstDecileMeanR).toBe(-2); // bottom decile of 6 → 1 sample → min
+  });
+});
+
+describe('TRA-4430 macro/FOMC arm — point-in-time helpers', () => {
+  // A mid-afternoon-UTC entry timestamp: proximity must use calendar-day
+  // arithmetic, not raw-ms rounding (14:30Z the day before a decision is 1d
+  // out, not 0.4 rounded to 0).
+  const at = (iso: string) => Date.parse(`${iso}T14:30:00Z`);
+
+  it('calDayDiff is whole-calendar-day, signed, and null on garbage', () => {
+    expect(calDayDiff('2024-06-12', at('2024-06-11'))).toBe(1);
+    expect(calDayDiff('2024-06-12', at('2024-06-12'))).toBe(0);
+    expect(calDayDiff('2024-06-12', at('2024-06-13'))).toBe(-1);
+    expect(calDayDiff('not-a-date', at('2024-06-13'))).toBeNull();
+  });
+
+  it('fomcAbsDaysAsOf reads the nearest decision day symmetrically (past or future)', () => {
+    const meetings = ['2024-06-12', '2024-07-31'];
+    expect(fomcAbsDaysAsOf(at('2024-06-11'), meetings)).toBe(1); // day before
+    expect(fomcAbsDaysAsOf(at('2024-06-12'), meetings)).toBe(0); // decision day
+    expect(fomcAbsDaysAsOf(at('2024-06-13'), meetings)).toBe(1); // day after — the ±1 half of rule 2
+    expect(fomcAbsDaysAsOf(at('2024-07-05'), meetings)).toBe(23); // gap between meetings → far from both
+    expect(fomcAbsDaysAsOf(at('2024-06-11'), [])).toBeNull();
+  });
+
+  it('the curated default calendar covers the 2021→2026 OOS span (never null in-window)', () => {
+    // AC: FOMC_MEETINGS covers 2021-01-01 → 2026-12-31. Any in-span read must
+    // resolve to a real distance; a walk-forward window can never see null.
+    for (const iso of ['2021-02-15', '2022-08-01', '2023-05-15', '2024-10-01', '2025-12-01', '2026-11-15']) {
+      const d = fomcAbsDaysAsOf(at(iso));
+      expect(d).not.toBeNull();
+      // Regular meetings are ~6 weeks apart → nearest decision is always ≤ ~35d.
+      expect(d!).toBeLessThanOrEqual(35);
+    }
+  });
+
+  it('toMacroRecords + armAtThreshold split rule 2 at the ±1d default and sweep wider', () => {
+    const meetings = ['2024-06-12'];
+    const trades = [
+      { openedAt: at('2024-06-11'), pnl: -80 }, // 1d before → gated at ±1
+      { openedAt: at('2024-06-13'), pnl: -50 }, // 1d after → gated at ±1 (high-impact-near branch)
+      { openedAt: at('2024-06-15'), pnl: 40 }, // 3d after → kept at ±1, gated at ±3
+      { openedAt: at('2024-05-01'), pnl: 60 }, // far → always kept
+    ];
+    const rs = [-1.1, -0.6, 0.4, 0.7];
+    const recs = toMacroRecords(trades, rs, meetings);
+    expect(recs.map((r) => r.eDays)).toEqual([1, 1, 3, 42]);
+
+    const t1 = armAtThreshold(recs, MACRO_MAX_DAYS);
+    expect(t1.removedRs).toEqual([-1.1, -0.6]);
+    expect(t1.gatedRs).toEqual([0.4, 0.7]);
+
+    const t3 = armAtThreshold(recs, 3);
+    expect(t3.removedRs).toEqual([-1.1, -0.6, 0.4]);
+    expect(t3.gatedRs).toEqual([0.7]);
   });
 });

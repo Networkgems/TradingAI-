@@ -7,6 +7,7 @@ import {
   daysToNextFOMC as daysToNextFOMCPure,
   nextEventOfType,
   daysUntil,
+  fomcEvents,
   type MacroEvent,
   type MacroEventType,
 } from '@trading-app/engine';
@@ -152,17 +153,50 @@ export interface MacroRefreshResult {
   stored: number;
   /** Number of those that are FOMC decisions. */
   fomc: number;
+  /**
+   * TRA-4430: `full` = FRED econ prints + curated FOMC; `fomc-only` = the
+   * curated FOMC schedule seeded without `FRED_API_KEY` (CPI/NFP/PCE absent).
+   */
+  mode: 'full' | 'fomc-only';
 }
 
 /**
- * Refresh the stored calendar from `client`, replacing the cache with the
- * fetched forward window. Throws only on a hard client failure so the caller can
- * log + continue; per-release fetch errors inside the client are swallowed (and
- * logged here) so a single bad release never blanks the calendar — the curated
- * FOMC rows always survive.
+ * Refresh the stored calendar. With a `client`, replaces the cache with the
+ * fetched forward window (FRED prints + curated FOMC). Throws only on a hard
+ * client failure so the caller can log + continue; per-release fetch errors
+ * inside the client are swallowed (and logged here) so a single bad release
+ * never blanks the calendar — the curated FOMC rows always survive.
+ *
+ * TRA-4430: with `client === null` (no `FRED_API_KEY`) the curated FOMC
+ * schedule is STILL seeded — it is a hard-coded constant needing no key, and
+ * skipping it left `daysToNextFOMCSync()` permanently `null` on keyless hosts
+ * (the inert-gate finding on bqb1). Previously fetched FRED rows are preserved,
+ * never blanked, by a keyless refresh; only the curated FOMC rows are replaced,
+ * filtered to the same forward window the full path uses.
  */
-export async function refreshMacroCalendar(client: EconomicCalendarClient): Promise<MacroRefreshResult> {
-  const events = await client.getUpcomingEvents({}, (releaseId, err) => {
+export async function refreshMacroCalendar(
+  client: EconomicCalendarClient | null,
+  opts: { asOf?: number } = {},
+): Promise<MacroRefreshResult> {
+  if (!client) {
+    const asOf = opts.asOf ?? Date.now();
+    const fromDay = new Date(asOf).toISOString().slice(0, 10);
+    const toDay = new Date(asOf + 180 * 86_400_000).toISOString().slice(0, 10);
+    const existing = await ensureLoaded();
+    const keptFred = existing.filter((e) => e.source === 'fred');
+    const fomc = fomcEvents().filter((e) => e.date >= fromDay && e.date <= toDay);
+    cache = [...keptFred, ...fomc].sort((a, b) => a.date.localeCompare(b.date));
+    await persist();
+    log.info('macro calendar refreshed', {
+      mode: 'fomc-only (FRED_API_KEY unset)',
+      stored: cache.length,
+      fomc: fomc.length,
+      keptFredRows: keptFred.length,
+    });
+    return { stored: cache.length, fomc: fomc.length, mode: 'fomc-only' };
+  }
+
+  const events = await client.getUpcomingEvents({ asOf: opts.asOf }, (releaseId, err) => {
     log.warn('macro release fetch failed — skipping', {
       releaseId,
       reason: err instanceof Error ? err.message : String(err),
@@ -171,15 +205,15 @@ export async function refreshMacroCalendar(client: EconomicCalendarClient): Prom
   cache = events;
   await persist();
   const fomc = events.filter((e) => e.type === 'FOMC').length;
-  log.info('macro calendar refreshed', { stored: events.length, fomc });
-  return { stored: events.length, fomc };
+  log.info('macro calendar refreshed', { mode: 'full', stored: events.length, fomc });
+  return { stored: events.length, fomc, mode: 'full' };
 }
 
 /**
  * Build an `EconomicCalendarClient` from `FRED_API_KEY`, or `null` when the key
- * is unset. Note: even without the key the curated FOMC schedule is still useful,
- * but we treat the key as required to fetch the econ prints; the boot job logs +
- * skips when it's absent, leaving trading unaffected.
+ * is unset. The key is only required for the FRED econ prints (CPI/NFP/PCE) —
+ * `refreshMacroCalendar(null)` still seeds the curated key-free FOMC schedule
+ * (TRA-4430), so a keyless host keeps FOMC proximity.
  */
 export function makeMacroClientFromEnv(): EconomicCalendarClient | null {
   const key = (process.env['FRED_API_KEY'] ?? '').trim();
