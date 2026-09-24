@@ -124,15 +124,40 @@ export interface BootArmRepairRequestOrigin {
   referer: string | null;
 }
 
-/** One durable JSONL line. Two kinds share the file so the ordering is unambiguous. */
+/**
+ * TRA-4861 — the ATTRIBUTED demotion. Recorded at the settings-write chokepoint when the
+ * write demoted the pinned operator and the arm was INELIGIBLE, so nothing re-converged
+ * and no `repair` row could exist. This is the only row that can carry an actor for the
+ * class of event that later surfaces as an actorless `origin: 'boot'` repair.
+ *
+ * DISK-ONLY and deliberately OUTSIDE every published counter — see the note on
+ * {@link recordPinnedOperatorDemotionWhileIneligible}.
+ */
+export interface PinnedOperatorDemotionAttribution {
+  /** ms epoch of the write that demoted the operator. */
+  ts: number;
+  at: string;
+  username: string | null;
+  demoted: string[];
+  /** Why the arm was not enforcing — see `LiveBrokerArmIneligibility`. */
+  ineligibleBecause: string | null;
+  /** Which keys the caller sent — shape without contents. */
+  bodyFields: string[];
+  requestOrigin: BootArmRepairRequestOrigin | null;
+}
+
+/** One durable JSONL line. Three kinds share the file so the ordering is unambiguous. */
 interface BootArmRepairRecord {
   /** Event time, ms epoch. */
   ts: number;
   /**
    * `repair` — an attempt was re-converged. `observation_start` — a process came up with
    * this ledger configured, which is what makes an absence measurable.
+   * `demotion_while_ineligible` (TRA-4861) — a write DEMOTED the pinned operator at a
+   * moment when the arm was not enforcing, so there was no repair to record. The only
+   * row in this file that can name the actor behind a later `origin: 'boot'` repair.
    */
-  kind: 'repair' | 'observation_start';
+  kind: 'repair' | 'observation_start' | 'demotion_while_ineligible';
   /** Where it came from (`null` on a marker row). */
   origin: BootArmRepairOrigin | null;
   /** The operator whose arm was repaired (`null` on a marker row). */
@@ -149,6 +174,11 @@ interface BootArmRepairRecord {
    * `null` on rows that are inherently one-per-event.
    */
   dedupeKey: string | null;
+  /**
+   * TRA-4861 — why the arm was ineligible. Only ever set on a
+   * `demotion_while_ineligible` row; `null` everywhere else.
+   */
+  ineligibleBecause?: string | null;
 }
 
 // ── In-memory store ──────────────────────────────────────────────────────────
@@ -161,6 +191,14 @@ let dataDir: string | null = null;
 const repairs: BootArmRepairRecord[] = [];
 /** Observation markers, ascending by ts. */
 const markers: BootArmRepairRecord[] = [];
+/**
+ * TRA-4861 — attributed demotions that happened while the arm was NOT enforcing,
+ * ascending by ts. Held apart from `repairs` on purpose: these are not repairs, they were
+ * never opposed, and folding them into `repairs` would move `attempts` /
+ * `attemptsByOrigin` / `hydratedRepairs` on the published rollup and silently re-baseline
+ * the TRA-2649 daily guard's series. See `recordPinnedOperatorDemotionWhileIneligible`.
+ */
+const ineligibleDemotions: BootArmRepairRecord[] = [];
 const seenDedupeKeys = new Set<string>();
 // TRA-1681 — durability provenance. The arrays are fed by BOTH the boot hydrate and the
 // live pass, and once folded the two are indistinguishable. These say which.
@@ -181,6 +219,7 @@ export function clearBootArmRepairLedger(): void {
   dataDir = null;
   repairs.length = 0;
   markers.length = 0;
+  ineligibleDemotions.length = 0;
   seenDedupeKeys.clear();
   hydratedRecords = 0;
   hydratedRepairs = 0;
@@ -193,7 +232,8 @@ function apply(rec: BootArmRepairRecord): void {
     if (seenDedupeKeys.has(rec.dedupeKey)) return;
     seenDedupeKeys.add(rec.dedupeKey);
   }
-  const target = rec.kind === 'repair' ? repairs : markers;
+  const target =
+    rec.kind === 'repair' ? repairs : rec.kind === 'observation_start' ? markers : ineligibleDemotions;
   target.push(rec);
   target.sort((a, b) => a.ts - b.ts);
 }
@@ -260,6 +300,104 @@ export function recordBootArmRepair(input: {
 }
 
 /**
+ * TRA-4861 — record a demotion of the pinned operator that reached disk while the arm was
+ * INELIGIBLE, i.e. while nothing was going to oppose it.
+ *
+ * ── Why this row has to exist ────────────────────────────────────────────────
+ * `recordBootArmRepair` above is reachable only when `applyLiveBrokerArm` returned a
+ * NON-EMPTY repair set, and that function returns `[]` unconditionally when
+ * `shouldBootArmLiveEquity` is false. So "a demotion can persist" and "the ledger records
+ * it" are mutually exclusive by construction — the ledger is blind in exactly the state
+ * where the damage happens, and the header's own note that an empty ledger on an
+ * ineligible service "is empty BY CONSTRUCTION" is that same fact seen from the other end.
+ *
+ * On 2026-09-23 that gap swallowed the whole event. Three writes under one traceId
+ * (01:13:46Z → 01:15:42Z) left `mode:'demo'` + `liveTradierEnvOptions:'sandbox'` on disk;
+ * `attemptsByOrigin` stayed `{settings_write: 9}`; the demotion survived five boots and
+ * was repaired by the sixth — the first one where the arm was eligible again — which
+ * recorded an `origin: 'boot'` row that names no actor, 15h26m after the fact. The only
+ * reason the actor was ever recovered is that Render's 7-day log retention had not yet
+ * expired. That is a deadline, not an instrument.
+ *
+ * ── Why it is held out of every published counter ────────────────────────────
+ * These rows are NOT repairs. Folding them into `repairs` would move `attempts`,
+ * `attemptsByOrigin`, `lastAttemptAt` and `hydratedRepairs`, re-baselining the TRA-2649
+ * daily guard against a population it has never counted — and `scripts/check-boot-arm-repairs`
+ * is explicitly out of scope for TRA-4861 (its Arm B stays RED by design through
+ * ~2027-02-24). `summarizeBootArmRepairs` reads `repairs` only, and `publish()` is a
+ * whitelist, so adding this kind changes no byte of `/api/health/options-live`.
+ *
+ * Read it with {@link lastPinnedOperatorDemotionWhileIneligible}.
+ *
+ * Best-effort on IO and never throws — this sits inline in a real-money settings write.
+ */
+export function recordPinnedOperatorDemotionWhileIneligible(input: {
+  username: string;
+  demoted: readonly string[];
+  ineligibleBecause: string;
+  bodyFields?: readonly string[];
+  requestOrigin?: BootArmRepairRequestOrigin | null;
+  now?: number;
+}): void {
+  const demoted = [...(input.demoted ?? [])].filter((f) => typeof f === 'string' && f !== '');
+  // An un-demoted write is not an event. Guarded here as well as at the call site, so a
+  // future caller cannot flood the file and manufacture an attribution for a clean write.
+  if (demoted.length === 0) return;
+
+  const rec: BootArmRepairRecord = {
+    ts: input.now ?? Date.now(),
+    kind: 'demotion_while_ineligible',
+    origin: null,
+    username: input.username,
+    repaired: demoted,
+    bodyFields: [...(input.bodyFields ?? [])].filter((f) => typeof f === 'string'),
+    requestOrigin: input.requestOrigin ?? null,
+    dedupeKey: null,
+    ineligibleBecause: input.ineligibleBecause,
+  };
+
+  const before = ineligibleDemotions.length;
+  apply(rec);
+  if (ineligibleDemotions.length === before) return;
+  appendRow(rec);
+}
+
+/**
+ * TRA-4861 — the most recent attributed demotion at or before `beforeMs`, or `null`.
+ *
+ * This is the join that gives an actorless `origin: 'boot'` repair a name: the boot-arm
+ * repairs at time T a demotion that some earlier write put on disk, and this returns the
+ * newest candidate write preceding T. It reads the HYDRATED store, so it sees rows
+ * written by previous processes — which is the whole point, since the repairing boot is
+ * never the process that did the demoting.
+ *
+ * It is a CANDIDATE, not a proof. Nothing ties a specific write to a specific repair
+ * except ordering, so a caller must present it as the most recent preceding demotion and
+ * not as the confirmed cause. When the file holds no such row the answer is `null`, which
+ * must be read as "no attributed write on record" — never as "no write happened" (rows
+ * older than `RETAIN_MS`, or written before this ticket shipped, are simply absent).
+ */
+export function lastPinnedOperatorDemotionWhileIneligible(
+  beforeMs: number = Date.now(),
+): PinnedOperatorDemotionAttribution | null {
+  let best: BootArmRepairRecord | null = null;
+  for (const rec of ineligibleDemotions) {
+    if (rec.ts > beforeMs) continue;
+    if (best === null || rec.ts > best.ts) best = rec;
+  }
+  if (best === null) return null;
+  return {
+    ts: best.ts,
+    at: new Date(best.ts).toISOString(),
+    username: best.username,
+    demoted: [...best.repaired],
+    ineligibleBecause: best.ineligibleBecause ?? null,
+    bodyFields: [...best.bodyFields],
+    requestOrigin: best.requestOrigin,
+  };
+}
+
+/**
  * Append the per-boot `observation_start` marker. Idempotent per `bootId` (the process
  * start time), so calling it twice in one process records once.
  *
@@ -306,7 +444,14 @@ function parseRow(trimmed: string): BootArmRepairRecord | null {
   if (raw === null || typeof raw !== 'object') return null;
   const r = raw as Partial<BootArmRepairRecord>;
   if (typeof r.ts !== 'number' || !Number.isFinite(r.ts)) return null;
-  if (r.kind !== 'repair' && r.kind !== 'observation_start') return null;
+  // TRA-4861 — `demotion_while_ineligible` MUST be listed here. The hydrate COMPACTS the
+  // file down to the rows this function accepts, so an unrecognised kind is not merely
+  // ignored on read, it is DELETED from disk at the next boot. A new row type that the
+  // parser does not know about survives exactly until the first restart — which, for a
+  // ledger whose entire purpose is surviving restarts, is the same as not existing.
+  if (r.kind !== 'repair' && r.kind !== 'observation_start' && r.kind !== 'demotion_while_ineligible') {
+    return null;
+  }
   const origin = r.origin === 'settings_write' || r.origin === 'boot' ? r.origin : null;
   const repaired = Array.isArray(r.repaired)
     ? r.repaired.filter((f): f is string => typeof f === 'string' && f !== '')
@@ -315,6 +460,8 @@ function parseRow(trimmed: string): BootArmRepairRecord | null {
   // row written by a caller that ignored the guard. Drop it: an unattributable row must
   // never be able to raise the alarm.
   if (r.kind === 'repair' && (origin === null || repaired.length === 0)) return null;
+  // Same rule for an attribution row: with no demoted fields it names nothing.
+  if (r.kind === 'demotion_while_ineligible' && repaired.length === 0) return null;
   const ro = r.requestOrigin;
   const str = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null);
   return {
@@ -337,6 +484,8 @@ function parseRow(trimmed: string): BootArmRepairRecord | null {
           }
         : null,
     dedupeKey: typeof r.dedupeKey === 'string' && r.dedupeKey !== '' ? r.dedupeKey : null,
+    ineligibleBecause:
+      typeof r.ineligibleBecause === 'string' && r.ineligibleBecause !== '' ? r.ineligibleBecause : null,
   };
 }
 
@@ -372,8 +521,17 @@ export function hydrateBootArmRepairLedgerFromDisk(
     if (rec === null || rec.ts < cutoff) continue;
     const beforeR = repairs.length;
     const beforeM = markers.length;
+    // TRA-4861 — the third array must be watched too, or every attribution row would look
+    // "deduped" here and be dropped from `kept`, i.e. compacted off disk.
+    const beforeD = ineligibleDemotions.length;
     apply(rec);
-    if (repairs.length === beforeR && markers.length === beforeM) continue; // deduped
+    if (
+      repairs.length === beforeR &&
+      markers.length === beforeM &&
+      ineligibleDemotions.length === beforeD
+    ) {
+      continue; // deduped
+    }
     kept.push(JSON.stringify(rec));
   }
 
@@ -395,6 +553,14 @@ export function hydrateBootArmRepairLedgerFromDisk(
   // TRA-1681 — freeze what came OFF DISK before this process folds its own rows in.
   // After the first live append the two are one array and no consumer can tell "recovered
   // an attempt from before the restart" from "one happened just now".
+  //
+  // TRA-4861 — `ineligibleDemotions` is deliberately NOT added to either number.
+  // `hydratedRecords`/`hydratedRepairs` are published as `durability` on
+  // /api/health/options-live and are the series the TRA-2649 daily guard trends; adding a
+  // new population to them would look like a step change in demotion attempts on the day
+  // this shipped. The attribution rows are read through their own accessor instead. The
+  // consequence to know: the hydrate's `records` count is now SMALLER than the number of
+  // lines in the file, by the number of attribution rows retained.
   hydratedRecords = repairs.length + markers.length;
   hydratedRepairs = repairs.length;
   return {

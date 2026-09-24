@@ -24722,12 +24722,112 @@ export function resolveLiveBrokerArmDrift(
   env: NodeJS.ProcessEnv = process.env,
 ): LiveBrokerArmField[] {
   if (!shouldBootArmLiveEquity(settings, username, env)) return [];
+  return liveBrokerArmFieldDrift(settings);
+}
+
+/**
+ * The field comparison ALONE — "is this settings object off the ratified arm?" — with no
+ * eligibility gate in front of it.
+ *
+ * Split out for TRA-4861. The gated caller above answers "should we repair this?"; this
+ * one answers "is this demoted?", and those two questions come apart exactly when the
+ * service is INELIGIBLE, which is the state the incident happened in. Keeping one body
+ * for both is what makes the two readings provably identical.
+ */
+function liveBrokerArmFieldDrift(settings: AccountSettings): LiveBrokerArmField[] {
   const drift: LiveBrokerArmField[] = [];
   if ((settings.mode ?? 'demo') !== 'live') drift.push('mode');
   if ((settings.liveTradierEnvOptions ?? 'sandbox') !== 'production') drift.push('liveTradierEnvOptions');
   // TRA-370 — absent ↔ true, so only an EXPLICIT `false` is drift here.
   if (settings.liveTradeEquitiesTradier === false) drift.push('liveTradeEquitiesTradier');
   return drift;
+}
+
+/**
+ * TRA-4861 — WHY `shouldBootArmLiveEquity` was false at the instant of a write. Each
+ * value is a different story and a different owner:
+ *
+ *   `operator_unpinned`            — `LIVE_EQUITY_BOOT_USER` is explicitly empty. This is
+ *                                    the DOCUMENTED kill-switch, so a demotion here is
+ *                                    very likely deliberate de-escalation. Recorded, not
+ *                                    opposed.
+ *   `service_env_not_production`   — `TRADIER_ENV` is not `production`. The pin is dormant
+ *                                    because of a Render ENV VAR, which is mutable from
+ *                                    outside this codebase and leaves no in-repo trace.
+ *   `prod_creds_unresolvable`      — pinned and prod-env, but no production token/account
+ *                                    resolves, so the arm could not be honoured anyway.
+ */
+export type LiveBrokerArmIneligibility =
+  | 'operator_unpinned'
+  | 'service_env_not_production'
+  | 'prod_creds_unresolvable';
+
+export interface PinnedOperatorDemotionWhileIneligible {
+  /** Which ratified-arm fields this settings object is OFF. Never empty. */
+  demoted: LiveBrokerArmField[];
+  ineligibleBecause: LiveBrokerArmIneligibility;
+}
+
+/**
+ * TRA-4861 — the demotion that {@link applyLiveBrokerArm} CANNOT see.
+ *
+ * `applyLiveBrokerArm` enforces the pin only while `shouldBootArmLiveEquity` is true.
+ * When it is false the function returns `[]`, which means three things at once:
+ * nothing is re-converged, the write persists DEMOTED, and — because
+ * `recordBootArmRepair` is reachable only from a non-empty repair set — **no ledger row
+ * is written**. So the two conditions "a demotion can reach disk" and "the ledger can
+ * see it" are MUTUALLY EXCLUSIVE by construction.
+ *
+ * That is not a theory. On 2026-09-23 three `saveSettings` writes under one traceId
+ * (`dc962d98…`, 01:13:46Z → 01:15:42Z) left `mode:'demo'` + `liveTradierEnvOptions:
+ * 'sandbox'` on disk. `attemptsByOrigin` never moved off `{settings_write: 9}`. The
+ * demotion then survived FIVE boots un-repaired, and was caught by the sixth only
+ * because an unrelated `envUpdated` redeploy at 16:41Z made the arm eligible again — at
+ * which point the boot-arm recorded an `origin: 'boot'` event that, by construction,
+ * names no actor. 15h26m after the write, with the actor unrecoverable from the ledger.
+ *
+ * This resolver is the missing detector: it answers "did this write demote the pinned
+ * operator at a moment when nothing was going to stop it?" and is deliberately
+ * INDEPENDENT of eligibility, because eligibility is the thing that fails.
+ *
+ * Returns `null` when there is nothing to record — the arm is eligible (the existing
+ * chokepoint already covers it), the subject is not the pinned operator, or the settings
+ * are not demoted at all.
+ *
+ * It is a RECORDER, not an enforcer. It deliberately does NOT clamp: `operator_unpinned`
+ * is the supported kill-switch and clamping there would remove the one de-escalation
+ * lever that works. Observability of a real-money demotion is not the same decision as
+ * opposing it, and this ticket only owns the first.
+ */
+export function resolvePinnedOperatorDemotionWhileIneligible(
+  settings: AccountSettings,
+  username: string,
+  env: NodeJS.ProcessEnv = process.env,
+): PinnedOperatorDemotionWhileIneligible | null {
+  // Eligible ⇒ `applyLiveBrokerArm` repairs and the settings-write chokepoint records.
+  // Recording here too would double-count a single attempt.
+  if (shouldBootArmLiveEquity(settings, username, env)) return null;
+
+  // WHO this service would pin if it were eligible. Under the kill-switch the pin reads
+  // empty, so fall back to the default operator name — otherwise the one state we most
+  // want attributed (a demotion while disarmed) would have no subject and be dropped.
+  const pin = resolveLiveBrokerOperator(env);
+  const subject = pin.length > 0 ? pin : BOOT_ARM_LIVE_EQUITY_USER_DEFAULT;
+  if (username !== subject) return null;
+
+  const demoted = liveBrokerArmFieldDrift(settings);
+  if (demoted.length === 0) return null;
+
+  // Ordered to match `shouldBootArmLiveEquity`'s own short-circuits, so the reason
+  // reported is the one that actually decided it.
+  const ineligibleBecause: LiveBrokerArmIneligibility =
+    pin.length === 0
+      ? 'operator_unpinned'
+      : (env['TRADIER_ENV'] ?? '') !== 'production'
+        ? 'service_env_not_production'
+        : 'prod_creds_unresolvable';
+
+  return { demoted, ineligibleBecause };
 }
 
 /**

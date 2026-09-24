@@ -271,8 +271,10 @@ import { hydrateGiveBackArmFloorFromDisk, summarizeGiveBackArmFloor } from './gi
 // instrument that replaces the since-boot `bootArmWriteRepairs` counter as an alarm basis.
 import {
   hydrateBootArmRepairLedgerFromDisk,
+  lastPinnedOperatorDemotionWhileIneligible, // TRA-4861
   recordBootArmObservationStart,
   recordBootArmRepair,
+  recordPinnedOperatorDemotionWhileIneligible, // TRA-4861
   summarizeBootArmRepairs,
 } from './boot-arm-repair-ledger.js';
 import { hydrateOptionsBreakerLedgerFromDisk, summarizeOptionsBreakerLedger } from './options-breaker-ledger.js'; // TRA-3218
@@ -469,7 +471,7 @@ import { initStateDb, getStateDb, getStateDbStatus } from './sqlite.js'; // TRA-
 import { evaluateDurability, enforceDurabilityPolicy } from './durability.js'; // TRA-1681 — fail CLOSED
 import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js';
 import { getSettings, loadSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
-import { resolveLiveBrokerOperator, isLiveBrokerOperator, shouldBootArmLiveEquity, resolveLiveBrokerArmDrift, applyLiveBrokerArm } from './signal-engine.js';
+import { resolveLiveBrokerOperator, isLiveBrokerOperator, shouldBootArmLiveEquity, resolveLiveBrokerArmDrift, applyLiveBrokerArm, resolvePinnedOperatorDemotionWhileIneligible } from './signal-engine.js';
 // TRA-3112 — the ONE copy of the market-data / account endpoint-class split that
 // decides whether the shared `process.env.TRADIER_*` fallback is lendable.
 import {
@@ -4823,10 +4825,31 @@ async function runLiveRealizedCalendarBackfill(): Promise<void> {
         requestOrigin: null,
         dedupeKey: `boot:${bootOutcome.ranAt}`,
       });
+      // TRA-4861 — give this event the actor it cannot have on its own. A `boot` repair
+      // records no requestOrigin by construction (that absence is the TRA-2649
+      // discriminator and is deliberately preserved above), so on 2026-09-23 the tenth
+      // event could say a real-money demotion had happened but never who did it.
+      //
+      // The attribution rows written by `recordPinnedOperatorDemotionWhileIneligible` are
+      // hydrated from disk a few lines above, so this sees writes made by PREVIOUS
+      // processes — which is the only useful case, since the process that repairs is never
+      // the process that demoted.
+      //
+      // It is the most recent preceding candidate, NOT a proof: only ordering links the
+      // two, and the fields are named `attributed*` rather than `cause*` so a reader
+      // cannot mistake one for the other. `null` means no attributed write is ON RECORD —
+      // the write may predate this instrument, or have aged past RETAIN_MS — and must
+      // never be read as "no write happened".
+      const attributed = lastPinnedOperatorDemotionWhileIneligible(Date.parse(bootOutcome.ranAt));
       log.warn('TRA-3810 boot-arm repaired a PERSISTED demotion — recorded durably', {
         username: bootOutcome.username,
         repaired: bootOutcome.repaired,
         ranAt: bootOutcome.ranAt,
+        attributedWriteAt: attributed?.at ?? null,
+        attributedWriteRoute: attributed?.requestOrigin?.route ?? null,
+        attributedWriteBodyFields: attributed?.bodyFields ?? null,
+        attributedWriteIneligibleBecause: attributed?.ineligibleBecause ?? null,
+        attributionStatus: attributed === null ? 'no_attributed_write_on_record' : 'candidate',
       });
     }
   }
@@ -15465,6 +15488,62 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
     updated.viewMode = null;
   }
   const armRepaired = applyLiveBrokerArm(updated, username);
+  // TRA-4488 item 4 — `originalUrl` and `Referer` both carry a query string, and these
+  // records are DURABLE (appended to disk). Parameter names survive, values do not.
+  // Hoisted out of the repair branch for TRA-4861: the ineligible branch below needs the
+  // IDENTICAL origin, and two hand-kept copies would drift.
+  const armRequestOrigin = {
+    ip: req.ip ?? null,
+    forwardedFor: typeof req.headers['x-forwarded-for'] === 'string'
+      ? req.headers['x-forwarded-for']
+      : null,
+    userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null,
+    route: `${req.method} ${redactQueryString(req.originalUrl)}`,
+    referer: typeof req.headers['referer'] === 'string' ? redactQueryString(req.headers['referer']) : null,
+  };
+  if (armRepaired.length === 0) {
+    // ── TRA-4861 — the branch that used to be silent ───────────────────────────
+    // `applyLiveBrokerArm` returns [] for TWO completely different reasons: the write is
+    // clean, or the arm is INELIGIBLE and therefore not enforcing. In the second case the
+    // demoted values persist unopposed AND no ledger row is written, because
+    // `recordBootArmRepair` is reachable only from a non-empty repair set. "A demotion
+    // can reach disk" and "the ledger can see it" were mutually exclusive by construction.
+    //
+    // That is what happened on 2026-09-23: three writes under traceId `dc962d98…`
+    // (01:13:46Z → 01:15:42Z) left `mode:'demo'` + `liveTradierEnvOptions:'sandbox'` on
+    // disk while the arm was ineligible; `attemptsByOrigin` never moved off
+    // `{settings_write: 9}`; five boots passed without repairing it; the sixth — the first
+    // eligible one, after an unrelated `envUpdated` redeploy — repaired it and recorded an
+    // `origin: 'boot'` row that names NOBODY. The actor was recoverable only from Render
+    // logs, and only because the 7-day retention had not yet expired.
+    //
+    // This records the actor at the one instant it exists. It does NOT clamp: the
+    // `operator_unpinned` case is the documented kill-switch and is the supported way to
+    // stand the arm down, so opposing it here would delete the only working de-escalation
+    // lever. Observing a real-money demotion and forbidding it are separate decisions and
+    // this ticket owns only the first.
+    const demotion = resolvePinnedOperatorDemotionWhileIneligible(updated, username);
+    if (demotion) {
+      recordPinnedOperatorDemotionWhileIneligible({
+        username,
+        demoted: demotion.demoted,
+        ineligibleBecause: demotion.ineligibleBecause,
+        bodyFields: Object.keys(body ?? {}),
+        requestOrigin: armRequestOrigin,
+      });
+      log.warn('TRA-4861 live-broker arm: settings write DEMOTED the pinned operator while the arm was NOT enforcing — persisted, attributed', {
+        username,
+        demoted: demotion.demoted,
+        // WHICH eligibility input was false. `service_env_not_production` means a Render
+        // env var, mutable from outside this repo, is what disarmed the pin.
+        ineligibleBecause: demotion.ineligibleBecause,
+        bodyFields: Object.keys(body ?? {}),
+        // Say the consequence out loud in the line itself. Nothing re-converges this, and
+        // the next boot will not repair it either until the arm becomes eligible again.
+        note: 'not re-converged; persists until the arm is eligible at some later boot',
+      });
+    }
+  }
   if (armRepaired.length > 0) {
     liveBrokerArmWriteRepairs += 1;
     liveBrokerArmLastWriteRepairAt = new Date().toISOString();
@@ -15480,18 +15559,7 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
       username,
       repaired: armRepaired,
       bodyFields: Object.keys(body ?? {}),
-      requestOrigin: {
-        ip: req.ip ?? null,
-        forwardedFor: typeof req.headers['x-forwarded-for'] === 'string'
-          ? req.headers['x-forwarded-for']
-          : null,
-        userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null,
-        // TRA-4488 item 4 — `originalUrl` and `Referer` both carry a query
-        // string, and this record is DURABLE (it is appended to disk). Parameter
-        // names survive, values do not; see `redactQueryString`.
-        route: `${req.method} ${redactQueryString(req.originalUrl)}`,
-        referer: typeof req.headers['referer'] === 'string' ? redactQueryString(req.headers['referer']) : null,
-      },
+      requestOrigin: armRequestOrigin,
     });
     log.warn('TRA-2649 live-broker arm: settings write would have DEMOTED the pinned operator off the ratified arm — re-converged', {
       username,
