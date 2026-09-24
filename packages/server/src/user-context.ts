@@ -842,6 +842,12 @@ async function createUserContext(username: string): Promise<UserContext> {
         recentSignals: stocksSnap.recentSignals ?? [],
         // TRA-3688 S-3 — restore the void ledger so the witness survives a boot.
         sma200SignalVoids: stocksSnap.sma200SignalVoids ?? [],
+        // TRA-4411 (AC6) — restore the gate-rejection ledger. `importTradeSnapshot`
+        // also rebuilds the rejections' OWN debounce map from it, so dropping the
+        // field here did not just lose the evidence: it let a name already
+        // refused on bar t be refused again inside its 5-bar window, double-
+        // counting the same setup in whatever cohort did survive.
+        sma200GateRejections: stocksSnap.sma200GateRejections ?? [],
         dailySignals: stocksSnap.dailySignals ?? [],
         positionSignalType: stocksSnap.positionSignalType ?? [],
         // TRA-2629 — routed through the single durability seam in `trade-store`.
@@ -1012,6 +1018,14 @@ export async function persistStocksNow(ctx: UserContext): Promise<void> {
       recentSignals: snap.recentSignals,
       // TRA-3688 S-3 — persist the void ledger (removed AND recorded).
       sma200SignalVoids: snap.sma200SignalVoids,
+      // TRA-4411 (AC6) — persist the gate-rejection ledger. It was shipped
+      // "snapshot-persisted" on the strength of the engine's own
+      // export/import pair, and that pair does carry it — but this literal is
+      // the only writer that reaches disk, and it did not, so every rejection
+      // died at the next boot and read back as `[]`: identical to "the gate
+      // refused nothing". Graded by `tra4411-rejection-ledger-durability.test.ts`
+      // against the WRITTEN object, not against `exportTradeSnapshot()`.
+      sma200GateRejections: snap.sma200GateRejections,
       dailySignals: snap.dailySignals,
       positionSignalType: snap.positionSignalType,
       options: snap.options,

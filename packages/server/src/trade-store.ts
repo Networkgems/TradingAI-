@@ -4,7 +4,7 @@ import { existsSync } from 'fs';
 import { constants as FS } from 'fs';
 import { join, dirname, basename } from 'path';
 import { accountDeletedAt, DELETED_ACCOUNTS_FILENAME } from './deleted-accounts.js';
-import type { AccountMode, Position, TradeSignal, Sma200Signal, Sma200SignalVoidRecord, OptionPosition, SignalType, TradierEnv } from '@trading-app/shared';
+import type { AccountMode, Position, TradeSignal, Sma200Signal, Sma200SignalVoidRecord, Sma200GateRejectionRecord, OptionPosition, SignalType, TradierEnv } from '@trading-app/shared';
 import type { DailySignalRecord } from './reports/eod-report.js';
 import type { PaperAccountSnapshot } from './paper-account.js';
 import { isEphemeralDataDir, resolveDataDir } from './data-dir.js';
@@ -167,6 +167,19 @@ export interface StocksTradeSnapshot {
    * Absent on snapshots written before the field.
    */
   sma200SignalVoids?: Sma200SignalVoidRecord[];
+  /**
+   * TRA-4411 (AC6) — SMA-200 setups the `maxDistAtr` gate REFUSED, persisted for
+   * the same reason as the void ledger above and for one more: a rejection lost
+   * at restart reads `[]`, which is INDISTINGUISHABLE from "no rejection
+   * happened", so the loss is silent and it undercounts the AC7 rejected cohort
+   * (its slow-accruing denominator) on every redeploy. The engine's own
+   * `exportTradeSnapshot`/`importTradeSnapshot` pair carried this field from the
+   * day it shipped; it was this DISK seam — the hand-written literal in
+   * `persistStocksNow` and the hand-written literal in the boot restore — that
+   * dropped it, exactly the TRA-2629 shape. Absent on snapshots written before
+   * the field.
+   */
+  sma200GateRejections?: Sma200GateRejectionRecord[];
   dailySignals: DailySignalRecord[];
   positionSignalType: Array<[string, SignalType]>; // serialized Map
   /**
