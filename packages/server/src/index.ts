@@ -687,6 +687,8 @@ import {
   listReversalShadowSignals,
   isReversalShadowEnabled,
   reversalHitRateByScore,
+  reversalShadowCompaction,
+  REVERSAL_SHADOW_RETENTION_DAYS,
 } from './reversal-shadow-ledger.js';
 import {
   initPreTradeGateLedger,
@@ -11083,6 +11085,13 @@ app.get('/api/health/reversal-shadow-signals', async (req, res) => {
     res.json({
       issue: 'TRA-921',
       flagEnabled: isReversalShadowEnabled(),
+      // TRA-4883 — the disk bound, published so the next person measuring `/data`
+      // can see this ledger is bounded without reading the source. `retentionDays`
+      // is the constant; `compaction` is what the boot hook actually DID, because a
+      // retention constant that ships without a working hook reads identically to
+      // one that works.
+      retentionDays: REVERSAL_SHADOW_RETENTION_DAYS,
+      compaction: reversalShadowCompaction(),
       count: signals.length,
       hitRateByScore: reversalHitRateByScore(signals),
       signals,
@@ -11416,6 +11425,11 @@ app.get('/api/health/learned-weights', async (req, res) => {
       // multiplierShrunk so QuantTrader can diff them; this says which one the live
       // `reversalSignalMultiplier` currently reads (default: hard-gate).
       shrinkageFlagEnabled: isLearnedShrinkageEnabled(),
+      // TRA-4883 — the learner pools the WHOLE ledger, so the ledger's retention
+      // horizon IS this fold's lookback. Published here too: a weight computed over
+      // 30 days and one computed over an unbounded file are different numbers, and
+      // nothing else on this response would say which you are reading.
+      retentionDays: REVERSAL_SHADOW_RETENTION_DAYS,
       count: signals.length,
       weights: computeLearnedWeights(signals),
     });

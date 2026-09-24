@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { rmSync } from 'fs';
+import { rmSync, readFileSync, writeFileSync } from 'fs';
 import type { Candle } from '@trading-app/shared';
 import type { ReversalChecklist } from '@trading-app/engine';
 import {
@@ -15,6 +15,8 @@ import {
   resolveReversalOutcome,
   reversalHitRateByScore,
   isReversalShadowEnabled,
+  reversalShadowCompaction,
+  REVERSAL_SHADOW_RETENTION_DAYS,
   type ReversalShadowOpen,
   type ReversalShadowRecord,
 } from './reversal-shadow-ledger.js';
@@ -109,7 +111,10 @@ describe('reversal-shadow-ledger — durable append-only store', () => {
       DAY + 10 * MIN,
     );
     setReversalShadowLedgerFileForTests(file); // drop cache, re-init from same file
-    await initReversalShadowLedger();
+    // TRA-4883 — the reload now applies the retention cutoff, so it needs a `now` that
+    // the fixture day is INSIDE. Left at the wall clock this assertion would decay from
+    // passing to failing as `DAY` ages past the horizon, with nothing having changed.
+    await initReversalShadowLedger(DAY + 60 * MIN);
     const rows = await listReversalShadowSignals();
     expect(rows[0].outcome).toBe('SL_HIT');
   });
@@ -219,4 +224,138 @@ describe('reversal-shadow-ledger — reversalHitRateByScore breakdown', () => {
     expect(bucket.hitRate).toBeNull();
     expect(bucket.avgR).toBeNull();
   });
+
+});
+
+// ── TRA-4883 — retention + boot compaction ──────────────────────────────────
+describe('reversal-shadow-ledger — retention + boot compaction (TRA-4883)', () => {
+  let file: string;
+  let n = 0;
+
+  beforeEach(() => {
+    n += 1;
+    file = join(tmpdir(), `reversal-retention-test-${process.pid}-${n}.jsonl`);
+    try { rmSync(file); } catch { /* fresh */ }
+    setReversalShadowLedgerFileForTests(file);
+  });
+  afterEach(() => {
+    setReversalShadowLedgerFileForTests(null);
+    try { rmSync(file); } catch { /* ignore */ }
+  });
+
+  {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    /** A fixed "now" all the cases below age against. */
+    const NOW = Date.UTC(2026, 8, 24, 21, 0, 0);
+    const openLine = (rec: ReversalShadowOpen) => JSON.stringify({ kind: 'open', rec });
+    const resolveLine = (id: string, outcome: string, resolvedAt: number) =>
+      JSON.stringify({
+        kind: 'resolve',
+        id,
+        res: { outcome, realizedR: 2, barsToResolution: 3 },
+        resolvedAt,
+      });
+
+    it('publishes a 30-day horizon matching the bounded siblings', () => {
+      expect(REVERSAL_SHADOW_RETENTION_DAYS).toBe(30);
+    });
+
+    it('drops rows older than the horizon from the fold AND from disk, keeping the rest verbatim', async () => {
+      const oldRec = openRec({ id: 'OLD:long:1', ts: NOW - 31 * DAY_MS });
+      const freshRec = openRec({ id: 'FRESH:long:1', ts: NOW - 2 * DAY_MS });
+      writeFileSync(
+        file,
+        [
+          openLine(oldRec),
+          resolveLine(oldRec.id, 'TP_HIT', NOW - 31 * DAY_MS + 60_000),
+          openLine(freshRec),
+          resolveLine(freshRec.id, 'SL_HIT', NOW - 2 * DAY_MS + 60_000),
+        ].join('\n') + '\n',
+        'utf-8',
+      );
+
+      await initReversalShadowLedger(NOW);
+
+      const rows = await listReversalShadowSignals();
+      expect(rows.map((r) => r.id)).toEqual(['FRESH:long:1']);
+      // The aged row's RESOLVE line goes with its OPEN — never orphaned, and never
+      // aged on `resolvedAt` (which a resolve line is the only carrier of).
+      const onDisk = readFileSync(file, 'utf-8').trim().split('\n');
+      expect(onDisk).toHaveLength(2);
+      expect(onDisk[0]).toBe(openLine(freshRec));
+      expect(onDisk[1]).toBe(resolveLine(freshRec.id, 'SL_HIT', NOW - 2 * DAY_MS + 60_000));
+
+      const c = reversalShadowCompaction()!;
+      expect(c.rewrote).toBe(true);
+      expect(c.linesBefore).toBe(4);
+      expect(c.linesAfter).toBe(2);
+      expect(c.recordsDropped).toBe(1);
+      expect(c.recordsAfter).toBe(1);
+      expect(c.bytesAfter).toBeLessThan(c.bytesBefore);
+      expect(c.cutoff).toBe(new Date(NOW - 30 * DAY_MS).toISOString());
+    });
+
+    it('preserves unknown fields on a retained line (the rewrite echoes bytes, it does not re-serialize)', async () => {
+      // TRA-1703/TRA-2355 one ledger over: a sanitizing rewrite ERASES FROM DISK any
+      // field it does not know about. A field a future version adds must survive a
+      // compaction that predates it.
+      const fresh = openRec({ id: 'FRESH:long:1', ts: NOW - 1 * DAY_MS });
+      const line = JSON.stringify({ kind: 'open', rec: { ...fresh, futureField: 'keep-me' } });
+      writeFileSync(
+        file,
+        [openLine(openRec({ id: 'OLD:long:1', ts: NOW - 40 * DAY_MS })), line].join('\n') + '\n',
+        'utf-8',
+      );
+
+      await initReversalShadowLedger(NOW);
+
+      expect(readFileSync(file, 'utf-8').trim()).toBe(line);
+      expect(readFileSync(file, 'utf-8')).toContain('keep-me');
+    });
+
+    it('does NOT rewrite when nothing aged out', async () => {
+      const fresh = openRec({ id: 'FRESH:long:1', ts: NOW - 3 * DAY_MS });
+      const body = openLine(fresh) + '\n';
+      writeFileSync(file, body, 'utf-8');
+
+      await initReversalShadowLedger(NOW);
+
+      const c = reversalShadowCompaction()!;
+      expect(c.rewrote).toBe(false);
+      expect(c.recordsDropped).toBe(0);
+      expect(c.linesBefore).toBe(1);
+      expect(c.linesAfter).toBe(1);
+      expect(c.bytesAfter).toBe(c.bytesBefore);
+      expect(readFileSync(file, 'utf-8')).toBe(body);
+    });
+
+    it('drops a stale OPEN row too — the forward horizon is intra-session, so it can never resolve', async () => {
+      writeFileSync(file, openLine(openRec({ id: 'STALE:long:1', ts: NOW - 45 * DAY_MS })) + '\n', 'utf-8');
+
+      await initReversalShadowLedger(NOW);
+
+      expect(openReversalShadowSignalsSync()).toHaveLength(0);
+      expect(readFileSync(file, 'utf-8')).toBe('');
+      expect(reversalShadowCompaction()!.recordsDropped).toBe(1);
+    });
+
+    it('a corrupt line is skipped by the fold and dropped by the rewrite, without losing its neighbours', async () => {
+      const fresh = openRec({ id: 'FRESH:long:1', ts: NOW - 1 * DAY_MS });
+      writeFileSync(file, ['{not json', openLine(fresh)].join('\n') + '\n', 'utf-8');
+
+      await initReversalShadowLedger(NOW);
+
+      expect((await listReversalShadowSignals()).map((r) => r.id)).toEqual(['FRESH:long:1']);
+      expect(readFileSync(file, 'utf-8').trim()).toBe(openLine(fresh));
+    });
+
+    it('reports a compaction summary even on an empty/absent ledger', async () => {
+      await initReversalShadowLedger(NOW);
+      const c = reversalShadowCompaction()!;
+      expect(c.rewrote).toBe(false);
+      expect(c.linesBefore).toBe(0);
+      expect(c.recordsAfter).toBe(0);
+      expect(c.ranAt).toBe(new Date(NOW).toISOString());
+    });
+  }
 });

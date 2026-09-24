@@ -1,4 +1,4 @@
-import { appendFile, readFile, mkdir } from 'fs/promises';
+import { appendFile, readFile, writeFile, mkdir, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import type { Candle } from '@trading-app/shared';
@@ -48,6 +48,72 @@ export function isReversalShadowEnabled(env: NodeJS.ProcessEnv = process.env): b
   return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
 }
 
+/**
+ * TRA-4883 — retention horizon. Rows whose SIGNAL time (`ts`) is older than this are
+ * dropped from the fold and from disk on the boot load below.
+ *
+ * Why 30 days, and why the time-based cutoff the siblings use rather than a byte cap:
+ * this file was the largest object on the money host's `/data` (133.5 MiB on
+ * 2026-09-24) and it is the only one of the five biggest that had no bound of ANY
+ * kind. Measured on bqb1 that beat, the ledger spans 2026-06-24 → 2026-09-24 (92.6
+ * days) at ~437 bytes/row and ~5-7k rows per TRADING day, i.e. ~1.51 MiB per calendar
+ * day averaged over its whole life. 30 days therefore parks it around 45-50 MiB —
+ * the same band as its already-bounded siblings `churn-brake-guard.jsonl` (30d,
+ * 38 MiB) and `live-enforce-gate.jsonl` (30d, 62 MiB), whose horizon this copies
+ * verbatim rather than inventing a third number.
+ *
+ * A byte cap was considered and rejected: the only consumers are the TRA-925 learning
+ * fold and the TRA-921 read probe, and BOTH reason in calendar time (per-ET-day
+ * snapshots, `?from=`/`?to=` ms-epoch windows). A byte cap would make "how much
+ * history is in here" depend on how busy the tape was, so a volatile fortnight would
+ * silently shorten the learner's lookback exactly when its buckets matter most. The
+ * min-sample guard is unaffected either way: 30 days is ~150k resolved rows against a
+ * `minSamples` of 10.
+ *
+ * No capital path depends on this. `reversalSignalMultiplier` has no caller in the
+ * signal engine (grepped 2026-09-24) — the ledger feeds the read probes and the daily
+ * `learned-weights-history` trail, and that trail persists the DERIVED multipliers, so
+ * pruning raw rows never rewrites recorded history.
+ */
+const RETAIN_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Published on the health probes (AC4) so `/data` can be audited without grepping here. */
+export const REVERSAL_SHADOW_RETENTION_DAYS = RETAIN_MS / (24 * 60 * 60 * 1000);
+
+/**
+ * What the boot load actually did — the AC5 surface. A `RETAIN_MS` that ships without a
+ * working boot hook reads identically to one that works, so the outcome is published,
+ * not the constant alone. `null` until {@link initReversalShadowLedger} has run.
+ */
+export interface ReversalShadowCompaction {
+  /** ISO time the load ran. */
+  ranAt: string;
+  /** Cutoff applied (ISO); rows with `ts` below this were dropped. */
+  cutoff: string;
+  /** Non-empty JSONL lines read off disk. */
+  linesBefore: number;
+  /** Lines kept (and, when `rewrote`, the lines now on disk). */
+  linesAfter: number;
+  /** Folded records dropped by the cutoff. */
+  recordsDropped: number;
+  /** Records retained in the in-memory fold. */
+  recordsAfter: number;
+  /** File size before/after, bytes. Equal when nothing was dropped. */
+  bytesBefore: number;
+  bytesAfter: number;
+  /** False when nothing aged out (no needless rewrite on a clean boot). */
+  rewrote: boolean;
+  /** Set when the rewrite itself failed; the fold is still correct, disk is not. */
+  error?: string;
+}
+
+let lastCompaction: ReversalShadowCompaction | null = null;
+
+/** The most recent boot compaction, or null if the ledger has not been loaded yet. */
+export function reversalShadowCompaction(): ReversalShadowCompaction | null {
+  return lastCompaction;
+}
+
 function defaultStoreFile(): string {
   const root = resolveDataDir();
   return join(root, 'reversal-shadow-signals.jsonl');
@@ -58,6 +124,7 @@ let storeFileOverride: string | null = null;
 export function setReversalShadowLedgerFileForTests(path: string | null): void {
   storeFileOverride = path;
   cache = null;
+  lastCompaction = null;
 }
 function storeFile(): string {
   return storeFileOverride ?? defaultStoreFile();
@@ -135,21 +202,74 @@ function foldLine(map: Map<string, ReversalShadowRecord>, line: LedgerLine): voi
   });
 }
 
-async function ensureLoaded(): Promise<Map<string, ReversalShadowRecord>> {
+/**
+ * Load the ledger and, in the same pass, APPLY {@link RETAIN_MS} — to the fold and to
+ * the file. Runs once per process (the cache short-circuits every later call), and the
+ * boot hook {@link initReversalShadowLedger} is its first caller, so in production this
+ * IS the boot compaction.
+ *
+ * The cutoff keys on the record's SIGNAL time `ts`, never on `resolvedAt`: a `resolve`
+ * line carries no `ts` of its own, so ageing the two line kinds independently would
+ * orphan resolutions from their opens. Because a resolve can only follow its open in an
+ * append-only file, one forward pass suffices — an open decides its id's fate, and a
+ * resolve inherits it.
+ *
+ * Retained lines are written back VERBATIM, not re-serialized from the folded record.
+ * The sibling ledgers rebuild sanitized lines and have twice paid for it (TRA-1703,
+ * TRA-2355: a field dropped by the rewrite is not merely absent from that boot's
+ * counters, it is ERASED FROM DISK). Echoing the original bytes makes a future field on
+ * {@link ReversalShadowRecord} survive a compaction that predates it.
+ */
+async function ensureLoaded(now: number = Date.now()): Promise<Map<string, ReversalShadowRecord>> {
   if (cache) return cache;
   const map = new Map<string, ReversalShadowRecord>();
   const path = storeFile();
+  const cutoff = now - RETAIN_MS;
+  let linesBefore = 0;
+  let recordsDropped = 0;
+  let bytesBefore = 0;
+  const kept: string[] = [];
+  let read = false;
+
   if (existsSync(path)) {
     try {
       const raw = await readFile(path, 'utf-8');
+      read = true;
+      bytesBefore = Buffer.byteLength(raw, 'utf-8');
+      // Ids the cutoff let through. A resolve line is kept iff its open was.
+      const retained = new Set<string>();
       for (const rawLine of raw.split('\n')) {
         const trimmed = rawLine.trim();
         if (!trimmed) continue;
+        linesBefore += 1;
+        let line: LedgerLine;
         try {
-          foldLine(map, JSON.parse(trimmed) as LedgerLine);
+          line = JSON.parse(trimmed) as LedgerLine;
         } catch {
-          // Skip a single corrupt line rather than losing the whole ledger.
+          // Skip a single corrupt line rather than losing the whole ledger. It is also
+          // dropped from the rewrite — an unparseable line folds to nothing either way.
+          continue;
         }
+        if (line.kind === 'open') {
+          const rec = line.rec;
+          if (!rec || typeof rec.id !== 'string' || typeof rec.ts !== 'number' || !Number.isFinite(rec.ts)) {
+            continue;
+          }
+          if (rec.ts < cutoff) {
+            // Aged out. Count it once, even if the file carries a duplicate open.
+            if (!retained.has(rec.id)) recordsDropped += 1;
+            continue;
+          }
+          if (map.has(rec.id)) continue; // duplicate open — the fold ignores it, so does the file
+          retained.add(rec.id);
+          foldLine(map, line);
+          kept.push(trimmed);
+          continue;
+        }
+        // resolve
+        if (!retained.has(line.id)) continue; // its open aged out (or never existed)
+        foldLine(map, line);
+        kept.push(trimmed);
       }
     } catch (err) {
       log.error('failed to read reversal shadow ledger, starting empty', {
@@ -157,6 +277,43 @@ async function ensureLoaded(): Promise<Map<string, ReversalShadowRecord>> {
       });
     }
   }
+
+  // Compact: rewrite to the retained lines only. Skipped when nothing aged out, so a
+  // clean boot never rewrites a 50 MiB file for nothing.
+  let rewrote = false;
+  let error: string | undefined;
+  if (read && kept.length < linesBefore) {
+    try {
+      const dir = dirname(path);
+      if (!existsSync(dir)) await mkdir(dir, { recursive: true });
+      await writeFile(path, kept.length > 0 ? `${kept.join('\n')}\n` : '', 'utf-8');
+      rewrote = true;
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+      log.warn('reversal shadow ledger compaction failed', { reason: error });
+    }
+  }
+
+  let bytesAfter = bytesBefore;
+  if (rewrote) {
+    bytesAfter = await stat(path).then((s) => s.size).catch(() => bytesBefore);
+  }
+  lastCompaction = {
+    ranAt: new Date(now).toISOString(),
+    cutoff: new Date(cutoff).toISOString(),
+    linesBefore,
+    linesAfter: kept.length,
+    recordsDropped,
+    recordsAfter: map.size,
+    bytesBefore,
+    bytesAfter,
+    rewrote,
+    ...(error ? { error } : {}),
+  };
+  if (recordsDropped > 0 || rewrote) {
+    log.info('reversal shadow ledger compacted', lastCompaction as unknown as Record<string, unknown>);
+  }
+
   cache = map;
   return cache;
 }
@@ -168,9 +325,14 @@ async function appendLine(line: LedgerLine): Promise<void> {
   await appendFile(path, `${JSON.stringify(line)}\n`, 'utf-8');
 }
 
-/** Eagerly load the ledger so reads have data right after boot. */
-export async function initReversalShadowLedger(): Promise<void> {
-  await ensureLoaded();
+/**
+ * Eagerly load the ledger so reads have data right after boot — and, in the same pass,
+ * apply the {@link RETAIN_MS} cutoff to disk. This is the boot compaction hook: it is
+ * awaited in the server's startup chain before the signal engine ticks, so the rewrite
+ * can never interleave with a live append. `now` is a test seam.
+ */
+export async function initReversalShadowLedger(now: number = Date.now()): Promise<void> {
+  await ensureLoaded(now);
 }
 
 /**
