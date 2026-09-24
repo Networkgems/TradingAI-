@@ -271,9 +271,21 @@ treat every surface except `PUT /env-vars/{key}` the way you treat a **settings*
 ⛔ Do **not** read that row as "env writes now pin the serving commit": `9472ced3` was *both* the
 serving commit *and* the branch tip (tip from 09-20T21:57:16Z to 09-22T19:33:37Z, 45h36m with
 nothing pushed), so it cannot discriminate the two. It cost nothing because `main` was quiet.
-Which key was written is **unreadable** — `GET /env-vars` returns `{key, value}` only, no timestamp,
-no actor. Full per-verb measurement: `ENV_WRITE_TRUTH` in `scripts/render-redeploy.mjs`; operator
-steps in `docs/runbook.md`.
+Which key was written is unreadable **from the env surface** — `GET /env-vars` returns `{key, value}`
+only, no timestamp, no actor. Full per-verb measurement: `ENV_WRITE_TRUTH` in
+`scripts/render-redeploy.mjs`; operator steps in `docs/runbook.md`.
+✅ **But the env surface is not the only witness, and reading "unreadable" as "unknowable" cost us
+two months of unattributed rows.** Any env var the process READS AT BOOT AND LOGS is recoverable
+per-boot off the Render tape for the 7-day retention window. `TRADIER_ENV` is such a var —
+`index.ts` logs `rv-scanner initialized {env}` at module scope on every boot — and
+`scripts/tra4863-tradier-env-timeline.mjs` reads it back, bounds each write to the open interval
+between the last boot holding the old value and the deploy that carried the new one, and refuses
+(BLIND, exit 3) rather than reporting a zero it cannot distinguish from an unindexed needle.
+Run **on the day you notice**, not later: at 7 days the tape is gone and the row is unattributable
+forever. Measured 2026-09-23 (TRA-4863): BOTH `service_updated` rows above were `TRADIER_ENV`
+writes — `dep-dao939egekts73bbv9cg` set it to `sandbox`, and `dep-daq028id0e5s73aka5i0` set it back
+to `production` 62h26m later. Neither records an actor. When you file an unattributed env write,
+check whether the key you suspect has a boot-time log line before writing "unreadable".
 ⚠ A **third** such row DID discriminate — the other way (`dep-daq028id0e5s73aka5i0`,
 2026-09-23T16:41:06Z, adjudicated on TRA-4845): it carried `7f290414`, the **serving** commit,
 while the tip was `2e6feeaa`, ≥11 commits ahead. Against 07-23 (shipped the TIP over a
