@@ -1,0 +1,393 @@
+{
+  "ok": true,
+  "time": "2026-08-13T20:05:42.228Z",
+  "build": {
+    "version": "0.0.0",
+    "commit": "4cac8b70ee3c206306bd17d6a836ff60374895fc",
+    "commitShort": "4cac8b70ee3c",
+    "branch": null,
+    "buildTime": null,
+    "commitSource": "git",
+    "nodeVersion": "v20.19.0",
+    "pid": 52,
+    "startedAt": "2026-08-13T14:18:50.162Z",
+    "uptimeSec": 20812
+  },
+  "marketOpen": false,
+  "window": "rth",
+  "partitionedBy": "mode",
+  "books": {
+    "live": {
+      "book": "live",
+      "blind": false,
+      "blindReason": null,
+      "enabled": false,
+      "engineCount": 3,
+      "armedEngineCount": 0,
+      "verdict": "disarmed",
+      "gradeable": false,
+      "notGradeableReason": "no `mode=live` engine has an exit timer — the hoist is disarmed on this book, nothing here grades it",
+      "samples": 2014,
+      "atOrAbove30s": 1229,
+      "p99Under30s": false,
+      "intervalHistogram": {
+        "lt5s": 0,
+        "lt10s": 0,
+        "lt15s": 1,
+        "lt30s": 784,
+        "lt60s": 1219,
+        "lt120s": 10,
+        "lt300s": 0,
+        "gte300s": 0
+      },
+      "rthDecoupledPassCount": 0,
+      "rthTickPassCount": 2014,
+      "rthDecoupledShare": 0,
+      "rthBoundaryIntervals": 3,
+      "rthClosedIntervals": 33,
+      "partitionHolds": true,
+      "maxExitIntervalMs": 65690,
+      "lifetime": {
+        "samples": 2050,
+        "atOrAbove30s": 1248,
+        "p99Under30s": false,
+        "intervalHistogram": {
+          "lt5s": 0,
+          "lt10s": 0,
+          "lt15s": 1,
+          "lt30s": 801,
+          "lt60s": 1238,
+          "lt120s": 10,
+          "lt300s": 0,
+          "gte300s": 0
+        }
+      },
+      "decoupledPassCount": 0,
+      "tickPassCount": 2053,
+      "decoupledFireCount": 0,
+      "decoupledSkips": {
+        "disarmed": 0,
+        "selfOverlap": 0,
+        "tickExitRegion": 0,
+        "marketClosed": 0,
+        "minGap": 0,
+        "stalePrices": 0,
+        "threw": 0
+      },
+      "tickExitRegionMs": {
+        "samples": 2053,
+        "sumMs": 507005,
+        "maxMs": 16650,
+        "atOrAbove20s": 0,
+        "atOrAbove30s": 0,
+        "exitWorkMs": {
+          "samples": 2053,
+          "sumMs": 5636,
+          "maxMs": 284
+        }
+      }
+    },
+    "demo": {
+      "book": "demo",
+      "blind": false,
+      "blindReason": null,
+      "enabled": true,
+      "engineCount": 64,
+      "armedEngineCount": 64,
+      "verdict": "bounded",
+      "gradeable": true,
+      "notGradeableReason": null,
+      "samples": 136224,
+      "atOrAbove30s": 34,
+      "p99Under30s": true,
+      "intervalHistogram": {
+        "lt5s": 17280,
+        "lt10s": 43409,
+        "lt15s": 64571,
+        "lt30s": 10930,
+        "lt60s": 34,
+        "lt120s": 0,
+        "lt300s": 0,
+        "gte300s": 0
+      },
+      "rthDecoupledPassCount": 93221,
+      "rthTickPassCount": 43003,
+      "rthDecoupledShare": 0.6843214117923421,
+      "rthBoundaryIntervals": 64,
+      "rthClosedIntervals": 668,
+      "partitionHolds": true,
+      "maxExitIntervalMs": 46213,
+      "lifetime": {
+        "samples": 136956,
+        "atOrAbove30s": 441,
+        "p99Under30s": true,
+        "intervalHistogram": {
+          "lt5s": 17286,
+          "lt10s": 43411,
+          "lt15s": 64594,
+          "lt30s": 11224,
+          "lt60s": 441,
+          "lt120s": 0,
+          "lt300s": 0,
+          "gte300s": 0
+        }
+      },
+      "decoupledPassCount": 93221,
+      "tickPassCount": 43799,
+      "decoupledFireCount": 132019,
+      "decoupledSkips": {
+        "disarmed": 0,
+        "selfOverlap": 1,
+        "tickExitRegion": 1411,
+        "marketClosed": 2160,
+        "minGap": 35062,
+        "stalePrices": 164,
+        "threw": 0
+      },
+      "tickExitRegionMs": {
+        "samples": 43799,
+        "sumMs": 7988582,
+        "maxMs": 22303,
+        "atOrAbove20s": 2,
+        "atOrAbove30s": 0,
+        "exitWorkMs": {
+          "samples": 43799,
+          "sumMs": 458827,
+          "maxMs": 6521
+        }
+      }
+    }
+  },
+  "liveEnabled": false,
+  "demoEnabled": true,
+  "liveArmedEngineCount": 0,
+  "demoArmedEngineCount": 64,
+  "engineCount": 67,
+  "liveEngineCount": 3,
+  "demoEngineCount": 64,
+  "unknownModeEngineCount": 0,
+  "verdict": "partitioned_by_book",
+  "gradeable": false,
+  "notGradeableReason": "THE AGGREGATE DOES NOT GRADE, BY CONSTRUCTION (TRA-2645). `p99Under30s` is TRA-2200's REAL-MONEY invalidation criterion and a demo engine cannot contribute evidence to it, so there is no fleet-wide population to compute it over. Read `books.live` for the money book and `books.demo` for the paper fleet; each carries its own `enabled`, `armedEngineCount`, `engineCount`, `samples`, `atOrAbove30s`, `p99Under30s`, `intervalHistogram`, `verdict`, `gradeable` and `notGradeableReason`. A book with NO engine in it is `blind` with verdict `no_engine_in_book` and every graded term NULL — it is never a pass.",
+  "maxExitIntervalMs": 65690,
+  "decoupledPassCount": 93221,
+  "tickPassCount": 45852,
+  "decoupledFireCount": 132019,
+  "decoupledSkips": {
+    "disarmed": 0,
+    "selfOverlap": 1,
+    "tickExitRegion": 1411,
+    "marketClosed": 2160,
+    "minGap": 35062,
+    "stalePrices": 164,
+    "threw": 0
+  },
+  "tickExitRegionMs": {
+    "samples": 45852,
+    "sumMs": 8495587,
+    "maxMs": 22303,
+    "atOrAbove20s": 2,
+    "atOrAbove30s": 0,
+    "exitWorkMs": {
+      "samples": 45852,
+      "sumMs": 464463,
+      "maxMs": 6521
+    }
+  },
+  "rthDecoupledShareFloor": 0.5,
+  "note": "TRA-2645: THERE IS NO FLEET-WIDE GRADE HERE. `partitionedBy: \"mode\"` marks that the graded terms live per book under `books.live` / `books.demo`; a payload WITHOUT that marker is a pre-TRA-2645 build whose `enabled` is an OR and whose `p99Under30s` is a sum over both books, and must not be read as either book's answer. Grade `books.<book>.p99Under30s` (TRA-2200 invalidation criterion) — but ONLY when that book's `gradeable` is true, and only ever quote `books.live` about real money. A book with `blind: true` cannot answer: `no_engine_in_book` means that book is not resident (HELD, never a pass — an assertion about a book no engine belongs to is satisfied for free), `unreadable_partition` means some engine carries no usable `mode` string so it could be EITHER book, and `unreadable_arm_state` means `timerArmed` was not a boolean. TRA-2269: `window` names the window, and the graded fields (`samples`, `atOrAbove30s`, `p99Under30s`, `intervalHistogram`) count ONLY intervals with BOTH endpoints inside 09:30-16:00 ET. They used to be lifetime accumulators since boot, which mixed in closed-market intervals that sit dead on the 30s bar: ~21.7 min of closed-market uptime was enough to force `p99Under30s` FALSE however well the hoist performed. Those numbers live under each book's `lifetime` and must NOT be read as the criterion. Buckets put the 30s bar on an edge, so `atOrAbove30s / samples < 0.01` IS p99 < 30s. `samples` counts INTERVALS, which is one fewer than passes per engine — the first pass after boot has no predecessor to measure against. Excluded intervals are counted, not dropped: `lifetime.samples === samples + rthBoundaryIntervals + rthClosedIntervals` (`partitionHolds`), where boundary = one endpoint each side of the open/close. TRA-2257: `decoupledPassCount` vs `tickPassCount` (LIFETIME) says which cadence produced intervals, and `decoupledSkips` names the branch every non-working timer fire refused on (they sum to `decoupledFireCount`, so a zero is a measurement, not a dark branch). `rthDecoupledShare` is the same split INSIDE the graded window and is the denominator-purity gate: at or below `rthDecoupledShareFloor` the verdict is `tick_dominated_window` and refuses rather than grading doTick as the hoist. All counters are strictly monotonic within a process, so two same-process snapshots (assert identical `build.startedAt` AND `build.pid`) difference cleanly into any sub-window. The TOP-LEVEL `tickExitRegionMs` is FLEET-SUMMED with no RTH predicate and no boot guard (TRA-2305/TRA-2268 grade that exact accumulator, so it is deliberately left fleet-scoped; per-book copies are in `books`). It is the suppression window doTick holds the exit interlock for (news + social + market-review + journal + tradier-balance + the 568-symbol quote-batch + 3 reconciles + shadow-chases): worst-case exit interval is bounded by THAT plus the timer period, never by the timer period alone, so a region at or above 30s makes `p99Under30s` unreachable however well the timer behaves.",
+  "engines": [
+    {
+      "enabled": false,
+      "timerArmed": false,
+      "intervalMs": 10000,
+      "minGapMs": 8000,
+      "mode": "live",
+      "engine": "engine-1",
+      "lastExitPassAt": 1786651532008,
+      "exitPassCount": 684,
+      "lastExitIntervalMs": 30611,
+      "maxExitIntervalMs": 61339,
+      "intervalHistogram": {
+        "lt5s": 0,
+        "lt10s": 0,
+        "lt15s": 1,
+        "lt30s": 293,
+        "lt60s": 382,
+        "lt120s": 7,
+        "lt300s": 0,
+        "gte300s": 0
+      },
+      "decoupledExitSkippedStalePrices": 0,
+      "decoupledPassCount": 0,
+      "tickPassCount": 684,
+      "decoupledSkips": {
+        "disarmed": 0,
+        "selfOverlap": 0,
+        "tickExitRegion": 0,
+        "marketClosed": 0,
+        "minGap": 0,
+        "stalePrices": 0,
+        "threw": 0
+      },
+      "decoupledFireCount": 0,
+      "tickExitRegionMs": {
+        "lastMs": 661,
+        "maxMs": 16650,
+        "samples": 684,
+        "sumMs": 228392,
+        "atOrAbove20s": 0,
+        "atOrAbove30s": 0,
+        "exitWorkMs": {
+          "samples": 684,
+          "sumMs": 2273,
+          "maxMs": 283
+        }
+      },
+      "rth": {
+        "intervalHistogram": {
+          "lt5s": 0,
+          "lt10s": 0,
+          "lt15s": 1,
+          "lt30s": 288,
+          "lt60s": 375,
+          "lt120s": 7,
+          "lt300s": 0,
+          "gte300s": 0
+        },
+        "decoupledPassCount": 0,
+        "tickPassCount": 671,
+        "boundaryIntervals": 1,
+        "closedIntervals": 11
+      }
+    },
+    {
+      "enabled": false,
+      "timerArmed": false,
+      "intervalMs": 10000,
+      "minGapMs": 8000,
+      "mode": "live",
+      "engine": "engine-2",
+      "lastExitPassAt": 1786651534330,
+      "exitPassCount": 681,
+      "lastExitIntervalMs": 30020,
+      "maxExitIntervalMs": 65690,
+      "intervalHistogram": {
+        "lt5s": 0,
+        "lt10s": 0,
+        "lt15s": 0,
+        "lt30s": 254,
+        "lt60s": 424,
+        "lt120s": 2,
+        "lt300s": 0,
+        "gte300s": 0
+      },
+      "decoupledExitSkippedStalePrices": 0,
+      "decoupledPassCount": 0,
+      "tickPassCount": 681,
+      "decoupledSkips": {
+        "disarmed": 0,
+        "selfOverlap": 0,
+        "tickExitRegion": 0,
+        "marketClosed": 0,
+        "minGap": 0,
+        "stalePrices": 0,
+        "threw": 0
+      },
+      "decoupledFireCount": 0,
+      "tickExitRegionMs": {
+        "lastMs": 80,
+        "maxMs": 14628,
+        "samples": 681,
+        "sumMs": 151170,
+        "atOrAbove20s": 0,
+        "atOrAbove30s": 0,
+        "exitWorkMs": {
+          "samples": 681,
+          "sumMs": 2443,
+          "maxMs": 284
+        }
+      },
+      "rth": {
+        "intervalHistogram": {
+          "lt5s": 0,
+          "lt10s": 0,
+          "lt15s": 0,
+          "lt30s": 248,
+          "lt60s": 418,
+          "lt120s": 2,
+          "lt300s": 0,
+          "gte300s": 0
+        },
+        "decoupledPassCount": 0,
+        "tickPassCount": 668,
+        "boundaryIntervals": 1,
+        "closedIntervals": 11
+      }
+    },
+    {
+      "enabled": true,
+      "timerArmed": true,
+      "intervalMs": 10000,
+      "minGapMs": 8000,
+      "mode": "demo",
+      "engine": "engine-3",
+      "lastExitPassAt": 1786651534334,
+      "exitPassCount": 2133,
+      "lastExitIntervalMs": 30023,
+      "maxExitIntervalMs": 35207,
+      "intervalHistogram": {
+        "lt5s": 213,
+        "lt10s": 690,
+        "lt15s": 1080,
+        "lt30s": 143,
+        "lt60s": 6,
+        "lt120s": 0,
+        "lt300s": 0,
+        "gte300s": 0
+      },
+      "decoupledExitSkippedStalePrices": 0,
+      "decoupledPassCount": 1452,
+      "tickPassCount": 681,
+      "decoupledSkips": {
+        "disarmed": 0,
+        "selfOverlap": 0,
+        "tickExitRegion": 28,
+        "marketClosed": 34,
+        "minGap": 562,
+        "stalePrices": 0,
+        "threw": 0
+      },
+      "decoupledFireCount": 2076,
+      "tickExitRegionMs": {
+        "lastMs": 76,
+        "maxMs": 14085,
+        "samples": 681,
+        "sumMs": 200550,
+        "atOrAbove20s": 0,
+        "atOrAbove30s": 0,
+        "exitWorkMs": {
+          "samples": 681,
+          "sumMs": 4614,
+          "maxMs": 70
+        }
+      },
+      "rth": {
+        "intervalHistogram": {
+          "lt5s": 213,
+          "lt10s": 690,
+          "lt15s": 1079,
+          "lt30s": 138,
+          "lt60s": 0,
+          "lt120s": 0,
+          "lt300s": 0,
+          "gte300s": 0
+        },
+        "decoupledPassCount": 1452,
+        "tickPassCount": 668,
+        "boundaryIntervals": 1,
+        "closedIntervals": 11
+      }
+    }
+  ]
+}

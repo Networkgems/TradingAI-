@@ -1,0 +1,178 @@
+== BUILD PIN (from /api/health/options-live -- /api/health has NO build block) ==
+   host       : https://tradingai-bqb1.onrender.com
+   commit     : 8b87cac15b06d08a3b986ed28c799b028e7dda02
+   pid        : 72   startedAt: 2026-09-22T21:06:36.896Z   uptimeSec: 1528
+   mode       : live   operator: admin
+   ancestry reader control: self=YES, zero-sha=NO. OK (repo C:\Users\eetienne\.paperclip\instances\default\projects\fc64eaf4-0c08-4270-9a4c-31ee16594dec\b6a879bc-aabf-4ee4-9e47-12404018a8f1\_default\TradingAI)
+   6eb0065 ancestor of live build: YES
+
+== JOURNAL == rows=3543  desk=197  fixture=1182
+== STATE == openOptions=0  with OCC=0  closedOptions=0
+   ! join control SKIPPED: state carries no open OCC this beat (Grade B degrades to "no OPEN import may exist at all").
+
+== IMPORTED WATCHLIST == 5 contract(s) seen importedFromTradier while open
+   TSLA260911C00555000  firstSeen=2026-08-05T15:43:53.502Z  mode=live
+   PLTR260821C00180000  firstSeen=2026-08-18T01:21:28.066Z  mode=live
+   SPY260821C00777000  firstSeen=2026-08-18T01:21:28.067Z  mode=live
+   BAC260925C00063000  firstSeen=2026-08-21T20:32:26.076Z  mode=live
+   RIG260925C00006000  firstSeen=2026-08-24T20:32:48.447Z  mode=live
+
+== GRADE C == learner exclusion
+   generatedFrom            : {"rows":2329,"resolved":2329,"priorRate":0.137398024903392,"excludedUnattributed":0}
+   excludedUnattributed     : 0
+   tradier_import rows, ALL modes : 5
+   ...eligible for the fold (mode=demo, non-fixture) : 0
+   fold denominator gf.rows : 2329  (demo non-fixture in journal: 2329)
+   denominator control: gf.rows === demo non-fixture -> OK
+   VERDICT C: PASS (VACUOUS) (published count must equal the ELIGIBLE tradier_import count)
+   ⚠️ VACUOUS -- the exclusion never RAN. The live imported cohort is filtered out by the
+      `mode:'demo'` pin in `loadModelFacingJournalRows`, one layer above this criterion,
+      so this reads 0 whether TRA-2937 change #2 shipped or was reverted. It is a control
+      over a DEMO import cohort that does not yet exist (TRA-2134), NOT over the live one.
+   NOTE: the pre-registered "must read 0" is graded against the PRE-DEPLOY baseline of 0
+         tradier_import rows measured on the prior build, which is what makes any
+         non-zero here attributable to the NEW writer rather than to a pre-deploy write.
+
+== GRADE B == no stale OPEN tradier_import row
+   OPEN tradier_import rows : 0
+   VERDICT B: PASS -- 0 OPEN tradier_import row(s) absent from state
+   PRE-EXISTING RESIDUE (reported, NOT graded): 0 live OPEN non-import row(s) whose OCC is absent from state
+
+== GRADE A == imported close round trip
+   MINT   candidates (structure=tradier_import, closeTs >= deploy 2026-08-05T22:00:00Z): 5
+   REBIND candidates (watchlisted OCC, closeTs >= boot 2026-09-22T21:06:36.896Z): 0
+   closes attributable to the imported cohort: 5
+   repair-authored exitReason on live rows (all time, NOT evidence for leg 1): 7
+      AMZN260904P00245000  outcome=LOSS  exitReason="reconstructed-TRA-3472"  structure=single_leg_otm
+      QQQ260904C00797000  outcome=LOSS  exitReason="reconstructed-TRA-3472"  structure=single_leg_otm
+      AMZN260904C00295000  outcome=WIN  exitReason="reconstructed-TRA-3472"  structure=single_leg_otm
+      TSLA260911C00555000  outcome=LOSS  exitReason="reconstructed-TRA-3472"  structure=single_leg_otm
+      PLTR260911C00170000  outcome=WIN  exitReason="reconstructed-TRA-3472"  structure=single_leg_otm
+      TSLA260911C00560000  outcome=LOSS  exitReason="reconstructed-TRA-3472"  structure=single_leg_otm
+      QQQ260911P00545000  outcome=LOSS  exitReason="reconstructed-TRA-3472"  structure=single_leg_otm
+   repair-marker control: catches both observed markers, catches none of [trail, chandelier, tp1, stop, ""]. OK
+   leg-3 window -- now 17:32 ET; the 21:00 ET archive has NOT yet run today.
+      ✅ READABLE REGARDLESS (TRA-3860, live 8b87cac15b06): the export folds the durable journal in,
+         so the archive bounds the BOOK half only. Provenance is graded below; it is not assumed.
+         208 minute(s) left in today's INDEPENDENT (book-sourced) window -- only reachable for a close that landed TODAY.
+   coverage (options, live) : 2026-07-30T13:42:19.751Z (source=option-trade-journal)
+   range control (NEGATIVE, from=2026-07-28 < floor) -> 400 OK -- refuses rather than serving an empty 200
+   range control (POSITIVE, unbounded read) -> 200 with a summary. OK -- the refusal does not fire on everything.
+   leg-3 read is bounded to the candidates' own close ET day(s): 2026-08-18, 2026-08-24, 2026-08-26, 2026-09-02
+   filter echo (summary.filters, NOT top-level) : {"markets":["options"],"modes":["live"],"from":1787011200000,"to":1788393599999}  OK -- both keys honoured
+   export (modes=live, markets=options) -> trades=14  option rows keyed by OCC: 11
+      BAC260925C00063000 -> 2 rows (SEPARATE ROUND TRIPS, not a double-count): journal/broker-fill net=-74.24 r=-0.492 reason="chandelier_restarted" exit=2026-08-21T17:05:10.473Z  |  journal/book net=-3 r=-0.026 reason="chandelier_daily_close" exit=2026-08-24T19:31:08.062Z
+      BAC260925C00063000 -> exit_time distinct values: 2 (2026-08-21T17:05:10.473Z, 2026-08-24T19:31:08.062Z)  <- all distinct: N closes on one contract, graded per close
+      RIG260925C00006000 -> 2 rows (SEPARATE ROUND TRIPS, not a double-count): journal/broker-fill net=-15.24 r=-0.462 reason="sl_otm_premium_pct" exit=2026-08-24T15:15:55.327Z  |  journal/book net=-7 r=-0.318 reason="profit_lock" exit=2026-08-26T13:45:31.275Z
+      RIG260925C00006000 -> exit_time distinct values: 2 (2026-08-24T15:15:55.327Z, 2026-08-26T13:45:31.275Z)  <- all distinct: N closes on one contract, graded per close
+      NOK261002C00010500 -> 2 rows (SEPARATE ROUND TRIPS, not a double-count): journal/broker-fill net=-39.24 r=-0.553 reason="manual" exit=2026-09-02T17:35:37.046Z  |  journal/book net=-22.5 r=-0.395 reason="broker_reconcile" exit=2026-09-02T17:36:03.829Z
+      NOK261002C00010500 -> exit_time distinct values: 2 (2026-09-02T17:35:37.046Z, 2026-09-02T17:36:03.829Z)  <- all distinct: N closes on one contract, graded per close
+      summary.totals as published: {"gross_pnl_usd":-562.5,"fees_usd":2.53,"net_pnl_usd":-565.03}  over summary.count=14 rows -- NOT overstated: every repeated OCC above is a distinct close.
+   summary.sources : {"book":0,"journal":14}  ⇒ leg-3 provenance: JOURNAL-SOURCED (SAME STORE as leg 1)
+      ⚠️ This read proves the ROUTE SURFACES the reason (the TRA-2937 defect) but it is NOT an
+         independent corroboration of the journal: the export IS serving the journal row. The
+         cross-store half of leg 3 needs a book-sourced read, i.e. the close's OWN ET day pre-archive.
+   PLTR260821C00180000  path=MINT (structure=tradier_import)
+      outcome=LOSS  exitReason="sl" OK
+      export exit_reason="sl" OK [SAME-STORE -- per-row source=journal]
+      money: export net_pnl_usd=-115 vs journal realizedPnlUsd=-115 OK   [export fees_usd=0 vs journal feesUsd=(absent)]
+      pre-registered CROSS-STORE prediction for the pre-archive read of PLTR260821C00180000:
+         book-served row must publish exit_reason="sl" (rowFromOption maps opt.exitReason since TRA-2937),
+         fees_usd=0 (hardcoded) and gross_pnl_usd=-115 (=net), i.e. the fee column FLATTENS vs journal 0.
+         net_pnl_usd is the OPEN question: -115 if TRA-3730's sweep restated the BOOK's opt.pnl,
+         or the pre-restatement figure if it restated the journal only. That single number is what the
+         cross-store half of leg 3 exists to settle -- do not grade it as PASS/FAIL until it is read.
+      realizedPnlUsd=-115.00000000000001  closeTs=2026-08-18T13:30:14.833Z
+   SPY260821C00777000  path=MINT (structure=tradier_import)
+      outcome=LOSS  exitReason="sl" OK
+      export exit_reason="sl" OK [SAME-STORE -- per-row source=journal]
+      money: export net_pnl_usd=-156.23 vs journal realizedPnlUsd=-156.23 OK   [export fees_usd=0.23 vs journal feesUsd=0.23]
+      pre-registered CROSS-STORE prediction for the pre-archive read of SPY260821C00777000:
+         book-served row must publish exit_reason="sl" (rowFromOption maps opt.exitReason since TRA-2937),
+         fees_usd=0 (hardcoded) and gross_pnl_usd=-156.23 (=net), i.e. the fee column FLATTENS vs journal 0.23.
+         net_pnl_usd is the OPEN question: -156.23 if TRA-3730's sweep restated the BOOK's opt.pnl,
+         or the pre-restatement figure if it restated the journal only. That single number is what the
+         cross-store half of leg 3 exists to settle -- do not grade it as PASS/FAIL until it is read.
+      realizedPnlUsd=-156.23  closeTs=2026-08-18T13:45:40.706Z
+   BAC260925C00063000  path=MINT (structure=tradier_import)
+      outcome=SCRATCH  exitReason="chandelier_daily_close" OK
+      export exit_reason="chandelier_daily_close" OK [SAME-STORE -- per-row source=journal]
+      this contract carries 2 export row(s); graded against the journal copy PAIRED ON exit_time=2026-08-24T19:31:08.062Z == journal closeTs (TRA-4333).
+         other copy: source=journal basis=broker-fill exit_reason="chandelier_restarted" net=-74.24 r=-0.492 exit=2026-08-21T17:05:10.473Z   <- different exit_reason, but a DIFFERENT close: not a disagreement
+      money: export net_pnl_usd=-3 vs journal realizedPnlUsd=-3 OK   [export fees_usd=0 vs journal feesUsd=(absent)]
+      pre-registered CROSS-STORE prediction for the pre-archive read of BAC260925C00063000:
+         book-served row must publish exit_reason="chandelier_daily_close" (rowFromOption maps opt.exitReason since TRA-2937),
+         fees_usd=0 (hardcoded) and gross_pnl_usd=-3 (=net), i.e. the fee column FLATTENS vs journal 0.
+         net_pnl_usd is the OPEN question: -3 if TRA-3730's sweep restated the BOOK's opt.pnl,
+         or the pre-restatement figure if it restated the journal only. That single number is what the
+         cross-store half of leg 3 exists to settle -- do not grade it as PASS/FAIL until it is read.
+      realizedPnlUsd=-3  closeTs=2026-08-24T19:31:08.062Z
+   RIG260925C00006000  path=MINT (structure=tradier_import)
+      outcome=LOSS  exitReason="profit_lock" OK
+      export exit_reason="profit_lock" OK [SAME-STORE -- per-row source=journal]
+      this contract carries 2 export row(s); graded against the journal copy PAIRED ON exit_time=2026-08-26T13:45:31.275Z == journal closeTs (TRA-4333).
+         other copy: source=journal basis=broker-fill exit_reason="sl_otm_premium_pct" net=-15.24 r=-0.462 exit=2026-08-24T15:15:55.327Z   <- different exit_reason, but a DIFFERENT close: not a disagreement
+      money: export net_pnl_usd=-7 vs journal realizedPnlUsd=-7 OK   [export fees_usd=0 vs journal feesUsd=(absent)]
+      pre-registered CROSS-STORE prediction for the pre-archive read of RIG260925C00006000:
+         book-served row must publish exit_reason="profit_lock" (rowFromOption maps opt.exitReason since TRA-2937),
+         fees_usd=0 (hardcoded) and gross_pnl_usd=-7 (=net), i.e. the fee column FLATTENS vs journal 0.
+         net_pnl_usd is the OPEN question: -7 if TRA-3730's sweep restated the BOOK's opt.pnl,
+         or the pre-restatement figure if it restated the journal only. That single number is what the
+         cross-store half of leg 3 exists to settle -- do not grade it as PASS/FAIL until it is read.
+      realizedPnlUsd=-7.000000000000001  closeTs=2026-08-26T13:45:31.275Z
+   NOK261002C00010500  path=MINT (structure=tradier_import)
+      outcome=LOSS  exitReason="broker_reconcile" OK
+      export exit_reason="broker_reconcile" OK [SAME-STORE -- per-row source=journal]
+      this contract carries 2 export row(s); graded against the journal copy PAIRED ON exit_time=2026-09-02T17:36:03.829Z == journal closeTs (TRA-4333).
+         other copy: source=journal basis=broker-fill exit_reason="manual" net=-39.24 r=-0.553 exit=2026-09-02T17:35:37.046Z   <- different exit_reason, but a DIFFERENT close: not a disagreement
+      money: export net_pnl_usd=-22.5 vs journal realizedPnlUsd=-22.5 OK   [export fees_usd=0 vs journal feesUsd=(absent)]
+      pre-registered CROSS-STORE prediction for the pre-archive read of NOK261002C00010500:
+         book-served row must publish exit_reason="broker_reconcile" (rowFromOption maps opt.exitReason since TRA-2937),
+         fees_usd=0 (hardcoded) and gross_pnl_usd=-22.5 (=net), i.e. the fee column FLATTENS vs journal 0.
+         net_pnl_usd is the OPEN question: -22.5 if TRA-3730's sweep restated the BOOK's opt.pnl,
+         or the pre-restatement figure if it restated the journal only. That single number is what the
+         cross-store half of leg 3 exists to settle -- do not grade it as PASS/FAIL until it is read.
+      realizedPnlUsd=-22.499999999999996  closeTs=2026-09-02T17:36:03.829Z
+   paths exercised: MINT=5  REBIND=0
+   ! Only one path was exercised. Both are passes and they are different code; the other half stays UNGRADED.
+   legs read: 1 exitReason non-empty=5/5  ·  3 export match=5/5 (5 matched)
+   VERDICT A: PASS  ⚠️ (LEG 3 READ but SAME-STORE -- see provenance above.)
+      ⇒ all three legs read, but leg 3 was answered by the JOURNAL, the same store leg 1 read.
+         The route SURFACES the reason (the TRA-2937 defect is fixed and stays fixed); the
+         CROSS-STORE half needs a book-sourced read on the close's own ET day, pre-archive.
+
+== GRADE D == partial-close arm (trim that STAYS OPEN)
+   D1 journal half -- baseline was 0 row(s) carrying partials[]
+      rows carrying partials[] now            : 1
+      ...with a slice ts >= boot (2026-09-22T21:06:36.896Z) : 0
+      ...attributable to the IMPORTED cohort  : 0
+      VERDICT D1: NO-RUN -- no imported trim landed on this build. NOT a pass.
+   D2 day-cell half -- anchor: most recently archived ET day (today=2026-09-22, prev=2026-09-21)
+      admin: grading archived ET day 2026-09-21 (previous ET day; this run is past ET midnight)
+      admin: source=journal optionsDaily=0 bucket=0 journalCloses=0 journalPartialCloses=0
+      v0nni: grading archived ET day 2026-09-21 (previous ET day; this run is past ET midnight)
+      v0nni: source=journal optionsDaily=0 bucket=0 journalCloses=0 journalPartialCloses=0
+      VERDICT D2: N/A
+   D3 log negative control -- e6a201e ancestor of live build: YES
+      control 1: unfiltered window since 2026-09-22T21:06:36.896Z -> 100 line(s). OK
+      control 2 (positive, phrase shape): text="slow async phase" (3 words) -> 100 line(s). OK
+      control 3 (negative, fabricated token): 0 line(s). OK -- the filter discriminates.
+      "…dropped: no OPEN row for this id"  : 0   <- WRITER-SIDE HOLE (TRA-2937 shape)
+      "…dropped: row already closed"       : 0   <- LATE SLICE (arrives after the close row)
+      VERDICT D3: CLEAN
+   VERDICT D: NO-RUN   [D1=NO-RUN D2=N/A D3=CLEAN]
+
+== GRADE X == cross-store arm (rows the export answers out of the BOOK, today's ET day)
+   read: from=2026-09-22&to=2026-09-22&markets=options&modes=live -> count=0
+   summary.sources : {"book":0,"journal":0}   summary.supersededRowCount : 0
+   positive control (2026-08-18, known to hold 2 rows) -> count=2 OK -- the reader is not blind
+   scope: the journal holds 0 live non-fixture close(s) for 2026-09-22 across book(s) []; this read is the CALLER'S BOOK only.
+   no book-served row today (0 row(s) served, all from the journal).
+   VERDICT X: NO-RUN -- the archive already ran, or nothing closed today. NOT a pass.
+
+===== ROLL-UP =====
+   A (round trip)      : PASS (3 LEGS, LEG 3 SAME-STORE)   [MINT=5 REBIND=0 leg3=READ(SAME-STORE)]
+   B (no stale OPEN)   : PASS   [residue reported separately: 0]
+   C (learner control) : PASS (VACUOUS)
+   D (partial arm)     : NO-RUN   [D1 journal=NO-RUN · D2 day cell=N/A · D3 log=CLEAN]
+   X (cross-store)     : NO-RUN

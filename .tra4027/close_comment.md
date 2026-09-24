@@ -1,0 +1,30 @@
+## Monitor fire #8 (2026-09-22T21:28Z): the recorded decision rule's terminal branch fired -- closing on AC1-AC4 + the journal-side identity; AC5's live book half re-homed to TRA-4797
+
+**Pin:** bqb1 `8b87cac15b06` **pid 72, startedAt 2026-09-22T21:06:36.896Z** (foreign deploy 22 min before the read; `c4b9ca2a` remains an ancestor of every build seen since 08-26). Post-close, pre-archive.
+
+```
+[tra4027] PASS readAt=2026-09-22T21:28:58.248Z pin=8b87cac15b06 pid=72 startedAt=2026-09-22T21:06:36.896Z
+[tra4027] options rows=106 census={"journal:premium-open-mark":103,"journal:premium-fill":3} journalTwins=3543 journalRoute=ok
+[tra4027] flow openOptionsNow=0 flatSessions=20 captureEtDay=2026-09-22 retention=33d since=2026-09-16 daysWithOptionOrders=[]
+```
+
+Both detector arms exercised in the same beat: the live arm (`--since=2026-09-16`) reads `[]`; the positive control (`--since=2026-08-24`) FIRES and names 08-24/25/26/27/28 + 09-02 with per-day attestations. The empty reading is a measurement, not an unexercised branch. Retention (33d) now covers the entire post-fix era, so no close has crossed the edge undetected since the detector shipped.
+
+## Why this is the closing fire
+
+Fire #7 recorded the rule: *"No option order by 2026-09-30, **or TRA-4376 rules the window terminal first** => AC5's book half is re-homed ... and TRA-4027 closes on AC1-AC4 plus the live journal-side identity."* The second disjunct fired hours after that comment was posted:
+
+- **TRA-4376 closed 09-16, ruling revision 2 executed 21:36Z**: window w1 TERMINAL, `verdict_insufficient_population` atN 4 (once-only pen SPENT), **NO successor authorized**. Starving gate = armed selector `[0.25,0.40]` DISJOINT from the frozen cell `[0.50,0.55)`; TRA-4569 is a standing NO-GO on re-pointing the band. TRA-3945 itself closed `done` the same evening.
+- The fleet has now placed **0 option orders for 20 consecutive ET sessions** (09-03..09-22), and the only authorized option sleeve's evaluation window is retired. The condition this AC waits on is not late; it is structurally gone until a fresh nomination decision no open ticket owns.
+
+## What this ticket closes on
+
+- **AC1-AC4**: shipped `c4b9ca2a` 08-26 and graded that day (comment 08-26T07:19Z) -- book mapper joins the journal OPEN twin's `atRiskUsd`; `pnl_r_basis` partition (`premium-open-mark`/`premium-fill`/`stop-distance`, bare `premium` retired); `entry_price` stays the FILL with `premium_basis_usd` published as the divisor; AC4 regression twin carries fill != mark (1.51 vs 139.5, agrees at -0.530, untwinned control -0.490). 162/162 across the export suites; negative control on the OLD build FAILED loudly (pid 75, no `premium_basis_usd`).
+- **The live identity `pnl_r == net_pnl_usd / premium_basis_usd`**: has held on **8 consecutive live reads over 4 weeks and 5+ builds** (08-26 x3, 09-10, 09-15, 09-16 x2, 09-22), 106/106 rows every time, inside the honest rounding bound `0.0005 + 0.00005 + 0.005/basis`.
+- **What is NOT claimed**: the archive-edge invariance on a REAL book-served row (a live close read before AND after 01:00Z). Every live read has been 100% journal-served. That grade -- procedure, detector, pins, and the flow-fact un-park trigger -- is now first-class as **TRA-4797** (mine, `todo`, child of this issue; precedent TRA-4357 AC5 -> TRA-4441). It becomes actionable the session `order-provenance-capture` names an option-order day or `openOptionsNow > 0`, from any sleeve.
+
+## Strand sweep (TRA-2617)
+
+`blocks: []`, `blockedBy: []`, interactions **0** (re-checked this beat; per the filing, no card was ever intended). Nothing to park. TRA-4797 verified on a fresh GET: `todo`, assigned LeadDev, description carries the full grade procedure.
+
+Snapshots: `.tra4027/before-2026-09-22.json` + `control-2026-09-22.json` (untracked, in the repo checkout).

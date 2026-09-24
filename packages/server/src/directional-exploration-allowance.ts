@@ -479,12 +479,23 @@ export function commitExplorationOpen(
  */
 export function handleExplorationJournalClose(
   id: string,
-  close: { realizedPnlUsd: number },
+  /** TRA-4857: realizedPnlUsd can be null for unpriced reconcile closes. */
+  close: { realizedPnlUsd: number | null },
   etDay: string,
   now: number = Date.now(),
 ): void {
   const o = opens.get(id);
   if (!o || o.closed) return;
+  // TRA-4857 — null is NOT the same as a non-finite number: null is "unmeasured",
+  // while NaN is a defect. An unpriced close contributes $0 to cumulative P&L.
+  if (close.realizedPnlUsd === null) {
+    log.info('exploration close was unpriced (broker_reconcile, no fill) — recorded as $0', { id });
+    appendEvent({ kind: 'close', id, realizedPnlUsd: 0, etDay, ts: now });
+    const pnl = realizedPnlUsd();
+    log.info('exploration close recorded (TRA-4378)', { id, realizedPnlUsd: 0, cumPnlUsd: pnl });
+    o.closed = true;
+    return;
+  }
   if (!Number.isFinite(close.realizedPnlUsd)) {
     log.warn('exploration close carried non-finite realizedPnlUsd — NOT recorded', { id });
     return;

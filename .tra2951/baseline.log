@@ -1,0 +1,34 @@
+== BUILD PIN (from /api/health/options-live -- /api/health has NO build block) ==
+   host       : https://tradingai-bqb1.onrender.com
+   commit     : 7b4cb2fe751dc9d907065ab9f1987249dff29ddc
+   pid        : 72   startedAt: 2026-08-05T12:11:44.917Z   uptimeSec: 13192
+   mode       : live   operator: admin
+   ancestry reader control: self=YES, zero-sha=NO. OK (repo C:\Users\eetienne\.paperclip\instances\default\projects\fc64eaf4-0c08-4270-9a4c-31ee16594dec\b6a879bc-aabf-4ee4-9e47-12404018a8f1\_default\TradingAI)
+   6eb0065 ancestor of live build: NO
+
+== JOURNAL == rows=2514  desk=150  fixture=172
+== STATE == openOptions=1  with OCC=1  closedOptions=5
+   underlying=TSLA  OCC=TSLA260911C00555000  mode=live  importedFromTradier=true
+   join control: known-present OCC joins, fabricated OCC does not. OK
+
+== IMPORTED WATCHLIST == 1 contract(s) seen importedFromTradier while open
+   TSLA260911C00555000  firstSeen=2026-08-05T15:43:53.502Z  mode=live
+
+== PRE-DEPLOY BASELINE ==
+   tradier_import rows            : 0
+   generatedFrom keys             : rows, resolved, priorRate
+   excludedUnattributed present   : false
+   weightsBasis                   : desk+unattributed
+   live OPEN journal rows         : 12
+   ...of which OCC absent from state (PRE-EXISTING RESIDUE): 11
+      DRAM260904C00060000  structure=single_leg_otm  openTs=2026-07-30T13:36:18.556Z
+      QQQ260904C00765000  structure=single_leg_otm  openTs=2026-07-30T13:42:23.136Z
+      IWM260904C00320000  structure=single_leg_otm  openTs=2026-07-30T13:42:23.379Z
+      AMZN260904P00245000  structure=single_leg_otm  openTs=2026-07-31T13:36:02.351Z
+      TSLA260904C00460000  structure=single_leg_otm  openTs=2026-07-31T13:36:03.405Z
+      QQQ260904C00797000  structure=single_leg_otm  openTs=2026-07-31T13:36:10.029Z
+      AMZN260904C00295000  structure=single_leg_otm  openTs=2026-07-31T13:47:32.151Z
+      SPY260911P00625000  structure=single_leg_otm  openTs=2026-08-04T13:42:52.981Z
+      PLTR260911C00170000  structure=single_leg_otm  openTs=2026-08-04T13:43:02.720Z
+      TSLA260911C00560000  structure=single_leg_otm  openTs=2026-08-04T13:47:53.234Z
+      QQQ260911P00545000  structure=single_leg_otm  openTs=2026-08-04T13:47:54.649Z

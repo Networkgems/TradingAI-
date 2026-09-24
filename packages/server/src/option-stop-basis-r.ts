@@ -64,8 +64,11 @@ export interface OptionStopBasisInput {
   /** `OptionPosition.stopLossPremium` as the row carried it at the close. */
   stopLossPremium: number | undefined;
   contracts: number | undefined;
-  /** The close row's `realizedPnlUsd` — CUMULATIVE, partials included. */
-  realizedPnlUsd: number | undefined;
+  /**
+   * The close row's `realizedPnlUsd` — CUMULATIVE, partials included.
+   * TRA-4857: can be `null` for unpriced reconcile closes.
+   */
+  realizedPnlUsd: number | null | undefined;
 }
 
 /** What the close row persists. A null figure ALWAYS carries a reason. */
@@ -81,7 +84,8 @@ export interface OptionStopBasisResult {
   stopBasisRPerPremiumR?: number;
 }
 
-const finite = (v: number | undefined): v is number => typeof v === 'number' && Number.isFinite(v);
+// TRA-4857: updated to handle null (unpriced reconcile closes).
+const finite = (v: number | null | undefined): v is number => typeof v === 'number' && Number.isFinite(v);
 
 /**
  * Compute the row's stop-basis R and its divisor.

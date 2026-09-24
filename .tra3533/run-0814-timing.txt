@@ -1,0 +1,121 @@
+[train] control ok    POSITIVE — a passed deadline with the commit ABSENT from live grades STRANDED
+[train] control ok    NEGATIVE — the same order with the commit PRESENT in live is SILENT (no finding)
+[train] control ok    NEGATIVE — a SATISFIED order whose deadline has passed reports timing UNREAD, not OK
+[train] control ok    USE-vs-MENTION — a RETRACTION quoting the order it kills is NOT classified as a train
+[train] control ok    USE-vs-MENTION — a real order that ALSO quotes the freeze rule IS still a train
+[train] control ok    ADOPTION LEVER — a prose train with NO order block is UNGRADED (exit 4), NOT stranded (exit 1)
+[train] control ok    FAILS CLOSED — a commit UNKNOWN to this checkout is BLIND, never STRANDED
+[train] control ok    FAILS CLOSED — a deadline with no Z is REJECTED, not silently read as local time
+[train] control ok    FAILS CLOSED — TWO order blocks is an error, not "take the first"
+[train] control ok    NOT-YET — an unmet order whose deadline is AHEAD is PENDING, not a finding
+[train] control ok    OPT-OUT — an explicit `deploy-order: none` marker leaves the population on the record
+[train] control ok    RECENCY — a fire inside the window is IN, one before it is OUT
+[train] control ok    RECENCY FAILS OPEN INTO THE POPULATION — an unreadable triggeredAt is INCLUDED
+[train] control ok    TIMING POSITIVE — the only carrying deploy served AFTER the deadline grades LATE (exit 5, not stranded)
+[train] control ok    TIMING NEGATIVE — a carrying deploy that served BEFORE the deadline is ON TIME and silent
+[train] control ok    TIMING FAILS CLOSED — history that starts AFTER the deadline is UNREAD, never LATE
+[train] control ok    TIMING FAILS CLOSED — a pre-deadline deploy whose commit is UNKNOWN to the checkout is UNREAD, never LATE
+[train] control ok    TIMING — a BUILD_FAILED deploy of the commit before the deadline is NOT "it was live by then"
+[train] control ok    TIMING — an order for a DIFFERENT host is UNREAD against this history, not graded off it
+[train] control ok    TIMING — with NO history injected a passed deadline is still UNREAD (the arm is off, not OK)
+[train] control ok    POPULATION — a carrier with no deploy mention at all is NOT_TRAIN and silent
+[train] 21/21 controls pass, both directions.
+
+[train] live build  1a5e8f1c  pid 73  booted 2026-08-14T03:58:46.033Z
+[train] timing arm ON — 600 deploy records over 6 page(s), back to 2026-06-10T15:53:17.533Z; history bound to live 1a5e8f1c by its newest `live` deploy.
+[train]   ⛔ page cap 6 hit — history may be truncated. An order whose deadline
+[train]   predates the oldest record above is reported UNREAD, never on-time and never LATE.
+[train] population: 74 carriers fired since 2026-08-07T04:23:57.008Z; 144 older EXCLUDED.
+[train]   (not a silent cap — settled history predates the `deploy-order` rule and cannot
+[train]    strand anything now. Re-run with --all to grade the backlog anyway.)
+
+[train] 74 carriers read, 24 in the deploy population, 3 GRADED against a machine-readable order.
+
+[train] ── GRADED (3) — these carry a `deploy-order` block and were measured ──
+[train]   SATISFIED   TRA-3654   routine 31a25426  fired 2026-08-14T00:21:37.795Z
+[train]       48a0883 is an ancestor of live 1a5e8f1c  [ON TIME]
+[train]       timing: serving by 2026-08-13T05:10:18.930Z (deploy of e0ae2447), before the 2026-08-14T01:00:00Z deadline
+[train]   SATISFIED   TRA-3652   routine e7ccfe59  fired 2026-08-14T00:21:25.309Z
+[train]       229af6d is an ancestor of live 1a5e8f1c
+[train]   SATISFIED   TRA-3639   routine fc05a69f  fired 2026-08-13T20:30:18.251Z
+[train]       8713331 is an ancestor of live 1a5e8f1c
+
+[train] ── UN-GRADED (21) — SUSPECTED trains this check could not see into ──
+[train]   Not an accusation: the prose classifier has known false positives, and every
+[train]   row below predates the rule. Resolve by adding the `deploy-order` block if it
+[train]   IS a train, or the `<!-- deploy-order: none -->` marker if it is not.
+[train]   AMBIGUOUS   TRA-3656   routine 6f88b5e5  fired 2026-08-14T00:21:44.006Z
+[train]       mentions deploying, every mention inside a prohibition or retraction — probably not a train, but a grep cannot prove which, so it is not dropped silently
+[train]       span: 1. render-redeploy.mjs Gate 4 (exit 8) + --allow-rollback="reason". Refuses a target that is
+[train]   UNGRADEABLE TRA-3677   routine cf9dfd16  fired 2026-08-14T01:15:02.956Z
+[train]       no ```deploy-order block — SUSPECTED train: add the block if it is one, or the `deploy-order: none` marker if it is not
+[train]       span: Use `node scripts/render-redeploy.mjs --commit=<full sha of origin/main>` -- the
+[train]   UNGRADEABLE TRA-3644   routine 22fbe2f5  fired 2026-08-14T00:21:03.542Z
+[train]       no ```deploy-order block — SUSPECTED train: add the block if it is one, or the `deploy-order: none` marker if it is not
+[train]       span: 13:25-20:00Z Mon-Fri freeze, clear of any graded soak, via `scripts/render-redeploy.mjs` and the
+[train]   UNGRADEABLE TRA-3657   routine 4dbebfa8  fired 2026-08-14T00:21:54.780Z
+[train]       no ```deploy-order block — SUSPECTED train: add the block if it is one, or the `deploy-order: none` marker if it is not
+[train]       span: 2. ROLLBACK. Three deploy carriers target bqb1 tonight, ALL assigned to LeadDev:
+[train]   UNGRADEABLE TRA-3635   routine 7d30dcfc  fired 2026-08-13T20:25:13.132Z
+[train]       no ```deploy-order block — SUSPECTED train: add the block if it is one, or the `deploy-order: none` marker if it is not
+[train]       span: # If you find yourself about to set a shadow flag, redeploy bqb1, or lift the pin -- STOP. That is
+[train]   UNGRADEABLE TRA-3631   routine 9a576b6f  fired 2026-08-13T20:10:12.988Z
+[train]       no ```deploy-order block — SUSPECTED train: add the block if it is one, or the `deploy-order: none` marker if it is not
+[train]       span: Invoke-RestMethod -Uri 'https://api.render.com/v1/services/srv-d7mb7rr7uimc73ev0chg/deploys?limit=12' -Headers @{Authorization="Bearer $k";Accept='application/json'}
+[train]   AMBIGUOUS   TRA-3633   routine 50d19ffb  fired 2026-08-13T20:15:18.125Z
+[train]       mentions deploying, every mention inside a prohibition or retraction — probably not a train, but a grep cannot prove which, so it is not dropped silently
+[train]       span: (measured on bqb1, TRA-2186 / TRA-2325). `render-redeploy.mjs` structurally **cannot** intercept an env
+[train]   UNGRADEABLE TRA-3629   routine 368ce26f  fired 2026-08-13T19:45:12.710Z
+[train]       no ```deploy-order block — SUSPECTED train: add the block if it is one, or the `deploy-order: none` marker if it is not
+[train]       span: a) `pnpm check:deploy-drift` -- publish no number measured against bqb1 until it reports CURRENT.
+[train]   UNGRADEABLE TRA-3609   routine 0a9e7abc  fired 2026-08-13T17:00:10.094Z
+[train]       no ```deploy-order block — SUSPECTED train: add the block if it is one, or the `deploy-order: none` marker if it is not
+[train]       span: > **No deploy and no env/settings write on bqb1 (`srv-d7mb7rr7uimc73ev0chg`) between 13:25Z and 20:20Z on Mon 2026-07-27.** CTO-ratified on **TRA-2322**; requested of LeadDev on **TRA-2325**; confirme
+[train]   UNGRADEABLE TRA-3513   routine bb11cef4  fired 2026-08-13T06:30:33.074Z
+[train]       no ```deploy-order block — SUSPECTED train: add the block if it is one, or the `deploy-order: none` marker if it is not
+[train]       span: RENDER_API_KEY=<host User-scope env> node scripts/render-redeploy.mjs --commit=$TIP
+[train]   UNGRADEABLE TRA-3511   routine 4a40da8c  fired 2026-08-13T06:15:33.263Z
+[train]       no ```deploy-order block — SUSPECTED train: add the block if it is one, or the `deploy-order: none` marker if it is not
+[train]       span: TRA-3483 one-shot 06:15Z 08-13: DEPLOY the costR recorder to bqb1 BEFORE the 08-13 open.
+[train]   UNGRADEABLE TRA-3493   routine 5300a8f6  fired 2026-08-13T04:15:31.247Z
+[train]       no ```deploy-order block — SUSPECTED train: add the block if it is one, or the `deploy-order: none` marker if it is not
+[train]       span: One-shot (TRA-3381, leaf = issue 581edb3e-41ed-46a3-8c7c-6b8c88694d34). Deploy commit 65fdb95 (byMode partition on /api/health/option-journal) to bqb1 and verify the TRA-2946 grading surface, then clo
+[train]   UNGRADEABLE TRA-3207   routine d4c1d037  fired 2026-08-11T13:30:53.497Z
+[train]       no ```deploy-order block — SUSPECTED train: add the block if it is one, or the `deploy-order: none` marker if it is not
+[train]       span: The `COMMIT_HOLDS` row in `scripts/render-redeploy.mjs` held it to `2026-07-27T21:00:00Z`, and
+[train]   AMBIGUOUS   TRA-3500   routine 9fb795b4  fired 2026-08-13T05:00:32.404Z
+[train]       mentions deploying, every mention inside a prohibition or retraction — probably not a train, but a grep cannot prove which, so it is not dropped silently
+[train]       span: 3. Otherwise deploy via the enforced freeze path ONLY: RENDER_API_KEY (host User scope) node scripts/render-redeploy.mjs --commit=<origin/main tip sha>. NEVER hand-curl the Render API. If the script p
+[train]   AMBIGUOUS   TRA-3377   routine 3d91c984  fired 2026-08-12T13:31:55.456Z
+[train]       mentions deploying, every mention inside a prohibition or retraction — probably not a train, but a grep cannot prove which, so it is not dropped silently
+[train]       span: 1. DEPLOY CHECK. `pnpm check:deploy-drift`. The TRA-3010 instrument must be live. RE-DERIVE the target yourself off `origin/main`; never reuse a SHA off a comment, including this one. The self-check t
+[train]   UNGRADEABLE TRA-3246   routine 16c91ef8  fired 2026-08-11T20:05:12.182Z
+[train]       no ```deploy-order block — SUSPECTED train: add the block if it is one, or the `deploy-order: none` marker if it is not
+[train]       span: `resolveTarget` in scripts/render-redeploy.mjs takes the tip of the service's BRANCH unless a
+[train]   AMBIGUOUS   TRA-3316   routine 5043738d  fired 2026-08-12T05:45:23.839Z
+[train]       mentions deploying, every mention inside a prohibition or retraction — probably not a train, but a grep cannot prove which, so it is not dropped silently
+[train]       span: 1. Confirm live bqb1 SHA ancestry contains d4246e0 (scripts/render-deploy-status.mjs for srv-d7mb7rr7uimc73ev0chg; NEVER re-trigger a deploy on a render-redeploy.mjs "error" — that script false-errors
+[train]   UNGRADEABLE TRA-3313   routine 93b02676  fired 2026-08-12T05:15:23.774Z
+[train]       no ```deploy-order block — SUSPECTED train: add the block if it is one, or the `deploy-order: none` marker if it is not
+[train]       span: One-shot: deploy the TRA-2959 fee-ledger coverage fix to bqb1 after the 2026-08-06 soak grade, then verify acceptance on LIVE and close TRA-2959.
+[train]   AMBIGUOUS   TRA-3254   routine 2f0c6457  fired 2026-08-11T20:45:18.687Z
+[train]       mentions deploying, every mention inside a prohibition or retraction — probably not a train, but a grep cannot prove which, so it is not dropped silently
+[train]       span: One-shot wake for TRA-3230 (clock gate of TRA-3221). Fires 20:45:00Z on 2026-08-11, after the RTH deploy freeze lifts (20:00Z) and after the 20:25Z TRA-1648 soak read completes. On fire: follow the WH
+[train]   UNGRADEABLE TRA-3175   routine a430eda3  fired 2026-08-11T12:44:42.146Z
+[train]       no ```deploy-order block — SUSPECTED train: add the block if it is one, or the `deploy-order: none` marker if it is not
+[train]       span: One-shot: deploy the TRA-2959 fee-ledger coverage fix to bqb1 after the 2026-08-06 soak grade, then verify acceptance on LIVE and close TRA-2959.
+[train]   UNGRADEABLE TRA-3161   routine 92ec7f01  fired 2026-08-11T12:41:53.691Z
+[train]       no ```deploy-order block — SUSPECTED train: add the block if it is one, or the `deploy-order: none` marker if it is not
+[train]       span: 2. CONFIRM THE FREEZE IS OPEN. It is a wall clock, not a judgement call. render-redeploy.mjs
+
+[train] ⛔ NAMED LIMIT, printed every run: carriers come from `lastRun` on the routines
+[train]    list route, i.e. ONE per routine, the newest. A worked newer carrier hides an
+[train]    abandoned older one. Deploy trains are one-shots that archive themselves at
+[train]    step 1, so they have ~one carrier each — close to complete here, still a limit.
+[train] ⛔ SATISFIED means the commit is live NOW. Whether it was live BY THE DEADLINE is the
+[train]    separate `timing` column, measured on this run against 600 Render deploy records.
+
+[train] VERDICT = UNGRADED — 0 stranded and 0 late among the 3 order(s) this check could
+[train] measure, and 21 suspected carrier(s) it could not. NOT a clean bill of health:
+[train] the un-graded rows are un-measured, not measured-and-fine — a stranded order
+[train] hiding in one of them is indistinguishable from this output.
