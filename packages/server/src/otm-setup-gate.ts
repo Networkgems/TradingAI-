@@ -5,6 +5,7 @@ import {
   type SetupTaxonomyDefinition,
   type SetupTaxonomyInput,
   type SetupTaxonomyReasonCode,
+  type SetupTaxonomySide,
   type SetupTaxonomyVerdict,
 } from '@trading-app/engine';
 import { isStockMarketOpen } from '@trading-app/shared';
@@ -265,6 +266,18 @@ export interface OtmSetupGateDecision {
    */
   readonly skipReasonCode: SetupTaxonomyReasonCode | undefined;
   readonly verdict: SetupTaxonomyVerdict;
+  /**
+   * The wing the mispricing nominator picked, carried through from the input.
+   *
+   * ⛔ NEEDED TO CLASSIFY `verdict.perSetup` (TRA-4423). A per-setup match
+   * records the side that setup fired on; "same side" vs "opposite side" is
+   * only meaningful against the NOMINEE's side, and the verdict alone cannot
+   * supply it — `confirmedSide` is null on `no_setup_matched`, and on a
+   * conflict it is the wrong wing by definition. Deriving it by inverting
+   * `confirmedSide` would silently break the day the taxonomy is allowed to
+   * flip (TRA-4421 §11 default 2).
+   */
+  readonly nomineeSide: SetupTaxonomySide;
   readonly mode: SetupTaxonomyMode;
   /**
    * Prose for the ledger's `reason` field, present only when blocked. Kept
@@ -292,7 +305,13 @@ export function evaluateOtmSetupGate(
 ): OtmSetupGateDecision {
   const { mode } = resolveSetupTaxonomyMode(env);
   const { enabled } = resolveSetupTaxonomySetups(env, registry);
-  const verdict = evaluateSetupTaxonomy(input, enabled);
+  // ⛔ ALWAYS dense, in BOTH modes. The verdict is unchanged by this flag
+  // (see `SetupTaxonomyScoreOptions`); it only fills `perSetup`, which is what
+  // makes the per-setup counterfactual order-independent. Deliberately NOT
+  // scoped to `observe`: an instrument that goes dark exactly when the gate
+  // starts refusing would leave the enforce flip ungradeable, which is the
+  // same failure this gate's own counterfactual exists to remove.
+  const verdict = evaluateSetupTaxonomy(input, enabled, { scoreAll: true });
   const blocked = mode === 'enforce' && !verdict.confirmed;
   return {
     blocked,
@@ -305,6 +324,7 @@ export function evaluateOtmSetupGate(
       ? (verdict.reasonCode ?? SETUP_TAXONOMY_DEFAULT_REFUSAL_CODE)
       : undefined,
     verdict,
+    nomineeSide: input.nomineeSide,
     mode,
     reason: blocked
       ? `setup taxonomy refused ${input.symbol} ${input.nomineeSide}: ${verdict.reasonCode}`
@@ -381,10 +401,43 @@ export interface OtmSetupGateCounterfactual {
    * quiet code from a code this build does not know).
    */
   readonly wouldBlockByReasonCode: Readonly<Record<SetupTaxonomyReasonCode, number>>;
-  /** Confirms attributed to the setup that fired. Dense over the registry. */
+  /**
+   * Confirms ATTRIBUTED to the setup that won. Dense over the registry.
+   *
+   * ⚠️ ATTRIBUTION, NOT FIRE RATE. The verdict is first-match-wins in registry
+   * order, so this credits only the FIRST setup to match; a setup late in the
+   * list scores here only when every earlier one declined. To ask "how often
+   * does setup E actually fire" read {@link matchedSameSideBySetup} against
+   * {@link reachedBySetup}.
+   */
   readonly confirmedBySetup: Readonly<Record<string, number>>;
-  /** Side conflicts attributed to the setup that fired on the wrong wing. */
+  /**
+   * Side conflicts attributed to the setup that fired on the wrong wing.
+   * ⚠️ Same first-match-wins censoring as {@link confirmedBySetup}.
+   */
   readonly conflictBySetup: Readonly<Record<string, number>>;
+  /**
+   * ORDER-INDEPENDENT (TRA-4423). Rows on which this setup's `evaluate` was
+   * actually CALLED. Dense over the registry.
+   *
+   * ⛔ THIS IS THE DENOMINATOR FOR EVERY PER-SETUP RATE. `matched* / reached`
+   * is a fire rate; `matched* / evaluated` is not, because a setup is not
+   * reached on rows an earlier setup settled. A setup whose `reached` is 0 is
+   * UNMEASURED, never "never fires".
+   */
+  readonly reachedBySetup: Readonly<Record<string, number>>;
+  /** Rows where this setup matched the nominee's OWN side, whoever won. */
+  readonly matchedSameSideBySetup: Readonly<Record<string, number>>;
+  /** Rows where this setup matched the OTHER side, whoever won. */
+  readonly matchedOppositeSideBySetup: Readonly<Record<string, number>>;
+  /**
+   * Rows folded that carried dense `perSetup` detail. ⛔ Compare against
+   * {@link evaluated}: if this is SHORT, the three order-independent maps above
+   * cover only part of the fold and their rates are understated. A build that
+   * scores first-match-wins reads `denseRows: 0` — which is UNMEASURED, and is
+   * exactly why this counter ships beside them instead of being inferred.
+   */
+  readonly denseRows: number;
   /** Epoch ms this fold started counting: module load, or the last test reset. */
   readonly since: number;
 }
@@ -401,7 +454,15 @@ let cfWouldBlock = 0;
 let cfByReasonCode = zeroByReasonCode();
 let cfConfirmedBySetup = new Map<string, number>();
 let cfConflictBySetup = new Map<string, number>();
+let cfReachedBySetup = new Map<string, number>();
+let cfMatchedSameBySetup = new Map<string, number>();
+let cfMatchedOppBySetup = new Map<string, number>();
+let cfDenseRows = 0;
 let cfSince = Date.now();
+
+function bump(m: Map<string, number>, id: string): void {
+  m.set(id, (m.get(id) ?? 0) + 1);
+}
 
 /**
  * Fold one live-book decision.
@@ -414,6 +475,20 @@ let cfSince = Date.now();
 export function noteOtmSetupGateCounterfactual(decision: OtmSetupGateDecision): void {
   cfEvaluated += 1;
   const v = decision.verdict;
+  // ORDER-INDEPENDENT half (TRA-4423). Folded FIRST and on every branch,
+  // including the confirmed early-return below. ⛔ An absent `perSetup` leaves
+  // all four of these untouched — the row is simply not dense, and `denseRows`
+  // is what tells the reader so. Never synthesise per-setup rows from the
+  // verdict's single `setupId`; that is the censoring this half removes.
+  if (v.perSetup) {
+    cfDenseRows += 1;
+    for (const s of v.perSetup) {
+      if (!s.reached) continue;
+      bump(cfReachedBySetup, s.setupId);
+      if (!s.matched || s.side === null) continue;
+      bump(s.side === decision.nomineeSide ? cfMatchedSameBySetup : cfMatchedOppBySetup, s.setupId);
+    }
+  }
   if (v.confirmed) {
     cfConfirmed += 1;
     if (v.setupId) cfConfirmedBySetup.set(v.setupId, (cfConfirmedBySetup.get(v.setupId) ?? 0) + 1);
@@ -434,23 +509,25 @@ export function noteOtmSetupGateCounterfactual(decision: OtmSetupGateDecision): 
 export function readOtmSetupGateCounterfactual(
   registry: readonly SetupTaxonomyDefinition[] = SETUP_DEFINITIONS,
 ): OtmSetupGateCounterfactual {
-  const confirmedBySetup: Record<string, number> = {};
-  const conflictBySetup: Record<string, number> = {};
-  for (const d of registry) {
-    confirmedBySetup[d.setupId] = cfConfirmedBySetup.get(d.setupId) ?? 0;
-    conflictBySetup[d.setupId] = cfConflictBySetup.get(d.setupId) ?? 0;
-  }
-  // A setup removed from the registry mid-process keeps its counts visible
-  // rather than silently vanishing from a fold that claims to be cumulative.
-  for (const [id, n] of cfConfirmedBySetup) if (!(id in confirmedBySetup)) confirmedBySetup[id] = n;
-  for (const [id, n] of cfConflictBySetup) if (!(id in conflictBySetup)) conflictBySetup[id] = n;
+  const dense = (src: Map<string, number>): Record<string, number> => {
+    const out: Record<string, number> = {};
+    for (const d of registry) out[d.setupId] = src.get(d.setupId) ?? 0;
+    // A setup removed from the registry mid-process keeps its counts visible
+    // rather than silently vanishing from a fold that claims to be cumulative.
+    for (const [id, n] of src) if (!(id in out)) out[id] = n;
+    return out;
+  };
   return {
     evaluated: cfEvaluated,
     confirmed: cfConfirmed,
     wouldBlock: cfWouldBlock,
     wouldBlockByReasonCode: { ...cfByReasonCode },
-    confirmedBySetup,
-    conflictBySetup,
+    confirmedBySetup: dense(cfConfirmedBySetup),
+    conflictBySetup: dense(cfConflictBySetup),
+    reachedBySetup: dense(cfReachedBySetup),
+    matchedSameSideBySetup: dense(cfMatchedSameBySetup),
+    matchedOppositeSideBySetup: dense(cfMatchedOppBySetup),
+    denseRows: cfDenseRows,
     since: cfSince,
   };
 }
@@ -462,5 +539,9 @@ export function resetOtmSetupGateCounterfactualForTest(): void {
   cfByReasonCode = zeroByReasonCode();
   cfConfirmedBySetup = new Map();
   cfConflictBySetup = new Map();
+  cfReachedBySetup = new Map();
+  cfMatchedSameBySetup = new Map();
+  cfMatchedOppBySetup = new Map();
+  cfDenseRows = 0;
   cfSince = Date.now();
 }

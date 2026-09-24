@@ -181,3 +181,96 @@ describe('setup taxonomy — reason-code roster', () => {
     expect(SETUP_TAXONOMY_REASON_CODES).toHaveLength(5);
   });
 });
+
+describe('TRA-4423 — scoreAll: per-setup truth WITHOUT changing the verdict', () => {
+  const input = { symbol: 'AAPL', series: series(120), nomineeSide: 'call' as const };
+
+  it('⛔ the verdict is IDENTICAL with and without scoreAll, on all three outcomes', () => {
+    const cases: Array<[string, SetupTaxonomyDefinition[]]> = [
+      ['confirm', [neverSetup('A'), alwaysSetup('B', 'call'), alwaysSetup('C', 'call')]],
+      ['conflict', [neverSetup('A'), alwaysSetup('B', 'put'), alwaysSetup('C', 'put')]],
+      ['no match', [neverSetup('A'), neverSetup('B')]],
+      ['conflict THEN confirm — first-match-wins must still pick the confirm', [
+        alwaysSetup('A', 'put'), alwaysSetup('B', 'call'),
+      ]],
+    ];
+    for (const [label, setups] of cases) {
+      const plain = evaluateSetupTaxonomy(input, setups);
+      const dense = evaluateSetupTaxonomy(input, setups, { scoreAll: true });
+      expect(
+        { c: dense.confirmed, r: dense.reasonCode, s: dense.setupId, side: dense.confirmedSide },
+        label,
+      ).toEqual({ c: plain.confirmed, r: plain.reasonCode, s: plain.setupId, side: plain.confirmedSide });
+    }
+  });
+
+  it('⛔ THE DISCRIMINATOR: a setup masked by an earlier confirm is reached+matched, not silent', () => {
+    // B confirms first, so the verdict credits B and C is never called by the
+    // default walk. C matching is invisible to any counter folded off setupId.
+    const setups = [alwaysSetup('B', 'call'), alwaysSetup('C', 'call')];
+    const plain = evaluateSetupTaxonomy(input, setups);
+    expect(plain.setupId).toBe('B');
+    expect(plain.perSetup).toBeUndefined();
+    expect(plain.setupsScored).toBe(1); // stopped at B
+
+    const dense = evaluateSetupTaxonomy(input, setups, { scoreAll: true });
+    expect(dense.setupId).toBe('B'); // verdict unmoved
+    expect(dense.setupsScored).toBe(2); // truthful call count
+    const c = dense.perSetup?.find((p) => p.setupId === 'C');
+    expect(c).toEqual({ setupId: 'C', reached: true, matched: true, side: 'call', threw: false });
+  });
+
+  it('separates NEVER FIRES from NEVER REACHED — the two that used to read alike', () => {
+    const neverFires = evaluateSetupTaxonomy(
+      input, [alwaysSetup('B', 'call'), neverSetup('C')], { scoreAll: true },
+    ).perSetup?.find((p) => p.setupId === 'C');
+    expect(neverFires).toMatchObject({ reached: true, matched: false });
+
+    // Same C, same zero matches — but never given the chance, under the
+    // default walk. `perSetup` is ABSENT, which a fold must skip, not zero.
+    const neverReached = evaluateSetupTaxonomy(input, [alwaysSetup('B', 'call'), neverSetup('C')]);
+    expect(neverReached.perSetup).toBeUndefined();
+  });
+
+  it('is dense over the ENABLED list and keeps registry order', () => {
+    const v = evaluateSetupTaxonomy(
+      input, [alwaysSetup('A', 'call'), neverSetup('B'), alwaysSetup('C', 'put')], { scoreAll: true },
+    );
+    expect(v.perSetup?.map((p) => p.setupId)).toEqual(['A', 'B', 'C']);
+    expect(v.perSetup?.every((p) => p.reached)).toBe(true);
+  });
+
+  it('a THROWING setup is a decline with threw:true, never a series fault', () => {
+    const boom: SetupTaxonomyDefinition = {
+      setupId: 'X', label: 'X', minBars: 10,
+      evaluate: () => { throw new Error('boom'); },
+    };
+    const v = evaluateSetupTaxonomy(input, [boom, neverSetup('B')], { scoreAll: true });
+    expect(v.reasonCode).toBe('no_setup_matched');
+    expect(v.perSetup?.find((p) => p.setupId === 'X'))
+      .toEqual({ setupId: 'X', reached: true, matched: false, side: null, threw: true });
+  });
+
+  it('an unreadable series short-circuits BEFORE scoring, so perSetup stays absent', () => {
+    const v = evaluateSetupTaxonomy(
+      { symbol: 'AAPL', series: [], nomineeSide: 'call' }, [alwaysSetup('A', 'call')], { scoreAll: true },
+    );
+    expect(v.reasonCode).toBe('series_unreadable');
+    expect(v.setupsScored).toBe(0);
+    expect(v.perSetup).toBeUndefined();
+  });
+
+  it('⛔ a later setup can NEVER overwrite a settled confirm, even while still being scored', () => {
+    // A confirms; C matches the opposite side afterwards. Under scoreAll the
+    // walk continues — if `conflict` were still assignable the verdict would
+    // flip to setup_side_conflict, which is the mutation this guards.
+    const v = evaluateSetupTaxonomy(
+      input, [alwaysSetup('A', 'call'), alwaysSetup('C', 'put')], { scoreAll: true },
+    );
+    expect(v.confirmed).toBe(true);
+    expect(v.reasonCode).toBeNull();
+    expect(v.setupId).toBe('A');
+    expect(v.perSetup?.find((p) => p.setupId === 'C'))
+      .toMatchObject({ reached: true, matched: true, side: 'put' });
+  });
+});

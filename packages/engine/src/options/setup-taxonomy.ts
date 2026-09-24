@@ -116,6 +116,31 @@ export interface SetupTaxonomyInput {
   readonly nomineeSide: SetupTaxonomySide;
 }
 
+/**
+ * What ONE setup did on ONE row, independent of who won.
+ *
+ * ⛔ THIS EXISTS BECAUSE THE VERDICT IS FIRST-MATCH-WINS AND THE REGISTRY IS
+ * ORDERED. {@link SetupTaxonomyVerdict.setupId} names whichever setup matched
+ * FIRST in registry order, so a setup late in the list is invisible on every row
+ * an earlier one already claimed — and a per-setup counter folded off `setupId`
+ * alone reads IDENTICALLY whether that setup never fires or is never reached.
+ * Measured live on 2026-09-24 (TRA-4423): setup `E`, last of five, scored 0
+ * confirms and 0 conflicts, but had genuinely been CALLED on only 2,197 of 2,876
+ * rows — the other 679 returned at A-D before E ran. `reached` is the
+ * discriminator that makes those two states distinguishable.
+ */
+export interface SetupTaxonomyScore {
+  readonly setupId: string;
+  /** TRUE ⇒ `evaluate` was actually CALLED on this row. */
+  readonly reached: boolean;
+  /** TRUE ⇒ it returned a match. ⛔ Meaningless unless `reached`. */
+  readonly matched: boolean;
+  /** The side it matched, when it did. Null otherwise. */
+  readonly side: SetupTaxonomySide | null;
+  /** TRUE ⇒ `evaluate` threw and was folded as a decline (never a series fault). */
+  readonly threw: boolean;
+}
+
 export interface SetupTaxonomyVerdict {
   /** TRUE ⇒ a setup confirmed on the nominee's own side. */
   readonly confirmed: boolean;
@@ -129,8 +154,22 @@ export interface SetupTaxonomyVerdict {
    * How many setups were actually scored. ⛔ ZERO IS NOT A PASS — with an empty
    * registry every verdict is `no_setup_matched` at `setupsScored: 0`, which a
    * grader must read as UNMEASURED, never as "the taxonomy found nothing".
+   *
+   * ⚠️ This is the TRUE call count, so it depends on `scoreAll`: under the
+   * default first-match-wins walk it stops at the confirming setup, and under
+   * `scoreAll` it is the full enabled count. Compare it against
+   * {@link perSetup} rather than across modes.
    */
   readonly setupsScored: number;
+  /**
+   * Per-setup detail, dense over the ENABLED list, in registry order. Present
+   * only when scored with `{ scoreAll: true }`.
+   *
+   * ⛔ ABSENT IS NOT EMPTY. An absent `perSetup` means this row was walked
+   * first-match-wins and carries NO per-setup truth — a fold must skip the row
+   * and say so, never treat it as "no setup matched".
+   */
+  readonly perSetup?: readonly SetupTaxonomyScore[];
   /** Bars seen. 0 ⇒ absent series. */
   readonly bars: number;
   /**
@@ -176,18 +215,40 @@ function spanOf(series: readonly Candle[]): number | null {
  *  1. READABILITY FIRST. An unreadable series short-circuits to
  *     `series_unreadable` before any setup runs, so a cold cache can never be
  *     laundered into `no_setup_matched`.
- *  2. Then every enabled setup is scored — ALL of them, not until-first-match —
+ *  2. Then the enabled setups are walked. A CONFLICT never stops the walk,
  *     because a match on the wrong side is a different fact from no match at
- *     all, and stopping early would report whichever one happened to be first.
+ *     all, and stopping there would report whichever one happened to be first.
+ *     ⚠️ A CONFIRMATION *does* settle the verdict, so by default the walk stops
+ *     and setups after the winner are never called. That is correct for the
+ *     decision and WRONG for measurement — pass `{ scoreAll: true }` to keep
+ *     walking and fill {@link SetupTaxonomyVerdict.perSetup}. The verdict is
+ *     identical either way. (TRA-4423: without it, a per-setup counter cannot
+ *     tell "never fires" from "never reached" for anything but setup A.)
  *  3. A same-side match confirms. Otherwise, if any setup matched on the other
  *     side, that is `setup_side_conflict` and NOT a flip: the sleeve does not go
  *     shopping for the other wing. (Flipping would make the taxonomy a
  *     nominator, a far larger change — TRA-4421 §11 default 2, still pending
  *     board ratification on card `70e36987`.)
  */
+export interface SetupTaxonomyScoreOptions {
+  /**
+   * Score EVERY enabled setup instead of returning at the first same-side
+   * match, and publish {@link SetupTaxonomyVerdict.perSetup}.
+   *
+   * ⛔ THE VERDICT IS BYTE-FOR-BYTE THE SAME EITHER WAY. This flag buys
+   * measurement, never behaviour: `confirmed`, `reasonCode`, `setupId` and
+   * `confirmedSide` are still first-match-wins in registry order, because that
+   * is what the gate consumes and what the enforce proposal (card `70e36987`)
+   * is written against. Only `setupsScored` moves, and only because it is a
+   * truthful call count.
+   */
+  readonly scoreAll?: boolean;
+}
+
 export function evaluateSetupTaxonomy(
   input: SetupTaxonomyInput,
   setups: readonly SetupTaxonomyDefinition[] = SETUP_TAXONOMY_REGISTRY,
+  opts: SetupTaxonomyScoreOptions = {},
 ): SetupTaxonomyVerdict {
   const bars = input.series.length;
   const seriesSpanMs = spanOf(input.series);
@@ -210,11 +271,25 @@ export function evaluateSetupTaxonomy(
     };
   }
 
+  const scoreAll = opts.scoreAll === true;
+  // Dense over the ENABLED list from the start, so a setup that is never
+  // reached is still present with `reached: false` rather than missing.
+  const perSetup: SetupTaxonomyScore[] | null = scoreAll
+    ? setups.map((s) => ({ setupId: s.setupId, reached: false, matched: false, side: null, threw: false }))
+    : null;
+
   let conflict: SetupTaxonomyMatch | null = null;
+  let confirm: SetupTaxonomyMatch | null = null;
   let scored = 0;
-  for (const setup of setups) {
+  for (let i = 0; i < setups.length; i += 1) {
+    const setup = setups[i]!;
+    // Once a confirmation is in hand the verdict is settled; under `scoreAll`
+    // we keep walking PURELY to fill `perSetup`, and nothing below may touch
+    // `confirm`/`conflict` again.
+    const settled = confirm !== null;
     scored += 1;
     let match: SetupTaxonomyMatch | null = null;
+    let threw = false;
     try {
       match = setup.evaluate(input);
     } catch {
@@ -222,20 +297,37 @@ export function evaluateSetupTaxonomy(
       // unreadable — the series demonstrably read fine for its siblings. It
       // folds to `no_setup_matched` rather than voiding the row's grade.
       match = null;
+      threw = true;
     }
-    if (!match) continue;
-    if (match.side === input.nomineeSide) {
-      return {
-        confirmed: true,
-        reasonCode: null,
-        setupId: match.setupId,
-        confirmedSide: match.side,
-        setupsScored: scored,
-        bars,
-        seriesSpanMs,
+    if (perSetup) {
+      perSetup[i] = {
+        setupId: setup.setupId,
+        reached: true,
+        matched: match !== null,
+        side: match?.side ?? null,
+        threw,
       };
     }
+    if (settled || !match) continue;
+    if (match.side === input.nomineeSide) {
+      confirm = match;
+      if (!scoreAll) break;
+      continue;
+    }
     if (!conflict) conflict = match;
+  }
+
+  if (confirm) {
+    return {
+      confirmed: true,
+      reasonCode: null,
+      setupId: confirm.setupId,
+      confirmedSide: confirm.side,
+      setupsScored: scored,
+      bars,
+      seriesSpanMs,
+      ...(perSetup ? { perSetup } : {}),
+    };
   }
 
   return {
@@ -246,5 +338,6 @@ export function evaluateSetupTaxonomy(
     setupsScored: scored,
     bars,
     seriesSpanMs,
+    ...(perSetup ? { perSetup } : {}),
   };
 }

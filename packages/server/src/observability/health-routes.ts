@@ -6454,9 +6454,51 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
               wouldBlockRate: cf.evaluated > 0 ? cf.wouldBlock / cf.evaluated : null,
               /** Dense over the vocabulary: a 0 is a real "never occurred since boot". */
               wouldBlockByReasonCode: cf.wouldBlockByReasonCode,
-              /** Which setup admitted / conflicted. Dense over the registry. */
+              /**
+               * ⚠️ ATTRIBUTION, NOT FIRE RATE — the verdict is first-match-wins
+               * in registry order (A→E), so these credit only the FIRST setup
+               * to match. Use `perSetup` below to ask what a given setup does.
+               */
               confirmedBySetup: cf.confirmedBySetup,
               conflictBySetup: cf.conflictBySetup,
+              /**
+               * ORDER-INDEPENDENT per-setup rates (TRA-4423). `reached` is the
+               * denominator — a setup is NOT reached on rows an earlier one
+               * already settled, so dividing by `evaluated` understates it.
+               */
+              perSetup: (() => {
+                const ids = Object.keys(cf.reachedBySetup);
+                return {
+                  denseRows: cf.denseRows,
+                  covered: cf.evaluated > 0 ? cf.denseRows / cf.evaluated : null,
+                  rows: ids.map((id) => {
+                    const reached = cf.reachedBySetup[id] ?? 0;
+                    const same = cf.matchedSameSideBySetup[id] ?? 0;
+                    const opp = cf.matchedOppositeSideBySetup[id] ?? 0;
+                    return {
+                      setupId: id,
+                      reached,
+                      matchedSameSide: same,
+                      matchedOppositeSide: opp,
+                      /** null (never 0) at reached 0 — UNMEASURED is not "never fires". */
+                      fireRate: reached > 0 ? (same + opp) / reached : null,
+                      sameSideRate: reached > 0 ? same / reached : null,
+                      confirmedAttributed: cf.confirmedBySetup[id] ?? 0,
+                      conflictAttributed: cf.conflictBySetup[id] ?? 0,
+                    };
+                  }),
+                  note: cf.denseRows === 0
+                    ? '⛔ UNMEASURED — no folded row carried per-setup detail, so every '
+                      + '`reached` here is 0 for want of an observation, NOT because a setup '
+                      + 'never ran. Either nothing has been folded since boot, or this build '
+                      + 'scores first-match-wins. Read `denseRows` before any cell.'
+                    : 'An ARRAY, read with `.find` — never indexed (TRA-4154). `reached` < '
+                      + '`evaluated` is EXPECTED and correct for later setups: the walk stops '
+                      + 'at the first same-side match, so setup A is reached on every row and '
+                      + 'E only on rows A-D all declined. ⛔ A setup at `reached: 0` is '
+                      + 'UNMEASURED; `fireRate: null` says so rather than claiming a zero.',
+                };
+              })(),
               note: cf.evaluated === 0
                 ? 'UNMEASURED — zero verdicts folded since this process booted. NOT a pass and '
                   + 'NOT a quiet market; read `crossCheck.scanWindow` above for whether the box '

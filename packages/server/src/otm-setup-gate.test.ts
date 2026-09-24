@@ -516,3 +516,98 @@ describe('setup_confirmation cross-check: in-window time, not uptime (TRA-4422 F
     expect(SETUP_CONFIRMATION_EXPECT_ROWS_AFTER_OPEN_MS).toBe(3 * cadenceMs);
   });
 });
+
+describe('TRA-4423 — the ORDER-INDEPENDENT per-setup fold', () => {
+  const env = { OTM_SETUP_TAXONOMY_SETUPS: 'B,E' };
+  const input = { symbol: 'AAPL', series: series(120), nomineeSide: 'call' as const };
+  const setupB = (side: 'call' | 'put'): SetupTaxonomyDefinition => ({
+    setupId: 'B', label: 'B', minBars: 10, evaluate: () => ({ setupId: 'B', side }),
+  });
+  const neverE: SetupTaxonomyDefinition = {
+    setupId: 'E', label: 'E', minBars: 10, evaluate: () => null,
+  };
+
+  beforeEach(() => resetOtmSetupGateCounterfactualForTest());
+
+  it('⛔ THE INCIDENT: E is masked in confirmedBySetup but VISIBLE in the reached/matched pair', () => {
+    // B confirms first on every row, so E is never credited by attribution —
+    // this is the live 2026-09-24 shape (E: 0 confirms, 0 conflicts) that could
+    // not be told apart from "E never fires".
+    const reg = [setupB('call'), setupE('call')];
+    for (let i = 0; i < 5; i += 1) {
+      noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(input, env, reg));
+    }
+    const cf = readOtmSetupGateCounterfactual(reg);
+
+    expect(cf.evaluated).toBe(5);
+    expect(cf.confirmedBySetup.E).toBe(0);   // attribution: still zero...
+    expect(cf.conflictBySetup.E).toBe(0);
+    expect(cf.reachedBySetup.E).toBe(5);     // ...but it WAS asked, all 5 times
+    expect(cf.matchedSameSideBySetup.E).toBe(5); // and it DID fire, all 5 times
+    expect(cf.denseRows).toBe(5);
+  });
+
+  it('separates "reached and declined" from "matched", which is the whole point', () => {
+    const reg = [setupB('call'), neverE];
+    noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(input, env, reg));
+    const cf = readOtmSetupGateCounterfactual(reg);
+    expect(cf.reachedBySetup.E).toBe(1);
+    expect(cf.matchedSameSideBySetup.E).toBe(0);
+    expect(cf.matchedOppositeSideBySetup.E).toBe(0);
+  });
+
+  it('classifies same-side vs opposite-side against the NOMINEE, not against the winner', () => {
+    // B confirms 'call'; E fires 'put'. E's match is opposite the nominee.
+    const reg = [setupB('call'), setupE('put')];
+    noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(input, env, reg));
+    const cf = readOtmSetupGateCounterfactual(reg);
+    expect(cf.matchedOppositeSideBySetup.E).toBe(1);
+    expect(cf.matchedSameSideBySetup.E).toBe(0);
+    // And the same setup on a PUT nominee flips the classification.
+    resetOtmSetupGateCounterfactualForTest();
+    noteOtmSetupGateCounterfactual(
+      evaluateOtmSetupGate({ ...input, nomineeSide: 'put' }, env, reg),
+    );
+    const cf2 = readOtmSetupGateCounterfactual(reg);
+    expect(cf2.matchedSameSideBySetup.E).toBe(1);
+    expect(cf2.matchedOppositeSideBySetup.E).toBe(0);
+  });
+
+  it('the gate passes nomineeSide through, so the classifier cannot be derived wrong', () => {
+    const d = evaluateOtmSetupGate({ ...input, nomineeSide: 'put' }, env, [neverE]);
+    expect(d.nomineeSide).toBe('put');
+  });
+
+  it('⛔ denseRows is UNMEASURED-safe: a row with no perSetup leaves the maps untouched', () => {
+    const reg = [setupB('call'), setupE('call')];
+    const d = evaluateOtmSetupGate(input, env, reg);
+    // Simulate a first-match-wins build: strip the dense detail off the verdict.
+    const { perSetup: _drop, ...bare } = d.verdict;
+    noteOtmSetupGateCounterfactual({ ...d, verdict: bare });
+    const cf = readOtmSetupGateCounterfactual(reg);
+    expect(cf.evaluated).toBe(1);
+    expect(cf.denseRows).toBe(0);          // the tell
+    expect(cf.reachedBySetup.E).toBe(0);   // 0 for want of an observation
+    expect(cf.confirmedBySetup.B).toBe(1); // attribution half still folds
+  });
+
+  it('reached/matched are dense over the registry, so an idle setup is 0 and not absent', () => {
+    const reg = [setupB('call'), setupE('call')];
+    noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(input, { OTM_SETUP_TAXONOMY_SETUPS: 'B' }, reg));
+    const cf = readOtmSetupGateCounterfactual(reg);
+    expect(cf.reachedBySetup).toHaveProperty('E', 0);
+    expect(cf.matchedSameSideBySetup).toHaveProperty('E', 0);
+    expect(cf.matchedOppositeSideBySetup).toHaveProperty('E', 0);
+  });
+
+  it('the attribution totals still reconcile to the reason-code fold', () => {
+    const reg = [setupB('put'), setupE('put')];
+    for (let i = 0; i < 3; i += 1) {
+      noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(input, env, reg));
+    }
+    const cf = readOtmSetupGateCounterfactual(reg);
+    const sumConflict = Object.values(cf.conflictBySetup).reduce((a, b) => a + b, 0);
+    expect(sumConflict).toBe(cf.wouldBlockByReasonCode.setup_side_conflict);
+    expect(cf.confirmed + cf.wouldBlock).toBe(cf.evaluated);
+  });
+});

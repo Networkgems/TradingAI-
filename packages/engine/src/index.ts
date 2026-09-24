@@ -638,6 +638,8 @@ export type {
   SetupTaxonomyDefinition,
   SetupTaxonomyInput,
   SetupTaxonomyVerdict,
+  SetupTaxonomyScore,
+  SetupTaxonomyScoreOptions,
 } from './options/setup-taxonomy.js';
 export {
   EarningsCalendarClient,
