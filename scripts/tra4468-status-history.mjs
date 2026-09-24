@@ -12,6 +12,9 @@
 //
 // Method and the measurements behind it: docs/issue-status-history-TRA-4468.md
 
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
 const RAW = (process.env.PAPERCLIP_API_URL || '').replace(/\/$/, '');
 const BASE = RAW.endsWith('/api') ? RAW.slice(0, -4) : RAW;
 const KEY = process.env.PAPERCLIP_API_KEY;
@@ -170,7 +173,22 @@ async function main() {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`.replace(/\\/g, '/') || process.argv[1]?.endsWith('tra4468-status-history.mjs')) {
+// Identity-first entry test (TRA-4867). The URL-comparison arm this used to lead with never
+// bound on Windows — `file://C:/…` is two slashes, `import.meta.url` is three — so the guard
+// was carried entirely by the NAME, and a copy graded under any other name evaluated the
+// module, called nothing, printed nothing and exited 0. The `endsWith` arm stays OR'd in so
+// this is never LESS permissive than what shipped. Same shape as
+// `scripts/check-journal-stale-opens.mjs` and `scripts/check-deploy-origin.mjs`.
+const isEntrypoint = (() => {
+  const argv1 = process.argv[1];
+  if (!argv1) return false;
+  try {
+    if (fs.realpathSync(argv1) === fs.realpathSync(fileURLToPath(import.meta.url))) return true;
+  } catch { /* unreadable argv[1] — fall through to the name test */ }
+  return argv1.endsWith('tra4468-status-history.mjs');
+})();
+
+if (isEntrypoint) {
   main().catch((e) => {
     console.error(e.message);
     process.exit(1);

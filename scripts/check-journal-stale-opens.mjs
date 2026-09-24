@@ -72,6 +72,12 @@
 //   node scripts/check-journal-stale-opens.mjs --fixture=path/to/payload.json
 //   node scripts/check-journal-stale-opens.mjs --selftest    # paired arms + controls
 
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
+
 const DEFAULT_HOST = 'https://tradingai-bqb1.onrender.com';
 const ROUTE = '/api/health/option-journal?rows=all';
 const DEFAULT_GRACE_DAYS = 3;
@@ -208,6 +214,73 @@ function selftest() {
   if (!covOk) failed++;
   console.log(`  ${covOk ? 'ok  ' : 'FAIL'}  coverage gap arithmetic                      want=1 outside  got=${cov.outsideZombieSweep}`);
 
+  // ── THE ENTRY GUARD — a ONE-VARIABLE PAIR (TRA-4867) ───────────────────────
+  //
+  // Grading a shipped blob means writing it somewhere else under some other
+  // name. If the entry test keys on the NAME, that copy calls main() zero times
+  // and exits 0 having printed nothing — which reads exactly like CLEAN. These
+  // two arms differ in ONE variable, the entry predicate: the RENAMED-COPY arm
+  // must reach the same STALE verdict the canonical call does, and its partner
+  // replays the OLD name-keyed predicate over the SAME bytes and asserts it is
+  // silent+0. The partner is what stops this pair from going green because the
+  // hazard quietly stopped being real — an arm that can only pass is not a
+  // control.
+  //
+  // The fixture's row expired 2026-07-31 and is still OPEN, so it is stale
+  // against any clock from here on; the child needs no network and no pinned
+  // time.
+  const SELF = fileURLToPath(import.meta.url);
+  const entryFixture = base([row({})]);
+  const spawnRenamed = (transform) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stale-opens-entry-'));
+    try {
+      const dst = path.join(dir, 'graded-blob.mjs');
+      const src = fs.readFileSync(SELF, 'utf8');
+      fs.writeFileSync(dst, transform ? transform(src) : src, 'utf8');
+      const fix = path.join(dir, 'payload.json');
+      fs.writeFileSync(fix, JSON.stringify(entryFixture), 'utf8');
+      const r = spawnSync(process.execPath, [dst, `--fixture=${fix}`], { encoding: 'utf8' });
+      return { code: r.status, out: `${r.stdout ?? ''}${r.stderr ?? ''}` };
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  let entryOk = true;
+  let entryNote = '';
+  try {
+    const live = spawnRenamed();
+    if (live.out.trim() === '') throw new Error('the renamed copy printed NOTHING — that is the failure this arm exists for');
+    if (live.code !== EXIT_STALE) throw new Error(`renamed copy exited ${live.code}, want ${EXIT_STALE} (STALE); out=${live.out.slice(-400)}`);
+    if (!live.out.includes('PYPL')) throw new Error('the renamed copy did not name the stale row');
+  } catch (err) {
+    entryOk = false;
+    entryNote = err?.message ?? String(err);
+  }
+  if (!entryOk) failed++;
+  console.log(`  ${entryOk ? 'ok  ' : 'FAIL'}  entry guard: RENAMED copy still runs        want=STALE+output  ${entryOk ? 'got=STALE+output' : `got=${entryNote}`}`);
+
+  let oldOk = true;
+  let oldNote = '';
+  try {
+    // Anchored on the NEWLINE so this arm cannot accidentally rewrite its own
+    // literal a few lines up and then report the wrong reason for failing.
+    const ANCHOR = '\nif (isEntrypoint) {';
+    const OLD = "\nif (process.argv[1]?.endsWith('check-journal-stale-opens.mjs')) {";
+    const dead = spawnRenamed((src) => {
+      const i = src.lastIndexOf(ANCHOR);
+      if (i === -1) throw new Error('the shipped entry guard is no longer `if (isEntrypoint) {` — this arm rewrites it by hand');
+      return `${src.slice(0, i)}${OLD}${src.slice(i + ANCHOR.length)}`;
+    });
+    if (dead.code !== EXIT_CLEAN) throw new Error(`the old predicate exited ${dead.code}, not 0 — then it was not the silent-pass defect this fix names`);
+    if (dead.out.trim() !== '') throw new Error('the old predicate printed something — then it was not silent and this pair proves nothing');
+  } catch (err) {
+    oldOk = false;
+    oldNote = err?.message ?? String(err);
+  }
+  if (!oldOk) failed++;
+  console.log(`  ${oldOk ? 'ok  ' : 'FAIL'}  entry guard: OLD predicate is silent+0      want=silent+0    ${oldOk ? 'got=silent+0' : `got=${oldNote}`}`);
+
   console.log('');
   if (failed > 0) {
     console.error(`[stale-opens] SELFTEST FAILED — ${failed} arm(s). The check does not grade what it claims to.`);
@@ -301,6 +374,32 @@ async function main() {
 }
 
 // Importable for tests; only runs the CLI when invoked directly.
-if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith('check-journal-stale-opens.mjs')) {
+//
+// ⛔ THE ENTRY TEST IS IDENTITY-FIRST, NOT NAME-FIRST (TRA-4867, the TRA-4821 class).
+// What shipped here read
+//     if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith('…mjs'))
+// and the first arm NEVER BOUND on Windows: `import.meta.url` is `file:///C:/…` while
+// `file://${argv[1]}` is `file://C:\…`. So the canonical `pnpm check:journal-stale-opens`
+// call was carried entirely by the NAME test — and this repo's grading discipline renames
+// the file:
+//     git show origin/main:scripts/check-journal-stale-opens.mjs > <scratch>/graded.mjs && node <scratch>/graded.mjs
+// Under a name-keyed guard that run evaluates the module, calls NOTHING, prints NOT ONE
+// LINE and exits 0 — at the call site indistinguishable from CLEAN, on a detector whose
+// whole job is to be loud. The realpath arm makes a renamed copy run; the `endsWith` arm
+// stays OR'd in so this can never be strictly LESS permissive than what shipped (a realpath
+// that fails to compare — case-folding, a junction, an odd argv[1] — must not silence the
+// canonical call). Do not collapse it to one arm, and do not delete the guard: the module
+// is imported for its pure `gradeJournalStaleOpens`, and a bare top-level `main()` would
+// run the CLI on every import.
+const isEntrypoint = (() => {
+  const argv1 = process.argv[1];
+  if (!argv1) return false;
+  try {
+    if (fs.realpathSync(argv1) === fs.realpathSync(fileURLToPath(import.meta.url))) return true;
+  } catch { /* unreadable argv[1] — fall through to the name test */ }
+  return argv1.endsWith('check-journal-stale-opens.mjs');
+})();
+
+if (isEntrypoint) {
   main();
 }
