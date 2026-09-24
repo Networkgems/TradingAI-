@@ -578,6 +578,17 @@ import {
   type ShadowChaseState,
 } from './option-maker-shadow.js';
 import { resolveMakerWalkConfig, type MakerWalkConfig } from './option-maker-config.js';
+import {
+  beginRestingOrder,
+  advanceRestingOrder,
+  finalizeRestingOrder,
+  recordRealFillShadowRow,
+  buildTaxonomy,
+  isOptionRealFillShadowEnabled,
+  DEFAULT_REAL_FILL_CONFIG,
+  type RestingOrderState,
+  type EntryType as RealFillEntryType,
+} from './option-real-fill-shadow.js';
 
 /**
  * TRA-1662 — cap on concurrent in-flight shadow chases. A chase lives at most
@@ -585,6 +596,23 @@ import { resolveMakerWalkConfig, type MakerWalkConfig } from './option-maker-con
  * this only bounds the pathological case where the tick stops draining them.
  */
 const SHADOW_CHASE_MAX_IN_FLIGHT = 200;
+
+/**
+ * TRA-4888 — a resting real-fill shadow order plus the context needed to
+ * re-poll its contract and stamp its taxonomy at finalize time.
+ *
+ * The taxonomy is captured at DECISION time and carried, not re-derived at
+ * finalize: delta, DTE and spread all move while the order rests, and a row
+ * bucketed on the spread it ended in would answer a different question from
+ * the one the promotion gate asks ("what did we enter into").
+ */
+interface RealFillShadowInFlight {
+  state: RestingOrderState;
+  symbol: string;
+  expiration: string;
+  structure: string;
+  taxonomy: ReturnType<typeof buildTaxonomy>;
+}
 import { recordOptionTradeEntrySlippage, recordOptionTradeEntryQuote, recordOptionTradeVoid } from './option-trade-journal.js';
 import { recordEntryQuoteStampOutcome } from './entry-quote-stamp.js';
 // TRA-3905 — the per-book submitted/filled/reject fold and the permission
@@ -3326,6 +3354,15 @@ export class SignalEngine {
    * (they simply never record) rather than booking them at a flattering price.
    */
   private shadowChases: ShadowChaseState[] = [];
+  /**
+   * TRA-4888 — in-flight REAL-FILL shadow orders (observe-only). Distinct from
+   * {@link shadowChases}: that one measures how much of the cross a maker
+   * LADDER recovers; this one books a per-row entry BASIS under a trade-through
+   * fill rule, which is what the mid-booking defect is actually about. Same
+   * memory-only, drop-on-restart discipline — an order whose rest we did not
+   * observe to the end must not be booked at all.
+   */
+  private realFillShadows: RealFillShadowInFlight[] = [];
   /** Last successful RV scan timestamp — gates the 5-minute cadence. */
   private lastRvScanAt = 0;
   /** TRA-1207 — last OTM-mispricing scan timestamp; gates the 5-minute cadence. */
@@ -6777,6 +6814,9 @@ export class SignalEngine {
     // TRA-1662 — walk the observe-only shadow maker chases before the mark
     // refresh, so a chase reads the same-age chain snapshot the marks do.
     await withPhase('signal.doTick.shadow-chases', () => this.advanceShadowChases());
+    // TRA-4888 — separate phase, so a stall in one shadow measurement is
+    // attributable and cannot be mistaken for the other's.
+    await withPhase('signal.doTick.real-fill-shadows', () => this.advanceRealFillShadows());
 
     // TRA-3444 — EXIT-CRITICAL BRACKET 2 of 2. Same rule as bracket 1: these two
     // containers are exactly what `refreshExitsOnly` re-runs, and therefore
@@ -9692,6 +9732,150 @@ export class SignalEngine {
    * already pulls each tick for these very contracts — so it adds ZERO Tradier
    * calls in steady state. Never throws into the tick.
    */
+  /**
+   * TRA-4888 — start a REAL-FILL shadow order for an option open. Observe-only:
+   * routes nothing, prices no live fill, and cannot affect the position that was
+   * just booked.
+   *
+   * What it adds over {@link beginShadowMakerChase}, which runs beside it on the
+   * same opens: that measures the maker LADDER's cross recovery; this books a
+   * per-row entry BASIS under a trade-through rule and stamps the delta / DTE /
+   * spread / liquidity / entry-type taxonomy TRA-4885 child A counts on.
+   *
+   * The resting limit is the MID — the exact price `premiumPaid` books today.
+   * That is the point: the row then reads "here is what booking at mid assumed,
+   * and here is whether a real resting order at that price would have filled at
+   * all". A limit placed anywhere else would answer a different question.
+   *
+   * Fire-and-forget and totally defensive. Never throws into the open path.
+   */
+  private beginRealFillShadow(
+    structure: string,
+    quote: { symbol?: string; expiration?: string; bid?: number; ask?: number },
+    opened: {
+      optionSymbol?: string;
+      contracts?: number;
+      delta?: number | null;
+      dte?: number | null;
+      openInterest?: number | null;
+    },
+    entryType: RealFillEntryType = 'maker_mid',
+  ): void {
+    try {
+      if (!isOptionRealFillShadowEnabled(this.resolveDemoFlagEnv())) return;
+      if (typeof this.rvScanner?.getOptionTapeSample !== 'function') return;
+
+      const { symbol, expiration, bid, ask } = quote;
+      const { optionSymbol, contracts } = opened;
+      if (!symbol || !expiration || !optionSymbol) return;
+      if (typeof bid !== 'number' || typeof ask !== 'number') return;
+      if (typeof contracts !== 'number' || !(contracts > 0)) return;
+
+      const state = beginRestingOrder(
+        { side: 'buy', optionSymbol, limitUsd: (bid + ask) / 2, contracts, bid, ask },
+        Date.now(),
+        DEFAULT_REAL_FILL_CONFIG,
+      );
+      // `null` = one-sided / crossed book. Such opens DROP OUT of the
+      // denominator rather than being booked at a flattering zero cost.
+      if (!state) return;
+      if (this.realFillShadows.length >= SHADOW_CHASE_MAX_IN_FLIGHT) return;
+
+      this.realFillShadows.push({
+        state,
+        symbol,
+        expiration,
+        structure,
+        taxonomy: buildTaxonomy({
+          structure,
+          delta: opened.delta ?? null,
+          dte: opened.dte ?? null,
+          bid,
+          ask,
+          openInterest: opened.openInterest ?? null,
+          entryType,
+          hasExit: false,
+        }),
+      });
+    } catch {
+      // Telemetry must never break a trade pass.
+    }
+  }
+
+  /**
+   * TRA-4888 — advance every in-flight real-fill shadow order against a fresh
+   * tape sample, and durably record the ones that reach a terminal outcome.
+   *
+   * Rides the scanner's warm chain cache (the same snapshot `refreshOptionMarks`
+   * already pulls each tick), so it adds ZERO Tradier calls in steady state.
+   *
+   * ⚠️ A dark tape does NOT drop the order the way `advanceShadowChases` drops a
+   * chase. The order keeps resting until `maxRestMs` and then finalises with
+   * whatever it managed to grade — quite possibly `ungraded`. Dropping it would
+   * silently remove the illiquid contracts from the population, which is exactly
+   * the survivorship hole this ticket exists to close: the rows a trade-through
+   * rule cannot grade are the rows the cost bar most needs to see counted.
+   */
+  private async advanceRealFillShadows(): Promise<void> {
+    if (this.realFillShadows.length === 0) return;
+    const getTape = this.rvScanner?.getOptionTapeSample;
+    if (typeof getTape !== 'function') {
+      this.realFillShadows = [];
+      return;
+    }
+
+    const now = Date.now();
+    const armed = isOptionRealFillShadowEnabled(this.resolveDemoFlagEnv());
+    const stillResting: RealFillShadowInFlight[] = [];
+    for (const order of this.realFillShadows) {
+      try {
+        const tape = await getTape.call(
+          this.rvScanner,
+          order.symbol,
+          order.expiration,
+          order.state.optionSymbol,
+        );
+        // A null tape is a poll that saw nothing — advance with an all-null
+        // sample so the order still AGES toward `maxRestMs` and the poll is
+        // counted. Skipping it would let an order rest forever on a dark feed.
+        const terminal = advanceRestingOrder(
+          order.state,
+          {
+            ts: now,
+            bid: tape?.bid ?? null,
+            ask: tape?.ask ?? null,
+            last: tape?.last ?? null,
+            // Tradier's last-trade clock is not projected into the chain row
+            // (TRA-4870); the volume tell carries the print detector alone.
+            lastTradeMs: null,
+            volume: tape?.volume ?? null,
+          },
+          now,
+        );
+        if (!terminal) {
+          stillResting.push(order);
+          continue;
+        }
+        const row = finalizeRestingOrder(
+          order.state,
+          {
+            mode: this.mode === 'live' ? 'live' : 'demo',
+            structure: order.structure,
+            underlying: order.symbol,
+            taxonomy: order.taxonomy,
+          },
+          now,
+        );
+        // Pass the DEMO-FLAG-resolved arm state — the ledger must not re-read
+        // process.env, which never sees a demo-flags.json-only arm.
+        await recordRealFillShadowRow(row, armed);
+      } catch {
+        // Drop this order; a measurement failure is never a trade failure.
+      }
+    }
+    this.realFillShadows = stillResting;
+  }
+
   private async advanceShadowChases(): Promise<void> {
     if (this.shadowChases.length === 0) return;
     const getQuote = this.rvScanner?.getOptionQuote;
@@ -15160,6 +15344,16 @@ export class SignalEngine {
           await this.stampOtmAtrInvalidation(openedLive);
           this.recordChurnOpen(signal.symbol, 'option');
           this.beginShadowMakerChase('single_leg_otm', signal, openedLive);
+          // TRA-4888 — observe-only basis shadow on the live-bounded path too.
+          // It reads a cached chain row and writes a ledger; it routes nothing
+          // and cannot touch the real order below.
+          this.beginRealFillShadow('single_leg_otm', signal, {
+            optionSymbol: openedLive.optionSymbol,
+            contracts: openedLive.contracts,
+            delta: cheap.delta,
+            dte: cheap.daysToExpiration,
+            openInterest: cheap.openInterest,
+          });
 
           // ASK-ONLY smart-open ladder: the single limit is the ask (fraction 1, no
           // cross-ticks past it) — matches the board's "the ask price is the one that
@@ -15290,6 +15484,15 @@ export class SignalEngine {
         this.recordChurnOpen(signal.symbol, 'option'); // TRA-1408 per-name same-session churn counter
         // TRA-1662 — shadow the maker chase this demo open did NOT route.
         this.beginShadowMakerChase('single_leg_otm', signal, opened);
+        // TRA-4888 — and shadow what a REAL resting limit at the mid this row
+        // just booked as `premiumPaid` would actually have filled at.
+        this.beginRealFillShadow('single_leg_otm', signal, {
+          optionSymbol: opened.optionSymbol,
+          contracts: opened.contracts,
+          delta: cheap.delta,
+          dte: cheap.daysToExpiration,
+          openInterest: cheap.openInterest,
+        });
 
         this.emitOptionFillAlert(opened);
         signal.mode = this.mode;

@@ -399,6 +399,11 @@ import {
   isOptionMakerShadowEnabled,
   buildRecoveryVerdicts,
 } from '../option-maker-shadow.js';
+import {
+  listRealFillShadowRows,
+  summarizeRealFillShadow,
+  isOptionRealFillShadowEnabled,
+} from '../option-real-fill-shadow.js';
 import { resolveMakerWalkConfig } from '../option-maker-config.js';
 import { isLearnedShrinkageEnabled } from '../learned-shrinkage-flag.js';
 import {
@@ -8860,6 +8865,56 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         'Fills are counted only when the opposing touch reaches our resting limit, so the fill rate is a LOWER bound.',
       verdicts,
       byStructure: stats,
+    });
+  });
+
+  // TRA-4888 — the REAL-FILL shadow readout: what an engine open would have
+  // cost if its entry were booked at a modelled resting-limit fill instead of
+  // the pre-trade NBBO mid `premiumPaid` books today.
+  //
+  // This is the surface TRA-4885 child A (the real-fill promotion gate) counts.
+  // It is deliberately NOT merged into /option-maker-shadow: that route answers
+  // "how much of the cross does a maker ladder recover", this one answers "what
+  // is the entry basis error", and a reader averaging the two would be pooling
+  // a recovery fraction with a dollar cost.
+  //
+  // Unauthenticated like its sibling: no balances, no PII — quote-derived
+  // counters only. Observe-only end to end; nothing here gates an admission.
+  app.get('/api/health/option-real-fill-shadow', async (req, res) => {
+    const modeRaw = typeof req.query.mode === 'string' ? req.query.mode : undefined;
+    const mode = modeRaw === 'demo' || modeRaw === 'live' ? modeRaw : undefined;
+    const sinceRaw = typeof req.query.since === 'string' ? Number(req.query.since) : Number.NaN;
+    const sinceTs = Number.isFinite(sinceRaw) ? sinceRaw : undefined;
+
+    const rows = await listRealFillShadowRows({
+      ...(mode ? { mode } : {}),
+      ...(sinceTs !== undefined ? { sinceTs } : {}),
+    });
+    const summary = summarizeRealFillShadow(rows, now());
+
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      enabled: isOptionRealFillShadowEnabled(),
+      ...(mode ? { mode } : {}),
+      ...(sinceTs !== undefined ? { sinceTs } : {}),
+      note:
+        'TRA-4888 — observe-only. `premiumPaid` on an engine-opened row starts life as the scanner\'s '
+        + 'pre-trade NBBO MID, which removes the dominant cost from a cost-dominated strategy (spread cross '
+        + 'is 99.1% of measured cost vs 0.9% fees, TRA-4885). Every row here carries BOTH bases: '
+        + '`midBasisUsd` (what the journal books) and `fillBasisUsd` (a resting limit at that same mid, '
+        + 'filled only when the tape PRINTS THROUGH it). `basisDeltaUsd` is the difference, sign-normalised '
+        + 'so buys and sells average. '
+        + '⚠️ READ `unmodelled` BEFORE ANY VERDICT: queue position is NOT modelled (no depth on this feed), '
+        + 'and each entry names which DIRECTION its omission biases the number. '
+        + '⚠️ READ `nUngraded` BEFORE ANY RATE: a row whose tape could not be read is `ungraded`, NOT '
+        + '`unfilled`, and every rate here is over `nGraded` alone — collapsing the two would drop exactly '
+        + 'the illiquid contracts the cost bar is about. '
+        + '⚠️ `ruleDisagreement` is the load-bearing column: `touch_cross` (the permissive rule '
+        + '/option-maker-shadow uses) and `print_through_limit` (the conservative one this route books on) '
+        + 'do not agree, and the size of that gap is how much the answer depends on the rule rather than '
+        + 'the market.',
+      summary,
     });
   });
 

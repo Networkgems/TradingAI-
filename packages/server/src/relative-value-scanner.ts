@@ -523,6 +523,37 @@ export interface RelativeValueScannerService {
     expiration: string,
     optionSymbol: string,
   ): Promise<number | null>;
+  /**
+   * TRA-4888 — the full TAPE sample for a contract: the two-sided quote PLUS
+   * `last`, `volume` and `openInterest`, in one read off the same cached chain
+   * snapshot. Feeds the real-fill shadow's trade-through rule.
+   *
+   * Why this is not a composition of the three existing readers: the fill model
+   * differences `volume` BETWEEN POLLS, so bid, ask, last and volume must come
+   * from ONE snapshot instant. Stitching them from separate calls could pair a
+   * quote with a volume read on the other side of a refresh and manufacture a
+   * print that never happened.
+   *
+   * ⚠️ `lastTradeMs` is NOT populated here. Tradier's `trade_date` — the
+   * last-trade clock (TRA-4870) — is not projected into `OptionChainRow`, so
+   * the print detector runs on the VOLUME tell alone. `volume` is a sufficient
+   * print detector on its own (see `detectNewPrint`), but a contract whose
+   * chain row omits volume grades UNGRADED, never no-fill.
+   *
+   * OPTIONAL on the interface, same contract as {@link getOptionQuote}: a
+   * scanner without it produces no shadow rows rather than half-measured ones.
+   */
+  getOptionTapeSample?(
+    symbol: string,
+    expiration: string,
+    optionSymbol: string,
+  ): Promise<{
+    bid: number | null;
+    ask: number | null;
+    last: number | null;
+    volume: number | null;
+    openInterest: number | null;
+  } | null>;
   diagnostics(): RelativeValueScannerDiagnostics;
 }
 
@@ -1049,6 +1080,50 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     return typeof row.last === 'number' && Number.isFinite(row.last) && row.last > 0
       ? row.last
       : null;
+  }
+
+  /**
+   * TRA-4888 — one tape sample off ONE cached chain snapshot. See the interface
+   * doc for why the fields must not be stitched from separate reads.
+   *
+   * Every field is independently nullable: a row that carries a quote but no
+   * volume is a real state on this feed, and the fill model needs to see it as
+   * "volume unreadable" rather than as zero traded.
+   */
+  async getOptionTapeSample(
+    symbol: string,
+    expiration: string,
+    optionSymbol: string,
+  ): Promise<{
+    bid: number | null;
+    ask: number | null;
+    last: number | null;
+    volume: number | null;
+    openInterest: number | null;
+  } | null> {
+    if (!this.client) return null;
+    if (this.isBreakerOpen()) return null;
+    const upper = symbol.trim().toUpperCase();
+    let chain: OptionChainRow[];
+    try {
+      chain = await this.fetchChain(upper, expiration);
+    } catch (err) {
+      this.tripBreaker(`getChainSnapshot(${upper},${expiration}) failed`, err);
+      return null;
+    }
+    const row = chain.find((r) => r.optionSymbol === optionSymbol);
+    if (!row) return null;
+    const num = (v: number | undefined, requirePositive = true): number | null =>
+      typeof v === 'number' && Number.isFinite(v) && (requirePositive ? v > 0 : v >= 0) ? v : null;
+    return {
+      bid: num(row.bid),
+      ask: num(row.ask),
+      last: num(row.last),
+      // Volume and OI are legitimately ZERO on a live contract — a zero here is
+      // a measurement, not an absence, so they do not require positivity.
+      volume: num(row.volume, false),
+      openInterest: num(row.openInterest, false),
+    };
   }
 
   // TRA-3502 — the reason-carrying form. `getOptionQuote` below is now a projection
