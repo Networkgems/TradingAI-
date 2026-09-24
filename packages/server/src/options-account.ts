@@ -7634,12 +7634,13 @@ export class PaperOptionsAccount {
   ): void {
     if (!isOptionTradeJournalEnabled()) return;
     const id = position.id;
-    // TRA-4857 — an unpriced reconcile close (broker flat, no fill to price
-    // against) writes honest nulls, not a fabricated 0. Key on the ABSENCE OF A
-    // BROKER FILL, never on `exitReason` alone: a `broker_reconcile` that DID
-    // find a fill (row `a2f9c8cd`, `NOK261002C00010500`, brokerOrderId
-    // 144350660, realizedPnlUsd -$22.50 LOSS) must still write the truthful P&L.
-    const unpricedClose = exitReason === 'broker_reconcile' && brokerOrderId === null;
+    // TRA-4857 / TRA-4860 — an unpriced close (no broker fill to price against)
+    // writes honest nulls, not a fabricated 0. Key on the ABSENCE OF A BROKER
+    // FILL, never on `exitReason` alone. This catches unpriced closes under ANY
+    // exit reason, not just `broker_reconcile`. Row `a2f9c8cd` (NOK261002C00010500,
+    // brokerOrderId 144350660, realizedPnlUsd -$22.50 LOSS) still writes truthful
+    // P&L because it HAS a brokerOrderId.
+    const unpricedClose = brokerOrderId === null;
     const realizedPnlUsd = unpricedClose ? null : (position.pnl ?? 0);
     const closeTs = position.closedAt ?? Date.now();
     this.journalWrites = this.journalWrites
