@@ -34,6 +34,7 @@ import {
   isOptionLiveOtmEnabled,
   isOptionLiveRvLongEnabled,
 } from './option-exec-flag.js';
+import { isOptionMakerTelemetryEnabled } from './option-maker-fill-ledger.js';
 
 export interface EnvLeverIntent {
   /** The env key the intent is about. */
@@ -90,10 +91,28 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
   },
   {
     key: 'ENABLE_OPTION_LIVE_OTM',
-    intended: 'off',
+    intended: 'on',
     provenance:
-      'TRA-4750 item 3 (2026-09-20): `single_leg_otm` STAND DOWN — SUPERSEDES the TRA-2877 standing arm, which is what this row read until 2026-09-22. Executed on bqb1 by TRA-4785 (env -> false + pinned same-window deploy). RE-ARMING NEEDS BOARD SIGN-OFF (TRA-4750 item 5): standing down is the risk-reducing direction and needed none; resuming is not. Do NOT "resolve" a mismatch here by flipping this row back — an `on` reading IS the event to escalate.',
+      'TRA-4750 item 5 board sign-off EXECUTED: card 6b82a9e7 on TRA-3401 (ask_user_questions, ' +
+      'human_only, answered by the board 2026-09-24T01:57Z) ordered the STANDING RE-ARM, superseding ' +
+      'the stand-down posture this row carried 2026-09-22..09-24 (TRA-4750 item 3, executed on bqb1 ' +
+      'by TRA-4785). Re-armed together with the TRA-4814 rider row (ENABLE_OPTION_MAKER_TELEMETRY ' +
+      'below) in the same change, as that ruling requires. The 0.385R cost bar still gates every ' +
+      'entry — arming does not by itself produce trades. An `off` reading here is now a silent ' +
+      'DISARM and is still the event to escalate, in the new direction; standing down again is ' +
+      'risk-reducing and needs no sign-off, but the manifest row must move in the same change.',
     resolve: (env) => (isOptionLiveOtmEnabled(env) ? 'on' : 'off'),
+  },
+  {
+    key: 'ENABLE_OPTION_MAKER_TELEMETRY',
+    intended: 'on',
+    provenance:
+      'TRA-4814 rider (2026-09-23): any TRA-4750 re-open must arm the maker fill ledger AND this ' +
+      'row in the same change, so the re-armed sleeve cannot run untelemetered — the sleeve was ' +
+      'stood down partly because its 32 real closes were never recorded. Armed by the TRA-3401 ' +
+      're-arm (card 6b82a9e7, 2026-09-24). An `off` reading while ENABLE_OPTION_LIVE_OTM is `on` ' +
+      'means live chases are going unrecorded — escalate; never edit this row alone to clear it.',
+    resolve: (env) => (isOptionMakerTelemetryEnabled(env) ? 'on' : 'off'),
   },
   {
     key: 'ENABLE_OPTION_LIVE_RV_LONG',
@@ -110,22 +129,17 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
   },
   {
     key: 'TRADIER_ENV',
-    intended: 'sandbox',
+    intended: 'production',
     provenance:
-      "TRA-2163 verified this by value as 'production' on 2026-07-23 (the go-live routing) and AGENTS.md still " +
-      'records that restoration. It reads `sandbox` on bqb1 today. TRA-4801 dated the change to the only env-var ' +
-      "write in the bracket [09-18T14:33Z last 'production' reading, 09-22T19:29Z first 'sandbox' reading]: " +
-      '2026-09-21T02:08:37.612656Z (dep-dao939egekts73bbv9cg, envUpdated:true, NO actor on the event), about 20h ' +
-      'after the TRA-4750 option-book stand-down — most likely a deliberate execution of it, but the actor is ' +
-      'unidentified and stays under TRA-4820/TRA-4821. ' +
-      "INTENT RULED 'sandbox' BY THE CTO ON TRA-4801 (2026-09-23), per that issue's own ask 3 (the posture call " +
-      'is reserved to the CTO there): while the TRA-4750 stand-down is in force nothing armed consumes the ' +
-      'production pair, so the event this row must catch is a silent re-point to `production` — the ' +
-      'risk-INCREASING direction. The ruling ratifies the POSTURE, not the unattributed 09-21 write. ' +
-      "Re-arming needs the TRA-4750 item 5 board sign-off and flips this row AND the env var in the same change " +
-      "(which is also what satisfies TRA-1655's G2 unblock condition, `TRADIER_ENV == production`, at go-live). " +
-      "A 'production' or 'unrecognized' reading here is the event to escalate — never edit this row alone to " +
-      'clear it. Same discipline as the ENABLE_OPTION_LIVE_OTM row above.',
+      "TRA-2163 verified 'production' by value on 2026-07-23 (the go-live routing). TRA-4801 ruled " +
+      "intent 'sandbox' on 2026-09-23 while the TRA-4750 option-book stand-down was in force. " +
+      'Card 6b82a9e7 on TRA-3401 (human board answer, 2026-09-24T01:57Z) RATIFIED production in the ' +
+      'same decision that ordered the TRA-4750 item 5 re-arm — which satisfies the TRA-1655 G2 ' +
+      "condition (TRADIER_ENV == production) and inverts this row's hazard again: with a live sleeve " +
+      "armed, a silent re-point to 'sandbox' routes real entries to the sandbox broker, so " +
+      "'sandbox' or 'unrecognized' here is now the event to escalate — never edit this row alone to " +
+      'clear it. The unattributed 09-21/09-23 env writes remain open incidents under ' +
+      'TRA-4820/TRA-4821; this ratifies the POSTURE, not those writes.',
     // Resolve the way the CREDENTIAL ROUTER does (index.ts ~1243), because that
     // is the read with consequences:
     //   const tradierEnv = (process.env['TRADIER_ENV'] as ...) ?? 'sandbox';

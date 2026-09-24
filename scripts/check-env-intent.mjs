@@ -182,6 +182,13 @@ const STORED_RESOLVERS = {
     reads: ['ENABLE_OPTION_LIVE_DIRECTIONAL'],
     resolve: (env) => (flagOn(env['ENABLE_OPTION_LIVE_DIRECTIONAL']) ? 'on' : 'off'),
   },
+  // option-maker-fill-ledger.ts:31 (isOptionMakerTelemetryEnabled) — same
+  // truthy list as flagOn, trimmed+lowercased; mapped on/off by the manifest
+  // row (TRA-4814 rider, armed by the TRA-3401 re-arm).
+  ENABLE_OPTION_MAKER_TELEMETRY: {
+    reads: ['ENABLE_OPTION_MAKER_TELEMETRY'],
+    resolve: (env) => (flagOn(env['ENABLE_OPTION_MAKER_TELEMETRY']) ? 'on' : 'off'),
+  },
   // TRA-4801 — index.ts:1243, the CREDENTIAL ROUTER, which is the read with
   // consequences:
   //   const tradierEnv = (process.env['TRADIER_ENV'] as ...) ?? 'sandbox';

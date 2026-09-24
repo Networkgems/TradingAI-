@@ -8,16 +8,14 @@ import { PRODUCTION_ENV_INTENT, summarizeEnvIntent } from './env-intent.js';
 const RULED_PROD_ENV: NodeJS.ProcessEnv = {
   NODE_ENV: 'production',
   DURABILITY_POLICY: 'refuse',
-  // TRA-4801 — intent RULED `sandbox` by the CTO on that issue (2026-09-23),
-  // while the TRA-4750 option-book stand-down is in force: nothing armed
-  // consumes the production credential pair, so the event to catch inverted to
-  // a silent re-point to `production`. bqb1 stores the explicit `sandbox`.
-  TRADIER_ENV: 'sandbox',
+  // Card 6b82a9e7 on TRA-3401 (human board answer, 2026-09-24T01:57Z): TRADIER_ENV
+  // production RATIFIED (TRA-1655 G2), the OTM sleeve RE-ARMED per TRA-4750 item 5,
+  // and the TRA-4814 telemetry rider armed in the same change.
+  TRADIER_ENV: 'production',
+  ENABLE_OPTION_LIVE_OTM: 'true',
+  ENABLE_OPTION_MAKER_TELEMETRY: 'true',
   // ENABLE_ORDER_QUOTE_GUARD / ENABLE_OPTION_LIVE_RV_LONG / _DIRECTIONAL absent:
   // their intent is `off` and their code default is off — absence MATCHES.
-  // ENABLE_OPTION_LIVE_OTM joined them on 2026-09-22: TRA-4750 stood the sleeve
-  // down and TRA-4785 pulled the lever on bqb1 (the live env holds the explicit
-  // `false`; absence would resolve off too, and both MATCH).
 };
 
 describe('summarizeEnvIntent (TRA-4474)', () => {
@@ -47,29 +45,56 @@ describe('summarizeEnvIntent (TRA-4474)', () => {
     expect(s.mismatches).toEqual(['ENABLE_OPTION_LIVE_DIRECTIONAL']);
   });
 
-  // TRA-4785. This assertion USED to run the other way — it graded a WIPE of the
-  // TRA-2877 standing arm as the mismatch. TRA-4750 stood `single_leg_otm` down,
-  // so the hazard inverted with it: the event to catch is now the sleeve being
-  // RE-ARMED on the money host without the board sign-off TRA-4750 item 5
-  // requires. Until 2026-09-22 nothing anywhere could see that — the sleeve was
-  // held dark only by cost-bar arithmetic, and "stood down" read identically to
-  // "armed but out-priced" on every surface we had.
-  it('THE STAND-DOWN: the OTM sleeve found ARMED on the money host is a named mismatch', () => {
-    const s = summarizeEnvIntent({ ...RULED_PROD_ENV, ENABLE_OPTION_LIVE_OTM: 'true' });
+  // This assertion has now run BOTH ways. Until 2026-09-22 it graded a wipe of
+  // the TRA-2877 standing arm; TRA-4750 stood the sleeve down and it graded a
+  // silent RE-ARM; card 6b82a9e7 on TRA-3401 (2026-09-24) executed the TRA-4750
+  // item 5 board sign-off, so the hazard inverted back: the event to catch is
+  // the board-armed sleeve being found silently DISARMED on the money host.
+  it('THE RE-ARM: the board-armed OTM sleeve found DARK on the money host is a named mismatch', () => {
+    for (const env of [{ ...RULED_PROD_ENV, ENABLE_OPTION_LIVE_OTM: 'false' }] as NodeJS.ProcessEnv[]) {
+      const s = summarizeEnvIntent(env);
+      expect(s.ok).toBe(false);
+      expect(s.mismatches).toEqual(['ENABLE_OPTION_LIVE_OTM']);
+      expect(s.levers.find((l) => l.key === 'ENABLE_OPTION_LIVE_OTM')).toMatchObject({
+        present: true,
+        effective: 'off',
+        intended: 'on',
+        matches: false,
+      });
+    }
+    // A WIPE reads dark too (the flag defaults off) — same named mismatch, with
+    // present:false keeping the wipe distinguishable from a stored `false`.
+    const { ENABLE_OPTION_LIVE_OTM: _gone, ...wiped } = RULED_PROD_ENV;
+    const s = summarizeEnvIntent(wiped);
     expect(s.ok).toBe(false);
     expect(s.mismatches).toEqual(['ENABLE_OPTION_LIVE_OTM']);
-    const lever = s.levers.find((l) => l.key === 'ENABLE_OPTION_LIVE_OTM');
-    expect(lever).toMatchObject({ present: true, effective: 'on', intended: 'off', matches: false });
+    expect(s.levers.find((l) => l.key === 'ENABLE_OPTION_LIVE_OTM')).toMatchObject({
+      present: false,
+      effective: 'off',
+      matches: false,
+    });
   });
 
-  it('the stood-down sleeve reads ok whether the env says `false` or the key is gone', () => {
-    for (const raw of ['false', '0', 'off', 'no']) {
+  it('the re-armed sleeve reads ok on every truthy raw the shipped flag accepts', () => {
+    for (const raw of ['1', 'true', 'yes', 'on']) {
       const s = summarizeEnvIntent({ ...RULED_PROD_ENV, ENABLE_OPTION_LIVE_OTM: raw });
       expect(s.mismatches).toEqual([]);
       expect(s.ok).toBe(true);
     }
-    // bqb1 holds the explicit `false`; absence resolves off by the code default.
-    expect(summarizeEnvIntent(RULED_PROD_ENV).ok).toBe(true);
+  });
+
+  // TRA-4814 rider: a re-opened sleeve may not run untelemetered.
+  it('THE RIDER: maker telemetry found OFF beside the armed sleeve is a named mismatch', () => {
+    const { ENABLE_OPTION_MAKER_TELEMETRY: _gone, ...wiped } = RULED_PROD_ENV;
+    const s = summarizeEnvIntent(wiped);
+    expect(s.ok).toBe(false);
+    expect(s.mismatches).toEqual(['ENABLE_OPTION_MAKER_TELEMETRY']);
+    expect(s.levers.find((l) => l.key === 'ENABLE_OPTION_MAKER_TELEMETRY')).toMatchObject({
+      present: false,
+      effective: 'off',
+      intended: 'on',
+      matches: false,
+    });
   });
 
   it('matches via the resolver, not string equality', () => {
@@ -85,45 +110,43 @@ describe('summarizeEnvIntent (TRA-4474)', () => {
     expect(s.mismatches).toEqual([]);
   });
 
-  // ── TRA-4801: TRADIER_ENV ────────────────────────────────────────────────
-  // These assertions RAN THE OTHER WAY between d98c411d and the CTO ruling of
-  // 2026-09-23: the row shipped `intended: 'production'` (TRA-2163's verified
-  // value) as a deliberate standing mismatch until someone ruled on the 09-21
-  // flip. The ruling landed on TRA-4801: `sandbox` while the TRA-4750
-  // stand-down is in force, so the mismatch to catch inverted with it.
-  it('THE RE-POINT: TRADIER_ENV=production on the stood-down money host is a named mismatch', () => {
-    const s = summarizeEnvIntent({ ...RULED_PROD_ENV, TRADIER_ENV: 'production' });
+  // ── TRADIER_ENV ──────────────────────────────────────────────────────────
+  // Third inversion of this row: 'production' (TRA-2163) → 'sandbox' (TRA-4801,
+  // under the stand-down) → 'production' again (card 6b82a9e7 ratification,
+  // 2026-09-24). With a live sleeve armed, the hazard is a silent re-point to
+  // sandbox: real entries would route to the sandbox broker.
+  it('THE RE-POINT: TRADIER_ENV=sandbox beside the armed live sleeve is a named mismatch', () => {
+    const s = summarizeEnvIntent({ ...RULED_PROD_ENV, TRADIER_ENV: 'sandbox' });
     expect(s.ok).toBe(false);
     expect(s.mismatches).toContain('TRADIER_ENV');
     expect(s.levers.find((l) => l.key === 'TRADIER_ENV')).toMatchObject({
-      intended: 'sandbox',
-      effective: 'production',
+      intended: 'production',
+      effective: 'sandbox',
       present: true,
       matches: false,
     });
   });
 
-  it('an ABSENT TRADIER_ENV resolves sandbox like the credential router, and MATCHES the ruled intent', () => {
+  it('an ABSENT TRADIER_ENV resolves sandbox like the credential router — a MISMATCH under the ratified intent', () => {
     const { TRADIER_ENV: _gone, ...noKey } = RULED_PROD_ENV;
     const s = summarizeEnvIntent(noKey);
-    expect(s.mismatches).not.toContain('TRADIER_ENV');
+    expect(s.mismatches).toContain('TRADIER_ENV');
     // index.ts: `(process.env['TRADIER_ENV'] as ...) ?? 'sandbox'` — absence
-    // routes SANDBOX credentials, which is now also the ruled posture. The
-    // present:false bit keeps a wipe distinguishable from the stored label.
+    // routes SANDBOX credentials under an armed sleeve. The present:false bit
+    // keeps a wipe distinguishable from a stored label.
     expect(s.levers.find((l) => l.key === 'TRADIER_ENV')).toMatchObject({
       present: false,
       raw: null,
       effective: 'sandbox',
-      matches: true,
+      matches: false,
     });
   });
 
-  it('a PADDED ` production ` is `unrecognized`, not a quiet sandbox — two live readers disagree on it', () => {
+  it('a PADDED ` production ` is `unrecognized`, not a quiet production — two live readers disagree on it', () => {
     const s = summarizeEnvIntent({ ...RULED_PROD_ENV, TRADIER_ENV: ' production ' });
     // The credential router (`=== 'production'`, no trim) hands out SANDBOX creds,
     // while /api/health/live-equity (`.trim() === 'production'`) reports production.
-    // Collapsing this into 'sandbox' would hide that disagreement — and, now that
-    // `sandbox` is the ruled intent, would silently grade it GREEN.
+    // Collapsing this into either label would hide that disagreement.
     expect(s.levers.find((l) => l.key === 'TRADIER_ENV')?.effective).toBe('unrecognized');
     expect(s.mismatches).toContain('TRADIER_ENV');
   });
@@ -147,8 +170,8 @@ describe('summarizeEnvIntent (TRA-4474)', () => {
   it('a recognized label still publishes verbatim — redaction is not blanket suppression', () => {
     const s = summarizeEnvIntent(RULED_PROD_ENV);
     expect(s.levers.find((l) => l.key === 'TRADIER_ENV')).toMatchObject({
-      raw: 'sandbox',
-      effective: 'sandbox',
+      raw: 'production',
+      effective: 'production',
       matches: true,
     });
   });
