@@ -359,6 +359,66 @@ describe('TRA-2688 state budget', () => {
     );
   });
 
+  it('TRA-4503 — a tape/ eviction does NOT mark the closes/ census INCOMPLETE, but is still stated', async () => {
+    // Measured live at the 2026-09-24T01:00Z boundary: the admin LIVE book
+    // logged `INCOMPLETE or evicted` with `closes: {pruned: 0}` — all 407
+    // evictions were `tape/`. The file was whole; only the shared count said
+    // otherwise. Both halves are asserted here: the false alarm is gone AND
+    // the sibling overage is not swallowed with it.
+    const dir = bucket();
+    const tapeB = join(root, 'users', 'b', 'reports', 'demo', 'tape');
+    await mkdir(dir, { recursive: true });
+    await mkdir(tapeB, { recursive: true });
+    const blob = 'x'.repeat(1000);
+    await writeFile(join(tapeB, '2026-01-01.json'), blob, 'utf-8');
+    await writeFile(join(tapeB, '2026-01-02.json'), blob, 'utf-8');
+    await writeFile(join(tapeB, '2026-01-03.json'), blob, 'utf-8');
+
+    const warns: string[] = [];
+    const infos: string[] = [];
+    const w = await writeCloseLedger({
+      targetDir: dir, date: '2026-08-11', symbols: [sym({ symbol: 'A' })], usersRoot: usersRoot(),
+      limits: { tape: 2500 },
+      log: { warn: (m: string) => warns.push(m), info: (m: string) => infos.push(m) },
+    });
+
+    expect(w.aggregateByDir?.tape.pruned).toBe(1);
+    expect(w.aggregateByDir?.closes.pruned).toBe(0);
+    expect(w.prunedForAggregate).toBe(1);
+    // The census claim is keyed on THIS file's pool, which did not evict.
+    expect(warns).not.toContain(
+      'TRA-2688 close ledger is INCOMPLETE or evicted under budget — do not read it as a full census',
+    );
+    expect(infos).toContain('TRA-2688 close ledger written');
+    // …and narrowing the warn did not delete the surface: the sibling overage
+    // is restated at the write, on top of the sweep's own line.
+    expect(warns).toContain(
+      'TRA-4156 a SIBLING ledger pool evicted during this write — this closes/ census is COMPLETE',
+    );
+    expect(warns).toContain('TRA-4156 per-directory ledger budget exceeded — evicted oldest sessions');
+  });
+
+  it('TRA-4503 — a closes/ eviction DOES still mark the census INCOMPLETE', async () => {
+    // The negative control for the narrowing above: when this file's own pool
+    // is the one paying, the original warn must be unchanged.
+    const dir = bucket();
+    const closes = join(dir, CLOSE_LEDGER_DIR);
+    await mkdir(closes, { recursive: true });
+    const blob = 'x'.repeat(4000);
+    await writeFile(join(closes, '2026-01-01.json'), blob, 'utf-8');
+
+    const warns: string[] = [];
+    const w = await writeCloseLedger({
+      targetDir: dir, date: '2026-08-11', symbols: [sym({ symbol: 'A' })], usersRoot: usersRoot(),
+      limits: { closes: 2500 },
+      log: { warn: (m: string) => warns.push(m), info: () => {} },
+    });
+    expect(w.aggregateByDir?.closes.pruned).toBeGreaterThan(0);
+    expect(warns).toContain(
+      'TRA-2688 close ledger is INCOMPLETE or evicted under budget — do not read it as a full census',
+    );
+  });
+
   it('reports WHY the aggregate leg did nothing — a 0 that never looked is not a 0 under budget', async () => {
     const dir = bucket();
     await mkdir(dir, { recursive: true });

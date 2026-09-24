@@ -356,6 +356,13 @@ export async function writeCloseLedger(args: {
   /** `<DATA_DIR>/users` — the root the aggregate budget is enumerated from. */
   usersRoot?: string;
   now?: number;
+  /**
+   * Test seam — forwarded verbatim to {@link enforceAggregateLedgerBudget}, so
+   * the write-level eviction branches can be exercised without minting 48 MiB
+   * of fixture. Production callers never pass it and get
+   * {@link LEDGER_BUDGET_LIMITS}.
+   */
+  limits?: Partial<Record<(typeof LEDGER_BUDGET_DIRS)[number], number>>;
   log?: LedgerLog;
 }): Promise<CloseLedgerWriteResult> {
   const { targetDir, date, symbols } = args;
@@ -434,6 +441,7 @@ export async function writeCloseLedger(args: {
     const agg = await enforceAggregateLedgerBudget({
       usersRoot: args.usersRoot,
       date,
+      ...(args.limits == null ? {} : { limits: args.limits }),
       log: args.log,
     });
 
@@ -450,15 +458,37 @@ export async function writeCloseLedger(args: {
       ...(agg.bytes == null ? {} : { aggregateBytes: agg.bytes }),
       ...(agg.byDir == null ? {} : { aggregateByDir: agg.byDir }),
     };
-    // No silent caps. A truncated ledger, or one written while the shared
-    // budget was evicting, must not read like an ordinary complete session.
-    if (file.truncated > 0 || agg.pruned > 0 || agg.sweep === 'failed') {
+    // No silent caps. A truncated ledger, or one written while ITS OWN pool was
+    // evicting, must not read like an ordinary complete session.
+    //
+    // TRA-4503 AC3: the predicate keys on the `closes/` pool, NOT on the
+    // combined count. Pre-split there was one pool, so `agg.pruned > 0` asked
+    // the same question; after the split it does not. Measured live at the
+    // 2026-09-24T01:00Z boundary: the admin LIVE book logged INCOMPLETE with
+    // `closes: {pruned: 0, bytes: 20746889/50331648}` — all 407 evictions were
+    // `tape/`, a sibling pool this file does not live in. Telling a reader that
+    // a complete census may be incomplete is the same class of defect, pointed
+    // the other way, as letting an evicted one read as whole.
+    const ownPruned = agg.byDir == null ? agg.pruned : (agg.byDir.closes?.pruned ?? 0);
+    const siblingPruned = agg.pruned - ownPruned;
+    if (file.truncated > 0 || ownPruned > 0 || agg.sweep === 'failed') {
       args.log?.warn(
         'TRA-2688 close ledger is INCOMPLETE or evicted under budget — do not read it as a full census',
         { ...result },
       );
     } else {
       args.log?.info('TRA-2688 close ledger written', { ...result });
+      // The sibling eviction is NOT suppressed by the narrowing above — it is
+      // RESTATED here, at the write it did not damage, so narrowing the warn
+      // cannot delete the surface that made the overage visible in the first
+      // place. Its own `TRA-4156 per-directory ledger budget exceeded` line
+      // (emitted once per sweep) remains the primary record.
+      if (siblingPruned > 0) {
+        args.log?.warn(
+          'TRA-4156 a SIBLING ledger pool evicted during this write — this closes/ census is COMPLETE',
+          { ...result, siblingPruned },
+        );
+      }
     }
     return result;
   } catch (err: unknown) {
