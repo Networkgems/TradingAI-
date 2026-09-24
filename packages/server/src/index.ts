@@ -765,6 +765,7 @@ import {
   buildEngineScorecard,
 } from './engine-scorecard.js';
 import { resolveBuildInfo } from './observability/build-info.js';
+import { resolveBuildStaleness } from './observability/build-staleness.js';
 import {
   generateMarketReview,
   getLatestMarketReview,
@@ -19553,6 +19554,35 @@ httpServer.listen(PORT, () => {
   // startup banner an operator expects on stdout when the process comes up.
   console.log(`Trading server running on http://localhost:${PORT}`);
   console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
+
+  // TRA-4851 — boot staleness self-check. A PM2 boot-resurrect re-serves
+  // whatever the shared checkout's HEAD is; on 2026-09-24 that was 42 days /
+  // ~600 commits stale and read exactly like quiet health (TRA-4849). The
+  // running commit's age at boot is published on /api/health/version; when it
+  // exceeds the threshold, or cannot be resolved, the boot is LOUD about it.
+  const bootBuild = resolveBuildInfo();
+  const staleness = resolveBuildStaleness({
+    commit: bootBuild.commit,
+    bootMs: Date.parse(bootBuild.startedAt),
+  });
+  if (staleness.state === 'fresh') {
+    console.log(
+      `Build staleness: fresh — commit ${bootBuild.commitShort} is ${staleness.ageDaysAtBoot}d old at boot (threshold ${staleness.thresholdDays}d)`,
+    );
+  } else {
+    console.error(
+      '████████████████████████████████████████████████████████████████████████\n' +
+      `██ TRA-4851 BUILD STALENESS: ${staleness.state.toUpperCase()}\n` +
+      `██ commit ${bootBuild.commit ?? 'UNKNOWN'}\n` +
+      (staleness.state === 'stale'
+        ? `██ is ${staleness.ageDaysAtBoot} days old at boot (threshold ${staleness.thresholdDays}d).\n` +
+          '██ This boot is probably re-serving a stale checkout (the TRA-4849\n' +
+          '██ shape). Fast-forward + rebuild before trusting any read:\n' +
+          '██   git pull && pnpm --filter @trading-app/server build && pm2 restart trading-server\n'
+        : `██ commit age unresolvable (${staleness.reason}) — staleness CANNOT be graded.\n`) +
+      '████████████████████████████████████████████████████████████████████████',
+    );
+  }
 });
 
 // TRA-3595 — the TRA-2906 cash-flow rebuild one-shot.

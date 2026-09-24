@@ -26,6 +26,7 @@ import {
   MODEL_FACING_JOURNAL_BASIS,
 } from '../model-facing-journal.js'; // TRA-2214, TRA-3831
 import { resolveBuildInfo } from './build-info.js';
+import { resolveBuildStaleness } from './build-staleness.js';
 import { computeValidationProgress } from '../validation-progress.js';
 import { summarizeLiveHealth, summarizeFeed } from './live-health.js';
 import { evaluateEnvDrift, loadRenderBlueprint } from './env-drift.js'; // TRA-2209
@@ -4810,7 +4811,14 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   };
 
   app.get('/api/health/version', (_req, res) => {
-    res.json(resolveBuildInfo());
+    // TRA-4851 — the SHA alone reads identically 600 commits behind and at the
+    // tip (the TRA-4849 boot-resurrect incident), so the running commit's AGE
+    // at boot is published beside it as a keyable staleness verdict.
+    const build = resolveBuildInfo();
+    res.json({
+      ...build,
+      staleness: resolveBuildStaleness({ commit: build.commit, bootMs: Date.parse(build.startedAt) }),
+    });
   });
 
   /**

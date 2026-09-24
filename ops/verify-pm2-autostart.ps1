@@ -30,8 +30,19 @@ Write-Output ""
 # ---- C1: task registered -----------------------------------------------------
 $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 if (-not $task) {
-  $fail += "C1 task '$taskName' is NOT registered. Fix: run ops/install-pm2-autostart.ps1 from an ELEVATED PowerShell."
-  Write-Output "C1 task registered      : FAIL (absent)"
+  # TRA-4851: Get-ScheduledTask silently FILTERS tasks this session lacks read
+  # access to, so "absent" and "registered but unreadable" looked identical —
+  # the verifier reported FAIL(absent) against a task that ran at the last boot.
+  # schtasks by exact name discriminates: a missing task says "cannot find the
+  # file specified"; an unreadable one says "Access is denied".
+  $probe = & schtasks /query /tn $taskName 2>&1 | Out-String
+  if ($probe -match 'Access is denied') {
+    Write-Output "C1 task registered      : PASS-UNREADABLE (task exists but this session cannot read it; its -File target is UNVERIFIABLE without elevation)"
+    Write-Output "   WARN: C2 cannot run. Re-run this verifier from an ELEVATED PowerShell to check what the task actually points at."
+  } else {
+    $fail += "C1 task '$taskName' is NOT registered. Fix: run ops/install-pm2-autostart.ps1 from an ELEVATED PowerShell."
+    Write-Output "C1 task registered      : FAIL (absent)"
+  }
 } else {
   Write-Output "C1 task registered      : PASS (state=$($task.State), user=$($task.Principal.UserId))"
   if ($task.State -eq 'Disabled') { $fail += "C1 task is registered but DISABLED - it will not run at boot." }
@@ -89,6 +100,39 @@ try {
   Write-Output "   health :4242          : $($r.StatusCode)"
 } catch {
   Write-Output "   health :4242          : UNREACHABLE"
+}
+
+# ---- C5: staleness of the checkout a boot would re-serve (TRA-4851) ----------
+# The dump points trading-server at a shared checkout; `pm2 resurrect` re-binds
+# :4242 to whatever HEAD that checkout holds. On 2026-09-24 that HEAD was 42
+# days / ~600 commits stale for at least 3 boots and read like quiet health
+# (TRA-4849). Grade the checkout the dump ACTUALLY names, not the one this
+# script happens to live in.
+# NB: parsed with node, not ConvertFrom-Json — the dump's saved env carries
+# case-duplicate keys (`username`/`USERNAME`) that PowerShell 5.1's JSON
+# parser refuses outright.
+$servedRepo = $null
+if (Test-Path $dump) {
+  try {
+    $servedRepo = & node -e "const d=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'));const e=d.find(p=>p.name==='trading-server');process.stdout.write(e&&e.pm_cwd?e.pm_cwd:'')" $dump 2>$null
+    if (-not $servedRepo) { $servedRepo = $null }
+  } catch { }
+}
+$guardScript = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\check-boot-staleness.mjs'
+if (-not $servedRepo) {
+  Write-Output "C5 checkout staleness   : SKIP (could not read trading-server's pm_cwd out of dump.pm2)"
+} elseif (-not (Test-Path $guardScript)) {
+  $fail += "C5 staleness guard script missing at $guardScript - a boot would be unguarded."
+  Write-Output "C5 checkout staleness   : FAIL (guard script missing)"
+} else {
+  & node $guardScript "--repo=$servedRepo" --fetch-attempts=1 | ForEach-Object { Write-Output "   $_" }
+  switch ($LASTEXITCODE) {
+    0 { Write-Output "C5 checkout staleness   : PASS (FRESH - a reboot now would re-serve a current build)" }
+    1 { $fail += "C5 the checkout at $servedRepo is CONFIRMED STALE - the next reboot re-serves it (the TRA-4849 incident). Remedy: git pull + rebuild + pm2 restart + pm2 save."
+        Write-Output "C5 checkout staleness   : FAIL (STALE_CONFIRMED)" }
+    2 { Write-Output "C5 checkout staleness   : WARN (HEAD over age threshold, origin unreachable - could not confirm)" }
+    default { Write-Output "C5 checkout staleness   : WARN (guard exit $LASTEXITCODE - could not grade)" }
+  }
 }
 
 # ---- verdict -----------------------------------------------------------------
