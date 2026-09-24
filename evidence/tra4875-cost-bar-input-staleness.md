@@ -75,8 +75,58 @@ Three-valued on the TRA-4783 contract: `true` / `false` (a clean pass — stampe
 bar, and `rowsUnstamped === 0`) / `null` (NOT COMPUTABLE). `?? false` on it re-creates the
 coerce-unknown-to-healthy bug one layer up.
 
-## AC3 — the AFTER read
+## The AFTER read — all four graded on live bytes
 
-Recorded in the ticket comment against the rolled pin. Strictly additive telemetry: nothing on the
-admission path reads `ok`, `degradations` or `inputFreshness`, and no gate, arm, bar or reason code
-branches on any of them.
+Same route, **2026-09-24T21:06:59Z**, rolled pin **`c00d79f291d6be18fdf6833f2ac3adfc66f83b42`**,
+pid 77, `startedAt` 2026-09-24T20:59:34.697Z (deploy `dep-daqotdu7bikc738879v0`, live 20:59:50Z).
+
+**AC3 — PASS, exactly.** Same retained rows, same verdicts:
+
+| population | before (`26ec52a4`) | after (`c00d79f2`) |
+|---|---|---|
+| `single_leg_otm::0.20-0.30` | 5002 / 5002 | 5002 / 5002 |
+| `single_leg_otm::0.30-0.40` | 6853 / 6853 | 6853 / 6853 |
+| **entry site total** | **11855 / 11855** | **11855 / 11855** |
+| whole gate, retained | 14633 / 14205 | 14633 / 14205 |
+| per ET day 09-11 → 09-24 | all `blocked == evaluated` | all `blocked == evaluated` |
+
+Zero candidates moved from blocked to admitted.
+
+**AC2 — PASS.** `ok: false` for the first time on this route, with one entry in `degradations[]`:
+`cost_bar_edge_input_stale`, severity `degraded`, `thresholdDays: 10`, `decisionsBlocked: 12578`,
+`globalInputStale: true`.
+
+**AC1 / AC4 — PASS.** `retained.byGate[cost_bar].byCell[].inputFreshness`:
+
+| cell | eval/blocked | `stale` | age at decision | tape ends | stamped/unstamped |
+|---|---|---|---|---|---|
+| `single_leg_otm::0.30-0.40` | 6853/6853 | **true** | 51.1 d | 2026-08-04T17:00:00Z | 4226 / 2627 |
+| `single_leg_otm::0.20-0.30` | 5002/5002 | **true** | 52.3 d | 2026-08-03T13:33:47Z | 2863 / 2139 |
+| `single_leg_otm::0.50-0.55` | 2055/1627 | **null** | — | — | 0 / 2055 |
+| `single_leg_rv::0.55-1.00` | 718/718 | **true** | 62.1 d | 2026-07-24T17:12:31Z | 85 / 633 |
+| `single_leg_rv::0.50-0.55` | 5/5 | **true** | 60.0 d | 2026-07-24T19:07:58Z | 5 / 0 |
+
+Four per-cell numbers, all different, none of them the global 78.1 d — which is the point of AC4.
+
+### Two things the live read surfaced that the ticket did not ask about
+
+**1. The RV sleeve is in the same state and nobody had looked.** `single_leg_rv::0.55-1.00` and
+`::0.50-0.55` are enforcing refusals off tapes **62.1 d** and **60.0 d** old — older than either OTM
+cell — refusing 723 of 723. TRA-4875 was scoped to the OTM entry site; a per-cell instrument found
+two more enforcing cells in the same condition on its first read. Same remedy applies (they keep
+refusing), and the strategy question is TRA-4622's.
+
+**2. The three-valued contract earned itself on the first live read.**
+`single_leg_otm::0.50-0.55` reads `stale: null`, not `false`, on 0 stamped / 2055 unstamped rows. A
+two-valued flag would have rendered that cell **fresh** purely because nothing was stamped — the
+coerce-unknown-to-healthy bug, reproduced inside the fix for it. Worth noting *why* it is unstamped:
+it is the one cell whose tape is still growing and the one cell that **admits** (1627/2055), and the
+armed band `[0.25, 0.40)` has stopped nominating it, so no post-TRA-4753 decision exists to stamp. It
+is a coverage hole, not a clean cell, and it says so.
+
+Strictly additive telemetry: nothing on the admission path reads `ok`, `degradations` or
+`inputFreshness`, and no gate, arm, bar or reason code branches on any of them.
+
+⚠️ **Operational note for anyone polling this route:** `ok` on
+`/api/health/live-enforce-gates` now reads `false` and will keep reading `false` while the tape stays
+frozen. That is the ticket working, not an outage. Read `degradations[]`.
