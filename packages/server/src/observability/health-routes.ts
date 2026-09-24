@@ -93,6 +93,8 @@ import {
   OPTION_OTM_DELTA_FLOOR_LIVE_FLAG,
   OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR,
 } from '../option-exec-flag.js';
+// TRA-3401 — the one-shot cost-bar grant's health block (card `6b82a9e7`).
+import { getLiveOtmOneShotGrantState } from '../live-otm-oneshot-grant.js';
 import {
   summarizeLiveOptionsFeeSlippage, // TRA-1929
   summarizeLiveOptionAdmissionStamps, // TRA-3997
@@ -5882,6 +5884,13 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         directionalFlagOn: isOptionLiveDirectionalEnabled(liveEnv),
         directionalArmed: isOptionLiveDirectionalArmed(liveEnv, nowMs),
       },
+      // TRA-3401 — the board's one-shot cost-bar bypass (card `6b82a9e7`,
+      // fa390549 scope). Published beside `arm` so the whole grant lifecycle —
+      // armed/window/committed-per-book/refusal tallies — reads off deployed
+      // state instead of logs. `armed:false` with the env unset is the shipped
+      // default; `stateUnreadable:true` means every consult is refusing
+      // (fail closed) and an operator must inspect the commit file.
+      oneShotCostBarGrant: getLiveOtmOneShotGrantState(liveEnv, nowMs),
       n: summary.n,
       opens: summary.opens,
       closes: summary.closes,

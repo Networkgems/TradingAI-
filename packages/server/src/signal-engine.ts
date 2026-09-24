@@ -364,6 +364,16 @@ import {
   takeExplorationGrant,
   commitExplorationOpen,
 } from './directional-exploration-allowance.js';
+// TRA-3401 — the board's one-shot cost-bar bypass for the two fa390549 test
+// tickets (card `6b82a9e7`). Consulted ONLY on the live flat-form branch of
+// costAwareGateReject after the tape verdict already said BLOCK, and spent only
+// at the live OTM open site once the broker mirror is FINAL. Env unset ⇒ the
+// consult refuses and the path is byte-identical to before.
+import {
+  consultLiveOtmOneShotGrant,
+  hasPendingLiveOtmOneShotGrant,
+  commitLiveOtmOneShotGrant,
+} from './live-otm-oneshot-grant.js';
 // TRA-2295 — the entry-path spread ceiling reads its thresholds from the SAME table
 // the cost model quotes, so the two cannot drift apart again.
 import {
@@ -8755,6 +8765,46 @@ export class SignalEngine {
         );
         return verdict.admit ? null : verdict.reason;
       }
+      // TRA-3401 — the board-ordered ONE-SHOT bypass (card `6b82a9e7` Q2
+      // `place`; fa390549 scope: two entries, one per book, 1 contract, ≤$300).
+      // Consulted only when the flat form already said BLOCK, so a merit admit
+      // never touches it, and only for `single_leg_otm` — the sleeve the card
+      // names. A grant records an ADMIT row (the ledger retains `reasonCode`
+      // on blocks only, so the attribution rides this log line, the grant
+      // module's health block, and the sheer anomaly of a cost_bar admit
+      // against weeks of 100% blocks). Every OTHER live gate still runs on the
+      // granted candidate; the open site spends the shot only on a FINAL open.
+      if (!tape.admit && structure === 'single_leg_otm') {
+        const grantAskUsd =
+          (typeof quote?.ask === 'number' && Number.isFinite(quote.ask) && quote.ask > 0
+            ? quote.ask
+            : inputs.mark) * 100;
+        const oneShot = consultLiveOtmOneShotGrant(process.env, this.alertUsername, grantAskUsd);
+        if (oneShot.granted) {
+          recordLiveEnforceDecision(
+            'cost_bar',
+            structure,
+            false,
+            etDateString(new Date()),
+            undefined,
+            Date.now(),
+            {
+              book: this.alertUsername ?? null,
+              cell: tape.cellKey ?? undefined,
+              predicate: tapeExpectancyFlatPredicate(tape),
+              ...costOpts,
+            },
+          );
+          log.info('live OTM cost bar BYPASSED by board one-shot grant (TRA-3401)', {
+            card: oneShot.card,
+            book: this.alertUsername ?? null,
+            askNotionalUsd: grantAskUsd,
+            barBlockedReason: tape.reason ?? null,
+            cell: tape.cellKey ?? null,
+          });
+          return null;
+        }
+      }
       // TRA-3216 — `reason` is per-candidate prose (it embeds this candidate's own
       // numbers), so a fold on it has one bucket per decision. `reasonCode` is the
       // bounded classification that makes a 99%+ block rate diagnosable, and since
@@ -14590,10 +14640,18 @@ export class SignalEngine {
           // cap (2). `maxContracts` above is the ops-settable canary ceiling
           // (board-authorized 2–4, TRA-2536); the floor bounds it from above
           // without moving it. Quantity only — the contract is unchanged.
-          const testContracts = capOtmEntryContracts(
+          // TRA-3401 — a candidate admitted through the board's one-shot
+          // cost-bar grant is capped at the card's EXACT size (1 contract),
+          // regardless of the ops-settable bounded-test ceiling. Read here,
+          // once, so the clamp and the commit below key on the same token.
+          const oneShotGrantPending = hasPendingLiveOtmOneShotGrant(this.alertUsername);
+          const sizedTestContracts = capOtmEntryContracts(
             resolveLiveOptionTestContracts(askLimit, notionalCap, maxContracts),
             otmFloor,
           );
+          const testContracts = oneShotGrantPending
+            ? Math.min(1, sizedTestContracts)
+            : sizedTestContracts;
           if (testContracts < 1) {
             const oneContractNotional = askLimit * 100;
             surfaceOtmLiveSkip(
@@ -15118,6 +15176,27 @@ export class SignalEngine {
           // would report opens the book does not hold (the directional path's
           // TRA-2193 rule, and it matters more here: this is the real-money site).
           scanRun.opened();
+          // TRA-3401 — spend the book's one shot ONLY here, once the broker
+          // mirror is final: a rolled-back paper open or a downstream refusal
+          // must not burn it. A commit the module could not make durable latches
+          // the grant unreadable (fail closed) — log it so the operator knows
+          // the second shot is refused by design, not by accident.
+          if (oneShotGrantPending) {
+            const oneShotDurable = commitLiveOtmOneShotGrant(
+              this.alertUsername,
+              cheap.optionSymbol ?? sym,
+            );
+            log[oneShotDurable ? 'info' : 'error'](
+              oneShotDurable
+                ? 'TRA-3401 one-shot cost-bar grant SPENT on a final open'
+                : 'TRA-3401 one-shot grant commit NOT durable — grant latched unreadable (fail closed)',
+              {
+                book: this.alertUsername ?? null,
+                optionSymbol: cheap.optionSymbol ?? sym,
+                contracts: testContracts,
+              },
+            );
+          }
           // TRA-4628 — the ordered link, at the FINAL point only (same TRA-2193
           // rule): a rolled-back open must not read as ordered on the tape.
           recordOtmAdmissionOrdered(
