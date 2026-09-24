@@ -62,6 +62,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
+import { gradedAncestry } from './lib/shallow-ancestry.mjs';
 
 const API = 'https://api.render.com/v1';
 const OWNER_ID = 'tea-d7macfog4nts73ai6p40';
@@ -268,19 +269,30 @@ async function pinWindowBuild() {
   return { before, inside, considered: deploys.length };
 }
 
+// TRA-3740: Rewritten to use the canonical shallow-aware ancestry grader. The old
+// version had bidirectional controls (fwd=0 && rev!=0 => contains) which is good for
+// detecting same-commit, but a shallow graft makes BOTH directions return 1, so
+// `contains = false` conflates "genuinely not an ancestor" with "path was grafted away"
+// — and the script's line 381 exports that as `buildContainsFix: false`, not `null`.
 function ancestry(child, parentCommit) {
+  const { verdict, answer } = gradedAncestry(parentCommit, child);
+  // Preserve the old interface for compatibility: { known, contains, fwd, rev }.
+  // But now `contains = null` when the ancestry is unreadable (including shallow grafts).
+  // For logging/debugging, expose the verdict string; fwd/rev are now less meaningful
+  // since the library handles the logic, but we can still compute them for compat.
   const git = args => {
     try { execFileSync('git', args, { stdio: ['ignore', 'pipe', 'ignore'] }); return 0; }
     catch (e) { return typeof e.status === 'number' ? e.status : -1; }
   };
-  try { execFileSync('git', ['cat-file', '-t', child], { stdio: 'ignore' }); }
-  catch { return { known: false, contains: null, fwd: null, rev: null }; }
   const fwd = git(['merge-base', '--is-ancestor', parentCommit, child]);
-  // The reverse is the CONTROL. The clone is SHALLOW, which produces false
-  // NEGATIVES only — so rc=0 forward proves ancestry, and an rc=0 in BOTH
-  // directions would mean the two refs are the same commit, not a proof.
   const rev = git(['merge-base', '--is-ancestor', child, parentCommit]);
-  return { known: true, contains: fwd === 0 && rev !== 0, fwd, rev };
+  return {
+    known: answer !== null || verdict.startsWith('blind-'), // object known if not blind-missing-object
+    contains: answer, // true/false/null — null is the key fix for shallow grafts
+    fwd,
+    rev,
+    verdict, // expose the detailed verdict string for debugging
+  };
 }
 
 const out = { ticket: 'TRA-3442', window: { from: FROM, to: TO }, generatedAtWindowEnd: TO };

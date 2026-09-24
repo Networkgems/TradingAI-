@@ -137,6 +137,7 @@ import { readFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gradedAncestry } from './lib/shallow-ancestry.mjs';
 
 /** This script's own repo, so the ancestry probe reads the checkout it shipped in. */
 const REPO_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -1371,30 +1372,24 @@ async function fetchLiveVersion(reconUrl) {
  * checkout, a shallow clone, or an unfetched object are all states in which we
  * simply do not know. This distinction is the whole reason UNATTRIBUTABLE exists
  * as a separate verdict from PRE_FIX_WRITER.
+ *
+ * TRA-3740: Rewritten to use the canonical shallow-aware ancestry grader from
+ * scripts/lib/shallow-ancestry.mjs. The old cat-file screens were necessary but NOT
+ * sufficient: both objects can be present while the path between them is cut by a
+ * shallow graft, so rc=1 still needs shallow detection to distinguish "genuinely not
+ * an ancestor" from "path was grafted away" — they're byte-identical on the wire.
  */
 function makeAncestryResolver(repoDir, fixCommit = AC2_WRITER_FIX_COMMIT) {
   const cache = new Map();
   return (sha) => {
     if (cache.has(sha)) return cache.get(sha);
-    let out = null;
-    try {
-      // Both objects must be present locally; `cat-file -e` distinguishes "absent"
-      // from "not an ancestor", which `merge-base` alone conflates into exit 1.
-      for (const rev of [fixCommit, sha]) {
-        const probe = spawnSync('git', ['cat-file', '-e', `${rev}^{commit}`], { cwd: repoDir, encoding: 'utf-8' });
-        if (probe.error || probe.status !== 0) { cache.set(sha, null); return null; }
-      }
-      const r = spawnSync(
-        'git', ['merge-base', '--is-ancestor', fixCommit, sha],
-        { cwd: repoDir, encoding: 'utf-8' },
-      );
-      if (r.error || (r.status !== 0 && r.status !== 1)) out = null;
-      else out = r.status === 0;
-    } catch {
-      out = null;
-    }
-    cache.set(sha, out);
-    return out;
+    // The library function handles object presence, shallow detection, and
+    // unrelated-graph detection — exactly what the cat-file + merge-base + git-error
+    // checks above were attempting to do, but now with graft awareness.
+    const { answer } = gradedAncestry(fixCommit, sha);
+    // answer: true (is ancestor) | false (provably not) | null (cannot tell)
+    cache.set(sha, answer);
+    return answer;
   };
 }
 

@@ -161,6 +161,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
+import { gradedAncestry as libGradedAncestry, blindReason } from './lib/shallow-ancestry.mjs';
 
 export const EXIT_CLEAN = 0;
 export const EXIT_FINDINGS = 1;
@@ -213,23 +214,22 @@ export { findOrderBlocks, parseDeployOrder, lineOrdersDeploy, classifyCarrier };
 /**
  * THE ANCESTRY PREDICATE, total over the three states ancestry actually has.
  *
- * `knownSha` MUST be consulted BEFORE `isAncestor`: a shallow clone answers "is X an
- * ancestor of Y" with the same non-zero exit whether the answer is no or the question is
- * unanswerable, so folding them together turns a blind checkout into a confident false
- * STRANDED — i.e. into an accusation.
- *
- * Deliberately a local copy of `check-fix-live.mjs`'s `gradeAncestry` rather than an
- * import: that file calls its main at MODULE SCOPE, so importing it would run a full
- * live grade and `process.exit()` this process (the trap `scripts/lib/
- * paperclip-enumeration.mjs` was extracted to survive).
+ * TRA-3740: Rewritten to use the canonical shallow-aware ancestry grader from
+ * scripts/lib/shallow-ancestry.mjs. A shallow clone makes `merge-base --is-ancestor`
+ * return exit 1 both for "genuinely not an ancestor" and "the path was grafted away",
+ * which are byte-identical. The old knownSha screens were necessary but NOT sufficient
+ * (both objects can be present while the path between them is cut). A graft falling
+ * through to 'absent' here manufactured STRANDED against a train that was obeyed on time.
  *
  * @returns {'present'|'absent'|'blind'}
  */
 export function gradeAncestry({ commit, liveSha, knownSha, isAncestor }) {
-  if (!commit || !liveSha) return 'blind';
-  if (!knownSha(commit)) return 'blind';
-  if (!knownSha(liveSha)) return 'blind';
-  return isAncestor(commit, liveSha) ? 'present' : 'absent';
+  // The library function is the canonical remedy (TRA-3699, TRA-3721).
+  // It handles object presence, shallow detection, and unrelated-graph detection.
+  const { answer } = libGradedAncestry(commit, liveSha);
+  if (answer === true) return 'present';
+  if (answer === false) return 'absent';
+  return 'blind'; // answer === null
 }
 
 /** "3h 12m" — for a lateness that has to be read at a glance in a report line. */
@@ -283,7 +283,15 @@ export function gradeTiming({ order, deploys, knownSha, isAncestor, historyHost 
     return { timing: 'unread', timingDetail: 'the deploy history contains no deploy that ever served' };
   }
 
-  const carries = (d) => typeof d.commit === 'string' && knownSha(d.commit) && isAncestor(order.commit, d.commit);
+  // TRA-3740: Use shallow-aware ancestry. A graft makes `isAncestor` return false for
+  // "path was cut" and "genuinely not an ancestor" identically, so a bare `.ok` can
+  // turn a pre-deadline deploy unknown to a shallow checkout into timing='unread'
+  // instead of timing='on_time', which then lets a stranded verdict through.
+  const carries = (d) => {
+    if (typeof d.commit !== 'string') return false;
+    const { answer } = libGradedAncestry(order.commit, d.commit);
+    return answer === true; // null (blind/shallow) fails closed to false
+  };
   const carrying = served.filter(carries).sort((a, b) => a.finishedMs - b.finishedMs);
 
   const onTime = carrying.filter((d) => d.finishedMs <= order.deadlineMs);

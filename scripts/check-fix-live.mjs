@@ -72,6 +72,7 @@
 //   3  BLIND        — could not read a leg. Never a pass.
 
 import { spawnSync } from 'node:child_process';
+import { gradedAncestry as libGradedAncestry } from './lib/shallow-ancestry.mjs';
 
 const DEFAULT_HOST = 'https://tradingai-bqb1.onrender.com';
 const BQB1_SERVICE_ID = 'srv-d7mb7rr7uimc73ev0chg';
@@ -85,18 +86,21 @@ const EXIT_BLIND = 3;
 /**
  * THE PREDICATE, pure and total over the three states ancestry actually has.
  *
- * `knownSha` MUST be consulted before `isAncestor`. A shallow clone answers
- * "is X an ancestor of Y" with the same non-zero exit whether the answer is no
- * or the question is unanswerable, so folding the two together is what turns a
- * blind checkout into a confident false ABSENT.
+ * TRA-3740: Rewritten to use the canonical shallow-aware ancestry grader from
+ * scripts/lib/shallow-ancestry.mjs. A shallow clone makes `merge-base --is-ancestor`
+ * return exit 1 both for "genuinely not an ancestor" and "the path was grafted away",
+ * which are byte-identical. The old knownSha screens were necessary but NOT sufficient
+ * (both objects can be present while the path between them is cut).
  *
  * @returns {'present'|'absent'|'blind'}
  */
 export function gradeAncestry({ commit, liveSha, knownSha, isAncestor }) {
-  if (!commit || !liveSha) return 'blind';
-  if (!knownSha(commit)) return 'blind';
-  if (!knownSha(liveSha)) return 'blind';
-  return isAncestor(commit, liveSha) ? 'present' : 'absent';
+  // The library function is the canonical remedy (TRA-3699, TRA-3721, TRA-3740).
+  // It handles object presence, shallow detection, and unrelated-graph detection.
+  const { answer } = libGradedAncestry(commit, liveSha);
+  if (answer === true) return 'present';
+  if (answer === false) return 'absent';
+  return 'blind'; // answer === null
 }
 
 /**
@@ -334,9 +338,13 @@ try {
 
 const spans = toLiveSpans(deploys);
 const nowMs = Date.now();
+// TRA-3740: Use shallow-aware ancestry. A bare `isAncestor` can return false both for
+// "not an ancestor" and "shallow graft", which would mark a window-build as contaminated
+// when it genuinely carries the fix but this checkout is shallow.
 const containsFix = sha => {
-  if (!sha || !knownSha(sha)) return null; // unknown → not provably clean
-  return isAncestor(COMMIT, sha);
+  if (!sha) return null;
+  const { answer } = libGradedAncestry(COMMIT, sha);
+  return answer; // true/false/null — null (blind) is not provably clean
 };
 const win = gradeWindow({ deploys: spans, windowStartMs, nowMs, containsFix });
 

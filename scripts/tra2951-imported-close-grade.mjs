@@ -44,6 +44,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gradedAncestry } from './lib/shallow-ancestry.mjs';
 
 const BQB1 = 'https://tradingai-bqb1.onrender.com';
 const FIX_COMMIT = '6eb0065';
@@ -105,26 +106,34 @@ say(`   commit     : ${build.commit}`);
 say(`   pid        : ${build.pid}   startedAt: ${build.startedAt}   uptimeSec: ${build.uptimeSec}`);
 say(`   mode       : ${live.mode}   operator: ${live.operator}`);
 
+// TRA-3740: Use shallow-aware ancestry. The old try/catch with bidirectional controls
+// was good for detecting broken git (wrong cwd, missing binary), but a shallow clone
+// makes `merge-base --is-ancestor` return non-zero (or throw) both for "not an ancestor"
+// and "path was grafted" — byte-identical. The controls below still catch git breakage;
+// the library call adds graft detection.
 const isAncestor = (a, b) => {
-  try {
-    execFileSync('git', ['merge-base', '--is-ancestor', a, b], { cwd: REPO, stdio: 'ignore' });
-    return true;
-  } catch { return false; }
+  const { answer } = gradedAncestry(a, b);
+  if (answer === null) return null; // blind — cannot tell
+  return answer; // true or false
 };
 // BIDIRECTIONAL control on the ancestry reader itself. A broken git invocation
-// (wrong cwd, unknown sha, no history) throws and is INDISTINGUISHABLE from an
-// honest "not an ancestor" -- which on Thursday would report BLIND against a
-// correctly deployed build and burn the day. A commit is always its own
-// ancestor, and an all-zero sha never is.
-if (!isAncestor(build.commit, build.commit)) {
-  die(3, `BLIND: ancestry reader is unusable in ${REPO} (a commit is not its own ancestor). Refusing to grade.`);
+// (wrong cwd, unknown sha, no history) returns null and is DISTINGUISHABLE from an
+// honest "not an ancestor" (false). A commit is always its own ancestor, and an
+// all-zero sha never is.
+const selfCheck = isAncestor(build.commit, build.commit);
+if (selfCheck !== true) {
+  die(3, `BLIND: ancestry reader is unusable in ${REPO} (a commit is not its own ancestor, got ${selfCheck}). Refusing to grade.`);
 }
-if (isAncestor('0000000000000000000000000000000000000000', build.commit)) {
-  die(3, 'BLIND: ancestry reader said an all-zero sha is an ancestor. Refusing to grade.');
+const zeroCheck = isAncestor('0000000000000000000000000000000000000000', build.commit);
+if (zeroCheck !== false) {
+  die(3, `BLIND: ancestry reader said an all-zero sha is an ancestor (got ${zeroCheck}). Refusing to grade.`);
 }
 say(`   ancestry reader control: self=YES, zero-sha=NO. OK (repo ${REPO})`);
 
 const fixLive = isAncestor(FIX_COMMIT, build.commit);
+if (fixLive === null) {
+  die(3, `BLIND: cannot determine whether ${FIX_COMMIT} is an ancestor of ${build.commit} (shallow clone or missing history). Run \`git fetch origin --unshallow\` and retry.`);
+}
 say(`   ${FIX_COMMIT} ancestor of live build: ${fixLive ? 'YES' : 'NO'}`);
 
 if (!BASELINE && !fixLive) {
