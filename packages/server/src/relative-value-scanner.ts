@@ -97,6 +97,21 @@ const MAX_REFUSAL_COOLDOWN_ENTRIES = 1024;
 // only stops a pathological day from turning a health route into a page of
 // payload, and `keysTruncated` says so out loud when it bites.
 const MAX_REFUSAL_COOLDOWN_KEYS_REPORTED = 300;
+// TRA-4865 — the third pass's census is a TEN-MINUTE WINDOW, not a session
+// census, and it reads identically in a trough and in a burst. Measured on live
+// `d26f58b9` 2026-09-24, one boot, counters monotone throughout:
+// `size` 110 @17:0xZ → 8 @17:30Z → 8 → 3 → 24 @17:35Z. `REFUSAL_4XX_COOLDOWN_MS`
+// is 10 min and `putBounded` sweeps every expired entry on EVERY insert, so
+// `size`/`cooling`/`keys[]` name only what was refused in the preceding ≤10 min.
+// A one-shot read landing in a trough reports 3 keys on a box where 20.8% of the
+// live desk OTM book's symbol-evaluations died on a refusal re-throw that day
+// (`/api/health/rv-scan` → `censusByEtDay`, otm/desk/live, 2,888 of 13,900).
+// So the window census now ships a SINCE-BOOT twin: every key Tradier has
+// actually refused this process, with how many times it was re-armed — one read,
+// no sampling, and `refusals/distinctKeys` separates a transient refusal from a
+// name that is permanently dark. Cap is a disclosure, never a silent clamp:
+// `evicted > 0` ⇔ `distinctKeys` is a LOWER BOUND.
+const MAX_REFUSED_KEY_CENSUS_ENTRIES = 4096;
 
 function is429Error(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
@@ -284,6 +299,18 @@ export interface RelativeValueScannerDiagnostics {
    * entries whose cooldown has expired but which nothing has swept yet, so
    * `size >= cooling`. Keys are `expirations|SYM` / `chain|SYM,YYYY-MM-DD` —
    * symbols and dates only, no credentials.
+   *
+   * TRA-4865 — `size`/`cooling`/`keys` are a TEN-MINUTE WINDOW (see
+   * `MAX_REFUSED_KEY_CENSUS_ENTRIES`): they answer "what is being silenced right
+   * now", which swung 110 → 3 → 24 inside half an hour on live `d26f58b9`.
+   * `sinceBoot` is the session census — every key upstream has actually refused
+   * this process, so ONE read is a census and no sampling schedule is needed.
+   * `sinceBoot.refusals` counts upstream refusals only (suppressed re-throws are
+   * in `suppressed`), so `refusals / distinctKeys` is the mean re-arm count: 1
+   * is a transient refusal, a large number is a permanently dark key. Same
+   * population as the cooldown (non-429 4xx), so `distinctKeys >= cooling`
+   * always. `evicted > 0` ⇔ the census cap bit and `distinctKeys` is a LOWER
+   * BOUND — the one reading that must never be mistaken for a complete census.
    */
   refusalCooldown?: {
     size: number;
@@ -292,6 +319,14 @@ export interface RelativeValueScannerDiagnostics {
     byEndpoint?: { expirations: number; chain: number };
     keys?: string[];
     keysTruncated?: boolean;
+    sinceBoot?: {
+      distinctKeys: number;
+      byEndpoint: { expirations: number; chain: number };
+      refusals: number;
+      refusalsByKey: Record<string, number>;
+      keysTruncated: boolean;
+      evicted: number;
+    };
   };
 }
 
@@ -559,6 +594,12 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
   // Key shapes match the caches: `expirations|SYM` and `chain|SYM|EXPIRATION`.
   private readonly refusalCooldown = new Map<string, CacheEntry<TradierHttpRefusalError>>();
   private suppressedRefusals = 0;
+  // TRA-4865 — the since-boot twin of `refusalCooldown`: same key shapes, same
+  // population, but nothing ever expires out of it. Value = how many times this
+  // key was refused UPSTREAM (i.e. how many times the cooldown was re-armed on
+  // it), which is what separates a one-off refusal from a permanently dark name.
+  private readonly refusedKeysSinceBoot = new Map<string, number>();
+  private refusedKeyCensusEvicted = 0;
 
   constructor(config: RelativeValueScannerConfig) {
     this.fetchSpot = config.fetchSpot;
@@ -603,6 +644,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
         size: this.refusalCooldown.size,
         suppressed: this.suppressedRefusals,
         ...this.refusalCooldownCensus(),
+        sinceBoot: this.refusedKeySinceBootCensus(),
       },
     };
   }
@@ -635,6 +677,62 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       byEndpoint,
       keys: keys.slice(0, MAX_REFUSAL_COOLDOWN_KEYS_REPORTED),
       keysTruncated: keys.length > MAX_REFUSAL_COOLDOWN_KEYS_REPORTED,
+    };
+  }
+
+  /**
+   * TRA-4865 — record an UPSTREAM refusal against the since-boot census. Never
+   * called from the suppression path: a re-thrown cooling refusal is not a new
+   * refusal, and counting it here would turn "how permanently dark is this key"
+   * into "how often did anything ask for it".
+   *
+   * The cap evicts oldest-inserted and BOOKS the eviction, because a census that
+   * silently clamps is the window census all over again.
+   */
+  private noteRefusedKeySinceBoot(key: string): void {
+    const prior = this.refusedKeysSinceBoot.get(key);
+    this.refusedKeysSinceBoot.set(key, (prior ?? 0) + 1);
+    while (this.refusedKeysSinceBoot.size > MAX_REFUSED_KEY_CENSUS_ENTRIES) {
+      const oldest = this.refusedKeysSinceBoot.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.refusedKeysSinceBoot.delete(oldest);
+      this.refusedKeyCensusEvicted += 1;
+    }
+  }
+
+  /**
+   * TRA-4865 — the session census. Read-only, like `refusalCooldownCensus`, and
+   * deliberately NOT filtered by the cooldown clock: a key Tradier refused at
+   * 14:02Z is still a key Tradier refuses, and the whole defect this answers is
+   * that the ten-minute view forgets it by 14:13Z.
+   */
+  private refusedKeySinceBootCensus(): {
+    distinctKeys: number;
+    byEndpoint: { expirations: number; chain: number };
+    refusals: number;
+    refusalsByKey: Record<string, number>;
+    keysTruncated: boolean;
+    evicted: number;
+  } {
+    const byEndpoint = { expirations: 0, chain: 0 };
+    let refusals = 0;
+    for (const [key, count] of this.refusedKeysSinceBoot) {
+      if (key.startsWith('chain|')) byEndpoint.chain += 1;
+      else byEndpoint.expirations += 1;
+      refusals += count;
+    }
+    const sorted = [...this.refusedKeysSinceBoot.keys()].sort();
+    const refusalsByKey: Record<string, number> = {};
+    for (const key of sorted.slice(0, MAX_REFUSAL_COOLDOWN_KEYS_REPORTED)) {
+      refusalsByKey[key] = this.refusedKeysSinceBoot.get(key)!;
+    }
+    return {
+      distinctKeys: this.refusedKeysSinceBoot.size,
+      byEndpoint,
+      refusals,
+      refusalsByKey,
+      keysTruncated: sorted.length > MAX_REFUSAL_COOLDOWN_KEYS_REPORTED,
+      evicted: this.refusedKeyCensusEvicted,
     };
   }
 
@@ -1119,6 +1217,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
         REFUSAL_4XX_COOLDOWN_MS,
         MAX_REFUSAL_COOLDOWN_ENTRIES,
       );
+      this.noteRefusedKeySinceBoot(`${endpoint}|${detail}`);
     }
     throw err;
   }

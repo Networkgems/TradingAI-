@@ -653,6 +653,16 @@ describe('Tradier HTTP refusals are not listings (TRA-4664)', () => {
       byEndpoint: { expirations: 1, chain: 0 },
       keys: ['expirations|BAD!'],
       keysTruncated: false,
+      // TRA-4865 — the suppressed retries are NOT refusals: one upstream 400
+      // happened, so the session census reads one key refused once.
+      sinceBoot: {
+        distinctKeys: 1,
+        byEndpoint: { expirations: 1, chain: 0 },
+        refusals: 1,
+        refusalsByKey: { 'expirations|BAD!': 1 },
+        keysTruncated: false,
+        evicted: 0,
+      },
     });
 
     // The cooldown is per-key: other symbols are untouched.
@@ -728,6 +738,89 @@ describe('Tradier HTTP refusals are not listings (TRA-4664)', () => {
     // second pass's `size` grade would move underneath itself.
     expect(after.size).toBe(1);
     expect(svc.diagnostics().refusalCooldown!.size).toBe(1);
+  });
+
+  // TRA-4865. The third pass's census is a TEN-MINUTE WINDOW. On live `d26f58b9`
+  // (one boot, counters monotone) `size` read 110 at 17:0xZ and 8 / 8 / 3 / 24
+  // over the next four minutes, while that ET day's retained scan census had
+  // 2,888 of 13,900 live-desk OTM evaluations dying on a refusal re-throw. So a
+  // one-shot read of the window can report ~nothing on a box that is 20% dark.
+  // These two tests are the discriminator between the window and the session.
+  it('keys swept out of the WINDOW census stay in the SINCE-BOOT census — the live 110 → 3 collapse', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, advance } = makeService({ client });
+    const badExp = new Set(['NOEXP', 'LATER']);
+    client.fetchExpirations.mockImplementation(async (s) =>
+      badExp.has(s) ? { ok: false, httpStatus: 400 } : okExp);
+    client.fetchChainSnapshot.mockImplementation(async (s) =>
+      s === 'NOCHAIN' ? { ok: false, httpStatus: 400 } : okChain);
+
+    expect((await svc.scanOtm('NOEXP')).reason).toBe('fetch_error');
+    expect((await svc.scanOtm('NOCHAIN')).reason).toBe('fetch_error');
+    expect(svc.diagnostics().refusalCooldown!.size).toBe(2);
+
+    // Past the cooldown, then a THIRD refusal — whose `putBounded` insert sweeps
+    // every expired entry, so the window census loses the first two outright.
+    // This is the live collapse: `size` 110 @17:0xZ → 3 @17:33Z on one boot.
+    advance(REFUSAL_4XX_COOLDOWN_MS + 1);
+    expect((await svc.scanOtm('LATER')).reason).toBe('fetch_error');
+
+    const cd = svc.diagnostics().refusalCooldown!;
+    expect(cd.size).toBe(1);
+    expect(cd.cooling).toBe(1);
+    expect(cd.keys).toEqual(['expirations|LATER']);
+    expect(cd.byEndpoint).toEqual({ expirations: 1, chain: 0 });
+    // …and the session census still NAMES all three, split by endpoint — which
+    // is the fork this issue turns on (a refused SYMBOL vs a refused EXPIRATION).
+    expect(cd.sinceBoot).toEqual({
+      distinctKeys: 3,
+      byEndpoint: { expirations: 2, chain: 1 },
+      refusals: 3,
+      refusalsByKey: {
+        [`chain|NOCHAIN,${EXP}`]: 1,
+        'expirations|LATER': 1,
+        'expirations|NOEXP': 1,
+      },
+      keysTruncated: false,
+      evicted: 0,
+    });
+  });
+
+  it('the since-boot census counts RE-ARMS, so a permanently dark key is distinguishable from a one-off refusal', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, advance } = makeService({ client });
+    let badCalls = 0;
+    client.fetchExpirations.mockImplementation(async (s) => {
+      if (s !== 'BAD!') return okExp;
+      badCalls += 1;
+      // Refused the first three times it is actually asked, fine afterwards —
+      // a transient refusal, which must not read like a dark name.
+      return badCalls <= 3 ? { ok: false, httpStatus: 400 } : okExp;
+    });
+    client.fetchChainSnapshot.mockResolvedValue(okChain);
+
+    for (let i = 0; i < 3; i++) {
+      expect((await svc.scanOtm('BAD!')).reason).toBe('fetch_error');
+      // Suppressed retries inside the window add to `suppressed`, never here.
+      advance(20_000);
+      expect((await svc.scanOtm('BAD!')).reason).toBe('fetch_error');
+      advance(REFUSAL_4XX_COOLDOWN_MS + 1);
+    }
+    expect(badCalls).toBe(3);
+    const cd = svc.diagnostics().refusalCooldown!;
+    expect(cd.suppressed).toBe(3);
+    expect(cd.sinceBoot!.distinctKeys).toBe(1);
+    expect(cd.sinceBoot!.refusals).toBe(3);
+    expect(cd.sinceBoot!.refusalsByKey).toEqual({ 'expirations|BAD!': 3 });
+
+    // The key recovers upstream. The census is a HISTORY, so it keeps naming it
+    // — and `cooling: 0` beside `distinctKeys: 1` is what says "was dark, is
+    // not now", a reading neither census can give on its own.
+    expect((await svc.scanOtm('BAD!')).reason).toBe('ok');
+    const rec = svc.diagnostics().refusalCooldown!;
+    expect(rec.cooling).toBe(0);
+    expect(rec.sinceBoot!.refusals).toBe(3);
+    expect(rec.sinceBoot!.evicted).toBe(0);
   });
 
   it('a genuine 200 empty listing is still no_expirations (the domain outcome is preserved)', async () => {
