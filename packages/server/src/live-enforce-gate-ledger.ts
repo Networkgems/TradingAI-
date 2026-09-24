@@ -3161,3 +3161,182 @@ export function summarizeLiveEnforceGate(
     lastDecisionAt,
   };
 }
+
+// ── TRA-4879 — counter PROVENANCE ────────────────────────────────────────────
+
+/**
+ * What the counters beside this block actually span.
+ *
+ * - `durable_proven`   — pre-boot rows are demonstrably IN these numbers.
+ * - `since_boot_proven`— nothing could have been loaded: there is no durable
+ *                        store at all (`durability.dataDir === null`), so the
+ *                        fold genuinely starts at this process's boot.
+ * - `unproven`         — a durable store is configured but this read carries no
+ *                        evidence either way (a genuine first boot looks exactly
+ *                        like this). ⛔ NOT a synonym for since-boot.
+ */
+export type LiveEnforceCounterProvenanceVerdict =
+  | 'durable_proven'
+  | 'since_boot_proven'
+  | 'unproven';
+
+export interface LiveEnforceCounterProvenance {
+  issue: 'TRA-4879';
+  /** Which fold on the payload this block describes. */
+  scope: 'top_level' | 'retained';
+  /** Per FIELD, because the two counters on the top-level block have DIFFERENT spans. */
+  covers: { decisionsRecorded?: string; byGate: string };
+  /** The STORE is configured durable: DATA_DIR resolved and not ephemeral. */
+  countersDurable: boolean;
+  /** MEASURED — this process hydrated pre-boot records INTO these counters at boot. */
+  countersLoadedAtBoot: boolean;
+  hydratedRecords: number;
+  hydratedDays: number;
+  /**
+   * ET-day-precision floor of the fold: the earliest retained day holding a
+   * record. `null` = nothing retained. It is a FLOOR, not an origin — the
+   * 30-day retention prune drops older days, so this is never "all time".
+   */
+  countersSinceEtDay: string | null;
+  /** Days WITH records (not calendar days spanned). */
+  retainedEtDays: number;
+  retentionDays: number;
+  processStartedAt: string | null;
+  lastDecisionAt: string | null;
+  /**
+   * The TRA-4879 in-band test, THREE-state. `true` proves durable. `false` is
+   * **UNINFORMATIVE** — it is NOT evidence of a since-boot counter. `null` =
+   * one of the two terms was unreadable.
+   */
+  lastDecisionPredatesBoot: boolean | null;
+  verdict: LiveEnforceCounterProvenanceVerdict;
+  provenBy:
+    | 'hydrated_records'
+    | 'last_decision_predates_boot'
+    | 'no_durable_store'
+    | null;
+  note: string;
+}
+
+/**
+ * TRA-4879 — publish what `decisionsRecorded` / `byGate` COVER, in band.
+ *
+ * These counters are DURABLE: `hydrateLiveEnforceGateFromDisk` replays the
+ * on-disk log through the same `apply()` the live path uses, so `decisionsTotal`
+ * and every `byDay` tally arrive at boot already holding records written by
+ * PREVIOUS builds. Nothing on the payload said so, and three independent readers
+ * concluded "since-boot" from the absence — once from a single coincidence (a
+ * zero on a 60-second-old box), and once one fire away from installing a
+ * permanent carve-out that discounted the current ET day on a live-money
+ * compliance arm.
+ *
+ * ⛔ The discriminators are ORDERED BY STRENGTH and the negative branches are
+ * deliberately NOT symmetric:
+ *
+ *  1. `hydratedRecords > 0` — the direct measurement. N pre-boot rows went into
+ *     these counters; no inference required. `=== 0` says nothing: a genuine
+ *     first boot on a durable store reads the same.
+ *  2. `lastDecisionAt < processStartedAt` — the pre-registered in-band test. A
+ *     process cannot know about a decision made before it existed. Its negative
+ *     branch is **uninformative**: a durable counter that was also written to
+ *     since boot has `lastDecisionAt >= startedAt` too. A test answering
+ *     "since-boot" there would reinstall the very bug this block removes.
+ *  3. `dataDir === null` — the ONLY proof of the since-boot direction. No
+ *     hydrate ran, so there is nothing pre-boot to have loaded.
+ *
+ * `countersDurable` describes the STORE (will the next restart keep these?);
+ * `verdict` describes THESE NUMBERS (do they already contain pre-boot rows?).
+ * They can disagree — an ephemeral DATA_DIR that happened to survive a process
+ * restart hydrates real history it will lose on the next redeploy — and that
+ * disagreement is information, not a contradiction.
+ */
+export function describeLiveEnforceCounterProvenance(
+  summary: LiveEnforceSummary,
+  opts: {
+    scope: 'top_level' | 'retained';
+    /** The requested ET day — only meaningful on the `top_level` scope. */
+    etDay?: string;
+    /** `build.startedAt` (ISO). `null`/unparseable ⇒ the in-band test reads `null`. */
+    processStartedAt?: string | null;
+  },
+): LiveEnforceCounterProvenance {
+  const { durability, retained } = summary;
+  const processStartedAt = opts.processStartedAt ?? null;
+  const processStartMs = processStartedAt === null ? NaN : Date.parse(processStartedAt);
+  const countersDurable = durability.dataDir !== null && !durability.ephemeral;
+  const countersLoadedAtBoot = durability.hydratedRecords > 0;
+  const lastDecisionPredatesBoot =
+    typeof summary.lastDecisionAt === 'number' && Number.isFinite(processStartMs)
+      ? summary.lastDecisionAt < processStartMs
+      : null;
+
+  let verdict: LiveEnforceCounterProvenanceVerdict;
+  let provenBy: LiveEnforceCounterProvenance['provenBy'];
+  if (countersLoadedAtBoot) {
+    verdict = 'durable_proven';
+    provenBy = 'hydrated_records';
+  } else if (lastDecisionPredatesBoot === true) {
+    verdict = 'durable_proven';
+    provenBy = 'last_decision_predates_boot';
+  } else if (durability.dataDir === null) {
+    verdict = 'since_boot_proven';
+    provenBy = 'no_durable_store';
+  } else {
+    verdict = 'unproven';
+    provenBy = null;
+  }
+
+  const etDays = retained.etDays;
+  const firstDay = etDays[0] ?? null;
+  const lastDay = etDays.length > 0 ? etDays[etDays.length - 1]! : null;
+  const retainedSpan =
+    firstDay === null
+      ? `no ET day holds a record yet (${retained.retentionDays}-day retention)`
+      : `ET days ${firstDay}..${lastDay} — ${etDays.length} day(s) WITH records inside a ${retained.retentionDays}-day retention window`;
+
+  const covers: LiveEnforceCounterProvenance['covers'] =
+    opts.scope === 'top_level'
+      ? {
+        decisionsRecorded:
+          `ALL retained ET days (${retainedSpan}) — NOT this ET day, and NOT since boot`,
+        byGate: `ET day ${opts.etDay ?? '(requested day)'} ONLY`,
+      }
+      : { byGate: retainedSpan };
+
+  const verdictClause =
+    verdict === 'durable_proven'
+      ? provenBy === 'hydrated_records'
+        ? `DURABLE, PROVEN IN BAND: this process hydrated ${durability.hydratedRecords} record(s) across ${durability.hydratedDays} ET day(s) from ${durability.dataDir} at boot, so pre-boot decisions are already inside every count here.`
+        : `DURABLE, PROVEN IN BAND: lastDecisionAt (${new Date(summary.lastDecisionAt!).toISOString()}) PREDATES this process's own start (${processStartedAt}) — a process cannot know about a decision made before it existed.`
+      : verdict === 'since_boot_proven'
+        ? 'SINCE BOOT, PROVEN: durability.dataDir is null, so no hydrate ran and there is nothing pre-boot to have loaded. These counts start at this process\'s boot and die with it.'
+        : `UNPROVEN — a durable store is configured (${durability.dataDir}) but this process hydrated 0 records and lastDecisionAt does not predate boot. That is exactly what a genuine FIRST boot on a durable store looks like. ⛔ UNPROVEN IS NOT "since-boot": do not read it as one.`;
+
+  return {
+    issue: 'TRA-4879',
+    scope: opts.scope,
+    covers,
+    countersDurable,
+    countersLoadedAtBoot,
+    hydratedRecords: durability.hydratedRecords,
+    hydratedDays: durability.hydratedDays,
+    countersSinceEtDay: firstDay,
+    retainedEtDays: etDays.length,
+    retentionDays: retained.retentionDays,
+    processStartedAt,
+    lastDecisionAt:
+      typeof summary.lastDecisionAt === 'number'
+        ? new Date(summary.lastDecisionAt).toISOString()
+        : null,
+    lastDecisionPredatesBoot,
+    verdict,
+    provenBy,
+    note:
+      `${verdictClause} `
+      + 'READ `verdict`, never the absence of a label — that absence is the TRA-4879 defect: it was read as "since-boot" three times in 50 days, and once nearly became a permanent carve-out discounting the current ET day on a live-money compliance arm (TRA-2879 finding F1, withdrawn). '
+      + '⛔ `lastDecisionPredatesBoot:false` is UNINFORMATIVE, NOT evidence of a since-boot counter: a durable counter written to since boot reads `false` too. Only `verdict:"since_boot_proven"` says since-boot. '
+      + '`countersDurable` describes the STORE (does the NEXT restart keep these?) and `verdict` describes THESE NUMBERS (do they ALREADY contain pre-boot rows?); they can legitimately disagree. '
+      + '`countersSinceEtDay` is a FLOOR at ET-day precision, not an origin — the retention prune drops older days, so this fold is never all-time. '
+      + 'Byte-identical totals across a restart AND a commit change are the expected reading of a durable counter, not a stuck one.',
+  };
+}
