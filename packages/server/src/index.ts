@@ -10981,11 +10981,22 @@ app.get('/api/health/news-catalyst-signals', async (_req, res) => {
       // TRA-4777 — the eviction discriminator. The `session` reported above is
       // carried by a last-match backstop that reads correct even if the
       // eviction regressed, so it grades the backstop and not the eviction.
-      // These fields do grade the eviction: on a process that has crossed an ET
-      // midnight, expect exactly ONE key per window that has run. More than
-      // that means `retireStaleWindowKeys` is dead and the backstop is silently
-      // carrying the probe. A day-1 process cannot tell the two apart — read
-      // the boot time first and say which boot the read belongs to.
+      // These fields grade the eviction, and the asymmetry matters:
+      //
+      //   FALSIFIABLE from any read — two resident keys sharing one window mean
+      //   `retireStaleWindowKeys` is dead and the backstop is carrying the probe.
+      //
+      //   NOT VERIFIABLE from just any read — if every key in
+      //   `sweepGateResidentSessions` carries the SAME session, this process has
+      //   only swept on one ET day, and a dead eviction would have produced the
+      //   identical key set. That read is vacuous, not passing.
+      //
+      // "Uptime crossed an ET midnight" is NOT the precondition, and assuming it
+      // is reproduces exactly the pass/fail-look-alike this field exists to kill:
+      // boot d26f58b9 @2026-09-24T02:21:01Z came up 22:21 ET, i.e. after 09-23's
+      // sweeps, so it held only 09-24 keys all day despite 16h uptime across a
+      // midnight. The precondition is TWO SWEPT SESSIONS in one process — alive
+      // before session D's sweep and still alive at session D+1's.
       ...(() => {
         const keys = catalystSweepResidentKeys();
         return { sweepGateResidentKeys: keys.length, sweepGateResidentSessions: keys.slice(0, 8) };
