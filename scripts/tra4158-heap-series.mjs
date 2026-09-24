@@ -57,6 +57,12 @@ const REPO = resolve(HERE, '..');
 const DEFAULT_TAPE = resolve(REPO, 'reports/tra4158-heap-series.jsonl');
 const DEFAULT_BASE = 'https://tradingai-bqb1.onrender.com';
 const MB = 1024 * 1024;
+// Mirrors HIGH_LAG_RING_MAX in packages/server/src/event-loop-watchdog.ts. Kept
+// as a literal because this script reads a DEPLOYED box that may be older than
+// the checkout: the tape records whether the ring was saturated at the read, so
+// a drift between the two shows up as a wrong saturation flag rather than a
+// silently wrong count.
+const HIGH_LAG_RING_MAX = 32;
 
 function arg(name, fallback) {
   const hit = process.argv.find(a => a.startsWith(`--${name}=`));
@@ -78,6 +84,83 @@ async function fetchJson(url) {
  * the build separately is how a row ends up attributing one boot's heap to
  * another boot's pid.
  */
+/**
+ * Fold the two PERISHABLE per-boot rings — `watchdog.recentHighLag` (>=1000ms
+ * loop-block windows) and `watchdog.gc.recent` (>=recordMs GC pauses) — into
+ * durable tape columns, plus the coincidence count between them.
+ *
+ * Why this exists (TRA-4158, 2026-09-24): the claim "21 high-lag events
+ * 1010-1544ms, NOT ONE coincident with a GC" was read live off a boot that then
+ * died. Four of that read's six numbers survived because they were already tape
+ * columns; the other two did not exist anywhere and became unverifiable the
+ * moment the process exited. Persisting the census ring was not enough — a beat
+ * that pins ONE perishable surface and cites a SECOND one from the same read has
+ * pinned nothing about the second.
+ *
+ * The coincidence window is deliberately WIDE: a high-lag entry's `atMs` stamps
+ * the END of its sample window, and the block itself can only have occurred
+ * inside `[atMs - sampleMs - lagMaxMs, atMs]`. Widening can only ever turn a
+ * non-coincidence into a coincidence, so a zero here is CONSERVATIVE — which is
+ * the direction a refutation needs. A narrow window would manufacture the
+ * negative this ticket wants to be true.
+ *
+ * Absent vs empty is preserved throughout: a build with no ring reports `null`
+ * (meter absent), a live boot with a quiet loop reports `0` (meter present, no
+ * events). Pooling those two is the §x133 error — a null meter and a small
+ * meter are different verdicts.
+ */
+function summarizeBlockVsGc(w) {
+  const highLag = Array.isArray(w?.recentHighLag) ? w.recentHighLag : null;
+  const gcRecent = Array.isArray(w?.gc?.recent) ? w.gc.recent : null;
+  const sampleMs = typeof w?.config?.sampleMs === 'number' ? w.config.sampleMs : 1000;
+
+  if (!highLag) {
+    return {
+      highLagCount: null,
+      highLagMaxMs: null,
+      highLagMinMs: null,
+      highLagRingSaturated: null,
+      gcRecentCount: gcRecent ? gcRecent.length : null,
+      highLagGcCoincident: null,
+      highLag: null,
+      gcRecent: gcRecent ? gcRecent.slice() : null,
+    };
+  }
+
+  const lags = highLag.map(e => e.lagMaxMs).filter(n => typeof n === 'number');
+  let coincident = null;
+  if (gcRecent) {
+    coincident = 0;
+    for (const e of highLag) {
+      if (typeof e.atMs !== 'number') continue;
+      const lag = typeof e.lagMaxMs === 'number' ? e.lagMaxMs : 0;
+      const from = e.atMs - sampleMs - lag;
+      const hit = gcRecent.some(g => {
+        if (typeof g?.atMs !== 'number') return false;
+        const dur = typeof g.durationMs === 'number' ? g.durationMs : 0;
+        // GC interval [g.atMs - dur, g.atMs] intersects the block window.
+        return g.atMs >= from && g.atMs - dur <= e.atMs;
+      });
+      if (hit) coincident += 1;
+    }
+  }
+
+  return {
+    highLagCount: highLag.length,
+    highLagMaxMs: lags.length ? Math.max(...lags) : null,
+    highLagMinMs: lags.length ? Math.min(...lags) : null,
+    // The ring is capped at 32 (HIGH_LAG_RING_MAX). At the cap the count is a
+    // LOWER BOUND, not a census — the same shape as `samples 64 / coverage
+    // truncated` on the lag ledger. A grade that reads a saturated ring as a
+    // total under-reports every busy boot.
+    highLagRingSaturated: highLag.length >= HIGH_LAG_RING_MAX,
+    gcRecentCount: gcRecent ? gcRecent.length : null,
+    highLagGcCoincident: coincident,
+    highLag: highLag.slice(),
+    gcRecent: gcRecent ? gcRecent.slice() : null,
+  };
+}
+
 async function readOnce(base) {
   const wd = await fetchJson(`${base}/api/health/watchdog`);
   const w = wd?.watchdog;
@@ -94,6 +177,18 @@ async function readOnce(base) {
     uptimeSec: wd.build?.uptimeSec ?? null,
     heapUsedMB: round1(s.heapUsedBytes / MB),
     heapLimitMB: round1((s.heapLimitBytes ?? 0) / MB),
+    // RAW BYTES, and the limit in BOTH conventions, because the box publishes
+    // two. `lastSample` is divided here by 1024^2 (MiB); `lastTrip` and
+    // `priorLiveness` display the SAME heapLimitBytes divided by 1000^2, so one
+    // box reports its cap as both "1728" and "1812". Any percentage that takes
+    // its numerator from one convention and its denominator from the other is
+    // wrong by 4.6% relative — which is exactly how the 2026-09-24 peak was
+    // published as 59.6% when it was 62.5%. MiB is the unit that matters for
+    // AC3: the live limit equals `--max-old-space-size` + 3 * `--max-semi-space-size`
+    // (1536 + 3*64 = 1728) EXACTLY, so only the MiB reading maps to the knob.
+    heapUsedBytes: s.heapUsedBytes ?? null,
+    heapLimitBytes: s.heapLimitBytes ?? null,
+    heapLimitMBDecimal: s.heapLimitBytes ? round1(s.heapLimitBytes / 1_000_000) : null,
     heapPct: typeof s.heapPct === 'number' ? Math.round(s.heapPct * 1000) / 1000 : null,
     rssMB: round1((s.rssBytes ?? 0) / MB),
     externalMB: round1((s.externalBytes ?? 0) / MB),
@@ -107,6 +202,13 @@ async function readOnce(base) {
     gcMajorMaxMs: w.gc?.byKind?.major?.maxMs ?? null,
     gcMaxPauseMs: w.gc?.maxPause?.durationMs ?? null,
     gcMaxPauseHeapMB: w.gc?.maxPause?.heapUsedMB ?? null,
+    // All-kinds totals. The major-only columns above cannot reconstruct a
+    // "largest pause of ANY kind" claim, which is the form the GC refutation is
+    // actually stated in — on 2026-09-24 that cost us the whole-boot 66,472-GC
+    // figure when the boot died (see summarizeBlockVsGc).
+    gcCountAll: w.gc?.count ?? null,
+    gcTotalMs: w.gc?.totalMs ?? null,
+    ...summarizeBlockVsGc(w),
     // Present only once the TRA-4158 census is deployed; null before that, and
     // the difference is visible in the tape rather than silently absent.
     censusTopName: null,
@@ -644,6 +746,109 @@ function selftest() {
     'live-boot-2026-09-01',
     !live.eligible && near(live.rthHours, 1.917, 0.01),
     `the 18:04:59Z boot carries ${live.rthHours.toFixed(2)} RTH-h by the close — NOT gradeable`,
+  );
+
+  // --- summarizeBlockVsGc: the block-vs-GC coincidence fold (2026-09-24) ---
+  // These exist because the 09-24 GC refutation was stated in numbers that lived
+  // only in a dead process. The fold is pure, so it is gradeable here.
+  const W = (highLag, gcRecent, sampleMs = 1000) => ({
+    config: { sampleMs },
+    recentHighLag: highLag,
+    gc: gcRecent === undefined ? undefined : { recent: gcRecent },
+  });
+
+  // A build with no ring at all must report null, NOT zero. "The meter is
+  // absent" and "the meter is present and saw nothing" are opposite verdicts
+  // and a 0 in both places pools them.
+  const absent = summarizeBlockVsGc({ config: { sampleMs: 1000 } });
+  check(
+    'ring-absent-is-null',
+    absent.highLagCount === null && absent.highLagGcCoincident === null,
+    'no recentHighLag on the build -> null, never 0 (a null meter != a small meter)',
+  );
+
+  const quiet = summarizeBlockVsGc(W([], []));
+  check(
+    'ring-empty-is-zero',
+    quiet.highLagCount === 0 && quiet.highLagGcCoincident === 0 && quiet.highLagRingSaturated === false,
+    'present-but-empty ring -> 0 blocks, 0 coincident (a real, citable negative)',
+  );
+
+  // The 09-24 claim's shape: blocks >1s, largest GC pause an order of magnitude
+  // smaller and nowhere near them in time.
+  const refutation = summarizeBlockVsGc(
+    W(
+      [
+        { lagMaxMs: 1010, lagMeanMs: 300, atMs: 1_000_000 },
+        { lagMaxMs: 1543.5, lagMeanMs: 800, atMs: 2_000_000 },
+      ],
+      [{ atMs: 1_500_000, durationMs: 113.98, kind: 'major', heapUsedMB: 617 }],
+    ),
+  );
+  check(
+    'blocks-not-gc-coincident',
+    refutation.highLagCount === 2 &&
+      refutation.highLagGcCoincident === 0 &&
+      near(refutation.highLagMaxMs, 1543.5, 0.01),
+    `2 blocks, max ${refutation.highLagMaxMs}ms, ${refutation.highLagGcCoincident} GC-coincident — the refutation, now durable`,
+  );
+
+  // Positive control: the SAME fold must find a GC that really does sit inside
+  // the block window, or the zero above proves nothing about the instrument.
+  const hit = summarizeBlockVsGc(
+    W([{ lagMaxMs: 1200, lagMeanMs: 400, atMs: 5_000_000 }], [{ atMs: 4_999_500, durationMs: 900 }]),
+  );
+  check(
+    'gc-inside-window-detected',
+    hit.highLagGcCoincident === 1,
+    'a GC pause landing inside the block window IS counted — the zero above is not a broken detector',
+  );
+
+  // The window is [atMs - sampleMs - lagMaxMs, atMs]. A GC just OUTSIDE its far
+  // edge must not count, or every boot reads as GC-attributed.
+  const justOutside = summarizeBlockVsGc(
+    W([{ lagMaxMs: 1000, lagMeanMs: 400, atMs: 5_000_000 }], [{ atMs: 5_000_000 - 1000 - 1000 - 1, durationMs: 0 }]),
+  );
+  check(
+    'gc-outside-window-refused',
+    justOutside.highLagGcCoincident === 0,
+    'a GC 1ms before the widened window edge does not count (the window is wide, not unbounded)',
+  );
+
+  // A saturated ring is a LOWER BOUND. Reading 32 as a total under-reports every
+  // busy boot — the `coverage: truncated` lesson from the lag ledger.
+  const saturated = summarizeBlockVsGc(
+    W(
+      Array.from({ length: HIGH_LAG_RING_MAX }, (_, i) => ({ lagMaxMs: 1100 + i, lagMeanMs: 500, atMs: 1_000 + i })),
+      [],
+    ),
+  );
+  check(
+    'saturated-ring-flagged',
+    saturated.highLagRingSaturated === true && saturated.highLagCount === HIGH_LAG_RING_MAX,
+    `${HIGH_LAG_RING_MAX} entries -> count is a LOWER BOUND, flagged so a grade cannot read it as a census`,
+  );
+
+  // --- heap-cap unit reconciliation (TRA-4158 AC3, 2026-09-24) ---
+  // The live box reports heapLimitBytes 1811939328. That is 1728 MiB and 1812
+  // decimal MB; the watchdog publishes BOTH, on different keys. AC3 has to
+  // re-derive --max-old-space-size against a measured peak, so it must be
+  // stated in the unit V8 actually accepts.
+  const LIVE_LIMIT_BYTES = 1_811_939_328;
+  check(
+    'heap-cap-is-MiB-of-the-knob',
+    Math.round(LIVE_LIMIT_BYTES / MB) === 1536 + 3 * 64,
+    `${Math.round(LIVE_LIMIT_BYTES / MB)} MiB == --max-old-space-size 1536 + 3 * --max-semi-space-size 64 — the knob speaks MiB`,
+  );
+  check(
+    'heap-cap-decimal-is-1812',
+    Math.round(LIVE_LIMIT_BYTES / 1_000_000) === 1812,
+    'the same bytes read as 1812 on lastTrip/priorLiveness — one cap, two published numbers',
+  );
+  check(
+    'unit-mix-is-material',
+    Math.abs(1080.3 / 1728 - 1080.3 / 1812) > 0.02,
+    `mixing them moves a percentage-of-cap by ${(((1080.3 / 1728 - 1080.3 / 1812) * 100)).toFixed(1)}pp (62.5% vs the 59.6% published on 09-24)`,
   );
 
   const failed = results.filter(r => !r.ok);
