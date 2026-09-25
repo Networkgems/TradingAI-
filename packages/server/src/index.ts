@@ -205,7 +205,10 @@ import { runZombieOpenSweep } from './zombie-open-journal-sweep.js';
 import { EXPIRED_DEMO_ORPHAN_DTE_BOUND_REASON, runExpiredDemoOrphanSweep } from './expired-demo-orphan-sweep.js'; // TRA-4711, TRA-4721
 // TRA-2214 — the EOD journal blocks fold HERE, not inline, so this module holds
 // no bare fold that could be fed a differently-sourced (pooled) row list.
-import { foldModelFacingEodJournal } from './model-facing-journal.js';
+import {
+  foldModelFacingEodJournal,
+  foldModelFacingStrategyDegradation,
+} from './model-facing-journal.js';
 // TRA-1046 (TRA-1041c L2) — synchronous on-demand hypothesis backtest behind
 // POST /api/backtest, reusing the audited apply→backtest→G0-grade pipeline.
 // TRA-1000 — external-intel source-quality scorer: per-source advisory weights
@@ -751,6 +754,9 @@ import {
   readLatestOptionsEvaluationReport,
   recordOptionsEvaluationReport,
 } from './options-evaluation-report-store.js';
+// TRA-4913 — the per-strategy degradation monitor (Phase 0 of TRA-4481, ratified
+// TRA-4911). ADVISORY ONLY: a flag and a recommendation, never an action.
+import { DECLARED_STRATEGY_ENVELOPES } from './strategy-degradation-monitor.js';
 import {
   loadUserMemoryStore,
   getUserMemory,
@@ -1980,6 +1986,8 @@ async function generateAndSaveReport(
       finalSnapshot.optionJournal = fold.optionJournal;
       finalSnapshot.optionLearnedWeights = fold.optionLearnedWeights;
       finalSnapshot.introspection = fold.introspection;
+      // TRA-4913 — advisory degradation section. Same rows, same basis.
+      finalSnapshot.strategyDegradation = fold.strategyDegradation;
       finalSnapshot.journalBasis = fold.journalBasis;
       finalSnapshot.journalBasisCounts = fold.journalBasisCounts;
     } catch (err) {
@@ -11509,6 +11517,65 @@ app.get('/api/health/options-evaluation', async (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read options evaluation report' });
+  }
+});
+
+// TRA-4913 — the per-strategy DEGRADATION MONITOR (Phase 0 item 2 of TRA-4481,
+// ratified on TRA-4911). Rolling PF / expectancy per `structure::entryArchetype`
+// cohort, graded against that cohort's OWN recorded envelope.
+//
+// ⚠ ADVISORY ONLY. Nothing downstream of this route halts, throttles, resizes or
+// disables anything. Hard halts remain with `options-risk-breaker`, the
+// `DailyRiskGovernor` and the churn brakes; `shadow-expectancy-guard` still owns
+// promotion. `sizeDown.recommendedSizeFactor` has no reader in the tree.
+//
+// The fold is computed LIVE off the journal rather than read from an artifact,
+// because it is pure and cheap and an artifact would introduce a staleness state
+// this route would then have to report. `lastRunStatus` is therefore the outcome
+// of THIS attempt (CLAUDE.md health-field rule: report what the dependency
+// actually did, never the configuration). A throw reads `read_failed`, never an
+// empty report — "could not check" and "checked and it is fine" must not share a
+// value, which is the same invariant every cell in the payload carries.
+app.get('/api/health/strategy-degradation', async (req, res) => {
+  const parsePositiveInt = (raw: unknown): number | undefined => {
+    if (typeof raw !== 'string') return undefined;
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  };
+  try {
+    const window = parsePositiveInt(req.query.window);
+    const minWindow = parsePositiveInt(req.query.minWindow);
+    // TRA-2214 basis — the MODEL-FACING rows (desk + unattributed, QA fixture
+    // books dropped), not the raw journal. This surface grades COHORTS, so a
+    // fixture book that leaked in would arrive as a cohort with its own verdict.
+    const { report, journalBasis, journalBasisCounts } = await foldModelFacingStrategyDegradation({
+      ...(window !== undefined ? { recentWindow: window } : {}),
+      ...(minWindow !== undefined ? { minWindowTrades: minWindow } : {}),
+    });
+    res.json({
+      issue: 'TRA-4913',
+      advisoryOnly: true,
+      // OUTCOME of this attempt. Never a config fact.
+      lastRunStatus: 'computed',
+      // CONFIG fact, named as one: how many envelopes were DECLARED (as opposed
+      // to derived from a cohort's own trailing baseline, which is not a
+      // validation). Zero is the honest reading today, not a failure.
+      declaredEnvelopesConfigured: DECLARED_STRATEGY_ENVELOPES.length,
+      // The basis rides the wire beside the numbers it moved.
+      journalBasis,
+      journalBasisCounts,
+      report,
+    });
+  } catch (err) {
+    log.error('strategy-degradation health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({
+      issue: 'TRA-4913',
+      lastRunStatus: 'read_failed',
+      error: 'Failed to compute strategy degradation report',
+      report: null,
+    });
   }
 });
 

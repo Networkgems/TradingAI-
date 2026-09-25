@@ -40,6 +40,11 @@ import {
   optionJournalToStrategyRows,
   type IntrospectionReadout,
 } from './strategy-introspection.js';
+import {
+  buildStrategyDegradationReport,
+  type DegradationMonitorOptions,
+  type StrategyDegradationReport,
+} from './strategy-degradation-monitor.js';
 import { excludeTestAccountRows } from './test-accounts.js';
 
 /**
@@ -187,11 +192,22 @@ export async function loadModelFacingJournalRows(
   return (await loadModelFacingJournal(opts)).rows;
 }
 
-/** The three EOD journal blocks, folded on one basis, with that basis attached. */
+/** The EOD journal blocks, folded on one basis, with that basis attached. */
 export interface ModelFacingEodFold {
   optionJournal: OptionTradeJournalSummary;
   optionLearnedWeights: OptionLearnedWeights;
   introspection: IntrospectionReadout;
+  /**
+   * TRA-4913 — the per-strategy degradation readout. ADVISORY ONLY; it is folded
+   * here, off the SAME model-facing rows as its three siblings, for the reason
+   * this whole function exists: a block sourced from a different row list would
+   * still be published under this fold's one `journalBasis` label.
+   *
+   * The basis matters to this block specifically. It grades cohorts, and a QA
+   * FIXTURE book that leaked in would appear as a cohort with its own verdict —
+   * the TRA-2214 defect wearing a new label.
+   */
+  strategyDegradation: StrategyDegradationReport;
   journalBasis: ModelFacingJournalBasis;
   journalBasisCounts: JournalBasisCounts;
 }
@@ -218,6 +234,38 @@ export async function foldModelFacingEodJournal(): Promise<ModelFacingEodFold> {
     // TRA-995 — the self-awareness readout off the SAME rows: per-strategy
     // attribution + the edge-decay flag the autopilot throttles on.
     introspection: computeStrategyIntrospection(optionJournalToStrategyRows(rows)),
+    // TRA-4913 — rolling PF / expectancy per cohort against that cohort's own
+    // recorded envelope. Advisory; nothing consumes the recommendation.
+    strategyDegradation: buildStrategyDegradationReport(rows, {
+      asOfIso: new Date().toISOString(),
+    }),
+    journalBasis: basis,
+    journalBasisCounts: counts,
+  };
+}
+
+/**
+ * TRA-4913 — the degradation readout alone, on the model-facing basis, for the
+ * health route.
+ *
+ * It lives HERE rather than at the `index.ts` call site for the same reason
+ * {@link foldModelFacingEodJournal} does: `index.ts` must not hold a bare fold
+ * over a raw journal read. The basis rides back with the report so the route can
+ * publish it beside the numbers instead of leaving a reader to assume it.
+ */
+export async function foldModelFacingStrategyDegradation(
+  options: DegradationMonitorOptions = {},
+): Promise<{
+  report: StrategyDegradationReport;
+  journalBasis: ModelFacingJournalBasis;
+  journalBasisCounts: JournalBasisCounts;
+}> {
+  const { rows, basis, counts } = await loadModelFacingJournal();
+  return {
+    report: buildStrategyDegradationReport(rows, {
+      asOfIso: new Date().toISOString(),
+      ...options,
+    }),
     journalBasis: basis,
     journalBasisCounts: counts,
   };

@@ -92,6 +92,11 @@ const BARE_FOLDS = [
   'computeStrategyIntrospection',
   'optionJournalToStrategyRows',
   'summarizeOptionTradeJournal',
+  // TRA-4913 — the degradation monitor grades COHORTS, so a QA fixture book that
+  // leaked into its row list would arrive as a cohort carrying its own verdict.
+  // It is folded in `model-facing-journal.ts` beside its three siblings; a bare
+  // call here would be the TRA-2214 defect under a new name.
+  'buildStrategyDegradationReport',
 ] as const;
 
 const SRC_ROOT = dirname(fileURLToPath(import.meta.url));

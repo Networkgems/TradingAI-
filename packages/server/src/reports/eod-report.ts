@@ -49,6 +49,12 @@ import type { OptionTradeJournalSummary } from '../option-trade-journal.js';
 import type { OptionLearnedWeights } from '../learned-option-weights.js';
 import type { SourceQualityWeights } from '../source-quality-scorer.js';
 import type { IntrospectionReadout } from '../strategy-introspection.js';
+// TRA-4913 — the per-strategy degradation monitor. ADVISORY ONLY; the renderer
+// emits a flag and a recommendation and the EOD never acts on either.
+import {
+  renderStrategyDegradationMarkdown,
+  type StrategyDegradationReport,
+} from '../strategy-degradation-monitor.js';
 import type { AutopilotAction } from '../risk-autopilot.js';
 import type { AutonomousDemoLoopReport } from '../autonomous-demo-loop.js';
 import type { AnalystPlan, AnalystReview } from '../analyst-agent.js';
@@ -850,6 +856,21 @@ ${actionRows || '_No autopilot actions today — risk at full size._'}`;
 }
 
 /**
+ * TRA-4913 — render the per-strategy degradation monitor's section, with the
+ * leading separator, or '' when there is no report or the report saw no cohorts.
+ *
+ * Note that an EMPTY section and a section reading all-`INSUFFICIENT` are
+ * different things and the renderer keeps them different: the monitor prints its
+ * verdict census whenever it has any cohort at all, precisely so a run where
+ * nothing could be judged does not render as a clean day.
+ */
+function buildStrategyDegradationSection(report: StrategyDegradationReport | undefined): string {
+  if (!report) return '';
+  const md = renderStrategyDegradationMarkdown(report);
+  return md === '' ? '' : `\n\n${md}`;
+}
+
+/**
  * TRA-1006 — render the analyst agent's pre-market plan (top ranked watchlist
  * symbols) + post-market reflection (closed-trade rollup + the hypotheses queued).
  * Returns '' when neither artifact is present (a firm not running the analyst adds
@@ -1025,6 +1046,7 @@ function buildMarkdown(
   analystReview?: AnalystReview,
   hypothesisQueue?: HypothesisQueueHealth,
   executionQuality?: ExecutionQualityKpi,
+  strategyDegradation?: StrategyDegradationReport,
 ): string {
   const { date, realizedPnl, unrealizedPnl, optionsPnl, combinedPnl,
           totalEquity, managedEquity, availableCash,
@@ -1088,7 +1110,7 @@ ${moverRows || '_No data._'}
 | Winning Signals | ${signalAccuracy.winningSignals} |
 | Signal Win Rate | ${pct(signalAccuracy.winRate)} |
 | Avg R:R | 1:${signalAccuracy.avgRR.toFixed(2)} |
-${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights, report.journalBasis, report.journalBasisCounts)}${buildIntrospectionMarkdown(introspection, autopilotActions)}${buildSourceQualityMarkdown(sourceQualityWeights)}${buildAutonomousDemoLoopMarkdown(autonomousDemoLoop)}${buildAnalystMarkdown(analystPlan, analystReview)}${hypothesisQueue ? buildRatificationQueueMarkdown(hypothesisQueue) : ''}${buildCorrelatedExposureCapMarkdown()}${buildExecutionQualityMarkdown(executionQuality)}`;
+${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights, report.journalBasis, report.journalBasisCounts)}${buildIntrospectionMarkdown(introspection, autopilotActions)}${buildStrategyDegradationSection(strategyDegradation)}${buildSourceQualityMarkdown(sourceQualityWeights)}${buildAutonomousDemoLoopMarkdown(autonomousDemoLoop)}${buildAnalystMarkdown(analystPlan, analystReview)}${hypothesisQueue ? buildRatificationQueueMarkdown(hypothesisQueue) : ''}${buildCorrelatedExposureCapMarkdown()}${buildExecutionQualityMarkdown(executionQuality)}`;
 }
 
 export interface ReportInput {
@@ -1130,6 +1152,17 @@ export interface ReportInput {
    * Optional ↔ no introspection section.
    */
   introspection?: IntrospectionReadout;
+  /**
+   * TRA-4913 — the per-strategy degradation readout (rolling PF / expectancy per
+   * `structure::entryArchetype` cohort against that cohort's own recorded
+   * envelope), built by the caller from the closed-trade journal via
+   * `buildStrategyDegradationReport`. Optional ↔ no degradation section.
+   *
+   * ADVISORY ONLY. The EOD renders the flag and the size-down recommendation and
+   * acts on neither; hard halts stay with `options-risk-breaker`, the
+   * `DailyRiskGovernor` and the churn brakes.
+   */
+  strategyDegradation?: StrategyDegradationReport;
   /**
    * TRA-995 — the risk-autopilot action log for the day (halts / throttles with
    * their trigger + reason), read from `DailyRiskGovernor.getAutopilotActions()`.
@@ -1245,7 +1278,7 @@ export interface ReportInput {
  */
 export function generateEodReport(input: ReportInput, asOfDate?: string): EodReport {
   const { state, allClosedPositions, closedOptions = [], dailySignals, signalTypeMap,
-          optionJournal, optionLearnedWeights, introspection, autopilotActions,
+          optionJournal, optionLearnedWeights, introspection, strategyDegradation, autopilotActions,
           sourceQualityWeights, autonomousDemoLoop, analystPlan, analystReview,
           hypothesisQueue, executionQuality,
           journalBasis, journalBasisCounts,
@@ -1402,6 +1435,7 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
       analystReview,
       hypothesisQueue,
       executionQuality,
+      strategyDegradation,
     ),
   };
 }
