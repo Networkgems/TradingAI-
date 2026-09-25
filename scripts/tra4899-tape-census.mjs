@@ -29,9 +29,18 @@
  *           been live longer than their own retention).
  *   rows    not convertible without a measured bytes/row; reported as the row
  *   files   cap with observed bytes as a FLOOR, never as a worst case.
+ *   sealed  worst = the ceiling, EXACTLY. TRA-4903's seal is enforced on the write
+ *           path rather than at boot, so it is the one kind here that carries no
+ *           `rate x bootGap` premium. At the ceiling the append is REFUSED, never
+ *           the oldest rows dropped — see `data-tape-bounds.ts` for why that
+ *           direction and not the other on these 27 specific files.
  *   none    worst = THE VOLUME. An append-only file with no retention, no byte
  *           cap and no row cap is bounded by the disk and nothing else, so it
  *           ranks above every finite reservation regardless of today's size.
+ *           TRA-4903 AC3: there must be ZERO of these. The run exits UNBOUNDED (4)
+ *           if one appears, because a new tape lands here by DEFAULT — writing an
+ *           append-only file is the easy thing to do and bounding it is the step
+ *           that gets skipped. That is how 27 accumulated.
  *
  * BOOT_GAP_DAYS is the longest gap between two process boots. It is measured,
  * not assumed — `--boot-gap=` overrides — and it is an UPPER bound taken off
@@ -45,7 +54,8 @@
  *   node scripts/tra4899-tape-census.mjs --offline     # policy table only
  *   node scripts/tra4899-tape-census.mjs --json
  *
- * Exit: 0 CLEAN · 1 UNCATALOGUED · 2 usage · 3 BLIND.  BLIND > UNCATALOGUED > CLEAN.
+ * Exit: 0 CLEAN · 1 UNCATALOGUED · 2 usage · 3 BLIND · 4 UNBOUNDED (TRA-4903 AC3).
+ *       BLIND > UNBOUNDED > UNCATALOGUED > CLEAN.
  */
 
 import { readFileSync, existsSync } from 'node:fs';
@@ -162,38 +172,82 @@ const MANIFEST = [
     needle: "const raw = Number(process.env['BACKUP_MAX_FILES']);",
     note: 'THE ONLY INODE-DENOMINATED CAP ON THE BOX (TRA-2817); also ≤24 generations' },
 
-  // ── UNCAPPED: append-only, no retention, no byte cap, no row cap ──────────
-  { name: 'shadow-signals.jsonl', src: 'shadow-signal-ledger.ts', unit: 'none', confirmed: true,
-    note: 'write path read end-to-end: appendFile only, no compaction hook' },
-  { name: 'paper-trading.jsonl', src: 'paper-trading.ts', unit: 'none', confirmed: true,
-    note: 'write path read end-to-end: appendFile only, no compaction hook' },
-  { name: 'option-trade-journal.jsonl', src: 'option-trade-journal.ts', unit: 'none', confirmed: false,
-    note: 'three 500-row SIDECAR ledgers are capped; the journal itself is not' },
-  { name: 'option-maker-shadow.jsonl', src: 'option-maker-shadow.ts', unit: 'none', confirmed: false },
-  { name: 'option-maker-fills.jsonl', src: 'option-maker-fill-ledger.ts', unit: 'none', confirmed: false },
-  { name: 'oi-shadow-signals.jsonl', src: 'oi-shadow-ledger.ts', unit: 'none', confirmed: false },
-  { name: 'pcr-shadow-signals.jsonl', src: 'pcr-shadow-ledger.ts', unit: 'none', confirmed: false },
-  { name: 'pcs-shadow-signals.jsonl', src: 'pcs-shadow-ledger.ts', unit: 'none', confirmed: false },
-  { name: 'orb-options-shadow-signals.jsonl', src: 'orb-options-shadow-ledger.ts', unit: 'none', confirmed: false },
-  { name: 'option-shadow-signals.jsonl', src: 'option-shadow-ledger.ts', unit: 'none', confirmed: false },
-  { name: 'option-real-fill-shadow.jsonl', src: 'option-real-fill-shadow.ts', unit: 'none', confirmed: false },
-  { name: 'pre-trade-gate-decisions.jsonl', src: 'pre-trade-gate-ledger.ts', unit: 'none', confirmed: false },
-  { name: 'pre-trade-liquidity-decisions.jsonl', src: 'pre-trade-liquidity-ledger.ts', unit: 'none', confirmed: false },
-  { name: 'news-catalyst-signals.jsonl', src: 'news-catalyst-ledger.ts', unit: 'none', confirmed: false },
-  { name: 'news-catalyst-runs.jsonl', src: 'news-catalyst-run-ledger.ts', unit: 'none', confirmed: false },
-  { name: 'news-catalyst-lean.jsonl', src: 'news-catalyst-lean-ledger.ts', unit: 'none', confirmed: false },
-  { name: 'live-canary-state.jsonl', src: 'live-canary-ledger.ts', unit: 'none', confirmed: false },
-  { name: 'engine-basis-restatements.jsonl', src: 'engine-basis-restatement-log.ts', unit: 'none', confirmed: false },
-  { name: 'directional-exploration-allowance.jsonl', src: 'directional-exploration-allowance.ts', unit: 'none', confirmed: false },
-  { name: 'tra3939-engine-submitted-orders.jsonl', src: 'tra3939-order-provenance-capture.ts', unit: 'none', confirmed: false },
-  { name: 'tra3939-broker-order-capture.jsonl', src: 'tra3939-order-provenance-capture.ts', unit: 'none', confirmed: false },
-  { name: 'tra4476-order-intents.jsonl', src: 'tra4476-order-intent-journal.ts', unit: 'none', confirmed: false },
-  { name: 'tra3932-open-leg-provenance.jsonl', src: 'tra3932-open-leg-provenance.ts', unit: 'none', confirmed: false },
-  { name: 'tra3926-judged-oversold.jsonl', src: 'tra3926-judged-oversold-store.ts', unit: 'none', confirmed: false },
-  { name: 'live-options-fill-archive.jsonl', src: 'live-options-fee-slippage-ledger.ts', unit: 'none', confirmed: false,
-    note: 'TRA-4727 overflow archive — where a fill goes when it ages OUT of the 30d ledger' },
-  { name: 'live-option-reconcile-terminations.jsonl', src: 'live-options-fee-slippage-ledger.ts', unit: 'none', confirmed: false },
-  { name: 'hypothesis-queue.jsonl', src: 'hypothesis-pipeline.ts', unit: 'none', confirmed: false },
+  // ── SEALED at a byte ceiling (TRA-4903) ───────────────────────────────────
+  // These 27 are the files TRA-4903 found with no retention, no byte cap and no
+  // row cap. They are now bounded by `data-tape-bounds.ts`, which REFUSES the
+  // append at the ceiling rather than truncating the oldest rows — see that
+  // module's docblock for the four ways a central time prune corrupts these
+  // specific tapes, each measured. `writer` names the module that appends, which
+  // is no longer where the cap lives; `needle` is asserted against the bounds
+  // manifest, so moving a ceiling without moving this table exits BLIND.
+  //
+  // There is NO boot-overshoot premium on these rows. Every other compactor on
+  // the box runs on boot only and therefore reserves `cap + rate x bootGap`; a
+  // seal is enforced at every append, so the ceiling IS the reservation.
+  { name: 'shadow-signals.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 32 * MiB,
+    writer: 'shadow-signal-ledger.ts', needle: "'shadow-signals.jsonl': { maxBytes: 32 * MiB,",
+    note: 'largest of the 27; supersede-fold ⇒ no central prune' },
+  { name: 'paper-trading.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 32 * MiB,
+    writer: 'paper-trading.ts', needle: "'paper-trading.jsonl': { maxBytes: 32 * MiB,",
+    note: 'cumulative book fold ⇒ a prune would rewrite the balance' },
+  { name: 'option-trade-journal.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 32 * MiB,
+    writer: 'option-trade-journal.ts', needle: "'option-trade-journal.jsonl': { maxBytes: 32 * MiB,",
+    note: 'TRA-2919 pre-onset money axis reads it; never age out' },
+  { name: 'pcr-shadow-signals.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 16 * MiB,
+    writer: 'pcr-shadow-ledger.ts', needle: "'pcr-shadow-signals.jsonl': { maxBytes: 16 * MiB,",
+    note: 'TRA-1664 ratifies N>=90 SESSIONS ⇒ sized 2x its band' },
+  { name: 'option-maker-shadow.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 8 * MiB,
+    writer: 'option-maker-shadow.ts', needle: "'option-maker-shadow.jsonl': { maxBytes: 8 * MiB," },
+  { name: 'news-catalyst-runs.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 8 * MiB,
+    writer: 'news-catalyst-run-ledger.ts', needle: "'news-catalyst-runs.jsonl': { maxBytes: 8 * MiB," },
+  { name: 'news-catalyst-signals.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 8 * MiB,
+    writer: 'news-catalyst-ledger.ts', needle: "'news-catalyst-signals.jsonl': { maxBytes: 8 * MiB," },
+  { name: 'tra3939-engine-submitted-orders.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 8 * MiB,
+    writer: 'tra3939-order-provenance-capture.ts', needle: "'tra3939-engine-submitted-orders.jsonl': { maxBytes: 8 * MiB,",
+    note: 'evidence expires at the broker' },
+  { name: 'tra4476-order-intents.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 8 * MiB,
+    writer: 'tra4476-order-intent-journal.ts', needle: "'tra4476-order-intents.jsonl': { maxBytes: 8 * MiB," },
+  { name: 'option-shadow-signals.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 8 * MiB,
+    writer: 'option-shadow-ledger.ts', needle: "'option-shadow-signals.jsonl': { maxBytes: 8 * MiB,",
+    note: 'session-window consumer' },
+  { name: 'live-options-fill-archive.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 8 * MiB,
+    writer: 'live-options-fee-slippage-ledger.ts', needle: "'live-options-fill-archive.jsonl': { maxBytes: 8 * MiB,",
+    note: 'TRA-4727 moved the reservation here rather than shrinking it' },
+  { name: 'pcs-shadow-signals.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 8 * MiB,
+    writer: 'pcs-shadow-ledger.ts', needle: "'pcs-shadow-signals.jsonl': { maxBytes: 8 * MiB," },
+  { name: 'oi-shadow-signals.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 8 * MiB,
+    writer: 'oi-shadow-ledger.ts', needle: "'oi-shadow-signals.jsonl': { maxBytes: 8 * MiB," },
+  { name: 'pre-trade-gate-decisions.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 8 * MiB,
+    writer: 'pre-trade-gate-ledger.ts', needle: "'pre-trade-gate-decisions.jsonl': { maxBytes: 8 * MiB,",
+    note: 'one row per gate decision — highest potential rate of the 27' },
+  { name: 'pre-trade-liquidity-decisions.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 8 * MiB,
+    writer: 'pre-trade-liquidity-ledger.ts', needle: "'pre-trade-liquidity-decisions.jsonl': { maxBytes: 8 * MiB," },
+  { name: 'tra3939-broker-order-capture.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 4 * MiB,
+    writer: 'tra3939-order-provenance-capture.ts', needle: "'tra3939-broker-order-capture.jsonl': { maxBytes: 4 * MiB," },
+  { name: 'tra3932-open-leg-provenance.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 4 * MiB,
+    writer: 'tra3932-open-leg-provenance.ts', needle: "'tra3932-open-leg-provenance.jsonl': { maxBytes: 4 * MiB,",
+    note: 'verdicts are not re-derivable' },
+  { name: 'news-catalyst-lean.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 4 * MiB,
+    writer: 'news-catalyst-lean-ledger.ts', needle: "'news-catalyst-lean.jsonl': { maxBytes: 4 * MiB," },
+  { name: 'engine-basis-restatements.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 4 * MiB,
+    writer: 'engine-basis-restatement-log.ts', needle: "'engine-basis-restatements.jsonl': { maxBytes: 4 * MiB," },
+  { name: 'directional-exploration-allowance.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 4 * MiB,
+    writer: 'directional-exploration-allowance.ts', needle: "'directional-exploration-allowance.jsonl': { maxBytes: 4 * MiB," },
+  { name: 'tra3926-judged-oversold.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 4 * MiB,
+    writer: 'tra3926-judged-oversold-store.ts', needle: "'tra3926-judged-oversold.jsonl': { maxBytes: 4 * MiB," },
+  { name: 'live-option-reconcile-terminations.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 4 * MiB,
+    writer: 'live-options-fee-slippage-ledger.ts', needle: "'live-option-reconcile-terminations.jsonl': { maxBytes: 4 * MiB," },
+  { name: 'orb-options-shadow-signals.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 4 * MiB,
+    writer: 'orb-options-shadow-ledger.ts', needle: "'orb-options-shadow-signals.jsonl': { maxBytes: 4 * MiB," },
+  { name: 'option-real-fill-shadow.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 4 * MiB,
+    writer: 'option-real-fill-shadow.ts', needle: "'option-real-fill-shadow.jsonl': { maxBytes: 4 * MiB," },
+  { name: 'option-maker-fills.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 4 * MiB,
+    writer: 'option-maker-fill-ledger.ts', needle: "'option-maker-fills.jsonl': { maxBytes: 4 * MiB," },
+  { name: 'live-canary-state.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 4 * MiB,
+    writer: 'live-canary-ledger.ts', needle: "'live-canary-state.jsonl': { maxBytes: 4 * MiB," },
+  { name: 'hypothesis-queue.jsonl', src: 'data-tape-bounds.ts', unit: 'sealed', value: 4 * MiB,
+    writer: 'hypothesis-pipeline.ts', needle: "'hypothesis-queue.jsonl': { maxBytes: 4 * MiB,",
+    note: 'a QUEUE, not a tape — an old enqueue is PENDING WORK' },
 
   // ── bounded elsewhere ─────────────────────────────────────────────────────
   { name: 'state.db', unit: 'ext', note: 'sqlite — bounded by its own content, not a tape' },
@@ -224,6 +278,22 @@ function assertManifestMatchesSource() {
     for (const needle of Array.isArray(row.needle) ? row.needle : [row.needle]) {
       if (!text.includes(needle)) broken.push(`${row.name}: ${row.src} no longer contains  ${needle}`);
     }
+    // TRA-4903 — a sealed row's cap lives in `data-tape-bounds.ts` but is only a
+    // BOUND if the writer actually routes through it. A ceiling whose call site
+    // was reverted reads identically to one that works, which is the whole reason
+    // the enforcement is also published as an outcome on the health probe. Assert
+    // the seam here too, so a revert exits BLIND at desk time instead of at 973 MiB.
+    if (row.unit === 'sealed') {
+      const w = join(SRC, row.writer);
+      if (!existsSync(w)) { broken.push(`${row.name}: writer ${row.writer} does not exist`); continue; }
+      const wt = readFileSync(w, 'utf8');
+      if (!/appendBoundedTapeLine(Sync)?\(/.test(wt)) {
+        broken.push(`${row.name}: ${row.writer} does not call appendBoundedTapeLine — the ceiling is NOT enforced`);
+      }
+      if (/\bappendFile(Sync)?\(/.test(wt)) {
+        broken.push(`${row.name}: ${row.writer} still has a RAW appendFile call — it may bypass the ceiling`);
+      }
+    }
   }
   return broken;
 }
@@ -249,6 +319,12 @@ function worstCase(row, observedBytes) {
     // A boot-only byte cap is a compaction target, not a ceiling: between boots
     // the file overshoots by whatever it writes. Reported as cap + overshoot.
     return { bytes: row.value, kind: 'HARD', overshoot: row.bootOnly };
+  }
+  if (row.unit === 'sealed') {
+    // TRA-4903 — enforced on the WRITE path, not at boot, so unlike every other
+    // cap on this box there is no `rate x bootGap` premium to add. The ceiling is
+    // the reservation. This is the only KIND here that is exact.
+    return { bytes: row.value, kind: 'SEALED', overshoot: false };
   }
   if (row.unit === 'days') {
     if (observedBytes == null) return { bytes: null, kind: 'NO-OBS' };
@@ -322,6 +398,7 @@ async function main() {
     console.log('  ----------  ----------  ------------------  ---------  ---------------------------------');
     for (const r of rows) {
       const cap = r.unit === 'bytes' ? `${mib(r.value)} MiB`
+        : r.unit === 'sealed' ? `${mib(r.value)} MiB (seal)`
         : r.unit === 'days'
           ? `${r.value} d${r.bootOnly === false && r.compactEveryDays
             ? ` +${r.compactEveryDays * 24}h timer`
@@ -337,8 +414,30 @@ async function main() {
     console.log();
     console.log('  WORST-CASE is MiB. KIND: HARD = the cap itself · DERIVED = observed x (retain+gap)/retain,');
     console.log('  where gap = min(compaction interval, bootGap) — the boot gap for a boot-only tape (TRA-4904).');
+    console.log('  SEALED = TRA-4903 write-path ceiling, EXACT (no boot-overshoot premium — the only kind that is)');
     console.log('  UNBOUNDED = the whole volume (no cap of any kind) · FLOOR = unit not convertible to bytes.');
     console.log('  "?" on an UNBOUNDED row = cap absence grepped, write path not yet read end-to-end.');
+    const sealed = rows.filter((r) => r.unit === 'sealed');
+    const sealedTotal = sealed.reduce((n, r) => n + r.value, 0);
+    const sealedObs = sealed.reduce((n, r) => n + (r.observedBytes ?? 0), 0);
+    const absent = sealed.filter((r) => r.observedBytes === null).length;
+    console.log();
+    console.log(`  TRA-4903 seals: ${sealed.length} tapes, ${mib(sealedTotal)} MiB reserved, ${mib(sealedObs)} MiB actual`
+      + ` (${((sealedObs / sealedTotal) * 100).toFixed(1)}% subscribed; ${absent} absent on this host).`);
+    console.log('  An ABSENT tape still reserved the whole volume before TRA-4903 — the reservation was');
+    console.log('  never proportional to today\'s size, which is why the filing ranked by worst case.');
+  }
+
+  // TRA-4903 AC3 — the gate this ticket is graded by. Ranked ABOVE uncatalogued:
+  // an unbounded file is a live reservation of the whole volume, whereas an
+  // uncatalogued one is a gap in the table.
+  const unbounded = rows.filter((r) => r.worst.kind === 'UNBOUNDED');
+  if (unbounded.length > 0) {
+    console.error(`\nUNBOUNDED — ${unbounded.length} tape(s) have no cap of any kind and reserve the whole volume:`);
+    for (const u of unbounded) console.error(`  ${u.name}  (writer ${u.src ?? '?'})`);
+    console.error('\nGive each one a bound. `packages/server/src/data-tape-bounds.ts` is the seam:');
+    console.error('add the ceiling to DATA_TAPE_BOUNDS and route the writer through appendBoundedTapeLine.');
+    process.exit(4);
   }
 
   if (uncatalogued.length > 0) {

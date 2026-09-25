@@ -180,6 +180,9 @@ import { describeNetEdgeBar } from '../option-net-edge-bar.js';
 // REPLACED the delta-proxy estimator, published per cell so the admission
 // decision is readable off deployed state instead of re-derived by hand.
 import { tapeExpectancyCache } from '../option-tape-expectancy-cache.js';
+// TRA-4889 (parent TRA-4885 item 5) — the COST / EDGE / DATA triage. PURE and
+// STRICTLY DIAGNOSTIC: it joins three already-shipped reads and decides nothing.
+import { buildQualificationMatrix } from '../qualification-matrix.js';
 import {
   DECLINE_REASON_TAXONOMY,
   TAPE_EXPECTANCY_MIN_CELL_N,
@@ -6098,6 +6101,128 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     });
   });
 
+  // ── TRA-4889 (parent TRA-4885, board item 5) — COST / EDGE / DATA, one row ──
+  // per tape cell, with ONE resolved reason for why it does not qualify.
+  //
+  // All three answers already shipped, on three different routes, and nothing
+  // put them side by side. An operator asking "is it cost, edge, or not enough
+  // data?" had to know all three route names and reconcile them by hand — which
+  // is how TRA-4885 came to be filed.
+  //
+  // ⚠️ STRICTLY DIAGNOSTIC. NOT A FOURTH ENFORCEMENT SURFACE. The board's item 5
+  // is to SEPARATE diagnostics from enforcement. Nothing on this route decides
+  // anything, `buildQualificationMatrix` is pure, and no trade path imports it.
+  //
+  // The reading it makes possible, and which none of the three sources does on
+  // its own: on 2026-09-24 the `cost_bar` gate blocked 3039/3039 and the
+  // `netEdgeShadow` sweep admitted 0 at EVERY `k`. Read off a gate named
+  // `cost_bar` with reason codes named `shortfall_*`, that says "cost is too
+  // high". It is not. The deployed form is FLAT (`admit ⟺ grossR >= barR`,
+  // TRA-4745) and `grossR` IS the cell's `lowerCI95` — negative on all three
+  // live-nominated cells. A negative bound fails at every bar setting including
+  // OFF, and makes `costR <= k·grossR` unsatisfiable at every `k`, so the sweep's
+  // flat zero restates the EDGE term and measures nothing about cost.
+  // `rows[].cost.admitsAtBarOff` is the field that separates those two readings.
+  //
+  // Observe-only, secrets-free (counts / R-multiples / bucket labels), and
+  // unauthenticated for parity with the three routes it joins.
+  app.get('/api/health/qualification-matrix', async (_req, res) => {
+    const nowMs = now();
+    const etDay = etDateString(new Date(nowMs));
+    const liveEnv = process.env;
+    const cache = tapeExpectancyCache();
+    const cached = await cache.get();
+
+    const costConfig = resolveCostGateConfig(liveEnv);
+    const netEdge = describeNetEdgeBar(liveEnv);
+    const summary = summarizeLiveEnforceGate(etDay, {
+      absCostFracCeiling: netEdge.absCostFracCeiling,
+      flatFormBarR: describeCostGateBar(COST_BAR_PUBLISHED_STRUCTURE, costConfig).barR,
+    });
+    // The RETAINED fold, not the day fold. `canAccrue` is a claim about whether a
+    // cell can still produce a live fill, and a one-ET-day cell axis self-clears
+    // at midnight (TRA-1703) — grading accrual off it would manufacture a FROZEN
+    // verdict on a cell that was admitted yesterday.
+    const retainedCostBar =
+      summary.retained.byGate.find((g) => g.gate === COST_BAR_GATE) ?? null;
+
+    const cells = cached?.table.cells ?? null;
+    const matrix = buildQualificationMatrix({
+      etDay,
+      cells,
+      minCellN: TAPE_EXPECTANCY_MIN_CELL_N,
+      minCellRealFillN: TAPE_EXPECTANCY_MIN_CELL_REAL_FILL_N,
+      gateCells: (retainedCostBar?.byCell ?? []).map((c) => ({
+        cell: c.cell,
+        evaluated: c.evaluated,
+        blocked: c.blocked,
+        blockRate: c.blockRate,
+      })),
+      // ⭐ The PER-ET-DAY cell axis. Without it `canAccrue` is a LEVEL over the
+      // whole retained window, and on the live fold that level LIES:
+      // `single_leg_otm::0.50-0.55` carries 428 pooled admits, every one of them
+      // on 2026-08-28 / 08-31 / 09-01, with the cell not nominated once since and
+      // every ET day from 09-02 on 100% blocked. Pooled says "admitting". The
+      // per-day axis says the cell is dead — and dead on the SELECTION side.
+      gateCellDays: (retainedCostBar?.byEtDay ?? []).flatMap((d) =>
+        (d.byCell ?? []).map((c) => ({
+          etDay: d.etDay,
+          cell: c.cell,
+          evaluated: c.evaluated,
+          blocked: c.blocked,
+        })),
+      ),
+      gateWindowEtDays: summary.retained.etDays,
+      gateEvaluated: retainedCostBar?.evaluated ?? null,
+      gateBlocked: retainedCostBar?.blocked ?? null,
+      netEdgeShadow: retainedCostBar?.netEdgeShadow
+        ? {
+            rowsEvaluated: retainedCostBar.netEdgeShadow.rowsEvaluated,
+            flatFormAdmits: retainedCostBar.netEdgeShadow.flatFormAdmits,
+            sweep: retainedCostBar.netEdgeShadow.sweep.map((s) => ({
+              k: s.k,
+              admits: s.admits,
+              admitRate: s.admitRate,
+            })),
+          }
+        : null,
+      // PER STRUCTURE (TRA-4749). Derived from the ledger's own scopes and the
+      // fold's own cells, never a hard-coded sleeve roster — that roster is what
+      // hid `single_leg_rv` behind an OTM-shaped bar in the first place.
+      bars: resolveGatedStructureBars({
+        scopeLabels: [...summary.byGate, ...summary.retained.byGate]
+          .filter((g) => g.gate === COST_BAR_GATE)
+          .flatMap((g) => (g.byScope ?? []).map((s) => s.scope)),
+        cellStructures: (cells ?? []).map((c) => c.structure),
+        config: costConfig,
+      }).map((b) => ({
+        structure: b.structure,
+        barR: b.barR,
+        costModelR: b.costModelR,
+        safetyMarginR: b.safetyMarginR,
+        minGrossR: b.minGrossR,
+      })),
+      netEdgeFormEnabled: netEdge.enabled,
+    });
+
+    res.json({
+      ok: true,
+      issue: 'TRA-4889',
+      diagnosticOnly: true,
+      time: new Date(nowMs).toISOString(),
+      build: resolveBuildInfo(),
+      /** The tape's own freshness — a stale fold is a stale verdict (TRA-4753). */
+      freshness: cache.freshness(),
+      sources: {
+        cost: '/api/health/live-enforce-gates → byGate[cost_bar] (retained fold) + netEdgeShadow',
+        costComposition: '/api/health/cost-aware-gate → bars, and arm.costBar.barsByStructure',
+        edge: '/api/health/option-expectancy-table → table.cells[].lowerCI95 / admits',
+        data: '/api/health/option-expectancy-table → table.cells[].nRealFill (TRA-4894)',
+      },
+      ...matrix,
+    });
+  });
+
   // TRA-3394 (authorization TRA-3392) — the RATIFIED BAND TABLE, the three
   // decline reason codes, and the ceiling gate's own counters, on one read.
   //
@@ -7818,7 +7943,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         etDay: etDateString(new Date(nowMs)),
         ...summary,
         ...(rows !== undefined ? { rows: rows.rows, rowsTruncated: rows.truncated } : {}),
-        note: `${summary.deskSessionsWithAdmissions}/20 desk-class ET sessions with >=1 ADMITTED candidate toward the TRA-4623 AC4 re-run bar. bindingReason = FIRST binding gate in engine evaluation order ('none' = admitted). Only sampling-policy-v2 days count; v1 rows (no samplingPolicy, 2026-09-17..18) exhausted a first-come daily budget in the opening minutes and are open-biased (legacySessions/legacyRows) - exclude them from any readout. v2 sampling is pass-level and independent of mark, spreadPct and time-of-day by construction (see policy); days[].rowsBySlotEt is the time-coverage check. An evidence archive has no backfill: the tape starts at the deploy that armed it. durability.appendErrors > 0 means rows were counted in memory that never reached disk — treat the on-disk export as an undercount, not the counters as an overcount.`,
+        note: `${summary.deskSessionsWithAdmissions}/20 desk-class ET sessions with >=1 ADMITTED candidate toward the TRA-4623 AC4 re-run bar. bindingReason = FIRST binding gate in engine evaluation order ('none' = admitted). Only sampling-policy-v2 days count; v1 rows (no samplingPolicy, 2026-09-17..18) exhausted a first-come daily budget in the opening minutes and are open-biased (legacySessions/legacyRows) - exclude them from any readout. v2 sampling is pass-level and independent of mark, spreadPct and time-of-day by construction (see policy); days[].rowsBySlotEt is the time-coverage check. TRA-4906: days[].dropsBySlotEt is the per-slot rule-3 slot-budget drop count AND the dropped passes' sizes, rebuilt from durable kind:budgetdrop rows, so it SURVIVES A BOOT — read it there, not off counters.slotBudgetPassesDropped, which is a process total zeroed by every restart; budgetdrop rows are NOT sample and are in no other count here. kind:ranked is deduped per (etDay, slot, accountClass, occSymbol) from 2026-09-25 (earlier days hold the un-deduped multiset, 4.3x-11.6x); kind:ordered stays unconditional as execution provenance. An evidence archive has no backfill: the tape starts at the deploy that armed it. durability.appendErrors > 0 means rows were counted in memory that never reached disk — treat the on-disk export as an undercount, not the counters as an overcount.`,
       });
     } catch (err: unknown) {
       // An instrument may not take the box down, and it may not report a read

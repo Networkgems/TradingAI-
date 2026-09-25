@@ -1,10 +1,11 @@
-import { appendFile, readFile, mkdir } from 'fs/promises';
+import { readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import type { CatalystScoreComponents } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { etDateKey } from './options-chain-recorder.js';
 import { resolveDataDir } from './data-dir.js';
+import { appendBoundedTapeLine } from './data-tape-bounds.js';
 
 // TRA-1629 (TRA-1623A, parent TRA-1623) — durable, flag-gated SHADOW ledger for
 // the news-catalyst watchlist source.
@@ -198,7 +199,7 @@ async function appendRecord(rec: CatalystShadowRecord): Promise<void> {
   const path = storeFile();
   const dir = dirname(path);
   if (!existsSync(dir)) await mkdir(dir, { recursive: true });
-  await appendFile(path, `${JSON.stringify(rec)}\n`, 'utf-8');
+  await appendBoundedTapeLine(path, `${JSON.stringify(rec)}\n`);
 }
 
 /** Result of a capture attempt. */

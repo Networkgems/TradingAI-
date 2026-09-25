@@ -34,12 +34,13 @@
  * still corroborates and which survive only here.
  */
 
-import { appendFileSync, mkdirSync, readFileSync } from 'fs';
+import { mkdirSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
 
 import type { LiveCloseGrant } from './live-options-fee-slippage-ledger.js';
+import { appendBoundedTapeLineSync } from './data-tape-bounds.js';
 import type {
   GrantedClose,
   OversoldCloseCensus,
@@ -137,7 +138,7 @@ export function captureJudgedOversoldCloses(
     }
     try {
       mkdirSync(dirname(path), { recursive: true });
-      appendFileSync(path, JSON.stringify(line) + '\n', 'utf8');
+      appendBoundedTapeLineSync(path, JSON.stringify(line) + '\n');
       appended += 1;
     } catch (err) {
       appendErrors += 1;

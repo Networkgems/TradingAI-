@@ -207,7 +207,7 @@ describe('TRA-4628 — v2 time coverage (the 2026-09-18 open-bias regression)', 
 });
 
 describe('TRA-4628 — ranked/ordered links', () => {
-  it('records links unthrottled and tallies them per class', () => {
+  it('records links and tallies them per class', () => {
     recordOtmAdmissionRanked({ symbol: 'RIG', book: 'deskbook', mode: 'live', now: NOW }, 'RIG261016C00005000');
     recordOtmAdmissionOrdered({ symbol: 'RIG', book: 'deskbook', mode: 'live', now: NOW + 1 }, 'RIG261016C00005000');
     const raw = readFileSync(otmAdmissionTapePath(dir), 'utf8').trim().split('\n');
@@ -215,6 +215,180 @@ describe('TRA-4628 — ranked/ordered links', () => {
     const desk = summarizeOtmAdmissionTape().byClass.find((c) => c.accountClass === 'desk');
     expect(desk?.ranked).toBe(1);
     expect(desk?.ordered).toBe(1);
+  });
+});
+
+// ── TRA-4906 (ruling TRA-4905) ───────────────────────────────────────────────
+
+/** A pass sized to blow the non-desk slot budget (200) in one go: 250 > 200. */
+function oversizedForFixtureSlot(now: number): { symbol: string; book: string } {
+  return { symbol: selectedSymbol('qa_tape', now, 'fixture'), book: 'qa_tape' };
+}
+
+/** Run one `rows`-decision pass for a fixture book, returning whether it taped. */
+function fixturePass(now: number, rows: number, symbol: string, book: string): void {
+  const p = beginOtmAdmissionPass({ symbol, book, mode: 'demo', now });
+  if (!p) throw new Error('pass was not selected — fix the fixture');
+  for (let i = 0; i < rows; i += 1) {
+    p.onAdmission(decision({ underlying: symbol, occSymbol: `${symbol}-${i}` }));
+  }
+  p.commit();
+}
+
+describe('TRA-4906 — slot-budget drops are DURABLE and per-slot (AC1/AC2)', () => {
+  it('writes a budgetdrop row carrying the slot and the dropped pass size', () => {
+    const { symbol, book } = oversizedForFixtureSlot(NOW);
+    fixturePass(NOW, 250, symbol, book); // 250 > MAX_ROWS_PER_SLOT_OTHER (200)
+
+    const rows = readFileSync(otmAdmissionTapePath(dir), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    expect(rows).toHaveLength(1); // the pass itself is dropped WHOLE — only the drop row lands
+    expect(rows[0]).toMatchObject({
+      kind: 'budgetdrop',
+      ts: NOW,
+      etDay: '2026-09-16',
+      accountClass: 'fixture',
+      slot: otmAdmissionSlot(NOW),
+      underlying: symbol,
+      rows: 250,
+    });
+
+    const summary = summarizeOtmAdmissionTape();
+    const day = summary.byClass.find((c) => c.accountClass === 'fixture')!.days[0]!;
+    expect(day.dropsBySlotEt).toEqual({ '11:00': { passes: 1, rows: 250 } });
+    expect(summary.counters.slotBudgetPassesDropped).toBe(1); // the scalar is KEPT (AC: not removed)
+  });
+
+  it('dropsBySlotEt SURVIVES A BOOT — the whole point (AC1)', () => {
+    const { symbol, book } = oversizedForFixtureSlot(NOW);
+    fixturePass(NOW, 250, symbol, book);
+    // A second drop in a LATER slot, so the rebuild has to be per-slot, not a total.
+    const later = NOW + 90 * 60 * 1000; // 12:30 ET
+    const s2 = selectedSymbol('qa_tape', later, 'fixture');
+    fixturePass(later, 210, s2, book);
+
+    // Boot: fresh process state, aggregates rebuilt from disk alone.
+    clearOtmAdmissionTape();
+    const h = hydrateOtmAdmissionTapeFromDisk(dir, NOW + 2 * 60 * 60 * 1000);
+    expect(h.records).toBe(2); // both drop rows round-tripped through parseRow (AC2)
+
+    const summary = summarizeOtmAdmissionTape();
+    const day = summary.byClass.find((c) => c.accountClass === 'fixture')!.days[0]!;
+    expect(day.dropsBySlotEt).toEqual({
+      '11:00': { passes: 1, rows: 250 },
+      '12:30': { passes: 1, rows: 210 },
+    });
+    // The process-total scalar is exactly what a boot DESTROYS — that is why the
+    // rows exist. Its reading 0 here while dropsBySlotEt is intact IS the AC.
+    expect(summary.counters.slotBudgetPassesDropped).toBe(0);
+  });
+
+  it('a budgetdrop row is NOT SAMPLE — it enters no other count (AC2)', () => {
+    const { symbol, book } = oversizedForFixtureSlot(NOW);
+    fixturePass(NOW, 250, symbol, book);
+    clearOtmAdmissionTape();
+    hydrateOtmAdmissionTapeFromDisk(dir, NOW);
+
+    const summary = summarizeOtmAdmissionTape();
+    const fixture = summary.byClass.find((c) => c.accountClass === 'fixture')!;
+    expect(fixture.candidateRows).toBe(0);
+    expect(fixture.admitted).toBe(0);
+    expect(fixture.ranked).toBe(0);
+    expect(fixture.ordered).toBe(0);
+    expect(fixture.sessionsWithAdmissions).toBe(0);
+    expect(fixture.legacySessions).toBe(0); // nor does it read as a v1 admitted day
+    expect(summary.deskSessionsWithAdmissions).toBe(0);
+    const day = fixture.days[0]!;
+    expect(day.candidateRows).toBe(0);
+    expect(day.passesRecorded).toBe(0); // a dropped pass is not a RECORDED pass
+    expect(day.rowsBySlotEt).toEqual({}); // and never feeds the rule-3 budget denominator
+  });
+
+  it('accepts a budgetdrop row with no `rows` field, and rejects one with no slot', () => {
+    const noRows = { kind: 'budgetdrop', ts: NOW, etDay: '2026-09-16', accountClass: 'desk', slot: 22, underlying: 'SPY' };
+    const noSlot = { kind: 'budgetdrop', ts: NOW, etDay: '2026-09-16', accountClass: 'desk', underlying: 'SPY', rows: 300 };
+    writeFileSync(otmAdmissionTapePath(dir), `${JSON.stringify(noRows)}\n${JSON.stringify(noSlot)}\n`, 'utf8');
+    hydrateOtmAdmissionTapeFromDisk(dir, NOW);
+    const day = summarizeOtmAdmissionTape().byClass.find((c) => c.accountClass === 'desk')!.days[0]!;
+    // The PASS still counts — losing it would understate rule 3's bite.
+    expect(day.dropsBySlotEt).toEqual({ '11:00': { passes: 1, rows: 0 } });
+  });
+});
+
+describe('TRA-4906 — `ranked` dedup, `ordered` unconditional (AC3/AC4)', () => {
+  const ctx = { symbol: 'XLF', book: 'deskbook', mode: 'live' as const };
+
+  it('collapses repeat nominations of one contract within a slot to ONE row (AC3)', () => {
+    // The measured live shape: XLF261030C00056000 written 87 times in a session.
+    for (let i = 0; i < 87; i += 1) {
+      recordOtmAdmissionRanked({ ...ctx, now: NOW + i * 1000 }, 'XLF261030C00056000');
+    }
+    const raw = readFileSync(otmAdmissionTapePath(dir), 'utf8').trim().split('\n');
+    expect(raw).toHaveLength(1);
+    const summary = summarizeOtmAdmissionTape();
+    expect(summary.byClass.find((c) => c.accountClass === 'desk')!.ranked).toBe(1);
+    expect(summary.counters.rankedDuplicatesSkipped).toBe(86);
+  });
+
+  it('keys on (etDay, slot, accountClass, occSymbol) — each axis re-admits', () => {
+    const OCC = 'XLF261030C00056000';
+    recordOtmAdmissionRanked({ ...ctx, now: NOW }, OCC);
+    recordOtmAdmissionRanked({ ...ctx, now: NOW + 30 * 60 * 1000 }, OCC); // next slot
+    recordOtmAdmissionRanked({ ...ctx, now: NOW, book: 'qa_tape' }, OCC); // other class
+    recordOtmAdmissionRanked({ ...ctx, now: NOW }, 'XLF261030C00057000'); // other contract
+    recordOtmAdmissionRanked({ ...ctx, now: NOW }, OCC); // duplicate of the first
+    const raw = readFileSync(otmAdmissionTapePath(dir), 'utf8').trim().split('\n');
+    expect(raw).toHaveLength(4);
+    expect(summarizeOtmAdmissionTape().counters.rankedDuplicatesSkipped).toBe(1);
+
+    // A NEW ET day re-admits (and the set evicts the old day, staying bounded).
+    const tomorrow = NOW + 24 * 60 * 60 * 1000;
+    recordOtmAdmissionRanked({ ...ctx, now: tomorrow }, OCC);
+    expect(readFileSync(otmAdmissionTapePath(dir), 'utf8').trim().split('\n')).toHaveLength(5);
+  });
+
+  it('rebuilds the dedup set on hydrate — a boot does not re-admit a banked link', () => {
+    recordOtmAdmissionRanked({ ...ctx, now: NOW }, 'XLF261030C00056000');
+    clearOtmAdmissionTape();
+    hydrateOtmAdmissionTapeFromDisk(dir, NOW);
+    recordOtmAdmissionRanked({ ...ctx, now: NOW + 5000 }, 'XLF261030C00056000');
+    expect(readFileSync(otmAdmissionTapePath(dir), 'utf8').trim().split('\n')).toHaveLength(1);
+    expect(summarizeOtmAdmissionTape().counters.rankedDuplicatesSkipped).toBe(1);
+  });
+
+  it('🔴 `ordered` is UNCONDITIONAL — no dedup, no budget, ever (AC4)', () => {
+    for (let i = 0; i < 50; i += 1) {
+      recordOtmAdmissionOrdered({ ...ctx, now: NOW + i * 1000 }, 'XLF261030C00056000');
+    }
+    const raw = readFileSync(otmAdmissionTapePath(dir), 'utf8').trim().split('\n');
+    expect(raw).toHaveLength(50); // every single one — execution provenance
+    expect(raw.every((l) => JSON.parse(l).kind === 'ordered')).toBe(true);
+    expect(summarizeOtmAdmissionTape().byClass.find((c) => c.accountClass === 'desk')!.ordered).toBe(50);
+    // Deduping `ranked` must not have leaked onto the `ordered` path.
+    expect(summarizeOtmAdmissionTape().counters.rankedDuplicatesSkipped).toBe(0);
+  });
+
+  it('the dedup is quote-blind — the key holds no quote and no scan order', () => {
+    // Same contract, wildly different quotes: still one row. The sample's
+    // independence from mark/spreadPct is the load-bearing property here.
+    recordOtmAdmissionRanked({ ...ctx, now: NOW }, 'XLF261030C00056000');
+    recordOtmAdmissionRanked({ ...ctx, now: NOW + 1 }, 'XLF261030C00056000');
+    expect(readFileSync(otmAdmissionTapePath(dir), 'utf8').trim().split('\n')).toHaveLength(1);
+  });
+});
+
+describe('TRA-4906 — the sample parameters are UNCHANGED by this ticket (AC5)', () => {
+  it('pins maxRowsPerSlot{Desk,Other} and maxFileBytes', () => {
+    // TRA-4905 ruled NO-CUT: the slot budget already size-filters each slot's
+    // tail (31/40 slots, p = 0.0007), so cutting it amplifies a measured bias
+    // AND reweights sessions already banked under a pre-registered readout.
+    // MAX_FILE_BYTES is re-derived by TRA-4905 §5 off a POST-dedup session, not here.
+    const { policy } = summarizeOtmAdmissionTape();
+    expect(policy.maxRowsPerSlotDesk).toBe(1000);
+    expect(policy.maxRowsPerSlotOther).toBe(200);
+    expect(policy.maxFileBytes).toBe(144 * 1024 * 1024);
+    expect(policy.maxRowsPerPass).toBe(400);
+    expect(policy.sampleModDesk).toBe(12);
+    expect(policy.samplingPolicy).toBe(2); // the dedup is NOT a policy bump: no candidate row moved
   });
 });
 

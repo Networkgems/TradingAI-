@@ -29,13 +29,14 @@
 // slippage/fee reads as "measured, and it was zero" — a false datapoint that would
 // bias the mean the board reads; `null` reads as "not measured").
 
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import type { TradierTradeHistoryFill, TradierGainLossLot } from '@trading-app/engine';
 import type { OptionAdmissionAbsentReason, OptionAdmissionBoundBy, OptionAdmissionStamp } from '@trading-app/shared';
 import { isCoherentOptionAdmissionStamp } from '@trading-app/shared';
 import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
+import { appendBoundedTapeLineSync } from './data-tape-bounds.js';
 
 const log = logger.child({ module: 'live-options-fee-slippage-ledger' });
 
@@ -814,7 +815,7 @@ export function recordLiveOptionFill(input: LiveOptionFillInput): void {
     // exists / unwritable — the append below surfaces the error
   }
   try {
-    appendFileSync(path, JSON.stringify(rec) + '\n', 'utf8');
+    appendBoundedTapeLineSync(path, JSON.stringify(rec) + '\n');
   } catch (err) {
     // Swallowed so the trade pass survives — but COUNTED, so the swallow is not silent.
     appendErrors += 1;
@@ -1010,7 +1011,7 @@ export function recordReconcileTermination(input: ReconcileTerminationInput): bo
     // exists / unwritable — the append below surfaces the error
   }
   try {
-    appendFileSync(path, JSON.stringify(rec) + '\n', 'utf8');
+    appendBoundedTapeLineSync(path, JSON.stringify(rec) + '\n');
   } catch (err) {
     terminationAppendErrors += 1;
     lastTerminationAppendError = err instanceof Error ? err.message : String(err);
@@ -2056,7 +2057,21 @@ export function hydrateLiveOptionsFeeSlippageFromDisk(
     const archivePath = liveOptionsFillArchivePath(dir);
     try {
       mkdirSync(dirname(archivePath), { recursive: true });
-      appendFileSync(archivePath, toArchive.map((f) => JSON.stringify(f)).join('\n') + '\n', 'utf8');
+      // TRA-4903 — the archive is now SEALED at a byte ceiling, and a refusal must
+      // count as a failed append, not as a success. It returns false instead of
+      // throwing, so without this the compaction below would proceed and delete
+      // aged fills that never reached the archive — destroying the rows on the one
+      // path whose stated invariant is "never in neither". A refusal keeps them in
+      // the main file and retries next boot, exactly like an ENOSPC would.
+      if (!appendBoundedTapeLineSync(archivePath, toArchive.map((f) => JSON.stringify(f)).join('\n') + '\n')) {
+        archiveOk = false;
+        archiveErrors += 1;
+        lastArchiveError = 'archive sealed at its TRA-4903 byte ceiling — append refused';
+        log.error('live-options fill archive is SEALED — main file NOT compacted, rows retained', {
+          reason: lastArchiveError,
+          rows: toArchive.length,
+        });
+      }
     } catch (err) {
       archiveOk = false;
       archiveErrors += 1;

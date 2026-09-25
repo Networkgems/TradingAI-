@@ -24,10 +24,11 @@
  * Volume is inherently tiny (one line per actual basis correction), so this
  * reads the whole file on demand rather than maintaining a hydrated fold.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 
 import { logger } from './observability/index.js';
+import { appendBoundedTapeLineSync } from './data-tape-bounds.js';
 
 const log = logger.child({ module: 'engine-basis-restatement-log' });
 
@@ -185,7 +186,7 @@ export function appendEngineBasisRestatement(
   try {
     const path = engineBasisRestatementLogPath(dir);
     mkdirSync(dirname(path), { recursive: true });
-    appendFileSync(path, `${JSON.stringify(rec)}\n`, 'utf8');
+    appendBoundedTapeLineSync(path, `${JSON.stringify(rec)}\n`);
   } catch (err: unknown) {
     appendErrors += 1;
     lastAppendError = err instanceof Error ? err.message : String(err);

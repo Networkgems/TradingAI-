@@ -67,12 +67,13 @@
 // publishes `null` counters (absent ⇒ UNREAD, never OK), because caps that
 // cannot be read must not be presumed unbound.
 
-import { appendFileSync, mkdirSync, readFileSync } from 'fs';
+import { mkdirSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
 import { isMarketDayIso } from './scheduler.js';
 import { DIRECTIONAL_STRUCTURE_LABEL, classifySpreadCeilingAccount } from './option-spread-cost.js';
+import { appendBoundedTapeLineSync } from './data-tape-bounds.js';
 
 const log = logger.child({ module: 'directional-exploration-allowance' });
 
@@ -221,7 +222,7 @@ function appendEvent(ev: ExplorationEvent): void {
     // exists / unwritable — the append below surfaces the error
   }
   try {
-    appendFileSync(path, JSON.stringify(ev) + '\n', 'utf8');
+    appendBoundedTapeLineSync(path, JSON.stringify(ev) + '\n');
   } catch (err) {
     appendErrors += 1;
     lastAppendError = err instanceof Error ? err.message : String(err);

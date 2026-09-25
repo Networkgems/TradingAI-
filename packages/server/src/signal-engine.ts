@@ -14684,8 +14684,14 @@ export class SignalEngine {
           }
           continue;
         }
-        // TRA-4628 — the nominee link, NEVER throttled (one row per pick): this
-        // is what lets the admission-vs-ranker split be measured directly.
+        // TRA-4628 — the nominee link: this is what lets the admission-vs-ranker
+        // split be measured directly. Call it on EVERY pick; the tape DEDUPS it
+        // per (etDay, slot, accountClass, occSymbol) (TRA-4906) — the join reads
+        // the SET of nominees, not the multiset of nomination events, and the
+        // candidate leg it joins to is itself (etDay, slot)-granular. Measured
+        // 4.33x-11.56x duplication before that (one contract 87 times in a day).
+        // Never gate this call on anything HERE: the dedup must stay quote-blind
+        // and inside the tape, where the sampling policy is stated.
         recordOtmAdmissionRanked(
           { symbol: sym, book: this.alertUsername, mode: this.mode },
           cheap.optionSymbol,

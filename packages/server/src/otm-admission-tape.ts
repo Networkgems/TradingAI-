@@ -36,6 +36,39 @@
 //      `MAX_ROWS_PER_SLOT[class]` candidate rows; further passes in that cell are
 //      dropped whole and counted (`slotBudgetPassesDropped`). The budget is per
 //      SLOT, never per day, so exhausting it can only thin one half-hour.
+//
+// ── A DROP IS ITSELF A DURABLE ROW (TRA-4906, ruling TRA-4905) ───────────────
+// Rule 3 is the leg that SETS desk volume (the budget saturates almost every RTH
+// slot), so how often it bites — and how big the dropped passes were — is the
+// measurement that sizes this file. `slotBudgetPassesDropped` alone could never
+// answer it: one module-level integer, reset by every boot, published as a
+// process total, and rebuilt from NOTHING on hydrate because a dropped pass used
+// to write no row. At ~3.3 deploys/day a 6.5h RTH window survives intact well
+// under half the time, so "read the scalar during RTH on a boot since the open"
+// is not a measurement anyone can schedule. So rule 3 now emits one compact
+// `kind: 'budgetdrop'` row per dropped pass carrying its `slot` and its `rows`
+// (the pass's size — the DIRECT reading of the size-filtering bias TRA-4905
+// could only reach through a paired within-slot test). It rebuilds per slot from
+// disk exactly the way `rowsBySlot` does, published as `dropsBySlotEt`.
+// ⚠ A `budgetdrop` row is NOT SAMPLE. It is excluded from `candidateRows`,
+// `admitted`, `ranked`, `ordered` and `sessionsWithAdmissions`, and must never be
+// counted as a candidate by any reader. Its cost is ~95 B/row, well under
+// 150 KB/session against {@link MAX_FILE_BYTES} — not a sizing concern.
+//
+// ── LINK ROWS: `ranked` IS A SET, `ordered` IS A LOG (TRA-4906) ──────────────
+// `ranked` is deduped per `(etDay, slot, accountClass, occSymbol)`. This is
+// information-preserving, NOT a throttle: the survivorship join needs the SET of
+// nominated contracts, and its candidate leg is itself `(etDay, slot)`-granular,
+// so a link finer than slot granularity has nothing finer to join to. Measured
+// pre-change on live bqb1 (2026-09-25, build `a158c516`): 4.33x–11.56x
+// duplication, with `XLF261030C00056000` written 87 times on 09-24, while the
+// count of DISTINCT nominated contracts was falling (872 → 1,023 → 800 over the
+// three complete sessions) as raw rows rose. Skips are counted
+// (`rankedDuplicatesSkipped`); the set is rebuilt on hydrate, so a mid-session
+// boot re-admits at most that session's remainder.
+// 🔴 `ordered` is NEVER deduped and NEVER throttled. It reads 0 on every day and
+// both classes, so it costs nothing, and an `ordered` row is execution
+// provenance — the one thing here that attests a real order.
 // ⚠ Policy v1 (f39e939b, live 2026-09-17..18) had a 2h per-pair throttle and a
 // first-come 6000-row DAILY budget. On its first session (2026-09-18) the desk
 // budget was exhausted by 10:17 ET and the fixture budget within one minute of
@@ -210,7 +243,27 @@ export interface OtmAdmissionTapeLinkRow {
   occSymbol: string;
 }
 
-export type OtmAdmissionTapeRow = OtmAdmissionTapeCandidateRow | OtmAdmissionTapeLinkRow;
+/**
+ * One rule-3 slot-budget drop, durable (TRA-4906). NOT SAMPLE — see the header.
+ * Carries its own `slot` rather than leaving it to be re-derived from `ts`, so a
+ * later change to {@link SLOT_MINUTES} cannot silently re-bucket banked drops.
+ */
+export interface OtmAdmissionTapeBudgetDropRow {
+  kind: 'budgetdrop';
+  ts: number;
+  etDay: string;
+  accountClass: SpreadCeilingAccountClass;
+  /** ET 30-minute slot index the dropped pass would have been written into. */
+  slot: number;
+  underlying: string;
+  /** Size of the dropped pass, in candidate rows — the size-filter reading. */
+  rows: number;
+}
+
+export type OtmAdmissionTapeRow =
+  | OtmAdmissionTapeCandidateRow
+  | OtmAdmissionTapeLinkRow
+  | OtmAdmissionTapeBudgetDropRow;
 
 interface ClassDayTally {
   candidateRows: number;
@@ -227,6 +280,12 @@ interface ClassDayTally {
   lastTs: number;
   /** Candidate rows per ET 30-minute slot — rule-3 budget AND time coverage. */
   rowsBySlot: Map<number, number>;
+  /**
+   * Rule-3 slot-budget drops per ET slot, rebuilt from `budgetdrop` rows on
+   * hydrate exactly the way {@link rowsBySlot} is (TRA-4906). `passes` = dropped
+   * passes, `rows` = candidate rows they would have written. NEVER sample.
+   */
+  dropsBySlot: Map<number, { passes: number; rows: number }>;
   /** `${underlying}|${ts}` of the last candidate row — rows of a pass are contiguous. */
   lastPassKey: string;
 }
@@ -237,8 +296,17 @@ let dataDir: string | null = null;
 const byDay = new Map<string, Map<string, ClassDayTally>>();
 /** `${book}|${symbol}` → `${etDay}|${slot}` of the pair's last COMMITTED pass (rule 1). */
 const lastSlotByPair = new Map<string, string>();
+/**
+ * etDay → `${slot}|${accountClass}|${occSymbol}` already written as a `ranked`
+ * link (TRA-4906). Holds ONE ET day at a time — see {@link markRankedSeen} — so
+ * it is bounded by a single session's nominee set (~1k contracts × 13 RTH slots
+ * × classes), which keeps the TRA-4158 RSS ceiling out of play.
+ */
+const rankedSeen = new Map<string, Set<string>>();
 let oversizedPassesDropped = 0;
 let slotBudgetPassesDropped = 0;
+/** `ranked` appends skipped as same-(day,slot,class,contract) duplicates. */
+let rankedDuplicatesSkipped = 0;
 let unsampledPasses = 0;
 let emptyPasses = 0;
 let appendErrors = 0;
@@ -257,8 +325,10 @@ export function clearOtmAdmissionTape(): void {
   dataDir = null;
   byDay.clear();
   lastSlotByPair.clear();
+  rankedSeen.clear();
   oversizedPassesDropped = 0;
   slotBudgetPassesDropped = 0;
+  rankedDuplicatesSkipped = 0;
   unsampledPasses = 0;
   emptyPasses = 0;
   appendErrors = 0;
@@ -330,6 +400,7 @@ function tallyFor(etDay: string, accountClass: string): ClassDayTally {
       firstTs: 0,
       lastTs: 0,
       rowsBySlot: new Map(),
+      dropsBySlot: new Map(),
       lastPassKey: '',
     };
     classes.set(accountClass, t);
@@ -337,9 +408,50 @@ function tallyFor(etDay: string, accountClass: string): ClassDayTally {
   return t;
 }
 
+// ── `ranked` link dedup (TRA-4906) ───────────────────────────────────────────
+// Deliberately keyed the same way the SURVIVORSHIP JOIN reads: the candidate leg
+// is (etDay, slot)-granular, so `(etDay, slot, accountClass, occSymbol)` is the
+// finest key that still has something to join to.
+
+function rankedSeenKey(slot: number, accountClass: string, occSymbol: string): string {
+  return `${slot}|${accountClass}|${occSymbol}`;
+}
+
+function rankedAlreadySeen(etDay: string, slot: number, accountClass: string, occSymbol: string): boolean {
+  return rankedSeen.get(etDay)?.has(rankedSeenKey(slot, accountClass, occSymbol)) === true;
+}
+
+/**
+ * Remember a written `ranked` link. Called from {@link applyRow}, so hydrate
+ * rebuilds the set off disk on the SAME code path the live append uses — there
+ * is no second marking site to drift.
+ *
+ * A previously unseen ET day EVICTS every other day: hydrate walks day buckets
+ * in ascending order and the live path only ever writes today, so the survivor
+ * is always the newest. A backwards day flip would therefore drop the set early;
+ * the only cost is a few re-admitted duplicate rows, and it self-heals.
+ */
+function markRankedSeen(etDay: string, slot: number, accountClass: string, occSymbol: string): void {
+  let seen = rankedSeen.get(etDay);
+  if (!seen) {
+    rankedSeen.clear();
+    seen = new Set<string>();
+    rankedSeen.set(etDay, seen);
+  }
+  seen.add(rankedSeenKey(slot, accountClass, occSymbol));
+}
+
 function applyRow(row: OtmAdmissionTapeRow): void {
   const t = tallyFor(row.etDay, row.accountClass);
-  if (row.kind === 'candidate') {
+  if (row.kind === 'budgetdrop') {
+    // NOT SAMPLE: touches dropsBySlot and the ts bounds only — never
+    // candidateRows / admitted / ranked / ordered / passesRecorded, and never
+    // rowsBySlot (which is the rule-3 budget's own denominator).
+    const cell = t.dropsBySlot.get(row.slot) ?? { passes: 0, rows: 0 };
+    cell.passes += 1;
+    cell.rows += Number.isFinite(row.rows) ? row.rows : 0;
+    t.dropsBySlot.set(row.slot, cell);
+  } else if (row.kind === 'candidate') {
     t.candidateRows += 1;
     const sampled = typeof row.samplingPolicy === 'number' && row.samplingPolicy >= 2;
     if (!sampled) t.legacyRows += 1;
@@ -358,6 +470,7 @@ function applyRow(row: OtmAdmissionTapeRow): void {
     }
   } else if (row.kind === 'ranked') {
     t.ranked += 1;
+    markRankedSeen(row.etDay, slotOf(row.ts), row.accountClass, row.occSymbol);
   } else {
     t.ordered += 1;
   }
@@ -446,7 +559,21 @@ export function beginOtmAdmissionPass(ctx: OtmAdmissionPassContext): OtmAdmissio
       const t = tallyFor(etDay, accountClass);
       const slotBudget = MAX_ROWS_PER_SLOT[accountClass] ?? MAX_ROWS_PER_SLOT_OTHER;
       if ((t.rowsBySlot.get(slot) ?? 0) + decisions.length > slotBudget) {
+        // The counter is the process total and is KEPT (cited elsewhere); the row
+        // is what makes the count per-slot and boot-durable (TRA-4906). Not
+        // sample — `applyRow` routes it to `dropsBySlot` only.
         slotBudgetPassesDropped += 1;
+        const dropRow: OtmAdmissionTapeBudgetDropRow = {
+          kind: 'budgetdrop',
+          ts: now,
+          etDay,
+          accountClass,
+          slot,
+          underlying: decisions[0]!.underlying,
+          rows: decisions.length,
+        };
+        applyRow(dropRow);
+        appendLines([JSON.stringify(dropRow)]);
         return;
       }
       const lines: string[] = [];
@@ -482,11 +609,19 @@ export function beginOtmAdmissionPass(ctx: OtmAdmissionPassContext): OtmAdmissio
 
 function recordLink(kind: 'ranked' | 'ordered', ctx: OtmAdmissionPassContext, occSymbol: string): void {
   const now = ctx.now ?? Date.now();
+  const etDay = etDateString(new Date(now));
+  const accountClass = classifySpreadCeilingAccount(ctx.book ?? undefined);
+  if (kind === 'ranked' && rankedAlreadySeen(etDay, slotOf(now), accountClass, occSymbol)) {
+    // Already on disk for this (day, slot, class, contract) — the join reads the
+    // SET of nominees, so a second row carries no information (TRA-4906).
+    rankedDuplicatesSkipped += 1;
+    return;
+  }
   const row: OtmAdmissionTapeLinkRow = {
     kind,
     ts: now,
-    etDay: etDateString(new Date(now)),
-    accountClass: classifySpreadCeilingAccount(ctx.book ?? undefined),
+    etDay,
+    accountClass,
     mode: ctx.mode,
     underlying: ctx.symbol,
     occSymbol,
@@ -495,12 +630,21 @@ function recordLink(kind: 'ranked' | 'ordered', ctx: OtmAdmissionPassContext, oc
   appendLines([JSON.stringify(row)]);
 }
 
-/** The selector nominated this contract (it was RANKED first). Never throttled. */
+/**
+ * The selector nominated this contract (it was RANKED first). DEDUPED per
+ * `(etDay, slot, accountClass, occSymbol)` — information-preserving, not a
+ * throttle; see the header. Never quote-dependent: the key holds no quote.
+ */
 export function recordOtmAdmissionRanked(ctx: OtmAdmissionPassContext, occSymbol: string): void {
   recordLink('ranked', ctx, occSymbol);
 }
 
-/** A final open went through for this contract (it was ORDERED). Never throttled. */
+/**
+ * A final open went through for this contract (it was ORDERED).
+ * 🔴 UNCONDITIONAL — never deduped, never throttled, never budgeted. This row is
+ * execution provenance (TRA-4906 AC4); it reads 0 on every day and both classes,
+ * so it costs nothing, and losing one loses the attestation that an order existed.
+ */
 export function recordOtmAdmissionOrdered(ctx: OtmAdmissionPassContext, occSymbol: string): void {
   recordLink('ordered', ctx, occSymbol);
 }
@@ -524,6 +668,16 @@ function parseRow(trimmed: string): OtmAdmissionTapeRow | null {
   if (rec.kind === 'ranked' || rec.kind === 'ordered') {
     if (typeof rec.occSymbol !== 'string') return null;
     return rec as unknown as OtmAdmissionTapeLinkRow;
+  }
+  if (rec.kind === 'budgetdrop') {
+    // `slot` is the row's whole point and is required. `rows` is read leniently:
+    // a drop with an unreadable size is still a drop, and losing the PASS count
+    // would understate rule-3's bite — the opposite of why the row exists.
+    if (typeof rec.slot !== 'number' || !Number.isFinite(rec.slot)) return null;
+    return {
+      ...(rec as unknown as OtmAdmissionTapeBudgetDropRow),
+      rows: typeof rec.rows === 'number' && Number.isFinite(rec.rows) ? rec.rows : 0,
+    };
   }
   if (rec.kind !== 'candidate') return null;
   if (typeof rec.occSymbol !== 'string' || typeof rec.admitted !== 'boolean') return null;
@@ -637,6 +791,14 @@ export interface OtmAdmissionTapeClassDaySummary {
   legacyRows?: number;
   /** Candidate rows per ET 30-minute slot, `HH:MM` slot start → rows. The time-coverage check. */
   rowsBySlotEt?: Record<string, number>;
+  /**
+   * Rule-3 slot-budget drops per ET slot, `HH:MM` slot start → dropped passes
+   * and the candidate rows they would have written (TRA-4906/TRA-4905 AC1).
+   * Rebuilt from durable `budgetdrop` rows, so it SURVIVES A BOOT — read it
+   * post-close from any boot. `{}` means rule 3 never bit that day/class.
+   * ⚠ NOT SAMPLE: these rows are in no other count on this surface.
+   */
+  dropsBySlotEt?: Record<string, { passes: number; rows: number }>;
   firstTs?: number;
   lastTs: number;
 }
@@ -678,7 +840,14 @@ export interface OtmAdmissionTapeSummary {
   counters: {
     unsampledPasses: number;
     oversizedPassesDropped: number;
+    /**
+     * PROCESS TOTAL since boot — kept because it is cited elsewhere, but it is
+     * NOT the AC1 readout: use `byClass[].days[].dropsBySlotEt`, which is
+     * per-slot and survives a restart.
+     */
     slotBudgetPassesDropped: number;
+    /** `ranked` appends skipped as duplicates (TRA-4906). Process total. */
+    rankedDuplicatesSkipped: number;
     emptyPasses: number;
   };
   durability: {
@@ -725,6 +894,10 @@ export function summarizeOtmAdmissionTape(): OtmAdmissionTapeSummary {
       for (const slot of [...t.rowsBySlot.keys()].sort((a, b) => a - b)) {
         rowsBySlotEt[slotLabel(slot)] = t.rowsBySlot.get(slot)!;
       }
+      const dropsBySlotEt: Record<string, { passes: number; rows: number }> = {};
+      for (const slot of [...t.dropsBySlot.keys()].sort((a, b) => a - b)) {
+        dropsBySlotEt[slotLabel(slot)] = { ...t.dropsBySlot.get(slot)! };
+      }
       c.days.push({
         etDay,
         candidateRows: t.candidateRows,
@@ -736,6 +909,7 @@ export function summarizeOtmAdmissionTape(): OtmAdmissionTapeSummary {
         ranked: t.ranked,
         ordered: t.ordered,
         rowsBySlotEt,
+        dropsBySlotEt,
         firstTs: t.firstTs,
         lastTs: t.lastTs,
       });
@@ -757,12 +931,13 @@ export function summarizeOtmAdmissionTape(): OtmAdmissionTapeSummary {
       retainDays: Math.round(RETAIN_MS / (24 * 60 * 60 * 1000)),
       maxFileBytes: MAX_FILE_BYTES,
       sampling:
-        'v2 slot sampler: first ok pass per (book×symbol) per ET 30-min slot, selected by fnv1a(book|symbol|etDay|slot) % sampleMod — decided from identity and clock before the scan, independent of mark, spreadPct, scan order and time-of-day. Whole-pass drops only; per-(class×day×slot) row budget, never a daily first-come one. Rows without samplingPolicy are v1 (open-biased) and excluded from sessionsWithAdmissions.',
+        'v2 slot sampler: first ok pass per (book×symbol) per ET 30-min slot, selected by fnv1a(book|symbol|etDay|slot) % sampleMod — decided from identity and clock before the scan, independent of mark, spreadPct, scan order and time-of-day. Whole-pass drops only; per-(class×day×slot) row budget, never a daily first-come one. Rows without samplingPolicy are v1 (open-biased) and excluded from sessionsWithAdmissions. Every slot-budget drop also writes a durable kind:budgetdrop row carrying the dropped pass\'s slot and size — read days[].dropsBySlotEt, which is per-slot and survives a boot; counters.slotBudgetPassesDropped is only a process total. budgetdrop rows are NOT sample: they are in no candidateRows/admitted/ranked/ordered/sessionsWithAdmissions count. kind:ranked links are deduped per (etDay, slot, accountClass, occSymbol) — information-preserving, since the candidate leg of the survivorship join is itself (etDay, slot)-granular; skips are counted as rankedDuplicatesSkipped, and pre-2026-09-25 days hold the un-deduped multiset. kind:ordered is UNCONDITIONAL — never deduped, never throttled (execution provenance).',
     },
     counters: {
       unsampledPasses,
       oversizedPassesDropped,
       slotBudgetPassesDropped,
+      rankedDuplicatesSkipped,
       emptyPasses,
     },
     durability: {
