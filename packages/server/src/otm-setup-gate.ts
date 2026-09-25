@@ -438,6 +438,41 @@ export interface OtmSetupGateCounterfactual {
    * exactly why this counter ships beside them instead of being inferred.
    */
   readonly denseRows: number;
+  /**
+   * Rows on which this setup's `evaluate` THREW and was folded as a decline
+   * (TRA-4423). Dense over the registry.
+   *
+   * ⛔ THIS IS THE THROW/DECLINE DISCRIMINATOR AND IT WAS MISSING. The engine
+   * has always recorded `SetupTaxonomyScore.threw`, but nothing folded it, so
+   * "setup E declined honestly on 1,869 rows" and "setup E threw on 1,869 rows"
+   * rendered BYTE-IDENTICAL on the health route — measured live 2026-09-25, in
+   * the very fold built to remove that class of ambiguity. A non-zero here is a
+   * CODE fault, never a market reading.
+   */
+  readonly threwBySetup: Readonly<Record<string, number>>;
+  /**
+   * Which conjunctive LEG refused, per setup: `setupId → declinedAt → count`
+   * (TRA-4423). Dense over the registry at the outer level; the inner map holds
+   * only legs actually seen, because the leg vocabulary belongs to each setup and
+   * this fold must not claim to know legs it has never been told about.
+   *
+   * ⛔ READ THIS BEFORE CALLING ANY `matchedSameSide: 0` A REAL ZERO. A setup is
+   * a CONJUNCTION; without the leg split, "the market offered nothing today" and
+   * "this threshold is unsatisfiable" are the same number.
+   */
+  readonly declineLegBySetup: Readonly<Record<string, Readonly<Record<string, number>>>>;
+  /**
+   * Declines this setup did NOT attribute to a leg — it returned a bare `null`.
+   * Dense over the registry.
+   *
+   * ⛔ THE COVERAGE TELL FOR THE MAP ABOVE, and it exists so an empty
+   * `declineLegBySetup` cannot be misread as "no declines". A setup that has
+   * never been taught to attribute (A-D today) reads ALL of its declines here,
+   * which is honest; a setup that attributes reads 0 here and its leg histogram
+   * sums to its declines. ⛔ `declineLegBySetup[id]` empty with a non-zero here
+   * means UNATTRIBUTED, never "never declined".
+   */
+  readonly declinedUnattributedBySetup: Readonly<Record<string, number>>;
   /** Epoch ms this fold started counting: module load, or the last test reset. */
   readonly since: number;
 }
@@ -457,11 +492,23 @@ let cfConflictBySetup = new Map<string, number>();
 let cfReachedBySetup = new Map<string, number>();
 let cfMatchedSameBySetup = new Map<string, number>();
 let cfMatchedOppBySetup = new Map<string, number>();
+let cfThrewBySetup = new Map<string, number>();
+let cfDeclineLegBySetup = new Map<string, Map<string, number>>();
+let cfDeclinedUnattributedBySetup = new Map<string, number>();
 let cfDenseRows = 0;
 let cfSince = Date.now();
 
 function bump(m: Map<string, number>, id: string): void {
   m.set(id, (m.get(id) ?? 0) + 1);
+}
+
+function bumpLeg(id: string, leg: string): void {
+  let inner = cfDeclineLegBySetup.get(id);
+  if (!inner) {
+    inner = new Map<string, number>();
+    cfDeclineLegBySetup.set(id, inner);
+  }
+  inner.set(leg, (inner.get(leg) ?? 0) + 1);
 }
 
 /**
@@ -485,7 +532,27 @@ export function noteOtmSetupGateCounterfactual(decision: OtmSetupGateDecision): 
     for (const s of v.perSetup) {
       if (!s.reached) continue;
       bump(cfReachedBySetup, s.setupId);
-      if (!s.matched || s.side === null) continue;
+      // ⛔ A THROW IS FOLDED AS A DECLINE UPSTREAM, so it must be counted here
+      // or it is indistinguishable from an honest decline (TRA-4423). Counted
+      // BEFORE the match branch and kept out of the leg histogram: a throw has
+      // no leg, and mixing it in would let a crashing setup read as a market
+      // reading.
+      if (s.threw) {
+        bump(cfThrewBySetup, s.setupId);
+        continue;
+      }
+      if (!s.matched) {
+        // Declined. Attribute the leg when the setup named one; otherwise count
+        // it as unattributed rather than silently dropping the row, so the leg
+        // histogram's coverage is always readable off the fold itself.
+        if (s.declinedAt !== null) bumpLeg(s.setupId, s.declinedAt);
+        else bump(cfDeclinedUnattributedBySetup, s.setupId);
+        continue;
+      }
+      // A match with no side is not constructible through `evaluate`; it is
+      // skipped rather than counted, exactly as before this fold learned about
+      // declines — it is NOT a decline and must not inflate the leg histogram.
+      if (s.side === null) continue;
       bump(s.side === decision.nomineeSide ? cfMatchedSameBySetup : cfMatchedOppBySetup, s.setupId);
     }
   }
@@ -528,6 +595,21 @@ export function readOtmSetupGateCounterfactual(
     matchedSameSideBySetup: dense(cfMatchedSameBySetup),
     matchedOppositeSideBySetup: dense(cfMatchedOppBySetup),
     denseRows: cfDenseRows,
+    threwBySetup: dense(cfThrewBySetup),
+    declineLegBySetup: (() => {
+      const out: Record<string, Record<string, number>> = {};
+      // Dense over the registry so a setup with zero attributed declines reads
+      // `{}` rather than being absent — absent would be indistinguishable from
+      // a setup this build does not know about.
+      for (const d of registry) out[d.setupId] = {};
+      for (const [id, inner] of cfDeclineLegBySetup) {
+        const legs: Record<string, number> = out[id] ?? {};
+        for (const [leg, n] of inner) legs[leg] = n;
+        out[id] = legs;
+      }
+      return out;
+    })(),
+    declinedUnattributedBySetup: dense(cfDeclinedUnattributedBySetup),
     since: cfSince,
   };
 }
@@ -542,6 +624,9 @@ export function resetOtmSetupGateCounterfactualForTest(): void {
   cfReachedBySetup = new Map();
   cfMatchedSameBySetup = new Map();
   cfMatchedOppBySetup = new Map();
+  cfThrewBySetup = new Map();
+  cfDeclineLegBySetup = new Map();
+  cfDeclinedUnattributedBySetup = new Map();
   cfDenseRows = 0;
   cfSince = Date.now();
 }

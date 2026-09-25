@@ -100,13 +100,63 @@ export interface SetupTaxonomyMatch {
   readonly detail?: string;
 }
 
+/**
+ * What a setup returns when it declines and wants to say WHICH LEG refused.
+ *
+ * ⛔ WHY THIS EXISTS (TRA-4423, measured live 2026-09-25). Every setup here is a
+ * CONJUNCTION, and a bare `null` collapses all of its legs into one symbol. On
+ * 2026-09-25 setup E read `matchedSameSide: 0` against an honest, dense
+ * `reached: 1869` — and that zero was STILL unreadable, because "the market
+ * offered no coiled breakout today" (correct, expected, common on one session)
+ * and "the coil threshold is mis-specified and can never pass" are the same
+ * `null`. Worse, E is the only setup of the five that reads `volume`, and the
+ * daily fetcher maps `volume: q.volume ?? 0` — so a provider answering null
+ * volume zeroes E's expansion leg FOREVER, on every row, with no tell.
+ *
+ * Returning a decline instead of `null` is what makes those states different
+ * symbols. It is OPTIONAL: `null` stays valid and means "declined, leg not
+ * attributed", so A-D need no change and no second implementation can drift
+ * away from the one that decides.
+ *
+ * ⛔ A DECLINE IS NOT A MATCH. It carries no `side` and the verdict treats it
+ * EXACTLY as `null` — see {@link isSetupTaxonomyMatch}.
+ */
+export interface SetupTaxonomyDecline {
+  readonly setupId: string;
+  /**
+   * Which conjunctive leg refused. Short, stable, low-cardinality snake_case —
+   * this is a histogram key on a health route, never a per-candidate number.
+   */
+  readonly declinedAt: string;
+}
+
+/** A match, an attributed decline, or an unattributed decline. */
+export type SetupTaxonomyOutcome = SetupTaxonomyMatch | SetupTaxonomyDecline | null;
+
+/**
+ * Discriminate a match from a decline.
+ *
+ * Keyed on `side`, which {@link SetupTaxonomyMatch} always carries and
+ * {@link SetupTaxonomyDecline} never does. ⛔ Do NOT key this on `declinedAt`
+ * being absent — that would read a malformed match as a decline instead of
+ * failing, and the whole point here is that the two must never be confusable.
+ */
+export function isSetupTaxonomyMatch(o: SetupTaxonomyOutcome): o is SetupTaxonomyMatch {
+  return o !== null && 'side' in o;
+}
+
 /** One registered setup. A-E implement this; none exist yet, by design. */
 export interface SetupTaxonomyDefinition {
   readonly setupId: string;
   readonly label: string;
   /** Minimum bars THIS setup needs; the gate takes the max over enabled setups. */
   readonly minBars: number;
-  evaluate(input: SetupTaxonomyInput): SetupTaxonomyMatch | null;
+  /**
+   * ⛔ A {@link SetupTaxonomyDecline} return is a DECLINE, byte-equivalent to
+   * `null` for the verdict. It exists only so the leg that refused reaches the
+   * counterfactual fold.
+   */
+  evaluate(input: SetupTaxonomyInput): SetupTaxonomyOutcome;
 }
 
 export interface SetupTaxonomyInput {
@@ -139,6 +189,15 @@ export interface SetupTaxonomyScore {
   readonly side: SetupTaxonomySide | null;
   /** TRUE ⇒ `evaluate` threw and was folded as a decline (never a series fault). */
   readonly threw: boolean;
+  /**
+   * Which conjunctive leg refused, when the setup declined AND attributed it.
+   * Null on a match, on a throw, and on a setup that returns bare `null`.
+   *
+   * ⛔ NULL IS "NOT ATTRIBUTED", NOT "NO REASON". A setup that declines without
+   * naming a leg reads null here, exactly like one that matched — always gate a
+   * decline histogram on `reached && !matched` before reading this.
+   */
+  readonly declinedAt: string | null;
 }
 
 export interface SetupTaxonomyVerdict {
@@ -275,7 +334,14 @@ export function evaluateSetupTaxonomy(
   // Dense over the ENABLED list from the start, so a setup that is never
   // reached is still present with `reached: false` rather than missing.
   const perSetup: SetupTaxonomyScore[] | null = scoreAll
-    ? setups.map((s) => ({ setupId: s.setupId, reached: false, matched: false, side: null, threw: false }))
+    ? setups.map((s) => ({
+        setupId: s.setupId,
+        reached: false,
+        matched: false,
+        side: null,
+        threw: false,
+        declinedAt: null,
+      }))
     : null;
 
   let conflict: SetupTaxonomyMatch | null = null;
@@ -289,14 +355,23 @@ export function evaluateSetupTaxonomy(
     const settled = confirm !== null;
     scored += 1;
     let match: SetupTaxonomyMatch | null = null;
+    let declinedAt: string | null = null;
     let threw = false;
     try {
-      match = setup.evaluate(input);
+      const outcome = setup.evaluate(input);
+      if (isSetupTaxonomyMatch(outcome)) {
+        match = outcome;
+      } else if (outcome !== null) {
+        // An ATTRIBUTED decline. Identical to `null` for the verdict below; the
+        // only thing it adds is which leg refused, for the fold.
+        declinedAt = outcome.declinedAt;
+      }
     } catch {
       // A setup that throws is that setup declining, not the series being
       // unreadable — the series demonstrably read fine for its siblings. It
       // folds to `no_setup_matched` rather than voiding the row's grade.
       match = null;
+      declinedAt = null;
       threw = true;
     }
     if (perSetup) {
@@ -306,6 +381,7 @@ export function evaluateSetupTaxonomy(
         matched: match !== null,
         side: match?.side ?? null,
         threw,
+        declinedAt,
       };
     }
     if (settled || !match) continue;

@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import type { Candle } from '@trading-app/shared';
 import {
   evaluateSetupTaxonomy,
+  isSetupTaxonomyMatch,
   SETUP_TAXONOMY_REGISTRY,
   SETUP_TAXONOMY_REASON_CODES,
   SETUP_TAXONOMY_MIN_BARS,
@@ -217,7 +218,9 @@ describe('TRA-4423 — scoreAll: per-setup truth WITHOUT changing the verdict', 
     expect(dense.setupId).toBe('B'); // verdict unmoved
     expect(dense.setupsScored).toBe(2); // truthful call count
     const c = dense.perSetup?.find((p) => p.setupId === 'C');
-    expect(c).toEqual({ setupId: 'C', reached: true, matched: true, side: 'call', threw: false });
+    expect(c).toEqual({
+      setupId: 'C', reached: true, matched: true, side: 'call', threw: false, declinedAt: null,
+    });
   });
 
   it('separates NEVER FIRES from NEVER REACHED — the two that used to read alike', () => {
@@ -247,8 +250,11 @@ describe('TRA-4423 — scoreAll: per-setup truth WITHOUT changing the verdict', 
     };
     const v = evaluateSetupTaxonomy(input, [boom, neverSetup('B')], { scoreAll: true });
     expect(v.reasonCode).toBe('no_setup_matched');
+    // ⛔ `declinedAt` stays NULL on a throw. A throw has no leg — folding it into
+    // the leg histogram would let a crashing setup read as a market observation,
+    // which is the exact confusion `threw` exists to prevent.
     expect(v.perSetup?.find((p) => p.setupId === 'X'))
-      .toEqual({ setupId: 'X', reached: true, matched: false, side: null, threw: true });
+      .toEqual({ setupId: 'X', reached: true, matched: false, side: null, threw: true, declinedAt: null });
   });
 
   it('an unreadable series short-circuits BEFORE scoring, so perSetup stays absent', () => {
@@ -272,5 +278,69 @@ describe('TRA-4423 — scoreAll: per-setup truth WITHOUT changing the verdict', 
     expect(v.setupId).toBe('A');
     expect(v.perSetup?.find((p) => p.setupId === 'C'))
       .toMatchObject({ reached: true, matched: true, side: 'put' });
+  });
+});
+
+describe('TRA-4423 — attributed declines: WHICH LEG refused', () => {
+  const input = { symbol: 'AAPL', series: series(120), nomineeSide: 'call' as const };
+
+  /** A setup that declines and NAMES the leg that refused. */
+  function declineSetup(setupId: string, declinedAt: string, minBars = 10): SetupTaxonomyDefinition {
+    return { setupId, label: setupId, minBars, evaluate: () => ({ setupId, declinedAt }) };
+  }
+
+  it('⛔ THE DISCRIMINATOR: an attributed decline carries its leg; a bare null carries none', () => {
+    // These two setups are behaviourally IDENTICAL — both decline. Before this
+    // change they were also INDISTINGUISHABLE, which is the whole defect: a
+    // four-leg conjunction returning one `null` cannot say whether the market
+    // was quiet or a threshold is unsatisfiable.
+    const v = evaluateSetupTaxonomy(
+      input, [declineSetup('A', 'not_coiled'), neverSetup('B')], { scoreAll: true },
+    );
+    expect(v.perSetup?.find((p) => p.setupId === 'A'))
+      .toEqual({ setupId: 'A', reached: true, matched: false, side: null, threw: false, declinedAt: 'not_coiled' });
+    expect(v.perSetup?.find((p) => p.setupId === 'B'))
+      .toEqual({ setupId: 'B', reached: true, matched: false, side: null, threw: false, declinedAt: null });
+  });
+
+  it('⛔ a decline is NOT a match — the verdict is byte-identical to a bare-null decline', () => {
+    // The behaviour-preservation claim. An attributed decline must reach the fold
+    // and change NOTHING the gate consumes.
+    const attributed = evaluateSetupTaxonomy(input, [declineSetup('A', 'not_coiled'), declineSetup('B', 'no_break')]);
+    const bare = evaluateSetupTaxonomy(input, [neverSetup('A'), neverSetup('B')]);
+    expect({
+      c: attributed.confirmed, r: attributed.reasonCode,
+      s: attributed.setupId, side: attributed.confirmedSide, n: attributed.setupsScored,
+    }).toEqual({
+      c: bare.confirmed, r: bare.reasonCode, s: bare.setupId, side: bare.confirmedSide, n: bare.setupsScored,
+    });
+    expect(attributed.reasonCode).toBe('no_setup_matched');
+  });
+
+  it('a declining setup never masks a later confirm, and the confirm records no leg', () => {
+    const v = evaluateSetupTaxonomy(
+      input, [declineSetup('A', 'not_coiled'), alwaysSetup('B', 'call')], { scoreAll: true },
+    );
+    expect(v.confirmed).toBe(true);
+    expect(v.setupId).toBe('B');
+    expect(v.perSetup?.find((p) => p.setupId === 'B'))
+      .toMatchObject({ matched: true, side: 'call', declinedAt: null });
+  });
+
+  it('isSetupTaxonomyMatch separates the three outcomes, keyed on side not on declinedAt', () => {
+    expect(isSetupTaxonomyMatch({ setupId: 'A', side: 'call' })).toBe(true);
+    expect(isSetupTaxonomyMatch({ setupId: 'A', declinedAt: 'not_coiled' })).toBe(false);
+    expect(isSetupTaxonomyMatch(null)).toBe(false);
+
+    // ⛔ CAPABILITY ASSERT, AND THE ONLY INPUT THAT DISCRIMINATES. The three
+    // cases above pass under BOTH `'side' in o` and `!('declinedAt' in o)` — they
+    // agree on every well-formed outcome, so they cannot defend the keying. An
+    // object carrying NEITHER key is the separating case: keyed on `side` it is
+    // correctly not a match; keyed on `declinedAt`-absence it would be read as a
+    // match and then consumed with `side: undefined`.
+    //
+    // Measured: mutating the guard to `!('declinedAt' in o)` left all 48 tests
+    // green until this line existed.
+    expect(isSetupTaxonomyMatch({ setupId: 'A' } as never)).toBe(false);
   });
 });
