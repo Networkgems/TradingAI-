@@ -66,6 +66,7 @@ describe('TRA-4893 §1 — the sell-to-close side produces rows', () => {
         structure: 'single_leg_otm',
         underlying: 'SPY',
         taxonomy: carryEntryTaxonomyToExit(ENTRY, 'stop_loss'),
+        admission: 'admitted',
       },
       T0 + 2_000,
     );
@@ -92,7 +93,7 @@ describe('TRA-4893 §1 — the sell-to-close side produces rows', () => {
     advanceRestingOrder(sell, sample({ ts: T0 + 2_000, last: 1.30, volume: 1_400, lastTradeMs: T0 + 2_000 }));
     const sellRow = finalizeRestingOrder(
       sell,
-      { mode: 'demo', structure: 's', underlying: 'X', taxonomy: carryEntryTaxonomyToExit(ENTRY, 'tp1') },
+      { mode: 'demo', structure: 's', underlying: 'X', taxonomy: carryEntryTaxonomyToExit(ENTRY, 'tp1'), admission: 'admitted' },
       T0 + 2_000,
     );
 
@@ -105,7 +106,7 @@ describe('TRA-4893 §1 — the sell-to-close side produces rows', () => {
     advanceRestingOrder(buy, sample({ ts: T0 + 2_000, last: 0.90, volume: 1_400, lastTradeMs: T0 + 2_000 }));
     const buyRow = finalizeRestingOrder(
       buy,
-      { mode: 'demo', structure: 's', underlying: 'X', taxonomy: ENTRY },
+      { mode: 'demo', structure: 's', underlying: 'X', taxonomy: ENTRY, admission: 'admitted' },
       T0 + 2_000,
     );
 
@@ -262,9 +263,9 @@ describe('TRA-4893 — the summary distinguishes states that used to look identi
       mkRow({ printTells: { clock: false, volume: true } }),
       mkRow({ printTells: { clock: false, volume: true } }),
     ]);
-    expect(inert.printTellCoverage.clockReadable).toBe(0);
-    expect(inert.printTellCoverage.volumeOnly).toBe(2);
-    expect(inert.printTellCoverage.both).toBe(0);
+    expect(inert.byAdmission.admitted.printTellCoverage.clockReadable).toBe(0);
+    expect(inert.byAdmission.admitted.printTellCoverage.volumeOnly).toBe(2);
+    expect(inert.byAdmission.admitted.printTellCoverage.both).toBe(0);
 
     // The tell working. Same `rows`, same fill rates — only this column moves,
     // which is exactly why the column had to exist.
@@ -272,29 +273,29 @@ describe('TRA-4893 — the summary distinguishes states that used to look identi
       mkRow({ printTells: { clock: true, volume: true } }),
       mkRow({ printTells: { clock: true, volume: false } }),
     ]);
-    expect(live.printTellCoverage.clockReadable).toBe(2);
-    expect(live.printTellCoverage.both).toBe(1);
-    expect(live.printTellCoverage.clockOnly).toBe(1);
-    expect(live.printTellCoverage.volumeOnly).toBe(0);
+    expect(live.byAdmission.admitted.printTellCoverage.clockReadable).toBe(2);
+    expect(live.byAdmission.admitted.printTellCoverage.both).toBe(1);
+    expect(live.byAdmission.admitted.printTellCoverage.clockOnly).toBe(1);
+    expect(live.byAdmission.admitted.printTellCoverage.volumeOnly).toBe(0);
     // The two summaries agree on everything else — proving the discriminator is
     // this column and not some incidental difference in the fixtures.
-    expect(live.overall.fillRate).toBe(inert.overall.fillRate);
+    expect(live.byAdmission.admitted.overall.fillRate).toBe(inert.byAdmission.admitted.overall.fillRate);
     expect(live.rows).toBe(inert.rows);
   });
 
   it('bySide.sell distinguishes "no exits yet" from "exits not instrumented"', () => {
     const openOnly = summarizeRealFillShadow([mkRow({}), mkRow({})]);
-    expect(openOnly.bySide).toEqual({ buy: 2, sell: 0 });
+    expect(openOnly.byAdmission.admitted.bySide).toEqual({ buy: 2, sell: 0 });
     // This is the TRA-4888 state: byExitType collapses to one open_side bucket.
-    expect(openOnly.byExitType.map((c) => c.key)).toEqual(['open_side']);
+    expect(openOnly.byAdmission.admitted.byExitType.map((c) => c.key)).toEqual(['open_side']);
 
     const withCloses = summarizeRealFillShadow([
       mkRow({}),
       mkRow({ side: 'sell', taxonomyOver: { exitType: 'stop_loss' } }),
       mkRow({ side: 'sell', taxonomyOver: { exitType: 'take_profit' } }),
     ]);
-    expect(withCloses.bySide).toEqual({ buy: 1, sell: 2 });
-    expect(withCloses.byExitType.map((c) => c.key).sort()).toEqual([
+    expect(withCloses.byAdmission.admitted.bySide).toEqual({ buy: 1, sell: 2 });
+    expect(withCloses.byAdmission.admitted.byExitType.map((c) => c.key).sort()).toEqual([
       'open_side',
       'stop_loss',
       'take_profit',
@@ -308,14 +309,14 @@ describe('TRA-4893 — the summary distinguishes states that used to look identi
       mkRow({ side: 'sell', taxonomyOver: { entryTaxonomySource: 'entry_rederived', liquidityBand: 'unknown' } }),
       mkRow({ side: 'sell', taxonomyOver: { entryTaxonomySource: 'entry_rederived', liquidityBand: 'unknown' } }),
     ]);
-    expect(s.byEntryTaxonomySource).toEqual({
+    expect(s.byAdmission.admitted.byEntryTaxonomySource).toEqual({
       entry_native: 1,
       entry_carried: 1,
       entry_rederived: 2,
     });
     // The reason the column matters: half this population's liquidity band is an
     // absent field, not a measurement.
-    const unknownOi = s.byLiquidityBand.find((c) => c.key === 'unknown');
+    const unknownOi = s.byAdmission.admitted.byLiquidityBand.find((c) => c.key === 'unknown');
     expect(unknownOi?.n).toBe(2);
   });
 
@@ -326,9 +327,9 @@ describe('TRA-4893 — the summary distinguishes states that used to look identi
     delete (legacy as Partial<RealFillShadowRow>).printTells;
     delete (legacy.taxonomy as Partial<RealFillTaxonomy>).entryTaxonomySource;
     const s = summarizeRealFillShadow([legacy]);
-    expect(s.byEntryTaxonomySource.entry_native).toBe(1);
-    expect(s.printTellCoverage.neither).toBe(1);
-    expect(s.printTellCoverage.clockReadable).toBe(0);
+    expect(s.byAdmission.admitted.byEntryTaxonomySource.entry_native).toBe(1);
+    expect(s.byAdmission.admitted.printTellCoverage.neither).toBe(1);
+    expect(s.byAdmission.admitted.printTellCoverage.clockReadable).toBe(0);
   });
 });
 
@@ -422,5 +423,9 @@ function mkRow(over: {
       ...(side === 'sell' ? carryEntryTaxonomyToExit(ENTRY, 'stop_loss') : ENTRY),
       ...over.taxonomyOver,
     },
+    admission: 'admitted',
+    refusedAtGate: null,
+    refusalReasonCode: null,
+    sizeBasis: 'actual_open',
   };
 }

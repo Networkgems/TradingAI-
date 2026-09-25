@@ -587,9 +587,13 @@ import {
   carryEntryTaxonomyToExit,
   isOptionRealFillShadowEnabled,
   DEFAULT_REAL_FILL_CONFIG,
+  realFillSampler,
   type RestingOrderState,
   type EntryType as RealFillEntryType,
   type RealFillTaxonomy,
+  type RealFillAdmission,
+  type RealFillRefusalGate,
+  type RealFillSizeBasis,
 } from './option-real-fill-shadow.js';
 
 /**
@@ -614,6 +618,17 @@ interface RealFillShadowInFlight {
   expiration: string;
   structure: string;
   taxonomy: ReturnType<typeof buildTaxonomy>;
+  /**
+   * TRA-4897 — carried from the call site to `finalizeRestingOrder` so the row
+   * is stamped with the partition it was BORN into. Deriving it at finalise time
+   * from "did this contract open?" would be wrong for the case that matters: a
+   * refused candidate and an opened-then-immediately-closed one look the same
+   * by then.
+   */
+  admission: RealFillAdmission;
+  refusedAtGate: RealFillRefusalGate | null;
+  refusalReasonCode: string | null;
+  sizeBasis: RealFillSizeBasis;
 }
 import { recordOptionTradeEntrySlippage, recordOptionTradeEntryQuote, recordOptionTradeVoid } from './option-trade-journal.js';
 import { recordEntryQuoteStampOutcome } from './entry-quote-stamp.js';
@@ -3365,6 +3380,19 @@ export class SignalEngine {
    * observe to the end must not be booked at all.
    */
   private realFillShadows: RealFillShadowInFlight[] = [];
+
+  /**
+   * TRA-4897 — the `reasonCode` and cell of the MOST RECENT `cost_bar` refusal
+   * `costAwareGateReject` produced, so the refused-candidate shadow can stamp
+   * the gate's own bucket instead of re-deriving it.
+   *
+   * ⚠️ Read it on the SAME SYNCHRONOUS PATH as the reject it describes — the
+   * refused call site is the next statement after the reject, and it must stay
+   * that way. This is a one-slot channel, not a history: the next candidate in
+   * the scan loop overwrites it, and `costAwareGateReject` clears it on entry so
+   * a stale code from a previous candidate can never be read as this one's.
+   */
+  private lastCostGateRefusal: { reasonCode: string | null; cell: string | null } | null = null;
   /**
    * TRA-4893 item 1 — the ENTRY-time taxonomy of every contract this process
    * opened a real-fill shadow for, keyed by OCC symbol, so the matching CLOSE
@@ -8643,6 +8671,12 @@ export class SignalEngine {
     // their rows contribute no `bySelection` key rather than a synthetic one.
     nominator?: LiveEnforceNominator | null,
   ): string | null {
+    // TRA-4897 — cleared on ENTRY so that every early return (gate off, wrong
+    // mode, a bypass grant) leaves it null without needing its own assignment.
+    // Only the four points below that return a REASON set it, and each sets it
+    // from the same `reasonCode` it hands the gate ledger on the line above — so
+    // this ledger and `byReason` cannot drift.
+    this.lastCostGateRefusal = null;
     if (this.mode === 'demo') {
       const env = this.resolveDemoFlagEnv();
       if (!isOptionCostAwareGateEnabled(env)) return null;
@@ -8684,6 +8718,9 @@ export class SignalEngine {
           // TRA-4439 D5 — the owning book's class, frozen at decision time.
           { accountClass: classifySpreadCeilingAccount(this.alertUsername) },
         );
+        this.lastCostGateRefusal = verdict.admit
+          ? null
+          : { reasonCode: verdict.reasonCode ?? null, cell: tape.cellKey ?? null };
         return verdict.admit ? null : verdict.reason;
       }
       // TRA-4378 — the board-approved bounded exploration allowance. When the
@@ -8739,6 +8776,9 @@ export class SignalEngine {
         Date.now(),
         { accountClass: classifySpreadCeilingAccount(this.alertUsername) }, // TRA-4439 D5
       );
+      this.lastCostGateRefusal = tape.admit
+        ? null
+        : { reasonCode: tape.reasonCode ?? null, cell: tape.cellKey ?? null };
       return tape.admit ? null : tape.reason;
     }
     // TRA-2048 — LIVE enforcing branch. Read the arm from the PROCESS env only (a
@@ -8842,6 +8882,9 @@ export class SignalEngine {
             ...costOpts,
           },
         );
+        this.lastCostGateRefusal = verdict.admit
+          ? null
+          : { reasonCode: verdict.reasonCode ?? null, cell: tape.cellKey ?? null };
         return verdict.admit ? null : verdict.reason;
       }
       // TRA-3401 — the board-ordered ONE-SHOT bypass (card `6b82a9e7` Q2
@@ -8917,6 +8960,11 @@ export class SignalEngine {
           ...costOpts,
         },
       );
+      // TRA-4897 — the DEPLOYED form, so this is the assignment the refused
+      // shadow rows on bqb1 will actually carry.
+      this.lastCostGateRefusal = tape.admit
+        ? null
+        : { reasonCode: tape.reasonCode ?? null, cell: tape.cellKey ?? null };
       return tape.admit ? null : tape.reason;
     }
     return null;
@@ -9818,7 +9866,18 @@ export class SignalEngine {
       // `null` = one-sided / crossed book. Such opens DROP OUT of the
       // denominator rather than being booked at a flattering zero cost.
       if (!state) return;
-      if (this.realFillShadows.length >= SHADOW_CHASE_MAX_IN_FLIGHT) return;
+      // TRA-4897 — the admitted partition has its OWN reserved slots and is
+      // never dropped for a refused candidate's sake. It grows at ≤2/day; a
+      // shared 200-slot buffer against 3,039 refusals/day would starve it.
+      if (
+        realFillSampler().offer({
+          admission: 'admitted',
+          optionSymbol,
+          etDay: etDateString(new Date()),
+          nowMs: Date.now(),
+          inFlightForPartition: this.countRealFillShadows('admitted'),
+        }) !== 'sampled'
+      ) return;
 
       const taxonomy = buildTaxonomy({
         structure,
@@ -9831,7 +9890,17 @@ export class SignalEngine {
         hasExit: false,
       });
 
-      this.realFillShadows.push({ state, symbol, expiration, structure, taxonomy });
+      this.realFillShadows.push({
+        state,
+        symbol,
+        expiration,
+        structure,
+        taxonomy,
+        admission: 'admitted',
+        refusedAtGate: null,
+        refusalReasonCode: null,
+        sizeBasis: 'actual_open',
+      });
 
       // TRA-4893 item 1 — remember the ENTRY taxonomy for this contract so its
       // eventual close row carries these exact bands. Stamped here, at the open,
@@ -9847,6 +9916,128 @@ export class SignalEngine {
         if (!oldest.done) this.realFillEntryTaxonomy.delete(oldest.value);
       }
       this.realFillEntryTaxonomy.set(optionSymbol, taxonomy);
+    } catch {
+      // Telemetry must never break a trade pass.
+    }
+  }
+
+  /** In-flight real-fill shadow orders belonging to one admission partition. */
+  private countRealFillShadows(admission: RealFillAdmission): number {
+    let n = 0;
+    for (const o of this.realFillShadows) if (o.admission === admission) n += 1;
+    return n;
+  }
+
+  /**
+   * TRA-4897 — shadow a candidate the COST BAR REFUSED, under the `refused`
+   * partition.
+   *
+   * ── Why this exists ─────────────────────────────────────────────────────────
+   * Every pre-existing call site is downstream of a successful open
+   * (`if (!opened) continue;`), and `cost_bar` refuses essentially every OTM
+   * candidate and `continue`s. So the ledger could not produce a row, and
+   * `rows: 0` / `fillRate: null` read EXACTLY like "we rested limits and the
+   * tape never printed through them" — a statement about the MARKET — when it
+   * was a statement about a gate. Partitioned, the route says
+   * `admitted: 0 (see live-enforce-gates)` beside `refused: N` and describes
+   * itself. Ruling TRA-4897 `01167edb`, build order `d9ea0632`.
+   *
+   * ── What a refused row is and is NOT ───────────────────────────────────────
+   * It models "would a resting limit at the mid have filled on this contract".
+   * It is NOT a trade we declined and carries no P&L: `cost_bar` is the single
+   * highest-blocking live gate and it `continue`s, so `spread`,
+   * `otm_delta_floor`, `aggregate_cap`, `canary_ceiling`,
+   * `fleet_reachable_bound`, `exit_actionability` and `sleeve_stand_down` were
+   * never run on this candidate. ⛔ It is inadmissible to TRA-4887/TRA-4894,
+   * which need a realised-R numerator.
+   *
+   * ⛔ Nothing here is a route back to trading. With `spreadCrossR → 0` the bar
+   * is `max(0.05 + 0 + 0.10, minGrossR 0.30) = 0.30` and the live cells carry
+   * −0.215375 / −0.063103 / −0.051113 — a shortfall ≥ 0.35R under FREE
+   * execution. No execution improvement, including a perfect one, admits any
+   * current cell. 0.385R untouched, TRA-4750 stand-down untouched.
+   *
+   * ── Size ───────────────────────────────────────────────────────────────────
+   * The gate rejected before sizing, so there is no contract count to carry. The
+   * shadow rests ONE and stamps `refused_nominal_1`; dollar totals on this
+   * partition are therefore per-one-contract and the size-free columns
+   * (`basisDeltaUsd`, `meanBasisDeltaPctOfMid`) are the ones to read.
+   *
+   * Fire-and-forget and totally defensive, like the other two call sites. It
+   * runs AFTER the gate has already decided to `continue`, so it cannot affect
+   * any admission.
+   */
+  private beginRealFillShadowRefused(
+    structure: string,
+    signal: { symbol?: string; expiration?: string },
+    candidate: {
+      optionSymbol?: string;
+      bid?: number;
+      ask?: number;
+      delta?: number | null;
+      dte?: number | null;
+      openInterest?: number | null;
+    },
+  ): void {
+    try {
+      if (!isOptionRealFillShadowEnabled(this.resolveDemoFlagEnv())) return;
+      if (typeof this.rvScanner?.getOptionTapeSample !== 'function') return;
+
+      const { symbol, expiration } = signal;
+      const { optionSymbol, bid, ask } = candidate;
+      if (!symbol || !expiration || !optionSymbol) return;
+      if (typeof bid !== 'number' || typeof ask !== 'number') return;
+
+      // ⛔ Read BEFORE any further work: it is a one-slot channel cleared on
+      // every `costAwareGateReject` entry, and this call site is the next
+      // statement after the reject that set it.
+      const refusal = this.lastCostGateRefusal;
+
+      const state = beginRestingOrder(
+        { side: 'buy', optionSymbol, limitUsd: (bid + ask) / 2, contracts: 1, bid, ask },
+        Date.now(),
+        DEFAULT_REAL_FILL_CONFIG,
+      );
+      // One-sided / crossed book — same drop-out as the open side. A basis
+      // comparison against a mid that does not exist is meaningless.
+      if (!state) return;
+
+      // ⛔ The sampler, NOT a length check. See `RefusedCandidateSampler`: at
+      // ~3,039 refusals/day an arrival-order buffer would silently make this
+      // population a 09:30–09:40 ET measurement while reading as the day's.
+      if (
+        realFillSampler().offer({
+          admission: 'refused',
+          optionSymbol,
+          etDay: etDateString(new Date()),
+          nowMs: Date.now(),
+          inFlightForPartition: this.countRealFillShadows('refused'),
+        }) !== 'sampled'
+      ) return;
+
+      this.realFillShadows.push({
+        state,
+        symbol,
+        expiration,
+        structure,
+        taxonomy: buildTaxonomy({
+          structure,
+          delta: candidate.delta ?? null,
+          dte: candidate.dte ?? null,
+          bid,
+          ask,
+          openInterest: candidate.openInterest ?? null,
+          entryType: 'maker_mid',
+          // There is no exit and there never will be one. `hasExit: false` keeps
+          // `exitType` null, and the rollup buckets these as `not_opened` rather
+          // than `open_side` — a refused candidate did not open either.
+          hasExit: false,
+        }),
+        admission: 'refused',
+        refusedAtGate: 'cost_bar',
+        refusalReasonCode: refusal?.reasonCode ?? null,
+        sizeBasis: 'refused_nominal_1',
+      });
     } catch {
       // Telemetry must never break a trade pass.
     }
@@ -9893,7 +10084,17 @@ export class SignalEngine {
       // partial's second leg.
       const contracts = closed.contractsRemaining;
       if (typeof contracts !== 'number' || !(contracts > 0)) return;
-      if (this.realFillShadows.length >= SHADOW_CHASE_MAX_IN_FLIGHT) return;
+      // A close row is the exit leg of an ADMITTED position, so it draws on the
+      // admitted budget — the partition it will be folded into.
+      if (
+        realFillSampler().offer({
+          admission: 'admitted',
+          optionSymbol,
+          etDay: etDateString(new Date()),
+          nowMs: Date.now(),
+          inFlightForPartition: this.countRealFillShadows('admitted'),
+        }) !== 'sampled'
+      ) return;
 
       // Exit-time two-sided quote, off the same cached chain snapshot the tape
       // sampler uses, so the decision mid and the polls that follow share one
@@ -9923,6 +10124,11 @@ export class SignalEngine {
         expiration,
         structure: taxonomy.cell.split('::')[0] ?? 'single_leg_otm',
         taxonomy,
+        // The exit leg of a position we DID take. Realised, not counterfactual.
+        admission: 'admitted',
+        refusedAtGate: null,
+        refusalReasonCode: null,
+        sizeBasis: 'actual_open',
       });
       // The position is gone; its entry taxonomy has served its purpose.
       this.realFillEntryTaxonomy.delete(optionSymbol);
@@ -10046,6 +10252,13 @@ export class SignalEngine {
             structure: order.structure,
             underlying: order.symbol,
             taxonomy: order.taxonomy,
+            // TRA-4897 — carried from the call site that STARTED this order, not
+            // inferred here. By finalize time a refused candidate and a real
+            // open are the same shape.
+            admission: order.admission,
+            refusedAtGate: order.refusedAtGate,
+            refusalReasonCode: order.refusalReasonCode,
+            sizeBasis: order.sizeBasis,
           },
           now,
         );
@@ -14892,6 +15105,19 @@ export class SignalEngine {
         }, { bid: cheap.bid, ask: cheap.ask }, nominator);
         if (otmCostReject) {
           signal.signalSkipReason = otmCostReject;
+          // TRA-4897 — the REFUSED-candidate shadow. Placed immediately after the
+          // reject because `lastCostGateRefusal` is a one-slot channel that the
+          // next candidate's `costAwareGateReject` clears. Observe-only: it reads
+          // a cached chain row and appends to its own JSONL. It runs after the
+          // gate has already decided to `continue`, so it cannot admit anything.
+          this.beginRealFillShadowRefused('single_leg_otm', signal, {
+            optionSymbol: cheap.optionSymbol,
+            bid: cheap.bid,
+            ask: cheap.ask,
+            delta: cheap.delta,
+            dte: cheap.daysToExpiration,
+            openInterest: cheap.openInterest,
+          });
           log.info('OTM open rejected by cost-aware fire bar (TRA-1602)', { sym, reason: otmCostReject });
           // The single highest-blocking gate on the live path (retained block rate
           // 0.9928). Named the same as the RV/directional paths' `cost_aware_bar`

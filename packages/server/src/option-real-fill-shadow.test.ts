@@ -69,7 +69,7 @@ describe('TRA-4888 real-fill shadow — the basis', () => {
 
     const row = finalizeRestingOrder(
       st!,
-      { mode: 'demo', structure: 'single_leg_otm', underlying: 'SPY', taxonomy: TAXONOMY },
+      { mode: 'demo', structure: 'single_leg_otm', underlying: 'SPY', taxonomy: TAXONOMY, admission: 'admitted' },
       T0 + 2_000,
     );
 
@@ -96,7 +96,7 @@ describe('TRA-4888 real-fill shadow — the basis', () => {
     );
     const row = finalizeRestingOrder(
       st,
-      { mode: 'demo', structure: 'single_leg_otm', underlying: 'X', taxonomy: TAXONOMY },
+      { mode: 'demo', structure: 'single_leg_otm', underlying: 'X', taxonomy: TAXONOMY, admission: 'admitted' },
       T0 + 2_000,
     );
     expect(row.fillBasisUsd).toBeCloseTo(1.15, 10);
@@ -117,7 +117,7 @@ describe('TRA-4888 real-fill shadow — the basis', () => {
     );
     const row = finalizeRestingOrder(
       st,
-      { mode: 'demo', structure: 'single_leg_otm', underlying: 'X', taxonomy: TAXONOMY },
+      { mode: 'demo', structure: 'single_leg_otm', underlying: 'X', taxonomy: TAXONOMY, admission: 'admitted' },
       T0 + 2_000,
     );
     expect(row.fillBasisUsd).toBeCloseTo(1.05, 10);
@@ -168,10 +168,10 @@ describe('TRA-4888 — the three rules DISAGREE (the control that makes the mode
     const reverse = mkRow({ touch: 'no_fill', through: 'fill' });
     const blind = mkRow({ touch: 'ungraded', through: 'ungraded' });
     const s = summarizeRealFillShadow([base, agree, reverse, blind], T0);
-    expect(s.ruleDisagreement.touchFilledPrintDidNot).toBe(1);
-    expect(s.ruleDisagreement.printFilledTouchDidNot).toBe(1);
-    expect(s.ruleDisagreement.agreed).toBe(1);
-    expect(s.ruleDisagreement.ungradedEither).toBe(1);
+    expect(s.byAdmission.admitted.ruleDisagreement.touchFilledPrintDidNot).toBe(1);
+    expect(s.byAdmission.admitted.ruleDisagreement.printFilledTouchDidNot).toBe(1);
+    expect(s.byAdmission.admitted.ruleDisagreement.agreed).toBe(1);
+    expect(s.byAdmission.admitted.ruleDisagreement.ungradedEither).toBe(1);
   });
 });
 
@@ -206,7 +206,7 @@ describe('TRA-4888 — an unreadable tape is UNGRADED, never a silent no-fill', 
     }
     const row = finalizeRestingOrder(
       st,
-      { mode: 'demo', structure: 'single_leg_otm', underlying: 'X', taxonomy: TAXONOMY },
+      { mode: 'demo', structure: 'single_leg_otm', underlying: 'X', taxonomy: TAXONOMY, admission: 'admitted' },
       T0 + 3_000,
     );
     expect(row.printTapeReadable).toBe(false);
@@ -219,10 +219,10 @@ describe('TRA-4888 — an unreadable tape is UNGRADED, never a silent no-fill', 
     const unfilled = mkRow({ outcome: 'unfilled' });
     const blind = mkRow({ outcome: 'ungraded' });
     const s = summarizeRealFillShadow([graded, unfilled, blind], T0);
-    expect(s.overall.n).toBe(3);
-    expect(s.overall.nGraded).toBe(2);
-    expect(s.overall.nUngraded).toBe(1);
-    expect(s.overall.fillRate).toBeCloseTo(0.5, 10);
+    expect(s.byAdmission.admitted.overall.n).toBe(3);
+    expect(s.byAdmission.admitted.overall.nGraded).toBe(2);
+    expect(s.byAdmission.admitted.overall.nUngraded).toBe(1);
+    expect(s.byAdmission.admitted.overall.fillRate).toBeCloseTo(0.5, 10);
   });
 });
 
@@ -243,7 +243,7 @@ describe('TRA-4888 — partial fills and the declared-unmodelled surface', () =>
     expect(st.contractsFilled).toBe(30);
     const row = finalizeRestingOrder(
       st,
-      { mode: 'demo', structure: 'single_leg_otm', underlying: 'X', taxonomy: TAXONOMY },
+      { mode: 'demo', structure: 'single_leg_otm', underlying: 'X', taxonomy: TAXONOMY, admission: 'admitted' },
       T0 + 2_000,
     );
     expect(row.outcome).toBe('partial');
@@ -265,13 +265,13 @@ describe('TRA-4888 — partial fills and the declared-unmodelled surface', () =>
     );
     const row = finalizeRestingOrder(
       st,
-      { mode: 'demo', structure: 'single_leg_otm', underlying: 'X', taxonomy: TAXONOMY },
+      { mode: 'demo', structure: 'single_leg_otm', underlying: 'X', taxonomy: TAXONOMY, admission: 'admitted' },
       T0 + 2_000,
     );
     expect(row.contractsFilled).toBe(100);
     expect(row.partialFillBasis).toBe('all_or_none_unmodelled');
     // The rollup must be able to count these — pooling them is then a choice.
-    expect(summarizeRealFillShadow([row], T0).rowsWithUnmodelledPartials).toBe(1);
+    expect(summarizeRealFillShadow([row], T0).byAdmission.admitted.rowsWithUnmodelledPartials).toBe(1);
   });
 
   it('queue position is declared unmodelled on every row AND on the summary', () => {
@@ -381,12 +381,12 @@ describe('TRA-4888 — the taxonomy TRA-4885 child A counts', () => {
       mkRow({ taxonomyOver: { deltaBand: '0.25-0.30', dteBand: 'lt30', spreadBand: 'gt40', entryType: 'taker_cross' } }),
     ];
     const s = summarizeRealFillShadow(rows, T0);
-    expect(s.byDeltaBand.map((c) => c.key)).toEqual(['0.25-0.30', '0.50-0.55']);
-    expect(s.byDteBand.map((c) => c.key).sort()).toEqual(['30to45', 'lt30']);
-    expect(s.bySpreadBand.map((c) => c.key).sort()).toEqual(['gt40', 'lte10']);
-    expect(s.byEntryType.map((c) => c.key).sort()).toEqual(['maker_mid', 'taker_cross']);
+    expect(s.byAdmission.admitted.byDeltaBand.map((c) => c.key)).toEqual(['0.25-0.30', '0.50-0.55']);
+    expect(s.byAdmission.admitted.byDteBand.map((c) => c.key).sort()).toEqual(['30to45', 'lt30']);
+    expect(s.byAdmission.admitted.bySpreadBand.map((c) => c.key).sort()).toEqual(['gt40', 'lte10']);
+    expect(s.byAdmission.admitted.byEntryType.map((c) => c.key).sort()).toEqual(['maker_mid', 'taker_cross']);
     // Open-side rows must not vanish from the exit axis.
-    expect(s.byExitType.map((c) => c.key)).toEqual(['open_side']);
+    expect(s.byAdmission.admitted.byExitType.map((c) => c.key)).toEqual(['open_side']);
   });
 });
 
@@ -473,5 +473,11 @@ function mkRow(over: {
     restedMs: 2_000,
     polls: 2,
     taxonomy: { ...TAXONOMY, ...over.taxonomyOver },
+    // TRA-4897 — these fixtures model ADMITTED rows (the pre-existing
+    // population). The refused partition has its own suite.
+    admission: 'admitted',
+    refusedAtGate: null,
+    refusalReasonCode: null,
+    sizeBasis: 'actual_open',
   };
 }

@@ -88,11 +88,93 @@ export function isOptionRealFillShadowEnabled(env: NodeJS.ProcessEnv = process.e
  * shape is versioned ON THE ROW: a consumer that folds two schema versions into
  * one mean is the failure this tag exists to make visible. Bump on any change
  * to the meaning of an existing field — never on an additive one.
+ *
+ * `v2` (TRA-4897 ruling `01167edb`, build order `d9ea0632`) — the population is
+ * now PARTITIONED into `admitted` and `refused`. That is a breaking change and
+ * it is deliberately breaking: a v1 consumer reading a v2 payload must FAIL
+ * rather than silently average a realised entry cost with a counterfactual one.
+ * The enforcement is structural, not documentary — {@link RealFillShadowSummary}
+ * has NO unpartitioned aggregate for such a consumer to find.
  */
-export const REAL_FILL_SHADOW_SCHEMA = 'real_fill_shadow_v1' as const;
+export const REAL_FILL_SHADOW_SCHEMA = 'real_fill_shadow_v2' as const;
 
-/** Fill-model version, stamped per row beside the schema. */
+/**
+ * Every schema tag that can appear on a row read off disk. The ledger is
+ * append-only and never rewritten, so v1 rows written before TRA-4893 remain
+ * readable — the constant above is what we WRITE, this union is what we may
+ * READ, and conflating the two would make a legacy row unrepresentable in the
+ * type that parses it.
+ */
+export type RealFillShadowSchema = 'real_fill_shadow_v1' | typeof REAL_FILL_SHADOW_SCHEMA;
+
+/**
+ * Fill-model version, stamped per row beside the schema.
+ *
+ * ⚠️ Deliberately NOT bumped by TRA-4893's partition work, and TRA-4885 child A
+ * keys on this field. The FILL MODEL is byte-for-byte what TRA-4888 shipped:
+ * same three rules, same `participationRate`, same limit-at-own-price
+ * discipline. What changed is WHICH CANDIDATES enter the ledger and how the
+ * rollup is partitioned — a schema fact, carried by `schema`. Bumping this too
+ * would tell a downstream reader the modelled prices moved when they did not.
+ */
 export const REAL_FILL_MODEL_VERSION = 'tra4888.1' as const;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The admission partition (TRA-4897).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Whether the candidate this row models was ADMITTED by the live gate stack and
+ * actually opened, or was REFUSED upstream and never traded.
+ *
+ * ⛔ These two populations answer different questions and MUST NEVER BE POOLED.
+ *   `admitted` — "what did our entries actually cost?" Realised. Has an open, an
+ *                exit, and a P&L.
+ *   `refused`  — "what would a resting order at the mid have cost on a candidate
+ *                we never took?" Counterfactual. No open, no exit, no P&L.
+ *
+ * A mean over both is a blend of a measurement and a simulation, and nothing
+ * downstream can un-blend it. The prohibition is enforced by SHAPE — every fold
+ * is emitted under {@link RealFillShadowSummary.byAdmission} and there is no
+ * pooled aggregate anywhere in the payload to read by accident.
+ */
+export type RealFillAdmission = 'admitted' | 'refused';
+
+export const REAL_FILL_ADMISSIONS: readonly RealFillAdmission[] = Object.freeze([
+  'admitted',
+  'refused',
+]);
+
+/**
+ * WHICH gate refused the candidate. Only `cost_bar` is wired today, and that is
+ * a fact about the gate ORDER, not about the candidate's merit: `cost_bar` is
+ * the single highest-blocking gate on the live path and it `continue`s, so
+ * `spread`, `otm_delta_floor`, `aggregate_cap`, `canary_ceiling`,
+ * `fleet_reachable_bound`, `exit_actionability` and `sleeve_stand_down` all read
+ * `evaluated: 0` on these candidates — they were NEVER RUN.
+ *
+ * ⛔ A `cost_bar`-refused candidate is therefore **not** "a trade we declined"
+ * and must never be labelled `declined` or `would_have_traded`. It is a
+ * candidate that failed ONE gate of many before the rest had an opinion.
+ */
+export type RealFillRefusalGate = 'cost_bar';
+
+/**
+ * How `contractsRequested` on the row was arrived at.
+ *
+ * `actual_open`        the real contract count the engine opened. Dollar totals
+ *                      over these rows are real dollars.
+ * `refused_nominal_1`  a refused candidate never had a size — the gate rejected
+ *                      it before sizing — so the shadow rests ONE contract to
+ *                      keep the row's price arithmetic well-defined.
+ *
+ * ⚠️ `basisDeltaTotalUsd` on a `refused_nominal_1` row is therefore a PER-ONE-
+ * CONTRACT figure and summing it across a refused cohort yields "dollars per
+ * contract, had we taken one of each", not a portfolio number. The per-share
+ * `basisDeltaUsd` and `meanBasisDeltaPctOfMid` are the size-free columns and are
+ * the ones to read on the refused partition.
+ */
+export type RealFillSizeBasis = 'actual_open' | 'refused_nominal_1';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The declared-unmodelled surface.
@@ -713,13 +795,44 @@ export function carryEntryTaxonomyToExit(
 
 export interface RealFillShadowRow {
   ts: number;
-  schema: typeof REAL_FILL_SHADOW_SCHEMA;
+  schema: RealFillShadowSchema;
   modelVersion: typeof REAL_FILL_MODEL_VERSION;
   mode: 'demo' | 'live';
   structure: string;
   underlying: string;
   optionSymbol: string;
   side: FillSide;
+
+  // ── The admission partition (TRA-4897). ───────────────────────────────────
+  /**
+   * REQUIRED on every row this module writes, and never defaulted at the write
+   * site. See {@link RealFillAdmission} for why the two populations may not be
+   * pooled.
+   *
+   * Optional in the TYPE only so a v1 row read off the append-only ledger is
+   * representable. {@link admissionOf} is the single place that resolves an
+   * absent value, and the summary publishes how many rows needed it
+   * (`rowsMissingAdmission`) so the back-fill can never be silent.
+   */
+  admission?: RealFillAdmission;
+  /** The gate that refused it. `null` iff `admission === 'admitted'`. */
+  refusedAtGate?: RealFillRefusalGate | null;
+  /**
+   * The gate ledger's OWN `reasonCode` for this refusal, verbatim — e.g.
+   * `shortfall_lt_0.10` / `shortfall_0.25_0.50` / `shortfall_gte_0.50` /
+   * `gross_negative` / `insufficient_real_fill_evidence`.
+   *
+   * Captured from the value the gate handed `recordLiveEnforceDecision`, NOT
+   * re-derived here: a call site that recomputes the bucket can describe a
+   * comparison the gate did not make. It joins this ledger to
+   * `/api/health/live-enforce-gates` `byReason` by identity.
+   *
+   * `null` on an admitted row, and also `null` when the gate refused without
+   * publishing a code — which is a readable state, not an assumed bucket.
+   */
+  refusalReasonCode?: string | null;
+  /** See {@link RealFillSizeBasis}. Absent on pre-TRA-4893 rows, all of which are `actual_open`. */
+  sizeBasis?: RealFillSizeBasis;
 
   // ── The basis, both ways. This pair IS the ticket. ────────────────────────
   /** The pre-trade NBBO mid. What `premiumPaid` books today. */
@@ -778,6 +891,17 @@ export function finalizeRestingOrder(
     structure: string;
     underlying: string;
     taxonomy: RealFillTaxonomy;
+    /**
+     * TRA-4897 — REQUIRED, and required POSITIONALLY in the type rather than as
+     * an optional with a default: a new call site that forgets it must fail to
+     * compile, not quietly write its rows into the admitted partition. That
+     * exact defaulting is how a counterfactual cohort would come to be averaged
+     * into a realised one.
+     */
+    admission: RealFillAdmission;
+    refusedAtGate?: RealFillRefusalGate | null;
+    refusalReasonCode?: string | null;
+    sizeBasis?: RealFillSizeBasis;
   },
   nowTs: number,
 ): RealFillShadowRow {
@@ -807,6 +931,13 @@ export function finalizeRestingOrder(
     underlying: meta.underlying,
     optionSymbol: state.optionSymbol,
     side: state.side,
+    admission: meta.admission,
+    // Normalised rather than passed through: `refusedAtGate` is `null` IFF the
+    // row is admitted, so an admitted row that was handed a gate name (or a
+    // refused one that was not) cannot encode a contradiction on disk.
+    refusedAtGate: meta.admission === 'refused' ? (meta.refusedAtGate ?? null) : null,
+    refusalReasonCode: meta.admission === 'refused' ? (meta.refusalReasonCode ?? null) : null,
+    sizeBasis: meta.sizeBasis ?? (meta.admission === 'refused' ? 'refused_nominal_1' : 'actual_open'),
     midBasisUsd: state.decisionMid,
     fillBasisUsd,
     basisDeltaUsd,
@@ -841,6 +972,247 @@ export function finalizeRestingOrder(
 export const REAL_FILL_PARTICIPATION_STARVED_NOTE =
   'ruleVerdicts[primaryRule]=fill with outcome=unfilled means participation-limited: '
   + 'the print was real and our modelled share of it rounded to zero contracts.';
+
+/**
+ * Resolve a row's admission partition, including for rows written before the
+ * column existed.
+ *
+ * A v1 row is `admitted` — not by assumption but by CONSTRUCTION: until this
+ * change the only call sites were downstream of a successful open
+ * (`if (!opened) continue;`), so no refused candidate could physically have
+ * reached the ledger. The count of rows resolved this way is published as
+ * `rowsMissingAdmission`, because "we inferred this" and "the writer stamped
+ * this" must not be indistinguishable in the rollup.
+ */
+export function admissionOf(row: RealFillShadowRow): RealFillAdmission {
+  return row.admission === 'refused' ? 'refused' : 'admitted';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The refused-candidate sampler (TRA-4897 build order §3).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * ⛔ THE SAMPLER MAY NOT BE FIRST-COME-WINS. This is the load-bearing part of
+ * the refused partition and the reason it is a class rather than a length check.
+ *
+ * The in-flight buffer holds 200 orders and drops on ARRIVAL ORDER. At the
+ * measured **3,039 refusals per ET day** it fills in the opening minutes, so an
+ * arrival-order population is a measurement of **09:30–09:40 ET** — the widest-
+ * spread window of the whole session — while reading as a measurement of the
+ * day. A fill rate off that cohort is biased low by the sampling, and nothing in
+ * the payload would say so.
+ *
+ * Three independent disciplines, each fixing a different bias:
+ *
+ *  1. **Separate budgets.** `admitted` gets reserved slots and is NEVER dropped
+ *     for budget. It grows at ≤2/day and is currently 0/day, so a shared buffer
+ *     would let refused rows starve the only population that carries realised
+ *     P&L.
+ *  2. **Deterministic stratified admission** on a hash of
+ *     `(optionSymbol, etDay, floor(now / bucketMs))`. Reproducible, spread
+ *     across the session by construction, and — unlike a PRNG — it cannot
+ *     correlate with poll cadence, which is the thing arrival order is
+ *     correlated with.
+ *  3. **A minimum re-observation interval per contract.** 3,039 evaluations
+ *     across ~318 symbols is overwhelmingly the SAME contracts re-polled. Without
+ *     this the row count measures poll frequency, not candidates.
+ */
+export interface RefusedSamplerConfig {
+  /** In-flight slots reserved for `admitted`. Never yielded to refused rows. */
+  admittedSlots: number;
+  /** In-flight slots available to `refused`. */
+  refusedSlots: number;
+  /** Stratification bucket width, and the per-contract re-observation floor. */
+  bucketMs: number;
+  /**
+   * Fraction of `(contract, bucket)` pairs to admit, in [0, 1]. 1 keeps every
+   * contract once per bucket, which at a 30-minute bucket over a 6.5h session is
+   * ≤13 rows per contract per day — already inside the target band, so the
+   * default does not throw away resolution it does not have to.
+   */
+  keepRate: number;
+}
+
+export const DEFAULT_REFUSED_SAMPLER_CONFIG: RefusedSamplerConfig = Object.freeze({
+  admittedSlots: 40,
+  refusedSlots: 160,
+  bucketMs: 30 * 60_000,
+  keepRate: 1,
+});
+
+export type RefusedSampleDecision =
+  | 'sampled'
+  | 'dropped_reobserve_interval'
+  | 'dropped_stratification'
+  | 'dropped_for_budget';
+
+export interface RealFillSamplingStats {
+  /** Candidates offered to the sampler. */
+  candidatesSeen: number;
+  /** Candidates it accepted (a shadow order was started). */
+  candidatesSampled: number;
+  /** `candidatesSampled / candidatesSeen`, or `null` at zero — never a silent 0. */
+  samplingRate: number | null;
+  /** Rejected because the partition's in-flight budget was full. */
+  droppedForBudget: number;
+  /** Rejected because this contract was already sampled inside the current bucket. */
+  droppedForReobserveInterval: number;
+  /** Rejected by the stratification hash (`keepRate < 1` only). */
+  droppedForStratification: number;
+}
+
+function emptySamplingStats(): RealFillSamplingStats {
+  return {
+    candidatesSeen: 0,
+    candidatesSampled: 0,
+    samplingRate: null,
+    droppedForBudget: 0,
+    droppedForReobserveInterval: 0,
+    droppedForStratification: 0,
+  };
+}
+
+/**
+ * FNV-1a over the stratification key. A named, stable, dependency-free hash:
+ * the requirement is determinism and even spread, not cryptographic strength,
+ * and a reader must be able to reproduce a sampling decision from the row.
+ */
+export function stratificationHash(key: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < key.length; i += 1) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+
+/**
+ * Per-process sampling gate for refused candidates.
+ *
+ * Memory-only and drop-on-restart, matching the in-flight order list it guards
+ * — its state is "what have I already sampled in this bucket", which is
+ * meaningless across a boot.
+ */
+export class RefusedCandidateSampler {
+  private readonly config: RefusedSamplerConfig;
+
+  /**
+   * Last sample TIMESTAMP per contract — deliberately not the bucket index.
+   *
+   * A fixed grid (`floor(now / bucketMs)`) bounds rows per CELL but places no
+   * floor on the INTERVAL: two polls straddling a boundary are both sampled
+   * even 1 ms apart, which re-admits at the grid edges exactly the
+   * poll-frequency bias the interval exists to remove. The grid still decides
+   * STRATIFICATION (so a keep/drop verdict is stable and reproducible within a
+   * cell); the elapsed floor below is what actually spaces the rows.
+   */
+  private readonly lastSampledAt = new Map<string, number>();
+
+  private readonly stats: Record<RealFillAdmission, RealFillSamplingStats> = {
+    admitted: emptySamplingStats(),
+    refused: emptySamplingStats(),
+  };
+
+  constructor(config: RefusedSamplerConfig = DEFAULT_REFUSED_SAMPLER_CONFIG) {
+    this.config = config;
+  }
+
+  /** Slots this partition may occupy in the shared in-flight list. */
+  slotsFor(admission: RealFillAdmission): number {
+    return admission === 'admitted' ? this.config.admittedSlots : this.config.refusedSlots;
+  }
+
+  /**
+   * Offer one candidate.
+   *
+   * `inFlightForPartition` is the caller's CURRENT count for this partition, so
+   * the budget is enforced against live occupancy rather than a total the
+   * sampler would have to shadow-track (and get wrong whenever an order
+   * finalises).
+   *
+   * ⚠️ An `admitted` candidate bypasses stratification and the re-observation
+   * interval entirely and is only ever refused for budget. Those two
+   * disciplines exist to de-bias a 3,039/day firehose; applying them to a
+   * ≤2/day population would discard most of the only rows that carry realised
+   * P&L, to fix a bias that population does not have.
+   */
+  offer(input: {
+    admission: RealFillAdmission;
+    optionSymbol: string;
+    etDay: string;
+    nowMs: number;
+    inFlightForPartition: number;
+  }): RefusedSampleDecision {
+    const { admission } = input;
+    const s = this.stats[admission];
+    s.candidatesSeen += 1;
+
+    const decide = (d: RefusedSampleDecision): RefusedSampleDecision => {
+      if (d === 'sampled') s.candidatesSampled += 1;
+      else if (d === 'dropped_for_budget') s.droppedForBudget += 1;
+      else if (d === 'dropped_reobserve_interval') s.droppedForReobserveInterval += 1;
+      else s.droppedForStratification += 1;
+      s.samplingRate = s.candidatesSeen === 0 ? null : s.candidatesSampled / s.candidatesSeen;
+      return d;
+    };
+
+    if (input.inFlightForPartition >= this.slotsFor(admission)) return decide('dropped_for_budget');
+    if (admission === 'admitted') return decide('sampled');
+
+    const bucket = Math.floor(input.nowMs / this.config.bucketMs);
+    const contractKey = `${input.etDay}|${input.optionSymbol}`;
+
+    // A TRUE elapsed floor, not a grid-cell test. See `lastSampledAt`.
+    const last = this.lastSampledAt.get(contractKey);
+    if (last !== undefined && input.nowMs - last < this.config.bucketMs) {
+      return decide('dropped_reobserve_interval');
+    }
+
+    if (this.config.keepRate < 1) {
+      const h = stratificationHash(`${contractKey}|${bucket}`);
+      if (h / 0x1_0000_0000 >= this.config.keepRate) return decide('dropped_stratification');
+    }
+
+    this.lastSampledAt.set(contractKey, input.nowMs);
+    // Bounded: an entry older than one interval can never block again, so it is
+    // dead weight. Swept lazily rather than on a timer — the map is consulted on
+    // every offer, which is the only moment its size matters.
+    if (this.lastSampledAt.size > 4_096) {
+      for (const [k, t] of this.lastSampledAt) {
+        if (input.nowMs - t >= this.config.bucketMs) this.lastSampledAt.delete(k);
+      }
+    }
+    return decide('sampled');
+  }
+
+  statsFor(admission: RealFillAdmission): RealFillSamplingStats {
+    return { ...this.stats[admission] };
+  }
+}
+
+/**
+ * Process-wide sampler, shared by the engine (which offers candidates) and the
+ * health route (which publishes the counters).
+ *
+ * ⚠️ These counters are SINCE BOOT, while the ledger they sit beside is DURABLE
+ * on a persistent disk. The two therefore disagree after any restart, and that
+ * is not a bug — it is why `samplingWindow: 'since_boot'` and `bootedAt` ship
+ * next to them. A since-boot counter and a durable one render identically and
+ * this desk has been bitten by exactly that; do not compute a per-day rate by
+ * dividing a durable row count by a since-boot denominator.
+ */
+let sampler = new RefusedCandidateSampler();
+export const REAL_FILL_SAMPLER_BOOTED_AT = Date.now();
+
+export function realFillSampler(): RefusedCandidateSampler {
+  return sampler;
+}
+
+/** Test seam — reset the process sampler. */
+export function resetRealFillSamplerForTests(config?: RefusedSamplerConfig): void {
+  sampler = new RefusedCandidateSampler(config);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Durable ledger — append-only JSONL, mirrors option-maker-shadow.ts.
@@ -971,17 +1343,21 @@ export interface RealFillRuleDisagreement {
   ungradedEither: number;
 }
 
-export interface RealFillShadowSummary {
-  schema: typeof REAL_FILL_SHADOW_SCHEMA;
-  modelVersion: typeof REAL_FILL_MODEL_VERSION;
-  generatedAt: number;
-  rows: number;
+/**
+ * Every fold, scoped to ONE admission partition.
+ *
+ * ⛔ There is deliberately no pooled twin of this object anywhere in the
+ * payload. TRA-4897 §3.2: "a documented prohibition on pooling is worth
+ * nothing; an absent field is worth everything." A consumer that wants a
+ * blended mean now has to build it itself, in the open, which is the point.
+ */
+export interface RealFillPartitionFolds {
+  admission: RealFillAdmission;
   /**
-   * ⚠️ Ships WITH the numbers, by design. A promotion gate reading this summary
-   * must be able to see what the measurement cannot see without opening the
-   * source. See {@link REAL_FILL_UNMODELLED}.
+   * This PARTITION's aggregate — not a pooled one. `byAdmission.refused.overall`
+   * is the counterfactual cohort's own fold and is a legitimate number to read;
+   * what does not exist is a fold across both partitions.
    */
-  unmodelled: readonly UnmodelledDimension[];
   overall: RealFillCohort;
   byDeltaBand: RealFillCohort[];
   byDteBand: RealFillCohort[];
@@ -990,6 +1366,14 @@ export interface RealFillShadowSummary {
   byEntryType: RealFillCohort[];
   byExitType: RealFillCohort[];
   byCell: RealFillCohort[];
+  /**
+   * TRA-4897 — refused rows folded by the gate's OWN `reasonCode`, so this
+   * ledger and `/api/health/live-enforce-gates` `byReason` join on identity.
+   * Empty on the admitted partition by construction. `no_reason_code` is a real
+   * bucket: a refusal the gate did not classify, kept visible rather than
+   * distributed into the coded ones.
+   */
+  byRefusalReasonCode: RealFillCohort[];
   ruleDisagreement: RealFillRuleDisagreement;
   /**
    * Rows stamped `all_or_none_unmodelled`. Their sizes are not modelled, so a
@@ -998,7 +1382,13 @@ export interface RealFillShadowSummary {
    */
   rowsWithUnmodelledPartials: number;
   /**
-   * TRA-4893 item 4 — per-tell readability across the whole population. Read
+   * Rows whose `contractsRequested` is the refused nominal 1 rather than a real
+   * open size. On the refused partition this equals `overall.n`; read it before
+   * summing `totalBasisDeltaUsd`, which is then dollars-per-one-contract.
+   */
+  rowsWithNominalSize: number;
+  /**
+   * TRA-4893 item 4 — per-tell readability across this partition. Read
    * `clockOnly + both` before crediting the `trade_date` detector with anything:
    * if it is 0 while `volumeOnly` is the entire population, the second detector
    * is wired but inert and `nUngraded` is still resting on one tell.
@@ -1023,9 +1413,61 @@ export interface RealFillShadowSummary {
    * Rows by side. TRA-4888 shipped OPEN-side call sites only, so a
    * `sell` count of 0 meant "the close side is not wired", NOT "no exits
    * happened" — published explicitly so that state can never again be read as
-   * an empty cohort.
+   * an empty cohort. On the refused partition `sell` is 0 by construction: a
+   * candidate that never opened cannot close.
    */
   bySide: Record<FillSide, number>;
+  /**
+   * TRA-4897 §3 — what the sampler did to reach this partition's population.
+   * ⚠️ SINCE BOOT, beside a DURABLE row count. See {@link realFillSampler}.
+   */
+  sampling: RealFillSamplingStats & {
+    samplingWindow: 'since_boot';
+    bootedAt: number;
+    slots: number;
+  };
+}
+
+export interface RealFillShadowSummary {
+  schema: typeof REAL_FILL_SHADOW_SCHEMA;
+  modelVersion: typeof REAL_FILL_MODEL_VERSION;
+  generatedAt: number;
+  rows: number;
+  /**
+   * ⚠️ Ships WITH the numbers, by design. A promotion gate reading this summary
+   * must be able to see what the measurement cannot see without opening the
+   * source. See {@link REAL_FILL_UNMODELLED}.
+   */
+  unmodelled: readonly UnmodelledDimension[];
+  /**
+   * PRESENT EVEN AT ZERO, both of them. This pair is the fix for the exact
+   * failure TRA-4897 was filed about: `rows: 0` / `fillRate: null` used to be
+   * byte-identical to "we rested limits and the tape never printed through
+   * them" — a statement about the MARKET — when it was a statement about
+   * `cost_bar`. `nAdmitted: 0` beside `nRefused: 1234` says which.
+   */
+  nAdmitted: number;
+  nRefused: number;
+  /**
+   * Rows that carried no `admission` column and were resolved by
+   * {@link admissionOf}. Pre-TRA-4893 rows are admitted BY CONSTRUCTION, but an
+   * inferred partition and a stamped one must not be indistinguishable.
+   */
+  rowsMissingAdmission: number;
+  /**
+   * Non-null IFF `nAdmitted === 0`, explaining what an empty admitted partition
+   * does and does not mean, and naming the surface that holds the live reason.
+   *
+   * ⚠️ It deliberately quotes NO gate counts. A measured constant copied into
+   * this module would age silently and be cited months later as current — which
+   * is TRA-4875's defect (four cells enforcing off an expectancy constant from a
+   * tape 51–62 days stale at decision time) reproduced one layer down.
+   */
+  admittedEmptyReason: string | null;
+  /**
+   * ⛔ The ONLY place folds live. See {@link RealFillPartitionFolds}.
+   */
+  byAdmission: Record<RealFillAdmission, RealFillPartitionFolds>;
 }
 
 function foldCohort(key: string, rows: readonly RealFillShadowRow[]): RealFillCohort {
@@ -1074,10 +1516,28 @@ function groupBy(
     .sort((a, b) => a.key.localeCompare(b.key));
 }
 
-export function summarizeRealFillShadow(
+/**
+ * The text that ships as {@link RealFillShadowSummary.admittedEmptyReason}.
+ *
+ * Exported so a control can assert the shipped string rather than a local copy
+ * of it — a check that compares two literals it owns both sides of agrees with
+ * itself no matter what the route serves.
+ */
+export const REAL_FILL_ADMITTED_EMPTY_REASON =
+  'NO ADMITTED ROWS IN THIS WINDOW. This is NOT a market finding. The admitted call sites run only '
+  + 'AFTER a successful open (`if (!opened) continue;`), so an empty admitted partition means no OTM '
+  + 'open cleared the live gate stack in this window — overwhelmingly `cost_bar`, which is the '
+  + 'single highest-blocking gate on the live path and `continue`s ahead of every gate ordered below '
+  + 'it. Read `/api/health/live-enforce-gates` -> `retained.byGate.cost_bar` for the LIVE '
+  + 'evaluated/blocked counts; they are deliberately NOT reproduced here, because a constant copied '
+  + 'into this module would age silently and later be cited as current (TRA-4875). '
+  + '⛔ Do NOT read `byAdmission.refused` as evidence about what the desk would have earned: a '
+  + 'refused candidate failed ONE gate of many and the rest were never run on it.';
+
+function foldPartition(
+  admission: RealFillAdmission,
   rows: readonly RealFillShadowRow[],
-  generatedAt = Date.now(),
-): RealFillShadowSummary {
+): RealFillPartitionFolds {
   const disagreement: RealFillRuleDisagreement = {
     touchFilledPrintDidNot: 0,
     printFilledTouchDidNot: 0,
@@ -1139,25 +1599,70 @@ export function summarizeRealFillShadow(
     if (r.side === 'buy' || r.side === 'sell') bySide[r.side] += 1;
   }
 
+  const samplerStats = realFillSampler().statsFor(admission);
+
   return {
-    schema: REAL_FILL_SHADOW_SCHEMA,
-    modelVersion: REAL_FILL_MODEL_VERSION,
-    generatedAt,
-    rows: rows.length,
-    unmodelled: REAL_FILL_UNMODELLED,
+    admission,
     overall: foldCohort('overall', rows),
     byDeltaBand: groupBy(rows, (r) => r.taxonomy.deltaBand),
     byDteBand: groupBy(rows, (r) => r.taxonomy.dteBand),
     bySpreadBand: groupBy(rows, (r) => r.taxonomy.spreadBand),
     byLiquidityBand: groupBy(rows, (r) => r.taxonomy.liquidityBand),
     byEntryType: groupBy(rows, (r) => r.taxonomy.entryType),
-    byExitType: groupBy(rows, (r) => r.taxonomy.exitType ?? 'open_side'),
+    // A refused candidate never opened, so it has no exit — and `open_side`
+    // would claim it did. `not_opened` keeps the two apart; pooling them would
+    // make an exit cohort's denominator include positions that never existed.
+    byExitType: groupBy(
+      rows,
+      (r) => r.taxonomy.exitType ?? (admissionOf(r) === 'refused' ? 'not_opened' : 'open_side'),
+    ),
     byCell: groupBy(rows, (r) => r.taxonomy.cell),
+    byRefusalReasonCode:
+      admission === 'refused'
+        ? groupBy(rows, (r) => r.refusalReasonCode ?? 'no_reason_code')
+        : [],
     ruleDisagreement: disagreement,
     rowsWithUnmodelledPartials: rows.filter((r) => r.partialFillBasis === 'all_or_none_unmodelled')
       .length,
+    rowsWithNominalSize: rows.filter((r) => r.sizeBasis === 'refused_nominal_1').length,
     printTellCoverage: tellCoverage,
     byEntryTaxonomySource: taxonomySource,
     bySide,
+    sampling: {
+      ...samplerStats,
+      samplingWindow: 'since_boot',
+      bootedAt: REAL_FILL_SAMPLER_BOOTED_AT,
+      slots: realFillSampler().slotsFor(admission),
+    },
+  };
+}
+
+export function summarizeRealFillShadow(
+  rows: readonly RealFillShadowRow[],
+  generatedAt = Date.now(),
+): RealFillShadowSummary {
+  const admitted: RealFillShadowRow[] = [];
+  const refused: RealFillShadowRow[] = [];
+  let rowsMissingAdmission = 0;
+  for (const r of rows) {
+    if (r.admission !== 'admitted' && r.admission !== 'refused') rowsMissingAdmission += 1;
+    if (admissionOf(r) === 'refused') refused.push(r);
+    else admitted.push(r);
+  }
+
+  return {
+    schema: REAL_FILL_SHADOW_SCHEMA,
+    modelVersion: REAL_FILL_MODEL_VERSION,
+    generatedAt,
+    rows: rows.length,
+    unmodelled: REAL_FILL_UNMODELLED,
+    nAdmitted: admitted.length,
+    nRefused: refused.length,
+    rowsMissingAdmission,
+    admittedEmptyReason: admitted.length === 0 ? REAL_FILL_ADMITTED_EMPTY_REASON : null,
+    byAdmission: {
+      admitted: foldPartition('admitted', admitted),
+      refused: foldPartition('refused', refused),
+    },
   };
 }
