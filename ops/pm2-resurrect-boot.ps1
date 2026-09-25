@@ -41,6 +41,30 @@ function Log($m) { "$(Get-Date -Format o)  $m" | Out-File -FilePath $log -Append
 
 try {
   Log "boot resurrect starting (PM2_HOME=$env:PM2_HOME)"
+
+  # ── TRA-4853: the wrapper states WHICH COPY OF ITSELF ran ────────────────────
+  # The "PM2 Resurrect" task's -File argument is readable ONLY from an elevated
+  # session: non-elevated, schtasks/the COM API/HKLM TaskCache/System32\Tasks all
+  # return "Access is denied" and Get-ScheduledTask silently FILTERS the task, so
+  # "absent" and "registered but unreadable" are indistinguishable. That left the
+  # TRA-605 dangling-path regression undetectable without a human at an admin
+  # prompt. The boot itself is the one context that always knows the answer, so
+  # it records it here, into a log any non-elevated session can read.
+  # Absence of this line in a boot's block is itself the finding: that boot ran a
+  # wrapper copy predating TRA-4853, i.e. a copy nobody has re-staged.
+  # NB: -ErrorAction Stop is REQUIRED for that catch to fire. Get-FileHash on an
+  # unreadable path emits a NON-TERMINATING error, which a bare try/catch does
+  # not intercept: measured under 5.1, the assignment then yields '' and the
+  # 'UNREADABLE' fallback never lands, so the log would carry `sha256=` and read
+  # as a blank field rather than a named failure. Do not rely on the wrapper's
+  # ambient $ErrorActionPreference='Stop' here - this line must stay correct if
+  # it is ever copied somewhere that does not set it.
+  $self = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+  $selfHash = 'UNREADABLE'
+  try { $selfHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $self -ErrorAction Stop).Hash } catch { }
+  $staged = if ($self -like 'C:\ProgramData\*') { 'STAGED' } else { 'NOT-STAGED (a working tree that can be wiped/reset - TRA-605 regression risk)' }
+  Log "TRA-4853 wrapper identity: -File=$self"
+  Log "TRA-4853 wrapper identity: sha256=$selfHash location=$staged"
   & $node $pm2 resurrect *>> $log
   Log "pm2 resurrect exit code = $LASTEXITCODE"
 

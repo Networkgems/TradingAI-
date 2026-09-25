@@ -14,15 +14,39 @@
 #   C2 does the -File it will run at boot actually exist? (a dangling path is
 #      SILENT at boot — the exact TRA-605 regression)
 #   C3 is there a saved dump.pm2 for it to restore?
+#   C2S does the wrapper the installer PROMISES to stage actually exist at the
+#      stable path, and does it match the repo? (checkable with NO elevation,
+#      unlike C2 — TRA-4853)
+#   C3 is there a saved dump.pm2 for it to restore?
 #   C4 boot evidence: if the host HAS rebooted since, did trading-server come
 #      back near boot, or hours later (i.e. by a human)?
 #
-# Exit 0 = PASS (autostart is armed) · 1 = FAIL (reasons printed).
+# Exit 0 = PASS (autostart is armed) · 1 = FAIL (reasons printed)
+#      · 2 = UNVERIFIED (nothing failed, but a load-bearing fact could not be
+#        read — TRA-4853).
+#
+# TRA-4853: this script used to exit 0 / "VERDICT: PASS - PM2 autostart is
+# armed" in a state where it had checked almost nothing. When the task is
+# registered-but-unreadable (the normal non-elevated case here), C1 printed
+# PASS-UNREADABLE, C2 never ran at all because it is nested inside `if ($task)`,
+# and the C4 finding "it did NOT autostart" was appended to $fail only under
+# that same `if ($task)` — so it was SWALLOWED in exactly the state where the
+# task cannot be read. The gate therefore reported the strongest possible verdict
+# while the -File target was unknown AND the promised staged path was an empty
+# directory. Per this repo's own rule (CLAUDE.md, "A health field reports the
+# outcome of the last REAL attempt"): absent evidence is its own named state and
+# an alarm, not a pass. "Could not check" and "checked and it is fine" must never
+# share an exit code.
 # ─────────────────────────────────────────────────────────────────────────────
-$taskName = 'PM2 Resurrect'
-$pm2Home  = 'C:\Users\eetienne\.pm2'
-$health   = 'http://localhost:4242/api/health'
-$fail     = @()
+$taskName   = 'PM2 Resurrect'
+$pm2Home    = 'C:\Users\eetienne\.pm2'
+$health     = 'http://localhost:4242/api/health'
+$stableDir  = 'C:\ProgramData\TradingAI\ops'
+$stableWrap = Join-Path $stableDir 'pm2-resurrect-boot.ps1'
+$repoWrap   = Join-Path $PSScriptRoot 'pm2-resurrect-boot.ps1'
+$bootLog    = Join-Path $pm2Home 'resurrect-boot.log'
+$fail       = @()
+$unverified = @()
 
 Write-Output "TRA-605 PM2 autostart verification - $((Get-Date).ToUniversalTime().ToString('u'))"
 Write-Output ""
@@ -39,6 +63,14 @@ if (-not $task) {
   if ($probe -match 'Access is denied') {
     Write-Output "C1 task registered      : PASS-UNREADABLE (task exists but this session cannot read it; its -File target is UNVERIFIABLE without elevation)"
     Write-Output "   WARN: C2 cannot run. Re-run this verifier from an ELEVATED PowerShell to check what the task actually points at."
+    # TRA-4853: this is the load-bearing unknown, so it must reach the verdict.
+    # Every non-elevated read of the -File target is denied - schtasks, the
+    # Schedule.Service COM API, HKLM\...\Schedule\TaskCache and
+    # C:\Windows\System32\Tasks all return access-denied, and Get-ScheduledTask
+    # filters the task out entirely. C2S below is the non-elevated substitute:
+    # it cannot say what the task points AT, but it can say whether the path the
+    # installer promises to point it at is intact.
+    $unverified += "C1/C2 the task exists but is UNREADABLE non-elevated, so what it runs at boot is UNKNOWN. C2S grades the promised staged path instead. To close this: run ops/verify-pm2-autostart.ps1 from an ELEVATED PowerShell, or read the TRA-4853 'wrapper identity' line in $bootLog after the next boot."
   } else {
     $fail += "C1 task '$taskName' is NOT registered. Fix: run ops/install-pm2-autostart.ps1 from an ELEVATED PowerShell."
     Write-Output "C1 task registered      : FAIL (absent)"
@@ -65,6 +97,46 @@ if (-not $task) {
   }
 }
 
+# ---- C2S: the promised staged wrapper (NO elevation needed) — TRA-4853 -------
+# C2 can only grade the path the task actually holds, which is unreadable without
+# admin. But install-pm2-autostart.ps1 promises a specific stable path and points
+# the task there, so that path is independently checkable — and on 2026-09-25 it
+# was an EMPTY DIRECTORY while this script still verdicted PASS. If the task does
+# point here (what the installer guarantees), a missing wrapper is silent at boot:
+# the TRA-605 regression, and nothing else in this gate could see it.
+if (-not (Test-Path $stableWrap)) {
+  $hint = if (Test-Path $stableDir) { "the directory exists but holds no wrapper" } else { "the directory does not exist either" }
+  $fail += "C2S the promised staged wrapper is MISSING at $stableWrap ($hint). If the task points here - which is what ops/install-pm2-autostart.ps1 guarantees - the next boot runs a dangling -File and resurrects NOTHING, silently. Fix: copy ops/pm2-resurrect-boot.ps1 there (no elevation needed to write the file), or re-run the installer ELEVATED to re-stage AND re-register."
+  Write-Output "C2S staged wrapper      : FAIL (absent -> $stableWrap)"
+} else {
+  $stagedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $stableWrap).Hash
+  $repoHash   = if (Test-Path $repoWrap) { (Get-FileHash -Algorithm SHA256 -LiteralPath $repoWrap).Hash } else { $null }
+  $stagedText = Get-Content -LiteralPath $stableWrap -Raw
+
+  # The guard is the whole point of TRA-4851. A staged copy predating it boots
+  # UNGUARDED, which reads exactly like a guarded boot in every other surface.
+  if ($stagedText -notmatch 'check-boot-staleness\.mjs') {
+    $fail += "C2S the staged wrapper at $stableWrap does NOT carry the TRA-4851 staleness guard - a boot running it re-serves a stale checkout silently. Re-stage it from ops/pm2-resurrect-boot.ps1."
+    Write-Output "C2S staged wrapper      : FAIL (present but UNGUARDED - no TRA-4851 staleness guard)"
+  } elseif (-not $repoHash) {
+    Write-Output "C2S staged wrapper      : PASS-PARTIAL (present and guarded; could not compare against $repoWrap)"
+  } elseif ($stagedHash -eq $repoHash) {
+    Write-Output "C2S staged wrapper      : PASS (present, guarded, byte-identical to ops/pm2-resurrect-boot.ps1)"
+  } else {
+    # Drift is not automatically a defect - the repo copy may simply have moved
+    # on. It IS a reason not to claim the committed wrapper is what boots.
+    $unverified += "C2S the staged wrapper at $stableWrap is guarded but DIFFERS from this checkout's ops/pm2-resurrect-boot.ps1 (staged $($stagedHash.Substring(0,12)) vs repo $($repoHash.Substring(0,12))). The bytes that boot are not the bytes committed here. Re-stage if the repo copy is newer."
+    Write-Output "C2S staged wrapper      : DRIFT (guarded, but not the same bytes as this checkout's copy)"
+  }
+
+  if ($stagedText -notmatch 'TRA-4853 wrapper identity') {
+    $unverified += "C2S the staged wrapper predates the TRA-4853 self-identification block, so the next boot will NOT record which -File ran. Re-stage from ops/pm2-resurrect-boot.ps1 to make the boot name its own path."
+    Write-Output "   WARN: staged copy has no TRA-4853 identity block - the next boot will not self-identify."
+  } else {
+    Write-Output "   staged copy self-identifies at boot (TRA-4853) -> next boot records its own -File in resurrect-boot.log."
+  }
+}
+
 # ---- C3: something to resurrect ----------------------------------------------
 $dump = Join-Path $pm2Home 'dump.pm2'
 if (Test-Path $dump) {
@@ -79,17 +151,80 @@ if (Test-Path $dump) {
 $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
 Write-Output "C4 last boot            : $($boot.ToUniversalTime().ToString('u')) ($([math]::Round(((Get-Date) - $boot).TotalHours,1))h ago)"
 
+# TRA-4853: the boot log is the DIRECT witness to whether the wrapper ran, and
+# this check used to ignore it in favour of two bad inferences:
+#   (a) it judged autostart by the CURRENT :4242 listener's process age, which any
+#       later legitimate `pm2 restart` invalidates. On 2026-09-25 that printed
+#       "came up 1491 min AFTER boot -> it did NOT autostart" when the wrapper had
+#       in fact run and passed its health gate 2 min after boot - the 1491 min pid
+#       was the TRA-4849 remediation restart. A rebuild+restart is normal
+#       operation; it must not read as an autostart failure.
+#   (b) it recorded that finding only `if ($task)` - i.e. never, in the normal
+#       non-elevated case - so the one direction that WAS a real alarm could not
+#       reach the verdict either.
+# Grade the wrapper's own log, and keep the listener age as context only.
+if (-not (Test-Path $bootLog)) {
+  $unverified += "C4 no boot log at $bootLog, so whether the wrapper ran at the last boot is UNKNOWN."
+  Write-Output "   boot log              : ABSENT ($bootLog) - cannot tell whether the wrapper ran."
+} else {
+  # The log interleaves the wrapper's own UTF-8 Log() lines with raw pm2 stdout
+  # (ANSI + wide chars), so match the timestamped Log() lines and ignore the rest.
+  $entries = @(Get-Content -LiteralPath $bootLog -ErrorAction SilentlyContinue |
+    Select-String -Pattern '^(\d{4}-\d{2}-\d{2}T[\d:.]+[+-]\d{2}:\d{2})\s+(.*)$' |
+    ForEach-Object {
+      # NB: [ref] needs a TYPED target - seeding $ts with $null makes 5.1 fail
+      # overload resolution ("Cannot find an overload ... argument count: 2").
+      [datetime]$ts = [datetime]::MinValue
+      if ([datetime]::TryParse($_.Matches[0].Groups[1].Value, [ref]$ts)) {
+        [pscustomobject]@{ When = $ts; Text = $_.Matches[0].Groups[2].Value.Trim() }
+      }
+    })
+
+  $starts = @($entries | Where-Object { $_.Text -match 'boot resurrect starting' })
+  # A fire belongs to THIS boot if it began within 10 min of it. The task is
+  # AtStartup, so a genuine boot fire is seconds away, not hours.
+  $thisBoot = @($starts | Where-Object { [math]::Abs((($_.When) - $boot).TotalMinutes) -le 10 })
+
+  if ($thisBoot.Count -gt 0) {
+    $t0 = ($thisBoot | Select-Object -Last 1).When
+    Write-Output "   boot log              : the wrapper RAN at this boot ($([math]::Round((($t0) - $boot).TotalMinutes,1)) min after boot) -> autostart fired."
+    # Everything this fire logged, up to the next fire.
+    $after = @($entries | Where-Object { $_.When -ge $t0 })
+    $ident = @($after | Where-Object { $_.Text -match 'TRA-4853 wrapper identity: -File=(.*)$' })
+    if ($ident.Count -gt 0) {
+      $ranFile = ([regex]'-File=(.*)$').Match($ident[0].Text).Groups[1].Value.Trim()
+      Write-Output "   boot -File (TRA-4853) : $ranFile"
+      if ($ranFile -eq $stableWrap) {
+        Write-Output "     -> that IS the stable staged path. The TRA-605 dangling-path risk is closed for this task."
+      } else {
+        $fail += "C4 the boot task's -File is '$ranFile', NOT the stable staged path '$stableWrap'. That is the TRA-605 regression: if that path is a per-agent checkout it can be reset or wiped, and the task then fails SILENTLY at boot. Fix: run ops/install-pm2-autostart.ps1 ELEVATED to re-point the task at the staged copy."
+        Write-Output "     -> NOT the stable staged path - see FAIL below."
+      }
+    } else {
+      $unverified += "C4 this boot's fire logged no TRA-4853 identity line, so the wrapper copy it ran is UNKNOWN (that boot predates the self-identification block, or ran a wrapper copy that does not carry it). The next boot after re-staging will record it."
+      Write-Output "   boot -File (TRA-4853) : NOT RECORDED (fire predates the identity block) - which copy ran is unknown."
+    }
+    $guardLines = @($after | Where-Object { $_.Text -match 'TRA-4851' })
+    if ($guardLines.Count -gt 0) {
+      Write-Output "   TRA-4851 guard at boot: $($guardLines[0].Text)"
+    } else {
+      Write-Output "   TRA-4851 guard at boot: no guard line logged -> that fire booted UNGUARDED against a stale checkout."
+    }
+  } else {
+    $lastStart = if ($starts.Count -gt 0) { ($starts | Select-Object -Last 1).When.ToUniversalTime().ToString('u') } else { 'never' }
+    $fail += "C4 the wrapper did NOT run at the last boot ($($boot.ToUniversalTime().ToString('u'))) - no 'boot resurrect starting' entry within 10 min of it in $bootLog (last fire: $lastStart). Either the task did not fire or its -File is dangling; both are silent at boot. Fix: run ops/install-pm2-autostart.ps1 ELEVATED, then ops/verify-pm2-autostart.ps1."
+    Write-Output "   boot log              : NO fire at the last boot (last: $lastStart) -> autostart did NOT run."
+  }
+}
+
 $listener = Get-NetTCPConnection -LocalPort 4242 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($listener) {
   $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $($listener.OwningProcess)" -ErrorAction SilentlyContinue
   if ($proc) {
     $mins = [math]::Round(($proc.CreationDate - $boot).TotalMinutes)
-    if ($mins -le 10) {
-      Write-Output "   trading-server came up $mins min after boot -> consistent with autostart."
-    } else {
-      Write-Output "   trading-server came up $mins min AFTER boot -> it did NOT autostart; something/someone else started it."
-      if ($task) { $fail += "C4 server started $mins min after boot despite the task being registered - check $pm2Home\resurrect-boot.log." }
-    }
+    # Context only - a later rebuild/restart makes this large and says nothing
+    # about autostart. The boot-log check above is the verdict-bearing one.
+    Write-Output "   :4242 listener age    : started $mins min after boot (pid $($listener.OwningProcess)); >10 min just means it was restarted since - see the boot log above for the autostart verdict."
   }
 } else {
   Write-Output "   nothing listening on :4242 - trading-server is DOWN right now."
@@ -137,10 +272,23 @@ if (-not $servedRepo) {
 
 # ---- verdict -----------------------------------------------------------------
 Write-Output ""
-if ($fail.Count -eq 0) {
-  Write-Output "VERDICT: PASS - PM2 autostart is armed; an unattended reboot will restore trading-server."
-  exit 0
+# TRA-4853: precedence FAIL > UNVERIFIED > PASS. A PASS here is a claim that an
+# unattended reboot WILL restore trading-server, so it may only be issued when
+# every load-bearing fact was actually read. "Could not check" gets its own exit
+# code (2) so no caller can mistake it for a clean run.
+if ($fail.Count -gt 0) {
+  Write-Output "VERDICT: FAIL"
+  $fail | ForEach-Object { Write-Output "  - $_" }
+  if ($unverified.Count -gt 0) {
+    Write-Output "  also UNVERIFIED:"
+    $unverified | ForEach-Object { Write-Output "  ? $_" }
+  }
+  exit 1
 }
-Write-Output "VERDICT: FAIL"
-$fail | ForEach-Object { Write-Output "  - $_" }
-exit 1
+if ($unverified.Count -gt 0) {
+  Write-Output "VERDICT: UNVERIFIED - nothing FAILED, but this run could not read a fact the PASS claim depends on."
+  $unverified | ForEach-Object { Write-Output "  ? $_" }
+  exit 2
+}
+Write-Output "VERDICT: PASS - PM2 autostart is armed; an unattended reboot will restore trading-server."
+exit 0
