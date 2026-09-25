@@ -262,3 +262,54 @@ describe('optionSetupMultiplier — flag-gated shrinkage switch', () => {
     );
   });
 });
+
+// TRA-4857 AC3 / TRA-4860 — an UNMEASURED row (an unpriced reconcile close, which
+// carries `realizedPnlUsd: null` and `realizedR: null`) must be INVISIBLE to the
+// fold: folding one must leave `resolved` and `avgR` exactly where they were with
+// the row absent. Two failure modes are guarded here, and they want opposite fixes:
+//
+//   1. the row slips past the outcome filter and its null R is coerced to 0,
+//      dragging `avgR` toward zero -- the fabricated-0 re-appearing inside the very
+//      mean the null was created to protect;
+//   2. the row slips past and is NOT coerced, so the reduce throws.
+//
+// Either way the fold has stopped being a statement about priced trades. The pair
+// of assertions below cannot both hold unless the row was actually excluded.
+describe('TRA-4857 — UNMEASURED rows are excluded from the learned fold', () => {
+  it('folding one UNMEASURED row leaves resolved and avgR identical to its absence', () => {
+    const base = bucket(20, 16); // 80% win rate, avg R = (16*2 - 4)/20 = +1.4
+    const withUnmeasured = [
+      ...bucket(20, 16),
+      row({ outcome: 'UNMEASURED', realizedPnlUsd: null, realizedR: null, exitReason: 'broker_reconcile' }),
+    ];
+
+    const before = computeOptionLearnedWeights(base).byStructure.find((x) => x.key === 'bull_put')!;
+    const after = computeOptionLearnedWeights(withUnmeasured).byStructure.find((x) => x.key === 'bull_put')!;
+
+    // The row is counted in `total` -- it happened, and hiding it there would be a
+    // second fabrication -- but contributes to nothing downstream of the filter.
+    expect(after.total).toBe(before.total + 1);
+
+    expect(after.resolved).toBe(before.resolved);
+    expect(after.avgR).toBeCloseTo(before.avgR!, 12);
+    expect(after.winRate).toBeCloseTo(before.winRate!, 12);
+    expect(after.multiplier).toBeCloseTo(before.multiplier, 12);
+
+    // Pin the absolute values too, so a future change that moves BOTH arms in step
+    // (which the equality assertions above would happily accept) still trips.
+    expect(after.resolved).toBe(20);
+    expect(after.avgR).toBeCloseTo(1.4, 12);
+  });
+
+  it('does not coerce a null realizedR to 0 -- the mean is unmoved, not diluted', () => {
+    // 20 rows at avg R = +1.4. Coercing a 21st null R to 0 would give 28/21 =
+    // 1.3333..., a visibly different number. Assert we are NOT at that value.
+    const withUnmeasured = [
+      ...bucket(20, 16),
+      row({ outcome: 'UNMEASURED', realizedPnlUsd: null, realizedR: null, exitReason: 'broker_reconcile' }),
+    ];
+    const s = computeOptionLearnedWeights(withUnmeasured).byStructure.find((x) => x.key === 'bull_put')!;
+    expect(s.avgR).toBeCloseTo(1.4, 12);
+    expect(s.avgR).not.toBeCloseTo(28 / 21, 6);
+  });
+});
