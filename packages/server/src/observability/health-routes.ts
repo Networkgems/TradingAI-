@@ -5416,6 +5416,12 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       policy: report.policy,
       dataDir: report.dataDir,
       ephemeral: report.ephemeral,
+      // TRA-4896 — WHY, beside the boolean, because the two classes have different
+      // remedies and a grader reading `true` alone cannot tell them apart.
+      // `in_build_bundle` says "point DATA_DIR off the bundle";
+      // `in_ephemeral_scratch_tree` says "leave the agent scratch tree entirely" —
+      // and doing the first literally lands you in the second, reading GREEN.
+      ephemeralReason: report.ephemeralReason,
       stateDb: report.stateDb,
       journal: report.journal,
       ledger: report.ledger,
