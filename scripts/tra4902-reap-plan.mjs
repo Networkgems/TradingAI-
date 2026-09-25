@@ -27,6 +27,22 @@ const QA_PATTERNS = [/^ctoverify_/i, /^qa_?\d/i, /^qa_/i, /^qtverify_/i, /^qtpro
 const MiB = 1024 * 1024;
 const mib = (b) => `${(b / MiB).toFixed(3)} MiB`;
 
+/**
+ * A reap candidate: QA-named AND NOT in a real-money mode directory.
+ *
+ * The second clause is not belt-and-braces, it is the whole guard. The first
+ * run of this script matched `v0nni` — whose tree includes `reports/LIVE/` —
+ * and folded a real-money row into the "frees this much" figure. TRA-4898
+ * reserved `live/` in the EVICTION ORDER, and a reap is a different code path
+ * that inherits none of that: the reservation protects those bytes from the
+ * budget sweep and not at all from an operator running a cleanup.
+ *
+ * So the mode check is applied HERE, at the candidate boundary, where it
+ * cannot be skipped by widening a name pattern — and `live` is a property of
+ * the artifact, per `REAL_MONEY_MODE_DIR`.
+ */
+const isReapCandidate = (b) => !b.live && QA_PATTERNS.some((re) => re.test(b.book));
+
 async function main() {
   const password = process.env.ADMIN_PASSWORD;
   if (!password) throw new Error('ADMIN_PASSWORD not set');
@@ -116,10 +132,18 @@ async function main() {
       // longer-lived than it is.
       const full = d.byDate.slice(1);
       const perDay = full.reduce((a, r) => a + r.bytes, 0) / full.length;
-      const qaPerDay = perDay * (d.books.filter((b) => QA_PATTERNS.some((re) => re.test(b.book))).reduce((a, b) => a + b.bytes, 0) / d.bytes);
-      const freed = d.books.filter((b) => QA_PATTERNS.some((re) => re.test(b.book))).reduce((a, b) => a + b.bytes, 0);
+      const candidates = d.books.filter(isReapCandidate);
+      const freed = candidates.reduce((a, b) => a + b.bytes, 0);
+      const qaPerDay = perDay * (freed / d.bytes);
+      // Named LOUDLY, because this is the class the mode guard pulled back out
+      // of the reap and the reader has to see that it was pulled.
+      const namedButLive = d.books.filter((b) => b.live && QA_PATTERNS.some((re) => re.test(b.book)));
+      if (namedButLive.length > 0) {
+        console.log(`   ⚠ EXCLUDED — QA-NAMED BUT REAL-MONEY MODE (${mib(namedButLive.reduce((a, b) => a + b.bytes, 0))}):`);
+        for (const b of namedButLive) console.log(`       ${b.book}/${b.root}/${b.mode}  ${mib(b.bytes)}  ${b.files}f`);
+      }
       console.log(`   ⇒ ${mib(perDay)}/session over the ${full.length} complete dates (oldest excluded — eviction already trimmed it)`);
-      console.log(`   ⇒ a name-pattern reap frees ${mib(freed)}; headroom after it = ${mib(d.maxBytes - (d.bytes - freed))}`);
+      console.log(`   ⇒ a name-pattern reap of ${candidates.length} rows frees ${mib(freed)}; headroom after it = ${mib(d.maxBytes - (d.bytes - freed))}`);
       console.log(`   ⇒ FILES DELETED, ACCOUNTS KEPT: refills at ${mib(perDay)}/session ⇒ back at cap in ${((d.maxBytes - (d.bytes - freed)) / perDay).toFixed(1)} sessions`);
       console.log(`   ⇒ ACCOUNTS RETIRED TOO:        refills at ${mib(perDay - qaPerDay)}/session ⇒ back at cap in ${((d.maxBytes - (d.bytes - freed)) / (perDay - qaPerDay)).toFixed(1)} sessions`);
     }
