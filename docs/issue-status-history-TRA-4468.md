@@ -22,6 +22,35 @@ node scripts/tra4468-status-history.mjs --at 2026-09-09T21:30:00Z TRA-4445
 
 Measured live `2026-09-10T00:2x–00:4xZ` over the 500 issues reachable via
 `GET /api/companies/{companyId}/issues?view=compact` and all **7,039** of their audit events.
+Re-verified live `2026-09-25T13:4xZ`: the TRA-4445 replay above reproduces byte-identically
+15 days on, including the `blocked` verdict at `21:30Z` that TRA-4463's corrected cell rests on.
+
+### `--at` must carry a timezone
+
+`--at 2026-09-09T21:30:00Z` or an explicit offset (`…T17:30:00-04:00`). A zone-less instant is
+**refused** (exit 2). It used to be accepted: `Date.parse` reads it in the *host's* zone, and on an
+ET host `--at "2026-09-09 21:30"` answered `done` where the same wall-clock in UTC answers
+`blocked` — the query silently landed on the far side of the window it was asked about. Every
+timestamp the platform serves is UTC. An unparseable instant is likewise refused, rather than
+making every comparison false and reporting `(before first recorded event)`.
+Unknown flags are refused by name; they used to fall through and be looked up as issue keys.
+
+### `--audit` self-checks the three event shapes
+
+```
+node scripts/tra4468-status-history.mjs --audit
+```
+
+Two halves, and only the first gates the exit code:
+
+- **fixtures** — each of the three shapes in §2 must still parse to the right transition, and a
+  non-status update must still parse to `null`. Deterministic; a failure here means the parser or
+  the platform's event schema moved.
+- **census** — counts each shape across the 500 most recent company audit rows (~15h of traffic)
+  and prints the window it actually covered. **Informational only.** The route ignores
+  `offset`/`cursor`/`from`, so the window cannot be widened, and `system` legitimately reads `0`
+  whenever the recovery sweep has not fired — as it does on a healthy day. Folding that into the
+  exit status would ship a check that is red on an ordinary day.
 
 ---
 
