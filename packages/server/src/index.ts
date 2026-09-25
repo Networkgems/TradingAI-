@@ -258,6 +258,7 @@ import { gradeSinceBootSessionCoverage } from './session-coverage.js';
 import {
   COST_AWARE_GATE_COMPACTION_INTERVAL_MS, // TRA-4904
   compactCostAwareGateLedgerNow, // TRA-4904
+  noteCostAwareGateCompactionTimerArmed, // TRA-4904
   hydrateCostAwareGateFromDisk,
 } from './cost-aware-gate-ledger.js';
 // TRA-4628 — the OTM candidate-admission tape (admitted AND refused scanner
@@ -19238,6 +19239,11 @@ const costAwareGateCompactionTimer = setInterval(() => {
   });
 }, COST_AWARE_GATE_COMPACTION_INTERVAL_MS);
 costAwareGateCompactionTimer.unref?.();
+// Record that something SCHEDULED a fire. bqb1's uptime is usually shorter than one
+// interval, so a healthy hook reports zero fires most of the time — without this the
+// health route cannot tell "not due yet" from "never wired", and "never wired" is the
+// defect TRA-4904 is fixing.
+noteCostAwareGateCompactionTimerArmed();
 
 // ── Static frontend (production web) ────────────────────────────────────────
 const DIST_DIR = join(__dirname, '..', '..', '..', 'apps', 'desktop', 'dist');

@@ -19,6 +19,7 @@ import {
   costAwareGateCompaction,
   costAwareGateLogPath,
   hydrateCostAwareGateFromDisk,
+  noteCostAwareGateCompactionTimerArmed,
   recordCostAwareGateDecision,
   summarizeCostAwareGate,
   COST_AWARE_GATE_COMPACTION_INTERVAL_MS,
@@ -185,6 +186,30 @@ describe('cost-aware-gate periodic compaction (TRA-4904)', () => {
     // dropped, nothing is corrupted, and the next boot hydrate clears the torn line.
     expect(out.rewrote).toBe(false);
     expect(readFileSync(costAwareGateLogPath(dir), 'utf8')).toContain(line(NOW - 30 * DAY_MS));
+  });
+
+  it('separates an unarmed hook from one that is merely not due yet', async () => {
+    writeFileSync(costAwareGateLogPath(dir), line(NOW - 30 * DAY_MS) + '\n' + line(NOW) + '\n', 'utf8');
+    hydrateCostAwareGateFromDisk(dir, NOW - 30 * DAY_MS + 1000);
+
+    // Nothing armed anything: the pre-TRA-4904 state. Every other field on this object
+    // reads perfectly healthy, which is why this one has to exist.
+    expect(costAwareGateCompaction(NOW).hookState).toBe('timer_not_armed');
+    expect(costAwareGateCompaction(NOW).nextFireDueAt).toBeNull();
+
+    noteCostAwareGateCompactionTimerArmed(NOW);
+    // 0 fires INSIDE the first interval is the ordinary healthy reading on bqb1, whose
+    // uptime is usually shorter than 6h. It must not read as a dead hook…
+    expect(costAwareGateCompaction(NOW + 60_000).hookState).toBe('armed_not_yet_due');
+    expect(costAwareGateCompaction(NOW).timerCompactions).toBe(0);
+    // …and it must not read as a working one either, once the fire is actually late.
+    expect(costAwareGateCompaction(NOW + 7 * 60 * 60 * 1000).hookState).toBe('overdue');
+
+    await compactCostAwareGateLedgerNow(NOW + 6 * 60 * 60 * 1000);
+    const s = costAwareGateCompaction(NOW + 6 * 60 * 60 * 1000);
+    expect(s.hookState).toBe('firing');
+    expect(s.timerCompactions).toBe(1);
+    expect(s.nextFireDueAt).toBe(new Date(NOW + 12 * 60 * 60 * 1000).toISOString());
   });
 
   it('names a skip instead of reporting a clean pass', async () => {

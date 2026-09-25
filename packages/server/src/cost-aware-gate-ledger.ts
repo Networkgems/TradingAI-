@@ -413,8 +413,21 @@ let spreadDecisionsUnstamped = 0;
 // works — the reversal-shadow ledger's AC5 lesson, copied verbatim — so the outcome
 // is published, never the constant alone.
 let lastCompaction: CostAwareGateCompaction | null = null;
-/** Timer fires that completed (any outcome). 0 with an armed timer ⇒ the hook is not running. */
+/** Timer fires that completed (any outcome). */
 let timerCompactions = 0;
+/**
+ * ms epoch the periodic hook was ARMED (`index.ts` calls
+ * {@link noteCostAwareGateCompactionTimerArmed} right after arming the interval), or
+ * `null` if nothing ever armed it.
+ *
+ * This exists because `timerCompactions === 0` has TWO causes that read identically,
+ * and on this host the benign one is the COMMON one: bqb1's uptime is usually well
+ * under the 6h interval (1416 s at the 04:36Z read on 2026-09-25), so a perfectly
+ * healthy hook reports zero fires most of the time. Without the arm instant there is
+ * no way to separate "not due yet" from "never wired" — the shape CLAUDE.md's
+ * health-field rule exists to forbid, and the shape AC2 of this ticket is about.
+ */
+let timerArmedAt: number | null = null;
 /** True while an async rewrite is between its read and its write. */
 let compactionInFlight = false;
 /**
@@ -451,6 +464,7 @@ export function clearCostAwareGateLedger(): void {
   spreadDecisionsUnstamped = 0;
   lastCompaction = null;
   timerCompactions = 0;
+  timerArmedAt = null;
   compactionInFlight = false;
   pendingAppends.length = 0;
 }
@@ -981,28 +995,71 @@ export interface CostAwareGateCompactionState {
   retentionDays: number;
   /** {@link COST_AWARE_GATE_COMPACTION_INTERVAL_MS}. The overshoot premium is `interval / retain`. */
   intervalMs: number;
-  /**
-   * Timer fires completed this uptime. **This is the liveness field.** 0 on a process
-   * that has been up longer than `intervalMs` means the interval is NOT armed, however
-   * healthy `last` looks — the boot compaction alone would leave `last.trigger: 'boot'`
-   * and every byte field looking perfectly ordinary.
-   */
+  /** Timer fires completed this uptime. Interpret it through `hookState`, never alone. */
   timerCompactions: number;
+  /** ISO time the interval was armed, `null` if nothing armed it. See {@link timerArmedAt}. */
+  timerArmedAt: string | null;
+  /** When the next fire is expected (ISO), `null` when unarmed. */
+  nextFireDueAt: string | null;
+  /**
+   * **THE FIELD TO READ.** `timerCompactions` alone cannot carry this: on bqb1 a healthy
+   * hook reports 0 fires most of the time, because the process rarely stays up for one
+   * 6h interval — and that is not a defect, it is the case where the boot compaction is
+   * already tighter than the timer (the overshoot is `min(bootGap, interval)`).
+   *
+   *   `timer_not_armed`    — nothing scheduled a fire. THE ALARM: this is the pre-TRA-4904
+   *                          state, and a `RETAIN_MS` with no hook reads healthy everywhere else.
+   *   `armed_not_yet_due`  — armed, 0 fires, still inside the first interval. NOT a reading.
+   *   `firing`             — ≥1 fire and the next is not yet overdue. The working state.
+   *   `overdue`            — armed and past due with no fire. The interval died (or the
+   *                          event loop is wedged).
+   */
+  hookState: 'timer_not_armed' | 'armed_not_yet_due' | 'firing' | 'overdue';
   /** The most recent outcome (boot or timer). `null` before the ledger has been hydrated. */
   last: CostAwareGateCompaction | null;
   note: string;
 }
 
 /**
+ * Called by `index.ts` immediately after arming the interval, so the health payload can
+ * tell an unarmed hook from one that is merely not due. NOT called from the timer body:
+ * the point is to record that something SCHEDULED a fire, which is exactly the fact a
+ * fire count cannot supply before the first fire.
+ */
+export function noteCostAwareGateCompactionTimerArmed(now: number = Date.now()): void {
+  timerArmedAt = now;
+}
+
+/** Slack on the due instant before an unfired timer is called dead. */
+const COMPACTION_OVERDUE_GRACE_MS = 5 * 60 * 1000;
+
+/**
  * The compaction hook's state for `/api/health/cost-aware-gate` (TRA-4904 AC2).
  * Read `timerCompactions` before `last`: a working constant and a dead timer publish
  * the same `last`.
  */
-export function costAwareGateCompaction(): CostAwareGateCompactionState {
+export function costAwareGateCompaction(now: number = Date.now()): CostAwareGateCompactionState {
+  // Due = one interval past the arm instant, advanced by each fire. Cheap and honest:
+  // it drifts by however long a pass takes, which is why `overdue` carries a grace.
+  const dueAt =
+    timerArmedAt === null
+      ? null
+      : timerArmedAt + COST_AWARE_GATE_COMPACTION_INTERVAL_MS * (timerCompactions + 1);
+  const hookState: CostAwareGateCompactionState['hookState'] =
+    timerArmedAt === null
+      ? 'timer_not_armed'
+      : dueAt !== null && now > dueAt + COMPACTION_OVERDUE_GRACE_MS
+        ? 'overdue'
+        : timerCompactions > 0
+          ? 'firing'
+          : 'armed_not_yet_due';
   return {
     retentionDays: COST_AWARE_GATE_RETENTION_DAYS,
     intervalMs: COST_AWARE_GATE_COMPACTION_INTERVAL_MS,
     timerCompactions,
+    timerArmedAt: timerArmedAt === null ? null : new Date(timerArmedAt).toISOString(),
+    nextFireDueAt: dueAt === null ? null : new Date(dueAt).toISOString(),
+    hookState,
     last: lastCompaction,
     note:
       'TRA-4904. This tape pairs the highest write rate in /data (9.98 MiB/day) with the SHORTEST '
@@ -1011,8 +1068,11 @@ export function costAwareGateCompaction(): CostAwareGateCompactionState {
       + 'steady state, 45.9 MiB of overshoot). The cutoff is now re-applied on a '
       + `${COST_AWARE_GATE_COMPACTION_INTERVAL_MS / (60 * 60 * 1000)}h timer as well as at boot, which caps the premium at `
       + `${(100 * COST_AWARE_GATE_COMPACTION_INTERVAL_MS / RETAIN_MS).toFixed(1)}% — under the 30-day tapes' 16.4%. `
-      + 'READ `timerCompactions` FIRST: it is 0 if and only if the periodic hook is not running, and a '
-      + 'dead hook is indistinguishable from a live one by any other field here. The three 30-day tapes '
+      + 'READ `hookState` FIRST, not `timerCompactions`: bqb1 is usually up for LESS than one 6h '
+      + 'interval, so 0 fires is the ordinary healthy reading (`armed_not_yet_due`) and the overshoot '
+      + 'is then bounded by the boot gap instead, which is tighter. `timer_not_armed` is the alarm — '
+      + 'it is the pre-TRA-4904 state, in which every other field on this object still reads healthy. '
+      + 'The three 30-day tapes '
       + '(live-enforce-gate, reversal-shadow-signals, churn-brake-guard) are deliberately NOT on this '
       + 'timer — see docs/tra4899-data-tape-budget.md AC4 for the uptime that would change that.',
   };
