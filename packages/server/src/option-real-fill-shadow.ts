@@ -250,6 +250,12 @@ export const DEFAULT_REAL_FILL_CONFIG: RealFillModelConfig = Object.freeze({
   maxRestMs: 5 * 60_000,
 });
 
+/** Which of the two independent print tells was readable, over an order's whole life. */
+export interface PrintTellCoverage {
+  clock: boolean;
+  volume: boolean;
+}
+
 export interface RestingOrderState {
   id: string;
   side: FillSide;
@@ -268,6 +274,12 @@ export interface RestingOrderState {
   prev: RealFillTapeSample | null;
   /** True once any poll produced a usable print clock or volume delta. */
   printTapeReadable: boolean;
+  /**
+   * WHICH tell carried that readability, over the order's whole life. Tracked
+   * separately from `printTapeReadable` so a rollup can say whether the
+   * TRA-4893 clock tell actually contributes, rather than inferring it.
+   */
+  printTells: PrintTellCoverage;
   firstFillAt: number | null;
   /** Size-weighted mean of the prices we were filled at. */
   filledNotionalUsd: number;
@@ -341,11 +353,37 @@ export function beginRestingOrder(
     polls: 0,
     prev: null,
     printTapeReadable: false,
+    printTells: { clock: false, volume: false },
     firstFillAt: null,
     filledNotionalUsd: 0,
     ruleVerdicts: { touch_cross: 'ungraded', print_at_limit: 'ungraded', print_through_limit: 'ungraded' },
     partialFillBasis: 'all_or_none_unmodelled',
   };
+}
+
+/**
+ * The outcome of one print probe.
+ *
+ * `clockReadable` / `volumeReadable` are carried SEPARATELY from `printed`
+ * (TRA-4893 item 4) because the two tells have very different coverage and the
+ * difference is not knowable a priori. Until TRA-4893 only the volume tell was
+ * ever fed — `lastTradeMs` was hard-wired `null` at the call site because
+ * Tradier's `trade_date` was not projected into `OptionChainRow`. Now that it
+ * is, "the clock tell is live" must be MEASURED rather than assumed: a chain
+ * endpoint that simply omits `trade_date` would leave `clockReadable` false on
+ * every row, and the fleet would read exactly as it does today — one more
+ * detector that is present, called, and contributes nothing. These two booleans
+ * are folded up into {@link RealFillShadowSummary.printTellCoverage} so that
+ * state is visible in the rollup instead of inferred from an unchanged
+ * `nUngraded`.
+ */
+export interface PrintDetection {
+  printed: boolean;
+  volumeDelta: number | null;
+  /** Both polls carried a last-trade clock, so the clock tell could be evaluated. */
+  clockReadable: boolean;
+  /** Both polls carried cumulative volume, so the volume tell could be evaluated. */
+  volumeReadable: boolean;
 }
 
 /**
@@ -361,7 +399,7 @@ export function beginRestingOrder(
 export function detectNewPrint(
   prev: RealFillTapeSample | null,
   curr: RealFillTapeSample,
-): { printed: boolean; volumeDelta: number | null } | null {
+): PrintDetection | null {
   if (prev === null) return null;
   const clockReadable = typeof prev.lastTradeMs === 'number' && typeof curr.lastTradeMs === 'number';
   const volumeReadable = typeof prev.volume === 'number' && typeof curr.volume === 'number';
@@ -374,7 +412,7 @@ export function detectNewPrint(
     volumeDelta = d >= 0 ? d : null; // negative ⇒ rollover ⇒ unreadable, not a print
   }
   const volumeRose = volumeDelta !== null && volumeDelta > 0;
-  return { printed: clockAdvanced || volumeRose, volumeDelta };
+  return { printed: clockAdvanced || volumeRose, volumeDelta, clockReadable, volumeReadable };
 }
 
 /** Grade one rule against one poll. Exported so a control can assert each rule in isolation. */
@@ -383,7 +421,7 @@ export function gradeRule(
   side: FillSide,
   limitUsd: number,
   curr: RealFillTapeSample,
-  print: { printed: boolean; volumeDelta: number | null } | null,
+  print: PrintDetection | null,
 ): RuleVerdict {
   if (rule === 'touch_cross') {
     const touch = side === 'buy' ? curr.ask : curr.bid;
@@ -428,7 +466,14 @@ export function advanceRestingOrder(
 ): boolean {
   state.polls += 1;
   const print = detectNewPrint(state.prev, curr);
-  if (print !== null) state.printTapeReadable = true;
+  if (print !== null) {
+    state.printTapeReadable = true;
+    // Sticky OR, not last-poll: a tell that was readable on any poll of this
+    // order's life did contribute to its grade, and a tape that goes dark on
+    // the final poll must not erase that.
+    if (print.clockReadable) state.printTells.clock = true;
+    if (print.volumeReadable) state.printTells.volume = true;
+  }
 
   const pollVerdicts: Record<RealFillRule, RuleVerdict> = {
     touch_cross: gradeRule('touch_cross', state.side, state.limitUsd, curr, print),
@@ -539,6 +584,36 @@ export function classifyExitType(exitReason: string | null | undefined): ExitTyp
   return 'other';
 }
 
+/**
+ * Where a row's ENTRY-TIME taxonomy came from. TRA-4893 item 1.
+ *
+ * Every row's delta / DTE / spread / liquidity bands describe WHAT WE ENTERED
+ * INTO, never what the contract decayed to — a close row bucketed on its exit
+ * delta would migrate cells as it moved and make `byDeltaBand` unreadable. But
+ * there are three different ways a row can come to hold entry-time numbers, and
+ * they are NOT equally trustworthy:
+ *
+ *   `entry_native`    Built at the open, from the live entry quote. Complete.
+ *   `entry_carried`   A close row handed the exact taxonomy object its own open
+ *                     row was built with. Identical to `entry_native` by
+ *                     construction — same object, same fields.
+ *   `entry_rederived` A close row whose open-side taxonomy was NOT in memory
+ *                     (process restarted between open and close, or the row was
+ *                     opened before the flag was armed) and which therefore
+ *                     rebuilt entry-time bands from the position's PERSISTED
+ *                     entry fields. Open interest is not persisted on the
+ *                     position, so `liquidityBand` is `unknown` on these rows —
+ *                     NOT a real band.
+ *
+ * ⚠️ A pooled `byLiquidityBand` over `entry_rederived` rows is measuring the
+ * absence of a persisted field, not the liquidity of the contracts. Partition on
+ * this column before reading that axis. It exists because the alternative — a
+ * close row that looks exactly like an open row while carrying a structurally
+ * `unknown` band — is the pass/fail-identical instrument this ticket was filed
+ * about.
+ */
+export type EntryTaxonomySource = 'entry_native' | 'entry_carried' | 'entry_rederived';
+
 export interface RealFillTaxonomy {
   /** `entryDeltaBucket(|delta|)` — the SHIPPED bucketer, not a re-implementation. */
   deltaBand: string;
@@ -557,6 +632,8 @@ export interface RealFillTaxonomy {
   exitType: ExitType | null;
   /** `${structure}::${deltaBand}` — the cost bar's own cell key, so rows join to `byCell`. */
   cell: string;
+  /** Provenance of the entry-time bands above. See {@link EntryTaxonomySource}. */
+  entryTaxonomySource: EntryTaxonomySource;
 }
 
 export function buildTaxonomy(input: {
@@ -570,6 +647,8 @@ export function buildTaxonomy(input: {
   exitReason?: string | null;
   /** Pass `false` for an open-side row so `exitType` stays `null`. */
   hasExit: boolean;
+  /** Defaults to `entry_native` — the open path, building from the live entry quote. */
+  entryTaxonomySource?: EntryTaxonomySource;
 }): RealFillTaxonomy {
   const { bid, ask } = input;
   const twoSided =
@@ -598,6 +677,33 @@ export function buildTaxonomy(input: {
     entryType: input.entryType,
     exitType: input.hasExit ? classifyExitType(input.exitReason) : null,
     cell: `${input.structure}::${deltaBand}`,
+    entryTaxonomySource: input.entryTaxonomySource ?? 'entry_native',
+  };
+}
+
+/**
+ * Re-stamp an OPEN row's taxonomy for its matching CLOSE row (TRA-4893 item 1).
+ *
+ * The entry-time bands are carried through UNTOUCHED — that is the whole point:
+ * a close row must bucket on what we entered into, not on what the contract
+ * decayed to by the time we sold it. Only two things change: `exitType` becomes
+ * readable, and the provenance is downgraded from `entry_native` to
+ * `entry_carried` so a reader can tell a close row from the open row it was
+ * derived from.
+ *
+ * ⚠️ `cell` is deliberately NOT recomputed. It is `${structure}::${deltaBand}`
+ * over the ENTRY delta band, which is the cost bar's own cell key — recomputing
+ * it at exit delta would silently move the close row into a different cell from
+ * its own open row, and the two would no longer join.
+ */
+export function carryEntryTaxonomyToExit(
+  entry: RealFillTaxonomy,
+  exitReason: string | null | undefined,
+): RealFillTaxonomy {
+  return {
+    ...entry,
+    exitType: classifyExitType(exitReason),
+    entryTaxonomySource: 'entry_carried',
   };
 }
 
@@ -643,6 +749,14 @@ export interface RealFillShadowRow {
   queuePositionModelled: false;
   /** `false` ⇒ the print rules on this row are `ungraded`; exclude it, do not count it as unfilled. */
   printTapeReadable: boolean;
+  /**
+   * WHICH print tell was readable (TRA-4893 item 4). `{clock:false,volume:true}`
+   * on every row means the `trade_date` projection is not reaching this path and
+   * the second detector is inert — a state that is otherwise invisible, because
+   * a detector that never fires and a detector that fires and agrees both leave
+   * `nUngraded` looking exactly the same.
+   */
+  printTells: PrintTellCoverage;
   timeToFirstFillMs: number | null;
   restedMs: number;
   polls: number;
@@ -707,6 +821,7 @@ export function finalizeRestingOrder(
     participationRate: state.config.participationRate,
     queuePositionModelled: false,
     printTapeReadable: state.printTapeReadable,
+    printTells: { ...state.printTells },
     timeToFirstFillMs: state.firstFillAt === null ? null : state.firstFillAt - state.placedAt,
     restedMs: nowTs - state.placedAt,
     polls: state.polls,
@@ -882,6 +997,35 @@ export interface RealFillShadowSummary {
    * count so the pooling is a choice rather than an accident.
    */
   rowsWithUnmodelledPartials: number;
+  /**
+   * TRA-4893 item 4 — per-tell readability across the whole population. Read
+   * `clockOnly + both` before crediting the `trade_date` detector with anything:
+   * if it is 0 while `volumeOnly` is the entire population, the second detector
+   * is wired but inert and `nUngraded` is still resting on one tell.
+   */
+  printTellCoverage: {
+    rows: number;
+    clockReadable: number;
+    volumeReadable: number;
+    both: number;
+    clockOnly: number;
+    volumeOnly: number;
+    neither: number;
+  };
+  /**
+   * TRA-4893 item 1 — how many rows hold entry-time bands by each route. See
+   * {@link EntryTaxonomySource}. `entry_rederived` rows have a structurally
+   * `unknown` `liquidityBand` (open interest is not persisted on the position),
+   * so `byLiquidityBand` must be partitioned on this before it is read.
+   */
+  byEntryTaxonomySource: Record<EntryTaxonomySource, number>;
+  /**
+   * Rows by side. TRA-4888 shipped OPEN-side call sites only, so a
+   * `sell` count of 0 meant "the close side is not wired", NOT "no exits
+   * happened" — published explicitly so that state can never again be read as
+   * an empty cohort.
+   */
+  bySide: Record<FillSide, number>;
 }
 
 function foldCohort(key: string, rows: readonly RealFillShadowRow[]): RealFillCohort {
@@ -949,6 +1093,52 @@ export function summarizeRealFillShadow(
     else disagreement.printFilledTouchDidNot += 1;
   }
 
+  const tellCoverage = {
+    rows: rows.length,
+    clockReadable: 0,
+    volumeReadable: 0,
+    both: 0,
+    clockOnly: 0,
+    volumeOnly: 0,
+    neither: 0,
+  };
+  for (const r of rows) {
+    // A row written before TRA-4893 has no `printTells`. That is an ABSENT
+    // field, not two `false`s — defaulting it to `{false,false}` would silently
+    // deepen `neither` with rows that simply predate the column. It is counted
+    // as `neither` only because `neither` here means "no tell is recorded for
+    // this row", which is true either way; the discriminator for the old rows is
+    // `schema`/`modelVersion`, which they carry.
+    const tells = r.printTells;
+    const clock = tells?.clock === true;
+    const volume = tells?.volume === true;
+    if (clock) tellCoverage.clockReadable += 1;
+    if (volume) tellCoverage.volumeReadable += 1;
+    if (clock && volume) tellCoverage.both += 1;
+    else if (clock) tellCoverage.clockOnly += 1;
+    else if (volume) tellCoverage.volumeOnly += 1;
+    else tellCoverage.neither += 1;
+  }
+
+  const taxonomySource: Record<EntryTaxonomySource, number> = {
+    entry_native: 0,
+    entry_carried: 0,
+    entry_rederived: 0,
+  };
+  const bySide: Record<FillSide, number> = { buy: 0, sell: 0 };
+  for (const r of rows) {
+    const src = r.taxonomy?.entryTaxonomySource;
+    if (src === 'entry_carried' || src === 'entry_rederived' || src === 'entry_native') {
+      taxonomySource[src] += 1;
+    } else {
+      // Pre-TRA-4893 rows carry no provenance. They are all open-side by
+      // construction (no close call site existed), so `entry_native` is their
+      // true provenance rather than a guess.
+      taxonomySource.entry_native += 1;
+    }
+    if (r.side === 'buy' || r.side === 'sell') bySide[r.side] += 1;
+  }
+
   return {
     schema: REAL_FILL_SHADOW_SCHEMA,
     modelVersion: REAL_FILL_MODEL_VERSION,
@@ -966,5 +1156,8 @@ export function summarizeRealFillShadow(
     ruleDisagreement: disagreement,
     rowsWithUnmodelledPartials: rows.filter((r) => r.partialFillBasis === 'all_or_none_unmodelled')
       .length,
+    printTellCoverage: tellCoverage,
+    byEntryTaxonomySource: taxonomySource,
+    bySide,
   };
 }

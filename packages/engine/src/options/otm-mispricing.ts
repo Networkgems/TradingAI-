@@ -20,6 +20,21 @@ export interface OptionChainRow {
   volume?: number;
   openInterest?: number;
 
+  /**
+   * TRA-4893 (item 4) — ms-epoch LAST-TRADE clock from Tradier `trade_date`.
+   *
+   * ⛔ This is NOT a quote clock. TRA-4870 measured `trade_date` frozen up to
+   * 863.7 h on a contract whose `bid_date` was 0.9 s old, so an age derived from
+   * it says nothing about whether the BOOK is live and must never be used as a
+   * freshness gate. It is projected here for the opposite reason: a clock that
+   * only moves when a print lands is exactly the new-print detector the
+   * real-fill shadow's trade-through rule needs, giving it a second tell
+   * independent of the cumulative-volume counter.
+   *
+   * Absent when the chain payload omits `trade_date`.
+   */
+  lastTradeMs?: number;
+
   /** Mid implied volatility from the market. */
   midIv?: number;
   /**

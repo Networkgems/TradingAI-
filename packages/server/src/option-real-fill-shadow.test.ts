@@ -433,6 +433,8 @@ function mkRow(over: {
   touch?: RealFillShadowRow['ruleVerdicts']['touch_cross'];
   through?: RealFillShadowRow['ruleVerdicts']['print_through_limit'];
   mode?: 'demo' | 'live';
+  side?: RealFillShadowRow['side'];
+  printTells?: RealFillShadowRow['printTells'];
   taxonomyOver?: Partial<RealFillTaxonomy>;
 }): RealFillShadowRow {
   const outcome = over.outcome ?? 'filled';
@@ -445,7 +447,7 @@ function mkRow(over: {
     structure: 'single_leg_otm',
     underlying: 'SPY',
     optionSymbol: 'SPY260925C00600000',
-    side: 'buy',
+    side: over.side ?? 'buy',
     midBasisUsd: 1.10,
     fillBasisUsd: filledContracts > 0 ? 1.15 : null,
     basisDeltaUsd: filledContracts > 0 ? 0.05 : null,
@@ -464,6 +466,9 @@ function mkRow(over: {
     participationRate: 0.1,
     queuePositionModelled: false,
     printTapeReadable: outcome !== 'ungraded',
+    // Pre-TRA-4893 default: the volume tell alone, which is what every row
+    // written before the `trade_date` projection actually had.
+    printTells: over.printTells ?? { clock: false, volume: outcome !== 'ungraded' },
     timeToFirstFillMs: filledContracts > 0 ? 1_000 : null,
     restedMs: 2_000,
     polls: 2,

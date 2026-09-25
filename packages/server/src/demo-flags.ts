@@ -249,6 +249,28 @@ export const DEMO_FLAG_ALLOWLIST = [
   // can never touch live capital. Allowlisted so the desk can arm/disarm the
   // measurement without a redeploy. Non-secret, demo-only.
   'ENABLE_OPTION_MAKER_SHADOW',
+  // TRA-4893 (parent TRA-4888) — the REAL-FILL shadow. Sibling of the flag above
+  // and the same class of thing: it re-polls the tape of a contract the book has
+  // ALREADY opened (or already closed) and records what a resting limit order at
+  // the mid the journal booked would actually have filled at. It routes no order,
+  // prices no live fill and gates no admission — `recordRealFillShadowRow` only
+  // ever appends JSONL.
+  //
+  // ⚠️ This entry is what makes the flag ARMABLE AT ALL. `loadDemoFlagFile`
+  // iterates the allowlist and nothing else, so a key absent from here that is
+  // written into `demo-flags.json` is silently dropped: the write reports success,
+  // the file on disk contains the key, `resolveDemoFlagEnv` never returns it, and
+  // the recorder stays dark. TRA-4888 shipped the flag and the
+  // `resolveDemoFlagEnv`-threaded call sites but never added this line, so the
+  // documented arming path could not work — a recorder that had never produced a
+  // row, with an arming step that reads as if it had succeeded.
+  //
+  // Unlike its sibling this one is NOT hard-gated on `mode === 'demo'`: the
+  // measurement is wanted on the live-bounded OTM path too, whose basis error is
+  // the actual subject. That is safe for the same reason the route is
+  // unauthenticated — the module's entire write surface is an append to its own
+  // ledger, and it is read by no gate.
+  'ENABLE_OPTION_REAL_FILL_SHADOW',
   // TRA-2028 (parent TRA-1966, spec TRA-2026) — the IV-PERCENTILE entry filter on
   // the wheel loop, plus its tunable thresholds. The wheel routing path is DEMO/
   // paper-only by construction (every write opens `mode:'demo'`, no Tradier mirror;

@@ -584,10 +584,12 @@ import {
   finalizeRestingOrder,
   recordRealFillShadowRow,
   buildTaxonomy,
+  carryEntryTaxonomyToExit,
   isOptionRealFillShadowEnabled,
   DEFAULT_REAL_FILL_CONFIG,
   type RestingOrderState,
   type EntryType as RealFillEntryType,
+  type RealFillTaxonomy,
 } from './option-real-fill-shadow.js';
 
 /**
@@ -3363,6 +3365,30 @@ export class SignalEngine {
    * observe to the end must not be booked at all.
    */
   private realFillShadows: RealFillShadowInFlight[] = [];
+  /**
+   * TRA-4893 item 1 — the ENTRY-time taxonomy of every contract this process
+   * opened a real-fill shadow for, keyed by OCC symbol, so the matching CLOSE
+   * row can carry it forward verbatim instead of re-deriving it.
+   *
+   * Why carrying beats re-deriving: delta and DTE both move continuously while a
+   * position is held, so a close row bucketed on exit-time values would land in
+   * a different `deltaBand` — and a different `cell` — from its own open row,
+   * and the two would not join. Open interest is worse than moved: it is not
+   * persisted on the position at all, so a re-derived close row's
+   * `liquidityBand` is structurally `unknown`.
+   *
+   * ⚠️ Memory-only and deliberately NOT persisted, matching `realFillShadows`.
+   * A close whose open-side entry is missing (process restarted mid-hold, or the
+   * row was opened before the flag was armed) still produces a row — it re-derives
+   * from the position's persisted entry fields and stamps
+   * `entryTaxonomySource: 'entry_rederived'` so the weaker provenance is
+   * readable. Dropping those rows instead would bias the exit population toward
+   * short holds, which is a survivorship hole, not a saving.
+   *
+   * Bounded the same way as the in-flight list, and each entry is evicted by its
+   * own close.
+   */
+  private realFillEntryTaxonomy = new Map<string, RealFillTaxonomy>();
   /** Last successful RV scan timestamp — gates the 5-minute cadence. */
   private lastRvScanAt = 0;
   /** TRA-1207 — last OTM-mispricing scan timestamp; gates the 5-minute cadence. */
@@ -6502,6 +6528,19 @@ export class SignalEngine {
         // survive the nightly/mid-session reboot (both restart directions).
         recordOptionsBreakerState(this.mode, this.feedContextKey, this.optionsBreaker.exportState());
       }
+      // TRA-4893 item 1 — shadow the SELL-TO-CLOSE these exits booked at the
+      // mark. Placed here, at the one site every exit-cascade close passes
+      // through, rather than at the several `closeOption` callers: a close-side
+      // call site that covers only some exit reasons would make `byExitType`
+      // look populated while silently omitting whole cohorts, which is the same
+      // unreadable-instrument failure as having no close site at all.
+      //
+      // Observe-only and after the breaker fold, so it cannot reorder or affect
+      // anything the exit does. Awaited (it reads the cached chain) but each
+      // order is independently try/caught inside.
+      await withPhase('signal.doTick.real-fill-shadow-closes', async () => {
+        for (const opt of optsClosed) await this.beginRealFillShadowClose(opt);
+      });
     }
 
     // TRA-1267 (TRA-1250 Rule 3) — book-level daily give-back cap + session
@@ -9781,25 +9820,163 @@ export class SignalEngine {
       if (!state) return;
       if (this.realFillShadows.length >= SHADOW_CHASE_MAX_IN_FLIGHT) return;
 
+      const taxonomy = buildTaxonomy({
+        structure,
+        delta: opened.delta ?? null,
+        dte: opened.dte ?? null,
+        bid,
+        ask,
+        openInterest: opened.openInterest ?? null,
+        entryType,
+        hasExit: false,
+      });
+
+      this.realFillShadows.push({ state, symbol, expiration, structure, taxonomy });
+
+      // TRA-4893 item 1 — remember the ENTRY taxonomy for this contract so its
+      // eventual close row carries these exact bands. Stamped here, at the open,
+      // rather than at the close, because `openInterest` is available on this
+      // path and is not persisted anywhere on the position.
+      //
+      // Bounded like the in-flight list. When full, the OLDEST entry is dropped:
+      // its close will re-derive and stamp `entry_rederived`, which is degraded
+      // but readable, whereas refusing to insert would silently favour whichever
+      // contracts happened to open first.
+      if (this.realFillEntryTaxonomy.size >= SHADOW_CHASE_MAX_IN_FLIGHT) {
+        const oldest = this.realFillEntryTaxonomy.keys().next();
+        if (!oldest.done) this.realFillEntryTaxonomy.delete(oldest.value);
+      }
+      this.realFillEntryTaxonomy.set(optionSymbol, taxonomy);
+    } catch {
+      // Telemetry must never break a trade pass.
+    }
+  }
+
+  /**
+   * TRA-4893 item 1 — shadow the SELL-TO-CLOSE that an exit did not route.
+   *
+   * ── Why this had to exist ───────────────────────────────────────────────────
+   * TRA-4888 wired call sites at the OTM **open** paths only. `exitType` was in
+   * the row shape and `finalizeRestingOrder` already normalised the sign for
+   * `side: 'sell'`, so nothing LOOKED missing — but with no close-side call site
+   * every exit-type cohort was structurally empty, and `byExitType` returned a
+   * single `open_side` bucket. A reader pulling that could not distinguish "no
+   * exits happened" from "exits are not instrumented". Same class of defect as
+   * the recorder that had never produced a row.
+   *
+   * ── The limit price ────────────────────────────────────────────────────────
+   * The resting limit is the exit MID, for exactly the reason the open side
+   * rests at the entry mid: that is the price the journal actually books. An
+   * exit is booked at the mark (`currentPremium`), which is the NBBO mid — the
+   * defect TRA-4674's `crossedPnlUsd` measures from the other direction. So the
+   * question this row answers is the symmetric one: would a real resting SELL
+   * limit at the mid we booked have filled at all?
+   *
+   * ── Taxonomy ───────────────────────────────────────────────────────────────
+   * ENTRY-time bands throughout, carried from the open row when this process
+   * still holds them, re-derived from the position's persisted entry fields when
+   * it does not. Never exit-time: a row bucketed on the delta it decayed to
+   * describes a contract we never chose to buy.
+   *
+   * Fire-and-forget and totally defensive, like the open side.
+   */
+  private async beginRealFillShadowClose(closed: OptionPosition): Promise<void> {
+    try {
+      if (!isOptionRealFillShadowEnabled(this.resolveDemoFlagEnv())) return;
+      const getTape = this.rvScanner?.getOptionTapeSample;
+      if (typeof getTape !== 'function') return;
+
+      const { optionSymbol, expiration, symbol } = closed;
+      if (!optionSymbol || !expiration || !symbol) return;
+      // Contracts CLOSED on this exit. `contractsRemaining` is what the exit
+      // sold; `contracts` is the original size and would over-state a TP1
+      // partial's second leg.
+      const contracts = closed.contractsRemaining;
+      if (typeof contracts !== 'number' || !(contracts > 0)) return;
+      if (this.realFillShadows.length >= SHADOW_CHASE_MAX_IN_FLIGHT) return;
+
+      // Exit-time two-sided quote, off the same cached chain snapshot the tape
+      // sampler uses, so the decision mid and the polls that follow share one
+      // definition.
+      const tape = await getTape.call(this.rvScanner, symbol, expiration, optionSymbol);
+      const bid = tape?.bid ?? null;
+      const ask = tape?.ask ?? null;
+      if (typeof bid !== 'number' || typeof ask !== 'number') return;
+
+      const state = beginRestingOrder(
+        { side: 'sell', optionSymbol, limitUsd: (bid + ask) / 2, contracts, bid, ask },
+        Date.now(),
+        DEFAULT_REAL_FILL_CONFIG,
+      );
+      // One-sided / crossed exit book — drops out of the denominator, same as
+      // the open side, rather than booking a flattering zero-cost exit.
+      if (!state) return;
+
+      const carried = this.realFillEntryTaxonomy.get(optionSymbol);
+      const taxonomy = carried
+        ? carryEntryTaxonomyToExit(carried, closed.exitReason ?? null)
+        : this.rederiveEntryTaxonomyForExit(closed);
+
       this.realFillShadows.push({
         state,
         symbol,
         expiration,
-        structure,
-        taxonomy: buildTaxonomy({
-          structure,
-          delta: opened.delta ?? null,
-          dte: opened.dte ?? null,
-          bid,
-          ask,
-          openInterest: opened.openInterest ?? null,
-          entryType,
-          hasExit: false,
-        }),
+        structure: taxonomy.cell.split('::')[0] ?? 'single_leg_otm',
+        taxonomy,
       });
+      // The position is gone; its entry taxonomy has served its purpose.
+      this.realFillEntryTaxonomy.delete(optionSymbol);
     } catch {
-      // Telemetry must never break a trade pass.
+      // A measurement failure is never an exit failure.
     }
+  }
+
+  /**
+   * TRA-4893 item 1 — rebuild ENTRY-time taxonomy for a close whose open-side
+   * entry is not in memory (process restarted mid-hold, or the row opened before
+   * the flag was armed).
+   *
+   * Every field comes from a value STAMPED AT ENTRY and persisted with the row —
+   * `entryDelta`, the entry NBBO (`entryBidAtOpen`/`entryAskAtOpen`), and DTE
+   * recomputed from `expiration` against `openedAt`, NOT against now. Using
+   * today's date would hand a 40-DTE entry held three weeks a `dteBand` of 19,
+   * which is a different contract from the one we bought.
+   *
+   * ⚠️ Open interest is NOT persisted on the position, so `liquidityBand` on
+   * these rows is `unknown` — structurally, for every one of them. That is why
+   * the row is stamped `entry_rederived`: `byLiquidityBand` has to be
+   * partitioned on the provenance column before it means anything.
+   */
+  private rederiveEntryTaxonomyForExit(closed: OptionPosition): RealFillTaxonomy {
+    const entryDte =
+      closed.expiration && Number.isFinite(closed.openedAt)
+        ? Math.max(
+            0,
+            Math.round(
+              (Date.parse(`${closed.expiration}T00:00:00Z`) - closed.openedAt) / 86_400_000,
+            ),
+          )
+        : null;
+    const structure =
+      closed.journalStructure
+      ?? closed.engineOriginSleeve
+      ?? 'single_leg_otm';
+    return buildTaxonomy({
+      structure,
+      delta: typeof closed.entryDelta === 'number' ? closed.entryDelta : null,
+      dte: entryDte !== null && Number.isFinite(entryDte) ? entryDte : null,
+      bid: closed.entryBidAtOpen ?? null,
+      ask: closed.entryAskAtOpen ?? null,
+      // Not persisted anywhere on the row — `unknown`, never a guessed band.
+      openInterest: null,
+      // The entry EXECUTION style is not persisted either. `unknown` rather than
+      // the open path's `maker_mid` default: stamping a style we did not read
+      // would put these rows in a cohort they may not belong to.
+      entryType: 'unknown',
+      exitReason: closed.exitReason ?? null,
+      hasExit: true,
+      entryTaxonomySource: 'entry_rederived',
+    });
   }
 
   /**
@@ -9845,9 +10022,15 @@ export class SignalEngine {
             bid: tape?.bid ?? null,
             ask: tape?.ask ?? null,
             last: tape?.last ?? null,
-            // Tradier's last-trade clock is not projected into the chain row
-            // (TRA-4870); the volume tell carries the print detector alone.
-            lastTradeMs: null,
+            // TRA-4893 item 4 — Tradier's last-trade clock IS projected into the
+            // chain row now, so the print detector has a second tell independent
+            // of the volume counter. `null` when the chain payload carries no
+            // usable stamp, which degrades to the volume tell alone (the
+            // pre-TRA-4893 behaviour). Which tell actually carried each row is
+            // recorded on the row (`printTells`) and folded into the summary's
+            // `printTellCoverage`, so an inert clock tell is visible rather than
+            // assumed to be working.
+            lastTradeMs: tape?.lastTradeMs ?? null,
             volume: tape?.volume ?? null,
           },
           now,

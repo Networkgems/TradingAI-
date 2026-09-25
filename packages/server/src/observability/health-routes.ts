@@ -403,6 +403,7 @@ import {
   listRealFillShadowRows,
   summarizeRealFillShadow,
   isOptionRealFillShadowEnabled,
+  OPTION_REAL_FILL_SHADOW_FLAG,
 } from '../option-real-fill-shadow.js';
 import { resolveMakerWalkConfig } from '../option-maker-config.js';
 import { isLearnedShrinkageEnabled } from '../learned-shrinkage-flag.js';
@@ -8892,10 +8893,38 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     });
     const summary = summarizeRealFillShadow(rows, now());
 
+    // TRA-4893 item 2 — resolve the arm through the demo-flags overlay, the SAME
+    // way `signal-engine` resolves it at the recording call sites. Reading
+    // `process.env` alone (what this route shipped with) would publish
+    // `enabled: false` on a host armed via `demo-flags.json` while the recorder
+    // was in fact writing rows — an arm indicator that disagrees with the
+    // recorder it describes is worse than no indicator, because it is the field
+    // an operator checks to confirm the arming step worked.
+    const dir = process.env.DATA_DIR;
+    const flagEnv = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const enabled = isOptionRealFillShadowEnabled(flagEnv);
+
     res.json({
       ok: true,
       time: new Date(now()).toISOString(),
-      enabled: isOptionRealFillShadowEnabled(),
+      enabled,
+      /**
+       * WHERE the arm came from. `demo_flags_file` vs `process_env` matters
+       * because only the first is writable without a redeploy, and an operator
+       * who armed the file needs to see that it took.
+       */
+      enabledSource: enabled
+        ? (isOptionRealFillShadowEnabled(process.env) ? 'process_env' : 'demo_flags_file')
+        : 'off',
+      flag: OPTION_REAL_FILL_SHADOW_FLAG,
+      /**
+       * TRA-4893 — whether the flag is allowlisted for `demo-flags.json` at all.
+       * `false` would mean the documented arming path CANNOT work no matter what
+       * is written to the file (`loadDemoFlagFile` iterates the allowlist only),
+       * which is precisely the state TRA-4888 shipped in. Published so that is a
+       * readable fact rather than a silent one.
+       */
+      armableViaDemoFlagsFile: DEMO_FLAG_ALLOWLIST.includes(OPTION_REAL_FILL_SHADOW_FLAG),
       ...(mode ? { mode } : {}),
       ...(sinceTs !== undefined ? { sinceTs } : {}),
       note:
@@ -8913,7 +8942,20 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         + '⚠️ `ruleDisagreement` is the load-bearing column: `touch_cross` (the permissive rule '
         + '/option-maker-shadow uses) and `print_through_limit` (the conservative one this route books on) '
         + 'do not agree, and the size of that gap is how much the answer depends on the rule rather than '
-        + 'the market.',
+        + 'the market. '
+        + 'TRA-4893 — the CLOSE side is wired: `bySide.sell` counts exit rows. Until TRA-4893 there was no '
+        + 'close-side call site at all, so `byExitType` held a single `open_side` bucket and every exit '
+        + 'cohort was structurally empty; `bySide.sell === 0` now distinguishes "no exits yet" from '
+        + '"exits not instrumented". '
+        + '⚠️ READ `byEntryTaxonomySource` BEFORE `byLiquidityBand`: `entry_rederived` close rows rebuild '
+        + 'entry-time bands from the position\'s persisted fields, and open interest is NOT persisted, so '
+        + 'their `liquidityBand` is structurally `unknown` rather than measured. '
+        + '⚠️ `printTellCoverage` says which of the two independent print detectors actually carried each '
+        + 'row. `clockReadable === 0` across the population means the Tradier `trade_date` tell is wired '
+        + 'but inert (the chain payload omits the stamp) and the grade still rests on the volume counter '
+        + 'alone — a state that otherwise looks identical to the tell working and agreeing. '
+        + '⚠️ `participationRate` is 0.10 and is NOT measured. It scales modelled fill SIZE, so any '
+        + 'conclusion that moves across a 0.05–0.25 sweep is a conclusion about the knob.',
       summary,
     });
   });

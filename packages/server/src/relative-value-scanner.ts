@@ -534,11 +534,16 @@ export interface RelativeValueScannerService {
    * quote with a volume read on the other side of a refresh and manufacture a
    * print that never happened.
    *
-   * ⚠️ `lastTradeMs` is NOT populated here. Tradier's `trade_date` — the
-   * last-trade clock (TRA-4870) — is not projected into `OptionChainRow`, so
-   * the print detector runs on the VOLUME tell alone. `volume` is a sufficient
-   * print detector on its own (see `detectNewPrint`), but a contract whose
-   * chain row omits volume grades UNGRADED, never no-fill.
+   * TRA-4893 item 4 — `lastTradeMs` IS populated now. Tradier's `trade_date`
+   * (the last-trade clock, TRA-4870) is projected into `OptionChainRow`, giving
+   * `detectNewPrint` a second tell independent of the cumulative-volume counter
+   * and shrinking the ungraded population on contracts whose chain row omits
+   * volume. It is `null` whenever the chain payload carries no usable stamp,
+   * which is the pre-TRA-4893 behaviour (volume tell alone).
+   *
+   * ⛔ Do NOT reuse this field as a quote-freshness clock. It is frozen on any
+   * contract that has not printed — measured up to 863.7 h stale beside a 0.9 s
+   * old book (TRA-4870). Its only valid reading is "a print landed".
    *
    * OPTIONAL on the interface, same contract as {@link getOptionQuote}: a
    * scanner without it produces no shadow rows rather than half-measured ones.
@@ -553,6 +558,7 @@ export interface RelativeValueScannerService {
     last: number | null;
     volume: number | null;
     openInterest: number | null;
+    lastTradeMs: number | null;
   } | null>;
   diagnostics(): RelativeValueScannerDiagnostics;
 }
@@ -1100,6 +1106,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     last: number | null;
     volume: number | null;
     openInterest: number | null;
+    lastTradeMs: number | null;
   } | null> {
     if (!this.client) return null;
     if (this.isBreakerOpen()) return null;
@@ -1123,6 +1130,11 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       // a measurement, not an absence, so they do not require positivity.
       volume: num(row.volume, false),
       openInterest: num(row.openInterest, false),
+      // TRA-4893 item 4 — the second print tell. Positivity IS required: a zero
+      // last-trade stamp is an absent clock, and treating it as epoch 0 would
+      // make the very next poll look like an advancing clock and manufacture a
+      // print that never happened.
+      lastTradeMs: num(row.lastTradeMs),
     };
   }
 

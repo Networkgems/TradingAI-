@@ -71,6 +71,16 @@ interface TradierRawOption {
   last?: number;
   volume?: number;
   open_interest?: number;
+  /**
+   * TRA-4893 (item 4) — the LAST-TRADE clock, same field and same semantics as
+   * on `/markets/quotes` (TRA-4870). Whether the CHAIN endpoint populates it is
+   * not documented and is not assumed here: absent ⇒ `lastTradeMs` undefined ⇒
+   * the consumer falls back to the volume tell alone, which is the pre-TRA-4893
+   * behaviour. The real-fill shadow counts per-row which tell it actually got,
+   * so "the chain does not carry this" is a readable state rather than a silent
+   * one.
+   */
+  trade_date?: number;
   greeks?: TradierRawGreeks | null;
 }
 
@@ -799,6 +809,13 @@ export class TradierOptionsClient extends TradierOrderClient {
       last: typeof o.last === 'number' ? o.last : undefined,
       volume: typeof o.volume === 'number' ? o.volume : undefined,
       openInterest: typeof o.open_interest === 'number' ? o.open_interest : undefined,
+      // TRA-4893 item 4 — project the last-trade clock. Guarded on `> 0` so a
+      // zero/absent stamp reads as UNREADABLE rather than as epoch 0, which
+      // would make every subsequent poll look like an advancing clock.
+      lastTradeMs:
+        typeof o.trade_date === 'number' && Number.isFinite(o.trade_date) && o.trade_date > 0
+          ? o.trade_date
+          : undefined,
       midIv: o.greeks?.mid_iv && o.greeks.mid_iv > 0 ? o.greeks.mid_iv : undefined,
       smvVol: o.greeks?.smv_vol && o.greeks.smv_vol > 0 ? o.greeks.smv_vol : undefined,
     }));
