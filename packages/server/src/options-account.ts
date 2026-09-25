@@ -7634,13 +7634,29 @@ export class PaperOptionsAccount {
   ): void {
     if (!isOptionTradeJournalEnabled()) return;
     const id = position.id;
-    // TRA-4857 / TRA-4860 — an unpriced close (no broker fill to price against)
-    // writes honest nulls, not a fabricated 0. Key on the ABSENCE OF A BROKER
-    // FILL, never on `exitReason` alone. This catches unpriced closes under ANY
-    // exit reason, not just `broker_reconcile`. Row `a2f9c8cd` (NOK261002C00010500,
-    // brokerOrderId 144350660, realizedPnlUsd -$22.50 LOSS) still writes truthful
-    // P&L because it HAS a brokerOrderId.
-    const unpricedClose = brokerOrderId === null;
+    // TRA-4857 — an unpriced reconcile close (broker flat, no fill to price
+    // against) writes honest nulls, not a fabricated 0. BOTH terms are load-
+    // bearing; do not "simplify" this to either one alone.
+    //
+    // `brokerOrderId === null` alone is NOT the unpriced population (TRA-4860
+    // shipped that and it was reverted). `brokerOrderId` is passed by exactly
+    // TWO of this method's THIRTEEN call sites — `finalizePendingExit` and
+    // `recordImportedFill`. The other eleven (`tp1`, `assigned`, `called_away`,
+    // `partial_drain`, every demo/paper exit and every expiry settle) book
+    // locally and pass nothing, so they default to `null` while carrying a
+    // perfectly real `position.pnl`. Keying on `brokerOrderId` alone therefore
+    // writes `UNMEASURED`/null over essentially the WHOLE tape.
+    //
+    // Nor can this key on "no price": the reconcile closes at
+    // `breakEvenFill = opt.premiumPaid` (see `closeOption(..., 'broker_reconcile')`),
+    // so the fabricated zero arrives as a finite, plausible `number`.
+    // `position.pnl == null` never fires. `exitReason === 'broker_reconcile'`
+    // is the ONLY marker of that break-even synthesis that survives to here.
+    //
+    // Row `a2f9c8cd` (NOK261002C00010500, brokerOrderId 144350660,
+    // realizedPnlUsd -$22.50 LOSS) is a reconcile close that DID find a fill,
+    // and the `brokerOrderId` term is what preserves its truthful P&L.
+    const unpricedClose = exitReason === 'broker_reconcile' && brokerOrderId === null;
     const realizedPnlUsd = unpricedClose ? null : (position.pnl ?? 0);
     const closeTs = position.closedAt ?? Date.now();
     this.journalWrites = this.journalWrites
