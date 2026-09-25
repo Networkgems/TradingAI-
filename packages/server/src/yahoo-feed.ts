@@ -1371,10 +1371,175 @@ export const MEAN_VERDICT_MIN_MINUTES = 5;
 // within its class, because `available`/`used` describe the CURRENT window and
 // an older sample of the same bucket is strictly less true. `allowed` is the
 // stable field and the one AC1 turns on.
-const tradierRateLimitByClass = new Map<TradierEndpointClass, TradierRateLimitReading>();
+//
+// ⛔⛔ TRA-4919 — "THE LAST ONE WINS" WAS WRONG FOR A HEADER-LESS RESPONSE, AND IT
+// BLINDED THE METER AT THE EXACT INSTANT THE METER WAS LOAD-BEARING.
+//
+// Measured on bqb1 `66a8a1ab40cc`, 2026-09-25T18:35:43Z: `timesales` returned a
+// `400` carrying NO `x-ratelimit-*` family. `observeRateLimit` is called before
+// the throw — correctly, TRA-4441's "a refusal is the informative one" — so it
+// wrote `{allowed:null, used:null, available:null}` into this map, and by the
+// rule above that null WON. It overwrote the last good `timesales` reading;
+// `upstream.observedClasses` fell 3 → 2 and stayed there for three consecutive
+// payloads.
+//
+// The rule is only true when the new reading is at least as informative as the
+// one it replaces. A header-less response is strictly LESS informative: it says
+// nothing about the bucket. Worse, the erased class then renders identically to a
+// class that was never called — both simply absent from `byClass` — which is the
+// same "cannot tell two opposite states apart" failure the TRA-4441 docblock
+// above installed `sawAnyResponse` to prevent for the COLD-START case. The
+// refusal case had no such split.
+//
+// So: keep the last HEADER-BEARING reading per class, and record the refusal
+// SEPARATELY. A refusal then ADDS information (what refused, when, why, how
+// often) instead of destroying it.
+const MAX_RECENT_REFUSALS = 20;
+
+/** TRA-4919 — one upstream refusal, as published on `/api/health/quotes`. */
+export interface TradierRefusalRecord {
+  endpointClass: string;
+  status: number;
+  /** The vendor's own body (`fault.faultstring` / `errors.error`), bounded by the
+   *  engine client. `null` = no body / unreadable, NEVER an empty string. */
+  reason: string | null;
+  atMs: number;
+  /** Did the refusal itself carry the rate-limit family? A refusal WITH headers
+   *  is self-explaining; one without is why this record has to exist. */
+  sawRateLimitHeaders: boolean;
+}
+
+/** TRA-4919 — per-class refusal summary. Lives beside the header-bearing reading,
+ *  never on top of it. */
+export interface TradierClassRefusalState {
+  lastRefusalAtMs: number;
+  lastRefusalStatus: number;
+  lastRefusalReason: string | null;
+  refusalsSinceBoot: number;
+  /** Fixed-minute bucket `refusalsThisMinute` is counted in. */
+  minuteBucket: number;
+  refusalsThisMinute: number;
+}
+
+/**
+ * TRA-4919 — everything the observer accumulates, in one plain object so the fold
+ * can be exercised by a unit test without reaching into module state (and so a
+ * test cannot silently inherit another test's readings).
+ */
+export interface TradierMeterState {
+  /** Last HEADER-BEARING reading per class. A header-less response never lands here. */
+  byClass: Map<TradierEndpointClass, TradierRateLimitReading>;
+  refusalByClass: Map<TradierEndpointClass, TradierClassRefusalState>;
+  /** Bounded ring, oldest first. */
+  recentRefusals: TradierRefusalRecord[];
+  /** Responses per class that carried no rate-limit family at all. Publishing this
+   *  is what keeps "blinded" separable from "never called". */
+  headerlessByClass: Map<TradierEndpointClass, number>;
+  /** Any response at all, header-bearing or not — the `sawAnyResponse` source.
+   *  ⛔ It can no longer be derived from `byClass.size`: that is the whole fix. */
+  responsesObserved: number;
+  /** TRA-4919 Defect 3 — per fixed minute, the HIGH-WATER of upstream's own `used`. */
+  meteredMinuteHighWater: Map<number, number>;
+  /** Per fixed minute, how many readings carried a `used` at all. The density
+   *  field: without it, "metered spend looks fine" and "we stopped looking" read
+   *  identically, which is the failure this whole issue is about. */
+  meteredMinuteReadings: Map<number, number>;
+  meteredLastReadingAtMs: number | null;
+}
+
+export function createTradierMeterState(): TradierMeterState {
+  return {
+    byClass: new Map(),
+    refusalByClass: new Map(),
+    recentRefusals: [],
+    headerlessByClass: new Map(),
+    responsesObserved: 0,
+    meteredMinuteHighWater: new Map(),
+    meteredMinuteReadings: new Map(),
+    meteredLastReadingAtMs: null,
+  };
+}
+
+/** Drop the oldest buckets once a minute-keyed map outgrows the history bound.
+ *  Insertion order is arrival order and buckets only advance, so the first keys
+ *  are the oldest — same argument as `recordAccountMinute`. */
+function pruneMinuteMap(m: Map<number, number>, keep: number): void {
+  if (m.size <= keep) return;
+  const excess = m.size - keep;
+  let dropped = 0;
+  for (const k of m.keys()) {
+    if (dropped++ >= excess) break;
+    m.delete(k);
+  }
+}
+
+/**
+ * TRA-4919 — fold one upstream reading into the meter. Pure w.r.t. module state
+ * (the state object is an argument) so both the refusal path and the metered path
+ * are unit-testable without a live Tradier round-trip.
+ */
+export function foldTradierRateLimitReading(
+  state: TradierMeterState,
+  reading: TradierRateLimitReading,
+  windowMs: number = BAR_PULL_RATE_WINDOW_MS,
+): void {
+  state.responsesObserved++;
+  const cls = reading.endpointClass;
+
+  // ── Defect 2: a header-less response must never overwrite a header-bearing one.
+  if (reading.sawRateLimitHeaders) {
+    state.byClass.set(cls, reading);
+  } else {
+    state.headerlessByClass.set(cls, (state.headerlessByClass.get(cls) ?? 0) + 1);
+  }
+
+  // ── Defect 1: the refusal, recorded separately and named.
+  const isRefusal = reading.status < 200 || reading.status >= 300;
+  if (isRefusal) {
+    const bucket = Math.floor(reading.observedAtMs / windowMs);
+    const prior = state.refusalByClass.get(cls);
+    state.refusalByClass.set(cls, {
+      lastRefusalAtMs: reading.observedAtMs,
+      lastRefusalStatus: reading.status,
+      lastRefusalReason: reading.refusalReason,
+      refusalsSinceBoot: (prior?.refusalsSinceBoot ?? 0) + 1,
+      minuteBucket: bucket,
+      // Reset on a new minute rather than decaying: the field names a FIXED
+      // minute, which is the window Tradier meters in.
+      refusalsThisMinute: prior && prior.minuteBucket === bucket ? prior.refusalsThisMinute + 1 : 1,
+    });
+    state.recentRefusals.push({
+      endpointClass: cls,
+      status: reading.status,
+      reason: reading.refusalReason,
+      atMs: reading.observedAtMs,
+      sawRateLimitHeaders: reading.sawRateLimitHeaders,
+    });
+    if (state.recentRefusals.length > MAX_RECENT_REFUSALS) {
+      state.recentRefusals.splice(0, state.recentRefusals.length - MAX_RECENT_REFUSALS);
+    }
+  }
+
+  // ── Defect 3: the METERED numerator — upstream's own `used`, per fixed minute.
+  // A high-water, not a last-value: `used` is cumulative inside upstream's window
+  // and we sample it opportunistically, so the largest value we saw in a minute is
+  // the best LOWER BOUND on that minute's spend. Labelled a lower bound where it
+  // is published (`meteredIsLowerBound`), because it is one.
+  if (reading.used !== null) {
+    const bucket = Math.floor(reading.observedAtMs / windowMs);
+    const prior = state.meteredMinuteHighWater.get(bucket);
+    if (prior === undefined || reading.used > prior) state.meteredMinuteHighWater.set(bucket, reading.used);
+    state.meteredMinuteReadings.set(bucket, (state.meteredMinuteReadings.get(bucket) ?? 0) + 1);
+    state.meteredLastReadingAtMs = reading.observedAtMs;
+    pruneMinuteMap(state.meteredMinuteHighWater, ACCOUNT_MINUTE_HISTORY);
+    pruneMinuteMap(state.meteredMinuteReadings, ACCOUNT_MINUTE_HISTORY);
+  }
+}
+
+const tradierMeter = createTradierMeterState();
 
 setTradierRateLimitObserver((reading) => {
-  tradierRateLimitByClass.set(reading.endpointClass, reading);
+  foldTradierRateLimitReading(tradierMeter, reading);
 });
 
 /**
@@ -1386,10 +1551,29 @@ setTradierRateLimitObserver((reading) => {
  * or not, so an all-null block with `sawAnyResponse: true` is a genuine "upstream
  * does not tell us", not a cold meter. Without that split an unarmed observer and a
  * silent upstream read identically — the failure that makes a health field useless.
+ *
+ * TRA-4919 — `byClass` now holds the last HEADER-BEARING reading per class, so a
+ * header-less refusal can no longer erase a live meter (see the fold above). Three
+ * companions make the erasure's replacement readable:
+ *   • `refusalByClass` — what refused, when, with what status and WHOSE REASON.
+ *   • `recentRefusals` — the bounded ring, so a burst is visible as a burst.
+ *   • `headerlessResponsesByClass` — how often upstream answered this bucket
+ *     without the family. A class present here and absent from `byClass` was
+ *     BLINDED; a class absent from both was never called. Previously identical.
  */
 export function getTradierUpstreamRateLimitState(): {
   observedClasses: number;
   sawAnyResponse: boolean;
+  /** TRA-4919 — every response observed, header-bearing or not. `sawAnyResponse`
+   *  is this `> 0`; published as a count so density is readable. */
+  responsesObserved: number;
+  /** TRA-4919 — the refusal ring, oldest first. Empty = no non-2xx since boot. */
+  recentRefusals: readonly TradierRefusalRecord[];
+  /** TRA-4919 — cap on the ring, so a reader can tell a quiet box from a truncated
+   *  one rather than inheriting the constant. */
+  recentRefusalsCap: number;
+  refusalByClass: Record<string, TradierClassRefusalState>;
+  headerlessResponsesByClass: Record<string, number>;
   /** Distinct non-null `allowed` values across buckets. >1 ⇒ separately metered. */
   distinctAllowedValues: readonly number[];
   /** All observed buckets report the SAME `allowed` ⇒ one shared meter is plausible.
@@ -1412,13 +1596,14 @@ export function getTradierUpstreamRateLimitState(): {
   }>;
 } {
   const now = Date.now();
+  const state = tradierMeter;
   const byClass: Record<string, {
     allowed: number | null; used: number | null; available: number | null;
     expiryMs: number | null; status: number; observedAtMs: number; ageMs: number;
     secondsToExpiry: number | null;
   }> = {};
   const allowedValues: number[] = [];
-  for (const [cls, r] of tradierRateLimitByClass) {
+  for (const [cls, r] of state.byClass) {
     if (typeof r.allowed === 'number') allowedValues.push(r.allowed);
     byClass[cls] = {
       allowed: r.allowed,
@@ -1433,15 +1618,134 @@ export function getTradierUpstreamRateLimitState(): {
         : null,
     };
   }
+  const refusalByClass: Record<string, TradierClassRefusalState> = {};
+  for (const [cls, r] of state.refusalByClass) refusalByClass[cls] = { ...r };
+  const headerlessResponsesByClass: Record<string, number> = {};
+  for (const [cls, n] of state.headerlessByClass) headerlessResponsesByClass[cls] = n;
   const distinct = [...new Set(allowedValues)].sort((a, b) => a - b);
   const bucketsAgree = allowedValues.length >= 2 ? distinct.length === 1 : null;
   return {
     observedClasses: allowedValues.length,
-    sawAnyResponse: tradierRateLimitByClass.size > 0,
+    sawAnyResponse: state.responsesObserved > 0,
+    responsesObserved: state.responsesObserved,
+    recentRefusals: state.recentRefusals.map((r) => ({ ...r })),
+    recentRefusalsCap: MAX_RECENT_REFUSALS,
+    refusalByClass,
+    headerlessResponsesByClass,
     distinctAllowedValues: distinct,
     bucketsAgree,
     sharedAllowedReqPerMin: distinct.length === 1 ? (distinct[0] ?? null) : null,
     byClass,
+  };
+}
+
+// ── TRA-4919 Defect 3 — `accountMeanReqPerMin` IS NOT METERED SPEND ───────────
+//
+// …and it is the field everyone grades. TRA-4830's acceptance criterion 2
+// (`mean < 120`) was graded on it. It disagrees with Tradier's own meter IN BOTH
+// DIRECTIONS inside a single fixed minute, measured on bqb1 2026-09-25:
+//
+//   minute ending 18:35:00Z — local 59 → 297 (+238 in 34s); upstream 5 → 32 (+27)
+//                             ⇒ ~9x HIGH.
+//   minute ending 18:37:00Z — local reads 0 at 43s in; upstream recorded 43 used
+//                             in the same window ⇒ reads ZERO while spending.
+//
+// It is not noise, it is construction. `recordAccountMinute` is fed from the
+// eight `bumpFallbackCounter('tradier')` sites in THIS FILE only, while the
+// rate-limit observer sees every call through
+// `packages/engine/src/tradier/stocks-client.ts` — and `options-client.ts` makes
+// Tradier calls that are on NEITHER path. Three different populations, and until
+// now no field said so. `localCounterPopulation` says so.
+//
+// The remedy is not to delete the local counter — it is the only sub-minute
+// signal the throttle gate can read synchronously. It is to publish the METERED
+// figure beside it, make the disagreement a first-class field, and re-point the
+// capacity VERDICT at the metered numerator.
+//
+// ⚠️ The metered figure is a LOWER BOUND and must be labelled one. We sample
+// upstream's cumulative `used` opportunistically, so a minute's high-water is the
+// largest value we HAPPENED to see, never the minute's true total. Which is why
+// the density fields below are not optional decoration: without them "metered
+// spend looks fine" is indistinguishable from "we stopped looking", and that
+// exact ambiguity is what this whole issue is about.
+
+/** TRA-4919 — paired completed minutes required before `localCounterAgreesWithUpstream`
+ *  may carry a verdict. One paired minute is one coincidence. */
+export const METERED_AGREEMENT_MIN_MINUTES = 2;
+
+/** TRA-4919 — the band inside which the local proxy is called "agreeing". Wide on
+ *  purpose: the local counter is a different population, so exact equality is not
+ *  the claim. The measured 4–9x divergence is far outside it, which is the point —
+ *  a band this wide rendering `false` is a strong statement. */
+export const METERED_AGREEMENT_BAND = { lo: 0.5, hi: 2.0 } as const;
+
+/**
+ * TRA-4919 — the METERED account statistics: upstream's own `used`, folded per
+ * fixed minute, plus the observation density that says whether they may be read
+ * at all, plus the reconciliation against the local proxy counter.
+ *
+ * Pure so both directions (over budget / under budget) can be driven by a test —
+ * a green that cannot go red is not evidence.
+ */
+export function meteredAccountStats(input: {
+  /** Per-minute high-water of upstream `used`. */
+  highWater: ReadonlyMap<number, number>;
+  /** Per-minute count of readings that carried a `used`. */
+  readings: ReadonlyMap<number, number>;
+  /** The LOCAL proxy counter, same bucket keys — `tradierAccountMinuteCounts`. */
+  localCounts: ReadonlyMap<number, number>;
+  lastReadingAtMs: number | null;
+  now: number;
+  windowMs: number;
+}): {
+  peakUsedReqPerMin: number | null;
+  meanUsedReqPerMin: number | null;
+  minutesObserved: number;
+  readingsThisMinute: number;
+  lastReadingAgeMs: number | null;
+  /** Completed minutes for which BOTH a metered and a local figure exist. The
+   *  reconciliation's actual sample size — not `minutesObserved`. */
+  pairedMinutes: number;
+  localVsMeteredRatio: number | null;
+  agrees: boolean | null;
+} {
+  const { highWater, readings, localCounts, lastReadingAtMs, now, windowMs } = input;
+  const currentBucket = Math.floor(now / windowMs);
+  // Same exclusion as `accountMinuteStats`: a minute sampled 3s in is not a rate.
+  const completed = [...highWater.entries()].filter(([b]) => b < currentBucket);
+  const values = completed.map(([, v]) => v);
+  const minutesObserved = values.length;
+  const peakUsedReqPerMin = minutesObserved > 0 ? Math.max(...values) : null;
+  const meanUsedReqPerMin = minutesObserved > 0
+    ? Number((values.reduce((a, b) => a + b, 0) / minutesObserved).toFixed(1))
+    : null;
+  let localSum = 0;
+  let meteredSum = 0;
+  let pairedMinutes = 0;
+  for (const [b, metered] of completed) {
+    const local = localCounts.get(b);
+    if (local === undefined) continue;
+    pairedMinutes++;
+    localSum += local;
+    meteredSum += metered;
+  }
+  const localVsMeteredRatio = pairedMinutes > 0 && meteredSum > 0
+    ? Number((localSum / meteredSum).toFixed(2))
+    : null;
+  // ⛔ `null`, not `true`. Too thin a sample must read as "cannot judge", never as
+  // agreement — the exact inversion that lets a blind meter pass for a healthy one.
+  const agrees = localVsMeteredRatio === null || pairedMinutes < METERED_AGREEMENT_MIN_MINUTES
+    ? null
+    : localVsMeteredRatio >= METERED_AGREEMENT_BAND.lo && localVsMeteredRatio <= METERED_AGREEMENT_BAND.hi;
+  return {
+    peakUsedReqPerMin,
+    meanUsedReqPerMin,
+    minutesObserved,
+    readingsThisMinute: readings.get(currentBucket) ?? 0,
+    lastReadingAgeMs: lastReadingAtMs === null ? null : now - lastReadingAtMs,
+    pairedMinutes,
+    localVsMeteredRatio,
+    agrees,
   };
 }
 
@@ -1500,6 +1804,39 @@ export function getTradierQuotaBudgetState(now: number = Date.now()): {
    * shared `allowed` is observed (no reading yet, or buckets disagree — and
    * disagreement is itself the answer: there is no single account budget). */
   budgetAgreesWithUpstream: boolean | null;
+  // ── TRA-4919 — the METERED numerator and its density. See the block above
+  //    `meteredAccountStats` for why the local counter cannot carry this.
+  /** Per-fixed-minute high-water of upstream's own `used`, over COMPLETED minutes.
+   *  `null` = no metered reading has completed a minute yet. */
+  meteredPeakUsedReqPerMin: number | null;
+  /** Mean of those per-minute high-waters. `null` on the same condition. */
+  meteredMeanUsedReqPerMin: number | null;
+  /** ⚠️ ALWAYS TRUE, and load-bearing: `used` is sampled opportunistically, so
+   *  every metered figure here is a LOWER BOUND on real spend. A reader must not
+   *  treat `meteredPeakUsedReqPerMin < budget` as proof of headroom. */
+  meteredIsLowerBound: true;
+  /** Completed minutes with at least one metered reading. */
+  meteredMinutesObserved: number;
+  /** Metered readings so far in the CURRENT partial minute — the live density
+   *  tell. `0` on a box that is still calling Tradier means we have gone blind. */
+  meteredReadingsThisMinute: number;
+  /** Age of the newest metered reading. `null` = never read one. */
+  meteredLastReadingAgeMs: number | null;
+  /** Completed minutes where BOTH meters have a figure — the reconciliation's
+   *  sample size, which is NOT `meteredMinutesObserved`. */
+  meteredPairedMinutes: number;
+  /** local ÷ metered over the paired minutes. >1 = the local counter overstates. */
+  localVsMeteredRatio: number | null;
+  /** The reconciliation verdict. `null` when density is too low to judge —
+   *  never `true`, which would let a blind meter pass as a healthy one. */
+  localCounterAgreesWithUpstream: boolean | null;
+  /** TRA-4919 — which numerator `crossed`/`budgetExhausted`/`headroomReqPerMin`
+   *  were actually computed from. `local_proxy` is the pre-TRA-4919 behaviour and
+   *  applies only until the metered path has a completed minute. */
+  capacityNumeratorSource: 'metered_upstream' | 'local_proxy';
+  /** TRA-4919 — names the local counter's population, because it is NOT "every
+   *  Tradier call the process makes" and every past grade assumed it was. */
+  localCounterPopulation: 'yahoo_feed_bump_sites_only';
 } {
   const quoteState = getTradierQuoteRateState(now);
   const upstream = getTradierUpstreamRateLimitState(); // TRA-4441
@@ -1520,12 +1857,32 @@ export function getTradierQuotaBudgetState(now: number = Date.now()): {
   // it off an `Infinity` ceiling would report `crossed: false` on every default
   // box, i.e. a gate satisfied by the absence of the thing it grades.
   const impliedCeiling = Math.max(1, TRADIER_ACCOUNT_BUDGET_PER_MIN - reservation);
+  // TRA-4919 — the capacity verdict reads the METERED numerator whenever one
+  // exists. The local counter stays published, under its own names, as the
+  // unvalidated proxy it is: it was ~9x high in one measured minute and read ZERO
+  // in the next while upstream metered 43. A verdict off that number is not a
+  // capacity reading, it is a reading of our own instrumentation's coverage.
+  //
+  // ⛔ ONLY THE NUMERATOR MOVES. `accountBudgetReqPerMin` remains the modelled
+  // constant with `budgetSource`/`budgetAgreesWithUpstream` telling the truth
+  // about it — adopting upstream's `allowed` as the denominator is TRA-4441's
+  // open sizing call, and moving both ends in one deploy makes a moved verdict
+  // unattributable. That is the whole reason TRA-4441 published without adopting.
+  const metered = meteredAccountStats({
+    highWater: tradierMeter.meteredMinuteHighWater,
+    readings: tradierMeter.meteredMinuteReadings,
+    localCounts: tradierAccountMinuteCounts,
+    lastReadingAtMs: tradierMeter.meteredLastReadingAtMs,
+    now,
+    windowMs: BAR_PULL_RATE_WINDOW_MS,
+  });
+  const useMetered = metered.peakUsedReqPerMin !== null && metered.meanUsedReqPerMin !== null;
   const verdict = quotaCrossingVerdict({
     barCeiling: impliedCeiling,
-    accountObservedPeak: stats.peak,
-    accountObservedMean: stats.mean,
+    accountObservedPeak: useMetered ? (metered.peakUsedReqPerMin ?? 0) : stats.peak,
+    accountObservedMean: useMetered ? (metered.meanUsedReqPerMin ?? 0) : stats.mean,
     accountBudget: TRADIER_ACCOUNT_BUDGET_PER_MIN,
-    minutesObserved: stats.minutes, // TRA-4441
+    minutesObserved: useMetered ? metered.minutesObserved : stats.minutes, // TRA-4441
   });
   return {
     accountBudgetReqPerMin: TRADIER_ACCOUNT_BUDGET_PER_MIN,
@@ -1556,6 +1913,18 @@ export function getTradierQuotaBudgetState(now: number = Date.now()): {
     budgetAgreesWithUpstream: upstream.sharedAllowedReqPerMin === null
       ? null
       : upstream.sharedAllowedReqPerMin === TRADIER_ACCOUNT_BUDGET_PER_MIN,
+    // TRA-4919 — the metered numerator, its density, and the reconciliation.
+    meteredPeakUsedReqPerMin: metered.peakUsedReqPerMin,
+    meteredMeanUsedReqPerMin: metered.meanUsedReqPerMin,
+    meteredIsLowerBound: true,
+    meteredMinutesObserved: metered.minutesObserved,
+    meteredReadingsThisMinute: metered.readingsThisMinute,
+    meteredLastReadingAgeMs: metered.lastReadingAgeMs,
+    meteredPairedMinutes: metered.pairedMinutes,
+    localVsMeteredRatio: metered.localVsMeteredRatio,
+    localCounterAgreesWithUpstream: metered.agrees,
+    capacityNumeratorSource: useMetered ? 'metered_upstream' : 'local_proxy',
+    localCounterPopulation: 'yahoo_feed_bump_sites_only',
   };
 }
 

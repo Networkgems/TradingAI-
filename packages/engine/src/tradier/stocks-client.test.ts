@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { TradierStocksClient } from './stocks-client.js';
+import { TradierStocksClient, setTradierRateLimitObserver } from './stocks-client.js';
 
 let fetchMock: ReturnType<typeof vi.fn>;
 
@@ -440,5 +440,89 @@ describe('TradierStocksClient.getDailyBars (TRA-586)', () => {
     const client = new TradierStocksClient('tok');
     expect(await client.getDailyBars('SPY', 0)).toEqual([]);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+// ─── TRA-4919 ────────────────────────────────────────────────────────────────
+//
+// On bqb1 2026-09-25T18:35:43Z the `timesales` class answered `400` while the
+// shared account meter read `used: 60/120` — HALF entitlement. Tradier returns
+// `400` for `Quota Violation`, but it also returns `400` for a malformed request,
+// and this layer rendered the two identically because the body was read only to
+// build an `Error` message and then discarded. Opposite remedies, one rendering.
+describe('TRA-4919 — the refusal carries its own reason to the meter', () => {
+  const readings: import('./stocks-client.js').TradierRateLimitReading[] = [];
+
+  beforeEach(() => {
+    readings.length = 0;
+    setTradierRateLimitObserver((r) => { readings.push(r); });
+  });
+  afterEach(() => {
+    setTradierRateLimitObserver(null);
+  });
+
+  it('hands the vendor fault body to the observer on a 400', async () => {
+    fetchMock.mockResolvedValueOnce(
+      textResponse('{"fault":{"faultstring":"Quota Violation","detail":{"errorcode":"policies.ratelimit"}}}', 400),
+    );
+    const client = new TradierStocksClient('tok');
+    await expect(client.getMinuteBars('SPY', 60)).rejects.toThrow(/HTTP 400/);
+    expect(readings).toHaveLength(1);
+    expect(readings[0]!.endpointClass).toBe('timesales');
+    expect(readings[0]!.status).toBe(400);
+    expect(readings[0]!.refusalReason).toContain('Quota Violation');
+  });
+
+  it('separates a quota 400 from a bad-parameter 400 — the point of the field', async () => {
+    fetchMock.mockResolvedValueOnce(
+      textResponse('{"errors":{"error":"Invalid parameter: start must be a valid date"}}', 400),
+    );
+    const client = new TradierStocksClient('tok');
+    await expect(client.getMinuteBars('SPY', 60)).rejects.toThrow(/HTTP 400/);
+    expect(readings[0]!.refusalReason).toContain('Invalid parameter');
+    expect(readings[0]!.refusalReason).not.toContain('Quota Violation');
+  });
+
+  it('⛔ reads the body ONCE and gives the same bytes to the meter AND the Error', async () => {
+    // The pre-fix code observed, then called `resp.text()` separately in the throw.
+    // A second read of a consumed body yields nothing, so any attempt to feed both
+    // from two reads silently blanks one of them.
+    fetchMock.mockResolvedValueOnce(textResponse('Quota Violation', 400));
+    const client = new TradierStocksClient('tok');
+    await expect(client.getQuotes(['AAPL'])).rejects.toThrow(/Tradier quotes HTTP 400: Quota Violation/);
+    expect(readings[0]!.refusalReason).toBe('Quota Violation');
+  });
+
+  it('records no reason on a 200, and flags whether the family was present at all', async () => {
+    // Negative control: a healthy response must not manufacture a refusal reason.
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ quotes: { quote: [] } }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'x-ratelimit-allowed': '120', 'x-ratelimit-used': '45' },
+    }));
+    const client = new TradierStocksClient('tok');
+    await client.getQuotes(['AAPL']);
+    expect(readings[0]!.refusalReason).toBeNull();
+    expect(readings[0]!.sawRateLimitHeaders).toBe(true);
+    expect(readings[0]!.allowed).toBe(120);
+  });
+
+  it('marks a header-less refusal as such, so the consumer can refuse to overwrite', async () => {
+    // The 18:35:43Z response carried NO `x-ratelimit-*` family. The consumer-side
+    // fix (yahoo-feed `foldTradierRateLimitReading`) keys on exactly this flag.
+    fetchMock.mockResolvedValueOnce(textResponse('Quota Violation', 400));
+    const client = new TradierStocksClient('tok');
+    await expect(client.getMinuteBars('SPY', 60)).rejects.toThrow();
+    expect(readings[0]!.sawRateLimitHeaders).toBe(false);
+    expect(readings[0]!.allowed).toBeNull();
+  });
+
+  it('never lets a broken observer take the quote feed down with it', async () => {
+    setTradierRateLimitObserver(() => { throw new Error('sink exploded'); });
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      quotes: { quote: { symbol: 'AAPL', last: 1, change: 0, change_percentage: 0, volume: 1 } },
+    }));
+    const client = new TradierStocksClient('tok');
+    const out = await client.getQuotes(['AAPL']);
+    expect(out.get('AAPL')!.price).toBe(1);
   });
 });

@@ -22,6 +22,31 @@ import { tradierBaseUrl, type TradierEnv } from './order-client.js';
 // ⛔ OBSERVE BEFORE THE THROW. The most informative response is the REFUSAL — a
 // 400/429 carries the headers stating what we exceeded. Recording only on `ok`
 // responses would blind the meter in precisely the window it exists for.
+//
+// ── TRA-4919 — …AND THE REFUSAL THAT CARRIES NO HEADERS IS THE ONE THAT BIT ────
+//
+// Measured on bqb1 `66a8a1ab40cc`, 2026-09-25T18:35:43Z in RTH: `timesales`
+// answered `400` while the shared account meter read `used: 60/120` — HALF
+// entitlement, no refusal on the quotes class in any of nine payloads. Tradier
+// returns `400` for `Quota Violation`, so that 400 may be a rate refusal; it may
+// equally be a malformed request (bad symbol, bad date range) we retry straight
+// back into a breaker trip. **Those two have opposite remedies and this layer
+// rendered them identically**, because the body — the only thing in the stack
+// that separates them — was read solely to build an `Error` message and then
+// thrown away. Same defect TRA-4865 fixed one layer over on `options-client.ts`;
+// same treatment applied here, so a refusal NAMES ITS OWN REASON.
+//
+// That 400 also carried no `x-ratelimit-*` family at all, and the reading it
+// produced ({allowed:null, used:null, available:null}) overwrote the last GOOD
+// `timesales` reading in the server's per-class map. `sawRateLimitHeaders` is the
+// discriminator that lets the consumer refuse that overwrite — a refusal must ADD
+// information, never destroy it. The consumer-side fix is in
+// `packages/server/src/yahoo-feed.ts` (`foldTradierRateLimitReading`).
+
+/** TRA-4919 — cap on the vendor refusal body carried on a reading. Matches
+ *  `options-client.ts`'s `MAX_REFUSAL_BODY_LEN`: Tradier's fault bodies are one
+ *  short sentence, and an upstream must not dictate our allocation. */
+const MAX_REFUSAL_BODY_LEN = 512;
 
 /** TRA-4441 — one Tradier `X-Ratelimit-*` reading, as reported by upstream. */
 export interface TradierRateLimitReading {
@@ -39,6 +64,25 @@ export interface TradierRateLimitReading {
   status: number;
   /** Local clock when read, so a consumer can age the reading and derive the window. */
   observedAtMs: number;
+  /**
+   * TRA-4919 — did this response carry ANY member of the `x-ratelimit-*` family?
+   *
+   * ⛔ NOT derivable from the four fields above by the consumer, and that is the
+   * whole point. An all-null reading has two causes with opposite meanings:
+   * upstream sent no headers (we learned NOTHING, and the previous reading for
+   * this bucket is still the best truth we hold), or upstream sent headers we
+   * could not parse. Folding an all-null reading into a per-class map as if it
+   * were news is what erased the live `timesales` meter at 18:35:43Z.
+   */
+  sawRateLimitHeaders: boolean;
+  /**
+   * TRA-4919 — the vendor's own refusal body on a non-2xx, trimmed and bounded to
+   * {@link MAX_REFUSAL_BODY_LEN}. `null` on a 2xx, and `null` when the body was
+   * empty or unreadable — never an empty string, so "no reason given" cannot be
+   * confused with a reason. This is the only field in the stack that separates a
+   * Tradier `Quota Violation` from a bad-parameter 400.
+   */
+  refusalReason: string | null;
 }
 
 export type TradierEndpointClass = 'quotes' | 'timesales' | 'history';
@@ -71,21 +115,37 @@ export function parseTradierRateLimitHeaders(
   endpointClass: TradierEndpointClass,
   status: number,
   observedAtMs: number,
+  /** TRA-4919 — the vendor refusal body, already trimmed/bounded by the caller. */
+  refusalReason: string | null = null,
 ): TradierRateLimitReading {
+  // TRA-4919 — `sawRateLimitHeaders` keys on PRESENCE of the raw header, not on
+  // parse success. A header we received but could not parse is still evidence
+  // that upstream is talking to us about the meter; it is a different fact from
+  // silence, and collapsing the two rebuilds the very ambiguity this field exists
+  // to remove. (The parsed value still degrades to `null` — an unparseable
+  // `allowed` must never become a number.)
+  let sawAny = false;
   const num = (name: string): number | null => {
     const raw = headers.get(name);
     if (raw === null || raw.trim() === '') return null;
+    sawAny = true;
     const n = Number(raw);
     return Number.isFinite(n) ? n : null;
   };
+  const allowed = num('x-ratelimit-allowed');
+  const used = num('x-ratelimit-used');
+  const available = num('x-ratelimit-available');
+  const expiryMs = num('x-ratelimit-expiry');
   return {
     endpointClass,
-    allowed: num('x-ratelimit-allowed'),
-    used: num('x-ratelimit-used'),
-    available: num('x-ratelimit-available'),
-    expiryMs: num('x-ratelimit-expiry'),
+    allowed,
+    used,
+    available,
+    expiryMs,
     status,
     observedAtMs,
+    sawRateLimitHeaders: sawAny,
+    refusalReason,
   };
 }
 
@@ -94,14 +154,55 @@ export function parseTradierRateLimitHeaders(
 function observeRateLimit(
   resp: { status: number; headers: { get(name: string): string | null } },
   endpointClass: TradierEndpointClass,
+  refusalReason: string | null = null,
 ): void {
   const observer = rateLimitObserver;
   if (!observer) return;
   try {
-    observer(parseTradierRateLimitHeaders(resp.headers, endpointClass, resp.status, Date.now()));
+    observer(
+      parseTradierRateLimitHeaders(resp.headers, endpointClass, resp.status, Date.now(), refusalReason),
+    );
   } catch {
     // A broken observer must never take the quote feed down with it.
   }
+}
+
+/**
+ * TRA-4919 — observe, then throw on a non-2xx, with the vendor's reason captured
+ * on the way past.
+ *
+ * ⛔ THE BODY MAY ONLY BE READ ONCE, which is why this is one helper rather than
+ * an observer call followed by an independent `resp.text()` in the throw: the
+ * three call sites used to do exactly that, and a second read of a consumed body
+ * yields nothing. Read once, hand the same bytes to BOTH the meter and the
+ * `Error` message.
+ *
+ * The `Error` message keeps its historical 200-char slice so existing log
+ * greps/fixtures are unchanged; the meter gets the fuller
+ * {@link MAX_REFUSAL_BODY_LEN} cut.
+ *
+ * Ordering is preserved from TRA-4441: the observer sees EVERY response,
+ * refusals included, before anything throws.
+ */
+async function observeAndAssertOk(
+  resp: { ok: boolean; status: number; headers: { get(name: string): string | null }; text(): Promise<string> },
+  endpointClass: TradierEndpointClass,
+  label: string,
+): Promise<void> {
+  if (resp.ok) {
+    observeRateLimit(resp, endpointClass);
+    return;
+  }
+  // A diagnostic must never convert a refusal into a different exception: a
+  // failed body read degrades to `null`, exactly as in `options-client.ts`.
+  let body = '';
+  try {
+    body = (await resp.text()).trim();
+  } catch {
+    body = '';
+  }
+  observeRateLimit(resp, endpointClass, body.length > 0 ? body.slice(0, MAX_REFUSAL_BODY_LEN) : null);
+  throw new Error(`Tradier ${label} HTTP ${resp.status}: ${body.slice(0, 200)}`);
 }
 
 export interface TradierEquityQuote {
@@ -339,10 +440,9 @@ export class TradierStocksClient {
     }
     const url = `${this.baseUrl}/markets/quotes?symbols=${encodeURIComponent([...wireToRequested.keys()].join(','))}`;
     const resp = await fetch(url, { headers: this.headers });
-    observeRateLimit(resp, 'quotes'); // TRA-4441 — before the throw: a refusal is the informative one.
-    if (!resp.ok) {
-      throw new Error(`Tradier quotes HTTP ${resp.status}: ${(await resp.text().catch(() => '')).slice(0, 200)}`);
-    }
+    // TRA-4441 — before the throw: a refusal is the informative one.
+    // TRA-4919 — …and it now carries the vendor's own reason with it.
+    await observeAndAssertOk(resp, 'quotes', 'quotes');
     const data = (await resp.json()) as TradierQuotesEnvelope;
     if (!data.quotes || typeof data.quotes !== 'object') return { quotes: out, unmatchedSymbols: [] };
     const unmatchedSymbols = asArray(data.quotes.unmatched_symbols?.symbol)
@@ -420,10 +520,10 @@ export class TradierStocksClient {
     });
     const url = `${this.baseUrl}/markets/timesales?${params}`;
     const resp = await fetch(url, { headers: this.headers });
-    observeRateLimit(resp, 'timesales'); // TRA-4441 — before the throw: a refusal is the informative one.
-    if (!resp.ok) {
-      throw new Error(`Tradier timesales(${symbol}) HTTP ${resp.status}: ${(await resp.text().catch(() => '')).slice(0, 200)}`);
-    }
+    // TRA-4441 — before the throw: a refusal is the informative one.
+    // TRA-4919 — this is the exact call that 400'd at 50% of entitlement on
+    // 2026-09-25; the reason now travels with the reading.
+    await observeAndAssertOk(resp, 'timesales', `timesales(${symbol})`);
     const data = (await resp.json()) as TradierTimeSalesEnvelope;
     if (!data.series || typeof data.series !== 'object') return [];
     const rows = asArray(data.series.data);
@@ -482,10 +582,9 @@ export class TradierStocksClient {
     });
     const url = `${this.baseUrl}/markets/history?${params}`;
     const resp = await fetch(url, { headers: this.headers });
-    observeRateLimit(resp, 'history'); // TRA-4441 — before the throw: a refusal is the informative one.
-    if (!resp.ok) {
-      throw new Error(`Tradier history(${symbol}) HTTP ${resp.status}: ${(await resp.text().catch(() => '')).slice(0, 200)}`);
-    }
+    // TRA-4441 — before the throw: a refusal is the informative one.
+    // TRA-4919 — …and it now carries the vendor's own reason with it.
+    await observeAndAssertOk(resp, 'history', `history(${symbol})`);
     const data = (await resp.json()) as TradierHistoryEnvelope;
     if (!data.history || typeof data.history !== 'object') return [];
     const candles: Candle[] = [];
