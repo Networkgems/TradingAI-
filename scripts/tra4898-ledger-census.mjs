@@ -14,7 +14,16 @@
  *   ADMIN_PASSWORD=… node scripts/tra4898-ledger-census.mjs
  */
 
-const BASE = process.env.TRADING_API_BASE || 'https://tradingai-bqb1.onrender.com';
+/**
+ * ⚠ `TRADING_API_BASE` is DELIBERATELY NOT READ. It is `http://localhost:4242`
+ * in the agent shells (the self-host), so honouring it silently pointed the
+ * first run of this script at a box whose build predates the route — which
+ * answered `404` and would have read as "the feature did not deploy" (TRA-4863
+ * §x29). Say `--base=` if you mean something other than bqb1.
+ */
+const BASE =
+  process.argv.find((a) => a.startsWith('--base='))?.slice('--base='.length) ??
+  'https://tradingai-bqb1.onrender.com';
 const QA_PATTERNS = [/^ctoverify_/i, /^qa_/i, /^qtverify_/i, /^qaverify_/i, /^cfoverify_/i, /^leadverify_/i];
 const MiB = 1024 * 1024;
 
