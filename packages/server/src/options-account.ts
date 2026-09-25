@@ -231,6 +231,8 @@ import {
   type OptionTradeJournalOpen,
   type SentimentIcBand,
 } from './option-trade-journal.js';
+// TRA-4912 — the entry-provenance stamp carried on OptionTradeJournalSetup.
+import type { OptionEntryProvenance } from './option-entry-provenance.js';
 // TRA-4246 (AC1) — the row's own stop-basis R, captured at the close write
 // while `stopLossPremium` is still in scope. See that module for why this is
 // per-row and not a per-sleeve constant.
@@ -296,6 +298,21 @@ export interface OptionTradeJournalSetup {
    * Omitted/undefined for opens that weren't gated by a swing archetype.
    */
   entryArchetype?: string;
+  /**
+   * TRA-4912 — the entry-provenance stamp: the trigger that fired, the engine
+   * regime at entry, and the per-signal score vector the selector saw.
+   *
+   * Carried as ONE optional object rather than three sibling fields so a setup
+   * site cannot supply a partial stamp — a row with a regime but no reason, or
+   * scores from one series and a regime from another, is worse than no row,
+   * because it reads as measured. Build it with `buildOptionEntryProvenance`,
+   * which takes the reason and the candle series together.
+   *
+   * Omitted ⇒ all three fold back ABSENT (forward-only; see
+   * {@link OptionTradeJournalOpen.entryReason}). Omission is the correct choice on
+   * any path where no selector ran — never a fabricated default.
+   */
+  entryProvenance?: OptionEntryProvenance;
   /**
    * TRA-2245 — the journal STRUCTURE label this open should stamp. Introduced so
    * the directional callers of {@link PaperOptionsAccount.openOptionFromRvCandidate}
@@ -7067,6 +7084,21 @@ export class PaperOptionsAccount {
       // TRA-1183 — only stamp the archetype when the caller supplied one, so
       // untagged opens omit the field entirely (folds back as undefined).
       ...(setup.entryArchetype ? { entryArchetype: setup.entryArchetype } : {}),
+      // TRA-4912 — the entry-provenance stamp, spread ALL-OR-NOTHING. A caller
+      // that supplied no provenance omits all three fields rather than writing
+      // nulls: an absent field reads as "this path does not record it", whereas a
+      // null regime beside a null score vector reads as "we looked and could not
+      // tell", and only one of those is true on an unwired path. Note the TRA-4160
+      // lesson in the other direction — these are NOT re-derived or re-seeded on a
+      // non-finite read; they are entry facts, written once, and a legitimately
+      // null score must stay null.
+      ...(setup.entryProvenance
+        ? {
+            entryReason: setup.entryProvenance.entryReason,
+            regimeAtEntry: setup.entryProvenance.regimeAtEntry,
+            signalScores: setup.entryProvenance.signalScores,
+          }
+        : {}),
       // TRA-1600 (D) — stamp the measured entry slippage only when the caller
       // supplied a finite value, so unmeasured opens fold back as undefined.
       ...(typeof entrySlippageUsd === 'number' && Number.isFinite(entrySlippageUsd)

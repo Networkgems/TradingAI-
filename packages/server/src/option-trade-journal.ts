@@ -6,6 +6,14 @@ import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason, OptionAdmissi
 import { logger } from './observability/index.js';
 import { STOP_DISTANCE_FRACTION_OF_MARK } from './option-spread-cost.js';
 import type { RiskThrottleSizingPath, RiskThrottleSizingScope } from './risk-throttle-sizing.js';
+// TRA-4912 — the entry-provenance stamps. Type-only: the journal owns the ROW
+// schema, `option-entry-provenance.ts` owns the measurement, and this import adds
+// no runtime edge between them.
+import type {
+  JournalRegime,
+  OptionEntryReason,
+  OptionEntrySignalScores,
+} from './option-entry-provenance.js';
 import { resolveDataDir } from './data-dir.js';
 // TRA-4674 — crossed (ask→bid) re-pricing. Pure, read-time-only; that module
 // imports nothing back from this one at runtime, so no cycle.
@@ -258,6 +266,50 @@ export interface OptionTradeJournalOpen {
    * them in bare `single_leg_rv`. Observe-only; never gates routing.
    */
   entryArchetype?: string;
+  /**
+   * TRA-4912 (Phase 0 of TRA-4481, ruled on TRA-4911) — the trigger that fired,
+   * as a short stable machine tag from a CLOSED vocabulary suitable for `GROUP BY`.
+   *
+   * Distinct from {@link entryArchetype} above, which names the SLEEVE that owns
+   * the fill and is the axis TRA-3715's grid and TRA-2295's spread ceiling are
+   * already keyed on. This names the TRIGGER inside that sleeve. Frequently 1:1
+   * today; collapsing them would re-key two graded surfaces.
+   *
+   * Optional and FORWARD-ONLY: absent on every row written before this field
+   * existed, and not backfillable — the state it records is live only at the open.
+   * A fold must bucket absent as UNKNOWN, exactly as `entryArchetype` does with its
+   * `unspecified` key, never as a default member of the vocabulary.
+   */
+  entryReason?: OptionEntryReason;
+  /**
+   * TRA-4912 — the engine regime (`packages/engine/src/regime.ts`) at entry.
+   *
+   * ADDITIVE to the coarse {@link trend} above, which is unchanged: `trend` is the
+   * three-way daily-trend read the trend GATE saw, this is the five-way classifier
+   * label (`trend_up`/`trend_down`/`range`/`high_vol`/`flat`). TRA-4912's scope is
+   * explicit that `trend` must not be repurposed or overloaded for this.
+   *
+   * `null` = not classifiable (too few bars). That is NOT the same as `'flat'`,
+   * which is a measured "no strategy fires" verdict, and a fold must keep the two
+   * apart — merging them would put every short-series row into a real regime cell.
+   * Optional/forward-only on the same terms as {@link entryReason}.
+   */
+  regimeAtEntry?: JournalRegime | null;
+  /**
+   * TRA-4912 — the per-signal score vector the selector saw at entry, as a NAMED
+   * numeric map rather than a flattened total (a total cannot be un-summed back
+   * into the conditions that produced it, which is the only thing P0-3 wants).
+   *
+   * Continuous values, NOT the gates' boolean reads — see the extended note on
+   * {@link OptionEntrySignalScores}. Stamping `confluenceSide`'s reads would record
+   * four `true`s on every row (TRA-840 / TRA-809 Anomaly 2: it returns them only on
+   * the all-true branch), which is zero variance and therefore zero attribution.
+   *
+   * Per-field `null` is the honest-unknown, following the {@link ivRank}
+   * convention; the whole object is absent on pre-TRA-4912 rows. A fold must treat
+   * both as unknown rather than zero — several of these are signed and straddle 0.
+   */
+  signalScores?: OptionEntrySignalScores;
   /**
    * TRA-1600 (deliverable D) — MEASURED entry-side slippage in USD for this
    * position: signed `(fillPremium − mark) × contracts × 100`. Positive = we paid
