@@ -93,6 +93,27 @@ A fourth, for that ticket's owner: the `ranked`/`ordered` link rows are document
 throttled"** and carry no slot budget. They were 27.6% of all v2 rows and **38% on 09-24** (9,216
 of 23,977, up 77% on 09-21). They are the one leg of this file with no policy bound at all.
 
+> **Resolved by TRA-4906 (2026-09-25), and it was not growth — it was duplication.** TRA-4905
+> measured 4.33x–11.56x duplication on `ranked` (`XLF261030C00056000` written 87 times on 09-24)
+> while the count of *distinct* nominated contracts was **falling**: 872 → 1,023 → 800 over the
+> three complete sessions as raw rows went 5,221 → 5,480 → 3,460. So `ranked` is now deduped per
+> `(etDay, slot, accountClass, occSymbol)` — **information-preserving, not a throttle**: the
+> survivorship join reads the SET of nominees, and its candidate leg is itself `(etDay, slot)`-
+> granular, so a link finer than slot granularity has nothing finer to join to. Projected saving
+> 1.60x–2.80x on the link leg, taking max per-session bytes 6.65 MB → **6.06 MB** (144 MiB: 22.7 →
+> **24.9** worst-case sessions against the 20-session AC4 bar). `ordered` is deliberately left
+> **unbounded** — it reads 0 on every day and both classes, so it costs nothing, and an `ordered`
+> row is execution provenance. The bound this paragraph asked for is a *set* invariant, not a cap.
+>
+> TRA-4906 also made the slot-budget drop itself durable (`kind: 'budgetdrop'`, ~95 B/row,
+> < 150 KB/session), published as `days[].dropsBySlotEt`. That is what the point above needs to be
+> settled at all: `counters.slotBudgetPassesDropped` was one module-level integer zeroed by every
+> boot and rebuilt from nothing on hydrate, so "how often does the budget bite, per slot" was
+> unmeasurable at ~3.3 deploys/day. `MAX_ROWS_PER_SLOT` and `MAX_FILE_BYTES` are **unchanged** by
+> that ticket: TRA-4905 ruled NO-CUT (the budget already size-filters each slot's tail — 31/40
+> slots, p = 0.0007 — so cutting it amplifies a measured bias), and the cap is re-derived by
+> TRA-4905 §5 off a *post-dedup* session, not before one exists.
+
 ---
 
 ## AC3 — `reversal-shadow-signals.jsonl` is already bounded
