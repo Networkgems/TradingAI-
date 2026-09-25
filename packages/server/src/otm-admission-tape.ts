@@ -98,18 +98,59 @@ const MAX_ROWS_PER_SLOT: Record<string, number> = { desk: 1000 };
 const MAX_ROWS_PER_SLOT_OTHER = 200;
 /** A pass bigger than this is dropped WHOLE (rule 2 above), never truncated. */
 const MAX_ROWS_PER_PASS = 400;
-/** Keep this many ms on disk — comfortably over the ≥20 RTH desk sessions AC4 needs. */
+/**
+ * Keep this many ms on disk — comfortably over the ≥20 RTH desk sessions AC4
+ * needs. It is deliberately SLACK: at the volume measured on
+ * {@link MAX_FILE_BYTES} the byte cap prunes long before 60 days elapse, so
+ * this leg has never bound and is here as the floor under a future, thinner
+ * sample (where 60 days of thin rows is a strictly better archive than 20
+ * sessions of fat ones). Do not cite it as the retention horizon.
+ */
 const RETAIN_MS = 60 * 24 * 60 * 60 * 1000;
 /**
  * After time compaction, prune whole OLDEST ET days until the file fits this.
- * Sized off MEASURED v2 volume (2026-09-21/22: ~20.9k rows/day at ~308 B/row
- * ≈ 6.4 MB per desk session — 2.7x the pre-deploy estimate): the AC4 bar needs
- * ≥20 desk sessions of RAW rows simultaneously on disk for the TRA-4623 re-run,
- * and `sessionsWithAdmissions` itself is rebuilt from hydrated days, so a cap
- * that holds fewer sessions than the bar makes the bar unreachable. 192 MB
- * holds ~30 v2 sessions; the 60-day time retention binds first.
+ *
+ * ── THE NUMBER IS THE AC4 BAR, NOT A ROUND ONE (TRA-4899) ───────────────────
+ * This is a RESERVATION against a 973.4 MiB volume that also holds all 68
+ * books' close ledgers in 64 MiB (TRA-4156). The previous value, 192 MiB, was
+ * 3x that entire ledger budget for one instrumentation tape, so it is sized
+ * here off the requirement it exists to serve and nothing else.
+ *
+ * MEASURED live on bqb1 2026-09-25T03:22Z, build `a158c516`, off
+ * `/api/health/otm-admission-tape` `durability` + `byClass[].days[]`:
+ *   - 29,956,613 B / 98,575 hydrated rows = **303.9 B/row** (blended; candidate
+ *     rows ≈ 357 B, `ranked`/`ordered` link rows ≈ 150 B).
+ *   - v2 sessions 09-21/22/23/24 = 20,809 / 21,091 / 18,796 / 23,977 rows
+ *     ⇒ mean **6.43 MB/session**, max **7.29 MB/session** (09-24).
+ * The AC4 bar (TRA-3927/TRA-4623) is **≥20 desk sessions of RAW rows on disk
+ * simultaneously**, and `sessionsWithAdmissions` is itself rebuilt from
+ * hydrated days, so a cap below the bar makes the bar unreachable:
+ *   20 × 7.29 MB = 145.8 MB is the FLOOR. 144 MiB = 151.0 MB clears it by 3.5%
+ *   ⇒ **20.7 worst-case sessions, 23.5 mean-case**. The 48 MiB returned is,
+ *   exactly, the whole 68-book `closes/` budget.
+ *
+ * ⚠ The 60-day {@link RETAIN_MS} does NOT bind first — the comment this
+ * replaces claimed it did, and was wrong by its own arithmetic. 60 calendar
+ * days ≈ 42 trading sessions ≈ 270 MB at the volume measured above, which is
+ * above the old 192 MiB and far above this. **The byte cap is the only leg
+ * that has ever bound this file**, which is why it is the whole lever here.
+ *
+ * ⚠ This cap is applied at BOOT ONLY (see {@link hydrateOtmAdmissionTapeFromDisk}),
+ * so it is a compaction target, not a live ceiling. The true reservation is
+ * `cap + rate × maxBootInterval`: at the measured 6.43 MB/session and bqb1's
+ * longest observed gap between process boots (4.93 days over the 100 deploys
+ * 2026-08-26→09-25, an upper bound since watchdog restarts also compact),
+ * that is 151.0 + ~22 = **~173 MB worst case on disk**. Do not quote 144 MiB
+ * as a hard ceiling.
+ *
+ * Getting this under the 64 MiB the close ledger lives in needs the SAMPLE to
+ * shrink, not the cap: `MAX_ROWS_PER_SLOT.desk` saturates almost every RTH slot
+ * (13 slots × 1000 ≈ the 12,168–12,990 rows/session measured), so desk volume
+ * is policy-set, not demand-driven. That is TRA-4628's call and is tracked
+ * separately — it must not be changed mid-collection without re-registering
+ * the readout, because it reweights sessions already banked.
  */
-const MAX_FILE_BYTES = 192 * 1024 * 1024;
+const MAX_FILE_BYTES = 144 * 1024 * 1024;
 /** Hard cap on rows a single health-route read may return. */
 const MAX_READ_ROWS = 20_000;
 
