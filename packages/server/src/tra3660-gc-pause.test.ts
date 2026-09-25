@@ -26,6 +26,7 @@ import {
   _resetWatchdogForTests,
   type PersistedTrip,
 } from './event-loop-watchdog.js';
+import { getSyncBlockCensus } from './phase-timing.js';
 import {
   recordGcPause,
   getGcPauseSnapshot,
@@ -263,7 +264,17 @@ describe('the GC meter is WIRED into the watchdog (TRA-3660 fourth instance)', (
     recordMs: 100,
     loudMs: 1000,
   });
-  const quietPhases = () => ({ lastSlowPhase: null, lastSlowSyncPhase: null, recentSlowPhases: [], activePhase: null });
+  // TRA-4920 — `syncBlockCensus` is a required member of PhaseAttribution, and
+  // deliberately so: an absent census must not be readable as an empty one.
+  // A reset module's real census IS empty, so read it rather than hand-rolling
+  // a literal that would drift from the shape.
+  const quietPhases = () => ({
+    lastSlowPhase: null,
+    lastSlowSyncPhase: null,
+    recentSlowPhases: [],
+    activePhase: null,
+    syncBlockCensus: getSyncBlockCensus(),
+  });
   const heap = () => ({ usedBytes: 100e6, limitBytes: 1536e6, rssBytes: 400e6 });
 
   it('publishes the live meter on the status, and omits it when the meter is off', () => {

@@ -30,7 +30,7 @@ import {
   _resetPreFanoutEpisodeForTests,
   PRE_FANOUT_REPORT_INTERVAL_MS,
 } from './yahoo-feed.js';
-import { getPhaseAttribution, _resetPhaseTimingForTests } from './phase-timing.js';
+import { getPhaseAttribution, getSyncBlockCensus, _resetPhaseTimingForTests } from './phase-timing.js';
 
 describe('classifyBlockAttribution (TRA-3660 AC1)', () => {
   const base = { tripAtMs: 1_000_000, lagMaxMs: 4060, sampleMs: 1000 };
@@ -557,6 +557,8 @@ describe('the lag ledger is WIRED, not just implemented (TRA-3660)', () => {
     lastSlowSyncPhase: null,
     recentSlowPhases: [],
     activePhase,
+    // TRA-4920 — required member; read the (reset, therefore empty) real one.
+    syncBlockCensus: getSyncBlockCensus(),
   });
 
   it('publishes a live ledger naming the in-flight phase, without any trip', () => {
@@ -592,6 +594,7 @@ describe('the lag ledger is WIRED, not just implemented (TRA-3660)', () => {
         lastSlowSyncPhase: null,
         recentSlowPhases: [],
         activePhase: { name: phase, elapsedMs: 1_000 },
+        syncBlockCensus: getSyncBlockCensus(),
       }),
       onTrip: () => {},
     });

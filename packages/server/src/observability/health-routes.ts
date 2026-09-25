@@ -9670,6 +9670,37 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     });
   }
 
+  // TRA-4920 — PARSE PATHS, because getting them wrong here reads EXACTLY like a
+  // clean box and has cost this chain real time twice:
+  //
+  //   gate counters + headroom  ->  .loopYieldGate            (ROOT, sibling of `watchdog`)
+  //   sync-block census         ->  .watchdog.phaseAttribution.syncBlockCensus
+  //   last sync witness         ->  .watchdog.phaseAttribution.lastSlowSyncPhase
+  //   census ring (EVICTS)      ->  .watchdog.phaseAttribution.recentSlowPhases
+  //
+  // Parsing the gate under `.watchdog` yields gate-absent + no-sync-block +
+  // empty-ring — a tidy all-clear off a payload never opened. Assert
+  // `recentSlowPhases.length > 0` at the path above before believing any leg.
+  //
+  // Which field carries which verdict:
+  //  - `loopYieldGate.headroom.level` — the PRE-block margin. `unmeasured` is
+  //    NOT `ok`; a disabled gate and a gate with no completed resume both read
+  //    `unmeasured`, each with its own `reason` string.
+  //  - `loopYieldGate.maxRunCompletedMs` — the contiguous run length, measured
+  //    at the run-end sentinel in the timers phase. Use THIS, not
+  //    `maxRunObservedMs` (observation range only; needs a waiter already
+  //    queued).
+  //  - `phaseAttribution.syncBlockCensus.count` / `.buckets` — how MANY sync
+  //    blocks, monotonic since boot. `recentSlowPhases` cannot answer this: it
+  //    is a 512-slot FIFO whose horizon is set by the `async` arrival rate, so
+  //    a rare `sync` record is evicted within minutes and the ring reads
+  //    512/512 async while sync witnesses are still landing.
+  //  - `forcedYields` is COLOUR, never a verdict: it is booked only when the
+  //    gate's run-clock fired ALONE, so a perfectly-binding gate whose
+  //    count/time sibling trigger wins also reports 0.
+  //
+  // All of the above are PROCESS-RESIDENT and die with the pid. Re-derive
+  // `build.commit`/`pid`/`startedAt` in the same read.
   app.get('/api/health/watchdog', (_req, res) => {
     const watchdog = getWatchdogStatus();
     res.json({
@@ -9679,6 +9710,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       watchdog,
       // TRA-4524 — process-wide yield gate counters (deferrals = resumes held
       // behind a spent run; maxHeldTurns = the round-robin wait, AC3).
+      // TRA-4920 — plus the measured per-resume cost and the headroom tripwire.
       loopYieldGate: getLoopYieldGateSnapshot(),
     });
   });

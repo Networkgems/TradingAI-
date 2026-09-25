@@ -100,12 +100,221 @@ function resolveRingMax(env: NodeJS.ProcessEnv = process.env): number {
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 512;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-4920 — the SINCE-BOOT SYNC CENSUS.
+//
+// `recentSlowPhases` is a FIFO ring, and that makes it structurally unable to
+// answer the only question a residual `yield-preempt` block raises: HOW MANY,
+// and are they trending up?
+//
+// The mechanism is EVICTION, not exclusion — and the distinction matters,
+// because the 2026-09-25 reading that opened this issue was read as exclusion.
+// `recordPhaseDuration` pushes every record past the slow threshold into the
+// ring regardless of `kind`, so a `sync` witness IS written there. But `async`
+// records outnumber `sync` ones by orders of magnitude on this box (the ring
+// read 512/512 `async` at 19:48Z while a `sync` witness from 19:01:20Z was
+// still latched in `lastSlowSyncPhase`), so a rare `sync` record is shifted out
+// of a 512-slot FIFO within minutes. The ring's retention horizon is set by the
+// ASYNC rate; the thing we need to count arrives at the SYNC rate. Widening the
+// ring does not fix that — it only moves the horizon.
+//
+// So: a monotonic, never-evicting census of `kind: 'sync'` records, alongside
+// the ring rather than inside it. Three properties the ring cannot have:
+//
+//  - MONOTONIC `count`. It only ever rises, so "is this trending up" is two
+//    reads on one boot instead of an anecdote. (Process-resident: it dies with
+//    the pid like everything else here, so re-derive `build.pid`/`startedAt` in
+//    the same heartbeat as any read of it.)
+//  - A LOWER INTAKE FLOOR than the ring. The ring records at
+//    PHASE_TIMING_SLOW_MS (1000ms). The census takes `sync` records from
+//    SYNC_BLOCK_CENSUS_MIN_MS (250ms) up, bucketed, so the approach to 1000ms
+//    is visible BEFORE a 1000ms block exists to be seen. A residual that decays
+//    back toward the 5s health budget crosses 250 → 500 → 1000 first.
+//  - PHASE NAMES retained per-bucket. The `yield-preempt@<phase>` witness is
+//    never the culprit (see {@link SyncSliceMeter}) but it is diagnostically
+//    load-bearing: it says the block was FOREIGN uninstrumented work observed
+//    from <phase>'s yield, which is the opposite verdict from a `#slice`.
+//
+// ⚠️ A counter that reads 0 when the box is quiet AND when the tagger is broken
+// is worse than no counter. The discriminating control is in
+// `phase-timing.test.ts` (TRA-4920): the SAME real ≥1s sync yield-preempt,
+// recorded through the SAME live call, with one flag (`heldTurns`) moved —
+// census 1 when tagged `sync`, census 0 when the shipped `heldTurns > 0` branch
+// re-tags it `async`. That is the live mis-tag path, not a synthetic mutant.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Census intake floor (ms) for `kind: 'sync'` records. Default 250 — a quarter
+ * of the ring's 1000ms threshold, so the 250/500 buckets show a residual
+ * climbing toward a block before it becomes one. Env-tunable for a diagnosis
+ * window, exactly like PHASE_TIMING_SLOW_MS.
+ */
+function resolveSyncCensusMinMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env['SYNC_BLOCK_CENSUS_MIN_MS'];
+  const n = raw != null && raw.trim() !== '' ? Number(raw.trim()) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : 250;
+}
+
+/**
+ * Bucket edges (ms), FIXED and independent of the intake floor. 1000 is the
+ * ring/latch threshold and 5000 is Render's HTTP health-check budget, so a
+ * reader can map a bucket straight onto a consequence without interpolating.
+ * Raising the floor above an edge simply leaves that bucket at 0 — which is why
+ * `thresholdMs` is published beside the buckets.
+ */
+export const SYNC_CENSUS_BUCKET_EDGES_MS = [250, 500, 1_000, 2_000, 5_000] as const;
+const SYNC_CENSUS_BUCKET_KEYS = ['250-499', '500-999', '1000-1999', '2000-4999', '5000+'] as const;
+export type SyncCensusBucketKey = (typeof SYNC_CENSUS_BUCKET_KEYS)[number];
+
+/** How many distinct phase names the census keeps before folding into `__other__`. */
+const SYNC_CENSUS_NAME_MAX = 64;
+
+/** Per-phase-name roll-up inside the census. */
+export interface SyncCensusName {
+  count: number;
+  maxMs: number;
+  lastAtMs: number;
+}
+
+/** TRA-4920 — monotonic since-boot census of `kind: 'sync'` phase records. */
+export interface SyncBlockCensus {
+  /** Intake floor actually in force (ms). Buckets below it can never fill. */
+  thresholdMs: number;
+  /** Total `sync` records at/above `thresholdMs` since boot. Never decremented. */
+  count: number;
+  /** Of those, how many reached 1000ms — the ring/latch threshold. */
+  countAtOrOver1s: number;
+  /** Largest `sync` duration seen since boot, and who/when. */
+  maxMs: number;
+  maxName: string | null;
+  maxAtMs: number | null;
+  /** First and most-recent intake (ms epoch), so a rate can be derived. */
+  firstAtMs: number | null;
+  lastAtMs: number | null;
+  /** Fixed-edge duration histogram. */
+  buckets: Record<SyncCensusBucketKey, number>;
+  /**
+   * Per-phase-name roll-up. Symbol ranges inside `#slice[..]`/`#span[..]` are
+   * collapsed to `[…]` so a per-symbol label cannot explode cardinality;
+   * `yield-preempt@<phase>` names are kept verbatim.
+   */
+  byName: Record<string, SyncCensusName>;
+  /** Records folded into `__other__` because `byName` was full. */
+  namesTruncated: number;
+}
+
+const OTHER_NAME = '__other__';
+
+/**
+ * The lower of the ring threshold and the census floor — the point past which a
+ * duration is interesting to SOMETHING. Used by {@link SyncSliceMeter} so a
+ * caller-side filter can never be tighter than the tightest consumer.
+ */
+function minIntakeMs(env: NodeJS.ProcessEnv = process.env): number {
+  return Math.min(resolveSlowMs(env), resolveSyncCensusMinMs(env));
+}
+
+function emptyBuckets(): Record<SyncCensusBucketKey, number> {
+  return { '250-499': 0, '500-999': 0, '1000-1999': 0, '2000-4999': 0, '5000+': 0 };
+}
+
+let censusCount = 0;
+let censusCountAtOrOver1s = 0;
+let censusMaxMs = 0;
+let censusMaxName: string | null = null;
+let censusMaxAtMs: number | null = null;
+let censusFirstAtMs: number | null = null;
+let censusLastAtMs: number | null = null;
+let censusBuckets = emptyBuckets();
+let censusByName = new Map<string, SyncCensusName>();
+let censusNamesTruncated = 0;
+
+/** Collapse an unbounded symbol range so `byName` cardinality stays bounded. */
+function censusNameKey(name: string): string {
+  return name.replace(/(#(?:slice|span))\[[^\]]*\]/, '$1[…]');
+}
+
+function bucketKeyFor(durationMs: number): SyncCensusBucketKey {
+  // Walk down: the highest edge the duration reaches wins.
+  for (let i = SYNC_CENSUS_BUCKET_EDGES_MS.length - 1; i >= 0; i -= 1) {
+    if (durationMs >= SYNC_CENSUS_BUCKET_EDGES_MS[i]!) return SYNC_CENSUS_BUCKET_KEYS[i]!;
+  }
+  // Below the lowest edge only reachable when SYNC_BLOCK_CENSUS_MIN_MS < 250;
+  // it still belongs to the bottom bucket rather than being dropped.
+  return SYNC_CENSUS_BUCKET_KEYS[0]!;
+}
+
+function noteSyncCensus(name: string, durationMs: number, atMs: number, env: NodeJS.ProcessEnv): void {
+  if (!(durationMs >= resolveSyncCensusMinMs(env))) return;
+  const ms = Math.round(durationMs);
+  censusCount += 1;
+  if (ms >= 1_000) censusCountAtOrOver1s += 1;
+  if (ms > censusMaxMs) {
+    censusMaxMs = ms;
+    censusMaxName = name;
+    censusMaxAtMs = atMs;
+  }
+  if (censusFirstAtMs === null) censusFirstAtMs = atMs;
+  censusLastAtMs = atMs;
+  censusBuckets[bucketKeyFor(ms)] += 1;
+  const key = censusNameKey(name);
+  const existing = censusByName.get(key);
+  if (existing) {
+    existing.count += 1;
+    if (ms > existing.maxMs) existing.maxMs = ms;
+    existing.lastAtMs = atMs;
+    return;
+  }
+  if (censusByName.size >= SYNC_CENSUS_NAME_MAX) {
+    censusNamesTruncated += 1;
+    const other = censusByName.get(OTHER_NAME);
+    if (other) {
+      other.count += 1;
+      if (ms > other.maxMs) other.maxMs = ms;
+      other.lastAtMs = atMs;
+    } else {
+      // Evicting one named row to make room for `__other__` is still strictly
+      // better than silently dropping every new name with no tell.
+      const victim = censusByName.keys().next().value as string | undefined;
+      if (victim !== undefined) censusByName.delete(victim);
+      censusByName.set(OTHER_NAME, { count: 1, maxMs: ms, lastAtMs: atMs });
+    }
+    return;
+  }
+  censusByName.set(key, { count: 1, maxMs: ms, lastAtMs: atMs });
+}
+
+/** Read the since-boot sync census (TRA-4920). */
+export function getSyncBlockCensus(env: NodeJS.ProcessEnv = process.env): SyncBlockCensus {
+  return {
+    thresholdMs: resolveSyncCensusMinMs(env),
+    count: censusCount,
+    countAtOrOver1s: censusCountAtOrOver1s,
+    maxMs: censusMaxMs,
+    maxName: censusMaxName,
+    maxAtMs: censusMaxAtMs,
+    firstAtMs: censusFirstAtMs,
+    lastAtMs: censusLastAtMs,
+    buckets: { ...censusBuckets },
+    byName: Object.fromEntries([...censusByName].map(([k, v]) => [k, { ...v }])),
+    namesTruncated: censusNamesTruncated,
+  };
+}
+
 let lastSlowPhase: SlowPhase | null = null;
 let lastSlowSyncPhase: SlowPhase | null = null;
 const recentSlowPhases: SlowPhase[] = [];
 
 /**
- * Record a completed phase's duration; a no-op below the slow threshold.
+ * Record a completed phase's duration.
+ *
+ * TRA-4920 — TWO thresholds, deliberately different:
+ *  - the SYNC CENSUS takes `kind: 'sync'` records from SYNC_BLOCK_CENSUS_MIN_MS
+ *    (250ms) up, and never evicts;
+ *  - the ring / `lastSlowPhase` / `lastSlowSyncPhase` / the log line stay on
+ *    PHASE_TIMING_SLOW_MS (1000ms) exactly as before, so every existing reader
+ *    and every persisted trip breadcrumb is byte-unchanged.
+ *
  * `kind` defaults to `sync` (the module's original pure-sync-block contract) so
  * existing direct callers keep block semantics; {@link withPhase} passes `async`.
  */
@@ -116,6 +325,10 @@ export function recordPhaseDuration(
   env: NodeJS.ProcessEnv = process.env,
   kind: PhaseKind = 'sync',
 ): void {
+  // TRA-4920 — census intake FIRST, and only for `sync`: an `async` record's
+  // wall time includes awaited I/O and is not loop-block time, so folding one
+  // in would make the count unreadable as a block count.
+  if (kind === 'sync') noteSyncCensus(name, durationMs, atMs, env);
   if (!(durationMs >= resolveSlowMs(env))) return;
   const rec: SlowPhase = { name, durationMs: Math.round(durationMs), atMs, kind };
   lastSlowPhase = rec;
@@ -270,7 +483,14 @@ export class SyncSliceMeter {
   endSlice(label?: string): void {
     const nowMs = Date.now();
     const durationMs = nowMs - this.sliceStartMs;
-    if (durationMs >= resolveSlowMs(this.env)) {
+    // TRA-4920 — hand off at the LOWER of the two floors. This method used to
+    // gate on the ring threshold alone, so a 250-999ms sync record could never
+    // reach `recordPhaseDuration` and the census's own lower floor was
+    // unreachable from here: the 250/500 buckets would have read 0 forever,
+    // which is exactly the "green that cannot go red" this issue is about.
+    // `recordPhaseDuration` still decides ring/latch membership on its own
+    // threshold, so nothing below 1000ms enters the ring.
+    if (durationMs >= minIntakeMs(this.env)) {
       const from = this.sliceStartLabel ?? '<start>';
       const to = label ?? '?';
       if (turnEpoch === this.sliceStartEpoch) {
@@ -302,7 +522,10 @@ export class SyncSliceMeter {
   onYieldResumed(scheduledAtMs: number, label?: string, heldTurns = 0): void {
     const nowMs = Date.now();
     const delayMs = nowMs - scheduledAtMs;
-    if (delayMs >= resolveSlowMs(this.env)) {
+    // TRA-4920 — same widening as `endSlice`: the `yield-preempt@*` witness is
+    // the record class the census exists to count, so it must not be filtered
+    // out one level above the census.
+    if (delayMs >= minIntakeMs(this.env)) {
       if (heldTurns > 0) {
         recordPhaseDuration(`yield-wait@${this.phase}`, delayMs, nowMs, this.env, 'async');
       } else {
@@ -331,14 +554,31 @@ export interface PhaseAttribution {
    * the field a block diagnosis / watchdog `block` attribution should read.
    */
   lastSlowSyncPhase: SlowPhase | null;
-  /** Short ring of prior slow phases (both kinds, tagged), newest last. */
+  /**
+   * Short ring of prior slow phases (both kinds, tagged), newest last.
+   *
+   * ⚠️ TRA-4920 — this is a FIFO bounded at PHASE_TIMING_RING_MAX and its
+   * retention horizon is set by the `async` arrival rate, which on bqb1 is
+   * orders of magnitude above the `sync` rate. A `sync` record IS written here,
+   * but it is evicted within minutes. NEVER read "0 sync in the ring" as "no
+   * sync blocks" — read {@link syncBlockCensus}, which does not evict.
+   */
   recentSlowPhases: SlowPhase[];
   /** The phase IN FLIGHT at read time (the block-in-progress attribution). */
   activePhase: { name: string; elapsedMs: number } | null;
+  /**
+   * TRA-4920 — monotonic since-boot count + duration histogram of `kind: 'sync'`
+   * records from 250ms up, with phase names retained. This is the ONLY surface
+   * that answers "how many, and is it trending"; `lastSlowSyncPhase` is a
+   * single last-write-wins latch and the ring evicts.
+   *
+   * Live JSON path: `.watchdog.phaseAttribution.syncBlockCensus`.
+   */
+  syncBlockCensus: SyncBlockCensus;
 }
 
-/** Read the current phase attribution (most-recent slow + sync-only + ring + in-flight). */
-export function getPhaseAttribution(): PhaseAttribution {
+/** Read the current phase attribution (most-recent slow + sync-only + ring + in-flight + census). */
+export function getPhaseAttribution(env: NodeJS.ProcessEnv = process.env): PhaseAttribution {
   return {
     lastSlowPhase,
     lastSlowSyncPhase,
@@ -346,6 +586,7 @@ export function getPhaseAttribution(): PhaseAttribution {
     activePhase: currentPhase
       ? { name: currentPhase.name, elapsedMs: Math.max(0, Date.now() - currentPhase.startedAtMs) }
       : null,
+    syncBlockCensus: getSyncBlockCensus(env),
   };
 }
 
@@ -355,4 +596,14 @@ export function _resetPhaseTimingForTests(): void {
   lastSlowSyncPhase = null;
   recentSlowPhases.length = 0;
   currentPhase = null;
+  censusCount = 0;
+  censusCountAtOrOver1s = 0;
+  censusMaxMs = 0;
+  censusMaxName = null;
+  censusMaxAtMs = null;
+  censusFirstAtMs = null;
+  censusLastAtMs = null;
+  censusBuckets = emptyBuckets();
+  censusByName = new Map();
+  censusNamesTruncated = 0;
 }
