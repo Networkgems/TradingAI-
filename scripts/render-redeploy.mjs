@@ -501,6 +501,38 @@ export const EMBARGOES = [
       'A same-SHA env-apply (--commit=<sha already serving>) is not a train but still boots the box: ' +
       'run it with --force-embargo-override="<TRA-#### why>" and it is recorded.',
   },
+  {
+    from: '2026-09-25T13:15:00Z',
+    // Opens BEFORE the 13:25Z RTH freeze on purpose. The freeze's ten-minute run-up is a legal
+    // deploy slot, and on this one day shipping the tip inside it would silently re-calibrate the
+    // instrument the G2 proof is measured with — see below. Closes at 20:15Z, not 19:45Z: the RTH
+    // freeze does not close late, so a deploy created at 19:59Z is legal and would boot the box
+    // underneath the post-window AC3 read.
+    to: '2026-09-25T20:15:00Z',
+    ticket: 'TRA-4884 (G2 test tickets; TRA-4622 cost-bar ruling; TRA-4890 undeployed on main)',
+    why:
+      'The two board-authorised G2 live OTM test tickets (card 6b82a9e7) run today inside the ' +
+      'oneShotCostBarGrant x OTM_ENTRY_WINDOWS_ET overlap: 14:15-15:30Z and 19:00-19:30Z. The whole ' +
+      'proof is read off ONE instrument — oneShotCostBarGrant.{consults,grants,commits} and ' +
+      'refusalsByReason against the LIVE 0.385R single_leg_otm cost bar — and TRA-4884 AC3 rests on ' +
+      'those counters separating "never consulted" from "consulted and refused". ' +
+      'THE INSTRUMENT IS ONE UNPINNED DEPLOY AWAY FROM MOVING. bqb1 serves 66a8a1ab (booted ' +
+      '04:13:12Z) and origin/main is SEVEN commits ahead, among them 8806e70b (TRA-4890), which ' +
+      'retunes optionsCost.commissionR 0.05 -> 0.0036 and, in its own commit message, takes the ' +
+      'live bqb1 bar 0.385 -> 0.3386. Ship that today and a zero `consults` stops meaning "the ' +
+      'bypass was never reached" and starts meaning "the retuned bar admitted the entry without ' +
+      'needing it" — two different findings behind one number, with no way to tell them apart after ' +
+      'the fact. TRA-4890 is board-directed (TRA-4885 item 1) and is NOT being held on its merits; ' +
+      'it is being held for ~7h so it does not land mid-measurement. ' +
+      'NOTHING IS LOST BY WAITING: 8806e70b rides the post-close train, and ' +
+      'check:deploy-train-window grades a deploy order by ANCESTRY, not equality. ' +
+      'IF A CAP RESTORE IS AUTHORISED INSIDE THIS WINDOW (the $300/$64 reconciliation on card ' +
+      '2c7d8389), it MUST be pinned: --commit=66a8a1ab40ccfc32fb9a85a11da6c901ea068935 makes the ' +
+      'apply a zero-byte code delta, which is the only form that restores the cap WITHOUT also ' +
+      'shipping TRA-4890. An env-var write is NOT a substitute: that verb is not routed through ' +
+      'this file at all, and the 2026-07-23 artifact in the VERB 1 note above measured it shipping ' +
+      'the BRANCH TIP despite autoDeploy:no.',
+  },
 ];
 
 // ── Why the 2026-07-27 row closes at 21:00Z, not 20:20Z (TRA-2306, CTO 2026-07-26) ──
