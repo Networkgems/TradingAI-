@@ -159,6 +159,55 @@ instability shortens this margin.** A stable box that stays up three weeks trips
 on exactly this path, with no code change anywhere. The periodic compaction on `cost-aware-gate` is
 the cheap way to stop that coupling.
 
+### AC4 resolution — TRA-4904, shipped 2026-09-25
+
+`cost-aware-gate-ledger.ts` now re-applies its 7-day cutoff **every 6 hours** as well as at boot
+(`COST_AWARE_GATE_COMPACTION_INTERVAL_MS`, armed in `index.ts` beside the other unref'd timers). The
+premium is `interval / retain`, so 6 h caps it at **+3.6%** against the AC1 bar of 16.4%, and the
+census row falls accordingly:
+
+```
+node scripts/tra4899-tape-census.mjs        # 2026-09-25T04:4xZ, host build 66a8a1ab40cc
+  72.3  DERIVED  7 d +6h timer   69.9  cost-aware-gate.jsonl     ← was 119.1 boot-only
+```
+
+⚠️ **That 72.3 MiB is a projection, not yet a measurement.** The observed 69.9 MiB was read off a
+host still running the pre-fix build; what changed in this run is the census's own multiplier
+(`(7 + 0.25)/7` instead of `(7 + 4.93)/7`), which is only true of the box once the build is live. The
+manifest row carries `bootOnly: false` + `compactEveryDays: 0.25` and its needle now asserts **both**
+constants, so the row cannot claim a cadence the source does not hold.
+
+The compaction **outcome** is published at `/api/health/cost-aware-gate` → `compaction`
+(`trigger`, `ranAt`, `cutoff`, `linesBefore/After`, `linesDropped`, `bytesBefore/After`, `rewrote`,
+`bufferedAppendsFlushed`) — `reversalShadowCompaction`'s shape plus the field that answers the
+question that shape cannot: **`timerCompactions`**. A build where the interval was never armed
+publishes a perfectly ordinary `trigger: 'boot'` outcome forever, and nothing else on the payload
+separates it from a working hook.
+
+**Do the other three need the same timer? Still no — and here is the arithmetic that would change
+the answer.** The trio's pooled append rate is `2.07 + 1.68 + 1.27` = **5.02 MiB/day**, so at the
+observed 4.93-day maximum boot gap their *combined* overshoot is **24.7 MiB — 9.3% of the 267.4 MiB
+headroom**, against the 45.9 MiB `cost-aware-gate` cost on its own.
+
+What this fix actually buys, and what it leaves:
+
+- `cost-aware-gate` is already **at** its 7-day steady state (69.9 MiB ÷ 9.98 = 7.00 d), so the timer
+  holds it flat rather than merely slowing it. Residual `/data` growth during a long uptime is
+  `19.73 − 9.98` = **9.75 MiB/day** ⇒ **~27.4 days** of continuous uptime before `minFreePct`, up
+  from ~13.5. That is **5.6× the observed maximum boot gap**, against 2.7× before.
+- The residual is now almost entirely four files: `otm-admission-tape` **4.38 MiB/day** (45% of it —
+  its *byte* cap is boot-only too) plus the trio's 5.02. The other twelve time-capped tapes together
+  are ~0.35 MiB/day.
+- The trio's pooled overshoot reaches the 45.9 MiB that justified this ticket at an uptime of
+  `45.9 / 5.02` = **9.1 days**.
+
+So the trigger is an uptime, not a size: **put the trio and `otm-admission-tape` on the same hook
+when a sustained uptime above ~9 days becomes plausible** — i.e. when the measured max boot gap
+crosses 9 d, or when TRA-4158/TRA-4820 are closed and a multi-week soak is actually being asked for,
+or if headroom ever falls below ~150 MiB. Two notes for whoever picks that up: it should be **one
+shared periodic-compaction hook**, not four bespoke timers, and `otm-admission-tape` is the single
+largest lever in the residual despite being the tape this parent ticket already re-scoped.
+
 ---
 
 ## AC5 — the inode budget: the file-count leg does **not** become binding

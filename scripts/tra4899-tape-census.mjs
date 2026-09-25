@@ -102,9 +102,17 @@ const MANIFEST = [
     value: 1 * MiB, needle: 'export const DENOM_FLIP_TAPE_MAX_BYTES = 1024 * 1024;', dir: true,
     note: 'per-file leg inside the 16 MiB tape/ aggregate' },
 
-  // ── time-capped (ALL of these compact on BOOT ONLY) ───────────────────────
+  // ── time-capped (every one of these compacts on BOOT ONLY except the first) ─
+  //
+  // `compactEveryDays` (TRA-4904) = the tape re-applies its cutoff on a TIMER, so its
+  // overshoot premium is `interval / retain` rather than `bootGap / retain`. Absent ⇒
+  // boot-only, and the premium is the boot gap. The needle is asserted verbatim, so the
+  // flag cannot claim a timer whose constant is not in the source.
   { name: 'cost-aware-gate.jsonl', src: 'cost-aware-gate-ledger.ts', unit: 'days', value: 7,
-    needle: 'const RETAIN_MS = 7 * 24 * 60 * 60 * 1000;', bootOnly: true },
+    needle: ['const RETAIN_MS = 7 * 24 * 60 * 60 * 1000;',
+      'export const COST_AWARE_GATE_COMPACTION_INTERVAL_MS = 6 * 60 * 60 * 1000;'],
+    bootOnly: false, compactEveryDays: 0.25,
+    note: 'TRA-4904 — 6h timer + boot; premium +3.6% (was +70.4% boot-only)' },
   { name: 'live-enforce-gate.jsonl', src: 'live-enforce-gate-ledger.ts', unit: 'days', value: 30,
     needle: 'const RETAIN_MS = 30 * 24 * 60 * 60 * 1000;', bootOnly: true },
   { name: 'reversal-shadow-signals.jsonl', src: 'reversal-shadow-ledger.ts', unit: 'days', value: 30,
@@ -209,7 +217,13 @@ function assertManifestMatchesSource() {
     if (!existsSync(p)) { broken.push(`${row.name}: writer ${row.src} does not exist`); continue; }
     if (row.unit === 'none') continue; // absence is not assertable by needle — see `confirmed`
     const text = readFileSync(p, 'utf8');
-    if (!text.includes(row.needle)) broken.push(`${row.name}: ${row.src} no longer contains  ${row.needle}`);
+    // TRA-4904 — a row may cite MORE THAN ONE constant (retention + compaction
+    // cadence). All of them are asserted: a row whose cadence needle still matched
+    // while its retention constant had moved would report a premium off the wrong
+    // denominator and read exactly like a correct one.
+    for (const needle of Array.isArray(row.needle) ? row.needle : [row.needle]) {
+      if (!text.includes(needle)) broken.push(`${row.name}: ${row.src} no longer contains  ${needle}`);
+    }
   }
   return broken;
 }
@@ -238,7 +252,21 @@ function worstCase(row, observedBytes) {
   }
   if (row.unit === 'days') {
     if (observedBytes == null) return { bytes: null, kind: 'NO-OBS' };
-    return { bytes: observedBytes * ((row.value + BOOT_GAP_DAYS) / row.value), kind: 'DERIVED' };
+    // TRA-4904 — the overshoot is one COMPACTION INTERVAL of un-dropped rows, and for a
+    // boot-only tape that interval IS the boot gap. A tape with a timer is bounded by
+    // whichever fires first, so the gap is the MIN: a box that reboots every 20 minutes
+    // does not overshoot more than one 6h timer window, and a box that stays up for
+    // three weeks is capped by the timer rather than by the boot gap.
+    //
+    // ⚠ `observedBytes` on a host that has been up less than `retain` is itself still
+    // filling, so this ratio is a projection off a partial file, not a measurement —
+    // the same caveat as before the timer landed.
+    const gapDays = Math.min(row.compactEveryDays ?? BOOT_GAP_DAYS, BOOT_GAP_DAYS);
+    return {
+      bytes: observedBytes * ((row.value + gapDays) / row.value),
+      kind: 'DERIVED',
+      gapDays,
+    };
   }
   if (row.unit === 'none') return { bytes: VOLUME_BYTES, kind: 'UNBOUNDED' };
   return { bytes: null, kind: 'FLOOR' }; // rows/files/ext — observed is a floor only
@@ -294,7 +322,10 @@ async function main() {
     console.log('  ----------  ----------  ------------------  ---------  ---------------------------------');
     for (const r of rows) {
       const cap = r.unit === 'bytes' ? `${mib(r.value)} MiB`
-        : r.unit === 'days' ? `${r.value} d${r.bootOnly ? ' (boot-only)' : ''}`
+        : r.unit === 'days'
+          ? `${r.value} d${r.bootOnly === false && r.compactEveryDays
+            ? ` +${r.compactEveryDays * 24}h timer`
+            : ' (boot-only)'}`
         : r.unit === 'rows' ? `${r.value} rows`
         : r.unit === 'files' ? `${r.value} inodes`
         : r.unit === 'none' ? 'NONE' : 'external';
@@ -304,7 +335,8 @@ async function main() {
       console.log(`  ${w}  ${r.worst.kind.padEnd(10)}  ${cap.padEnd(18)}  ${o}  ${r.name}${flag}`);
     }
     console.log();
-    console.log('  WORST-CASE is MiB. KIND: HARD = the cap itself · DERIVED = observed x (retain+bootGap)/retain');
+    console.log('  WORST-CASE is MiB. KIND: HARD = the cap itself · DERIVED = observed x (retain+gap)/retain,');
+    console.log('  where gap = min(compaction interval, bootGap) — the boot gap for a boot-only tape (TRA-4904).');
     console.log('  UNBOUNDED = the whole volume (no cap of any kind) · FLOOR = unit not convertible to bytes.');
     console.log('  "?" on an UNBOUNDED row = cap absence grepped, write path not yet read end-to-end.');
   }

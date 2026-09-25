@@ -254,7 +254,11 @@ import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 // TRA-4343 — the durable entry-site census + the since-boot vacuity disclosure.
 import { hydrateEntrySiteCensusFromDisk } from './entry-site-census-ledger.js';
 import { gradeSinceBootSessionCoverage } from './session-coverage.js';
-import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
+import {
+  COST_AWARE_GATE_COMPACTION_INTERVAL_MS, // TRA-4904
+  compactCostAwareGateLedgerNow, // TRA-4904
+  hydrateCostAwareGateFromDisk,
+} from './cost-aware-gate-ledger.js';
 // TRA-4628 — the OTM candidate-admission tape (admitted AND refused scanner
 // candidates), hydrated at boot so a post-close read spans the whole session.
 import { hydrateOtmAdmissionTapeFromDisk } from './otm-admission-tape.js';
@@ -19197,6 +19201,29 @@ function tickPromotionDivergence(): void {
 // waiting an hour; then hourly.
 setTimeout(tickPromotionDivergence, 2 * 60_000).unref?.();
 setInterval(tickPromotionDivergence, PROMOTION_DIVERGENCE_RECOMPUTE_MS).unref?.();
+
+// TRA-4904 — re-apply the cost-aware-gate ledger's 7-day retention TO DISK every
+// 6 hours, not only at boot.
+//
+// The boot hydrate above compacts once and then never again, so the file carried up
+// to one BOOT INTERVAL of rows already past retention: +70.4% at the observed 4.93-day
+// max boot gap, 119.1 MiB worst case against a ~73 MiB steady state. This tape is the
+// only one on the box where that premium matters, because it pairs the highest write
+// rate in /data (9.98 MiB/day) with the shortest retention (7d; every sibling holds
+// 30d at +16.4%). The margin to `minFreePct` today (~13.5 d of uptime) exists only
+// because the box keeps restarting — so FIXING the instability is what makes this bite,
+// which is why it ships before it does. See TRA-4899 AC4 / docs/tra4899-data-tape-budget.md.
+//
+// The first fire is one full interval out, not at boot: the hydrate has just compacted,
+// so an immediate pass could only re-read ~70 MiB to drop nothing.
+const costAwareGateCompactionTimer = setInterval(() => {
+  void compactCostAwareGateLedgerNow().catch((err) => {
+    log.warn('TRA-4904 cost-aware-gate periodic compaction failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  });
+}, COST_AWARE_GATE_COMPACTION_INTERVAL_MS);
+costAwareGateCompactionTimer.unref?.();
 
 // ── Static frontend (production web) ────────────────────────────────────────
 const DIST_DIR = join(__dirname, '..', '..', '..', 'apps', 'desktop', 'dist');

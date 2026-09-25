@@ -29,6 +29,10 @@
 // balances/PII — just structure, ET day, modeled R, and the bar.
 
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+// TRA-4904 — the PERIODIC compaction is async on purpose; see
+// {@link compactCostAwareGateLedgerNow}. The boot path stays sync (it must finish
+// before the first live append).
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
 import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
@@ -47,11 +51,49 @@ const log = logger.child({ module: 'cost-aware-gate-ledger' });
 export const COST_AWARE_GATE_LOG_FILENAME = 'cost-aware-gate.jsonl';
 
 /**
- * Retain this many ms of decisions on disk (compacted on boot). QuantTrader's
- * forward validation grades a rolling multi-session window, so a week comfortably
- * covers a weekly grade while bounding a file that takes one line per candidate.
+ * Retain this many ms of decisions on disk (compacted on boot AND on the
+ * {@link COST_AWARE_GATE_COMPACTION_INTERVAL_MS} timer). QuantTrader's forward
+ * validation grades a rolling multi-session window, so a week comfortably covers a
+ * weekly grade while bounding a file that takes one line per candidate.
  */
 const RETAIN_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Published beside the compaction outcome so `/data` can be audited without grepping here. */
+export const COST_AWARE_GATE_RETENTION_DAYS = RETAIN_MS / (24 * 60 * 60 * 1000);
+
+/**
+ * TRA-4904 — how often the retention cutoff is re-applied TO DISK while the process
+ * stays up.
+ *
+ * ── WHY A TIMER AT ALL ───────────────────────────────────────────────────────
+ * A boot-only compaction leaves the file carrying up to one BOOT INTERVAL of rows
+ * that have aged past {@link RETAIN_MS} and never been dropped, so the steady-state
+ * size is `rate × (retain + bootGap)`, not `rate × retain`. The premium is
+ * `bootGap / retain`, and this tape is the box's worst case on BOTH factors: the
+ * highest write rate in `/data` (9.98 MiB/day, measured on bqb1 2026-09-25) against
+ * the SHORTEST retention (7d, where every sibling holds 30d). Premium **+70.4%**,
+ * worst case 119.1 MiB against a ~73 MiB steady state — 45.9 MiB of pure overshoot,
+ * most of one whole close-ledger budget (TRA-4899 AC4,
+ * `docs/tra4899-data-tape-budget.md`).
+ *
+ * Nothing is breached today only because the box is UNSTABLE: the observed maximum
+ * uptime over 100 Render deploys is 4.93 d against ~13.5 d of `/data` headroom, and
+ * every restart compacts. Fixing the instability (TRA-4158's watchdog restarts,
+ * TRA-4820's env-write deploys) SHORTENS that margin — a box that stays up three
+ * weeks trips `minFreePct` on this path with no code change anywhere. So the timer
+ * is the fix for a reliability win becoming a disk incident.
+ *
+ * ── WHY 6 HOURS ──────────────────────────────────────────────────────────────
+ * The premium above is `interval / retain`, so the AC1 bar — beat the 30-day tapes'
+ * +16.4% — is `interval ≤ 0.164 × 7 d = 1.15 d`. 6 h gives **+3.6%** (≈2.6 MiB),
+ * four fires a day, comfortably inside the bar with room for a fire to be skipped.
+ * It is deliberately NOT tied to the ET day: this file's cutoff is a TIMESTAMP
+ * cutoff (see {@link hydrateCostAwareGateFromDisk}), a daily-at-a-fixed-instant
+ * schedule is its own single point of failure on a process restarted several times
+ * an hour (the TRA-2840 lesson), and a wall-clock-derived interval needs no
+ * catch-up logic.
+ */
+export const COST_AWARE_GATE_COMPACTION_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 /**
  * Which gate produced the record. `cost_bar` is the TRA-1602 modeled-gross-R bar
@@ -364,6 +406,33 @@ const spreadDecisionsByClassifier = new Map<string, number>();
 /** Retained spread decisions written before TRA-2948 (no stamp). Indeterminate, never "current". */
 let spreadDecisionsUnstamped = 0;
 
+// ── TRA-4904 — compaction outcome + the append interlock ─────────────────────
+//
+// `lastCompaction` is the OUTCOME of the most recent compaction (boot or timer).
+// A `RETAIN_MS` that ships without a working hook reads identically to one that
+// works — the reversal-shadow ledger's AC5 lesson, copied verbatim — so the outcome
+// is published, never the constant alone.
+let lastCompaction: CostAwareGateCompaction | null = null;
+/** Timer fires that completed (any outcome). 0 with an armed timer ⇒ the hook is not running. */
+let timerCompactions = 0;
+/** True while an async rewrite is between its read and its write. */
+let compactionInFlight = false;
+/**
+ * Lines a live decision produced WHILE a rewrite was in flight.
+ *
+ * THIS IS THE INTERLOCK, and it is why the periodic compaction is safe to run
+ * mid-session at all. The boot compaction cannot lose an append because it completes
+ * before the engine ticks; a timer rewrite has no such ordering, so an
+ * `appendFileSync` landing between the async read and the async write would be
+ * silently erased by the write — a lost row that reads identically to a row that was
+ * never recorded, on the one counter family whose whole purpose is that a missing
+ * write must be visible (TRA-1681). Buffering instead of writing is exact rather
+ * than probabilistic: appends are synchronous and this process is single-threaded,
+ * so nothing can reach the file while the flag is up, and the buffer is flushed in a
+ * `finally` — a FAILED rewrite still gets its rows appended to the un-rewritten file.
+ */
+const pendingAppends: string[] = [];
+
 export function costAwareGateLogPath(dir: string): string {
   return join(dir, COST_AWARE_GATE_LOG_FILENAME);
 }
@@ -380,6 +449,10 @@ export function clearCostAwareGateLedger(): void {
   lastAppendError = null;
   spreadDecisionsByClassifier.clear();
   spreadDecisionsUnstamped = 0;
+  lastCompaction = null;
+  timerCompactions = 0;
+  compactionInFlight = false;
+  pendingAppends.length = 0;
 }
 
 /**
@@ -652,14 +725,32 @@ function applyAndAppend(rec: CostGateDecisionRecord): void {
   // durable write. `durability` below is the field that tells them apart (TRA-1681).
   apply(rec);
   if (dataDir == null) return;
-  const path = costAwareGateLogPath(dataDir);
+  const line = JSON.stringify(rec) + '\n';
+  // TRA-4904 — a rewrite is between its read and its write; writing now would be
+  // erased by it. Buffer and let the rewrite's `finally` flush. See
+  // {@link pendingAppends}.
+  if (compactionInFlight) {
+    pendingAppends.push(line);
+    return;
+  }
+  appendRawLine(dataDir, line);
+}
+
+/**
+ * Append one already-serialized JSONL line, best-effort. Factored out of
+ * {@link applyAndAppend} (TRA-4904) so the compaction's buffer flush writes through
+ * the SAME error accounting — a flush that swallowed silently would put the lost-row
+ * shape back one layer down.
+ */
+function appendRawLine(dir: string, line: string): void {
+  const path = costAwareGateLogPath(dir);
   try {
     mkdirSync(dirname(path), { recursive: true });
   } catch {
     // exists / unwritable — the append below surfaces the error
   }
   try {
-    appendFileSync(path, JSON.stringify(rec) + '\n', 'utf8');
+    appendFileSync(path, line, 'utf8');
   } catch (err) {
     // Swallowed so the trade pass survives — but COUNTED, so the swallow is not silent.
     // An uncounted swallow is how a lost row reads identically to a written one.
@@ -782,17 +873,42 @@ export function hydrateCostAwareGateFromDisk(dir: string, now: number = Date.now
   // Compact: rewrite the file to the retained lines only (best-effort). Skipped when
   // there is nothing to drop, to avoid a needless rewrite on every clean boot.
   const nonEmptyLines = raw.split('\n').filter((l) => l.trim() !== '').length;
+  const bytesBefore = Buffer.byteLength(raw, 'utf8');
+  let bytesAfter = bytesBefore;
+  let rewrote = false;
+  let error: string | undefined;
   if (kept.length < nonEmptyLines) {
     const path = costAwareGateLogPath(dir);
+    const next = kept.length > 0 ? kept.join('\n') + '\n' : '';
     try {
       mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, kept.length > 0 ? kept.join('\n') + '\n' : '', 'utf8');
+      writeFileSync(path, next, 'utf8');
+      rewrote = true;
+      bytesAfter = Buffer.byteLength(next, 'utf8');
     } catch (err) {
-      log.warn('cost-aware-gate compaction failed', {
-        reason: err instanceof Error ? err.message : String(err),
-      });
+      error = err instanceof Error ? err.message : String(err);
+      log.warn('cost-aware-gate compaction failed', { reason: error });
     }
   }
+  // TRA-4904 — PUBLISH the boot outcome, not just the constant. Before this the boot
+  // compaction was completely unobservable: a `RETAIN_MS` whose rewrite silently threw
+  // every boot read exactly like one that worked, which is the same shape as the
+  // "armed-but-inert" trap this whole module exists to remove.
+  lastCompaction = {
+    trigger: 'boot',
+    ranAt: new Date(now).toISOString(),
+    cutoff: new Date(cutoff).toISOString(),
+    retentionDays: COST_AWARE_GATE_RETENTION_DAYS,
+    linesBefore: nonEmptyLines,
+    linesAfter: kept.length,
+    linesDropped: nonEmptyLines - kept.length,
+    bytesBefore,
+    bytesAfter,
+    rewrote,
+    rewriteBasis: 'sanitized',
+    bufferedAppendsFlushed: 0,
+    ...(error ? { error } : {}),
+  };
 
   // TRA-1681 — freeze what came OFF DISK, before the live pass starts folding its own
   // decisions into the same `byDay`. After the first live record the two are one map and
@@ -800,6 +916,323 @@ export function hydrateCostAwareGateFromDisk(dir: string, now: number = Date.now
   hydratedRecords = kept.length;
   hydratedDays = byDay.size;
   return { days: byDay.size, records: kept.length };
+}
+
+// ── TRA-4904 — the PERIODIC compaction ───────────────────────────────────────
+
+/**
+ * What a compaction actually DID — boot or timer. Modelled on
+ * `ReversalShadowCompaction` (`reversal-shadow-ledger.ts`), which exists for the same
+ * reason and states it best: *a `RETAIN_MS` that ships without a working hook reads
+ * identically to one that works*. Published on `/api/health/cost-aware-gate`.
+ */
+export interface CostAwareGateCompaction {
+  /**
+   * WHICH hook produced this outcome. `timer` is the TRA-4904 addition and it is the
+   * field that answers "is the periodic hook running at all" — a build where the
+   * interval was never armed publishes `boot` forever, which is exactly the state
+   * this ticket found.
+   */
+  trigger: 'boot' | 'timer';
+  /** ISO time the compaction ran. */
+  ranAt: string;
+  /** Cutoff applied (ISO): rows with `ts` below this are dropped. */
+  cutoff: string;
+  /** {@link RETAIN_MS} in days, so the cutoff can be checked against the horizon. */
+  retentionDays: number;
+  /** Non-empty JSONL lines on disk before / after. */
+  linesBefore: number;
+  linesAfter: number;
+  linesDropped: number;
+  /** File size before / after, bytes. Equal when nothing was dropped. */
+  bytesBefore: number;
+  bytesAfter: number;
+  /** False when nothing aged out — no needless rewrite of a ~70 MiB file. */
+  rewrote: boolean;
+  /**
+   * HOW the retained lines were written back.
+   *
+   * `sanitized` (boot) re-serializes every line through the hydrate's field
+   * whitelist, which is why this module has twice had to fix a field the rewrite
+   * ERASED FROM DISK (TRA-1703, TRA-2355). `verbatim-suffix` (timer) copies the
+   * retained bytes through untouched, so a field added after this code ships survives
+   * a compaction that predates it — the discipline `reversal-shadow-ledger.ts` adopted
+   * after watching those two tickets. The boot path keeps its sanitizing rewrite
+   * because it is also the hydrate, and changing both at once would mix a size fix
+   * with a durability change.
+   */
+  rewriteBasis: 'sanitized' | 'verbatim-suffix';
+  /** Live appends buffered during the rewrite and appended after it (the interlock worked). */
+  bufferedAppendsFlushed: number;
+  /**
+   * Timer only: the prefix scan hit a line whose `ts` it could not read and STOPPED
+   * there rather than guess. Nothing young was dropped; the boot compaction (which
+   * parses every line) clears whatever this stalled on.
+   */
+  stoppedOnUnreadableTs?: true;
+  /** Set when the rewrite itself failed. The retention horizon is unchanged; disk is not compacted. */
+  error?: string;
+  /** Set when no work was attempted, naming why. Never silently reported as a clean pass. */
+  skipped?: 'no_data_dir' | 'already_in_flight' | 'no_file';
+}
+
+/** The compaction hook's configuration AND its last outcome — see {@link costAwareGateCompaction}. */
+export interface CostAwareGateCompactionState {
+  retentionDays: number;
+  /** {@link COST_AWARE_GATE_COMPACTION_INTERVAL_MS}. The overshoot premium is `interval / retain`. */
+  intervalMs: number;
+  /**
+   * Timer fires completed this uptime. **This is the liveness field.** 0 on a process
+   * that has been up longer than `intervalMs` means the interval is NOT armed, however
+   * healthy `last` looks — the boot compaction alone would leave `last.trigger: 'boot'`
+   * and every byte field looking perfectly ordinary.
+   */
+  timerCompactions: number;
+  /** The most recent outcome (boot or timer). `null` before the ledger has been hydrated. */
+  last: CostAwareGateCompaction | null;
+  note: string;
+}
+
+/**
+ * The compaction hook's state for `/api/health/cost-aware-gate` (TRA-4904 AC2).
+ * Read `timerCompactions` before `last`: a working constant and a dead timer publish
+ * the same `last`.
+ */
+export function costAwareGateCompaction(): CostAwareGateCompactionState {
+  return {
+    retentionDays: COST_AWARE_GATE_RETENTION_DAYS,
+    intervalMs: COST_AWARE_GATE_COMPACTION_INTERVAL_MS,
+    timerCompactions,
+    last: lastCompaction,
+    note:
+      'TRA-4904. This tape pairs the highest write rate in /data (9.98 MiB/day) with the SHORTEST '
+      + 'retention (7d vs 30d on every sibling), so a boot-only compaction carried up to one boot '
+      + 'interval of aged rows: premium bootGap/retain = +70.4% (119.1 MiB worst case against a ~73 MiB '
+      + 'steady state, 45.9 MiB of overshoot). The cutoff is now re-applied on a '
+      + `${COST_AWARE_GATE_COMPACTION_INTERVAL_MS / (60 * 60 * 1000)}h timer as well as at boot, which caps the premium at `
+      + `${(100 * COST_AWARE_GATE_COMPACTION_INTERVAL_MS / RETAIN_MS).toFixed(1)}% — under the 30-day tapes' 16.4%. `
+      + 'READ `timerCompactions` FIRST: it is 0 if and only if the periodic hook is not running, and a '
+      + 'dead hook is indistinguishable from a live one by any other field here. The three 30-day tapes '
+      + '(live-enforce-gate, reversal-shadow-signals, churn-brake-guard) are deliberately NOT on this '
+      + 'timer — see docs/tra4899-data-tape-budget.md AC4 for the uptime that would change that.',
+  };
+}
+
+/** Lines scanned between event-loop yields — see {@link compactCostAwareGateLedgerNow}. */
+const COMPACTION_SCAN_CHUNK_LINES = 25_000;
+
+function yieldToLoop(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
+/**
+ * Read `ts` off a raw JSONL line WITHOUT parsing it. Every line this module writes is
+ * `JSON.stringify` of an object whose FIRST key is `ts`, so the number is in the first
+ * few dozen bytes. `null` means "could not read it", never a guess.
+ *
+ * A full `JSON.parse` per line is what makes the boot hydrate affordable only once: at
+ * the worst-case ~1.7M lines it is seconds of BLOCKED EVENT LOOP, and this hook runs
+ * four times a day on a live money box — straight into the TRA-2111 yield-preempt
+ * tripwire (which already fired at 1080 ms on a sync `doTick` segment). The periodic
+ * path therefore never parses a line it keeps.
+ */
+function extractLineTs(line: string): number | null {
+  const m = /"ts":\s*(-?\d+(?:\.\d+)?)/.exec(line.slice(0, 64));
+  if (!m) return null;
+  const ts = Number(m[1]);
+  return Number.isFinite(ts) ? ts : null;
+}
+
+/** Count JSONL lines natively — one O(len) newline walk, no per-line allocation. */
+function countJsonlLines(s: string): number {
+  if (s.length === 0) return 0;
+  let n = 0;
+  for (let i = s.indexOf('\n'); i !== -1; i = s.indexOf('\n', i + 1)) n += 1;
+  if (!s.endsWith('\n')) n += 1; // a torn/unterminated trailing line is still a line
+  return n;
+}
+
+/**
+ * TRA-4904 — re-apply {@link RETAIN_MS} TO DISK without a reboot. The timer body; also
+ * callable directly (tests, and a one-off from a route if one is ever wanted).
+ *
+ * ── WHAT IT DROPS, AND WHY ONLY A PREFIX ─────────────────────────────────────
+ * It drops the maximal CONTIGUOUS PREFIX of lines whose `ts` is below the cutoff and
+ * keeps the remaining bytes verbatim. Records are appended in decision order, so that
+ * prefix IS the aged window in every normal file — and the rule is safe in the one
+ * case it is not: an out-of-order old row hiding behind a young one is simply kept
+ * until the next boot compaction (which sorts nothing but validates every line
+ * individually). The failure direction matters here — dropping a row that is still
+ * inside the window would delete live evidence from the tape a ceiling tripwire reads,
+ * while keeping one row too long costs bytes. This scan cannot do the former.
+ *
+ * Consequences, both deliberate:
+ *   • Work is O(dropped), not O(file). In steady state the prefix is one interval of
+ *     rows (~2.6 MiB) and the retained ~70 MiB is never scanned or re-serialized.
+ *   • The retained bytes are echoed, so no field can be erased by this rewrite
+ *     (see {@link CostAwareGateCompaction.rewriteBasis}).
+ *
+ * ── WHAT IT DOES NOT DO ──────────────────────────────────────────────────────
+ * It does not touch the IN-MEMORY fold. `byDay` is fed by both the hydrate and the
+ * live pass and its provenance counters (`hydratedRecords`, the TRA-2948 classifier
+ * census) are window-scoped rather than day-keyed, so pruning it here would need those
+ * counters re-keyed by ET day first. The consequence is that on an uptime longer than
+ * the retention, `retained.etDays` spans more days than `retained.retentionDays`
+ * claims — a pre-existing reporting gap, unchanged by this ticket and tracked
+ * separately. No byte of `/data` depends on it.
+ *
+ * The rewrite is tmp-file + rename because it now runs 4x/day on the money box rather
+ * than once per boot: a crash midway through an in-place `writeFile` of a 70 MiB tape
+ * truncates it, and multiplying that exposure by every deploy-free day is not a trade
+ * worth making for one fewer syscall.
+ */
+export async function compactCostAwareGateLedgerNow(
+  now: number = Date.now(),
+): Promise<CostAwareGateCompaction> {
+  const cutoff = now - RETAIN_MS;
+  const base = {
+    trigger: 'timer' as const,
+    ranAt: new Date(now).toISOString(),
+    cutoff: new Date(cutoff).toISOString(),
+    retentionDays: COST_AWARE_GATE_RETENTION_DAYS,
+    rewriteBasis: 'verbatim-suffix' as const,
+    bufferedAppendsFlushed: 0,
+    linesBefore: 0,
+    linesAfter: 0,
+    linesDropped: 0,
+    bytesBefore: 0,
+    bytesAfter: 0,
+    rewrote: false,
+  };
+
+  // No boot hydrate ran (unit tests / CLI): nothing is durable, so there is nothing to
+  // compact. Named, never reported as a clean pass.
+  if (dataDir == null) {
+    const out: CostAwareGateCompaction = { ...base, skipped: 'no_data_dir' };
+    lastCompaction = out;
+    timerCompactions += 1;
+    return out;
+  }
+  // An overlapping fire would read the file the in-flight one is about to replace. Not
+  // counted as a fire and it does NOT overwrite the last real outcome.
+  if (compactionInFlight) {
+    return { ...base, skipped: 'already_in_flight' };
+  }
+
+  const dir = dataDir;
+  const path = costAwareGateLogPath(dir);
+
+  /**
+   * The pass itself. Separated from the interlock below because the flush has to be
+   * OUTSIDE it: a `finally` that mutates the result cannot change what an inner
+   * `return` already captured, so publishing from a `finally` would have shipped a
+   * payload whose `bufferedAppendsFlushed` was always 0 while the real flush happened
+   * invisibly — a field that reads identically whether or not the interlock works,
+   * which is the exact defect class this ticket is fixing one level up.
+   */
+  const runPass = async (): Promise<CostAwareGateCompaction> => {
+    let raw: string;
+    try {
+      raw = await readFile(path, 'utf8');
+    } catch {
+      // Missing (nothing written yet) or unreadable — the append path surfaces write
+      // failures; there is nothing for a compaction to do either way.
+      return { ...base, skipped: 'no_file' };
+    }
+
+    let start = 0;
+    let scanned = 0;
+    let stoppedOnUnreadableTs = false;
+    while (start < raw.length) {
+      const nl = raw.indexOf('\n', start);
+      const end = nl === -1 ? raw.length : nl;
+      const line = raw.slice(start, end);
+      if (line.trim() !== '') {
+        const ts = extractLineTs(line);
+        if (ts === null) {
+          stoppedOnUnreadableTs = true;
+          break;
+        }
+        if (ts >= cutoff) break; // first retained line — everything from here is kept
+      }
+      start = nl === -1 ? raw.length : end + 1;
+      if ((scanned += 1) % COMPACTION_SCAN_CHUNK_LINES === 0) await yieldToLoop();
+    }
+
+    const bytesBefore = Buffer.byteLength(raw, 'utf8');
+    const linesBefore = countJsonlLines(raw);
+    if (start === 0) {
+      // Nothing aged out. Do NOT rewrite: at ~70 MiB a needless rewrite four times a
+      // day is the cost this ticket is trying to remove, not add.
+      return {
+        ...base,
+        linesBefore,
+        linesAfter: linesBefore,
+        bytesBefore,
+        bytesAfter: bytesBefore,
+        ...(stoppedOnUnreadableTs ? { stoppedOnUnreadableTs: true as const } : {}),
+      };
+    }
+
+    const next = raw.slice(start);
+    const linesAfter = countJsonlLines(next);
+    let bytesAfter = Buffer.byteLength(next, 'utf8');
+    let rewrote = false;
+    let error: string | undefined;
+    const tmp = `${path}.compact-${process.pid}-${now}.tmp`;
+    try {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(tmp, next, 'utf8');
+      await rename(tmp, path);
+      rewrote = true;
+      bytesAfter = await stat(path).then((s) => s.size).catch(() => bytesAfter);
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+      await rm(tmp, { force: true }).catch(() => {});
+      bytesAfter = bytesBefore; // the file is untouched
+      log.warn('cost-aware-gate periodic compaction failed', { reason: error });
+    }
+    return {
+      ...base,
+      linesBefore,
+      linesAfter: rewrote ? linesAfter : linesBefore,
+      linesDropped: rewrote ? linesBefore - linesAfter : 0,
+      bytesBefore,
+      bytesAfter,
+      rewrote,
+      ...(stoppedOnUnreadableTs ? { stoppedOnUnreadableTs: true as const } : {}),
+      ...(error ? { error } : {}),
+    };
+  };
+
+  let out: CostAwareGateCompaction;
+  compactionInFlight = true;
+  try {
+    out = await runPass();
+  } catch (err) {
+    // Defensive: an unexpected throw must still release the interlock and flush, or the
+    // buffer keeps growing and every subsequent append goes to memory only.
+    out = { ...base, error: err instanceof Error ? err.message : String(err) };
+    log.warn('cost-aware-gate periodic compaction threw', { reason: out.error });
+  } finally {
+    // Drop the flag BEFORE the flush so the flush writes through instead of
+    // re-buffering itself.
+    compactionInFlight = false;
+  }
+  // A failed rewrite still flushes — those rows are already in the in-memory tally, and
+  // a buffered row that never reaches disk is the lost-write shape `durability` exists
+  // to make visible (TRA-1681).
+  const buffered = pendingAppends.splice(0, pendingAppends.length);
+  for (const line of buffered) appendRawLine(dir, line);
+  out = { ...out, bufferedAppendsFlushed: buffered.length };
+  lastCompaction = out;
+  timerCompactions += 1;
+  if (out.rewrote || out.error !== undefined || out.skipped !== undefined) {
+    log.info('cost-aware-gate ledger compacted (TRA-4904)', out as unknown as Record<string, unknown>);
+  }
+  return out;
 }
 
 // ── Health summary ───────────────────────────────────────────────────────────
@@ -1077,6 +1510,13 @@ export interface CostAwareGateSummary {
    * count off a multi-session window; see {@link CostAwareGateDurability}.
    */
   durability: CostAwareGateDurability;
+  /**
+   * TRA-4904 — the retention hook's configuration AND the outcome of its last run.
+   * `durability` above says whether a row reached disk; this says whether the rows that
+   * aged out ever LEAVE it. Read `compaction.timerCompactions` first — see
+   * {@link CostAwareGateCompactionState}.
+   */
+  compaction: CostAwareGateCompactionState;
   /**
    * TRA-2295 — WHICH `byStructure` KEY CARRIES THE SPREAD GATE. Read this before
    * concluding a sleeve is ungated.
@@ -1495,6 +1935,7 @@ export function summarizeCostAwareGate(
       appendErrors,
       lastAppendError,
     },
+    compaction: costAwareGateCompaction(),
     lastDecisionAt,
   };
 }
