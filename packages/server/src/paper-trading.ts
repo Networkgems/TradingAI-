@@ -31,7 +31,7 @@
 // open fill and one close fill per position id, at the original contract
 // count). Both bounds are documented here rather than silently absorbed.
 
-import { appendFile, mkdir } from 'fs/promises';
+import { mkdir } from 'fs/promises';
 import { existsSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { logger } from './observability/index.js';
@@ -47,6 +47,7 @@ import {
   DEFAULT_MARKETABLE_HALF_SPREAD_FRAC,
 } from './marketable-open-mtm.js';
 import { DEFAULT_COST_MODEL } from './options-cost-model.js';
+import { appendBoundedTapeLine } from './data-tape-bounds.js';
 
 const log = logger.child({ module: 'paper-trading' });
 
@@ -304,7 +305,7 @@ function append(row: PaperLedgerRow): void {
   writeQueue = writeQueue
     .then(async () => {
       await mkdir(dirname(file), { recursive: true });
-      await appendFile(file, `${JSON.stringify(row)}\n`, 'utf-8');
+      await appendBoundedTapeLine(file, `${JSON.stringify(row)}\n`);
     })
     .catch((err) => {
       log.warn('paper ledger append failed (row survives in memory this process)', {

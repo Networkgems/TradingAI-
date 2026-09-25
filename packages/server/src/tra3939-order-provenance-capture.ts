@@ -136,11 +136,12 @@
  * that day reads `fleetCaptured:false` and names `v0nni` in `missingAccounts`.
  */
 
-import { appendFileSync, mkdirSync, readFileSync } from 'fs';
+import { mkdirSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import type { TradierAccountOrder, TradierOrderSubmitEvent } from '@trading-app/engine';
 import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
+import { appendBoundedTapeLineSync } from './data-tape-bounds.js';
 
 const log = logger.child({ module: 'tra3939-order-provenance-capture' });
 
@@ -322,7 +323,7 @@ function appendLine(path: string, line: unknown): boolean {
     // exists / unwritable — the append below surfaces it
   }
   try {
-    appendFileSync(path, JSON.stringify(line) + '\n', 'utf8');
+    appendBoundedTapeLineSync(path, JSON.stringify(line) + '\n');
     return true;
   } catch (err) {
     lastSubmitAppendError = err instanceof Error ? err.message : String(err);

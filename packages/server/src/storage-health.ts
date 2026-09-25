@@ -68,6 +68,7 @@ import type { DiskReading } from './observability/alerts.js';
 import type { DataDirUsage } from './data-dir-usage.js';
 import { getDiskWatermark, type DiskWatermark } from './observability/disk-watermark.js'; // TRA-3011
 import { summarizeLedgerPools } from './close-ledger.js'; // TRA-4898
+import { dataTapeBoundsReport, type DataTapeBoundsReport } from './data-tape-bounds.js'; // TRA-4903
 
 /** `{ exists }` alone when the file is absent — never a fabricated zero size. */
 export interface FileStamp {
@@ -164,6 +165,12 @@ export interface StorageDiagnostic {
   userCount: number;
   userContextCount: number;
   processStart: string;
+  /**
+   * TRA-4903 — the byte ceiling now carried by each of the 27 `/data` tapes that
+   * had no bound of any kind, with the live fill fraction and refusal count.
+   * ADMIN-GATED only (it names files); never projected onto the liveness route.
+   */
+  tapeBounds: DataTapeBoundsReport;
 }
 
 /**
@@ -228,6 +235,12 @@ export const STORAGE_GATED_KEYS = [
   'userCount',
   'userContextCount',
   'processStart',
+  // TRA-4903 — the 27 tape ceilings. GATED, not liveness: every row names a file
+  // and carries its byte size, which is exactly the material TRA-2414 found
+  // leaking. The open route's `belowThreshold` verdict is unaffected — a breach
+  // here is a per-tape condition, not a volume one, and folding it into the
+  // public boolean would let an anonymous caller infer which tapes are hot.
+  'tapeBounds',
 ] as const;
 
 /** Gated `disk` keys — byte-level figures and the raw monitor run count. */
@@ -556,6 +569,18 @@ export async function buildStorageDiagnostic(
     userCount: deps.getUserCount(),
     userContextCount: deps.getUserContextCount(),
     processStart: deps.processStart(),
+    // TRA-4903 — the 27 tapes that had NO bound of any kind, and the byte ceiling
+    // each now carries. It rides the ADMIN-GATED detail payload and is deliberately
+    // NOT projected onto the open liveness route: it names files, which is the
+    // material TRA-2414 found leaking.
+    //
+    // Published as an OUTCOME (`bytes`, `fillPct`, `breached`) and not as the
+    // constants alone, because a ceiling that ships with its enforcement unwired
+    // reads identically to one that works — the TRA-3514 hole, where an off layer
+    // and a layer that found nothing both publish a zero. `bytes: null` means no
+    // append has been attempted through the seam this boot, which on a tape whose
+    // flag is off is the correct standing read and is NOT the same as 0.
+    tapeBounds: dataTapeBoundsReport(),
   };
 }
 

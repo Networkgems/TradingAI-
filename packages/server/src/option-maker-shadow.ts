@@ -1,10 +1,11 @@
-import { appendFile, readFile, mkdir } from 'fs/promises';
+import { readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { logger } from './observability/index.js';
 import { buildWalkLimits, derivePricingPath } from './tradier-smart-open.js';
 import type { MakerWalkConfig } from './option-maker-config.js';
 import { resolveDataDir } from './data-dir.js';
+import { appendBoundedTapeLine } from './data-tape-bounds.js';
 
 // TRA-1662 (TRA-1600 A2) — SHADOW maker-chase measurement. Observe-only.
 //
@@ -543,7 +544,7 @@ export async function recordShadowChase(
   const path = storeFile();
   const dir = dirname(path);
   if (!existsSync(dir)) await mkdir(dir, { recursive: true });
-  await appendFile(path, `${JSON.stringify(event)}\n`, 'utf-8');
+  await appendBoundedTapeLine(path, `${JSON.stringify(event)}\n`);
   return true;
 }
 

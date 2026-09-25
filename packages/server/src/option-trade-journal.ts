@@ -1,4 +1,4 @@
-import { appendFile, readFile, mkdir } from 'fs/promises';
+import { readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { deriveEntrySpreadPct } from '@trading-app/shared';
@@ -11,6 +11,7 @@ import { resolveDataDir } from './data-dir.js';
 // imports nothing back from this one at runtime, so no cycle.
 import { foldCrossedCells, foldSpreadCells } from './option-crossed-pnl.js';
 import type { CrossedFoldCells, SpreadFoldCells } from './option-crossed-pnl.js';
+import { appendBoundedTapeLine } from './data-tape-bounds.js';
 
 // TRA-990 (Learning A) — the option-trade JOURNAL: a durable, observe-only
 // setup -> outcome ledger for option positions (calls/puts, spreads and
@@ -2717,7 +2718,7 @@ async function appendLine(line: JournalLine): Promise<void> {
   const path = storeFile();
   const dir = dirname(path);
   if (!existsSync(dir)) await mkdir(dir, { recursive: true });
-  await appendFile(path, `${JSON.stringify(line)}\n`, 'utf-8');
+  await appendBoundedTapeLine(path, `${JSON.stringify(line)}\n`);
 }
 
 /** Eagerly load the journal so reads have data right after boot. */

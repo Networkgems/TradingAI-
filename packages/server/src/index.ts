@@ -167,6 +167,7 @@ import {
   onOptionTradeClose,
   type OptionTradeJournalRecord,
 } from './option-trade-journal.js';
+import { seedDataTapeBounds, DATA_TAPE_BOUNDS_TOTAL_BYTES } from './data-tape-bounds.js'; // TRA-4903
 import {
   hydrateExplorationAllowanceFromDisk,
   handleExplorationJournalClose,
@@ -4741,6 +4742,19 @@ async function runLiveRealizedCalendarBackfill(): Promise<void> {
 // DATA_DIR for appends. Same durability rationale as the ledgers above: the
 // TRA-4623 rule needs >=20 RTH desk sessions, which no since-boot counter can
 // span. Compacted to a 60-day window / 64MB (whole-oldest-day pruning) on boot.
+// TRA-4903 — seed the byte-ceiling size cache for the 27 previously-unbounded
+// `/data` tapes. Changes no file: a seal never rewrites, it refuses. Running it
+// up front means `/api/health/storage/detail` can answer "is this enforcement
+// wired in at all?" on a quiet box, before any tape has been appended to.
+{
+  const s = seedDataTapeBounds(DATA_DIR);
+  log.info('data tape byte ceilings seeded (TRA-4903)', {
+    tapes: s.seeded,
+    existingOnDisk: s.existing,
+    totalMaxBytes: DATA_TAPE_BOUNDS_TOTAL_BYTES,
+  });
+}
+
 {
   const h = hydrateOtmAdmissionTapeFromDisk(DATA_DIR);
   if (h.records > 0) {

@@ -90,13 +90,14 @@
  * TRA-3926 and TRA-3913. This establishes WHAT HAPPENED.
  */
 
-import { appendFileSync, mkdirSync, readFileSync } from 'fs';
+import { mkdirSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import type { TradierAccountOrder } from '@trading-app/engine';
 import type { LiveOptionFillRecord } from './live-options-fee-slippage-ledger.js';
 import type { OversoldCloseCensus } from './tra3926-oversold-close-detector.js';
 import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
+import { appendBoundedTapeLineSync } from './data-tape-bounds.js';
 
 const log = logger.child({ module: 'tra3932-open-leg-provenance' });
 
@@ -658,7 +659,7 @@ export function persistOpenLegProvenance(result: OpenLegProvenanceResult): {
     }
     const line: ProvenanceLine = { kind: 'resolution', row, reach: result.reach };
     try {
-      appendFileSync(path, JSON.stringify(line) + '\n', 'utf8');
+      appendBoundedTapeLineSync(path, JSON.stringify(line) + '\n');
       appended += 1;
     } catch (err) {
       appendErrors += 1;

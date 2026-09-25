@@ -234,10 +234,18 @@ belongs with TRA-4898's book-reap work, not here.
 
 ```bash
 TRADING_ADMIN_PASSWORD=… node scripts/tra4899-tape-census.mjs
-#   0 CLEAN · 1 UNCATALOGUED · 2 usage · 3 BLIND
+#   0 CLEAN · 1 UNCATALOGUED · 2 usage · 3 BLIND · 4 UNBOUNDED
 node scripts/tra4899-tape-census.mjs --offline   # policy table, no host
 node scripts/tra4899-tape-census.mjs --json
 ```
+
+> **TRA-4903 (2026-09-25) — the 27 uncapped tapes this document ranked are now bounded.**
+> They print as `SEALED` with a byte ceiling enforced on the write path, **248 MiB across all 27**,
+> and the census exits **UNBOUNDED (4)** if a new one ever appears. The bound is bytes rather than
+> time on all 27, because a central time prune corrupts these specific tapes four measured ways —
+> most sharply, it splits a supersede pair in a way that **biases the survivors toward fast
+> resolutions**. A seal also carries **no boot-overshoot premium**, unlike every cap in the AC4 table
+> below. See `docs/tra4903-tape-bounds.md`.
 
 Two guards, both of which have fired during development and are the reason the table can be
 trusted:
