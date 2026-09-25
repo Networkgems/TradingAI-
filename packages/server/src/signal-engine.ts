@@ -117,7 +117,7 @@ import {
   isPreTradeGateEnabled,
   recordPreTradeGateDecision,
 } from './pre-trade-gate-ledger.js';
-import { ivRankSync, ivPercentileSync, atmIvFromRows, recordDailyIv } from './iv-rank-store.js';
+import { ivRankSync, ivPercentileSync, atmIvFromRows, recordDailyIv, readIvRankCoverageSync } from './iv-rank-store.js';
 import type { SentimentIcBand } from './option-trade-journal.js';
 import { loadModelFacingJournalRows } from './model-facing-journal.js';
 import {
@@ -17562,7 +17562,13 @@ export class SignalEngine {
         // gate) — warms the store like TRA-1153, no extra per-symbol fetch.
         const atmIv = atmIvFromRows(snap.rows, snap.spot);
         if (atmIv != null) void recordDailyIv(sym, atmIv, asOf).catch(() => {});
-        const ivRank = atmIv != null ? ivRankSync(sym, atmIv, asOf) : null;
+        // TRA-4917 — ONE store read yields the rank AND the branch that produced
+        // it, so a null on `GET /api/health/short-premium` is attributable
+        // (`store_unloaded` / `no_atm_iv` / `uncovered` / `insufficient_history` /
+        // `flat_window`). Deliberately NOT `ivRankSync` plus a separate depth
+        // read: two reads can disagree about which window they saw, and the whole
+        // point is that the reason and the value describe the same window.
+        const ivReading = readIvRankCoverageSync(sym, atmIv, asOf);
         // TRA-2028 — the IV-PERCENTILE the wheel entry filter gates on, off the
         // SAME mid-mark ATM-IV surface. `markKind:'stale'` when no usable mid IV
         // this pass (fail-loud), so the filter never gates on a proxy.
@@ -17572,7 +17578,7 @@ export class SignalEngine {
         const result = scanShortPremiumFromSnapshot(
           { symbol: snap.symbol, spot: snap.spot, expiration: snap.expiration, rows: snap.rows },
           dailyCloses,
-          ivRank,
+          ivReading,
         );
         recordShortPremiumScan(result, asOf);
         if (routeWheel && isWheelUniverseSymbol(result.symbol)) {
@@ -17585,6 +17591,8 @@ export class SignalEngine {
             expiration: result.expiration,
             realizedVol: result.realizedVol,
             ivRank: result.ivRank,
+            ivRankCoverage: result.ivRankCoverage,
+            ivSampleDepth: result.ivSampleDepth,
             candidateCount: result.candidates.length,
             top: result.candidates[0]?.structure,
             topScore: result.candidates[0]?.score,

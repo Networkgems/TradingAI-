@@ -13,6 +13,9 @@ import {
   atmIvFromRows,
   setIvStoreFileForTests,
   MIN_IV_SAMPLES,
+  readIvRankCoverageSync,
+  isIvRankStoreLoaded,
+  IV_RANK_COVERAGE_CODES,
   type IvSample,
 } from './iv-rank-store.js';
 
@@ -136,5 +139,121 @@ describe('recordDailyIv + ivRankSync (disk-backed)', () => {
 
   it('ivPercentileSync returns null before the store is loaded', () => {
     expect(ivPercentileSync('AAA', 0.3)).toBeNull();
+  });
+});
+
+describe('readIvRankCoverageSync (TRA-4917) — the five null branches are separable', () => {
+  let dir: string;
+  const start = Date.parse('2025-06-01T00:00:00Z');
+  const asOf = start + (MIN_IV_SAMPLES + 4) * DAY;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'iv-cov-'));
+    setIvStoreFileForTests(join(dir, 'iv-history.json'));
+  });
+  afterEach(() => {
+    setIvStoreFileForTests(null);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function seed(symbol: string, ivs: number[]): Promise<void> {
+    for (let i = 0; i < ivs.length; i++) await recordDailyIv(symbol, ivs[i]!, start + i * DAY);
+  }
+  const ramp = (n: number): number[] => Array.from({ length: n }, (_, i) => 0.1 + i * 0.01);
+
+  it('an UNLOADED store reads store_unloaded, and depth is null — NOT 0', () => {
+    expect(isIvRankStoreLoaded()).toBe(false);
+    const r = readIvRankCoverageSync('AAA', 0.3, asOf);
+    expect(r.coverage).toBe('store_unloaded');
+    expect(r.ivRank).toBeNull();
+    // 0 would be a claim about the symbol; the honest answer is "unknown".
+    expect(r.ivSampleDepth).toBeNull();
+  });
+
+  it('no ATM IV reads no_atm_iv even when the store is deep — branch (a) vs (b)', async () => {
+    await seed('AAA', ramp(MIN_IV_SAMPLES));
+    await initIvRankStore();
+    const r = readIvRankCoverageSync('AAA', null, asOf);
+    expect(r.coverage).toBe('no_atm_iv');
+    expect(r.ivRank).toBeNull();
+    expect(r.atmIv).toBeNull();
+    // The depth is still REPORTED, which is what proves (a) and not (b).
+    expect(r.ivSampleDepth).toBe(MIN_IV_SAMPLES);
+  });
+
+  it('a non-finite / non-positive ATM IV is no_atm_iv, never ranked', async () => {
+    await seed('AAA', ramp(MIN_IV_SAMPLES));
+    await initIvRankStore();
+    for (const bad of [0, -0.2, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(readIvRankCoverageSync('AAA', bad, asOf).coverage).toBe('no_atm_iv');
+    }
+  });
+
+  it('an unknown symbol with ATM IV in hand reads uncovered (depth 0)', async () => {
+    await seed('AAA', ramp(MIN_IV_SAMPLES));
+    await initIvRankStore();
+    const r = readIvRankCoverageSync('ZZZ', 0.3, asOf);
+    expect(r.coverage).toBe('uncovered');
+    expect(r.ivSampleDepth).toBe(0);
+  });
+
+  it('one sample short of the floor reads insufficient_history; the floor itself covers', async () => {
+    await seed('THIN', ramp(MIN_IV_SAMPLES - 1));
+    await initIvRankStore();
+    const thin = readIvRankCoverageSync('THIN', 0.15, asOf);
+    expect(thin.coverage).toBe('insufficient_history');
+    expect(thin.ivSampleDepth).toBe(MIN_IV_SAMPLES - 1);
+    expect(thin.ivRank).toBeNull();
+
+    await seed('DEEP', ramp(MIN_IV_SAMPLES));
+    await initIvRankStore();
+    const deep = readIvRankCoverageSync('DEEP', 0.15, asOf);
+    expect(deep.coverage).toBe('covered');
+    expect(deep.ivSampleDepth).toBe(MIN_IV_SAMPLES);
+    expect(deep.ivRank).not.toBeNull();
+  });
+
+  it('a FLAT window at/above the floor reads flat_window, not insufficient_history', async () => {
+    await seed('FLAT', Array.from({ length: MIN_IV_SAMPLES + 3 }, () => 0.3));
+    await initIvRankStore();
+    const r = readIvRankCoverageSync('FLAT', 0.3, asOf);
+    expect(r.coverage).toBe('flat_window');
+    // The discriminator: depth CLEARS the floor, so "warm up and wait" is wrong here.
+    expect(r.ivSampleDepth).toBeGreaterThanOrEqual(MIN_IV_SAMPLES);
+    expect(r.ivRank).toBeNull();
+  });
+
+  it('samples aged out of the trailing window read uncovered, not covered', async () => {
+    await seed('OLD', ramp(MIN_IV_SAMPLES));
+    await initIvRankStore();
+    const wayLater = start + 800 * DAY; // past the 366d trailing window
+    const r = readIvRankCoverageSync('OLD', 0.15, wayLater);
+    expect(r.coverage).toBe('uncovered');
+    expect(r.ivSampleDepth).toBe(0);
+  });
+
+  it('the rank it reports is byte-identical to the one ivRankSync gates on', async () => {
+    await seed('AAA', ramp(MIN_IV_SAMPLES));
+    await initIvRankStore();
+    for (const iv of [0.1, 0.15, 0.29, 0.4]) {
+      expect(readIvRankCoverageSync('AAA', iv, asOf).ivRank).toBe(ivRankSync('AAA', iv, asOf));
+    }
+  });
+
+  it('every code the classifier can emit is in the published vocabulary', async () => {
+    await seed('AAA', ramp(MIN_IV_SAMPLES));
+    await seed('THIN', ramp(3));
+    await seed('FLAT', Array.from({ length: MIN_IV_SAMPLES }, () => 0.3));
+    await initIvRankStore();
+    const emitted = new Set([
+      readIvRankCoverageSync('AAA', 0.15, asOf).coverage,
+      readIvRankCoverageSync('AAA', null, asOf).coverage,
+      readIvRankCoverageSync('ZZZ', 0.3, asOf).coverage,
+      readIvRankCoverageSync('THIN', 0.15, asOf).coverage,
+      readIvRankCoverageSync('FLAT', 0.3, asOf).coverage,
+    ]);
+    // Five distinct codes — if any two branches collapsed, this set would shrink.
+    expect(emitted.size).toBe(5);
+    for (const code of emitted) expect(IV_RANK_COVERAGE_CODES).toContain(code);
   });
 });
