@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'fs';
-import { mkdir, writeFile, readFile, readdir } from 'fs/promises';
+import { mkdir, writeFile, readFile, readdir, utimes } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { assessLevelContinuity } from '@trading-app/shared';
@@ -573,7 +573,7 @@ describe('TRA-4898 — the live book is last in the eviction queue, not second',
   it('the comparator itself: non-live before live, then date, then path', () => {
     const f = (book: string, mode: string, name: string) => ({
       path: `/users/${book}/reports/${mode}/closes/${name}`,
-      name, size: 1, book, root: 'reports', mode, live: mode === 'live',
+      name, size: 1, book, root: 'reports', mode, live: mode === 'live', mtimeMs: 0, digest: null,
     });
     const sorted = [
       f('admin', 'live', '2020-01-01.json'),
@@ -620,6 +620,92 @@ describe('TRA-4898 — the live book is last in the eviction queue, not second',
     // Pools stay separate here too, and nothing was deleted by measuring.
     expect(s.dirs.tape.bytes).toBe(700);
     expect(await names('admin', 'live')).toEqual(['2026-01-01.json']);
+  });
+
+  // TRA-4902 — the three axes a reap predicate has to cross. Name pattern is
+  // the caller's business; these are the two the box has to supply, plus the
+  // fill rate that says whether deleting anything is durable.
+  it('TRA-4902 — the census carries registry membership, and an absent roster is NOT "orphaned"', async () => {
+    await plant('qa_alpha', 'demo', '2026-06-01');
+    await plant('ghost', 'demo', '2026-06-01');
+
+    // Roster supplied: `ghost` has no entry, `qa_alpha` does.
+    const asserted = await summarizeLedgerPools({
+      usersRoot: usersRoot(), registryBooks: ['qa_alpha', 'someone_with_no_tree'],
+    });
+    expect(asserted.dirs.closes.books.map((b) => [b.book, b.inRegistry]).sort())
+      .toEqual([['ghost', false], ['qa_alpha', true]]);
+
+    // Roster withheld: every row reads `null`. A caller that cannot see the
+    // registry must not be handed `false`, which is the reading that argues
+    // for deletion.
+    const unasserted = await summarizeLedgerPools({ usersRoot: usersRoot() });
+    expect(unasserted.dirs.closes.books.every((b) => b.inRegistry === null)).toBe(true);
+    // Explicit null is the same abstention as omitting it.
+    const nulled = await summarizeLedgerPools({ usersRoot: usersRoot(), registryBooks: null });
+    expect(nulled.dirs.closes.books.every((b) => b.inRegistry === null)).toBe(true);
+  });
+
+  it('TRA-4902 — `newestMtime` is the MAX mtime, not the last file in eviction order', async () => {
+    // Eviction order is (non-live, date, path), so the LAST file this row's
+    // loop visits is its NEWEST DATE — which is not the newest write. Plant
+    // the fresh mtime on the OLDER date to make the two disagree.
+    const older = await plant('qa_alpha', 'demo', '2026-06-01');
+    const newer = await plant('qa_alpha', 'demo', '2026-06-09');
+    // BOTH get an explicit mtime: a freshly written file's real mtime is
+    // `now`, which would dominate the max and make this pass for the wrong
+    // reason.
+    await utimes(older, new Date('2026-07-01T00:00:00Z'), new Date('2026-07-01T00:00:00Z'));
+    await utimes(newer, new Date('2026-06-09T00:00:00Z'), new Date('2026-06-09T00:00:00Z'));
+
+    const s = await summarizeLedgerPools({ usersRoot: usersRoot() });
+    const row = s.dirs.closes.books.find((b) => b.book === 'qa_alpha')!;
+    // The filename axis and the mtime axis are reported separately and DO
+    // disagree here. A predicate that reads only one of them is guessing.
+    expect(row.newest).toBe('2026-06-09.json');
+    expect(row.newestMtime).toBe('2026-07-01T00:00:00.000Z');
+  });
+
+  it('TRA-4902 — `contentDigest` collapses books holding identical ledgers, and is opt-in', async () => {
+    // Two QA books written the same empty-book ledger, one real book that
+    // actually traded. Same dates, same sizes for the first two.
+    for (const book of ['qa_alpha', 'qa_beta']) {
+      await plant(book, 'demo', '2026-06-01', 0);
+      await plant(book, 'demo', '2026-06-02', 0);
+      await writeFile(join(usersRoot(), book, 'reports/demo/closes/2026-06-01.json'), '{"rows":[]}', 'utf-8');
+      await writeFile(join(usersRoot(), book, 'reports/demo/closes/2026-06-02.json'), '{"rows":[]}', 'utf-8');
+    }
+    await plant('enock', 'demo', '2026-06-01', 0);
+    await writeFile(join(usersRoot(), 'enock', 'reports/demo/closes/2026-06-01.json'), '{"rows":[1]}', 'utf-8');
+
+    const s = await summarizeLedgerPools({ usersRoot: usersRoot(), withDigests: true });
+    const dig = (b: string) => s.dirs.closes.books.find((x) => x.book === b)!.contentDigest;
+    // The two QA books are ONE equivalence class: the pool holds their shared
+    // ledger twice. That is the reap argument, and no name pattern makes it.
+    expect(dig('qa_alpha')).toBe(dig('qa_beta'));
+    expect(dig('qa_alpha')).not.toBeNull();
+    // The book that actually traded is its own class, and would survive a
+    // digest-driven reap even though it is only one file.
+    expect(dig('enock')).not.toBe(dig('qa_alpha'));
+
+    // Opt-in: the default walk never reads a file body.
+    const cheap = await summarizeLedgerPools({ usersRoot: usersRoot() });
+    expect(cheap.dirs.closes.books.every((b) => b.contentDigest === null)).toBe(true);
+  });
+
+  it('TRA-4902 — `byDate` reports the fill rate, oldest date first', async () => {
+    await plant('qa_alpha', 'demo', '2026-06-02', 1000);
+    await plant('qa_beta', 'demo', '2026-06-02', 1500);
+    await plant('qa_alpha', 'demo', '2026-06-01', 400);
+    await plant('qa_alpha', 'demo', '2026-06-03', 900, 'tape');
+
+    const s = await summarizeLedgerPools({ usersRoot: usersRoot() });
+    expect(s.dirs.closes.byDate).toEqual([
+      { date: '2026-06-01', bytes: 400, files: 1 },
+      { date: '2026-06-02', bytes: 2500, files: 2 },
+    ]);
+    // Per-pool, like every other figure here.
+    expect(s.dirs.tape.byDate).toEqual([{ date: '2026-06-03', bytes: 900, files: 1 }]);
   });
 
   it('the census never throws on an absent root, and reports the live ceilings', async () => {

@@ -317,6 +317,12 @@ export interface StorageHealthDeps {
   dataDirEnv: () => string | null;
   getUserCount: () => number;
   getUserContextCount: () => number;
+  /**
+   * TRA-4902 — the `users.json` roster, for the ledger census's `inRegistry`
+   * column. Optional: an unwired caller leaves the column `null`, which reads
+   * as "not asserted" rather than as "orphaned".
+   */
+  getRegistryBooks?: () => readonly string[];
   diskMinFreePct: () => number;
   readDiskSpace: (path: string) => Promise<DiskReading | null>;
   /**
@@ -587,7 +593,16 @@ export function registerStorageHealthRoutes(app: Express, deps: StorageHealthDep
   // books' `2026-09-24.json` collapse into one row. Read-only — it stats the
   // same population `enforceAggregateLedgerBudget` would evict from, and
   // deletes nothing.
-  app.get(STORAGE_LEDGER_ROUTE, deps.requireAuth, deps.requireAdmin, async (_req, res) => {
-    res.json(await summarizeLedgerPools({ usersRoot: join(deps.dataDir, 'users') }));
+  app.get(STORAGE_LEDGER_ROUTE, deps.requireAuth, deps.requireAdmin, async (req, res) => {
+    res.json(
+      await summarizeLedgerPools({
+        usersRoot: join(deps.dataDir, 'users'),
+        registryBooks: deps.getRegistryBooks?.() ?? null,
+        // TRA-4902 — OPT-IN, because it reads every byte of the pool rather
+        // than stat()ing it. The default stays the cheap walk so that adding
+        // the reap evidence did not quietly make the census route expensive.
+        withDigests: req.query['digests'] === '1',
+      }),
+    );
   });
 }

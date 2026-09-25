@@ -8412,6 +8412,9 @@ registerStorageHealthRoutes(app, {
   dataDirEnv: () => process.env['DATA_DIR'] ?? null,
   getUserCount: () => getAllUsers().length,
   getUserContextCount: () => getAllUserContexts().length,
+  // TRA-4902 — the same roster the EOD archive iterates, so the ledger census
+  // can say whether a book's bytes are being REPLACED every session.
+  getRegistryBooks: () => getAllUsers().map((u) => u.username),
   diskMinFreePct,
   readDiskSpace,
   dataDirUsage: (root) => dataDirUsageCached(root),

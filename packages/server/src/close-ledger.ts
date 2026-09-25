@@ -141,6 +141,7 @@
  */
 
 import { writeFile, readFile, readdir, unlink, mkdir, stat } from 'fs/promises';
+import { createHash } from 'crypto';
 import { join } from 'path';
 import { isMoveSuspect } from '@trading-app/shared';
 import { isMarketDayIso } from './scheduler.js';
@@ -603,6 +604,15 @@ export interface LedgerPoolFile {
   root: string;
   mode: string;
   live: boolean;
+  /**
+   * Last-write time. TRA-4902 needs it because the FILENAME date is not
+   * evidence of when a book was last active: it is the session the file
+   * describes, and the EOD archive writes one per book per session for every
+   * book in the roster. The two axes disagreeing is itself the finding.
+   */
+  mtimeMs: number;
+  /** {@link fileDigest}, or `null` when digests were not requested. */
+  digest: string | null;
 }
 
 /**
@@ -640,6 +650,24 @@ export function compareLedgerEviction(a: LedgerPoolFile, b: LedgerPoolFile): num
 const LEDGER_POOL_FILE_RE = /^\d{4}-\d{2}-\d{2}(?:\.orphan\d+)?\.json$/;
 
 /**
+ * Content hash of one pool file, truncated. `null` if it cannot be read.
+ *
+ * TRA-4902 — the axis that actually discriminates a dead book. Name pattern is
+ * a convention, mtime and session date are both stamped by the nightly archive
+ * for every book in the roster whether or not it traded. Content is the thing
+ * a reap destroys, so content is what the decision should be denominated in:
+ * two books whose ledgers hash the same hold the same information, and
+ * whatever that information is, the second copy of it is not evidence.
+ */
+async function fileDigest(path: string): Promise<string | null> {
+  try {
+    return createHash('sha256').update(await readFile(path)).digest('hex').slice(0, 16);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Stat every file in every budget pool, once.
  *
  * Extracted from {@link enforceAggregateLedgerBudget} on TRA-4898 so that the
@@ -650,7 +678,7 @@ const LEDGER_POOL_FILE_RE = /^\d{4}-\d{2}-\d{2}(?:\.orphan\d+)?\.json$/;
  *
  * NEVER THROWS; an unreadable directory contributes nothing.
  */
-async function scanLedgerPools(usersRoot: string): Promise<{
+async function scanLedgerPools(usersRoot: string, withDigests = false): Promise<{
   filesByKind: Record<string, LedgerPoolFile[]>;
   totals: Record<string, number>;
 }> {
@@ -688,6 +716,8 @@ async function scanLedgerPools(usersRoot: string): Promise<{
           root: bucketDir.root,
           mode: bucketDir.mode,
           live: bucketDir.live,
+          mtimeMs: st.mtimeMs,
+          digest: withDigests ? await fileDigest(join(dir, name)) : null,
         });
         totals[kind] += st.size;
       } catch {
@@ -712,6 +742,40 @@ export interface LedgerPoolBookRow {
   newest: string;
   /** 1-based position of this row's FIRST file in the eviction queue. */
   evictionRank: number;
+  /**
+   * TRA-4902 — the LAST WRITE to this row, as an mtime, independent of the
+   * session dates in `oldest`/`newest`.
+   *
+   * These are two different questions and a reap predicate needs both. The
+   * filename says which session a file describes; the mtime says when the box
+   * last touched it. A book that stopped trading but is still in the roster
+   * keeps acquiring fresh files of both kinds, so `newest` alone cannot find a
+   * dead book — and a restore would move every mtime to one instant while
+   * leaving the filenames alone, which is the inverse failure. Publish both.
+   */
+  newestMtime: string;
+  /**
+   * Does this book directory answer to an entry in the `users.json` roster?
+   * `null` when no roster was supplied (the caller declined to assert).
+   *
+   * ⚠️ Read this as evidence of LIFE, not of death. `bookReportRoots`
+   * (TRA-3064) found three quarters of the trees on this volume orphaned, and
+   * that fact is what `ledgerBudgetDirs` is denominated in directories for —
+   * but it is a statement about THAT population at THAT time, not a standing
+   * property of the volume. A registered book is one the EOD archive iterates
+   * every session, so deleting its files reclaims nothing durable.
+   */
+  inRegistry: boolean | null;
+  /**
+   * TRA-4902 — a hash over this row's `<date> -> content digest` pairs, so two
+   * rows holding the SAME ledger content share a value. `null` when digests
+   * were not requested.
+   *
+   * The point is the equivalence classes, not the hash. If N books' ledgers
+   * collapse to one digest, the pool is storing one book's information N
+   * times, and that is an argument no name convention can make.
+   */
+  contentDigest: string | null;
 }
 
 /** A read-only census of the budget pools, per book. TRA-4898 AC4. */
@@ -730,6 +794,13 @@ export interface LedgerPoolSummary {
       books: LedgerPoolBookRow[];
       /** The next files this pool would unlink, in order, capped. */
       nextToEvict: Array<{ book: string; root: string; mode: string; name: string; bytes: number }>;
+      /**
+       * TRA-4902 — bytes and files per SESSION DATE, oldest first. This is the
+       * pool's fill RATE, and it is the number that decides whether a reap is
+       * a fix or a delay: a one-off delete that frees N MiB buys
+       * `N / bytesPerDay` days and nothing more if the writers survive it.
+       */
+      byDate: Array<{ date: string; bytes: number; files: number }>;
     }
   >;
 }
@@ -751,19 +822,37 @@ export async function summarizeLedgerPools(args: {
   limits?: Partial<Record<(typeof LEDGER_BUDGET_DIRS)[number], number>>;
   /** Files listed in `nextToEvict`. */
   evictionPreview?: number;
+  /**
+   * The `users.json` roster, for {@link LedgerPoolBookRow.inRegistry}. Omit to
+   * leave every row's membership `null` rather than guessing — an absent
+   * roster must not read as "orphaned", which is the direction that gets data
+   * deleted.
+   */
+  registryBooks?: readonly string[] | null;
+  /**
+   * Hash every file's CONTENT, for {@link LedgerPoolBookRow.contentDigest}.
+   * Off by default: it turns a `stat()` walk into a full read of every file in
+   * the pool (~900 files / ~37 MiB on bqb1), which is fine for an operator
+   * asking a one-off question and not fine for a health route's default path.
+   */
+  withDigests?: boolean;
   now?: () => number;
 }): Promise<LedgerPoolSummary> {
   const previewN = args.evictionPreview ?? 10;
+  const registry = args.registryBooks == null ? null : new Set(args.registryBooks);
   const dirs: LedgerPoolSummary['dirs'] = {};
   let filesByKind: Record<string, LedgerPoolFile[]> = {};
   try {
-    ({ filesByKind } = await scanLedgerPools(args.usersRoot));
+    ({ filesByKind } = await scanLedgerPools(args.usersRoot, args.withDigests === true));
   } catch {
     filesByKind = {};
   }
   for (const kind of LEDGER_BUDGET_DIRS) {
     const files = (filesByKind[kind] ?? []).slice().sort(compareLedgerEviction);
     const byBook = new Map<string, LedgerPoolBookRow>();
+    const byDate = new Map<string, { date: string; bytes: number; files: number }>();
+    /** `<name>:<digest>` pairs per row, folded into `contentDigest` below. */
+    const digestParts = new Map<string, string[]>();
     let bytes = 0;
     let liveBytes = 0;
     let liveFiles = 0;
@@ -773,21 +862,50 @@ export async function summarizeLedgerPools(args: {
         liveBytes += f.size;
         liveFiles += 1;
       }
+      // `YYYY-MM-DD` off the front of the name — orphan files are
+      // `<date>.orphanN.json`, so slicing beats splitting on `.`.
+      const date = f.name.slice(0, 10);
+      const dRow = byDate.get(date);
+      if (dRow == null) byDate.set(date, { date, bytes: f.size, files: 1 });
+      else {
+        dRow.bytes += f.size;
+        dRow.files += 1;
+      }
       const key = bookModeKey(f);
+      if (f.digest != null) {
+        const parts = digestParts.get(key);
+        if (parts == null) digestParts.set(key, [`${f.name}:${f.digest}`]);
+        else parts.push(`${f.name}:${f.digest}`);
+      }
       const row = byBook.get(key);
       if (row == null) {
         byBook.set(key, {
           book: f.book, root: f.root, mode: f.mode, live: f.live,
           files: 1, bytes: f.size, oldest: f.name, newest: f.name,
           evictionRank: i + 1,
+          newestMtime: new Date(f.mtimeMs).toISOString(),
+          inRegistry: registry == null ? null : registry.has(f.book),
+          contentDigest: null, // folded in after the walk, once all parts are known
         });
       } else {
         row.files += 1;
         row.bytes += f.size;
         if (f.name < row.oldest) row.oldest = f.name;
         if (f.name > row.newest) row.newest = f.name;
+        // MAX, not last-seen: `files` is in EVICTION order (non-live, then
+        // date), which is not mtime order.
+        if (f.mtimeMs > Date.parse(row.newestMtime)) row.newestMtime = new Date(f.mtimeMs).toISOString();
       }
     });
+    // SORTED before folding: two books that hold the same ledger must produce
+    // the same digest, and they are not guaranteed to be walked in the same
+    // order (the eviction sort ties on full path, which embeds the book name).
+    for (const [key, parts] of digestParts) {
+      const row = byBook.get(key);
+      if (row != null) {
+        row.contentDigest = createHash('sha256').update(parts.sort().join('|')).digest('hex').slice(0, 16);
+      }
+    }
     dirs[kind] = {
       maxBytes: args.limits?.[kind] ?? LEDGER_BUDGET_LIMITS[kind],
       bytes,
@@ -798,6 +916,7 @@ export async function summarizeLedgerPools(args: {
       nextToEvict: files.slice(0, previewN).map((f) => ({
         book: f.book, root: f.root, mode: f.mode, name: f.name, bytes: f.size,
       })),
+      byDate: [...byDate.values()].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0)),
     };
   }
   return {
