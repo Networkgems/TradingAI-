@@ -902,6 +902,7 @@ watch:
 | Symptom | Action |
 |---|---|
 | `disk-near-full` alert; `health/storage` shows `disk.belowThreshold: true` (byte figures on `health/storage/detail`, admin) | Prune old option-chain caches; attach a larger volume / raise free space on the `DATA_DIR` disk. |
+| A `TRA-4156 per-directory ledger budget exceeded` warn, or you need to know WHOSE ledger bytes those are | `GET /api/health/storage/ledger` (admin, TRA-4898) — per-book×mode bytes for the `closes/` and `tape/` pools, plus the next files in the eviction queue. `storage/detail` cannot answer this: it aggregates by basename pattern, so every book's `<date>.json` collapses into one row. `reports/live/` is evicted LAST; a `TRA-4898 a REAL-MONEY (live) ledger file was evicted` warn means the pool held no non-live file at all and the remedy is capacity or a reap, not a re-ordering. |
 | Tick loop lagging / high memory under user growth | Move the process to a larger machine — vertical scale only. |
 | Need true HA / horizontal scale | Larger effort: extract engine state to shared storage and add a message bus. Not supported today; scope as a project. |
 
