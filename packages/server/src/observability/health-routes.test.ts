@@ -1970,11 +1970,13 @@ describe('TRA-1602 cost-aware fire-bar health route', () => {
     expect(body.armed).toBe(false); // no env flag set in the test process
     expect(body.demoOnly).toBe(true);
     expect(body.liveCapitalReachable).toBe(false);
-    // TRA-1661 — the options bar off the MEASURED spread cross: commission 0.05 +
-    // spread 0.235 (TRA-1656) + margin 0.20 = 0.485R, clear of the 0.30 floor.
-    // Was 1.25R against the refuted 1.00R modeled cross.
-    expect(body.bars['single_leg_rv']).toBeCloseTo(0.485, 3);
-    expect(body.bars['single_leg_otm']).toBeCloseTo(0.485, 3);
+    // TRA-1661 — the options bar off the MEASURED spread cross, now with a
+    // MEASURED commission too (TRA-4890): commission 0.0036 + spread 0.235
+    // (TRA-1656) + margin 0.20 = 0.4386R, clear of the 0.30 floor. Was 0.485R
+    // against the conservative 0.05 commission stand-in, and 1.25R before that
+    // against the refuted 1.00R modeled cross.
+    expect(body.bars['single_leg_rv']).toBeCloseTo(0.4386, 3);
+    expect(body.bars['single_leg_otm']).toBeCloseTo(0.4386, 3);
     expect(body.admittedTotal).toBe(0);
     expect(body.rejectedTotal).toBe(0);
   });
@@ -3043,7 +3045,10 @@ describe('GET /api/health/option-spread-cost (TRA-1656)', () => {
     // "measurement vs phantom" but "measurement vs the input it produced". Pinning
     // the shipped input here is what makes a silent revert to 1.00R fail a test.
     expect(body.modeledInput.makerAdjustedSpreadCrossR).toBe(0.235);
-    expect(body.modeledInput.barR).toBeCloseTo(0.485, 3);
+    // TRA-4890 retuned commission 0.05 → 0.0036, so the shipped bar is 0.4386.
+    // (The route publishes `commissionR` at runtime but does not declare it on
+    // this payload's type, so the bar is the typed handle on that retune here.)
+    expect(body.modeledInput.barR).toBeCloseTo(0.4386, 3);
     // impliedBarR is re-derived from the MEASUREMENT (measured commission + measured
     // cross + margin), not from the config's cost inputs — that independence is the
     // whole point of the probe, and is what lets it re-falsify the gate if the two
@@ -6202,7 +6207,7 @@ describe('GET /api/health/live-enforce-gates (TRA-3216)', () => {
   it('publishes the bar composition, so a floor-pinned bar is not re-derived by hand', () => {
     const body = serve();
     expect(body.arm.costBar.bar).toMatchObject({ barPinnedByFloor: false, dominantTerm: 'spread_cross' });
-    expect(body.arm.costBar.bar.barR).toBeCloseTo(0.485, 10);
+    expect(body.arm.costBar.bar.barR).toBeCloseTo(0.4386, 10);
   });
 
   it('surfaces the universe rejects with the NAME, the reason split and the BOOK', () => {
