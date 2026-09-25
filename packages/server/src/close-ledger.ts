@@ -520,6 +520,35 @@ export function resetAggregateLedgerSweepMemo(): void {
 }
 
 /**
+ * The mode sub-directory that holds REAL MONEY.
+ *
+ * TRA-4898 keys the eviction reservation on the MODE, not on the book name.
+ * `admin` is merely today's name of the real-money book — it is registry state,
+ * and `ledgerBudgetDirs` is deliberately denominated in directories on disk
+ * precisely because that registry is not trustworthy here (TRA-3064). `live/`
+ * is a property of the artifact itself: whatever book wrote it, a file under
+ * `reports/live/` records orders that could have been sent to a production
+ * broker. Reserving every book's `live/` is also the conservative direction —
+ * per-user Tradier credentials already reach the live close path (TRA-3925), so
+ * `admin` is not provably the only real-money book on the volume.
+ */
+export const REAL_MONEY_MODE_DIR = 'live';
+
+/** One ledger/tape directory, with the provenance its path encodes. */
+interface LedgerBudgetDir {
+  path: string;
+  kind: (typeof LEDGER_BUDGET_DIRS)[number];
+  /** Book directory name under `usersRoot` (NOT a registry lookup). */
+  book: string;
+  /** `reports` | `crypto-reports`. */
+  root: string;
+  /** `live` | `demo` | `sandbox` | whatever else is on disk. */
+  mode: string;
+  /** `mode === 'live'` — see {@link REAL_MONEY_MODE_DIR}. */
+  live: boolean;
+}
+
+/**
  * Enumerate every ledger/tape directory under `usersRoot`.
  *
  * Denominated in DIRECTORIES ON DISK, not in registry entries, for the reason
@@ -528,10 +557,8 @@ export function resetAggregateLedgerSweepMemo(): void {
  * would silently scope itself to the shrinking half of the problem while
  * reporting a clean run.
  */
-async function ledgerBudgetDirs(
-  usersRoot: string,
-): Promise<Array<{ path: string; kind: (typeof LEDGER_BUDGET_DIRS)[number] }>> {
-  const out: Array<{ path: string; kind: (typeof LEDGER_BUDGET_DIRS)[number] }> = [];
+async function ledgerBudgetDirs(usersRoot: string): Promise<LedgerBudgetDir[]> {
+  const out: LedgerBudgetDir[] = [];
   let books: Array<{ name: string; isDirectory(): boolean }>;
   try {
     books = await readdir(usersRoot, { withFileTypes: true });
@@ -551,12 +578,241 @@ async function ledgerBudgetDirs(
       for (const mode of modes) {
         if (!mode.isDirectory()) continue;
         for (const sub of LEDGER_BUDGET_DIRS) {
-          out.push({ path: join(rootPath, mode.name, sub), kind: sub });
+          out.push({
+            path: join(rootPath, mode.name, sub),
+            kind: sub,
+            book: book.name,
+            root,
+            mode: mode.name,
+            live: mode.name === REAL_MONEY_MODE_DIR,
+          });
         }
       }
     }
   }
   return out;
+}
+
+/** One candidate file in a budget pool, with the provenance of its directory. */
+export interface LedgerPoolFile {
+  path: string;
+  /** Bare filename — `YYYY-MM-DD.json`, so lexical order IS date order. */
+  name: string;
+  size: number;
+  book: string;
+  root: string;
+  mode: string;
+  live: boolean;
+}
+
+/**
+ * Eviction order within one pool: **NON-LIVE FIRST, then oldest date, then
+ * path**. Lowest sorts first and is unlinked first.
+ *
+ * TRA-4898. Before this the comparator was `(date, path)` only, pooled across
+ * all 68 books — and since the tie-break is a plain string compare on the full
+ * path, `admin` (the real-money book) sorted **2nd of 68**, ahead of all 66
+ * QA/demo books. For the oldest date present, the sweep would have unlinked the
+ * live book's session second while ~60 dead `ctoverify_*` / `qa_*` / `qtverify_*`
+ * books kept theirs.
+ *
+ * The reservation is expressed as an ORDERING rather than as a carve-out of
+ * bytes, and that choice is load-bearing in two directions:
+ *
+ * - It cannot deadlock the budget. A reserved *quota* whose protected class
+ *   alone exceeds the ceiling would leave the sweep with nothing it is allowed
+ *   to delete and the pool permanently over cap — silently, since the overage
+ *   is logged the same way every day. Ordering degrades instead: when the last
+ *   non-live file is gone the live files start paying, oldest-first, and the
+ *   ceiling still holds. That path emits its own warn (see below) because it
+ *   means the volume, not the ordering, is the problem.
+ * - It changes WHO pays, never HOW MUCH is kept. Total bytes after a sweep are
+ *   identical to Phase 1's, so this cannot grow the footprint — which is the
+ *   out-of-scope line CFO drew on TRA-4156 Phase 2 (no increase to the 64 MiB).
+ */
+export function compareLedgerEviction(a: LedgerPoolFile, b: LedgerPoolFile): number {
+  if (a.live !== b.live) return a.live ? 1 : -1;
+  if (a.name !== b.name) return a.name < b.name ? -1 : 1;
+  return a.path < b.path ? -1 : 1;
+}
+
+/** `<date>.json`, plus leg 2's `<date>.orphanN.json`. Both occupy the pool. */
+const LEDGER_POOL_FILE_RE = /^\d{4}-\d{2}-\d{2}(?:\.orphan\d+)?\.json$/;
+
+/**
+ * Stat every file in every budget pool, once.
+ *
+ * Extracted from {@link enforceAggregateLedgerBudget} on TRA-4898 so that the
+ * read-only measurement surface ({@link summarizeLedgerPools}) reports the
+ * population the SWEEP would act on, rather than a second walk that could drift
+ * from it — the pattern `check:deploy-build` follows for the same reason: a
+ * grader that re-implements its subject eventually grades something else.
+ *
+ * NEVER THROWS; an unreadable directory contributes nothing.
+ */
+async function scanLedgerPools(usersRoot: string): Promise<{
+  filesByKind: Record<string, LedgerPoolFile[]>;
+  totals: Record<string, number>;
+}> {
+  const filesByKind: Record<string, LedgerPoolFile[]> = {};
+  const totals: Record<string, number> = {};
+  for (const kind of LEDGER_BUDGET_DIRS) {
+    filesByKind[kind] = [];
+    totals[kind] = 0;
+  }
+  for (const bucketDir of await ledgerBudgetDirs(usersRoot)) {
+    const { path: dir, kind } = bucketDir;
+    let names: string[];
+    try {
+      names = await readdir(dir);
+    } catch {
+      // An absent `closes/` or `tape/` is the ordinary case for a book that
+      // has not archived yet. Not an error, and not a reason to abort the
+      // pool: a sweep that gave up on the first missing directory would
+      // under-count the total and report a budget it never measured.
+      continue;
+    }
+    for (const name of names) {
+      // Leg 2's orphan files (`<date>.orphanN.json`) count too — they occupy
+      // the same pool, and TRA-3116 already counts them against leg 2's own
+      // retention for the same reason.
+      if (!LEDGER_POOL_FILE_RE.test(name)) continue;
+      try {
+        const st = await stat(join(dir, name));
+        if (!st.isFile()) continue;
+        filesByKind[kind].push({
+          path: join(dir, name),
+          name,
+          size: st.size,
+          book: bucketDir.book,
+          root: bucketDir.root,
+          mode: bucketDir.mode,
+          live: bucketDir.live,
+        });
+        totals[kind] += st.size;
+      } catch {
+        // Vanished between readdir and stat (a concurrent prune). It is not
+        // in the pool, so it is not in the total either.
+      }
+    }
+  }
+  return { filesByKind, totals };
+}
+
+/** One book×root×mode's occupancy of one budget pool. */
+export interface LedgerPoolBookRow {
+  book: string;
+  root: string;
+  mode: string;
+  live: boolean;
+  files: number;
+  bytes: number;
+  /** Oldest / newest session date held, by filename. `null` never occurs here. */
+  oldest: string;
+  newest: string;
+  /** 1-based position of this row's FIRST file in the eviction queue. */
+  evictionRank: number;
+}
+
+/** A read-only census of the budget pools, per book. TRA-4898 AC4. */
+export interface LedgerPoolSummary {
+  usersRoot: string;
+  measuredAt: string;
+  dirs: Record<
+    string,
+    {
+      maxBytes: number;
+      bytes: number;
+      files: number;
+      /** Bytes/files held under `reports/live/` — the reserved class. */
+      liveBytes: number;
+      liveFiles: number;
+      books: LedgerPoolBookRow[];
+      /** The next files this pool would unlink, in order, capped. */
+      nextToEvict: Array<{ book: string; root: string; mode: string; name: string; bytes: number }>;
+    }
+  >;
+}
+
+/**
+ * Measure each budget pool per book, WITHOUT deleting anything.
+ *
+ * TRA-4898 AC4 asks how much of `closes/` belongs to the ~60 dead QA books, and
+ * nothing on the box could answer it: `/api/health/storage/detail` aggregates by
+ * BASENAME PATTERN, deliberately (`data-dir-usage.ts`: "patterns, not paths"),
+ * so every book's `2026-09-24.json` lands in one bucket. That is the right call
+ * for a route that leaks paths; it is also why the ask needed a surface of its
+ * own rather than a re-read of an existing one.
+ *
+ * Pure read — no unlink, no write, no network. NEVER THROWS.
+ */
+export async function summarizeLedgerPools(args: {
+  usersRoot: string;
+  limits?: Partial<Record<(typeof LEDGER_BUDGET_DIRS)[number], number>>;
+  /** Files listed in `nextToEvict`. */
+  evictionPreview?: number;
+  now?: () => number;
+}): Promise<LedgerPoolSummary> {
+  const previewN = args.evictionPreview ?? 10;
+  const dirs: LedgerPoolSummary['dirs'] = {};
+  let filesByKind: Record<string, LedgerPoolFile[]> = {};
+  try {
+    ({ filesByKind } = await scanLedgerPools(args.usersRoot));
+  } catch {
+    filesByKind = {};
+  }
+  for (const kind of LEDGER_BUDGET_DIRS) {
+    const files = (filesByKind[kind] ?? []).slice().sort(compareLedgerEviction);
+    const byBook = new Map<string, LedgerPoolBookRow>();
+    let bytes = 0;
+    let liveBytes = 0;
+    let liveFiles = 0;
+    files.forEach((f, i) => {
+      bytes += f.size;
+      if (f.live) {
+        liveBytes += f.size;
+        liveFiles += 1;
+      }
+      const key = bookModeKey(f);
+      const row = byBook.get(key);
+      if (row == null) {
+        byBook.set(key, {
+          book: f.book, root: f.root, mode: f.mode, live: f.live,
+          files: 1, bytes: f.size, oldest: f.name, newest: f.name,
+          evictionRank: i + 1,
+        });
+      } else {
+        row.files += 1;
+        row.bytes += f.size;
+        if (f.name < row.oldest) row.oldest = f.name;
+        if (f.name > row.newest) row.newest = f.name;
+      }
+    });
+    dirs[kind] = {
+      maxBytes: args.limits?.[kind] ?? LEDGER_BUDGET_LIMITS[kind],
+      bytes,
+      files: files.length,
+      liveBytes,
+      liveFiles,
+      books: [...byBook.values()].sort((a, b) => b.bytes - a.bytes),
+      nextToEvict: files.slice(0, previewN).map((f) => ({
+        book: f.book, root: f.root, mode: f.mode, name: f.name, bytes: f.size,
+      })),
+    };
+  }
+  return {
+    usersRoot: args.usersRoot,
+    measuredAt: new Date(args.now?.() ?? Date.now()).toISOString(),
+    dirs,
+  };
+}
+
+/** Books named in one eviction warn before the tail is summarised as a count. */
+export const EVICTION_ATTRIBUTION_MAX_BOOKS = 8;
+
+/** `book/root/mode`, the attribution key the eviction warn is grouped by. */
+function bookModeKey(f: { book: string; root: string; mode: string }): string {
+  return `${f.book}/${f.root}/${f.mode}`;
 }
 
 /**
@@ -569,8 +825,10 @@ async function ledgerBudgetDirs(
  * were evicted to make room for tape — a bound on the right total protecting
  * the wrong files. The pool is now denominated per directory type: a `tape/`
  * overage can only evict `tape/` files, and `closes/` likewise. Within a
- * type, "oldest" is still the filename's ISO date across ALL books, ties
- * breaking on path so the order is deterministic.
+ * type, "oldest" is the filename's ISO date across ALL books — but only AFTER
+ * the real-money reservation, which evicts every non-live file in the pool
+ * before the first live one ({@link compareLedgerEviction}, TRA-4898). Ties
+ * break on path so the order is deterministic.
  *
  * NEVER THROWS.
  */
@@ -597,39 +855,7 @@ export async function enforceAggregateLedgerBudget(args: {
     return { sweep: 'skipped_already_run', pruned: 0 };
   }
   try {
-    const filesByKind: Record<string, Array<{ path: string; name: string; size: number }>> = {};
-    const totals: Record<string, number> = {};
-    for (const kind of LEDGER_BUDGET_DIRS) {
-      filesByKind[kind] = [];
-      totals[kind] = 0;
-    }
-    for (const { path: dir, kind } of await ledgerBudgetDirs(usersRoot)) {
-      let names: string[];
-      try {
-        names = await readdir(dir);
-      } catch {
-        // An absent `closes/` or `tape/` is the ordinary case for a book that
-        // has not archived yet. Not an error, and not a reason to abort the
-        // pool: a sweep that gave up on the first missing directory would
-        // under-count the total and report a budget it never measured.
-        continue;
-      }
-      for (const name of names) {
-        // Leg 2's orphan files (`<date>.orphanN.json`) count too — they occupy
-        // the same pool, and TRA-3116 already counts them against leg 2's own
-        // retention for the same reason.
-        if (!/^\d{4}-\d{2}-\d{2}(?:\.orphan\d+)?\.json$/.test(name)) continue;
-        try {
-          const st = await stat(join(dir, name));
-          if (!st.isFile()) continue;
-          filesByKind[kind].push({ path: join(dir, name), name, size: st.size });
-          totals[kind] += st.size;
-        } catch {
-          // Vanished between readdir and stat (a concurrent prune). It is not
-          // in the pool, so it is not in the total either.
-        }
-      }
-    }
+    const { filesByKind, totals } = await scanLedgerPools(usersRoot);
     let prunedAll = 0;
     let bytesAll = 0;
     const byDir: Record<string, { bytes: number; maxBytes: number; pruned: number }> = {};
@@ -639,25 +865,82 @@ export async function enforceAggregateLedgerBudget(args: {
       let pruned = 0;
       if (total > maxBytes) {
         const files = filesByKind[kind];
-        files.sort((a, b) => (a.name === b.name ? (a.path < b.path ? -1 : 1) : a.name < b.name ? -1 : 1));
+        files.sort(compareLedgerEviction);
+        // TRA-4898 AC3 — attribute the deletions. Phase 1 established that an
+        // eviction must be readable from one log line (`aggregateByDir` did it
+        // for the pool); a pool-level count still cannot answer WHOSE session
+        // went, which is the only question anyone asks the morning after.
+        const evictedBy = new Map<
+          string,
+          { book: string; root: string; mode: string; live: boolean; files: number; bytes: number; oldest: string; newest: string }
+        >();
+        let prunedLive = 0;
         for (const f of files) {
           if (total <= maxBytes) break;
           try {
             await unlink(f.path);
             total -= f.size;
             pruned += 1;
+            if (f.live) prunedLive += 1;
+            const key = bookModeKey(f);
+            const acc = evictedBy.get(key);
+            if (acc == null) {
+              evictedBy.set(key, {
+                book: f.book, root: f.root, mode: f.mode, live: f.live,
+                files: 1, bytes: f.size, oldest: f.name, newest: f.name,
+              });
+            } else {
+              acc.files += 1;
+              acc.bytes += f.size;
+              if (f.name < acc.oldest) acc.oldest = f.name;
+              if (f.name > acc.newest) acc.newest = f.name;
+            }
           } catch {
             // Cannot remove it — leave the total as-is so the loop keeps trying
             // the next-oldest rather than spinning on one unremovable file.
           }
         }
+        // Heaviest books first, and CAPPED: a sweep that evicted across 60 dead
+        // QA books must not emit a 60-entry line that gets truncated by the log
+        // transport, so the tail is summarised rather than dropped silently.
+        const ranked = [...evictedBy.values()].sort((a, b) => b.bytes - a.bytes);
+        const shown = ranked.slice(0, EVICTION_ATTRIBUTION_MAX_BOOKS);
         args.log?.warn('TRA-4156 per-directory ledger budget exceeded — evicted oldest sessions', {
           issue: 'TRA-4156',
           dir: kind,
           maxBytes,
           bytesAfter: total,
           prunedForAggregate: pruned,
+          // TRA-4898 — WHO paid, and whether the real-money reservation held.
+          prunedLive,
+          liveFilesInPool: files.filter((f) => f.live).length,
+          evictedFrom: shown.map((e) => ({
+            book: e.book, root: e.root, mode: e.mode, live: e.live,
+            files: e.files, bytes: e.bytes, oldest: e.oldest, newest: e.newest,
+          })),
+          evictedFromBooks: ranked.length,
+          evictedFromOmitted: Math.max(0, ranked.length - shown.length),
         });
+        if (prunedLive > 0) {
+          // Reaching a live file means the pool ran out of non-live ones: the
+          // reservation did not fail, it was EXHAUSTED. That is a different
+          // fact from an ordinary overage and must not read as one — the
+          // remedy is capacity or a reap, never a re-ordering.
+          args.log?.warn(
+            'TRA-4898 a REAL-MONEY (live) ledger file was evicted — every non-live file in this pool was already gone',
+            {
+              issue: 'TRA-4898',
+              dir: kind,
+              maxBytes,
+              bytesAfter: total,
+              prunedLive,
+              evictedFrom: ranked.filter((e) => e.live).map((e) => ({
+                book: e.book, root: e.root, mode: e.mode,
+                files: e.files, bytes: e.bytes, oldest: e.oldest, newest: e.newest,
+              })),
+            },
+          );
+        }
       }
       byDir[kind] = { bytes: total, maxBytes, pruned };
       prunedAll += pruned;

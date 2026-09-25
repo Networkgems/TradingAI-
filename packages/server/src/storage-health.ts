@@ -67,6 +67,7 @@ import { join } from 'path';
 import type { DiskReading } from './observability/alerts.js';
 import type { DataDirUsage } from './data-dir-usage.js';
 import { getDiskWatermark, type DiskWatermark } from './observability/disk-watermark.js'; // TRA-3011
+import { summarizeLedgerPools } from './close-ledger.js'; // TRA-4898
 
 /** `{ exists }` alone when the file is absent — never a fabricated zero size. */
 export interface FileStamp {
@@ -556,6 +557,12 @@ export async function buildStorageDiagnostic(
 export const STORAGE_DETAIL_ROUTE = '/api/health/storage/detail';
 /** The ungated liveness route's path. Unchanged from TRA-141 on purpose. */
 export const STORAGE_LIVENESS_ROUTE = '/api/health/storage';
+/**
+ * TRA-4898 — the per-book ledger-pool census. ADMIN-GATED, and it must stay
+ * that way: unlike `usage` it names book directories, which is exactly the
+ * material TRA-2414 found leaking. It is NOT projected onto the liveness route.
+ */
+export const STORAGE_LEDGER_ROUTE = '/api/health/storage/ledger';
 
 export function registerStorageHealthRoutes(app: Express, deps: StorageHealthDeps): void {
   // TRA-141 / TRA-2599 — storage liveness. Open, like the other health probes,
@@ -573,5 +580,14 @@ export function registerStorageHealthRoutes(app: Express, deps: StorageHealthDep
   app.get(STORAGE_DETAIL_ROUTE, deps.requireAuth, deps.requireAdmin, async (_req, res) => {
     const full = await buildStorageDiagnostic(deps, { includeUsage: true });
     res.json(full);
+  });
+
+  // TRA-4898 AC4 — WHOSE bytes are in the ledger budget pools. `usage` above
+  // cannot answer this: it aggregates by basename pattern on purpose, so all 68
+  // books' `2026-09-24.json` collapse into one row. Read-only — it stats the
+  // same population `enforceAggregateLedgerBudget` would evict from, and
+  // deletes nothing.
+  app.get(STORAGE_LEDGER_ROUTE, deps.requireAuth, deps.requireAdmin, async (_req, res) => {
+    res.json(await summarizeLedgerPools({ usersRoot: join(deps.dataDir, 'users') }));
   });
 }

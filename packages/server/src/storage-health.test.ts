@@ -24,7 +24,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import express, { type RequestHandler } from 'express';
 import { createServer, type Server } from 'http';
 import type { AddressInfo } from 'net';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import type { DiskReading } from './observability/alerts.js';
@@ -42,6 +42,7 @@ import {
   diskExhaustedAxis,
   STORAGE_LIVENESS_ROUTE,
   STORAGE_DETAIL_ROUTE,
+  STORAGE_LEDGER_ROUTE,
   type StorageDiagnostic,
   type StorageHealthDeps,
 } from './storage-health.js';
@@ -568,5 +569,54 @@ describe('TRA-3011 — the since-boot low-water mark', () => {
       disk: Record<string, unknown>;
     };
     expect(anon.disk['belowThresholdSeen']).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TRA-4898 — the per-book ledger census, on the GATED route only.
+// ---------------------------------------------------------------------------
+
+describe('TRA-4898 — /api/health/storage/ledger', () => {
+  beforeAll(() => {
+    // Three books in the closes/ pool: the real-money one, and two of the dead
+    // QA artifacts the ask is about.
+    const plant = (book: string, mode: string, name: string, bytes: number) => {
+      const dir = join(dataDir, 'users', book, 'reports', mode, 'closes');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, name), 'x'.repeat(bytes));
+    };
+    plant('admin', 'live', '2026-01-01.json', 111);
+    plant('qa_alpha', 'demo', '2026-06-01.json', 2222);
+    plant('qtverify_7', 'demo', '2026-06-02.json', 333);
+  });
+
+  it('401s an unauthenticated GET — it names book directories, which is gated material', async () => {
+    expect((await get(STORAGE_LEDGER_ROUTE)).status).toBe(401);
+    expect((await get(STORAGE_LEDGER_ROUTE, USER_TOKEN)).status).toBe(403);
+  });
+
+  it('attributes the pool per book and puts the live book LAST in the eviction queue', async () => {
+    const res = await get(STORAGE_LEDGER_ROUTE, ADMIN_TOKEN);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      dirs: Record<string, {
+        bytes: number; files: number; liveBytes: number;
+        books: Array<{ book: string; mode: string; bytes: number }>;
+        nextToEvict: Array<{ book: string; name: string }>;
+      }>;
+    };
+    const closes = body.dirs.closes;
+    expect(closes.bytes).toBe(111 + 2222 + 333);
+    expect(closes.files).toBe(3);
+    expect(closes.liveBytes).toBe(111);
+    expect(closes.books.map((b) => b.book)).toEqual(['qa_alpha', 'qtverify_7', 'admin']);
+    expect(closes.nextToEvict.map((f) => f.book)).toEqual(['qa_alpha', 'qtverify_7', 'admin']);
+  });
+
+  it('is a READ — the census does not unlink anything it measured', async () => {
+    await get(STORAGE_LEDGER_ROUTE, ADMIN_TOKEN);
+    expect(
+      existsSync(join(dataDir, 'users', 'admin', 'reports', 'live', 'closes', '2026-01-01.json')),
+    ).toBe(true);
   });
 });

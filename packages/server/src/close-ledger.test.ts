@@ -20,6 +20,8 @@ import {
   capCloseLedgerRows,
   toCloseLedgerRow,
   enforceAggregateLedgerBudget,
+  compareLedgerEviction,
+  summarizeLedgerPools,
   resetAggregateLedgerSweepMemo,
   CLOSE_LEDGER_MAX_ROWS,
   CLOSE_LEDGER_MAX_FILES,
@@ -436,6 +438,194 @@ describe('TRA-2688 state budget', () => {
       targetDir: bucket('other'), date: '2026-08-11', symbols: [], usersRoot: usersRoot(),
     });
     expect(second.aggregateSweep).toBe('skipped_already_run');
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// TRA-4898 — the real-money reservation INSIDE the closes/ pool
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('TRA-4898 — the live book is last in the eviction queue, not second', () => {
+  /** Write `n` bytes at `<book>/<root>/<mode>/<kind>/<date>.json`. */
+  async function plant(
+    book: string, mode: string, date: string, bytes = 1000,
+    kind = CLOSE_LEDGER_DIR, root = 'reports',
+  ): Promise<string> {
+    const dir = join(usersRoot(), book, root, mode, kind);
+    await mkdir(dir, { recursive: true });
+    const p = join(dir, `${date}.json`);
+    await writeFile(p, 'x'.repeat(bytes), 'utf-8');
+    return p;
+  }
+  const names = async (book: string, mode: string, kind = CLOSE_LEDGER_DIR, root = 'reports') =>
+    (await readdir(join(usersRoot(), book, root, mode, kind))).sort();
+
+  it('AC2 negative control — the live book holds the OLDEST date and survives while QA books are unlinked', async () => {
+    // This is the AC that fails on `main`: pre-TRA-4898 the comparator was
+    // (date, path), so the oldest date went first no matter who wrote it — and
+    // the live book here holds it. `Richard` is planted because it is the one
+    // book that sorts ahead of `admin` on the path tie-break; the measured
+    // 2026-09-25 ordering put the real-money book 2nd of 68.
+    await plant('admin', 'live', '2026-01-01');       // OLDEST in the pool
+    await plant('Richard', 'demo', '2026-06-03');
+    await plant('qa_alpha', 'demo', '2026-06-01');
+    await plant('qtverify_7', 'demo', '2026-06-02');
+
+    const r = await enforceAggregateLedgerBudget({
+      usersRoot: usersRoot(), date: '2026-08-11', force: true,
+      limits: { closes: 2500, tape: 2500 },
+    });
+
+    expect(r.sweep).toBe('ran');
+    expect(r.pruned).toBe(2);
+    // The real-money session is untouched despite being the oldest file present.
+    expect(await names('admin', 'live')).toEqual(['2026-01-01.json']);
+    // The two oldest NON-LIVE sessions paid instead, oldest-first among them.
+    expect(await names('qa_alpha', 'demo')).toEqual([]);
+    expect(await names('qtverify_7', 'demo')).toEqual([]);
+    expect(await names('Richard', 'demo')).toEqual(['2026-06-03.json']);
+    expect(r.byDir?.closes).toEqual({ bytes: 2000, maxBytes: 2500, pruned: 2 });
+  });
+
+  it('the reservation is an ORDERING, not a carve-out — a pool of only live files still holds its ceiling', async () => {
+    // A reserved QUOTA would leave nothing deletable and the pool permanently
+    // over cap. Ordering degrades: the live files pay, oldest-first…
+    await plant('admin', 'live', '2026-01-01');
+    await plant('admin', 'live', '2026-01-02');
+    await plant('admin', 'live', '2026-01-03');
+
+    const warns: Array<[string, unknown]> = [];
+    const r = await enforceAggregateLedgerBudget({
+      usersRoot: usersRoot(), date: '2026-08-11', force: true,
+      limits: { closes: 2500, tape: 2500 },
+      log: { warn: (m: string, c?: unknown) => warns.push([m, c]), info: () => {} },
+    });
+
+    expect(r.pruned).toBe(1);
+    expect(await names('admin', 'live')).toEqual(['2026-01-02.json', '2026-01-03.json']);
+    // …and it says so with its own line, because "the reservation was
+    // EXHAUSTED" is a different fact from an ordinary overage: the remedy is
+    // capacity or a reap of the dead books, never a re-ordering.
+    const live = warns.find(([m]) =>
+      m === 'TRA-4898 a REAL-MONEY (live) ledger file was evicted — every non-live file in this pool was already gone');
+    expect(live).toBeDefined();
+    expect((live?.[1] as { prunedLive: number }).prunedLive).toBe(1);
+  });
+
+  it('a mixed pool exhausts every non-live file BEFORE the first live one', async () => {
+    await plant('admin', 'live', '2026-01-01');       // oldest overall
+    await plant('qa_alpha', 'demo', '2026-06-01');
+    await plant('qa_beta', 'sandbox', '2026-06-02');
+    // Needs 3 of 4 gone: both QA files, then the live one — in that order.
+    const r = await enforceAggregateLedgerBudget({
+      usersRoot: usersRoot(), date: '2026-08-11', force: true,
+      limits: { closes: 500, tape: 500 },
+    });
+    expect(r.pruned).toBe(3);
+    expect(await names('admin', 'live')).toEqual([]);
+    expect(await names('qa_alpha', 'demo')).toEqual([]);
+    expect(await names('qa_beta', 'sandbox')).toEqual([]);
+  });
+
+  it('crypto-reports/live is reserved too, and a non-live crypto book is not', async () => {
+    await plant('admin', 'live', '2026-01-01', 1000, CLOSE_LEDGER_DIR, 'crypto-reports');
+    await plant('qa_alpha', 'demo', '2026-06-01', 1000, CLOSE_LEDGER_DIR, 'crypto-reports');
+    const r = await enforceAggregateLedgerBudget({
+      usersRoot: usersRoot(), date: '2026-08-11', force: true,
+      limits: { closes: 1500, tape: 1500 },
+    });
+    expect(r.pruned).toBe(1);
+    expect(await names('admin', 'live', CLOSE_LEDGER_DIR, 'crypto-reports')).toEqual(['2026-01-01.json']);
+    expect(await names('qa_alpha', 'demo', CLOSE_LEDGER_DIR, 'crypto-reports')).toEqual([]);
+  });
+
+  it('AC3 — the eviction warn names the book, root and mode it deleted from', async () => {
+    await plant('qa_alpha', 'demo', '2026-06-01');
+    await plant('qa_alpha', 'demo', '2026-06-02');
+    await plant('qtverify_7', 'demo', '2026-06-03');
+    await plant('admin', 'live', '2026-06-04');
+
+    const warns: Array<[string, unknown]> = [];
+    await enforceAggregateLedgerBudget({
+      usersRoot: usersRoot(), date: '2026-08-11', force: true,
+      limits: { closes: 1500, tape: 1500 },
+      log: { warn: (m: string, c?: unknown) => warns.push([m, c]), info: () => {} },
+    });
+
+    const overage = warns.find(([m]) =>
+      m === 'TRA-4156 per-directory ledger budget exceeded — evicted oldest sessions');
+    expect(overage).toBeDefined();
+    const ctx = overage?.[1] as {
+      dir: string; prunedLive: number; liveFilesInPool: number; evictedFromBooks: number;
+      evictedFrom: Array<{ book: string; root: string; mode: string; files: number; oldest: string; newest: string }>;
+    };
+    expect(ctx.dir).toBe('closes');
+    expect(ctx.prunedLive).toBe(0);
+    expect(ctx.liveFilesInPool).toBe(1);
+    // One line, and it attributes every deletion: 2 from qa_alpha, 1 from qtverify_7.
+    expect(ctx.evictedFromBooks).toBe(2);
+    expect(ctx.evictedFrom).toEqual([
+      { book: 'qa_alpha', root: 'reports', mode: 'demo', live: false, files: 2, bytes: 2000, oldest: '2026-06-01.json', newest: '2026-06-02.json' },
+      { book: 'qtverify_7', root: 'reports', mode: 'demo', live: false, files: 1, bytes: 1000, oldest: '2026-06-03.json', newest: '2026-06-03.json' },
+    ]);
+  });
+
+  it('the comparator itself: non-live before live, then date, then path', () => {
+    const f = (book: string, mode: string, name: string) => ({
+      path: `/users/${book}/reports/${mode}/closes/${name}`,
+      name, size: 1, book, root: 'reports', mode, live: mode === 'live',
+    });
+    const sorted = [
+      f('admin', 'live', '2020-01-01.json'),
+      f('zz_qa', 'demo', '2026-06-02.json'),
+      f('aa_qa', 'demo', '2026-06-02.json'),
+      f('other', 'live', '2019-01-01.json'),
+    ].sort(compareLedgerEviction).map((x) => x.path);
+    expect(sorted).toEqual([
+      '/users/aa_qa/reports/demo/closes/2026-06-02.json',   // non-live first…
+      '/users/zz_qa/reports/demo/closes/2026-06-02.json',   // …ties on path
+      '/users/other/reports/live/closes/2019-01-01.json',   // live last, oldest first
+      '/users/admin/reports/live/closes/2020-01-01.json',
+    ]);
+  });
+
+  it('AC4 — the census attributes pool bytes per book, and previews the eviction queue', async () => {
+    await plant('admin', 'live', '2026-01-01', 1000);
+    await plant('qa_alpha', 'demo', '2026-06-01', 3000);
+    await plant('qa_alpha', 'demo', '2026-06-02', 1000);
+    await plant('qtverify_7', 'demo', '2026-06-03', 500);
+    await plant('qa_alpha', 'demo', '2026-06-01', 700, 'tape');
+
+    const s = await summarizeLedgerPools({ usersRoot: usersRoot() });
+    const closes = s.dirs.closes;
+    expect(closes.bytes).toBe(5500);
+    expect(closes.files).toBe(4);
+    // The reserved class is measured separately — that is the number that says
+    // how much of the ceiling the reservation can ever be asked to hold.
+    expect(closes.liveBytes).toBe(1000);
+    expect(closes.liveFiles).toBe(1);
+    expect(closes.books.map((b) => [b.book, b.mode, b.files, b.bytes])).toEqual([
+      ['qa_alpha', 'demo', 2, 4000],
+      ['admin', 'live', 1, 1000],
+      ['qtverify_7', 'demo', 1, 500],
+    ]);
+    // The live book is LAST in the queue now, so it cannot appear in a preview
+    // that still has non-live files to name.
+    expect(closes.nextToEvict.map((f) => `${f.book}/${f.name}`)).toEqual([
+      'qa_alpha/2026-06-01.json',
+      'qa_alpha/2026-06-02.json',
+      'qtverify_7/2026-06-03.json',
+      'admin/2026-01-01.json',
+    ]);
+    // Pools stay separate here too, and nothing was deleted by measuring.
+    expect(s.dirs.tape.bytes).toBe(700);
+    expect(await names('admin', 'live')).toEqual(['2026-01-01.json']);
+  });
+
+  it('the census never throws on an absent root, and reports the live ceilings', async () => {
+    const s = await summarizeLedgerPools({ usersRoot: join(root, 'nope') });
+    expect(s.dirs.closes).toMatchObject({ bytes: 0, files: 0, liveBytes: 0, books: [], maxBytes: 48 * 1024 * 1024 });
+    expect(s.dirs.tape.maxBytes).toBe(16 * 1024 * 1024);
   });
 });
 
