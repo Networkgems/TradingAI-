@@ -1,12 +1,17 @@
 // TRA-4745 — the REALISED predicate, graded against the REAL verdict functions.
 //
-// The load-bearing assertion in this file is the NEGATIVE one: three flat-form
+// The load-bearing assertion in this file is the NEGATIVE one: four flat-form
 // branches refuse WITHOUT comparing anything, and `band_deauthorized` is the
 // trap — it reports a non-null `lowerCI95` (deliberately, so a reader can see the
 // mandate and the tape agree) while having decided on the mandate alone. A
 // predicate builder keyed on "is there a bound?" would publish that row as a bar
 // comparison, which is the same class of false inference the whole ticket is
 // about, one layer down.
+//
+// ⭐ TRA-4894 added a FOURTH, and a worse one: `insufficient_real_fill_evidence`
+// can refuse a cell whose pooled bound CLEARS the bar. `band_deauthorized` at
+// least tends to co-occur with a losing tape; this branch is a HOLDING predicate
+// beside a BLOCKED row, which is `consistent: false` on a healthy gate.
 //
 // Nothing here uses a hand-built verdict object. Every case is produced by
 // `tapeExpectancyVerdict` / `netEdgeBarVerdict` themselves, so a branch added to
@@ -27,7 +32,7 @@ import {
   tapeExpectancyVerdict,
   type TapeExpectancyTable,
 } from './option-tape-expectancy.js';
-import { DEFAULT_COST_GATE_CONFIG } from './option-cost-gate.js';
+import { DEFAULT_COST_GATE_CONFIG, type CostGateConfig } from './option-cost-gate.js';
 import { DEFAULT_NET_EDGE_BAR_CONFIG, netEdgeBarVerdict } from './option-net-edge-bar.js';
 import { OTM_SLEEVE_MANDATE_STRUCTURE } from './otm-sleeve-mandate.js';
 import type { OptionTradeJournalRecord } from './option-trade-journal.js';
@@ -36,20 +41,53 @@ const OTM = OTM_SLEEVE_MANDATE_STRUCTURE;
 /** Inside the ratified band [0.495, 0.55), so the mandate never preempts the tape. */
 const AUTHORIZED_DELTA = 0.52;
 
-/** A synthetic closed row. `realizedR` is PREMIUM R; the gate's R is 4x. */
-function row(entryDelta: number, realizedR: number): OptionTradeJournalRecord {
+/**
+ * A synthetic closed row. `realizedR` is PREMIUM R; the gate's R is 4x.
+ *
+ * ⭐ TRA-4894 — `realFillR` (in GATE R) stamps the row as BROKER TRUTH on both
+ * legs so it counts toward `nRealFill`. A row without it is MID-BOOKED, and a
+ * mid-booked cell now refuses under `insufficient_real_fill_evidence` whatever
+ * its pooled bound says. That is the point of that ticket, and it is why the
+ * fixtures below must opt in before they can reach a POOLED bar comparison.
+ *
+ * The rig: `contracts: 1`, `entryFillPremium: 1.00` ⇒ denominator 100, and the
+ * exit fill sits exactly on the bid ⇒ zero exit cross, so `Rfill_net` is
+ * `4 · realizedPnlUsd / 100`, i.e. `realizedPnlUsd = 25 · realFillR`.
+ */
+function row(entryDelta: number, realizedR: number, realFillR?: number): OptionTradeJournalRecord {
   return {
     structure: OTM,
     outcome: realizedR >= 0 ? 'WIN' : 'LOSS',
     entryDelta,
     realizedR,
     closeTs: 1_700_000_000_000,
+    ...(realFillR === undefined
+      ? {}
+      : {
+        contracts: 1,
+        pnlBasis: 'broker-fill',
+        feesUsd: 0.65,
+        entryFillPremium: 1.0,
+        exitFillPremium: 0.8,
+        realizedPnlUsd: 25 * realFillR,
+        markProvenance: {
+          markSource: 'quote',
+          staleMarkTicks: 0,
+          at: 1_700_000_000_000,
+          quoteAtFire: { bid: 0.8, ask: 0.85 },
+        },
+      }),
   } as unknown as OptionTradeJournalRecord;
 }
 
-function tableOf(entryDelta: number, realizedR: number, n = 40): TapeExpectancyTable {
+function tableOf(
+  entryDelta: number,
+  realizedR: number,
+  n = 40,
+  realFillR?: number,
+): TapeExpectancyTable {
   return buildTapeExpectancyTable(
-    Array.from({ length: n }, () => row(entryDelta, realizedR)),
+    Array.from({ length: n }, () => row(entryDelta, realizedR, realFillR)),
     { config: DEFAULT_COST_GATE_CONFIG },
   );
 }
@@ -64,10 +102,14 @@ describe('TRA-4745 — the flat form publishes the comparison it actually ran', 
   it('names grossR vs barR as the two sides, and NEVER costR', () => {
     const verdict = tapeExpectancyVerdict(
       { structure: OTM, delta: AUTHORIZED_DELTA },
-      tableOf(AUTHORIZED_DELTA, 5),
+      // TRA-4894 — real-fill-stamped at +5.0 gate R, because an ADMIT now needs
+      // BOTH arms. A mid-booked table here would refuse on the real-fill arm and
+      // this test would be asserting the shape of a decline it did not intend.
+      tableOf(AUTHORIZED_DELTA, 5, 40, 5.0),
       DEFAULT_COST_GATE_CONFIG,
     );
     const p = tapeExpectancyFlatPredicate(verdict);
+    expect(verdict.nRealFill).toBe(40);
     expect(verdict.admit).toBe(true);
     expect(p.compared).toBe(true);
     expect(p.form).toBe('tape_expectancy_flat');
@@ -89,12 +131,20 @@ describe('TRA-4745 — the flat form publishes the comparison it actually ran', 
     // Gate R = 4 × premium R, so 0.01 premium R is a 0.04 lower bound — well
     // under the 0.385 bar, and non-negative, so it buckets as `shortfall_*`
     // rather than `gross_negative`.
+    //
+    // ⭐ TRA-4894 — "MEASURED" now means measured ON FILLS. The rows are
+    // real-fill-stamped at +5.0 gate R so the REAL-FILL arm is satisfied and the
+    // POOLED bar comparison is the operative refusal; without the stamp this
+    // cell reports `insufficient_real_fill_evidence` and the flat predicate
+    // short-circuits, because a mid-booked shortfall is a BASIS gap wearing a
+    // bar shortfall's clothes and the two want opposite responses.
     const verdict = tapeExpectancyVerdict(
       { structure: OTM, delta: AUTHORIZED_DELTA },
-      tableOf(AUTHORIZED_DELTA, 0.01),
+      tableOf(AUTHORIZED_DELTA, 0.01, 40, 5.0),
       DEFAULT_COST_GATE_CONFIG,
     );
     expect(verdict.admit).toBe(false);
+    expect(verdict.nRealFill).toBe(40);
     expect(verdict.reasonCode).toMatch(/^shortfall_/);
     const p = tapeExpectancyFlatPredicate(verdict);
     expect(p.compared).toBe(true);
@@ -159,10 +209,47 @@ describe('TRA-4745 — the flat form publishes the comparison it actually ran', 
       'band_deauthorized',
       'gross_unknown',
       'insufficient_evidence',
+      'insufficient_real_fill_evidence',
     ]);
     // `gross_negative` and `shortfall_*` are DELIBERATELY absent: both are real
     // comparisons whose left side lost.
     expect(TAPE_EXPECTANCY_PRE_COMPARISON_REASON_CODES).not.toContain('gross_negative');
+  });
+
+  it('⛔ TRA-4894 — a real-fill refusal whose POOLED bar PASSED is not published as a comparison', () => {
+    // ⛔ THE TRAP, and it is the TRA-4890 case exactly. The bar is retuned to
+    // 0.3386; the cell's pooled bound CLEARS it; the gate BLOCKS anyway because
+    // nothing in the cell is a broker fill. A builder keyed on "is there a
+    // bound?" would publish `compared: true` with `lhs >= rhs` beside a BLOCKED
+    // row — a predicate that HOLDS on a refusal, i.e. `consistent: false` on a
+    // healthy gate, and a surface reading "the bar passed" about a refusal the
+    // bar had nothing to do with.
+    const retuned: CostGateConfig = {
+      ...DEFAULT_COST_GATE_CONFIG,
+      optionsCost: { commissionR: 0.0036, makerAdjustedSpreadCrossR: 0.135 },
+    };
+    const verdict = tapeExpectancyVerdict(
+      { structure: OTM, delta: AUTHORIZED_DELTA },
+      buildTapeExpectancyTable(
+        Array.from({ length: 40 }, () => row(AUTHORIZED_DELTA, 0.12)),
+        { config: retuned },
+      ),
+      retuned,
+    );
+    expect(verdict.reasonCode).toBe('insufficient_real_fill_evidence');
+    expect(verdict.nRealFill).toBe(0);
+    // The pooled arm GENUINELY passed — without this the test proves nothing.
+    expect(verdict.lowerCI95!).toBeGreaterThanOrEqual(verdict.barR);
+    expect(verdict.admit).toBe(false);
+
+    const p = tapeExpectancyFlatPredicate(verdict);
+    expect(p.compared).toBe(false);
+    expect(p.lhs).toBeNull();
+    expect(p.rhs).toBeNull();
+    expect(p.shortCircuit).toBe('insufficient_real_fill_evidence');
+    expect(p.admit).toBe(false);
+    // …and therefore the row does not read as an inconsistent gate.
+    expect(predicateOutcomeConsistent(p, true)).not.toBe(false);
   });
 });
 
@@ -232,12 +319,30 @@ describe('TRA-4745 — the net-edge form publishes the comparison IT ran', () =>
 // this ticket exists to kill, reproduced one layer down inside its own fix.
 
 describe('TRA-4745 — the predicate re-evaluates, and says whether it explains its own outcome', () => {
-  /** A blocked row, real verdict: lower bound 0.04 against a 0.385 bar. */
+  /**
+   * A blocked row, real verdict: lower bound 0.04 against a 0.385 bar.
+   *
+   * ⭐ TRA-4894 — real-fill-stamped so the POOLED bar comparison is what refuses
+   * it. Unstamped, this cell short-circuits on the real-fill arm and every
+   * `predicateHolds` assertion below would be reading `null`, i.e. passing on a
+   * row that was never compared.
+   */
   function blockedPredicate() {
     return tapeExpectancyFlatPredicate(
       tapeExpectancyVerdict(
         { structure: OTM, delta: AUTHORIZED_DELTA },
-        tableOf(AUTHORIZED_DELTA, 0.01),
+        tableOf(AUTHORIZED_DELTA, 0.01, 40, 5.0),
+        DEFAULT_COST_GATE_CONFIG,
+      ),
+    );
+  }
+
+  /** An admitted row: both arms clear. */
+  function admittedPredicate() {
+    return tapeExpectancyFlatPredicate(
+      tapeExpectancyVerdict(
+        { structure: OTM, delta: AUTHORIZED_DELTA },
+        tableOf(AUTHORIZED_DELTA, 5, 40, 5.0),
         DEFAULT_COST_GATE_CONFIG,
       ),
     );
@@ -253,13 +358,7 @@ describe('TRA-4745 — the predicate re-evaluates, and says whether it explains 
   });
 
   it('`holds` is TRUE on an admitted row, and derives from the NUMBERS, not from `admit`', () => {
-    const p = tapeExpectancyFlatPredicate(
-      tapeExpectancyVerdict(
-        { structure: OTM, delta: AUTHORIZED_DELTA },
-        tableOf(AUTHORIZED_DELTA, 5),
-        DEFAULT_COST_GATE_CONFIG,
-      ),
-    );
+    const p = admittedPredicate();
     expect(predicateHolds(p)).toBe(true);
     // Independence from `admit` is the property that gives the consistency test
     // its teeth: flip the recorded verdict and the re-evaluation does NOT follow.
@@ -291,13 +390,7 @@ describe('TRA-4745 — the predicate re-evaluates, and says whether it explains 
   it('⭐ and the other direction: a HOLDING predicate on a BLOCKED row is inconsistent', () => {
     // This is the live shape reading (A) predicts — a candidate whose cost
     // comparison passes, refused anyway and stamped `cost_bar`.
-    const p = tapeExpectancyFlatPredicate(
-      tapeExpectancyVerdict(
-        { structure: OTM, delta: AUTHORIZED_DELTA },
-        tableOf(AUTHORIZED_DELTA, 5),
-        DEFAULT_COST_GATE_CONFIG,
-      ),
-    );
+    const p = admittedPredicate();
     expect(predicateHolds(p)).toBe(true);
     expect(predicateOutcomeConsistent(p, true)).toBe(false);
   });

@@ -200,14 +200,19 @@ describe('TRA-3394 item 2 — band_deauthorized is sourced from the mandate, not
     expect(v.reasonCode).not.toBe('band_deauthorized');
   });
 
-  it('publishes all three codes in the taxonomy the health read serves', () => {
+  it('publishes every code in the taxonomy the health read serves', () => {
+    // TRA-4894 added a FOURTH: `insufficient_real_fill_evidence`. It is here and
+    // not folded into `insufficient_evidence` because the two want different
+    // responses — "accrue rows" vs "accrue REAL FILLS, and do NOT move the bar"
+    // — which is what the size assertion below is actually checking.
     expect(DECLINE_REASON_TAXONOMY.map((r) => r.code)).toEqual([
       'band_deauthorized',
       'insufficient_evidence',
       'gross_negative',
+      'insufficient_real_fill_evidence',
     ]);
-    // Each states a DIFFERENT response — that is why they are three codes.
-    expect(new Set(DECLINE_REASON_TAXONOMY.map((r) => r.response)).size).toBe(3);
+    // Each states a DIFFERENT response — that is why they are separate codes.
+    expect(new Set(DECLINE_REASON_TAXONOMY.map((r) => r.response)).size).toBe(4);
   });
 });
 

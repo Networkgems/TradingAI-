@@ -105,11 +105,27 @@ export interface LiveEnforceGatePredicate {
  *   • `insufficient_evidence` — the cell holds n < minCellN, so there is no
  *                               lower bound to compare. "We never measured" is
  *                               NOT "we measured a loser" (TRA-3388 Ruling 2.5).
+ *   • `insufficient_real_fill_evidence`
+ *                             — TRA-4894. The cell is refused by the REAL-FILL
+ *                               arm, which is a different comparison on a
+ *                               different population (`loRealFillNet` vs
+ *                               `barR + boundNoiseR`), not this one.
+ *
+ * ⛔ `insufficient_real_fill_evidence` MUST stay on this list, and the reason is
+ * {@link predicateOutcomeConsistent}. At the TRA-4890 retuned bar the live
+ * cell's POOLED comparison PASSES (`lowerCI95 0.36168 >= 0.3386`) while the gate
+ * BLOCKS. Publishing that as `compared: true` would hand a reader a predicate
+ * that HOLDS beside a row that BLOCKED — `consistent: false` on a perfectly
+ * healthy gate, and, read the other way, a surface saying "the bar passed" about
+ * a refusal the bar had nothing to do with. `compared: false` with this
+ * `shortCircuit` says the true thing: the displayed flat predicate is not the
+ * operative one.
  */
 export const TAPE_EXPECTANCY_PRE_COMPARISON_REASON_CODES: readonly string[] = [
   'gross_unknown',
   'band_deauthorized',
   'insufficient_evidence',
+  'insufficient_real_fill_evidence',
 ];
 
 /**

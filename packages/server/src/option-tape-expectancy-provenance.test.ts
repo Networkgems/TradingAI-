@@ -197,8 +197,17 @@ describe('TRA-4578 — the net-of-modelled-cross companion', () => {
       modelledCrossRSource: 'test-source',
     }).cells, '0.50-0.55');
 
-    expect(uncharged.admits).toBe(true);
-    expect(charged.admits).toBe(true);
+    // TRA-4894 — the attestation is now on `admitsPooled`, which IS the field
+    // this test was written about: the pre-TRA-4894 predicate, unchanged by the
+    // cross charge. `admits` is the conjunction and reads `false` on both sides
+    // here because these 40 fixture rows carry no `pnlBasis: 'broker-fill'`
+    // stamp — which is the correct new behaviour and is itself asserted, so the
+    // pair below cannot degenerate into "both false for the same boring reason".
+    expect(uncharged.admitsPooled).toBe(true);
+    expect(charged.admitsPooled).toBe(true);
+    expect(uncharged.nRealFill).toBe(0);
+    expect(uncharged.admits).toBe(false);
+    expect(charged.admits).toBe(false);
     expect(charged.meanR_gate).toBe(uncharged.meanR_gate);
     expect(charged.lowerCI95).toBe(uncharged.lowerCI95);
     expect(charged.barR).toBe(uncharged.barR);

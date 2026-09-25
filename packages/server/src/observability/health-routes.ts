@@ -183,6 +183,7 @@ import { tapeExpectancyCache } from '../option-tape-expectancy-cache.js';
 import {
   DECLINE_REASON_TAXONOMY,
   TAPE_EXPECTANCY_MIN_CELL_N,
+  TAPE_EXPECTANCY_MIN_CELL_REAL_FILL_N,
   TAPE_INPUT_STALE_THRESHOLD_DAYS,
   summarizeTapeInputStaleness,
 } from '../option-tape-expectancy.js';
@@ -6045,6 +6046,14 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     const cached = await cache.get();
     const admitted = cached?.table.cells.filter((c) => c.admits) ?? [];
     const underpowered = cached?.table.cells.filter((c) => c.n < (cached.table.minCellN)) ?? [];
+    // TRA-4894 — the cells the POOLED arm would have promoted and the real-fill
+    // arm refuses. This list is the whole point of the ticket: on ship it is
+    // empty at the live 0.385 bar and holds `single_leg_otm::0.50-0.55` at the
+    // TRA-4890 retuned bar, which is the flip that would otherwise have been
+    // invisible. Published as its own column so a grader never has to diff two
+    // booleans across 19 cells to find it.
+    const heldForRealFill =
+      cached?.table.cells.filter((c) => c.admitsPooled && !c.admitsRealFill) ?? [];
     res.json({
       ok: true,
       issue: 'TRA-3391',
@@ -6052,18 +6061,40 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       build: resolveBuildInfo(),
       etDay: etDateString(new Date(nowMs)),
       /** The decision rule, published as text so a grader never has to infer it. */
-      rule: 'admit iff mean(R_gate) - 1.96*SE >= admissionBarR AND n >= minCellN; otherwise BLOCK (insufficient_evidence when n < minCellN)',
+      rule:
+        'admit iff (POOLED: mean(R_gate) - 1.96*SE >= admissionBarR AND n >= minCellN) '
+        + 'AND (REAL-FILL, TRA-4894: nRealFill >= minCellRealFillN AND loRealFillNet >= barR + boundNoiseR, '
+        + 'where loRealFillNet uses the STUDENT-t quantile and Rfill_net is denominated on entryFillPremium '
+        + 'and net of the measured EXIT cross); otherwise BLOCK — `insufficient_evidence` when n < minCellN, '
+        + '`insufficient_real_fill_evidence` when the pooled arm passes and the real-fill arm does not',
       unit: 'R_gate = realizedR / 0.25 — the same currency as admissionBarR',
       minCellN: TAPE_EXPECTANCY_MIN_CELL_N,
+      minCellRealFillN: TAPE_EXPECTANCY_MIN_CELL_REAL_FILL_N,
       freshness: cache.freshness(),
       basis: cached?.census ?? null,
       table: cached?.table ?? null,
       admittedCells: admitted.map((c) => c.cellKey),
       underpoweredCells: underpowered.map((c) => ({ cell: c.cellKey, n: c.n })),
+      /**
+       * TRA-4894 — cells the pre-TRA-4894 predicate WOULD have promoted, held by
+       * the real-fill arm. Each carries its own refusal arithmetic so the hold is
+       * auditable from this read alone.
+       */
+      heldForRealFillCells: heldForRealFill.map((c) => ({
+        cell: c.cellKey,
+        n: c.n,
+        nRealFill: c.nRealFill,
+        lowerCI95: c.lowerCI95,
+        loRealFillNet: c.loRealFillNet,
+        boundNoiseR: c.boundNoiseR,
+        barR: c.barR,
+        needR: c.boundNoiseR === null ? null : c.barR + c.boundNoiseR,
+        reason: c.realFillUnavailableReason,
+      })),
       note:
         cached === null
           ? 'BLIND — the expectancy tape has never been folded in this process. This is NOT a clean bill: every candidate is currently DECLINED with `insufficient_evidence` (fail-closed). Check freshness.lastError.'
-          : `Folded ${cached.table.rowsUsed} closed rows into ${cached.table.cells.length} cells over a ${cached.table.windowDays ?? 'unbounded'}-day rolling window. ${admitted.length} cell(s) ADMIT: ${admitted.length > 0 ? admitted.map((c) => `${c.cellKey} (n=${c.n}, mean ${c.meanR_gate.toFixed(3)}, lower95 ${(c.lowerCI95 ?? 0).toFixed(3)} >= bar ${c.barR.toFixed(3)})`).join('; ') : 'NONE — every cell either measures below its bar or holds too few rows'}. ${underpowered.length} cell(s) hold n < ${cached.table.minCellN} and DECLINE under \`insufficient_evidence\`, which is distinct from \`gross_negative\`: it means we never measured, not that we measured a loser (TRA-3388 Ruling 2.5). Cross-read against /api/health/live-enforce-gates → byGate[cost_bar].byCell to see which cells the LIVE gate actually decided under.`,
+          : `Folded ${cached.table.rowsUsed} closed rows into ${cached.table.cells.length} cells over a ${cached.table.windowDays ?? 'unbounded'}-day rolling window. ${admitted.length} cell(s) ADMIT: ${admitted.length > 0 ? admitted.map((c) => `${c.cellKey} (n=${c.n}, mean ${c.meanR_gate.toFixed(3)}, lower95 ${(c.lowerCI95 ?? 0).toFixed(3)} >= bar ${c.barR.toFixed(3)}, nRealFill ${c.nRealFill})`).join('; ') : 'NONE — every cell either measures below its bar, holds too few rows, or has never been measured on real broker fills'}. ${underpowered.length} cell(s) hold n < ${cached.table.minCellN} and DECLINE under \`insufficient_evidence\`, which is distinct from \`gross_negative\`: it means we never measured, not that we measured a loser (TRA-3388 Ruling 2.5). TRA-4894: ${heldForRealFill.length} cell(s) clear the POOLED arm and are HELD by the real-fill arm under \`insufficient_real_fill_evidence\`${heldForRealFill.length > 0 ? ` — ${heldForRealFill.map((c) => `${c.cellKey} (n=${c.n}, nRealFill=${c.nRealFill}/${cached.table.minCellRealFillN})`).join('; ')}` : ''}; that is a THIRD state, and the pooled number on such a cell is booked at the pre-trade NBBO mid on every row without a \`broker-fill\` basis. Cross-read against /api/health/live-enforce-gates → byGate[cost_bar].byCell to see which cells the LIVE gate actually decided under.`,
     });
   });
 
@@ -6996,6 +7027,31 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       meanR_gate_netOfModelledCross: c.meanR_gate_netOfModelledCross,
       lowerCI95_netOfModelledCross: c.lowerCI95_netOfModelledCross,
       netOfModelledCross: c.netOfModelledCross,
+      /**
+       * ⭐ TRA-4894 — the REAL-FILL arm. `admits` above is now the CONJUNCTION
+       * `admitsPooled && admitsRealFill`, so read these to see WHICH arm
+       * refused: `admitsPooled` is the pre-TRA-4894 predicate, published
+       * unchanged, and a cell reading `admitsPooled: true, admitsRealFill:
+       * false` is one the old form would have promoted to capital on rows
+       * booked at the pre-trade NBBO mid.
+       *
+       * `nRealFill` counts rows that are broker truth on BOTH legs; it is
+       * published BESIDE `n`, never folded into it. Every real-fill column is
+       * `null` rather than 0 when the subset cannot be formed, with
+       * `realFillUnavailableReason` naming the drop census — an absent measure
+       * charged as zero would read identically to a measured one, which is the
+       * defect this whole block exists to discriminate against.
+       *
+       * Decides nothing on its own; the decision is `admits`.
+       */
+      admitsPooled: c.admitsPooled,
+      admitsRealFill: c.admitsRealFill,
+      nRealFill: c.nRealFill,
+      meanR_gate_realFillNet: c.meanR_gate_realFillNet,
+      sdR_gate_realFill: c.sdR_gate_realFill,
+      loRealFillNet: c.loRealFillNet,
+      boundNoiseR: c.boundNoiseR,
+      realFillUnavailableReason: c.realFillUnavailableReason,
     });
     const cellsByStructure = barsByStructure.map((b) => {
       const cells = tapeCells.filter((c) => c.structure === b.structure);

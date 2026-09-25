@@ -38,6 +38,32 @@
 // re-imports exactly the overconfidence that produced this ticket, and it is the
 // same lower-bound discipline TRA-431 exists to enforce.
 //
+// ── TRA-4894 (spec TRA-4887): the REAL-FILL arm, ANDed on ────────────────────
+//
+// The rule above is necessary and it is not sufficient, because `realizedR` on a
+// row with no `pnlBasis: 'broker-fill'` stamp is booked at the **pre-trade NBBO
+// mid** on both legs. Measured live 2026-09-24 on `single_leg_otm::0.50-0.55`:
+// n=110, mean +1.12911, lowerCI95 +0.36168 against a 0.385 bar — refused by
+// 0.02332. **93 of those 110 rows are demo**, and the 23 real desk rows the band
+// actually produced returned **−0.835 R_gate / −$497**. TRA-4890's 0.0464 bar
+// move would have flipped that cell to `admits: true`, with real money behind
+// it, and nothing in the table would have said the positive number was a basis
+// artifact.
+//
+//   admit  ⟺  n              ≥ minCellN          (30, UNCHANGED)
+//         AND  nRealFill      ≥ minCellRealFillN  (40)
+//         AND  loRealFillNet  ≥ barR + boundNoiseR
+//
+//   Rfill_net     = 4 · netPnlUsd / (entryFillPremium · contracts · 100)
+//   netPnlUsd     = realizedPnlUsd − the measured EXIT cross   (exit leg ONLY)
+//   loRealFillNet = mean − t(nRealFill−1, .975)·sd/√nRealFill  ← `t`, not `z`
+//   boundNoiseR   = t·sd/√nRealFill · 1/√(2(nRealFill−1))
+//
+// ADDITIVE, the way TRA-4578 was: `n`, `meanR_gate`, `lowerCI95` and `barR` are
+// byte-identical to their pre-TRA-4894 values, the old predicate is published as
+// `admitsPooled`, and `admits` is the conjunction — so this can only ever refuse
+// something the old form admitted, never the reverse.
+//
 // ── `insufficient_evidence` DECLINES ─────────────────────────────────────────
 //
 // A cell with `n < 30` BLOCKS under its own reason code, distinct from
@@ -99,6 +125,14 @@ import { mandateBandFor, OTM_SLEEVE_MANDATE_ISSUE } from './otm-sleeve-mandate.j
 // TRA-4578 — the ACCOUNT-CLASS predicate, imported rather than re-written, so the
 // per-cell census cannot drift from the table-level one in `applyModelFacingBasis`.
 import { isUnattributedRow } from './model-facing-journal.js';
+// TRA-4894 (spec TRA-4887) — the REAL-FILL arm: the per-row broker-truth
+// discriminator, the fill-denominated R, and the exit-leg cross. Imported so the
+// classification cannot drift from the one a row-level reader would apply.
+import {
+  priceRealFillRow,
+  type RealFillUnpricedReason,
+} from './option-real-fill-r.js';
+import { tQuantile975 } from './student-t-quantile.js';
 
 /**
  * Ruling 2.5 — a cell needs this many closed rows before its expectancy may
@@ -114,6 +148,31 @@ export const TAPE_EXPECTANCY_MIN_CELL_N = 30;
 
 /** Two-sided 95% normal quantile — the `1.96` in Ruling 2.4's decision rule. */
 export const TAPE_EXPECTANCY_Z95 = 1.96;
+
+/**
+ * TRA-4894 (spec TRA-4887 §5) — the REAL-FILL floor. A cell may not promote to
+ * capital on fewer than this many rows whose P&L is broker truth on BOTH legs.
+ *
+ * **40, and 30 is rejected on measurement, not taste.** At the dispersion the
+ * live cell under audit actually carries (`sd = 4.10660` gate R), the 95% bound
+ * at n=30 holds **0.1930 R of pure SD-estimation noise** — 8.3× the 0.02332 R
+ * shortfall the decision turns on — and the normal approximation alone is worth
+ * **0.0639 R**, larger than the whole 0.0464 R bar move TRA-4890 makes. At 40,
+ * `SE(s) <= 11.3%`. Not 50+, because {@link boundNoiseR} already scales with the
+ * cell's OWN dispersion, so the floor must only guarantee the variance estimate
+ * is usable — it must not become the binding constraint on a well-behaved cell.
+ *
+ * ⚠ The floor is NOT the fix. `lo >= bar` is algebraically already the power
+ * test, so a bare n-floor adds nothing on top of the CI. Measured: grant the
+ * live cell all 110 of its rows as real fills at the retuned bar 0.3386 and it
+ * STILL refuses (`lo 0.3531` vs `need 0.3912`) — that is `boundNoiseR` doing
+ * the work, and it is why the fix does not depend on this number holding.
+ *
+ * Deliberately NOT env-overridable, same reasoning as
+ * {@link TAPE_EXPECTANCY_MIN_CELL_N}: changing it is a code change with a
+ * measurement behind it.
+ */
+export const TAPE_EXPECTANCY_MIN_CELL_REAL_FILL_N = 40;
 
 /**
  * Ruling 2.3's bucket edges, half-open `[from, to)` except the top band which is
@@ -306,8 +365,68 @@ export interface TapeExpectancyCell {
   lowerCI95: number | null;
   /** The bar this cell's structure faces under the config the table was built with. */
   barR: number;
-  /** Ruling 2.4 + 2.5: `n >= 30 && lowerCI95 >= barR`. */
+  /**
+   * The promotion decision. TRA-4894 made it a CONJUNCTION:
+   * `admitsPooled && admitsRealFill`.
+   *
+   * ⚠ Strictly more conservative than the pre-TRA-4894 form, never less: the
+   * pooled arm's own inputs (`n`, `meanR_gate`, `lowerCI95`, `barR`) are
+   * untouched, and the real-fill arm is ANDed on. Read {@link admitsPooled} to
+   * see what this field said before, and {@link admitsRealFill} to see which
+   * arm refused.
+   */
   admits: boolean;
+  /**
+   * TRA-4894 — the PRE-TRA-4894 predicate, published so `admits` stays
+   * decomposable: `n >= minCellN && lowerCI95 >= barR`.
+   *
+   * It exists because a reader who sees `admits: false` has to be able to tell
+   * "the mid-booked tape is under its bar" from "the mid-booked tape clears its
+   * bar and we have never measured this cell on real fills" — which is exactly
+   * the state of `single_leg_otm::0.50-0.55` at the retuned bar, and exactly
+   * the flip TRA-4890 would otherwise have made silently.
+   */
+  admitsPooled: boolean;
+  /**
+   * TRA-4894 — the real-fill arm alone:
+   * `nRealFill >= minCellRealFillN && loRealFillNet >= barR + boundNoiseR`.
+   */
+  admitsRealFill: boolean;
+  /**
+   * TRA-4894 — rows in this cell whose P&L is broker truth on BOTH legs
+   * (`pnlBasis: 'broker-fill'` + finite positive `entryFillPremium` and
+   * `exitFillPremium`) AND which carry a usable exit quote to charge the cross
+   * against.
+   *
+   * ⛔ Published BESIDE `n`, never folded INTO it. `n` is the pooled evidence
+   * count every prior verdict and ledger row was written against; moving it
+   * would silently restate history rather than add to it.
+   */
+  nRealFill: number;
+  /** Mean `Rfill_net` over the real-fill subset, in gate R; null at n=0. */
+  meanR_gate_realFillNet: number | null;
+  /** Sample SD (n−1) of `Rfill_net`; null below nRealFill=2. */
+  sdR_gate_realFill: number | null;
+  /**
+   * `mean − t(nRealFill−1, .975)·sd/√nRealFill`. **`t`, not `z`** — at this
+   * cell's dispersion the substitution error is 0.0639 R at n=30, larger than
+   * the 0.0464 R bar move it would have to resolve. Null when no SD exists.
+   */
+  loRealFillNet: number | null;
+  /**
+   * `t·sd/√n · 1/√(2(nRealFill−1))` — the 1-SD estimation noise of the bound's
+   * OWN SD, added to the bar. The statistically load-bearing term: it refuses
+   * when the bar-clearing margin sits inside the noise of the variance estimate.
+   * Null whenever {@link loRealFillNet} is.
+   */
+  boundNoiseR: number | null;
+  /**
+   * Why the real-fill arm cannot decide, naming the drop census by reason.
+   * Null ONLY when the arm is fully populated (`nRealFill >= minCellRealFillN`
+   * and a bound exists). ⛔ Never null-with-a-zero-count: an unmeasured subset
+   * must not read like a measured empty one.
+   */
+  realFillUnavailableReason: string | null;
   /** TRA-4578 — who is in this cell. Decides nothing; see the interface doc. */
   provenance: TapeExpectancyCellProvenance;
   /**
@@ -353,6 +472,8 @@ export interface TapeExpectancyTable {
   computedAt: number;
   minCellN: number;
   z: number;
+  /** TRA-4894 — the real-fill floor the `admits` conjunction was built with. */
+  minCellRealFillN: number;
   /** Cells, ascending by structure then bucket. Empty cells are omitted. */
   cells: TapeExpectancyCell[];
 }
@@ -365,6 +486,14 @@ export interface BuildTapeExpectancyOpts {
   /** Cost-gate config the `admits` / `barR` columns are computed against. */
   config?: CostGateConfig;
   minCellN?: number;
+  /**
+   * TRA-4894 — override for {@link TAPE_EXPECTANCY_MIN_CELL_REAL_FILL_N}. For
+   * CONTROLS ONLY: the production loader never passes it, so the shipped floor
+   * is the constant. It exists so a control can mutate the floor as a single
+   * knob and watch a green go red, which is the only way to know the floor is
+   * wired to the decision at all.
+   */
+  minCellRealFillN?: number;
   /**
    * TRA-4578 item 2 — measured round-trip cross cost per cell, in gate R, keyed
    * by `cellKey`. INJECTED: this module has no ledger edge and must keep none
@@ -405,6 +534,15 @@ interface CellAccumulator {
    * closes cannot present as fully measured.
    */
   droppedUnpriced: number;
+  /**
+   * TRA-4894 — `Rfill_net` for the rows that priced. NOT parallel to
+   * {@link values}: it is a SUBSET, deliberately, because a parallel array would
+   * need a placeholder for the unpriced rows and the only available placeholder
+   * is 0 — the fail-zero this ticket exists to forbid.
+   */
+  realFillValues: number[];
+  /** TRA-4894 — why each non-real-fill row dropped out. Sums to `n − nRealFill`. */
+  realFillDrops: Partial<Record<RealFillUnpricedReason, number>>;
 }
 
 /** Mean / sample-SD / SE / lower 95% bound over one value list. Shared by both columns. */
@@ -421,6 +559,42 @@ function cellStats(values: readonly number[]): {
   const sd = n > 1 ? Math.sqrt(values.reduce((a, v) => a + (v - mean) ** 2, 0) / (n - 1)) : null;
   const se = sd !== null ? sd / Math.sqrt(n) : null;
   return { mean, sd, se, lowerCI95: se !== null ? mean - TAPE_EXPECTANCY_Z95 * se : null };
+}
+
+/**
+ * TRA-4894 — the real-fill arm's statistics for one cell.
+ *
+ * Separate from {@link cellStats} on purpose: this one uses **`t`, not `z`**
+ * (see {@link tQuantile975}), and it carries {@link boundNoiseR}, which the
+ * pooled column does not have and must not acquire — the pooled `lowerCI95` is
+ * the number every prior ruling was written against.
+ *
+ * ⛔ Every field is `null` below nRealFill=2. A cell with one real fill has a
+ * mean and no dispersion; publishing the mean as a bound would be a bound with
+ * no interval, which admits on a single row.
+ */
+function realFillStats(values: readonly number[]): {
+  mean: number | null;
+  sd: number | null;
+  lo: number | null;
+  boundNoiseR: number | null;
+} {
+  const n = values.length;
+  if (n === 0) return { mean: null, sd: null, lo: null, boundNoiseR: null };
+  const mean = values.reduce((a, v) => a + v, 0) / n;
+  if (n < 2) return { mean, sd: null, lo: null, boundNoiseR: null };
+  const sd = Math.sqrt(values.reduce((a, v) => a + (v - mean) ** 2, 0) / (n - 1));
+  const t = tQuantile975(n - 1);
+  if (t === null) return { mean, sd, lo: null, boundNoiseR: null };
+  const halfWidth = (t * sd) / Math.sqrt(n);
+  return {
+    mean,
+    sd,
+    lo: mean - halfWidth,
+    // `1/√(2(n−1))` is SE(s)/s for a normal sample: the half-width's own 1-SD
+    // estimation noise, expressed in the same R unit as the bar it is added to.
+    boundNoiseR: halfWidth / Math.sqrt(2 * (n - 1)),
+  };
 }
 
 /**
@@ -441,6 +615,7 @@ export function buildTapeExpectancyTable(
 ): TapeExpectancyTable {
   const config = opts.config ?? DEFAULT_COST_GATE_CONFIG;
   const minCellN = opts.minCellN ?? TAPE_EXPECTANCY_MIN_CELL_N;
+  const minCellRealFillN = opts.minCellRealFillN ?? TAPE_EXPECTANCY_MIN_CELL_REAL_FILL_N;
   const windowDays = opts.windowDays ?? null;
   const computedAt = opts.nowMs ?? 0;
   // TRA-4578 item 2 — `null` and `undefined` are both "no source"; kept as a
@@ -491,6 +666,13 @@ export function buildTapeExpectancyTable(
               fromTs: null,
               toTs: null,
               droppedUnpriced: 0,
+              // TRA-4894 — an UNMEASURED close is not a real fill either, and it
+              // is deliberately NOT counted in `realFillDrops`: that census sums
+              // to `n − nRealFill` over the rows that LANDED in the cell, and
+              // this row never lands (it `continue`s before `values.push`).
+              // Its visibility is `droppedUnpriced`, one field up.
+              realFillValues: [],
+              realFillDrops: {},
             };
             cells.set(key, cell);
           }
@@ -536,10 +718,25 @@ export function buildTapeExpectancyTable(
         fromTs: null,
         toTs: null,
         droppedUnpriced: 0, // TRA-4857
+        realFillValues: [],
+        realFillDrops: {},
       };
       cells.set(key, cell);
     }
     cell.values.push(r.realizedR * GATE_R_PER_PREMIUM_R);
+    // TRA-4894 — classify the row on the REAL-FILL basis in the same pass that
+    // folds it, for the same reason TRA-4578's census is counted here: only this
+    // loop knows which rows survived the four drop predicates and the window,
+    // and a subset re-derived upstream would have to re-implement all of them.
+    const realFill = priceRealFillRow(r as Parameters<typeof priceRealFillRow>[0]);
+    if (realFill.rFillNet !== null && Number.isFinite(realFill.rFillNet)) {
+      cell.realFillValues.push(realFill.rFillNet);
+    } else {
+      // A finite-check failure with no reason is still an ignorance case, and it
+      // is named rather than silently pooled with the priced rows.
+      const why = realFill.unpriced ?? 'realized_pnl_missing';
+      cell.realFillDrops[why] = (cell.realFillDrops[why] ?? 0) + 1;
+    }
     // TRA-4578 — census the row that actually LANDED in the cell. It is counted
     // here, after all four drop predicates and the window cutoff, and not in the
     // cache beside the table-level census, precisely because only this loop knows
@@ -589,6 +786,28 @@ export function buildTapeExpectancyTable(
       const netValues = costR === null ? null : values.map((v, i) => (grossOfCross[i] ? v - costR : v));
       const net = netValues === null ? null : cellStats(netValues);
 
+      // ── TRA-4894 — the REAL-FILL arm ───────────────────────────────────────
+      const nRealFill = acc.realFillValues.length;
+      const rf = realFillStats(acc.realFillValues);
+      const need = rf.boundNoiseR === null ? null : barR + rf.boundNoiseR;
+      const admitsPooled = n >= minCellN && lowerCI95 !== null && lowerCI95 >= barR;
+      const admitsRealFill =
+        nRealFill >= minCellRealFillN && rf.lo !== null && need !== null && rf.lo >= need;
+      // FAIL-NULL: the reason is populated whenever the arm cannot decide, and
+      // it names the drop census. `nRealFill: 0` with a null reason would read
+      // as "measured, and empty" — the same-reading-instrument defect.
+      const dropCensus = Object.entries(acc.realFillDrops)
+        .sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]))
+        .map(([why, count]) => `${why}=${count}`)
+        .join(', ');
+      const realFillUnavailableReason = admitsRealFill
+        ? null
+        : nRealFill < minCellRealFillN
+          ? `nRealFill=${nRealFill} of n=${n} carries broker truth on BOTH legs (< ${minCellRealFillN} required) — dropped: ${dropCensus || 'none'}`
+          : rf.lo === null || need === null
+            ? `nRealFill=${nRealFill} but no dispersion estimate exists for the real-fill subset — no bound, so no promotion`
+            : `real-fill bound ${rf.lo.toFixed(4)}R < ${need.toFixed(4)}R (bar ${barR.toFixed(4)} + boundNoise ${(rf.boundNoiseR as number).toFixed(4)}) over nRealFill=${nRealFill}`;
+
       return {
         structure,
         bucket,
@@ -602,7 +821,18 @@ export function buildTapeExpectancyTable(
         seR_gate: se,
         lowerCI95,
         barR,
-        admits: n >= minCellN && lowerCI95 !== null && lowerCI95 >= barR,
+        // TRA-4894 — a CONJUNCTION. The pooled arm's inputs are untouched; the
+        // real-fill arm is ANDed on, so this can only ever become MORE
+        // conservative than the pre-TRA-4894 value, which is `admitsPooled`.
+        admits: admitsPooled && admitsRealFill,
+        admitsPooled,
+        admitsRealFill,
+        nRealFill,
+        meanR_gate_realFillNet: rf.mean,
+        sdR_gate_realFill: rf.sd,
+        loRealFillNet: rf.lo,
+        boundNoiseR: rf.boundNoiseR,
+        realFillUnavailableReason,
         provenance: {
           byMode: { ...acc.byMode },
           byAccountClass: { desk: acc.desk, unattributed: acc.unattributed },
@@ -644,6 +874,7 @@ export function buildTapeExpectancyTable(
     computedAt,
     minCellN,
     z: TAPE_EXPECTANCY_Z95,
+    minCellRealFillN,
     cells: out,
   };
 }
@@ -672,6 +903,22 @@ export function findTapeExpectancyCell(
  *                              `otm-sleeve-mandate.ts`, NOT from the bar, and
  *                              checked BEFORE any bar arithmetic — see
  *                              {@link tapeExpectancyVerdict}.
+ *   `insufficient_real_fill_evidence`
+ *                            — NEW (TRA-4894, spec TRA-4887). The cell holds
+ *                              enough POOLED rows, but fewer than
+ *                              {@link TAPE_EXPECTANCY_MIN_CELL_REAL_FILL_N} of
+ *                              them are broker truth on both legs. **We measured
+ *                              it at the MID, and we have never measured it on
+ *                              real fills.** Deliberately distinct from
+ *                              `insufficient_evidence` (too few rows of ANY
+ *                              kind) and from `gross_negative` (we measured a
+ *                              loser): the live cell under audit was 93 demo
+ *                              rows booked at the pre-trade NBBO mid against 17
+ *                              live ones, and at the TRA-4890 bar it would have
+ *                              promoted to capital under the OLD `shortfall_*`
+ *                              vocabulary — i.e. under a code that says "close,
+ *                              needs a nudge" about a cell whose 23 real desk
+ *                              rows returned −0.835 R_gate / −$497.
  *   `insufficient_evidence`  — Ruling 2.5. The cell exists on the delta axis but
  *                              holds `n < 30` closed rows, or the tape has never
  *                              been folded. **We never measured.** It DECLINES,
@@ -699,6 +946,7 @@ export function findTapeExpectancyCell(
 export type TapeExpectancyReasonCode =
   | 'band_deauthorized'
   | 'insufficient_evidence'
+  | 'insufficient_real_fill_evidence'
   | 'gross_unknown'
   | 'gross_negative'
   | string;
@@ -742,6 +990,21 @@ export const DECLINE_REASON_TAXONOMY: readonly {
     source: 'option-tape-expectancy.ts, cell mean vs 0 (classified on the MEAN, not the lower bound).',
     response: 'None needed — the bar is doing its job. Do not confuse with an imprecise-but-positive cell.',
   },
+  {
+    code: 'insufficient_real_fill_evidence',
+    meaning:
+      'WE MEASURED IT AT THE MID — the pooled cell is powered, but fewer than 40 of its rows carry '
+      + 'broker truth on BOTH legs (`pnlBasis: broker-fill` + finite positive entry AND exit fill premia). '
+      + 'That is NOT "too few rows" and NOT "a measured loser": it is a cell whose positive number is a '
+      + 'basis artifact until real fills say otherwise.',
+    source:
+      'option-tape-expectancy.ts, cell.nRealFill vs TAPE_EXPECTANCY_MIN_CELL_REAL_FILL_N, and '
+      + 'cell.loRealFillNet vs barR + cell.boundNoiseR (TRA-4894, spec TRA-4887 §5).',
+    response:
+      'Accrue REAL FILLS, not rows. ⛔ Do NOT respond by moving the bar: the measured entry-basis '
+      + 'overstatement alone is 0.2004 R_gate at the median of the 16 broker_reconcile restatements '
+      + '(14 of 16 adverse), 4.3x the bar move that would otherwise have promoted this cell.',
+  },
 ];
 
 /** The admit/decline verdict for one candidate under the tape-calibrated form. */
@@ -759,6 +1022,17 @@ export interface TapeExpectancyVerdict {
   seR_gate: number | null;
   /** The decision statistic: `mean − 1.96·SE`. Null ⇒ declined for want of it. */
   lowerCI95: number | null;
+  /**
+   * TRA-4894 — rows behind the decision that are broker truth on BOTH legs.
+   * 0 when no cell was found. Carried on the verdict, not just on the table,
+   * because the ledger's `byReason` fold is where a reader asks "how many of
+   * these declines were basis-unmeasured?" and the cell is not in scope there.
+   */
+  nRealFill: number;
+  /** TRA-4894 — the real-fill arm's `t`-bound; null when it could not be formed. */
+  loRealFillNet: number | null;
+  /** TRA-4894 — the SD-estimation noise added to the bar; null with the bound. */
+  boundNoiseR: number | null;
   /** The bar the lower bound had to clear. */
   barR: number;
   /** Bounded classification for the ledger fold; null when admitted. */
@@ -831,6 +1105,9 @@ export function tapeExpectancyVerdict(
       meanR_gate: null,
       seR_gate: null,
       lowerCI95: null,
+      nRealFill: 0,
+      loRealFillNet: null,
+      boundNoiseR: null,
       reasonCode: 'gross_unknown',
       reason: `tape-expectancy gate (TRA-3391): candidate |delta| ${candidate.delta} is not a usable delta — no cell exists, fail closed`,
     };
@@ -853,6 +1130,9 @@ export function tapeExpectancyVerdict(
       meanR_gate: cell?.meanR_gate ?? null,
       seR_gate: cell?.seR_gate ?? null,
       lowerCI95: cell?.lowerCI95 ?? null,
+      nRealFill: cell?.nRealFill ?? 0,
+      loRealFillNet: cell?.loRealFillNet ?? null,
+      boundNoiseR: cell?.boundNoiseR ?? null,
       reasonCode: 'band_deauthorized',
       reason:
         `sleeve mandate (${OTM_SLEEVE_MANDATE_ISSUE}, enforced by TRA-3394): |delta| band `
@@ -877,34 +1157,74 @@ export function tapeExpectancyVerdict(
       meanR_gate: cell?.meanR_gate ?? null,
       seR_gate: cell?.seR_gate ?? null,
       lowerCI95: cell?.lowerCI95 ?? null,
+      nRealFill: cell?.nRealFill ?? 0,
+      loRealFillNet: cell?.loRealFillNet ?? null,
+      boundNoiseR: cell?.boundNoiseR ?? null,
       reasonCode: 'insufficient_evidence',
       reason: `tape-expectancy gate (TRA-3391): INSUFFICIENT EVIDENCE for ${structure} |delta| ${bucket} — ${why}. This is NOT a measured loser; it is an unmeasured cell, and an unmeasured cell declines (TRA-3388 Ruling 2.5).`,
     };
   }
 
   const lower = cell.lowerCI95;
-  if (lower >= barR) {
+  const stats = {
+    n: cell.n,
+    meanR_gate: cell.meanR_gate,
+    seR_gate: cell.seR_gate,
+    lowerCI95: lower,
+    nRealFill: cell.nRealFill,
+    loRealFillNet: cell.loRealFillNet,
+    boundNoiseR: cell.boundNoiseR,
+  };
+
+  // TRA-4894 — `cell.admits` is the conjunction, so an admit here is an admit on
+  // BOTH arms. Read off the cell rather than recomputed, so the verdict and the
+  // published table cannot disagree about a decision with money behind it.
+  if (cell.admits) {
+    return { ...base, ...stats, admit: true, reasonCode: null, reason: '' };
+  }
+
+  // A MEASURED LOSER stays a measured loser. This branch keeps its pre-TRA-4894
+  // precedence deliberately: `gross_negative` is the settled, actionable fact
+  // ("the bar is working"), and demoting it behind a real-fill code would tell
+  // the board to go accrue fills on a cell that already measured negative.
+  if (lower < barR && cell.meanR_gate < 0) {
+    const detail = `${structure} |delta| ${bucket}: mean ${cell.meanR_gate.toFixed(3)}R_gate, SE ${(cell.seR_gate ?? 0).toFixed(3)}, lower 95% CI ${lower.toFixed(3)}R < ${barR.toFixed(3)}R bar over n=${cell.n} closed tape rows`;
     return {
       ...base,
-      admit: true,
-      n: cell.n,
-      meanR_gate: cell.meanR_gate,
-      seR_gate: cell.seR_gate,
-      lowerCI95: lower,
-      reasonCode: null,
-      reason: '',
+      ...stats,
+      admit: false,
+      reasonCode: 'gross_negative',
+      reason: `tape-expectancy gate (TRA-3391): ${detail}`,
+    };
+  }
+
+  // TRA-4894 — the real-fill arm, AHEAD of the pooled shortfall bucketing. The
+  // order is the guarantee, the same way TRA-3394's mandate check runs ahead of
+  // the bar: a cell that has never been measured on broker fills must not be
+  // reported as "close to the bar", because that is a `shortfall_*` code and the
+  // documented response to a shortfall is to look at the bar.
+  if (!cell.admitsRealFill) {
+    const why = cell.realFillUnavailableReason ?? 'the real-fill subset could not be evaluated';
+    return {
+      ...base,
+      ...stats,
+      admit: false,
+      reasonCode: 'insufficient_real_fill_evidence',
+      reason:
+        `tape-expectancy gate (TRA-4894, spec TRA-4887): NO REAL-FILL EVIDENCE for ${structure} `
+        + `|delta| ${bucket} — ${why}. The pooled cell (n=${cell.n}, mean ${cell.meanR_gate.toFixed(3)}R_gate, `
+        + `lower95 ${lower.toFixed(3)}R vs bar ${barR.toFixed(3)}R) is booked at the PRE-TRADE NBBO MID on `
+        + 'every row without a `broker-fill` basis. This is NOT a measured loser and NOT a bar shortfall; '
+        + 'it is an unmeasured basis, and it declines.',
     };
   }
 
   const detail = `${structure} |delta| ${bucket}: mean ${cell.meanR_gate.toFixed(3)}R_gate, SE ${(cell.seR_gate ?? 0).toFixed(3)}, lower 95% CI ${lower.toFixed(3)}R < ${barR.toFixed(3)}R bar over n=${cell.n} closed tape rows`;
   return {
     ...base,
+    ...stats,
     admit: false,
-    n: cell.n,
-    meanR_gate: cell.meanR_gate,
-    seR_gate: cell.seR_gate,
-    lowerCI95: lower,
-    reasonCode: cell.meanR_gate < 0 ? 'gross_negative' : shortfallCode(barR - lower),
+    reasonCode: shortfallCode(barR - lower),
     reason: `tape-expectancy gate (TRA-3391): ${detail}`,
   };
 }

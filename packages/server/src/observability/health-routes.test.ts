@@ -6414,17 +6414,25 @@ describe('GET /api/health/otm-sleeve-mandate (TRA-3394)', () => {
   });
 
   // (b) the three decline reason codes
-  it('publishes THREE distinct decline reason codes, each with its own response', () => {
+  it('publishes FOUR distinct decline reason codes, each with its own response', () => {
     const body = serve();
     expect(body.declineReasonCodes.map((r) => r.code)).toEqual([
       'band_deauthorized', 'insufficient_evidence', 'gross_negative',
+      // TRA-4894 — the fourth: the pooled cell is powered and the bar is not the
+      // issue; we have simply never measured this cell on broker fills.
+      'insufficient_real_fill_evidence',
     ]);
-    expect(new Set(body.declineReasonCodes.map((r) => r.response)).size).toBe(3);
-    // "we measured a loser" vs "we never measured" vs "the mandate forbids it" is
-    // the distinction the board could not previously make.
+    expect(new Set(body.declineReasonCodes.map((r) => r.response)).size).toBe(4);
+    // "we measured a loser" vs "we never measured" vs "the mandate forbids it"
+    // vs "we measured it AT THE MID" is the distinction the board could not
+    // previously make.
     expect(body.declineReasonCodes[0]!.meaning).toMatch(/MANDATE FORBIDS/);
     expect(body.declineReasonCodes[1]!.meaning).toMatch(/NEVER MEASURED/);
     expect(body.declineReasonCodes[2]!.meaning).toMatch(/MEASURED A LOSER/);
+    expect(body.declineReasonCodes[3]!.meaning).toMatch(/MEASURED IT AT THE MID/);
+    // …and the fourth's response must NOT be "move the bar", which is the
+    // response the `shortfall_*` vocabulary it replaces would have invited.
+    expect(body.declineReasonCodes[3]!.response).toMatch(/Do NOT respond by moving the bar/);
   });
 
   // (c) the ceiling gate's own counters
