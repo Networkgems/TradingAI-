@@ -81,6 +81,70 @@ describe('durability verdict (TRA-1681)', () => {
     expect(r.ok).toBe(false);
   });
 
+  // ── TRA-4896 ───────────────────────────────────────────────────────────────────────
+  // The self-host's DATA_DIR was SET (so the `data_dir_unset` arm above never applied)
+  // and pointed at `<paperclip scratch>/_default/tradingai_repo/packages/server/data`.
+  // It tripped `data_dir_ephemeral` on the `/packages/server` marker alone — which is
+  // the right VERDICT for the wrong REASON, and the wrong reason has a different fix.
+  // The bundle marker says "point DATA_DIR off the bundle"; obeying that literally
+  // lands you at `<paperclip scratch>/_default/data`, which is just as erasable and
+  // would have read GREEN. These pin that it does not.
+  describe('the ephemeral scratch tree is its own reason, not a bundle-path accident', () => {
+    const scratch = 'C:/Users/x/.paperclip/instances/default/projects/co/proj/_default';
+
+    it('names the scratch tree when the path is inside it but OUT of the bundle', () => {
+      const dataDir = `${scratch}/data`;
+      const r = evaluateDurability(inputs({ dataDir }), { DATA_DIR: dataDir } as NodeJS.ProcessEnv);
+      expect(r.ephemeral).toBe(true);
+      expect(r.ephemeralReason).toBe('in_ephemeral_scratch_tree');
+      expect(r.violations).toContain('data_dir_ephemeral');
+    });
+
+    it('reports the live pre-fix path (both markers) as ephemeral', () => {
+      const dataDir = `${scratch}/tradingai_repo/packages/server/data`;
+      const r = evaluateDurability(inputs({ dataDir }), { DATA_DIR: dataDir } as NodeJS.ProcessEnv);
+      expect(r.ephemeral).toBe(true);
+      expect(r.violations).toContain('data_dir_ephemeral');
+    });
+
+    it('accepts the post-fix machine-wide targets and reports reason null', () => {
+      for (const dataDir of ['C:/ProgramData/TradingAI/data', '/srv/tradingai/data', '/data']) {
+        const r = evaluateDurability(inputs({ dataDir }), { DATA_DIR: dataDir } as NodeJS.ProcessEnv);
+        expect(r.ephemeral, dataDir).toBe(false);
+        expect(r.ephemeralReason, dataDir).toBeNull();
+        expect(r.violations, dataDir).toEqual([]);
+      }
+    });
+
+    it('carries the reason on the two pre-existing arms too', () => {
+      expect(
+        evaluateDurability(inputs({ dataDir: null }), { DATA_DIR: '/data' } as NodeJS.ProcessEnv)
+          .ephemeralReason,
+      ).toBe('memory_only');
+      expect(
+        evaluateDurability(inputs({ dataDir: '/data' }), {} as NodeJS.ProcessEnv).ephemeralReason,
+      ).toBe('data_dir_unset');
+      expect(
+        evaluateDurability(
+          inputs({ dataDir: '/app/packages/server/data' }),
+          { DATA_DIR: '/app/packages/server/data' } as NodeJS.ProcessEnv,
+        ).ephemeralReason,
+      ).toBe('in_build_bundle');
+    });
+
+    it('is separable from the disk axis — free space cannot clear it (TRA-4854)', () => {
+      // The parent ticket's deliverable was "durability reads ok:true", pursued by
+      // pruning disk. This is the arithmetic showing that could never have worked.
+      const dataDir = `${scratch}/tradingai_repo/packages/server/data`;
+      const r = evaluateDurability(
+        inputs({ dataDir, disk: disk({ belowThreshold: false, belowThresholdSeen: false }) }),
+        { DATA_DIR: dataDir } as NodeJS.ProcessEnv,
+      );
+      expect(r.violations).toEqual(['data_dir_ephemeral']);
+      expect(r.ok).toBe(false);
+    });
+  });
+
   it('treats an UNMEASURED journal as not-ok, never as a pass', () => {
     // `corruptLines: null` means no load has run. It is NOT `0`, which is a real
     // measurement of a clean file (TRA-1707). Folding unmeasured into ok=true would

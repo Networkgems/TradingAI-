@@ -61,7 +61,61 @@ export function resolveDataDir(
 }
 
 /**
- * TRUE when `dir` will be ERASED on the next redeploy/restart.
+ * TRA-4896 — the path substrings that mark a directory as NOT durable, each with the
+ * reason it is not, because the two classes have different remedies.
+ *
+ * `in_build_bundle` is erased by the next *redeploy* (the bytes ship with the build).
+ * `in_ephemeral_scratch_tree` is erased by the next *re-stage* of an agent scratch
+ * tree, which is a separate event that no deploy record mentions.
+ *
+ * Exported so the marker list is greppable and testable in one place rather than
+ * re-spelled at each call site — the copy-drifts lesson that created this module.
+ */
+export const EPHEMERAL_PATH_MARKERS: ReadonlyArray<{
+  marker: string;
+  reason: 'in_build_bundle' | 'in_ephemeral_scratch_tree';
+}> = [
+  { marker: 'node_modules', reason: 'in_build_bundle' },
+  { marker: '/packages/server', reason: 'in_build_bundle' },
+  // TRA-4896 — the Paperclip per-project scratch tree
+  // (`~/.paperclip/instances/<inst>/projects/<company>/<project>/_default/...`) and the
+  // per-agent workspace tree beside it are RE-STAGEABLE BY DESIGN: the harness may
+  // replace the checkout wholesale between runs, and TRA-4851 already had to defend the
+  // PM2 boot path against exactly that property. A data dir anywhere under
+  // `.paperclip/instances/` is therefore ephemeral REGARDLESS of how durable the
+  // underlying volume is, and — crucially — regardless of whether the path also happens
+  // to contain `/packages/server`. Without this marker the obvious "fix" for TRA-4896
+  // (point DATA_DIR at `<project>/_default/data`, one level up out of the bundle) would
+  // clear the violation while changing nothing about what erases the bytes.
+  { marker: '/.paperclip/instances/', reason: 'in_ephemeral_scratch_tree' },
+];
+
+/** Why a data dir is not durable, or `null` when it is. */
+export type EphemeralDataDirReason =
+  | 'memory_only'
+  | 'data_dir_unset'
+  | 'in_build_bundle'
+  | 'in_ephemeral_scratch_tree'
+  | null;
+
+/** Why `dir` is not durable, or `null` when it is. See `isEphemeralDataDir`. */
+export function ephemeralDataDirReason(
+  dir: string | null,
+  env: NodeJS.ProcessEnv = process.env,
+): EphemeralDataDirReason {
+  // Memory-only (no boot hydrate ran): nothing is durable by definition.
+  if (dir == null) return 'memory_only';
+  // Unset env ⇒ the caller took its in-bundle fallback, whatever that path looks like.
+  if (!env.DATA_DIR) return 'data_dir_unset';
+  const norm = dir.replace(/\\/g, '/');
+  for (const { marker, reason } of EPHEMERAL_PATH_MARKERS) {
+    if (norm.includes(marker)) return reason;
+  }
+  return null;
+}
+
+/**
+ * TRUE when `dir` will be ERASED on the next redeploy/restart/re-stage.
  *
  * Two ways to be ephemeral, and the first is the one that bites: `DATA_DIR` unset means
  * the caller fell back to a path inside the build bundle (`index.ts` does
@@ -74,10 +128,5 @@ export function isEphemeralDataDir(
   dir: string | null,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  // Memory-only (no boot hydrate ran): nothing is durable by definition.
-  if (dir == null) return true;
-  // Unset env ⇒ the caller took its in-bundle fallback, whatever that path looks like.
-  if (!env.DATA_DIR) return true;
-  const norm = dir.replace(/\\/g, '/');
-  return norm.includes('node_modules') || norm.includes('/packages/server');
+  return ephemeralDataDirReason(dir, env) !== null;
 }

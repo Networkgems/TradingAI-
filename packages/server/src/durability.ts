@@ -35,7 +35,7 @@
 // So the verdict has to be COMPUTED and PUBLISHED, not caught — and then something
 // has to be willing to act on it. A guard protecting an invariant must fail CLOSED.
 
-import { isEphemeralDataDir } from './data-dir.js';
+import { ephemeralDataDirReason, type EphemeralDataDirReason } from './data-dir.js';
 // TRA-3011 — the staleness bar for a disk reading. `disk-watermark.ts` has only a
 // type-only import of its own, so this pulls in no runtime dependency.
 import { DISK_READING_MAX_AGE_SEC } from './observability/disk-watermark.js';
@@ -169,6 +169,13 @@ export interface DurabilityReport {
   dataDir: string | null;
   /** TRUE ⇒ every durable count on this box dies at the next redeploy. Read this FIRST. */
   ephemeral: boolean;
+  /**
+   * TRA-4896 — WHY it is ephemeral, `null` when it is not. The remedies are different:
+   * `in_build_bundle` is fixed by pointing DATA_DIR off the bundle, while
+   * `in_ephemeral_scratch_tree` is fixed by leaving the agent scratch tree entirely —
+   * and the naive fix for the first lands you squarely in the second.
+   */
+  ephemeralReason: EphemeralDataDirReason;
   stateDb: StateDbStatus;
   journal: { corruptLines: number | null; readError: string | null } | null;
   ledger: { appendErrors: number } | null;
@@ -192,7 +199,8 @@ export function evaluateDurability(
   const violations: DurabilityViolation[] = [];
   const unmeasured: DurabilityUnmeasured[] = [];
 
-  const ephemeral = isEphemeralDataDir(inputs.dataDir, env);
+  const ephemeralReason = ephemeralDataDirReason(inputs.dataDir, env);
+  const ephemeral = ephemeralReason !== null;
   if (ephemeral) violations.push('data_dir_ephemeral');
 
   // `initialized:false` is UNKNOWN, not broken — a CLI or a unit test never opens the
@@ -239,6 +247,7 @@ export function evaluateDurability(
     policy: resolveDurabilityPolicy(env),
     dataDir: inputs.dataDir,
     ephemeral,
+    ephemeralReason,
     stateDb: inputs.stateDb,
     journal: inputs.journal ?? null,
     ledger: inputs.ledger ?? null,

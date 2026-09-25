@@ -5820,6 +5820,7 @@ describe('durabilityNote (TRA-3011)', () => {
     policy: 'observe' as const,
     dataDir: '/data',
     ephemeral: false,
+    ephemeralReason: null, // TRA-4896
     stateDb: { available: true, reason: null, initialized: true },
     journal: { corruptLines: 0, readError: null },
     ledger: { appendErrors: 0 },

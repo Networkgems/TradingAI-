@@ -36,10 +36,24 @@ APP_NAME="trading-server"
 NO_BUILD=0
 [ "${1:-}" = "--no-build" ] && NO_BUILD=1
 
-# ── 2. Canonical, absolute, launch-independent DATA_DIR ───────────────────────
-# Default to the canonical repo's data dir; override by exporting DATA_DIR.
-# Resolve to an absolute path so the value is identical no matter the launch cwd.
-DATA_DIR="${DATA_DIR:-${REPO_ROOT}/packages/server/data}"
+# ── 2. Canonical, absolute, launch-independent, OUT-OF-TREE DATA_DIR ──────────
+# TRA-4896 — the default moved OFF `${REPO_ROOT}/packages/server/data`.
+#
+# TRA-522 made the path launch-independent, which fixed the swap. But it left the
+# book inside the CHECKOUT, and a checkout is disposable: on the self-host it sits
+# in an agent scratch tree the harness may re-stage wholesale, and on any host it
+# is inside the build bundle a redeploy replaces. `/api/health/durability` has been
+# reporting that as `data_dir_ephemeral` — independent of free disk, so no amount
+# of pruning (TRA-4854) could ever clear it.
+#
+# This default MUST agree with `defaultDataDir()` in ecosystem.config.cjs. Two
+# copies of a path convention drift, and the one that drifts is the one somebody is
+# trusting — the lesson that created packages/server/src/data-dir.ts.
+#
+# ⚠️ Changing where this points does NOT move the bytes, and a launch against an
+# empty DATA_DIR boots an empty book that reads as a quiet window rather than as
+# missing data. Run `node ops/relocate-data-dir.mjs` (server stopped) first.
+DATA_DIR="${DATA_DIR:-/srv/tradingai/data}"
 mkdir -p "${DATA_DIR}"
 DATA_DIR="$(cd -- "${DATA_DIR}" >/dev/null 2>&1 && pwd -P)"
 export DATA_DIR
