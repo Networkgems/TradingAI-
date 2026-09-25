@@ -201,9 +201,22 @@ constants, so the row cannot claim a cadence the source does not hold.
 The compaction **outcome** is published at `/api/health/cost-aware-gate` → `compaction`
 (`trigger`, `ranAt`, `cutoff`, `linesBefore/After`, `linesDropped`, `bytesBefore/After`, `rewrote`,
 `bufferedAppendsFlushed`) — `reversalShadowCompaction`'s shape plus the field that answers the
-question that shape cannot: **`timerCompactions`**. A build where the interval was never armed
-publishes a perfectly ordinary `trigger: 'boot'` outcome forever, and nothing else on the payload
-separates it from a working hook.
+question that shape cannot: **`hookState`**. A build where the interval was never armed publishes a
+perfectly ordinary `trigger: 'boot'` outcome forever, and nothing else on the payload separates it
+from a working hook.
+
+⚠️ **Read `hookState`, not `timerCompactions`.** A fire count cannot carry this on bqb1, because the
+box is usually up for *less* than one 6h interval (1416 s at the 04:36Z read), so **zero fires is the
+ordinary healthy reading** — and in that case the overshoot is bounded by the boot gap instead, which
+is tighter than the timer. The enum is derived off the arm instant
+(`noteCostAwareGateCompactionTimerArmed`, called in `index.ts` right after the `setInterval`):
+
+| `hookState` | meaning |
+|---|---|
+| `timer_not_armed` | **the alarm** — nothing scheduled a fire. The pre-TRA-4904 state. |
+| `armed_not_yet_due` | armed, 0 fires, inside the first interval. Not a reading either way. |
+| `firing` | ≥1 fire, next not overdue. The working state. |
+| `overdue` | armed and past due with no fire — the interval died, or the loop is wedged. |
 
 **Do the other three need the same timer? Still no — and here is the arithmetic that would change
 the answer.** The trio's pooled append rate is `2.07 + 1.68 + 1.27` = **5.02 MiB/day**, so at the
