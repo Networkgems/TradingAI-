@@ -610,4 +610,102 @@ describe('TRA-4423 — the ORDER-INDEPENDENT per-setup fold', () => {
     expect(sumConflict).toBe(cf.wouldBlockByReasonCode.setup_side_conflict);
     expect(cf.confirmed + cf.wouldBlock).toBe(cf.evaluated);
   });
+
+  // ─── throw / decline-leg discrimination (TRA-4423) ────────────────────────
+  //
+  // ⛔ WHY. On 2026-09-25 E read a dense `reached: 1869 / matchedSameSide: 0` on
+  // the live book and the zero was STILL unreadable, for two reasons this block
+  // closes: a THROW folds as a decline upstream and nothing counted it, and a
+  // four-leg conjunction returned one undifferentiated `null`.
+
+  /** E, but it crashes. */
+  const throwingE: SetupTaxonomyDefinition = {
+    setupId: 'E', label: 'E', minBars: 10, evaluate: () => { throw new Error('boom'); },
+  };
+  /** E, but it declines and says which leg refused. */
+  const decliningE = (leg: string): SetupTaxonomyDefinition => ({
+    setupId: 'E', label: 'E', minBars: 10, evaluate: () => ({ setupId: 'E', declinedAt: leg }),
+  });
+
+  it('⛔ THE DISCRIMINATOR: a setup that THROWS on every row is not a setup that declines', () => {
+    // Before `threwBySetup` these two folds were byte-identical on every
+    // published cell, so a crashing setup read as a quiet market.
+    const crashing = [setupB('call'), throwingE];
+    for (let i = 0; i < 4; i += 1) {
+      noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(input, env, crashing));
+    }
+    const crash = readOtmSetupGateCounterfactual(crashing);
+    expect(crash.reachedBySetup.E).toBe(4);
+    expect(crash.matchedSameSideBySetup.E).toBe(0);
+    expect(crash.threwBySetup.E).toBe(4);
+    // ⛔ A throw has NO leg — folding it into the histogram would let a crash
+    // read as a market observation.
+    expect(crash.declineLegBySetup.E).toEqual({});
+    expect(crash.declinedUnattributedBySetup.E).toBe(0);
+
+    // The honest-decline control, same shape on every OLD cell.
+    resetOtmSetupGateCounterfactualForTest();
+    const quiet = [setupB('call'), neverE];
+    for (let i = 0; i < 4; i += 1) {
+      noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(input, env, quiet));
+    }
+    const calm = readOtmSetupGateCounterfactual(quiet);
+    expect(calm.reachedBySetup.E).toBe(4);
+    expect(calm.matchedSameSideBySetup.E).toBe(0);
+    // Identical to the crash on the pre-existing cells; different where it counts.
+    expect(calm.threwBySetup.E).toBe(0);
+    expect(calm.declinedUnattributedBySetup.E).toBe(4);
+  });
+
+  it('folds WHICH LEG refused, per setup, and keeps the legs apart', () => {
+    const reg = [setupB('call'), decliningE('not_coiled')];
+    for (let i = 0; i < 3; i += 1) {
+      noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(input, env, reg));
+    }
+    const alt = [setupB('call'), decliningE('no_volume_data')];
+    noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(input, env, alt));
+    const cf = readOtmSetupGateCounterfactual(reg);
+    expect(cf.declineLegBySetup.E).toEqual({ not_coiled: 3, no_volume_data: 1 });
+    // Attributed declines are NOT double-counted as unattributed.
+    expect(cf.declinedUnattributedBySetup.E).toBe(0);
+    expect(cf.threwBySetup.E).toBe(0);
+  });
+
+  it('⛔ an UNATTRIBUTED decline is counted, so an empty leg map cannot read as "never declined"', () => {
+    const reg = [setupB('call'), neverE];
+    noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(input, env, reg));
+    const cf = readOtmSetupGateCounterfactual(reg);
+    // A-D return bare `null` today; this is the honest reading of that.
+    expect(cf.declineLegBySetup.E).toEqual({});
+    expect(cf.declinedUnattributedBySetup.E).toBe(1);
+  });
+
+  it('the new maps are dense over the registry, so an idle setup is 0/{} and not absent', () => {
+    const reg = [setupB('call'), setupE('call')];
+    noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(input, { OTM_SETUP_TAXONOMY_SETUPS: 'B' }, reg));
+    const cf = readOtmSetupGateCounterfactual(reg);
+    expect(cf.threwBySetup).toHaveProperty('E', 0);
+    expect(cf.declinedUnattributedBySetup).toHaveProperty('E', 0);
+    expect(cf.declineLegBySetup).toHaveProperty('E', {});
+  });
+
+  it('every reached row lands in exactly ONE bucket: match, throw, or decline', () => {
+    // ⛔ CAPABILITY ASSERT / the conservation law. Without this, a future edit
+    // could count a row twice (or drop it) and every individual cell above would
+    // still read plausibly.
+    const reg = [decliningE('not_coiled'), setupB('call')];
+    for (let i = 0; i < 6; i += 1) {
+      noteOtmSetupGateCounterfactual(evaluateOtmSetupGate(input, env, reg));
+    }
+    const cf = readOtmSetupGateCounterfactual(reg);
+    for (const id of ['B', 'E']) {
+      const legs = Object.values(cf.declineLegBySetup[id] ?? {}).reduce((a, b) => a + b, 0);
+      const accounted = (cf.matchedSameSideBySetup[id] ?? 0)
+        + (cf.matchedOppositeSideBySetup[id] ?? 0)
+        + (cf.threwBySetup[id] ?? 0)
+        + legs
+        + (cf.declinedUnattributedBySetup[id] ?? 0);
+      expect(accounted, `setup ${id} must conserve its reached rows`).toBe(cf.reachedBySetup[id] ?? 0);
+    }
+  });
 });

@@ -297,9 +297,9 @@ describe('TRA-2335 · §6 — the accumulation monitor must not publish a false 
 });
 
 describe('TRA-2335 · AC4 — the per-open bar shares the constant (LATENT, not live)', () => {
-  it('is comfortably feasible today at the live 0.485R bar', () => {
+  it('is comfortably feasible today at the shipped 0.4386R bar', () => {
     const bar = admissionBarR('single_leg_otm', DEFAULT_COST_GATE_CONFIG);
-    expect(bar).toBeCloseTo(0.485, 3);
+    expect(bar).toBeCloseTo(0.4386, 3);
     const f = evaluatePerOpenFeasibility({
       rewardR: 2.0,
       rewardSource: 'target_stop',
@@ -344,7 +344,7 @@ describe('TRA-2335 · AC4 — the per-open bar shares the constant (LATENT, not 
       structure: 'single_leg_otm',
     });
     expect(f.verdict).toBe('infeasible');
-    expect(f.reason).toContain('0.485');
+    expect(f.reason).toContain('0.439');
     expect(f.reason).toContain('0.300');
   });
 

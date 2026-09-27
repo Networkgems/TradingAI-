@@ -70,10 +70,24 @@ function parseNonNegFloat(raw: string | undefined): number | undefined {
 
 /**
  * The per-structure cost inputs (R-multiples of the trade's at-risk basis).
- *  - `commissionR`: Tradier options commission, round trip. $0.35/contract each
- *    way = $0.70/contract; against the estimator's true R = 25% of premium
- *    (R≈$50 on a $2.00 premium) that is ~0.014R — we default to a conservative
- *    0.05R (TRA-1603). Bounded and unavoidable.
+ *  - `commissionR`: Tradier options fees, round trip, in the estimator's true
+ *    R = 25% of premium (R≈$50 on a $2.00 premium). RETUNED to the MEASURED fee
+ *    by TRA-4890 (board direction on TRA-4885): the desk is on a Tradier **Pro**
+ *    plan, which charges **$0 commission** on options. What survives is the
+ *    unavoidable regulatory/clearing residue (ORF + OCC + SEC/TAF), ≈$0.09 per
+ *    contract per side ⇒ 2 × $0.09 / $50 = **0.0036R**. Equivalently
+ *    `commissionR(2.00, 1, 0.09)` in `option-spread-cost.ts` — this constant is
+ *    that helper's output, not an independent guess.
+ *
+ *    The prior 0.05R default (TRA-1603) predates the Pro plan and was explicitly
+ *    a CONSERVATIVE stand-in: it overstated even the old commissioned fee
+ *    ($0.35/side ⇒ $0.70 round trip ⇒ 0.014R) by ~3.6×, and overstates the fee
+ *    actually paid today by ~14×. ⚠ This is the one input of the three that
+ *    LOOSENS the bar, so it is retuned under the TRA-1897 hold / TRA-4750
+ *    stand-down on the TRA-4885 board direction and on NOTHING else. It is safe
+ *    to land only because the TRA-4894 real-fill promotion arm is LIVE and
+ *    independently refuses the single cell this move flips on the pooled arm —
+ *    see {@link DEFAULT_COST_GATE_CONFIG}. Do not widen scope from it.
  *  - `makerAdjustedSpreadCrossR`: the round-trip bid-ask spread cross, in the
  *    estimator's 25%-of-premium R. MEASURED (TRA-1656) over 38 days of recorded
  *    chains, restricted to each sleeve's admissible universe: 0.235R mean on
@@ -128,8 +142,9 @@ export interface CostGateConfig {
 
 /**
  * The shipped reference config. Options bar resolves to
- * 0.05 (commission) + 0.235 (MEASURED spread cross) + 0.20 (margin) = 0.485R,
- * clear of the 0.30R backstop floor. Equity bar resolves to
+ * 0.0036 (MEASURED commission, TRA-4890) + 0.235 (MEASURED spread cross)
+ * + 0.20 (margin) = 0.4386R, clear of the 0.30R backstop floor. Equity bar
+ * resolves to
  * 0.00 + 0.02 + 0.20 = 0.22R (kept low per the plan; equity is the least
  * cost-impaired leg).
  *
@@ -165,13 +180,26 @@ export interface CostGateConfig {
  * cost-input collapse admitting everything. If you retune the cost inputs, CHECK
  * THE FLOOR — moving one knob alone is a no-op in the binding direction.
  *
- * Effective bar 0.485R ⇒ admits at `3·|delta| − 1 ≥ 0.485`, i.e. |delta| ≥ ~0.50.
+ * FLOOR CHECKED for the TRA-4890 commission retune, both configs that exist:
+ * shipped bar 0.4386R > 0.30, and the LIVE bqb1 bar 0.3386R > 0.30 (bqb1 sets
+ * `OPTION_COST_GATE_SAFETY_MARGIN_R=0.10`, measured on the host 2026-09-25, so
+ * its bar is 0.0036 + 0.235 + 0.10, not the shipped 0.4386). The floor does not
+ * pin in either, so the retune is live-effective rather than inert — which is
+ * the direction that needed checking, because an inert retune would have read
+ * as "shipped" while behaving identically.
+ *
+ * ⚠ bqb1 sets SAFETY_MARGIN_R but does NOT set `OPTION_COST_GATE_COMMISSION_R`
+ * (measured against the host's env list, same date). That is why this constant
+ * is load-bearing on the host at all: had the env override been present it would
+ * win over this default and the code change would be a no-op there.
+ *
+ * Effective bar 0.4386R ⇒ admits at `3·|delta| − 1 ≥ 0.4386`, i.e. |delta| ≥ ~0.48.
  * Note the delta-slope in that estimator is itself unvalidated and is what
  * TRA-1647 grades next off the `byDelta` journal rollup; this config fixes the
  * COST side only.
  */
 export const DEFAULT_COST_GATE_CONFIG: CostGateConfig = {
-  optionsCost: { commissionR: 0.05, makerAdjustedSpreadCrossR: 0.235 },
+  optionsCost: { commissionR: 0.0036, makerAdjustedSpreadCrossR: 0.235 },
   equityCost: { commissionR: 0.0, makerAdjustedSpreadCrossR: 0.02 },
   safetyMarginR: 0.2,
   optionsMinGrossR: 0.3,

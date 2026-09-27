@@ -117,7 +117,7 @@ import {
   isPreTradeGateEnabled,
   recordPreTradeGateDecision,
 } from './pre-trade-gate-ledger.js';
-import { ivRankSync, ivPercentileSync, atmIvFromRows, recordDailyIv } from './iv-rank-store.js';
+import { ivRankSync, ivPercentileSync, atmIvFromRows, recordDailyIv, readIvRankCoverageSync } from './iv-rank-store.js';
 import type { SentimentIcBand } from './option-trade-journal.js';
 import { loadModelFacingJournalRows } from './model-facing-journal.js';
 import {
@@ -640,6 +640,8 @@ interface RealFillShadowInFlight {
   sizeBasis: RealFillSizeBasis;
 }
 import { recordOptionTradeEntrySlippage, recordOptionTradeEntryQuote, recordOptionTradeVoid } from './option-trade-journal.js';
+// TRA-4912 — the entry-provenance stamp (trigger + regime + score vector).
+import { buildOptionEntryProvenance } from './option-entry-provenance.js';
 import { recordEntryQuoteStampOutcome } from './entry-quote-stamp.js';
 // TRA-3905 — the per-book submitted/filled/reject fold and the permission
 // breaker. A book the broker refuses 100% of the time read FULLY ARMED on every
@@ -13153,7 +13155,19 @@ export class SignalEngine {
                     sentimentIcBand: null,
                     agentConviction: null,
                     ...(isOptionVolumeBreakoutEnabled()
-                      ? { entryArchetype: 'volume-breakout' }
+                      ? {
+                          entryArchetype: 'volume-breakout',
+                          // TRA-4912 — reason only; no candle series is in scope
+                          // in this block, so the regime and the score vector are
+                          // recorded as NOT MEASURED rather than fetched for.
+                          // Stamped ONLY on the sub-flag-admitted branch, so the
+                          // reason column partitions exactly as the archetype
+                          // does: a bare Donchian breakout keeps folding into the
+                          // `unspecified` baseline with no reason of its own,
+                          // rather than being relabelled a volume breakout it
+                          // was not.
+                          entryProvenance: buildOptionEntryProvenance('volume_breakout', null),
+                        }
                       : {}),
                     // TRA-2333 — `openDefinedRiskSpread` takes no sizing scalar,
                     // so no throttle term was applied to this ticket.
@@ -13413,6 +13427,19 @@ export class SignalEngine {
           ...(emaPullbackReason
             ? { entryArchetype: 'ema-pullback' }
             : { entryArchetype: 'rv-long' }),
+          // TRA-4912 — REASON ONLY on this path, and the omission is deliberate.
+          // The trigger is known here for free (it is the same test the archetype
+          // above keys on), so the `GROUP BY` column is populated. The regime and
+          // the score vector are passed `null` — i.e. recorded as NOT MEASURED —
+          // because no candle series is in scope in this block, and the whole
+          // point of the `ivRank: null` note directly above is that this path does
+          // not lift a per-symbol read out of the exec gate merely to enrich a
+          // journal row (TRA-1082 / TRA-1087 / TRA-1089). An honest null beats a
+          // hot-path fetch, and beats a fabricated regime outright.
+          entryProvenance: buildOptionEntryProvenance(
+            emaPullbackReason ? 'ema_pullback' : 'rv_long',
+            null,
+          ),
           // TRA-2245 — the ONE caller that keeps the reserved `single_leg_rv`
           // structure label: this is the genuine RV-scan path (compile-time OFF
           // since TRA-1207). Stamped explicitly so a future re-arm of the RV
@@ -17210,6 +17237,22 @@ export class SignalEngine {
           // counter. A dead sleeve was undetectable by the exact metric we would have
           // used to detect it. Forward-only — historical rows cannot be back-attributed.
           entryArchetype: 'directional',
+          // TRA-4912 — the entry-provenance stamp (trigger + engine regime +
+          // per-signal score vector), measured off `series`: the SAME shadow
+          // candle array `confluenceSide` read a few lines up, so the scores
+          // explain the gate that actually admitted this fill rather than
+          // describing a separately-fetched tape.
+          //
+          // Placed HERE, at the setup, not in the scan loop: every gate has
+          // already run, so this executes a handful of times a day instead of once
+          // per scanned symbol per pass. `classifyRegime`'s trailing ATR-median
+          // walk is the heaviest call in the provenance module and the scan loop
+          // is the bqb1 event-loop hot path (TRA-1082 / TRA-1087) that the
+          // `ivRank: null` convention exists to keep clear.
+          //
+          // This sleeve is the one that serves BOTH books — `demoOn` and `liveOn`
+          // gate the same scan — so wiring it stamps demo and live alike.
+          entryProvenance: buildOptionEntryProvenance('directional_confluence', series),
           // TRA-2245 — stamp the directional STRUCTURE label so this near-ATM,
           // trend-aligned sleeve no longer wears the `single_leg_rv` label of the
           // (compile-time-OFF, TRA-1207) True RV engine. Keeps the board's RV vs
@@ -17533,7 +17576,13 @@ export class SignalEngine {
         // gate) — warms the store like TRA-1153, no extra per-symbol fetch.
         const atmIv = atmIvFromRows(snap.rows, snap.spot);
         if (atmIv != null) void recordDailyIv(sym, atmIv, asOf).catch(() => {});
-        const ivRank = atmIv != null ? ivRankSync(sym, atmIv, asOf) : null;
+        // TRA-4917 — ONE store read yields the rank AND the branch that produced
+        // it, so a null on `GET /api/health/short-premium` is attributable
+        // (`store_unloaded` / `no_atm_iv` / `uncovered` / `insufficient_history` /
+        // `flat_window`). Deliberately NOT `ivRankSync` plus a separate depth
+        // read: two reads can disagree about which window they saw, and the whole
+        // point is that the reason and the value describe the same window.
+        const ivReading = readIvRankCoverageSync(sym, atmIv, asOf);
         // TRA-2028 — the IV-PERCENTILE the wheel entry filter gates on, off the
         // SAME mid-mark ATM-IV surface. `markKind:'stale'` when no usable mid IV
         // this pass (fail-loud), so the filter never gates on a proxy.
@@ -17543,7 +17592,7 @@ export class SignalEngine {
         const result = scanShortPremiumFromSnapshot(
           { symbol: snap.symbol, spot: snap.spot, expiration: snap.expiration, rows: snap.rows },
           dailyCloses,
-          ivRank,
+          ivReading,
         );
         recordShortPremiumScan(result, asOf);
         if (routeWheel && isWheelUniverseSymbol(result.symbol)) {
@@ -17556,6 +17605,8 @@ export class SignalEngine {
             expiration: result.expiration,
             realizedVol: result.realizedVol,
             ivRank: result.ivRank,
+            ivRankCoverage: result.ivRankCoverage,
+            ivSampleDepth: result.ivSampleDepth,
             candidateCount: result.candidates.length,
             top: result.candidates[0]?.structure,
             topScore: result.candidates[0]?.score,
@@ -18023,6 +18074,10 @@ export class SignalEngine {
       // Attribution hook: separates these fills from the RV sleeve in the
       // TRA-1200 byArchetype rollup — how the board reads "mispriced vs RV".
       entryArchetype: 'iv-rv-buy-premium',
+      // TRA-4912 — reason only. This sleeve's trigger is an IV-vs-RV residual on
+      // the option chain, not a read of the underlying's candles, so there is no
+      // series here to classify a regime from. Recorded as not-measured.
+      entryProvenance: buildOptionEntryProvenance('iv_rv_mispricing', null),
       // TRA-2245 — a directional (`sleeve: 'directional'`) mispriced-value buy,
       // NOT the True RV engine. Stamp the directional structure label so it stops
       // sharing `single_leg_rv` with the (compile-time-OFF) RV scan.

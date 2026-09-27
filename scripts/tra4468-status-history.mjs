@@ -141,16 +141,119 @@ async function resolveIssue(ref) {
   return api(`/api/issues/${hit.id}`); // compact rows null out blockedTransitionAt
 }
 
+/**
+ * Self-check the three event shapes `transitionOf` keys on.
+ *
+ * Two halves, and the live one is the point. The fixtures prove the parser still
+ * recognises each shape; the census proves the PLATFORM still emits it. A shape
+ * that quietly stops appearing is indistinguishable from a quiet fleet — which is
+ * the same class of defect this whole script exists to work around — so a zero
+ * count is reported as a failure, not as a clean run.
+ */
+async function audit() {
+  const T = '2026-09-09T20:32:16.020Z';
+  const fixtures = [
+    {
+      shape: 'changes.status (explicit PATCH)',
+      event: { createdAt: T, action: 'issue.updated', details: { changes: { status: { from: 'todo', to: 'in_progress' } } } },
+      want: { from: 'todo', to: 'in_progress', via: 'patch' },
+    },
+    {
+      shape: 'previousStatus/status (system + recovery write, no `changes` block)',
+      event: { createdAt: T, action: 'issue.updated', details: { previousStatus: 'in_progress', status: 'blocked', source: 'recovery.reconcile_stranded_assigned_issue' } },
+      want: { from: 'in_progress', to: 'blocked', via: 'system:recovery.reconcile_stranded_assigned_issue' },
+    },
+    {
+      shape: 'issue.created / issue.child_created (birth status)',
+      event: { createdAt: T, action: 'issue.created', details: { status: 'todo' } },
+      want: { from: null, to: 'todo', via: 'created' },
+    },
+  ];
+
+  let bad = 0;
+  console.log('fixtures — does the parser still recognise each shape?');
+  for (const f of fixtures) {
+    const got = transitionOf(f.event);
+    const ok = got && got.from === f.want.from && got.to === f.want.to && got.via === f.want.via;
+    if (!ok) bad++;
+    console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${f.shape}`);
+    if (!ok) console.log(`        want ${JSON.stringify(f.want)}\n        got  ${JSON.stringify(got)}`);
+  }
+
+  // A row that carries no transition must parse to null, or every unrelated audit
+  // event would be replayed as a status change.
+  const negative = transitionOf({ createdAt: T, action: 'issue.updated', details: { changes: { priority: { from: 'low', to: 'high' } } } });
+  const negOk = negative === null;
+  if (!negOk) bad++;
+  console.log(`  ${negOk ? 'PASS' : 'FAIL'}  non-status update parses to null (got ${JSON.stringify(negative)})`);
+
+  if (!COMPANY) {
+    console.log('\ncensus SKIPPED — PAPERCLIP_COMPANY_ID unset, cannot read the shared feed');
+    return bad ? 1 : 0;
+  }
+
+  const rows = await api(`/api/companies/${COMPANY}/activity?limit=${ACTIVITY_CAP}`);
+  const seen = { patch: 0, system: 0, created: 0 };
+  for (const ev of rows) {
+    const t = transitionOf(ev);
+    if (!t) continue;
+    if (t.via === 'patch') seen.patch++;
+    else if (t.via === 'created') seen.created++;
+    else seen.system++;
+  }
+  const span = rows.length
+    ? `${rows[rows.length - 1].createdAt} .. ${rows[0].createdAt}`
+    : '(empty)';
+  console.log(`\ncensus over the ${rows.length} most recent company audit rows${rows.length >= ACTIVITY_CAP ? ` (feed cap ${ACTIVITY_CAP}, not widenable — the route ignores offset/cursor/from)` : ''}`);
+  console.log(`  window: ${span}`);
+  for (const [via, n] of Object.entries(seen)) {
+    console.log(`  ${String(via).padEnd(8)} ${n}${n ? '' : '   <- not observed in this window'}`);
+  }
+  // Deliberately NOT folded into the exit code. The window is a fixed 500 rows and
+  // cannot be widened, so a shape with no traffic in it reads zero on a perfectly
+  // healthy day — `system` writes only appear when the recovery sweep fires. A gate
+  // that is red on an ordinary day gets ignored, and then it is not a gate.
+  // The fixtures are the assertion; this half is a reading.
+  return bad ? 1 : 0;
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   let at = null;
   const refs = [];
   for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--audit') return process.exit(await audit());
     if (argv[i] === '--at') at = argv[++i];
-    else refs.push(argv[i]);
+    // An unknown flag used to fall through into `refs` and be looked up as an
+    // issue key, so a typo reported "no issue matching --sicne" and a documented
+    // flag nobody had wired reported the same. Refuse it by name instead.
+    else if (argv[i].startsWith('--')) {
+      console.error(`unknown flag ${argv[i]}`);
+      console.error('usage: tra4468-status-history.mjs [--at <ISO>] <issueId|TRA-xxxx>...   |   --audit');
+      process.exit(2);
+    } else refs.push(argv[i]);
+  }
+  // Two ways `--at` used to answer confidently and wrongly, both silent:
+  //   unparseable -> every `<=` compare false -> "(before first recorded event)";
+  //   zone-less   -> `Date.parse` reads it in the HOST's zone, not UTC. Measured:
+  //                  `--at "2026-09-09 21:30"` on an ET host answered `done` where
+  //                  `2026-09-09T21:30:00Z` answers `blocked` — the whole point of
+  //                  the query, off by the host offset and onto the wrong side of
+  //                  the window. Every timestamp the platform serves is UTC, so
+  //                  demand an explicit designator rather than guessing.
+  if (at != null) {
+    if (!/(?:Z|[+-]\d{2}:?\d{2})$/.test(at)) {
+      console.error(`--at ${at} carries no timezone — it would be read in this host's local zone, not UTC.`);
+      console.error('want a trailing Z or an explicit offset, e.g. 2026-09-09T21:30:00Z');
+      process.exit(2);
+    }
+    if (!Number.isFinite(Date.parse(at))) {
+      console.error(`--at ${at} is not a parseable instant (want e.g. 2026-09-09T21:30:00Z)`);
+      process.exit(2);
+    }
   }
   if (!refs.length) {
-    console.error('usage: tra4468-status-history.mjs [--at <ISO>] <issueId|TRA-xxxx>...');
+    console.error('usage: tra4468-status-history.mjs [--at <ISO>] <issueId|TRA-xxxx>...   |   --audit');
     process.exit(2);
   }
 

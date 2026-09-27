@@ -8,6 +8,9 @@
 // `globalThis.setTimeout`, and must not be able to freeze the gate's sentinel.
 import { setTimeout as realSetTimeout } from 'node:timers';
 import { SyncSliceMeter } from './phase-timing.js';
+import { logger } from './observability/index.js';
+
+const gateLog = logger.child({ module: 'loop-yield-gate' });
 
 // TRA-1082 — yield to the libuv event loop between batches of the full-universe
 // equity sweeps. Each engine tick iterates the ENTIRE active/watchlist universe
@@ -103,6 +106,82 @@ export const TICK_PACER_BUDGET_MS = 500;
 // ─────────────────────────────────────────────────────────────────────────────
 export const LOOP_YIELD_GATE_BUDGET_MS = 500;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-4920 — GATE HEADROOM.
+//
+// TRA-4524's mechanism is LINEAR IN N: N per-book engines co-resume on a shared
+// settled await, each runs ~one budget to its boundary, and Node drains every
+// queued immediate inside one check phase, so the loop sees N x per-book
+// contiguous (harness: N=1 1070ms / N=4 2151 / N=8 4310 / N=12 6470). The gate
+// is what breaks that chain. So the gate's own safety margin is a FUNCTION OF N,
+// and N is not a constant: measured `maxQueueDepth` on bqb1 went 3 (10 min into
+// an off-RTH boot, 2026-09-25T02:31Z) to 19 (RTH peak, 19:48Z) — 73% past the
+// N~11 the remedy was modelled on.
+//
+// Everything that alarms today fires only AFTER a block ends: `lagMaxMs` is
+// sampled by a timer that cannot run during the block, and a watchdog trip is by
+// construction post-hoc. This publishes the margin BEFORE the block, from the
+// two quantities that produce it.
+//
+// ⚠️ The per-book constant is MEASURED HERE, not inherited from TRA-4524's
+// harness. Book count and per-book work have both moved. The measurement is
+// taken at the run-end SENTINEL — a 0ms `node:timers` timeout can only fire in
+// the timers phase, so its `now - runStartAt` is the full CONTIGUOUS run as the
+// loop actually experienced it, and `resumesInRun` is how many waiters ran
+// inside it. `runMs / resumesInRun` is therefore a direct in-band reading of
+// "one book's cost per resume", from production traffic.
+//
+// This is strictly better instrumentation than `maxRunObservedMs`, which is
+// stamped only inside `slot()` — i.e. only on turns where a waiter was ALREADY
+// queued — so it measures observation range, not run length. Both are published;
+// `maxRunCompletedMs` is the one that is a run length.
+//
+// ⚠️ `level` reads `unmeasured`, never `ok`, until a per-resume sample exists.
+// "Not measured" and "measured and fine" must not share a reading.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Render's HTTP health-check budget. A contiguous loop block past this is the
+ * TRA-1082/TRA-2111 incident: `http.accept` never gets a turn, the probe times
+ * out, and Render hard-restarts the instance.
+ */
+export const LOOP_BLOCK_BUDGET_MS = 5_000;
+/** Fraction of {@link LOOP_BLOCK_BUDGET_MS} at which headroom reads `warn`. */
+export const GATE_HEADROOM_WARN_AT = 0.5;
+/** Fraction of {@link LOOP_BLOCK_BUDGET_MS} at which headroom reads `page`. */
+export const GATE_HEADROOM_PAGE_AT = 0.75;
+
+export type GateHeadroomLevel = 'unmeasured' | 'ok' | 'warn' | 'page';
+
+export interface GateHeadroom {
+  /** Denominator: Render's health-check budget (ms). */
+  blockBudgetMs: number;
+  warnAt: number;
+  pageAt: number;
+  /**
+   * Measured per-resume cost (ms), mean over completed runs that resumed at
+   * least one waiter. `null` until the gate has completed such a run — the box
+   * has to be doing the work before the constant exists.
+   */
+  perResumeMs: number | null;
+  /** Worst single completed run's per-resume cost (ms). */
+  perResumeMaxMs: number | null;
+  perResumeSamples: number;
+  /** The N the projection uses: the deepest queue the gate has ever held. */
+  queueDepth: number;
+  /** `queueDepth x perResumeMs` — what one co-resume burst would cost unguarded. */
+  projectedBlockMs: number | null;
+  projectedUtilization: number | null;
+  /** The longest contiguous run actually measured at the sentinel (ms). */
+  observedMaxRunMs: number;
+  observedUtilization: number;
+  /** `max(projected, observed)` — an already-observed run cannot read `ok`. */
+  utilization: number | null;
+  level: GateHeadroomLevel;
+  /** Why the level reads what it reads, in one line. Never omitted. */
+  reason: string;
+}
+
 export interface LoopYieldGateSnapshot {
   enabled: boolean;
   budgetMs: number;
@@ -117,9 +196,26 @@ export interface LoopYieldGateSnapshot {
   maxQueueDepth: number;
   /** Most loop turns any single waiter was held before it resumed. */
   maxHeldTurns: number;
-  /** Longest run any gate slot observed when it decided (ms). */
+  /**
+   * Longest run any gate slot OBSERVED when it decided (ms).
+   *
+   * ⚠️ Stamped only inside `slot()`, so a waiter must already have been queued.
+   * It is an observation range, not a time-join to any specific block — do not
+   * report it as "the gate saw that block". {@link maxRunCompletedMs} is the
+   * field that is a run length.
+   */
   maxRunObservedMs: number;
   lastDeferralAtMs: number | null;
+  /** TRA-4920 — runs that reached their sentinel (i.e. the loop really turned). */
+  runsCompleted: number;
+  /** TRA-4920 — longest CONTIGUOUS run, measured at the sentinel (ms). */
+  maxRunCompletedMs: number;
+  /** TRA-4920 — most waiters resumed inside one contiguous run (the live N). */
+  maxResumesInRun: number;
+  /** TRA-4920 — total waiters resumed since boot. */
+  resumesTotal: number;
+  /** TRA-4920 — the pre-block margin tripwire. */
+  headroom: GateHeadroom;
 }
 
 interface GateWaiter {
@@ -131,7 +227,17 @@ export interface LoopYieldGateOptions {
   budgetMs?: number;
   /** Read on every call. Default: on unless `LOOP_YIELD_GATE=0`. */
   enabled?: () => boolean;
+  /**
+   * TRA-4920 — the block budget the headroom tripwire measures against.
+   * Defaults to {@link LOOP_BLOCK_BUDGET_MS}; tests inject a small one so a
+   * headroom escalation can be driven without burning 5 real seconds.
+   */
+  blockBudgetMs?: number;
+  /** TRA-4920 — called once per upward headroom transition (default: log). */
+  onHeadroomEscalation?: (h: GateHeadroom) => void;
 }
+
+const HEADROOM_RANK: Record<GateHeadroomLevel, number> = { unmeasured: 0, ok: 1, warn: 2, page: 3 };
 
 export class LoopYieldGate {
   private readonly budgetMs: number;
@@ -146,10 +252,24 @@ export class LoopYieldGate {
   private maxHeldTurns = 0;
   private maxRunObservedMs = 0;
   private lastDeferralAtMs: number | null = null;
+  // TRA-4920 — run-end (sentinel) measurements. See the GATE HEADROOM block.
+  private readonly blockBudgetMs: number;
+  private readonly onHeadroomEscalation: (h: GateHeadroom) => void;
+  private resumesInRun = 0;
+  private runsCompleted = 0;
+  private maxRunCompletedMs = 0;
+  private maxResumesInRun = 0;
+  private resumesTotal = 0;
+  private perResumeSumMs = 0;
+  private perResumeSamples = 0;
+  private perResumeMaxMs = 0;
+  private reportedHeadroom: GateHeadroomLevel = 'unmeasured';
 
   constructor(opts: LoopYieldGateOptions = {}) {
     this.budgetMs = opts.budgetMs ?? LOOP_YIELD_GATE_BUDGET_MS;
     this.isEnabled = opts.enabled ?? (() => process.env.LOOP_YIELD_GATE !== '0');
+    this.blockBudgetMs = opts.blockBudgetMs ?? LOOP_BLOCK_BUDGET_MS;
+    this.onHeadroomEscalation = opts.onHeadroomEscalation ?? defaultHeadroomEscalation;
   }
 
   enabled(): boolean {
@@ -203,6 +323,60 @@ export class LoopYieldGate {
       maxHeldTurns: this.maxHeldTurns,
       maxRunObservedMs: this.maxRunObservedMs,
       lastDeferralAtMs: this.lastDeferralAtMs,
+      runsCompleted: this.runsCompleted,
+      maxRunCompletedMs: this.maxRunCompletedMs,
+      maxResumesInRun: this.maxResumesInRun,
+      resumesTotal: this.resumesTotal,
+      headroom: this.headroom(),
+    };
+  }
+
+  /** TRA-4920 — the pre-block margin. See the GATE HEADROOM block above. */
+  headroom(): GateHeadroom {
+    const perResumeMs = this.perResumeSamples > 0 ? this.perResumeSumMs / this.perResumeSamples : null;
+    const projectedBlockMs = perResumeMs !== null ? this.maxQueueDepth * perResumeMs : null;
+    const projectedUtilization = projectedBlockMs !== null ? projectedBlockMs / this.blockBudgetMs : null;
+    const observedUtilization = this.maxRunCompletedMs / this.blockBudgetMs;
+    const utilization =
+      projectedUtilization !== null ? Math.max(projectedUtilization, observedUtilization) : null;
+
+    let level: GateHeadroomLevel;
+    let reason: string;
+    if (!this.isEnabled()) {
+      // A disabled gate is the TRA-4524 pre-remedy world: N x per-book runs
+      // contiguous with nothing bounding them. It is never `ok`, and it is not
+      // `unmeasured` either — we know exactly why it cannot be graded.
+      level = 'unmeasured';
+      reason = 'gate disabled (LOOP_YIELD_GATE=0) — the process-wide bound is off, headroom is not defined';
+    } else if (utilization === null) {
+      level = 'unmeasured';
+      reason =
+        `no completed run has resumed a waiter yet (runsCompleted=${this.runsCompleted}, resumesTotal=${this.resumesTotal})` +
+        ' — the per-resume cost is UNMEASURED, which is not the same as safe';
+    } else {
+      level = utilization >= GATE_HEADROOM_PAGE_AT ? 'page' : utilization >= GATE_HEADROOM_WARN_AT ? 'warn' : 'ok';
+      reason =
+        `${(utilization * 100).toFixed(1)}% of the ${this.blockBudgetMs}ms health-check budget` +
+        ` (projected ${projectedBlockMs === null ? 'n/a' : Math.round(projectedBlockMs)}ms =` +
+        ` maxQueueDepth ${this.maxQueueDepth} x ${perResumeMs === null ? 'n/a' : perResumeMs.toFixed(1)}ms/resume` +
+        ` over ${this.perResumeSamples} runs; observed max run ${Math.round(this.maxRunCompletedMs)}ms)`;
+    }
+
+    return {
+      blockBudgetMs: this.blockBudgetMs,
+      warnAt: GATE_HEADROOM_WARN_AT,
+      pageAt: GATE_HEADROOM_PAGE_AT,
+      perResumeMs: perResumeMs === null ? null : Math.round(perResumeMs * 10) / 10,
+      perResumeMaxMs: this.perResumeSamples > 0 ? Math.round(this.perResumeMaxMs * 10) / 10 : null,
+      perResumeSamples: this.perResumeSamples,
+      queueDepth: this.maxQueueDepth,
+      projectedBlockMs: projectedBlockMs === null ? null : Math.round(projectedBlockMs),
+      projectedUtilization: projectedUtilization === null ? null : Math.round(projectedUtilization * 1000) / 1000,
+      observedMaxRunMs: Math.round(this.maxRunCompletedMs),
+      observedUtilization: Math.round(observedUtilization * 1000) / 1000,
+      utilization: utilization === null ? null : Math.round(utilization * 1000) / 1000,
+      level,
+      reason,
     };
   }
 
@@ -210,12 +384,44 @@ export class LoopYieldGate {
     this.runStartAt = nowMs;
     this.runEpoch++;
     this.runsStarted++;
+    this.resumesInRun = 0;
     // The sentinel: a timer can only fire in the timers phase, so the run ends
     // exactly when the loop has really turned (see above). Unref'd: it must
     // never hold a process open.
     realSetTimeout(() => {
+      // TRA-4920 — the run-end measurement. Taken HERE and nowhere else: this
+      // callback runs in the timers phase, i.e. the first moment after the
+      // contiguous run, so `endedAt - nowMs` is the run length the event loop
+      // actually experienced. `resumesInRun` is the live N that length was
+      // spread across.
+      const endedAt = Date.now();
+      const runMs = endedAt - nowMs;
+      this.runsCompleted++;
+      if (runMs > this.maxRunCompletedMs) this.maxRunCompletedMs = runMs;
+      const resumes = this.resumesInRun;
+      if (resumes > this.maxResumesInRun) this.maxResumesInRun = resumes;
+      if (resumes > 0) {
+        const perResume = runMs / resumes;
+        this.perResumeSumMs += perResume;
+        this.perResumeSamples++;
+        if (perResume > this.perResumeMaxMs) this.perResumeMaxMs = perResume;
+      }
       this.runStartAt = null;
+      this.noteHeadroom();
     }, 0).unref();
+  }
+
+  /**
+   * TRA-4920 — fire the escalation hook on an UPWARD transition only, so the
+   * log carries one line per real degradation instead of one per run. The latch
+   * never walks back down: a box that reached `page` once stays reported, and
+   * the live level is always readable from {@link headroom} regardless.
+   */
+  private noteHeadroom(): void {
+    const h = this.headroom();
+    if (HEADROOM_RANK[h.level] <= HEADROOM_RANK[this.reportedHeadroom]) return;
+    this.reportedHeadroom = h.level;
+    if (h.level === 'warn' || h.level === 'page') this.onHeadroomEscalation(h);
   }
 
   // One slot is queued per waiter. A slot either resumes the OLDEST waiter or
@@ -240,8 +446,39 @@ export class LoopYieldGate {
     const waiter = this.waiters.shift()!;
     const heldTurns = Math.max(0, this.runEpoch - waiter.epoch - 1);
     if (heldTurns > this.maxHeldTurns) this.maxHeldTurns = heldTurns;
+    // TRA-4920 — count the resume BEFORE handing control over: the waiter's
+    // work runs synchronously off `resolve()`'s microtask inside this same run,
+    // so it is part of the run length the sentinel is about to measure.
+    this.resumesInRun++;
+    this.resumesTotal++;
     waiter.resolve(heldTurns);
   };
+}
+
+/**
+ * TRA-4920 — default escalation sink: one structured log line per upward
+ * transition. Deliberately NOT a throw or a restart — the whole point is to
+ * surface the margin while it is still a margin.
+ */
+function defaultHeadroomEscalation(h: GateHeadroom): void {
+  const line = h.level === 'page' ? gateLog.error : gateLog.warn;
+  line.call(
+    gateLog,
+    h.level === 'page'
+      ? 'loop-yield-gate headroom PAGE: a co-resume burst projects past 75% of the health-check budget'
+      : 'loop-yield-gate headroom WARN: a co-resume burst projects past 50% of the health-check budget',
+    {
+      level: h.level,
+      utilization: h.utilization,
+      projectedBlockMs: h.projectedBlockMs,
+      observedMaxRunMs: h.observedMaxRunMs,
+      queueDepth: h.queueDepth,
+      perResumeMs: h.perResumeMs,
+      perResumeSamples: h.perResumeSamples,
+      blockBudgetMs: h.blockBudgetMs,
+      reason: h.reason,
+    },
+  );
 }
 
 /** The process-wide gate every signal-engine yielder shares. */

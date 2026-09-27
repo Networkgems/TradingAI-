@@ -205,7 +205,10 @@ import { runZombieOpenSweep } from './zombie-open-journal-sweep.js';
 import { EXPIRED_DEMO_ORPHAN_DTE_BOUND_REASON, runExpiredDemoOrphanSweep } from './expired-demo-orphan-sweep.js'; // TRA-4711, TRA-4721
 // TRA-2214 — the EOD journal blocks fold HERE, not inline, so this module holds
 // no bare fold that could be fed a differently-sourced (pooled) row list.
-import { foldModelFacingEodJournal } from './model-facing-journal.js';
+import {
+  foldModelFacingEodJournal,
+  foldModelFacingStrategyDegradation,
+} from './model-facing-journal.js';
 // TRA-1046 (TRA-1041c L2) — synchronous on-demand hypothesis backtest behind
 // POST /api/backtest, reusing the audited apply→backtest→G0-grade pipeline.
 // TRA-1000 — external-intel source-quality scorer: per-source advisory weights
@@ -743,6 +746,17 @@ import {
   isLearnedWeightsSnapshotEnabled,
   type SnapshotDimension,
 } from './learned-weights-history.js';
+// TRA-4914 — the options evaluation report (Phase 0 of TRA-4481, ratified TRA-4911).
+import {
+  OPTIONS_EVAL_REPORT_FLAG,
+  isOptionsEvalReportEnabled,
+  listOptionsEvaluationReportDates,
+  readLatestOptionsEvaluationReport,
+  recordOptionsEvaluationReport,
+} from './options-evaluation-report-store.js';
+// TRA-4913 — the per-strategy degradation monitor (Phase 0 of TRA-4481, ratified
+// TRA-4911). ADVISORY ONLY: a flag and a recommendation, never an action.
+import { DECLARED_STRATEGY_ENVELOPES } from './strategy-degradation-monitor.js';
 import {
   loadUserMemoryStore,
   getUserMemory,
@@ -1973,6 +1987,8 @@ async function generateAndSaveReport(
       finalSnapshot.optionJournal = fold.optionJournal;
       finalSnapshot.optionLearnedWeights = fold.optionLearnedWeights;
       finalSnapshot.introspection = fold.introspection;
+      // TRA-4913 — advisory degradation section. Same rows, same basis.
+      finalSnapshot.strategyDegradation = fold.strategyDegradation;
       finalSnapshot.journalBasis = fold.journalBasis;
       finalSnapshot.journalBasisCounts = fold.journalBasisCounts;
     } catch (err) {
@@ -11464,6 +11480,106 @@ app.get('/api/health/learned-weights', async (req, res) => {
   }
 });
 
+// TRA-4914 — the options evaluation report, read back off the artifact the 21:00
+// ET archive tick writes. The STANDARD GRADING SURFACE for the options path
+// (Phase 0 of the TRA-4481 upgrade plan, ratified on TRA-4911). Unauthenticated,
+// read-only, write-only-observer class; no capital path.
+//
+// The three fields below follow CLAUDE.md's health-field rule, and the split is
+// the whole point of publishing them separately:
+//   • `flagEnabled`  — a CONFIG fact, named as one. It says what we INTENDED.
+//   • `lastRunStatus`— the OUTCOME of the last real attempt, off the artifact
+//     itself. `never_written_this_boot` is its own named state and is an ALARM,
+//     not a pass: an absent artifact is NOT an empty report and must never
+//     render as zeros.
+//   • `report`       — `null` when nothing has been written. Every cell inside
+//     carries its own `status` (`OK` / `INSUFFICIENT` / `NOT_MEASURED`), so a
+//     thin book is legible as thin rather than as a confident flat result.
+app.get('/api/health/options-evaluation', async (_req, res) => {
+  try {
+    const artifact = await readLatestOptionsEvaluationReport();
+    const dates = await listOptionsEvaluationReportDates();
+    res.json({
+      issue: 'TRA-4914',
+      // CONFIG fact — presence of the arm, never liveness of the report.
+      flagEnabled: isOptionsEvalReportEnabled(),
+      flagName: OPTIONS_EVAL_REPORT_FLAG,
+      // OUTCOME of the last real attempt, with its date beside it.
+      lastRunStatus: artifact ? 'written' : 'never_written_this_boot',
+      lastRunAsOfDate: artifact?.report.asOfDate ?? null,
+      lastRunGeneratedAt: artifact?.report.generatedAt ?? null,
+      lateForEtDate: artifact?.lateForEtDate ?? null,
+      // Dates on disk, ascending. Gaps are GAPS — a reader must not interpolate.
+      availableDates: dates,
+      report: artifact?.report ?? null,
+    });
+  } catch (err) {
+    log.error('options-evaluation health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read options evaluation report' });
+  }
+});
+
+// TRA-4913 — the per-strategy DEGRADATION MONITOR (Phase 0 item 2 of TRA-4481,
+// ratified on TRA-4911). Rolling PF / expectancy per `structure::entryArchetype`
+// cohort, graded against that cohort's OWN recorded envelope.
+//
+// ⚠ ADVISORY ONLY. Nothing downstream of this route halts, throttles, resizes or
+// disables anything. Hard halts remain with `options-risk-breaker`, the
+// `DailyRiskGovernor` and the churn brakes; `shadow-expectancy-guard` still owns
+// promotion. `sizeDown.recommendedSizeFactor` has no reader in the tree.
+//
+// The fold is computed LIVE off the journal rather than read from an artifact,
+// because it is pure and cheap and an artifact would introduce a staleness state
+// this route would then have to report. `lastRunStatus` is therefore the outcome
+// of THIS attempt (CLAUDE.md health-field rule: report what the dependency
+// actually did, never the configuration). A throw reads `read_failed`, never an
+// empty report — "could not check" and "checked and it is fine" must not share a
+// value, which is the same invariant every cell in the payload carries.
+app.get('/api/health/strategy-degradation', async (req, res) => {
+  const parsePositiveInt = (raw: unknown): number | undefined => {
+    if (typeof raw !== 'string') return undefined;
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  };
+  try {
+    const window = parsePositiveInt(req.query.window);
+    const minWindow = parsePositiveInt(req.query.minWindow);
+    // TRA-2214 basis — the MODEL-FACING rows (desk + unattributed, QA fixture
+    // books dropped), not the raw journal. This surface grades COHORTS, so a
+    // fixture book that leaked in would arrive as a cohort with its own verdict.
+    const { report, journalBasis, journalBasisCounts } = await foldModelFacingStrategyDegradation({
+      ...(window !== undefined ? { recentWindow: window } : {}),
+      ...(minWindow !== undefined ? { minWindowTrades: minWindow } : {}),
+    });
+    res.json({
+      issue: 'TRA-4913',
+      advisoryOnly: true,
+      // OUTCOME of this attempt. Never a config fact.
+      lastRunStatus: 'computed',
+      // CONFIG fact, named as one: how many envelopes were DECLARED (as opposed
+      // to derived from a cohort's own trailing baseline, which is not a
+      // validation). Zero is the honest reading today, not a failure.
+      declaredEnvelopesConfigured: DECLARED_STRATEGY_ENVELOPES.length,
+      // The basis rides the wire beside the numbers it moved.
+      journalBasis,
+      journalBasisCounts,
+      report,
+    });
+  } catch (err) {
+    log.error('strategy-degradation health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({
+      issue: 'TRA-4913',
+      lastRunStatus: 'read_failed',
+      error: 'Failed to compute strategy degradation report',
+      report: null,
+    });
+  }
+});
+
 // TRA-2352 (TRA-927 / TRA-920 A2) — the day-by-day TRAIL behind the live fold
 // above. Its sibling `/api/health/learned-weights` answers "what are the weights
 // NOW" (computed live, never stale); this answers "how did they GET here" from
@@ -19430,6 +19546,22 @@ scheduler.start({
         log.error('learned-weights snapshot tick failed', {
           reason: err instanceof Error ? err.message : String(err),
         }),
+    );
+    // TRA-4914 — the options evaluation report: the standard grading surface for
+    // the options path (Phase 0 of the TRA-4481 upgrade plan, ratified TRA-4911).
+    // Chained AFTER `runDailyCloseForAllUsers()` so today's closes are already in
+    // the journal before the fold is taken. Zero-IO no-op while
+    // ENABLE_OPTIONS_EVAL_REPORT is off — the flag is checked before the journal
+    // is read. WRITE-ONLY OBSERVER: nothing consumes a snapshot to make a
+    // decision, so no live behaviour change and no capital path.
+    //
+    // SURFACE CLASS B (journal = append-only): a LATE fire reads a strict
+    // superset and its verdict is VALID. The artifact records `lateForEtDate`
+    // beside the report rather than refusing — see the module header.
+    await recordOptionsEvaluationReport({ asOfDate: etDateString(new Date()) }).catch(err =>
+      log.error('options evaluation report tick failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      }),
     );
     // TRA-3449 — assert the LIVE-MONEY NAV tripwire and write one durable row for this ET
     // day. LAST in the chain: `runDailyCloseForAllUsers()` above is what writes today's EOD

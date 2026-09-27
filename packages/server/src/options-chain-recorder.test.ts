@@ -117,7 +117,7 @@ describe('recordOptionChains', () => {
       client: {
         getExpirations: async () => [],
         getChainSnapshot: async () => [],
-        fetchExpirations: async () => ({ ok: false as const, httpStatus: 429 }),
+        fetchExpirations: async () => ({ ok: false as const, httpStatus: 429, reason: null }),
         fetchChainSnapshot: async () => ({ ok: true as const, httpStatus: 200, value: [] }),
       },
       outDir: tmpRoot,
@@ -141,7 +141,7 @@ describe('recordOptionChains', () => {
         fetchExpirations: async (sym: string) => {
           calls++;
           // AAPL is refused on the first pass only; MSFT always answers.
-          if (sym === 'AAPL' && calls <= 1) return { ok: false as const, httpStatus: 429 };
+          if (sym === 'AAPL' && calls <= 1) return { ok: false as const, httpStatus: 429, reason: null };
           return { ok: true as const, httpStatus: 200, value: ['2026-06-19'] };
         },
         fetchChainSnapshot: async () => ({ ok: true as const, httpStatus: 200, value: [chainRow(105, 'call')] }),
@@ -174,7 +174,7 @@ describe('recordOptionChains', () => {
       client: {
         getExpirations: async () => [],
         getChainSnapshot: async () => [],
-        fetchExpirations: async () => { calls++; return { ok: false as const, httpStatus: 503 }; },
+        fetchExpirations: async () => { calls++; return { ok: false as const, httpStatus: 503, reason: null }; },
         fetchChainSnapshot: async () => ({ ok: true as const, httpStatus: 200, value: [] }),
       },
       outDir: tmpRoot,

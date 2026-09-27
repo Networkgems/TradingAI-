@@ -319,3 +319,100 @@ export function atmIvFromRows(rows: readonly OptionChainRow[], spot: number): nu
   }
   return best ? best.iv : null;
 }
+
+// ── IV-rank COVERAGE classification (TRA-4917) ───────────────────────────────
+//
+// `ivRankSync` collapses five structurally different outcomes into one `null`:
+// the store never loaded, the chain carried no usable ATM IV, the symbol is
+// uncovered, the window is too thin, or the window is flat. On bqb1 the
+// short-premium scan published `ivRank: null` on 164/164 rows and NO surface
+// could say which branch produced them — and they have opposite fixes (an
+// extraction bug vs a store that self-heals as it warms). This is the
+// discriminator: one read of the store, one code out of a CLOSED vocabulary.
+//
+// `not_evaluated` is deliberately part of the vocabulary and is REUSED from the
+// existing `buildIvRankCoverage` idiom (options-forward-test.ts): it marks a row
+// whose producer supplied no classification at all, so an unclassified row can
+// never be silently folded into a real branch.
+
+/**
+ * Closed vocabulary for "why is this IV-rank what it is". `covered` is the only
+ * code that carries a number; every other code means `ivRank === null`, and the
+ * set is exhaustive over {@link readIvRankCoverageSync}'s branches.
+ */
+export const IV_RANK_COVERAGE_CODES = [
+  /** A finite 0–100 rank was computed. */
+  'covered',
+  /** The trailing-IV store is not loaded in this process — every symbol is blind. */
+  'store_unloaded',
+  /** `atmIvFromRows` found no usable mid IV on the chain this pass (branch (a)). */
+  'no_atm_iv',
+  /** Store loaded, ATM IV in hand, but ZERO usable in-window samples for the symbol. */
+  'uncovered',
+  /** 0 < usable in-window samples < {@link MIN_IV_SAMPLES} — self-heals as the store warms. */
+  'insufficient_history',
+  /** Enough samples, but max === min: a rank would be a meaningless 0 or 100. */
+  'flat_window',
+  /** The producer supplied no classification (legacy/hand-built row). NOT a measurement. */
+  'not_evaluated',
+] as const;
+
+export type IvRankCoverageCode = (typeof IV_RANK_COVERAGE_CODES)[number];
+
+/** The rank plus the two diagnostics that separate its null branches. */
+export interface IvRankCoverageReading {
+  /** Trailing-window IV-rank, or null. Never fabricated — no `?? 0`. */
+  ivRank: number | null;
+  /** The ATM IV the rank was (or would have been) computed against. */
+  atmIv: number | null;
+  /**
+   * USABLE in-window sample count — {@link windowFor} further filtered to finite
+   * positive IVs, i.e. exactly the count {@link MIN_IV_SAMPLES} binds against
+   * inside {@link computeIvRank}. `null` only when the store is unloaded, where
+   * the honest answer is "unknown", never 0. (This is a strictly tighter number
+   * than {@link ivSampleDepthSync}, which does not apply the usability filter.)
+   */
+  ivSampleDepth: number | null;
+  coverage: IvRankCoverageCode;
+}
+
+/** Whether the trailing-IV store has been loaded in this process. */
+export function isIvRankStoreLoaded(): boolean {
+  return cache != null;
+}
+
+/**
+ * Classify one symbol's IV-rank read, reading the store ONCE so the rank and the
+ * reason can never disagree about which window they saw.
+ *
+ * Precedence — `store_unloaded` before `no_atm_iv` because an unloaded store is a
+ * PROCESS fault that makes the whole surface blind, and reporting a per-symbol
+ * chain reason for it would understate the fault. Below that the branches are
+ * mutually exclusive by construction: with `atmIv > 0` guaranteed,
+ * {@link computeIvRank} can only return null for `usable.length < MIN_IV_SAMPLES`
+ * or `max <= min`, so `uncovered` / `insufficient_history` / `flat_window`
+ * partition the remaining null space exhaustively.
+ */
+export function readIvRankCoverageSync(
+  symbol: string,
+  atmIv: number | null,
+  asOf: number = Date.now(),
+): IvRankCoverageReading {
+  const iv = atmIv != null && Number.isFinite(atmIv) && atmIv > 0 ? atmIv : null;
+  if (!cache) {
+    return { ivRank: null, atmIv: iv, ivSampleDepth: null, coverage: 'store_unloaded' };
+  }
+  const samples = cache.get(symbol.trim().toUpperCase()) ?? [];
+  const usable = windowFor(samples, asOf).filter((s) => Number.isFinite(s.iv) && s.iv > 0);
+  const depth = usable.length;
+  if (iv == null) {
+    return { ivRank: null, atmIv: null, ivSampleDepth: depth, coverage: 'no_atm_iv' };
+  }
+  const ivRank = computeIvRank(usable, iv);
+  if (ivRank != null) {
+    return { ivRank, atmIv: iv, ivSampleDepth: depth, coverage: 'covered' };
+  }
+  const coverage: IvRankCoverageCode =
+    depth === 0 ? 'uncovered' : depth < MIN_IV_SAMPLES ? 'insufficient_history' : 'flat_window';
+  return { ivRank: null, atmIv: iv, ivSampleDepth: depth, coverage };
+}

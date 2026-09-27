@@ -6648,6 +6648,10 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
                     const reached = cf.reachedBySetup[id] ?? 0;
                     const same = cf.matchedSameSideBySetup[id] ?? 0;
                     const opp = cf.matchedOppositeSideBySetup[id] ?? 0;
+                    const threw = cf.threwBySetup[id] ?? 0;
+                    const legs = cf.declineLegBySetup[id] ?? {};
+                    const unattributed = cf.declinedUnattributedBySetup[id] ?? 0;
+                    const attributed = Object.values(legs).reduce((a, b) => a + b, 0);
                     return {
                       setupId: id,
                       reached,
@@ -6658,6 +6662,35 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
                       sameSideRate: reached > 0 ? same / reached : null,
                       confirmedAttributed: cf.confirmedBySetup[id] ?? 0,
                       conflictAttributed: cf.conflictBySetup[id] ?? 0,
+                      /**
+                       * ⛔ A NON-ZERO `threw` IS A CODE FAULT, NEVER A MARKET
+                       * READING. A throw folds as a decline upstream, so before
+                       * this counter shipped a setup crashing on every row read
+                       * exactly like one declining on every row (TRA-4423).
+                       */
+                      threw,
+                      /**
+                       * ⛔ WHICH LEG REFUSED. Read this before calling any
+                       * `matchedSameSide: 0` a real zero — a setup is a
+                       * CONJUNCTION, and without the split "the market offered
+                       * nothing" and "this threshold is unsatisfiable" are the
+                       * same number. For E specifically, `no_volume_data`
+                       * dominating means the FEED carries no volume and E can
+                       * never fire; `not_coiled` / `no_close_break` dominating
+                       * means E is working and the market simply did not set up.
+                       */
+                      declineLegs: legs,
+                      /** Declines this setup did not attribute (bare `null`). */
+                      declinedUnattributed: unattributed,
+                      /**
+                       * Fraction of this setup's declines that named a leg. null
+                       * when it has not declined at all. ⛔ 0 means UNATTRIBUTED
+                       * (A-D today), never "no declines" — `declineLegs: {}`
+                       * alone cannot tell you which.
+                       */
+                      declineLegCoverage: attributed + unattributed > 0
+                        ? attributed / (attributed + unattributed)
+                        : null,
                     };
                   }),
                   note: cf.denseRows === 0
@@ -6665,11 +6698,14 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
                       + '`reached` here is 0 for want of an observation, NOT because a setup '
                       + 'never ran. Either nothing has been folded since boot, or this build '
                       + 'scores first-match-wins. Read `denseRows` before any cell.'
-                    : 'An ARRAY, read with `.find` — never indexed (TRA-4154). `reached` < '
-                      + '`evaluated` is EXPECTED and correct for later setups: the walk stops '
-                      + 'at the first same-side match, so setup A is reached on every row and '
-                      + 'E only on rows A-D all declined. ⛔ A setup at `reached: 0` is '
-                      + 'UNMEASURED; `fireRate: null` says so rather than claiming a zero.',
+                    : 'An ARRAY, read with `.find` — never indexed (TRA-4154). Under '
+                      + '`scoreAll` the walk is DENSE, so every enabled setup is reached on '
+                      + 'every dense row and `reached` is equal across setups — it falls short '
+                      + 'of `evaluated` only by the rows that carried no per-setup detail '
+                      + '(`series_unreadable`). ⛔ A setup at `reached: 0` is UNMEASURED; '
+                      + '`fireRate: null` says so rather than claiming a zero. ⛔ A setup at '
+                      + '`reached > 0, fireRate: 0` is a MEASURED zero — read `threw` and '
+                      + '`declineLegs` before believing the market caused it.',
                 };
               })(),
               note: cf.evaluated === 0
@@ -9634,6 +9670,37 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     });
   }
 
+  // TRA-4920 — PARSE PATHS, because getting them wrong here reads EXACTLY like a
+  // clean box and has cost this chain real time twice:
+  //
+  //   gate counters + headroom  ->  .loopYieldGate            (ROOT, sibling of `watchdog`)
+  //   sync-block census         ->  .watchdog.phaseAttribution.syncBlockCensus
+  //   last sync witness         ->  .watchdog.phaseAttribution.lastSlowSyncPhase
+  //   census ring (EVICTS)      ->  .watchdog.phaseAttribution.recentSlowPhases
+  //
+  // Parsing the gate under `.watchdog` yields gate-absent + no-sync-block +
+  // empty-ring — a tidy all-clear off a payload never opened. Assert
+  // `recentSlowPhases.length > 0` at the path above before believing any leg.
+  //
+  // Which field carries which verdict:
+  //  - `loopYieldGate.headroom.level` — the PRE-block margin. `unmeasured` is
+  //    NOT `ok`; a disabled gate and a gate with no completed resume both read
+  //    `unmeasured`, each with its own `reason` string.
+  //  - `loopYieldGate.maxRunCompletedMs` — the contiguous run length, measured
+  //    at the run-end sentinel in the timers phase. Use THIS, not
+  //    `maxRunObservedMs` (observation range only; needs a waiter already
+  //    queued).
+  //  - `phaseAttribution.syncBlockCensus.count` / `.buckets` — how MANY sync
+  //    blocks, monotonic since boot. `recentSlowPhases` cannot answer this: it
+  //    is a 512-slot FIFO whose horizon is set by the `async` arrival rate, so
+  //    a rare `sync` record is evicted within minutes and the ring reads
+  //    512/512 async while sync witnesses are still landing.
+  //  - `forcedYields` is COLOUR, never a verdict: it is booked only when the
+  //    gate's run-clock fired ALONE, so a perfectly-binding gate whose
+  //    count/time sibling trigger wins also reports 0.
+  //
+  // All of the above are PROCESS-RESIDENT and die with the pid. Re-derive
+  // `build.commit`/`pid`/`startedAt` in the same read.
   app.get('/api/health/watchdog', (_req, res) => {
     const watchdog = getWatchdogStatus();
     res.json({
@@ -9643,6 +9710,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       watchdog,
       // TRA-4524 — process-wide yield gate counters (deferrals = resumes held
       // behind a spent run; maxHeldTurns = the round-robin wait, AC3).
+      // TRA-4920 — plus the measured per-resume cost and the headroom tripwire.
       loopYieldGate: getLoopYieldGateSnapshot(),
     });
   });

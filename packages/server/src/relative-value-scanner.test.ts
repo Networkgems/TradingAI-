@@ -661,8 +661,14 @@ describe('Tradier HTTP refusals are not listings (TRA-4664)', () => {
         refusals: 1,
         refusalsByKey: { 'expirations|BAD!': 1 },
         keysTruncated: false,
+        reportedByEndpoint: { expirations: 1, chain: 0 },
         evicted: 0,
       },
+      // TRA-4865 — this mock answers `ok:false` with no `reason` at all, which
+      // is the pre-TRA-4865 client shape. It buckets as `(not captured)` and
+      // must NEVER fold into a populated reason bucket: a refusal whose cause we
+      // did not see is not evidence about any cause we did.
+      byReason: { '400 (not captured)': 1 },
     });
 
     // The cooldown is per-key: other symbols are untouched.
@@ -782,6 +788,7 @@ describe('Tradier HTTP refusals are not listings (TRA-4664)', () => {
         'expirations|NOEXP': 1,
       },
       keysTruncated: false,
+      reportedByEndpoint: { expirations: 2, chain: 1 },
       evicted: 0,
     });
   });
@@ -821,6 +828,145 @@ describe('Tradier HTTP refusals are not listings (TRA-4664)', () => {
     expect(rec.cooling).toBe(0);
     expect(rec.sinceBoot!.refusals).toBe(3);
     expect(rec.sinceBoot!.evicted).toBe(0);
+  });
+
+  // TRA-4865 (third pass). Measured on live `66a8a1ab` 2026-09-25 16:35Z:
+  // `sinceBoot.byEndpoint` read `{expirations: 445, chain: 307}` while the
+  // `refusalsByKey` it shipped beside carried 300 chain rows and ZERO
+  // expirations rows. The truncation was the head of ONE lexical sort across
+  // both endpoints, and `chain|` sorts before `expirations|` — so the published
+  // sample was partitioned on exactly the axis this issue was opened to decide
+  // ("which endpoint dominates"), and answered "chain, unanimously" about a
+  // population that is 59% expirations. A lexical head reads like a sample.
+  it('the since-boot census cannot partition its sample by endpoint — the live 300-chain/0-expirations truncation', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, advance } = makeService({ client });
+    // 200 chain-refusing symbols and 200 expirations-refusing ones: 400 keys
+    // against a 300 cap, so the truncation MUST bite, with both endpoints
+    // over the 150 per-endpoint floor. Under the old lexical head this yields
+    // 300 chain / 0 expirations.
+    const badExp = new Set<string>();
+    const badChain = new Set<string>();
+    for (let i = 0; i < 200; i++) {
+      badExp.add(`ZEXP${i}`); // sorts AFTER `chain|` under the old scheme
+      badChain.add(`ACHN${i}`);
+    }
+    client.fetchExpirations.mockImplementation(async (s) =>
+      badExp.has(s) ? { ok: false, httpStatus: 400 } : okExp);
+    client.fetchChainSnapshot.mockImplementation(async (s) =>
+      badChain.has(s) ? { ok: false, httpStatus: 400 } : okChain);
+
+    for (const s of [...badChain, ...badExp]) {
+      expect((await svc.scanOtm(s)).reason).toBe('fetch_error');
+      advance(1_000);
+    }
+
+    const sb = svc.diagnostics().refusalCooldown!.sinceBoot!;
+    // The full-population counts are unaffected by any reporting cap.
+    expect(sb.distinctKeys).toBe(400);
+    expect(sb.byEndpoint).toEqual({ expirations: 200, chain: 200 });
+    expect(sb.keysTruncated).toBe(true);
+    expect(sb.evicted).toBe(0);
+
+    // The REPORTED sample is the assertion that matters: 300 keys, and both
+    // endpoints present. This is the line that fails under a lexical head.
+    const reported = Object.keys(sb.refusalsByKey);
+    expect(reported.length).toBe(300);
+    const reportedChain = reported.filter((k) => k.startsWith('chain|')).length;
+    const reportedExp = reported.length - reportedChain;
+    expect(reportedChain).toBe(150);
+    expect(reportedExp).toBe(150);
+    // …and `reportedByEndpoint` says so out loud, so a reader comparing it to
+    // `byEndpoint` can see the sample is a sample and not the population.
+    expect(sb.reportedByEndpoint).toEqual({ expirations: 150, chain: 150 });
+  });
+
+  it('the per-endpoint floor is a floor, not a quota — one endpoint spends the other unspent budget', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, advance } = makeService({ client });
+    // 310 expirations refusals and 2 chain refusals. The chain side cannot use
+    // its 150, so the expirations side must report 298 — not be clamped to 150,
+    // which would throw away 148 rows the cap had room for.
+    const badExp = new Set<string>();
+    for (let i = 0; i < 310; i++) badExp.add(`E${String(i).padStart(4, '0')}`);
+    const badChain = new Set(['CH1', 'CH2']);
+    client.fetchExpirations.mockImplementation(async (s) =>
+      badExp.has(s) ? { ok: false, httpStatus: 400 } : okExp);
+    client.fetchChainSnapshot.mockImplementation(async (s) =>
+      badChain.has(s) ? { ok: false, httpStatus: 400 } : okChain);
+
+    for (const s of [...badExp, ...badChain]) {
+      expect((await svc.scanOtm(s)).reason).toBe('fetch_error');
+      advance(1_000);
+    }
+
+    const sb = svc.diagnostics().refusalCooldown!.sinceBoot!;
+    expect(sb.byEndpoint).toEqual({ expirations: 310, chain: 2 });
+    expect(sb.reportedByEndpoint).toEqual({ expirations: 298, chain: 2 });
+    expect(Object.keys(sb.refusalsByKey).length).toBe(300);
+    expect(sb.keysTruncated).toBe(true);
+  });
+
+  it('the reported sample is ranked by REFUSAL COUNT, so the darkest keys survive truncation', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, advance } = makeService({ client });
+    // 400 expirations-refusing symbols; `E0399` is asked (and refused) twice,
+    // every other key once. Under a lexical head `E0399` falls off the end.
+    const badExp = new Set<string>();
+    for (let i = 0; i < 400; i++) badExp.add(`E${String(i).padStart(4, '0')}`);
+    client.fetchExpirations.mockImplementation(async (s) =>
+      badExp.has(s) ? { ok: false, httpStatus: 400 } : okExp);
+    client.fetchChainSnapshot.mockResolvedValue(okChain);
+
+    for (const s of badExp) {
+      expect((await svc.scanOtm(s)).reason).toBe('fetch_error');
+      advance(1_000);
+    }
+    advance(REFUSAL_4XX_COOLDOWN_MS + 1);
+    expect((await svc.scanOtm('E0399')).reason).toBe('fetch_error');
+
+    const sb = svc.diagnostics().refusalCooldown!.sinceBoot!;
+    expect(sb.distinctKeys).toBe(400);
+    expect(sb.refusals).toBe(401);
+    // The twice-refused key is the one the census exists to surface.
+    expect(sb.refusalsByKey['expirations|E0399']).toBe(2);
+  });
+
+  // TRA-4865 (third pass). `refuse()` only ever saw an HTTP status: the vendor's
+  // fault body was dropped at `getJsonChecked`. So live `66a8a1ab` reported
+  // 3,340 × "HTTP 400" with nothing anywhere in the stack able to separate a
+  // throttle from an entitlement gap from a bad parameter.
+  it('the refusal reason histogram carries the VENDOR body, and never folds an unseen cause into a seen one', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, advance } = makeService({ client });
+    client.fetchExpirations.mockImplementation(async (s) => {
+      if (s === 'THROTTLED')
+        return { ok: false, httpStatus: 400, reason: 'Rate limit exceeded for this endpoint' };
+      if (s === 'NOTFOUND')
+        return { ok: false, httpStatus: 400, reason: 'symbol not found' };
+      if (s === 'SILENT') return { ok: false, httpStatus: 400, reason: null };
+      if (s === 'LEGACY') return { ok: false, httpStatus: 400 }; // pre-TRA-4865 shape
+      return okExp;
+    });
+    client.fetchChainSnapshot.mockResolvedValue(okChain);
+
+    for (const s of ['THROTTLED', 'NOTFOUND', 'SILENT', 'LEGACY', 'THROTTLED']) {
+      expect((await svc.scanOtm(s)).reason).toBe('fetch_error');
+      advance(REFUSAL_4XX_COOLDOWN_MS + 1);
+    }
+
+    const byReason = svc.diagnostics().refusalCooldown!.byReason!;
+    expect(byReason).toEqual({
+      '400 Rate limit exceeded for this endpoint': 2,
+      '400 symbol not found': 1,
+      // An empty body and an uncaptured body are DIFFERENT facts and must not
+      // share a bucket — nor may either join a real reason.
+      '400 (no body)': 1,
+      '400 (not captured)': 1,
+    });
+    // The status is always part of the bucket, so a vendor that reuses the same
+    // sentence under a different status splits rather than silently merges.
+    expect(Object.keys(byReason).every((k) => k.startsWith('400 '))).toBe(true);
   });
 
   it('a genuine 200 empty listing is still no_expirations (the domain outcome is preserved)', async () => {
