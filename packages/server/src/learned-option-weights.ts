@@ -19,7 +19,11 @@ import { entryDteBand as dteBand } from './option-trade-journal.js';
 // TRA-2937 — the attribution predicate that keeps un-chosen trades out of the
 // fold; see `excludedUnattributed` on {@link OptionLearnedWeights.generatedFrom}.
 import { isUnattributedImportRow } from './option-trade-journal.js';
+import { logger } from './observability/index.js';
 export { dteBand };
+
+/** TRA-4860 — this fold is observe-only; it warns, it does not throw. */
+const learnedLog = logger.child({ module: 'learned-option-weights' });
 
 // TRA-990 (Learning B) — fold the option-trade journal into learned, bounded
 // scoring weights, the options analog of `learned-signal-weights.ts`.
@@ -54,8 +58,29 @@ export interface OptionLearnedStat {
   scratch: number;
   /** WIN / resolved over resolved rows; null when none resolved. */
   winRate: number | null;
-  /** Mean realized R over resolved rows; null when none resolved. */
+  /**
+   * Mean realized R over the resolved rows that carry a NUMERIC R; null when
+   * none do. TRA-4860: the denominator is {@link rMeasured}, NOT {@link resolved}
+   * — dividing a short numerator by `resolved` is the fabricated-0 dilution
+   * TRA-4857 exists to remove, arriving by a different route.
+   */
   avgR: number | null;
+  /**
+   * TRA-4860 — resolved rows whose `realizedR` is a number, i.e. `avgR`'s own
+   * denominator. Published so `avgR` can never be read as covering more rows
+   * than it does.
+   */
+  rMeasured: number;
+  /**
+   * TRA-4860 — resolved rows carrying NO numeric R (`resolved − rMeasured`).
+   * Normal reading is 0: the UNMEASURED filter above removes the shape this
+   * learner expects to see. A non-zero here is a genuine writer defect (an
+   * outcome that is not `UNMEASURED` yet has no R), and it is PUBLISHED rather
+   * than thrown — this fold is observe-only and reached from a health route, so
+   * a throw here takes the whole report down for one bad row, which is how the
+   * TRA-2590 cross-tab test has been red on `main` since 2026-09-24.
+   */
+  rUnknown: number;
   /**
    * Hard-gate multiplier, kept as `multiplier` for backward-compat (eod-report,
    * etc.). Always equals {@link multiplierHardGate}; the flag-gated switch to the
@@ -172,19 +197,36 @@ function statFor(
   const winRate = resolved > 0 ? win / resolved : null;
   // TRA-4857 — don't coerce null realizedR to 0. A null here is a defect (the
   // row passed the outcome filter yet carries no R), but coercing it re-creates
-  // the fabricated-0 inside the exact mean the null was created to protect. Let
-  // it NaN the fold and surface loud, never silently flatten the mean.
+  // the fabricated-0 inside the exact mean the null was created to protect.
+  //
+  // TRA-4860 — it must not THROW either. This fold is observe-only and is
+  // reached from `/api/health/option-journal`; the throw took the entire report
+  // down for one row and has had the TRA-2590 cross-tab test red on `main` since
+  // 2026-09-24. So the row leaves `avgR`'s numerator AND its denominator — an
+  // R-less row is not evidence about the mean in either direction — and it is
+  // counted in `rUnknown`, which is the same treatment the cross-tab beside it
+  // already gives the same shape. Dropping it from the numerator alone would
+  // divide a short sum by `resolved` and pull the mean toward zero, which is the
+  // fabricated 0 again wearing a different hat.
+  const rMeasuredRows = resolvedRows.filter((r) => typeof r.realizedR === 'number');
+  const rMeasured = rMeasuredRows.length;
+  const rUnknown = resolved - rMeasured;
+  if (rUnknown > 0) {
+    learnedLog.warn('resolved option rows carry no realizedR — excluded from avgR', {
+      issue: 'TRA-4860',
+      key,
+      resolved,
+      rMeasured,
+      rUnknown,
+      ids: resolvedRows
+        .filter((r) => typeof r.realizedR !== 'number')
+        .slice(0, 10)
+        .map((r) => `${r.id}:${r.outcome}`),
+    });
+  }
   const avgR =
-    resolved > 0
-      ? resolvedRows.reduce((acc, r) => {
-          const rVal = r.realizedR;
-          if (typeof rVal !== 'number') {
-            throw new Error(
-              `learned-option-weights: resolved row ${r.id} (outcome ${r.outcome}) has non-number realizedR`,
-            );
-          }
-          return acc + rVal;
-        }, 0) / resolved
+    rMeasured > 0
+      ? rMeasuredRows.reduce((acc, r) => acc + (r.realizedR as number), 0) / rMeasured
       : null;
 
   const confident = resolved >= p.minSamples;
@@ -202,6 +244,8 @@ function statFor(
     scratch,
     winRate,
     avgR,
+    rMeasured,
+    rUnknown,
     multiplier,
     multiplierHardGate,
     multiplierShrunk,
