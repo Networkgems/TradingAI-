@@ -174,7 +174,7 @@ check('D6  the census publishes `outstanding` (durable row-stamp bytes; survives
 // `exitQuantityBoundDurable` accumulates verdict TRANSITIONS on DATA_DIR across
 // boots, so `everExercised` is the first byte on this route that can ever turn
 // that verdict over. Key absent on any build before 2026-09-27.
-const BOUND_DURABLE_KEYS = ['rows', 'verdicts', 'everExercised', 'ephemeral', 'lines', 'parsed', 'cap', 'droppedAtCap'];
+const BOUND_DURABLE_KEYS = ['rows', 'verdicts', 'everExercised', 'ephemeral', 'lines', 'parsed', 'cap', 'droppedAtCap', 'armedAt'];
 const boundDurable = optionsLive.exitQuantityBoundDurable;
 const boundDurablePresent = !!boundDurable && typeof boundDurable === 'object'
   && BOUND_DURABLE_KEYS.every(k => k in boundDurable)
@@ -182,7 +182,7 @@ const boundDurablePresent = !!boundDurable && typeof boundDurable === 'object'
 check('D9  the route publishes `exitQuantityBoundDurable` (bound-carrier bytes; survives a RESTART)',
   boundDurablePresent,
   boundDurablePresent
-    ? `everExercised ${boundDurable.everExercised} / rows ${boundDurable.rows} / `
+    ? `everExercised ${boundDurable.everExercised} since ${boundDurable.armedAt ? new Date(boundDurable.armedAt).toISOString() : 'UNKNOWN (no arming stamp)'} / rows ${boundDurable.rows} / `
       + `bounded ${boundDurable.verdicts.bounded} blind ${boundDurable.verdicts.blind} `
       + `suppressed ${boundDurable.verdicts.suppressed} clean ${boundDurable.verdicts.clean} / `
       + `ephemeral ${boundDurable.ephemeral} / lines ${boundDurable.lines} parsed ${boundDurable.parsed} / `
@@ -679,8 +679,18 @@ if (!boundExercised) {
     + (boundDurablePresent
       ? `\n        The durable carrier agrees and is HEALTHY (rows ${boundDurable.rows}, ephemeral `
         + `${boundDurable.ephemeral}, ${boundDurable.parsed}/${boundDurable.lines} parsed, dropped `
-        + `${boundDurable.droppedAtCap}) — so this is now a measured never across every boot this DATA_DIR `
-        + `has survived, not a counter that forgot.`
+        + `${boundDurable.droppedAtCap}) — so this is a measured never SINCE `
+        + `${boundDurable.armedAt ? new Date(boundDurable.armedAt).toISOString() : 'an UNKNOWN instant (no arming stamp)'}`
+        + `${boundDurable.armedAt ? ` (${Math.floor((Date.now() - boundDurable.armedAt) / 86400000)}d of carriage)` : ''}`
+        + `, not a counter that forgot.`
+        + (boundDurable.armedAt === null
+          ? `\n        ⚠ With no arming stamp the store cannot date its own zero, so that never is worth `
+            + `nothing until one is written.`
+          : Date.now() - boundDurable.armedAt < 7 * 86400000
+            ? `\n        ⚠ The carrier is younger than 7 days. It cannot testify about any boot that predates `
+              + `its own installation, so this zero is not yet evidence about the 37 days the bound had already `
+              + `been deployed — only about the days it has actually watched.`
+            : '')
       : `\n        ⚠ And this build carries NO durable bound carrier, so "unexercised" here means "unexercised `
         + `since the last restart" and nothing more. It is unfalsifiable at any age.`)
     + (unauthorizedAdopted > 0

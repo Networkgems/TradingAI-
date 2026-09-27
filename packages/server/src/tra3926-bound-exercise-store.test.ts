@@ -244,6 +244,45 @@ describe('TRA-3926 — the bound\'s refusal survives the restart its census does
     expect(stored.verdicts).toEqual({ bounded: 0, suppressed: 0, blind: 0, clean: 0 });
     expect(stored.firstAt).toBeNull();
   });
+
+  it('DATES its own zero — an empty store must not read as "never, across every boot"', () => {
+    // Measured 2026-09-27T23:46Z, six minutes after this carrier first deployed:
+    // the grader's BLIND banner called `everExercised false` "a measured never
+    // across every boot this DATA_DIR has survived". That was false and falsely
+    // reassuring — the store cannot testify about a boot that predates its own
+    // installation, and at that moment it had watched for six minutes.
+    const stored = summarizeBoundExercise();
+    expect(stored.everExercised).toBe(false);
+    expect(stored.armedAt).toBeTypeOf('number');
+    expect(stored.armedAt).toBeLessThanOrEqual(Date.now());
+    // The arming stamp is UNDERSTOOD, not damage: a healthy new store must not
+    // red the carrier-health check on its very first read.
+    expect(stored.lines).toBe(1);
+    expect(stored.parsed).toBe(1);
+  });
+
+  it('keeps the arming stamp out of the verdict fold once real verdicts land', () => {
+    recordEngineOpen(1, 1.08, 142603071);
+    recordDeskImport(1, 0.85);
+    tick(liveBook(widenedRow()));
+
+    const stored = summarizeBoundExercise();
+    expect(stored.lines).toBe(2);
+    expect(stored.parsed).toBe(2);
+    expect(stored.rows).toBe(1);
+    expect(stored.verdicts.bounded).toBe(1);
+    expect(stored.firstAt).toBeTypeOf('number');
+    expect(stored.armedAt).toBeLessThanOrEqual(stored.firstAt ?? 0);
+  });
+
+  it('an UNSTAMPED store reports armedAt null — unknown start, never "since forever"', () => {
+    // A store whose stamp could not be written (or was lost) must degrade to
+    // "this store's own start is UNKNOWN". `null` routes the reader to the
+    // conservative side; a fabricated date would not.
+    writeFileSync(join(dir, BOUND_EXERCISE_LOG_FILENAME), '', 'utf8');
+    setBoundExerciseDataDir(dir); // re-arm: the file EXISTS, so no stamp is written
+    expect(summarizeBoundExercise().armedAt).toBeNull();
+  });
 });
 
 // ─── The denominator, which is why `clean` is stored at all ────────────────
@@ -406,8 +445,9 @@ describe('TRA-3926 — a damaged store reports damage, not a clean answer', () =
     writeFileSync(join(dir, BOUND_EXERCISE_LOG_FILENAME), '{ not json\n', { flag: 'a' });
 
     const stored = summarizeBoundExercise();
-    expect(stored.lines).toBe(2);
-    expect(stored.parsed).toBe(1);
+    // 3 on disk: the arming stamp, the verdict, the garbage. 2 understood.
+    expect(stored.lines).toBe(3);
+    expect(stored.parsed).toBe(2);
     // The judgement survives; the damage is visible beside it rather than
     // folded away.
     expect(stored.verdicts.bounded).toBe(1);

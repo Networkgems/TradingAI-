@@ -73,7 +73,7 @@
  * summary publishes the cap itself so a reader never has to guess it.
  */
 
-import { appendFileSync, mkdirSync, readFileSync } from 'fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
@@ -101,6 +101,25 @@ export const BOUND_EXERCISE_MAX_LINES = 5000;
  */
 export type BoundExerciseVerdict = 'bounded' | 'suppressed' | 'blind' | 'clean';
 
+/**
+ * The ARMING marker, written once when a store is first pointed at a DATA_DIR.
+ *
+ * Without it an EMPTY store is ambiguous in the one direction that matters: it
+ * reads identically whether the carrier has watched this box for a year and
+ * seen nothing, or was installed ninety seconds ago. Measured 2026-09-27 at
+ * 23:46Z, six minutes after this carrier first deployed, the grader's own BLIND
+ * banner said the zero was "a measured never across every boot this DATA_DIR
+ * has survived" — which was false, and falsely reassuring, because the store
+ * could not testify about a single boot before its own installation.
+ *
+ * `armedAt` makes the claim exactly as strong as the evidence: a never SINCE a
+ * stated instant, which is worth nothing on day one and a great deal on day 90.
+ */
+export interface BoundExerciseArmedLine {
+  kind: 'armed';
+  at: number;
+}
+
 export interface BoundExerciseLine {
   kind: 'bound-exercise';
   /** ms epoch of the capture — when the bound reached this verdict. */
@@ -121,8 +140,30 @@ export interface BoundExerciseLine {
 
 let dataDir: string | null = null;
 
+/**
+ * Point the store at a DATA_DIR, and stamp the {@link BoundExerciseArmedLine}
+ * if this dir has never carried one.
+ *
+ * Best-effort and never throws: an arming stamp that could break a boot would
+ * be a worse defect than the ambiguity it removes. A dir whose stamp could not
+ * be written reports `armedAt: null`, which the route must read as "this
+ * store's own start is UNKNOWN" — not as "since forever".
+ */
 export function setBoundExerciseDataDir(dir: string | null): void {
   dataDir = dir;
+  storedSignatureByKey.clear();
+  if (dir == null) return;
+  const path = boundExerciseLogPath(dir);
+  try {
+    if (existsSync(path)) return;
+    mkdirSync(dirname(path), { recursive: true });
+    const line: BoundExerciseArmedLine = { kind: 'armed', at: Date.now() };
+    appendFileSync(path, JSON.stringify(line) + '\n', 'utf8');
+  } catch (err) {
+    log.warn('tra3926 bound-exercise arming stamp failed — the store cannot date its own zero', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 export function boundExerciseLogPath(dir: string): string {
@@ -167,29 +208,45 @@ export function classifyBoundExercise(bound: EngineExitQuantityBound): BoundExer
  * Read every stored line. Corrupt lines are skipped here and COUNTED by the
  * summary's `lines` vs `parsed` delta, never folded into a clean answer.
  */
-export function readBoundExercise(): { lines: BoundExerciseLine[]; rawLines: number } {
-  if (dataDir == null) return { lines: [], rawLines: 0 };
+export function readBoundExercise(): {
+  lines: BoundExerciseLine[];
+  rawLines: number;
+  /** Lines this build understood — verdicts PLUS the arming stamp. */
+  understood: number;
+  /** ms epoch this dir was first armed, or `null` if it carries no stamp. */
+  armedAt: number | null;
+} {
+  const empty = { lines: [], rawLines: 0, understood: 0, armedAt: null };
+  if (dataDir == null) return empty;
   let raw: string;
   try {
     raw = readFileSync(boundExerciseLogPath(dataDir), 'utf8');
   } catch {
-    return { lines: [], rawLines: 0 };
+    return empty;
   }
   const out: BoundExerciseLine[] = [];
   let rawLines = 0;
+  let understood = 0;
+  let armedAt: number | null = null;
   for (const line of raw.split('\n')) {
     if (line.trim() === '') continue;
     rawLines += 1;
     try {
-      const parsed = JSON.parse(line) as BoundExerciseLine;
-      if (parsed && parsed.kind === 'bound-exercise' && typeof parsed.positionId === 'string') {
+      const parsed = JSON.parse(line) as BoundExerciseLine | BoundExerciseArmedLine;
+      // The arming stamp is UNDERSTOOD, not damage. Counting it against
+      // `parsed` would make a healthy store red D9b on its very first read.
+      if (parsed && parsed.kind === 'armed' && typeof parsed.at === 'number') {
+        understood += 1;
+        if (armedAt === null || parsed.at < armedAt) armedAt = parsed.at;
+      } else if (parsed && parsed.kind === 'bound-exercise' && typeof parsed.positionId === 'string') {
+        understood += 1;
         out.push(parsed);
       }
     } catch {
-      // surfaced by the summary as a lines/parsed mismatch, not swallowed
+      // surfaced by the summary as a lines/understood mismatch, not swallowed
     }
   }
-  return { lines: out, rawLines };
+  return { lines: out, rawLines, understood, armedAt };
 }
 
 let droppedAtCap = 0;
@@ -293,8 +350,17 @@ export interface BoundExerciseSummary {
   ephemeral: boolean;
   /** Lines on disk, INCLUDING any this build could not parse. */
   lines: number;
-  /** Lines that parsed. `lines - parsed > 0` means the file is damaged. */
+  /** Lines this build understood (verdicts + the arming stamp). `lines - parsed > 0` means the file is damaged. */
   parsed: number;
+  /**
+   * When this DATA_DIR was first armed. **Read it before believing a zero.**
+   * `everExercised: false` is a never SINCE THIS INSTANT and no earlier — the
+   * store cannot testify about a boot that predates its own installation, and
+   * on day one that zero is worth nothing at all. `null` means the arming stamp
+   * could not be written or has been lost, i.e. this store's own start is
+   * UNKNOWN, which must never be read as "since forever".
+   */
+  armedAt: number | null;
   /** Distinct (book, OCC, row) keys the store testifies to. */
   rows: number;
   /**
@@ -310,10 +376,11 @@ export interface BoundExerciseSummary {
   /** Verdicts this boot could not store because the cap was reached. > 0 needs a human. */
   droppedAtCap: number;
   /**
-   * The headline. `false` means no imported row has reached an exit staging
-   * site on ANY boot this DATA_DIR has survived — the bound is deployed and
-   * untested by the tape, which is a statement about the market, not about the
-   * guard. `true` means AC1's live grade is answerable from this block.
+   * The headline, and it is only as strong as {@link armedAt}. `false` means no
+   * imported row has reached an exit staging site since this store was armed —
+   * the bound is deployed and untested by the tape, which is a statement about
+   * the market, not about the guard. `true` means AC1's live grade is
+   * answerable from this block. **Never quote the `false` without its date.**
    */
   everExercised: boolean;
   latest: Array<{
@@ -345,7 +412,7 @@ export interface BoundExerciseSummary {
  * history the fold drops.
  */
 export function summarizeBoundExercise(): BoundExerciseSummary {
-  const { lines, rawLines } = readBoundExercise();
+  const { lines, rawLines, understood, armedAt } = readBoundExercise();
   const byKey = new Map<string, BoundExerciseLine[]>();
   for (const l of lines) {
     const k = boundExerciseKey(l);
@@ -393,7 +460,8 @@ export function summarizeBoundExercise(): BoundExerciseSummary {
     dataDir,
     ephemeral: dataDir === null ? true : isEphemeralDataDir(dataDir),
     lines: rawLines,
-    parsed: lines.length,
+    parsed: understood,
+    armedAt,
     rows: byKey.size,
     verdicts,
     refusedContracts,
