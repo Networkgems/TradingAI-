@@ -319,6 +319,10 @@ import {
 } from './tra3932-open-leg-provenance.js';
 // TRA-3926 — the durable carrier for judgements the 30-day tape will outlive.
 import { setJudgedOversoldDataDir } from './tra3926-judged-oversold-store.js';
+import {
+  setBoundExerciseDataDir,
+  summarizeBoundExercise,
+} from './tra3926-bound-exercise-store.js';
 // TRA-4476 — the durable half of the unknown-outcome state machine: a pre-submit
 // intent journal that survives a restart, and the health readout for the halt.
 import {
@@ -4985,6 +4989,11 @@ setOpenLegProvenanceDataDir(DATA_DIR);
 // where a judgement, once served, survives the horizon. Nothing to hydrate:
 // read on demand, never compacted.
 setJudgedOversoldDataDir(DATA_DIR);
+// TRA-3926 (2026-09-27) — and the BOUND's exercise record, on the same resolved
+// DATA_DIR and equally uncompacted. Armed here rather than lazily on first use:
+// an unset dir makes every capture a silent no-op, and the population this
+// records is the one that only ever appears on real money.
+setBoundExerciseDataDir(DATA_DIR);
 
 // TRA-3939 — ARM THE TWO CAPTURES. Both stores hang off the same resolved
 // DATA_DIR and neither is compacted (see the module docblock: they hold evidence
@@ -13147,6 +13156,29 @@ app.get('/api/health/options-live', async (_req, res) => {
           },
         },
       ),
+      // TRA-3926 (2026-09-27) — the BOUND's durable exercise record, the direct
+      // analogue of `judgedOversoldDurable` one layer down.
+      //
+      // Every column of `exitQuantityBound` above, `outstanding` excepted, is a
+      // process-lifetime counter. Measured on `66a8a1ab` / pid 76 after 37 days
+      // of deployed bound: `checked 0` — the same reading every boot serves,
+      // because each boot starts at zero and nothing carried the prior one's.
+      // `outstanding` does not fill the gap either: it is derived from stamps on
+      // OPEN rows, so it is erased by the event that ends a refusal (the row
+      // closing). The consequence was that "has this guard ever bitten on real
+      // money" was not a question that could be answered SLOWLY — it could not
+      // be answered at all.
+      //
+      // Read `everExercised` first. `false` = no imported row has reached an
+      // exit staging site on any boot this DATA_DIR has survived; that is a fact
+      // about the tape, NOT a verdict on the bound, and AC1's live grade stays
+      // open. `true` = the record below answers it. `verdicts.clean` is the
+      // denominator and is why it is stored at all: without it, "armed and
+      // nothing has tried" and "never runs" both publish 0, which is the exact
+      // ambiguity `checked` was added to kill. `ephemeral: true`,
+      // `lines > parsed`, or `droppedAtCap > 0` mean this carrier is NOT doing
+      // its job — read those three before trusting anything under them.
+      exitQuantityBoundDurable: summarizeBoundExercise(),
     });
   } catch (err) {
     log.error('options-live health probe failed', {

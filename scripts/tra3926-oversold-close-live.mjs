@@ -162,6 +162,48 @@ check('D6  the census publishes `outstanding` (durable row-stamp bytes; survives
       + `${outstanding.latestAt ? new Date(outstanding.latestAt).toISOString() : 'none'} ${outstanding.latestReason ?? ''}`.trim()
     : 'ABSENT — this build predates the durable block; a since-boot zero here is NOT "no refusals"');
 
+// TRA-3926 (2026-09-27) — the BOUND's DURABLE EXERCISE RECORD, and the reason
+// this grader could not previously reach a verdict on AC1 at all.
+//
+// Every column of `exitQuantityBound` except `outstanding` is a process-lifetime
+// field, and `outstanding` is derived from stamps on OPEN rows — so it is erased
+// by the event that ends a refusal (the row closing). Measured `66a8a1ab` /
+// pid 76 / 2026-09-27, 37 days after the bound deployed: `checked 0`, which is
+// the reading every boot in between served and the reading day 400 would serve.
+// The BLIND exit below was therefore not a slow answer, it was a permanent one.
+// `exitQuantityBoundDurable` accumulates verdict TRANSITIONS on DATA_DIR across
+// boots, so `everExercised` is the first byte on this route that can ever turn
+// that verdict over. Key absent on any build before 2026-09-27.
+const BOUND_DURABLE_KEYS = ['rows', 'verdicts', 'everExercised', 'ephemeral', 'lines', 'parsed', 'cap', 'droppedAtCap'];
+const boundDurable = optionsLive.exitQuantityBoundDurable;
+const boundDurablePresent = !!boundDurable && typeof boundDurable === 'object'
+  && BOUND_DURABLE_KEYS.every(k => k in boundDurable)
+  && !!boundDurable.verdicts && typeof boundDurable.verdicts === 'object';
+check('D9  the route publishes `exitQuantityBoundDurable` (bound-carrier bytes; survives a RESTART)',
+  boundDurablePresent,
+  boundDurablePresent
+    ? `everExercised ${boundDurable.everExercised} / rows ${boundDurable.rows} / `
+      + `bounded ${boundDurable.verdicts.bounded} blind ${boundDurable.verdicts.blind} `
+      + `suppressed ${boundDurable.verdicts.suppressed} clean ${boundDurable.verdicts.clean} / `
+      + `ephemeral ${boundDurable.ephemeral} / lines ${boundDurable.lines} parsed ${boundDurable.parsed} / `
+      + `cap ${boundDurable.cap} dropped ${boundDurable.droppedAtCap}`
+    : 'ABSENT — this build predates the bound carrier; `checked 0` below is unfalsifiable and stays so at any age');
+// The carrier's own health, graded apart from its contents for the reason the
+// sibling carrier is: an ephemeral dir, a damaged file or a hit cap all make a
+// QUIET store, and a quiet store is indistinguishable from an unexercised bound
+// unless these are read first.
+if (boundDurablePresent) {
+  const carrierHealthy = boundDurable.ephemeral === false
+    && boundDurable.lines === boundDurable.parsed
+    && boundDurable.droppedAtCap === 0;
+  check('D9b the bound carrier is on a durable disk, undamaged, and below its cap',
+    carrierHealthy,
+    carrierHealthy
+      ? `ephemeral false / ${boundDurable.parsed}/${boundDurable.lines} lines parsed / ${boundDurable.rows} row(s) below cap ${boundDurable.cap}`
+      : `ephemeral ${boundDurable.ephemeral} / ${boundDurable.parsed}/${boundDurable.lines} lines parsed / `
+        + `dropped ${boundDurable.droppedAtCap} — a quiet store here is NOT an unexercised bound`);
+}
+
 if (!census) {
   print();
   console.error('FAIL — the detector is not on this build; nothing below is gradeable.');
@@ -591,16 +633,56 @@ const outstandingLine = outstandingPresent
 
 console.log(`# BOUND CENSUS (this boot only, ${before.uptimeSec}s):  ${JSON.stringify(bound)}`);
 console.log(`# OUTSTANDING refusals on open rows (DURABLE, survives a restart):  ${outstandingLine}`);
+console.log(`# BOUND EXERCISE, LIFETIME (DURABLE, survives a restart AND a close):  ${
+  boundDurablePresent
+    ? `everExercised ${boundDurable.everExercised} / ${boundDurable.rows} row(s) — `
+      + `bounded ${boundDurable.verdicts.bounded} / suppressed ${boundDurable.verdicts.suppressed} / `
+      + `blind ${boundDurable.verdicts.blind} / clean ${boundDurable.verdicts.clean}; `
+      + `contracts refused ${boundDurable.refusedContracts}; first `
+      + `${boundDurable.firstAt ? new Date(boundDurable.firstAt).toISOString() : 'none'}`
+    : 'key ABSENT on this build'
+}`);
 console.log(`# the gate that owns the denominator:  liveUnmanagedRisk.byReason.adopted_not_authorized = ${unauthorizedAdopted}`);
 
 if (failed.length > 0) {
   console.error(`\nFAIL — ${failed.length}/${rows.length}: ${failed.map(r => r.id).join(' | ')}`);
   process.exit(1);
 }
+// TRA-3926 (2026-09-27) — the boot-scoped `checked` is no longer the only way
+// to reach a verdict here. A bound that bit on a PREVIOUS boot is still a bound
+// that has been exercised on this box's real tape, and before the carrier
+// existed that fact was unrecoverable, so the BLIND branch below fired on
+// evidence it had merely forgotten. Graded only where D9 has the key: on an
+// older build `boundEverExercised` is false because the byte is absent, which
+// must not be reported as a measured never.
+const boundEverExercised = boundDurablePresent && boundDurable.everExercised === true;
+if (!boundExercised && boundEverExercised) {
+  console.log(`\nPASS (DURABLE) — ${rows.length}/${rows.length}; the bound is UNEXERCISED on this boot `
+    + `(checked ${bound?.checked}, uptime ${before.uptimeSec}s) but its carrier holds ${boundDurable.rows} row(s) `
+    + `from earlier boots: bounded ${boundDurable.verdicts.bounded} / suppressed ${boundDurable.verdicts.suppressed} / `
+    + `blind ${boundDurable.verdicts.blind} / clean ${boundDurable.verdicts.clean}, `
+    + `${boundDurable.refusedContracts} contract(s) refused, first `
+    + `${boundDurable.firstAt ? new Date(boundDurable.firstAt).toISOString() : 'none'}.`
+    + `\n       ⚠ This is PRESERVED EXERCISE, not a live re-derivation — the same reading discipline as `
+    + `judgedOversoldDurable.onLiveTape. It says the staging site has been reached on this box; it says nothing `
+    + `about today's tape.`
+    + (boundDurable.verdicts.bounded === 0 && boundDurable.verdicts.suppressed === 0
+      ? `\n       ⚠ And nothing in that record is a BITE: every stored verdict is clean or blind, so AC1's `
+        + `REFUSAL arm is still unproven on the wire. The path has run; it has not yet had to bound anything.`
+      : ''));
+  process.exit(0);
+}
 if (!boundExercised) {
   console.error(`\nBLIND — the DETECTOR passed ${rows.length}/${rows.length}, but the BOUND is UNEXERCISED on this boot `
     + `(exitQuantityBound.checked = ${bound?.checked}). Not one imported row reached an exit staging site, so AC1–AC4 `
     + `are proven by the unit suite and by deployed bytes ONLY, never by this reading.`
+    + (boundDurablePresent
+      ? `\n        The durable carrier agrees and is HEALTHY (rows ${boundDurable.rows}, ephemeral `
+        + `${boundDurable.ephemeral}, ${boundDurable.parsed}/${boundDurable.lines} parsed, dropped `
+        + `${boundDurable.droppedAtCap}) — so this is now a measured never across every boot this DATA_DIR `
+        + `has survived, not a counter that forgot.`
+      : `\n        ⚠ And this build carries NO durable bound carrier, so "unexercised" here means "unexercised `
+        + `since the last restart" and nothing more. It is unfalsifiable at any age.`)
     + (unauthorizedAdopted > 0
       ? `\n        And the population is currently held UPSTREAM: ${unauthorizedAdopted} adopted row(s) sit `
         + `\`adopted_not_authorized\`, refused by ruling B's gate before the bound is ever consulted.`

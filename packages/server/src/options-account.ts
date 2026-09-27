@@ -144,6 +144,9 @@ import {
   splitEngineExposureContracts,
   type EngineExitQuantityBound,
 } from './option-exec-flag.js';
+// TRA-3926 — the bound's census is boot-scoped; this is the half that survives
+// a restart. Observation only, never consulted by an exit decision.
+import { captureBoundExercise } from './tra3926-bound-exercise-store.js';
 // TRA-3909 — the PER-LOT adoption planner. Pure, so every refusal below is
 // reachable from a test without a broker, a ledger or a clock.
 import {
@@ -10744,7 +10747,25 @@ export class PaperOptionsAccount {
     // box stages exits all day and none of them are imported; counting those
     // here would bury the one number that matters under a rising `checked` that
     // proves nothing about live imported rows.
-    if (opt.importedFromTradier === true) this.exitQuantityChecked += 1;
+    if (opt.importedFromTradier === true) {
+      this.exitQuantityChecked += 1;
+      // TRA-3926 (2026-09-27) — the DURABLE half of this census. Every counter
+      // below is a process-lifetime field, so the whole exercise record dies at
+      // the next restart and "has this guard ever bitten on real money" was not
+      // a question that could be answered slowly — it could not be answered at
+      // all. Captured here, on the SAME verdict the branches below act on and
+      // scoped to the SAME imported-row denominator as `exitQuantityChecked`,
+      // so the two reconcile on one read. Observation only: nothing below reads
+      // it back and no exit decision can change because of it.
+      captureBoundExercise(
+        {
+          owner: this.owner ?? null,
+          optionSymbol: opt.optionSymbol ?? null,
+          positionId: opt.id,
+        },
+        bound,
+      );
+    }
     if (bound.netOfCloses) this.exitQuantityNetOfCloses += 1;
     if (bound.reason === 'reconcile_terminal') this.exitQuantityReconcileTerminal += 1;
     if (bound.reason === 'desk_add_exempt') this.exitQuantityDeskAddExempt += 1;
