@@ -167,6 +167,7 @@ import {
   onOptionTradeClose,
   type OptionTradeJournalRecord,
 } from './option-trade-journal.js';
+import { seedDataTapeBounds, DATA_TAPE_BOUNDS_TOTAL_BYTES } from './data-tape-bounds.js'; // TRA-4903
 import {
   hydrateExplorationAllowanceFromDisk,
   handleExplorationJournalClose,
@@ -204,7 +205,10 @@ import { runZombieOpenSweep } from './zombie-open-journal-sweep.js';
 import { EXPIRED_DEMO_ORPHAN_DTE_BOUND_REASON, runExpiredDemoOrphanSweep } from './expired-demo-orphan-sweep.js'; // TRA-4711, TRA-4721
 // TRA-2214 — the EOD journal blocks fold HERE, not inline, so this module holds
 // no bare fold that could be fed a differently-sourced (pooled) row list.
-import { foldModelFacingEodJournal } from './model-facing-journal.js';
+import {
+  foldModelFacingEodJournal,
+  foldModelFacingStrategyDegradation,
+} from './model-facing-journal.js';
 // TRA-1046 (TRA-1041c L2) — synchronous on-demand hypothesis backtest behind
 // POST /api/backtest, reusing the audited apply→backtest→G0-grade pipeline.
 // TRA-1000 — external-intel source-quality scorer: per-source advisory weights
@@ -254,7 +258,12 @@ import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 // TRA-4343 — the durable entry-site census + the since-boot vacuity disclosure.
 import { hydrateEntrySiteCensusFromDisk } from './entry-site-census-ledger.js';
 import { gradeSinceBootSessionCoverage } from './session-coverage.js';
-import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
+import {
+  COST_AWARE_GATE_COMPACTION_INTERVAL_MS, // TRA-4904
+  compactCostAwareGateLedgerNow, // TRA-4904
+  noteCostAwareGateCompactionTimerArmed, // TRA-4904
+  hydrateCostAwareGateFromDisk,
+} from './cost-aware-gate-ledger.js';
 // TRA-4628 — the OTM candidate-admission tape (admitted AND refused scanner
 // candidates), hydrated at boot so a post-close read spans the whole session.
 import { hydrateOtmAdmissionTapeFromDisk } from './otm-admission-tape.js';
@@ -741,6 +750,17 @@ import {
   isLearnedWeightsSnapshotEnabled,
   type SnapshotDimension,
 } from './learned-weights-history.js';
+// TRA-4914 — the options evaluation report (Phase 0 of TRA-4481, ratified TRA-4911).
+import {
+  OPTIONS_EVAL_REPORT_FLAG,
+  isOptionsEvalReportEnabled,
+  listOptionsEvaluationReportDates,
+  readLatestOptionsEvaluationReport,
+  recordOptionsEvaluationReport,
+} from './options-evaluation-report-store.js';
+// TRA-4913 — the per-strategy degradation monitor (Phase 0 of TRA-4481, ratified
+// TRA-4911). ADVISORY ONLY: a flag and a recommendation, never an action.
+import { DECLARED_STRATEGY_ENVELOPES } from './strategy-degradation-monitor.js';
 import {
   loadUserMemoryStore,
   getUserMemory,
@@ -807,6 +827,7 @@ import { startEventLoopWatchdog, type WatchdogHandle } from './event-loop-watchd
 import { installStdioBlockMeter } from './stdio-block-meter.js';
 import { installGcPauseMeter } from './gc-pause-meter.js';
 import { startHeapCensusSampler, type HeapCensusSamplerHandle } from './heap-census-sampler.js';
+import { marketDataDailyCacheCensusTarget } from './market-data-daily-cache.js';
 import type { CensusSubject } from './heap-retainer-census.js';
 import {
   logger,
@@ -1970,6 +1991,8 @@ async function generateAndSaveReport(
       finalSnapshot.optionJournal = fold.optionJournal;
       finalSnapshot.optionLearnedWeights = fold.optionLearnedWeights;
       finalSnapshot.introspection = fold.introspection;
+      // TRA-4913 — advisory degradation section. Same rows, same basis.
+      finalSnapshot.strategyDegradation = fold.strategyDegradation;
       finalSnapshot.journalBasis = fold.journalBasis;
       finalSnapshot.journalBasisCounts = fold.journalBasisCounts;
     } catch (err) {
@@ -4745,6 +4768,19 @@ async function runLiveRealizedCalendarBackfill(): Promise<void> {
 // DATA_DIR for appends. Same durability rationale as the ledgers above: the
 // TRA-4623 rule needs >=20 RTH desk sessions, which no since-boot counter can
 // span. Compacted to a 60-day window / 64MB (whole-oldest-day pruning) on boot.
+// TRA-4903 — seed the byte-ceiling size cache for the 27 previously-unbounded
+// `/data` tapes. Changes no file: a seal never rewrites, it refuses. Running it
+// up front means `/api/health/storage/detail` can answer "is this enforcement
+// wired in at all?" on a quiet box, before any tape has been appended to.
+{
+  const s = seedDataTapeBounds(DATA_DIR);
+  log.info('data tape byte ceilings seeded (TRA-4903)', {
+    tapes: s.seeded,
+    existingOnDisk: s.existing,
+    totalMaxBytes: DATA_TAPE_BOUNDS_TOTAL_BYTES,
+  });
+}
+
 {
   const h = hydrateOtmAdmissionTapeFromDisk(DATA_DIR);
   if (h.records > 0) {
@@ -11450,6 +11486,106 @@ app.get('/api/health/learned-weights', async (req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to compute learned weights' });
+  }
+});
+
+// TRA-4914 — the options evaluation report, read back off the artifact the 21:00
+// ET archive tick writes. The STANDARD GRADING SURFACE for the options path
+// (Phase 0 of the TRA-4481 upgrade plan, ratified on TRA-4911). Unauthenticated,
+// read-only, write-only-observer class; no capital path.
+//
+// The three fields below follow CLAUDE.md's health-field rule, and the split is
+// the whole point of publishing them separately:
+//   • `flagEnabled`  — a CONFIG fact, named as one. It says what we INTENDED.
+//   • `lastRunStatus`— the OUTCOME of the last real attempt, off the artifact
+//     itself. `never_written_this_boot` is its own named state and is an ALARM,
+//     not a pass: an absent artifact is NOT an empty report and must never
+//     render as zeros.
+//   • `report`       — `null` when nothing has been written. Every cell inside
+//     carries its own `status` (`OK` / `INSUFFICIENT` / `NOT_MEASURED`), so a
+//     thin book is legible as thin rather than as a confident flat result.
+app.get('/api/health/options-evaluation', async (_req, res) => {
+  try {
+    const artifact = await readLatestOptionsEvaluationReport();
+    const dates = await listOptionsEvaluationReportDates();
+    res.json({
+      issue: 'TRA-4914',
+      // CONFIG fact — presence of the arm, never liveness of the report.
+      flagEnabled: isOptionsEvalReportEnabled(),
+      flagName: OPTIONS_EVAL_REPORT_FLAG,
+      // OUTCOME of the last real attempt, with its date beside it.
+      lastRunStatus: artifact ? 'written' : 'never_written_this_boot',
+      lastRunAsOfDate: artifact?.report.asOfDate ?? null,
+      lastRunGeneratedAt: artifact?.report.generatedAt ?? null,
+      lateForEtDate: artifact?.lateForEtDate ?? null,
+      // Dates on disk, ascending. Gaps are GAPS — a reader must not interpolate.
+      availableDates: dates,
+      report: artifact?.report ?? null,
+    });
+  } catch (err) {
+    log.error('options-evaluation health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read options evaluation report' });
+  }
+});
+
+// TRA-4913 — the per-strategy DEGRADATION MONITOR (Phase 0 item 2 of TRA-4481,
+// ratified on TRA-4911). Rolling PF / expectancy per `structure::entryArchetype`
+// cohort, graded against that cohort's OWN recorded envelope.
+//
+// ⚠ ADVISORY ONLY. Nothing downstream of this route halts, throttles, resizes or
+// disables anything. Hard halts remain with `options-risk-breaker`, the
+// `DailyRiskGovernor` and the churn brakes; `shadow-expectancy-guard` still owns
+// promotion. `sizeDown.recommendedSizeFactor` has no reader in the tree.
+//
+// The fold is computed LIVE off the journal rather than read from an artifact,
+// because it is pure and cheap and an artifact would introduce a staleness state
+// this route would then have to report. `lastRunStatus` is therefore the outcome
+// of THIS attempt (CLAUDE.md health-field rule: report what the dependency
+// actually did, never the configuration). A throw reads `read_failed`, never an
+// empty report — "could not check" and "checked and it is fine" must not share a
+// value, which is the same invariant every cell in the payload carries.
+app.get('/api/health/strategy-degradation', async (req, res) => {
+  const parsePositiveInt = (raw: unknown): number | undefined => {
+    if (typeof raw !== 'string') return undefined;
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  };
+  try {
+    const window = parsePositiveInt(req.query.window);
+    const minWindow = parsePositiveInt(req.query.minWindow);
+    // TRA-2214 basis — the MODEL-FACING rows (desk + unattributed, QA fixture
+    // books dropped), not the raw journal. This surface grades COHORTS, so a
+    // fixture book that leaked in would arrive as a cohort with its own verdict.
+    const { report, journalBasis, journalBasisCounts } = await foldModelFacingStrategyDegradation({
+      ...(window !== undefined ? { recentWindow: window } : {}),
+      ...(minWindow !== undefined ? { minWindowTrades: minWindow } : {}),
+    });
+    res.json({
+      issue: 'TRA-4913',
+      advisoryOnly: true,
+      // OUTCOME of this attempt. Never a config fact.
+      lastRunStatus: 'computed',
+      // CONFIG fact, named as one: how many envelopes were DECLARED (as opposed
+      // to derived from a cohort's own trailing baseline, which is not a
+      // validation). Zero is the honest reading today, not a failure.
+      declaredEnvelopesConfigured: DECLARED_STRATEGY_ENVELOPES.length,
+      // The basis rides the wire beside the numbers it moved.
+      journalBasis,
+      journalBasisCounts,
+      report,
+    });
+  } catch (err) {
+    log.error('strategy-degradation health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({
+      issue: 'TRA-4913',
+      lastRunStatus: 'read_failed',
+      error: 'Failed to compute strategy degradation report',
+      report: null,
+    });
   }
 });
 
@@ -19230,6 +19366,34 @@ function tickPromotionDivergence(): void {
 setTimeout(tickPromotionDivergence, 2 * 60_000).unref?.();
 setInterval(tickPromotionDivergence, PROMOTION_DIVERGENCE_RECOMPUTE_MS).unref?.();
 
+// TRA-4904 — re-apply the cost-aware-gate ledger's 7-day retention TO DISK every
+// 6 hours, not only at boot.
+//
+// The boot hydrate above compacts once and then never again, so the file carried up
+// to one BOOT INTERVAL of rows already past retention: +70.4% at the observed 4.93-day
+// max boot gap, 119.1 MiB worst case against a ~73 MiB steady state. This tape is the
+// only one on the box where that premium matters, because it pairs the highest write
+// rate in /data (9.98 MiB/day) with the shortest retention (7d; every sibling holds
+// 30d at +16.4%). The margin to `minFreePct` today (~13.5 d of uptime) exists only
+// because the box keeps restarting — so FIXING the instability is what makes this bite,
+// which is why it ships before it does. See TRA-4899 AC4 / docs/tra4899-data-tape-budget.md.
+//
+// The first fire is one full interval out, not at boot: the hydrate has just compacted,
+// so an immediate pass could only re-read ~70 MiB to drop nothing.
+const costAwareGateCompactionTimer = setInterval(() => {
+  void compactCostAwareGateLedgerNow().catch((err) => {
+    log.warn('TRA-4904 cost-aware-gate periodic compaction failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  });
+}, COST_AWARE_GATE_COMPACTION_INTERVAL_MS);
+costAwareGateCompactionTimer.unref?.();
+// Record that something SCHEDULED a fire. bqb1's uptime is usually shorter than one
+// interval, so a healthy hook reports zero fires most of the time — without this the
+// health route cannot tell "not due yet" from "never wired", and "never wired" is the
+// defect TRA-4904 is fixing.
+noteCostAwareGateCompactionTimerArmed();
+
 // ── Static frontend (production web) ────────────────────────────────────────
 const DIST_DIR = join(__dirname, '..', '..', '..', 'apps', 'desktop', 'dist');
 if (existsSync(DIST_DIR)) {
@@ -19414,6 +19578,22 @@ scheduler.start({
         log.error('learned-weights snapshot tick failed', {
           reason: err instanceof Error ? err.message : String(err),
         }),
+    );
+    // TRA-4914 — the options evaluation report: the standard grading surface for
+    // the options path (Phase 0 of the TRA-4481 upgrade plan, ratified TRA-4911).
+    // Chained AFTER `runDailyCloseForAllUsers()` so today's closes are already in
+    // the journal before the fold is taken. Zero-IO no-op while
+    // ENABLE_OPTIONS_EVAL_REPORT is off — the flag is checked before the journal
+    // is read. WRITE-ONLY OBSERVER: nothing consumes a snapshot to make a
+    // decision, so no live behaviour change and no capital path.
+    //
+    // SURFACE CLASS B (journal = append-only): a LATE fire reads a strict
+    // superset and its verdict is VALID. The artifact records `lateForEtDate`
+    // beside the report rather than refusing — see the module header.
+    await recordOptionsEvaluationReport({ asOfDate: etDateString(new Date()) }).catch(err =>
+      log.error('options evaluation report tick failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      }),
     );
     // TRA-3449 — assert the LIVE-MONEY NAV tripwire and write one durable row for this ET
     // day. LAST in the chain: `runDailyCloseForAllUsers()` above is what writes today's EOD
@@ -19828,12 +20008,20 @@ const eventLoopWatchdog: WatchdogHandle | null = startEventLoopWatchdog();
 // a hand-written suspect list would only ever find a retainer someone already
 // suspected. Shallow (`.size`/`.length`, O(1) per field) on the sampled path;
 // the O(entries) deep sum is opt-in per request on `/api/health/heap-census`.
+// TRA-4158 — `marketData` is the process-global daily store the per-engine
+// `dailyCloseCache` / `otmDailyBarCache` were hoisted into. It MUST be a census
+// subject: a successful hoist drops those two per-engine rows to zero owners,
+// which is byte-identical to the instrument going blind on them, so the
+// replacement rows have to appear in the same read for the AC2 plateau proof to
+// distinguish "moved" from "stopped looking".
 const heapCensusSampler: HeapCensusSamplerHandle | null = startHeapCensusSampler({
-  subjects: () =>
-    getAllUserContexts().flatMap((ctx): CensusSubject[] => [
+  subjects: () => [
+    ...getAllUserContexts().flatMap((ctx): CensusSubject[] => [
       { klass: 'signalEngine', target: ctx.engine },
       { klass: 'pnlTracker', target: ctx.tracker },
     ]),
+    { klass: 'marketData', target: marketDataDailyCacheCensusTarget },
+  ],
 });
 
 /**

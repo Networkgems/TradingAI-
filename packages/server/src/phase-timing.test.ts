@@ -5,6 +5,8 @@ import {
   getCurrentPhase,
   recordPhaseDuration,
   getPhaseAttribution,
+  getSyncBlockCensus,
+  SyncSliceMeter,
   _resetPhaseTimingForTests,
 } from './phase-timing.js';
 
@@ -167,5 +169,195 @@ describe('phase-timing', () => {
       // instrument entirely, which is the failure this guards.
       expect(getPhaseAttribution().recentSlowPhases).toHaveLength(20);
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-4920 — the since-boot sync census.
+//
+// Live on bqb1 2026-09-25T19:48Z, one payload, one instant:
+//   .watchdog.phaseAttribution.lastSlowSyncPhase =
+//        yield-preempt@signal.doTick.equity-entry-sweep, 1436ms, kind "sync", 19:01:20Z
+//   .watchdog.phaseAttribution.recentSlowPhases  = n=512, histogram {async: 512}
+// From that we could state that ONE 1436ms block happened. Not how many, not
+// the distribution, not whether it is trending. Every grade of the residual was
+// therefore an anecdote, and a residual you cannot measure decays back toward
+// the 5s health budget silently.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Hold the loop synchronously for ~ms (a real block, not a timer). */
+function busyBlock(ms: number): void {
+  const until = Date.now() + ms;
+  while (Date.now() < until) { /* burn */ }
+}
+
+describe('TRA-4920 — sync-block census', () => {
+  it('AC2: a REAL >=1s synchronous yield-preempt increments the census, through the live wrapper', () => {
+    // The fixture: drive the shipped SyncSliceMeter, with a genuine >=1s
+    // synchronous burn standing in for the foreign uninstrumented work that
+    // starves the loop during a yield. No injected duration, no stubbed clock —
+    // the same call the live box makes, at the live default thresholds.
+    const meter = new SyncSliceMeter('signal.doTick.equity-entry-sweep');
+    const scheduledAt = Date.now();
+    busyBlock(1_050);
+    meter.onYieldResumed(scheduledAt, 'TSLA');
+
+    const c = getSyncBlockCensus();
+    expect(c.count).toBe(1);
+    expect(c.countAtOrOver1s).toBe(1);
+    expect(c.buckets['1000-1999']).toBe(1);
+    expect(c.maxMs).toBeGreaterThanOrEqual(1_000);
+    // AC1 — the phase name survives. The witness is never the culprit, but it
+    // says the block was FOREIGN work seen from this phase's yield, which is
+    // the opposite verdict from a `#slice`.
+    expect(c.maxName).toBe('yield-preempt@signal.doTick.equity-entry-sweep');
+    expect(c.byName['yield-preempt@signal.doTick.equity-entry-sweep']).toMatchObject({ count: 1 });
+  }, 10_000);
+
+  it('AC2 (the mutation): the SAME >=1s delay reads 0 when the tagger mislabels it', () => {
+    // The discriminator has to be a LIVE mis-tag path, not a synthetic mutant.
+    // This is one: `onYieldResumed` re-tags the identical delay as
+    // `yield-wait@<phase>` kind `async` whenever heldTurns > 0. Same method,
+    // same duration, one flag moved.
+    const meter = new SyncSliceMeter('signal.doTick.equity-entry-sweep');
+    const scheduledAt = Date.now();
+    busyBlock(1_050);
+    meter.onYieldResumed(scheduledAt, 'TSLA', /* heldTurns */ 1);
+
+    const c = getSyncBlockCensus();
+    // A >=1s event provably happened — the ring caught it, tagged async.
+    expect(getPhaseAttribution().recentSlowPhases).toHaveLength(1);
+    expect(getPhaseAttribution().recentSlowPhases[0]!.kind).toBe('async');
+    // ...and the census reads ZERO. This is the reading a broken tagger
+    // produces, and it is indistinguishable from a quiet box — which is why
+    // this control ships WITH the counter and not as a follow-up.
+    expect(c.count).toBe(0);
+    expect(c.countAtOrOver1s).toBe(0);
+    expect(c.maxName).toBeNull();
+  }, 10_000);
+
+  it('AC1: the census keeps counting past RING_MAX — the ring EVICTS, the census does not', () => {
+    // THE MECHANISM, stated precisely: `recentSlowPhases` does not EXCLUDE sync
+    // records (recordPhaseDuration pushes both kinds). It EVICTS them. The ring
+    // horizon is set by the `async` arrival rate, which on bqb1 is orders of
+    // magnitude above the `sync` rate — so the live 512/512-async read is a
+    // FIFO artefact, not proof that no sync record was ever written.
+    const env = { PHASE_TIMING_RING_MAX: '8' } as NodeJS.ProcessEnv;
+    recordPhaseDuration('yield-preempt@signal.doTick.equity-entry-sweep', 1_436, 1_000, env, 'sync');
+    // The sync record IS in the ring at first — exclusion would show up here.
+    expect(getPhaseAttribution().recentSlowPhases.map((p) => p.kind)).toEqual(['sync']);
+    // ...then the async flood arrives and shifts it straight back out.
+    for (let i = 0; i < 40; i += 1) recordPhaseDuration('signal.doTick', 13_000, 2_000 + i, env, 'async');
+
+    const ring = getPhaseAttribution().recentSlowPhases;
+    expect(ring).toHaveLength(8);
+    expect(ring.filter((p) => p.kind === 'sync')).toHaveLength(0); // the live 512/512 reading, reproduced
+
+    // The census is untouched by the flood: it still knows the block happened,
+    // how big it was, and what it was called.
+    const c = getSyncBlockCensus(env);
+    expect(c.count).toBe(1);
+    expect(c.maxMs).toBe(1_436);
+    expect(c.maxName).toBe('yield-preempt@signal.doTick.equity-entry-sweep');
+  });
+
+  it('AC1: buckets make the approach to 1000ms visible BEFORE a 1000ms block exists', () => {
+    // The ring threshold is 1000ms, so a residual climbing 300 -> 600 -> 900 is
+    // completely invisible to every existing surface until it is already a
+    // block. The census floor is 250ms for exactly this reason.
+    for (const ms of [260, 300, 499, 500, 900, 1_100, 2_500, 6_000]) {
+      recordPhaseDuration('yield-preempt@p', ms, 1_000, process.env, 'sync');
+    }
+    const c = getSyncBlockCensus();
+    expect(c.thresholdMs).toBe(250);
+    expect(c.buckets).toEqual({ '250-499': 3, '500-999': 2, '1000-1999': 1, '2000-4999': 1, '5000+': 1 });
+    expect(c.count).toBe(8);
+    expect(c.countAtOrOver1s).toBe(3);
+    // Only the three >=1000ms records reached the ring — the census widened the
+    // intake without changing what the ring or the latch mean.
+    expect(getPhaseAttribution().recentSlowPhases).toHaveLength(3);
+  });
+
+  it('a sub-threshold sync record and an async record both stay out of the census', () => {
+    recordPhaseDuration('cheap.sync', 249, 1_000, process.env, 'sync');
+    recordPhaseDuration('signal.doTick', 13_134, 1_000, process.env, 'async');
+    const c = getSyncBlockCensus();
+    expect(c.count).toBe(0);
+    expect(c.firstAtMs).toBeNull();
+    // An `async` wall time includes awaited I/O — folding one in would make the
+    // count unreadable as a BLOCK count, which is the only thing it is for.
+    expect(c.byName).toEqual({});
+  });
+
+  it('SYNC_BLOCK_CENSUS_MIN_MS tightens the intake floor without a redeploy', () => {
+    const env = { SYNC_BLOCK_CENSUS_MIN_MS: '600' } as NodeJS.ProcessEnv;
+    recordPhaseDuration('yield-preempt@p', 400, 1_000, env, 'sync');
+    recordPhaseDuration('yield-preempt@p', 700, 1_001, env, 'sync');
+    const c = getSyncBlockCensus(env);
+    expect(c.thresholdMs).toBe(600);
+    expect(c.count).toBe(1);
+    // The floor is published beside the buckets, so a reader can tell a raised
+    // floor from an empty bucket.
+    expect(c.buckets['250-499']).toBe(0);
+    expect(c.buckets['500-999']).toBe(1);
+  });
+
+  it('a junk SYNC_BLOCK_CENSUS_MIN_MS falls back to 250 rather than blinding the census', () => {
+    for (const raw of ['', '  ', 'abc', '0', '-5']) {
+      _resetPhaseTimingForTests();
+      const env = { SYNC_BLOCK_CENSUS_MIN_MS: raw } as NodeJS.ProcessEnv;
+      recordPhaseDuration('yield-preempt@p', 300, 1_000, env, 'sync');
+      expect(getSyncBlockCensus(env)).toMatchObject({ thresholdMs: 250, count: 1 });
+    }
+  });
+
+  it('per-symbol slice labels collapse in byName so cardinality cannot explode', () => {
+    // `<phase>#slice[AAPL..NVDA]` is unbounded in the symbol universe. The count
+    // must stay whole while the KEY stays bounded.
+    for (const [from, to] of [['AAPL', 'NVDA'], ['MSFT', 'AMD'], ['TSLA', 'INTC']]) {
+      recordPhaseDuration(`signal.doTick.sweep#slice[${from}..${to}]`, 1_200, 1_000, process.env, 'sync');
+    }
+    recordPhaseDuration('signal.doTick.pacer#span[a..b]', 1_200, 1_000, process.env, 'sync');
+    const c = getSyncBlockCensus();
+    expect(c.count).toBe(4);
+    expect(Object.keys(c.byName).sort()).toEqual([
+      'signal.doTick.pacer#span[…]',
+      'signal.doTick.sweep#slice[…]',
+    ]);
+    expect(c.byName['signal.doTick.sweep#slice[…]']).toMatchObject({ count: 3, maxMs: 1_200 });
+    // The full name still survives on the max record — the range that blocked
+    // is diagnostically useful even though the key is folded.
+    expect(c.maxName).toContain('#slice[');
+  });
+
+  it('byName is capped and says so rather than silently dropping new names', () => {
+    for (let i = 0; i < 80; i += 1) {
+      recordPhaseDuration(`yield-preempt@phase-${i}`, 1_200, 1_000 + i, process.env, 'sync');
+    }
+    const c = getSyncBlockCensus();
+    // The total is never lost, whatever happens to the per-name breakdown.
+    expect(c.count).toBe(80);
+    expect(Object.keys(c.byName).length).toBeLessThanOrEqual(64);
+    expect(c.namesTruncated).toBeGreaterThan(0);
+    expect(c.byName['__other__']!.count).toBe(c.namesTruncated);
+  });
+
+  it('the census is monotonic — a second read can only be >= the first (the trend property)', () => {
+    recordPhaseDuration('yield-preempt@p', 1_400, 1_000, process.env, 'sync');
+    const first = getSyncBlockCensus();
+    recordPhaseDuration('yield-preempt@p', 300, 2_000, process.env, 'sync');
+    const second = getSyncBlockCensus();
+    expect(second.count).toBeGreaterThan(first.count);
+    expect(second.maxMs).toBeGreaterThanOrEqual(first.maxMs); // the 300ms record must not lower it
+    expect(second.firstAtMs).toBe(first.firstAtMs);
+    expect(second.lastAtMs).toBe(2_000);
+  });
+
+  it('getPhaseAttribution carries the census, so /api/health/watchdog exposes it (AC1)', () => {
+    recordPhaseDuration('yield-preempt@signal.doTick.equity-entry-sweep', 1_436, 1_000, process.env, 'sync');
+    // Live JSON path: .watchdog.phaseAttribution.syncBlockCensus
+    const attr = getPhaseAttribution();
+    expect(attr.syncBlockCensus.count).toBe(1);
+    expect(attr.syncBlockCensus.maxName).toBe('yield-preempt@signal.doTick.equity-entry-sweep');
   });
 });

@@ -626,6 +626,7 @@ export type {
 // Arming is still the env list `OTM_SETUP_TAXONOMY_SETUPS`, absent ⇒ nothing on.
 export {
   evaluateSetupTaxonomy,
+  isSetupTaxonomyMatch,
   SETUP_TAXONOMY_REGISTRY,
   SETUP_TAXONOMY_REASON_CODES,
   SETUP_TAXONOMY_MIN_BARS,
@@ -635,6 +636,8 @@ export type {
   SetupTaxonomySide,
   SetupTaxonomyReasonCode,
   SetupTaxonomyMatch,
+  SetupTaxonomyDecline,
+  SetupTaxonomyOutcome,
   SetupTaxonomyDefinition,
   SetupTaxonomyInput,
   SetupTaxonomyVerdict,

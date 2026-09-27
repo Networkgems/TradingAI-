@@ -24,10 +24,11 @@
  * Volume is inherently tiny (one line per actual basis correction), so this
  * reads the whole file on demand rather than maintaining a hydrated fold.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 
 import { logger } from './observability/index.js';
+import { appendBoundedTapeLineSync } from './data-tape-bounds.js';
 
 const log = logger.child({ module: 'engine-basis-restatement-log' });
 
@@ -185,7 +186,7 @@ export function appendEngineBasisRestatement(
   try {
     const path = engineBasisRestatementLogPath(dir);
     mkdirSync(dirname(path), { recursive: true });
-    appendFileSync(path, `${JSON.stringify(rec)}\n`, 'utf8');
+    appendBoundedTapeLineSync(path, `${JSON.stringify(rec)}\n`);
   } catch (err: unknown) {
     appendErrors += 1;
     lastAppendError = err instanceof Error ? err.message : String(err);
@@ -210,6 +211,18 @@ export interface EngineBasisRestatementLogRead {
    */
   logPresent: boolean;
   dataDir: string | null;
+  /**
+   * TRA-4781 — the file existed but could not be opened, reason verbatim.
+   *
+   * `logPresent: true` + `records: []` carried TWO readings with nothing to
+   * separate them: a branch that genuinely produced nothing, and a file we
+   * failed to read. The catch below was careful in PROSE not to call an
+   * unreadable log empty, but the SHAPE it returned said exactly that to every
+   * caller. Any consumer about to conclude "the restatement never landed for
+   * this row" must check this first — `null` here is the only reading that
+   * licenses the claim.
+   */
+  readError: string | null;
 }
 
 export function readEngineBasisRestatements(dir: string | undefined): EngineBasisRestatementLogRead {
@@ -220,6 +233,7 @@ export function readEngineBasisRestatements(dir: string | undefined): EngineBasi
     lastAppendError,
     logPresent: false,
     dataDir: dir ?? null,
+    readError: null,
   };
   if (!dir) return base;
   const path = engineBasisRestatementLogPath(dir);
@@ -228,9 +242,11 @@ export function readEngineBasisRestatements(dir: string | undefined): EngineBasi
   let raw: string;
   try {
     raw = readFileSync(path, 'utf8');
-  } catch {
-    // Unreadable is NOT empty. Leave `logPresent: true` and no records so the
-    // caller cannot read this as "the restatement never ran".
+  } catch (err) {
+    // Unreadable is NOT empty. Leave `logPresent: true` and no records, and
+    // STAMP `readError` so the shape says what the comment always meant — see
+    // the field doc (TRA-4781).
+    base.readError = err instanceof Error ? err.message : String(err);
     return base;
   }
   for (const line of raw.split('\n')) {

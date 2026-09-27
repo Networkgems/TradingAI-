@@ -1,5 +1,10 @@
 import type { Candle } from '@trading-app/shared';
-import type { SetupTaxonomyDefinition, SetupTaxonomyInput, SetupTaxonomyMatch } from './setup-taxonomy.js';
+import type {
+  SetupTaxonomyDefinition,
+  SetupTaxonomyInput,
+  SetupTaxonomyMatch,
+  SetupTaxonomyOutcome,
+} from './setup-taxonomy.js';
 
 /**
  * TRA-4423 — the A-E setup definitions for the OTM mispricing taxonomy.
@@ -281,34 +286,52 @@ const VOLUME_EXPANSION = 1.3;
  * independent confirmations are required: the close must clear the range (not
  * just the intrabar high — a wick through a level is not a break), and volume
  * must expand, because a breakout nobody participated in is noise.
+ *
+ * ⛔ EVERY DECLINE PATH HERE IS ATTRIBUTED (TRA-4423). E is the first setup to
+ * return {@link SetupTaxonomyDecline} instead of a bare `null`, because on
+ * 2026-09-25 it read an honest, dense `matchedSameSide: 0 / reached: 1869` live
+ * and that zero was still unreadable — a four-leg conjunction collapsed into one
+ * symbol cannot say whether the market was quiet or a threshold is unsatisfiable.
+ *
+ * ⛔ `no_volume_data` IS SPLIT FROM `volume_not_expanded` ON PURPOSE, and it is
+ * the reason this attribution was built. E is the ONLY setup of the five that
+ * reads `volume`; `fetchDailyCandles` maps `volume: q.volume ?? 0`, so a provider
+ * that answers null volume silently coerces the whole leg to zero and E can
+ * NEVER fire — on any symbol, on any day, forever, while looking exactly like an
+ * ordinary quiet session. Those two readings must not share a histogram key.
  */
 const SETUP_E: SetupTaxonomyDefinition = {
   setupId: 'E',
   label: 'Breakout after consolidation',
   minBars: 30,
-  evaluate(input: SetupTaxonomyInput): SetupTaxonomyMatch | null {
+  evaluate(input: SetupTaxonomyInput): SetupTaxonomyOutcome {
     const bars = tail(input.series, 40);
-    if (bars.length < CONSOLIDATION_BARS + 3) return null;
+    if (bars.length < CONSOLIDATION_BARS + 3) return { setupId: 'E', declinedAt: 'too_few_real_bars' };
     const last = bars[bars.length - 1]!;
 
     // The consolidation is the window BEFORE the breakout bar.
     const hi = highestHigh(bars, CONSOLIDATION_BARS, 1);
     const lo = lowestLow(bars, CONSOLIDATION_BARS, 1);
-    if (hi === null || lo === null) return null;
+    if (hi === null || lo === null) return { setupId: 'E', declinedAt: 'no_range' };
     const mid = (hi + lo) / 2;
-    if (!(mid > 0)) return null;
-    if ((hi - lo) / mid > MAX_CONSOLIDATION_RANGE) return null; // not coiled
+    if (!(mid > 0)) return { setupId: 'E', declinedAt: 'bad_midpoint' };
+    if ((hi - lo) / mid > MAX_CONSOLIDATION_RANGE) return { setupId: 'E', declinedAt: 'not_coiled' };
 
     // Volume expansion vs. the consolidation's own average.
     const priorVol = bars.slice(bars.length - 1 - CONSOLIDATION_BARS, bars.length - 1).map((c) => c.volume);
     const avgVol = mean(priorVol);
-    const expanded = avgVol > 0 && last.volume >= avgVol * VOLUME_EXPANSION;
-    if (!expanded) return null;
+    // ⛔ Split deliberately — see the header. `no_volume_data` is a FEED fault
+    // that makes E structurally unable to fire; `volume_not_expanded` is E
+    // working and the market declining to participate.
+    if (!(avgVol > 0)) return { setupId: 'E', declinedAt: 'no_volume_data' };
+    if (last.volume < avgVol * VOLUME_EXPANSION) {
+      return { setupId: 'E', declinedAt: 'volume_not_expanded' };
+    }
 
     // CLOSE beyond the range, not merely a wick.
     if (last.close > hi) return { setupId: 'E', side: 'call', detail: 'range_break_up' };
     if (last.close < lo) return { setupId: 'E', side: 'put', detail: 'range_break_down' };
-    return null;
+    return { setupId: 'E', declinedAt: 'no_close_break' };
   },
 };
 

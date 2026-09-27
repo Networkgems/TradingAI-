@@ -1,8 +1,9 @@
-import { appendFile, readFile, mkdir } from 'fs/promises';
+import { readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { logger } from './observability/index.js';
 import { resolveDataDir } from './data-dir.js';
+import { appendBoundedTapeLine } from './data-tape-bounds.js';
 
 // TRA-1601 (TRA-1600 deliverable A/telemetry) — the maker-fill TELEMETRY ledger.
 //
@@ -131,7 +132,7 @@ async function appendLine(event: MakerFillEvent): Promise<void> {
   const path = storeFile();
   const dir = dirname(path);
   if (!existsSync(dir)) await mkdir(dir, { recursive: true });
-  await appendFile(path, `${JSON.stringify(event)}\n`, 'utf-8');
+  await appendBoundedTapeLine(path, `${JSON.stringify(event)}\n`);
 }
 
 /** Eagerly load the ledger so reads have data right after boot. */

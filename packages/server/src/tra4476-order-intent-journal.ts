@@ -40,7 +40,7 @@
  * ⚠ The file is REWRITTEN on compaction of terminal intents ONLY at boot, and
  * only into a `.archive` sibling — never deleted. See {@link compactAtBoot}.
  */
-import { appendFileSync, existsSync, readFileSync, renameSync } from 'fs';
+import { existsSync, readFileSync, renameSync } from 'fs';
 import path from 'path';
 import {
   getUnknownIntentBreaker,
@@ -52,6 +52,7 @@ import {
   type UnknownIntentSummary,
 } from '@trading-app/engine';
 import { logger } from './observability/index.js';
+import { appendBoundedTapeLineSync } from './data-tape-bounds.js';
 
 const log = logger.child({ module: 'tra4476-order-intent-journal' });
 
@@ -85,7 +86,7 @@ export class FileOrderIntentJournal implements OrderIntentJournal {
 
   private append(intent: OrderIntent): boolean {
     try {
-      appendFileSync(this.filePath, `${JSON.stringify(intent)}\n`, 'utf8');
+      appendBoundedTapeLineSync(this.filePath, `${JSON.stringify(intent)}\n`);
       this.writes += 1;
       return true;
     } catch (err) {

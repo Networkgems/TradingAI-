@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { Candle } from '@trading-app/shared';
 import { SETUP_DEFINITIONS, setupDefinitionsById } from './setup-definitions.js';
-import { evaluateSetupTaxonomy } from './setup-taxonomy.js';
+import { evaluateSetupTaxonomy, isSetupTaxonomyMatch } from './setup-taxonomy.js';
 
 /**
  * TRA-4423 — A-E.
@@ -53,10 +53,17 @@ describe('SETUP_DEFINITIONS registry', () => {
   it('never fires on a flat, featureless series', () => {
     // The global negative control. If this goes red, every CONFIRM arm below is
     // suspect — a setup that fires on nothing will also fire on the fixtures.
+    //
+    // ⛔ ASSERTED AS "NOT A MATCH", NOT AS `null` (TRA-4423). A setup may decline
+    // by returning an attributed `SetupTaxonomyDecline` rather than a bare
+    // `null` — E does — and a decline is emphatically NOT a fire. Keying this
+    // control on `toBeNull` would fail an attributed decline, which pressures the
+    // next author to DROP attribution to keep the control green.
     const series = flatBase(40);
     for (const d of SETUP_DEFINITIONS) {
-      expect(d.evaluate({ symbol: 'TEST', series, nomineeSide: 'call' })).toBeNull();
-      expect(d.evaluate({ symbol: 'TEST', series, nomineeSide: 'put' })).toBeNull();
+      for (const nomineeSide of ['call', 'put'] as const) {
+        expect(isSetupTaxonomyMatch(d.evaluate({ symbol: 'TEST', series, nomineeSide }))).toBe(false);
+      }
     }
   });
 
@@ -214,6 +221,61 @@ describe('Setup E — Breakout after consolidation', () => {
     );
     const series = [...flatBase(20, 100), ...wide, bar({ open: 108, close: 112, high: 112.5, low: 107.8, volume: 2_000_000 })];
     expect(run('E', series, 'call').confirmed).toBe(false);
+  });
+
+  // ─── leg attribution (TRA-4423) ───────────────────────────────────────────
+  //
+  // ⛔ WHY THESE EXIST. On 2026-09-25 E read an honest, dense `reached: 1869`
+  // with `matchedSameSide: 0` on the live book, and that zero was STILL
+  // unreadable: every one of E's four legs returned the same bare `null`, so
+  // "no coiled breakout occurred today" and "a threshold is unsatisfiable" were
+  // the same observation. Each arm below pins ONE leg to ONE key.
+
+  /** E's own outcome, uncensored by the walk. */
+  const legOf = (series: Candle[]): string | null => {
+    const out = setupDefinitionsById(['E'])[0]!.evaluate({ symbol: 'TEST', series, nomineeSide: 'call' });
+    if (out === null || isSetupTaxonomyMatch(out)) return null;
+    return out.declinedAt;
+  };
+
+  it('the CONFIRM arm returns a match, so no leg is attributed', () => {
+    const series = [...flatBase(20, 100), ...coil(), bar({ open: 100.5, close: 103, high: 103.2, low: 100.3, volume: 2_000_000 })];
+    const out = setupDefinitionsById(['E'])[0]!.evaluate({ symbol: 'TEST', series, nomineeSide: 'call' });
+    expect(isSetupTaxonomyMatch(out)).toBe(true);
+  });
+
+  it('each REFUSE arm names a DIFFERENT leg — the legs are not one bucket', () => {
+    const wick = [...flatBase(20, 100), ...coil(), bar({ open: 100.5, close: 100.4, high: 103.2, low: 100.3, volume: 2_000_000 })];
+    const thin = [...flatBase(20, 100), ...coil(), bar({ open: 100.5, close: 103, high: 103.2, low: 100.3, volume: 900_000 })];
+    const wide = Array.from({ length: 12 }, (_, i) =>
+      bar({ open: 95 + i, close: 96 + i, high: 97 + i, low: 94 + i, volume: 1_000_000 }),
+    );
+    const uncoiled = [...flatBase(20, 100), ...wide, bar({ open: 108, close: 112, high: 112.5, low: 107.8, volume: 2_000_000 })];
+
+    expect(legOf(wick)).toBe('no_close_break');
+    expect(legOf(thin)).toBe('volume_not_expanded');
+    expect(legOf(uncoiled)).toBe('not_coiled');
+    // ⛔ CAPABILITY ASSERT — three distinct keys. If a refactor ever collapses
+    // the legs back to one symbol this goes red, which `toBe` on each alone
+    // would not guarantee.
+    expect(new Set([legOf(wick), legOf(thin), legOf(uncoiled)]).size).toBe(3);
+  });
+
+  it('⛔ THE SPLIT THAT MATTERS: a feed carrying NO volume is `no_volume_data`, never `volume_not_expanded`', () => {
+    // E is the ONLY setup of the five that reads `volume`, and
+    // `fetchDailyCandles` maps `volume: q.volume ?? 0`. So a provider answering
+    // null volume coerces the whole expansion leg to zero and E can NEVER fire —
+    // on any symbol, on any day, forever — while looking exactly like an ordinary
+    // quiet session. A FEED FAULT and A QUIET MARKET must not share a key.
+    const zeroVolCoil = Array.from({ length: 12 }, () =>
+      bar({ open: 100, close: 100.2, high: 100.8, low: 99.4, volume: 0 }),
+    );
+    const series = [...flatBase(20, 100), ...zeroVolCoil, bar({ open: 100.5, close: 103, high: 103.2, low: 100.3, volume: 2_000_000 })];
+    expect(legOf(series)).toBe('no_volume_data');
+    // The paired control: the SAME coil with real volume declines for a
+    // genuinely different reason, on the market's merits.
+    const withVol = [...flatBase(20, 100), ...coil(), bar({ open: 100.5, close: 103, high: 103.2, low: 100.3, volume: 900_000 })];
+    expect(legOf(withVol)).toBe('volume_not_expanded');
   });
 });
 

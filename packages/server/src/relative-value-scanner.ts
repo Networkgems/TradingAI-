@@ -112,6 +112,16 @@ const MAX_REFUSAL_COOLDOWN_KEYS_REPORTED = 300;
 // name that is permanently dark. Cap is a disclosure, never a silent clamp:
 // `evicted > 0` ⇔ `distinctKeys` is a LOWER BOUND.
 const MAX_REFUSED_KEY_CENSUS_ENTRIES = 4096;
+// TRA-4865 (third pass) — how many characters of the vendor's refusal body are
+// kept in `byReason`. Tradier's 400 fault bodies are one short sentence; this is
+// long enough to carry the distinguishing clause and short enough that a
+// pathological body cannot turn the health route into a payload dump.
+const MAX_REFUSAL_REASON_LEN = 160;
+// TRA-4865 (third pass) — how many DISTINCT reasons `byReason` will carry. The
+// reason string is vendor-controlled, so an unbounded map is an unbounded
+// allocation driven by the upstream. On overflow, further novel reasons fold
+// into `"(other)"` — which is a disclosure, not a silent clamp.
+const MAX_REFUSAL_REASONS_TRACKED = 64;
 
 function is429Error(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
@@ -325,8 +335,27 @@ export interface RelativeValueScannerDiagnostics {
       refusals: number;
       refusalsByKey: Record<string, number>;
       keysTruncated: boolean;
+      /**
+       * TRA-4865 (third pass) — how many keys of each endpoint `refusalsByKey`
+       * actually CARRIES, beside `byEndpoint`'s full-population count. The two
+       * disagreeing is the whole point: they are the discriminator for the
+       * truncation bug below, and a reader that assumes `refusalsByKey` is
+       * representative of `byEndpoint` is the reader this field exists to stop.
+       */
+      reportedByEndpoint: { expirations: number; chain: number };
       evicted: number;
     };
+    /**
+     * TRA-4865 — WHY upstream refused, not just how often. `refuse()` only ever
+     * saw an HTTP status: the vendor's fault body was dropped at the transport
+     * boundary (`getJsonChecked`), so "3340 × HTTP 400" could not be separated
+     * into throttle vs entitlement vs bad-parameter without an operator token
+     * and a symbol-by-symbol probe. Keyed `"<status> <vendor reason>"`, bounded
+     * and truncated per {@link MAX_REFUSAL_REASON_LEN}. `"<status> (no body)"`
+     * when the vendor sent nothing, `"<status> (unreadable)"` when the body
+     * could not be read — never silently folded into a success-shaped bucket.
+     */
+    byReason?: Record<string, number>;
   };
 }
 
@@ -637,6 +666,36 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
   // it), which is what separates a one-off refusal from a permanently dark name.
   private readonly refusedKeysSinceBoot = new Map<string, number>();
   private refusedKeyCensusEvicted = 0;
+  // TRA-4865 — WHY upstream refused. See `RelativeValueScannerDiagnostics`.
+  private readonly refusalsByReason: Record<string, number> = {};
+
+  /**
+   * TRA-4865 — fold one upstream refusal into the reason histogram. The bucket
+   * is always prefixed with the status, so a vendor that changes its wording
+   * splits a bucket rather than silently merging into an unrelated one.
+   *
+   * `undefined` (the caller had no body to offer) and `null` (there was no
+   * body, or it was unreadable) are kept DISTINCT from any real reason: folding
+   * either into a populated bucket would manufacture evidence about a refusal
+   * whose cause we never saw, which is the defect this whole field answers.
+   */
+  private noteRefusalReason(httpStatus: number, reason?: string | null): void {
+    const trimmed = typeof reason === 'string' ? reason.trim() : '';
+    const suffix =
+      trimmed.length > 0
+        ? trimmed.slice(0, MAX_REFUSAL_REASON_LEN)
+        : reason === undefined
+          ? '(not captured)'
+          : '(no body)';
+    let bucket = `${httpStatus} ${suffix}`;
+    if (
+      this.refusalsByReason[bucket] === undefined &&
+      Object.keys(this.refusalsByReason).length >= MAX_REFUSAL_REASONS_TRACKED
+    ) {
+      bucket = `${httpStatus} (other)`;
+    }
+    this.refusalsByReason[bucket] = (this.refusalsByReason[bucket] ?? 0) + 1;
+  }
 
   constructor(config: RelativeValueScannerConfig) {
     this.fetchSpot = config.fetchSpot;
@@ -682,6 +741,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
         suppressed: this.suppressedRefusals,
         ...this.refusalCooldownCensus(),
         sinceBoot: this.refusedKeySinceBootCensus(),
+        byReason: { ...this.refusalsByReason },
       },
     };
   }
@@ -749,26 +809,69 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     refusals: number;
     refusalsByKey: Record<string, number>;
     keysTruncated: boolean;
+    reportedByEndpoint: { expirations: number; chain: number };
     evicted: number;
   } {
     const byEndpoint = { expirations: 0, chain: 0 };
     let refusals = 0;
+    const chainKeys: string[] = [];
+    const expirationKeys: string[] = [];
     for (const [key, count] of this.refusedKeysSinceBoot) {
-      if (key.startsWith('chain|')) byEndpoint.chain += 1;
-      else byEndpoint.expirations += 1;
+      if (key.startsWith('chain|')) {
+        byEndpoint.chain += 1;
+        chainKeys.push(key);
+      } else {
+        byEndpoint.expirations += 1;
+        expirationKeys.push(key);
+      }
       refusals += count;
     }
-    const sorted = [...this.refusedKeysSinceBoot.keys()].sort();
+
+    // TRA-4865 (third pass) — the truncation used to be the head of ONE lexical
+    // sort over both endpoints. `chain|` sorts before `expirations|`, so once
+    // the population passed the cap the published rows were 100% chain and 0%
+    // expirations — on live `66a8a1ab` 2026-09-25, 300 chain rows and zero
+    // expirations rows while `byEndpoint` read {expirations: 445, chain: 307}.
+    // The issue's PRIMARY fork is "which endpoint dominates", so the reported
+    // sample was partitioned on exactly the axis it was being read to decide,
+    // and it answered "chain, unanimously" on a population that is 59%
+    // expirations. A lexical head reads like a sample and is a partition.
+    //
+    // So: rank each endpoint independently by refusal COUNT descending — which
+    // is the stated purpose of the counter ("what separates a one-off refusal
+    // from a permanently dark name") — and give each endpoint at least half the
+    // budget before either is allowed to spend the other's share.
+    const byCountDesc = (a: string, b: string): number => {
+      const ca = this.refusedKeysSinceBoot.get(a)!;
+      const cb = this.refusedKeysSinceBoot.get(b)!;
+      if (ca !== cb) return cb - ca;
+      return a < b ? -1 : a > b ? 1 : 0;
+    };
+    chainKeys.sort(byCountDesc);
+    expirationKeys.sort(byCountDesc);
+
+    const half = Math.floor(MAX_REFUSAL_COOLDOWN_KEYS_REPORTED / 2);
+    // Each endpoint is guaranteed `half`; whatever the smaller one leaves
+    // unspent goes to the larger, so a cap of 300 still reports 300 keys when
+    // one endpoint has fewer than 150.
+    const chainQuota = Math.min(chainKeys.length, Math.max(half, MAX_REFUSAL_COOLDOWN_KEYS_REPORTED - expirationKeys.length));
+    const expirationQuota = Math.min(
+      expirationKeys.length,
+      MAX_REFUSAL_COOLDOWN_KEYS_REPORTED - chainQuota,
+    );
+
+    const picked = [...chainKeys.slice(0, chainQuota), ...expirationKeys.slice(0, expirationQuota)];
+    picked.sort();
     const refusalsByKey: Record<string, number> = {};
-    for (const key of sorted.slice(0, MAX_REFUSAL_COOLDOWN_KEYS_REPORTED)) {
-      refusalsByKey[key] = this.refusedKeysSinceBoot.get(key)!;
-    }
+    for (const key of picked) refusalsByKey[key] = this.refusedKeysSinceBoot.get(key)!;
+
     return {
       distinctKeys: this.refusedKeysSinceBoot.size,
       byEndpoint,
       refusals,
       refusalsByKey,
-      keysTruncated: sorted.length > MAX_REFUSAL_COOLDOWN_KEYS_REPORTED,
+      keysTruncated: this.refusedKeysSinceBoot.size > picked.length,
+      reportedByEndpoint: { expirations: expirationQuota, chain: chainQuota },
       evicted: this.refusedKeyCensusEvicted,
     };
   }
@@ -1286,11 +1389,17 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
   }
 
   /** TRA-4664 — record a Tradier HTTP refusal and raise it on the throw path. */
-  private refuse(endpoint: 'expirations' | 'chain', httpStatus: number, detail: string): never {
+  private refuse(
+    endpoint: 'expirations' | 'chain',
+    httpStatus: number,
+    detail: string,
+    reason?: string | null,
+  ): never {
     const key = String(httpStatus);
     this.refusalsByStatus[key] = (this.refusalsByStatus[key] ?? 0) + 1;
     this.lastRefusalAtMs = this.now();
     this.lastRefusalStatus = httpStatus;
+    this.noteRefusalReason(httpStatus, reason);
     const err = new TradierHttpRefusalError(endpoint, httpStatus, detail);
     // TRA-4664 (second pass) — a non-429 4xx refuses this KEY, and Tradier will
     // refuse it identically next cycle: stop asking for a cooldown period.
@@ -1370,7 +1479,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       const client = this.client!;
       if (typeof client.fetchExpirations === 'function') {
         const r = await client.fetchExpirations(symbol);
-        if (!r.ok) this.refuse('expirations', r.httpStatus, symbol);
+        if (!r.ok) this.refuse('expirations', r.httpStatus, symbol, r.reason);
         expirations = r.value;
       } else {
         expirations = await client.getExpirations(symbol);
@@ -1437,7 +1546,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     let rows: OptionChainRow[];
     if (typeof client.fetchChainSnapshot === 'function') {
       const r = await client.fetchChainSnapshot(symbol, expiration);
-      if (!r.ok) this.refuse('chain', r.httpStatus, `${symbol},${expiration}`);
+      if (!r.ok) this.refuse('chain', r.httpStatus, `${symbol},${expiration}`, r.reason);
       rows = r.value;
     } else {
       rows = await client.getChainSnapshot(symbol, expiration);

@@ -1,4 +1,4 @@
-import { appendFile, readFile, mkdir } from 'fs/promises';
+import { readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import {
@@ -16,6 +16,7 @@ import {
 import { sizeFromStopViaRiskManager } from './account-sizing.js';
 import { logger } from './observability/index.js';
 import { resolveDataDir } from './data-dir.js';
+import { appendBoundedTapeLine } from './data-tape-bounds.js';
 
 // TRA-2051 — server seam for the live-canary staging harness. The pure guard
 // logic + state machine live in the engine (packages/engine/src/live-canary.ts);
@@ -130,7 +131,7 @@ async function appendLine(line: LedgerLine): Promise<void> {
   const path = storeFile();
   const dir = dirname(path);
   if (!existsSync(dir)) await mkdir(dir, { recursive: true });
-  await appendFile(path, `${JSON.stringify(line)}\n`, 'utf-8');
+  await appendBoundedTapeLine(path, `${JSON.stringify(line)}\n`);
 }
 
 /** Eagerly load the ledger so a health read has state right after boot. */

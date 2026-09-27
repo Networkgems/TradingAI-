@@ -1,4 +1,4 @@
-import { appendFile, readFile, mkdir } from 'fs/promises';
+import { readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import {
@@ -12,6 +12,7 @@ import { logger } from './observability/index.js';
 import { etDateKey } from './options-chain-recorder.js';
 import type { PcrTrioVerdict } from './pcr-shadow-ledger.js';
 import { resolveDataDir } from './data-dir.js';
+import { appendBoundedTapeLine } from './data-tape-bounds.js';
 
 // TRA-1610 (parent TRA-1607) — durable, flag-gated SHADOW Open-Interest-trend
 // ledger.
@@ -170,7 +171,7 @@ async function appendRecord(rec: OiShadowRecord): Promise<void> {
   const path = storeFile();
   const dir = dirname(path);
   if (!existsSync(dir)) await mkdir(dir, { recursive: true });
-  await appendFile(path, `${JSON.stringify(rec)}\n`, 'utf-8');
+  await appendBoundedTapeLine(path, `${JSON.stringify(rec)}\n`);
 }
 
 /**

@@ -27,6 +27,11 @@ import {
   tradierBreakerGate,
   barPullThrottleGate,
   secondaryFanoutCeiling,
+  // TRA-4919
+  createTradierMeterState,
+  foldTradierRateLimitReading,
+  meteredAccountStats,
+  METERED_AGREEMENT_MIN_MINUTES,
 } from './yahoo-feed.js';
 import { parseTradierRateLimitHeaders } from '@trading-app/engine'; // TRA-4441
 
@@ -689,6 +694,273 @@ describe('getTradierQuotaBudgetState upstream block (TRA-4441 AC1)', () => {
     // bucket agreeing with itself is not evidence that the meters are shared, and
     // that claim is exactly what decides whether TRA-4441's premise holds.
     if (u.distinctAllowedValues.length < 2) expect(u.sharedAllowedReqPerMin).toBe(u.distinctAllowedValues[0] ?? null);
+  });
+});
+
+// ─── TRA-4919 ────────────────────────────────────────────────────────────────
+//
+// A Tradier 400 tripped the breaker at 50% of entitlement on bqb1 2026-09-25, and
+// the refusal blinded the meter that would have said why. Three defects, one
+// shape: the instrument goes dark at the instant it is load-bearing.
+describe('TRA-4919 — a refusal must ADD information, never destroy it', () => {
+  const W = 60_000;
+  const headers = (map: Record<string, string>) => ({
+    get: (name: string) => map[name.toLowerCase()] ?? null,
+  });
+  // Build a reading the way the engine client does, so the test is driven through
+  // the SHIPPED parser rather than through a hand-written literal that could agree
+  // with a stale idea of the shape.
+  const reading = (
+    map: Record<string, string>,
+    cls: 'quotes' | 'timesales' | 'history',
+    status: number,
+    atMs: number,
+    refusalReason: string | null = null,
+  ) => parseTradierRateLimitHeaders(headers(map), cls, status, atMs, refusalReason);
+
+  const GOOD = { 'x-ratelimit-allowed': '120', 'x-ratelimit-used': '45', 'x-ratelimit-available': '75' };
+
+  // ── Defect 1 / AC1 — the vendor's reason survives the transport boundary.
+  it('names the vendor reason on a refusal, and shows NO refusal row on a 200', () => {
+    const s = createTradierMeterState();
+    foldTradierRateLimitReading(s, reading(GOOD, 'timesales', 200, 10 * W), W);
+    // Negative control FIRST: a healthy 200 must not manufacture a refusal row.
+    expect(s.recentRefusals).toHaveLength(0);
+    expect(s.refusalByClass.size).toBe(0);
+
+    foldTradierRateLimitReading(
+      s,
+      reading({}, 'timesales', 400, 10 * W + 30_000, '{"fault":{"faultstring":"Quota Violation"}}'),
+      W,
+    );
+    expect(s.recentRefusals).toHaveLength(1);
+    expect(s.recentRefusals[0]?.reason).toContain('Quota Violation');
+    expect(s.recentRefusals[0]?.status).toBe(400);
+    expect(s.recentRefusals[0]?.endpointClass).toBe('timesales');
+    // …and the discriminator this whole ticket turns on: `Quota Violation` vs a
+    // bad-parameter 400 have opposite remedies and used to render identically.
+    foldTradierRateLimitReading(
+      s,
+      reading({}, 'timesales', 400, 10 * W + 31_000, '{"errors":{"error":"Invalid parameter: start"}}'),
+      W,
+    );
+    const reasons = s.recentRefusals.map((r) => r.reason ?? '');
+    expect(reasons.some((r) => r.includes('Quota Violation'))).toBe(true);
+    expect(reasons.some((r) => r.includes('Invalid parameter'))).toBe(true);
+    expect(new Set(reasons).size).toBe(2); // not two byte-identical "HTTP 400"s
+  });
+
+  it('records "no reason given" as null, never as an empty string', () => {
+    // An empty string in a reason histogram buckets as a real reason and is then
+    // indistinguishable from one. The absent case must stay absent.
+    const s = createTradierMeterState();
+    foldTradierRateLimitReading(s, reading({}, 'quotes', 400, 10 * W, null), W);
+    expect(s.recentRefusals[0]?.reason).toBeNull();
+  });
+
+  it('bounds the refusal ring so an upstream cannot dictate our allocation', () => {
+    const s = createTradierMeterState();
+    for (let i = 0; i < 200; i++) {
+      foldTradierRateLimitReading(s, reading({}, 'quotes', 429, 10 * W + i, `r${i}`), W);
+    }
+    expect(s.recentRefusals.length).toBeLessThanOrEqual(64);
+    // Oldest-dropped, so the ring answers "what is happening now".
+    expect(s.recentRefusals.at(-1)?.reason).toBe('r199');
+    expect(s.refusalByClass.get('quotes')?.refusalsSinceBoot).toBe(200);
+  });
+
+  // ── Defect 2 / AC2 — the header-less refusal must not null out a live meter.
+  it('⛔ a header-less 400 does NOT erase the last header-bearing reading', () => {
+    // The incident, byte for byte: `timesales` read allowed 120 / used 45 at
+    // 18:35:13Z, then 400'd at 18:35:43Z carrying no `x-ratelimit-*` family at all.
+    // Under "the last one wins", the all-null reading WON — `observedClasses` fell
+    // 3 → 2 and stayed there for three payloads, and the blinded class became
+    // indistinguishable from one that was never called.
+    const s = createTradierMeterState();
+    foldTradierRateLimitReading(s, reading(GOOD, 'timesales', 200, 10 * W), W);
+    const before = s.byClass.get('timesales');
+    expect(before?.allowed).toBe(120);
+    expect(before?.used).toBe(45);
+
+    foldTradierRateLimitReading(s, reading({}, 'timesales', 400, 10 * W + 30_000, 'Quota Violation'), W);
+
+    const after = s.byClass.get('timesales');
+    expect(after?.allowed).toBe(120);            // survived
+    expect(after?.used).toBe(45);                // survived
+    expect(after?.observedAtMs).toBe(10 * W);    // still the GOOD reading, not the 400
+    expect(s.byClass.size).toBe(1);              // observedClasses does not fall
+    // The refusal is recorded — separately, and additively.
+    expect(s.refusalByClass.get('timesales')?.lastRefusalStatus).toBe(400);
+    expect(s.refusalByClass.get('timesales')?.lastRefusalReason).toBe('Quota Violation');
+    expect(s.refusalByClass.get('timesales')?.refusalsThisMinute).toBe(1);
+    // …and BLINDED is now separable from NEVER-CALLED: the blinded class is
+    // counted here, a never-called class is absent from both maps.
+    expect(s.headerlessByClass.get('timesales')).toBe(1);
+    expect(s.headerlessByClass.get('history')).toBeUndefined();
+    expect(s.byClass.get('history')).toBeUndefined();
+  });
+
+  it('still adopts a refusal that DOES carry headers — that one is the informative one', () => {
+    // ⛔ The fix must not become "ignore refusals". TRA-4441's rule stands: a 400
+    // carrying `available: 0` is the single most informative response we ever get.
+    const s = createTradierMeterState();
+    foldTradierRateLimitReading(s, reading(GOOD, 'quotes', 200, 10 * W), W);
+    foldTradierRateLimitReading(
+      s,
+      reading({ 'x-ratelimit-allowed': '120', 'x-ratelimit-used': '120', 'x-ratelimit-available': '0' },
+        'quotes', 400, 10 * W + 5_000),
+      W,
+    );
+    expect(s.byClass.get('quotes')?.available).toBe(0);   // the refusal's reading won
+    expect(s.byClass.get('quotes')?.status).toBe(400);
+    expect(s.headerlessByClass.get('quotes')).toBeUndefined();
+  });
+
+  it('counts a header we received but could not parse as a HEADER, not as silence', () => {
+    // `allowed: "unlimited"` parses to null but is not silence — upstream IS
+    // talking to us about the meter. Collapsing the two rebuilds the ambiguity.
+    const r = reading({ 'x-ratelimit-allowed': 'unlimited' }, 'history', 200, 1);
+    expect(r.allowed).toBeNull();
+    expect(r.sawRateLimitHeaders).toBe(true);
+    expect(reading({}, 'history', 200, 1).sawRateLimitHeaders).toBe(false);
+  });
+
+  it('keeps sawAnyResponse true off a header-less response, now that byClass cannot', () => {
+    // `sawAnyResponse` used to be `byClass.size > 0`. Once header-less readings
+    // stop landing in `byClass`, that derivation would report a COLD meter on a box
+    // that has been refused a hundred times — the TRA-4441 split, inverted.
+    const s = createTradierMeterState();
+    expect(s.responsesObserved).toBe(0);
+    foldTradierRateLimitReading(s, reading({}, 'quotes', 400, 10 * W, 'nope'), W);
+    expect(s.byClass.size).toBe(0);
+    expect(s.responsesObserved).toBe(1);
+  });
+
+  // ── Defect 3 / AC3 — the metered numerator and its density.
+  it('publishes upstream `used` as a per-minute high-water, and calls it a lower bound', () => {
+    const s = createTradierMeterState();
+    // Two readings inside minute 10: 32 then 5 (a window reset). The high-water is
+    // the best LOWER BOUND on that minute's spend; a last-value would report 5.
+    foldTradierRateLimitReading(s, reading({ 'x-ratelimit-used': '32' }, 'quotes', 200, 10 * W + 1_000), W);
+    foldTradierRateLimitReading(s, reading({ 'x-ratelimit-used': '5' }, 'quotes', 200, 10 * W + 40_000), W);
+    const m = meteredAccountStats({
+      highWater: s.meteredMinuteHighWater, readings: s.meteredMinuteReadings,
+      localCounts: new Map(), lastReadingAtMs: s.meteredLastReadingAtMs,
+      now: 11 * W + 5_000, windowMs: W,
+    });
+    expect(m.peakUsedReqPerMin).toBe(32);
+    expect(m.minutesObserved).toBe(1);
+    expect(m.lastReadingAgeMs).toBe(W + 5_000 - 40_000);
+  });
+
+  it('separates "metered spend looks fine" from "we stopped looking"', () => {
+    // The density fields ARE the discriminator. A quiet payload with
+    // `meteredReadingsThisMinute: 0` on a box still calling Tradier means we have
+    // gone blind, and without this field it renders exactly like a quiet market.
+    const s = createTradierMeterState();
+    foldTradierRateLimitReading(s, reading({ 'x-ratelimit-used': '60' }, 'quotes', 200, 10 * W + 1_000), W);
+    foldTradierRateLimitReading(s, reading({ 'x-ratelimit-used': '62' }, 'quotes', 200, 10 * W + 2_000), W);
+    const live = meteredAccountStats({
+      highWater: s.meteredMinuteHighWater, readings: s.meteredMinuteReadings,
+      localCounts: new Map(), lastReadingAtMs: s.meteredLastReadingAtMs, now: 10 * W + 3_000, windowMs: W,
+    });
+    expect(live.readingsThisMinute).toBe(2);
+    const blind = meteredAccountStats({
+      highWater: s.meteredMinuteHighWater, readings: s.meteredMinuteReadings,
+      localCounts: new Map(), lastReadingAtMs: s.meteredLastReadingAtMs, now: 20 * W, windowMs: W,
+    });
+    expect(blind.readingsThisMinute).toBe(0);
+    expect(blind.lastReadingAgeMs).toBeGreaterThan(9 * W);
+    // A cold meter reports null, never 0 — 0 req/min is a claim, absence is not.
+    const cold = meteredAccountStats({
+      highWater: new Map(), readings: new Map(), localCounts: new Map(),
+      lastReadingAtMs: null, now: 10 * W, windowMs: W,
+    });
+    expect(cold.peakUsedReqPerMin).toBeNull();
+    expect(cold.lastReadingAgeMs).toBeNull();
+    expect(cold.agrees).toBeNull();
+  });
+
+  it('renders the measured 2026-09-25 divergence as DISAGREEMENT, not as agreement', () => {
+    // bqb1, minute ending 18:35:00Z: local counter 297, upstream meter 32 — ~9x
+    // high. TRA-4830 criterion 2 (`mean < 120`) was graded on the local number.
+    const highWater = new Map([[10, 32], [11, 43]]);
+    const readings = new Map([[10, 6], [11, 6]]);
+    const local = new Map([[10, 297], [11, 0]]);
+    const m = meteredAccountStats({
+      highWater, readings, localCounts: local, lastReadingAtMs: 11 * W + 40_000,
+      now: 12 * W, windowMs: W,
+    });
+    expect(m.pairedMinutes).toBe(2);
+    expect(m.localVsMeteredRatio).toBeCloseTo(297 / 75, 2);
+    expect(m.agrees).toBe(false);   // ⛔ `false`, explicitly — not `null`
+  });
+
+  it('withholds the agreement verdict below the density floor instead of asserting it', () => {
+    const m = meteredAccountStats({
+      highWater: new Map([[10, 32]]), readings: new Map([[10, 3]]),
+      localCounts: new Map([[10, 30]]), lastReadingAtMs: 10 * W, now: 11 * W, windowMs: W,
+    });
+    expect(m.pairedMinutes).toBe(1);
+    expect(METERED_AGREEMENT_MIN_MINUTES).toBeGreaterThan(1);
+    expect(m.agrees).toBeNull();    // a ratio of 0.94 that we refuse to bless
+  });
+
+  // ── AC4 — the capability assert. A green that cannot go red is not evidence.
+  it('⭐ the METERED numerator can read BOTH over and under budget', () => {
+    // The whole point of re-pointing the verdict is that it now moves with real
+    // spend. Prove the path is capable of both answers against the SAME budget, or
+    // "under budget" is a property of the instrument, not of the box.
+    const budget = 120;
+    const mk = (usedPerMinute: number) => {
+      const s = createTradierMeterState();
+      for (let b = 10; b < 16; b++) {
+        foldTradierRateLimitReading(
+          s, reading({ 'x-ratelimit-used': String(usedPerMinute) }, 'quotes', 200, b * W + 1_000), W,
+        );
+      }
+      const m = meteredAccountStats({
+        highWater: s.meteredMinuteHighWater, readings: s.meteredMinuteReadings,
+        localCounts: new Map(), lastReadingAtMs: s.meteredLastReadingAtMs, now: 16 * W, windowMs: W,
+      });
+      return quotaCrossingVerdict({
+        barCeiling: budget - 20,
+        accountObservedPeak: m.peakUsedReqPerMin ?? 0,
+        accountObservedMean: m.meanUsedReqPerMin ?? 0,
+        accountBudget: budget,
+        minutesObserved: m.minutesObserved,
+      });
+    };
+    const under = mk(62);   // the TRA-4830 measured RTH peak at N=100
+    const over = mk(150);
+    expect(under.crossed).toBe(false);
+    expect(under.budgetExhausted).toBe(false);
+    expect(over.crossed).toBe(true);
+    expect(over.budgetExhausted).toBe(true);   // ≥5 completed minutes, so not withheld
+    expect(over.headroomReqPerMin).toBeLessThan(0);
+    expect(under.headroomReqPerMin).toBeGreaterThan(0);
+  });
+
+  it('publishes the metered block and names the numerator the verdict actually used', () => {
+    const s = getTradierQuotaBudgetState();
+    expect(s.meteredIsLowerBound).toBe(true);
+    expect(s.localCounterPopulation).toBe('yahoo_feed_bump_sites_only');
+    expect(['metered_upstream', 'local_proxy']).toContain(s.capacityNumeratorSource);
+    // The source field must MATCH what was available, or it is decoration.
+    expect(s.capacityNumeratorSource).toBe(
+      s.meteredPeakUsedReqPerMin === null ? 'local_proxy' : 'metered_upstream',
+    );
+    expect(typeof s.meteredMinutesObserved).toBe('number');
+    expect(typeof s.meteredReadingsThisMinute).toBe('number');
+    // ⛔ never `true` on a cold meter.
+    if (s.meteredPairedMinutes < METERED_AGREEMENT_MIN_MINUTES) {
+      expect(s.localCounterAgreesWithUpstream).toBeNull();
+    }
+    const u = s.upstream;
+    expect(Array.isArray(u.recentRefusals)).toBe(true);
+    expect(u.recentRefusalsCap).toBeGreaterThan(0);
+    expect(u.responsesObserved).toBeGreaterThanOrEqual(0);
+    expect(u.sawAnyResponse).toBe(u.responsesObserved > 0);
   });
 });
 

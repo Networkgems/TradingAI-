@@ -5,6 +5,16 @@ import { summarizeMarkSanity, clearMarkSanityTape } from './option-mark-sanity.j
 // TRA-3879 — the cross-engine fleet-capital read. Wired per-test so the ORDER
 // SITE can be shown to consult it; a resolver-only suite cannot see that seam.
 import { setLiveOtmFleetCapitalProvider } from './live-otm-fleet-capital.js';
+// TRA-4158 — the per-engine daily-close/daily-bar Maps were hoisted into ONE
+// process-global store. That store OUTLIVES a `beforeEach`, so it is reset
+// globally below: without the reset, one suite's seeded closes silently satisfy
+// another suite's COLD-cache assertion (TRA-1226's backfill test asserts the
+// engine fetches when the cache is empty) and that test goes green for the wrong
+// reason.
+import {
+  setDailyCloses as setSharedDailyCloses,
+  __resetMarketDataDailyCacheForTest,
+} from './market-data-daily-cache.js';
 import type { PaperOptionsAccount } from './options-account.js'; // TRA-3445
 import { etDateString } from './scheduler.js';
 // TRA-1226 — evaluateIvRvScan now backfills the underlying's daily closes from
@@ -365,6 +375,11 @@ afterEach(() => {
   vi.useRealTimers();
   delete process.env.OTM_CONTRACT_FLOOR_DELTA_MIN;
   delete process.env.OTM_CONTRACT_FLOOR_DELTA_MAX;
+});
+
+beforeEach(() => {
+  // TRA-4158 — see the import note: the shared daily store is process-global.
+  __resetMarketDataDailyCacheForTest();
 });
 
 describe('SignalEngine — relative-value scanner bridge', () => {
@@ -7807,8 +7822,14 @@ describe('SignalEngine — IV-RV mispriced routing (TRA-1203)', () => {
   function runScan(engine: SignalEngine, syms: string[]): Promise<void> {
     return (engine as unknown as { evaluateIvRvScan: (s: string[]) => Promise<void> }).evaluateIvRvScan(syms);
   }
+  // TRA-4158 — the daily-close cache is no longer a private Map on the engine; it
+  // is a process-global store. Seeding the old field would set a property nothing
+  // reads and these suites would go green against an EMPTY cache, which is the
+  // silent direction. `engine` is kept in the signature so the call sites read
+  // unchanged.
   function seedCloses(engine: SignalEngine, sym: string, closes: number[]): void {
-    (engine as unknown as { dailyCloseCache: Map<string, number[]> }).dailyCloseCache.set(sym, closes);
+    void engine;
+    setSharedDailyCloses(sym, closes);
   }
 
   beforeEach(() => {
@@ -9713,8 +9734,14 @@ describe('SignalEngine — wheel paper routing (TRA-1977)', () => {
   function runShortPremium(engine: SignalEngine, syms: string[]): Promise<void> {
     return (engine as unknown as { evaluateShortPremiumScan: (s: string[]) => Promise<void> }).evaluateShortPremiumScan(syms);
   }
+  // TRA-4158 — the daily-close cache is no longer a private Map on the engine; it
+  // is a process-global store. Seeding the old field would set a property nothing
+  // reads and these suites would go green against an EMPTY cache, which is the
+  // silent direction. `engine` is kept in the signature so the call sites read
+  // unchanged.
   function seedCloses(engine: SignalEngine, sym: string, closes: number[]): void {
-    (engine as unknown as { dailyCloseCache: Map<string, number[]> }).dailyCloseCache.set(sym, closes);
+    void engine;
+    setSharedDailyCloses(sym, closes);
   }
   function demoCoveredWrites(engine: SignalEngine, sym: string) {
     const acct = (engine as unknown as { optionsAccount: { getStateForMode: (m: 'demo' | 'live') => { openOptions: Array<{ symbol: string; coveredWrite?: string; optionType?: string; strike?: number }> } } }).optionsAccount;

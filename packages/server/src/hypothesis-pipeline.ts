@@ -26,7 +26,7 @@
 // in tests and wired to the real `@trading-app/backtest` runner in production.
 
 import { existsSync } from 'fs';
-import { readFile, appendFile, mkdir } from 'fs/promises';
+import { readFile, mkdir } from 'fs/promises';
 import { dirname, join } from 'path';
 import {
   DEFAULT_PROMOTION_THRESHOLDS,
@@ -35,6 +35,7 @@ import {
 } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { resolveDataDir } from './data-dir.js';
+import { appendBoundedTapeLine } from './data-tape-bounds.js';
 
 const log = logger.child({ module: 'hypothesis-pipeline' });
 // ── 1. Hypothesis schema ─────────────────────────────────────────────────────
@@ -444,7 +445,7 @@ async function appendLine(line: QueueLine): Promise<void> {
   const path = storeFile();
   const dir = dirname(path);
   if (!existsSync(dir)) await mkdir(dir, { recursive: true });
-  await appendFile(path, `${JSON.stringify(line)}\n`, 'utf-8');
+  await appendBoundedTapeLine(path, `${JSON.stringify(line)}\n`);
 }
 
 // ── 6. Pipeline orchestration ────────────────────────────────────────────────

@@ -61,13 +61,26 @@ describe('measureSpreadCross', () => {
 });
 
 describe('commissionR', () => {
-  it('checks the gate 0.05R commission input against Tradier $0.35/contract/side', () => {
-    // $2.00 mark, 1 contract. Round trip = 2 × $0.35 = $0.70.
-    // R = 0.25 × $2.00 × 100 = $50. => 0.014R.
-    const c = commissionR(2.0, 1, 0.35)!;
-    expect(c).toBeCloseTo(0.014, 6);
-    // The gate's 0.05R input is conservative here — it OVERstates true commission.
-    expect(c).toBeLessThan(DEFAULT_COST_GATE_CONFIG.optionsCost.commissionR);
+  it('derives the gate commission input from the Tradier Pro fee ($0 commission)', () => {
+    // TRA-4890. The desk is on Tradier **Pro**: $0 commission on options. What
+    // remains is the regulatory/clearing residue (ORF + OCC + SEC/TAF), ≈$0.09
+    // per contract per side. $2.00 mark, 1 contract ⇒ round trip 2 × $0.09 =
+    // $0.18; R = 0.25 × $2.00 × 100 = $50 ⇒ 0.0036R. The gate's input IS this
+    // number — it is derived, so a drift in either side fails here.
+    const measured = commissionR(2.0, 1, 0.09)!;
+    expect(measured).toBeCloseTo(0.0036, 10);
+    expect(DEFAULT_COST_GATE_CONFIG.optionsCost.commissionR).toBeCloseTo(measured, 10);
+  });
+
+  it('still prices the pre-Pro commissioned schedule, which the old input overstated', () => {
+    // The 0.05R the gate shipped until TRA-4890 was a CONSERVATIVE stand-in, not
+    // a measurement: it overstated even the commissioned $0.35/side schedule by
+    // ~3.6×, and the fee actually paid today by ~14×. Kept as the negative
+    // control so "0.0036 is merely smaller" cannot pass for "0.0036 is measured".
+    const commissioned = commissionR(2.0, 1, 0.35)!;
+    expect(commissioned).toBeCloseTo(0.014, 6);
+    expect(commissioned).toBeLessThan(0.05);
+    expect(commissioned).toBeGreaterThan(DEFAULT_COST_GATE_CONFIG.optionsCost.commissionR);
   });
 
   it('is invariant to contract count (both terms scale linearly)', () => {

@@ -1,4 +1,4 @@
-import { appendFile, readFile, mkdir } from 'fs/promises';
+import { readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import {
@@ -11,6 +11,7 @@ import {
 import type { OptionLeg } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { resolveDataDir } from './data-dir.js';
+import { appendBoundedTapeLine } from './data-tape-bounds.js';
 
 // TRA-911 (TRA-908 Phase A) — flag-gated SHADOW option-trade signal ledger.
 //
@@ -255,7 +256,7 @@ async function appendRecord(rec: OptionShadowRecord): Promise<void> {
   const path = storeFile();
   const dir = dirname(path);
   if (!existsSync(dir)) await mkdir(dir, { recursive: true });
-  await appendFile(path, `${JSON.stringify(rec)}\n`, 'utf-8');
+  await appendBoundedTapeLine(path, `${JSON.stringify(rec)}\n`);
 }
 
 /**

@@ -23,12 +23,33 @@ describe('isOptionCostAwareGateEnabled', () => {
 });
 
 describe('admissionBarR — default config rides the MEASURED spread cross (TRA-1656 → TRA-1661)', () => {
-  it('options structures resolve to the ~0.485R bar', () => {
-    // costModel 0.05 + 0.235 (MEASURED) = 0.285, + 0.20 margin = 0.485, clear of
-    // the 0.30 backstop floor. Was 1.25R off the phantom 1.00R spread input.
+  it('options structures resolve to the ~0.4386R bar', () => {
+    // costModel 0.0036 (MEASURED commission, TRA-4890) + 0.235 (MEASURED spread
+    // cross) = 0.2386, + 0.20 margin = 0.4386, clear of the 0.30 backstop floor.
+    // Was 0.485 off the conservative 0.05 commission stand-in, and 1.25R before
+    // that off the phantom 1.00R spread input.
     for (const s of ['single_leg_otm', 'single_leg_rv', 'directional', 'bull_put']) {
-      expect(admissionBarR(s)).toBeCloseTo(0.485, 10);
+      expect(admissionBarR(s)).toBeCloseTo(0.4386, 10);
     }
+  });
+
+  it('the TRA-4890 commission retune does not let the backstop floor pin the bar', () => {
+    // The retune LOOSENS, so the failure mode that matters is the opposite one:
+    // a floor at or above the new model bar would make the cost inputs inert and
+    // the gate would read "retuned" while behaving identically. Checked for both
+    // configs that exist — the shipped 0.20 margin and bqb1's env-set 0.10.
+    expect(admissionBarR('single_leg_otm')).toBeGreaterThan(DEFAULT_COST_GATE_CONFIG.optionsMinGrossR);
+    const live = { ...DEFAULT_COST_GATE_CONFIG, safetyMarginR: 0.1 };
+    expect(admissionBarR('single_leg_otm', live)).toBeCloseTo(0.3386, 10);
+    expect(admissionBarR('single_leg_otm', live)).toBeGreaterThan(live.optionsMinGrossR);
+  });
+
+  it('moves the bar by exactly the 0.0464R the TRA-4894 controls are written against', () => {
+    // tra4894-real-fill-promotion-gate.test.ts hard-codes this delta as the move
+    // that flips `single_leg_otm::0.50-0.55` on the POOLED arm. If this drifts,
+    // that file's premise is stale and its controls stop grading what they claim.
+    const prior = { ...DEFAULT_COST_GATE_CONFIG, optionsCost: { ...DEFAULT_COST_GATE_CONFIG.optionsCost, commissionR: 0.05 } };
+    expect(admissionBarR('single_leg_otm', prior) - admissionBarR('single_leg_otm')).toBeCloseTo(0.0464, 10);
   });
 
   it('the spread-cross input sits BELOW both sleeve ceilings (TRA-1656 feasibility)', () => {
@@ -67,7 +88,7 @@ describe('admissionBarR — default config rides the MEASURED spread cross (TRA-
   it('the options floor lifts the bar above the pure cost model when set high', () => {
     const cfg = { ...DEFAULT_COST_GATE_CONFIG, optionsMinGrossR: 1.5 };
     expect(admissionBarR('single_leg_rv', cfg)).toBeCloseTo(1.5, 10);
-    // model bar (0.285+0.20=0.485) is below the 1.5 floor, so the floor wins.
+    // model bar (0.2386+0.20=0.4386) is below the 1.5 floor, so the floor wins.
   });
 });
 
@@ -119,7 +140,7 @@ describe('resolveCostGateConfig', () => {
       OPTION_COST_GATE_COMMISSION_R: '-1',
       OPTION_COST_GATE_MIN_GROSS_R: 'abc',
     });
-    expect(cfg.optionsCost.commissionR).toBeCloseTo(0.05, 10);
+    expect(cfg.optionsCost.commissionR).toBeCloseTo(0.0036, 10);
     expect(cfg.optionsMinGrossR).toBeCloseTo(0.3, 10);
   });
 });
@@ -133,10 +154,13 @@ describe('resolveCostGateConfig', () => {
 // estimator swap and is still the most common way a "retune" ships as a no-op.
 describe('cost gate bar description (TRA-3216)', () => {
   it('describes the bar composition, and flags the floor PINNING it (a retune no-op)', () => {
-    // Shipped config: 0.05 + 0.235 + 0.20 = 0.485R, clear of the 0.30 floor.
+    // Shipped config: 0.0036 + 0.235 + 0.20 = 0.4386R, clear of the 0.30 floor.
     const shipped = describeCostGateBar('single_leg_otm');
-    expect(shipped.barR).toBeCloseTo(0.485, 10);
+    expect(shipped.barR).toBeCloseTo(0.4386, 10);
     expect(shipped.barPinnedByFloor).toBe(false);
+    // The TRA-4890 retune shrinks the commission term by ~14×, so the spread
+    // cross dominates by MORE than before — the retune cannot silently hand
+    // dominance to the term it just cut.
     expect(shipped.dominantTerm).toBe('spread_cross');
 
     // Raise the floor above costModel+margin and the measured cost inputs go

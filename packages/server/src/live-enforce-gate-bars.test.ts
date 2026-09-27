@@ -18,7 +18,13 @@ import {
 } from './live-enforce-gate-bars.js';
 import { DEFAULT_COST_GATE_CONFIG, describeCostGateBar } from './option-cost-gate.js';
 
-/** The live bqb1 config on 2026-09-20: margin cut to 0.1, bar 0.385, floor 0.3. */
+/**
+ * The live bqb1 config: margin cut to 0.1 via `OPTION_COST_GATE_SAFETY_MARGIN_R`
+ * — the host sets that key and NO other cost knob (measured against its env list
+ * 2026-09-25), which is why the `commissionR` default is load-bearing here —
+ * floor 0.3. The bar was 0.385 until TRA-4890 retuned `commissionR` 0.05 →
+ * 0.0036 (the MEASURED Tradier Pro fee); it is now 0.0036 + 0.235 + 0.1 = 0.3386.
+ */
 const LIVE_CONFIG = { ...DEFAULT_COST_GATE_CONFIG, safetyMarginR: 0.1 };
 
 describe('resolveGatedStructureBars — the RV question (AC1/AC3)', () => {
@@ -46,9 +52,11 @@ describe('resolveGatedStructureBars — the RV question (AC1/AC3)', () => {
     expect(rv.barIdenticalToOtm).toBe(true);
     expect(rv.costInputs).toBe('options');
     // The live numbers the ticket cites, so a config move is caught here.
-    expect(rv.barR).toBeCloseTo(0.385, 10);
-    expect(rv.costModelR).toBeCloseTo(0.285, 10);
+    expect(rv.barR).toBeCloseTo(0.3386, 10);
+    expect(rv.costModelR).toBeCloseTo(0.2386, 10);
     expect(rv.spreadCrossR).toBeCloseTo(0.235, 10);
+    // The retune LOOSENS, so the floor is the thing that could silently absorb
+    // it. 0.3386 clears the 0.3 floor, so the move reaches the live gate.
     expect(rv.barPinnedByFloor).toBe(false);
     // Every composition field equals OTM's. `structure` and the provenance
     // fields are the only things that may differ.

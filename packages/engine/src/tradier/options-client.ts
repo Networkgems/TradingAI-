@@ -44,7 +44,22 @@ export interface TradierOptionQuote {
  */
 export type TradierFetchResult<T> =
   | { ok: true; httpStatus: number; value: T }
-  | { ok: false; httpStatus: number };
+  /**
+   * TRA-4865 — `reason` is the vendor's own refusal body, trimmed and bounded.
+   * It used to be dropped here, which made every 4xx byte-identical to every
+   * other 4xx: 3,340 × "HTTP 400" on live `66a8a1ab` could not be separated
+   * into throttle vs entitlement vs bad-parameter by any reader in the stack.
+   * `null` means the vendor sent no body or it could not be read — never an
+   * empty string, so "no reason given" cannot be confused with a real one.
+   */
+  | { ok: false; httpStatus: number; reason: string | null };
+
+/**
+ * TRA-4865 — cap on the vendor refusal body kept in {@link TradierFetchResult}.
+ * Tradier's fault bodies are one short sentence; this carries the
+ * distinguishing clause without letting an upstream dictate our allocation.
+ */
+const MAX_REFUSAL_BODY_LEN = 512;
 
 interface TradierExpirationsEnvelope {
   expirations?: { date?: string | string[] } | string | null;
@@ -710,7 +725,22 @@ export class TradierOptionsClient extends TradierOrderClient {
     const resp = await fetch(`${this.baseUrl}${path}`, {
       headers: { Authorization: this.headers.Authorization, Accept: 'application/json' },
     });
-    if (!resp.ok) return { ok: false, httpStatus: resp.status };
+    if (!resp.ok) {
+      // TRA-4865 — read the fault body BEFORE discarding the response. Tradier
+      // answers a refused chain/expirations GET with a short fault sentence,
+      // and that sentence is the only thing in the whole stack that separates a
+      // throttle from an entitlement gap from a bad parameter. Bounded, and a
+      // read failure degrades to `null` rather than throwing: a diagnostic must
+      // never be able to convert a refusal into an exception on the hot path.
+      let reason: string | null = null;
+      try {
+        const body = (await resp.text()).trim();
+        reason = body.length > 0 ? body.slice(0, MAX_REFUSAL_BODY_LEN) : null;
+      } catch {
+        reason = null;
+      }
+      return { ok: false, httpStatus: resp.status, reason };
+    }
     return { ok: true, httpStatus: resp.status, value: (await resp.json()) as T };
   }
 
