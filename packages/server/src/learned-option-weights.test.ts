@@ -313,3 +313,60 @@ describe('TRA-4857 — UNMEASURED rows are excluded from the learned fold', () =
     expect(s.avgR).not.toBeCloseTo(28 / 21, 6);
   });
 });
+
+// TRA-4860 — the OTHER shape: a row whose outcome is NOT `UNMEASURED` (so the
+// filter above lets it through) yet carries no numeric R. That is a writer defect
+// and it must be visible, but it reaches this fold from
+// `/api/health/option-journal`, so the fold must not THROW: the original
+// TRA-4857 implementation did, and it took the whole report down for one row —
+// the TRA-2590 cross-tab test was red on `main` from 2026-09-24 for exactly this.
+//
+// The repair has a trap of its own. Dropping the row from `avgR`'s NUMERATOR
+// while leaving `resolved` as its denominator is the fabricated 0 arriving by a
+// different route: a short sum over a full denominator pulls the mean toward
+// zero. So the row must leave BOTH, the denominator is published as `rMeasured`,
+// and the count of what was dropped is published as `rUnknown`.
+describe('TRA-4860 — a resolved row with no numeric R is published, not thrown and not diluted', () => {
+  const rLess = () =>
+    row({ outcome: 'LOSS', realizedPnlUsd: -100, realizedR: undefined, exitReason: 'sl' });
+
+  it('does not throw, and leaves avgR exactly where the R-less row was absent', () => {
+    const base = bucket(20, 16); // avg R = +1.4 over 20 priced rows
+    const before = computeOptionLearnedWeights(base).byStructure.find((x) => x.key === 'bull_put')!;
+    const after = computeOptionLearnedWeights([...bucket(20, 16), rLess()]).byStructure.find(
+      (x) => x.key === 'bull_put',
+    )!;
+
+    expect(after.avgR).toBeCloseTo(before.avgR!, 12);
+    expect(after.avgR).toBeCloseTo(1.4, 12);
+    // NEGATIVE CONTROL — dividing the same 28 by `resolved` (21) instead of by
+    // `rMeasured` (20). This is the value a numerator-only fix produces.
+    expect(after.avgR).not.toBeCloseTo(28 / 21, 6);
+
+    // The row is NOT deleted from the record: it is a real close and it still
+    // counts on the outcome axis, which is what makes `rUnknown` a defect signal
+    // rather than a silently smaller fold.
+    expect(after.resolved).toBe(before.resolved + 1);
+    expect(after.loss).toBe(before.loss + 1);
+    expect(after.rMeasured).toBe(20);
+    expect(after.rUnknown).toBe(1);
+  });
+
+  it('normal reading is zero, and rMeasured equals resolved when every row is priced', () => {
+    const s = computeOptionLearnedWeights(bucket(20, 16)).byStructure.find(
+      (x) => x.key === 'bull_put',
+    )!;
+    expect(s.rUnknown).toBe(0);
+    expect(s.rMeasured).toBe(s.resolved);
+  });
+
+  it('a bucket whose resolved rows are ALL R-less publishes avgR null, not 0 and not NaN', () => {
+    const s = computeOptionLearnedWeights([rLess(), rLess(), rLess()]).byStructure.find(
+      (x) => x.key === 'bull_put',
+    )!;
+    expect(s.resolved).toBe(3);
+    expect(s.rMeasured).toBe(0);
+    expect(s.rUnknown).toBe(3);
+    expect(s.avgR).toBeNull();
+  });
+});
