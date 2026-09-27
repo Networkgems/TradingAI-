@@ -31,13 +31,14 @@ import { foldCensus } from './heap-retainer-census.js';
 function bar(i: number, base = 100): Candle {
   const close = base + (i % 7);
   return {
-    time: new Date(Date.UTC(2026, 0, 1 + i)).toISOString(),
+    symbol: 'AAA',
+    timestamp: Date.UTC(2026, 0, 1 + i),
     open: close - 0.5,
     high: close + 1.5,
     low: close - 1.5,
     close,
     volume: 1_000 + i,
-  } as Candle;
+  };
 }
 
 const series = (n: number, base = 100): Candle[] => Array.from({ length: n }, (_, i) => bar(i, base));
