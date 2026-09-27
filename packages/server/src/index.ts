@@ -809,6 +809,7 @@ import { startEventLoopWatchdog, type WatchdogHandle } from './event-loop-watchd
 import { installStdioBlockMeter } from './stdio-block-meter.js';
 import { installGcPauseMeter } from './gc-pause-meter.js';
 import { startHeapCensusSampler, type HeapCensusSamplerHandle } from './heap-census-sampler.js';
+import { marketDataDailyCacheCensusTarget } from './market-data-daily-cache.js';
 import type { CensusSubject } from './heap-retainer-census.js';
 import {
   logger,
@@ -19843,12 +19844,20 @@ const eventLoopWatchdog: WatchdogHandle | null = startEventLoopWatchdog();
 // a hand-written suspect list would only ever find a retainer someone already
 // suspected. Shallow (`.size`/`.length`, O(1) per field) on the sampled path;
 // the O(entries) deep sum is opt-in per request on `/api/health/heap-census`.
+// TRA-4158 — `marketData` is the process-global daily store the per-engine
+// `dailyCloseCache` / `otmDailyBarCache` were hoisted into. It MUST be a census
+// subject: a successful hoist drops those two per-engine rows to zero owners,
+// which is byte-identical to the instrument going blind on them, so the
+// replacement rows have to appear in the same read for the AC2 plateau proof to
+// distinguish "moved" from "stopped looking".
 const heapCensusSampler: HeapCensusSamplerHandle | null = startHeapCensusSampler({
-  subjects: () =>
-    getAllUserContexts().flatMap((ctx): CensusSubject[] => [
+  subjects: () => [
+    ...getAllUserContexts().flatMap((ctx): CensusSubject[] => [
       { klass: 'signalEngine', target: ctx.engine },
       { klass: 'pnlTracker', target: ctx.tracker },
     ]),
+    { klass: 'marketData', target: marketDataDailyCacheCensusTarget },
+  ],
 });
 
 /**

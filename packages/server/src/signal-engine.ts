@@ -162,6 +162,15 @@ import {
 // TRA-3926 (2026-08-26) — the close record carries the row's authority.
 import { resolveCloseGrant } from './tra3926-oversold-close-detector.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
+// TRA-4158 — symbol-keyed daily market data lives in ONE process-global store,
+// not in a private Map on each of the 68 per-user engines. See that module's
+// header for the +531 MB matched-quiescent measurement that motivates it.
+import {
+  getDailyBars as getSharedDailyBars,
+  setDailyBars as setSharedDailyBars,
+  getDailyCloses as getSharedDailyCloses,
+  setDailyCloses as setSharedDailyCloses,
+} from './market-data-daily-cache.js';
 // TRA-2193 — per-scan liveness for the paths that journal `single_leg_rv`.
 import { beginRvScan, type RvScanPathId, type RvScanRecord } from './rv-scan-telemetry.js';
 import { maybeCaptureTermStructureShadow } from './term-structure-shadow.js'; // TRA-4413 item 4
@@ -3847,21 +3856,17 @@ export class SignalEngine {
   private lastShortPremiumScanAt = 0;
   /** TRA-4570 — last observe-only swing signal scanner pass (reuses {@link RV_SCAN_INTERVAL_MS}). */
   private lastSwingSignalScanAt = 0;
-  /**
-   * TRA-1156 — per-symbol trailing daily closes, stashed from the SAME
-   * `fetchDailyCandles` pull {@link refreshTechnicalSnapshot} already makes, so
-   * the IV-vs-RV scan reads realised-vol history without a second feed call.
-   */
-  private dailyCloseCache: Map<string, number[]> = new Map();
-  /**
-   * TRA-3943 — per-symbol DAILY candles for the OTM sleeve's entry ATR, stashed
-   * off the same {@link refreshTechnicalSnapshot} pull `dailyCloseCache` rides.
-   *
-   * Full OHLC and not closes: an ATR needs the high/low range, and a
-   * close-to-close proxy computed from `dailyCloseCache` would be a DIFFERENT
-   * number published under the board's name.
-   */
-  private otmDailyBarCache: Map<string, Candle[]> = new Map();
+  // TRA-1156's per-symbol trailing daily closes and TRA-3943's per-symbol daily
+  // CANDLES used to live here, as two private `Map`s on every engine. They are
+  // now ONE process-global store (`market-data-daily-cache.ts`): both hold public
+  // daily OHLCV keyed by ticker, which is user-independent by definition, and one
+  // `SignalEngine` is built per user — so on bqb1 they were 68 private copies of
+  // the same market data, measured at 6793 + 6789 entries / ~3.45M retained
+  // objects, against a watchlist union of ~614 distinct names. That multiplier is
+  // what pays for the +531 MB retained working set TRA-4158 priced with a
+  // matched-quiescent A/B; a bound or a TTL buys little, because both containers
+  // already plateau. Semantics are preserved per key — see that module's header
+  // for why closes stay last-writer-wins while bars go deepest-or-equal-wins.
   /** TRA-3943 — resolved ATR(14, daily) per symbol, keyed on the ET day it was taken. */
   private otmDailyAtrCache: Map<string, { dayKey: string; atr: number | undefined }> = new Map();
   /**
@@ -11879,11 +11884,20 @@ export class SignalEngine {
     const dayKey = etDateKey(Date.now());
     const hit = this.otmDailyAtrCache.get(sym);
     if (hit && hit.dayKey === dayKey) return hit.atr;
-    let bars = this.otmDailyBarCache.get(sym);
+    let bars = getSharedDailyBars(sym);
     if (!bars || bars.length < 15) {
       bars = await fetchDailyCandles(sym, OTM_DAILY_ATR_BARS).catch(() => [] as Candle[]);
     }
-    if (bars.length >= 15) this.otmDailyBarCache.set(sym, bars);
+    if (bars.length >= 15) {
+      // Deepest-or-equal-wins, so this cold `OTM_DAILY_ATR_BARS` pull cannot
+      // clobber the deeper `MTF_DAILY_BARS` series the technical-snapshot pass
+      // maintains. When the write IS refused the ATR has to be taken off the
+      // series the store kept, not off the shallower local pull — otherwise the
+      // number published here would still depend on which writer ran last, which
+      // is the write-order dependence the shared store exists to remove.
+      setSharedDailyBars(sym, bars);
+      bars = getSharedDailyBars(sym) ?? bars;
+    }
     const a = bars.length >= 15 ? atr(bars) : null;
     const value = a != null && Number.isFinite(a) && a > 0 ? a : undefined;
     this.otmDailyAtrCache.set(sym, { dayKey, atr: value });
@@ -16299,7 +16313,7 @@ export class SignalEngine {
    * A daily bar is the same information at 1/390th the payload, and Yahoo's
    * chart route serves it in one round trip.
    *
-   * ── Why not {@link otmDailyBarCache}, which already holds daily bars ────────
+   * ── Why not the shared daily-bar store, which already holds daily bars ─────
    * It exists (TRA-3943) and it is NOT a substitute, for three reasons that each
    * fail in the silent direction:
    *
@@ -17344,7 +17358,7 @@ export class SignalEngine {
    * For each active symbol it pulls the SAME warm selector chain the
    * directional/shadow passes already fetched this tick (rides the scanner's 60s
    * cache → no extra Tradier call), reads the underlying's daily closes off the
-   * {@link dailyCloseCache} the technical-snapshot pass populated, runs
+   * shared daily-close store the technical-snapshot pass populated, runs
    * {@link scanIvRvFromSnapshot}, and records the result into the in-memory store
    * backing `GET /api/health/iv-rv`.
    *
@@ -17389,13 +17403,13 @@ export class SignalEngine {
 
         // TRA-1226 — the IV-RV scan universe (the option-chain symbols
         // getSelectorChain resolves, ~128 names) is NOT the same set the
-        // TRA-533 technical-snapshot pass warms into `dailyCloseCache`: that
-        // pass runs market-hours-only, throttled, and over the active-interest
+        // TRA-533 technical-snapshot pass warms into the shared daily-close
+        // store: that pass runs market-hours-only, throttled, over the active-interest
         // equity subset, so most iv-rv underlyings arrive here with zero
         // daily-close history and short-circuit at `no_realized_vol` (0
         // candidates for the whole book — the TRA-1204 forward-test can never
         // start). Backfill the underlying's daily closes directly from the same
-        // daily feed when the cache is cold, then prime `dailyCloseCache` so the
+        // daily feed when the cache is cold, then prime the shared store so the
         // next pass is warm. Shares the feed client's retry/breaker; a cold pull
         // is swallowed and just leaves this symbol at `no_realized_vol` for the
         // pass, exactly as before.
@@ -17406,7 +17420,7 @@ export class SignalEngine {
         // exact symptom TRA-1204 hit. Fall back to Tradier daily history (the sole
         // reliable Render stock source, its own breaker) when Yahoo is empty, so
         // the backfill is session- and Yahoo-breaker-independent.
-        let dailyCloses = this.dailyCloseCache.get(sym) ?? [];
+        let dailyCloses = getSharedDailyCloses(sym) ?? [];
         if (dailyCloses.length === 0) {
           let bars = await fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
           if (bars.length === 0) {
@@ -17414,7 +17428,7 @@ export class SignalEngine {
           }
           if (bars.length > 0) {
             dailyCloses = bars.map((b) => b.close);
-            this.dailyCloseCache.set(sym, dailyCloses);
+            setSharedDailyCloses(sym, dailyCloses);
           }
         }
         const result = scanIvRvFromSnapshot(
@@ -17503,7 +17517,7 @@ export class SignalEngine {
         // universe isn't the technical-snapshot warm set, so most underlyings
         // arrive cold; pull daily bars directly (Yahoo → Tradier fallback) and
         // prime the cache so the next pass is warm.
-        let dailyCloses = this.dailyCloseCache.get(sym) ?? [];
+        let dailyCloses = getSharedDailyCloses(sym) ?? [];
         if (dailyCloses.length === 0) {
           let bars = await fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
           if (bars.length === 0) {
@@ -17511,7 +17525,7 @@ export class SignalEngine {
           }
           if (bars.length > 0) {
             dailyCloses = bars.map((b) => b.close);
-            this.dailyCloseCache.set(sym, dailyCloses);
+            setSharedDailyCloses(sym, dailyCloses);
           }
         }
 
@@ -23748,11 +23762,11 @@ export class SignalEngine {
       // call. Only update on a non-empty pull so a transient cold feed keeps the
       // last good series.
       if (dailyBars.length > 0) {
-        this.dailyCloseCache.set(sym, dailyBars.map((b) => b.close));
+        setSharedDailyCloses(sym, dailyBars.map((b) => b.close));
         // TRA-3943 — and stash the BARS for the OTM sleeve's entry ATR(14,
         // daily). Same pull, same non-empty guard, zero extra feed calls; this
         // is what keeps `otmDailyAtr`'s on-demand fetch a cold path.
-        if (dailyBars.length >= 15) this.otmDailyBarCache.set(sym, dailyBars);
+        if (dailyBars.length >= 15) setSharedDailyBars(sym, dailyBars);
       }
       return snap;
     } catch (err: unknown) {
