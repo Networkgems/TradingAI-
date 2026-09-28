@@ -21,6 +21,7 @@ import {
   appendEngineBasisRestatement,
   configureEngineBasisRestatementLog,
 } from './engine-basis-restatement-log.js';
+import { etDateKey } from './et-clock.js';
 import {
   buildPaperDailySummary,
   forceCloseAllPaperPositions,
@@ -253,7 +254,10 @@ describe('force-close (control 7, the paper leg)', () => {
     expect(fc.every((x) => x.markStale === true && x.paperPnlUsd === null)).toBe(true);
     const s = buildPaperDailySummary(ET_DAY);
     expect(s.forceCloses).toBe(2);
-    expect(s.theoreticalRealizedPnlUsd).toBe(0); // stale marks never price the P&L
+    // Stale marks never price the P&L — and TRA-4874: that is published as `null`
+    // under `only_force_closes`, not as a `0` indistinguishable from a flat day.
+    expect(s.theoreticalRealizedPnlUsd).toBeNull();
+    expect(s.pnlBasis).toBe('only_force_closes');
     expect(getPaperTradingState().openPositions).toHaveLength(0);
   });
 
@@ -372,7 +376,11 @@ describe('TRA-4781 — the basis split is readable on the row', () => {
     expect(row.paperPnlUsd).toBeCloseTo(47.4, 10);
 
     const s = buildPaperDailySummary(ET_DAY);
-    const gap = s.demoRealizedPnlUsd - s.theoreticalRealizedPnlUsd;
+    // TRA-4874 — the bridge is only computable over a non-empty population, and
+    // the payload now SAYS which it is. Assert that before subtracting.
+    expect(s.pnlBasis).toBe('matched_closes');
+    expect(s.demoPnlCloses).toBe(1);
+    const gap = s.demoRealizedPnlUsd! - s.theoreticalRealizedPnlUsd!;
     expect(gap).toBeCloseTo(62.6, 10);
     // Residual $0.0000 — the same control the live 2026-09-22 fixture ran.
     expect(gap - (s.slippageAssumedUsd + s.commissionAssumedUsd + s.basisDeltaUsd)).toBeCloseTo(0, 10);
@@ -445,5 +453,124 @@ describe('TRA-4781 — the basis split is readable on the row', () => {
     expect(s.basisDeltaUsd).toBe(0);
     // The legacy row's own P&L still counts — only its basis term is unknown.
     expect(s.demoRealizedPnlUsd).toBe(20);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TRA-4874 item 4 — `theoreticalRealizedPnlUsd: 0` was byte-identical across a
+// measured breakeven, a no-trade day, a flattened day and a day where every
+// close was unbookable (the real 2026-09-23 / 09-24 sessions, 12 unmatched
+// closes each). The row level was already honest; the DAY SUMMARY flattened it.
+// These cover the separation, not a changed number.
+// ---------------------------------------------------------------------------
+
+describe('TRA-4874 — the day summary cannot publish a zero it never measured', () => {
+  /** A hand-written matched close, so a MEASURED zero is expressible exactly. */
+  function legacyClose(overrides: Record<string, unknown>): string {
+    return `${JSON.stringify({
+      kind: 'close', instrument: 'option', atMs: NOW, etDay: ET_DAY, mode: 'paper',
+      positionId: 'm-1', symbol: 'ABC', occ: null, exitReason: 'tp', qty: 1, multiplier: 100,
+      midPerShare: 1.2,
+      fill: { fillPerShare: 1.08, slippagePerShare: 0.12, spreadSource: 'modeled_entry_spread', halfSpreadFrac: 0.1, aggression: 1 },
+      commissionUsd: 0, demoPnlUsd: 0, paperPnlUsd: 0, matchedOpen: true,
+      entryBasisAtOpen: 1.2, entryBasisRestated: 1.2, basisDeltaUsd: 0, basisRestatementCount: 1,
+      ...overrides,
+    })}\n`;
+  }
+
+  function seed(lines: string): void {
+    const file = join(dir, 'tra4874.jsonl');
+    writeFileSync(file, lines, 'utf-8');
+    setPaperTradingLedgerFileForTests(file);
+  }
+
+  it('⛔ THE DISCRIMINATOR: a MEASURED breakeven and an ALL-UNBOOKABLE day are no longer the same payload', () => {
+    // A — one matched close that really did settle at exactly zero.
+    seed(legacyClose({}));
+    const measured = buildPaperDailySummary(ET_DAY);
+    expect(measured.theoreticalRealizedPnlUsd).toBe(0);
+    expect(measured.pnlBasis).toBe('matched_closes');
+    expect(measured.pnlCloses).toEqual({ inFold: 1, unmatched: 0, noMark: 0 });
+
+    // B — the 2026-09-23 shape: closes landed, not one could be settled.
+    setPaperTradingLedgerFileForTests(join(dir, 'b.jsonl'));
+    for (let i = 0; i < 12; i++) {
+      recordPaperOptionClose(
+        { id: `unbookable-${i}`, symbol: 'MSTR', contracts: 1, currentPremium: 1.0, closedAt: NOW, pnl: -5 },
+        'paper',
+      );
+    }
+    const unbookable = buildPaperDailySummary(ET_DAY);
+    expect(unbookable.closes).toBe(12);
+    expect(unbookable.unmatchedCloses).toBe(12);
+    expect(unbookable.theoreticalRealizedPnlUsd).toBeNull();
+    expect(unbookable.pnlBasis).toBe('all_closes_unbookable');
+    expect(unbookable.pnlCloses).toEqual({ inFold: 0, unmatched: 12, noMark: 0 });
+
+    // The cell that used to carry the whole story: identical. That is the defect.
+    const asPublishedBefore = (s: { theoreticalRealizedPnlUsd: number | null }) => s.theoreticalRealizedPnlUsd ?? 0;
+    expect(asPublishedBefore(measured)).toBe(asPublishedBefore(unbookable));
+    expect(measured.pnlBasis).not.toBe(unbookable.pnlBasis);
+
+    // And the demo leg survives the same day — a real number beside a null
+    // theoretical is itself the tell that closes happened and none were bookable.
+    expect(unbookable.demoRealizedPnlUsd).toBe(-60);
+    expect(unbookable.demoPnlCloses).toBe(12);
+  });
+
+  it('a NO-TRADE day and a FLATTENED day are separated too, and neither publishes a number', async () => {
+    const quiet = buildPaperDailySummary(ET_DAY);
+    expect(quiet.closes).toBe(0);
+    expect(quiet.theoreticalRealizedPnlUsd).toBeNull();
+    expect(quiet.demoRealizedPnlUsd).toBeNull();
+    expect(quiet.pnlBasis).toBe('no_closes');
+
+    recordPaperOptionOpen(optOpen(), 'paper', NOW);
+    await forceCloseAllPaperPositions(NOW + 5_000);
+    const flattened = buildPaperDailySummary(ET_DAY);
+    expect(flattened.forceCloses).toBe(1);
+    expect(flattened.closes).toBe(0); // a force-close is not a settleable close
+    expect(flattened.theoreticalRealizedPnlUsd).toBeNull();
+    expect(flattened.pnlBasis).toBe('only_force_closes');
+    expect(flattened.pnlBasis).not.toBe(quiet.pnlBasis);
+  });
+
+  it('the denominator is an EXHAUSTIVE partition: inFold + unmatched + noMark === closes', () => {
+    // inFold: a real matched round trip.
+    const o = optOpen({ id: 'in-fold' });
+    recordPaperOptionOpen(o, 'paper', NOW);
+    recordPaperOptionClose(
+      { id: o.id, symbol: o.symbol, optionSymbol: o.optionSymbol, contracts: 1, currentPremium: 1.5, entrySpreadPct: 0.2, closedAt: NOW, pnl: 50 },
+      'paper',
+    );
+    // unmatched: never opened.
+    recordPaperOptionClose({ id: 'nope', symbol: 'ABC', contracts: 1, currentPremium: 1.0, closedAt: NOW, pnl: 1 }, 'paper');
+    // noMark: matched, but the exit price is missing ⇒ mid 0 ⇒ no P&L to strike.
+    recordPaperEquityOpen({ id: 'eq-nm', symbol: 'XYZ', side: 'buy', entryPrice: 10, quantity: 1, openedAt: NOW - 1_000 }, 'paper', NOW);
+    recordPaperEquityClose({ id: 'eq-nm', symbol: 'XYZ', side: 'buy', quantity: 1, closedAt: NOW, pnl: 3 }, 'paper');
+
+    const s = buildPaperDailySummary(ET_DAY);
+    expect(s.pnlCloses).toEqual({ inFold: 1, unmatched: 1, noMark: 1 });
+    expect(s.pnlCloses.inFold + s.pnlCloses.unmatched + s.pnlCloses.noMark).toBe(s.closes);
+    // One row folded, so the total is MEASURED — over a population of one, named.
+    expect(s.pnlBasis).toBe('matched_closes');
+    expect(s.theoreticalRealizedPnlUsd).toBeCloseTo(23.7, 10);
+    // ⛔ And the noMark row is NOT the unmatched row: `unmatchedCloses` counts 1,
+    // the P&L denominator excludes 2. Reading either as the other is the bug.
+    expect(s.unmatchedCloses).toBe(1);
+  });
+
+  it('the route payload carries the discriminator, not just the type (state + summary agree)', () => {
+    // `getPaperTradingState().today` folds the CURRENT ET day, not the fixture's,
+    // so the row has to be stamped today or the route reads an empty day.
+    const today = etDateKey(Date.now());
+    seed(legacyClose({ etDay: today, atMs: Date.now(), paperPnlUsd: null, matchedOpen: false, demoPnlUsd: null }));
+    const state = getPaperTradingState();
+    expect(state.today.etDay).toBe(today);
+    expect(state.today.closes).toBe(1);
+    expect(state.today.theoreticalRealizedPnlUsd).toBeNull();
+    expect(state.today.demoRealizedPnlUsd).toBeNull();
+    expect(state.today.pnlBasis).toBe('all_closes_unbookable');
+    expect(state.today.pnlCloses.unmatched).toBe(1);
   });
 });

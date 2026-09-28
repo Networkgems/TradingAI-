@@ -813,10 +813,27 @@ export interface PaperDailySummary {
   opens: { admitted: number; refused: number; refusedByReason: Record<string, number> };
   closes: number;
   forceCloses: number;
-  /** Net of spread + commissions, over matched closes with a real mark. */
-  theoreticalRealizedPnlUsd: number;
-  /** The demo book's own (mid-based) realized P&L over the same closes. */
-  demoRealizedPnlUsd: number;
+  /**
+   * Net of spread + commissions, over matched closes with a real mark.
+   *
+   * TRA-4874 — **`null` when NOTHING was bookable**, never `0`. A bare `0` here
+   * was byte-identical across four different days: a genuine breakeven, a
+   * no-trade day, a day flattened by the force-close handler (marks stale ⇒ P&L
+   * excluded by construction), and a day where every close was unbookable. The
+   * 2026-09-23 and 2026-09-24 paper sessions were the fourth kind — 12 unmatched
+   * closes each — and both published `0`, which reads as "equities were flat".
+   * The row level was already honest (`paperPnlUsd: null` + `matchedOpen: false`);
+   * only the day summary flattened it. `pnlBasis` below names which case this is.
+   * ⛔ Never `?? 0` this — that re-merges the readings the null exists to split.
+   */
+  theoreticalRealizedPnlUsd: number | null;
+  /**
+   * The demo book's own (mid-based) realized P&L over the same closes. `null`
+   * under the same rule (TRA-4874), counted separately: the two legs have
+   * different populations, and a day with unmatched closes typically publishes a
+   * demo number with NO theoretical twin — which is itself the discriminator.
+   */
+  demoRealizedPnlUsd: number | null;
   /** Total logged slippage assumption (open + close legs), USD. */
   slippageAssumedUsd: number;
   commissionAssumedUsd: number;
@@ -829,6 +846,11 @@ export interface PaperDailySummary {
    *
    *     demoRealizedPnlUsd − theoreticalRealizedPnlUsd
    *       = slippageAssumedUsd + commissionAssumedUsd + basisDeltaUsd
+   *
+   * ⚠️ TRA-4874 — that bridge is only computable when BOTH legs are non-null,
+   * i.e. `pnlBasis === 'matched_closes'` and `demoPnlCloses ≥ 1`. Do not coerce a
+   * null leg to zero to make the subtraction go through; there is no bridge to
+   * close on a day that booked nothing.
    */
   basisDeltaUsd: number;
   /**
@@ -840,6 +862,31 @@ export interface PaperDailySummary {
    *     structurally zero, NOT a measured agreement
    */
   basisCloses: { inFold: number; unreadable: number; unstamped: number; neverRestated: number };
+  /**
+   * TRA-4874 — WHY `theoreticalRealizedPnlUsd` reads the way it does. Exhaustive
+   * and mutually exclusive, so the four readings a bare `0` collapsed are four
+   * distinct values:
+   *   • `matched_closes`        — `pnlCloses.inFold ≥ 1`: the number is MEASURED
+   *   • `no_closes`             — no close and no force-close landed today
+   *   • `only_force_closes`     — flattened by control 7; a force-close prices off
+   *     the entry mid and publishes no P&L, so zero is structural, not measured
+   *   • `all_closes_unbookable` — closes landed and not one could be settled
+   *     (the 2026-09-23 / 09-24 state). ⛔ This is the reading that used to be
+   *     indistinguishable from a flat day, and it is the point of the field.
+   */
+  pnlBasis: 'matched_closes' | 'no_closes' | 'only_force_closes' | 'all_closes_unbookable';
+  /**
+   * TRA-4874 — the denominator behind `theoreticalRealizedPnlUsd`, partitioned so
+   * the three ways a close can fail to contribute stay separate. The four counts
+   * sum to `closes` exactly (force-closes are counted in `forceCloses`, never
+   * here), which is what makes the partition auditable rather than asserted:
+   *   • `inFold`    — contributed a finite `paperPnlUsd`
+   *   • `unmatched` — no admitted paper open to settle against (`matchedOpen:false`)
+   *   • `noMark`    — matched, but the exit mark was missing/non-finite
+   */
+  pnlCloses: { inFold: number; unmatched: number; noMark: number };
+  /** TRA-4874 — closes that contributed a finite `demoPnlUsd`. `0` ⇒ that leg is null. */
+  demoPnlCloses: number;
   /** Closes that had no admitted paper open to settle against. */
   unmatchedCloses: number;
   openPositionsNow: number;
@@ -855,15 +902,26 @@ export function buildPaperDailySummary(etDay?: string, env: NodeJS.ProcessEnv = 
     opens: { admitted: 0, refused: 0, refusedByReason: {} },
     closes: 0,
     forceCloses: 0,
-    theoreticalRealizedPnlUsd: 0,
-    demoRealizedPnlUsd: 0,
+    // TRA-4874 — seeded NULL, not 0: "nothing bookable" is the state before the
+    // fold runs, and an early return must never publish a zero it never measured.
+    theoreticalRealizedPnlUsd: null,
+    demoRealizedPnlUsd: null,
     slippageAssumedUsd: 0,
     commissionAssumedUsd: 0,
     basisDeltaUsd: 0,
     basisCloses: { inFold: 0, unreadable: 0, unstamped: 0, neverRestated: 0 },
+    pnlBasis: 'no_closes',
+    pnlCloses: { inFold: 0, unmatched: 0, noMark: 0 },
+    demoPnlCloses: 0,
     unmatchedCloses: 0,
     openPositionsNow: book.size,
   };
+  // TRA-4874 — the two P&L legs fold into LOCALS, not into the payload, because
+  // the payload cells are three-valued now: a running `0` that is later published
+  // as `null` must never be observable half-way. Each is published only if its
+  // own population is non-empty.
+  let theoreticalUsd = 0;
+  let demoUsd = 0;
   for (const row of rows) {
     if (row.etDay !== day) continue;
     if (row.kind === 'signal') {
@@ -883,8 +941,27 @@ export function buildPaperDailySummary(etDay?: string, env: NodeJS.ProcessEnv = 
     } else {
       summary.closes += 1;
       if (!row.matchedOpen) summary.unmatchedCloses += 1;
-      if (typeof row.paperPnlUsd === 'number') summary.theoreticalRealizedPnlUsd += row.paperPnlUsd;
-      if (typeof row.demoPnlUsd === 'number') summary.demoRealizedPnlUsd += row.demoPnlUsd;
+      // TRA-4874 — bucket EVERY close, so `inFold + unmatched + noMark == closes`
+      // and the published total carries its own denominator. `Number.isFinite`
+      // rather than the old bare `typeof`: a NaN is not a P&L, and folding one
+      // would poison the whole day's total into `NaN` — a fourth unreadable value
+      // in the cell this ticket is un-flattening. It buckets as `noMark`.
+      // (Not reachable through the JSONL seam — `JSON.stringify(NaN)` is `null` —
+      //  so this is a guard on the in-process path, deliberately untested.)
+      const paperPnl = row.paperPnlUsd;
+      if (typeof paperPnl === 'number' && Number.isFinite(paperPnl)) {
+        theoreticalUsd += paperPnl;
+        summary.pnlCloses.inFold += 1;
+      } else if (!row.matchedOpen) {
+        summary.pnlCloses.unmatched += 1;
+      } else {
+        summary.pnlCloses.noMark += 1;
+      }
+      const demoPnl = row.demoPnlUsd;
+      if (typeof demoPnl === 'number' && Number.isFinite(demoPnl)) {
+        demoUsd += demoPnl;
+        summary.demoPnlCloses += 1;
+      }
       summary.slippageAssumedUsd += row.fill.slippagePerShare * row.qty * row.multiplier;
       summary.commissionAssumedUsd += row.commissionUsd;
       // TRA-4781 — fold the basis term, and bucket every option close that
@@ -906,6 +983,16 @@ export function buildPaperDailySummary(etDay?: string, env: NodeJS.ProcessEnv = 
       }
     }
   }
+  // TRA-4874 — publish the two totals ONLY over a non-empty population, and name
+  // the case. The four `pnlBasis` arms are checked in the order that makes them
+  // mutually exclusive; `matched_closes` is the only one that publishes a number.
+  summary.theoreticalRealizedPnlUsd = summary.pnlCloses.inFold > 0 ? theoreticalUsd : null;
+  summary.demoRealizedPnlUsd = summary.demoPnlCloses > 0 ? demoUsd : null;
+  summary.pnlBasis =
+    summary.pnlCloses.inFold > 0 ? 'matched_closes'
+      : summary.closes > 0 ? 'all_closes_unbookable'
+        : summary.forceCloses > 0 ? 'only_force_closes'
+          : 'no_closes';
   return summary;
 }
 
