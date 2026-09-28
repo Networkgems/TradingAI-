@@ -92,7 +92,7 @@ describe('TRA-4897 — the v2 schema break is DISCRIMINATING', () => {
       'byDeltaBand', 'byDteBand', 'bySpreadBand', 'byLiquidityBand',
       'byEntryType', 'byExitType', 'byCell', 'ruleDisagreement',
       'printTellCoverage', 'byEntryTaxonomySource', 'bySide',
-      'rowsWithUnmodelledPartials',
+      'rowsWithUnmodelledPartials', 'participationSensitivity',
     ]) {
       expect((s as unknown as Record<string, unknown>)[fold]).toBeUndefined();
     }

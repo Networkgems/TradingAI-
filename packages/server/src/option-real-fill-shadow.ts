@@ -52,13 +52,25 @@ import { appendBoundedTapeLine } from './data-tape-bounds.js';
 //                       cannot see queue position (see UNMODELLED below).
 //   print_through_limit a NEW PRINT occurred STRICTLY better than L. This is the
 //                       rule the board asked for — "fills only when the market
-//                       trades through it" — and it is the CONSERVATIVE one: if
-//                       the tape printed below our buy limit, a resting order at
-//                       L ahead of that print would have had to be served first
-//                       regardless of where in the queue it sat.
+//                       trades through it" — and it is the STRICTEST of the
+//                       three ON ITS OWN OBSERVABLE: if the tape printed below
+//                       our buy limit, a resting order at L ahead of that print
+//                       would have had to be served first regardless of where
+//                       in the queue it sat.
 //
 // `print_through_limit` is the default `primaryRule` and is what stamps
 // `fillBasisUsd`. The other two ride along as columns.
+//
+// ⛔ THE THREE RULES ARE NOT NESTED, so `print_through_limit` is NOT a lower
+// bound on `touch_cross` and neither is an envelope around the other. They read
+// DIFFERENT OBSERVABLES: `touch_cross` reads the QUOTE (`ask`/`bid`), both print
+// rules read the LAST TRADE (`last`). A print can land below our buy limit while
+// the quoted ask never comes down to it — so
+// `ruleDisagreement.printFilledTouchDidNot` is a genuinely reachable bucket and
+// was measured POPULATED on the first live cohort (2026-09-25 RTH). Describing
+// either rule as "the conservative one" in the sense of *bounding* the other is
+// wrong; the only honest reading is to publish both and read `ruleDisagreement`.
+// (This comment used to say exactly that wrong thing. TRA-4893.)
 //
 // ── Why a print tape is readable at all (TRA-4870) ──────────────────────────
 // Tradier's `trade_date` was documented in this repo as a quote timestamp and
@@ -1335,9 +1347,14 @@ export interface RealFillCohort {
 }
 
 export interface RealFillRuleDisagreement {
-  /** Polls where the permissive rule said fill and the conservative one did not. */
+  /** Rows where `touch_cross` said fill and `print_through_limit` did not. */
   touchFilledPrintDidNot: number;
-  /** The reverse — a print through our limit with no touch at it. */
+  /**
+   * The reverse — a print through our limit with no touch at it. ⛔ NOT a
+   * residual: the two rules read different observables (quote vs last trade),
+   * so this bucket is reachable and was measured populated. Its being non-zero
+   * is the proof that neither rule bounds the other.
+   */
   printFilledTouchDidNot: number;
   agreed: number;
   /** Rows where at least one of the two could not be graded. */
@@ -1380,8 +1397,70 @@ export interface RealFillPartitionFolds {
    * Rows stamped `all_or_none_unmodelled`. Their sizes are not modelled, so a
    * dollar total that pools them is over a mixed population — published as a
    * count so the pooling is a choice rather than an accident.
+   *
+   * ⛔ DO NOT read this as "the volume tell was absent on this many rows".
+   * `all_or_none_unmodelled` is also the INITIAL value of `partialFillBasis`,
+   * and the field is only ever reassigned inside the fill branch — so every row
+   * on which the primary rule NEVER fired carries it untouched, with nothing
+   * having been missing. On the first live cohort that was the overwhelming
+   * majority (588 of 672 rows here, against `printTellCoverage.volumeReadable`
+   * of 632 — the two columns are inconsistent under the naive reading, and that
+   * contradiction is the tell). The honest split is
+   * `participationSensitivity.sizingNeverEvaluated`. (TRA-4893)
    */
   rowsWithUnmodelledPartials: number;
+  /**
+   * ⭐ TRA-4893 — the participation knob's own reach, published AS COUNTERS.
+   *
+   * `overall.fillRate` on this route is bounded by `participationRate` as much
+   * as by the tape. A row whose primary rule DID fire, but whose modelled share
+   * of the printed volume floored to ZERO contracts, is recorded `unfilled` —
+   * byte-identical to a row the tape never traded through. That is a
+   * suppression, so it ships a counter rather than a footnote.
+   *
+   * Read `fillCeilingAtRateOne` beside `filled`: it is the fill count the SAME
+   * tape under the SAME rule would have produced with participation removed,
+   * and it is exact when `partialUnreachableRows === overall.n` (every row asks
+   * for 1 contract, so `take` is 0 or 1); above that it is an upper bound on
+   * rows reaching `filled`. Quoting `fillRate` without that interval is quoting
+   * the knob, not the market.
+   */
+  participationSensitivity: {
+    /**
+     * The one `participationRate` every row in this partition was modelled at,
+     * or `null` if the cohort is MIXED — in which case a single rate would be a
+     * lie and the sensitivity below spans more than one model.
+     */
+    participationRate: number | null;
+    /** Rows that reached `outcome: 'filled'`. Equals `overall.filled`. */
+    filled: number;
+    /**
+     * Rows where the primary rule fired on some poll and ZERO contracts were
+     * modelled as filled — `floor(volumeDelta × participationRate) === 0`. The
+     * tape DID trade through our limit on these.
+     */
+    participationStarved: number;
+    /**
+     * Filled rows whose last sizing decision had no volume tell, so they filled
+     * all-or-none. A LOWER bound on the fills no participation rate can remove.
+     */
+    filledWithoutVolumeTell: number;
+    /** `filled + participationStarved`. See the note above for exactness. */
+    fillCeilingAtRateOne: number;
+    /**
+     * Rows whose `contractsRequested` is 1, on which `outcome: 'partial'` is
+     * UNREACHABLE by construction. `overall.partial === 0` over such a
+     * population is an identity, not a measurement.
+     */
+    partialUnreachableRows: number;
+    /**
+     * Rows where sizing was never evaluated at all, because the primary rule
+     * never fired on any poll. These hold the DEFAULT `partialFillBasis`
+     * without any volume tell having been missing — the correction to
+     * `rowsWithUnmodelledPartials`.
+     */
+    sizingNeverEvaluated: number;
+  };
   /**
    * Rows whose `contractsRequested` is the refused nominal 1 rather than a real
    * open size. On the refused partition this equals `overall.n`; read it before
@@ -1527,11 +1606,16 @@ function groupBy(
 export const REAL_FILL_ADMITTED_EMPTY_REASON =
   'NO ADMITTED ROWS IN THIS WINDOW. This is NOT a market finding. The admitted call sites run only '
   + 'AFTER a successful open (`if (!opened) continue;`), so an empty admitted partition means no OTM '
-  + 'open cleared the live gate stack in this window — overwhelmingly `cost_bar`, which is the '
-  + 'single highest-blocking gate on the live path and `continue`s ahead of every gate ordered below '
-  + 'it. Read `/api/health/live-enforce-gates` -> `retained.byGate.cost_bar` for the LIVE '
-  + 'evaluated/blocked counts; they are deliberately NOT reproduced here, because a constant copied '
-  + 'into this module would age silently and later be cited as current (TRA-4875). '
+  + 'open cleared the live gate stack in this window. `cost_bar` is the single highest-blocking gate '
+  + 'on the live path and `continue`s ahead of every gate ordered below it, so it is where to look '
+  + 'FIRST — but ⛔ THE GATE NAME IS NOT THE BINDING REASON, and this sentence used to assert one '
+  + 'without measuring it (TRA-4893). Read `byAdmission.refused.byRefusalReasonCode` in THIS '
+  + 'payload: it carries the value the gate handed `recordLiveEnforceDecision`, so it joins '
+  + '`/api/health/live-enforce-gates` -> `retained.byGate[cost_bar].byReason` by identity rather '
+  + 'than by inference, and a cohort refused entirely under one reason code is a different finding '
+  + 'from a bar shortfall. The LIVE evaluated/blocked counts are deliberately NOT reproduced here, '
+  + 'because a constant copied into this module would age silently and later be cited as current '
+  + '(TRA-4875). '
   + '⛔ Do NOT read `byAdmission.refused` as evidence about what the desk would have earned: a '
   + 'refused candidate failed ONE gate of many and the rest were never run on it.';
 
@@ -1600,6 +1684,30 @@ function foldPartition(
     if (r.side === 'buy' || r.side === 'sell') bySide[r.side] += 1;
   }
 
+  // TRA-4893 — the participation knob as counters. `primaryFired` is read off
+  // the row's OWN `primaryRule`, never a module default, so a row modelled under
+  // a different primary rule is still classified by the rule that sized it.
+  let participationStarved = 0;
+  let filledWithoutVolumeTell = 0;
+  let sizingNeverEvaluated = 0;
+  let partialUnreachableRows = 0;
+  let filledRows = 0;
+  const ratesSeen = new Set<number>();
+  for (const r of rows) {
+    const primaryFired = r.ruleVerdicts?.[r.primaryRule] === 'fill';
+    if (!primaryFired) sizingNeverEvaluated += 1;
+    if (r.outcome === 'filled') {
+      filledRows += 1;
+      if (r.partialFillBasis === 'all_or_none_unmodelled') filledWithoutVolumeTell += 1;
+    } else if (primaryFired && r.contractsFilled === 0 && r.outcome !== 'ungraded') {
+      participationStarved += 1;
+    }
+    if (r.contractsRequested === 1) partialUnreachableRows += 1;
+    if (typeof r.participationRate === 'number' && Number.isFinite(r.participationRate)) {
+      ratesSeen.add(r.participationRate);
+    }
+  }
+
   const samplerStats = realFillSampler().statsFor(admission);
 
   return {
@@ -1625,6 +1733,15 @@ function foldPartition(
     ruleDisagreement: disagreement,
     rowsWithUnmodelledPartials: rows.filter((r) => r.partialFillBasis === 'all_or_none_unmodelled')
       .length,
+    participationSensitivity: {
+      participationRate: ratesSeen.size === 1 ? [...ratesSeen][0] : null,
+      filled: filledRows,
+      participationStarved,
+      filledWithoutVolumeTell,
+      fillCeilingAtRateOne: filledRows + participationStarved,
+      partialUnreachableRows,
+      sizingNeverEvaluated,
+    },
     rowsWithNominalSize: rows.filter((r) => r.sizeBasis === 'refused_nominal_1').length,
     printTellCoverage: tellCoverage,
     byEntryTaxonomySource: taxonomySource,

@@ -481,3 +481,175 @@ function mkRow(over: {
     sizeBasis: 'actual_open',
   };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-4893 — the participation knob decides FILL vs NO-FILL, so it ships
+// counters. Measured on the first live cohort (2026-09-25 RTH): 8 filled of 632
+// graded, and 76 further rows where the tape DID print through our limit and the
+// modelled share floored to zero contracts. Those 76 were indistinguishable, on
+// the route, from 76 rows the tape never touched — the exact shape where a
+// suppression must ship a counter.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A 1-contract buy resting AT the decision mid (1.10 on a 1.00 x 1.20 quote). */
+function restAtMid(volumeOnPrintPoll: number | null, printThrough: boolean) {
+  const st = beginRestingOrder(
+    { side: 'buy', optionSymbol: 'SPY260925C00600000', limitUsd: 1.10, contracts: 1, bid: 1.0, ask: 1.2 },
+    T0,
+  )!;
+  // Seed poll: the quote stays wide (ask 1.20 > our 1.10), so touch_cross never fills.
+  advanceRestingOrder(st, sample({ ts: T0 + 1_000, volume: 1_000 }), T0 + 1_000);
+  advanceRestingOrder(
+    st,
+    sample({
+      ts: T0 + 2_000,
+      last: printThrough ? 1.05 : 1.18,
+      lastTradeMs: T0 + 1_900,
+      volume: volumeOnPrintPoll === null ? undefined : 1_000 + volumeOnPrintPoll,
+    }),
+    T0 + 2_000,
+  );
+  return finalizeRestingOrder(
+    st,
+    {
+      mode: 'demo',
+      structure: 'single_leg_otm',
+      underlying: 'SPY',
+      taxonomy: TAXONOMY,
+      admission: 'refused',
+      refusedAtGate: 'cost_bar',
+      refusalReasonCode: 'insufficient_real_fill_evidence',
+      sizeBasis: 'refused_nominal_1',
+    },
+    T0 + 2_000,
+  );
+}
+
+describe('TRA-4893 — participation-starved rows are COUNTED, not silently unfilled', () => {
+  it('a print THROUGH the limit whose modelled share floors to zero is starved, not untouched', () => {
+    // volumeDelta 5 ⇒ floor(5 × 0.10) = 0 contracts. The tape traded through us.
+    const starved = restAtMid(5, true);
+    expect(starved.ruleVerdicts.print_through_limit).toBe('fill');
+    expect(starved.outcome).toBe('unfilled'); // the misreadable state
+    expect(starved.contractsFilled).toBe(0);
+
+    const p = summarizeRealFillShadow([starved], T0).byAdmission.refused.participationSensitivity;
+    expect(p.participationStarved).toBe(1);
+    expect(p.filled).toBe(0);
+    expect(p.fillCeilingAtRateOne).toBe(1);
+    expect(p.sizingNeverEvaluated).toBe(0);
+  });
+
+  it('THE DISCRIMINATOR: a starved row and an untouched row read identically in `overall`', () => {
+    const starved = restAtMid(5, true);
+    const untouched = restAtMid(5_000, false); // plenty of volume, no print through us
+    expect(untouched.ruleVerdicts.print_through_limit).toBe('no_fill');
+
+    const s = summarizeRealFillShadow([starved, untouched], T0);
+    const o = s.byAdmission.refused.overall;
+    // Indistinguishable on every pre-TRA-4893 column: both are graded no-fills.
+    expect(o.n).toBe(2);
+    expect(o.nGraded).toBe(2);
+    expect(o.filled).toBe(0);
+    expect(o.unfilled).toBe(2);
+    expect(o.fillRate).toBe(0);
+    // Only the new counters tell them apart — 1 each, never 0 or 2.
+    const p = s.byAdmission.refused.participationSensitivity;
+    expect(p.participationStarved).toBe(1);
+    expect(p.sizingNeverEvaluated).toBe(1);
+    expect(p.fillCeilingAtRateOne).toBe(1);
+  });
+
+  it('enough printed volume fills it — so the starved verdict is about the RATE, not the rule', () => {
+    const filled = restAtMid(10, true); // floor(10 × 0.10) = 1
+    expect(filled.outcome).toBe('filled');
+    const p = summarizeRealFillShadow([filled], T0).byAdmission.refused.participationSensitivity;
+    expect(p.filled).toBe(1);
+    expect(p.participationStarved).toBe(0);
+    expect(p.fillCeilingAtRateOne).toBe(1);
+    expect(p.filledWithoutVolumeTell).toBe(0);
+  });
+
+  it('`rowsWithUnmodelledPartials` is NOT "the volume tell was absent" — it is the DEFAULT', () => {
+    // The volume tell is readable on this row; the primary rule simply never
+    // fired, so `partialFillBasis` was never reassigned. Before TRA-4893 this
+    // row inflated `rowsWithUnmodelledPartials` as if volume had been missing.
+    const untouched = restAtMid(5_000, false);
+    expect(untouched.partialFillBasis).toBe('all_or_none_unmodelled');
+    const f = summarizeRealFillShadow([untouched], T0).byAdmission.refused;
+    expect(f.rowsWithUnmodelledPartials).toBe(1);
+    expect(f.printTellCoverage.volumeReadable).toBe(1); // the contradiction, in-band
+    expect(f.participationSensitivity.sizingNeverEvaluated).toBe(1);
+  });
+
+  it('a fill with NO volume tell is all-or-none and invariant to the rate', () => {
+    const noVolume = restAtMid(null, true); // print clock only ⇒ volumeDelta null
+    expect(noVolume.outcome).toBe('filled');
+    expect(noVolume.partialFillBasis).toBe('all_or_none_unmodelled');
+    const p = summarizeRealFillShadow([noVolume], T0).byAdmission.refused.participationSensitivity;
+    expect(p.filledWithoutVolumeTell).toBe(1);
+    expect(p.participationStarved).toBe(0);
+  });
+
+  it('`partial` is UNREACHABLE on a 1-contract cohort, and that is published', () => {
+    const f = summarizeRealFillShadow([restAtMid(5, true), restAtMid(10, true)], T0)
+      .byAdmission.refused;
+    expect(f.overall.partial).toBe(0); // an identity, not a measurement
+    expect(f.participationSensitivity.partialUnreachableRows).toBe(f.overall.n);
+  });
+
+  it('reports the rate it was modelled at, and `null` rather than a lie on a MIXED cohort', () => {
+    const atDefault = restAtMid(10, true);
+    expect(atDefault.participationRate).toBe(DEFAULT_REAL_FILL_CONFIG.participationRate);
+    expect(
+      summarizeRealFillShadow([atDefault], T0).byAdmission.refused.participationSensitivity
+        .participationRate,
+    ).toBe(DEFAULT_REAL_FILL_CONFIG.participationRate);
+
+    const st = beginRestingOrder(
+      { side: 'buy', optionSymbol: 'X', limitUsd: 1.10, contracts: 1, bid: 1.0, ask: 1.2 },
+      T0,
+      { ...DEFAULT_REAL_FILL_CONFIG, participationRate: 0.25 },
+    )!;
+    advanceRestingOrder(st, sample({ ts: T0 + 1_000, volume: 1_000 }), T0 + 1_000);
+    advanceRestingOrder(
+      st,
+      sample({ ts: T0 + 2_000, last: 1.05, lastTradeMs: T0 + 1_900, volume: 1_005 }),
+      T0 + 2_000,
+    );
+    const atQuarter = finalizeRestingOrder(
+      st,
+      {
+        mode: 'demo',
+        structure: 'single_leg_otm',
+        underlying: 'SPY',
+        taxonomy: TAXONOMY,
+        admission: 'refused',
+        refusedAtGate: 'cost_bar',
+        refusalReasonCode: 'insufficient_real_fill_evidence',
+        sizeBasis: 'refused_nominal_1',
+      },
+      T0 + 2_000,
+    );
+    // Same tape, same rule, HIGHER rate ⇒ floor(5 × 0.25) = 1 ⇒ it fills. The knob
+    // decides fill vs no-fill outright, which is why the interval has to ship.
+    expect(atQuarter.outcome).toBe('filled');
+    expect(
+      summarizeRealFillShadow([atDefault, atQuarter], T0).byAdmission.refused
+        .participationSensitivity.participationRate,
+    ).toBeNull();
+  });
+
+  it('a fill AT the decision mid has a structurally ZERO basis delta', () => {
+    // Not evidence the mid basis is unbiased: the order rests at the mid and
+    // fills at its own limit, so the difference cannot be anything but 0. The
+    // signal for `maker_mid` lives entirely in the fill RATE.
+    const filled = restAtMid(10, true);
+    expect(filled.fillBasisUsd).toBeCloseTo(1.10, 10);
+    expect(filled.midBasisUsd).toBeCloseTo(1.10, 10);
+    expect(filled.basisDeltaUsd).toBe(0);
+    expect(
+      summarizeRealFillShadow([filled], T0).byAdmission.refused.overall.meanBasisDeltaUsd,
+    ).toBe(0);
+  });
+});
