@@ -505,7 +505,7 @@ export type {
   PortfolioGreeksGateInput,
   PortfolioGreeksGateVerdict,
 } from './options/portfolio-greeks-gate.js';
-export { findMispricedOtmContracts } from './options/otm-mispricing.js';
+export { findMispricedOtmContracts, parityImpliedCarry } from './options/otm-mispricing.js';
 export type {
   OptionChainRow,
   OtmMispricingCandidate,

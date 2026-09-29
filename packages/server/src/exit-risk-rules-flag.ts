@@ -133,6 +133,30 @@ export function resolveOtmDeltaFloor(env: NodeJS.ProcessEnv = process.env): numb
   return OTM_DELTA_FLOOR_DEFAULT;
 }
 
+// TRA-OTM-UNBLOCK — the two OTM mispricing-model corrections, demo-first.
+//  - OTM_MISPRICING_PARITY_CARRY (1/true/yes/on): price theo/delta with the
+//    put–call-parity-implied carry per expiration instead of q = 0. With q = 0
+//    against a vendor IV fitted WITH dividends, calls read cheap and puts read
+//    expensive on every dividend payer — a side bias, not a mispricing.
+//  - OTM_MISPRICING_BASIS = `mid` | `executable`: classify on (mid − theo) or on
+//    the side you actually trade (ask vs theo to buy, bid vs theo to sell).
+// Consulted ONLY on the `mode === 'demo'` OTM branch (same containment as the
+// delta floor). Both OFF by default ⇒ byte-identical scans.
+export const OTM_MISPRICING_PARITY_CARRY_FLAG = 'OTM_MISPRICING_PARITY_CARRY';
+export const OTM_MISPRICING_BASIS_VAR = 'OTM_MISPRICING_BASIS';
+
+export function resolveOtmMispricingModelOpts(
+  env: NodeJS.ProcessEnv = process.env,
+): { impliedCarry?: true; mispricingBasis?: 'executable' } {
+  const out: { impliedCarry?: true; mispricingBasis?: 'executable' } = {};
+  if (flagOn(env[OTM_MISPRICING_PARITY_CARRY_FLAG])) out.impliedCarry = true;
+  const basis = env[OTM_MISPRICING_BASIS_VAR];
+  if (typeof basis === 'string' && basis.trim().toLowerCase() === 'executable') {
+    out.mispricingBasis = 'executable';
+  }
+  return out;
+}
+
 // TRA-1670 (TRA-1647B, parent TRA-1647) — the OTHER half of the band: a
 // per-structure entry-delta CEILING.
 //

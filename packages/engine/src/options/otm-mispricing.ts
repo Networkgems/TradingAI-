@@ -84,6 +84,21 @@ export interface OtmMispricingCandidate {
   ivUsed: number;
   /** Sign-adjusted Black-Scholes delta of the OTM contract. */
   delta: number;
+  /**
+   * TRA-OTM-UNBLOCK — the continuous carry (q) the theo and delta were priced
+   * with. Equals `dividendYield` unless `impliedCarry` is on and a put–call
+   * parity forward could be read for this expiration.
+   */
+  carryUsed?: number;
+  /** Where `carryUsed` came from. */
+  carrySource?: 'fixed' | 'parity';
+  /**
+   * (theo − ask) / theo on the REPAIRED theo. The EXECUTABLE edge of buying:
+   * positive only when you can lift the offer below fair value. A mid that
+   * reads 15% cheap inside a 20%-wide market is usually `edgeVsAskPct < 0` —
+   * i.e. not capturable.
+   */
+  edgeVsAskPct?: number;
 }
 
 /**
@@ -197,6 +212,24 @@ export interface OtmScannerOptions {
    * recommended value is TRA-1407 / board territory.
    */
   minAbsDelta?: number;
+  /**
+   * TRA-OTM-UNBLOCK — derive the carry (dividends + borrow) per expiration from
+   * put–call parity on the near-the-money strikes instead of assuming
+   * `dividendYield` (default 0). With q = 0 against a vendor IV that was fitted
+   * WITH dividends, every call on a dividend payer prices rich (reads `cheap`)
+   * and every put prices thin (reads `expensive`) — a systematic side bias, not
+   * a mispricing. Default OFF (byte-identical legacy behaviour).
+   */
+  impliedCarry?: boolean;
+  /**
+   * TRA-OTM-UNBLOCK — what `classification` is measured against.
+   *  - `mid` (default, legacy): (mid − theo) / theo.
+   *  - `executable`: `cheap` iff (theo − ask) / theo > threshold (you can BUY
+   *    below fair), `expensive` iff (bid − theo) / theo > threshold (you can
+   *    SELL above fair), else `fair`. This is the only form whose edge survives
+   *    paying the spread.
+   */
+  mispricingBasis?: 'mid' | 'executable';
   /** Override of `Date.now()` — test seam. */
   now?: number;
   /**
@@ -212,6 +245,8 @@ export interface OtmScannerOptions {
 const DEFAULTS: Required<Omit<OtmScannerOptions, 'now' | 'onAdmission'>> = {
   riskFreeRate: 0.045,
   dividendYield: 0,
+  impliedCarry: false,
+  mispricingBasis: 'mid',
   maxSpreadPct: 0.2,
   minOpenInterest: 50,
   minMark: 0.05,
@@ -224,6 +259,65 @@ function classify(mispricingPct: number, threshold: number): Mispricing {
   if (mispricingPct > threshold) return 'expensive';
   if (mispricingPct < -threshold) return 'cheap';
   return 'fair';
+}
+
+/** TRA-OTM-UNBLOCK — classification on the executable side of the book. */
+function classifyExecutable(bid: number, ask: number, theo: number, threshold: number): Mispricing {
+  if ((theo - ask) / theo > threshold) return 'cheap';
+  if ((bid - theo) / theo > threshold) return 'expensive';
+  return 'fair';
+}
+
+/** Bounds on a parity-implied carry. Anything outside is a bad quote, not a dividend. */
+const PARITY_CARRY_MIN = -0.1;
+const PARITY_CARRY_MAX = 0.2;
+/** How many strikes nearest spot (with BOTH legs two-sided) feed the parity read. */
+const PARITY_STRIKES = 3;
+
+/**
+ * TRA-OTM-UNBLOCK — the continuous carry q implied by put–call parity for one
+ * expiration: F_K = K + e^{rT}(C_mid − P_mid), F = median over the
+ * {@link PARITY_STRIKES} strikes nearest spot, q = r − ln(F/S)/T.
+ *
+ * Returns null (caller falls back to the fixed yield) when no strike has a
+ * two-sided call AND put, T ≤ 0, or the implied q is outside
+ * [{@link PARITY_CARRY_MIN}, {@link PARITY_CARRY_MAX}]. PURE.
+ *
+ * American exercise adds a small early-exercise premium to the put, which
+ * biases this q slightly high; near the money at 3–6 weeks it is second order,
+ * and it errs toward pricing calls LOWER (fewer false `cheap` calls).
+ */
+export function parityImpliedCarry(
+  rows: OptionChainRow[],
+  spot: number,
+  timeToExpiryYears: number,
+  riskFreeRate: number,
+): number | null {
+  if (!(timeToExpiryYears > 0) || !(spot > 0)) return null;
+  const calls = new Map<number, number>();
+  const puts = new Map<number, number>();
+  for (const r of rows) {
+    const bid = r.bid ?? 0;
+    const ask = r.ask ?? 0;
+    if (!(bid > 0 && ask >= bid)) continue;
+    (r.optionType === 'call' ? calls : puts).set(r.strike, (bid + ask) / 2);
+  }
+  const strikes = [...calls.keys()]
+    .filter((k) => puts.has(k))
+    .sort((a, b) => Math.abs(a - spot) - Math.abs(b - spot) || a - b)
+    .slice(0, PARITY_STRIKES);
+  if (strikes.length === 0) return null;
+  const growth = Math.exp(riskFreeRate * timeToExpiryYears);
+  const forwards = strikes
+    .map((k) => k + growth * ((calls.get(k) as number) - (puts.get(k) as number)))
+    .filter((f) => f > 0)
+    .sort((a, b) => a - b);
+  if (forwards.length === 0) return null;
+  const mid = Math.floor(forwards.length / 2);
+  const fwd = forwards.length % 2 === 1 ? forwards[mid] : (forwards[mid - 1] + forwards[mid]) / 2;
+  const q = riskFreeRate - Math.log(fwd / spot) / timeToExpiryYears;
+  if (!Number.isFinite(q) || q < PARITY_CARRY_MIN || q > PARITY_CARRY_MAX) return null;
+  return q;
 }
 
 /**
@@ -286,6 +380,29 @@ export function findMispricedOtmContracts(
   for (const bucket of sortedByType.values()) {
     bucket.sort((a, b) => a.strike - b.strike);
   }
+
+  // TRA-OTM-UNBLOCK — one parity carry per expiration, computed lazily.
+  const carryByExpiration = new Map<string, { q: number; source: 'fixed' | 'parity' }>();
+  const carryFor = (expiration: string, dte: number): { q: number; source: 'fixed' | 'parity' } => {
+    const hit = carryByExpiration.get(expiration);
+    if (hit) return hit;
+    let out: { q: number; source: 'fixed' | 'parity' } = { q: opts.dividendYield, source: 'fixed' };
+    if (opts.impliedCarry) {
+      const rows = [
+        ...(sortedByType.get(`${expiration}|call`) ?? []),
+        ...(sortedByType.get(`${expiration}|put`) ?? []),
+      ];
+      const q = parityImpliedCarry(rows, underlyingPrice, dte / 365, opts.riskFreeRate);
+      if (q !== null) out = { q, source: 'parity' };
+    }
+    carryByExpiration.set(expiration, out);
+    return out;
+  };
+
+  const classifyRow = (mark: number, bid: number, ask: number, theo: number): Mispricing =>
+    opts.mispricingBasis === 'executable'
+      ? classifyExecutable(bid, ask, theo, opts.mispricingThresholdPct)
+      : classify((mark - theo) / theo, opts.mispricingThresholdPct);
 
   const candidates: OtmMispricingCandidate[] = [];
 
@@ -359,6 +476,7 @@ export function findMispricedOtmContracts(
       continue;
     }
 
+    const carry = carryFor(row.expiration, dte);
     const theo = blackScholesPrice({
       spot: underlyingPrice,
       strike: row.strike,
@@ -366,7 +484,7 @@ export function findMispricedOtmContracts(
       riskFreeRate: opts.riskFreeRate,
       volatility: ivUsed,
       optionType: row.optionType,
-      dividendYield: opts.dividendYield,
+      dividendYield: carry.q,
     });
     if (theo <= 0) {
       emit?.('non_positive_theo');
@@ -380,7 +498,7 @@ export function findMispricedOtmContracts(
       riskFreeRate: opts.riskFreeRate,
       volatility: ivUsed,
       optionType: row.optionType,
-      dividendYield: opts.dividendYield,
+      dividendYield: carry.q,
     });
 
     // TRA-1407 — delta floor: drop far-OTM lottery tickets whose |delta| is below
@@ -407,7 +525,7 @@ export function findMispricedOtmContracts(
       theo,
       theoRaw: theo,
       mispricingPct,
-      classification: classify(mispricingPct, opts.mispricingThresholdPct),
+      classification: classifyRow(mark, bid, ask, theo),
       bid,
       ask,
       spreadPct,
@@ -415,6 +533,9 @@ export function findMispricedOtmContracts(
       volume: row.volume ?? 0,
       ivUsed,
       delta,
+      carryUsed: carry.q,
+      carrySource: carry.source,
+      edgeVsAskPct: (theo - ask) / theo,
     });
   }
 
@@ -449,7 +570,8 @@ export function findMispricedOtmContracts(
       if (repaired[i] === c.theo) return;
       c.theo = repaired[i];
       c.mispricingPct = (c.mark - c.theo) / c.theo;
-      c.classification = classify(c.mispricingPct, opts.mispricingThresholdPct);
+      c.edgeVsAskPct = (c.theo - c.ask) / c.theo;
+      c.classification = classifyRow(c.mark, c.bid, c.ask, c.theo);
     });
   }
 

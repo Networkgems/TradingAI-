@@ -102,6 +102,10 @@ export const DEMO_FLAG_ALLOWLIST = [
   // the self-hosted host after QuantTrader's forward-validation (no PM2/admin).
   'OTM_DELTA_FLOOR_ENABLED',
   'OTM_DELTA_FLOOR',
+  // TRA-OTM-UNBLOCK — demo-only OTM mispricing-model corrections (parity-implied
+  // carry; executable ask/bid basis). Consulted only on the demo OTM branch.
+  'OTM_MISPRICING_PARITY_CARRY',
+  'OTM_MISPRICING_BASIS',
   // TRA-1682 (parent TRA-1680 → TRA-1677) — the TRA-1293 PoP/delta entry-greeks gate.
   // Non-secret and DEMO-only by construction: the signal-engine consults this flag ONLY
   // on the `mode === 'demo'` RV-long branch (live reads ENABLE_OPTION_LIVE_RV_LONG from

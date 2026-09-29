@@ -1164,7 +1164,19 @@ export function tapeExpectancyVerdict(
   candidate: { structure: string; delta: number },
   table: TapeExpectancyTable | null,
   config: CostGateConfig = DEFAULT_COST_GATE_CONFIG,
+  /**
+   * TRA-OTM-UNBLOCK — whether the TRA-4894 REAL-FILL arm is ANDed on.
+   * Default `true` (the live posture, unchanged). The DEMO book passes `false`:
+   * a demo/paper row is never a broker fill, so on the demo branch
+   * `nRealFill >= 40` is unsatisfiable BY CONSTRUCTION and the arm turns the
+   * paper gate into a permanent refusal (0 demo OTM admits since de960f11) —
+   * which in turn stops the very tape the pooled arm is folded from. The real-
+   * fill arm is a live-capital PROMOTION criterion; paper decides on the pooled
+   * arm, exactly as it did before TRA-4894.
+   */
+  opts: { requireRealFill?: boolean } = {},
 ): TapeExpectancyVerdict {
+  const requireRealFill = opts.requireRealFill !== false;
   const structure = canonicalTapeStructure(candidate.structure);
   const barR = admissionBarR(structure, config);
   const bucket = tapeExpectancyBucket(candidate.delta);
@@ -1257,7 +1269,7 @@ export function tapeExpectancyVerdict(
   // TRA-4894 — `cell.admits` is the conjunction, so an admit here is an admit on
   // BOTH arms. Read off the cell rather than recomputed, so the verdict and the
   // published table cannot disagree about a decision with money behind it.
-  if (cell.admits) {
+  if (requireRealFill ? cell.admits : cell.admitsPooled) {
     return { ...base, ...stats, admit: true, reasonCode: null, reason: '' };
   }
 
@@ -1281,7 +1293,7 @@ export function tapeExpectancyVerdict(
   // the bar: a cell that has never been measured on broker fills must not be
   // reported as "close to the bar", because that is a `shortfall_*` code and the
   // documented response to a shortfall is to look at the bar.
-  if (!cell.admitsRealFill) {
+  if (requireRealFill && !cell.admitsRealFill) {
     const why = cell.realFillUnavailableReason ?? 'the real-fill subset could not be evaluated';
     return {
       ...base,
