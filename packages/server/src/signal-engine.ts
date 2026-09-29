@@ -235,7 +235,7 @@ import {
 import { recordWheelBookSnapshot } from './wheel-promotion-gate-store.js';
 import type { WheelBookPosition } from './wheel-vol-stress-harness.js';
 import { buildProfitFloorLadder, resolveOtmProfitSchedule } from './otm-profit-schedule.js';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isProfitFloorTrailEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, resolveSwingTimeStopTradingDays, resolveOptionOpeningRangeMin, resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule, resolveChandelierAtrTimeframe, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isProfitFloorTrailEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, resolveOtmMispricingModelOpts, entryDeltaCeilingVerdict, resolveSwingTimeStopTradingDays, resolveOptionOpeningRangeMin, resolveLiveOptionStopPolicy, resolveOtmSleeveExitRule, resolveChandelierAtrTimeframe, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
 // TRA-4436 — the RV exit re-tune param set, extracted so the shipped demo/live
 // construction is testable and its demo-effective ma20 gate publishable.
 import { buildRvExitParams } from './rv-exit-params.js';
@@ -9437,6 +9437,10 @@ export class SignalEngine {
         { structure, delta: inputs.delta },
         peekTapeExpectancyTable(),
         resolveCostGateConfig(env),
+        // TRA-OTM-UNBLOCK — paper rows can never be broker fills, so the
+        // TRA-4894 real-fill arm is unsatisfiable here; demo decides on the
+        // pooled arm (the pre-TRA-4894 behaviour). Live is unchanged below.
+        { requireRealFill: false },
       );
       // TRA-3272 — NET-EDGE form (demo shadow-arm path via demo-flags env). When
       // armed for this structure it REPLACES the flat verdict; the recorded barR
@@ -15309,10 +15313,17 @@ export class SignalEngine {
     // post-hoc). OFF by default — no change to the shipped far-OTM behaviour until
     // the board flips it via demo-flags.json after QuantTrader forward-validates.
     const demoEnv = this.resolveDemoFlagEnv();
+    // TRA-OTM-UNBLOCK — the two mispricing-model corrections, DEMO-FIRST via
+    // demo-flags (same containment as the delta floor above): parity-implied
+    // carry (removes the q=0 cheap-call / expensive-put bias) and the
+    // executable (ask/bid vs theo) classification basis. Both default OFF.
+    const mispricingOpts = this.mode === 'demo' ? resolveOtmMispricingModelOpts(demoEnv) : {};
     const otmScanOpts =
       this.mode === 'demo' && isOtmDeltaFloorEnabled(demoEnv)
-        ? { minAbsDelta: resolveOtmDeltaFloor(demoEnv) }
-        : undefined;
+        ? { ...mispricingOpts, minAbsDelta: resolveOtmDeltaFloor(demoEnv) }
+        : Object.keys(mispricingOpts).length > 0
+          ? mispricingOpts
+          : undefined;
 
     // TRA-3557 — open the scan run HERE: below every gate that can `return null`
     // above (no scanner, sleeve breaker, book halt) and above the sweep. That
