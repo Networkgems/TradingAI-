@@ -93,16 +93,48 @@
  *     clamped to the routine's `createdAt`, so a routine armed yesterday is
  *     not billed for last week.
  *
- * VERDICTS — precedence BLIND > SLOT_LOSS > CLEAN
- *   0 CLEAN      every graded trigger served every expected slot in the window
- *   1 SLOT_LOSS  at least one trigger has >= --min-lost unserved expected slots
+ *  9. ⛔⛔ A SLOT SERVED PAST `--max-late` IS **LATE**, NOT LOST, AND THE TWO
+ *     NEED DIFFERENT REPAIRS. Trap 4 got the principle right and then put the
+ *     bar in the wrong place: with ONE bar, every slot beyond it falls into
+ *     LOST, which is "no run exists" — an accusation against the routine — when
+ *     the truth is "a run exists, the dispatcher was slow", which is an
+ *     observation about the scheduler and needs NOTHING done to the routine.
+ *     Measured 2026-10-01 (TRA-4958, QuantTrader on TRA-4953): at the 6h
+ *     default, **66 of 180 reported losses (36.7%) across 11 of 12 routines**
+ *     were lateness artifacts — including this checker's own carrier routine
+ *     `efd820ff`, which held the largest absolute loss count in its own report.
+ *     `11ff643f` was the extreme (7 of 10 reported losses phantom) only because
+ *     its cron is WEEKLY: one slot a week means a one-day lag always clears a
+ *     six-hour bar with no on-time neighbours to dilute it. It was routed to an
+ *     owner as a dead routine while it was in fact firing and accruing. There
+ *     are now TWO bars and THREE outcomes — SERVED / LATE_SERVED / LOST — and
+ *     LATE_DISPATCH carries its own exit code so neither hides behind the other.
+ *
+ * 10. ⛔⛔ `lastServedAt` IS WINDOW-SCOPED, SO ITS NULL IS NOT "NEVER FIRED".
+ *     `served` is keyed only on slots INSIDE the lookback, so a routine whose
+ *     last credited slot predates `--days` renders null — and that null used to
+ *     print as the word `NEVER`, which reads as the universal. Same routine,
+ *     same runs, same bar: `--days=14` printed "last served NEVER" while
+ *     `--days=90` printed `2026-07-20T13:00:00Z`. That string carried into a
+ *     filed issue as "the accrual is not accruing" about a routine sitting at
+ *     89/100. The universal is the RUN-ROW COUNT, which is window-free; the
+ *     renderer prints that and the two are never collapsed again.
+ *
+ * VERDICTS — precedence BLIND > SLOT_LOSS > LATE_DISPATCH > CLEAN
+ *   0 CLEAN          every graded trigger served every expected slot in the window
+ *   1 SLOT_LOSS      at least one trigger has >= --min-lost slots with NO run at
+ *                    either bar — a dispatch failure
  *   2 usage
- *   3 BLIND      unparseable cron, unknown timezone, truncated history,
- *                transport failure, or an empty population
+ *   3 BLIND          unparseable cron, unknown timezone, truncated history,
+ *                    transport failure, or an empty population
+ *   4 LATE_DISPATCH  no dispatch failure, but >= --min-lost slots on some trigger
+ *                    were served only past --max-late. NOT a broken routine and
+ *                    NOT green: the repair is to the dispatcher (trap 9).
  *
  * USAGE
  *   pnpm check:slot-loss
  *   pnpm check:slot-loss -- --days=14 --json
+ *   pnpm check:slot-loss -- --late-ceiling=2160
  *   pnpm check:slot-loss:controls
  */
 
@@ -130,6 +162,24 @@ const DEFAULT_DAYS = 14;
 const DEFAULT_GRACE_MIN = 20;
 /** How late a run may arrive and still be credited with the slot (catch-up flush). */
 const DEFAULT_MAX_LATE_MIN = 6 * 60;
+/**
+ * Second bar (trap 9, TRA-4958). A run arriving between `--max-late` and this
+ * is credited as LATE_SERVED, not counted LOST.
+ *
+ * 72h, from the measured dispatch-lateness distribution rather than taste: on
+ * 2026-10-01 routine `11ff643f`'s ten fires landed at 19s, 18s, 13.1h, 23.9h,
+ * 24.2h, 24.5h, 28.8h, 30.1h, 30.4h and 74.3h past their crons — only the two
+ * 19s/18s fires clear the 6h bar above, which is why eight healthy dispatches
+ * read as losses. 72h covers a weekend-long scheduler outage and still refuses
+ * the 74.3h outlier.
+ *
+ * ⛔ Do NOT "fix" chronic lateness by raising `--max-late` instead. That buys a
+ * false negative with the false positive: at a 36h bar `11ff643f` reads a
+ * healthy 9/12 and BURIES its real 2026-08-17 / 08-24 outage. The two bars have
+ * to stay separate so a dispatch failure and a late dispatch keep different
+ * exit codes and different repairs.
+ */
+const DEFAULT_LATE_CEILING_MIN = 72 * 60;
 /** A run may lead its slot by this much (scheduler clock skew / early claim). */
 const EARLY_TOLERANCE_MIN = 2;
 /** Below this, a single ragged slot is noise, not a finding. */
@@ -146,7 +196,7 @@ const DEFAULT_RUN_LIMIT = 1000;
 /** Refuses to enumerate a pathological cron (e.g. `* * * * *` over 90 days). */
 const MAX_SLOTS_PER_TRIGGER = 20_000;
 
-const VERDICT_EXIT = { CLEAN: 0, SLOT_LOSS: 1, BLIND: 3 };
+const VERDICT_EXIT = { CLEAN: 0, SLOT_LOSS: 1, BLIND: 3, LATE_DISPATCH: 4 };
 
 /* ==================================================================
  * Cron
@@ -355,32 +405,50 @@ const SUPPRESSED_STATUSES = new Set(['skipped', 'coalesced', 'suppressed']);
  * the newest still-unserved slot at or before it (within maxLate). This is
  * what makes a catch-up flush (trap 4) credit exactly the slots it replays
  * instead of one slot or all of them.
+ *
+ * TWO PASSES (trap 9, TRA-4958). Pass 1 credits runs inside `maxLateMs` —
+ * SERVED. Pass 2 then offers the LEFTOVER runs to the LEFTOVER slots out to
+ * `lateCeilingMs` — LATE_SERVED: a run demonstrably exists for that slot, it
+ * just arrived past the bar. Over-crediting is structurally impossible: each
+ * run index is consumed at most once and each slot is taken at most once, and
+ * because pass 1 runs first a run always covers its OWN slot before it can be
+ * spent on an older one.
  */
-function assignRunsToSlots(slots, runs, { maxLateMs, earlyMs }) {
-  const served = new Map(); // slotMs -> run
+function assignRunsToSlots(slots, runs, { maxLateMs, earlyMs, lateCeilingMs = maxLateMs }) {
   const ordered = [...slots].sort((a, b) => a - b);
   const byNewest = [...runs].sort((a, b) => b.at - a.at);
   const taken = new Set();
+  const consumed = new Set();
 
-  for (const run of byNewest) {
-    let best = -1;
-    for (let i = ordered.length - 1; i >= 0; i -= 1) {
-      const slot = ordered[i];
-      if (taken.has(slot)) continue;
-      if (run.at + earlyMs < slot) continue; // run predates this slot
-      if (run.at - slot > maxLateMs) break; // and every earlier slot too
-      best = i;
-      break;
+  const pass = (ceilingMs, sink) => {
+    for (let ri = 0; ri < byNewest.length; ri += 1) {
+      if (consumed.has(ri)) continue;
+      const run = byNewest[ri];
+      let best = -1;
+      for (let i = ordered.length - 1; i >= 0; i -= 1) {
+        const slot = ordered[i];
+        if (taken.has(slot)) continue;
+        if (run.at + earlyMs < slot) continue; // run predates this slot
+        if (run.at - slot > ceilingMs) break; // and every earlier slot too
+        best = i;
+        break;
+      }
+      if (best !== -1) {
+        taken.add(ordered[best]);
+        consumed.add(ri);
+        sink.set(ordered[best], run);
+      }
     }
-    if (best !== -1) {
-      taken.add(ordered[best]);
-      served.set(ordered[best], run);
-    }
-  }
-  return served;
+  };
+
+  const served = new Map(); // slotMs -> run, within maxLate
+  const lateServed = new Map(); // slotMs -> run, past maxLate but inside the ceiling
+  pass(maxLateMs, served);
+  if (lateCeilingMs > maxLateMs) pass(lateCeilingMs, lateServed);
+  return { served, lateServed };
 }
 
-function gradeTrigger({ routine, trigger, runs, now, windowStartMs, graceMs, maxLateMs, minLost }) {
+function gradeTrigger({ routine, trigger, runs, now, windowStartMs, graceMs, maxLateMs, lateCeilingMs, minLost }) {
   const label = trigger.label || trigger.id || '(unlabelled)';
   const base = {
     routineId: routine.id,
@@ -458,16 +526,25 @@ function gradeTrigger({ routine, trigger, runs, now, windowStartMs, graceMs, max
     }
   }
 
-  const served = assignRunsToSlots(slots, mine, { maxLateMs, earlyMs: EARLY_TOLERANCE_MIN * MIN });
-  const lostSlots = slots.filter((s) => !served.has(s));
-  const suppressed = [...served.values()].filter((r) => SUPPRESSED_STATUSES.has(r.status)).length;
+  const { served, lateServed } = assignRunsToSlots(slots, mine, {
+    maxLateMs,
+    earlyMs: EARLY_TOLERANCE_MIN * MIN,
+    lateCeilingMs: lateCeilingMs ?? maxLateMs,
+  });
+  // A slot is LOST only if NO run exists for it at either bar (trap 9).
+  const lostSlots = slots.filter((s) => !served.has(s) && !lateServed.has(s));
+  const lateSlots = slots.filter((s) => lateServed.has(s));
+  const credited = [...served.keys(), ...lateServed.keys()];
+  const suppressed = [...served.values(), ...lateServed.values()].filter((r) =>
+    SUPPRESSED_STATUSES.has(r.status),
+  ).length;
 
   // Determine clamping status (TRA-4167).
   let clampedBy = 'none';
   let firstLostCensored = false;
   if (lostSlots.length > 0) {
     const firstLost = lostSlots[0];
-    const servedBeforeFirstLost = [...served.keys()].some((s) => s < firstLost);
+    const servedBeforeFirstLost = credited.some((s) => s < firstLost);
 
     // Birth clamp: the routine didn't exist before this window, and the first
     // expected slot is at/near its birth.
@@ -483,7 +560,18 @@ function gradeTrigger({ routine, trigger, runs, now, windowStartMs, graceMs, max
     // Otherwise: observed transition (we can see slots served, then stopped).
   }
 
-  const state = lostSlots.length >= minLost ? 'SLOT_LOSS' : lostSlots.length > 0 ? 'RAGGED' : 'SERVED';
+  // Precedence inside a row: a genuine dispatch failure outranks chronic
+  // lateness, which outranks a single ragged slot. Every count is carried on
+  // the row either way, so neither hides behind the other (trap 9).
+  const state =
+    lostSlots.length >= minLost
+      ? 'SLOT_LOSS'
+      : lateSlots.length >= minLost
+        ? 'LATE_DISPATCH'
+        : lostSlots.length > 0
+          ? 'RAGGED'
+          : 'SERVED';
+  const lateMinutes = [...lateServed.entries()].map(([slot, run]) => (run.at - slot) / MIN);
   return {
     ...base,
     state,
@@ -499,6 +587,21 @@ function gradeTrigger({ routine, trigger, runs, now, windowStartMs, graceMs, max
     firstLostAt: lostSlots.length ? new Date(lostSlots[0]).toISOString() : null,
     lastLostAt: lostSlots.length ? new Date(lostSlots[lostSlots.length - 1]).toISOString() : null,
     lastServedAt: served.size ? new Date(Math.max(...served.keys())).toISOString() : null,
+    // --- trap 9 fields (TRA-4958) ---
+    lateCount: lateSlots.length,
+    firstLateAt: lateSlots.length ? new Date(lateSlots[0]).toISOString() : null,
+    lastLateAt: lateSlots.length ? new Date(lateSlots[lateSlots.length - 1]).toISOString() : null,
+    maxLateObservedMin: lateMinutes.length ? Math.round(Math.max(...lateMinutes)) : null,
+    /** Credited at EITHER bar — the honest "has this slot had a run" answer. */
+    lastCreditedAt: credited.length ? new Date(Math.max(...credited)).toISOString() : null,
+    /**
+     * ⛔ `lastServedAt`/`lastCreditedAt` are WINDOW-SCOPED: they are computed
+     * from slots inside the lookback only, so null means "no slot credited in
+     * THIS window" and NEVER "this trigger has never fired". These two fields
+     * are the universal, and the renderer must use them instead (trap 10).
+     */
+    runRowCount: mine.length,
+    lastRunAt: mine.length ? new Date(Math.max(...mine.map((r) => r.at))).toISOString() : null,
   };
 }
 
@@ -507,6 +610,7 @@ export async function sweep(transport, opts = {}) {
   const days = opts.days ?? DEFAULT_DAYS;
   const graceMs = (opts.graceMin ?? DEFAULT_GRACE_MIN) * MIN;
   const maxLateMs = (opts.maxLateMin ?? DEFAULT_MAX_LATE_MIN) * MIN;
+  const lateCeilingMs = Math.max(maxLateMs, (opts.lateCeilingMin ?? DEFAULT_LATE_CEILING_MIN) * MIN);
   const minLost = opts.minLost ?? DEFAULT_MIN_LOST;
   const windowStartMs = now - days * DAY;
 
@@ -553,12 +657,15 @@ export async function sweep(transport, opts = {}) {
     }
 
     for (const trigger of live) {
-      rows.push(gradeTrigger({ routine, trigger, runs, now, windowStartMs, graceMs, maxLateMs, minLost }));
+      rows.push(
+        gradeTrigger({ routine, trigger, runs, now, windowStartMs, graceMs, maxLateMs, lateCeilingMs, minLost }),
+      );
     }
   }
 
   const blind = rows.filter((r) => r.state === 'BLIND');
   const findings = rows.filter((r) => r.state === 'SLOT_LOSS');
+  const lateRows = rows.filter((r) => r.state === 'LATE_DISPATCH');
   const graded = rows.filter((r) => r.state !== 'BLIND');
 
   // Trap 7 — an empty census is unmeasured, not clean.
@@ -566,6 +673,7 @@ export async function sweep(transport, opts = {}) {
   if (!graded.length) verdict = 'BLIND';
   else if (blind.length) verdict = 'BLIND';
   else if (findings.length) verdict = 'SLOT_LOSS';
+  else if (lateRows.length) verdict = 'LATE_DISPATCH';
   else verdict = 'CLEAN';
 
   if (!graded.length && !blind.length) {
@@ -579,11 +687,13 @@ export async function sweep(transport, opts = {}) {
     windowStart: new Date(windowStartMs).toISOString(),
     minLost,
     maxLateMin: maxLateMs / MIN,
+    lateCeilingMin: lateCeilingMs / MIN,
     routineCount: routines.length,
     gradedCount: graded.length,
     rows,
     blind,
     findings,
+    lateRows,
     tally: rows.reduce((acc, r) => ((acc[r.state] = (acc[r.state] || 0) + 1), acc), {}),
   };
 }
@@ -597,17 +707,35 @@ function renderReport(result, names = {}) {
   out.push(
     `  window ${result.windowStart} .. now (${result.days}d) · ` +
       `graded ${result.gradedCount} trigger(s) across ${result.routineCount} routine(s) · ` +
-      `min-lost ${result.minLost} · max-late ${result.maxLateMin}min`,
+      `min-lost ${result.minLost} · max-late ${result.maxLateMin}min · late-ceiling ${result.lateCeilingMin}min`,
   );
   out.push(`  tally ${JSON.stringify(result.tally)}`);
+
+  /**
+   * ⛔ trap 10 (TRA-4958). `lastCreditedAt` is WINDOW-SCOPED, so its null is
+   * "no slot credited in this window" and NOT "never fired" — the word NEVER
+   * used to be printed here and read as the universal, which sent a correct
+   * `lost: 2` to the wrong owner with the wrong diagnosis. The run-row count is
+   * the universal; print that instead and never collapse the two.
+   */
+  const credit = (f) => {
+    if (f.lastCreditedAt) return `last served ${f.lastCreditedAt}`;
+    if (!f.runRowCount) return 'no run row has EVER existed for this trigger';
+    return `no slot credited in window (${f.runRowCount} run row(s) exist, newest ${f.lastRunAt})`;
+  };
+  const lateTail = (f) =>
+    f.lateCount
+      ? ` · +${f.lateCount} LATE-SERVED (worst +${f.maxLateObservedMin}min, inside the ${result.lateCeilingMin}min ceiling)`
+      : '';
 
   if (result.findings?.length) {
     out.push('');
     out.push(`  SLOT LOSS (at --days=${result.days}) — ${result.findings.length} trigger(s) stopped serving their cron:`);
+    out.push('    (LOST = no run exists for the slot at EITHER bar. Late-but-served slots are NOT counted here.)');
     for (const f of [...result.findings].sort((a, b) => b.lost - a.lost)) {
       out.push(
         `    ${f.routineShort}  LOST ${f.lost}/${f.expected}  ` +
-          `last served ${f.lastServedAt ?? 'NEVER'}  owner ${who(f.assigneeAgentId)}`,
+          `${credit(f)}  owner ${who(f.assigneeAgentId)}${lateTail(f)}`,
       );
       out.push(`        cron ${JSON.stringify(f.cronExpression)} ${f.timezone ?? '(UTC assumed)'} — ${f.routineTitle}`);
 
@@ -620,10 +748,29 @@ function renderReport(result, names = {}) {
         firstLostLine = `        first lost ${f.firstLostAt}  (SINCE BIRTH ${bornAt})`;
       } else {
         // Observed transition: served, then stopped.
-        const context = f.lastServedAt ? ` (observed: served through ${f.lastServedAt})` : '';
+        const context = f.lastCreditedAt ? ` (observed: served through ${f.lastCreditedAt})` : '';
         firstLostLine = `        first lost ${f.firstLostAt}${context}`;
       }
       out.push(`${firstLostLine} · last lost ${f.lastLostAt} · nextRunAt claims ${f.nextRunAt}`);
+    }
+  }
+
+  if (result.lateRows?.length) {
+    out.push('');
+    out.push(
+      `  LATE DISPATCH — ${result.lateRows.length} trigger(s) whose slots DID get a run, past the ` +
+        `${result.maxLateMin}min bar:`,
+    );
+    out.push('    NOT a lost slot and NOT a broken routine — nothing on these rows needs re-arming.');
+    out.push('    This is a SCHEDULER-LATENESS datum: the repair is to the dispatcher, not the trigger.');
+    for (const f of [...result.lateRows].sort((a, b) => b.lateCount - a.lateCount)) {
+      out.push(
+        `    ${f.routineShort}  LATE ${f.lateCount}/${f.expected}  ` +
+          `worst +${f.maxLateObservedMin}min  owner ${who(f.assigneeAgentId)}` +
+          (f.lost ? `  (+${f.lost} genuinely lost, below the --min-lost=${result.minLost} bar)` : ''),
+      );
+      out.push(`        cron ${JSON.stringify(f.cronExpression)} ${f.timezone ?? '(UTC assumed)'} — ${f.routineTitle}`);
+      out.push(`        first late ${f.firstLateAt} · last late ${f.lastLateAt} · ${credit(f)}`);
     }
   }
 
@@ -631,7 +778,9 @@ function renderReport(result, names = {}) {
   if (ragged.length) {
     out.push('');
     out.push(`  RAGGED — ${ragged.length} trigger(s) below the --min-lost=${result.minLost} bar (not a finding):`);
-    for (const r of ragged) out.push(`    ${r.routineShort}  lost ${r.lost}/${r.expected}  ${r.routineTitle.slice(0, 60)}`);
+    for (const r of ragged) {
+      out.push(`    ${r.routineShort}  lost ${r.lost}/${r.expected}${lateTail(r)}  ${r.routineTitle.slice(0, 60)}`);
+    }
   }
 
   const supp = result.rows?.filter((r) => r.suppressedCount > 0 && r.state !== 'SLOT_LOSS') ?? [];
@@ -935,13 +1084,161 @@ const CONTROLS = [
       return true;
     },
   },
+
+  /* ---- trap 9 / trap 10, TRA-4958 ------------------------------------- */
+  {
+    name: 'trap 9 — every slot served +7h is LATE_DISPATCH, never SLOT_LOSS',
+    expect: 'LATE_DISPATCH',
+    note: 'the 36.7% phantom-loss cohort: a run EXISTS for each slot, past the 6h bar',
+    build: () => {
+      const r = dailyRoutine();
+      // One run 7h after every 13:00Z slot in the window — outside --max-late=6h,
+      // and far from the NEXT slot (17h early), so pass 1 can credit none of them.
+      const runs = [];
+      for (let d = 1; d <= 14; d += 1) {
+        const slot = Date.parse('2026-08-26T13:00:00Z') - d * DAY;
+        runs.push({
+          triggerId: 'tttttttt-0000-0000-0000-000000000001',
+          status: 'completed',
+          triggeredAt: iso(slot + 7 * HOUR),
+        });
+      }
+      return fakeTransport([r], { [r.id]: runs });
+    },
+    assert: (r) => {
+      const row = r.rows[0];
+      if (row.state !== 'LATE_DISPATCH') return `expected state LATE_DISPATCH, got ${row.state}`;
+      if (row.lost !== 0) return `a slot with a run must not be LOST (lost=${row.lost})`;
+      if (row.lateCount !== row.expected) return `expected all ${row.expected} slots late, got ${row.lateCount}`;
+      if (row.maxLateObservedMin !== 420) return `expected worst lateness 420min, got ${row.maxLateObservedMin}`;
+      return true;
+    },
+  },
+  {
+    name: 'trap 9 — the SAME fixture at a single bar regresses to 14 phantom losses',
+    expect: 'SLOT_LOSS',
+    note: 'pins WHICH change rescues the cohort: collapse the ceiling onto --max-late and the bug is back',
+    opts: { lateCeilingMin: DEFAULT_MAX_LATE_MIN },
+    build: () => {
+      const r = dailyRoutine();
+      const runs = [];
+      for (let d = 1; d <= 14; d += 1) {
+        const slot = Date.parse('2026-08-26T13:00:00Z') - d * DAY;
+        runs.push({
+          triggerId: 'tttttttt-0000-0000-0000-000000000001',
+          status: 'completed',
+          triggeredAt: iso(slot + 7 * HOUR),
+        });
+      }
+      return fakeTransport([r], { [r.id]: runs });
+    },
+    assert: (r) => {
+      const f = r.findings[0];
+      if (!f) return 'expected a finding';
+      if (f.lateCount !== 0) return 'with one bar there is no LATE bucket to fall into';
+      return f.lost === f.expected ? true : `expected all ${f.expected} slots lost, got ${f.lost}`;
+    },
+  },
+  {
+    name: 'trap 9 — SLOT_LOSS OUTRANKS LATE_DISPATCH, and both counts survive on the row',
+    expect: 'SLOT_LOSS',
+    note: 'a real dispatch failure must not be downgraded by late neighbours (nor hide them)',
+    build: () => {
+      const r = dailyRoutine();
+      const runs = [];
+      // 08-12..08-23 served +7h (late); 08-24 and 08-25 get no run at all.
+      for (let d = 3; d <= 14; d += 1) {
+        const slot = Date.parse('2026-08-26T13:00:00Z') - d * DAY;
+        runs.push({
+          triggerId: 'tttttttt-0000-0000-0000-000000000001',
+          status: 'completed',
+          triggeredAt: iso(slot + 7 * HOUR),
+        });
+      }
+      return fakeTransport([r], { [r.id]: runs });
+    },
+    assert: (r) => {
+      const f = r.findings[0];
+      if (!f) return 'expected a finding';
+      if (f.lost !== 2) return `expected exactly the 2 runless slots lost, got ${f.lost}`;
+      if (f.lateCount !== 12) return `expected 12 late-served slots carried on the row, got ${f.lateCount}`;
+      return true;
+    },
+  },
+  {
+    name: 'trap 9 — the late ceiling REFUSES an outlier: +30h credits, +80h stays LOST',
+    expect: 'SLOT_LOSS',
+    note: 'the 11ff643f weekly shape — the ceiling must not become a blanket amnesty',
+    opts: { minLost: 1 },
+    build: () => {
+      const r = dailyRoutine();
+      r.triggers[0].cronExpression = '0 13 * * 1'; // Mondays: 08-17 and 08-24 in window
+      return fakeTransport([r], {
+        [r.id]: [
+          // 08-17 slot + 80h — BEYOND the 72h ceiling, so genuinely unserved.
+          { triggerId: 'tttttttt-0000-0000-0000-000000000001', status: 'completed', triggeredAt: iso(Date.parse('2026-08-17T13:00:00Z') + 80 * HOUR) },
+          // 08-24 slot + 30h — inside the ceiling, so LATE and not a loss.
+          { triggerId: 'tttttttt-0000-0000-0000-000000000001', status: 'completed', triggeredAt: iso(Date.parse('2026-08-24T13:00:00Z') + 30 * HOUR) },
+        ],
+      });
+    },
+    assert: (r) => {
+      const f = r.findings[0];
+      if (!f) return 'expected a finding';
+      if (f.expected !== 2) return `expected 2 Monday slots, got ${f.expected}`;
+      if (f.lost !== 1) return `expected the +80h slot LOST, got lost=${f.lost}`;
+      if (f.lateCount !== 1) return `expected the +30h slot LATE, got lateCount=${f.lateCount}`;
+      if (f.firstLostAt !== '2026-08-17T13:00:00.000Z') return `wrong slot blamed: ${f.firstLostAt}`;
+      return true;
+    },
+  },
+  {
+    name: 'trap 10 — out-of-window runs render the RUN-ROW COUNT, never the word NEVER',
+    expect: 'SLOT_LOSS',
+    note: 'the exact 11ff643f mis-report: --days=14 printed "last served NEVER" for a routine that had fired',
+    build: () => {
+      const r = dailyRoutine({ createdAt: '2026-07-01T00:00:00Z' });
+      // The only run row predates the 14d window entirely.
+      return fakeTransport([r], {
+        [r.id]: [
+          { triggerId: 'tttttttt-0000-0000-0000-000000000001', status: 'completed', triggeredAt: '2026-07-20T13:00:00Z' },
+        ],
+      });
+    },
+    assert: (r) => {
+      const f = r.findings[0];
+      if (!f) return 'expected a finding';
+      if (f.lastCreditedAt !== null) return 'no slot in this window can be credited by a 07-20 run';
+      if (f.runRowCount !== 1) return `expected runRowCount=1 (the universal), got ${f.runRowCount}`;
+      if (f.lastRunAt !== '2026-07-20T13:00:00.000Z') return `expected lastRunAt off the run row, got ${f.lastRunAt}`;
+      const text = renderReport(r).join('\n');
+      if (/NEVER/.test(text)) return 'the word NEVER is still printed for a window-scoped null';
+      if (!/1 run row\(s\) exist, newest 2026-07-20/.test(text)) return 'report does not state the run-row count';
+      return true;
+    },
+  },
+  {
+    name: 'trap 10 — a trigger with ZERO run rows DOES earn the universal claim',
+    expect: 'SLOT_LOSS',
+    note: 'the honest "never" must stay sayable, or the fix trades one false reading for another',
+    build: () => fakeTransport([dailyRoutine()], { 'aaaaaaaa-0000-0000-0000-000000000001': [] }),
+    assert: (r) => {
+      const f = r.findings[0];
+      if (!f) return 'expected a finding';
+      if (f.runRowCount !== 0) return `expected runRowCount=0, got ${f.runRowCount}`;
+      const text = renderReport(r).join('\n');
+      return /no run row has EVER existed for this trigger/.test(text)
+        ? true
+        : 'a genuinely never-fired trigger must say so';
+    },
+  },
 ];
 
 async function selftest() {
   let pass = 0;
   const seen = new Set();
   for (const c of CONTROLS) {
-    const result = await sweep(c.build(), { now: T_NOW, days: DEFAULT_DAYS });
+    const result = await sweep(c.build(), { now: T_NOW, days: DEFAULT_DAYS, ...(c.opts || {}) });
     seen.add(result.verdict);
     let ok = result.verdict === c.expect;
     let detail = ok ? '' : `verdict ${result.verdict}, expected ${c.expect}`;
@@ -956,7 +1253,7 @@ async function selftest() {
     console.log(`${ok ? 'PASS' : 'FAIL'}  ${c.name}${c.note ? `  [${c.note}]` : ''}${detail ? ` — ${detail}` : ''}`);
   }
   console.log(`\n${pass}/${CONTROLS.length} controls pass; verdicts reachable: ${[...seen].sort().join(', ')}`);
-  for (const v of ['CLEAN', 'SLOT_LOSS', 'BLIND']) {
+  for (const v of ['CLEAN', 'SLOT_LOSS', 'LATE_DISPATCH', 'BLIND']) {
     if (!seen.has(v)) console.log(`WARN  verdict ${v} was never reached by any control`);
   }
   return pass === CONTROLS.length ? 0 : 1;
@@ -1008,12 +1305,15 @@ async function main() {
         '  --days=N        lookback window (default 14)',
         '  --grace=N       minutes a slot gets before it is judged (default 20)',
         '  --max-late=N    minutes a run may lag its slot and still credit it (default 360)',
+        '  --late-ceiling=N  minutes past --max-late a run still credits its slot as',
+        '                  LATE_SERVED rather than LOST (default 4320 = 72h)',
         '  --min-lost=N    lost slots before a trigger is a finding (default 2)',
         '  --run-limit=N   /runs page size; a full page inside the window reads BLIND (default 200)',
         '  --json          machine-readable',
         '  --selftest      run the controls',
         '',
-        '  0 CLEAN · 1 SLOT_LOSS · 2 usage · 3 BLIND;  BLIND > SLOT_LOSS > CLEAN',
+        '  0 CLEAN · 1 SLOT_LOSS · 2 usage · 3 BLIND · 4 LATE_DISPATCH;',
+        '  BLIND > SLOT_LOSS > LATE_DISPATCH > CLEAN',
       ].join('\n'),
     );
     return 2;
@@ -1025,6 +1325,7 @@ async function main() {
     days: numArg('days', DEFAULT_DAYS),
     graceMin: numArg('grace', DEFAULT_GRACE_MIN),
     maxLateMin: numArg('max-late', DEFAULT_MAX_LATE_MIN),
+    lateCeilingMin: numArg('late-ceiling', DEFAULT_LATE_CEILING_MIN),
     minLost: numArg('min-lost', DEFAULT_MIN_LOST),
   });
 
