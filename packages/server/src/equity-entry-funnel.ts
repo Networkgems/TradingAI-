@@ -67,6 +67,32 @@
 // generated no candidates did not reject 0 candidates for a reason — it had NO
 // candidates — and those two must never collide.
 
+// ── TRA-4998 — THE DURABLE TWIN ──────────────────────────────────────────────
+// Everything above remains true and unchanged: these counters are since-boot, and
+// that is the trade TRA-1768 deliberately made. What did not survive contact with
+// the reboot schedule is the *premise* that a reader gets to look within the
+// session. bqb1 restarts ~6x/day, so the 2026-09-30 cell QuantTrader had to report
+// as unexplained (60,592 presented at the churn brake, 0 admitted) was unreadable
+// here by construction — measured on prod at 2026-10-01T21:41Z, 13 min after a
+// post-close boot, every `cumulative.*` field on all four engines read `null`.
+//
+// So each hook below ALSO folds into `equity-entry-funnel-ledger.ts`, a durable
+// per-ET-day twin keyed `(etDay, mode, engineId)` and rebuilt on boot — the
+// `churn-brake-guard.jsonl` pattern. The hooks are the chokepoints that already
+// exist; nothing in signal-engine.ts changes, and the observe-only invariant above
+// is preserved (the ledger places no order, gates nothing, and swallows+counts
+// every IO failure).
+import {
+  clearEquityEntryFunnelLedger,
+  ledgerRecordPassIterated,
+  ledgerRecordPassGated,
+  ledgerRecordSymbolEvaluated,
+  ledgerRecordSymbolSkipped,
+  ledgerRecordCandidate,
+  ledgerRecordRejected,
+  ledgerRecordAdmitted,
+} from './equity-entry-funnel-ledger.js';
+
 /** Which book the funnel row describes. Demo and live are NEVER pooled. */
 export type EquityEntryMode = 'demo' | 'live';
 
@@ -430,6 +456,7 @@ export function beginEquityEntryPass(
   led.lastPassSymbolsSkippedSymbols = {};
   led.lastPassSymbolsSkippedTruncated = false;
   led.cumSymbolsConsidered += opts.symbolsConsidered;
+  ledgerRecordPassIterated(mode, engineId, opts.symbolsConsidered, at); // TRA-4998
 }
 
 /**
@@ -479,6 +506,11 @@ export function recordEquityEntryPassGated(
   // clean close, not a truncation.
   if (slot.open !== null && !slot.open.complete) led.passesTruncated += 1;
   slot.open = null;
+  // TRA-4998 — the durable twin records the gate reason AND its detail, so a day
+  // whose every pass was held reads `all_passes_gated` + the named gate, not a bare
+  // zero. `led.lastPassGateBlockedDetail` (not `detail`) on purpose: that is the
+  // reason-keyed value, so the pair can never disagree across the two ledgers.
+  ledgerRecordPassGated(mode, engineId, reason, led.lastPassGateBlockedDetail, at);
 }
 
 /**
@@ -499,6 +531,7 @@ export function recordEquityEntryPassGated(
 export function recordEquitySymbolEvaluated(mode: EquityEntryMode, engineId: string): void {
   const slot = slotFor(mode, engineId);
   slot.led.cumSymbolsEvaluated += 1;
+  ledgerRecordSymbolEvaluated(mode, engineId); // TRA-4998
   const pass = slot.open;
   if (!pass) return;
   pass.symbolsEvaluated += 1;
@@ -525,6 +558,7 @@ export function recordEquitySymbolSkipped(
   const slot = slotFor(mode, engineId);
   const led = slot.led;
   bump(led.cumSymbolsSkipped, reason); // TRA-1834 — cumulative BEFORE the guard (see above)
+  ledgerRecordSymbolSkipped(mode, engineId, reason); // TRA-4998
   // TRA-1835 — the since-boot per-symbol tally, in-universe only. Folds cumulatively (before
   // the open-pass guard) so an intermittently-dark name's history survives across passes.
   if (opts?.inUniverse && opts.symbol) {
@@ -568,6 +602,7 @@ export function recordEquityCandidate(mode: EquityEntryMode, engineId: string, s
   const led = slot.led;
   led.cumCandidates += 1;
   bump(led.cumBySource, source);
+  ledgerRecordCandidate(mode, engineId, source); // TRA-4998
   const pass = slot.open;
   if (pass) {
     pass.candidates += 1;
@@ -580,6 +615,7 @@ export function recordEquityEntryRejected(mode: EquityEntryMode, engineId: strin
   const slot = slotFor(mode, engineId);
   const led = slot.led;
   bump(led.cumRejected, reason);
+  ledgerRecordRejected(mode, engineId, reason); // TRA-4998
   const pass = slot.open;
   if (pass) {
     bump(pass.rejected, reason);
@@ -593,6 +629,7 @@ export function recordEquityEntryAdmitted(mode: EquityEntryMode, engineId: strin
   const led = slot.led;
   led.cumAdmitted += 1;
   led.lastAdmittedAt = at;
+  ledgerRecordAdmitted(mode, engineId, at); // TRA-4998
   const pass = slot.open;
   if (pass) {
     pass.admitted += 1;
@@ -752,7 +789,8 @@ export function summarizeEquityEntryFunnel(): { demo: EquityEntryFunnelBlock[]; 
   return out;
 }
 
-/** Test-only: drop all state back to boot. */
+/** Test-only: drop all state back to boot — the durable TRA-4998 twin included. */
 export function __resetEquityEntryFunnelForTests(): void {
   SLOTS.clear();
+  clearEquityEntryFunnelLedger();
 }

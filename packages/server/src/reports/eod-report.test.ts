@@ -178,7 +178,13 @@ describe('generateEodReport', () => {
     expect(report.trades).toHaveLength(0);
     expect(report.totalTrades).toBe(0);
     expect(report.realizedPnl).toBe(0);
-    expect(report.winRate).toBe(0);
+    // TRA-4998 defect B — was `toBe(0)`. A day that closed NO trade has no win rate;
+    // reporting 0 made "nothing traded" render identically to "traded and lost every
+    // one". `null` is the no-reading value. (`expectancy`/`maxDrawdown`/`sharpeRatio`
+    // below are deliberately left at 0 — they are not ratios over an empty
+    // denominator in the same way, and QuantTrader's acceptance names winRate/avgRR.)
+    expect(report.winRate).toBeNull();
+    expect(report.avgRR).toBeNull();
     // TRA-208: backtest-parity metrics — all zero when no trades closed.
     expect(report.expectancy).toBe(0);
     expect(report.maxDrawdown).toBe(0);
@@ -319,6 +325,121 @@ describe('generateEodReport', () => {
     expect(report.signalAccuracy.totalSignals).toBe(3);
     expect(report.signalAccuracy.winningSignals).toBe(2);
     expect(report.signalAccuracy.winRate).toBeCloseTo(2 / 3, 3);
+    // TRA-4998 — all three resolved, so the resolved denominator equals the total and
+    // the rate is unchanged by the fix. This is the direction that must NOT become null.
+    expect(report.signalAccuracy.resolvedSignals).toBe(3);
+    expect(report.signalAccuracy.unresolvedSignals).toBe(0);
+    expect(report.signalAccuracy.winRateBasis).toBe('resolved');
+  });
+
+  // ── TRA-4998 defect B ──────────────────────────────────────────────────────
+  //
+  // `signalAccuracy.winRate` reported `0` on an empty denominator. Prod 2026-09-30:
+  // `totalSignals: 557, winRate: 0, totalTrades: 0` — which is NOT a 0% hit rate, it
+  // is 557 signals of which zero had resolved. It rendered identically to a signal set
+  // that fired 557 times and was wrong every single time.
+  //
+  // QuantTrader's acceptance is explicitly two-directional: "a change that makes every
+  // day read `null` is the same defect with the sign flipped, and I will grade it that
+  // way." So every case below is paired with its opposite.
+  describe('TRA-4998 — winRate on an empty vs a real denominator', () => {
+    const today = () => new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    const ts = () => new Date(`${today()}T10:00:00`).getTime();
+
+    const run = (dailySignals: Parameters<typeof generateEodReport>[0]['dailySignals']) =>
+      generateEodReport({
+        state: makeEngineState(),
+        allClosedPositions: [],
+        dailySignals,
+        signalTypeMap: new Map(),
+      });
+
+    it('signals fired but NONE resolved ⇒ winRate null, basis `unresolved` (the 09-30 shape)', () => {
+      // `outcome` is filled in only when the position closes, so an open signal has
+      // none. The old formula counted every one of these as a non-winner.
+      const report = run([
+        { id: 's1', symbol: 'AAPL', type: 'orb_breakout' as const, firedAt: ts() },
+        { id: 's2', symbol: 'MSFT', type: 'reversal' as const, firedAt: ts() + 1 },
+        { id: 's3', symbol: 'NVDA', type: 'orb_breakout' as const, firedAt: ts() + 2 },
+      ]);
+      expect(report.signalAccuracy.totalSignals).toBe(3);
+      expect(report.signalAccuracy.resolvedSignals).toBe(0);
+      expect(report.signalAccuracy.unresolvedSignals).toBe(3);
+      expect(report.signalAccuracy.winRate).toBeNull();
+      expect(report.signalAccuracy.avgRR).toBeNull();
+      expect(report.signalAccuracy.winRateBasis).toBe('unresolved');
+    });
+
+    it('resolved signals that ALL LOST ⇒ a real 0, never null — the alarm stays reachable', () => {
+      const report = run([
+        { id: 's1', symbol: 'AAPL', type: 'orb_breakout' as const, firedAt: ts(), outcome: 'loss' as const, rr: -1 },
+        { id: 's2', symbol: 'MSFT', type: 'reversal' as const, firedAt: ts() + 1, outcome: 'loss' as const, rr: -1 },
+      ]);
+      expect(report.signalAccuracy.resolvedSignals).toBe(2);
+      // THE load-bearing assertion of the whole fix: a genuine 0% hit rate must still
+      // serialise as 0. Suppressing this would be the defect with the sign flipped.
+      expect(report.signalAccuracy.winRate).toBe(0);
+      expect(report.signalAccuracy.winRateBasis).toBe('resolved');
+    });
+
+    it('distinguishes "no signals" from "signals that never resolved"', () => {
+      // On prod these BOTH read `winRate: 0` — 10-01 had totalSignals 0 and 09-30 had
+      // 557, and the field could not tell them apart. Now the basis does.
+      const none = run([]);
+      expect(none.signalAccuracy.totalSignals).toBe(0);
+      expect(none.signalAccuracy.winRate).toBeNull();
+      expect(none.signalAccuracy.winRateBasis).toBe('no_signals');
+
+      const unresolved = run([
+        { id: 's1', symbol: 'AAPL', type: 'orb_breakout' as const, firedAt: ts() },
+      ]);
+      expect(unresolved.signalAccuracy.winRateBasis).toBe('unresolved');
+      // Same null rate, different stated basis — two nulls must not share one meaning.
+      expect(none.signalAccuracy.winRate).toBe(unresolved.signalAccuracy.winRate);
+      expect(none.signalAccuracy.winRateBasis).not.toBe(unresolved.signalAccuracy.winRateBasis);
+    });
+
+    it('a partially-resolved day rates only the RESOLVED subset', () => {
+      // 1 win + 1 loss resolved, 2 still open. The honest rate is 1/2, not 1/4.
+      const report = run([
+        { id: 's1', symbol: 'AAPL', type: 'orb_breakout' as const, firedAt: ts(), outcome: 'win' as const, rr: 2 },
+        { id: 's2', symbol: 'MSFT', type: 'reversal' as const, firedAt: ts() + 1, outcome: 'loss' as const, rr: -1 },
+        { id: 's3', symbol: 'NVDA', type: 'orb_breakout' as const, firedAt: ts() + 2 },
+        { id: 's4', symbol: 'AMD', type: 'reversal' as const, firedAt: ts() + 3 },
+      ]);
+      expect(report.signalAccuracy.totalSignals).toBe(4);
+      expect(report.signalAccuracy.resolvedSignals).toBe(2);
+      expect(report.signalAccuracy.unresolvedSignals).toBe(2);
+      expect(report.signalAccuracy.winRate).toBeCloseTo(0.5, 6);
+      // The old denominator would have reported 0.25 — a 2x understatement that reads
+      // as a real measurement.
+      expect(report.signalAccuracy.winRate).not.toBeCloseTo(0.25, 6);
+    });
+
+    it('avgRR divides by the signals that CARRY an R, not by all of them', () => {
+      // The same wrong-denominator bug one line down: this summed the R of the rated
+      // signals and divided by every signal, with Math.max(1, …) turning the empty
+      // case into a confident 0.
+      const report = run([
+        { id: 's1', symbol: 'AAPL', type: 'orb_breakout' as const, firedAt: ts(), outcome: 'win' as const, rr: 2 },
+        { id: 's2', symbol: 'MSFT', type: 'reversal' as const, firedAt: ts() + 1, outcome: 'win' as const, rr: 4 },
+        { id: 's3', symbol: 'NVDA', type: 'orb_breakout' as const, firedAt: ts() + 2 },
+      ]);
+      expect(report.signalAccuracy.avgRR).toBeCloseTo(3, 6); // (2+4)/2
+      expect(report.signalAccuracy.avgRR).not.toBeCloseTo(2, 6); // (2+4)/3, the old answer
+    });
+
+    it('renders a null rate as an em dash with its basis, never as 0.0%', () => {
+      const report = run([
+        { id: 's1', symbol: 'AAPL', type: 'orb_breakout' as const, firedAt: ts() },
+      ]);
+      // The markdown is what a human actually reads; a null that formats as "0.0%"
+      // re-creates the defect downstream of the fix.
+      expect(report.markdown).toContain('| Signal Win Rate | — (unresolved) |');
+      expect(report.markdown).not.toContain('| Signal Win Rate | 0.0% |');
+      expect(report.markdown).toContain('| Win Rate | — |');
+      expect(report.markdown).toContain('| Avg R:R Achieved | — |');
+    });
   });
 
   it('generates valid markdown containing all report sections', () => {

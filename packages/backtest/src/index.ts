@@ -245,7 +245,7 @@ export {
   scoreSignal,
   scoreReplay,
 } from './agent-scoring.js';
-export type { ScoredSignal, AgentScoreReport } from './agent-scoring.js';
+export type { ScoredSignal, AgentScoreReport, ReplayAccuracy } from './agent-scoring.js';
 export {
   reliabilityCurve,
   netOfCostEdge,

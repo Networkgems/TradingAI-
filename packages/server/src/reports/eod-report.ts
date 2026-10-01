@@ -1056,7 +1056,11 @@ function buildMarkdown(
           top5Movers: movers, signalAccuracy, portfolioGreeks } = report;
 
   const pnlSign = (n: number) => (n >= 0 ? '+' : '') + n.toFixed(2);
-  const pct = (n: number) => (n * 100).toFixed(1) + '%';
+  // TRA-4998 — null-safe, matching the other three `pct` helpers in this file. A
+  // no-reading rate renders `—`; it must never be formatted as `0.0%`, which is the
+  // entire defect. Same for the R:R helper below.
+  const pct = (n: number | null | undefined) => (n == null ? '—' : (n * 100).toFixed(1) + '%');
+  const rr = (n: number | null | undefined) => (n == null ? '—' : '1:' + n.toFixed(2));
   const usd = (n: number) => '$' + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
   const tradeRows = trades.map(t =>
@@ -1088,7 +1092,7 @@ ${PNL_LEG_COVERAGE_NOTE}
 | Winners | ${winners} |
 | Losers | ${losers} |
 | Win Rate | ${pct(winRate)} |
-| Avg R:R Achieved | 1:${avgRR.toFixed(2)} |
+| Avg R:R Achieved | ${rr(avgRR)} |
 | Expectancy (avg R / trade) | ${expectancy.toFixed(2)}R |
 | Max Drawdown | ${pct(maxDrawdown)} |
 | Sharpe (per-trade) | ${sharpeRatio.toFixed(2)} |
@@ -1108,8 +1112,10 @@ ${moverRows || '_No data._'}
 |--------|-------|
 | Total Signals Fired | ${signalAccuracy.totalSignals} |
 | Winning Signals | ${signalAccuracy.winningSignals} |
-| Signal Win Rate | ${pct(signalAccuracy.winRate)} |
-| Avg R:R | 1:${signalAccuracy.avgRR.toFixed(2)} |
+| Resolved Signals | ${signalAccuracy.resolvedSignals ?? '—'} |
+| Unresolved (still open) | ${signalAccuracy.unresolvedSignals ?? '—'} |
+| Signal Win Rate | ${pct(signalAccuracy.winRate)}${signalAccuracy.winRate == null ? ` (${signalAccuracy.winRateBasis ?? 'no basis recorded'})` : ''} |
+| Avg R:R | ${rr(signalAccuracy.avgRR)} |
 ${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights, report.journalBasis, report.journalBasisCounts)}${buildIntrospectionMarkdown(introspection, autopilotActions)}${buildStrategyDegradationSection(strategyDegradation)}${buildSourceQualityMarkdown(sourceQualityWeights)}${buildAutonomousDemoLoopMarkdown(autonomousDemoLoop)}${buildAnalystMarkdown(analystPlan, analystReview)}${hypothesisQueue ? buildRatificationQueueMarkdown(hypothesisQueue) : ''}${buildCorrelatedExposureCapMarkdown()}${buildExecutionQualityMarkdown(executionQuality)}`;
 }
 
@@ -1335,8 +1341,12 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
   const winners = trades.filter(t => t.pnl > 0).length;
   const losers = trades.filter(t => t.pnl <= 0).length;
   const totalTrades = trades.length;
-  const winRate = totalTrades > 0 ? winners / totalTrades : 0;
-  const avgRR = totalTrades > 0 ? trades.reduce((sum, t) => sum + Math.abs(t.rr), 0) / totalTrades : 0;
+  // TRA-4998 defect B — `null`, not 0, on an empty denominator. `winRate: 0` over 0
+  // closed trades is an artifact of the division, and it renders identically to a
+  // book that closed trades and lost every one. Three callers formatted it straight
+  // into a dashboard cell as "0.0%".
+  const winRate = totalTrades > 0 ? winners / totalTrades : null;
+  const avgRR = totalTrades > 0 ? trades.reduce((sum, t) => sum + Math.abs(t.rr), 0) / totalTrades : null;
 
   // TRA-208: backtest-parity metrics. Anchor the equity curve at the close-of-
   // day equity *minus* today's realized PnL — that's the equity at session
@@ -1374,15 +1384,41 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
   );
 
   // Signal accuracy
+  //
+  // TRA-4998 defect B. `DailySignalRecord.outcome` is "filled in once the position
+  // closes", so an UNRESOLVED signal carries no outcome at all. The old denominator
+  // was `todaySignals.length`, which counted every one of those as a non-winner:
+  // prod 2026-09-30 reported `totalSignals: 557, winRate: 0`, which is not a 0% hit
+  // rate — it is 557 signals of which zero had resolved. Byte-identical to a signal
+  // set that fired 557 times and was wrong every time.
+  //
+  // The denominator is therefore the RESOLVED set, and it is published beside the
+  // rate so the reading cannot be guessed at.
   const todaySignals = dailySignals.filter(s => dateString(s.firedAt) === today);
+  const resolved = todaySignals.filter(s => s.outcome != null);
   const winningSignals = todaySignals.filter(s => s.outcome === 'win').length;
-  const sigAvgRR = todaySignals.filter(s => s.rr != null).reduce((sum, s) => sum + (s.rr ?? 0), 0)
-    / Math.max(1, todaySignals.length);
+  // The SAME wrong-denominator bug, one line down and independently: this summed the
+  // R multiples of the signals that HAVE one and divided by ALL of today's signals,
+  // and `Math.max(1, …)` then turned the empty case into a confident `0` rather than
+  // "no reading". Divide by the population actually summed.
+  const ratedSignals = todaySignals.filter(s => s.rr != null);
+  const sigAvgRR = ratedSignals.length > 0
+    ? ratedSignals.reduce((sum, s) => sum + (s.rr ?? 0), 0) / ratedSignals.length
+    : null;
   const signalAccuracy: EodSignalAccuracy = {
     totalSignals: todaySignals.length,
     winningSignals,
-    winRate: todaySignals.length > 0 ? winningSignals / todaySignals.length : 0,
+    resolvedSignals: resolved.length,
+    unresolvedSignals: todaySignals.length - resolved.length,
+    // Both directions are live here, deliberately: resolved signals that all lost
+    // still return a real `0` (the alarm must stay reachable), and only an EMPTY
+    // resolved set returns `null`. A change that made every day read `null` would be
+    // this defect with the sign flipped.
+    winRate: resolved.length > 0 ? winningSignals / resolved.length : null,
     avgRR: sigAvgRR,
+    winRateBasis: resolved.length > 0
+      ? 'resolved'
+      : todaySignals.length === 0 ? 'no_signals' : 'unresolved',
   };
 
   const partial: Omit<EodReport, 'markdown'> = {

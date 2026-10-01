@@ -21,7 +21,9 @@ import {
   MacdTrendStrategy,
   type SupertrendConfluenceParams,
 } from '@trading-app/engine';
-import type { Candle, EodSignalAccuracy } from '@trading-app/shared';
+import type { Candle } from '@trading-app/shared';
+// TRA-4998 — the replay-side accuracy shape (non-null winRate/avgRR); see agent-scoring.ts.
+import type { ReplayAccuracy } from './agent-scoring.js';
 import { scoreSignal, summarizeAccuracy, type ScoredSignal } from './agent-scoring.js';
 import { annualizedSharpe, maxDrawdown } from './tra731-metrics.js';
 
@@ -51,8 +53,8 @@ export interface BuyHoldStat {
 export interface SymbolTrackAResult {
   symbol: string;
   bars: number;
-  supertrend: EodSignalAccuracy;
-  macdTrend: EodSignalAccuracy;
+  supertrend: ReplayAccuracy;
+  macdTrend: ReplayAccuracy;
   buyHold: BuyHoldStat;
 }
 
@@ -116,8 +118,8 @@ export function buyHoldStat(symbol: string, bars: readonly Candle[]): BuyHoldSta
 export interface TrackAReport {
   perSymbol: SymbolTrackAResult[];
   /** Pooled SupertrendConfluence accuracy across all symbols. */
-  supertrend: EodSignalAccuracy;
-  macdTrend: EodSignalAccuracy;
+  supertrend: ReplayAccuracy;
+  macdTrend: ReplayAccuracy;
   edgeVsMacd: { winRateDelta: number; avgRDelta: number };
   /** Mean buy-hold total return across symbols. */
   avgBuyHoldReturnPct: number;
@@ -126,7 +128,7 @@ export interface TrackAReport {
 
 const round = (v: number, dp = 4): number => Math.round(v * 10 ** dp) / 10 ** dp;
 
-function poolAccuracy(parts: EodSignalAccuracy[]): EodSignalAccuracy {
+function poolAccuracy(parts: ReplayAccuracy[]): ReplayAccuracy {
   const totalSignals = parts.reduce((a, p) => a + p.totalSignals, 0);
   const winningSignals = parts.reduce((a, p) => a + p.winningSignals, 0);
   // Weighted avg R by signal count.

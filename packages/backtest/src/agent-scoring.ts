@@ -52,19 +52,52 @@ export interface ScoredSignal {
 }
 
 /**
+ * A replay study's accuracy: `EodSignalAccuracy` with `winRate`/`avgRR` narrowed
+ * back to non-null.
+ *
+ * TRA-4998 made those two nullable on the LIVE report, because a live signal's
+ * `outcome` is filled in only when its position closes — so a day can hold 557
+ * signals and zero resolutions, and a rate over that is undefined. **A replay has
+ * no such state.** `ScoredSignal.win` is a `boolean` computed from the look-forward
+ * bars, so every scored signal is resolved by construction and
+ * `resolvedSignals === totalSignals` identically. The narrowing is therefore sound
+ * here and not merely convenient, and it keeps the nullability out of a dozen
+ * research CLIs that legitimately do arithmetic on these numbers.
+ *
+ * ⚠️ One defect is deliberately left standing: an EMPTY scored set still reports
+ * `winRate: 0` rather than `null`, so a study that routed nothing reads as a study
+ * that routed and lost. That is the same bug TRA-4998 fixed on the live path, and it
+ * is out of this ticket's scope (QuantTrader's acceptance is about `/api/reports`).
+ * `totalSignals` sits beside it and is the discriminator in the meantime.
+ */
+export type ReplayAccuracy = Omit<EodSignalAccuracy, 'winRate' | 'avgRR'> & {
+  winRate: number;
+  avgRR: number;
+};
+
+/**
  * Aggregate a set of scored signals into the existing `EodSignalAccuracy`
  * shape. `winRate` is the hit-rate (R > 0); `avgRR` carries the avg realized
  * R-multiple — the EOD path's "avg R:R achieved" column, reused verbatim so the
  * replay study and the live report are directly comparable.
  */
-export function summarizeAccuracy(scored: ScoredSignal[]): EodSignalAccuracy {
+export function summarizeAccuracy(scored: ScoredSignal[]): ReplayAccuracy {
   const totalSignals = scored.length;
   const winningSignals = scored.filter((s) => s.win).length;
   const winRate = totalSignals > 0 ? round(winningSignals / totalSignals) : 0;
   const avgRR = totalSignals > 0
     ? round(scored.reduce((sum, s) => sum + s.r, 0) / totalSignals)
     : 0;
-  return { totalSignals, winningSignals, winRate, avgRR };
+  return {
+    totalSignals,
+    winningSignals,
+    // TRA-4998 — every replay signal is resolved by construction (see ReplayAccuracy).
+    resolvedSignals: totalSignals,
+    unresolvedSignals: 0,
+    winRate,
+    avgRR,
+    winRateBasis: totalSignals > 0 ? 'resolved' : 'no_signals',
+  };
 }
 
 /** Score one signal against the bars strictly after its decision bar. */
@@ -81,9 +114,9 @@ export function scoreSignal(
 
 export interface AgentScoreReport {
   /** Accuracy of the agent's ROUTABLE trades (APPROVE → non-null proposedSignal). */
-  agent: EodSignalAccuracy;
+  agent: ReplayAccuracy;
   /** Accuracy of the deterministic candidate signals that gated the runs. */
-  baseline: EodSignalAccuracy;
+  baseline: ReplayAccuracy;
   /** Agent − baseline edge (positive ⇒ the agent layer added value). */
   edgeVsBaseline: {
     winRateDelta: number;

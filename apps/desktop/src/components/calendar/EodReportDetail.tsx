@@ -3,6 +3,22 @@ import type { EodReport } from '@trading-app/shared';
 import { UNLABELLED_MEASURE, pnlMeasure, deskFoldScope } from './pnl-day';
 import { fmt, fmtDollar } from './format';
 
+/** TRA-4998 — the no-reading glyph, matching the other `—` cells in the calendar. */
+const EM_DASH = '—';
+
+/**
+ * TRA-4998 — render a rate that may legitimately have NO value.
+ *
+ * `EodReport.winRate` and `EodSignalAccuracy.winRate` are `number | null`: null means the
+ * denominator was empty (no closed trade / no resolved signal), so no rate exists.
+ * Formatting that as `0.0%` is the defect the ticket fixes — on prod 2026-09-30 it made
+ * 557 signals with zero resolutions render identically to 557 signals that were all wrong.
+ * A real, measured 0 still prints `0.0%`; that direction must keep working.
+ */
+function fmtRate(rate: number | null | undefined, digits: number): string {
+  return rate == null ? EM_DASH : `${(rate * 100).toFixed(digits)}%`;
+}
+
 export function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => void }) {
   // TRA-3100 — the detail view is where "what does this number actually measure"
   // has to be answerable. The grid badge is a hint; this is the statement.
@@ -42,7 +58,7 @@ export function EodReportDetail({ report, onBack }: { report: EodReport; onBack:
               {fmtDollar(report.combinedPnl)}
             </span>
           )}
-          &nbsp;·&nbsp;Win rate {(report.winRate * 100).toFixed(0)}%
+          &nbsp;·&nbsp;Win rate {fmtRate(report.winRate, 0)}
           &nbsp;·&nbsp;{report.totalTrades} trades
         </span>
       </div>
@@ -212,11 +228,11 @@ export function EodReportDetail({ report, onBack }: { report: EodReport; onBack:
           </div>
           <div className="eod-stat">
             <span className="eod-stat-label">Win Rate</span>
-            <span className="eod-stat-value">{(report.winRate * 100).toFixed(1)}%</span>
+            <span className="eod-stat-value">{fmtRate(report.winRate, 1)}</span>
           </div>
           <div className="eod-stat">
             <span className="eod-stat-label">Avg R:R</span>
-            <span className="eod-stat-value">1:{report.avgRR.toFixed(2)}</span>
+            <span className="eod-stat-value">{report.avgRR == null ? EM_DASH : `1:${report.avgRR.toFixed(2)}`}</span>
           </div>
           <div className="eod-stat">
             <span className="eod-stat-label">Signals Fired</span>
@@ -225,7 +241,7 @@ export function EodReportDetail({ report, onBack }: { report: EodReport; onBack:
           <div className="eod-stat">
             <span className="eod-stat-label">Signal Win %</span>
             <span className="eod-stat-value">
-              {(report.signalAccuracy.winRate * 100).toFixed(1)}%
+              {fmtRate(report.signalAccuracy.winRate, 1)}
             </span>
           </div>
         </div>

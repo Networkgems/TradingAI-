@@ -346,6 +346,7 @@ import {
 import { isScaleoutLadderEnabled } from '../scaleout-ladder-flag.js';
 import { summarizeScaleoutLadder } from '../scaleout-ladder-ledger.js';
 import { summarizeEquityEntryFunnel } from '../equity-entry-funnel.js'; // TRA-1768
+import { summarizeEquityEntryFunnelLedger } from '../equity-entry-funnel-ledger.js'; // TRA-4998
 import {
   isSessionEdgeBlackoutEnabled,
   resolveSessionEdgeBlackoutMinutes,
@@ -8432,6 +8433,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // silently. cumulative.symbolsSkippedByName (reason → symbol → n) splits a name dark EVERY pass
       // (dead subscription) from one dark occasionally (jitter) — read each against iteratedPassCount.
       symbolNamesNote: 'lastPass.symbolsSkippedSymbols names the ACTUAL in-universe tickers skipped last pass (reason → string[]); off_swing_universe is intentionally NOT named. {} = iterated pass, no in-universe drop; null = no iterated pass since boot. symbolsSkippedSymbolsTruncated flags a capped list (never silently cut). cumulative.symbolsSkippedByName (reason → symbol → count) is the since-boot per-symbol tally: divide by iteratedPassCount for the dark-rate — 100% ⇒ a broken feed subscription, low ⇒ normal jitter.',
+      // TRA-4998 defect A — THE DURABLE PER-ET-DAY FOLD. Everything above is since-boot,
+      // so on bqb1 (≈6 restarts/day) a reader asking about any PAST session gets all-null
+      // and cannot attribute an `admitted: 0` day to a stage. `retained.byEtDay[]` carries
+      // the same stage counters per (ET day, mode) and `zeroedAtStage`/`zeroedCount`/
+      // `zeroedDetail` name the first blocking stage outright.
+      retained: summarizeEquityEntryFunnelLedger(),
+      // The read ORDER between the two blocks, on the wire — the since-boot block is the
+      // one that looks authoritative and is the one that evaporates.
+      retainedReadRule: 'For ANY question about a past ET day, read `retained.byEtDay` — NOT the since-boot demo/live blocks, which read all-null on a box that booted after that session (bqb1 restarts ~6x/day; this is why TRA-4971 had to report the 2026-09-30 admitted:0 cell as unexplained). On any retained day with admitted:0, `zeroedAtStage` names the first blocking stage in funnel order (no_passes → all_passes_gated → no_symbols_evaluated → no_candidates → all_candidates_rejected), `zeroedCount` is how many that stage accounted for, and `zeroedDetail` is its biggest named bucket. A day ABSENT from retained.byEtDay is UNRECORDED (it predates this ledger, deployed 2026-10-01) — never read it as "nothing happened". Check `retained.durability.ephemeral` first: true ⇒ every retained count dies at the next redeploy and this block is no better than the since-boot one.',
       note: 'candidatesEvaluated is three-valued: null = no ITERATED pass since boot (says nothing about the signal side), 0 = a pass ran and generated NO candidates (THE ALARM — the strategy is dry, no guardrail can be blamed), >0 = ideas exist. If candidatesEvaluated > 0 and admitted = 0, rejectedByReason names the guardrail eating them. passGateBlockedReason is set when the pass FIRED but never iterated (market closed / halted / auto-trading off) — that is NOT a strategy verdict and candidatesEvaluated stays null. Counters are SINCE-BOOT and in-memory by design: DATA_DIR is ephemeral (TRA-1719), so a durable counter here would be pinned at 0 forever; this instrument needs n=1 and reads correctly on the FIRST tick after a deploy. There is deliberately NO min_holding_days bucket — that guardrail gates discretionary CLOSES, never entries, so the bucket could never increment. TRA-1834 — demo/live are LISTS of per-engine blocks (each with engineId + label), never pooled: two demo engines shared one ledger before, and a gated tick on one nulled the other pass mid-sweep, silently DROPPING symbolsEvaluated/symbolsSkippedByReason. passesTruncated is the sentinel — it MUST be 0; a non-zero value means an engineId collision and those two symbol counters are lower bounds, not real counts.',
     });
   });

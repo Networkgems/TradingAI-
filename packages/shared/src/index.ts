@@ -5978,8 +5978,55 @@ export interface EodSignalAccuracy {
   totalSignals: number;
   /** Signals that closed with profit (TP hit) */
   winningSignals: number;
-  winRate: number;
-  avgRR: number;
+  /**
+   * TRA-4998 defect B — signals whose outcome has RESOLVED (`win` or `loss`).
+   * **This is the `winRate` denominator**, and it is published because the rate is
+   * uninterpretable without it.
+   *
+   * It is NOT `totalSignals`. A `DailySignalRecord.outcome` is filled in only once
+   * the position closes, so a signal fired at 15:55 and still open at the archive
+   * carries no outcome — it cannot be a winner, and dividing by `totalSignals`
+   * silently counted it as a loser. On 2026-09-30 prod reported
+   * `totalSignals: 557, winRate: 0`: not a 0% hit rate, but 557 signals of which
+   * zero had resolved. That rendered identically to a signal set that fired 557
+   * times and was wrong every time — a five-alarm emergency — and the benign
+   * reading is the one a dashboard invites.
+   *
+   * OPTIONAL for back-compat: reports archived before this field existed do not
+   * carry it. **Absent = UNKNOWN, never 0** — a legacy snapshot cannot say how many
+   * of its signals resolved, which is exactly why {@link winRate} is served as
+   * `null` on those days (see {@link winRateBasis}).
+   */
+  resolvedSignals?: number;
+  /**
+   * TRA-4998 — signals still carrying no outcome at report time. Cannot win and must
+   * never count as losses. Optional for the same back-compat reason; absent = UNKNOWN.
+   */
+  unresolvedSignals?: number;
+  /**
+   * Winning share of the RESOLVED signals.
+   *
+   * ⚠️ `null` is a first-class value here and means **no rate is defined** — never
+   * render it as 0%. `0` means a real, measured 0%: signals resolved and none of
+   * them won. {@link winRateBasis} says which flavour of `null` you are looking at.
+   */
+  winRate: number | null;
+  /** Mean R multiple over the signals that carry one. `null` when none do. */
+  avgRR: number | null;
+  /**
+   * TRA-4998 — WHY `winRate` reads the way it does. Two different `null`s must not
+   * share a serialization:
+   *
+   *   `resolved`      — a real rate over a non-empty resolved denominator.
+   *   `no_signals`    — no signal fired at all this day.
+   *   `unresolved`    — signals fired, NONE resolved ⇒ no rate exists yet.
+   *   `legacy_unknown`— an archived pre-TRA-4998 snapshot. Its stored `winRate` was
+   *                     `winningSignals / totalSignals`, a wrong-denominator ratio
+   *                     whose resolved count was never recorded, so it is suppressed
+   *                     rather than restated. Optional: absent on pre-fix snapshots
+   *                     that nothing has normalized.
+   */
+  winRateBasis?: 'resolved' | 'no_signals' | 'unresolved' | 'legacy_unknown';
 }
 
 /**
@@ -6048,8 +6095,17 @@ export interface EodReport {
   openPositionCount: number;
 
   // Performance
-  winRate: number;         // % of closed trades that were winners
-  avgRR: number;           // average risk-reward achieved
+  /**
+   * Share of closed trades that were winners.
+   *
+   * TRA-4998 defect B — `null` when `totalTrades === 0`, NEVER 0. A day that closed
+   * no trade has no win rate; serializing that as `0` made "nothing traded" render
+   * identically to "everything traded lost", and the two call for opposite responses.
+   * Render `null` as `—`, never as `0%`.
+   */
+  winRate: number | null;
+  /** Average risk-reward achieved. `null` when no trade closed — see {@link winRate}. */
+  avgRR: number | null;
   totalTrades: number;
   winners: number;
   losers: number;

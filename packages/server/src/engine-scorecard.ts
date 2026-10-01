@@ -2,8 +2,10 @@ import { existsSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
-import type { EodSignalAccuracy } from '@trading-app/shared';
-import type { AgentScoreReport } from '@trading-app/backtest';
+// TRA-4998 — `ReplayAccuracy`, not `EodSignalAccuracy`: the replay side keeps
+// `winRate`/`avgRR` non-null (every scored signal resolves by construction), which is
+// what lets the `rSum += s.avgRR * s.totalSignals` weighting below stay arithmetic.
+import type { AgentScoreReport, ReplayAccuracy } from '@trading-app/backtest';
 import { logger } from './observability/index.js';
 import type { ForwardTestReport } from './options-forward-test.js';
 
@@ -178,7 +180,7 @@ export function poolProposalScores(reports: readonly AgentScoreReport[]): {
   horizonBars: number | null;
   totalRecommendations: number;
 } {
-  const poolSide = (pick: (r: AgentScoreReport) => EodSignalAccuracy): AccuracyPair => {
+  const poolSide = (pick: (r: AgentScoreReport) => ReplayAccuracy): AccuracyPair => {
     let n = 0;
     let wins = 0;
     let rSum = 0;

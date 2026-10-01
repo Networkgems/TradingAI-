@@ -66,8 +66,13 @@ export function buildDeskDayReport(
   const losers = closedRows.filter((r) => r.outcome === 'LOSS').length;
   const optionsPnl = closedRows.reduce((acc, r) => acc + (r.realizedPnlUsd ?? 0), 0);
   const sumR = closedRows.reduce((acc, r) => acc + (r.realizedR ?? 0), 0);
-  const avgRR = totalTrades > 0 ? sumR / totalTrades : 0;
-  const winRate = totalTrades > 0 ? winners / totalTrades : 0;
+  // TRA-4998 — `null`, not 0, when nothing closed. `expectancy` below keeps a numeric
+  // 0 deliberately: it is typed `number` on EodReport and is an average R, not a ratio
+  // over an empty denominator in the sense this ticket is about; widening it is a
+  // separate change with its own consumers.
+  const avgRR = totalTrades > 0 ? sumR / totalTrades : null;
+  const winRate = totalTrades > 0 ? winners / totalTrades : null;
+  const expectancy = avgRR ?? 0;
 
   return {
     date,
@@ -87,11 +92,16 @@ export function buildDeskDayReport(
     totalTrades,
     winners,
     losers,
-    expectancy: avgRR,
+    expectancy,
     maxDrawdown: 0,
     sharpeRatio: 0,
     top5Movers: [],
-    signalAccuracy: { totalSignals: 0, winningSignals: 0, winRate: 0, avgRR: 0 },
+    // TRA-4998 — the desk cell is an option-journal fold and carries no signal census
+    // at all, so every field here is "no reading", not a measured zero.
+    signalAccuracy: {
+      totalSignals: 0, winningSignals: 0, resolvedSignals: 0, unresolvedSignals: 0,
+      winRate: null, avgRR: null, winRateBasis: 'no_signals',
+    },
     // TRA-1413 — the desk cell is a live journal fold, not an archived narrative
     // report; the markdown body is unused by the calendar grid/detail, so it's a
     // one-line provenance stamp rather than a generated report.

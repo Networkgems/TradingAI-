@@ -179,8 +179,26 @@ describe('buildJournalCalendarCells — journal → cells, de-noise not optional
 describe('buildDeskDayReport', () => {
   it('reads a flat (no-close) day as $0, not missing data', () => {
     const cell = buildDeskDayReport('2026-07-01', [], GEN);
+    // A flat day's P&L is a GENUINE zero: nothing closed, so $0 was realized. That is
+    // this test's point and it is unchanged.
     expect(cell.combinedPnl).toBe(0);
     expect(cell.totalTrades).toBe(0);
-    expect(cell.winRate).toBe(0);
+    // TRA-4998 — but a flat day's WIN RATE is not zero, it is undefined: 0/0 trades
+    // won. This assertion used to read `toBe(0)`, bundling a real measurement
+    // (combinedPnl) and a division artifact (winRate) under one "flat day" heading.
+    // They are different facts and only one of them is a number.
+    expect(cell.winRate).toBeNull();
+    expect(cell.avgRR).toBeNull();
+  });
+
+  it('TRA-4998 — a desk day that DID close trades still reports a real rate', () => {
+    // The negative control for the assertion above: the null must come from the empty
+    // denominator, not from the field having been blanket-nulled.
+    const cell = buildDeskDayReport('2026-07-01', [
+      closed({ id: 'w', closeTs: JUL01, realizedPnlUsd: 100 }),
+      closed({ id: 'l', closeTs: JUL01, realizedPnlUsd: -50 }),
+    ], GEN);
+    expect(cell.totalTrades).toBe(2);
+    expect(cell.winRate).toBeCloseTo(0.5, 6);
   });
 });

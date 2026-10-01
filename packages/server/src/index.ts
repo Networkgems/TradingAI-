@@ -257,6 +257,7 @@ import {
 import { hydrateScaleoutLadderFromDisk } from './scaleout-ladder-ledger.js';
 import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
 import { hydrateChurnBrakeGuardFromDisk } from './churn-brake-ledger.js';
+import { hydrateEquityEntryFunnelFromDisk } from './equity-entry-funnel-ledger.js';
 import { hydrateRvScanCensusFromDisk } from './rv-scan-census-ledger.js'; // TRA-4350
 import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 // TRA-4343 — the durable entry-site census + the since-boot vacuity disclosure.
@@ -4056,8 +4057,10 @@ function makeRealizedBackfillReport(
       availableCash: 0,
       trades: [],
       openPositionCount: 0,
-      winRate: 0,
-      avgRR: 0,
+      // TRA-4998 — this cell carries no closed-trade detail, so there is no win rate to
+      // report. `null` = no reading; 0 would claim every trade lost.
+      winRate: null,
+      avgRR: null,
       totalTrades: closeCount,
       winners: 0,
       losers: 0,
@@ -4065,7 +4068,13 @@ function makeRealizedBackfillReport(
       maxDrawdown: 0,
       sharpeRatio: 0,
       top5Movers: [],
-      signalAccuracy: { totalSignals: 0, winningSignals: 0, winRate: 0, avgRR: 0 },
+      // TRA-4998 — a SYNTHESIZED cell measured nothing, so its rates are `null`, not 0.
+      // A stub that publishes 0 is the defect this ticket fixes, minted by the fix's own
+      // neighbours: it reads as a measured 0% to every consumer downstream.
+      signalAccuracy: {
+        totalSignals: 0, winningSignals: 0, resolvedSignals: 0, unresolvedSignals: 0,
+        winRate: null, avgRR: null, winRateBasis: 'no_signals',
+      },
       markdown: '',
     };
   const priorBody = base.markdown.replace(
@@ -4526,7 +4535,11 @@ async function buildLiveTodayCellReport(
     maxDrawdown: 0,
     sharpeRatio: 0,
     top5Movers: [],
-    signalAccuracy: { totalSignals: 0, winningSignals: 0, winRate: 0, avgRR: 0 },
+    // TRA-4998 — see the sibling stub above: an unmeasured rate is `null`, never 0.
+    signalAccuracy: {
+      totalSignals: 0, winningSignals: 0, resolvedSignals: 0, unresolvedSignals: 0,
+      winRate: null, avgRR: null, winRateBasis: 'no_signals',
+    },
     pnlSource: 'live-intraday',
     markdown: header,
   };
@@ -4665,6 +4678,22 @@ async function runLiveRealizedCalendarBackfill(): Promise<void> {
   const h = hydrateChurnBrakeGuardFromDisk(DATA_DIR);
   if (h.records > 0) {
     log.info('churn-brake open-cap guard ledger hydrated (TRA-4335)', {
+      records: h.records,
+      days: h.days,
+    });
+  }
+}
+
+// TRA-4998 — hydrate the DURABLE per-ET-day equity entry funnel. Its since-boot
+// twin on `/api/health/equity-entry-funnel` reads ALL-NULL on any box that booted
+// after the session it is being asked about (bqb1 restarts ~6x/day), which is why
+// the 2026-09-30 `admitted: 0` cell could not be attributed to a stage. This fold
+// is what names the stage instead. Best-effort; compacted to a 30-day window —
+// the SAME window `churn-brake-guard.jsonl` keeps, so the two chain.
+{
+  const h = hydrateEquityEntryFunnelFromDisk(DATA_DIR);
+  if (h.records > 0) {
+    log.info('equity entry funnel ledger hydrated (TRA-4998)', {
       records: h.records,
       days: h.days,
     });
