@@ -75,12 +75,47 @@ export interface ContainerReading {
   nested: number | null;
 }
 
+/**
+ * TRA-4986 (AC3) — the published disposition of one retainer: what bounds it,
+ * or why it is allowed not to be bounded.
+ *
+ * Exists because "unbounded" and "unbounded ON PURPOSE, for this reason" are
+ * different readings and the census could not tell them apart. A reader looking
+ * at `signalEngine.dynamicSymbols` growing +433/24 h has no way, from counts
+ * alone, to know whether that is a leak or the faithful mirror of a persisted
+ * store whose growth is real and is capped somewhere else — and the expensive
+ * mistake is capping the mirror, which fixes the reading and not the thing.
+ */
+export interface RetainerBoundNote {
+  /**
+   * The published cap, or `null` for "deliberately unbounded". `null` is a
+   * CLAIM backed by {@link reason}, never the absence of one.
+   */
+  bound: number | null;
+  /** The eviction rule when bounded; why unboundedness is correct when not. */
+  reason: string;
+  /** Where the bound actually lives, when it is not on this container. */
+  boundedBy?: string;
+}
+
 export interface CensusOptions {
   /**
    * Sum the lengths of array-valued `Map`/`Set`/`Array` members. O(entries).
    * Off by default so the sampled path stays O(#fields).
    */
   deep?: boolean;
+  /**
+   * TRA-4986 — `<klass>.<key>` -> its published bound/reason, attached to the
+   * matching {@link RetainerRow.note}.
+   *
+   * Passed IN rather than declared here on purpose. This module's whole premise
+   * is that the walk is reflective so no container can hide from it (see the
+   * header); a registry of container names living inside it would be the
+   * hand-written suspect list it argues against. Annotations decide nothing
+   * about what gets measured — they only label rows the walk already found, and
+   * a name with no note reads `null`, which is itself a finding.
+   */
+  notes?: Readonly<Record<string, RetainerBoundNote>>;
   /**
    * Cap on how many entries the deep sum will walk per container before it
    * stops and reports what it has. Guards the probe against being turned into
@@ -181,6 +216,13 @@ export interface RetainerRow {
   maxEntries: number;
   /** Σ `nested` across owners, or `null` when no owner reported one. */
   nested: number | null;
+  /**
+   * TRA-4986 (AC3) — the row's published bound or its published reason for
+   * having none. `null` means **no disposition has been published for this
+   * container**, which is a gap in the record rather than a statement that it is
+   * unbounded. Supplied via {@link CensusOptions.notes}.
+   */
+  note: RetainerBoundNote | null;
 }
 
 /**
@@ -201,6 +243,7 @@ export function foldCensus(subjects: readonly CensusSubject[], opts: CensusOptio
           entries: reading.entries,
           maxEntries: reading.entries,
           nested: reading.nested,
+          note: opts.notes?.[name] ?? null,
         });
         continue;
       }

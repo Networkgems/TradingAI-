@@ -1,5 +1,8 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { SignalEngine } from './signal-engine.js';
+// TRA-4986 — `candleCache` is now one PROCESS-GLOBAL store behind a getter, so a
+// seed outlives the case that wrote it.
+import { __resetMarketDataCandleCacheForTest } from './market-data-candle-cache.js';
 import { DEFAULT_ACCOUNT_SETTINGS, CONVICTION_DCA } from '@trading-app/shared';
 import type { TradeSignal, Candle } from '@trading-app/shared';
 
@@ -48,6 +51,10 @@ function openAaplLong(engine: SignalEngine): Privates {
 }
 
 describe('SignalEngine.getPositionAdvisor (TRA-1303)', () => {
+  beforeEach(() => {
+    __resetMarketDataCandleCacheForTest();
+  });
+
   it('surfaces a sell plan (SL/TP) and a DCA next-add plan for a held demo equity position', () => {
     const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' });
     openAaplLong(engine);

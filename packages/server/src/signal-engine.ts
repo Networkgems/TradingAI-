@@ -171,6 +171,10 @@ import {
   getDailyCloses as getSharedDailyCloses,
   setDailyCloses as setSharedDailyCloses,
 } from './market-data-daily-cache.js';
+// TRA-4986 — the third subject of the same hoist: the per-symbol MINUTE-bar
+// series, measured at 527,371 nested Candles across 68 owners (2.34x the two
+// daily maps above combined). `candleCache` below is now a getter onto this.
+import { marketDataCandleCacheCensusTarget, setCandles } from './market-data-candle-cache.js';
 // TRA-2193 — per-scan liveness for the paths that journal `single_leg_rv`.
 import { beginRvScan, type RvScanPathId, type RvScanRecord } from './rv-scan-telemetry.js';
 import { maybeCaptureTermStructureShadow } from './term-structure-shadow.js'; // TRA-4413 item 4
@@ -3498,7 +3502,27 @@ export class SignalEngine {
   private denominatorFlipTape = new DenominatorFlipTape();
   /** Wall-clock of the last `denominator-flip candidate` info line (rate limit). */
   private lastDenominatorFlipLogAt = 0;
-  private candleCache: Map<string, Candle[]> = new Map();
+  /**
+   * TRA-4986 — module-shared (was a per-instance `Map`), exactly like
+   * {@link shadowCandleCache} and for the same reason. The minute-bar series is
+   * pure market data: the single writer ({@link refreshCandles}) sources it from
+   * `fetchMinuteBarsWithSource(symbol, 80)`, whose signature carries no user,
+   * and which is already fronted by one process-global `minuteBarCache` plus a
+   * singleflight. The 68 per-user copies the heap census measured were 68
+   * `.slice()` copies of ONE shared cache entry — 527,371 nested `Candle`s,
+   * 2.34x the two maps TRA-4158 hoisted for a measured −330.7 MB.
+   *
+   * A getter (not a field) so the ten existing `this.candleCache.get(...)` call
+   * sites are untouched. It is also what makes the AC2 census proof work: a
+   * prototype accessor is neither an own property nor a data property, so
+   * `signalEngine.candleCache` leaves the census entirely and the replacement
+   * `marketData.minuteCandles` row (`owners: 1`) stands in for it in the same
+   * read. Semantics and the write-provenance instrument live in
+   * `market-data-candle-cache.ts`.
+   */
+  private get candleCache(): Map<string, Candle[]> {
+    return marketDataCandleCacheCensusTarget.minuteCandles;
+  }
   // TRA-3688 — `Sma200Signal` no longer extends `TradeSignal` (its takeProfit /
   // riskRewardRatio are `null`: no exit model, no fabricated target), so the
   // display feed is the explicit union.
@@ -16463,7 +16487,11 @@ export class SignalEngine {
   private async refreshCandles(symbol: string): Promise<void> {
     const { bars, source, cached } = await fetchMinuteBarsWithSource(symbol, 80);
     if (bars.length === 0) return;
-    this.candleCache.set(symbol, bars);
+    // TRA-4986 — through the shared store's writer, not `candleCache.set`, so
+    // the AC1 write-provenance comparison (`candleShareStats`) sees every write.
+    // The per-key semantics are identical: last-writer-wins, one depth (80), one
+    // upstream. This is the ONLY writer in the server.
+    setCandles(symbol, bars);
     // TRA-1539 — attribute residual staleness at the source. A feed OUTAGE trips a
     // provider breaker and yields 0 bars (handled above: cache retains its prior,
     // aging set). When we DO get bars but the freshest one is already old, the feed

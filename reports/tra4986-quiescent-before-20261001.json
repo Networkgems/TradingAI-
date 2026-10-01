@@ -1,0 +1,156 @@
+{
+  "arm": "PRE (TRA-4158 shipped, TRA-4986 not)",
+  "build": "faae938837bf",
+  "pid": 76,
+  "startedAt": "2026-09-28T01:22:49.650Z",
+  "readAt": "2026-10-01T19:06:41.656Z",
+  "window": {
+    "fromZ": "2026-09-30T20:03:11.055Z",
+    "toZ": "2026-10-01T13:28:11.154Z",
+    "n": 210,
+    "spanH": 17.42,
+    "marketShutThroughout": true
+  },
+  "uptimeClassH": {
+    "at": 66.67,
+    "to": 84.09
+  },
+  "heapUsedMB": {
+    "mean": 471.8,
+    "min": 416.8,
+    "max": 600.9
+  },
+  "rssMB": {
+    "mean": 1698.5,
+    "min": 1475.2,
+    "max": 2008.2
+  },
+  "rows": {
+    "signalEngine.candleCache": {
+      "first": 6608,
+      "last": 6608,
+      "min": 6608,
+      "max": 6608
+    },
+    "signalEngine.dynamicSymbols": {
+      "first": 22192,
+      "last": 22625,
+      "min": 22192,
+      "max": 22625
+    },
+    "signalEngine.technicalSnapshots": {
+      "first": 6800,
+      "last": 6800,
+      "min": 6800,
+      "max": 6800
+    },
+    "signalEngine.symbolState": {
+      "first": 6800,
+      "last": 6800,
+      "min": 6800,
+      "max": 6800
+    },
+    "marketData.dailyCloses": {
+      "first": 449,
+      "last": 449,
+      "min": 449,
+      "max": 449
+    },
+    "marketData.dailyBars": {
+      "first": 447,
+      "last": 447,
+      "min": 447,
+      "max": 447
+    }
+  },
+  "liveDeep": {
+    "signalEngine.dynamicSymbols": {
+      "name": "signalEngine.dynamicSymbols",
+      "kind": "set",
+      "owners": 68,
+      "entries": 22625,
+      "maxEntries": 782,
+      "nested": null
+    },
+    "signalEngine.symbolState": {
+      "name": "signalEngine.symbolState",
+      "kind": "map",
+      "owners": 68,
+      "entries": 6800,
+      "maxEntries": 100,
+      "nested": null
+    },
+    "signalEngine.technicalSnapshots": {
+      "name": "signalEngine.technicalSnapshots",
+      "kind": "map",
+      "owners": 68,
+      "entries": 6800,
+      "maxEntries": 100,
+      "nested": null
+    },
+    "signalEngine.candleCache": {
+      "name": "signalEngine.candleCache",
+      "kind": "map",
+      "owners": 68,
+      "entries": 6608,
+      "maxEntries": 99,
+      "nested": 527371
+    },
+    "marketData.dailyCloses": {
+      "name": "marketData.dailyCloses",
+      "kind": "map",
+      "owners": 1,
+      "entries": 449,
+      "maxEntries": 449,
+      "nested": 112841
+    },
+    "marketData.dailyBars": {
+      "name": "marketData.dailyBars",
+      "kind": "map",
+      "owners": 1,
+      "entries": 447,
+      "maxEntries": 447,
+      "nested": 112840
+    }
+  },
+  "ringTrends": [
+    {
+      "name": "signalEngine.dynamicSymbols",
+      "first": 22192,
+      "last": 22625,
+      "peak": 22625,
+      "delta": 433,
+      "ratio": 1.02
+    },
+    {
+      "name": "signalEngine.candleCache",
+      "first": 6608,
+      "last": 6608,
+      "peak": 6608,
+      "delta": 0,
+      "ratio": 1
+    }
+  ],
+  "bootTrends": [
+    {
+      "name": "signalEngine.candleCache",
+      "first": 0,
+      "firstAtMs": 1790558583127,
+      "last": 6608,
+      "peak": 6608,
+      "peakAtMs": 1790622184974,
+      "delta": 6608,
+      "ratio": null
+    },
+    {
+      "name": "signalEngine.dynamicSymbols",
+      "first": 20953,
+      "firstAtMs": 1790558583127,
+      "last": 22625,
+      "peak": 22625,
+      "peakAtMs": 1790859791155,
+      "delta": 1672,
+      "ratio": 1.08
+    }
+  ]
+}

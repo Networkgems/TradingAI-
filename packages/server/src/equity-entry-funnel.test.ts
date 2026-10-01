@@ -24,6 +24,10 @@ import {
   CHURN_SAME_SESSION_OPEN_CAP_VALUE,
 } from './churn-loss-brake-flag.js';
 import { clearChurnBrakeLedger } from './churn-brake-ledger.js';
+// TRA-4986 — `candleCache` is now one PROCESS-GLOBAL store behind a getter, so a
+// seed here outlives the `beforeEach` and would satisfy another case's
+// cold-cache premise. Every arm in this file resets it.
+import { __resetMarketDataCandleCacheForTest } from './market-data-candle-cache.js';
 
 /** The real engine internals we drive. No re-implementation — these ARE the loop. */
 type Privates = {
@@ -77,6 +81,7 @@ describe('TRA-1768 — equity entry funnel', () => {
 
   beforeEach(() => {
     __resetEquityEntryFunnelForTests();
+    __resetMarketDataCandleCacheForTest();
     clearChurnBrakeLedger();
     delete process.env[CHURN_LOSS_BRAKE_FLAG];
     delete process.env[CHURN_SAME_SESSION_OPEN_CAP_VALUE];
@@ -88,6 +93,7 @@ describe('TRA-1768 — equity entry funnel', () => {
     if (priorCap === undefined) delete process.env[CHURN_SAME_SESSION_OPEN_CAP_VALUE];
     else process.env[CHURN_SAME_SESSION_OPEN_CAP_VALUE] = priorCap;
     __resetEquityEntryFunnelForTests();
+    __resetMarketDataCandleCacheForTest();
     clearChurnBrakeLedger();
   });
 
@@ -309,6 +315,7 @@ describe('TRA-1793 — a dry signal vs a dead feed', () => {
 
   beforeEach(() => {
     __resetEquityEntryFunnelForTests();
+    __resetMarketDataCandleCacheForTest();
     delete process.env.EQUITY_SWING_MODE;
     vi.useFakeTimers();
     // The freshness gate only applies while the market is OPEN, and `isStockMarketOpen`
@@ -324,6 +331,7 @@ describe('TRA-1793 — a dry signal vs a dead feed', () => {
     if (priorSwing === undefined) delete process.env.EQUITY_SWING_MODE;
     else process.env.EQUITY_SWING_MODE = priorSwing;
     __resetEquityEntryFunnelForTests();
+    __resetMarketDataCandleCacheForTest();
   });
 
   it('acceptance 2 — EVERY symbol stale: symbolsEvaluated 0, {stale_feed: N}, candidatesEvaluated 0. The pass ran and evaluated NOTHING.', async () => {
@@ -423,6 +431,7 @@ describe('TRA-1835 — name the dark symbols', () => {
 
   beforeEach(() => {
     __resetEquityEntryFunnelForTests();
+    __resetMarketDataCandleCacheForTest();
     process.env.EQUITY_SWING_MODE = 'true'; // the whole ticket lives under swing mode
     vi.useFakeTimers();
     vi.setSystemTime(RTH_OPEN_MS);
@@ -434,6 +443,7 @@ describe('TRA-1835 — name the dark symbols', () => {
     if (priorSwing === undefined) delete process.env.EQUITY_SWING_MODE;
     else process.env.EQUITY_SWING_MODE = priorSwing;
     __resetEquityEntryFunnelForTests();
+    __resetMarketDataCandleCacheForTest();
   });
 
   it('the in-universe stale names are NAMED; the off-universe cut is counted but NOT named', async () => {

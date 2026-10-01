@@ -30,6 +30,8 @@ import {
   type RetainerTrend,
   foldCensus,
 } from './heap-retainer-census.js';
+import { RETAINER_BOUND_NOTES } from './retainer-bound-notes.js';
+import { candleShareStats, type CandleShareStats } from './market-data-candle-cache.js';
 
 /**
  * 300 s. Chosen against the shape being measured, not for resolution: the
@@ -93,6 +95,17 @@ export interface HeapCensusStatus {
    * the ring has already forgotten.
    */
   bootTrends: BootRetainerTrend[];
+  /**
+   * TRA-4986 (AC1) — the write-provenance comparison for the hoisted minute-bar
+   * store. Published here rather than behind its own route because it is only
+   * readable WITH the census row it explains: `marketData.minuteCandles`'
+   * `entries` is the union the hoist bought, and this says whether the 68
+   * callers that now share it ever disagreed.
+   *
+   * Read `divergentSameInstant` first — it is the only counter that can falsify
+   * sharing, and 0 is the expected reading.
+   */
+  candleShare: CandleShareStats;
 }
 
 let tape: HeapCensusTape | null = null;
@@ -196,7 +209,10 @@ export function getHeapCensusStatus(opts: CensusOptions = {}): HeapCensusStatus 
   let liveError: string | null = null;
   if (subjectsFn) {
     try {
-      live = foldCensus(subjectsFn(), opts);
+      // TRA-4986 — annotate with the published bound/reason unless the caller
+      // supplied its own registry (tests do). `notes` never changes WHAT is
+      // walked, only how a found row is labelled.
+      live = foldCensus(subjectsFn(), { notes: RETAINER_BOUND_NOTES, ...opts });
     } catch (err: unknown) {
       liveError = err instanceof Error ? err.message : String(err);
     }
@@ -213,5 +229,6 @@ export function getHeapCensusStatus(opts: CensusOptions = {}): HeapCensusStatus 
     tape: samples,
     trends: tape ? tape.trends() : [],
     bootTrends: tape ? tape.bootTrends() : [],
+    candleShare: candleShareStats(),
   };
 }

@@ -61,6 +61,7 @@ import {
 } from './signal-engine.js';
 import { MINUTE_BAR_FALLBACK_CEILING_MS, YF_CALL_TIMEOUT_MS, fetchMinuteBarsWithSource } from './yahoo-feed.js';
 import { resetSweepCursors, sweepCursorSnapshot, SWEEP_BUDGET_MS, type SweepPass } from './tick-sweep-budget.js';
+import { __resetMarketDataCandleCacheForTest } from './market-data-candle-cache.js';
 
 /** Measured on the 2026-08-12 RTH tape — the numbers this budget is sized against. */
 const MEASURED_P90_MS = 28_900;
@@ -83,12 +84,17 @@ beforeEach(() => {
   clock = 1_000_000;
   nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock);
   resetSweepCursors();
+  // TRA-4986 — `candleCache` is now one PROCESS-GLOBAL store behind a getter, so
+  // it outlives this `beforeEach`. Without the reset the `.size` assertion below
+  // counts another case's residue and reads green for the wrong reason.
+  __resetMarketDataCandleCacheForTest();
 });
 
 afterEach(() => {
   nowSpy?.mockRestore();
   nowSpy = null;
   resetSweepCursors();
+  __resetMarketDataCandleCacheForTest();
 });
 
 type ColdBarInternals = {

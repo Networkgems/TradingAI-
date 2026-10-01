@@ -832,6 +832,7 @@ import { installStdioBlockMeter } from './stdio-block-meter.js';
 import { installGcPauseMeter } from './gc-pause-meter.js';
 import { startHeapCensusSampler, type HeapCensusSamplerHandle } from './heap-census-sampler.js';
 import { marketDataDailyCacheCensusTarget } from './market-data-daily-cache.js';
+import { marketDataCandleCacheCensusTarget } from './market-data-candle-cache.js';
 import type { CensusSubject } from './heap-retainer-census.js';
 import {
   logger,
@@ -20113,6 +20114,14 @@ const heapCensusSampler: HeapCensusSamplerHandle | null = startHeapCensusSampler
       { klass: 'pnlTracker', target: ctx.tracker },
     ]),
     { klass: 'marketData', target: marketDataDailyCacheCensusTarget },
+    // TRA-4986 — the minute-bar store, hoisted out of the same 68 engines for
+    // the same reason. Its row IS the AC2 proof: `signalEngine.candleCache` is a
+    // prototype accessor now, so the census (own enumerable DATA properties
+    // only) emits NO row for it at all — and an absent row is byte-identical to
+    // the instrument going blind. `marketData.minuteCandles` with `owners: 1`
+    // has to be present in the SAME read for "moved" to be distinguishable from
+    // "stopped looking". The success condition is ABSENT, never `owners: 0`.
+    { klass: 'marketData', target: marketDataCandleCacheCensusTarget },
   ],
 });
 
