@@ -191,6 +191,15 @@ import {
   TAPE_INPUT_STALE_THRESHOLD_DAYS,
   summarizeTapeInputStaleness,
 } from '../option-tape-expectancy.js';
+// TRA-4978 (parent TRA-4931) — the REMEDY half of TRA-4875: the attribution
+// split that separates refusals the stale constant DECIDED from refusals made
+// upstream of it, plus the explicit NOT-TRADEABLE stand-down verdict. Pure and
+// read-only; nothing on the admission path consults it.
+import {
+  describeCostBarCellStandDown,
+  foldStaleCostBarCells,
+  summarizeCostBarSleeveStandDown,
+} from '../cost-bar-stale-attribution.js';
 // TRA-4749 (parent TRA-4622 §4) — the bar for EVERY structure the gate is
 // observed to charge, not just the one `bar` was hard-coded to.
 import {
@@ -7294,41 +7303,46 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // depends on, which is how a degradation signal earns its way to being
     // ignored. The keys here are the ledger's OWN `byCell` rows: a cell is in
     // this fold if and only if it decided at least one live candidate.
-    const costBarCellRows = [
-      // Retained first (the 30-day fold, survives a redeploy), then since-boot.
-      // Same cell can appear in both; the reducer keeps the WORSE reading, so a
-      // fresh boot can never wash out a staleness the retained fold recorded.
-      ...(summary.retained.byGate.find((g) => g.gate === COST_BAR_GATE)?.byCell ?? []),
-      ...(summary.byGate.find((g) => g.gate === COST_BAR_GATE)?.byCell ?? []),
-    ];
-    const staleCellsByKey = new Map<
-      string,
-      { cell: string; tapeAgeDaysAtDecisionMax: number | null; tapeToIsoNewest: string | null; decisionsBlocked: number; decisionsEvaluated: number }
-    >();
-    for (const row of costBarCellRows) {
-      if (row.inputFreshness?.stale !== true) continue;
-      const prior = staleCellsByKey.get(row.cell);
-      const next = {
-        cell: row.cell,
-        tapeAgeDaysAtDecisionMax: row.inputFreshness.tapeAgeDaysAtDecisionMax,
-        tapeToIsoNewest: row.inputFreshness.tapeToIsoNewest,
-        decisionsBlocked: row.blocked,
-        decisionsEvaluated: row.evaluated,
-      };
-      if (
-        prior === undefined
-        || (next.tapeAgeDaysAtDecisionMax ?? 0) > (prior.tapeAgeDaysAtDecisionMax ?? 0)
-      ) {
-        staleCellsByKey.set(row.cell, {
-          ...next,
-          decisionsBlocked: Math.max(prior?.decisionsBlocked ?? 0, next.decisionsBlocked),
-          decisionsEvaluated: Math.max(prior?.decisionsEvaluated ?? 0, next.decisionsEvaluated),
-        });
-      }
-    }
-    const staleCells = [...staleCellsByKey.values()].sort(
-      (a, b) => (b.tapeAgeDaysAtDecisionMax ?? 0) - (a.tapeAgeDaysAtDecisionMax ?? 0),
+    //
+    // ⭐ TRA-4978 — the fold, the per-cell ATTRIBUTION SPLIT (which refusals the
+    // stale constant actually DECIDED vs which were refused upstream of it, on
+    // TRA-4745's `rowsCompared` / `rowsShortCircuited`) and the per-cell + sleeve
+    // STAND-DOWN verdict all live in `cost-bar-stale-attribution.ts`, which is
+    // pure and unit-tested. Read that file's header for the measurement that
+    // made the split necessary: since 2026-09-25 the constant decides NOTHING
+    // (`rowsCompared: 0`, 100% `insufficient_real_fill_evidence`), so
+    // `decisionsBlocked` counts refusals made WHILE the input was stale, not
+    // refusals CAUSED by it.
+    //
+    // Retained fold first (30 days, survives a redeploy), then since-boot. A
+    // cell in both keeps the WORSE reading, so a fresh boot can never wash out a
+    // staleness the retained fold recorded.
+    const tapeCellByKey = new Map(tapeCells.map((c) => [c.cellKey, c] as const));
+    const staleCells = foldStaleCostBarCells(
+      summary.retained.byGate.find((g) => g.gate === COST_BAR_GATE)?.byCell ?? [],
+      summary.byGate.find((g) => g.gate === COST_BAR_GATE)?.byCell ?? [],
+    ).map((c) => ({
+      ...c,
+      standDown: describeCostBarCellStandDown(c.cell, tapeCellByKey.get(c.cell) ?? null),
+    }));
+    const decidedByStaleInput = staleCells.reduce(
+      (s, c) => s + c.decisionsDecidedByStaleInput,
+      0,
     );
+    const shortCircuitedUpstream = staleCells.reduce(
+      (s, c) => s + c.decisionsShortCircuitedUpstream,
+      0,
+    );
+    const sleeveStandDown = summarizeCostBarSleeveStandDown({
+      structureCells: tapeCells.filter((c) => c.structure === COST_BAR_PUBLISHED_STRUCTURE),
+      sleeve: COST_BAR_PUBLISHED_STRUCTURE,
+      // The selector's band narrows the roll-up ONLY when the selector is armed;
+      // unarmed, the legacy nominator can reach any cell, so nothing narrows it.
+      armedBand: admissibleStrikeArmed ? admissibleStrikeBand : null,
+      decidedByStaleInput,
+      shortCircuitedUpstream,
+    });
+
     const degradations =
       staleCells.length === 0
         ? []
@@ -7336,6 +7350,8 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
             {
               code: 'cost_bar_edge_input_stale',
               issue: 'TRA-4875',
+              /** TRA-4978 — the remedy ticket: attribution split + stand-down. */
+              remedyIssue: 'TRA-4978',
               gate: COST_BAR_GATE,
               /**
                * `degraded`, not `critical`: the gate is REFUSING, which is the
@@ -7344,11 +7360,52 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
                * LOOK, not that anything stop.
                */
               severity: 'degraded' as const,
+              /**
+               * ⛔ TRA-4978 item 3 / AC4 — EXPLICITLY NOT AN ALARM, and the
+               * field exists so that is readable rather than inferred from the
+               * absence of one. TRA-3711 is the precedent in the other
+               * direction: the live-NAV tripwire reads `alarm: false` while its
+               * own verdict is `blind` (0 of 31 sessions tripped, 31
+               * ungradeable), so on this codebase `alarm` has already been
+               * demonstrated to coexist with a dead instrument. An input-age
+               * assertion belongs at `degraded`: the gate is REFUSING, which is
+               * the conservative direction with real money, so the ask is that
+               * somebody LOOK — not that anything stop. Raising it to `alarm`
+               * would also put a condition that is the EXPECTED steady state
+               * (see `standDown.verdict`) onto a channel whose signal value
+               * depends on being rare.
+               */
+              alarm: false as const,
               thresholdDays: TAPE_INPUT_STALE_THRESHOLD_DAYS,
-              /** Cells the gate DECIDED on whose constant was stale at the decision. */
+              /**
+               * Cells the gate DECIDED on whose constant was stale at the
+               * decision, each carrying the TRA-4978 attribution split and its
+               * own stand-down verdict.
+               */
               cells: staleCells,
-              /** Live refusals made against a stale constant, over the retained fold. */
+              /**
+               * Live refusals made WHILE the constant was stale, over the
+               * retained fold. ⚠️ TRA-4978 — this is NOT a count of refusals
+               * CAUSED by the staleness; read `decisionsDecidedByStaleInput`
+               * for that. Value and meaning deliberately unchanged so a reader
+               * holding the old number can reconcile it.
+               */
               decisionsBlocked: staleCells.reduce((s, c) => s + c.decisionsBlocked, 0),
+              /**
+               * ⭐ TRA-4978 — refusals the stale constant actually DECIDED
+               * (`byCell[].rowsCompared`). `0` against a nonzero
+               * `decisionsBlocked` means the staleness is enforcing NOTHING and
+               * a tape refresh would move no decision.
+               */
+              decisionsDecidedByStaleInput: decidedByStaleInput,
+              /** Refused by a precondition upstream of the constant — never read. */
+              decisionsShortCircuitedUpstream: shortCircuitedUpstream,
+              /** Rows carrying no predicate stamp: coverage, not a clean bill. */
+              decisionsUnstamped: staleCells.reduce((s, c) => s + c.decisionsUnstamped, 0),
+              /** FALSE ⇒ no live decision anywhere is currently made off a stale constant. */
+              staleInputGovernsAnyDecision: decidedByStaleInput > 0,
+              /** ⭐ TRA-4978 item 2 — the published fail direction, design (a). */
+              standDown: sleeveStandDown,
               /**
                * The global flag this route already published and nobody read,
                * echoed here so the two can be held against each other — and so
@@ -7362,15 +7419,22 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
                   edgeReadAt,
                 ).inputStale,
               detail:
-                `⚠️ ${staleCells.length} cost_bar cell(s) are ENFORCING live refusals off an expectancy constant `
+                `⚠️ ${staleCells.length} cost_bar cell(s) decided live candidates off an expectancy constant `
                 + `derived from a tape that stopped advancing more than ${TAPE_INPUT_STALE_THRESHOLD_DAYS} days before the decision: `
-                + `${staleCells.map((c) => `${c.cell} (${c.tapeAgeDaysAtDecisionMax} d, tape ends ${c.tapeToIsoNewest ?? 'unknown'}, ${c.decisionsBlocked}/${c.decisionsEvaluated} blocked)`).join('; ')}. `
+                + `${staleCells.map((c) => `${c.cell} (${c.tapeAgeDaysAtDecisionMax} d, tape ends ${c.tapeToIsoNewest ?? 'unknown'}, ${c.decisionsBlocked}/${c.decisionsEvaluated} blocked, of which ${c.decisionsDecidedByStaleInput} decided BY the stale constant and ${c.decisionsShortCircuitedUpstream} refused upstream of it)`).join('; ')}. `
                 + 'THE REFUSALS ARE CORRECT AND MUST NOT BE RELAXED ON ACCOUNT OF THIS — a stale estimator keeps refusing. '
                 + 'What this says is that the refusal count is ONE frozen verdict replayed, not N independent measurements, '
                 + 'so it is not evidence about the market and must not be read as robustness. '
+                + '⭐ TRA-4978 — READ `decisionsDecidedByStaleInput` BEFORE ACTING ON `decisionsBlocked`: '
+                + `${decidedByStaleInput} of the ${staleCells.reduce((s, c) => s + c.decisionsBlocked, 0)} refusal(s) in this fold were actually DECIDED by the stale constant; `
+                + `${shortCircuitedUpstream} were refused by a precondition UPSTREAM of it, so on those rows the constant was never read and its age caused nothing. `
+                + (decidedByStaleInput === 0
+                  ? 'At zero, this degradation is a statement about an input nothing is currently consuming — refreshing the tape would move NO decision. '
+                  : '')
+                + `Sleeve verdict: ${sleeveStandDown.verdict}${sleeveStandDown.bindingConstraint === null ? '' : ` (binding constraint: ${sleeveStandDown.bindingConstraint})`} — ${sleeveStandDown.statement} `
                 + 'The tape grows only on a CLOSED FILL and this gate refuses every candidate that could produce one, '
                 + 'so the loop is self-sealing and closing it is a STRATEGY decision (TRA-4622), not a fix inside this gate. '
-                + 'Per-decision detail: byGate[cost_bar].byCell[].inputFreshness.',
+                + 'Per-decision detail: byGate[cost_bar].byCell[].inputFreshness; per-cell tradeability: degradations[].cells[].standDown.',
             },
           ];
     // TRA-4879 — WHAT INTERVAL DO THE COUNTERS BELOW COVER? They are DURABLE

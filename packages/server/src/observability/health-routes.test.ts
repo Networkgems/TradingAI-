@@ -44,6 +44,12 @@ import { resolveDemoFlagEnv } from '../demo-flags.js';
 // TRA-3216 — the live OTM underlying allowlist + the enforcement-gate ledger it publishes through.
 import { OPTION_LIVE_OTM_UNIVERSE_VAR } from '../otm-live-universe-flag.js';
 import { clearLiveEnforceGateLedger, recordLiveEnforceDecision } from '../live-enforce-gate-ledger.js';
+// TRA-4978 — the stale-input attribution split, graded on the ROUTE. Imported
+// from the real modules so the fixture builds a genuine stale provenance stamp
+// rather than a hand-written mirror of one.
+import { buildTapeExpectancyTable, tapeExpectancyVerdict } from '../option-tape-expectancy.js';
+import { tapeExpectancyGrossProvenance } from '../live-enforce-gate-gross-provenance.js';
+import { DEFAULT_COST_GATE_CONFIG } from '../option-cost-gate.js';
 // TRA-4748 — the real published shape, so the route assertion below cannot drift
 // against a hand-copied mirror of it.
 import type { LiveEnforceSessionCoverage } from '../live-enforce-gate-session-coverage.js';
@@ -8281,5 +8287,153 @@ describe('TRA-4510 option-swing-exits profitFloorTrail — both books', () => {
     const pft = serve();
     expect(pft.demo).toEqual({ enabled: true, exitRiskMaster: true });
     expect(pft.live).toEqual({ enabled: false, exitRiskMaster: true });
+  });
+});
+
+// ─── TRA-4978 (parent TRA-4931) — the stale-input ATTRIBUTION SPLIT on the wire ─
+//
+// The fold's own cases live in `tra4978-cost-bar-stale-attribution.test.ts`. What
+// this pins is that the split and the stand-down verdict REACH THE ROUTE, and
+// that the no-estimator path reads `null` / `NOT_MEASURED` rather than passing.
+//
+// Why the no-estimator path is the one worth a route test: the degradation is
+// built from the LEDGER's cells while the stand-down is read off the ESTIMATOR's
+// cells, and those two populations are not the same set. A cell the ledger
+// decided on but the estimator no longer holds is exactly the case where a
+// `?? false` or an `admits ?? true` would turn an unknown into a verdict.
+describe('GET /api/health/live-enforce-gates — stale-input attribution (TRA-4978)', () => {
+  beforeEach(() => {
+    clearLiveEnforceGateLedger();
+  });
+  afterEach(() => {
+    clearLiveEnforceGateLedger();
+  });
+
+  /** A `cost_bar` refusal whose constant was 57.9 d old and NEVER COMPARED. */
+  function recordShortCircuitedRefusal() {
+    const closeTs = Date.UTC(2026, 7, 4, 17, 0, 0);
+    const decidedAt = closeTs + Math.round(57.9 * 86_400_000);
+    const table = buildTapeExpectancyTable(
+      Array.from(
+        { length: 124 },
+        (_, i) =>
+          ({
+            structure: 'single_leg_otm',
+            outcome: 'LOSS',
+            entryDelta: 0.35,
+            realizedR: -0.05,
+            mode: 'demo',
+            closeTs: closeTs - i * 60_000,
+          }) as never,
+      ),
+      { config: DEFAULT_COST_GATE_CONFIG, nowMs: decidedAt },
+    );
+    const verdict = tapeExpectancyVerdict(
+      { structure: 'single_leg_otm', delta: 0.35 },
+      table,
+      DEFAULT_COST_GATE_CONFIG,
+    );
+    recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, '2026-10-01', 'refused', decidedAt, {
+      reasonCode: 'insufficient_real_fill_evidence',
+      cell: 'single_leg_otm::0.30-0.40',
+      symbol: 'MSFT',
+      grossR: verdict.lowerCI95,
+      // A cost sample is what carries the provenance + predicate stamps into the
+      // fold (TRA-3483): a row with no usable cost is counted as missing and the
+      // staleness verdict then reads `null`, not `true`. The numbers are the live
+      // `single_leg_otm::0.30-0.40` sample off `faae9388`.
+      cost: { costR: 0.707361, spreadR: 0.6, feeR: 0.1, costFracOfPremium: 0.2 },
+      grossRProvenance: tapeExpectancyGrossProvenance(table, verdict),
+      // `compared: false` — the TRA-4894 real-fill arm refused upstream of the
+      // comparison, which is the live 2026-09-25-onward shape.
+      predicate: {
+        form: 'tape_expectancy_flat',
+        compared: false,
+        lhsLabel: 'grossR',
+        lhs: null,
+        op: '>=',
+        rhsLabel: 'barR',
+        rhs: null,
+        admit: false,
+        shortCircuit: 'insufficient_real_fill_evidence',
+      },
+    });
+  }
+
+  function serveGates() {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => undefined) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const res = fakeRes();
+    routes.get('/api/health/live-enforce-gates')![0]!({}, res);
+    return res.body as {
+      degradations: Array<{
+        code: string;
+        severity: string;
+        alarm: boolean;
+        decisionsBlocked: number;
+        decisionsDecidedByStaleInput: number;
+        decisionsShortCircuitedUpstream: number;
+        staleInputGovernsAnyDecision: boolean;
+        standDown: { verdict: string; bindingConstraint: string | null; statement: string };
+        cells: Array<{
+          cell: string;
+          decisionsDecidedByStaleInput: number;
+          decisionsShortCircuitedUpstream: number;
+          staleInputGovernsDecisions: boolean;
+          shortCircuitReasonsSampled: string[];
+          standDown: { tradeable: boolean | null; reasonCodes: string[]; statement: string };
+        }>;
+        detail: string;
+      }>;
+    };
+  }
+
+  it('publishes the refusal as SHORT-CIRCUITED, not as decided by the stale constant', () => {
+    recordShortCircuitedRefusal();
+    const d = serveGates().degradations.find((x) => x.code === 'cost_bar_edge_input_stale')!;
+    expect(d).toBeDefined();
+
+    // The TRA-4875 headline keeps its meaning...
+    expect(d.decisionsBlocked).toBe(1);
+    // ...and the TRA-4978 split says the constant decided NOTHING.
+    expect(d.decisionsDecidedByStaleInput).toBe(0);
+    expect(d.decisionsShortCircuitedUpstream).toBe(1);
+    expect(d.staleInputGovernsAnyDecision).toBe(false);
+    expect(d.cells[0]!.cell).toBe('single_leg_otm::0.30-0.40');
+    expect(d.cells[0]!.staleInputGovernsDecisions).toBe(false);
+    expect(d.cells[0]!.shortCircuitReasonsSampled).toEqual(['insufficient_real_fill_evidence']);
+
+    // The prose must say it too — a reader who only reads `detail` is the reader
+    // who acted on the 20,678.
+    expect(d.detail).toContain('READ `decisionsDecidedByStaleInput` BEFORE ACTING ON `decisionsBlocked`');
+    expect(d.detail).toContain('refreshing the tape would move NO decision');
+  });
+
+  it('is DEGRADED and explicitly NOT an alarm (AC4 / TRA-3711)', () => {
+    recordShortCircuitedRefusal();
+    const d = serveGates().degradations.find((x) => x.code === 'cost_bar_edge_input_stale')!;
+    expect(d.severity).toBe('degraded');
+    expect(d.alarm).toBe(false);
+  });
+
+  it('a cell the estimator does not hold reads NULL and NOT_MEASURED, never a pass', () => {
+    // The fold is empty in this process (no journal), so the ledger's cell has no
+    // estimator counterpart. Unknown must not render as tradeable OR as refused.
+    recordShortCircuitedRefusal();
+    const d = serveGates().degradations.find((x) => x.code === 'cost_bar_edge_input_stale')!;
+    expect(d.cells[0]!.standDown.tradeable).toBeNull();
+    expect(d.cells[0]!.standDown.reasonCodes).toEqual(['cell_absent_from_estimator']);
+    expect(d.standDown.verdict).toBe('NOT_MEASURED');
+    expect(d.standDown.bindingConstraint).toBeNull();
+    expect(d.standDown.statement).toContain('Unknown is NOT tradeable');
+  });
+
+  it('no stale cell ⇒ no degradation at all (the detector is not stuck on)', () => {
+    expect(serveGates().degradations).toEqual([]);
   });
 });
