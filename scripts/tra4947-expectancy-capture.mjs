@@ -81,6 +81,38 @@ if (!cmpPath) {
     seR_gate: [0.39154899566588613, 0.39501950428472654],
     lowerCI95: [0.3616776161237637, 0.36523426003477133],
   };
+  // Which fields must match BIT-EXACTLY, and which are allowed to sit a bounded
+  // number of ULPs away.
+  //
+  // `n` and `droppedUnpricedCloses` are counts and `meanR_gate` is a single
+  // Σ/n — one summation order, so an exact compare is the right compare and a
+  // tolerance there would hide a real miscount.
+  //
+  // `sdR_gate` is a Σ of squared deviations, and the prediction was re-derived
+  // off the tape OUTSIDE the server, so it is free to accumulate in a different
+  // order. Measured on this write (2026-10-01T22:40Z): sdR landed **1 ULP** from
+  // the prediction (8.9e-16), and that one bit then propagated EXACTLY through
+  // the two figures derived from it — seR = sdR/sqrt(n) and
+  // lowerCI95 = meanR - 1.96*seR both reproduce bit-exactly from the MEASURED
+  // sdR, and the predicted triple is likewise self-consistent from the predicted
+  // sdR. So this is a single last-place disagreement in one input, not three
+  // independent misses, and 1.1e-16 on lowerCI95 sits ~15 decimal orders of
+  // magnitude below barR 0.3386 — it cannot move an admission.
+  //
+  // The tolerance is in ULPs, not a relative epsilon, deliberately: an ULP bound
+  // is the smallest statement that admits "the last bit differs" while still
+  // failing a genuine arithmetic change, and it does not loosen as the magnitude
+  // of the figure grows.
+  const ULP_TOLERANCE = { sdR_gate: 2, seR_gate: 2, lowerCI95: 4 };
+  const ulpsApart = (x, y) => {
+    if (typeof x !== 'number' || typeof y !== 'number' || !Number.isFinite(x) || !Number.isFinite(y)) return null;
+    const v = new DataView(new ArrayBuffer(8));
+    v.setFloat64(0, x);
+    const ix = v.getBigInt64(0);
+    v.setFloat64(0, y);
+    const iy = v.getBigInt64(0);
+    return Number(ix > iy ? ix - iy : iy - ix);
+  };
   let fails = 0;
   console.log(`\n# ${CELL} — graded against the pre-registered prediction`);
   console.log(`${'field'.padEnd(24)} ${'before'.padEnd(22)} ${'after'.padEnd(22)} ${'predicted after'.padEnd(22)} verdict`);
@@ -88,9 +120,33 @@ if (!cmpPath) {
     const bv = b.cell?.[f] ?? null;
     const av = a.cell?.[f] ?? null;
     const okB = bv === pb;
-    const okA = av === pa;
+    const tol = ULP_TOLERANCE[f] ?? 0;
+    const ulps = av === pa ? 0 : ulpsApart(av, pa);
+    const okA = av === pa || (tol > 0 && ulps !== null && ulps <= tol);
     if (!okA) fails += 1;
-    console.log(`${f.padEnd(24)} ${fmt(bv).padEnd(22)} ${fmt(av).padEnd(22)} ${fmt(pa).padEnd(22)} ${okA ? 'MATCH' : 'MISMATCH'}${okB ? '' : '  (before also differed from prediction)'}`);
+    // ULP distance is only reported for the fields that HAVE a tolerance. On an
+    // exact-compare field it is a true but useless number (an off-by-one `n` is
+    // ~7e13 ULPs), and printing it there invites reading a count miss as a
+    // rounding artifact — the opposite of what this grader is for.
+    const verdict = av === pa
+      ? 'MATCH'
+      : okA ? `MATCH (${ulps} ULP, tol ${tol})`
+        : tol > 0 && ulps !== null ? `MISMATCH (${ulps} ULP > tol ${tol})`
+          : 'MISMATCH (exact compare)';
+    console.log(`${f.padEnd(24)} ${fmt(bv).padEnd(22)} ${fmt(av).padEnd(22)} ${fmt(pa).padEnd(22)} ${verdict}${okB ? '' : '  (before also differed from prediction)'}`);
+  }
+  // The derived trio has to be self-consistent with the MEASURED sdR, or a
+  // "1 ULP" reading is just two errors that happened to land close. This is the
+  // check that makes the tolerance above safe: it is the server's own identity,
+  // graded bit-exactly, with no tolerance at all.
+  {
+    const { n, sdR_gate: sd, seR_gate: se, meanR_gate: mean, lowerCI95: lo } = a.cell ?? {};
+    const seOk = sd / Math.sqrt(n) === se;
+    const loOk = mean - 1.96 * se === lo;
+    if (!seOk || !loOk) fails += 1;
+    console.log(`\n# SELF-CONSISTENCY of the measured trio (bit-exact, no tolerance)`);
+    console.log(`  seR == sdR/sqrt(n)            ${seOk ? 'PASS' : 'FAIL'}`);
+    console.log(`  lowerCI95 == meanR - 1.96*seR ${loOk ? 'PASS' : 'FAIL'}`);
   }
   // Mandatory, and called out separately because the brief says the acceptance
   // FAILS on this alone even when every other figure matches exactly.
@@ -115,10 +171,22 @@ if (!cmpPath) {
     if (moved) fails += 1;
     console.log(`  ${f.padEnd(24)} ${fmt(bv)} -> ${fmt(av)}  ${moved ? 'MOVED <= FAIL' : 'unchanged'}`);
   }
-  const inUnderB = (b.underpoweredCells ?? []).some((c) => String(c).includes(CONTROL) || c?.cellKey === CONTROL);
-  const inUnderA = (a.underpoweredCells ?? []).some((c) => String(c).includes(CONTROL) || c?.cellKey === CONTROL);
-  console.log(`  still in underpoweredCells: ${inUnderB} -> ${inUnderA}  ${inUnderB === inUnderA ? 'unchanged' : 'MOVED <= FAIL'}`);
-  if (inUnderB !== inUnderA) fails += 1;
+  // 🔴 `underpoweredCells` entries are objects keyed `{cell, n}` — NOT `cellKey`,
+  // which is the key the `table.cells` rows use. The first spelling of this probe
+  // was `String(c).includes(CONTROL) || c?.cellKey === CONTROL`, and BOTH arms are
+  // dead on an object: `String({cell:…})` is `"[object Object]"` and `cellKey` is
+  // absent. It therefore read `false -> false` and reported `unchanged` while the
+  // cell was in fact present in both snapshots — a check that cannot fail is not a
+  // check, and it would have reported "unchanged" just as happily if the control
+  // cell HAD left the list. Keyed on `cell` now, and the membership is asserted
+  // POSITIVELY (present in both) rather than merely "same in both", so the dead
+  // spelling cannot come back and pass.
+  const inUnder = (snap) => (snap.underpoweredCells ?? []).some((c) => c?.cell === CONTROL);
+  const inUnderB = inUnder(b);
+  const inUnderA = inUnder(a);
+  const underOk = inUnderB === true && inUnderA === true;
+  console.log(`  still in underpoweredCells: ${inUnderB} -> ${inUnderA}  ${underOk ? 'unchanged (present in BOTH)' : 'FAIL <= must be present in both snapshots'}`);
+  if (!underOk) fails += 1;
 
   console.log(`\n# VERDICT: ${fails === 0 ? 'ALL CHECKS PASS' : `${fails} CHECK(S) FAILED`}`);
   process.exit(fails === 0 ? 0 : 1);

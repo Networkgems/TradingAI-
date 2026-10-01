@@ -1,0 +1,148 @@
+{
+ "readAt": "2026-10-01T22:39:38.966Z",
+ "servingCommit": "571b38dc8b9b2fbcab57623ff361a7093d063323",
+ "servingPid": 76,
+ "servingStartedAt": "2026-10-01T21:55:18.967Z",
+ "tableCommit": "571b38dc8b9b2fbcab57623ff361a7093d063323",
+ "computedAt": 1790894378803,
+ "rowsConsidered": 2361,
+ "rowsUsed": 2338,
+ "rowsDroppedUnpriced": 0,
+ "cell": {
+  "structure": "single_leg_otm",
+  "bucket": "0.50-0.55",
+  "cellKey": "single_leg_otm::0.50-0.55",
+  "deltaFrom": 0.5,
+  "deltaTo": 0.55,
+  "n": 110,
+  "droppedUnpricedCloses": 0,
+  "meanR_gate": 1.1291136476289005,
+  "sdR_gate": 4.106600511465177,
+  "seR_gate": 0.39154899566588613,
+  "lowerCI95": 0.3616776161237637,
+  "barR": 0.3386,
+  "admits": false,
+  "admitsPooled": true,
+  "admitsRealFill": false,
+  "nRealFill": 5,
+  "meanR_gate_realFillNet": -1.4759796859149588,
+  "sdR_gate_realFill": 0.6024834035033195,
+  "loRealFillNet": -2.224061609215938,
+  "boundNoiseR": 0.26448690042459866,
+  "realFillUnavailableReason": "nRealFill=5 of n=110 carries broker truth on BOTH legs (< 40 required) — dropped: not_broker_fill=94, exit_quote_missing=11",
+  "provenance": {
+   "byMode": {
+    "demo": 93,
+    "live": 17
+   },
+   "byAccountClass": {
+    "desk": 57,
+    "unattributed": 53
+   },
+   "fromTs": 1782918966564,
+   "toTs": 1788378634361
+  },
+  "meanR_gate_netOfModelledCross": null,
+  "lowerCI95_netOfModelledCross": null,
+  "netOfModelledCross": {
+   "costR_gate": null,
+   "source": null,
+   "rowsCharged": 93,
+   "rowsUncharged": 17,
+   "sdR_gate": null,
+   "seR_gate": null,
+   "wouldAdmit": null,
+   "unavailableReason": "no measured round-trip costR for single_leg_otm::0.50-0.55 in live-enforce-gate-ledger: retained.byGate[cost_bar].byCell[].costRQuantiles.p50 — NOT charged as zero"
+  }
+ },
+ "control": {
+  "structure": "single_leg_otm",
+  "bucket": "0.40-0.45",
+  "cellKey": "single_leg_otm::0.40-0.45",
+  "deltaFrom": 0.4,
+  "deltaTo": 0.45,
+  "n": 29,
+  "droppedUnpricedCloses": 0,
+  "meanR_gate": -0.4338359959079601,
+  "sdR_gate": 4.77019994409015,
+  "seR_gate": 0.8858038917899743,
+  "lowerCI95": -2.17001162381631,
+  "barR": 0.3386,
+  "admits": false,
+  "admitsPooled": false,
+  "admitsRealFill": false,
+  "nRealFill": 0,
+  "meanR_gate_realFillNet": null,
+  "sdR_gate_realFill": null,
+  "loRealFillNet": null,
+  "boundNoiseR": null,
+  "realFillUnavailableReason": "nRealFill=0 of n=29 carries broker truth on BOTH legs (< 40 required) — dropped: not_broker_fill=29",
+  "provenance": {
+   "byMode": {
+    "demo": 29
+   },
+   "byAccountClass": {
+    "desk": 0,
+    "unattributed": 29
+   },
+   "fromTs": 1782936026655,
+   "toTs": 1783534395968
+  },
+  "meanR_gate_netOfModelledCross": null,
+  "lowerCI95_netOfModelledCross": null,
+  "netOfModelledCross": {
+   "costR_gate": null,
+   "source": null,
+   "rowsCharged": 29,
+   "rowsUncharged": 0,
+   "sdR_gate": null,
+   "seR_gate": null,
+   "wouldAdmit": null,
+   "unavailableReason": "no measured round-trip costR for single_leg_otm::0.40-0.45 in live-enforce-gate-ledger: retained.byGate[cost_bar].byCell[].costRQuantiles.p50 — NOT charged as zero"
+  }
+ },
+ "underpoweredCells": [
+  {
+   "cell": "single_leg_directional::0.40-0.45",
+   "n": 4
+  },
+  {
+   "cell": "single_leg_directional::0.45-0.50",
+   "n": 9
+  },
+  {
+   "cell": "single_leg_directional::0.50-0.55",
+   "n": 10
+  },
+  {
+   "cell": "single_leg_directional::0.55-1.00",
+   "n": 7
+  },
+  {
+   "cell": "single_leg_otm::0.40-0.45",
+   "n": 29
+  },
+  {
+   "cell": "single_leg_otm::0.55-1.00",
+   "n": 21
+  },
+  {
+   "cell": "single_leg_rv::0.00-0.10",
+   "n": 1
+  }
+ ],
+ "heldForRealFillCells": [
+  {
+   "cell": "single_leg_otm::0.50-0.55",
+   "n": 110,
+   "nRealFill": 5,
+   "lowerCI95": 0.3616776161237637,
+   "loRealFillNet": -2.224061609215938,
+   "boundNoiseR": 0.26448690042459866,
+   "barR": 0.3386,
+   "needR": 0.6030869004245987,
+   "reason": "nRealFill=5 of n=110 carries broker truth on BOTH legs (< 40 required) — dropped: not_broker_fill=94, exit_quote_missing=11"
+  }
+ ],
+ "admittedCells": []
+}
