@@ -952,6 +952,25 @@ export type TapeExpectancyReasonCode =
   | string;
 
 /**
+ * TRA-4974 — the code a cost-bar REFUSAL carries onto the display feed when the
+ * verdict produced no `reasonCode` of its own.
+ *
+ * The OTM open path stamps `signal.signalSkipReasonCode` from
+ * `lastCostGateRefusal.reasonCode`, which is nullable on both verdict forms. The
+ * dedup ring and `classifyCardAdmissionWindow` both key on that VALUE, so an
+ * unset code would land a refused in-window nominee in the same bucket as a
+ * signal that was never refused at all. Named HERE, in the gate's own module and
+ * on the `SETUP_TAXONOMY_DEFAULT_REFUSAL_CODE` precedent, so the call site never
+ * spells a literal — two spellings of one refusal become two refusals (TRA-3953).
+ *
+ * ⚠️ It is a FALLBACK, not the ordinary value. On bqb1 the deployed flat form
+ * supplies `gross_negative` / `insufficient_evidence` / `shortfall_*`; seeing
+ * this code in the wild means a refusal reached the feed with no classification,
+ * which is itself worth a look.
+ */
+export const COST_BAR_DEFAULT_REFUSAL_CODE: TapeExpectancyReasonCode = 'cost_bar_blocked';
+
+/**
  * TRA-3394 item 2 — the three codes the board asked to be able to tell apart,
  * with the question each one answers. Published on the health surface so the
  * distinction is documented where it is read, not only where it is written.

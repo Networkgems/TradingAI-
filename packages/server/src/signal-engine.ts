@@ -699,6 +699,8 @@ import {
 import {
   tapeExpectancyVerdict,
   tapeEdgeR,
+  // TRA-4974 — the named fallback for a cost-bar refusal that carried no code.
+  COST_BAR_DEFAULT_REFUSAL_CODE,
 } from './option-tape-expectancy.js';
 // TRA-3394 item 1 — the LIVE entry-delta CEILING: the upper edge of the TRA-3392
 // authorized band, and the one cut a cost bar (algebraically a floor) cannot make.
@@ -15257,6 +15259,14 @@ export class SignalEngine {
         }, { bid: cheap.bid, ask: cheap.ask }, nominator);
         if (otmCostReject) {
           signal.signalSkipReason = otmCostReject;
+          // TRA-4974 — THE LOW-CARDINALITY TWIN, read off the one-slot channel the
+          // gate just wrote. Ordered above `beginRealFillShadowRefused` for the
+          // same reason that call is ordered where it is: the next candidate's
+          // `costAwareGateReject` clears `lastCostGateRefusal` on entry, so this
+          // is the only point at which the refusal's own code is still readable.
+          signal.signalSkipReasonCode =
+            this.lastCostGateRefusal?.reasonCode ?? COST_BAR_DEFAULT_REFUSAL_CODE;
+          if (this.mode === 'live') signal.liveSkipReason = otmCostReject;
           // TRA-4897 — the REFUSED-candidate shadow. Placed immediately after the
           // reject because `lastCostGateRefusal` is a one-slot channel that the
           // next candidate's `costAwareGateReject` clears. Observe-only: it reads
@@ -15269,6 +15279,53 @@ export class SignalEngine {
             delta: cheap.delta,
             dte: cheap.daysToExpiration,
             openInterest: cheap.openInterest,
+          });
+          // TRA-4974 — THE CHURN-BRAKE PUBLISH, AND IT IS THE WHOLE TICKET.
+          //
+          // Until now this was the ONLY refusal below the entry-window check that
+          // `continue`d WITHOUT parking its signal in `recentSignals`. Every other
+          // one of the fourteen — contract-floor pick, live universe, asset class,
+          // both delta cuts, `live_otm_dark`, `no_ask`, `no_balance_snapshot`,
+          // `over_entry_cap`, `over_aggregate_cap`, `over_fleet_reachable_bound`,
+          // the exit interlock, the churn brake — publishes, five of them through
+          // `surfaceOtmLiveSkip`. This one did not, and it is the gate that
+          // refuses 99.28% of the live nominees that reach it (1929/1943).
+          //
+          // The consequence was exactly inverted from the intent. OUT of window
+          // the window reject above publishes, so the card ring filled with rows
+          // whose `not_suppressed` criterion refuses them for being out of window.
+          // IN window the window reject does not fire, control falls to here, and
+          // 99.28% of nominees left NO trace on the feed at all — so
+          // `signalTypeCounts.otm_mispricing.attempted` froze the instant the
+          // window opened. Measured on bqb1 2026-10-01: newest card in the ring
+          // stamped 10:14:43 ET, 17 seconds before the 10:15 open, `attempted`
+          // pinned at 1356 across four reads spanning 70 minutes of an OPEN
+          // window, with `buildFailures: 0` and both loops advancing. A dedup
+          // swallow, an empty nominee set and this silent `continue` were
+          // byte-identical from outside, which is why three grading attempts on
+          // TRA-4645 priorities 1 and 4 read it as a liveness or dedup mystery.
+          //
+          // ⚠️ `cost_bar.evaluated` STEPS DOWN THE DAY THIS DEPLOYS, by roughly
+          // the sweep-to-brake ratio (~12 five-minute sweeps per hour). Parking
+          // the signal writes a dedup token, so an OCC that stays un-buyable now
+          // records ~1 cost-bar verdict per hour instead of one per sweep —
+          // deliberately, and the same trade every published sibling already
+          // makes. The BLOCK RATE is brake-invariant (numerator and denominator
+          // brake together); the absolute counts either side of this deploy are
+          // NOT comparable, exactly as TRA-3216 documented for its own hoist.
+          //
+          // ⛔ This does NOT make `summary.complete` reachable, and nothing here
+          // claims it does. `trade-opportunity-card.ts` appends `not_suppressed`
+          // with `pass: false` for ANY `signalSkipReason`/`liveSkipReason`, which
+          // refuses `entryTrigger`, which pins `complete: false` — so a complete
+          // card requires an ADMITTED entry, not a better-labelled refusal. What
+          // this buys is `builtInWindow > 0` on TRA-4936's per-ET-day fold: the
+          // in-window funnel becomes readable for the first time, instead of
+          // reporting a zero that a genuinely dead scanner would produce
+          // identically. The remaining pins are filed separately (TRA-4975).
+          this.pushRecentSignal(signal);
+          this.dailySignals.push({
+            id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
           });
           log.info('OTM open rejected by cost-aware fire bar (TRA-1602)', { sym, reason: otmCostReject });
           // The single highest-blocking gate on the live path (retained block rate
