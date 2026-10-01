@@ -1244,6 +1244,31 @@ export interface OptionTradeCloseBasis {
   exitFillPremium: number;
 }
 
+/**
+ * TRA-4947 — the payload of an `amend_close_unmeasured` line. Carries NO money,
+ * by construction: the whole content of the write is that the row's realized
+ * columns become empty. What it DOES carry is the audit record, because a money
+ * column that goes from a figure to nothing with no authority beside it reads
+ * exactly like a silent edit.
+ *
+ * None of the three fields is optional. `reason` and `issue` are what make the
+ * write auditable from the file alone; `skipReason` is the close-basis pass's own
+ * refusal label, which is the machine-checkable half — it says the row reached
+ * this treatment because the pass LOOKED for a broker basis and could not
+ * establish one, not because someone decided the number was wrong.
+ */
+export interface OptionTradeCloseUnmeasured {
+  /** Why this row's figure was never backed by a fill. Human-readable, audited. */
+  reason: string;
+  /** The ruling that authorises it (e.g. `TRA-4859 / TRA-3978 821c3fef`). */
+  issue: string;
+  /**
+   * The {@link CloseBasisSkipReason} the close-basis pass reached this row by —
+   * carried as a plain string so the journal does not import the planner.
+   */
+  skipReason: string;
+}
+
 // Append-only line shapes (discriminated by `kind`).
 type OpenLine = { kind: 'open'; rec: OptionTradeJournalOpen };
 type CloseLine = { kind: 'close'; id: string; close: OptionTradeJournalClose };
@@ -1307,6 +1332,41 @@ type AmendCloseBasisLine = {
   id: string;
   ts: number;
   basis: OptionTradeCloseBasis;
+};
+// TRA-4947 — the THIRD close-basis treatment, and the only one that writes no
+// money at all: retract an unbacked figure from an already-CLOSED row and leave
+// `UNMEASURED` where it was.
+//
+// `amend_close_basis` is "I have a broker number, write it". This is "I have NO
+// broker number, AND the number already on the row was never priced against a
+// fill either, so the honest column is empty." TRA-4857 made the FORWARD path
+// write that (a `broker_reconcile` close with no `brokerOrderId` books
+// `realizedPnlUsd: null` / `outcome: 'UNMEASURED'`), but it is forward-only: the
+// rows closed before it shipped still carry the fabricated figure, and no write
+// path could reach them. Row `34f1ee99` / `SOFI260925C00019000` is the measured
+// instance — `realizedPnlUsd 0` / `SCRATCH` on a position last marked 0.865
+// against a 1.23 basis (TRA-3978), folded into a LIVE order-admission cell.
+//
+// A SEPARATE kind rather than a nullable `basis`, deliberately. The
+// `amend_close_basis` fold refuses a non-finite `realizedPnlUsd` outright
+// (`refusal: 'non_finite'`), and that guard is the thing standing between the
+// money column and a `NaN` from a mis-derived restatement. Widening it to admit
+// `null` would make "I meant nulls" and "my arithmetic produced garbage"
+// indistinguishable at the one place the distinction is load-bearing. So the
+// intent is carried by the LINE KIND, where it cannot be reached by accident.
+//
+// Three things are NOT on this line and must not be: `closeTs`, `exitReason` and
+// `holdDays` — same rule as `amend_close_basis`. The close happened, the engine
+// journalled why, and "we cannot price it" says nothing about any of that.
+//
+// `reason` and `issue` are REQUIRED, not optional. A money column going from a
+// number to empty with no authority recorded beside it is indistinguishable from
+// a silent edit, which is exactly the complaint TRA-3978 was filed about.
+type AmendCloseUnmeasuredLine = {
+  kind: 'amend_close_unmeasured';
+  id: string;
+  ts: number;
+  unmeasured: OptionTradeCloseUnmeasured;
 };
 // TRA-3946 — supersede the row's running MAE. Appended while the row is OPEN,
 // on a bounded cadence (`AVERAGE_DOWN_MAE_PERSIST_STEP`); folded as a MIN so
@@ -1440,6 +1500,7 @@ type JournalLine =
   | PartialCloseLine
   | VoidLine
   | AmendCloseBasisLine
+  | AmendCloseUnmeasuredLine
   | MaeLine
   | AverageDownShadowLine
   | TakeProfitEarlyShadowLine
@@ -1656,6 +1717,95 @@ export function getOptionTradeCloseBasisAmends(): {
     netDeltaUsd:
       Math.round(applied.reduce((s, a) => s + (a.deltaUsd ?? 0), 0) * 100) / 100,
     recent: closeBasisAmendLedger.map((a) => ({ ...a })),
+  };
+}
+
+/**
+ * TRA-4947 — one witnessed retraction of an unbacked realized figure.
+ *
+ * Same contract as the close-basis witness above: the ROW can testify to
+ * retractions that happened (it ends up `UNMEASURED`, and it keeps
+ * `realizedPnlUsdBeforeRestatement`), and only a ledger can testify to the ones
+ * the fold REFUSED. The refusals here are the ones that matter most, because
+ * every one of them is an attempt to delete a number that might have been real:
+ *
+ *   • `row_open` — pointed at an unsettled position.
+ *   • `has_broker_fill_basis` — pointed at a row ALREADY priced from broker
+ *     fills (`pnlBasis: 'broker-fill'`). That row's figure is the best number
+ *     this system can produce; replacing it with `null` would be a strict loss
+ *     of information, and it is the one mistake this line kind makes possible
+ *     that `amend_close_basis` does not.
+ *   • `already_unmeasured` — idempotence. Recorded, never silently dropped, for
+ *     the same reason `zero_delta` is named in the planner: a pass that found
+ *     nothing to do and a pass that never ran must not read alike.
+ *   • `malformed` — no `reason` or no `issue`. An unauditable retraction of a
+ *     money column is refused rather than written.
+ *
+ * `outcomeBefore` / `realizedPnlUsdBefore` / `realizedRBefore` ARE the audit
+ * record TRA-4859's AC2 is graded on, read off the record before the overwrite.
+ */
+export interface OptionTradeCloseUnmeasuredAmendRecord {
+  id: string;
+  ts: number | null;
+  applied: boolean;
+  refusal: 'unknown_row' | 'row_open' | 'has_broker_fill_basis' | 'already_unmeasured' | 'malformed' | null;
+  reason: string | null;
+  issue: string | null;
+  skipReason: string | null;
+  mode: 'demo' | 'live' | null;
+  symbol: string | null;
+  optionSymbol: string | null;
+  /** The prior values this retraction superseded; `null` when the fold refused. */
+  outcomeBefore: OptionTradeOutcome | 'OPEN' | null;
+  realizedPnlUsdBefore: number | null;
+  realizedRBefore: number | null;
+}
+
+/** Same rationale and cap as {@link VOID_LEDGER_CAP} — a witness, not a second journal. */
+const CLOSE_UNMEASURED_LEDGER_CAP = 500;
+let closeUnmeasuredLedger: OptionTradeCloseUnmeasuredAmendRecord[] = [];
+let closeUnmeasuredDropped = 0;
+
+function pushCloseUnmeasured(
+  sink: OptionTradeCloseUnmeasuredAmendRecord[],
+  rec: OptionTradeCloseUnmeasuredAmendRecord,
+): void {
+  sink.push(rec);
+  while (sink.length > CLOSE_UNMEASURED_LEDGER_CAP) {
+    sink.shift();
+    closeUnmeasuredDropped += 1;
+  }
+}
+
+/**
+ * TRA-4947 — retractions observed by the last load plus every one written since.
+ * Served by `/api/health/option-journal` as `closeUnmeasuredAmends`.
+ *
+ * There is no `netDeltaUsd` here and there must not be one. This write moves a
+ * figure to EMPTY, so the "delta" is undefined rather than zero, and publishing
+ * a 0 beside it would invite exactly the reading this ticket exists to refuse —
+ * that nothing happened to the money.
+ */
+export function getOptionTradeCloseUnmeasuredAmends(): {
+  total: number;
+  dropped: number;
+  applied: number;
+  refused: number;
+  live: number;
+  /** Σ |figure retracted| over APPLIED retractions — how much fabricated money left the tape. */
+  retractedAbsUsd: number;
+  recent: OptionTradeCloseUnmeasuredAmendRecord[];
+} {
+  const applied = closeUnmeasuredLedger.filter((a) => a.applied);
+  return {
+    total: closeUnmeasuredLedger.length,
+    dropped: closeUnmeasuredDropped,
+    applied: applied.length,
+    refused: closeUnmeasuredLedger.length - applied.length,
+    live: closeUnmeasuredLedger.filter((a) => a.mode === 'live').length,
+    retractedAbsUsd:
+      Math.round(applied.reduce((s, a) => s + Math.abs(a.realizedPnlUsdBefore ?? 0), 0) * 100) / 100,
+    recent: closeUnmeasuredLedger.map((a) => ({ ...a })),
   };
 }
 
@@ -2008,6 +2158,8 @@ function foldLine(
   openBasisSink: OptionTradeOpenBasisAmendRecord[] = openBasisAmendLedger,
   // TRA-4609 — and once more for the conviction-DCA add witness.
   convictionAddSink: OptionTradeConvictionAddRecord[] = convictionAddLedger,
+  // TRA-4947 — and once more for the unmeasured-retraction witness.
+  unmeasuredSink: OptionTradeCloseUnmeasuredAmendRecord[] = closeUnmeasuredLedger,
 ): void {
   if (line.kind === 'open') {
     if (!map.has(line.rec.id)) map.set(line.rec.id, { ...line.rec, outcome: 'OPEN' });
@@ -2229,6 +2381,99 @@ function foldLine(
         : {}),
       // `closeTs`, `exitReason`, `holdDays` and `partials` are carried through
       // by the spread and deliberately NOT restated — see OptionTradeCloseBasis.
+    });
+    return;
+  }
+  if (line.kind === 'amend_close_unmeasured') {
+    // TRA-4947 — retract an unbacked realized figure from a CLOSED row.
+    //
+    // Guarded on `outcome !== 'OPEN'` for the same reason as the branch above,
+    // and on `pnlBasis !== 'broker-fill'` for a reason unique to this kind: that
+    // label means the row's figure WAS priced from broker fills, which is the
+    // best number this system can produce. Nulling it would be a strict loss,
+    // and it is the only way this line can do damage that
+    // `amend_close_basis` cannot — so it is refused HERE, in the fold, where no
+    // caller can route around it.
+    const rec = map.get(line.id);
+    const u = line.unmeasured;
+    const ts = typeof line.ts === 'number' && Number.isFinite(line.ts) ? line.ts : null;
+    const reason = typeof u?.reason === 'string' && u.reason.trim() !== '' ? u.reason : null;
+    const issue = typeof u?.issue === 'string' && u.issue.trim() !== '' ? u.issue : null;
+    const skipReason = typeof u?.skipReason === 'string' && u.skipReason.trim() !== '' ? u.skipReason : null;
+    const refuseUnmeasured = (
+      refusal: NonNullable<OptionTradeCloseUnmeasuredAmendRecord['refusal']>,
+    ): void => {
+      pushCloseUnmeasured(unmeasuredSink, {
+        id: line.id,
+        ts,
+        applied: false,
+        refusal,
+        reason,
+        issue,
+        skipReason,
+        mode: rec?.mode ?? null,
+        symbol: rec?.symbol ?? null,
+        optionSymbol: rec?.optionSymbol ?? null,
+        // Deliberately NOT populated on a refusal. These three are the audit
+        // record of a write that HAPPENED; carrying them on a refusal would make
+        // a refused line read, in the witness, like a retraction that landed.
+        outcomeBefore: null,
+        realizedPnlUsdBefore: null,
+        realizedRBefore: null,
+      });
+    };
+    // Malformed FIRST, before the row lookup: an unauditable retraction is
+    // refused whether or not the id resolves, and reporting `unknown_row` for a
+    // line that also carries no authority would name the wrong defect.
+    if (reason === null || issue === null || skipReason === null) { refuseUnmeasured('malformed'); return; }
+    if (!rec) { refuseUnmeasured('unknown_row'); return; }
+    if (rec.outcome === 'OPEN') { refuseUnmeasured('row_open'); return; }
+    if (rec.pnlBasis === 'broker-fill') { refuseUnmeasured('has_broker_fill_basis'); return; }
+    // Idempotence. Keyed on BOTH the label and the emptiness of the column, not
+    // on the label alone: `outcome: 'UNMEASURED'` beside a surviving figure is
+    // a half-applied row and must still be finished, and a figure beside any
+    // other outcome is still a candidate.
+    if (rec.outcome === 'UNMEASURED' && (rec.realizedPnlUsd === null || rec.realizedPnlUsd === undefined)) {
+      refuseUnmeasured('already_unmeasured');
+      return;
+    }
+    const before = Number.isFinite(rec.realizedPnlUsd) ? (rec.realizedPnlUsd as number) : null;
+    const rBefore = Number.isFinite(rec.realizedR) ? (rec.realizedR as number) : null;
+    pushCloseUnmeasured(unmeasuredSink, {
+      id: line.id,
+      ts,
+      applied: true,
+      refusal: null,
+      reason,
+      issue,
+      skipReason,
+      mode: rec.mode,
+      symbol: rec.symbol,
+      optionSymbol: rec.optionSymbol ?? null,
+      outcomeBefore: rec.outcome,
+      realizedPnlUsdBefore: before,
+      realizedRBefore: rBefore,
+    });
+    map.set(line.id, {
+      ...rec,
+      outcome: 'UNMEASURED',
+      realizedPnlUsd: null,
+      realizedR: null,
+      // `pnlBasis` is deliberately NOT set. There is no broker fill behind this
+      // row — that absence is the entire finding — so stamping 'broker-fill'
+      // would be the same fabrication in a provenance column, and it would also
+      // make the close-basis planner skip the row as `already_restated` and so
+      // stop publishing it as unmeasurable.
+      //
+      // Same pin as the close-basis branch: the ORIGINAL figure, set once and
+      // never moved again, so a replay of two amends cannot record the
+      // intermediate value as "what the engine said".
+      ...(rec.realizedPnlUsdBeforeRestatement === undefined && before !== null
+        ? { realizedPnlUsdBeforeRestatement: before }
+        : {}),
+      // `closeTs`, `exitReason`, `holdDays`, `partials`, `atRiskUsd` all carry
+      // through by the spread. The close happened and the engine journalled why;
+      // "we cannot price it" says nothing about any of that.
     });
     return;
   }
@@ -2738,6 +2983,8 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
   const openBasisSink: OptionTradeOpenBasisAmendRecord[] = [];
   // TRA-4609 — and the conviction-DCA add witness.
   const convictionAddSink: OptionTradeConvictionAddRecord[] = [];
+  // TRA-4947 — and the unmeasured-retraction witness.
+  const unmeasuredSink: OptionTradeCloseUnmeasuredAmendRecord[] = [];
   if (existsSync(path)) {
     try {
       const raw = await readFile(path, 'utf-8');
@@ -2745,7 +2992,7 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
         const trimmed = rawLine.trim();
         if (!trimmed) continue;
         try {
-          foldLine(map, JSON.parse(trimmed) as JournalLine, voidSink, amendSink, supersedeSink, openBasisSink, convictionAddSink);
+          foldLine(map, JSON.parse(trimmed) as JournalLine, voidSink, amendSink, supersedeSink, openBasisSink, convictionAddSink, unmeasuredSink);
         } catch {
           // Skip a single corrupt line rather than losing the whole journal — but
           // COUNT it, so a dropped row cannot pass for a clean load.
@@ -2770,6 +3017,7 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
   closeSupersedeLedger = supersedeSink;
   openBasisAmendLedger = openBasisSink;
   convictionAddLedger = convictionAddSink;
+  closeUnmeasuredLedger = unmeasuredSink;
 
   // TRA-1681 — do NOT cache a book we could not read.
   //
@@ -3291,6 +3539,81 @@ export async function recordOptionTradeCloseBasis(
     feesUsd: basis.feesUsd,
   });
   return true;
+}
+
+/**
+ * TRA-4947 — RETRACT an unbacked realized figure from ONE closed row, witnessed.
+ *
+ * The third close-basis treatment, and the only one that writes no money:
+ * `realizedPnlUsd`, `realizedR` → `null`, `outcome` → `UNMEASURED`. Used for the
+ * historical residue TRA-4857's forward-only fix cannot reach — a
+ * `broker_reconcile` close with no `brokerOrderId`, whose journalled figure was
+ * synthesised at `breakEvenFill = premiumPaid` and never priced against a fill.
+ *
+ * Folds FIRST and appends only if the fold applied, so the file never carries a
+ * line a replay would refuse — the same ordering as
+ * {@link recordOptionTradeCloseBasis} and {@link recordOptionTradeOpenBasis}.
+ *
+ * Returns the refusal rather than a bare boolean. The four refusals are not
+ * interchangeable and the caller has to report WHICH one: `has_broker_fill_basis`
+ * means something tried to delete a broker-settled number, which is a different
+ * and worse event than `already_unmeasured`.
+ *
+ * Does NOT re-notify close listeners. The row's realized money is being
+ * withdrawn, not restated, and every downstream fold already excludes
+ * `UNMEASURED` (`learned-option-weights` drops it from `resolvedRows`,
+ * `option-tape-expectancy` counts it in `droppedUnpricedCloses`) off the journal
+ * it re-reads.
+ */
+export async function recordOptionTradeCloseUnmeasured(
+  id: string,
+  unmeasured: OptionTradeCloseUnmeasured,
+  // Test seam — pin the witness clock. Defaults to wall time.
+  ts: number = Date.now(),
+): Promise<{ applied: boolean; refusal: OptionTradeCloseUnmeasuredAmendRecord['refusal'] }> {
+  if (!isOptionTradeJournalEnabled()) return { applied: false, refusal: null };
+  const map = await ensureLoaded();
+  const existing = map.get(id);
+  const before = existing?.realizedPnlUsd ?? null;
+  const outcomeBefore = existing?.outcome ?? null;
+  const line: AmendCloseUnmeasuredLine = { kind: 'amend_close_unmeasured', id, ts, unmeasured };
+  // The fold pushes exactly one witness per line; `dropped` moves instead of
+  // `length` once the ledger is at cap, so watch both.
+  const lenBefore = closeUnmeasuredLedger.length;
+  const droppedBefore = closeUnmeasuredDropped;
+  foldLine(map, line);
+  const witness = closeUnmeasuredLedger[closeUnmeasuredLedger.length - 1];
+  const pushed = (closeUnmeasuredLedger.length > lenBefore || closeUnmeasuredDropped > droppedBefore)
+    && witness !== undefined && witness.id === id;
+  if (!pushed || !witness.applied) {
+    log.warn('option trade journal UNMEASURED retraction REFUSED', {
+      issue: 'TRA-4947',
+      id,
+      refusal: witness?.refusal ?? null,
+      outcomeBefore,
+      realizedPnlUsdBefore: before,
+      pnlBasis: existing?.pnlBasis ?? null,
+    });
+    return { applied: false, refusal: pushed ? witness.refusal : null };
+  }
+  await appendLine(line);
+  // Logged at WARN, not INFO, and unlike the restatement log this one names the
+  // figure that LEFT the tape. A number disappearing from a money column is the
+  // loudest thing this module does and the hardest to reconstruct afterwards.
+  log.warn('option trade journal realized figure RETRACTED to UNMEASURED', {
+    issue: 'TRA-4947',
+    id,
+    symbol: existing?.symbol,
+    optionSymbol: existing?.optionSymbol,
+    mode: existing?.mode,
+    outcomeBefore,
+    realizedPnlUsdBefore: before,
+    realizedRBefore: witness.realizedRBefore,
+    authority: unmeasured.issue,
+    skipReason: unmeasured.skipReason,
+    reason: unmeasured.reason,
+  });
+  return { applied: true, refusal: null };
 }
 
 /**

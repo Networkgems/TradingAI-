@@ -110,7 +110,7 @@ describe('TRA-2819 close-basis restatement — the live 2026-07-30 cohort', () =
     ];
 
     const plan = planCloseBasisRestate(rows, ledger);
-    expect(plan.counts).toEqual({ restate: 3, skip: 0 });
+    expect(plan.counts).toEqual({ restate: 3, skip: 0, unmeasure: 0 });
 
     const byId = new Map(plan.rows.map((r) => [r.id, r]));
     // Tradier `/gainloss` `gain_loss`, per lot, from the ticket's own table.
@@ -172,7 +172,7 @@ describe('TRA-2819 close-basis restatement — the live 2026-07-30 cohort', () =
     const partial = aaplFills();
     partial[2] = { ...partial[2]!, fees: null };
     const plan = planCloseBasisRestate([row()], partial);
-    expect(plan.counts).toEqual({ restate: 0, skip: 1 });
+    expect(plan.counts).toEqual({ restate: 0, skip: 1, unmeasure: 0 });
     expect(plan.rows[0]!.skipReason).toBe('fees_unmeasured');
     expect(plan.rows[0]!.realizedPnlUsdAfter).toBeNull();
     expect(plan.netDeltaUsd).toBe(0);
@@ -203,7 +203,7 @@ describe('TRA-2819 close-basis restatement — the live 2026-07-30 cohort', () =
         fill({ optionSymbol: 'PLTR260911C00170000', side: 'sell_to_close', ts: 1785862800000, contracts: 1, filledPrice: 6, fees: 0.14, origin: 'history_import' }),
       ],
     );
-    expect(plan.counts).toEqual({ restate: 0, skip: 1 });
+    expect(plan.counts).toEqual({ restate: 0, skip: 1, unmeasure: 0 });
     expect(plan.rows[0]!.skipReason).toBe('zero_delta');
     // Reported WITH its numbers: a bare skip could not be told from a miss.
     expect(plan.rows[0]!.realizedPnlUsdAfter).toBe(155.75);
@@ -212,7 +212,7 @@ describe('TRA-2819 close-basis restatement — the live 2026-07-30 cohort', () =
 
   it('is idempotent — a restated row is not re-priced on a second pass', () => {
     const plan = planCloseBasisRestate([row({ pnlBasis: 'broker-fill' })], aaplFills());
-    expect(plan.counts).toEqual({ restate: 0, skip: 1 });
+    expect(plan.counts).toEqual({ restate: 0, skip: 1, unmeasure: 0 });
     expect(plan.rows[0]!.skipReason).toBe('already_restated');
   });
 

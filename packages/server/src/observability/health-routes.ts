@@ -366,6 +366,7 @@ import {
   getOptionTradeJournalIntegrity,
   getOptionTradeVoids, // TRA-3472 — the acceptance witness for the never-filled retraction
   getOptionTradeCloseBasisAmends, // TRA-2819 — the acceptance witness for the broker-basis restatement
+  getOptionTradeCloseUnmeasuredAmends, // TRA-4947 — ...and for the honest-nulls retraction
   getOptionTradeCloseSupersedes, // TRA-4004 — the acceptance witness for a real close landing on an already-closed row
   getOptionTradeOpenBasisAmends, // TRA-4028 — the acceptance witness for an entry-basis restatement (blend → own fill)
   getOptionTradeConvictionAdds, // TRA-4609 — the acceptance witness for a conviction-DCA add growing an OPEN row's basis
@@ -9008,6 +9009,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // those rows and picks them up on a later tick rather than publishing a
       // gross number wearing a broker-settled label.
       closeBasisSweep: getCloseBasisSweepState(),
+      // TRA-4947 — the RETRACTION witness, beside `closeBasisAmends` and for the
+      // same reason: a row whose realized figure was withdrawn and a row that
+      // never had one read identically on the row itself, so only this ledger
+      // says a retraction happened and who authorised it. No `netDeltaUsd` here
+      // on purpose — the after-figure is EMPTY, so the delta is undefined rather
+      // than 0, and a 0 beside it would read as "nothing happened to the money".
+      // `refused` is the alarm: `has_broker_fill_basis` means something tried to
+      // delete a broker-settled number.
+      closeUnmeasuredAmends: getOptionTradeCloseUnmeasuredAmends(),
       // TRA-4950 — IS `peakPremium` AN MFE? For a long option the realized exit
       // can never exceed the true peak, and on the 2026-10-01 tape 101 of the 312
       // rows carrying all four operands booked MORE than their recorded peak —

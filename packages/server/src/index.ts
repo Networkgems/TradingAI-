@@ -147,6 +147,10 @@ import {
   getOptionTradeVoids,
   recordOptionTradeCloseBasis,
   getOptionTradeCloseBasisAmends,
+  // TRA-4947 — the third close-basis treatment: retract an unbacked realized
+  // figure to honest nulls, and its witness.
+  recordOptionTradeCloseUnmeasured,
+  getOptionTradeCloseUnmeasuredAmends,
   // TRA-4004 — the measured backfill of a close a reconstruction displaced.
   recordOptionTradeCloseSupersede,
   getOptionTradeCloseSupersedes,
@@ -14588,6 +14592,15 @@ app.post('/api/health/option-journal/close-basis-repair', requireAuth, requireAd
     return;
   }
   const apply = wantsApply && confirmed;
+  // TRA-4947 — the `unmeasure` treatment needs its OWN token, on top of
+  // `apply=true&confirm=TRA-2819`. It is the only treatment that moves a money
+  // column to EMPTY, and the recurring TRA-2819 restatement run must not be able
+  // to do that as a side effect: a restatement is recoverable (re-derive from
+  // the ledger and write again), a retraction is a deletion. Two tokens means a
+  // routine restatement pass and a deliberate retraction cannot be the same
+  // request by accident.
+  const unmeasureConfirmed = q['unmeasure'] === 'TRA-4947';
+  const applyUnmeasure = apply && unmeasureConfirmed;
 
   // Re-derived in THIS request off the live journal and the live fill ledger.
   // There is no stored cohort and no list of ids in the code, for the reason the
@@ -14624,6 +14637,7 @@ app.post('/api/health/option-journal/close-basis-repair', requireAuth, requireAd
   const results: {
     id: string;
     optionSymbol: string | null;
+    treatment: string;
     ok: boolean;
     realizedPnlUsdBefore: number | null;
     realizedPnlUsdAfter: number | null;
@@ -14637,6 +14651,7 @@ app.post('/api/health/option-journal/close-basis-repair', requireAuth, requireAd
       results.push({
         id: row.id,
         optionSymbol: row.optionSymbol,
+        treatment: row.treatment,
         ok,
         realizedPnlUsdBefore: row.realizedPnlUsdBefore,
         realizedPnlUsdAfter: row.realizedPnlUsdAfter,
@@ -14647,6 +14662,34 @@ app.post('/api/health/option-journal/close-basis-repair', requireAuth, requireAd
         detail: ok
           ? `restated through the replay fold: ${row.realizedPnlUsdBefore} -> ${row.realizedPnlUsdAfter} USD (fees ${row.feesUsd})`
           : 'REFUSED by the fold (row unknown or still OPEN)',
+      });
+    }
+  }
+  // TRA-4947 — the retraction pass, separate from the restatement loop above
+  // and gated on its own token. Runs SECOND on purpose: a row that the
+  // restatement could price is not a candidate here, and after the loop above
+  // such a row carries `pnlBasis: 'broker-fill'`, which the fold refuses as
+  // `has_broker_fill_basis`. So the ordering makes the overlap impossible
+  // rather than merely unlikely.
+  const unmeasureRows = plan.rows.filter((r) => r.treatment === 'unmeasure' && r.unmeasured);
+  if (applyUnmeasure) {
+    for (const row of unmeasureRows) {
+      const res = await recordOptionTradeCloseUnmeasured(row.id, row.unmeasured!);
+      results.push({
+        id: row.id,
+        optionSymbol: row.optionSymbol,
+        treatment: row.treatment,
+        ok: res.applied,
+        realizedPnlUsdBefore: row.realizedPnlUsdBefore,
+        // Not "0". The after-state of this write is an EMPTY column, and the
+        // whole point of the ticket is that an empty column and a 0 are
+        // different claims.
+        realizedPnlUsdAfter: null,
+        deltaUsd: null,
+        detail: res.applied
+          ? `RETRACTED through the replay fold: realizedPnlUsd ${row.realizedPnlUsdBefore} -> null, `
+            + `realizedR -> null, outcome -> UNMEASURED (authority ${row.unmeasured!.issue})`
+          : `REFUSED by the fold: ${res.refusal ?? 'journal disabled'}`,
       });
     }
   }
@@ -14676,9 +14719,35 @@ app.post('/api/health/option-journal/close-basis-repair', requireAuth, requireAd
     liveRowsCarryingBrokerBasis: restatedRows.length,
     liveClosedRealizedPnlUsd:
       Math.round(after.filter((r) => r.outcome !== 'OPEN').reduce((s, r) => s + (r.realizedPnlUsd ?? 0), 0) * 100) / 100,
+    // TRA-4947 — the retraction population, its witness, and the hard gate,
+    // published on EVERY response including the dry run. `population` is what the
+    // CFO's gate is read off: an operator is required to confirm it is exactly
+    // the row(s) they intend before adding the second token.
+    unmeasure: {
+      requested: wantsApply,
+      tokenPresent: unmeasureConfirmed,
+      applied: applyUnmeasure,
+      population: unmeasureRows.map((r) => ({
+        id: r.id,
+        optionSymbol: r.optionSymbol,
+        // Both conjuncts of the predicate, PUBLISHED. The first attempt to grade
+        // this from outside the planner read `undefined` for both on all 32 live
+        // rows, because neither was on the plan row — so `brokerOrderId === null`
+        // evaluated vacuously true for every one of them.
+        exitReason: r.exitReason,
+        brokerOrderId: r.brokerOrderId,
+        skipReason: r.skipReason,
+        realizedPnlUsdBefore: r.realizedPnlUsdBefore,
+        realizedRBefore: null,
+        authority: r.unmeasured?.issue ?? null,
+      })),
+      witness: applyUnmeasure ? getOptionTradeCloseUnmeasuredAmends() : null,
+    },
     note: apply
-      ? `Applied: ${results.filter((r) => r.ok).length}/${plan.counts.restate} rows restated, net ${plan.netDeltaUsd} USD.`
-      : `DRY RUN — nothing written. Plan: ${plan.counts.restate} restate / ${plan.counts.skip} skip, net ${plan.netDeltaUsd} USD. Re-POST with ?apply=true&confirm=TRA-2819 to execute.`,
+      ? `Applied: ${results.filter((r) => r.ok && r.treatment === 'restate').length}/${plan.counts.restate} rows restated, net ${plan.netDeltaUsd} USD.`
+        + ` Retractions: ${applyUnmeasure ? `${results.filter((r) => r.ok && r.treatment === 'unmeasure').length}/${plan.counts.unmeasure}` : `0/${plan.counts.unmeasure} (no unmeasure=TRA-4947 token)`}.`
+      : `DRY RUN — nothing written. Plan: ${plan.counts.restate} restate / ${plan.counts.unmeasure} unmeasure / ${plan.counts.skip} skip, net ${plan.netDeltaUsd} USD.`
+        + ' Re-POST with ?apply=true&confirm=TRA-2819 to restate, and additionally &unmeasure=TRA-4947 to retract unbacked figures.',
   });
 });
 

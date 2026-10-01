@@ -129,6 +129,14 @@ export type CloseBasisSweepOutcome =
   | 'restated'
   | 'refused'
   | 'fees-pending'
+  /**
+   * TRA-4947 — the pass found row(s) whose journalled figure was never priced
+   * against a fill and that it is not permitted to write. Distinct from
+   * `fees-pending` (COME BACK — the fee reconcile will clear it by itself) and
+   * from `clean`: nothing clears this except an operator POSTing the admin
+   * route, so publishing `clean` over it would retire a standing backlog.
+   */
+  | 'unmeasurable-backlog'
   | 'observe-only'
   | 'ledger-unusable'
   | 'error';
@@ -155,6 +163,19 @@ export interface CloseBasisSweepCounts {
   feesPending: number;
   /** Rows skipped for anything else (unjoinable, partial coverage, no basis). */
   otherSkips: number;
+  /**
+   * TRA-4947 — rows the planner would RETRACT to `UNMEASURED`: no broker basis
+   * AND an `exitReason: 'broker_reconcile'` close with no `brokerOrderId`, so the
+   * figure on the row was never priced against a fill either.
+   *
+   * This sweep MEASURES these and never writes them — see the note in
+   * {@link runCloseBasisSweep}. A non-zero reading here is a standing backlog
+   * that an operator has to clear through the admin route, which is why it is a
+   * counted, named cell and not folded into `otherSkips`.
+   */
+  unmeasurable: number;
+  /** Rows already retracted — the idempotence cell, so a cleared backlog is visible. */
+  alreadyUnmeasured: number;
   /** Per-reason census, so the denominator is never implicit. */
   skipsByReason: Record<string, number>;
   /** Σ `deltaUsd` over the restatable rows — what this tick WOULD move the book by. */
@@ -280,13 +301,19 @@ function countsFrom(plan: CloseBasisPlan): CloseBasisSweepCounts {
   const alreadyRestated = by['already_restated'] ?? 0;
   const zeroDelta = by['zero_delta'] ?? 0;
   const feesPending = by['fees_unmeasured'] ?? 0;
+  const alreadyUnmeasured = by['already_unmeasured'] ?? 0;
   return {
     closedLiveRows: plan.scanned,
     restatable: plan.counts.restate,
     alreadyRestated,
     zeroDelta,
     feesPending,
-    otherSkips: plan.counts.skip - alreadyRestated - zeroDelta - feesPending,
+    // TRA-4947 — `plan.counts.skip` no longer includes the `unmeasure` rows (the
+    // planner subtracts them), so this remainder stays a remainder over SKIPS
+    // only and `unmeasurable` is published beside it rather than inside it.
+    otherSkips: plan.counts.skip - alreadyRestated - zeroDelta - feesPending - alreadyUnmeasured,
+    unmeasurable: plan.counts.unmeasure,
+    alreadyUnmeasured,
     skipsByReason: { ...by },
     plannedNetDeltaUsd: plan.netDeltaUsd,
   };
@@ -395,6 +422,28 @@ export async function runCloseBasisSweep(deps: CloseBasisSweepDeps): Promise<Clo
     // The fee-pending backlog and every other non-routine skip are evidence too:
     // a row that is being SKIPPED forever, and cannot be named, is the defect
     // this whole module exists to make impossible.
+    //
+    // TRA-4947 — the `unmeasure` rows come through here as well, and they are
+    // published with `applied: false` because THIS SWEEP DELIBERATELY DOES NOT
+    // WRITE THEM. Three reasons, and the first is the binding one:
+    //
+    //  1. The forward path already handles new closes of this shape at the write
+    //     site (TRA-4857): a `broker_reconcile` close with no `brokerOrderId`
+    //     books `null`/`UNMEASURED` the moment it lands. So anything reaching
+    //     this branch is HISTORICAL residue — a bounded, enumerable set — and
+    //     the remedy for a bounded set is an operator who has read it, not a
+    //     background loop.
+    //  2. It is the one treatment that DELETES a money figure. The CFO's gate on
+    //     TRA-4947 is "enumerate the population and confirm it is exactly one
+    //     row before you write", and a gate nobody stands at is not a gate. The
+    //     admin route's `unmeasure=TRA-4947` token is where a human stands.
+    //  3. `7b2f9b50` is the precedent: a one-term-too-wide predicate on exactly
+    //     this population, forward-only, which read normal on every historical
+    //     surface while new closes silently stopped landing. An auto-writing
+    //     sweep would have made that retroactive too.
+    //
+    // The backlog is LOUD rather than silent: `counts.unmeasurable`, a per-row
+    // evidence line each tick, and `lastOutcome: 'unmeasurable-backlog'`.
     for (const row of plan.rows) {
       if (row.treatment === 'restate' || !isNoteworthySkip(row)) continue;
       evidence.push({
@@ -407,7 +456,11 @@ export async function runCloseBasisSweep(deps: CloseBasisSweepDeps): Promise<Clo
         deltaUsd: row.deltaUsd,
         feesUsd: row.feesUsd,
         applied: false,
-        reason: row.reason,
+        reason: row.treatment === 'unmeasure'
+          ? `${row.reason}. NOT WRITTEN BY THIS SWEEP — retracting a money column requires the admin `
+            + 'route POST /api/health/option-journal/close-basis-repair?apply=true&confirm=TRA-2819'
+            + '&unmeasure=TRA-4947, so the population is enumerated by an operator first'
+          : row.reason,
       });
     }
     state.lastRows = evidence.slice(0, ROW_EVIDENCE_MAX);
@@ -433,6 +486,10 @@ export async function runCloseBasisSweep(deps: CloseBasisSweepDeps): Promise<Clo
       state.lastOutcome = 'refused';
     } else if (counts.feesPending > 0) {
       state.lastOutcome = 'fees-pending';
+    } else if (counts.unmeasurable > 0) {
+      // TRA-4947 — AFTER `fees-pending`, which is self-clearing, and ahead of
+      // `clean`, which this is not: an unmeasurable row needs an operator.
+      state.lastOutcome = 'unmeasurable-backlog';
     } else {
       state.lastOutcome = 'clean';
     }
