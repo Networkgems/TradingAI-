@@ -60,9 +60,27 @@ describe('summarizeAccuracy', () => {
     expect(acc.avgRR).toBeCloseTo(1, 6); // (2 -1 +2)/3
   });
 
-  it('is all-zero on an empty set', () => {
+  it('is all-zero on an empty set, and says WHY the winRate is zero', () => {
     const acc = summarizeAccuracy([]);
-    expect(acc).toEqual({ totalSignals: 0, winningSignals: 0, winRate: 0, avgRR: 0 });
+    // ⚠️ REPAIRED 2026-10-01 (TRA-5021). `19c26272` (TRA-4998) added
+    // `resolvedSignals` / `unresolvedSignals` / `winRateBasis`, so this exact-shape
+    // `toEqual` went red on three fields the source had legitimately gained.
+    //
+    // The exact-shape form is KEPT on purpose — it is what makes a silently added
+    // field visible — but the stale literal is the reason this was the SIXTH red test
+    // in the monorepo while the headline count said five. `winRateBasis` is now
+    // asserted rather than merely accommodated: a `winRate: 0` that means "nothing to
+    // grade" must not read the same as a measured 0% (CLAUDE.md — absent evidence is
+    // its own named state), and that distinction is the whole of TRA-4998.
+    expect(acc).toEqual({
+      totalSignals: 0,
+      winningSignals: 0,
+      winRate: 0,
+      avgRR: 0,
+      resolvedSignals: 0,
+      unresolvedSignals: 0,
+      winRateBasis: 'no_signals',
+    });
   });
 });
 
