@@ -1403,6 +1403,63 @@ export function raisePeakPremiumForBookkeeping(opt: OptionPosition, premium: num
 }
 
 /**
+ * TRA-4950 — THE CLOSE-SIDE RATCHET. The peak was advanced in exactly two
+ * places and both were TICK paths ({@link ratchetObservedPeakPremium} off
+ * `checkExits`' per-row `mark`, and `refreshImportedMarks`). Every CLOSE path
+ * resolves its OWN exit price — `closeOption` off `opt.currentPremium`,
+ * `resolvePendingExit` off the broker's avg fill, `recordImportedFill` /
+ * `bookPartialFill` likewise, the multi-leg settle off a synthetic `closeMark` —
+ * and booked P&L against it without ever offering that price to the ratchet. The
+ * tick ratchet is also skipped whenever the row `continue`s above it, most of all
+ * on `opt.pendingExit`, i.e. for the whole life of a staged exit.
+ *
+ * So the engine could observe a price, act on it, bank it, and never widen the
+ * excursion it claims to have seen. Measured on bqb1 `faae9388` (2026-10-01,
+ * 3542 rows): 101 of the 312 rows carrying all four operands book MORE than
+ * their recorded peak — `sl` and every other adverse-side exit 0/78,
+ * `take_profit_early` 8/8, `book_halt_flat` 85/201. The side-asymmetry is the
+ * test's POWER, not a second bug: a stop books far below any peak and satisfies
+ * the inequality however badly the stamp under-records.
+ *
+ * ⚠️ CLOSE TIME ONLY, and that is a correctness constraint rather than
+ * conservatism. `peakPremium` is an INPUT to `profitLockDecision`, the premium
+ * trail and the TRA-4020 floor ladder, so raising it at any instant a rule could
+ * still fire would move exit decisions — which TRA-4950 AC5 forbids and
+ * TRA-4168 settled. A position that is closing has no further decisions to
+ * change, so a ratchet here is observable in the journal and nowhere else.
+ * (For the same reason the `book_halt_flat` → `profit_lock` relabel in
+ * `closeOption` is evaluated BEFORE this call: the relabel reproduces what the
+ * exit cascade would have decided, and it must keep reading the peak that
+ * cascade would have read.)
+ *
+ * `basis` is the usual TRA-4160 provenance split and it is not cosmetic: a
+ * broker fill or a mark the book carried IS a price the market served
+ * (`observed`, and it dates the stamp), while a synthesised per-share close mark
+ * is a BOOKKEEPING figure — `raisePeakPremiumForBookkeeping` clears
+ * `peakPremiumAt` rather than asserting an excursion at an instant nothing
+ * printed.
+ *
+ * Non-finite, non-positive and non-advancing prices are no-ops, so every call
+ * site may call unconditionally. Returns whether the peak moved.
+ */
+export function ratchetPeakPremiumAtClose(
+  opt: OptionPosition,
+  closePremium: number,
+  basis: 'observed' | 'bookkeeping',
+  now: number,
+): boolean {
+  if (!Number.isFinite(closePremium) || closePremium <= 0) return false;
+  // Covered writes are SHORT the premium: the favourable excursion runs DOWN, so
+  // raising a peak toward a buy-back debit would invert the quantity. They settle
+  // through `settleCoveredWrite` and are out of this field's domain (the grader
+  // in `option-peak-mfe.ts` reads them as `not_applicable_not_long_single_leg`).
+  if (opt.coveredWrite) return false;
+  return basis === 'observed'
+    ? ratchetObservedPeakPremium(opt, closePremium, now)
+    : raisePeakPremiumForBookkeeping(opt, closePremium);
+}
+
+/**
  * TRA-4160 ask 4 — the sentinel, installed at the snapshot boundary.
  *
  * A row arriving from disk with a peak materially above its basis and NO stamp
@@ -13060,6 +13117,19 @@ export class PaperOptionsAccount {
       this.applyRealtimeImportedPnl(pnl);
     }
     opt.pnl = (opt.pnl ?? 0) + pnl;
+    // TRA-4950 — a broker fill is a PRINT the tick loop never sampled, and this
+    // path is skipped by the tick ratchet by construction (`checkExits`
+    // `continue`s on `opt.pendingExit`, so the row is unobserved for the whole
+    // life of a staged exit). `fillPrice` present ⇒ the broker told us what it
+    // filled at ⇒ `observed`; absent ⇒ all we hold is our own `limitPrice`, which
+    // is an INTENT, so it raises the peak as `bookkeeping` with no stamp rather
+    // than asserting an excursion at a price we never saw confirmed.
+    ratchetPeakPremiumAtClose(
+      opt,
+      price,
+      typeof fillPrice === 'number' && Number.isFinite(fillPrice) && fillPrice > 0 ? 'observed' : 'bookkeeping',
+      Date.now(),
+    );
     opt.currentPremium = price;
     opt.contractsRemaining -= exitContracts;
 
@@ -16739,6 +16809,9 @@ export class PaperOptionsAccount {
     const remainingContracts = opt.contractsRemaining;
     const pnl = (avgFillPrice - opt.premiumPaid) * remainingContracts * 100;
     opt.pnl = (opt.pnl ?? 0) + pnl;
+    // TRA-4950 — a Tradier avg fill is an observed print. `refreshImportedMarks`
+    // ratchets the HOLD for mirrored rows; this is the close.
+    ratchetPeakPremiumAtClose(opt, avgFillPrice, 'observed', Date.now());
     opt.exitReason = exitReason; // TRA-2940 — same value the journal receives below
     opt.closedAt = Date.now();
     opt.currentPremium = avgFillPrice;
@@ -16820,6 +16893,10 @@ export class PaperOptionsAccount {
       this.applyRealtimeImportedPnl(pnl);
     }
     opt.pnl = (opt.pnl ?? 0) + pnl;
+    // TRA-4950 — same argument as `resolvePendingExit`: a broker fill on a slice
+    // is still a print, and the row is `pendingExit`-gated out of the tick
+    // ratchet while the close is in flight.
+    ratchetPeakPremiumAtClose(opt, avgFillPrice, 'observed', Date.now());
     opt.currentPremium = avgFillPrice;
     opt.contractsRemaining -= slice;
     opt.partialCloseBookedOrderId = orderId;
@@ -17117,6 +17194,22 @@ export class PaperOptionsAccount {
         }
       }
     }
+    // TRA-4950 — the close-side ratchet, placed AFTER the relabel above (which
+    // must keep reading the peak the exit cascade would have read) and BEFORE the
+    // P&L below. This is the dominant missing update site: 85 of the 201
+    // `book_halt_flat` rows on the 2026-10-01 tape booked more than their
+    // recorded peak, because the flatten closes at `opt.currentPremium` — a mark
+    // written by `resolvePendingExit` / `bookPartialFill`, or carried from the
+    // last tick the row was not gated out of, and in neither case ever offered to
+    // the ratchet.
+    //
+    // Ratcheted off `closePrice`, NOT `effectiveExit`: the pre-haircut figure is
+    // the price the book actually saw, where `demoExitFillPrice` then models what
+    // a sale would have fetched. Using the haircut number would under-record the
+    // excursion by exactly the modelled spread — the same under-recording this
+    // ticket is the remedy for, one layer down.
+    ratchetPeakPremiumAtClose(opt, closePrice, 'observed', Date.now());
+
     // TRA-2233 — demo manual close fills at the marketable bid/ask when armed; MID otherwise.
     // (Live path already substituted the broker's real avg fill into `closePrice`.)
     const effectiveExit = this.demoExitFillPrice(closePrice, opt);

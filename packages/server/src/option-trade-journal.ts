@@ -20,6 +20,10 @@ import { resolveDataDir } from './data-dir.js';
 import { foldCrossedCells, foldSpreadCells } from './option-crossed-pnl.js';
 import type { CrossedFoldCells, SpreadFoldCells } from './option-crossed-pnl.js';
 import { appendBoundedTapeLine } from './data-tape-bounds.js';
+// TRA-4950 — the peak-MFE grader. A LEAF module (pure math + a boot-scoped
+// counter, no journal import), so this cannot cycle.
+import { notePeakMfeClose } from './option-peak-mfe.js';
+import type { PeakMfeRowInput } from './option-peak-mfe.js';
 
 // TRA-990 (Learning A) — the option-trade JOURNAL: a durable, observe-only
 // setup -> outcome ledger for option positions (calls/puts, spreads and
@@ -610,6 +614,25 @@ export interface OptionTradeJournalClose {
    * engine never marked). The twin of {@link OptionTradeJournalRecord.mae}:
    * together they make "how much of the peak did this exit rule give back"
    * a subtraction rather than an inference.
+   *
+   * ⛔ TRA-4950 — ON A CLOSE WRITTEN BEFORE 2026-10-01 THIS IS NOT AN MFE, AND
+   * IT IS NOT REPAIRED. The peak was advanced on TICK paths only, while every
+   * CLOSE path resolved its own exit price and never offered it to the ratchet —
+   * so the field systematically UNDER-records the favourable side while tracking
+   * the adverse side fine. Measured on bqb1 `faae9388` (3542 rows): 101 of the
+   * 312 rows carrying all four operands book MORE than their recorded peak,
+   * every one on a winner, `take_profit_early` 8/8 and `book_halt_flat` 85/201
+   * against 0/78 on every adverse-side exit. A give-back / capture-ratio fold
+   * over that cohort returns 3.1, 4.0 and 12.5 — i.e. nonsense — WITHOUT going
+   * red, which is why {@link PEAK_MFE_TRUSTWORTHY_FROM_ISO} exists and why
+   * `/api/health/option-journal` → `peakMfeInvariant` publishes the live
+   * violation rate rather than a presence flag.
+   *
+   * Backfilling is refused for the TRA-4160 reason, restated: the tick that
+   * would have set the true peak was never recorded anywhere, and
+   * reconstructing one off the open/close window is a fabricated column. Rows
+   * closed before the cut keep their stamp and must be read as a LOWER BOUND on
+   * the excursion, never as the excursion.
    */
   peakPremium?: number;
   peakPremiumAt?: number;
@@ -2949,6 +2972,40 @@ export async function recordOptionTradeClose(
   log.info('option trade journal closed', {
     id, outcome: close.outcome, realizedR: close.realizedR, pnl: close.realizedPnlUsd,
   });
+  // TRA-4950 — grade the peak-MFE invariant on THE ROW A READER WILL SEE, which
+  // is why this sits after `foldLine` rather than on the incoming `close`: the
+  // fold is what merges the open row's `contracts`/`atRiskUsd`/`structure` with
+  // the close's `peakPremium`/`entryBasisPremium`, and the inequality needs both
+  // halves. Per the CLAUDE.md health-field rule this is the OUTCOME OF THE LAST
+  // REAL ATTEMPT — a close that actually happened — not a configuration fact;
+  // `/api/health/option-journal` → `peakMfeInvariant` publishes it, and reads
+  // `never_attempted_this_boot` (an alarm) until the first one lands.
+  //
+  // Wrapped: an instrument must never be able to fail a close write. A throw here
+  // would lose the very money column it exists to grade.
+  try {
+    const graded = map.get(id);
+    if (graded) {
+      const grade = notePeakMfeClose(graded as PeakMfeRowInput, close.closeTs);
+      if (grade.violated) {
+        log.warn('peak-MFE invariant VIOLATED on a real close', {
+          issue: 'TRA-4950',
+          id,
+          optionSymbol: graded.optionSymbol ?? null,
+          mode: graded.mode,
+          exitReason: close.exitReason,
+          peakPremium: grade.peakPremium,
+          impliedExitPremium: grade.impliedExitPremium,
+          excessPremium: grade.excessPremium,
+          excessR: grade.excessR,
+        });
+      }
+    }
+  } catch (err) {
+    log.warn('peak-MFE grade threw; close is unaffected', {
+      issue: 'TRA-4950', id, err: err instanceof Error ? err.message : String(err),
+    });
+  }
   // TRA-1046 — a realized close changes the learned-weights fold; notify the
   // refresh subscribers so the next selection read recomputes (intraday) rather
   // than waiting for the EOD snapshot.

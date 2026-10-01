@@ -110,6 +110,7 @@ import {
   type AdoptedHandoverCensusRow,
 } from '../tra4505-adopted-arm-health.js';
 import { getCloseBasisSweepState } from '../tra3730-close-basis-sweep.js'; // TRA-3730
+import { getOptionPeakMfeHealth } from '../option-peak-mfe.js'; // TRA-4950
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
 import { summarizeTermStructureShadow } from '../term-structure-shadow.js'; // TRA-4413 item 4
 import {
@@ -9007,6 +9008,29 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // those rows and picks them up on a later tick rather than publishing a
       // gross number wearing a broker-settled label.
       closeBasisSweep: getCloseBasisSweepState(),
+      // TRA-4950 — IS `peakPremium` AN MFE? For a long option the realized exit
+      // can never exceed the true peak, and on the 2026-10-01 tape 101 of the 312
+      // rows carrying all four operands booked MORE than their recorded peak —
+      // every one on a winner, `take_profit_early` 8/8, `book_halt_flat` 85/201,
+      // and every adverse-side exit 0/78 because a stop satisfies the inequality
+      // however badly the stamp under-records. The peak was advanced on TICK
+      // paths only; every close path resolved its own exit price and never
+      // offered it to the ratchet.
+      //
+      // Read `state` FIRST. `never_attempted_this_boot` means nothing has closed
+      // since boot, so this field has measured NOTHING — an alarm, not a pass
+      // (the live sleeve has opened nothing since 2026-09-22). `violationRate` is
+      // `null` over `graded: 0` for the same reason: a rate with an empty
+      // denominator is not zero, and publishing zero there is the
+      // `queriesSucceeded: 0` conflation the CLAUDE.md health-field rule exists
+      // to forbid. `byVerdict.unmeasurable_*` rows are absent evidence with a
+      // name on it and are never folded into `ok`.
+      //
+      // ⛔ `sinceBoot` is BOOT-SCOPED and the stamps are FORWARD-ONLY: the rows
+      // already on the tape are not repaired and `rows[].peakPremium` is an MFE
+      // only on closes written on/after `trustworthyFromIso`. This field grades
+      // closes this process wrote; it says nothing about history.
+      peakMfeInvariant: getOptionPeakMfeHealth(),
     });
   });
 
