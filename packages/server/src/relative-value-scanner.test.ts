@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { TradierRelativeValueScannerService, REFUSAL_4XX_COOLDOWN_MS } from './relative-value-scanner.js';
+import {
+  TradierRelativeValueScannerService,
+  REFUSAL_4XX_COOLDOWN_MS,
+  canonicalizeRefusalReason,
+} from './relative-value-scanner.js';
 import type { OptionChainRow, TradierOptionsClient } from '@trading-app/engine';
 
 class FakeClient {
@@ -581,7 +585,15 @@ describe('Tradier HTTP refusals are not listings (TRA-4664)', () => {
     expect(first.errorMessage).toMatch(/HTTP 429/);
     const diag = svc.diagnostics();
     expect(diag.breakerOpen).toBe(true);
-    expect(diag.upstreamRefusals).toEqual({ byStatus: { '429': 1 }, lastAtMs: NOW_BASE, lastStatus: 429 });
+    // `lastReason` is `(not captured)` here, not a real cause: this fixture is
+    // the pre-TRA-4865 client shape, which offers no body at all. An uncaptured
+    // cause must never read as a measured one.
+    expect(diag.upstreamRefusals).toEqual({
+      byStatus: { '429': 1 },
+      lastAtMs: NOW_BASE,
+      lastStatus: 429,
+      lastReason: '(not captured)',
+    });
     // Nothing cached: pre-fix this entry was `[]` for SIX HOURS.
     expect(diag.expirationsCacheSize).toBe(0);
 
@@ -967,6 +979,57 @@ describe('Tradier HTTP refusals are not listings (TRA-4664)', () => {
     // The status is always part of the bucket, so a vendor that reuses the same
     // sentence under a different status splits rather than silently merges.
     expect(Object.keys(byReason).every((k) => k.startsWith('400 '))).toBe(true);
+  });
+
+  // TRA-4865 (fourth pass) — the live defect. On `faae9388` Tradier answered
+  // `400 Quota Violation: Expires <epoch-ms>`, where the epoch is the quota's
+  // next MINUTE boundary — so every refused minute minted a fresh bucket. 61 of
+  // 65 buckets were the same reason at 61 different minutes, the 64-bucket
+  // budget was gone 25h into an 89h boot, and 6,953 refusals (54% of the
+  // population, and every refusal of the last two days) fell into `(other)`.
+  it('a vendor reason stamped per-occurrence collapses to ONE bucket instead of exhausting the budget', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, advance } = makeService({ client });
+    // 80 symbols > MAX_REFUSAL_REASONS_TRACKED (64), each refused once under its
+    // own quota-reset epoch — exactly the live shape.
+    const syms = Array.from({ length: 80 }, (_, i) => `Q${String(i).padStart(3, '0')}`);
+    let epoch = 1790602260000;
+    client.fetchExpirations.mockImplementation(async (s) =>
+      syms.includes(s)
+        ? { ok: false, httpStatus: 400, reason: `Quota Violation: Expires ${(epoch += 60_000)}` }
+        : okExp);
+    client.fetchChainSnapshot.mockResolvedValue(okChain);
+
+    for (const s of syms) {
+      expect((await svc.scanOtm(s)).reason).toBe('fetch_error');
+      advance(1_000);
+    }
+
+    const diags = svc.diagnostics();
+    const byReason = diags.refusalCooldown!.byReason!;
+    // The whole population in one bucket: the reset epoch is not a taxonomy.
+    expect(byReason).toEqual({ '400 Quota Violation: Expires <n>': 80 });
+    // The budget was never spent, so nothing was lost to the overflow bucket.
+    expect(byReason['400 (other)']).toBeUndefined();
+    expect(Object.keys(byReason).length).toBe(1);
+    // ...and the newest cause is still readable VERBATIM, with its real epoch,
+    // datable against `lastAtMs`. This is the field that stayed two days stale.
+    expect(diags.upstreamRefusals!.lastReason).toBe(`Quota Violation: Expires ${epoch}`);
+    expect(diags.upstreamRefusals!.lastStatus).toBe(400);
+  });
+
+  it('canonicalising a reason keeps short numbers and the two unseen-cause sentinels byte-exact', async () => {
+    // >=5 digits only: a status, a strike count or a short error code is
+    // taxonomy and must survive, or distinct vendor faults would silently merge.
+    expect(canonicalizeRefusalReason('504 Gateway Timeout')).toBe('504 Gateway Timeout');
+    expect(canonicalizeRefusalReason('errorcode 1234 flow')).toBe('errorcode 1234 flow');
+    expect(canonicalizeRefusalReason('Expires 1790602260000')).toBe('Expires <n>');
+    expect(canonicalizeRefusalReason('req 9f3a12345 of acct 00012345')).toBe('req 9f3a<n> of acct <n>');
+    // The sentinels are never passed through the canonicaliser at all (the
+    // histogram test above asserts that); they carry no digits, so this pins
+    // that a future caller change cannot corrupt them either.
+    expect(canonicalizeRefusalReason('(not captured)')).toBe('(not captured)');
+    expect(canonicalizeRefusalReason('(no body)')).toBe('(no body)');
   });
 
   it('a genuine 200 empty listing is still no_expirations (the domain outcome is preserved)', async () => {

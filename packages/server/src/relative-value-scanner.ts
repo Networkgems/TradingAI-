@@ -123,6 +123,27 @@ const MAX_REFUSAL_REASON_LEN = 160;
 // into `"(other)"` — which is a disclosure, not a silent clamp.
 const MAX_REFUSAL_REASONS_TRACKED = 64;
 
+/**
+ * TRA-4865 (fourth pass) — collapse per-occurrence numbers in a vendor reason to
+ * a placeholder BEFORE it becomes a bucket key.
+ *
+ * Measured on live `faae9388`: Tradier expresses a rate limit as
+ * `400 Quota Violation: Expires <epoch-ms>`, and that epoch is the quota's next
+ * MINUTE boundary — so every refused minute minted a brand-new bucket. The
+ * 64-bucket budget was spent inside the first 25h of an 89h boot (61 of 65
+ * buckets were the same reason at 61 different minutes), after which 6,953
+ * refusals — 54% of the population, and 100% of the most recent two days —
+ * folded into `(other)`.
+ *
+ * A cap bounds a vendor that invents new reasons; it cannot defend against one
+ * that stamps every occurrence, which is what this does. Runs of >=5 digits
+ * only, so HTTP statuses and small counts stay literal while epochs, request
+ * ids and account numbers collapse.
+ */
+export function canonicalizeRefusalReason(reason: string): string {
+  return reason.replace(/\d{5,}/g, '<n>');
+}
+
 function is429Error(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return /\b429\b|Too Many Requests/i.test(msg);
@@ -289,7 +310,18 @@ export interface RelativeValueScannerDiagnostics {
    * the scanner reported as `no_expirations`/`no_chain` and CACHED (6h for
    * expirations). Absent key ≠ zero: an older build omits the whole object.
    */
-  upstreamRefusals?: { byStatus: Record<string, number>; lastAtMs: number | null; lastStatus: number | null };
+  upstreamRefusals?: {
+    byStatus: Record<string, number>;
+    lastAtMs: number | null;
+    lastStatus: number | null;
+    /**
+     * TRA-4865 (fourth pass) — the newest refusal's vendor reason, verbatim.
+     * `byReason` is a bounded histogram and CAN saturate; this cannot, so the
+     * current cause stays readable and datable (against `lastAtMs`) even when
+     * every recent refusal has folded into `(other)`.
+     */
+    lastReason?: string | null;
+  };
   /**
    * TRA-4664 (second pass) — the non-429-4xx per-key refusal cooldown.
    * `size` = keys currently under cooldown; `suppressed` = upstream calls NOT
@@ -354,6 +386,16 @@ export interface RelativeValueScannerDiagnostics {
      * and truncated per {@link MAX_REFUSAL_REASON_LEN}. `"<status> (no body)"`
      * when the vendor sent nothing, `"<status> (unreadable)"` when the body
      * could not be read — never silently folded into a success-shaped bucket.
+     *
+     * ANSWERED on live `faae9388` (2026-10-01): **100% of classified 400s are
+     * `Quota Violation` — 5,923 of 5,923, zero non-quota 400s.** The refusal is
+     * a RATE LIMIT expressed as a 400, not an entitlement gap and not a bad
+     * parameter, so BOTH forks this field was built to decide are refuted. The
+     * bucket key is canonicalised per {@link canonicalizeRefusalReason} because
+     * the reason embeds the quota's reset epoch and was minting one bucket per
+     * minute. Read `upstreamRefusals.lastReason` for the newest cause verbatim:
+     * `(other)` being the largest bucket is a statement about the BUDGET, never
+     * about the distribution.
      */
     byReason?: Record<string, number>;
   };
@@ -656,6 +698,10 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
   private readonly refusalsByStatus: Record<string, number> = {};
   private lastRefusalAtMs: number | null = null;
   private lastRefusalStatus: number | null = null;
+  // TRA-4865 (fourth pass) — see `noteRefusalReason`. Pairs with the two fields
+  // above: `lastStatus`/`lastAtMs`/`lastReason` all describe ONE refusal, the
+  // newest.
+  private lastRefusalReason: string | null = null;
   // TRA-4664 (second pass) — see `RelativeValueScannerDiagnostics.refusalCooldown`.
   // Key shapes match the caches: `expirations|SYM` and `chain|SYM|EXPIRATION`.
   private readonly refusalCooldown = new Map<string, CacheEntry<TradierHttpRefusalError>>();
@@ -681,13 +727,21 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
    */
   private noteRefusalReason(httpStatus: number, reason?: string | null): void {
     const trimmed = typeof reason === 'string' ? reason.trim() : '';
-    const suffix =
-      trimmed.length > 0
-        ? trimmed.slice(0, MAX_REFUSAL_REASON_LEN)
-        : reason === undefined
-          ? '(not captured)'
-          : '(no body)';
-    let bucket = `${httpStatus} ${suffix}`;
+    const captured = trimmed.length > 0;
+    const suffix = captured
+      ? trimmed.slice(0, MAX_REFUSAL_REASON_LEN)
+      : reason === undefined
+        ? '(not captured)'
+        : '(no body)';
+    // TRA-4865 (fourth pass) — the newest refusal's reason, VERBATIM and
+    // un-canonicalised, held outside the bucket budget. A saturated `byReason`
+    // must never make the CURRENT cause unreadable: on live `faae9388` every
+    // refusal of the last two days sat in `(other)`, so the freshest datable
+    // reason was two days stale while the counter kept climbing.
+    this.lastRefusalReason = suffix;
+    // Canonicalise only a real vendor body — the two sentinels are ours, not the
+    // vendor's, and stay byte-exact so neither can collide with a real reason.
+    let bucket = `${httpStatus} ${captured ? canonicalizeRefusalReason(suffix) : suffix}`;
     if (
       this.refusalsByReason[bucket] === undefined &&
       Object.keys(this.refusalsByReason).length >= MAX_REFUSAL_REASONS_TRACKED
@@ -735,6 +789,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
         byStatus: { ...this.refusalsByStatus },
         lastAtMs: this.lastRefusalAtMs,
         lastStatus: this.lastRefusalStatus,
+        lastReason: this.lastRefusalReason,
       },
       refusalCooldown: {
         size: this.refusalCooldown.size,
