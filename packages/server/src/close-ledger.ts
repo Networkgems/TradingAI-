@@ -255,6 +255,16 @@ export interface CloseLedgerWriteResult {
    * "looked and we are under budget" are not the same fact.
    */
   aggregateSweep: 'ran' | 'skipped_no_root' | 'skipped_already_run' | 'failed';
+  /**
+   * TRA-4949 — WHY the sweep ran, and what each pool had accrued when the
+   * decision was taken. `aggregateSweep: 'ran'` alone cannot tell the first
+   * write of an ET date from the mid-fan-out re-sweep that holds the ceiling,
+   * and distinguishing them is the whole observable of this fix: a boundary that
+   * logs `first_of_date` once and never an `accrual` is one where the accrual
+   * trigger is not firing, which reads identically to the defect.
+   */
+  aggregateSweepTrigger?: LedgerSweepTrigger;
+  aggregateAccruedBytes?: Record<string, number>;
   /** Combined bytes across both directories — the pre-TRA-4156 quantity. */
   aggregateBytes?: number;
   /**
@@ -282,6 +292,15 @@ interface LedgerLog {
   info: (msg: string, meta?: Record<string, unknown>) => void;
   warn: (msg: string, meta?: Record<string, unknown>) => void;
 }
+
+/**
+ * TRA-4949 — what made the aggregate sweep eligible to run.
+ *
+ * `first_of_date` is the pre-TRA-4949 behaviour and is still the common case;
+ * `accrual` is the re-sweep that holds the ceiling ACROSS a boundary rather than
+ * only at the instant of the first book's write; `forced` is the test seam.
+ */
+export type LedgerSweepTrigger = 'first_of_date' | 'accrual' | 'forced';
 
 /** UTF-8 byte length — the budget is bytes on disk, not JS string length. */
 function byteLen(s: string): number {
@@ -420,17 +439,32 @@ export async function writeCloseLedger(args: {
     // Compact: this is a machine-read artifact, and pretty-printing ~614 rows
     // would spend roughly a third of the file on whitespace for no reader.
     const json = JSON.stringify(file);
+    // TRA-4949 — the bytes this file REPLACES, read before the write. The
+    // aggregate accrual has to be the net POOL delta, and this path overwrites
+    // `closes/<date>.json` on a re-run of the same session.
+    const priorBytes = await fileBytesOrZero(path);
     await writeFile(path, json, 'utf-8');
 
     // Per-bucket count prune, oldest-first. Filenames lead with the ISO date so
-    // lexical order is date order — no `stat` round-trip per file here.
+    // lexical order is date order — no `stat` round-trip to ORDER them.
+    //
+    // TRA-4949 does add one `stat` per file actually REMOVED (not per file in
+    // the bucket): those bytes leave the pool in this same call, and an accrual
+    // that ignored them would report growth the pool did not have. On bqb1 today
+    // no bucket is at the 250-file cap, so this prune removes nothing and the
+    // term is zero — it is here for the buckets that WILL reach retention, where
+    // it removes one file for every one written and the net growth goes to ~0.
     let prunedFiles = 0;
+    let prunedBytes = 0;
     try {
       const names = (await readdir(dir)).filter(n => LEDGER_FILE_RE.test(n)).sort();
       const excess = names.length - CLOSE_LEDGER_MAX_FILES;
       for (let i = 0; i < excess; i += 1) {
-        await unlink(join(dir, names[i]));
+        const victim = join(dir, names[i]);
+        const victimBytes = await fileBytesOrZero(victim);
+        await unlink(victim);
         prunedFiles += 1;
+        prunedBytes += victimBytes;
       }
     } catch (err: unknown) {
       args.log?.warn('TRA-2688 close-ledger per-bucket prune failed', {
@@ -438,6 +472,12 @@ export async function writeCloseLedger(args: {
         reason: err instanceof Error ? err.message : String(err),
       });
     }
+
+    // TRA-4949 — accrue BEFORE the sweep, so the write that crosses the trigger
+    // is the write that pays for the re-sweep. Ordering this after the sweep
+    // would push every overage one book further down the fan-out and re-open the
+    // defect by one write.
+    noteLedgerPoolWrite(CLOSE_LEDGER_DIR, byteLen(json) - priorBytes - prunedBytes);
 
     const agg = await enforceAggregateLedgerBudget({
       usersRoot: args.usersRoot,
@@ -456,6 +496,8 @@ export async function writeCloseLedger(args: {
       prunedFiles,
       prunedForAggregate: agg.pruned,
       aggregateSweep: agg.sweep,
+      ...(agg.trigger == null ? {} : { aggregateSweepTrigger: agg.trigger }),
+      ...(agg.accruedBytes == null ? {} : { aggregateAccruedBytes: agg.accruedBytes }),
       ...(agg.bytes == null ? {} : { aggregateBytes: agg.bytes }),
       ...(agg.byDir == null ? {} : { aggregateByDir: agg.byDir }),
     };
@@ -504,20 +546,189 @@ export async function writeCloseLedger(args: {
  *
  * The sweep walks every book's ledger + tape directories, and
  * `generateAndSaveReport` runs once per USER — so an unguarded sweep would
- * repeat that walk ~60 times per session for a budget that cannot have moved
- * much between two of them.
+ * repeat that walk ~68 times per session for a budget that cannot have moved
+ * much between two of them. The memo is therefore kept; dropping it is not the
+ * remedy (TRA-4949 AC1).
  *
- * ⚠️ STATED, because a bound you cannot see the slack in is not a bound: with
- * the memo the fleet can exceed the budgets by at most ONE session's writes
- * (~62 books x ~90 KB ~= 5.6 MB, i.e. under 12% of the 48 MiB `closes/` cap)
- * before the next date's first EOD reclaims it. A restart clears the memo and
- * simply re-runs an idempotent prune, which is the safe direction.
+ * ⛔ THE DATE ALONE IS NOT A SUFFICIENT KEY, and the note that used to sit here
+ * proved it by getting its own arithmetic wrong. It read: *"the fleet can exceed
+ * the budgets by at most ONE session's writes (~62 books x ~90 KB ~= 5.6 MB,
+ * i.e. under 12% of the 48 MiB `closes/` cap)"*. Every clause is true and the
+ * conclusion is still wrong, because the bound was quoted against the LARGEST
+ * pool. Measured on bqb1 `2026-09-28T00:23Z` (`GET /api/health/storage/ledger`,
+ * build `08e911e3`), the same one-session slack landed as:
+ *
+ *   `tape/`   20,497,082 B / 16,777,216 B = **122.2%**, over by 3,719,866 B
+ *   `closes/` 23,438,354 B / 50,331,648 B = 46.6%
+ *
+ * `tape/` was 3,867 B UNDER cap at the sweep that ran on the first book's write
+ * at the `2026-09-26T01:00Z` boundary; the other 67 books then added 3.72 MiB
+ * with no further sweep, and nothing reclaimed it until the next market day's
+ * first write — ~72h across a weekend, not ~24h. A slack bound quoted against
+ * the largest pool understates every smaller one, and the smaller one is the
+ * pool that was actually at its ceiling. The comment that existed to make the
+ * slack visible is what hid it. (TRA-4949.)
+ *
+ * ### The key is now `(date, bytes accrued per pool since the last sweep)`
+ *
+ * {@link noteLedgerPoolWrite} is called by BOTH writers with the NET delta their
+ * write made to their own pool — the new file's bytes, minus whatever file it
+ * replaced, minus whatever the per-bucket count prune removed in the same call.
+ * The net delta is the load-bearing part: at steady state a book writes one file
+ * and its count prune removes one, so a raw file-size accrual would over-count
+ * on `closes/` and sweep far more often than the budget needs. Leg 2 is the
+ * sharper case — its write is a MERGE that rewrites `tape/<date>.json` whole, so
+ * the file's own length is not what the pool grew by at all.
+ *
+ * Once any pool's accrual reaches {@link ledgerSweepAccrualLimit} for THAT pool,
+ * the next call re-sweeps and the accrual resets. Because the sweep runs inside
+ * the same call as the write that crossed the trigger, the accrual is `< trigger`
+ * at every point where the fleet is AT REST between books.
+ *
+ * ### Residual slack, per pool, as a percentage of THAT POOL'S OWN cap
+ *
+ * This is the arithmetic the old note got wrong, so it is stated in the unit
+ * that binds. The trigger is {@link LEDGER_SWEEP_ACCRUAL_FRACTION} of each
+ * pool's own cap, so the resting residual is a FLAT percentage everywhere —
+ * there is no pool for which this number is quietly larger:
+ *
+ *   `tape/`   ≤ **2.0%** of its own 16 MiB cap (335,544 B)  ← THE SMALLEST CAP,
+ *                                                             so the smallest
+ *                                                             absolute trigger,
+ *                                                             so the one that
+ *                                                             binds the fleet.
+ *   `closes/` ≤ **2.0%** of its own 48 MiB cap (1,006,632 B)
+ *
+ * Against `tape/`'s measured 122.2% that is a 20.2pp reduction in the resting
+ * overage, and it is now a BOUND rather than a consequence of how many books
+ * happen to be registered.
+ *
+ * ⚠️ ONE TRANSIENT TERM, named rather than rounded away. The sweep is only
+ * reached from {@link writeCloseLedger}, and a book's EOD flow drains leg 2's
+ * tape BEFORE it writes its ledger (`index.ts`). So a `tape/` accrual that
+ * crosses its trigger is evaluated at that same book's closes write a few lines
+ * later, and in that gap `tape/` can sit at `trigger + one tape file` — at most
+ * `DENOM_FLIP_TAPE_MAX_BYTES` (1 MiB), i.e. **≤ 8.3% of the 16 MiB cap**. It is
+ * inside one call stack with no boundary ending in it, and the structural
+ * ceiling on it exists only because leg 2's files have a per-file BYTE cap.
+ * `closes/` has a per-file ROW cap and no byte cap, so no comparable structural
+ * term can be quoted for it — which is exactly why its write and its evaluation
+ * are the same call and it has no transient term at all.
+ *
+ * ### What this costs, measured rather than estimated
+ *
+ * The `2026-09-29T01:00Z` boundary on bqb1, read off the Render tape
+ * (`scripts/tra4949-eviction-tape-grade.mjs` and the probe beside it):
+ *
+ *   68 `TRA-2689 denominator-flip tape flushed`  →  3,806,015 B into `tape/`
+ *   68 `TRA-2688 close ledger written`           →    904,054 B into `closes/`
+ *   `aggregateSweep`: **ran 1, skipped_already_run 67**
+ *   the one sweep left `tape/` at 16,776,252 / 16,777,216 B — **99.994% of cap**
+ *
+ * That last number is the defect's whole signature: the sweep did its job
+ * perfectly at the instant it ran, and then 67 books piled 3.8 MB on top of a
+ * pool with 964 B of headroom, with nothing looking again for ~24h (~72h over a
+ * weekend). The eviction itself was healthy — 64 files, `prunedLive: 0`, 0
+ * real-money lines — which is precisely why nothing paged.
+ *
+ * Under this fix those 3,806,015 B cross `tape/`'s 335,544 B trigger **11.3
+ * times**, so the same boundary runs ~11 sweeps instead of 1, against 68 for no
+ * memo at all: the memo still absorbs ~84% of the rescans it was introduced to
+ * absorb. `closes/`'s own 904,054 B stays under its 1,006,632 B trigger and
+ * contributes none — which is the point, and is why the accrual had to be
+ * per-pool: watching `closes/` alone would have re-swept ZERO times on the exact
+ * boundary where `tape/` needed eleven.
+ *
+ * A restart clears both the memo and the accrual and simply re-runs an
+ * idempotent prune, which is the safe direction.
  */
 let aggregateSweptForDate: string | null = null;
+
+/**
+ * Net bytes each pool has accrued since the last successful sweep, keyed like
+ * {@link LEDGER_BUDGET_LIMITS}. Never negative: a shrinking pool is not a
+ * reason to sweep, and letting it go negative would let one book's prune buy
+ * another book's overage.
+ */
+const ledgerBytesSinceSweep: Record<string, number> = {};
+
+/**
+ * The share of a pool's OWN cap that may accrue between sweeps.
+ *
+ * 2% is a balance, and both sides of it are stated above: lower means a tighter
+ * ceiling and more full rescans per boundary, higher means fewer rescans and a
+ * larger resting overage. It is deliberately a FRACTION rather than a byte
+ * constant so that the bound stays a fixed percentage of every pool, including
+ * pools added later — a byte constant would silently become a large share of the
+ * next small pool someone adds, which is the TRA-4949 defect rebuilt.
+ */
+export const LEDGER_SWEEP_ACCRUAL_FRACTION = 0.02;
+
+/**
+ * The accrual that forces a re-sweep of `kind`, in bytes.
+ *
+ * Exported so a test (and an operator) can assert the bound in the same unit
+ * the budget is denominated in rather than re-deriving the multiplication.
+ * `Math.floor` so the trigger is never ABOVE the stated percentage.
+ *
+ * `limits` is the same test seam {@link enforceAggregateLedgerBudget} takes, and
+ * it is honoured HERE rather than only at the eviction: the trigger is a
+ * fraction of the cap ACTUALLY IN FORCE, so a case that shrinks a cap to 2,500 B
+ * does not silently keep the production 1 MiB trigger and read as if the memo
+ * had never been re-keyed. Production callers pass nothing.
+ */
+export function ledgerSweepAccrualLimit(
+  kind: string,
+  limits?: Partial<Record<(typeof LEDGER_BUDGET_DIRS)[number], number>>,
+): number {
+  const cap = limits?.[kind as (typeof LEDGER_BUDGET_DIRS)[number]] ?? LEDGER_BUDGET_LIMITS[kind];
+  if (cap == null) return Number.POSITIVE_INFINITY;
+  return Math.floor(cap * LEDGER_SWEEP_ACCRUAL_FRACTION);
+}
+
+/**
+ * Record the NET byte delta a write made to one budgeted pool.
+ *
+ * Called by both writers — leg 1 here in {@link writeCloseLedger} and leg 2 in
+ * `denominator-flip-tape-writer.ts`. It must be the net POOL delta, not the
+ * file's size: see the memo docblock. A non-finite delta is dropped rather than
+ * poisoning the accrual with `NaN`, which would compare `false` against the
+ * trigger forever and silently restore the TRA-4949 behaviour.
+ */
+export function noteLedgerPoolWrite(kind: string, deltaBytes: number): void {
+  if (!Number.isFinite(deltaBytes)) return;
+  if (LEDGER_BUDGET_LIMITS[kind] == null) return;
+  ledgerBytesSinceSweep[kind] = Math.max(0, (ledgerBytesSinceSweep[kind] ?? 0) + deltaBytes);
+}
+
+/** The current accrual, for the log and for tests. Never mutated by the reader. */
+export function ledgerBytesSinceLastSweep(): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const kind of LEDGER_BUDGET_DIRS) out[kind] = ledgerBytesSinceSweep[kind] ?? 0;
+  return out;
+}
 
 /** Test seam — the memo is process-global and would leak between cases. */
 export function resetAggregateLedgerSweepMemo(): void {
   aggregateSweptForDate = null;
+  for (const kind of Object.keys(ledgerBytesSinceSweep)) delete ledgerBytesSinceSweep[kind];
+}
+
+/**
+ * `stat` one path for its byte size, reporting `0` for "not there".
+ *
+ * Used to turn a file write into a NET pool delta. The absent case genuinely IS
+ * zero bytes of prior occupancy, so collapsing ENOENT into `0` is not a
+ * fail-open here; any other error also reads `0`, which OVER-states the delta
+ * and therefore sweeps EARLIER — the conservative direction for a ceiling.
+ */
+async function fileBytesOrZero(path: string): Promise<number> {
+  try {
+    const st = await stat(path);
+    return st.isFile() ? st.size : 0;
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -967,12 +1178,30 @@ export async function enforceAggregateLedgerBudget(args: {
   pruned: number;
   bytes?: number;
   byDir?: Record<string, { bytes: number; maxBytes: number; pruned: number }>;
+  /** TRA-4949 — why this sweep ran, or what was accrued when it was skipped. */
+  trigger?: LedgerSweepTrigger;
+  accruedBytes?: Record<string, number>;
 }> {
   const { usersRoot } = args;
   if (!usersRoot) return { sweep: 'skipped_no_root', pruned: 0 };
-  if (!args.force && aggregateSweptForDate === args.date) {
-    return { sweep: 'skipped_already_run', pruned: 0 };
+  // TRA-4949 — the memo key is `(date, per-pool accrual)`, not the date alone.
+  // `overAccrued` is the pools whose own-cap share has been spent since the last
+  // sweep; any one of them forces the walk. REPORTED in the result (not inferred
+  // from the fact that a sweep happened) for the same reason
+  // `skipped_already_run` is: "the first write of the date" and "the 7th book,
+  // which spent `tape/`'s 2% share" are different facts about the same `ran`.
+  const accruedBytes = ledgerBytesSinceLastSweep();
+  const overAccrued = LEDGER_BUDGET_DIRS.filter(
+    kind => accruedBytes[kind] >= ledgerSweepAccrualLimit(kind, args.limits),
+  );
+  if (!args.force && aggregateSweptForDate === args.date && overAccrued.length === 0) {
+    return { sweep: 'skipped_already_run', pruned: 0, accruedBytes };
   }
+  const trigger: LedgerSweepTrigger = args.force
+    ? 'forced'
+    : aggregateSweptForDate !== args.date
+      ? 'first_of_date'
+      : 'accrual';
   try {
     const { filesByKind, totals } = await scanLedgerPools(usersRoot);
     let prunedAll = 0;
@@ -1030,6 +1259,14 @@ export async function enforceAggregateLedgerBudget(args: {
           maxBytes,
           bytesAfter: total,
           prunedForAggregate: pruned,
+          // TRA-4949 — WHICH sweep of the fan-out this was, and the accrual that
+          // earned it. An eviction line that cannot say whether it came from the
+          // first book's write or from the accrual re-sweep cannot distinguish
+          // "the ceiling held across the boundary" from "the ceiling held at one
+          // instant and nothing looked again".
+          sweepTrigger: trigger,
+          accruedBytes,
+          accrualLimit: ledgerSweepAccrualLimit(kind, args.limits),
           // TRA-4898 — WHO paid, and whether the real-money reservation held.
           prunedLive,
           liveFilesInPool: files.filter((f) => f.live).length,
@@ -1066,12 +1303,20 @@ export async function enforceAggregateLedgerBudget(args: {
       bytesAll += total;
     }
     aggregateSweptForDate = args.date;
-    return { sweep: 'ran', pruned: prunedAll, bytes: bytesAll, byDir };
+    // TRA-4949 — the accrual is zeroed ONLY here, on a sweep that completed.
+    // `byDir[kind].bytes` is now the measured post-eviction truth for every
+    // pool, so everything accrued before it has been accounted for. A `failed`
+    // sweep deliberately leaves the accrual standing: the pools did not move
+    // back under cap, so the next write must still be eligible to try.
+    for (const kind of LEDGER_BUDGET_DIRS) ledgerBytesSinceSweep[kind] = 0;
+    return { sweep: 'ran', pruned: prunedAll, bytes: bytesAll, byDir, trigger, accruedBytes };
   } catch (err: unknown) {
     args.log?.warn('TRA-2688 ledger budget sweep failed', {
       reason: err instanceof Error ? err.message : String(err),
+      trigger,
+      accruedBytes,
     });
-    return { sweep: 'failed', pruned: 0 };
+    return { sweep: 'failed', pruned: 0, trigger, accruedBytes };
   }
 }
 

@@ -143,9 +143,10 @@
  * kill.
  */
 
-import { writeFile, readFile, rename, mkdir, readdir, unlink } from 'fs/promises';
+import { writeFile, readFile, rename, mkdir, readdir, unlink, stat } from 'fs/promises';
 import { join } from 'path';
 import { etWallClockToUtcMs } from './et-clock.js';
+import { noteLedgerPoolWrite } from './close-ledger.js';
 import { isMarketDayIso } from './scheduler.js';
 import type { DenominatorFlipTapeDump, DenominatorFlipCandidate } from './denominator-flip-tape.js';
 
@@ -303,6 +304,23 @@ export interface FlushResult {
 /** UTF-8 byte length — the ceiling is bytes on disk, not JS string length. */
 function byteLen(s: string): number {
   return Buffer.byteLength(s, 'utf-8');
+}
+
+/**
+ * TRA-4949 — one path's byte size, `0` for "not there".
+ *
+ * Feeds the NET pool delta handed to leg 1's accrual. Absent genuinely IS zero
+ * prior occupancy; any other error also reads `0`, which OVER-states the growth
+ * and therefore makes the aggregate sweep run EARLIER — the conservative
+ * direction for a ceiling, and the one a budget should fail in.
+ */
+async function tapeFileBytesOrZero(path: string): Promise<number> {
+  try {
+    const st = await stat(path);
+    return st.isFile() ? st.size : 0;
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -682,18 +700,32 @@ export async function flushDenominatorFlipTape(args: {
           }
         : file;
     const finalJson = finalFile === file ? json : JSON.stringify(finalFile);
+    // TRA-4949 — the bytes this write REPLACES, read before it lands. This path
+    // is a MERGE: `tape/<date>.json` almost always already exists and is rewritten
+    // whole, so the file's own size is not what the `tape/` pool grew by. Reading
+    // it as the growth would over-count by the prior file's entire length and
+    // force a full fleet rescan on nearly every book's drain.
+    const priorBytesOnDisk = await tapeFileBytesOrZero(path);
     await writeFile(path, finalJson, 'utf-8');
 
     // Prune oldest-first. Filenames lead with an ISO date, so lexical order IS
-    // date order — no `stat` round-trip per file. Orphans count against the
+    // date order — no `stat` round-trip to ORDER them. Orphans count against the
     // budget (2c) so an unreadable file cannot grow retention without bound.
+    //
+    // TRA-4949 sizes the files it actually REMOVES (one `stat` per deletion, not
+    // per file in the bucket): those bytes leave the `tape/` pool in this call and
+    // the aggregate accrual below has to be the pool's NET movement.
     let prunedFiles = 0;
+    let prunedBytes = 0;
     try {
       const names = (await readdir(dir)).filter((n) => TAPE_FILE_RE.test(n)).sort();
       const excess = names.length - DENOM_FLIP_TAPE_MAX_FILES;
       for (let i = 0; i < excess; i += 1) {
-        await unlink(join(dir, names[i]));
+        const victim = join(dir, names[i]);
+        const victimBytes = await tapeFileBytesOrZero(victim);
+        await unlink(victim);
         prunedFiles += 1;
+        prunedBytes += victimBytes;
       }
     } catch (err: unknown) {
       args.log?.warn('TRA-2689 tape prune failed', {
@@ -701,6 +733,25 @@ export async function flushDenominatorFlipTape(args: {
         reason: err instanceof Error ? err.message : String(err),
       });
     }
+
+    // TRA-4949 — tell leg 1's aggregate budget what this pool just moved by.
+    //
+    // ⛔ THIS IS THE LOAD-BEARING HALF OF THAT FIX AND IT IS EASY TO MISREAD AS
+    // BOOKKEEPING. The sweep that holds the 16 MiB `tape/` ceiling lives in
+    // `close-ledger.ts` and is memoised; before TRA-4949 the memo was keyed on
+    // the ET date alone, so it ran inside the FIRST book's write and never again.
+    // Keying it on bytes-since-sweep only helps if the accrual counts the pool
+    // that actually overflows — and `tape/` grew ~4x faster than `closes/` on
+    // bqb1 (~55.6 KB vs ~13.2 KB net per book). An accrual that watched only
+    // leg 1's own writes would have understated `tape/` by that factor, which is
+    // the exact shape of the defect being fixed: a bound measured against the
+    // wrong pool.
+    //
+    // ZERO NETWORK CALLS (TRA-2688): this is a synchronous in-process counter
+    // bump. It cannot throw — `noteLedgerPoolWrite` drops non-finite input — so
+    // it needs no guard of its own, and it is positioned after the prune so the
+    // delta it reports is final.
+    noteLedgerPoolWrite(DENOM_FLIP_TAPE_DIR, byteLen(finalJson) - priorBytesOnDisk - prunedBytes);
 
     const result: FlushResult = {
       written: true,
