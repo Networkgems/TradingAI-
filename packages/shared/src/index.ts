@@ -6294,6 +6294,16 @@ export interface EodReport {
      * statement.
      */
     equityIncluded: boolean;
+    /**
+     * TRA-4979 — equity closing fills on this date that were SUPPRESSED (equity
+     * withheld for the pass, or the symbol quarantined). The discriminator for
+     * `equityIncluded: false`: `0` ⇒ nothing was withheld here, `combinedPnl` is
+     * complete; `> 0` ⇒ incomplete by an unmeasured amount.
+     *
+     * ⛔ **`undefined` is UNKNOWN, not `0`.** Rows written before TRA-4979 lack
+     * the key. Read it through {@link brokerRealizedIsSummable}, never directly.
+     */
+    equitySuppressedCloseCount?: number;
     /** ISO timestamp of the reconstructing pass. */
     reconstructedAt: string;
   };
@@ -6350,6 +6360,39 @@ export interface EodReport {
 
   // Markdown report body
   markdown: string;
+}
+
+/**
+ * TRA-4979 — may this row's `brokerRealized.combinedPnl` be SUMMED as an
+ * all-instrument realized figure?
+ *
+ * The one implementation of the rule, here rather than in either consumer,
+ * because two implementations of one rule is the defect TRA-2864 already paid
+ * for. Server-side graders and the desktop R view both go through this.
+ *
+ * It is `false` in exactly one case: equity was withheld for the reconstructing
+ * pass **and** we cannot show that nothing equity-shaped closed that day.
+ *
+ * ⛔ **Absence fails closed.** A companion written before TRA-4979 carries no
+ * `equitySuppressedCloseCount`, and `undefined` means NOBODY MEASURED — which is
+ * precisely the state that produced the finding, so it must not read as a clean
+ * `0`. One backfill pass over a row replaces `undefined` with a real count and a
+ * provably-complete cell becomes summable again.
+ *
+ * Measured basis (live book, 2026-10-01, TRA-4979): the admin account withholds
+ * all equity on every pass — one `adjustment` whose description names the company
+ * (`" reverse split DREAMLAND LIMITED"`) and therefore matches none of the tape's
+ * tickers. Eight of TRA-3100's nine dates closed zero stock, so their
+ * options-only figure is exact; 2026-06-16 hid an $0.80 MIR close and its figure
+ * is not. `equityIncluded` alone cannot separate those, and `closeCount` counts
+ * option closes only when equity is withheld.
+ */
+export function brokerRealizedIsSummable(
+  companion: NonNullable<EodReport['brokerRealized']> | undefined,
+): boolean {
+  if (!companion) return false;
+  if (companion.equityIncluded) return true;
+  return companion.equitySuppressedCloseCount === 0;
 }
 
 // ===========================================================================

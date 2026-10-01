@@ -60,6 +60,32 @@ export type BrokerRealizedCompanion = {
    * on this will present an options-only figure as an all-instrument one.
    */
   equityIncluded: boolean;
+  /**
+   * TRA-4979 — THE COUNTER THAT MAKES `equityIncluded: false` READABLE.
+   *
+   * Equity closing fills on this date that were **suppressed** — dropped before
+   * the FIFO because equity was withheld for the pass, or the symbol was
+   * quarantined. It is the discriminator `equityIncluded` alone cannot be:
+   *
+   *  · `0`   ⇒ nothing was withheld on this date. `combinedPnl` is COMPLETE and
+   *            may be summed, even with `equityIncluded: false`.
+   *  · `> 0` ⇒ `combinedPnl` is INCOMPLETE by an unmeasured amount. Render it,
+   *            never count it.
+   *
+   * ⛔ **OPTIONAL, and `undefined` is UNKNOWN — never `?? 0`.** Every row written
+   * before TRA-4979 lacks the key, and those rows are exactly the ones whose
+   * completeness nobody measured. Defaulting absence to `0` would convert "we did
+   * not look" into "we looked and it was clean", which is the whole bug class
+   * this field exists to close. Readers must treat `undefined` like `> 0`.
+   *
+   * Why this is not derivable from `closeCount`: with equity withheld the matcher
+   * runs `instruments: ['option']`, so `closeCount` is an OPTION close count. On
+   * the live book 2026-10-01 the nine TRA-3100 dates read `closeCount: 1..5` with
+   * `equityPnl: 0, equityIncluded: false` — and eight of them were genuinely
+   * equity-free while 2026-06-16 was hiding an $0.80 stock close. Same shape,
+   * different truth.
+   */
+  equitySuppressedCloseCount?: number;
   /** ISO timestamp of the pass that reconstructed these figures. */
   reconstructedAt: string;
 };
@@ -82,6 +108,13 @@ export function buildBrokerRealizedCompanion(input: {
   equityPnl: number;
   closeCount: number;
   equityIncluded: boolean;
+  /**
+   * TRA-4979 — suppressed equity closes for this date. REQUIRED of the caller,
+   * not defaulted: the pass that reconstructs a row is the only thing that knows
+   * this, and a `= 0` default here would mint the clean-looking zero that the
+   * field exists to refuse.
+   */
+  equitySuppressedCloseCount: number;
   /** ISO timestamp; injected so tests are not clock-dependent. */
   reconstructedAt: string;
 }): BrokerRealizedCompanion {
@@ -93,6 +126,7 @@ export function buildBrokerRealizedCompanion(input: {
     equityPnl,
     closeCount: Math.max(0, Math.trunc(input.closeCount) || 0),
     equityIncluded: input.equityIncluded,
+    equitySuppressedCloseCount: Math.max(0, Math.trunc(input.equitySuppressedCloseCount) || 0),
     reconstructedAt: input.reconstructedAt,
   };
 }
@@ -117,7 +151,13 @@ export function companionFiguresEqual(
     a.optionsPnl === b.optionsPnl &&
     a.equityPnl === b.equityPnl &&
     a.closeCount === b.closeCount &&
-    a.equityIncluded === b.equityIncluded
+    a.equityIncluded === b.equityIncluded &&
+    // TRA-4979 — `undefined !== 0`, deliberately. The ~100 rows already on disk
+    // carry no suppressed-close count, so they MUST compare unequal to a freshly
+    // built companion that has one; otherwise the idempotency skip would pin them
+    // at UNKNOWN forever and the field could never reach the rows that need it.
+    // This costs exactly one rewrite per existing row, once.
+    a.equitySuppressedCloseCount === b.equitySuppressedCloseCount
   );
 }
 

@@ -1,5 +1,5 @@
 // TRA-4729 — moved verbatim out of CalendarTab.tsx; no behaviour change.
-import type { EodReport } from '@trading-app/shared';
+import { brokerRealizedIsSummable, type EodReport } from '@trading-app/shared';
 import { fmtCompact, fmtDollar } from './format';
 
 // ── TRA-3100 — label the MEASURE, not just the number ────────────────────────
@@ -343,6 +343,17 @@ type DayReading =
   | { state: 'unknown' }
   /** TRA-3102 — the row's own figure was never broker-confirmed. Shown, never counted. */
   | { state: 'unreconciled'; pnl: number | null }
+  /**
+   * TRA-4979 — R only: reconstructed, but stock realized was WITHHELD for the
+   * pass and we cannot show that no stock closed that day. Shown, never counted.
+   *
+   * This is the state that was missing, and its absence is the finding: `readDay`
+   * returned `counted` for these rows, so `summarise()` summed options-only cells
+   * and all-instrument cells into one net and one win rate with no marker on the
+   * figure. `RealizedViewNote` counted the options-only DAYS in prose, which told
+   * the reader a mixture existed without excluding it from the number.
+   */
+  | { state: 'equity_withheld'; pnl: number }
   /** A figure this view is entitled to render AND to sum. */
   | { state: 'counted'; pnl: number };
 
@@ -373,6 +384,14 @@ function readDay(report: EodReport | undefined, view: PnlView): DayReading {
   // matched no closes on did not trade, and a `$0.00` here would put it back in
   // the win-rate denominator — the exact defect this view exists to remove.
   if (companion.closeCount === 0) return { state: 'no_closes' };
+  // TRA-4979 — the same rule one level further down: an options-only figure is
+  // not an all-instrument one, so it may be rendered but not summed with cells
+  // that are. `brokerRealizedIsSummable` fails closed on a companion written
+  // before the suppressed-close counter existed — `undefined` is "nobody
+  // measured", which is exactly the state that produced this finding.
+  if (!brokerRealizedIsSummable(companion)) {
+    return { state: 'equity_withheld', pnl: companion.combinedPnl };
+  }
   return { state: 'counted', pnl: companion.combinedPnl };
 }
 
@@ -411,6 +430,12 @@ export function summarise(reports: readonly (EodReport | undefined)[], view: Pnl
 export function RealizedViewNote({ reports }: { reports: EodReport[] }) {
   const withCompanion = reports.filter(r => r.brokerRealized);
   const optionsOnly = withCompanion.filter(r => r.brokerRealized?.equityIncluded === false);
+  // TRA-4979 — split the options-only days by whether the caveat COSTS anything.
+  // The old note counted them as one bucket, which made a run of cells whose
+  // figures are exactly right read as alarming, and buried the one cell that is
+  // actually wrong inside the same sentence. On the live book that ratio is 8:1.
+  const optionsOnlyIncomplete = optionsOnly.filter(r => !brokerRealizedIsSummable(r.brokerRealized));
+  const optionsOnlyExact = optionsOnly.length - optionsOnlyIncomplete.length;
   const noCompanion = reports.length - withCompanion.length;
   return (
     <div className="cal-summary-mixed" title="Realized P&L on positions the broker recorded as CLOSED that day, FIFO-matched from Tradier fills. Days with no matched closes did not trade and are shown as `--`, not $0.00.">
@@ -420,9 +445,16 @@ export function RealizedViewNote({ reports }: { reports: EodReport[] }) {
         <> {noCompanion} day{noCompanion === 1 ? ' has' : 's have'} no realized reconstruction at all
         (outside the backfill window, or not yet settled).</>
       )}
-      {optionsOnly.length > 0 && (
-        <> ⚠ {optionsOnly.length} day{optionsOnly.length === 1 ? '' : 's'} are OPTIONS-ONLY — stock
-        realized was withheld because the corporate-action feed could not be trusted for that pass.</>
+      {optionsOnlyIncomplete.length > 0 && (
+        <> ⚠ {optionsOnlyIncomplete.length} day{optionsOnlyIncomplete.length === 1 ? '' : 's'} are
+        OPTIONS-ONLY <strong>and did have stock closes</strong> (or predate the suppressed-close
+        count) — those figures are incomplete by an unmeasured amount and are EXCLUDED from every
+        figure below ({optionsOnlyIncomplete.map(r => r.date).sort().join(', ')}).</>
+      )}
+      {optionsOnlyExact > 0 && (
+        <> {optionsOnlyExact} further day{optionsOnlyExact === 1 ? '' : 's'} had stock realized
+        withheld but closed no stock, so {optionsOnlyExact === 1 ? 'its' : 'their'} figure{' '}
+        {optionsOnlyExact === 1 ? 'is' : 'are'} complete and counted.</>
       )}
     </div>
   );
@@ -521,6 +553,19 @@ export function CellPnl({ report, view }: { report: EodReport | undefined; view:
           --
         </span>
       );
+    // TRA-4979 — options-only. Same treatment as `unreconciled`: the figure is
+    // real and stays visible, but it carries a flag and never a win/loss tint,
+    // because what is on screen is not the measure the column claims to be.
+    case 'equity_withheld':
+      return (
+        <span
+          className="cal-pnl cal-pnl--unreconciled"
+          title="OPTIONS ONLY — stock realized was withheld for the pass that reconstructed this day (a corporate action could not be attributed to a ticker), and this day DID have stock closes, or the row predates the suppressed-close counter. The figure is incomplete by an unmeasured amount, so it is excluded from Net P&L and from the win rate."
+        >
+          {fmtCompact(reading.pnl)}
+          <span className="cal-pnl-flag">!</span>
+        </span>
+      );
     case 'counted':
       return <span className="cal-pnl">{fmtCompact(reading.pnl)}</span>;
   }
@@ -536,7 +581,10 @@ export function cellStateClass(report: EodReport | undefined, view: PnlView): st
       return ' cal-cell--unknown';
     // TRA-3102 — same rule, same reason: a number the broker never confirmed
     // must not be coloured as though it were money that moved.
+    // TRA-4979 — an options-only figure is not a win or a loss on the
+    // all-instrument measure this column claims, for the same reason.
     case 'unreconciled':
+    case 'equity_withheld':
       return ' cal-cell--unreconciled';
     // TRA-4201 — an untraded / unreconstructed day is neither a win nor a loss.
     case 'no_closes':

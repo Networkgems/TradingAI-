@@ -145,12 +145,35 @@ export function EodReportDetail({ report, onBack }: { report: EodReport; onBack:
                 <span className={companion.combinedPnl >= 0 ? 'green' : 'red'}>
                   {fmtDollar(companion.combinedPnl)}
                 </span>{' '}
-                (options {fmtDollar(companion.optionsPnl)} · stocks {fmtDollar(companion.equityPnl)})
-                {' '}· {companion.closeCount} close{companion.closeCount === 1 ? '' : 's'}
+                (options {fmtDollar(companion.optionsPnl)} ·{' '}
+                {/* TRA-4979 — the stock tile must not print a MEASURED $0.00 for a
+                    sleeve that was never read. `equityPnl: 0` under
+                    `equityIncluded: false` is an ABSTENTION, and rendering it as a
+                    dollar figure beside a real one is what let nine live cells
+                    labelled "ties to your broker statement" read as all-instrument. */}
+                {companion.equityIncluded
+                  ? <>stocks {fmtDollar(companion.equityPnl)}</>
+                  : <>stocks <em>withheld</em></>})
+                {' '}· {companion.closeCount} option close{companion.closeCount === 1 ? '' : 's'}
                 {!companion.equityIncluded && (
                   <> · <strong>⚠ options only</strong> — stock realized was withheld this pass
-                  (corporate-action feed unreadable or a split invalidated the lot book), so this
-                  will not tie to an all-instrument statement.</>
+                  (corporate-action feed unreadable, or a corporate action could not be attributed
+                  to a ticker).{' '}
+                  {/* TRA-4979 — the counter, which is the only thing that says whether
+                      the caveat above COSTS anything on this particular day. */}
+                  {companion.equitySuppressedCloseCount === undefined ? (
+                    <>This row predates the suppressed-close count, so whether any stock closed this
+                    day is <strong>UNKNOWN</strong> — treat the figure as incomplete.</>
+                  ) : companion.equitySuppressedCloseCount === 0 ? (
+                    <>No stock closed this day, so the figure above is nonetheless{' '}
+                    <strong>complete</strong> and does tie out.</>
+                  ) : (
+                    <><strong>{companion.equitySuppressedCloseCount} stock close
+                    {companion.equitySuppressedCloseCount === 1 ? '' : 's'} on this day{' '}
+                    {companion.equitySuppressedCloseCount === 1 ? 'is' : 'are'} MISSING</strong> from
+                    the figure above — it is incomplete by an unmeasured amount and will not tie to
+                    an all-instrument statement.</>
+                  )}</>
                 )}
               </>
             )}

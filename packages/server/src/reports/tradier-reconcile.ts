@@ -131,6 +131,40 @@ export interface RealizedAllInstrumentTotals extends RealizedBackfillTotals {
   equityRealizedByDate: Map<string, number>;
   /** `YYYY-MM-DD` → the OPTIONS slice of `realizedByDate`. */
   optionsRealizedByDate: Map<string, number>;
+  /**
+   * TRA-4979 — THE COUNTER THE SUPPRESSION OWED. `YYYY-MM-DD` → equity closing
+   * fills on that date that did **not** enter `equityRealizedByDate`, because
+   * `includeEquity` was false or the symbol was in `excludeSymbols`.
+   *
+   * Without it, these two states are byte-identical on the wire and the one
+   * reader who can tell them apart is a human reading the raw broker tape:
+   *
+   *  · withheld **and no equity closed that day** ⇒ `realizedByDate` is EXACTLY
+   *    right, the options-only caveat is cosmetic, the cell may be summed.
+   *  · withheld **and equity DID close that day** ⇒ `realizedByDate` is wrong by
+   *    an unmeasured amount and must not be summed as all-instrument.
+   *
+   * Measured on the live book 2026-10-01 (TRA-4979): the admin account withholds
+   * ALL equity on every pass — `adjustment -7 shares 2026-06-12`, description
+   * `" reverse split DREAMLAND LIMITED"`, which names the COMPANY and so
+   * intersects none of the tape's tickers (TDIC) ⇒ `withholdAllEquity`. Of the
+   * nine TRA-3100 dates, **eight** carried zero equity closes (caveat cosmetic)
+   * and **one** — 2026-06-16 — carried the $0.80 MIR close this docblock already
+   * names above. Eight correct cells and one wrong one, indistinguishable.
+   *
+   * `closeCountByDate` CANNOT serve this purpose: under `includeEquity: false`
+   * the matcher runs `instruments: ['option']`, so it counts option closes only.
+   *
+   * Needs no lot book, which is the point — it is computable exactly when the
+   * FIFO is refusing to run. A close is `amount > 0`, the matcher's own rule
+   * (side comes from the sign of `amount`, never the description).
+   *
+   * Counts every suppressed equity close, including one whose open is outside
+   * the window and would not have been attributed anyway. That over-warns by
+   * design: "we might be missing equity here" is the safe direction, and a cell
+   * whose equity opens predate the window genuinely has unknown equity realized.
+   */
+  equitySuppressedCloseCountByDate: Map<string, number>;
 }
 
 /**
@@ -177,7 +211,29 @@ export function realizedPnlByCloseDate(
   for (const [date, total] of realizedByDate) {
     optionsRealizedByDate.set(date, total - (equityRealizedByDate.get(date) ?? 0));
   }
-  return { realizedByDate, closeCountByDate, equityRealizedByDate, optionsRealizedByDate };
+  // TRA-4979 — count what the scope above just dropped. Derived from the SAME
+  // predicates the matcher uses (`instruments` membership, `excludeSymbols`, and
+  // `amount > 0` for a close) so the counter cannot drift away from the thing it
+  // is counting: a leg is suppressed iff the matcher would not have read it.
+  const equitySuppressedCloseCountByDate = new Map<string, number>();
+  for (const fill of fills) {
+    if (fill.tradeType !== 'equity') continue;
+    if (fill.quantity <= 0 || fill.amount <= 0) continue; // opens and zero-cash rows are not closes
+    const suppressed =
+      !equityScope.includeEquity || (equityScope.excludeSymbols?.has(fill.symbol) ?? false);
+    if (!suppressed) continue;
+    equitySuppressedCloseCountByDate.set(
+      fill.date,
+      (equitySuppressedCloseCountByDate.get(fill.date) ?? 0) + 1,
+    );
+  }
+  return {
+    realizedByDate,
+    closeCountByDate,
+    equityRealizedByDate,
+    optionsRealizedByDate,
+    equitySuppressedCloseCountByDate,
+  };
 }
 
 /** Outcome of one FIFO pass over a window of fills. */

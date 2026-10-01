@@ -4222,11 +4222,16 @@ async function backfillLiveRealizedCalendar(
     : caScope.reasons.length > 0
       ? ` Stock realized excludes ${[...caScope.excludeSymbols].join(', ')} — ${caScope.reasons.join('; ')}.`
       : '';
-  const { closeCountByDate, equityRealizedByDate, optionsRealizedByDate, realizedByDate } =
-    realizedPnlByCloseDate(fills, {
-      includeEquity,
-      excludeSymbols: caScope?.excludeSymbols,
-    });
+  const {
+    closeCountByDate,
+    equityRealizedByDate,
+    optionsRealizedByDate,
+    realizedByDate,
+    equitySuppressedCloseCountByDate,
+  } = realizedPnlByCloseDate(fills, {
+    includeEquity,
+    excludeSymbols: caScope?.excludeSymbols,
+  });
   const dir = stockReportsDirFor(ctx, mode);
 
   // Candidate days = existing report files in the bucket ∪ realized-close days,
@@ -4304,6 +4309,10 @@ async function backfillLiveRealizedCalendar(
       equityPnl: equityRealizedByDate.get(date) ?? 0,
       closeCount: dayCloseCount,
       equityIncluded: includeEquity,
+      // TRA-4979 — a real 0 here, not an absent one: this pass DID look. The
+      // `?? 0` is safe only because the map above was built over the whole tape
+      // in the same pass, so "no key" provably means "no suppressed close".
+      equitySuppressedCloseCount: equitySuppressedCloseCountByDate.get(date) ?? 0,
       reconstructedAt,
     });
     // TRA-3100 — the write decision proper. It lives in
@@ -4384,6 +4393,22 @@ async function backfillLiveRealizedCalendar(
     // with no corporate actions in it.
     equityIncluded: includeEquity,
     equityExcludedSymbols: caScope ? [...caScope.excludeSymbols] : null,
+    // TRA-4979 — WHAT THE WITHHOLDING ACTUALLY COST, in the same line that
+    // reports the withholding. `equityIncluded: false` was the only tell, and it
+    // reads identically whether the account closed no stock all window (the
+    // caveat is cosmetic) or closed stock on a day this pass just wrote
+    // options-only (the caveat is an error). Measured 2026-10-01: 1 suppressed
+    // close across the whole 24-month window, worth $0.80 on 2026-06-16.
+    equitySuppressedCloses: [...equitySuppressedCloseCountByDate.values()].reduce(
+      (s, n) => s + n,
+      0,
+    ),
+    equitySuppressedCloseDates: [...equitySuppressedCloseCountByDate.keys()].sort(),
+    // TRA-4979 — the reason string, which until now existed ONLY inside the
+    // markdown of rows the pass happened to WRITE. On a steady-state pass that
+    // writes nothing (the normal case — 100 protected rows, 0 written) the reason
+    // why equity was withheld was unreadable from the logs entirely.
+    equityWithheldReasons: includeEquity ? null : (caScope?.reasons ?? ['corporate-action feed unreadable']),
     corporateActionsSeen: corporateActions?.length ?? null,
   });
   return outcome(written, forced, protectedRows, companionsWritten);

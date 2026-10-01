@@ -105,6 +105,7 @@ describe('TRA-4201 — companion construction', () => {
       equityPnl: 12.5,
       closeCount: 2,
       equityIncluded: true,
+      equitySuppressedCloseCount: 0,
       reconstructedAt: AT,
     });
     expect(c.combinedPnl).toBe(-381.42);
@@ -117,6 +118,7 @@ describe('TRA-4201 — companion construction', () => {
       equityPnl: 0,
       closeCount: 1,
       equityIncluded: true,
+      equitySuppressedCloseCount: 0,
       reconstructedAt: AT,
     });
     expect(c.optionsPnl).toBe(-393.92);
@@ -129,6 +131,7 @@ describe('TRA-4201 — companion construction', () => {
       equityPnl: 0,
       closeCount: 1,
       equityIncluded: true,
+      equitySuppressedCloseCount: 0,
       reconstructedAt: AT,
     });
     expect(c.optionsPnl).toBe(0.3);
@@ -144,6 +147,7 @@ describe('TRA-4201 — companion construction', () => {
       equityPnl: 0,
       closeCount: 1,
       equityIncluded: false,
+      equitySuppressedCloseCount: 0,
       reconstructedAt: AT,
     });
     expect(withheld.equityIncluded).toBe(false);
@@ -169,6 +173,7 @@ describe('TRA-4201 — a PROTECTED row gains the companion and loses nothing', (
       equityPnl: 0,
       closeCount: AUG_EPISODE.settleDay.closes,
       equityIncluded: true,
+      equitySuppressedCloseCount: 0,
       reconstructedAt: AT,
     });
     const { changed, row } = applyBrokerRealizedCompanion(before, companion);
@@ -191,7 +196,7 @@ describe('TRA-4201 — a PROTECTED row gains the companion and loses nothing', (
     // "the file changed" as a signal that a NUMBER changed.
     const before = protectedRow();
     const companion = buildBrokerRealizedCompanion({
-      optionsPnl: -393.92, equityPnl: 0, closeCount: 1, equityIncluded: true, reconstructedAt: AT,
+      optionsPnl: -393.92, equityPnl: 0, closeCount: 1, equityIncluded: true, equitySuppressedCloseCount: 0, reconstructedAt: AT,
     });
     const { row } = applyBrokerRealizedCompanion(before, companion);
 
@@ -211,7 +216,7 @@ describe('TRA-4201 — a PROTECTED row gains the companion and loses nothing', (
     const { row } = applyBrokerRealizedCompanion(
       flagged,
       buildBrokerRealizedCompanion({
-        optionsPnl: 0, equityPnl: 0, closeCount: 0, equityIncluded: true, reconstructedAt: AT,
+        optionsPnl: 0, equityPnl: 0, closeCount: 0, equityIncluded: true, equitySuppressedCloseCount: 0, reconstructedAt: AT,
       }),
     );
     expect(row.pnlUnreconciled).toEqual(flagged.pnlUnreconciled);
@@ -227,7 +232,7 @@ describe('TRA-4201 — absence must not read as zero', () => {
     const { changed, row } = applyBrokerRealizedCompanion(
       protectedRow({ date: '2026-08-19', combinedPnl: -0.42 }),
       buildBrokerRealizedCompanion({
-        optionsPnl: 0, equityPnl: 0, closeCount: 0, equityIncluded: true, reconstructedAt: AT,
+        optionsPnl: 0, equityPnl: 0, closeCount: 0, equityIncluded: true, equitySuppressedCloseCount: 0, reconstructedAt: AT,
       }),
     );
     expect(changed).toBe(true);
@@ -241,7 +246,7 @@ describe('TRA-4201 — absence must not read as zero', () => {
   it('the six fee-only August days all reconstruct to closeCount 0 — excludable as untraded', () => {
     const companions = FEE_ONLY_DAYS.map(() =>
       buildBrokerRealizedCompanion({
-        optionsPnl: 0, equityPnl: 0, closeCount: 0, equityIncluded: true, reconstructedAt: AT,
+        optionsPnl: 0, equityPnl: 0, closeCount: 0, equityIncluded: true, equitySuppressedCloseCount: 0, reconstructedAt: AT,
       }),
     );
     expect(companions.every(c => c.closeCount === 0)).toBe(true);
@@ -251,7 +256,7 @@ describe('TRA-4201 — absence must not read as zero', () => {
     const withSettlement = [
       ...companions,
       buildBrokerRealizedCompanion({
-        optionsPnl: -393.92, equityPnl: 0, closeCount: 1, equityIncluded: true, reconstructedAt: AT,
+        optionsPnl: -393.92, equityPnl: 0, closeCount: 1, equityIncluded: true, equitySuppressedCloseCount: 0, reconstructedAt: AT,
       }),
     ];
     const traded = withSettlement.filter(c => c.closeCount > 0);
@@ -266,11 +271,11 @@ describe('TRA-4201 — absence must not read as zero', () => {
     // why a win rate computed off the first one is not a strategy statistic.
     const open = buildBrokerRealizedCompanion({
       optionsPnl: AUG_EPISODE.openDay.realized, equityPnl: 0,
-      closeCount: AUG_EPISODE.openDay.closes, equityIncluded: true, reconstructedAt: AT,
+      closeCount: AUG_EPISODE.openDay.closes, equityIncluded: true, equitySuppressedCloseCount: 0, reconstructedAt: AT,
     });
     const settle = buildBrokerRealizedCompanion({
       optionsPnl: AUG_EPISODE.settleDay.realized, equityPnl: 0,
-      closeCount: AUG_EPISODE.settleDay.closes, equityIncluded: true, reconstructedAt: AT,
+      closeCount: AUG_EPISODE.settleDay.closes, equityIncluded: true, equitySuppressedCloseCount: 0, reconstructedAt: AT,
     });
     expect(open.closeCount).toBe(0);            // renders `--`, not -197.36
     expect(settle.combinedPnl).toBe(-393.92);   // the whole trip, on the day it settled
@@ -279,10 +284,10 @@ describe('TRA-4201 — absence must not read as zero', () => {
 
   it('a day that traded FLAT is not the same as a day that did not trade', () => {
     const flat = buildBrokerRealizedCompanion({
-      optionsPnl: 0, equityPnl: 0, closeCount: 2, equityIncluded: true, reconstructedAt: AT,
+      optionsPnl: 0, equityPnl: 0, closeCount: 2, equityIncluded: true, equitySuppressedCloseCount: 0, reconstructedAt: AT,
     });
     const untraded = buildBrokerRealizedCompanion({
-      optionsPnl: 0, equityPnl: 0, closeCount: 0, equityIncluded: true, reconstructedAt: AT,
+      optionsPnl: 0, equityPnl: 0, closeCount: 0, equityIncluded: true, equitySuppressedCloseCount: 0, reconstructedAt: AT,
     });
     expect(flat.combinedPnl).toBe(untraded.combinedPnl); // identical money…
     expect(flat.closeCount).not.toBe(untraded.closeCount); // …distinguishable anyway
@@ -292,7 +297,7 @@ describe('TRA-4201 — absence must not read as zero', () => {
 describe('TRA-4201 — idempotency', () => {
   const companionAt = (at: string): BrokerRealizedCompanion =>
     buildBrokerRealizedCompanion({
-      optionsPnl: -393.92, equityPnl: 0, closeCount: 1, equityIncluded: true, reconstructedAt: at,
+      optionsPnl: -393.92, equityPnl: 0, closeCount: 1, equityIncluded: true, equitySuppressedCloseCount: 0, reconstructedAt: at,
     });
 
   it('a re-run with the same figures reports changed:false and hands back the SAME object', () => {
@@ -308,7 +313,7 @@ describe('TRA-4201 — idempotency', () => {
   it('a CHANGED figure does write, so a corrected reconstruction is not stuck behind the cache', () => {
     const first = applyBrokerRealizedCompanion(protectedRow(), companionAt(AT));
     const corrected = buildBrokerRealizedCompanion({
-      optionsPnl: -393.92, equityPnl: -12.5, closeCount: 2, equityIncluded: true, reconstructedAt: '2026-08-29T02:00:00.000Z',
+      optionsPnl: -393.92, equityPnl: -12.5, closeCount: 2, equityIncluded: true, equitySuppressedCloseCount: 0, reconstructedAt: '2026-08-29T02:00:00.000Z',
     });
     const second = applyBrokerRealizedCompanion(first.row, corrected);
     expect(second.changed).toBe(true);
@@ -319,10 +324,10 @@ describe('TRA-4201 — idempotency', () => {
     // Otherwise a pass that RECOVERED the corporate-action feed would leave the
     // row asserting "options only" forever, on numbers that are now complete.
     const optionsOnly = buildBrokerRealizedCompanion({
-      optionsPnl: -393.92, equityPnl: 0, closeCount: 1, equityIncluded: false, reconstructedAt: AT,
+      optionsPnl: -393.92, equityPnl: 0, closeCount: 1, equityIncluded: false, equitySuppressedCloseCount: 0, reconstructedAt: AT,
     });
     const complete = buildBrokerRealizedCompanion({
-      optionsPnl: -393.92, equityPnl: 0, closeCount: 1, equityIncluded: true, reconstructedAt: AT,
+      optionsPnl: -393.92, equityPnl: 0, closeCount: 1, equityIncluded: true, equitySuppressedCloseCount: 0, reconstructedAt: AT,
     });
     expect(companionFiguresEqual(optionsOnly, complete)).toBe(false);
     expect(applyBrokerRealizedCompanion({ brokerRealized: optionsOnly }, complete).changed).toBe(true);
@@ -362,7 +367,7 @@ describe('TRA-4201 — a BACKFILL-OWNED row is not double-counted', () => {
     expect(decision.action).toBe('write');
 
     const companion = buildBrokerRealizedCompanion({
-      optionsPnl: -80.72, equityPnl: 0, closeCount: 3, equityIncluded: true, reconstructedAt: AT,
+      optionsPnl: -80.72, equityPnl: 0, closeCount: 3, equityIncluded: true, equitySuppressedCloseCount: 0, reconstructedAt: AT,
     });
     // The row's own combined figure and the companion's are the SAME number, so
     // no view can produce a doubled total whichever field it reads.
@@ -375,10 +380,10 @@ describe('TRA-4201 — a BACKFILL-OWNED row is not double-counted', () => {
     // block forward would leave the cell holding two realized numbers with
     // nothing saying which pass produced which.
     const stale = buildBrokerRealizedCompanion({
-      optionsPnl: -100, equityPnl: 0, closeCount: 1, equityIncluded: true, reconstructedAt: '2026-08-01T00:00:00.000Z',
+      optionsPnl: -100, equityPnl: 0, closeCount: 1, equityIncluded: true, equitySuppressedCloseCount: 0, reconstructedAt: '2026-08-01T00:00:00.000Z',
     });
     const fresh = buildBrokerRealizedCompanion({
-      optionsPnl: -393.92, equityPnl: 0, closeCount: 1, equityIncluded: true, reconstructedAt: AT,
+      optionsPnl: -393.92, equityPnl: 0, closeCount: 1, equityIncluded: true, equitySuppressedCloseCount: 0, reconstructedAt: AT,
     });
     const { row } = applyBrokerRealizedCompanion({ brokerRealized: stale }, fresh);
     expect(row.brokerRealized).toEqual(fresh);
