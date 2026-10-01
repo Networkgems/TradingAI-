@@ -90,6 +90,17 @@ const BACKOFF_429_MAX_MS = 10 * 60_000;
 // call, and every suppressed retry is counted in diagnostics — a suppression
 // that doesn't ship a counter is invisible. 429 and 5xx are excluded: those
 // are vendor-wide states owned by the breaker/backoff, not per-key ones.
+//
+// ⛔ TRA-5005 — the premise in that paragraph ("a non-429 4xx refuses this KEY")
+// is MEASURED FALSE for the only 400 this vendor actually sends. 100% of
+// classified 400s on live `faae9388` were `Quota Violation` (5,923 of 5,923) —
+// an ACCOUNT-level per-minute rate limit, so the cooldown named the wrong
+// subject (whichever key was in flight), the wrong duration (10 min vs the <60s
+// the vendor's own `Expires` states) and the wrong class (vendor-wide, not
+// per-key). Those refusals now take the account-scoped gate instead — see
+// `isQuotaViolationReason` and `RelativeValueScannerDiagnostics.quotaHold`. This
+// constant still governs the 4xx reasons that genuinely ARE per-key (a bad
+// parameter, a delisted symbol), which is the population it was right about.
 export const REFUSAL_4XX_COOLDOWN_MS = 10 * 60_000;
 const MAX_REFUSAL_COOLDOWN_ENTRIES = 1024;
 // TRA-4664 (third pass) — how many cooling keys `diagnostics()` will NAME. The
@@ -144,6 +155,82 @@ export function canonicalizeRefusalReason(reason: string): string {
   return reason.replace(/\d{5,}/g, '<n>');
 }
 
+/**
+ * TRA-5005 — is this vendor refusal body an ACCOUNT-level quota violation?
+ *
+ * Measured on live `faae9388` (89.1h boot, read 2026-10-01 mid-RTH): **100% of
+ * classified 400s are `Quota Violation` — 5,923 of 5,923, zero non-quota**, and
+ * `quota + (other) === byStatus['400']` exactly, so no other 400 reason string
+ * was ever bucketed. That refutes the premise the per-key cooldown was built on
+ * (see {@link REFUSAL_4XX_COOLDOWN_MS}): a quota violation is not a property of
+ * the (endpoint, symbol, date) KEY that happened to be in flight, it is a
+ * property of the ACCOUNT at that minute. Routing it to a per-key cooldown
+ * blacked out an innocent key for 10 minutes over a global condition that
+ * resets in under 60s — which is why SPY and AAPL both sat in the refused
+ * census next to names that priced fine minutes earlier.
+ *
+ * This is the discriminator that keeps the per-key cooldown for the 4xx reasons
+ * that genuinely ARE per-key (a bad parameter, a delisted symbol). It is
+ * deliberately a match on the vendor's own words and not on the status: Tradier
+ * signals a rate limit with a **400**, which is exactly why `is429Error` —
+ * `/\b429\b|Too Many Requests/i` — never saw it.
+ */
+export function isQuotaViolationReason(reason: string | null | undefined): boolean {
+  return typeof reason === 'string' && /quota\s+violation/i.test(reason);
+}
+
+/**
+ * TRA-5005 — the quota's own reset instant, parsed out of `Expires <epoch-ms>`.
+ *
+ * Every `Expires` gap in the live census is a multiple of 60s, so the vendor's
+ * bucket is per MINUTE and this epoch is when it refills. We already had the
+ * datum that says the hold should last seconds; the old code held the key dark
+ * for `REFUSAL_4XX_COOLDOWN_MS` (10 min) anyway — roughly 10x longer than the
+ * vendor requires.
+ *
+ * Returns epoch MILLIS, or `null` when there is no readable datum. `null` is a
+ * distinct answer from a number and the caller must treat it as UNKNOWN and
+ * count it (see `quotaHold.expiresUnreadable`) — never as 0, which would read
+ * as "the hold already expired" and silently restore the hammering this fixes.
+ */
+export function parseQuotaExpiresMs(reason: string | null | undefined): number | null {
+  if (typeof reason !== 'string') return null;
+  const m = /\bexpires\b\D{0,4}(\d{9,})/i.exec(reason);
+  if (!m) return null;
+  const raw = Number(m[1]);
+  if (!Number.isFinite(raw) || raw <= 0) return null;
+  // Measured shape is epoch-MILLIS. Epoch-SECONDS is accepted too rather than
+  // read as a 1970 instant: a 10-digit value taken for millis lands in 1970,
+  // `Expires <= now` releases the hold immediately, and the failure is the
+  // silent no-hold direction. Anything outside both plausible bands is `null`
+  // (unknown) rather than a guess.
+  if (raw >= 1e12) return raw;
+  if (raw >= 1e9 && raw < 1e11) return raw * 1000;
+  return null;
+}
+
+/**
+ * TRA-5005 — the ceiling on a single quota hold, and the floor under it.
+ *
+ * The vendor's bucket is per minute, so a well-formed `Expires` is always <60s
+ * out. The ceiling is a clamp on the VENDOR's datum, not a policy: a fat-
+ * fingered or malicious epoch three days out must not black the scanner out for
+ * three days, and `quotaHold.expiresClamped` says out loud when it bit. The
+ * floor stops a boundary that is 1ms away from amounting to no hold at all and
+ * re-opening the hammer loop this fix exists to close.
+ */
+export const MAX_QUOTA_HOLD_MS = 90_000;
+export const MIN_QUOTA_HOLD_MS = 1_000;
+
+/**
+ * TRA-5005 — the fallback hold when `Expires` is unreadable: the next minute
+ * boundary, because that is what the vendor's bucket is keyed to. Short on
+ * purpose — the cost of over-holding is exactly the defect being fixed.
+ */
+function nextMinuteBoundaryMs(nowMs: number): number {
+  return Math.floor(nowMs / 60_000) * 60_000 + 60_000;
+}
+
 function is429Error(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return /\b429\b|Too Many Requests/i.test(msg);
@@ -191,6 +278,14 @@ export interface RelativeValueScanResult {
     | 'no_expirations'
     | 'no_chain'
     | 'breaker_open'
+    /**
+     * TRA-5005 — the ACCOUNT-level Tradier quota gate was held, so no upstream
+     * call was made for this symbol. Split out of `fetch_error` because the two
+     * are on opposite sides of the wire: `fetch_error` is "they refused or
+     * failed", `quota_held` is "we suppressed the call". Pooling them made
+     * 20.8% of a day's evaluations unattributable. See {@link TradierQuotaHoldError}.
+     */
+    | 'quota_held'
     | 'fetch_error';
   errorMessage?: string;
 }
@@ -227,6 +322,8 @@ export interface TermStructureScanResult {
     | 'no_spot'
     | 'no_expirations'
     | 'no_chain'
+    /** TRA-5005 — see {@link RelativeValueScanResult.reason}. */
+    | 'quota_held'
     | 'fetch_error';
   errorMessage?: string;
 }
@@ -269,6 +366,8 @@ export type OtmScanReason =
   | 'no_spot'
   | 'no_expirations'
   | 'no_chain'
+  /** TRA-5005 — see {@link RelativeValueScanResult.reason}. */
+  | 'quota_held'
   | 'fetch_error'
   /** Legacy catch-all; no longer emitted, kept so existing switches still type. */
   | 'unavailable';
@@ -353,6 +452,15 @@ export interface RelativeValueScannerDiagnostics {
    * population as the cooldown (non-429 4xx), so `distinctKeys >= cooling`
    * always. `evicted > 0` ⇔ the census cap bit and `distinctKeys` is a LOWER
    * BOUND — the one reading that must never be mistaken for a complete census.
+   *
+   * ⛔ TRA-5005 — the POPULATION of this whole block changed. A `Quota Violation`
+   * 400 no longer arms the per-key cooldown and no longer enters `sinceBoot`;
+   * it arms the account-scoped {@link RelativeValueScannerDiagnostics.quotaHold}
+   * gate instead. Since 100% of this vendor's classified 400s were quota
+   * violations, a healthy box can now read `cooling: 0` and
+   * `sinceBoot.distinctKeys: 0` where it previously read 110 keys. That is the
+   * fix landing, NOT the instrument going dark — cross-read `quotaHold` before
+   * concluding anything from a zero here.
    */
   refusalCooldown?: {
     size: number;
@@ -399,6 +507,68 @@ export interface RelativeValueScannerDiagnostics {
      */
     byReason?: Record<string, number>;
   };
+  /**
+   * TRA-5005 — the ACCOUNT-scoped quota gate that replaced the per-key cooldown
+   * for `Quota Violation` refusals. ONE global hold, released at the vendor's
+   * own `Expires`, instead of N per-key 10-minute blackouts of whichever key
+   * happened to be in flight when the account's minute ran out.
+   *
+   * A suppression must ship a counter (TRA-3800), and the suppression this
+   * replaces shipped one (`refusalCooldown.suppressed` = 907,095 local re-throws,
+   * 55.6% of all option cache misses). So every arm of the gate is counted here,
+   * and the counts close a SUM IDENTITY against the old surface:
+   *
+   *   `upstreamRefusals + <non-quota 4xx refusals> === upstreamRefusals.byStatus['4xx']`
+   *   `expiresHonoured + expiresUnreadable + expiresStale + expiresClamped === upstreamRefusals`
+   *
+   * ⚠ A quota refusal no longer enters `refusalCooldown` OR its `sinceBoot`
+   * census — that is the fix, not a regression in those fields, but it does mean
+   * a box whose only 400s are quota violations now reads `cooling: 0` /
+   * `sinceBoot.distinctKeys: 0` where it used to read 110 keys. Read THIS block
+   * for the quota population; read those for genuinely per-key 4xx.
+   *
+   * `heldNow`/`blockedUntilMs` are instantaneous and `null` when the gate is
+   * open — an open gate is NOT the same statement as "no quota refusal has ever
+   * happened", which is what `upstreamRefusals` answers.
+   */
+  quotaHold?: {
+    /** Epoch-ms the gate is held until, or `null` when open RIGHT NOW. */
+    blockedUntilMs: number | null;
+    /** Remaining hold in ms, or `null` when open. Derived; saves a clock round-trip. */
+    heldMsRemaining: number | null;
+    /** Quota-violation refusals received from upstream this boot. */
+    upstreamRefusals: number;
+    /** Times the gate went from open → held. */
+    holdsArmed: number;
+    /** Times an already-held gate was pushed further out by a newer `Expires`. */
+    holdsExtended: number;
+    /** Times a held gate was observed expired and released. */
+    holdsReleased: number;
+    /** Upstream calls the gate skipped — the replacement for `refusalCooldown.suppressed`. */
+    suppressed: number;
+    /** `suppressed`, split by endpoint. Sums to `suppressed`. */
+    suppressedByEndpoint: { expirations: number; chain: number };
+    /** Refusals whose `Expires` parsed and was used verbatim. */
+    expiresHonoured: number;
+    /**
+     * Refusals with NO readable `Expires`. The hold fell back to the next minute
+     * boundary. `undefined`/absent is not 0 — a build without this field cannot
+     * tell you, and a 0 here is a measured zero (TRA-3802).
+     */
+    expiresUnreadable: number;
+    /** `Expires` parsed but already in the past (clock skew / a stale body). */
+    expiresStale: number;
+    /** `Expires` parsed but beyond {@link MAX_QUOTA_HOLD_MS}; the clamp bit. */
+    expiresClamped: number;
+    /** The clamp itself, disclosed so a reader can tell a clamp from a vendor datum. */
+    maxHoldMs: number;
+    /** Longest single hold armed this boot, in ms. */
+    longestHoldMs: number;
+    /** Newest `Expires` the vendor sent, verbatim. `null` = never readable. */
+    lastExpiresAtMs: number | null;
+    /** When the gate was last armed. `null` = never. */
+    lastArmedAtMs: number | null;
+  };
 }
 
 export interface CacheCounters {
@@ -415,10 +585,52 @@ export interface CacheCounters {
  * rate-limit refusal and the TRA-417 429 backoff finally engages.
  */
 export class TradierHttpRefusalError extends Error {
-  constructor(readonly endpoint: 'expirations' | 'chain', readonly httpStatus: number, detail: string) {
+  constructor(
+    readonly endpoint: 'expirations' | 'chain',
+    readonly httpStatus: number,
+    detail: string,
+    /**
+     * TRA-5005 — the vendor said this was an ACCOUNT-level quota violation (see
+     * {@link isQuotaViolationReason}). Carried on the error because the CAUSE
+     * has to survive the throw: every caller's catch flattened a refusal to
+     * `fetch_error`, which is why 20.8% of a day's symbol-evaluations were
+     * indistinguishable at the census level from a real upstream failure.
+     */
+    readonly quotaViolation = false,
+  ) {
     super(`Tradier ${endpoint} HTTP ${httpStatus} (${detail})`);
     this.name = 'TradierHttpRefusalError';
   }
+}
+
+/**
+ * TRA-5005 — raised INSTEAD of an upstream call while the account-level quota
+ * gate is held. Subclasses {@link TradierHttpRefusalError} with a 400 on
+ * purpose: `tripBreaker` already declines to open the breaker on a non-429 4xx
+ * refusal, so a quota hold inherits that exemption rather than re-stating it.
+ *
+ * It must stay distinguishable from the refusal the vendor actually sent — this
+ * one is OUR suppression, not their answer, and the two belong on different
+ * sides of the wire. `heldUntilMs` makes the hold's end instant readable from
+ * the error itself.
+ */
+export class TradierQuotaHoldError extends TradierHttpRefusalError {
+  constructor(endpoint: 'expirations' | 'chain', detail: string, readonly heldUntilMs: number) {
+    super(endpoint, 400, `${detail}; account quota hold until ${new Date(heldUntilMs).toISOString()}`, true);
+    this.name = 'TradierQuotaHoldError';
+  }
+}
+
+/**
+ * TRA-5005 — classify a thrown fetch failure for the scan-result `reason`.
+ *
+ * AC3: `censusByEtDay` must be able to separate quota-held evaluations from
+ * other `fetch_error` causes. The census keys off `scan:${result.reason}`
+ * (`signal-engine.ts`), so the split has to happen here, in the reason, or it
+ * cannot happen at all downstream.
+ */
+function throwReason(err: unknown): 'quota_held' | 'fetch_error' {
+  return err instanceof TradierHttpRefusalError && err.quotaViolation ? 'quota_held' : 'fetch_error';
 }
 
 /**
@@ -714,6 +926,27 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
   private refusedKeyCensusEvicted = 0;
   // TRA-4865 — WHY upstream refused. See `RelativeValueScannerDiagnostics`.
   private readonly refusalsByReason: Record<string, number> = {};
+  // TRA-5005 — the ACCOUNT-scoped quota gate. ONE instant for the whole scanner,
+  // not a per-key map: the condition it models is a property of the account at a
+  // minute, so there is nothing to key it by. `null` = open.
+  // See `RelativeValueScannerDiagnostics.quotaHold`.
+  private quotaBlockedUntilMs: number | null = null;
+  private lastQuotaExpiresAtMs: number | null = null;
+  private lastQuotaHoldArmedAtMs: number | null = null;
+  private readonly quotaHoldCounters = {
+    upstreamRefusals: 0,
+    holdsArmed: 0,
+    holdsExtended: 0,
+    holdsReleased: 0,
+    suppressed: 0,
+    suppressedExpirations: 0,
+    suppressedChain: 0,
+    expiresHonoured: 0,
+    expiresUnreadable: 0,
+    expiresStale: 0,
+    expiresClamped: 0,
+    longestHoldMs: 0,
+  };
 
   /**
    * TRA-4865 — fold one upstream refusal into the reason histogram. The bucket
@@ -798,7 +1031,125 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
         sinceBoot: this.refusedKeySinceBootCensus(),
         byReason: { ...this.refusalsByReason },
       },
+      quotaHold: this.quotaHoldDiagnostics(),
     };
+  }
+
+  /**
+   * TRA-5005 — the quota gate's counters. Read-only, like every other census
+   * here: it reports an expired hold as still-set `blockedUntilMs` with a
+   * non-positive remaining time rather than releasing it, because a read that
+   * changes what the next read sees is not an instrument (the TRA-4664 third-pass
+   * rule). `heldMsRemaining` is `null` exactly when the gate is open.
+   */
+  private quotaHoldDiagnostics(): NonNullable<RelativeValueScannerDiagnostics['quotaHold']> {
+    const c = this.quotaHoldCounters;
+    const until = this.quotaBlockedUntilMs;
+    const remaining = until == null ? null : until - this.now();
+    const held = remaining != null && remaining > 0;
+    return {
+      blockedUntilMs: held ? until : null,
+      heldMsRemaining: held ? remaining : null,
+      upstreamRefusals: c.upstreamRefusals,
+      holdsArmed: c.holdsArmed,
+      holdsExtended: c.holdsExtended,
+      holdsReleased: c.holdsReleased,
+      suppressed: c.suppressed,
+      suppressedByEndpoint: { expirations: c.suppressedExpirations, chain: c.suppressedChain },
+      expiresHonoured: c.expiresHonoured,
+      expiresUnreadable: c.expiresUnreadable,
+      expiresStale: c.expiresStale,
+      expiresClamped: c.expiresClamped,
+      maxHoldMs: MAX_QUOTA_HOLD_MS,
+      longestHoldMs: c.longestHoldMs,
+      lastExpiresAtMs: this.lastQuotaExpiresAtMs,
+      lastArmedAtMs: this.lastQuotaHoldArmedAtMs,
+    };
+  }
+
+  /**
+   * TRA-5005 — arm (or extend) the ACCOUNT-scoped quota gate off the vendor's own
+   * reset instant.
+   *
+   * Three things this deliberately does NOT do:
+   *
+   * 1. **It does not touch the per-key cooldown.** The key in flight did nothing
+   *    wrong; blacking it out is the defect. AC1.
+   * 2. **It does not trip the breaker.** The breaker opens the WHOLE scanner, and
+   *    a quota that refills in <60s does not warrant that — it would trade 55.6%
+   *    silent misses for 100% darkness. A short, precisely-dated global hold is
+   *    the point.
+   * 3. **It never shortens an existing hold.** Extensions only, so a stale body
+   *    arriving after a fresher one cannot re-open the gate early.
+   */
+  private armQuotaHold(reason?: string | null): void {
+    const now = this.now();
+    const c = this.quotaHoldCounters;
+    c.upstreamRefusals += 1;
+    const parsed = parseQuotaExpiresMs(reason);
+    // `lastExpiresAtMs` carries the vendor datum VERBATIM — `null` when there was
+    // none. Never coalesced to 0: an unreadable datum and an epoch of 0 are
+    // different statements and only one of them is a measurement (TRA-3802).
+    this.lastQuotaExpiresAtMs = parsed;
+    let until: number;
+    if (parsed == null) {
+      c.expiresUnreadable += 1;
+      until = nextMinuteBoundaryMs(now);
+    } else if (parsed <= now) {
+      c.expiresStale += 1;
+      until = nextMinuteBoundaryMs(now);
+    } else if (parsed - now > MAX_QUOTA_HOLD_MS) {
+      c.expiresClamped += 1;
+      until = now + MAX_QUOTA_HOLD_MS;
+    } else {
+      c.expiresHonoured += 1;
+      until = parsed;
+    }
+    if (until < now + MIN_QUOTA_HOLD_MS) until = now + MIN_QUOTA_HOLD_MS;
+
+    const prior = this.quotaBlockedUntilMs;
+    if (prior != null && prior > now) {
+      if (until > prior) {
+        this.quotaBlockedUntilMs = until;
+        c.holdsExtended += 1;
+      }
+    } else {
+      this.quotaBlockedUntilMs = until;
+      c.holdsArmed += 1;
+      this.lastQuotaHoldArmedAtMs = now;
+      log.warn('tradier account quota hold armed (global, not per-key)', {
+        holdMs: until - now,
+        expiresAtMs: parsed,
+        reason: reason ?? null,
+      });
+    }
+    const span = (this.quotaBlockedUntilMs ?? now) - now;
+    if (span > c.longestHoldMs) c.longestHoldMs = span;
+  }
+
+  /**
+   * TRA-5005 — skip the upstream call for EVERY key while the account's quota
+   * gate is held, and count it.
+   *
+   * Runs ahead of {@link throwIfCooling} because the condition is global: there
+   * is no point consulting a per-key map about a state that belongs to the
+   * account. The warm chain/expirations caches are checked by the callers BEFORE
+   * this, so a held gate never invalidates data we already have — it only stops
+   * new calls that the vendor would refuse anyway.
+   */
+  private throwIfQuotaHeld(endpoint: 'expirations' | 'chain', detail: string): void {
+    const until = this.quotaBlockedUntilMs;
+    if (until == null) return;
+    const now = this.now();
+    if (now >= until) {
+      this.quotaBlockedUntilMs = null;
+      this.quotaHoldCounters.holdsReleased += 1;
+      return;
+    }
+    this.quotaHoldCounters.suppressed += 1;
+    if (endpoint === 'chain') this.quotaHoldCounters.suppressedChain += 1;
+    else this.quotaHoldCounters.suppressedExpirations += 1;
+    throw new TradierQuotaHoldError(endpoint, detail, until);
   }
 
   /**
@@ -964,7 +1315,9 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       this.tripBreaker(`getExpirations(${upper}) failed`, err);
       return {
         symbol: upper, spot, expiration: null, candidates: [],
-        reason: 'fetch_error', errorMessage: err instanceof Error ? err.message : String(err),
+        // TRA-5005 — `quota_held` when the account quota gate suppressed or the
+        // vendor quota-refused this call; `fetch_error` otherwise.
+        reason: throwReason(err), errorMessage: err instanceof Error ? err.message : String(err),
       };
     }
     if (!expiration) {
@@ -978,7 +1331,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       this.tripBreaker(`getChainSnapshot(${upper},${expiration}) failed`, err);
       return {
         symbol: upper, spot, expiration, candidates: [],
-        reason: 'fetch_error', errorMessage: err instanceof Error ? err.message : String(err),
+        reason: throwReason(err), errorMessage: err instanceof Error ? err.message : String(err),
       };
     }
     if (chain.length === 0) {
@@ -1060,7 +1413,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       windowed = await this.resolveWindowedExpirations(upper, dtePrefs);
     } catch (err) {
       this.tripBreaker(`getExpirations(${upper}) failed`, err);
-      return fail('fetch_error', spot, err instanceof Error ? err.message : String(err));
+      return fail(throwReason(err), spot, err instanceof Error ? err.message : String(err));
     }
     // A term axis needs at least two expirations; below that the scan refuses
     // with its own reason rather than handing the engine a degenerate input
@@ -1090,7 +1443,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
         chain = await this.fetchChain(upper, exp.d);
       } catch (err) {
         this.tripBreaker(`getChainSnapshot(${upper},${exp.d}) failed`, err);
-        return fail('fetch_error', spot, err instanceof Error ? err.message : String(err));
+        return fail(throwReason(err), spot, err instanceof Error ? err.message : String(err));
       }
       if (chain) rows.push(...chain);
     }
@@ -1166,7 +1519,10 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       this.tripBreaker(`getExpirations(${upper}) failed`, err);
       return {
         snapshot: null,
-        reason: 'fetch_error',
+        // TRA-5005 — this is the OTM/desk/live path whose `scan:fetch_error` was
+        // 20.8% of 13,900 evaluations on 2026-09-24. Splitting it here is what
+        // makes `censusByEtDay` able to answer AC3.
+        reason: throwReason(err),
         errorMessage: err instanceof Error ? err.message : String(err),
       };
     }
@@ -1179,7 +1535,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       this.tripBreaker(`getChainSnapshot(${upper},${expiration}) failed`, err);
       return {
         snapshot: null,
-        reason: 'fetch_error',
+        reason: throwReason(err),
         errorMessage: err instanceof Error ? err.message : String(err),
       };
     }
@@ -1364,6 +1720,18 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       err instanceof TradierHttpRefusalError &&
       err.httpStatus >= 400 && err.httpStatus < 500 && err.httpStatus !== 429
     ) {
+      // TRA-5005 — a quota HOLD is our own suppression, not an upstream event, and
+      // it fires on every suppressed key for the length of the hold. Logging it at
+      // `warn` would put the gate's whole suppression volume (the old surface
+      // counted 907,095 local re-throws) into the warn stream. The counters in
+      // `quotaHold` are the attributable record; the `warn` is reserved for the
+      // single arming event in `armQuotaHold`.
+      if (err instanceof TradierQuotaHoldError) {
+        log.debug('upstream call skipped (account quota hold)', {
+          label, heldUntilMs: err.heldUntilMs, reason: msg,
+        });
+        return;
+      }
       log.warn('upstream request refused (breaker not tripped)', { label, reason: msg });
       return;
     }
@@ -1455,12 +1823,24 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     this.lastRefusalAtMs = this.now();
     this.lastRefusalStatus = httpStatus;
     this.noteRefusalReason(httpStatus, reason);
-    const err = new TradierHttpRefusalError(endpoint, httpStatus, detail);
-    // TRA-4664 (second pass) — a non-429 4xx refuses this KEY, and Tradier will
-    // refuse it identically next cycle: stop asking for a cooldown period.
-    // 429/5xx stay out — the breaker/backoff owns vendor-wide states, and a
-    // per-key cooldown would outlive the vendor's recovery.
-    if (httpStatus >= 400 && httpStatus < 500 && httpStatus !== 429) {
+    // TRA-5005 — the fork. `isQuotaViolationReason` is the discriminator the
+    // TRA-4865 `byReason` histogram was built to produce, now consumed: an
+    // ACCOUNT-level quota violation arms ONE global, vendor-dated gate, while a
+    // genuinely per-key 4xx keeps the per-key cooldown below unchanged.
+    const quota = isQuotaViolationReason(reason);
+    const err = new TradierHttpRefusalError(endpoint, httpStatus, detail, quota);
+    if (quota) {
+      this.armQuotaHold(reason);
+    } else if (httpStatus >= 400 && httpStatus < 500 && httpStatus !== 429) {
+      // TRA-4664 (second pass) — a non-429 4xx refuses this KEY, and Tradier will
+      // refuse it identically next cycle: stop asking for a cooldown period.
+      // 429/5xx stay out — the breaker/backoff owns vendor-wide states, and a
+      // per-key cooldown would outlive the vendor's recovery.
+      //
+      // TRA-5005 — and a quota violation stays out too, for the mirror-image
+      // reason: it is a vendor-wide (account-wide) state wearing a 400, so a
+      // per-key cooldown both named the wrong subject and outlived the vendor's
+      // recovery by ~10x. It takes the gate above instead.
       this.putBounded(
         this.refusalCooldown,
         `${endpoint}|${detail}`,
@@ -1530,6 +1910,9 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       // `no_expirations` — a quota blip poisoning the symbol until the size cap
       // happened to evict it. A refusal now throws: never cached, and the
       // caller's catch trips the breaker and reports `fetch_error`.
+      // TRA-5005 — the account-scoped gate runs FIRST: a quota violation is not a
+      // property of this key, so there is no point asking a per-key map about it.
+      this.throwIfQuotaHeld('expirations', symbol);
       this.throwIfCooling('expirations', symbol);
       const client = this.client!;
       if (typeof client.fetchExpirations === 'function') {
@@ -1596,6 +1979,8 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     this.chainCounters.misses += 1;
     // TRA-4664 — same as `resolveWindowedExpirations`: a refusal was `[]`,
     // cached for the chain TTL and reported as `no_chain`. Now it throws.
+    // TRA-5005 — see `resolveWindowedExpirations`: global gate before per-key.
+    this.throwIfQuotaHeld('chain', `${symbol},${expiration}`);
     this.throwIfCooling('chain', `${symbol},${expiration}`);
     const client = this.client!;
     let rows: OptionChainRow[];

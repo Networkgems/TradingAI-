@@ -42,6 +42,13 @@ type ScanReason =
   | 'no_spot'
   | 'no_expirations'
   | 'no_chain'
+  /**
+   * TRA-5005 — the server suppressed the upstream call because Tradier's
+   * ACCOUNT-level per-minute quota was exhausted. Distinct from `fetch_error`
+   * on purpose: that one is "the vendor refused or failed", this one is "we did
+   * not ask", and they are different pages to different people.
+   */
+  | 'quota_held'
   | 'fetch_error'
   | 'unavailable';
 
@@ -215,6 +222,11 @@ const REASON_COPY: Record<Exclude<ScanReason, 'ok'>, { title: string; detail: st
     title: 'Empty option chain',
     detail:
       'The expiration was picked but the chain came back with no rows. Typically a symbol with no listed options at that expiration.',
+  },
+  quota_held: {
+    title: 'Account quota held',
+    detail:
+      "Tradier's ACCOUNT-level per-minute request quota was exhausted, so the server deliberately did not call upstream for this symbol. The hold releases at the quota's own reset instant — usually under a minute — and is global rather than per-symbol: nothing is wrong with this ticker. Read quotaHold on /api/health/options-mispricing for the live hold and its counters.",
   },
   fetch_error: {
     title: 'Upstream fetch failed',

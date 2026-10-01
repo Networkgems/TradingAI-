@@ -3,6 +3,9 @@ import {
   TradierRelativeValueScannerService,
   REFUSAL_4XX_COOLDOWN_MS,
   canonicalizeRefusalReason,
+  isQuotaViolationReason,
+  parseQuotaExpiresMs,
+  MAX_QUOTA_HOLD_MS,
 } from './relative-value-scanner.js';
 import type { OptionChainRow, TradierOptionsClient } from '@trading-app/engine';
 
@@ -562,11 +565,16 @@ describe('scanTermStructure (TRA-4413 item 4)', () => {
 // which the scanner reported as a domain outcome AND CACHED (6h for
 // expirations). These tests drive the status-preserving `fetch*` path.
 class CheckedFakeClient extends FakeClient {
+  // `reason` mirrors the real engine client's `{ ok: false; httpStatus; reason: string | null }`
+  // (TRA-4865). Optional here so the pre-TRA-4865 shape — a refusal with no body
+  // at all — stays expressible; that is a distinct case the suite asserts.
   fetchExpirations = vi.fn<(s: string) => Promise<
-    { ok: true; httpStatus: number; value: string[] } | { ok: false; httpStatus: number }
+    { ok: true; httpStatus: number; value: string[] }
+    | { ok: false; httpStatus: number; reason?: string | null }
   >>();
   fetchChainSnapshot = vi.fn<(s: string, e: string) => Promise<
-    { ok: true; httpStatus: number; value: OptionChainRow[] } | { ok: false; httpStatus: number }
+    { ok: true; httpStatus: number; value: OptionChainRow[] }
+    | { ok: false; httpStatus: number; reason?: string | null }
   >>();
 }
 
@@ -1001,8 +1009,16 @@ describe('Tradier HTTP refusals are not listings (TRA-4664)', () => {
     client.fetchChainSnapshot.mockResolvedValue(okChain);
 
     for (const s of syms) {
-      expect((await svc.scanOtm(s)).reason).toBe('fetch_error');
-      advance(1_000);
+      // TRA-5005 — `quota_held`, not `fetch_error`: this reason is now classified
+      // as the account-level condition it always was. The 91s step is also
+      // TRA-5005's doing — these 80 refusals are 80 UPSTREAM responses, and the
+      // account-scoped gate now suppresses everything inside a hold, so reaching
+      // upstream 80 times requires clearing the hold 80 times. That is the fix
+      // working, and it is why this fixture had to say so explicitly: with the
+      // old 1s step, symbols 2..80 never reach the vendor and `byReason` would
+      // read 1, which would look like the canonicaliser regressing.
+      expect((await svc.scanOtm(s)).reason).toBe('quota_held');
+      advance(MAX_QUOTA_HOLD_MS + 1_000);
     }
 
     const diags = svc.diagnostics();
@@ -1072,5 +1088,382 @@ describe('Tradier HTTP refusals are not listings (TRA-4664)', () => {
     await svc.getSelectorChain('FRESH');
     expect(svc.diagnostics().chainCache!.capacityEvictions).toBe(before);
     expect(svc.diagnostics().cacheSize).toBe(1);
+  });
+});
+
+// ── TRA-5005 ───────────────────────────────────────────────────────────────
+//
+// Tradier's 400 `Quota Violation` is an ACCOUNT-level per-minute rate limit, but
+// `refuse()` routed every non-429 4xx to the PER-KEY 10-minute cooldown. So a
+// global condition blacked out whichever (endpoint, symbol, date) happened to be
+// in flight when the account's minute ran out — wrong subject, wrong duration
+// (10 min vs the <60s the vendor's own `Expires` states), wrong class.
+//
+// Measured on live `faae9388`: 100% of classified 400s were `Quota Violation`
+// (5,923 of 5,923), `suppressed` = 907,095 local re-throws = 55.6% of all
+// 1,632,370 option cache misses, and `scan:fetch_error` was 20.8% of 13,900
+// otm/desk/live evaluations on 2026-09-24.
+//
+// Corroborating evidence that the CLASS was the defect: the sibling quotes/bars
+// path in `yahoo-feed.ts` already treats this exact body as vendor-wide —
+// `shouldTripTradierBreaker` returns true on `/quota/i`. The options path was
+// the outlier. It does NOT get the breaker here, though: the breaker opens the
+// whole scanner, which would trade 55.6% silent misses for 100% darkness.
+describe('a Quota Violation 400 is an ACCOUNT-level hold, not a per-key blackout (TRA-5005)', () => {
+  const okExp = { ok: true as const, httpStatus: 200, value: [EXP] };
+  const okChain = { ok: true as const, httpStatus: 200, value: [row(100, 'call', 0.3)] };
+
+  /** A service plus a clock the fixture can read, so `Expires` can be dated relative to now. */
+  function makeQuotaService(client: CheckedFakeClient) {
+    const { svc, advance } = makeService({ client });
+    let t = NOW_BASE;
+    return {
+      svc,
+      now: () => t,
+      step: (ms: number) => { t += ms; advance(ms); },
+    };
+  }
+
+  it('parses the vendor own reset epoch, and answers UNKNOWN rather than guessing', () => {
+    expect(isQuotaViolationReason('Quota Violation: Expires 1790602260000')).toBe(true);
+    expect(isQuotaViolationReason('quota   violation')).toBe(true); // vendor casing/spacing is not ours
+    expect(isQuotaViolationReason('Invalid parameter, ^TNX: symbol not found.')).toBe(false);
+    expect(isQuotaViolationReason(null)).toBe(false);
+    expect(isQuotaViolationReason(undefined)).toBe(false);
+
+    // epoch-MILLIS, the measured shape.
+    expect(parseQuotaExpiresMs('Quota Violation: Expires 1790602260000')).toBe(1790602260000);
+    expect(parseQuotaExpiresMs('Quota Violation: Expires: 1790602260000')).toBe(1790602260000);
+    // epoch-SECONDS is scaled, not read as a 1970 instant. Mistaking 10 digits
+    // for millis puts `Expires` 56 years in the past, the hold releases
+    // immediately, and the hammering this fixes comes back SILENTLY.
+    expect(parseQuotaExpiresMs('Quota Violation: Expires 1790602260')).toBe(1790602260000);
+    // No readable datum ⇒ `null` (UNKNOWN), never 0. A 0 reads as "already
+    // expired", which is the same silent no-hold failure (TRA-3802).
+    expect(parseQuotaExpiresMs('Quota Violation')).toBeNull();
+    expect(parseQuotaExpiresMs('Quota Violation: Expires soon')).toBeNull();
+    expect(parseQuotaExpiresMs('Quota Violation: Expires 0')).toBeNull();
+    expect(parseQuotaExpiresMs(null)).toBeNull();
+  });
+
+  // AC1 — one global gate, released at its own `Expires`, and NO key marked dark.
+  it('holds ONE global gate until its own Expires and marks no individual key dark', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, now, step } = makeQuotaService(client);
+    client.fetchExpirations.mockImplementation(async (s) =>
+      s === 'AAPL'
+        ? { ok: false, httpStatus: 400, reason: `Quota Violation: Expires ${now() + 30_000}` }
+        : okExp);
+    client.fetchChainSnapshot.mockResolvedValue(okChain);
+    const callsFor = (s: string) => client.fetchExpirations.mock.calls.filter(([x]) => x === s).length;
+
+    const first = await svc.scanOtm('AAPL');
+    // The reason is the CAUSE now, not a flattened `fetch_error` (AC3's mechanism:
+    // `signal-engine.ts` keys the census `scan:${reason}`, so this string IS the
+    // census bucket — `scan:quota_held` instead of `scan:fetch_error`).
+    expect(first.reason).toBe('quota_held');
+
+    let d = svc.diagnostics();
+    // The gate: ONE instant, the vendor's own, not `now + REFUSAL_4XX_COOLDOWN_MS`.
+    expect(d.quotaHold!.blockedUntilMs).toBe(NOW_BASE + 30_000);
+    expect(d.quotaHold!.heldMsRemaining).toBe(30_000);
+    expect(d.quotaHold!.expiresHonoured).toBe(1);
+    expect(d.quotaHold!.holdsArmed).toBe(1);
+    expect(d.quotaHold!.upstreamRefusals).toBe(1);
+    expect(d.quotaHold!.suppressed).toBe(0); // an upstream refusal is not a suppression
+    // ...and NOTHING is per-key dark. This is the defect, inverted: `AAPL` was the
+    // key in flight when the ACCOUNT ran out of minute, and it takes no blackout.
+    expect(d.refusalCooldown!.cooling).toBe(0);
+    expect(d.refusalCooldown!.keys).toEqual([]);
+    expect(d.refusalCooldown!.sinceBoot!.distinctKeys).toBe(0);
+    expect(d.refusalCooldown!.suppressed).toBe(0);
+
+    // One gate, not N: an innocent symbol is held too, with zero upstream calls.
+    // (That is the honest cost of a global condition — and it is why the hold has
+    // to be SHORT and vendor-dated rather than a 10-minute per-key cooldown.)
+    const spy = await svc.scanOtm('SPY');
+    expect(spy.reason).toBe('quota_held');
+    expect(spy.errorMessage).toMatch(/account quota hold until/);
+    expect(callsFor('SPY')).toBe(0);
+    d = svc.diagnostics();
+    expect(d.quotaHold!.suppressed).toBe(1);
+    expect(d.quotaHold!.suppressedByEndpoint).toEqual({ expirations: 1, chain: 0 });
+    // The suppression is booked to the quota gate, never to the per-key counter.
+    expect(d.refusalCooldown!.suppressed).toBe(0);
+    // A suppressed call is OURS, so it is not an upstream response.
+    expect(d.upstreamRefusals!.byStatus).toEqual({ '400': 1 });
+
+    // Still held one ms before `Expires`...
+    step(29_999);
+    expect((await svc.scanOtm('SPY')).reason).toBe('quota_held');
+    expect(svc.diagnostics().quotaHold!.suppressed).toBe(2);
+
+    // ...and open one ms after it. Released at the VENDOR's instant.
+    step(2);
+    expect((await svc.scanOtm('SPY')).reason).toBe('ok');
+    d = svc.diagnostics();
+    expect(d.quotaHold!.blockedUntilMs).toBeNull();
+    expect(d.quotaHold!.heldMsRemaining).toBeNull();
+    expect(d.quotaHold!.holdsReleased).toBe(1);
+
+    // And the proof `AAPL` was never marked dark: it is re-asked UPSTREAM the
+    // very next cycle. Under the old routing it would have been silent for 10
+    // minutes over a condition that had nothing to do with it.
+    expect(callsFor('AAPL')).toBe(1);
+    expect((await svc.scanOtm('AAPL')).reason).toBe('quota_held');
+    expect(callsFor('AAPL')).toBe(2);
+  });
+
+  // AC2 — the control. These two cases differ in ONE respect: the vendor's reason
+  // string. Everything else — status, endpoint, symbol, clock — is identical.
+  // Mutating the discriminator moves the refusal between the two mechanisms, so
+  // either assertion block goes red if the fork is removed.
+  it('a genuinely per-key 4xx still gets the per-key cooldown — the reason string is the whole discriminator', async () => {
+    const perKey = new CheckedFakeClient();
+    const a = makeQuotaService(perKey);
+    perKey.fetchExpirations.mockImplementation(async (s) =>
+      s === 'BADSYM'
+        ? { ok: false, httpStatus: 400, reason: 'Invalid parameter, BADSYM: symbol not found.' }
+        : okExp);
+    perKey.fetchChainSnapshot.mockResolvedValue(okChain);
+
+    expect((await a.svc.scanOtm('BADSYM')).reason).toBe('fetch_error');
+    let d = a.svc.diagnostics();
+    // PER-KEY: the key is cooled, the census names it, the gate never arms.
+    expect(d.refusalCooldown!.cooling).toBe(1);
+    expect(d.refusalCooldown!.keys).toEqual(['expirations|BADSYM']);
+    expect(d.refusalCooldown!.sinceBoot!.distinctKeys).toBe(1);
+    expect(d.quotaHold!.upstreamRefusals).toBe(0);
+    expect(d.quotaHold!.blockedUntilMs).toBeNull();
+    expect(d.quotaHold!.holdsArmed).toBe(0);
+    // ...and a per-key cooldown is exactly that: every other symbol is fine.
+    expect((await a.svc.scanOtm('SPY')).reason).toBe('ok');
+    // The per-key cooldown is still 10 minutes — this population is the one the
+    // TRA-4664 premise was RIGHT about, and TRA-5005 does not touch it.
+    a.step(REFUSAL_4XX_COOLDOWN_MS - 1_000);
+    expect((await a.svc.scanOtm('BADSYM')).reason).toBe('fetch_error');
+    expect(a.svc.diagnostics().refusalCooldown!.suppressed).toBe(1);
+
+    // Now mutate ONLY the reason string.
+    const quota = new CheckedFakeClient();
+    const b = makeQuotaService(quota);
+    quota.fetchExpirations.mockImplementation(async (s) =>
+      s === 'BADSYM'
+        ? { ok: false, httpStatus: 400, reason: `Quota Violation: Expires ${b.now() + 30_000}` }
+        : okExp);
+    quota.fetchChainSnapshot.mockResolvedValue(okChain);
+
+    expect((await b.svc.scanOtm('BADSYM')).reason).toBe('quota_held');
+    d = b.svc.diagnostics();
+    // ACCOUNT-SCOPED: nothing per-key, one global gate, and the innocent symbol
+    // is held too — the exact inversion of the block above.
+    expect(d.refusalCooldown!.cooling).toBe(0);
+    expect(d.refusalCooldown!.keys).toEqual([]);
+    expect(d.refusalCooldown!.sinceBoot!.distinctKeys).toBe(0);
+    expect(d.quotaHold!.upstreamRefusals).toBe(1);
+    expect(d.quotaHold!.holdsArmed).toBe(1);
+    expect((await b.svc.scanOtm('SPY')).reason).toBe('quota_held');
+  });
+
+  // Defect #2 — wrong duration. We held keys dark ~10x longer than the vendor
+  // asked, while holding the datum that said so.
+  it('releases at Expires, which is far sooner than the cooldown it replaced', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, now, step } = makeQuotaService(client);
+    client.fetchExpirations.mockImplementation(async (s) =>
+      s === 'AAPL'
+        ? { ok: false, httpStatus: 400, reason: `Quota Violation: Expires ${now() + 30_000}` }
+        : okExp);
+    client.fetchChainSnapshot.mockResolvedValue(okChain);
+
+    await svc.scanOtm('AAPL');
+    const hold = svc.diagnostics().quotaHold!.heldMsRemaining!;
+    expect(hold).toBe(30_000);
+    // The number that matters: the vendor's minute, not our ten.
+    expect(hold).toBeLessThan(REFUSAL_4XX_COOLDOWN_MS / 10);
+
+    // 60s later — a full minute, still four-fifths short of the old cooldown —
+    // the scanner is fully live again.
+    step(60_000);
+    expect((await svc.scanOtm('SPY')).reason).toBe('ok');
+    expect(svc.diagnostics().quotaHold!.longestHoldMs).toBe(30_000);
+  });
+
+  // An unreadable/implausible `Expires` must fail SHORT and say so. Over-holding
+  // is the defect being fixed, so the fallback is the vendor's own bucket width.
+  it('an unreadable, stale or absurd Expires falls back to the minute boundary and is counted separately', async () => {
+    // (a) no `Expires` at all.
+    const noExp = new CheckedFakeClient();
+    const a = makeQuotaService(noExp);
+    noExp.fetchExpirations.mockImplementation(async (s) =>
+      s === 'AAPL' ? { ok: false, httpStatus: 400, reason: 'Quota Violation' } : okExp);
+    noExp.fetchChainSnapshot.mockResolvedValue(okChain);
+    expect((await a.svc.scanOtm('AAPL')).reason).toBe('quota_held');
+    let q = a.svc.diagnostics().quotaHold!;
+    expect(q.expiresUnreadable).toBe(1);
+    expect(q.expiresHonoured).toBe(0);
+    // UNKNOWN stays `null`. A `0` here would be a fabricated 1970 epoch, and a
+    // reader cannot tell a fabricated datum from a measured one.
+    expect(q.lastExpiresAtMs).toBeNull();
+    // Next minute boundary: NOW_BASE is 15:00:00.000Z exactly, so +60s.
+    expect(q.blockedUntilMs).toBe(NOW_BASE + 60_000);
+    expect(q.heldMsRemaining!).toBeGreaterThan(0);
+    expect(q.heldMsRemaining!).toBeLessThanOrEqual(60_000);
+
+    // (b) `Expires` three days out — a clamp, disclosed, never a three-day blackout.
+    const far = new CheckedFakeClient();
+    const b = makeQuotaService(far);
+    far.fetchExpirations.mockImplementation(async (s) =>
+      s === 'AAPL'
+        ? { ok: false, httpStatus: 400, reason: `Quota Violation: Expires ${NOW_BASE + 3 * 86_400_000}` }
+        : okExp);
+    far.fetchChainSnapshot.mockResolvedValue(okChain);
+    await b.svc.scanOtm('AAPL');
+    q = b.svc.diagnostics().quotaHold!;
+    expect(q.expiresClamped).toBe(1);
+    expect(q.heldMsRemaining).toBe(MAX_QUOTA_HOLD_MS);
+    expect(q.maxHoldMs).toBe(MAX_QUOTA_HOLD_MS); // the clamp is published, not implied
+    // The vendor's datum is still reported verbatim beside the clamped hold, so a
+    // reader can see WHICH of the two the hold came from.
+    expect(q.lastExpiresAtMs).toBe(NOW_BASE + 3 * 86_400_000);
+
+    // (c) `Expires` already past (clock skew / a stale body). Must still hold —
+    // a zero-length hold is the hammer loop, 1,079,861 requests in 4.9h.
+    const past = new CheckedFakeClient();
+    const c = makeQuotaService(past);
+    past.fetchExpirations.mockImplementation(async (s) =>
+      s === 'AAPL'
+        ? { ok: false, httpStatus: 400, reason: `Quota Violation: Expires ${NOW_BASE - 5_000}` }
+        : okExp);
+    past.fetchChainSnapshot.mockResolvedValue(okChain);
+    await c.svc.scanOtm('AAPL');
+    q = c.svc.diagnostics().quotaHold!;
+    expect(q.expiresStale).toBe(1);
+    expect(q.heldMsRemaining!).toBeGreaterThan(0);
+    expect((await c.svc.scanOtm('SPY')).reason).toBe('quota_held');
+  });
+
+  // A SECOND quota refusal can only reach us from a call that was already in
+  // flight when the gate armed — once it is held, nothing new gets out. (That
+  // asymmetry is itself worth pinning: it is why `holdsExtended` is rare and why
+  // a serial fixture cannot produce one.) The scanner is async and the sleeves
+  // scan concurrently, so this is a real arrival, not a contrived one.
+  it('a concurrent refusal extends a held gate by a later Expires and never shortens it', async () => {
+    const defer = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((r) => { resolve = r; });
+      return { promise, resolve };
+    };
+    const tick = () => new Promise<void>((r) => { setTimeout(r, 0); });
+
+    /**
+     * Park both scans INSIDE their upstream call — i.e. both past the gate check,
+     * which was open for both — then land their refusals in a chosen order.
+     * Returns the gate after both have landed.
+     */
+    async function raceTwoRefusals(firstMs: number, secondMs: number) {
+      const client = new CheckedFakeClient();
+      const { svc } = makeQuotaService(client);
+      const a = defer();
+      const b = defer();
+      client.fetchExpirations.mockImplementation(async (s) => {
+        if (s === 'AAA') { await a.promise; return { ok: false, httpStatus: 400, reason: `Quota Violation: Expires ${NOW_BASE + firstMs}` }; }
+        if (s === 'BBB') { await b.promise; return { ok: false, httpStatus: 400, reason: `Quota Violation: Expires ${NOW_BASE + secondMs}` }; }
+        return okExp;
+      });
+      client.fetchChainSnapshot.mockResolvedValue(okChain);
+
+      const both = Promise.all([svc.scanOtm('AAA'), svc.scanOtm('BBB')]);
+      await tick(); // both now parked in the mock, both having seen an OPEN gate
+      a.resolve();
+      await tick();
+      b.resolve();
+      const results = await both;
+      expect(results.map((r) => r.reason)).toEqual(['quota_held', 'quota_held']);
+      return svc.diagnostics().quotaHold!;
+    }
+
+    // A FARTHER instant arrives second: the gate moves out, booked as an extension.
+    let q = await raceTwoRefusals(40_000, 70_000);
+    expect(q.blockedUntilMs).toBe(NOW_BASE + 70_000);
+    expect(q.upstreamRefusals).toBe(2);
+    expect(q.holdsArmed).toBe(1);    // an extension is not a second arm
+    expect(q.holdsExtended).toBe(1);
+    expect(q.longestHoldMs).toBe(70_000);
+
+    // A NEARER instant arrives second (a stale body overtaking a fresh one). The
+    // gate must NOT move in: releasing early re-opens the hammer loop this fixes.
+    q = await raceTwoRefusals(70_000, 20_000);
+    expect(q.blockedUntilMs).toBe(NOW_BASE + 70_000);
+    expect(q.upstreamRefusals).toBe(2);
+    expect(q.holdsArmed).toBe(1);
+    expect(q.holdsExtended).toBe(0);
+    expect(q.longestHoldMs).toBe(70_000);
+  });
+
+  // The explicit instruction on the filing: do NOT route this to the breaker.
+  it('does NOT open the breaker — a sub-minute quota reset must not black out the whole scanner', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, now, step } = makeQuotaService(client);
+    client.fetchExpirations.mockImplementation(async (s) =>
+      s === 'AAPL'
+        ? { ok: false, httpStatus: 400, reason: `Quota Violation: Expires ${now() + 30_000}` }
+        : okExp);
+    client.fetchChainSnapshot.mockResolvedValue(okChain);
+
+    await svc.scanOtm('AAPL');
+    expect(svc.diagnostics().breakerOpen).toBe(false);
+    // Had this tripped the breaker, recovery would be on the breaker's clock
+    // (90s / 5min) and `breaker_open` would be the reason — 100% darkness in
+    // place of 55.6% silent misses. It recovers on the vendor's clock instead.
+    step(30_001);
+    expect(svc.diagnostics().breakerOpen).toBe(false);
+    expect((await svc.scanOtm('SPY')).reason).toBe('ok');
+  });
+
+  it('a warm cache still serves while the gate is held — the gate stops NEW calls, it does not invalidate data', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, now } = makeQuotaService(client);
+    client.fetchExpirations.mockResolvedValue(okExp);
+    client.fetchChainSnapshot.mockImplementation(async (s) =>
+      s === 'AAPL'
+        ? { ok: false, httpStatus: 400, reason: `Quota Violation: Expires ${now() + 30_000}` }
+        : okChain);
+
+    // Warm SPY's chain first.
+    expect((await svc.scanOtm('SPY')).reason).toBe('ok');
+    const warmCalls = client.fetchChainSnapshot.mock.calls.length;
+
+    // Arm the gate on AAPL's chain fetch.
+    expect((await svc.scanOtm('AAPL')).reason).toBe('quota_held');
+    expect(svc.diagnostics().quotaHold!.suppressedByEndpoint.chain).toBe(0); // upstream, not suppressed
+
+    // SPY still answers `ok` off the warm chain, inside the hold, with no new call.
+    expect((await svc.scanOtm('SPY')).reason).toBe('ok');
+    expect(client.fetchChainSnapshot.mock.calls.length).toBe(warmCalls + 1); // +1 = AAPL's refusal only
+  });
+
+  it('every suppressed call is attributable: the endpoint split sums to the total (TRA-3800)', async () => {
+    const client = new CheckedFakeClient();
+    const { svc, now } = makeQuotaService(client);
+    client.fetchExpirations.mockResolvedValue(okExp);
+    client.fetchChainSnapshot.mockImplementation(async (s) =>
+      s === 'AAPL'
+        ? { ok: false, httpStatus: 400, reason: `Quota Violation: Expires ${now() + 30_000}` }
+        : okChain);
+
+    await svc.scanOtm('AAPL'); // upstream chain refusal arms the gate
+    await svc.scanOtm('SPY');  // SPY expirations are cold ⇒ suppressed at `expirations`
+    await svc.scanOtm('COLD'); // likewise
+    const q = svc.diagnostics().quotaHold!;
+    expect(q.suppressed).toBe(q.suppressedByEndpoint.expirations + q.suppressedByEndpoint.chain);
+    expect(q.suppressed).toBe(2);
+    expect(q.suppressedByEndpoint).toEqual({ expirations: 2, chain: 0 });
+    // The arming refusal is in `upstreamRefusals`, the suppressions are not —
+    // the two sides of the wire never share a counter.
+    expect(q.upstreamRefusals).toBe(1);
+    // And the fate of every refusal is accounted for exactly once.
+    expect(q.expiresHonoured + q.expiresUnreadable + q.expiresStale + q.expiresClamped)
+      .toBe(q.upstreamRefusals);
   });
 });
