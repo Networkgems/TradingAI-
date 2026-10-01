@@ -1467,3 +1467,149 @@ describe('a Quota Violation 400 is an ACCOUNT-level hold, not a per-key blackout
       .toBe(q.upstreamRefusals);
   });
 });
+
+// TRA-5006 — the expirations cache was pinned 256/256 on live `faae9388` with
+// 282,047 capacity evictions in 89.1h (52.7/min), driving 135.6 real upstream
+// attempts/min into a ~120/min vendor quota. Two things were wrong and only one
+// of them was the number: `capacityEvictions` can say the cap is too SMALL but
+// never what size would be big enough, and `size == max` reads IDENTICALLY on a
+// cache whose working set fits exactly and one that is thrashing. These tests
+// pin the demand instrument that answers the sizing question, and the raised cap
+// whose first live read has to confirm it.
+describe('cache demand is measured, not argued (TRA-5006)', () => {
+  const okExp = { ok: true as const, httpStatus: 200, value: [EXP] };
+  const okChain = { ok: true as const, httpStatus: 200, value: [row(100, 'call', 0.3)] };
+
+  it('liveDemandPeak is the smallest cap that would have produced zero live evictions', async () => {
+    const { svc, client } = makeService();
+    client.getExpirations.mockResolvedValue([EXP]);
+    client.getChainSnapshot.mockResolvedValue([row(100, 'call', 0.3)]);
+
+    // 300 distinct symbols inside one chain TTL. The chain cap is 256, so the
+    // chain cache MUST evict live — and its demand must report the 300 that
+    // would have held. This is the discriminator: `cacheSize` saturates at 256
+    // and tells you nothing about 300.
+    for (let i = 0; i < 300; i++) await svc.getSelectorChain(`SYM${i}`);
+
+    const diag = svc.diagnostics();
+    const chain = diag.chainCacheDemand!;
+    expect(chain.truncated).toBe(false);
+    expect(chain.liveDemandPeak).toBe(300);
+    expect(chain.maxEntries).toBe(diag.chainCacheMaxEntries);
+    expect(chain.capBinds).toBe(true);
+    // …and the cap genuinely bit, so both surfaces agree on the fact while only
+    // one of them carries the size that would fix it.
+    expect(diag.chainCache!.capacityEvictions).toBeGreaterThan(0);
+    expect(diag.cacheSize).toBe(diag.chainCacheMaxEntries);
+
+    // Same 300 keys through the expirations cache, whose raised cap holds them:
+    // demand is identical, `capBinds` is false, and NO entry was evicted live.
+    const exp = diag.expirationsCacheDemand!;
+    expect(exp.liveDemandPeak).toBe(300);
+    expect(exp.capBinds).toBe(false);
+    expect(diag.expirationsCache!.capacityEvictions).toBe(0);
+  });
+
+  it('the raised expirations cap holds a keyspace the shipped 256 could not', async () => {
+    const { svc, client } = makeService();
+    client.getExpirations.mockResolvedValue([EXP]);
+    client.getChainSnapshot.mockResolvedValue([row(100, 'call', 0.3)]);
+
+    // 449 = the live `refusalCooldown.sinceBoot` census of distinct refused
+    // `expirations|SYM` keys, which is a LOWER bound on the live keyspace. The
+    // shipped cap was 256; dropping back below this re-arms the thrash.
+    for (let i = 0; i < 449; i++) await svc.getSelectorChain(`SYM${i}`);
+
+    const diag = svc.diagnostics();
+    expect(diag.expirationsCacheMaxEntries).toBeGreaterThanOrEqual(449);
+    expect(diag.expirationsCacheSize).toBe(449);
+    expect(diag.expirationsCache!.capacityEvictions).toBe(0);
+    expect(diag.expirationsCacheDemand!.capBinds).toBe(false);
+  });
+
+  it('demand is swept at the cache TTL, so it reports CONCURRENT keys and not a boot total', async () => {
+    const { svc, client, advance } = makeService();
+    client.getExpirations.mockResolvedValue([EXP]);
+    client.getChainSnapshot.mockResolvedValue([row(100, 'call', 0.3)]);
+
+    await svc.getSelectorChain('AAA');
+    await svc.getSelectorChain('BBB');
+    expect(svc.diagnostics().chainCacheDemand!.liveDemand).toBe(2);
+
+    // Past the 60s chain TTL, AAA/BBB are no longer concurrent with CCC: a cache
+    // sized for this workload needs 1 slot, not 3. The since-boot distinct count
+    // still says 3 — the two numbers answer different questions and the sizing
+    // one is `liveDemandPeak`.
+    advance(61_000);
+    await svc.getSelectorChain('CCC');
+    const chain = svc.diagnostics().chainCacheDemand!;
+    expect(chain.liveDemand).toBe(1);
+    expect(chain.liveDemandPeak).toBe(2);
+    expect(chain.distinctKeys).toBe(3);
+
+    // The expirations TTL is 6h, so nothing expired there: all three are still
+    // concurrent on that cache. Same reads, different windows, different answers.
+    expect(svc.diagnostics().expirationsCacheDemand!.liveDemand).toBe(3);
+  });
+
+  it('a key suppressed before the wire still counts as demand', async () => {
+    const client = new CheckedFakeClient();
+    const { svc } = makeService({ client });
+    client.fetchChainSnapshot.mockResolvedValue(okChain);
+    client.fetchExpirations.mockImplementation(async (s) =>
+      s === 'AAPL'
+        ? { ok: false, httpStatus: 400, reason: `Quota Violation: Expires ${NOW_BASE + 30_000}` }
+        : okExp);
+
+    await svc.scanOtm('AAPL'); // upstream quota refusal arms the account-level hold
+    await svc.scanOtm('SPY');  // suppressed at `expirations`, no upstream call
+    await svc.scanOtm('COLD'); // likewise
+
+    const diag = svc.diagnostics();
+    expect(diag.quotaHold!.suppressedByEndpoint.expirations).toBe(2);
+    // All three symbols are part of the keyspace the cache has to cover. Scoping
+    // demand to calls that reached the vendor would shrink the measurement by
+    // exactly the population a quota storm creates — understating the cap in the
+    // one regime where an undersized cap is what caused the storm.
+    const exp = diag.expirationsCacheDemand!;
+    expect(exp.liveDemand).toBe(3);
+    expect(exp.distinctKeys).toBe(3);
+  });
+
+  it('reading the census does not change what the next read sees', async () => {
+    const { svc, client, advance } = makeService();
+    client.getExpirations.mockResolvedValue([EXP]);
+    client.getChainSnapshot.mockResolvedValue([row(100, 'call', 0.3)]);
+
+    await svc.getSelectorChain('AAA');
+    advance(61_000);
+    // AAA is past the chain TTL. A census that SWEPT would drop it here and the
+    // second read would differ — the TRA-4664 third-pass rule: a read that moves
+    // the thing it measures is not an instrument.
+    const first = svc.diagnostics().chainCacheDemand!;
+    const second = svc.diagnostics().chainCacheDemand!;
+    expect(first).toEqual(second);
+    expect(first.liveDemand).toBe(0);
+    expect(first.distinctKeys).toBe(1);
+  });
+
+  it('truncated is the discriminator: a clamped census never reads as a measurement', async () => {
+    const { svc, client } = makeService();
+    client.getExpirations.mockResolvedValue([EXP]);
+    client.getChainSnapshot.mockResolvedValue([row(100, 'call', 0.3)]);
+
+    // Push the expirations demand shadow past its OWN 8192 cap. Beyond it every
+    // number on the row is a lower bound, so the flag is what a reader has to
+    // check first — a clamp that does not say so is the bug this field retires.
+    for (let i = 0; i < 8_300; i++) await svc.getSelectorChain(`SYM${i}`);
+
+    const exp = svc.diagnostics().expirationsCacheDemand!;
+    expect(exp.truncated).toBe(true);
+    expect(exp.liveDemandPeak).toBe(8_192);
+    expect(exp.distinctKeys).toBe(8_192);
+    // The real demand was 8,300 > 2,048, so the cap DOES bind — and that is only
+    // visible because the shadow is capped WELL ABOVE the cache. A shadow clamped
+    // to the cache's own size could never report the one fact it exists for.
+    expect(exp.capBinds).toBe(true);
+  }, 20_000);
+});

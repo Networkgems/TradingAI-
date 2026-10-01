@@ -25,8 +25,27 @@ const log = logger.child({ module: 'relative-value-scanner' });
  * compared against buys no accuracy (the chain is already up to this old) and
  * costs an upstream quote call per symbol per sweep. See the note at the
  * `fetchSpot` wiring for the quota failure that made this explicit.
+ *
+ * TRA-5006 — this constant, NOT `MAX_CHAIN_CACHE_ENTRIES`, is what sets the
+ * floor on chain upstream calls. A sweep of S symbols × E in-window expirations
+ * repeated every cycle cannot cost less than `S × E` calls per TTL no matter how
+ * large the cache is: at the TRA-4830 universe of 100 symbols × 2–3 expirations
+ * that is 200–300 calls/min against a ~120/min vendor quota, from the chain path
+ * alone. Doubling the TTL halves that floor — but it also doubles the staleness
+ * of every strike/delta decision AND of the spot this is the coherent bound for,
+ * which is a trading-semantics change and not a cache-sizing one. It is
+ * deliberately NOT made here; see the follow-up named in the TRA-5006 thread.
  */
 export const CHAIN_CACHE_TTL_MS = 60_000;
+/**
+ * TRA-5006 — left at 6h. Once the size cap stops binding (it was the whole
+ * defect), this TTL costs at most `keyspace × 4` upstream calls per day — about
+ * 1.2/min at a 450-symbol keyspace, against the 180.8/min the thrashing cache
+ * was spending. Listed expiration sets change daily at most, so a longer TTL is
+ * cheap in correctness, but it is also worth almost nothing once the cap is
+ * fixed, and a 24h TTL would delay a newly-listed weekly by up to a day. The
+ * lever that mattered here was the cap.
+ */
 const EXPIRATIONS_CACHE_TTL_MS = 6 * 60 * 60_000;
 
 // TRA-943 (TRA-908 Phase A) — bound the retained working set of these caches.
@@ -52,8 +71,46 @@ const EXPIRATIONS_CACHE_TTL_MS = 6 * 60 * 60_000;
 // 256 holds the whole capped universe for its 6h TTL. Chain entries die at
 // their 60s TTL regardless, so the heap cost of the larger cap is bounded by
 // churn, not by the cap.
+// TRA-5006 — 256 was still undersized for the EXPIRATIONS cache, and this time
+// the cache was pinned exactly full rather than merely busy. Live `faae9388`,
+// 89.1h uptime, read 2026-10-01: `expirationsCacheSize 256 / max 256` with
+// **282,047 capacityEvictions (52.7/min)** — every one an entry thrown away by
+// the cap while still inside its SIX HOUR TTL, i.e. a refetch we paid for and
+// then bought again. Against a `refusalCooldown.sinceBoot` census of 449
+// DISTINCT refused `expirations|SYM` keys (`evicted: 0`, so a true census of
+// the refused population and therefore a hard LOWER bound on the live one),
+// a 256-slot cache cannot hold the keyspace at all: it is a permanent thrash,
+// not a warm cache under pressure.
+//
+// The cap is raised to 2048 rather than to the measured lower bound, for two
+// reasons. (1) 449 is a count of REFUSED symbols; the true keyspace is ≥449 and
+// sizing to a lower bound re-arms the same bug one universe-expansion later.
+// (2) An expirations entry is a `string[]` of ~20–40 `YYYY-MM-DD` strings keyed
+// by one symbol — single-digit KB — so 2048 of them is a few MB, which buys
+// 4.5x headroom over the lower bound for a cost the chain cache could not
+// absorb. The honest sizing input is now MEASURED rather than argued: see
+// {@link CacheDemand} and `expirationsCacheDemand.liveDemandPeak` /
+// `capBinds` on the diagnostics route.
+//
+// ⛔ `chainCache` is deliberately LEFT at 256 in this pass. It read 213/256 —
+// not full — and its entries are whole `OptionChainRow[]` snapshots (hundreds
+// of rows each), so raising its cap is a heap decision (TRA-937, TRA-4158) that
+// must follow its own `liveDemandPeak`, which this build is the first to
+// measure. Its 73,524 capacity evictions (13.7/min) are a quarter of the
+// expirations rate and its 60s TTL — not its cap — is what sets its floor on
+// upstream calls; see the TTL note on `CHAIN_CACHE_TTL_MS`.
 const MAX_CHAIN_CACHE_ENTRIES = 256;
-const MAX_EXPIRATIONS_CACHE_ENTRIES = 256;
+const MAX_EXPIRATIONS_CACHE_ENTRIES = 2048;
+/**
+ * TRA-5006 — how many keys the per-cache DEMAND shadow (see {@link CacheDemand})
+ * will track before it starts evicting and declaring itself truncated. It holds
+ * `key -> lastReadAtMs` only — no payload — so an entry is a short string and a
+ * number, and this cap exists to bound a pathological keyspace rather than to
+ * bound normal operation. It is set well above both cache caps on purpose: a
+ * demand census clamped to the cache's own size could never report the one fact
+ * it exists to report, which is that demand EXCEEDS the cap.
+ */
+const MAX_CACHE_DEMAND_ENTRIES = 8192;
 // TRA-417 — replaced the flat 1h cooldown with discriminated cooldowns.
 // Tradier's rate limit is a ~60s sliding window (60/min sandbox, 120/min
 // prod); a 1h breaker over-suppressed scanning by ~60x on any transient
@@ -266,6 +323,20 @@ interface CacheEntry<T> {
   at: number;
 }
 
+/**
+ * TRA-5006 — the bookkeeping behind one {@link CacheDemand}. `seen` is the
+ * since-boot distinct-key set; it stops ADDING at
+ * {@link MAX_CACHE_DEMAND_ENTRIES} and raises `truncated` rather than evicting,
+ * so `seen.size` is always a true lower bound and never a rolling window
+ * dressed up as a census. `truncated` is shared with the live-demand map's own
+ * cap: either clamp makes the whole row a lower bound, so one flag is correct.
+ */
+interface DemandState {
+  peak: number;
+  seen: Set<string>;
+  truncated: boolean;
+}
+
 export interface RelativeValueScanResult {
   symbol: string;
   spot: number | null;
@@ -403,6 +474,12 @@ export interface RelativeValueScannerDiagnostics {
    */
   chainCache?: CacheCounters;
   expirationsCache?: CacheCounters;
+  /**
+   * TRA-5006 — the sizing input. See {@link CacheDemand}. Absent on a build that
+   * predates this field; absent is NOT "demand is zero".
+   */
+  chainCacheDemand?: CacheDemand;
+  expirationsCacheDemand?: CacheDemand;
   /**
    * TRA-4664 — Tradier HTTP refusals (429/5xx/401) seen by this scanner, keyed
    * by HTTP status. Before TRA-4664 the client collapsed these into `[]`, which
@@ -576,6 +653,53 @@ export interface CacheCounters {
   misses: number;
   /** Entries evicted by the size cap while still inside their TTL. */
   capacityEvictions: number;
+}
+
+/**
+ * TRA-5006 — how big this cache WOULD be with no cap, measured rather than
+ * argued.
+ *
+ * `capacityEvictions` (TRA-4664) answers "is the cap biting", which is the right
+ * alarm and the wrong sizing input: it tells you the number is too small and
+ * says nothing about what number would be big enough. `expirationsCacheSize ==
+ * max` is worse — a cache that is full because its working set fits exactly and
+ * a cache that is full because it is thrashing read IDENTICALLY, which is how
+ * 256/256 sat on the health route for a week reading like a warm cache.
+ *
+ * So this is a payload-free shadow of the cache with a much larger cap:
+ * `key -> lastReadAtMs` for every key READ (hit, miss, or refused before the
+ * wire — a key that was demanded is part of the keyspace whether or not the
+ * vendor answered), swept at the cache's own TTL. `liveDemand` is therefore
+ * exactly the size the real cache would have had at this instant with no cap,
+ * and `liveDemandPeak` is the smallest cap that would have produced ZERO
+ * capacity evictions this boot. That is the number to size to.
+ *
+ * ⚠ `truncated` is the discriminator that keeps this honest. The shadow has its
+ * own cap ({@link MAX_CACHE_DEMAND_ENTRIES}); when it bites, `liveDemand`,
+ * `liveDemandPeak` and `distinctKeys` all become LOWER BOUNDS and `capBinds`
+ * may read `false` for a cache that in truth binds. A clamped census that does
+ * not say so is the bug this whole field exists to retire — never read a
+ * `truncated: true` row as a measurement.
+ */
+export interface CacheDemand {
+  /** Distinct keys read within the last TTL — the uncapped size, right now. */
+  liveDemand: number;
+  /**
+   * High-water mark of `liveDemand` this boot. The smallest `maxEntries` that
+   * would have held the working set without one live eviction.
+   */
+  liveDemandPeak: number;
+  /** Distinct keys read at any point this boot (`>= liveDemandPeak`). */
+  distinctKeys: number;
+  /** The cap this demand is measured against, echoed so one read is self-contained. */
+  maxEntries: number;
+  /**
+   * `liveDemandPeak > maxEntries`. The acceptance signal: `false` with
+   * `truncated: false` is the only reading that proves the cap is adequate.
+   */
+  capBinds: boolean;
+  /** The shadow's own cap bit. When `true`, every number above is a lower bound. */
+  truncated: boolean;
 }
 
 /**
@@ -907,6 +1031,13 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
   // TRA-4664 — see `RelativeValueScannerDiagnostics.chainCache`/`upstreamRefusals`.
   private readonly chainCounters: CacheCounters = { hits: 0, misses: 0, capacityEvictions: 0 };
   private readonly expirationsCounters: CacheCounters = { hits: 0, misses: 0, capacityEvictions: 0 };
+  // TRA-5006 — the payload-free demand shadows. See `CacheDemand`. Insertion
+  // order is ascending `lastReadAtMs` because `noteKeyDemand` deletes before it
+  // sets, which is what lets the TTL sweep stop at the first live entry.
+  private readonly chainDemand = new Map<string, number>();
+  private readonly expirationsDemand = new Map<string, number>();
+  private readonly chainDemandState: DemandState = { peak: 0, seen: new Set(), truncated: false };
+  private readonly expirationsDemandState: DemandState = { peak: 0, seen: new Set(), truncated: false };
   private readonly refusalsByStatus: Record<string, number> = {};
   private lastRefusalAtMs: number | null = null;
   private lastRefusalStatus: number | null = null;
@@ -1018,6 +1149,18 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       expirationsCacheMaxEntries: MAX_EXPIRATIONS_CACHE_ENTRIES,
       chainCache: { ...this.chainCounters },
       expirationsCache: { ...this.expirationsCounters },
+      chainCacheDemand: this.cacheDemandCensus(
+        this.chainDemand,
+        this.chainDemandState,
+        CHAIN_CACHE_TTL_MS,
+        MAX_CHAIN_CACHE_ENTRIES,
+      ),
+      expirationsCacheDemand: this.cacheDemandCensus(
+        this.expirationsDemand,
+        this.expirationsDemandState,
+        EXPIRATIONS_CACHE_TTL_MS,
+        MAX_EXPIRATIONS_CACHE_ENTRIES,
+      ),
       upstreamRefusals: {
         byStatus: { ...this.refusalsByStatus },
         lastAtMs: this.lastRefusalAtMs,
@@ -1811,6 +1954,73 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     }
   }
 
+  /**
+   * TRA-5006 — record that `key` was DEMANDED of a cache, for the payload-free
+   * demand shadow behind {@link CacheDemand}.
+   *
+   * Called on every read of the key, before any gate — a key suppressed by the
+   * quota hold or a per-key cooldown is still part of the keyspace the cache has
+   * to cover, and excluding it would shrink the measured demand by exactly the
+   * population a quota storm creates, i.e. understate the cap in the one regime
+   * where the cap matters.
+   *
+   * `delete` before `set` keeps the Map in ascending-`lastReadAt` order, so the
+   * TTL sweep can stop at the first live entry instead of walking the whole map
+   * (`putBounded` does walk it, which is affordable at a 2048 cap and would not
+   * be here). The cap evicts oldest and DISCLOSES, never silently.
+   */
+  private noteKeyDemand(
+    demand: Map<string, number>,
+    state: DemandState,
+    key: string,
+    ttlMs: number,
+  ): void {
+    const now = this.now();
+    demand.delete(key);
+    for (const [k, at] of demand) {
+      if (now - at < ttlMs) break;
+      demand.delete(k);
+    }
+    demand.set(key, now);
+    while (demand.size > MAX_CACHE_DEMAND_ENTRIES) {
+      const oldest = demand.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      demand.delete(oldest);
+      state.truncated = true;
+    }
+    if (demand.size > state.peak) state.peak = demand.size;
+    if (state.seen.size < MAX_CACHE_DEMAND_ENTRIES) state.seen.add(key);
+    else if (!state.seen.has(key)) state.truncated = true;
+  }
+
+  /**
+   * TRA-5006 — read one demand shadow. Read-only by the TRA-4664 third-pass
+   * rule: it does NOT sweep the expired entries it filters out, so a health poll
+   * cannot change what the next poll sees. `liveDemand` is therefore computed by
+   * filtering on the clock, not by trusting `demand.size`.
+   */
+  private cacheDemandCensus(
+    demand: Map<string, number>,
+    state: DemandState,
+    ttlMs: number,
+    maxEntries: number,
+  ): CacheDemand {
+    const now = this.now();
+    let liveDemand = 0;
+    for (const at of demand.values()) {
+      if (now - at < ttlMs) liveDemand += 1;
+    }
+    const liveDemandPeak = Math.max(state.peak, liveDemand);
+    return {
+      liveDemand,
+      liveDemandPeak,
+      distinctKeys: state.seen.size,
+      maxEntries,
+      capBinds: liveDemandPeak > maxEntries,
+      truncated: state.truncated,
+    };
+  }
+
   /** TRA-4664 — record a Tradier HTTP refusal and raise it on the throw path. */
   private refuse(
     endpoint: 'expirations' | 'chain',
@@ -1898,6 +2108,14 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     symbol: string,
     dtePrefs: DtePrefs = {},
   ): Promise<{ inWindow: Array<{ d: string; ms: number }>; targetMs: number } | null> {
+    // TRA-5006 — demand is noted for every read, hit or miss, and before the
+    // gates below. See `noteKeyDemand`.
+    this.noteKeyDemand(
+      this.expirationsDemand,
+      this.expirationsDemandState,
+      symbol,
+      EXPIRATIONS_CACHE_TTL_MS,
+    );
     const cached = this.expirationsCache.get(symbol);
     let expirations: string[];
     if (cached && this.now() - cached.at < EXPIRATIONS_CACHE_TTL_MS) {
@@ -1971,6 +2189,8 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
 
   private async fetchChain(symbol: string, expiration: string): Promise<OptionChainRow[]> {
     const key: ChainKey = `${symbol}|${expiration}`;
+    // TRA-5006 — see `resolveWindowedExpirations`; same contract, chain TTL.
+    this.noteKeyDemand(this.chainDemand, this.chainDemandState, key, CHAIN_CACHE_TTL_MS);
     const cached = this.chainCache.get(key);
     if (cached && this.now() - cached.at < CHAIN_CACHE_TTL_MS) {
       this.chainCounters.hits += 1;
