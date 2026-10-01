@@ -10889,6 +10889,12 @@ describe('TRA-4649 — trade opportunity cards ride the signal feed sink', () =>
       incomplete: 0,
       unbuildable: 0,
       refusedOnly: 0,
+      // TRA-4990 — the two cells that separate "the product produced an
+      // actionable card" from "the sleeve admitted an entry". This card is
+      // admitted, so `completeExceptAdmission` matches `complete`; the gap
+      // between them on a refused population IS the admission rate.
+      completeExceptAdmission: 1,
+      refusedByCardRule: 0,
       missingByField: {},
       refusedByField: {},
     });

@@ -9257,6 +9257,96 @@ export class PaperOptionsAccount {
     return this.sizingBudget(this.otmRiskParams.budgetRatio, equityOverride);
   }
 
+  /**
+   * TRA-4990 Pin 2 — THE OTM ENTRY CONTRACT COUNT, as ONE expression.
+   *
+   * Extracted verbatim out of {@link openOptionFromCandidate} so that the Trade
+   * Opportunity Card's `sizing` field can report the model the engine actually
+   * runs instead of its own stop-distance risk budget. The card used to publish
+   * `floor(managedEquity × riskPerTrade / (stopDistance × 100))`, a model NO OTM
+   * entry path runs — stop distance is not an input here at all — and refused
+   * 47 of the 50 cards retained on 2026-10-01 while the engine was opening 1-
+   * and 2-contract rows. A card that refuses a row the engine placed cannot be
+   * used to grade the sleeve.
+   *
+   * ⚠️ Pure and allocation-free: it must stay a read, because the card builder
+   * calls it on every published signal including refused ones. It moves no
+   * bound — `maxContractsPerEntry`, the per-position cap and the bounded-live
+   * override are all consumed exactly as the open path consumed them.
+   */
+  private otmSizedContracts(
+    premiumPaid: number,
+    opts: {
+      equityOverride?: number;
+      boundedLiveContracts?: number;
+      sizeMultiplier?: number;
+      maxContracts?: number;
+    },
+  ): number {
+    const { equityOverride, boundedLiveContracts, maxContracts } = opts;
+    const sizeMultiplier = opts.sizeMultiplier ?? 1;
+    const budget = this.otmBudgetPerTrade(equityOverride);
+    const costPerContract = premiumPaid * 100;
+    // TRA-378 — `sizeContracts` applies the forced 1-contract floor (live).
+    // TRA-1929 — the bounded live test forces an exact contract count and skips the
+    // % sizing entirely (the notional cap is enforced upstream against real cash).
+    // TRA-1001 — trim the sized count by the tighten-only size multiplier
+    // (risk-autopilot throttle). `>= 1` short-circuits to the untouched count so
+    // the unarmed/no-throttle case is byte-for-byte the prior behaviour.
+    const sizedContracts = boundedLiveContracts !== undefined
+      ? boundedLiveContracts
+      : this.sizeContracts(budget, costPerContract, equityOverride);
+    const throttled = boundedLiveContracts === undefined && sizeMultiplier < 1
+      ? Math.floor(sizedContracts * sizeMultiplier)
+      : sizedContracts;
+    // TRA-3944 rule 4 — cap the count. A cap is the ONE place this ticket
+    // clamps: it bounds quantity, never substitutes a different contract.
+    return maxContracts !== undefined
+      ? capOtmEntryContracts(throttled, { maxContractsPerEntry: maxContracts })
+      : throttled;
+  }
+
+  /**
+   * TRA-4990 Pin 2 — what {@link openOptionFromCandidate} WOULD size for this
+   * premium, plus the basis string naming the model. Read-only; opens nothing,
+   * spends nothing, mutates nothing.
+   *
+   * `contracts: 0` means the ENFORCED sizer refuses the row — a real refusal the
+   * card may publish. The gates `openOptionFromCandidate` applies BEFORE sizing
+   * (trading window, daily cap, OCC dedup, DTE guard, the $5k live equity floor)
+   * are deliberately NOT replayed: they are admission decisions, already carried
+   * by the card's `not_suppressed` criterion, and folding them in here would put
+   * admission back inside the sizing field — the exact conflation TRA-4990 Pin 1
+   * is about.
+   */
+  previewOtmContracts(
+    mark: number,
+    mode: AccountMode = 'demo',
+    opts: {
+      equityOverride?: number;
+      boundedLiveContracts?: number;
+      sizeMultiplier?: number;
+      maxContracts?: number;
+    } = {},
+  ): { unit: 'contracts'; quantity: number; basis: string } | null {
+    if (!Number.isFinite(mark) || mark <= 0) return null;
+    // Same demo slippage bias the open path applies, so the preview and the
+    // booked row read the same premium.
+    const premiumPaid = mode === 'demo' ? mark * (1 + this.demoSlippagePct) : mark;
+    const quantity = this.otmSizedContracts(premiumPaid, opts);
+    const basis = opts.boundedLiveContracts !== undefined
+      ? `bounded-live OTM test: exactly ${opts.boundedLiveContracts} contract(s) from `
+        + 'resolveLiveOptionTestContracts(ask, min(available cash, test cap), maxContracts), '
+        + `clamped to the contract floor's ${opts.maxContracts ?? '∞'}/entry`
+      : `floor(otmBudgetPerTrade / (premium × 100)) on a $${(premiumPaid * 100).toFixed(2)} `
+        + `contract, per-position cap applied, clamped to the contract floor's `
+        + `${opts.maxContracts ?? '∞'}/entry`
+        + (opts.sizeMultiplier !== undefined && opts.sizeMultiplier < 1
+          ? `, × risk-autopilot throttle ${opts.sizeMultiplier}`
+          : '');
+    return { unit: 'contracts', quantity: Math.max(0, quantity), basis };
+  }
+
   private rvBudgetPerTrade(equityOverride?: number): number {
     return this.sizingBudget(this.rvRiskParams.budgetRatio, equityOverride);
   }
@@ -9457,27 +9547,15 @@ export class PaperOptionsAccount {
     if (!Number.isFinite(rawMark) || rawMark <= 0) return null;
     const premiumPaid = mode === 'demo' ? rawMark * (1 + this.demoSlippagePct) : rawMark;
 
-    const budget = this.otmBudgetPerTrade(equityOverride);
-    const costPerContract = premiumPaid * 100;
-    // TRA-378 — `sizeContracts` applies the forced 1-contract floor (live).
-    // TRA-1929 — the bounded live test forces an exact contract count and skips the
-    // % sizing entirely (the notional cap is enforced upstream against real cash).
-    // TRA-1001 — trim the sized count by the tighten-only size multiplier
-    // (risk-autopilot throttle). `>= 1` short-circuits to the untouched count so
-    // the unarmed/no-throttle case is byte-for-byte the prior behaviour.
-    const sizedContracts = boundedLiveContracts !== undefined
-      ? boundedLiveContracts
-      : this.sizeContracts(budget, costPerContract, equityOverride);
-    const throttled = boundedLiveContracts === undefined && sizeMultiplier < 1
-      ? Math.floor(sizedContracts * sizeMultiplier)
-      : sizedContracts;
-    // TRA-3944 rule 4 — cap the count. A cap is the ONE place this ticket
-    // clamps: it bounds quantity, never substitutes a different contract.
-    const contracts = maxContracts !== undefined
-      ? capOtmEntryContracts(throttled, { maxContractsPerEntry: maxContracts })
-      : throttled;
+    // TRA-4990 — the count comes from `otmSizedContracts`, which is the SAME
+    // expression the card's `previewOtmContracts` reports. One implementation,
+    // so the instrument and the enforced bound cannot fork.
+    const contracts = this.otmSizedContracts(premiumPaid, {
+      equityOverride, boundedLiveContracts, sizeMultiplier, maxContracts,
+    });
     if (contracts <= 0) return null;
 
+    const costPerContract = premiumPaid * 100;
     const totalCost = contracts * costPerContract;
     const demoFee = mode === 'demo' ? contracts * this.demoFeePerContract : 0;
     // TRA-1929 — skip the paper-cash check for the bounded live test (paper cash is

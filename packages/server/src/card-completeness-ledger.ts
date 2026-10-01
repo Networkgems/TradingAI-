@@ -136,6 +136,26 @@ export function classifyCardAdmissionWindow(
 export interface CardCompletenessWindowCell {
   built: number;
   complete: number;
+  /**
+   * TRA-4990 Pin 1 — cards with EVERY field populated whose only refusal is the
+   * sleeve's own admission decision. **This is the TRA-4645 priority-1 cell**;
+   * `complete` beside it is the sleeve's ADMISSION RATE, because
+   * `not_suppressed` is unconditionally `pass: false` and any skip reason
+   * therefore refuses `entryTrigger`.
+   *
+   * Superset of `complete`. The three-way partition
+   * `unbuildable + completeExceptAdmission + refusedByCardRule === built`
+   * is what separates the three findings that used to share one zero:
+   * - `unbuildable > 0` — missing inputs / coverage hole (fix the builder).
+   * - `refusedByCardRule > 0` — a CARD rule declined a row the engine may well
+   *   have placed (TRA-4990 Pin 2 lived entirely here: 47 of 50 on 2026-10-01).
+   * - `completeExceptAdmission > 0` with `complete: 0` — the product DOES
+   *   produce actionable cards and the sleeve admitted none of them. A
+   *   statement about the market and the gates, not about the card surface.
+   */
+  completeExceptAdmission: number;
+  /** TRA-4990 — fully built, refused by a card rule rather than by admission. */
+  refusedByCardRule: number;
   /** Cards with ≥1 field the builder could not populate (the defect cell). */
   unbuildable: number;
   /** Per-field count of cards that built the field and whose rule declined entry. */
@@ -190,6 +210,14 @@ export interface CardCompletenessRow {
   builtWindowNotApplicable: number;
   completeInWindow: number;
   completeOutOfWindow: number;
+  /**
+   * TRA-4990 — `= byWindow.in_window.completeExceptAdmission`, hoisted beside
+   * `completeInWindow` because it is the TRA-4645 priority-1 headline and
+   * `completeInWindow` is the admission rate wearing its costume. Read the pair:
+   * `completeExceptAdmissionInWindow > 0, completeInWindow === 0` is a healthy
+   * product whose sleeve admitted nothing — not a broken card builder.
+   */
+  completeExceptAdmissionInWindow: number;
   byWindow: Record<CardAdmissionWindowBucket, CardCompletenessWindowCell>;
   /**
    * Independent cross-check of the bucket above against a FRESH
@@ -232,6 +260,16 @@ export interface CardCompletenessSinceBootRow {
   etDaysWithComplete: number;
   /** Most recent ET day with a `complete` card, or null if there has never been one. */
   lastCompleteEtDay: string | null;
+  /**
+   * TRA-4990 — ET days this family produced at least one card whose ONLY
+   * obstacle was admission. This is the row that answers "can this product ever
+   * produce an actionable card" (TRA-4645 priority 1); `etDaysWithComplete`
+   * answers "did the sleeve ever admit an entry", which is a different question
+   * and is the one the ring was being read for.
+   */
+  etDaysWithCompleteExceptAdmission: number;
+  /** Most recent ET day with a `completeExceptAdmission` card, else null. */
+  lastCompleteExceptAdmissionEtDay: string | null;
   /** ET days this family built at least one IN-WINDOW card on. */
   etDaysWithInWindow: number;
   /** Oldest / newest `generatedAt` this family ever folded, any bucket. */
@@ -372,6 +410,8 @@ function emptyCell(): CardCompletenessWindowCell {
   return {
     built: 0,
     complete: 0,
+    completeExceptAdmission: 0,
+    refusedByCardRule: 0,
     unbuildable: 0,
     refusedByField: {},
     missingByField: {},
@@ -384,6 +424,8 @@ function cloneCell(cell: CardCompletenessWindowCell): CardCompletenessWindowCell
   return {
     built: cell.built,
     complete: cell.complete,
+    completeExceptAdmission: cell.completeExceptAdmission,
+    refusedByCardRule: cell.refusedByCardRule,
     unbuildable: cell.unbuildable,
     refusedByField: { ...cell.refusedByField },
     missingByField: { ...cell.missingByField },
@@ -452,7 +494,13 @@ export class CardCompletenessLedger {
    */
   private readonly sinceBootDays = new Map<
     string,
-    { seen: Set<string>; complete: Set<string>; inWindow: Set<string> }
+    {
+      seen: Set<string>;
+      complete: Set<string>;
+      /** TRA-4990 — ET days with ≥1 admission-only-refused (or complete) card. */
+      completeExceptAdmission: Set<string>;
+      inWindow: Set<string>;
+    }
   >();
   private readonly countsSince: number;
   private readonly etDayKeysSeen = new Set<string>();
@@ -512,6 +560,7 @@ export class CardCompletenessLedger {
         builtWindowNotApplicable: 0,
         completeInWindow: 0,
         completeOutOfWindow: 0,
+        completeExceptAdmissionInWindow: 0,
         byWindow: {
           in_window: emptyCell(),
           out_of_window: emptyCell(),
@@ -542,6 +591,17 @@ export class CardCompletenessLedger {
       if (bucket === 'out_of_window') row.completeOutOfWindow += 1;
     }
     if (card.incompleteFields.length > 0) cell.unbuildable += 1;
+    // TRA-4990 Pin 1 — the exhaustive three-way partition of `cell.built`.
+    // Derived from the card's own fields (one definition, shared with
+    // `summarizeCards`) and written as if/else so the three cells cannot
+    // double-count: a subtraction here would make the sum identity in the tests
+    // true by construction and therefore unable to fail.
+    else if (card.completeExceptAdmission) cell.completeExceptAdmission += 1;
+    else cell.refusedByCardRule += 1;
+    if (card.completeExceptAdmission && card.incompleteFields.length === 0
+        && bucket === 'in_window') {
+      row.completeExceptAdmissionInWindow += 1;
+    }
     for (const f of card.incompleteFields) bump(cell.missingByField, f);
     for (const f of card.refusedFields) bump(cell.refusedByField, f);
     if (bucket === 'in_window') row.builtInWindow += 1;
@@ -593,6 +653,8 @@ export class CardCompletenessLedger {
         etDaysSeen: 0,
         etDaysWithComplete: 0,
         lastCompleteEtDay: null,
+        etDaysWithCompleteExceptAdmission: 0,
+        lastCompleteExceptAdmissionEtDay: null,
         etDaysWithInWindow: 0,
         firstBuiltAt: card.generatedAt,
         lastBuiltAt: card.generatedAt,
@@ -603,7 +665,12 @@ export class CardCompletenessLedger {
     }
     let seen = this.sinceBootDays.get(card.signalType);
     if (!seen) {
-      seen = { seen: new Set<string>(), complete: new Set<string>(), inWindow: new Set<string>() };
+      seen = {
+        seen: new Set<string>(),
+        complete: new Set<string>(),
+        completeExceptAdmission: new Set<string>(),
+        inWindow: new Set<string>(),
+      };
       this.sinceBootDays.set(card.signalType, seen);
     }
     roll.built += 1;
@@ -617,6 +684,18 @@ export class CardCompletenessLedger {
       roll.etDaysWithComplete = seen.complete.size;
       if (roll.lastCompleteEtDay === null || etDay > roll.lastCompleteEtDay) {
         roll.lastCompleteEtDay = etDay;
+      }
+    }
+    // TRA-4990 — NOT an `else if`: `completeExceptAdmission` is a SUPERSET of
+    // `complete`, so a complete card must advance both. Chaining them would
+    // make the priority-1 row read 0 on the one day the sleeve did admit an
+    // entry, which is the direction that reads as "the product never worked".
+    if (card.completeExceptAdmission) {
+      seen.completeExceptAdmission.add(etDay);
+      roll.etDaysWithCompleteExceptAdmission = seen.completeExceptAdmission.size;
+      if (roll.lastCompleteExceptAdmissionEtDay === null
+          || etDay > roll.lastCompleteExceptAdmissionEtDay) {
+        roll.lastCompleteExceptAdmissionEtDay = etDay;
       }
     }
     if (bucket === 'in_window') {
@@ -718,7 +797,13 @@ export class CardCompletenessLedger {
         + '`attempted_unreadable` means no engine counter was supplied, so the identity could not '
         + 'be checked — it is NOT a pass. `lastInWindowBuiltAt` dates the last time the sink ran '
         + 'with the admission window open; `lastObservedBuiltAt` spans every bucket and therefore '
-        + 'reads as recent even when the in-window side produced nothing.',
+        + 'reads as recent even when the in-window side produced nothing. '
+        + 'TRA-4990 — then read `days[].completeExceptAdmissionInWindow`, NOT '
+        + '`completeInWindow`: `complete` requires an ADMITTED entry (`not_suppressed` is '
+        + 'unconditionally pass:false), so it is the sleeve\'s admission rate, not a statement '
+        + 'about whether this product can produce an actionable card. '
+        + '`byWindow.in_window.{unbuildable, completeExceptAdmission, refusedByCardRule}` is the '
+        + 'exhaustive partition of that question.',
     };
   }
 

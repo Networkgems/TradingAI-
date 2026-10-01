@@ -7949,6 +7949,21 @@ export class SignalEngine {
               },
             }
           : {}),
+        // TRA-4990 Pin 2 — the model the OTM entry path ENFORCES, computed by
+        // the account's own sizer (one expression, shared with
+        // `openOptionFromCandidate`). Without this the card published
+        // `floor(managedEquity × riskPerTrade / (stopDistance × 100))`, which
+        // no OTM entry path runs, and refused rows the engine was opening.
+        //
+        // `boundedLiveContracts` is deliberately NOT guessed here: it depends on
+        // the live balance snapshot and the per-entry notional cap read inside
+        // `runOtmScan`, and inventing one would make the card report a bound
+        // nobody enforced. Absent ⇒ the preview reports the budget-ratio model,
+        // which is what the demo book enforces and the live floor for the %
+        // path. A null preview (non-finite mark) leaves the key absent, so the
+        // card falls back to the advisory model and SAYS it is advisory —
+        // never a silent zero.
+        ...(this.enforcedOtmSizingForCard(signal) ?? {}),
         ...(quote ? { underlyingQuote: quote } : {}),
         reasonsNotToEnter: this.reasonsNotToEnterInputs(signal.symbol),
         // TRA-4720 — observe-only RS reading; flag OFF ⇒ key absent, card unchanged.
@@ -7990,6 +8005,38 @@ export class SignalEngine {
     } catch {
       this.cardBuildFailures += 1;
     }
+  }
+
+  /**
+   * TRA-4990 Pin 2 — the ENFORCED OTM sizing model for a carded signal, or
+   * `null` when this engine cannot state one.
+   *
+   * Scoped to the families the OTM entry path actually sizes
+   * (`WINDOW_GATED_CARD_SIGNAL_TYPES`, which is exactly `runOtmScan`'s own
+   * signal type). Claiming the OTM model for an RV or directional option row
+   * would publish a bound that row's exec path never applies — the
+   * false-accusation direction, and worse than the advisory model it replaces,
+   * which at least now says it is advisory.
+   *
+   * Returns the spread-ready key so the caller can splat it: absent key ⇒ the
+   * card reports the advisory model and labels it as such. Never a zero
+   * quantity standing in for "could not compute".
+   */
+  private enforcedOtmSizingForCard(
+    signal: TradeSignal,
+  ): { enforcedOptionSizing: { unit: 'contracts'; quantity: number; basis: string } } | null {
+    if (!isWindowGatedCardSignalType(signal.type)) return null;
+    const mark = (signal as TradeSignal & { mark?: unknown }).mark;
+    if (typeof mark !== 'number' || !Number.isFinite(mark) || mark <= 0) return null;
+    // Live books size against the real Tradier equity; demo against paper.
+    // `null` cash in live mode is the fail-closed state the open path also
+    // takes, so no equity override is passed and the preview reports the paper
+    // budget — labelled by its own basis string, not silently.
+    const preview = this.optionsAccount.previewOtmContracts(mark, this.mode, {
+      sizeMultiplier: this.activeRiskSizingMultiplier('options_otm'),
+      maxContracts: this.otmContractFloor().maxContractsPerEntry,
+    });
+    return preview === null ? null : { enforcedOptionSizing: preview };
   }
 
   private bumpCardTypeCount(type: string, cell: 'attempted' | 'built'): void {

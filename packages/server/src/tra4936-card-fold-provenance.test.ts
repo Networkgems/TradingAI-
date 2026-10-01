@@ -52,6 +52,9 @@ function card(opts: {
   generatedAt: number;
   complete?: boolean;
   refusedFields?: string[];
+  /** TRA-4990 — fields refused by ADMISSION only; drives `completeExceptAdmission`. */
+  admissionRefusedFields?: string[];
+  completeExceptAdmission?: boolean;
 }): TradeOpportunityCard {
   const refusedFields = opts.refusedFields ?? [];
   return {
@@ -64,6 +67,14 @@ function card(opts: {
     disposition: 'proposal_only',
     confidence: null,
     complete: opts.complete ?? refusedFields.length === 0,
+    // TRA-4990 — stated explicitly on the fixture: these synthetic cards carry
+    // no `fields.entryTrigger.criteria`, so the builder's own derivation cannot
+    // run here, and defaulting it to `false` would quietly park every row in
+    // `refusedByCardRule`. The live shape in this file is an out-of-window
+    // refusal, which IS admission-only.
+    completeExceptAdmission: opts.completeExceptAdmission
+      ?? refusedFields.every((f) => (opts.admissionRefusedFields ?? []).includes(f)),
+    admissionRefusedFields: opts.admissionRefusedFields ?? [],
     incompleteFields: [],
     refusedFields,
     fields: {} as TradeOpportunityCard['fields'],
@@ -72,7 +83,14 @@ function card(opts: {
 
 /** The live shape: fully built, entry refused BY THE WINDOW, so not complete. */
 function outOfWindowRefusal(generatedAt: number): TradeOpportunityCard {
-  return card({ generatedAt, refusedFields: ['entryTrigger', 'sizing'], complete: false });
+  // TRA-4990 — `admissionRefusedFields` is deliberately LEFT EMPTY here, which
+  // makes `completeExceptAdmission` false. That is the measured 2026-10-01 shape
+  // faithfully: `entryTrigger` was admission-refused but `sizing` was refused by
+  // a CARD rule (the stop-distance budget the engine does not run), so these 50
+  // rows belong in `refusedByCardRule`, not in the priority-1 cell. Do not
+  // "repair" this fixture by adding 'sizing' here — that would hide Pin 2.
+  return card({ generatedAt, refusedFields: ['entryTrigger', 'sizing'], complete: false,
+                admissionRefusedFields: ['entryTrigger'] });
 }
 
 /** The measured 2026-10-01 population: pre-window builds only, all refused. */

@@ -425,6 +425,25 @@ export interface CostEstimate {
   exceedsAbsCeiling: boolean | null;
 }
 
+/**
+ * TRA-4990 Pin 2 — WHICH sizing model produced `quantity`.
+ *
+ * - `enforced` — the caller supplied the count the EXECUTION PATH would place
+ *   for this row ({@link CardBuildContext.enforcedOptionSizing}). The card's
+ *   verdict is that model's verdict, so a card describing a row the engine
+ *   actually opened can no longer refuse it.
+ * - `risk_budget_advisory` — nobody supplied the enforced count, so the card
+ *   reports its own stop-distance risk budget. For the OTM sleeve that is **not
+ *   the model the engine runs**: every OTM entry path sizes on PREMIUM NOTIONAL
+ *   (`floor(budget / (premium × 100))`, or the bounded-live
+ *   `resolveLiveOptionTestContracts(askLimit, min(cash, testCap), maxContracts)`),
+ *   then clamps to the contract floor's 2-per-entry. Stop distance appears in
+ *   neither. The two therefore disagree in the direction that matters — the
+ *   engine opens 1 contract while a stop-distance budget buys 0 — which was 47
+ *   of the 50 cards retained on 2026-10-01.
+ */
+export type PositionSizingModel = 'enforced' | 'risk_budget_advisory';
+
 export interface PositionSizing {
   unit: 'contracts' | 'shares';
   quantity: number;
@@ -434,6 +453,25 @@ export interface PositionSizing {
   /** Options: full-premium loss if the position gaps through the stop. */
   maxLossHard: number | null;
   basis: string;
+  /**
+   * TRA-4990 — which model `quantity` came from. Field ABSENT ⇒ the card
+   * predates this change; never infer `enforced` from silence.
+   */
+  model?: PositionSizingModel;
+  /**
+   * TRA-4990 — the stop-distance risk-budget count, ALWAYS computed for option
+   * rows so the two models stay comparable on the wire. `null` for underlying
+   * rows (there the RiskManager IS the enforced model, so there is no second
+   * number) and when the budget basis was unusable.
+   */
+  riskBudgetContracts?: number | null;
+  /**
+   * TRA-4990 — true iff the two models disagree about whether this row is
+   * sizeable AT ALL (`>= 1` vs `0`). That disagreement, not the exact count, is
+   * what makes the card unusable for grading the sleeve. `null` when only one
+   * model was readable — "could not compare" must not read as "they agree".
+   */
+  divergesFromRiskBudget?: boolean | null;
 }
 
 export interface WhyNowContext {
@@ -500,6 +538,36 @@ export interface TradeOpportunityCard {
   calibrationReasons?: string[];
   /** True iff all 8 fields `verified` — i.e. both lists below are empty. */
   complete: boolean;
+  /**
+   * TRA-4990 Pin 1 — `complete` is GATED ON ADMISSION and therefore cannot
+   * answer the TRA-4645 priority-1 question ("convert every signal into a clear
+   * proposed trade: setup, entry trigger, invalidation, target, holding period,
+   * contract choice, liquidity, estimated slippage, position size, why now").
+   *
+   * The builder appends `not_suppressed` with `pass: false` for ANY
+   * `signalSkipReason`/`liveSkipReason`, which refuses `entryTrigger`, which
+   * pins `complete: false`. So `complete: true` requires a signal that cleared
+   * every gate and reached `openOptionFromCandidate` — i.e. it re-expresses the
+   * sleeve's ADMISSION RATE, not whether the product can state a proposal.
+   *
+   * THIS is the priority-1 column: every field populated, and the only thing
+   * refusing is the sleeve's own admission decision. Superset of `complete`
+   * (`complete ⇒ completeExceptAdmission`), so the two are never in tension;
+   * the gap between them IS the admission rate, read in the open.
+   *
+   * ⛔ It is NOT a loosening of `not_suppressed` — that criterion still reads
+   * `pass: false`, `entryTrigger` is still `refused`, and a refused card still
+   * cannot reach `proposed` (TRA-4651). Only the question being asked changed.
+   */
+  completeExceptAdmission: boolean;
+  /**
+   * TRA-4990 — the subset of `refusedFields` whose refusal is attributable
+   * ENTIRELY to `admission`-kind criteria. Derived from the criteria's own
+   * `kind`, never from the reason strings: a prose match would go green the
+   * first time a criterion is renamed, which is this repo's recurring
+   * instrument-reads-identically bug.
+   */
+  admissionRefusedFields: string[];
   /** Fields whose inputs were MISSING — the builder could not populate them. */
   incompleteFields: string[];
   /**
@@ -549,6 +617,27 @@ export interface CardBuildContext {
     riskPerTrade: number;
     /** Whole shares when false; 8dp when true (crypto). Default false. */
     fractionalQuantity?: boolean;
+  };
+  /**
+   * TRA-4990 Pin 2 — the contract count the EXECUTION PATH would place for this
+   * option row, computed by the engine with the SAME expression the open path
+   * runs (`OptionsAccount.previewOtmContracts`). Supplied ⇒ the `sizing` field
+   * reports and grades THAT model, and the card's stop-distance risk budget
+   * drops to an advisory number beside it.
+   *
+   * ⚠️ Deliberately a number the caller already computed, never a bound
+   * re-implemented here. A second copy of a capital bound inside an instrument
+   * agrees with itself and would silently fork from the enforced one — and
+   * TRA-4990 explicitly forbids moving `maxContractsPerEntry` or any capital
+   * bound. `quantity: 0` means the enforced sizer REFUSES the row; absent means
+   * nobody asked it, which is a different claim and must not read as zero.
+   */
+  enforcedOptionSizing?: {
+    unit: 'contracts';
+    /** 0 ⇒ the enforced sizer refuses this row. */
+    quantity: number;
+    /** Names the model, e.g. the bounded-live notional cap or the demo budget ratio. */
+    basis: string;
   };
   /** Round-trip fees $/contract; defaults to the TRA-2810 measurement. */
   feesPerContractRoundTrip?: number;
@@ -918,30 +1007,81 @@ export function buildTradeOpportunityCard(
     sizing = incomplete<PositionSizing>(null, ['cannot size without a valid entry and stop distance']);
   } else if (opt) {
     const budget = ctx.sizing.managedEquity * ctx.sizing.riskPerTrade;
-    const contracts = Math.floor(budget / (riskPerShare * 100));
-    sizing =
-      contracts >= 1
-        ? verified<PositionSizing>({
-            unit: 'contracts',
-            quantity: contracts,
-            riskBudget: budget,
-            maxLossAtStop: contracts * riskPerShare * 100,
-            maxLossHard: contracts * entryPrice * 100,
-            basis: 'floor(managedEquity × riskPerTrade / (stopDistance × 100)); hard max loss is full premium',
-          })
-        : refused<PositionSizing>(
-            {
-              unit: 'contracts',
-              quantity: 0,
-              riskBudget: budget,
-              maxLossAtStop: 0,
-              maxLossHard: 0,
-              basis: 'floor(managedEquity × riskPerTrade / (stopDistance × 100)) = 0 — budget below one contract',
-            },
-            [
-              `risk budget $${budget.toFixed(2)} buys 0 contracts at $${(riskPerShare * 100).toFixed(2)} risk/contract`,
-            ],
-          );
+    // The card's own stop-distance reading. Kept in BOTH arms below so the two
+    // models are always comparable on the wire — an advisory number that
+    // disappears when the enforced one shows up would make the divergence
+    // unmeasurable exactly where it matters.
+    const riskBudgetContracts = Math.floor(budget / (riskPerShare * 100));
+    const enforced = ctx.enforcedOptionSizing;
+    if (enforced !== undefined) {
+      // TRA-4990 Pin 2 — the ENFORCED model governs. The engine sizes OTM on
+      // premium notional and clamps to the contract floor; stop distance is not
+      // an input to any OTM entry path. Reporting the enforced count here is
+      // what stops the card refusing a row the engine placed.
+      const q = Number.isFinite(enforced.quantity) ? Math.floor(enforced.quantity) : 0;
+      const diverges = q >= 1 !== riskBudgetContracts >= 1;
+      const data: PositionSizing = {
+        unit: 'contracts',
+        quantity: Math.max(0, q),
+        riskBudget: budget,
+        maxLossAtStop: Math.max(0, q) * riskPerShare * 100,
+        maxLossHard: Math.max(0, q) * entryPrice * 100,
+        basis: `${enforced.basis} (ENFORCED). Stop-distance risk budget $${budget.toFixed(2)} would size `
+          + `${riskBudgetContracts} at $${(riskPerShare * 100).toFixed(2)} risk/contract — advisory only, `
+          + 'no OTM entry path sizes on stop distance.',
+        model: 'enforced',
+        riskBudgetContracts,
+        divergesFromRiskBudget: diverges,
+      };
+      sizing =
+        q >= 1
+          ? verified<PositionSizing>(data)
+          : refused<PositionSizing>(data, [
+              `the enforced sizer places 0 contracts: ${enforced.basis}`,
+            ]);
+    } else {
+      // No enforced count supplied. The verdict stays what it was — this ticket
+      // moves no capital bound and must not silently re-bucket existing cards —
+      // but the basis string now NAMES the model it is, and says it is not the
+      // one the sleeve runs. A basis naming a model the engine does not run was
+      // the defect TRA-4990 Pin 2 filed.
+      const advisory =
+        'floor(managedEquity × riskPerTrade / (stopDistance × 100)) — RISK-BUDGET ADVISORY, '
+        + 'NOT the enforced model: every OTM entry path sizes on premium notional '
+        + '(bounded-live: resolveLiveOptionTestContracts(ask, min(cash, testCap), maxContracts); '
+        + 'demo: floor(budgetRatio × equity / (premium × 100))) and clamps to the contract floor\'s '
+        + '2-per-entry. No enforced count was supplied for this row (TRA-4990).';
+      const common = {
+        unit: 'contracts' as const,
+        riskBudget: budget,
+        model: 'risk_budget_advisory' as const,
+        riskBudgetContracts,
+        // One model read, so the comparison is UNAVAILABLE. Never `false`.
+        divergesFromRiskBudget: null,
+      };
+      sizing =
+        riskBudgetContracts >= 1
+          ? verified<PositionSizing>({
+              ...common,
+              quantity: riskBudgetContracts,
+              maxLossAtStop: riskBudgetContracts * riskPerShare * 100,
+              maxLossHard: riskBudgetContracts * entryPrice * 100,
+              basis: `${advisory} Hard max loss is full premium.`,
+            })
+          : refused<PositionSizing>(
+              {
+                ...common,
+                quantity: 0,
+                maxLossAtStop: 0,
+                maxLossHard: 0,
+                basis: `${advisory} It evaluates to 0 — budget below one contract.`,
+              },
+              [
+                `risk budget $${budget.toFixed(2)} buys 0 contracts at $${(riskPerShare * 100).toFixed(2)} risk/contract`
+                  + ' — advisory model; the enforced sizer was not consulted for this row (TRA-4990 Pin 2)',
+              ],
+            );
+    }
   } else {
     const qty = sizeFromStopViaRiskManager(entryPrice, stop!, {
       managedEquity: ctx.sizing.managedEquity,
@@ -957,6 +1097,12 @@ export function buildTradeOpportunityCard(
             maxLossAtStop: qty * riskPerShare,
             maxLossHard: null,
             basis: 'sizeFromStopViaRiskManager (TRA-2034: engine RiskManager + TRA-178 notional cap)',
+            // TRA-4990 — on the UNDERLYING path the card calls the engine's own
+            // RiskManager, so this IS the enforced model and there is no second
+            // number to diverge from. `null`, not `false`: no comparison ran.
+            model: 'enforced',
+            riskBudgetContracts: null,
+            divergesFromRiskBudget: null,
           })
         : refused<PositionSizing>(
             {
@@ -966,6 +1112,9 @@ export function buildTradeOpportunityCard(
               maxLossAtStop: 0,
               maxLossHard: null,
               basis: 'sizeFromStopViaRiskManager (TRA-2034) returned 0 — budget below one unit or notional-capped to zero',
+              model: 'enforced',
+              riskBudgetContracts: null,
+              divergesFromRiskBudget: null,
             },
             ['RiskManager sized 0 (budget below one unit or notional-capped to zero)'],
           );
@@ -1020,6 +1169,17 @@ export function buildTradeOpportunityCard(
   const fieldNames = Object.keys(fields) as (keyof typeof fields)[];
   const incompleteFields = fieldNames.filter((k) => fields[k].status === 'incomplete');
   const refusedFields = fieldNames.filter((k) => fields[k].status === 'refused');
+  // TRA-4990 Pin 1 — which refusals are the SLEEVE's admission decision rather
+  // than a card rule. Keyed on the criteria's own `kind`, so it stays correct
+  // when a criterion is renamed and goes BLIND (empty) rather than green if the
+  // criteria list ever stops being published. `entryTrigger` is the only field
+  // that can carry admission criteria today; the filter is written over the
+  // field list so a second one needs no edit here.
+  const admissionRefusedFields = refusedFields.filter((k) => {
+    if (k !== 'entryTrigger') return false;
+    const failing = (fields.entryTrigger.data?.criteria ?? []).filter((c) => !c.pass);
+    return failing.length > 0 && failing.every((c) => c.kind === 'admission');
+  });
   // TRA-4788 — one lookup, kept whole: the verdict, the gate it landed on and
   // its reasons travel together. An absent index is 'not_run' — nothing was
   // folded and no floor was tested — which is a different claim from a floor
@@ -1043,8 +1203,17 @@ export function buildTradeOpportunityCard(
     calibrationStatus: calibration ? calibration.status : 'not_run',
     calibrationReasons: calibration ? calibration.reasons : [CALIBRATION_NOT_RUN_REASON],
     complete: incompleteFields.length === 0 && refusedFields.length === 0,
+    // TRA-4990 — the TRA-4645 priority-1 column. Note the ORDER of the two
+    // terms: `incompleteFields.length === 0` first, so an unbuildable card can
+    // never reach this cell by having no refusals. `every` over an empty
+    // `refusedFields` is vacuously true, which is exactly right — that is the
+    // `complete` case, and this must be its superset.
+    completeExceptAdmission:
+      incompleteFields.length === 0
+      && refusedFields.every((f) => admissionRefusedFields.includes(f)),
     incompleteFields,
     refusedFields,
+    admissionRefusedFields,
     fields,
     reasonsNotToEnter: buildReasonsNotToEnter(
       {
@@ -1078,6 +1247,27 @@ export interface CardBatchSummary {
    * contract. It is not a defect and must never be read as one.
    */
   refusedOnly: number;
+  /**
+   * TRA-4990 Pin 1 — THE TRA-4645 PRIORITY-1 COLUMN. Cards with every field
+   * populated whose only refusal is the sleeve's own admission decision.
+   * Superset of `complete`; `completeExceptAdmission - complete` IS the
+   * admission rate, which is what `complete` alone was silently reporting.
+   *
+   * Read this, not `complete`, to answer "does this product produce an
+   * actionable card". Read `complete` to answer "did the sleeve admit an
+   * entry" — a question about the sleeve, not about the card surface.
+   */
+  completeExceptAdmission: number;
+  /**
+   * TRA-4990 — fully built cards refused by a CARD RULE (sizing, contract,
+   * costs, …) rather than by admission. This is the cell Pin 2 lives in: a
+   * sizing model that is not the enforced one lands 47-of-50 here and reads as
+   * "the sleeve declined", which it is not.
+   *
+   * Exhaustive partition, asserted in the tests:
+   * `unbuildable + completeExceptAdmission + refusedByCardRule === total`.
+   */
+  refusedByCardRule: number;
   /** Per-field count of cards that could not BUILD the field. */
   missingByField: Record<string, number>;
   /** Per-field count of cards that built it and whose rule declined entry. */
@@ -1108,12 +1298,27 @@ export function summarizeCards(cards: readonly TradeOpportunityCard[]): CardBatc
   const refusedOnly = cards.filter(
     (c) => c.incompleteFields.length === 0 && c.refusedFields.length > 0,
   ).length;
+  // TRA-4990 — read the card's OWN `completeExceptAdmission` rather than
+  // re-deriving it: one definition, so the fold and the card cannot disagree.
+  const completeExceptAdmission = cards.filter((c) => c.completeExceptAdmission).length;
+  // Derived INDEPENDENTLY — off the two field lists, not by subtracting the
+  // cell above. A subtraction would make
+  // `unbuildable + completeExceptAdmission + refusedByCardRule === total`
+  // true by construction, i.e. a sum identity that cannot fail, which is the
+  // green-that-cannot-go-red trap. This way the identity actually tests the
+  // boolean against the arrays.
+  const refusedByCardRule = cards.filter(
+    (c) => c.incompleteFields.length === 0
+      && c.refusedFields.some((f) => !c.admissionRefusedFields.includes(f)),
+  ).length;
   return {
     total: cards.length,
     complete,
     incomplete: cards.length - complete,
     unbuildable,
     refusedOnly,
+    completeExceptAdmission,
+    refusedByCardRule,
     missingByField,
     refusedByField,
   };

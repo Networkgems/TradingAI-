@@ -10642,6 +10642,38 @@ app.get('/api/state', requireAuth, async (_req, res) => {
 // `wiring[].lastInWindowBuiltAt` dates the last run with the window open;
 // `lastBuiltAt` spans every bucket and therefore reads as recent even when the
 // in-window side produced nothing.
+//
+// ⛔ TRA-4990 — AND `summary.complete` IS NOT THE COLUMN FOR "DOES THIS PRODUCT
+// PRODUCE AN ACTIONABLE CARD". It is the sleeve's ADMISSION RATE. The builder
+// appends `not_suppressed` with `pass: false` for ANY
+// `signalSkipReason`/`liveSkipReason`, which refuses `entryTrigger`, which pins
+// `complete: false` — so `complete: true` requires a signal that cleared every
+// gate and reached `openOptionFromCandidate`. The TRA-4645 priority-1 ask was
+// "convert every signal into a clear proposed trade: setup, entry trigger,
+// invalidation, target, holding period, contract choice, liquidity, estimated
+// slippage, position size, and why now" — not "the sleeve admitted the entry".
+//
+// Read instead, in this order:
+//   1. `summary.unbuildable` — ≥1 field the builder COULD NOT populate. The
+//      only defect cell. Fix the builder.
+//   2. `summary.completeExceptAdmission` — every field populated, the only
+//      refusal is admission. **This is the priority-1 answer.** Superset of
+//      `complete`; the gap between them is the admission rate, read in the open.
+//   3. `summary.refusedByCardRule` — a CARD rule declined a row the engine may
+//      well have placed. TRA-4990 Pin 2 lived entirely here.
+// The three are an exhaustive partition of `total`.
+//
+// ⛔ Do NOT "fix" a zero `complete` by loosening `not_suppressed`. TRA-4974
+// ruled that out and the criterion is correct: a suppressed signal is not an
+// actionable proposal, and a refused card still must not reach `proposed`
+// (TRA-4651). The column changed; the gate did not.
+//
+// TRA-4990 Pin 2 — `fields.sizing.model` says WHICH sizing model produced
+// `quantity`. `enforced` ⇒ it is the count the execution path would place
+// (`OptionsAccount.previewOtmContracts`, one expression shared with
+// `openOptionFromCandidate`). `risk_budget_advisory` ⇒ nobody supplied one and
+// this is the card's own stop-distance budget, which NO OTM entry path runs —
+// read `divergesFromRiskBudget` (`null` = not compared, never "they agree").
 app.get('/api/cards', requireAuth, async (_req, res) => {
   const ctx = await userCtx(res);
   res.json({ asOf: new Date().toISOString(), ...ctx.engine.getRecentCards() });
