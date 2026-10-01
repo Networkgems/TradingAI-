@@ -31,10 +31,12 @@ import { resolveDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
 import {
   MODEL_FACING_JOURNAL_BASIS,
-  loadModelFacingJournalRows,
+  MODEL_FACING_JOURNAL_MODE,
+  loadModelFacingFold,
 } from './model-facing-journal.js';
 import {
   buildOptionsEvaluationReport,
+  type EvalJournalModeBasis,
   type OptionsEvaluationReport,
 } from './options-evaluation-report.js';
 
@@ -103,8 +105,37 @@ export interface RecordOptionsEvaluationReportDeps {
   from?: number;
   env?: NodeJS.ProcessEnv;
   now?: number;
-  /** Test seam — defaults to the model-facing (demo, QA fixtures removed) fold. */
-  loadRows?: typeof loadModelFacingJournalRows;
+  /**
+   * Test seam — defaults to the model-facing (demo-pinned, QA fixtures removed)
+   * fold.
+   *
+   * TRA-5001 — this is `loadModelFacingFold`, not `loadModelFacingJournalRows`,
+   * for one reason: it returns `modeExcluded`. The rows are identical either way
+   * (same pin, same predicate); the difference is that the count of LIVE rows the
+   * pin dropped is measurable here and therefore publishable beside the basis.
+   */
+  loadFold?: typeof loadModelFacingFold;
+}
+
+/**
+ * TRA-5001 — the mode axis of the basis, built off what the fold actually
+ * removed.
+ *
+ * The note is written for a reader who has the artifact and not this file. It has
+ * to say the thing the old label did not: that a `broker_fill` cost basis — the
+ * only one derived from a real executed price — cannot appear in this report at
+ * all, so a G1/G2/G3 gate read off it can never be satisfied by live evidence.
+ */
+function modeBasisFor(modeExcluded: number): EvalJournalModeBasis {
+  return {
+    mode: MODEL_FACING_JOURNAL_MODE,
+    excludedRows: modeExcluded,
+    note:
+      `Rows are PINNED to mode='${MODEL_FACING_JOURNAL_MODE}' by model-facing-journal.ts; `
+      + `${modeExcluded} live row(s) were removed before grading. This report therefore CANNOT `
+      + 'contain a live fill, and no `broker_fill` cost basis can ever appear in it. A promotion '
+      + 'gate read off this surface is not satisfiable by live evidence — grade live fills elsewhere.',
+  };
 }
 
 /**
@@ -122,11 +153,12 @@ export async function recordOptionsEvaluationReport(
   if (!isOptionsEvalReportEnabled(env)) return null;
 
   try {
-    const load = deps.loadRows ?? loadModelFacingJournalRows;
-    const rows = await load({ from: deps.from, to: deps.to, env });
-    const report = buildOptionsEvaluationReport(rows, {
+    const load = deps.loadFold ?? loadModelFacingFold;
+    const fold = await load({ from: deps.from, to: deps.to, env });
+    const report = buildOptionsEvaluationReport(fold.rows, {
       asOfDate: deps.asOfDate,
       journalBasis: MODEL_FACING_JOURNAL_BASIS,
+      journalModeBasis: modeBasisFor(fold.modeExcluded),
       now: deps.now,
     });
     const writtenOnEtDate = deps.todayEtDate ?? deps.asOfDate;
@@ -145,6 +177,9 @@ export async function recordOptionsEvaluationReport(
       asOfDate: deps.asOfDate,
       graded: report.coverage.graded,
       closedRows: report.coverage.closedRows,
+      // TRA-5001 — the mode axis in the log line too, so a boot's worth of Render
+      // tape answers "was this demo-only?" without reading the artifact back.
+      journalBasisLabel: report.journalBasisLabel,
       headlineStatus: report.headline.status,
       constraints: report.constraints.overall,
       lateForEtDate: artifact.lateForEtDate,

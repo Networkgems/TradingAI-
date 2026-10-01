@@ -45,6 +45,11 @@ const MODE_PINNED_ENTRIES = [
   'loadModelFacingJournalRows',
   'foldModelFacingEodJournal',
   'applyModelFacingFoldBasis',
+  // TRA-5001 — the demo pin applied IN MEMORY over a pooled read, so the live
+  // rows it drops are countable and can be published beside the basis label. The
+  // population is identical to `loadModelFacingJournal`'s; only the census is
+  // new, which is why it belongs in this list and not outside it.
+  'loadModelFacingFold',
 ] as const;
 
 /**

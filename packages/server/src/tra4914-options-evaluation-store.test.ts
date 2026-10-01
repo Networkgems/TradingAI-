@@ -9,6 +9,7 @@ import {
   readLatestOptionsEvaluationReport,
   recordOptionsEvaluationReport,
 } from './options-evaluation-report-store.js';
+import { applyModelFacingFoldBasis } from './model-facing-journal.js';
 import type { OptionTradeJournalRecord } from './option-trade-journal.js';
 
 // TRA-4914 — the SCHEDULED ARTIFACT. What is under test is the contract that
@@ -29,13 +30,18 @@ afterEach(() => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-function closedRow(id: string, closeTs: number, pnl: number): OptionTradeJournalRecord {
+function closedRow(
+  id: string,
+  closeTs: number,
+  pnl: number,
+  mode: 'demo' | 'live' = 'demo',
+): OptionTradeJournalRecord {
   return {
     id,
     openTs: 1,
     symbol: 'AAPL',
     structure: 'single_leg_rv',
-    mode: 'demo',
+    mode,
     ivRank: null,
     trend: 'up',
     sentiment: null,
@@ -55,7 +61,20 @@ function closedRow(id: string, closeTs: number, pnl: number): OptionTradeJournal
 }
 
 const rows = [closedRow('a', 10, 20), closedRow('b', 20, -5)];
-const loadRows = async () => rows;
+
+/**
+ * The fold seam, driven through the REAL `applyModelFacingFoldBasis` over a
+ * pooled row list rather than hand-stubbed.
+ *
+ * TRA-5001 — `modeExcluded` is the number this ticket exists to publish, so a
+ * stub that just asserts whatever integer the test wants would pass while the
+ * production pin counted something else. Running the real predicate means the
+ * count under test is the count the pin produces.
+ */
+const foldOf = (pooled: readonly OptionTradeJournalRecord[]) => async () =>
+  applyModelFacingFoldBasis(pooled, { env: {} });
+
+const loadFold = foldOf(rows);
 
 describe('options evaluation report store (TRA-4914)', () => {
   it('is a zero-IO no-op while the flag is off, and never writes an artifact', async () => {
@@ -63,9 +82,9 @@ describe('options evaluation report store (TRA-4914)', () => {
     const out = await recordOptionsEvaluationReport({
       asOfDate: '2026-09-25',
       env: { DATA_DIR: dataDir },
-      loadRows: async () => {
+      loadFold: async () => {
         touched = true;
-        return rows;
+        return applyModelFacingFoldBasis(rows, { env: {} });
       },
     });
     expect(out).toBeNull();
@@ -85,7 +104,7 @@ describe('options evaluation report store (TRA-4914)', () => {
     const out = await recordOptionsEvaluationReport({
       asOfDate: '2026-09-25',
       env,
-      loadRows,
+      loadFold,
       now: 1_700_000_000_000,
     });
     expect(out).not.toBeNull();
@@ -96,6 +115,11 @@ describe('options evaluation report store (TRA-4914)', () => {
     expect(out!.report.journalBasis).toBe('desk+unattributed');
 
     const back = await readLatestOptionsEvaluationReport(env);
+    // The basis block survives the JSON round-trip to disk — a field that only
+    // exists in the returned object would miss the on-host artifact, which is the
+    // surface the TRA-5001 AC names first.
+    expect(back?.report.journalModeBasis.mode).toBe('demo');
+    expect(back?.report.journalBasisLabel).toContain('mode=demo');
     expect(back?.report.generatedAt).toBe(1_700_000_000_000);
     expect(await listOptionsEvaluationReportDates(env)).toEqual(['2026-09-25']);
   });
@@ -109,20 +133,20 @@ describe('options evaluation report store (TRA-4914)', () => {
       asOfDate: '2026-09-24',
       todayEtDate: '2026-09-25',
       env,
-      loadRows,
+      loadFold,
     });
     expect(late!.lateForEtDate).toBe(true);
     expect(late!.writtenOnEtDate).toBe('2026-09-25');
     expect(late!.report.headline.status).not.toBe('OK'); // n=2, still honestly thin
 
-    const onTime = await recordOptionsEvaluationReport({ asOfDate: '2026-09-25', env, loadRows });
+    const onTime = await recordOptionsEvaluationReport({ asOfDate: '2026-09-25', env, loadFold });
     expect(onTime!.lateForEtDate).toBe(false);
   });
 
   it('keeps one file per ET date and lists them ascending, gaps left as gaps', async () => {
-    await recordOptionsEvaluationReport({ asOfDate: '2026-09-21', env, loadRows });
-    await recordOptionsEvaluationReport({ asOfDate: '2026-09-25', env, loadRows });
-    await recordOptionsEvaluationReport({ asOfDate: '2026-09-25', env, loadRows }); // same date ⇒ overwrite
+    await recordOptionsEvaluationReport({ asOfDate: '2026-09-21', env, loadFold });
+    await recordOptionsEvaluationReport({ asOfDate: '2026-09-25', env, loadFold });
+    await recordOptionsEvaluationReport({ asOfDate: '2026-09-25', env, loadFold }); // same date ⇒ overwrite
     expect(await listOptionsEvaluationReportDates(env)).toEqual(['2026-09-21', '2026-09-25']);
     expect((await readLatestOptionsEvaluationReport(env))!.report.asOfDate).toBe('2026-09-25');
   });
@@ -131,11 +155,81 @@ describe('options evaluation report store (TRA-4914)', () => {
     const out = await recordOptionsEvaluationReport({
       asOfDate: '2026-09-25',
       env,
-      loadRows: async () => {
+      loadFold: async () => {
         throw new Error('journal unreadable');
       },
     });
     expect(out).toBeNull();
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // TRA-5001 — the published basis must not be silent about `mode`.
+  // ───────────────────────────────────────────────────────────────────────────
+
+  it('publishes the mode pin and the COUNT of live rows it removed', async () => {
+    // The measured bqb1 shape in miniature: live rows present in the pooled
+    // population, dropped by the pin, and — before this ticket — dropped with no
+    // tell whatsoever on the wire.
+    const pooled = [
+      closedRow('a', 10, 20),
+      closedRow('b', 20, -5),
+      closedRow('live-1', 30, 40, 'live'),
+      closedRow('live-2', 40, -7, 'live'),
+      closedRow('live-3', 50, 3, 'live'),
+    ];
+    const out = await recordOptionsEvaluationReport({
+      asOfDate: '2026-10-01',
+      env,
+      loadFold: foldOf(pooled),
+    });
+
+    // The pin itself is unchanged — the two demo rows, and ONLY those, are graded.
+    expect(out!.report.coverage.graded).toBe(2);
+    // ...and now it says so, with the number it dropped.
+    expect(out!.report.journalModeBasis.mode).toBe('demo');
+    expect(out!.report.journalModeBasis.excludedRows).toBe(3);
+    expect(out!.report.journalBasisLabel).toBe(
+      'desk+unattributed;mode=demo;modeExcludedRows=3',
+    );
+    // The note must name the consequence, not just the fact. A reader holding
+    // only this artifact has to learn that `broker_fill` cannot appear in it.
+    expect(out!.report.journalModeBasis.note).toContain('broker_fill');
+  });
+
+  it('states the mode axis even when the pin removed nothing — 0 is not absent', async () => {
+    // The direction that would re-open the hole quietly: on a book with no live
+    // rows the count is a legitimate 0, and a field that only appeared when
+    // non-zero would be missing on exactly the days nobody is watching.
+    const out = await recordOptionsEvaluationReport({ asOfDate: '2026-10-01', env, loadFold });
+    expect(out!.report.journalModeBasis.excludedRows).toBe(0);
+    expect(out!.report.journalBasisLabel).toContain('mode=demo');
+  });
+
+  it('REFUSES to publish an account-class-only basis — the TRA-5001 defect verbatim', async () => {
+    // This is the regression the AC asks for, stated as the property rather than
+    // as a field name: whatever the basis block is called, the published report
+    // must not be readable as a basis statement that omits `mode`. Asserting over
+    // the SERIALIZED artifact rather than over one field means a future rename or
+    // restructure cannot satisfy it by moving the mode axis somewhere a reader
+    // does not look.
+    const out = await recordOptionsEvaluationReport({ asOfDate: '2026-10-01', env, loadFold });
+    const onDisk = (await readLatestOptionsEvaluationReport(env))!;
+
+    // The account-class axis alone is NOT a sufficient basis statement...
+    expect(out!.report.journalBasis).not.toContain('mode');
+    // ...so the artifact must carry the mode axis beside it, naming the pin.
+    const basisFields = JSON.stringify({
+      journalBasis: onDisk.report.journalBasis,
+      journalModeBasis: onDisk.report.journalModeBasis,
+      journalBasisLabel: onDisk.report.journalBasisLabel,
+    });
+    expect(basisFields).toContain('mode');
+    expect(basisFields).toContain('demo');
+    // And the composite label must differ from the bare account-class string —
+    // if they are ever equal, the mode axis has been dropped again.
+    expect(onDisk.report.journalBasisLabel).not.toBe(onDisk.report.journalBasis);
+    // The schema bump is the tell for a v1 artifact, which carries NEITHER field.
+    expect(onDisk.report.version).toBe(2);
   });
 
   it('the flag predicate accepts the standard truthy spellings and nothing else', () => {

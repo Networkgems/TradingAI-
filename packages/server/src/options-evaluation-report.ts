@@ -1066,20 +1066,109 @@ function gradeConstraints(
 // The report
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The row basis, BOTH axes (TRA-5001)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * TRA-5001 — the `mode` pin the graded rows were folded under.
+ *
+ * `'unspecified'` is the NOT-MEASURED arm and is the default: a caller that did
+ * not state its pin gets a field saying so, never an assumed `'demo'`. Guessing
+ * here would reinstate the exact defect — a label that reads the same whether the
+ * population is pooled or pinned.
+ */
+export type EvalModePin = 'demo' | 'live' | 'pooled' | 'unspecified';
+
+/**
+ * TRA-5001 — the MODE axis of the row basis, published beside
+ * {@link OptionsEvaluationReport.journalBasis}, which is silent about it.
+ *
+ * `journalBasis` names the ACCOUNT-CLASS axis (`desk+unattributed`) and nothing
+ * else — `model-facing-journal.ts` documents it that way at its definition — and
+ * every reader of this report took it for the whole population. `mode` is the axis
+ * that decides whether real money is in the number: the default fold is pinned
+ * `demo`, so this report STRUCTURALLY CANNOT see a live fill, and on bqb1 that
+ * silently dropped all 32 live rows and with them all 21 `broker_fill` cost-basis
+ * rows — the only basis derived from a real executed price rather than a mark or a
+ * modelled cross.
+ *
+ * This is TRA-3831 running backwards. TRA-3831 fixed a POOLED fold wearing a demo
+ * label; this fixes a DEMO-PINNED fold wearing a label that never mentioned mode.
+ */
+export interface EvalJournalModeBasis {
+  /** The pin applied to the rows handed to this report. */
+  mode: EvalModePin;
+  /**
+   * Rows the pin REMOVED, or `null` when the caller could not measure it.
+   *
+   * `null` is NOT MEASURED and is not a zero: a caller whose pin ran as a store
+   * filter never saw the dropped rows and has no honest count to publish, which
+   * is a different fact from "the pin dropped nothing". Non-zero is the number
+   * that separates a pinned fold from a pooled one.
+   */
+  excludedRows: number | null;
+  /** One line a reader can act on. Never empty. */
+  note: string;
+}
+
+/**
+ * Compose the two axes into ONE string, so the basis a casual reader eyeballs
+ * cannot be the account-class axis alone.
+ *
+ * Deliberately a distinct field rather than an edit to `journalBasis`:
+ * `MODEL_FACING_JOURNAL_BASIS` is a grep literal shared with `weightsBasis` on
+ * other surfaces, and rewriting the value it echoes would break that grep for a
+ * cosmetic win. The label is derived, so the two can never disagree.
+ */
+export function journalBasisLabel(basis: string, mode: EvalJournalModeBasis): string {
+  const dropped = mode.excludedRows === null ? 'NOT MEASURED' : String(mode.excludedRows);
+  return `${basis};mode=${mode.mode};modeExcludedRows=${dropped}`;
+}
+
+/** The NOT-MEASURED mode basis — what a caller that stated no pin gets. */
+export const EVAL_MODE_BASIS_UNSPECIFIED: EvalJournalModeBasis = {
+  mode: 'unspecified',
+  excludedRows: null,
+  note:
+    'The caller did not state a mode pin. Treat the mode axis of this report as NOT MEASURED: '
+    + 'it is unknown whether live rows are included, excluded, or absent.',
+};
+
 /** Default notional the Monte-Carlo equity band is expressed against. */
 export const EVAL_DEFAULT_INITIAL_EQUITY_USD = 25_000;
 
 export interface OptionsEvaluationReport {
-  /** Schema version — bump when a consumer-visible field changes shape. */
-  version: 1;
+  /**
+   * Schema version — bump when a consumer-visible field changes shape.
+   *
+   * 2 (TRA-5001): added the required `journalModeBasis` / `journalBasisLabel`
+   * basis fields. A v1 artifact on disk carries NEITHER, so a reader that finds
+   * `version: 1` must treat the mode axis as NOT MEASURED rather than assume the
+   * demo pin — which is what every v1 artifact was in fact folded under, but the
+   * artifact itself does not say so and that is the whole point of this bump.
+   */
+  version: 2;
   /** Ticket that owns the artifact, so a stray file is traceable. */
   ticket: 'TRA-4914';
   /** ms-epoch the report was built. */
   generatedAt: number;
   /** ET date the report is filed under. */
   asOfDate: string;
-  /** The row basis the caller folded on (echoed, e.g. `desk+unattributed`). */
+  /**
+   * The ACCOUNT-CLASS axis of the row basis the caller folded on (echoed, e.g.
+   * `desk+unattributed`).
+   *
+   * ⚠ THIS FIELD IS SILENT ABOUT `mode` — read {@link journalModeBasis} beside
+   * it, or {@link journalBasisLabel} which carries both. Quoting this alone is
+   * the TRA-5001 defect: a demo-pinned fold and a pooled one print the same
+   * value here.
+   */
   journalBasis: string;
+  /** TRA-5001 — the MODE axis, and the count of rows the pin removed. */
+  journalModeBasis: EvalJournalModeBasis;
+  /** TRA-5001 — both axes in one string. The field to quote if you quote one. */
+  journalBasisLabel: string;
   /** Window of `closeTs` covered by the graded population; null when nothing graded. */
   window: { fromTs: number; toTs: number } | null;
   coverage: EvalCostCoverage;
@@ -1101,6 +1190,12 @@ export const EVAL_EXCLUDED_SAMPLE_MAX = 50;
 export interface BuildOptionsEvaluationReportOptions {
   asOfDate: string;
   journalBasis?: string;
+  /**
+   * TRA-5001 — the mode pin the caller applied, and how many rows it dropped.
+   * Omitted ⇒ {@link EVAL_MODE_BASIS_UNSPECIFIED}, i.e. NOT MEASURED. There is no
+   * default pin, because assuming one is the defect.
+   */
+  journalModeBasis?: EvalJournalModeBasis;
   initialEquityUsd?: number;
   now?: number;
 }
@@ -1123,13 +1218,17 @@ export function buildOptionsEvaluationReport(
   const walkForward = buildWalkForward(trades);
   const monteCarlo = buildMonteCarlo(trades, opts.initialEquityUsd ?? EVAL_DEFAULT_INITIAL_EQUITY_USD);
   const overfitting = buildOverfitting(trades, walkForward.pooledOosReturns);
+  const basis = opts.journalBasis ?? 'unspecified';
+  const modeBasis = opts.journalModeBasis ?? EVAL_MODE_BASIS_UNSPECIFIED;
 
   return {
-    version: 1,
+    version: 2,
     ticket: 'TRA-4914',
     generatedAt: opts.now ?? Date.now(),
     asOfDate: opts.asOfDate,
-    journalBasis: opts.journalBasis ?? 'unspecified',
+    journalBasis: basis,
+    journalModeBasis: modeBasis,
+    journalBasisLabel: journalBasisLabel(basis, modeBasis),
     window:
       trades.length > 0
         ? { fromTs: trades[0].closeTs, toTs: trades[trades.length - 1].closeTs }

@@ -11618,6 +11618,13 @@ app.get('/api/health/learned-weights', async (req, res) => {
 //   • `report`       — `null` when nothing has been written. Every cell inside
 //     carries its own `status` (`OK` / `INSUFFICIENT` / `NOT_MEASURED`), so a
 //     thin book is legible as thin rather than as a confident flat result.
+//
+// TRA-5001 — `journalBasisLabel` / `journalModeBasis` are echoed to the TOP LEVEL
+// rather than left nested inside `report`. The report is demo-PINNED and so
+// cannot contain a live fill; `report.journalBasis` ('desk+unattributed') names
+// only the account-class axis and reads identically for a pooled fold, which is
+// how every reader of this route took a config fact for the population. A reader
+// who never opens `report` must still be unable to miss the pin.
 app.get('/api/health/options-evaluation', async (_req, res) => {
   try {
     const artifact = await readLatestOptionsEvaluationReport();
@@ -11632,6 +11639,11 @@ app.get('/api/health/options-evaluation', async (_req, res) => {
       lastRunAsOfDate: artifact?.report.asOfDate ?? null,
       lastRunGeneratedAt: artifact?.report.generatedAt ?? null,
       lateForEtDate: artifact?.lateForEtDate ?? null,
+      // BOTH axes of the row basis (TRA-5001). `null` with no artifact — absent,
+      // not pooled. A v1 artifact predates these fields and reads `undefined`,
+      // which is NOT MEASURED and must not be read as "no pin".
+      journalBasisLabel: artifact?.report.journalBasisLabel ?? null,
+      journalModeBasis: artifact?.report.journalModeBasis ?? null,
       // Dates on disk, ascending. Gaps are GAPS — a reader must not interpolate.
       availableDates: dates,
       report: artifact?.report ?? null,

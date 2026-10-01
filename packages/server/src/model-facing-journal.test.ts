@@ -16,6 +16,7 @@ import { rm } from 'fs/promises';
 import {
   applyModelFacingBasis,
   applyModelFacingFoldBasis,
+  loadModelFacingFold,
   loadModelFacingJournal,
   loadModelFacingJournalRows,
   MODEL_FACING_JOURNAL_BASIS,
@@ -252,6 +253,32 @@ describe('TRA-2214 loadModelFacingJournal — through the real durable store', (
     const rows = await loadModelFacingJournalRows();
 
     expect(rows.map((r) => r.id)).toEqual([demo.id]);
+  });
+
+  it('TRA-5001 loadModelFacingFold returns the SAME population and counts what the pin dropped', async () => {
+    // The load-bearing claim of TRA-5001: moving the pin from the store filter to
+    // an in-memory predicate must not change WHICH rows are folded — only whether
+    // the dropped ones are countable. Asserted as an identity against
+    // `loadModelFacingJournal` over the same durable store rather than against a
+    // hand-written expectation, so the two can never drift apart silently.
+    const demo = closedRow(DESK);
+    const orphan = closedRow(UNATTRIBUTED);
+    const fixture = closedRow(FIXTURE);
+    const live = closedRow({ ...DESK, mode: 'live' });
+    const liveOrphan = closedRow({ ...UNATTRIBUTED, mode: 'live' });
+    for (const r of [demo, orphan, fixture, live, liveOrphan]) await persist(r);
+
+    const pinnedAtStore = await loadModelFacingJournal();
+    const fold = await loadModelFacingFold();
+
+    expect(fold.rows.map((r) => r.id)).toEqual(pinnedAtStore.rows.map((r) => r.id));
+    expect(fold.counts).toEqual(pinnedAtStore.counts);
+    expect(fold.basis).toBe(MODEL_FACING_JOURNAL_BASIS);
+    // ...and the number the store-filtered loader structurally cannot report.
+    // Both live rows count, including the one the account predicate would also
+    // have dropped — the mode pin runs FIRST, so it owns them.
+    expect(fold.modeExcluded).toBe(2);
+    expect(fold.rows.map((r) => r.mode)).not.toContain('live');
   });
 });
 

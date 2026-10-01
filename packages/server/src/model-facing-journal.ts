@@ -185,6 +185,39 @@ export async function loadModelFacingJournal(
   return applyModelFacingBasis(rows, basisOpts);
 }
 
+/**
+ * TRA-5001 — {@link loadModelFacingJournal}, but it also REPORTS how many rows
+ * the mode pin removed.
+ *
+ * `loadModelFacingJournal` applies the pin as the STORE filter, so the live rows
+ * never arrive and `modeExcluded` is not merely unmeasured there — it is
+ * unmeasurABLE. A caller that publishes an artifact a human grades off therefore
+ * had no number to put beside the basis label, and the options evaluation report
+ * published `desk+unattributed` — the ACCOUNT-CLASS axis, documented at
+ * {@link MODEL_FACING_JOURNAL_BASIS} as silent about `mode` — with nothing on the
+ * wire saying the fold was demo-pinned at all.
+ *
+ * So this reads POOLED and applies the pin in memory via
+ * {@link applyModelFacingFoldBasis}. The rows are IDENTICAL to
+ * `loadModelFacingJournal`'s by construction — `listOptionTradeJournal` filters
+ * with `r.mode === mode` and {@link isModelFacingModeRow} is that same test — and
+ * the journal fold is already in memory (`ensureLoaded`), so the wider read costs
+ * one extra array pass, not an extra IO.
+ *
+ * ⚠ This does NOT widen the pin, and must not be "simplified" into doing so. It
+ * is the same demo population; the only thing that changed is that the rows it
+ * dropped are now countable. `loadModelFacingJournal` is left exactly as it was
+ * for the four training consumers (TRA-2214/TRA-3831) — a publishing surface
+ * needing a census is not a reason to move the store filter out from under them.
+ */
+export async function loadModelFacingFold(
+  opts: { from?: number; to?: number; includeTest?: boolean; env?: NodeJS.ProcessEnv } = {},
+): Promise<ModelFacingFold> {
+  const { from, to, ...basisOpts } = opts;
+  const pooled = await listOptionTradeJournal({ from, to });
+  return applyModelFacingFoldBasis(pooled, basisOpts);
+}
+
 /** Convenience for the fold sites that need only the rows. */
 export async function loadModelFacingJournalRows(
   opts: { from?: number; to?: number; includeTest?: boolean; env?: NodeJS.ProcessEnv } = {},

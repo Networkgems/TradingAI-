@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   EVAL_CELL_MIN_N,
   EVAL_FEE_PER_CONTRACT_PER_SIDE_USD,
+  EVAL_MODE_BASIS_UNSPECIFIED,
   EVAL_PSR_MIN_N,
   OPTIONS_EVAL_CONSTRAINTS,
   OPTIONS_PATH_TUNED_PARAMS,
@@ -11,6 +12,7 @@ import {
   buildWalkForward,
   evaluateOptionTradeRow,
   extractEvaluatedTrades,
+  journalBasisLabel,
 } from './options-evaluation-report.js';
 import type { OptionTradeJournalRecord } from './option-trade-journal.js';
 
@@ -228,6 +230,43 @@ describe('the report as a whole', () => {
     // The constraint table must not read PASS off an empty book.
     expect(r.constraints.overall).toBe('INSUFFICIENT');
     expect(r.constraints.rows.every((row_) => row_.note.length > 0)).toBe(true);
+  });
+
+  it('TRA-5001: a caller that states no mode pin gets NOT MEASURED, never an assumed demo', () => {
+    // The default has to be the honest one. `buildOptionsEvaluationReport` does
+    // not decide which book it is grading (the pins live in
+    // model-facing-journal.ts), so inferring `demo` here because that is what the
+    // one production caller happens to pass would fabricate an attribution from
+    // silence — the CLAUDE.md health-field rule, applied to a report.
+    const r = buildOptionsEvaluationReport([], { asOfDate: '2026-09-25', now: 1 });
+    expect(r.journalBasis).toBe('unspecified');
+    expect(r.journalModeBasis).toEqual(EVAL_MODE_BASIS_UNSPECIFIED);
+    expect(r.journalModeBasis.mode).toBe('unspecified');
+    // null is NOT MEASURED — it must not render as "the pin dropped nothing".
+    expect(r.journalModeBasis.excludedRows).toBeNull();
+    expect(r.journalBasisLabel).toBe(
+      'unspecified;mode=unspecified;modeExcludedRows=NOT MEASURED',
+    );
+  });
+
+  it('TRA-5001: the composite label is DERIVED, so the two axes cannot disagree', () => {
+    // A hand-written label is how the original defect would come back: someone
+    // changes the pin and leaves the string. The label is a function of both
+    // axes, so the only way to desync it is to stop calling it.
+    const modeBasis = {
+      mode: 'live' as const,
+      excludedRows: 3510,
+      note: 'live-only sibling surface',
+    };
+    const r = buildOptionsEvaluationReport([], {
+      asOfDate: '2026-09-25',
+      now: 1,
+      journalBasis: 'desk+unattributed',
+      journalModeBasis: modeBasis,
+    });
+    expect(r.journalBasisLabel).toBe(journalBasisLabel('desk+unattributed', modeBasis));
+    expect(r.journalBasisLabel).toContain('mode=live');
+    expect(r.journalBasisLabel).toContain('modeExcludedRows=3510');
   });
 
   it('splits per-regime and buckets a pre-TRA-4912 row as unknown, never as a plausible label', () => {
