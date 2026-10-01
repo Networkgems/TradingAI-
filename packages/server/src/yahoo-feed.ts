@@ -21,6 +21,17 @@ import {
 // TRA-3805 — per-SYMBOL announcement ledger. Replaces the set-keyed dedupe that
 // sharded batches defeated on every call.
 import { announceSymbols, __resetSymbolLogDedupeForTests } from './symbol-log-dedupe.js';
+// TRA-4987 - the Tradier-scoped admissibility gate. 28% of metered Tradier spend
+// was `400 symbol not found` on the BAR paths. See that module's header for why
+// it is NOT `unservable-symbols.ts` (this suppresses one LEG, not the cascade)
+// and why it is wired on the bar paths only.
+import {
+  admitTradierSymbol,
+  isTradierSymbolNotFound,
+  noteTradierSymbolNotFound,
+  noteTradierSymbolServed,
+  getTradierSymbolAdmissibilityState,
+} from './tradier-symbol-admissibility.js';
 
 /**
  * TRA-3390 — the currency of the venue the Tradier equity adapter queries. See
@@ -348,6 +359,19 @@ function tradierBlockedUntilMax(): number {
  *  (429/5xx) OR an account-wide quota violation (surfaced as an HTTP 400 whose body
  *  contains "Quota Violation"). See TRA-1940. */
 export function shouldTripTradierBreaker(msg: string): boolean {
+  // TRA-4987 (remedy 4) — a guaranteed-`400` bad symbol must never open a breaker
+  // that exists to protect against UPSTREAM DEGRADATION. That is how a data-quality
+  // defect becomes a feed outage (TRA-4826).
+  //
+  // ⚠️ Honest about what this line is: a **PIN, not a fix**. Tradier's bad-symbol
+  // body (`Invalid parameter, ^TNX: symbol not found.`) carries neither a 429/5xx
+  // nor the word "quota", so 29,084 of them since boot tripped nothing — measured,
+  // not assumed. This makes that non-trip a property of the function rather than a
+  // coincidence of two regexes, so a future widening of the quota pattern cannot
+  // silently convert the bad-symbol storm into a breaker storm. The `quota` carve-
+  // out keeps a body that somehow states BOTH tripping, because a missed real
+  // quota violation is the expensive direction.
+  if (isTradierSymbolNotFound(msg) && !/quota/i.test(msg)) return false;
   return /HTTP\s+(429|5\d\d)/.test(msg) || /quota/i.test(msg);
 }
 function tripTradierBreaker(label: string, msg: string, source: 'quote' | 'bar'): void {
@@ -1837,6 +1861,12 @@ export function getTradierQuotaBudgetState(now: number = Date.now()): {
   /** TRA-4919 — names the local counter's population, because it is NOT "every
    *  Tradier call the process makes" and every past grade assumed it was. */
   localCounterPopulation: 'yahoo_feed_bump_sites_only';
+  /** TRA-4987 — the bad-symbol suppression's own counters, published beside the
+   *  refusal fold that measured the storm so one read grades both halves.
+   *  ⛔ ALWAYS PRESENT. An ABSENT block means the deploy predates TRA-4987 —
+   *  a different fact from `suppressed: 0`, and it must never be `?? 0`'d. Read
+   *  `evaluations` first: `0` there means the gate never ran. */
+  admissibility: ReturnType<typeof getTradierSymbolAdmissibilityState>;
 } {
   const quoteState = getTradierQuoteRateState(now);
   const upstream = getTradierUpstreamRateLimitState(); // TRA-4441
@@ -1925,6 +1955,10 @@ export function getTradierQuotaBudgetState(now: number = Date.now()): {
     localCounterAgreesWithUpstream: metered.agrees,
     capacityNumeratorSource: useMetered ? 'metered_upstream' : 'local_proxy',
     localCounterPopulation: 'yahoo_feed_bump_sites_only',
+    // TRA-4987 — the suppression's own counters. Unconditional: there is no branch
+    // on which this key is absent, so a reader that finds it missing has learned
+    // "pre-TRA-4987 build", not "nothing suppressed".
+    admissibility: getTradierSymbolAdmissibilityState(now),
   };
 }
 
@@ -2758,11 +2792,17 @@ export async function fetchShortInterestFundamentals(
  */
 export async function fetchTradierDailyCandles(symbol: string, count = 30): Promise<Candle[]> {
   if (!tradierStocksClient || isTradierBlocked()) return [];
+  // TRA-4987 — gate BEFORE `bumpFallbackCounter`: an unsent request must not show
+  // up in the local spend meter, or the reclaimed-spend figure becomes unreadable.
+  if (!admitTradierSymbol(symbol, 'history').admitted) return [];
   try {
     bumpFallbackCounter('tradier');
-    return await tradierStocksClient.getDailyBars(symbol, count);
+    const bars = await tradierStocksClient.getDailyBars(symbol, count);
+    noteTradierSymbolServed(symbol);
+    return bars;
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
+    if (isTradierSymbolNotFound(msg)) noteTradierSymbolNotFound(symbol, 'history');
     if (shouldTripTradierBreaker(msg)) tripTradierBreaker(`history(${symbol})`, msg, 'bar');
     else console.warn(`[yahoo-feed] tradier history(${symbol}) error: ${msg}`);
     return [];
@@ -2779,7 +2819,14 @@ export function isTradierDailyAvailable(): boolean {
 }
 
 export interface TradierCandleDiag {
-  reason: 'no_credentials' | 'breaker_open' | 'http_error' | 'no_data' | 'fetch_error' | 'ok';
+  /** TRA-4987 — `symbol_inadmissible`: the Tradier leg was suppressed by the
+   *  admissibility gate (bad shape, or a cached `symbol not found`). Distinct from
+   *  `no_data` (Tradier answered, with nothing) and from `fetch_error` (we spent a
+   *  request to be refused) — collapsing it into either would make the reclaimed
+   *  spend unattributable. The fallback chain below still runs. */
+  reason: 'no_credentials' | 'breaker_open' | 'http_error' | 'no_data' | 'fetch_error' | 'symbol_inadmissible' | 'ok';
+  /** TRA-4987 — which admissibility layer refused, on `symbol_inadmissible` only. */
+  inadmissibleReason?: 'index_prefix' | 'foreign_suffix' | 'symbol_not_found';
   httpStatus?: number;
   rawLen?: number;
   filteredLen?: number;
@@ -2792,12 +2839,29 @@ async function fetchTradierMinuteBars(
 ): Promise<{ bars: Candle[]; diag: TradierCandleDiag }> {
   if (!tradierStocksClient) return { bars: [], diag: { reason: 'no_credentials' } };
   if (isTradierBlocked()) return { bars: [], diag: { reason: 'breaker_open' } };
+  // TRA-4987 — THE site the storm was measured at: 29,084 `timesales`
+  // `400 symbol not found` since boot, ~18/min, ~28% of metered Tradier spend.
+  // Gated BEFORE `bumpFallbackCounter` so an unsent request never enters the local
+  // meter. Returning empty bars routes the symbol to the Yahoo / Twelve-Data legs
+  // below, which are what actually price `^TNX` — nothing loses coverage here.
+  const admission = admitTradierSymbol(symbol, 'timesales');
+  if (!admission.admitted) {
+    return {
+      bars: [],
+      diag: { reason: 'symbol_inadmissible', inadmissibleReason: admission.reason ?? undefined },
+    };
+  }
   try {
     bumpFallbackCounter('tradier');
     const bars = await tradierStocksClient.getMinuteBars(symbol, count);
+    // A 200 is proof the symbol is servable even when the series is empty (a
+    // non-printing minute), so recovery keys on the RESPONSE, not on bar count.
+    noteTradierSymbolServed(symbol);
     return { bars, diag: { reason: bars.length > 0 ? 'ok' : 'no_data', filteredLen: bars.length } };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
+    // The durable fact, learned once per TTL instead of re-paid every sweep.
+    if (isTradierSymbolNotFound(msg)) noteTradierSymbolNotFound(symbol, 'timesales');
     if (shouldTripTradierBreaker(msg)) tripTradierBreaker(`timesales(${symbol})`, msg, 'bar');
     return { bars: [], diag: { reason: 'fetch_error', errorMsg: msg } };
   }
