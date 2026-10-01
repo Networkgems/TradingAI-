@@ -80,7 +80,17 @@ describe('priceCrossedRow (TRA-4674 AC1/AC2)', () => {
 
   it('a row with no exit quote is null + exit_quote_missing — never 0', () => {
     const p = priceCrossedRow(LIVE_DESK_CLOSES[0]!); // NVTS, quoteAtFire null
-    expect(p).toEqual({ crossedPnlUsd: null, crossedR: null, crossedUnpriced: 'exit_quote_missing' });
+    // TRA-4997 — the row also carries no close-seam `exitQuote` (it predates
+    // that writer), so the verdict is unchanged and the two provenance columns
+    // beside it are null. ⛔ `crossedExitQuoteSource: null` on an unpriced row
+    // is the whole-shape assertion that no fallback quietly priced it.
+    expect(p).toEqual({
+      crossedPnlUsd: null,
+      crossedR: null,
+      crossedUnpriced: 'exit_quote_missing',
+      crossedExitQuoteSource: null,
+      crossedExitQuoteAgeMs: null,
+    });
   });
 
   it('an OPEN row, a multi-leg structure, and a missing contract count each name their reason', () => {

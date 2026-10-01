@@ -2,7 +2,7 @@ import { readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { deriveEntrySpreadPct } from '@trading-app/shared';
-import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason, OptionAdmissionStamp, OptionMarkProvenance, OptionPeakStampBasis, OptionProfitLockFire, OptionTakeProfitEarlyFire } from '@trading-app/shared';
+import type { EntryQuoteStamp, EntryQuoteSource, EntryQuoteReason, OptionAdmissionStamp, OptionExitQuote, OptionMarkProvenance, OptionPeakStampBasis, OptionProfitLockFire, OptionTakeProfitEarlyFire } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { STOP_DISTANCE_FRACTION_OF_MARK } from './option-spread-cost.js';
 import type { RiskThrottleSizingPath, RiskThrottleSizingScope } from './risk-throttle-sizing.js';
@@ -575,8 +575,48 @@ export interface OptionTradeJournalClose {
    * cost). Optional; `undefined` when no closing mark was captured. Entry + exit
    * together are the measured per-round-trip spread-cross the gate's cost model
    * can be recalibrated against.
+   *
+   * TRA-4997 — WHAT ACTUALLY WRITES THIS, and why the docblock above describes
+   * an intent nothing delivered: until TRA-4997 **no close path wrote this field
+   * at all**, so `summary.slippage.exitSampled` read `0` over 3,541 rows with
+   * `avgExitSlippageR` and `avgRoundTripCostR` both `null`. It is now written
+   * from the MEASURED half-spread of {@link exitQuote} —
+   * `((ask − bid) / 2) × contracts × 100`, positive = cost — against the same
+   * contract basis as {@link contractsAtClose}, so it is comparable with
+   * `crossedPnlUsd`. The basis is named beside it in {@link exitSlippageBasis}.
+   *
+   * ⛔ It is deliberately NOT `(mark − modelled demo fill)`. `demoSlippagePct`
+   * defaults to 0, so that expression is identically $0.00 on the demo book:
+   * the measurement would equal its own input and report "no slippage" on every
+   * trade whose slippage is unknown. Same trap, same wording, as the
+   * reconstructed-close writer refuses in `tra3485-stale-open-repair.ts`.
+   *
+   * Corollary of being a half-spread: this is ≥ 0 by construction. A favourable
+   * cross is not representable here and must not be inferred from its absence.
    */
   exitSlippageUsd?: number;
+  /**
+   * TRA-4997 — the BASIS of `exitSlippageUsd`, so the two kinds of measurement
+   * can never be averaged together unlabelled. `quote_cross` = the half-spread
+   * of the captured exit book (everything written today). `broker_fill` is
+   * reserved for a real `(mark − avg fill)` measurement off broker truth and is
+   * written by nothing yet — ⛔ absent means "no measurement", never
+   * `quote_cross` by default.
+   */
+  exitSlippageBasis?: 'quote_cross' | 'broker_fill';
+  /**
+   * TRA-4997 — THE EXIT-SIDE BOOK, captured at the close seam that EVERY close
+   * path funnels through (`queueJournalClose`), not just the exit cascade's fire
+   * site that {@link markProvenance} covers. This is what turns `crossedPnlUsd`
+   * from a 1.6%-coverage column into a measurable one; see
+   * `option-exit-quote.ts` for the measurement and `OptionExitQuote` for why
+   * `source`/`ageMs` ride along.
+   *
+   * Absent on every row closed before this shipped, and on a close whose
+   * position carried no usable two-sided quote at all. ⛔ NEVER BACKFILLED — a
+   * reconstructed book is a fabricated column, exactly as for `markProvenance`.
+   */
+  exitQuote?: OptionExitQuote;
   /**
    * TRA-3945 — the broker order id of the `sell_to_close` that realised this
    * row, when the close went through Tradier (engine-fired `pendingExit` or a
@@ -889,6 +929,15 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
   holdDays?: number;
   /** TRA-1600 (D) — measured exit-side slippage USD, folded from the CLOSE row. */
   exitSlippageUsd?: number;
+  /** TRA-4997 — the basis of `exitSlippageUsd`; absent ⇒ no measurement, never a default. */
+  exitSlippageBasis?: 'quote_cross' | 'broker_fill';
+  /**
+   * TRA-4997 — the exit-side book this row was closed against, folded from the
+   * CLOSE row. Read by `priceCrossedRow` strictly AFTER
+   * `markProvenance.quoteAtFire`, so it can only add coverage. ⛔ Never
+   * backfilled.
+   */
+  exitQuote?: OptionExitQuote;
   /** TRA-3945 — broker order id of the realising close, folded from the CLOSE row. */
   brokerOrderId?: string | number | null;
   /**
@@ -2822,9 +2871,16 @@ function foldLine(
       // `contractsAtClose` says how many lots THAT close settled, and a close
       // that was never this position's cannot testify about this one's size.
       contractsAtClose: _contractsAtClose,
+      // TRA-4997 — the superseded close's exit BOOK goes with it for exactly the
+      // same reason its money and its size do: that quote was captured at a
+      // close instant that was never this position's, so carrying it across
+      // would price the new close's cross against a book from the wrong event.
+      exitSlippageBasis: _exitSlippageBasis,
+      exitQuote: _exitQuote,
       ...kept
     } = rec;
     void _pnlBasis; void _feesUsd; void _entryFillPremium; void _exitFillPremium; void _before; void _exitSlippage; void _entryBasis; void _contractsAtClose;
+    void _exitSlippageBasis; void _exitQuote;
     map.set(line.id, {
       ...kept,
       outcome: c.outcome,
@@ -2834,6 +2890,10 @@ function foldLine(
       exitReason: c.exitReason,
       holdDays: c.holdDays,
       ...(c.exitSlippageUsd !== undefined ? { exitSlippageUsd: c.exitSlippageUsd } : {}),
+      // TRA-4997 — the SUPERSEDING close's own book and basis, or absent. Never
+      // the replaced close's (dropped in the destructure above).
+      ...(c.exitSlippageBasis !== undefined ? { exitSlippageBasis: c.exitSlippageBasis } : {}),
+      ...(c.exitQuote !== undefined ? { exitQuote: { ...c.exitQuote } } : {}),
       brokerOrderId: c.brokerOrderId ?? null,
       // TRA-4031 — the superseding close names its own basis, or the field is
       // absent (never the replaced close's).
@@ -2863,6 +2923,13 @@ function foldLine(
     // the summary rollup can decompose the round-trip cost. Only overwritten when
     // the close row carries a measurement (undefined leaves it absent).
     ...(line.close.exitSlippageUsd !== undefined ? { exitSlippageUsd: line.close.exitSlippageUsd } : {}),
+    // TRA-4997 — the basis of that measurement, and the exit BOOK it was taken
+    // from; absent stays absent on both. Copied so a replayed line cannot alias
+    // the ledger's object (same reason as `markProvenance` below).
+    ...(line.close.exitSlippageBasis !== undefined
+      ? { exitSlippageBasis: line.close.exitSlippageBasis }
+      : {}),
+    ...(line.close.exitQuote !== undefined ? { exitQuote: { ...line.close.exitQuote } } : {}),
     // TRA-3945 — the dedupe handle for the evaluation window; absent stays absent.
     ...(line.close.brokerOrderId !== undefined ? { brokerOrderId: line.close.brokerOrderId } : {}),
     // TRA-4031 — the basis the exit rule consumed; absent stays absent (a

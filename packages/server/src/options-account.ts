@@ -240,6 +240,9 @@ import type { OptionEntryProvenance } from './option-entry-provenance.js';
 // while `stopLossPremium` is still in scope. See that module for why this is
 // per-row and not a per-sleeve constant.
 import { computeOptionStopBasisR } from './option-stop-basis-r.js';
+// TRA-4997 — the exit-side quote stamp + its measured cross. Pure; imports
+// nothing back from here.
+import { resolveExitQuote, exitQuoteCrossUsd } from './option-exit-quote.js';
 // TRA-3946 — the observe-only average-down shadow (phase 1, zero capital).
 import {
   resolveAverageDownConfig,
@@ -7751,6 +7754,38 @@ export class PaperOptionsAccount {
     const unpricedClose = exitReason === 'broker_reconcile' && brokerOrderId === null;
     const realizedPnlUsd = unpricedClose ? null : (position.pnl ?? 0);
     const closeTs = position.closedAt ?? Date.now();
+    // TRA-4997 — THE ONE EXIT-QUOTE STAMP, and it is resolved HERE,
+    // SYNCHRONOUSLY, for two reasons that are both load-bearing:
+    //
+    //  • HERE, because `queueJournalClose` is the single seam every close path
+    //    funnels through — the exit cascade, the halt flatten, the manual close,
+    //    the broker reconcile, the expiry settle. Stamping at the cascade's fire
+    //    site is what `markProvenance` already does, and it is why 189 of the 228
+    //    post-TRA-4055 rows that still could not be priced at the cross were
+    //    `book_halt_flat`: that path evaluates no mark, so it stamped nothing.
+    //    Same argument as `stampExitMarkProvenance`'s header, one seam further out.
+    //
+    //  • SYNCHRONOUSLY, because the body below runs inside `journalWrites` — a
+    //    promise chain that can drain a tick or more later, by which time
+    //    `refreshOptionQuotes` has WHOLESALE-REPLACED `lastUsableQuote` with a
+    //    later pass's book. Resolving in the `.then` would stamp a quote from
+    //    after the close and call it the close's own.
+    //
+    // Fire-tick quote first (see `resolveExitQuote`): a row that priced before
+    // TRA-4997 prices off the identical number.
+    const exitQuote = resolveExitQuote({
+      closeTs,
+      fireQuote: position.exitMarkProvenance?.quoteAtFire ?? null,
+      fireQuoteAt: position.exitMarkProvenance?.at ?? null,
+      lastUsableQuote: position.lastUsableQuote ?? null,
+    });
+    // The MEASURED exit-side cross for this close, on the SAME contract basis as
+    // the TRA-4609 `contractsAtClose` column below — so `exitSlippageUsd` and
+    // `crossedPnlUsd` are charged over the same size and stay comparable.
+    // `null` — never 0 — with no book; the field and its basis then stay ABSENT,
+    // which is what keeps `exitSampled` an honest denominator.
+    const exitSlippageUsd =
+      exitQuote !== null ? exitQuoteCrossUsd(exitQuote, position.contracts) : null;
     this.journalWrites = this.journalWrites
       .then(async () => {
         // TRA-2937 — resolved inside the task, for the ordering reason spelled
@@ -7891,6 +7926,17 @@ export class PaperOptionsAccount {
           // and ⛔ a reconstructed one is a fabricated column.
           ...(position.exitMarkProvenance !== undefined
             ? { markProvenance: { ...position.exitMarkProvenance } }
+            : {}),
+          // TRA-4997 — the exit-side BOOK, and the measured cross taken off it.
+          // Deliberately a SEPARATE column from `markProvenance` above rather
+          // than a widening of it: that field's ABSENCE is the load-bearing
+          // signal "this close path evaluated no mark", and a stamp that started
+          // appearing on halt flattens and broker reconciles would have silently
+          // changed what the TRA-4055 column means. Absent stays absent on both;
+          // ⛔ neither is ever reconstructed.
+          ...(exitQuote !== null ? { exitQuote: { ...exitQuote } } : {}),
+          ...(exitSlippageUsd !== null
+            ? { exitSlippageUsd, exitSlippageBasis: 'quote_cross' as const }
             : {}),
           // TRA-4317 (AC1) — the profit-lock release level as the rule computed
           // it at the firing tick, beside the provenance of the mark it read.
@@ -8837,6 +8883,21 @@ export class PaperOptionsAccount {
    */
   refreshOptionQuotes(quotesByOcc: Map<string, { bid: number; ask: number }>): void {
     this.optionQuotes = new Map(quotesByOcc);
+    // TRA-4997 — ratchet the NEWEST USABLE book onto each open row, so a close
+    // path that evaluates no quote of its own (`closeOption`: the give-back halt
+    // flatten, the manual close, the broker reconcile — 189 of the 228
+    // post-TRA-4055 unpriceable rows) still has an exit-side book to stamp.
+    //
+    // ⛔ This does NOT weaken the wholesale-REPLACE contract above: `optionQuotes`
+    // is still cleared every pass, and nothing that prices an order, a level or a
+    // fill reads this field. It is an observe-only carry for the journal's crossed
+    // column, and it carries `at` precisely so a stale one is readable rather than
+    // silently standing in for a live one.
+    const at = Date.now();
+    for (const opt of this.openOptions.values()) {
+      const q = this.liveQuoteFor(opt);
+      if (q !== null) opt.lastUsableQuote = { bid: q.bid, ask: q.ask, at };
+    }
   }
 
   /**

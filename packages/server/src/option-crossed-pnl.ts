@@ -26,7 +26,8 @@
  *     one replacing the other.
  */
 
-import { deriveEntrySpreadPct } from '@trading-app/shared';
+import { deriveEntrySpreadPct, type OptionExitQuote } from '@trading-app/shared';
+import { EXIT_QUOTE_MAX_AGE_MS } from './option-exit-quote.js';
 
 /**
  * The structural slice of a journal record this module reads. Kept structural
@@ -48,7 +49,15 @@ export interface CrossedPricingRow {
   /** TRA-1656 scanner snapshot — the pre-stamp fallback. */
   entryBid?: number;
   entryAsk?: number;
-  markProvenance?: { quoteAtFire: { bid: number; ask: number } | null } | null;
+  markProvenance?: { quoteAtFire: { bid: number; ask: number } | null; at?: number } | null;
+  /**
+   * TRA-4997 — the exit-side quote stamped at the CLOSE SEAM, which every close
+   * path reaches (the cascade fire, the halt flatten, the manual close, the
+   * broker reconcile) rather than only the one `markProvenance` covers. Read
+   * ONLY as a fallback, strictly after `markProvenance.quoteAtFire`, so the
+   * crossed number on a row that already priced is bit-for-bit unchanged.
+   */
+  exitQuote?: OptionExitQuote | null;
 }
 
 /**
@@ -88,8 +97,14 @@ export const CROSSED_SHORT_PREMIUM_STRUCTURES: ReadonlySet<string> = new Set([
  *   • `contracts_unknown`        — pre-TRA-1656 row with no contract count.
  *   • `entry_quote_missing`      — neither the TRA-3990 stamp nor the TRA-1656
  *     snapshot carries a usable entry side (finite, > 0).
- *   • `exit_quote_missing`       — no `markProvenance.quoteAtFire` (row closed
- *     before TRA-4055, or by a path that never evaluated a mark).
+ *   • `exit_quote_missing`       — NEITHER `markProvenance.quoteAtFire` NOR the
+ *     TRA-4997 close-seam `exitQuote` carries a book: the row closed before
+ *     either stamp shipped, or on a path that captured no quote at all.
+ *   • `exit_quote_stale`         — TRA-4997: a close-seam `exitQuote` exists but
+ *     its `ageMs` exceeds `EXIT_QUOTE_MAX_AGE_MS`. A NAMED refusal, held apart
+ *     from `exit_quote_missing` on purpose: "we have a book and it is too old to
+ *     price against" and "we never had a book" license different conclusions,
+ *     and collapsing them is how a coverage gap reads as a feed outage.
  *   • `exit_quote_unusable`      — a quote was stamped but the side this
  *     structure transacts on is not a positive finite number.
  */
@@ -99,6 +114,7 @@ export type CrossedUnpricedReason =
   | 'contracts_unknown'
   | 'entry_quote_missing'
   | 'exit_quote_missing'
+  | 'exit_quote_stale'
   | 'exit_quote_unusable';
 
 /** Per-row crossed re-pricing, spread onto the `?rows=` dump. */
@@ -112,6 +128,19 @@ export interface CrossedRowPricing {
   /** `crossedPnlUsd / atRiskUsd` — same divisor as `realizedR` — 4 dp. */
   crossedR: number | null;
   crossedUnpriced: CrossedUnpricedReason | null;
+  /**
+   * TRA-4997 — WHICH exit-side book priced this row, `null` when it did not
+   * price. `fire_tick` = the quote the closing exit rule itself read (the strong
+   * case, and the only one that existed before TRA-4997); `last_known` = the
+   * newest usable book before a close path that evaluated no quote of its own.
+   *
+   * Published per row, and counted on the fold as `pricedByLastKnownQuote`,
+   * because the two are indistinguishable in the price itself — a re-grade that
+   * wants to discount the weaker half has to be able to partition it.
+   */
+  crossedExitQuoteSource: 'fire_tick' | 'last_known' | null;
+  /** TRA-4997 — `exitQuote.ageMs` of the book that priced it; `null` on a fire-tick or unpriced row. */
+  crossedExitQuoteAgeMs: number | null;
 }
 
 const roundCents = (v: number): number => Math.round(v * 100) / 100;
@@ -123,7 +152,47 @@ const unpriced = (reason: CrossedUnpricedReason): CrossedRowPricing => ({
   crossedPnlUsd: null,
   crossedR: null,
   crossedUnpriced: reason,
+  crossedExitQuoteSource: null,
+  crossedExitQuoteAgeMs: null,
 });
+
+/**
+ * TRA-4997 — the exit-side book to price this row against, with its provenance.
+ *
+ * ⛔ The precedence is load-bearing and must not be reordered: the fire-tick
+ * quote wins unconditionally, so every row that had a crossed number before
+ * TRA-4997 keeps the IDENTICAL one and the fallback can only add coverage.
+ * `{ quote: null, reason }` when nothing is usable.
+ */
+function resolveCrossedExitQuote(row: CrossedPricingRow): {
+  quote: { bid: number; ask: number } | null;
+  source: 'fire_tick' | 'last_known' | null;
+  ageMs: number | null;
+  reason: CrossedUnpricedReason | null;
+} {
+  const fire = row.markProvenance?.quoteAtFire ?? null;
+  if (fire !== null && fire !== undefined) {
+    return { quote: fire, source: 'fire_tick', ageMs: null, reason: null };
+  }
+  const stamp = row.exitQuote ?? null;
+  if (stamp === null || stamp === undefined) {
+    return { quote: null, source: null, ageMs: null, reason: 'exit_quote_missing' };
+  }
+  // A stamp whose own age is unreadable is treated as stale, not as fresh: the
+  // absence of an age is not evidence of a young quote.
+  const ageMs = typeof stamp.ageMs === 'number' && Number.isFinite(stamp.ageMs)
+    ? stamp.ageMs
+    : Number.POSITIVE_INFINITY;
+  if (ageMs > EXIT_QUOTE_MAX_AGE_MS) {
+    return { quote: null, source: null, ageMs: null, reason: 'exit_quote_stale' };
+  }
+  return {
+    quote: { bid: stamp.bid, ask: stamp.ask },
+    source: stamp.source === 'fire_tick' ? 'fire_tick' : 'last_known',
+    ageMs,
+    reason: null,
+  };
+}
 
 /** Price ONE row at the cross. Pure; fails to `null` + reason, never to 0. */
 export function priceCrossedRow(row: CrossedPricingRow): CrossedRowPricing {
@@ -142,10 +211,13 @@ export function priceCrossedRow(row: CrossedPricingRow): CrossedRowPricing {
     ? (usableSide(row.entryAskAtOpen) ? row.entryAskAtOpen : usableSide(row.entryAsk) ? row.entryAsk : null)
     : (usableSide(row.entryBidAtOpen) ? row.entryBidAtOpen : usableSide(row.entryBid) ? row.entryBid : null);
   if (entrySide === null) return unpriced('entry_quote_missing');
-  const quote = row.markProvenance?.quoteAtFire ?? null;
-  if (quote === null || quote === undefined) return unpriced('exit_quote_missing');
+  // TRA-4997 — fire-tick quote first, close-seam stamp second. See
+  // `resolveCrossedExitQuote`: the ordering is what keeps every already-priced
+  // row's number identical.
+  const resolved = resolveCrossedExitQuote(row);
+  if (resolved.quote === null) return unpriced(resolved.reason ?? 'exit_quote_missing');
   // Long sells the exit bid; short buys back the exit ask.
-  const exitSide = long ? quote.bid : quote.ask;
+  const exitSide = long ? resolved.quote.bid : resolved.quote.ask;
   if (!usableSide(exitSide)) return unpriced('exit_quote_unusable');
   const crossedPnlUsd = roundCents(
     (long ? exitSide - entrySide : entrySide - exitSide) * 100 * contracts,
@@ -154,7 +226,13 @@ export function priceCrossedRow(row: CrossedPricingRow): CrossedRowPricing {
     typeof row.atRiskUsd === 'number' && Number.isFinite(row.atRiskUsd) && row.atRiskUsd > 0
       ? Math.round((crossedPnlUsd / row.atRiskUsd) * 10_000) / 10_000
       : null;
-  return { crossedPnlUsd, crossedR, crossedUnpriced: null };
+  return {
+    crossedPnlUsd,
+    crossedR,
+    crossedUnpriced: null,
+    crossedExitQuoteSource: resolved.source,
+    crossedExitQuoteAgeMs: resolved.ageMs,
+  };
 }
 
 /**
@@ -169,6 +247,28 @@ export function priceCrossedRow(row: CrossedPricingRow): CrossedRowPricing {
 export interface CrossedFoldCells {
   /** Closed rows the re-pricing could price (both quotes + a contract count). */
   priced: number;
+  /**
+   * TRA-4997 — of `priced`, how many were priced off the FIRE-TICK quote (the
+   * book the closing exit rule itself read). Before TRA-4997 this was `priced`
+   * by construction; it is published so that stays checkable.
+   */
+  pricedByFireTickQuote: number;
+  /**
+   * TRA-4997 — of `priced`, how many were priced off a `last_known` close-seam
+   * quote instead. **The discount column.** `pricedByFireTickQuote +
+   * pricedByLastKnownQuote === priced`, always. A fold whose coverage is carried
+   * by this cell is a weaker measurement than one carried by the other, and
+   * there is nothing in `crossedPnlUsd` itself that says which you have.
+   */
+  pricedByLastKnownQuote: number;
+  /**
+   * TRA-4997 — mean `ageMs` over the `pricedByLastKnownQuote` rows; `null` when
+   * that count is 0 (⛔ never 0 — an unmeasured age must not read as a fresh
+   * quote). Seconds-scale ⇒ the fallback resolved inside the closing tick;
+   * minutes-scale ⇒ it did not, and the cross is priced against a book that may
+   * already have moved.
+   */
+  lastKnownQuoteMeanAgeMs: number | null;
   /** Closed rows it could not. priced + unpriced === closed, always. */
   unpriced: number;
   /** Census of WHY, by {@link CrossedUnpricedReason}. Sums to `unpriced`. */
@@ -198,6 +298,8 @@ export function foldCrossedCells(closedRows: CrossedPricingRow[]): CrossedFoldCe
   let win = 0;
   let loss = 0;
   let flat = 0;
+  let pricedByFireTickQuote = 0;
+  const lastKnownAges: number[] = [];
   const crossedRs: number[] = [];
   for (const row of closedRows) {
     const p = priceCrossedRow(row);
@@ -207,6 +309,13 @@ export function foldCrossedCells(closedRows: CrossedPricingRow[]): CrossedFoldCe
       continue;
     }
     priced += 1;
+    // TRA-4997 — partition the coverage by WHICH book priced it. Exhaustive by
+    // construction: a priced row always carries a source.
+    if (p.crossedExitQuoteSource === 'last_known') {
+      lastKnownAges.push(p.crossedExitQuoteAgeMs ?? 0);
+    } else {
+      pricedByFireTickQuote += 1;
+    }
     crossedSum += p.crossedPnlUsd;
     // The matched booked column: THIS row's booked P&L, because this row
     // priced. A row that did not price contributes to neither sum.
@@ -220,6 +329,12 @@ export function foldCrossedCells(closedRows: CrossedPricingRow[]): CrossedFoldCe
   const bookedPnlUsdPriced = priced > 0 ? roundCents(bookedSum) : null;
   return {
     priced,
+    pricedByFireTickQuote,
+    pricedByLastKnownQuote: lastKnownAges.length,
+    lastKnownQuoteMeanAgeMs:
+      lastKnownAges.length > 0
+        ? Math.round(lastKnownAges.reduce((a, v) => a + v, 0) / lastKnownAges.length)
+        : null,
     unpriced: closedRows.length - priced,
     unpricedReasons: reasons,
     crossedPnlUsd,
@@ -288,7 +403,10 @@ export function foldSpreadCells(closedRows: CrossedPricingRow[]): SpreadFoldCell
         : (deriveEntrySpreadPct(row.entryBidAtOpen, row.entryAskAtOpen)
           ?? deriveEntrySpreadPct(row.entryBid, row.entryAsk));
     if (stamped !== null && stamped !== undefined) entry.push(stamped);
-    const quote = row.markProvenance?.quoteAtFire;
+    // TRA-4997 — the same precedence the crossed pricing uses, so the exit-side
+    // spread distribution is measured over exactly the rows the cross priced
+    // rather than over a narrower set.
+    const quote = resolveCrossedExitQuote(row).quote;
     const exitSpread = quote ? deriveEntrySpreadPct(quote.bid, quote.ask) : null;
     if (exitSpread !== null) exit.push(exitSpread);
   }

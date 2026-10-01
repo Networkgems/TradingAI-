@@ -737,6 +737,13 @@ describe('generateEodReport — TRA-594 calendar aggregation', () => {
   // null sums (never 0) with the row named in the census.
   const noCrossedCells = () => ({
     priced: 0,
+    // TRA-4997 — the coverage partition. Both 0 here because nothing priced;
+    // the invariant `pricedByFireTickQuote + pricedByLastKnownQuote === priced`
+    // holds trivially, and `lastKnownQuoteMeanAgeMs` is null (⛔ never 0 — an
+    // unmeasured age must not read as a fresh quote).
+    pricedByFireTickQuote: 0,
+    pricedByLastKnownQuote: 0,
+    lastKnownQuoteMeanAgeMs: null,
     unpriced: 1,
     unpricedReasons: { structure_not_crossable: 1 as number },
     crossedPnlUsd: null,

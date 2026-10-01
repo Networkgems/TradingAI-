@@ -2690,6 +2690,57 @@ export interface OptionMarkProvenance {
   at: number;
 }
 /**
+ * TRA-4997 — THE EXIT-SIDE TWIN OF THE TRA-3990 ENTRY QUOTE STAMP: the two-sided
+ * book this row was closed against, captured at the close seam and folded onto
+ * the journal close row.
+ *
+ * ## Why this exists beside `OptionMarkProvenance.quoteAtFire`
+ *
+ * `quoteAtFire` is stamped by ONE seam — the exit cascade's fire site — and is a
+ * record of a DECISION. Three quarters of the book does not close there: the
+ * give-back halt flatten, the manual close and the broker reconcile all go
+ * through `closeOption`, which evaluates no mark and therefore stamps no
+ * provenance. Measured on bqb1 2026-10-01, of the 228 rows that closed after the
+ * TRA-4055 stamp shipped and still could not be priced at the cross, **189 (83%)
+ * were `book_halt_flat`** — a path with no provenance at all — and the other 39
+ * were cascade fires on a tick that served no usable quote. Both read as the one
+ * bucket `exit_quote_missing`, which is why 1,310 rows (37% of the journal) were
+ * unpriceable and `summary.slippage.exitSampled` was **0**.
+ *
+ * Widening `quoteAtFire` to cover those paths would have changed what the
+ * TRA-4055 column MEANS — its absence is the load-bearing signal "no mark was
+ * evaluated here" — so this is a separate field with its own provenance.
+ *
+ * `source` is the whole point and must never be collapsed:
+ *   • `fire_tick`  — `markProvenance.quoteAtFire`: the book the closing exit rule
+ *                    itself read. The strong case.
+ *   • `last_known` — the newest usable two-sided quote seen for this contract
+ *                    BEFORE the close (`OptionPosition.lastUsableQuote`), used
+ *                    when the closing path evaluated no quote of its own. Within
+ *                    an engine tick this is seconds old; after a dark feed it can
+ *                    be minutes. `ageMs` is what tells those apart, and a reader
+ *                    that ignores it is reading a stale bid as a live one.
+ *
+ * Observe-only. Nothing here reaches an order, a level or a cadence — the exit
+ * FILL is still whatever the close path booked; this is only what the book said.
+ */
+export interface OptionExitQuote {
+  /** Bid at `at`. May be `0` — a real, unsellable book, not a missing one. */
+  bid: number;
+  /** Ask at `at`. Always > 0 (the usability predicate rejects anything else). */
+  ask: number;
+  source: 'fire_tick' | 'last_known';
+  /** ms epoch of the quote itself. */
+  at: number;
+  /**
+   * `closeTs − at`, floored at 0. **The discount column.** `0` means the quote
+   * and the close are the same instant; a large value means this row was priced
+   * against a book that may no longer have existed. ⛔ Never defaulted — a row
+   * with no quote carries no stamp at all rather than an `ageMs` of 0.
+   */
+  ageMs: number;
+}
+/**
  * TRA-4317 (AC1) — the profit-lock give-back rule's OWN release level, stamped
  * at the tick it chose to exit. The level is the one quantity a reader of the
  * close row cannot re-derive (`markProvenance.quoteAtFire` gives the quote,
@@ -3642,6 +3693,22 @@ export interface OptionPosition {
    * row whose stop fired three ticks earlier.
    */
   exitMarkProvenance?: OptionMarkProvenance;
+  /**
+   * TRA-4997 — the NEWEST usable two-sided quote seen for this contract,
+   * ratcheted on every quote fan (`refreshOptionQuotes`) and read at the close
+   * seam to stamp {@link OptionExitQuote} when the closing path evaluated no
+   * quote of its own (the halt flatten, the manual close, the broker reconcile).
+   *
+   * Deliberately the OPPOSITE contract to `exitMarkProvenance`: this one IS
+   * re-stamped every tick, because it is a record of the BOOK and not of a
+   * decision, and `at` is what makes a stale one readable. ⛔ It must never be
+   * read as "the quote at the close" without checking `at` — that substitution
+   * is the whole reason the quote fan itself is a wholesale REPLACE (TRA-3502).
+   *
+   * Observe-only. ⛔ No order, level or fill price may be derived from this: a
+   * price the book will be EXITED at must come from the tick's own quote.
+   */
+  lastUsableQuote?: { bid: number; ask: number; at: number };
   /**
    * TRA-4317 (AC1) — the profit-lock release level at the tick the give-back
    * rule fired, stamped beside `exitMarkProvenance` (first fire only, same
