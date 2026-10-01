@@ -221,12 +221,29 @@ export { findOrderBlocks, parseDeployOrder, lineOrdersDeploy, classifyCarrier };
  * (both objects can be present while the path between them is cut). A graft falling
  * through to 'absent' here manufactured STRANDED against a train that was obeyed on time.
  *
+ * ⛔ TRA-4942: `ancestryOracle` IS THE CONTROLS' ONLY SEAM, AND THE TRA-3740 REWRITE CUT IT.
+ * That rewrite replaced the injected `isAncestor` with a direct `libGradedAncestry` call —
+ * correct for production (the library is the shallow-aware remedy) but it made this function
+ * read the REAL repository unconditionally. The controls grade synthetic SHAs
+ * (`65fdb95aaa…`, `deadbeef…`, live `c44a8900…`) that exist in NO checkout by construction,
+ * so every one of them came back `answer: null` ⇒ `blind` ⇒ `VERDICT = BLIND, 11 controls
+ * failed` — in EVERY checkout, shallow or not, since the rewrite. Measured 2026-10-01 in a
+ * checkout with `is-shallow-repository = false` where the real carrier SHAs resolve fine, so
+ * the standing diagnosis ("the TRA-3740 shallow condition in this checkout") was wrong on
+ * both counts: not shallow, not checkout-local.
+ *
+ * The seam is therefore re-opened as a SEPARATE, OPTIONAL parameter rather than by honouring
+ * `knownSha`/`isAncestor` again — reviving those screens would re-introduce the graft hole
+ * TRA-3740 closed (both objects can be present while the path between them is cut). The
+ * default IS the library, and no production call site passes an oracle.
+ *
+ * @param {(held: string, target: string) => {answer: boolean|null}} [ancestryOracle]
  * @returns {'present'|'absent'|'blind'}
  */
-export function gradeAncestry({ commit, liveSha, knownSha, isAncestor }) {
+export function gradeAncestry({ commit, liveSha, ancestryOracle = libGradedAncestry }) {
   // The library function is the canonical remedy (TRA-3699, TRA-3721).
   // It handles object presence, shallow detection, and unrelated-graph detection.
-  const { answer } = libGradedAncestry(commit, liveSha);
+  const { answer } = ancestryOracle(commit, liveSha);
   if (answer === true) return 'present';
   if (answer === false) return 'absent';
   return 'blind'; // answer === null
@@ -265,7 +282,7 @@ export function humanGap(ms) {
  *
  * @returns {{ timing: 'on_time'|'late'|'unread', timingDetail: string }}
  */
-export function gradeTiming({ order, deploys, knownSha, isAncestor, historyHost = null }) {
+export function gradeTiming({ order, deploys, knownSha, ancestryOracle = libGradedAncestry, historyHost = null }) {
   if (historyHost && order?.host && order.host !== historyHost) {
     return {
       timing: 'unread',
@@ -289,7 +306,7 @@ export function gradeTiming({ order, deploys, knownSha, isAncestor, historyHost 
   // instead of timing='on_time', which then lets a stranded verdict through.
   const carries = (d) => {
     if (typeof d.commit !== 'string') return false;
-    const { answer } = libGradedAncestry(order.commit, d.commit);
+    const { answer } = ancestryOracle(order.commit, d.commit);
     return answer === true; // null (blind/shallow) fails closed to false
   };
   const carrying = served.filter(carries).sort((a, b) => a.finishedMs - b.finishedMs);
@@ -343,7 +360,7 @@ export function gradeTiming({ order, deploys, knownSha, isAncestor, historyHost 
  * @returns {{ verdict, finding: boolean, ungraded: boolean, timing: 'unread'|'n/a', detail: string }}
  *   verdict ∈ SATISFIED | PENDING | STRANDED | UNGRADEABLE | AMBIGUOUS | NOT_TRAIN | BLIND
  */
-export function gradeCarrier({ description, nowMs, liveSha, knownSha, isAncestor, deploys = null, historyHost = null }) {
+export function gradeCarrier({ description, nowMs, liveSha, knownSha, ancestryOracle = libGradedAncestry, deploys = null, historyHost = null }) {
   const cls = classifyCarrier(description);
   if (cls.kind === 'not-train') {
     return { verdict: 'NOT_TRAIN', finding: false, late: false, ungraded: false, timing: 'n/a', detail: cls.reason, span: cls.span };
@@ -374,7 +391,7 @@ export function gradeCarrier({ description, nowMs, liveSha, knownSha, isAncestor
   }
 
   const { order } = parsed;
-  const ancestry = gradeAncestry({ commit: order.commit, liveSha, knownSha, isAncestor });
+  const ancestry = gradeAncestry({ commit: order.commit, liveSha, ancestryOracle });
   if (ancestry === 'blind') {
     return {
       verdict: 'BLIND',
@@ -397,7 +414,7 @@ export function gradeCarrier({ description, nowMs, liveSha, knownSha, isAncestor
     let timingDetail = null;
     if (pastDeadline) {
       if (Array.isArray(deploys)) {
-        ({ timing, timingDetail } = gradeTiming({ order, deploys, knownSha, isAncestor, historyHost }));
+        ({ timing, timingDetail } = gradeTiming({ order, deploys, knownSha, ancestryOracle, historyHost }));
       } else {
         timing = 'unread';
         timingDetail = 'no Render deploy history read — pass --render-key or set RENDER_API_KEY to add the timing arm';
@@ -473,6 +490,14 @@ const NOT_IN_LIVE = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
 const stubKnown = (s) => [LIVE, IN_LIVE, NOT_IN_LIVE].includes(s);
 const stubAncestor = (a, b) => b === LIVE && a === IN_LIVE;
 
+// TRA-4942: the graders take an ancestry ORACLE, not an `isAncestor` boolean, because the
+// library answer is three-state. This stub reproduces exactly that: a definite answer only
+// when BOTH objects are fixtures, `null` (blind) otherwise — which is what makes the
+// "a pre-deadline deploy whose commit is UNKNOWN to the checkout" control a real negative
+// rather than an artefact of the fixture SHAs being absent from the real repo.
+const stubOracle = (a, b) =>
+  stubKnown(a) && stubKnown(b) ? { answer: stubAncestor(a, b) } : { answer: null };
+
 const orderBlock = (commit, deadline) =>
   ['```deploy-order', `commit: ${commit}`, 'host: tradingai-bqb1', `deadline: ${deadline}`, '```'].join('\n');
 
@@ -483,7 +508,7 @@ const CONTROLS = [
       expect(
         gradeCarrier({
           description: `Deploy to bqb1 before the open.\n\n${orderBlock(NOT_IN_LIVE, '2026-08-13T11:00:00Z')}`,
-          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
         }),
         (r) => r.verdict === 'STRANDED' && r.finding === true,
       ),
@@ -494,7 +519,7 @@ const CONTROLS = [
       expect(
         gradeCarrier({
           description: `Deploy to bqb1 before the open.\n\n${orderBlock(IN_LIVE, '2026-08-13T11:00:00Z')}`,
-          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
         }),
         (r) => r.verdict === 'SATISFIED' && r.finding === false,
       ),
@@ -505,7 +530,7 @@ const CONTROLS = [
       expect(
         gradeCarrier({
           description: orderBlock(IN_LIVE, '2026-08-13T11:00:00Z'),
-          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
         }),
         (r) => r.verdict === 'SATISFIED' && r.timing === 'unread',
       ),
@@ -539,7 +564,7 @@ const CONTROLS = [
       expect(
         gradeCarrier({
           description: 'One-shot: post-RTH deploy 65fdb95 to bqb1 via scripts/render-redeploy.mjs.',
-          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
         }),
         // The two buckets must be DISJOINT. If `finding` ever went true here, a migration
         // backlog of eighteen would report as eighteen stranded deploys and the exit code
@@ -553,7 +578,7 @@ const CONTROLS = [
       expect(
         gradeCarrier({
           description: orderBlock('abc1234', '2026-08-13T11:00:00Z'),
-          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
         }),
         (r) => r.verdict === 'BLIND' && r.finding === false,
       ),
@@ -576,7 +601,7 @@ const CONTROLS = [
       expect(
         gradeCarrier({
           description: orderBlock(NOT_IN_LIVE, '2026-08-13T23:00:00Z'),
-          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
         }),
         (r) => r.verdict === 'PENDING' && r.finding === false,
       ),
@@ -607,7 +632,7 @@ const CONTROLS = [
       expect(
         gradeCarrier({
           description: orderBlock(IN_LIVE, '2026-08-13T11:00:00Z'),
-          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
           deploys: [
             { commit: LIVE, status: 'live', finishedAt: '2026-08-13T11:45:00Z' },
             { commit: NOT_IN_LIVE, status: 'deactivated', finishedAt: '2026-08-13T09:00:00Z' },
@@ -622,7 +647,7 @@ const CONTROLS = [
       expect(
         gradeCarrier({
           description: orderBlock(IN_LIVE, '2026-08-13T11:00:00Z'),
-          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
           deploys: [
             { commit: LIVE, status: 'live', finishedAt: '2026-08-13T10:30:00Z' },
             { commit: NOT_IN_LIVE, status: 'deactivated', finishedAt: '2026-08-13T09:00:00Z' },
@@ -637,7 +662,7 @@ const CONTROLS = [
       expect(
         gradeCarrier({
           description: orderBlock(IN_LIVE, '2026-08-13T11:00:00Z'),
-          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
           deploys: [{ commit: LIVE, status: 'live', finishedAt: '2026-08-13T11:45:00Z' }],
         }),
         (r) => r.timing === 'unread' && r.late === false,
@@ -649,7 +674,7 @@ const CONTROLS = [
       expect(
         gradeCarrier({
           description: orderBlock(IN_LIVE, '2026-08-13T11:00:00Z'),
-          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
           deploys: [
             { commit: LIVE, status: 'live', finishedAt: '2026-08-13T11:45:00Z' },
             { commit: 'facefeed'.repeat(5), status: 'deactivated', finishedAt: '2026-08-13T10:00:00Z' },
@@ -664,7 +689,7 @@ const CONTROLS = [
       expect(
         gradeCarrier({
           description: orderBlock(IN_LIVE, '2026-08-13T11:00:00Z'),
-          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
           deploys: [
             { commit: LIVE, status: 'build_failed', finishedAt: '2026-08-13T10:00:00Z' },
             { commit: NOT_IN_LIVE, status: 'deactivated', finishedAt: '2026-08-13T09:30:00Z' },
@@ -680,7 +705,7 @@ const CONTROLS = [
       expect(
         gradeCarrier({
           description: ['```deploy-order', `commit: ${IN_LIVE}`, 'host: some-other-service', 'deadline: 2026-08-13T11:00:00Z', '```'].join('\n'),
-          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
           historyHost: 'tradingai-bqb1',
           deploys: [{ commit: LIVE, status: 'live', finishedAt: '2026-08-13T11:45:00Z' }],
         }),
@@ -693,7 +718,7 @@ const CONTROLS = [
       expect(
         gradeCarrier({
           description: orderBlock(IN_LIVE, '2026-08-13T11:00:00Z'),
-          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
         }),
         (r) => r.timing === 'unread' && r.late === false,
       ),
@@ -704,7 +729,7 @@ const CONTROLS = [
       expect(
         gradeCarrier({
           description: 'Re-check the journal cross-tab and post the numbers.',
-          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, ancestryOracle: stubOracle,
         }),
         (r) => r.verdict === 'NOT_TRAIN' && r.finding === false,
       ),
@@ -752,7 +777,10 @@ const timingTag = (r) => {
 };
 
 const knownSha = (s) => git(['cat-file', '-e', `${s}^{commit}`]).ok;
-const isAncestor = (a, b) => git(['merge-base', '--is-ancestor', a, b]).ok;
+// ⛔ There is deliberately NO `isAncestor` here. A bare `merge-base --is-ancestor .ok` is the
+// graft hole TRA-3740 closed, and leaving one defined invites a call site to pass it as the
+// oracle. The production graders take the default `ancestryOracle` — the shallow-aware
+// library — and the only thing that ever overrides it is the control stub (TRA-4942).
 
 async function getJson(url, headers) {
   const res = await fetch(url, { headers });
@@ -920,7 +948,7 @@ async function main() {
       console.error(`[train] ERROR reading ${ident}: ${err.message}`);
       return EXIT_ERROR;
     }
-    const g = gradeCarrier({ description: issue?.description, nowMs: Date.now(), liveSha, knownSha, isAncestor, deploys, historyHost: ORDER_HOST });
+    const g = gradeCarrier({ description: issue?.description, nowMs: Date.now(), liveSha, knownSha, deploys, historyHost: ORDER_HOST });
     console.log(`[train] single issue ${issue?.identifier || ident} — ${issue?.title || ''}`);
     console.log(`[train]   VERDICT = ${g.verdict}${timingTag(g)}`);
     console.log(`[train]   ${g.detail}`);
@@ -1000,7 +1028,7 @@ async function main() {
       rows.push({ ...c, identifier: c.issueId, verdict: 'BLIND', finding: false, detail: `carrier unreadable: ${err.message}` });
       continue;
     }
-    const g = gradeCarrier({ description: issue?.description, nowMs, liveSha, knownSha, isAncestor, deploys, historyHost: ORDER_HOST });
+    const g = gradeCarrier({ description: issue?.description, nowMs, liveSha, knownSha, deploys, historyHost: ORDER_HOST });
     rows.push({ ...c, identifier: issue?.identifier || c.issueId, status: issue?.status, startedAt: issue?.startedAt ?? null, ...g });
   }
 
