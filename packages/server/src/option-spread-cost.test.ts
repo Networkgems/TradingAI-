@@ -831,6 +831,42 @@ const directionalWriterCensus = (src: string) => ({
   ceilingCallSites: (src.match(/this\.spreadCeilingRejectReason\(/g) ?? []).length,
 });
 
+/**
+ * TRA-5021 — are `lines[a]` and `lines[b]` properties of the SAME object literal?
+ *
+ * Walks the bracket depth strictly BETWEEN the two lines, over source with line comments
+ * and quoted strings removed (a `{` inside a comment or a string is not structure — and
+ * `signal-engine.ts` has plenty of both). Same literal iff the depth returns to zero and
+ * never dips below it:
+ *   • dips negative ⇒ the first stamp's literal CLOSED before the second stamp;
+ *   • ends positive ⇒ the second stamp was pushed into a NESTED literal.
+ * A balanced excursion in between (an inline arrow body, a nested sibling object) nets to
+ * zero and is correctly read as "still siblings".
+ *
+ * Deliberately not a line-distance bar: comments and new sibling keys must be free, and
+ * only a genuine re-nesting may turn this red. Proven in both directions by the CONTROL
+ * case below.
+ */
+const sameObjectLiteral = (lines: string[], a: number, b: number): boolean => {
+  const [lo, hi] = a <= b ? [a, b] : [b, a];
+  let depth = 0;
+  for (const raw of lines.slice(lo + 1, hi)) {
+    const code = raw
+      .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+      .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+      .replace(/`(?:[^`\\]|\\.)*`/g, '``')
+      .replace(/\/\/.*$/, '');
+    for (const ch of code) {
+      if (ch === '{' || ch === '[' || ch === '(') depth += 1;
+      else if (ch === '}' || ch === ']' || ch === ')') {
+        depth -= 1;
+        if (depth < 0) return false; // the enclosing literal closed between them
+      }
+    }
+  }
+  return depth === 0;
+};
+
 describe('single_leg_directional writer census (TRA-2306)', () => {
   const engineSrc = readFileSync(new URL('./signal-engine.ts', import.meta.url), 'utf8');
   const census = directionalWriterCensus(engineSrc);
@@ -867,18 +903,67 @@ describe('single_leg_directional writer census (TRA-2306)', () => {
   it('the gated structure stamp and the gated archetype stamp are the SAME object literal', () => {
     // TRA-2306's description leans on this: forward of the TRA-2245 cutover the two
     // axes agree BY CONSTRUCTION on in-scope rows, which is why a disagreement between
-    // them on Monday is a FINDING rather than a tiebreak. Written as a proximity check
-    // because that is the durable form — adjacent keys in one literal, not a line number.
+    // them on Monday is a FINDING rather than a tiebreak.
+    //
+    // ⚠️ REPAIRED 2026-10-01 (TRA-5021). This was written as `Math.abs(a - b) <= 20` —
+    // a PROXIMITY PROXY for "one literal" — and the header above argues against exactly
+    // that: a line-distance bar is a line number wearing a disguise. It was authored at
+    // `ff12988d` when the true distance was 8, so it carried 12 lines of headroom, and
+    // `b91bf82c` (TRA-4912, 09-25) spent all of it in one go by inserting a 15-line
+    // comment plus the `entryProvenance:` sibling key between the two stamps — distance
+    // 8 → 24, RED, while the invariant it stands for was never touched. Invisible for a
+    // week because `check:deploy-build` runs `tsc -b --force`, which type-checks test
+    // files without executing them.
+    //
+    // Now measured STRUCTURALLY, so comments and new sibling keys cannot move it and only
+    // a real re-nesting can: between the two stamps the brace/bracket depth must net to
+    // ZERO and must never go negative. Negative ⇒ the earlier literal closed, so the
+    // later stamp lives in a different one. Positive-and-unreturned ⇒ the later stamp was
+    // pushed down into a nested literal. Either is the failure this test exists to catch.
     const lines = engineSrc.split('\n');
     const structureLine = lines.findIndex((l) => /structureLabel:\s*DIRECTIONAL_STRUCTURE_LABEL/.test(l));
     const archetypeLine = lines.findIndex((l) => /entryArchetype:\s*'directional'/.test(l));
     expect(structureLine).toBeGreaterThan(-1);
     expect(archetypeLine).toBeGreaterThan(-1);
     expect(
-      Math.abs(structureLine - archetypeLine),
+      sameObjectLiteral(lines, archetypeLine, structureLine),
       'The gated archetype stamp and the gated structure stamp are no longer in one object '
         + 'literal. They can now disagree on a row, which breaks TRA-2306 read #2.',
-    ).toBeLessThanOrEqual(20);
+    ).toBe(true);
+  });
+
+  // The discriminator for the check above. A structural check that cannot report `false`
+  // is the same silent green as a stale numeric bar, so prove both directions on synthetic
+  // sources rather than trusting that the live one happens to exercise them.
+  it('CONTROL — the same-literal check reports FALSE when the stamps really do split', () => {
+    const find = (src: string[]) => [
+      src.findIndex((l) => /entryArchetype:/.test(l)),
+      src.findIndex((l) => /structureLabel:/.test(l)),
+    ] as const;
+    const run = (src: string[]) => {
+      const [a, s] = find(src);
+      return sameObjectLiteral(src, a, s);
+    };
+    // One literal, separated by a comment and a sibling key — the TRA-4912 shape. TRUE.
+    expect(run([
+      'const signal = {', "  entryArchetype: 'directional',", '  // a comment',
+      '  entryProvenance: build(x),', '  structureLabel: LABEL,', '};',
+    ])).toBe(true);
+    // TWO literals — the regression. The first closes before the second opens. FALSE.
+    expect(run([
+      'const a = {', "  entryArchetype: 'directional',", '};',
+      'const b = {', '  structureLabel: LABEL,', '};',
+    ])).toBe(false);
+    // Re-nested into a child literal — also a split. FALSE.
+    expect(run([
+      'const signal = {', "  entryArchetype: 'directional',", '  nested: {',
+      '    structureLabel: LABEL,', '  },', '};',
+    ])).toBe(false);
+    // A brace that opens AND closes in between (an inline fn) must not fool it. TRUE.
+    expect(run([
+      'const signal = {', "  entryArchetype: 'directional',", '  onFill: () => { emit(); },',
+      '  structureLabel: LABEL,', '};',
+    ])).toBe(true);
   });
 
   // ── the failing state, demonstrated ───────────────────────────────────────

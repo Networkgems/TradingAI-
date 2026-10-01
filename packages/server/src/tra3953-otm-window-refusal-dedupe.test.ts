@@ -52,6 +52,30 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // another (TRA-3942's note, and it applies verbatim here).
 const ENGINE_SRC = readFileSync(join(HERE, 'signal-engine.ts'), 'utf8').replace(/\r\n/g, '\n');
 
+/**
+ * TRA-5021 — every `signalSkipReasonCode` assignment in `src`, as a WHOLE STATEMENT
+ * (match → the terminating `;`) with runs of whitespace collapsed to one space.
+ *
+ * Statement-scoped, not line-scoped, on purpose: the previous version sliced to the
+ * next `\n`, so an assignment whose RHS wrapped onto the following line reduced to the
+ * bare fragment `signal.signalSkipReasonCode =` and could not match ANY allow-list
+ * entry. That is a census a writer defeats with a line break — and one did.
+ */
+const skipReasonCodeAssignments = (src: string): string[] =>
+  [...src.matchAll(/signalSkipReasonCode\s*=/g)].map((m) => {
+    const end = src.indexOf(';', m.index!);
+    return src.slice(m.index!, end === -1 ? src.length : end + 1).replace(/\s+/g, ' ');
+  });
+
+/**
+ * The permitted right-hand sides. Every one is a NAMED code resolved by the module that
+ * owns the vocabulary — never a literal spelled at the stamp site. A new writer joins
+ * this list only after someone has established it is not a second producer of
+ * `entry_window_closed` (which the `windowStamps` count guards independently).
+ */
+const ALLOWED_SKIP_REASON_WRITERS =
+  /= (OTM_ENTRY_WINDOW_CLOSED_CODE|otmFloorPick\.code|setupDecision\.skipReasonCode|this\.lastCostGateRefusal\?\.reasonCode \?\? COST_BAR_DEFAULT_REFUSAL_CODE);/;
+
 const RULING = resolveOtmEntryWindows({} as NodeJS.ProcessEnv);
 const MIN = 60_000;
 
@@ -364,17 +388,50 @@ describe('TRA-3953 — the predicate is WIRED into the OTM dedup', () => {
     // producer. Assert that, not the field's writer count.
     const windowStamps = [...ENGINE_SRC.matchAll(/signalSkipReasonCode\s*=\s*OTM_ENTRY_WINDOW_CLOSED_CODE/g)];
     expect(windowStamps).toHaveLength(1);
-    const allStamps = [...ENGINE_SRC.matchAll(/signalSkipReasonCode\s*=/g)];
-    for (const m of allStamps) {
-      const line = ENGINE_SRC.slice(m.index!, ENGINE_SRC.indexOf('\n', m.index!));
+    for (const stmt of skipReasonCodeAssignments(ENGINE_SRC)) {
       // Every other writer stamps a NAMED code from another module, never a literal.
       // TRA-4422 added a THIRD writer (the setup taxonomy), and it joins this
       // roster rather than being exempted from it: `skipReasonCode` is resolved
       // inside `otm-setup-gate.ts`, which owns the vocabulary, precisely so this
       // line stays a named read. A census a new writer can slip past silently is
       // not a census.
-      expect(line).toMatch(/= (OTM_ENTRY_WINDOW_CLOSED_CODE|otmFloorPick\.code|setupDecision\.skipReasonCode);/);
+      //
+      // ⚠️ REPAIRED 2026-10-01 (TRA-5021) on TWO axes, because fixing either one
+      // alone leaves this broken:
+      //  (1) It sliced the match to the next `\n`, i.e. ONE PHYSICAL LINE. When
+      //      `26745612` (TRA-4974, 10-01) added a writer whose RHS wraps to the
+      //      following line, the slice yielded the bare fragment
+      //      `signal.signalSkipReasonCode =` — which no allow-list entry can ever
+      //      match. So the census was defeated by a LINE BREAK: any future writer
+      //      could have slipped past simply by wrapping. Now sliced to the
+      //      statement's `;` and whitespace-normalised.
+      //  (2) That writer is also a genuine FOURTH producer
+      //      (`lastCostGateRefusal?.reasonCode ?? COST_BAR_DEFAULT_REFUSAL_CODE`),
+      //      so it joins the roster. It is NOT a second producer of the window
+      //      code — `COST_BAR_DEFAULT_REFUSAL_CODE` is `'cost_bar_blocked'`, and
+      //      it sits BELOW the window gate's own `continue`, so it is unreachable
+      //      on a window refusal. `windowStamps` above still reads exactly 1.
+      expect(stmt).toMatch(ALLOWED_SKIP_REASON_WRITERS);
     }
+  });
+
+  // The census above is only as good as its ability to report a violation. Axis (1)
+  // was a silent-green hole for a day, so pin both directions on synthetic sources.
+  it('CONTROL — the census catches a rogue writer, including one that wraps its RHS', () => {
+    const rogueSameLine = "        signal.signalSkipReasonCode = 'entry_window_closed';";
+    const rogueWrapped = '        signal.signalSkipReasonCode =\n          someOtherGate.code;';
+    for (const src of [rogueSameLine, rogueWrapped]) {
+      const found = skipReasonCodeAssignments(src);
+      expect(found).toHaveLength(1);
+      // THE FAILING STATE: a rogue writer is seen AND rejected. Before the TRA-5021
+      // repair the wrapped case produced `signal.signalSkipReasonCode =` and would
+      // have been reported as the same unmatchable fragment as a legitimate writer,
+      // which is indistinguishable from the census working.
+      expect(found[0]).not.toMatch(ALLOWED_SKIP_REASON_WRITERS);
+    }
+    // ...and a legitimate wrapped writer PASSES, which is the regression axis (1) left.
+    const legit = '        signal.signalSkipReasonCode =\n          this.lastCostGateRefusal?.reasonCode ?? COST_BAR_DEFAULT_REFUSAL_CODE;';
+    expect(skipReasonCodeAssignments(legit)[0]).toMatch(ALLOWED_SKIP_REASON_WRITERS);
   });
 });
 

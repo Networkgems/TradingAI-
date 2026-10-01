@@ -318,9 +318,20 @@ describe('TRA-3944 AC4 — source-level: arm / row size / 2-row cap untouched; o
 
   it('both open sites carry the per-entry cap; the live count is capped AFTER the canary sizing, not instead of it', () => {
     expect(ENGINE_SRC).toContain('otmFloor.maxContractsPerEntry,');
-    const live = ENGINE_SRC.indexOf('const testContracts = capOtmEntryContracts(');
-    expect(live).toBeGreaterThan(-1);
-    expect(ENGINE_SRC.slice(live, live + 200)).toContain('resolveLiveOptionTestContracts(askLimit, notionalCap, maxContracts)');
+    // ⚠️ REPAIRED 2026-10-01 (TRA-5021). This read
+    // `indexOf('const testContracts = capOtmEntryContracts(')` — a literal that
+    // pinned the BINDING NAME, which is not the invariant. `c8488569`
+    // (TRA-3401, 09-24) renamed it `testContracts` → `sizedTestContracts` to
+    // layer a strictly-tightening `Math.min(1, …)` one-shot clamp on top, and
+    // this went RED for a week over a rename while the cap it guards survived
+    // byte-identical. (Invisible for the usual reason — see the AC4 note below.)
+    //
+    // Now asserts the NESTING, which is the actual rule: the per-entry cap must
+    // WRAP the canary sizing — `cap(size(...), otmFloor)` — so the cap is
+    // applied AFTER sizing rather than instead of it. Rename-proof; still red if
+    // anyone unwraps it, reorders the arguments, or drops the `otmFloor` bound.
+    const capWrapsSizing = /capOtmEntryContracts\(\s*resolveLiveOptionTestContracts\(askLimit, notionalCap, maxContracts\),\s*otmFloor,\s*\)/;
+    expect(ENGINE_SRC, 'the per-entry cap no longer wraps the canary sizing').toMatch(capWrapsSizing);
     // The account applies the cap as min(), after sizing and after the bounded override.
     expect(ACCOUNT_SRC).toContain("capOtmEntryContracts(throttled, { maxContractsPerEntry: maxContracts })");
   });

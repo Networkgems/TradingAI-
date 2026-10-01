@@ -308,8 +308,20 @@ describe('TRA-3942 AC1 — an EXIT at 13:45Z still fires', () => {
     // them: a test that compiles and fails is invisible to `check:deploy-build`
     // by construction. A roster a new importer must join is doing its job; one
     // that is already red is a roster nobody reads.
+    //
+    // ⚠️ REPAIRED AGAIN 2026-10-01 (TRA-5021), same shape, same blind spot:
+    // `card-completeness-ledger.ts` (TRA-4936, `47d16a9b`, 10-01) joined the
+    // roster. It imports the `OTM_ENTRY_WINDOW_CLOSED_CODE` CONSTANT — not a
+    // predicate, not a verdict function — and has exactly one call site, a pure
+    // `===` that buckets an ALREADY-DECIDED `skipReasonCode` as
+    // `out_of_window` / `in_window` for the per-ET-day completeness fold. It
+    // reads no clock and cannot PRODUCE a window decision, only classify one;
+    // the file contains zero occurrences of `checkExits` / `closeOption` /
+    // `sell_to_close`, and neither `options-account.ts` nor
+    // `exit-risk-rules-flag.ts` imports it, so there is no transitive exit
+    // reach either. Invariant held; the literal was stale.
     expect(importers.sort()).toEqual([
-      'index.ts', 'otm-evaluation-window.ts', 'signal-engine.ts',
+      'card-completeness-ledger.ts', 'index.ts', 'otm-evaluation-window.ts', 'signal-engine.ts',
     ]);
     expect(importers).not.toContain('options-account.ts');
     expect(importers).not.toContain('exit-risk-rules-flag.ts');

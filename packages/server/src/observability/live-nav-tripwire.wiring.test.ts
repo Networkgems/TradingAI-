@@ -292,7 +292,29 @@ describe('TRA-3449 wiring — the route exists and reports a non-run', () => {
   it('reports VACUOUS through the route when the denominator is empty', async () => {
     // The route summarises the last 45 CALENDAR days ending today, so every session in that
     // window has to carry a row — otherwise `missing` makes the fold `blind` and the vacuity
-    // prose is never reached. Filled relative to the real clock so this does not rot.
+    // prose is never reached.
+    //
+    // ⚠️ REPAIRED 2026-10-01 (TRA-5021) — this was a TIME BOMB, and it had already gone off.
+    // The rows were written at `Date.now() - back * 86_400_000` under a comment claiming
+    // "filled relative to the real clock so this does not rot", while the READER was
+    // `register()`, whose default freezes the route's clock at 2026-08-12. Relative writer,
+    // absolute reader: the two windows drifted apart by one day per day. On 2026-09-27 —
+    // the first day on which `Date.now() − 45d > 2026-08-12` — the row span (08-17→10-01)
+    // stopped overlapping the route window (06-29→08-12) at all, every session in the
+    // window became `not_measured`, `sessions.length === 0`, and the fold returned the
+    // `null` "NOT MEASURED" verdict instead of `vacuous`. Permanently red from that date
+    // on, and it can never self-heal.
+    //
+    // ⚠️ It is NOT flaky and it is NOT a regression: nothing had touched
+    // `live-nav-tripwire-ledger.ts` or `health-routes.ts` for 36 days when it started
+    // failing, and `expect(grade.verdict).toBe('vacuous')` below still passes — the
+    // shipped grader is intact. Only this fixture's clocks disagreed. (It was filed as one
+    // of "2 flaky files" on TRA-5021 precisely because a date-dependent failure LOOKS
+    // intermittent across runs on different days.)
+    //
+    // Both clocks are now the SAME pinned instant, so the test is date-independent: it
+    // cannot rot, and it cannot pass or fail depending on when CI happens to run.
+    const readAt = Date.parse('2026-08-12T21:30:00-04:00');
     const grade = gradeLiveNavTripwirePayload({
         ungradeableFields: [],
         livePriorOptionsLagOk: true, // the vacuous true
@@ -321,10 +343,10 @@ describe('TRA-3449 wiring — the route exists and reports a non-run', () => {
       recordLiveNavTripwireAssertion({
         grade,
         source: 'served',
-        now: Date.now() - back * 86_400_000,
+        now: readAt - back * 86_400_000,
       });
     }
-    const routes = register();
+    const routes = register(readAt);
     const res = fakeRes();
     await routes.get('/api/health/live-nav-tripwire')![0]!({ query: {} }, res);
     const body = res.body as {
