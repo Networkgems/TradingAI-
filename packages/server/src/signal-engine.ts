@@ -15322,7 +15322,9 @@ export class SignalEngine {
           // this buys is `builtInWindow > 0` on TRA-4936's per-ET-day fold: the
           // in-window funnel becomes readable for the first time, instead of
           // reporting a zero that a genuinely dead scanner would produce
-          // identically. The remaining pins are filed separately (TRA-4975).
+          // identically. The remaining pins are filed separately (TRA-4990):
+          // `not_suppressed` is unconditionally `pass: false`, and the card's
+          // sizing model is not the one this path enforces.
           this.pushRecentSignal(signal);
           this.dailySignals.push({
             id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
