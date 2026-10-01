@@ -259,6 +259,7 @@ import {
   capOtmEntryContracts,
   auditOtmContractFloorRows,
   otmContractFloorBandIntersects,
+  clampOtmDteWindowToFloor,
   type OtmContractFloorCode,
   type OtmContractFloorImportedAudit,
 } from './otm-contract-floor.js';
@@ -14584,6 +14585,48 @@ export class SignalEngine {
     // on every call, identical to the RV path.
     const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
 
+    // TRA-4976 — ...but the OTM path then hands that window to a floor with a
+    // NARROWER one. `dtePrefs` defaults to 21/60/35 off saved account settings;
+    // the contract floor below refuses DTE outside [21, 45] with
+    // `contract_floor_dte`. `pickExpiration` fetches ONE expiration per symbol
+    // and never retries, so any symbol whose nearest-to-35 LISTED expiration
+    // landed in 46-60 was picked here and refused twenty lines down — the whole
+    // symbol discarded, every sweep, for a window mismatch rather than anything
+    // about the chain.
+    //
+    // The bound is DERIVED from the resolved floor, never a hardcoded 21/45:
+    // both ends are env-tunable and a hardcoded copy decouples silently the
+    // moment the board retunes either one.
+    //
+    // ⛔ This clamps the NOMINATOR, never the check — `applyOtmContractFloor`
+    // below is untouched and still refuses an out-of-band contract that reaches
+    // it. `evaluateSwingSignalScan` is unaffected: it already hardcodes
+    // {25, 45, 35}, which is inside the band.
+    const otmFloorForWindow = this.otmContractFloor();
+    const dteClamp = clampOtmDteWindowToFloor(dtePrefs, otmFloorForWindow);
+    if (dteClamp.window === null) {
+      // An EMPTY intersection, so no listed expiration can clear the floor for
+      // ANY symbol — the floor is process-global, not per-symbol. Stand down
+      // beside the sleeve breaker and the book halt above rather than burn the
+      // whole sweep budget on a guaranteed-zero pass, and leave `lastScanAt`
+      // untouched: "never ran" is the honest read for a stand-down, where a
+      // zero-count scan would read as "ran, found nothing".
+      //
+      // ⛔ Never pass the inverted window through instead:
+      // `resolveWindowedExpirations` flips an inverted min/max back to the
+      // 21/60 SPEC DEFAULTS, which would silently restore the exact window this
+      // block exists to remove.
+      log.warn('OTM scan stood down — DTE window does not intersect the contract floor (TRA-4976)', {
+        mode: this.mode,
+        requested: dtePrefs,
+        floorBand: { dteMin: otmFloorForWindow.dteMin, dteMax: otmFloorForWindow.dteMax, dteHardFloor: otmFloorForWindow.dteHardFloor },
+        floorSource: otmFloorForWindow.source,
+        reason: dteClamp.reason,
+      });
+      return null;
+    }
+    const otmDtePrefs = dteClamp.window;
+
     // TRA-1407 (parent TRA-1406) — OTM entry delta floor. DEMO-SCOPED: only the
     // demo book applies it, so the flag is structurally incapable of altering a
     // live option open (matching the TRA-1293 greeks-gate / take-profit-early
@@ -14660,7 +14703,9 @@ export class SignalEngine {
         const result = await this.rvScanner!.scanOtm(
           sym,
           admissionPass ? { ...otmScanOpts, onAdmission: admissionPass.onAdmission } : otmScanOpts,
-          dtePrefs,
+          // TRA-4976 — the floor-clamped window, NOT the raw `dtePrefs`. This is
+          // the one call whose pick the contract floor then grades.
+          otmDtePrefs,
         );
         // A usable chain came back, so the market-data leg is healthy as of now.
         // This is what lets `dataSource.lastFetchOkAt` separate a dead feed from
@@ -14674,6 +14719,11 @@ export class SignalEngine {
           // the RV loop. Wired HERE too because this is the path that actually
           // runs in prod (RV_ENGINE_ENABLED default-off retires the RV loop);
           // the module's per-symbol throttle dedupes when both fire.
+          // TRA-4976 — deliberately the UNCLAMPED `dtePrefs`. This is a
+          // research capture of the term STRUCTURE, which wants the full
+          // configured window; the floor's band bounds what may be BOUGHT, not
+          // what may be observed. Narrowing it here would silently shorten the
+          // captured curve, which is a different ticket's data.
           void maybeCaptureTermStructureShadow({
             symbol: sym,
             scanner: this.rvScanner!,

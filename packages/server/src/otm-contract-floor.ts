@@ -558,5 +558,115 @@ export function otmContractFloorBandIntersects(
   return floor.deltaMax >= selectorBand.min && floor.deltaMin < selectorBand.max;
 }
 
+/** A DTE window as `pickExpiration` consumes it. */
+export interface OtmDteWindow {
+  min: number;
+  max: number;
+  target: number;
+}
+
+export interface OtmDteWindowClamp {
+  /**
+   * The window to hand the scanner, already intersected with the floor's own
+   * band — or `null` when the intersection is EMPTY, which is a stand-down and
+   * never a window.
+   */
+  window: OtmDteWindow | null;
+  /** True when either end of the requested window was actually narrowed. */
+  narrowed: boolean;
+  /** Prose for the log. Always present; says what moved, or why nothing can. */
+  reason: string;
+}
+
+/**
+ * TRA-4976 — intersect the scan's expiration-selection window with the band the
+ * contract floor will actually admit.
+ *
+ * The OTM scan resolved its window from saved account settings
+ * (`resolveRvDtePrefs`, defaults 21/60/35) and the floor refuses DTE outside
+ * [`dteMin`, `dteMax`] (defaults 21/45) with `contract_floor_dte`.
+ * `pickExpiration` fetches exactly ONE expiration per symbol and never retries,
+ * so for any symbol whose nearest-to-target LISTED expiration fell in 46–60 the
+ * scanner picked it and the floor then refused the whole symbol. The searched
+ * window was strictly wider than the admissible one and nothing reconciled them.
+ *
+ * ⛔ This clamps the NOMINATOR, never the check. `otmContractFloorVerdict` /
+ * `applyOtmContractFloor` are untouched: an out-of-band contract that reaches
+ * the floor by any other path is still refused. Narrowing where the selector
+ * may LOOK cannot weaken what the floor will ACCEPT.
+ *
+ * The bound is derived from the resolved floor, never a hardcoded 21/45 — both
+ * ends are env-tunable (`OTM_CONTRACT_FLOOR_DTE_MIN` / `_MAX`) and a hardcoded
+ * copy silently decouples the moment the board retunes either one.
+ *
+ * Two details that are the whole point:
+ *
+ * 1. **The low end respects the HARD floor too.** Rule 3's second clause
+ *    refuses `dte <= dteHardFloor` *regardless of band*, so the admissible low
+ *    end is `max(dteMin, dteHardFloor + 1)` — a board that spells
+ *    `OTM_CONTRACT_FLOOR_DTE_MIN=5` still cannot buy an 8-DTE contract, and the
+ *    selector must not go looking for one.
+ * 2. **An empty intersection returns `null`, never an inverted window.**
+ *    `resolveWindowedExpirations` flips an inverted `min`/`max` back to the
+ *    21/60 SPEC DEFAULTS — so handing it `{min: 21, max: 20}` would silently
+ *    restore the exact window this function exists to remove. The caller must
+ *    stand the scan down instead.
+ *
+ * `target` is clamped LAST, after min/max, so an inverted or out-of-band
+ * override cannot push it outside the clamped window.
+ */
+export function clampOtmDteWindowToFloor(
+  requested: Partial<OtmDteWindow>,
+  floor: Pick<OtmContractFloor, 'dteMin' | 'dteMax' | 'dteHardFloor'>,
+): OtmDteWindowClamp {
+  // The floor's own admissible band, hard clause included. `resolveOtmContractFloor`
+  // already guarantees dteMin <= dteMax; the hard floor can still bite above dteMin.
+  const floorLow = Math.max(floor.dteMin, floor.dteHardFloor + 1);
+  const floorHigh = floor.dteMax;
+
+  if (floorLow > floorHigh) {
+    return {
+      window: null,
+      narrowed: true,
+      reason:
+        `contract floor admits no DTE at all: band [${floor.dteMin}, ${floor.dteMax}] `
+        + `lies at or below the hard floor (> ${floor.dteHardFloor} required)`,
+    };
+  }
+
+  // Coerce exactly as `resolveWindowedExpirations` does — a non-finite or
+  // non-positive saved setting means "unset", not "zero".
+  const usable = (n: number | undefined): n is number => Number.isFinite(n) && (n as number) > 0;
+  const reqMin = usable(requested.min) ? requested.min : floorLow;
+  const reqMax = usable(requested.max) ? requested.max : floorHigh;
+
+  const min = Math.max(reqMin, floorLow);
+  const max = Math.min(reqMax, floorHigh);
+
+  if (min > max) {
+    return {
+      window: null,
+      narrowed: true,
+      reason:
+        `requested DTE window [${reqMin}, ${reqMax}] does not intersect the contract floor's `
+        + `admissible band [${floorLow}, ${floorHigh}] — no listed expiration can clear the floor`,
+    };
+  }
+
+  // Clamp the target LAST, against the already-clamped window.
+  const reqTarget = usable(requested.target) ? requested.target : min;
+  const target = Math.min(Math.max(reqTarget, min), max);
+
+  const narrowed = min !== reqMin || max !== reqMax;
+  return {
+    window: { min, max, target },
+    narrowed,
+    reason: narrowed
+      ? `DTE window [${reqMin}, ${reqMax}] clamped to the contract floor's band `
+        + `[${floorLow}, ${floorHigh}] → [${min}, ${max}] (target ${reqTarget} → ${target})`
+      : `DTE window [${min}, ${max}] already inside the contract floor's band [${floorLow}, ${floorHigh}]`,
+  };
+}
+
 /** The subset of the scanner signal a refusal stamps. Kept here so the test can build one. */
 export type OtmContractFloorSignal = Pick<OtmMispricingSignal, 'signalSkipReason' | 'signalSkipReasonCode'>;
