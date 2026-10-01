@@ -10589,6 +10589,17 @@ app.get('/api/state', requireAuth, async (_req, res) => {
 // 'proposal_only' until real evidence advances the machine; there is
 // deliberately NO order path here — advancing goes through
 // POST /api/cards/:signalId/lifecycle/advance, which itself mints nothing.
+//
+// ⛔ TRA-4936 — `summary` IS A FOLD OVER THE RING, NOT A CENSUS, and the ring
+// retains by RECENCY. The TRA-3942 entry windows shut at 15:45 ET while the
+// scanner builds cards until the close, so after 15:45 ET the ring is always
+// back-filled with out-of-window refusals and `summary.complete` is
+// structurally pinned at 0 — indistinguishable from a broken builder. Measured
+// 2026-09-27 against `66a8a1ab40cc`: 907 built, 50 kept (5.5%), all stamped
+// 15:49–15:54 ET. Read `retained` for the ring's own coverage, and grade
+// `cardCompleteness` — the per-ET-day, per-family fold OUTSIDE the ring,
+// partitioned into `builtInWindow` / `builtOutOfWindow` so "never sampled" and
+// "sampled and nothing completed" are different numbers.
 app.get('/api/cards', requireAuth, async (_req, res) => {
   const ctx = await userCtx(res);
   res.json({ asOf: new Date().toISOString(), ...ctx.engine.getRecentCards() });

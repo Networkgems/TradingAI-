@@ -240,6 +240,14 @@ import {
   otmDedupeSuppressionEndMs,
   OTM_ENTRY_WINDOW_CLOSED_CODE,
 } from './otm-entry-window.js';
+// TRA-4936 — the per-ET-day completeness fold that escapes the card ring's
+// newest-50 cap, partitioned by the TRA-3942 window above. See its header for
+// why a wider ring is NOT the fix.
+import {
+  CardCompletenessLedger,
+  isWindowGatedCardSignalType,
+  type CardCompletenessView,
+} from './card-completeness-ledger.js';
 // TRA-3944 — WHICH contract the OTM sleeve may buy, and HOW MANY. Entry-side
 // only, both books, engine-opened rows only (imported rows are audited, not
 // gated — see the module header).
@@ -3526,6 +3534,26 @@ export class SignalEngine {
   /** Wall-clock the counters started at (engine construction ≈ process boot). */
   private readonly cardCountsSince = Date.now();
   /**
+   * TRA-4936 — per-ET-day completeness fold, OUTSIDE the ring, partitioned by
+   * the TRA-3942 admission window. `signalTypeCounts` escaped the cap for the
+   * setup MIX (TRA-4788); this escapes it for the question the product is
+   * actually graded on — "does a complete card ever get built" — which the ring
+   * cannot answer because it retains by RECENCY and recency is anti-correlated
+   * with admissibility (the windows shut at 15:45 ET and the scanner builds
+   * until the close, so a post-close reader sees 50 out-of-window refusals and
+   * `complete: 0` whatever the day actually did). Not cleared by forceReset /
+   * clearSignals, same argument as {@link cardTypeCounts}.
+   */
+  private readonly cardCompleteness = new CardCompletenessLedger();
+  /**
+   * TRA-4936 — ring loss, MEASURED at the eviction site rather than derived by
+   * subtracting two keys the reader has to find first. `total: 50` must never
+   * again be readable as the population: 907 built / 50 kept was on the wire
+   * with nothing on it saying so.
+   */
+  private cardRingEvicted = 0;
+  private cardRingDroppedByClear = 0;
+  /**
    * TRA-3688 S-3 — voided SMA-200 signals, newest last, capped. A voided
    * signal is REMOVED from `recentSignals` and RECORDED here so the void rate
    * is measurable — a silent drop is what made the original filing
@@ -4964,6 +4992,7 @@ export class SignalEngine {
     });
     this.allClosedPositions = [];
     this.recentSignals = [];
+    this.cardRingDroppedByClear += this.recentCards.length; // TRA-4936 — count the loss
     this.recentCards = []; // TRA-4649 — the card ring mirrors the signal ring
     this.lifecycleRing.clear(); // TRA-4813 — and the machines die with their cards
     this.dailySignals = [];
@@ -5001,6 +5030,7 @@ export class SignalEngine {
    */
   clearSignals(): void {
     this.recentSignals = [];
+    this.cardRingDroppedByClear += this.recentCards.length; // TRA-4936 — count the loss
     this.recentCards = []; // TRA-4649 — a cleared feed must not leave stale proposals readable
     this.lifecycleRing.clear(); // TRA-4813 — stale machines are stale proposals too
     // TRA-451 — also clear the SMA-200 debounce ledger; otherwise a cleared
@@ -7900,7 +7930,28 @@ export class SignalEngine {
           : {}),
       });
       this.recentCards.unshift(card);
-      if (this.recentCards.length > MAX_SIGNALS) this.recentCards.length = MAX_SIGNALS;
+      if (this.recentCards.length > MAX_SIGNALS) {
+        // TRA-4936 — count the loss at the site that causes it.
+        this.cardRingEvicted += this.recentCards.length - MAX_SIGNALS;
+        this.recentCards.length = MAX_SIGNALS;
+      }
+      // TRA-4936 — the per-ET-day fold, OUTSIDE the ring. Window side comes
+      // from `signalSkipReasonCode`, the low-cardinality twin of the prose the
+      // card's own `not_suppressed` criterion reads (both stamped in the same
+      // breath at the TRA-3942 reject), so the fold and the card cannot
+      // disagree about why entry was refused. The clock reading beside it is an
+      // INDEPENDENT second read of the same window at the card's own
+      // `generatedAt` — it does not decide the bucket (the stamp is the
+      // decision that was actually taken); it only populates the agreement
+      // column, so a stamp that stops tracking the window is visible instead of
+      // being the thing everything else is measured against.
+      this.cardCompleteness.record(
+        card,
+        signal.signalSkipReasonCode ?? null,
+        isWindowGatedCardSignalType(signal.type)
+          ? otmEntryWindowVerdict(new Date(card.generatedAt), resolveOtmEntryWindows(process.env))
+          : null,
+      );
       // TRA-4813 — birth the TRA-4651 machine and drive it as far as THIS
       // card's evidence supports (armed → confirmed → proposed). `engineArmed`
       // is true by construction here: this sink only runs inside the display
@@ -7938,6 +7989,19 @@ export class SignalEngine {
    * cumulative since `countsSince`, every known family present even at 0. On a
    * saturated ring it will disagree with the ring tally — that disagreement is
    * the point, not a defect.
+   *
+   * ⛔ **`summary.complete` IS NOT A CENSUS AND AFTER 15:45 ET IT CANNOT BE
+   * NON-ZERO** (TRA-4936). The ring retains by RECENCY, and recency is
+   * anti-correlated with admissibility: the TRA-3942 entry windows shut at
+   * 15:45 ET while the scanner builds cards until the close, so the ring is
+   * always back-filled with out-of-window refusals before a post-close reader
+   * arrives. Measured 2026-09-27: 907 built, 50 kept, every one of them stamped
+   * 15:49–15:54 ET, `complete: 0` — a reading a *broken builder* would produce
+   * identically. Grade `cardCompleteness` instead: a per-ET-day fold outside
+   * the ring, PARTITIONED by that window, so `builtInWindow: 0` ("never
+   * sampled") is distinguishable from `builtInWindow: N, complete: 0` ("sampled
+   * and nothing completed"). `retained` states the ring's own coverage so
+   * `total: 50` can never again be read as the population.
    */
   getRecentCards(): {
     cards: TradeOpportunityCard[];
@@ -7947,6 +8011,17 @@ export class SignalEngine {
     countsSinceBoot: true;
     countsSince: string;
     reasonsNotToEnter: ReasonsNotToEnterTally & { enabled: boolean };
+    retained: {
+      kept: number;
+      ringCap: number;
+      builtSinceCountsStart: number;
+      evictedByRingCap: number;
+      droppedByClear: number;
+      keptFractionOfBuilt: number | null;
+      retentionAxis: 'recency';
+      note: string;
+    };
+    cardCompleteness: CardCompletenessView;
   } {
     // TRA-4788 — every known family at 0 first, then the measured rows on top.
     // A key can exceed the known set (an unregistered signal type still counts
@@ -7954,6 +8029,11 @@ export class SignalEngine {
     const signalTypeCounts: Record<string, { attempted: number; built: number }> = {};
     for (const t of CARDED_SIGNAL_TYPES) signalTypeCounts[t] = { attempted: 0, built: 0 };
     for (const [t, row] of this.cardTypeCounts) signalTypeCounts[t] = { ...row };
+    // TRA-4936 — ring coverage. `builtSinceCountsStart` folds the SAME
+    // out-of-ring counters `signalTypeCounts` publishes, so it saturates with
+    // neither the ring nor the day cap.
+    let builtSinceCountsStart = 0;
+    for (const row of this.cardTypeCounts.values()) builtSinceCountsStart += row.built;
     return {
       cards: [...this.recentCards],
       summary: summarizeCards(this.recentCards),
@@ -7972,6 +8052,31 @@ export class SignalEngine {
         enabled: isCardReasonsNotToEnterEnabled(this.reasonsFlagEnv()),
         ...summarizeReasonsNotToEnter(this.recentCards.map((c) => c.reasonsNotToEnter)),
       },
+      // TRA-4936 (TRA-4748 style) — the ring states its OWN coverage, so a
+      // reader never has to find two keys and divide them to discover that
+      // `total` is 5.5% of the population. `evictedByRingCap` and
+      // `droppedByClear` are measured at their own sites and kept apart: a
+      // reset dropping the display is not the same finding as the cap
+      // overwriting the session.
+      retained: {
+        kept: this.recentCards.length,
+        ringCap: MAX_SIGNALS,
+        builtSinceCountsStart,
+        evictedByRingCap: this.cardRingEvicted,
+        droppedByClear: this.cardRingDroppedByClear,
+        keptFractionOfBuilt:
+          builtSinceCountsStart > 0 ? this.recentCards.length / builtSinceCountsStart : null,
+        retentionAxis: 'recency',
+        note:
+          '`cards`/`summary` cover the newest '
+          + `${MAX_SIGNALS} cards only, retained by RECENCY. Recency is ANTI-CORRELATED with `
+          + 'admissibility (TRA-3942 entry windows shut at 15:45 ET; the scanner builds until the '
+          + 'close), so after 15:45 ET `summary.complete` is structurally 0 whatever the day did. '
+          + 'Grade `cardCompleteness`, not `summary`. Widening ringCap is NOT the fix (TRA-4920).',
+      },
+      // TRA-4936 — the fold that can actually answer "is a complete card ever
+      // built", per ET day, per family, partitioned by the admission window.
+      cardCompleteness: this.cardCompleteness.snapshot(),
     };
   }
 
