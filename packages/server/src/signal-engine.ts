@@ -8079,7 +8079,26 @@ export class SignalEngine {
       },
       // TRA-4936 — the fold that can actually answer "is a complete card ever
       // built", per ET day, per family, partitioned by the admission window.
-      cardCompleteness: this.cardCompleteness.snapshot(),
+      //
+      // `attemptedByType` is handed in because the fold cannot source it: it is
+      // the engine's own counter, bumped ABOVE the sink's `try`, so it is the
+      // one term that still moves when everything below it — this fold's
+      // `record()` included — throws. Without it the fold's `builtInWindow: 0`
+      // cannot be told apart from a fold that was never called, and the whole
+      // point of this surface is that those two have to read differently
+      // (CEO, 2026-10-01).
+      //
+      // Sourced from `signalTypeCounts` rather than the raw `cardTypeCounts`
+      // map, so the family universe is the TRA-4788 known set seeded at 0 and
+      // not just the families that happen to have built something. A family the
+      // sink never ran for has to say `sink_never_ran`; if its row is instead
+      // absent, the absence renders as an ordinary empty surface — the exact
+      // failure mode this block exists to remove.
+      cardCompleteness: this.cardCompleteness.snapshot({
+        attemptedByType: Object.fromEntries(
+          Object.entries(signalTypeCounts).map(([type, row]) => [type, row.attempted]),
+        ),
+      }),
     };
   }
 

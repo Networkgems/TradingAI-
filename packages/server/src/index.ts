@@ -10604,6 +10604,18 @@ app.get('/api/state', requireAuth, async (_req, res) => {
 // `cardCompleteness` — the per-ET-day, per-family fold OUTSIDE the ring,
 // partitioned into `builtInWindow` / `builtOutOfWindow` so "never sampled" and
 // "sampled and nothing completed" are different numbers.
+//
+// Read `cardCompleteness.wiring` BEFORE `builtInWindow` (CEO, 2026-10-01). The
+// in-window read taken that day found `builtInWindow: 0` with the sink's last
+// run stamped 10:14:43 ET — 17 seconds before the 10:15 window opened — and
+// nothing published in the 70 minutes the window was then open. That zero is
+// REAL, and `wiring[].verdict` is what says so: `in_window_measured_zero` (the
+// sink ran, the fold saw every card, none landed in window) versus
+// `fold_not_reached` / `sink_never_ran` (the zero says nothing about the
+// market) versus `attempted_unreadable` (could not check — not a pass).
+// `wiring[].lastInWindowBuiltAt` dates the last run with the window open;
+// `lastBuiltAt` spans every bucket and therefore reads as recent even when the
+// in-window side produced nothing.
 app.get('/api/cards', requireAuth, async (_req, res) => {
   const ctx = await userCtx(res);
   res.json({ asOf: new Date().toISOString(), ...ctx.engine.getRecentCards() });

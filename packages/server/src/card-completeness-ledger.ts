@@ -142,6 +142,20 @@ export interface CardCompletenessWindowCell {
   refusedByField: Record<string, number>;
   /** Per-field count of cards that could not BUILD the field. */
   missingByField: Record<string, number>;
+  /**
+   * Oldest / newest `generatedAt` that landed in THIS bucket, `null` while the
+   * bucket is empty (TRA-4936 provenance, CEO 2026-10-01).
+   *
+   * The row's own `firstBuiltAt`/`lastBuiltAt` span every bucket, so on a day
+   * where the window side produced nothing they still read as healthy
+   * timestamps — which is the confusion this ticket exists to kill, one level
+   * down. `byWindow.in_window.lastBuiltAt === null` beside a populated
+   * `byWindow.out_of_window.lastBuiltAt` says the classifier demonstrably RAN
+   * and routed every card to the other side; `null` in both says nothing was
+   * observed at all. Those are different findings.
+   */
+  firstBuiltAt: number | null;
+  lastBuiltAt: number | null;
 }
 
 /**
@@ -220,6 +234,101 @@ export interface CardCompletenessSinceBootRow {
   lastCompleteEtDay: string | null;
   /** ET days this family built at least one IN-WINDOW card on. */
   etDaysWithInWindow: number;
+  /** Oldest / newest `generatedAt` this family ever folded, any bucket. */
+  firstBuiltAt: number;
+  lastBuiltAt: number;
+  /**
+   * Newest `generatedAt` that landed IN WINDOW, and its ET day — `null` when the
+   * in-window population has never been sampled (TRA-4936 provenance).
+   *
+   * This is the cell that dates the last time the publish sink ran while the
+   * admission window was open. On 2026-10-01 the sink's last run was stamped
+   * 10:14:43 ET, 17 seconds BEFORE the 10:15 window opened, and nothing ran for
+   * the 70 minutes the window was then open — a fact `lastBuiltAt` alone cannot
+   * state, because it reads as a perfectly recent timestamp.
+   */
+  lastInWindowBuiltAt: number | null;
+  lastInWindowEtDay: string | null;
+}
+
+/**
+ * Why a family's `builtInWindow` reads the number it reads.
+ *
+ * `builtInWindow: 0` has FOUR causes that are indistinguishable from the cell
+ * itself, and conflating them is the defect one layer below the one this ticket
+ * was filed for (CEO, 2026-10-01): "0 because nothing was produced" must not
+ * read the same as "0 because the fold is not wired".
+ *
+ * - `in_window_measured_nonzero` — the window population was sampled and is
+ *   non-empty. `builtInWindow` is a real measurement.
+ * - `in_window_measured_zero` — the sink ran, the fold saw every card, the
+ *   classifier routed them, and **none** landed in window. The zero is REAL.
+ *   This is the headline the fold exists to publish, not a wiring bug.
+ * - `fold_not_reached` — the engine attempted cards for this family and the fold
+ *   observed none of them. The zero says nothing about the market.
+ * - `sink_never_ran` — the engine never even attempted a card for this family.
+ * - `window_not_applicable` — the family is not window-gated, so it has no side
+ *   of a window. Applicability FIRST: a family with no window must never be
+ *   reported as a family that failed to reach one.
+ * - `attempted_unreadable` — no `attemptedByType` was supplied, so the
+ *   attempted-vs-observed identity could not be evaluated. "Could not check"
+ *   gets its own name and never borrows a verdict from "checked and it is fine".
+ */
+export type CardFoldWiringVerdict =
+  | 'in_window_measured_nonzero'
+  | 'in_window_measured_zero'
+  | 'fold_not_reached'
+  | 'sink_never_ran'
+  | 'window_not_applicable'
+  | 'attempted_unreadable';
+
+/** One per family the engine attempted OR the fold observed — the union, never one side. */
+export interface CardCompletenessWiringRow {
+  signalType: string;
+  /**
+   * The engine's own pre-try `attempted` counter, or `null` when the caller
+   * supplied none.
+   *
+   * This is the term that makes the partition exhaustive, and it has to come
+   * from OUTSIDE the fold: `bumpCardTypeCount(type, 'attempted')` is the first
+   * statement in `recordOpportunityCard`, ABOVE the `try`, so it increments even
+   * when everything below it — including this fold's own `record()` — throws.
+   * A counter that only the fold maintains cannot distinguish "the fold was
+   * never called" from "nothing ever happened", because in both cases the fold
+   * holds zero.
+   */
+  attempted: number | null;
+  /** `record()` calls this family's fold actually received. */
+  observed: number;
+  /** Cards folded into a RETAINED ET day; below `observed` when the day cap dropped some. */
+  foldedIntoRetainedDays: number;
+  builtInWindow: number;
+  builtOutOfWindow: number;
+  builtWindowNotApplicable: number;
+  /** Newest `generatedAt` observed, any bucket. */
+  lastBuiltAt: number | null;
+  /** Newest `generatedAt` observed IN WINDOW — the CEO's provenance stamp. */
+  lastInWindowBuiltAt: number | null;
+  /** `attempted - observed`, or null when `attempted` is unreadable. */
+  unobserved: number | null;
+  verdict: CardFoldWiringVerdict;
+}
+
+/**
+ * TRA-4936 provenance. Published so a reader who finds `builtInWindow: 0` can
+ * tell which of the causes above produced it WITHOUT dividing two numbers on two
+ * different keys — the TRA-4748 rule the ring's own coverage block already obeys.
+ */
+export interface CardCompletenessWiring {
+  attemptedSource: 'engine_card_type_counts' | 'not_supplied';
+  /** Total `record()` calls across every family. 0 ⇒ the fold was never reached. */
+  observations: number;
+  /** Newest `generatedAt` the fold has ever seen, any family, any bucket. */
+  lastObservedBuiltAt: number | null;
+  /** Newest `generatedAt` the fold has ever seen IN WINDOW. */
+  lastInWindowBuiltAt: number | null;
+  families: CardCompletenessWiringRow[];
+  note: string;
 }
 
 /**
@@ -243,6 +352,8 @@ export interface CardCompletenessCoverage {
 
 export interface CardCompletenessView {
   coverage: CardCompletenessCoverage;
+  /** Why each family's `builtInWindow` reads what it reads. See {@link CardCompletenessWiring}. */
+  wiring: CardCompletenessWiring;
   /** Newest ET day first; within a day, `signalType` ascending. */
   days: CardCompletenessRow[];
   /** Every family that has built a card, never evicted. */
@@ -258,7 +369,15 @@ export interface CardWindowClockReading {
 }
 
 function emptyCell(): CardCompletenessWindowCell {
-  return { built: 0, complete: 0, unbuildable: 0, refusedByField: {}, missingByField: {} };
+  return {
+    built: 0,
+    complete: 0,
+    unbuildable: 0,
+    refusedByField: {},
+    missingByField: {},
+    firstBuiltAt: null,
+    lastBuiltAt: null,
+  };
 }
 
 function cloneCell(cell: CardCompletenessWindowCell): CardCompletenessWindowCell {
@@ -268,6 +387,8 @@ function cloneCell(cell: CardCompletenessWindowCell): CardCompletenessWindowCell
     unbuildable: cell.unbuildable,
     refusedByField: { ...cell.refusedByField },
     missingByField: { ...cell.missingByField },
+    firstBuiltAt: cell.firstBuiltAt,
+    lastBuiltAt: cell.lastBuiltAt,
   };
 }
 
@@ -407,6 +528,13 @@ export class CardCompletenessLedger {
     const cell = row.byWindow[bucket];
     row.built += 1;
     cell.built += 1;
+    // Per-BUCKET span. An empty bucket stays null rather than inheriting the
+    // row's span, so "this side of the window produced nothing" is readable
+    // without subtracting two other cells.
+    cell.firstBuiltAt =
+      cell.firstBuiltAt === null ? card.generatedAt : Math.min(cell.firstBuiltAt, card.generatedAt);
+    cell.lastBuiltAt =
+      cell.lastBuiltAt === null ? card.generatedAt : Math.max(cell.lastBuiltAt, card.generatedAt);
     if (card.complete) {
       row.complete += 1;
       cell.complete += 1;
@@ -466,6 +594,10 @@ export class CardCompletenessLedger {
         etDaysWithComplete: 0,
         lastCompleteEtDay: null,
         etDaysWithInWindow: 0,
+        firstBuiltAt: card.generatedAt,
+        lastBuiltAt: card.generatedAt,
+        lastInWindowBuiltAt: null,
+        lastInWindowEtDay: null,
       };
       this.sinceBoot.set(card.signalType, roll);
     }
@@ -475,6 +607,8 @@ export class CardCompletenessLedger {
       this.sinceBootDays.set(card.signalType, seen);
     }
     roll.built += 1;
+    roll.firstBuiltAt = Math.min(roll.firstBuiltAt, card.generatedAt);
+    roll.lastBuiltAt = Math.max(roll.lastBuiltAt, card.generatedAt);
     seen.seen.add(etDay);
     roll.etDaysSeen = seen.seen.size;
     if (card.complete) {
@@ -489,8 +623,103 @@ export class CardCompletenessLedger {
       roll.builtInWindow += 1;
       seen.inWindow.add(etDay);
       roll.etDaysWithInWindow = seen.inWindow.size;
+      // The provenance stamp: when did the sink last run while the window was
+      // OPEN. Kept on the never-evicting roll so the day cap cannot erase it.
+      if (roll.lastInWindowBuiltAt === null || card.generatedAt > roll.lastInWindowBuiltAt) {
+        roll.lastInWindowBuiltAt = card.generatedAt;
+        roll.lastInWindowEtDay = etDay;
+      }
     } else if (bucket === 'out_of_window') roll.builtOutOfWindow += 1;
     else roll.builtWindowNotApplicable += 1;
+  }
+
+  /**
+   * Build the provenance block.
+   *
+   * The family list is the **UNION** of the engine's attempted keys and the
+   * fold's own keys, never one side: a family the engine attempted and the fold
+   * never saw (`fold_not_reached`) only exists on the engine side, and reading
+   * the fold's keys alone would make it vanish — the absence would then render
+   * as an ordinary empty surface, which is the shape of every bug on this
+   * ticket.
+   */
+  private buildWiring(
+    days: CardCompletenessRow[],
+    attemptedByType?: Readonly<Record<string, number>>,
+  ): CardCompletenessWiring {
+    const foldedByType = new Map<string, number>();
+    for (const row of days) {
+      foldedByType.set(row.signalType, (foldedByType.get(row.signalType) ?? 0) + row.built);
+    }
+
+    const families = new Set<string>(this.sinceBoot.keys());
+    if (attemptedByType) for (const t of Object.keys(attemptedByType)) families.add(t);
+
+    const rows: CardCompletenessWiringRow[] = [];
+    let observations = 0;
+    let lastObservedBuiltAt: number | null = null;
+    let lastInWindowBuiltAt: number | null = null;
+
+    for (const signalType of [...families].sort()) {
+      const roll = this.sinceBoot.get(signalType);
+      const observed = roll?.built ?? 0;
+      const attempted = attemptedByType ? (attemptedByType[signalType] ?? 0) : null;
+      observations += observed;
+      if (roll) {
+        if (lastObservedBuiltAt === null || roll.lastBuiltAt > lastObservedBuiltAt) {
+          lastObservedBuiltAt = roll.lastBuiltAt;
+        }
+        if (
+          roll.lastInWindowBuiltAt !== null
+          && (lastInWindowBuiltAt === null || roll.lastInWindowBuiltAt > lastInWindowBuiltAt)
+        ) {
+          lastInWindowBuiltAt = roll.lastInWindowBuiltAt;
+        }
+      }
+
+      // Applicability FIRST, exactly as `classifyCardAdmissionWindow` does it.
+      // A family with no window has no side of one, so its zero is not a finding
+      // and must not be reported in the same cell as one that is.
+      const windowGated = isWindowGatedCardSignalType(signalType);
+      let verdict: CardFoldWiringVerdict;
+      if (attempted === null) verdict = 'attempted_unreadable';
+      else if (!windowGated) verdict = 'window_not_applicable';
+      else if (attempted === 0 && observed === 0) verdict = 'sink_never_ran';
+      else if (observed === 0) verdict = 'fold_not_reached';
+      else if ((roll?.builtInWindow ?? 0) > 0) verdict = 'in_window_measured_nonzero';
+      else verdict = 'in_window_measured_zero';
+
+      rows.push({
+        signalType,
+        attempted,
+        observed,
+        foldedIntoRetainedDays: foldedByType.get(signalType) ?? 0,
+        builtInWindow: roll?.builtInWindow ?? 0,
+        builtOutOfWindow: roll?.builtOutOfWindow ?? 0,
+        builtWindowNotApplicable: roll?.builtWindowNotApplicable ?? 0,
+        lastBuiltAt: roll?.lastBuiltAt ?? null,
+        lastInWindowBuiltAt: roll?.lastInWindowBuiltAt ?? null,
+        unobserved: attempted === null ? null : attempted - observed,
+        verdict,
+      });
+    }
+
+    return {
+      attemptedSource: attemptedByType ? 'engine_card_type_counts' : 'not_supplied',
+      observations,
+      lastObservedBuiltAt,
+      lastInWindowBuiltAt,
+      families: rows,
+      note:
+        'TRA-4936 provenance. Read `verdict` BEFORE `builtInWindow`: '
+        + '`in_window_measured_zero` means the sink ran, the fold saw every card and none landed '
+        + 'in window — the zero is REAL and is a finding about the sleeve, not about this fold. '
+        + '`fold_not_reached` / `sink_never_ran` mean the zero says nothing about the market. '
+        + '`attempted_unreadable` means no engine counter was supplied, so the identity could not '
+        + 'be checked — it is NOT a pass. `lastInWindowBuiltAt` dates the last time the sink ran '
+        + 'with the admission window open; `lastObservedBuiltAt` spans every bucket and therefore '
+        + 'reads as recent even when the in-window side produced nothing.',
+    };
   }
 
   /** Drop oldest ET days beyond the cap, counting each one into coverage. */
@@ -512,8 +741,15 @@ export class CardCompletenessLedger {
     }
   }
 
-  /** Deep snapshot — the caller may not hold a reference into live state. */
-  snapshot(): CardCompletenessView {
+  /**
+   * Deep snapshot — the caller may not hold a reference into live state.
+   *
+   * @param opts.attemptedByType the engine's own per-family `attempted` counter
+   *   (`cardTypeCounts`), bumped ABOVE the sink's `try` and therefore the only
+   *   term that can say the sink ran when the fold holds nothing. Omit it and
+   *   every `wiring` verdict reads `attempted_unreadable` — never a green.
+   */
+  snapshot(opts?: { attemptedByType?: Readonly<Record<string, number>> }): CardCompletenessView {
     const retainedEtDays = [...this.days.keys()].sort();
     const days: CardCompletenessRow[] = [];
     for (const etDay of [...retainedEtDays].reverse()) {
@@ -543,6 +779,7 @@ export class CardCompletenessLedger {
     const sinceBoot: Record<string, CardCompletenessSinceBootRow> = {};
     for (const [t, roll] of this.sinceBoot) sinceBoot[t] = { ...roll };
     return {
+      wiring: this.buildWiring(days, opts?.attemptedByType),
       coverage: {
         retainedEtDays,
         etDaysRetained: retainedEtDays.length,
