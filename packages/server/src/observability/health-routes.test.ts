@@ -8379,6 +8379,18 @@ describe('GET /api/health/live-enforce-gates — stale-input attribution (TRA-49
         decisionsDecidedByStaleInput: number;
         decisionsShortCircuitedUpstream: number;
         staleInputGovernsAnyDecision: boolean;
+        /** TRA-4978 second pass — WHEN the constant last decided, not merely WHETHER. */
+        recency: {
+          etDaysWithRefusals: number;
+          latestEtDayWithRefusals: string | null;
+          latestEtDayDecidedByStaleInput: string | null;
+          sessionsSinceStaleInputLastDecided: number | null;
+          staleInputGovernsLatestSession: boolean | null;
+          latestSessionDecidedByStaleInput: number;
+          latestSessionShortCircuitedUpstream: number;
+          latestSessionUnclassified: number;
+          statement: string;
+        };
         standDown: { verdict: string; bindingConstraint: string | null; statement: string };
         cells: Array<{
           cell: string;
@@ -8414,11 +8426,33 @@ describe('GET /api/health/live-enforce-gates — stale-input attribution (TRA-49
     expect(d.detail).toContain('refreshing the tape would move NO decision');
   });
 
-  it('is DEGRADED and explicitly NOT an alarm (AC4 / TRA-3711)', () => {
+  it('is ATTENTION when the constant decided nothing on the latest session, and NEVER an alarm (AC4 / TRA-3711)', () => {
+    // TRA-4978 second pass. The only refusal in this process is short-circuited
+    // upstream, so the recency arm reads `false` and the severity drops one
+    // notch: the condition is real and published, but refreshing the tape today
+    // would move zero decisions, so it is not the thing to work on first.
+    // ⛔ What must NOT move under any branch is `alarm`.
     recordShortCircuitedRefusal();
     const d = serveGates().degradations.find((x) => x.code === 'cost_bar_edge_input_stale')!;
-    expect(d.severity).toBe('degraded');
+    expect(d.severity).toBe('attention');
     expect(d.alarm).toBe(false);
+    expect(d.recency.staleInputGovernsLatestSession).toBe(false);
+    expect(d.recency.latestEtDayDecidedByStaleInput).toBeNull();
+    // Never 0 — there is no "since" to count from when it has never decided.
+    expect(d.recency.sessionsSinceStaleInputLastDecided).toBeNull();
+    expect(d.detail).toContain('⏱ RECENCY:');
+    expect(d.detail).toContain('Dormant is not clear');
+  });
+
+  it('the LIFETIME arm stays published beside the recency one — the old number must reconcile', () => {
+    // TRA-3660 §10: a consistency fix that deletes the truthful surface is the
+    // failure, not the remedy. `staleInputGovernsAnyDecision` is correct about
+    // the past and simply cannot grade a fix; both arms ship.
+    recordShortCircuitedRefusal();
+    const d = serveGates().degradations.find((x) => x.code === 'cost_bar_edge_input_stale')!;
+    expect(d.staleInputGovernsAnyDecision).toBe(false);
+    expect(d.decisionsDecidedByStaleInput).toBe(0);
+    expect(d.recency).toBeDefined();
   });
 
   it('a cell the estimator does not hold reads NULL and NOT_MEASURED, never a pass', () => {

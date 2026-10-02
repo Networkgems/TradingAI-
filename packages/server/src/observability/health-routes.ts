@@ -198,6 +198,7 @@ import {
 import {
   describeCostBarCellStandDown,
   foldStaleCostBarCells,
+  foldStaleCostBarRecency,
   summarizeCostBarSleeveStandDown,
 } from '../cost-bar-stale-attribution.js';
 // TRA-4749 (parent TRA-4622 §4) — the bar for EVERY structure the gate is
@@ -7334,6 +7335,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       (s, c) => s + c.decisionsShortCircuitedUpstream,
       0,
     );
+    // ⭐ TRA-4978 (second pass) — WHEN, not merely WHETHER. The lifetime counter
+    // above is folded over an append-only archive with no backfill, so it
+    // latches TRUE for the retention window no matter what any remedy does.
+    // This arm reads the retained per-ET-day reason census and says whether the
+    // constant decided anything on the LATEST refusing session. Three-valued:
+    // `null` is NOT COMPUTABLE, never a clean bill.
+    const staleRecency = foldStaleCostBarRecency(
+      summary.retained.byGate.find((g) => g.gate === COST_BAR_GATE)?.byEtDay ?? [],
+    );
     const sleeveStandDown = summarizeCostBarSleeveStandDown({
       structureCells: tapeCells.filter((c) => c.structure === COST_BAR_PUBLISHED_STRUCTURE),
       sleeve: COST_BAR_PUBLISHED_STRUCTURE,
@@ -7359,8 +7369,18 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
                * conservative direction with real money. Nothing is at risk of
                * being admitted on a stale number — the ask is that somebody
                * LOOK, not that anything stop.
+               *
+               * ⭐ TRA-4978 (second pass) — and it DROPS to `attention` when the
+               * recency arm says the constant decided nothing on the latest
+               * refusing session. The condition is still real and still
+               * published; what has changed is that refreshing the tape today
+               * would move zero decisions, so it is no longer the thing to work
+               * on first. `null` (NOT COMPUTABLE) stays at `degraded`: unknown
+               * is not a clean bill. Neither value is `alarm` — see below.
                */
-              severity: 'degraded' as const,
+              severity: (staleRecency.staleInputGovernsLatestSession === false
+                ? 'attention'
+                : 'degraded') as 'attention' | 'degraded',
               /**
                * ⛔ TRA-4978 item 3 / AC4 — EXPLICITLY NOT AN ALARM, and the
                * field exists so that is readable rather than inferred from the
@@ -7403,8 +7423,20 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
               decisionsShortCircuitedUpstream: shortCircuitedUpstream,
               /** Rows carrying no predicate stamp: coverage, not a clean bill. */
               decisionsUnstamped: staleCells.reduce((s, c) => s + c.decisionsUnstamped, 0),
-              /** FALSE ⇒ no live decision anywhere is currently made off a stale constant. */
+              /**
+               * FALSE ⇒ no live decision anywhere is currently made off a stale
+               * constant.
+               *
+               * ⚠️ TRA-4978 (second pass) — this is a LIFETIME predicate over an
+               * append-only 30-day archive, so once true it stays true until the
+               * deciding rows age out, whatever any remedy does. It is correct
+               * about the past and it CANNOT grade a fix. Read `recency` for
+               * that. Kept verbatim rather than redefined: a reader holding this
+               * number must still be able to reconcile it.
+               */
               staleInputGovernsAnyDecision: decidedByStaleInput > 0,
+              /** ⭐ TRA-4978 (second pass) — WHEN the constant last decided a refusal. */
+              recency: staleRecency,
               /** ⭐ TRA-4978 item 2 — the published fail direction, design (a). */
               standDown: sleeveStandDown,
               /**
@@ -7432,6 +7464,10 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
                 + (decidedByStaleInput === 0
                   ? 'At zero, this degradation is a statement about an input nothing is currently consuming — refreshing the tape would move NO decision. '
                   : '')
+                // ⭐ TRA-4978 (second pass) — the lifetime split above says WHICH
+                // refusals; without this sentence it does not say WHEN, and an
+                // undated 7,179 against an append-only archive reads as current.
+                + `⏱ RECENCY: ${staleRecency.statement} `
                 + `Sleeve verdict: ${sleeveStandDown.verdict}${sleeveStandDown.bindingConstraint === null ? '' : ` (binding constraint: ${sleeveStandDown.bindingConstraint})`} — ${sleeveStandDown.statement} `
                 + 'The tape grows only on a CLOSED FILL and this gate refuses every candidate that could produce one, '
                 + 'so the loop is self-sealing and closing it is a STRATEGY decision (TRA-4622), not a fix inside this gate. '
