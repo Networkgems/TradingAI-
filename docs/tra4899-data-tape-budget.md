@@ -242,6 +242,69 @@ or if headroom ever falls below ~150 MiB. Two notes for whoever picks that up: i
 shared periodic-compaction hook**, not four bespoke timers, and `otm-admission-tape` is the single
 largest lever in the residual despite being the tape this parent ticket already re-scoped.
 
+#### Verified live 2026-10-02T03:1xZ — and the AC4 "no, not today" has since expired
+
+The build is live: bqb1 serves `6690770689b5` (boot 02:13:38Z), which carries `969f1beb` as an
+ancestor. `/api/health/cost-aware-gate` → `compaction` reads:
+
+```
+hookState        armed_not_yet_due     timerArmedAt  2026-10-02T02:13:56.829Z
+intervalMs       21600000              nextFireDueAt 2026-10-02T08:13:56.829Z
+last.trigger     boot                  last.ranAt    2026-10-02T02:13:45.526Z
+last.cutoff      2026-09-25T02:13:45Z  linesDropped  0   rewrote false
+last.linesBefore 376622                bytesBefore   84332698
+```
+
+**The arm is the live reading, not the fire count.** `timer_not_armed` — the pre-fix state — is
+excluded by `timerArmedAt` being stamped, which is the whole reason `hookState` exists: at a 2,923 s
+uptime a healthy hook has 0 fires and `timerCompactions` cannot tell that from a dead one. The boot
+outcome publishes, so AC2's "a `RETAIN_MS` with no working hook reads identically" hole is closed on
+the real host. `linesDropped: 0` is itself the AC1 result: nothing on disk had aged past the cutoff.
+
+**AC3, re-run against the live build — the premium claim verifies exactly; the *level* did not.**
+
+```
+node scripts/tra4899-tape-census.mjs        # 2026-10-02T03:1xZ, host build 6690770689b5
+  144.0  HARD     144.0 MiB            56.1   otm-admission-tape.jsonl
+  110.2  DERIVED  30 d (boot-only)     94.7   live-enforce-gate.jsonl     ← was 72.3 / 62.1
+   83.3  DERIVED  7 d +6h timer        80.4   cost-aware-gate.jsonl       ← was 119.1 boot-only
+   78.8  DERIVED  30 d (boot-only)     67.7   churn-brake-guard.jsonl     ← was 44.4 / 38.1
+   51.6  DERIVED  30 d (boot-only)     44.3   reversal-shadow-signals.jsonl
+volume: 973.4 MiB total, 239.0 MiB free (24.554%)
+```
+
+119.1 → **83.3 MiB**, not the 72.3 MiB projected, and the gap is **not** a shortfall in the fix.
+Separate the two factors or a rate regression hides behind a cap fix:
+
+- **The premium is exactly as specified.** `83.3 / 80.4` = +3.6%, the `interval/retain` figure. Had
+  the tape stayed boot-only it would today read `80.4 × 1.704` = **137.0 MiB**, so the fix removes
+  **53.7 MiB** of overshoot at today's size — *more* than the 45.9 MiB that justified the ticket.
+- **The level rose because the write rate did.** The tape is at steady state (`retained.etDays`
+  spans 09-25→10-01; `linesDropped: 0`), so its rate is `80.4 / 7` = **11.49 MiB/day**, 15% above
+  the 9.98 measured on 09-25. The cadence bounds the overshoot; it cannot bound the rate.
+
+⚠️ **The trio measurement that produced "still no" is stale, and two of the three named triggers
+have tripped.** Over the 6.94 days since, `live-enforce-gate` grew **+32.6 MiB** (62.1 → 94.7) and
+`churn-brake-guard` **+29.6 MiB** (38.1 → 67.7); `reversal-shadow-signals` *fell* 6.2 MiB, which is
+what a tape at its 30-day steady state looks like. Both readings of the trio's pooled rate are above
+the 5.02 MiB/day the "no" rested on, and the discriminator between them is unmeasured — neither tape
+has a health route publishing a retained day span, so whether they are still filling toward 30 days
+cannot be settled from here:
+
+| keying | live-enf | churn | reversal | pooled | overshoot @4.93 d gap | uptime to 45.9 MiB |
+|---|---|---|---|---|---|---|
+| at steady state (`size/30`) | 3.16 | 2.26 | 1.48 | **6.90** | 34.0 MiB | **6.7 d** |
+| still filling (6.94 d growth) | 4.70 | 4.27 | 1.48 | **10.45** | **51.5 MiB** | **4.4 d** |
+
+Under the upper keying the trio *already* costs the 45.9 MiB that justified this ticket at the
+observed boot gap, and the 9.1-day threshold has moved **inside** it. And headroom to the 10%
+`minFreePct` is now `239.0 − 97.3` = **141.7 MiB**, below the **~150 MiB** trigger written above.
+**So the answer to AC4 flips from "no, at ~9 days of uptime" to "yes, now"** — on a measured size
+trigger rather than the hypothesised uptime one, which is the opposite of how this section expected
+to be falsified. It does not change what gets built: still **one shared periodic hook** over
+`live-enforce-gate`, `churn-brake-guard`, `reversal-shadow-signals` and `otm-admission-tape`, whose
+first job is to measure which keying above is true. Successor: **TRA-5038**.
+
 ---
 
 ## AC5 — the inode budget: the file-count leg does **not** become binding
