@@ -289,9 +289,46 @@ function controls() {
     const clean = readFileSync(BUNDLE, 'utf8');
     const corrupt = join(tmp, 'corrupt.ts');
     // Delete ONE closure — the smallest possible real drift.
-    writeFileSync(corrupt, clean.replace(/^\s*\['2027-01-01'.*\n/m, ''), 'utf8');
+    //
+    // TRA-5039 — `[^\n]`, NOT `.`, and `^[ \t]*`, NOT `^\s*`. Two separate traps:
+    //
+    //  1. In JavaScript `.` does not match CR. CR is a LINE TERMINATOR, same class as
+    //     LF and the two Unicode separators at U+2028/U+2029. (Do not paste those two
+    //     literally into a `//` comment to say so — they terminate the comment and the
+    //     rest of the line parses as code. Learned writing this one.)
+    //
+    //     This bundle is checked out CRLF on every Windows clone (core.autocrlf=true,
+    //     and it carries no .gitattributes override), so the old `.*\n` halted before
+    //     the CR, never reached the LF, and the replace was a NO-OP. `corrupt` came
+    //     out byte-identical to `clean`, the generator correctly graded it 0, and
+    //     ARM 13 reported that as the DETECTOR failing — blocking root `pretest`'s
+    //     `&&` chain, and so the entire suite, on Windows while CI (LF) stayed green.
+    //     The detector was never broken. This line was.
+    //  2. `\s` matches newlines, so `^\s*` could swallow preceding blank lines and
+    //     delete more than the single closure this arm claims to remove.
+    // ONE regex, shared by the plant and by ARM 13-eol below. Two copies would let the
+    // eol arm agree with itself while the plant used something else entirely.
+    const DROP_ONE_CLOSURE = /^[ \t]*\['2027-01-01'[^\n]*\r?\n/m;
+    const planted = clean.replace(DROP_ONE_CLOSURE, '');
+    writeFileSync(corrupt, planted, 'utf8');
+    // The plant is asserted LIVE before the detector is graded on it. A fixture that
+    // removed nothing makes ARM 13 read exactly like a detector miss, which is how
+    // (1) got misfiled; these must be two distinguishable failures, not one.
+    arm('13-fixture', true, planted !== clean,
+      'the fixture actually removed a line (a no-op plant is NOT a detector miss)');
     arm(13, 1, runGenerator([`--check`, `--file=${corrupt}`]).status,
       'a bundle missing exactly one closure (2027-01-01) reads DRIFT');
+    // TRA-5039 — and the plant works under BOTH line endings. Asserted by
+    // normalising the fixture INPUT rather than by trusting whatever this checkout
+    // happens to hold: the defect above was invisible to CI precisely because CI
+    // only ever sees one of the two, so a control that reads the checkout's endings
+    // can only ever grade the half this box is standing on.
+    const BOTH = [['crlf', clean.replace(/\r?\n/g, '\r\n')], ['lf', clean.replace(/\r\n/g, '\n')]];
+    arm('13-eol', 'crlf:planted lf:planted',
+      BOTH.map(([k, src]) =>
+        `${k}:${src.replace(DROP_ONE_CLOSURE, '') !== src ? 'planted' : 'NO-OP'}`,
+      ).join(' '),
+      'the fixture regex is line-ending-agnostic (CR is a JS line terminator, so `.` cannot see it)');
     arm(14, 1, runGenerator([`--check`, `--file=${join(tmp, 'absent.ts')}`]).status,
       'an ABSENT bundle reads DRIFT, never 0');
     const same = join(tmp, 'same.ts');
