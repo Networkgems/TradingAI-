@@ -156,4 +156,36 @@ describe('getHeapCensusStatus', () => {
     expect(status).toMatchObject({ enabled: false, samples: 0, spanSec: 0, live: null });
     expect(status.trends).toEqual([]);
   });
+
+  // TRA-4986 AC4 — the pricing pass allocates ~10-15 MB transiently, so it must
+  // be unreachable except when a caller asks for it by name. `null` is the
+  // "nobody asked" value; a refusal object is the instrument having looked.
+  it('keeps the AC4 pricing pass off unless the caller asks for it', () => {
+    const engine = new EngineLike();
+    startHeapCensusSampler({
+      subjects: () => [{ klass: 'signalEngine', target: engine }],
+      intervalMs: 60_000,
+    });
+    expect(getHeapCensusStatus().pricing).toBeNull();
+    expect(getHeapCensusStatus({ deep: true }).pricing).toBeNull();
+
+    const sized = getHeapCensusStatus({ sizing: true });
+    expect(sized.pricing).not.toBeNull();
+    // No `marketData.minuteCandles` in this fixture's subjects, so the only
+    // honest answer is a refusal — never a 0-byte saving.
+    expect(sized.pricing!.refusal).toBe('store_row_absent');
+    expect(sized.pricing!.savingBytes).toBeNull();
+  });
+
+  it('does not price on the SAMPLED path — the 300s cadence must stay cheap', () => {
+    const engine = new EngineLike();
+    const handle = startHeapCensusSampler({
+      subjects: () => [{ klass: 'signalEngine', target: engine }],
+      intervalMs: 60_000,
+    });
+    const sample = handle!.sampleNow();
+    // The tape sample carries counts only; pricing is a read-time opt-in and has
+    // no representation in the ring at all.
+    expect(Object.keys(sample)).not.toContain('pricing');
+  });
 });

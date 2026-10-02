@@ -168,6 +168,59 @@ export function foldVerdict({ beforePopulation, afterPopulation }) {
 }
 
 /**
+ * ⭐ AC4-PRICED — the replacement instrument, graded off `census.pricing`.
+ *
+ * The fold AC4 asked for is dead twice over: the arms are cross-population
+ * (refused above) and the effect at the surviving 4-engine roster is 4.5% of the
+ * filed lever against a 184.1 MB within-arm spread, so even a perfectly matched
+ * A/B could not resolve it. The roster cannot be restored to settle it — bqb1's
+ * `tape/` pool is at 15.959/16 MiB with 41 KB of headroom against a ~49 KB mean
+ * file, so 68 writers would permanently evict ~130 files of leg-2 history
+ * (CTO, TRA-4986 comment `96d82cdd`).
+ *
+ * So the saving is PRICED instead: `bytesPerEntry x duplicateEntries`, both
+ * measured on the subject process in one read. This verdict's whole job is to
+ * keep the two halves apart — a PASS here is a point estimate under a stated
+ * model, never the matched fold, and the projection to the filed 68 is labelled
+ * and separate.
+ *
+ * ⚠️ A refusal is NOT a soft pass. A cold store prices the hoist at ~0 bytes,
+ * which reads as "the fix bought nothing"; that state must exit BLIND.
+ */
+export function pricedVerdict(pricing) {
+  if (!pricing) {
+    return {
+      verdict: 'BLIND',
+      reason:
+        'census.pricing is absent — either the build predates the AC4 pricing pass or the read did '
+        + 'not ask for it (?sizing=true). Absence is not a zero saving.',
+    };
+  }
+  if (pricing.refusal) {
+    return { verdict: 'BLIND', reason: `pricing REFUSED (${pricing.refusal}) — ${pricing.refusalDetail ?? 'no detail'}` };
+  }
+  if (typeof pricing.savingBytes !== 'number' || !Number.isFinite(pricing.savingBytes)) {
+    return { verdict: 'BLIND', reason: 'pricing published no refusal AND no savingBytes — the instrument contradicted itself' };
+  }
+  if (pricing.savingBytes <= 0) {
+    return {
+      verdict: 'FAIL',
+      reason:
+        `priced saving is ${pricing.savingBytes} bytes at population ${fmt(pricing.population)} — the hoist `
+        + 'removed no duplication at this roster. Read duplicateEntries: a non-positive one means the union '
+        + 'is as large as the per-engine sum, i.e. the universes were disjoint.',
+    };
+  }
+  return {
+    verdict: 'PASS',
+    reason:
+      `priced saving ${pricing.savingMB} MB MEASURED at population ${fmt(pricing.population)} `
+      + `(${fmt(pricing.duplicateEntries)} duplicate entries x ${fmt(pricing.bytesPerEntry)} bytes/entry, `
+      + `sharing efficiency ${fmt(pricing.sharingEfficiency)})`,
+  };
+}
+
+/**
  * How much of the FILED lever survives at a different roster, from the arms'
  * own numbers rather than from a constant.
  *
@@ -300,12 +353,25 @@ export function resolveBase(args) {
   return (args.base ?? SUBJECT_HOST).replace(/\/$/, '');
 }
 
+/**
+ * The live census URL, as ONE function so the selftest can assert the query the
+ * fetch actually sends rather than a reconstruction of it.
+ *
+ * `sizing=true` runs the AC4 pricing pass (a transient ~10-15 MB allocation on
+ * the subject). Asked for unconditionally because AC4 has no other instrument
+ * left: a read without it grades AC4 BLIND by construction, and a control that
+ * rebuilt this string itself would pass while the fetch dropped the parameter.
+ */
+export function censusUrl(args) {
+  return `${resolveBase(args)}/api/health/heap-census?deep=true&sizing=true`;
+}
+
 async function readCensus(args) {
   if (args.census) {
     if (!existsSync(args.census)) throw new Error(`--census file not found: ${args.census}`);
     return JSON.parse(readFileSync(args.census, 'utf-8'));
   }
-  const url = `${resolveBase(args)}/api/health/heap-census?deep=true`;
+  const url = censusUrl(args);
   const res = await fetch(url, { signal: AbortSignal.timeout(120_000) });
   if (!res.ok) throw new Error(`${url} -> HTTP ${res.status}`);
   return res.json();
@@ -449,6 +515,60 @@ function selftest() {
     check('the REAL before-arm report names its host', typeof arm.base === 'string' && arm.base.includes('bqb1'));
   }
 
+  // AC4-PRICED — the instrument that replaced the fold. Every one of its
+  // not-a-number states has to be BLIND, because every one of them also has a
+  // reading that looks like an ordinary result.
+  const goodPricing = {
+    refusal: null,
+    savingBytes: 3_200_000,
+    savingMB: 3.1,
+    duplicateEntries: 300,
+    bytesPerEntry: 10_600,
+    sharingEfficiency: 1,
+    population: 4,
+    projection: { label: 'PROJECTION — not a measurement', atPopulation: 68, mb: 66.1, duplicateEntries: 6511, unmeasuredInput: 'x' },
+  };
+  check('priced PASSES on a positive measured saving', pricedVerdict(goodPricing).verdict === 'PASS');
+  check('priced BLIND when census.pricing is absent', pricedVerdict(undefined).verdict === 'BLIND');
+  check('priced BLIND when census.pricing is null', pricedVerdict(null).verdict === 'BLIND');
+  // ⭐ The false-negative this instrument exists to refuse: a cold store has
+  // nothing to copy, so it prices at ~0 and reads as "the fix bought nothing".
+  check(
+    'priced BLIND on a cold store, NOT a 0-byte pass',
+    pricedVerdict({ refusal: 'store_cold', refusalDetail: 'nothing written since boot', savingBytes: null }).verdict === 'BLIND',
+  );
+  check(
+    'priced BLIND when an arm measured non-positive bytes',
+    pricedVerdict({ refusal: 'arm_non_positive', refusalDetail: 'gc', savingBytes: null }).verdict === 'BLIND',
+  );
+  check(
+    'priced BLIND when the population was unreadable',
+    pricedVerdict({ refusal: 'population_unreadable', refusalDetail: 'no signalEngine row', savingBytes: null }).verdict === 'BLIND',
+  );
+  // A refusal with a number still attached must NOT be read off the number.
+  check(
+    'priced reads the refusal BEFORE savingBytes',
+    pricedVerdict({ refusal: 'proxy_below_union', refusalDetail: 'x', savingBytes: 9_000_000 }).verdict === 'BLIND',
+  );
+  check(
+    'priced FAILS a non-positive saving that was NOT refused',
+    pricedVerdict({ ...goodPricing, savingBytes: 0, savingMB: 0, duplicateEntries: 0 }).verdict === 'FAIL',
+  );
+  check(
+    'priced BLIND when the instrument publishes neither a refusal nor a number',
+    pricedVerdict({ refusal: null, savingBytes: null }).verdict === 'BLIND',
+  );
+  check(
+    'priced BLIND on a non-finite saving',
+    pricedVerdict({ refusal: null, savingBytes: Number.NaN }).verdict === 'BLIND',
+  );
+  // The read must ASK for the pricing pass, or AC4 is BLIND by construction.
+  check(
+    'the live census URL the fetch uses requests BOTH the deep and the sizing pass',
+    censusUrl({}).includes('sizing=true') && censusUrl({}).includes('deep=true'),
+  );
+  check('the census URL honours --base', censusUrl({ base: 'https://example.test' }).startsWith('https://example.test/'));
+
   // Host pinning: the env var that flipped must not be a silent input.
   check('base defaults to the subject host', resolveBase({}) === SUBJECT_HOST);
   check('--base overrides and is normalised', resolveBase({ base: 'https://example.test/' }) === 'https://example.test');
@@ -578,7 +698,40 @@ async function main() {
   }
   bump(hasNote ? 0 : 1);
 
-  // ── AC4 ────────────────────────────────────────────────────────────────────
+  // ── AC4-PRICED ─────────────────────────────────────────────────────────────
+  // Graded BEFORE the fold on purpose: this is the instrument that can still
+  // return a number, and the fold below exists now only to keep refusing.
+  const priced = pricedVerdict(census.pricing);
+  console.log(`\n[AC4 priced] ${priced.verdict} — ${priced.reason}`);
+  const pr = census.pricing;
+  if (pr && !pr.refusal) {
+    console.log(`  bytes/entry ${fmt(pr.bytesPerEntry)} · bytes/candle ${fmt(pr.bytesPerCandle)} · candles/entry ${fmt(pr.candlesPerEntry)}`);
+    console.log(`  |union| ${fmt(pr.unionEntries)} measured · per-engine Σ ${fmt(pr.counterfactualEntries)} (proxy ${fmt(pr.proxyEntries)} x calibration)`);
+    console.log(`  arms (heapUsed delta per arm): ${(pr.arms ?? []).map((a) => `${(a.bytes / 1048576).toFixed(1)}MB/${a.entriesCopied}`).join(', ')}`);
+    console.log(`  cost: ${pr.cost?.sampleEntries} entries x ${pr.cost?.replicas} replicas x ${pr.cost?.arms} arms in ${pr.cost?.elapsedMs}ms`);
+    if (pr.projection) {
+      console.log(`  ${pr.projection.label} at ${pr.projection.atPopulation} engines: ${fmt(pr.projection.mb)} MB`);
+      console.log(`    (${fmt(pr.projection.duplicateEntries)} duplicate entries; unmeasured input: ${pr.projection.unmeasuredInput})`);
+      console.log('    ⚠️  This is the ONLY number here that is not a measurement. Do not quote it as one.');
+    }
+  }
+  bump(priced.verdict === 'PASS' ? 0 : priced.verdict === 'FAIL' ? 1 : 3);
+
+  // ── AC4 (the fold, retained as a refusal) ─────────────────────────────────
+  //
+  // ⭐ The fold NO LONGER OWNS AC4'S EXIT CODE. It is superseded by the priced
+  // arm above, and its every path at the current roster is a refusal — so if it
+  // kept bumping, this grader could never return anything but BLIND no matter
+  // what the evidence said, which is a control with no discriminating power
+  // left. It still runs, and it still prints, because a refusal with its reason
+  // attached is the record of WHY AC4 changed instrument.
+  //
+  // The one exception is a fold that actually clears its population gate: if a
+  // matched roster ever returns, a fold showing the heap UP is a real failure
+  // and bumps. `foldBump` is that asymmetry, named.
+  const foldBump = (code, why) => {
+    console.log(`    (fold ${code === 3 ? 'BLIND' : 'FAIL'} — not bumping the exit code: ${why})`);
+  };
   let window = null;
   if (args.from && args.to) {
     window = { fromMs: Date.parse(args.from), toMs: Date.parse(args.to) };
@@ -590,7 +743,7 @@ async function main() {
     window = autoQuiescentWindow(tape);
     if (!window) {
       console.log('\n[AC4 fold] BLIND — no market-shut run in the tape');
-      bump(3);
+      foldBump(3, 'AC4 is graded by the priced arm above');
     }
   }
 
@@ -598,7 +751,7 @@ async function main() {
     const q = quiescentWindow(tape, window.fromMs, window.toMs);
     if (q.verdict !== 'PASS') {
       console.log(`\n[AC4 fold] BLIND — ${q.reason}`);
-      bump(3);
+      foldBump(3, 'AC4 is graded by the priced arm above');
     } else {
       const s = q.samples;
       const spanH = (s[s.length - 1].atMs - s[0].atMs) / 3.6e6;
@@ -629,7 +782,7 @@ async function main() {
 
       if (warm === false) {
         console.log('  ⚠️  BLIND for AC4: no RTH session between boot and this arm — cold caches read clean for the WRONG REASON.');
-        bump(3);
+        foldBump(3, 'cold-cache arm; AC4 is graded by the priced arm above');
       }
 
       if (existsSync(BEFORE_ARM)) {
@@ -675,19 +828,25 @@ async function main() {
               + '— compare any predicted saving against THAT before calling a quiescent fold powered.',
             );
           }
-          bump(3);
+          foldBump(3, 'cross-population/cross-host; AC4 is graded by the priced arm above');
         } else {
           console.log(`\n  MATCHED-QUIESCENT FOLD: ${d >= 0 ? '+' : ''}${d.toFixed(1)} MB heapUsed (${before.heapUsedMB.mean} -> ${heap.mean})`);
           console.log(`    rss: ${(rss.mean - before.rssMB.mean >= 0 ? '+' : '')}${(rss.mean - before.rssMB.mean).toFixed(1)} MB (${before.rssMB.mean} -> ${rss.mean})`);
           console.log(`    population: ${pop.reason}`);
+          // A VALID fold is evidence again, so this one counts: a matched-roster
+          // quiescent arm whose heap went UP is a regression, not a refusal.
+          if (d > 0) {
+            console.log('    ⚠️  FAIL: matched-roster quiescent heap is HIGHER after the fix.');
+            bump(1);
+          }
         }
         if (before.build === (build.commitShort ?? '')) {
           console.log('    ⚠️  BLIND: both arms are the SAME build — this differences two reads of one binary, not the fix.');
-          bump(3);
+          foldBump(3, 'same-build self-difference; AC4 is graded by the priced arm above');
         }
       } else {
         console.log(`\n  BLIND for the fold — BEFORE arm ${BEFORE_ARM} not found`);
-        bump(3);
+        foldBump(3, 'AC4 is graded by the priced arm above');
       }
     }
   }

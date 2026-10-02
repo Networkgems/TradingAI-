@@ -33,6 +33,7 @@ import {
 } from './heap-retainer-census.js';
 import { RETAINER_BOUND_NOTES } from './retainer-bound-notes.js';
 import { candleShareStats, type CandleShareStats } from './market-data-candle-cache.js';
+import { priceCandleHoist, type CandleHoistPricing } from './candle-hoist-pricing.js';
 
 /**
  * 300 s. Chosen against the shape being measured, not for resolution: the
@@ -122,6 +123,18 @@ export interface HeapCensusStatus {
    * a roster of 1.
    */
   population: number | null;
+  /**
+   * TRA-4986 (AC4) — the PRICED saving of the candle hoist, measured on this
+   * process, replacing the cross-population heap fold AC4 asked for (see
+   * `candle-hoist-pricing.ts` for why that instrument is dead and underpowered).
+   *
+   * `null` when the caller did not ask (`?sizing=true`): it allocates ~10-15 MB
+   * transiently, which must never land on the 300 s sampled path. A present
+   * object with `refusal` set is the instrument saying so out loud — read
+   * `refusal` before any number, and note that a cold store prices the hoist at
+   * ~0 bytes, which is the false-negative this whole block is shaped around.
+   */
+  pricing: CandleHoistPricing | null;
 }
 
 let tape: HeapCensusTape | null = null;
@@ -212,7 +225,16 @@ export function __resetHeapCensusForTest(): void {
  * `deep` is opt-in per REQUEST, never on the sampled path: it is O(entries) and
  * the sampled path has to stay cheap enough to run during RTH on a live host.
  */
-export function getHeapCensusStatus(opts: CensusOptions = {}): HeapCensusStatus {
+export interface HeapCensusReadOptions extends CensusOptions {
+  /**
+   * TRA-4986 (AC4) — run the retained-bytes measurement and price the hoist.
+   * Opt-in per REQUEST for the same reason `deep` is, only more so: `deep` is
+   * O(entries) of reads, this is ~10-15 MB of transient allocation.
+   */
+  sizing?: boolean;
+}
+
+export function getHeapCensusStatus(opts: HeapCensusReadOptions = {}): HeapCensusStatus {
   const samples = tape ? tape.snapshot() : [];
   const spanSec =
     samples.length >= 2
@@ -238,8 +260,39 @@ export function getHeapCensusStatus(opts: CensusOptions = {}): HeapCensusStatus 
       liveError = err instanceof Error ? err.message : String(err);
     }
   }
+  // TRA-4986 (AC4). Priced off the rows from THIS read, never a second census:
+  // the whole defect AC4 tripped over was two arms describing two different
+  // populations, and re-folding here would re-open that seam inside one payload.
+  let pricing: CandleHoistPricing | null = null;
+  if (opts.sizing === true && live !== null) {
+    try {
+      pricing = priceCandleHoist({ rows: live, population });
+    } catch (err: unknown) {
+      // Same rule as `liveError`: a health route must not 500 because the thing
+      // it measures misbehaved. Surfaced as a refusal so it cannot read as a 0.
+      pricing = {
+        refusal: 'arm_non_positive',
+        refusalDetail: `pricing threw: ${err instanceof Error ? err.message : String(err)}`,
+        arms: [],
+        bytesPerEntry: null,
+        bytesPerCandle: null,
+        candlesPerEntry: null,
+        unionEntries: null,
+        proxyEntries: null,
+        counterfactualEntries: null,
+        duplicateEntries: null,
+        population,
+        savingBytes: null,
+        savingMB: null,
+        sharingEfficiency: null,
+        projection: null,
+        cost: { sampleEntries: 0, replicas: 0, arms: 0, elapsedMs: 0 },
+      };
+    }
+  }
   return {
     population,
+    pricing,
     enabled: timer !== null,
     intervalMs: configuredIntervalMs,
     capacity: configuredCapacity,

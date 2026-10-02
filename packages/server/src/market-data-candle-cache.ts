@@ -325,6 +325,19 @@ export function marketDataCandleCacheSize(): number {
 }
 
 /**
+ * TRA-4986 (AC4) — iterate the held series, for the retained-bytes measurement
+ * in `candle-hoist-pricing.ts`.
+ *
+ * Returns the live iterator rather than a materialised array on purpose: the
+ * caller samples a bounded prefix and stops, so nothing here is O(store). The
+ * arrays it yields are the REAL ones — the pricing path must never mutate them,
+ * and it does not: it only copies.
+ */
+export function marketDataCandleCacheEntries(): IterableIterator<[string, Candle[]]> {
+  return minuteCandles.entries();
+}
+
+/**
  * Test-only reset. A process-global store outlives a `beforeEach`, so without
  * this one suite's seeded candles silently satisfy another suite's cold-cache
  * assertion — the green-for-the-wrong-reason direction TRA-4158 hit on

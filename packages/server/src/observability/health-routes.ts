@@ -9917,6 +9917,10 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // to run on a live money-adjacent host mid-session.
   app.get('/api/health/heap-census', (req, res) => {
     const deep = req.query.deep === '1' || req.query.deep === 'true';
+    // TRA-4986 (AC4) — `?sizing=true` additionally measures the retained bytes
+    // of the hoisted candle store and prices the hoist. Opt-in because it
+    // allocates ~10-15 MB transiently; off by default and never sampled.
+    const sizing = req.query.sizing === '1' || req.query.sizing === 'true';
     const mem = process.memoryUsage();
     res.json({
       ok: true,
@@ -9929,7 +9933,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         externalMB: Math.round((mem.external / 1048576) * 10) / 10,
         arrayBuffersMB: Math.round((mem.arrayBuffers / 1048576) * 10) / 10,
       },
-      census: getHeapCensusStatus({ deep }),
+      census: getHeapCensusStatus({ deep, sizing }),
     });
   });
 
