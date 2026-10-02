@@ -1,5 +1,9 @@
 {
   "arm": "PRE (TRA-4158 shipped, TRA-4986 not)",
+  "base": "https://tradingai-bqb1.onrender.com",
+  "baseProvenance": "BACKFILLED 2026-10-02 from the ticket pin, NOT re-measured: this arm was read at build faae938837bf pid 76, which TRA-4986 and TRA-4158 both pin to bqb1. Recorded because the grader honoured TRADING_API_BASE (=http://localhost:4242 on the author box) and lined a 3-engine dev process up against this arm.",
+  "population": 68,
+  "populationProvenance": "MEASURED in this arm: max owners over the signalEngine.* rows in liveDeep. TRA-4902 took the live roster 68 -> 4 at 2026-10-01T19:53Z, so any AFTER arm must publish its own.",
   "build": "faae938837bf",
   "pid": 76,
   "startedAt": "2026-09-28T01:22:49.650Z",

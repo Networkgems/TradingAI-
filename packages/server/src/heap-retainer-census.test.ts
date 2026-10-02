@@ -1,9 +1,13 @@
 import { describe, it, expect } from 'vitest';
+import { RETAINER_BOUND_NOTES } from './retainer-bound-notes.js';
 import {
   censusObject,
   foldCensus,
+  enginePopulation,
+  resolvePopulationNotes,
   HeapCensusTape,
   type CensusSubject,
+  type RetainerRow,
 } from './heap-retainer-census.js';
 
 // TRA-4158 — the census exists to name the container that retains bqb1's RTH
@@ -311,5 +315,127 @@ describe('HeapCensusTape', () => {
       delta: ring?.delta,
       ratio: ring?.ratio,
     });
+  });
+});
+
+// TRA-4902 — the population a per-user retainer's fleet total is a function of.
+//
+// The live roster went 68 -> 4 at 2026-10-01T19:53Z via `destroyUserContext`,
+// with NO RESTART, so `startedAt` cannot segment reads by roster and a published
+// ceiling fitted to 68 was 17x too high the instant it was written. Everything
+// here is a control on "a number that silently belongs to a different roster".
+describe('enginePopulation / resolvePopulationNotes (TRA-4902)', () => {
+  const row = (name: string, owners: number, note?: RetainerRow['note']): RetainerRow => ({
+    name,
+    kind: 'map',
+    owners,
+    entries: 0,
+    maxEntries: 0,
+    nested: null,
+    note: note ?? null,
+  });
+
+  it('reads the population off signalEngine.* owners', () => {
+    expect(enginePopulation([
+      row('signalEngine.symbolState', 4),
+      row('signalEngine.dynamicSymbols', 3),
+    ])).toBe(4);
+  });
+
+  // ⭐ The control that defines the reader. The hoisted store is owners:1 BY
+  // DESIGN, so a max over all rows would peg the roster at 1 the moment a hoist
+  // lands — and then every post-fix read would "match" every pre-fix one.
+  it('IGNORES the owners:1 hoisted marketData store', () => {
+    expect(enginePopulation([
+      row('marketData.minuteCandles', 1),
+      row('signalEngine.symbolState', 68),
+    ])).toBe(68);
+  });
+
+  // null is its own value: an unreadable roster must not be reported as 1, which
+  // is a legitimate population and would fold as one.
+  it('is null — not 1 — when no signalEngine row is visible', () => {
+    expect(enginePopulation([row('marketData.minuteCandles', 1)])).toBeNull();
+  });
+
+  it('derives a per-owner bound against the measured population', () => {
+    const rows = [
+      row('signalEngine.symbolState', 4),
+      row('marketData.minuteCandles', 1, {
+        bound: null,
+        boundPerOwner: 100,
+        reason: 'union over {OWNERS} engines x 100',
+      }),
+    ];
+    expect(resolvePopulationNotes(rows)).toBe(4);
+    expect(rows[1].note).toMatchObject({ bound: 400, boundAtPopulation: 4 });
+    expect(rows[1].note?.reason).toBe('union over 4 engines x 100');
+  });
+
+  // ⭐ The regression this whole change exists to prevent: the SAME note must
+  // publish a different ceiling at a different roster, rather than the literal
+  // 6,800 it shipped with.
+  it('publishes a different ceiling at a different roster', () => {
+    const note = { bound: null, boundPerOwner: 100, reason: '{OWNERS} engines' };
+    const at68 = [row('signalEngine.symbolState', 68), row('marketData.minuteCandles', 1, { ...note })];
+    const at4 = [row('signalEngine.symbolState', 4), row('marketData.minuteCandles', 1, { ...note })];
+    resolvePopulationNotes(at68);
+    resolvePopulationNotes(at4);
+    expect(at68[1].note?.bound).toBe(6800);
+    expect(at4[1].note?.bound).toBe(400);
+  });
+
+  // An unreadable roster must not leave the last-known total standing.
+  it('reports a null bound — never a stale literal — when the roster is unreadable', () => {
+    const rows = [row('marketData.minuteCandles', 1, {
+      bound: 6800,
+      boundPerOwner: 100,
+      reason: 'bounded above by {OWNERS} engines x 100',
+    })];
+    expect(resolvePopulationNotes(rows)).toBeNull();
+    expect(rows[0].note?.bound).toBeNull();
+    expect(rows[0].note?.boundAtPopulation).toBeNull();
+    expect(rows[0].note?.reason).toContain('an UNREADABLE number of');
+  });
+
+  // The registry is module-global. Writing a derived total back into it would
+  // make the FIRST read's population stick for the life of the process.
+  it('does not mutate the shared note object it was given', () => {
+    const shared = { bound: null, boundPerOwner: 100, reason: '{OWNERS} engines' };
+    const rows = [row('signalEngine.symbolState', 7), row('marketData.minuteCandles', 1, shared)];
+    resolvePopulationNotes(rows);
+    expect(shared.bound).toBeNull();
+    expect(shared.reason).toBe('{OWNERS} engines');
+    expect(rows[1].note?.bound).toBe(700);
+  });
+
+  // A constant per-engine bound (symbolState's 100) is NOT population-derived.
+  it('leaves a non-derived bound alone', () => {
+    const rows = [row('signalEngine.symbolState', 4, { bound: 100, reason: 'per engine' })];
+    resolvePopulationNotes(rows);
+    expect(rows[0].note).toMatchObject({ bound: 100 });
+    expect(rows[0].note).not.toHaveProperty('boundAtPopulation');
+  });
+});
+
+// The registry itself, not a fixture of it. A fixture passing while the shipped
+// note still carries `bound: 6800` is the defect, not a pass.
+describe('RETAINER_BOUND_NOTES does not encode a roster (TRA-4902)', () => {
+  it('marketData.minuteCandles publishes a per-owner bound, not a fleet literal', () => {
+    const note = RETAINER_BOUND_NOTES['marketData.minuteCandles'];
+    expect(note.boundPerOwner).toBe(100);
+    // The literal 6,800 must not be the published ceiling. It may still appear
+    // in the prose as DATED PROVENANCE for the hoist, which is why this asserts
+    // on `bound` rather than grepping the reason.
+    expect(note.bound).toBeNull();
+    expect(note.reason).toContain('{OWNERS}');
+  });
+
+  it('every fleet total still quoted in prose carries the roster it was measured at', () => {
+    for (const [name, note] of Object.entries(RETAINER_BOUND_NOTES)) {
+      const prose = `${note.reason} ${note.boundedBy ?? ''}`;
+      if (!prose.includes('6,800') && !prose.includes('6800')) continue;
+      expect(prose, `${name} quotes 6,800 without naming the 68-context roster`).toContain('68');
+    }
   });
 });

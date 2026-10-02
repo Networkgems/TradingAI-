@@ -70,11 +70,15 @@ export const RETAINER_BOUND_NOTES: Readonly<Record<string, RetainerBoundNote>> =
       + '/api/watchlist/stocks report symbols the engine no longer tracks (TRA-2627 silent-absence '
       + 'shape). The growth is in the STORE: addStocksSymbol appends and nothing prunes, while the '
       + 'premarket smart-watchlist build and the midday news-catalyst refresh add market-wide names '
-      + 'to every user daily — measured, the whole +433/23.9h landed inside the overnight '
-      + 'market-shut window (~6.4/user), which is the premarket slot. Costs string memory only '
-      + '(~1.8%/month of heap) and zero request demand. Store-level TTL pruning with add-provenance '
-      + 'is the real fix and is a product decision (it removes symbols from a visible watchlist), '
-      + 'filed as TRA-5009.',
+      + 'to every user daily — measured 2026-10-01 AT A 68-CONTEXT ROSTER (build faae938837bf): the '
+      + 'whole +433/23.9h landed inside the overnight market-shut window, ~6.4 per user, which is the '
+      + 'premarket slot. ⚠️ That +433 is a FLEET rate at 68 engines and does not transfer: TRA-4902 took '
+      + 'the live box to 4 contexts on 2026-10-01T19:53Z, so the per-user ~6.4/day is the figure that '
+      + 'carries and the fleet rate must be re-measured at the current population (read owners on this '
+      + 'row) before it is quoted. Likewise the ~1.8%/month of heap was extrapolated at 68. Costs '
+      + 'string memory only and zero request demand at any roster. Store-level TTL pruning with '
+      + 'add-provenance is the real fix and is a product decision (it removes symbols from a visible '
+      + 'watchlist), filed as TRA-5009.',
     boundedBy:
       'the CONSUMER side, not this container: boundActiveSymbols() caps the polled universe at '
       + 'resolveScanSymbolLimit() = 100 per engine by priority tier (TRA-4830), published on '
@@ -87,15 +91,27 @@ export const RETAINER_BOUND_NOTES: Readonly<Record<string, RetainerBoundNote>> =
    * `market-data-candle-cache.ts`.
    */
   'marketData.minuteCandles': {
-    bound: 6800,
+    // DERIVED from the live population — see `boundPerOwner`. Any literal here
+    // is overwritten by resolvePopulationNotes(); the `null` is what a reader
+    // sees when the roster could not be read, which is not the same as 0.
+    bound: null,
+    boundPerOwner: 100,
     reason:
       'Bounded by CONSTRUCTION, not by an eviction. Keys are the union of the engines\' scan '
       + 'universes, each capped at resolveScanSymbolLimit() = 100 (TRA-4830), so the union is bounded '
-      + 'above by 68 owners x 100 = 6,800 — which is the pre-hoist fleet total (6,608), i.e. the worst '
-      + 'case is parity and not a regression. The expected value is |union|, which is this row\'s own '
-      + 'entries count and is therefore measured rather than assumed. dynamicSymbols being unbounded '
-      + 'does not leak in: at most 100 of a user\'s names survive boundActiveSymbols().',
-    boundedBy: 'resolveScanSymbolLimit() = 100 per engine (TRA-4830), union over owners.',
+      + 'above by {OWNERS} engines x 100 — DERIVED from the population measured in this same read, not '
+      + 'a constant. It was first published as the literal 6,800, which was 100 x the 68-context roster '
+      + 'of 2026-10-01; TRA-4902 then took the live box to 4 contexts with no restart, leaving that '
+      + 'literal 17x above the real ceiling, and a book returns with one API call so it would have gone '
+      + 'PERMISSIVE again on the next QA registration. For reference the pre-hoist fleet total was 6,608 '
+      + 'entries over 68 owners (2026-10-01, build faae938837bf), so AT THAT ROSTER the worst case was '
+      + 'parity and not a regression — that is provenance for the hoist, not a live comparand. The '
+      + 'expected value is |union|, which is this row\'s own entries count and is therefore measured '
+      + 'rather than assumed. dynamicSymbols being unbounded does not leak in: at most 100 of a user\'s '
+      + 'names survive boundActiveSymbols().',
+    boundedBy:
+      'resolveScanSymbolLimit() = 100 per engine (TRA-4830), union over the {OWNERS} engines measured in '
+      + 'this read. Read boundAtPopulation beside bound: a derived ceiling belongs to one roster.',
   },
 
   /**
@@ -105,20 +121,28 @@ export const RETAINER_BOUND_NOTES: Readonly<Record<string, RetainerBoundNote>> =
    * position/signal state, `technicalSnapshots` is derived per engine), so the
    * note records the bound without claiming they are hoistable.
    */
+  // ⚠️ `bound` on these two is PER ENGINE and is a real constant (the scan
+  // limit), so it is NOT derived — unlike `marketData.minuteCandles`, whose
+  // bound is a fleet union. The fleet totals quoted below are dated and carry
+  // the roster they were taken at, because 6,800 is 100 x 68 and nothing else.
   'signalEngine.symbolState': {
     bound: 100,
     reason:
-      'Seeded from getActiveSymbols(), so bounded at resolveScanSymbolLimit() = 100 per engine and '
-      + 'measured sitting at it (6,800 = 100 x 68, ring delta 0). NOT a hoist candidate: this is '
-      + 'per-user position/signal state, not market data.',
-    boundedBy: 'resolveScanSymbolLimit() = 100 per engine (TRA-4830).',
+      'Per-engine bound. Seeded from getActiveSymbols(), so bounded at resolveScanSymbolLimit() = 100 '
+      + 'per engine, and measured sitting at it: fleet 6,800 = 100 x the 68-context roster of '
+      + '2026-10-01 (ring delta 0). That fleet total is dated provenance — TRA-4902 moved the roster to '
+      + '4 — while the per-engine 100 holds at any population. NOT a hoist candidate: this is per-user '
+      + 'position/signal state, not market data.',
+    boundedBy: 'resolveScanSymbolLimit() = 100 per engine (TRA-4830). The 100 is per engine, not a fleet cap.',
   },
   'signalEngine.technicalSnapshots': {
     bound: 100,
     reason:
-      'Bounded at resolveScanSymbolLimit() = 100 per engine and measured sitting at it (6,800 = '
-      + '100 x 68, ring delta 0). Derived from the candle series, so hoistability follows from '
-      + 'whether the derivation is user-independent — not yet measured, so not claimed.',
-    boundedBy: 'resolveScanSymbolLimit() = 100 per engine (TRA-4830).',
+      'Per-engine bound. Bounded at resolveScanSymbolLimit() = 100 per engine and measured sitting at '
+      + 'it: fleet 6,800 = 100 x the 68-context roster of 2026-10-01 (ring delta 0), which is dated '
+      + 'provenance and not a current ceiling (TRA-4902 moved the roster to 4). Derived from the candle '
+      + 'series, so hoistability follows from whether the derivation is user-independent — not yet '
+      + 'measured, so not claimed.',
+    boundedBy: 'resolveScanSymbolLimit() = 100 per engine (TRA-4830). The 100 is per engine, not a fleet cap.',
   },
 };

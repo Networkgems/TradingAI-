@@ -90,12 +90,38 @@ export interface RetainerBoundNote {
   /**
    * The published cap, or `null` for "deliberately unbounded". `null` is a
    * CLAIM backed by {@link reason}, never the absence of one.
+   *
+   * ⚠️ When {@link boundPerOwner} is set this field is DERIVED at read time and
+   * whatever is written here is overwritten. Do not hand-write a total.
    */
   bound: number | null;
   /** The eviction rule when bounded; why unboundedness is correct when not. */
   reason: string;
   /** Where the bound actually lives, when it is not on this container. */
   boundedBy?: string;
+  /**
+   * TRA-4902 — a per-OWNER cap, for a container whose total bound is
+   * `boundPerOwner x <live engine population>` rather than a constant.
+   *
+   * The first version of `marketData.minuteCandles` published `bound: 6800`,
+   * which is `100 x 68` — the roster on the day it was written. TRA-4902 took
+   * bqb1 from 68 user contexts to 4 at 2026-10-01T19:53Z with no restart, which
+   * left that row publishing a ceiling 17x above the real one; and because a
+   * book returns with a single API call, the same literal goes PERMISSIVE the
+   * moment QA re-registers. A control that encodes a population size is wrong at
+   * every population except the one it was written at.
+   *
+   * So the total is derived from the measured population by
+   * {@link resolvePopulationNotes}, and reads `null` — never a stale literal —
+   * when the population cannot be read.
+   */
+  boundPerOwner?: number;
+  /**
+   * The population {@link bound} was derived at, when it was derived. Published
+   * so a reader can tell a derived ceiling from a constant one, and can tell
+   * WHICH roster a derived one belongs to.
+   */
+  boundAtPopulation?: number | null;
 }
 
 export interface CensusOptions {
@@ -254,6 +280,61 @@ export function foldCensus(subjects: readonly CensusSubject[], opts: CensusOptio
     }
   }
   return [...byName.values()].sort((a, b) => b.entries - a.entries || a.name.localeCompare(b.name));
+}
+
+/**
+ * The per-user engine population the rows were folded at.
+ *
+ * Read off `signalEngine.*` owners, and deliberately NOT as a max over all rows:
+ * the hoisted `marketData.*` store is `owners: 1` BY DESIGN, so including it
+ * would peg the population at 1 the moment a hoist lands. Max over the class
+ * rather than any single row, because not every engine carries every field at
+ * every instant, so one row's `owners` can undercount a fleet the maximum
+ * cannot.
+ *
+ * `null` when no `signalEngine.*` row is present at all — "could not read the
+ * roster" is its own value and must not be passed off as a population of 1.
+ */
+export function enginePopulation(rows: readonly RetainerRow[]): number | null {
+  let max: number | null = null;
+  for (const row of rows) {
+    if (!row.name.startsWith('signalEngine.')) continue;
+    if (!Number.isFinite(row.owners) || row.owners <= 0) continue;
+    if (max === null || row.owners > max) max = row.owners;
+  }
+  return max;
+}
+
+/**
+ * Resolve every population-dependent note against the measured population, and
+ * substitute `{OWNERS}` in the published prose so the row cannot narrate one
+ * roster while its number describes another.
+ *
+ * Mutates the rows' notes into fresh objects rather than editing the shared
+ * `RETAINER_BOUND_NOTES` registry in place — that registry is module-global and
+ * frozen in spirit; writing a derived total back into it would make the FIRST
+ * read's population stick for the life of the process.
+ */
+export function resolvePopulationNotes(rows: RetainerRow[]): number | null {
+  const population = enginePopulation(rows);
+  for (const row of rows) {
+    const note = row.note;
+    if (!note) continue;
+    const derived = note.boundPerOwner !== undefined;
+    const needsText = note.reason.includes('{OWNERS}') || (note.boundedBy?.includes('{OWNERS}') ?? false);
+    if (!derived && !needsText) continue;
+    const shown = population === null ? 'an UNREADABLE number of' : String(population);
+    row.note = {
+      ...note,
+      bound: derived
+        ? (population === null ? null : note.boundPerOwner! * population)
+        : note.bound,
+      ...(derived ? { boundAtPopulation: population } : {}),
+      reason: note.reason.split('{OWNERS}').join(shown),
+      ...(note.boundedBy === undefined ? {} : { boundedBy: note.boundedBy.split('{OWNERS}').join(shown) }),
+    };
+  }
+  return population;
 }
 
 /** One sample in the tape: memory levels plus the census that explains them. */

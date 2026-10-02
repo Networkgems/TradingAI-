@@ -29,6 +29,7 @@ import {
   type RetainerRow,
   type RetainerTrend,
   foldCensus,
+  resolvePopulationNotes,
 } from './heap-retainer-census.js';
 import { RETAINER_BOUND_NOTES } from './retainer-bound-notes.js';
 import { candleShareStats, type CandleShareStats } from './market-data-candle-cache.js';
@@ -106,6 +107,21 @@ export interface HeapCensusStatus {
    * sharing, and 0 is the expected reading.
    */
   candleShare: CandleShareStats;
+  /**
+   * TRA-4902 — the per-user engine population this read was taken at, off
+   * `signalEngine.*` owners (NOT a max over all rows: the hoisted
+   * `marketData.*` store is `owners: 1` by design).
+   *
+   * Published because every per-user retainer's fleet total is a function of it,
+   * and because it can change WITHOUT A RESTART: `destroyUserContext` tore down
+   * 64 contexts on the live process at 2026-10-01T19:53Z, so `startedAt` cannot
+   * be used to segment reads by roster. Any delta across two reads with different
+   * populations is confounded and must be refused, not disclaimed.
+   *
+   * `null` means no `signalEngine.*` row was visible — an unreadable roster, not
+   * a roster of 1.
+   */
+  population: number | null;
 }
 
 let tape: HeapCensusTape | null = null;
@@ -207,17 +223,23 @@ export function getHeapCensusStatus(opts: CensusOptions = {}): HeapCensusStatus 
   // is the reading that gets a real incident dismissed as a flaky endpoint.
   let live: RetainerRow[] | null = null;
   let liveError: string | null = null;
+  let population: number | null = null;
   if (subjectsFn) {
     try {
       // TRA-4986 — annotate with the published bound/reason unless the caller
       // supplied its own registry (tests do). `notes` never changes WHAT is
       // walked, only how a found row is labelled.
       live = foldCensus(subjectsFn(), { notes: RETAINER_BOUND_NOTES, ...opts });
+      // TRA-4902 — and resolve the population-dependent ones against the roster
+      // measured in THIS read, so no row can publish a ceiling fitted to a
+      // roster the box no longer has.
+      population = resolvePopulationNotes(live);
     } catch (err: unknown) {
       liveError = err instanceof Error ? err.message : String(err);
     }
   }
   return {
+    population,
     enabled: timer !== null,
     intervalMs: configuredIntervalMs,
     capacity: configuredCapacity,
