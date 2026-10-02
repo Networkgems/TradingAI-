@@ -6333,7 +6333,20 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // state instead of logs. `armed:false` with the env unset is the shipped
       // default; `stateUnreadable:true` means every consult is refusing
       // (fail closed) and an operator must inspect the commit file.
-      oneShotCostBarGrant: getLiveOtmOneShotGrantState(liveEnv, nowMs),
+      // TRA-5020 — `counterProvenance` says WHICH of these fields survive a
+      // restart, computed BY THE ROUTE so no reader has to diff two values by
+      // eye. `consults`/`grants`/`commits`/`refusalsByReason` are SINCE-BOOT
+      // (module-level tallies); `committed`/`stateUnreadable` are DURABLE. The
+      // block published both side by side with nothing distinguishing them, and
+      // bqb1 reboots ~6x/day — so a post-reboot `commits: 0` is evidence about
+      // NOTHING while reading byte-identically to "the grant was never spent".
+      // Read `counterProvenance.verdict` and `commitsDurable`, never `commits`,
+      // for any cross-boot claim. The boot stamp is handed in because the module
+      // cannot know it; without it the tallies' start instant renders UNKNOWN
+      // rather than being back-filled from the read time.
+      oneShotCostBarGrant: getLiveOtmOneShotGrantState(liveEnv, nowMs, {
+        processStartedAt: resolveBuildInfo().startedAt,
+      }),
       n: summary.n,
       opens: summary.opens,
       closes: summary.closes,
