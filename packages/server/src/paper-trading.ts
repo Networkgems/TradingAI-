@@ -31,6 +31,7 @@
 // open fill and one close fill per position id, at the original contract
 // count). Both bounds are documented here rather than silently absorbed.
 
+import type { OptionBasisWriter } from '@trading-app/shared';
 import { mkdir } from 'fs/promises';
 import { existsSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
@@ -56,25 +57,39 @@ import {
 const log = logger.child({ module: 'paper-trading' });
 
 /**
- * TRA-4781 — how many times the engine restated THIS row's entry basis.
+ * TRA-4781 — how many times the engine restated THIS row's entry basis
+ * **through the durable restatement log**.
  *
- * Three-valued on purpose, and the whole point of the ticket. A row the
- * restatement never reached (`quantity_mismatch` / `multi_leg` /
- * `covered_write`) and a row it reached at zero delta BOTH show
- * `basisDeltaUsd: 0.00` — the delta alone cannot separate them, and publishing
- * a bare `0` for both is the indistinguishable-payload shape this whole ticket
- * is about.
+ * Three-valued on purpose. A row the logged restatement never reached and a row
+ * it reached at zero delta BOTH show `basisDeltaUsd: 0.00` — the delta alone
+ * cannot separate them, and publishing a bare `0` for both is the
+ * indistinguishable-payload shape TRA-4781 is about.
  *
  *   • `null`  — the durable census is UNREADABLE (DATA_DIR unset, file absent,
  *     or open failed). NOT zero. A consumer must never `?? 0` this.
- *   • `0`     — census readable and it holds nothing for this id: the
- *     restatement genuinely never landed, so the engine's basis is still the
- *     open mark and `basisDeltaUsd` of 0.00 is structural, not measured.
- *   • `n >= 1` — it landed n times; a `basisDeltaUsd` of 0.00 is then a real
- *     measurement that happens to be zero.
+ *   • `0`     — census readable and it holds nothing for this id: **no LOGGED
+ *     restatement landed**.
+ *   • `n >= 1` — a logged restatement landed n times.
  *
- * Fails to `null` in every doubt: asserting "never restated" off a census we
- * could not read is the expensive direction.
+ * ⛔ TRA-5010 — `0` DOES NOT MEAN THE BASIS DID NOT MOVE, and the shipped
+ * wording here used to say it did ("the engine's basis is still the open mark
+ * and `basisDeltaUsd` of 0.00 is structural"). That is only true of a row whose
+ * basis no *other* writer touched, and there are eleven other writers. The log
+ * has **four** feeders (`broker_reconcile`, `recorded_fill_repair`,
+ * `operator_restatement`, `desk_lot_split`); `premiumPaid` is assigned at
+ * **twelve** sites. Measured on bqb1 2026-09-28: the census read
+ * `logPresent: true, count: 22`, newest record `2026-09-01T19:08:40Z`, while the
+ * 2026-09-22 fixture session moved the basis by $13.80 net across four pairs —
+ * i.e. `count: 0` on every one of them, and the basis moved anyway.
+ *
+ * So the honest pair is `basisRestatementCount` (did the LOGGED path land?) and
+ * {@link PaperCloseRow.basisDeltaAttribution} (did the basis move, and was the
+ * logged path what moved it?). This function answers only the first question,
+ * and widening it to count unlogged writes would destroy its one clean property:
+ * it is backed by an append-only durable log.
+ *
+ * Fails to `null` in every doubt: asserting "no logged restatement" off a census
+ * we could not read is the expensive direction.
  */
 function countBasisRestatements(positionId: string): number | null {
   try {
@@ -84,6 +99,69 @@ function countBasisRestatements(positionId: string): number | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * TRA-5010 — the attribution of `basisDeltaUsd`. Exhaustive and mutually
+ * exclusive, because the pair (`basisDeltaUsd`, `basisRestatementCount`) carries
+ * four readings that a consumer was collapsing into two.
+ *
+ *   • `null`                     — NOT COMPUTABLE: `basisDeltaUsd` is null (no
+ *     matched open, or either basis unknown). There is no delta to attribute.
+ *   • `census_unreadable`        — the delta is readable and the census is not.
+ *     The basis may or may not have moved through the logged path; we cannot say.
+ *     ⛔ Not an error state and not a zero.
+ *   • `logged_restatement`       — a logged restatement landed on this row
+ *     (`count >= 1`). It accounts for AT LEAST PART of the delta; it does not
+ *     prove it accounts for all of it, because an unlogged writer can have moved
+ *     the basis too and the log would not know.
+ *   • `unlogged_writer`          — ★ THE FINDING. The census is readable, holds
+ *     nothing, and the basis moved anyway ⇒ one of the eight unlogged writers did
+ *     it. A LEGITIMATE, EXPECTED live reading, not a fault. Read
+ *     {@link PaperCloseRow.basisWriter} for which one.
+ *   • `no_delta_no_restatement`  — census readable and empty, and the basis did
+ *     not move. The never-restated class on live data. Named rather than folded
+ *     into a boolean `explained: true`, which would be a VACUOUS pass: there is
+ *     nothing here to explain, and a row with nothing to explain must not read
+ *     identically to one whose gap was accounted for.
+ *
+ * That last bullet is why this is an enum and not the
+ * `basisDeltaExplainedByRestatement: boolean | null` TRA-5010 proposed — a
+ * boolean has three cells to carry and four readings to carry them.
+ */
+export type PaperBasisDeltaAttribution =
+  | 'census_unreadable'
+  | 'logged_restatement'
+  | 'unlogged_writer'
+  | 'no_delta_no_restatement';
+
+/**
+ * Float-noise guard ONLY. `entryBasisAtOpen - entryBasisRestated` is exactly
+ * `0` when the two bases are equal, so this never fires on real inputs; it is
+ * here so a denormal residue cannot be reported as a basis move.
+ *
+ * ⛔ Deliberately NOT a materiality threshold. Anything larger would silently
+ * re-merge "moved a little" into "did not move", which is the exact collapse
+ * this field exists to undo. A sub-cent basis move IS a basis move here.
+ */
+export const BASIS_DELTA_ZERO_EPSILON_USD = 1e-9;
+
+/**
+ * The shipped classifier, exported so the row, the daily summary and the tests
+ * all read one implementation — a second copy would be free to disagree with
+ * the published cell.
+ */
+export function classifyBasisDelta(
+  basisRestatementCount: number | null | undefined,
+  basisDeltaUsd: number | null | undefined,
+): PaperBasisDeltaAttribution | null {
+  if (typeof basisDeltaUsd !== 'number' || !Number.isFinite(basisDeltaUsd)) return null;
+  if (basisRestatementCount === null || basisRestatementCount === undefined) return 'census_unreadable';
+  if (!Number.isFinite(basisRestatementCount)) return 'census_unreadable';
+  if (basisRestatementCount >= 1) return 'logged_restatement';
+  return Math.abs(basisDeltaUsd) <= BASIS_DELTA_ZERO_EPSILON_USD
+    ? 'no_delta_no_restatement'
+    : 'unlogged_writer';
 }
 
 export const PAPER_TRADING_FLAG = 'ENABLE_PAPER_TRADING';
@@ -278,12 +356,37 @@ export interface PaperCloseRow {
    */
   basisDeltaUsd: number | null;
   /**
-   * Three-valued: `null` = census UNREADABLE · `0` = restatement never landed
-   * (so a zero delta is structural) · `n ≥ 1` = it landed (so a zero delta is
-   * measured). ⛔ Never `?? 0` this — that re-merges the two readings the
-   * field exists to split.
+   * Three-valued: `null` = census UNREADABLE · `0` = no **LOGGED** restatement
+   * landed · `n ≥ 1` = one landed n times. ⛔ Never `?? 0` this — that re-merges
+   * the two readings the field exists to split.
+   *
+   * ⛔ TRA-5010 — `0` IS NOT "THE BASIS DID NOT MOVE". It is a single-writer-
+   * family census: the durable log has four feeders and `premiumPaid` has twelve
+   * assignment sites, so `basisDeltaUsd != 0` beside `basisRestatementCount: 0`
+   * is a legitimate live reading meaning "the basis moved, through a path that
+   * does not append". Read {@link basisDeltaAttribution} for that distinction and
+   * {@link basisWriter} for which writer did it.
    */
   basisRestatementCount: number | null;
+  /**
+   * TRA-5010 — which of the four readings of the (`basisDeltaUsd`,
+   * `basisRestatementCount`) pair this row actually is. See
+   * {@link PaperBasisDeltaAttribution}. `null` ⇒ no delta to attribute.
+   *
+   * The cell that matters is `unlogged_writer`: the basis moved and the durable
+   * restatement log holds nothing for the row. That is the reading a consumer of
+   * `basisRestatementCount: 0` alone gets exactly backwards.
+   */
+  basisDeltaAttribution: PaperBasisDeltaAttribution | null;
+  /**
+   * TRA-5010 — the writer that last assigned the engine's `premiumPaid`, i.e.
+   * the one that produced `entryBasisRestated` above. `null` ⇒ the position was
+   * opened before the stamp shipped, or the engine passed no position at all.
+   *
+   * ⛔ `null` is UNSTAMPED, not "no writer". Splitting a future `_missing` census
+   * by the date this shipped is the TRA-4997 lesson; do not fold the two.
+   */
+  basisWriter: OptionBasisWriter | null;
   /** FALSE ⇒ no admitted paper open existed for this id (refused/pre-arm). */
   matchedOpen: boolean;
   /** TRUE on force-closes priced off the entry mid — mark unknown, P&L excluded. */
@@ -610,6 +713,12 @@ export interface PaperOptionCloseLike {
    * basis to report, and inventing one would be worse than a null.
    */
   premiumPaid?: number;
+  /**
+   * TRA-5010 — the writer that produced `premiumPaid` above. `OptionPosition`
+   * carries this, so the one production call site needs no change: widening the
+   * structural type is the whole wiring, exactly as `premiumPaid` was wired.
+   */
+  basisWriter?: OptionBasisWriter;
 }
 
 export function recordPaperOptionClose(opt: PaperOptionCloseLike, mode: string): { recorded: boolean } {
@@ -640,6 +749,7 @@ export function recordPaperOptionClose(opt: PaperOptionCloseLike, mode: string):
       entry && entryBasisAtOpen !== null && entryBasisRestated !== null
         ? (entryBasisAtOpen - entryBasisRestated) * entry.qty * entry.multiplier
         : null;
+    const basisRestatementCount = countBasisRestatements(opt.id);
     const row: PaperCloseRow = {
       kind: 'close',
       instrument: 'option',
@@ -660,7 +770,11 @@ export function recordPaperOptionClose(opt: PaperOptionCloseLike, mode: string):
       entryBasisAtOpen,
       entryBasisRestated,
       basisDeltaUsd,
-      basisRestatementCount: countBasisRestatements(opt.id),
+      basisRestatementCount,
+      // TRA-5010 — computed from the SHIPPED classifier, not re-derived here, so
+      // the row and the summary cannot fork.
+      basisDeltaAttribution: classifyBasisDelta(basisRestatementCount, basisDeltaUsd),
+      basisWriter: opt.basisWriter ?? null,
       matchedOpen: !!entry,
     };
     foldRowIntoBook(row);
@@ -723,6 +837,10 @@ export function recordPaperEquityClose(pos: PaperEquityCloseLike, mode: string):
       entryBasisRestated: null,
       basisDeltaUsd: null,
       basisRestatementCount: null,
+      // TRA-5010 — nothing to attribute: these paths carry no engine basis at
+      // all, so `null` here is "not computable", never "no writer".
+      basisDeltaAttribution: null,
+      basisWriter: null,
       matchedOpen: !!entry,
     };
     foldRowIntoBook(row);
@@ -780,6 +898,10 @@ export async function forceCloseAllPaperPositions(nowMs: number = Date.now()): P
       entryBasisRestated: null,
       basisDeltaUsd: null,
       basisRestatementCount: null,
+      // TRA-5010 — nothing to attribute: these paths carry no engine basis at
+      // all, so `null` here is "not computable", never "no writer".
+      basisDeltaAttribution: null,
+      basisWriter: null,
       matchedOpen: true,
       markStale: true,
     };
@@ -858,10 +980,52 @@ export interface PaperDailySummary {
    * broken census never render as the same number:
    *   • `unreadable` — the restatement census could not be read
    *   • `unstamped`  — row predates TRA-4781 (no basis fields on it at all)
-   *   • `neverRestated` — census readable, zero records: the delta is
-   *     structurally zero, NOT a measured agreement
+   *   • `neverRestated` — census readable, zero records: **no LOGGED restatement
+   *     landed on the row**. ⛔ TRA-5010 — this used to be documented as "the
+   *     delta is structurally zero", which is wrong: it counts rows whose basis
+   *     moved through one of the eight UNLOGGED writers too. It is a subset of
+   *     `inFold` and it is the SUM of `basisAttribution.unloggedWriter +
+   *     basisAttribution.noDeltaNoRestatement`. Read those two if you want the
+   *     structural zero on its own.
    */
   basisCloses: { inFold: number; unreadable: number; unstamped: number; neverRestated: number };
+  /**
+   * TRA-5010 — the in-fold basis closes partitioned by WHAT the pair
+   * (`basisDeltaUsd`, `basisRestatementCount`) actually says. Exhaustive over
+   * `basisCloses.inFold` and mutually exclusive, so the partition is auditable
+   * rather than asserted:
+   *
+   *     loggedRestatement + unloggedWriter + noDeltaNoRestatement
+   *       === basisCloses.inFold
+   *
+   * `unloggedWriter` is the cell this ticket exists for: the basis MOVED and the
+   * durable restatement log holds nothing for the row. A non-zero reading here is
+   * normal operation, not an incident — but it is also proof that
+   * `basisRestatementCount` is not an account of the basis gap. A day with
+   * `unloggedWriter: 0` and `neverRestated > 0` is the genuinely-never-moved day.
+   *
+   * (`census_unreadable` has no cell: it lands in `basisCloses.unreadable` and is
+   * excluded from the fold by the branch above, so counting it twice would break
+   * the sum identity.)
+   */
+  basisAttribution: {
+    loggedRestatement: number;
+    unloggedWriter: number;
+    noDeltaNoRestatement: number;
+  };
+  /**
+   * TRA-5010 item 3 — WHICH writer produced the basis each in-fold close settled
+   * against, keyed by {@link OptionBasisWriter} plus `unstamped` for a row opened
+   * before the stamp shipped. Bounded by construction (eleven possible keys, none
+   * derived from a per-row value), so it cannot saturate.
+   *
+   * This is the attribution the restatement log structurally cannot give: the log
+   * only ever sees its own four feeders, so "which of the eight unlogged writers
+   * moved the basis" was previously unanswerable from any payload. Absent key ⇒
+   * no close settled against that writer today; ⛔ never read a missing key as a
+   * measured zero for a writer the build cannot produce.
+   */
+  basisWriters: Record<string, number>;
   /**
    * TRA-4874 — WHY `theoreticalRealizedPnlUsd` reads the way it does. Exhaustive
    * and mutually exclusive, so the four readings a bare `0` collapsed are four
@@ -910,6 +1074,8 @@ export function buildPaperDailySummary(etDay?: string, env: NodeJS.ProcessEnv = 
     commissionAssumedUsd: 0,
     basisDeltaUsd: 0,
     basisCloses: { inFold: 0, unreadable: 0, unstamped: 0, neverRestated: 0 },
+    basisAttribution: { loggedRestatement: 0, unloggedWriter: 0, noDeltaNoRestatement: 0 },
+    basisWriters: {},
     pnlBasis: 'no_closes',
     pnlCloses: { inFold: 0, unmatched: 0, noMark: 0 },
     demoPnlCloses: 0,
@@ -977,6 +1143,19 @@ export function buildPaperDailySummary(etDay?: string, env: NodeJS.ProcessEnv = 
           summary.basisDeltaUsd += row.basisDeltaUsd;
           summary.basisCloses.inFold += 1;
           if (row.basisRestatementCount === 0) summary.basisCloses.neverRestated += 1;
+          // TRA-5010 — attribute the term, do not just total it. Re-derived from
+          // the row's own two numbers through the SHIPPED classifier rather than
+          // read off `row.basisDeltaAttribution`, so rows written before that
+          // field shipped bucket correctly instead of falling out of the
+          // partition. The two agree by construction on a stamped row.
+          const attribution = classifyBasisDelta(row.basisRestatementCount, row.basisDeltaUsd);
+          if (attribution === 'logged_restatement') summary.basisAttribution.loggedRestatement += 1;
+          else if (attribution === 'unlogged_writer') summary.basisAttribution.unloggedWriter += 1;
+          else if (attribution === 'no_delta_no_restatement') summary.basisAttribution.noDeltaNoRestatement += 1;
+          // `unstamped` keeps a pre-TRA-5010 row out of the ten real writers
+          // rather than attributing its basis to a writer nothing observed.
+          const writerKey = row.basisWriter ?? 'unstamped';
+          summary.basisWriters[writerKey] = (summary.basisWriters[writerKey] ?? 0) + 1;
         } else {
           summary.basisCloses.unreadable += 1;
         }

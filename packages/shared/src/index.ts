@@ -3705,6 +3705,62 @@ export interface ExitBreakerTrip {
   count: number;
 }
 
+/**
+ * TRA-5010 — WHICH code path last assigned {@link OptionPosition.premiumPaid}.
+ *
+ * `basisRestatementCount` (TRA-4781) counts the rows the **durable restatement
+ * log** holds for a position, and that log has exactly four feeders. The basis
+ * itself is assigned at **twelve** sites under **ten** distinct writers
+ * (measured on `7c5ca6a6`; eight are position mints, four are mutations in
+ * place). So a readable census reading `0` next to a
+ * non-zero `basisDeltaUsd` is a perfectly ordinary live state — "the basis
+ * moved, through a path that does not append" — and a consumer cannot tell
+ * WHICH path from the census, because the census never saw it.
+ *
+ * This tag is the attribution the log cannot carry: stamped at the assignment,
+ * last-writer-wins, so it always names the writer that produced the basis the
+ * row is carrying NOW (which is exactly the basis a close settles against).
+ *
+ * LOGGED — these four also append to the restatement log, so a row carrying one
+ * of them should also carry `basisRestatementCount >= 1`:
+ *   • `broker_reconcile`       — the Tradier sweep moved an engine-opened row to
+ *     broker truth (TRA-3965). The one writer TRA-4781's census was built for.
+ *   • `recorded_fill_repair`   — TRA-3896, repaired from this engine's own fills.
+ *   • `operator_restatement`   — TRA-3958, the operator pin. ⚠️ TRA-5010's own
+ *     table listed this as UNLOGGED; it has appended since 2026-08-22
+ *     (`ea73fb029`), which is what rules the operator pin OUT as the cause of a
+ *     two-signed gap on a session the census shows nothing for.
+ *   • `desk_lot_split`         — TRA-3909, a blended row unsplit back to its fill.
+ *
+ * UNLOGGED — the gap TRA-5010 is about. None of these append anything:
+ *   • `engine_open_mark`       — the open-time mark. In demo it is biased up by
+ *     `demoSlippagePct` (TRA-374), so it is ONE-SIGNED, which is what rules it
+ *     out as the whole story of a both-ways gap.
+ *   • `defined_risk_max_loss`  — a spread/combo's `maxLossPerLot / 100`.
+ *   • `short_credit`           — premium SOLD per share (CSP / covered call).
+ *   • `atm_synthetic`          — `underlyingPrice × OPTIONS_ATM_PREMIUM_RATIO`.
+ *   • `average_on_add`         — the contract-weighted blend on an add.
+ *     TWO-SIGNED and unlogged: adding below the basis moves it down, above moves
+ *     it up. The leading suspect for a both-ways basis gap.
+ *   • `import_adopted`         — a broker/desk row minted or overwritten from
+ *     `incoming.premiumPaid`. Also two-signed and unlogged.
+ *
+ * ABSENT (`undefined`) is its own reading and must never be coerced to a value:
+ * the row predates this stamp, or it was opened by a writer added after it. Not
+ * "no writer".
+ */
+export type OptionBasisWriter =
+  | 'engine_open_mark'
+  | 'defined_risk_max_loss'
+  | 'short_credit'
+  | 'atm_synthetic'
+  | 'average_on_add'
+  | 'import_adopted'
+  | 'broker_reconcile'
+  | 'recorded_fill_repair'
+  | 'operator_restatement'
+  | 'desk_lot_split';
+
 export interface OptionPosition {
   id: string;
   symbol: string;
@@ -3715,6 +3771,12 @@ export interface OptionPosition {
   contracts: number;
   contractsRemaining: number; // after partial exit at TP1; starts equal to contracts
   premiumPaid: number;        // per-share premium at entry
+  /**
+   * TRA-5010 — the writer that last assigned `premiumPaid` above. See
+   * {@link OptionBasisWriter}; absent ⇒ unstamped, never "no writer".
+   * Persisted with the row (`exportSnapshot` serialises the whole object).
+   */
+  basisWriter?: OptionBasisWriter;
   currentPremium: number;     // current mark (updated on each tick)
   /**
    * TRA-2890 — the broker-tape LAST TRADE per share, refreshed on the same tick

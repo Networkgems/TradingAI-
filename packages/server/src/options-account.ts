@@ -7,6 +7,7 @@ import type {
   TradeSignal,
   OptionLeg,
   OptionPosition,
+  OptionBasisWriter,
   OptionPendingExit,
   OptionsAccountState,
   OtmMispricingSignal,
@@ -5475,13 +5476,21 @@ export type AdoptedBasisRestatementOutcome =
       riskUnmanagedReason: string | null;
     };
 
-function restateEngineOpenedBasis(opt: OptionPosition, brokerPremium: number): void {
+function restateEngineOpenedBasis(
+  opt: OptionPosition,
+  brokerPremium: number,
+  // TRA-5010 — three different LOGGED callers share this one mutation, so the
+  // writer cannot be recovered from the row afterwards unless it is passed in.
+  // Required rather than defaulted: a fourth caller must choose a tag.
+  writer: OptionBasisWriter,
+): void {
   const previous = opt.premiumPaid;
   if (!Number.isFinite(previous) || previous <= 0) return;
   const ratio = brokerPremium / previous;
   if (!Number.isFinite(ratio) || ratio <= 0) return;
 
   opt.premiumPaid = brokerPremium;
+  opt.basisWriter = writer; // TRA-5010 — attribution the log cannot carry alone
   // NOT touched, deliberately:
   //   • `contracts` / `contractsRemaining` — the broker-flat sweep above owns
   //     disappearance, and letting the payload drive quantity would fight the
@@ -9692,6 +9701,8 @@ export class PaperOptionsAccount {
       contracts,
       contractsRemaining: contracts,
       premiumPaid,
+      // TRA-5010 — the open-time mark; demo biases it up by demoSlippagePct (one-signed).
+      basisWriter: 'engine_open_mark',
       currentPremium: premiumPaid,
       tp1Premium,
       tp1Hit: false,
@@ -9868,6 +9879,8 @@ export class PaperOptionsAccount {
       contracts,
       contractsRemaining: contracts,
       premiumPaid,
+      // TRA-5010 — the open-time mark; demo biases it up by demoSlippagePct (one-signed).
+      basisWriter: 'engine_open_mark',
       currentPremium: premiumPaid,
       tp1Premium,
       tp1Hit: false,
@@ -10154,6 +10167,8 @@ export class PaperOptionsAccount {
       contracts,
       contractsRemaining: contracts,
       premiumPaid,
+      // TRA-5010 — the capped worst case per lot, not a traded premium.
+      basisWriter: 'defined_risk_max_loss',
       currentPremium: premiumPaid,
       // Combos are held to manual close / expiry; the per-leg SL/TP/trailing
       // engine skips them (sentinels keep checkExits a no-op even if reached).
@@ -10260,6 +10275,11 @@ export class PaperOptionsAccount {
     const addPricePerShare = addDebitPerContract / 100;
     // Blend the per-share basis: (Σ existing + add) / total contracts.
     opt.premiumPaid = (opt.premiumPaid * opt.contracts + addPricePerShare * addContracts) / newContracts;
+    // TRA-5010 — this blend appends NOTHING to the restatement log, and it moves
+    // the basis in EITHER direction (an add below the basis lowers it). That makes
+    // it the leading candidate for a both-ways `basisDeltaUsd` on a session whose
+    // restatement census is empty, and this stamp is the only trace it leaves.
+    opt.basisWriter = 'average_on_add';
 
     // Defined-risk combo: scale the reserved capital + display totals. The
     // per-lot defined-risk bound is unchanged; we only add lots.
@@ -10437,6 +10457,8 @@ export class PaperOptionsAccount {
       // Short basis: the premium sold per share. Settlement reads creditUsd /
       // collateralUsd directly rather than the long `(mark − premiumPaid)` math.
       premiumPaid: creditPerShare,
+      // TRA-5010 — premium SOLD per share — settlement reads creditUsd, not (mark - basis).
+      basisWriter: 'short_credit',
       currentPremium: creditPerShare,
       // Held to roll / assignment / expiry — sentinels keep the long exit
       // engine a no-op even if a covered write ever reached it.
@@ -10781,6 +10803,8 @@ export class PaperOptionsAccount {
       contracts,
       contractsRemaining: contracts,
       premiumPaid: creditPerShare,
+      // TRA-5010 — premium SOLD per share — settlement reads creditUsd, not (mark - basis).
+      basisWriter: 'short_credit',
       currentPremium: creditPerShare,
       tp1Premium: Number.POSITIVE_INFINITY,
       tp1Hit: false,
@@ -10938,6 +10962,8 @@ export class PaperOptionsAccount {
       contracts,
       contractsRemaining: contracts,
       premiumPaid,
+      // TRA-5010 — underlyingPrice x OPTIONS_ATM_PREMIUM_RATIO — a model, not a quote.
+      basisWriter: 'atm_synthetic',
       currentPremium: premiumPaid,
       tp1Premium,
       tp1Hit: false,
@@ -14838,7 +14864,7 @@ export class PaperOptionsAccount {
     // what re-derives the stop off the corrected basis: BAC 1.41 -> 1.65 carries
     // the 0.80 stop to 1.32 and the 1.50 TP1 to 2.475.
     this.recordEngineBasisRestatement(opt, recorded.premiumPaid, 'recorded_fill_repair');
-    restateEngineOpenedBasis(opt, recorded.premiumPaid);
+    restateEngineOpenedBasis(opt, recorded.premiumPaid, 'recorded_fill_repair');
     this.finishEngineBasisRestatement(opt);
 
     accountLog.warn('engine row basis REPAIRED from this engine\'s own recorded fill', {
@@ -15072,6 +15098,10 @@ export class PaperOptionsAccount {
      */
     const install = (row: OptionPosition): boolean => {
       row.premiumPaid = requestedPremiumPaid;
+      // TRA-5010 — this path DOES append (`operator_restatement`, since
+      // ea73fb029 / 2026-08-22), which is what rules the operator pin out as the
+      // cause of a basis move on a session whose restatement census is empty.
+      row.basisWriter = 'operator_restatement';
       // ★ The correction is a STANDING INSTRUCTION, not a value. Without this
       // pin the write lands, reads back perfectly, and the next Tradier sweep
       // 30s later copies the broker's blend back over it — measured on bqb1 at
@@ -15358,7 +15388,7 @@ export class PaperOptionsAccount {
             continue;
           }
           this.recordEngineBasisRestatement(existing, incoming.premiumPaid);
-          restateEngineOpenedBasis(existing, incoming.premiumPaid);
+          restateEngineOpenedBasis(existing, incoming.premiumPaid, 'broker_reconcile');
           this.finishEngineBasisRestatement(existing);
           // Count it: an engine-opened row was previously invisible to the
           // summary, so a reconcile that fixed nothing for it still reported
@@ -15655,6 +15685,10 @@ export class PaperOptionsAccount {
           existing.contracts = incoming.contracts;
           existing.contractsRemaining = incoming.contracts;
           existing.premiumPaid = incoming.premiumPaid;
+          // TRA-5010 — the IMPORTED-row arm. Unlike the engine-opened arm ~300
+          // lines above, nothing here appends to the restatement log, and the
+          // broker's figure can land either side of ours.
+          existing.basisWriter = 'import_adopted';
           // Mark current premium as the entry premium until a fresh quote
           // refreshes it — better than zero or stale data.
           existing.currentPremium = incoming.premiumPaid;
@@ -15682,6 +15716,8 @@ export class PaperOptionsAccount {
         contracts: incoming.contracts,
         contractsRemaining: incoming.contracts,
         premiumPaid: incoming.premiumPaid,
+        // TRA-5010 — the broker's own figure for a row this engine did not open.
+        basisWriter: 'import_adopted',
         currentPremium: incoming.premiumPaid,
         // TRA-361 — thresholds installed by `applyImportedRiskThresholds`
         // below so the auto-manage flag and the new RV-defaults logic share
@@ -15947,7 +15983,7 @@ export class PaperOptionsAccount {
         row.contracts = plan.split.toContracts;
         row.contractsRemaining = plan.split.toContracts;
         this.recordEngineBasisRestatement(row, plan.split.toPremiumPaid, 'desk_lot_split');
-        restateEngineOpenedBasis(row, plan.split.toPremiumPaid);
+        restateEngineOpenedBasis(row, plan.split.toPremiumPaid, 'desk_lot_split');
         this.finishEngineBasisRestatement(row);
         this.lotAdoptionSplitTotal += 1;
         split = 1;
@@ -16002,6 +16038,8 @@ export class PaperOptionsAccount {
         contracts: plan.mint.contracts,
         contractsRemaining: plan.mint.contracts,
         premiumPaid: plan.mint.premiumPaid,
+        // TRA-5010 — the desk lot-adoption mint.
+        basisWriter: 'import_adopted',
         // The mark refresher repopulates this from the quote cache; the entry
         // price is a better placeholder than zero or the broker's blend.
         currentPremium: plan.mint.premiumPaid,
