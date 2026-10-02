@@ -361,7 +361,7 @@ import { describeOtmProfitSchedule } from '../otm-profit-schedule.js';
 import { summarizeOptionsBreakerLedger } from '../options-breaker-ledger.js'; // TRA-3218
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX, ENTRY_DELTA_THETA_RATIO_FLOOR, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
-import { resolveDemoFlagEnv, DEMO_FLAG_ALLOWLIST } from '../demo-flags.js';
+import { resolveDemoFlagEnv, resolveDemoFlagEnvFromEnv, DEMO_FLAG_ALLOWLIST } from '../demo-flags.js';
 // TRA-4436 — demo-effective ma20 confirm bars, derived from the shipped
 // `buildRvExitParams` so the option-swing-exits readout cannot drift from it.
 import { demoEffectiveMa20ConfirmBars } from '../rv-exit-params.js';
@@ -9267,8 +9267,21 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // was in fact writing rows — an arm indicator that disagrees with the
     // recorder it describes is worse than no indicator, because it is the field
     // an operator checks to confirm the arming step worked.
-    const dir = process.env.DATA_DIR;
-    const flagEnv = dir ? resolveDemoFlagEnv(dir) : process.env;
+    //
+    // TRA-5030 — through `resolveDemoFlagEnvFromEnv` rather than the inline
+    // `dir ? resolveDemoFlagEnv(dir) : process.env` idiom TRA-4893 shipped. That
+    // idiom tests TRUTHINESS, and a blank-but-present `DATA_DIR` (`' '`) is truthy,
+    // so it resolved the overlay against a directory literally named `" "`. The
+    // helper trims, which makes blank behave as unset; it owns the three-state
+    // decision and carries the reasoning. Not `resolveDataDir()` (what
+    // `check:data-dir` prescribes generically): that would consult
+    // `<bundle>/data/demo-flags.json` when `DATA_DIR` is unset, which the engine
+    // never does — re-opening the route-vs-recorder disagreement above, inverted.
+    //
+    // ⚠️ The 11 sibling reads in this file still carry the naked idiom, so do NOT
+    // "match the neighbours" here — they are the backlog, not the pattern. TRA-5037
+    // carries them, the recorder included, with the per-site classification.
+    const flagEnv = resolveDemoFlagEnvFromEnv();
     const enabled = isOptionRealFillShadowEnabled(flagEnv);
 
     res.json({

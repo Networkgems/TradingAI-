@@ -665,6 +665,52 @@ export function resolveDemoFlagEnv(
 }
 
 /**
+ * TRA-5030 — {@link resolveDemoFlagEnv} with the `DATA_DIR` lookup folded in, so a
+ * caller that wants "the overlay env, resolved the way the engine resolves it" does
+ * not have to re-spell the env read and cannot get the BLANK case wrong.
+ *
+ * The three states, which is the thing this helper exists to make one decision about:
+ *
+ *   - **unset**   ⇒ `baseEnv` verbatim. There is no canonical file location to read,
+ *     so there is no overlay. Deliberately NOT `resolveDataDir()`: that returns the
+ *     in-bundle default root, which would make a reader consult
+ *     `<bundle>/data/demo-flags.json` on a host where the ENGINE never does — an arm
+ *     indicator that disagrees with the recorder it describes, which is exactly the
+ *     defect TRA-4893 closed, re-opened in the opposite direction.
+ *   - **blank** (`''`, `' '`, any all-whitespace value) ⇒ treated as UNSET. The naked
+ *     idiom this replaces tested truthiness, and `' '` is truthy, so it resolved the
+ *     overlay against a directory literally named `" "` relative to the launch cwd.
+ *     Blank-but-present is not hypothetical — bqb1 has reached it twice
+ *     (TRA-2136 / TRA-2193 / TRA-2195).
+ *   - **set**     ⇒ `baseEnv` with `<dir>/demo-flags.json` layered on top, file wins.
+ *
+ * Takes the env as an ARGUMENT rather than reading the global: that is what makes the
+ * blank case unit-testable without `vi.stubEnv`, and it keeps the banned inline
+ * literal (`scripts/check-data-dir.mjs`, TRA-2603) out of this file.
+ *
+ * ⚠️ The blank branch is NOT merely cosmetic, but its cost today is an INEFFECTIVE
+ * ARM rather than a wrong readout. `loadDemoFlagFile(' ')` misses and
+ * {@link resolveDemoFlagEnv} then returns `baseEnv`, so the old idiom also ended up at
+ * `process.env` — by accident, via a doomed filesystem read. The real asymmetry is
+ * against the WRITER: `index.ts` arms through `resolveDataDir()`, which trims, so a
+ * blank `DATA_DIR` has the arm written to `<bundle>/data/demo-flags.json` and read
+ * from `" "/demo-flags.json`. The write returns 200 and its read-back succeeds; the
+ * flag never takes.
+ *
+ * ⚠️ 15 of the 17 reader sites still gate on truthiness — including
+ * `SignalEngine.resolveDemoFlagEnv()`, which is the RECORDER, so the ineffective arm
+ * above is still live until they are converted to this helper. TRA-5037 carries the
+ * migration and the per-site classification; TRA-5030 converted only the one site
+ * `check:data-dir` flagged.
+ */
+export function resolveDemoFlagEnvFromEnv(
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const dir = baseEnv['DATA_DIR']?.trim();
+  return dir ? resolveDemoFlagEnv(dir, baseEnv) : baseEnv;
+}
+
+/**
  * Result of a {@link writeDemoFlagFile} call: the resulting on-disk map plus a
  * per-key disposition so the caller can audit-log exactly what changed.
  */
