@@ -82,15 +82,18 @@ export const SHADOW_CANDLE_TIMEFRAME_MS = 5 * 60_000;
  * `market-data-daily-cache` store `refreshTechnicalSnapshot` warms for free and
  * `otmDailyAtr` already reads for the sibling (entry-invalidation) leg.
  *
- * ⚠️ NOMINAL, and the one place the distinction bites. A daily series' MEASURED
- * spacing is never this number: weekends and holidays make the median
- * consecutive delta 86400000 only across a Mon–Fri run, and a session-boundary
- * gap is 3x it. So with the flag on `daily` the route's configured
- * `atrTimeframeMs` and a row's measured `chandelier.atrTimeframeMs` are EXPECTED
- * to differ — the row is the measurement (TRA-4991's rule), and a measured
- * ~86.4e6 ± a weekend is the positive confirmation that the daily series is what
- * the ATR was actually taken on. ⛔ Do not "reconcile" these two by asserting
- * equality; that assertion would fail on every correct daily read.
+ * ⚠️ NOMINAL — treat it as an order of magnitude, not an identity. A daily
+ * series' consecutive deltas are NOT constant: a weekend gap is 3x this and a
+ * holiday more, so the series carries a mixture. `measureCandleTimeframeMs`
+ * takes the LOWER MEDIAN, and on an ordinary weekday-dense window the 1-day
+ * gaps outnumber the weekend ones about 4:1, so the measured value normally
+ * lands exactly here — but that is a property of the window, not a guarantee:
+ * a short or holiday-dense series can put the lower median at 3 days.
+ *
+ * ⛔ So do NOT gate anything on `measured === DAILY_CANDLE_TIMEFRAME_MS`. The
+ * useful discrimination is against the 5m constant, which is ~288x smaller:
+ * `series: 'daily'` with a measured spacing anywhere near 300000 means the
+ * selector flipped and the cache did not. That is the reading worth asserting.
  */
 export const DAILY_CANDLE_TIMEFRAME_MS = 86_400_000;
 

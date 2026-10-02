@@ -150,12 +150,15 @@ describe('TRA-4992 fixture preconditions — the two series genuinely disagree',
 
   it('measured spacing distinguishes the two series, and the daily one is NOT the nominal constant', () => {
     expect(measureCandleTimeframeMs(fiveMin())).toBe(SHADOW_CANDLE_TIMEFRAME_MS);
-    // This fixture is a synthetic calendar-day grid, so it measures exactly.
-    // A REAL daily series does not: weekends make the median delta 86400000 only
-    // across a Mon–Fri run. Hence `DAILY_CANDLE_TIMEFRAME_MS` is documented
-    // NOMINAL and the route/row pair must never be asserted equal in prod.
+    // This fixture is a synthetic gap-free calendar grid, so it measures
+    // exactly. A REAL daily series carries weekend/holiday gaps and only
+    // normally lands here (1-day deltas outnumber weekend ones ~4:1 under the
+    // LOWER MEDIAN) — which is why `DAILY_CANDLE_TIMEFRAME_MS` is documented
+    // NOMINAL and nothing in prod gates on equality with it.
     expect(measureCandleTimeframeMs(daily())).toBe(DAILY_CANDLE_TIMEFRAME_MS);
-    expect(DAILY_CANDLE_TIMEFRAME_MS).not.toBe(SHADOW_CANDLE_TIMEFRAME_MS);
+    // The discrimination that IS robust: the two scales are ~288x apart, so a
+    // daily read can never be mistaken for a 5m one.
+    expect(DAILY_CANDLE_TIMEFRAME_MS / SHADOW_CANDLE_TIMEFRAME_MS).toBe(288);
   });
 });
 
