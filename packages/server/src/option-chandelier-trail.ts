@@ -114,10 +114,65 @@ export interface OptionChandelierAtrSource {
 
 // ── AC3 — the high-beta branch counter ───────────────────────────────────────
 
+/**
+ * Why a row the exit pass looked at produced NO ratchet.
+ *
+ * ⛔ THIS IS AC3'S DENOMINATOR, and without it AC3 has the defect it was filed
+ * against. Measured on live `7b99dda8cd30` minutes after this shipped: `ratchets:
+ * 0` across both books — and the book held exactly TWO open rows, both
+ * `bull_put` combos. The chandelier is single-leg only, so that zero was a 0/0:
+ * nothing was ELIGIBLE. A bare `ratchets: 0` reads identically to "the trail ran
+ * all day and never went high-beta", which is the exact "reads the same whether
+ * the branch is live or dead" failure the counter exists to kill, one level up.
+ *
+ * `multi_leg` — a combo (`legs.length > 1`). Held to expiry / manual close; the
+ * single-leg trail never evaluates it. ⚠ Counted at the exit loop's OWN combo
+ * filter, which `continue`s ~400 lines before the chandelier chain — a census
+ * taken at the chain cannot see these rows at all, which is exactly how the live
+ * 0/0 above came to be unreadable.
+ * `covered_write` — a cash-secured put / covered call. Short credit positions
+ * with an inverted P&L basis; the long-side schedule does not apply. Same filter
+ * boundary as `multi_leg`.
+ * `retired` — TRA-3941: the whole chandelier family is retired on
+ * `single_leg_otm`, so those rows never reach the ratchet. This is the cell that
+ * explains a zero on a book trading only that sleeve.
+ * `no_exit_risk` — no `OptionExitRiskInput` was attached, i.e. the exit-risk
+ * master is off. A STRUCTURAL zero; read `exitRiskMaster` beside the census.
+ * `no_spot_or_atr` — eligible, but the tick served no underlying spot or no
+ * positive ATR (too few cached bars for this underlying). The nearest cell to a
+ * real absence: the trail would have run if the feed had reached it.
+ *
+ * ⛔ `rowsSeen` IS NOT THE OPEN-ROW COUNT. It counts rows reaching the chandelier
+ * chain plus the two filters named above; the exit loop has further `continue`s
+ * (an unmirrored import, an in-flight `pendingExit`) that are NOT instrumented
+ * here. For the book census read `/api/health/option-journal?rows=open`. What
+ * `rowsSeen` is good for is the question it was added to answer: is a
+ * `ratchets: 0` a rate or a 0/0?
+ */
+export type ChandelierSkipReason =
+  | 'retired'
+  | 'multi_leg'
+  | 'covered_write'
+  | 'no_exit_risk'
+  | 'no_spot_or_atr';
+
+export const CHANDELIER_SKIP_REASONS: readonly ChandelierSkipReason[] = [
+  'retired', 'multi_leg', 'covered_write', 'no_exit_risk', 'no_spot_or_atr',
+];
+
 /** One book's ratchet tally. `maxAtrPct` is `null` until an `atrPct` is seen. */
 export interface ChandelierRatchetTally {
+  /**
+   * Every row the exit pass evaluated for the chandelier, ratcheted or not —
+   * `ratchets + Σ skipped`. ⛔ READ THIS FIRST. `rowsSeen: 0` means the pass
+   * looked at NO row, so every other number below is a 0/0 and none of them is a
+   * reading about the trail.
+   */
+  rowsSeen: number;
   /** Ratchets resolved, one per row per exit pass. */
   ratchets: number;
+  /** Why the other `rowsSeen − ratchets` rows produced none. See {@link ChandelierSkipReason}. */
+  skipped: Record<ChandelierSkipReason, number>;
   /** Resolved to `EXIT_CHANDELIER_ATR_MULT_HIGHBETA`. */
   highBeta: number;
   /** Resolved to `EXIT_CHANDELIER_ATR_MULT` with a MEASURED `atrPct` below the threshold. */
@@ -155,7 +210,15 @@ export interface ChandelierRatchetSummary {
 type RatchetMode = 'live' | 'demo';
 
 function emptyTally(): ChandelierRatchetTally {
-  return { ratchets: 0, highBeta: 0, base: 0, baseAtrPctAbsent: 0, maxAtrPct: null };
+  return {
+    rowsSeen: 0,
+    ratchets: 0,
+    skipped: { retired: 0, multi_leg: 0, covered_write: 0, no_exit_risk: 0, no_spot_or_atr: 0 },
+    highBeta: 0,
+    base: 0,
+    baseAtrPctAbsent: 0,
+    maxAtrPct: null,
+  };
 }
 
 const ledger: Record<RatchetMode, ChandelierRatchetTally> = {
@@ -179,6 +242,7 @@ export function noteChandelierRatchet(
   mult: number,
 ): void {
   const tally = ledger[mode];
+  tally.rowsSeen += 1;
   tally.ratchets += 1;
   const measured = typeof atrPct === 'number' && Number.isFinite(atrPct);
   if (measured && (tally.maxAtrPct === null || (atrPct as number) > tally.maxAtrPct)) {
@@ -196,10 +260,26 @@ export function noteChandelierRatchet(
   }
 }
 
+/**
+ * Record ONE row the exit pass evaluated for the chandelier that produced NO
+ * ratchet, and WHY (AC3's denominator). See {@link ChandelierSkipReason} — the
+ * live 0/0 this exists for is documented there.
+ */
+export function noteChandelierRowSkipped(
+  mode: RatchetMode,
+  reason: ChandelierSkipReason,
+): void {
+  const tally = ledger[mode];
+  tally.rowsSeen += 1;
+  tally.skipped[reason] += 1;
+}
+
 function foldTallies(parts: readonly ChandelierRatchetTally[]): ChandelierRatchetTally {
   const out = emptyTally();
   for (const p of parts) {
+    out.rowsSeen += p.rowsSeen;
     out.ratchets += p.ratchets;
+    for (const r of CHANDELIER_SKIP_REASONS) out.skipped[r] += p.skipped[r];
     out.highBeta += p.highBeta;
     out.base += p.base;
     out.baseAtrPctAbsent += p.baseAtrPctAbsent;
@@ -212,14 +292,24 @@ function foldTallies(parts: readonly ChandelierRatchetTally[]): ChandelierRatche
 
 /** The since-boot ratchet census (AC3). Pure read; copies, never aliases. */
 export function summarizeChandelierRatchets(): ChandelierRatchetSummary {
-  const live = { ...ledger.live };
-  const demo = { ...ledger.demo };
+  const live = { ...ledger.live, skipped: { ...ledger.live.skipped } };
+  const demo = { ...ledger.demo, skipped: { ...ledger.demo.skipped } };
   return {
     byMode: { live, demo },
     all: foldTallies([live, demo]),
     sinceBootAt: ledgerSinceBootAt,
     note:
-      'TRA-4991 AC3. One count per row per exit pass, SINCE BOOT only (nothing persists these). '
+      'TRA-4991 AC3. ⛔ READ `rowsSeen` FIRST: it is the DENOMINATOR (ratchets + sum of skipped). '
+      + 'rowsSeen 0 means the exit pass evaluated NO row for the chandelier, so `ratchets: 0` and '
+      + '`highBeta: 0` are a 0/0 and neither is a reading about the trail — measured exactly that '
+      + 'way on 2026-10-02, when the whole book was two bull_put combos. `skipped` attributes every '
+      + 'non-ratchet: `multi_leg` = a combo (never reaches the single-leg trail), `covered_write` = '
+      + 'a CSP/covered call (inverted P&L basis), `retired` = TRA-3941 retired the family on '
+      + 'single_leg_otm, `no_exit_risk` = the exit-risk master is off (structural), `no_spot_or_atr` '
+      + '= eligible but the tick served no spot or no positive ATR. ⛔ rowsSeen is NOT the open-row '
+      + 'count: the exit loop has further skips that are not instrumented here, so read '
+      + '/api/health/option-journal?rows=open for the book census. '
+      + 'One count per row per exit pass, SINCE BOOT only (nothing persists these). '
       + 'The three cells partition `ratchets`: `highBeta` resolved to '
       + `EXIT_CHANDELIER_ATR_MULT_HIGHBETA (${EXIT_CHANDELIER_ATR_MULT_HIGHBETA}), \`base\` resolved to `
       + `EXIT_CHANDELIER_ATR_MULT (${EXIT_CHANDELIER_ATR_MULT}) with a MEASURED atrPct at or below `

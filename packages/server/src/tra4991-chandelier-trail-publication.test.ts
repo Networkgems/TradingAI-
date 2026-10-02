@@ -55,6 +55,9 @@ import { OTM_SLEEVE_EXIT_RULE_VALUE } from './exit-risk-rules-flag.js';
 const SESSION_1 = Date.parse('2024-06-04T14:00:00Z');
 const SESSION_2_OPEN = Date.parse('2024-06-05T13:34:00Z');
 
+/** Every AC3 skip cell at zero — the shape a pass that ratcheted every row has. */
+const NO_SKIPS = { retired: 0, multi_leg: 0, covered_write: 0, no_exit_risk: 0, no_spot_or_atr: 0 } as const;
+
 const UATR = 4;
 /** base width 3.0 × 4 = 12 under the running high 210 ⇒ stop 198. */
 const BASE_STOP = 210 - EXIT_CHANDELIER_ATR_MULT * UATR;
@@ -320,7 +323,12 @@ describe('TRA-4991 AC5 — no exit behaviour moved', () => {
     const row = acct.getState().openOptions[0]!;
     expect(row.chandelierStop).toBeUndefined();
     expect(row.chandelierFire).toBeUndefined();
-    expect(summarizeChandelierRatchets().all.ratchets).toBe(2); // the legacy run only
+    // Only the legacy run ratcheted. The retired row's two passes are still SEEN
+    // and attributed — "retired" is a reading, not an absence.
+    const all = summarizeChandelierRatchets().all;
+    expect(all.ratchets).toBe(2);
+    expect(all.skipped.retired).toBe(2);
+    expect(all.rowsSeen).toBe(4);
   });
 });
 
@@ -335,7 +343,9 @@ describe('TRA-4991 AC3 — the high-beta multiplier is COUNTED, not flagged', ()
       { otmSleeveExitRule: 'chandelier' }, undefined, risk(),
     );
     const tally = summarizeChandelierRatchets().byMode.demo;
+    expect(tally.rowsSeen).toBe(1);
     expect(tally.ratchets).toBe(1);
+    expect(tally.skipped).toEqual({ retired: 0, multi_leg: 0, covered_write: 0, no_exit_risk: 0, no_spot_or_atr: 0 });
     expect(tally.highBeta).toBe(0);
     expect(tally.base).toBe(0);
     // ⛔ THE DISCRIMINATION: `highBeta: 0` here is NOT a reading about
@@ -388,16 +398,104 @@ describe('TRA-4991 AC3 — the high-beta multiplier is COUNTED, not flagged', ()
     // ⚠ A pooled counter would let demo volatility answer a question asked about
     // real money. The live book's reading is its own.
     expect(s.byMode.live).toEqual({
-      ratchets: 2, highBeta: 1, base: 1, baseAtrPctAbsent: 0, maxAtrPct: 0.09,
+      rowsSeen: 2, ratchets: 2, skipped: NO_SKIPS,
+      highBeta: 1, base: 1, baseAtrPctAbsent: 0, maxAtrPct: 0.09,
     });
     expect(s.byMode.demo).toEqual({
-      ratchets: 1, highBeta: 0, base: 0, baseAtrPctAbsent: 1, maxAtrPct: null,
+      rowsSeen: 1, ratchets: 1, skipped: NO_SKIPS,
+      highBeta: 0, base: 0, baseAtrPctAbsent: 1, maxAtrPct: null,
     });
     for (const t of [s.byMode.live, s.byMode.demo, s.all]) {
       expect(t.highBeta + t.base + t.baseAtrPctAbsent).toBe(t.ratchets);
     }
     expect(s.all.maxAtrPct).toBe(0.09);
     expect(s.sinceBootAt).toBe(SESSION_1);
+  });
+
+  // ── the DENOMINATOR ───────────────────────────────────────────────────────
+  // Measured on live 7b99dda8cd30 minutes after the first deploy: `ratchets: 0`
+  // on both books — and the whole book was TWO `bull_put` combos, which the
+  // single-leg trail never evaluates. So that zero was a 0/0. A bare `ratchets:
+  // 0` reads identically to "the trail ran all session and never went high beta",
+  // which is the "reads the same whether the branch is live or dead" vacuity AC3
+  // exists to kill, one level up. `rowsSeen` + `skipped` is the fix.
+
+  it('a COMBO book produces rowsSeen > 0 with 0 ratchets, attributed to `multi_leg` — the live 0/0, made readable', () => {
+    const { acct, sym } = openOtmCall();
+    // Turn the row into a combo the way the book does: a `legs[]` array means the
+    // single-leg chandelier does not evaluate it at all.
+    const open = acct.getState().openOptions[0]!;
+    open.legs = [
+      { optionSymbol: open.optionSymbol!, optionType: 'put', strike: 190, side: 'buy', ratio: 1, expiration: '2024-07-05' },
+      { optionSymbol: 'AAPL240705P00195000', optionType: 'put', strike: 195, side: 'sell', ratio: 1, expiration: '2024-07-05' },
+    ] as never;
+
+    vi.setSystemTime(SESSION_1);
+    acct.checkExits(
+      new Map([['AAPL', 210]]), new Map([[sym, 1.4]]), 'demo',
+      { otmSleeveExitRule: 'chandelier' }, undefined, risk(),
+    );
+    const t = summarizeChandelierRatchets().byMode.demo;
+    // ⛔ The discrimination: rowsSeen is NON-zero, ratchets is zero, and the
+    // reason is named. "Nothing was eligible" and "eligible, never high beta" are
+    // now different readings.
+    expect(t.rowsSeen).toBe(1);
+    expect(t.ratchets).toBe(0);
+    expect(t.skipped.multi_leg).toBe(1);
+    expect(t.rowsSeen).toBe(t.ratchets + Object.values(t.skipped).reduce((a, n) => a + n, 0));
+  });
+
+  it('a COVERED WRITE is counted and attributed, so a CSP book does not read as a book whose trail ran', () => {
+    const { acct, sym } = openOtmCall();
+    acct.getState().openOptions[0]!.coveredWrite = true as never;
+    vi.setSystemTime(SESSION_1);
+    acct.checkExits(
+      new Map([['AAPL', 210]]), new Map([[sym, 1.4]]), 'demo',
+      { otmSleeveExitRule: 'chandelier' }, undefined, risk(),
+    );
+    const t = summarizeChandelierRatchets().byMode.demo;
+    expect(t).toMatchObject({ rowsSeen: 1, ratchets: 0 });
+    expect(t.skipped.covered_write).toBe(1);
+  });
+
+  it('a RETIRED OTM row is counted and attributed to `retired`, not silently absent', () => {
+    const { acct, sym } = openOtmCall();
+    vi.setSystemTime(SESSION_1);
+    // The TRA-3941 ruling: the family is retired on this sleeve. The row is still
+    // SEEN — that is what stops "the sleeve is retired" reading as "no data".
+    acct.checkExits(
+      new Map([['AAPL', 210]]), new Map([[sym, 1.4]]), 'demo',
+      { otmSleeveExitRule: 'trail' }, undefined, risk(),
+    );
+    const t = summarizeChandelierRatchets().byMode.demo;
+    expect(t).toMatchObject({ rowsSeen: 1, ratchets: 0 });
+    expect(t.skipped.retired).toBe(1);
+  });
+
+  it('no `exitRisk` at all is `no_exit_risk` — a STRUCTURAL zero, named as one', () => {
+    const { acct, sym } = openOtmCall();
+    vi.setSystemTime(SESSION_1);
+    // The exit-risk master off: no input attached, so the ratchet cannot run. The
+    // route publishes `exitRiskMaster` beside the census for exactly this case.
+    acct.checkExits(new Map([['AAPL', 210]]), new Map([[sym, 1.4]]), 'demo', { otmSleeveExitRule: 'chandelier' });
+    const t = summarizeChandelierRatchets().byMode.demo;
+    expect(t).toMatchObject({ rowsSeen: 1, ratchets: 0 });
+    expect(t.skipped.no_exit_risk).toBe(1);
+  });
+
+  it('eligible but no ATR for the underlying is `no_spot_or_atr` — the nearest cell to a real absence', () => {
+    const { acct, sym } = openOtmCall();
+    vi.setSystemTime(SESSION_1);
+    // `exitRisk` attached but carrying no ATR for AAPL: the trail WOULD have run
+    // had the feed reached it, which is a different fact from a retired sleeve.
+    acct.checkExits(
+      new Map([['AAPL', 210]]), new Map([[sym, 1.4]]), 'demo',
+      { otmSleeveExitRule: 'chandelier' }, undefined,
+      { underlyingAtrBySymbol: new Map() },
+    );
+    const t = summarizeChandelierRatchets().byMode.demo;
+    expect(t).toMatchObject({ rowsSeen: 1, ratchets: 0 });
+    expect(t.skipped.no_spot_or_atr).toBe(1);
   });
 });
 

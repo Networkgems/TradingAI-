@@ -41,6 +41,7 @@ import { chandelierMultiplier } from '@trading-app/engine';
 import {
   CHANDELIER_ATR_PERIOD,
   noteChandelierRatchet,
+  noteChandelierRowSkipped,
   type OptionChandelierAtrSource,
 } from './option-chandelier-trail.js';
 import { recordEntryQuoteStampOutcome } from './entry-quote-stamp.js';
@@ -11350,6 +11351,13 @@ export class PaperOptionsAccount {
       // mirroring — combos aren't leg-mirrored in v1), and an in-flight
       // `pendingExit` keep the skip.
       if (opt.legs && opt.legs.length > 1) {
+        // TRA-4991 (AC3) — counted HERE, at the filter itself, because a combo
+        // `continue`s ~400 lines before the chandelier chain and so is invisible
+        // to a census taken there. That invisibility is not hypothetical: live
+        // `7b99dda8cd30` published `ratchets: 0` while the whole book was two
+        // `bull_put` combos, and a reader could not tell that from "the trail ran
+        // and never went high beta". ⛔ Observe-only.
+        noteChandelierRowSkipped(opt.mode === 'live' ? 'live' : 'demo', 'multi_leg');
         if (
           multiLegExitParams
           && mode === 'demo'
@@ -11372,7 +11380,13 @@ export class PaperOptionsAccount {
       // credit positions held to roll / assignment / expiry. The long-side
       // SL/TP/trailing schedule doesn't apply (its P&L basis is inverted), so
       // the per-tick engine skips them; they settle via settleCoveredWrite.
-      if (opt.coveredWrite) continue;
+      if (opt.coveredWrite) {
+        // TRA-4991 (AC3) — the second documented pre-chain filter, counted for the
+        // same reason as the combo above: a book of covered writes must not read
+        // as a book whose trail ran.
+        noteChandelierRowSkipped(opt.mode === 'live' ? 'live' : 'demo', 'covered_write');
+        continue;
+      }
       const isImported = opt.importedFromTradier === true;
       if (isImported) {
         // TRA-361 — imports flow through SL/TP1/trail when auto-management is
@@ -11730,7 +11744,14 @@ export class PaperOptionsAccount {
         atrMult: number;
         highBeta: boolean;
       } | null = null;
+      // TRA-4991 (AC3) — the ratchet census needs its DENOMINATOR, so every
+      // branch of this chain reports itself. `ratchets: 0` with no denominator is
+      // the same vacuity the counter exists to kill: measured on live
+      // `7b99dda8cd30` the book was two `bull_put` combos, which the single-leg
+      // trail never sees, so the zero was a 0/0 and not a reading. ⛔ Observe-only.
+      const chandelierCensusMode = opt.mode === 'live' ? 'live' : 'demo';
       if (chandelierRetired) {
+        noteChandelierRowSkipped(chandelierCensusMode, 'retired');
         // A row that ticked on a pre-TRA-3941 build carries a PERSISTED stop, a
         // trail note and possibly a daily-close hold latch. Dropped here rather
         // than left inert: `summarizeLiveStopActionability` reads the hold latch
@@ -11832,7 +11853,7 @@ export class PaperOptionsAccount {
           // Counted once per row per exit pass (the TRA-3217 re-anchor below
           // recomputes the SAME width from the same ATR and atrPct, so counting
           // it again would inflate the denominator without adding a resolution).
-          noteChandelierRatchet(opt.mode === 'live' ? 'live' : 'demo', uatrPct, uatrMult);
+          noteChandelierRatchet(chandelierCensusMode, uatrPct, uatrMult);
 
           // TRA-3217 — breach bookkeeping. While suppressed, the flag mirrors
           // the CURRENT breach state (a breach that heals mid-hold clears it,
@@ -11873,7 +11894,17 @@ export class PaperOptionsAccount {
               this.chandelierStaleBreachVetoes += 1;
             }
           }
+        } else {
+          // Eligible, but this tick served no underlying spot or no positive ATR
+          // (too few cached bars for the underlying). The nearest cell to a real
+          // absence: the trail WOULD have run had the feed reached it.
+          noteChandelierRowSkipped(chandelierCensusMode, 'no_spot_or_atr');
         }
+      } else {
+        // Never reaches the ratchet at all: a combo (held to expiry/manual close,
+        // the single-leg trail does not evaluate it), or no `exitRisk` attached,
+        // i.e. the exit-risk master is off and the zero is STRUCTURAL.
+        noteChandelierRowSkipped(chandelierCensusMode, opt.legs ? 'multi_leg' : 'no_exit_risk');
       }
 
       // TRA-2820 — the unmanaged sentinel is a DECISION, and until now it existed

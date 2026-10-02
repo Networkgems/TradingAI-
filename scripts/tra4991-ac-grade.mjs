@@ -83,16 +83,36 @@ export function gradeSwingExits(payload) {
       `the three cells do not partition \`ratchets\` on: ${broken.map(([n]) => n).join(', ')}`));
     return out;
   }
+  // The DENOMINATOR must partition too, or `rowsSeen` is not the denominator.
+  const skipSum = (t) => Object.values(t.skipped ?? {}).reduce((a, n) => a + n, 0);
+  const denomBroken = cells.filter(([, t]) =>
+    typeof t.rowsSeen !== 'number' || t.rowsSeen !== t.ratchets + skipSum(t));
+  if (denomBroken.length > 0) {
+    out.push(ac('AC3', 'FAIL',
+      `\`rowsSeen\` !== ratchets + sum(skipped) on: ${denomBroken.map(([n]) => n).join(', ')}`
+      + ' — the denominator does not account for every row the pass looked at'));
+    return out;
+  }
+
   const master = c.exitRiskMaster ?? {};
   const say = ([n, t]) =>
-    `${n} n=${t.ratchets} highBeta=${t.highBeta} base=${t.base} atrPctAbsent=${t.baseAtrPctAbsent} maxAtrPct=${t.maxAtrPct}`;
-  // ⛔ A zero census is NOT a FAIL and NOT a reading about volatility: the ratchet
-  // only runs while the exit-risk master is on and a row is open. Say which.
-  if (r.all.ratchets === 0) {
+    `${n} seen=${t.rowsSeen} ratch=${t.ratchets} highBeta=${t.highBeta} base=${t.base} `
+    + `atrPctAbsent=${t.baseAtrPctAbsent} maxAtrPct=${t.maxAtrPct} skipped=${JSON.stringify(t.skipped)}`;
+  const all = r.all;
+  const why = JSON.stringify(all.skipped);
+  // ⛔ THREE different zeros, and they license different conclusions.
+  if (all.rowsSeen === 0) {
+    // The pass looked at NO row. Every number below it is a 0/0.
+    out.push(ac('AC3', 'PENDING_NO_DENOMINATOR',
+      `census live, rowsSeen 0 since boot ${new Date(r.sinceBootAt).toISOString()} — the exit pass `
+      + 'evaluated no row at all (flat book, or no pass has run yet), so `ratchets: 0` is a 0/0 and '
+      + 'not a reading about the trail.'));
+  } else if (all.ratchets === 0) {
+    // Rows were looked at and NONE ratcheted — now attributable.
     out.push(ac('AC3', master.live === true || master.demo === true ? 'PENDING_POPULATION' : 'PENDING_MASTER_DARK',
-      `census live. 0 ratchets since boot ${new Date(r.sinceBootAt).toISOString()} `
-      + `(exitRiskMaster live=${master.live} demo=${master.demo}) — the instrument is on the wire; `
-      + 'the high-beta question needs ratchets to have run.'));
+      `census live, rowsSeen ${all.rowsSeen} but 0 ratchets, attributed: ${why} `
+      + `(exitRiskMaster live=${master.live} demo=${master.demo}). The instrument is on the wire and `
+      + 'now says WHY the trail did not run; the high-beta question needs an eligible single-leg row.'));
   } else {
     out.push(ac('AC3', 'PASS', `${cells.map(say).join(' | ')} (since ${new Date(r.sinceBootAt).toISOString()})`));
   }
@@ -268,22 +288,45 @@ function selftest() {
     atrTimeframeMs: 300_000, atrSeries: 'supertrend_shadow_5m', multSource: 'compiled',
     otmSleeveExitRule: { rule: 'trail', source: 'default', chandelierRetired: true },
   };
+  const noSkips = { retired: 0, multi_leg: 0, covered_write: 0, no_exit_risk: 0, no_spot_or_atr: 0 };
+  const tally = (over = {}) => ({
+    rowsSeen: 0, ratchets: 0, skipped: { ...noSkips },
+    highBeta: 0, base: 0, baseAtrPctAbsent: 0, maxAtrPct: null, ...over,
+  });
+  const census = (live, demo, all, master = { live: true, demo: true }) => ({
+    chandelier: { ...params, exitRiskMaster: master, ratchets: { byMode: { live, demo }, all, sinceBootAt: 0 } },
+  });
+  const oneHighBeta = tally({ rowsSeen: 1, ratchets: 1, highBeta: 1, maxAtrPct: 0.09 });
   check('full params ⇒ AC2 PASS',
-    verdictOf(gradeSwingExits({ chandelier: { ...params, exitRiskMaster: { live: true, demo: true }, ratchets: { byMode: { live: { ratchets: 1, highBeta: 1, base: 0, baseAtrPctAbsent: 0, maxAtrPct: 0.09 }, demo: { ratchets: 0, highBeta: 0, base: 0, baseAtrPctAbsent: 0, maxAtrPct: null } }, all: { ratchets: 1, highBeta: 1, base: 0, baseAtrPctAbsent: 0, maxAtrPct: 0.09 }, sinceBootAt: 0 } } }), 'AC2') === 'PASS');
-  check('a non-partitioning census ⇒ AC3 FAIL',
-    verdictOf(gradeSwingExits({ chandelier: { ...params, ratchets: { byMode: { live: { ratchets: 5, highBeta: 1, base: 1, baseAtrPctAbsent: 1, maxAtrPct: 0.1 }, demo: { ratchets: 0, highBeta: 0, base: 0, baseAtrPctAbsent: 0, maxAtrPct: null } }, all: { ratchets: 5, highBeta: 1, base: 1, baseAtrPctAbsent: 1, maxAtrPct: 0.1 }, sinceBootAt: 0 } } }), 'AC3') === 'FAIL');
-  const zeroCensus = { ratchets: 0, highBeta: 0, base: 0, baseAtrPctAbsent: 0, maxAtrPct: null };
-  check('zero census with master ON ⇒ PENDING_POPULATION, never PASS and never FAIL',
-    verdictOf(gradeSwingExits({ chandelier: { ...params, exitRiskMaster: { live: true, demo: false }, ratchets: { byMode: { live: zeroCensus, demo: zeroCensus }, all: zeroCensus, sinceBootAt: 0 } } }), 'AC3') === 'PENDING_POPULATION');
-  check('zero census with master DARK ⇒ PENDING_MASTER_DARK (a structural zero)',
-    verdictOf(gradeSwingExits({ chandelier: { ...params, exitRiskMaster: { live: false, demo: false }, ratchets: { byMode: { live: zeroCensus, demo: zeroCensus }, all: zeroCensus, sinceBootAt: 0 } } }), 'AC3') === 'PENDING_MASTER_DARK');
+    verdictOf(gradeSwingExits(census(oneHighBeta, tally(), oneHighBeta)), 'AC2') === 'PASS');
+  check('a live high-beta ratchet ⇒ AC3 PASS',
+    verdictOf(gradeSwingExits(census(oneHighBeta, tally(), oneHighBeta)), 'AC3') === 'PASS');
+  const badMult = tally({ rowsSeen: 5, ratchets: 5, highBeta: 1, base: 1, baseAtrPctAbsent: 1, maxAtrPct: 0.1 });
+  check('a non-partitioning MULTIPLIER census ⇒ AC3 FAIL',
+    verdictOf(gradeSwingExits(census(badMult, tally(), badMult)), 'AC3') === 'FAIL');
+  // The denominator is itself under control: a `rowsSeen` that does not account
+  // for every row is not a denominator, it is a second unexplained number.
+  const badDenom = tally({ rowsSeen: 9, ratchets: 1, highBeta: 1, maxAtrPct: 0.1 });
+  check('a non-partitioning DENOMINATOR ⇒ AC3 FAIL',
+    verdictOf(gradeSwingExits(census(badDenom, tally(), badDenom)), 'AC3') === 'FAIL');
+  // ⛔ The three different zeros, each licensing a different conclusion.
+  check('rowsSeen 0 ⇒ PENDING_NO_DENOMINATOR (a 0/0, the live 2026-10-02 shape)',
+    verdictOf(gradeSwingExits(census(tally(), tally(), tally())), 'AC3') === 'PENDING_NO_DENOMINATOR');
+  const allCombos = tally({ rowsSeen: 2, skipped: { ...noSkips, multi_leg: 2 } });
+  check('rows seen but all skipped, master ON ⇒ PENDING_POPULATION',
+    verdictOf(gradeSwingExits(census(allCombos, tally(), allCombos)), 'AC3') === 'PENDING_POPULATION');
+  const masterOff = tally({ rowsSeen: 3, skipped: { ...noSkips, no_exit_risk: 3 } });
+  check('rows seen, all `no_exit_risk`, master DARK ⇒ PENDING_MASTER_DARK (structural)',
+    verdictOf(gradeSwingExits(census(masterOff, tally(), masterOff, { live: false, demo: false })), 'AC3') === 'PENDING_MASTER_DARK');
+  check('a census with no `skipped` key at all ⇒ AC3 FAIL (pre-denominator build)',
+    verdictOf(gradeSwingExits({ chandelier: { ...params, ratchets: { byMode: { live: { ratchets: 0, highBeta: 0, base: 0, baseAtrPctAbsent: 0, maxAtrPct: null }, demo: { ratchets: 0, highBeta: 0, base: 0, baseAtrPctAbsent: 0, maxAtrPct: null } }, all: { ratchets: 0, highBeta: 0, base: 0, baseAtrPctAbsent: 0, maxAtrPct: null }, sinceBootAt: 0 } } }), 'AC3') === 'FAIL');
 
   if (fails.length > 0) {
     console.error(`[tra4991] CONTROLS FAILED (${fails.length}):`);
     for (const f of fails) console.error(`  ✗ ${f}`);
     process.exit(1);
   }
-  console.log('[tra4991] controls OK — 22 discriminations, every refusal shape exercised.');
+  console.log('[tra4991] controls OK — every refusal shape exercised, including the three distinct zeros.');
 }
 
 async function main() {

@@ -8398,7 +8398,12 @@ describe('TRA-4991 option-swing-exits — the chandelier trail parameterisation 
     expect(ratchets.byMode.demo.maxAtrPct).toBeNull();
     for (const t of [ratchets.byMode.live, ratchets.byMode.demo, ratchets.all]) {
       expect(t.highBeta + t.base + t.baseAtrPctAbsent).toBe(t.ratchets);
+      // …and the DENOMINATOR partitions too. `rowsSeen` is what stops a
+      // `ratchets: 0` being read as a measurement when nothing was eligible —
+      // measured live on 2026-10-02, where the whole book was two combos.
+      expect(t.rowsSeen).toBe(t.ratchets + Object.values(t.skipped).reduce((a, n) => a + n, 0));
     }
+    expect(ratchets.all.rowsSeen).toBe(2);
     resetChandelierRatchetLedgerForTests();
   });
 
