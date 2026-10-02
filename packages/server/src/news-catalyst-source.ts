@@ -609,6 +609,24 @@ interface SessionSweepState {
 const sweepStates = new Map<string, SessionSweepState>();
 
 /**
+ * Distinct sessions for which THIS PROCESS has created a sweep state, per
+ * window. Monotone: `retireStaleWindowKeys` deletes the *state*, never the
+ * fact that the session was swept.
+ *
+ * This is the missing half of the TRA-4777 discriminator. Once the eviction
+ * works you can NEVER observe two resident keys for one window — so the
+ * resident-key set alone cannot tell "eviction alive, two sessions swept"
+ * from "only ever swept one session", which is precisely the vacuous read
+ * TRA-4761 was left holding. The resident set says how many survived; this
+ * says how many there were to survive. You need both, and the second one has
+ * to outlive the eviction to be worth anything.
+ */
+const sweptSessions: Record<CatalystSweepWindow, Set<string>> = {
+  premarket: new Set(),
+  midday: new Set(),
+};
+
+/**
  * Retire every other key for this window, so the map holds AT MOST ONE state
  * per window — the invariant the old single-slot `sweepState` gave for free and
  * that {@link catalystSweepGateSnapshot} reads. Without this the map is
@@ -617,16 +635,56 @@ const sweepStates = new Map<string, SessionSweepState>();
  * by any caller mid-await, so dropping it here cannot strand an in-flight
  * sweep — it only stops a PAST session from being consulted again, which is
  * exactly what the pre-TRA-4901 code did when `sweepState.session !== session`.
+ *
+ * Takes the map as a parameter so {@link catalystSweepEvictionProof} can run
+ * THIS function — not a copy of its logic — against a scratch map. A probe
+ * that re-implemented the rule would only ever agree with itself.
  */
-function retireStaleWindowKeys(liveKey: string, window: CatalystSweepWindow): void {
-  for (const k of [...sweepStates.keys()]) {
-    if (k !== liveKey && k.endsWith(`:${window}`)) sweepStates.delete(k);
+function retireStaleWindowKeys(
+  states: Map<string, SessionSweepState>,
+  liveKey: string,
+  window: CatalystSweepWindow,
+): void {
+  for (const k of [...states.keys()]) {
+    if (k !== liveKey && k.endsWith(`:${window}`)) states.delete(k);
   }
+}
+
+/**
+ * The one and only way a sweep state enters the map: get-or-create, then
+ * retire this window's stale keys. Production and
+ * {@link catalystSweepEvictionProof} both go through here, so the proof grades
+ * the *composition* (insert AND evict) rather than the eviction function in
+ * isolation — deleting the `retireStaleWindowKeys` call below turns the live
+ * health field red, which a test of `retireStaleWindowKeys` alone would not.
+ */
+function ensureSweepState(
+  states: Map<string, SessionSweepState>,
+  session: string,
+  window: CatalystSweepWindow,
+): SessionSweepState {
+  const key = `${session}:${window}`;
+  const existing = states.get(key);
+  if (existing) return existing;
+  const state: SessionSweepState = {
+    key,
+    attempts: 0,
+    lastAttemptAt: 0,
+    pool: null,
+    servedFromCache: 0,
+    skipped: 0,
+    inFlight: null,
+  };
+  states.set(key, state);
+  retireStaleWindowKeys(states, key, window);
+  return state;
 }
 
 /** Test seam — forget every per-session/window sweep gate. */
 export function resetCatalystSweepGateForTests(): void {
   sweepStates.clear();
+  sweptSessions.premarket.clear();
+  sweptSessions.midday.clear();
 }
 
 /**
@@ -656,6 +714,128 @@ export function catalystSweepStateCountForTests(): number {
  */
 export function catalystSweepResidentKeys(): string[] {
   return [...sweepStates.keys()];
+}
+
+/**
+ * Distinct sessions this process has swept, per window (see {@link sweptSessions}).
+ * `>= 2` for a window is what makes that window's resident-key read a GRADE
+ * instead of a vacuous restatement of "we only ever saw one day".
+ */
+export function catalystSweepSessionsSweptByWindow(): Record<CatalystSweepWindow, number> {
+  return { premarket: sweptSessions.premarket.size, midday: sweptSessions.midday.size };
+}
+
+/** Outcome of the in-band eviction proof. `proven` is an AND over `checks`. */
+export interface CatalystSweepEvictionProof {
+  proven: boolean;
+  checks: {
+    /** A second session for the same window retires the first. */
+    sameWindowRetired: boolean;
+    /** ...and does NOT retire the other window's key. */
+    otherWindowPreserved: boolean;
+  };
+  detail: string | null;
+}
+
+/**
+ * Exercise the live eviction path on a scratch map and report whether it holds
+ * (TRA-4777 blind 3).
+ *
+ * WHY THIS EXISTS. The natural-traffic grade needs one process to survive from
+ * before session D's 13:00Z sweep to D+1's. bqb1 restarts several times a day
+ * under the pm2 watchdog — which writes no deploy record at all — so that
+ * window is a lottery, and the two measured attempts to catch it both landed on
+ * a box booted AFTER the day's sweeps: 0 resident keys, nothing to grade. This
+ * turns the verification into a per-boot measured fact that needs no uptime.
+ *
+ * It runs {@link ensureSweepState} — the actual production insert path, with
+ * the actual {@link retireStaleWindowKeys} — against a map of its own. The map
+ * instance is the ONLY thing not shared with production, and the invariant
+ * under test is map-instance-independent, so this is not a self-agreeing copy
+ * of the rule.
+ *
+ * It must never touch `sweepStates`: `retireStaleWindowKeys` deletes every
+ * other key for the window it is given, so running the probe against the live
+ * map would destroy the very resident key the other fields publish.
+ *
+ * Both directions are checked, because the one-sided check is passable by a
+ * bug: an eviction that did `states.clear()` would retire the stale premarket
+ * key *and* silently drop the midday slot that TRA-4901 added.
+ *
+ * Never throws — a probe that can take down the health route is worse than no
+ * probe. A thrown error reads `proven: false` with the message in `detail`,
+ * never a missing field and never an optimistic default.
+ */
+export function catalystSweepEvictionProof(): CatalystSweepEvictionProof {
+  try {
+    const scratch = new Map<string, SessionSweepState>();
+    const [a, b]: CatalystSweepWindow[] = ['premarket', 'midday'];
+
+    ensureSweepState(scratch, 'proof-session-1', a);
+    ensureSweepState(scratch, 'proof-session-1', b);
+    ensureSweepState(scratch, 'proof-session-2', a);
+
+    const keys = [...scratch.keys()];
+    const sameWindowRetired =
+      keys.filter((k) => k.endsWith(`:${a}`)).join(',') === `proof-session-2:${a}`;
+    const otherWindowPreserved =
+      keys.filter((k) => k.endsWith(`:${b}`)).join(',') === `proof-session-1:${b}`;
+
+    return {
+      proven: sameWindowRetired && otherWindowPreserved,
+      checks: { sameWindowRetired, otherWindowPreserved },
+      detail:
+        sameWindowRetired && otherWindowPreserved
+          ? null
+          : `resident after proof: ${keys.join(' | ') || '(none)'}`,
+    };
+  } catch (err) {
+    return {
+      proven: false,
+      checks: { sameWindowRetired: false, otherWindowPreserved: false },
+      detail: `proof threw: ${(err as Error)?.message ?? String(err)}`,
+    };
+  }
+}
+
+/**
+ * Grade one window's eviction from a resident-key set and the session census.
+ *
+ * Pure, and separate from the probe above because the two answer different
+ * questions and have different preconditions: the proof needs no traffic and
+ * grades the code, this grades what the code ACTUALLY DID to this process's
+ * real keys. A read where both agree is the one worth publishing.
+ *
+ *   `falsified`              two keys resident for one window. The eviction is
+ *                            dead; `catalystSweepGateSnapshot`'s last-match
+ *                            backstop is silently carrying the reported
+ *                            `session`, which is why that field cannot be used
+ *                            here. Falsifiable from a SINGLE read.
+ *   `confirmed`              two or more sessions entered this window and one
+ *                            key survived. The real grade.
+ *   `vacuous_single_session` fewer than two sessions swept. NOT a pass — a dead
+ *                            eviction emits an identical key set, because no
+ *                            prior-session key ever existed to survive. The
+ *                            word is in the value so the read cannot be
+ *                            mistaken for a green one.
+ *
+ * Note what is NOT a precondition: uptime, and "the process crossed an ET
+ * midnight". A box that boots after the day's 13:00Z/16:00Z sweeps holds one
+ * key per window and reads identically to a healthy one no matter how many
+ * hours or midnights it then survives (measured: boot d26f58b9
+ * @2026-09-24T02:21:01Z = 22:21 ET, 16h up, one midnight, zero discriminating
+ * power). Count swept sessions, never elapsed time.
+ */
+export type CatalystSweepEvictionVerdict = 'confirmed' | 'falsified' | 'vacuous_single_session';
+
+export function catalystSweepEvictionVerdict(
+  residentKeys: readonly string[],
+  sessionsSwept: number,
+  window: CatalystSweepWindow,
+): CatalystSweepEvictionVerdict {
+  const resident = residentKeys.filter((k) => k.endsWith(`:${window}`)).length;
+  if (resident > 1) return 'falsified';
+  return sessionsSwept >= 2 ? 'confirmed' : 'vacuous_single_session';
 }
 
 /** Probe view of the gate, for `/api/health/news-catalyst-signals`. Defaults to `premarket`. */
@@ -715,21 +895,11 @@ export async function sessionCatalystPicks(
   window: CatalystSweepWindow = 'premarket',
 ): Promise<string[]> {
   const session = etDateKey(deps.now);
-  const key = `${session}:${window}`;
-  let state = sweepStates.get(key);
-  if (!state) {
-    state = {
-      key,
-      attempts: 0,
-      lastAttemptAt: 0,
-      pool: null,
-      servedFromCache: 0,
-      skipped: 0,
-      inFlight: null,
-    };
-    sweepStates.set(key, state);
-    retireStaleWindowKeys(key, window);
-  }
+  // Recorded before the state is created, and never cleared by the eviction:
+  // this is the denominator that tells a one-session read (vacuous) from a
+  // two-session one (a real grade of the eviction). See `sweptSessions`.
+  sweptSessions[window].add(session);
+  const state = ensureSweepState(sweepStates, session, window);
   // Single-flight: a concurrent caller waits for the running sweep, then reads
   // its outcome like any later caller.
   if (state.inFlight) await state.inFlight;
@@ -751,7 +921,7 @@ export async function sessionCatalystPicks(
   let picks: string[] = [];
   const run = runCatalystSweep(deps).then((r) => {
     picks = r.picks;
-    if (r.pool) state!.pool = r.pool;
+    if (r.pool) state.pool = r.pool;
   });
   state.inFlight = run.catch(() => undefined);
   try {
