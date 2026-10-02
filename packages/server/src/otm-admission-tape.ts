@@ -33,9 +33,48 @@
 //      (`oversizedPassesDropped`), never truncated: truncation by chain position
 //      correlates with strike and therefore with mark.
 //   3. PER-SLOT BUDGET — a (accountClass × ET day × slot) cell holds at most
-//      `MAX_ROWS_PER_SLOT[class]` candidate rows; further passes in that cell are
-//      dropped whole and counted (`slotBudgetPassesDropped`). The budget is per
-//      SLOT, never per day, so exhausting it can only thin one half-hour.
+//      `MAX_ROWS_PER_SLOT[class]` candidate rows. Since policy v3 the budget
+//      THINS passes rather than starving symbols — see the next block.
+//
+// ── RULE 3 THINS, IT DOES NOT STARVE (TRA-4954, policy v3) ──────────────────
+// Policy v2 dropped a pass IN FULL once `rowsBySlot[slot] + n > slotBudget`.
+// That is first-come eviction, and it has two measured biases (bqb1 2026-10-01,
+// raw pull, both classes):
+//   - it preferentially discards LARGE passes, because a big pass is likelier to
+//     breach the remaining headroom (mean banked 38.2 → mean dropped 50.9 desk;
+//     26.1 → 45.2 fixture), and pass size tracks option-chain width, which tracks
+//     LIQUIDITY — so the names it drops are the TIGHTEST-SPREAD ones;
+//   - once a slot fills, every remaining symbol in it banks ZERO rows. Measured
+//     on 2026-10-01: 54 (desk) and 985 (fixture) (slot × symbol) cells presented
+//     and banked nothing — SPY/QQQ/TSLA/GOOGL/META 100% dropped on fixture.
+// `byBindingReason` is folded over the banked subsample, so under-representing
+// tight-spread names biases `max_spread_pct` binding UPWARD — the exact axis the
+// TRA-4623 `minMark × maxSpreadPct` readout reads.
+//
+// v3 replaces whole-pass eviction with an allowance per pass
+// ({@link otmAdmissionSlotAllowance}) built from two terms:
+//   FLOOR    — every symbol that PRESENTS in a slot is guaranteed
+//              `min(FLOOR_ROWS_PER_SYMBOL, floor(budget / expectedSymbols))`
+//              rows, held in reserve for symbols that have not presented yet, so
+//              arriving late in the slot can no longer cost a symbol its row.
+//   SHARE    — the discretionary remainder is split in PROPORTION to pass size
+//              (`headroom × n / expectedRemainingRows`). Proportional is the only
+//              split under which the SHED FRACTION is independent of pass size;
+//              a max-min/equal-rows split would shed strictly more from wide
+//              chains, which is the bias being removed (TRA-4954 AC3).
+// `expectedSymbols` / `expectedRows` are learned PER (class × slot index) as the
+// running max over every day on disk, seeded from the measurement above. They are
+// read off identity, the clock and row COUNTS only — never a quote.
+//
+// 🔴 WHICH rows survive a truncation is chosen by `fnv1a(occSymbol)` rank, NOT by
+// chain position. Truncating by chain position correlates with strike and
+// therefore with mark — the thing rule 2 exists to avoid. A hash rank is a
+// uniform subsample of the chain and is reproducible from the row itself.
+//
+// A thinned pass writes its banked rows AND a `budgetdrop` row carrying
+// `passRows` (the pass's full size), `rows` (what was shed) and `banked` (what
+// survived), so the bias stays measurable after the change exactly the way
+// TRA-4906 made it measurable before it. `banked: 0` is the v2 whole-drop shape.
 //
 // ── A DROP IS ITSELF A DURABLE ROW (TRA-4906, ruling TRA-4905) ───────────────
 // Rule 3 is the leg that SETS desk volume (the budget saturates almost every RTH
@@ -49,7 +88,8 @@
 // `kind: 'budgetdrop'` row per dropped pass carrying its `slot` and its `rows`
 // (the pass's size — the DIRECT reading of the size-filtering bias TRA-4905
 // could only reach through a paired within-slot test). It rebuilds per slot from
-// disk exactly the way `rowsBySlot` does, published as `dropsBySlotEt`.
+// disk exactly the way `rowsBySlot` does, published as `dropsBySlotEt`. Since
+// v3 that row is emitted for a TRUNCATION too, and `rows` means "rows SHED".
 // ⚠ A `budgetdrop` row is NOT SAMPLE. It is excluded from `candidateRows`,
 // `admitted`, `ranked`, `ordered` and `sessionsWithAdmissions`, and must never be
 // counted as a candidate by any reader. Its cost is ~95 B/row, well under
@@ -112,8 +152,18 @@ const log = logger.child({ module: 'otm-admission-tape' });
 
 export const OTM_ADMISSION_TAPE_FILENAME = 'otm-admission-tape.jsonl';
 
-/** Rows written by this build carry this; v1 rows (no field) are open-biased. */
-export const OTM_ADMISSION_SAMPLING_POLICY = 2;
+/**
+ * Rows written by this build carry this; v1 rows (no field) are open-biased.
+ *
+ * `2` = the slot sampler with WHOLE-PASS budget eviction (2026-09-19 → 10-02).
+ * `3` = the same sampler with THINNING eviction (TRA-4954). A v3 slot is a
+ * per-symbol-capped subsample of its own demand where a v2 slot was a
+ * first-come prefix of it, so the two must not be pooled inside one readout —
+ * filter `samplingPolicy === 3` for anything that reads per-symbol coverage.
+ * Both are quote-independent, so `>= 2` remains the correct filter for the
+ * TRA-4623 AC4 session count and for any mark/spread retention ratio.
+ */
+export const OTM_ADMISSION_SAMPLING_POLICY = 3;
 /** ET slot width for the sampler (rule 1) and the budget (rule 3). */
 const SLOT_MINUTES = 30;
 /**
@@ -131,6 +181,51 @@ const MAX_ROWS_PER_SLOT: Record<string, number> = { desk: 1000 };
 const MAX_ROWS_PER_SLOT_OTHER = 200;
 /** A pass bigger than this is dropped WHOLE (rule 2 above), never truncated. */
 const MAX_ROWS_PER_PASS = 400;
+/**
+ * TRA-4954 — the per-(slot × symbol) floor. Every symbol that PRESENTS in a slot
+ * banks at least this many rows, before any symbol takes a second helping. The
+ * effective floor is `min(this, floor(budget / expectedSymbols))`, so a class
+ * whose universe cannot fit two rows each (fixture: 94 symbols into 200 rows)
+ * degrades to 1 rather than silently re-starving its tail.
+ */
+const FLOOR_ROWS_PER_SYMBOL = 2;
+/**
+ * Seed for the per-(class × slot) demand learner, in DISTINCT SYMBOLS per slot.
+ * Measured on bqb1 2026-10-01 off the raw pull: desk max 36/slot (mean 28.2),
+ * fixture max 94/slot (mean 83.3). Seeded ~33%/17% above the observed max so the
+ * floor reserve survives a universe that grows before the learner sees it — the
+ * learner only ever raises these, never lowers them.
+ */
+const SEED_SYMBOLS_PER_SLOT: Record<string, number> = { desk: 48 };
+const SEED_SYMBOLS_PER_SLOT_OTHER = 110;
+/**
+ * COLD-BOOT default for the same learner in PRESENTED ROWS per slot (banked +
+ * shed) — the denominator of the proportional share. Measured the same way: desk
+ * max 2,048 per slot (range 699–2,048), fixture max 6,834 (range 4,313–6,834).
+ *
+ * 🔴 The two seeds are floored DIFFERENTLY, on purpose.
+ * {@link SEED_SYMBOLS_PER_SLOT} is a FLOOR the learner may only raise: it sizes
+ * the reserve that guarantees AC1, and over-reserving costs only
+ * `floorRowsPerSymbol × expectedSymbols` rows (96 desk / 110 fixture out of the
+ * slot), so conservatism there is nearly free.
+ * This one is a DEFAULT used only where that (class × slot) has no history:
+ * flooring it at the global max would make a quiet slot thin against a busy
+ * slot's demand and under-spend the budget by ~38% (measured in simulation
+ * against the 2026-10-01 tape: 7,472 desk rows banked vs 12,119 presented).
+ * Per-slot history is far tighter than a global max, and the term is raised to
+ * `presented + n` intra-slot anyway, so a slot that blows past its own history
+ * self-corrects within itself.
+ *
+ * ⚠ It is still the running MAX over the days on disk, never a mean or an EWMA.
+ * An expectation that UNDER-reads demand empties the discretionary pool part-way
+ * through the slot and hands the remainder to whoever scanned FIRST — an
+ * order-correlated bias, which is strictly worse than the precision cost of
+ * over-reading. A smaller unbiased sample beats a larger biased one for a
+ * readout whose whole subject is the bias. (AC1 and AC2 do not depend on this
+ * term at all: `share ≤ headroom` holds for any value of it.)
+ */
+const SEED_ROWS_PER_SLOT: Record<string, number> = { desk: 2100 };
+const SEED_ROWS_PER_SLOT_OTHER = 7000;
 /**
  * Keep this many ms on disk — comfortably over the ≥20 RTH desk sessions AC4
  * needs. It is deliberately SLACK: at the volume measured on
@@ -253,17 +348,46 @@ export interface OtmAdmissionTapeBudgetDropRow {
   ts: number;
   etDay: string;
   accountClass: SpreadCeilingAccountClass;
-  /** ET 30-minute slot index the dropped pass would have been written into. */
+  /** ET 30-minute slot index the shed rows would have been written into. */
   slot: number;
   underlying: string;
-  /** Size of the dropped pass, in candidate rows — the size-filter reading. */
+  /**
+   * Rows SHED by rule 3. Under v2 this was always the whole pass; under v3
+   * (TRA-4954) a pass is usually truncated, so this is `passRows - banked`.
+   */
   rows: number;
+  /**
+   * The pass's FULL size — the size-filter reading, and the only field that
+   * survives truncation as a statement about demand. ABSENT on v2 rows, where
+   * the pass was dropped whole and `rows` already carried it.
+   */
+  passRows?: number;
+  /**
+   * Rows of this pass that DID bank. `0` (or absent, on a v2 row) is the
+   * whole-drop shape — the TRA-4954 AC1 reading is "no (slot × symbol) cell has
+   * a shed row with `banked: 0` and no candidate rows".
+   */
+  banked?: number;
 }
 
 export type OtmAdmissionTapeRow =
   | OtmAdmissionTapeCandidateRow
   | OtmAdmissionTapeLinkRow
   | OtmAdmissionTapeBudgetDropRow;
+
+/**
+ * Rule-3 shedding in one (class × day × slot) cell. `passes` counts passes that
+ * shed ANYTHING; `wholeDrops` counts the subset that banked nothing — the v2
+ * shape, and the TRA-4954 AC1 alarm. `passRows` is the full size of the shed
+ * passes, which is what AC3's size comparison reads.
+ */
+export interface OtmAdmissionSlotShedCell {
+  passes: number;
+  rows: number;
+  banked: number;
+  passRows: number;
+  wholeDrops: number;
+}
 
 interface ClassDayTally {
   candidateRows: number;
@@ -285,7 +409,7 @@ interface ClassDayTally {
    * hydrate exactly the way {@link rowsBySlot} is (TRA-4906). `passes` = dropped
    * passes, `rows` = candidate rows they would have written. NEVER sample.
    */
-  dropsBySlot: Map<number, { passes: number; rows: number }>;
+  dropsBySlot: Map<number, OtmAdmissionSlotShedCell>;
   /** `${underlying}|${ts}` of the last candidate row — rows of a pass are contiguous. */
   lastPassKey: string;
 }
@@ -303,8 +427,49 @@ const lastSlotByPair = new Map<string, string>();
  * × classes), which keeps the TRA-4158 RSS ceiling out of play.
  */
 const rankedSeen = new Map<string, Set<string>>();
+/**
+ * TRA-4954 — etDay → `${accountClass}|${slot}` → underlyings that have PRESENTED
+ * in that cell (banked or shed). Drives the floor reserve's "how many symbols
+ * are still to come" term. Holds ONE ET day at a time, evicted exactly the way
+ * {@link rankedSeen} is: hydrate walks days ascending and the live path only
+ * ever writes today, so the survivor is always the newest. Bounded by one
+ * session's (slots × symbols) — ~48 × 110 per class, so the TRA-4158 RSS
+ * ceiling is not in play.
+ */
+const slotSymbols = new Map<string, Map<string, Set<string>>>();
+/**
+ * TRA-4954 — `${accountClass}|${slot}` → the learned demand for that slot of the
+ * day: the running MAX over every day on disk of distinct symbols and of
+ * presented rows. Rebuilt on hydrate through {@link applyRow}, so there is no
+ * second learning site to drift from the live one. Bounded by 48 slots × classes.
+ */
+const slotDemand = new Map<string, SlotDemand>();
+
+/**
+ * 🔴 `priorRows` excludes the day currently accruing. The expectation has to be a
+ * statement about a WHOLE slot, and today's partial total is not one: feeding it
+ * back would make the first pass of a fresh slot the whole expectation, the
+ * second pass see "no rows left to come", and the budget go first-come again —
+ * the exact bias TRA-4954 removes. `dayRows` accrues today and is folded into
+ * `priorRows` when the day rolls over (hydrate walks days ascending, so the fold
+ * happens there too, on the same code path).
+ */
+interface SlotDemand {
+  /** Max distinct symbols in this slot over ALL days seen, today included. */
+  symbols: number;
+  /** Max presented rows over days STRICTLY BEFORE {@link day}. 0 = no history. */
+  priorRows: number;
+  /** The ET day {@link dayRows} is accruing. */
+  day: string;
+  /** Presented rows in this slot on {@link day} so far. */
+  dayRows: number;
+}
 let oversizedPassesDropped = 0;
 let slotBudgetPassesDropped = 0;
+/** Passes TRUNCATED by rule 3 (banked ≥1 row, shed the rest). Process total. */
+let slotBudgetPassesThinned = 0;
+/** Candidate rows shed by rule 3 since boot, whole drops and truncations alike. */
+let slotBudgetRowsShed = 0;
 /** `ranked` appends skipped as same-(day,slot,class,contract) duplicates. */
 let rankedDuplicatesSkipped = 0;
 let unsampledPasses = 0;
@@ -326,8 +491,12 @@ export function clearOtmAdmissionTape(): void {
   byDay.clear();
   lastSlotByPair.clear();
   rankedSeen.clear();
+  slotSymbols.clear();
+  slotDemand.clear();
   oversizedPassesDropped = 0;
   slotBudgetPassesDropped = 0;
+  slotBudgetPassesThinned = 0;
+  slotBudgetRowsShed = 0;
   rankedDuplicatesSkipped = 0;
   unsampledPasses = 0;
   emptyPasses = 0;
@@ -378,6 +547,170 @@ export function otmAdmissionSlotSelected(
 ): boolean {
   const mod = SAMPLE_MOD[accountClass] ?? SAMPLE_MOD_OTHER;
   return fnv1a(`${book}|${symbol}|${etDay}|${slot}`) % mod === 0;
+}
+
+// ── Rule 3 v2: the slot allowance (TRA-4954) ─────────────────────────────────
+
+/** Everything {@link otmAdmissionSlotAllowance} reads. Holds NO quote. */
+export interface OtmAdmissionSlotState {
+  /** `MAX_ROWS_PER_SLOT[class]` for this cell. */
+  budget: number;
+  /** Candidate rows already banked in this (class × day × slot). */
+  banked: number;
+  /** Rows already PRESENTED in it (banked + shed) — the share's denominator. */
+  presented: number;
+  /** Distinct underlyings that have already presented, EXCLUDING this one when new. */
+  symbolsSeen: number;
+  /** Is this the symbol's first presentation in this slot? */
+  symbolIsNew: boolean;
+  /** Learned/seeded distinct symbols for this (class × slot index). */
+  expectedSymbols: number;
+  /** Learned/seeded presented rows for this (class × slot index). */
+  expectedRows: number;
+  /** The pass's full size, in candidate rows. */
+  passRows: number;
+}
+
+/**
+ * How many of a pass's rows rule 3 admits. Pure, and deliberately exported: it
+ * is the whole eviction policy, and TRA-4954's AC1/AC2 are properties of THIS
+ * function, provable without a session of tape.
+ *
+ * ```
+ *   floorK  = min(FLOOR_ROWS_PER_SYMBOL, budget / expectedSymbols)   ≥ 1
+ *   reserve = floorK × (symbols expected but not yet presented, incl. this one)
+ *   share   = ceil((budget − banked − reserve) × n / rows still expected)
+ *   allow   = min(n, share + (isNew ? floorK : 0), budget − banked)
+ * ```
+ *
+ * Two invariants fall straight out of that, and the tests assert both:
+ *   - **AC1 (no starvation).** After admitting a new symbol,
+ *     `banked ≤ budget − floorK × unseenAfter`, so the rows reserved for symbols
+ *     that have not presented yet are never spendable by the ones that have.
+ *     Every symbol presenting in a slot therefore banks ≥ `floorK` ≥ 1 rows —
+ *     for as long as the slot's actual symbol count stays inside
+ *     `expectedSymbols`, which is why the seeds sit above the measured max AND
+ *     the learner only ever raises them.
+ *   - **AC2 (the budget is not raised).** `allow ≤ budget − banked` is applied
+ *     last and unconditionally, so `sum(rowsBySlot) ≤ budget` per cell exactly
+ *     as under v2.
+ *
+ * `share` is PROPORTIONAL to `n` by construction. That is the AC3 property: the
+ * fraction shed does not depend on pass size, so the banked sample no longer
+ * filters on chain width. An equal-rows (max-min fair) split would read better
+ * on "rows per symbol" and strictly worse here — it sheds more from wide chains
+ * by definition — and chain width is the liquidity proxy this tape must not
+ * sample on.
+ */
+export function otmAdmissionSlotAllowance(state: OtmAdmissionSlotState): number {
+  const budget = Math.max(0, Math.floor(state.budget));
+  const n = Math.max(0, Math.floor(state.passRows));
+  if (n === 0 || budget === 0) return 0;
+  const banked = Math.max(0, Math.floor(state.banked));
+  const remainingBudget = Math.max(0, budget - banked);
+  if (remainingBudget === 0) return 0;
+
+  const seen = Math.max(0, Math.floor(state.symbolsSeen));
+  // The expectation can never read below what this slot has already shown it —
+  // an under-read would hand the tail's reserve to whoever scanned first.
+  const expectedSymbols = Math.max(1, state.expectedSymbols, seen + (state.symbolIsNew ? 1 : 0));
+  const floorK = Math.max(1, Math.min(FLOOR_ROWS_PER_SYMBOL, Math.floor(budget / expectedSymbols)));
+  // Includes THIS symbol while it is still unseen; `guaranteed` is how it draws
+  // its own share back out, which is what keeps the invariant exact.
+  const unseen = Math.max(0, expectedSymbols - seen);
+  const headroom = Math.max(0, budget - banked - floorK * unseen);
+
+  const presented = Math.max(0, Math.floor(state.presented));
+  const expectedRows = Math.max(state.expectedRows, presented + n);
+  const remainingRows = Math.max(n, expectedRows - presented);
+  const share = Math.ceil((headroom * n) / remainingRows);
+
+  // 🔴 MAX, not PLUS. The floor is a FLOOR UNDER the proportional share, not a
+  // bonus on top of it. Adding it hands every pass the same +floorK, which is a
+  // large relative boost to a tiny pass and a rounding error to a wide one — so
+  // small passes stop shedding at all and the shed population skews large again.
+  // Measured in simulation over 4 desk sessions: `+` leaves mean shed-pass size
+  // +6.3%/+11.2%/+13.5%/+9.6% above the mean pass (2 of 4 outside AC3's ±10%);
+  // `max` is what makes the shed fraction flat in pass size. It is also strictly
+  // tighter on the budget — the reserve is no longer spent twice.
+  const guaranteed = state.symbolIsNew ? floorK : 0;
+  return Math.max(0, Math.min(n, Math.max(share, guaranteed), remainingBudget));
+}
+
+function slotDemandKey(accountClass: string, slot: number): string {
+  return `${accountClass}|${slot}`;
+}
+
+/**
+ * Learned demand for a (class × slot). `symbols` is floored at its seed (AC1
+ * reserve — cheap to over-reserve); `rows` falls back to its seed ONLY where the
+ * slot has no history, so a quiet slot thins against its OWN demand and not a
+ * busy slot's. See {@link SEED_ROWS_PER_SLOT} for why the two differ.
+ */
+function demandFor(accountClass: string, slot: number): { symbols: number; rows: number } {
+  const seedSymbols = SEED_SYMBOLS_PER_SLOT[accountClass] ?? SEED_SYMBOLS_PER_SLOT_OTHER;
+  const seedRows = SEED_ROWS_PER_SLOT[accountClass] ?? SEED_ROWS_PER_SLOT_OTHER;
+  const existing = slotDemand.get(slotDemandKey(accountClass, slot));
+  if (!existing) return { symbols: seedSymbols, rows: seedRows };
+  return {
+    symbols: Math.max(existing.symbols, seedSymbols),
+    rows: existing.priorRows > 0 ? existing.priorRows : seedRows,
+  };
+}
+
+/** Underlyings that have presented in one (day × class × slot). Current day only. */
+function slotSymbolSet(etDay: string, accountClass: string, slot: number): Set<string> {
+  let perDay = slotSymbols.get(etDay);
+  if (!perDay) {
+    // A previously unseen day evicts every other — see {@link markRankedSeen}.
+    slotSymbols.clear();
+    perDay = new Map();
+    slotSymbols.set(etDay, perDay);
+  }
+  const key = slotDemandKey(accountClass, slot);
+  let set = perDay.get(key);
+  if (!set) {
+    set = new Set();
+    perDay.set(key, set);
+  }
+  return set;
+}
+
+/**
+ * Record that `underlying` presented in this cell and raise the learned demand.
+ * Called from {@link applyRow} for candidate AND shed rows, so hydrate rebuilds
+ * the learner off disk on the SAME path the live append uses.
+ */
+function noteSlotDemand(
+  etDay: string,
+  accountClass: string,
+  slot: number,
+  underlying: string,
+  presentedRows: number,
+): void {
+  const set = slotSymbolSet(etDay, accountClass, slot);
+  set.add(underlying);
+  const key = slotDemandKey(accountClass, slot);
+  // 🔴 Store the OBSERVED maxima, never the seed-floored read from `demandFor` —
+  // folding the seed in here would make the `rows` default a permanent floor and
+  // silently undo the asymmetry that function exists for.
+  const current = slotDemand.get(key);
+  if (!current) {
+    slotDemand.set(key, { symbols: set.size, priorRows: 0, day: etDay, dayRows: presentedRows });
+    return;
+  }
+  if (current.day !== etDay) {
+    current.priorRows = Math.max(current.priorRows, current.dayRows);
+    current.day = etDay;
+    current.dayRows = 0;
+  }
+  current.symbols = Math.max(current.symbols, set.size);
+  current.dayRows = Math.max(current.dayRows, presentedRows);
+}
+
+/** Presented rows (banked + shed) in one (day × class × slot). */
+function presentedRowsIn(t: ClassDayTally, slot: number): number {
+  return (t.rowsBySlot.get(slot) ?? 0) + (t.dropsBySlot.get(slot)?.rows ?? 0);
 }
 
 function tallyFor(etDay: string, accountClass: string): ClassDayTally {
@@ -447,10 +780,23 @@ function applyRow(row: OtmAdmissionTapeRow): void {
     // NOT SAMPLE: touches dropsBySlot and the ts bounds only — never
     // candidateRows / admitted / ranked / ordered / passesRecorded, and never
     // rowsBySlot (which is the rule-3 budget's own denominator).
-    const cell = t.dropsBySlot.get(row.slot) ?? { passes: 0, rows: 0 };
+    const cell = t.dropsBySlot.get(row.slot)
+      ?? { passes: 0, rows: 0, banked: 0, passRows: 0, wholeDrops: 0 };
+    const shed = Number.isFinite(row.rows) ? row.rows : 0;
+    // v2 rows carry neither field: the pass was dropped WHOLE, so its full size
+    // is `rows` and nothing banked. Reading them any other way would retcon the
+    // v2 days into looking like they thinned.
+    const banked = typeof row.banked === 'number' && Number.isFinite(row.banked) ? row.banked : 0;
+    const passRows = typeof row.passRows === 'number' && Number.isFinite(row.passRows)
+      ? row.passRows
+      : shed + banked;
     cell.passes += 1;
-    cell.rows += Number.isFinite(row.rows) ? row.rows : 0;
+    cell.rows += shed;
+    cell.banked += banked;
+    cell.passRows += passRows;
+    if (banked <= 0) cell.wholeDrops += 1;
     t.dropsBySlot.set(row.slot, cell);
+    noteSlotDemand(row.etDay, row.accountClass, row.slot, row.underlying, presentedRowsIn(t, row.slot));
   } else if (row.kind === 'candidate') {
     t.candidateRows += 1;
     const sampled = typeof row.samplingPolicy === 'number' && row.samplingPolicy >= 2;
@@ -462,6 +808,7 @@ function applyRow(row: OtmAdmissionTapeRow): void {
     t.byBindingReason[row.bindingReason] = (t.byBindingReason[row.bindingReason] ?? 0) + 1;
     const slot = slotOf(row.ts);
     t.rowsBySlot.set(slot, (t.rowsBySlot.get(slot) ?? 0) + 1);
+    noteSlotDemand(row.etDay, row.accountClass, slot, row.underlying, presentedRowsIn(t, slot));
     // Rebuilt on hydrate too (v1 read 0 after every reboot).
     const passKey = `${row.underlying}|${row.ts}`;
     if (passKey !== t.lastPassKey) {
@@ -558,26 +905,63 @@ export function beginOtmAdmissionPass(ctx: OtmAdmissionPassContext): OtmAdmissio
       }
       const t = tallyFor(etDay, accountClass);
       const slotBudget = MAX_ROWS_PER_SLOT[accountClass] ?? MAX_ROWS_PER_SLOT_OTHER;
-      if ((t.rowsBySlot.get(slot) ?? 0) + decisions.length > slotBudget) {
-        // The counter is the process total and is KEPT (cited elsewhere); the row
+      const demand = demandFor(accountClass, slot);
+      const presentedSymbols = slotSymbolSet(etDay, accountClass, slot);
+      const passUnderlying = decisions[0]!.underlying;
+      // Rule 3 (TRA-4954): how many of this pass's rows the slot admits. The
+      // allowance is computed from row COUNTS and identity only — no quote, and
+      // no scan order, reaches it.
+      const allow = otmAdmissionSlotAllowance({
+        budget: slotBudget,
+        banked: t.rowsBySlot.get(slot) ?? 0,
+        presented: presentedRowsIn(t, slot),
+        symbolsSeen: presentedSymbols.size - (presentedSymbols.has(passUnderlying) ? 1 : 0),
+        symbolIsNew: !presentedSymbols.has(passUnderlying),
+        expectedSymbols: demand.symbols,
+        expectedRows: demand.rows,
+        passRows: decisions.length,
+      });
+      const shed = decisions.length - allow;
+      /**
+       * WHICH rows survive a truncation. 🔴 Hash rank over `occSymbol`, never
+       * chain position: a prefix/suffix of the chain correlates with strike and
+       * therefore with mark, which would make the tape's own axes a function of
+       * its sampling — the defect rule 2 refuses truncation to avoid. An fnv1a
+       * rank is a uniform subsample of the chain, blind to every quote field,
+       * and reproducible from the banked row alone.
+       */
+      const kept = allow >= decisions.length
+        ? decisions
+        : [...decisions]
+          .map((d, i) => ({ d, i, h: fnv1a(d.occSymbol) }))
+          .sort((a, b) => (a.h - b.h) || (a.i - b.i))
+          .slice(0, allow)
+          .sort((a, b) => a.i - b.i)
+          .map((e) => e.d);
+      if (shed > 0) {
+        // The counters are process totals and are KEPT (cited elsewhere); the row
         // is what makes the count per-slot and boot-durable (TRA-4906). Not
         // sample — `applyRow` routes it to `dropsBySlot` only.
-        slotBudgetPassesDropped += 1;
+        if (allow === 0) slotBudgetPassesDropped += 1;
+        else slotBudgetPassesThinned += 1;
+        slotBudgetRowsShed += shed;
         const dropRow: OtmAdmissionTapeBudgetDropRow = {
           kind: 'budgetdrop',
           ts: now,
           etDay,
           accountClass,
           slot,
-          underlying: decisions[0]!.underlying,
-          rows: decisions.length,
+          underlying: passUnderlying,
+          rows: shed,
+          passRows: decisions.length,
+          banked: allow,
         };
         applyRow(dropRow);
         appendLines([JSON.stringify(dropRow)]);
-        return;
+        if (allow === 0) return;
       }
       const lines: string[] = [];
-      for (const d of decisions) {
+      for (const d of kept) {
         const row: OtmAdmissionTapeCandidateRow = {
           kind: 'candidate',
           ts: now,
@@ -792,13 +1176,31 @@ export interface OtmAdmissionTapeClassDaySummary {
   /** Candidate rows per ET 30-minute slot, `HH:MM` slot start → rows. The time-coverage check. */
   rowsBySlotEt?: Record<string, number>;
   /**
-   * Rule-3 slot-budget drops per ET slot, `HH:MM` slot start → dropped passes
-   * and the candidate rows they would have written (TRA-4906/TRA-4905 AC1).
-   * Rebuilt from durable `budgetdrop` rows, so it SURVIVES A BOOT — read it
-   * post-close from any boot. `{}` means rule 3 never bit that day/class.
+   * Rule-3 shedding per ET slot, `HH:MM` slot start → the shed cell
+   * (TRA-4906/TRA-4905 AC1, extended by TRA-4954). Rebuilt from durable
+   * `budgetdrop` rows, so it SURVIVES A BOOT — read it post-close from any boot.
+   * `{}` means rule 3 never bit that day/class.
+   *
+   * `passes` = passes that shed anything · `rows` = rows shed · `banked` = rows
+   * of those same passes that survived · `passRows` = their full size ·
+   * `wholeDrops` = the subset that banked NOTHING.
+   * ⚠ `wholeDrops` is NOT by itself the TRA-4954 AC1 alarm. Several BOOKS of one
+   * class can scan the same underlying in one slot, and the second such pass
+   * legitimately banks 0 once the symbol already holds its floor — measured in
+   * simulation at 286/1,665 fixture passes with AC1 still clean. AC1 is a
+   * statement about (slot × SYMBOL) coverage, so it is read off the raw pull:
+   * no `(slot, underlying)` may hold a `budgetdrop` row and no candidate rows.
+   * On v2 days `wholeDrops == passes` by construction — that IS the defect
+   * TRA-4954 fixed, not a regression.
    * ⚠ NOT SAMPLE: these rows are in no other count on this surface.
    */
-  dropsBySlotEt?: Record<string, { passes: number; rows: number }>;
+  dropsBySlotEt?: Record<string, OtmAdmissionSlotShedCell>;
+  /**
+   * Distinct underlyings that PRESENTED per ET slot (banked or shed) — the AC1
+   * denominator. Present for TODAY'S day only: the set it is counted from holds
+   * one ET day at a time (RSS), so an older day reads `undefined`, never `0`.
+   */
+  symbolsPresentedBySlotEt?: Record<string, number>;
   firstTs?: number;
   lastTs: number;
 }
@@ -832,6 +1234,17 @@ export interface OtmAdmissionTapeSummary {
     maxRowsPerPass: number;
     maxRowsPerSlotDesk: number;
     maxRowsPerSlotOther: number;
+    /** TRA-4954 — the per-(slot × symbol) floor rule 3 reserves before thinning. */
+    floorRowsPerSymbol: number;
+    /**
+     * TRA-4954 — the learned demand rule 3 sizes the floor reserve and the
+     * proportional share from: `class|slotIndex` → the EFFECTIVE values an
+     * allowance in that slot would read right now (`symbols` floored at its
+     * seed, `rows` = the max over days strictly before today, falling back to
+     * its seed where there is none). Published so a grader can reproduce an
+     * allowance off this route without reading source.
+     */
+    slotDemand: Record<string, { symbols: number; rows: number }>;
     retainDays: number;
     maxFileBytes: number;
     /** The independence statement, published so a grader need not read source. */
@@ -846,6 +1259,15 @@ export interface OtmAdmissionTapeSummary {
      * per-slot and survives a restart.
      */
     slotBudgetPassesDropped: number;
+    /**
+     * TRA-4954 — passes rule 3 TRUNCATED (banked ≥1 row, shed the rest). Process
+     * total. On a v3 build this carries essentially all of rule 3's bite.
+     * `slotBudgetPassesDropped` counts the whole-drop residue, which is NOT in
+     * itself an AC1 failure — see `dropsBySlotEt`.
+     */
+    slotBudgetPassesThinned: number;
+    /** TRA-4954 — candidate rows shed by rule 3 since boot (drops + truncations). */
+    slotBudgetRowsShed: number;
     /** `ranked` appends skipped as duplicates (TRA-4906). Process total. */
     rankedDuplicatesSkipped: number;
     emptyPasses: number;
@@ -894,9 +1316,21 @@ export function summarizeOtmAdmissionTape(): OtmAdmissionTapeSummary {
       for (const slot of [...t.rowsBySlot.keys()].sort((a, b) => a - b)) {
         rowsBySlotEt[slotLabel(slot)] = t.rowsBySlot.get(slot)!;
       }
-      const dropsBySlotEt: Record<string, { passes: number; rows: number }> = {};
+      const dropsBySlotEt: Record<string, OtmAdmissionSlotShedCell> = {};
       for (const slot of [...t.dropsBySlot.keys()].sort((a, b) => a - b)) {
         dropsBySlotEt[slotLabel(slot)] = { ...t.dropsBySlot.get(slot)! };
+      }
+      // Only the newest day's symbol sets are retained (RSS) — omit the field
+      // entirely for the others rather than publish a 0 that reads as "none".
+      const perDaySymbols = slotSymbols.get(etDay);
+      const symbolsPresentedBySlotEt: Record<string, number> = {};
+      if (perDaySymbols) {
+        const prefix = `${accountClass}|`;
+        for (const [key, set] of perDaySymbols) {
+          if (!key.startsWith(prefix)) continue;
+          const slot = Number(key.slice(prefix.length));
+          if (Number.isFinite(slot)) symbolsPresentedBySlotEt[slotLabel(slot)] = set.size;
+        }
       }
       c.days.push({
         etDay,
@@ -910,6 +1344,7 @@ export function summarizeOtmAdmissionTape(): OtmAdmissionTapeSummary {
         ordered: t.ordered,
         rowsBySlotEt,
         dropsBySlotEt,
+        ...(perDaySymbols ? { symbolsPresentedBySlotEt } : {}),
         firstTs: t.firstTs,
         lastTs: t.lastTs,
       });
@@ -928,15 +1363,24 @@ export function summarizeOtmAdmissionTape(): OtmAdmissionTapeSummary {
       maxRowsPerPass: MAX_ROWS_PER_PASS,
       maxRowsPerSlotDesk: MAX_ROWS_PER_SLOT.desk,
       maxRowsPerSlotOther: MAX_ROWS_PER_SLOT_OTHER,
+      floorRowsPerSymbol: FLOOR_ROWS_PER_SYMBOL,
+      slotDemand: Object.fromEntries(
+        [...slotDemand.keys()].sort().map((k) => {
+          const sep = k.lastIndexOf('|');
+          return [k, demandFor(k.slice(0, sep), Number(k.slice(sep + 1)))] as const;
+        }),
+      ),
       retainDays: Math.round(RETAIN_MS / (24 * 60 * 60 * 1000)),
       maxFileBytes: MAX_FILE_BYTES,
       sampling:
-        'v2 slot sampler: first ok pass per (book×symbol) per ET 30-min slot, selected by fnv1a(book|symbol|etDay|slot) % sampleMod — decided from identity and clock before the scan, independent of mark, spreadPct, scan order and time-of-day. Whole-pass drops only; per-(class×day×slot) row budget, never a daily first-come one. Rows without samplingPolicy are v1 (open-biased) and excluded from sessionsWithAdmissions. Every slot-budget drop also writes a durable kind:budgetdrop row carrying the dropped pass\'s slot and size — read days[].dropsBySlotEt, which is per-slot and survives a boot; counters.slotBudgetPassesDropped is only a process total. budgetdrop rows are NOT sample: they are in no candidateRows/admitted/ranked/ordered/sessionsWithAdmissions count. kind:ranked links are deduped per (etDay, slot, accountClass, occSymbol) — information-preserving, since the candidate leg of the survivorship join is itself (etDay, slot)-granular; skips are counted as rankedDuplicatesSkipped, and pre-2026-09-25 days hold the un-deduped multiset. kind:ordered is UNCONDITIONAL — never deduped, never throttled (execution provenance).',
+        'v3 slot sampler: first ok pass per (book×symbol) per ET 30-min slot, selected by fnv1a(book|symbol|etDay|slot) % sampleMod — decided from identity and clock before the scan, independent of mark, spreadPct, scan order and time-of-day. Rule 3 (the per-(class×day×slot) row budget) THINS rather than starves since policy v3 (TRA-4954): every symbol that presents in a slot is reserved min(floorRowsPerSymbol, budget/expectedSymbols) >= 1 rows, and the discretionary remainder is split in PROPORTION to pass size, so the shed FRACTION does not depend on chain width. Which rows survive a truncation is fnv1a(occSymbol) rank — NEVER chain position, which correlates with strike and therefore with mark. v2 days (2026-09-19..10-02) dropped whole passes first-come instead: on those days a slot is a first-come PREFIX of its demand and 54 (desk) / 985 (fixture) (slot×symbol) cells banked zero rows, biasing max_spread_pct binding upward — filter samplingPolicy === 3 for any per-symbol coverage readout; >= 2 remains correct for AC4 sessions and for mark/spread retention. Rows without samplingPolicy are v1 (open-biased) and excluded from sessionsWithAdmissions. Rule 2 is unchanged: a pass over maxRowsPerPass is still dropped WHOLE, never truncated. Every shed pass writes a durable kind:budgetdrop row carrying slot, underlying, rows (SHED), passRows (full size) and banked (survivors) — read days[].dropsBySlotEt, which is per-slot and survives a boot; counters.slotBudget* are only process totals. wholeDrops > 0 on a v3 day is the AC1 alarm. budgetdrop rows are NOT sample: they are in no candidateRows/admitted/ranked/ordered/sessionsWithAdmissions count. kind:ranked links are deduped per (etDay, slot, accountClass, occSymbol) — information-preserving, since the candidate leg of the survivorship join is itself (etDay, slot)-granular; skips are counted as rankedDuplicatesSkipped, and pre-2026-09-25 days hold the un-deduped multiset. kind:ordered is UNCONDITIONAL — never deduped, never throttled, never budgeted (execution provenance).',
     },
     counters: {
       unsampledPasses,
       oversizedPassesDropped,
       slotBudgetPassesDropped,
+      slotBudgetPassesThinned,
+      slotBudgetRowsShed,
       rankedDuplicatesSkipped,
       emptyPasses,
     },

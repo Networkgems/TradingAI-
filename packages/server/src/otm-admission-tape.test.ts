@@ -11,6 +11,7 @@ import {
   clearOtmAdmissionTape,
   hydrateOtmAdmissionTapeFromDisk,
   otmAdmissionSlot,
+  otmAdmissionSlotAllowance,
   otmAdmissionSlotSelected,
   otmAdmissionTapePath,
   readOtmAdmissionTapeRows,
@@ -165,7 +166,13 @@ describe('TRA-4628 — v2 time coverage (the 2026-09-18 open-bias regression)', 
       .reduce((n, [, v]) => n + v, 0);
     expect(late / day.candidateRows).toBeGreaterThan(0.2);
     // Volume stays inside the byte plan (~1/12 of the unsampled ~53k rows).
-    expect(day.candidateRows).toBeGreaterThan(2000);
+    // ⚠ The lower bound is 1,500 rather than v2's 2,000 because this fixture is
+    // a COLD BOOT: rule 3's share denominator falls back to SEED_ROWS_PER_SLOT
+    // where the slot has no prior day on disk, and that seed is sized off real
+    // desk demand (~2,100 rows/slot), which is ~4x this fixture's. A live deploy
+    // hydrates ten days of history and thins against each slot's OWN measured
+    // demand instead — simulated at −12%..−23% of v2 volume, not −60%.
+    expect(day.candidateRows).toBeGreaterThan(1500);
     expect(day.candidateRows).toBeLessThan(8000);
     expect(summary.deskSessionsWithAdmissions).toBe(1);
   });
@@ -236,55 +243,74 @@ function fixturePass(now: number, rows: number, symbol: string, book: string): v
 }
 
 describe('TRA-4906 — slot-budget drops are DURABLE and per-slot (AC1/AC2)', () => {
-  it('writes a budgetdrop row carrying the slot and the dropped pass size', () => {
+  it('writes a budgetdrop row carrying the slot, the shed count and the full pass size', () => {
     const { symbol, book } = oversizedForFixtureSlot(NOW);
     fixturePass(NOW, 250, symbol, book); // 250 > MAX_ROWS_PER_SLOT_OTHER (200)
 
     const rows = readFileSync(otmAdmissionTapePath(dir), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
-    expect(rows).toHaveLength(1); // the pass itself is dropped WHOLE — only the drop row lands
-    expect(rows[0]).toMatchObject({
+    // TRA-4954: the pass is THINNED, not dropped whole — the shed row lands
+    // first, then whatever banked. v2 wrote the shed row and nothing else.
+    const shed = rows.find((r) => r.kind === 'budgetdrop');
+    const banked = rows.filter((r) => r.kind === 'candidate');
+    expect(shed).toMatchObject({
       kind: 'budgetdrop',
       ts: NOW,
       etDay: '2026-09-16',
       accountClass: 'fixture',
       slot: otmAdmissionSlot(NOW),
       underlying: symbol,
-      rows: 250,
+      passRows: 250,
     });
+    expect(banked.length).toBeGreaterThan(0); // AC1 — the symbol is REPRESENTED
+    expect(shed.banked).toBe(banked.length);
+    expect(shed.rows).toBe(250 - banked.length); // `rows` means rows SHED
 
     const summary = summarizeOtmAdmissionTape();
     const day = summary.byClass.find((c) => c.accountClass === 'fixture')!.days[0]!;
-    expect(day.dropsBySlotEt).toEqual({ '11:00': { passes: 1, rows: 250 } });
-    expect(summary.counters.slotBudgetPassesDropped).toBe(1); // the scalar is KEPT (AC: not removed)
+    expect(day.dropsBySlotEt).toEqual({
+      '11:00': { passes: 1, rows: 250 - banked.length, banked: banked.length, passRows: 250, wholeDrops: 0 },
+    });
+    // The scalars are KEPT (AC: not removed); a thinned pass counts as thinned.
+    expect(summary.counters.slotBudgetPassesDropped).toBe(0);
+    expect(summary.counters.slotBudgetPassesThinned).toBe(1);
+    expect(summary.counters.slotBudgetRowsShed).toBe(250 - banked.length);
   });
 
   it('dropsBySlotEt SURVIVES A BOOT — the whole point (AC1)', () => {
     const { symbol, book } = oversizedForFixtureSlot(NOW);
     fixturePass(NOW, 250, symbol, book);
-    // A second drop in a LATER slot, so the rebuild has to be per-slot, not a total.
+    // A second shed in a LATER slot, so the rebuild has to be per-slot, not a total.
     const later = NOW + 90 * 60 * 1000; // 12:30 ET
     const s2 = selectedSymbol('qa_tape', later, 'fixture');
     fixturePass(later, 210, s2, book);
 
+    const before = summarizeOtmAdmissionTape().byClass
+      .find((c) => c.accountClass === 'fixture')!.days[0]!.dropsBySlotEt;
+
     // Boot: fresh process state, aggregates rebuilt from disk alone.
     clearOtmAdmissionTape();
-    const h = hydrateOtmAdmissionTapeFromDisk(dir, NOW + 2 * 60 * 60 * 1000);
-    expect(h.records).toBe(2); // both drop rows round-tripped through parseRow (AC2)
+    hydrateOtmAdmissionTapeFromDisk(dir, NOW + 2 * 60 * 60 * 1000);
 
     const summary = summarizeOtmAdmissionTape();
     const day = summary.byClass.find((c) => c.accountClass === 'fixture')!.days[0]!;
-    expect(day.dropsBySlotEt).toEqual({
-      '11:00': { passes: 1, rows: 250 },
-      '12:30': { passes: 1, rows: 210 },
-    });
+    expect(Object.keys(day.dropsBySlotEt ?? {})).toEqual(['11:00', '12:30']);
+    expect(day.dropsBySlotEt).toEqual(before); // every field round-trips, per slot
+    expect(day.dropsBySlotEt!['11:00']!.passRows).toBe(250);
+    expect(day.dropsBySlotEt!['12:30']!.passRows).toBe(210);
     // The process-total scalar is exactly what a boot DESTROYS — that is why the
     // rows exist. Its reading 0 here while dropsBySlotEt is intact IS the AC.
-    expect(summary.counters.slotBudgetPassesDropped).toBe(0);
+    expect(summary.counters.slotBudgetPassesThinned).toBe(0);
   });
 
   it('a budgetdrop row is NOT SAMPLE — it enters no other count (AC2)', () => {
-    const { symbol, book } = oversizedForFixtureSlot(NOW);
-    fixturePass(NOW, 250, symbol, book);
+    // A WHOLE drop (the v2 shape) so there are no banked rows to confuse the
+    // "enters no other count" reading: policy v3 still produces one when a slot
+    // presents more symbols than its reserve was sized for.
+    const whole = {
+      kind: 'budgetdrop', ts: NOW, etDay: '2026-09-16', accountClass: 'fixture',
+      slot: otmAdmissionSlot(NOW), underlying: 'SPY', rows: 250, passRows: 250, banked: 0,
+    };
+    writeFileSync(otmAdmissionTapePath(dir), JSON.stringify(whole) + '\n', 'utf8');
     clearOtmAdmissionTape();
     hydrateOtmAdmissionTapeFromDisk(dir, NOW);
 
@@ -309,8 +335,29 @@ describe('TRA-4906 — slot-budget drops are DURABLE and per-slot (AC1/AC2)', ()
     writeFileSync(otmAdmissionTapePath(dir), `${JSON.stringify(noRows)}\n${JSON.stringify(noSlot)}\n`, 'utf8');
     hydrateOtmAdmissionTapeFromDisk(dir, NOW);
     const day = summarizeOtmAdmissionTape().byClass.find((c) => c.accountClass === 'desk')!.days[0]!;
-    // The PASS still counts — losing it would understate rule 3's bite.
-    expect(day.dropsBySlotEt).toEqual({ '11:00': { passes: 1, rows: 0 } });
+    // The PASS still counts — losing it would understate rule 3's bite. A v2 row
+    // carries neither `passRows` nor `banked`: it was dropped WHOLE, so its full
+    // size IS `rows` and nothing banked. Here `rows` is itself unreadable, so
+    // `passRows` folds to 0 — the pass count is the part that must not be lost.
+    expect(day.dropsBySlotEt).toEqual({
+      '11:00': { passes: 1, rows: 0, banked: 0, passRows: 0, wholeDrops: 1 },
+    });
+  });
+
+  it('a v2 budgetdrop row is NOT retconned into a thinned one on hydrate', () => {
+    // The whole v2 corpus (2026-09-19..10-02) carries neither field. Reading the
+    // absence as "banked: unknown" and guessing would make those days look like
+    // they thinned — they did not, and that difference is the TRA-4954 finding.
+    const v2 = {
+      kind: 'budgetdrop', ts: NOW, etDay: '2026-09-16', accountClass: 'desk',
+      slot: otmAdmissionSlot(NOW), underlying: 'SPY', rows: 246,
+    };
+    writeFileSync(otmAdmissionTapePath(dir), JSON.stringify(v2) + '\n', 'utf8');
+    hydrateOtmAdmissionTapeFromDisk(dir, NOW);
+    const day = summarizeOtmAdmissionTape().byClass.find((c) => c.accountClass === 'desk')!.days[0]!;
+    expect(day.dropsBySlotEt).toEqual({
+      '11:00': { passes: 1, rows: 246, banked: 0, passRows: 246, wholeDrops: 1 },
+    });
   });
 });
 
@@ -388,7 +435,197 @@ describe('TRA-4906 — the sample parameters are UNCHANGED by this ticket (AC5)'
     expect(policy.maxFileBytes).toBe(144 * 1024 * 1024);
     expect(policy.maxRowsPerPass).toBe(400);
     expect(policy.sampleModDesk).toBe(12);
-    expect(policy.samplingPolicy).toBe(2); // the dedup is NOT a policy bump: no candidate row moved
+    // TRA-4954 bumped this to 3. The dedup (TRA-4906) was NOT a policy bump —
+    // no candidate row moved — but thinning IS one: a v3 slot is a per-symbol
+    // capped subsample of its demand where a v2 slot was a first-come prefix.
+    expect(policy.samplingPolicy).toBe(3);
+  });
+
+  it('🔴 TRA-4954 did NOT raise the budget or the byte cap (AC2/AC4)', () => {
+    const { policy } = summarizeOtmAdmissionTape();
+    expect(policy.maxRowsPerSlotDesk).toBe(1000);
+    expect(policy.maxRowsPerSlotOther).toBe(200);
+    expect(policy.maxFileBytes).toBe(144 * 1024 * 1024);
+    expect(policy.floorRowsPerSymbol).toBe(2);
+  });
+});
+
+// ── TRA-4954 — rule 3 THINS, it does not starve ──────────────────────────────
+
+/**
+ * Replay a whole desk slot: `symbols` distinct underlyings, each presenting one
+ * pass of `size(i)` rows, in arrival order. Returns per-symbol banked counts and
+ * the shed rows, read back OFF DISK — never off a counter (the AC1 instruction).
+ */
+function replaySlot(
+  now: number,
+  book: string,
+  accountClass: string,
+  sizes: number[],
+): { banked: Map<string, number>; shed: Record<string, unknown>[]; slotRows: number } {
+  const slot = otmAdmissionSlot(now);
+  const etDay = new Date(now).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+  const chosen: string[] = [];
+  for (let i = 0; chosen.length < sizes.length && i < 200_000; i += 1) {
+    const sym = `W${i}`;
+    if (otmAdmissionSlotSelected(book, sym, etDay, slot, accountClass)) chosen.push(sym);
+  }
+  chosen.forEach((sym, i) => {
+    const p = beginOtmAdmissionPass({ symbol: sym, book, mode: 'live', now: now + i });
+    if (!p) throw new Error(`pass ${sym} was not selected — fix the fixture`);
+    for (let k = 0; k < sizes[i]!; k += 1) {
+      p.onAdmission(decision({ underlying: sym, occSymbol: `${sym}C${String(k).padStart(5, '0')}` }));
+    }
+    p.commit();
+  });
+  const rows = readFileSync(otmAdmissionTapePath(dir), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const banked = new Map<string, number>(chosen.map((s) => [s, 0]));
+  let slotRows = 0;
+  for (const r of rows) {
+    if (r.kind !== 'candidate') continue;
+    banked.set(r.underlying, (banked.get(r.underlying) ?? 0) + 1);
+    slotRows += 1;
+  }
+  return { banked, shed: rows.filter((r) => r.kind === 'budgetdrop'), slotRows };
+}
+
+describe('TRA-4954 — the slot budget THINS wide-chain names instead of starving them', () => {
+  it('AC1 — every symbol presenting in an OVER-SUBSCRIBED slot banks ≥1 row', () => {
+    // 40 desk symbols × 120 rows = 4,800 rows presented into a 1,000-row slot.
+    // Under v2 the first ~8 passes banked everything and the other 32 symbols
+    // banked ZERO — the measured defect (24 desk / 159 fixture symbols on 09-25).
+    const { banked, slotRows } = replaySlot(NOW, 'deskbook', 'desk', Array(40).fill(120));
+    expect(banked.size).toBe(40);
+    expect([...banked.values()].filter((n) => n === 0)).toEqual([]); // read off disk
+    expect(Math.min(...banked.values())).toBeGreaterThanOrEqual(2); // the floor
+    expect(slotRows).toBeLessThanOrEqual(1000); // AC2, same breath
+  });
+
+  it('AC1 — the LAST symbol to present is not starved by the first (the eviction order)', () => {
+    // One 400-row monster first, then 30 ordinary names. v2's first-come rule is
+    // exactly what let the monster take 40% of the slot and starve the tail.
+    const { banked } = replaySlot(NOW, 'deskbook', 'desk', [400, ...Array(30).fill(100)]);
+    const values = [...banked.values()];
+    // The ticket's own statement of the defect: "a 246-row SPY pass must not be
+    // able to consume 25% of a 1,000-row slot". v2 gave this pass all 400 (40%).
+    expect(values[0]).toBeLessThan(1000 * 0.25);
+    expect(Math.min(...values)).toBeGreaterThanOrEqual(2);
+    expect(values[values.length - 1]).toBeGreaterThanOrEqual(2); // arriving last costs nothing
+  });
+
+  it('AC2 — rowsBySlot still respects MAX_ROWS_PER_SLOT, and still equals candidateRows', () => {
+    replaySlot(NOW, 'deskbook', 'desk', Array(40).fill(120));
+    const day = summarizeOtmAdmissionTape().byClass.find((c) => c.accountClass === 'desk')!.days[0]!;
+    const perSlot = Object.values(day.rowsBySlotEt ?? {});
+    expect(Math.max(...perSlot)).toBeLessThanOrEqual(1000);
+    // The identity the AC names, exactly — not approximately.
+    expect(perSlot.reduce((a, b) => a + b, 0)).toBe(day.candidateRows);
+  });
+
+  it('AC3 — the shed FRACTION does not depend on pass size (the size filter is gone)', () => {
+    // Widths spanning 14x. Under v2 the wide ones were dropped whole (shed
+    // fraction 1.0) and the narrow ones banked whole (0.0) — a perfect filter.
+    const sizes = [20, 40, 60, 80, 100, 140, 180, 220, 260, 280];
+    const { banked, shed } = replaySlot(NOW, 'deskbook', 'desk', sizes);
+    const byUnderlying = new Map(shed.map((r) => [r.underlying as string, r]));
+    const fractions = [...banked.entries()].map(([sym, got]) => {
+      const row = byUnderlying.get(sym);
+      const full = row ? (row.passRows as number) : got;
+      return (full - got) / full;
+    });
+    const spread = Math.max(...fractions) - Math.min(...fractions);
+    expect(spread).toBeLessThan(0.1); // every width sheds the same share, ±10pp
+    // …and the comparison the AC pre-registered, off the shed rows directly.
+    const shedSizes = shed.map((r) => r.passRows as number);
+    const meanShed = shedSizes.reduce((a, b) => a + b, 0) / shedSizes.length;
+    const meanAll = sizes.reduce((a, b) => a + b, 0) / sizes.length;
+    expect(Math.abs(meanShed / meanAll - 1)).toBeLessThan(0.1);
+  });
+
+  it('🔴 a truncation keeps rows by HASH RANK, never by chain position', () => {
+    // Chain position correlates with strike and therefore with mark. If the
+    // thinner kept a prefix, the banked strikes would be the low ones — which
+    // would make the tape's own axis a function of its sampling.
+    const { banked } = replaySlot(NOW, 'deskbook', 'desk', Array(30).fill(200));
+    const rows = readFileSync(otmAdmissionTapePath(dir), 'utf8').trim().split('\n')
+      .map((l) => JSON.parse(l)).filter((r) => r.kind === 'candidate');
+    const first = [...banked.keys()][0]!;
+    const kept = rows.filter((r) => r.underlying === first).map((r) => Number(r.occSymbol.slice(-5)));
+    expect(kept.length).toBeGreaterThan(1);
+    expect(kept.length).toBeLessThan(200); // it really was truncated
+    // A prefix would put every kept index below `kept.length`; a hash rank
+    // scatters them across the whole chain.
+    expect(Math.max(...kept)).toBeGreaterThan(200 * 0.5);
+    expect(Math.min(...kept)).toBeLessThan(200 * 0.5);
+  });
+
+  it('AC5 — `ordered` is still unconditional under a saturated slot', () => {
+    replaySlot(NOW, 'deskbook', 'desk', Array(40).fill(120)); // saturate first
+    for (let i = 0; i < 20; i += 1) {
+      recordOtmAdmissionOrdered({ symbol: 'RIG', book: 'deskbook', mode: 'live', now: NOW + i }, `RIG${i}`);
+    }
+    const desk = summarizeOtmAdmissionTape().byClass.find((c) => c.accountClass === 'desk')!;
+    expect(desk.ordered).toBe(20); // never deduped, never throttled, never budgeted
+  });
+
+  it('the allowance is a pure function of counts — no quote, no scan order, reaches it', () => {
+    const base = {
+      budget: 1000, banked: 400, presented: 900, symbolsSeen: 12, symbolIsNew: true,
+      expectedSymbols: 36, expectedRows: 2048, passRows: 120,
+    };
+    const a = otmAdmissionSlotAllowance(base);
+    expect(a).toBe(otmAdmissionSlotAllowance({ ...base })); // deterministic
+    expect(a).toBeGreaterThan(0);
+    expect(a).toBeLessThanOrEqual(base.passRows);
+    // Doubling the pass doubles the share — the proportionality AC3 rests on.
+    const wide = otmAdmissionSlotAllowance({ ...base, passRows: 240 });
+    expect(wide / a).toBeGreaterThan(1.8);
+    expect(wide / a).toBeLessThan(2.2);
+  });
+
+  it('the AC1 reserve invariant holds for every state in a swept grid', () => {
+    // `banked ≤ budget − floorK × unseenAfter` is what makes AC1 a property of
+    // the function rather than of one fixture. Swept, not sampled.
+    for (const budget of [200, 1000]) {
+      for (const expectedSymbols of [8, 36, 110]) {
+        const floorK = Math.max(1, Math.min(2, Math.floor(budget / expectedSymbols)));
+        for (let seen = 0; seen <= expectedSymbols; seen += 1) {
+          for (const n of [1, 3, 40, 246, 400]) {
+            for (const banked of [0, Math.floor(budget / 2), budget - 1, budget]) {
+              for (const isNew of [true, false]) {
+                const got = otmAdmissionSlotAllowance({
+                  budget, banked, presented: banked, symbolsSeen: seen, symbolIsNew: isNew,
+                  expectedSymbols, expectedRows: budget * 3, passRows: n,
+                });
+                expect(got).toBeGreaterThanOrEqual(0);
+                expect(got).toBeLessThanOrEqual(n);
+                expect(banked + got).toBeLessThanOrEqual(budget); // AC2, always
+                const unseenAfter = Math.max(0, Math.max(expectedSymbols, seen + (isNew ? 1 : 0)) - seen - (isNew ? 1 : 0));
+                if (banked + floorK * (unseenAfter + (isNew ? 1 : 0)) <= budget) {
+                  // There was room for the reserve going in, so it survives.
+                  expect(banked + got + floorK * unseenAfter).toBeLessThanOrEqual(budget);
+                  if (isNew) expect(got).toBeGreaterThanOrEqual(Math.min(n, floorK));
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  });
+
+  it('the demand learner rebuilds from disk and never folds TODAY into the expectation', () => {
+    // A slot's own partial total is not a statement about the whole slot: if it
+    // fed back, pass 2 would see "nothing left to come" and take the budget
+    // first-come — the bias this ticket removes.
+    replaySlot(NOW, 'deskbook', 'desk', Array(20).fill(60));
+    const live = summarizeOtmAdmissionTape().policy.slotDemand;
+    clearOtmAdmissionTape();
+    hydrateOtmAdmissionTapeFromDisk(dir, NOW);
+    expect(summarizeOtmAdmissionTape().policy.slotDemand).toEqual(live); // same path
+    const cell = live[`desk|${otmAdmissionSlot(NOW)}`]!;
+    expect(cell.symbols).toBeGreaterThanOrEqual(20); // learned, floored at the seed
+    expect(cell.rows).toBe(2100); // the SEED — today is not prior-day history
   });
 });
 
