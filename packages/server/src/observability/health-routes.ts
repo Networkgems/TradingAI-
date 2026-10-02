@@ -7610,6 +7610,26 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       loRealFillNet: c.loRealFillNet,
       boundNoiseR: c.boundNoiseR,
       realFillUnavailableReason: c.realFillUnavailableReason,
+      /**
+       * TRA-5040 — the real-fill arm's SHADOW trio: what `nRealFill` WOULD read
+       * if the arm also resolved TRA-4997's close-seam `exitQuote` on the rows it
+       * drops at `exit_quote_missing`. `nRealFill`, `loRealFillNet` and
+       * `admitsRealFill` above are bit-for-bit what they were before that ticket;
+       * nothing here feeds a verdict. `realFillSeamStale` is held APART from
+       * `recovered` because "a book we will not trust" and "no book at all" are
+       * different refusals, and only the second one a backfill could fix.
+       *
+       * ⚠️ These three shipped on `/api/health/option-expectancy-table` — which
+       * publishes `table` wholesale — from the first commit, but THIS projector is
+       * a WHITELIST, so on `/api/health/live-enforce-gates` the same numbers
+       * arrived only as prose inside `realFillUnavailableReason`: readable by a
+       * human, invisible to anything grading the gate. A coverage fix that lands
+       * on the writer and starves at a whitelisting reader is the exact shape of
+       * the defect this ticket was filed about, one surface further out.
+       */
+      nRealFillSeamShadow: c.nRealFillSeamShadow,
+      realFillSeamRecovered: c.realFillSeamRecovered,
+      realFillSeamStale: c.realFillSeamStale,
     });
     const cellsByStructure = barsByStructure.map((b) => {
       const cells = tapeCells.filter((c) => c.structure === b.structure);
