@@ -1885,6 +1885,31 @@ export interface Sma200SweepCensusReport {
      * count, and a TypeScript doc comment never reaches them.
      */
     rejectedMaxDistIs: 'SIGMA_OVER_ENGINES_NOT_AC7_N';
+    /**
+     * TRA-5065 — WHO served the bars, Σ over graded engines.
+     *
+     * `evaluated` alone cannot tell a healthy Yahoo from a permanently-429ing
+     * one carried by the Tradier fallback, and the whole filed defect was that
+     * `evaluated: 0` read as a quiet market. The positive control this ticket
+     * owes is exactly the pair `yahooBreakerOpen: true` (on
+     * `/api/health/quotes`) next to `servedFallback > 0` here.
+     */
+    servedPrimary: number;
+    servedFallback: number;
+    /**
+     * Σ of the two sub-tags on `starvedBreakerOpen`. ⚠️ ALREADY COUNTED inside
+     * `starvedBreakerOpen` — they name the reason that bucket filled, they do
+     * not add to it. Adding them to the starve total double-counts.
+     */
+    starvedFallbackBudget: number;
+    fallbackUnavailable: number;
+    /**
+     * Graded engines whose census carries NO `servedPrimary`/`servedFallback`
+     * key — a build from before this ticket. Non-zero ⇒ the four numbers above
+     * are a lower bound over a partial fleet and a `0` is not a reading.
+     * ABSENT ≠ ZERO, the same discipline as `rejectedMaxDistUnpublished`.
+     */
+    servedUnpublished: number;
   };
   /**
    * TRA-4922 (AC-a) — the AC7 count arm: the DISTINCT rejected cohort, folded
@@ -2095,6 +2120,12 @@ export function summarizeSma200Sweeps(
     rejectedMaxDist: 0,
     rejectedMaxDistUnpublished: 0,
     rejectedMaxDistIs: 'SIGMA_OVER_ENGINES_NOT_AC7_N' as const,
+    // TRA-5065 — the provider attribution.
+    servedPrimary: 0,
+    servedFallback: 0,
+    starvedFallbackBudget: 0,
+    fallbackUnavailable: 0,
+    servedUnpublished: 0,
   };
   let graded = 0;
   let neverSwept = 0;
@@ -2226,6 +2257,18 @@ export function summarizeSma200Sweeps(
       totals.rejectedMaxDist += stats.rejectedMaxDist;
     } else {
       totals.rejectedMaxDistUnpublished++;
+    }
+    // TRA-5065 — the provider attribution, same ABSENT ≠ ZERO discipline. The
+    // presence test is `servedFallback`, not `servedPrimary`: both ship in the
+    // same commit, and keying on the one whose non-zero IS the finding makes a
+    // partially-upgraded fleet impossible to misread as a served one.
+    if (typeof stats.servedFallback === 'number') {
+      totals.servedPrimary += stats.servedPrimary ?? 0;
+      totals.servedFallback += stats.servedFallback;
+      totals.starvedFallbackBudget += stats.starvedFallbackBudget ?? 0;
+      totals.fallbackUnavailable += stats.fallbackUnavailable ?? 0;
+    } else {
+      totals.servedUnpublished++;
     }
     // TRA-4922 (AC-c) — the DISTINCT universe. Same absent-key discipline: a
     // missing list is an unmeasured engine, never an engine that swept nothing.

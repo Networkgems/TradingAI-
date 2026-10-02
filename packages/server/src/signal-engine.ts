@@ -102,7 +102,8 @@ import {
   buildChandelierAtrShadowArm,
   type ChandelierAtrShadowPair,
 } from './tra5061-chandelier-atr-shadow.js';
-import { trySma200ScanSlot, releaseSma200ScanSlot, fetchSma200CandlesShared } from './sma200-scan-admission.js';
+import { trySma200ScanSlot, releaseSma200ScanSlot, fetchSma200CandlesShared, orderSma200FallbackFairness } from './sma200-scan-admission.js';
+import type { Sma200CandlePull } from './sma200-scan-admission.js';
 import { resolveSma200PullbackMaxDistAtr, resolveSma200PullbackTimeCapBars, sma200PullbackExitModel, sma200VoidVerdict, sma200SweepVerdict, sma200SweepStarved, signalRingEvictionIndex, isSma200SignalType, type Sma200SweepVerdict } from './sma200-validity.js';
 import { getLatestReviewBlock } from './research-store.js';
 import { earningsInDaysSync, earningsCalendarReadSync, recentEarningsDateSync } from './earnings-store.js';
@@ -984,17 +985,66 @@ export interface Sma200ScanStats {
   /** Symbols that yielded >= `SMA200_MIN_BARS` bars and were actually scored. */
   evaluated: number;
   /**
-   * Symbols that came back short WHILE the Yahoo breaker was open — i.e. we
-   * never asked. Attributed by a post-hoc sample of `isYahooBreakerOpen()`, so
-   * it is sound in aggregate but not per-symbol.
+   * Symbols NO PROVIDER served: the Yahoo breaker was open so the primary was
+   * never asked, and the Tradier fallback did not carry it either.
+   *
+   * TRA-5065 — the attribution is now PER-SYMBOL and taken BEFORE the call
+   * (`Sma200CandlePull.primarySuppressed`), not from a post-hoc
+   * `isYahooBreakerOpen()` sample that could not tell a mid-sweep breaker flip
+   * from a short listing. A symbol the fallback was asked for and that came
+   * back empty stays in THIS bucket rather than `starvedShortHistory`:
+   * `fetchTradierDailyCandles` returns `[]` for a refusal and for a genuinely
+   * empty series alike, so the conservative reading — "we did not get a look" —
+   * is the one that cannot be mistaken for a market fact.
    */
   starvedBreakerOpen: number;
   /**
-   * Symbols that came back short with the breaker CLOSED — a genuinely short
-   * listing history (a recent IPO, a delisted ticker). A different condition
-   * from the above with a different remedy, so it gets its own counter.
+   * Symbols that came back short with the primary ASKED and answering — a
+   * genuinely short listing history (a recent IPO, a delisted ticker), or bars
+   * that arrived but numbered under {@link SMA200_MIN_BARS}. A different
+   * condition from the above with a different remedy, so it gets its own
+   * counter.
    */
   starvedShortHistory: number;
+  /**
+   * TRA-5065 — symbols whose bars came off the PRIMARY (Yahoo) leg, including
+   * replays out of the process-wide memo (the memo carries its origin). Σ with
+   * {@link servedFallback} is "symbols somebody served"; the gap to
+   * `considered` is the starve.
+   *
+   * Optional (TRA-3913): absent on a build without the fallback, and ABSENT ≠
+   * ZERO — a fold that reads a missing key as "Yahoo served nothing" would
+   * invent this ticket's own defect on a mixed-build fleet.
+   */
+  servedPrimary?: number;
+  /**
+   * TRA-5065 (AC3) — symbols whose bars came off the TRADIER fallback leg.
+   * Sibling of `OtmDailySeriesCounters.fetchOkFallback`, and the reason it is
+   * published separately: a fallback that hides inside `evaluated` turns
+   * "Tradier carried this sweep" into "the sweep ran", and the next reader
+   * cannot tell a healthy Yahoo from a permanently-429ing one.
+   */
+  servedFallback?: number;
+  /**
+   * TRA-5065 — symbols the fallback could not be asked for because this
+   * sweep's fallback wall-clock budget was spent.
+   *
+   * ⚠️ A SUB-TAG OF {@link starvedBreakerOpen}, NOT A DISJOINT BUCKET. Those
+   * symbols are counted in BOTH, and `sma200SweepStarved` must keep
+   * reconciling to `considered - evaluated`; a fourth independent bucket would
+   * silently drop them out of the starve total and read as a healthier sweep.
+   * It exists because the two have different OWNERS: the remedy here is ours
+   * (raise the budget, shrink the universe), not Yahoo's.
+   */
+  starvedFallbackBudget?: number;
+  /**
+   * TRA-5065 — symbols the fallback could not be asked for because Tradier
+   * itself was unavailable (no client, or its bar breaker open). The same
+   * sub-tag relationship to {@link starvedBreakerOpen} as above — counted in
+   * both, never added to the starve total twice. Non-zero means BOTH providers
+   * were down, which is TRA-4826's shape and not this ticket's.
+   */
+  fallbackUnavailable?: number;
   /** Symbols whose fetch threw outright. */
   fetchFailed: number;
   /** Signals emitted by this sweep. */
@@ -2358,6 +2408,30 @@ const SMA200_SCAN_INTERVAL_MS = 4 * 60 * 60_000;
 // TRA-451 — daily bars pulled per symbol for the SMA-200 scan. The spec needs
 // ≥ 250 sessions; an extra ~30-bar cushion covers holidays / missing prints.
 const SMA200_DAILY_BARS = SMA200_MIN_BARS + 30;
+/**
+ * TRA-5065 — wall clock one sweep may spend on the TRADIER FALLBACK leg.
+ *
+ * ⛔ Not a nicety. `runSma200Scan` is AWAITED inside `doTick`, and `doTick`'s
+ * duration is still the live exit-evaluation interval on the real-money book
+ * (TRA-2200's hoist is deferred), so every millisecond here is exit latency on
+ * live capital. A Tradier `/markets/history` call costs ~350ms (measured
+ * 2026-10-02, 10 concurrent), so at `SCAN_BATCH` 5 an UNBUDGETED 750-symbol
+ * universe would add ~52s to a tick and put ~750 requests against a modelled
+ * 200 req/min account budget — tripping the SHARED Tradier bar breaker and
+ * taking the OTM daily series and the MTF backfill down with it.
+ *
+ * Sized below `OTM_DAILY_SERIES_BUDGET_MS` (8s) for the same reason that one
+ * is below `SWEEP_BUDGET_MS`: this sink is DISPLAY-ONLY (TRA-819), nothing
+ * capital-facing waits on it, and the budget's cost is bounded coverage, not
+ * lost coverage — the fairness order rotates which symbols the next sweep
+ * reaches, and the shortfall is published as `starvedFallbackBudget` rather
+ * than hidden. 6s ≈ 85 symbols/sweep, which clears the live universes measured
+ * on bqb1 (~100 per engine, 400 across 4 engines) in one or two sweeps.
+ *
+ * The budget bounds the FALLBACK leg only. A healthy Yahoo sweep never consults
+ * it and is exactly as fast as it was before this ticket.
+ */
+const SMA200_FALLBACK_BUDGET_MS = 6_000;
 
 // TRA-1926 — collapse a daily-bar timestamp to its UTC calendar day. Yahoo can
 // hand back the same session with a drifting sub-day timestamp (an intraday
@@ -8667,6 +8741,13 @@ export class SignalEngine {
       starvedBreakerOpen: stats.starvedBreakerOpen,
       starvedShortHistory: stats.starvedShortHistory,
       fetchFailed: stats.fetchFailed,
+      // TRA-5065 — WHO served, beside how many. `evaluated > 0` with
+      // `servedFallback == evaluated` is the whole point of this ticket and is
+      // unreadable from `evaluated` alone.
+      servedPrimary: stats.servedPrimary,
+      servedFallback: stats.servedFallback,
+      starvedFallbackBudget: stats.starvedFallbackBudget,
+      fallbackUnavailable: stats.fallbackUnavailable,
       fired: stats.fired,
       voided: stats.voided,
       maxDistAtr: stats.maxDistAtr,
@@ -8721,6 +8802,13 @@ export class SignalEngine {
       rejectedMaxDist: 0,
       maxDistAtr: null,
       memoHits: 0,
+      // TRA-5065 — present from birth so a build that carries the fallback
+      // publishes zeros rather than absent keys. ABSENT ≠ ZERO is the fleet
+      // fold's discriminator for "this engine is on an older build".
+      servedPrimary: 0,
+      servedFallback: 0,
+      starvedFallbackBudget: 0,
+      fallbackUnavailable: 0,
     };
     // TRA-4457 — an empty universe still owes a census. It is a DIFFERENT fault
     // from a starved feed (the watchlist upstream, not the bar feed), which is
@@ -8740,18 +8828,40 @@ export class SignalEngine {
     // pullback fired by one sweep carries the same stamp.
     const pullbackTimeCapBars = resolveSma200PullbackTimeCapBars(process.env);
     stats.timeCapBars = pullbackTimeCapBars;
-    for (let i = 0; i < symbols.length; i += SCAN_BATCH) {
+    // TRA-5065 — the fallback leg's wall-clock allowance for THIS sweep. See
+    // `SMA200_FALLBACK_BUDGET_MS`; the deadline is captured once so every
+    // symbol in the sweep is measured against the same clock.
+    const fallbackDeadline = Date.now() + SMA200_FALLBACK_BUDGET_MS;
+    // …and the order the budget cuts. Least-recently-fallback-served first, so
+    // a universe bigger than the budget rotates its coverage instead of
+    // pinning a permanent blind spot on the tail.
+    const scanOrder = orderSma200FallbackFairness(symbols);
+    for (let i = 0; i < scanOrder.length; i += SCAN_BATCH) {
       await Promise.all(
-        symbols.slice(i, i + SCAN_BATCH).map(async (sym) => {
+        scanOrder.slice(i, i + SCAN_BATCH).map(async (sym) => {
           let candles: Candle[];
+          let pull: Sma200CandlePull;
           try {
             // TRA-4457 S2 — shared across engines: the next engine to sweep this
             // symbol inside the memo window scores it without a request.
+            // TRA-5065 — …and the Tradier leg behind it, so the sweep is not
+            // pinned to a provider that 429s ~permanently on this host.
             const pulled = await fetchSma200CandlesShared(
               sym, SMA200_DAILY_BARS, (s, n) => fetchDailyCandles(s, n),
+              {
+                breakerOpen: () => isYahooBreakerOpen(),
+                fallback: {
+                  fetch: (s, n) => fetchTradierDailyCandles(s, n),
+                  available: () => isTradierDailyAvailable(),
+                  budgetExhausted: () => Date.now() >= fallbackDeadline,
+                },
+              },
             );
+            pull = pulled;
             candles = pulled.candles;
             if (pulled.fromMemo) stats.memoHits = (stats.memoHits ?? 0) + 1;
+            if (pulled.source === 'primary') stats.servedPrimary = (stats.servedPrimary ?? 0) + 1;
+            else if (pulled.source === 'fallback') stats.servedFallback = (stats.servedFallback ?? 0) + 1;
           } catch (err: unknown) {
             stats.fetchFailed++;
             log.warn('sma200: daily candle fetch failed', {
@@ -8761,15 +8871,30 @@ export class SignalEngine {
             return;
           }
           if (candles.length < SMA200_MIN_BARS) {
-            // TRA-4457 — attribute the starve. `isYahooBreakerOpen()` is a
-            // sample taken after the fact, not a proof for this symbol (the
-            // breaker can flip mid-sweep), but across a sweep it cleanly
-            // separates "we never asked" from "this ticker has < 250 sessions
-            // of history", which are different conditions with different
-            // remedies. Still no per-symbol log line: at 751 symbols a starved
-            // sweep would emit 751 of them. The summary below is the trace.
-            if (isYahooBreakerOpen()) stats.starvedBreakerOpen++;
-            else stats.starvedShortHistory++;
+            // TRA-4457 — attribute the starve: "we never asked" and "this
+            // ticker has < 250 sessions of history" are different conditions
+            // with different remedies.
+            //
+            // TRA-5065 — attributed off what the pull ACTUALLY DID, per
+            // symbol, rather than a post-hoc `isYahooBreakerOpen()` sample
+            // that a mid-sweep breaker flip could misread. Order matters: a
+            // symbol the fallback never reached because WE ran out of budget
+            // is our latency decision, not a vendor outage, so it is named
+            // first and separately.
+            //
+            // Still no per-symbol log line: at 751 symbols a starved sweep
+            // would emit 751 of them. The summary below is the trace.
+            if (candles.length === 0 && pull.fallbackSkipped === 'budget_exhausted') {
+              stats.starvedFallbackBudget = (stats.starvedFallbackBudget ?? 0) + 1;
+              stats.starvedBreakerOpen++;
+            } else if (candles.length === 0 && pull.primarySuppressed) {
+              if (pull.fallbackSkipped === 'unavailable') {
+                stats.fallbackUnavailable = (stats.fallbackUnavailable ?? 0) + 1;
+              }
+              stats.starvedBreakerOpen++;
+            } else {
+              stats.starvedShortHistory++;
+            }
             return;
           }
           stats.evaluated++;

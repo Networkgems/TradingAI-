@@ -204,13 +204,19 @@ describe('TRA-4457 S2 — the sweep shares daily bars across engines', () => {
     await scan(blind, ['AAA']);
     expect(blind.getState().sma200ScanStats?.starvedBreakerOpen).toBe(1);
     expect(__sma200CandleMemoSizeForTest()).toBe(0);
+    // TRA-5065 — and the breaker is asked BEFORE the call now, so a suppressed
+    // symbol never reaches the primary at all. Strictly stronger than the old
+    // "it returned [] without asking" (which trusted `withRetry`'s
+    // short-circuit): the pull site itself refuses.
+    expect(fetchSpy).not.toHaveBeenCalled();
 
     fetchSpy.mockResolvedValue(bars as never);
     breaker.mockReturnValue(false);
     const next = new SignalEngine();
     await scan(next, ['AAA']);
 
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    // One call total: the suppressed sweep spent none, the sighted one spent one.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(next.getState().sma200ScanStats?.memoHits).toBe(0);
     expect(next.getState().sma200ScanStats?.evaluated).toBe(1);
   });
