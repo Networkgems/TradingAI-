@@ -23,7 +23,7 @@ import {
   CHURN_LOSS_BRAKE_FLAG,
   CHURN_SAME_SESSION_OPEN_CAP_VALUE,
 } from './churn-loss-brake-flag.js';
-import { clearChurnBrakeLedger } from './churn-brake-ledger.js';
+import { clearChurnBrakeLedger, summarizeChurnBrakeGuard } from './churn-brake-ledger.js';
 // TRA-4986 — `candleCache` is now one PROCESS-GLOBAL store behind a getter, so a
 // seed here outlives the `beforeEach` and would satisfy another case's
 // cold-cache premise. Every arm in this file resets it.
@@ -36,7 +36,14 @@ type Privates = {
     price: number | undefined,
     source?: 'deterministic' | 'agent-gating',
   ) => Promise<unknown>;
-  recordChurnOpen: (symbol: string, sleeve?: string, now?: number) => void;
+  // TRA-5026 — `assetClass` is required on the real method; declared required here so
+  // this seam cannot drift out of the book split while still compiling.
+  recordChurnOpen: (
+    symbol: string,
+    assetClass: 'equity' | 'option',
+    sleeve?: string,
+    now?: number,
+  ) => void;
   /** TRA-1793 — the universe sweep. THE loop the engine runs; the tests call the same one. */
   sweepEquityEntryUniverse: (activeSymbols: string[]) => Promise<Array<{ sym: string; candles: Candle[] }>>;
   candleCache: Map<string, Candle[]>;
@@ -171,7 +178,7 @@ describe('TRA-1768 — equity entry funnel', () => {
     // at the already-open dedup that sits ahead of it.
     process.env[CHURN_LOSS_BRAKE_FLAG] = '1';
     process.env[CHURN_SAME_SESSION_OPEN_CAP_VALUE] = '1';
-    priv(engine).recordChurnOpen('AAPL');
+    priv(engine).recordChurnOpen('AAPL', 'equity');
 
     beginEquityEntryPass('demo', priv(engine).feedContextKey, { symbolsConsidered: 21 });
     await priv(engine).routeEquitySignal(buildSignal(), 100, 'deterministic');
@@ -185,6 +192,28 @@ describe('TRA-1768 — equity entry funnel', () => {
     expect(demo.funnelStatus).not.toBe('no_candidates'); // the distinction that decides everything
     // And no position opened, so `admitted` is counting FILLS, not attempts.
     expect(engine.getState().account.openPositions.some(p => p.symbol === 'AAPL')).toBe(false);
+
+    // TRA-5026 — THE CHAIN, driven through the real engine chokepoint. The same
+    // rejection the funnel books as `churn_brake: 1` must land in the churn-brake
+    // ledger's EQUITY cell, or the two folds still cannot be joined. `presented` is
+    // 1, not 2: the quota-burning `recordChurnOpen` above writes an `open_admitted`
+    // line, which is a different population and never touches this denominator.
+    //
+    // ⚠ SCOPE OF THIS ARM: it drives `routeEquitySignal` only — ONE of the cap's two
+    // equity chokepoints. A wrong book literal at the other (`openSma200Pullback`)
+    // passes here; it is caught by the per-call-site census in
+    // `tra5026-churn-cap-asset-class.test.ts`. Both plants were run.
+    const retained = summarizeChurnBrakeGuard();
+    const day = retained.byEtDay.at(-1)!;
+    expect(day.opensRejectedByAssetClass).toEqual({ equity: 1, option: 0, unknown: 0 });
+    expect(day.opensPresentedByAssetClass).toEqual({ equity: 1, option: 0, unknown: 0 });
+    // The identity the acceptance asks for, on a day produced by the engine itself.
+    const split = day.opensPresentedByAssetClass;
+    expect(split.equity + split.option + split.unknown).toBe(day.opensPresented);
+    // …and the day is attributed, so this is a MEASURED equity 1, not an unrecorded one.
+    expect(retained.presentedAssetClassSinceEtDay).toBe(day.etDay);
+    // The equity funnel's own reject count is now joinable to it on one denominator.
+    expect(demo.lastPass.rejectedByReason!.churn_brake).toBe(day.opensRejectedByAssetClass.equity);
   });
 
   it('ENGINE: a candidate outside the swing universe is named, not silently dropped', async () => {

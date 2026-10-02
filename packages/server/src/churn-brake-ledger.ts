@@ -63,6 +63,26 @@ export type ChurnDcaLeg = 'equity' | 'option';
  */
 export type ChurnOpenAssetClass = 'equity' | 'option';
 
+/**
+ * TRA-5026 — one counter decomposed by book.
+ *
+ * `unknown` is a FIRST-CLASS cell, never an omission: a line written before the
+ * split existed (or by a chokepoint that did not state its book) lands there, so
+ * `equity + option + unknown` closes on the undecomposed total exactly. Defaulting
+ * an absent class into `equity` or `option` would silently restate every retained
+ * day's denominator on the first boot after deploy — see {@link ChurnBrakeGuardEvent.kind}.
+ */
+export interface ChurnBrakeAssetClassSplit {
+  equity: number;
+  option: number;
+  unknown: number;
+}
+
+/** Fold one possibly-absent/unrecognised class onto a {@link ChurnBrakeAssetClassSplit} key. */
+function assetClassCell(assetClass: ChurnOpenAssetClass | undefined): keyof ChurnBrakeAssetClassSplit {
+  return assetClass === 'equity' || assetClass === 'option' ? assetClass : 'unknown';
+}
+
 /** A per-symbol NEW-open counter scoped to one ET session. */
 interface EtDayCount {
   etDay: string;
@@ -307,8 +327,21 @@ export interface ChurnBrakeGuardEvent {
    */
   kind?: 'cap_verdict' | 'open_admitted';
   /**
-   * TRA-4462 — the book an `open_admitted` line landed in. Only meaningful on that
-   * kind; absent ⇒ unknown (a pre-split line, or a chokepoint that did not say).
+   * The book this line belongs to. Absent ⇒ `unknown` (a pre-split line, or a
+   * chokepoint that did not say) — never defaulted to a book.
+   *
+   * TRA-4462 shipped it on `open_admitted` only. TRA-5026 extends it to
+   * `cap_verdict`, because the ADMITTED side being the only decomposable one made
+   * `opensPresented` a mixed-sleeve denominator with no way to split it: on
+   * 2026-09-30 the demo book presented 60,592 candidates, rejected 0 and admitted 0
+   * in BOTH sleeves, and no surface could say whether the equity leg contributed any
+   * of the 60,592 — i.e. whether the equity zero was upstream or downstream of the
+   * cap. Those are different investigations.
+   *
+   * ⚠ The cut matters as much as the field: see
+   * {@link ChurnBrakeGuardSummary.presentedAssetClassSinceEtDay}. A retained day
+   * written before this split is byte-identical to a fully-attributed one unless the
+   * payload says where the attribution starts.
    */
   assetClass?: ChurnOpenAssetClass;
   /** Evaluation time, ms epoch. */
@@ -334,10 +367,21 @@ interface GuardDayTally {
   presented: number;
   evaluated: number;
   rejected: number;
+  /**
+   * TRA-5026 — the same three counters decomposed by book, so the cap's ATTEMPT
+   * denominator can be chained onto the per-book funnels (the equity funnel's
+   * `churn_brake` reject cell, TRA-4998) instead of being a mixed-sleeve total.
+   * Each split sums to its scalar above, `unknown` included.
+   */
+  presentedByAssetClass: ChurnBrakeAssetClassSplit;
+  evaluatedByAssetClass: ChurnBrakeAssetClassSplit;
+  rejectedByAssetClass: ChurnBrakeAssetClassSplit;
+  /** Did ANY `cap_verdict` line this day state its book? Backs the attribution cut. */
+  presentedAttributed: boolean;
   rejectsBySymbol: Map<string, number>;
   /** TRA-4462 — opens the cap ADMITTED that actually reached a book, this ET day. */
   admitted: number;
-  admittedByAssetClass: { equity: number; option: number; unknown: number };
+  admittedByAssetClass: ChurnBrakeAssetClassSplit;
   admittedBySymbol: Map<string, number>;
   firstAt: number | null;
   lastAt: number | null;
@@ -390,6 +434,10 @@ function guardDayTally(etDay: string): GuardDayTally {
       presented: 0,
       evaluated: 0,
       rejected: 0,
+      presentedByAssetClass: { equity: 0, option: 0, unknown: 0 },
+      evaluatedByAssetClass: { equity: 0, option: 0, unknown: 0 },
+      rejectedByAssetClass: { equity: 0, option: 0, unknown: 0 },
+      presentedAttributed: false,
       rejectsBySymbol: new Map(),
       admitted: 0,
       admittedByAssetClass: { equity: 0, option: 0, unknown: 0 },
@@ -408,9 +456,9 @@ function applyGuardEvent(ev: ChurnBrakeGuardEvent): void {
   // TRA-4462 — an ADMITTED-open line is a different population from a cap verdict.
   // Folding it into `presented` would inflate the cap's own denominator with the
   // opens it let through, which is the reverse of the defect this fixes.
+  const cls = assetClassCell(ev.assetClass);
   if (ev.kind === 'open_admitted') {
     t.admitted += 1;
-    const cls = ev.assetClass === 'equity' || ev.assetClass === 'option' ? ev.assetClass : 'unknown';
     t.admittedByAssetClass[cls] += 1;
     const sym = normSymbol(ev.symbol);
     t.admittedBySymbol.set(sym, (t.admittedBySymbol.get(sym) ?? 0) + 1);
@@ -419,12 +467,21 @@ function applyGuardEvent(ev: ChurnBrakeGuardEvent): void {
     return;
   }
   t.presented += 1;
-  if (ev.guardEnabled) t.evaluated += 1;
+  // TRA-5026 — fold the book on the SAME branch as the scalar, so the split can
+  // never disagree with the total it decomposes. `unknown` is incremented
+  // explicitly; it is a measured cell, not a missing key.
+  t.presentedByAssetClass[cls] += 1;
+  if (cls !== 'unknown') t.presentedAttributed = true;
+  if (ev.guardEnabled) {
+    t.evaluated += 1;
+    t.evaluatedByAssetClass[cls] += 1;
+  }
   // A halt is only meaningful as a subset of the evaluated population (the
   // TRA-2598 rule): a malformed line claiming `blocked` while dark must not be
   // able to break `rejected ≤ evaluated`.
   if (ev.guardEnabled && ev.blocked) {
     t.rejected += 1;
+    t.rejectedByAssetClass[cls] += 1;
     const sym = normSymbol(ev.symbol);
     t.rejectsBySymbol.set(sym, (t.rejectsBySymbol.get(sym) ?? 0) + 1);
   }
@@ -592,6 +649,29 @@ export interface ChurnBrakeGuardDaySummary {
   opensPresented: number;
   opensEvaluated: number;
   opensRejected: number;
+  /**
+   * TRA-5026 — the ATTEMPT denominator decomposed by book. The per-name cap is
+   * reached from five chokepoints, two equity (`routeEquitySignal`,
+   * `openSma200Pullback`) and three option (RV / OTM / directional), so without
+   * this `opensPresented` is a mixed-sleeve number and the equity and option
+   * funnels cannot be chained on a shared denominator.
+   *
+   * `equity + option + unknown === opensPresented` exactly, on every day. Same for
+   * the evaluated and rejected splits against their own scalars.
+   *
+   * ⚠ Before reading any of the three, check
+   * {@link ChurnBrakeGuardSummary.presentedAssetClassSinceEtDay}: on a day earlier
+   * than that cut EVERY line predates the split, so `unknown` carries the whole
+   * total and the two real cells read `0` — which means UNRECORDED, not "that book
+   * presented nothing".
+   *
+   * The chain this exists for: `opensRejectedByAssetClass.equity` is the cell
+   * `/api/health/equity-entry-funnel`'s `churn_brake` reject cell (TRA-4998) is
+   * comparable against. `opensRejectedByAssetClass.option` is the option side's.
+   */
+  opensPresentedByAssetClass: ChurnBrakeAssetClassSplit;
+  opensEvaluatedByAssetClass: ChurnBrakeAssetClassSplit;
+  opensRejectedByAssetClass: ChurnBrakeAssetClassSplit;
   /** Per-symbol rejects for this day, most-rejected first (top N). */
   rejectsBySymbol: ChurnBrakeSymbolCount[];
   /**
@@ -612,7 +692,7 @@ export interface ChurnBrakeGuardDaySummary {
    * state its book. It is a stated cell, not an omission: a silently-absent key
    * would let a partially-migrated ledger read as a fully-attributed one.
    */
-  opensAdmittedByAssetClass: { equity: number; option: number; unknown: number };
+  opensAdmittedByAssetClass: ChurnBrakeAssetClassSplit;
   /** Per-symbol ADMITTED opens for this day, busiest first (top N). */
   admittedBySymbol: ChurnBrakeSymbolCount[];
 }
@@ -644,10 +724,45 @@ export interface ChurnBrakeGuardSummary {
   opensEvaluated: number;
   /** Candidates the cap refused. */
   opensRejected: number;
+  /**
+   * TRA-5026 — the three ATTEMPT counters split by book, summed over the retained
+   * window. See {@link ChurnBrakeGuardDaySummary.opensPresentedByAssetClass}.
+   *
+   * ⚠ A WINDOW total straddles the attribution cut by construction, so these three
+   * are the LEAST safe cells on the payload to read on their own: a window holding
+   * 29 pre-cut days and 1 post-cut day reports a huge `unknown` that says nothing
+   * about either book. Read `byEtDay` at or after
+   * {@link presentedAssetClassSinceEtDay}; these exist so the per-day cells have a
+   * total that reconciles, not as a window verdict.
+   */
+  opensPresentedByAssetClass: ChurnBrakeAssetClassSplit;
+  opensEvaluatedByAssetClass: ChurnBrakeAssetClassSplit;
+  opensRejectedByAssetClass: ChurnBrakeAssetClassSplit;
+  /**
+   * TRA-5026 — the ET day from which a `cap_verdict` line STATES its book: the
+   * earliest retained day carrying at least one attributed cap verdict, or `null`
+   * when not one retained line is attributed (i.e. the whole window predates the
+   * split and every `*ByAssetClass` cell above is `unknown`-only).
+   *
+   * This is the mirror of {@link opensAdmittedSinceEtDay} and it is load-bearing for
+   * the same reason, one step sharper: `opensPresented` has ALWAYS been recorded, so
+   * a pre-split day does not read as a hole — it reads as a complete day that
+   * happened to present nothing on either book. Migrated and unmigrated states are
+   * byte-identical without this field, which is the exact defect class this family of
+   * tickets exists to remove, re-minted by its own fix. Hence the name: the cut is on
+   * the ASSET-CLASS attribution, not on `opensPresented` itself.
+   *
+   * ⚠ The cut DAY may itself be partial — a deploy mid-session leaves pre-split and
+   * post-split lines on the same ET day. The cut is "attribution starts here", not
+   * "this day is fully attributed". To require a complete day, test
+   * `opensPresentedByAssetClass.unknown === 0` on that day's row; the identity
+   * `equity + option + unknown === opensPresented` makes that test exact.
+   */
+  presentedAssetClassSinceEtDay: string | null;
   /** TRA-4462 — opens that actually reached a book, across the retained window. */
   opensAdmitted: number;
   /** TRA-4462 — the admitted split by book. See {@link ChurnBrakeGuardDaySummary}. */
-  opensAdmittedByAssetClass: { equity: number; option: number; unknown: number };
+  opensAdmittedByAssetClass: ChurnBrakeAssetClassSplit;
   /**
    * TRA-4462 — the ET day from which `opensAdmitted` is a complete count (the first
    * retained day carrying at least one `open_admitted` line), or `null` when no such
@@ -690,8 +805,12 @@ export function summarizeChurnBrakeGuard(): ChurnBrakeGuardSummary {
   let evaluated = 0;
   let rejected = 0;
   let admitted = 0;
-  const admittedByAssetClass = { equity: 0, option: 0, unknown: 0 };
+  const presentedByAssetClass: ChurnBrakeAssetClassSplit = { equity: 0, option: 0, unknown: 0 };
+  const evaluatedByAssetClass: ChurnBrakeAssetClassSplit = { equity: 0, option: 0, unknown: 0 };
+  const rejectedByAssetClass: ChurnBrakeAssetClassSplit = { equity: 0, option: 0, unknown: 0 };
+  const admittedByAssetClass: ChurnBrakeAssetClassSplit = { equity: 0, option: 0, unknown: 0 };
   let admittedSinceEtDay: string | null = null;
+  let presentedAssetClassSinceEtDay: string | null = null;
   let lastEvaluatedAt: number | null = null;
   let lastRejectedAt: number | null = null;
   const etDays = [...guardByDay.keys()].sort();
@@ -702,12 +821,21 @@ export function summarizeChurnBrakeGuard(): ChurnBrakeGuardSummary {
     evaluated += t.evaluated;
     rejected += t.rejected;
     admitted += t.admitted;
-    admittedByAssetClass.equity += t.admittedByAssetClass.equity;
-    admittedByAssetClass.option += t.admittedByAssetClass.option;
-    admittedByAssetClass.unknown += t.admittedByAssetClass.unknown;
+    for (const cell of ['equity', 'option', 'unknown'] as const) {
+      presentedByAssetClass[cell] += t.presentedByAssetClass[cell];
+      evaluatedByAssetClass[cell] += t.evaluatedByAssetClass[cell];
+      rejectedByAssetClass[cell] += t.rejectedByAssetClass[cell];
+      admittedByAssetClass[cell] += t.admittedByAssetClass[cell];
+    }
     // `etDays` is sorted ascending, so the first day with an admitted line is the
     // earliest one this counter can honestly speak for.
     if (admittedSinceEtDay === null && t.admitted > 0) admittedSinceEtDay = etDay;
+    // TRA-5026 — same rule for the ATTEMPT attribution, but keyed on an ATTRIBUTED
+    // line rather than on a non-zero count: `presented > 0` has been true on every
+    // retained day since long before the split, so it cannot date the cut.
+    if (presentedAssetClassSinceEtDay === null && t.presentedAttributed) {
+      presentedAssetClassSinceEtDay = etDay;
+    }
     if (t.lastAt !== null && (lastEvaluatedAt === null || t.lastAt > lastEvaluatedAt)) {
       lastEvaluatedAt = t.lastAt;
     }
@@ -721,6 +849,9 @@ export function summarizeChurnBrakeGuard(): ChurnBrakeGuardSummary {
       opensPresented: t.presented,
       opensEvaluated: t.evaluated,
       opensRejected: t.rejected,
+      opensPresentedByAssetClass: { ...t.presentedByAssetClass },
+      opensEvaluatedByAssetClass: { ...t.evaluatedByAssetClass },
+      opensRejectedByAssetClass: { ...t.rejectedByAssetClass },
       rejectsBySymbol: [...t.rejectsBySymbol.entries()]
         .map(([symbol, count]) => ({ symbol, count }))
         .sort((a, b) => b.count - a.count)
@@ -748,6 +879,10 @@ export function summarizeChurnBrakeGuard(): ChurnBrakeGuardSummary {
     opensPresented: presented,
     opensEvaluated: evaluated,
     opensRejected: rejected,
+    opensPresentedByAssetClass: presentedByAssetClass,
+    opensEvaluatedByAssetClass: evaluatedByAssetClass,
+    opensRejectedByAssetClass: rejectedByAssetClass,
+    presentedAssetClassSinceEtDay,
     opensAdmitted: admitted,
     opensAdmittedByAssetClass: admittedByAssetClass,
     opensAdmittedSinceEtDay: admittedSinceEtDay,
@@ -812,4 +947,13 @@ const RECONCILIATION_NOTE =
   + 'admit counts toward the cap and is structurally absent from that journal, which is why '
   + '2026-09-08 shows 26 MSTR rejects against a journal that holds no MSTR row on any day. '
   + 'Before comparing any day, check `opensAdmittedSinceEtDay`: a retained day earlier than '
-  + 'that cut predates this counter and its `opensAdmitted: 0` means UNRECORDED, not zero.';
+  + 'that cut predates this counter and its `opensAdmitted: 0` means UNRECORDED, not zero. '
+  + 'TRA-5026 — the ATTEMPT side splits the same way: `opensPresentedByAssetClass` / '
+  + '`opensEvaluatedByAssetClass` / `opensRejectedByAssetClass`, each summing to its scalar '
+  + 'with `unknown` included, so `opensRejectedByAssetClass.equity` is the cell the equity '
+  + 'entry funnel\'s `churn_brake` reject count (TRA-4998) is comparable against and the two '
+  + 'folds finally chain on one denominator. Gate that read on '
+  + '`presentedAssetClassSinceEtDay`: before that cut no cap verdict stated its book, so '
+  + '`unknown` carries the whole total and `equity: 0` means UNRECORDED, not "the equity leg '
+  + 'presented nothing". The cut DAY itself may be partial (a mid-session deploy); require '
+  + '`opensPresentedByAssetClass.unknown === 0` to call a day fully attributed.';

@@ -7971,8 +7971,20 @@ describe('SignalEngine — IV-RV mispriced routing (TRA-1203)', () => {
 describe('SignalEngine — churn + same-day-loss brake (TRA-1408)', () => {
   type ChurnInternals = {
     mode: 'demo' | 'live';
-    churnOpenCapVerdict: (symbol: string, now?: number) => { blocked: boolean; count: number; cap: number };
-    recordChurnOpen: (symbol: string, sleeve?: 'directional' | 'other', now?: number) => void;
+    // TRA-5026 — `assetClass` is required on BOTH, and declared here as required on
+    // purpose: a seam that declares it optional lets this suite keep compiling while
+    // the real chokepoints drift out of the split (and silently grades `unknown`).
+    churnOpenCapVerdict: (
+      symbol: string,
+      assetClass: 'equity' | 'option',
+      now?: number,
+    ) => { blocked: boolean; count: number; cap: number };
+    recordChurnOpen: (
+      symbol: string,
+      assetClass: 'equity' | 'option',
+      sleeve?: 'directional' | 'other',
+      now?: number,
+    ) => void;
     isSameDayLoser: (realizedToday: number, unrealized: number) => boolean;
     realizedEquityPnlToday: (symbol: string, etDay: string) => number;
     allClosedPositions: Array<{ symbol: string; pnl?: number; closedAt?: number; mode?: 'demo' | 'live' }>;
@@ -8003,8 +8015,8 @@ describe('SignalEngine — churn + same-day-loss brake (TRA-1408)', () => {
     const inner = engine as unknown as ChurnInternals;
     delete process.env.ENABLE_CHURN_LOSS_BRAKE;
     // Even after many opens the cap never binds while dark.
-    for (let i = 0; i < 10; i++) inner.recordChurnOpen('GIS');
-    expect(inner.churnOpenCapVerdict('GIS').blocked).toBe(false);
+    for (let i = 0; i < 10; i++) inner.recordChurnOpen('GIS', 'equity');
+    expect(inner.churnOpenCapVerdict('GIS', 'equity').blocked).toBe(false);
   });
 
   it('blocks a NEW open once a name hits the cap (default N=3); other names are independent', () => {
@@ -8013,14 +8025,14 @@ describe('SignalEngine — churn + same-day-loss brake (TRA-1408)', () => {
     const inner = engine as unknown as ChurnInternals;
 
     // 0,1,2 opens all admitted; the 3rd puts the name at the cap and the next is blocked.
-    expect(inner.churnOpenCapVerdict('GIS')).toMatchObject({ blocked: false, count: 0, cap: 3 });
-    inner.recordChurnOpen('GIS');
-    inner.recordChurnOpen('GIS');
-    expect(inner.churnOpenCapVerdict('GIS')).toMatchObject({ blocked: false, count: 2 });
-    inner.recordChurnOpen('GIS'); // count → 3 == cap
-    expect(inner.churnOpenCapVerdict('GIS')).toMatchObject({ blocked: true, count: 3, cap: 3 });
+    expect(inner.churnOpenCapVerdict('GIS', 'equity')).toMatchObject({ blocked: false, count: 0, cap: 3 });
+    inner.recordChurnOpen('GIS', 'equity');
+    inner.recordChurnOpen('GIS', 'equity');
+    expect(inner.churnOpenCapVerdict('GIS', 'equity')).toMatchObject({ blocked: false, count: 2 });
+    inner.recordChurnOpen('GIS', 'equity'); // count → 3 == cap
+    expect(inner.churnOpenCapVerdict('GIS', 'equity')).toMatchObject({ blocked: true, count: 3, cap: 3 });
     // A different underlier is unaffected by GIS's churn.
-    expect(inner.churnOpenCapVerdict('AAPL').blocked).toBe(false);
+    expect(inner.churnOpenCapVerdict('AAPL', 'equity').blocked).toBe(false);
   });
 
   it('honours the CHURN_SAME_SESSION_OPEN_CAP override', () => {
@@ -8028,9 +8040,9 @@ describe('SignalEngine — churn + same-day-loss brake (TRA-1408)', () => {
     process.env.CHURN_SAME_SESSION_OPEN_CAP = '1';
     const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' });
     const inner = engine as unknown as ChurnInternals;
-    expect(inner.churnOpenCapVerdict('GIS').cap).toBe(1);
-    inner.recordChurnOpen('GIS');
-    expect(inner.churnOpenCapVerdict('GIS').blocked).toBe(true);
+    expect(inner.churnOpenCapVerdict('GIS', 'equity').cap).toBe(1);
+    inner.recordChurnOpen('GIS', 'equity');
+    expect(inner.churnOpenCapVerdict('GIS', 'equity').blocked).toBe(true);
   });
 
   it('never binds on the LIVE path (demo-scoped by construction)', () => {
@@ -8038,9 +8050,9 @@ describe('SignalEngine — churn + same-day-loss brake (TRA-1408)', () => {
     process.env.CHURN_SAME_SESSION_OPEN_CAP = '1';
     const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'live' });
     const inner = engine as unknown as ChurnInternals;
-    inner.recordChurnOpen('GIS'); // no-op on live
-    inner.recordChurnOpen('GIS');
-    expect(inner.churnOpenCapVerdict('GIS').blocked).toBe(false);
+    inner.recordChurnOpen('GIS', 'equity'); // no-op on live
+    inner.recordChurnOpen('GIS', 'equity');
+    expect(inner.churnOpenCapVerdict('GIS', 'equity').blocked).toBe(false);
   });
 
   it('same-day-loss test: net-negative (realized + unrealized) halts, non-negative allows', () => {

@@ -9223,7 +9223,10 @@ export class SignalEngine {
     };
 
     // TRA-1408 — per-name same-session open cap (DEMO-scoped, DARK until armed).
-    const churnCap = this.churnOpenCapVerdict(signal.symbol);
+    // TRA-5026 — `equity`: the SMA-200 pullback router opens shares directly (it
+    // never passes through `routeEquitySignal`), so it is the cap's second equity
+    // chokepoint and must state the same book.
+    const churnCap = this.churnOpenCapVerdict(signal.symbol, 'equity');
     if (churnCap.blocked) {
       signal.signalSkipReason = `churn brake: ${signal.symbol} hit same-session open cap (${churnCap.count}/${churnCap.cap})`;
       recordEquityEntryRejected(funnelMode, funnelEngineId, 'churn_brake');
@@ -11017,9 +11020,19 @@ export class SignalEngine {
    * count on the ET session exactly like the DCA per-name counters, so the cap
    * auto-resets at the ET-day roll. Consulted at each demo open chokepoint BEFORE
    * the position opens; the caller records the open via {@link recordChurnOpen}.
+   *
+   * TRA-5026 — `assetClass` is REQUIRED and stated by the chokepoint, exactly like
+   * {@link recordChurnOpen}'s. The cap is cross-asset-class (two equity entries,
+   * three option ones), so without it `opensPresented` is a mixed-sleeve denominator:
+   * on 2026-09-30 the demo book presented 60,592 candidates, rejected 0 and admitted
+   * 0 in BOTH sleeves, and nothing could say whether the equity leg contributed any
+   * of them — i.e. whether the equity zero sat upstream or downstream of this cap.
+   * It is a required positional (not an optional with a default) so a new chokepoint
+   * cannot compile while silently writing its verdict into the `unknown` cell.
    */
   private churnOpenCapVerdict(
     symbol: string,
+    assetClass: ChurnOpenAssetClass,
     now = Date.now(),
   ): { blocked: boolean; count: number; cap: number } {
     if (this.mode === 'live') return { blocked: false, count: 0, cap: 0 };
@@ -11028,12 +11041,16 @@ export class SignalEngine {
       // TRA-4335 — presented-but-DARK. Recorded so `opensEvaluated: 0` against a
       // non-zero `opensPresented` is readable as "the brake did not run", which a
       // bare reject count of 0 can never say (same denominator rule as TRA-2598).
+      // TRA-5026 — a DARK verdict still states its book: it counts into
+      // `opensPresentedByAssetClass` (not `opensEvaluatedByAssetClass`), which is
+      // what lets "the brake was off for the equity leg specifically" be read.
       recordChurnBrakeGuardEvent({
         ts: now,
         etDay: etDateString(new Date(now)),
         symbol,
         guardEnabled: false,
         blocked: false,
+        assetClass,
       });
       return { blocked: false, count: 0, cap: 0 };
     }
@@ -11058,6 +11075,7 @@ export class SignalEngine {
       blocked,
       count,
       cap,
+      assetClass,
     });
     return { blocked, count, cap };
   }
@@ -14251,7 +14269,8 @@ export class SignalEngine {
         // (DEMO-scoped, DARK until ENABLE_CHURN_LOSS_BRAKE). Rejects a new open on
         // a name that already hit N opens this ET session, before any Tradier
         // mirror. Same containment as the greeks gate / correlated cap above.
-        const rvChurnCap = this.churnOpenCapVerdict(signal.symbol);
+        // TRA-5026 — `option`: the RV sleeve opens option contracts.
+        const rvChurnCap = this.churnOpenCapVerdict(signal.symbol, 'option');
         if (rvChurnCap.blocked) {
           signal.signalSkipReason = `churn brake: ${signal.symbol} hit same-session open cap (${rvChurnCap.count}/${rvChurnCap.cap})`;
           log.info('RV long rejected by churn brake (TRA-1408)', {
@@ -16694,7 +16713,8 @@ export class SignalEngine {
         // has hit N opens this ET session (the churn pathology). Placed after the
         // live-suppression bail so the demo book — the only book that opens here —
         // is the one gated.
-        const otmChurnCap = this.churnOpenCapVerdict(signal.symbol);
+        // TRA-5026 — `option`: the OTM sleeve opens option contracts.
+        const otmChurnCap = this.churnOpenCapVerdict(signal.symbol, 'option');
         if (otmChurnCap.blocked) {
           signal.signalSkipReason = `churn brake: ${signal.symbol} hit same-session open cap (${otmChurnCap.count}/${otmChurnCap.cap})`;
           this.pushRecentSignal(signal);
@@ -17865,7 +17885,8 @@ export class SignalEngine {
         // that gate was off. Reject the Nth+1 open exactly like the other
         // chokepoints; DEMO-SCOPED + DARK until ENABLE_CHURN_LOSS_BRAKE (caller is
         // already demo-only), so the live options path is untouched.
-        const dirChurnCap = this.churnOpenCapVerdict(sym, asOf);
+        // TRA-5026 — `option`: the directional sleeve opens option contracts.
+        const dirChurnCap = this.churnOpenCapVerdict(sym, 'option', asOf);
         if (dirChurnCap.blocked) {
           log.info('demo directional rejected by churn brake (TRA-1408)', {
             symbol: sym, count: dirChurnCap.count, cap: dirChurnCap.cap,
@@ -21183,7 +21204,9 @@ export class SignalEngine {
     // pathology). DEMO-SCOPED + DARK until ENABLE_CHURN_LOSS_BRAKE — a no-op on
     // the live path and when the flag is off, so prod is unchanged. Checked here,
     // before the broker order, so no Tradier OTOCO is submitted past the cap.
-    const churnCap = this.churnOpenCapVerdict(signal.symbol);
+    // TRA-5026 — `equity`: this is one of the cap's two equity chokepoints, and the
+    // reject below is the SAME event the equity funnel books as `churn_brake`.
+    const churnCap = this.churnOpenCapVerdict(signal.symbol, 'equity');
     if (churnCap.blocked) {
       signal.signalSkipReason = `churn brake: ${signal.symbol} hit same-session open cap (${churnCap.count}/${churnCap.cap})`;
       this.pushRecentSignal(signal);
