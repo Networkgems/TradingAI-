@@ -101,18 +101,14 @@ export async function grade({ repo, sha, workflow, token, fetcher }) {
 
 // ---------------------------------------------------------------------------
 export async function selftest() {
-  const { EXPECTED_JOBS, TEST_JOB_NAME, TEST_STEP_NAME } = await import('./ci-verdict.mjs');
-  const greenJobs = {
-    jobs: Object.entries(EXPECTED_JOBS).map(([id, name]) => ({
-      name,
-      status: 'completed',
-      conclusion: 'success',
-      steps:
-        name === TEST_JOB_NAME
-          ? [{ name: TEST_STEP_NAME, status: 'completed', conclusion: 'success', started_at: '2026-09-09T00:00:00Z', completed_at: '2026-09-09T00:07:30Z' }]
-          : [{ name: id, status: 'completed', conclusion: 'success', started_at: '2026-09-09T00:00:00Z', completed_at: '2026-09-09T00:01:00Z' }],
-    })),
-  };
+  // TRA-5029 — the green fixture is IMPORTED, never re-typed here. This file used to
+  // hand-roll its own copy of "a complete /jobs payload" while delegating the grading to
+  // `gradeJobs`; when TRA-5029 added a required step to the test job, the copy went stale
+  // and this selftest went red in CI on a change that touched neither this file nor the
+  // gate's live behaviour (run 2117, step `Verdict gate mutation controls`). The grader
+  // owns the fixture.
+  const { TEST_JOB_NAME, greenJobsFixture } = await import('./ci-verdict.mjs');
+  const greenJobs = greenJobsFixture();
   const clone = (o) => JSON.parse(JSON.stringify(o));
   const mkFetcher = (runs, jobsByRunId) => (kind, params) => {
     if (kind === 'runs') return runs instanceof Error ? Promise.reject(runs) : Promise.resolve(runs);
@@ -127,6 +123,14 @@ export async function selftest() {
       { fetcher: mkFetcher({ workflow_runs: [run(1, 'completed', 'success')] }, { 1: clone(greenJobs) }) }, CLEAN],
     ['green conclusion but the test job was DROPPED from the run -> BLIND (3)',
       { fetcher: mkFetcher({ workflow_runs: [run(1, 'completed', 'success')] }, { 1: { jobs: clone(greenJobs).jobs.filter((j) => j.name !== TEST_JOB_NAME) } }) }, BLIND],
+    // TRA-5029 — a run GitHub called `success` whose test job never published an executed
+    // test count. That is the 2026-09-25 shape with the redness removed, and it is the one
+    // a promotion gate must refuse: `--passWithNoTests` makes an empty suite a pass at the
+    // package level, so "green" is not evidence the suite ran.
+    ['green run whose test job published NO executed-count step -> BLIND (3)',
+      { fetcher: mkFetcher({ workflow_runs: [run(1, 'completed', 'success')] }, {
+        1: (() => { const p = clone(greenJobs); const t = p.jobs.find((j) => j.name === TEST_JOB_NAME); t.steps = t.steps.slice(0, 1); return p; })(),
+      }) }, BLIND],
     ['red run only -> BROKEN (1)',
       { fetcher: mkFetcher({ workflow_runs: [run(1, 'completed', 'failure')] }, {}) }, BROKEN],
     ['red first attempt, green re-run -> VERIFIED (0)',
