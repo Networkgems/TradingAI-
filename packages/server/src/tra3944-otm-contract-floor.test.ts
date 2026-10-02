@@ -270,6 +270,147 @@ describe('TRA-3944 — the conflict with the armed selector band is PUBLISHED, n
   });
 });
 
+// ── TRA-5024 — the live per-entry cap, graded as a VERDICT, not a grep ──────
+//
+// The rule being guarded is a capital bound on the live OTM sleeve: the
+// per-entry contract cap must be applied **AFTER** the canary sizing, never
+// INSTEAD of it. `cap(size(...))` bounds a sized count; `cap(maxContracts)`
+// throws the sizing away and can hand the book MORE contracts than the canary
+// ask-notional fit allows.
+//
+// Two separate failures have now been paid for on this one assertion:
+//   • TRA-3401 (`c8488569`) renamed the receiving binding `testContracts` →
+//     `sizedTestContracts`. A literal `indexOf` of the binding name returned
+//     -1 and the test read `expected -1 to be greater than -1` — RED for a
+//     week while the bound itself survived byte-identical.
+//   • That red SHORT-CIRCUITED the account-side assertion two lines below it,
+//     so the second open site's cap went unchecked the whole time. One blind
+//     anchor hid a further invariant. (TRA-5024, found while shipping
+//     TRA-4990.)
+//
+// So this helper separates the two outcomes the old grep conflated:
+//   • anchors gone entirely  ⇒ **THROWS** (`BLIND:`). "I could not check" must
+//     not share an outcome with "I checked and the cap moved".
+//   • anchors present        ⇒ a named verdict, including the two WRONG shapes,
+//     so the negative controls below can assert the predicate reports exactly
+//     the defect that was planted.
+const LIVE_SIZING_CALL = 'resolveLiveOptionTestContracts(askLimit, notionalCap, maxContracts)';
+const CAP_CALL = 'capOtmEntryContracts(';
+
+type LiveCapVerdict =
+  /** `cap(size(...), otmFloor)` — the invariant. */
+  | 'cap_wraps_sizing'
+  /** The cap is called, but not on the sized count — the capital defect. */
+  | 'cap_instead_of_sizing'
+  /** Sizing is called and never capped — the other capital defect. */
+  | 'sizing_uncapped';
+
+/** Balanced-paren argument text of the call whose `(` ends at `openParenEnd`. */
+function callArgText(src: string, openParenEnd: number): string | null {
+  let depth = 1;
+  for (let i = openParenEnd; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === '(') depth++;
+    else if (ch === ')') {
+      depth--;
+      if (depth === 0) return src.slice(openParenEnd, i);
+    }
+  }
+  return null;
+}
+
+/** Split an argument list on TOP-LEVEL commas only. */
+function splitTopLevelArgs(args: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < args.length; i++) {
+    const ch = args[i];
+    if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') depth--;
+    else if (ch === ',' && depth === 0) {
+      out.push(args.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(args.slice(start));
+  // Whitespace-normalised: the call is wrapped across four physical lines in
+  // the engine, and TRA-3953 was defeated by exactly that line break.
+  return out.map((a) => a.replace(/\s+/g, ' ').trim()).filter((a) => a.length > 0);
+}
+
+/**
+ * Grade how the live canary count is capped.
+ *
+ * @throws if BOTH anchors are absent — the region was restructured past what
+ *   this predicate can read, which is BLIND, not a verdict.
+ */
+function liveOtmCapNesting(source: string): { verdict: LiveCapVerdict; binding: string } {
+  const sizingAt = source.indexOf(LIVE_SIZING_CALL);
+  const capAt = source.indexOf(CAP_CALL);
+  if (sizingAt < 0 && capAt < 0) {
+    throw new Error(
+      'BLIND: neither the canary sizing call nor the per-entry cap call is present in '
+      + 'signal-engine.ts. This predicate cannot grade whether the cap wraps the sizing — '
+      + 're-anchor it. Do NOT read this as the cap having been removed.',
+    );
+  }
+  // The binding that receives the capped count, for the one-shot clamp check.
+  const bindingAt = capAt >= 0 ? source.lastIndexOf('const ', capAt) : -1;
+  const binding = bindingAt >= 0
+    ? (/^const (\w+)/.exec(source.slice(bindingAt, bindingAt + 80))?.[1] ?? '')
+    : '';
+
+  // Does ANY `capOtmEntryContracts(` take the sizing call as its FIRST argument?
+  for (let at = source.indexOf(CAP_CALL); at >= 0; at = source.indexOf(CAP_CALL, at + 1)) {
+    const args = callArgText(source, at + CAP_CALL.length);
+    if (args === null) continue;
+    const parts = splitTopLevelArgs(args);
+    if (parts[0] === LIVE_SIZING_CALL) {
+      // ...and bounded by the floor, not by some looser ceiling.
+      if (parts[1] !== 'otmFloor') {
+        throw new Error(
+          `BLIND: the cap wraps the sizing but its bound argument reads \`${parts[1]}\`, `
+          + 'not `otmFloor`. The shape this predicate grades has changed — re-anchor it.',
+        );
+      }
+      const b = source.lastIndexOf('const ', at);
+      return {
+        verdict: 'cap_wraps_sizing',
+        binding: b >= 0 ? (/^const (\w+)/.exec(source.slice(b, b + 80))?.[1] ?? binding) : binding,
+      };
+    }
+  }
+  if (capAt >= 0) return { verdict: 'cap_instead_of_sizing', binding };
+  return { verdict: 'sizing_uncapped', binding };
+}
+
+// ⚠️ TRA-5024 — SCOPE OF THIS REPAIR, so nobody reads it as broader coverage
+// than it is. Every assertion in this `describe` is a SOURCE GREP, and they all
+// share the staleness class that produced TRA-4422, TRA-5021 and TRA-5024: a
+// literal pinned to a name someone may legitimately rename, invisible to
+// `check:deploy-build` because `tsc -b --force` type-checks test files without
+// running them.
+//
+//   RE-ANCHORED by TRA-5024 (now BLIND-on-missing-anchor, with controls):
+//     • the live per-entry cap / canary-sizing nesting      → 4 `it`s + controls
+//     • the TRA-3401 one-shot grant clamp                   → newly guarded;
+//       it had NO assertion at all before this ticket
+//
+//   RE-VERIFIED ONLY (ran green at `f4f84d3c`, 24/24; literals left as-is,
+//   NOT hardened — they remain rename-fragile):
+//     • 'the module reads none of the arm, …'   — negative greps; a rename makes
+//       these pass VACUOUSLY rather than fail. Weakest of the four.
+//     • 'CHAIN cut sits ABOVE the selector…'    — ordering; does guard each
+//       anchor with `toBeGreaterThan(-1)`, so it fails RED, never silently.
+//     • 'the refusal is stamped with the LOW-CARDINALITY code…' — the `pick`
+//       index is NOT guarded before being used as a slice bound; a moved anchor
+//       slices from -1 and the `toContain`s fail for the wrong reason.
+//     • 'no exit path imports the module'       — importer roster; already
+//       repaired once (TRA-4422) and will rot again on the next new importer.
+//
+// No capital behaviour is in scope here: the bound itself is correct and was
+// verified unchanged. This is a guard repair only.
 describe('TRA-3944 AC4 — source-level: arm / row size / 2-row cap untouched; ordering; no exit surface', () => {
   it('the module reads none of the arm, the row size or the 2-row cap', () => {
     for (const sym of [
@@ -316,24 +457,87 @@ describe('TRA-3944 AC4 — source-level: arm / row size / 2-row cap untouched; o
     expect(selectorConsult).toBeGreaterThan(chainReject);
   });
 
-  it('both open sites carry the per-entry cap; the live count is capped AFTER the canary sizing, not instead of it', () => {
+  // ── TRA-5024 — split from ONE `it` into four. ──────────────────────────────
+  // These four assertions were a single `it` whose FIRST line was a stale
+  // binding-name grep. When it returned -1 the `it` aborted, and the three
+  // assertions below it — including the account-side cap, the second open
+  // site's only guard — never ran at all. A short-circuit code is evidence
+  // only about the assertions that ran BEFORE it. Splitting them means one
+  // blind anchor can no longer hide the others; each site is now independently
+  // reported in the same run.
+
+  it('ENGINE: the per-entry cap WRAPS the canary sizing (applied AFTER it, not instead of it)', () => {
+    // Throws `BLIND:` rather than going red if the anchors are gone — see
+    // `liveOtmCapNesting`. A red here means the CAPITAL BOUND moved.
+    expect(liveOtmCapNesting(ENGINE_SRC).verdict).toBe('cap_wraps_sizing');
+  });
+
+  it('ENGINE: the TRA-3401 one-shot grant clamp is a TIGHTENING on top of the capped count', () => {
+    // A grant-capped count must not be able to pass as an un-capped one: the
+    // `Math.min(1, …)` clamp has to take the ALREADY-CAPPED binding as its
+    // operand, and the non-grant arm has to be that same binding. If the clamp
+    // were layered on the RAW sizing instead, the grant path would be tight
+    // (1 contract) while the ordinary path silently lost the floor bound.
+    const { verdict, binding } = liveOtmCapNesting(ENGINE_SRC);
+    expect(verdict).toBe('cap_wraps_sizing');
+    expect(binding, 'BLIND: could not read the binding that receives the capped count').toBeTruthy();
+    const clampAt = ENGINE_SRC.indexOf('oneShotGrantPending');
+    if (clampAt < 0) {
+      throw new Error('BLIND: `oneShotGrantPending` (TRA-3401) is absent from signal-engine.ts — the one-shot clamp cannot be graded here.');
+    }
+    // Statement-scoped and whitespace-normalised: the ternary is wrapped across
+    // three physical lines, so a single-line slice reads a bare fragment.
+    const stmtStart = ENGINE_SRC.lastIndexOf('const ', ENGINE_SRC.indexOf('? Math.min(1,'));
+    const stmt = ENGINE_SRC.slice(stmtStart, ENGINE_SRC.indexOf(';', stmtStart) + 1).replace(/\s+/g, ' ');
+    expect(stmt).toBe(
+      `const testContracts = oneShotGrantPending ? Math.min(1, ${binding}) : ${binding};`,
+    );
+  });
+
+  it('ACCOUNT: the cap is applied as min(), after sizing and after the bounded override', () => {
+    // Independent of the engine-side greps above — this is the assertion the
+    // old short-circuit suppressed, and it is the only guard on the second
+    // open site (`OptionsAccount.otmSizedContracts`, extracted by TRA-4990).
+    expect(ACCOUNT_SRC).toContain('capOtmEntryContracts(throttled, { maxContractsPerEntry: maxContracts })');
+  });
+
+  it('both open sites carry the per-entry cap', () => {
     expect(ENGINE_SRC).toContain('otmFloor.maxContractsPerEntry,');
-    // ⚠️ REPAIRED 2026-10-01 (TRA-5021). This read
-    // `indexOf('const testContracts = capOtmEntryContracts(')` — a literal that
-    // pinned the BINDING NAME, which is not the invariant. `c8488569`
-    // (TRA-3401, 09-24) renamed it `testContracts` → `sizedTestContracts` to
-    // layer a strictly-tightening `Math.min(1, …)` one-shot clamp on top, and
-    // this went RED for a week over a rename while the cap it guards survived
-    // byte-identical. (Invisible for the usual reason — see the AC4 note below.)
+  });
+
+  it('NEGATIVE CONTROL — the predicate reports the cap applied INSTEAD of the sizing, and an UNCAPPED sizing', () => {
+    // Plant each wrong shape on a synthetic source and assert the repaired
+    // predicate names exactly that defect. A repaired census that cannot go
+    // red is the same silent green it replaced.
     //
-    // Now asserts the NESTING, which is the actual rule: the per-entry cap must
-    // WRAP the canary sizing — `cap(size(...), otmFloor)` — so the cap is
-    // applied AFTER sizing rather than instead of it. Rename-proof; still red if
-    // anyone unwraps it, reorders the arguments, or drops the `otmFloor` bound.
-    const capWrapsSizing = /capOtmEntryContracts\(\s*resolveLiveOptionTestContracts\(askLimit, notionalCap, maxContracts\),\s*otmFloor,\s*\)/;
-    expect(ENGINE_SRC, 'the per-entry cap no longer wraps the canary sizing').toMatch(capWrapsSizing);
-    // The account applies the cap as min(), after sizing and after the bounded override.
-    expect(ACCOUNT_SRC).toContain("capOtmEntryContracts(throttled, { maxContractsPerEntry: maxContracts })");
+    // (1) the capital defect: the cap is called, but on the raw ops ceiling —
+    //     the canary ask-notional fit is thrown away, so the book can be handed
+    //     more contracts than the notional cap allows.
+    const capInsteadOfSizing = `
+          const sizedTestContracts = capOtmEntryContracts(maxContracts, otmFloor);
+    `.replace(/\r\n/g, '\n');
+    expect(liveOtmCapNesting(capInsteadOfSizing).verdict).toBe('cap_instead_of_sizing');
+
+    // (2) the other direction: sized, never capped — the per-entry floor bound
+    //     is simply absent.
+    const sizingUncapped = `
+          const sizedTestContracts = ${LIVE_SIZING_CALL};
+    `.replace(/\r\n/g, '\n');
+    expect(liveOtmCapNesting(sizingUncapped).verdict).toBe('sizing_uncapped');
+
+    // (3) BLIND, not red: both anchors gone ⇒ throws, and says so by name.
+    expect(() => liveOtmCapNesting('const x = 1;\n')).toThrow(/^BLIND: neither the canary sizing call/);
+
+    // (4) BLIND: the cap wraps the sizing but the bound argument is not the floor.
+    expect(() => liveOtmCapNesting(
+      `const sizedTestContracts = capOtmEntryContracts(${LIVE_SIZING_CALL}, someOtherCeiling);`,
+    )).toThrow(/^BLIND: the cap wraps the sizing but its bound argument/);
+
+    // (5) POSITIVE control — the real shape, reconstructed, grades clean. Proves
+    //     (1)–(4) are not passing merely because the helper rejects everything.
+    expect(liveOtmCapNesting(
+      `const sizedTestContracts = capOtmEntryContracts(\n  ${LIVE_SIZING_CALL},\n  otmFloor,\n);`,
+    )).toEqual({ verdict: 'cap_wraps_sizing', binding: 'sizedTestContracts' });
   });
 
   it('no exit path imports the module', () => {
