@@ -305,6 +305,102 @@ to be falsified. It does not change what gets built: still **one shared periodic
 `live-enforce-gate`, `churn-brake-guard`, `reversal-shadow-signals` and `otm-admission-tape`, whose
 first job is to measure which keying above is true. Successor: **TRA-5038**.
 
+#### TRA-5038 — the shared hook, built 2026-10-02 (code landed; live readings pending deploy)
+
+`packages/server/src/shared-tape-compaction.ts` is **one** registry and **one** `setInterval`, armed
+once in `index.ts`, covering all four tapes. Each owner contributes only its path and its
+**predicate**, and the predicates genuinely differ — which is why the hook takes one per tape rather
+than assuming a cutoff:
+
+| tape | predicate | bound | cadence premium |
+|---|---|---|---|
+| `live-enforce-gate.jsonl` | `age` | 30 d | 6 h / 30 d = **+0.83%** |
+| `churn-brake-guard.jsonl` | `age` | 30 d | **+0.83%** |
+| `reversal-shadow-signals.jsonl` | `age` | 30 d | **+0.83%** |
+| `otm-admission-tape.jsonl` | `bytes_whole_day` | 144 MiB | n/a — a byte cap has no retention to overshoot |
+
+All four are well inside AC2's ceiling (`cost-aware-gate`'s +3.6%), and one cadence nobody has to
+re-check beats four tuned ones.
+
+**`otm-admission-tape` needed a third predicate kind, not the obvious `bytes` one.** Its prune must
+land on an **ET-day boundary**: its consumers divide by *sessions*, so a partial day biases its own
+within-day sample toward the afternoon, and a biased day is worse than an absent one — the reason
+`hydrateOtmAdmissionTapeFromDisk` has always pruned whole days. A plain byte-prefix cut would have
+silently changed that. The periodic pass deliberately does **not** reuse the hydrate's prune, which
+`JSON.parse`s every line and rebuilds the fold: affordable once at boot, and exactly what AC4 forbids
+four times a day at ~189k rows.
+
+**Two properties carried over from TRA-4904, per tape:**
+
+- **Does not parse what it keeps** — applies to all four. The walk reads `ts` (and `etDay` for
+  `otm-admission-tape`) off the first 96 bytes of each line with a regex, and only over the prefix it
+  is about to **delete**; the retained bytes are echoed verbatim and never deserialized, so no field
+  can be erased by the rewrite (TRA-1703) and the pass stays clear of the TRA-2111 tripwire.
+- **Buffered-and-flushed live appends** — applies to all four, and the flush happens **even on a
+  failed rewrite** (an erased row reads identically to a row never written, TRA-1681). Each owner's
+  append path checks the interlock *synchronously* and routes its flush back through its own raw
+  append, so `durability.appendErrors` stays the authority on what reached disk.
+  `reversal-shadow-ledger.ts` is the one whose append is `async`; the check is still sync and runs
+  before any `await`, so it cannot observe a stale `false` and then land inside the window.
+
+**One deliberate departure from the prototype: the rewrite is streamed, not a whole-file string.**
+`compactCostAwareGateLedgerNow` does `readFile(path, 'utf8')` and holds the tape as one string, which
+was affordable for one 80 MiB file. These four are 263 MiB on disk, and a JS string is UTF-16 — a
+94 MiB ASCII tape is ~188 MiB of heap. Four of those per pass, four times a day, on the box TRA-4158
+just cut 330 MB of RSS out of, would be a **memory** incident shipped to fix a **disk** problem. The
+scan is chunked and the rewrite is `createReadStream(start) → tmp → rename`, so memory is O(chunk).
+
+⚠️ **Consequence, deliberate:** the shared payload publishes no `linesBefore` / `linesAfter`. Neither
+can be computed without reading every retained byte, which is the cost just removed. `linesDropped`
+and `bytesDropped` are exact (the dropped prefix is walked) and `bytesBefore/After` come off `stat`.
+**Do not "complete" the payload by adding a full-file line count back.**
+
+**AC3 surface.** Each of the four publishes `sharedCompaction` on its health route
+(`/api/health/live-enforce-gates`, `/api/health/churn-brake`, `/api/health/reversal-shadow-signals`,
+`/api/health/otm-admission-tape`) carrying the same four-state arm-derived enum as
+`/api/health/cost-aware-gate`. The key is `sharedCompaction`, not `compaction`, on all four
+deliberately: `reversal-shadow-signals` already publishes `compaction` for its **boot** outcome, and
+one consistent name across the four beats a collision on one of them.
+
+**AC1 is answered by `sharedCompaction.span`, and it is measured at boot, not only on a fire.** A
+span published only inside a timer outcome would be unreadable on bqb1, whose uptime is routinely
+under one interval — so `index.ts` runs a measure-only pass (no rewrite) right after arming, once
+each owner's own boot compaction has already run. `span.fill` reads `at_steady_state` when the pass
+dropped rows or the oldest row sits within one day of the cutoff (one day, because these tapes only
+write on sessions, so a weekend leaves a legitimate hole at the head), `still_filling` when the
+content begins well inside the cutoff, and `unknown` when it cannot be read — never guessed. When it
+reads `still_filling`, `size / retentionDays` **understates** the rate and `span.observedBytesPerDay`
+(`size / spanDays`) is the honest figure.
+
+**The census row cannot claim a timer that is not wired.** Each of the four manifest rows carries
+`bootOnly: false` + `compactEveryDays: 0.25`, and the needle check now asserts three further seams:
+the owner's own `predicate:` literal, `SHARED_TAPE_COMPACTION_INTERVAL_MS = 6 * …` in the shared
+module, and that `index.ts` still references that tape's spec factory, `registerSharedTape(` and
+`noteSharedTapeCompactionArmed()`. A reverted registration leaves every other field on the health
+route reading healthy, so it exits **BLIND (3)** at desk time instead of at `minFreePct`. Both
+directions were run as controls: a row claiming a 12 h cadence and a spec factory `index.ts` never
+references each exit 3 naming the row.
+
+⛔ **Still open at the time of writing — these are measurements, not code:**
+
+1. **AC1's live answer.** The keying (steady state vs still filling) for `live-enforce-gate` and
+   `churn-brake-guard` is settled by reading `sharedCompaction.span` off the deployed build. Until
+   then the ranking in this document is provisional, exactly as the ticket says. What is already
+   visible from the *existing* routes is suggestive but not conclusive: `live-enforce-gate`'s
+   `retained.etDays` starts **2026-09-02** against a 09-02T12:51Z cutoff (consistent with steady
+   state) while `churn-brake-guard`'s starts **2026-09-04**, two days inside its cutoff (consistent
+   with still filling) — but an ET-day bucket cannot settle it, because a 09-02 row written before
+   08:51 ET would have been dropped by that same cutoff. That is precisely why AC1 asks for the
+   oldest retained `ts` and not a day list.
+2. **AC3b — the prototype's timer has still never been observed firing.** Read at
+   2026-10-02T14:50Z: build `104bc8ed322c`, uptime **7133 s (1.98 h)**, `hookState`
+   `armed_not_yet_due`, `nextFireDueAt` **18:52:07Z**. Under 6 h, so the read AC3b asks for is not
+   yet available on this host. It must be taken **before** the next deploy, because a deploy resets
+   uptime and the window closes for another 6 h.
+3. **AC5's live re-run** of the census (`/data` growth rate and days-to-`minFreePct`) is only
+   meaningful against the deployed build; the offline run is CLEAN and the four rows now read
+   `30 d +6h timer` / `144 MiB +6h timer`.
+
 ---
 
 ## AC5 — the inode budget: the file-count leg does **not** become binding

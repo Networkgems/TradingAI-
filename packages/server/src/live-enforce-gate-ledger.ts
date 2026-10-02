@@ -41,6 +41,13 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { isEphemeralDataDir } from './data-dir.js';
 import {
+  bufferSharedTapeAppend,
+  sharedTapeCompactionState,
+  sharedTapeRewriteInFlight,
+  type SharedTapeCompactionState,
+  type SharedTapeSpec,
+} from './shared-tape-compaction.js';
+import {
   DEFAULT_NET_EDGE_BAR_CONFIG,
   NET_EDGE_SHADOW_K_SWEEP,
   netEdgeShadowAdmits,
@@ -84,11 +91,17 @@ const log = logger.child({ module: 'live-enforce-gate-ledger' });
 export const LIVE_ENFORCE_GATE_LOG_FILENAME = 'live-enforce-gate.jsonl';
 
 /**
- * Retain this many ms of decisions on disk (compacted on boot). A month covers
+ * Retain this many ms of decisions on disk (compacted on boot AND, since TRA-5038,
+ * on the shared 6h timer — see {@link liveEnforceGateSharedTapeSpec}). A month covers
  * reading enforcement back well after a bounded live window closes while bounding
  * a file that takes one line per armed live evaluation.
  */
 const RETAIN_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Registry key for the shared compaction hook (TRA-5038). */
+export const LIVE_ENFORCE_GATE_TAPE = 'live-enforce-gate';
+
+export const LIVE_ENFORCE_GATE_RETENTION_DAYS = RETAIN_MS / (24 * 60 * 60 * 1000);
 
 /**
  * Which live gate produced the record. `cost_bar` is the TRA-1602 modeled-gross-R
@@ -1146,6 +1159,26 @@ function applyAndAppend(rec: LiveEnforceRecord): void {
   // clean durable write (TRA-1681).
   apply(rec);
   if (dataDir == null) return;
+  // TRA-5038 — the shared periodic compaction rewrites this file mid-session. A row
+  // written between that rewrite's read and its rename would be erased by the rename,
+  // and an erased row reads identically to a row never written (TRA-1681). Buffer
+  // instead; the hook flushes through `appendLiveEnforceGateRawLine` below, so the
+  // `appendErrors` accounting above stays the authority on what reached disk.
+  const line = JSON.stringify(rec) + '\n';
+  if (sharedTapeRewriteInFlight(LIVE_ENFORCE_GATE_TAPE)) {
+    if (bufferSharedTapeAppend(LIVE_ENFORCE_GATE_TAPE, line)) return;
+  }
+  appendLiveEnforceGateRawLine(line);
+}
+
+/**
+ * Append one already-serialized line. Split out so the shared compaction hook's
+ * buffer flush goes through THIS path rather than its own `appendFileSync` — the
+ * error accounting below is what `durability` reports, and a flush that bypassed it
+ * would make a failed flush invisible.
+ */
+function appendLiveEnforceGateRawLine(line: string): void {
+  if (dataDir == null) return;
   const path = liveEnforceGateLogPath(dataDir);
   try {
     mkdirSync(dirname(path), { recursive: true });
@@ -1153,12 +1186,32 @@ function applyAndAppend(rec: LiveEnforceRecord): void {
     // exists / unwritable — the append below surfaces the error
   }
   try {
-    appendFileSync(path, JSON.stringify(rec) + '\n', 'utf8');
+    appendFileSync(path, line, 'utf8');
   } catch (err) {
     appendErrors += 1;
     lastAppendError = err instanceof Error ? err.message : String(err);
     log.warn('live-enforce-gate append failed', { reason: lastAppendError });
   }
+}
+
+/**
+ * TRA-5038 — what this tape contributes to the ONE shared compaction hook. Registered
+ * by `index.ts` at boot, which is also where the single interval is armed: four
+ * bespoke timers would be four chances to ship a `RETAIN_MS` whose hook was never
+ * armed and whose payload reads healthy anyway.
+ */
+export function liveEnforceGateSharedTapeSpec(): SharedTapeSpec {
+  return {
+    tape: LIVE_ENFORCE_GATE_TAPE,
+    resolvePath: () => (dataDir == null ? null : liveEnforceGateLogPath(dataDir)),
+    predicate: () => ({ kind: 'age', retainMs: RETAIN_MS }),
+    flushLine: appendLiveEnforceGateRawLine,
+    note:
+      'One line per ARMED LIVE gate evaluation — the highest-rate 30-day tape in /data '
+      + '(94.7 MiB on 2026-10-02, +32.6 in 7 d). Boot-only compaction left up to one boot '
+      + 'gap of aged rows on top of it; TRA-4904 AC4 named ~150 MiB of headroom as the '
+      + 'trigger to put it on a timer, and headroom reached 141.7 MiB.',
+  };
 }
 
 /**
@@ -2340,6 +2393,16 @@ export interface LiveEnforceSummary {
     sessionCoverage: LiveEnforceSessionCoverage;
   };
   durability: LiveEnforceDurability;
+  /**
+   * TRA-5038 AC3 — the shared compaction hook as this tape sees it.
+   *
+   * ⚠ READ `compaction.hookState`, NOT `compaction.timerPasses`. `timer_not_armed` is
+   * the alarm, and it is the state in which every other field in this payload still
+   * reads healthy. `compaction.span.fill` is the AC1 answer: when it reads
+   * `still_filling`, this tape's size divided by `retained.retentionDays` UNDERSTATES
+   * its write rate and the worst case derived from it is too low.
+   */
+  sharedCompaction: SharedTapeCompactionState;
   lastDecisionAt: number | null;
 }
 
@@ -3309,6 +3372,10 @@ export function summarizeLiveEnforceGate(
       appendErrors,
       lastAppendError,
     },
+    // TRA-5038 AC3 — the compaction OUTCOME and an ARM-DERIVED `hookState`, not a fire
+    // count: bqb1's uptime is routinely under one interval, so 0 fires is the ordinary
+    // healthy reading. `span.fill` is the AC1 answer for this tape.
+    sharedCompaction: sharedTapeCompactionState(LIVE_ENFORCE_GATE_TAPE),
     lastDecisionAt,
   };
 }

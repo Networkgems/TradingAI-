@@ -258,7 +258,7 @@ import {
 } from './options-ideas-credit-width-ledger.js';
 import { hydrateScaleoutLadderFromDisk } from './scaleout-ladder-ledger.js';
 import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
-import { hydrateChurnBrakeGuardFromDisk } from './churn-brake-ledger.js';
+import { hydrateChurnBrakeGuardFromDisk, churnBrakeGuardSharedTapeSpec } from './churn-brake-ledger.js';
 import { hydrateEquityEntryFunnelFromDisk } from './equity-entry-funnel-ledger.js';
 import { hydrateRvScanCensusFromDisk } from './rv-scan-census-ledger.js'; // TRA-4350
 import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
@@ -273,7 +273,7 @@ import {
 } from './cost-aware-gate-ledger.js';
 // TRA-4628 — the OTM candidate-admission tape (admitted AND refused scanner
 // candidates), hydrated at boot so a post-close read spans the whole session.
-import { hydrateOtmAdmissionTapeFromDisk } from './otm-admission-tape.js';
+import { hydrateOtmAdmissionTapeFromDisk, otmAdmissionTapeSharedTapeSpec } from './otm-admission-tape.js';
 // TRA-3434 — boot warm for the TRA-3391 tape-expectancy fold the live cost bar
 // admits on. Without it the first candidates after every process start decline
 // blind under a reason code that reads exactly like a measured verdict.
@@ -295,7 +295,17 @@ import {
 } from './boot-arm-repair-ledger.js';
 import { hydrateOptionsBreakerLedgerFromDisk, summarizeOptionsBreakerLedger } from './options-breaker-ledger.js'; // TRA-3218
 import { hydrateMarkSanityFromDisk } from './option-mark-sanity.js'; // TRA-2945
-import { hydrateLiveEnforceGateFromDisk } from './live-enforce-gate-ledger.js';
+import { hydrateLiveEnforceGateFromDisk, liveEnforceGateSharedTapeSpec } from './live-enforce-gate-ledger.js';
+// TRA-5038 — ONE shared periodic compaction hook for the four exposed tapes above.
+import {
+  SHARED_TAPE_COMPACTION_INTERVAL_MS,
+  measureSharedTapeSpan,
+  noteSharedTapeCompactionArmed,
+  registerSharedTape,
+  registeredSharedTapes,
+  runSharedTapeCompactionPass,
+  sharedTapeCompactionState,
+} from './shared-tape-compaction.js';
 import { registerHardControlRoutes } from './hard-controls-routes.js'; // TRA-4655
 import { bindHardControlsToEngines } from './hard-controls-bridge.js'; // TRA-4650
 import { registerPaperTradingRoutes } from './paper-trading-routes.js'; // TRA-4657
@@ -717,7 +727,9 @@ import {
   isReversalShadowEnabled,
   reversalHitRateByScore,
   reversalShadowCompaction,
+  reversalShadowSharedTapeSpec,
   REVERSAL_SHADOW_RETENTION_DAYS,
+  REVERSAL_SHADOW_TAPE,
 } from './reversal-shadow-ledger.js';
 import {
   initPreTradeGateLedger,
@@ -11456,6 +11468,12 @@ app.get('/api/health/reversal-shadow-signals', async (req, res) => {
       // one that works.
       retentionDays: REVERSAL_SHADOW_RETENTION_DAYS,
       compaction: reversalShadowCompaction(),
+      // TRA-5038 AC3 — `compaction` above is the BOOT hook's outcome; this is the
+      // shared PERIODIC hook, with the same four-state arm-derived enum every other
+      // registered tape publishes. Read `sharedCompaction.hookState`, not a fire
+      // count: `timer_not_armed` is the alarm and every other field here still reads
+      // healthy in that state. `sharedCompaction.span.fill` is the AC1 answer.
+      sharedCompaction: sharedTapeCompactionState(REVERSAL_SHADOW_TAPE),
       count: signals.length,
       hitRateByScore: reversalHitRateByScore(signals),
       signals,
@@ -19808,6 +19826,51 @@ costAwareGateCompactionTimer.unref?.();
 // health route cannot tell "not due yet" from "never wired", and "never wired" is the
 // defect TRA-4904 is fixing.
 noteCostAwareGateCompactionTimerArmed();
+
+// ── TRA-5038 — ONE shared periodic compaction for the other four exposed tapes ──
+//
+// TRA-4904 (above) shipped a per-ledger timer because `cost-aware-gate.jsonl` was the
+// only exposed tape, and it ruled the four below did NOT need one — naming ~150 MiB of
+// headroom as a trigger that would flip the answer. Headroom reached 141.7 MiB in seven
+// days, so they need it now.
+//
+// It is ONE registry and ONE interval on purpose. Four bespoke copies of the timer +
+// `hookState` enum would be four chances to ship a retention whose hook was never
+// armed and whose payload reads healthy anyway — which is the exact failure the enum
+// exists to expose. Each tape contributes only its path and its PREDICATE, and the
+// predicates genuinely differ: three retain by age, `otm-admission-tape` by a 144 MiB
+// byte ceiling pruned on whole ET-day boundaries.
+for (const spec of [
+  liveEnforceGateSharedTapeSpec(),
+  churnBrakeGuardSharedTapeSpec(),
+  reversalShadowSharedTapeSpec(),
+  otmAdmissionTapeSharedTapeSpec(),
+]) {
+  registerSharedTape(spec);
+}
+const sharedTapeCompactionTimer = setInterval(() => {
+  void runSharedTapeCompactionPass().catch((err) => {
+    log.warn('TRA-5038 shared tape compaction pass failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  });
+}, SHARED_TAPE_COMPACTION_INTERVAL_MS);
+sharedTapeCompactionTimer.unref?.();
+noteSharedTapeCompactionArmed();
+// Measure the span WITHOUT rewriting, so TRA-5038 AC1 ("is each tape at its 30-day
+// steady state or still filling?") is answerable from the health routes immediately.
+// It has to happen here rather than inside the first fire: bqb1's uptime is routinely
+// under one 6h interval, so a span published only inside a fire outcome would be
+// unreadable on the one host that matters. Each owner's own boot compaction has
+// already run by this point, so what gets measured is the post-compaction file —
+// which is the file the AC asks about.
+void Promise.all(registeredSharedTapes().map((tape) => measureSharedTapeSpan(tape))).catch(
+  (err) => {
+    log.warn('TRA-5038 shared tape boot span measure failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  },
+);
 
 // ── Static frontend (production web) ────────────────────────────────────────
 const DIST_DIR = join(__dirname, '..', '..', '..', 'apps', 'desktop', 'dist');

@@ -35,6 +35,13 @@
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { isEphemeralDataDir } from './data-dir.js';
+import {
+  bufferSharedTapeAppend,
+  sharedTapeCompactionState,
+  sharedTapeRewriteInFlight,
+  type SharedTapeCompactionState,
+  type SharedTapeSpec,
+} from './shared-tape-compaction.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'churn-brake-ledger' });
@@ -275,6 +282,9 @@ export const CHURN_BRAKE_GUARD_LOG_FILENAME = 'churn-brake-guard.jsonl';
 const GUARD_RETAIN_MS = 30 * 24 * 60 * 60 * 1000;
 const GUARD_RETENTION_DAYS = 30;
 
+/** Registry key for the shared compaction hook (TRA-5038). */
+export const CHURN_BRAKE_GUARD_TAPE = 'churn-brake-guard';
+
 /**
  * One demo NEW-open candidate as seen by the TRA-1408 per-name same-session cap.
  * Written on EVERY branch of `churnOpenCapVerdict` (never on the live path, which
@@ -432,6 +442,25 @@ function applyGuardEvent(ev: ChurnBrakeGuardEvent): void {
 export function recordChurnBrakeGuardEvent(ev: ChurnBrakeGuardEvent): void {
   applyGuardEvent(ev);
   if (guardDataDir == null) return;
+  // TRA-5038 — the shared periodic compaction rewrites this file mid-session. A row
+  // written between that rewrite's read and its rename would be erased by the rename,
+  // and an erased row reads identically to a row never written (TRA-1681). Buffer
+  // instead; the flush goes back through the raw append below, so `appendErrors`
+  // stays the authority on what reached disk.
+  const line = JSON.stringify(ev) + '\n';
+  if (sharedTapeRewriteInFlight(CHURN_BRAKE_GUARD_TAPE)) {
+    if (bufferSharedTapeAppend(CHURN_BRAKE_GUARD_TAPE, line)) return;
+  }
+  appendChurnBrakeGuardRawLine(line);
+}
+
+/**
+ * Append one already-serialized line. Split out so the shared compaction hook's buffer
+ * flush goes through THIS path and keeps counting into `durability.appendErrors` — a
+ * flush that bypassed it would make a failed flush invisible.
+ */
+function appendChurnBrakeGuardRawLine(line: string): void {
+  if (guardDataDir == null) return;
   const path = churnBrakeGuardLogPath(guardDataDir);
   try {
     mkdirSync(dirname(path), { recursive: true });
@@ -439,12 +468,31 @@ export function recordChurnBrakeGuardEvent(ev: ChurnBrakeGuardEvent): void {
     // exists / unwritable — the append below surfaces the error
   }
   try {
-    appendFileSync(path, JSON.stringify(ev) + '\n', 'utf8');
+    appendFileSync(path, line, 'utf8');
   } catch (err) {
     guardAppendErrors += 1;
     guardLastAppendError = err instanceof Error ? err.message : String(err);
     log.warn('churn-brake guard append failed', { reason: guardLastAppendError });
   }
+}
+
+/**
+ * TRA-5038 — what this tape contributes to the ONE shared compaction hook. Registered
+ * by `index.ts` at boot, which is also where the single interval is armed: four
+ * bespoke timers would be four chances to ship a retention whose hook was never armed
+ * and whose payload reads healthy anyway.
+ */
+export function churnBrakeGuardSharedTapeSpec(): SharedTapeSpec {
+  return {
+    tape: CHURN_BRAKE_GUARD_TAPE,
+    resolvePath: () => (guardDataDir == null ? null : churnBrakeGuardLogPath(guardDataDir)),
+    predicate: () => ({ kind: 'age', retainMs: GUARD_RETAIN_MS }),
+    flushLine: appendChurnBrakeGuardRawLine,
+    note:
+      'One line per demo open candidate that reaches a chokepoint — 67.7 MiB on '
+      + '2026-10-02, +29.6 in 7 d, the second-fastest 30-day tape in /data. TRA-4904 AC4 '
+      + 'ruled a timer unnecessary at 267.4 MiB of headroom; headroom reached 141.7 MiB.',
+  };
 }
 
 /** What {@link hydrateChurnBrakeGuardFromDisk} recovered (for the boot log line). */
@@ -621,6 +669,16 @@ export interface ChurnBrakeGuardSummary {
   lastEvaluatedAt: number | null;
   lastRejectedAt: number | null;
   durability: ChurnBrakeGuardDurability;
+  /**
+   * TRA-5038 AC3 — the shared compaction hook as this tape sees it.
+   *
+   * ⚠ READ `compaction.hookState`, NOT `compaction.timerPasses`. `timer_not_armed` is
+   * the alarm, and it is the state in which every other field in this payload still
+   * reads healthy. `compaction.span.fill` is the AC1 answer: when it reads
+   * `still_filling`, `retained.retentionDays` is NOT the right denominator for this
+   * tape's write rate and the worst case derived from it is too low.
+   */
+  sharedCompaction: SharedTapeCompactionState;
   note: string;
   /** TRA-4462 — the journal-reconciliation rule, on the wire. See {@link RECONCILIATION_NOTE}. */
   reconciliation: string;
@@ -706,6 +764,10 @@ export function summarizeChurnBrakeGuard(): ChurnBrakeGuardSummary {
       appendErrors: guardAppendErrors,
       lastAppendError: guardLastAppendError,
     },
+    // TRA-5038 AC3 — compaction outcome + an ARM-DERIVED `hookState`. Read `hookState`,
+    // not `timerPasses`: `timer_not_armed` is the alarm and every other field here
+    // still reads healthy in that state. `span.fill` is the AC1 answer for this tape.
+    sharedCompaction: sharedTapeCompactionState(CHURN_BRAKE_GUARD_TAPE),
     note:
       'TRA-4335 — durable per-ET-day open-cap guard counters (restart-safe, unlike the '
       + 'since-boot fields beside this block). state=dark means candidates arrived while '

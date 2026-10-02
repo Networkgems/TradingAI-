@@ -101,7 +101,10 @@ const mib = (b) => (b / MiB).toFixed(1);
 const MANIFEST = [
   // ── byte-capped ───────────────────────────────────────────────────────────
   { name: 'otm-admission-tape.jsonl', src: 'otm-admission-tape.ts', unit: 'bytes', value: 144 * MiB,
-    needle: 'const MAX_FILE_BYTES = 144 * 1024 * 1024;', bootOnly: true, note: 'TRA-4899 re-scope; was 192 MiB' },
+    needle: ['const MAX_FILE_BYTES = 144 * 1024 * 1024;',
+      "predicate: () => ({ kind: 'bytes_whole_day', maxBytes: MAX_FILE_BYTES }),"],
+    bootOnly: false, compactEveryDays: 0.25, sharedSpec: 'otmAdmissionTapeSharedTapeSpec',
+    note: 'TRA-4899 re-scope (was 192 MiB); TRA-5038 — 6h SHARED timer + boot. Cap pruned by WHOLE ET DAYS' },
   { name: 'users/**/reports/closes/', src: 'close-ledger.ts', unit: 'bytes', value: 48 * MiB,
     needle: 'export const CLOSE_LEDGER_MAX_BYTES = 48 * 1024 * 1024;', dir: true,
     note: 'aggregate across all 68 books; TRA-4156 Phase 1' },
@@ -124,11 +127,20 @@ const MANIFEST = [
     bootOnly: false, compactEveryDays: 0.25,
     note: 'TRA-4904 — 6h timer + boot; premium +3.6% (was +70.4% boot-only)' },
   { name: 'live-enforce-gate.jsonl', src: 'live-enforce-gate-ledger.ts', unit: 'days', value: 30,
-    needle: 'const RETAIN_MS = 30 * 24 * 60 * 60 * 1000;', bootOnly: true },
+    needle: ['const RETAIN_MS = 30 * 24 * 60 * 60 * 1000;',
+      "predicate: () => ({ kind: 'age', retainMs: RETAIN_MS }),"],
+    bootOnly: false, compactEveryDays: 0.25, sharedSpec: 'liveEnforceGateSharedTapeSpec',
+    note: 'TRA-5038 — 6h SHARED timer + boot; premium +0.83% (was bootGap/30d boot-only)' },
   { name: 'reversal-shadow-signals.jsonl', src: 'reversal-shadow-ledger.ts', unit: 'days', value: 30,
-    needle: 'const RETAIN_MS = 30 * 24 * 60 * 60 * 1000;', bootOnly: true, note: 'bounded by TRA-4883' },
+    needle: ['const RETAIN_MS = 30 * 24 * 60 * 60 * 1000;',
+      "predicate: () => ({ kind: 'age', retainMs: RETAIN_MS }),"],
+    bootOnly: false, compactEveryDays: 0.25, sharedSpec: 'reversalShadowSharedTapeSpec',
+    note: 'bounded by TRA-4883; TRA-5038 — 6h SHARED timer + boot' },
   { name: 'churn-brake-guard.jsonl', src: 'churn-brake-ledger.ts', unit: 'days', value: 30,
-    needle: 'const GUARD_RETAIN_MS = 30 * 24 * 60 * 60 * 1000;', bootOnly: true },
+    needle: ['const GUARD_RETAIN_MS = 30 * 24 * 60 * 60 * 1000;',
+      "predicate: () => ({ kind: 'age', retainMs: GUARD_RETAIN_MS }),"],
+    bootOnly: false, compactEveryDays: 0.25, sharedSpec: 'churnBrakeGuardSharedTapeSpec',
+    note: 'TRA-5038 — 6h SHARED timer + boot; premium +0.83%' },
   { name: 'rv-scan-census.jsonl', src: 'rv-scan-census-ledger.ts', unit: 'days', value: 30,
     needle: 'export const CENSUS_RETAIN_MS = 30 * 24 * 60 * 60 * 1000;', bootOnly: true },
   { name: 'entry-site-asset-class.jsonl', src: 'entry-site-census-ledger.ts', unit: 'days', value: 14,
@@ -277,6 +289,44 @@ function assertManifestMatchesSource() {
     // denominator and read exactly like a correct one.
     for (const needle of Array.isArray(row.needle) ? row.needle : [row.needle]) {
       if (!text.includes(needle)) broken.push(`${row.name}: ${row.src} no longer contains  ${needle}`);
+    }
+    // TRA-5038 — a row claiming `compactEveryDays` via the SHARED hook is only on a
+    // timer if three separate seams are intact, and the premium it reports is wrong if
+    // any of them is reverted. The owner's own predicate needle (above) proves it
+    // CONTRIBUTES a spec; it does not prove anything ARMS the hook. A registration that
+    // was reverted in `index.ts` leaves every other field on the health route reading
+    // healthy — the exact shape `hookState` exists to expose — so assert it here too,
+    // and exit BLIND at desk time rather than at `minFreePct`.
+    if (row.sharedSpec) {
+      const sharedPath = join(SRC, 'shared-tape-compaction.ts');
+      const idxPath = join(SRC, 'index.ts');
+      if (!existsSync(sharedPath)) {
+        broken.push(`${row.name}: shared-tape-compaction.ts does not exist — the hook is GONE`);
+      } else {
+        const hours = (row.compactEveryDays ?? 0) * 24;
+        const want = `export const SHARED_TAPE_COMPACTION_INTERVAL_MS = ${hours} * 60 * 60 * 1000;`;
+        if (!readFileSync(sharedPath, 'utf8').includes(want)) {
+          broken.push(
+            `${row.name}: compactEveryDays=${row.compactEveryDays} claims a ${hours}h cadence, `
+            + `but shared-tape-compaction.ts does not contain  ${want}`,
+          );
+        }
+      }
+      if (!existsSync(idxPath)) {
+        broken.push(`${row.name}: index.ts does not exist — cannot verify the hook is armed`);
+      } else {
+        const idx = readFileSync(idxPath, 'utf8');
+        for (const seam of [
+          `${row.sharedSpec}()`,
+          'registerSharedTape(',
+          'noteSharedTapeCompactionArmed()',
+          'SHARED_TAPE_COMPACTION_INTERVAL_MS)',
+        ]) {
+          if (!idx.includes(seam)) {
+            broken.push(`${row.name}: index.ts does not contain  ${seam}  — the timer is NOT armed for this tape`);
+          }
+        }
+      }
     }
     // TRA-4903 — a sealed row's cap lives in `data-tape-bounds.ts` but is only a
     // BOUND if the writer actually routes through it. A ceiling whose call site
