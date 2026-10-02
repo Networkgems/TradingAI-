@@ -527,3 +527,50 @@ That proposal step **must re-validate the F1 cost model against realized fills**
 (the gate's costs are modeled, not measured) and confirm the data-hygiene
 exclusion counts are immaterial to the track record. Until then the product ships
 as event-aware, risk-defined **idea generation + paper entry**, exactly as today.
+
+## At this book size the LIVE EQUITY path is a cheap-ticker sleeve, and that is the design (TRA-4877)
+
+A go-live input, recorded here because it was adjudicated once and must not be
+re-litigated from a comment thread. **No bound moves.** `HARD_MAX_ORDER_NOTIONAL_USD`
+($300), `OPTIONS_PER_TICKET_DOLLAR_FLOOR` ($150) and `OPTIONS_POSITION_CAP_RATIO`
+(0.15) are board numbers and are untouched.
+
+**The arithmetic.** Live equity sizing refuses any ticket whose **one-share cost
+reaches the per-position cap** `max($150, 15% × E)` (the TRA-499 strict-less-than
+admission). Measured against the live bqb1 balance on 2026-09-24T20:45–20:49Z
+(engineMode live, production creds, account tail ***0154): `totalCash $427.94` +
+`longMarketValue $0.00` ⇒ `E = $427.94` ⇒ `15% × E = $64.19` ⇒ the **$150 dollar
+floor binds**. **44 of 97 watchlist tickers (45.4%) were priced ≥ $150** and
+therefore size to `qty = 0` on the equity path at any risk setting — including all
+five symbols the TRA-4657 paper week produced equity signals on (MSTR, AMZN, COIN,
+AMD, NVDA). Separately, the account is a **cash** account, so every `sell`-side
+equity entry is refused regardless of price (`shortBlockedOnCashAccount`).
+
+**This is the concentration control working, not failing.** On a $428 book one
+share of a $150 stock is **35%** of total equity and one share of a $350 stock is
+**82%** — a single-name concentration no risk policy here would sign off on. The
+`max($150, …)` floor is what makes the cap *generous*: the 15% term alone would cut
+off at $64.19 and strand **far more** than 44 of 97.
+
+**Adjudicated direction (CEO, 2026-09-27 on TRA-4877).** The coverage consequence
+is a statement about **capital size**, not about the sizing code, and the remedy is
+**(c)**: reach expensive underlyings through **options rather than shares**, which
+is what the engine already does and why the live book is 100% option. (c) is not a
+workaround; it is the design. Explicitly **NOT** chosen: raising the cap (refused —
+refuse, never resize, on a real-money path); fractional shares (declined in the
+TRA-499 spec and unavailable on this broker path). Funding the book above ~$1,000
+would make `15% × E` clear the floor (and clearing a $250 share needs E ≥ $1,667),
+but that is a capital decision, not a code one.
+
+**So state it plainly in any go-live readout:** at sub-$1k equity the LIVE EQUITY
+path is a **long-only, cheap-ticker sleeve**. A dashboard equity signal on an
+expensive name is expected to be display-only, and that is not a defect.
+
+**The legibility fix that did ship** (TRA-4877): a `qty = 0` now names which bound
+produced it — `priced_out_at_book` vs a risk/quote/funds zero — on `liveSkipReason`,
+in the redacted `/api/health/live-equity` category breakdown
+(`sizing_priced_out_at_book` vs `sizing_zero_not_cap`, previously both `other`), and
+as a per-ET-day fold counted at the decision point rather than off the newest-50
+signal ring. ⚠️ That fold publishes a `wiring` cell: **`never_recorded` means the
+counts are defaults**, so a `priced_out_at_book: 0` under it is NOT evidence the
+book is clearing its cap. See `packages/server/src/live-equity-sizing-reason.ts`.

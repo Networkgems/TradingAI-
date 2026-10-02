@@ -11,6 +11,9 @@ import type { Express, Response, RequestHandler } from 'express';
 import { findMissingLiveCredentials, isStockMarketOpen, DEFAULT_ACCOUNT_SETTINGS, type AccountSettings } from '@trading-app/shared';
 import type { DecoupledExitSkipReason, EngineState, ExitCadenceHealth, ExitIntervalBucket, LiveEquityAcceptance, LiveSkipCategory } from '../signal-engine.js';
 import { DECOUPLED_EXIT_SKIP_REASONS, EXIT_INTERVAL_BUCKETS, LIVE_SKIP_CATEGORIES, emptyDecoupledExitSkips, emptyExitIntervalHistogram, emptyLiveSkipBreakdown, isLiveBrokerOperator, resolveLiveBrokerOperator, isRvEngineEnabled, sma200BarDay } from '../signal-engine.js';
+// TRA-4877 — the sizing-zero fold is counted at the decision, not off the ring.
+import { aggregateLiveEquitySizingZeroViews } from '../live-equity-sizing-reason.js';
+import type { LiveEquitySizingZeroFleetView, LiveEquitySizingZeroView } from '../live-equity-sizing-reason.js';
 import {
   isTestAccount,
   unrecognisedDeskBooks,
@@ -892,6 +895,18 @@ export interface LiveEquityAcceptanceReport {
    * only constant category keys + counts, never a raw reason string.
    */
   liveSkipReasonBreakdown: Record<LiveSkipCategory, number>;
+  /**
+   * TRA-4877 — fleet fold of WHICH zero the live-equity sizer returned, keyed by
+   * {@link LiveEquitySizingZeroReason}. Unlike `liveSkipReasonBreakdown` above
+   * this is NOT derived from the newest-50 signal ring — it is counted at the
+   * sizing decision — so it answers "how often did we price out today" for a
+   * reader who arrives after the close.
+   *
+   * ⚠️ Read `.wiring` BEFORE any count. `never_recorded` ⇒ no engine recorded a
+   * decision this boot ⇒ every count is a default, and `priced_out_at_book: 0`
+   * is NOT evidence the book is clearing its per-position cap.
+   */
+  liveEquitySizingZeros: LiveEquitySizingZeroFleetView;
   /** Most recent live-equity mirror open across the fleet (ISO), or null. */
   lastLiveEquityFillAt: string | null;
   /**
@@ -957,6 +972,10 @@ export function aggregateLiveEquityAcceptance(
       liveSkipReasons: sum(s => s.liveSkipReasonCount),
     },
     liveSkipReasonBreakdown,
+    // TRA-4877 — counted at the sizing decision, not folded off the signal ring.
+    liveEquitySizingZeros: aggregateLiveEquitySizingZeroViews(
+      snapshots.map(s => s.liveEquitySizingZeros).filter((v): v is LiveEquitySizingZeroView => !!v),
+    ),
     lastLiveEquityFillAt: lastFillMs > 0 ? new Date(lastFillMs).toISOString() : null,
     serviceEnv: {
       tradierEnvProduction: (env['TRADIER_ENV'] ?? '').trim() === 'production',

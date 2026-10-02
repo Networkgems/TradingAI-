@@ -120,6 +120,7 @@ import { // TRA-3394
 import { getRecentAlerts, __resetAlertsForTest } from './alerts.js';
 import type { EngineState, ExitCadenceHealth, ExitIntervalBucket, LiveEquityAcceptance } from '../signal-engine.js';
 import { categorizeLiveSkipReason, emptyLiveSkipBreakdown, emptyDecoupledExitSkips, emptyExitIntervalHistogram } from '../signal-engine.js';
+import { LiveEquitySizingLedger } from '../live-equity-sizing-reason.js';
 import type { AccountSettings } from '@trading-app/shared';
 
 const NOW = 2_000_000_000;
@@ -323,6 +324,9 @@ describe('TRA-580 live-equity acceptance probe', () => {
       liveEquityMirrorsWithOrderId: 0,
       liveSkipReasonCount: 0,
       liveSkipReasonCategories: emptyLiveSkipBreakdown(),
+      // TRA-4877 — a fixture engine that has taken no sizing decision reads
+      // `never_recorded`, which is the honest default: not a clean zero.
+      liveEquitySizingZeros: new LiveEquitySizingLedger(Date.parse('2026-09-24T20:00:00Z')).snapshot(),
       firstLiveEquityFillConfirmed: false,
       lastLiveEquityFillAt: null,
       ...over,
@@ -373,6 +377,7 @@ describe('TRA-580 live-equity acceptance probe', () => {
         'lastLiveEquityFillAt',
         'liveEngineCount',
         'liveEquityClientConfigured',
+        'liveEquitySizingZeros',
         'liveEquityTradingEnabled',
         'liveSkipReasonBreakdown',
         'ok',
@@ -384,6 +389,27 @@ describe('TRA-580 live-equity acceptance probe', () => {
     );
     // serviceEnv carries booleans only — never a credential value.
     expect(Object.values(report.serviceEnv).every(v => typeof v === 'boolean')).toBe(true);
+    // TRA-4877 — the sizing-zero fold is counts + constant labels only. The
+    // sizer's decision also knows the book size, the cap and the share price;
+    // none of those may reach this unauthenticated surface.
+    const sizing = report.liveEquitySizingZeros as unknown as Record<string, unknown>;
+    expect(Object.keys(sizing).sort()).toEqual(
+      [
+        'capLabelMismatch',
+        'decisionsSinceBoot',
+        'engineCount',
+        'enginesNeverRecorded',
+        'lastDecisionEtDay',
+        'sizedSinceBoot',
+        'wiring',
+        'zerosSinceBootByReason',
+      ].sort(),
+    );
+    for (const banned of ['cap', 'capSource', 'baseEquity', 'currentPrice', 'affordableShares', 'days']) {
+      expect(Object.keys(sizing)).not.toContain(banned);
+    }
+    // An engine that has sized nothing must not read as a clean zero.
+    expect(report.liveEquitySizingZeros.wiring).toBe('never_recorded');
   });
 
   it('TRA-1573 — maps raw skip reasons to a fixed, leak-free category vocabulary', () => {
