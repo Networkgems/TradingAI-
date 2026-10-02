@@ -2594,6 +2594,18 @@ async function generateAndSaveReport(
         date: finalReport.date,
         symbols: finalSnapshot.state?.symbols ?? [],
         usersRoot: join(DATA_DIR, 'users'),
+        // TRA-5036 — the roster the ledger eviction's registry reservation is
+        // denominated in. THE SAME expression `getRegistryBooks` hands the
+        // census route, so the published eviction queue and the sweep that
+        // acts on it are tiered off one roster rather than two.
+        //
+        // `usersRoot` stays enumerated from DIRECTORIES (TRA-3064): the roster
+        // is used ONLY to move a book LATER in the queue, never to decide what
+        // exists and never to decide what to delete. A book missing from it is
+        // evicted exactly as it is today; a book present in it is protected.
+        // So an incomplete roster costs protection, never data — which is why a
+        // registry this module elsewhere declines to trust is admissible here.
+        registryBooks: getAllUsers().map((u) => u.username),
         log,
       });
     } catch (err) {
