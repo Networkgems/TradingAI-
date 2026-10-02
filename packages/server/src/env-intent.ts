@@ -85,6 +85,7 @@ import {
   isOptionLiveRvLongEnabled,
 } from './option-exec-flag.js';
 import { isOptionMakerTelemetryEnabled } from './option-maker-fill-ledger.js';
+import { isExplorationAllowanceFlagOn } from './directional-exploration-allowance.js';
 
 export interface EnvLeverIntent {
   /** The env key the intent is about. */
@@ -95,6 +96,41 @@ export interface EnvLeverIntent {
   provenance: string;
   /** Resolve the effective value the SAME way the consumer does. */
   resolve: (env: NodeJS.ProcessEnv) => string;
+  /**
+   * TRA-5014 — this lever's AUTHORITATIVE HOME is the `demo-flags.json` overlay
+   * (`DATA_DIR/demo-flags.json`, allowlisted by `DEMO_FLAG_ALLOWLIST`), not the
+   * service env var list.
+   *
+   * ⚠️ Without this marker such a lever is UNGRADEABLE HERE, and ungradeable in
+   * the silent direction. `resolveDemoFlagEnv` layers the file OVER the base env
+   * and never writes into `process.env`, so a flag armed only through the
+   * overlay reads `raw: null, present: false` and resolves to its code default —
+   * i.e. a lever that is ON in force publishes as `off`. That is the TRA-4474
+   * failure this whole file exists to kill, reached by a second route: one term,
+   * nothing for a grader to disagree with.
+   *
+   * It is not hypothetical. `ENABLE_DIRECTIONAL_EXPLORATION_ALLOWANCE` is the
+   * paper directional sleeve's ONLY admission path, it has no `render.yaml`
+   * seed, and it was absent from this manifest — so when an unattributed write
+   * disarmed it on 2026-09-22/23 the sleeve went dark for SEVEN consecutive ET
+   * sessions while `pnpm check:env-intent` graded MATCH / exit 0 every day
+   * (TRA-5014).
+   *
+   * Marking a lever `overlayBacked` changes two things and only two:
+   *   • `resolve`/`raw`/`present` read the OVERLAY env the caller supplied,
+   *     because that is where the consumer reads (file wins over base env), and
+   *   • a caller that supplies NO overlay env grades this lever `matches: null`
+   *     and lists it in `blindLevers` — never a pass, and never a false
+   *     mismatch either. A blind lever is reported as blind.
+   *
+   * Env-backed levers are untouched by the overlay by construction: they keep
+   * resolving from the base env, so a demo override can never move one. That is
+   * belt-and-braces over the allowlist, which already shares ZERO keys with this
+   * manifest (asserted in `env-intent.test.ts`, which fails if a manifest lever
+   * is ever added to `DEMO_FLAG_ALLOWLIST` — that would hand a non-admin
+   * overlay write a real-money lever).
+   */
+  overlayBacked?: true;
   /**
    * TRA-4801 — optional publication filter for the RAW value.
    *
@@ -163,6 +199,39 @@ export const PRODUCTION_ENV_INTENT: readonly EnvLeverIntent[] = [
       're-arm (card 6b82a9e7, 2026-09-24). An `off` reading while ENABLE_OPTION_LIVE_OTM is `on` ' +
       'means live chases are going unrecorded — escalate; never edit this row alone to clear it.',
     resolve: (env) => (isOptionMakerTelemetryEnabled(env) ? 'on' : 'off'),
+  },
+  {
+    // TRA-5014 — ⚠️ DO NOT DELETE THIS ROW TO MAKE A CHECKER GO GREEN. It is the
+    // only second term that can disagree with a silent disarm of this flag; the
+    // seven dark sessions below happened precisely because the row was absent.
+    key: 'ENABLE_DIRECTIONAL_EXPLORATION_ALLOWANCE',
+    intended: 'on',
+    provenance:
+      'TRA-5014 / TRA-5033. The TRA-4378 bounded exploration carve-out is the paper directional ' +
+      "sleeve's ONLY admission path — the flat cost bar has never admitted a `directional` " +
+      'candidate (TRA-4053 premise; read 2026-10-02: admitted 0 / rejected 99,269 over 5 retained ' +
+      'days), so every desk entry it ever made came through this bypass. An UNATTRIBUTED write ' +
+      'disarmed it on 2026-09-22/23 and the desk book then produced ZERO entries for SEVEN ' +
+      'consecutive ET sessions (2026-09-23..2026-10-01), terminating the TRA-4744 pre-registered ' +
+      "chandelier read at NOT RUN. Nothing could notice: the flag has no `render.yaml` seed, it is " +
+      'armed through the DATA_DIR demo-flags overlay rather than the service env list, and it was ' +
+      'absent from this manifest — so `check:env-intent` graded MATCH / exit 0 on all seven dark ' +
+      'days. The actor is unrecoverable past Render\'s 7-day log retention, so the record is the ' +
+      'remedy (CTO ruling on TRA-5033, 2026-10-02T02:55Z: TRA-4750 binds CAPITAL-COMMITTING entry ' +
+      'paths and this instrument is demo-only with `liveCapitalReachable: false`, so the ' +
+      'stand-down never reached it; its board sign-off — TRA-4053 card `17e5f566`, 2026-09-08 — is ' +
+      'live and was never revoked, and no terminal `disarm` event exists across 41 durable rows). ' +
+      'RE-ARMED 2026-10-02T02:55Z via `POST /api/admin/demo-flags`, box RESUMED not reset ' +
+      '(armedEtDay 2026-09-09, rowsUsed 20/25, expiresEtDay 2026-11-03) and verified to survive a ' +
+      'deploy (`durability.ephemeral: false`, 41 hydrated events, re-read on pid 73 after the ' +
+      '2026-10-02T04:25:48Z boot onto new bytes). An `off` reading here is now a SILENT DISARM of ' +
+      'a board-signed-off carve-out and is the event to escalate; arming does not by itself ' +
+      'produce trades (the quality gate and spread ceiling still run on every granted candidate), ' +
+      'and because the home is the overlay the re-arm is HOT — no deploy, no env-var write.',
+    resolve: (env) => (isExplorationAllowanceFlagOn(env) ? 'on' : 'off'),
+    // The overlay IS this lever's home — see `overlayBacked` on EnvLeverIntent.
+    // Without it this row would publish `off` on a box where the flag is armed.
+    overlayBacked: true,
   },
   {
     key: 'ENABLE_OPTION_LIVE_RV_LONG',
@@ -236,9 +305,28 @@ export interface EnvIntentLeverReading {
   present: boolean;
   /** The value the consumer actually resolves. */
   effective: string;
-  /** `null` when the box is not (provably) production — nothing is graded. */
+  /**
+   * `null` when the box is not (provably) production — nothing is graded — OR
+   * when this is an `overlayBacked` lever and the caller supplied no overlay env
+   * (see `blindLevers`). Both are UNGRADED, never a pass.
+   */
   matches: boolean | null;
   provenance: string;
+  /**
+   * TRA-5014 — `true` when this lever's home is the `demo-flags.json` overlay
+   * rather than the service env var list. A consumer of this payload (notably
+   * `scripts/check-env-intent.mjs`, whose leg 2 grades the Render STORED env
+   * list) must not read an absent stored env var as a disarm for these: there is
+   * no stored env var to read, by design, and `key ABSENT` is the healthy state.
+   */
+  overlayBacked: boolean;
+  /**
+   * TRA-5014 — `null` for an env-backed lever (not applicable). For an
+   * `overlayBacked` lever: whether the caller supplied the overlay env at all.
+   * `false` ⇒ this lever was NOT graded, because the only layer that can hold
+   * its value was not read.
+   */
+  overlayVisible: boolean | null;
 }
 
 export interface EnvIntentSummary {
@@ -255,16 +343,48 @@ export interface EnvIntentSummary {
   levers: EnvIntentLeverReading[];
   /** Keys where the graded effective value disagrees with the manifest. */
   mismatches: string[];
-  /** TRUE only when graded and clean; FALSE on any mismatch; `null` when not graded. */
+  /**
+   * TRA-5014 — keys that could NOT be graded on a box that otherwise applies,
+   * because an `overlayBacked` lever's overlay env was not supplied. Separate
+   * from `mismatches` on purpose: a blind lever is not a disagreement, and
+   * reporting it as one would train an operator to ignore this instrument. It
+   * still blocks `ok`, per the fail-closed rule this file states up top.
+   */
+  blindLevers: string[];
+  /**
+   * TRUE only when graded and clean; FALSE on any mismatch OR any blind lever;
+   * `null` when not graded at all.
+   */
   ok: boolean | null;
 }
 
-/** Pure — no IO, safe from an open health route. */
-export function summarizeEnvIntent(env: NodeJS.ProcessEnv = process.env): EnvIntentSummary {
+/**
+ * Pure — no IO, safe from an open health route.
+ *
+ * `overlayEnv` (TRA-5014) is the `demo-flags.json`-layered env, which the CALLER
+ * resolves (`resolveDemoFlagEnvFromEnv()`) because resolving it reads the disk
+ * and this function must stay IO-free. Only `overlayBacked` levers consult it;
+ * every other lever resolves from `env`, so an overlay can never move one.
+ * Omitting it does not silently degrade a reading to `off` — the affected levers
+ * come back `matches: null` in `blindLevers`.
+ */
+export function summarizeEnvIntent(
+  env: NodeJS.ProcessEnv = process.env,
+  overlayEnv?: NodeJS.ProcessEnv,
+): EnvIntentSummary {
   const applies = (env['NODE_ENV'] ?? '').trim() === 'production';
   const levers = PRODUCTION_ENV_INTENT.map((lever): EnvIntentLeverReading => {
-    const raw = env[lever.key];
-    const effective = lever.resolve(env);
+    const overlayBacked = lever.overlayBacked === true;
+    // An overlay-backed lever is read from the layered env, because that is the
+    // layer its consumer reads (the file wins over the base env). Env-backed
+    // levers never see the overlay: inertness by construction, not by argument.
+    const overlayVisible = overlayBacked ? overlayEnv !== undefined : null;
+    const source = overlayBacked && overlayEnv !== undefined ? overlayEnv : env;
+    const raw = source[lever.key];
+    const effective = lever.resolve(source);
+    // Blind ⇒ UNGRADED. Resolving an overlay-backed lever against the base env
+    // would publish its code default as if it were a measurement.
+    const gradeable = applies && !(overlayBacked && overlayVisible === false);
     return {
       key: lever.key,
       intended: lever.intended,
@@ -274,17 +394,23 @@ export function summarizeEnvIntent(env: NodeJS.ProcessEnv = process.env): EnvInt
       raw: lever.redact ? lever.redact(raw) : (raw ?? null),
       present: raw !== undefined,
       effective,
-      matches: applies ? effective === lever.intended : null,
+      matches: gradeable ? effective === lever.intended : null,
       provenance: lever.provenance,
+      overlayBacked,
+      overlayVisible,
     };
   });
   const mismatches = levers.filter((l) => l.matches === false).map((l) => l.key);
+  const blindLevers = applies
+    ? levers.filter((l) => l.overlayVisible === false).map((l) => l.key)
+    : [];
   return {
     source: 'packages/server/src/env-intent.ts',
     applies,
     nodeEnv: env['NODE_ENV'] ?? null,
     levers,
     mismatches,
-    ok: applies ? mismatches.length === 0 : null,
+    blindLevers,
+    ok: applies ? mismatches.length === 0 && blindLevers.length === 0 : null,
   };
 }

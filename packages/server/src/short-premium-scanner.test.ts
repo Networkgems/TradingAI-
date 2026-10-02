@@ -302,6 +302,73 @@ describe('IV-rank coverage stamp + rollup (TRA-4917)', () => {
     expect(cov.ivRankMeasured).toBe(0);
     expect(cov.ivRankUnknown).toBe(0);
     expect(cov.wireRowCount).toBe(0);
-    expect(cov.partitionOk).toBe(true);
+    // This assertion used to read `toBe(true)` — the test NAMED the hazard in its
+    // own title and then asserted the pass value anyway. `partitionOk` must be an
+    // honest null here: nothing was compared, so there is no verdict to publish.
+    expect(cov.partitionOk).toBeNull();
+    expect(cov.populated).toBe(false);
+    expect(cov.partitionState).toBe('no_population');
+    expect(cov.partitionMismatch).toContain('NOTHING WAS CHECKED');
+    expect(cov.lastRecordedAt).toBeNull();
+  });
+
+  it('an empty fold is DISTINGUISHABLE from a fully-covered one — the three asserts pass vacuously', () => {
+    // The defect this closes, measured on bqb1 2026-10-02T06:31Z (live
+    // `28e61b7be5f5`, booted 05:59:57Z, pre-open): scanCount 0 and EVERY counter
+    // 0, including `gateInert: 0` — which on a populated fold is the healthiest
+    // value there is ("the floor evaluated on every row"). The old `partitionOk`
+    // derived from `mismatches.length === 0`, and all three of its asserts are
+    // `0 === 0` on an empty fold, so the pass value was published having compared
+    // nothing. Separation has to come from the POPULATION, not the complaint list.
+    const empty = summarizeShortPremiumScans(NOW).ivRankCoverage;
+
+    const covered = scanShortPremiumFromSnapshot(
+      snap(ladder()),
+      CALM_CLOSES,
+      reading({ ivRank: 70, ivSampleDepth: 240, coverage: 'covered' }),
+      { now: NOW },
+    );
+    recordShortPremiumScan({ ...covered, symbol: 'GGG' }, NOW);
+    const full = summarizeShortPremiumScans(NOW).ivRankCoverage;
+
+    // Every counter that a reader would use to judge health is IDENTICAL across
+    // the two folds. This is the whole bug: these fields cannot separate them.
+    expect(full.gateInert).toBe(empty.gateInert); // 0 both sides
+    expect(full.ivRankUnknown).toBe(empty.ivRankUnknown); // 0 both sides
+    expect(full.unknownByCode).toEqual(empty.unknownByCode); // all-zero both sides
+
+    // ...so the separator must be a field that is NOT a count of problems found.
+    expect(empty.populated).toBe(false);
+    expect(full.populated).toBe(true);
+    expect(empty.partitionState).toBe('no_population');
+    expect(full.partitionState).toBe('verified');
+    expect(empty.partitionOk).toBeNull();
+    expect(full.partitionOk).toBe(true);
+  });
+
+  it('publishes the sweep horizon and the newest in-TTL record, so a stale-read is diagnosable', () => {
+    // `no_population` has exactly one cause — no demo tick inside STORE_TTL_MS —
+    // and a reader must be able to confirm that without a code read.
+    const out = scanShortPremiumFromSnapshot(
+      snap(ladder()),
+      CALM_CLOSES,
+      reading({ ivRank: 70, ivSampleDepth: 240, coverage: 'covered' }),
+      { now: NOW },
+    );
+    recordShortPremiumScan({ ...out, symbol: 'HHH' }, NOW - 5 * 60_000);
+    recordShortPremiumScan({ ...out, symbol: 'III' }, NOW - 60_000);
+
+    const cov = summarizeShortPremiumScans(NOW).ivRankCoverage;
+    expect(cov.storeTtlMs).toBe(30 * 60_000);
+    expect(cov.lastRecordedAt).toBe(new Date(NOW - 60_000).toISOString());
+    expect(cov.populated).toBe(true);
+
+    // One tick past the horizon the whole population is swept and the verdict must
+    // flip to `no_population` — NOT to a green over the survivors of the sweep.
+    const stale = summarizeShortPremiumScans(NOW + 30 * 60_000).ivRankCoverage;
+    expect(stale.scanCount).toBe(0);
+    expect(stale.populated).toBe(false);
+    expect(stale.partitionOk).toBeNull();
+    expect(stale.lastRecordedAt).toBeNull();
   });
 });

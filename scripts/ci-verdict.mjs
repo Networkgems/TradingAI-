@@ -44,9 +44,16 @@ export const EXPECTED_JOBS = {
 
 export const TEST_JOB_NAME = EXPECTED_JOBS.test;
 export const TEST_STEP_NAME = 'Test';
-// Floor, not a target: pretest alone (guard scripts + three package builds) takes
-// minutes. If the measured duration is under this, the suite did not run and the
-// green is manufactured.
+// TRA-5029 — the step that grades the suite by its EXECUTED TEST COUNT, run with
+// `if: always()` so it reports whether or not `Test` passed. Its whole purpose is to
+// give this gate a second, independent reading of the one thing a job conclusion
+// cannot express: did the suite RUN. See scripts/run-test-suite.mjs.
+export const SUITE_VERDICT_STEP_NAME = 'Suite executed (count floor)';
+// Floor, not a target: the suite is ~13.6k tests over six packages and takes minutes.
+// If the measured duration is under this, the suite did not run and the green is
+// manufactured. Kept as a cheap PROXY beside the count check above — it is the only
+// signal available for historical runs, and it is what first showed the TRA-5029
+// window (Test step: 393s on 2026-09-24T23:38Z, then 0–1s for the next 73 runs).
 export const TEST_STEP_FLOOR_SECONDS = 60;
 
 const CLEAN = 0;
@@ -122,12 +129,28 @@ export function gradeJobs(payload, selfName = 'CI verdict') {
   const testJob = byName.get(TEST_JOB_NAME);
   if (testJob) {
     const step = (testJob.steps ?? []).find((s) => s.name === TEST_STEP_NAME);
+    // TRA-5029 — "N tests failed" and "the suite never executed" arrived here as the
+    // same `Test -> failure` and were graded the same BROKEN. They are different
+    // incidents with different owners, so they get different codes: the count-floor
+    // step is what discriminates them, and its ABSENCE is BLIND rather than a licence
+    // to fall back to the old one-bit reading.
+    const suiteStep = (testJob.steps ?? []).find((s) => s.name === SUITE_VERDICT_STEP_NAME);
+    if (!suiteStep) {
+      lines.push(`[jobs] '${TEST_JOB_NAME}' carries no step named '${SUITE_VERDICT_STEP_NAME}' — cannot tell a failed suite from an unexecuted one — BLIND`);
+      code = worse(code, BLIND);
+    } else if (suiteStep.conclusion !== 'success') {
+      lines.push(`[jobs] step '${SUITE_VERDICT_STEP_NAME}': conclusion '${suiteStep.conclusion}' — the suite DID NOT EXECUTE (or executed too few tests to be the suite) — BLIND, not a test failure`);
+      code = worse(code, BLIND);
+    } else {
+      lines.push(`[jobs] step '${SUITE_VERDICT_STEP_NAME}': success — the suite executed above its count floor`);
+    }
     if (!step) {
       lines.push(`[jobs] '${TEST_JOB_NAME}' carries no step named '${TEST_STEP_NAME}' — BLIND`);
       code = worse(code, BLIND);
     } else if (step.conclusion !== 'success') {
-      lines.push(`[jobs] step '${TEST_STEP_NAME}': conclusion '${step.conclusion}' — BROKEN`);
-      code = worse(code, BROKEN);
+      const executed = suiteStep?.conclusion === 'success';
+      lines.push(`[jobs] step '${TEST_STEP_NAME}': conclusion '${step.conclusion}' — ${executed ? 'the suite executed and lost tests — BROKEN' : 'and the suite did not execute — BLIND'}`);
+      code = worse(code, executed ? BROKEN : BLIND);
     } else {
       const secs = stepSeconds(step);
       if (secs === null) {
@@ -164,20 +187,36 @@ async function fetchAllJobs(repo, runId, token) {
 // selftest — mutation controls. Each arm plants a defect and requires the gate
 // to refuse it with the exact code; the all-green arm requires it to pass. Both
 // directions, because a gate hardwired to refuse passes every one-sided control.
-export function selftest() {
-  const green = Object.fromEntries(Object.keys(EXPECTED_JOBS).map((k) => [k, { result: 'success' }]));
-  const jobsGreen = {
+// A /jobs payload that `gradeJobs` must call CLEAN. EXPORTED on purpose, and the only
+// copy: `require-green-ci.mjs` imports `gradeJobs`, so it needs the same notion of "a
+// complete run" and used to hand-roll its own. TRA-5029 grew the required step set (the
+// test job must also publish the count-floor step) and that stale second copy went red
+// in CI — `Verdict gate mutation controls` failing on a change that touched neither the
+// gate's behaviour nor that file. A grader and its fixture are one artefact; a second
+// hand-written fixture is a silent drift waiting for the next required field.
+export function greenJobsFixture() {
+  return {
     jobs: Object.entries(EXPECTED_JOBS).map(([id, name]) => ({
       name,
       status: 'completed',
       conclusion: 'success',
       steps:
         name === TEST_JOB_NAME
-          ? [{ name: TEST_STEP_NAME, status: 'completed', conclusion: 'success', started_at: '2026-09-09T00:00:00Z', completed_at: '2026-09-09T00:07:30Z' }]
+          ? [
+            { name: TEST_STEP_NAME, status: 'completed', conclusion: 'success', started_at: '2026-09-09T00:00:00Z', completed_at: '2026-09-09T00:07:30Z' },
+            { name: SUITE_VERDICT_STEP_NAME, status: 'completed', conclusion: 'success', started_at: '2026-09-09T00:07:30Z', completed_at: '2026-09-09T00:07:31Z' },
+          ]
           : [{ name: id, status: 'completed', conclusion: 'success', started_at: '2026-09-09T00:00:00Z', completed_at: '2026-09-09T00:01:00Z' }],
     })),
   };
+}
+
+export function selftest() {
+  const green = Object.fromEntries(Object.keys(EXPECTED_JOBS).map((k) => [k, { result: 'success' }]));
+  const jobsGreen = greenJobsFixture();
   const clone = (o) => JSON.parse(JSON.stringify(o));
+  const testSteps = (p) => p.jobs.find((j) => j.name === TEST_JOB_NAME).steps;
+  const testStep = (p, name) => testSteps(p).find((s) => s.name === name);
 
   const arms = [
     ['needs: all success -> CLEAN', () => gradeNeeds(green).code, CLEAN],
@@ -195,6 +234,45 @@ export function selftest() {
     ['jobs: Test step absent -> BLIND', () => { const p = clone(jobsGreen); p.jobs.find((j) => j.name === TEST_JOB_NAME).steps = []; return gradeJobs(p).code; }, BLIND],
     ['jobs: Test step skipped -> BROKEN', () => { const p = clone(jobsGreen); p.jobs.find((j) => j.name === TEST_JOB_NAME).steps[0].conclusion = 'skipped'; return gradeJobs(p).code; }, BROKEN],
     ['jobs: empty payload -> BLIND', () => gradeJobs({}).code, BLIND],
+    // TRA-5029 — the two failure modes that shared one code for 7d 1h 48m. Both arms
+    // are required: without the first, a gate that calls everything BLIND passes the
+    // second, and "the suite lost tests" would stop being actionable.
+    ['jobs: Test red but the suite EXECUTED (count step green) -> BROKEN', () => {
+      const p = clone(jobsGreen);
+      p.jobs.find((j) => j.name === TEST_JOB_NAME).conclusion = 'failure';
+      testStep(p, TEST_STEP_NAME).conclusion = 'failure';
+      return gradeJobs(p).code;
+    }, BROKEN],
+    ['jobs: Test red AND the suite never executed (count step red) -> BLIND', () => {
+      const p = clone(jobsGreen);
+      p.jobs.find((j) => j.name === TEST_JOB_NAME).conclusion = 'failure';
+      testStep(p, TEST_STEP_NAME).conclusion = 'failure';
+      testStep(p, SUITE_VERDICT_STEP_NAME).conclusion = 'failure';
+      return gradeJobs(p).code;
+    }, BLIND],
+    // The 2026-09-25 shape exactly: Test failed at 1s. Duration alone cannot grade a
+    // FAILED step (the conclusion check short-circuits), so the count step is what
+    // makes this BLIND rather than an ordinary red.
+    ['jobs: the TRA-5029 shape — Test failure at 1s with no count step -> BLIND', () => {
+      const p = clone(jobsGreen);
+      const job = p.jobs.find((j) => j.name === TEST_JOB_NAME);
+      job.conclusion = 'failure';
+      job.steps = [{ name: TEST_STEP_NAME, status: 'completed', conclusion: 'failure', started_at: '2026-09-25T00:22:08Z', completed_at: '2026-09-25T00:22:09Z' }];
+      return gradeJobs(p).code;
+    }, BLIND],
+    // A green Test over an absent or red count step is the dangerous direction: the
+    // suite reported success having executed nothing (every package carries
+    // --passWithNoTests). It must never read CLEAN.
+    ['jobs: Test green but the count step is ABSENT -> BLIND', () => {
+      const p = clone(jobsGreen);
+      p.jobs.find((j) => j.name === TEST_JOB_NAME).steps = [testStep(p, TEST_STEP_NAME)];
+      return gradeJobs(p).code;
+    }, BLIND],
+    ['jobs: Test green but the count step is RED -> BLIND', () => {
+      const p = clone(jobsGreen);
+      testStep(p, SUITE_VERDICT_STEP_NAME).conclusion = 'failure';
+      return gradeJobs(p).code;
+    }, BLIND],
   ];
 
   let failed = 0;

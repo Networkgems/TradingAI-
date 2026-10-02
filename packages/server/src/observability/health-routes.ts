@@ -10,7 +10,10 @@ import { timingSafeEqual } from 'node:crypto';
 import type { Express, Response, RequestHandler } from 'express';
 import { findMissingLiveCredentials, isStockMarketOpen, DEFAULT_ACCOUNT_SETTINGS, type AccountSettings } from '@trading-app/shared';
 import type { DecoupledExitSkipReason, EngineState, ExitCadenceHealth, ExitIntervalBucket, LiveEquityAcceptance, LiveSkipCategory } from '../signal-engine.js';
-import { DECOUPLED_EXIT_SKIP_REASONS, EXIT_INTERVAL_BUCKETS, LIVE_SKIP_CATEGORIES, emptyDecoupledExitSkips, emptyExitIntervalHistogram, emptyLiveSkipBreakdown, isLiveBrokerOperator, resolveLiveBrokerOperator, isRvEngineEnabled } from '../signal-engine.js';
+import { DECOUPLED_EXIT_SKIP_REASONS, EXIT_INTERVAL_BUCKETS, LIVE_SKIP_CATEGORIES, emptyDecoupledExitSkips, emptyExitIntervalHistogram, emptyLiveSkipBreakdown, isLiveBrokerOperator, resolveLiveBrokerOperator, isRvEngineEnabled, sma200BarDay } from '../signal-engine.js';
+// TRA-4877 — the sizing-zero fold is counted at the decision, not off the ring.
+import { aggregateLiveEquitySizingZeroViews } from '../live-equity-sizing-reason.js';
+import type { LiveEquitySizingZeroFleetView, LiveEquitySizingZeroView } from '../live-equity-sizing-reason.js';
 import {
   isTestAccount,
   unrecognisedDeskBooks,
@@ -361,7 +364,7 @@ import { describeOtmProfitSchedule } from '../otm-profit-schedule.js';
 import { summarizeOptionsBreakerLedger } from '../options-breaker-ledger.js'; // TRA-3218
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX, ENTRY_DELTA_THETA_RATIO_FLOOR, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
-import { resolveDemoFlagEnv, DEMO_FLAG_ALLOWLIST } from '../demo-flags.js';
+import { resolveDemoFlagEnv, resolveDemoFlagEnvFromEnv, DEMO_FLAG_ALLOWLIST } from '../demo-flags.js';
 // TRA-4436 — demo-effective ma20 confirm bars, derived from the shipped
 // `buildRvExitParams` so the option-swing-exits readout cannot drift from it.
 import { demoEffectiveMa20ConfirmBars } from '../rv-exit-params.js';
@@ -892,6 +895,18 @@ export interface LiveEquityAcceptanceReport {
    * only constant category keys + counts, never a raw reason string.
    */
   liveSkipReasonBreakdown: Record<LiveSkipCategory, number>;
+  /**
+   * TRA-4877 — fleet fold of WHICH zero the live-equity sizer returned, keyed by
+   * {@link LiveEquitySizingZeroReason}. Unlike `liveSkipReasonBreakdown` above
+   * this is NOT derived from the newest-50 signal ring — it is counted at the
+   * sizing decision — so it answers "how often did we price out today" for a
+   * reader who arrives after the close.
+   *
+   * ⚠️ Read `.wiring` BEFORE any count. `never_recorded` ⇒ no engine recorded a
+   * decision this boot ⇒ every count is a default, and `priced_out_at_book: 0`
+   * is NOT evidence the book is clearing its per-position cap.
+   */
+  liveEquitySizingZeros: LiveEquitySizingZeroFleetView;
   /** Most recent live-equity mirror open across the fleet (ISO), or null. */
   lastLiveEquityFillAt: string | null;
   /**
@@ -957,6 +972,10 @@ export function aggregateLiveEquityAcceptance(
       liveSkipReasons: sum(s => s.liveSkipReasonCount),
     },
     liveSkipReasonBreakdown,
+    // TRA-4877 — counted at the sizing decision, not folded off the signal ring.
+    liveEquitySizingZeros: aggregateLiveEquitySizingZeroViews(
+      snapshots.map(s => s.liveEquitySizingZeros).filter((v): v is LiveEquitySizingZeroView => !!v),
+    ),
     lastLiveEquityFillAt: lastFillMs > 0 ? new Date(lastFillMs).toISOString() : null,
     serviceEnv: {
       tradierEnvProduction: (env['TRADIER_ENV'] ?? '').trim() === 'production',
@@ -1827,12 +1846,223 @@ export interface Sma200SweepCensusReport {
     fetchFailed: number;
     fired: number;
     voided: number;
+    /**
+     * TRA-4922 (AC-b) — pullback setups refused by the max-dist gate, Σ OVER
+     * ENGINES.
+     *
+     * 🔴 THIS IS NOT AC7's n. It is the per-engine row count AC7 explicitly
+     * forbids: 68 engines sweeping largely overlapping universes count ONE
+     * (symbol, barTimestamp) rejection up to 68 times, so this number crosses
+     * 30 on roughly one real market event. AC7's n is
+     * {@link Sma200RejectionFleetFold.distinctCount}, published beside it.
+     *
+     * It is published anyway because its ABSENCE was the filed defect: a zero on
+     * a key that does not exist is not a measurement. Both numbers present and
+     * named is the requirement — one alone, whichever it is, gets read as AC7's
+     * n. The `rejectedMaxDistIs` tag below is the on-the-wire label, since a
+     * doc comment is not served.
+     */
+    rejectedMaxDist: number;
+    /**
+     * TRA-4922 (AC-b) — graded engines whose census does NOT carry the
+     * `rejectedMaxDist` key at all (an older build). Non-zero ⇒ the sigma above
+     * is a lower bound over a partial fleet, and a `0` is not a reading.
+     * ABSENT ≠ ZERO, the same discipline as `unpublished` above.
+     */
+    rejectedMaxDistUnpublished: number;
+    /**
+     * TRA-4922 (AC-b) — the label, on the wire. A reader who lands in `totals`
+     * and reads `rejectedMaxDist` must not be able to mistake it for AC7's
+     * count, and a TypeScript doc comment never reaches them.
+     */
+    rejectedMaxDistIs: 'SIGMA_OVER_ENGINES_NOT_AC7_N';
   };
+  /**
+   * TRA-4922 (AC-a) — the AC7 count arm: the DISTINCT rejected cohort, folded
+   * across the whole fleet. See {@link Sma200RejectionFleetFold}.
+   */
+  rejections: Sma200RejectionFleetFold;
+  /**
+   * TRA-4922 (AC-c) — the fleet's DISTINCT swept symbol census. See
+   * {@link Sma200SweepUniverseFold}.
+   */
+  universe: Sma200SweepUniverseFold;
   /** ISO time the most-recent sweep in the fleet finished, or null. */
   newestSweepAt: string | null;
   /** Age of `newestSweepAt` in ms at read time — a stale census is not a live one. */
   newestSweepAgeMs: number | null;
 }
+
+/**
+ * TRA-4922 (AC-a) — one deduped rejected setup in the fleet union.
+ *
+ * Carries every field AC7's invalidation comparison needs (`distAtr` against
+ * `maxDistAtr` is the gate's own decision; `entryPrice`/`stopLoss`/`atr14` are
+ * the R-denominator) plus the provenance of the fold itself: how many engines
+ * saw this row, and whether they AGREED about it.
+ */
+export interface Sma200FleetRejectionRow {
+  symbol: string;
+  /** The AC7 key's second component, raw. */
+  barTimestamp: number;
+  /** …and rendered, so a reader does not have to convert to see the session. */
+  barAt: string;
+  /** UTC calendar day of `barTimestamp` — the engine's OWN dedupe identity. */
+  barDay: number;
+  distAtr: number;
+  atr14: number;
+  maxDistAtr: number;
+  entryPrice: number;
+  stopLoss: number;
+  /** Earliest `recordedAt` across the engines that hold this row, ISO. */
+  firstRecordedAt: string;
+  /**
+   * How many fleet engines hold this exact `(symbol, barTimestamp)`. 1 means a
+   * single book saw it — which is also the only case a `forceReset` on that one
+   * book can silently remove from the union (AC-e).
+   */
+  seenByEngines: number;
+  /**
+   * TRA-4922 — two engines reported this same key with DIFFERENT `distAtr`.
+   * The kept row is the earliest-recorded one. A union that silently picked a
+   * winner here would publish one book's measurement as the fleet's.
+   */
+  conflicting: boolean;
+}
+
+/**
+ * TRA-4922 (AC-a) — the fleet-folded rejected cohort: AC7's count arm.
+ *
+ * Why this exists at all. Before it, AC7's count had NO surface. `/api/state`
+ * carries the rows but is ONE engine's book (measured 2026-09-25: `considered`
+ * 100 against a fleet of 68 engines / 6800 considered), and the only fleet fold
+ * — `summarizeSma200Sweeps` — published no rejection key whatsoever, so a zero
+ * read there was an ABSENT KEY, not a measurement. The count arm was therefore
+ * unexecutable on the deployed build and the 6-month calendar arm won by
+ * default on n≈2 — the exact outcome the "read the fleet" instruction was
+ * written to prevent.
+ *
+ * ⚠️ WHOLE FLEET, BOTH MODES, for the reason already recorded on
+ * {@link summarizeSma200Sweeps}: `runSma200Scan` is driven from `doTick` with no
+ * mode predicate, so a `.filter(mode === 'demo')` here would silently drop
+ * engines that really do sweep and really do reject.
+ */
+export interface Sma200RejectionFleetFold {
+  /**
+   * **AC7's n**, on the key AC7 ratified: DISTINCT `(symbol, barTimestamp)`
+   * rejected setups unioned over every engine in the fleet.
+   */
+  distinctCount: number;
+  /**
+   * The SAME union keyed `(symbol, UTC bar DAY)` — the identity the engine
+   * itself debounces on (`sma200BarDay`, TRA-1926), because "Yahoo can hand back
+   * the same session with a drifting sub-day timestamp".
+   *
+   * 🔴 Read this next to `distinctCount`, never instead of it. Within ONE engine
+   * the day-key dedupe suppresses a drifting duplicate; ACROSS engines nothing
+   * does, and the fleet union is exactly where that bites. So
+   * `distinctByBarDayCount < distinctCount` ⇒ bar-timestamp drift is splitting
+   * one logical rejection into several rows and `distinctCount` — the ratified
+   * key — is INFLATED by the difference. The day-keyed number is the defensible
+   * one; the raw-keyed number is published because it is what AC7 literally
+   * says. Equal values ⇒ no drift in this population and the question is moot.
+   */
+  distinctByBarDayCount: number;
+  /** Engines contributing at least one row. */
+  contributingEngines: number;
+  /**
+   * Engines whose build does not carry `sma200GateRejections` at all. Non-zero ⇒
+   * every count here is a lower bound over a partial fleet. ABSENT ≠ EMPTY.
+   */
+  ledgerUnpublished: number;
+  /** Σ of per-engine ledger lengths — the pre-dedupe row count, for the ratio. */
+  rowsBeforeDedupe: number;
+  /** The deduped rows, oldest bar first. */
+  rows: Sma200FleetRejectionRow[];
+  /**
+   * `rows` was clipped by {@link FLEET_REJECTION_ROW_CAP}. `distinctCount` is
+   * NEVER clipped, so n stays correct even when the detail is abridged — but a
+   * `true` here means the AC7 E[R] comparison cannot be run off this read alone.
+   */
+  rowsTruncated: boolean;
+  /** Oldest / newest bar in the union, ISO, or null when empty. */
+  oldestBarAt: string | null;
+  newestBarAt: string | null;
+  /**
+   * TRA-4922 (AC-d + AC-e) — why `distinctCount` may be a LOWER bound, and why a
+   * re-read can be smaller than an earlier one.
+   */
+  integrity: {
+    /** The per-engine ring capacity, as published by the engines. */
+    cap: number | null;
+    /** Engines whose ring is sitting AT the cap — one arrival from evicting. */
+    enginesAtCap: number;
+    /** Σ rows the FIFO cap has dropped (AC-d). */
+    evicted: number;
+    /** Σ `forceReset` wipes of a rejection ledger (AC-e). */
+    resets: number;
+    /** Rows discarded by the most recent wipe in the fleet. */
+    lastResetDropped: number;
+    /** ISO time of the most recent wipe anywhere in the fleet, or null. */
+    newestResetAt: string | null;
+    /**
+     * Engines not publishing {@link Sma200RejectionLedgerMeta}. Non-zero ⇒
+     * `nonMonotonic` below is itself a lower bound: those books could have reset
+     * without saying so.
+     */
+    metaUnpublished: number;
+    /**
+     * `true` ⇒ at least one row has been evicted or one ledger wiped, so
+     * `distinctCount` is NOT a monotonic accrual and a smaller re-read has a
+     * named cause rather than being a quiet tape. `false` with
+     * `metaUnpublished: 0` is the only state in which n may be treated as an
+     * accruing count.
+     */
+    nonMonotonic: boolean;
+  };
+  /** The label, on the wire — see `totals.rejectedMaxDistIs`. */
+  note: string;
+}
+
+/**
+ * TRA-4922 (AC-c) — the fleet's DISTINCT swept symbol census.
+ *
+ * TRA-4921's arrival-rate table derives its fleet column from "~751 names",
+ * which is a CODE COMMENT, not a live census — and Σ `considered` is no
+ * substitute, because it is a sigma over engines (68 × 100 = 6800) while the
+ * true union may be 100. The per-engine universe really does differ:
+ * `getActiveSymbols` is cut by priority tier and what a book HOLDS is per book.
+ */
+export interface Sma200SweepUniverseFold {
+  /**
+   * DISTINCT symbols across the graded engines' most-recent sweep universes, or
+   * `null` when NO graded engine publishes its symbol list (absent key, not an
+   * empty fleet).
+   */
+  distinctSymbols: number | null;
+  /** Σ `considered` — the number that is NOT a census. Kept for the ratio. */
+  consideredSigma: number;
+  /**
+   * Graded engines whose census lacks `consideredSymbols`. Non-zero ⇒
+   * `distinctSymbols` is a lower bound over a partial fleet.
+   */
+  symbolsUnpublished: number;
+  /** Largest single-engine universe, or null when none published. */
+  maxEngineUniverse: number | null;
+  /** Smallest single-engine universe, or null when none published. */
+  minEngineUniverse: number | null;
+  /** The label, on the wire. */
+  note: string;
+}
+
+/**
+ * TRA-4922 — ceiling on PUBLISHED rejection rows. The structural maximum is
+ * `engines × SMA200_REJECTION_MAX` (≈ 68 × 400), so this is generous headroom
+ * rather than an expected clip; it exists so a future fleet/cap growth degrades
+ * VISIBLY (`rowsTruncated: true`) instead of quietly serving a 30MB body.
+ * `distinctCount` is computed before the clip and is never affected.
+ */
+export const FLEET_REJECTION_ROW_CAP = 5000;
 
 /**
  * Fold the fleet's sweep censuses. Pure (clock injected) so the five verdict
@@ -1852,6 +2082,10 @@ export function summarizeSma200Sweeps(
   const totals = {
     considered: 0, evaluated: 0, starvedBreakerOpen: 0,
     starvedShortHistory: 0, fetchFailed: 0, fired: 0, voided: 0,
+    // TRA-4922 (AC-b) — the per-engine sigma, explicitly labelled below.
+    rejectedMaxDist: 0,
+    rejectedMaxDistUnpublished: 0,
+    rejectedMaxDistIs: 'SIGMA_OVER_ENGINES_NOT_AC7_N' as const,
   };
   let graded = 0;
   let neverSwept = 0;
@@ -1859,8 +2093,101 @@ export function summarizeSma200Sweeps(
   let liveEngines = 0;
   let newestFinishedAt: number | null = null;
 
+  // TRA-4922 (AC-a) — the rejection union, accumulated over the SAME pass. Keyed
+  // on the AC7 key; the day-keyed set rides along so the two can be compared.
+  const byAc7Key = new Map<string, Sma200FleetRejectionRow>();
+  const byBarDayKey = new Set<string>();
+  let rowsBeforeDedupe = 0;
+  let contributingEngines = 0;
+  let ledgerUnpublished = 0;
+  // TRA-4922 (AC-c) — the universe union.
+  const universeSymbols = new Set<string>();
+  let symbolsUnpublished = 0;
+  let maxEngineUniverse: number | null = null;
+  let minEngineUniverse: number | null = null;
+  // TRA-4922 (AC-d + AC-e) — the integrity witness fold.
+  let cap: number | null = null;
+  let enginesAtCap = 0;
+  let evicted = 0;
+  let resets = 0;
+  let lastResetDropped = 0;
+  let newestResetAt: number | null = null;
+  let metaUnpublished = 0;
+
   for (const { state, mode } of engines) {
     if (mode === 'live') liveEngines++;
+
+    // ── TRA-4922 — the rejection fold runs over EVERY engine, graded or not ──
+    // Deliberately OUTSIDE the census gates below. The ledger and the census are
+    // different objects with different lifetimes: `sma200GateRejections` is
+    // snapshot-PERSISTED, `sma200ScanStats` deliberately is not, so a
+    // just-rebooted engine carries a full rejection ledger and a `null` census.
+    // Folding rejections only for `graded` engines would therefore drop real
+    // AC7 rows for exactly as long as a redeploy takes to finish its first
+    // sweep — and a redeploy is the one moment a reader checks.
+    if (!('sma200GateRejections' in state)) {
+      ledgerUnpublished++;
+    } else {
+      const ledger = state.sma200GateRejections ?? [];
+      rowsBeforeDedupe += ledger.length;
+      if (ledger.length > 0) contributingEngines++;
+      for (const r of ledger) {
+        if (typeof r.barTimestamp !== 'number' || !Number.isFinite(r.barTimestamp)) continue;
+        const key = `${r.symbol}\u0000${r.barTimestamp}`;
+        byBarDayKey.add(`${r.symbol}\u0000${sma200BarDay(r.barTimestamp)}`);
+        const seen = byAc7Key.get(key);
+        if (seen === undefined) {
+          byAc7Key.set(key, {
+            symbol: r.symbol,
+            barTimestamp: r.barTimestamp,
+            barAt: new Date(r.barTimestamp).toISOString(),
+            barDay: sma200BarDay(r.barTimestamp),
+            distAtr: r.distAtr,
+            atr14: r.atr14,
+            maxDistAtr: r.maxDistAtr,
+            entryPrice: r.entryPrice,
+            stopLoss: r.stopLoss,
+            firstRecordedAt: new Date(r.recordedAt).toISOString(),
+            seenByEngines: 1,
+            conflicting: false,
+          });
+          continue;
+        }
+        seen.seenByEngines++;
+        // Two books measuring the same setup differently is a real possibility
+        // (each pulls its own daily bars), and silently keeping one would
+        // publish one book's number as the fleet's. Flag it instead; the kept
+        // row stays the earliest-RECORDED one so the choice is deterministic.
+        if (seen.distAtr !== r.distAtr || seen.atr14 !== r.atr14) seen.conflicting = true;
+        if (r.recordedAt < Date.parse(seen.firstRecordedAt)) {
+          seen.firstRecordedAt = new Date(r.recordedAt).toISOString();
+        }
+      }
+    }
+    // AC-d/AC-e — the integrity witness, also over every engine for the same
+    // reason: a reset survives a reboot, the census does not.
+    if (!('sma200RejectionLedgerMeta' in state)) {
+      metaUnpublished++;
+    } else {
+      const meta = state.sma200RejectionLedgerMeta;
+      if (meta === undefined || meta === null) {
+        metaUnpublished++;
+      } else {
+        evicted += meta.evicted;
+        resets += meta.resets;
+        if (meta.lastResetAt !== null && (newestResetAt === null || meta.lastResetAt > newestResetAt)) {
+          newestResetAt = meta.lastResetAt;
+          lastResetDropped = meta.lastResetDropped;
+        }
+      }
+    }
+    if (typeof state.sma200RejectionCap === 'number') {
+      // A mixed-build fleet can serve two caps. Publish the SMALLEST, because it
+      // is the one that bounds how much evidence the weakest book can hold.
+      cap = cap === null ? state.sma200RejectionCap : Math.min(cap, state.sma200RejectionCap);
+      if ((state.sma200GateRejections?.length ?? 0) >= state.sma200RejectionCap) enginesAtCap++;
+    }
+
     // A build without the census carries NEITHER key. A build WITH it carries
     // both, holding `null` until the first sweep lands. Keying on the key's
     // presence (not its value) is what keeps "old build" out of "quiet fleet".
@@ -1883,6 +2210,24 @@ export function summarizeSma200Sweeps(
     totals.fetchFailed += stats.fetchFailed;
     totals.fired += stats.fired;
     totals.voided += stats.voided;
+    // TRA-4922 (AC-b) — ABSENT ≠ ZERO. `rejectedMaxDist` is optional on the
+    // census (older build), and folding `?? 0` into the sigma would publish a
+    // partial-fleet number as a whole-fleet one. Count the absence instead.
+    if (typeof stats.rejectedMaxDist === 'number') {
+      totals.rejectedMaxDist += stats.rejectedMaxDist;
+    } else {
+      totals.rejectedMaxDistUnpublished++;
+    }
+    // TRA-4922 (AC-c) — the DISTINCT universe. Same absent-key discipline: a
+    // missing list is an unmeasured engine, never an engine that swept nothing.
+    if (Array.isArray(stats.consideredSymbols)) {
+      for (const sym of stats.consideredSymbols) universeSymbols.add(sym);
+      const n = stats.consideredSymbols.length;
+      maxEngineUniverse = maxEngineUniverse === null ? n : Math.max(maxEngineUniverse, n);
+      minEngineUniverse = minEngineUniverse === null ? n : Math.min(minEngineUniverse, n);
+    } else {
+      symbolsUnpublished++;
+    }
     if (newestFinishedAt === null || stats.finishedAt > newestFinishedAt) {
       newestFinishedAt = stats.finishedAt;
     }
@@ -1895,6 +2240,12 @@ export function summarizeSma200Sweeps(
   else if (byVerdict.SWEPT > 0) verdict = 'SWEPT';
   else verdict = 'BLIND';
 
+  // TRA-4922 (AC-a) — n is counted BEFORE the row clip, so the AC7 count is
+  // never truncated even when the detail is.
+  const allRows = Array.from(byAc7Key.values()).sort((a, b) => a.barTimestamp - b.barTimestamp);
+  const distinctCount = allRows.length;
+  const rows = allRows.slice(0, FLEET_REJECTION_ROW_CAP);
+
   return {
     engines: engines.length,
     liveEngines,
@@ -1904,6 +2255,52 @@ export function summarizeSma200Sweeps(
     byVerdict,
     verdict,
     totals,
+    rejections: {
+      distinctCount,
+      distinctByBarDayCount: byBarDayKey.size,
+      contributingEngines,
+      ledgerUnpublished,
+      rowsBeforeDedupe,
+      rows,
+      rowsTruncated: distinctCount > rows.length,
+      oldestBarAt: allRows.length === 0 ? null : allRows[0]!.barAt,
+      newestBarAt: allRows.length === 0 ? null : allRows[allRows.length - 1]!.barAt,
+      integrity: {
+        cap,
+        enginesAtCap,
+        evicted,
+        resets,
+        lastResetDropped,
+        newestResetAt: newestResetAt === null ? null : new Date(newestResetAt).toISOString(),
+        metaUnpublished,
+        nonMonotonic: evicted > 0 || resets > 0,
+      },
+      note:
+        'distinctCount IS the TRA-3688 AC7 n: DISTINCT (symbol, barTimestamp) max-dist '
+        + 'rejections unioned across the WHOLE fleet, both modes. totals.rejectedMaxDist is '
+        + 'the per-engine SIGMA and is NOT this number. Read distinctByBarDayCount beside '
+        + 'distinctCount: it keys on the engine own UTC-bar-day identity (TRA-1926), so a '
+        + 'lower value means bar-timestamp drift across engines has inflated the ratified '
+        + 'key. ledgerUnpublished > 0 or integrity.metaUnpublished > 0 makes every count '
+        + 'here a LOWER BOUND, and integrity.nonMonotonic true means a later re-read may be '
+        + 'smaller than an earlier one with a named cause (eviction or reset), not a quiet tape.',
+    },
+    universe: {
+      distinctSymbols: universeSymbols.size === 0 && symbolsUnpublished === graded
+        ? null
+        : universeSymbols.size,
+      consideredSigma: totals.considered,
+      symbolsUnpublished,
+      maxEngineUniverse,
+      minEngineUniverse,
+      note:
+        'distinctSymbols is the DISTINCT symbol union of the graded engines most-recent '
+        + 'sweep universes. consideredSigma is a SIGMA OVER ENGINES and is NOT a census: '
+        + 'per-engine universes overlap heavily, so it overstates the fleet population by '
+        + 'roughly the engine count. Any arrival-rate estimate must use distinctSymbols. '
+        + 'symbolsUnpublished > 0 makes distinctSymbols a lower bound; null means NO graded '
+        + 'engine published its symbol list (an absent key, not an empty fleet).',
+    },
     newestSweepAt: newestFinishedAt === null ? null : new Date(newestFinishedAt).toISOString(),
     newestSweepAgeMs: newestFinishedAt === null ? null : now - newestFinishedAt,
   };
@@ -5453,7 +5850,13 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // can vanish, so the intent must not live there). `envIntent.ok` is
       // tri-state: `null` off-production is UNGRADED, never a pass — see
       // `pnpm check:env-intent`, which fails closed on it.
-      envIntent: summarizeEnvIntent(process.env),
+      // TRA-5014 — the second argument is the demo-flags OVERLAY env, and it is
+      // resolved HERE rather than inside `summarizeEnvIntent` because resolving
+      // it reads `DATA_DIR/demo-flags.json` and that function is contractually
+      // IO-free. Omitting it would not be a safe default: an `overlayBacked`
+      // lever (the paper sleeve's only admission path) would come back blind,
+      // and `ok` would correctly refuse to go green.
+      envIntent: summarizeEnvIntent(process.env, resolveDemoFlagEnvFromEnv()),
       note: durabilityNote(report),
     });
   });
@@ -7226,6 +7629,26 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       loRealFillNet: c.loRealFillNet,
       boundNoiseR: c.boundNoiseR,
       realFillUnavailableReason: c.realFillUnavailableReason,
+      /**
+       * TRA-5040 — the real-fill arm's SHADOW trio: what `nRealFill` WOULD read
+       * if the arm also resolved TRA-4997's close-seam `exitQuote` on the rows it
+       * drops at `exit_quote_missing`. `nRealFill`, `loRealFillNet` and
+       * `admitsRealFill` above are bit-for-bit what they were before that ticket;
+       * nothing here feeds a verdict. `realFillSeamStale` is held APART from
+       * `recovered` because "a book we will not trust" and "no book at all" are
+       * different refusals, and only the second one a backfill could fix.
+       *
+       * ⚠️ These three shipped on `/api/health/option-expectancy-table` — which
+       * publishes `table` wholesale — from the first commit, but THIS projector is
+       * a WHITELIST, so on `/api/health/live-enforce-gates` the same numbers
+       * arrived only as prose inside `realFillUnavailableReason`: readable by a
+       * human, invisible to anything grading the gate. A coverage fix that lands
+       * on the writer and starves at a whitelisting reader is the exact shape of
+       * the defect this ticket was filed about, one surface further out.
+       */
+      nRealFillSeamShadow: c.nRealFillSeamShadow,
+      realFillSeamRecovered: c.realFillSeamRecovered,
+      realFillSeamStale: c.realFillSeamStale,
     });
     const cellsByStructure = barsByStructure.map((b) => {
       const cells = tapeCells.filter((c) => c.structure === b.structure);
@@ -8052,9 +8475,21 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // `mark`/`spreadPct` on every row use the scanner's (bid+ask)/2 mid — the
   // TRA-1656 entry-stamp convention — so the tape's axes match the journal's.
   //
-  // Query: `?day=YYYY-MM-DD&class=desk&rows=5000` streams raw rows (capped);
-  // omit `rows` for the summary alone. Row fields are OPTIONAL on the read
-  // side: a row written by an older build genuinely lacks newer fields.
+  // Query: `?day=YYYY-MM-DD&class=desk&kind=candidate&rows=20000&offset=0`
+  // streams raw rows; omit `rows` for the summary alone. Row fields are
+  // OPTIONAL on the read side: a row written by an older build genuinely lacks
+  // newer fields.
+  //
+  // ⚠ The row read is PAGED, and `?rows=all` does NOT lift the ceiling (it is
+  // non-numeric, so it parses to the ceiling — the sweep script reaches for
+  // `rows=all` by analogy with `/api/health/option-journal`, where it works).
+  // A (day × class) slice can exceed one response: measured 2026-10-02, desk
+  // 2026-09-24 holds 21,384 rows (12,168 candidate + 9,216 `ranked`) and the
+  // unfiltered read returned a 20,000-row PREFIX — clipping 524 candidate rows
+  // off the file tail, i.e. the day's LAST ET slots. Read `rowsTruncated` /
+  // `rowsNextOffset` and page, or pass `kind=candidate` to drop the link rows
+  // a sweep never reads. An undetected tail clip is a time-of-day bias, the
+  // exact v1-sampler defect this tape was rebuilt to escape.
   //
   // Observe-only: the trading path never reads this tape, and serving it never
   // routes an order or moves a parameter.
@@ -8066,11 +8501,16 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       let rows: Awaited<ReturnType<typeof readOtmAdmissionTapeRows>> | undefined;
       if (wantRows) {
         const limitRaw = Number(req.query.rows);
+        const offsetRaw = Number(req.query.offset);
         rows = await readOtmAdmissionTapeRows({
           ...(typeof req.query.day === 'string' && req.query.day !== '' ? { etDay: req.query.day } : {}),
           ...(typeof req.query.class === 'string' && req.query.class !== ''
             ? { accountClass: req.query.class }
             : {}),
+          ...(typeof req.query.kind === 'string' && req.query.kind !== ''
+            ? { kind: req.query.kind }
+            : {}),
+          ...(Number.isFinite(offsetRaw) && offsetRaw > 0 ? { offset: Math.floor(offsetRaw) } : {}),
           ...(Number.isFinite(limitRaw) && limitRaw > 0 ? { limit: Math.floor(limitRaw) } : {}),
         });
       }
@@ -8081,7 +8521,18 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         build: resolveBuildInfo(),
         etDay: etDateString(new Date(nowMs)),
         ...summary,
-        ...(rows !== undefined ? { rows: rows.rows, rowsTruncated: rows.truncated } : {}),
+        ...(rows !== undefined
+          ? {
+              rows: rows.rows,
+              rowsTruncated: rows.truncated,
+              rowsReturned: rows.rows.length,
+              rowsOffset: rows.offset,
+              rowsNextOffset: rows.nextOffset,
+              rowsNote: rows.truncated
+                ? `TRUNCATED — this is a PREFIX of the filter, not the slice. More matching rows exist; re-read with &offset=${rows.nextOffset} (file order is append-only, so paging a CLOSED session is exact) and concatenate. ${rows.rows.length} is the per-response row ceiling, and \`?rows=all\` does NOT lift it (non-numeric parses to the ceiling). Add &kind=candidate to drop the ranked/ordered link rows a sweep does not read: measured 2026-10-02, desk 2026-09-24 is 21,384 rows unfiltered (over the ceiling, clipping the day's LAST ET slots) and 12,168 filtered.`
+                : 'COMPLETE — the filter was exhausted within the per-response ceiling (rowsNextOffset null).',
+            }
+          : {}),
         note: `${summary.deskSessionsWithAdmissions}/20 desk-class ET sessions with >=1 ADMITTED candidate toward the TRA-4623 AC4 re-run bar. bindingReason = FIRST binding gate in engine evaluation order ('none' = admitted). Only sampling-policy >= 2 days count; v1 rows (no samplingPolicy, 2026-09-17..18) exhausted a first-come daily budget in the opening minutes and are open-biased (legacySessions/legacyRows) - exclude them from any readout. v2/v3 sampling is pass-level and independent of mark, spreadPct and time-of-day by construction (see policy); days[].rowsBySlotEt is the time-coverage check. TRA-4954: rule 3 THINS rather than starves from policy v3 — every symbol presenting in a slot is reserved policy.floorRowsPerSymbol rows and the remainder is split in PROPORTION to pass size, so a wide chain is down-weighted instead of dropped whole. v2 days (2026-09-19..10-02) are a first-come PREFIX of each slot's demand, on which 54 (desk) / 985 (fixture) (slot x symbol) cells banked ZERO rows and max_spread_pct binding reads biased UPWARD: filter samplingPolicy === 3 for anything that reads per-symbol coverage, >= 2 for AC4 sessions and mark/spread retention. TRA-4906: days[].dropsBySlotEt is the per-slot rule-3 shed cell — passes, rows SHED, banked survivors, full passRows and wholeDrops — rebuilt from durable kind:budgetdrop rows, so it SURVIVES A BOOT; read it there, not off counters.slotBudget*, which are process totals zeroed by every restart. budgetdrop rows are NOT sample and are in no other count here. wholeDrops > 0 is not by itself a starvation: several books of a class can scan one underlying in a slot and the repeat pass legitimately banks 0 — per-symbol coverage is read off the raw ?rows= pull, as (slot, underlying) with a shed row and no candidate rows. kind:ranked is deduped per (etDay, slot, accountClass, occSymbol) from 2026-09-25 (earlier days hold the un-deduped multiset, 4.3x-11.6x); kind:ordered stays unconditional as execution provenance. An evidence archive has no backfill: the tape starts at the deploy that armed it. durability.appendErrors > 0 means rows were counted in memory that never reached disk — treat the on-disk export as an undercount, not the counters as an overcount.`,
       });
     } catch (err: unknown) {
@@ -9267,8 +9718,21 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // was in fact writing rows — an arm indicator that disagrees with the
     // recorder it describes is worse than no indicator, because it is the field
     // an operator checks to confirm the arming step worked.
-    const dir = process.env.DATA_DIR;
-    const flagEnv = dir ? resolveDemoFlagEnv(dir) : process.env;
+    //
+    // TRA-5030 — through `resolveDemoFlagEnvFromEnv` rather than the inline
+    // `dir ? resolveDemoFlagEnv(dir) : process.env` idiom TRA-4893 shipped. That
+    // idiom tests TRUTHINESS, and a blank-but-present `DATA_DIR` (`' '`) is truthy,
+    // so it resolved the overlay against a directory literally named `" "`. The
+    // helper trims, which makes blank behave as unset; it owns the three-state
+    // decision and carries the reasoning. Not `resolveDataDir()` (what
+    // `check:data-dir` prescribes generically): that would consult
+    // `<bundle>/data/demo-flags.json` when `DATA_DIR` is unset, which the engine
+    // never does — re-opening the route-vs-recorder disagreement above, inverted.
+    //
+    // ⚠️ The 11 sibling reads in this file still carry the naked idiom, so do NOT
+    // "match the neighbours" here — they are the backlog, not the pattern. TRA-5037
+    // carries them, the recorder included, with the per-site classification.
+    const flagEnv = resolveDemoFlagEnvFromEnv();
     const enabled = isOptionRealFillShadowEnabled(flagEnv);
 
     res.json({
@@ -9904,6 +10368,10 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // to run on a live money-adjacent host mid-session.
   app.get('/api/health/heap-census', (req, res) => {
     const deep = req.query.deep === '1' || req.query.deep === 'true';
+    // TRA-4986 (AC4) — `?sizing=true` additionally measures the retained bytes
+    // of the hoisted candle store and prices the hoist. Opt-in because it
+    // allocates ~10-15 MB transiently; off by default and never sampled.
+    const sizing = req.query.sizing === '1' || req.query.sizing === 'true';
     const mem = process.memoryUsage();
     res.json({
       ok: true,
@@ -9916,7 +10384,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         externalMB: Math.round((mem.external / 1048576) * 10) / 10,
         arrayBuffersMB: Math.round((mem.arrayBuffers / 1048576) * 10) / 10,
       },
-      census: getHeapCensusStatus({ deep }),
+      census: getHeapCensusStatus({ deep, sizing }),
     });
   });
 

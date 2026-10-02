@@ -848,6 +848,13 @@ async function createUserContext(username: string): Promise<UserContext> {
         // refused on bar t be refused again inside its 5-bar window, double-
         // counting the same setup in whatever cohort did survive.
         sma200GateRejections: stocksSnap.sma200GateRejections ?? [],
+        // TRA-4922 (AC-e) — and the ledger's integrity witness. Dropping it here
+        // is the same silent loss the line above was filed for, one field over:
+        // a reset recorded before a redeploy would read back as `resets: 0`, so
+        // the post-restart fleet fold would call a genuinely SHRUNK AC7 n
+        // monotonic. Absent on pre-TRA-4922 snapshots; left undefined so the
+        // engine's restore zeroes it rather than this literal inventing a value.
+        sma200RejectionLedgerMeta: stocksSnap.sma200RejectionLedgerMeta,
         dailySignals: stocksSnap.dailySignals ?? [],
         positionSignalType: stocksSnap.positionSignalType ?? [],
         // TRA-2629 — routed through the single durability seam in `trade-store`.
@@ -1026,6 +1033,9 @@ export async function persistStocksNow(ctx: UserContext): Promise<void> {
       // refused nothing". Graded by `tra4411-rejection-ledger-durability.test.ts`
       // against the WRITTEN object, not against `exportTradeSnapshot()`.
       sma200GateRejections: snap.sma200GateRejections,
+      // TRA-4922 (AC-e) — the ledger's integrity witness reaches disk through
+      // THIS literal and no other, exactly like the ring above.
+      sma200RejectionLedgerMeta: snap.sma200RejectionLedgerMeta,
       dailySignals: snap.dailySignals,
       positionSignalType: snap.positionSignalType,
       options: snap.options,

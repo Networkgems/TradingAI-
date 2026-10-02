@@ -18,6 +18,10 @@ import {
   IV_RANK_COVERAGE_CODES,
   type IvSample,
 } from './iv-rank-store.js';
+import {
+  IV_PERCENTILE_COVERAGE_CODES,
+  classifyIvPercentileCoverage,
+} from './iv-percentile-coverage.js';
 
 const DAY = 86_400_000;
 function samples(ivs: number[], startMs: number): IvSample[] {
@@ -255,5 +259,40 @@ describe('readIvRankCoverageSync (TRA-4917) — the five null branches are separ
     // Five distinct codes — if any two branches collapsed, this set would shrink.
     expect(emitted.size).toBe(5);
     for (const code of emitted) expect(IV_RANK_COVERAGE_CODES).toContain(code);
+  });
+
+  it('carries every IV_PERCENTILE_COVERAGE_CODES name verbatim — the two lists cannot drift', () => {
+    // TRA-4917 asked for the TRA-4644 vocabulary to be reused rather than a fifth
+    // one minted, and `0fb62e3e` recorded that the constant "does not exist on
+    // origin/main". It did — `215fd4db` added it 2026-09-17, eight days earlier;
+    // the clearing grep ran against a stale ref in a checkout 285 commits behind.
+    // This set relation is what that grep was supposed to establish, asserted
+    // mechanically so it stays true as either list changes.
+    for (const code of IV_PERCENTILE_COVERAGE_CODES) {
+      expect(IV_RANK_COVERAGE_CODES).toContain(code);
+    }
+  });
+
+  it('is a strict REFINEMENT of the percentile vocabulary — `uncovered` is narrower here', () => {
+    // The names overlap but two of them do NOT mean the same thing, so the two
+    // surfaces' per-code counts must never be pooled:
+    //
+    //   percentile `uncovered` = store unloaded OR symbol never recorded
+    //   rank       `uncovered` = store LOADED, symbol has zero usable samples
+    //
+    // An unloaded store is a process-wide fault with a different owner than a
+    // per-symbol gap, which is the exact distinction the 164/164 incident lacked.
+    expect(isIvRankStoreLoaded()).toBe(false);
+    expect(readIvRankCoverageSync('AAA', 0.3, asOf).coverage).toBe('store_unloaded');
+    // `classifyIvPercentileCoverage` cannot express that: with no store it sees
+    // sampleDepth 0 and answers `uncovered`, pooling the two.
+    expect(classifyIvPercentileCoverage(0.3, null, 0)).toBe('uncovered');
+
+    // And the codes this vocabulary adds are genuinely absent from the other one,
+    // i.e. the refinement is real rather than a rename.
+    for (const extra of ['store_unloaded', 'flat_window', 'not_evaluated'] as const) {
+      expect(IV_RANK_COVERAGE_CODES).toContain(extra);
+      expect(IV_PERCENTILE_COVERAGE_CODES as readonly string[]).not.toContain(extra);
+    }
   });
 });

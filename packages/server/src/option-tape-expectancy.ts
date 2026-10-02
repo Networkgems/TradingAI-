@@ -427,6 +427,22 @@ export interface TapeExpectancyCell {
    * must not read like a measured empty one.
    */
   realFillUnavailableReason: string | null;
+  /**
+   * TRA-5040 — what {@link nRealFill} WOULD read if this arm resolved its exit
+   * book the way `crossedPnlUsd` already does: fire-tick quote first, then
+   * TRA-4997's close-seam `exitQuote`. `nRealFill + realFillSeamRecovered`.
+   *
+   * ⛔ **DECIDES NOTHING.** `admits` / `admitsRealFill` read {@link nRealFill},
+   * and this ticket does not move them — the arm gates live capital, so the
+   * recovery is published to be ruled on, not applied because it was available.
+   * ⛔ Equal to `nRealFill` is NOT "no gap": on a cell whose misses are all
+   * `not_broker_fill` there was never a quote question to answer.
+   */
+  nRealFillSeamShadow: number;
+  /** TRA-5040 — the rows behind the shadow: dropped `exit_quote_missing`, priceable off the close-seam stamp. */
+  realFillSeamRecovered: number;
+  /** TRA-5040 — dropped `exit_quote_missing` WITH a close-seam stamp too old to price (`> EXIT_QUOTE_MAX_AGE_MS`). */
+  realFillSeamStale: number;
   /** TRA-4578 — who is in this cell. Decides nothing; see the interface doc. */
   provenance: TapeExpectancyCellProvenance;
   /**
@@ -543,6 +559,19 @@ interface CellAccumulator {
   realFillValues: number[];
   /** TRA-4894 — why each non-real-fill row dropped out. Sums to `n − nRealFill`. */
   realFillDrops: Partial<Record<RealFillUnpricedReason, number>>;
+  /**
+   * TRA-5040 — rows that dropped on `exit_quote_missing` and WOULD have priced
+   * off TRA-4997's close-seam `exitQuote`. Shadow only: never pushed into
+   * {@link realFillValues} and never read by `admitsRealFill`.
+   */
+  realFillSeamRecovered: number;
+  /**
+   * TRA-5040 — rows that dropped on `exit_quote_missing` and carry a close-seam
+   * `exitQuote` too OLD to price (`ageMs > EXIT_QUOTE_MAX_AGE_MS`). Counted apart
+   * from {@link realFillSeamRecovered} because "a book we will not trust" and "no
+   * book at all" are different findings about the close path.
+   */
+  realFillSeamStale: number;
 }
 
 /** Mean / sample-SD / SE / lower 95% bound over one value list. Shared by both columns. */
@@ -673,6 +702,8 @@ export function buildTapeExpectancyTable(
               // Its visibility is `droppedUnpriced`, one field up.
               realFillValues: [],
               realFillDrops: {},
+              realFillSeamRecovered: 0, // TRA-5040
+              realFillSeamStale: 0,
             };
             cells.set(key, cell);
           }
@@ -720,6 +751,8 @@ export function buildTapeExpectancyTable(
         droppedUnpriced: 0, // TRA-4857
         realFillValues: [],
         realFillDrops: {},
+        realFillSeamRecovered: 0, // TRA-5040
+        realFillSeamStale: 0,
       };
       cells.set(key, cell);
     }
@@ -736,6 +769,21 @@ export function buildTapeExpectancyTable(
       // is named rather than silently pooled with the priced rows.
       const why = realFill.unpriced ?? 'realized_pnl_missing';
       cell.realFillDrops[why] = (cell.realFillDrops[why] ?? 0) + 1;
+      // TRA-5040 — SHADOW, and only for the one reason the fallback can answer.
+      // Re-priced here rather than beside the census because only this loop holds
+      // the row; the result is counted and then thrown away — it is never pushed
+      // into `realFillValues`, so `nRealFill`, `loRealFillNet` and
+      // `admitsRealFill` are bit-for-bit what they were before this ticket.
+      if (why === 'exit_quote_missing') {
+        const shadow = priceRealFillRow(r as Parameters<typeof priceRealFillRow>[0], {
+          seamQuoteFallback: true,
+        });
+        if (shadow.rFillNet !== null && Number.isFinite(shadow.rFillNet)) {
+          cell.realFillSeamRecovered += 1;
+        } else if (shadow.unpriced === 'exit_quote_stale') {
+          cell.realFillSeamStale += 1;
+        }
+      }
     }
     // TRA-4578 — census the row that actually LANDED in the cell. It is counted
     // here, after all four drop predicates and the window cutoff, and not in the
@@ -800,10 +848,15 @@ export function buildTapeExpectancyTable(
         .sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]))
         .map(([why, count]) => `${why}=${count}`)
         .join(', ');
+      // TRA-5040 — the shadow, appended to the SAME published string rather than
+      // left to a field a projection might not carry. `+0` is printed, not
+      // omitted: a cell whose misses are all `not_broker_fill` has a measured
+      // zero recovery, and that is the finding, not an absence.
+      const seamShadow = ` · TRA-5040 seam-quote shadow: +${acc.realFillSeamRecovered} recoverable (${acc.realFillSeamStale} stale) ⇒ nRealFill would read ${nRealFill + acc.realFillSeamRecovered}; NOT counted in the decision`;
       const realFillUnavailableReason = admitsRealFill
         ? null
         : nRealFill < minCellRealFillN
-          ? `nRealFill=${nRealFill} of n=${n} carries broker truth on BOTH legs (< ${minCellRealFillN} required) — dropped: ${dropCensus || 'none'}`
+          ? `nRealFill=${nRealFill} of n=${n} carries broker truth on BOTH legs (< ${minCellRealFillN} required) — dropped: ${dropCensus || 'none'}${seamShadow}`
           : rf.lo === null || need === null
             ? `nRealFill=${nRealFill} but no dispersion estimate exists for the real-fill subset — no bound, so no promotion`
             : `real-fill bound ${rf.lo.toFixed(4)}R < ${need.toFixed(4)}R (bar ${barR.toFixed(4)} + boundNoise ${(rf.boundNoiseR as number).toFixed(4)}) over nRealFill=${nRealFill}`;
@@ -833,6 +886,12 @@ export function buildTapeExpectancyTable(
         loRealFillNet: rf.lo,
         boundNoiseR: rf.boundNoiseR,
         realFillUnavailableReason,
+        // TRA-5040 — SHADOW trio. `nRealFillSeamShadow` is what `nRealFill` WOULD
+        // read if the arm resolved its exit book the way `crossedPnlUsd` already
+        // does. Nothing above this line reads any of the three.
+        nRealFillSeamShadow: nRealFill + acc.realFillSeamRecovered,
+        realFillSeamRecovered: acc.realFillSeamRecovered,
+        realFillSeamStale: acc.realFillSeamStale,
         provenance: {
           byMode: { ...acc.byMode },
           byAccountClass: { desk: acc.desk, unattributed: acc.unattributed },

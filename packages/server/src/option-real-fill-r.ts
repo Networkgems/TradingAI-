@@ -49,13 +49,27 @@
  * exact defect this ticket exists to close, while reading green. Same discipline
  * as TRA-4578's `netOfModelledCross` and TRA-4674's `crossedUnpriced`.
  *
+ * ── TRA-5040: this arm reads ONE field fewer than its sibling ──────────────
+ *
+ * `crossedPnlUsd` resolves its exit book as `markProvenance.quoteAtFire` and
+ * then TRA-4997's close-seam `exitQuote`; this module read only the first, so 15
+ * of the 20 broker-truth rows on the live tape dropped `exit_quote_missing`
+ * (measured 2026-10-02T03:29Z on `6690770689b5`) — inside the one gate standing
+ * between the OTM sleeve and a live entry. The fallback is implemented here as an
+ * OPT-IN ({@link RealFillPricingOpts.seamQuoteFallback}, default off) and the
+ * fold publishes what it recovers as a SHADOW beside `nRealFill`: the deciding
+ * number does not move until the board rules on the shadow.
+ *
  * PURE — no env, no I/O, no clock. Structural row type (the `CrossedPricingRow`
  * pattern) so this module has no import back into `option-trade-journal.ts`.
  */
 
+import type { OptionExitQuote } from '@trading-app/shared';
+
 import {
   CROSSED_LONG_PREMIUM_STRUCTURES,
   CROSSED_SHORT_PREMIUM_STRUCTURES,
+  resolveCrossedExitQuote,
 } from './option-crossed-pnl.js';
 
 /**
@@ -78,7 +92,14 @@ import { GATE_R_PER_PREMIUM_R } from './option-trade-journal.js';
  *     the package, and a wrong-sign charge is worse than none.
  *   • `contracts_unknown`       — pre-TRA-1656 row with no contract count.
  *   • `exit_quote_missing`      — no `markProvenance.quoteAtFire` (closed before
- *     TRA-4055, or by a path that never evaluated a mark).
+ *     TRA-4055, or by a path that never evaluated a mark) and — when the
+ *     TRA-5040 fallback is enabled — no TRA-4997 close-seam `exitQuote` either.
+ *   • `exit_quote_stale`        — TRA-5040: a close-seam `exitQuote` exists but
+ *     its `ageMs` exceeds `EXIT_QUOTE_MAX_AGE_MS`. Held apart from
+ *     `exit_quote_missing` for the reason TRA-4997 gives: "we have a book and it
+ *     is too old to price against" and "we never had a book" license different
+ *     conclusions, and collapsing them makes a coverage gap read as a feed
+ *     outage. ⛔ Only reachable with the fallback enabled.
  *   • `exit_quote_unusable`     — a quote was stamped but the side this
  *     structure transacts on is not a positive finite number.
  */
@@ -90,6 +111,7 @@ export type RealFillUnpricedReason =
   | 'structure_not_crossable'
   | 'contracts_unknown'
   | 'exit_quote_missing'
+  | 'exit_quote_stale'
   | 'exit_quote_unusable';
 
 /** The structural slice of a journal record this module reads. */
@@ -103,6 +125,33 @@ export interface RealFillPricingRow {
   entryFillPremium?: number;
   exitFillPremium?: number;
   markProvenance?: { quoteAtFire: { bid: number; ask: number } | null } | null;
+  /**
+   * TRA-4997's close-seam exit book — stamped synchronously in
+   * `queueJournalClose`, the one seam EVERY close path funnels through, where
+   * `markProvenance` is stamped only at the exit cascade's fire site.
+   *
+   * ⛔ Read ONLY when {@link RealFillPricingOpts.seamQuoteFallback} is set, and
+   * then strictly after `markProvenance.quoteAtFire` — see
+   * {@link priceRealFillRow}. With the flag off this field is not read at all and
+   * the shipped census is byte-identical to pre-TRA-5040.
+   */
+  exitQuote?: OptionExitQuote | null;
+}
+
+/** TRA-5040 — opt-ins for {@link priceRealFillRow}. Default: everything off. */
+export interface RealFillPricingOpts {
+  /**
+   * Fall back to TRA-4997's close-seam `exitQuote` when the row carries no
+   * `markProvenance.quoteAtFire`.
+   *
+   * ⛔ **Default FALSE, and the live gate does not set it.** The real-fill arm is
+   * a conjunct of a live-capital promotion gate (`nRealFill >= 40`), so widening
+   * the population it counts can only move that count toward its floor. The flag
+   * exists so the recovery can be MEASURED as a shadow beside the deciding
+   * number and put to the board with that number attached, rather than flipped
+   * because the data happened to be sitting there (TRA-5040 AC4).
+   */
+  seamQuoteFallback?: boolean;
 }
 
 /** One row's real-fill pricing. `rFillNet` is null iff `unpriced` is non-null. */
@@ -119,6 +168,16 @@ export interface RealFillRowPricing {
    */
   exitCrossUsd: number | null;
   unpriced: RealFillUnpricedReason | null;
+  /**
+   * TRA-5040 — WHICH exit book charged the cross, `null` when the row did not
+   * price. `fire_tick` is the only value reachable with the fallback off, so a
+   * `last_known` row is exactly a row this ticket recovered — which is what makes
+   * the shadow countable without re-running the fold a second way.
+   *
+   * Same discipline as `crossedExitQuoteSource`: a fallback ships its own
+   * counter, because the two provenances are indistinguishable in the price.
+   */
+  exitQuoteSource: 'fire_tick' | 'last_known' | null;
 }
 
 const usable = (v: unknown): v is number =>
@@ -129,6 +188,7 @@ const unpriced = (reason: RealFillUnpricedReason): RealFillRowPricing => ({
   netPnlUsd: null,
   exitCrossUsd: null,
   unpriced: reason,
+  exitQuoteSource: null,
 });
 
 /**
@@ -141,7 +201,10 @@ const unpriced = (reason: RealFillUnpricedReason): RealFillRowPricing => ({
  * reader folds off these reasons has to say "we never measured on fills" louder
  * than it says "one quote was missing".
  */
-export function priceRealFillRow(row: RealFillPricingRow): RealFillRowPricing {
+export function priceRealFillRow(
+  row: RealFillPricingRow,
+  opts: RealFillPricingOpts = {},
+): RealFillRowPricing {
   if (row.pnlBasis !== 'broker-fill') return unpriced('not_broker_fill');
   if (!usable(row.entryFillPremium)) return unpriced('entry_fill_missing');
   if (!usable(row.exitFillPremium)) return unpriced('exit_fill_missing');
@@ -155,8 +218,27 @@ export function priceRealFillRow(row: RealFillPricingRow): RealFillRowPricing {
   const contracts = row.contracts;
   if (!usable(contracts)) return unpriced('contracts_unknown');
 
-  const quote = row.markProvenance?.quoteAtFire ?? null;
-  if (quote === null || quote === undefined) return unpriced('exit_quote_missing');
+  // TRA-5040 — the fire-tick quote first, ALWAYS. With `seamQuoteFallback` off
+  // this is the whole resolution and the refusal is the pre-TRA-5040 one; with it
+  // on, `resolveCrossedExitQuote` applies TRA-4997's precedence and staleness
+  // rule — the same function `crossedPnlUsd` prices on, not a second copy of it.
+  const fireQuote = row.markProvenance?.quoteAtFire ?? null;
+  let quote: { bid: number; ask: number } | null =
+    fireQuote === undefined ? null : fireQuote;
+  let exitQuoteSource: 'fire_tick' | 'last_known' = 'fire_tick';
+  if (quote === null) {
+    if (!opts.seamQuoteFallback) return unpriced('exit_quote_missing');
+    const resolved = resolveCrossedExitQuote(row);
+    if (resolved.quote === null) {
+      // Only these two of the crossed reasons are reachable here: everything
+      // upstream of the exit book was already decided above.
+      return unpriced(
+        resolved.reason === 'exit_quote_stale' ? 'exit_quote_stale' : 'exit_quote_missing',
+      );
+    }
+    quote = resolved.quote;
+    exitQuoteSource = resolved.source ?? 'last_known';
+  }
   // Long premium sells the exit BID; short premium buys back the exit ASK.
   const exitSide = long ? quote.bid : quote.ask;
   if (!usable(exitSide)) return unpriced('exit_quote_unusable');
@@ -174,5 +256,6 @@ export function priceRealFillRow(row: RealFillPricingRow): RealFillRowPricing {
     netPnlUsd,
     exitCrossUsd,
     unpriced: null,
+    exitQuoteSource,
   };
 }

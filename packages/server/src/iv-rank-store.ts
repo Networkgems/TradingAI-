@@ -334,6 +334,29 @@ export function atmIvFromRows(rows: readonly OptionChainRow[], spot: number): nu
 // existing `buildIvRankCoverage` idiom (options-forward-test.ts): it marks a row
 // whose producer supplied no classification at all, so an unclassified row can
 // never be silently folded into a real branch.
+//
+// ── Relationship to `IV_PERCENTILE_COVERAGE_CODES` (correction, 2026-10-02) ──
+// TRA-4917 asked for that 4-code vocabulary to be reused rather than a fifth one
+// minted. The commit that shipped this file (`0fb62e3e`) recorded that the
+// constant "does not exist on origin/main" — THAT WAS WRONG. `215fd4db`
+// (TRA-4644) added `iv-percentile-coverage.ts` on 2026-09-17, eight days EARLIER;
+// the grep that cleared it ran against a stale `origin/main` in a checkout 285
+// commits behind, which is the repo's own LOCAL-IS-A-FORK trap.
+//
+// The vocabularies are kept COMPATIBLE rather than merged, and the difference is
+// load-bearing, so do not pool the two surfaces' counts by code name:
+//
+//   * All four percentile codes appear here VERBATIM — asserted mechanically in
+//     `iv-rank-store.test.ts` so neither list can drift away from the other.
+//   * `uncovered` is NARROWER here. `classifyIvPercentileCoverage` pools "store
+//     unloaded" into `uncovered`; this classifier splits `store_unloaded` out,
+//     because a process-wide blind store and a per-symbol gap have different
+//     owners and the 164/164 incident was exactly a failure to tell branches
+//     apart. `flat_window` is likewise split out of `insufficient_history` —
+//     pooling it tells a reader "warm up and wait" about a window that will
+//     never rank.
+//   * So this set is a REFINEMENT: every code here maps up to exactly one
+//     percentile code, but not back down.
 
 /**
  * Closed vocabulary for "why is this IV-rank what it is". `covered` is the only

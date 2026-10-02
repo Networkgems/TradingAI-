@@ -475,5 +475,154 @@ describe('TRA-4745 — cost_bar explains its own block rate', () => {
     expect(sample.holds).toBeNull();
     expect(sample.outcomeConsistent).toBeNull();
     expect(sample.statement).toContain('NO COMPARISON');
+    // ⭐ TRA-4941 — and that silence is now a VALUE on the same object, so the
+    // comment above no longer has to be the only place it is written down.
+    expect(cb.rowsPredicateInconsistentState).toBe('unread_all_short_circuited');
+  });
+});
+
+// ⭐ TRA-4941 DEFECT 1 — `rowsPredicateInconsistent` is folded over COMPARED rows
+// only, so at `rowsCompared: 0` it is structurally pinned to `0` and renders a
+// clean all-clear over a population it could not look at. These assert the
+// readability STATE, which is the thing that can go red on that path.
+describe('TRA-4941 — rowsPredicateInconsistent publishes its own readability', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'live-enforce-4941-'));
+    clearLiveEnforceGateLedger();
+    hydrateLiveEnforceGateFromDisk(dir, 1_000);
+  });
+
+  afterEach(() => {
+    clearLiveEnforceGateLedger();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // ACCEPTANCE (defect 1, ask 3) — the 2026-09-25 live fixture: 1319 + 999 = 2318
+  // short-circuited rows across two cells, 100% `insufficient_real_fill_evidence`,
+  // ZERO compared. The detector saw none of its own population and read `0`.
+  it('THE FAIL STATE ON A REAL READ — the whole day short-circuited, 2318 rows', () => {
+    for (let i = 0; i < 1319; i += 1) {
+      shortCircuitRow({ cell: OTM_CELL, structure: 'single_leg_otm', costR: 0.2, ts: 2_000 + i });
+    }
+    for (let i = 0; i < 999; i += 1) {
+      shortCircuitRow({ cell: RV_CELL, structure: 'single_leg_rv', costR: 0.2, ts: 9_000 + i });
+    }
+    const cb = costBar();
+    expect(cb.rowsShortCircuited).toBe(2318);
+    expect(cb.rowsCompared).toBe(0);
+    // The zero the live route rendered on 2026-09-25...
+    expect(cb.rowsPredicateInconsistent).toBe(0);
+    // ...now arrives with the reason it is a zero.
+    expect(cb.rowsPredicateInconsistentState).toBe('unread_all_short_circuited');
+
+    // And per cell, with the denominator ADJACENT (ask 1) on the same object.
+    const otm = cb.byCell.find((c) => c.cell === OTM_CELL)!;
+    expect(otm.rowsShortCircuited).toBe(1319);
+    expect(otm.rowsPredicateInconsistentState).toBe('unread_all_short_circuited');
+    expect(cb.byCell.find((c) => c.cell === RV_CELL)!.rowsShortCircuited).toBe(999);
+
+    // ⭐ And DAY-SCOPED, which is how 09-25 was actually read. Before TRA-4941 the
+    // per-day cell row carried no coverage split at all, so a day-scoped reader
+    // had no denominator on the object in front of them.
+    const day = cb.byEtDay.find((d) => d.etDay === DAY)!;
+    const dayOtm = day.byCell.find((c) => c.cell === OTM_CELL)!;
+    expect(dayOtm.rowsShortCircuited).toBe(1319);
+    expect(dayOtm.rowsCompared).toBe(0);
+    expect(dayOtm.rowsPredicateInconsistent).toBe(0);
+    expect(dayOtm.rowsPredicateInconsistentState).toBe('unread_all_short_circuited');
+  });
+
+  // The negative control. A state that only ever reads `unread_*` is not an
+  // instrument either — it has to reach `checked` on a clean compared population.
+  it('CONTROL — a fully compared population reads `checked`, not an unread state', () => {
+    for (let i = 0; i < 4; i += 1) {
+      comparedRow({
+        cell: OTM_CELL,
+        structure: 'single_leg_otm',
+        grossR: 0.5,
+        costR: 0.2,
+        ts: 3_000 + i,
+      });
+    }
+    const cb = costBar();
+    expect(cb.rowsCompared).toBe(4);
+    expect(cb.rowsShortCircuited).toBe(0);
+    expect(cb.predicateUnstamped).toBe(0);
+    expect(cb.rowsPredicateInconsistent).toBe(0);
+    // THIS zero is a real all-clear, and says so.
+    expect(cb.rowsPredicateInconsistentState).toBe('checked');
+  });
+
+  // The third cell of the partition: compared rows present, but not ALL rows were
+  // compared. The `0` is an all-clear over `rowsCompared` only — never over the
+  // population — so it must not read `checked`.
+  it('a MIXED population reads `unread_partial` — the zero covers only rowsCompared', () => {
+    comparedRow({
+      cell: OTM_CELL,
+      structure: 'single_leg_otm',
+      grossR: 0.5,
+      costR: 0.2,
+      ts: 4_000,
+    });
+    shortCircuitRow({ cell: OTM_CELL, structure: 'single_leg_otm', costR: 0.2, ts: 4_001 });
+    const cb = costBar();
+    expect(cb.rowsCompared).toBe(1);
+    expect(cb.rowsShortCircuited).toBe(1);
+    expect(cb.rowsPredicateInconsistentState).toBe('unread_partial');
+  });
+
+  // ⛔ A population where nothing was compared and nothing short-circuited either
+  // must not read `checked` — a check that passes vacuously over zero compared
+  // rows is the vacuous-green shape, not an all-clear. It is also a DIFFERENT
+  // fact from "every row short-circuited" (the remedy is the stamp, not the
+  // precondition), so it gets its own state rather than being folded in.
+  it('an UNSTAMPED-only population reads `unread_none_compared`, never `checked`', () => {
+    // A row the fold records but whose predicate it refuses to read: counted as
+    // `predicateUnstamped`, so `rowsCompared` and `rowsShortCircuited` are BOTH 0.
+    recordLiveEnforceDecision(
+      'cost_bar', 'single_leg_rv', true, DAY, 'under bar', 6_000,
+      {
+        reasonCode: 'shortfall_gte_0.50',
+        cell: RV_CELL,
+        symbol: 'RIG',
+        grossR: 0.05,
+        cost: { costR: 0.16, spreadR: 0.13, feeR: 0.03, costFracOfPremium: 0.1 },
+        predicate: {
+          form: 'tape_expectancy_flat',
+          compared: true,
+          lhsLabel: LHS_LABEL,
+          lhs: 0.05,
+          op: '>=',
+          rhsLabel: RHS_LABEL,
+          rhs: null,
+          admit: false,
+          shortCircuit: null,
+        } as never,
+      },
+    );
+    const cb = costBar();
+    // The population is NOT empty — this is a real recorded row, which is what
+    // makes the assertion non-vacuous.
+    expect(cb.evaluated).toBe(1);
+    expect(cb.predicateUnstamped).toBe(1);
+    expect(cb.rowsCompared).toBe(0);
+    expect(cb.rowsShortCircuited).toBe(0);
+    expect(cb.rowsPredicateInconsistent).toBe(0);
+    expect(cb.rowsPredicateInconsistentState).toBe('unread_none_compared');
+  });
+
+  // Ask 1, as its own assertion: the denominator travels WITH the counter. A
+  // reader cannot receive the zero without receiving what it was computed over.
+  it('the denominator is ADJACENT on every object that publishes the counter', () => {
+    shortCircuitRow({ cell: OTM_CELL, structure: 'single_leg_otm', costR: 0.2, ts: 5_000 });
+    const cb = costBar();
+    for (const o of [cb, ...cb.byCell, ...cb.byEtDay.flatMap((d) => d.byCell)]) {
+      expect(o).toHaveProperty('rowsShortCircuited');
+      expect(o).toHaveProperty('rowsCompared');
+      expect(o).toHaveProperty('rowsPredicateInconsistent');
+      expect(o).toHaveProperty('rowsPredicateInconsistentState');
+    }
   });
 });

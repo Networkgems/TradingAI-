@@ -13,6 +13,8 @@ import {
   getUpcomingMacroEvents,
   initMacroStore,
   makeMacroClientFromEnv,
+  lastMacroRefreshAttempt,
+  noteMacroRefreshFailure,
   __resetMacroStoreForTests,
 } from './macro-store.js';
 
@@ -133,6 +135,75 @@ describe('macro-store', () => {
       __resetMacroStoreForTests(join(tmpRoot, 'economic-calendar.json'));
       await initMacroStore();
       expect(daysToNextFOMCSync(Date.parse('2026-09-09T12:00:00Z'))).toBe(7);
+    });
+  });
+
+  // ── TRA-4430 — the last REAL refresh attempt, for /api/health/catalyst-gate ──
+  // CLAUDE.md §1: the health field reports what the dependency DID, never our
+  // intent; absent evidence is its own named state; a suppression on our side and
+  // a vendor failure are different codes.
+  describe('lastMacroRefreshAttempt — outcome of the last real attempt', () => {
+    const seedAsOf = Date.parse('2026-09-01T12:00:00Z');
+
+    it('reads never_attempted_this_boot before any refresh — not a pass, and not a failure', () => {
+      const a = lastMacroRefreshAttempt();
+      expect(a.outcome).toBe('never_attempted_this_boot');
+      expect(a.attemptedAt).toBeNull();
+      expect(a.stored).toBeNull();
+      expect(a.failureSide).toBeNull();
+    });
+
+    it('a keyless refresh records ok_fomc_only with a timestamp and the rows it seeded', async () => {
+      await refreshMacroCalendar(null, { asOf: seedAsOf });
+      const a = lastMacroRefreshAttempt();
+      expect(a.outcome).toBe('ok_fomc_only');
+      expect(a.attemptedAt).not.toBeNull();
+      expect(Number.isFinite(Date.parse(a.attemptedAt as string))).toBe(true);
+      expect(a.fomc).toBeGreaterThan(0);
+      expect(a.stored).toBe(a.fomc);
+      // No vendor call was made on this path, so a 0 would be a fabricated
+      // attribution: the field is null, and `mode`/`outcome` says why.
+      expect(a.fredReleasesFailed).toBeNull();
+      expect(a.failureSide).toBeNull();
+    });
+
+    it('a keyed refresh records ok_full and counts vendor-side per-release failures', async () => {
+      const client = new EconomicCalendarClient('test-key');
+      vi.spyOn(client, 'getUpcomingEvents').mockImplementation(async (_opts, onError) => {
+        onError?.(10, new Error('FRED 429'));
+        onError?.(50, new Error('FRED 429'));
+        return [ev('FOMC', '2026-09-16')];
+      });
+      const res = await refreshMacroCalendar(client);
+      expect(res.mode).toBe('full');
+      expect(res.fredReleasesFailed).toBe(2);
+
+      const a = lastMacroRefreshAttempt();
+      expect(a.outcome).toBe('ok_full');
+      expect(a.fredReleasesFailed).toBe(2); // they refused, not us
+      expect(a.failureSide).toBeNull();
+    });
+
+    it('attributes a failure to the right side of the wire, and never rolls the two together', () => {
+      noteMacroRefreshFailure('ENOSPC writing economic-calendar.json', 'local');
+      let a = lastMacroRefreshAttempt();
+      expect(a.outcome).toBe('failed');
+      expect(a.failureSide).toBe('local');
+      expect(a.reason).toContain('ENOSPC');
+
+      noteMacroRefreshFailure('fetch failed', 'unattributed');
+      a = lastMacroRefreshAttempt();
+      expect(a.failureSide).toBe('unattributed');
+      // A failed attempt must not publish stale row counts from an older success.
+      expect(a.stored).toBeNull();
+      expect(a.fomc).toBeNull();
+    });
+
+    it('a successful refresh clears a prior failure (the LAST attempt is what is reported)', async () => {
+      noteMacroRefreshFailure('fetch failed', 'unattributed');
+      await refreshMacroCalendar(null, { asOf: seedAsOf });
+      expect(lastMacroRefreshAttempt().outcome).toBe('ok_fomc_only');
+      expect(lastMacroRefreshAttempt().reason).toBeNull();
     });
   });
 });

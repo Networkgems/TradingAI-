@@ -48,10 +48,15 @@ import {
 } from './option-net-edge-bar.js';
 import {
   impliedBarR,
+  impliedBarRScopeCheck,
   predicateHolds,
   predicateOutcomeConsistent,
 } from './live-enforce-gate-predicate.js';
-import type { ImpliedBarR, LiveEnforceGatePredicate } from './live-enforce-gate-predicate.js';
+import type {
+  ImpliedBarR,
+  ImpliedBarRScopeCheck,
+  LiveEnforceGatePredicate,
+} from './live-enforce-gate-predicate.js';
 // TRA-4753 — the NUMERATOR's provenance: the counterpart of `impliedBarR`, which
 // recovered the denominator.
 import { foldGrossRProvenance } from './live-enforce-gate-gross-provenance.js';
@@ -1596,8 +1601,18 @@ export interface LiveEnforceCellSummary {
    * witness an inconsistency but never bound it. `0` against a nonzero
    * `rowsCompared` is a real all-clear for this cell; `0` against
    * `rowsCompared: 0` is silence.
+   *
+   * ⛔ TRA-4941 — that last sentence used to live ONLY in this docblock, which is
+   * not a place a reader of the payload looks. Read
+   * {@link rowsPredicateInconsistentState} instead: the silence is now a value.
    */
   rowsPredicateInconsistent: number;
+  /**
+   * ⭐ TRA-4941 — whether the counter above was READABLE at all, computed here
+   * rather than left to the reader. `unread_all_short_circuited` ⇒ the `0` above
+   * means "not looked at", never "nothing found".
+   */
+  rowsPredicateInconsistentState: RowsPredicateInconsistentState;
 }
 
 /**
@@ -1951,8 +1966,34 @@ export interface LiveEnforceDayCellSummary {
    * measured against, recovered by inverting `reasonCode` over the recorded
    * `grossR`. Read `consistent` first: `false` means the bar moved INSIDE the
    * day. Null when no row in the group constrained the bar at all.
+   *
+   * ⛔ TRA-4941 — `consistent` is THREE-VALUED and `null` is NOT a weak `true`.
+   * A day-scoped group is far more likely than the pooled fold to hold only one
+   * side of the comparison, which is exactly how 2026-09-25 / `0.30-0.40` came to
+   * conclude the published bar was refuted off 111 admitted-only rows. Read
+   * {@link barRImpliedScopeCheck} beside it before quoting a day-scoped verdict.
    */
   barRImplied: ImpliedBarR | null;
+  /**
+   * ⭐ TRA-4941 — this day's verdict for this cell HELD AGAINST the whole-window
+   * verdict for the same cell, in-band. Null ⇔ `barRImplied` is null.
+   *
+   * The wider scope wins on the merits (`authoritativeScope: 'window'`), but the
+   * disagreement is itself the finding and is not resolved silently.
+   */
+  barRImpliedScopeCheck: ImpliedBarRScopeCheck | null;
+  /**
+   * ⭐ TRA-4941 — THIS DAY's predicate coverage split, so a day-scoped reader gets
+   * the denominator on the same object as the counter. Previously only the pooled
+   * `byGate[].byCell[]` row carried these, so reading one day meant either a join
+   * or a zero with no denominator at all.
+   */
+  rowsCompared: number;
+  rowsShortCircuited: number;
+  predicateUnstamped: number;
+  rowsPredicateInconsistent: number;
+  /** TRA-4941 — the readability of this day's `rowsPredicateInconsistent`. */
+  rowsPredicateInconsistentState: RowsPredicateInconsistentState;
 }
 
 /**
@@ -2186,8 +2227,16 @@ export interface LiveEnforceGateSummary {
    * Read it as a FRACTION of `rowsCompared`. Nonzero ⇒ a non-cost refusal is
    * being stamped `cost_bar` and the remedy is in the gate's attribution, not
    * the bar and not the edge estimator.
+   *
+   * ⛔ TRA-4941 — read {@link rowsPredicateInconsistentState} FIRST. This counter
+   * is folded over compared rows only, so at `rowsCompared: 0` it cannot go red.
    */
   rowsPredicateInconsistent: number | null;
+  /**
+   * ⭐ TRA-4941 — the readability of the counter above, as a value. Null on every
+   * gate that is not `cost_bar` (same contract as the counters themselves).
+   */
+  rowsPredicateInconsistentState: RowsPredicateInconsistentState | null;
   /**
    * ⭐ TRA-4753 — the NUMERATOR's provenance over the WHOLE gate: which estimator
    * folds decided, how many rows each was replayed across, and the tape age
@@ -2491,6 +2540,7 @@ function predicateCoverage(samples: CostSample[]): {
   rowsShortCircuited: number;
   predicateUnstamped: number;
   rowsPredicateInconsistent: number;
+  rowsPredicateInconsistentState: RowsPredicateInconsistentState;
 } {
   let rowsCompared = 0;
   let rowsShortCircuited = 0;
@@ -2505,7 +2555,56 @@ function predicateCoverage(samples: CostSample[]): {
       }
     } else rowsShortCircuited += 1;
   }
-  return { rowsCompared, rowsShortCircuited, predicateUnstamped, rowsPredicateInconsistent };
+  return {
+    rowsCompared,
+    rowsShortCircuited,
+    predicateUnstamped,
+    rowsPredicateInconsistent,
+    rowsPredicateInconsistentState: rowsPredicateInconsistentState(
+      rowsCompared,
+      rowsShortCircuited,
+      predicateUnstamped,
+    ),
+  };
+}
+
+/**
+ * ⭐ TRA-4941 — whether `rowsPredicateInconsistent` was READABLE, as a value.
+ *
+ * The counter is computed over COMPARED rows only; a short-circuited row carries
+ * `compared: false` / `outcomeConsistent: null` and is excluded. So at
+ * `rowsCompared: 0` the counter is structurally pinned to `0` and renders a clean
+ * all-clear over a population it could not look at. Measured live 2026-09-27 over
+ * 2026-09-25: `rowsShortCircuited` 1319 + 999 = 2318 = the ENTIRE day (100%
+ * `insufficient_real_fill_evidence`), `rowsPredicateInconsistent: 0`.
+ *
+ * ⛔ Same rule TRA-3694 applied to `ratifiedMatchesLive`, one instrument over: an
+ * unreadable check must never render `0` with no qualifier.
+ *
+ * • `checked` — `rowsCompared > 0` and NOTHING was excluded. The zero is real.
+ * • `unread_partial` — `rowsCompared > 0`, but short-circuited and/or unstamped
+ *   rows were excluded. The zero is an all-clear over `rowsCompared` ONLY.
+ * • `unread_all_short_circuited` — `rowsCompared === 0` with short-circuited rows
+ *   present. The incident shape: the detector saw none of its population.
+ * • `unread_none_compared` — `rowsCompared === 0` and nothing was short-circuited
+ *   either: an EMPTY population, or unstamped rows only. A separate state because
+ *   a check that passes vacuously over zero rows must not read as `checked`.
+ */
+export type RowsPredicateInconsistentState =
+  | 'checked'
+  | 'unread_partial'
+  | 'unread_all_short_circuited'
+  | 'unread_none_compared';
+
+function rowsPredicateInconsistentState(
+  rowsCompared: number,
+  rowsShortCircuited: number,
+  predicateUnstamped: number,
+): RowsPredicateInconsistentState {
+  if (rowsCompared > 0) {
+    return rowsShortCircuited > 0 || predicateUnstamped > 0 ? 'unread_partial' : 'checked';
+  }
+  return rowsShortCircuited > 0 ? 'unread_all_short_circuited' : 'unread_none_compared';
 }
 
 /** Options for the counterfactual sweep — resolved config, never literals. */
@@ -2629,6 +2728,12 @@ function foldGateDay(
   // reader to join a scalar onto a 30-day fold. Null when the caller has no
   // resolved bar; the recovery still runs, it just reports no verdict.
   flatFormBarR: number | null = null,
+  // ⭐ TRA-4941 — the WHOLE-WINDOW `barRImplied` per cell for this same gate, so
+  // each day row can publish the day-vs-window disagreement in-band. The caller
+  // builds it from the pooled `byCell` it has already folded; recomputing it here
+  // is how the two copies start disagreeing. Empty map ⇒ every day row reports
+  // `disagrees: null` (not comparable), never `false`.
+  windowBarRImpliedByCell: ReadonlyMap<string, ImpliedBarR | null> = new Map(),
 ): LiveEnforceGateDaySummary {
   const t = tallies ?? emptyTallies();
 
@@ -2702,13 +2807,37 @@ function foldGateDay(
     cellEvaluated += c.evaluated;
     cellBlocked += c.blocked;
     const cellDaySamples = daySamplesByCell.get(cell) ?? [];
+    // TRA-4941 — folded ONCE and read twice (published, and compared against the
+    // window verdict). Two computations of one verdict is how a hoisted copy
+    // starts disagreeing with the nested one — same reason as `cellProvenance`.
+    const dayBarRImplied = impliedBarR(cellDaySamples, flatFormBarR);
+    // TRA-4941 — this day's own predicate coverage, so the day row carries the
+    // denominator the `rowsPredicateInconsistent` zero was computed over.
+    const dayCoverage = predicateCoverage(cellDaySamples);
     byCell.push({
       cell,
       evaluated: c.evaluated,
       blocked: c.blocked,
       blockRate: c.evaluated > 0 ? round(c.blocked / c.evaluated) : null,
       grossR: dayCellGrossR(cellDaySamples, Math.max(0, c.evaluated - cellDaySamples.length)),
-      barRImplied: impliedBarR(cellDaySamples, flatFormBarR),
+      barRImplied: dayBarRImplied,
+      // ⭐ TRA-4941 — `has(cell)` NOT `get(cell) ?? null`: a window row that exists
+      // and recovered nothing (`barRImplied: null`) is a different fact from no
+      // window row at all, and collapsing them would let an absent scope read as
+      // agreement. Both land on `disagrees: null` today, but the distinction is
+      // the one the next reader of this field will need.
+      barRImpliedScopeCheck:
+        dayBarRImplied === null
+          ? null
+          : impliedBarRScopeCheck(
+              dayBarRImplied,
+              windowBarRImpliedByCell.get(cell) ?? null,
+            ),
+      rowsCompared: dayCoverage.rowsCompared,
+      rowsShortCircuited: dayCoverage.rowsShortCircuited,
+      predicateUnstamped: dayCoverage.predicateUnstamped,
+      rowsPredicateInconsistent: dayCoverage.rowsPredicateInconsistent,
+      rowsPredicateInconsistentState: dayCoverage.rowsPredicateInconsistentState,
     });
   }
   byCell.sort((a, b) => b.evaluated - a.evaluated || a.cell.localeCompare(b.cell));
@@ -2877,6 +3006,8 @@ function foldGates(
         rowsCompared: coverage.rowsCompared,
         rowsShortCircuited: coverage.rowsShortCircuited,
         rowsPredicateInconsistent: coverage.rowsPredicateInconsistent,
+        // TRA-4941 — the counter's own readability, beside the counter.
+        rowsPredicateInconsistentState: coverage.rowsPredicateInconsistentState,
       });
     }
     byCell.sort((a, b) => b.evaluated - a.evaluated || a.cell.localeCompare(b.cell));
@@ -2945,6 +3076,13 @@ function foldGates(
     // TRA-4745 — the gate-wide predicate coverage split, over the same sample
     // list the quantiles are folded from.
     const gatePredicateCoverage = predicateCoverage(tallies.costSamples);
+    // ⭐ TRA-4941 — the pooled per-cell bar recovery, keyed for the per-day fold
+    // below. Read off the `byCell` rows already built rather than re-folded, so
+    // the day row's `windowConsistent` is BY CONSTRUCTION the same value this
+    // payload publishes at `byCell[].barRImplied.consistent`.
+    const windowBarRImpliedByCell = new Map<string, ImpliedBarR | null>(
+      byCell.map((c) => [c.cell, c.barRImplied] as const),
+    );
     // TRA-4269 — the ratified-set counterfactual: `0` / `[]` on `universe` at
     // n=0 (never omitted), and null on every other gate.
     const counterfactual = gate === 'universe' ? foldRatifiedCounterfactual(tallies) : null;
@@ -2958,7 +3096,15 @@ function foldGates(
       // for this gate: a day on which this gate recorded nothing must publish a
       // zero row, not vanish. `etDays` is ascending on both callers.
       byEtDay: etDays.map((d) =>
-        foldGateDay(gate, d, perDay.get(d)?.get(gate), shadowOpts.flatFormBarR ?? null),
+        foldGateDay(
+          gate,
+          d,
+          perDay.get(d)?.get(gate),
+          shadowOpts.flatFormBarR ?? null,
+          // ⭐ TRA-4941 — the pooled verdicts this fold ALREADY computed, handed
+          // down so each day row can grade itself against the wider scope.
+          windowBarRImpliedByCell,
+        ),
       ),
       byScope,
       byReason,
@@ -2982,6 +3128,11 @@ function foldGates(
       predicateUnstamped: instrumented ? gatePredicateCoverage.predicateUnstamped : null,
       rowsPredicateInconsistent: instrumented
         ? gatePredicateCoverage.rowsPredicateInconsistent
+        : null,
+      // TRA-4941 — the gate-wide counter's readability. Null off `cost_bar` for
+      // the same reason the counters are: "not instrumented" is not a reading.
+      rowsPredicateInconsistentState: instrumented
+        ? gatePredicateCoverage.rowsPredicateInconsistentState
         : null,
       costBySymbol: instrumented ? costBySymbol : null,
       costRowsMissingSymbol: instrumented ? tallies.symbolRowsMissing : null,

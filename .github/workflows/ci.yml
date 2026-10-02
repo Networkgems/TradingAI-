@@ -9,6 +9,16 @@ name: CI
 # at. Now every axis runs and reports on every push; the first failure hides
 # nothing behind it.
 #
+# TRA-5029 — that guarantee was FALSE for 7d 1h 48m, because the fail-fast chain
+# reappeared one level down: the Test step ran `pnpm test`, an npm lifecycle name, so
+# root `pretest` (~30 guards chained on `&&`) ran first and a broken link at position 2
+# meant `pnpm -r test` was never reached. 73 consecutive runs reported
+# `Test -> failure` with the step lasting 0–1 seconds and ZERO tests executed. Splitting
+# jobs is not enough on its own: what matters is that nothing which can fail sits in
+# front of an axis, and that "it failed" and "it never ran" do not share a signal. The
+# Test job therefore runs `pnpm test:ci` (no pre-hook) and publishes the executed test
+# count as its own step.
+#
 # `ci-verdict` is the single REQUIRED status (branch protection on `main` names
 # it). It grades the run by its OWN /jobs step list — presence, conclusion and
 # step durations of every expected job — never by the run conclusion, and its
@@ -66,6 +76,20 @@ jobs:
   # The guard family stays grouped — these are cheap, ordered on purpose (stale-js
   # must precede anything that compiles), and none of them gates the suite: lint,
   # typecheck and test run in their own jobs regardless of what happens here.
+  #
+  # TRA-5029 — every step carries `if: ${{ !cancelled() }}`, because this job was ALSO
+  # a fail-fast chain and nobody had looked. `check:data-dir` started failing at step 7
+  # in `c8208189` (2026-09-25T00:22:08Z) and for the next 73 runs / 7d 1h 48m the nine
+  # steps behind it read `skipped` — the DATA_DIR controls, the env-intent controls, the
+  # strand-drain controls, import cycles, the TRA-3695 deploy-build gate, its hook check,
+  # its live-history controls, the package build and the TRA-2361 prover controls. All of
+  # them reported nothing at all while the job reported `failure`, which reads exactly
+  # like one guard being red. A skipped step is not a passing step and must not be able
+  # to hide behind a sibling. The job still fails when any step fails; it just no longer
+  # stops measuring. (Yes, that means a stale-js failure no longer gates the compile
+  # steps below it — in a pristine actions/checkout tree that condition means a `.js` was
+  # committed, which is loudly red on its own line, and hiding nine guards is the
+  # measured, more expensive failure.)
   guards:
     name: Guards (stale-js / data-dir / cycles / deploy-build gate / prover)
     runs-on: ubuntu-latest
@@ -97,6 +121,7 @@ jobs:
       # TS sources and can make the suite pass against code we are not shipping.
       # A green run below is only meaningful if this step is green first.
       - name: Check for stale compiled output shadowing TS sources
+        if: ${{ !cancelled() }}
         run: pnpm check:stale-js
 
       # TRA-2603 — beside check:stale-js, and before build/test. Ratchets the count of
@@ -106,12 +131,14 @@ jobs:
       # (TRA-2193/TRA-2195) and it fails SILENTLY: every write succeeds and the data
       # evaporates on redeploy. The controls are `pnpm check:data-dir:controls`.
       - name: Check for unguarded DATA_DIR resolver copies
+        if: ${{ !cancelled() }}
         run: pnpm check:data-dir
 
       # TRA-2603 — the guard's own both-direction controls: a real planted copy must FAIL,
       # a zeroed pattern must read BROKEN not CLEAN, `-a` must be provably load-bearing
       # against the NUL-byte file, and the baseline must not regenerate itself.
       - name: DATA_DIR guard controls (TRA-2603)
+        if: ${{ !cancelled() }}
         run: pnpm check:data-dir:controls
 
       # TRA-4474/TRA-4803 — the env-intent checker's own controls. `check:env-intent`
@@ -137,6 +164,7 @@ jobs:
       # text says to "fix the STORED value", i.e. to undo it. ARM 0 must keep failing on
       # the pre-fix code or this control is decorative.
       - name: env-intent checker controls (TRA-4474/TRA-4803/TRA-4862)
+        if: ${{ !cancelled() }}
         run: pnpm check:env-intent:controls
 
       # TRA-4145 — the strand drain's 43 write-path controls, which until now ran only
@@ -156,6 +184,7 @@ jobs:
       # so no scheduled fire will ever re-exercise it. A control that only runs by hand
       # is a control that silently stops running. `--selftest` sends nothing.
       - name: Strand drain write-path controls (TRA-4145)
+        if: ${{ !cancelled() }}
         run: pnpm drain:strands:controls
 
       # TRA-1684 — also before build/test. A circular import only throws from SOME
@@ -163,6 +192,7 @@ jobs:
       # doors and only one of them crashes (TRA-1674). A green suite is not
       # evidence the import graph is sound; this step is.
       - name: Check for import cycles
+        if: ${{ !cancelled() }}
         run: pnpm check:cycles
 
       # TRA-3695 — the DEPLOY'S OWN build command, named as such and run FIRST.
@@ -179,6 +209,7 @@ jobs:
       # that IS the commit, so isolation would buy nothing. Locally the gate isolates,
       # because a developer's tree is not the commit.
       - name: Deploy build gate — the deploy's own build command (TRA-3695)
+        if: ${{ !cancelled() }}
         run: pnpm check:deploy-build --worktree
 
       # TRA-3695 — the gate above is a DETECTOR (it runs after the push, like everything
@@ -187,6 +218,7 @@ jobs:
       # that silently is not. This asserts the hook is tracked, wired to `prepare`, and that
       # `pnpm install` above actually armed it.
       - name: Pre-push build gate is installed (TRA-3695)
+        if: ${{ !cancelled() }}
         run: pnpm check:deploy-build --verify-hook
 
       # TRA-3695 — the gate's own both-direction controls, run on LIVE HISTORY (needs the
@@ -194,9 +226,11 @@ jobs:
       # `(202,66) error TS18047`, and `1ff4fa7b` must read CLEAN. Without that second arm a
       # gate hardwired to refuse would pass every other control.
       - name: Deploy build gate controls (TRA-3695)
+        if: ${{ !cancelled() }}
         run: pnpm check:deploy-build:controls
 
       - name: Build shared packages
+        if: ${{ !cancelled() }}
         run: pnpm -r --filter './packages/**' build
 
       # TRA-2372 — controls for the TRA-2361 AC5 monotonicity prover. It runs the prover
@@ -207,6 +241,7 @@ jobs:
       # `src/` on the BLIND path — where `pnpm check:stale-js` cannot see it, because that
       # guard looks for compiler OUTPUT and the strand is a `.ts`.
       - name: Monotonicity prover controls (TRA-2361 AC5)
+        if: ${{ !cancelled() }}
         run: pnpm check:tra2361-prover
 
   lint:
@@ -267,8 +302,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Full history: `pretest` runs the TRA-4420 arg-guard suite, whose ARM 0
-          # reconstitutes a187fc14's bytes via `git show` — unreachable at depth 1.
+          # Full history. This used to be justified by `pretest` (the TRA-4420 arg-guard
+          # ARM 0 reconstitutes `a187fc14`'s bytes via `git show`, unreachable at depth
+          # 1); as of TRA-5029 this job no longer runs `pretest` — that control now runs
+          # only where it always belonged, in `pretest` locally and in the Guards job.
+          # Kept at 0 because tests in this workspace read git history directly and a
+          # shallow clone turns those into silent skips, which is this file's own lesson.
           fetch-depth: 0
 
       - uses: pnpm/action-setup@v4
@@ -289,8 +328,54 @@ jobs:
       - name: Build shared packages
         run: pnpm -r --filter './packages/**' build
 
+      # TRA-5029 — `pnpm test:ci`, NOT `pnpm test`.
+      #
+      # `test` is an npm lifecycle name, so `pnpm test` ran root `pretest` first — a
+      # single `&&` chain of ~30 guards and selftests — and only then `pnpm -r test`.
+      # From `c8208189` (2026-09-25T00:22:08Z) link 2 (`check-data-dir`, TRA-5030)
+      # exited 1 and the suite was never reached again until `212a5dab`
+      # (2026-10-02T03:10:38Z): 73 consecutive runs, 7d 1h 48m, this step running for
+      # 0–1 SECONDS and executing ZERO tests while reporting `Test -> failure`. That is
+      # precisely TRA-4440's fail-fast chain, re-created inside the job TRA-4477 split
+      # off to prevent it — one level down, in a package.json script the job
+      # restructuring never touched.
+      #
+      # `test:ci` carries no `pre*` hook, so no guard can suppress it. The guards did
+      # not move out of `pretest` (CLAUDE.md: the local pretest hook is load-bearing for
+      # the stale-js trap) and they keep their own job above; they simply no longer sit
+      # in front of the suite. The one exception is `check-stale-js`, which the runner
+      # executes itself — a shadowing emit makes the suite's result MEANINGLESS rather
+      # than unknown, and that reads BLIND, never "tests failed".
+      #
+      # `if: !cancelled()` for the same reason as the guards job: if the build step above
+      # fails, this step must REPORT (and read BLIND via the count step below), not skip.
       - name: Test
-        run: pnpm test
+        if: ${{ !cancelled() }}
+        run: pnpm test:ci
+
+      # TRA-5029 AC2 — the discriminator. `Test -> failure` cannot distinguish "the
+      # suite ran and N tests failed" from "the suite never executed"; both arrive as
+      # one bit, which is why the 7.4-day streak above read as ordinary redness. This
+      # step reports the EXECUTED TEST COUNT against a frozen floor and runs with
+      # `if: always()`, so the two modes land as two different STEP conclusions:
+      #   Test red + this step green  -> the suite executed and lost tests  (BROKEN)
+      #   Test red + this step red    -> the suite did not execute          (BLIND)
+      # `ci-verdict` grades by exactly that pair; its absence reads BLIND there rather
+      # than silently reverting to the old one-bit reading.
+      - name: Suite executed (count floor)
+        if: ${{ always() }}
+        run: pnpm test:ci:grade
+
+      # The runner is an instrument, so it ships with both-direction controls: a clean
+      # stream reads CLEAN, a 5-failure stream reads RED with the count, a package
+      # missing from the stream reads BLIND rather than RED, `--passWithNoTests`
+      # emptiness reads BLIND, a count under the floor reads BLIND, and a test job that
+      # goes back to invoking a pre-hooked script fails the structural arm. Placed after
+      # the suite, with `if: always()`, because a control that can suppress the thing it
+      # grades is the defect on this very ticket.
+      - name: Suite runner controls (TRA-5029)
+        if: ${{ always() }}
+        run: pnpm test:ci:controls
 
   # The single REQUIRED status. Grades this very run by its /jobs step list and
   # durations (TRA-4440's lesson: never the run conclusion), and proves on every

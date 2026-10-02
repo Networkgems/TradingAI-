@@ -62,3 +62,8 @@ apps/desktop/src/**/*.d.ts.map
 # ~76 MB of recorded option chains; it is a rebuildable mirror of
 # `/api/health/chain-capture/partition/:date`, never a source artifact.
 .tra3727-cache/
+
+# TRA-5029 — `pnpm test:ci` writes its verdict here (executed test count per package,
+# verdict, reasons) so the `Suite executed (count floor)` CI step can read it back with
+# `if: always()`. A run artifact, never a source file.
+test-suite-verdict.json

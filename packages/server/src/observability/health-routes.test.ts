@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rm } from 'node:fs/promises';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import {
   makeHypothesis,
   runHypothesis,
@@ -40,7 +40,13 @@ import {
   PROFIT_FLOOR_TRAIL_FLAG,
   EXIT_RISK_RULES_FLAG,
 } from '../exit-risk-rules-flag.js';
-import { resolveDemoFlagEnv } from '../demo-flags.js';
+import { resolveDemoFlagEnv, resolveDemoFlagEnvFromEnv } from '../demo-flags.js';
+// TRA-5030 — the arm predicate + its flag name, imported as SYMBOLS so the route
+// assertions below cannot drift against retyped literals.
+import {
+  isOptionRealFillShadowEnabled,
+  OPTION_REAL_FILL_SHADOW_FLAG,
+} from '../option-real-fill-shadow.js';
 // TRA-3216 — the live OTM underlying allowlist + the enforcement-gate ledger it publishes through.
 import { OPTION_LIVE_OTM_UNIVERSE_VAR } from '../otm-live-universe-flag.js';
 import { clearLiveEnforceGateLedger, recordLiveEnforceDecision } from '../live-enforce-gate-ledger.js';
@@ -114,6 +120,7 @@ import { // TRA-3394
 import { getRecentAlerts, __resetAlertsForTest } from './alerts.js';
 import type { EngineState, ExitCadenceHealth, ExitIntervalBucket, LiveEquityAcceptance } from '../signal-engine.js';
 import { categorizeLiveSkipReason, emptyLiveSkipBreakdown, emptyDecoupledExitSkips, emptyExitIntervalHistogram } from '../signal-engine.js';
+import { LiveEquitySizingLedger } from '../live-equity-sizing-reason.js';
 import type { AccountSettings } from '@trading-app/shared';
 
 const NOW = 2_000_000_000;
@@ -317,6 +324,9 @@ describe('TRA-580 live-equity acceptance probe', () => {
       liveEquityMirrorsWithOrderId: 0,
       liveSkipReasonCount: 0,
       liveSkipReasonCategories: emptyLiveSkipBreakdown(),
+      // TRA-4877 — a fixture engine that has taken no sizing decision reads
+      // `never_recorded`, which is the honest default: not a clean zero.
+      liveEquitySizingZeros: new LiveEquitySizingLedger(Date.parse('2026-09-24T20:00:00Z')).snapshot(),
       firstLiveEquityFillConfirmed: false,
       lastLiveEquityFillAt: null,
       ...over,
@@ -367,6 +377,7 @@ describe('TRA-580 live-equity acceptance probe', () => {
         'lastLiveEquityFillAt',
         'liveEngineCount',
         'liveEquityClientConfigured',
+        'liveEquitySizingZeros',
         'liveEquityTradingEnabled',
         'liveSkipReasonBreakdown',
         'ok',
@@ -378,6 +389,27 @@ describe('TRA-580 live-equity acceptance probe', () => {
     );
     // serviceEnv carries booleans only — never a credential value.
     expect(Object.values(report.serviceEnv).every(v => typeof v === 'boolean')).toBe(true);
+    // TRA-4877 — the sizing-zero fold is counts + constant labels only. The
+    // sizer's decision also knows the book size, the cap and the share price;
+    // none of those may reach this unauthenticated surface.
+    const sizing = report.liveEquitySizingZeros as unknown as Record<string, unknown>;
+    expect(Object.keys(sizing).sort()).toEqual(
+      [
+        'capLabelMismatch',
+        'decisionsSinceBoot',
+        'engineCount',
+        'enginesNeverRecorded',
+        'lastDecisionEtDay',
+        'sizedSinceBoot',
+        'wiring',
+        'zerosSinceBootByReason',
+      ].sort(),
+    );
+    for (const banned of ['cap', 'capSource', 'baseEquity', 'currentPrice', 'affordableShares', 'days']) {
+      expect(Object.keys(sizing)).not.toContain(banned);
+    }
+    // An engine that has sized nothing must not read as a clean zero.
+    expect(report.liveEquitySizingZeros.wiring).toBe('never_recorded');
   });
 
   it('TRA-1573 — maps raw skip reasons to a fixed, leak-free category vocabulary', () => {
@@ -8534,5 +8566,118 @@ describe('GET /api/health/live-enforce-gates — stale-input attribution (TRA-49
 
   it('no stale cell ⇒ no degradation at all (the detector is not stuck on)', () => {
     expect(serveGates().degradations).toEqual([]);
+  });
+});
+
+// TRA-5030 — the three DATA_DIR states on /api/health/option-real-fill-shadow.
+//
+// TRA-4893 item 2 made this route resolve its arm bit through the demo-flags overlay
+// instead of `process.env`, using the inline `dir ? resolveDemoFlagEnv(dir) : process.env`
+// idiom. That idiom tests TRUTHINESS, and a blank-but-present `DATA_DIR` (`' '`) is
+// TRUTHY — so it resolved the overlay against a directory literally named `" "`,
+// relative to the launch cwd. bqb1 has reached blank-but-present twice
+// (TRA-2136 / TRA-2193 / TRA-2195), and `scripts/check-data-dir.mjs` has banned the
+// naked read since TRA-2603 for exactly this reason.
+//
+// ⚠️ The blank case is only OBSERVABLE when a directory named `" "` actually exists
+// and holds a `demo-flags.json`: otherwise `loadDemoFlagFile(' ')` misses and
+// `resolveDemoFlagEnv` falls back to `baseEnv`, so the old idiom reached `process.env`
+// too — by accident, down a doomed path. A test that merely set `DATA_DIR=' '` and
+// asserted `enabled: false` would therefore have passed against the DEFECT, which is
+// the whole class of green-that-cannot-go-red this repo keeps getting bitten by. So
+// the blank case below PLANTS that directory, and asserts the fixture is live through
+// the old idiom in the same test before asserting the route ignores it.
+describe('TRA-5030 DATA_DIR states on /api/health/option-real-fill-shadow', () => {
+  const FLAG = OPTION_REAL_FILL_SHADOW_FLAG;
+  let tmp: string | null = null;
+  let cwd0: string | null = null;
+
+  const serve = async (): Promise<{ enabled: boolean; enabledSource: string }> => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const res = fakeRes();
+    await routes.get('/api/health/option-real-fill-shadow')![0]!({ query: {} }, res);
+    return res.body as { enabled: boolean; enabledSource: string };
+  };
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'tra5030-'));
+    delete process.env[FLAG];
+    delete process.env.DATA_DIR;
+  });
+
+  afterEach(() => {
+    if (cwd0) process.chdir(cwd0);
+    cwd0 = null;
+    delete process.env[FLAG];
+    delete process.env.DATA_DIR;
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    tmp = null;
+  });
+
+  it('UNSET ⇒ process.env only; no overlay is consulted at the in-bundle default root', async () => {
+    expect(await serve()).toMatchObject({ enabled: false, enabledSource: 'off' });
+
+    process.env[FLAG] = '1';
+    expect(await serve()).toMatchObject({ enabled: true, enabledSource: 'process_env' });
+
+    // The load-bearing half: `resolveDataDir()` — what check:data-dir prescribes
+    // generically — would resolve UNSET to `<bundle>/data` and consult the overlay
+    // there. The ENGINE never does (`SignalEngine.resolveDemoFlagEnv` falls through to
+    // `process.env`), so doing it here would re-open the route-vs-recorder
+    // disagreement TRA-4893 closed. Pinned as an identity on the helper, because the
+    // in-bundle file does not exist in a test tree and its absence would let a route
+    // that DID consult it pass this case vacuously.
+    expect(resolveDemoFlagEnvFromEnv({ [FLAG]: '1' } as NodeJS.ProcessEnv)).toEqual({
+      [FLAG]: '1',
+    });
+  });
+
+  it('SET ⇒ the overlay wins and is attributed to the file', async () => {
+    writeFileSync(join(tmp!, 'demo-flags.json'), JSON.stringify({ [FLAG]: '1' }), 'utf8');
+    process.env.DATA_DIR = tmp!;
+
+    // Control: the flag is NOT in process.env, so a `true` here can only have come
+    // off the file — which also proves the route opened the overlay on this request.
+    expect(process.env[FLAG]).toBeUndefined();
+    expect(await serve()).toMatchObject({ enabled: true, enabledSource: 'demo_flags_file' });
+  });
+
+  it('BLANK ⇒ treated as UNSET; it must NOT resolve to a directory named " "', async () => {
+    // Plant the hazard: `<tmp>/" "/demo-flags.json`, armed, reached cwd-relatively.
+    cwd0 = process.cwd();
+    mkdirSync(join(tmp!, ' '), { recursive: true });
+    writeFileSync(join(tmp!, ' ', 'demo-flags.json'), JSON.stringify({ [FLAG]: '1' }), 'utf8');
+    process.chdir(tmp!);
+
+    // FIXTURE IS LIVE — the old idiom (`' '` is truthy ⇒ resolveDemoFlagEnv(' ')`)
+    // demonstrably reads that file from here. Without this assertion the two below
+    // would pass against the defect, since a MISSING overlay also falls back to
+    // `baseEnv`. This is the negative control, and it must stay anchored to the
+    // real `resolveDemoFlagEnv` rather than a local mirror of it.
+    expect(resolveDemoFlagEnv(' ', {} as NodeJS.ProcessEnv)[FLAG]).toBe('1');
+    expect(isOptionRealFillShadowEnabled(resolveDemoFlagEnv(' ', {} as NodeJS.ProcessEnv))).toBe(
+      true,
+    );
+
+    // ...and the route, which trims, does not.
+    process.env.DATA_DIR = ' ';
+    expect(await serve()).toMatchObject({ enabled: false, enabledSource: 'off' });
+
+    // Blank is UNSET, not "overlay off": process.env still arms it, and is still
+    // attributed to process.env rather than to the file it refused to read.
+    process.env[FLAG] = '1';
+    expect(await serve()).toMatchObject({ enabled: true, enabledSource: 'process_env' });
+
+    // `''` is the other blank spelling. It was already falsy, so this direction never
+    // regressed — pinned so a future `!= null` "simplification" cannot un-fix it.
+    delete process.env[FLAG];
+    process.env.DATA_DIR = '';
+    expect(await serve()).toMatchObject({ enabled: false, enabledSource: 'off' });
   });
 });

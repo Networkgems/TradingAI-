@@ -361,6 +361,39 @@ async function gradeStoredEnv(levers) {
   const mismatches = [];
   const notes = [];
   for (const lever of levers) {
+    // TRA-5014 — an OVERLAY-BACKED lever is armed through
+    // `DATA_DIR/demo-flags.json`, not the service env list. For these, `key
+    // ABSENT` from the stored set is the HEALTHY state, so grading them on this
+    // leg would manufacture a permanent "STAGED" mismatch and the operator would
+    // learn to ignore the whole check. They are NOT ungraded overall: leg 1
+    // grades them off the route's own overlay-resolved `effective`, and the
+    // route refuses to publish `ok: true` if it could not read the overlay
+    // (`blindLevers`). The note is printed, never silent — a skipped lever that
+    // says nothing is how a hole gets inherited.
+    if (lever.overlayBacked === true) {
+      const alsoStored = storedEnv[lever.key];
+      if (alsoStored === undefined) {
+        notes.push(
+          `${lever.key}: overlay-backed (DATA_DIR/demo-flags.json) — the stored env leg does not ` +
+            `apply and 'key ABSENT' here is correct. Graded by leg 1 off the route: effective ` +
+            `'${lever.effective}' vs intended '${lever.intended}'.`,
+        );
+        continue;
+      }
+      // TWO homes for one lever. `resolveDemoFlagEnv` layers the FILE OVER the
+      // base env, so the overlay wins and this stored value is dead weight that
+      // nonetheless reads as authoritative to anyone inspecting Render's env
+      // list. That disagreement is a finding in its own right even when both
+      // happen to resolve the same today.
+      mismatches.push(
+        `${lever.key}: TWO HOMES — this lever is overlay-backed (DATA_DIR/demo-flags.json, which ` +
+          `WINS) yet the service env list also stores '${alsoStored}'. The stored value is inert ` +
+          `while the overlay sets the key, so Render's env list misreports the live posture; and ` +
+          `if the overlay file is ever lost the stored value silently takes over. Pick one home: ` +
+          `either drop the stored key or promote the lever off the overlay (TRA-5014).`,
+      );
+      continue;
+    }
     const { effective: storedEffective, why } = resolveStored(lever, storedEnv);
     if (why !== undefined) blind(`env-list arm was ON but ${why} (fail closed — unresolvable is never a match)`);
 
@@ -500,7 +533,20 @@ function gradeDeclared(declared, routeLevers, storedEnv) {
     // actually holds where we can, because "not deployed" and "not applied" are
     // different failures with different remedies, and the incident was both.
     let reach;
-    if (storedEnv === null) {
+    if (onWire.overlayBacked === true) {
+      // TRA-5014 — this lever's home is DATA_DIR/demo-flags.json. Resolving it
+      // against the Render env list would report 'off' from an absent key and
+      // tell the operator the declaration "is standing nothing down right now",
+      // which is false whenever the overlay holds the arm. The honest reach for
+      // an overlay-backed lever is the route's own overlay-resolved effective.
+      reach =
+        `This lever is OVERLAY-BACKED (DATA_DIR/demo-flags.json): there is no service env var to ` +
+        `reach, so the stored-env leg cannot speak to it. The running build's overlay-resolved ` +
+        `effective is '${onWire.effective}'` +
+        (onWire.overlayVisible === false
+          ? ' — but it was graded WITHOUT the overlay, so that value is the code default, not a measurement'
+          : `, which ${onWire.effective === row.intended ? 'AGREES with' : 'DISAGREES with'} the declaration`);
+    } else if (storedEnv === null) {
       reach = 'Whether the declaration reached the live env var is NOT GRADED (env-list arm OFF)';
     } else {
       const { effective: storedEffective, why } = resolveStored(row, storedEnv);
@@ -547,7 +593,21 @@ if (!Array.isArray(intent.levers) || intent.levers.length === 0) {
 
 const routeMismatches = intent.levers
   .filter((l) => l.matches !== true)
-  .map((l) => `${l.key}: IN FORCE — intended '${l.intended}', effective '${l.effective}' (key ${l.present ? `present, raw '${l.raw}'` : 'ABSENT — the default is deciding'})`);
+  .map((l) =>
+    // TRA-5014 — `matches: null` on a box that APPLIES is BLIND, not a reading.
+    // An overlay-backed lever whose overlay the route could not read publishes
+    // its code default as `effective`, so reporting it as "IN FORCE" would
+    // assert a measurement that was never taken — and in the permissive
+    // direction for the reader, since the default is `off` and `off` looks like
+    // a tidy stand-down. Named as its own failure with its own remedy.
+    l.overlayBacked === true && l.overlayVisible === false
+      ? `${l.key}: BLIND — overlay-backed lever, but the running build graded it WITHOUT the ` +
+        `demo-flags overlay (overlayVisible:false), so the published effective '${l.effective}' is ` +
+        `this lever's code DEFAULT and not a measurement. Intended '${l.intended}'. The route must ` +
+        `pass resolveDemoFlagEnvFromEnv() into summarizeEnvIntent (health-routes.ts). Do NOT read ` +
+        `this as a disarm, and do NOT clear it by editing the manifest.`
+      : `${l.key}: IN FORCE — intended '${l.intended}', effective '${l.effective}' (key ${l.present ? `present, raw '${l.raw}'` : 'ABSENT — the default is deciding'})`,
+  );
 
 const arm = await gradeStoredEnv(intent.levers);
 const { mismatches: declaredMismatches, appliedPendingDeploy } = gradeDeclared(

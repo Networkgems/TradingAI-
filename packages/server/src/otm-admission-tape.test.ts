@@ -684,4 +684,63 @@ describe('TRA-4628 — hydrate / retention / export', () => {
     const fixtureOnly = await readOtmAdmissionTapeRows({ accountClass: 'fixture' });
     expect(fixtureOnly.rows).toHaveLength(0);
   });
+
+  // The export is the AC4 consumer's only surface, and a (day × class) slice is
+  // NOT guaranteed to fit one response — measured 2026-10-02, desk 2026-09-24
+  // is 21,384 rows against a 20,000 ceiling, so an unpaged reader silently got
+  // the day's EARLY slots only. Paging must be exact and `kind` must be able to
+  // drop the link rows the sweep never reads.
+  it('pages a slice that exceeds one response, and filters by kind', async () => {
+    const ctx = { symbol: SEL, book: 'deskbook', mode: 'live', now: NOW } as const;
+    const pass = beginOtmAdmissionPass({ ...ctx });
+    pass!.onAdmission(decision({ occSymbol: 'RIG1' }));
+    pass!.onAdmission(decision({ occSymbol: 'RIG2', admitted: false, bindingReason: 'min_mark' }));
+    pass!.onAdmission(decision({ occSymbol: 'RIG3' }));
+    pass!.commit();
+    recordOtmAdmissionRanked({ ...ctx }, 'RIG1');
+    recordOtmAdmissionOrdered({ ...ctx }, 'RIG1');
+
+    // Unpaged, under the ceiling: complete, and no cursor handed back.
+    const all = await readOtmAdmissionTapeRows({});
+    expect(all.rows).toHaveLength(5);
+    expect(all.truncated).toBe(false);
+    expect(all.nextOffset).toBeNull();
+
+    // Paged at the ceiling: the concatenation is the whole slice, in file order,
+    // with every row seen exactly once.
+    const collected: string[] = [];
+    let cursor: number | null = 0;
+    let pages = 0;
+    while (cursor !== null) {
+      const page = await readOtmAdmissionTapeRows({ limit: 2, offset: cursor });
+      expect(page.offset).toBe(cursor);
+      for (const r of page.rows) collected.push(`${r.kind}:${'occSymbol' in r ? r.occSymbol : ''}`);
+      cursor = page.nextOffset;
+      pages += 1;
+      expect(pages).toBeLessThan(10); // a cursor that does not advance must fail loudly
+    }
+    expect(collected).toEqual(
+      all.rows.map((r) => `${r.kind}:${'occSymbol' in r ? r.occSymbol : ''}`),
+    );
+
+    // kind narrows the slice to the sweep's own population. The COUNT is read
+    // off the unfiltered slice, not hard-coded: this is a COLD BOOT, so rule 3's
+    // share denominator falls back to SEED_ROWS_PER_SLOT and even a 3-row pass is
+    // thinned (TRA-4954). The subject here is the filter, not the budget.
+    const bankedHere = all.rows.filter((r) => r.kind === 'candidate').length;
+    expect(bankedHere).toBeGreaterThanOrEqual(2);
+    const candidates = await readOtmAdmissionTapeRows({ kind: 'candidate' });
+    expect(candidates.rows.map((r) => r.kind)).toEqual(Array(bankedHere).fill('candidate'));
+    expect(candidates.truncated).toBe(false);
+    // …and the shed row is reachable by its own kind, which is how AC1 is graded.
+    const shed = await readOtmAdmissionTapeRows({ kind: 'budgetdrop' });
+    expect(shed.rows).toHaveLength(all.rows.length - bankedHere - 2); // minus ranked+ordered
+    const ranked = await readOtmAdmissionTapeRows({ kind: 'ranked' });
+    expect(ranked.rows).toHaveLength(1);
+
+    // offset past the end of the slice is empty and terminal, never a wrap.
+    const past = await readOtmAdmissionTapeRows({ kind: 'candidate', offset: 99 });
+    expect(past.rows).toHaveLength(0);
+    expect(past.nextOffset).toBeNull();
+  });
 });

@@ -96,6 +96,12 @@ function tapeCell(over: Partial<TapeExpectancyCell> & { cellKey: string }): Tape
     boundNoiseR: null,
     realFillUnavailableReason:
       'nRealFill=0 of n=124 carries broker truth on BOTH legs (< 40 required)',
+    // TRA-5040 — the shadow trio. This fixture's cell has no seam-quote
+    // recovery, which is the live `0.30-0.40` reading (its 124 misses are all
+    // `not_broker_fill`): a measured zero, not an absence.
+    nRealFillSeamShadow: 0,
+    realFillSeamRecovered: 0,
+    realFillSeamStale: 0,
     provenance: {} as TapeExpectancyCell['provenance'],
     meanR_gate_netOfModelledCross: null,
     lowerCI95_netOfModelledCross: null,

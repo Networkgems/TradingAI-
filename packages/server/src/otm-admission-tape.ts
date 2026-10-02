@@ -1398,6 +1398,27 @@ export function summarizeOtmAdmissionTape(): OtmAdmissionTapeSummary {
 export interface OtmAdmissionTapeRowFilter {
   etDay?: string;
   accountClass?: string;
+  /**
+   * Row `kind` to keep (`candidate` / `ranked` / `ordered` / `budgetdrop`).
+   *
+   * TRA-4628 (measured 2026-10-02): a (day × class) slice is NOT guaranteed to
+   * fit {@link MAX_READ_ROWS} — desk 2026-09-24 holds 12,168 candidate + 9,216
+   * `ranked` rows = 21,384, and the unfiltered read of it returned 20,000 with
+   * `truncated: true`, clipping 524 candidate rows off the FILE TAIL, i.e. the
+   * day's LAST ET slots. A time-of-day-biased clip is precisely the v1-sampler
+   * defect this tape was rebuilt to escape, so the sweep's own axes must never
+   * depend on a reader noticing a flag. Filtering to `candidate` drops the link
+   * rows the sweep does not read and brings every measured day under the cap;
+   * {@link OtmAdmissionTapeRowFilter.offset} is the general answer for a slice
+   * that is over the cap on its own.
+   */
+  kind?: string;
+  /**
+   * Matching rows to SKIP before collecting — the paging cursor. Pass back the
+   * `nextOffset` of the previous read; file order is append-only and stable, so
+   * paging a day that is not being appended to (any CLOSED session) is exact.
+   */
+  offset?: number;
   /** Hard-capped at {@link MAX_READ_ROWS} regardless of the requested value. */
   limit?: number;
 }
@@ -1406,19 +1427,31 @@ export interface OtmAdmissionTapeRowFilter {
  * Stream-read raw rows off disk for the export path (the TRA-4623 sweep re-run).
  * readline over a stream, never `readFileSync` — the file may be tens of MB and
  * this route must not spike RSS against the TRA-4158 ceiling.
+ *
+ * `truncated` means MORE MATCHING ROWS EXIST, not that the read failed: resume
+ * at `nextOffset` (null exactly when the slice was exhausted). A caller that
+ * reads one page and ignores both fields is reading a prefix of its filter.
  */
 export async function readOtmAdmissionTapeRows(
   filter: OtmAdmissionTapeRowFilter = {},
-): Promise<{ rows: OtmAdmissionTapeRow[]; truncated: boolean }> {
-  if (dataDir == null) return { rows: [], truncated: false };
+): Promise<{
+  rows: OtmAdmissionTapeRow[];
+  truncated: boolean;
+  offset: number;
+  nextOffset: number | null;
+}> {
+  const offset = Math.max(0, Math.floor(filter.offset ?? 0));
+  if (dataDir == null) return { rows: [], truncated: false, offset, nextOffset: null };
   const limit = Math.min(Math.max(1, filter.limit ?? MAX_READ_ROWS), MAX_READ_ROWS);
   const rows: OtmAdmissionTapeRow[] = [];
   let truncated = false;
+  /** Matching rows seen, including the ones `offset` skipped. */
+  let matched = 0;
   let stream: ReturnType<typeof createReadStream>;
   try {
     stream = createReadStream(otmAdmissionTapePath(dataDir), { encoding: 'utf8' });
   } catch {
-    return { rows: [], truncated: false };
+    return { rows: [], truncated: false, offset, nextOffset: null };
   }
   const rl = createInterface({ input: stream, crlfDelay: Infinity });
   try {
@@ -1429,6 +1462,9 @@ export async function readOtmAdmissionTapeRows(
       if (rec == null) continue;
       if (filter.etDay !== undefined && rec.etDay !== filter.etDay) continue;
       if (filter.accountClass !== undefined && rec.accountClass !== filter.accountClass) continue;
+      if (filter.kind !== undefined && rec.kind !== filter.kind) continue;
+      matched += 1;
+      if (matched <= offset) continue;
       if (rows.length >= limit) {
         truncated = true;
         break;
@@ -1445,5 +1481,5 @@ export async function readOtmAdmissionTapeRows(
     rl.close();
     stream.destroy();
   }
-  return { rows, truncated };
+  return { rows, truncated, offset, nextOffset: truncated ? offset + rows.length : null };
 }

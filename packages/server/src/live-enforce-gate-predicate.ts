@@ -324,6 +324,31 @@ export interface ImpliedBarRRow {
  * that slack is deliberate and is always in the direction that makes the interval
  * WIDER, so an `excludesPublishedBarR: true` is never an artefact of it.
  */
+/**
+ * TRA-4941 — WHY {@link ImpliedBarR.consistent} holds the value it holds, as a
+ * value rather than as prose. It is ALWAYS present, so a reader can never see
+ * the verdict without the basis it was computed on.
+ *
+ * • `two_sided` — the recovered interval is CLOSED at both ends
+ *   (`lowerBound !== null && upperBound !== null`). This is the ONLY basis on
+ *   which `consistent` is a real boolean. One blocked row in a bounded shortfall
+ *   bucket reaches it by itself; it does NOT require an admitted row.
+ * • `one_sided_sample` — one end is open, so nothing in this group ever bounded
+ *   the bar from that direction. `consistent` is `null`, and
+ *   `excludesPublishedBarR` is `null` — a half-open interval must not refute a
+ *   published scalar. This is the 2026-09-25 shape.
+ *
+ * ⚠️ `one_sided_sample` is a proxy for the thing that actually invalidated
+ * 2026-09-25, not that thing itself. All 111 admits in that cell were
+ * one-shot-GRANT (bypass) rows, and `admit ⟺ grossR >= barR` — the identity this
+ * whole inversion rests on — does not hold for a row that bypassed the
+ * comparison. {@link ImpliedBarRRow} cannot currently see grant-ness, so every
+ * non-blocked row is still counted as proof of `barR <= grossR`. A scope mixing
+ * genuine admits with grants can therefore still skew `upperBound` while reading
+ * `two_sided`. Filed as the residual on TRA-4941.
+ */
+export type ImpliedBarRConsistentReason = 'two_sided' | 'one_sided_sample';
+
 export interface ImpliedBarR {
   /** `barR >= lowerBound`. Null when no row constrained it from below. */
   lowerBound: number | null;
@@ -341,15 +366,31 @@ export interface ImpliedBarR {
   /**
    * `lowerBound <= upperBound`. FALSE ⇒ the group's own rows cannot all have
    * faced one bar ⇒ the bar MOVED inside the group. Read this before the bounds.
+   *
+   * ⛔ TRA-4941 — THREE-VALUED. `null` ⇒ NOT GRADED, and it is not a weaker
+   * `true`: see {@link consistentReason}. Until TRA-4941 a group whose interval
+   * was open at one end rendered `consistent: true`, because `lower === null ||
+   * upper === null` short-circuited the comparison to `true`. That `true` then
+   * unlocked `excludesPublishedBarR`, so a HALF-OPEN interval could publish "the
+   * live bar is refuted". Measured 2026-09-25, cell `0.30-0.40` day-scoped:
+   * `rowsAdmittedUsed: 111`, `rowsBlockedUsed: 0`, `lowerBound: null`,
+   * `upperBound: -0.215375`, `consistent: true`, `excludesPublishedBarR: true`.
+   * The whole-window fold for the same cell read `consistent: false`, and the
+   * contradicting evidence lived only outside the day — see
+   * {@link impliedBarRScopeCheck}.
    */
-  consistent: boolean;
+  consistent: boolean | null;
+  /** TRA-4941 — the basis {@link consistent} was computed on. Always present. */
+  consistentReason: ImpliedBarRConsistentReason;
   /** The bar this route publishes today, echoed so the reader performs no join. */
   publishedBarR: number | null;
   /**
    * `true` ⇒ the published bar lies OUTSIDE the recovered interval: the rows in
    * this group were NOT decided against the bar the payload advertises. `null`
-   * when there is no published bar to grade, or when `consistent` is false (an
-   * empty interval excludes everything and would read as a false positive).
+   * when there is no published bar to grade, or when `consistent` is not `true`
+   * — `false` (an empty interval excludes everything and would read as a false
+   * positive) and, since TRA-4941, `null` (a one-sided sample bounds nothing
+   * that could refute a bar).
    */
   excludesPublishedBarR: boolean | null;
 }
@@ -422,10 +463,34 @@ export function impliedBarR(
   if (rowsBlockedUsed === 0 && rowsAdmittedUsed === 0) return null;
 
   const EPS = 1e-9;
-  const consistent = lower === null || upper === null || lower <= upper + EPS;
+  // ⭐ TRA-4941 — the basis FIRST, then the verdict, and the verdict is only a
+  // boolean when the recovered interval is CLOSED AT BOTH ENDS.
+  //
+  // ⛔ The discriminator is BOUND one-sidedness, NOT `rowsBlockedUsed > 0 &&
+  // rowsAdmittedUsed > 0`. The row-count version is what TRA-4941 literally asked
+  // for and it is wrong in the expensive direction: ONE blocked row in a bounded
+  // shortfall bucket proves `barR ∈ [grossR, grossR + width]` all by itself —
+  // both ends, zero admitted rows. That single-blocked-row case IS the TRA-4745
+  // headline finding (`0.50-0.55`, interval [0.428045, 0.528045], published bar
+  // 0.385 refuted), so keying on row counts would have abstained on exactly the
+  // reading the instrument was built to produce, and the two live rv/otm
+  // fixtures in `live-enforce-gate-bar-recovery.test.ts` fail against it.
+  //
+  // What actually went wrong on 2026-09-25 was a HALF-OPEN interval: 111 admitted
+  // rows set `upper = -0.215375` and NOTHING set `lower`, so `lower === null`
+  // made `lower <= upper` vacuously true and the open end below still let
+  // `bar > upper` render `excludesPublishedBarR: true`.
+  // Inlined rather than hoisted behind a `twoSided` boolean so the compiler
+  // narrows `lower`/`upper` here instead of needing a non-null assertion.
+  const consistent: boolean | null =
+    lower !== null && upper !== null ? lower <= upper + EPS : null;
+  const consistentReason: ImpliedBarRConsistentReason =
+    consistent === null ? 'one_sided_sample' : 'two_sided';
   const bar = finite(publishedBarR);
+  // `consistent !== true` covers BOTH refusals: `false` (empty interval) and
+  // `null` (one-sided). An unreadable comparison must not render a verdict.
   const excludes =
-    bar === null || !consistent
+    bar === null || consistent !== true
       ? null
       : (lower !== null && bar < lower - EPS) || (upper !== null && bar > upper + EPS);
 
@@ -436,8 +501,72 @@ export function impliedBarR(
     rowsAdmittedUsed,
     rowsUnusable,
     consistent,
+    consistentReason,
     publishedBarR: bar,
     excludesPublishedBarR: excludes,
+  };
+}
+
+/**
+ * TRA-4941 — the DAY-vs-WINDOW scope comparison for one cell, published in-band
+ * so the disagreement does not require the reader to hold two payloads side by
+ * side.
+ *
+ * On 2026-09-25 the day-scoped fold for cell `0.30-0.40` concluded the published
+ * bar was REFUTED off 111 admitted-only rows, while the whole-window fold for the
+ * same cell read `consistent: false` (`lowerBound` 0.284625 > `upperBound`
+ * -0.215375). The contradicting evidence existed only outside the day.
+ *
+ * ⛔ This resolves NOTHING silently. The wider scope wins on the merits —
+ * {@link authoritativeScope} is a constant `'window'` and says so — but the
+ * disagreement is itself the finding and is published as its own field.
+ */
+export interface ImpliedBarRScopeCheck {
+  /** This day's verdict for this cell, echoed so no join is needed. */
+  dayConsistent: boolean | null;
+  dayConsistentReason: ImpliedBarRConsistentReason;
+  dayExcludesPublishedBarR: boolean | null;
+  /**
+   * The whole-fold verdict for the SAME cell. Null ⇒ the window fold holds no
+   * row for this cell at all, which is a coverage hole, NOT agreement.
+   */
+  windowConsistent: boolean | null;
+  windowConsistentReason: ImpliedBarRConsistentReason | null;
+  windowExcludesPublishedBarR: boolean | null;
+  /**
+   * `true` ⇒ the two scopes reached different verdicts for this cell. `null` ⇒
+   * not comparable (no window-scoped row). ⛔ Never read `null` as `false`.
+   */
+  disagrees: boolean | null;
+  /** Which scope wins ON THE MERITS. Constant; the disagreement still stands. */
+  authoritativeScope: 'window';
+}
+
+/**
+ * Compare a cell's day-scoped bar recovery against the same cell's whole-window
+ * recovery. PURE. `window === null` ⇒ no window row for this cell ⇒ `disagrees`
+ * is `null`, never `false`.
+ */
+export function impliedBarRScopeCheck(
+  day: ImpliedBarR,
+  window: ImpliedBarR | null,
+): ImpliedBarRScopeCheck {
+  return {
+    dayConsistent: day.consistent,
+    dayConsistentReason: day.consistentReason,
+    dayExcludesPublishedBarR: day.excludesPublishedBarR,
+    windowConsistent: window?.consistent ?? null,
+    windowConsistentReason: window?.consistentReason ?? null,
+    windowExcludesPublishedBarR: window?.excludesPublishedBarR ?? null,
+    // Both columns are compared, not just `consistent`: on 09-25 the day read
+    // `excludesPublishedBarR: true` and the window read `null` (because its own
+    // `consistent` was false), which is the disagreement that nearly published.
+    disagrees:
+      window === null
+        ? null
+        : day.consistent !== window.consistent ||
+          day.excludesPublishedBarR !== window.excludesPublishedBarR,
+    authoritativeScope: 'window',
   };
 }
 

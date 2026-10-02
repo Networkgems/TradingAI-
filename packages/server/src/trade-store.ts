@@ -4,7 +4,7 @@ import { existsSync } from 'fs';
 import { constants as FS } from 'fs';
 import { join, dirname, basename } from 'path';
 import { accountDeletedAt, DELETED_ACCOUNTS_FILENAME } from './deleted-accounts.js';
-import type { AccountMode, Position, TradeSignal, Sma200Signal, Sma200SignalVoidRecord, Sma200GateRejectionRecord, OptionPosition, SignalType, TradierEnv } from '@trading-app/shared';
+import type { AccountMode, Position, TradeSignal, Sma200Signal, Sma200SignalVoidRecord, Sma200GateRejectionRecord, Sma200RejectionLedgerMeta, OptionPosition, SignalType, TradierEnv } from '@trading-app/shared';
 import type { DailySignalRecord } from './reports/eod-report.js';
 import type { PaperAccountSnapshot } from './paper-account.js';
 import { isEphemeralDataDir, resolveDataDir } from './data-dir.js';
@@ -180,6 +180,18 @@ export interface StocksTradeSnapshot {
    * the field.
    */
   sma200GateRejections?: Sma200GateRejectionRecord[];
+  /**
+   * TRA-4922 (AC-e) — the ledger above is a capped FIFO that `forceReset` wipes,
+   * so the fleet-folded AC7 count is not monotonic. This witness names WHICH of
+   * the two causes shrank it (eviction vs reset) and must travel with the ring
+   * through the DISK seam for the same reason the ring itself does: a reset
+   * followed by a redeploy would otherwise read `resets: 0` afterwards, and the
+   * restart would launder the decrement. Graded by
+   * `tra4411-rejection-ledger-durability.test.ts` against the WRITTEN object.
+   * Absent on snapshots written before the field — which means "no witness",
+   * NOT "no reset".
+   */
+  sma200RejectionLedgerMeta?: Sma200RejectionLedgerMeta;
   dailySignals: DailySignalRecord[];
   positionSignalType: Array<[string, SignalType]>; // serialized Map
   /**

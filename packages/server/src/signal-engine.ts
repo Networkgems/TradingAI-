@@ -16,8 +16,8 @@ import {
 // is HIDING. Pure; see the module doc for why it invents no new census.
 import { foldHiddenBookExposure } from './hidden-book-exposure.js';
 import { roundToCent } from '@trading-app/engine';
-import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Sma200SignalVoidRecord, Sma200VoidReason, Sma200GateRejectionRecord, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason, HiddenBookExposure } from '@trading-app/shared';
+import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Sma200SignalVoidRecord, Sma200VoidReason, Sma200GateRejectionRecord, Sma200RejectionLedgerMeta, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason, HiddenBookExposure } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-3390 (impl child of TRA-2628) — the entry-path currency refusal. See
 // `quoteCurrencyEntryVerdict` below for where it is consulted.
@@ -252,6 +252,16 @@ import {
   isWindowGatedCardSignalType,
   type CardCompletenessView,
 } from './card-completeness-ledger.js';
+// TRA-4877 — WHICH zero the live-equity sizer returned. `qty = 0` was one
+// byte-identical string for six different refusals, so a $428 book priced out
+// of AAPL read exactly like a dead quote feed. See the module header; the
+// bounds themselves are untouched.
+import {
+  explainLiveEquitySizing,
+  describeLiveEquitySizingZero,
+  LiveEquitySizingLedger,
+  type LiveEquitySizingZeroView,
+} from './live-equity-sizing-reason.js';
 // TRA-3944 — WHICH contract the OTM sleeve may buy, and HOW MANY. Entry-side
 // only, both books, engine-opened rows only (imported rows are audited, not
 // gated — see the module header).
@@ -936,6 +946,28 @@ export interface Sma200ScanStats {
   finishedAt: number;
   /** Symbols handed to the sweep. */
   considered: number;
+  /**
+   * TRA-4922 (AC-c) — the ACTUAL symbols this sweep was handed, so the fleet
+   * fold can publish a DISTINCT symbol union instead of Σ `considered`.
+   *
+   * Why the list and not the count: `considered` is a per-engine number and
+   * summing it over the fleet is a sigma, not a census — 68 engines × 100
+   * considered reads `6800` while the true union may be 100. TRA-4921's
+   * arrival-rate table was derived off "~751 names", which is a CODE COMMENT
+   * (`SMA200_DAILY_BARS` neighbourhood / `getActiveSymbols` docs), never a live
+   * census, and the per-engine universe genuinely differs: `getActiveSymbols`
+   * is cut by priority tier (held → signalled → risk inputs → watchlist →
+   * discovery tail, TRA-4830), and what a book HOLDS is per book.
+   *
+   * Snapshotted at sweep time and copied, NOT held by reference: the caller's
+   * `activeSymbols` is rebuilt per tick, so a reference would silently
+   * re-describe a later universe as the one this census graded.
+   *
+   * Optional (TRA-3913): absent on a build without it, and ABSENT ≠ EMPTY — a
+   * fold that reads a missing key as "swept nothing" re-creates this ticket's
+   * own defect. Deliberately NOT persisted (the census never is).
+   */
+  consideredSymbols?: string[];
   /** Symbols that yielded >= `SMA200_MIN_BARS` bars and were actually scored. */
   evaluated: number;
   /**
@@ -1009,6 +1041,33 @@ export interface EngineState {
    * Optional so pre-TRA-4411 fixtures still type-check (TRA-3913).
    */
   sma200GateRejections?: Sma200GateRejectionRecord[];
+  /**
+   * TRA-4922 (AC-d + AC-e) — the rejection ledger's INTEGRITY witness.
+   *
+   * `sma200GateRejections` above is a capped FIFO ring that `forceReset` also
+   * wipes, so the fleet-folded AC7 n is NOT monotonic: a re-read can be LOWER
+   * than an earlier one with no visible cause, and the two causes have opposite
+   * remedies (an eviction means the cap is too small for the burst; a reset
+   * means a book was re-based). Without this object both losses read exactly
+   * like a quiet tape — the same absent-key-as-measurement trap this ticket was
+   * filed for, one layer in.
+   *
+   * Scoped to the ledger's durable life, not the process: persisted with the
+   * ring, so a reset at 10:00 followed by a redeploy at 11:00 is still visible
+   * at 12:00. A counter that reset with the process would let a restart launder
+   * the decrement it exists to report.
+   *
+   * Optional (TRA-3913): absent on a build without it, and field presence is
+   * the deployed-bytes proof.
+   */
+  sma200RejectionLedgerMeta?: Sma200RejectionLedgerMeta;
+  /**
+   * TRA-4922 (AC-d) — the ring's capacity, published so a reader can see
+   * `sma200GateRejections.length === cap` (a ring sitting AT the cap is one
+   * arrival away from evicting a cohort member) without hard-coding the
+   * constant on the read side. Optional: deployed-bytes proof for the raise.
+   */
+  sma200RejectionCap?: number;
   /**
    * TRA-4457 — census of the most recent `runSma200Scan` sweep, or `null` if no
    * sweep has completed in this process yet.
@@ -1186,6 +1245,22 @@ export type LiveSkipCategory =
   | 'otm_mirror_not_wired'
   /** No quote / dedup / risk-manager gate declined the open — benign. */
   | 'risk_or_quote_gate'
+  /**
+   * TRA-4877 — one share costs at or above the per-position cap at this book,
+   * so the TRA-499 concentration admission refused the ticket. A CAPITAL-SIZE
+   * fact, not a wiring gap and not a broker reject: at a $427.94 book the cap
+   * is the $150 floor and 44 of 97 watchlist names are above it. Split out
+   * because it used to land in `other` alongside genuinely broken feeds.
+   */
+  | 'sizing_priced_out_at_book'
+  /**
+   * TRA-4877 — the sizer returned 0 for a reason that is NOT the price cap:
+   * an empty book, a zero risk budget, available funds below one share, a dead
+   * quote, or a degenerate stop distance. Still one bucket on the redacted
+   * probe (the raw `liveSkipReason` names which), but no longer the same bucket
+   * as the cap — that is the distinction the operator acts on.
+   */
+  | 'sizing_zero_not_cap'
   /** Broker (Tradier) rejected/cancelled the placement — a real broker-side reject. */
   | 'broker_reject'
   /** Anything not matched above. */
@@ -1204,6 +1279,24 @@ export function categorizeLiveSkipReason(reason: string): LiveSkipCategory {
   if (r.includes('live routing disabled') || r.includes('go-live gate')) return 'live_routing_gated';
   if (r.includes('daily equity limit')) return 'daily_limit_reached';
   if (r.includes('otm live broker mirror not wired')) return 'otm_mirror_not_wired';
+  // TRA-4877 — the sizing zeros, BEFORE the broker-reject match below. The
+  // priced-out string says "TRA-499 concentration admission" and the
+  // funds-below-one-share string says "would bounce at the broker", both of
+  // which contain "reject"-adjacent prose; matching broker_reject first would
+  // re-file a capital-size refusal as a broker reject, which is the exact
+  // mis-attribution this split exists to remove. The bracketed reason key is
+  // emitted by `describeLiveEquitySizingZero` and is the stable hook.
+  if (r.includes('[priced_out_at_book]')) return 'sizing_priced_out_at_book';
+  if (
+    r.includes('[available_funds_below_one_share]')
+    || r.includes('[risk_budget_nonpositive]')
+    || r.includes('[equity_nonpositive]')
+    || r.includes('[price_nonpositive]')
+    || r.includes('[stop_distance_nonpositive]')
+    || r.includes('tradier sizing yielded qty=0')
+  ) {
+    return 'sizing_zero_not_cap';
+  }
   if (r.includes('reject') || r.includes('cancel')) return 'broker_reject';
   if (r.includes('no quote') || r.includes('dedup') || r.includes('risk gate') || r.includes('not opened')) {
     return 'risk_or_quote_gate';
@@ -1219,6 +1312,8 @@ export const LIVE_SKIP_CATEGORIES: readonly LiveSkipCategory[] = [
   'daily_limit_reached',
   'otm_mirror_not_wired',
   'risk_or_quote_gate',
+  'sizing_priced_out_at_book',
+  'sizing_zero_not_cap',
   'broker_reject',
   'other',
 ];
@@ -1257,6 +1352,19 @@ export interface LiveEquityAcceptance {
    * real wiring gap (`client_not_configured`) without reading source or logs.
    */
   liveSkipReasonCategories: Record<LiveSkipCategory, number>;
+  /**
+   * TRA-4877 — WHICH zero the live-equity sizer returned, folded per ET day at
+   * the decision point and therefore NOT subject to the newest-50 ring that
+   * `liveSkipReasonCategories` above is derived from (TRA-4936 measured that
+   * ring dropping 94.5% of its population).
+   *
+   * ⚠️ Read `.wiring` FIRST. `never_recorded` means no sizing decision has
+   * reached this fold since boot, so every count is a DEFAULT — a
+   * `pricedOutAtBook: 0` there is not evidence the book is clearing its cap.
+   * Counts and constant labels only; no price, quantity or balance, so it is
+   * safe on the unauthenticated probe.
+   */
+  liveEquitySizingZeros: LiveEquitySizingZeroView;
   /** True once a mirror exists with both OCO legs AND a captured order id. */
   firstLiveEquityFillConfirmed: boolean;
   /** ISO time of the most recent live-equity mirror open, or null. Coarse — no trade detail. */
@@ -2243,7 +2351,12 @@ const SMA200_DAILY_BARS = SMA200_MIN_BARS + 30;
 // forming bar vs the settled bar), so debouncing on the raw millisecond value
 // defeats itself; the calendar day is the stable identity of "the same daily
 // bar" for dedupe purposes.
-function sma200BarDay(ts: number): number {
+// TRA-4922 — EXPORTED so the fleet fold in `health-routes` dedupes a union of
+// rejection rows with the SAME day identity the engine debounces on. A second
+// inlined `Math.floor(ts / 86_400_000)` there would be a copy that can drift
+// from this one, and the whole point of the fleet key is that it is the engine's
+// key. (See `summarizeSma200Sweeps`.)
+export function sma200BarDay(ts: number): number {
   return Math.floor(ts / 86_400_000);
 }
 
@@ -3573,6 +3686,11 @@ export class SignalEngine {
    */
   private readonly cardCompleteness = new CardCompletenessLedger();
   /**
+   * TRA-4877 — per-ET-day fold of live-equity sizing outcomes, OUTSIDE the
+   * newest-50 signal ring. Fed from `placeTradierEquityBracket` only.
+   */
+  private readonly liveEquitySizing = new LiveEquitySizingLedger();
+  /**
    * TRA-4936 — ring loss, MEASURED at the eviction site rather than derived by
    * subtracting two keys the reader has to find first. `total: 50` must never
    * again be readable as the population: 907 built / 50 kept was on the wire
@@ -3602,7 +3720,41 @@ export class SignalEngine {
    * for why the rejected cohort must have a durable surface at all.
    */
   private sma200GateRejections: Sma200GateRejectionRecord[] = [];
-  private static readonly SMA200_REJECTION_MAX = 50;
+  /**
+   * TRA-4922 (AC-d) — RAISED 50 → 400.
+   *
+   * AC7 requires each counted rejection to accrue ~20 daily bars before it
+   * enters its cohort, so a row must survive ~20 sessions in this ring. 50 is
+   * ample at the MEAN arrival rate (measured: this process's whole ledger sat
+   * flat at 4 rows across an 18h session, 2026-09-24 full-session census;
+   * `rejectedMaxDist: 0` on the reporting book 2026-09-25) — but the mean is not
+   * the binding case. Arrivals are DATE-CLUSTERED: a market-wide trend day
+   * rejects many names in one sweep, and a single such burst is what evicts a
+   * cohort before it matures.
+   *
+   * The ceiling is derived, not guessed. The per-name rejection debounce is
+   * {@link SMA200_DEBOUNCE_BARS} (5) bars keyed `(symbol, kind)` on its OWN
+   * ledger, so across a 20-bar cohort window ONE name can contribute at most
+   * ⌈20/5⌉ = 4 rows. 400 therefore holds a complete 20-session cohort for up to
+   * ~100 distinct names — and the live universe handed to a sweep is ~100-751
+   * names, so 400 covers a burst that refuses every name of a 100-name book and
+   * still leaves headroom. Cost: ~400 × ~150B ≈ 60KB per book, bounded, which is
+   * noise against the TRA-4158 heap envelope.
+   *
+   * 🔴 No cap is PROVABLY sufficient — the burst has never been observed, so any
+   * number here is an estimate against an unmeasured tail. That is precisely why
+   * the raise ships WITH {@link Sma200RejectionLedgerMeta}`.evicted`: the
+   * guarantee is not "we never evict", it is "an eviction is never silent".
+   * Grading the cap by its size alone would be grading a control by its flag.
+   */
+  private static readonly SMA200_REJECTION_MAX = 400;
+  /**
+   * TRA-4922 (AC-d + AC-e) — the ledger's integrity witness. See
+   * {@link Sma200RejectionLedgerMeta}; persisted with the ring.
+   */
+  private sma200RejectionLedgerMeta: Sma200RejectionLedgerMeta = {
+    evicted: 0, resets: 0, lastResetAt: null, lastResetDropped: 0,
+  };
   /**
    * TRA-787 — per-symbol 5m candle series for the SupertrendConfluence shadow
    * scan, resampled from a deeper minute-bar pull than the ORB cache. Refreshed
@@ -3934,12 +4086,36 @@ export class SignalEngine {
   private supertrendShadowSignals: TradeSignal[] = [];
   /**
    * TRA-1972 (D1 of TRA-1968) — ring buffer of the most recent catalyst
-   * earnings/macro proximity SHADOW decisions (both gated and clear), surfaced
-   * on EngineState.catalystGateShadowDecisions so QuantTrader can eyeball what
+   * earnings/macro proximity SHADOW decisions, surfaced on
+   * EngineState.catalystGateShadowDecisions so QuantTrader can eyeball what
    * WOULD get gated on the live path before any live suppression is armed.
    * Observe-only: appended by {@link evaluateCatalystGateShadow}; never routes.
+   *
+   * ⚠️ Only **gated** decisions land here (see {@link evaluateCatalystGateShadow}) —
+   * the docstring used to claim "both gated and clear", which it never was. So an
+   * empty buffer reads identically whether the gate evaluated nothing or evaluated
+   * thousands of entries and cleared them all. {@link catalystGateShadowCensus}
+   * is the denominator that tells those two apart (TRA-4430).
    */
   private catalystGateShadowDecisions: CatalystGateDecision[] = [];
+  /**
+   * TRA-4430 — process-local census over EVERY catalyst-gate SHADOW evaluation,
+   * gated or clear. The ring buffer above is the gated numerator only; without a
+   * denominator an inert gate and a quiet one are indistinguishable — which is
+   * the whole TRA-4430 finding. `fomcReadable`/`earningsReadable` count the
+   * evaluations whose calendar read came back non-null, i.e. the ones where the
+   * corresponding rule was *able* to fire. Resets on reboot.
+   */
+  private catalystGateShadowStats = {
+    evaluated: 0,
+    gated: 0,
+    byRule: { earnings_swing: 0, earnings_intraday: 0, macro_meanrev: 0 } as Record<string, number>,
+    fomcReadable: 0,
+    earningsReadable: 0,
+    firstEvaluatedAt: null as number | null,
+    lastEvaluatedAt: null as number | null,
+    lastDaysToFomc: null as number | null,
+  };
   /**
    * TRA-4626 — latest swing signal candidates from the fusion engine, surfaced
    * on EngineState.swingSignals. Observe-only until graduation gates pass.
@@ -5029,6 +5205,14 @@ export class SignalEngine {
     this.sma200LastFired.clear();
     // TRA-4411 — a full reset drops the gate-rejection ledger and its debounce
     // with it (the evidence archive belongs to the state being reset).
+    // TRA-4922 (AC-e) — but it does NOT get to do so silently. This wipe removes
+    // this book's whole contribution to the fleet-folded AC7 union, so a re-read
+    // afterwards is LOWER than the earlier one; without the stamp below, the
+    // shrink has no cause a reader can see and is indistinguishable from a quiet
+    // tape. Stamped BEFORE the clear so `lastResetDropped` is the real loss.
+    this.sma200RejectionLedgerMeta.resets += 1;
+    this.sma200RejectionLedgerMeta.lastResetAt = Date.now();
+    this.sma200RejectionLedgerMeta.lastResetDropped = this.sma200GateRejections.length;
     this.sma200GateRejections = [];
     this.sma200LastRejected.clear();
     // TRA-335 — wipe the live equity mirror too. The Tradier-side positions
@@ -7782,6 +7966,22 @@ export class SignalEngine {
       asOf,
       config: resolveCatalystGateConfig(),
     });
+    // TRA-4430 — census EVERY evaluation, not just the gated ones, so
+    // `/api/health/catalyst-gate` can report a denominator beside the ring
+    // buffer's numerator and an inert calendar cannot read as a quiet tape.
+    const st = this.catalystGateShadowStats;
+    st.evaluated += 1;
+    st.firstEvaluatedAt ??= asOf;
+    st.lastEvaluatedAt = asOf;
+    if (decision.daysToFomc !== null) {
+      st.fomcReadable += 1;
+      st.lastDaysToFomc = decision.daysToFomc;
+    }
+    if (decision.earningsInDays !== null) st.earningsReadable += 1;
+    if (decision.gated) {
+      st.gated += 1;
+      if (decision.rule) st.byRule[decision.rule] = (st.byRule[decision.rule] ?? 0) + 1;
+    }
     if (decision.gated) {
       signal.catalystGateShadowReason = decision.reason ?? undefined;
       catalystGateLog.info('catalyst gate SHADOW decision (observe-only, not routed)', {
@@ -7804,6 +8004,41 @@ export class SignalEngine {
       }
     }
     return decision;
+  }
+
+  /**
+   * TRA-4430 — redacted, per-engine census of the TRA-1972 SHADOW gate's
+   * evaluations for the unauthenticated `/api/health/catalyst-gate` probe.
+   * Counts and timestamps only: no symbols, no strategies-per-symbol, nothing
+   * position-bearing, matching the sibling open probes. Process-local — it
+   * resets on reboot, so read `evaluated: 0` as "no targeted entry has been
+   * evaluated since this boot", never as "the gate is broken".
+   */
+  catalystGateShadowCensus(): {
+    engineMode: string;
+    evaluated: number;
+    gated: number;
+    byRule: Record<string, number>;
+    fomcReadable: number;
+    earningsReadable: number;
+    firstEvaluatedAt: string | null;
+    lastEvaluatedAt: string | null;
+    lastDaysToFomc: number | null;
+    surfacedDecisions: number;
+  } {
+    const st = this.catalystGateShadowStats;
+    return {
+      engineMode: this.mode,
+      evaluated: st.evaluated,
+      gated: st.gated,
+      byRule: { ...st.byRule },
+      fomcReadable: st.fomcReadable,
+      earningsReadable: st.earningsReadable,
+      firstEvaluatedAt: st.firstEvaluatedAt === null ? null : new Date(st.firstEvaluatedAt).toISOString(),
+      lastEvaluatedAt: st.lastEvaluatedAt === null ? null : new Date(st.lastEvaluatedAt).toISOString(),
+      lastDaysToFomc: st.lastDaysToFomc,
+      surfacedDecisions: this.catalystGateShadowDecisions.length,
+    };
   }
 
   /**
@@ -8354,6 +8589,8 @@ export class SignalEngine {
       startedAt: Date.now(),
       finishedAt: 0,
       considered: symbols.length,
+      // TRA-4922 (AC-c) — copy, never alias: `activeSymbols` is rebuilt per tick.
+      consideredSymbols: [...symbols],
       evaluated: 0,
       starvedBreakerOpen: 0,
       starvedShortHistory: 0,
@@ -8558,9 +8795,18 @@ export class SignalEngine {
               recordedAt: Date.now(),
             });
             if (this.sma200GateRejections.length > SignalEngine.SMA200_REJECTION_MAX) {
-              this.sma200GateRejections.splice(
-                0, this.sma200GateRejections.length - SignalEngine.SMA200_REJECTION_MAX,
-              );
+              const dropped = this.sma200GateRejections.length - SignalEngine.SMA200_REJECTION_MAX;
+              this.sma200GateRejections.splice(0, dropped);
+              // TRA-4922 (AC-d) — count the loss. An evicted row and a row that
+              // never arrived are byte-identical once gone, so an un-counted
+              // eviction silently truncates the AC7 cohort and reads as a quiet
+              // tape. Same discipline as `cardRingEvicted` (TRA-4936).
+              this.sma200RejectionLedgerMeta.evicted += dropped;
+              log.warn('sma200 rejection ledger evicted rows at cap', {
+                component: 'sma200-scan', issue: 'TRA-4922',
+                dropped, cap: SignalEngine.SMA200_REJECTION_MAX,
+                evictedTotal: this.sma200RejectionLedgerMeta.evicted,
+              });
             }
             this.sma200LastRejected.set(key, latestBarTs);
             stats.rejectedMaxDist = (stats.rejectedMaxDist ?? 0) + 1;
@@ -23759,6 +24005,12 @@ export class SignalEngine {
         sma200SignalVoids: this.sma200SignalVoids,
         // TRA-4411 (AC6) — the max-dist gate's rejected cohort (its only surface).
         sma200GateRejections: this.sma200GateRejections,
+        // TRA-4922 (AC-d/AC-e) — and the ring's integrity witness beside it, so a
+        // SHRINKING fleet-folded n has a named cause (eviction vs reset) instead
+        // of reading as a quiet tape. Published on BOTH getState branches: a
+        // witness visible on one branch only is unobservable for half the fleet.
+        sma200RejectionLedgerMeta: this.sma200RejectionLedgerMeta,
+        sma200RejectionCap: SignalEngine.SMA200_REJECTION_MAX,
         // TRA-4457 — the sweep census, so a reader can see the denominator that
         // makes an empty `signals` array mean something.
         sma200ScanStats: this.lastSma200ScanStats,
@@ -23832,6 +24084,9 @@ export class SignalEngine {
       sma200SignalVoids: this.sma200SignalVoids,
       // TRA-4411 (AC6) — the max-dist gate's rejected cohort (its only surface).
       sma200GateRejections: this.sma200GateRejections,
+      // TRA-4922 (AC-d/AC-e) — see the sibling getState branch above.
+      sma200RejectionLedgerMeta: this.sma200RejectionLedgerMeta,
+      sma200RejectionCap: SignalEngine.SMA200_REJECTION_MAX,
       // TRA-4457 — the sweep census, so a reader can see the denominator that
       // makes an empty `signals` array mean something.
       sma200ScanStats: this.lastSma200ScanStats,
@@ -23911,6 +24166,7 @@ export class SignalEngine {
       liveEquityMirrorsWithOrderId: mirrorsWithOrderId,
       liveSkipReasonCount,
       liveSkipReasonCategories,
+      liveEquitySizingZeros: this.liveEquitySizing.snapshot(),
       firstLiveEquityFillConfirmed: bracketsWithBothLegs > 0 && mirrorsWithOrderId > 0,
       lastLiveEquityFillAt: lastOpenedAt > 0 ? new Date(lastOpenedAt).toISOString() : null,
     };
@@ -24243,6 +24499,14 @@ export class SignalEngine {
      * Optional: absent on pre-TRA-4411 snapshots.
      */
     sma200GateRejections?: Sma200GateRejectionRecord[];
+    /**
+     * TRA-4922 (AC-e) — persisted integrity witness for the ledger above. MUST
+     * travel with the ring: a reset at 10:00 followed by a redeploy at 11:00
+     * would otherwise read `resets: 0` at 12:00, and the restart would launder
+     * the very decrement this field exists to report. Optional: absent on
+     * pre-TRA-4922 snapshots, where ABSENT means "no witness", not "no reset".
+     */
+    sma200RejectionLedgerMeta?: Sma200RejectionLedgerMeta;
     dailySignals: DailySignalRecord[];
     positionSignalType: Array<[string, SignalType]>;
     account: ReturnType<PaperAccount['exportSnapshot']>;
@@ -24276,6 +24540,7 @@ export class SignalEngine {
       recentSignals: [...this.recentSignals],
       sma200SignalVoids: [...this.sma200SignalVoids],
       sma200GateRejections: [...this.sma200GateRejections],
+      sma200RejectionLedgerMeta: { ...this.sma200RejectionLedgerMeta },
       dailySignals: [...this.dailySignals],
       positionSignalType: Array.from(this.positionSignalType.entries()),
       account: this.account.exportSnapshot(),
@@ -24405,6 +24670,28 @@ export class SignalEngine {
     this.sma200GateRejections = Array.isArray(snap.sma200GateRejections)
       ? [...snap.sma200GateRejections]
       : [];
+    // TRA-4922 (AC-e) — and its integrity witness, restored with it. A
+    // pre-TRA-4922 snapshot carries no witness; that must read as a ZEROED
+    // witness (no eviction/reset OBSERVED), never be silently invented, so the
+    // fields are copied only when actually present and numeric.
+    const restoredMeta = snap.sma200RejectionLedgerMeta;
+    this.sma200RejectionLedgerMeta = {
+      evicted: typeof restoredMeta?.evicted === 'number' ? restoredMeta.evicted : 0,
+      resets: typeof restoredMeta?.resets === 'number' ? restoredMeta.resets : 0,
+      lastResetAt: typeof restoredMeta?.lastResetAt === 'number' ? restoredMeta.lastResetAt : null,
+      lastResetDropped: typeof restoredMeta?.lastResetDropped === 'number'
+        ? restoredMeta.lastResetDropped
+        : 0,
+    };
+    // TRA-4922 (AC-d) — a snapshot written under a LARGER cap than this build
+    // runs would silently over-fill the ring and then evict on the next arrival
+    // without ever crossing the splice above. Re-apply the cap at restore and
+    // count the loss, so a cap DOWNGRADE is as visible as a runtime eviction.
+    if (this.sma200GateRejections.length > SignalEngine.SMA200_REJECTION_MAX) {
+      const dropped = this.sma200GateRejections.length - SignalEngine.SMA200_REJECTION_MAX;
+      this.sma200GateRejections.splice(0, dropped);
+      this.sma200RejectionLedgerMeta.evicted += dropped;
+    }
     this.sma200LastRejected.clear();
     for (const r of this.sma200GateRejections) {
       if (typeof r.barTimestamp !== 'number') continue;
@@ -24911,7 +25198,12 @@ export class SignalEngine {
     if (shortBlockedOnCashAccount(signal.side, balance)) {
       return { ok: false, reason: 'short not supported on a cash account' };
     }
-    const qty = sizeLiveEquityFromStop({
+    // TRA-4877 — `explainLiveEquitySizing` IS `sizeLiveEquityFromStop` (the
+    // latter is a `.qty` projection of it), so the share count below is
+    // unchanged. What it adds is WHICH bound produced a zero: the old single
+    // string could not tell a $428 book priced out of a $350 share from a dead
+    // quote, an empty account, or a zero risk budget.
+    const sizing = explainLiveEquitySizing({
       balance,
       managedAccountRatio: this.managedAccountRatio,
       riskPerTrade: this.riskPerTrade,
@@ -24924,10 +25216,20 @@ export class SignalEngine {
       // de-risk decision short of a halt actually shrinks the broker order.
       sizeMultiplier: this.activeRiskSizingMultiplier('equity_live') * capScale,
     });
+    // Fold at the DECISION, not off `recentSignals`: that ring keeps the newest
+    // 50 rows and TRA-4936 measured it dropping 94.5% of its own population, so
+    // a count derived from it cannot answer "how often did we price out today".
+    // Recorded here only — the mirror and the correlated-cap estimate re-run the
+    // same sizer on the same tick and counting those would treble the
+    // denominator for one decision.
+    this.liveEquitySizing.record(sizing, Date.now());
+    const qty = sizing.qty;
     if (qty <= 0) {
       return {
         ok: false,
-        reason: `Tradier sizing yielded qty=0 (cash=${balance.totalCash.toFixed(2)} stockBP=${balance.stockBuyingPower ?? 'null'})`,
+        reason:
+          `${describeLiveEquitySizingZero(sizing)} `
+          + `(cash=${balance.totalCash.toFixed(2)} stockBP=${balance.stockBuyingPower ?? 'null'})`,
       };
     }
     // TRA-4650 — the TRA-4655 hard-controls choke point, bound at THE live
@@ -26013,94 +26315,17 @@ export function sizeLiveEquityFromStop(args: {
    */
   sizeMultiplier?: number;
 }): number {
-  const { balance, managedAccountRatio, riskPerTrade, entryPrice, stopPrice, currentPrice } = args;
-  const dist = Math.abs(entryPrice - stopPrice);
-  if (dist <= 0 || currentPrice <= 0) return 0;
-  const lmv = balance.longMarketValue ?? 0;
-  const baseEquity = (balance.totalCash ?? 0) + lmv;
-  if (baseEquity <= 0) return 0;
-  const managedEquity = baseEquity * managedAccountRatio;
-  const maxRisk = managedEquity * riskPerTrade;
-  if (maxRisk <= 0) return 0;
-  const riskQty = Math.floor(maxRisk / dist);
-  const equityCap = Math.floor(managedEquity / currentPrice);
-  let qty = Math.min(riskQty, equityCap);
-  const sbp = balance.stockBuyingPower;
-  if (typeof sbp === 'number' && sbp > 0) {
-    qty = Math.min(qty, Math.floor(sbp / currentPrice));
-  }
-  const mult = args.sizeMultiplier;
-  if (typeof mult === 'number' && Number.isFinite(mult) && mult > 0 && mult < 1) {
-    qty = Math.floor(qty * mult);
-  }
-  // TRA-499 — per-position dollar cap on live equity tickets, mirroring the
-  // TRA-495/TRA-497 options ticket cap. Below ~$1k equity the raw 15%-of-equity
-  // cap drops below the $150 ticket floor and would null out reasonable
-  // entries even though the risk-from-stop math allows them. Apply the cap
-  // *after* the risk/equity/BP/regime trims so the cap is the final upper
-  // bound rather than something the broader risk math has to respect.
+  // TRA-4877 — the arithmetic moved VERBATIM into `explainLiveEquitySizing`,
+  // which returns the same share count PLUS the reason when that count is 0.
+  // This signature is a `.qty` projection of it and is kept because ~40 call
+  // sites and tests read a bare number. There is deliberately only ONE copy of
+  // the sizing arithmetic: a "mirror" of it here would agree with itself and
+  // drift from the engine, which is exactly the control-on-a-local-copy trap.
   //
-  // Two-step gate, mirroring `OptionsAccount.sizeContracts`:
-  //   1. If the risk-from-stop math rounded `qty` to 0 (e.g. $550 book, $50
-  //      share, $2 stop distance ⇒ `riskQty = 13` but the buying-power /
-  //      managed-equity caps trim it down) AND a single share's notional fits
-  //      under the per-position cap, force `qty = 1`. This is the LIVE-only
-  //      1-share floor that makes a $550 book actually buy something.
-  //   2. If multi-share `qty × currentPrice` exceeds the cap, trim back to
-  //      `floor(cap / currentPrice)`. This is the same trim the options path
-  //      does after the dollar floor lifts the budget above the cap.
-  //
-  // Cap is `max($150, 15% × equity)`. Per QuantTrader on the TRA-499 review
-  // handoff, the equity sizing uses a *strict-less-than* admission boundary
-  // for the 1-share-cost vs the per-position cap: a single ticket whose
-  // 1-share cost equals or exceeds the cap is rejected up-front, because
-  // that ticket would consume 100% of the cap (e.g. a $150 stock on a $550
-  // book is 27% concentration in one fill). This is intentionally asymmetric
-  // with `OptionsAccount.sizeContracts`, where the 1-contract floor uses
-  // `<= cap` because options have 100× quantization and the cap floor was
-  // raised to $150 in TRA-497 specifically to admit a $1.50-mark contract
-  // on a small book. Multi-share equity positions trimmed down so that the
-  // final notional equals the cap exactly (e.g. 3 × $50 = $150) are kept —
-  // the per-share granularity diversifies the same dollar concentration
-  // across multiple fills. Fractional-share support is intentionally not
-  // enabled here (see TRA-499 spec).
-  // TRA-711 — how many whole shares the account's *available funds* can
-  // actually cover. `stockBuyingPower` is Tradier's option/stock buying power
-  // on margin accounts and falls back to `cash.cash_available` on cash
-  // accounts, i.e. the funds left after cash already committed to open /
-  // pending orders — the same "Available Funds" figure the broker enforces at
-  // submit time. `null` ⇒ Tradier didn't surface any buying-power bucket ⇒
-  // stay permissive (Infinity) and let the post-submit reconcile void the
-  // mirror if the order bounces.
-  const affordableShares =
-    typeof sbp === 'number' && Number.isFinite(sbp) && sbp > 0
-      ? Math.floor(sbp / currentPrice)
-      : Number.POSITIVE_INFINITY;
-
-  const cap = perPositionCap(baseEquity);
-  if (currentPrice >= cap) return 0;
-  // TRA-711 — only lift to the LIVE 1-share floor when a single share's
-  // notional actually fits inside available funds. Forcing qty = 1 on a book
-  // whose available funds are below one share's cost (e.g. $26 available, a
-  // $129 share) is exactly what made Tradier reject the equity bracket in the
-  // screenshot: the buying-power cap above had already ground qty to 0 and
-  // this floor re-inflated it to an order the broker could never fill. When
-  // funds can't cover even one share, size to 0 so the caller surfaces a
-  // clean `liveSkipReason` instead of submitting an order we know will bounce.
-  if (qty <= 0) {
-    if (affordableShares < 1) return 0;
-    qty = 1;
-  }
-  if (qty > 0 && qty * currentPrice > cap) {
-    qty = Math.floor(cap / currentPrice);
-  }
-  // TRA-711 — final hard ceiling on available funds. The buying-power cap
-  // above runs before the per-position-cap trim and the 1-share floor, so
-  // re-apply it here as the last word: never request more shares than the
-  // account's available funds can settle, no matter what the intermediate
-  // risk / cap / floor steps produced.
-  if (Number.isFinite(affordableShares)) {
-    qty = Math.min(qty, affordableShares);
-  }
-  return qty > 0 ? qty : 0;
+  // `0` from this function is UNATTRIBUTED by construction. A caller that needs
+  // to tell "priced out at this book" from "no quote" / "empty book" / "risk
+  // budget zero" / "funds below one share" MUST call `explainLiveEquitySizing`
+  // directly — the four were one byte-identical string until TRA-4877.
+  return explainLiveEquitySizing(args).qty;
 }
+
