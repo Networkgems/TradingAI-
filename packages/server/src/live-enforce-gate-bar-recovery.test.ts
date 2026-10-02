@@ -128,7 +128,52 @@ describe('TRA-4745 — the bar as applied, recovered from already-recorded rows'
     expect(got!.lowerBound).toBeNull();
     expect(got!.upperBound).toBeCloseTo(0.42, 6);
     expect(got!.rowsAdmittedUsed).toBe(1);
-    expect(got!.excludesPublishedBarR).toBe(false);
+    // ⭐ TRA-4941 — the bound above is still RECOVERED and still published; what
+    // changed is that it no longer produces a VERDICT. Nothing here bounded the
+    // bar from below, so the interval is half-open and must not grade a published
+    // scalar in EITHER direction. This assertion used to read `false`.
+    expect(got!.consistentReason).toBe('one_sided_sample');
+    expect(got!.consistent).toBeNull();
+    expect(got!.excludesPublishedBarR).toBeNull();
+  });
+
+  // ⭐ TRA-4941 — the incident, as a unit. The 2026-09-25 / `0.30-0.40` shape:
+  // admits only, no blocked row, and a published bar far ABOVE the recovered
+  // upper bound. The old code rendered `consistent: true` +
+  // `excludesPublishedBarR: true` off this — "the live bar is not 0.385" —
+  // because `lower === null` made `lower <= upper` vacuously true.
+  it('TRA-4941 — a HALF-OPEN interval must not refute the published bar', () => {
+    const got = impliedBarR(
+      Array.from({ length: 111 }, () => ({
+        grossR: -0.215375,
+        blocked: false,
+        reasonCode: null,
+      })),
+      PUBLISHED_BAR,
+    );
+    expect(got!.rowsAdmittedUsed).toBe(111);
+    expect(got!.rowsBlockedUsed).toBe(0);
+    expect(got!.lowerBound).toBeNull();
+    expect(got!.upperBound).toBeCloseTo(-0.215375, 6);
+    // The published bar 0.385 IS numerically outside `barR <= -0.215375`. The
+    // refusal is not about the arithmetic — it is that one side of the
+    // comparison was never tested here, so the interval is not evidence.
+    expect(got!.consistentReason).toBe('one_sided_sample');
+    expect(got!.consistent).toBeNull();
+    expect(got!.excludesPublishedBarR).toBeNull();
+  });
+
+  // The negative control for the assertion above: the guard must NOT fire on a
+  // two-sided interval, or it would have suppressed TRA-4745's whole finding.
+  it('TRA-4941 — ONE blocked row in a bounded bucket is still two-sided and still grades', () => {
+    const got = impliedBarR(
+      [{ grossR: 0.428045, blocked: true, reasonCode: 'shortfall_lt_0.10' }],
+      PUBLISHED_BAR,
+    );
+    expect(got!.rowsAdmittedUsed).toBe(0);
+    expect(got!.consistentReason).toBe('two_sided');
+    expect(got!.consistent).toBe(true);
+    expect(got!.excludesPublishedBarR).toBe(true);
   });
 
   it('an EMPTY intersection is a RESULT: consistent=false says the bar moved mid-group', () => {
@@ -195,8 +240,13 @@ describe('TRA-4745 — the per-day cell edge axis separates recorded from back-f
     // in the direction that matters — a back-fill CANNOT produce two values.
     expect(d21.grossR!.min).not.toBe(d26.grossR!.min);
 
-    // And each day is individually consistent, at DIFFERENT bars.
-    expect(d21.barRImplied!.consistent).toBe(true);
+    // And neither day CONFLICTS with itself — but TRA-4941: say that with the
+    // basis attached. 08-21 holds one ADMITTED row, so its interval is half-open
+    // (`barR <= 0.658764`) and it grades nothing; 08-26 holds one blocked row in
+    // a bounded bucket, which closes both ends and does grade.
+    expect(d21.barRImplied!.consistentReason).toBe('one_sided_sample');
+    expect(d21.barRImplied!.consistent).toBeNull();
+    expect(d26.barRImplied!.consistentReason).toBe('two_sided');
     expect(d26.barRImplied!.consistent).toBe(true);
     expect(d26.barRImplied!.lowerBound).toBeCloseTo(0.428045, 6);
   });
@@ -209,15 +259,112 @@ describe('TRA-4745 — the per-day cell edge axis separates recorded from back-f
     row({ day: '2026-08-26', cell: CELL, grossR: 0.428045, blocked: true, reasonCode: 'shortfall_lt_0.10', ts: 1 });
     row({ day: '2026-09-01', cell: CELL, grossR: 0.40, blocked: false, ts: 2 });
 
-    expect(dayCell('2026-08-26', CELL).barRImplied!.consistent).toBe(true);
-    expect(dayCell('2026-09-01', CELL).barRImplied!.consistent).toBe(true);
+    const d0826 = dayCell('2026-08-26', CELL);
+    const d0901 = dayCell('2026-09-01', CELL);
+    expect(d0826.barRImplied!.consistent).toBe(true);
+    // TRA-4941 — 09-01 holds ONE admitted row, so it is half-open and grades
+    // nothing. It used to read `consistent: true`, which is the vacuous `true`
+    // this ticket removed. (It was never the same claim as 08-26's.)
+    expect(d0901.barRImplied!.consistentReason).toBe('one_sided_sample');
+    expect(d0901.barRImplied!.consistent).toBeNull();
 
     const pooled = pooledCell('2026-09-01', CELL);
     // barR >= 0.428045 (from 08-26) AND barR <= 0.40 (from 09-01) is empty.
     expect(pooled.barRImplied!.consistent).toBe(false);
+    expect(pooled.barRImplied!.consistentReason).toBe('two_sided');
     // This is the fact no other field on the payload can state: these rows did
     // not all face one bar, so the published scalar describes neither of them.
     expect(pooled.barRImplied!.excludesPublishedBarR).toBeNull();
+
+    // ⭐ TRA-4941 DEFECT 2 ask 2 — the day-vs-window disagreement, IN BAND. A
+    // reader of the 08-26 day row alone sees `consistent: true` and would publish
+    // it; the scope check on that same row says the whole-window fold for this
+    // cell disagrees, and that the window is the scope that wins.
+    const check = d0826.barRImpliedScopeCheck!;
+    expect(check.dayConsistent).toBe(true);
+    expect(check.windowConsistent).toBe(false);
+    expect(check.disagrees).toBe(true);
+    expect(check.authoritativeScope).toBe('window');
+    // The disagreement is published, NOT resolved: the day row still carries its
+    // own verdict verbatim beside it.
+    expect(d0826.barRImplied!.consistent).toBe(true);
+  });
+
+  // ⭐ TRA-4941 DEFECT 2 ACCEPTANCE — the live 2026-09-25 / `0.30-0.40` read,
+  // reproduced end to end through the fold (not just the pure function).
+  //
+  // Day-scoped: `rowsAdmittedUsed` 111, `rowsBlockedUsed` 0, `upperBound`
+  // -0.215375 ⇒ the old build published `consistent: true` +
+  // `excludesPublishedBarR: true`, i.e. "the published bar 0.385 is REFUTED".
+  // Whole-window, same cell: `lowerBound` 0.284625 > `upperBound` -0.215375 ⇒
+  // `consistent: false`. The contradicting evidence lived ONLY outside the day.
+  it('TRA-4941 ACCEPTANCE — the 09-25 cell abstains day-scoped AND publishes the scope disagreement', () => {
+    const C = 'single_leg_otm::0.30-0.40';
+    // The day's 111 admits, all at the same recorded edge.
+    for (let i = 0; i < 111; i += 1) {
+      row({ day: '2026-09-25', cell: C, grossR: -0.215375, blocked: false, ts: 1_000 + i });
+    }
+    // The contradicting evidence, OUTSIDE the day: a blocked row demanding
+    // barR >= 0.284625. Present in the window fold, absent from 09-25.
+    row({
+      day: '2026-09-22',
+      cell: C,
+      grossR: 0.284625,
+      blocked: true,
+      reasonCode: 'shortfall_lt_0.10',
+      ts: 900,
+    });
+
+    const day = dayCell('2026-09-25', C);
+    expect(day.barRImplied!.rowsAdmittedUsed).toBe(111);
+    expect(day.barRImplied!.rowsBlockedUsed).toBe(0);
+    expect(day.barRImplied!.upperBound).toBeCloseTo(-0.215375, 6);
+    expect(day.barRImplied!.lowerBound).toBeNull();
+    // ACCEPTANCE 1 — `consistent: null` with a reason, never `true`, and no
+    // verdict against the published bar off one side of the comparison.
+    expect(day.barRImplied!.consistentReason).toBe('one_sided_sample');
+    expect(day.barRImplied!.consistent).toBeNull();
+    expect(day.barRImplied!.excludesPublishedBarR).toBeNull();
+
+    // The window fold, for the same cell, reaches the opposite verdict.
+    const pooled = pooledCell('2026-09-25', C);
+    expect(pooled.barRImplied!.lowerBound).toBeCloseTo(0.284625, 6);
+    expect(pooled.barRImplied!.upperBound).toBeCloseTo(-0.215375, 6);
+    expect(pooled.barRImplied!.consistent).toBe(false);
+
+    // ACCEPTANCE 2 — the disagreement is visible WITHOUT the reader holding both
+    // payloads side by side: it is a field on the day row itself.
+    const check = day.barRImpliedScopeCheck!;
+    expect(check.dayConsistent).toBeNull();
+    expect(check.dayConsistentReason).toBe('one_sided_sample');
+    expect(check.windowConsistent).toBe(false);
+    expect(check.windowConsistentReason).toBe('two_sided');
+    expect(check.disagrees).toBe(true);
+    // ⛔ Not resolved silently in either direction — the wider scope is NAMED as
+    // the one that wins, and the day's own verdict is still published verbatim.
+    expect(check.authoritativeScope).toBe('window');
+  });
+
+  // The negative control for the scope check: when the two scopes AGREE it must
+  // read `false`, not `true`, or the field is a constant rather than a detector.
+  it('TRA-4941 — agreeing scopes read disagrees:false, and an absent window scope reads null', () => {
+    const C = 'single_leg_otm::0.30-0.40';
+    // One blocked row, one day. Day fold and window fold see the same rows, so
+    // every column matches.
+    row({
+      day: '2026-09-25',
+      cell: C,
+      grossR: 0.428045,
+      blocked: true,
+      reasonCode: 'shortfall_lt_0.10',
+      ts: 1,
+    });
+    const check = dayCell('2026-09-25', C).barRImpliedScopeCheck!;
+    expect(check.dayConsistent).toBe(true);
+    expect(check.windowConsistent).toBe(true);
+    expect(check.dayExcludesPublishedBarR).toBe(true);
+    expect(check.windowExcludesPublishedBarR).toBe(true);
+    expect(check.disagrees).toBe(false);
   });
 
   it('a cell-day that re-folds mid-session publishes distinct > 1 — the only way a day lands strictly between', () => {
