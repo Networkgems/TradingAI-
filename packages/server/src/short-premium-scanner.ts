@@ -306,13 +306,43 @@ export interface ShortPremiumIvRankCoverageRollup {
   /** The sample floor a trailing window must clear before any rank is emitted. */
   minSamples: number;
   /**
+   * Whether this fold had ANY population to measure — `scanCount > 0`.
+   *
+   * ⚠️ Read this BEFORE any counter below it. The store is swept to
+   * {@link STORE_TTL_MS}, so a read taken more than 30 minutes after the last
+   * demo tick folds ZERO scans, and every counter here is then a vacuous 0 —
+   * `gateInert: 0` in particular reads exactly like "the floor evaluated on
+   * every row", which is the *healthiest* possible value, published over
+   * nothing. Measured on bqb1 2026-10-02T06:31Z (live `28e61b7be5f5`, booted
+   * 05:59:57Z, pre-open): `scanCount 0`, every counter 0, `partitionOk` was
+   * `true`. That is the repo's "absent evidence must read as its own named
+   * state" rule (CLAUDE.md §health fields) violated by this very rollup.
+   */
+  populated: boolean;
+  /** The store's sweep horizon, so "no pass within the TTL" is answerable on the wire. */
+  storeTtlMs: number;
+  /** Newest in-TTL scan record in this fold, or null when there is no population. */
+  lastRecordedAt: string | null;
+  /**
+   * Named outcome of the cross-check, never a bare boolean:
+   *   `verified`      — there was a population AND no field disagreed.
+   *   `mismatch`      — a producer stamped rank and code inconsistently.
+   *   `no_population` — nothing was folded, so NOTHING WAS CHECKED. Not a pass.
+   */
+  partitionState: 'verified' | 'mismatch' | 'no_population';
+  /**
    * Cross-check between two independently STORED fields: the rank value and the
    * coverage code. `false` means a producer stamped them inconsistently (e.g.
    * `covered` beside a null rank) and every counter here is suspect. It can go
    * red — see the scanner tests.
+   *
+   * **`null` when {@link populated} is false** — an honest unknown, the same
+   * discipline this row applies to `ivRank` itself (TRA-4917 point 4: never
+   * collapse "not measured" into the value that happens to mean healthy). A
+   * `true` here therefore always means "checked, over at least one row".
    */
-  partitionOk: boolean;
-  /** Why `partitionOk` is false, or null when it holds. */
+  partitionOk: boolean | null;
+  /** Why `partitionOk` is not `true`, or null when it holds. */
   partitionMismatch: string | null;
 }
 
@@ -355,7 +385,26 @@ function buildIvRankCoverageRollup(
   if (unknownByCode.covered !== 0) {
     mismatches.push(`${unknownByCode.covered} scan(s) coded 'covered' with a null ivRank`);
   }
+
+  // An EMPTY fold satisfies all three asserts vacuously — 0 === 0 three times —
+  // so a bare `mismatches.length === 0` publishes the pass value having compared
+  // nothing. Gate the verdict on the POPULATION, never on the absence of a
+  // complaint (the same shape as `gateInert: 0` over zero scans).
+  const populated = scanCount > 0;
+  const recordedAts = views
+    .map((v) => Date.parse(v.recordedAt))
+    .filter((t) => Number.isFinite(t));
+  const partitionState = !populated
+    ? ('no_population' as const)
+    : mismatches.length === 0
+      ? ('verified' as const)
+      : ('mismatch' as const);
   return {
+    populated,
+    storeTtlMs: STORE_TTL_MS,
+    lastRecordedAt:
+      recordedAts.length > 0 ? new Date(Math.max(...recordedAts)).toISOString() : null,
+    partitionState,
     scanCount,
     candidateCount,
     wireRowCount: scanCount + candidateCount,
@@ -371,8 +420,12 @@ function buildIvRankCoverageRollup(
     gateEvaluable: ivRankMeasured,
     gateInert: ivRankUnknown,
     minSamples: MIN_IV_SAMPLES,
-    partitionOk: mismatches.length === 0,
-    partitionMismatch: mismatches.length === 0 ? null : mismatches.join('; '),
+    partitionOk: populated ? mismatches.length === 0 : null,
+    partitionMismatch: !populated
+      ? 'no_population: 0 scans within storeTtlMs — NOTHING WAS CHECKED, this is not a pass'
+      : mismatches.length === 0
+        ? null
+        : mismatches.join('; '),
   };
 }
 
