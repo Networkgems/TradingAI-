@@ -76,6 +76,20 @@ jobs:
   # The guard family stays grouped — these are cheap, ordered on purpose (stale-js
   # must precede anything that compiles), and none of them gates the suite: lint,
   # typecheck and test run in their own jobs regardless of what happens here.
+  #
+  # TRA-5029 — every step carries `if: ${{ !cancelled() }}`, because this job was ALSO
+  # a fail-fast chain and nobody had looked. `check:data-dir` started failing at step 7
+  # in `c8208189` (2026-09-25T00:22:08Z) and for the next 73 runs / 7d 1h 48m the nine
+  # steps behind it read `skipped` — the DATA_DIR controls, the env-intent controls, the
+  # strand-drain controls, import cycles, the TRA-3695 deploy-build gate, its hook check,
+  # its live-history controls, the package build and the TRA-2361 prover controls. All of
+  # them reported nothing at all while the job reported `failure`, which reads exactly
+  # like one guard being red. A skipped step is not a passing step and must not be able
+  # to hide behind a sibling. The job still fails when any step fails; it just no longer
+  # stops measuring. (Yes, that means a stale-js failure no longer gates the compile
+  # steps below it — in a pristine actions/checkout tree that condition means a `.js` was
+  # committed, which is loudly red on its own line, and hiding nine guards is the
+  # measured, more expensive failure.)
   guards:
     name: Guards (stale-js / data-dir / cycles / deploy-build gate / prover)
     runs-on: ubuntu-latest
@@ -107,6 +121,7 @@ jobs:
       # TS sources and can make the suite pass against code we are not shipping.
       # A green run below is only meaningful if this step is green first.
       - name: Check for stale compiled output shadowing TS sources
+        if: ${{ !cancelled() }}
         run: pnpm check:stale-js
 
       # TRA-2603 — beside check:stale-js, and before build/test. Ratchets the count of
@@ -116,12 +131,14 @@ jobs:
       # (TRA-2193/TRA-2195) and it fails SILENTLY: every write succeeds and the data
       # evaporates on redeploy. The controls are `pnpm check:data-dir:controls`.
       - name: Check for unguarded DATA_DIR resolver copies
+        if: ${{ !cancelled() }}
         run: pnpm check:data-dir
 
       # TRA-2603 — the guard's own both-direction controls: a real planted copy must FAIL,
       # a zeroed pattern must read BROKEN not CLEAN, `-a` must be provably load-bearing
       # against the NUL-byte file, and the baseline must not regenerate itself.
       - name: DATA_DIR guard controls (TRA-2603)
+        if: ${{ !cancelled() }}
         run: pnpm check:data-dir:controls
 
       # TRA-4474/TRA-4803 — the env-intent checker's own controls. `check:env-intent`
@@ -147,6 +164,7 @@ jobs:
       # text says to "fix the STORED value", i.e. to undo it. ARM 0 must keep failing on
       # the pre-fix code or this control is decorative.
       - name: env-intent checker controls (TRA-4474/TRA-4803/TRA-4862)
+        if: ${{ !cancelled() }}
         run: pnpm check:env-intent:controls
 
       # TRA-4145 — the strand drain's 43 write-path controls, which until now ran only
@@ -166,6 +184,7 @@ jobs:
       # so no scheduled fire will ever re-exercise it. A control that only runs by hand
       # is a control that silently stops running. `--selftest` sends nothing.
       - name: Strand drain write-path controls (TRA-4145)
+        if: ${{ !cancelled() }}
         run: pnpm drain:strands:controls
 
       # TRA-1684 — also before build/test. A circular import only throws from SOME
@@ -173,6 +192,7 @@ jobs:
       # doors and only one of them crashes (TRA-1674). A green suite is not
       # evidence the import graph is sound; this step is.
       - name: Check for import cycles
+        if: ${{ !cancelled() }}
         run: pnpm check:cycles
 
       # TRA-3695 — the DEPLOY'S OWN build command, named as such and run FIRST.
@@ -189,6 +209,7 @@ jobs:
       # that IS the commit, so isolation would buy nothing. Locally the gate isolates,
       # because a developer's tree is not the commit.
       - name: Deploy build gate — the deploy's own build command (TRA-3695)
+        if: ${{ !cancelled() }}
         run: pnpm check:deploy-build --worktree
 
       # TRA-3695 — the gate above is a DETECTOR (it runs after the push, like everything
@@ -197,6 +218,7 @@ jobs:
       # that silently is not. This asserts the hook is tracked, wired to `prepare`, and that
       # `pnpm install` above actually armed it.
       - name: Pre-push build gate is installed (TRA-3695)
+        if: ${{ !cancelled() }}
         run: pnpm check:deploy-build --verify-hook
 
       # TRA-3695 — the gate's own both-direction controls, run on LIVE HISTORY (needs the
@@ -204,9 +226,11 @@ jobs:
       # `(202,66) error TS18047`, and `1ff4fa7b` must read CLEAN. Without that second arm a
       # gate hardwired to refuse would pass every other control.
       - name: Deploy build gate controls (TRA-3695)
+        if: ${{ !cancelled() }}
         run: pnpm check:deploy-build:controls
 
       - name: Build shared packages
+        if: ${{ !cancelled() }}
         run: pnpm -r --filter './packages/**' build
 
       # TRA-2372 — controls for the TRA-2361 AC5 monotonicity prover. It runs the prover
@@ -217,6 +241,7 @@ jobs:
       # `src/` on the BLIND path — where `pnpm check:stale-js` cannot see it, because that
       # guard looks for compiler OUTPUT and the strand is a `.ts`.
       - name: Monotonicity prover controls (TRA-2361 AC5)
+        if: ${{ !cancelled() }}
         run: pnpm check:tra2361-prover
 
   lint:
@@ -321,7 +346,11 @@ jobs:
       # in front of the suite. The one exception is `check-stale-js`, which the runner
       # executes itself — a shadowing emit makes the suite's result MEANINGLESS rather
       # than unknown, and that reads BLIND, never "tests failed".
+      #
+      # `if: !cancelled()` for the same reason as the guards job: if the build step above
+      # fails, this step must REPORT (and read BLIND via the count step below), not skip.
       - name: Test
+        if: ${{ !cancelled() }}
         run: pnpm test:ci
 
       # TRA-5029 AC2 — the discriminator. `Test -> failure` cannot distinguish "the
