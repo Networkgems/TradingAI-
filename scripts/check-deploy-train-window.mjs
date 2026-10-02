@@ -82,8 +82,9 @@
  * Both directions, and they run on EVERY invocation, not only under --selftest. A
  * one-directional control is half a control: proving the detector can SEE a stranded
  * order says nothing about whether it stays SILENT on a satisfied one, and the failure
- * mode of a grader over other people's artefacts is to convict them. If any control
- * fails, the instrument is BLIND (exit 3) and no verdict is printed.
+ * mode of a grader over other people's artefacts is to convict them. If any control fails
+ * the run exits 6 HARNESS — its own code, outranking every live verdict — and the live
+ * sweep still runs and still prints, labelled PROVISIONAL (TRA-4977 AC4, reasoned below).
  *
  * POPULATION — TWO ARMS, and a NAMED limitation printed every run
  * ---------------------------------------------------------------
@@ -182,10 +183,42 @@
  *                  until AFTER its deadline. Distinct from 1 because nothing is stranded
  *                  and distinct from 0 because the window was missed — which is the
  *                  literal subject of this ticket, and the state 2026-08-13 was in.
+ *   6  HARNESS    — MY OWN CONTROLS FAILED (TRA-4977 AC4). See below: this is the
+ *                  instrument reporting itself broken, which is a DIFFERENT message to a
+ *                  DIFFERENT person than "I cannot grade your deploy", and the live scan
+ *                  still runs and still prints underneath it.
  *
- * Precedence when several apply: BLIND > STRANDED > LATE > UNGRADED > CLEAN. A blind leg
- * outranks a clean one, a stranded order outranks a missed window, and both outrank a
- * backlog.
+ * Precedence when several apply: HARNESS > BLIND > STRANDED > LATE > UNGRADED > CLEAN. A
+ * broken instrument outranks everything it says, a blind leg outranks a clean one, a
+ * stranded order outranks a missed window, and both outrank a backlog.
+ *
+ * ⛔ WHY A CONTROL FAILURE GETS ITS OWN CODE AND NO LONGER SILENCES THE LIVE SCAN (TRA-4977
+ * AC4) — THE DECISION, AND BOTH HALVES OF IT
+ * Until now a failing control `return`ed exit 3 BEFORE the live sweep ran, so ONE STALE
+ * FIXTURE SILENCED THE PRODUCTION ALARM FOR EVERY CARRIER IN THE COMPANY, and the operator
+ * could not tell "my test harness rotted" from "I cannot grade your deploy" — same exit
+ * code, and in the first case not one word about the board.
+ *
+ *   KEPT: fail-closed. A control failure is still non-zero, it still OUTRANKS every live
+ *   verdict including STRANDED, and the live rows printed under it are labelled
+ *   PROVISIONAL. That ordering is not a formality — the detector's expensive direction is
+ *   the false accusation (it grades other people's deploys), so a STRANDED produced by an
+ *   instrument that cannot pass its own controls must not page as an incident.
+ *
+ *   CHANGED: it is exit 6, not 3, and the sweep RUNS ANYWAY. A broken fixture is a defect
+ *   in THIS FILE, owned by whoever last edited it; a BLIND live leg is an operational fact
+ *   about a checkout or a host. Routing both to one code routed them to one reader, and
+ *   the historical cost is on the record: the controls sat red for six weeks, read as
+ *   "known-bad instrument", and the six weeks of unprinted live scans are what let the
+ *   population hole (TRA-4984) go unnoticed underneath them. Printing the scan is how a
+ *   rotted harness stops also being a blackout.
+ *
+ * ⛔ A ROTTED HARNESS IS NOW CAUGHT BEFORE ANYONE RUNS THE SWEEP (TRA-4977 AC5). This
+ * script's `--selftest` is in root `pretest`, beside `check:stale-js` and
+ * `check:arg-guard`, so a control that goes stale fails the test suite for whoever broke
+ * it instead of waiting for a carrier owner to run the detector by hand four days later.
+ * The LIVE sweep is deliberately NOT in `pretest` — it is a multi-minute network scan —
+ * which is exactly why the two needed separate exit codes first.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -201,6 +234,21 @@ export const EXIT_ERROR = 2;
 export const EXIT_BLIND = 3;
 export const EXIT_UNGRADED = 4;
 export const EXIT_LATE = 5;
+export const EXIT_HARNESS = 6;
+
+/**
+ * THE ONE PLACE THE RUN'S EXIT CODE IS DECIDED (TRA-4977 AC4). Pure, so the precedence is
+ * gradeable in both directions rather than asserted in a comment.
+ *
+ * `controlsFailed` outranks `liveExit` unconditionally, INCLUDING over EXIT_FINDINGS. The
+ * live rows are still computed and still printed — the point is that they arrive labelled,
+ * not suppressed — but a verdict from an instrument that fails its own controls cannot be
+ * allowed to page as an incident, because this detector's expensive direction is the false
+ * accusation of someone else's deploy.
+ */
+export function finalExit({ controlsFailed, liveExit }) {
+  return controlsFailed > 0 ? EXIT_HARNESS : liveExit;
+}
 
 const DEFAULT_HOST = 'https://tradingai-bqb1.onrender.com';
 
@@ -269,16 +317,47 @@ export { findOrderBlocks, parseDeployOrder, lineOrdersDeploy, classifyCarrier };
  * TRA-3740 closed (both objects can be present while the path between them is cut). The
  * default IS the library, and no production call site passes an oracle.
  *
- * @param {(held: string, target: string) => {answer: boolean|null}} [ancestryOracle]
- * @returns {'present'|'absent'|'blind'}
+ * ⛔ TRA-4977 AC3: IT RETURNS THE LIBRARY'S OWN `verdict` ALONGSIDE THE STATE, AND THAT IS NOT
+ * COSMETIC. The old signature returned the bare string `'blind'`, so the caller had nothing to
+ * print and wrote the cause in by hand: `shallow checkout or unknown sha`. The library had
+ * already MEASURED which of the two it was (`gradedAncestry` runs `rev-parse
+ * --is-shallow-repository` on every negative and distinguishes `blind-shallow` /
+ * `blind-missing-object` / `blind-unrelated` / `blind-no-sha` / `blind-undecidable`) — the grader
+ * threw the answer away and then guessed it. Measured 2026-10-01 in a checkout where
+ * `--is-shallow-repository` is **false**: the printed detail named a shallow clone as a candidate
+ * cause of its own blindness, the first triage spent itself on clone depth, and the real cause
+ * (synthetic control SHAs) was in the string's other half all along. A detector that
+ * misattributes its own blindness costs a triage every time it fires, so the cause is now
+ * REPORTED, never asserted — and an oracle that supplies no verdict reads `NOT MEASURED` rather
+ * than borrowing a plausible one.
+ *
+ * @param {(held: string, target: string) => {answer: boolean|null, verdict?: string}} [ancestryOracle]
+ * @returns {{ state: 'present'|'absent'|'blind', verdict: string|null }}
  */
 export function gradeAncestry({ commit, liveSha, ancestryOracle = libGradedAncestry }) {
   // The library function is the canonical remedy (TRA-3699, TRA-3721).
   // It handles object presence, shallow detection, and unrelated-graph detection.
-  const { answer } = ancestryOracle(commit, liveSha);
-  if (answer === true) return 'present';
-  if (answer === false) return 'absent';
-  return 'blind'; // answer === null
+  const { answer, verdict } = ancestryOracle(commit, liveSha);
+  const v = typeof verdict === 'string' && verdict !== '' ? verdict : null;
+  if (answer === true) return { state: 'present', verdict: v };
+  if (answer === false) return { state: 'absent', verdict: v };
+  return { state: 'blind', verdict: v }; // answer === null
+}
+
+/**
+ * The one sentence a BLIND row prints about WHY it is blind. It is the library's own graded
+ * verdict wherever there is one; where there is not, it says so in those words.
+ *
+ * ⛔ The absent-verdict branch is a NAMED STATE, not a fallback to the plausible cause. Listing
+ * "shallow, or a missing object, or git failed" when nothing was measured is the behaviour AC3
+ * removed: it reads as a diagnosis, sends the reader to the wrong place, and is indistinguishable
+ * in the output from a cause that WAS measured.
+ */
+export function ancestryBlindDetail(verdict) {
+  if (typeof verdict !== 'string' || verdict === '') {
+    return 'cause NOT MEASURED — the ancestry oracle returned no verdict to attribute it to';
+  }
+  return `${verdict}: ${blindReason(verdict)}`;
 }
 
 /** "3h 12m" — for a lateness that has to be read at a glance in a report line. */
@@ -457,7 +536,7 @@ export function gradeCarrier({ description, nowMs, liveSha, knownSha, ancestryOr
   }
 
   const { order } = parsed;
-  const ancestry = gradeAncestry({ commit: order.commit, liveSha, ancestryOracle });
+  const { state: ancestry, verdict: ancestryVerdict } = gradeAncestry({ commit: order.commit, liveSha, ancestryOracle });
   if (ancestry === 'blind') {
     return {
       verdict: 'BLIND',
@@ -465,7 +544,7 @@ export function gradeCarrier({ description, nowMs, liveSha, knownSha, ancestryOr
       late: false,
       ungraded: false,
       timing: 'n/a',
-      detail: `ancestry unanswerable for ${short(order.commit)} against live ${short(liveSha)} — shallow checkout or unknown sha`,
+      detail: `ancestry unanswerable for ${short(order.commit)} against live ${short(liveSha)} — ${ancestryBlindDetail(ancestryVerdict)}`,
       order,
       span: cls.span,
     };
@@ -1124,14 +1203,146 @@ const CONTROLS = [
         (r) => r[0] === '2026-08-13T06:30:00Z' && r[1] === '2026-07-01T00:00:00Z' && r[2] === null && r[3] === true && r[4] === true,
       ),
   },
+
+  // ── TRA-4977 AC3: the BLIND row REPORTS its cause, it does not assert one ──────────────
+  {
+    name: 'BLIND ATTRIBUTION — a MISSING-OBJECT blind says so and does NOT name a shallow clone',
+    run: () =>
+      expect(
+        gradeCarrier({
+          description: orderBlock(NOT_IN_LIVE, '2026-08-13T11:00:00Z'),
+          nowMs: T0,
+          liveSha: LIVE,
+          knownSha: stubKnown,
+          ancestryOracle: () => ({ answer: null, verdict: 'blind-missing-object' }),
+        }),
+        // The negative half is the one that matters: the old string named a shallow clone on
+        // EVERY blind, in a checkout where `--is-shallow-repository` is false, and the first
+        // triage went looking at clone depth.
+        (r) =>
+          r.verdict === 'BLIND' &&
+          r.detail.includes('blind-missing-object') &&
+          r.detail.includes('not in this checkout') &&
+          !/shallow/i.test(r.detail),
+      ),
+  },
+  {
+    name: 'BLIND ATTRIBUTION — a SHALLOW blind names the shallow clone and the --unshallow remedy',
+    run: () =>
+      expect(
+        gradeCarrier({
+          description: orderBlock(NOT_IN_LIVE, '2026-08-13T11:00:00Z'),
+          nowMs: T0,
+          liveSha: LIVE,
+          knownSha: stubKnown,
+          ancestryOracle: () => ({ answer: null, verdict: 'blind-shallow' }),
+        }),
+        (r) => r.verdict === 'BLIND' && /SHALLOW/.test(r.detail) && r.detail.includes('--unshallow'),
+      ),
+  },
+  {
+    name: 'BLIND ATTRIBUTION FAILS HONEST — an oracle with NO verdict reads `NOT MEASURED`, it does not borrow a cause',
+    run: () =>
+      expect(
+        [
+          gradeCarrier({
+            description: orderBlock(NOT_IN_LIVE, '2026-08-13T11:00:00Z'),
+            nowMs: T0,
+            liveSha: LIVE,
+            knownSha: stubKnown,
+            ancestryOracle: () => ({ answer: null }),
+          }),
+          ancestryBlindDetail(''),
+        ],
+        (r) =>
+          r[0].verdict === 'BLIND' &&
+          r[0].detail.includes('NOT MEASURED') &&
+          !/shallow/i.test(r[0].detail) &&
+          r[1].includes('NOT MEASURED'),
+      ),
+  },
+  {
+    name: 'BLIND ATTRIBUTION — `gradeAncestry` PASSES THE VERDICT THROUGH on all three states, not just the blind one',
+    run: () =>
+      expect(
+        [
+          gradeAncestry({ commit: IN_LIVE, liveSha: LIVE, ancestryOracle: () => ({ answer: true, verdict: 'carries' }) }),
+          gradeAncestry({ commit: NOT_IN_LIVE, liveSha: LIVE, ancestryOracle: () => ({ answer: false, verdict: 'not-carried' }) }),
+          gradeAncestry({ commit: NOT_IN_LIVE, liveSha: LIVE, ancestryOracle: () => ({ answer: null, verdict: 'blind-unrelated' }) }),
+          gradeAncestry({ commit: NOT_IN_LIVE, liveSha: LIVE, ancestryOracle: () => ({ answer: null }) }),
+        ],
+        (r) =>
+          r[0].state === 'present' && r[0].verdict === 'carries' &&
+          r[1].state === 'absent' && r[1].verdict === 'not-carried' &&
+          r[2].state === 'blind' && r[2].verdict === 'blind-unrelated' &&
+          // An absent verdict is NULL, never a string that could be printed as a cause.
+          r[3].state === 'blind' && r[3].verdict === null,
+      ),
+  },
+
+  // ── TRA-4977 AC4: a rotted harness and an ungradeable deploy are different messages ────
+  {
+    name: 'HARNESS vs BLIND — a failing control exits 6 and OUTRANKS every live verdict, including STRANDED',
+    run: () =>
+      expect(
+        [
+          finalExit({ controlsFailed: 1, liveExit: EXIT_CLEAN }),
+          finalExit({ controlsFailed: 1, liveExit: EXIT_FINDINGS }),
+          finalExit({ controlsFailed: 11, liveExit: EXIT_BLIND }),
+          // …and with the harness intact it is TRANSPARENT: every live code passes through
+          // unchanged, so the new leg cannot mask a real grade.
+          finalExit({ controlsFailed: 0, liveExit: EXIT_CLEAN }),
+          finalExit({ controlsFailed: 0, liveExit: EXIT_FINDINGS }),
+          finalExit({ controlsFailed: 0, liveExit: EXIT_BLIND }),
+          finalExit({ controlsFailed: 0, liveExit: EXIT_LATE }),
+          finalExit({ controlsFailed: 0, liveExit: EXIT_UNGRADED }),
+          finalExit({ controlsFailed: 0, liveExit: EXIT_ERROR }),
+        ],
+        (r) =>
+          r[0] === EXIT_HARNESS && r[1] === EXIT_HARNESS && r[2] === EXIT_HARNESS &&
+          r[3] === EXIT_CLEAN && r[4] === EXIT_FINDINGS && r[5] === EXIT_BLIND &&
+          r[6] === EXIT_LATE && r[7] === EXIT_UNGRADED && r[8] === EXIT_ERROR,
+      ),
+  },
+  {
+    name: 'HARNESS vs BLIND — the two codes are DISTINCT and neither is 0 (sharing one was the AC4 defect)',
+    run: () =>
+      expect(
+        [EXIT_CLEAN, EXIT_FINDINGS, EXIT_ERROR, EXIT_BLIND, EXIT_UNGRADED, EXIT_LATE, EXIT_HARNESS],
+        (r) => new Set(r).size === r.length && EXIT_HARNESS !== EXIT_BLIND && EXIT_HARNESS !== EXIT_CLEAN,
+      ),
+  },
 ];
 
 function expect(actual, pred) {
   return pred(actual) ? { ok: true, actual } : { ok: false, actual };
 }
 
+/**
+ * ⭐ THE NEGATIVE CONTROL FOR AC4 ITSELF, AND IT CANNOT BE A PURE ONE.
+ *
+ * `finalExit` is unit-graded above, but the defect AC4 names was never in the precedence —
+ * it was in the WIRING: a `return EXIT_BLIND` that fired before the live sweep was reached.
+ * A pure control over the precedence function cannot see that, and would have passed
+ * throughout the six weeks the alarm was dark. So the only honest control plants a REAL
+ * failing control and observes the whole process:
+ *
+ *   node scripts/check-deploy-train-window.mjs --selftest --plant-control-failure   # exit 6
+ *   node scripts/check-deploy-train-window.mjs --plant-control-failure              # exit 6,
+ *       # AND the live carrier rows are printed underneath, which is the half that regressed.
+ *
+ * It is a FLAG, deliberately not an environment variable: a flag cannot leak in from a
+ * parent process or a CI secret store and silently sabotage a real sweep, and the planted
+ * row prints under its own screaming name so no reader can mistake the run for a clean one.
+ */
+const PLANTED_FAILURE = {
+  name: '⚠ PLANTED FAILURE (--plant-control-failure) — this run is a NEGATIVE CONTROL, not a grade',
+  run: () => expect('planted', () => false),
+};
+
 export function runControls() {
-  return CONTROLS.map((c) => {
+  const rows = flag('plant-control-failure') ? [...CONTROLS, PLANTED_FAILURE] : CONTROLS;
+  return rows.map((c) => {
     let res;
     try {
       res = c.run();
@@ -1334,26 +1545,13 @@ async function bindDeployHistory({ key, serviceId, liveSha }) {
   };
 }
 
-async function main() {
-  // The instrument is graded before anything it says can be believed.
-  const controls = runControls();
-  const badControls = controls.filter((c) => !c.ok);
-  for (const c of controls) console.log(`[train] control ${c.ok ? 'ok  ' : 'FAIL'}  ${c.name}`);
-  if (badControls.length > 0) {
-    console.log('');
-    console.log(`[train] VERDICT = BLIND — ${badControls.length} control(s) failed. The detector is broken,`);
-    console.log('[train] so its silence is worth nothing and no carrier verdict is printed.');
-    for (const c of badControls) console.log(`[train]   FAILED: ${c.name}\n[train]     got ${JSON.stringify(c.actual)}`);
-    return EXIT_BLIND;
-  }
-  console.log(`[train] ${controls.length}/${controls.length} controls pass, both directions.`);
-  console.log('');
-
-  if (flag('selftest')) {
-    console.log('[train] --selftest: controls only, no live sweep.');
-    return EXIT_CLEAN;
-  }
-
+/**
+ * The whole live leg, returning the exit code it would have been in isolation. Split out of
+ * `main` by TRA-4977 AC4 so that a FAILING CONTROL no longer `return`s ahead of it: the
+ * harness verdict and the carrier verdict are now computed independently and combined by
+ * `finalExit`, instead of the first one suppressing the second.
+ */
+async function liveSweep() {
   const base = String(process.env.PAPERCLIP_API_URL || '').replace(/\/$/, '').replace(/\/api$/, '');
   const key = process.env.PAPERCLIP_API_KEY;
   const company = process.env.PAPERCLIP_COMPANY_ID;
@@ -1748,6 +1946,52 @@ async function main() {
   console.log(`[train] VERDICT = CLEAN — all ${graded.length} graded deploy order(s) SATISFIED or legitimately PENDING,`);
   console.log('[train] and no suspected carrier is unannotated.');
   return EXIT_CLEAN;
+}
+
+async function main() {
+  // The instrument is graded before anything it says can be believed — but no longer
+  // INSTEAD of saying it. See the AC4 block in the header: a control failure is a defect in
+  // this file, a BLIND live leg is a fact about a checkout or a host, and collapsing them
+  // into one exit code meant one stale fixture blacked out the alarm for the whole company.
+  const controls = runControls();
+  const badControls = controls.filter((c) => !c.ok);
+  for (const c of controls) console.log(`[train] control ${c.ok ? 'ok  ' : 'FAIL'}  ${c.name}`);
+  if (badControls.length > 0) {
+    console.log('');
+    console.log(`[train] HARNESS = BROKEN — ${badControls.length} of ${controls.length} control(s) failed. Everything this run says`);
+    console.log('[train] about the board below is PROVISIONAL: a grader that cannot pass its own controls');
+    console.log('[train] must not convict somebody else\'s deploy. Fix the fixtures, then re-read.');
+    for (const c of badControls) console.log(`[train]   FAILED: ${c.name}\n[train]     got ${JSON.stringify(c.actual)}`);
+  } else {
+    console.log(`[train] ${controls.length}/${controls.length} controls pass, both directions.`);
+  }
+  console.log('');
+
+  if (flag('selftest')) {
+    console.log('[train] --selftest: controls only, no live sweep.');
+    return finalExit({ controlsFailed: badControls.length, liveExit: EXIT_CLEAN });
+  }
+
+  // ⛔ The sweep runs even with a broken harness, and a THROW inside it must not be allowed
+  // to erase the harness verdict either — that is the same suppression in the other
+  // direction.
+  let liveExit;
+  try {
+    liveExit = await liveSweep();
+  } catch (err) {
+    console.error('[train] ERROR in the live sweep', err?.stack || err);
+    liveExit = EXIT_BLIND;
+  }
+
+  const code = finalExit({ controlsFailed: badControls.length, liveExit });
+  if (badControls.length > 0) {
+    console.log('');
+    console.log(`[train] VERDICT = HARNESS BROKEN (exit ${EXIT_HARNESS}) — ${badControls.length} control(s) failed, named above.`);
+    console.log(`[train] The live sweep ran anyway and would have exited ${liveExit} on its own; read that as`);
+    console.log('[train] PROVISIONAL, not as a grade. "My fixtures rotted" and "I cannot grade your deploy"');
+    console.log('[train] are different messages to different people, so they no longer share exit 3.');
+  }
+  return code;
 }
 
 main()

@@ -350,7 +350,7 @@ a bare local time is rejected, never guessed. A carrier that mentions deploying 
 opts out with `<!-- deploy-order: none -->` — there is no way to leave the population by accident.
 
 ```bash
-pnpm check:deploy-train-window       # 0 clean · 1 STRANDED · 3 BLIND · 4 UNGRADED · 5 LATE
+pnpm check:deploy-train-window       # 0 clean · 1 STRANDED · 3 BLIND · 4 UNGRADED · 5 LATE · 6 HARNESS
 pnpm check:deploy-train-window:controls
 ```
 
@@ -366,8 +366,32 @@ column, and it is the one this ticket is actually about — on 08-13 both orders
 measured when `RENDER_API_KEY` + `RENDER_SERVICE_ID` are in the environment (`--render-key` /
 `--render-service`), and whether the arm is ON or OFF is **printed with its reason** — `UNREAD` is
 never OK. A missed window exits **5 LATE**: nothing is stranded, so it must not page as one, and the
-window was missed, so it must not pass as clean. Precedence `BLIND > STRANDED > LATE > UNGRADED >
-CLEAN`.
+window was missed, so it must not pass as clean. Precedence `HARNESS > BLIND > STRANDED > LATE >
+UNGRADED > CLEAN`.
+
+⛔ **A failing CONTROL is `6 HARNESS`, not `3 BLIND`, and it no longer silences the live scan**
+(TRA-4977). A control failure used to `return` exit 3 *before* the live sweep ran, so **one stale
+fixture blacked out the alarm for every carrier in the company** — and exit 3 could not tell "my test
+harness rotted" from "I cannot grade your deploy", which are different pages to different people.
+Fail-closed is unchanged: 6 is non-zero and **outranks every live verdict including STRANDED**,
+because this grader's expensive direction is the false accusation of someone else's deploy. What
+changed is that the sweep **runs anyway** and prints its rows underneath, labelled PROVISIONAL, with
+the code it would have exited on its own. The cost of the old coupling is on the record: the controls
+sat red for six weeks, read as "known-bad instrument", and the unprinted live scans underneath are
+what let the TRA-4984 population hole go unnoticed. `--plant-control-failure` is the negative control
+(a flag, not an env var, so it cannot leak in and sabotage a real sweep) — the defect was in the
+*wiring*, which no unit test over the precedence could have caught.
+
+⛔ **A BLIND row names the cause it MEASURED.** The detail used to read `shallow checkout or unknown
+sha` on every blind, while `gradedAncestry` had already run `rev-parse --is-shallow-repository` and
+knew which it was. One triage was spent on clone depth in a checkout where that flag reads **false**.
+`gradeAncestry` now returns `{state, verdict}`; an oracle that supplies no verdict reads
+`cause NOT MEASURED` rather than borrowing a plausible one.
+
+⭐ **Its own health is owned by `pretest`** — `check-deploy-train-window.mjs --selftest` runs there
+beside `check:stale-js`, so a stale fixture fails the suite for whoever broke it. The *live* sweep is
+deliberately not in `pretest` (it is a multi-minute network scan over the whole board), which is
+exactly why the two legs needed separate exit codes first.
 
 ⛔ The arm binds Render's history to the box by **live-SHA identity**, not by name: a deploy-order
 block names the onrender hostname `tradingai-bqb1` while the Render service's own `name` is
