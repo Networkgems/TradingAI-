@@ -21,6 +21,7 @@ import {
   toCloseLedgerRow,
   enforceAggregateLedgerBudget,
   compareLedgerEviction,
+  measureLedgerQueueOrdering,
   summarizeLedgerPools,
   resetAggregateLedgerSweepMemo,
   CLOSE_LEDGER_MAX_ROWS,
@@ -564,9 +565,11 @@ describe('TRA-4898 — the live book is last in the eviction queue, not second',
     expect(ctx.liveFilesInPool).toBe(1);
     // One line, and it attributes every deletion: 2 from qa_alpha, 1 from qtverify_7.
     expect(ctx.evictedFromBooks).toBe(2);
+    // TRA-5036 adds `inRegistry` per entry — `null` here because this case
+    // asserts no roster, which is exactly the reading "not asserted".
     expect(ctx.evictedFrom).toEqual([
-      { book: 'qa_alpha', root: 'reports', mode: 'demo', live: false, files: 2, bytes: 2000, oldest: '2026-06-01.json', newest: '2026-06-02.json' },
-      { book: 'qtverify_7', root: 'reports', mode: 'demo', live: false, files: 1, bytes: 1000, oldest: '2026-06-03.json', newest: '2026-06-03.json' },
+      { book: 'qa_alpha', root: 'reports', mode: 'demo', live: false, inRegistry: null, files: 2, bytes: 2000, oldest: '2026-06-01.json', newest: '2026-06-02.json' },
+      { book: 'qtverify_7', root: 'reports', mode: 'demo', live: false, inRegistry: null, files: 1, bytes: 1000, oldest: '2026-06-03.json', newest: '2026-06-03.json' },
     ]);
   });
 
@@ -574,6 +577,9 @@ describe('TRA-4898 — the live book is last in the eviction queue, not second',
     const f = (book: string, mode: string, name: string) => ({
       path: `/users/${book}/reports/${mode}/closes/${name}`,
       name, size: 1, book, root: 'reports', mode, live: mode === 'live', mtimeMs: 0, digest: null,
+      // TRA-5036 — `null` is "no roster asserted", which must reproduce the
+      // TRA-4898 ordering exactly. That is what this case now also pins.
+      inRegistry: null,
     });
     const sorted = [
       f('admin', 'live', '2020-01-01.json'),
@@ -712,6 +718,290 @@ describe('TRA-4898 — the live book is last in the eviction queue, not second',
     const s = await summarizeLedgerPools({ usersRoot: join(root, 'nope') });
     expect(s.dirs.closes).toMatchObject({ bytes: 0, files: 0, liveBytes: 0, books: [], maxBytes: 48 * 1024 * 1024 });
     expect(s.dirs.tape.maxBytes).toBe(16 * 1024 * 1024);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// TRA-5036 — the registry reservation: the ACTIVE non-live books, behind the
+// dead-but-undeleted trees the TRA-4902 ruling left on disk
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('TRA-5036 — registered books evict after unregistered ones, and before the live book', () => {
+  async function plant(
+    book: string, mode: string, date: string, bytes = 1000,
+    kind = CLOSE_LEDGER_DIR, root = 'reports',
+  ): Promise<string> {
+    const dir = join(usersRoot(), book, root, mode, kind);
+    await mkdir(dir, { recursive: true });
+    const p = join(dir, `${date}.json`);
+    await writeFile(p, 'x'.repeat(bytes), 'utf-8');
+    return p;
+  }
+  const names = async (book: string, mode: string, kind = CLOSE_LEDGER_DIR, root = 'reports') =>
+    (await readdir(join(usersRoot(), book, root, mode, kind))).sort();
+
+  /** The measured 2026-10-02 shape: 2 active books behind dead QA tape. */
+  async function plantBqb1Shape(kind = 'tape'): Promise<void> {
+    // The two ACTIVE non-live books. `enock/demo`'s 09-24 file was 3rd in the
+    // real queue at 4 writers — the file this ticket exists to keep.
+    await plant('enock', 'demo', '2026-09-24', 1000, kind);
+    await plant('Richard', 'sandbox', '2026-09-25', 1000, kind);
+    // Dead QA trees: DEREGISTERED by TRA-4902 but still on disk by ruling, and
+    // holding NEWER session dates, so plain age order puts them last.
+    await plant('ctoverify_1', 'demo', '2026-09-30', 1000, kind);
+    await plant('qa_alpha', 'demo', '2026-10-01', 1000, kind);
+    // Real money, oldest of all — the TRA-4898 tier, which must stay last.
+    await plant('admin', 'live', '2026-01-01', 1000, kind);
+  }
+  const ROSTER = ['enock', 'Richard', 'admin', 'v0nni'];
+
+  it('AC1 negative control — the ACTIVE books hold the oldest dates and survive while dead trees pay', async () => {
+    // This is the AC that fails on `main`. Pre-TRA-5036 the first sort key was
+    // `live` alone, so among non-live files the oldest date went first no
+    // matter whether anything still writes to it — and here the two active
+    // books hold the two oldest dates in the pool.
+    await plantBqb1Shape();
+
+    const r = await enforceAggregateLedgerBudget({
+      usersRoot: usersRoot(), date: '2026-10-05', force: true,
+      limits: { closes: 3500, tape: 3500 },
+      registryBooks: ROSTER,
+    });
+
+    expect(r.sweep).toBe('ran');
+    expect(r.registryAsserted).toBe(true);
+    expect(r.pruned).toBe(2);
+    // The dead-but-undeleted trees paid, DESPITE holding the newest dates.
+    expect(await names('ctoverify_1', 'demo', 'tape')).toEqual([]);
+    expect(await names('qa_alpha', 'demo', 'tape')).toEqual([]);
+    // Both active books keep their history, and so does real money.
+    expect(await names('enock', 'demo', 'tape')).toEqual(['2026-09-24.json']);
+    expect(await names('Richard', 'sandbox', 'tape')).toEqual(['2026-09-25.json']);
+    expect(await names('admin', 'live', 'tape')).toEqual(['2026-01-01.json']);
+  });
+
+  it('scope item 2 — the 64 orphans stay FULLY evictable: an unregistered tree is tier 0, never protected', async () => {
+    // The inversion this must not become. Only dead trees in the pool, and the
+    // ceiling still binds: a reservation that protected them would leave the
+    // sweep with nothing to delete and the pool permanently over cap.
+    await plant('ctoverify_1', 'demo', '2026-09-28', 1000, 'tape');
+    await plant('ctoverify_2', 'demo', '2026-09-29', 1000, 'tape');
+    await plant('qa_alpha', 'demo', '2026-09-30', 1000, 'tape');
+
+    const r = await enforceAggregateLedgerBudget({
+      usersRoot: usersRoot(), date: '2026-10-05', force: true,
+      limits: { closes: 1000, tape: 1000 },
+      registryBooks: ROSTER,
+    });
+    expect(r.pruned).toBe(2);
+    expect(r.byDir?.tape).toEqual({ bytes: 1000, maxBytes: 1000, pruned: 2 });
+    // Oldest-first WITHIN the tier — the reservation reorders tiers, it does
+    // not disturb age order inside one.
+    expect(await names('ctoverify_1', 'demo', 'tape')).toEqual([]);
+    expect(await names('ctoverify_2', 'demo', 'tape')).toEqual([]);
+    expect(await names('qa_alpha', 'demo', 'tape')).toEqual(['2026-09-30.json']);
+  });
+
+  it('tier 1 sits strictly BETWEEN tier 0 and tier 2 — a registered book pays before real money', async () => {
+    // Exhaust the unregistered tier and keep going. The order of the last two
+    // deletions is the whole ordering claim: registered non-live, THEN live.
+    await plant('admin', 'live', '2026-01-01', 1000, 'tape');
+    await plant('enock', 'demo', '2026-09-24', 1000, 'tape');
+    await plant('qa_alpha', 'demo', '2026-10-01', 1000, 'tape');
+
+    const warns: Array<[string, unknown]> = [];
+    const r = await enforceAggregateLedgerBudget({
+      usersRoot: usersRoot(), date: '2026-10-05', force: true,
+      limits: { closes: 500, tape: 500 },
+      registryBooks: ROSTER,
+      log: { warn: (m: string, c?: unknown) => warns.push([m, c]), info: () => {} },
+    });
+    expect(r.pruned).toBe(3);
+    // …and the registered-tier exhaustion gets its OWN line, distinct from
+    // TRA-4898's real-money line: an active demo book losing leg-2 history is
+    // not a real-money event and must not page as one.
+    const reg = warns.find(([m]) => m.startsWith('TRA-5036 a REGISTERED book'));
+    expect(reg).toBeDefined();
+    expect((reg?.[1] as { prunedRegistered: number }).prunedRegistered).toBe(1);
+    expect((reg?.[1] as { evictedFrom: Array<{ book: string }> }).evictedFrom)
+      .toEqual([{ book: 'enock', root: 'reports', mode: 'demo', files: 1, bytes: 1000, oldest: '2026-09-24.json', newest: '2026-09-24.json' }]);
+    // TRA-4898's own warn still fires for the live file, unchanged.
+    expect(warns.some(([m]) => m.startsWith('TRA-4898 a REAL-MONEY'))).toBe(true);
+  });
+
+  it('no roster asserted ⇒ the TRA-4898 ordering EXACTLY, and the sweep says the reservation was inert', async () => {
+    // `null` must not read as "registered" — that would protect all 64 dead
+    // trees the moment a caller forgot to wire the roster. It must not read as
+    // a silent loss of protection either.
+    await plantBqb1Shape();
+
+    const warns: Array<[string, unknown]> = [];
+    const r = await enforceAggregateLedgerBudget({
+      usersRoot: usersRoot(), date: '2026-10-05', force: true,
+      limits: { closes: 3500, tape: 3500 },
+      log: { warn: (m: string, c?: unknown) => warns.push([m, c]), info: () => {} },
+    });
+
+    expect(r.registryAsserted).toBe(false);
+    expect(r.pruned).toBe(2);
+    // Pre-TRA-5036 order: oldest non-live dates, which are the ACTIVE books.
+    expect(await names('enock', 'demo', 'tape')).toEqual([]);
+    expect(await names('Richard', 'sandbox', 'tape')).toEqual([]);
+    expect(await names('qa_alpha', 'demo', 'tape')).toEqual(['2026-10-01.json']);
+    expect(await names('admin', 'live', 'tape')).toEqual(['2026-01-01.json']);
+    // And it is VISIBLE. `prunedRegistered: 0` beside `registryAsserted: false`
+    // is a different fact from `0` beside `true`, and the overage line carries
+    // both so the two cannot be confused.
+    expect(warns.some(([m]) => m.startsWith('TRA-5036 ledger eviction ran with NO users.json roster'))).toBe(true);
+    const overage = warns.find(([m]) => m.startsWith('TRA-4156 per-directory'));
+    expect(overage?.[1]).toMatchObject({ registryAsserted: false, prunedRegistered: 0, registeredFilesInPool: 0 });
+  });
+
+  it('AC3 — the PUBLISHED queue is gradable: zero registered rows ahead of any unregistered row, both pools', async () => {
+    await plantBqb1Shape('tape');
+    await plantBqb1Shape(CLOSE_LEDGER_DIR);
+
+    const s = await summarizeLedgerPools({ usersRoot: usersRoot(), registryBooks: ROSTER, evictionPreview: 50 });
+    expect(s.registryAsserted).toBe(true);
+
+    for (const kind of ['closes', 'tape'] as const) {
+      const q = s.dirs[kind].nextToEvict;
+      expect(q.length).toBe(5);
+      // The grading predicate, stated as the AC states it.
+      const firstRegistered = q.findIndex((f) => f.inRegistry === true);
+      const lastUnregistered = q.map((f) => f.inRegistry === false).lastIndexOf(true);
+      expect(firstRegistered).toBeGreaterThan(lastUnregistered);
+      // Tiers are monotonically non-decreasing down the queue, and the live
+      // file is still strictly last (TRA-4898 keeps its exact position).
+      expect(q.map((f) => f.evictionTier)).toEqual([0, 0, 1, 1, 2]);
+      expect(q[q.length - 1]).toMatchObject({ book: 'admin', mode: 'live', live: true });
+      // The reserved classes are sized separately and do not double-count.
+      expect(s.dirs[kind].registeredFiles).toBe(2);
+      expect(s.dirs[kind].liveFiles).toBe(1);
+      expect(s.dirs[kind].registeredBytes).toBe(2000);
+    }
+    // The census row carries the tier beside the rank, so WHICH reservation
+    // placed a row is readable without re-deriving the predicate.
+    const enock = s.dirs.tape.books.find((b) => b.book === 'enock');
+    expect(enock).toMatchObject({ inRegistry: true, evictionTier: 1 });
+    expect(s.dirs.tape.books.find((b) => b.book === 'qa_alpha'))
+      .toMatchObject({ inRegistry: false, evictionTier: 0 });
+  });
+
+  it('AC3 is graded off the UNCAPPED queue, not off the capped preview', async () => {
+    // The bqb1 failure mode for a prefix-grader: the queue head is all dead QA
+    // tape, so the default 10-entry preview contains ZERO registered rows and a
+    // preview-grader reports "no registered row ahead of an unregistered one"
+    // — vacuously, forever, whether or not the reservation shipped.
+    for (let i = 0; i < 12; i += 1) {
+      await plant(`ctoverify_${i}`, 'demo', `2026-09-${String(i + 10).padStart(2, '0')}`, 100, 'tape');
+    }
+    await plant('enock', 'demo', '2026-09-24', 100, 'tape');
+    await plant('admin', 'live', '2026-01-01', 100, 'tape');
+
+    const s = await summarizeLedgerPools({ usersRoot: usersRoot(), registryBooks: ROSTER });
+    // The preview really is blind here — that is the premise, pinned.
+    expect(s.dirs.tape.nextToEvict.length).toBe(10);
+    expect(s.dirs.tape.nextToEvict.some((f) => f.inRegistry === true)).toBe(false);
+    // …and the uncapped measurement is not.
+    expect(s.dirs.tape.queueOrdering).toEqual({
+      firstRegisteredRank: 13,
+      lastUnregisteredRank: 12,
+      firstLiveRank: 14,
+      lastNonLiveRank: 13,
+      registeredAheadOfUnregistered: 0,
+      liveAheadOfNonLive: 0,
+      tiersMonotone: true,
+      registeredFiles: 1,
+    });
+  });
+
+  it('the AC3 measurement DETECTS a violation — it is not a predicate that only ever returns 0', async () => {
+    // A grader that cannot fail is not a grader. Feed `measureLedgerQueueOrdering`
+    // the pre-TRA-5036 order (date-only among non-live) over the measured bqb1
+    // shape and it must report the inversion, with its magnitude.
+    const f = (book: string, mode: string, name: string, inRegistry: boolean | null) => ({
+      path: `/users/${book}/reports/${mode}/tape/${name}`,
+      name, size: 1, book, root: 'reports', mode, live: mode === 'live',
+      mtimeMs: 0, digest: null, inRegistry,
+    });
+    const preTra5036 = [
+      f('enock', 'demo', '2026-09-24.json', true),       // active, oldest date
+      f('Richard', 'sandbox', '2026-09-25.json', true),  // active
+      f('ctoverify_1', 'demo', '2026-09-30.json', false),// dead, newer date
+      f('admin', 'live', '2026-01-01.json', true),
+    ];
+    const bad = measureLedgerQueueOrdering(preTra5036);
+    expect(bad.registeredAheadOfUnregistered).toBe(2);
+    expect(bad.tiersMonotone).toBe(false);
+    expect(bad.firstRegisteredRank).toBe(1);
+    expect(bad.lastUnregisteredRank).toBe(3);
+    // Re-sorting the SAME files with the shipped comparator clears it, so the
+    // difference is the comparator and nothing else in the fixture.
+    const good = measureLedgerQueueOrdering([...preTra5036].sort(compareLedgerEviction));
+    expect(good.registeredAheadOfUnregistered).toBe(0);
+    expect(good.liveAheadOfNonLive).toBe(0);
+    expect(good.tiersMonotone).toBe(true);
+  });
+
+  it('an unasserted census publishes tier 0/2 only, so AC3 cannot pass vacuously unnoticed', async () => {
+    await plantBqb1Shape('tape');
+    const s = await summarizeLedgerPools({ usersRoot: usersRoot() });
+    expect(s.registryAsserted).toBe(false);
+    expect(s.dirs.tape.nextToEvict.every((f) => f.inRegistry === null)).toBe(true);
+    expect(s.dirs.tape.nextToEvict.map((f) => f.evictionTier)).toEqual([0, 0, 0, 0, 2]);
+    expect(s.dirs.tape.registeredFiles).toBe(0);
+    expect(s.dirs.tape.registeredBytes).toBe(0);
+  });
+
+  it('crypto-reports is tiered the same way — the registry axis is per BOOK, not per root', async () => {
+    await plant('enock', 'demo', '2026-09-24', 1000, 'tape', 'crypto-reports');
+    await plant('qa_alpha', 'demo', '2026-10-01', 1000, 'tape', 'crypto-reports');
+    const r = await enforceAggregateLedgerBudget({
+      usersRoot: usersRoot(), date: '2026-10-05', force: true,
+      limits: { closes: 1500, tape: 1500 },
+      registryBooks: ROSTER,
+    });
+    expect(r.pruned).toBe(1);
+    expect(await names('enock', 'demo', 'tape', 'crypto-reports')).toEqual(['2026-09-24.json']);
+    expect(await names('qa_alpha', 'demo', 'tape', 'crypto-reports')).toEqual([]);
+  });
+
+  it('the reservation changes WHO pays, never HOW MUCH is kept', async () => {
+    // Same invariant TRA-4898 pinned, re-pinned across the new tier: the
+    // post-sweep total is a function of the ceiling alone, so this cannot grow
+    // the footprint (the out-of-scope line CFO drew on TRA-4156 Phase 2).
+    await plantBqb1Shape();
+    const withRoster = await enforceAggregateLedgerBudget({
+      usersRoot: usersRoot(), date: '2026-10-05', force: true,
+      limits: { closes: 3500, tape: 3500 }, registryBooks: ROSTER,
+    });
+    rmSync(usersRoot(), { recursive: true, force: true });
+    await plantBqb1Shape();
+    const without = await enforceAggregateLedgerBudget({
+      usersRoot: usersRoot(), date: '2026-10-05', force: true,
+      limits: { closes: 3500, tape: 3500 },
+    });
+    expect(withRoster.byDir?.tape).toEqual(without.byDir?.tape);
+    expect(withRoster.pruned).toBe(without.pruned);
+  });
+
+  it('the writer forwards the roster — the production path is wired, not just the sweep', async () => {
+    // `writeCloseLedger` is the ONLY production caller of the sweep, so the
+    // reservation is only in force if the roster reaches it through here.
+    await plant('enock', 'demo', '2026-09-24', 1000, 'tape');
+    await plant('qa_alpha', 'demo', '2026-10-01', 1000, 'tape');
+    const res = await writeCloseLedger({
+      targetDir: join(usersRoot(), 'admin', 'reports', 'live'),
+      date: '2026-10-05',
+      symbols: [sym({ symbol: 'AAPL' })],
+      usersRoot: usersRoot(),
+      limits: { closes: 48 * 1024 * 1024, tape: 1500 },
+      registryBooks: ROSTER,
+    });
+    expect(res.written).toBe(true);
+    expect(await names('enock', 'demo', 'tape')).toEqual(['2026-09-24.json']);
+    expect(await names('qa_alpha', 'demo', 'tape')).toEqual([]);
   });
 });
 

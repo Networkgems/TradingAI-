@@ -627,6 +627,16 @@ export function registerStorageHealthRoutes(app: Express, deps: StorageHealthDep
         // than stat()ing it. The default stays the cheap walk so that adding
         // the reap evidence did not quietly make the census route expensive.
         withDigests: req.query['digests'] === '1',
+        // TRA-5036 — the preview head is all dead-QA tape on bqb1 (~12 MiB of
+        // a 321-file pool), so the default 10 entries never reach a registered
+        // row. `?preview=N` lets an operator see past it. Clamped: the AC is
+        // graded off `dirs[].queueOrdering`, which is uncapped and does not
+        // need this, so there is no reason to let a query param dump a
+        // 900-entry path list into a response.
+        ...(() => {
+          const n = Number.parseInt(String(req.query['preview'] ?? ''), 10);
+          return Number.isFinite(n) && n > 0 ? { evictionPreview: Math.min(n, 200) } : {};
+        })(),
       }),
     );
   });
